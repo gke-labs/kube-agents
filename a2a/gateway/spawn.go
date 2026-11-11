@@ -140,6 +140,10 @@ const (
 	// scratch emptyDir, the one writable place.
 	sessionHermesHome = "/scratch"
 
+	kubeProxyCAVolume    = "kube-proxy-ca"
+	kubeProxyCAMountPath = "/var/run/secrets/kubeagents/kube-proxy-ca"
+	kubeProxyCAFile      = "ca.crt"
+
 	labelPartOf = "app.kubernetes.io/part-of"
 	partOfValue = "a2a-next"
 	labelRole   = "app.kubernetes.io/component"
@@ -573,6 +577,9 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 			corev1.EnvVar{Name: "HERMES_HOME", Value: sessionHermesHome},
 			corev1.EnvVar{Name: lib.EnvClusterView, Value: "true"},
 		)
+		if s.cfg.CredentialProxyExecURL != "" {
+			c.Env = append(c.Env, corev1.EnvVar{Name: "CREDENTIAL_PROXY_EXEC_URL", Value: s.cfg.CredentialProxyExecURL})
+		}
 		c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{Name: credentialProxyTokenVolume, MountPath: credentialProxyTokenMountPath, ReadOnly: true})
 		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
 			Name: credentialProxyTokenVolume,
@@ -585,6 +592,23 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 				}}},
 			}},
 		})
+		if s.cfg.KubeProxyURL != "" {
+			c.Env = append(c.Env, corev1.EnvVar{Name: "KUBE_PROXY_URL", Value: s.cfg.KubeProxyURL})
+			if s.cfg.KubeProxyHostContext != "" {
+				c.Env = append(c.Env, corev1.EnvVar{Name: "KUBE_PROXY_HOST_CONTEXT", Value: s.cfg.KubeProxyHostContext})
+			}
+		}
+		if s.cfg.KubeProxyCAConfigMap != "" {
+			c.Env = append(c.Env, corev1.EnvVar{Name: "KUBE_PROXY_CA_FILE", Value: kubeProxyCAMountPath + "/" + kubeProxyCAFile})
+			c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{Name: kubeProxyCAVolume, MountPath: kubeProxyCAMountPath, ReadOnly: true})
+			pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
+				Name: kubeProxyCAVolume,
+				VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{Name: s.cfg.KubeProxyCAConfigMap},
+					Items:                []corev1.KeyToPath{{Key: kubeProxyCAFile, Path: kubeProxyCAFile}},
+				}},
+			})
+		}
 	}
 	created, err := s.client.CoreV1().Pods(s.cfg.Namespace).Create(ctx, pod, metav1.CreateOptions{})
 	if err != nil {
@@ -703,9 +727,16 @@ func (s *podSpawner) Reusable(ctx context.Context, podName string) (bool, error)
 
 // busTransport is the stamp annoBusTransport carries: a digest of the NATS
 // URL and the CA file path the spawner hands a pod, which is what changes when
-// the bus moves to TLS.
+// the bus moves to TLS. The exec tier's address joins it when the spawner
+// hands a pod one: a pod spawned with another address, or none, would keep
+// sending commands where the tier no longer is, or past it. A spawner that
+// hands none keeps the stamp its pods already carry.
 func (s *podSpawner) busTransport() string {
-	sum := sha256.Sum256([]byte(s.cfg.NATSURL + "\n" + s.cfg.NATSCAFile))
+	stamped := s.cfg.NATSURL + "\n" + s.cfg.NATSCAFile
+	if s.cfg.SessionClusterView && s.cfg.CredentialProxyExecURL != "" {
+		stamped += "\n" + s.cfg.CredentialProxyExecURL
+	}
+	sum := sha256.Sum256([]byte(stamped))
 	return hex.EncodeToString(sum[:])[:busTransportLength]
 }
 

@@ -76,7 +76,8 @@
         },
         "assignees": [],
         "sha": "7d462311fd849dfae2341381a114157772bffd24",
-        "merge_commit_sha": null,
+        "merge_commit_sha": "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+        "squash_commit_sha": null,
         "web_url": "https://gitlab.com/acme/infra/-/merge_requests/2",
         "references": {
           "short": "!1",

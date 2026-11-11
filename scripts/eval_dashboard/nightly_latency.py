@@ -1,4 +1,4 @@
-"""The latency block of the 9 AM digest's nightly section: last night's
+"""The latency block of the 11 AM digest's nightly section: last night's
 timing against its own recent past, and the cases that slowed down.
 
 The nightly runs record each repetition's timing (``agent_s``, the agent
@@ -39,6 +39,11 @@ than the digest's list holds, one line says so instead of naming them: a
 shift that wide has one cause (the model, the mode, quota), not one per
 case. A list's worth is always named, so a night that timed few cases
 still names its slow one.
+
+Both count dates, not runs: the digest passes ``nightly.night_dates``, the
+last NIGHTS_ON_RECORD dates, and ``nightly.one_per_date`` keeps a list from
+``night_reports`` to one night per date. A same-date re-run of the main job
+is one night here, the newest run of the date.
 
 All of it is advisory, like the turn-1 target: no verdict, state or gate
 reads it. A backtest on the history of 2026-10-15 to 10-28 set the case
@@ -151,6 +156,7 @@ def _marked(value: float, base: float | None, text: str) -> str:
 def night_line(nights: list[dict]) -> str | None:
     """The night line for ``nights[0]`` (``nights`` newest first), or None
     when last night carried no timing at all."""
+    nights = nightly.one_per_date(nights)
     if not nights:
         return None
     night = nights[0]
@@ -200,6 +206,7 @@ def slow_cases(nights: list[dict], keep: set[str] | None = None) -> tuple[list[d
     a row it was slow, last night included), largest ratio first; ``timed``
     the cases last night with timing and a typical. With ``keep``, only the
     cases it names are judged or counted."""
+    nights = nightly.one_per_date(nights)
     if not nights:
         return [], 0
     history = _case_history(nights[1:])

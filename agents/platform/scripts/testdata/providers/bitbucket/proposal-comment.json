@@ -1,0 +1,59 @@
+{
+  "payload": {
+    "number": 11,
+    "body": "Rebased onto the new base image. <!-- agent:ack -->"
+  },
+  "responses": [
+    {
+      "id": 893081678,
+      "created_on": "2026-11-02T18:33:19.264757+00:00",
+      "updated_on": "2026-11-02T18:33:19.291760+00:00",
+      "content": {
+        "type": "rendered",
+        "raw": "Rebased onto the new base image. <!-- agent:ack -->",
+        "markup": "markdown",
+        "html": "<p>Rebased onto the new base image. &lt;!-- agent:ack --&gt;</p>"
+      },
+      "user": {
+        "type": "app_user",
+        "links": {
+          "avatar": {
+            "href": "https://bitbucket.org/account/example/avatar/"
+          }
+        },
+        "created_on": "2026-11-02T15:08:55.432081+00:00",
+        "display_name": "kube-agents",
+        "uuid": "{4b1c9e2a-7d3f-4a6b-9c8e-1f2a3b4c5d6e}",
+        "account_id": "712020:00000000-0000-0000-0000-000000000001",
+        "account_status": "active",
+        "kind": "repository_access_token"
+      },
+      "deleted": false,
+      "pending": false,
+      "type": "pullrequest_comment",
+      "links": {
+        "self": {
+          "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/11/comments/893081678"
+        },
+        "html": {
+          "href": "https://bitbucket.org/acme/infra/pull-requests/11/_/diff#comment-893081678"
+        }
+      },
+      "pullrequest": {
+        "type": "pullrequest",
+        "id": 11,
+        "title": "Raise the replica floor on the ingest deployment",
+        "draft": true,
+        "links": {
+          "self": {
+            "href": "https://api.bitbucket.org/2.0/repositories/acme/infra/pullrequests/11"
+          },
+          "html": {
+            "href": "https://bitbucket.org/acme/infra/pull-requests/11"
+          }
+        },
+        "queued": false
+      }
+    }
+  ]
+}

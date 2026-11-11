@@ -7,19 +7,19 @@ sidebar:
 
 A rollback is an upgrade run from the older release's own checkout. There is no rollback flag:
 `upgrade.sh` refuses to run unless the sources it runs from are the exact commit `--image-tag`
-names, so a move to `N-1` from a checkout or a release bundle runs `N-1`'s copy of the script,
-`N-1`'s chart and `N-1`'s CRDs against your install. Two of its three modes do that by Helm alone
+names. A move to `N-1` from a checkout or a release bundle therefore runs `N-1`'s copy of the
+script, `N-1`'s chart and `N-1`'s CRDs against your install. Two of its three modes do that by Helm alone
 and never run Terraform; the third re-applies `N-1`'s Terraform composition, Helm release
 included. The supported rollback is the Helm-only pair below. The full mode is the GCP-level
 revert, and it needs a plan read first.
 
 Because the script that runs is `N-1`'s, its timeouts and Helm flags are `N-1`'s too, and this
-page says where the published releases differ. A copy of the script that carries no baked version
-— one taken from `main` rather than from release `N-1` — fetches `N-1`'s tree and runs its own
-steps over it, and it cannot complete a rollback to any release through `0.7.0`: it calls
-installer functions the libraries of `0.4.0` through `0.7.0` do not define, and `0.3.0` and
-earlier have no installer library to load, so its operator step, `--plan` and full mode each stop
-before they apply anything of `N-1`. Roll back from the `N-1` checkout, which is what this page
+page says where the published releases differ. A copy of the script that carries no baked version,
+one taken from `main` rather than from release `N-1`, fetches `N-1`'s tree and runs its own steps
+over it. It cannot complete a rollback to any release through `0.7.0`: it calls installer functions
+the libraries of `0.4.0` through `0.7.0` do not define, and `0.3.0` and earlier have no installer
+library to load. So its operator step, `--plan` and full mode each stop before they apply anything
+of `N-1`. Roll back from the `N-1` checkout, which is what this page
 describes.
 
 The forward move, the three upgrade modes, and how a run resolves the version it targets are in
@@ -70,13 +70,55 @@ about, and the next two sections say what happens to each kind of thing.
 
 On an install running `spec.mode: next`, switch it to `today` first ([Upgrade → Switching back to
 `today`](/kube-agents/install/upgrade/#switching-back-to-today)) and check that Slack answers. No
-chart up to 0.9.0 declares `platformAgent.mode`, so a rollback to one cannot keep the mode: the
+chart up to 0.9.0 declares `platformAgent.mode`, so a rollback to one cannot keep the mode. The
 recorded key is a value `N-1` does not declare, refused, dropped or ignored as [The
-rollback](#the-rollback) and [When a rollback is refused](#when-a-rollback-is-refused) say, and
-without it the install is back on `today` with nothing in the run to say so. Switching first moves
+rollback](#the-rollback) and [When a rollback is refused](#when-a-rollback-is-refused) say. Without
+it the install is back on `today` with nothing in the run to say so. Switching first moves
 Slack back to the credential broker, and the Slack app back to its `today` settings, with the checks
 that section gives, instead of leaving you to find the app without its slash commands after the
 rollback.
+
+### A bus left down by a rollback under `next`
+
+Since the release that separates the bus's accounts, the bus keeps its stored streams under a
+`TRUSTED` account that earlier releases do not configure, and `upgrade.sh` refuses a direct rollback
+past that change unless it is given `--allow-breaking-downgrade`. If one ran under `next` anyway, the bus pod `<name>-a2a-nats-0` stays
+not Ready with `JetStream account 'TRUSTED' could not be resolved` in its log, and the auth callouts,
+the A2A gateway and the agent's bridge fail behind it.
+
+Upgrade forward to the release you came from. The operator then replaces the stuck pod: once the
+StatefulSet carries the forward template, it deletes a bus pod that has not been Ready for two
+minutes on an earlier revision, and records an `A2ABusPodReplaced` event on the `PlatformAgent`. The
+forward upgrade usually rolls the auth callouts too, and they cannot become Ready without the bus.
+The operator does not make a bus that has not been Ready for two minutes wait for callouts that
+cannot become Ready: it moves the bus to the forward template at once and records an
+`A2ABusHoldSkipped` event.
+The bus is back within about two minutes of the forward upgrade, and the callouts follow it.
+
+A forward run in harness or full mode waits for the agent, and completes once the bus is back.
+To see the replacement:
+
+```bash
+kubectl get events -n kubeagents-system --field-selector reason=A2ABusPodReplaced
+```
+
+An operator that predates this repair does not replace the pod. If the pod is still not Ready about
+fifteen minutes after the forward upgrade was applied, run the checks below. Delete the pod once its
+`controller-revision-hash` label differs from the StatefulSet's `status.updateRevision` (the default
+agent name is `platform-agent`); a pod deleted before then comes back on the earlier template. The
+delete is the same one the operator makes, so it is safe with either operator:
+
+```bash
+kubectl get statefulset platform-agent-a2a-nats -n kubeagents-system \
+  -o jsonpath='{.status.updateRevision}{"\n"}'
+kubectl get pod platform-agent-a2a-nats-0 -n kubeagents-system \
+  -o jsonpath='{.metadata.labels.controller-revision-hash}{"\n"}'
+kubectl delete pod platform-agent-a2a-nats-0 -n kubeagents-system
+```
+
+Then roll back as this page says: switch to `today` first, and move the bus's store back as the
+bus-accounts entry under [Upgrade → Breaking changes](/kube-agents/install/upgrade/#breaking-changes-in-recent-releases)
+says before you return to `next`.
 
 ## The rollback
 
@@ -108,11 +150,13 @@ run does, and only warns about uncommitted changes, which the real run refuses.
 The operator step applies `N-1`'s CRDs to the cluster with a server-side apply, then runs one
 `helm upgrade` on the existing release with `N-1`'s chart, re-tagging the operator image. `N-1`'s
 operator then reconciles the `PlatformAgent` from `N-1`'s schema, and its first pass re-renders
-the agent Deployment with `N-1`'s spec, rolling the pod wherever that spec differs, still on `N`'s
-image, because the agent tag in the release's values has not moved yet. The harness step is a
-second `helm upgrade` with the same chart re-tagging the agent image (on releases that ship the
-shell sandbox, the sandbox image with it, and from the first release after `0.6.0` the plugin
-images the release records), followed by a wait for the rollout. Operator first
+the agent Deployment with `N-1`'s spec, rolling the pod wherever that spec differs. The pod is
+still on `N`'s image, because the agent tag in the release's values has not moved yet.
+
+The harness step is a second `helm upgrade` with the same chart re-tagging the agent image,
+followed by a wait for the rollout. On releases that ship the shell sandbox it re-tags the sandbox
+image with it, and from the first release after `0.6.0` the plugin images the release records.
+Operator first
 because the CRD schema and the controller have to agree before the agent the controller renders
 is replaced. Between the two commands `N`'s agent image runs under `N-1`'s Deployment spec,
 without whatever `N`'s operator had added to it, which is why the pair is run back to back rather
@@ -121,13 +165,16 @@ than a step at a time.
 Each step's `helm upgrade` waits up to ten minutes for the objects the chart renders, the
 controller Deployment among them. A timeout there leaves the release `failed`, which the next run
 does not un-stick on its own: the current script un-sticks a `pending-*` release alone, and
-`0.4.0`'s un-sticks nothing. After Helm returns, the script first reads the gateway Deployment's
-release images back against the tag and fails the step on any still on `N` (from `0.5.0`; the
-current script reads plugin image volumes too), then waits with `kubectl rollout status`
-for the rollouts the chart does not cover, the agent Deployment first, and those waits are
-`N-1`'s: the current script gives the agent twenty-five minutes in the namespace `install.env` names,
-while `0.4.0`'s gives it two minutes in `kubeagents-system` whatever `NAMESPACE` says. So on a
-slow image pull, or on an install in another namespace, `0.4.0`'s harness step can report a
+`0.4.0`'s un-sticks nothing.
+
+After Helm returns, the script first reads the gateway Deployment's release images back against
+the tag and fails the step on any still on `N` (from `0.5.0`; the current script reads plugin
+image volumes too). It then waits with `kubectl rollout status` for the rollouts the chart does
+not cover, the agent Deployment first. Those waits are `N-1`'s: the current script gives the agent
+twenty-five minutes in the namespace `install.env` names, while `0.4.0`'s gives it two minutes in
+`kubeagents-system` whatever `NAMESPACE` says.
+
+So on a slow image pull, or on an install in another namespace, `0.4.0`'s harness step can report a
 failure after both Helm moves have succeeded. A timeout is not a signal to run the step again.
 Read the rollout yourself first:
 
@@ -144,7 +191,7 @@ kubectl describe pod -n kubeagents-system -l app=platform-agent-gateway
   and the plugin images when `N-1`'s script is from after `0.6.0`. `0.4.0`, `0.5.0` and `0.6.0`
   all leave the plugin images on `N`'s tag. With a plugin enabled, `0.5.0`'s and `0.6.0`'s image
   check then refuses where the plugin is staged by an init container (GKE Autopilot, and Standard
-  below 1.35), with both Helm moves already made; where it is mounted as an image volume the check
+  below 1.35), with both Helm moves already made. Where it is mounted as an image volume the check
   does not read it and passes, and `0.4.0` has no check. In every case, finish that rollback from
   the `N-1` checkout by re-tagging the two plugin keys by hand (`--reuse-values` for `0.4.0`, to
   match its script):
@@ -163,9 +210,9 @@ kubectl describe pod -n kubeagents-system -l app=platform-agent-gateway
 - Which values those templates are rendered with depends on the script. From `0.5.0` through
   `0.7.0` the re-tag is `helm upgrade --reset-then-reuse-values`: `N-1`'s chart defaults, with the
   values the install set on top. From the first release after `0.7.0` it is the same, less any
-  value the install set that `N-1`'s values schema refuses as undeclared, which the script drops
-  and names before any of `N-1` is applied when it is given `--drop-undeclared-values`, and names
-  and stops on when it is not. `0.4.0` and earlier use `--reuse-values`, which
+  value the install set that `N-1`'s values schema refuses as undeclared. The script drops and
+  names each such value before any of `N-1` is applied when it is given `--drop-undeclared-values`,
+  and names and stops on it when it is not. `0.4.0` and earlier use `--reuse-values`, which
   keeps every value `N`'s release computed, defaults included, so a chart default `N` changed
   stays at `N`'s value after a rollback to `0.4.0` even though the chart version reads `0.4.0`.
 
@@ -173,10 +220,12 @@ kubectl describe pod -n kubeagents-system -l app=platform-agent-gateway
 
 Terraform state and every GCP resource. The Helm-only modes write nothing to state, so it keeps
 recording `N` as the installed tag. What `./upgrade.sh --plan` then reports depends on the copy it
-runs from: the `N-1` checkout's script carries `N-1` as its baked version, so it plans at `N-1` and
+runs from. The `N-1` checkout's script carries `N-1` as its baked version, so it plans at `N-1` and
 the report holds the re-tag along with every composition difference between `N-1` and `N`, which is
 the next section's subject. A copy carrying no baked version plans at the tag state records
-instead, and the re-tag is not in that report. The state and the cluster disagree on the tag until
+instead, and the re-tag is not in that report.
+
+The state and the cluster disagree on the tag until
 the next `--upgrade-mode=full`, which re-applies whatever tag it is given. The `terraform.tfvars`
 in the `N-1` checkout is regenerated on every run and is not a record of anything.
 
@@ -185,8 +234,9 @@ finds missing is generated and added, which is what a forward upgrade does too.
 
 Objects `N`'s operator created that `N-1`'s operator does not know. The operator only reconciles
 what its own release renders, so an object introduced by a later release stays in place, on `N`'s
-image, unmanaged, until the next forward upgrade re-adopts it. The shell sandbox is the current
-example: rolling back to a release whose chart has no `agentSandbox` values (`0.4.0` and earlier)
+image, unmanaged, until the next forward upgrade re-adopts it.
+
+The shell sandbox is the current example: rolling back to a release whose chart has no `agentSandbox` values (`0.4.0` and earlier)
 leaves the `platform-agent-shell` StatefulSet behind, and that release's harness step re-tags the
 agent alone. It keeps running until its pod next restarts: the same Helm move deleted the
 `platform-agent-shell-authorized-keys` Secret it mounts, because `0.4.0`'s chart does not render
@@ -198,21 +248,32 @@ them from the stored object, and `N-1`'s chart does not render them. The full mo
 Helm values that produced them. A re-tag by the script of `0.7.0` or earlier keeps those values in
 the release's recorded values: a later forward re-tag renders them again, and the schema refusal
 below turns on them. A re-tag by a script from after `0.7.0`, run with `--drop-undeclared-values`,
-drops each one `N-1`'s values schema refuses as undeclared, so after such a rollback the release no
+drops each one `N-1`'s values schema refuses as undeclared. After such a rollback the release no
 longer records it, and the next forward re-tag renders it from `N`'s chart default until a
 full-mode apply sets it again.
 
 The agent's persistent volume, apart from what the entrypoint re-syncs from the image. The
 harness step rolls the pod, and the volume follows it; what the next start does to it is `N-1`'s
 entrypoint's doing, and every published release's entrypoint does the same. Skills are not kept:
-on every start the entrypoint replaces the platform profile's `skills/`, and every cluster
-profile's, whole from the image, so a skill `N` added is gone at the first start after the
+on every start the entrypoint replaces the platform profile's `skills/` whole from the image, and
+a cluster profile's whenever its boot stamp does not match the image, which a start on a
+different image always is. A skill `N` added is therefore gone at the first start after the
 harness step rather than staying and failing on use
 ([Skills](/kube-agents/concepts/skills/#importing-external-skills) says the same of an injected
-skill). The platform profile's persona files, governance and hindsight configuration are
-overwritten with `N-1`'s copies too, though a governance file only `N` shipped stays, because
-that overlay prunes nothing; the default profile's persona files and the shared scripts are
-overwritten the same way. Cron definitions are merged per job id: `N-1`'s image wins every key
+skill).
+
+The platform profile's persona files, governance, hindsight configuration and plugin directories
+are overwritten with `N-1`'s copies too, though a governance file only `N` shipped stays, because
+that overlay prunes nothing. The default profile's persona files and the shared scripts are
+overwritten the same way.
+Its plugin directories depend on `N-1`. A release after `0.27.0` cut from `main` overwrites every
+plugin directory the image ships, except `hermes_otel`, which follows the `cp -ru` rule below. A
+plugin or module only `N` shipped stays, and a plugin's own state files survive, because that copy
+prunes nothing. Releases `0.21.0` to `0.27.0` overwrite `bootstrap_onboarding` only, and `0.20.0`
+and earlier overwrite none, so with those every other default-profile plugin directory follows the
+`cp -ru` rule.
+
+Cron definitions are merged per job id: `N-1`'s image wins every key
 it ships, the scheduler's own state stays, and a job only `N` shipped keeps its entry and keeps
 firing, now against `N-1`'s tools. The rest of what the image seeds is copied with `cp -ru`,
 which skips any file the volume holds that is newer, so those files stay at `N`'s copy, and the
@@ -223,7 +284,9 @@ through the credential proxy, the entrypoint rewrites those two entries in every
 `config.yaml` (and the platform profile's, when it is the front door) to the proxy's relay. An
 earlier release's entrypoint repairs only the User-Agent header in them, so after a rollback across
 that change each Cluster Agent's two servers name a relay address the older operator never sets,
-and every call to them fails. Put the two entries back from the rolled-back image's own templates,
+and every call to them fails.
+
+Put the two entries back from the rolled-back image's own templates,
 keeping the rest of each file, from the gateway's `platform-agent` container. The command covers
 every cluster profile and, when the platform profile is the front door, that one too:
 
@@ -260,16 +323,19 @@ wrong place.
 From the `N-1` checkout, the full mode applies `N-1`'s CRDs, then runs `terraform apply` on
 `N-1`'s composition on top of the state `N` wrote. Its Helm half is not the re-tag: the
 composition's own `helm_release` upgrades the release with `N-1`'s chart and the values `N-1`'s
-composition computes from `install.env`, and it sets neither `reuse_values` nor `reset_values`,
-so the values the release recorded are discarded rather than reused. Anything in them that the
+composition computes from `install.env`. It sets neither `reuse_values` nor `reset_values`, so
+the values the release recorded are discarded rather than reused. Anything in them that the
 composition does not render goes with them: a value set by hand with `helm upgrade --set`, a key
 `N`'s composition added, and on a `0.4.0` rollback the `N` defaults the pair's `--reuse-values`
-kept. The plan lists that as the `helm_release` change, next to the GCP resources. This is the
-GCP-level revert: a resource `N`'s composition added is planned for destruction because `N-1`'s
-composition does not declare it, and a setting `N` changed goes back. Read the whole plan first.
-A plan that destroys a bucket, a KMS key or the cluster is a decision to take with what those
-resources hold in front of you, not a rollback step; the composition on `N` may have added a
-resource that now carries data. The plan's exit code follows Terraform's: `0` for no changes,
+kept.
+
+The plan lists that as the `helm_release` change, next to the GCP resources. This is the GCP-level
+revert: a resource `N`'s composition added is planned for destruction because `N-1`'s composition
+does not declare it, and a setting `N` changed goes back.
+
+Read the whole plan first. A plan that destroys a bucket, a KMS key or the cluster is a decision to
+take with what those resources hold in front of you, not a rollback step. The composition on `N`
+may have added a resource that now carries data. The plan's exit code follows Terraform's: `0` for no changes,
 `2` for changes, `1` for an error.
 
 The composition refuses some of those destructions itself: its `lifecycle.sh` exits before
@@ -295,11 +361,10 @@ kubectl get pods -n kubeagents-system
 helm history kube-agents -n kubeagents-system
 ```
 
-Both images end in `:<N-1>`, so does every plugin image the fourth command lists (the lines naming
-`pubsub-platform` or `gke-stockout-investigator`; a plugin installed on its own, outside the
-release, keeps its own tag and is not the rollback's to move), the `Ready` condition reads `True`,
-the gateway pod is `Running`,
-and the newest Helm revision is `deployed` at chart version `N-1`, with the operator step's
+Both images end in `:<N-1>`, and so does every plugin image the fourth command lists (the lines
+naming `pubsub-platform` or `gke-stockout-investigator`). A plugin installed on its own, outside
+the release, keeps its own tag and is not the rollback's to move. The `Ready` condition reads
+`True`, the gateway pod is `Running`, and the newest Helm revision is `deployed` at chart version `N-1`, with the operator step's
 revision `superseded` just before it. `kubeagents-system` is the default namespace; an install
 that set `NAMESPACE` in `install.env` uses that one. `platform-agent` is the chart's default
 `platformAgent.name` value.
@@ -317,7 +382,7 @@ revision.
   again from a clean checkout or bundle of `N-1`.
 - **No install configuration.** No `install.env` was found in `KUBE_AGENTS_INSTALL_ENV`, the
   checkout the script runs from, the working directory, or (when run from outside a checkout)
-  `$HOME/kube-agents` — or `KUBE_AGENTS_INSTALL_ENV` names a file that is not there, which is
+  `$HOME/kube-agents`. Or `KUBE_AGENTS_INSTALL_ENV` names a file that is not there, which is
   reported by that path rather than searched past. Supply the install's own file; a fresh one
   written from memory re-renders the `PlatformAgent` with whatever it forgets.
 - **A commit between `N` and `N-1` is marked as a breaking change.** The script names each one, as
@@ -327,8 +392,8 @@ revision.
   read it, the run also stops. Read the named commits, then re-run with
   `--allow-breaking-downgrade`. `--plan` reports the same commits as a warning and does not stop.
 - **The memory store cannot be checked and the configuration does not name one.** A rollback runs
-  `upgrade.sh`, and its `terraform.tfvars` is regenerated in every mode, so an `install.env` with
-  no `MEMORY` line makes the run ask the cluster whether it is running Hindsight rather than
+  `upgrade.sh`, and its `terraform.tfvars` is regenerated in every mode. An `install.env` with
+  no `MEMORY` line therefore makes the run ask the cluster whether it is running Hindsight rather than
   default to a value that would plan the store away. If the cluster cannot be asked, the run stops.
   This lands after `kubectl` has been pointed at the cluster and, on a real run, after the Secret
   backfills, but before `N-1`'s CRDs are applied. Record `MEMORY=hindsight|file|off` in
@@ -341,8 +406,9 @@ revision.
   before it renders, so the release keeps its last revision, but in the operator step the CRD
   apply has already run: put `N`'s CRDs back from the `N` checkout with the same command the
   script uses, `kubectl apply --server-side --force-conflicts -f charts/kube-agents/crds/`. For a
-  pair whose `N-1` is `0.7.0` or earlier the Helm-only rollback therefore does not complete. From
-  the first release after `0.7.0` the re-tag checks the recorded values against the schema before
+  pair whose `N-1` is `0.7.0` or earlier the Helm-only rollback therefore does not complete.
+
+  From the first release after `0.7.0` the re-tag checks the recorded values against the schema before
   any of `N-1` is applied, and names and stops on each key the schema refuses as undeclared. Given
   `--drop-undeclared-values` it drops those keys instead, so with the flag the refusal no longer
   happens where `N-1` is that release or later. The full mode completes either way, because its
@@ -365,23 +431,25 @@ revision.
   that carries another manager's ownership labels (`exists and cannot be imported into the
 current release: invalid ownership metadata`). The `litellm-policy` NetworkPolicy is the case
   in hand: every chart through `0.5.0` renders it, and from the first release after `0.5.0` the
-  operator creates and labels it instead, so a rollback from that release to `0.5.0` or earlier
-  is refused at the operator step's `helm upgrade`, with `N-1`'s CRDs already applied and the
-  release still at its last revision. The way through is the chart README's
+  operator creates and labels it instead. A rollback from that release to `0.5.0` or earlier is
+  therefore refused at the operator step's `helm upgrade`, with `N-1`'s CRDs already applied and
+  the release still at its last revision.
+
+  The way through is the chart README's
   [handoff](https://github.com/gke-labs/kube-agents/blob/main/charts/kube-agents/README.md#handing-litellm-policy-back-to-helm):
   scale `N`'s operator to zero, relabel and annotate the object for Helm, then run the two
   commands; the operator step adopts it. Put `N`'s CRDs back first if the refusal has already
   happened, as for the schema case.
 
 A further refusal is a future one. The API server rejects a CRD whose `spec.versions` drops a
-version still listed in `status.storedVersions`, so if `N` introduced a new API version of the
+version still listed in `status.storedVersions`. So if `N` introduced a new API version of the
 `PlatformAgent` CRD and objects were stored in it, the operator step fails at the CRD apply,
 before anything moves. Every published release serves `v1alpha1` alone; it is here so that the
 day it happens the error is recognised as the rollback boundary it is.
 
 Two things this page does not do. `helm rollback kube-agents <revision>` reverts the chart and
 values to an earlier revision without applying that revision's CRDs and without the source check,
-which is why the runbook goes through `upgrade.sh`; `upgrade.sh` itself uses `helm rollback` only
+which is why the runbook goes through `upgrade.sh`. `upgrade.sh` itself uses `helm rollback` only
 to un-stick a release left in a `pending-*` state. And nothing here restores data: the agent's
 volume, the Terraform state bucket and anything `N`'s agent wrote to a repository or a cluster are
 where `N` left them.

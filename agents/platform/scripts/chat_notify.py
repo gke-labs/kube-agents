@@ -43,6 +43,15 @@ NOTIFY_PLATFORM_ENV = "A2A_NOTIFY_PLATFORM"
 # route, home channel or not (platformagent_a2a_manifests.go,
 # a2aNotifyConversationsEnvVar): the platform whose backend the gateway holds.
 NOTIFY_CONVERSATIONS_ENV = "A2A_NOTIFY_CONVERSATIONS"
+# The operator projects the home channel it admitted (the CR field, else the
+# channel the gateway learned) into a ConfigMap mounted as a directory in the
+# agent pod, so a learned channel reaches the pod without a restart. One file,
+# the Slack channel id or empty; the directory is absent on an operator older
+# than the projection and in today mode. No env override: the agent's own
+# .env is loaded into its environment, so a seam there would let a line on
+# the writable volume point the readers at a file of its own.
+HOME_FILE_DIR = "/etc/kube-agents/chat-home"
+HOME_FILE_KEY = "slack_home"
 #: The Slack platform name, whose threads go out channel-qualified (command).
 SLACK_PLATFORM = "slack"
 # What `a2a notify` needs to reach the bus (a2a/cmd/a2a/main.go, connect): the
@@ -71,9 +80,14 @@ HERMES_CLI = "hermes"
 # post may or may not have landed, so a caller must not post it again.
 NOTIFY_OUTCOME_UNKNOWN = 3
 # The exit status `a2a notify` uses when the route is not there right now: no
-# gateway subscribed (a roll, or its bind retry) or the bus unreachable. Nothing
-# was posted, and waiting may help where retrying a refusal would not.
+# gateway subscribed (a roll, or its bind retry), the bus unreachable, or a
+# refusal the gateway marks retry (stopping, a record it couldn't read in time).
+# Nothing was posted, and waiting may help where retrying a refusal would not.
 NOTIFY_ROUTE_UNAVAILABLE = 4
+# `a2a notify`'s exit when the gateway refused a home post for want of a home
+# channel and kept it for the digest it posts once one is set: nothing posted
+# now, nothing lost, so a sender that re-sends on failure treats it as handled.
+NOTIFY_KEPT = 5
 # The waits before each retry of a send that found the route unavailable, for
 # a caller with one shot at the post. They sum past the gateway's longest wait
 # between attempts to bind the route (a2a/gateway/notify.go,
@@ -104,9 +118,48 @@ def alert_update_key(session_id: str) -> str:
     return ALERT_UPDATE_FORMAT.format(session=session_id) if session_id else ""
 
 
+def home_file() -> tuple[str, bool]:
+    """The projected Slack home channel, trimmed, and whether the file is mounted.
+
+    Read on every call: the kubelet refreshes the file in place when the
+    operator's projection changes, within about a minute, and no process
+    restarts for it. Mounted means the directory is there: the Optional
+    volume gives an empty directory until the operator writes the ConfigMap,
+    and in that gap the home is still the operator's to say. No directory at
+    all is today mode, or an operator older than the projection: ("", False).
+    """
+    try:
+        with open(os.path.join(HOME_FILE_DIR, HOME_FILE_KEY), encoding="utf-8") as handle:
+            try:
+                return handle.read().strip(), True
+            except ValueError:
+                # Not text: mounted, but no channel to read, as the gateway reads it.
+                return "", True
+    except OSError:
+        return "", os.path.isdir(HOME_FILE_DIR)
+
+
+def home_file_value() -> str:
+    """The Slack home channel the operator projected into the pod, or "" when none."""
+    return home_file()[0]
+
+
 def routed_platform() -> str:
-    """The platform whose posts go through the gateway, or "" when none does."""
-    return os.environ.get(NOTIFY_PLATFORM_ENV, "").strip()
+    """The platform whose posts go through the gateway, or "" when none does.
+
+    The rendered env names it when the CR sets the home channel, and when the
+    gateway's backend is the install's only chat platform with no home channel
+    set: the gateway then refuses each post and keeps it for the digest it
+    posts once one is. A learned channel is never rendered into the pod, so
+    with the env empty the answer is derived: the gateway holds Slack
+    (``A2A_NOTIFY_CONVERSATIONS``) and the projected file names a home channel.
+    """
+    routed = os.environ.get(NOTIFY_PLATFORM_ENV, "").strip()
+    if routed:
+        return routed
+    if gateway_platform() == SLACK_PLATFORM and home_file_value():
+        return SLACK_PLATFORM
+    return ""
 
 
 def gateway_platform() -> str:
@@ -196,8 +249,8 @@ def command(target: str, message: str, json_output: bool = True, hermes_bin: str
     ``wait_seconds`` bounds how long `a2a notify` waits for the gateway, for a
     caller with a deadline shorter than the CLI's default. ``update`` names the
     message on the gateway path (``a2a notify --update``), so a later notify
-    with the same key in the same conversation edits it; the Hermes path has
-    no such key and ignores it.
+    with the same key in the same conversation or home thread edits it; the
+    Hermes path has no such key and ignores it.
     """
     platform, _, rest = target.partition(":")
     if not routes(platform):
@@ -253,6 +306,11 @@ def outcome_unknown(returncode: int) -> bool:
 def route_unavailable(returncode: int) -> bool:
     """Whether a failed send found no route (nothing posted; waiting may help)."""
     return returncode == NOTIFY_ROUTE_UNAVAILABLE
+
+
+def kept(returncode: int) -> bool:
+    """Whether a failed send was kept by the gateway for its digest (nothing posted now; do not re-send)."""
+    return returncode == NOTIFY_KEPT
 
 
 def thread_from_response(platform: str, response: dict) -> str:

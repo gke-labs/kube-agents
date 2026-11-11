@@ -23,6 +23,12 @@ that is merely slow is not reported:
     than the threshold. Referents are resolved by name only; Secret contents
     are never read.
 
+An object that asks for zero replicas is skipped by every heuristic. A
+Gateway's own ``Programmed=False`` row is dropped when its in-cluster proxy
+Deployment, found from the GatewayClass's ``controllerName`` in the Gateway's
+namespace (and Envoy Gateway's controller namespace), asks for zero replicas:
+the gateway is switched off on purpose. Its other rows stay.
+
 The script never mutates. It prints a table (or ``--json``) and always ends
 with ``stalled resources: <count>``, ``0`` on a healthy namespace.
 
@@ -68,6 +74,19 @@ DEFAULT_STALL_MINUTES = 15
 STALL_MINUTES_BY_KIND: dict[str, int] = {
     "Deployment": 10,
 }
+# Config Connector holds Ready=False with reason Updating for the whole of a
+# create or update and Deleting for a delete, and a SQLInstance or a
+# ContainerCluster takes longer than DEFAULT_STALL_MINUTES to create, so an
+# object in either state is in progress, not stalled, at any age: neither its
+# Ready condition nor its generation lag is a row (the daily kcc-object-wedged
+# audit check skips the same two reasons). DependencyNotReady lasts as long as
+# the referenced resource's own create, so it is held to
+# DEPENDENCY_STALL_MINUTES, past any ordinary create, before it is a row; a
+# dependency still not ready after an hour is the wedge the audit check finds.
+READY_CONDITION_TYPE = "Ready"
+IN_PROGRESS_READY_REASONS = frozenset({"Updating", "Deleting"})
+DEPENDENCY_NOT_READY_REASON = "DependencyNotReady"
+DEPENDENCY_STALL_MINUTES = 60
 
 # Condition types whose status is expected to reach "True" on a settled object.
 # Anything else on an object's conditions list (ReplicaFailure, ScalingLimited,
@@ -90,6 +109,37 @@ TERMINAL_POD_PHASES = frozenset({"Succeeded", "Failed"})
 FINISHED_JOB_CONDITION_TYPES = frozenset({"Complete", "Failed"})
 REPLICAS_SPEC_KEY = "replicas"
 JOB_KIND = "Job"
+
+# A Gateway whose in-cluster proxy is scaled to zero on purpose reports
+# Programmed=False (Envoy Gateway: reason NoResources). That one row is dropped
+# when the proxy Deployment exists and asks for zero replicas; every other row
+# of the Gateway stays, since a scale to zero cannot cause it, and routes are
+# left alone (their backends at zero raise only BackendsAvailable=False, which
+# no heuristic reads). The proxy is read only when that row has been reported,
+# so a healthy namespace costs no extra read.
+GATEWAY_KIND = "Gateway"
+SCALED_TO_ZERO_DETAIL = "Programmed=False"
+DEPLOYMENTS_RESOURCE = "deployments"
+GATEWAY_CLASSES_RESOURCE = "gatewayclasses.gateway.networking.k8s.io"
+LABEL_SELECTOR_FLAG = "-l"
+# How an in-cluster gateway controller labels the proxy Deployment it runs for
+# a Gateway, by the GatewayClass's spec.controllerName, and the namespace it
+# runs it in besides the Gateway's own: Envoy Gateway runs it in its controller
+# namespace by default. Every other controller is looked up by the label the
+# Gateway API recommends for generated resources, in the Gateway's namespace
+# only. The lookup stays out of other namespaces, so nobody can silence a
+# Gateway by planting a zero-replica Deployment labelled for it elsewhere. A
+# controller with no in-cluster proxy (GKE's managed classes) matches no
+# Deployment, so its Gateways keep the row.
+ENVOY_GATEWAY_NAMESPACE = "envoy-gateway-system"
+PROXY_SELECTORS: dict[str, tuple[str, tuple[str, ...]]] = {
+    "gateway.envoyproxy.io/gatewayclass-controller": (
+        "gateway.envoyproxy.io/owning-gateway-name={name},"
+        "gateway.envoyproxy.io/owning-gateway-namespace={namespace}",
+        (ENVOY_GATEWAY_NAMESPACE,),
+    ),
+}
+DEFAULT_PROXY_SELECTOR: tuple[str, tuple[str, ...]] = ("gateway.networking.k8s.io/gateway-name={name}", ())
 
 # The stall watch's opt-out annotation. An object that carries it is still
 # reported, and the table is unchanged; each of its --json rows says so in
@@ -312,6 +362,52 @@ class NameResolver:
         return name in names
 
 
+class ScaleResolver:
+    """Answers whether a Gateway's in-cluster proxy is scaled to zero, from
+    listings read on first use and cached. A read that fails, or an answer it
+    cannot give, counts as not scaled to zero."""
+
+    def __init__(self, reader=kubectl_json):
+        self._reader = reader
+        self._cache: dict[tuple[str, ...], list[dict] | None] = {}
+
+    def _items(self, *args: str) -> list[dict] | None:
+        if args not in self._cache:
+            try:
+                listing = self._reader(list(args))
+            except RuntimeError as exc:
+                sys.stderr.write(f"{WARNING_PREFIX}scaled-to-zero check could not read: {exc}\n")
+                listing = None
+            if listing is None:
+                self._cache[args] = None
+            else:
+                self._cache[args] = (listing.get("items") or []) if "items" in listing else [listing]
+        return self._cache[args]
+
+    def proxy_at_zero(self, gateway: dict) -> bool:
+        """Whether the Gateway's in-cluster proxy Deployment exists and every
+        one found asks for zero replicas. A namespace that cannot be read
+        counts as one holding a running proxy."""
+        meta = gateway.get("metadata") or {}
+        namespace = meta.get("namespace", "")
+        class_name = (gateway.get("spec") or {}).get("gatewayClassName")
+        if not class_name:
+            return False
+        classes = self._items(KUBECTL_GET, GATEWAY_CLASSES_RESOURCE, class_name)
+        if not classes:
+            return False
+        controller = (classes[0].get("spec") or {}).get("controllerName") or ""
+        template, extra_namespaces = PROXY_SELECTORS.get(controller, DEFAULT_PROXY_SELECTOR)
+        selector = template.format(name=meta.get("name", ""), namespace=namespace)
+        proxies: list[dict] = []
+        for where in dict.fromkeys((namespace, *extra_namespaces)):
+            found = self._items(KUBECTL_GET, DEPLOYMENTS_RESOURCE, LABEL_SELECTOR_FLAG, selector, NAMESPACE_FLAG, where)
+            if found is None:
+                return False
+            proxies.extend(found)
+        return bool(proxies) and all((d.get("spec") or {}).get(REPLICAS_SPEC_KEY) == 0 for d in proxies)
+
+
 # --------------------------------------------------------------------------
 # time helpers
 # --------------------------------------------------------------------------
@@ -399,11 +495,43 @@ def finding(obj: dict, heuristic: str, detail: str, stalled: timedelta) -> dict:
     }
 
 
+def ready_reason(obj: dict) -> str:
+    """The reason on the object's own Ready condition while it is not True,
+    else the empty string."""
+    status = obj.get("status")
+    if not isinstance(status, dict):
+        return ""
+    for path, cond in iter_conditions(status):
+        if path == "" and cond.get("type") == READY_CONDITION_TYPE and cond.get("status") != CONDITION_TRUE:
+            return str(cond.get("reason") or "")
+    return ""
+
+
+def ready_in_progress(obj: dict) -> bool:
+    """Whether the object's own Ready condition says its controller is still
+    applying or deleting it (IN_PROGRESS_READY_REASONS), in which case no
+    heuristic calls it stalled."""
+    return ready_reason(obj) in IN_PROGRESS_READY_REASONS
+
+
+def dependency_wait(reason: str, threshold: timedelta) -> timedelta:
+    """The age a Ready=False with this reason must reach: the usual threshold,
+    or DEPENDENCY_STALL_MINUTES at least for DependencyNotReady, by every
+    heuristic alike, so the generation lag of an object waiting on a
+    dependency is not a row sooner than its condition."""
+    if reason == DEPENDENCY_NOT_READY_REASON:
+        return max(threshold, timedelta(minutes=DEPENDENCY_STALL_MINUTES))
+    return threshold
+
+
 def check_generation_lag(obj: dict, now: datetime, threshold: timedelta) -> list[dict]:
     meta = obj.get("metadata") or {}
     status = obj.get("status")
     if not isinstance(status, dict) or "observedGeneration" not in status:
         return []
+    if ready_in_progress(obj):
+        return []
+    threshold = dependency_wait(ready_reason(obj), threshold)
     generation = meta.get("generation")
     observed = status.get("observedGeneration")
     if not isinstance(generation, int) or not isinstance(observed, int):
@@ -469,10 +597,13 @@ def check_stale_conditions(obj: dict, now: datetime, threshold: timedelta) -> li
         if created is not None and since < created:
             since = created
         age = now - since
-        if age < threshold:
+        reason = cond.get("reason") or ""
+        if ctype == READY_CONDITION_TYPE and reason in IN_PROGRESS_READY_REASONS:
+            continue
+        wait = dependency_wait(reason, threshold) if ctype == READY_CONDITION_TYPE else threshold
+        if age < wait:
             continue
         where = f"{path} " if path else ""
-        reason = cond.get("reason") or ""
         detail = f"{where}{ctype}={cond.get('status')} {reason}".strip()
         findings.append(finding(obj, HEURISTIC_CONDITION, detail, age))
     return findings
@@ -606,15 +737,23 @@ def is_finished(obj: dict) -> bool:
     return isinstance(spec, dict) and spec.get(REPLICAS_SPEC_KEY) == 0
 
 
+def is_scaled_to_zero_row(row: dict) -> bool:
+    """The Gateway's own Programmed=False stale condition: not a listener's,
+    which carries a listeners[...] prefix."""
+    return row["heuristic"] == HEURISTIC_CONDITION and row["detail"].split(" ", 1)[0] == SCALED_TO_ZERO_DETAIL
+
+
 def analyze(
     objects: list[dict],
     events: list[dict],
     resolver: NameResolver,
     now: datetime,
     override_minutes: int | None = None,
+    scale: ScaleResolver | None = None,
 ) -> list[dict]:
-    """Apply every heuristic to every object; pure apart from the resolver."""
+    """Apply every heuristic to every object; pure apart from the resolvers."""
     events_by_object = index_events(events)
+    scale = scale or ScaleResolver()
     findings: list[dict] = []
     for obj in objects:
         kind = obj.get("kind", "")
@@ -622,12 +761,15 @@ def analyze(
             continue
         name = (obj.get("metadata") or {}).get("name", "")
         threshold = threshold_for(kind, override_minutes)
-        findings.extend(check_generation_lag(obj, now, threshold))
-        findings.extend(check_stale_conditions(obj, now, threshold))
-        findings.extend(
-            check_repeating_warnings(obj, events_by_object.get((kind, name), []), now, threshold)
-        )
-        findings.extend(check_dangling_references(obj, resolver, now, threshold))
+        found = [
+            *check_generation_lag(obj, now, threshold),
+            *check_stale_conditions(obj, now, threshold),
+            *check_repeating_warnings(obj, events_by_object.get((kind, name), []), now, threshold),
+            *check_dangling_references(obj, resolver, now, threshold),
+        ]
+        if kind == GATEWAY_KIND and any(is_scaled_to_zero_row(f) for f in found) and scale.proxy_at_zero(obj):
+            found = [f for f in found if not is_scaled_to_zero_row(f)]
+        findings.extend(found)
     findings.sort(key=lambda f: (-f["stalled_seconds"], f["object"], f["heuristic"]))
     return findings
 

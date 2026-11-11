@@ -1,11 +1,12 @@
 package lib
 
-// The submission subject (#3660, decided 2026-10-22): a new task for a
-// profile goes on a2a.tasks.{profile}.{tier}.{kind}.{taskId}.submit, while
-// its follow-ups and cancels stay on the five-token `…in`. The property the
-// split exists for is the routing one: a durable on a profile's submissions
-// never sees a follow-up, and nothing filtering the five-token subjects ever
-// sees a submission.
+// The submission subject (#3660, decided 2026-10-22, moved to its own stream
+// 2026-10-28): a new task for a profile goes on
+// a2a.submit.{profile}.{tier}.{kind}.{taskId}, on PROFILE_SUBMITS, while its
+// follow-ups and cancels stay on the five-token `…in` on TASKS. The property
+// the split exists for is the routing one: a durable on a profile's
+// submissions never sees a follow-up, and nothing on TASKS ever sees a
+// submission.
 
 import (
 	"errors"
@@ -18,7 +19,7 @@ import (
 
 func TestSubmitSubjectRoundTrips(t *testing.T) {
 	subject := TaskSubmitSubject("cluster-agent", "read", SubmitKindChild, "task-1")
-	if subject != "a2a.tasks.cluster-agent.read.child.task-1.submit" {
+	if subject != "a2a.submit.cluster-agent.read.child.task-1" {
 		t.Fatalf("TaskSubmitSubject = %q", subject)
 	}
 	profile, tier, kind, taskID, ok := ParseSubmitSubject(subject)
@@ -30,11 +31,11 @@ func TestSubmitSubjectRoundTrips(t *testing.T) {
 	}
 	for _, s := range []string{
 		TaskInSubject("cluster-agent", "task-1"),
-		"a2a.tasks.cluster-agent.read.other.task-1.submit", // not top or child
-		"a2a.tasks.cluster-agent.read.top.task-1.in",
-		"a2a.tasks.cluster-agent.read.top.submit",
-		"a2a.tasks.cluster-agent..top.task-1.submit",
-		"a2a.tasks.cluster-agent.read.top.task-1.extra.submit",
+		"a2a.submit.cluster-agent.read.other.task-1",     // not top or child
+		"a2a.tasks.cluster-agent.read.top.task-1.submit", // the old shape, on TASKS
+		"a2a.submit.cluster-agent.read.top",
+		"a2a.submit.cluster-agent..top.task-1",
+		"a2a.submit.cluster-agent.read.top.task-1.extra",
 	} {
 		if _, _, _, _, ok := ParseSubmitSubject(s); ok {
 			t.Errorf("ParseSubmitSubject accepted %q", s)
@@ -101,7 +102,7 @@ func TestSubmitSubjectAgreement(t *testing.T) {
 // The gateway's submission is delivered; another writer's is not.
 func TestASubmissionIsDeliveredOnlyFromTheSubmitter(t *testing.T) {
 	s := startServer(t)
-	provisionTasksStream(t, clientURL(s))
+	provisionProfileSubmitStream(t, clientURL(s))
 	ctx := testCtx(t)
 	pub, err := Connect(ctx, clientURL(s), WithName("publisher"))
 	if err != nil {
@@ -116,8 +117,8 @@ func TestASubmissionIsDeliveredOnlyFromTheSubmitter(t *testing.T) {
 	const profile = "cluster-agent"
 	got := make(chan string, 4)
 	sub, err := disp.SubscribeDurable(ctx, SubscribeConfig{
-		Stream: "TASKS", Durable: "dispatch-" + profile + "-read-top",
-		Subject: "a2a.tasks." + profile + ".read.top.*.submit", Session: profile,
+		Stream: ProfileSubmitStream, Durable: ProfileDurableName(profile, "read", SubmitKindTop),
+		Subject: ProfileDurableFilter(profile, "read", SubmitKindTop), Session: profile,
 	}, func(env *Envelope) { got <- env.TaskID })
 	if err != nil {
 		t.Fatalf("SubscribeDurable: %v", err)
@@ -150,7 +151,7 @@ func TestASubmissionIsDeliveredOnlyFromTheSubmitter(t *testing.T) {
 // source, as it does every task subject's.
 func TestPublishChecksASubmissionSubject(t *testing.T) {
 	s := startServer(t)
-	provisionTasksStream(t, clientURL(s))
+	provisionProfileSubmitStream(t, clientURL(s))
 	ctx := testCtx(t)
 	c, err := Connect(ctx, clientURL(s), WithName("gateway"))
 	if err != nil {
@@ -163,9 +164,9 @@ func TestPublishChecksASubmissionSubject(t *testing.T) {
 		t.Fatalf("publish of a well-formed submission: %v", err)
 	}
 	for subject, want := range map[string]string{
-		"a2a.tasks.cluster-agent.Read.top.task-2.submit":   "malformed submission subject",
-		"a2a.tasks.cluster-agent.r_d.top.task-2.submit":    "malformed submission subject",
-		"a2a.tasks.cluster-agent.read.other.task-2.submit": "want a2a.tasks.<profile>.<tier>.<top|child>.<taskId>.submit",
+		"a2a.submit.cluster-agent.Read.top.task-2":   "malformed submission subject",
+		"a2a.submit.cluster-agent.r_d.top.task-2":    "malformed submission subject",
+		"a2a.submit.cluster-agent.read.other.task-2": "want a2a.submit.<profile>.<tier>.<top|child>.<taskId>",
 	} {
 		var perr *ProtocolError
 		err := c.Publish(ctx, subject, submission(t, gateway, "task-2", "cluster-agent"))
@@ -181,11 +182,13 @@ func TestPublishChecksASubmissionSubject(t *testing.T) {
 }
 
 // The routing property: a durable on one (profile, tier, kind)'s submissions
-// takes only those, and a consumer on the profile's five-token `…in` subjects
-// takes the follow-up and never the submission.
+// takes only those, and the follow-up lands on TASKS, where a consumer on the
+// profile's five-token `…in` subjects takes it, while no submission is
+// stored on TASKS at all.
 func TestSubmissionsAndFollowUpsReachDifferentConsumers(t *testing.T) {
 	s := startServer(t)
 	provisionTasksStream(t, clientURL(s))
+	provisionProfileSubmitStream(t, clientURL(s))
 	ctx := testCtx(t)
 	c, err := Connect(ctx, clientURL(s), WithName("gateway"))
 	if err != nil {
@@ -206,9 +209,9 @@ func TestSubmissionsAndFollowUpsReachDifferentConsumers(t *testing.T) {
 		}
 	}
 	_, js := c.conn()
-	got := func(filter string) []string {
+	got := func(stream, filter string) []string {
 		t.Helper()
-		cons, err := js.OrderedConsumer(ctx, "TASKS", jetstream.OrderedConsumerConfig{FilterSubjects: []string{filter}})
+		cons, err := js.OrderedConsumer(ctx, stream, jetstream.OrderedConsumerConfig{FilterSubjects: []string{filter}})
 		if err != nil {
 			t.Fatalf("consumer on %s: %v", filter, err)
 		}
@@ -221,10 +224,13 @@ func TestSubmissionsAndFollowUpsReachDifferentConsumers(t *testing.T) {
 			subjects = append(subjects, msg.Subject())
 		}
 	}
-	if s := got("a2a.tasks." + profile + ".read.top.*.submit"); len(s) != 1 || s[0] != TaskSubmitSubject(profile, "read", SubmitKindTop, "task-1") {
+	if s := got(ProfileSubmitStream, ProfileDurableFilter(profile, "read", SubmitKindTop)); len(s) != 1 || s[0] != TaskSubmitSubject(profile, "read", SubmitKindTop, "task-1") {
 		t.Errorf("the (read, top) durable's filter took %v, want only task-1's submission", s)
 	}
-	if s := got("a2a.tasks." + profile + ".*.in"); len(s) != 1 || s[0] != TaskInSubject(profile, "task-1") {
+	if s := got(TasksStream, "a2a.tasks."+profile+".*.in"); len(s) != 1 || s[0] != TaskInSubject(profile, "task-1") {
 		t.Errorf("the profile's `…in` filter took %v, want only the follow-up", s)
+	}
+	if s := got(TasksStream, "a2a.tasks.>"); len(s) != 1 {
+		t.Errorf("TASKS holds %v, want only the follow-up and no submission", s)
 	}
 }

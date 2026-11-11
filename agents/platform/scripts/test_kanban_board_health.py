@@ -29,6 +29,22 @@ sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
 import kanban_board_health as kbh  # noqa: E402
 
+_EMPTY_VOLUME = None
+
+
+def setUpModule():
+    """Every test sees an empty data volume unless it patches its own, so none
+    depends on how full the machine running the suite is."""
+    global _EMPTY_VOLUME
+    block = 4096
+    _EMPTY_VOLUME = unittest.mock.patch.object(
+        kbh.os, "statvfs", lambda path: type("S", (), {"f_blocks": 1 << 20, "f_frsize": block, "f_bavail": 1 << 20})())
+    _EMPTY_VOLUME.start()
+
+
+def tearDownModule():
+    _EMPTY_VOLUME.stop()
+
 
 # The columns the two queries touch, with the types the real board uses. Not
 # the whole 37-column table on purpose: a fixture that mirrored the in-image
@@ -420,6 +436,48 @@ class StuckTasksTests(unittest.TestCase):
         tasks = {t["task_id"]: t["person"] for t in kbh.stuck_tasks(items, context)}
         self.assertEqual(tasks, {"a": True, "b": False, "c": False})
 
+    def test_a_re_checked_card_says_what_the_re_check_found(self):
+        """The row carries the re-check's result instead of a bare repeat (#5260)."""
+        now = 1_800_000_000
+        hour = 3600
+
+        def line(recheck):
+            context = {"a": {"title": "A", "kind": "transient", "recheck": recheck}}
+            tasks = kbh.stuck_tasks([("a", {"data": {"age_hours": 72}}, {})], context, now=now)
+            return kbh.stuck_rows(tasks)[1][0]["status"]
+
+        self.assertEqual(
+            line({"last_outcome": "still_blocked", "last_checked_at": now - 2 * hour, "check_after": now - 3 * hour, "expires_at": None}),
+            "Stopped 3 days ago before finishing. Re-checked 2 hours ago, still blocked.")
+        self.assertEqual(
+            line({"last_outcome": None, "last_checked_at": None, "check_after": now + 40 * 60, "expires_at": None}),
+            "Stopped 3 days ago before finishing. Retries automatically in 40 minutes.")
+        self.assertEqual(
+            line({"last_outcome": "expired", "last_checked_at": now - 25 * hour, "check_after": 1, "expires_at": 1}),
+            "Stopped 3 days ago before finishing. Re-checks ended 1 day ago, still blocked.")
+        self.assertEqual(
+            line({"last_outcome": "unknown", "last_checked_at": now - hour, "check_after": 1, "expires_at": None}),
+            "Stopped 3 days ago before finishing. Re-check 1 hour ago could not read the cluster.")
+        self.assertEqual(
+            line({"last_outcome": "retry_limit", "last_checked_at": now - 2 * hour, "check_after": 1, "expires_at": 1}),
+            "Stopped 3 days ago before finishing. Condition cleared 2 hours ago; already retried once, so it waits for someone.")
+        # Due but not yet run, and no record at all: the plain line.
+        self.assertEqual(line({"last_outcome": None, "last_checked_at": None, "check_after": now - 1, "expires_at": None}),
+                         "Stopped 3 days ago before finishing.")
+        self.assertEqual(line(None), "Stopped 3 days ago before finishing.")
+
+    def test_a_shared_row_carries_the_longest_waiting_card_s_re_check(self):
+        now = 1_800_000_000
+        context = {
+            "n": {"title": "Same", "kind": "transient",
+                  "recheck": {"last_outcome": "still_blocked", "last_checked_at": now - 3600, "check_after": 1, "expires_at": None}},
+            "o": {"title": "Same", "kind": "transient", "recheck": None},
+        }
+        items = [("n", {"data": {"age_hours": 30}}, {}), ("o", {"data": {"age_hours": 100}}, {})]
+        rows = kbh.stuck_rows(kbh.stuck_tasks(items, context, now=now))[1]
+        self.assertEqual(rows[0]["status"], "Stopped 4 days ago before finishing.")
+        self.assertEqual(rows[0]["tasks"], ["n", "o"])
+
     def test_the_board_title_wins_and_the_cli_title_is_the_fallback(self):
         items = [("t_1", {"data": {"age_hours": 30}}, {"title": "From the CLI"}),
                  ("t_2", {"data": {"age_hours": 30}}, {"title": "From the CLI"})]
@@ -661,7 +719,8 @@ class ReportTests(unittest.TestCase):
             tasks, lines = kbh.report(Path(d), runner=lambda argv, env, timeout: (0, STUCK_PAYLOAD, ""),
                                       binary="/x/hermes", env={})
         self.assertEqual(lines, [])
-        self.assertEqual(tasks, [{"task_id": "t_stuck", "title": "Triage x", "person": True, "age_hours": 456.2, "held": []}])
+        self.assertEqual(tasks, [{"task_id": "t_stuck", "title": "Triage x", "person": True, "age_hours": 456.2,
+                                  "held": [], "recheck": None}])
 
     def test_an_engine_that_did_not_answer_returns_no_stuck_tasks(self):
         with tempfile.TemporaryDirectory() as d:
@@ -845,6 +904,135 @@ class MainOutputContractTests(unittest.TestCase):
 
 
 
+def fake_statvfs(percent_used: int, total_gib: int = 10):
+    """An os.statvfs stand-in for a volume `percent_used` full."""
+    block = 4096
+    blocks = total_gib * (1 << 30) // block
+    free = blocks * (100 - percent_used) // 100
+    return lambda path: type("S", (), {"f_blocks": blocks, "f_frsize": block, "f_bavail": free})()
+
+
+class DataVolumeTests(unittest.TestCase):
+    """A full data volume is its own reason, ahead of what it causes."""
+
+    @staticmethod
+    def clean_runner(argv, env, timeout):
+        return 0, "[]", ""
+
+    def test_a_volume_past_the_warn_line_leads_another_finding(self):
+        with tempfile.TemporaryDirectory() as d:
+            make_board(Path(d), tasks=[{"id": "t_ghost", "status": "ready", "claim_lock": "host:9"}])
+            with unittest.mock.patch.object(kbh.os, "statvfs", fake_statvfs(95)):
+                _tasks, lines = kbh.report(Path(d), runner=self.clean_runner, binary="/x/hermes", env={})
+        self.assertEqual(lines[0],
+                         "The agent's data volume is 95% full (9.5 of 10.0 GiB). Remove unused cluster profiles,"
+                         " or ask an admin to raise spec.storage.size on the PlatformAgent.")
+        self.assertIn("Board invariant violations", "\n".join(lines[1:]))
+
+    def test_the_warn_line_is_inclusive(self):
+        """At or above the line, so a volume at exactly 90% is past it."""
+        with tempfile.TemporaryDirectory() as d:
+            make_board(Path(d), tasks=[{"id": "t_ghost", "status": "ready", "claim_lock": "host:9"}])
+            with unittest.mock.patch.object(kbh.os, "statvfs", fake_statvfs(90)):
+                _tasks, lines = kbh.report(Path(d), runner=self.clean_runner, binary="/x/hermes", env={})
+        self.assertTrue(lines[0].startswith("The agent's data volume is 90% full"), lines)
+
+    def test_a_full_volume_alone_says_nothing(self):
+        """The Session KV server's once-per-crossing warning is the alert; alone, the
+        line here would repeat it daily and cost a stuck-tasks report its card."""
+        with tempfile.TemporaryDirectory() as d:
+            make_board(Path(d), tasks=[{"id": "t", "status": "done"}])
+            with unittest.mock.patch.object(kbh.os, "statvfs", fake_statvfs(95)):
+                self.assertEqual(kbh.report(Path(d), runner=self.clean_runner, binary="/x/hermes", env={}), ([], []))
+        with tempfile.TemporaryDirectory() as d:
+            make_board(Path(d), tasks=[{"id": "t_stuck", "status": "blocked", "title": "Triage x", "block_kind": "needs_input"}])
+            with unittest.mock.patch.object(kbh.os, "statvfs", fake_statvfs(95)):
+                tasks, lines = kbh.report(Path(d), runner=lambda argv, env, timeout: (0, STUCK_PAYLOAD, ""),
+                                          binary="/x/hermes", env={})
+        self.assertEqual(lines, [], "a full volume beside stuck tasks alone would turn their card into text")
+        self.assertEqual(len(tasks), 1)
+
+    def test_a_volume_under_the_line_or_unreadable_adds_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            make_board(Path(d), tasks=[{"id": "t_ghost", "status": "ready", "claim_lock": "host:9"}])
+            for stat in (fake_statvfs(89), unittest.mock.Mock(side_effect=OSError("gone"))):
+                with unittest.mock.patch.object(kbh.os, "statvfs", stat):
+                    _tasks, lines = kbh.report(Path(d), runner=self.clean_runner, binary="/x/hermes", env={})
+                    self.assertTrue(lines and not lines[0].startswith("The agent's data volume"))
+
+    def test_a_disk_full_board_error_is_said_for_the_channel(self):
+        for message in ("disk I/O error", "database or disk is full"):
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as d:
+                def boom(home, **kwargs):
+                    raise sqlite3.OperationalError(message)
+                buffer = io.StringIO()
+                with unittest.mock.patch.object(kbh, "agent_home", return_value=Path(d)), \
+                        unittest.mock.patch.object(kbh, "report", boom), \
+                        unittest.mock.patch.object(kbh.os, "statvfs", fake_statvfs(100)), \
+                        contextlib.redirect_stdout(buffer):
+                    code = kbh.main(env={kbh.STATE_ENV: str(Path(d) / "state.json")})
+                self.assertEqual(code, 0)
+                out = buffer.getvalue().splitlines()
+                self.assertEqual(out[0], kbh.REPORT_HEADER)
+                self.assertEqual(out[1], f"The task board cannot be read or written because the agent's disk is full ({message}).")
+                self.assertIn("100% full", out[2])
+                self.assertNotIn("cannot read", buffer.getvalue())
+
+    def test_another_board_error_keeps_the_plain_line(self):
+        """Another error, or a disk I/O error while the volume is not full (it has
+        other causes), is said as before; past the warn line the volume line
+        follows it, as a fact and not as the cause."""
+        for message, percent in (("unable to open database file", 100), ("disk I/O error", 40), ("disk I/O error", 92)):
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as d:
+                def boom(home, **kwargs):
+                    raise sqlite3.OperationalError(message)
+                buffer = io.StringIO()
+                with unittest.mock.patch.object(kbh, "agent_home", return_value=Path(d)), \
+                        unittest.mock.patch.object(kbh, "report", boom), \
+                        unittest.mock.patch.object(kbh.os, "statvfs", fake_statvfs(percent)), \
+                        contextlib.redirect_stdout(buffer):
+                    kbh.main(env={kbh.STATE_ENV: str(Path(d) / "state.json")})
+                out = buffer.getvalue().splitlines()
+                self.assertIn("cannot read", out[0])
+                self.assertNotIn("disk is full", buffer.getvalue())
+                if percent >= kbh.DATA_VOLUME_WARN_PERCENT:
+                    self.assertEqual(len(out), 2, out)
+                    self.assertTrue(out[1].startswith(f"The agent's data volume is {percent}% full"), out)
+                else:
+                    self.assertEqual(len(out), 1, out)
+
+    def _main_output(self, message: str, percent: int) -> str:
+        with tempfile.TemporaryDirectory() as d:
+            def boom(home, **kwargs):
+                raise sqlite3.OperationalError(message)
+            buffer = io.StringIO()
+            with unittest.mock.patch.object(kbh, "agent_home", return_value=Path(d)), \
+                    unittest.mock.patch.object(kbh, "report", boom), \
+                    unittest.mock.patch.object(kbh.os, "statvfs", fake_statvfs(percent)), \
+                    contextlib.redirect_stdout(buffer):
+                kbh.main(env={kbh.STATE_ENV: str(Path(d) / "state.json")})
+            return buffer.getvalue()
+
+    def test_a_disk_io_error_is_a_full_disk_only_with_no_space_left(self):
+        """At 92% a "disk I/O error" is as likely a failing disk as a full one, and
+        raising spec.storage.size would not help; "database or disk is full" is space."""
+        self.assertIn("cannot read", self._main_output("disk I/O error", 92))
+        self.assertIn("disk is full (database or disk is full)", self._main_output("database or disk is full", 92))
+        self.assertIn("disk is full (disk I/O error)", self._main_output("disk I/O error", 100))
+
+    def test_the_volume_line_counts_against_the_report_budget(self):
+        """The line takes its share of the other findings' budget, so a report past
+        the warn line stays within max_chars."""
+        budget = 1200
+        with tempfile.TemporaryDirectory() as d:
+            make_board(Path(d), tasks=[{"id": f"t_{i:03d}", "status": "ready", "claim_lock": "ghost"} for i in range(40)])
+            with unittest.mock.patch.object(kbh.os, "statvfs", fake_statvfs(95)):
+                _tasks, lines = kbh.report(Path(d), runner=self.clean_runner, binary="/x/hermes", env={},
+                                           max_chars=budget)
+        self.assertTrue(lines[0].startswith("The agent's data volume is 95% full"))
+        self.assertLessEqual(len("\n".join(lines)) + kbh.REPORT_HEADER_RESERVE, budget)
+
+
 class DeliveryFailureTests(unittest.TestCase):
     """`main` against a real agent home, so it reads the scheduler's store as on the pod."""
 
@@ -953,6 +1141,119 @@ class BlockedContextTests(unittest.TestCase):
             finally:
                 conn.close()
         self.assertEqual(context["t_b"]["kind"], "dependency")
+
+    def test_the_re_check_record_is_read_when_the_board_has_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = make_board(
+                Path(tmp),
+                tasks=[{"id": "t_b", "status": "blocked", "block_kind": "transient"},
+                       {"id": "t_c", "status": "blocked", "block_kind": "needs_input"}],
+            )
+            conn = sqlite3.connect(db)
+            conn.executescript(
+                "CREATE TABLE kanban_block_rechecks (task_id TEXT PRIMARY KEY, block_event_id INTEGER, kind TEXT,"
+                " condition TEXT, check_after INTEGER, expires_at INTEGER, checks INTEGER, last_checked_at INTEGER,"
+                " last_outcome TEXT, last_detail TEXT, created_at INTEGER);"
+                "INSERT INTO kanban_block_rechecks VALUES ('t_b', 1, 'transient', '{\"kind\": \"time\"}', 500, 500, 1, 600,"
+                " 'still_blocked', 'not Available', 400);"
+                "INSERT INTO kanban_block_rechecks VALUES ('t_gone', 1, 'transient', '{}', 1, 1, 0, NULL, NULL, NULL, 1);")
+            conn.commit(); conn.close()
+            conn = kbh.read_only_connection(db)
+            try:
+                context = kbh.blocked_context(conn)
+            finally:
+                conn.close()
+        self.assertEqual(context["t_b"]["recheck"],
+                         {"check_after": 500, "last_checked_at": 600, "last_outcome": "still_blocked"})
+        self.assertNotIn("recheck", context["t_c"])
+        self.assertNotIn("t_gone", context)
+
+
+class BreakerParkedTests(unittest.TestCase):
+    """A card the circuit breaker parked has no `blocked` event, so the engine's
+    rule never lists it; the report does, from the board."""
+
+    NOW = 1_800_000_000
+
+    def board(self, tmp, events):
+        return make_board(
+            Path(tmp),
+            tasks=[{"id": "t_g", "status": "blocked", "title": "Triage x"}, {"id": "t_d", "status": "done"}],
+            events=events,
+        )
+
+    def parked(self, db):
+        conn = kbh.read_only_connection(db)
+        try:
+            return kbh.breaker_parked(conn, self.NOW)
+        finally:
+            conn.close()
+
+    def test_a_day_old_breaker_trip_is_a_stuck_card(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self.board(tmp, [{"task_id": "t_g", "kind": "gave_up", "payload": {"failures": 2},
+                                   "created_at": self.NOW - 30 * 3600}])
+            items = self.parked(db)
+        self.assertEqual([(tid, diag["data"]["age_hours"], entry["title"]) for tid, diag, entry in items],
+                         [("t_g", 30.0, "Triage x")])
+
+    def test_a_fresh_trip_or_an_unblock_since_leaves_it_out(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self.board(tmp, [{"task_id": "t_g", "kind": "gave_up", "created_at": self.NOW - 30 * 3600},
+                                  {"task_id": "t_g", "kind": "unblocked", "created_at": self.NOW - 3600}])
+            self.assertEqual(self.parked(db), [])
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self.board(tmp, [{"task_id": "t_g", "kind": "gave_up", "created_at": self.NOW - 3600}])
+            self.assertEqual(self.parked(db), [])
+
+    def test_the_comment_the_harness_writes_after_the_trip_does_not_hide_it(self):
+        """A failed turn's charge and the budget hand-off both comment on the card
+        right after `gave_up`; the card is no less parked for it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self.board(tmp, [{"task_id": "t_g", "kind": "gave_up", "created_at": self.NOW - 30 * 3600},
+                                  {"task_id": "t_g", "kind": "commented", "payload": {"author": "platform"},
+                                   "created_at": self.NOW - 30 * 3600}])
+            self.assertEqual([tid for tid, _d, _e in self.parked(db)], ["t_g"])
+
+    def test_a_breaker_trip_after_a_question_reads_stopped_not_paused(self):
+        """`block_kind` survives an unblock, so the card's row keys off its newest
+        block event, a `gave_up`, the way the re-check job resolves it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = make_board(
+                Path(tmp),
+                tasks=[{"id": "t_g", "status": "blocked", "title": "Triage x", "block_kind": "needs_input"}],
+                events=[{"task_id": "t_g", "kind": "blocked", "payload": {"kind": "needs_input"}, "created_at": 1},
+                        {"task_id": "t_g", "kind": "unblocked", "created_at": 2},
+                        {"task_id": "t_g", "kind": "gave_up", "payload": {"failures": 2}, "created_at": 3}],
+            )
+            conn = kbh.read_only_connection(db)
+            try:
+                context = kbh.blocked_context(conn)
+            finally:
+                conn.close()
+        self.assertEqual(context["t_g"]["kind"], "gave_up")
+        tasks = kbh.stuck_tasks([("t_g", {"data": {"age_hours": 30}}, {})], context, now=self.NOW)
+        self.assertFalse(tasks[0]["person"])
+
+    def test_the_report_adds_it_once_beside_the_engine_s_cards(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            make_board(
+                home,
+                tasks=[{"id": "t_g", "status": "blocked", "title": "Breaker"},
+                       {"id": "t_stuck", "status": "blocked", "title": "Engine", "block_kind": "needs_input"}],
+                events=[{"task_id": "t_g", "kind": "gave_up", "created_at": self.NOW - 48 * 3600},
+                        {"task_id": "t_stuck", "kind": "gave_up", "created_at": self.NOW - 48 * 3600},
+                        {"task_id": "t_stuck", "kind": "blocked", "payload": {"kind": "needs_input"},
+                         "created_at": self.NOW - 47 * 3600}],
+            )
+            tasks, lines = kbh.report(home, runner=lambda argv, env, timeout: (0, STUCK_PAYLOAD, ""),
+                                      binary="/bin/true", now=self.NOW)
+        self.assertEqual(lines, [])
+        self.assertEqual(sorted(t["task_id"] for t in tasks), ["t_g", "t_stuck"])
+        rows = kbh.stuck_rows(tasks)[1]
+        self.assertEqual([(r["title"], r["status"]) for r in rows if r["title"] == "Breaker"],
+                         [("Breaker", "Stopped 2 days ago before finishing.")])
 
     def test_an_unmigrated_board_yields_no_context_rather_than_raising(self):
         with tempfile.TemporaryDirectory() as tmp:

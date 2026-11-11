@@ -66,6 +66,9 @@ is today, as every record before the component existed is), exactly what
 it was before next-mode records existed; ``next`` holds the same per-case
 and per-domain blocks built from the next-mode records, or null when the
 store holds none (a mode this module does not know is in neither).
+The page draws next by default, today when its link asks (``mode=today``)
+or the store holds no next record; no job records today mode any more, so
+that series ends and leaves the window.
 Latency stays top-level: it is read from the main nightly's runs (tier
 ``nightly``), which grade next through the inject door, where the harness
 times the opening task from the door accepting it to its terminal. Nights
@@ -229,7 +232,7 @@ def night_id(record: dict, anchors: dict[str, str] | None = None) -> str:
     """One nightly job's records share its build; a record without one (a
     laptop run, a name outside the layout) stands alone under its stamp.
     ``anchors`` (nightly.night_builds) puts the builds of a night split
-    across jobs (main, main-b, writers) under the one build the report files
+    across jobs (the main shards and the writers thirds) under the one build the report files
     that night by, so the night is one night here too, and a domain's point
     that night pools the cases of all its parts."""
     build = record.get("build")
@@ -596,7 +599,8 @@ def trend_document(store: dict | None, data: dict) -> dict:
         "nights": nights,
         "cases": today["cases"],
         "domains": today["domains"],
-        "latency": latency_document(data if store else {}, nights, in_window),
+        # Dated by either series' nights: the page draws next by default.
+        "latency": latency_document(data if store else {}, nights + nxt["nights"], in_window),
         "next": nxt if nxt["records"] or nxt["cases"] else None,
     }
 

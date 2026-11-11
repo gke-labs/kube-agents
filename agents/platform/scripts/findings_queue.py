@@ -1337,6 +1337,7 @@ def pace(
     added_today: Mapping[str, int],
     may_add: bool = True,
     announced: Iterable[Iterable[str]] = (),
+    announced_ids: Iterable[str] | None = None,
 ) -> PacingPlan:
     """What a paced publisher names now, from the open rows in ranked order.
 
@@ -1356,7 +1357,12 @@ def pace(
     `announced` is the keys of the items already added today. One that is
     still new (every mark of it failed) is not added again, counts as an
     addition of its class, as if `added_today` held it, and holds additions
-    back as a pending item of its class would.
+    back as a pending item of its class would. `announced_ids` is the ids of
+    the members those additions named: an announced item counts as one of
+    these only while one of those ids is still among its new members, so a
+    row that joined the line later (a decision left it open) is an ordinary
+    new item. None (a record from before the ids were kept) matches on the
+    key alone.
     """
     now = (now if now.tzinfo else now.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
     items, managed = _gather(rows)
@@ -1365,8 +1371,15 @@ def pace(
     pending = [item for item in items if item.pending]
     new = [item for item in items if not item.pending]
     announced_keys = {tuple(key) for key in announced}
-    unrecorded = [item for item in new if item.key in announced_keys]
-    new = [item for item in new if item.key not in announced_keys]
+    named = None if announced_ids is None else {str(finding_id) for finding_id in announced_ids}
+
+    def was_announced(item: Item) -> bool:
+        if item.key not in announced_keys:
+            return False
+        return named is None or any(str(member.get("id")) in named for member in item.members)
+
+    unrecorded = [item for item in new if was_announced(item)]
+    new = [item for item in new if not was_announced(item)]
 
     def spent(item_class: str) -> int:
         return int(added_today.get(item_class) or 0) + sum(1 for item in unrecorded if item.item_class == item_class)

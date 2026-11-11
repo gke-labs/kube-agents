@@ -56,10 +56,10 @@ const (
 	slackStopNewerTurnReply = "No tasks were running yet. I'm still answering your latest question."
 )
 
-// isSlackStop reports a stop from the Slack Stop button rather than the word:
-// the Slack adapter sets IntentCancel only on agent_session_stopped.
+// isSlackStop reports a stop from the Slack Stop button rather than the word,
+// as stopGatedBackends describes Slack's press (stopgate.go).
 func isSlackStop(msg InboundMessage, backend string) bool {
-	return backend == slackBackend && msg.Intent == IntentCancel
+	return backend == slackBackend && isStopPress(msg, backend)
 }
 
 // slackStop is the Stop button's stop with the card stop armed and on its

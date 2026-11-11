@@ -16,6 +16,9 @@ the shell lifted out of hack/ci-eval-pr.sh):
   - the sweep's GitLab pass reads the pool's pair through gcloud, never argv,
     walks the GitLab mapping, writes its own report, and fails the run when a
     token is inside the warning window, naming it;
+  - every call is paced under gitlab.com's Free-plan burst limit, a 429 is
+    waited out and the project carries on, and a project with nothing to
+    close or delete is not read back (kube-agents#5215);
   - the eval script under EVAL_FORGE=gitlab reads the pair once, exports what
     the bench reads with the GitHub token unset, hands the agent token and
     `--forge gitlab` to the resets, and refuses a forge it does not know; its
@@ -57,6 +60,18 @@ import ci_sweep_agent_pulls as sweeper  # noqa: E402
 PATH = "gke-agentic/kube-agents-evals-2-infra"
 PROJECT = "kube-agents-evals-2"
 BOT = "kube-agents-eval-bot"
+
+# The module's pacer sleeps between calls for real; a spacing of 0 never
+# does. PacingTest installs a pacer of its own with a fake clock.
+_NO_PACING = mock.patch.object(gitlab, "pacer", gitlab.Pacer(0))
+
+
+def setUpModule():
+    _NO_PACING.start()
+
+
+def tearDownModule():
+    _NO_PACING.stop()
 PROJECT_ID = 144080700
 ENC = "gke-agentic%2Fkube-agents-evals-2-infra"
 
@@ -550,6 +565,18 @@ class LedgerProbeTest(unittest.TestCase):
         self.assertIn("reset: 1 probe ledger(s) did not close", err.getvalue())
 
 
+def _listings(fake):
+    """How many times each of the two listings was read."""
+    counts = {"merge_requests": 0, "branches": 0}
+    for method, path, _ in fake.calls:
+        bare = path.split("?")[0]
+        if method == "GET" and bare.endswith("/merge_requests"):
+            counts["merge_requests"] += 1
+        if method == "GET" and bare.endswith("/repository/branches"):
+            counts["branches"] += 1
+    return counts
+
+
 class MergeRequestResetTest(unittest.TestCase):
     def _reset(self, fake, dry_run=False):
         record = gitlab.empty_record()
@@ -584,6 +611,31 @@ class MergeRequestResetTest(unittest.TestCase):
         self.assertEqual(writes[1], ("PUT", "2", {"add_labels": "audit:stale-closed"}))
         self.assertEqual(writes[2], ("PUT", "2", {"state_event": "close"}))
         self.assertIn("!3 left open, not the agent's (human/work)", out)
+        # A write happened, so the read-back ran: both listings twice.
+        self.assertEqual(_listings(fake), {"merge_requests": 2, "branches": 2})
+
+    def test_a_project_with_nothing_to_close_or_delete_is_not_read_back(self):
+        # The sweep's common case across the pool: nothing of the bot's, so
+        # the second pair of listings would repeat the first for the same
+        # answer, and across 30+ free projects those repeats are what tripped
+        # gitlab.com's burst limit (kube-agents#5215).
+        fake = FakeGitLab(mrs=[mr(3, author="human", source="human/work")], branches=["main", "human/work"])
+        record, out, _, fake = self._reset(fake)
+        self.assertEqual([m for m, _, _ in fake.calls if m != "GET"], [])
+        self.assertEqual(_listings(fake), {"merge_requests": 1, "branches": 1})
+        self.assertEqual((record["open_after"], record["branches_after"], record["clean"]), (0, 0, True))
+        self.assertEqual((record["kept_open"], record["kept_branches"]), ([3], ["human/work"]))
+        self.assertRegex(record["finished_at"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+        self.assertIn("0 agent merge request(s) and 0 branch(es) remain", out)
+
+    def test_a_write_that_failed_is_still_read_back(self):
+        # Attempted is what counts, not succeeded: a refused close leaves the
+        # project in a state only a read-back can report.
+        fake = FakeGitLab(mrs=[mr(1)], branches=["main"], fail=(("PUT", "/merge_requests/1"),))
+        record, _, _, fake = self._reset(fake)
+        self.assertEqual((record["closed"], record["unclosed"]), ([], [1]))
+        self.assertEqual(_listings(fake), {"merge_requests": 2, "branches": 2})
+        self.assertEqual((record["open_after"], record["clean"]), (1, False))
 
     def test_the_bot_is_whoever_the_token_belongs_to(self):
         # A renamed or replaced bot account is followed, as the GitHub sweep
@@ -691,20 +743,29 @@ class RetryTest(unittest.TestCase):
         _, _, pauses = self._call([self._http(429, {"Retry-After": "9999"}), {}])
         self.assertEqual(pauses, [float(gitlab.RETRY_AFTER_MAX_SECONDS)])
 
-    def test_a_second_429_ends_the_run_as_rate_limited(self):
-        result, calls, pauses = self._call([self._http(429, {"Retry-After": "3"}), self._http(429, {"Retry-After": "3"})])
+    def test_a_429_is_waited_out_three_times_and_the_fourth_is_rate_limited(self):
+        # The sweep's failure in kube-agents#5215: a second 429 on one request
+        # ended the run. Now each is waited out and the call goes on.
+        self.assertEqual(gitlab.RATE_LIMIT_WAITS, 3)
+        result, calls, pauses = self._call([self._http(429, {"Retry-After": "3"})] * 3 + [{"ok": True}])
+        self.assertEqual((result, calls, pauses), ({"ok": True}, 4, [3.0, 3.0, 3.0]))
+        result, calls, pauses = self._call([self._http(429, {"Retry-After": "3"})] * 4)
         self.assertIsInstance(result, gitlab.RateLimited)
-        self.assertEqual((calls, pauses), (2, [3.0]))
-        # Whatever sits between the two, the last attempt included.
-        for answers in (
-            [self._http(503), self._http(429, {"Retry-After": "1"}), self._http(429, {"Retry-After": "1"})],
-            [self._http(429, {"Retry-After": "1"}), self._http(503), self._http(429, {"Retry-After": "1"})],
-            # A first 429 with no attempt left to wait for is the limit too.
-            [self._http(503), self._http(503), self._http(429, {"Retry-After": "1"})],
-        ):
-            with self.subTest(answers=[getattr(a, "code", a) for a in answers]):
-                result, _, _ = self._call(answers)
-                self.assertIsInstance(result, gitlab.RateLimited)
+        self.assertEqual((calls, pauses), (4, [3.0, 3.0, 3.0]))
+        self.assertIn("HTTP 429 on /x 4 times over", str(result))
+
+    def test_a_429_costs_none_of_the_transient_attempts(self):
+        # The two counts are separate: a 429 between two 5xx neither ends the
+        # call nor spends a 5xx attempt, and a 429 after the last 5xx attempt
+        # is still waited out.
+        result, calls, pauses = self._call([self._http(503), self._http(429, {"Retry-After": "1"}), self._http(503), self._http(429, {"Retry-After": "1"}), {"ok": True}])
+        self.assertEqual((result, calls, pauses), ({"ok": True}, 5, [2, 1.0, 8, 1.0]))
+        result, calls, pauses = self._call([self._http(503), self._http(503), self._http(429, {"Retry-After": "1"}), {"ok": True}])
+        self.assertEqual((result, calls, pauses), ({"ok": True}, 4, [2, 8, 1.0]))
+        # And a 5xx after the waits does not inherit them: the third 5xx raises as before.
+        result, calls, _ = self._call([self._http(429, {"Retry-After": "1"}), self._http(503), self._http(503), self._http(503)])
+        self.assertIsInstance(result, urllib.error.HTTPError)
+        self.assertEqual((result.code, calls), (503, 4))
 
     def test_a_write_loop_lets_rate_limited_through(self):
         fake = FakeGitLab(mrs=[mr(1), mr(2)], branches=["main"])
@@ -731,6 +792,69 @@ class RetryTest(unittest.TestCase):
 
     def test_the_record_timestamp_format_is_the_github_resets(self):
         self.assertEqual(gitlab.ISO_UTC_FORMAT, pulls.ISO_UTC_FORMAT)
+
+
+class _FakeClock:
+    """A monotonic clock that only moves when something sleeps on it, or the test says."""
+
+    def __init__(self):
+        self.now = 1000.0
+        self.slept = []
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.slept.append(round(seconds, 6))
+        self.now += seconds
+
+
+class PacingTest(unittest.TestCase):
+    """Every call starts REQUEST_SPACING_SECONDS after the previous one, which
+    holds one process under gitlab.com's 100-a-minute Free-plan burst limit
+    (kube-agents#5215)."""
+
+    def test_the_spacing_stays_under_the_burst_limit(self):
+        # 60 s / 100 requests = 0.6 s is the floor; the margin is for the
+        # agent and the eval lane, which share the bot's allowance.
+        self.assertGreaterEqual(gitlab.REQUEST_SPACING_SECONDS, 0.6)
+        self.assertLess(60 / gitlab.REQUEST_SPACING_SECONDS, 100)
+
+    def test_back_to_back_calls_are_spaced_and_a_late_one_is_not_held(self):
+        clock = _FakeClock()
+        api = mock.Mock(return_value={})
+        with mock.patch.object(gitlab, "pacer", gitlab.Pacer(0.7, clock=clock, sleep=clock.sleep)), mock.patch.object(gitlab, "api", api):
+            gitlab.call("GET", "/a", "tok")  # the first call waits for nothing
+            gitlab.call("GET", "/b", "tok")
+            clock.now += 0.2
+            gitlab.call("GET", "/c", "tok")  # 0.2 s after /b started: held the other 0.5
+            clock.now += 5
+            gitlab.call("GET", "/d", "tok")  # well after /c: not held
+        self.assertEqual(clock.slept, [0.7, 0.5])
+        self.assertEqual(api.call_count, 4)
+
+    def test_a_retry_is_paced_too(self):
+        clock = _FakeClock()
+        api = mock.Mock(side_effect=[urllib.error.HTTPError("/x", 503, "x", {}, io.BytesIO(b"")), {}])
+        pauses = []
+        with mock.patch.object(gitlab, "pacer", gitlab.Pacer(0.7, clock=clock, sleep=clock.sleep)), mock.patch.object(gitlab, "api", api), \
+                mock.patch.object(gitlab, "pause", pauses.append), redirect_stderr(io.StringIO()):
+            gitlab.call("GET", "/x", "tok")
+        # The retry wait is the pause seam's (and does not move this clock), so
+        # the second attempt is held the full spacing by the pacer.
+        self.assertEqual((pauses, clock.slept), ([2], [0.7]))
+
+    def test_the_pacer_is_one_per_process_and_every_call_goes_through_it(self):
+        # One user's allowance, so one pacer: the listings, the token lookup
+        # and the user lookup all start through the same instance.
+        self.assertIsInstance(gitlab.pacer, gitlab.Pacer)
+        clock = _FakeClock()
+        fake = FakeGitLab(mrs=[], branches=["main"])
+        with mock.patch.object(gitlab, "pacer", gitlab.Pacer(0.7, clock=clock, sleep=clock.sleep)), mock.patch.object(gitlab, "api", fake), redirect_stdout(io.StringIO()):
+            gitlab.reset_merge_requests(PATH, PROJECT, "b", "s", "tok", False, gitlab.empty_record())
+            gitlab.token_expiry("tok", today=datetime.date(2026, 10, 6))
+        self.assertEqual(len(clock.slept), len(fake.calls) - 1)
+        self.assertTrue(all(s == 0.7 for s in clock.slept))
 
 
 class TokenExpiryTest(unittest.TestCase):
@@ -1099,11 +1223,33 @@ class SweepGitLabPassTest(unittest.TestCase):
             self.assertEqual(sweeper.default_report_path("gitlab"), "/a/pull-sweep-gitlab.json")
             self.assertEqual(sweeper.default_report_path(), "/a/pull-sweep.json")
 
-    def test_a_rate_limited_project_ends_the_run_like_the_github_pass(self):
+    def test_a_429_is_waited_out_and_the_project_is_swept(self):
+        # kube-agents#5215: the burst limit's 429 is a wait, not the end of
+        # the GitLab run; the project's sweep finishes and the walk goes on.
+        # Two in a row on one listing: what the old rule turned into
+        # RateLimited and the sweep into a skipped rest of the pool.
+        fake = FakeGitLab(mrs=[mr(1)], branches=["main", "platform-agent/fix"])
+        original = fake.__call__
+        refused = []
+
+        def limited_twice(method, path, token, body=None, host=gitlab.DEFAULT_HOST):
+            if path.split("?")[0].endswith("/merge_requests") and len(refused) < 2:
+                refused.append(path)
+                raise urllib.error.HTTPError(path, 429, "x", {"Retry-After": "7"}, io.BytesIO(b""))
+            return original(method, path, token, body, host)
+
+        pauses = []
+        with mock.patch.object(gitlab, "api", limited_twice), mock.patch.object(gitlab, "pause", pauses.append), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            self.assertEqual(sweeper.sweep_gitlab_project(PROJECT, PATH, "tok"), 1)
+        self.assertEqual(pauses[:2], [7.0, 7.0])
+        self.assertEqual(fake.mrs[0]["state"], "closed")
+
+    def test_a_429_that_outlasts_the_waits_ends_the_run_like_the_github_pass(self):
         limited = mock.Mock(side_effect=urllib.error.HTTPError("/x", 429, "x", {"Retry-After": "1"}, io.BytesIO(b"")))
         with mock.patch.object(gitlab, "api", limited), mock.patch.object(gitlab, "pause", lambda s: None), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             with self.assertRaises(sweeper.RateLimited):
                 sweeper.sweep_gitlab_project(PROJECT, PATH, "tok")
+        self.assertEqual(limited.call_count, gitlab.RATE_LIMIT_WAITS + 1)
 
     def test_a_termination_names_a_due_token_too(self):
         due = {"name": "pool-agent", "secret": "kube-agents-prow/gitlab-agent-token", "expires_at": "2026-11-01", "days_left": 26, "active": True, "warn": True, "urgent": False, "scopes": ["api"]}
@@ -1387,6 +1533,9 @@ class EvalScriptGitLabTest(unittest.TestCase):
                 lifted_forge_setup(),
                 f'PROJECT_ID="{PROJECT}"; BUILD_ID=1; EVAL_LEDGER_APP_KEY_FILE=""; EVAL_LEDGER_APP_ID=1',
                 f'ARTIFACT_DIR="{self.dir}/artifacts"; AGENT_PULLS_RESET_PERMISSIONS=\'{{}}\'',
+                # The ledger reset's helper lines quote ledger titles, so they go
+                # to the grading artifact, never to the job log.
+                f'EVAL_GRADING_LOG="{self.dir}/eval-grading.log"',
                 'EVAL_GITLAB_AGENT_TOKEN=""',
                 lifted("gitlab_token_source"),
                 lifted("read_gitlab_token"),
@@ -1525,15 +1674,18 @@ class EvalScriptGitLabTest(unittest.TestCase):
         )
         proc = self._run(body)
         out = proc.stdout
-        self.assertIn(f'HELPER argv=["--repo", "{PATH}", "--project", "{PROJECT}", "--build", "1", "--forge", "gitlab", "--host", "gitlab.com"]', out)
-        self.assertIn(f'HELPER argv=["--repo", "{PATH}", "--project", "{PROJECT}", "--build", "1", "--forge", "gitlab", "--host", "gitlab.com", "--audit", "compliance-audit"]', out)
+        ledger = (self.dir / "eval-grading.log").read_text()
+        self.assertIn(f'HELPER argv=["--repo", "{PATH}", "--project", "{PROJECT}", "--build", "1", "--forge", "gitlab", "--host", "gitlab.com"]', ledger)
+        self.assertIn(f'HELPER argv=["--repo", "{PATH}", "--project", "{PROJECT}", "--build", "1", "--forge", "gitlab", "--host", "gitlab.com", "--audit", "compliance-audit"]', ledger)
+        self.assertNotIn("Ledger reset", out, "the ledger helper's lines stay out of the job log")
         record = f"{self.dir}/artifacts/agent-pulls-reset/lease.json"
         self.assertIn(
             f'HELPER argv=["--repo", "{PATH}", "--project", "{PROJECT}", "--build", "1", "--scope", "lease", "--record", "{record}", "--forge", "gitlab", "--host", "gitlab.com"]',
             out,
         )
         self.assertIn("HELPER token=glpat-agent", out)
-        self.assertNotIn("glpat-ledger", out.replace("LEDGER=glpat-ledger", ""))
+        self.assertIn("HELPER token=glpat-agent", ledger)
+        self.assertNotIn("glpat-ledger", (out + ledger).replace("LEDGER=glpat-ledger", ""))
         self.assertIn("PULLS_RC=0", out)
 
     def test_the_resets_run_on_a_per_run_gitlab_without_the_app_key(self):
@@ -1555,11 +1707,13 @@ class EvalScriptGitLabTest(unittest.TestCase):
         )
         proc = self._run(body)
         out = proc.stdout
+        ledger = (self.dir / "eval-grading.log").read_text()
         self.assertNotIn("EVAL_LEDGER_APP_KEY_FILE is unset", out)
         per_run = f"gke-agentic/{PROJECT}-infra"
-        self.assertIn(f'HELPER argv=["--repo", "{per_run}", "--project", "{PROJECT}", "--build", "1", "--forge", "gitlab", "--host", "gitlab.eval.internal", "--ca-file", "{state}/ca.crt"]', out)
+        self.assertIn(f'HELPER argv=["--repo", "{per_run}", "--project", "{PROJECT}", "--build", "1", "--forge", "gitlab", "--host", "gitlab.eval.internal", "--ca-file", "{state}/ca.crt"]', ledger)
         self.assertIn("HELPER token=glpat-perrun-agent", out)
-        self.assertEqual(out.count("HELPER argv="), 2)
+        self.assertEqual(out.count("HELPER argv="), 1, "the agent-pulls reset's line")
+        self.assertEqual(ledger.count("HELPER argv="), 1, "the ledger reset's line")
         self.assertIn("PULLS_RC=0", out)
 
     def test_the_forge_switch_refuses_an_unknown_forge(self):

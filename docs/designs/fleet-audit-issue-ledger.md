@@ -42,11 +42,33 @@ Two tiers. The issue is the only always-on object.
 
 ### Tier 1 — the ledger issue
 
-One open GitHub issue per audit stream, rewritten in place on every run.
+One open GitHub issue per audit stream per install, rewritten in place on every run.
 
 - Title, body, labels, and every timestamp are generated. The agent never hand-writes them.
+- The ledger is scoped to the install that writes it. `ledger_scope()` derives the scope from the
+  host cluster the operator declares on the pods (`GKE_PROJECT_ID`, `GKE_LOCATION`,
+  `GKE_CLUSTER_NAME`, which `spec.harness` sets), or from `FLEET_AUDIT_LEDGER_SCOPE` when that is
+  in the shell pod's own environment (no operator setting reaches the pod with it today; it is for
+  a test or a hand-driven run there, where it stands in for a second install); an install with
+  neither has no scope and keeps the unscoped ledger. A scope is a label,
+  `audit-scope:<name slug>-<8 hex of the identity's SHA-256>`, under GitHub's 50-character label
+  limit, and a name, the cluster's (or the variable's whole value), which the title carries in
+  parentheses after the stream's name. Two installs that audit different fleets into one repository
+  therefore keep one ledger per stream each, where before they rewrote one ledger in turn and a
+  clean run over one fleet closed a ledger that carried the other fleet's findings. A relative age in
+  a finding's free text ("completed 166 days ago") is dated to the run that published it ("as of
+  2026-11-06"), once, by `finish` and by `remediate` alike, since a finding's wording is carried
+  between runs and the body is rewritten only by a run with findings. Text inside a code span or a
+  fence, read as CommonMark pairs backtick runs, and the evidence are left as written: a command is
+  reproduced, not read, and the carry of unchanged wording compares the evidence byte for byte
+  between runs.
 - The harness finds the ledger with one list of the open issues that carry the `audit:<audit-id>`
-  label. When the list has more than one issue, the highest number is the ledger. An empty list is
+  label and, on a scoped install, the scope label. When that list is empty on a scoped install, a
+  second list on the stream label alone finds the ledger from before scopes: an open issue with no
+  `audit-scope:` label at all, which the install adopts by adding its scope label, so an upgrade
+  does not open a second ledger. An open issue carrying another install's scope label is that
+  install's and is never read, rewritten or closed. When the list has more than one issue, the
+  highest number is the ledger. An empty list is
   not always "no ledger": GitHub's label-filtered list can omit an open, labelled issue for a short
   time, usually just after a label write. `start`, `finish` and `remediate` look up the ledger, and
   each one ensures the labels just before the lookup. The forge writes a label only when its colour
@@ -83,7 +105,21 @@ One open GitHub issue per audit stream, rewritten in place on every run.
   `resolved_because` (#1683) — or, on a run that passed `--manifest-file`, whose candidate the
   collector still emits and the document has not moved under `declared`
   ([collector design §3.3](fleet-audit-collector-manifest.md)). `start` hands the worker the
-  carried findings so it can. After the close, the run changes the title to `0 findings` and puts a
+  carried findings so it can. A previous finding on a cluster the run lists in neither
+  `scope.clusters` nor `scope.skipped` holds nothing: the run's fleet listing has no such cluster,
+  which is a cluster deleted since the finding was filed, and a ledger held open for it would never
+  close (`bench/tasks/fleet-audit-clean-close-reads-clean`). The close retires it, but the
+  all-clear names it under "Not confirmed fixed" by cluster and id, `resolved` leaves it out (on
+  the JSON line, in the stored envelope, on the since-last-scheduled line and in the whole-run
+  count), the JSON line lists it under `retired_unlisted`, and the run is never silent over one.
+  The lead of that all-clear and the banner `close_ledger_reads_clean` puts at the top of the
+  closed ledger say the same: with a retired finding, neither claims that every finding is gone
+  or that all of them are resolved; both count the retired ones as not confirmed fixed, and the
+  banner names their ids, or counts them alone when the names would push the body past the
+  forge's limit.
+  The store ledger applies the same rule; the no-forge record keeps ids with no places, so a run
+  with no repository cannot tell such a finding apart and counts it resolved as before. After the
+  close, the run changes the title to `0 findings` and puts a
   banner above the old body, so the closed issue does not show its findings as open. After and not
   before: if the close fails, an open ledger must not show an all-clear. The old
   body stays below the banner as the record. A later run with findings opens a new ledger, because
@@ -159,7 +195,26 @@ collide), based on `main`, linked to the ledger issue with `Part of #<issue>`.
 - Body carries only that finding (or one section per member for a group): evidence, impact, the
   recommendation, `## Files`, and the trailing `<!-- audit-findings -->` delta block plus
   `<!-- audit-id-scheme -->` stamp.
-- Labels: `agent:audit`, `audit:<audit-id>`, `audit:remediation`, `severity:<highest>`.
+- Labels: `agent:audit`, `audit:<audit-id>`, `audit:remediation`, `severity:<highest>`, and on a
+  scoped install `audit-scope:<slug>` (§8); the listing drops another install's pull requests, and
+  the open-proposal lookup on a branch adopts none of theirs. Two installs that stage the same
+  path would share a branch name, so when another install's open pull request holds the primary
+  name (`foreign_proposal_on`), a scoped install lands its fix on the primary name plus its scope
+  digest (`scoped_group_branch_for`), and the mapping from a group to its pull request reads the
+  primary name first and the scoped name second. The primary name stays for every install with no
+  such neighbour and for every pull request open today, so nothing is renamed on upgrade. A pull
+  request with no scope label is from before scopes, and the listing keeps it, since the install
+  that opened it cannot be read off it. The stale close on a scoped install therefore leaves an
+  unlabelled open pull request alone when none of the ids it covers was on this install's ledger
+  (the last body's hidden block, the stored document behind it, and the complete block of a body
+  that cut findings for space, handed to the stale close as its `previous_ids`), is current, or
+  is shielded by a namespace this install declared: in the mixed-version window of an upgrade,
+  every install that shares the repository reads such a pull request as its own, and closing it as
+  stale or as "no longer reproduces" would retire another install's fix over a fleet this run never
+  read. The run logs the pull request it leaves. This install's own pre-scope fix whose ids the
+  shared ledger happened not to carry is left open the same way, for a person to close. A forge
+  with no labels skips nothing: no pull request there carries a scope label, and the listing already
+  proved each one this install's.
 
 ## 3. Decisions
 
@@ -434,7 +489,8 @@ Three of the rendered rows are easy to misread, and two of them were wrong in an
   morning forever.
 
 `pr-merged-persists` is the state the current design cannot express and is a primary reason for the
-change. It must be visually distinct in the ledger.
+change. It must be visually distinct in the ledger. Its row and its comment give the cause when the
+collector saw it: Config Connector not applying the declaration (§6, `finish`).
 
 The two "once" obligations in the last column — the comment on a merged PR and the reply to a
 refused command — are enforced by the hidden `audit-persists` / `audit-refused` markers of §3.1,
@@ -460,7 +516,9 @@ practice groups are almost always singletons.
 
 ## 6. Script surface
 
-`agents/platform/skills/fleet-audit/scripts/audit_report.py` — three subcommands.
+`agents/platform/skills/fleet-audit/scripts/audit_report.py` — the subcommands below, plus
+`draft`, the content-mode reads and `precheck`; `precheck` and the `precheck` key it adds to the
+`finish` line are in [`fleet-audit-collector-manifest.md`](fleet-audit-collector-manifest.md) §3.7.
 
 ### `start --audit <id>`
 
@@ -490,8 +548,10 @@ writable entry by the shared parser; a key no write path reads is read-only by c
 minter policy does read it, for a `contents: read` grant the broker's own clone presents).
 The document may carry a `declared` list beside `findings` — a finding's four identity fields plus
 the `repo`, `path` and `excerpt` of the declaration — validated for scope, a non-overlapping
-identity, and a `check` in the stream's `declarable` set (its posture checks, held in `AUDITS`
-beside the roster; a fault check or a stream with no declared-intent step is rejected), and never
+identity, a `check` in the stream's `declarable` set (its posture checks, held in `AUDITS`
+beside the roster; a fault check or a stream with no declared-intent step is rejected), and an
+`object` of a kind the check files where the check fixes one (`DECLARABLE_OBJECT_KINDS`: the cost
+checks' kinds and `NodePool/` for the stockout pool check), and never
 given an id, so it enters no delta and no pull request. The obtainability SOP (§4a) is the pilot;
 the schema and the ledger section it renders to are stated in the skill file, and `finish` reports
 the list's length as `declared`.
@@ -511,7 +571,7 @@ declarable check and the list does not cover every slug in the record — or the
 record — every finding whose check is declarable is withheld and the run goes partial (§7.4).
 `remediate` applies the same withhold and refuses a withheld id by name. The sha comes from the
 reads: `list`, `grep` and `fetch` print the broker's tree sha, and in content mode
-`inspect_repository.py clone` and `open` print it for a context copy (#1477).
+`inspect_repository.py clone` prints it for a context copy (#1477).
 
 `start` also performs the search itself: it reads each repository in that set for `declares:`
 frontmatter within the paths its `.kube-agents/intent.yaml` names — in content mode copying the
@@ -521,7 +581,19 @@ completely (every note under the searched paths arrived and was read) under `sea
 record, and `finish` unions that list into the document and moves each covered finding to
 `declared` before the withhold (#1576, #1577). The join moves `hpa-cannot-scale` only at the
 severity the SOP fixes for its `min == max` shape; the dangling-target fault shares the slug and
-stays a finding.
+stays a finding. It moves `netpol-missing` only on a `Namespace/` object, and `single-zone-nodepool`
+only when the collector's excerpt opens with `single-zone (` and carries no `at its autoscaling
+ceiling:` clause — the one rule read off the excerpt rather than the identity or the severity,
+because the two arms of that check share both; the prefixes are the collector's own constants,
+pinned by a test. An item may carry `expires`, an ISO 8601 date (`YYYY-MM-DD`, UTC) that is the
+last day it stands: `start` files the date and `finish` holds it to the day the run started, from
+`start`'s record, whatever day the join or a later `remediate` happens to run on, so a lapsed item
+moves nothing, declares no collector candidate and shields no sibling, and the finding
+it covered publishes with a _Declared intent expired_ line naming the note and the date — the
+renewal is an edit to the note, never one the harness makes. A standing item for the same posture
+wins over a lapsed one. The Declared intent row of an item with a date says what day it stands
+until, and a hand-written `declared[].declaration.expires` is held to the format always and to the
+same run-start day by `finish`, so one run gives a date one answer whichever route filed it.
 
 `workspace` is the clone, and it is not decoration. The audit cron starts in the agent's profile
 directory, which is not a working tree — so there is nothing to `git add` into and nothing for
@@ -687,6 +759,9 @@ Exit contract — the keys below on every line:
 - `{"status":"CLEAN","issue_url":"…","new":0,"resolved":5,"prs_opened":[],"prs_still_open":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":[],"publish_s":41.2}`
 - `{"status":"CLEAN","issue_url":"…","new":0,"resolved":0,"prs_opened":[],"prs_still_open":[],"prs_closed":[],"partial":true,"coverage_gaps":["prod-eu-1: API server unreachable"],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":[],"publish_s":41.2}`
 - `{"status":"HELD","issue_url":"…","new":0,"resolved":0,"prs_opened":[],"prs_still_open":[],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":["cluster-admin-binding.prod-us-east._.clusterrolebinding-debug-binding"],"publish_s":41.2}`
+- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":1,"prs_opened":[],"prs_still_open":[],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[],"unaccounted":[],"retired_unlisted":["model-image-floating-tag.retired-east.models.deployment-server"],"publish_s":41.2}`
+  — `retired_unlisted` (only when not empty): the previous findings the close retired unread, on a
+  cluster this run listed nowhere (§2).
 - `{"status":"UPDATED","issue_url":"…","new":0,"resolved":0,"prs_opened":[],"prs_still_open":[],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":true,"declared":0,"postures_withheld":[],"unaccounted":[],"publish_s":41.2}`
 
 `postures_withheld` is the ids of the posture findings `finish` took out of the document because it
@@ -794,6 +869,143 @@ remediation's `uncut_note`, and the carry of an unchanged finding puts that note
 does not stay on a later run that has room. The dry run can leave out notes the real run adds, because it reads no
 pull request and no `--decline-fix`, and so skips every fix the refusal would list.
 
+In the same place, `finish` adds a note to each fix whose finding's own object Config Connector
+does not apply, whatever the fix's kind. A merged fix of that kind changes nothing on the cloud resource: on
+2026-09-05 one `PubSubTopic` failed with `UpdateFailed` on an IAM role and put fifteen
+`ContainerCluster`s into `DependencyNotReady`, and every manifest fix against them would have merged
+into a controller that applied nothing.
+
+`finish` reads no cluster. The collectors record, on each cluster entry, the Config Connector objects
+whose `Ready` condition is `False`
+([`fleet-audit-collector-manifest.md`](fleet-audit-collector-manifest.md) §2, `kcc_unready`). They
+leave out the transient reasons `Updating` and `Deleting`, which Config Connector sets while it
+still applies the object. `finish` parses the fix's file as the Config Connector index parses a
+clone, and matches each object it declares on kind, `metadata.name`, `metadata.namespace` when the
+file sets one, and `clusterRef` when the file object and the recorded object both set one. A known
+`location` on the recorded object (its `spec.location`) must equal the file's `spec.location` or,
+for a cluster or a node pool, the location of the finding's cluster.
+
+Only the finding's own object in the file counts, also when the file declares one Config Connector
+object: for `NodePool/<n>`, the `ContainerNodePool` `<n>` on the finding's cluster; for
+`Cluster/<n>`, the `ContainerCluster` `<n>`; for `<Kind>/<n>` of a Config Connector kind, the object
+of that kind and that name. This last rule applies only to a `kcc-object-wedged` finding, which is
+about a Config Connector object, and only to an object on the finding's cluster, in the fix's file
+and outside it. A finding of another kind (a `Deployment`, a `HorizontalPodAutoscaler`)
+has no Config Connector object of its own, even when the file declares one of the same name: a
+`Deployment` fix in a file that also declares an `IAMServiceAccount` did not change that account, so
+a stall of the account gives it no note. A file with no object of the finding gives no in-file
+match; the own-object rule below still applies, as for a fix of any other kind, and then the fix gets
+the paragraph that names the object's declaration.
+
+A match that is not certain gives no note. Two cases are by name: the same object is not ready on
+more than one host cluster and nothing tells them apart (Config Controller puts the objects of each
+instance in `config-control`), or the file sets no namespace and more than one object fits. The
+other cases are by project. The collector records the project each object manages as `project`: the
+object's `cnrm.cloud.google.com/project-id` annotation. Without it, a kind with `spec.projectRef`
+takes `projectRef.external` (with no `projects/` prefix), or the `spec.resourceID` (else the name) of
+the `Project` object that `projectRef.name` names when the read listed it; otherwise the project is
+unknown, and `project_ref` names that object. Any other kind takes the annotation on its namespace,
+else the namespace's name. A
+known `project` must equal the project the file gives (the object's annotation, else the annotation
+of its Namespace when the file declares that Namespace), also with one host, because one management
+cluster can hold an object of the same name for each project. When the file gives none, a `Cluster/`
+or `NodePool/` finding uses its own project, because it is about the managed cluster; a finding of
+another Config Connector kind is on the cluster that runs Config Connector, so its project stays
+unknown.
+
+A ready object is not in the list, so with more than one possible host the same name can be ready
+on one host and not ready on another. Then the `project` must also be known, for a `Cluster/` or
+`NodePool/` finding. A `kcc-object-wedged` finding's object is on the finding's own cluster, so the
+number of hosts does not apply to it. In the fix's file, a known `project` that differs from the
+file's still blocks the match. Outside it, the files that declare the object in the stall's
+namespace, the fix's file included, are the evidence: when each of them gives a known project or
+location that differs from the stall's, the match is not certain. A possible host is an
+entry that carries `kcc_unready` (also empty) or `kcc_unread`, or, when any entry carries either key,
+a cluster entry the collector never read (`unreachable` or `gate-failed`), or a project whose
+cluster list failed (a `gate-failed` `project/<id>` entry). An entry
+whose `cluster_status` says the cluster is not running is not a host: it cannot run the
+controllers. A `Cluster/` or `NodePool/` finding's own object with no recorded project does not
+match when the manifest holds a cluster of the same name in another project. The own object must
+also be in a namespace the file sets, when it sets one, and in the finding's cluster location when
+its location is known, so a `default-pool` of another cluster of the same name does not match.
+
+The note is the last paragraph of the remediation note, starts "**Config Connector is not applying
+this file.**", and names each matched object and the controller's reason in code spans. When the
+reason is `DependencyNotReady` and the referenced object is not ready on the same host cluster, it
+follows the chain and names only the deepest unready object, the root cause, with a count of the
+ones between. When the host's read did not list the referenced object's kind (the drift, patch
+readiness and stockout collectors read only `ContainerCluster` and `ContainerNodePool`), the note
+names that object and says that its state was not read. It names at most two objects in the file and
+counts the rest.
+
+A `manifest` fix whose file declares the object gets the paragraph above. Any other fix (`manual`,
+`gcloud`, a fix degraded to `manual` because the worker did not write its file, or a `manifest` fix
+to another file) gets a paragraph that names the object's declaration. `finish` looks it up in the
+Config Connector declaration index the `gcloud` check reads: the clone, or in content mode
+`kcc_declarations_via_broker` over the probe's snapshot of the repository, with its own read of the
+files that name any Config Connector group (`every_kind`), so every kind is indexed. Both read
+`.yaml`, `.yml` and `.json` files. `finish` and `remediate` build this index the same way
+(`kcc_paragraph_index`), and only when a finding needs it (`kcc_index_needed`): a
+`Cluster/` or `NodePool/` finding whose own object matches a stall, or a `kcc-object-wedged` finding
+with a stall of its kind and name on its cluster. When the `gcloud` check also runs, it takes this
+index, so the snapshot and each clone are read once. The fix's file is not the declaration, so the
+paragraph does not say "this file": when exactly one file declares the object, its first sentence
+names that file ("**Config Connector is not applying `<path>`.**", `KCC_STALLED_DECLARED_MARK`, or
+"`<path>` in the repository `<repo>`" for a declaration in a context repository).
+Otherwise it starts "**Config Connector is not applying the declaration of this object.**" and
+says that more than one file declares the object, or only that the audit names no declaration file
+for it. It never says that no file declares the object: the index skips a file it cannot parse (a
+template, for example), so no search proves an absence. A snapshot that cannot be taken is a
+warning in the log. The index keys each declaration by its namespace and its
+project (the annotation, else that of a Namespace the same file declares) as well, so two objects of one name in two namespaces, or for two projects, are
+two declarations. It keeps each other file that declares the same object, whole, in
+`KccDeclaration.also`, and matches each file on its own fields, so two files of one object read as
+ambiguous. A `gcloud` fix's note is its command, so
+its paragraph goes in `kcc_stalled_paragraph` and renders after the command block. The
+strip-and-rewrite pattern covers every form: an exact first sentence (`KCC_STALLED_NOTE_PATTERN`)
+followed by " When the audit ran, Config Connector reported " (`KCC_STALLED_CONTINUATION`), which
+every paragraph `finish` writes goes on with. A worker sentence that only starts the same way stays.
+An earlier release wrote "this file.**" and then "The declaration is `<path>`." for a fix of another
+file. A previous ledger can hold that form, and the carry copies it, so the pattern also accepts
+that sentence (`KCC_STALLED_OLD_DECLARATION_SENTENCE`) before the continuation.
+
+The fix keeps `kind: manifest`: the change belongs in that file, the stall usually clears before
+anyone reads the ledger, and degrading the fix would drop the pull request. The note does not say
+that the change is correct, because the reason can reject the change itself (a node pool change
+that sets both `spec.autoscaling.maxNodeCount` and `spec.autoscaling.totalMaxNodeCount` fails with
+`UpdateFailed`). It says to
+correct the declaration if the reason rejects the change, and that otherwise the change takes effect
+when Config Connector applies the object again.
+
+The note fits the note cap through `_fit_route_notes`, the route-note pass's fit: only the worker's
+own text is cut, never inside a code block, and the text `finish` wrote stays whole (the Kustomize
+note's own text, the closing text of `degrade_missing_remediations`, the note of
+`degrade_reverted_gcloud_remediations`, `GENERATED_FIX_NOTE`, and the route notes). The paragraph
+goes after the route notes, and a step that would push out any route note already on the note (a
+location note or the reconciler note) does not fit. The
+Kustomize note's copied file can only become shorter by whole lines, as below. When the
+whole paragraph does not fit, it names one object, then no object it waits on, then drops its tail;
+when even that core does not fit beside the text `finish` wrote and the note carries a Kustomize
+copied file, that block is made shorter by whole lines, with its fences closed, to make room for
+the core and every route note, as `_fit_route_notes` does for the reconciler note. Only when that does not fit either does the core go
+past the cap, and the log warns that the renderer cuts its end. A cut keeps the whole worker note in
+`uncut_note`, as the route-note pass does, so the carry puts it back once the stall is gone. The
+route-note pass removes a copy of either paragraph from the worker's note before it keeps that note
+as `uncut_note`, so no later pass brings back a paragraph from an earlier ledger. The paragraph pass
+also removes an earlier copy from every remediation, and the carry removes it too, so a note never
+shows a stall that this run's manifest does not. A cluster whose read failed
+(`kcc_unread`) records no objects, so no note names an object there, and the log has a warning. The
+absence of the note never says that Config Connector applies a file. `remediate` runs the same pass
+before its dry-run preview and before it opens a pull request, because `finish` does not revisit a
+finding whose pull request is open. With no `--manifest-file`, the pass only removes a paragraph
+that the worker copied, and claims no stall.
+
+The same match makes the `pr-merged-persists` row and the comment on the merged pull request state
+the stall in place of "the remediation was incomplete, or something outside this repository
+reverted it", with the same advice as the note; the comment is posted once and never updated. So
+does any finding whose own object is not ready (a `Cluster/` or `NodePool/` finding, or a
+`kcc-object-wedged` finding of a Config Connector kind, `<Kind>/<n>`), whatever the fix's kind.
+
 ### `remediate --audit <id> --findings-file <path> --finding <id>... [--manifest-file <path>]`
 
 The promotion primitive, callable directly and reused internally by `finish`. For each group: reset
@@ -806,6 +1018,14 @@ subcommand. Sharing one code path between the two is right; sharing the sweep is
 make `remediate --finding one-id` open up to six pull requests, five of them for findings the
 operator never mentioned and cannot tell apart from the one they did, on the command whose entire
 purpose is to act on a specific request.
+
+A named `no-pdb` finding the worker left `manual` because the collector found its declaration is
+the one non-`manifest` target `remediate` accepts. `finish` writes that PodDisruptionBudget itself,
+and given `--manifest-file`, `remediate` writes it the same way, with the same planner and the same
+refusals, and opens it. A pull request on the budget's own branch is left to the promotion gate, so
+a human close is reported as superseded and `--override-human-close` applies, as for any fix.
+Without this, a direct ask could not open the budget on an install whose automatic sweep is off, or
+past the sweep's cap.
 
 `remediate` degrades the same way, for the same reason at a smaller scale. A named target whose fix
 is not a readable file inside the clone is refused **by name** — logged, and returned in the
@@ -859,7 +1079,7 @@ lose and anything present is debris from a run that did not finish.
 
 | Artifact              | Contents                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Ledger issue title    | `[audit] <human name> — <n> findings (<c> critical)`, singular `1 finding`. Names from `AUDITS`, still asserted against the cron roster by test.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| Ledger issue title    | `[audit] <human name> — <n> findings (<c> critical)`, singular `1 finding`; on a scoped install `<human name> (<scope name>)` (§2). Names from `AUDITS`, still asserted against the cron roster by test.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | Ledger issue body     | Scope, findings table with state column and a link from each id to its detail, then per-finding detail: evidence, impact, its own id, recommendation, remediation (`manifest` links fill the `fileUrl` template from the forge's `capabilities` response at the repository commit when the forge supplies one and the file exists at that commit, and keep the bare path for a newly written file or when `fileUrl` is absent), PR link. Hidden `<!-- audit-findings -->` marker at the end, listing the ids the body rendered, the collector-held ids ([collector design §3.3](fleet-audit-collector-manifest.md)) and the ids under _Not re-checked this run_ (§7.4), then the `<!-- audit-id-scheme -->` stamp, and on a truncated body an `audit-findings-all` block (§7.1). |
 | Scope                 | Targets covered (counted by kind: clusters, subnets, projects via `scope_phrase`) with their `n/applicable` checks-run count (suffixed `(m n/a)` where checks were declared inapplicable) and optional per-target `limitations`, `skipped` with reasons, partial-coverage banner. Both tables cap at 60 rows. See §7.2. A `### Coverage` list follows for the holds the document cannot express — the collector-manifest waiver (a lost memory shows in the clean run's comment) ([collector design §3.3, §4](fleet-audit-collector-manifest.md)).                                                                                                                                                                                                                               |
 | Held by the collector | On a run that passed `--manifest-file`: previous findings the collector still flags and the document did not carry, each with the identity lines a finding has and, for the first `MAX_HELD_DETAIL_ROWS`, its check and the collector's command. On a findings run over a gap, with or without a manifest: rows under _Not re-checked this run_ (§7.4). Measured after the findings; degrades before it displaces one. See collector design §3.3.                                                                                                                                                                                                                                                                                                                                |
@@ -904,7 +1124,8 @@ headroom for the trailing marker and for anything a later section appends.
 - **A name outranks a full block, except a critical's.** When the full blocks do not all fit, the
   findings left over are each listed on one line — severity, title, location, id, then any fix
   state and its pull request — under
-  `### Listed without detail (N)`. Bands are taken most severe first. A non-critical band shows as
+  `### Listed without detail (N)`; a 2.7 finding the shared-account shield made manual keeps the
+  shield's note on an indented line under its row. Bands are taken most severe first. A non-critical band shows as
   many full blocks as still leave room to name the rest of it and every finding below it; the
   critical band keeps room for its own names only, so a critical never loses its evidence to a less
   severe finding's name. When naming everything below cannot fit even with no full blocks, a
@@ -1339,7 +1560,8 @@ URL. An earlier run of the same job, the same morning, had got the same rule rig
 applies correctly most of the time is a rule the harness should be applying.
 
 So `finish` computes it and returns `silent_ok` on both branches. It is `true` only when the run
-moved nothing an operator needs to hear about — nothing new, nothing resolved, no new or changed coverage gap, no
+moved nothing an operator needs to hear about — nothing new, nothing resolved, nothing retired
+unread (§2), no new or changed coverage gap, no
 held close, no remediation PR opened or closed, and, on a run that passed `--manifest-file`, no
 collector candidate the document dropped ([collector design §3.5](fleet-audit-collector-manifest.md))
 — and it is computed from the numbers `finish` is
@@ -1360,7 +1582,10 @@ section says so. The one limit: an on-demand run that goes through `hermes cron 
 the cron prompt, so it counts as a scheduled run and can be silent.
 
 The flag comes from the cron prompt and from nowhere else. Every fleet-audit job in
-`agents/platform/cron/jobs.json` tells the worker to pass `--scheduled` to `finish`. The SOPs do
+`agents/platform/cron/jobs.json` tells the worker to pass `--scheduled` to `finish`, and, on a
+stream whose SOP runs `precheck` after its collector, to `precheck` too; a run `precheck` closes
+from the stored document is decided by this rule unchanged, since the close is `finish --scheduled`
+([`fleet-audit-collector-manifest.md`](fleet-audit-collector-manifest.md) §3.7). The SOPs do
 not, because a scheduled run and an on-demand run read the same SOP, and an SOP that passed the
 flag would make every on-demand run of its stream able to go silent. A scheduled worker that
 forgets the flag reports a run that could have been silent. That is noise in the channel, and it
@@ -1388,7 +1613,7 @@ the channel. An id that a scheduled run already reported under a gap (`scheduled
 is not a difference. Its `new` and `resolved` then can be 0, so the JSON line also carries
 `since_last_scheduled`, the ids new and resolved since the last scheduled run, and the text chat
 report says them on a line of its own ("Changed since the last scheduled run: 1 resolved (…)."), with
-no count of zero. A Slack card built from the ledger issue (`KAGE_SLACK_UX` on) replaces the text and
+no count of zero. A card built from the ledger issue (`KAGE_SLACK_UX` on; Slack, and Google Chat under `spec.mode: next`) replaces the text and
 does not show this line. The card of a run with no ledger issue is built from its summary, which puts
 the line under the finding rows, so that card shows it. When no record shows
 the ids, or the record was written under another finding id scheme, the value is `null` and the
@@ -1438,7 +1663,7 @@ Agent profile holds no chat destination either — it ships no `platforms:` sect
 fleet-management profile should not acquire one — so the Platform Agent's own delivery leg has no
 destination. The channel is the Chat Agent's, which owns ingress: the cron report relay
 ([`cron-report-relay.md`](cron-report-relay.md)) posts the run's one line of counts ending with the
-ledger URL. In Slack with `KAGE_SLACK_UX` on that line becomes a card built from the ledger issue:
+ledger URL. In Slack with `KAGE_SLACK_UX` on, and in Google Chat under `spec.mode: next`, that line becomes a card built from the ledger issue:
 a headline carrying the count of the most severe findings present, up to ten critical findings or
 the top two of a lower severity when there are none (tagged new where the body marks it so), a
 count of the rest, any clusters the run did not scan, and a link to the issue; the
@@ -1448,15 +1673,16 @@ reaches the channel. The ledger stays the record in both cases.
 
 ## 8. Labels
 
-`ensure_labels` gains two entries; the rest are unchanged.
+`ensure_labels` creates every label below; the scope label only on a scoped install (§2).
 
-| Label                | Applies to  | Purpose                                      |
-| -------------------- | ----------- | -------------------------------------------- |
-| `agent:audit`        | issue + PRs | Everything this skill owns                   |
-| `audit:<audit-id>`   | issue + PRs | Stream identity; how the ledger is found     |
-| `audit:remediation`  | PRs only    | Distinguishes a fix PR from the ledger issue |
-| `audit:stale-closed` | PRs only    | The harness closed this, not a human (§3.3)  |
-| `severity:*`         | issue + PRs | Highest live severity, mutually exclusive    |
+| Label                | Applies to  | Purpose                                                                                                                                 |
+| -------------------- | ----------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `agent:audit`        | issue + PRs | Everything this skill owns                                                                                                              |
+| `audit:<audit-id>`   | issue + PRs | Stream identity; how the ledger is found                                                                                                |
+| `audit-scope:<slug>` | issue + PRs | Install identity (§2); only on a scoped install. The ledger lookup and the remediation listing keep what carries this install's or none |
+| `audit:remediation`  | PRs only    | Distinguishes a fix PR from the ledger issue                                                                                            |
+| `audit:stale-closed` | PRs only    | The harness closed this, not a human (§3.3)                                                                                             |
+| `severity:*`         | issue + PRs | Highest live severity, mutually exclusive                                                                                               |
 
 A forge with no labels (Bitbucket; `capabilities` answers `labels: false`) gets none of these.
 There, a remediation PR is found by its branch prefix `platform-agent/fix-<audit-id>-`, the marker
@@ -1612,8 +1838,8 @@ unchanged. As shipped it is **346**. New cases:
 - `start` prints `checks` and `sop` for every stream, and `AuditSpec.sop` agrees with an independently
   spelled-out filename map and with a file that exists.
 - Zero findings with a coverage gap and no ledger opens one, titled `coverage incomplete` and
-  labelled `agent:audit` + `audit:<id>`; zero findings with complete coverage and no ledger opens
-  nothing.
+  labelled `agent:audit` + `audit:<id>` (+ the scope label on a scoped install); zero findings
+  with complete coverage and no ledger opens nothing.
 - Grouping: disjoint paths, two findings one path, transitive union across three findings.
 - Promotion eligibility: critical+manifest auto, and major+manifest auto only on a
   `MAJOR_SWEEP_CHECKS` check an at-least-`major` candidate backs; critical+gcloud not;
@@ -1631,7 +1857,8 @@ unchanged. As shipped it is **346**. New cases:
 - Idempotency markers: a merged PR already carrying `audit-persists` gets no second comment; a ledger
   already carrying `audit-refused` for a comment node id does not re-refuse it; a different node id
   for the same finding does.
-- Clean run closes the issue and every open remediation PR.
+- Clean run closes the issue and every open remediation PR of this install's; on a scoped install an
+  unlabelled one whose ids this ledger never carried stays open.
 - `--dry-run` issues no command through the harness runner at all (assert the recorder is empty),
   prints every pull request body it would open, separated from the ledger body by a machine-findable
   line so a size check can measure each one against the limit rather than the concatenation, and

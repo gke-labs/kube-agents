@@ -14,7 +14,7 @@ import tempfile
 import unittest
 import unittest.mock
 
-from eval_dashboard import nightly, post_health, render, trend
+from eval_dashboard import links, nightly, post_health, render, trend
 from test_eval_dashboard_pages import (
     TWO_POLLS_BUDGET_MS,
     chrome,
@@ -34,7 +34,7 @@ NOW = "2026-09-08T14:30:00+00:00"  # Tue 10:30 AM ET
 NIGHT_1 = "3000000000000000001"
 NIGHT_2 = "3000000000000000002"
 JOB = "ci-kube-agents-eval-nightly"
-DIGEST_AT = datetime.datetime(2026, 9, 8, 13, 0, tzinfo=UTC)  # Tue 9 AM ET
+DIGEST_AT = datetime.datetime(2026, 9, 8, 15, 0, tzinfo=UTC)  # Tue 11 AM ET
 
 
 def rep(n, result, reason=None):
@@ -163,6 +163,21 @@ class NightDocumentTest(unittest.TestCase):
         self.assertEqual(nightly.night_reports(data, limit=1)[0]["previous_build"], NIGHT_1, "the night outside the window still serves as the comparison")
         self.assertEqual(nightly.nightly_document({"runs": [], "cases": []}), {"job": JOB, "nights": [], "running": []})
 
+    def test_night_dates_takes_the_window_in_dates(self):
+        """A cron run on 09-01 to 09-14 and a 09:00 re-run on the newest three
+        dates: the newest 14 runs cover 11 dates, the newest 14 dates are the
+        three re-runs and eleven cron runs, newest first."""
+        passed = [task("case-a", "pass", "pass", "pass")]
+        cron = {d: f"30000000000000001{d:02d}" for d in range(1, 15)}
+        reruns = {d: f"30000000000000002{d:02d}" for d in (12, 13, 14)}
+        runs = [night(cron[d], f"2026-09-{d:02d}T00:00:00+00:00", f"2026-09-{d:02d}T06:40:00+00:00", passed) for d in cron]
+        runs += [night(reruns[d], f"2026-09-{d:02d}T09:00:00+00:00", f"2026-09-{d:02d}T15:40:00+00:00", passed) for d in reruns]
+        data = {"schema_version": 1, "generated_at": NOW, "cases": copy.deepcopy(CASES), "runs": runs}
+        self.assertEqual(len({n["started"][:10] for n in nightly.night_reports(data)}), 11, "the window in runs, as before")
+        dates = nightly.night_dates(data)
+        self.assertEqual([n["build"] for n in dates], [reruns[14], reruns[13], reruns[12], *[cron[d] for d in range(11, 0, -1)]])
+        self.assertEqual([n["build"] for n in nightly.night_dates(data, limit=2)], [reruns[14], reruns[13]])
+
     def test_turn1_and_agent_medians_per_case_and_the_nights_turn1_percentiles(self):
         data = two_nights()
         a, b, c = data["runs"][-1]["tasks"]
@@ -199,7 +214,7 @@ class NightDocumentTest(unittest.TestCase):
         data["pending_builds"] = [
             {"build_id": "3000000000000000003", "first_seen": "2026-09-08T14:05:00+00:00", "tier": "nightly"},
             {"build_id": "3000000000000000004", "first_seen": "2026-09-08T14:10:00+00:00"},  # the presubmit's
-            {"build_id": "2999999999999999999", "first_seen": "2026-09-08T01:00:00+00:00", "tier": "nightly"},  # died 13.5 h ago
+            {"build_id": "2999999999999999999", "first_seen": "2026-09-07T23:30:00+00:00", "tier": "nightly"},  # died 15 h ago
             {"build_id": "bogus", "first_seen": "2026-09-08T14:05:00+00:00", "tier": "nightly"},
         ]
         now = datetime.datetime.fromisoformat(NOW)
@@ -214,12 +229,70 @@ class NightDocumentTest(unittest.TestCase):
         self.assertEqual([p["build"] for p in brief["pending"]], ["3000000000000000004"], "the Grid's running columns are the presubmit's")
 
 
-class BuildUrlTest(unittest.TestCase):
-    """The links follow the bucket the collector read the build from
-    (``runs[].log_url``); a record without the field is from the bucket the
-    nightly used before 2026-09-15 and is linked there."""
+class ShapeRollupTest(unittest.TestCase):
+    GOOD = {"opens_on_verdict": True, "apology": False, "bot_messages": 2, "words_before_answer": 0, "answer_words": 40}
+    BAD = {"opens_on_verdict": False, "apology": True, "bot_messages": 3, "words_before_answer": 7, "answer_words": 300}
 
-    URL = "https://oss.gprow.dev/view/gs/kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly/3000000000000000005"
+    def test_a_share_and_medians_over_the_reps_that_carried_a_shape(self):
+        reps = [dict(rep(1, "pass"), shape=self.GOOD), dict(rep(2, "fail"), shape=self.BAD),
+                dict(rep(3, "pass"), shape=self.GOOD), rep(4, "pass")]
+        self.assertEqual(nightly.shape_rollup(reps), {
+            "n": 3, "opens_on_verdict": 2, "apology": 1,
+            "bot_messages_p50": 2, "words_before_answer_p50": 0, "answer_words_p50": 40,
+        })
+
+    def test_an_infra_rep_a_missing_flag_and_a_missing_count_are_unknown(self):
+        reps = [dict(rep(1, "infra"), shape=self.BAD), dict(rep(2, "pass"), shape={"opens_on_verdict": True, "apology": False}),
+                dict(rep(3, "fail"), shape={"apology": True, "answer_words": 900})]
+        self.assertEqual(nightly.shape_rollup(reps), {
+            "n": 1, "opens_on_verdict": 1, "apology": 0,
+            "bot_messages_p50": None, "words_before_answer_p50": None, "answer_words_p50": None,
+        })
+
+    def test_no_shape_on_record_is_none(self):
+        self.assertIsNone(nightly.shape_rollup([rep(1, "pass"), dict(rep(2, "infra"), shape=self.GOOD)]))
+        self.assertIsNone(nightly.shape_rollup(None))
+
+    def test_the_night_and_its_cases_carry_the_rollup(self):
+        data = two_nights()
+        for r in data["runs"][-1]["tasks"][0]["reps"]:
+            r["shape"] = self.GOOD
+        data["runs"][-1]["tasks"][1]["reps"][0]["shape"] = self.BAD
+        last = nightly.night_reports(data)[0]
+        by_case = {c["case"]: c for c in last["cases"]}
+        self.assertEqual(by_case["case-a"]["shape"]["n"], 3)
+        self.assertIsNone(by_case["case-c"]["shape"])
+        self.assertEqual((last["shape"]["n"], last["shape"]["opens_on_verdict"], last["shape"]["apology"]), (4, 3, 1))
+
+
+class BuildUrlTest(unittest.TestCase):
+    """The links follow the bucket the collector read the build from:
+    Spyglass for a bucket Deck reads (``runs[].log_url``), the Cloud Console
+    for a private one (``runs[].gcs_base``, or a Spyglass ``log_url`` into it
+    from before the field; links.py); a record with neither field is from
+    the bucket the nightly used before 2026-09-15 and is linked there."""
+
+    URL = f"https://oss.gprow.dev/view/gs/kube-agents-prow/logs/{JOB}/3000000000000000005"
+    PRIVATE_URL = f"https://oss.gprow.dev/view/gs/kube-agents-evals-nightly-logs/logs/{JOB}/3000000000000000005"
+    GCS_BASE = f"gs://kube-agents-evals-nightly-logs/logs/{JOB}/3000000000000000005/"
+    CONSOLE = f"https://console.cloud.google.com/storage/browser/kube-agents-evals-nightly-logs/logs/{JOB}/3000000000000000005"
+    CONSOLE_TRANSCRIPT = f"https://storage.cloud.google.com/kube-agents-evals-nightly-logs/logs/{JOB}/3000000000000000005/artifacts/eval_case-b_rep1.log"
+
+    def test_a_run_in_a_private_bucket_links_the_console(self):
+        run = {"build_id": "3000000000000000005", "job": JOB, "gcs_base": self.GCS_BASE, "log_url": self.PRIVATE_URL}
+        self.assertEqual(nightly.build_url(run), self.CONSOLE)
+        self.assertEqual(nightly.transcript_url(run, "case-b"), self.CONSOLE_TRANSCRIPT)
+        # A record from before gcs_base: its Spyglass link into the private bucket is dead, so it is rewritten.
+        legacy = {"build_id": "3000000000000000005", "job": JOB, "log_url": self.PRIVATE_URL}
+        self.assertEqual(nightly.build_url(legacy), self.CONSOLE)
+        self.assertEqual(nightly.transcript_url(legacy, "case-b"), self.CONSOLE_TRANSCRIPT)
+        self.assertEqual(links.private_gcs_base(self.PRIVATE_URL), self.GCS_BASE)
+        # A bucket Deck reads keeps its Spyglass link.
+        public = {"build_id": "3000000000000000005", "job": JOB, "log_url": self.URL}
+        self.assertEqual(nightly.build_url(public), self.URL)
+        self.assertEqual(nightly.transcript_url(public, "case-b"), self.URL + "/artifacts/eval_case-b_rep1.log")
+        self.assertIsNone(links.private_gcs_base(self.URL))
+        self.assertIsNone(links.private_gcs_base(self.GCS_BASE), "not a Spyglass link")
 
     def test_a_recorded_log_url_wins_and_the_transcript_hangs_off_it(self):
         run = {"build_id": "3000000000000000005", "job": JOB, "log_url": self.URL}
@@ -245,6 +318,8 @@ class BuildUrlTest(unittest.TestCase):
         data["pending_builds"] = [{"build_id": "3000000000000000005", "first_seen": "2026-09-08T14:05:00+00:00", "tier": "nightly", "log_url": self.URL}]
         now = datetime.datetime.fromisoformat(NOW)
         self.assertEqual(nightly.running_nights(data, now)[0]["log_url"], self.URL)
+        data["pending_builds"][0]["log_url"] = self.PRIVATE_URL
+        self.assertEqual(nightly.running_nights(data, now)[0]["log_url"], self.CONSOLE, "a running night in the private bucket links the Console")
 
 
 class DigestLineTest(unittest.TestCase):
@@ -278,18 +353,36 @@ class DigestLineTest(unittest.TestCase):
         self.assertEqual(self.line(data, two_days_on), "🌙 Nightly: no run last night (the newest on record started Mon 8:00 PM ET)")
         # Unless a night is still running: a late start, or one at its budget.
         data["pending_builds"] = [{"build_id": "3000000000000000003", "first_seen": (two_days_on - datetime.timedelta(hours=8)).isoformat(), "tier": "nightly"}]
-        self.assertEqual(self.line(data, two_days_on), "🌙 Nightly: still running (first seen Thu 1:00 AM ET) · the report follows when it finishes")
-        self.assertEqual(self.line({"runs": [], "cases": [], "pending_builds": data["pending_builds"]}, two_days_on), "🌙 Nightly: still running (first seen Thu 1:00 AM ET) · the report follows when it finishes")
+        self.assertEqual(self.line(data, two_days_on), "🌙 Nightly: still running (first seen Thu 3:00 AM ET) · the report follows when it finishes")
+        self.assertEqual(self.line({"runs": [], "cases": [], "pending_builds": data["pending_builds"]}, two_days_on), "🌙 Nightly: still running (first seen Thu 3:00 AM ET) · the report follows when it finishes")
         # A last night on record outranks a build in flight: the numbers are there.
         self.assertIn("newly failing: case-b", self.line(data))
         # These IDs are not snowflakes, so the first sighting dates the start.
-        data["pending_builds"][0]["first_seen"] = (two_days_on - datetime.timedelta(hours=12, minutes=20)).isoformat()
-        self.assertEqual(self.line(data, two_days_on), "🌙 Nightly: still running (first seen Wed 8:40 PM ET) · the report follows when it finishes", "past its 12-hour budget, inside the upload slack: still running")
-        data["pending_builds"][0]["first_seen"] = (two_days_on - datetime.timedelta(hours=12, minutes=31)).isoformat()
+        data["pending_builds"][0]["first_seen"] = (two_days_on - datetime.timedelta(hours=14, minutes=20)).isoformat()
+        self.assertEqual(self.line(data, two_days_on), "🌙 Nightly: still running (first seen Wed 8:40 PM ET) · the report follows when it finishes", "past its 14-hour budget, inside the upload slack: still running")
+        data["pending_builds"][0]["first_seen"] = (two_days_on - datetime.timedelta(hours=14, minutes=31)).isoformat()
         self.assertEqual(self.line(data, two_days_on), "🌙 Nightly: no run last night (the newest on record started Mon 8:00 PM ET)", "past the budget: not running")
         self.assertEqual(self.line({"runs": [], "cases": []}), "🌙 Nightly: no run on record yet")
         self.assertEqual(self.line({}), "🌙 Nightly: no data.json to read a night from")
         self.assertEqual(self.line(None), "🌙 Nightly: no data.json to read a night from")
+
+    def test_the_running_window_sits_between_the_budget_and_the_digest_window(self):
+        # The two bounds RUNNING_MAX_AGE lives between (nightly.py, beside the
+        # constant): above the longest part's Prow budget plus its 5-minute
+        # grace and the minutes a deadline kill takes to end, or a healthy slow
+        # night reads as dead; below the gap from the 00:00 UTC start to the
+        # summer digest window (DEFAULT_DIGEST_HOUR on the LOCAL_TZ clock, Toronto,
+        # the window opens DIGEST_WINDOW early), or a dead night reads as
+        # running at the digest. The budget is oss-test-infra's
+        # (kube-agents-periodics.yaml, eval-nightly and -main-b: 840m); move
+        # this constant with it.
+        from eval_dashboard import post_health
+        longest_budget = datetime.timedelta(minutes=840)
+        kill_slack = datetime.timedelta(minutes=5 + 6)
+        summer_offset = datetime.datetime(2026, 7, 1, tzinfo=post_health.LOCAL_TZ).utcoffset()  # Toronto, UTC-4 in summer
+        summer_window_opens = datetime.timedelta(hours=post_health.DEFAULT_DIGEST_HOUR) - summer_offset - post_health.DIGEST_WINDOW
+        self.assertGreater(nightly.RUNNING_MAX_AGE, longest_budget + kill_slack, "a night cut at its budget must still read as running")
+        self.assertLess(nightly.RUNNING_MAX_AGE, summer_window_opens, "a dead 00:00 UTC night must read as missing when the digest window opens")
 
     def test_a_night_is_aged_from_its_build_start_not_its_first_sighting(self):
         data = two_nights()
@@ -300,10 +393,10 @@ class DigestLineTest(unittest.TestCase):
         self.assertEqual(nightly.build_started("1234", started), started, "not a snowflake: the first sighting")
         # First seen 40 minutes late, as the collector's late cron does.
         data["pending_builds"] = [{"build_id": build, "first_seen": (started + datetime.timedelta(minutes=40)).isoformat(), "tier": "nightly"}]
-        self.assertEqual(self.line(data, started + datetime.timedelta(hours=12, minutes=25)), "🌙 Nightly: still running (first seen Wed 8:40 PM ET) · the report follows when it finishes", "cut at its deadline, not yet recorded: still running")
-        # The summer digest window opens at 12:40 UTC; a night pending then died
-        # without uploading, though first seen only 12 hours before.
-        digest = datetime.datetime(2026, 9, 10, 12, 41, tzinfo=UTC)
+        self.assertEqual(self.line(data, started + datetime.timedelta(hours=14, minutes=25)), "🌙 Nightly: still running (first seen Wed 8:40 PM ET) · the report follows when it finishes", "cut at its deadline, not yet recorded: still running")
+        # The summer digest window opens at 14:40 UTC (11 AM Toronto); a night
+        # pending then died without uploading, though first seen only 14 hours before.
+        digest = datetime.datetime(2026, 9, 10, 14, 41, tzinfo=UTC)
         self.assertEqual(self.line(data, digest), "🌙 Nightly: no run last night (the newest on record started Mon 8:00 PM ET)", "dead at the digest: not running")
 
     def test_the_nights_turn1_percentiles_are_advice_beside_the_target(self):
@@ -329,7 +422,10 @@ WRITERS_2 = "3000000000000000012"
 SPLIT_CASES = [*CASES, {"name": "pr-a", "domain": "gitops", "active": False, "nightly_active": True},
                {"name": "pr-b", "domain": "gitops", "active": False, "nightly_active": True}]
 RERUN_MAIN = "3000000000000000004"
-WRITERS_URL = f"https://oss.gprow.dev/view/gs/kube-agents-evals-nightly-logs/logs/{WRITERS_JOB}/{WRITERS_2}"
+# The writers part logs to the private nightly bucket (its fixture's log_url is
+# the Spyglass link the collector recorded), so the report links the Console.
+WRITERS_URL = f"https://console.cloud.google.com/storage/browser/kube-agents-evals-nightly-logs/logs/{WRITERS_JOB}/{WRITERS_2}"
+WRITERS_TRANSCRIPT = f"https://storage.cloud.google.com/kube-agents-evals-nightly-logs/logs/{WRITERS_JOB}/{WRITERS_2}/artifacts/eval_pr-b_rep1.log"
 
 
 def writers(build, started, finished, tasks, result="SUCCESS", duration_s=7800, **extra):
@@ -353,6 +449,73 @@ def split_nights():
 class SplitNightTest(unittest.TestCase):
     def line(self, data, at=DIGEST_AT):
         return nightly.digest_line(data, at, clock=lambda value: post_health.clock(value, weekday=True))
+
+    def test_a_main_c_build_is_a_main_shard_for_the_cut_and_the_verdict(self):
+        """The main part as five jobs (#4238): a ci-kube-agents-eval-nightly-main-c
+        build is the main-c part, joins the night beside main and main-b, cuts
+        the night short when it is cut, is named with its own wall clock, and
+        withholds the newly-failing verdict when it is missing."""
+        job, build = "ci-kube-agents-eval-nightly-main-c", "3000000000000000023"
+        data = split_nights()
+        data["cases"].append({"name": "c-c", "domain": "cost", "active": True, "nightly_active": True})
+        data["runs"].append(night(build, "2026-09-08T00:00:04+00:00", "2026-09-08T05:00:04+00:00", [task("c-c", "pass", "pass", "pass")],
+                                  result="SUCCESS", duration_s=18000, job=job,
+                                  log_url=f"https://oss.gprow.dev/view/gs/kube-agents-evals-nightly-logs/logs/{job}/{build}"))
+        self.assertEqual(nightly.night_part({"job": job}), "main-c")
+        self.assertIn("main-c", nightly.MAIN_PARTS)
+        last = nightly.night_reports(data)[0]
+        self.assertEqual([p["part"] for p in last["parts"]], ["main", "main-c", "writers"])
+        self.assertEqual(last["counts"]["recorded"], 6)
+        self.assertFalse(last["truncated"])
+        self.assertIsNone(last["verdict_withheld_by"])
+        # Cut short: the night is cut, and the digest names the third with its own clock.
+        cut = copy.deepcopy(data)
+        run = next(r for r in cut["runs"] if r["build_id"] == build)
+        run.update(result="FAILURE", eval_verdict=None, duration_s=18000)
+        report = nightly.night_reports(cut)[0]
+        self.assertTrue(report["truncated"])
+        self.assertIn("main-c part truncated after 5h", self.line(cut))
+        # Missing the next night, after it recorded a case: no verdict on what is newly failing.
+        later = copy.deepcopy(data)
+        later["runs"].append(night("3000000000000000031", "2026-09-09T00:00:00+00:00", "2026-09-09T06:40:00+00:00", [task("case-a", "pass", "pass", "pass")]))
+        report = nightly.night_reports(later)[0]
+        self.assertIn("main-c", report["missing_parts"])
+        self.assertEqual(report["verdict_withheld_by"], "main-c")
+
+    def test_the_writers_thirds_join_the_night_as_parts_of_their_own(self):
+        """The writers part as three jobs (#4238): a build of
+        ci-kube-agents-eval-nightly-writers-b or -writers-c is the writers-b
+        or writers-c part, joins the night of its date beside the writers
+        part, counts its cases once, and is named by its own word when cut
+        short; the writers job's build stays the writers part."""
+        data = split_nights()
+        data["cases"] += [{"name": "pr-c", "domain": "gitops", "active": False, "nightly_active": True},
+                          {"name": "pr-d", "domain": "gitops", "active": False, "nightly_active": True}]
+        for job, build, case, result in (("ci-kube-agents-eval-nightly-writers-b", "3000000000000000022", "pr-c", "SUCCESS"),
+                                         ("ci-kube-agents-eval-nightly-writers-c", "3000000000000000023", "pr-d", "FAILURE")):
+            data["runs"].append(night(build, "2026-09-08T00:00:07+00:00", "2026-09-08T03:00:07+00:00", [task(case, "pass", "pass", "pass")],
+                                      result=result, duration_s=10800, job=job,
+                                      log_url=f"https://oss.gprow.dev/view/gs/kube-agents-evals-nightly-logs/logs/{job}/{build}"))
+        self.assertEqual(nightly.night_part({"job": "ci-kube-agents-eval-nightly-writers-b"}), "writers-b")
+        self.assertEqual(nightly.night_part({"job": "ci-kube-agents-eval-nightly-writers-c"}), "writers-c")
+        nights = nightly.night_reports(data)
+        self.assertEqual([n["build"] for n in nights], [NIGHT_2, NIGHT_1], "still two nights, filed by the main part")
+        last = nights[0]
+        self.assertEqual([(p["part"], p["job"]) for p in last["parts"]],
+                         [("main", JOB), ("writers", WRITERS_JOB), ("writers-b", "ci-kube-agents-eval-nightly-writers-b"), ("writers-c", "ci-kube-agents-eval-nightly-writers-c")])
+        self.assertEqual(last["counts"], {"expected": 7, "recorded": 7, "passed": 4, "partial": 1, "failed": 2, "infra": 0, "missing": 0})
+        self.assertTrue(last["complete"])
+        # writers-c ended FAILURE with its verdict recorded: not a truncation,
+        # and a writers third never cuts the night short anyway.
+        self.assertFalse(last["truncated"])
+        self.assertEqual((last["missing_parts"], last["running_parts"]), ([], []))
+        self.assertEqual((last["job"], last["duration_s"]), (JOB, 24000), "the main part's name and the longest part's clock")
+        self.assertEqual(self.line(data), "🌙 Nightly: 7 cases · 4 passed all reps · 1 partial · 2 failed · newly failing: case-b, pr-b · 6h 40m")
+        # The night after, short of pr-c, names the part that recorded it.
+        later = copy.deepcopy(data)
+        later["runs"].append(night("3000000000000000031", "2026-09-09T00:00:00+00:00", "2026-09-09T06:40:00+00:00", [task("case-a", "pass", "pass", "pass")]))
+        self.assertEqual(nightly.night_reports(later)[0]["missing_parts"], ["writers", "writers-b", "writers-c"])
+        self.assertIn("writers-b part missing", self.line(later, DIGEST_AT + datetime.timedelta(days=1)))
 
     def test_one_job_alone_is_one_part_per_night_and_expects_no_other(self):
         for report in nightly.night_reports(two_nights()):
@@ -378,7 +541,7 @@ class SplitNightTest(unittest.TestCase):
         self.assertEqual((last["job"], last["result"], last["project"]), (JOB, "FAILURE", "kube-agents-evals-3"), "the main part's")
         self.assertEqual((last["started"], last["finished"], last["duration_s"]), ("2026-09-08T00:00:00+00:00", "2026-09-08T06:40:00+00:00", 24000))
         by_name = {c["case"]: c for c in last["cases"]}
-        self.assertEqual(by_name["pr-b"]["transcript_url"], f"{WRITERS_URL}/artifacts/eval_pr-b_rep1.log", "each case links its own build")
+        self.assertEqual(by_name["pr-b"]["transcript_url"], WRITERS_TRANSCRIPT, "each case links its own build")
         self.assertEqual([c["case"] for c in last["cases"]], ["case-a", "pr-a", "pr-b", "case-b", "case-c"], "by domain, then name, across the parts")
         # Monday, before any writers build: incomplete against today's
         # matrix, but no part is missing.
@@ -765,7 +928,8 @@ MAIN_B_JOB = "ci-kube-agents-eval-nightly-main-b"
 MAIN_B_2 = "3000000000000000022"
 THREE_PART_CASES = [*SPLIT_CASES, {"name": "b-a", "domain": "network", "active": True, "nightly_active": True},
                     {"name": "b-b", "domain": "network", "active": True, "nightly_active": True}]
-MAIN_B_URL = f"https://oss.gprow.dev/view/gs/kube-agents-evals-nightly-logs/logs/{MAIN_B_JOB}/{MAIN_B_2}"
+MAIN_B_URL = f"https://console.cloud.google.com/storage/browser/kube-agents-evals-nightly-logs/logs/{MAIN_B_JOB}/{MAIN_B_2}"
+MAIN_B_TRANSCRIPT = f"https://storage.cloud.google.com/kube-agents-evals-nightly-logs/logs/{MAIN_B_JOB}/{MAIN_B_2}/artifacts/eval_b-b_rep1.log"
 
 
 def main_b(build, started, finished, tasks, result="SUCCESS", duration_s=12000, **extra):
@@ -807,7 +971,7 @@ class ThreePartNightTest(unittest.TestCase):
         self.assertEqual(last["newly_failing"], ["b-b", "case-b", "pr-b"])
         self.assertEqual((last["build"], last["job"], last["result"]), (NIGHT_2, JOB, "FAILURE"), "the main part's")
         self.assertEqual((last["started"], last["finished"], last["duration_s"]), ("2026-09-08T00:00:00+00:00", "2026-09-08T06:40:00+00:00", 24000))
-        self.assertEqual({c["case"]: c["transcript_url"] for c in last["cases"]}["b-b"], f"{MAIN_B_URL}/artifacts/eval_b-b_rep1.log")
+        self.assertEqual({c["case"]: c["transcript_url"] for c in last["cases"]}["b-b"], MAIN_B_TRANSCRIPT)
         self.assertEqual(nightly.night_builds(data), {NIGHT_1: NIGHT_1, NIGHT_2: NIGHT_2, MAIN_B_2: NIGHT_2, WRITERS_2: NIGHT_2})
         # Monday, before any main-b or writers build: short of today's
         # matrix, but no part is missing.
@@ -1005,6 +1169,11 @@ class NightlyPageTest(unittest.TestCase):
         # Last night's case-a carries the reps' timing; nothing else does.
         for r, (agent, turn1) in zip(data["runs"][-1]["tasks"][0]["reps"], [(100.0, 4.0), (120.0, 11.5), (110.0, 6.0)]):
             r.update(agent_s=agent, turn1_s=turn1)
+        # And its reply shape: two reps open on the verdict, one on a lead-in
+        # with an apology.
+        for r, (verdict, words) in zip(data["runs"][-1]["tasks"][0]["reps"], [(True, 30), (False, 240), (True, 40)]):
+            r["shape"] = {"opens_on_verdict": verdict, "apology": not verdict, "bot_messages": 2,
+                          "words_before_answer": 0 if verdict else 7, "answer_words": words}
         # A third night in flight at render time (NOW is Tue 10:30 AM ET).
         data["pending_builds"] = [{"build_id": "3000000000000000003", "first_seen": "2026-09-08T14:05:00+00:00", "tier": "nightly"}]
         with unittest.mock.patch.object(render.classify, "admitted_cases", return_value=frozenset()), \
@@ -1019,7 +1188,7 @@ class NightlyPageTest(unittest.TestCase):
 
     def test_the_no_domain_group_row_carries_the_label_and_tooltip(self):
         tip = 'title="cases with no domain on record"'
-        self.assertIn(f'<tr class="grp"><td colspan="6" {tip}>no domain</td></tr>', dom_text(self.page))
+        self.assertIn(f'<tr class="grp"><td colspan="7" {tip}>no domain</td></tr>', dom_text(self.page))
 
     def test_last_nights_report(self):
         app = dom_text(self.page)
@@ -1029,7 +1198,7 @@ class NightlyPageTest(unittest.TestCase):
         self.assertIn("The job ran to the end in 6h 40m: 3 cases recorded of 3 expected.", app)
         self.assertIn(f'href="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/{JOB}/{NIGHT_2}"', app)
         # Grouped by domain, each case with its state pill, reps and reason.
-        self.assertLess(app.index('<tr class="grp"><td colspan="6">cost</td></tr>'), app.index('<tr class="grp"><td colspan="6">reliability</td></tr>'))
+        self.assertLess(app.index('<tr class="grp"><td colspan="7">cost</td></tr>'), app.index('<tr class="grp"><td colspan="7">reliability</td></tr>'))
         self.assertIn('<tr class="newly"><td class="nm">case-b</td><td><span class="pill p-fail"', app)
         self.assertIn('<span class="pill p-partial" title="failed some reps">partial</span></td><td class="num" title="repetitions passed / graded">2/3</td>', app)
         self.assertIn("check y: required phrases absent", app)
@@ -1039,6 +1208,12 @@ class NightlyPageTest(unittest.TestCase):
         self.assertIn(">— / —</td>", app)
         self.assertIn('<div class="k">Chat turn 1</div><div class="v">6.0<small>s p50</small></div><div class="d2">p95 11.5 s · advisory target p95 &lt; 10 s</div>', app)
         self.assertNotIn('<div class="k">Chat turn 1</div>', dom_text(self.page, fragment=f"#build={NIGHT_1}"), "no tile for a night with no timing")
+        # The reply shape: case-a's count and median length, a dash where
+        # none was measured, and the night's share as a seventh tile.
+        self.assertIn('title="repetitions whose answer opens on its verdict / repetitions measured, then the answer\'s median length; reported, never graded">2/3 <small class="mut">1 apology</small><br><small class="mut">40 words</small></td>', app)
+        self.assertIn('<div class="tiles seven">', app)
+        self.assertIn('<div class="k">Opens on answer</div><div class="v">67%</div><div class="d2">of 3 reps · answer p50 40 words · 1 with an apology</div>', app)
+        self.assertNotIn('<div class="k">Opens on answer</div>', dom_text(self.page, fragment=f"#build={NIGHT_1}"), "no tile for a night with no shape")
         self.assertIn("chat turn 1 p50 5.3 s, p95 9.0 s (6 reps) · agent p50 120.0 s (6 reps)", dom_text(self.out / "cases.html"))
         self.assertIn(f'href="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/{JOB}/{NIGHT_2}/artifacts/eval_case-b_rep1.log"', app)
         self.assertIn('href="cases.html#case-b"', app)

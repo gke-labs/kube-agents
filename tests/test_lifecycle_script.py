@@ -8,6 +8,11 @@ Tests safety guards in lifecycle.sh before terraform apply:
 - guard_kms_identity: prevents the CMEK key ring or key being replaced (and the live
   key's versions scheduled for destruction) when GKE_DB_KMS_KEYRING / GKE_DB_KMS_KEY
   disagree with state.
+- guard_standard_node_count: prevents the Standard cluster's replacement when
+  standard_node_count (its ForceNew initial_node_count) disagrees with state.
+- guard_node_pool_shape: prevents a lost or blanked sizing line in install.env from
+  recreating every node of a Standard pool onto the small profile; a sizing input
+  the operator named lets the resize through.
 """
 
 import os
@@ -81,6 +86,27 @@ def _scratch_composition(root):
     return comp
 
 
+# The six explicit shape inputs guard_node_pool_shape reads, unset, and the
+# module's resolved-shape outputs at the small profile, as the stub answers
+# them unless a test says otherwise.
+_UNSET_POOL_SHAPES = {
+    "standard_machine_type": "null",
+    "standard_disk_size_gb": "null",
+    "standard_disk_type": "null",
+    "gvisor_machine_type": "null",
+    "gvisor_disk_size_gb": "null",
+    "gvisor_disk_type": "null",
+}
+_SMALL_MODULE_OUTPUTS = {
+    "standard_machine_type": '"e2-standard-4"',
+    "standard_disk_size_gb": "100",
+    "standard_disk_type": '"pd-balanced"',
+    "gvisor_machine_type": '"e2-standard-4"',
+    "gvisor_disk_size_gb": "100",
+    "gvisor_disk_type": '"pd-balanced"',
+}
+
+
 class LifecycleScriptGuardTest(unittest.TestCase):
     def _run_guard(self, func_call, state_list="", state_show="", tfvar_agent_sa="null",
                    tfvar_create_cluster="true", gcloud_stub="exit 1",
@@ -89,7 +115,13 @@ class LifecycleScriptGuardTest(unittest.TestCase):
                    tfvar_kms_key='"k8s-secret-encryption-key"',
                    tfvar_cluster_name="null",
                    tfvar_enable_minter="false",
+                   tfvar_minter_shared_key='""',
+                   tfvar_minter_adopt_key='""',
                    gcloud_key_version="",
+                   gcloud_scheduled_version="",
+                   gcloud_scheduled_fail=False,
+                   gcloud_disabled_version="",
+                   gcloud_disabled_fail=False,
                    gcloud_kms_fail=False,
                    gcloud_kms_error="ERROR: permission denied",
                    gcloud_kms_notice="",
@@ -103,6 +135,15 @@ class LifecycleScriptGuardTest(unittest.TestCase):
                    tfvar_enable_stockout="false",
                    tfvar_stockout_topic='"gke-stockout-alerts-topic"',
                    tfvar_stockout_sub='"gke-stockout-alerts-sub"',
+                   tfvar_standard_node_count="1",
+                   tfvar_sizing_profile="null",
+                   tfvar_enable_gvisor="true",
+                   tfvar_pool_shapes=None,
+                   module_outputs=None,
+                   recorded_outputs=None,
+                   state_show_by_address=None,
+                   output_stderr_noise="",
+                   output_stub=None,
                    console_fail_var="",
                    apply_stub="exit 0",
                    show_rc=0,
@@ -121,14 +162,72 @@ class LifecycleScriptGuardTest(unittest.TestCase):
                 # gcloud_kms_notice models a warning written to stderr on a zero exit.
                 notice = f"echo '{gcloud_kms_notice}' >&2; " if gcloud_kms_notice else ""
                 kms_behavior = f"{notice}echo '{gcloud_key_version}'; exit 0"
+            # The guard's second list asks for DESTROY_SCHEDULED versions only.
+            # Answered apart only when a test sets it: restore_key_versions sends
+            # the same filter, and its tests read the answer from gcloud_key_version.
+            scheduled_clause = ""
+            if gcloud_scheduled_version or gcloud_scheduled_fail:
+                scheduled_behavior = ("exit 1" if gcloud_scheduled_fail
+                                      else f"echo '{gcloud_scheduled_version}'; exit 0")
+                scheduled_clause = (
+                    'if [[ "$*" == *"kms keys versions list"* && "$*" == *"state=DESTROY_SCHEDULED"* ]]; then\n'
+                    f"    {scheduled_behavior}\nfi\n")
+            # The guard's third list, DISABLED versions, asked only when none is scheduled.
+            if gcloud_disabled_version or gcloud_disabled_fail:
+                disabled_behavior = ("exit 1" if gcloud_disabled_fail
+                                     else f"echo '{gcloud_disabled_version}'; exit 0")
+                scheduled_clause += (
+                    'if [[ "$*" == *"kms keys versions list"* && "$*" == *"state=DISABLED"* ]]; then\n'
+                    f"    {disabled_behavior}\nfi\n")
             gcloud.write_text(f"""#!/usr/bin/env bash
 set -e
-if [[ "$*" == *"kms keys versions list"* ]]; then
+{scheduled_clause}if [[ "$*" == *"kms keys versions list"* ]]; then
     {kms_behavior}
 fi
 {gcloud_stub}
 """)
             gcloud.chmod(0o755)
+
+            # What `terraform console` answers for the six explicit shape inputs
+            # (var.<pool>_<attr>; null unless a test names one) and for the
+            # gke-cluster module's resolved-shape outputs
+            # (module.gke_cluster.<pool>_<attr>; the small profile unless a test
+            # says otherwise). Strings quoted and numbers bare, as console prints.
+            pool_shapes = dict(_UNSET_POOL_SHAPES)
+            pool_shapes.update(tfvar_pool_shapes or {})
+            outputs = dict(_SMALL_MODULE_OUTPUTS)
+            outputs.update(module_outputs or {})
+            pool_shape_case = "\n".join(
+                f"        {name}) echo '{answer}'; exit 0 ;;" for name, answer in pool_shapes.items())
+            module_output_case = "\n".join(
+                f"        {name}) echo '{answer}'; exit 0 ;;" for name, answer in outputs.items())
+            # Quoted: a state address carries `[0]`, a bracket expression in
+            # an unquoted case pattern.
+            state_show_case = "\n".join(
+                f"        \"{addr}\") cat << 'EOF'\n{text}\nEOF\n        exit 0 ;;"
+                for addr, text in (state_show_by_address or {}).items())
+
+            # What `terraform output -raw <name>` answers: the root outputs the
+            # last apply recorded in state. A name not in recorded_outputs gets
+            # the binary's not-found error (exit 1), the shape a state from
+            # before the output was declared gives; output_stub replaces the
+            # whole branch for the other shapes (a state with no outputs at all
+            # exits 0 and prints nothing; a backend failure exits 1 otherwise).
+            # output_stderr_noise is written to stderr first, on every answer:
+            # what TF_LOG in the operator's shell, or a provider warning, adds
+            # to a read that still exits 0.
+            recorded_output_case = "\n".join(
+                f"        {name}) echo '{answer}'; exit 0 ;;"
+                for name, answer in (recorded_outputs or {}).items())
+            noise = f"echo '{output_stderr_noise}' >&2\n    " if output_stderr_noise else ""
+            if output_stub is None:
+                output_stub = f"""{noise}name="${{@: -1}}"
+    case "$name" in
+{recorded_output_case}
+    esac
+    echo "Error: Output \\"$name\\" not found" >&2
+    echo "The output variable requested could not be found in the state file." >&2
+    exit 1"""
 
             # Stub terraform CLI to return configured state list, state show, and console outputs
             terraform_stub = bin_dir / "terraform"
@@ -143,10 +242,17 @@ if [[ "$cmd" == "state" && "${{2:-}}" == "list" ]]; then
 EOF
     exit 0
 elif [[ "$cmd" == "state" && "${{2:-}}" == "show" ]]; then
+    # The address is the last argument (`state show -no-color <addr>`). One
+    # named in state_show_by_address gets its own text; any other gets state_show.
+    case "${{@: -1}}" in
+{state_show_case}
+    esac
     cat << 'EOF'
 {state_show}
 EOF
     exit 0
+elif [[ "$cmd" == "output" ]]; then
+    {output_stub}
 elif [[ "$cmd" == "console" ]]; then
     read -r expr
     # console_fail_var models a terraform console that cannot answer -- a state
@@ -156,11 +262,31 @@ elif [[ "$cmd" == "console" ]]; then
         echo 'Error: could not load the configuration' >&2
         exit 1
     fi
+    if [[ "$expr" == "var.sizing_profile" ]]; then
+        echo '{tfvar_sizing_profile}'
+        exit 0
+    elif [[ "$expr" == module.gke_cluster.* ]]; then
+        case "${{expr#module.gke_cluster.}}" in
+{module_output_case}
+        esac
+        echo "unknown module output $expr" >&2
+        exit 1
+    elif [[ " {' '.join(pool_shapes)} " == *" ${{expr#var.}} "* ]]; then
+        case "${{expr#var.}}" in
+{pool_shape_case}
+        esac
+    fi
     if [[ "$expr" == *"agent_service_account_id"* ]]; then
         echo '{tfvar_agent_sa}'
         exit 0
     elif [[ "$expr" == *"create_cluster"* ]]; then
         echo '{tfvar_create_cluster}'
+        exit 0
+    elif [[ "$expr" == *"github_minter_shared_kms_key"* ]]; then
+        echo '{tfvar_minter_shared_key}'
+        exit 0
+    elif [[ "$expr" == *"github_minter_adopt_unlabelled_kms_key"* ]]; then
+        echo '{tfvar_minter_adopt_key}'
         exit 0
     elif [[ "$expr" == *"namespace"* ]]; then
         echo '{tfvar_namespace}'
@@ -219,6 +345,12 @@ elif [[ "$cmd" == "console" ]]; then
     elif [[ "$expr" == *"stockout_pubsub_subscription"* ]]; then
         echo '{tfvar_stockout_sub}'
         exit 0
+    elif [[ "$expr" == *"standard_node_count"* ]]; then
+        echo '{tfvar_standard_node_count}'
+        exit 0
+    elif [[ "$expr" == *"enable_gvisor_node_pool"* ]]; then
+        echo '{tfvar_enable_gvisor}'
+        exit 0
     fi
     echo 'null'
     exit 0
@@ -234,6 +366,9 @@ elif [[ "$cmd" == "untaint" ]]; then
     # The address is the last argument; -no-color precedes it.
     echo "untaint ${{@: -1}}" >> "${{TF_STUB_LOG:-/dev/null}}"
     {untaint_stub}
+elif [[ "$cmd" == "import" ]]; then
+    # The address, for the adoption tests (`import -input=false -no-color <addr> <id>`).
+    echo "import ${{@: -2:1}}" >> "${{TF_STUB_LOG:-/dev/null}}"
 elif [[ "$cmd" == "apply" ]]; then
     # One line per attempt, for the retry tests; apply_stub decides the outcome.
     echo "apply ${{@:2}}" >> "${{TF_STUB_LOG:-/dev/null}}"
@@ -644,6 +779,421 @@ resource "google_service_account" "agent" {
         self.assertIn("namespace resolved to 'agents-two', but this state's release runs in 'kubeagents-system'", proc.stderr)
         self.assertIn('NAMESPACE="kubeagents-system"', proc.stderr)
 
+    # terraform state show prints a number bare and the top-level attributes
+    # before the nested blocks; the node_pool block repeats the name.
+    _STANDARD_CLUSTER_STATE = (
+        'resource "google_container_cluster" "standard" {\n'
+        '    initial_node_count = 1\n'
+        '    name               = "fleet-host"\n'
+        '    node_pool {\n'
+        '        initial_node_count = 1\n'
+        '        name               = "default-pool"\n'
+        '    }\n'
+        '}'
+    )
+
+    def test_guard_standard_node_count_no_op_without_a_standard_cluster_in_state(self):
+        """An Autopilot install, or an adopted cluster, has no standard[0] to replace."""
+        proc = self._run_guard(
+            "guard_standard_node_count",
+            state_list="module.gke_cluster.google_container_cluster.autopilot[0]",
+            tfvar_standard_node_count="3",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_guard_standard_node_count_passes_when_configuration_matches_state(self):
+        proc = self._run_guard(
+            "guard_standard_node_count",
+            state_list="module.gke_cluster.google_container_cluster.standard[0]",
+            state_show=self._STANDARD_CLUSTER_STATE,
+            tfvar_standard_node_count="1",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_guard_standard_node_count_refuses_a_changed_count(self):
+        """initial_node_count is ForceNew on the cluster: a changed count plans its destroy-and-recreate."""
+        proc = self._run_guard(
+            "guard_standard_node_count",
+            state_list="module.gke_cluster.google_container_cluster.standard[0]",
+            state_show=self._STANDARD_CLUSTER_STATE,
+            tfvar_standard_node_count="2",
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("standard_node_count resolved to '2', but this state's cluster was created with 1 node(s) per zone", proc.stderr)
+        self.assertIn("cluster's DESTRUCTION", proc.stderr)
+        self.assertIn("TF_VAR_standard_node_count=1", proc.stderr)
+
+    # terraform state show on the Standard cluster: attributes first, then the
+    # nested blocks sorted, so cluster_autoscaling (whose
+    # auto_provisioning_defaults carries its own disk_type) precedes
+    # node_config, and node_pool repeats the pool's node_config after it.
+    @staticmethod
+    def _standard_cluster_state(machine_type, disk_size_gb, disk_type):
+        return (
+            'resource "google_container_cluster" "standard" {\n'
+            '    initial_node_count = 1\n'
+            '    name               = "fleet-host"\n'
+            '    cluster_autoscaling {\n'
+            '        enabled = false\n'
+            '        auto_provisioning_defaults {\n'
+            '            disk_size = 100\n'
+            '            disk_type = "pd-ssd"\n'
+            '        }\n'
+            '    }\n'
+            '    node_config {\n'
+            f'        disk_size_gb = {disk_size_gb}\n'
+            f'        disk_type    = "{disk_type}"\n'
+            f'        machine_type = "{machine_type}"\n'
+            '        workload_metadata_config {\n'
+            '            mode = "GKE_METADATA"\n'
+            '        }\n'
+            '    }\n'
+            '    node_pool {\n'
+            '        initial_node_count = 1\n'
+            '        name               = "default-pool"\n'
+            '        node_config {\n'
+            f'            disk_size_gb = {disk_size_gb}\n'
+            f'            disk_type    = "{disk_type}"\n'
+            f'            machine_type = "{machine_type}"\n'
+            '        }\n'
+            '    }\n'
+            '}'
+        )
+
+    @staticmethod
+    def _gvisor_pool_state(machine_type, disk_size_gb, disk_type):
+        return (
+            'resource "google_container_node_pool" "gvisor" {\n'
+            '    initial_node_count = 1\n'
+            '    name               = "gvisor-pool"\n'
+            '    node_config {\n'
+            f'        disk_size_gb = {disk_size_gb}\n'
+            f'        disk_type    = "{disk_type}"\n'
+            f'        machine_type = "{machine_type}"\n'
+            '        sandbox_config {\n'
+            '            type = "GVISOR"\n'
+            '        }\n'
+            '    }\n'
+            '}'
+        )
+
+    # The fleet profile's gVisor shape, and the same pool built with an
+    # explicit gvisor_machine_type beside the profile.
+    _FLEET_GVISOR_SHAPE = ("n2-standard-4", 150, "pd-balanced")
+    _FLEET_GVISOR_SHAPE_EXPLICIT_MACHINE = ("n2-standard-8", 150, "pd-balanced")
+    _FLEET_GVISOR_OUTPUTS = {"gvisor_machine_type": '"n2-standard-4"', "gvisor_disk_size_gb": "150"}
+    _FLEET_STANDARD_OUTPUTS = {"standard_machine_type": '"n2-standard-8"', "standard_disk_size_gb": "200"}
+    _STANDARD_ADDRESS = "module.gke_cluster.google_container_cluster.standard[0]"
+    _GVISOR_ADDRESS = "module.gke_cluster.google_container_node_pool.gvisor[0]"
+
+    def test_guard_node_pool_shape_no_op_without_a_standard_pool_in_state(self):
+        """An Autopilot install has neither pool; a first Standard apply has none in state yet."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list="module.gke_cluster.google_container_cluster.autopilot[0]",
+            state_show=self._standard_cluster_state("n2-standard-8", 200, "pd-balanced"),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+
+    def test_guard_node_pool_shape_passes_when_the_resolved_shape_matches_state(self):
+        """A small host with nothing named: the recorded shape is the resolved one. The
+        cluster_autoscaling block's pd-ssd must not be read as the pool's disk type."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list=self._STANDARD_ADDRESS,
+            state_show=self._standard_cluster_state("e2-standard-4", 100, "pd-balanced"),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+
+    def test_guard_node_pool_shape_refuses_a_lost_profile_line(self):
+        """A fleet host whose TF_VAR_sizing_profile line is gone resolves the small shape;
+        with no sizing input named, the apply that would recreate every node is refused."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list=self._STANDARD_ADDRESS,
+            state_show=self._standard_cluster_state("n2-standard-8", 200, "pd-balanced"),
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn(
+            "standard_machine_type resolved to 'e2-standard-4', but this state's cluster runs the default pool on 'n2-standard-8'",
+            proc.stderr)
+        self.assertIn("recreate EVERY node of the default pool", proc.stderr)
+        self.assertIn("TF_VAR_sizing_profile=<profile>", proc.stderr)
+        self.assertIn("TF_VAR_standard_machine_type=n2-standard-8", proc.stderr)
+
+    def test_guard_node_pool_shape_treats_a_blanked_profile_line_as_lost(self):
+        """TF_VAR_sizing_profile= exports "", which the module reads as small; so does the guard."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list=self._STANDARD_ADDRESS,
+            state_show=self._standard_cluster_state("n2-standard-8", 200, "pd-balanced"),
+            tfvar_sizing_profile='""',
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("no sizing input asks for the change", proc.stderr)
+
+    def test_guard_node_pool_shape_passes_a_resize_the_profile_names(self):
+        """sizing_profile set to a profile other than the one the last apply recorded, small
+        included, is the operator asking for the shape."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list=self._STANDARD_ADDRESS,
+            state_show=self._standard_cluster_state("n2-standard-8", 200, "pd-balanced"),
+            tfvar_sizing_profile='"small"',
+            recorded_outputs={"sizing_profile": "fleet"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_guard_node_pool_shape_passes_a_profile_set_on_a_state_that_recorded_none(self):
+        """A state from before the composition recorded the profile (terraform output says the
+        output is not found): a profile set now names the shape, as any first setting does."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list=self._STANDARD_ADDRESS,
+            state_show=self._standard_cluster_state("e2-standard-4", 100, "pd-balanced"),
+            tfvar_sizing_profile='"fleet"',
+            module_outputs=self._FLEET_STANDARD_OUTPUTS,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_guard_node_pool_shape_treats_a_state_with_no_outputs_as_recording_none(self):
+        """terraform output prints nothing and exits 0 when the state carries no output at all."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list=self._STANDARD_ADDRESS,
+            state_show=self._standard_cluster_state("e2-standard-4", 100, "pd-balanced"),
+            tfvar_sizing_profile='"fleet"',
+            module_outputs=self._FLEET_STANDARD_OUTPUTS,
+            output_stub="exit 0",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_guard_node_pool_shape_refuses_a_lost_explicit_line_beside_a_kept_profile(self):
+        """A fleet host built with TF_VAR_gvisor_machine_type=n2-standard-8 beside
+        TF_VAR_sizing_profile=fleet, the explicit line lost and the profile kept: the profile is
+        the one the last apply recorded, so it names no change, and the apply that would recreate
+        the gVisor pool's nodes onto the profile's n2-standard-4 is refused."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list=self._GVISOR_ADDRESS,
+            state_show=self._gvisor_pool_state(*self._FLEET_GVISOR_SHAPE_EXPLICIT_MACHINE),
+            tfvar_sizing_profile='"fleet"',
+            module_outputs=self._FLEET_GVISOR_OUTPUTS,
+            recorded_outputs={"sizing_profile": "fleet"},
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn(
+            "gvisor_machine_type resolved to 'n2-standard-4', but this state's cluster runs the gVisor pool on 'n2-standard-8'",
+            proc.stderr)
+        self.assertIn("sizing_profile is 'fleet', the profile the last apply recorded", proc.stderr)
+        self.assertIn("TF_VAR_gvisor_machine_type=n2-standard-8", proc.stderr)
+
+    # The host the fleet sizing guide's `mode: next` row describes, as the
+    # installer builds it: both pools on the small profile, the gVisor pool's
+    # machine type set beside it by an explicit TF_VAR_gvisor_machine_type line,
+    # and the last apply's two root outputs recording that.
+    _SMALL_STANDARD_SHAPE = ("e2-standard-4", 100, "pd-balanced")
+    _SMALL_GVISOR_SHAPE_EXPLICIT_MACHINE = ("n2-standard-8", 100, "pd-balanced")
+    _FLEET_OUTPUTS = {**_FLEET_STANDARD_OUTPUTS, **_FLEET_GVISOR_OUTPUTS}
+    _SMALL_HOST_RECORDED_OUTPUTS = {"sizing_profile": "small",
+                                    "node_pool_shape_inputs": "gvisor_machine_type"}
+
+    def _small_host_state(self):
+        return {
+            self._STANDARD_ADDRESS: self._standard_cluster_state(*self._SMALL_STANDARD_SHAPE),
+            self._GVISOR_ADDRESS: self._gvisor_pool_state(*self._SMALL_GVISOR_SHAPE_EXPLICIT_MACHINE),
+        }
+
+    def test_guard_node_pool_shape_refuses_a_lost_explicit_line_beside_a_changed_profile(self):
+        """That host upsized to the fleet profile from a shell or clone without the gVisor
+        line: the changed profile names the default pool's resize, which goes through, and
+        nothing about the gVisor pool's machine type, which the last apply recorded as an
+        explicit input; the apply that would recreate the gVisor pool's nodes onto the
+        profile's n2-standard-4 is refused with the line to put back."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list=f"{self._STANDARD_ADDRESS}\n{self._GVISOR_ADDRESS}",
+            state_show_by_address=self._small_host_state(),
+            tfvar_sizing_profile='"fleet"',
+            module_outputs=self._FLEET_OUTPUTS,
+            recorded_outputs=self._SMALL_HOST_RECORDED_OUTPUTS,
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn(
+            "gvisor_machine_type resolved to 'n2-standard-4', but this state's cluster runs the gVisor pool on 'n2-standard-8'",
+            proc.stderr)
+        self.assertIn("a shape the last apply set", proc.stderr)
+        self.assertIn("through TF_VAR_gvisor_machine_type", proc.stderr)
+        self.assertIn("Put back TF_VAR_gvisor_machine_type=n2-standard-8", proc.stderr)
+        self.assertNotIn("standard_machine_type resolved", proc.stderr)
+
+    def test_guard_node_pool_shape_passes_a_changed_profile_beside_a_kept_explicit_line(self):
+        """The same upsizing with the gVisor line still in place: the profile names the resize
+        of every attribute it decides, the default pool's and the gVisor disk's, and the
+        explicit machine type resolves to the shape in state, so nothing is refused."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list=f"{self._STANDARD_ADDRESS}\n{self._GVISOR_ADDRESS}",
+            state_show_by_address=self._small_host_state(),
+            tfvar_sizing_profile='"fleet"',
+            tfvar_pool_shapes={"gvisor_machine_type": '"n2-standard-8"'},
+            module_outputs={**self._FLEET_OUTPUTS, "gvisor_machine_type": '"n2-standard-8"'},
+            recorded_outputs=self._SMALL_HOST_RECORDED_OUTPUTS,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+
+    def test_guard_node_pool_shape_refuses_a_recorded_explicit_line_before_reading_the_profile(self):
+        """A kept profile beside a lost explicit line the last apply recorded: the refusal names
+        the recorded line rather than the profile, which is read only for an attribute no
+        explicit input decided."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list=self._GVISOR_ADDRESS,
+            state_show=self._gvisor_pool_state(*self._FLEET_GVISOR_SHAPE_EXPLICIT_MACHINE),
+            tfvar_sizing_profile='"fleet"',
+            module_outputs=self._FLEET_GVISOR_OUTPUTS,
+            recorded_outputs={"sizing_profile": "fleet",
+                              "node_pool_shape_inputs": "gvisor_machine_type"},
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("a shape the last apply set", proc.stderr)
+        self.assertNotIn("the profile the last apply recorded", proc.stderr)
+
+    def test_guard_node_pool_shape_lets_a_dropped_explicit_line_go_when_the_shape_matches(self):
+        """An explicit line dropped once the profile renders the same shape asks for no change:
+        the resolved shape is the recorded one, so no output is consulted and the next apply
+        records the input as unset."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list=self._GVISOR_ADDRESS,
+            state_show=self._gvisor_pool_state(*self._FLEET_GVISOR_SHAPE),
+            tfvar_sizing_profile='"fleet"',
+            module_outputs=self._FLEET_GVISOR_OUTPUTS,
+            recorded_outputs={"sizing_profile": "fleet",
+                              "node_pool_shape_inputs": "gvisor_machine_type gvisor_disk_size_gb"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+
+    def test_guard_node_pool_shape_reads_the_recorded_profile_past_stderr_noise(self):
+        """The same lost explicit line beside a kept profile, with terraform output writing a
+        TF_LOG line to stderr before the value it prints: the recorded profile is the value
+        alone, so the profile still names no change and the apply is still refused."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list=self._GVISOR_ADDRESS,
+            state_show=self._gvisor_pool_state(*self._FLEET_GVISOR_SHAPE_EXPLICIT_MACHINE),
+            tfvar_sizing_profile='"fleet"',
+            module_outputs=self._FLEET_GVISOR_OUTPUTS,
+            recorded_outputs={"sizing_profile": "fleet"},
+            output_stderr_noise="2026-11-04T08:00:00.000Z [INFO]  Terraform version: 1.15.8",
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("sizing_profile is 'fleet', the profile the last apply recorded", proc.stderr)
+
+    def test_guard_node_pool_shape_lets_a_gvisor_pool_being_removed_go(self):
+        """enable_gvisor_node_pool off with the pool still in state is the apply that destroys
+        it, not one that recreates its nodes: the pool's shape is not read, whatever it was
+        built with, and the lost explicit line beside it asks for nothing to be put back."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list=self._GVISOR_ADDRESS,
+            state_show=self._gvisor_pool_state(*self._FLEET_GVISOR_SHAPE_EXPLICIT_MACHINE),
+            tfvar_sizing_profile='"fleet"',
+            module_outputs=self._FLEET_GVISOR_OUTPUTS,
+            recorded_outputs={"sizing_profile": "fleet"},
+            tfvar_enable_gvisor="false",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+
+    def test_guard_node_pool_shape_refuses_a_kept_profile_whose_shape_changed(self):
+        """When medium gets a shape of its own, a host on a kept TF_VAR_sizing_profile=medium
+        line asked for nothing; the resize waits until an input names it."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list=self._STANDARD_ADDRESS,
+            state_show=self._standard_cluster_state("e2-standard-4", 100, "pd-balanced"),
+            tfvar_sizing_profile='"medium"',
+            module_outputs=self._FLEET_STANDARD_OUTPUTS,
+            recorded_outputs={"sizing_profile": "medium"},
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("sizing_profile is 'medium', the profile the last apply recorded", proc.stderr)
+
+    def test_guard_node_pool_shape_fails_closed_when_the_recorded_profile_cannot_be_read(self):
+        """A terraform output that fails for any reason but a missing output is the backend's
+        failure, and the guard refuses rather than reading it as a first setting. The first
+        output read is the recorded inputs, so that is the read the refusal names."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list=self._STANDARD_ADDRESS,
+            state_show=self._standard_cluster_state("e2-standard-4", 100, "pd-balanced"),
+            tfvar_sizing_profile='"fleet"',
+            module_outputs=self._FLEET_STANDARD_OUTPUTS,
+            output_stub="echo 'Error: Failed to load state: storage: object does not exist' >&2; exit 1",
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("could not read output node_pool_shape_inputs", proc.stderr)
+        self.assertIn("Failed to load state", proc.stderr)
+
+    def test_guard_node_pool_shape_passes_a_resize_the_explicit_input_names(self):
+        """An explicit standard_machine_type beside a lost profile line changes that one
+        attribute deliberately; the disks still match the small state, so nothing else trips."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list=self._STANDARD_ADDRESS,
+            state_show=self._standard_cluster_state("e2-standard-4", 100, "pd-balanced"),
+            tfvar_pool_shapes={"standard_machine_type": '"n2-standard-8"'},
+            module_outputs={"standard_machine_type": '"n2-standard-8"'},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_guard_node_pool_shape_refuses_a_changed_gvisor_disk(self):
+        """The gVisor pool is read too, and a number attribute (state show prints it bare)."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list=self._GVISOR_ADDRESS,
+            state_show=self._gvisor_pool_state(*self._FLEET_GVISOR_SHAPE),
+            module_outputs={"gvisor_machine_type": '"n2-standard-4"'},
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn(
+            "gvisor_disk_size_gb resolved to '100', but this state's cluster runs the gVisor pool on '150'",
+            proc.stderr)
+        self.assertIn("TF_VAR_gvisor_disk_size_gb=150", proc.stderr)
+
+    def test_guard_node_pool_shape_refuses_an_older_default_pools_disk_type_until_named(self):
+        """A default pool created when GKE defaulted to pd-standard: the module resolves
+        pd-balanced, a rolling node recreation, so the move waits for standard_disk_type."""
+        state = self._standard_cluster_state("e2-standard-4", 100, "pd-standard")
+        refused = self._run_guard(
+            "guard_node_pool_shape", state_list=self._STANDARD_ADDRESS, state_show=state)
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("standard_disk_type resolved to 'pd-balanced'", refused.stderr)
+        named = self._run_guard(
+            "guard_node_pool_shape", state_list=self._STANDARD_ADDRESS, state_show=state,
+            tfvar_pool_shapes={"standard_disk_type": '"pd-balanced"'})
+        self.assertEqual(named.returncode, 0, named.stderr)
+
+    def test_guard_node_pool_shape_reads_a_typed_null_number_as_unset(self):
+        """terraform console prints an unset number input as tonumber(null); read raw, it
+        would count as a named input and let the shrink through. The machine type matches
+        the small output so the guard, which refuses on the first mismatch, reaches the
+        disk size, the one attribute whose input is a number."""
+        proc = self._run_guard(
+            "guard_node_pool_shape",
+            state_list=self._STANDARD_ADDRESS,
+            state_show=self._standard_cluster_state("e2-standard-4", 200, "pd-balanced"),
+            tfvar_pool_shapes={"standard_disk_size_gb": "tonumber(null)"},
+            tfvar_sizing_profile="tostring(null)",
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("standard_disk_size_gb resolved to '100'", proc.stderr)
+
     def test_guard_pubsub_subscription_no_op_when_chat_disabled(self):
         """A subscription in state whose feature is switched off is a teardown, not a rename."""
         proc = self._run_guard(
@@ -895,6 +1445,108 @@ resource "google_service_account" "agent" {
         self.assertEqual(proc.returncode, 1)
         self.assertIn("enable_github_minter is true, but KMS signing key 'us-central1/github-token-minter-keyring/github-token-minter-key' has no ENABLED version.", proc.stderr)
         self.assertIn("Applying now would deploy the minter and wedge waiting on its readiness probe.", proc.stderr)
+        # A key never imported has nothing to restore: the import advice stands.
+        self.assertIn("Import the GitHub App private key before applying", proc.stderr)
+        self.assertNotIn("adopt-kms", proc.stderr)
+
+    def test_guard_minter_key_names_the_restore_when_versions_are_scheduled_for_destruction(self):
+        """A raw terraform destroy leaves the key's versions DESTROY_SCHEDULED.
+
+        The apply is still refused (the guard runs before adopt_kms, so a refused
+        apply changes no state), but the message names the restore adopt-kms does
+        instead of sending the operator to re-import the private key.
+        """
+        proc = self._run_guard(
+            "guard_minter_key",
+            tfvar_enable_minter='"true"',
+            gcloud_key_version="",
+            gcloud_scheduled_version="projects/test-project/locations/us-central1/keyRings/github-token-minter-keyring/cryptoKeys/github-token-minter-key/cryptoKeyVersions/1",
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("has no ENABLED version.", proc.stderr)
+        self.assertIn("Its versions are scheduled for destruction", proc.stderr)
+        self.assertIn("Run './lifecycle.sh adopt-kms'", proc.stderr)
+        self.assertNotIn("Import the GitHub App private key", proc.stderr)
+
+    def test_guard_minter_key_names_the_gcloud_restore_when_the_key_is_still_in_state(self):
+        """adopt_kms restores only a key it imports or untaints, so for a key still in
+        state the guard names the gcloud restore, not adopt-kms, which would change nothing."""
+        proc = self._run_guard(
+            "guard_minter_key",
+            tfvar_enable_minter='"true"',
+            gcloud_key_version="",
+            gcloud_scheduled_version="projects/test-project/locations/us-central1/keyRings/github-token-minter-keyring/cryptoKeys/github-token-minter-key/cryptoKeyVersions/1",
+            state_list="module.github_minter[0].google_kms_crypto_key.minter",
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("Its versions are scheduled for destruction", proc.stderr)
+        self.assertIn("The key is still in Terraform state", proc.stderr)
+        self.assertIn("gcloud kms keys versions restore <version> --key github-token-minter-key", proc.stderr)
+        self.assertNotIn("adopt-kms", proc.stderr)
+
+    def test_guard_minter_key_names_the_enable_when_versions_are_only_disabled(self):
+        """A restore leaves a version DISABLED until it is enabled: the guard names the
+        gcloud enable, in state or out of it, not a re-import."""
+        for state_list in ("", "module.github_minter[0].google_kms_crypto_key.minter"):
+            with self.subTest(state_list=state_list):
+                proc = self._run_guard(
+                    "guard_minter_key",
+                    tfvar_enable_minter='"true"',
+                    gcloud_key_version="",
+                    gcloud_disabled_version="projects/test-project/locations/us-central1/keyRings/github-token-minter-keyring/cryptoKeys/github-token-minter-key/cryptoKeyVersions/1",
+                    state_list=state_list,
+                )
+                self.assertEqual(proc.returncode, 1)
+                self.assertIn("has no ENABLED version.", proc.stderr)
+                self.assertIn("Its versions are disabled, as a restore leaves them.", proc.stderr)
+                self.assertIn(
+                    "gcloud kms keys versions enable <version> --key github-token-minter-key --keyring github-token-minter-keyring --location us-central1 --project test-project",
+                    proc.stderr,
+                )
+                self.assertIn(
+                    "import the new App key into this key and set githubMinter.kms.keyVersion to its version in extra_helm_values instead.",
+                    proc.stderr,
+                )
+                self.assertNotIn("versions restore", proc.stderr)
+                self.assertNotIn("adopt-kms", proc.stderr)
+                self.assertNotIn("Import the GitHub App private key before applying", proc.stderr)
+
+    def test_guard_minter_key_names_the_restore_when_versions_are_scheduled_and_disabled(self):
+        """Scheduled versions need the restore first; its advice already names the enable."""
+        proc = self._run_guard(
+            "guard_minter_key",
+            tfvar_enable_minter='"true"',
+            gcloud_key_version="",
+            gcloud_scheduled_version="projects/test-project/locations/us-central1/keyRings/github-token-minter-keyring/cryptoKeys/github-token-minter-key/cryptoKeyVersions/2",
+            gcloud_disabled_version="projects/test-project/locations/us-central1/keyRings/github-token-minter-keyring/cryptoKeys/github-token-minter-key/cryptoKeyVersions/1",
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("Its versions are scheduled for destruction", proc.stderr)
+        self.assertNotIn("Its versions are disabled", proc.stderr)
+
+    def test_guard_minter_key_keeps_the_import_advice_when_the_disabled_query_fails(self):
+        """If the DISABLED list fails, nothing says a version can be enabled, so the import advice stands."""
+        proc = self._run_guard(
+            "guard_minter_key",
+            tfvar_enable_minter='"true"',
+            gcloud_key_version="",
+            gcloud_disabled_fail=True,
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("Import the GitHub App private key before applying", proc.stderr)
+        self.assertNotIn("Its versions are disabled", proc.stderr)
+
+    def test_guard_minter_key_keeps_the_import_advice_when_the_scheduled_query_fails(self):
+        """If the second list fails, nothing says the versions are restorable, so the import advice stands."""
+        proc = self._run_guard(
+            "guard_minter_key",
+            tfvar_enable_minter='"true"',
+            gcloud_key_version="",
+            gcloud_scheduled_fail=True,
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("Import the GitHub App private key before applying", proc.stderr)
+        self.assertNotIn("adopt-kms", proc.stderr)
 
     def test_guard_minter_key_warns_and_proceeds_when_gcloud_fails(self):
         """When enable_github_minter is true but gcloud command fails, guard_minter_key logs warning and allows apply."""
@@ -925,6 +1577,9 @@ resource "google_service_account" "agent" {
         self.assertIn("KMS signing key 'us-central1/github-token-minter-keyring/github-token-minter-key' does not exist yet.", proc.stderr)
         self.assertIn("Applying now would deploy the minter and wedge waiting on its readiness probe.", proc.stderr)
         self.assertNotIn("Proceeding with apply", proc.stderr)
+        # The first-install wedge: nothing to restore, so the import advice stands.
+        self.assertIn("Import the GitHub App private key before applying", proc.stderr)
+        self.assertNotIn("adopt-kms", proc.stderr)
 
     def test_guard_minter_key_refuses_when_cloud_kms_is_not_enabled_yet(self):
         """A disabled Cloud KMS API is the same first-apply state as an absent key.
@@ -1067,6 +1722,125 @@ resource "google_service_account" "agent" {
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("could not read the state for tainted resources", proc.stderr)
         self.assertIn(f"untaint {self._KEYRING}", log)
+
+    # The minter's ownership check (#3504): adopt_kms imports a minter key ring
+    # or key this state doesn't hold only when it is this install's own, or the
+    # one github_minter_shared_kms_key names.
+    _MINTER_KEYRING = "module.github_minter[0].google_kms_key_ring.minter"
+    _MINTER_KEY = "module.github_minter[0].google_kms_crypto_key.minter"
+
+    @staticmethod
+    def _minter_gcloud(labels: str | None, key_exists: bool = True, labels_fail: bool = False) -> str:
+        """gcloud for the adoption: the ring exists, the key exists or not, and
+        `kms keys describe --format=value(labels)` prints the labels (or fails)."""
+        if labels_fail:
+            labels_behavior = "exit 1"
+        else:
+            labels_behavior = f"echo '{labels or ''}'; exit 0"
+        return (
+            'if [[ "$*" == *"kms keys describe"* && "$*" == *"value(labels)"* ]]; then\n'
+            f"    {labels_behavior}\n"
+            'elif [[ "$*" == *"kms keys describe"* ]]; then\n'
+            f"    exit {0 if key_exists else 1}\n"
+            "fi\n"
+            "exit 0"
+        )
+
+    def _adopt_minter(self, labels, **kwargs):
+        kwargs.setdefault("tfvar_cluster_name", '"cluster-b"')
+        return self._run_with_stub_log(
+            "adopt_kms",
+            state_list="",
+            tfvar_create_cluster="false",
+            tfvar_enable_minter="true",
+            tfvar_enable_google_chat="false",
+            gcloud_stub=self._minter_gcloud(labels, **{k: kwargs.pop(k) for k in ("key_exists", "labels_fail") if k in kwargs}),
+            **kwargs,
+        )
+
+    def test_another_installs_minter_key_is_refused(self):
+        proc, log = self._adopt_minter("kube-agents-cluster=cluster-a;kube-agents-namespace=kubeagents-system")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("belongs to install cluster-a/kubeagents-system", proc.stderr)
+        self.assertIn("github_minter_shared_kms_key", proc.stderr)
+        self.assertNotIn("import ", log)
+
+    def test_an_unlabelled_minter_key_is_refused(self):
+        """A key from before the labels may be another install's: refused, not guessed."""
+        proc, log = self._adopt_minter("")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("carries no owner labels", proc.stderr)
+        self.assertNotIn("import ", log)
+        # The way out for an install's own key from before the labels, on the
+        # paths that never ran the interview (upgrade.sh, the Day-2 menu).
+        self.assertIn("MINTER_ADOPT_KEY=github-token-minter-keyring/github-token-minter-key in install.env", proc.stderr)
+
+    def test_this_installs_own_minter_key_is_adopted(self):
+        proc, log = self._adopt_minter("kube-agents-cluster=cluster-b;kube-agents-namespace=kubeagents-system")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("its owner labels name this install", proc.stdout)
+        self.assertIn(f"import {self._MINTER_KEYRING}", log)
+        self.assertIn(f"import {self._MINTER_KEY}", log)
+
+    def test_the_same_cluster_in_another_namespace_is_another_install(self):
+        proc, log = self._adopt_minter("kube-agents-cluster=cluster-b;kube-agents-namespace=team-two")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("belongs to install cluster-b/team-two", proc.stderr)
+
+    def test_the_key_named_as_shared_is_adopted_whatever_its_labels(self):
+        proc, log = self._adopt_minter(
+            "", tfvar_minter_shared_key='"github-token-minter-keyring/github-token-minter-key"')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("names it as shared on purpose", proc.stdout)
+        self.assertIn(f"import {self._MINTER_KEY}", log)
+
+    def test_an_unlabelled_key_named_explicitly_is_adopted_as_this_installs_own(self):
+        """The installer names it when KMS_KEYRING and KMS_KEY were given; the apply then labels it."""
+        proc, log = self._adopt_minter(
+            "", tfvar_minter_adopt_key='"github-token-minter-keyring/github-token-minter-key"')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("carries no owner labels and was named explicitly", proc.stdout)
+        self.assertIn(f"import {self._MINTER_KEY}", log)
+
+    def test_labels_win_over_an_explicit_name(self):
+        proc, log = self._adopt_minter(
+            "kube-agents-cluster=cluster-a;kube-agents-namespace=kubeagents-system",
+            tfvar_minter_adopt_key='"github-token-minter-keyring/github-token-minter-key"')
+        self.assertEqual(proc.returncode, 1)
+        self.assertNotIn("import ", log)
+
+    def test_a_shared_key_naming_another_key_adopts_nothing(self):
+        """The opt-in names one resource; it isn't a switch that lets any key in."""
+        proc, log = self._adopt_minter(
+            "kube-agents-cluster=cluster-a;kube-agents-namespace=kubeagents-system",
+            tfvar_minter_shared_key='"github-token-minter-keyring/some-other-key"')
+        self.assertEqual(proc.returncode, 1)
+        self.assertNotIn("import ", log)
+
+    def test_a_ring_whose_key_does_not_exist_yet_is_adopted(self):
+        proc, log = self._adopt_minter("", key_exists=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(f"import {self._MINTER_KEYRING}", log)
+        self.assertNotIn(f"import {self._MINTER_KEY}", log)
+
+    def test_unreadable_owner_labels_refuse_rather_than_adopt(self):
+        proc, log = self._adopt_minter(None, labels_fail=True)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("Could not read the owner labels", proc.stderr)
+        self.assertNotIn("import ", log)
+
+    def test_a_minter_key_already_in_state_is_not_checked(self):
+        """An existing install's own key is in its state: no describe, no refusal."""
+        proc, log = self._run_with_stub_log(
+            "adopt_kms",
+            state_list=f"{self._MINTER_KEYRING}\n{self._MINTER_KEY}",
+            tfvar_create_cluster="false",
+            tfvar_enable_minter="true",
+            tfvar_enable_google_chat="false",
+            gcloud_stub=self._minter_gcloud(None, labels_fail=True),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("owner labels", proc.stderr)
 
     def test_the_tainted_list_is_not_read_when_no_kms_resource_is_in_state(self):
         proc, log = self._run_with_stub_log("adopt_kms", state_list="", gcloud_stub="exit 1")

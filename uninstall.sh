@@ -306,7 +306,7 @@ resolve_state_location() {
     # Remote state where the installer keeps it (or where the caller pointed
     # us): pin the backend for lifecycle.sh.
     export KUBE_AGENTS_STATE_BUCKET="${KUBE_AGENTS_STATE_BUCKET:-$DEFAULT_KUBE_AGENTS_STATE_BUCKET}"
-  elif ! printf '%s' "$probe_err" | grep -qiE "$GCS_OBJECT_ABSENT_PATTERN"; then
+  elif ! grep -qiE "$GCS_OBJECT_ABSENT_PATTERN" <<<"$probe_err"; then
     # Anything that is not a clean "absent" — refuse rather than report an
     # empty target. Reaching the local-state branches below on a permission
     # error would be the same mistake one level down.
@@ -929,6 +929,9 @@ main() {
   # Gateway redaction, for the same reason: the generator refuses a misspelt
   # toggle or a malformed rule, and the gateway goes with the release.
   export LITELLM_REDACTION_ENABLED="false" LITELLM_REDACTION_IP_ACTION="" LITELLM_REDACTION_IP_ALLOW_CIDRS="" LITELLM_REDACTION_RULES=""
+  # The gateway's spend ceiling, likewise: the generator refuses an amount or
+  # a period it cannot read, and the gateway goes with the release.
+  export LITELLM_BUDGET_USD="" LITELLM_BUDGET_PERIOD=""
   # The scoped service account pool, likewise: the generator refuses a
   # misspelt switch or a malformed cap, and the destroy removes the members
   # in state whatever these say.
@@ -937,6 +940,9 @@ main() {
   # value, and the destroy removes the two serving-project resources in state
   # whichever way the key renders.
   export VERTEX_MANAGE_SERVING_PROJECT=""
+  # The release's upgrade_install switch, likewise: the generator refuses a
+  # misspelt value, and the destroy removes the release however it renders.
+  export HELM_UPGRADE_INSTALL=""
   # The mode, likewise: the generator refuses a value outside the CRD's enum,
   # and the destroy removes the release whichever mode it renders.
   export PLATFORM_AGENT_MODE=""
@@ -968,6 +974,10 @@ main() {
     export MODEL_PROVIDER="$DEFAULT_MODEL_PROVIDER" MODEL_DEFAULT_NAME=""
   fi
   export WEB_CONSOLE_ENABLED="false"
+  # The minter keys a lifecycle.sh refusal asks an operator to type into
+  # install.env by hand: the composition refuses either one in the wrong shape,
+  # and a destroy has no use for them, since both only steer adoption.
+  export MINTER_SHARED_KEY="" MINTER_ADOPT_KEY=""
   write_tfvars_from_state "${compose_dir}/terraform.tfvars"
   (
     cd "$compose_dir"

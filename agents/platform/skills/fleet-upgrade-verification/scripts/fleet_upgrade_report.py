@@ -109,6 +109,16 @@ for _shared_dir in SHARED_SCRIPT_DIRS:
     if _shared_dir not in sys.path:
         sys.path.append(_shared_dir)
 import fleet_scope_args  # noqa: E402
+import collector_run  # noqa: E402
+
+# The JSON reads page through `kubectl get --raw`, one kind at a time
+# (collector_run.paged_dump), so a list the credential proxy would cut at its
+# output cap in one `-A -o json` read comes back whole in pages; the node read
+# keeps its jsonpath projection.
+Run = collector_run.Run
+paged_dump = collector_run.paged_dump
+paged_command_text = collector_run.paged_command_text
+failed_page_text = collector_run.failed_page_text
 
 # The scope this collector was handed, set by main from the scope flags.
 declared_scope = fleet_scope_args.DeclaredScope()
@@ -327,9 +337,7 @@ KUBECTL_WEBHOOK_RESOURCES = "validatingwebhookconfigurations,mutatingwebhookconf
 # code. The kinds are readiness_rules.READ_KINDS, named once for the rules and the report; a
 # failed command marks every kind it carried, including a partial listing.
 # KUBECTL_READS_PER_MEMBER, derived from the table, is the count the help cites.
-ALL_NAMESPACES_FLAG = "-A"
 OUTPUT_FLAG = "-o"
-JSON_OUTPUT_ARGS = (OUTPUT_FLAG, "json")
 READ_MODE_NAMESPACED_JSON = "namespaced-json"
 READ_MODE_CLUSTER_JSON = "cluster-json"
 READ_MODE_NODE_JSONPATH = "node-jsonpath"
@@ -358,10 +366,11 @@ NODE_RAW_FIELDS = 4
 NODE_POD_CIDR_KEY = "podCIDR"
 NODE_KIND = readiness_rules.KIND_NODE
 # The credential proxy caps each stream a brokered command returns; past the cap it writes
-# the cut stdout, prints a marker on stderr (readiness_rules.PROXY_TRUNCATION_MARKER, which
-# the audit-log reader checks too) and returns the command's own exit code, so a cut list
-# reads as rc 0 with output that may or may not parse. The marker, not the parse failure,
-# names the cause, and the kinds the read carried are recorded as cut.
+# the cut stdout and prints a marker on stderr (readiness_rules.PROXY_TRUNCATION_MARKER, which
+# the audit-log reader checks too), and the shim exits 74 on a cut payload (an older shim
+# returned the command's own exit code). Every reader checks the marker before the exit
+# code, so the marker, not the exit code or the parse failure, names the cause, and the
+# kinds the read carried are recorded as cut.
 PROXY_TRUNCATION_MARKER = readiness_rules.PROXY_TRUNCATION_MARKER
 KUBECTL_OUTPUT_CUT = "{cmd} output was cut at the credential proxy's output cap, so the list did not fit in one read"
 GCLOUD_OUTPUT_CUT = KUBECTL_OUTPUT_CUT  # one cap, one sentence, for a kubectl list and a gcloud list alike
@@ -373,6 +382,14 @@ GCLOUD_OUTPUT_CUT = KUBECTL_OUTPUT_CUT  # one cap, one sentence, for a kubectl l
 # row of its own under the table.
 NOTE_DIRECTORY_FAILED = "kubeconfig directory could not be created; PDBs and webhooks not graded"
 NOTE_CREDENTIALS_FAILED = "credentials for the cluster could not be fetched; PDBs and webhooks not graded"
+# A member spec.scope.exclude.clusters excludes (--scope-readiness-excluded-clusters):
+# the credential broker refuses its Kubernetes API, so the in-cluster reads don't
+# run and the rules that need them are not graded. Its versions still are.
+NOTE_EXCLUDED_CLUSTER = "excluded by spec.scope.exclude.clusters; in-cluster readiness not read"
+EXCLUDED_CLUSTER_READ = "excluded by spec.scope.exclude.clusters; the agents don't reach its Kubernetes API"
+READINESS_EXCLUDED_FLAG = "--scope-readiness-excluded-clusters"
+# The members whose in-cluster reads are skipped, as (project, location, cluster).
+readiness_excluded: frozenset[tuple[str, str, str]] = frozenset()
 NOTE_PDB_READ_FAILED = "PDB read failed; PDBs not graded"
 NOTE_WEBHOOK_READ_FAILED = "webhook read failed; webhooks not graded"
 NOTE_WEBHOOK_READ_SKIPPED = f"webhook read {WEBHOOK_READ_SKIPPED}; webhooks not graded"
@@ -562,10 +579,10 @@ def run_cmd(cmd: list[str], timeout: int = GCLOUD_TIMEOUT_SECONDS, env: dict | N
 def run_gcloud_json(cmd: list[str]) -> tuple[list | dict | None, str | None]:
     """Runs a gcloud command with JSON output and returns (parsed, error_message)."""
     rc, stdout, stderr = run_cmd(cmd)
-    if rc != 0:
-        return None, f"{' '.join(cmd)} failed ({rc}): {stderr.strip()}"
     if PROXY_TRUNCATION_MARKER in stderr:
         return None, GCLOUD_OUTPUT_CUT.format(cmd=" ".join(cmd))
+    if rc != 0:
+        return None, f"{' '.join(cmd)} failed ({rc}): {stderr.strip()}"
     if not stdout.strip():
         return [], None
     try:
@@ -941,23 +958,32 @@ def get_credentials_cmd(cluster: dict, project: str) -> list[str]:
     ]
 
 
-def _kubectl_get(resources: str, env: dict, namespaced: bool) -> tuple[list | None, str | None]:
-    """(items, error) of one `kubectl get <resources> [-A] -o json`; a list the credential
-    proxy cut at its output cap is an error naming the cap."""
-    cmd = [KUBECTL, "get", resources, *([ALL_NAMESPACES_FLAG] if namespaced else []), *JSON_OUTPUT_ARGS]
-    rc, stdout, stderr = run_cmd(cmd, KUBECTL_TIMEOUT_SECONDS, env)
-    if rc != 0:
-        return None, f"{' '.join(cmd)} failed ({rc}): {stderr.strip()}"
-    if PROXY_TRUNCATION_MARKER in stderr:
-        return None, KUBECTL_OUTPUT_CUT.format(cmd=" ".join(cmd))
-    try:
-        data = json.loads(stdout) if stdout.strip() else {}
-    except ValueError as e:
-        return None, f"{' '.join(cmd)} returned unparsable JSON: {e}"
-    items = data.get("items") if isinstance(data, dict) else None
-    if not isinstance(items, list):
-        return None, f"{' '.join(cmd)} returned no items list"
-    return items, None
+def _paged_run(argv: list[str], *, env: dict | None = None) -> Run:
+    """`run_cmd` in the shape the paged reader drives: one page's argv in, its `Run` out."""
+    rc, stdout, stderr = run_cmd(argv, KUBECTL_TIMEOUT_SECONDS, env)
+    return Run(argv, rc, stdout, stderr, 0.0)
+
+
+def _kubectl_get(resources: str, env: dict) -> tuple[list | None, str | None]:
+    """(items, error) of one read of `resources` (a kubectl kind list), one kind at a time in
+    pages through `kubectl get --raw`. An error names the page that failed, not every kind's
+    first page: the paged reader hands back the failing page's `Run`, and the one-page text
+    leaves the member's 160-character note room for the reason. A later page's `continue`
+    token is elided from that text (`collector_run.failed_page_text`): the token alone is
+    longer than the note and names a list that has moved on. The reason is the page's exit
+    code and stderr, or, for a page that exited 0, the reader's own text for what was wrong
+    with it (empty, not JSON, not a list, a repeated token). A page the credential proxy cut
+    at its output cap is an error naming the cap, as a cut list was."""
+    kinds = resources.split(",")
+    parsed, result = paged_dump(kinds, run=_paged_run, env=env)
+    if parsed is not None:
+        return parsed.get("items") or [], None
+    text = failed_page_text(result.argv)
+    if PROXY_TRUNCATION_MARKER in result.stderr:
+        return None, KUBECTL_OUTPUT_CUT.format(cmd=text)
+    if result.rc != 0:
+        return None, f"{text} failed ({result.rc}): {result.stderr.strip()}"
+    return None, f"{text} failed: {result.stderr.strip()}"
 
 
 def prepare_kubeconfig(kubeconfig_dir: str, path: str) -> str | None:
@@ -1098,10 +1124,10 @@ def _kubectl_nodes(env: dict) -> tuple[list[dict] | None, str | None]:
     when the cut fell on a line boundary and the lines before it parse."""
     cmd = [KUBECTL, "get", KUBECTL_NODE_RESOURCE, OUTPUT_FLAG, JSONPATH_OUTPUT_FORMAT.format(template=KUBECTL_NODE_JSONPATH)]
     rc, stdout, stderr = run_cmd(cmd, KUBECTL_TIMEOUT_SECONDS, env)
-    if rc != 0:
-        return None, f"{' '.join(cmd[:3])} failed ({rc}): {stderr.strip()}"
     if PROXY_TRUNCATION_MARKER in stderr:
         return None, KUBECTL_OUTPUT_CUT.format(cmd=" ".join(cmd[:3]))
+    if rc != 0:
+        return None, f"{' '.join(cmd[:3])} failed ({rc}): {stderr.strip()}"
     return parse_node_lines(stdout)
 
 
@@ -1109,7 +1135,7 @@ def _later_read(resources: str, mode: str, env: dict) -> tuple[list | None, str 
     """One read of LATER_READS, by its mode."""
     if mode == READ_MODE_NODE_JSONPATH:
         return _kubectl_nodes(env)
-    return _kubectl_get(resources, env, mode == READ_MODE_NAMESPACED_JSON)
+    return _kubectl_get(resources, env)
 
 
 def first_read_failed_before_the_server_answered(error: str) -> bool:
@@ -1119,6 +1145,18 @@ def first_read_failed_before_the_server_answered(error: str) -> bool:
     which the second read may still be answered through."""
     lowered = error.lower()
     return SERVER_ANSWERED_PREFIX not in lowered and any(marker in lowered for marker in FIRST_READ_SKIP_MARKERS)
+
+
+def excluded_read(cluster: dict, project: str, kubeconfig_dir: str) -> dict:
+    """The `read` dict for a member whose in-cluster reads don't run because the
+    install excludes it: no `get-credentials`, no kubectl, every read recorded as
+    not run, and `excluded` set so the notes say why rather than report a failure."""
+    path = kubeconfig_path(kubeconfig_dir, project, cluster.get("name", ""), cluster.get("location", ""))
+    read = {"kubeconfig": path, "items": None, "error": EXCLUDED_CLUSTER_READ, "webhook_items": None,
+            "webhook_error": EXCLUDED_CLUSTER_READ, "webhook_skipped": False, "credentials_error": None,
+            "directory_error": None, "excluded": True,
+            "read_errors": {kind: None for kind in readiness_rules.READ_KINDS}}
+    return _later_reads_skipped(read, readiness_rules.NO_READ_RAN_REASON)
 
 
 def read_cluster_objects(cluster: dict, project: str, kubeconfig_dir: str) -> dict:
@@ -1163,12 +1201,12 @@ def read_cluster_objects(cluster: dict, project: str, kubeconfig_dir: str) -> di
     if rc != 0:
         read["error"] = read["webhook_error"] = read["credentials_error"] = f"{' '.join(cmd)} failed ({rc}): {stderr.strip()}"
         return _later_reads_skipped(read, readiness_rules.NO_READ_RAN_REASON)
-    read["items"], read["error"] = _kubectl_get(KUBECTL_RESOURCES, env, True)
+    read["items"], read["error"] = _kubectl_get(KUBECTL_RESOURCES, env)
     if read["error"] is not None and first_read_failed_before_the_server_answered(read["error"]):
         read["webhook_skipped"] = True
         read["webhook_error"] = f"{WEBHOOK_READ_SKIPPED} ({read['error']})"
         return _later_reads_skipped(read, readiness_rules.LATER_READS_SKIPPED_REASON)
-    read["webhook_items"], read["webhook_error"] = _kubectl_get(KUBECTL_WEBHOOK_RESOURCES, env, True)
+    read["webhook_items"], read["webhook_error"] = _kubectl_get(KUBECTL_WEBHOOK_RESOURCES, env)
     if read["error"] is not None:
         return _later_reads_skipped(read, readiness_rules.LATER_READS_SKIPPED_REASON)
     for kinds, resources, mode in LATER_READS:
@@ -1260,7 +1298,9 @@ def assess_readiness(cluster: dict, member: dict, read: dict, at: datetime, flee
     status = readiness.readiness_status(pdbs, webhooks, maintenance, skew, target is not None, rules)
 
     notes = []
-    if read.get("directory_error"):
+    if read.get("excluded"):
+        notes.append(NOTE_EXCLUDED_CLUSTER)
+    elif read.get("directory_error"):
         notes.append(NOTE_DIRECTORY_FAILED)
     elif read.get("credentials_error"):
         notes.append(NOTE_CREDENTIALS_FAILED)
@@ -1411,7 +1451,12 @@ def build_report(projects: list[str], explicit_target: str | None, readiness_opt
             found.append((project, cluster))
     for project, cluster in found:
         member = grade_member(cluster, project, explicit_target, cache)
-        if readiness_options is not None:
+        if readiness_options is not None and (project, member["location"], member["cluster"]) in readiness_excluded:
+            # Not a failure, so no error row: the install chose to keep the agents
+            # out of this cluster's API, and the note says so on the member.
+            read = excluded_read(cluster, project, readiness_options["kubeconfig_dir"])
+            member["readiness"] = assess_readiness(cluster, member, read, readiness_options["at"], fleet, project_reads.for_member(project, member["location"]), graded=[c for _, c in found])
+        elif readiness_options is not None:
             read = read_cluster_objects(cluster, project, readiness_options["kubeconfig_dir"])
             # A credentials failure fills both slots with one message; a skipped webhook read is not a failure and gets no row.
             failed = (read["error"], None if read.get("webhook_skipped") else read.get("webhook_error"))
@@ -1901,9 +1946,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--rollout-in-progress", action="store_true", help="Assert a rollout is under way, so an unchanged, behind member is flagged stalled even when no other member moved.")
     parser.add_argument("--readiness", action="store_true", help=f"Also grade each member's readiness for the upgrade: drain-blocking PDBs and fail-closed webhooks with an unreachable backend in the upgrade's path or able to refuse the control plane's bootstrap RBAC writes (ClusterRoles and ClusterRoleBindings; Roles and RoleBindings in kube-system and kube-public), maintenance exclusions and window, node-pool skew, then the per-entry rules of the upgrade-failure catalogue (readiness_rules/; {KUBECTL_READS_PER_MEMBER} kubectl reads per member in all, each after the webhook read failing on its own), whose blockers join the verdict and whose risks get a column of their own; three gcloud list reads per project (backend services, instances, operations) and the server config per location feed them, one `clusters describe` and one `operations list` for the cluster confirm a member listed not RUNNING with no RUNNING operation, and the add-on inventory follows the readiness table.")
     parser.add_argument("--at", help="RFC 3339 instant to evaluate maintenance exclusions and the window at (default: now). Only with --readiness.")
+    parser.add_argument(READINESS_EXCLUDED_FLAG, default=None, help="project/location/cluster entries, space- or comma-separated, whose versions are graded but whose in-cluster readiness reads are skipped: the clusters spec.scope.exclude.clusters keeps the agents out of. Only with --readiness.")
     parser.add_argument("--kubeconfig-dir", help="Directory for the per-member kubeconfig files --readiness writes (default: $HERMES_HOME/.kubeconfigs).")
     args = parser.parse_args(argv)
     declared_scope.set(args.scope_projects, args.scope_unread, args.scope_exclude_clusters)
+    global readiness_excluded
+    try:
+        readiness_excluded = fleet_scope_args.parse_scope_exclude_clusters(getattr(args, READINESS_EXCLUDED_FLAG[2:].replace("-", "_")))
+    except ValueError as exc:
+        sys.stderr.write(f"{READINESS_EXCLUDED_FLAG}: {exc}\n")
+        return EXIT_USAGE
 
     if args.target_version and parse_version(args.target_version) is None:
         sys.stderr.write(f"--target-version {args.target_version!r} is not MAJOR.MINOR.PATCH[-gke.BUILD]\n")

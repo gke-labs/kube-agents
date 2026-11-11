@@ -111,6 +111,10 @@ FLAKY_CHECK_EXCLUDED_WORKFLOWS = (
     "Hold Unresolved Threads",
     "Merge Gate",
     "Risk Classification",
+    # A measurement lane, not a check on the tree: it downloads a control
+    # plane and seeds a cluster, gates nothing, and a red there is the
+    # fixture not running, reported by its own job and artifact.
+    "Scale Lane",
 )
 SCRIPTS_DIR = REPO_ROOT / "agents" / "platform" / "scripts"
 REPO_SCRIPTS = REPO_ROOT / "scripts"
@@ -187,11 +191,15 @@ class SpecToolRegistryTest(unittest.TestCase):
     # to use it, backticked or called
     # (test_the_core_allowlist_still_has_evidence_in_the_agent_text).
     # `terminal` is the tool a worker's shell commands go through, which
-    # delegated-proposal-stays-in-reply's safeguard reads (#2610).
-    HERMES_CORE_TOOLS = {"skill_view", "terminal"}
+    # delegated-proposal-stays-in-reply's safeguard reads (#2610); `web_search`
+    # is the built-in web lookup tool forbidden on the Autopilot headroom
+    # invariant check (#3141).
+    HERMES_CORE_TOOLS = {"skill_view", "terminal", "execute_code", "web_search"}
     CORE_TOOL_EVIDENCE = (
         "agents/platform/skills/github-issue-resolver/SKILL.md",
         "agents/platform/AGENTS.md",
+        "agents/cluster/SOUL.md",
+        "agents/platform/SOUL.md",
     )
 
     # Tools behind a remote MCP proxy (`/opt/mcp-remote/dist/proxy.js <url>`),
@@ -206,9 +214,16 @@ class SpecToolRegistryTest(unittest.TestCase):
         # #1765: the 50-a-day Developer Knowledge method the personas forbid
         # and knowledge-grounding-sources-probe's safeguard names.
         ("developer_knowledge", "answer_query"),
+        # #3141: Developer Knowledge lookup methods forbidden on the Autopilot
+        # headroom invariant check.
+        ("developer_knowledge", "search_documents"),
+        ("developer_knowledge", "get_documents"),
         # #953: read-only workload existence inspection across clusters
         ("gke", "get_k8s_resource"),
         ("gke", "describe_k8s_resource"),
+        ("gke", "list_k8s_events"),
+        ("gke", "get_k8s_logs"),
+        ("gke", "get_k8s_rollout_status"),
     }
     REMOTE_TOOL_EVIDENCE = (
         "agents/platform/SOUL.md",
@@ -873,6 +888,29 @@ class WorkflowNameJoinTest(unittest.TestCase):
             "but would not fail the check",
         )
 
+    def test_the_join_reads_each_shards_latest_attempt(self):
+        """A re-run shard's upload must not hide behind its earlier attempt's.
+
+        download-artifact keeps the same-named artifact with the highest ID,
+        and IDs do not follow upload order, so a join once read a re-run
+        shard's red first attempt. The shards put the run attempt in the name,
+        and the join keeps the latest attempt per shard before coverage-merge.
+        """
+        workflow = _yaml().safe_load((WORKFLOWS / "python-tests.yml").read_text())
+        uploads = [
+            step for step in workflow["jobs"]["test-shard"]["steps"]
+            if str(step.get("uses", "")).startswith("actions/upload-artifact@")
+        ]
+        self.assertEqual(len(uploads), 1, "the shard job does not have exactly one upload step")
+        self.assertIn("${{github.run_attempt}}", self._expr(uploads[0]["with"]["name"]),
+                      "the shard's artifact name does not carry the run attempt")
+        runs = [str(step.get("run", "")) for step in workflow["jobs"]["test"]["steps"]]
+        select = [i for i, run in enumerate(runs) if "scripts/coverage_shard_attempts.py" in run]
+        merge = [i for i, run in enumerate(runs) if "coverage-merge" in run]
+        self.assertEqual(len(select), 1, "the join does not run scripts/coverage_shard_attempts.py once")
+        self.assertEqual(len(merge), 1, "the join does not run coverage-merge once")
+        self.assertLess(select[0], merge[0], "the join merges before it keeps each shard's latest attempt")
+
     SHARD_RESULT = "${{needs.test-shard.result}}"
     BENCH_RESULT = "${{needs.bench-tests.result}}"
     NOT_SUCCESS = ("failure", "cancelled", "skipped")
@@ -1210,6 +1248,9 @@ class PoolPressureArtifactContractTest(unittest.TestCase):
                 "lease_failures_hours": doc["recent"]["hours"],
                 "no_build_id": sum(doc["no_build_id"].values()),
                 "max_concurrency": doc["max_concurrency"],
+                "breached_days": doc["trend"]["breached_days"],
+                "worst_s": int(day["worst_minutes"] * 60),
+                "waiting": doc["queue"]["waiting"],
             },
             {key: note[key] for key in note if key not in ("since", "measured_at")},
         )

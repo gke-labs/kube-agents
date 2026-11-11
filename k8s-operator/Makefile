@@ -26,12 +26,13 @@ CONTAINER_TOOL ?= docker
 PRETTIER := $(shell command -v prettier 2>/dev/null || echo npx prettier)
 
 # The CRD field reference pages on the docs site are generated from the API
-# types in api/v1alpha1, so `manifests` refreshes them beside the CRD YAML and
-# one command leaves both current. scripts/generate_docs.py registers one
-# block per kind under this prefix, so a kind added there is covered here
-# without an edit; `make docs-check-generated` at the repository root fails
-# when a page is stale.
-CRD_FIELD_DOC_BLOCK_PREFIX := crd-fields-
+# types in api/v1alpha1, and the PlatformAgent conditions table from
+# internal/controller/condition_docs.go, so `manifests` refreshes them beside
+# the CRD YAML and one command leaves all of it current. scripts/generate_docs.py
+# registers every such block under this prefix, so a kind added there is
+# covered here without an edit; `make docs-check-generated` at the repository
+# root fails when a page is stale.
+CRD_DOC_BLOCK_PREFIX := crd-
 
 # Setting SHELL to bash allows bash commands to be executed by recipes.
 # Options are set to exit when a recipe line exits non-zero or a piped command fails.
@@ -50,9 +51,9 @@ help: ## Display this help.
 ##@ Development
 
 .PHONY: manifests
-manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects, and the CRD field pages on the docs site.
+manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects, and the CRD field pages and conditions table on the docs site.
 	$(CONTROLLER_GEN) rbac:roleName=manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases
-	python3 ../scripts/generate_docs.py --block-prefix $(CRD_FIELD_DOC_BLOCK_PREFIX)
+	python3 ../scripts/generate_docs.py --block-prefix $(CRD_DOC_BLOCK_PREFIX)
 	@$(PRETTIER) --write "config/crd/bases/*.yaml" "config/rbac/*.yaml" "config/webhook/*.yaml" \
 		|| echo "WARNING: prettier did not run (not installed, or npm registry unreachable?). The regenerated YAML is left unformatted, which CI's prettier check will reject. Re-run prettier --write over config/ once prettier is available." >&2
 

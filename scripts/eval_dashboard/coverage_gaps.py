@@ -33,7 +33,10 @@ clears it"). When
 evidence store says at the current next-mode version key, the mode the main nightly grades (``trend.record_state``:
 ``would-admit``, ``would-demote``, ``collecting`` with the runs still needed
 for a full window of 20). They are ranked store ``would-admit`` first, then
-by whether the nightly record meets the bar, then by pass rate.
+by whether the nightly record meets the bar, then by pass rate. The issue's
+table names them in that order and nothing more, since the repository is
+public: the best candidate's record goes to the Chat digest line, every
+candidate's to the log.
 
 **How long.** From the allowlist record's ``since:`` when the entry is a record
 (#3968 section 1), else from ``since YYYY-MM-DD`` in the comment directly
@@ -63,7 +66,7 @@ line (hack/OWNERS). The issue names the move; a person makes it.
 Dry run is the default: reads happen, every write is printed. ``--live``
 writes; the workflow passes it under the switch the nightly bug filer uses
 (``NIGHTLY_BUGS_LIVE=true`` and ``CI_HEALTH_MUTE`` not ``true``).
-``digest_lines`` gives the 9 AM digest one line per uncovered domain
+``digest_lines`` gives the 11 AM digest one line per uncovered domain
 (``post_health.coverage_lines``); it reads no GitHub.
 """
 
@@ -96,7 +99,7 @@ try:
 except ImportError:
     domain_allowlist = None
 from eval_dashboard import ghcli, nightly, nightly_bugs, trend
-from eval_dashboard.post_health import NIGHTLY_URL
+from eval_dashboard.post_health import DOMAIN_SCORECARD_URL, NIGHTLY_URL
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 BLOCKING_ROSTER_PATH = domain_coverage.BLOCKING_ROSTER_PATH
@@ -131,7 +134,7 @@ BODY = """\
 
 {expiry}**Why it is uncovered:** {why}
 
-**Candidates** (the domain's cases on the nightly matrix with a `verification_spec`, not `expected_fail`, best first). The nightly record is the graded repetitions over the last {nights} nightly nights, read as the nightly bug filer reads them; **Bar** holds it to the roster's {bar_pct}% over at least {bar_runs} graded runs, and the evidence store applies the same bar at the current next-mode version key.
+**Candidates** (the domain's cases on the nightly matrix with a `verification_spec`, not `expected_fail`). They are ranked by their nightly record over the last {nights} nightly nights, read as the nightly bug filer reads them, and by their evidence-store record at the current next-mode version key; both are on the [domain scorecard]({scorecard_url}), held to the roster's bar of {bar_pct}% over at least {bar_runs} graded runs.
 
 {candidates}
 
@@ -139,14 +142,17 @@ Nightly report: {nightly_url}
 
 **What the owner decides** (one pull request, approved by the eval crew)
 
-- **Seat a candidate:** move its line from `hack/eval/nightly-cases.txt` into `hack/eval/presubmit-cases.txt` and `hack/eval/blocking-roster.txt`, delete the domain's `allowlist` entry in `docs/designs/domains.yaml`, and cite the record above.
+- **Seat a candidate:** move its line from `hack/eval/nightly-cases.txt` into `hack/eval/presubmit-cases.txt` and `hack/eval/blocking-roster.txt`, delete the domain's `allowlist` entry in `docs/designs/domains.yaml`, and cite its record on the domain scorecard.
 - **Fix the demoted case** and restore its roster line the same way.
 - **Keep it held out** on the presubmit (docs/eval-gate-roster.md), with the allowlist entry kept and its exit condition named.
 
 Kept current by `scripts/eval_dashboard/coverage_gaps.py` on the CI-health tick (docs/ci-health.md, "Coverage gaps"). It rewrites this body as the record moves, so put notes in comments; it finds the issue by the `presubmit-gate` label and the marker at the top, so keep both. Closing it as not planned keeps it closed for this gap; any other close is filed again on the next tick. It closes the issue with a comment when a roster case covers the domain again. It does not open the roster pull request.
 """
-TABLE_HEAD = "| Case | Nightly record | Bar | Evidence store |\n|---|---|---|---|"
-TABLE_ROW = "| `{case}`{held} | {record} | {bar} | {store} |"
+# The issue's table names the candidates and nothing else: their records
+# (record_text, bar_text, store_text) go to the Chat digest and the log, and
+# the repository is public.
+TABLE_HEAD = "| Candidate (best first) |\n|---|"
+TABLE_ROW = "| `{case}`{held} |"
 CANDIDATES_NOT_READ = "Not read this tick: the data.json it read held no cases."
 NO_CANDIDATES = "None: no case of this domain on the nightly matrix carries a `verification_spec` without `expected_fail`, off the roster. The domain needs a new case, or a spec on one it has, and this issue is where to ask for it."
 # Where the owner comes from: the domain row, or the allowlist record's own
@@ -327,17 +333,12 @@ def rank_key(c: dict):
     return (not store_admits, not c["meets_bar"], -(c["rate"] or 0), -c["graded"], c["case"])
 
 
-def find_gaps(repo_root: pathlib.Path, data: dict, store: dict | None, now: datetime.datetime) -> list[dict]:
-    """Every domain with no blocking seat, oldest gap first, each with its
-    owner, how long, why, and its ranked candidates (None when ``data``
-    holds no cases to rank). Raises ValueError when domains.yaml gives no
-    domains (an unreadable file must not read as every domain covered), and
-    BadRead when a gap is off the allowlist (a bad roster or task read must
-    not file or close anything)."""
-    rows, allowlist = load_domains(repo_root)
-    if not rows:
-        raise ValueError(f"{repo_root / case_owner.DOMAINS_PATH} gave no domains")
-    claims = domain_coverage.domain_claims(repo_root)
+def domain_candidates(repo_root: pathlib.Path, data: dict, store: dict | None) -> dict[str, list[dict]] | None:
+    """``{domain slug: its candidates, best first}`` for every domain with
+    one, covered or not (the understudies, ``understudies.py``); None when
+    ``data`` holds no cases to rank."""
+    if not data.get("cases"):
+        return None
     roster = set(eval_rosters.blocking_roster(repo_root / BLOCKING_ROSTER_PATH))
     try:
         presubmit = set(eval_rosters.presubmit_cases(repo_root / PRESUBMIT_CASES_PATH))
@@ -346,10 +347,6 @@ def find_gaps(repo_root: pathlib.Path, data: dict, store: dict | None, now: date
     nights = nightly_bugs.graded_nights(data)
     records = store_records(store, data)
     matrix = set(nightly.expected_cases(data))
-    # One calendar for both day counts in the body, UTC, the one expiry is
-    # read on: they roll over on the same tick.
-    today = now.astimezone(datetime.timezone.utc).date()
-    past = expired(repo_root, today)
     # A case with no verification_spec would cover nothing once seated.
     specced = {case_of(path) for path, _, has_spec in domain_coverage.task_claims(repo_root) if has_spec}
     by_domain: dict[str, list[str]] = {}
@@ -357,6 +354,29 @@ def find_gaps(repo_root: pathlib.Path, data: dict, store: dict | None, now: date
         fields = nightly_bugs.task_fields(case, repo_root)
         if fields and fields.get("domain") and not fields["expected_fail"]:
             by_domain.setdefault(fields["domain"], []).append(case)
+    return {slug: sorted((candidate(c, nights.get(c, []), records, c in presubmit) for c in cases), key=rank_key)
+            for slug, cases in by_domain.items()}
+
+
+def find_gaps(repo_root: pathlib.Path, data: dict, store: dict | None, now: datetime.datetime,
+              candidates: dict[str, list[dict]] | None = None) -> list[dict]:
+    """Every domain with no blocking seat, oldest gap first, each with its
+    owner, how long, why, and its ranked candidates (None when ``data``
+    holds no cases to rank; ``candidates`` is ``domain_candidates``' result
+    when the caller already has it). Raises ValueError when domains.yaml gives no
+    domains (an unreadable file must not read as every domain covered), and
+    BadRead when a gap is off the allowlist (a bad roster or task read must
+    not file or close anything)."""
+    rows, allowlist = load_domains(repo_root)
+    if not rows:
+        raise ValueError(f"{repo_root / case_owner.DOMAINS_PATH} gave no domains")
+    claims = domain_coverage.domain_claims(repo_root)
+    if candidates is None:
+        candidates = domain_candidates(repo_root, data, store)
+    # One calendar for both day counts in the body, UTC, the one expiry is
+    # read on: they roll over on the same tick.
+    today = now.astimezone(datetime.timezone.utc).date()
+    past = expired(repo_root, today)
     gaps = []
     for row in rows:
         slug = row["slug"]
@@ -367,7 +387,7 @@ def find_gaps(repo_root: pathlib.Path, data: dict, store: dict | None, now: date
         if since and since > today:
             log(f"warning: the allowlist entry for {slug} has since {since}, after today; read as not recorded")
             since = None
-        cands = sorted((candidate(c, nights.get(c, []), records, c in presubmit) for c in by_domain.get(slug, [])), key=rank_key) if data.get("cases") else None
+        cands = None if candidates is None else candidates.get(slug, [])
         gaps.append({
             "slug": slug, "name": row.get("name") or slug, "meaning": row.get("meaning") or "",
             "owner": (entry or {}).get("owner") or row.get("owner"), "owner_from_record": bool((entry or {}).get("owner")), "backup": row.get("backup"),
@@ -479,9 +499,7 @@ def candidates_block(gap: dict) -> str:
         return CANDIDATES_NOT_READ
     if not gap["candidates"]:
         return NO_CANDIDATES
-    rows = [TABLE_ROW.format(case=c["case"], held=" (held out on the presubmit)" if c["held_out"] else "", record=record_text(c),
-                             bar=bar_text(c), store=store_text(c["store"]))
-            for c in gap["candidates"][:CANDIDATES_IN_ISSUE]]
+    rows = [TABLE_ROW.format(case=c["case"], held=" (held out on the presubmit)" if c["held_out"] else "") for c in gap["candidates"][:CANDIDATES_IN_ISSUE]]
     more = len(gap["candidates"]) - CANDIDATES_IN_ISSUE
     return "\n".join([TABLE_HEAD, *rows] + ([f"\nAnd {more} more on the Nightly report."] if more > 0 else []))
 
@@ -491,7 +509,8 @@ def render_issue(gap: dict, refused: bool = False, assignees: list[str] | None =
     body = BODY.format(
         marker=MARKER.format(slug=gap["slug"]), name=gap["name"], slug=gap["slug"], how_long="for " + how_long(gap) if gap["days"] is not None else how_long(gap),
         meaning=gap["meaning"], addressee=addressee(gap, refused, assignees), expiry=expiry_text(gap), why=why_text(gap), nights=nightly_bugs.LOOKBACK_NIGHTS,
-        bar_pct=round(BAR_RATE * 100), bar_runs=BAR_RUNS, candidates=candidates_block(gap), nightly_url=NIGHTLY_URL)
+        bar_pct=round(BAR_RATE * 100), bar_runs=BAR_RUNS, candidates=candidates_block(gap), nightly_url=NIGHTLY_URL,
+        scorecard_url=DOMAIN_SCORECARD_URL)
     return title[:nightly_bugs.TITLE_MAX_CHARS], body[:nightly_bugs.ISSUE_BODY_MAX_CHARS]
 
 

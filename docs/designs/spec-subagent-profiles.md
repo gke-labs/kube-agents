@@ -173,6 +173,7 @@ spec:
 | `lifecycle.ttlSecondsAfterFinished`     | How long a finished Job lingers for `kubectl` inspection before GC.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `concurrency`                           | Max simultaneous pods for this profile. Replaces the board-wide `max_in_progress`, per profile instead of global.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `allowedTiers`                          | Optional, default `[read]`. The tiers this profile may run at, `read` and `unattended` (#3660, "Tiers and identity"). A task runs at its requester's tier and the dispatcher refuses one whose tier is not listed; a pinned production profile might allow only `read`. Tier is authority, so it lives on the CR, never in the persona.                                                                                                                                                                                                                                                              |
+| `parameters`                            | Optional. The task parameters the persona declares, `[{name, required}]`, at most 16 (amended 10/28, #3655). The gateway routes cluster work by them and the dispatcher refuses a submission missing a required one, since neither can read the persona image; the worker refuses to run when this list and the persona's differ.                                                                                                                                                                                                                                                                    |
 | `resources`                             | Pod resources. Default is the demo-proven class: 250m/512Mi requests, 1 CPU/2Gi limits.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 
 Everything here is dark content: the dispatcher and the profile CRD render nothing unless
@@ -240,6 +241,19 @@ profile's dispatch. Notes on the mechanics:
 - The demo created the pod first and published the task second, and papered over the race
   with a stream lookup. This ordering is the fix: the pod exists _because_ the message
   is already durable, so the worker's task fetch cannot miss.
+
+**Amended 10/28 (#3655):** the dispatcher is its own Deployment (`<agent>-a2a-dispatcher`,
+one replica, replaced with `Recreate`), not a controller in the operator, and it reads one
+shared durable per (profile, tier, kind) on `PROFILE_SUBMITS` (`a2a.submit.>`) rather than
+one per profile on `…in`. Ack-after-create is replaced by holding: the dispatcher keeps each
+submission unacknowledged for the task's whole life, with in-progress acks, and acks it
+only when the task ends (the worker's final lease renewal, an expired lease, or a passed
+deadline). A restart therefore redelivers every held task, and the task's lease record
+decides whether it is re-adopted, failed or dispatched. A submission past
+`queueTimeoutSeconds` gets terminal `rejected` with `reason: queue-timeout`, since nothing
+ran, in place of the field table's `failed` and `queue-deadline-exceeded`. The design spec's
+"Admission and holding" ([`spec-profiles-dispatch.md`](spec-profiles-dispatch.md)) has the
+rest.
 
 **The Job.** `backoffLimit: 0` - Kubernetes does not get to re-run an LLM task that may
 have half-performed side effects. Retry is a decision for the requester, made against the
@@ -322,10 +336,12 @@ What the operator renders per profile, as built (amended 10/6):
   which presents the ServiceAccount token alone, gets the dispatch subjects, its inbox and
   its topics. After it accepts a task it opens a task connection with the token as the
   connection token and a task credential as the password. The dispatcher signs the
-  credential (`a2a/taskcred`), and the callout refuses it unless its pod name and UID are
-  the pod the token is bound to, and its profile and tier are the entry's. The task
-  connection gets that one task's `.events` publish and its three consumers, filtered
-  exactly on the task. They and its inbox are named for the task, not the pod
+  credential (`a2a/taskcred`) and sends it on the confirm as `taskCredential`, with a
+  `proxyToken` for the credential proxy when the task names a cluster (contract addendum 8;
+  [the dispatch design](spec-profiles-dispatch.md) has the details). The callout refuses it
+  unless its pod name and UID are the pod the token is bound to, and its profile and tier
+  are the entry's. The task connection gets that one task's `.events` publish and its
+  three consumers, filtered exactly on the task. They and its inbox are named for the task, not the pod
   (`<pod>_<task>-origin`, `-in`, `-events`, and `_INBOX.<pod>_<task>`), because a consumer's
   info, pull and delete subjects carry only its name, and a pod-named consumer would be
   reachable from the pod's next task. A credential may run to the callout's maximum task
@@ -345,15 +361,18 @@ What the operator renders per profile, as built (amended 10/6):
   shim, and they reach the shared broker, not a proxy in the worker's pod (one there could
   ask the metadata server for the broker's Workload Identity token). The broker gives them a
   role of its own, `profile`, by the audience `kubeagents-credential-proxy-profile`: the exec
-  route only, `kubectl` and `gcloud` only, with the session pods' `kubectl` flag allowlist.
+  route, `kubectl` and `gcloud` only, with the session pods' `kubectl` flag allowlist, and,
+  with a task credential, the MCP relay for Developer Knowledge's two document reads alone
+  (`mcp_policy.PROFILE_SERVER_TOOLS`).
   The operator renders the audience, an identity map from each tier's ServiceAccount to its
   (profile, tier) (`CREDENTIAL_PROXY_PROFILE_IDENTITIES`, from the callout map's profile
   entries), those ServiceAccounts on the broker's callers, and the task-signing public key
-  (`A2A_TASK_SIGNING_PUBLIC_KEYS`). It newly reserves four names against `spec.deployment.env`:
+  (`A2A_TASK_SIGNING_PUBLIC_KEYS`). It newly reserves five names against `spec.deployment.env`:
   `CREDENTIAL_PROXY_PROFILE_AUDIENCE`, `CREDENTIAL_PROXY_PROFILE_IDENTITIES`,
-  `A2A_TASK_SIGNING_PUBLIC_KEYS` and `A2A_TASK_CREDENTIAL_MAX_LIFETIME`;
-  `CREDENTIAL_PROXY_ALLOWED_CALLERS` was reserved already. The operator doesn't render the
-  max lifetime yet. The broker's fence admits the profile namespace and
+  `A2A_TASK_SIGNING_PUBLIC_KEYS`, `A2A_TASK_CREDENTIAL_MAX_LIFETIME` and
+  `A2A_TASK_SIGNING_SEED_FILE`; `CREDENTIAL_PROXY_ALLOWED_CALLERS` was reserved already.
+  **Amended 11/5 (#4471):** the operator renders the max lifetime, one value for the callout,
+  the broker and the dispatcher. The broker's fence admits the profile namespace and
   the profile namespace's fence lets it out to the broker's credentialed port.
   - The shim reads the dispatcher's `proxyToken` from `CREDENTIAL_PROXY_TASK_TOKEN_FILE` on
     every call and sends it in `X-Kube-Agents-Task-Credential`, never in the body. The
@@ -391,9 +410,9 @@ What the operator renders per profile, as built (amended 10/6):
     `--name=value` token, then positionals), and its executor reads the parse for the
     kubeconfig, isolation and `get-credentials`, never parsing the argv again. The shim honours no
     `KUBECONFIG` or `CLOUDSDK_*` override for a task, and says so. Profile calls hold at most
-    `CREDENTIAL_PROXY_PROFILE_SLOTS` (default 4) of the broker's command slots, clamped to the pool
-    less the session share and one (never below one), so the platform agent's shell keeps a
-    slot given a pool larger than the session share plus one.
+    `CREDENTIAL_PROXY_PROFILE_SLOTS` (default 4) of the broker's command slots, clamped to the
+    background share: profile work is background, which holds at most the admitted count less two,
+    so on a pod that admits three or more, interactive work keeps two admissions ([`credential-broker-exec-tier.md`](credential-broker-exec-tier.md) §4.2).
   - Nothing may change what a later bare command targets. `gcloud config set`, `unset` and
     `configurations`, and every `kubectl config` write (`use-context`, `set-context`,
     `set-cluster`, `set-credentials` and the rest) are refused with or without a credential.
@@ -573,9 +592,10 @@ the dispatcher exists there is no janitor ROLE for profile-addressed tasks; the 
 bridge's startup sweep is the executor finalising its own predecessor's orphan and writes
 on `…events` as itself. No role is not the same as no writer, and the render is the thing
 to read: the gateway's supervisor grant is `a2a.tasks.*.*.supervisor`, a wildcard over the
-addressee, so the gateway can write every profile's supervisor subject even though nothing
-asks it to. Production would scope that grant to the sessions the gateway spawned; a static
-render cannot express it. A consumer with no configured supervisor name falls back to the
+addressee, which a static render cannot scope to the sessions the gateway spawned. The render
+instead denies the gateway `a2a.tasks.<profile>.*.supervisor` for each bound or draining
+profile, so it cannot publish directly to a profile's supervisor subject. That deny covers
+direct publishes only. A consumer with no configured supervisor name falls back to the
 negative form - `from` is not the addressee - which a gateway-credentialled terminal
 satisfies. So do not model a profile task's `…supervisor` as unreachable, and do not treat
 an envelope arriving there as impossible.

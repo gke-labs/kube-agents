@@ -18,6 +18,8 @@ import (
 	"sync"
 	"time"
 	"unicode"
+
+	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
 )
 
 const (
@@ -80,6 +82,42 @@ const (
 	// summary line until the relay names one, on a served pull or a refused
 	// one; a relay that predates naming it never does.
 	gchatSubscriptionUnreported = "(not reported by the relay)"
+	// gchatQuotedReadTimeout bounds the read of a message a member quoted
+	// in reply (quotedAsk). The read runs off the event pump, so it is not
+	// held to the pull cadence; the bound is so a stalled relay cannot hold
+	// the member's turn back forever.
+	gchatQuotedReadTimeout = 10 * time.Second
+	// gchatQuotedAsk is the turn's text for a message that quotes another
+	// and says nothing of its own: the quote, framed as every ask made of
+	// someone else's message is (shortcut_ask.go).
+	gchatQuotedAsk = shortcutAskOpen + " I quoted it in my reply:\n\n%s\n\n" + shortcutAskRule
+	// gchatQuotedAskWithWords is the turn's text when the member typed
+	// words beside the quote: their words first, then the message quoted.
+	gchatQuotedAskWithWords = "%s\n\nThe message I quoted in my reply:\n\n%s\n\n" + shortcutAskRule
+	// gchatQuotedOwnAsk and gchatQuotedOwnAskWithWords are the two frames
+	// for a quote of the gateway's own message: a member quote-replies
+	// "yes" to its question or "why?" to its answer, which is Chat's
+	// ordinary reply gesture, so the quote is context and carries no rule
+	// sentence (ownQuoted).
+	gchatQuotedOwnAsk          = "Look into this message of yours for me. I quoted it in my reply:\n\n%s"
+	gchatQuotedOwnAskWithWords = "%s\n\nThe message of yours I quoted in my reply:\n\n%s"
+	// gchatQuotedUnreadWords and gchatQuotedUnreadBare are the one line
+	// posted in the conversation when the quoted message could not be
+	// read, or had nothing to read: with the member's words, the turn goes
+	// ahead on those and the router posts the line as it hands them to an
+	// agent (InboundMessage.QuotedUnread); without, nothing starts and the
+	// adapter's line says what to do. A failed quote an agent would have
+	// read is never silent.
+	gchatQuotedUnreadWords = "I couldn't read the message you quoted, so I'm answering your words alone."
+	gchatQuotedUnreadBare  = "I couldn't read the message you quoted. Paste its text, or ask again in a moment."
+	// gchatQuoteTypeForward is the quoteType of a message quoted from
+	// another space or thread; REPLY, the default, quotes one in the same.
+	gchatQuoteTypeForward = "FORWARD"
+	// gchatGetMethod reads one message (spaces.messages.get).
+	gchatGetMethod = "get"
+	// gchatShuttingDownReason is the drop reason for a turn composed after
+	// Run's context ended: the pump hands nothing over then.
+	gchatShuttingDownReason = "the gateway is shutting down"
 )
 
 const (
@@ -120,6 +158,20 @@ const (
 	gchatThreadsToken   = "/threads/"
 	// gchatUsersToken prefixes a user resource name ("users/{id}").
 	gchatUsersToken = "users/"
+	// gchatMentionOpen opens the <users/…> mention Chat parses out of
+	// message text; gchatMentionDefused is what it posts as instead.
+	gchatMentionOpen    = "<" + gchatUsersToken
+	gchatMentionDefused = "< " + gchatUsersToken
+	// gchatTextMax bounds one posted text, in bytes, under Chat's 32,000-byte
+	// message cap with room for the markdown rules' few added bytes and a
+	// laid-out message's buttons: a rendered chunk past it posts its tables
+	// as written (toGchatText), and a laid-out message past it posts its
+	// fallback (renderGchatChat).
+	gchatTextMax = 30000
+	// gchatLayoutUpdateMask names what a laid-out edit replaces: the text
+	// and the accessory widgets, in the field-path spelling the Chat API's
+	// messages.patch takes.
+	gchatLayoutUpdateMask = "text,accessory_widgets"
 )
 
 // Google Chat's own vocabulary, as it appears in event payloads and API
@@ -276,6 +328,53 @@ type gchatMessage struct {
 	// that does not support reply threading.
 	ThreadReply bool        `json:"threadReply"`
 	Sender      gchatSender `json:"sender"`
+	// AccessoryWidgets are the buttons under the message, as a click event
+	// carries the clicked message (gchat_clicks.go).
+	AccessoryWidgets []gchatAccessoryWidget `json:"accessoryWidgets"`
+	// QuotedMessageMetadata is the message this one quotes, when the member
+	// quoted one in reply (Chat API Message resource, field
+	// quotedMessageMetadata): the quoted message's name, its quoteType
+	// (REPLY in the same thread or space, FORWARD from another), and
+	// Chat's output-only snapshot of it, the author's name as a string and
+	// the text, with formattedText and the attachments on a FORWARD. The
+	// snapshot is what the agent gets when it carries content; the message
+	// is read only when it does not (quotedAsk).
+	QuotedMessageMetadata struct {
+		Name      string `json:"name"`
+		QuoteType string `json:"quoteType"`
+		Snapshot  struct {
+			Sender        string `json:"sender"`
+			Text          string `json:"text"`
+			FormattedText string `json:"formattedText"`
+			Attachments   []struct {
+				ContentName string `json:"contentName"`
+			} `json:"attachments"`
+		} `json:"quotedMessageSnapshot"`
+	} `json:"quotedMessageMetadata"`
+}
+
+// gchatQuotedMessage is the part of a quoted message's spaces.messages.get
+// answer the adapter puts to the agent: its text (formattedText when the
+// plain text is empty), who posted it, and the names of its files (Chat API
+// Message resource: text, formattedText, sender, attachment[].contentName).
+type gchatQuotedMessage struct {
+	Text          string      `json:"text"`
+	FormattedText string      `json:"formattedText"`
+	Sender        gchatSender `json:"sender"`
+	Attachment    []struct {
+		ContentName string `json:"contentName"`
+	} `json:"attachment"`
+}
+
+// gchatQuoted is a quoted message as the agent gets it: who posted it, its
+// content, and what is known of the poster's kind, from the snapshot or the
+// read (quotedMessage).
+type gchatQuoted struct {
+	poster  string
+	content string
+	// senderType is the poster's Chat user type when the read gave one
+	// (HUMAN or BOT); the snapshot names the poster and says no more.
+	senderType string
 }
 
 // gchatEvent is one Chat event normalized to the legacy field layout: Type
@@ -300,6 +399,8 @@ type gchatEvent struct {
 	// or, for an add-on event carrying some other payload, that payload's
 	// key(s).
 	shape string
+	// click is set on a CARD_CLICKED event (gchat_clicks.go).
+	click *gchatClick
 }
 
 // gchatWireEvent is the union of both wire shapes as JSON sees them.
@@ -308,6 +409,14 @@ type gchatWireEvent struct {
 	Space   gchatSpace                 `json:"space"`
 	Message gchatMessage               `json:"message"`
 	Chat    map[string]json.RawMessage `json:"chat"`
+	Common  gchatCommonEvent           `json:"commonEventObject"`
+	// The legacy layout's click fields (gchat_clicks.go, decodeGchatLegacyClick):
+	// the clicker, the event time, the button's action, and the common
+	// event object under its legacy key.
+	User         gchatSender       `json:"user"`
+	EventTime    string            `json:"eventTime"`
+	Action       gchatLegacyAction `json:"action"`
+	LegacyCommon gchatCommonEvent  `json:"common"`
 }
 
 // gchatAddonMessagePayload is chat.messagePayload of the add-on event object.
@@ -318,7 +427,8 @@ type gchatAddonMessagePayload struct {
 
 // GoogleChatAdapter implements Adapter over the credential proxy's chat
 // relay: events arrive by long-polling the relay's A2A event routes, and
-// posts, edits, roster reads and openDirect ride its Chat API passthrough.
+// posts, edits, roster reads, openDirect and the read of a message a member
+// quoted ride its Chat API passthrough.
 // The adapter holds no cloud credential — it authenticates to the relay with
 // the pod's projected ServiceAccount token, and the one Chat credential in
 // the deployment stays in the credential proxy.
@@ -334,6 +444,12 @@ type GoogleChatAdapter struct {
 	// seenOrder is its eviction queue, bounded at gchatSeenCap.
 	seen      map[string]bool
 	seenOrder []string
+	// posted records the names of the messages this process created, so a
+	// quote of one is read as the gateway's own (ownQuoted). postedOrder is
+	// its eviction queue, bounded at gchatSeenCap like seen; a message from
+	// before a restart is not remembered.
+	posted      map[string]bool
+	postedOrder []string
 	// userIDs maps a sender's immutable users/{id} resource name to the
 	// email Chat asserted for them, learned from inbound events. Under app
 	// credentials Chat withholds member emails from spaces.members.list
@@ -343,6 +459,25 @@ type GoogleChatAdapter struct {
 	// inverse, for OpenDirect.
 	userIDs    map[string]string
 	userEmails map[string]string
+	// ux is the click state: the questions posted, the clicks waiting on
+	// verification, and the questions answered (gchat_clicks.go).
+	// syncRewrites runs an answered question's rewrite inline, under test.
+	ux           *gchatUX
+	syncRewrites bool
+	// rewrites counts the rewrites goRewrite runs off the inbox worker,
+	// so a test can wait for them to finish.
+	rewrites sync.WaitGroup
+	// feedback is the answer-feedback recorder the gateway hands over
+	// (FeedbackSink); until then no rating buttons are drawn.
+	feedback FeedbackRecorder
+	// boardActor and boardAdmits are the board route and the admission
+	// rule the gateway hands over for a board-health row's Retry and Drop
+	// (BoardActSink, BoardAdmitSink; gchat_board.go); until both are set a
+	// tap changes nothing. now is the clock a tapped row's time is read
+	// from, time.Now outside a test.
+	boardActor  BoardActor
+	boardAdmits BoardAdmits
+	now         func() time.Time
 
 	// countInterval paces the received-events summary line
 	// (gchatEventCountInterval; tests shorten it). subscription is the Chat
@@ -354,6 +489,34 @@ type GoogleChatAdapter struct {
 	// metrics counts each pull by outcome beside the summary line's counts
 	// (SetMetrics; nil counts nothing).
 	metrics *Metrics
+
+	// quotedReadTimeout bounds the read of a quoted message
+	// (gchatQuotedReadTimeout; tests shorten it).
+	quotedReadTimeout time.Duration
+	// admits is the gateway's admission gate (SetSenderAdmission), read
+	// before the line on a quote that could not be read is posted: the
+	// adapter posts nothing in a sender's conversation ahead of the gateway
+	// for a sender it would refuse. Nil admits nobody.
+	admits SenderAdmission
+}
+
+var _ SenderAdmissionSink = (*GoogleChatAdapter)(nil)
+
+// SetSenderAdmission receives the gateway's admission gate
+// (SenderAdmissionSink).
+func (a *GoogleChatAdapter) SetSenderAdmission(admits SenderAdmission) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.admits = admits
+}
+
+// admitted reports whether the gateway would take a turn from the sender of
+// msg, or false when it has not said how it decides.
+func (a *GoogleChatAdapter) admitted(msg InboundMessage) bool {
+	a.mu.Lock()
+	admits := a.admits
+	a.mu.Unlock()
+	return admits != nil && admits(gchatBackend, msg.AuthorID)
 }
 
 // SetMetrics gives the adapter the gateway's counters, so each pull is
@@ -379,23 +542,31 @@ func NewGoogleChatAdapter(relayURL, tokenPath string, log *slog.Logger) (*Google
 		client:     &http.Client{Timeout: gchatRelayTimeout},
 		log:        log,
 		seen:       map[string]bool{},
+		posted:     map[string]bool{},
 		userIDs:    map[string]string{},
 		userEmails: map[string]string{},
 
-		countInterval: gchatEventCountInterval,
+		countInterval:     gchatEventCountInterval,
+		quotedReadTimeout: gchatQuotedReadTimeout,
 	}, nil
 }
 
 // apiCall runs one Chat API method through the relay passthrough and decodes
-// the response body into out when out is non-nil.
+// the response body into out when out is non-nil. The call is bounded by
+// the client's own timeout alone (gchatRelayTimeout).
 func (a *GoogleChatAdapter) apiCall(resource []string, method string, arguments map[string]any, out any) error {
+	return a.apiCallContext(context.Background(), resource, method, arguments, out)
+}
+
+// apiCallContext is apiCall under ctx, for a read with a budget of its own.
+func (a *GoogleChatAdapter) apiCallContext(ctx context.Context, resource []string, method string, arguments map[string]any, out any) error {
 	payload, err := json.Marshal(map[string]any{
 		"resource": resource, "method": method, "arguments": arguments,
 	})
 	if err != nil {
 		return fmt.Errorf("gchat: encoding %s.%s: %w", strings.Join(resource, "."), method, err)
 	}
-	resp, err := a.relayPost(gchatRelayAPIPath, payload)
+	resp, err := a.relayPostContext(ctx, gchatRelayAPIPath, payload)
 	if err != nil {
 		return err
 	}
@@ -426,7 +597,12 @@ func (a *GoogleChatAdapter) authorize(req *http.Request) error {
 
 // relayPost is one authenticated POST to the relay.
 func (a *GoogleChatAdapter) relayPost(path string, payload []byte) ([]byte, error) {
-	req, err := http.NewRequest(http.MethodPost, a.relayURL+path, bytes.NewReader(payload))
+	return a.relayPostContext(context.Background(), path, payload)
+}
+
+// relayPostContext is relayPost under ctx.
+func (a *GoogleChatAdapter) relayPostContext(ctx context.Context, path string, payload []byte) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.relayURL+path, bytes.NewReader(payload))
 	if err != nil {
 		return nil, fmt.Errorf("gchat: building relay request: %w", err)
 	}
@@ -460,19 +636,8 @@ func (a *GoogleChatAdapter) Post(conversation, text string) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("gchat: not a gchat conversation: %q", conversation)
 	}
-	body := map[string]any{"text": toGchatText(text)}
-	arguments := map[string]any{"parent": space, "body": body}
-	if thread != "" {
-		body["thread"] = map[string]any{"name": thread}
-		arguments["messageReplyOption"] = gchatReplyOption
-	}
-	var created struct {
-		Name string `json:"name"`
-	}
-	if err := a.apiCall([]string{"spaces", "messages"}, "create", arguments, &created); err != nil {
-		return "", err
-	}
-	return created.Name, nil
+	message, _, err := a.create(space, thread, map[string]any{"text": toGchatText(text)})
+	return message, err
 }
 
 // PostNotify writes text into space, as a new thread when thread is empty or
@@ -484,7 +649,103 @@ func (a *GoogleChatAdapter) PostNotify(space, thread, text string) (message, lan
 	if !gchatIsSpaceName(space) {
 		return "", "", fmt.Errorf("gchat: not a space name: %q", space)
 	}
-	body := map[string]any{"text": toGchatText(text)}
+	return a.create(space, thread, map[string]any{"text": toGchatText(text)})
+}
+
+// Edit replaces the text of a previously posted message (Adapter.Edit) — the
+// rolling progress line edits one message as artifacts arrive. It is
+// EditMessage with the text alone: the widgets are patched empty too, since
+// the message may have been laid out before, in this process or one a
+// restart replaced, and a question it asked is closed.
+func (a *GoogleChatAdapter) Edit(conversation, messageID, text string) error {
+	return a.EditMessage(conversation, messageID, OutMessage{Text: text})
+}
+
+// PostMessage posts a message value: a chat message laid out as a text
+// message with accessory buttons (renderGchatChat, gchat_chat.go), with
+// m.Text as the fallback the gateway posts when the layout is refused; one
+// with no chat message is Post, or postStopLine for a running task's line
+// (gchat_stop.go; a laid-out line is only ever an edit, so m.Stop is read
+// on EditMessage alone for one), or postRatedText for a rated answer. A
+// layout this renderer will not send, or one Chat's API refuses, is
+// ErrLayoutRefused, so the gateway posts the text instead
+// (Gateway.chatOutcome); a failed call is returned as it is.
+func (a *GoogleChatAdapter) PostMessage(conversation string, m OutMessage) (string, error) {
+	if m.Chat == nil && m.Stop != "" {
+		return a.postStopLine(conversation, m.Text, m.Stop)
+	}
+	if m.Chat == nil && a.rates(m) {
+		return a.postRatedText(conversation, m)
+	}
+	if m.Chat == nil {
+		return a.Post(conversation, m.Text)
+	}
+	space, thread, ok := gchatSpaceThread(conversation)
+	if !ok {
+		return "", fmt.Errorf("gchat: not a gchat conversation: %q", conversation)
+	}
+	name, _, err := a.createLaidOut(space, thread, conversation, m)
+	return name, err
+}
+
+// PostNotifyMessage is PostMessage for the chat.notify route's home posts
+// (notifyChatPoster): the same laid-out message into space, as a new thread
+// or on thread, and the thread it landed in back, as PostNotify gives it.
+func (a *GoogleChatAdapter) PostNotifyMessage(space, thread string, m OutMessage) (message, landed string, err error) {
+	if !gchatIsSpaceName(space) {
+		return "", "", fmt.Errorf("gchat: not a space name: %q", space)
+	}
+	if m.Chat == nil {
+		return a.PostNotify(space, thread, m.Text)
+	}
+	return a.createLaidOut(space, thread, "", m)
+}
+
+// createLaidOut lays m.Chat out and creates it in space, as a reply on
+// thread when one is given, records the layout it sent (gchat_layout.go),
+// and remembers the question when it carries choices, bound to
+// conversation (empty for a home post). A rated answer in a conversation
+// ends with the rating buttons; when Chat refuses that layout it is created
+// once more without them, and that outcome is returned and recorded.
+func (a *GoogleChatAdapter) createLaidOut(space, thread, conversation string, m OutMessage) (message, landed string, err error) {
+	layout, err := renderGchatChat(m.Chat)
+	if err != nil {
+		return "", "", fmt.Errorf("%w: %w", ErrLayoutRefused, err)
+	}
+	if conversation == "" {
+		layout = gchatHomeButtons(layout)
+	}
+	var rating gchatRating
+	if conversation != "" && a.rates(m) {
+		rating.task = m.Feedback
+	}
+	rated := layout
+	rated.Widgets = gchatWithRating(layout.Widgets, rating)
+	message, landed, err = a.create(space, thread, gchatLayoutBody(rated))
+	if err != nil {
+		err = gchatLayoutError(err, false)
+		if rating.task == "" || !errors.Is(err, ErrLayoutRefused) {
+			return "", "", err
+		}
+		rating = gchatRating{}
+		if message, landed, err = a.create(space, thread, gchatLayoutBody(layout)); err != nil {
+			return "", "", gchatLayoutError(err, false)
+		}
+	}
+	sent := layout
+	if rating.task != "" {
+		a.rememberRating(message, rating)
+		sent = rated
+	}
+	a.trackQuestion(message, conversation, m.Chat)
+	a.trackLayout(message, m.Chat, sent)
+	return message, landed, nil
+}
+
+// create is spaces.messages.create with body, in space as a new thread or
+// as a reply on thread (degrading to a new thread when that one cannot take
+// replies), returning the message's name and the thread it landed in.
+func (a *GoogleChatAdapter) create(space, thread string, body map[string]any) (message, landed string, err error) {
 	arguments := map[string]any{"parent": space, "body": body}
 	if thread != "" {
 		body["thread"] = map[string]any{"name": thread}
@@ -499,31 +760,139 @@ func (a *GoogleChatAdapter) PostNotify(space, thread, text string) (message, lan
 	if err := a.apiCall([]string{"spaces", "messages"}, "create", arguments, &created); err != nil {
 		return "", "", err
 	}
+	a.rememberPosted(created.Name)
 	return created.Name, created.Thread.Name, nil
 }
 
-// Edit replaces the text of a previously posted message (Adapter.Edit) — the
-// rolling progress line edits one message as artifacts arrive.
-func (a *GoogleChatAdapter) Edit(conversation, messageID, text string) error {
+// rememberPosted records a message this process created, evicting the
+// oldest at the cap (ownQuoted reads it).
+func (a *GoogleChatAdapter) rememberPosted(name string) {
+	if name == "" {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.posted[name] {
+		return
+	}
+	a.posted[name] = true
+	a.postedOrder = append(a.postedOrder, name)
+	if len(a.postedOrder) > gchatSeenCap {
+		delete(a.posted, a.postedOrder[0])
+		a.postedOrder = a.postedOrder[1:]
+	}
+}
+
+// EditMessage replaces a posted message with a message value, laid out when
+// it carries a chat message. Without one the text replaces the layout too:
+// the accessory widgets are sent empty, since a patch keeps whatever its
+// mask does not name.
+func (a *GoogleChatAdapter) EditMessage(conversation, messageID string, m OutMessage) error {
 	if _, _, ok := gchatSpaceThread(conversation); !ok {
 		return fmt.Errorf("gchat: not a gchat conversation: %q", conversation)
 	}
-	arguments := map[string]any{
-		"name":       messageID,
-		"updateMask": "text",
-		"body":       map[string]any{"text": toGchatText(text)},
+	return a.editLaidOut(conversation, messageID, m)
+}
+
+// EditNotifyMessage is EditMessage for the chat.notify route's home posts
+// (notifyChatEditor): the message in space, edited in place by its name, so
+// the thread argument goes unread. A question it carries stays bound to no
+// conversation, as a home post's is (createLaidOut), so its click binds to
+// the thread the click's event names (classifyClick).
+func (a *GoogleChatAdapter) EditNotifyMessage(space, _, messageID string, m OutMessage) error {
+	if !gchatIsSpaceName(space) {
+		return fmt.Errorf("gchat: not a space name: %q", space)
 	}
-	return a.apiCall([]string{"spaces", "messages"}, "patch", arguments, nil)
+	return a.editLaidOut("", messageID, m)
 }
 
-// PostMessage and EditMessage post text only: a chat message falls back to
-// its text (ErrTextOnly) until this adapter renders cards.
-func (a *GoogleChatAdapter) PostMessage(conversation string, m OutMessage) (string, error) {
-	return postTextOnly(a.Post, conversation, m)
+// editLaidOut patches messageID to m, laid out when m carries a chat
+// message and as text otherwise, records the layout it sent
+// (gchat_layout.go), and tracks the question it opens or closes under
+// conversation, or under no conversation for a home post. A re-ask whose
+// layout is refused forgets the earlier answer, since the notifier's text
+// edit follows and must not carry the answer's line; one that fails with the
+// message left as it was keeps the answer the message still shows. A
+// running task's line (m.Stop) takes the Stop button after its own buttons.
+// A text line Chat refuses with the button is patched once more without it;
+// a laid-out line's refusal is the layout's, answered as any refused layout
+// is (the relay edits the text instead, which then takes this path).
+func (a *GoogleChatAdapter) editLaidOut(conversation, messageID string, m OutMessage) error {
+	layout := gchatChatLayout{Text: toGchatText(m.Text)}
+	asks := m.Chat != nil && len(m.Chat.Choices) > 0
+	if m.Chat != nil {
+		var err error
+		if layout, err = renderGchatChat(m.Chat); err != nil {
+			if asks {
+				a.forgetAnswer(messageID)
+			}
+			return fmt.Errorf("%w: %w", ErrLayoutRefused, err)
+		}
+		if conversation == "" {
+			layout = gchatHomeButtons(layout)
+		}
+	}
+	// Under the message's rewrite lock, so a rating tap's patch never lands
+	// over this one and a tap after it redraws what it left.
+	defer a.lockRewrite(messageID)()
+	layout = a.answeredLayout(messageID, m, layout)
+	if m.Stop != "" {
+		layout = gchatStopButtons(layout, conversation, m.Stop)
+	}
+	patch := func(layout gchatChatLayout) error {
+		return a.apiCall([]string{"spaces", "messages"}, "patch", map[string]any{
+			"name":       messageID,
+			"updateMask": gchatLayoutUpdateMask,
+			"body":       gchatLayoutBody(layout),
+		}, nil)
+	}
+	err := patch(layout)
+	if err != nil && m.Stop != "" && m.Chat == nil && errors.Is(gchatLayoutError(err, true), ErrLayoutRefused) {
+		// The text line once more without the button, under the same
+		// lock: a second entry here would wait on it for good.
+		a.log.Warn("gchat: the Stop button was refused; patching the text line without it", "conversation", conversation, "err", err)
+		m.Stop = ""
+		layout = a.answeredLayout(messageID, m, gchatChatLayout{Text: toGchatText(m.Text)})
+		err = patch(layout)
+	}
+	if err != nil {
+		err = gchatLayoutError(err, true)
+		if asks && errors.Is(err, ErrLayoutRefused) {
+			a.forgetAnswer(messageID)
+		}
+		return err
+	}
+	a.trackQuestion(messageID, conversation, m.Chat)
+	a.trackLayout(messageID, m.Chat, layout)
+	return nil
 }
 
-func (a *GoogleChatAdapter) EditMessage(conversation, messageID string, m OutMessage) error {
-	return editTextOnly(a.Edit, conversation, messageID, m)
+// gchatLayoutBody is the message body a layout posts or patches: its text,
+// and its accessory widgets, an empty list when it has none so a patch
+// clears the ones a message had.
+func gchatLayoutBody(layout gchatChatLayout) map[string]any {
+	widgets := layout.Widgets
+	if widgets == nil {
+		widgets = []map[string]any{}
+	}
+	return map[string]any{"text": layout.Text, "accessoryWidgets": widgets}
+}
+
+// gchatLayoutError reads the Chat API's answer to a laid-out post or patch:
+// a 400 refuses what the message carries (ErrLayoutRefused), a 404 on an
+// edit says the message is gone (ErrMessageGone), and anything else (a rate
+// limit, an outage, the relay down, a 404 on a create) is returned as it is.
+func gchatLayoutError(err error, edit bool) error {
+	var api *gchatAPIError
+	switch {
+	case err == nil || !errors.As(err, &api):
+		return err
+	case api.Status == http.StatusBadRequest:
+		return fmt.Errorf("%w: %w", ErrLayoutRefused, err)
+	case edit && api.Status == http.StatusNotFound:
+		return fmt.Errorf("%w: %w", ErrMessageGone, err)
+	}
+	return err
 }
 
 // Roster returns one page of the space's membership (Adapter.Roster):
@@ -650,6 +1019,11 @@ type gchatEnvelope struct {
 func (a *GoogleChatAdapter) Run(ctx context.Context, handler func(InboundMessage)) error {
 	a.log.Info("gchat event pull starting",
 		"relay", a.relayURL+gchatRelayEventsPath, "summaryEvery", a.countInterval)
+	// A quoted ask reads from Chat before it has a turn to hand over, so it
+	// runs off the pump (quotedAsk); wg holds Run until each is done, and
+	// every read is under ctx, so the wait is finite.
+	var wg sync.WaitGroup
+	defer wg.Wait()
 	windowStart := time.Now()
 	var received, emptyPulls, failedPulls int
 	for {
@@ -719,7 +1093,27 @@ func (a *GoogleChatAdapter) Run(ctx context.Context, handler func(InboundMessage
 				"pubsubMessageId", env.MessageID, "reason", reason)
 			continue
 		}
-		handler(msg)
+		if !quotedReadNeeded(ev, msg) {
+			handler(msg)
+			continue
+		}
+		// The dedupe ran on the pump (classify); the read and the hand-over
+		// run off it, so a slow relay holds this turn alone, not the next
+		// pull. A turn composed after ctx ended is not handed over, as the
+		// pump starts none then.
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			msg, reason := a.quotedAsk(ctx, ev, msg)
+			if reason == "" && ctx.Err() != nil {
+				reason = gchatShuttingDownReason
+			}
+			if reason != "" {
+				a.log.Info("gchat event is not a turn; acked", "pubsubMessageId", id, "reason", reason)
+				return
+			}
+			handler(msg)
+		}(env.MessageID)
 	}
 }
 
@@ -799,7 +1193,9 @@ func gchatRelayError(status string, body []byte) error {
 		return errors.New(status)
 	}
 	var details []string
+	chatStatus := 0
 	if parsed.Chat != nil && parsed.Chat.Status != 0 {
+		chatStatus = parsed.Chat.Status
 		detail := "chat " + strconv.Itoa(parsed.Chat.Status)
 		if reason := gchatRelayDetail(parsed.Chat.Reason); reason != "" {
 			detail += " " + reason
@@ -824,8 +1220,23 @@ func gchatRelayError(status string, body []byte) error {
 	if len(details) == 0 {
 		return errors.New(status)
 	}
-	return errors.New(status + ": " + strings.Join(details, ", "))
+	err := errors.New(status + ": " + strings.Join(details, ", "))
+	if chatStatus != 0 {
+		return &gchatAPIError{Status: chatStatus, Err: err}
+	}
+	return err
 }
+
+// gchatAPIError is a relay answer that carried the Chat API's own status:
+// what the API said of the call, as distinct from the relay being down or
+// refusing the caller. Its text is the relay error's.
+type gchatAPIError struct {
+	Status int
+	Err    error
+}
+
+func (e *gchatAPIError) Error() string { return e.Err.Error() }
+func (e *gchatAPIError) Unwrap() error { return e.Err }
 
 // gchatRelayDetail makes one string from a relay response body safe to log: no
 // control, format, or line/paragraph-separator characters (a body that could
@@ -866,6 +1277,9 @@ func decodeGchatEvent(data string) (*gchatEvent, error) {
 		return nil, fmt.Errorf("event json: %w", err)
 	}
 	if wire.Chat == nil {
+		if wire.Type == gchatEventTypeClick {
+			return decodeGchatLegacyClick(&wire), nil
+		}
 		return &gchatEvent{Type: wire.Type, Space: wire.Space, Message: wire.Message, shape: gchatShapeLegacy}, nil
 	}
 	if payload, ok := wire.Chat[gchatAddonMessageKey]; ok {
@@ -883,6 +1297,9 @@ func decodeGchatEvent(data string) (*gchatEvent, error) {
 			}
 		}
 		return ev, nil
+	}
+	if payload, ok := wire.Chat[gchatAddonClickKey]; ok {
+		return decodeGchatClick(payload, wire.Chat[gchatAddonUserKey], wire.Chat[gchatAddonEventTimeKey], wire.Common)
 	}
 	// An add-on event carrying some other interaction: name its payload
 	// keys so the drop log says what arrived rather than "not a MESSAGE".
@@ -922,8 +1339,28 @@ func decodeGchatEvent(data string) (*gchatEvent, error) {
 // link's text admits no `<`, so no mention rides out in it. The markdown
 // rules (bold pairs, code spans, links, the label-host refusal) are the ones
 // markdown.go holds for both chat surfaces.
+//
+// Before any of it, the line pass the Slack adapter runs (rewriteLineForms,
+// slack_blocks.go) rewrites the forms Chat's text format has no syntax for
+// either: a heading becomes a bold line, a rule goes, a pipe table becomes a
+// fenced block with its columns padded, and a list marker becomes the one
+// Chat draws a bullet from. The mention defang runs before it, so a table's
+// cells are measured as they will post; the link defang runs after it, and
+// reads the fenced table as the code it is.
+//
+// The pass is measured after it runs: a pipe table's cells are padded to
+// their column's widest, so a chunk the relay cut under its raw size can
+// render past Chat's message cap, and Chat would refuse the post and the
+// rest of the answer with it. A chunk whose rendering runs past
+// gchatTextMax is rendered again with its tables left as written, which is
+// what posted before tables were rendered at all.
 func toGchatText(s string) string {
-	return rewriteMarkdown(keepChatLinks(s, defangGchatControls, func(dest, label string) string {
+	s = defangGchatMentions(s)
+	out := rewriteLineForms(s, gchatBullet, true)
+	if len(out) > gchatTextMax {
+		out = rewriteLineForms(s, gchatBullet, false)
+	}
+	return rewriteMarkdown(keepChatLinks(out, defangGchatControls, func(dest, label string) string {
 		return chatLinkOpen + dest + chatLinkSep + label + chatLinkClose
 	}), gchatLinkRe)
 }
@@ -945,12 +1382,18 @@ func toGchatText(s string) string {
 // too: this adapter posts a result in chunks, so the fence is as likely the
 // closing one of a block the chunker cut as an opener (rewriteOutsideCode).
 func defangGchatControls(s string) string {
-	s = strings.ReplaceAll(s, "<users/", "< users/")
+	s = defangGchatMentions(s)
 	return rewriteOutsideCode(s, func(prose string) string {
 		return gchatPipeRe.ReplaceAllStringFunc(prose, func(m string) string {
 			return "< " + m[1:]
 		})
 	})
+}
+
+// defangGchatMentions defuses every <users/…> mention in s, code included,
+// with a visible space. Idempotent: the defused form is not the sequence.
+func defangGchatMentions(s string) string {
+	return strings.ReplaceAll(s, gchatMentionOpen, gchatMentionDefused)
 }
 
 // classify normalizes one Chat event to an InboundMessage, or names why it
@@ -962,6 +1405,9 @@ func defangGchatControls(s string) string {
 // is indistinguishable from one that receives none — which is exactly how
 // the add-on wire shape went unnoticed until live traffic.
 func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
+	if ev.Type == gchatEventTypeClick {
+		return a.classifyClick(ev)
+	}
 	if ev.Type != gchatEventTypeMessage {
 		return InboundMessage{}, "not a message event (shape " + ev.shape + ", type " + strconv.Quote(ev.Type) + ")"
 	}
@@ -984,71 +1430,274 @@ func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
 	if ev.Message.ArgumentText != nil {
 		text = strings.TrimSpace(*ev.Message.ArgumentText)
 	}
-	if text == "" {
+	// A message that quotes another is an ask even with no words of its
+	// own: the quoted message is the ask (quotedAsk, which Run calls next).
+	if text == "" && ev.Message.QuotedMessageMetadata.Name == "" {
 		return InboundMessage{}, "empty ask (bare mention)"
 	}
 
-	// A space misread as a DM would bind every thread in it to one session,
-	// so DM requires a positive signal; anything unclassifiable is a group.
-	kind := "group"
-	if ev.Space.SpaceType == gchatSpaceTypeDM || ev.Space.Type == gchatLegacySpaceTypeDM {
-		kind = "dm"
-	}
-	// A GROUP_CHAT surface never supports reply threading, whatever thread
-	// name the event carries — in an unthreaded space every message has its
-	// own thread resource, and binding those would fragment the group chat
-	// into one session per ask.
-	thread := ev.Message.Thread.Name
-	if ev.Space.SpaceThreadingState == gchatThreadingUnthreaded || ev.Space.SpaceType == gchatSpaceTypeGroupChat {
-		thread = ""
-	}
-	// A DM is threaded too, but Chat attaches a thread to every message: a
-	// top-level DM carries the thread Chat auto-created for it. Only a
-	// message typed inside an existing thread (threadReply) is a side
-	// thread with its own conversation, answered in that thread; top-level
-	// DMs share the space's one conversation and are answered top-level.
-	// This is the default-mode Hermes Google Chat rule (main flow versus
-	// side thread), read from Chat's own flag rather than an inbound count
-	// (spec-chatops-gateway.md, "The Google Chat adapter").
-	if kind == "dm" && !ev.Message.ThreadReply {
-		thread = ""
-	}
+	// The surface binding, shared with a click on a message (gchatSurface).
+	kind, thread := gchatSurface(ev)
 
 	a.mu.Lock()
-	if strings.HasPrefix(sender.Name, gchatUsersToken) {
-		// Bounded by the same cap as the dedupe memory: one entry per
-		// human who has spoken, evicted wholesale rather than leaked.
-		if len(a.userIDs) >= gchatSeenCap {
-			a.userIDs = map[string]string{}
-			a.userEmails = map[string]string{}
-		}
-		a.userIDs[sender.Name] = sender.Email
-		a.userEmails[strings.ToLower(sender.Email)] = sender.Name
-	}
-	dup := a.seen[ev.Message.Name]
-	if !dup {
-		a.seen[ev.Message.Name] = true
-		a.seenOrder = append(a.seenOrder, ev.Message.Name)
-		// Pub/Sub's redelivery window is bounded, so the dedupe memory is
-		// too: evict oldest-first at the cap rather than leaking one entry
-		// per message for the pod's lifetime.
-		if len(a.seenOrder) > gchatSeenCap {
-			delete(a.seen, a.seenOrder[0])
-			a.seenOrder = a.seenOrder[1:]
-		}
-	}
+	a.rememberUserLocked(sender)
+	dup := a.seenLocked(ev.Message.Name)
 	a.mu.Unlock()
 	if dup {
 		return InboundMessage{}, "duplicate delivery of " + ev.Message.Name
 	}
 
-	return InboundMessage{
+	msg := InboundMessage{
 		Conversation: gchatConversationID(ev.Space.Name, thread, kind),
 		Kind:         kind,
 		AuthorID:     sender.Email,
 		MessageID:    ev.Message.Name,
+		TopLevel:     kind == sessionKindDM && thread != "" && !ev.Message.ThreadReply,
 		Text:         text,
-	}, ""
+	}
+	if text != "" {
+		a.noteTypedAnswer(msg, sender)
+	}
+	return msg, ""
+}
+
+// quotedReadNeeded reports a message whose turn is composed from the
+// message it quotes (quotedAsk): one that quotes a message, unless its words
+// are a stop. A stop never reaches an agent whatever the conversation's
+// task state (routeTurn answers every form of it itself), so the quote it
+// was typed under is never read, and the stop goes over inline on the pump:
+// a cancel does not wait on the relay's read, nor queue behind the member's
+// next message. It is the one command the adapter knows; the rest turn on
+// task state the router alone has.
+func quotedReadNeeded(ev *gchatEvent, msg InboundMessage) bool {
+	return ev.Message.QuotedMessageMetadata.Name != "" && !chattext.IsStop(msg.Text)
+}
+
+// quotedAsk is the turn for a message that quotes another in reply, Chat's
+// counterpart of Slack's "ask about this" shortcut: the quoted message is
+// put to the agent quoted, opened by who posted it and closed by the rule
+// that it is something to check, not an instruction (shortcut_ask.go). The
+// member's own words, when they typed any beside the quote, come first. A
+// quote of the gateway's own message (ownQuoted) is Chat's ordinary reply
+// gesture, a "yes" to its question or a "why?" to its answer, and gets the
+// quote as context with no rule sentence. The composed ask travels beside
+// the words, as InboundMessage.Quoted, and Text stays the words as typed
+// (empty for a bare quote): the gateway's own routing reads the words, so a
+// stop, a status ask or a "/session off" quoted onto one of the bot's posts
+// is the command when routeTurn would answer it without an agent, and a
+// turn that reaches an agent carries the quote. The adapter does not know
+// the conversation's task state, which that answer turns on, so it decides
+// nothing here beyond the stop (quotedReadNeeded). Everything else about
+// the turn is the message's own, as
+// classify set it: the member typed it themselves, so its conversation is
+// their message's thread and it is no Shortcut (that flag moves a refusal
+// out of a thread the clicker did not start; here they did).
+//
+// The quoted message comes from the event's snapshot when that carries
+// content, and from a read through the relay otherwise (quotedMessage). Run
+// calls this off the event pump, since the read happens before it has the
+// turn to hand over, under quotedReadTimeout. A quote that yields nothing,
+// the read refused or timed out or the message empty, is never silent for a
+// sender the gateway admits when an agent would have read it: the member's
+// words go ahead alone, marked QuotedUnread, and the router posts the line
+// saying so as it hands them to an agent (a command it answers itself gets
+// none); a message with no words is no turn, the adapter's line says what
+// to do, and the reason is logged. A sender it would refuse gets no line,
+// since the adapter posts nothing in their conversation ahead of the
+// gateway: their words go ahead, to the refusal verifySender gives any
+// message, and their bare quote is dropped.
+func (a *GoogleChatAdapter) quotedAsk(ctx context.Context, ev *gchatEvent, msg InboundMessage) (InboundMessage, string) {
+	if !quotedReadNeeded(ev, msg) {
+		return msg, ""
+	}
+	name := ev.Message.QuotedMessageMetadata.Name
+	if ctx.Err() != nil {
+		return InboundMessage{}, gchatShuttingDownReason
+	}
+	quoted, ok := a.quotedMessage(ctx, ev)
+	if !ok {
+		if ctx.Err() != nil {
+			// Shutdown cut the read short: no line, since the pump hands
+			// nothing over now and the line would promise an answer that
+			// never comes, and no post for Run's wait to sit behind.
+			return InboundMessage{}, gchatShuttingDownReason
+		}
+		if msg.Text != "" {
+			// The words go ahead alone, marked: the gateway posts the
+			// line for them once they reach an agent, since it, not the
+			// adapter, knows whether they are a command it answers itself.
+			msg.QuotedUnread = true
+			return msg, ""
+		}
+		if !a.admitted(msg) {
+			return InboundMessage{}, "the quoted message " + name + " could not be read, the message has no words of its own, and its sender is not admitted, so no line is posted"
+		}
+		if _, err := a.Post(msg.Conversation, gchatQuotedUnreadBare); err != nil {
+			a.log.Warn("gchat: posting the unread-quote line failed", "conversation", msg.Conversation, "err", err)
+		}
+		return InboundMessage{}, "the quoted message " + name + " could not be read and the message has no words of its own"
+	}
+	quote := shortcutAskQuoted(quoted.poster, quoted.content)
+	own := a.ownQuoted(ev, quoted)
+	switch {
+	case own && msg.Text == "":
+		msg.Quoted = fmt.Sprintf(gchatQuotedOwnAsk, quote)
+	case own:
+		msg.Quoted = fmt.Sprintf(gchatQuotedOwnAskWithWords, msg.Text, quote)
+	case msg.Text == "":
+		msg.Quoted = fmt.Sprintf(gchatQuotedAsk, quote)
+	default:
+		msg.Quoted = fmt.Sprintf(gchatQuotedAskWithWords, msg.Text, quote)
+	}
+	return msg, ""
+}
+
+// quotedMessage is the quoted message's poster and content: from the
+// event's snapshot when it carries any content, which has no scope limit
+// and names a forwarded message from a space the app is not in, else read
+// through the relay's spaces.messages.get, which under the app's chat.bot
+// scope answers only for a message the app has access to. ok is false when
+// neither yields content: a message with no text and no files (a card or an
+// image alone) counts as nothing to quote, like a refused read.
+func (a *GoogleChatAdapter) quotedMessage(ctx context.Context, ev *gchatEvent) (gchatQuoted, bool) {
+	q := ev.Message.QuotedMessageMetadata
+	var names []string
+	for _, f := range q.Snapshot.Attachments {
+		names = append(names, f.ContentName)
+	}
+	if content := gchatQuotedContent(q.Snapshot.Text, q.Snapshot.FormattedText, names); content != "" {
+		poster := strings.TrimSpace(q.Snapshot.Sender)
+		if poster == "" {
+			poster = namelessClicker
+		}
+		return gchatQuoted{poster: poster, content: content}, true
+	}
+	parent := ctx
+	ctx, cancel := context.WithTimeout(ctx, a.quotedReadTimeout)
+	defer cancel()
+	var read gchatQuotedMessage
+	err := a.apiCallContext(ctx, []string{gchatSpacesResource, gchatMessagesResource}, gchatGetMethod,
+		map[string]any{gchatNameArg: q.Name}, &read)
+	if err != nil {
+		if parent.Err() != nil {
+			// Cut short by shutdown, not refused: nothing to warn about.
+			return gchatQuoted{}, false
+		}
+		a.log.Warn("gchat: could not read the message a member quoted; asking without it",
+			"message", ev.Message.Name, "quoted", q.Name, "err", err)
+		return gchatQuoted{}, false
+	}
+	names = names[:0]
+	for _, f := range read.Attachment {
+		names = append(names, f.ContentName)
+	}
+	content := gchatQuotedContent(read.Text, read.FormattedText, names)
+	if content == "" {
+		a.log.Info("gchat: the message a member quoted has no text and no files; asking without it",
+			"message", ev.Message.Name, "quoted", q.Name)
+		return gchatQuoted{}, false
+	}
+	return gchatQuoted{poster: a.quotedAuthor(read.Sender), content: content, senderType: read.Sender.Type}, true
+}
+
+// ownQuoted reports a quoted message as the gateway's own: one this process
+// remembers posting (rememberPosted), on any surface; or, in a DM, a REPLY
+// quote by an app, since the DM has one app in it, this one. The read says
+// the poster's kind; the snapshot names the poster alone, and in a DM a
+// name that is not the member's own is the app's. A quote this cannot place
+// (a space message this process did not post, a FORWARD from elsewhere, a
+// nameless poster) is a third party's and keeps the rule sentence.
+func (a *GoogleChatAdapter) ownQuoted(ev *gchatEvent, quoted gchatQuoted) bool {
+	q := ev.Message.QuotedMessageMetadata
+	a.mu.Lock()
+	posted := a.posted[q.Name]
+	a.mu.Unlock()
+	if posted {
+		return true
+	}
+	if kind, _ := gchatSurface(ev); kind != sessionKindDM || q.QuoteType == gchatQuoteTypeForward {
+		return false
+	}
+	if quoted.senderType != "" {
+		return quoted.senderType == gchatSenderBot
+	}
+	member := strings.TrimSpace(ev.Message.Sender.DisplayName)
+	return member != "" && quoted.poster != namelessClicker && quoted.poster != member
+}
+
+// quotedAuthor names who posted a quoted message: the display name Chat
+// gives, else, for a member whose name it withheld, the email the adapter
+// learned for them from their own messages, else a placeholder by kind.
+func (a *GoogleChatAdapter) quotedAuthor(sender gchatSender) string {
+	if name := strings.TrimSpace(sender.DisplayName); name != "" {
+		return name
+	}
+	if sender.Type == gchatSenderBot {
+		return shortcutAskSomeApp
+	}
+	a.mu.Lock()
+	email := a.userIDs[sender.Name]
+	a.mu.Unlock()
+	if email != "" {
+		return email
+	}
+	return namelessClicker
+}
+
+// gchatQuotedContent is a quoted message's content as text: its text
+// (formatted when the plain text is empty, as it is for a message made only
+// of markup) and the names of its files, clipped to shortcutAskQuoteMax code
+// points. Empty when the message has neither.
+func gchatQuotedContent(text, formatted string, files []string) string {
+	var parts []string
+	if text = strings.TrimSpace(text); text != "" {
+		parts = append(parts, text)
+	} else if formatted = strings.TrimSpace(formatted); formatted != "" {
+		parts = append(parts, formatted)
+	}
+	for _, f := range files {
+		if name := strings.TrimSpace(f); name != "" {
+			parts = append(parts, fmt.Sprintf(shortcutAskAttached, name))
+		}
+	}
+	return shortcutAskClip(strings.Join(parts, "\n"), shortcutAskQuoteMax)
+}
+
+// rememberUserLocked records a human's users/{id} resource name against the
+// email Chat asserted for them, from a message or a click, so Roster can map
+// a member's id back to the email they were verified as and OpenDirect can
+// open their DM by id (Chat withholds emails from spaces.members.list under
+// app credentials). Bounded by the same cap as the dedupe memory: one entry
+// per human who has spoken, evicted wholesale rather than leaked. Called
+// under a.mu.
+func (a *GoogleChatAdapter) rememberUserLocked(sender gchatSender) {
+	if !strings.HasPrefix(sender.Name, gchatUsersToken) || sender.Email == "" {
+		return
+	}
+	if len(a.userIDs) >= gchatSeenCap {
+		a.userIDs = map[string]string{}
+		a.userEmails = map[string]string{}
+	}
+	a.userIDs[sender.Name] = sender.Email
+	a.userEmails[strings.ToLower(sender.Email)] = sender.Name
+}
+
+// seenLocked reports whether name was delivered before, and records it:
+// Pub/Sub is at-least-once, and a redelivered event, a message or a click,
+// must not become a second turn. Pub/Sub's redelivery window is bounded, so
+// the dedupe memory is too: evict oldest-first at the cap rather than
+// leaking one entry per event for the pod's lifetime. Called under a.mu.
+func (a *GoogleChatAdapter) seenLocked(name string) bool {
+	if a.seen[name] {
+		return true
+	}
+	a.seen[name] = true
+	a.seenOrder = append(a.seenOrder, name)
+	if len(a.seenOrder) > gchatSeenCap {
+		delete(a.seen, a.seenOrder[0])
+		a.seenOrder = a.seenOrder[1:]
+	}
+	return false
 }
 
 // resolvePrincipal establishes the requester's principal from the backend's
@@ -1231,7 +1880,7 @@ func (g *Gateway) resolveA2AGooglePrincipal(authorID string) string {
 // gchatConversationID mints the session key for one inbound message. space is
 // the Chat space resource name ("spaces/AAA"), thread the thread resource name
 // ("spaces/AAA/threads/BBB", empty when the message binds the whole space),
-// kind "dm" or "group". A DM side thread keeps the DM prefix, so the key
+// kind "dm" or "group". A DM thread keeps the DM prefix, so the key
 // says what the record's Kind says.
 func gchatConversationID(space, thread, kind string) string {
 	switch {
@@ -1255,9 +1904,8 @@ func gchatSpaceThread(conversation string) (space, thread string, ok bool) {
 		return rest, "", true
 	}
 	if rest, found := strings.CutPrefix(conversation, gchatDMKeyPrefix); found {
-		// A DM binds the whole space (top-level messages, and the
-		// thread-less key every pre-side-thread record carries) or one
-		// side thread.
+		// A DM binds the whole space (the thread-less key legacy
+		// records carry) or one thread.
 		if gchatIsSpaceName(rest) {
 			return rest, "", true
 		}

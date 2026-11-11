@@ -97,8 +97,15 @@ Four behaviours worth knowing before the first run:
   unsandboxed pod shares the node kernel with everything else on the node. Autopilot, the shape a
   fresh install creates, ships the RuntimeClass and needs no node pool, from GKE `1.27.4-gke.800`
   on — so the sandbox costs nothing there. On a Standard cluster it provisions a `gvisor-pool`
-  node pool of one `e2-standard-4` per zone. Pass `--enable-gvisor=false` to run on the standard
-  container runtime.
+  node pool of one `e2-standard-4` per zone, autoscaling to two. The module's
+  [sizing inputs](terraform/modules/gke-cluster/README.md#sizing-the-node-pools) resize it; the
+  installer writes none of them, so an `install.sh`-driven install sets them as `TF_VAR_` lines in
+  `install.env` (`TF_VAR_sizing_profile=fleet`), which Terraform reads where the generated tfvars
+  is silent, and keeps them there for every later run: `lifecycle.sh` refuses an apply that would
+  resize a pool no sizing input asked to resize (the pool's own explicit input, or, for an attribute
+  no explicit input decided at the last apply, a profile other than the one that apply recorded),
+  the shape a lost line would otherwise plan. Pass
+  `--enable-gvisor=false` to run on the standard container runtime.
 - **Out-of-band change detection is on**, because a cluster reconciled from a GitOps repository is
   one where a change made outside that repository is worth reporting, and nothing else here
   reports it. It costs three GCP resources in the install's project — a Log Router sink, a Pub/Sub
@@ -410,7 +417,7 @@ Before beginning installation, ensure your environment meets the requirements fo
 | **`gke-gcloud-auth-plugin`**    | Standard                                        | `gke-gcloud-auth-plugin --version` | Required for `kubectl` to authenticate to GKE clusters (`gcloud components install gke-gcloud-auth-plugin`).                                                                                                                                            | **All Methods** (GKE)                            |
 | **`kubectl`**                   | `1.28+`                                         | `kubectl version --client`         | Communicates with your target Kubernetes or GKE cluster.                                                                                                                                                                                                | **All Methods**                                  |
 | **Terraform**                   | `~> 1.5`                                        | `terraform version`                | The install and lifecycle engine. `install.sh` offers to install it when missing.                                                                                                                                                                       | **Methods 0 & 1**                                |
-| **Helm**                        | `3.10+`                                         | `helm version`                     | `upgrade.sh`'s fast path, standalone chart install, and the teardown's release uninstall on a cluster the install did not create.                                                                                                                       | **Methods 0, 1, & 2**                            |
+| **Helm**                        | `3.14+`                                         | `helm version`                     | `upgrade.sh`'s fast path, standalone chart install, and the teardown's release uninstall on a cluster the install did not create. 3.14 for `--reset-then-reuse-values`, the hand-run upgrade path the chart documents.                                  | **Methods 0, 1, & 2**                            |
 | **`jq`**                        | `1.6+`                                          | `jq --version`                     | JSON parsing utility used by `install.sh` and deploy scripts to read `images.json`, and by `upgrade.sh` to read the release's values and confirm the images it re-tagged.                                                                               | **All Methods**                                  |
 | **GitHub CLI (`gh`)**           | `2.0+`                                          | `gh --version`                     | GitOps repository discovery, token management, and PR automation. The installer checks for it on every install, a GitLab install too, and installs it when it is missing.                                                                               | **Methods 0 & 1**                                |
 | **`git`**                       | `2.20+`                                         | `git --version`                    | Clones configuration templates and resolves release tags.                                                                                                                                                                                               | **All Methods**                                  |
@@ -643,7 +650,7 @@ If you enabled Google Chat or Slack during the install, perform the following re
 2. **Send a Test Direct Message**:
    - Send a DM to the bot in Google Chat with the message `"Hi Platform Agent"`.
    - If you left `GOOGLE_CHAT_HOME_CHANNEL` empty and this is the install's first chat message on either platform, it makes its space the home channel, where scheduled reports post. To send them to a team space instead, send the first message there, or run `/sethome` there afterwards.
-   - Under `spec.mode: next` neither the first message nor `/sethome` sets it: the A2A gateway posts alerts and reports only to `GOOGLE_CHAT_HOME_CHANNEL`, a space name (`spaces/<id>`), and drops them while it is empty. The installer warns before it applies with it empty (and `install.sh`'s setup interview asks you to confirm), and the PlatformAgent carries the `HomeChannelUnset` condition until it is set. A value that is not a space name turns the gateway's notify route off, so card reports back to their conversation stop too.
+   - Under `spec.mode: next` neither the first message nor `/sethome` sets it: the A2A gateway posts alerts and reports only to `GOOGLE_CHAT_HOME_CHANNEL`, a space name (`spaces/<id>`), and while it is empty refuses and keeps them (up to fifty, for thirty days) for one digest into the space once it is set; with Slack enabled too, they go to the Slack Hermes platform, which delivers them only if Slack has a home channel. The installer warns before it applies with it empty (and `install.sh`'s setup interview asks you to confirm), and the PlatformAgent carries the `HomeChannelUnset` condition until it is set. A value that is not a space name turns the gateway's notify route off, so card reports back to their conversation stop too.
 3. **Approve Pairing Code (Optional / First-time setup)**:
    - If pairing mode is enabled, approve the pairing code displayed in the gateway logs:
      ```bash
@@ -657,7 +664,7 @@ If you enabled Google Chat or Slack during the install, perform the following re
 
 ##### 2. Slack Configuration (`SLACK_ENABLED=true`)
 
-[Slack app setup](docs/site/src/content/docs/install/slack-app.md) covers creating the app, its tokens, the allowlist and how to verify, for both `spec.mode` values. Under `spec.mode: next`, unless Google Chat is also enabled (Google Chat then holds the A2A gateway and Slack stays on the Hermes listener, so the steps below apply), the A2A gateway holds Slack and needs a different app manifest from the one below; follow that page instead of steps 1, 3, 4 and 5 here, and skip step 2's home-channel bullet: under `next` the home channel is only `SLACK_HOME_CHANNEL`, a channel ID, and that page's home-channel section says how to set it.
+[Slack app setup](docs/site/src/content/docs/install/slack-app.md) covers creating the app, its tokens, the allowlist and how to verify, for both `spec.mode` values. Under `spec.mode: next`, unless Google Chat is also enabled (Google Chat then holds the A2A gateway and Slack stays on the Hermes listener, so the steps below apply), the A2A gateway holds Slack and needs a different app manifest from the one below; follow that page instead of steps 1, 3, 4 and 5 here, and skip step 2's home-channel bullet: under `next` the home channel is `SLACK_HOME_CHANNEL`, a channel ID, or, under `homeChannelPolicy` auto (the default), the channel of the first top-level mention of the agent; that page's home-channel section says how to set it.
 
 1. **Verify Slack App Settings**:
    - Ensure **Socket Mode** is enabled in your Slack App console.
@@ -680,9 +687,9 @@ If you enabled Google Chat or Slack during the install, perform the following re
      kubectl exec deploy/platform-agent-gateway -n kubeagents-system -- hermes slack manifest
      ```
    - Paste the JSON into the Slack App Console (**Features → App Manifest → Edit**), save, and reinstall when Slack prompts. That manifest replaces the whole app definition, its "Hermes" name included — to keep an app you have already configured, add `--slashes-only` and merge the printed array into the existing `features.slash_commands`.
-   - This adds Slack's autocomplete, not the behaviour: a typed `/hermes <subcommand>` works either way, because the Planning Agent's `legacy_slash_commands` plugin unwraps it before the gateway resolves the command.
+   - This adds Slack's autocomplete, not the behaviour: a typed `/hermes <subcommand>` works either way, because the Planning Agent's `legacy_slash_commands` plugin unwraps it before the Hermes gateway resolves the command. (Under `next` this step is skipped; what a typed `@bot /sethome` gets there is on the [ChatOps page](docs/site/src/content/docs/concepts/chatops.md).)
 5. **Set or Move the Home Channel (if you left `SLACK_HOME_CHANNEL` empty)**:
-   - If step 2's message was the install's first chat message, it set the home channel to the channel or DM it came from. If Google Chat received the first message instead, Slack has none, and scheduled audits have nowhere to post on Slack. Either way, run `/sethome` (or `/hermes sethome`) from the Slack channel you want. It takes effect immediately and persists across restarts.
+   - If step 2's message was the install's first chat message, it set the home channel to the channel or DM it came from. If Google Chat received the first message instead, Slack has none, and scheduled audits have nowhere to post on Slack. Either way, run `/sethome` (or `/hermes sethome`) from the Slack channel you want. It takes effect immediately and persists across restarts. Under `spec.mode: next` with Slack on the gateway, neither command sets it: pick the channel on the app's Home tab instead.
 
 - Re-display these instructions at any time from the repository root. When `install.env` records `PLATFORM_AGENT_MODE=next` and Google Chat is off, it prints the A2A gateway's checklist from the [Slack app setup](docs/site/src/content/docs/install/slack-app.md) page instead. As for Google Chat, this script takes the mode from `install.env` alone, while the checklist `install.sh` prints after an apply follows the mode it expects after it:
   ```bash
@@ -692,7 +699,8 @@ If you enabled Google Chat or Slack during the install, perform the following re
 #### Step 6: Talk to the Agent With No Chat Platform
 
 Both chat integrations are opt-in and off by default, so an install that enabled neither reaches
-the agent over `kubectl exec`. `install.sh` prints these two commands when you choose "None" at the
+the agent over `kubectl exec`; under `spec.mode: next` the PlatformAgent carries the `NoChatPlatform`
+condition, which says where the agent's findings go instead. `install.sh` prints these two commands when you choose "None" at the
 chat prompt and again when it finishes, with the cluster, region, project and namespace already
 filled in:
 
@@ -849,14 +857,15 @@ github_app_id         = "12"
 
 The composition declares the github forge at `gitops_host` in `spec.integration.forges`, with the owner as its namespace and `caBundleRef` from `github_ca_secret_name`, and no `github` alias. The chart points the minter at `https://<host>/api/v3` and mounts the CA. In this order:
 
-1. **Create the Cloud KMS key and import the App's private key.** The minter is not Ready until the key holds an `ENABLED` version, and the apply waits for every Deployment, so import the key before the apply. Use the composition's default names and the cluster's region (for a zonal cluster, the region that contains the zone). The import calls only Cloud KMS.
+1. **Create the Cloud KMS key and import the App's private key.** The minter is not Ready until the key holds an `ENABLED` version, and the apply waits for every Deployment, so import the key before the apply. Use the composition's default names and the cluster's region (for a zonal cluster, the region that contains the zone). The labels name this install as the key's owner: `make tf-apply` adopts a key it doesn't hold only when they do. The import calls only Cloud KMS.
 
    ```bash
    gcloud services enable cloudkms.googleapis.com --project=PROJECT_ID
    gcloud kms keyrings create github-token-minter-keyring --location=REGION --project=PROJECT_ID
    gcloud kms keys create github-token-minter-key --keyring=github-token-minter-keyring --location=REGION \
      --purpose=asymmetric-signing --default-algorithm=rsa-sign-pkcs1-2048-sha256 \
-     --import-only --skip-initial-version-creation --protection-level=software --project=PROJECT_ID
+     --import-only --skip-initial-version-creation --protection-level=software \
+     --labels=kube-agents-cluster=CLUSTER_NAME,kube-agents-namespace=kubeagents-system --project=PROJECT_ID
    git clone --depth 1 --branch v2.7.1 https://github.com/abcxyz/github-token-minter.git ~/minty
    (cd ~/minty && go run ./cmd/minty tools import-pk -project-id=PROJECT_ID -location=REGION \
      -key-ring=github-token-minter-keyring -key=github-token-minter-key -private-key=@/path/to/app.pem)
@@ -907,7 +916,7 @@ Or on an existing one:
 
 ```bash
 helm upgrade kube-agents ./charts/kube-agents \
-  --namespace kubeagents-system --reuse-values \
+  --namespace kubeagents-system --reset-then-reuse-values \
   --set platformAgent.harness.experimental.shellSandbox.runtimeClassName=gvisor \
   --wait --timeout 10m
 ```
@@ -1121,13 +1130,16 @@ at nothing and the policies silently inert:
 # the chart, which checks the version itself, this apply will fail there.
 kubectl apply -f config/admission/agent-rbac-policy.yaml
 kubectl apply -f config/admission/a2a-gateway-pod-policy.yaml
+kubectl apply -f config/admission/a2a-dispatcher-job-policy.yaml
 ```
 
 [Method 1](#method-1-the-install-engine--terraform--helm) gets these from the chart and needs no
 such step. Skipping it here leaves agent RBAC without its admission backstop, and leaves the
 pods the A2A gateway creates under `spec.mode: next` free to run as any ServiceAccount in the
 namespace. The operator on this path does not get the chart's `A2A_GATEWAY_POD_POLICY` signal, so
-an operator feature that needs the second policy stays off. Read each file's header for what the
+an operator feature that needs the second policy stays off. Likewise `A2A_DISPATCHER_JOB_POLICY`:
+without it the operator runs no dispatcher Job mode, and unattended profile tasks have no worker
+and are refused at admission (`no-worker`); set it on the operator only once the third policy is applied. With it set, under `mode: next` with the dispatcher running (`A2A_DISPATCHER_IMAGE`), the `PlatformAgent`'s `DispatcherJobMode` condition says whether Job mode is on, and why not. Read each file's header for what the
 policies do and do not enforce — notably, the agent-RBAC policies cannot check the rules of a role
 that a binding merely _references_.
 
@@ -1316,7 +1328,12 @@ and ranks the findings. The ranked report is posted once, into the thread of the
 someone sends the bot in Google Chat or Slack
 ([Step 5](#step-5-enable-google-chat--slack-integrations-manual-required-steps)), after the report
 is ready. A `kubectl exec` session ([Step 6](#step-6-talk-to-the-agent-with-no-chat-platform)) does
-not receive it; with no chat platform enabled, read it from the sandbox once it is written. After
+not receive it; with no chat platform enabled, read it from the sandbox once it is written, within
+a day: when nobody has written to the agent in chat a day after the sweep, the report is filed as an
+issue labelled `agent:onboarding` instead, in the GitOps repository when it is on GitHub or else in
+the install's one managed GitHub repository (a week after the sweep, a report that could not be
+filed is retired in favour of the scheduled audits), as
+[the onboarding design](docs/designs/oobe.md#3-onboarding-before-the-fold-for-reference) describes. After
 a delivery run the file is renamed `INVENTORY.delivered.md`.
 
 ```bash
@@ -1522,7 +1539,7 @@ When the checks in the entry above pass and a message still gets no reply, follo
   kubectl logs -n kubeagents-system deploy/platform-agent-credential-proxy | grep -E 'Slack relay (enabled|initialization)|Slack bot token'
   ```
   On Google Chat, a sender must be on `ALLOWED_USERS` (emails; empty admits everyone), and the Chat app has to publish to the install's Pub/Sub topic ([ChatOps → Google Chat](docs/site/src/content/docs/concepts/chatops.md#google-chat)).
-- **`next`: is the gateway running?** The operator runs the gateway on every `next` install. With no chat backend configured it serves the console door alone, so chat messages reach nobody until you configure a backend: enable Google Chat or Slack on the install, or create the `discord-bot` Secret. A new `discord-bot` Secret is not watched, so the gateway takes it on the operator's next pass, within 15 minutes; `kubectl rollout restart deployment/platform-agent-a2a-gateway` makes it immediate. An install upgraded from an operator that ran no gateway without a backend may briefly carry `A2AGateway=False`: `Reason: NoChatBackend` clears on the first pass where that operator never created the gateway, and a gateway it scaled to zero shows `WaitingForReplica` until its replica is ready; the [`A2AGateway` condition](docs/site/src/content/docs/operator/platformagent-crd.md#status) has the details.
+- **`next`: is the gateway running?** The operator runs the gateway on every `next` install. With no chat backend configured it serves the console door alone (the PlatformAgent carries the `NoChatPlatform` condition), so chat messages reach nobody until you configure a backend: enable Google Chat or Slack on the install, or create the `discord-bot` Secret. A new `discord-bot` Secret is not watched, so the gateway takes it on the operator's next pass, within 15 minutes; `kubectl rollout restart deployment/platform-agent-a2a-gateway` makes it immediate. An install upgraded from an operator that ran no gateway without a backend may briefly carry `A2AGateway=False`: `Reason: NoChatBackend` clears on the first pass where that operator never created the gateway, and a gateway it scaled to zero shows `WaitingForReplica` until its replica is ready; the [`A2AGateway` condition](docs/site/src/content/docs/operator/platformagent-crd.md#status) has the details.
   ```bash
   kubectl get platformagent platform-agent -n kubeagents-system \
     -o jsonpath='{.status.conditions[?(@.type=="A2AGateway")]}{"\n"}'
@@ -1570,7 +1587,7 @@ On Google Chat the gateway posts a status line for every task ([what a task look
      ```bash
      kubectl logs -n kubeagents-system deploy/platform-agent-a2a-gateway | grep -E 'chat.notify|notify'
      ```
-     `notify refused` with `not a live conversation with that context` means the gateway has no session record for the conversation the report named, the record carries another context, or the record could not be read (logged first as `notify: session record unreadable`).
+     `notify refused` with `not a live conversation with that context` means the gateway has no session record for the conversation the report named, the record carries another context, or the record doesn't decode (logged first as `notify: session record unreadable`). A record that couldn't be read in time gets `the conversation's record couldn't be read in time; not posted` instead, which the sender retries.
   2. The bridge recorded where the conversation is. If it could not, it logs `conversation route not recorded; a card this task files cannot report back`, and the answer itself ends `(If this turn filed a card, its answer cannot be posted back to this conversation: the conversation's route could not be recorded.)`.
      ```bash
      kubectl logs -n kubeagents-system deploy/platform-agent-gateway -c hermes-bridge | grep 'conversation route'

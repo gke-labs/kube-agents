@@ -24,10 +24,37 @@ import fleet_waste as fw  # noqa: E402
 # collector, not the host it runs on, so both are neutralised at import.
 os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)  # module-level, on purpose
 # The sweep width is read from the credential broker (broker_admission); with its
-# URL unset that read makes no request and the width is the fallback, four, so
+# URLs unset that read makes no request and the width is the fallback, four, so
 # no test here reaches the network or depends on the host's broker.
 os.environ.pop("CREDENTIAL_PROXY_URL", None)  # module-level, on purpose
+os.environ.pop("CREDENTIAL_PROXY_EXEC_URL", None)  # module-level, on purpose
 import fleet_scope_args as _fleet_scope_args  # noqa: E402
+import test_collector_run as _shared_run_tests  # noqa: E402
+import audit_report  # noqa: E402
+
+# The longest identifiers a recorded command can carry in its kubeconfig path
+# under the shipped platform profile: a 30-character project id, a 40-character
+# cluster name, GCP's longest location. A collector's recorded chain is held
+# under `audit_report.MAX_COMMAND_CHARS` at this length, since `finish` refuses
+# a `checks_run` command over it and the SOPs copy the chain verbatim.
+PLATFORM_PROFILE_KUBECONFIG_DIR = Path("/opt/data/profiles/platform/.kubeconfigs")
+LONGEST_PROJECT = "p" * 30
+LONGEST_CLUSTER = "c" * 40
+LONGEST_LOCATION = "northamerica-northeast1-a"
+
+# The collector pages its kinds through `kubectl get --raw`; the fakes below
+# still answer the one-shot dump, and the adapter feeds the real paging from
+# it (test_collector_run.paged_dump_over). The tests that assert the paged
+# argv itself pass a `--raw`-aware fake and bypass this by patching it back.
+_PAGED_DUMP = patch.object(fw, "paged_dump", _shared_run_tests.paged_dump_over())
+
+
+def setUpModule():
+    _PAGED_DUMP.start()
+
+
+def tearDownModule():
+    _PAGED_DUMP.stop()
 
 _fleet_scope_args.SCOPE_DECLARED_FILE = "/nonexistent/kube-agents-sandbox/scope-declared"
 
@@ -5340,6 +5367,58 @@ class CollectClusterTest(unittest.TestCase):
         self.assertEqual(entry["outcome"], "unreachable")
         self.assertEqual(facts, {"pv_handles": set(), "service_names": set(), "referenced_addresses": set()})
 
+    def test_the_cluster_is_read_one_kind_per_paged_raw_read(self):
+        """The real paging, not the adapter: every kind in CLUSTER_DUMP_KINDS
+        is one `kubectl get --raw` collection read with a page limit, a pod
+        page's continue token is followed, and the manifest records the first
+        page of each kind."""
+        issued = []
+
+        def run(argv, **kwargs):
+            issued.append(argv)
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:3] == ["kubectl", "get", "--raw"]:
+                path, _, query = argv[3].partition("?")
+                if path == "/api/v1/pods" and "continue=" not in query:
+                    return run_of(0, json.dumps({"metadata": {"continue": "more"}, "items": [{"metadata": {"name": "p1", "namespace": "ns", "managedFields": [{}]}, "status": {"phase": "Running"}}]}))
+                if path == "/api/v1/pods":
+                    return run_of(0, json.dumps({"metadata": {}, "items": [{"metadata": {"name": "p2", "namespace": "ns"}, "status": {"phase": "Running"}}]}))
+                return run_of(0, json.dumps({"metadata": {}, "items": []}))
+            if argv[:2] == ["kubectl", "get"]:
+                raise AssertionError(f"a one-shot dump was issued: {argv}")
+            if argv[:3] == ["gcloud", "container", "node-pools"]:
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp, patch.object(fw, "KUBECONFIG_DIR", Path(tmp)), patch.object(fw, "paged_dump", _shared_run_tests.cr.paged_dump):
+            entry, _ = fw.collect_cluster(self.CLUSTER, run=run, session=usage_session(), now=NOW)
+        self.assertEqual(entry["outcome"], "collected", entry.get("error"))
+        raw = [a[3] for a in issued if a[:3] == ["kubectl", "get", "--raw"]]
+        self.assertEqual(len(fw.CLUSTER_DUMP_KINDS.split(",")) + 1, len(raw))
+        self.assertIn("/api/v1/pods?limit=500", raw)
+        self.assertIn("/api/v1/pods?limit=500&continue=more", raw)
+        self.assertIn("/api/v1/nodes?limit=100", raw)
+        self.assertIn("/apis/networking.k8s.io/v1/ingresses?limit=500", raw)
+        command = next(c["command"] for c in entry["commands"] if c["check"] == "terminal-pods")
+        self.assertIn("kubectl get --raw '/api/v1/nodes?limit=100'", command)
+        self.assertIn("kubectl get --raw '/api/v1/pods?limit=500'", command)
+        # The kubeconfig exported once for the whole chain, in a subshell.
+        self.assertTrue(command.startswith("( export KUBECONFIG="), command)
+        self.assertTrue(command.endswith(" )"), command)
+        self.assertEqual(1, command.count("KUBECONFIG="), command)
+
+    def test_the_recorded_chain_stays_under_the_published_command_cap(self):
+        """The fifteen-kind dump is recorded once and copied verbatim into five checks'
+        `checks_run`; with the kubeconfig spelled per read, the longest legal names put it
+        over `MAX_COMMAND_CHARS` and `finish` refused the document."""
+        with patch.object(fw, "KUBECONFIG_DIR", PLATFORM_PROFILE_KUBECONFIG_DIR):
+            kubeconfig = fw.kubeconfig_path(LONGEST_PROJECT, LONGEST_CLUSTER, LONGEST_LOCATION)
+        text = fw.paged_command_text(fw.CLUSTER_DUMP_KINDS.split(","), kubeconfig=kubeconfig)
+        self.assertLessEqual(len(text), audit_report.MAX_COMMAND_CHARS, len(text))
+        self.assertEqual(text, audit_report.validate_check_command(text, "clusters[0]", "orphan-pv"))
+        self.assertEqual(text, audit_report.trim_command(text))
+
     def test_a_dump_with_no_items_list_is_gate_failed_not_empty(self):
         def run(argv, **kwargs):
             if "get-credentials" in argv:
@@ -5701,6 +5780,94 @@ class AutopilotNotApplicableTest(unittest.TestCase):
         entry = self.collect(autopilot=False)
         self.assertNotIn("checks_not_applicable", entry)
         self.assertIn("idle-nodepool", {c["check"] for c in entry["commands"]})
+
+
+class NodePoolsFromTheDiscoveryListingTest(unittest.TestCase):
+    """idle-nodepool takes the pools from the `clusters list` item that
+    discovered the cluster, recorded against that listing's command, and runs
+    its own `node-pools list` only when the item carries none (#4081)."""
+
+    POOLS = [{"name": "idle", "config": {"machineType": "e2-standard-4"}},
+             {"name": "busy", "config": {"machineType": "e2-standard-4"}}]
+    NODE_POOLS_ARGV = [
+        "gcloud", "container", "node-pools", "list", "--cluster", "two-usc1", "--location", "us-central1",
+        "--project", "acme", "--format", "json",
+    ]
+
+    def listed(self, **extra):
+        """The running cluster `enumerate_clusters` builds from one item, and the listing argv."""
+        issued = []
+        item = {"name": "two-usc1", "location": "us-central1", "status": "RUNNING", **extra}
+
+        def run(argv, **kwargs):
+            issued.append(list(argv))
+            return run_of(0, json.dumps([item]))
+
+        (cluster,), _ = fw.enumerate_clusters("acme", run=run)
+        (listing_argv,) = issued
+        return cluster, listing_argv
+
+    def collect(self, cluster, served_pools):
+        """`served_pools` is what the cluster's own `node-pools list` would answer."""
+        calls = []
+        node = obj("Node", "node-1", **{
+            "metadata.labels": {"cloud.google.com/gke-nodepool": "idle"},
+            "status.allocatable": {"cpu": "4", "memory": "8Gi"},
+        })
+
+        def run(argv, **kwargs):
+            calls.append(list(argv))
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of(node)))
+            if argv[:3] == ["gcloud", "container", "node-pools"]:
+                return run_of(0, json.dumps(served_pools))
+            if argv[:3] == ["gcloud", "container", "operations"]:
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp, patch.object(fw, "KUBECONFIG_DIR", Path(tmp)), patch.object(fw, "log") as log:
+            entry, _ = fw.collect_cluster(cluster, run=run, session=usage_session(), now=NOW)
+        self.node_pools_reads = [a for a in calls if a[:3] == ["gcloud", "container", "node-pools"]]
+        self.logged = [c.args[0] for c in log.call_args_list]
+        return entry
+
+    def test_the_listing_projects_node_pools_and_nothing_more(self):
+        _, argv = self.listed()
+        self.assertEqual(argv[argv.index("--format") + 1], "json(name,location,status,autopilot.enabled,createTime,nodePools)")
+        self.assertNotIn("masterauth", " ".join(argv).lower())
+
+    def test_listed_pools_replace_the_node_pools_read(self):
+        cluster, listing_argv = self.listed(nodePools=self.POOLS)
+        # The cluster's own read would answer no pools, so a candidate can
+        # only come from the listing.
+        entry = self.collect(cluster, served_pools=[])
+        self.assertEqual(self.node_pools_reads, [])
+        self.assertIn("NodePool/idle", {c["object"] for c in entry["candidates"] if c["check"] == "idle-nodepool"})
+        record = next(c for c in entry["commands"] if c["check"] == "idle-nodepool")
+        self.assertEqual(record["command"], shlex.join(listing_argv))
+        self.assertEqual((record["rc"], record["duration_s"]), (0, 0))
+        self.assertEqual(record["output_sha256"], fw.output_digest(json.dumps(self.POOLS, sort_keys=True)))
+        self.assertNotIn(fw.collector_run.LISTED_NODE_POOLS_KEY, json.dumps(entry))
+
+    def test_an_empty_listed_list_is_a_cluster_with_no_pools(self):
+        cluster, _ = self.listed(nodePools=[])
+        entry = self.collect(cluster, served_pools=self.POOLS)
+        self.assertEqual(self.node_pools_reads, [])
+        self.assertNotIn("idle-nodepool", {c["check"] for c in entry["candidates"]})
+        self.assertNotIn("idle-nodepool", {e["check"] for e in entry.get("checks_unevaluated") or []})
+
+    def test_a_listing_without_pools_falls_back_to_the_node_pools_read(self):
+        for extra in ({}, {"nodePools": "not a list"}):
+            with self.subTest(extra=extra):
+                cluster, _ = self.listed(**extra)
+                entry = self.collect(cluster, served_pools=self.POOLS)
+                self.assertEqual(self.node_pools_reads, [self.NODE_POOLS_ARGV])
+                record = next(c for c in entry["commands"] if c["check"] == "idle-nodepool")
+                self.assertEqual(record["command"], shlex.join(self.NODE_POOLS_ARGV))
+                self.assertIn("NodePool/idle", {c["object"] for c in entry["candidates"]})
+                self.assertTrue([m for m in self.logged if m.endswith("; reading node-pools list")], self.logged)
 
 
 class NodePoolAgeFromOperationsTest(unittest.TestCase):
@@ -8038,6 +8205,7 @@ class ContentModeWorkspaceTest(unittest.TestCase):
         seen = {}
 
         def partial_mirror(repo, dest):
+            dest.mkdir(parents=True, exist_ok=True)
             (dest / "half.yaml").write_text("kind: Deployment\n")
             return False
 

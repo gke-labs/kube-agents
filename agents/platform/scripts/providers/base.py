@@ -39,6 +39,7 @@ and the controls would still look present in the file that no longer decides.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Mapping
 
 import repo_ref
@@ -48,12 +49,19 @@ from .credentials import Credential, NoCredential
 from .errors import Override
 from .validate import repo_segments
 
+# The key a `proposal_tally` answer carries the forge's one count of every state
+# under, where the forge counts the states in separate queries.
+TALLY_TOTAL = "total"
+
 # Re-exported so a forge package can refuse a request without importing outside
 # the shared contract. `WorkspaceError` is the broker's "the caller sent
 # something wrong" with an HTTP status attached; a forge raises it for anything
 # specific to its own request shapes that the shared validators cannot know.
+
 __all__ = [
     "BROKER_VERBS",
+    "TALLY_TOTAL",
+    "tally_with_open",
     "COLLABORATION_VERBS",
     "ISSUE_VERBS",
     "LABEL_FIELDS",
@@ -61,9 +69,11 @@ __all__ = [
     "ForgeUnsupported",
     "IdentityUnknown",
     "LabelsUnsupported",
+    "QuotaReading",
     "StubForge",
     "WorkspaceError",
     "listing",
+    "quota_reading",
 ]
 
 # The verbs a forge may serve, plus the ones the broker serves for every forge.
@@ -109,13 +119,61 @@ LABEL_FIELDS: tuple[str, ...] = ("labels", "labelsAdd", "labelsRemove", "exclude
 # `branch-view` and `branch-delete` are the broker's rather than a forge's for the
 # reason `publish` is: which refs a remote holds, and removing one, is git
 # against a URL on every forge. `snapshot` is git against a URL too.
+# `proposal-claim` is the broker's because the claim token it burns is the
+# broker's: no forge has one.
 BROKER_VERBS: tuple[str, ...] = (
     "capabilities", "clone", "snapshot", "publish", "identity", "branch-view", "branch-delete",
+    "proposal-claim",
 )
-# Served to library callers only (`vcs_client.snapshot`), so `capabilities` does
-# not advertise them: no `vcs.py` command runs them, and an advertised verb sends
-# the agent to a command that does not exist.
-LIBRARY_VERBS: frozenset[str] = frozenset({"snapshot"})
+# Served to library callers only (`vcs_client.snapshot`, the `pr_opened` hook's
+# claim), so `capabilities` does not advertise them: no `vcs.py` command runs
+# them, and an advertised verb sends the agent to a command that does not exist.
+LIBRARY_VERBS: frozenset[str] = frozenset({"snapshot", "proposal-claim"})
+
+
+
+def tally_with_open(tally: dict[str, Any]) -> dict[str, Any]:
+    """`tally` with `open` as the remainder of its one count less merged and closed.
+
+    The three counts are separate requests, not one snapshot, so a proposal
+    that changes state between two of them is counted twice or not at all;
+    the remainder keeps the sum at the forge's one count. Clamped at zero, so
+    a count that straddled a merge never publishes a negative gauge.
+    """
+    tally["open"] = max(tally[TALLY_TOTAL] - tally["merged"] - tally["closed"], 0)
+    return tally
+
+@dataclass(frozen=True)
+class QuotaReading:
+    """What one forge answer said of the credential's request quota.
+
+    `reset_at` is when the quota refills, in seconds since the epoch. A field
+    the answer did not carry, or carried malformed, is None; a reading whose
+    `remaining` is None says nothing a caller can pace on, and reads as unknown.
+    """
+
+    limit: int | None
+    remaining: int | None
+    reset_at: float | None
+
+
+def _quota_number(headers: Mapping[str, Any], name: str) -> int | None:
+    value = str(headers.get(name) or "").strip()
+    return int(value) if value.isascii() and value.isdigit() else None
+
+
+def quota_reading(
+    headers: Mapping[str, Any], limit: str, remaining: str, reset: str
+) -> QuotaReading | None:
+    """The reading three headers give (lower-case names, `reset` in epoch
+    seconds), or None when the answer carried none of them."""
+    reset_at = _quota_number(headers, reset)
+    reading = QuotaReading(
+        _quota_number(headers, limit),
+        _quota_number(headers, remaining),
+        None if reset_at is None else float(reset_at),
+    )
+    return None if reading == QuotaReading(None, None, None) else reading
 
 
 class ForgeUnsupported(WorkspaceError):
@@ -236,18 +294,26 @@ class Forge:
     unconfigured: tuple[str, ...] = ()
     # The few statuses whose shared guidance this forge disagrees with.
     error_overrides: Mapping[int, Override] = {}
+    # What a clone or a push says when git over HTTPS refuses this forge's
+    # credential, for a forge whose refusal means more than "the token is not
+    # valid": a forge that answers 401 there for a repository the token
+    # cannot see says so. Empty keeps the broker's generic git failure.
+    git_refused = ""
     # Whether `proposal-acknowledge` does anything here. A capability rather
-    # than an assumption: Bitbucket Cloud has no reactions on pull-request
+    # than an assumption: some forges have no reactions on pull-request
     # comments, and a caller that assumed one would either crash there or
     # silently skip it. Read back from `capabilities`.
     acknowledges = False
     # Whether proposals and issues carry labels here. A capability for the
-    # same reason: Bitbucket has no labels at all, and label fields ride on
+    # same reason: a forge can have no labels at all, and label fields ride on
     # other verbs, so `verbs` cannot say it. A forge that declares none gets
     # every label field refused by name (`refuse_labels`), and its callers
     # find their own items by branch prefix and body marker. Off by default,
     # so a new forge that forgets it refuses a label instead of dropping one.
     labels = False
+    # The routes that spend a separate, smaller search quota, which the
+    # readings sweep paces (`vcs_readings.VCS_READINGS_SEARCH_CALLS_PER_MINUTE`).
+    search_routes: frozenset[str] = frozenset()
     # The login this install's credential acts as, when the forge cannot ask:
     # a token whose API has no current-user call, or refuses the call. A
     # provider package sets it from its forge configuration. Empty means ask
@@ -285,6 +351,29 @@ class Forge:
         login; with `identity_required`, the broker refuses that.
         """
         return self.identity.strip() or None
+
+    @staticmethod
+    def quota_from_headers(headers: Mapping[str, Any]) -> QuotaReading | None:
+        """The request quota one answer's headers (lower-case names) report.
+
+        None when this forge reports none the code knows how to read, which
+        is the default: a forge declares its own headers rather than having
+        names guessed for it. Static, so the broker hands it to the HTTP
+        transport it builds, as it hands `whoami_route`, and the transport
+        keeps the latest reading (`HttpTransport.quota`).
+        """
+        return None
+
+    @staticmethod
+    def quota_scope(path: str) -> str:
+        """Which of the host's request quotas `path`'s credential spends.
+
+        "" is one quota for the whole host, which is right for a forge with
+        one static token. A forge whose credential is minted per owner
+        names the owner, so a quota one owner drained pauses no other's
+        reads (the readings sweep keys its pause on host and scope).
+        """
+        return ""
 
     def refuse_labels(self, verb: str, payload: Mapping[str, Any]) -> None:
         """Refuse a label field on a forge that has no labels. No call is made.
@@ -472,6 +561,43 @@ class Forge:
     def proposal_acknowledge(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
         return self._unsupported("proposal-acknowledge")
 
+    # -- the readings sweep's calls -------------------------------------------
+    #
+    # Not verbs: no route serves them and no forge lists them in `verbs`. The
+    # broker's own sweep calls them through a binding's `api`, to count the
+    # install's proposals by outcome and who touched them. A forge that
+    # cannot answer one inherits the same named refusal, and the sweep reads
+    # it as "no reading from this forge".
+
+    def proposal_list_by_author(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        """A page of the proposals `payload["author"]` opened, newest activity first.
+
+        Filtered by the forge, never here. Each item is `number`, `state`,
+        `author`, `authorBot`, `created`, `updated` and `closed`; beside
+        `count` and `truncated` is `total`, the forge's own count for the
+        query, or None when it gives none. A page the forge itself says is
+        incomplete also carries `incomplete: True`, and is `truncated`.
+        """
+        return self._unsupported("proposal-list-by-author")
+
+    def proposal_tally(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        """How many proposals `payload["author"]` has open, merged and closed.
+
+        None for a count the forge cannot split out. A forge whose counts are
+        separate queries also answers `TALLY_TOTAL`, its one count of every
+        state together, and derives `open` from it: the states are not one
+        snapshot, and the sum is what the sweep publishes.
+        """
+        return self._unsupported("proposal-tally")
+
+    def proposal_reviews(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        """A proposal's reviews, a bodiless approval included."""
+        return self._unsupported("proposal-reviews")
+
+    def proposal_closer(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
+        """Who closed a proposal: `actor`, "" when the forge does not say, and `bot`."""
+        return self._unsupported("proposal-closer")
+
     def issue_update(self, api: Callable, repo: str, payload: dict) -> dict[str, Any]:
         return self._unsupported("issue-update")
 
@@ -554,3 +680,4 @@ class StubForge(Forge):
     proposal_update = proposal_close = proposal_commits = proposal_acknowledge = _refuse
     issue_create = issue_list = issue_view = issue_comment = _refuse
     issue_update = issue_close = label_ensure = _refuse
+    proposal_list_by_author = proposal_tally = proposal_reviews = proposal_closer = _refuse

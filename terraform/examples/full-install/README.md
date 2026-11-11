@@ -13,7 +13,10 @@ install without the interview.
   API when Google Chat is enabled.
 - A GKE cluster ([`gke-cluster`](../../modules/gke-cluster) module) — Autopilot
   by default, or `cluster_mode = "standard"` for an e2-standard-4 node pool
-  (with an optional gVisor node pool) — with Workload Identity, Cloud KMS
+  (with an optional gVisor node pool; `sizing_profile = "fleet"` or the
+  `standard_*` and `gvisor_*` inputs resize both pools, per the module's
+  [sizing section](../../modules/gke-cluster/README.md#sizing-the-node-pools))
+  — with Workload Identity, Cloud KMS
   database encryption (CMEK), the Backup for GKE agent enabled, and the
   `kube-agents-host=true` discovery label applied. Setting
   `create_cluster = false` instead makes the module read an existing cluster:
@@ -55,7 +58,10 @@ install without the interview.
   the gateway asks for on a request that names none; `litellm_redaction`
   (off by default) redacts every request body the gateway forwards to the
   provider, and `install.sh` sets it from the `LITELLM_REDACTION_*` keys in
-  `install.env`; `platform_agent_mode` (default `"today"`, which passes the
+  `install.env`; `litellm_budget` (default `{}`, meaning no ceiling) caps what
+  the gateway spends per period, and `install.sh` sets it from
+  `LITELLM_BUDGET_USD` and `LITELLM_BUDGET_PERIOD` in `install.env`;
+  `platform_agent_mode` (default `"today"`, which passes the
   chart nothing, so the CR carries no `mode` field) sets the `PlatformAgent`'s
   `spec.mode`, and `"next"` puts the NATS bus and the A2A gateway in front of
   the agent. `install.sh` sets it from `PLATFORM_AGENT_MODE` in `install.env`,
@@ -196,7 +202,12 @@ run it again after a few minutes and it untaints the key ring or key the first
 run created, where a bare `terraform apply` would plan their replacement and 409.
 Once the project has been destroyed and re-applied even once, `make tf-apply`
 is required — it adopts the Cloud KMS resources GCP refuses to delete, which a
-bare `terraform apply` fails on. The table under
+bare `terraform apply` fails on. For the minter's key ring and key it adopts only
+this install's own, by the owner labels on the key, or the one
+`github_minter_shared_kms_key` names. A key with no owner labels is adopted as
+this install's own, and labelled, when `github_minter_adopt_unlabelled_kms_key`
+names it (the installer sets it when `KMS_KEYRING` and `KMS_KEY` were given). Any
+other, and any key another install's labels claim, refuses the apply. The table under
 [Teardown and re-apply](#teardown-and-re-apply) has both.
 
 ### Remote state
@@ -241,7 +252,11 @@ release namespace (`NAMESPACE` in `install.env`) has the same guard,
 so do the CMEK key ring and key names (`GKE_DB_KMS_KEYRING` / `GKE_DB_KMS_KEY`,
 `guard_kms_identity`): on a cluster this state created, a renamed key would be
 destroyed and recreated, which schedules the live key's versions for destruction.
-A key is rotated in Cloud KMS, not by renaming it here.
+A key is rotated in Cloud KMS, not by renaming it here. On a Standard cluster
+`standard_node_count` is the cluster's own `initial_node_count`, ForceNew on the
+cluster itself, and a `TF_VAR_standard_node_count` line in `install.env` reaches
+it: `guard_standard_node_count` refuses a count other than the one the cluster
+was created with, because the plan would be the cluster's destroy-and-recreate.
 And a distinct GSA name un-collides creation, not identity: the Workload
 Identity principal names a namespace and KSA project-wide, no cluster, so two
 installs that share the namespace and the default KSA name bind the same
@@ -263,6 +278,23 @@ KSA back to the default and re-shares the identity silently, and there is no
 `guard_ksa_identity` to refuse that the way `guard_gsa_identity` refuses the
 GSA's destroy-and-recreate. The `agent_service_account_id` description in
 `variables.tf` carries the limits to read before relying on any of this.
+The Standard pools' sizing inputs (`sizing_profile`, `standard_*`, `gvisor_*`)
+travel the same way, as `TF_VAR_` lines the generator never writes, and the
+lines have to be present on every later `install.sh` and `upgrade.sh` run: a
+lost one resolves the `small` profile, and the apply would recreate every node
+of a larger pool onto it. `guard_node_pool_shape` refuses that apply unless a
+sizing input asks for the change: the pool's own input, set to any value, or,
+for an attribute no explicit input decided at the last apply, a profile other
+than the one that apply recorded. Two root outputs carry what the last apply
+decided them with: `sizing_profile`, and `node_pool_shape_inputs`, the
+explicit inputs that were set. A profile kept beside a lost explicit line asks
+for nothing, and a changed profile asks nothing about an attribute an explicit
+line set, so both of those applies are refused until the line is back or the
+pool's input names the shape. An install applied before the two outputs
+existed plans them once, `+ sizing_profile = "<profile>"` and
+`+ node_pool_shape_inputs = "<names>"` under `Changes to Outputs` and nothing
+else, which `-detailed-exitcode` reports as 2 and `./upgrade.sh --plan` as
+drift, until the next apply records them.
 The drift audit-log ingress has the same one-default-per-project shape, and
 this one every second install meets, because `ENABLE_DRIFT_DETECTOR` defaults
 to `true`: `drift_pubsub_topic`, `drift_pubsub_subscription` and
@@ -1113,8 +1145,21 @@ project that use the same key need that grant, so a raw destroy must
 > you did not create here.
 
 > [!NOTE]
-> Cloud KMS key rings and crypto keys (for GKE CMEK and optional GitHub minter)
-> cannot be deleted from GCP — `terraform destroy` only removes them from state,
-> and they stay in the project forever. `make tf-apply` imports them back
-> automatically. Applying with bare `terraform apply` after a destroy fails with
-> a 409 until you either import them yourself or choose new key/keyring names.
+> Cloud KMS key rings and crypto keys (for GKE CMEK and the optional GitHub
+> minter) cannot be deleted from GCP, and they stay in the project forever. A
+> raw `terraform destroy` does more than forget them: destroying a crypto key
+> schedules every version of it for destruction, so the key can no longer
+> encrypt and a cluster that uses it cannot read its etcd. `make tf-destroy`
+> (`lifecycle.sh destroy`, which `uninstall.sh` runs) forgets the keys from
+> state first, so they stay usable; a raw destroy needs the `terraform state rm`
+> in the paragraph above. When `make tf-apply` imports them back, which it does
+> automatically, it also restores any cluster key version a raw destroy
+> scheduled, as long as its destruction time has not passed. A minter key with
+> no enabled version stops `make tf-apply` before that step: run
+> `./lifecycle.sh adopt-kms` first, which imports and restores both keys.
+> Applying with bare `terraform apply` after a destroy fails with a 409 until
+> you either import them yourself or choose new key/keyring names. A key you
+> import by hand is not restored: restore and enable each scheduled version
+> with `gcloud kms keys versions restore` and `enable` before its destruction
+> time. See
+> [Full teardown](../../../docs/site/src/content/docs/install/uninstall.md#full-teardown).

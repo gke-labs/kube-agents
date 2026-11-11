@@ -7,6 +7,8 @@ not shapes invented to match the parser. Both APIs were the reason those two
 checks stayed prose-only, so a hand-written fixture would re-create exactly the
 problem converting them was meant to solve."""
 
+import contextlib
+import io
 import json
 import os
 import shlex
@@ -28,10 +30,37 @@ import fleet_stockout as fs  # noqa: E402
 # collector, not the host it runs on, so both are neutralised at import.
 os.environ.pop("KUBEAGENTS_SCOPE_DECLARED", None)  # module-level, on purpose
 # The sweep width is read from the credential broker (broker_admission); with its
-# URL unset that read makes no request and the width is the fallback, four, so
+# URLs unset that read makes no request and the width is the fallback, four, so
 # no test here reaches the network or depends on the host's broker.
 os.environ.pop("CREDENTIAL_PROXY_URL", None)  # module-level, on purpose
+os.environ.pop("CREDENTIAL_PROXY_EXEC_URL", None)  # module-level, on purpose
 import fleet_scope_args as _fleet_scope_args  # noqa: E402
+import test_collector_run as _shared_run_tests  # noqa: E402
+import audit_report  # noqa: E402
+
+# The longest identifiers a recorded command can carry in its kubeconfig path
+# under the shipped platform profile: a 30-character project id, a 40-character
+# cluster name, GCP's longest location. A collector's recorded chain is held
+# under `audit_report.MAX_COMMAND_CHARS` at this length, since `finish` refuses
+# a `checks_run` command over it and the SOPs copy the chain verbatim.
+PLATFORM_PROFILE_KUBECONFIG_DIR = Path("/opt/data/profiles/platform/.kubeconfigs")
+LONGEST_PROJECT = "p" * 30
+LONGEST_CLUSTER = "c" * 40
+LONGEST_LOCATION = "northamerica-northeast1-a"
+
+# The collector pages its kinds through `kubectl get --raw`; the fakes below
+# still answer the one-shot dump, and the adapter feeds the real paging from
+# it (test_collector_run.paged_dump_over). The tests that assert the paged
+# argv itself pass a `--raw`-aware fake and bypass this by patching it back.
+_PAGED_DUMP = patch.object(fs, "paged_dump", _shared_run_tests.paged_dump_over())
+
+
+def setUpModule():
+    _PAGED_DUMP.start()
+
+
+def tearDownModule():
+    _PAGED_DUMP.stop()
 
 _fleet_scope_args.SCOPE_DECLARED_FILE = "/nonexistent/kube-agents-sandbox/scope-declared"
 
@@ -73,8 +102,38 @@ def storage_class(name, provisioner="pd.csi.storage.gke.io", params=None):
     return {"kind": "StorageClass", "metadata": {"name": name}, "provisioner": provisioner, "parameters": params or {}}
 
 
-def node(name, pool):
-    return {"kind": "Node", "metadata": {"name": name, "labels": {"cloud.google.com/gke-nodepool": pool}}}
+def node(name, pool, labels=None):
+    return {"kind": "Node", "metadata": {"name": name, "labels": {"cloud.google.com/gke-nodepool": pool, **(labels or {})}}}
+
+
+PINNED_TOLERATION = {"key": "seeded-role", "operator": "Equal", "value": "pinned-inference", "effect": "NoSchedule"}
+
+
+REFUSED_FOR_CPU = "0/1 nodes are available: 1 Insufficient cpu. preemption: 0/1 nodes are available: 1 No preemption victims found for incoming pod."
+
+
+def pod(name, node_selector=None, *, phase="Pending", scheduled="False", reason="Unschedulable", message=REFUSED_FOR_CPU, owner=("ReplicaSet", "inference-server-7d9f8b6c4"), template_hash="7d9f8b6c4", tolerations=(PINNED_TOLERATION,), owners=None):
+    """A pod as the paged read returns it: by default one the scheduler has
+    refused for cpu, owned by a Deployment's ReplicaSet, tolerating the
+    pinned pool's taint as the seeded workload does. `owners` replaces the
+    one-owner shape with a full ownerReferences list."""
+    labels = {"pod-template-hash": template_hash} if template_hash else {}
+    meta = {"name": name, "namespace": "seeded-capacity", "labels": labels}
+    if owners is not None:
+        meta["ownerReferences"] = list(owners)
+    elif owner:
+        meta["ownerReferences"] = [{"kind": owner[0], "name": owner[1]}]
+    condition = {"type": "PodScheduled", "status": scheduled}
+    if reason:
+        condition["reason"] = reason
+    if message:
+        condition["message"] = message
+    return {
+        "kind": "Pod",
+        "metadata": meta,
+        "spec": {"nodeSelector": dict(node_selector or {}), "tolerations": [dict(t) for t in tolerations]},
+        "status": {"phase": phase, "conditions": [condition]},
+    }
 
 
 def capacity_history(rates, machine_type="n2-standard-8", price=None):
@@ -181,6 +240,23 @@ class EnumerateClustersTest(unittest.TestCase):
             clusters, not_running = fs.enumerate_clusters("acme", run=lambda argv, **kwargs: run_of(0, json.dumps(listing)))
         self.assertEqual([c["name"] for c in clusters], ["ka-today"])
         self.assertEqual(not_running, [])
+
+    def test_a_cluster_with_the_config_connector_add_on_is_marked_and_read_first(self):
+        """Stockout has the least time left of the three, so its add-on
+        clusters are read first, as drift and patch readiness mark theirs."""
+        listing = [
+            {"name": "hub", "location": "us-central1", "status": "RUNNING", "addonsConfig": {"configConnectorConfig": {"enabled": True}}},
+            {"name": "edge", "location": "us-central1", "status": "RUNNING"},
+        ]
+        issued = []
+
+        def run(argv, **kwargs):
+            issued.append(argv)
+            return run_of(0, json.dumps(listing))
+
+        clusters, _ = fs.enumerate_clusters("acme", run=run)
+        self.assertIn("addonsConfig.configConnectorConfig.enabled", issued[0][-1])
+        self.assertEqual({c["name"]: c.get(fs.kcc_health.ADDON_FIELD) for c in clusters}, {"hub": True, "edge": False})
 
     def test_reads_the_control_plane_version(self):
         clusters_json = json.dumps([{"name": "c1", "location": "us-central1", "status": "RUNNING", "currentMasterVersion": "1.35.3-gke.1200"}])
@@ -1061,6 +1137,203 @@ class SingleZoneNodepoolTest(unittest.TestCase):
         self.assertNotIn("ceiling", below["excerpt"])
         self.assertNotIn("ceiling", below["impact"])
 
+    PINNED_POOL = {
+        "name": "pinned-inference-pool", "locations": ["us-central1-a"],
+        "autoscaling": {"enabled": True, "maxNodeCount": 1},
+        "config": {"machineType": "e2-small", "labels": {"seeded-role": "pinned-inference"},
+                   "taints": [{"key": "seeded-role", "value": "pinned-inference", "effect": "NO_SCHEDULE"}]},
+    }
+
+    def test_the_excerpt_names_the_unschedulable_pods_pinned_to_the_pool(self):
+        """The live shape of the seeded fleet: a zone-locked pool at 1/1 with a
+        Deployment's replicas the scheduler refuses. "At its ceiling" says the
+        pool cannot grow; this clause says what is waiting on it, which is
+        the harm an operator acts on."""
+        pods = [pod(f"inference-server-7d9f8b6c4-{i}", {"seeded-role": "pinned-inference"}) for i in range(9)]
+        hit = fs.check_single_zone_nodepool(self.PINNED_POOL, has_nap=False, current_node_count=1, unschedulable_pods=pods)
+        self.assertTrue(hit["excerpt"].endswith("; 9 Unschedulable pods of inference-server select this pool and cannot be placed"), hit["excerpt"])
+        self.assertIn("at its autoscaling ceiling: 1/1 live nodes", hit["excerpt"])
+        # The arms' sentences are the Impact; the clause is evidence only.
+        self.assertNotIn("Unschedulable", hit["impact"])
+
+    def test_the_clause_keeps_one_shape_at_a_count_of_one_and_names_several_workloads(self):
+        """A fleet whose desired count sits one above the pool's capacity has
+        exactly one refused pod, and the ledger is graded on the clause, so
+        the noun stays plural at 1 rather than giving that fleet a second
+        shape."""
+        one = fs.check_single_zone_nodepool(self.PINNED_POOL, has_nap=False, current_node_count=1, unschedulable_pods=[pod("inference-server-7d9f8b6c4-a", {"seeded-role": "pinned-inference"})])
+        self.assertIn("; 1 Unschedulable pods of inference-server select this pool and cannot be placed", one["excerpt"])
+        mixed = [pod(f"inference-server-7d9f8b6c4-{i}", {"seeded-role": "pinned-inference"}) for i in range(2)]
+        mixed.append(pod("batch-scorer-0", {"seeded-role": "pinned-inference"}, owner=("StatefulSet", "batch-scorer"), template_hash=""))
+        mixed.append(pod("lone-pod", {"seeded-role": "pinned-inference"}, owner=None, template_hash=""))
+        several = fs.check_single_zone_nodepool(self.PINNED_POOL, has_nap=False, current_node_count=1, unschedulable_pods=mixed)
+        self.assertIn("; 4 Unschedulable pods of inference-server (2), batch-scorer (1), lone-pod (1) select this pool", several["excerpt"])
+
+    def test_no_unschedulable_pods_leaves_the_excerpt_as_it_was(self):
+        bare = fs.check_single_zone_nodepool(self.PINNED_POOL, has_nap=False, current_node_count=1)
+        self.assertNotIn("Unschedulable", bare["excerpt"])
+        self.assertNotIn("select this pool", bare["excerpt"])
+
+    def test_the_clause_decides_nothing(self):
+        """A pool neither zone-locked nor near its ceiling stays unflagged
+        whatever waits on it: the backlog is evidence on an arm's finding,
+        not a third arm."""
+        roomy = {**self.PINNED_POOL, "locations": ["us-central1-a", "us-central1-b"], "autoscaling": {"enabled": True, "maxNodeCount": 10}}
+        pods = [pod(f"inference-server-7d9f8b6c4-{i}", {"seeded-role": "pinned-inference"}) for i in range(9)]
+        self.assertIsNone(fs.check_single_zone_nodepool(roomy, has_nap=False, current_node_count=2, unschedulable_pods=pods))
+
+    def test_only_the_scheduler_s_refusal_is_backlog(self):
+        """Pending covers more than refused: a pod the scheduler placed and
+        that waits on an image or a volume has PodScheduled=True; a pod not
+        yet looked at has no reason. Neither counts, nor does a Running pod."""
+        selector = {"seeded-role": "pinned-inference"}
+        refused = pod("p-refused", selector)
+        self.assertTrue(fs.is_unschedulable(refused))
+        for name, kwargs in (
+            ("placed-image-pull", {"scheduled": "True", "reason": None}),
+            ("not-yet-looked-at", {"scheduled": "False", "reason": None}),
+            ("running", {"phase": "Running", "scheduled": "True", "reason": None}),
+            # A pod that was refused and then placed keeps nothing of the
+            # refusal in its condition, but a stale fake could; the phase
+            # guard is what keeps it out.
+            ("running-stale-refusal", {"phase": "Running", "scheduled": "False", "reason": "Unschedulable"}),
+            ("other-reason", {"scheduled": "False", "reason": "SchedulerError"}),
+            # Refused, and no node change would lift it: not the pool's backlog.
+            ("unbound-claim", {"message": "0/3 nodes are available: pod has unbound immediate PersistentVolumeClaims. preemption: 0/3 nodes are available: 3 Preemption is not helpful for scheduling."}),
+            ("volume-binding-wait", {"message": "0/3 nodes are available: 3 waiting for ephemeral volume controller to create the persistentvolumeclaim."}),
+            ("no-message", {"message": ""}),
+        ):
+            with self.subTest(name=name):
+                self.assertFalse(fs.is_unschedulable(pod(name, selector, **kwargs)))
+        # The scheduler's capacity and placement clauses all count.
+        for name, message in (
+            ("cpu", REFUSED_FOR_CPU),
+            ("taint", "0/3 nodes are available: 1 node(s) had untolerated taint {seeded-role: pinned-inference}, 2 Insufficient memory."),
+            ("affinity", "0/3 nodes are available: 3 node(s) didn't match Pod's node affinity/selector."),
+            ("old-selector", "0/3 nodes are available: 3 node(s) didn't match node selector."),
+            ("pods-per-node", "0/1 nodes are available: 1 Too many pods."),
+            ("gpu", "0/2 nodes are available: 2 Insufficient nvidia.com/gpu."),
+        ):
+            with self.subTest(name=name):
+                self.assertTrue(fs.is_unschedulable(pod(name, selector, message=message)))
+
+    # Two pools in one zone, both e2-small: the pinned pool with its own label
+    # and taint, and a default pool. Their nodes carry what GKE stamps.
+    DEFAULT_POOL = {"name": "default-pool", "locations": ["us-central1-a"], "autoscaling": {"enabled": True, "maxNodeCount": 3}, "config": {"machineType": "e2-small"}}
+    STAMPED = {"topology.kubernetes.io/zone": "us-central1-a", "node.kubernetes.io/instance-type": "e2-small", "kubernetes.io/os": "linux", "kubernetes.io/arch": "amd64"}
+
+    def two_pools(self):
+        pools = [self.PINNED_POOL, self.DEFAULT_POOL]
+        nodes = [node("n0", "pinned-inference-pool", {**self.STAMPED, "seeded-role": "pinned-inference"}), node("n1", "default-pool", self.STAMPED)]
+        return pools, fs.pool_label_index(pools, nodes)
+
+    def test_a_pod_is_pinned_to_the_one_pool_its_selector_narrows_it_to(self):
+        """The selector resolves against the labels the pool's nodes carry,
+        the pool's own label or any label GKE stamped, and the pod counts for
+        a pool only when the selector leaves that pool alone. A label every
+        pool carries narrows nothing; a chart's default `kubernetes.io/os`
+        beside the pinning label changes nothing."""
+        pools, index = self.two_pools()
+        for name, selector, expected in (
+            ("own-label", {"seeded-role": "pinned-inference"}, "pinned-inference-pool"),
+            ("own-label-plus-chart-default", {"seeded-role": "pinned-inference", "kubernetes.io/os": "linux"}, "pinned-inference-pool"),
+            ("pool-name-label", {"cloud.google.com/gke-nodepool": "pinned-inference-pool"}, "pinned-inference-pool"),
+            ("other-pool-by-name", {"cloud.google.com/gke-nodepool": "default-pool"}, "default-pool"),
+            ("zone-both-pools-share", {"topology.kubernetes.io/zone": "us-central1-a"}, None),
+            ("machine-type-both-share", {"node.kubernetes.io/instance-type": "e2-small"}, None),
+            ("os-every-pool-carries", {"kubernetes.io/os": "linux"}, None),
+            ("label-no-pool-carries", {"seeded-role": "idle-batch"}, None),
+            ("zone-outside-the-cluster", {"seeded-role": "pinned-inference", "topology.kubernetes.io/zone": "us-central1-f"}, None),
+            ("empty", {}, None),
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(fs.pinned_pool(pod(name, selector), pools, index), expected)
+
+    def test_a_pod_that_does_not_tolerate_the_pool_s_taint_is_not_pinned_to_it(self):
+        """The scheduler could never place it there, so it is not that pool's
+        backlog, whatever its selector says."""
+        pools, index = self.two_pools()
+        selector = {"seeded-role": "pinned-inference"}
+        self.assertIsNone(fs.pinned_pool(pod("bare", selector, tolerations=()), pools, index))
+        self.assertIsNone(fs.pinned_pool(pod("wrong-value", selector, tolerations=({**PINNED_TOLERATION, "value": "idle-batch"},)), pools, index))
+        exists = {"key": "seeded-role", "operator": "Exists", "effect": "NoSchedule"}
+        self.assertEqual(fs.pinned_pool(pod("exists", selector, tolerations=(exists,)), pools, index), "pinned-inference-pool")
+        # The default pool carries no taint, so a bare pod pinned by name counts.
+        self.assertEqual(fs.pinned_pool(pod("untainted", {"cloud.google.com/gke-nodepool": "default-pool"}, tolerations=()), pools, index), "default-pool")
+
+    def test_a_gpu_pool_is_found_by_the_labels_its_nodes_carry(self):
+        gpu = {"name": "gpu-pool", "locations": ["us-central1-b"], "autoscaling": {"enabled": True, "maxNodeCount": 1}, "config": {"machineType": "a2-highgpu-1g", "accelerators": [{"acceleratorType": "nvidia-tesla-a100", "acceleratorCount": "1"}]}}
+        pools = [self.PINNED_POOL, self.DEFAULT_POOL, gpu]
+        nodes = [
+            node("n0", "pinned-inference-pool", {**self.STAMPED, "seeded-role": "pinned-inference"}),
+            node("n1", "default-pool", self.STAMPED),
+            node("g0", "gpu-pool", {**self.STAMPED, "topology.kubernetes.io/zone": "us-central1-b", "node.kubernetes.io/instance-type": "a2-highgpu-1g", "cloud.google.com/gke-accelerator": "nvidia-tesla-a100"}),
+        ]
+        index = fs.pool_label_index(pools, nodes)
+        for name, selector in (
+            ("accelerator", {"cloud.google.com/gke-accelerator": "nvidia-tesla-a100"}),
+            ("zone-only-it-spans", {"topology.kubernetes.io/zone": "us-central1-b"}),
+            ("machine-type", {"node.kubernetes.io/instance-type": "a2-highgpu-1g"}),
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(fs.pinned_pool(pod(name, selector, tolerations=()), pools, index), "gpu-pool")
+        self.assertIsNone(fs.pinned_pool(pod("other-gpu", {"cloud.google.com/gke-accelerator": "nvidia-l4"}, tolerations=()), pools, index))
+
+    def test_a_pool_at_zero_nodes_is_still_found_by_its_own_labels(self):
+        """A labelled pool that scaled to nothing has no node to read; its
+        record's `config.labels` still name it."""
+        pools = [self.PINNED_POOL, self.DEFAULT_POOL]
+        index = fs.pool_label_index(pools, [node("n1", "default-pool", self.STAMPED)])
+        self.assertEqual(fs.pinned_pool(pod("a", {"seeded-role": "pinned-inference"}), pools, index), "pinned-inference-pool")
+
+    def test_a_pool_at_zero_nodes_is_found_by_the_pool_name_label_too(self):
+        """A stocked-out autoscaled pool sits at 0 nodes with no `config.labels`;
+        GKE's documented pin, the pool-name label, must still find it, with
+        the pool's taints still applied. A stamped label it would carry at one
+        node is not knowable from the record and is not resolved."""
+        gpu = {"name": "gpu-pool", "locations": ["us-central1-b"], "autoscaling": {"enabled": True, "maxNodeCount": 4}, "config": {"machineType": "a2-highgpu-1g", "accelerators": [{"acceleratorType": "nvidia-tesla-a100", "acceleratorCount": "1"}], "taints": [{"key": "nvidia.com/gpu", "value": "present", "effect": "NO_SCHEDULE"}]}}
+        pools = [self.DEFAULT_POOL, gpu]
+        index = fs.pool_label_index(pools, [node("n1", "default-pool", self.STAMPED)])
+        by_name = {"cloud.google.com/gke-nodepool": "gpu-pool"}
+        tolerates = ({"key": "nvidia.com/gpu", "operator": "Exists", "effect": "NoSchedule"},)
+        self.assertEqual(fs.pinned_pool(pod("a", by_name, tolerations=tolerates), pools, index), "gpu-pool")
+        self.assertIsNone(fs.pinned_pool(pod("b", by_name, tolerations=()), pools, index))
+        self.assertIsNone(fs.pinned_pool(pod("c", {"cloud.google.com/gke-accelerator": "nvidia-tesla-a100"}, tolerations=tolerates), pools, index))
+
+    def test_on_a_cluster_with_one_pool_every_selected_pod_is_that_pool_s(self):
+        """The common Standard shape: one pool with nodes, or one beside pools
+        scaled to zero. The question is where the pod can go, so a selector
+        its nodes satisfy pins the pod to it, whether the selector names the
+        pool's own label or a label every node carries."""
+        only = {**self.DEFAULT_POOL, "config": {"machineType": "e2-small", "labels": {"role": "inference"}}}
+        pools = [only]
+        index = fs.pool_label_index(pools, [node("n1", "default-pool", {**self.STAMPED, "role": "inference"})])
+        for name, selector in (("own-label", {"role": "inference"}), ("os-only", {"kubernetes.io/os": "linux"}), ("zone", {"topology.kubernetes.io/zone": "us-central1-a"})):
+            with self.subTest(name=name):
+                self.assertEqual(fs.pinned_pool(pod(name, selector, tolerations=()), pools, index), "default-pool")
+        self.assertIsNone(fs.pinned_pool(pod("other", {"role": "batch"}, tolerations=()), pools, index))
+        # Beside a pool scaled to zero, the same pods still resolve to the one pool their selector names.
+        scaled_to_zero = {**self.PINNED_POOL, "name": "idle-batch-pool", "config": {"machineType": "e2-small", "labels": {"role": "batch"}}}
+        index = fs.pool_label_index([only, scaled_to_zero], [node("n1", "default-pool", {**self.STAMPED, "role": "inference"})])
+        self.assertEqual(fs.pinned_pool(pod("a", {"role": "inference"}, tolerations=()), [only, scaled_to_zero], index), "default-pool")
+        self.assertEqual(fs.pinned_pool(pod("b", {"role": "batch"}, tolerations=()), [only, scaled_to_zero], index), "idle-batch-pool")
+
+    def test_a_shared_selector_resolves_through_the_taints_the_pod_tolerates(self):
+        """Two pools satisfy a zone-only selector; the pod tolerates only the
+        pinned pool's taint, so the default pool is the one place it can go."""
+        pools, index = self.two_pools()
+        zone = {"topology.kubernetes.io/zone": "us-central1-a"}
+        self.assertEqual(fs.pinned_pool(pod("bare", zone, tolerations=()), pools, index), "default-pool")
+        self.assertIsNone(fs.pinned_pool(pod("tolerant", zone), pools, index))
+
+    def test_the_workload_name_is_the_cost_stream_s_owner_rule(self):
+        """The controller reference names the workload, whatever its position;
+        a Deployment stands in for its ReplicaSet; an unowned pod is itself."""
+        two_owners = [{"kind": "InferenceService", "name": "llm-serving", "controller": False}, {"kind": "ReplicaSet", "name": "inference-server-7d9f8b6c4", "controller": True}]
+        self.assertEqual(fs.workload_of(pod("p", owners=two_owners)), "inference-server")
+        self.assertEqual(fs.workload_of(pod("p", owner=("StatefulSet", "batch-scorer"), template_hash="")), "batch-scorer")
+        self.assertEqual(fs.workload_of(pod("lone", owner=None, template_hash="")), "lone")
+
     def test_a_pool_ceiling_needs_both_an_enabled_autoscaler_and_a_zone_span(self):
         """Neither shape reaches this from `node-pools list` -- GKE omits the
         `autoscaling` key entirely for a static pool, and `locations` is always
@@ -1532,6 +1805,60 @@ class CollectClusterTest(unittest.TestCase):
         "message=Autopilot node pools cannot be accessed or modified."
     )
 
+    def test_the_cluster_is_read_as_one_crd_read_and_five_paged_reads(self):
+        """The real paging, not the adapter: ComputeClass keeps its one-shot
+        read (a CRD outside the paged collections), the four built-in kinds
+        are paged `kubectl get --raw` reads, the backlog is a fifth paged read
+        server-filtered to Pending pods, and a cut page fails the cluster
+        closed with the shim's marker in the error."""
+        issued = []
+
+        def run(argv, cut=False, **kwargs):
+            issued.append(argv)
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:3] == ["kubectl", "get", "computeclasses"]:
+                return run_of(0, json.dumps(dump_of()))
+            if argv[:3] == ["kubectl", "get", "--raw"]:
+                return run_of(0, json.dumps({"metadata": {}, "items": []}))
+            if argv[:2] == ["kubectl", "get"]:
+                raise AssertionError(f"a one-shot dump was issued: {argv}")
+            if argv[:3] == ["gcloud", "container", "node-pools"]:
+                return run_of(0, "[]")
+            return run_of(0, "")
+
+        with TemporaryDirectory() as tmp, patch.object(fs, "KUBECONFIG_DIR", Path(tmp)), patch.object(fs, "paged_dump", _shared_run_tests.cr.paged_dump):
+            entry = fs.collect_cluster(self.CLUSTER, run=run)
+        self.assertEqual(entry["outcome"], "collected", entry.get("error"))
+        raw = [a[3] for a in issued if a[:3] == ["kubectl", "get", "--raw"]]
+        self.assertEqual(
+            ["/apis/apps/v1/deployments?limit=500", "/apis/apps/v1/statefulsets?limit=500",
+             "/apis/storage.k8s.io/v1/storageclasses?limit=500", "/api/v1/nodes?limit=100",
+             "/api/v1/pods?limit=500&fieldSelector=status.phase%3DPending%2Cspec.nodeName%3D"],
+            raw,
+        )
+        self.assertEqual(1, len([a for a in issued if a[:3] == ["kubectl", "get", "computeclasses"]]))
+        command = next(c["command"] for c in entry["commands"] if c["check"] == "dangling-compute-class")
+        kubeconfig = next(part for part in command.split() if part.startswith("KUBECONFIG=")).removeprefix("KUBECONFIG=")
+        self.assertEqual(command.split("; ")[0], f"KUBECONFIG={kubeconfig} kubectl get computeclasses -A -o json")
+        # The one-shot read under the kubeconfig, then the paged chain with the
+        # kubeconfig exported once for every read in it: the line is recorded
+        # to be pasted unchanged.
+        self.assertEqual(command, f"KUBECONFIG={kubeconfig} {shlex.join(['kubectl', 'get', 'computeclasses', '-A', '-o', 'json'])}; {fs.paged_command_text(fs.PAGED_DUMP_KINDS, kubeconfig=kubeconfig)}")
+        self.assertIn(f"; ( export KUBECONFIG={kubeconfig}; kubectl get --raw ", command)
+        self.assertEqual(2, command.count("KUBECONFIG="), command)
+
+        def cut_run(argv, **kwargs):
+            if argv[:3] == ["kubectl", "get", "--raw"] and argv[3].startswith("/api/v1/nodes"):
+                return run_of(74, '{"items": [{"metadata": {"name": "n', "credential proxy output truncated at 8388608 bytes (kept 8388608 bytes of stdout; exit 74)")
+            return run(argv, **kwargs)
+
+        with TemporaryDirectory() as tmp, patch.object(fs, "KUBECONFIG_DIR", Path(tmp)), patch.object(fs, "paged_dump", _shared_run_tests.cr.paged_dump):
+            entry = fs.collect_cluster(self.CLUSTER, run=cut_run)
+        self.assertEqual(entry["outcome"], fs.GATE_FAILED_OUTCOME)
+        self.assertIn("rc=74", entry["error"])
+        self.assertIn("credential proxy output truncated", entry["error"])
+
     def run_with(
         self,
         dump_items=(),
@@ -1633,6 +1960,12 @@ class CollectClusterTest(unittest.TestCase):
         entry = self.run_with(dump_items=[cc])
         self.assertEqual(entry["outcome"], "collected")
         self.assertEqual(entry["candidates"], [])
+
+    def test_a_collected_add_on_cluster_carries_the_marker(self):
+        entry = self.run_with(cluster={**self.CLUSTER, fs.kcc_health.ADDON_FIELD: True})
+        self.assertEqual(entry["outcome"], "collected")
+        self.assertIs(entry[fs.kcc_health.ADDON_FIELD], True)
+        self.assertNotIn(fs.kcc_health.ADDON_FIELD, self.run_with())
 
     def test_get_credentials_failure_is_unreachable(self):
         def run(argv, **kwargs):
@@ -1747,6 +2080,67 @@ class CollectClusterTest(unittest.TestCase):
         entry = self.run_with(dump_items=live_nodes, pools=[pool])
         slugs = {c["check"] for c in entry["candidates"]}
         self.assertIn("single-zone-nodepool", slugs)
+
+    PINNED_POOL = SingleZoneNodepoolTest.PINNED_POOL
+
+    def test_the_backlog_reaches_the_candidate_with_both_reads_as_its_evidence(self):
+        """End to end: the Unschedulable pods the paged read returns land in
+        the pool's candidate excerpt, and the candidate's own evidence command
+        names the pods read beside the pools list, because the pools list
+        alone cannot reproduce the count."""
+        selector = {"seeded-role": "pinned-inference"}
+        stamped = {"topology.kubernetes.io/zone": "us-central1-a", "kubernetes.io/os": "linux"}
+        second = {"name": "batch-pool", "locations": ["us-central1-a"], "autoscaling": {"enabled": True, "maxNodeCount": 1}, "config": {"machineType": "e2-small"}}
+        items = [node("n0", "pinned-inference-pool", {**stamped, "seeded-role": "pinned-inference"}), node("b0", "batch-pool", stamped)]
+        items += [pod(f"inference-server-7d9f8b6c4-{i}", selector) for i in range(9)]
+        items.append(pod("placed", selector, scheduled="True", reason=None))
+        items.append(pod("elsewhere-7d9f8b6c4-x", {"seeded-role": "idle-batch"}))
+        # Pinned to the zone both pools share and tolerating both: no pool's
+        # backlog, counted nowhere.
+        items += [pod(f"zone-only-{i}", {"topology.kubernetes.io/zone": "us-central1-a"}) for i in range(2)]
+        entry = self.run_with(dump_items=items, pools=[self.PINNED_POOL, second])
+        flagged = {c["object"]: c for c in entry["candidates"] if c["check"] == "single-zone-nodepool"}
+        candidate = flagged["NodePool/pinned-inference-pool"]
+        self.assertTrue(candidate["excerpt"].endswith("; 9 Unschedulable pods of inference-server select this pool and cannot be placed"), candidate["excerpt"])
+        self.assertNotIn("Unschedulable", flagged["NodePool/batch-pool"]["excerpt"])
+        self.assertIn("gcloud container node-pools list", candidate["command"])
+        self.assertIn("/api/v1/pods?limit=500&fieldSelector=status.phase%3DPending%2Cspec.nodeName%3D", candidate["command"])
+        # The module's adapter answers the paged read from the one-shot fake,
+        # so the read shows up here as `kubectl get pods`; the query it
+        # carries on the wire is asserted on the real paging above
+        # (`test_the_cluster_is_read_as_one_crd_read_and_five_paged_reads`).
+        self.assertEqual(1, len([a for a in self.issued if a[:3] == ["kubectl", "get", "pods"]]), self.issued)
+        self.assertNotIn("Pending pods read failed", entry.get("limitations", ""))
+
+    def test_a_pool_with_no_backlog_keeps_the_pools_list_as_its_only_evidence(self):
+        entry = self.run_with(dump_items=[node("n0", "pinned-inference-pool")], pools=[self.PINNED_POOL])
+        candidate = next(c for c in entry["candidates"] if c["check"] == "single-zone-nodepool")
+        self.assertNotIn("Unschedulable", candidate["excerpt"])
+        self.assertNotIn("command", candidate)
+
+    def test_a_failed_pods_read_costs_the_clause_and_a_limitations_sentence_only(self):
+        pool = self.PINNED_POOL
+
+        def run(argv, **kwargs):
+            self.issued.append(argv)
+            if "get-credentials" in argv:
+                return run_of(0)
+            if argv[:3] == ["kubectl", "get", "--raw"] and "/api/v1/pods?" in argv[3]:
+                return run_of(1, "", "pods is forbidden: User cannot list resource")
+            if argv[:2] == ["kubectl", "get"]:
+                return run_of(0, json.dumps(dump_of(node("n0", "pinned-inference-pool"))))
+            if argv[:3] == ["gcloud", "container", "node-pools"]:
+                return run_of(0, json.dumps([pool]))
+            return run_of(0, "")
+
+        self.issued = []
+        with TemporaryDirectory() as tmp, patch.object(fs, "KUBECONFIG_DIR", Path(tmp)), patch.object(fs, "paged_dump", _shared_run_tests.cr.paged_dump):
+            entry = fs.collect_cluster(self.CLUSTER, run=run)
+        self.assertEqual(entry["outcome"], "collected", entry.get("error"))
+        candidate = next(c for c in entry["candidates"] if c["check"] == "single-zone-nodepool")
+        self.assertNotIn("Unschedulable", candidate["excerpt"])
+        self.assertIn("the Pending pods read failed (rc=1: pods is forbidden: User cannot list resource)", entry["limitations"])
+        self.assertNotIn("single-zone-nodepool", entry.get("checks_unevaluated") or {})
 
     def test_cluster_level_nap_suppresses_the_finding(self):
         pool = {"name": "p1", "locations": ["us-central1-a"], "autoscaling": {"enabled": True, "maxNodeCount": 10}}
@@ -2469,6 +2863,81 @@ class CollectClusterTest(unittest.TestCase):
         cc = compute_class("batch-staging", [{"machineFamily": "n2", "spot": True}])
         entry = self.run_with(dump_items=[cc])
         self.assertEqual([c for c in entry["candidates"] if c["check"] == "ccc-no-ondemand-floor"], [])
+
+
+class NodePoolsFromTheDiscoveryListingTest(unittest.TestCase):
+    """single-zone-nodepool takes the pools from the `clusters list` item that
+    discovered the cluster, recorded against that listing's command, and runs
+    its own `node-pools list` only when the item carries none (#4081)."""
+
+    CLUSTER = CollectClusterTest.CLUSTER
+    AUTOPILOT_NODE_POOLS_ERROR = CollectClusterTest.AUTOPILOT_NODE_POOLS_ERROR
+    run_with = CollectClusterTest.run_with
+    issued_node_pools_read = CollectClusterTest.issued_node_pools_read
+
+    POOL = {"name": "p1", "locations": ["us-central1-a"], "autoscaling": {"enabled": True, "maxNodeCount": 10}, "config": {"machineType": "e2-standard-4"}}
+    LIVE = [node(f"n{i}", "p1") for i in range(10)]
+
+    def listed(self, **extra):
+        """The running cluster `enumerate_clusters` builds from one item, and the listing argv."""
+        issued = []
+        item = {"name": "prod-usc1", "location": "us-central1", "status": "RUNNING", **extra}
+
+        def run(argv, **kwargs):
+            issued.append(list(argv))
+            return run_of(0, json.dumps([item]))
+
+        (cluster,), _ = fs.enumerate_clusters("acme", run=run)
+        (listing_argv,) = issued
+        return cluster, listing_argv
+
+    def test_the_listing_projects_node_pools_and_nothing_more(self):
+        _, argv = self.listed()
+        projection = argv[argv.index("--format") + 1]
+        self.assertEqual(
+            projection,
+            "json(name,location,locations,status,currentMasterVersion,autopilot.enabled,"
+            "autoscaling.enableNodeAutoprovisioning,autoscaling.autoprovisioningLocations,"
+            "addonsConfig.configConnectorConfig.enabled,nodePools)",
+        )
+        self.assertNotIn("masterauth", " ".join(argv).lower())
+
+    def test_listed_pools_replace_the_node_pools_read(self):
+        cluster, listing_argv = self.listed(nodePools=[self.POOL])
+        # The fake's own `node-pools list` answers no pools, so a candidate
+        # can only come from the listing.
+        entry = self.run_with(dump_items=self.LIVE, pools=(), cluster=cluster)
+        self.assertEqual(self.issued_node_pools_read(), [])
+        self.assertIn("NodePool/p1", {c["object"] for c in entry["candidates"] if c["check"] == "single-zone-nodepool"})
+        record = next(c for c in entry["commands"] if c["check"] == "single-zone-nodepool")
+        self.assertEqual(record["command"], shlex.join(listing_argv))
+        self.assertEqual((record["rc"], record["duration_s"]), (0, 0))
+        self.assertEqual(record["output_sha256"], fs.output_digest(json.dumps([self.POOL], sort_keys=True)))
+        self.assertNotIn(fs.collector_run.LISTED_NODE_POOLS_KEY, json.dumps(entry))
+
+    def test_an_empty_listed_list_is_a_cluster_with_no_pools(self):
+        cluster, _ = self.listed(nodePools=[])
+        entry = self.run_with(dump_items=self.LIVE, pools=[self.POOL], cluster=cluster)
+        self.assertEqual(self.issued_node_pools_read(), [])
+        self.assertIn("single-zone-nodepool", {c["check"] for c in entry["commands"]})
+        self.assertNotIn("single-zone-nodepool", {c["check"] for c in entry["candidates"]})
+
+    def test_a_listing_without_pools_falls_back_to_the_node_pools_read(self):
+        for extra in ({}, {"nodePools": {"not": "a list"}}):
+            with self.subTest(extra=extra):
+                cluster, _ = self.listed(**extra)
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    entry = self.run_with(dump_items=self.LIVE, pools=[self.POOL], cluster=cluster)
+                expected = [
+                    "gcloud", "container", "node-pools", "list", "--cluster", "prod-usc1", "--location", "us-central1",
+                    "--project", "acme", "--format", "json",
+                ]
+                self.assertEqual(self.issued_node_pools_read(), [expected])
+                record = next(c for c in entry["commands"] if c["check"] == "single-zone-nodepool")
+                self.assertEqual(record["command"], shlex.join(expected))
+                self.assertIn("NodePool/p1", {c["object"] for c in entry["candidates"]})
+                self.assertIn("reading node-pools list", stderr.getvalue())
 
 
 class StockoutExclusionHelpersTest(unittest.TestCase):
@@ -3580,6 +4049,14 @@ class PrepareKubeconfigTest(unittest.TestCase):
             self.assertEqual((path, kc.parent.stat().st_mode & 0o7777, kc.exists(), [p.name for p in Path(tmp).iterdir()]), (kc, 0o755, False, [".kubeconfigs"]))
 
 
+class NotRunningClusterStatusTest(unittest.TestCase):
+    def test_a_cluster_that_is_not_running_carries_its_status(self):
+        """`finish` must not count a STOPPING cluster as one that may run
+        Config Connector (`audit_report.kcc_health`)."""
+        entry = fs.not_running_entry({"name": "going", "location": "us-central1", "status": "STOPPING"}, "acme")
+        self.assertEqual(entry["cluster_status"], "STOPPING")
+
+
 class DeclaredScopeFromTheToolTest(unittest.TestCase):
     """The declared scope the agent carries from the platform_control fleet_scope
     tool (`--scope-projects`, `--scope-unread`) is the sweep: nothing is listed,
@@ -3644,6 +4121,79 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
         self.assertTrue(fs._only_a_scope_note(entry, None))
         self.assertFalse(fs._only_a_scope_note({"name": fs.UNENUMERATED_PROJECTS_TARGET, "error": "`gcloud projects list` rc=1: boom"}, None))
 
+    def test_main_prints_the_sweep_when_the_time_budget_is_spent(self):
+        """The Config Connector reads stop at the collector's time budget, and
+        the manifest of the sweep prints with `kcc_unread` on each entry."""
+        manifest = {"clusters": [{"name": "acme/us-central1/hub", "project": "acme", "location": "us-central1", "outcome": "collected", "candidates": []}]}
+
+        out = io.StringIO()
+        with patch.object(fs, "collect_fleet", return_value=manifest), patch.object(fs.kcc_health, "RUN_DEADLINE_S", 0):
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                fs.main(["--config-connector"])
+        entry = json.loads(out.getvalue())["clusters"][0]
+        self.assertEqual(entry["candidates"], [])
+        self.assertIn("time budget", entry["kcc_unread"])
+
+    def test_main_reads_no_config_connector_without_the_flag(self):
+        """The chat route runs this collector without `--config-connector`:
+        only `finish` uses the read, so nothing reads it there."""
+        manifest = {"clusters": [{"name": "acme/us-central1/hub", "project": "acme", "location": "us-central1", "outcome": "collected", "candidates": []}]}
+        out = io.StringIO()
+        with patch.object(fs, "collect_fleet", return_value=manifest), patch.object(fs.kcc_health, "annotate_manifest") as annotate:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+                fs.main([])
+        annotate.assert_not_called()
+        entry = json.loads(out.getvalue())["clusters"][0]
+        self.assertNotIn("kcc_unread", entry)
+        self.assertNotIn("kcc_unready", entry)
+
+    def test_main_reads_config_connector_while_an_audit_run_is_in_flight(self):
+        """The live run never passed `--config-connector`. The read must not
+        depend on the model copying the flag: while `start`'s in-flight note
+        of this stream is there, `main` reads without it, and the manifest
+        says why (`config_connector_read`)."""
+        import contextlib as _contextlib  # noqa: PLC0415
+        import io as _io  # noqa: PLC0415
+        import tempfile as _tempfile  # noqa: PLC0415
+        from unittest import mock as _mock  # noqa: PLC0415
+
+        def run(argv, scratch, note):
+            manifest = {"clusters": [{"name": "acme/us-central1/hub", "project": "acme", "location": "us-central1",
+                                       "outcome": "collected", "candidates": []}]}
+            if note:
+                Path(scratch, f"inflight_{fs.AUDIT_ID}.json").write_text("{}", encoding="utf-8")
+            out = _io.StringIO()
+            with _mock.patch.dict(os.environ, {"FLEET_AUDIT_SCRATCH_DIR": scratch}), _mock.patch.object(
+                fs, "collect_fleet", return_value=manifest
+            ), _mock.patch.object(fs.kcc_health, "annotate_manifest") as annotate:
+                with _contextlib.redirect_stdout(out), _contextlib.redirect_stderr(_io.StringIO()):
+                    fs.main(argv)
+            return annotate.called, json.loads(out.getvalue())["config_connector_read"]
+
+        for argv, note, expected in (([], True, (True, "in-flight")), ([], False, (False, False)),
+                                     (["--config-connector"], False, (True, "flag"))):
+            with self.subTest(argv=argv, note=note), _tempfile.TemporaryDirectory() as scratch:
+                self.assertEqual(run(argv, scratch, note), expected)
+
+    def test_main_adds_the_config_connector_read_before_it_prints(self):
+        """A stockout fix can edit a `ContainerNodePool` declaration, so `main`
+        puts `kcc_health`'s keys on the manifest `finish` reads."""
+        manifest = {"clusters": [{"name": "acme/us-central1/hub", "project": "acme", "location": "us-central1", "outcome": "collected", "candidates": []}]}
+
+        def annotate(found, *, mapper, deadline, **kwargs):
+            self.assertGreater(deadline, 0)
+            # Only the kinds this stream's findings can own: from the agent, all
+            # ~230 kinds do not fit the time budget.
+            self.assertEqual(kwargs["kinds"], fs.kcc_health.CONTAINER_KINDS)
+            self.assertEqual(kwargs["kubeconfig_for"](found["clusters"][0]), fs.kubeconfig_path("acme", "hub", "us-central1"))
+            found["clusters"][0]["kcc_unread"] = "".join(mapper(lambda entry: entry["name"], found["clusters"]))
+
+        out = io.StringIO()
+        with patch.object(fs, "collect_fleet", return_value=manifest), patch.object(fs.kcc_health, "annotate_manifest", side_effect=annotate):
+            with contextlib.redirect_stdout(out):
+                fs.main(["--config-connector"])
+        self.assertEqual(json.loads(out.getvalue())["clusters"][0]["kcc_unread"], "acme/us-central1/hub")
+
     def test_main_hands_the_flags_to_the_resolver(self):
         # The wiring the SOP relies on: the three flags main parses reach the
         # holder the resolver reads, before anything else runs.
@@ -3665,6 +4215,19 @@ class DeclaredScopeFromTheToolTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("--scope-projects", proc.stdout)
         self.assertIn("--scope-unread", proc.stdout)
+
+
+class RecordedChainUnderTheCommandCapTest(unittest.TestCase):
+    def test_the_recorded_chain_stays_under_the_published_command_cap(self):
+        """The compute-class read and the paged chain are recorded as one line and copied
+        verbatim into `checks_run`; held under `MAX_COMMAND_CHARS` at the longest kubeconfig
+        path the platform profile makes."""
+        with patch.object(fs, "KUBECONFIG_DIR", PLATFORM_PROFILE_KUBECONFIG_DIR):
+            kubeconfig = fs.kubeconfig_path(LONGEST_PROJECT, LONGEST_CLUSTER, LONGEST_LOCATION)
+        text = f"KUBECONFIG={kubeconfig} {shlex.join(['kubectl', 'get', 'computeclasses', '-A', '-o', 'json'])}; {fs.paged_command_text(fs.PAGED_DUMP_KINDS, kubeconfig=kubeconfig)}"
+        self.assertLessEqual(len(text), audit_report.MAX_COMMAND_CHARS, len(text))
+        self.assertEqual(text, audit_report.validate_check_command(text, "clusters[0]", "dangling-compute-class"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -12,7 +12,8 @@ If your system prompt gives you a different role, that role wins over this file.
 Your system prompt says what this turn can reach. Go by it, not by this file.
 
 - With the read-only cluster view, `kubectl` and `gcloud` are on PATH and already
-  authorized: they run through the credential broker, which allows read verbs only.
+  authorized: `kubectl` routes through `kube-proxy` (`read-only-dry-run` with `Secret`
+  redaction) and `gcloud` runs through the credential broker (read verbs only).
   Just run them, one command per call, with no pipes or other programs. Look before
   you answer. If a command is refused or fails, say what was refused and answer from
   what you have.
@@ -34,21 +35,33 @@ it when the ask:
 Answer yourself when what you have is enough: a concept, output the user pasted, or a
 diagnosis you can make with the cluster view.
 
-You can delegate only when the `delegate` tool is available. If it isn't, answer from
-what you have and say plainly what you couldn't check.
+The `delegate` tool's addressee field lists every agent you may hand a task to. Besides
+`platform` it can name agent profiles, each with a line on what it does. When the person
+asks for one of them by name ("use e2e5", "have the triage profile look"), delegate to it
+under that name, even when you could answer yourself.
+
+You can delegate only when the `delegate` tool is available and its addressee field lists
+an agent. If it isn't, or it says no agent is available, answer from what you have and say
+plainly what you couldn't check.
 
 ## Read-only
 
 You don't change anything. When the answer is a change, write it out as a proposal:
 the patch or the command, and why. If the person wants it done, delegate it to
-`platform`, which decides whether and how. Never describe a change as made.
+`platform` when the delegate tool lists it, which decides whether and how. Never describe a
+change as made.
 
 ## Skills
 
 Your skills are GKE diagnosis procedures:
 
-- crash loops, failed or pending pods, OOMs, mount and connectivity errors:
-  `gke-workload-troubleshooting`
+- what is failing or degraded across a cluster, is it healthy: `workload-triage-scan`
+- a failing workload whose symptom you don't know yet: `gke-workload-troubleshooting`,
+  which reads its pods once and sends you to one of the four below
+- crash loops, OOMs, restarts and failing probes: `pod-crashloop-oom`
+- pending pods that won't schedule: `pod-pending-scheduling`
+- containers stuck creating, mount, image pull and config errors: `pod-container-creating`
+- timeouts between services, empty endpoints, NetworkPolicy: `service-connectivity`
 - something stuck or not reconciling with nothing red: `gke-stall-detection`
 - availability, PodDisruptionBudgets, probes, zone spread: `gke-reliability`
 - logging, monitoring and tracing: `gke-observability`

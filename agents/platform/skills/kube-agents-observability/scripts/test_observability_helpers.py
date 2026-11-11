@@ -892,7 +892,7 @@ class GetChatUsersTest(unittest.TestCase):
         # message's claim that no notice arrives for gcloud rests on the
         # broker appending one for kubectl alone.
         broker = (Path(credential_proxy_client.__file__).with_name("credential_proxy.py")).read_text(encoding="utf-8")
-        exit_code = re.search(r"exit_code=(\d+) if captured\.timed_out else process\.returncode", broker)
+        exit_code = re.search(r"exit_code=\(?(\d+) if captured\.timed_out\b", broker)
         self.assertIsNotNone(exit_code, "the broker's timed-out exit code was not found")
         self.assertEqual(get_chat_users.BROKER_DEADLINE_EXIT_CODE, int(exit_code.group(1)))
         deadline = re.search(r'os\.getenv\("CREDENTIAL_PROXY_TIMEOUT_SECONDS", "(\d+)"\)', broker)
@@ -915,6 +915,18 @@ class GetChatUsersTest(unittest.TestCase):
         self.assertIn("lower --limit", err)
         self.assertIn(f"the {get_chat_users.LOG_LIMIT} newest entries", err)
         self.assertNotIn("did not return JSON", err)
+
+    def test_a_read_the_shim_cut_with_exit_74_names_the_cap_not_the_exit_code(self):
+        # The shipped shim exits 74 on a cut reply, with the counts after the
+        # marker; the marker is read first, so the remedy is still the limit.
+        cut = json.dumps(self.ENTRIES)[:-40]
+        truncated = self.completed(returncode=74, stdout=cut, stderr="credential proxy output truncated at 8388608 bytes (kept 8388608 bytes of stdout; exit 74)\n")
+        with patch.object(get_chat_users.subprocess, "run", return_value=truncated):
+            code, out, err = run(get_chat_users.main, ["--project-id", PROJECT])
+        self.assertEqual(get_chat_users.EXIT_READ_FAILED, code)
+        self.assertIn("lower --limit", err)
+        self.assertIn(f"the {get_chat_users.LOG_LIMIT} newest entries", err)
+        self.assertNotIn("exited 74", err)
 
     def test_a_truncated_read_names_the_limit_the_caller_asked_for(self):
         truncated = self.completed(returncode=0, stdout="[{", stderr="credential proxy output truncated\n")

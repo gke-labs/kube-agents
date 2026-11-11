@@ -65,7 +65,7 @@ python3 /opt/data/scripts/cluster_agent_profile.py delete \
   --project "<project>" --cluster "<cluster>" --location "<location>"
 ```
 
-This deregisters the profile and removes its home directory. Do not delete a profile while its cluster still exists.
+This deregisters the profile and removes its home directory, here and in the shell sandbox. Do not delete a profile while its cluster still exists.
 
 To stop managing a cluster that still exists, exclude it instead; the reconcile below recreates a deleted profile for every in-scope cluster. Follow `manage-cluster`, "Stop managing": the exclusion is declared where the install's scope is declared (`SCOPE_EXCLUDE_CLUSTERS` in `install.env` on an install made with `install.sh`, applied with `./upgrade.sh --upgrade-mode=full`), and that section says how to tell the install shapes apart.
 
@@ -91,14 +91,18 @@ both directions:
   out-of-band, so its profile is never left orphaned pointing at a dead kubeconfig.
 
 A create that fails is recorded rather than only logged: the cluster goes into a `create_failed`
-bucket. Both places that bucket surfaces are narrower than it looks. The chat summary names the
+bucket. A run creates no more than `BOOTSTRAP_MAX_CREATES_PER_TICK` profiles (100 by default;
+failed creates do not count) and puts the clusters it left for the next run into a
+`create_deferred` bucket. Both places the failure bucket surfaces are narrower than it looks. The chat summary names the
 failures only on a run that also created or pruned something — a run whose sole outcome is a failed
 create posts nothing, because a permanent cause repeats every minute while the bootstrap gate is
 ticking. A failed create is only one of the things `--require-create-pass` reports. Under that flag the run
 exits `3` when the CREATE direction never ran (the management project would not resolve, or
 its clusters could not be listed), when `reconcile()` raised, or when it ran and every create failed with no fully
-scaffolded profile already on the roster — and `4` when another reconcile holds the lock. One
-failure alongside a success exits 0 and costs the sweep one `gaps` row. Without the flag every one
+scaffolded profile already on the roster — `4` when another reconcile holds the lock — and `5`
+when it created its cap's worth and deferred the rest, which the gate reads like `4`: retry next
+tick, no attempt counted. One failure alongside a success exits 0 and costs the sweep one `gaps`
+row. Without the flag every one
 of those exits 0, because a cron producer must. That flag's caller is the bootstrap scan gate,
 which gates a one-shot fleet sweep on the exit code, so a non-zero exit means "the roster is not
 worth fanning out against yet", not specifically "a create failed".

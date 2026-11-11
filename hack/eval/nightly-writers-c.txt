@@ -1,0 +1,12 @@
+# The cases of the nightly's writers part that run in writers-c. Read with
+# nightly-writers-b.txt, whose header says how the thirds are placed.
+#
+# Balanced on the same night: rca-remediation-pr 27 unit-minutes,
+# cluster-agent-crashloop-fix-request 25, vcs-spent-branch-reuse 18,
+# cluster-setting-request-proposes-pr 16,
+# provisioning-kcc-cluster-without-crds-stops 12.
+rca-remediation-pr
+cluster-agent-crashloop-fix-request
+vcs-spent-branch-reuse
+cluster-setting-request-proposes-pr
+provisioning-kcc-cluster-without-crds-stops

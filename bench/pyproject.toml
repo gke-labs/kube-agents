@@ -44,7 +44,8 @@ kubeagents = "kube_agents_bench.harness:KubeAgentsHarness"
 # makes report-text, tool-trace and published-artifact checks possible without
 # an upstream change; fleet_resource_property reads cluster state, but the
 # cluster of a seeded-fleet fixture ROLE rather than the ambient one;
-# sandbox_tree_matches_image execs into the agent's own shell sandbox pod.
+# sandbox_tree_matches_image execs into the agent's own shell sandbox pod, or
+# with `target: gateway` into its gateway pod.
 #
 # A key already in the registry when the scan runs is SKIPPED (see
 # devops_bench.core.registry), and upstream registers `resource_property` at
@@ -62,8 +63,10 @@ bootstrap_handoff = "kube_agents_bench.verifiers:BootstrapHandoffVerifier"
 bootstrap_report_criticals = "kube_agents_bench.verifiers:BootstrapReportCriticalsVerifier"
 bootstrap_report_posture = "kube_agents_bench.verifiers:BootstrapReportPostureVerifier"
 bootstrap_report_read = "kube_agents_bench.verifiers:BootstrapReportReadVerifier"
+delegated_to = "kube_agents_bench.verifiers:DelegatedToVerifier"
 findings_item_state = "kube_agents_bench.verifiers:FindingsItemStateVerifier"
 fleet_resource_property = "kube_agents_bench.verifiers:FleetResourcePropertyVerifier"
+forge_issue_state = "kube_agents_bench.verifiers:ForgeIssueStateVerifier"
 github_writes = "kube_agents_bench.verifiers:GitHubWritesVerifier"
 ledger_issue_contains = "kube_agents_bench.verifiers:LedgerIssueContainsVerifier"
 notification_fell_back_to_home = "kube_agents_bench.notify_fallback:NotificationFellBackToHomeVerifier"

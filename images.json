@@ -19,6 +19,15 @@
       "description": "Envoy, the credential runtime, and the CLIs it wraps — the only image holding real credentials."
     },
     {
+      "name": "kube-proxy",
+      "origin": "first-party",
+      "repository": "ghcr.io/gke-labs/kube-agents/kube-proxy",
+      "tagPolicy": "release",
+      "override": "KUBE_PROXY_IMAGE",
+      "pulledBy": "The kube-proxy Deployment the operator renders beside every agent pod.",
+      "description": "Out-of-sandbox Kubernetes API reverse proxy (k8s-api-proxy) enforcing verb policy and Secret value redaction."
+    },
+    {
       "name": "agent-sandbox",
       "origin": "first-party",
       "repository": "ghcr.io/gke-labs/kube-agents/agent-sandbox",
@@ -76,8 +85,16 @@
       "repository": "ghcr.io/gke-labs/kube-agents/a2a-worker",
       "tagPolicy": "release",
       "override": "A2A_WORKER_IMAGE",
-      "pulledBy": "The session pods the A2A gateway spawns under spec.mode: next; the operator passes its resolution to the gateway as A2A_WORKER_IMAGE. The image also carries the credential broker's shim as `kubectl` and `gcloud`, used only when the operator's A2A_SESSION_CLUSTER_VIEW flag gives a session pod its read-only cluster view.",
-      "description": "The session worker of the A2A next stack (a2a/Dockerfile.worker): the agent SDK, the worker adapter, the session agent's persona and read-only skills (a2a/cmd/session-persona), and the credential broker's shim as kubectl and gcloud for the flag-gated cluster view."
+      "pulledBy": "The session pods the A2A gateway spawns under spec.mode: next; the operator passes its resolution to the gateway as A2A_WORKER_IMAGE. The image carries stock `kubectl` (wired to `<name>-kube-proxy` on session pods under A2A_SESSION_CLUSTER_VIEW, and falling back to the credential broker shim on AgentProfile workers) plus the credential broker's shim as `gcloud`.",
+      "description": "The session worker of the A2A next stack (a2a/Dockerfile.worker): the agent SDK, the worker adapter, the session agent's persona and read-only skills (a2a/cmd/session-persona), stock kubectl wired to kube-proxy for session pods (falling back to the credential broker shim for AgentProfile workers), the credential broker's shim as gcloud, and jq, which the cluster agent's persona requires when the image runs its profile workers."
+    },
+    {
+      "name": "persona-cluster",
+      "origin": "first-party",
+      "repository": "ghcr.io/gke-labs/kube-agents/persona-cluster",
+      "tagPolicy": "release",
+      "pulledBy": "The worker pods of the cluster AgentProfile under spec.mode: next, when the chart's profiles.cluster.enabled renders it: mounted at /persona, or copied there by a staging init container where image volumes are unavailable.",
+      "description": "The cluster agent's persona (agents/cluster/persona) as a persona image (a2a/Dockerfile.persona-cluster): the manifest, instructions, MCP servers and skills under /files, on busybox for the staging copy."
     },
     {
       "name": "a2a-authcallout",
@@ -105,6 +122,15 @@
       "override": "A2A_VERIFIER_IMAGE",
       "pulledBy": "The capability verifier Deployment the operator renders under spec.mode: next, and nothing under spec.mode: today. It resolves the same way the gateway, the worker and the callout do.",
       "description": "The one reader of the capability bucket: it answers every executor's capability check over the bus and holds no RBAC (a2a/Dockerfile.verifier)."
+    },
+    {
+      "name": "a2a-dispatcher",
+      "origin": "first-party",
+      "repository": "ghcr.io/gke-labs/kube-agents/a2a-dispatcher",
+      "tagPolicy": "release",
+      "override": "A2A_DISPATCHER_IMAGE",
+      "pulledBy": "The AgentProfile dispatcher Deployment the operator renders under spec.mode: next when A2A_DISPATCHER_IMAGE is set, and nothing otherwise: it is off by default until profiles dispatch end to end, so the operator derives nothing for it. Nothing under spec.mode: today.",
+      "description": "The AgentProfile dispatcher: the only reader of the profiles' shared durables, it holds each submission for the life of its task and hands it to a ready worker under a lease (a2a/Dockerfile.dispatcher)."
     },
     {
       "name": "hermes-bridge",
@@ -158,6 +184,15 @@
       "override": "A2A_PROVISION_IMAGE",
       "pulledBy": "The provision Job the operator runs against that NATS under spec.mode: next, and nothing under spec.mode: today.",
       "description": "Carries the nats CLI the provisioning script drives to create the streams and buckets. Same pin and override arrangement as nats."
+    },
+    {
+      "name": "nats-server-config-reloader",
+      "origin": "third-party",
+      "repository": "docker.io/natsio/nats-server-config-reloader",
+      "tag": "0.25.0@sha256:24bacde6b844f8875f93424ed153d33b3d9e9367fcccc14b683eb71fab3a4d8c",
+      "override": "A2A_NATS_RELOADER_IMAGE",
+      "pulledBy": "A sidecar in the NATS pod the operator renders under spec.mode: next, and nothing under spec.mode: today.",
+      "description": "Signals nats-server to reload its config when the operator changes only the bus's permissions, so an AgentProfile added or removed doesn't restart the bus. From nats-io, the same publisher as nats. Pinned by digest as well as tag; same override arrangement as nats."
     },
     {
       "name": "k8s",
@@ -261,8 +296,8 @@
       "repository": "docker.io/library/golang",
       "tag": "1.27-alpine",
       "buildArg": "GOLANG_IMAGE",
-      "pulledBy": "deploy/docker/Dockerfile, k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.gateway, a2a/Dockerfile.hermes-bridge, a2a/Dockerfile.verifier, a2a/Dockerfile.web-console, a2a/Dockerfile.worker and a2a/Dockerfile.console builder stages.",
-      "description": "Go toolchain for the operator and k8s-event-watcher builds."
+      "pulledBy": "deploy/docker/Dockerfile, deploy/kube-proxy/Dockerfile, k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.dispatcher, a2a/Dockerfile.gateway, a2a/Dockerfile.hermes-bridge, a2a/Dockerfile.verifier, a2a/Dockerfile.web-console, a2a/Dockerfile.worker and a2a/Dockerfile.console builder stages.",
+      "description": "Go toolchain for the operator, k8s-api-proxy, and k8s-event-watcher builds."
     },
     {
       "name": "node",
@@ -279,8 +314,8 @@
       "repository": "docker.io/library/python",
       "tag": "3.14-slim",
       "buildArg": "PYTHON_IMAGE",
-      "pulledBy": "examples/inference-replay/replay-proxy/Dockerfile and deploy/sandbox/Dockerfile.",
-      "description": "Runtime base for the replay proxy, and for the agent sandbox — which needs a python3 on PATH because that is what execute_code invokes."
+      "pulledBy": "examples/inference-replay/replay-proxy/Dockerfile, hack/replay-proxy/Dockerfile and deploy/sandbox/Dockerfile.",
+      "description": "Runtime base for the replay proxies, and for the agent sandbox — which needs a python3 on PATH because that is what execute_code invokes."
     },
     {
       "name": "distroless-static",
@@ -288,16 +323,16 @@
       "repository": "gcr.io/distroless/static",
       "tag": "nonroot",
       "buildArg": "DISTROLESS_IMAGE",
-      "pulledBy": "k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.gateway, a2a/Dockerfile.verifier, a2a/Dockerfile.web-console and a2a/Dockerfile.console runtime stages.",
-      "description": "Runtime base for the operator image."
+      "pulledBy": "deploy/kube-proxy/Dockerfile, k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.dispatcher, a2a/Dockerfile.gateway, a2a/Dockerfile.verifier, a2a/Dockerfile.web-console and a2a/Dockerfile.console runtime stages.",
+      "description": "Runtime base for the operator and kube-proxy images."
     },
     {
       "name": "busybox",
       "origin": "build-time",
       "repository": "docker.io/library/busybox",
       "tag": "musl@sha256:ea2b9914a16a4ac1981994af97b318f7c7d4db76b580c56177f08bf76f4a0be8",
-      "pulledBy": "agentplugins/*/Dockerfile base images.",
-      "description": "Minimal userland (sh, cp, ls) base image for plugin images to support staging init containers."
+      "pulledBy": "agentplugins/*/Dockerfile and a2a/Dockerfile.persona-* base images.",
+      "description": "Minimal userland (sh, cp, ls) base image for plugin and persona images to support staging init containers."
     }
   ]
 }

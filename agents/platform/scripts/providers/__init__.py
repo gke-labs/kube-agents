@@ -14,6 +14,8 @@ forge and names no forge at all.
 """
 
 from .base import (
+    TALLY_TOTAL,
+    tally_with_open,
     BROKER_VERBS,
     COLLABORATION_VERBS,
     ISSUE_VERBS,
@@ -23,6 +25,7 @@ from .base import (
     ForgeUnsupported,
     IdentityUnknown,
     LabelsUnsupported,
+    QuotaReading,
     StubForge,
     WorkspaceError,
     listing,
@@ -80,8 +83,11 @@ __all__ = [
     "IdentityUnknown",
     "LABEL_FIELDS",
     "LabelsUnsupported",
+    "QuotaReading",
     "Guidance",
     "MAX_PAGE_SIZE",
+    "TALLY_TOTAL",
+    "tally_with_open",
     "MintedReadCredential",
     "MintedWriteCredential",
     "NoCredential",

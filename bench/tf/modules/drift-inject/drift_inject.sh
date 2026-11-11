@@ -270,7 +270,7 @@ drift_require_daemon() {
     echo "ERROR: could not read $drift_daemon_url/healthz in $drift_agent_container (exit $kinds_rc); kubectl's or curl's own error is above. This says nothing about which inject kinds the daemon advertises -- it is an exec, RBAC, connection or HTTP failure, and the install may be perfectly current." >&2
     exit 1
   fi
-  if ! printf '%s\n' "$kinds" | grep -qxF "$DRIFT_INJECT_KIND"; then
+  if ! grep -qxF "$DRIFT_INJECT_KIND" <<<"$kinds"; then
     echo "ERROR: the Session KV daemon at $drift_daemon_url does not advertise the '$DRIFT_INJECT_KIND' inject kind (it advertises: $kinds). This install predates the drift dispatch, so a record sent to it would be graded as a Warning Pod event and reported back as delivered. Redeploy the agent image before running this case." >&2
     exit 1
   fi

@@ -34,17 +34,19 @@ message id, as the door does.
 from __future__ import annotations
 
 import json
+import logging
 import socket
 import sqlite3
+import subprocess
 import threading
 import time
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 import pytest
-from kube_agents_bench import board, harness, worker_trajectory
+from kube_agents_bench import board, harness, transcript, worker_trajectory
 from kube_agents_bench import inject_transport as inject
 from kube_agents_bench import scoring, stop_hook
 from kube_agents_bench.harness import KubeAgentsHarness
@@ -216,6 +218,13 @@ class _StubGatewayHandler(BaseHTTPRequestHandler):
             }
         )
         if failed:
+            if self.server.poll_retry_after is not None:
+                # As a gateway standby answers: a 503 naming how long to wait.
+                self.send_response(self.server.poll_status or 503)
+                self.send_header("Retry-After", self.server.poll_retry_after)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             self.send_error(self.server.poll_status or 503)
             return
         probe: dict[str, Any] | None = None
@@ -307,6 +316,8 @@ class _StubGatewayServer(ThreadingHTTPServer):
     # arrive poll_fail_after_seconds or more after the first accepted POST,
     # which is a tunnel dropping mid-task.
     poll_status: int | None = None
+    # A Retry-After the failed GETs carry; None sends none.
+    poll_retry_after: str | None = None
     poll_failures: int = -1
     poll_fail_after_seconds: float = 0.0
     failed_polls: int = 0
@@ -333,6 +344,9 @@ class _StubGatewayServer(ThreadingHTTPServer):
     probe_usage: dict[str, Any] | None = None
     # The chain's child tasks' usage and the partial flag, sent beside it.
     probe_child_usage: dict[str, Any] | None = None
+    # The read route's childAddressees on the chain read after the terminal;
+    # None leaves the key out, as a door older than the field does.
+    probe_child_addressees: list[str] | None = None
     probe_usage_partial: bool = False
 
     def poll_fails(self) -> bool:
@@ -375,6 +389,9 @@ class _StubGatewayServer(ThreadingHTTPServer):
                 report["activityDropped"] = self.probe_activity_dropped
             if self.probe_progress:
                 report["progress"] = self.probe_progress
+        if self.probe_child_addressees is not None and chain and task == self.task_id:
+            report["taskId"] = self.task_id
+            report["childAddressees"] = list(self.probe_child_addressees)
         if self.probe_usage is not None and chain and task == self.task_id:
             report["taskId"] = self.task_id
             report["usage"] = dict(self.probe_usage)
@@ -560,6 +577,24 @@ def test_the_opening_task_is_timed_to_its_terminal(
     timing = json.loads(target.read_text(encoding="utf-8"))
     assert set(timing) == {"turn1_s"}
     assert 0 <= timing["turn1_s"] <= took
+
+
+def test_the_replys_shape_counts_the_tasks_posts(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    """The status placeholder the relay edited is still a message in the
+    thread; the answer is the post that carries it."""
+    target = tmp_path / "shape.json"
+    monkeypatch.setenv("KUBE_AGENTS_SHAPE_FILE", str(target))
+    stub_gateway.entries = completed_transcript(stub_gateway.task_id, "**Two pods are OOMKilled.**")
+
+    result = KubeAgentsHarness().run("anything failing?")
+
+    assert not result.errors
+    shape = json.loads(target.read_text(encoding="utf-8"))
+    assert shape["bot_messages"] == 2
+    assert shape["opens_on_verdict"] is True
+    assert shape["answer_words"] == 4
 
 
 def test_an_opening_task_at_its_budget_writes_no_timing(
@@ -1291,6 +1326,15 @@ def test_an_own_tunnel_forwards_the_inject_service_and_respawns_it_on_a_drop(
 
     monkeypatch.setattr(harness, "_ensure_port_forward", _ensure)
     monkeypatch.setattr(harness, "_reset_port_forward", _reset)
+    # No Lease on this install: the door's Service, as every unelected
+    # gateway serves it.
+    asked: list[tuple[str, str]] = []
+
+    def _no_lease(agent_service: str, service: str) -> str:
+        asked.append((agent_service, service))
+        return f"svc/{service}"
+
+    monkeypatch.setattr(harness, "_gateway_door_target", _no_lease)
     stub_gateway.entries = running_transcript(stub_gateway.task_id, "partial findings")
     stub_gateway.poll_status = 503
     stub_gateway.poll_failures = 1
@@ -1299,13 +1343,289 @@ def test_an_own_tunnel_forwards_the_inject_service_and_respawns_it_on_a_drop(
 
     result = KubeAgentsHarness().run("take your time")
 
-    door = (local_port, "platform-agent-a2a-inject", harness._INJECT_REMOTE_PORT)
+    door = (local_port, "svc/platform-agent-a2a-inject", harness._INJECT_REMOTE_PORT)
     assert established == [door]
     assert respawned == [door]
+    assert asked == [("platform-agent", "platform-agent-a2a-inject")] * 2
     assert stub_gateway.failed_polls == 1
     assert len(stub_gateway.submissions) == 1
     assert result.output == "partial findings"
     assert not infra(result)
+
+
+def test_a_respawn_after_a_standbys_503_forwards_to_the_new_holder(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Behind an elected gateway the tunnel goes to the Lease holder's pod,
+    and the holder is read again on each respawn: a 503 from a standby (the
+    lease moved, or the first read was stale) is retried against the replica
+    that holds it now, not the same pod or the Service."""
+    monkeypatch.delenv("AGENT_INJECT_URL")
+    monkeypatch.delenv("AGENT_INJECT_SERVICE", raising=False)
+    monkeypatch.delenv("AGENT_SERVICE_NAME", raising=False)
+    local_port = stub_gateway.server_address[1]
+    monkeypatch.setenv("AGENT_INJECT_LOCAL_PORT", str(local_port))
+    targets: list[str | None] = []
+
+    def _forward(port: int, *, service: str | None = None, remote_port: int = harness.SERVICE_API_PORT) -> None:
+        targets.append(service)
+
+    monkeypatch.setattr(harness, "_ensure_port_forward", _forward)
+    monkeypatch.setattr(harness, "_reset_port_forward", _forward)
+    holders = iter(["pod/platform-agent-a2a-gateway-a", "pod/platform-agent-a2a-gateway-b"])
+    monkeypatch.setattr(harness, "_gateway_door_target", lambda agent_service, service: next(holders))
+    stub_gateway.entries = running_transcript(stub_gateway.task_id, "partial findings")
+    stub_gateway.poll_status = 503
+    stub_gateway.poll_failures = 1
+    stub_gateway.poll_fail_after_seconds = 0.5
+    monkeypatch.setenv("AGENT_INJECT_TIMEOUT", "2")
+
+    result = KubeAgentsHarness().run("take your time")
+
+    assert targets == ["pod/platform-agent-a2a-gateway-a", "pod/platform-agent-a2a-gateway-b"]
+    assert result.output == "partial findings"
+    assert not infra(result)
+
+
+@pytest.mark.parametrize(
+    ("owned", "want_reset"),
+    [
+        # An earlier exchange's tunnel still goes to the old holder, now a
+        # standby: replaced on this exchange's first spawn.
+        ("pod/platform-agent-a2a-gateway-a", True),
+        # Already where the lease points: kept.
+        ("pod/platform-agent-a2a-gateway-b", False),
+        # No tunnel of this process's own on the port: established as usual.
+        (None, False),
+    ],
+)
+def test_a_first_spawn_replaces_an_owned_tunnel_aimed_at_an_old_holder(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch, owned: str | None, want_reset: bool
+) -> None:
+    monkeypatch.delenv("AGENT_INJECT_URL")
+    monkeypatch.delenv("AGENT_INJECT_SERVICE", raising=False)
+    monkeypatch.delenv("AGENT_SERVICE_NAME", raising=False)
+    local_port = stub_gateway.server_address[1]
+    monkeypatch.setenv("AGENT_INJECT_LOCAL_PORT", str(local_port))
+    calls: list[tuple[str, str | None]] = []
+
+    def _ensure(port: int, *, service: str | None = None, remote_port: int = harness.SERVICE_API_PORT) -> None:
+        calls.append(("ensure", service))
+
+    def _reset(port: int, *, service: str | None = None, remote_port: int = harness.SERVICE_API_PORT) -> None:
+        calls.append(("reset", service))
+
+    monkeypatch.setattr(harness, "_ensure_port_forward", _ensure)
+    monkeypatch.setattr(harness, "_reset_port_forward", _reset)
+    monkeypatch.setattr(harness, "_owned_forward_target", lambda port: owned)
+    monkeypatch.setattr(harness, "_gateway_door_target", lambda agent_service, service: "pod/platform-agent-a2a-gateway-b")
+    stub_gateway.entries = completed_transcript(stub_gateway.task_id, "done")
+
+    result = KubeAgentsHarness().run("hello")
+
+    assert calls[0] == ("reset" if want_reset else "ensure", "pod/platform-agent-a2a-gateway-b")
+    assert not infra(result)
+
+
+def test_the_owned_target_is_what_this_process_spawned() -> None:
+    port = 41234
+    with harness._PF_LOCK:
+        harness._PF_TARGETS[port] = "pod/x"
+    try:
+        # A target with no live process of ours: not owned.
+        assert harness._owned_forward_target(port) is None
+        with harness._PF_LOCK:
+            harness._PF_PROCESSES[port] = object()  # type: ignore[assignment]
+        assert harness._owned_forward_target(port) == "pod/x"
+    finally:
+        with harness._PF_LOCK:
+            harness._PF_TARGETS.pop(port, None)
+            harness._PF_PROCESSES.pop(port, None)
+
+
+class _KubectlReads:
+    """A stand-in for ``subprocess.run`` answering the three reads the door
+    target takes: the Lease's holder, the door Service's selector, and the
+    pods it selects."""
+
+    def __init__(
+        self,
+        holder: str = "platform-agent-a2a-gateway-7d9f-abcde",
+        lease_rc: int = 0,
+        lease_stderr: str = "",
+        raises: BaseException | None = None,
+        selector: str = '{"app.kubernetes.io/component":"a2a-gateway","app.kubernetes.io/instance":"platform-agent"}',
+        pods: str = "platform-agent-a2a-gateway-7d9f-abcde platform-agent-a2a-gateway-7d9f-fghij",
+    ) -> None:
+        self.holder, self.lease_rc, self.lease_stderr, self.raises = holder, lease_rc, lease_stderr, raises
+        self.selector, self.pods = selector, pods
+        self.commands: list[list[str]] = []
+
+    def __call__(self, cmd: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        self.commands.append(cmd)
+        if self.raises is not None:
+            raise self.raises
+        if cmd[1:3] == ["get", "lease"]:
+            return subprocess.CompletedProcess(cmd, self.lease_rc, stdout=self.holder if self.lease_rc == 0 else "", stderr=self.lease_stderr)
+        if cmd[1:3] == ["get", "svc"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout=self.selector, stderr="")
+        if cmd[1:3] == ["get", "pods"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout=self.pods, stderr="")
+        raise AssertionError(f"unexpected kubectl {cmd}")
+
+
+_SERVICE = "platform-agent-a2a-inject"
+_HOLDER_POD = "pod/platform-agent-a2a-gateway-7d9f-abcde"
+
+
+@pytest.mark.parametrize(
+    ("reads", "want"),
+    [
+        (_KubectlReads(), _HOLDER_POD),
+        # Released, or between leaders: nobody to point at.
+        (_KubectlReads(holder=""), f"svc/{_SERVICE}"),
+        # No Lease: an unelected gateway, every install before the operator renders one.
+        (_KubectlReads(lease_rc=1, lease_stderr='Error from server (NotFound): leases.coordination.k8s.io "x" not found'), f"svc/{_SERVICE}"),
+        # A read that failed answers nothing: the caller keeps what it has.
+        (_KubectlReads(raises=OSError("kubectl not found")), None),
+        (_KubectlReads(raises=subprocess.TimeoutExpired(["kubectl"], 15)), None),
+        (_KubectlReads(lease_rc=1, lease_stderr='Error from server (Forbidden): leases "x" is forbidden'), None),
+        # The tunnel carries the door's token: a holder that isn't one of the
+        # gateway's own pods (a Lease written by something else) is not
+        # trusted with it.
+        (_KubectlReads(holder="some-other-pod"), f"svc/{_SERVICE}"),
+        (_KubectlReads(selector=""), f"svc/{_SERVICE}"),
+        (_KubectlReads(selector="not json"), f"svc/{_SERVICE}"),
+        (_KubectlReads(pods=""), f"svc/{_SERVICE}"),
+    ],
+)
+def test_the_door_target_is_a_gateway_pod_holding_the_lease_or_the_service(
+    monkeypatch: pytest.MonkeyPatch, reads: _KubectlReads, want: str | None
+) -> None:
+    monkeypatch.delenv("AGENT_GATEWAY_LEASE", raising=False)
+    monkeypatch.setenv("AGENT_NAMESPACE", "kubeagents-system")
+    monkeypatch.setenv("AGENT_CLUSTER_CONTEXT", "ctx-1")
+    monkeypatch.setattr(harness.subprocess, "run", reads)
+
+    assert harness._gateway_door_target("platform-agent", _SERVICE) == want
+    assert reads.commands[0] == [
+        "kubectl",
+        "get",
+        "lease",
+        "platform-agent-a2a-gateway",
+        "-o",
+        "jsonpath={.spec.holderIdentity}",
+        "-n",
+        "kubeagents-system",
+        "--context",
+        "ctx-1",
+    ]
+    if want == _HOLDER_POD:
+        # The holder is checked against the pods the door's own Service selects.
+        assert reads.commands[2][1:5] == [
+            "get",
+            "pods",
+            "-l",
+            "app.kubernetes.io/component=a2a-gateway,app.kubernetes.io/instance=platform-agent",
+        ]
+
+
+def test_a_lease_read_that_fails_for_another_reason_is_said(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A forbidden read answers nothing about where the door is, and says
+    so: at two replicas the Service can land on the standby every time."""
+    monkeypatch.setattr(
+        harness.subprocess,
+        "run",
+        _KubectlReads(lease_rc=1, lease_stderr='Error from server (Forbidden): leases.coordination.k8s.io "x" is forbidden'),
+    )
+    with caplog.at_level(logging.WARNING, logger=harness._log.name):
+        assert harness._gateway_door_target("platform-agent", _SERVICE) is None
+    assert "Forbidden" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("owned", "want"),
+    [
+        # A failed read keeps the tunnel to the leader this process owns.
+        ("pod/platform-agent-a2a-gateway-a", ("ensure", "pod/platform-agent-a2a-gateway-a")),
+        # With none of its own, the Service.
+        (None, ("ensure", "svc/platform-agent-a2a-inject")),
+    ],
+)
+def test_a_failed_lease_read_keeps_the_owned_forward(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch, owned: str | None, want: tuple[str, str]
+) -> None:
+    monkeypatch.delenv("AGENT_INJECT_URL")
+    monkeypatch.delenv("AGENT_INJECT_SERVICE", raising=False)
+    monkeypatch.delenv("AGENT_SERVICE_NAME", raising=False)
+    monkeypatch.setenv("AGENT_INJECT_LOCAL_PORT", str(stub_gateway.server_address[1]))
+    calls: list[tuple[str, str | None]] = []
+    monkeypatch.setattr(harness, "_ensure_port_forward", lambda port, *, service=None, remote_port=0: calls.append(("ensure", service)))
+    monkeypatch.setattr(harness, "_reset_port_forward", lambda port, *, service=None, remote_port=0: calls.append(("reset", service)))
+    monkeypatch.setattr(harness, "_owned_forward_target", lambda port: owned)
+    monkeypatch.setattr(harness, "_gateway_door_target", lambda agent_service, service: None)
+    stub_gateway.entries = completed_transcript(stub_gateway.task_id, "done")
+
+    result = KubeAgentsHarness().run("hello")
+
+    assert calls[0] == want
+    assert not infra(result)
+
+
+def test_a_standbys_retry_after_is_waited_before_the_respawn(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A standby's 503 names how long the lease takes to change hands;
+    retrying at once can spend the transport budget before the new leader
+    serves."""
+    monkeypatch.delenv("AGENT_INJECT_URL")
+    monkeypatch.delenv("AGENT_INJECT_SERVICE", raising=False)
+    monkeypatch.setenv("AGENT_INJECT_LOCAL_PORT", str(stub_gateway.server_address[1]))
+    order: list[str] = []
+    monkeypatch.setattr(harness, "_ensure_port_forward", lambda port, *, service=None, remote_port=0: order.append("ensure"))
+    monkeypatch.setattr(harness, "_reset_port_forward", lambda port, *, service=None, remote_port=0: order.append("reset"))
+    monkeypatch.setattr(harness, "_gateway_door_target", lambda agent_service, service: "pod/platform-agent-a2a-gateway-b")
+    real_sleep = time.sleep
+
+    def _sleep(seconds: float) -> None:
+        order.append(f"sleep {seconds:g}")
+        real_sleep(min(seconds, 0.01))
+
+    monkeypatch.setattr(harness.time, "sleep", _sleep)
+    stub_gateway.entries = running_transcript(stub_gateway.task_id, "partial findings")
+    stub_gateway.poll_status = 503
+    stub_gateway.poll_retry_after = "2"
+    stub_gateway.poll_failures = 1
+    stub_gateway.poll_fail_after_seconds = 0.5
+    monkeypatch.setenv("AGENT_INJECT_TIMEOUT", "2")
+
+    result = KubeAgentsHarness().run("take your time")
+
+    assert "sleep 2" in order and "reset" in order, order
+    assert order.index("sleep 2") < order.index("reset"), order
+    assert not infra(result)
+
+
+@pytest.mark.parametrize(("header", "want"), [("2", 2.0), ("0", 0.0), ("Wed, 21 Oct 2015 07:28:00 GMT", None), ("-1", None)])
+def test_a_retry_after_is_read_in_seconds(header: str, want: float | None) -> None:
+    import email.message
+    import urllib.error
+
+    headers = email.message.Message()
+    headers["Retry-After"] = header
+    exc = urllib.error.HTTPError("http://x", 503, "Service Unavailable", headers, None)
+    assert inject._retry_after(exc) == want
+
+
+def test_a_resolved_target_is_forwarded_as_given(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A pod target from the lease reaches kubectl unchanged, not as a
+    Service named ``svc/pod/...``."""
+    monkeypatch.delenv("AGENT_CLUSTER_CONTEXT", raising=False)
+    monkeypatch.setenv("AGENT_NAMESPACE", "kubeagents-system")
+    cmd = harness._port_forward_command(28099, "pod/platform-agent-a2a-gateway-7d9f-abcde", harness._INJECT_REMOTE_PORT)
+    assert cmd[2:4] == ["pod/platform-agent-a2a-gateway-7d9f-abcde", "28099:8099"]
 
 
 def test_a_status_outside_the_retry_set_is_not_retried(stub_gateway: _StubGatewayServer) -> None:
@@ -2388,6 +2708,49 @@ def test_each_status_word_is_carried_and_a_part_without_one_is_called() -> None:
     assert all(set(e) == {"name", "args", "result", "status"} for e in calls)
 
 
+def test_a_card_worker_s_calls_stay_out_of_the_router_trajectory() -> None:
+    """The bridge's trace carries the card workers' calls too, labelled with
+    the worker's session; the router's own carry ``platform``, and its
+    ``kanban_create`` names the card it made. Only the router's are written,
+    so the delegation-boundary safeguard (a router-scoped ``tool_called`` on
+    ``kanban_complete``) does not fire on a worker closing its own card. An
+    unlabelled part (a bridge older than the label, or the cli executor) and
+    one with a label this side does not know stay the router's; a label that
+    is not a string is counted as malformed."""
+    from kube_agents_bench import transcript
+    from kube_agents_bench.verifiers import ToolCalledVerifier
+
+    card = "card:t_1 (back up the selected namespaces)"
+    fold = inject.Fold("task-1")
+    fold.note_activity(
+        [
+            {**CALL_CREATE, "worker": "platform", "cardId": "t_1"},
+            {"tool": "kanban_show", "status": "completed", "worker": card, "cardId": "t_1"},
+            {"tool": "skill_view", "status": "completed", "worker": card, "cardId": "t_1"},
+            {"tool": "kanban_heartbeat", "status": "completed", "worker": "worker:session-9"},
+            {"tool": "kanban_complete", "status": "completed", "worker": card, "cardId": "t_1"},
+            {"tool": "kanban_list", "status": "completed"},
+            {"tool": "kanban_show", "status": "completed", "worker": "router"},
+            {"tool": "kanban_block", "status": "completed", "worker": 7},
+        ],
+        0,
+        0,
+    )
+    marker, *calls = trace_block(fold.trajectory)
+    assert [c["name"] for c in calls] == ["kanban_create", "kanban_list", "kanban_show"]
+    assert marker["args"] == {"calls": 3, "dropped": 0, "malformed": 1}
+    transcript.set("answer", fold.trajectory)
+    try:
+        # The safeguard's inner check: ``fail`` is no worker verb in the
+        # router's calls, which the ``none`` wrapper reads as a pass.
+        worker_verbs = ToolCalledVerifier(
+            type="tool_called", tool_names=["kanban_complete", "kanban_block", "kanban_heartbeat"]
+        )
+        assert worker_verbs.verify(5.0).status == "fail"
+    finally:
+        transcript.clear()
+
+
 def test_a_call_whose_input_the_executor_truncated_is_counted_on_the_marker() -> None:
     """The bridge replaces an input over its cap with a stand-in object.
     The call is still written, with the stand-in as its args; a wrapper so
@@ -2865,6 +3228,270 @@ def test_inject_transport_delegated_worker_rate_limit_marks_run_infra(
     assert "card on board recorded rate_limit" in result.errors[0]
 
 
+def test_inject_transport_delegated_worker_rate_limit_triage_marks_run_infra(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On inject transport, when a card enters triage with the Hermes rate limit summary, mark infra."""
+    build_session_store(tmp_path, created=[CARD_A])
+    rate_limit_msg = f"{harness._RATE_LIMIT_REASON_PREFIX} (failure_reason=rate_limit): 429 TPM quota exhausted"
+    set_card(tmp_path, CARD_A, "triage", summary=rate_limit_msg)
+    real_shell = local_shell(tmp_path, monkeypatch)
+
+    def shell(script: str, timeout: float) -> str:
+        if harness._LOGS_DIR in script:
+            return f"{harness._LOG_PRESENT} {CARD_A} 0\n"
+        return real_shell(script, timeout)
+
+    monkeypatch.setattr(harness, "_agent_shell", shell)
+    monkeypatch.setattr(
+        harness.worker_trajectory,
+        "capture",
+        lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+            entries=[],
+            tokens={},
+            unbilled=[],
+            summary={},
+        ),
+    )
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "card on board recorded rate_limit" in result.errors[0]
+
+
+def test_inject_transport_delegated_worker_mid_wait_rate_limit_triage_marks_run_infra(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A card starting 'running' that transitions to 'triage' with rate limit summary during polling retires and marks infra."""
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(tmp_path, CARD_A, "running")
+    rate_limit_msg = f"{harness._RATE_LIMIT_REASON_PREFIX} (failure_reason=rate_limit): 429 TPM quota exhausted"
+
+    def advance(n: int) -> None:
+        if n == 2:
+            set_card(tmp_path, CARD_A, "triage", summary=rate_limit_msg)
+
+    real_shell = local_shell(tmp_path, monkeypatch, advance)
+
+    def shell(script: str, timeout: float) -> str:
+        if harness._LOGS_DIR in script:
+            return f"{harness._LOG_PRESENT} {CARD_A} 0\n"
+        return real_shell(script, timeout)
+
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "2")
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0.01")
+    monkeypatch.setattr(harness, "_agent_shell", shell)
+    monkeypatch.setattr(
+        harness.worker_trajectory,
+        "capture",
+        lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+            entries=[],
+            tokens={},
+            unbilled=[],
+            summary={},
+        ),
+    )
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "card on board recorded rate_limit" in result.errors[0]
+    assert not any(harness.DELEGATION_CEILING_MARKER in e or "did not finish within" in e for e in result.errors)
+
+
+def test_inject_transport_delegated_worker_triage_and_running_card_does_not_flap(
+    api_executor: _StubGatewayServer,
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A triage card carrying rate limit alongside a running card does not flap back into outstanding."""
+    caplog.set_level(logging.INFO)
+    build_session_store(tmp_path, created=[CARD_A, CARD_B])
+    rate_limit_msg = f"{harness._RATE_LIMIT_REASON_PREFIX} (failure_reason=rate_limit): 429 TPM quota exhausted"
+    set_card(tmp_path, CARD_A, "triage", summary=rate_limit_msg)
+    set_card(tmp_path, CARD_B, "running")
+
+    def advance(n: int) -> None:
+        if n == 3:
+            set_card(tmp_path, CARD_B, "done", result="finished task b")
+
+    real_shell = local_shell(tmp_path, monkeypatch, advance)
+
+    def shell(script: str, timeout: float) -> str:
+        if harness._LOGS_DIR in script:
+            return f"{harness._LOG_PRESENT} {CARD_A} 0\n{harness._LOG_PRESENT} {CARD_B} 0\n"
+        return real_shell(script, timeout)
+
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "2")
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0.01")
+    monkeypatch.setattr(harness, "_agent_shell", shell)
+    monkeypatch.setattr(
+        harness.worker_trajectory,
+        "capture",
+        lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+            entries=[],
+            tokens={},
+            unbilled=[],
+            summary={},
+        ),
+    )
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert not any(harness.DELEGATION_CEILING_MARKER in e for e in result.errors)
+
+    # CARD_A must not flap back into outstanding during polling.
+    # While CARD_B is still running, log output must not wait on CARD_A.
+    wait_logs = [
+        r.message
+        for r in caplog.records
+        if "waiting" in r.message and "delegated tasks" in r.message
+    ]
+    assert wait_logs, "expected delegation wait log entries"
+    assert all(CARD_A not in msg for msg in wait_logs), (
+        f"CARD_A flapped into outstanding waiting logs: {wait_logs}"
+    )
+    assert all(CARD_B in msg for msg in wait_logs)
+
+    # Reads:
+    # Read 0: initial read
+    # Read 1: initial deliverables fetch for created cards
+    # Read 2: in-loop poll for awaited tasks
+    # Read 3: post-loop final read for settled cards
+    reads: list[str] = getattr(real_shell, "reads", [])
+    assert len(reads) == 4, (
+        f"expected 4 reads (initial, initial fetch, loop poll, final), got {len(reads)}"
+    )
+    loop_poll_script = reads[2]
+    assert CARD_B in loop_poll_script
+
+
+def test_inject_transport_delegated_worker_triage_does_not_deliver_result_or_drop_sibling_ceiling(
+    api_executor: _StubGatewayServer,
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rate-limited triage card's 429 summary is not delivered as a result and does not drop sibling ceiling marker."""
+    build_session_store(tmp_path, created=[CARD_A, CARD_B])
+    rate_limit_msg = f"{harness._RATE_LIMIT_REASON_PREFIX} (failure_reason=rate_limit): 429 TPM quota exhausted"
+    stashed_result = "stashed completed answer from refused turn"
+    set_card(tmp_path, CARD_A, "triage", summary=rate_limit_msg, result=stashed_result)
+    set_card(tmp_path, CARD_B, "running")
+
+    real_shell = local_shell(tmp_path, monkeypatch)
+
+    def shell(script: str, timeout: float) -> str:
+        if harness._LOGS_DIR in script:
+            return f"{harness._LOG_PRESENT} {CARD_A} 0\n{harness._LOG_PRESENT} {CARD_B} 0\n"
+        return real_shell(script, timeout)
+
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "0.05")
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0.01")
+    monkeypatch.setattr(harness, "_agent_shell", shell)
+    monkeypatch.setattr(
+        harness.worker_trajectory,
+        "capture",
+        lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+            entries=[{"name": "terminal", "args": {"command": "echo test"}, "result": "ok"}],
+            tokens={},
+            unbilled=[],
+            summary={},
+        ),
+    )
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert result.has_errors()
+    # Sibling CARD_B outrunning the budget must receive the ceiling marker because CARD_A delivered no answer
+    assert any(harness.DELEGATION_CEILING_MARKER in e for e in result.errors)
+    # Neither the 429 failure reason nor the stashed result must be delivered into output as a task result
+    assert "Result of delegated task" not in result.output
+    assert rate_limit_msg not in result.output
+    assert stashed_result not in result.output
+
+
+def test_inject_transport_delegated_worker_triage_initial_exhaustion_raises_infra(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When a triage card without summary exhausts all retry attempts on the initial fetch, raise transport exhausted."""
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(tmp_path, CARD_A, "triage")
+
+    call_count = 0
+    real_read = board.read_session_cards
+
+    def failing_read(shell: Any, sid: str, to: float, want: Sequence[str] = (), max_want: int = 32) -> board.SessionCards | None:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return real_read(shell, sid, to, want=want, max_want=max_want)
+        return None
+
+    monkeypatch.setattr(board, "read_session_cards", failing_read)
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0.01")
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch))
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert f"still waiting on: {CARD_A}" in result.errors[0]
+    # 1 initial discovery read + 3 retry attempts on triage_initial = 4 reads total (no second loop retry cycle)
+    assert call_count == 4
+
+
+def test_inject_transport_delegated_worker_blocked_to_triage_transition_marks_infra(
+    api_executor: _StubGatewayServer,
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A card starting blocked that unblocks and enters rate-limited triage mid-wait is recognized immediately."""
+    build_session_store(tmp_path, created=[CARD_A, CARD_B])
+    set_card(tmp_path, CARD_A, "blocked")
+    set_card(tmp_path, CARD_B, "running")
+    rate_limit_msg = f"{harness._RATE_LIMIT_REASON_PREFIX} (failure_reason=rate_limit): 429 TPM quota exhausted"
+
+    def advance(n: int) -> None:
+        if n == 2:
+            set_card(tmp_path, CARD_A, "triage", summary=rate_limit_msg)
+            time.sleep(0.06)
+
+    real_shell = local_shell(tmp_path, monkeypatch, advance)
+
+    def shell(script: str, timeout: float) -> str:
+        if harness._LOGS_DIR in script:
+            return f"{harness._LOG_PRESENT} {CARD_A} 0\n{harness._LOG_PRESENT} {CARD_B} 0\n"
+        return real_shell(script, timeout)
+
+    monkeypatch.setenv("AGENT_DELEGATION_TIMEOUT", "0.05")
+    monkeypatch.setenv("AGENT_DELEGATION_POLL_INTERVAL", "0.01")
+    monkeypatch.setattr(harness, "_agent_shell", shell)
+    monkeypatch.setattr(
+        harness.worker_trajectory,
+        "capture",
+        lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(
+            entries=[],
+            tokens={},
+            unbilled=[],
+            summary={},
+        ),
+    )
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "rate_limit" in result.errors[0]
+    assert f"{CARD_A} (triage)" not in "\n".join(result.errors)
+    assert f"{CARD_B} (running)" in "\n".join(result.errors)
+
+
 def test_a_board_that_stops_answering_is_infrastructure(
     api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2885,6 +3512,62 @@ def test_a_board_that_stops_answering_is_infrastructure(
 
     assert infra(result)
     assert "the kanban board could not be read 3 times running" in result.errors[0]
+
+
+def test_an_inject_lane_settle_floors_its_purge(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The settle the presubmit's inject lane takes carries the run-start floor (#4591)."""
+    floor = 1_700_000_000
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(tmp_path, CARD_A, "done", result="all 3 clusters healthy")
+    real = local_shell(tmp_path, monkeypatch)
+    purges: list[str] = []
+
+    def clocked(script: str, timeout: float) -> str:
+        if script == harness._POD_CLOCK_SCRIPT:
+            return f"{floor}\n"
+        if harness._shell_quote(harness._PURGE_ROWS_SCRIPT) in script:
+            purges.append(script)
+        return real(script, timeout)
+
+    monkeypatch.setattr(harness, "_agent_shell", clocked)
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert not result.errors, result.errors
+    (purge,) = purges
+    assert purge.endswith(" ".join(harness._shell_quote(a) for a in harness._purge_argv([CARD_A], floor=floor)))
+
+
+def test_a_board_that_stops_answering_floors_its_purge(
+    api_executor: _StubGatewayServer, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The purge on the way out of an exhausted board wait carries the run-start floor (#4591)."""
+    floor = 1_700_000_000
+    build_session_store(tmp_path, created=[CARD_A])
+    real = local_shell(tmp_path, monkeypatch)
+    calls: list[str] = []
+    purges: list[str] = []
+
+    def flaky(script: str, timeout: float) -> str:
+        if script == harness._POD_CLOCK_SCRIPT:
+            return f"{floor}\n"
+        if harness._shell_quote(harness._PURGE_ROWS_SCRIPT) in script:
+            purges.append(script)
+        if board.SESSION_CARDS_PRESENT in script:
+            calls.append(script)
+            if len(calls) > 1:
+                return "error: unable to upgrade connection"
+        return real(script, timeout)
+
+    monkeypatch.setattr(harness, "_agent_shell", flaky)
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert "the kanban board could not be read 3 times running" in result.errors[0]
+    (purge,) = purges
+    assert purge.endswith(" ".join(harness._shell_quote(a) for a in harness._purge_argv([CARD_A], floor=floor)))
 
 
 @pytest.mark.parametrize(
@@ -2959,7 +3642,8 @@ def test_the_workers_entries_do_not_unblind_a_record_whose_door_showed_no_trace(
     """The scorer sets a router-scope check aside on an inject record with no
     activity marker and nothing outside the envelope. A worker's entry would
     end that, grading the check against no router calls, so on such a record
-    the workers' entries stay off the trajectory; with a marker they join it."""
+    the workers' entries stay off the trajectory and a gap entry stands in
+    for them; with a marker they join it."""
     if door_shows_trace:
         api_executor.probe_activity = []
     build_session_store(tmp_path, created=[CARD_A])
@@ -2979,8 +3663,46 @@ def test_the_workers_entries_do_not_unblind_a_record_whose_door_showed_no_trace(
         assert "terminal" not in names
         assert scoring._inject_blind(result.trajectory)
         assert result.metadata["worker_entries_withheld"] == 1
+        # A gap entry takes their place, so a record that merges this turn
+        # with one whose workers were kept does not read as a full capture.
+        assert result.trajectory[-1] == worker_trajectory.gap_entry([worker_trajectory.WITHHELD_ENTRIES_GAP])
+        assert not scoring._inject_workers_carried([*result.trajectory, dict(WORKER_ENTRY)])
     # The counts are not entries and do not move the scorer: they stay.
     assert result.tokens["workers"] is not None
+
+
+@pytest.mark.parametrize("entries", [1, 0], ids=["entries-and-gap", "gap-only"])
+def test_a_withheld_turn_keeps_the_captures_own_gap_entry(
+    api_executor: _StubGatewayServer,
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    entries: int,
+) -> None:
+    """On a door that showed no trace, only the workers' entries are withheld:
+    the capture's own gap entry stays with its reasons, the count is the
+    entries alone, and the withheld gap entry is added only when an entry
+    was withheld."""
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(tmp_path, CARD_A, "done", result="all 3 clusters healthy")
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch))
+    unread = "session store for platform: locked"
+
+    def capture(shell: Any, task_ids: list[str], timeout: float) -> Any:
+        return worker_trajectory.WorkerCapture(
+            entries=[dict(WORKER_ENTRY)] * entries,
+            summary={"cards": {CARD_A: {"sessions": ["s1"]}}, "unread": [unread]},
+        )
+
+    monkeypatch.setattr(worker_trajectory, "capture", capture)
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    gaps = [e for e in result.trajectory if e.get("name") == worker_trajectory.GAP_ENTRY]
+    withheld_gap = worker_trajectory.gap_entry([worker_trajectory.WITHHELD_ENTRIES_GAP])
+    assert worker_trajectory.gap_entry([unread]) in gaps
+    assert (withheld_gap in gaps) == bool(entries)
+    assert result.metadata["worker_entries_withheld"] == entries
+    assert scoring._inject_blind(result.trajectory)
 
 
 def _failing_first(shell: Any, failures: int) -> Any:
@@ -3304,6 +4026,169 @@ def test_a_stop_that_drops_once_in_transport_is_retried(
     assert answers[0][0] is True
 
 
+def test_a_stop_answered_by_a_standby_waits_its_retry_after(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stop's retry waits a standby's Retry-After before it respawns, as
+    the opening exchange's does."""
+    real_submit = inject.InjectTask.submit
+    drops: list[int] = []
+    sleeps: list[float] = []
+    real_sleep = time.sleep
+
+    def flaky(self: Any) -> str:
+        if self.prompt == stop_hook.STOP_WORD and not drops:
+            drops.append(1)
+            raise inject.InjectUnavailable("HTTP 503: standby", retryable=True, answered=True, retry_after=2.0)
+        return real_submit(self)
+
+    def _sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        real_sleep(min(seconds, 0.01))
+
+    def arrange(stub: _StubGatewayServer) -> None:
+        refuse_no_task(stub)
+        monkeypatch.setattr(inject.InjectTask, "submit", flaky)
+        monkeypatch.setattr(harness.time, "sleep", _sleep)
+
+    _, answers = run_stopped_ask(stub_gateway, monkeypatch, arrange)
+
+    assert drops == [1]
+    assert 2.0 in sleeps, sleeps
+    assert answers[0][0] is True
+
+
+def test_a_failed_read_after_a_standbys_503_moves_off_the_owned_forward(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The owned forward is the replica that just answered as a standby: a
+    respawn whose lease read fails goes to the Service, not back to it."""
+    monkeypatch.delenv("AGENT_INJECT_URL")
+    monkeypatch.delenv("AGENT_INJECT_SERVICE", raising=False)
+    monkeypatch.delenv("AGENT_SERVICE_NAME", raising=False)
+    monkeypatch.setenv("AGENT_INJECT_LOCAL_PORT", str(stub_gateway.server_address[1]))
+    calls: list[tuple[str, str | None]] = []
+    monkeypatch.setattr(harness, "_ensure_port_forward", lambda port, *, service=None, remote_port=0: calls.append(("ensure", service)))
+    monkeypatch.setattr(harness, "_reset_port_forward", lambda port, *, service=None, remote_port=0: calls.append(("reset", service)))
+    monkeypatch.setattr(harness, "_owned_forward_target", lambda port: "pod/platform-agent-a2a-gateway-a")
+    monkeypatch.setattr(harness, "_gateway_door_target", lambda agent_service, service: None)
+    monkeypatch.setattr(harness.time, "sleep", lambda seconds: None)
+    stub_gateway.entries = running_transcript(stub_gateway.task_id, "partial findings")
+    stub_gateway.poll_status = 503
+    stub_gateway.poll_retry_after = "2"
+    stub_gateway.poll_failures = 1
+    stub_gateway.poll_fail_after_seconds = 0.5
+    monkeypatch.setenv("AGENT_INJECT_TIMEOUT", "2")
+
+    KubeAgentsHarness().run("take your time")
+
+    assert ("reset", "svc/platform-agent-a2a-inject") in calls, calls
+
+
+# A mid-turn stop (stop_hook.MID_TURN_DIRECTIVE): the `stop` goes from the
+# opening exchange's polls while the task is working, before its terminal.
+
+MID_TURN_ASK = f"{stop_hook.MID_TURN_DIRECTIVE} after=0.5 observe=60\nscale checkout-gateway to 4"
+# How many reads the stub had served when the last mid-turn stop went.
+polls_at_stop: list[int] = []
+
+
+def run_mid_turn_ask(
+    stub: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch, *, finish_first: bool = False
+) -> tuple[Any, list[Any], list[bool]]:
+    """Run MID_TURN_ASK against a task that runs until the stop cancels it
+    (or, ``finish_first``, completes at once). Returns the result, what the
+    stop seam was handed, and, per stop sent, whether the opening task was
+    still running when it went."""
+    if finish_first:
+        stub.entries = completed_transcript(stub.task_id, "filed a card")
+    else:
+        stub.entries = running_transcript(stub.task_id)
+    real_submit = inject.InjectTask.submit
+    running_at_stop: list[bool] = []
+    polls_at_stop.clear()
+
+    def submit(self: Any) -> str:
+        if self.prompt == stop_hook.STOP_WORD:
+            running_at_stop.append(not any(e["kind"] == inject.ENTRY_TERMINAL for e in stub.entries))
+            polls_at_stop.append(len(stub.polls))
+            refuse_no_task(stub)
+            stub.entries = stub.entries + [
+                entry(len(stub.entries) + 1, inject.ENTRY_TERMINAL, taskId=stub.task_id, state="canceled",
+                      source=inject.TERMINAL_SOURCE_EXECUTOR),
+            ]
+        return real_submit(self)
+
+    monkeypatch.setattr(inject.InjectTask, "submit", submit)
+    answers: list[Any] = []
+
+    def seam(self: Any, result: Any, session_id: str, stop: Any, *, send_stop: Any, poll_interval: float) -> None:
+        answers.append(send_stop())
+
+    monkeypatch.setattr(KubeAgentsHarness, "_stop_after_first_card", seam)
+    return KubeAgentsHarness().run(MID_TURN_ASK), answers, running_at_stop
+
+
+def test_a_mid_turn_stop_goes_while_the_opening_task_runs(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, answers, running_at_stop = run_mid_turn_ask(stub_gateway, monkeypatch)
+
+    assert stub_gateway.submissions[0]["text"] == "scale checkout-gateway to 4"
+    assert stub_gateway.submissions[-1]["text"] == stop_hook.STOP_WORD
+    assert running_at_stop == [True]
+    assert answers[0][0] is True
+
+
+def test_a_turn_that_ends_before_the_mid_turn_stop_sends_none(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, answers, running_at_stop = run_mid_turn_ask(stub_gateway, monkeypatch, finish_first=True)
+
+    assert running_at_stop == []
+    assert answers[0] == (False, "the opening turn ended before the stop could land while it ran")
+
+
+@pytest.mark.parametrize("hooked", [False, True])
+def test_a_stream_terminal_ends_the_wait_with_or_without_a_poll_hook(
+    stub_gateway: _StubGatewayServer, hooked: bool
+) -> None:
+    """A status turn awaits with no hook and the opening exchange with one;
+    the read that finds the stream terminal ends either wait at once rather
+    than at the deadline."""
+    stub_gateway.entries = running_transcript(stub_gateway.task_id, "the answer")
+    stub_gateway.executor_states = ["completed"]
+    stub_gateway.probe_final = True
+    stub_gateway.probe_terminal_source = inject.TERMINAL_SOURCE_EXECUTOR
+    task = inject.InjectTask(
+        base_url=f"http://127.0.0.1:{stub_gateway.server_address[1]}",
+        conversation=CONVERSATION,
+        prompt="quick one",
+        token=TOKEN,
+    )
+    task_id = task.submit()
+    polled: list[Any] = []
+    started = time.monotonic()
+
+    exchange = task.await_terminal(
+        task_id, deadline=started + 60.0, on_poll=polled.append if hooked else None
+    )
+
+    assert exchange.outcome == inject.OUTCOME_STREAM_TERMINAL
+    assert time.monotonic() - started < 30.0
+
+
+def test_a_mid_turn_stop_caps_the_reads_until_it_goes(
+    stub_gateway: _StubGatewayServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A long poll would hold the stop up to 30 s past its delay, so the
+    opening exchange's reads block at most a second until it has gone."""
+    run_mid_turn_ask(stub_gateway, monkeypatch)
+
+    before = stub_gateway.polls[: polls_at_stop[-1]]
+    opening = [p for p in before if p["probe"] and p["task"] == stub_gateway.task_id]
+    assert opening and all(p["wait"] <= 1 for p in opening)
+
 # --- The front door's token usage. The executor publishes each turn's usage
 # artifact before its terminal, the door's probe carries the task's total
 # (``usage``), and the harness maps its two counts into the record's
@@ -3508,6 +4393,66 @@ def test_the_chains_children_count_apart_and_join_the_total(stub_gateway: _StubG
     assert result.tokens["children"] == {"input": 900, "output": 90, "total": 990}
     assert result.tokens["total"] == 2690
     assert "usage_partial" not in result.tokens
+
+
+def test_the_chains_addressees_reach_the_record_and_the_transcript(stub_gateway: _StubGatewayServer) -> None:
+    """The read after the terminal names whom the chain delegated to; the
+    record's metadata and the verifiers' transcript carry it as given."""
+    stub_gateway.entries = completed_transcript(stub_gateway.task_id, "the tse agent found it")
+    stub_gateway.probe_child_addressees = ["tse", "platform"]
+
+    result = KubeAgentsHarness().run("/session ask the tse agent")
+
+    assert result.metadata["child_addressees"] == ["tse", "platform"]
+    snap = transcript.get()
+    assert snap is not None and snap.child_addressees == ["tse", "platform"]
+
+
+def test_a_door_without_the_addressees_field_reads_as_cannot_say(stub_gateway: _StubGatewayServer) -> None:
+    stub_gateway.entries = completed_transcript(stub_gateway.task_id, "done")
+
+    result = KubeAgentsHarness().run("watch it")
+
+    assert result.metadata["child_addressees"] is None
+    snap = transcript.get()
+    assert snap is not None and snap.child_addressees is None
+
+
+def test_the_addressees_a_poll_carried_survive_a_read_after_the_terminal_that_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The door sends childAddressees on every read; a poll's copy is kept,
+    so the deadline or a transient error on the read after the terminal
+    doesn't lose whom the chain delegated to."""
+    task = inject.InjectTask(base_url="http://127.0.0.1:1", conversation="c", prompt="p", token="t")
+    monkeypatch.setattr(inject, "POLL_PAUSE_SECONDS", 0.0)
+    monkeypatch.setattr(task, "_poll", lambda *args, **kwargs: {
+        "entries": completed_transcript("task-1", "done"),
+        "lastSeq": 6,
+        "probe": {"active": False, "taskId": "task-1", "final": True, "executorState": "completed",
+                  "childAddressees": ["tse"]},
+    })
+
+    def unavailable(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise inject.InjectUnavailable("the door is restarting")
+
+    monkeypatch.setattr(inject, "_request", unavailable)
+    exchange = task.await_terminal("task-1", deadline=time.monotonic() + 30)
+    assert exchange.fold.child_addressees == ["tse"]
+
+
+def test_the_addressees_field_parses_none_from_cannot_say() -> None:
+    def parsed(value: Any) -> list[str] | None:
+        probe = inject.Probe.from_body({"probe": {"active": False, "taskId": "t", "childAddressees": value}})
+        assert probe is not None
+        return probe.child_addressees
+
+    assert parsed([]) == []
+    assert parsed(["tse"]) == ["tse"]
+    assert parsed(None) is None
+    assert parsed("tse") is None
+    assert parsed(["tse", 3]) is None
+    assert inject.Probe.from_body({"probe": {"active": False}}).child_addressees is None
 
 
 def test_a_partial_usage_is_read_again_and_marked_when_it_stays_partial(

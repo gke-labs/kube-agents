@@ -119,6 +119,7 @@ version-control abstraction lands.
 | The shims themselves           | [`deploy/docker/Dockerfile`](../../deploy/docker/Dockerfile) — symlinks under `/opt/credential-proxy/bin`                                                                                                                                                                             |
 | Its command policy             | `/etc/credential-proxy/policy.json`, from `CREDENTIAL_PROXY_POLICY`                                                                                                                                                                                                                   |
 | Proxy placement and federation | [`credential_proxy_manifests.go`](../../k8s-operator/internal/controller/credential_proxy_manifests.go), `buildCredentialProxyEnv` in [`platformagent_manifests.go`](../../k8s-operator/internal/controller/platformagent_manifests.go)                                               |
+| The Kubernetes API proxy       | [`kube-proxy.md`](kube-proxy.md) — [`k8s-api-proxy/`](../../k8s-api-proxy/) and [`kube_proxy_manifests.go`](../../k8s-operator/internal/controller/kube_proxy_manifests.go)                                                                                                           |
 | The STS credential file        | [`agents/platform/scripts/wif_credentials.py`](../../agents/platform/scripts/wif_credentials.py)                                                                                                                                                                                      |
 | The isolation contract         | [`docs/credential-isolation-design.md`](../credential-isolation-design.md)                                                                                                                                                                                                            |
 | The Session KV store           | [`agents/platform/scripts/session_kv_server.py`](../../agents/platform/scripts/session_kv_server.py), SQLite under `/var/lib/kube-agents/session/`                                                                                                                                    |
@@ -355,6 +356,19 @@ a closed stdout drops the printf) gets a
 connection was closed under the command or never opened, and that it may have
 run. A per-environment `ControlPath` would remove the sharing itself and is
 upstream's to make.
+
+The sharing also puts a ceiling on fan-out. Every concurrent command is a session on the
+one master, and `sshd` caps sessions per connection at `MaxSessions`, 10 by default: the
+eleventh concurrent command is refused by the master and the client exits 255 with
+nothing on stderr, the same shape as the teardown above. A sweep that delegates a card
+per cluster hit it on a large fleet. `deploy/sandbox/sshd_config` sets `MaxSessions 128`,
+and raises `MaxStartups` to `64:30:256` for the moment several agent processes open a
+master at once after a sandbox restart; the image's smoke test opens one master and runs
+64 sessions over it. More sessions mean more shells in the one pod, so the container's
+memory is the counterpart: `spec.harness.experimental.shellSandbox.resources` sizes the
+shell container, and the
+[CRD reference](../site/src/content/docs/operator/platformagent-crd.md#shellsandbox) owns
+its defaults, merge rule and refusals.
 
 ### What the credential proxy is for
 
@@ -1386,7 +1400,14 @@ scaffolded later, so a cluster onboarded at 3am does not wait for a pod restart 
 directories. The scaffold passes `--profile <name>` and pushes that home plus the machine
 home and `profiles/platform`, the two roots the sandbox creates bare; the start pushes
 every home. Re-sending every home on every scaffold made onboarding N clusters
-cost O(N²) (#3701). Nothing about it is ordered against the sandbox starting: the Deployment and
+cost O(N²) (#3701). A profile delete runs it the other way: `--remove-profile <name>`
+removes that home from the sandbox once the agent pod's copy is gone, over the same
+SSH hop, and refuses a name that still has anything under the agent pod's `profiles/`.
+Create and delete hold a per-profile lock, so a delete cannot remove the sandbox home a
+concurrent scaffold of the same name has just pushed (#4389). The reconcile's PRUNE
+deletes its names together: it holds each one's lock, in sorted order and in chunks of
+50, and removes every chunk's sandbox homes with one `--remove-profile` call that reports
+each name's outcome, rather than one call and one SSH hop per profile (#4574). Nothing about it is ordered against the sandbox starting: the Deployment and
 the StatefulSet come up independently, so the script waits for sshd and, failing that,
 leaves the agent pod's files untouched and lets the next start retry.
 
@@ -1652,8 +1673,8 @@ worker on the default profile sends and is silent — the root is matched by val
 a data root with a `profiles` component in its own path is not read as a profile; a name
 that is not one component is refused with a line on stderr; a well-formed name with no
 home here is a profile the mirror has not
-delivered yet, so the wrapper says so and falls back to the cwd. `sandbox_mirror.py` runs
-on the agent pod's start and when a profile is scaffolded, and a card dispatched inside
+delivered yet, so the wrapper says so and falls back to the cwd. `sandbox_mirror.py` pushes
+the layout on the agent pod's start and when a profile is scaffolded, and a card dispatched inside
 that window would otherwise fail the same way with nothing beside the failure to say why.
 Nothing evaluates the value; every use is a quoted expansion.
 
@@ -1800,8 +1821,8 @@ wholesale would put a file named `credential_proxy.py` inside the sandbox, which
 wrong thing for a reviewer to find even though it is inert there. So the image gets an
 explicit allowlist: `sandbox_exec.py`, `forge.py`, `pr_triggers.py`,
 `github_token_refresh.py`, `gitops_workspace.py`, `gke_endpoint.py`, `cluster_preflight.sh`,
-`stall_report.py`, `audit_cluster.sh`, the three Cluster Agent domain collectors (`audit_storage.py`, `audit_networking.py`,
-`audit_certificates.py`) and `inventory_findings.py` — the entry points an agent is told to run,
+`stall_report.py`, `audit_cluster.sh`, the four Cluster Agent domain collectors (`audit_storage.py`, `audit_networking.py`,
+`audit_certificates.py`, `kcc_fleet_audit.py`) and `inventory_findings.py` — the entry points an agent is told to run,
 plus the transitive closure of what they import, and the shared modules the skill-tree collectors import from `/opt/defaults/scripts` (`credential_proxy_client.py`, `fleet_scope_args.py`, `collector_run.py`, `broker_admission.py`). `inventory_findings.py extract` and `select`
 work there, and `select` chooses the report's items from the scores file alone. `register` calls
 the Session KV server on the agent pod's loopback and exits 13 from the sandbox, and the
@@ -2065,7 +2086,7 @@ That split is now the smaller half of what has already happened. `resolver.py` r
 sandbox today; what is left to move is the script around them.
 
 `bootstrap_delivery.py` takes the same shape. Its gating markers, `.user_aligned` and
-`.bootstrap_completed`, are written agent-side and stay on the PVC, so it checks them
+`.bootstrap_completed` (and, for a report nobody aligned to, the age of `.bootstrap_scan_filed`), are written agent-side and stay on the PVC, so it checks them
 first; only once they say a delivery is due does it read `INVENTORY.md` out of the
 sandbox with `sandbox_exec.read_bytes`, claim the delivery on the PVC, print the report,
 and rename it to `INVENTORY.delivered.md` in the sandbox. Before the claim it reads the
@@ -2158,8 +2179,11 @@ from the test fleet now that cron runs have a working directory of their own. A 
 is listed before the pod's profile list is read, so a profile scaffolded between the two
 reads is never taken for stale; only cluster-prefixed names go, only when the pod lists the
 platform profile, and only under a profiles root that `find -P` reports as a real directory,
-by one `rm` per home as the model's account, which owns the homes; a home whose `rm` fails
-is named in one chat bullet each night until it goes. The listing runs as
+by one `rm` per home as the model's account, which owns the homes, each under that
+profile's lock, the one `create_profile` and `delete_profile` hold (#4389): taken without
+blocking, from the pod's last-moment recheck through the `rm`, so a name being scaffolded
+right then is left for the next night. A home whose `rm` fails is named in one chat bullet
+each night until it goes. The listing runs as
 `hermes`, the default principal, because its output is believed, under the sandbox's own
 `workspace_root` rather than the agent pod's home, and with NUL-terminated records so a
 name cannot forge a row.
@@ -2522,18 +2546,21 @@ ReadWriteOnce data PVC that only the gateway pod mounts.
 
 So `CREDENTIAL_PROXY_ROLE` selects which services a container starts:
 
-| Role        | Starts                                               | Runs in                              |
-| ----------- | ---------------------------------------------------- | ------------------------------------ |
-| `broker`    | credential exec broker, Google Chat and Slack relays | the `<agent>-credential-proxy` pod   |
-| `api-proxy` | API authenticator, k8s-event-watcher, drift-detector | the gateway pod, as `agent-api-auth` |
-| `combined`  | all of them                                          | nothing, now — the default           |
+| Role        | Starts                                                                       | Runs in                                                                       |
+| ----------- | ---------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| `broker`    | credential exec broker, Google Chat and Slack relays                         | the `<agent>-credential-proxy` pod                                            |
+| `api-proxy` | API authenticator, k8s-event-watcher, drift-detector                         | the gateway pod, as `agent-api-auth`                                          |
+| `combined`  | all of them                                                                  | nothing, now — the default                                                    |
+| `exec`      | credential exec broker, without the event relays (the Cloud API relay stays) | the `<agent>-credential-proxy-exec-tier` pods, once the operator renders them |
 
 `combined` is the default, so an image paired with an operator that does not set the
 variable starts every service; `start-services.sh` refuses any other value rather than
-falling back to it. The `api-proxy` container loads no policy and builds no
-`CommandExecutor`: it compares one key and forwards, holding no credential path. It is
-called `agent-api-auth`, and `envoy-credential-proxy` names the `broker` container — the
-one that does proxy credentials.
+falling back to it. An `exec` pod serves only the exec routes that
+[`credential-broker-exec-tier.md`](credential-broker-exec-tier.md) §12 lists. The
+`api-proxy` container loads no policy and builds no `CommandExecutor`: it compares one key
+and forwards, holding no credential path. It is called `agent-api-auth`, and
+`envoy-credential-proxy` names the `broker` container — the one that does proxy
+credentials.
 
 ### How the proxy gets a token
 
@@ -2657,7 +2684,7 @@ the `TokenReview` layer. The audience is chosen by the operator, per Pod, and th
 will not validate a token against an audience it was not minted for, so it is a claim the
 caller cannot restate. `ROUTE_ROLES` in `credential_proxy.py` is the table it feeds: the
 sandbox, where every model-authored command runs, cannot reach `/v1/chat/**` at all, and the
-gateway cannot reach `/v1/exec`, `/v1/github/**` or `/v1/workspace/**`; `/v1/gcp/**`, the
+gateway cannot reach `/v1/exec` or `/v1/github/**`; `/v1/gcp/**`, the
 read-only Cloud API relay ([gcp-api-relay.md](gcp-api-relay.md)), is the shell's as well. Neither of those
 two ever needed the other's routes, so this enforces a separation the deployment already
 had and nothing checked. The same table carries a third role, `a2a-chat`, for the A2A
@@ -2666,12 +2693,12 @@ role, and the legacy event routes it cannot reach; [the chatops gateway
 design](spec-chatops-gateway.md) ("The Google Chat adapter") owns why that caller is kept
 apart from the legacy chat one. Under the operator's `A2A_SESSION_CLUSTER_VIEW` flag there is
 a fourth, `session`, for the pods the A2A gateway spawns per conversation: their token is
-minted for `kubeagents-credential-proxy-session`, `/v1/exec` admits `(shell, session, profile)`
-(the sixth role, `profile`, is below), and
-within that route `ROLE_EXECUTABLES` holds the session to `kubectl` and `gcloud`. One path
+minted for `kubeagents-credential-proxy-session`, `/v1/exec` admits the session beside the shell
+(the `profile` and `scope` roles, below, reach it too), and
+within that route `ROLE_EXECUTABLES` holds the session to `gcloud` while session `kubectl` routes through `<agent>-kube-proxy`. One path
 under it is the shell's alone: `/v1/exec/admission`, the read-only report of how many commands
 the broker admits at once, which the shell's fleet sweeps size their pools by
-(`broker_admission.py`); the session and profile roles don't reach it, and a sweep run under
+(`broker_admission.py`); the session, profile and scope roles don't reach it, and a sweep run under
 either falls back to four. Because a
 Pod picks the audience it projects, the role is also bound to the caller:
 `CREDENTIAL_PROXY_SESSION_CALLERS` names the session ServiceAccount, which may present only
@@ -2696,6 +2723,15 @@ credential's cluster and project. Profile calls together hold at most
 ([spec-subagent-profiles.md](spec-subagent-profiles.md) owns the detail). A `NetworkPolicy` would have expressed the same thing and is not the mechanism
 chosen, because it does nothing at all on a CNI that does not implement `NetworkPolicy` and
 `TokenReview` is answered by the API server on every cluster.
+
+The scope publisher Job under `mode: next` has a role of its own, `scope`:
+its token is minted for `kubeagents-credential-proxy-scope`, it is bound to its callers through
+`CREDENTIAL_PROXY_SCOPE_CALLERS` as the mcp role is, it reaches `/v1/exec` alone, and
+`ROLE_EXECUTABLES` holds it to `gcloud`. Within that, `scope_policy.py` admits five lookups token
+for token, each on an argument the `scope.json` at `CREDENTIAL_PROXY_SCOPE_FILE` declares or
+that an earlier lookup returned to the role within five hours. That record of returned members is
+memory in the one broker process, so the role stays on the single broker pod
+([credential-proxy-single-pod.md](credential-proxy-single-pod.md#2-state-that-lives-in-the-pod)).
 
 Be precise about what the token buys: it is a **multi-tenancy control** that stops another
 workload in the cluster borrowing the agent's credentials, and not an agent-containment
@@ -2756,20 +2792,24 @@ longer. A `.gitattributes` naming `filter=evil` is a file the agent can still wr
 `filter.evil.clean` in `.git/config` it names a driver that does not exist, and git leaves the
 content alone.
 
-So the exchange stops being a directory and starts being content. The agent hands the broker
-`{path, contentBase64}` pairs and a commit message; the broker owns the only checkout, on a
-volume the agent does not mount, and commits and pushes there. `content_workspace.py` holds
+So the exchange stops being a directory and starts being content. The first form of it was the
+broker's content workspace, which is retired (#4243). The agent handed the broker
+`{path, contentBase64}` pairs and a commit message; the broker owned the only checkout, on a
+volume the agent does not mount, and committed and pushed there. `content_workspace.py` held
 the seven verbs — `open`, `read`, `list`, `grep`, `commit`, `push`, `close` — reached over the
-same loopback endpoint as `/v1/exec`, and `credential_proxy_client.Workspace` is the client. The
-broker refuses a path that is absolute, contains `..`, or sits behind a symlink, and it
-answers `list` from `git ls-files` rather than from a filesystem walk, so its own `.git` is
-not nameable. `commit` continues `origin/<branch>` when the remote already has it rather than
+same loopback endpoint as `/v1/exec`, and `credential_proxy_client.Workspace` was the client. The
+broker refused a path that was absolute, contained `..`, or sat behind a symlink, and it
+answered `list` from `git ls-files` rather than from a filesystem walk, so its own `.git` was
+not nameable. `commit` continued `origin/<branch>` when the remote already had it rather than
 recutting from the base, because recutting is how a second round of review feedback silently
-deletes the reviewed commits; `push` uses `--force-with-lease` and does not fetch immediately
-before it, since fetching first moves the very ref the lease compares against.
+deletes the reviewed commits; `push` used `--force-with-lease` and did not fetch immediately
+before it, since fetching first moves the very ref the lease compares against. Today the
+exchange is the version-control verbs ([version-control-support.md](version-control-support.md)):
+history crosses as a git bundle, a one-off read crosses as a `snapshot` tar, and each broker
+scratch tree lives for one request.
 
-`assert_disjoint_roots` runs at construction and refuses to start the broker if its tree root
-sits inside the agent-shared workspace, and `validateExtraVolumeMounts` in the operator
+`assert_disjoint_roots` runs at construction and refuses to start the broker if its
+version-control scratch root sits inside the agent-shared workspace, and `validateExtraVolumeMounts` in the operator
 refuses a CR that mounts a broker-owned volume into the agent container. Neither is an
 escape the agent could attempt — both are configuration mistakes that would apply cleanly and
 produce no symptom.
@@ -2782,32 +2822,25 @@ path is `execute_internal`, which runs the provider's own credential helper from
 image and nothing else. It is reached three ways, none of them with agent-supplied argv: the
 credential refresh route (`/v1/forge/refresh`, with `/v1/github/refresh` kept as an alias), the
 in-process refresh a version-control verb makes before it spends the credential, and the
-read-only mint for a context-repository clone. The content workspaces run their git
-through `execute_workspace_git`, which shares `_execute` with the agent-facing path — so it
+read-only mint for a context-repository clone. The version-control broker runs its git
+through `execute_vcs_git`, which shares `_execute` with the agent-facing path — so it
 inherits the same hardened environment — but is not reachable from `/v1/exec` and takes no
-agent-supplied argv: the subcommands are literals in `content_workspace.py`, and the only
-caller-supplied strings in them are a validated branch name and validated repository-relative
-paths. The clone URL is never one of them: the broker composes it from a validated `owner/name`
+agent-supplied argv: the subcommands are literals in `vcs_broker.py`, held to
+`VCS_GIT_SUBCOMMANDS`, and the caller-supplied strings in them are validated branch names and
+validated repository-relative paths. The clone URL is never one of them: the broker composes it from a validated `owner/name`
 for GitHub, or the forge that owns a host-qualified name composes it. That separation is what lets the agent-facing git surface go to zero once the skills
 migrate, rather than going to zero by accident.
 
-**What runs which way.** Both mechanisms are live at once, because a fleet does not upgrade
-atomically. The operator sets `CREDENTIAL_PROXY_CONTENT_WORKSPACE` on the broker whenever the
-sandbox is on, with no field to turn it off: the routes are what let the agent publish without
-holding a `.git`, and an install that could disarm them would be choosing to keep git's
-config-driven exec surface open. A skill asks the broker once per process whether the routes
-exist and takes the same fork for the whole run. An unreachable broker answers "no" and the run
-publishes through the leased clone, which is the one question in a run where falling back beats
-failing — every other call still fails loudly. It answers "no" by code as well as by status:
-`CONTENT_WORKSPACES_DISABLED` on a 404 says the broker does not have them armed, where a bare
-404 says that and "no such route" indistinguishably. The migrated skills were
-`submit-suggestion` and `fleet-audit`. `submit-suggestion` has since left content mode
-entirely — the version-control verbs give it a real checkout in its own container, with the
-credential in another, so there is nothing for the contentless fork to buy — and what is
-written here now describes `fleet-audit` alone. It needed the read side to replace what
-the clone used to answer: `list` pages the repository's tracked files, `read` fetches them
-singly or in a batch, and `grep` searches them, which is how a remediation path stays something
-discovered rather than invented when there is nothing local to search.
+**What runs which way.** The content workspace and the leased clone ran side by side, because
+a fleet does not upgrade atomically. The operator set `CREDENTIAL_PROXY_CONTENT_WORKSPACE` on
+the broker whenever the sandbox was on, and a skill asked the broker once per process whether
+the routes existed. The migrated skills were `submit-suggestion` and `fleet-audit`.
+`submit-suggestion` left content mode first: the version-control verbs give it a real checkout
+in its own container, with the credential in another. `fleet-audit` used the read side to
+replace what the clone used to answer: `list` paged the repository's tracked files, `read`
+fetched them singly or in a batch, and `grep` searched them. It now reads through `snapshot`
+and lands its changes through `clone`, `publish` and `proposal-create`. With no caller left,
+the routes, the client class and the variable are retired (#4243).
 
 **Reading is the half that nearly went missing.** Writing was the visible use of the shared
 tree, so the write skills were migrated first and the protocol was sized for them: a commit
@@ -2819,30 +2852,30 @@ had no search at all, and cloned full-depth into an `emptyDir` sized for manifes
 acceptance test that surfaced it is the one the change is now held to: clone a public
 repository and analyse the code in it, using no file access to a repository.
 
-What that took is four things, none of them a new trust boundary. `list` pages: it reports
-`total` and `truncated`, and takes an `after` cursor so a caller can walk a tree larger than
-the ceiling instead of guessing at names beyond it. `grep` runs `git grep` over the tracked
-files, fixed-string unless the caller asks for a regular expression, with the pattern carried
-as the argument of `-e` so one beginning with `-` is a pattern rather than an option; because
-git greps tracked files, no pattern reaches `.git`. `read` takes a list of paths as well as a
+What that took was four things, none of them a new trust boundary. `list` paged: it reported
+`total` and `truncated`, and took an `after` cursor so a caller could walk a tree larger than
+the ceiling instead of guessing at names beyond it. `grep` ran `git grep` over the tracked
+files, fixed-string unless the caller asked for a regular expression, with the pattern carried
+as the argument of `-e` so one beginning with `-` was a pattern rather than an option; because
+git greps tracked files, no pattern reached `.git`. `read` took a list of paths as well as a
 single one, since materialising a tree one round trip per file is a reader that reads less
-than it should, and it answers with what it skipped and why rather than dropping files
-quietly. And `open` takes a `depth`, which makes a shallow single-branch clone — refused
+than it should, and it answered with what it skipped and why rather than dropping files
+quietly. And `open` took a `depth`, which made a shallow single-branch clone — refused
 together with `branch`, since a single-branch clone cannot see whether the working branch
 exists on the remote and would answer from the base instead, and read-only, since `commit`
-refuses on a shallow workspace rather than failing later at a push the remote rejects. A
-clone that does not fit `CREDENTIAL_PROXY_MAX_CLONE_BYTES` is removed and refused; the ceiling
-bounds what stays on the volume, not what a clone transiently writes.
+refused on a shallow workspace rather than failing later at a push the remote rejects. A
+clone that did not fit `CREDENTIAL_PROXY_MAX_CLONE_BYTES` was removed and refused. The
+`snapshot` verb that replaced all four is stateless; the next paragraph describes it.
 
 The agent-facing surface for all of it is the `inspect-repository` skill, which is the thing a
 list of protocol verbs does not give you: without a skill naming the capability, the agent has
-no way to know that reading somebody else's code is still possible. Its `clone` subcommand
-pages the listing, batches the reads and writes the files into a scratch directory; what lands
-is source with no repository around it, which is the same property the write path has for the
-same reason. Its `open`/`grep`/`fetch`/`close` sequence is for repositories too large to copy,
-and the handle rather than a directory is what travels between the agent's turns. On a broker
-that has not been armed, `clone` falls back to the leased checkout and says `"mode":
-"directory"`; the handle subcommands say they cannot serve the request instead of pretending.
+no way to know that reading somebody else's code is still possible. Its `clone` command takes
+one revision through the broker's stateless `snapshot` verb (`/v1/vcs/snapshot`) and unpacks it
+into a scratch directory; what lands is source with no repository around it, which is the same
+property the write path has for the same reason. A repository over the snapshot ceiling is
+refused whole, and `--prefix` takes part of it. With no broker, `clone` falls back to
+the leased checkout and says `"mode": "directory"`. A broker older than the verb is an error that
+names the image to roll forward, because the sandbox's `git` has no transport for that checkout.
 
 What content-passing does not remove is the volume itself. The clone path still needs it, so
 the mount stays until the last skill has migrated and directory mode is deleted; the
@@ -2851,19 +2884,19 @@ after that. Nor does it change the exec path for `kubectl`, `gcloud` or `gh`, wh
 needed a shared filesystem — except that `gh` did, for `--body-file`, and now takes its
 documents on stdin instead.
 
-**The deny policy does not see the workspace verbs.** The proxy's policy matches on argv, and
-the workspace protocol has none: `commit` and `push` are JSON bodies on their own routes, not
+**The deny policy did not see the workspace verbs.** The proxy's policy matches on argv, and
+the workspace protocol had none: `commit` and `push` were JSON bodies on their own routes, not
 commands submitted to `/v1/exec`. So the rules that stop the agent merging its own pull
 request — no `gh pr merge`, no `gh pr review --approve`, no mutating `gh api`, no repository
-administration (#725) — do not apply to them. That is intended. `push` is the sanctioned
-write, the thing the write skills exist to do, and what it can do is bounded by the verb
-rather than by a pattern: it updates a branch, and it cannot merge, cannot approve or dismiss
-a review, and cannot change repository settings or branch protection, because there is no
-argv through which a caller could ask it to. It does trigger whatever CI the repository runs
-on a push, the same as any other push and bounded by the installation token's scope. The line
-worth writing down is that `commit` and `push` are a GitHub write path those `gh` rules do not
-cover, so reading the deny policy as the complete set of writes the agent can perform gives
-the wrong answer.
+administration (#725) — did not apply to them. That was intended. `push` was the sanctioned
+write, the thing the write skills exist to do, and what it could do was bounded by the verb
+rather than by a pattern: it updated a branch, and it could not merge, could not approve or
+dismiss a review, and could not change repository settings or branch protection, because there
+was no argv through which a caller could ask it to. It did trigger whatever CI the repository
+runs on a push, the same as any other push and bounded by the installation token's scope. The
+`/v1/vcs/*` verbs that replaced it are JSON bodies too, and the policy does not see them
+either. So reading the deny policy as the complete set of writes the agent can perform still
+gives the wrong answer.
 
 ### One replica
 

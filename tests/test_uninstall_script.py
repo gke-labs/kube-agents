@@ -1143,6 +1143,11 @@ class GvisorFloorCannotBlockTheTeardownTest(unittest.TestCase):
         env_secret_at = text.find('export LITELLM_ENV_SECRET_NAME=""')
         self.assertNotEqual(env_secret_at, -1, "uninstall.sh must blank LITELLM_ENV_SECRET_NAME")
         self.assertLess(env_secret_at, call_at)
+        # The minter's adoption keys (#3504): terraform validates their shape,
+        # and an operator types them into install.env by hand.
+        minter_at = text.find('export MINTER_SHARED_KEY="" MINTER_ADOPT_KEY=""')
+        self.assertNotEqual(minter_at, -1, "uninstall.sh must blank MINTER_SHARED_KEY and MINTER_ADOPT_KEY")
+        self.assertLess(minter_at, call_at)
         provider_at = text.find('export MODEL_PROVIDER="$DEFAULT_MODEL_PROVIDER" MODEL_DEFAULT_NAME=""')
         self.assertNotEqual(provider_at, -1, "uninstall.sh must reset an openai_compatible provider")
         self.assertLess(provider_at, call_at)
@@ -1157,6 +1162,11 @@ class GvisorFloorCannotBlockTheTeardownTest(unittest.TestCase):
         )
         self.assertNotEqual(redaction_at, -1, "uninstall.sh must blank the LITELLM_REDACTION_* keys")
         self.assertLess(redaction_at, call_at)
+        # The spend ceiling too: the generator refuses an amount or a period it
+        # cannot read, and a teardown must not stop on either.
+        budget_at = text.find('export LITELLM_BUDGET_USD="" LITELLM_BUDGET_PERIOD=""')
+        self.assertNotEqual(budget_at, -1, "uninstall.sh must blank the LITELLM_BUDGET_* keys")
+        self.assertLess(budget_at, call_at)
         # And the mode: the generator refuses a value outside the CRD's enum,
         # and a teardown must not stop on a typo in install.env.
         mode_at = text.find('export PLATFORM_AGENT_MODE=""')
@@ -1180,6 +1190,11 @@ class GvisorFloorCannotBlockTheTeardownTest(unittest.TestCase):
         vertex_at = text.find('export VERTEX_MANAGE_SERVING_PROJECT=""')
         self.assertNotEqual(vertex_at, -1, "uninstall.sh must blank VERTEX_MANAGE_SERVING_PROJECT")
         self.assertLess(vertex_at, call_at)
+        # The release's upgrade_install switch too: the generator refuses a
+        # misspelt HELM_UPGRADE_INSTALL, and a teardown must not stop on it.
+        helm_at = text.find('export HELM_UPGRADE_INSTALL=""')
+        self.assertNotEqual(helm_at, -1, "uninstall.sh must blank HELM_UPGRADE_INSTALL")
+        self.assertLess(helm_at, call_at)
         # And the daily alert ceilings: the generator refuses a value that is
         # not a whole number, and a teardown must not stop on it. The names
         # come from the generator's own list, so a key added there and not

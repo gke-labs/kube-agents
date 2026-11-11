@@ -72,6 +72,24 @@ func provision(t *testing.T, url string) {
 	}); err != nil {
 		t.Fatalf("create TASKS: %v", err)
 	}
+	// Profile submissions' own stream, as the provision Job makes it.
+	if _, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+		Name:      lib.ProfileSubmitStream,
+		Subjects:  []string{lib.SubmitSubjectPrefix + ">"},
+		Retention: jetstream.LimitsPolicy,
+	}); err != nil {
+		t.Fatalf("create %s: %v", lib.ProfileSubmitStream, err)
+	}
+	// Profile tasks' stop records, as the provision Job makes it.
+	if _, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+		Name:              lib.DispatchStopStream,
+		Subjects:          []string{lib.DispatchStopPrefix + ">"},
+		Retention:         jetstream.LimitsPolicy,
+		MaxMsgsPerSubject: 1,
+		AllowDirect:       true,
+	}); err != nil {
+		t.Fatalf("create %s: %v", lib.DispatchStopStream, err)
+	}
 	if _, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: lib.SessionStateBucket}); err != nil {
 		t.Fatalf("create session-state: %v", err)
 	}
@@ -90,8 +108,8 @@ func provision(t *testing.T, url string) {
 // Not before the gateway's relay has bound its durable on the stream, though.
 // The rig starts Run on a goroutine, and Run binds the relay before it starts
 // the adapter that reads the inbox; a stream deleted ahead of that bind leaves
-// Run retrying "stream not found" for the whole bind window (lib's
-// subscribeBindWindow, 45s), so no turn is ever read and the test times out
+// Run waiting for the stream to exist again (the relay's WaitForStream), so
+// no turn is ever read and the test times out
 // waiting for a failure the gateway never got to have. Under a loaded
 // `go test ./...` the goroutine can lose that race.
 func deleteTasksStream(t *testing.T, url string) {
@@ -210,6 +228,12 @@ type fakeAdapter struct {
 	// answers errNoTerminalFrames, as a chat backend would.
 	takesTerminals bool
 	terminals      []fakeTerminal
+	// stopLines records every post and edit that carried OutMessage.Stop,
+	// a running task's live message; laidOut the messages whose current
+	// edit is a layout, so an edit back to text is recorded in chatEdits as
+	// nil, and a text edit of a text line is not.
+	stopLines []fakePost
+	laidOut   map[string]bool
 }
 
 type fakeTerminal struct {
@@ -267,7 +291,13 @@ func (a *fakeAdapter) PostMessage(conversation string, m OutMessage) (string, er
 		a.mu.Unlock()
 	}
 	if m.Chat == nil {
-		return a.Post(conversation, m.Text)
+		id, err := a.Post(conversation, m.Text)
+		if err == nil && m.Stop != "" {
+			a.mu.Lock()
+			a.stopLines = append(a.stopLines, fakePost{conversation, id, m.Text})
+			a.mu.Unlock()
+		}
+		return id, err
 	}
 	a.mu.Lock()
 	rendersChat, refuseChat := a.rendersChat, a.refuseChat
@@ -281,8 +311,25 @@ func (a *fakeAdapter) PostMessage(conversation string, m OutMessage) (string, er
 	id, err := a.Post(conversation, m.Text)
 	a.mu.Lock()
 	a.chatPosts = append(a.chatPosts, m.Chat)
+	a.setLaidOutLocked(id, true)
+	if m.Stop != "" {
+		a.stopLines = append(a.stopLines, fakePost{conversation, id, m.Text})
+	}
 	a.mu.Unlock()
 	return id, err
+}
+
+func (a *fakeAdapter) setLaidOutLocked(messageID string, laidOut bool) {
+	if a.laidOut == nil {
+		a.laidOut = map[string]bool{}
+	}
+	a.laidOut[messageID] = laidOut
+}
+
+func (a *fakeAdapter) stopLinesCopy() []fakePost {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]fakePost(nil), a.stopLines...)
 }
 
 func (a *fakeAdapter) EditMessage(conversation, messageID string, m OutMessage) error {
@@ -306,7 +353,13 @@ func (a *fakeAdapter) EditMessage(conversation, messageID string, m OutMessage) 
 		return err
 	}
 	a.mu.Lock()
-	a.chatEdits = append(a.chatEdits, m.Chat)
+	if m.Chat != nil || a.laidOut[messageID] {
+		a.chatEdits = append(a.chatEdits, m.Chat)
+	}
+	a.setLaidOutLocked(messageID, m.Chat != nil)
+	if m.Stop != "" {
+		a.stopLines = append(a.stopLines, fakePost{conversation, messageID, m.Text})
+	}
 	a.mu.Unlock()
 	return nil
 }
@@ -1483,6 +1536,13 @@ func restartRig(t *testing.T, r *rig, whileDown ...func()) (*rig, *fakeSpawner) 
 // by wrap, as startRigWithSpawnerAdapter chooses the first's.
 func restartRigWrapped(t *testing.T, r *rig, wrap func(*fakeAdapter) Adapter, whileDown ...func()) (*rig, *fakeSpawner) {
 	t.Helper()
+	return restartRigWith(t, r, wrap, RunOptions{}, whileDown...)
+}
+
+// restartRigWith is restartRigWrapped with the second gateway run under opts,
+// as an elected gateway runs (RunWith).
+func restartRigWith(t *testing.T, r *rig, wrap func(*fakeAdapter) Adapter, opts RunOptions, whileDown ...func()) (*rig, *fakeSpawner) {
+	t.Helper()
 	r.stop()
 	select {
 	case <-r.ran:
@@ -1515,7 +1575,7 @@ func restartRigWrapped(t *testing.T, r *rig, wrap func(*fakeAdapter) Adapter, wh
 		t.Fatalf("New: %v", err)
 	}
 	ran := make(chan struct{})
-	go func() { _ = g.Run(ctx); close(ran) }()
+	go func() { _ = g.RunWith(ctx, opts); close(ran) }()
 	return &rig{g: g, adapter: adapter, client: client, bus: r.bus, url: r.url, logs: logs, stop: cancel, ran: ran}, spawn
 }
 
@@ -2565,26 +2625,76 @@ func TestSessionWithTextOnARunningSessionSteers(t *testing.T) {
 // unmentioned thread reply only once a task has started there, so the ack
 // after a bare /session in a Slack channel must not promise that the next
 // message opens the pod - it asks for the mention. DMs and every other
-// backend keep the plain promise. A Slack DM is told to reply in the thread:
-// each top-level DM is a conversation of its own, so the binding holds only
-// there.
+// backend keep the plain promise. A threaded Slack DM is told to reply in the
+// thread: each top-level DM is a conversation of its own, so the binding
+// holds only there.
 func TestSessionOnAckTellsSlackChannelsToMention(t *testing.T) {
-	slackChannel := sessionOnAck("slack", "group", "platform")
+	slackChannel := sessionOnAck("slack", "group", true, "platform")
 	if !strings.Contains(slackChannel, "mention") || strings.Contains(slackChannel, "your next message opens") {
 		t.Fatalf("slack channel ack = %q", slackChannel)
 	}
-	slackDM := sessionOnAck("slack", "dm", "platform")
+	slackDM := sessionOnAck("slack", "dm", true, "platform")
 	if !strings.Contains(slackDM, "reply in this thread") || strings.Contains(slackDM, "mention") || strings.Contains(slackDM, "your next message opens") {
 		t.Fatalf("slack dm ack = %q", slackDM)
 	}
 	for _, c := range [][2]string{{"discord", "dm"}, {"discord", "group"}, {"gchat", "group"}, {"inject", "group"}} {
-		ack := sessionOnAck(c[0], c[1], "platform")
+		ack := sessionOnAck(c[0], c[1], false, "platform")
 		if !strings.Contains(ack, "your next message opens a session pod") || strings.Contains(ack, "mention") {
 			t.Fatalf("%s/%s ack = %q", c[0], c[1], ack)
 		}
 	}
-	if !strings.Contains(sessionOnAck("discord", "group", "platform"), "`platform`") {
+	if !strings.Contains(sessionOnAck("discord", "group", false, "platform"), "`platform`") {
 		t.Fatal("the ack does not name the default addressee")
+	}
+}
+
+// TestSessionOnAckTellsThreadedDMsToReplyInThread: a Google Chat DM roots
+// each top-level message in a conversation of its own, as a Slack DM does,
+// so a DM record keyed by its thread gets Slack's DM wording. A DM record
+// with no thread (a thread-less Google Chat key, a legacy Slack key) shares
+// its key with every later message, and a Discord DM has no threads: both
+// keep the generic wording.
+func TestSessionOnAckTellsThreadedDMsToReplyInThread(t *testing.T) {
+	ack := func(backend, key string) string {
+		return sessionOnAck(backend, sessionKindDM, conversationIsOwnThread(backend, key), "bridge")
+	}
+	want := ack(slackBackend, "slack:dm/D1/200.1")
+	if !strings.Contains(want, "reply in this thread") {
+		t.Fatalf("threaded Slack DM ack = %q, want the thread wording", want)
+	}
+	if got := ack(gchatBackend, "gchat:dm/spaces/D1/threads/T1"); got != want {
+		t.Fatalf("threaded gchat DM ack = %q, want Slack's DM wording %q", got, want)
+	}
+	generic := sessionOnAck(discordBackend, sessionKindGroup, false, "bridge")
+	for _, c := range [][2]string{{gchatBackend, "gchat:dm/spaces/D1"}, {slackBackend, "slack:dm/D1"}, {discordBackend, "discord:dm/1001"}} {
+		if got := ack(c[0], c[1]); got != generic {
+			t.Errorf("%s DM ack = %q, want the generic wording %q", c[1], got, generic)
+		}
+	}
+}
+
+// TestConversationIsOwnThreadReadsTheKeyShape: only a key that names a
+// thread is its own thread; a whole-space key, a thread-less DM key, a key
+// that does not parse and a backend without threads are not.
+func TestConversationIsOwnThreadReadsTheKeyShape(t *testing.T) {
+	for _, c := range []struct {
+		backend, key string
+		want         bool
+	}{
+		{gchatBackend, "gchat:dm/spaces/D1/threads/T1", true},
+		{gchatBackend, "gchat:spaces/S1/threads/T1", true},
+		{gchatBackend, "gchat:dm/spaces/D1", false},
+		{gchatBackend, "gchat:space/spaces/S1", false},
+		{gchatBackend, "not-a-key", false},
+		{slackBackend, "slack:dm/D1/200.1", true},
+		{slackBackend, "slack:C1/200.1", true},
+		{slackBackend, "slack:dm/D1", false},
+		{slackBackend, "not-a-key", false},
+		{discordBackend, "discord:g1/thread-s1", false},
+	} {
+		if got := conversationIsOwnThread(c.backend, c.key); got != c.want {
+			t.Errorf("conversationIsOwnThread(%s, %s) = %v, want %v", c.backend, c.key, got, c.want)
+		}
 	}
 }
 

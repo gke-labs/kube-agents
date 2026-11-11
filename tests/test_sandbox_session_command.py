@@ -34,6 +34,8 @@ _PROBE = (
     'echo "home=[$HERMES_HOME] kc=[$KUBECONFIG]'
     ' ws=[$HERMES_KANBAN_WORKSPACE] task=[$HERMES_KANBAN_TASK]"'
 )
+# The scheduled run's key beside the card's, for SessionCommandCronRunTest.
+_CRON_PROBE = 'echo "task=[$HERMES_KANBAN_TASK] cron=[$HERMES_CRON_RUN]"'
 
 # A shared-root scratch workspace, the shape the dispatcher gives every card on
 # the default board and the one the cwd derivation cannot place.
@@ -53,7 +55,7 @@ def _wire(cwd: str, command: str) -> str:
     return f"bash -c {shlex.quote(script)}"
 
 
-class SessionCommandProfileHomeTest(unittest.TestCase):
+class _SessionCommandCase(unittest.TestCase):
     def setUp(self) -> None:
         self.root = pathlib.Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
@@ -85,6 +87,8 @@ class SessionCommandProfileHomeTest(unittest.TestCase):
             timeout=60,
         )
 
+
+class SessionCommandProfileHomeTest(_SessionCommandCase):
     def test_the_clients_name_beats_a_shared_root_workspace(self) -> None:
         """The gap the forwarded name closes: a card's workspace is under no
         profile home, and the name under a different agent-pod root is rebased
@@ -215,6 +219,65 @@ class SessionCommandProfileHomeTest(unittest.TestCase):
             proc.stdout.strip(),
             f"home=[{self.mirrored}] kc=[{self.mirrored}/kubeconfig.yaml]",
         )
+
+    def test_default_kubeconfig_exported_for_root_and_platform_only(self) -> None:
+        """When .kubeconfig exists at the data root, the root and platform
+        profiles export it as KUBECONFIG, while a cluster profile without a
+        pinned kubeconfig.yaml keeps KUBECONFIG unset."""
+        default_kc = self.root / ".kubeconfig"
+        default_kc.write_text("kubeconfig\n")
+        unpinned_cluster = self.profiles / "cluster-unpinned"
+        unpinned_cluster.mkdir()
+
+        root_proc = self._run(str(self.workspace))
+        self.assertIn(f"home=[{self.root}] kc=[{default_kc}]", root_proc.stdout)
+
+        platform_proc = self._run(str(self.workspace), named=f"{self.root}/profiles/platform")
+        self.assertIn(
+            f"home=[{self.profiles / 'platform'}] kc=[{default_kc}]",
+            platform_proc.stdout,
+        )
+
+        cluster_proc = self._run(
+            str(self.workspace), named=f"{self.root}/profiles/cluster-unpinned"
+        )
+        self.assertIn(f"home=[{unpinned_cluster}] kc=[]", cluster_proc.stdout)
+
+
+class SessionCommandCronRunTest(_SessionCommandCase):
+    """A scheduled run's commands carry its key: the run directory the cron
+    workdir patch minted, which is the cwd they cd into, becomes HERMES_CRON_RUN
+    for the credential-proxy shim to send as the request's sessionId."""
+
+    def _probe(self, cwd: str) -> str:
+        proc = self._run(cwd, command=_CRON_PROBE)
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        return proc.stdout
+
+    def test_a_cron_run_directory_exports_its_name(self) -> None:
+        run_dir = self.profiles / "platform" / "cron" / "runs" / "job_7c1e2a_e6b9f0d1"
+        out = self._probe(str(run_dir))
+        self.assertIn("cron=[job_7c1e2a_e6b9f0d1]", out)
+        self.assertIn("task=[]", out)
+
+    def test_a_subdirectory_still_reports_the_run(self) -> None:
+        run_dir = self.root / "cron" / "runs" / "job_7c1e2a_e6b9f0d1" / "scratch" / "deeper"
+        self.assertIn("cron=[job_7c1e2a_e6b9f0d1]", self._probe(str(run_dir)))
+
+    def test_a_name_outside_the_shims_grammar_is_not_exported(self) -> None:
+        for name in ("a b", "x" * 65, "run:1"):
+            with self.subTest(name=name):
+                run_dir = self.root / "cron" / "runs" / name
+                self.assertIn("cron=[]", self._probe(str(run_dir)))
+
+    def test_a_card_workspace_and_a_plain_directory_export_none(self) -> None:
+        out = self._probe(str(self.workspace))
+        self.assertIn("cron=[]", out)
+        self.assertIn("task=[%s]" % _TASK_ID, out)
+        self.assertIn("cron=[]", self._probe(str(self.root / "scratch")))
+        # `cron/runs` has to be two whole path components, not a suffix of one.
+        self.assertIn("cron=[]", self._probe(str(self.root / "mycron" / "runs" / "x")))
+        self.assertIn("cron=[]", self._probe(str(self.root / "cron" / "runs")))
 
 
 if __name__ == "__main__":

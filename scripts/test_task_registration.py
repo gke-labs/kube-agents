@@ -98,6 +98,7 @@ class TestEveryTaskIsRegistered(unittest.TestCase):
         homes = {
             "presubmit-cases.txt": set(eval_rosters.presubmit_cases()),
             "nightly-cases.txt": set(eval_rosters.nightly_cases()),
+            "certification-cases.txt": set(eval_rosters.certification_cases()),
             "FIXTURE_NOT_READY": set(validator.FIXTURE_NOT_READY),
             "KNOWN_UNREGISTERED": set(validator.KNOWN_UNREGISTERED),
         }
@@ -436,6 +437,31 @@ class TestTheValidatorItself(unittest.TestCase):
         self.assertEqual(len(problems), 1, problems)
         self.assertIn("can only pass", problems[0])
 
+    def test_a_finding_scope_without_its_check_is_rejected(self):
+        """The verifier's model refuses the pair after the cluster lease; this
+        rule refuses it here."""
+        for node, phrase in (
+            ({"scope": "finding", "required_phrases": ["x"]}, "names no 'finding_check'"),
+            ({"scope": "finding", "finding_check": [" "], "required_phrases": ["x"]}, "names no 'finding_check'"),
+            ({"scope": "finding", "finding_check": 123, "required_phrases": ["x"]}, "names no 'finding_check'"),
+            ({"scope": "finding", "finding_check": [123], "required_phrases": ["x"]}, "names no 'finding_check'"),
+            ({"finding_check": "no-pdb", "required_phrases": ["x"]}, "read only under scope 'finding'"),
+            ({"finding_check": "", "required_phrases": ["x"]}, "read only under scope 'finding'"),
+            ({"scope": "finding_ids", "finding_check": [], "any_of_phrases": ["x"]}, "read only under scope 'finding'"),
+        ):
+            problems = []
+            validator._check_assertions({"type": "ledger_issue_contains", **node}, "check 'x'", problems)
+            self.assertEqual(len(problems), 1, problems)
+            self.assertIn(phrase, problems[0])
+        for node in (
+            {"scope": "finding", "finding_check": "no-pdb", "required_phrases": ["x"]},
+            {"scope": "finding", "finding_check": ["a", "b"], "required_phrases": ["x"]},
+            {"scope": "finding_ids", "any_of_phrases": ["x"]},
+        ):
+            problems = []
+            validator._check_assertions({"type": "ledger_issue_contains", **node}, "check 'x'", problems)
+            self.assertEqual(problems, [])
+
     def test_a_quoted_boolean_against_a_boolean_field_is_rejected(self):
         """The verifier compares `value` raw and the API holds a bool, so a
         quoted boolean never compares equal and the check asserts nothing; the
@@ -604,13 +630,15 @@ class TestTheRulesReject(unittest.TestCase):
         ],
     }
 
-    def _validate(self, *, registered=frozenset({"made-up-case"}), text=None, **overrides):
+    def _validate(self, *, registered=frozenset({"made-up-case"}), certification=None, text=None, **overrides):
         spec = {k: v for k, v in {**self.VALID, **overrides}.items() if v is not DELETE}
         with tempfile.TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp) / "made-up-case" / "task.yaml"
             path.parent.mkdir()
             path.write_text(text if text is not None else yaml.safe_dump(spec))
-            return validator.validate_case("made-up-case", path, registered=set(registered))
+            return validator.validate_case(
+                "made-up-case", path, registered=set(registered), certification=None if certification is None else set(certification)
+            )
 
     def _only(self, needle, **kwargs):
         """The one problem this mutation causes, and nothing else."""
@@ -625,6 +653,27 @@ class TestTheRulesReject(unittest.TestCase):
 
     def test_the_valid_case_passes(self):
         self.assertEqual(self._validate(), [])
+
+    # -- the certification suite: the roster and the suite line agree --
+
+    def test_a_certification_case_with_its_line_in_the_roster_passes(self):
+        self.assertEqual(self._validate(suite="certification", certification={"made-up-case"}), [])
+
+    def test_a_rostered_certification_case_without_the_line_is_reported(self):
+        self._only("is in hack/eval/certification-cases.txt but declares no 'suite: certification'", certification={"made-up-case"})
+
+    def test_a_suite_line_outside_the_roster_is_reported_once(self):
+        # Registered nowhere at all: the suite finding names the right file,
+        # and the general registration finding (which would say
+        # nightly-cases.txt) stays quiet.
+        self._only("is not in hack/eval/certification-cases.txt", suite="certification", certification=set(), registered=set())
+
+    def test_a_parked_certification_case_may_carry_its_suite_line(self):
+        with unittest.mock.patch.dict(validator.FIXTURE_NOT_READY, {"made-up-case": "waits on #1"}, clear=False):
+            self.assertEqual(self._validate(suite="certification", certification=set(), registered=set()), [])
+
+    def test_an_unknown_suite_is_reported(self):
+        self._only("the only suite is 'certification'", suite="nightly")
 
     # -- the first-install-hello stack's phrase --
 
@@ -786,6 +835,14 @@ class TestTheRulesReject(unittest.TestCase):
     def test_a_declared_scope_exclusion_passes(self):
         self.assertEqual(self._validate(scope_exclude={"slots": ["b", "d"]}), [])
 
+    def test_a_scope_exclusion_with_absent_clusters_passes(self):
+        self.assertEqual(self._validate(scope_exclude={"slots": ["b", "d"], "absent": 1}), [])
+
+    def test_an_absent_count_out_of_range_is_rejected(self):
+        for absent in (0, -1, 9, True, "1"):
+            with self.subTest(absent=absent):
+                self._only("must be {slots:", scope_exclude={"slots": ["b"], "absent": absent})
+
     def test_a_slot_the_catalogue_does_not_declare_is_rejected(self):
         self._only("does not declare", scope_exclude={"slots": ["b", "z"]})
 
@@ -818,6 +875,51 @@ class TestTheRulesReject(unittest.TestCase):
         for value in (1, 0, ["true"]):
             with self.subTest(value=value):
                 self._only("is not a YAML boolean", expected_fail=value)
+
+    def test_a_requested_pull_requests_key_above_the_cases_own_leaves_passes(self):
+        spec = self._entry(check={"type": "pull_request_opened"})
+        self.assertEqual(self._validate(verification_spec=spec, requested_pull_requests=2), [])
+
+    def test_a_requested_pull_requests_key_the_cases_own_leaves_already_reach_is_rejected(self):
+        spec = self._entry(check={"type": "pull_request_opened"})
+        self._only("is not above the 1", verification_spec=spec, requested_pull_requests=1)
+
+    def test_a_requested_pull_requests_key_that_is_not_a_count_is_rejected(self):
+        for value in (True, "2", -1, 1.5):
+            with self.subTest(value=value):
+                self._only("is not a bare non-negative decimal", requested_pull_requests=value)
+
+    def test_a_requested_pull_requests_key_in_a_non_decimal_spelling_is_rejected(self):
+        # YAML reads `0x2` as 2 and `2#c` as the string '2#c'; the roster
+        # script's text read sees neither as the count, and the validator says
+        # so rather than crashing on the string.
+        text = yaml.safe_dump({**self.VALID, "verification_spec": self._entry(check={"type": "pull_request_opened"})})
+        for line in ("requested_pull_requests: 0x2\n", "requested_pull_requests: 2#c\n", "requested_pull_requests: +2\n"):
+            with self.subTest(line=line.strip()):
+                self._only("is not a bare non-negative decimal", text=text + line)
+
+    def test_a_draft_not_named_task_yaml_is_read_from_the_path_it_was_given(self):
+        # `validate_paths` accepts a scratch draft outside the tree; the key check
+        # reads that file, never a task.yaml rebuilt from the draft's name.
+        spec = {**self.VALID, "id": "draft", "verification_spec": self._entry(check={"type": "pull_request_opened"})}
+        with tempfile.TemporaryDirectory() as tmp:
+            draft = pathlib.Path(tmp) / "draft.yaml"
+            draft.write_text(yaml.safe_dump(spec))
+            self.assertEqual(validator.validate_case("draft", draft, registered={"draft"}), [])
+            draft.write_text(yaml.safe_dump({**spec, "requested_pull_requests": 2}))
+            self.assertEqual(validator.validate_case("draft", draft, registered={"draft"}), [])
+            draft.write_text(yaml.safe_dump({**spec, "requested_pull_requests": 1}))
+            problems = validator.validate_case("draft", draft, registered={"draft"})
+            self.assertEqual(len(problems), 1, problems)
+            self.assertIn("is not above the 1", problems[0])
+
+    def test_a_key_line_inside_a_quoted_scalar_is_rejected(self):
+        # A continuation line of a multi-line quoted prompt can start at column
+        # 0; YAML folds it into the string, but a text read takes it for the key.
+        spec = {**self.VALID, "verification_spec": self._entry(check={"type": "pull_request_opened"})}
+        spec.pop("prompt", None)
+        text = yaml.safe_dump(spec) + 'prompt: "first line\nrequested_pull_requests: 5\nlast line"\n'
+        self._only("sits inside another value", text=text)
 
     def test_a_bare_boolean_expected_fail_passes(self):
         for value in (True, False):
@@ -947,6 +1049,45 @@ class TestTheRulesReject(unittest.TestCase):
             verification_spec=self._entry(check={"type": "report_contains", "required_phrases": ["x"], "fixture_roles": ["orphan-disks"]}),
         )
         self.assertIn("'fixture_roles:' names 'orphan-disks'", problem)
+
+    def test_a_project_scoped_role_is_rejected_in_fixture_role(self):
+        # startup-fail-vm has cluster_slot null: the runner writes no
+        # kubeconfig for it, so a check cannot read its objects.
+        problem = self._only(
+            "a project-scoped role",
+            fixtures=["startup-fail-vm"],
+            verification_spec=self._entry(check={
+                "type": "fleet_resource_property", "fixture_role": "startup-fail-vm", "kind": "deployment",
+                "resource_name": "x", "path": "spec.replicas", "op": "eq", "value": 1,
+            }),
+        )
+        self.assertIn("'fixture_role:' names 'startup-fail-vm'", problem)
+
+    def test_a_project_scoped_role_is_rejected_in_fixture_roles(self):
+        problem = self._only(
+            "has no cluster slot in the fleet catalogue",
+            fixtures=["startup-fail-vm"],
+            verification_spec=self._entry(check={"type": "report_contains", "required_phrases": ["x"], "fixture_roles": ["startup-fail-vm"]}),
+        )
+        self.assertIn("'fixture_roles:' names 'startup-fail-vm'", problem)
+
+    def test_a_project_scoped_role_is_accepted_in_fixtures(self):
+        self.assertEqual(self._validate(fixtures=["startup-fail-vm"]), [])
+
+    def test_a_project_scoped_catalogue_role_the_overlay_omits_is_a_disagreement(self):
+        roles = {**validator._catalog_roles(), "made-up-vm": {"cluster_slot": None, "probes": ["instance/made-up-*"]}}
+        with unittest.mock.patch.object(validator, "_catalog_roles", return_value=roles):
+            problems = validator.fixture_catalog_disagreements()
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("'made-up-vm' is project-scoped", problems[0])
+
+    def test_a_catalogue_role_that_is_not_a_mapping_is_rejected_not_project_scoped(self):
+        roles = {**validator._catalog_roles(), "made-up-broken": "cluster_slot: a"}
+        with unittest.mock.patch.object(validator, "_catalog_roles", return_value=roles):
+            self.assertNotIn("made-up-broken", validator._catalog_project_roles())
+            problems = validator.fixture_catalog_disagreements()
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("'made-up-broken' is not a mapping", problems[0])
 
     def test_a_scalar_fixture_roles_is_rejected_as_a_shape_not_as_letters(self):
         problem = self._only(

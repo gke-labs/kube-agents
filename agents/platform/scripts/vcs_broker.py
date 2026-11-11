@@ -37,8 +37,7 @@ turns them into behaviour.
 
 The routes are stateless to their callers. There is no handle, no answer depends
 on an earlier request, and two concurrent requests share nothing but the lock the
-HTTP layer holds and the proposal-outcome counts' own, which guards two metrics and
-never an answer.
+HTTP layer holds.
 
 This file names no forge, and a test enforces that. Everything a forge decides
 is behind `providers`; everything here is true whatever forge the URL named.
@@ -68,8 +67,8 @@ import os
 import re
 import subprocess
 import threading
-import datetime
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -92,14 +91,14 @@ from providers import (
     validate_revision,
 )
 from providers.credentials import CREDENTIAL_HELPER_KEY
+from providers.errors import UNAVAILABLE, UNRECOGNISED
 from workspace_paths import WorkspaceError, validate_path
 
 LOGGER = logging.getLogger("credential-proxy.vcs")
 #: The key in a forge's credentials Secret that holds its read-only token.
 FORGE_READ_TOKEN_KEY = "read-token"
 
-# The same shape of ceiling `content_workspace` applies, for the same reason:
-# the broker's scratch volume is an emptyDir sized for manifests, and a
+# A ceiling on one clone: the broker's scratch volume is an emptyDir sized for manifests, and a
 # repository that does not fit should say so rather than fill the disk out from
 # under everything else.
 DEFAULT_MAX_CLONE_BYTES = 256 << 20  # 256 MiB
@@ -146,17 +145,30 @@ LS_REMOTE_NO_MATCH_EXIT_CODE = 2
 # another tool's, whatever its history says.
 AGENT_BRANCH_PREFIX = "platform-agent/"
 # The neutral proposal state a forge reports once a proposal has merged
-# (`providers/*/translate.py` maps every forge's spelling to it), and the
-# spelling of UTC `datetime.fromisoformat` did not accept before Python 3.11.
+# (`providers/*/translate.py` maps every forge's spelling to it).
 MERGED_PROPOSAL_STATE = "merged"
 # The neutral state for a proposal closed without a merge, the same adapters'
-# spelling; the broker counts it apart from a merge.
+# spelling.
 CLOSED_PROPOSAL_STATE = "closed"
-# A forge answer below this status is the forge's own refusal (401, 403, 404,
-# 409, 422, 429: providers/errors.py keeps those as they are), so the write was
-# not applied; at or above it the answer was lost or unreadable and the write
-# may have been (502, 503 there), which is what the own-close mark is for.
-FORGE_REFUSAL_STATUS_CEILING = 500
+
+# The neutral state of a proposal still open, the same adapters' spelling.
+OPEN_PROPOSAL_STATE = "open"
+
+# `proposal-claim`'s forge check: the proposal the claim names must have been
+# created at most CLAIM_WINDOW_SECONDS ago, the life of the claim token the
+# HTTP layer minted with the `proposal-create` answer, and at most
+# CLAIM_CLOCK_SKEW_SECONDS in the future, the room the forge's clock gets. The
+# title it answers is cut at CLAIM_TITLE_MAX characters.
+CLAIM_WINDOW_SECONDS = 900
+CLAIM_CLOCK_SKEW_SECONDS = 60
+CLAIM_TITLE_MAX = 300
+# The forge failures `proposal-claim` asks again once: the two refusals the
+# provider layer reads as the forge's own trouble (`providers/errors.py`), the
+# set the agent side's `forge.TRANSIENT_CODES` retries reads on. The claim
+# token is spent before the check, so without this one 502 loses the claim.
+CLAIM_TRANSIENT_CODES = frozenset({UNAVAILABLE.code, UNRECOGNISED.code})
+# A forge's timestamp spells UTC as `Z`, which `fromisoformat` reads as an
+# offset only from Python 3.11.
 ISO_UTC_SUFFIX = "Z"
 ISO_UTC_OFFSET = "+00:00"
 
@@ -226,7 +238,8 @@ SNAPSHOT_LISTING_FORMAT = "--format=%(objectmode) %(objectsize) %(path)"
 # target, which goes in the tar header and not after it, and a tree or a
 # submodule is a directory entry whose name ends in `/`.
 GIT_MODE_SYMLINK = "120000"
-GIT_MODES_DIRECTORY = frozenset({"040000", "160000"})
+GIT_MODE_TREE = "040000"
+GIT_MODES_DIRECTORY = frozenset({GIT_MODE_TREE, "160000"})
 # The tar `git archive` writes, as the measure counts it: one 512-byte header
 # for each entry and the data padded to 512; a pax header (a header block and
 # its padded record) for a name or a link target longer than the 100 bytes the
@@ -239,6 +252,19 @@ TAR_PAX_RECORD_OVERHEAD_BYTES = 32
 TAR_GLOBAL_HEADER_BYTES = 2 * TAR_BLOCK_BYTES
 TAR_END_BYTES = 2 * TAR_BLOCK_BYTES
 TAR_RECORD_BYTES = 20 * TAR_BLOCK_BYTES
+# A tree over the snapshot ceiling is refused with its entries one level
+# below what was asked (the top level, or each of `paths`), each with what its
+# own tar would measure, so a caller can ask again for parts that fit. Past
+# this many entries the refusal carries none: a reply of that size is a cost
+# of its own, and a caller cannot ask for that many parts anyway.
+MAX_SNAPSHOT_ENTRIES = 4096
+SNAPSHOT_ENTRY_TREE = "tree"
+SNAPSHOT_ENTRY_BLOB = "blob"
+# Each entry also counts the files under it a manifest reader reads, so a
+# caller can leave out a part of vendored archives or images without asking
+# for it. A link with such a name counts too, so the caller still sees it (and
+# can say it skipped it); a tree or a submodule does not.
+SNAPSHOT_MANIFEST_SUFFIXES = (".yaml", ".yml", ".json")
 
 # What git prints when the remote answered the delete and said no for good: a
 # hook, branch rule or ruleset (`[remote rejected] <ref> (... declined)`), a
@@ -280,6 +306,17 @@ def max_bundle_bytes() -> int:
     return _positive_int("CREDENTIAL_PROXY_MAX_BUNDLE_BYTES", DEFAULT_MAX_BUNDLE_BYTES)
 
 
+# How `VcsBroker._scratch` names a directory, and the one grammar that reads
+# it back: the kind is a word, then this process's pid, then its counter.
+SCRATCH_NAME_FORMAT = "{kind}-{pid}-{sequence}"
+SCRATCH_NAME_RE = re.compile(r"^(?P<kind>[a-z]+)-(?P<pid>\d+)-(?P<sequence>\d+)$")
+# The bundle a clone writes or a publish reads lives inside the verb's scratch
+# tree, named after it, so the tree's removal, at the verb's end, at start or
+# by the reclaimer, takes the bundle with it; a sibling under the root would
+# outlive a broker killed mid-verb, and nothing lists siblings.
+SCRATCH_BUNDLE_SUFFIX = ".bundle"
+
+
 def _remove_tree(path: Path) -> None:
     for entry in sorted(path.rglob("*"), key=lambda p: len(p.parts), reverse=True):
         try:
@@ -317,20 +354,65 @@ def _base_branch_missing(repo: str, base: str) -> WorkspaceError:
     )
 
 
-def _iso_timestamp(value: Any) -> float | None:
-    """An ISO-8601 instant as seconds since the epoch, or None for anything else."""
-    if not isinstance(value, str) or not value:
+#: What git prints when the server refused the credential it presented. With
+#: prompts off it asks for a username; older paths name the status.
+_GIT_CREDENTIAL_REFUSED = (
+    "could not read Username for 'https://",
+    "returned error: 401",
+    "Authentication failed",
+)
+
+
+def _git_refused_credential(stderr: Any) -> bool:
+    """Whether a failed git call's output says the server refused the credential."""
+    text = stderr.decode("utf-8", "replace") if isinstance(stderr, bytes) else str(stderr or "")
+    return any(marker in text for marker in _GIT_CREDENTIAL_REFUSED)
+
+
+def _git_refusal(forge: Forge, repo: str, stderr: Any, verb: str) -> WorkspaceError | None:
+    """The forge's own answer to a git call that its server refused, or None.
+
+    For a forge whose git refusal means more than "the token is not valid"
+    (`git_refused`). Only the forge's own text goes back: git's output can
+    carry the remote URL, so none of it does. Every other forge, and every
+    other failure, keeps the caller's own handling. git asks for a username
+    when the helper has no token too -- a Secret that is not there yet, or an
+    empty file -- so the credential is read first, and that case is
+    FORGE_CREDENTIAL_UNAVAILABLE, not the forge's refusal.
+    """
+    # Read as an optional member: a caller may hand in any object with the
+    # forge's shape, and one without the member has no text of its own.
+    text = getattr(forge, "git_refused", "")
+    if not text or not _git_refused_credential(stderr):
         return None
-    text = value.strip()
-    if text.endswith(ISO_UTC_SUFFIX):
-        text = text[: -len(ISO_UTC_SUFFIX)] + ISO_UTC_OFFSET
+    forge.credential.headers(repo)
+    LOGGER.warning("git refused the %s credential for a %s call", forge.name, verb)
+    return WorkspaceError(text, status=401, code="FORGE_UNAUTHENTICATED")
+
+
+def _once_more_if_transient(what: str, call: Callable[[], Any]) -> Any:
+    """`call()`, asked once more when the forge's failure is in CLAIM_TRANSIENT_CODES.
+
+    A second failure, or any other refusal, is raised as the forge gave it.
+    """
     try:
-        parsed = datetime.datetime.fromisoformat(text)
+        return call()
+    except WorkspaceError as error:
+        if error.fields.get("code") not in CLAIM_TRANSIENT_CODES:
+            raise
+        LOGGER.warning("proposal-claim: %s failed with %s; retrying once", what, error.fields.get("code"))
+    return call()
+
+
+def _age_seconds(created: Any, now: datetime) -> float | None:
+    """Seconds since a forge's `created` timestamp, or None when it cannot be read."""
+    try:
+        when = datetime.fromisoformat(str(created).replace(ISO_UTC_SUFFIX, ISO_UTC_OFFSET))
     except ValueError:
         return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
-    return parsed.timestamp()
+    if when.tzinfo is None:
+        return None
+    return (now - when).total_seconds()
 
 
 def _login_key(login: str) -> str:
@@ -388,6 +470,64 @@ def _tar_bytes(listing: str) -> int:
     return _padded(total + TAR_END_BYTES, TAR_RECORD_BYTES)
 
 
+def _snapshot_entries(listing: str, paths: list[str]) -> list[dict[str, Any]] | None:
+    """The entries one level below what a snapshot asked for, each with its own measure.
+
+    ``listing`` is the one `_measure_snapshot` read. With no ``paths`` the
+    entries are the top level of the tree; with ``paths``, the children of
+    each asked directory, and an asked file as itself. Each entry is a `tree`
+    or a `blob` (a link or a submodule counts as a blob: there is nothing
+    under it to ask for) with ``manifests``, its count of files and links named
+    `*.yaml`, `*.yml` or `*.json`, and ``bytes``: what `_tar_bytes` measures for a
+    snapshot of that entry alone, its parent directories included, as `ls-tree`
+    lists them and `archive` writes them. So a snapshot of the entry is refused
+    exactly when ``bytes`` is over the ceiling. None past `MAX_SNAPSHOT_ENTRIES`.
+    """
+    entries = [entry for entry in listing.split("\0") if entry]
+    directories = {
+        path: entry
+        for entry in entries
+        for mode, _size, path in [entry.split(" ", 2)]
+        if mode == GIT_MODE_TREE
+    }
+    grouped: dict[str, list[str]] = {}
+    trees: set[str] = set()
+    manifests: dict[str, int] = {}
+    for entry in entries:
+        mode, _size, path = entry.split(" ", 2)
+        scope = next((asked for asked in paths if path == asked or path.startswith(asked + "/")), None)
+        if scope is None and paths:
+            continue  # a parent directory of an asked path
+        if path == scope:
+            if mode == GIT_MODE_TREE:
+                continue
+            child = path
+        else:
+            rest = path[len(scope) + 1:] if scope else path
+            head, _, below = rest.partition("/")
+            child = f"{scope}/{head}" if scope else head
+            if below or mode == GIT_MODE_TREE:
+                trees.add(child)
+        grouped.setdefault(child, []).append(entry)
+        manifests[child] = manifests.get(child, 0) + (
+            mode not in GIT_MODES_DIRECTORY and path.lower().endswith(SNAPSHOT_MANIFEST_SUFFIXES)
+        )
+        if len(grouped) > MAX_SNAPSHOT_ENTRIES:
+            return None
+    answer = []
+    for child, own in sorted(grouped.items()):
+        parts = child.split("/")
+        parents = [directories["/".join(parts[:depth])] for depth in range(1, len(parts))
+                   if "/".join(parts[:depth]) in directories]
+        answer.append({
+            "path": child,
+            "type": SNAPSHOT_ENTRY_TREE if child in trees else SNAPSHOT_ENTRY_BLOB,
+            "manifests": manifests[child],
+            "bytes": _tar_bytes("\0".join(parents + own)),
+        })
+    return answer
+
+
 def holds_stored_token(forge: Forge) -> bool:
     """Whether ``forge`` presents a stored token rather than a minted one.
 
@@ -443,10 +583,38 @@ def _tree_bytes(root: Path, stop_past: int) -> int:
     return total
 
 
+def _snapshot_max_bytes(raw: Any) -> int | None:
+    """`maxBytes` of a snapshot request: the bytes the caller unpacks at most, or None.
+
+    A caller that unpacks under a bound of its own sends it, so that a tree
+    whose files pass that bound is refused here, with the entries a caller can
+    ask for one by one, rather than served and then refused by the caller with
+    none. It is compared with the files' own bytes, as the caller counts them,
+    not with the tar's measure, which the install's ceiling bounds.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        raise WorkspaceError("maxBytes must be a whole number of bytes, 0 or more")
+    return raw
+
+
+def _unpacked_bytes(listing: str) -> int:
+    """The bytes the regular files in ``listing`` unpack to: a symbolic link or a directory has none."""
+    total = 0
+    for entry in listing.split("\0"):
+        if not entry:
+            continue
+        mode, size, _ = entry.split(" ", 2)
+        if mode != GIT_MODE_SYMLINK and mode not in GIT_MODES_DIRECTORY:
+            total += int(size)
+    return total
+
+
 def _snapshot_paths(raw: Any) -> list[str]:
     """`paths` of a snapshot request: literal repository-relative names, or none.
 
-    Each is checked as the content routes check a name (`validate_path`):
+    Each is checked with `validate_path`:
     no absolute path, no `.` or `..` segment, no `.git` segment, no control
     character.
     """
@@ -556,9 +724,7 @@ class VcsBroker:
     `scratch_root` is on the broker's own volume. Nothing under it outlives a
     request, which is what makes these routes stateless to their callers: there
     is no handle to leak, no tree to collide with another caller's, and no
-    cleanup an interrupted client can skip. What the process keeps across
-    requests is the proposal-outcome counts' seen sets and the identity cache
-    beside it (`_count_outcomes`), which no answer depends on.
+    cleanup an interrupted client can skip.
     """
 
     def __init__(
@@ -574,9 +740,6 @@ class VcsBroker:
         request_deadline: Callable[[], float | None] | None = None,
         pinned_bases: Mapping[tuple[str, str], str] | None = None,
         tls_refusal: Callable[[str], WorkspaceError | None] | None = None,
-        merge_observer: Callable[[int], None] | None = None,
-        close_observer: Callable[[int], None] | None = None,
-        started_at: float | None = None,
         mint_write: Callable[[str, str], str] | None = None,
         drop_write: Callable[[str], None] | None = None,
         mint: Callable[[str, str], str] | None = None,
@@ -600,24 +763,8 @@ class VcsBroker:
         # raising it. The broker hands its own, which names a forge's CA
         # Secret; without one, the shared reading names the cause alone.
         self._tls_refusal = tls_refusal or tls_refusal_default
-        # The proposal-outcome counts (`_count_outcomes`): each observer is
-        # called with how many proposals of this install's own a read just
-        # showed in its outcome, merged or closed without a merge, for the
-        # first time in this process. None counts nothing. `started_at` is the
-        # process start the counts are bounded by, so a restart counts no
-        # outcome the previous process could have counted.
-        self.merge_observer = merge_observer
-        self.close_observer = close_observer
-        self.started_at = time.time() if started_at is None else started_at
-        self._merged_seen: set[tuple[str, str, Any]] = set()
-        self._closed_seen: set[tuple[str, str, Any]] = set()
-        self._merged_lock = threading.Lock()
-        # The credential's login per (forge, repository), asked once per process
-        # and only when a merge could count: the lookup is a forge call. A
-        # lookup that raised is not remembered, so an outage is asked again.
-        self._merged_viewer: dict[tuple[str, str], str] = {}
-        self._merged_nameless_logged = False
         self.scratch_root.mkdir(parents=True, exist_ok=True)
+        self._sweep_scratch()
         self._git_runner = git_runner
         self.base_branch = (base_branch or "").strip()
         # (forge host, path) -> the base every proposal onto that repository
@@ -662,6 +809,9 @@ class VcsBroker:
         # no property gained.
         self._sequence = 0
         self._sequence_lock = threading.Lock()
+        # The scratch directories requests of this process hold right now.
+        self._live: set[Path] = set()
+        self._live_lock = threading.Lock()
 
     # ---- plumbing ------------------------------------------------------
 
@@ -698,6 +848,7 @@ class VcsBroker:
                 ca_file=forge.ca_file,
                 ca_source=forge.ca_source,
                 allow_http=(forge.scheme == "http"),
+                quota_from_headers=getattr(forge, "quota_from_headers", None),
             )
         raise ForgeUnsupported(
             f"{forge.name} declares the {forge.transport!r} transport, which "
@@ -723,9 +874,24 @@ class VcsBroker:
         # Read per invocation, not at bind time: a minted credential holds no
         # token until the verb's `ensure` has run, and a token minted later
         # than the bind is the one git must present.
-        return self._git_with(
+        runner = self._git_with(
             lambda: tuple(forge.credential.git_config(repo)), forge.scheme == "http"
         )
+
+        def run(cwd: Path, *args: str, check: bool = True, stop: Callable[[], bool] | None = None):
+            try:
+                return runner(cwd, *args, check=check, stop=stop)
+            except subprocess.CalledProcessError as exc:
+                # A forge whose git refusal means more than "the token is not
+                # valid" says what it means. Only the forge's own text goes
+                # back: git's output can carry the remote URL, so none of it
+                # does. Every other forge keeps the generic git failure.
+                refusal = _git_refusal(forge, repo, exc.stderr, args[0] if args else "git")
+                if refusal is not None:
+                    raise refusal from exc
+                raise
+
+        return run
 
     def _git_with(
         self, config: Callable[[], tuple[tuple[str, str], ...]], allow_http: bool
@@ -742,18 +908,83 @@ class VcsBroker:
 
         return run
 
+    def _scratch_names(self) -> list[Path]:
+        """The scratch directories under the root, by the name `_scratch`
+        mints; nothing else under it is this broker's to remove."""
+        try:
+            entries = list(self.scratch_root.iterdir())
+        except OSError:
+            return []
+        return [
+            entry
+            for entry in entries
+            if SCRATCH_NAME_RE.match(entry.name) and entry.is_dir() and not entry.is_symlink()
+        ]
+
+    def _sweep_scratch(self) -> None:
+        """Remove every scratch tree under the root at construction. Nothing
+        under it outlives a request, so whatever is there was left by a
+        process that died mid-request; the emptyDir outlives the container,
+        and a restarted container's broker gets the dead one's pid, so the
+        name cannot tell its own trees from the dead one's, and at start it
+        has none."""
+        found = self._scratch_names()
+        for path in found:
+            _remove_tree(path)
+        if found:
+            LOGGER.info("version control start: removed %d orphaned scratch tree(s)", len(found))
+
+    def reclaim_orphan_scratch(self) -> int:
+        """Remove the scratch trees no request of this process holds: a
+        reclaimer for the broker's resource watermark gate. After the start
+        sweep only this process's names exist, so this finds a tree only
+        when a request of this process left one behind without reaching its
+        cleanup. The live set alone decides: `_scratch` records a directory
+        as in flight before it creates it, so a tree minted while this walks
+        the root is already in the set, where a snapshot of the sequence
+        counter taken before the listing would call it an orphan. Returns how
+        many this call removed: a tree whose request finished between the
+        listing and its turn is gone already, by that request's own cleanup,
+        and is not relief."""
+        removed = 0
+        for path in self._scratch_names():
+            # Not in flight and gone: the request's cleanup took it (the tree
+            # goes before the path leaves the live set), not this walk.
+            if self._in_flight(path) or not path.exists():
+                continue
+            _remove_tree(path)
+            removed += not path.exists()
+        return removed
+
+    def _in_flight(self, path: Path) -> bool:
+        with self._live_lock:
+            return path in self._live
+
+    def _discard_scratch(self, path: Path) -> None:
+        """A request's end: the tree goes, then the directory is no longer in
+        flight. In that order, so `reclaim_orphan_scratch` on the sampler
+        thread never finds entries on disk for a path the live set has let go
+        and removes them as its own."""
+        _remove_tree(path)
+        with self._live_lock:
+            self._live.discard(path)
+
     def _scratch(self, kind: str) -> Path:
         """A fresh directory under the broker's root.
 
         Named from a counter rather than from anything the caller sent. A
         directory named after a repository is a directory two requests for the
         same repository collide in, and the name is also a place a caller-chosen
-        string would reach the filesystem.
+        string would reach the filesystem. Recorded as in flight until the
+        request removes it, so `reclaim_orphan_scratch` leaves it alone.
         """
         with self._sequence_lock:
             self._sequence += 1
             sequence = self._sequence
-        path = self.scratch_root / f"{kind}-{os.getpid()}-{sequence}"
+        path = self.scratch_root / SCRATCH_NAME_FORMAT.format(kind=kind, pid=os.getpid(), sequence=sequence)
+        assert SCRATCH_NAME_RE.match(path.name), path.name
+        with self._live_lock:
+            self._live.add(path)
         if path.exists():
             _remove_tree(path)
         path.mkdir(parents=True)
@@ -886,7 +1117,7 @@ class VcsBroker:
         git = bound.git
 
         root = self._scratch("clone")
-        bundle = root.parent / f"{root.name}.bundle"
+        bundle = root / f"{root.name}{SCRATCH_BUNDLE_SUFFIX}"
         try:
             url = bound.forge.clone_url(bound.repo)
             if branch is None and base is not None:
@@ -934,7 +1165,7 @@ class VcsBroker:
             blob = base64.b64encode(bundle.read_bytes()).decode("ascii")
         finally:
             bundle.unlink(missing_ok=True)
-            _remove_tree(root)
+            self._discard_scratch(root)
         return bound.stamp(
             {
                 "branch": branch,
@@ -961,7 +1192,8 @@ class VcsBroker:
         chosen here by the repository's role (`_snapshot_git`). `ref` is a
         branch or a tag; with none, a pinned base is used, as `clone` does,
         and then the remote's default branch. `paths` narrows the tar to
-        literal repository-relative paths.
+        literal repository-relative paths. `maxBytes` is the caller's own
+        unpack bound (`_snapshot_max_bytes`).
         """
         ref = payload.get("ref")
         if ref is not None:
@@ -971,6 +1203,7 @@ class VcsBroker:
                     "ref names a revision; a snapshot takes a branch or a tag name"
                 )
         paths = _snapshot_paths(payload.get("paths"))
+        max_unpacked = _snapshot_max_bytes(payload.get("maxBytes"))
         repository, fallback = self.snapshot_source(payload.get("repository"))
         if fallback is not None:
             forge_name, repo, url = fallback
@@ -1037,7 +1270,7 @@ class VcsBroker:
             attributes = clone_dir / SNAPSHOT_ATTRIBUTES_FILE
             attributes.parent.mkdir(parents=True, exist_ok=True)
             attributes.write_text(SNAPSHOT_ATTRIBUTES, encoding="utf-8")
-            self._measure_snapshot(git, clone_dir, revision, paths, repo)
+            self._measure_snapshot(git, clone_dir, revision, paths, repo, max_unpacked)
             # `--literal-pathspecs` is GIT_LITERAL_PATHSPECS as a flag: each
             # path is a name, never a glob or pathspec magic.
             argv = [
@@ -1063,10 +1296,10 @@ class VcsBroker:
             # The second check: the measure above is the one that keeps a
             # large tar off the disk.
             if size > self.max_snapshot_bytes:
-                raise self._snapshot_too_large(repo, size)
+                raise self._snapshot_too_large(repo, size, revision=revision)
             blob = base64.b64encode(archive.read_bytes()).decode("ascii")
         finally:
-            _remove_tree(root)
+            self._discard_scratch(root)
         return {
             "forge": forge_name,
             "repo": repo,
@@ -1078,17 +1311,37 @@ class VcsBroker:
             "history": SNAPSHOT_HISTORY,
         }
 
-    def _snapshot_too_large(self, repo: str, size: int) -> WorkspaceError:
+    def _snapshot_too_large(
+        self,
+        repo: str,
+        size: int,
+        entries: list[dict[str, Any]] | None = None,
+        revision: str | None = None,
+        over: str | None = None,
+    ) -> WorkspaceError:
+        """The 413, with the entries one level down when the measure listed them.
+
+        `ceiling` goes with it, so a caller can choose entries that fit
+        without knowing this install's setting, and the `revision` measured,
+        as on `PATH_NOT_FOUND`, so a caller that reads no part still learns
+        which commit it was refused.
+        """
+        fields: dict[str, Any] = {"code": "SNAPSHOT_TOO_LARGE", "ceiling": self.max_snapshot_bytes}
+        if entries is not None:
+            fields["entries"] = entries
+        if revision:
+            fields["revision"] = revision
+        if over is None:
+            over = f"is {size} bytes, over the {self.max_snapshot_bytes}-byte ceiling"
         return WorkspaceError(
-            f"the snapshot of {repo} is {size} bytes, over the "
-            f"{self.max_snapshot_bytes}-byte ceiling. Name `paths` to "
-            "take part of the tree.",
+            f"the snapshot of {repo} {over}. Name `paths` to take part of the tree.",
             status=413,
-            code="SNAPSHOT_TOO_LARGE",
+            **fields,
         )
 
     def _measure_snapshot(
-        self, git: Callable, clone_dir: Path, revision: str, paths: list[str], repo: str
+        self, git: Callable, clone_dir: Path, revision: str, paths: list[str], repo: str,
+        max_unpacked: int | None = None,
     ) -> None:
         """Refuse a tree whose tar would pass the ceiling, before `git archive` writes it.
 
@@ -1111,7 +1364,15 @@ class VcsBroker:
             )
         size = _tar_bytes(listed.stdout or "")
         if size > self.max_snapshot_bytes:
-            raise self._snapshot_too_large(repo, size)
+            raise self._snapshot_too_large(repo, size, _snapshot_entries(listed.stdout or "", paths), revision)
+        # The caller's bound, on what it unpacks: past it, the same 413 and
+        # entries, so the caller can ask for the parts that fit.
+        unpacked = _unpacked_bytes(listed.stdout or "")
+        if max_unpacked is not None and unpacked > max_unpacked:
+            raise self._snapshot_too_large(
+                repo, size, _snapshot_entries(listed.stdout or "", paths), revision,
+                over=f"unpacks to {unpacked} bytes, over the {max_unpacked} bytes the caller unpacks at most",
+            )
 
     def snapshot_source(self, repository: Any) -> tuple[Any, tuple[str, str, str] | None]:
         """The repository `snapshot` resolves, and the read outside the host table, if any.
@@ -1308,7 +1569,7 @@ class VcsBroker:
         git = bound.git
 
         root = self._scratch("publish")
-        bundle = root.parent / f"{root.name}.bundle"
+        bundle = root / f"{root.name}{SCRATCH_BUNDLE_SUFFIX}"
         try:
             bundle.write_bytes(blob)
             git(root, "init", "--quiet")
@@ -1467,7 +1728,7 @@ class VcsBroker:
             git(root, "push", "origin", f"{_INCOMING}:refs/heads/{branch}")
         finally:
             bundle.unlink(missing_ok=True)
-            _remove_tree(root)
+            self._discard_scratch(root)
         return bound.stamp({"branch": branch, "revision": tip})
 
     def branch_view(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1491,7 +1752,7 @@ class VcsBroker:
         try:
             revision = self._remote_tip(bound, root, branch)
         finally:
-            _remove_tree(root)
+            self._discard_scratch(root)
         return bound.stamp(
             {"branch": {"name": branch, "exists": bool(revision), "revision": revision or None}}
         )
@@ -1682,11 +1943,14 @@ class VcsBroker:
                         status=409,
                         code="DELETE_REFUSED",
                     )
+                refusal = _git_refusal(bound.forge, bound.repo, pushed.stderr, "push")
+                if refusal is not None:
+                    raise refusal
                 raise subprocess.CalledProcessError(
                     pushed.returncode, ["git", *argv], pushed.stdout, pushed.stderr
                 )
         finally:
-            _remove_tree(root)
+            self._discard_scratch(root)
         return bound.stamp({"branch": {"name": branch, "deleted": True, "revision": tip}})
 
     def _remote_tip(self, bound: Binding, root: Path, branch: str) -> str:
@@ -1709,6 +1973,9 @@ class VcsBroker:
             return ""
         if listed.returncode != 0:
             refusal = self._tls_refusal(listed.stderr or "")
+            if refusal is not None:
+                raise refusal
+            refusal = _git_refusal(bound.forge, bound.repo, listed.stderr, "ls-remote")
             if refusal is not None:
                 raise refusal
             raise WorkspaceError(
@@ -1997,7 +2264,6 @@ class VcsBroker:
         verb: str,
         payload: dict[str, Any],
         pinned_target: bool = False,
-        observe: Callable[[Binding, dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         bound = self._bind(payload)
         # Before anything else that could spend a call: a forge with no labels
@@ -2015,151 +2281,67 @@ class VcsBroker:
             if base is not None:
                 payload = {**payload, "target": base}
         method = getattr(bound.forge, verb.replace("-", "_"))
-        result = bound.stamp(method(bound.api, bound.repo, payload))
-        if observe is not None:
-            # A reader of the answer, never a party to it: whatever it does
-            # or fails to do, the caller gets the forge's answer.
-            observe(bound, result)
-        return result
+        return bound.stamp(method(bound.api, bound.repo, payload))
 
     def proposal_create(self, payload):
         return self._forge_verb("proposal-create", payload, pinned_target=True)
 
+    def proposal_claim(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """`{url, number, title}` when the forge says this install just opened the proposal.
+
+        Reached through the HTTP layer only with a claim token it minted for
+        a `proposal-create` answer, and with that answer's url, number and
+        repository in `payload` in place of anything the caller sent: the
+        token is what proves the call, this is what proves the proposal. The
+        forge must answer `proposal-view` for the number with the same url, an
+        open state, a creation time inside CLAIM_WINDOW_SECONDS, and as author
+        the account this credential acts as. Anything else the forge answers
+        is a 409; the answer is the forge's, never the caller's. A forge that
+        must name its account and cannot raises IdentityUnknown, whose code
+        names the missing identity. The repository was held to
+        the managed list by the route before this ran. The route spent the
+        token before this ran, so a transient forge failure on either read
+        (CLAIM_TRANSIENT_CODES) is asked once more before it is answered.
+        """
+        url = payload.get("url")
+        number = validate_number(payload.get("number"))
+        bound = self._bind(payload)
+        # IdentityUnknown is not transient, so the wrapper raises it as it came:
+        # refused with its own code, which names the fix, as the other two
+        # `_viewer` callers are. The token is spent either way.
+        viewer = _once_more_if_transient("whoami", lambda: self._viewer(bound))
+        view = (
+            _once_more_if_transient(
+                "proposal-view",
+                lambda: bound.forge.proposal_view(bound.api, bound.repo, {"number": number}),
+            )
+            or {}
+        ).get("proposal") or {}
+        age = _age_seconds(view.get("created"), datetime.now(timezone.utc))
+        if not (
+            viewer
+            and isinstance(url, str)
+            and view.get("url") == url
+            and view.get("number") == number
+            and view.get("state") == OPEN_PROPOSAL_STATE
+            and age is not None
+            and -CLAIM_CLOCK_SKEW_SECONDS <= age <= CLAIM_WINDOW_SECONDS
+            and _login_key(str(view.get("author") or "")) == _login_key(viewer)
+        ):
+            raise WorkspaceError(
+                "The forge does not say this install opened that proposal in the "
+                "last few minutes: it is not open, not this credential's, not the "
+                "one the claim was minted for, or older than the claim window.",
+                status=409,
+                code="CLAIM_NOT_CONFIRMED",
+            )
+        return {"url": url, "number": number, "title": str(view.get("title") or "")[:CLAIM_TITLE_MAX]}
+
     def proposal_list(self, payload):
-        return self._forge_verb("proposal-list", payload, observe=self._observe_outcomes_list)
+        return self._forge_verb("proposal-list", payload)
 
     def proposal_view(self, payload):
-        return self._forge_verb("proposal-view", payload, observe=self._observe_outcomes_view)
-
-    # -- the proposal-outcome counts ---------------------------------------
-    #
-    # The agent never merges, and closes only through `proposal-close` here,
-    # which is marked seen; any other merge or close is a person's, a forge
-    # rule's or a bot's act on the forge, and the broker learns of it only
-    # when a later read shows the proposal in that state. The counts therefore ride on the reads the agent
-    # already makes of its proposals, under three rules that keep them from
-    # counting an outcome twice without a store: the proposal is this
-    # install's own (its author is the credential's login), it reached the
-    # outcome no earlier than this process started (one before that was the
-    # previous process's to count, or is lost with it), and each proposal is
-    # counted once per outcome per process. An outcome this process never
-    # reads is not counted: the counts under-count rather than over-count,
-    # like the operator's totals they feed. A proposal closed, reopened and
-    # merged counts once in each.
-
-    def _observe_outcomes_list(self, bound: Binding, result: dict[str, Any]) -> None:
-        proposals = result.get("proposals")
-        self._count_outcomes(bound, proposals if isinstance(proposals, list) else [])
-
-    def _observe_outcomes_view(self, bound: Binding, result: dict[str, Any]) -> None:
-        proposal = result.get("proposal")
-        self._count_outcomes(bound, [proposal] if isinstance(proposal, dict) else [])
-
-    def _note_own_close(self, bound: Binding, result: dict[str, Any], number: Any) -> None:
-        """Mark a proposal as closed by this broker, so no read counts it."""
-        proposal = result.get("proposal") if isinstance(result, dict) else None
-        if isinstance(proposal, dict) and proposal.get("number") is not None:
-            number = proposal.get("number")
-        if number is None:
-            return
-        with self._merged_lock:
-            self._closed_seen.add(self._merged_key(bound, number))
-
-    def _count_outcomes(self, bound: Binding, proposals: list) -> None:
-        try:
-            self._count_outcome(bound, proposals, MERGED_PROPOSAL_STATE, self.merge_observer, self._merged_seen)
-            self._count_outcome(bound, proposals, CLOSED_PROPOSAL_STATE, self.close_observer, self._closed_seen)
-        except Exception as exc:  # noqa: BLE001 -- the count never fails the read
-            LOGGER.debug("proposal-outcome count skipped type=%s", type(exc).__name__)
-
-    def _count_outcome(
-        self,
-        bound: Binding,
-        proposals: list,
-        state: str,
-        observer: Callable[[int], None] | None,
-        seen: set[tuple[str, str, Any]],
-    ) -> None:
-        if observer is None:
-            return
-        # The free rules first -- in the state, not before this process
-        # started, not already counted -- so the identity lookup, a forge call,
-        # runs only when something could count, and never for a history of old
-        # outcomes a `state=all` listing carries on every read.
-        with self._merged_lock:
-            candidates = [
-                p for p in proposals
-                if isinstance(p, dict)
-                and p.get("state") == state
-                and (closed := _iso_timestamp(p.get("closed"))) is not None
-                and closed >= self.started_at
-                and self._merged_key(bound, p.get("number")) not in seen
-            ]
-        if not candidates:
-            return
-        viewer = self._merged_viewer_for(bound)
-        if not viewer:
-            return
-        count = 0
-        with self._merged_lock:
-            for proposal in candidates:
-                if _login_key(str(proposal.get("author") or "")) != _login_key(viewer):
-                    continue
-                key = self._merged_key(bound, proposal.get("number"))
-                if key in seen:
-                    continue
-                seen.add(key)
-                count += 1
-        if count:
-            observer(count)
-
-    @staticmethod
-    def _merged_scope(forge: Forge) -> str:
-        """What the merged count and its identity cache are keyed on besides
-        the repository: the forge's canonical host, as `_pinned_base` keys the
-        pins, since one provider serves several hosts (two forges of one
-        provider on different hosts carry the same `name` and may carry the
-        same path) and the same path on another host is another repository
-        with its own credential."""
-        return forge.hosts[0] if forge.hosts else forge.name
-
-    @classmethod
-    def _merged_key(cls, bound: Binding, number: Any) -> tuple[str, str, Any]:
-        """The seen-set key: forge host, repository and number. The repository
-        is casefolded, since a caller may spell `Acme/Infra` and `acme/infra`
-        for the one repository the forge resolves them to, and the count is per
-        proposal, not per spelling."""
-        return (cls._merged_scope(bound.forge), bound.repo.casefold(), number)
-
-    def _merged_viewer_for(self, bound: Binding) -> str:
-        """The credential's login for the outcome counts, remembered per repository,
-        keyed the way the seen set is: the login is the credential's, not the
-        spelling's.
-
-        "" is a real answer, a credential that cannot name itself, and is
-        remembered too, with one INFO line per process so that a flat
-        `remediationsMergedTotal` and `remediationsClosedUnmergedTotal` on such
-        an install are explained in the log;
-        a lookup that raises is left to the caller's guard and asked again next
-        time.
-        """
-        key = (self._merged_scope(bound.forge), bound.repo.casefold())
-        with self._merged_lock:
-            if key in self._merged_viewer:
-                return self._merged_viewer[key]
-        viewer = self._viewer(bound)
-        with self._merged_lock:
-            self._merged_viewer[key] = viewer
-            announce = not viewer and not self._merged_nameless_logged
-            if announce:
-                self._merged_nameless_logged = True
-        if announce:
-            LOGGER.info(
-                "proposal-outcome counts are off for %s: the credential cannot name itself, "
-                "so no proposal can be told to be this install's own",
-                self._merged_scope(bound.forge),
-            )
-        return viewer
+        return self._forge_verb("proposal-view", payload)
 
     def proposal_comment(self, payload):
         return self._forge_verb("proposal-comment", payload)
@@ -2187,31 +2369,7 @@ class VcsBroker:
         )
 
     def proposal_close(self, payload):
-        # A close this route makes is the harness tidying up (the fleet audit
-        # closes its own stale remediation proposals here), not a person
-        # rejecting: it is marked seen before the forge call, because the
-        # forge applies the close before it answers, and an answer lost to a
-        # timeout or a reset would otherwise leave a close of the broker's own
-        # for a later read to count as a person's. A close the forge refused
-        # leaves the proposal open; if a person closes it later, that close is
-        # not counted, the under-counting direction every counter here takes.
-        # The number is validated here first, as the adapter would, so a number
-        # the forge never issued, or a bool that hashes like 1, leaves no mark.
-        number = validate_number(payload.get("number")) if isinstance(payload, dict) else None
-        bound = self._bind(payload) if number is not None else None
-        if bound is not None:
-            self._note_own_close(bound, {}, number)
-        try:
-            return self._forge_verb("proposal-close", payload)
-        except WorkspaceError as exc:
-            # The forge refused and applied nothing: the mark comes off, so a
-            # person's later close of this proposal counts. A lost answer (502,
-            # 503) keeps it: the forge may have applied the close.
-            status = getattr(exc, "status", None)
-            if bound is not None and isinstance(status, int) and status < FORGE_REFUSAL_STATUS_CEILING:
-                with self._merged_lock:
-                    self._closed_seen.discard(self._merged_key(bound, number))
-            raise
+        return self._forge_verb("proposal-close", payload)
 
     def proposal_commits(self, payload):
         return self._forge_verb("proposal-commits", payload)
@@ -2332,6 +2490,7 @@ VCS_VERBS = frozenset(
         "proposal-close",
         "proposal-commits",
         "proposal-acknowledge",
+        "proposal-claim",
         "issue-update",
         "issue-close",
         "label-ensure",
@@ -2366,6 +2525,7 @@ def route_table(broker: VcsBroker) -> dict[str, Callable[[dict], dict]]:
         "proposal-close": broker.proposal_close,
         "proposal-commits": broker.proposal_commits,
         "proposal-acknowledge": broker.proposal_acknowledge,
+        "proposal-claim": broker.proposal_claim,
         "issue-update": broker.issue_update,
         "issue-close": broker.issue_close,
         "label-ensure": broker.label_ensure,

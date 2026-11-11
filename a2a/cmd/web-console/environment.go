@@ -83,13 +83,14 @@ const (
 	// The kube-agents Deployments whose newest ReplicaSet dates the last
 	// upgrade, by how the chart and operator name them: the operator is
 	// "<release>-controller-manager" (operator-deployment.yaml), the
-	// gateway and credential proxy are "<agent>-gateway" and
-	// "<agent>-credential-proxy" (the operator's manifests), and LiteLLM's
-	// name is fixed (litellm.yaml).
+	// gateway, credential proxy and its exec tier are "<agent>-gateway",
+	// "<agent>-credential-proxy" and "<agent>-credential-proxy-exec-tier" (the
+	// operator's manifests), and LiteLLM's name is fixed (litellm.yaml).
 	defaultHelmReleaseName          = "kube-agents"
 	controllerManagerSuffix         = "-controller-manager"
 	gatewayDeploymentSuffix         = "-gateway"
 	credentialProxyDeploymentSuffix = "-credential-proxy"
+	credentialProxyExecTierSuffix   = "-credential-proxy-exec-tier"
 	litellmDeploymentName           = "litellm"
 )
 
@@ -123,6 +124,7 @@ func rolloutDeployments(agentName, helmRelease string) map[string]bool {
 		helmRelease + controllerManagerSuffix:       true,
 		agentName + gatewayDeploymentSuffix:         true,
 		agentName + credentialProxyDeploymentSuffix: true,
+		agentName + credentialProxyExecTierSuffix:   true,
 		litellmDeploymentName:                       true,
 	}
 }

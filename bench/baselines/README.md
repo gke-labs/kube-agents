@@ -105,7 +105,7 @@ above does not cover: the candidate is a commit on `main`, and the run measuring
 it is a periodic with no `PULL_NUMBER`, so it satisfies both conditions exactly.
 `RC_COMMIT_SHA` being set is the third condition, enforced in the same two
 places. `EVAL_ROLLBACK_LANE=1` is the fourth, also enforced in both: the today
-lane's periodic on `main` deploys `next` and rolls it back to `today` before its
+lane deploys `next` and rolls it back to `today` before its
 matrix, so its key reads `today`, but a rolled-back install is not the fresh
 `today` install that window measures. The third has to be enforced twice,
 because the mistake is not correctable afterwards:
@@ -115,7 +115,7 @@ candidate's record and `main`'s are the same record once written — and the
 candidate would then be judged non-inferior to a window it had just moved.
 
 A next-mode run on `main` does append. The main nightly
-(`ci-kube-agents-eval-nightly`, its `-main-b` half and its `-writers` part) is a periodic with no
+(`ci-kube-agents-eval-nightly`, its `-main-b` to `-main-e` shards and its three writers thirds) is a periodic with no
 `PULL_NUMBER` whose matrix runs through the inject door, which `bench-gate`
 reads as the key's `next` mode, so its lines file under a key of their own and
 never reach today's window. No job appends today's window now: the
@@ -149,7 +149,8 @@ directory.
 
 The local backend is the default and stays the default: the store travels with
 the checkout, so running the gate needs no credential and no network, and every
-unit test is hermetic.
+unit test is hermetic. The committed copy of this directory stays empty but for
+`VERSIONS.json`; the bucket is the record.
 
 GCS is the intended production home for one reason — on the local backend
 something has to _commit_ the file, and the CI job that measures the

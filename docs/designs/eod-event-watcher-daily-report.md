@@ -61,13 +61,16 @@ CR — `spec.integration.googleChat.homeChannel`, which the operator renders int
 field is the only way. The operator renders the Google Chat field into the gateway as
 `A2A_GCHAT_HOME_CHANNEL` rather than into the agent, so there the check below reads `<unset>`; read
 `spec.integration.googleChat.homeChannel` on the `PlatformAgent` instead. A `next` install whose
-only chat platform is the gateway's and has no home channel gets no send at all: the error names the
-platform and the field, as in
-`composed but not delivered to slack (no home channel: set spec.integration.slack.homeChannel / SLACK_HOME_CHANNEL)`.
-A malformed home channel gets the same refusal without the platform. Every entry
+only chat platform is the gateway's and has no home channel sends anyway: the gateway refuses the
+recap, keeps it, and names it in the digest it posts once a home channel is set; the recorded error
+is the relay's `composed but not delivered to <platform>`, as above. Alerts on such an install are
+sent too, refused and kept, and the recap lists each as not delivered with the keep as the reason
+(`kept by the gateway for its digest`); the headless class below is the install with no chat platform
+at all. A malformed home channel
+leaves the agent unrouted: the relay answers that no route exists and the gateway is never asked. Every entry
 on the roster shipping `deliver: "chat"` takes this route; nothing about it is specific to
 `no_agent`. It matters here because the recap is the only place a filtered event is ever reported,
-so an install without a home channel loses those events entirely rather than seeing them late.
+so an install without a home channel sees those events late, in the digest, rather than never.
 Check before relying on the recap:
 
 ```bash
@@ -93,7 +96,10 @@ with no chat platform enabled (`2`, `NOTIFIED_HEADLESS`). It has other writers �
 land in the same table under `reason = 'OutOfBandChange'`, and `controller-stall` injects (see
 [stall-watch-inject.md](stall-watch-inject.md)) under `reason = 'ControllerStall'` — and the
 generator excludes those rows before it counts
-anything, so every number below is still the watcher's alone. That exclusion is
+anything, so every number below is still the watcher's alone. Rows marked `excluded = 1` are the
+events an alert-exclude rule held back in the watcher, which it posts to `POST /v1/excluded-events`
+without a session; they are counted on a line of their own and in no other number (see
+[What this recap does not report](#what-this-recap-does-not-report)). That exclusion is
 load-bearing: this card is titled as the watcher's recap and says "Forwarded N events", and a
 drift record is not an event the watcher forwarded. [`agents/platform/docs/session_management.md`](../../agents/platform/docs/session_management.md) is
 canonical for the schema and the ingestion flow it records.
@@ -316,6 +322,34 @@ one folded into its workload's open incident (`duplicate_of` set, with
 withheld. The row adds to the headline's forwarded total, and its group is keyed as one that went
 out, so it adds to the group count only when its reason or severity differs from its anchor's, or
 its anchor's chat post failed.
+
+Events that an alert-exclude rule (`spec.harness.eventWatcher.alertExclude`) held back in the watcher
+are counted on their own line, `🔇 N events from M workloads were silenced by alert-exclude rules:`,
+followed by the five workloads that sent the most sightings, each with its count (and its cluster when
+it is not the recap's own), and "and K more workloads" past five. This line names workloads where the
+withheld line does not, and the difference is who decided. The ceiling withheld alerts nobody chose to
+lose, and naming them would make the recap a second place an incident is described. The rules muted
+these events on purpose, at the operator's own request, so a name repeats nothing chat said; and the
+point of the line is to notice a chronic failure that got worse while it was muted, which a bare
+count cannot show. The verb is "silenced", not "held back", because the ✅ line beneath it can say
+that nothing was held back from chat: these events were never offered to chat.
+
+The watcher sends the daemon one record per object and reason per 15 minutes, carrying the sightings
+since its last one, and the daemon adds each to that object's row from the last hour. A row that
+collected for longer would carry sightings from after one recap into a row the next recap does not
+read, since the recap selects rows by when they were created; an hour bounds that loss to the hour at
+the recap's edge. `N` is in sightings, not incidents: the rules run before the watcher's count and
+settle gates, so it includes sightings that would never have alerted. `M` is keyed as the withheld
+line's workloads are. These rows are in no other figure and do not veto the ✅ all-clear or the 🟢
+header: the rules silenced them on purpose. Their clusters are in the scope the header names, and a
+row in a namespace in `EOD_EXCLUDE_NAMESPACES` is left out of the line, as it is out of the
+breakdown. The watcher's `k8s_event_watcher_events_filtered_total{gate="alert_excluded"}` counts them
+per cluster.
+
+Two limits. The watcher keeps its count in memory, so a watcher restart counts the events still
+inside the API server's Event TTL once more. And the rows count toward
+`LEDGER_MAX_ROWS` like every other row, up to 24 per object and reason a day, so a large set of
+chronic excluded keys pushes older rows out of the ledger sooner.
 
 ## Running it by hand
 

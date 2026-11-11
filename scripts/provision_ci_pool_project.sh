@@ -51,6 +51,30 @@ readonly COMPUTE_SWEEP_ROLE_ID="kubeAgentsComputePlantSweeper"
 readonly COMPUTE_SWEEP_ROLE_TITLE="kube-agents Compute plant sweeper"
 readonly COMPUTE_SWEEP_ROLE_STAGE="GA"
 readonly COMPUTE_SWEEP_PERMISSIONS="compute.addresses.delete,compute.addresses.deleteInternal,compute.addresses.list,compute.globalAddresses.delete,compute.globalAddresses.deleteInternal,compute.globalAddresses.list,compute.globalOperations.get,compute.networks.delete,compute.networks.list,compute.regionOperations.get,compute.subnetworks.delete,compute.subnetworks.list,monitoring.alertPolicies.delete,monitoring.alertPolicies.list"
+# The once-per-project pieces of a self-managed forge (hack/ci-forge.sh reads
+# them per run; docs/ci-pool-projects.md 5.8): the private zone, one reserved
+# address and one A record per row, the 443 firewall rule and the VM identity,
+# a registry reader. The rows' hosts are hack/ci-deploy.sh's forge table
+# defaults, read below; the names here are kept equal to
+# scripts/verify_ci_pool_project.py by its tests.
+readonly FORGE_DNS_ZONE="eval-internal"
+readonly FORGE_DNS_NAME="eval.internal."
+readonly FORGE_NETWORK="default"
+readonly FORGE_ROWS="ghes gitlab-ce"
+readonly FORGE_FIREWALL_RULE="allow-forge-443"
+readonly FORGE_FIREWALL_SOURCE_RANGES="10.0.0.0/8"
+readonly FORGE_FIREWALL_ALLOWED="tcp:443"
+# The deny rule on the same tag, one priority step below the allow (gcloud's
+# default 1000): a forge VM's external address answers nothing else, the
+# default network's stock allow-ssh included.
+readonly FORGE_DENY_RULE="deny-forge-ingress"
+readonly FORGE_DENY_PRIORITY=1100
+readonly FORGE_DENY_SOURCE_RANGES="0.0.0.0/0"
+readonly FORGE_DENY_RULES="all"
+readonly FORGE_NETWORK_TAG="forge"
+readonly FORGE_VM_SA_ID="forge-vm"
+readonly FORGE_VM_SA_ROLE="roles/artifactregistry.reader"
+readonly FORGE_RECORD_TTL=60
 # The identity the seeded-fleet reconcile runs as (hack/fleet_reconcile.py, a
 # postsubmit and a daily on main). The IAM step before 1.3 grants it what re-applying
 # bench/tf/fleet needs on the project; step 2 grants it the state bucket.
@@ -69,17 +93,18 @@ readonly GITOPS_SEED_CONTENT="# GitOps Infrastructure Repo"
 # The declared-intent note the declared-intent cases read (GITOPS_INTENT_NOTE_CASES
 # in scripts/verify_ci_pool_project.py): the fleet's declared-no-pdb-workload role
 # runs without a budget or a NetworkPolicy, declared-token-workload's
-# token-reader keeps its mounted token, and declared-overrequest-workload's
-# burst-ingest keeps its headroom, all on purpose. The harness reads the
+# token-reader keeps its mounted token, declared-overrequest-workload's
+# burst-ingest keeps its headroom, and declared-single-zone-pool's
+# declared-zonal-pool stays in one zone, all on purpose. The harness reads the
 # frontmatter, not the prose.
 # What `gh api` prints on stderr for a path that is not there; any other failure
 # of the existence read stops the seed rather than writing blind.
 readonly GITOPS_NOTE_ABSENT_PATTERN="HTTP 404"
 readonly GITOPS_INTENT_NOTE_PATH="knowledge/notification-relay-no-pdb.md"
-readonly GITOPS_INTENT_NOTE_MESSAGE="Declare seeded-intent's missing PodDisruptionBudget and NetworkPolicy, token-reader's mounted token, seeded-c's missing upgrade notifications, and burst-ingest's headroom, as intended"
+readonly GITOPS_INTENT_NOTE_MESSAGE="Declare seeded-intent's missing PodDisruptionBudget and NetworkPolicy, token-reader's mounted token, seeded-c's missing upgrade notifications, burst-ingest's headroom, and declared-zonal-pool's single zone, as intended"
 readonly GITOPS_INTENT_NOTE_CONTENT='---
 type: decision
-title: seeded-intent, seeded-token, seeded-c and seeded-headroom carry five postures on purpose
+title: seeded-intent, seeded-token, seeded-c, seeded-headroom and the declared-zonal-pool of seeded-a carry six postures on purpose
 declares:
   - check: no-pdb
     namespace: seeded-intent
@@ -96,6 +121,9 @@ declares:
   - check: overrequest
     namespace: seeded-headroom
     object: Deployment/burst-ingest
+  - check: single-zone-nodepool
+    namespace: ""
+    object: NodePool/declared-zonal-pool
 ---
 
 `notification-relay` in `seeded-intent` runs two replicas with no PodDisruptionBudget by design:
@@ -105,9 +133,10 @@ in `seeded-token` runs on the default ServiceAccount of its namespace with the t
 design: it reads the API server with that identity. Its neighbour `token-sidecar` is not declared.
 `seeded-c` publishes no GKE upgrade notifications by design: this fleet learns about upgrades from
 the weekly audit. `burst-ingest` in `seeded-headroom` requests far more memory than it uses by
-design: it is sized for an ingest burst the measured week does not show. The obtainability,
-compliance, upgrade readiness and waste audits list the five postures under Declared intent rather
-than as findings.'
+design: it is sized for an ingest burst the measured week does not show. `declared-zonal-pool` on
+`seeded-a` is an autoscaling pool kept in one zone by design: the cluster is single-zone, and the
+pool stays empty until a zonal batch needs it. The obtainability, compliance, upgrade readiness,
+waste and capacity audits list the six postures under Declared intent rather than as findings.'
 # checkout-gateway's declaration, the file the remediation cases propose a
 # PodDisruptionBudget beside (GITOPS_WORKLOAD_MANIFEST_CASES in the verifier).
 # With no manifest in the repository the agent finds nothing to fix and refuses
@@ -332,8 +361,8 @@ fi
 # A bare `grep "${PROJECT_ID}"` also matches comments and any longer project ID
 # that contains this one as a prefix.
 CI_DEPLOY="${REPO_ROOT}/hack/ci-deploy.sh"
-if ! awk '/gitops_repo_for_project\(\)[[:space:]]*\{/,/^\}/' "${CI_DEPLOY}" 2>/dev/null \
-     | grep -qE "^[[:space:]]*${PROJECT_ID}\)[[:space:]]+echo[[:space:]]+\"${GITOPS_REPO}\""; then
+if ! grep -qE "^[[:space:]]*${PROJECT_ID}\)[[:space:]]+echo[[:space:]]+\"${GITOPS_REPO}\"" \
+     <<<"$(awk '/gitops_repo_for_project\(\)[[:space:]]*\{/,/^\}/' "${CI_DEPLOY}" 2>/dev/null)"; then
   echo "⚠️ ${PROJECT_ID} is not mapped in hack/ci-deploy.sh." >&2
   echo "   Add to gitops_repo_for_project():" >&2
   echo "       ${PROJECT_ID}) echo \"${GITOPS_REPO}\" ;;" >&2
@@ -364,6 +393,10 @@ gcloud services enable \
   gkehub.googleapis.com \
   iam.googleapis.com \
   cloudkms.googleapis.com \
+  dns.googleapis.com \
+  apikeys.googleapis.com \
+  secretmanager.googleapis.com \
+  generativelanguage.googleapis.com \
   --project="${PROJECT_ID}"
 
 PROJECT_NUMBER="$(gcloud projects describe "${PROJECT_ID}" --format='value(projectNumber)')"
@@ -426,7 +459,7 @@ done
 # (docs/designs/eval-scorer.md). In the pool the two need the same set: a
 # project granting only the presubmit's account leases fine and dies at
 # get-credentials the first night it is drawn, as kube-agents-evals-10 did on
-# 2026-09-16 (gke-labs/kube-agents#1491). The same thirteen, not a subset -- the
+# 2026-09-16 (gke-labs/kube-agents#1491). The same fourteen, not a subset -- the
 # run is the same script end to end, so a partial grant fails at a later step
 # on a later night instead.
 #
@@ -440,9 +473,12 @@ done
 PROW_RUNNER_SA="serviceAccount:prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com"
 NIGHTLY_RUNNER_SA="serviceAccount:eval-baseline-recorder@kube-agents-prow.iam.gserviceaccount.com"
 echo "Granting the Prow and nightly runners access to ${PROJECT_ID}..."
+# compute.instanceAdmin.v1: hack/ci-forge.sh creates and deletes the
+# self-managed forge VM per run and reads its serial console (section 5.8).
 for role in \
   roles/cloudbuild.builds.editor \
   roles/cloudbuild.builds.viewer \
+  roles/compute.instanceAdmin.v1 \
   roles/container.admin \
   roles/container.developer \
   roles/iam.serviceAccountAdmin \
@@ -586,7 +622,7 @@ seed_gitops_file() {
   local path="$1" message="$2" content="$3" what="$4" read_error
   if read_error="$(gh api "repos/${GITOPS_REPO}/contents/${path}" 2>&1 >/dev/null)"; then
     return 0
-  elif printf '%s' "${read_error}" | grep -q "${GITOPS_NOTE_ABSENT_PATTERN}"; then
+  elif grep -q "${GITOPS_NOTE_ABSENT_PATTERN}" <<<"${read_error}"; then
     echo "Seeding ${GITOPS_REPO} with ${path} (${what})..."
     gh api -X PUT "repos/${GITOPS_REPO}/contents/${path}" \
       -f message="${message}" \
@@ -625,6 +661,57 @@ fi
 echo "⚠ ${GITOPS_REPO} must also be added to GitHub App ${LEDGER_APP_ID}'s installation."
 echo "  That edit widens which repositories the App can read issues and pull requests in:"
 echo "  https://github.com/organizations/gke-agentic/settings/installations/${LEDGER_INSTALLATION_ID}"
+
+# ─── Step 1.5: The self-managed forges' pieces ────────────────────────────────
+echo -e "\n==> [Step 1.5] Reserving the self-managed forges' zone, addresses, firewall rule and VM identity..."
+# The rows' hosts, from the one table (forge_profile in hack/ci-deploy.sh).
+eval "$(sed -n 's/^\(EVAL_FORGE_DEFAULT_[A-Z_]*HOST=.*\)$/\1/p' "${REPO_ROOT}/hack/ci-deploy.sh")"
+forge_host_for_row() { # ghes -> EVAL_FORGE_DEFAULT_GHES_HOST, gitlab-ce -> EVAL_FORGE_DEFAULT_GITLAB_CE_HOST
+  local var
+  var="EVAL_FORGE_DEFAULT_$(printf '%s' "$1" | tr '[:lower:]-' '[:upper:]_')_HOST"
+  printf '%s' "${!var}"
+}
+if ! gcloud dns managed-zones describe "${FORGE_DNS_ZONE}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+  gcloud dns managed-zones create "${FORGE_DNS_ZONE}" --dns-name="${FORGE_DNS_NAME}" --visibility=private \
+    --networks="${FORGE_NETWORK}" --description="Self-managed eval forges (hack/ci-forge.sh)" --project="${PROJECT_ID}" >/dev/null
+fi
+for row in ${FORGE_ROWS}; do
+  address="forge-${row}"
+  host="$(forge_host_for_row "${row}")"
+  if ! ip="$(gcloud compute addresses describe "${address}" --region="${REGION}" --project="${PROJECT_ID}" --format='value(address)' 2>/dev/null)"; then
+    gcloud compute addresses create "${address}" --region="${REGION}" --subnet="${FORGE_NETWORK}" --purpose=GCE_ENDPOINT \
+      --description="The ${row} forge VM's address (hack/ci-forge.sh)" --project="${PROJECT_ID}" >/dev/null
+    ip="$(gcloud compute addresses describe "${address}" --region="${REGION}" --project="${PROJECT_ID}" --format='value(address)')"
+  fi
+  if record="$(gcloud dns record-sets describe "${host}." --zone="${FORGE_DNS_ZONE}" --type=A --project="${PROJECT_ID}" --format='value(rrdatas[0])' 2>/dev/null)"; then
+    if [ "${record}" != "${ip}" ]; then
+      gcloud dns record-sets update "${host}." --zone="${FORGE_DNS_ZONE}" --type=A --ttl="${FORGE_RECORD_TTL}" --rrdatas="${ip}" --project="${PROJECT_ID}" >/dev/null
+    fi
+  else
+    gcloud dns record-sets create "${host}." --zone="${FORGE_DNS_ZONE}" --type=A --ttl="${FORGE_RECORD_TTL}" --rrdatas="${ip}" --project="${PROJECT_ID}" >/dev/null
+  fi
+  echo "✓ ${host} -> ${ip} (${address})"
+done
+if ! gcloud compute firewall-rules describe "${FORGE_FIREWALL_RULE}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+  gcloud compute firewall-rules create "${FORGE_FIREWALL_RULE}" --network="${FORGE_NETWORK}" --direction=INGRESS --allow="${FORGE_FIREWALL_ALLOWED}" \
+    --source-ranges="${FORGE_FIREWALL_SOURCE_RANGES}" --target-tags="${FORGE_NETWORK_TAG}" --project="${PROJECT_ID}" >/dev/null
+fi
+if ! gcloud compute firewall-rules describe "${FORGE_DENY_RULE}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+  gcloud compute firewall-rules create "${FORGE_DENY_RULE}" --network="${FORGE_NETWORK}" --direction=INGRESS --action=DENY --rules="${FORGE_DENY_RULES}" \
+    --priority="${FORGE_DENY_PRIORITY}" --source-ranges="${FORGE_DENY_SOURCE_RANGES}" --target-tags="${FORGE_NETWORK_TAG}" --project="${PROJECT_ID}" >/dev/null
+fi
+FORGE_VM_SA="${FORGE_VM_SA_ID}@${PROJECT_ID}.iam.gserviceaccount.com"
+if ! gcloud iam service-accounts describe "${FORGE_VM_SA}" --project="${PROJECT_ID}" >/dev/null 2>&1; then
+  gcloud iam service-accounts create "${FORGE_VM_SA_ID}" --display-name="kube-agents forge VM" --project="${PROJECT_ID}" >/dev/null
+fi
+gcloud projects add-iam-policy-binding "${PROJECT_ID}" --member="serviceAccount:${FORGE_VM_SA}" --role="${FORGE_VM_SA_ROLE}" --quiet >/dev/null
+echo "✓ Forge pieces: zone ${FORGE_DNS_ZONE}, firewall rules ${FORGE_FIREWALL_RULE} and ${FORGE_DENY_RULE}, VM identity ${FORGE_VM_SA} (${FORGE_VM_SA_ROLE})"
+
+# ─── Step 1.6: The eval nightlies' Gemini Developer API key ───────────────────
+echo -e "\n==> [Step 1.6] Minting the project's Gemini Developer API key..."
+# Per project so each leased project gets its own quota window; the same script repairs an already-registered project, which must not be re-provisioned.
+# Step 1 already enabled its three APIs (REQUIRED_APIS); the script enables them again, which is a no-op.
+"${SCRIPT_DIR}/provision_ci_pool_gemini_key.sh" "${PROJECT_ID}"
 
 # ─── Step 2: Host GKE Cluster & Seeded Fleet ──────────────────────────────────
 # One bucket per project, one prefix per stack. Versioning and uniform

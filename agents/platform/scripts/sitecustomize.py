@@ -8,8 +8,9 @@ distinction. The operator sets ``PYTHONPATH=/opt/defaults/scripts``
 on the agent container (``platformagent_manifests.go``), which means this module
 runs in *every* Python the pod starts, and calling ``install()`` eagerly pulled
 in ``gateway`` -> ``slack_bolt`` -> ``aiohttp``/``requests`` before the process
-reached its own work: 747 modules, 2.2-6.1s under gVisor, to set up a hook only
-the long-lived gateway can ever fire. Kanban spawns a fresh subprocess per card
+reached its own work: 747 modules, 2.2-6.1s under gVisor, to set up a hook that
+fires only in a process that imports the registry: the long-lived gateway, and
+the ``hermes send`` and cron children whose standalone sends the relays reroute. Kanban spawns a fresh subprocess per card
 and Hermes' environment probe spawns four more interpreters per session, so that
 import was paid several times over on every card. Deferring it took the probe
 from 9.6-10.3s to 0.39-0.44s.

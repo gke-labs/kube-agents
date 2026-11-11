@@ -4,14 +4,20 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import os
 import re
+import threading
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from typing import Protocol
+from typing import Protocol, TypeVar
 
 from admin_console.kube_access import (
     GKEKubeAccess,
     KubeCommandResult,
+    KubeFailure,
     kube_failure_guidance,
 )
 from admin_console.project_config import (
@@ -32,6 +38,18 @@ from admin_console.telemetry import redact_evidence
 _K8S_NAME = re.compile(r"^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$")
 _KANBAN_TASK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 GATEWAY_PYTHON = "/opt/hermes/.venv/bin/python3"
+# Every runtime read starts with the same two discovery questions, which
+# PlatformAgent is canonical and which gateway pod runs it. Before this cache
+# every provider answered them afresh, and the pages build a provider on each
+# rerun, so an active session asked the cluster hundreds of times a minute.
+# The answers are now held for this long, shared by every provider in one
+# process (the API server and the Streamlit pages are two processes, so each
+# holds its own copy). 0 disables the cache; an unparsable or negative value
+# falls back to the default.
+RUNTIME_CACHE_TTL_ENV = "ADMIN_CONSOLE_RUNTIME_CACHE_TTL_SECONDS"
+DEFAULT_RUNTIME_CACHE_TTL_SECONDS = 30.0
+_CANONICAL_AGENT_KEY = "canonical_agent"
+_GATEWAY_ENDPOINT_KEY = "gateway_endpoint"
 # Must match FRAME_TAG in _READ_SCRIPT.
 _READ_FRAME_TAG = "KA-READ-1"
 _READ_CUT_SHORT_GUIDANCE = (
@@ -70,21 +88,27 @@ GAVE_UP_SQL = """
         0))
 """
 # A run can record a PR or MR URL in its metadata. Any run counts, because a
-# later review run does not repeat the URL. Only a text value is a URL.
+# later review run does not repeat the URL. The read selects each run's text
+# pr_url in this column, one per line, matches it with PR_URL_PATTERN as it does
+# the result, and removes the column before it sends the row.
+PR_METADATA_COLUMN = "pr_scan_metadata"
 PR_METADATA_SQL = """
-    EXISTS (SELECT 1 FROM task_runs r WHERE r.task_id = t.id
-            AND CASE WHEN json_valid(r.metadata)
-                     THEN json_type(r.metadata, '$.pr_url') = 'text'
-                          AND json_extract(r.metadata, '$.pr_url') <> ''
-                     ELSE 0 END)
+    (SELECT group_concat(json_extract(r.metadata, '$.pr_url'), char(10))
+     FROM task_runs r WHERE r.task_id = t.id
+       AND CASE WHEN json_valid(r.metadata)
+                THEN json_type(r.metadata, '$.pr_url') = 'text'
+                ELSE 0 END)
 """
 # Most workers give the PR or MR URL only in the card result. The console shows
 # the PR only for a done card. Thus the read selects the result of a done card
 # in this column, and removes the column before it sends the row.
 PR_RESULT_COLUMN = "pr_scan_result"
 PR_RESULT_SQL = "CASE WHEN t.status = 'done' THEN t.result END"
-# A PR or MR URL in the result. The URL must not contain white space.
-PR_URL_PATTERN = re.compile(r"https?://\S+/(?:pull|merge_requests)/\d+")
+# A pull or merge request URL in the result, on any forge the broker serves:
+# GitHub `/pull/<n>`, GitLab `/merge_requests/<n>`, Gitea `/pulls/<n>`, Bitbucket
+# Cloud and Data Center `/pull-requests/<n>`. The URL must not contain white space,
+# and its tail carries no further marker, `/-/` or `/issues/`.
+PR_URL_PATTERN = re.compile(r"https?://\S+/(?:pull|pulls|pull-requests|merge_requests)/\d+(?:[/?#](?:(?!/-/|/issues/|/pull/|/pulls/|/pull-requests/|/merge_requests/)\S)*)?(?![/?#\w])")
 
 
 def profiles():
@@ -125,20 +149,21 @@ def card_state(connection):
 
     block_kind = "t.block_kind" if has("tasks", "block_kind") else "NULL"
     gave_up = GAVE_UP_SQL if has("task_events", "kind") else "0"
-    has_pr = PR_METADATA_SQL if has("task_runs", "metadata") else "0"
+    pr_metadata = PR_METADATA_SQL if has("task_runs", "metadata") else "NULL"
     result = PR_RESULT_SQL if has("tasks", "result") else "NULL"
     return (
-        f"{block_kind} AS block_kind, {gave_up} AS gave_up, {has_pr} AS has_pr, "
-        f"{result} AS {PR_RESULT_COLUMN}"
+        f"{block_kind} AS block_kind, {gave_up} AS gave_up, "
+        f"{pr_metadata} AS {PR_METADATA_COLUMN}, {result} AS {PR_RESULT_COLUMN}"
     )
 
 
 def card_row(row):
-    # Scan the result for a PR or MR URL. Then remove the result to keep the
-    # read small.
+    # Scan the runs' pr_url values and the result for a PR or MR URL. Then remove
+    # both columns to keep the read small.
     card = dict(row)
+    pr_metadata = card.pop(PR_METADATA_COLUMN) or ""
     result = card.pop(PR_RESULT_COLUMN) or ""
-    card["has_pr"] = bool(card["has_pr"]) or bool(PR_URL_PATTERN.search(result))
+    card["has_pr"] = bool(PR_URL_PATTERN.search(pr_metadata) or PR_URL_PATTERN.search(result))
     return card
 
 
@@ -615,6 +640,195 @@ class KubeRunner(Protocol):
     def run(self, arguments: list[str], *, timeout: int = 20) -> KubeCommandResult: ...
 
 
+_T = TypeVar("_T")
+_Held = TypeVar("_Held")
+
+
+def runtime_cache_ttl_seconds() -> float:
+    """Return the configured discovery cache lifetime; 0 disables the cache."""
+    raw = os.environ.get(RUNTIME_CACHE_TTL_ENV, "").strip()
+    if not raw:
+        return DEFAULT_RUNTIME_CACHE_TTL_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_RUNTIME_CACHE_TTL_SECONDS
+    if not math.isfinite(value) or value < 0:
+        return DEFAULT_RUNTIME_CACHE_TTL_SECONDS
+    return value
+
+
+def _target_key(target: DeploymentTarget) -> tuple[str, str, str, str]:
+    """Identify the cluster namespace a discovery answer belongs to."""
+    return (
+        target.project_id.strip(),
+        target.cluster_name.strip(),
+        target.location.strip(),
+        target.namespace.strip(),
+    )
+
+
+@dataclass(frozen=True)
+class _CacheEntry:
+    value: object
+    expires_at: float
+
+
+class _Flight:
+    """One key's single-flight state: its lock, how its last attempt ended, and
+    how many times the key was invalidated, so an answer computed before an
+    invalidation is not held after it."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.attempts = 0
+        self.error: Exception | None = None
+        self.generation = 0
+
+
+class RuntimeDiscoveryCache:
+    """Thread-safe TTL cache of discovery answers, keyed by target and method.
+
+    Only successful answers are stored. Concurrent lookups of one key wait for
+    the first to finish rather than each asking the cluster: when that attempt
+    succeeds they share its answer, and when it fails the lookups queued behind
+    it get its error rather than each asking in turn. A lookup that arrives
+    after a failure asks again. Lookups of different keys never block each
+    other on a kubectl call. An answer whose computation began before an
+    `invalidate` of its target is returned to its caller but not held, so the
+    next lookup asks the cluster again rather than reading a pre-invalidation
+    answer for the rest of the window.
+    """
+
+    def __init__(
+        self,
+        ttl_seconds: float | None = None,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._ttl_seconds = ttl_seconds
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._entries: dict[tuple, _CacheEntry] = {}
+        self._in_flight: dict[tuple, _Flight] = {}
+
+    def ttl_seconds(self) -> float:
+        if self._ttl_seconds is None:
+            return runtime_cache_ttl_seconds()
+        return self._ttl_seconds
+
+    def _fresh(self, cache_key: tuple) -> _CacheEntry | None:
+        entry = self._entries.get(cache_key)
+        if entry is None:
+            return None
+        if entry.expires_at <= self._clock():
+            del self._entries[cache_key]
+            return None
+        return entry
+
+    def lookup(
+        self,
+        target: DeploymentTarget,
+        key: object,
+        compute: Callable[[], _T],
+    ) -> _T:
+        """Return the held answer for (target, key), or compute and hold it."""
+        ttl = self.ttl_seconds()
+        if ttl <= 0:
+            return compute()
+        cache_key = (_target_key(target), key)
+        with self._lock:
+            entry = self._fresh(cache_key)
+            if entry is not None:
+                return entry.value  # type: ignore[return-value]
+            flight = self._in_flight.setdefault(cache_key, _Flight())
+            joined_at = flight.attempts
+        with flight.lock:
+            with self._lock:
+                entry = self._fresh(cache_key)
+                if entry is not None:
+                    return entry.value  # type: ignore[return-value]
+                if flight.attempts != joined_at and flight.error is not None:
+                    # The attempt this lookup queued behind failed; its error
+                    # is the answer, and asking again would only queue the
+                    # same failure behind it.
+                    raise flight.error
+                generation = flight.generation
+            try:
+                value = compute()
+            except Exception as exc:
+                with self._lock:
+                    flight.attempts += 1
+                    flight.error = exc
+                raise
+            with self._lock:
+                if flight.generation == generation:
+                    # Not held when the target was invalidated while this
+                    # attempt ran: the answer may predate what the
+                    # invalidation reacted to.
+                    self._entries[cache_key] = _CacheEntry(value, self._clock() + ttl)
+                flight.attempts += 1
+                flight.error = None
+            return value
+
+    def invalidate(self, target: DeploymentTarget | None = None) -> None:
+        """Forget one target's answers, or every target's when none is given.
+
+        Answers still being computed for those targets are not held either.
+        """
+        with self._lock:
+            target_key = None if target is None else _target_key(target)
+            for cache_key in [
+                k for k in self._entries if target_key is None or k[0] == target_key
+            ]:
+                del self._entries[cache_key]
+            for cache_key, flight in self._in_flight.items():
+                if target_key is None or cache_key[0] == target_key:
+                    flight.generation += 1
+
+
+_discovery_cache = RuntimeDiscoveryCache()
+
+
+def invalidate(target: DeploymentTarget | None = None) -> None:
+    """Drop this process's discovery answers after an action that may change them."""
+    _discovery_cache.invalidate(target)
+
+
+def held_per_target(
+    resolve_target: Callable[[], DeploymentTarget],
+    build: Callable[[DeploymentTarget], _Held],
+) -> Callable[[], _Held]:
+    """Keep one built object per target, rebuilt only when the target changes.
+
+    The console's providers and chat backends are safe to share across request
+    threads (each kubectl call is its own subprocess, prepared under the
+    kubeconfig store's lock), and building one per call spawned the kubeconfig
+    probe every time.
+    """
+    lock = threading.Lock()
+    held: list[tuple[DeploymentTarget, _Held]] = []
+
+    def get() -> _Held:
+        target = resolve_target()
+        with lock:
+            if not held or held[0][0] != target:
+                held[:] = [(target, build(target))]
+            return held[0][1]
+
+    return get
+
+
+def answered_by_cluster(result: KubeCommandResult) -> bool:
+    """Whether a failed kubectl call was answered by the cluster.
+
+    A timeout or a kubeconfig-preparation failure says nothing about the pod
+    the call was aimed at, so discovering again on one would only lengthen the
+    failure it reports.
+    """
+    return not result.timed_out and result.failure is KubeFailure.NONE
+
+
 class KubectlRunner:
     """Runtime adapter over the portal's shared GKE access component."""
 
@@ -899,6 +1113,7 @@ class AgentRuntimeProvider:
         target: DeploymentTarget,
         *,
         runner: KubeRunner | None = None,
+        cache: RuntimeDiscoveryCache | None = None,
     ) -> None:
         if not (
             is_valid_project_id(target.project_id)
@@ -912,7 +1127,7 @@ class AgentRuntimeProvider:
             f"gke_{target.project_id}_{target.location}_{target.cluster_name}"
         )
         self.runner = runner or KubectlRunner(target)
-        self._canonical_agent: str | None = None
+        self._cache = cache or _discovery_cache
 
     def _base(self) -> list[str]:
         return ["--context", self.context, "-n", self.target.namespace]
@@ -954,31 +1169,50 @@ class AgentRuntimeProvider:
         """Return the one stock PlatformAgent selected for this installation."""
         return (self.canonical_agent(),)
 
+    def _discover(self, key: object, compute: Callable[[], _T]) -> _T:
+        """Answer a discovery question through the cache; a failure evicts the target."""
+        try:
+            return self._cache.lookup(self.target, key, compute)
+        except AgentRuntimeError:
+            self._cache.invalidate(self.target)
+            raise
+
     def canonical_agent(self) -> str:
         """Discover and select the stock PlatformAgent, or fail closed."""
-        if self._canonical_agent is not None:
-            return self._canonical_agent
+        return self._discover(_CANONICAL_AGENT_KEY, self._discover_canonical_agent)
+
+    def _discover_canonical_agent(self) -> str:
         resources = self.runner.run(
             [*self._base(), "get", "platformagents", "-o", "json"],
             timeout=15,
         )
         resource_payload = self._json(resources, "PlatformAgent discovery")
         try:
-            expected = select_canonical_platform_agent(resource_payload)
+            return select_canonical_platform_agent(resource_payload)
         except CanonicalPlatformAgentMissing as exc:
             raise AgentRuntimeError(
                 str(exc),
                 f"Install the stock PlatformAgent/{canonical_platform_agent_name()} "
                 "resource or select the cluster containing it.",
             ) from exc
-        self._canonical_agent = expected
-        return self._canonical_agent
 
     def gateway_endpoint(self, agent: str) -> tuple[str, str]:
-        """Return one running gateway pod and its live API container name."""
-        canonical = self.canonical_agent()
+        """Return one running gateway pod and its live API container name.
+
+        The guard compares against the stock name, which is the only answer
+        `canonical_agent` can give, so it costs no discovery of its own; with
+        the cache disabled, a discovery here would repeat the one the caller
+        just made.
+        """
+        canonical = canonical_platform_agent_name()
         if agent != canonical:
             raise ValueError(f"agentId must be the canonical PlatformAgent {canonical}")
+        return self._discover(
+            (_GATEWAY_ENDPOINT_KEY, agent),
+            lambda: self._discover_gateway_endpoint(agent),
+        )
+
+    def _discover_gateway_endpoint(self, agent: str) -> tuple[str, str]:
         result = self.runner.run(
             [
                 *self._base(),
@@ -1011,8 +1245,47 @@ class AgentRuntimeProvider:
         return self.gateway_pod(agent)
 
     def _read(self, agent: str, arguments: list[str], *, timeout: int = 25) -> dict:
-        pod, container = self.gateway_endpoint(agent)
-        result = self.runner.run(
+        _endpoint, result = self.exec_on_gateway(
+            agent, lambda endpoint: self._exec(endpoint, arguments, timeout)
+        )
+        return self._parse_read(result)
+
+    def exec_on_gateway(
+        self,
+        agent: str,
+        run: Callable[[tuple[str, str]], KubeCommandResult],
+    ) -> tuple[tuple[str, str], KubeCommandResult]:
+        """Run `run` against the held gateway endpoint; once more if the pod moved.
+
+        A failure the cluster answered may mean the held pod was replaced under
+        the call, so the target is discovered again and, only when the answer
+        moved, `run` is repeated on the new pod. A failure against a pod that
+        is still current is returned as it is, and so is a timeout or a
+        preparation failure, which say nothing about the pod. A kubectl exit
+        that was answered by nothing (a refused connection, an expired token)
+        looks like a cluster answer and fails the rediscovery the same way;
+        the call's own result is then returned rather than the discovery
+        error, so the failure is reported as the failure of what was asked.
+        Returns the endpoint the returned result ran against.
+        """
+        endpoint = self.gateway_endpoint(agent)
+        result = run(endpoint)
+        if result.returncode != 0 and answered_by_cluster(result):
+            self._cache.invalidate(self.target)
+            try:
+                current = self.gateway_endpoint(agent)
+            except AgentRuntimeError:
+                return endpoint, result
+            if current != endpoint:
+                endpoint = current
+                result = run(current)
+        return endpoint, result
+
+    def _exec(
+        self, endpoint: tuple[str, str], arguments: list[str], timeout: int
+    ) -> KubeCommandResult:
+        pod, container = endpoint
+        return self.runner.run(
             [
                 *self._base(),
                 "exec",
@@ -1027,6 +1300,8 @@ class AgentRuntimeProvider:
             ],
             timeout=timeout,
         )
+
+    def _parse_read(self, result: KubeCommandResult) -> dict:
         framed = _unframe(result.stdout)
         if framed is not None:
             expected, body = framed

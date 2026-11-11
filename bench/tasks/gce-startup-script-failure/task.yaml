@@ -1,7 +1,7 @@
-# NIGHTLY-TIER once its fixture is applied: a full audit, the same cost band
-# as the other fleet-audit cases. Until then a FIXTURE_NOT_READY entry in
-# scripts/validate_bench_cases.py, because the VM below exists in no pool
-# project yet.
+# NIGHTLY-TIER: a full audit, the same cost band as the other fleet-audit
+# cases, registered in hack/eval/nightly-cases.txt. The VM below is on every
+# pool project: the fixture-state scan of 2026-11-06 reads the startup-fail-vm
+# role healthy on all 40.
 #
 # The check this case grades is `gce-startup-script-status`, GCE compute SOP
 # §2.1: a RUNNING instance whose startup script failed. The collector
@@ -11,15 +11,18 @@
 #
 # Planted state: bench/tf/fleet/main.tf `google_compute_instance.startup_fail`,
 # `startup-fail-<cluster_prefix>` in the fleet's zone, whose script exits 1 on
-# every boot. It is a project-level object, not a cluster's, so there is no
-# fixtures.json role: that catalogue's probes are Kubernetes objects.
+# every boot. It is a project-level object, not a cluster's: the
+# project-scoped startup-fail-vm role in bench/tf/fleet/fixtures.json
+# (cluster_slot null), which the runner probes with gcloud. No check reads it
+# by `fixture_role:`, because the role has no kubeconfig.
 #
-# Eval-driven development (.agents/rules/eval_driven_development.md): red on
-# main, whose markers (`startup-script exit status 1`, `Finished running
-# startup scripts with error`) are the older guest agent's; the current agent
-# prints `Script "startup-script" failed with error: exit status 1` and a plain
-# `Finished running startup scripts`, so no finding can be filed. Green once
-# the collector recognises the current line.
+# Eval-driven development (.agents/rules/eval_driven_development.md): the
+# case was red before the collector fix. The collector knew only the markers
+# of the older guest agent (`startup-script exit status 1`, `Finished running
+# startup scripts with error`). The current agent prints `Script
+# "startup-script" failed with error: exit status 1` and a plain `Finished
+# running startup scripts`, so no finding was filed. The collector now
+# recognises the current line too, and the case is green.
 #
 # Isolation class: read-only on the project; writes the ledger issue to the
 # eval GitOps repo, as every fleet-audit stream does.
@@ -37,6 +40,14 @@ validated: false
 
 # Slug per docs/designs/domains.yaml.
 domain: fleet-audits
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: dshnayder
+
+# Documentation, and the role the lease-time fixture-drift pass reads for
+# this case (bench/kube_agents_bench/fixture_drift.py).
+fixtures:
+  - startup-fail-vm
 
 verification_spec:
   # The slug against the LEDGER's finding ids (scope: finding_ids), as

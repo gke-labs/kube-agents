@@ -77,7 +77,7 @@ func a2aWriteServingPair(t *testing.T, dir string, names []string) *x509.CertPoo
 func a2aStartRenderedWebsocket(t *testing.T) (string, *x509.CertPool) {
 	t.Helper()
 	agent := a2aTestAgent()
-	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 
 	dir := t.TempDir()
 	pool := a2aWriteServingPair(t, dir, a2aNATSDNSNames(agent))
@@ -105,6 +105,8 @@ func a2aStartRenderedWebsocket(t *testing.T) (string, *x509.CertPool) {
 	opts.Websocket.Port = -1
 	opts.StoreDir = filepath.Join(t.TempDir(), "store")
 	opts.NoSigs = true
+	// The rendered pid_file is the pod's path.
+	opts.PidFile = filepath.Join(t.TempDir(), "nats.pid")
 	s, err := natsserver.NewServer(opts)
 	if err != nil {
 		t.Fatalf("nats-server refused the rendered config: %v", err)

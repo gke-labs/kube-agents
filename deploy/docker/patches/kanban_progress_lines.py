@@ -186,6 +186,13 @@ FOLD_ANCESTOR_DEPTH = 8
 #: card has stopped as a give-up stops, parked at ``blocked`` for a human, so
 #: it settles as one (:func:`settles_as`); ``needs_input`` stays a pause.
 HARD_WALL_BLOCK_KIND = "capability"
+#: The dispatcher's own hard wall (``hermes_cli/kanban_admission.py``): a card
+#: refused for capacity (the pod's memory budget, a worker's resident-size cap,
+#: or a wait past the queue bound) is parked the same way and settles the same
+#: way; the reason names the alternatives.
+CAPACITY_BLOCK_KIND = "capacity"
+#: Every kind a block settles as a give-up under.
+HARD_WALL_BLOCK_KINDS = (HARD_WALL_BLOCK_KIND, CAPACITY_BLOCK_KIND)
 #: The kind a hard-wall block settles as.
 GAVE_UP_KIND = "gave_up"
 #: The most of a hard-wall block's reason its line carries, as
@@ -199,7 +206,7 @@ GAVE_UP_SQL = (
     "({card}.status = 'blocked' AND COALESCE((SELECT CASE g.kind WHEN 'blocked' "
     "THEN json_extract(g.payload, '$.kind') ELSE g.kind END FROM task_events g "
     "WHERE g.task_id = {card}.id AND g.kind IN ('blocked', 'unblocked', 'gave_up') "
-    "ORDER BY g.id DESC LIMIT 1), '') IN ('" + GAVE_UP_KIND + "', '" + HARD_WALL_BLOCK_KIND + "'))"
+    "ORDER BY g.id DESC LIMIT 1), '') IN ('" + "', '".join((GAVE_UP_KIND, *HARD_WALL_BLOCK_KINDS)) + "'))"
 )
 
 #: One row when the card's nearest ancestor that created more than one card is
@@ -365,7 +372,7 @@ def result_line(kind: str, payload: object) -> str:
 
 def settles_as(kind: str, payload: object) -> str:
     """The kind an event settles its plan row and its ask as: a hard-wall block as a give-up, else its own."""
-    if kind == NEEDS_YOU_KIND and isinstance(payload, dict) and payload.get("kind") == HARD_WALL_BLOCK_KIND:
+    if kind == NEEDS_YOU_KIND and isinstance(payload, dict) and payload.get("kind") in HARD_WALL_BLOCK_KINDS:
         return GAVE_UP_KIND
     return kind
 
@@ -558,7 +565,9 @@ async def _settle_reaction(adapter: Any, sub: dict, kind: str, board: Optional[s
 
 
 def _slack_quiet(sub: dict) -> Any:
-    """``kanban_notifier`` when ``KAGE_SLACK_UX`` is on for this Slack card, else None.
+    """``kanban_notifier`` when ``KAGE_SLACK_UX`` is on for this card's platform, else None:
+    a Slack card, or a Google Chat card under ``spec.mode: next``, where the gateway
+    lays the chat messages out (``kanban_notifier.chat_ux_on``).
 
     Imported when a delivery runs: ``gateway/kanban_notifier.py`` is copied into
     the image after this module, and this one's build-time check runs before it
@@ -572,7 +581,7 @@ def _slack_quiet(sub: dict) -> Any:
         except ImportError:
             return None
     try:
-        return kanban_notifier if kanban_notifier.slack_ux_on(sub.get("platform")) else None
+        return kanban_notifier if kanban_notifier.chat_ux_on(sub.get("platform")) else None
     except Exception as exc:  # noqa: BLE001 — presentation must not fail a delivery
         logger.debug("kanban progress: reading KAGE_SLACK_UX failed: %s", exc)
         return None
@@ -948,9 +957,9 @@ def _wake_reply_lost(adapter: Any) -> bool:
     Under ``spec.mode: next`` a conversation card's wake is self-posted into
     the bridge's session and its reply goes nowhere
     (``kanban_chat_notify.ConversationNotifyAdapter``), so a line held for it
-    would never be told. Only a hard-wall block is posted instead (see
-    :func:`deliver`): a give-up or crash on such a card is still held and
-    dropped, a gap this module leaves to the next-mode wake work.
+    would never be told: :func:`deliver` holds nothing for such a card and
+    posts the line, a hard-wall block's reason as the answer and a give-up,
+    crash or timeout as its own line.
     """
     notify = _chat_notify()
     stand_in = getattr(notify, "ConversationNotifyAdapter", None) if notify is not None else None
@@ -1123,7 +1132,7 @@ async def deliver(
             await _settle_reaction(adapter, sub, settled_as, board)
             await _pr_opened(moments, adapter, sub, _with_summary(ev, message), None)
             return None
-        if not (hard_wall and _wake_reply_lost(adapter)) and _explained_by_wake(quiet, sub, kind) and _hold(
+        if not _wake_reply_lost(adapter) and _explained_by_wake(quiet, sub, kind) and _hold(
             quiet, watcher, sub, kind, event_id, message, metadata,
         ):
             await _settle_reaction(adapter, sub, settled_as, board)

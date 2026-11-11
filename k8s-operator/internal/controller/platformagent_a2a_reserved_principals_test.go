@@ -58,7 +58,7 @@ func renderedNATSConfAuthUsers(t *testing.T, conf string) []string {
 
 func calloutContainer(t *testing.T, agent *agentv1alpha1.PlatformAgent) corev1.Container {
 	t.Helper()
-	for _, c := range buildA2ACalloutDeployment(agent, "").Spec.Template.Spec.Containers {
+	for _, c := range buildA2ACalloutDeployment(agent, "", 1).Spec.Template.Spec.Containers {
 		if c.Name == "callout" {
 			return c
 		}
@@ -69,7 +69,7 @@ func calloutContainer(t *testing.T, agent *agentv1alpha1.PlatformAgent) corev1.C
 
 func TestTheCalloutReservesExactlyTheNATSConfStaticUsers(t *testing.T) {
 	agent := authMapTestAgent()
-	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 	authUsers := renderedNATSConfAuthUsers(t, conf)
 	if len(authUsers) == 0 {
 		t.Fatal("the rendered auth_users list is empty; the comparison below would pass vacuously")

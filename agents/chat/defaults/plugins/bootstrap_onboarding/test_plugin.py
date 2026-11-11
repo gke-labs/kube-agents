@@ -11,6 +11,7 @@ the greeting context it returns.
 
 import enum
 import json
+import types
 import os
 import sqlite3
 import subprocess
@@ -415,6 +416,103 @@ class PreLlmCallTest(unittest.TestCase):
 
     # --- one-time means one time ----------------------------------------
 
+    def test_a_first_turn_after_the_report_was_filed_points_at_the_issue_once(self):
+        """Nobody wrote within a day, so the delivery stage filed the report as an issue and
+        claimed delivery; the first human after that gets the link, not a report that is not coming."""
+        (self.data_dir / ".bootstrap_completed").touch()
+        (self.data_dir / plugin.REPORT_FILED_MARKER).write_text(
+            json.dumps({"repo": "acme/fleet", "number": 75, "url": "https://github.com/acme/fleet/issues/75",
+                        "filed_at": 1794003335.0}), encoding="utf-8")
+        first = self._call()
+        self.assertIsNotNone(first)
+        self.assertIn("https://github.com/acme/fleet/issues/75", first["context"])
+        self.assertIn("REPORT FILED", first["context"])
+        self.assertIn("(filed 2026-11-06 22:15 UTC)", first["context"])
+        self.assertIn("Want me to start on one of those findings?", first["context"])
+        self.assertTrue((self.data_dir / plugin.GREETED_MARKER).exists())
+        self.update_job.assert_not_called()
+        self.assertFalse((self.data_dir / ".user_aligned").exists(), "nothing is bound: the report is in the issue")
+        self.assertIsNone(self._call(), "once")
+
+    def test_an_alert_turn_does_not_spend_the_filed_greeting(self):
+        """Alert, triage and A2A-door turns are API-server turns with no conversation route."""
+        (self.data_dir / ".bootstrap_completed").touch()
+        (self.data_dir / plugin.REPORT_FILED_MARKER).write_text(
+            json.dumps({"url": "https://github.com/acme/fleet/issues/75", "filed_at": 1794003335.0}), encoding="utf-8")
+        no_route = types.SimpleNamespace(conversation_route=lambda sid: {})
+        with mock.patch.object(plugin, "_load_chat_notify", return_value=no_route):
+            self.assertIsNone(self._call(platform="api_server", session_id="triage-1"))
+        self.assertFalse((self.data_dir / plugin.GREETED_MARKER).exists(), "the one-time greeting is kept for a human")
+        routed = types.SimpleNamespace(
+            conversation_route=lambda sid: {"platform": "slack", "conversation": "slack:D1/1.2", "context_id": "c1"})
+        with mock.patch.object(plugin, "_load_chat_notify", return_value=routed):
+            first = self._call(platform="api_server", session_id="a2a-human-1")
+        self.assertIsNotNone(first)
+        self.assertIn("issues/75", first["context"])
+
+    def test_after_a_retire_the_first_turn_still_sets_the_home_channel_and_says_nothing(self):
+        (self.data_dir / ".bootstrap_completed").touch()
+        (self.data_dir / ".bootstrap_report_retired").touch()
+        with mock.patch.object(plugin, "_set_home_channel_if_unset", return_value=True) as home:
+            self.assertIsNone(self._call())
+        home.assert_called_once()
+        self.assertTrue((self.data_dir / plugin.GREETED_MARKER).exists())
+        with mock.patch.object(plugin, "_set_home_channel_if_unset", return_value=True) as again:
+            self.assertIsNone(self._call())
+        again.assert_not_called()
+
+    def test_an_override_with_a_literal_brace_still_greets(self):
+        (self.data_dir / ".bootstrap_completed").touch()
+        (self.data_dir / plugin.REPORT_FILED_MARKER).write_text(
+            json.dumps({"url": "https://github.com/acme/fleet/issues/75", "filed_at": 1794003335.0}), encoding="utf-8")
+        base = self.data_dir / "onboarding"
+        base.mkdir(exist_ok=True)
+        (base / plugin.REPORT_FILED_INSTRUCTIONS).write_text('Say {"ok": true} and link {url}', encoding="utf-8")
+        first = self._call()
+        self.assertIn('{"ok": true}', first["context"])
+        self.assertIn("issues/75", first["context"])
+
+    def test_the_filed_greeting_says_so_when_it_set_the_home_channel(self):
+        (self.data_dir / ".bootstrap_completed").touch()
+        (self.data_dir / plugin.REPORT_FILED_MARKER).write_text(
+            json.dumps({"url": "https://github.com/acme/fleet/issues/75", "filed_at": 1794003335.0}), encoding="utf-8")
+        with mock.patch.object(plugin, "_set_home_channel_if_unset", return_value=True):
+            first = self._call()
+        self.assertIn(plugin.HOME_CHANNEL_INSTRUCTION, first["context"])
+
+    def test_an_operator_can_override_the_filed_instruction(self):
+        (self.data_dir / ".bootstrap_completed").touch()
+        (self.data_dir / plugin.REPORT_FILED_MARKER).write_text(
+            json.dumps({"url": "https://github.com/acme/fleet/issues/75", "filed_at": 1794003335.0}), encoding="utf-8")
+        base = self.data_dir / "onboarding"
+        base.mkdir(exist_ok=True)
+        (base / plugin.REPORT_FILED_INSTRUCTIONS).write_text("Custom: {url}{dated}", encoding="utf-8")
+        first = self._call()
+        self.assertIn("Custom: https://github.com/acme/fleet/issues/75", first["context"])
+
+    def test_the_filed_greeting_still_sets_the_home_channel_on_today(self):
+        (self.data_dir / ".bootstrap_completed").touch()
+        (self.data_dir / plugin.REPORT_FILED_MARKER).write_text(
+            json.dumps({"url": "https://github.com/acme/fleet/issues/75", "filed_at": 1794003335.0}), encoding="utf-8")
+        with mock.patch.object(plugin, "_set_home_channel_if_unset", return_value=True) as home:
+            self.assertIsNotNone(self._call())
+        home.assert_called_once()
+
+    def test_a_filed_record_without_a_time_names_no_date(self):
+        (self.data_dir / ".bootstrap_completed").touch()
+        (self.data_dir / plugin.REPORT_FILED_MARKER).write_text(
+            json.dumps({"url": "https://github.com/acme/fleet/issues/75", "filed_at": "nope"}), encoding="utf-8")
+        first = self._call()
+        self.assertIn("https://github.com/acme/fleet/issues/75", first["context"])
+        self.assertNotIn("unknown", first["context"])
+        self.assertNotIn("UTC", first["context"])
+
+    def test_a_filed_record_without_an_address_changes_nothing(self):
+        (self.data_dir / ".bootstrap_completed").touch()
+        (self.data_dir / plugin.REPORT_FILED_MARKER).write_text(json.dumps({"repo": "acme/fleet", "number": 75}), encoding="utf-8")
+        self.assertIsNone(self._call())
+        self.assertFalse((self.data_dir / plugin.GREETED_MARKER).exists())
+
     def test_greets_only_once_across_sessions(self):
         """Every new session opens with is_first_turn=True.
 
@@ -642,6 +740,23 @@ class PreLlmCallTest(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertIn("SCAN IN PROGRESS", result["context"])
         self.assertIn("IN-PROGRESS-INSTRUCTIONS", result["context"])
+
+    def test_eval_marker_filed_gives_the_pointer_greeting_without_a_record(self):
+        self._plant(variant=plugin.EVAL_VARIANT_FILED, url="https://github.com/acme/fleet/issues/75", filed_at=1794003335)
+        first = self._eval_call()
+        self.assertIn("REPORT FILED", first["context"])
+        self.assertIn("https://github.com/acme/fleet/issues/75", first["context"])
+        self.assertIn("(filed 2026-11-06 22:15 UTC)", first["context"])
+        self.assertFalse((self.data_dir / plugin.REPORT_FILED_MARKER).exists(), "the seam reads and writes no record")
+        self.assertFalse((self.data_dir / plugin.GREETED_MARKER).exists(), "a retried turn greets again")
+
+    def test_eval_marker_filed_without_an_address_is_ignored(self):
+        self._plant(variant=plugin.EVAL_VARIANT_FILED, url="not a url")
+        self.assertIsNone(self._eval_call())
+
+    def test_eval_marker_filed_with_home_channel_set_adds_the_sentence(self):
+        self._plant(variant=plugin.EVAL_VARIANT_FILED, url="https://github.com/acme/fleet/issues/75", home_channel_set=True)
+        self.assertIn(plugin.HOME_CHANNEL_INSTRUCTION, self._eval_call()["context"])
 
     def test_eval_marker_variant_picks_the_completed_instructions(self):
         self._plant(variant="completed")

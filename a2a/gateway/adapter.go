@@ -36,6 +36,23 @@ type InboundMessage struct {
 	MessageID string
 	// Text is the message content.
 	Text string
+	// Quoted is the turn's text when it reaches an agent: the member's words
+	// followed by the message they quoted, framed; empty when the message
+	// quotes nothing. Text stays the member's own words so the gateway's
+	// command matchers read them: a stop or a status ask quoted onto an
+	// alert is answered on the words alone, and the router puts Quoted in
+	// Text's place only for a turn that reaches an agent (agentText). Set by
+	// Google Chat's quote-in-reply (gchat.go, quotedAsk); empty on every
+	// other path.
+	Quoted string
+	// QuotedUnread marks a message that quoted one the adapter could not
+	// read (the read refused or timed out, or a card or an image with no
+	// text), so the words travel alone: Quoted is empty and the member is
+	// owed one line saying so. The router posts that line only for a turn
+	// that reaches an agent (noteUnreadQuote), since a command it answers
+	// itself never needed the quote. Set with words beside the quote; a
+	// bare quote that could not be read is no turn (gchat.go, quotedAsk).
+	QuotedUnread bool
 
 	// Backend names the ingress this message arrived through, and empty
 	// means the gateway's own configured backend. It exists because one
@@ -44,6 +61,14 @@ type InboundMessage struct {
 	// rather than of the process. A message that says nothing is attributed
 	// to the configured backend, which is every chat backend's case.
 	Backend string
+
+	// Profile, when set, addresses this turn to an AgentProfile, with
+	// Parameters its task parameters (the target cluster's project, location
+	// and cluster for cluster work). Only the console sets it today, whose
+	// clients name an agent; every chat backend leaves it empty and its
+	// turns go to the conversation's route.
+	Profile    string
+	Parameters map[string]string
 
 	// Intent, when set, is a control action the backend expressed directly
 	// rather than a message to be understood. Empty is an ordinary message.
@@ -58,17 +83,19 @@ type InboundMessage struct {
 	TaskID string
 	// TopLevel marks a message that roots a conversation of its own in a
 	// space whose questions each get their own thread, rather than one
-	// typed inside a thread: today a top-level Slack DM, which the adapter
-	// keys on its own message id. Such a conversation has nothing running
-	// in it, so a stop or a status question there gets a reply saying
-	// where to send it instead of being read as an ask. False is every
-	// other message, and every other backend's case.
+	// typed inside a thread: a top-level Slack DM, or a top-level Google
+	// Chat DM whose message has a thread of its own, which the adapter keys
+	// on its own message id or thread. Such a conversation
+	// has nothing running in it, so a stop or a status question there gets
+	// a reply saying where to send it instead of being read as an ask.
+	// False is every other message, and every other backend's case.
 	TopLevel bool
 	// Click marks a message that is a click on a choice button rather than a
 	// message of its own: MessageID then names the click (the audit chain's
 	// join), not a message anything can be drawn on. A chain a click starts
 	// carries its mark on the conversation's previous ask instead (mark.go).
-	// False for a typed message, and for every backend but Slack.
+	// False for a typed message, and for every backend but Slack and Google
+	// Chat.
 	Click bool
 	// Answer marks a typed message that answers a question the conversation
 	// has open (one the adapter laid out with choices). Like a click, it
@@ -129,14 +156,16 @@ type Adapter interface {
 	// the reason. Either way nothing was posted, and the gateway posts
 	// m.Text instead, chunked under the backend's cap (Gateway.postMessage).
 	// With m.Chat nil it is Post(conversation, m.Text), unless m.Feedback
-	// marks an answer a backend draws rating controls on (feedback.go).
+	// marks an answer a backend draws rating controls on (feedback.go), or
+	// m.Stop a task's live message a backend draws a Stop control on.
 	PostMessage(conversation string, m OutMessage) (messageID string, err error)
 
 	// EditMessage replaces a posted message with m, laid out or not, under
 	// PostMessage's rules: ErrTextOnly from a backend that renders no chat
 	// message, which the gateway answers with Edit. With m.Chat nil a
 	// backend that laid the message out before replaces the layout with the
-	// text; any other backend makes it Edit.
+	// text; any other backend makes it Edit. m.Stop is read as on
+	// PostMessage, and an edit without it takes the Stop control off.
 	EditMessage(conversation, messageID string, m OutMessage) error
 
 	// Roster returns the members of a conversation in the same vocabulary
@@ -223,12 +252,19 @@ type OutMessage struct {
 	// feedback, feedback.go). A backend that draws rating controls draws
 	// them on this message; every other backend ignores it.
 	Feedback string
+	// Stop, when set, is the id of the running task whose live message
+	// this is: the status line the gateway posts for a task and edits as
+	// it moves (relay.go). A backend that draws a Stop control draws it on
+	// this message, naming that task, and an edit without Stop takes it
+	// off, which is the terminal edit; every other backend ignores it.
+	Stop string
 }
 
 // ErrTextOnly is a backend's answer to a message value with a chat message
-// when it renders none: Discord, Google Chat, the inject door, the console
-// and the A2A door. The gateway posts the text instead, so every one of them
-// posts exactly what it posted before chat messages existed.
+// when it renders none: Discord, the inject door, the console and the A2A
+// door. The gateway posts the text instead, so every one of them posts
+// exactly what it posted before chat messages existed. Slack and Google
+// Chat render one (slack_chat.go, gchat_chat.go).
 var ErrTextOnly = errors.New("this backend posts text only")
 
 // ErrLayoutRefused wraps a backend's refusal of one chat message's layout:
@@ -500,6 +536,22 @@ type SessionLookupSink interface {
 	SetSessionLookup(lookup SessionLookup, idleTTL time.Duration)
 }
 
+// SenderAdmission reports whether the gateway would take a turn from author
+// on backend: the same gate verifySender applies, read ahead of the hand-over
+// by an adapter that has to decide on its own goroutine whether to post
+// anything in the sender's conversation before the gateway has seen them
+// (the Google Chat adapter's line on a quote it could not read). It decides
+// nothing about the turn: verifySender still rules on every message.
+type SenderAdmission func(backend, author string) bool
+
+// SenderAdmissionSink is the optional extension an Adapter implements to
+// receive the gateway's SenderAdmission. Wired in New the way
+// SessionLookupSink is; an adapter without it posts nothing ahead of the
+// gateway.
+type SenderAdmissionSink interface {
+	SetSenderAdmission(admits SenderAdmission)
+}
+
 // ConversationState is one read's answer: the record as it stands, plus the
 // two gateway-wide facts a caller needs beside it.
 type ConversationState struct {
@@ -583,6 +635,13 @@ type ConversationState struct {
 	Usage        *lib.Usage
 	ChildUsage   *lib.Usage
 	UsagePartial bool
+	// ChildAddressees names whom the chain delegated to: each child task's
+	// addressee under TaskID's root, a profile's name or platform, once
+	// each in the order delegated (chainChildAddressees), empty when it
+	// delegated nothing, nil when the task is unknown. Read from the
+	// record, so it costs no stream read. Only the inject door's read
+	// route carries it, for a harness grading which agent a turn chose.
+	ChildAddressees []string
 }
 
 // chainUsageKey marks a probe's context as asking for

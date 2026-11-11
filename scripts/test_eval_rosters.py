@@ -13,7 +13,8 @@ so is the 2026-09-22 decision that the presubmit runs the blocking roster
 only (HELD_OUT_TO_NIGHTLY: the seven held-out cases that left the presubmit
 file for the nightly one that day) and the held-out seats a coverage tracker
 puts back in the presubmit file without a roster line (HELD_OUT_IN_PRESUBMIT,
-the documented exception: #2013; #2016's seat took its roster line 2026-10-14) and the
+the documented exception: #2016's seat took its roster line 2026-10-14 and
+#2013's on 2026-11-02, RESEATED_FROM_HELD_OUT) and the
 cases demoted since (DEMOTED_AFTER_THE_SPLIT) -- and the nightly file holds the
 script's nightly array plus the nine cases the TASKS array held commented
 out, which the same decision moved into the nightly (#1546, #1564), plus
@@ -44,13 +45,17 @@ import pathlib
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
+
+import yaml
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 import eval_rosters
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+TASKS_DIR = REPO_ROOT / "bench" / "tasks"
 SCRIPT = REPO_ROOT / "hack" / "ci-eval-pr.sh"
 
 # The TASKS array's uncommented entries at the split (main at 8263e7fd), in
@@ -231,17 +236,21 @@ PARKED_AFTER_THE_MOVE: list[str] = []
 # (case, the roster line it follows): the file keeps the presubmit file's
 # reporting order.
 ADMITTED_AFTER_THE_SPLIT = [
-    # 2026-09-22 (#1023): 529/570 graded presubmit repetitions since #1626, no collapse.
+    # 2026-09-22 (#1023): above the bar on the presubmit since #1626, no collapse.
     ("capacity-pinned-pool-probe", "reliability-pdb-probe"),
-    # 2026-09-22 (#1023): 10/12 on the same four nights, both misses platform bugs (#1840, #1874).
+    # 2026-09-22 (#1023): above the bar on the same four nights, both misses platform bugs (#1840, #1874).
     ("incident-triage-oom-event-probe", "cluster-agent-crashloop-evidence-chain"),
-    # 2026-10-14 (#2016): 3/3 on the three writers nightlies 10-12 to 10-14, the store at would-admit, 90.2% of 2,086 graded presubmit repetitions since #2263 (10-03).
-    # Demoted 2026-10-17 (#3120); back 2026-10-26 after #3145: 21/21 on the writers nightlies since the claude-opus-5-5 key of 10-19, 9/9 since #3145, the store at collecting.
+    # 2026-10-14 (#2016): clean on the three writers nightlies 10-12 to 10-14, the store at would-admit, the presubmit above the bar since #2263 (10-03).
+    # Demoted 2026-10-17 (#3120); back 2026-10-26 after #3145: clean on the writers nightlies since the model change of 10-19, the nights since #3145 included, the store at collecting.
     ("pdb-remediation-pr", "obtainability-remediation-proposal"),
-    # 2026-10-23: 42/42 on the fourteen writers nightlies 10-09 to 10-22 (12/12 since the claude-opus-5-5 key of 10-19), the store at collecting.
+    # 2026-10-23: clean on the fourteen writers nightlies 10-09 to 10-22, the four since the model change of 10-19 included, the store at collecting.
     ("vcs-spent-branch-reuse", "agent-kanban-smoke"),
-    # 2026-10-26: 33/34 on the twelve graded main nightlies 10-13 to 10-26 (14/14 since the claude-opus-5-5 key of 10-19, 5/5 under spec.mode next), the store at collecting.
+    # 2026-10-26: one miss on the twelve graded main nightlies 10-13 to 10-26, clean since the model change of 10-19 and under spec.mode next, the store at collecting.
     ("consistency-drift-outlier", "cost-idle-pool-probe"),
+    # 2026-11-02 (#2013 step 4, #4094): clean on the twelve graded main nightlies 10-20 to 11-02 and at the current next key (the store at collecting), the presubmit above the bar 10-27 to 11-02 with no all-reps collapse.
+    ("compliance-rbac-overgrant", "vcs-spent-branch-reuse"),
+    # 2026-11-02 (#4095): clean on the seven main-b nightlies 10-27 to 11-02, every one under spec.mode next, on both sides of the model change of 10-29, the store at collecting.
+    ("monitoring-alert-policy-read", "incident-triage-oom-event-probe"),
 ]
 # Moved from the nightly file into the presubmit one after the split, as
 # (case, the presubmit line it follows); the same case leaves the nightly
@@ -252,6 +261,7 @@ PROMOTED_AFTER_THE_SPLIT = [
     ("pdb-remediation-pr", "obtainability-remediation-proposal"),  # 2026-10-14 (#2016), from its held-out seat; again 2026-10-26, from the nightly file (#3120)
     ("vcs-spent-branch-reuse", "agent-kanban-smoke"),  # 2026-10-23, from the nightly file's frozen part
     ("consistency-drift-outlier", "cost-idle-pool-probe"),  # 2026-10-26, from the nightly file's frozen part
+    ("monitoring-alert-policy-read", "incident-triage-oom-event-probe"),  # 2026-11-02 (#4095), from the nightly file's sorted section, which pins no history
 ]
 # Moved from the presubmit file to the end of the nightly one on 2026-09-22
 # (#1023), when the eval crew decided the presubmit runs the blocking roster
@@ -265,7 +275,7 @@ HELD_OUT_TO_NIGHTLY = [
     "obtainability-fleet-exposure-sweep",  # #1049, never admitted
     "obtainability-healthy-namespace-silence",  # #1049, never admitted
     "rca-remediation-pr",  # demoted 2026-09-02, #1189
-    "compliance-rbac-overgrant",  # demoted 2026-09-02, #1171; seated back in the presubmit 2026-09-29 (HELD_OUT_IN_PRESUBMIT)
+    "compliance-rbac-overgrant",  # demoted 2026-09-02, #1171; seated back in the presubmit 2026-09-29, its roster line 2026-11-02 (RESEATED_FROM_HELD_OUT)
     "cluster-agent-healthy-workload-no-finding",  # held out on #1010
 ]
 
@@ -280,9 +290,23 @@ HELD_OUT_TO_NIGHTLY = [
 # roster-line step deletes the entry here and adds the name to
 # blocking-roster.txt. roster <= presubmit holds; presubmit == roster holds
 # less exactly this list.
-HELD_OUT_IN_PRESUBMIT = [
-    ("compliance-rbac-overgrant", "vcs-spent-branch-reuse"),  # #2013 step 2, seated 2026-09-29 after agent-kanban-smoke; the roster line is step 4
+HELD_OUT_IN_PRESUBMIT: list[tuple[str, str]] = []
+# A held-out seat that took its roster line without ever leaving the
+# presubmit file, as (case, the presubmit line it follows): its line moved
+# up out of the held-out section and its name joined blocking-roster.txt in
+# one edit. It is in the presubmit and on the roster like a promoted case,
+# but it is pinned here rather than in PROMOTED_AFTER_THE_SPLIT because its
+# split-time presubmit line is also in HELD_OUT_TO_NIGHTLY, so the
+# presubmit expectation drops that line and re-inserts this one, and the
+# nightly expectation leaves it out. pdb-remediation-pr's seat could take
+# the PROMOTED_AFTER_THE_SPLIT route on 2026-10-14 because its split-time
+# line was not in HELD_OUT_TO_NIGHTLY. A later demotion of a case here is
+# the ordinary one: the entry stays, DEMOTED_AFTER_THE_SPLIT records it
+# with None, and the DEMOTED filter removes it from every expectation.
+RESEATED_FROM_HELD_OUT = [
+    ("compliance-rbac-overgrant", "vcs-spent-branch-reuse"),  # #2013 step 2 seated it 2026-09-29; step 4, the roster line, 2026-11-02 (#4094)
 ]
+RESEATED = {case for case, _ in RESEATED_FROM_HELD_OUT}
 
 
 # Demoted after the split under docs/eval-gate-roster.md "Demoting a flaky
@@ -297,7 +321,7 @@ DEMOTED_AFTER_THE_SPLIT = [
     # fleet-cost-idle-pool) and took its roster line back on three clean nightlies after #3338.
     # pdb-remediation-pr sat here 2026-10-17 to 2026-10-26 (#3120; its line followed
     # fleet-cost-idle-pool) and took its roster line back after #3145 seeded the manifest it needs.
-    ("consistency-authorized-networks-probe", None),  # 2026-10-21, #3598 (Gemini reads seeded-c's leftover authorized-networks block as configured; #3448 for the 429s)
+    ("consistency-authorized-networks-probe", None),  # 2026-10-21, #3598 (the agent model of the day read seeded-c's leftover authorized-networks block as configured; #3448 for the 429s)
 ]
 DEMOTED = {case for case, _ in DEMOTED_AFTER_THE_SPLIT}
 # The demotions recorded before the freeze (#3495), whose lines sit in the
@@ -378,6 +402,67 @@ class ParserTest(unittest.TestCase):
         self.assertTrue(eval_rosters.presubmit_cases())
         self.assertTrue(eval_rosters.nightly_cases())
         self.assertTrue(eval_rosters.blocking_roster())
+
+
+def cases_without_a_suite_line(roster: pathlib.Path, tasks_dir: pathlib.Path) -> list[str]:
+    """Certification-roster cases whose task file lacks `suite: certification`,
+    read as the validator reads it: the parsed top-level key, not a raw line."""
+    return [
+        case for case in eval_rosters.certification_cases(roster)
+        if (yaml.safe_load((tasks_dir / case / "task.yaml").read_text(encoding="utf-8")) or {}).get("suite")
+        != eval_rosters.CERTIFICATION_SUITE
+    ]
+
+
+class CertificationFileTest(unittest.TestCase):
+    """hack/eval/certification-cases.txt: the suite's own lane, in `# part N`
+    sections, disjoint from the presubmit and nightly files."""
+
+    def test_the_parts_parser_reads_the_markers_the_shell_reads(self):
+        text = "# header\n./tasks/a-case/task.yaml\n# part 2\n./tasks/b-case/task.yaml # note\n\n#  part 4\n./tasks/c-case/task.yaml\n# part 3\n"
+        self.assertEqual(eval_rosters.parse_certification_parts(text), {1: ["a-case"], 2: ["b-case"], 4: ["c-case"]})
+        self.assertEqual(eval_rosters.parse_certification_parts("# part 1\n"), {})
+        with self.assertRaises(ValueError):
+            eval_rosters.parse_certification_parts("# part 1\na-case\n")
+
+    def test_a_line_that_is_not_a_marker_to_the_shell_is_a_comment_here_too(self):
+        # The awk twin in hack/ci-eval-pr.sh: `#` then whitespace, `part`, a
+        # number from 1, nothing else, at the start of the line.
+        for not_a_marker in ("#part 2\n", "  # part 2\n", "# part 0\n", "# part 2 # note\n", "# parts 2\n"):
+            with self.subTest(line=not_a_marker):
+                parts = eval_rosters.parse_certification_parts(not_a_marker + "./tasks/a-case/task.yaml\n")
+                self.assertEqual(parts, {1: ["a-case"]})
+
+    def test_the_suite_line_check_runs_over_a_scratch_roster(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            cases = (
+                ("with-line", "id: with-line\nsuite: certification\n"),
+                ("quoted-with-note", 'id: quoted-with-note\nsuite: "certification"  # the page row\n'),
+                ("without-line", "id: without-line\n"),
+                ("line-in-prompt", "id: line-in-prompt\nprompt: |\n  x\nsuite: certification\n".replace("\nsuite:", "\n  suite:")),
+            )
+            for case, body in cases:
+                (root / case).mkdir()
+                (root / case / "task.yaml").write_text(body)
+            roster = root / "certification-cases.txt"
+            roster.write_text("".join(f"./tasks/{case}/task.yaml\n" for case, _ in cases))
+            self.assertEqual(cases_without_a_suite_line(roster, root), ["without-line", "line-in-prompt"])
+
+    def test_the_real_file_parses_and_shares_no_case_with_the_other_rosters(self):
+        certification = eval_rosters.certification_cases()
+        self.assertEqual(sorted(certification), sorted(set(certification)), "a case is listed once")
+        shared = set(certification) & (set(eval_rosters.presubmit_cases()) | set(eval_rosters.nightly_cases()))
+        self.assertEqual(shared, set(), "a certification case runs on its lane only")
+        self.assertEqual(sum(len(v) for v in eval_rosters.certification_parts().values()), len(certification))
+
+    def test_every_certification_case_declares_its_suite(self):
+        self.assertEqual(cases_without_a_suite_line(eval_rosters.CERTIFICATION_CASES_FILE, TASKS_DIR), [])
+
+    def test_the_summary_counts_the_file(self):
+        got = eval_rosters.summary()
+        self.assertEqual(got["certification cases"], len(eval_rosters.certification_cases()))
+        self.assertEqual(got["certification parts"], len(eval_rosters.certification_parts()))
 
 
 class NightlySortedSectionTest(unittest.TestCase):
@@ -468,9 +553,13 @@ class SplitLostNothingTest(unittest.TestCase):
     def test_the_presubmit_file_is_the_tasks_array_at_the_split_plus_the_promoted_less_the_held_out(self):
         expected = [
             c for c in with_insertions(PRESUBMIT_AT_SPLIT, PROMOTED_AFTER_THE_SPLIT)
-            if c not in HELD_OUT_TO_NIGHTLY and c not in DEMOTED
+            if c not in HELD_OUT_TO_NIGHTLY
         ]
-        self.assertEqual(eval_rosters.presubmit_cases(), with_insertions(expected, HELD_OUT_IN_PRESUBMIT))
+        # The DEMOTED filter runs last, after the reseated and held-out
+        # insertions, so a demotion of any of them is the ordinary edit.
+        self.assertEqual(
+            eval_rosters.presubmit_cases(),
+            [c for c in with_insertions(expected, RESEATED_FROM_HELD_OUT + HELD_OUT_IN_PRESUBMIT) if c not in DEMOTED])
 
     def test_the_presubmit_runs_the_blocking_roster_plus_the_held_out_seats_and_nothing_else(self):
         # Decided 2026-09-22 (#1023): a case that cannot red a pull request
@@ -494,12 +583,26 @@ class SplitLostNothingTest(unittest.TestCase):
                 # A seat for a case registered after the freeze came from the
                 # sorted section, which pins no history; its seat cites its record.
         for case in HELD_OUT_TO_NIGHTLY:
-            if case in seated:
+            if case in seated or case in RESEATED:
                 continue
             with self.subTest(case=case):
                 self.assertNotIn(case, eval_rosters.presubmit_cases())
                 self.assertNotIn(case, eval_rosters.blocking_roster())
                 self.assertIn(case, eval_rosters.nightly_cases())
+
+    def test_a_reseated_case_sits_after_its_line_and_is_pinned_once(self):
+        # A seat that took its roster line in place (RESEATED_FROM_HELD_OUT):
+        # its membership is held with the promoted cases below; what is new
+        # here is its place in the presubmit file and the cross-list pins.
+        for case, follows in RESEATED_FROM_HELD_OUT:
+            if case in DEMOTED:
+                continue  # demoted since; test_a_demoted_case_is_in_the_nightly_only holds it
+            with self.subTest(case=case):
+                presubmit = eval_rosters.presubmit_cases()
+                self.assertEqual(presubmit.index(case), presubmit.index(follows) + 1)
+                self.assertIn(case, HELD_OUT_TO_NIGHTLY, "a reseated case is one that left for the nightly on 2026-09-22 and came back held out")
+                self.assertNotIn(case, {c for c, _ in HELD_OUT_IN_PRESUBMIT})
+                self.assertIn(case, {c for c, _ in ADMITTED_AFTER_THE_SPLIT})
 
     def test_the_blocking_roster_is_bootstrap_admitted_at_the_split_plus_the_admitted(self):
         self.assertEqual(
@@ -523,7 +626,7 @@ class SplitLostNothingTest(unittest.TestCase):
             [
                 c
                 for c in expected + HELD_OUT_TO_NIGHTLY + ADDED_AT_THE_TAIL + ADDED_AFTER_THE_MOVE
-                if c not in seated and c not in PARKED_AFTER_THE_MOVE
+                if c not in seated and c not in RESEATED and c not in PARKED_AFTER_THE_MOVE
             ],
             DEMOTED_AFTER_THE_SPLIT,
         )
@@ -552,7 +655,7 @@ class SplitLostNothingTest(unittest.TestCase):
                 self.assertNotIn(case, eval_rosters.blocking_roster())
 
     def test_a_promoted_case_is_in_the_presubmit_and_on_the_roster_and_not_in_the_nightly(self):
-        for case, _ in PROMOTED_AFTER_THE_SPLIT:
+        for case, _ in PROMOTED_AFTER_THE_SPLIT + RESEATED_FROM_HELD_OUT:
             if case in DEMOTED:
                 continue  # demoted since its promotion; test_a_demoted_case_is_in_the_nightly_only holds it
             with self.subTest(case=case):
@@ -611,6 +714,30 @@ def positive_check_types(node, negations: int = 0) -> set:
             found |= positive_check_types(item, negations)
         return found
     return set()
+
+
+class GHESLaneTest(unittest.TestCase):
+    """hack/eval/ghes-cases.txt: what the GHES lane runs (kube-agents#3684),
+    under the GitLab lane's rules: registered cases that grade the forge."""
+
+    FORGE_CHECKS = {"pull_request_opened", "pull_request_diff_contains", "ledger_issue_contains"}
+    PINNED = ["vcs-spent-branch-reuse", "vcs-review-feedback-read-back", "pdb-remediation-pr"]
+
+    def test_the_file_is_the_pinned_set(self):
+        self.assertEqual(eval_rosters.ghes_cases(), self.PINNED)
+
+    def test_every_lane_case_is_registered_and_grades_the_forge(self):
+        import yaml
+
+        registered = eval_rosters.presubmit_cases() + eval_rosters.nightly_cases()
+        for case in eval_rosters.ghes_cases():
+            with self.subTest(case=case):
+                self.assertIn(case, registered, "the lane picks from the catalogue, it does not register")
+                doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
+                self.assertTrue(positive_check_types(doc) & self.FORGE_CHECKS, f"{case} grades nothing on the forge")
+
+    def test_no_commented_out_case_path(self):
+        self.assertEqual(eval_rosters.commented_out_cases(eval_rosters.GHES_CASES_FILE.read_text(encoding="utf-8")), [])
 
 
 class GitLabLaneTest(unittest.TestCase):
@@ -731,6 +858,7 @@ class InjectLaneExclusionsTest(unittest.TestCase):
 # inject door can carry. An edit to the file edits this set.
 API_LANE_EXCLUDED = [
     "chat-stop-halts-delegated-remediation",  # #3263: the harness types `stop` through the door
+    "chat-stop-mid-turn-files-no-card",  # #3263: the same, while the opening turn runs
     "chat-question-asked-to-choose-pauses",  # #4004: grades the question only the inject lane's board read folds in
     "chat-reply-under-pushed-report",  # #4059: the harness stores the report and sends the reply through the door
     "chat-stop-names-pull-request-already-opened",  # #4061: the stop's answer, read off the inject conversation
@@ -798,6 +926,27 @@ class ApiLaneExclusionsTest(unittest.TestCase):
                     self.assertIn(case, excluded, f"{case} replays a pushed report but is not in {eval_rosters.API_LANE_EXCLUSIONS_FILE.name}")
         self.assertIn("chat-reply-under-pushed-report", found)
 
+    def test_every_registered_case_grading_delegated_to_is_excluded(self):
+        # delegated_to reads the inject read route's childAddressees, which
+        # the api transport has no chain to report, so the check errors
+        # there; a case that uses it anywhere in its spec runs on the inject
+        # lane only.
+        import yaml
+
+        def uses_delegated_to(node) -> bool:
+            if isinstance(node, dict):
+                return node.get("type") == "delegated_to" or any(uses_delegated_to(v) for v in node.values())
+            if isinstance(node, list):
+                return any(uses_delegated_to(v) for v in node)
+            return False
+
+        excluded = eval_rosters.api_lane_exclusions()
+        for case in set(eval_rosters.presubmit_cases()) | set(eval_rosters.nightly_cases()):
+            doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
+            if uses_delegated_to(doc.get("verification_spec")):
+                with self.subTest(case=case):
+                    self.assertIn(case, excluded, f"{case} grades delegated_to but is not in {eval_rosters.API_LANE_EXCLUSIONS_FILE.name}")
+
 
 # The inject lane's safeguards at their introduction (#2079, 2026-09-28): the
 # one entry every case on the lane carries beside its own. An edit to the
@@ -806,11 +955,11 @@ class ApiLaneExclusionsTest(unittest.TestCase):
 INJECT_LANE_SAFEGUARDS = [
     "no-github-writes-the-case-did-not-request",  # #2079: a none-wrapped github_writes, catastrophic
 ]
-# The registered cases whose checks request a pull request, at the
-# safeguard's introduction: what hack/ci-eval-pr.sh runs in the fan-out's
-# second phase on both lanes, after every other unit has finished. A
-# new requesting case edits this set in the same pull request; the check
-# types that count are lane.REQUESTING_CHECK_TYPES.
+# The registered cases that request a pull request -- a check of a type in
+# lane.REQUESTING_CHECK_TYPES, a `requested_pull_requests:` key of their own,
+# or a `requesting:` entry in the lane file: what hack/ci-eval-pr.sh runs in
+# the fan-out's second phase on both lanes, after every other unit has
+# finished. A new requesting case edits this set in the same pull request.
 INJECT_LANE_REQUESTING = [
     # chat-stop-names-pull-request-already-opened (#4061): the card opens the
     # pull request the stop's answer has to name; listed in `requesting:`,
@@ -821,6 +970,10 @@ INJECT_LANE_REQUESTING = [
     # may propose the change as a pull request; its objective's
     # pull_request_opened leaf allows one.
     "cluster-setting-request-proposes-pr",
+    # obtainability-major-pdb-auto-pr: the sweep opens the no-pdb pull
+    # request for checkout-gateway; its objective's pull_request_opened leaf
+    # allows one.
+    "obtainability-major-pdb-auto-pr",
     # obtainability-remediation-proposal was listed in the safeguards file's
     # `requesting:` while the persona answered its "propose a manifest" prompt
     # with a pull request; the persona's rule now puts that manifest in the
@@ -836,6 +989,10 @@ INJECT_LANE_REQUESTING = [
     # the change as a pull request; its objective's pull_request_opened leaf
     # allows one.
     "scale-request-proposes-pr",
+    # stop-on-permission-refusal: refused or declined the kubectl scale the
+    # user asked for, it may propose the change as a pull request (#4224);
+    # its objective's pull_request_opened leaf allows one.
+    "stop-on-permission-refusal",
     "vcs-review-feedback-read-back",
     # Also listed in `requesting:`, for the pull request it opens and closes
     # beside the one its check grades.
@@ -924,15 +1081,20 @@ class InjectLaneSafeguardsTest(unittest.TestCase):
         from kube_agents_bench import lane
 
         listed = lane.load_lane_requesting(eval_rosters.INJECT_LANE_SAFEGUARDS_FILE)
-        requesting = [c for c in self.lane_cases() if lane.requested_pull_requests(self.task_spec(c)) > 0 or c in listed]
-        # A listed case is registered and on the lane, and its own checks do
-        # not yet request as many as it is allowed: once they do, the entry
-        # is a leftover.
+
+        def declared(case):
+            doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
+            return lane.declared_pull_requests(doc)
+
+        requesting = [c for c in self.lane_cases() if lane.requested_pull_requests(self.task_spec(c)) > 0 or declared(c) > 0 or c in listed]
+        # A listed case is registered and on the lane, and neither its own
+        # checks nor its own `requested_pull_requests:` key yet request as many
+        # as it is allowed: once they do, the entry is a leftover.
         for case, count in listed.items():
             with self.subTest(listed=case):
                 self.assertIn(case, self.lane_cases())
-                requested = lane.requested_pull_requests(self.task_spec(case))
-                self.assertLess(requested, count, f"{case}'s own checks request {requested} pull request(s) now, at least the {count} `requesting:` allows it; drop the entry")
+                requested = max(lane.requested_pull_requests(self.task_spec(case)), declared(case))
+                self.assertLess(requested, count, f"{case}'s own checks or key request {requested} pull request(s) now, at least the {count} `requesting:` allows it; drop the entry")
         self.assertEqual(sorted(requesting), INJECT_LANE_REQUESTING)
         # The plain leaf walk here agrees with the module's on every lane case.
         for case in self.lane_cases():
@@ -1213,6 +1375,28 @@ class SeatBarTest(unittest.TestCase):
         # Until the scan defines its repository subject, a catalog entry alone clears nothing.
         self.assertEqual(repository_asserted_roles(assertions, None), set())
 
+    def test_the_text_read_of_a_requested_pull_requests_key_agrees_with_the_lane_module(self):
+        """A case's own `requested_pull_requests:` places it in the serial phase
+        on the text read as it does through the lane module."""
+        import tempfile
+
+        import yaml
+
+        source = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / "agent-kanban-smoke" / "task.yaml").read_text(encoding="utf-8"))
+        with tempfile.TemporaryDirectory() as tmp:
+            tasks = pathlib.Path(tmp)
+            (tasks / "declared-case").mkdir()
+            (tasks / "declared-case" / "task.yaml").write_text(
+                yaml.safe_dump({**source, "id": "declared-case", "requested_pull_requests": 1}, sort_keys=False), encoding="utf-8"
+            )
+            (tasks / "plain-case").mkdir()
+            (tasks / "plain-case" / "task.yaml").write_text(yaml.safe_dump({**source, "id": "plain-case"}, sort_keys=False), encoding="utf-8")
+            self.assertEqual(eval_rosters.declared_pull_requests("declared-case", tasks), 1)
+            self.assertTrue(eval_rosters.requests_a_pull_request("declared-case", {}, tasks))
+            self.assertFalse(eval_rosters.requests_a_pull_request("plain-case", {}, tasks))
+            doc = yaml.safe_load((tasks / "declared-case" / "task.yaml").read_text(encoding="utf-8"))
+            self.assertEqual(self.lane.declared_pull_requests(doc), 1)
+
     def test_the_text_read_of_requesting_agrees_with_the_lane_module(self):
         """eval_rosters is stdlib-only, so it reads a requesting check out of
         the text; hold it to lane.py's YAML read on every registered case."""
@@ -1225,7 +1409,25 @@ class SeatBarTest(unittest.TestCase):
             with self.subTest(case=case):
                 doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
                 self.assertEqual(eval_rosters.requests_a_pull_request(case, self.lane_requesting),
-                                 self.lane.requested_for(doc.get("verification_spec") or [], listed.get(case, 0)) > 0)
+                                 self.lane.requested_for(doc.get("verification_spec") or [],
+                                                         max(listed.get(case, 0), self.lane.declared_pull_requests(doc))) > 0)
+
+    def test_the_validators_requesting_types_are_the_lanes(self):
+        """scripts/validate_bench_cases.py counts a case's requesting leaves
+        with its own copy of the set, to hold `requested_pull_requests:` above
+        them; the copy must not drift from lane.py's."""
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("validate_bench_cases", REPO_ROOT / "scripts" / "validate_bench_cases.py")
+        validator = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(validator)
+        self.assertEqual(validator.REQUESTING_CHECK_TYPES, self.lane.REQUESTING_CHECK_TYPES)
+        # And its own leaf walk counts what the lane counts, on every shipped case.
+        for task_yaml in sorted((REPO_ROOT / "bench" / "tasks").glob("*/task.yaml")):
+            with self.subTest(case=task_yaml.parent.name):
+                doc = yaml.safe_load(task_yaml.read_text(encoding="utf-8")) or {}
+                spec = doc.get("verification_spec")
+                self.assertEqual(validator._requesting_leaves(spec), self.lane.requested_pull_requests(spec if isinstance(spec, list) else []))
 
 
 class PresubmitWallTimeTest(unittest.TestCase):
@@ -1253,29 +1455,41 @@ class PresubmitWallTimeTest(unittest.TestCase):
         self.assertEqual([int(n) for n in out], [hints.get(c, default) for c in cases])
 
     def test_the_text_read_of_a_stopped_ask_agrees_with_stop_hook(self):
-        """A stopped ask runs in the serial phase too (unit_phase reads
-        STOPPED_ASK_CASES); hold the stdlib read to stop_hook's on every
-        registered case, and price one in phase two."""
+        """A stopped ask and a writes_alone case run in the serial phase too
+        (unit_phase reads STOPPED_ASK_CASES); hold the stdlib reads to
+        stop_hook's and lane.runs_alone on every registered case, and price
+        one of each in phase two."""
         import yaml
         from unittest import mock
 
         sys.path.insert(0, str(REPO_ROOT / "bench"))
-        from kube_agents_bench import stop_hook
+        from kube_agents_bench import lane, stop_hook
 
         self.assertEqual(eval_rosters.STOP_DIRECTIVE, stop_hook.STOP_DIRECTIVE)
+        self.assertEqual(eval_rosters.MID_TURN_DIRECTIVE, stop_hook.MID_TURN_DIRECTIVE)
         stopped = []
+        alone = []
         for case in eval_rosters.presubmit_cases() + eval_rosters.nightly_cases():
             with self.subTest(case=case):
                 doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
                 self.assertEqual(eval_rosters.is_stopped_ask(case), stop_hook.is_stopped_ask(str(doc.get("prompt") or "")))
+                self.assertEqual(eval_rosters.runs_alone(case), lane.runs_alone(doc))
                 if eval_rosters.is_stopped_ask(case):
                     stopped.append(case)
+                if eval_rosters.declares_writes_alone(case):
+                    alone.append(case)
         self.assertTrue(stopped, "no registered stopped ask left to price")
         base = eval_rosters.presubmit_wall_estimate()
         with mock.patch.object(eval_rosters, "presubmit_cases", return_value=eval_rosters.presubmit_cases() + stopped[:1]):
             grown = eval_rosters.presubmit_wall_estimate()
         self.assertEqual(grown["phase one"], base["phase one"])
         self.assertIn(stopped[0], grown["requesting"])
+        # A writes_alone case is priced in phase two the same way.
+        self.assertTrue(alone, "no registered writes_alone case left to price")
+        with mock.patch.object(eval_rosters, "presubmit_cases", return_value=eval_rosters.presubmit_cases() + alone[:1]):
+            grown = eval_rosters.presubmit_wall_estimate()
+        self.assertEqual(grown["phase one"], base["phase one"])
+        self.assertIn(alone[0], grown["requesting"])
 
     def test_a_requesting_case_adds_its_serial_chain_and_settles(self):
         from unittest import mock
@@ -1316,6 +1530,104 @@ class PresubmitWallTimeTest(unittest.TestCase):
         got = eval_rosters.summary()
         self.assertEqual(got["presubmit wall budget, minutes"], eval_rosters.PRESUBMIT_WALL_BUDGET_MINUTES)
         self.assertEqual(got["presubmit wall estimate, minutes"], -(-eval_rosters.presubmit_wall_estimate()["total"] // 60))
+
+
+# ─── Roster comments carry the outcome, not the record (#5245) ───────────────
+# .agents/rules/public_surfaces.md: a committed file names a run's outcome and
+# where its record is, nothing from inside it. A roster comment therefore says
+# red, green, a miss, a collapse, above or under the bar, and cites the build;
+# the counts, ratios and judge scores stay on the domain scorecard. Every
+# `hack/eval/*.txt` is read, comment text only.
+ROSTER_COMMENT_FILES = sorted(eval_rosters.EVAL_DIR.glob("*.txt"))
+# A judge reading (`1.0`, `0.8`) stands alone: not inside a version
+# (`1.36.3`, `v0.17.0`, `GKE 1.36`), a section reference (`§1.5`) or a
+# longer number.
+JUDGE_READING_RE = re.compile(r"(?<!GKE )(?<![\w.§])[01]\.\d+(?![\w.])")
+# A result counted in words (`three passes`, `two failed repetitions`, `one
+# repetition failed`); `three repetitions` alone is the run's configuration.
+WORD_NUMBERS = "one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve"
+WORD_COUNT_RE = re.compile(
+    rf"\b({WORD_NUMBERS}) ((failed |passing |scored |graded )repetitions?|passes|misses)\b"
+    rf"|\b({WORD_NUMBERS}) repetitions? (passed|failed|pass|fail)\b")
+RESULT_SHAPES = {
+    "a pass ratio (N/M)": re.compile(r"\b\d+/\d+\b"),
+    "a count of passes (N of M)": re.compile(r"\b\d+ of \d+\b"),
+    "a percentage": re.compile(r"\b\d+(\.\d+)? ?%"),
+    "a judge score name": re.compile(r"OutcomeValidity|Verification(Catastrophic|Coverage)"),
+    "a judge reading": JUDGE_READING_RE,
+    "a repetition count": re.compile(r"\b\d+ (graded |passing )?repetitions?\b"),
+    "a miss count": re.compile(r"\b\d+ misses\b"),
+    "a per-repetition verdict": re.compile(r"passed every|failed every|fails every|nights in a row"),
+    "a count of passes or misses in words": WORD_COUNT_RE,
+}
+# Exact substrings of the comment lines where a number is a budget or
+# infrastructure fact, not a run's result. Short on purpose: a new entry
+# needs the same kind of reason.
+RESULT_SHAPE_ALLOWLIST = {
+    # nightly-budget-history.txt: the share of the deadline the first night used.
+    "used 71% of the budget",
+    # nightly-budget-history.txt: how many cases the deadline reached, a budget fact.
+    "cut the night at 32 of 73",
+    # nightly-budget-history.txt: the infra-lock chain's share of the build's wall clock.
+    "The chain is 72 to 85% of the build, 79% summed",
+    # nightly-cases.txt: the fixture scan over the pool projects, infrastructure.
+    "reads the role healthy on 40 of 40",
+    # blocking-roster.txt: rung 4's definition, a rule constant.
+    "three failed repetitions red the job",
+}
+RESULT_SHAPE_RULE = (
+    "a roster comment states the outcome and cites the run; the numbers are on the "
+    "domain scorecard (.agents/rules/public_surfaces.md)"
+)
+
+
+def roster_comment_lines(text: str):
+    """(line number, comment text) for every comment in a roster file, the
+    parsed markers left out: `# part N` and the nightly's sorted-section marker."""
+    for number, raw in enumerate(text.splitlines(), start=1):
+        if "#" not in raw:
+            continue
+        if eval_rosters.PART_MARKER_RE.match(raw) or raw.startswith(eval_rosters.NIGHTLY_SORTED_SECTION_MARKER):
+            continue
+        yield number, raw.split("#", 1)[1]
+
+
+def result_shape_findings(path: pathlib.Path, text: str) -> list[str]:
+    findings = []
+    for number, comment in roster_comment_lines(text):
+        if any(allowed in comment for allowed in RESULT_SHAPE_ALLOWLIST):
+            continue
+        for name, pattern in RESULT_SHAPES.items():
+            if pattern.search(comment):
+                findings.append(f"{path.name}:{number}: {comment.strip()!r} carries {name}; {RESULT_SHAPE_RULE}")
+    return findings
+
+
+class RosterCommentsCarryNoResultsTest(unittest.TestCase):
+    def test_no_roster_comment_carries_a_count_ratio_or_score(self):
+        self.assertTrue(ROSTER_COMMENT_FILES, "no hack/eval/*.txt to read")
+        findings = []
+        for path in ROSTER_COMMENT_FILES:
+            findings.extend(result_shape_findings(path, path.read_text(encoding="utf-8")))
+        self.assertEqual(findings, [], "\n".join(findings))
+
+    def test_the_shapes_catch_a_result_and_pass_a_citation(self):
+        caught = result_shape_findings(pathlib.Path("x.txt"), "# 3/3 on build 1\n")
+        self.assertEqual(len(caught), 1, caught)
+        self.assertIn("a pass ratio", caught[0])
+        clean = (
+            "# green on build 2113733214391504896 (2026-10-23); a miss on GKE 1.36.3-gke.1244000,\n"
+            "# SOUL §1.5, v0.17.0, 2026-10-14 (#2016), 40 of 40 pool projects read healthy\n"
+        )
+        self.assertEqual(
+            result_shape_findings(pathlib.Path("x.txt"), clean.replace("40 of 40 pool", "reads the role healthy on 40 of 40 pool")), [])
+        self.assertEqual(result_shape_findings(pathlib.Path("x.txt"), "# part 2\n./tasks/a/task.yaml\n"), [])
+
+    def test_every_allowlist_entry_still_matches_a_line(self):
+        text = "\n".join(p.read_text(encoding="utf-8") for p in ROSTER_COMMENT_FILES)
+        for allowed in RESULT_SHAPE_ALLOWLIST:
+            with self.subTest(allowed=allowed):
+                self.assertIn(allowed, text, "an allowlist entry no roster comment carries any more: delete it")
 
 
 if __name__ == "__main__":
