@@ -9,7 +9,7 @@
 #
 # It exercises the cluster persona's model-facing edits without grading them
 # separately: the worker reaches `developer_knowledge` through the broker's
-# relay (#5498), and once #5446 removes the persona's `gke` MCP server, which
+# relay (#5498), and, the persona having no `gke` MCP server (#5446), which
 # the broker refuses to profile workers, it reads the cluster with `kubectl`
 # and `gcloud` alone.
 #
