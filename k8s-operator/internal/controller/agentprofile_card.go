@@ -210,7 +210,7 @@ type cardPublisher interface {
 	Publish(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profile string, card *a2aAgentCard) error
 	// SyncDurables makes the profile's shared durables exactly want, and
 	// deletes the rest this operator made (agentprofile_durables.go).
-	SyncDurables(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profile string, want []profileDurable) error
+	SyncDurables(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profile string, want []profileDurable, probe []string) error
 }
 
 // natsCardPublisher holds one bus connection per PlatformAgent, opened on first

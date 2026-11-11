@@ -335,3 +335,24 @@ func TestTheStatusLostFallbackIgnoresADrainingTier(t *testing.T) {
 		t.Errorf("verdict %+v: weekly keeps serving, nightly conflicts", v)
 	}
 }
+
+// A tier whose drain has ended, its Tier deleted and its ServiceAccount gone,
+// still has its durables found: the applied config still lists it.
+func TestADurableProbeIncludesTheAppliedConfigsTiers(t *testing.T) {
+	agent := a2aTestAgent()
+	cat := builtinTierCatalog()
+	was := testAgentProfile(agent.Namespace, "tse", func(p *agentv1alpha1.AgentProfile) { p.Spec.AllowedTiers = []string{"read"} })
+	cm := appliedConfig(t, agent, cat, func(c *a2aDispatchConfig) {
+		for i := range c.Profiles {
+			c.Profiles[i].DrainingTiers = []a2aDrainingTier{{Tier: "oncall", Mode: tierModeInteractive, Until: time.Now().Add(-time.Minute)}}
+		}
+	}, &was)
+	h := newProfileHarness(t, agent, &was, cm)
+	probe, err := h.r.durableProbeTiers(t.Context(), agent, &was)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(probe, "oncall") {
+		t.Errorf("probe %v, want the ended drain's tier", probe)
+	}
+}
