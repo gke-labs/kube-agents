@@ -94,18 +94,21 @@ verification_spec:
         - '(?m)^(?!result of delegated task\b|question from delegated task\b|artifact\b.*\bproduced by delegated task\b).*\bt_?[0-9a-f]{8}\b.*$'
   # The answer still gives the count: a number within three words of
   # "cluster(s)" ("209 running gke clusters", "209 clusters"), or "clusters:
-  # 209". A reply that only offers to count has no such line.
+  # 209". The front door's acknowledgement ("checking all 3 clusters.") is
+  # not a count and is excluded by line, and a number that is the tail of a
+  # clock time ("14:20 utc for your clusters") does not count. A reply that
+  # only offers to count has no such line.
   - name: the-answer-gives-the-count
     role: objective
     mode: assert
     check:
       type: report_contains
       any_of_patterns:
-        - '\b\d{1,4} (?:(?!projects?\b)\S+ ){0,3}clusters?\b'
-        - '\bclusters?(?: \S+){0,2}[:=] \d{1,4}\b'
+        - '(?m)^(?!checking\b).*(?<![:\d-])\b\d{1,4} (?:(?!projects?\b)\S+ ){0,3}clusters?\b'
+        - '(?m)^(?!checking\b).*\bclusters?(?: \S+){0,2}[:=] \d{1,4}\b'
   # An answer drawn from an earlier card says when the count was taken, as a
-  # duration or a clock time ("about two hours ago", "two hours old", "at
-  # 14:02", a date); a bare "earlier" or "today" tells the reader nothing
+  # duration or a clock time ("about two hours ago", "two hours old", "14:02
+  # UTC" however it is introduced, a date); a bare "earlier" or "today" tells the reader nothing
   # about staleness and is not accepted. A fresh card's result arrives under
   # the harness's delivered header instead, which is the other way this
   # check is met.
@@ -116,4 +119,4 @@ verification_spec:
       type: report_contains
       any_of_patterns:
         - '(?m)^result of delegated task\b'
-        - '\b(?:ago|(?:\d+|an?|one|two|three|four|five|six|seven|eight|nine|ten|twelve|half an?) (?:minutes?|hours?|days?) old|yesterday|just now|this (?:morning|afternoon|evening)|last night|(?:at|as of) \d{1,2}:\d{2}|\d{4}-\d{2}-\d{2}|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]* \d{1,2})\b'
+        - '\b(?:ago|(?:\d+|an?|one|two|three|four|five|six|seven|eight|nine|ten|twelve|half an?) (?:minutes?|hours?|days?) old|yesterday|just now|this (?:morning|afternoon|evening)|last night|\d{1,2}:\d{2}|\d{4}-\d{2}-\d{2}|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]* \d{1,2})\b'
