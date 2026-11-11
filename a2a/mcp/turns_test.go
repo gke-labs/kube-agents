@@ -96,6 +96,25 @@ func publishSubmission(t *testing.T, js jetstream.JetStream, addressee, taskID, 
 	pub(t, js, lib.TaskInSubject(addressee, taskID), env)
 }
 
+// publishProfileSubmission puts a profile task's submission where the
+// gateway puts it with the profile dispatcher on: a2a.submit, off TASKS. A
+// core publish, as a watch reads that subject with a core subscription.
+func publishProfileSubmission(t *testing.T, nc *nats.Conn, profile, taskID, conversation, text, viaTask string) {
+	t.Helper()
+	msg := mustJSON(t, lib.Message{Role: "user", Parts: []lib.Part{{Kind: "text", Text: text}}, MessageID: "m-" + taskID})
+	env, err := lib.NewMessageEnvelope(fakeGateway, taskID, "ctx-"+taskID, "corr-"+taskID, msg, lib.WithAuthority(authorityFor(t, conversation, viaTask)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := nc.Publish(lib.TaskSubmitSubject(profile, "unattended", lib.SubmitKindChild, taskID), data); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func publishStatus(t *testing.T, js jetstream.JetStream, addressee, taskID string, state lib.TaskState, final bool) {
 	t.Helper()
 	p := mustJSON(t, lib.StatusUpdate{TaskID: taskID, ContextID: "ctx-" + taskID, Status: lib.TaskStatus{State: state}, Final: final})
@@ -136,12 +155,15 @@ func publishRun(t *testing.T, js jetstream.JetStream, addressee, taskID, answer 
 
 // gatewayScenario says what the fake gateway does with an ordinary turn.
 type gatewayScenario struct {
-	finish   bool      // the root task completes with answerText
-	delegate bool      // the root delegates; a child runs and a wake task carries the answer
-	handoff  bool      // the root acknowledges and hands its work to kanban cards (no wake task ever)
-	bigChild bool      // with delegate: the child's events total more than readMaxBytes, and no wake task comes
-	decoys   bool      // before the root: another conversation's turn, a delegated child here, an earlier turn's late submission, and a cancel here
-	frames   *frameLog // when set, every frame the gateway reads is recorded
+	finish   bool // the root task completes with answerText
+	delegate bool // the root delegates; a child runs and a wake task carries the answer
+	handoff  bool // the root acknowledges and hands its work to kanban cards (no wake task ever)
+	bigChild bool // with delegate: the child's events total more than readMaxBytes, and no wake task comes
+	// profileChild, with delegate: the child is submitted on a2a.submit, as
+	// for an AgentProfile with the profile dispatcher on (#5494).
+	profileChild bool
+	decoys       bool      // before the root: another conversation's turn, a delegated child here, an earlier turn's late submission, and a cancel here
+	frames       *frameLog // when set, every frame the gateway reads is recorded
 	// after, when set, runs once the turn's tasks are published, on its
 	// own goroutine, with the gateway's connection: a card's posts come
 	// from there (publishNotify).
@@ -251,7 +273,11 @@ func runFakeGateway(t *testing.T, url string, js jetstream.JetStream, sc gateway
 			publishArtifact(t, js, fakeAddressee, root, lib.ArtifactDelegate, "cluster-a: look at checkout")
 			publishStatus(t, js, fakeAddressee, root, lib.StateCompleted, true)
 			child := fmt.Sprintf("task-deleg%d", i)
-			publishSubmission(t, js, "cluster-a", child, conv, "look at checkout", root)
+			if sc.profileChild {
+				publishProfileSubmission(t, nc, "cluster-a", child, conv, "look at checkout", root)
+			} else {
+				publishSubmission(t, js, "cluster-a", child, conv, "look at checkout", root)
+			}
 			if sc.bigChild {
 				publishRun(t, js, "cluster-a", child, "", false)
 				for range readMaxBytes/(800<<10) + 1 {
@@ -337,12 +363,16 @@ func TestSendMessageAnswersFromTheTurnsOwnTask(t *testing.T) {
 // A delegate turn is matched under its stripped text, and the answer is taken
 // from the wake task the delegation ends in, not the delegator's empty result.
 func TestADelegationsAnswerComesFromTheWakeTask(t *testing.T) {
-	s, _, _, _ := turnServer(t, gatewayScenario{delegate: true})
-	res := callTool(t, s, ToolSendMessage, map[string]any{"text": "delegate check the rollout", "wait_seconds": 10})
-	if res.IsError {
-		t.Fatalf("send_message failed: %s", res.Content[0].Text)
+	for _, profileChild := range []bool{false, true} {
+		t.Run(fmt.Sprintf("profileChild=%v", profileChild), func(t *testing.T) {
+			s, _, _, _ := turnServer(t, gatewayScenario{delegate: true, profileChild: profileChild})
+			res := callTool(t, s, ToolSendMessage, map[string]any{"text": "delegate check the rollout", "wait_seconds": 10})
+			if res.IsError {
+				t.Fatalf("send_message failed: %s", res.Content[0].Text)
+			}
+			mustContain(t, res.Content[0].Text, "answer came from a delegated task", fakeAddressee+"/task-wake1", wakeAnswer, "cluster-a/task-deleg1")
+		})
 	}
-	mustContain(t, res.Content[0].Text, "answer came from a delegated task", fakeAddressee+"/task-wake1", wakeAnswer, "cluster-a/task-deleg1")
 }
 
 // A delegated task too large to read is read once, not again every 200 ms
@@ -1816,9 +1846,13 @@ func TestAStreamedDelegationSettlesOnTheWakeTasksAnswer(t *testing.T) {
 		name        string
 		childResult bool
 		lag         time.Duration
+		// profileSubmit submits the child on a2a.submit, as the gateway
+		// does for an AgentProfile with the profile dispatcher on (#5494).
+		profileSubmit bool
 	}{
-		{"child with a result", true, time.Second},
-		{"child without a result", false, delegationSettle + time.Second},
+		{"child with a result", true, time.Second, false},
+		{"child without a result", false, delegationSettle + time.Second, false},
+		{"profile child submitted off TASKS", true, time.Second, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			url, js := testBus(t)
@@ -1838,7 +1872,11 @@ func TestAStreamedDelegationSettlesOnTheWakeTasksAnswer(t *testing.T) {
 				publishRun(t, js, fakeAddressee, rootID, "", false)
 				publishArtifact(t, js, fakeAddressee, rootID, lib.ArtifactDelegate, "cluster-a: inspect")
 				publishStatus(t, js, fakeAddressee, rootID, lib.StateCompleted, true)
-				publishSubmission(t, js, "cluster-a", childID, conv, "inspect", rootID)
+				if tc.profileSubmit {
+					publishProfileSubmission(t, nc, "cluster-a", childID, conv, "inspect", rootID)
+				} else {
+					publishSubmission(t, js, "cluster-a", childID, conv, "inspect", rootID)
+				}
 				publishRun(t, js, "cluster-a", childID, "child notes", tc.childResult)
 				if !tc.childResult {
 					publishStatus(t, js, "cluster-a", childID, lib.StateCompleted, true)

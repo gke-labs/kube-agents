@@ -38,6 +38,12 @@ const (
 	// submissionSubjects is every task's .in subject, which the console grant
 	// lets the server watch (a2a.>): submissions, follow-ups and cancels.
 	submissionSubjects = "a2a.tasks.*.*." + lib.TaskClassIn
+	// profileSubmissionSubjects is every AgentProfile task's submission,
+	// a2a.submit.<profile>.<tier>.<top|child>.<task> (lib.TaskSubmitSubject):
+	// with the profile dispatcher on, the gateway submits a task for a
+	// profile there and not on its .in, a delegated child included. The
+	// console grant's a2a.> covers it.
+	profileSubmissionSubjects = lib.SubmitSubjectPrefix + "*.*.*.*"
 	// submissionSubjectParts is a2a.tasks.<addressee>.<task>.in; the
 	// addressee is field 2.
 	submissionSubjectParts = 5
@@ -1344,10 +1350,14 @@ func (b *NATSBus) openTurn(token string, texts []string, submissions bool) (*tur
 	// matcher and then its follower. A settled turn has neither, and an
 	// undrained subscription on a busy install is a slow consumer on the
 	// connection every tool shares, so it takes the notices alone.
-	var sub *nats.Subscription
+	var sub, psub *nats.Subscription
 	if submissions {
 		var err error
 		if sub, err = nc.ChanSubscribe(submissionSubjects, w.subs); err != nil {
+			return nil, err
+		}
+		if psub, err = nc.ChanSubscribe(profileSubmissionSubjects, w.subs); err != nil {
+			_ = sub.Unsubscribe()
 			return nil, err
 		}
 	}
@@ -1375,16 +1385,20 @@ func (b *NATSBus) openTurn(token string, texts []string, submissions bool) (*tur
 		default:
 		}
 	})
-	if err != nil {
+	unsubscribeSubmissions := func() {
 		if sub != nil {
 			_ = sub.Unsubscribe()
 		}
+		if psub != nil {
+			_ = psub.Unsubscribe()
+		}
+	}
+	if err != nil {
+		unsubscribeSubmissions()
 		return nil, err
 	}
 	w.unsubscribe = func() {
-		if sub != nil {
-			_ = sub.Unsubscribe()
-		}
+		unsubscribeSubmissions()
 		_ = nsub.Unsubscribe()
 	}
 	if err := nc.Flush(); err != nil {
@@ -1673,16 +1687,25 @@ func (w *turnWatch) close() {
 	}
 }
 
-// submission parses an .in message into its task, conversation, the task it
-// was delegated from (if any) and its text. Only a message counts: a cancel,
-// or anything else on the subject, is not a turn.
+// submission parses an .in message, or a profile task's submission, into
+// its task, conversation, the task it was delegated from (if any) and its
+// text. Only a message counts: a cancel, or anything else on the subject,
+// is not a turn. A profile submission's addressee is its profile, whose
+// task's stream stays on a2a.tasks.<profile>.<task>.
 func submission(m *nats.Msg) (ref TaskRef, a submissionAuthority, text string, ok bool) {
-	parts := strings.Split(m.Subject, ".")
-	if len(parts) != submissionSubjectParts {
+	var addressee, subjectTask string
+	if profile, _, _, taskID, isSubmit := lib.ParseSubmitSubject(m.Subject); isSubmit {
+		addressee, subjectTask = profile, taskID
+	} else if parts := strings.Split(m.Subject, "."); len(parts) == submissionSubjectParts {
+		addressee = parts[submissionAddressee]
+	} else {
 		return
 	}
 	env, err := lib.ParseEnvelope(m.Data)
 	if err != nil || env.Kind != lib.KindMessage || env.TaskID == "" || len(env.Authority) == 0 {
+		return
+	}
+	if subjectTask != "" && subjectTask != env.TaskID {
 		return
 	}
 	if json.Unmarshal(env.Authority, &a) != nil {
@@ -1692,7 +1715,7 @@ func submission(m *nats.Msg) (ref TaskRef, a submissionAuthority, text string, o
 	if json.Unmarshal(env.Payload, &msg) != nil {
 		return
 	}
-	return TaskRef{Addressee: parts[submissionAddressee], TaskID: env.TaskID}, a, strings.TrimSpace(partsText(msg.Parts)), true
+	return TaskRef{Addressee: addressee, TaskID: env.TaskID}, a, strings.TrimSpace(partsText(msg.Parts)), true
 }
 
 // ownSubmission reports whether m carries this turn: a message in this
