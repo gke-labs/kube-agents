@@ -9,6 +9,8 @@ Audit standalone GCE virtual machines, Managed Instance Groups (MIGs), serial co
 
 # Workflow
 
+This workflow is for an audit run: a request to run the GCE compute audit, or one that names its SOP. A fleet-wide question about the VMs or MIGs that does neither is not a run: run only the collector below, once, with terminal `timeout=600`, to `/opt/data/scratch/chat_manifest_gce-compute-fleet-audit.json`, and answer in chat as `SOUL.md`'s chat route says. A question about one named VM or project is a live read, as `SOUL.md` says. Never run `start`, `draft` or `finish` for either (`fleet-audit` skill, "Run an audit", form 4).
+
 ## 1. Open the Run, Then Execute Compute Inspection
 
 Open the run first with the `fleet-audit` harness's `start` (SOP §0). `finish` refuses a manifest that finished before `start` did, as an earlier run's. Then call the platform_control `fleet_scope` tool (SOP §1) and run the compute fleet collector with its `collector_args`, which hand it the install's declared scope; an install that declares none passes nothing and the collector sweeps every project the identity can list. It writes a collector manifest to stdout:
