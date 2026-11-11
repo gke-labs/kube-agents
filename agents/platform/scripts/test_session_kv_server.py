@@ -10797,6 +10797,10 @@ class TestCardStop(unittest.TestCase):
         self.addCleanup(modules.stop)
         os.environ["SESSION_KV_API_KEY"] = API_KEY
         self.addCleanup(lambda: os.environ.pop("SESSION_KV_API_KEY", None))
+        # Each test is its own conversation's stops: no joined result carries
+        # over from another test's stop on the same session (#5528).
+        session_kv_server._card_stop_flights.clear()
+        self.addCleanup(session_kv_server._card_stop_flights.clear)
         self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
 
     # -- the stub Hermes ---------------------------------------------------
@@ -11219,14 +11223,103 @@ class TestCardStop(unittest.TestCase):
         body = self.stop().json()
         self.assertEqual((body["stopped"], body["rounds"], self.sleeps), ([], 0, []))
 
-    def test_a_second_call_stops_nothing(self):
+    def test_a_second_call_past_the_join_window_stops_nothing(self):
         self.the_tree()
         first = self.stop().json()
         self.assertEqual(len(first["stopped"]), 4)
-        second = self.stop()
+        with patch.object(session_kv_server, "CARD_STOP_JOIN_WINDOW_S", 0.0):
+            second = self.stop()
         self.assertEqual(second.status_code, 200)
         self.assertEqual(second.json()["stopped"], [])
         self.assertEqual(second.json()["rounds"], 0)
+        self.assertNotIn("joined", second.json())
+
+    def test_a_second_call_inside_the_join_window_gets_the_first_answer(self):
+        # #5528: the gateway's card-stop control and the bridge's cancel
+        # archive both stop one session; the later one must not read
+        # "stopped 0" against the cards the earlier one stopped.
+        import sqlite3
+
+        self.the_tree()
+        # Filed a while before the stop, as real cards are: one filed in the
+        # stop's own second counts as possibly new (whole-second stamps).
+        with sqlite3.connect(self.board) as conn:
+            conn.execute("UPDATE tasks SET created_at = created_at - 10")
+        first = self.stop().json()
+        second = self.stop()
+        self.assertEqual(second.status_code, 200)
+        body = second.json()
+        self.assertTrue(body["joined"])
+        self.assertEqual(self.stopped_ids(body), self.stopped_ids(first))
+        self.assertNotIn("joined", first)
+
+    def test_a_card_filed_after_the_first_stop_began_gets_a_fresh_stop(self):
+        # The planner's correction to #5528: a joined answer is stale once the
+        # conversation has a card the first scan could not have seen.
+        self.the_tree()
+        first = self.stop().json()
+        self.card("t_new", "running", session=self.SESSION, created=time.time() + 1)
+        second = self.stop().json()
+        self.assertNotIn("joined", second)
+        self.assertEqual(self.stopped_ids(second), ["t_new"])
+        self.assertEqual(self.status("t_new"), "archived")
+        self.assertNotIn("t_new", self.stopped_ids(first))
+
+    def test_a_card_filed_in_the_same_second_the_first_stop_began_gets_a_fresh_stop(self):
+        # Hermes stamps created_at in whole seconds: a card filed just after
+        # the first scan began, in that second, carries a stamp below the
+        # scan's start, and must still count as new.
+        import math
+
+        self.the_tree()
+        self.stop()
+        (flight,) = session_kv_server._card_stop_flights.values()
+        self.card("t_same_second", "running", session=self.SESSION, created=math.floor(flight.started_at))
+        second = self.stop().json()
+        self.assertNotIn("joined", second)
+        self.assertEqual(self.stopped_ids(second), ["t_same_second"])
+
+    def test_concurrent_stops_for_one_conversation_scan_once_and_answer_alike(self):
+        import threading as _threading
+
+        release, entered = _threading.Event(), _threading.Event()
+        calls = []
+
+        def run():
+            calls.append(1)
+            entered.set()
+            release.wait(5)
+            return {"session_id": self.SESSION, "stopped": [{"id": "t_1"}]}
+
+        out = {}
+
+        def caller(name):
+            out[name] = session_kv_server._card_stop_single_flight(self.SESSION, self.CONVERSATION, run)
+
+        a = _threading.Thread(target=caller, args=("a",))
+        a.start()
+        self.assertTrue(entered.wait(5))
+        b = _threading.Thread(target=caller, args=("b",))
+        b.start()
+        time.sleep(0.2)
+        release.set()
+        a.join(5)
+        b.join(5)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(out["a"]["stopped"], out["b"]["stopped"])
+        self.assertNotIn("joined", out["a"])
+        self.assertTrue(out["b"]["joined"])
+
+    def test_another_conversation_never_joins(self):
+        calls = []
+
+        def run():
+            calls.append(1)
+            return {"stopped": []}
+
+        session_kv_server._card_stop_single_flight(self.SESSION, "slack:C1/1", run)
+        session_kv_server._card_stop_single_flight(self.SESSION, "slack:C1/2", run)
+        self.assertEqual(len(calls), 2)
 
     def test_the_set_is_capped_and_says_so(self):
         import sqlite3

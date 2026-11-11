@@ -10422,8 +10422,11 @@ def stop_session_cards(session_id: str, request_data: Dict[str, Any]) -> Dict[st
     pid never appeared (a worker may still spawn for it), `errors` for a board
     error after the first pass, how many re-scans ran, `truncated` when the set
     was larger than one pass, and `deadline` when the budget ran out. Answers
-    within CARD_STOP_WORST_CASE_S. Calling it again stops nothing new, since
-    an archived card is not open.
+    within CARD_STOP_WORST_CASE_S. A call while another for the same session
+    and conversation runs, or within CARD_STOP_JOIN_WINDOW_S of one with no
+    card filed since its first scan, answers with that stop's result marked
+    `joined` (_card_stop_single_flight). Past that, calling it again stops
+    nothing new, since an archived card is not open.
     """
     context_id = str(request_data.get("context_id") or "").strip()
     conversation = str(request_data.get("conversation") or "").strip()
@@ -10435,7 +10438,125 @@ def stop_session_cards(session_id: str, request_data: Dict[str, Any]) -> Dict[st
         raise HTTPException(status_code=400, detail="conversation or context_id is too long")
     if session_id != _conversation_session_id(context_id):
         raise HTTPException(status_code=400, detail="context_id is not this session's")
+    return _card_stop_single_flight(session_id, conversation, lambda: _stop_session_cards_now(session_id, conversation))
 
+
+# A conversation's card stop is single-flight (#5528). With the gateway's
+# card-stop control armed, a typed console or MCP stop runs two stops on one
+# session at once: the control's and the hermes-bridge's cancel archive. The
+# second to arrive would find the cards archived and answer "stopped 0", and
+# the caller would read the two answers as contradicting each other. So a stop
+# that arrives while one for the same session and conversation is running
+# waits for it and answers with its result, marked `joined`. One that arrives
+# within CARD_STOP_JOIN_WINDOW_S of a finished stop gets that result too, but
+# only when no card in the conversation's tree was created after that stop's
+# first scan began: a card filed since is real new work, and a fresh stop has
+# to reach it. Anything else scans afresh.
+CARD_STOP_JOIN_WINDOW_S = 60.0
+
+
+class _CardStopFlight:
+    """One stop for a (session, conversation): its result or error, when its
+    first scan began (wall clock, as kanban's created_at), and when it ended."""
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.started_at = time.time()
+        self.finished_at: Optional[float] = None  # monotonic
+        self.result: Optional[Dict[str, Any]] = None
+        self.error: Optional[HTTPException] = None
+
+
+_card_stop_flights_lock = threading.Lock()
+_card_stop_flights: Dict[tuple, _CardStopFlight] = {}
+
+
+def _joined(flight: _CardStopFlight) -> Dict[str, Any]:
+    if flight.error is not None:
+        raise flight.error
+    out = dict(flight.result or {})
+    out["joined"] = True
+    return out
+
+
+def _card_stop_single_flight(session_id: str, conversation: str, run) -> Dict[str, Any]:
+    key = (session_id, conversation)
+    recent: Optional[_CardStopFlight] = None
+    with _card_stop_flights_lock:
+        flight = _card_stop_flights.get(key)
+        if (
+            flight is not None
+            and flight.done.is_set()
+            and flight.error is None
+            and flight.finished_at is not None
+            and time.monotonic() - flight.finished_at < CARD_STOP_JOIN_WINDOW_S
+        ):
+            recent = flight
+    if recent is not None and not _card_stop_tree_has_card_since(session_id, conversation, recent.started_at):
+        return _joined(recent)
+    # Register this stop, unless one is running for the conversation, which
+    # this call joins instead: checked and registered under one lock, so two
+    # callers that arrive together never both scan.
+    own: Optional[_CardStopFlight] = _CardStopFlight()
+    with _card_stop_flights_lock:
+        racing = _card_stop_flights.get(key)
+        if racing is not None and not racing.done.is_set():
+            own = None
+        else:
+            _card_stop_flights[key] = own
+            # Bounded: drop finished flights past the window.
+            now = time.monotonic()
+            for k in [
+                k
+                for k, f in _card_stop_flights.items()
+                if f.finished_at is not None and now - f.finished_at >= CARD_STOP_JOIN_WINDOW_S
+            ]:
+                del _card_stop_flights[k]
+    if own is None:
+        # The running stop answers within CARD_STOP_WORST_CASE_S; past that
+        # (it can't, but a wedged board connection is not ours to trust) this
+        # call answers 503 rather than waiting on.
+        if not racing.done.wait(CARD_STOP_WORST_CASE_S + 2.0):
+            raise HTTPException(status_code=503, detail="a card stop for this conversation is still running")
+        return _joined(racing)
+    try:
+        own.result = run()
+        return own.result
+    except HTTPException as exc:
+        own.error = exc
+        raise
+    except Exception:
+        own.error = HTTPException(status_code=500, detail="the card stop failed")
+        raise
+    finally:
+        own.finished_at = time.monotonic()
+        own.done.set()
+
+
+def _card_stop_tree_has_card_since(session_id: str, conversation: str, since: float) -> bool:
+    """Whether the conversation's card tree holds a card created at or after
+    `since`. Any failure to read it answers True, so the caller scans afresh."""
+    board = _kanban_db_path()
+    if not os.path.isfile(board):
+        return False
+    try:
+        _, connect_tracked = _hermes_kanban()
+        conn = _card_stop_connect(connect_tracked, board)
+        with closing(conn):
+            sessions = [session_id, *_compression_descendants(session_id)]
+            tree = _collect_card_tree(conn, sessions, session_id, conversation, _Budget())
+    except Exception:
+        return True
+    # Hermes stamps created_at in whole seconds, so a card filed after the
+    # scan began in the same second carries a stamp below `since`: compare
+    # against that second, which errs toward a fresh stop, never a stale one.
+    floor = math.floor(since)
+    return any(float(card.get("created_at") or 0) >= floor for card in tree.cards.values())
+
+
+def _stop_session_cards_now(session_id: str, conversation: str) -> Dict[str, Any]:
+    """One stop of the conversation's cards: the route's body, run through
+    _card_stop_single_flight."""
     budget = _Budget()
     result: Dict[str, Any] = {
         "session_id": session_id,
