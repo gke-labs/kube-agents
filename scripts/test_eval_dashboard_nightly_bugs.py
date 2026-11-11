@@ -289,6 +289,14 @@ class StreakTest(Harness):
         gh, _, _ = self.run_once(data(night(15, [all_infra]), night(16, [all_infra]), night(17, [all_infra])))
         self.assertEqual(self.filed(gh), [])
 
+    def test_forge_reps_count_as_infra_on_a_graded_night(self):
+        """A forge rep (#5342) is ungraded, and the night's infra count carries it."""
+        forge = "KUBE_AGENTS_FORGE_UNAVAILABLE: a forge read failed in transport or was rate limited, so these checks could not be evaluated, which says nothing about the run: a-check: answered 503"
+        mixed = {"name": "case-red", "result": "fail", "reps": [rep(1, "fail", FAIL_REASON), rep(2, "infra", forge), rep(3, "infra", forge)]}
+        nights = nightly_bugs.graded_nights(data(night(15, [mixed])))
+        row = nights["case-red"][0]
+        self.assertEqual((row["passed"], row["graded"], row["infra"]), (0, 1, 2))
+
     def test_run_level_event_night_is_skipped(self):
         # Every graded case failed on the 17th: a run-level event, which says
         # nothing about case-red.
