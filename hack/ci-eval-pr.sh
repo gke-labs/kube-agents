@@ -115,9 +115,10 @@ readonly EVAL_GRADER_CASES_DIR="tasks"
 readonly EVAL_FLEET_CATALOG="tf/fleet/fixtures.json"
 # Where `uv sync` builds the grader's environment inside that tree, relative
 # to it. The export may carry an entry by this name that is not a directory
-# (bench/.venv was committed as a link to a developer's machine at c418002ff),
-# and uv cannot create the directory over it; drop_stray_grader_venv removes
-# such an entry from the exported tree before the sync.
+# (bench/.venv has been a committed link to a developer's machine since
+# c418002ff), and uv cannot create the directory over it;
+# drop_stray_grader_venv removes such an entry from the exported tree before
+# the sync.
 readonly EVAL_GRADER_VENV_DIR=".venv"
 
 # A repetition the launcher could not start because GitHub's token endpoint

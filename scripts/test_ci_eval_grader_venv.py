@@ -3,7 +3,7 @@
 `hack/ci-eval-pr.sh` grades a pull request with main's `bench/` at
 PULL_BASE_SHA, exported by `pin_grader` into a scratch directory and synced
 there with `uv sync`. A `.venv` entry the export carries -- `bench/.venv` was
-committed as a symbolic link to a developer's machine at c418002ff -- is a
+a symbolic link to a developer's machine, committed since c418002ff -- is a
 dangling link in the scratch tree, and `uv sync` fails on it twice with
 "failed to create directory ... File exists (os error 17)" before any case
 runs. The guard under test, `drop_stray_grader_venv`, removes a `.venv` that
@@ -29,11 +29,16 @@ STRAY_TARGET = "/Users/someone/ws/bench/.venv"
 # What `uv sync` does first in a tree without a venv, and what failed on the
 # link: create the directory. The stub stands in for the network fetch.
 UV_STUB = 'uv() { [ "$1" = sync ] && mkdir "${PWD}/.venv"; }'
+# An identity and no user or system git config: a global commit.gpgsign or
+# hooksPath would otherwise fail the throwaway commit for a reason that is
+# not the guard's.
 GIT_IDENTITY = {
     "GIT_AUTHOR_NAME": "t",
     "GIT_AUTHOR_EMAIL": "t@example.invalid",
     "GIT_COMMITTER_NAME": "t",
     "GIT_COMMITTER_EMAIL": "t@example.invalid",
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_CONFIG_NOSYSTEM": "1",
 }
 
 
@@ -54,8 +59,10 @@ def lifted_constant(name: str) -> str:
     return match.group(0)
 
 
-def run_bash(body: str) -> subprocess.CompletedProcess:
-    prelude = "\n".join([*(lifted_constant(c) for c in CONSTANTS), lifted(GUARD), lifted(EXPORT)])
+def run_bash(body: str, export: str | None = None) -> subprocess.CompletedProcess:
+    """The constants, the guard and the export as written, then `body`;
+    `export` replaces the lifted pin_grader when a case needs a variant."""
+    prelude = "\n".join([*(lifted_constant(c) for c in CONSTANTS), lifted(GUARD), export or lifted(EXPORT)])
     return subprocess.run(
         ["bash", "-c", "set -uo pipefail\n" + prelude + "\n" + body],
         capture_output=True,
@@ -118,15 +125,30 @@ class ExportTest(unittest.TestCase):
             self.assertTrue((out / "bench" / "tasks" / "a-case" / "task.yaml").is_file())
 
     def test_the_regression_this_guards(self):
-        # Without the guard, uv's mkdir over the dangling link is the os
-        # error 17 the gate failed with on every pull request.
+        # The same export with the guard's call line taken out of pin_grader
+        # is the export before this change: the link comes through, and
+        # uv's mkdir over it is the os error 17 the gate failed with on
+        # every pull request.
+        export_without_guard = "\n".join(line for line in lifted(EXPORT).splitlines() if GUARD not in line)
+        self.assertNotEqual(export_without_guard, lifted(EXPORT), "the export calls the guard")
         with tempfile.TemporaryDirectory() as tmp:
-            bench = pathlib.Path(tmp) / "bench"
-            bench.mkdir()
-            (bench / ".venv").symlink_to(STRAY_TARGET)
-            proc = run_bash("\n".join([UV_STUB, f'cd "{bench}" && uv sync --quiet']))
-            self.assertNotEqual(proc.returncode, 0)
+            root = pathlib.Path(tmp)
+            repo, sha = repo_with_committed_link(root)
+            out = root / "scratch"
+            out.mkdir()
+            proc = run_bash(
+                "\n".join(
+                    [
+                        UV_STUB,
+                        f'{EXPORT} "{repo}" "{sha}" "{out}" || exit 7',
+                        f'(cd "{out}/bench" && uv sync --quiet) || exit 8',
+                    ]
+                ),
+                export=export_without_guard,
+            )
+            self.assertEqual(proc.returncode, 8, proc.stdout + proc.stderr)
             self.assertIn("File exists", proc.stderr)
+            self.assertTrue((out / "bench" / ".venv").is_symlink(), "the link came through the export")
 
 
 class GuardTest(unittest.TestCase):
@@ -174,9 +196,6 @@ class GuardTest(unittest.TestCase):
             proc = self.run_guard(bench)
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertEqual(proc.stdout, "")
-
-    def test_the_export_calls_the_guard(self):
-        self.assertIn(GUARD, lifted(EXPORT))
 
 
 if __name__ == "__main__":
