@@ -1136,6 +1136,17 @@ the profile does. On the roll path it landed when the new pod came up, tens of s
 later, with the bus down for the roll. The websocket listener on 9222, the console's
 door, serves the same certificate from the same files (below).
 
+**A new profile waits for its deny.** The dispatch config, the dispatcher's identity-map
+grant and the agent card take a newly bound AgentProfile only once every bus server has
+loaded the config carrying its deny; until then the profile's `CardPublished` condition is
+`False` with reason `BusConfigPending`. On a cluster, where a profile change rolls the
+servers, the pod template records the profile list, and the operator reads the revision
+each server runs from the StatefulSet's ControllerRevisions (the operator's one `get` on
+them). On one server the config Secret records the previous list while a reload is pending
+or the pod restarts, and the profile counts as loaded once the server is on the new config.
+Only the way in waits: a profile the dispatch config already lists live, or whose card is
+already published, stays, and a removed profile keeps its deny while it drains, as before.
+
 **Certificate source.** The operator mints the certificates itself, with no dependency on
 cert-manager, which the chart does not install. Three objects, all owned by the
 `PlatformAgent` and removed with the stack on a flip to `today`:
