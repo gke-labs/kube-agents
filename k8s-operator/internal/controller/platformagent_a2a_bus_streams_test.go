@@ -713,22 +713,22 @@ func TestOnlyTheBusStatefulSetsOwnPodsAreRead(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			agent := busStreamsAgent(1)
-			impostor := busStreamsPod(agent, 5)
-			impostor.Name = "impostor"
-			tc.alter(impostor)
-			rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete), impostor)
+			stray := busStreamsPod(agent, 5)
+			stray.Name = "stray"
+			tc.alter(stray)
+			rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete), stray)
 			rig.serve(1, a2aProvisionedStreams...)
 			rig.source.bodies[busStreamsAddr(5)] = exporterBody(true, "")
-			// The real server stops answering, so only the impostor could.
+			// The real server stops answering, so only the stray pod could.
 			delete(rig.source.bodies, busStreamsAddr(0))
 			for i := 0; i < 4; i++ {
 				rig.poll()
 			}
 			if len(rig.deleted) != 0 {
-				t.Errorf("deleted %v on an impostor's word", rig.deleted)
+				t.Errorf("deleted %v on a stray pod's word", rig.deleted)
 			}
 			if c := rig.condition(); c == nil || c.Reason != busStreamsReasonExporterUnreachable {
-				t.Errorf("condition = %+v, want ExporterUnreachable: the impostor is not a server", c)
+				t.Errorf("condition = %+v, want ExporterUnreachable: the stray pod is not a server", c)
 			}
 		})
 	}
