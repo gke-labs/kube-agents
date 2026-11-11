@@ -2786,6 +2786,7 @@ class TestAuditCatalogue(unittest.TestCase):
                 "kanban-workspace-gc",
                 "session-retention",
                 "kanban-board-health",
+                "kanban-block-recheck",
                 "findings-morning-nudge",
                 "chat-delivery-watch",
                 "feedback-prompt",
@@ -6673,7 +6674,7 @@ class TestDeclaredIntent(BaseTestCase):
                 self.validate(doc)
 
     def test_a_stream_without_a_declared_intent_step_rejects_the_list(self):
-        # Five streams have no declared-intent step. A worker on one of them that writes a
+        # Four streams have no declared-intent step. A worker on one of them that writes a
         # `declared` list has misread a step that does not exist for it, and a
         # hostile document has found a stream with no rule to break; both are
         # rejected whole rather than admitted because the check is on the
@@ -6685,7 +6686,7 @@ class TestDeclaredIntent(BaseTestCase):
             if not spec.declarable
         ]
         self.assertIn(NON_DECLARING_AUDIT, silent)
-        self.assertEqual(len(silent), len(audit_report.AUDITS) - 4)
+        self.assertEqual(len(silent), len(audit_report.AUDITS) - 5)
         for audit_id in silent:
             with self.subTest(audit=audit_id):
                 doc = make_doc(audit=audit_id, findings=[])
@@ -7734,6 +7735,247 @@ class TestCostDeclaredShapes(HarnessTestCase):
                     audit_report.validate_findings(copy.deepcopy(written), self.COST)
                 self.assertIn("declared[0].object", str(caught.exception))
                 self.assertIn("never a roll-up", str(caught.exception))
+
+
+class TestStockoutDeclaredShapes(HarnessTestCase):
+    """The stockout stream's one posture: a zone-locked pool. The pool at its ceiling shares the slug and stays a finding."""
+
+    STOCKOUT = "stockout-prevention"
+    CLUSTER = "acme-prod/us-east1-b/prod-us-east"
+    PROJECT = "project/acme-prod"
+    # The two arms as fleet_stockout.py's check_single_zone_nodepool spells
+    # them; a pool matching both carries both clauses, joined.
+    ZONE_LOCKED = "single-zone (['us-east1-b']), autoscaling enabled, no NAP, tainted (seeded-role), so no other pool is counted as its fallback"
+    AT_CEILING = "at its autoscaling ceiling: 9/10 live nodes (90% of maxNodeCount 10 x 1 zone), zones ['us-east1-b']"
+
+    def _pool_finding(self, fid, obj, excerpt):
+        return make_finding(fid=fid, check="single-zone-nodepool", severity="major", cluster=self.CLUSTER, namespace="", obj=obj, excerpt=excerpt, command="gcloud container node-pools list --cluster=prod-us-east --location=us-east1-b --project=acme-prod --format=json", remediation={"kind": "manual", "note": "a human decides"})
+
+    def _quota_finding(self):
+        return make_finding(fid="quota", check="quota-exhaustion-risk", severity="critical", cluster=self.PROJECT, namespace="", obj="Quota/us-east1:CPUS", excerpt="CPUS at 95% of its limit", command="gcloud compute regions describe us-east1 --project=acme-prod --format=json(quotas)", remediation={"kind": "manual", "note": "a human decides"})
+
+    def _doc(self, findings):
+        clusters = [
+            {"name": self.CLUSTER, "location": "us-east1-b", "project": "acme-prod", "checks_run": list(audit_report.audit_target_checks(self.STOCKOUT, self.CLUSTER))},
+            {"name": self.PROJECT, "location": "-", "project": "acme-prod", "checks_run": list(audit_report.audit_target_checks(self.STOCKOUT, self.PROJECT))},
+        ]
+        return audit_report.validate_findings(make_doc(findings=findings, audit=self.STOCKOUT, clusters=clusters), self.STOCKOUT)
+
+    def _declaration(self, obj, check="single-zone-nodepool", **extra):
+        return {"check": check, "namespace": "", "object": obj, "repo": "acme/fleet", "path": "knowledge/zonal-pools.md", "excerpt": "x", **extra}
+
+    def test_the_declarable_set_is_the_zone_locked_pool(self):
+        # Pinned as a literal: the catalogue test only checks the set is a
+        # subset of the roster, and a fault slipping in would pass it.
+        self.assertEqual(audit_report.audit_declarable_checks(self.STOCKOUT), frozenset({"single-zone-nodepool"}))
+        for fault in ("quota-exhaustion-risk", "autoscaler-out-of-resources", "ccc-no-ondemand-floor", "dangling-compute-class", "spot-scarcity-risk"):
+            self.assertNotIn(fault, audit_report.audit_declarable_checks(self.STOCKOUT))
+
+    def test_a_declaration_moves_the_zone_locked_pool_and_not_one_at_its_ceiling(self):
+        # One note names three pools and a quota. The zone-locked pool moves;
+        # the pool at its ceiling and the pool matching both arms stay, each
+        # said on stderr; the quota is never looked up.
+        locked = self._pool_finding("locked", "NodePool/zonal-batch", self.ZONE_LOCKED)
+        ceiling = self._pool_finding("ceiling", "NodePool/regional-web", self.AT_CEILING)
+        both = self._pool_finding("both", "NodePool/zonal-full", f"{self.ZONE_LOCKED}; {self.AT_CEILING}")
+        doc = self._doc([locked, ceiling, both, self._quota_finding()])
+        declarations = [self._declaration(obj) for obj in ("NodePool/zonal-batch", "NodePool/regional-web", "NodePool/zonal-full")]
+        declarations.append(self._declaration("Quota/us-east1:CPUS", check="quota-exhaustion-risk"))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            moved = audit_report.apply_declarations(doc, declarations)
+        self.assertEqual([f["object"] for f in moved], ["NodePool/zonal-batch"])
+        self.assertEqual([f["object"] for f in doc["findings"]], ["NodePool/regional-web", "NodePool/zonal-full", "Quota/us-east1:CPUS"])
+        self.assertEqual([e["object"] for e in doc["declared"]], ["NodePool/zonal-batch"])
+        self.assertEqual(err.getvalue().count("DECLARATION NOT APPLIED"), 2)
+        self.assertIn("at its autoscaling ceiling", err.getvalue())
+        self.assertIn("SOP §3.9", err.getvalue())
+        self.assertIn("acme/fleet:knowledge/zonal-pools.md stands and the finding publishes", err.getvalue())
+
+    def test_the_manifest_route_declares_a_zone_locked_candidate_and_not_one_at_its_ceiling(self):
+        locked = {"check": "single-zone-nodepool", "cluster": self.CLUSTER, "namespace": "", "object": "NodePool/zonal-batch", "severity": "major", "excerpt": self.ZONE_LOCKED}
+        full = {"check": "single-zone-nodepool", "cluster": self.CLUSTER, "namespace": "", "object": "NodePool/zonal-full", "severity": "major", "excerpt": f"{self.ZONE_LOCKED}; {self.AT_CEILING}"}
+        manifest = {"clusters": [{"name": self.CLUSTER, "candidates": [locked, full]}]}
+        doc = self._doc([])
+        declarations = [self._declaration("NodePool/zonal-batch"), self._declaration("NodePool/zonal-full")]
+        with contextlib.redirect_stderr(io.StringIO()):
+            added = audit_report.declare_collector_candidates(doc, declarations, manifest)
+        self.assertEqual(added, [audit_report._shorten_id(audit_report.derive_finding_id(locked))])
+        self.assertEqual([e["object"] for e in doc["declared"]], ["NodePool/zonal-batch"])
+
+    def test_an_incomplete_search_withholds_both_arms_and_publishes_the_faults(self):
+        # The withhold cannot tell the arms apart without reading the excerpt
+        # and errs toward holding, as it does for `hpa-cannot-scale`.
+        locked = self._pool_finding("locked", "NodePool/zonal-batch", self.ZONE_LOCKED)
+        ceiling = self._pool_finding("ceiling", "NodePool/regional-web", self.AT_CEILING)
+        doc = self._doc([locked, ceiling, self._quota_finding()])
+        doc.pop(audit_report.DECLARED_INTENT_SEARCHED_KEY, None)
+        with contextlib.redirect_stderr(io.StringIO()):
+            withheld = audit_report.withhold_unsearched_postures(doc, None)
+        self.assertEqual(sorted(f["object"] for f in withheld), ["NodePool/regional-web", "NodePool/zonal-batch"])
+        self.assertEqual([f["object"] for f in doc["findings"]], ["Quota/us-east1:CPUS"])
+        # The coverage-gap sentence says why a fault sits among the withheld
+        # postures, as it does for the hpa dangling-target fault.
+        gap = audit_report._declared_intent_gap(doc)
+        self.assertIn("single-zone-nodepool at its autoscaling ceiling shares its slug", gap)
+        # And the ledger body's rendering of the same gap carries the footnote,
+        # so an operator is not told the held-back fault is a posture.
+        body = "\n".join(audit_report._render_declared_intent_search(doc))
+        self.assertIn("`single-zone-nodepool` at its autoscaling ceiling is a fault", body)
+        self.assertIn("NodePool/regional-web", body)
+
+    def test_the_validator_rejects_a_declared_fault_and_an_object_that_is_not_a_pool(self):
+        doc = self._doc([])
+        doc["declared"] = [make_declared(check="single-zone-nodepool", cluster=self.CLUSTER, namespace="", obj="NodePool/zonal-batch", title="zonal-batch stays in one zone by design", repo="acme/fleet", path="knowledge/zonal-pools.md", excerpt="x")]
+        audit_report.validate_findings(copy.deepcopy(doc), self.STOCKOUT)
+        for fault in ("quota-exhaustion-risk", "autoscaler-out-of-resources", "spot-scarcity-risk", "ccc-missing-fallbacks"):
+            with self.subTest(fault):
+                doc["declared"][0]["check"] = fault
+                with self.assertRaises(audit_report.ValidationError) as cm:
+                    audit_report.validate_findings(copy.deepcopy(doc), self.STOCKOUT)
+                self.assertIn("declared[0].check", str(cm.exception))
+                self.assertIn("fault, not a posture", str(cm.exception))
+        doc["declared"][0]["check"] = "single-zone-nodepool"
+        for obj in ("Cluster/prod-us-east", "Deployment/web", "ComputeClass/zonal"):
+            with self.subTest(obj):
+                doc["declared"][0]["object"] = obj
+                with self.assertRaises(audit_report.ValidationError) as cm:
+                    audit_report.validate_findings(copy.deepcopy(doc), self.STOCKOUT)
+                self.assertIn("declared[0].object", str(cm.exception))
+                self.assertIn("nodepool", str(cm.exception))
+
+    def test_an_expired_declaration_leaves_the_pool_a_finding_and_a_standing_one_moves_it(self):
+        # Dates judged against the run's start day; pinned with the clock
+        # pinned beside it, so the test reads neither live.
+        run_day = date(2026, 11, 9)
+        self.patch_attr("run_start_day", lambda audit_id: run_day)
+        self.patch_attr("_today_utc", lambda: run_day)
+        yesterday = (run_day - timedelta(days=1)).strftime(audit_report.DECLARATION_EXPIRES_FORMAT)
+        next_year = (run_day + timedelta(days=365)).strftime(audit_report.DECLARATION_EXPIRES_FORMAT)
+        locked = self._pool_finding("locked", "NodePool/zonal-batch", self.ZONE_LOCKED)
+        ceiling = self._pool_finding("ceiling", "NodePool/regional-web", self.AT_CEILING)
+        doc = self._doc([locked, ceiling])
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            moved = audit_report.apply_declarations(doc, [self._declaration("NodePool/zonal-batch", expires=yesterday), self._declaration("NodePool/regional-web", expires=yesterday)])
+        self.assertEqual(moved, [])
+        lapsed, held = doc["findings"]
+        self.assertEqual(lapsed[audit_report.EXPIRED_DECLARATION_FIELD]["path"], "knowledge/zonal-pools.md")
+        self.assertEqual(lapsed[audit_report.EXPIRED_DECLARATION_FIELD]["expires"], yesterday)
+        # A lapsed note is reported only against a posture it did cover: the
+        # pool at its ceiling was never covered, so it carries no line.
+        self.assertNotIn(audit_report.EXPIRED_DECLARATION_FIELD, held)
+        self.assertEqual(err.getvalue().count("DECLARATION EXPIRED"), 1)
+        doc = self._doc([self._pool_finding("locked", "NodePool/zonal-batch", self.ZONE_LOCKED)])
+        with contextlib.redirect_stderr(io.StringIO()):
+            moved = audit_report.apply_declarations(doc, [self._declaration("NodePool/zonal-batch", expires=next_year)])
+        self.assertEqual([f["object"] for f in moved], ["NodePool/zonal-batch"])
+        self.assertEqual(doc["declared"][0]["declaration"]["expires"], next_year)
+
+    def test_the_arm_marks_are_the_collectors_prefixes(self):
+        # The join reads the arm off the excerpt the collector writes, so each
+        # prefix's two copies are pinned to each other and to what
+        # check_single_zone_nodepool produces for a zone-locked pool and for
+        # one at its ceiling; a rewording on one side alone fails here.
+        import fleet_stockout
+
+        self.assertEqual(audit_report.ZONE_LOCKED_ARM_MARK, fleet_stockout.ZONE_LOCKED_ARM_PREFIX)
+        self.assertEqual(audit_report.CEILING_ARM_MARK, fleet_stockout.CEILING_ARM_PREFIX)
+        pool = {"name": "zonal-batch", "locations": ["us-east1-b"], "autoscaling": {"enabled": True, "minNodeCount": 0, "maxNodeCount": 2}, "config": {"machineType": "e2-small", "taints": [{"key": "seeded-role", "value": "zonal", "effect": "NO_SCHEDULE"}]}}
+        locked = fleet_stockout.check_single_zone_nodepool(pool, False, 0)
+        full = fleet_stockout.check_single_zone_nodepool(pool, False, 2)
+        self.assertTrue(audit_report._is_zone_locked_arm(locked), locked)
+        self.assertTrue(audit_report._is_ceiling_arm(full), full)
+        self.assertFalse(audit_report._is_zone_locked_arm(full), full)
+
+    def test_a_hand_written_excerpt_naming_no_arm_is_not_moved(self):
+        # A finding the worker wrote on a cluster the collector could not read
+        # carries the worker's wording; with neither prefix nothing says which
+        # arm it is, and the join errs toward not silencing.
+        prose = self._pool_finding("prose", "NodePool/zonal-batch", "2/2 live nodes, 100% of maxNodeCount 2, in us-east1-b")
+        # The zone-locked prefix counts only where the collector writes it, at
+        # the start: a full pool described in prose that mentions a single
+        # zone later on is still not the posture.
+        trailing = self._pool_finding("trailing", "NodePool/zonal-full", "2/2 live nodes, 100% of maxNodeCount 2, single-zone (us-east1-b) pool cannot grow")
+        doc = self._doc([prose, trailing])
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            moved = audit_report.apply_declarations(doc, [self._declaration("NodePool/zonal-batch"), self._declaration("NodePool/zonal-full")])
+        self.assertEqual(moved, [])
+        self.assertEqual([f["object"] for f in doc["findings"]], ["NodePool/zonal-batch", "NodePool/zonal-full"])
+        self.assertEqual(err.getvalue().count("opens neither 3.9 arm"), 2)
+
+    def test_a_namespace_a_worker_wrote_onto_the_pool_is_folded_before_the_join(self):
+        # The collector files the pool with no namespace and the note writes
+        # `namespace: ""`; a worker's namespace would give the pool a third
+        # identity that neither matches, so the validator empties it
+        # (UNNAMESPACED_CHECKS) and the declaration still joins.
+        stray = make_finding(fid="stray", check="single-zone-nodepool", severity="major", cluster=self.CLUSTER, namespace="kube-system", obj="NodePool/zonal-batch", excerpt=self.ZONE_LOCKED, command="gcloud container node-pools list --cluster=prod-us-east --location=us-east1-b --project=acme-prod --format=json", remediation={"kind": "manual", "note": "a human decides"})
+        doc = self._doc([stray])
+        self.assertEqual(doc["findings"][0]["namespace"], "")
+        self.assertIn("._.nodepool-zonal-batch", doc["findings"][0]["id"])
+        with contextlib.redirect_stderr(io.StringIO()):
+            moved = audit_report.apply_declarations(doc, [self._declaration("NodePool/zonal-batch")])
+        self.assertEqual([f["object"] for f in moved], ["NodePool/zonal-batch"])
+
+    def test_a_hand_written_declared_entry_for_a_pool_at_its_ceiling_is_refused_against_the_manifest(self):
+        # A `declared[]` entry carries no excerpt, so the validator cannot tell
+        # the arms apart and lets the entry through; its identity would then
+        # enter `known` and keep the collector's at-ceiling candidate off the
+        # ledger. The manifest is where the entry meets the arm: exit 2.
+        full = {"check": "single-zone-nodepool", "cluster": self.CLUSTER, "namespace": "", "object": "NodePool/zonal-full", "severity": "major", "excerpt": f"{self.ZONE_LOCKED}; {self.AT_CEILING}"}
+        locked = {"check": "single-zone-nodepool", "cluster": self.CLUSTER, "namespace": "", "object": "NodePool/zonal-batch", "severity": "major", "excerpt": self.ZONE_LOCKED}
+        manifest = {"clusters": [{"name": self.CLUSTER, "candidates": [full, locked]}]}
+        doc = self._doc([])
+        doc["declared"] = [make_declared(check="single-zone-nodepool", cluster=self.CLUSTER, namespace="", obj="NodePool/zonal-full", title="zonal-full stays in one zone by design", repo="acme/fleet", path="knowledge/zonal-pools.md", excerpt="x")]
+        doc = audit_report.validate_findings(doc, self.STOCKOUT)
+        with self.assertRaises(audit_report.ValidationError) as cm:
+            audit_report.reject_declared_ceiling_pools(doc, manifest)
+        self.assertIn("declared[]", str(cm.exception))
+        self.assertIn("NodePool/zonal-full", str(cm.exception))
+        self.assertIn(audit_report.CEILING_ARM_MARK, str(cm.exception))
+        # The same entry for the zone-locked pool stands, and a run without a
+        # manifest has nothing to hold the entry to.
+        doc["declared"][0]["object"] = "NodePool/zonal-batch"
+        self.assertIsNone(audit_report.reject_declared_ceiling_pools(doc, manifest))
+        doc["declared"][0]["object"] = "NodePool/zonal-full"
+        self.assertIsNone(audit_report.reject_declared_ceiling_pools(doc, None))
+
+    def test_remediate_reads_the_collectors_excerpt_before_judging_the_arm(self):
+        # The worker reworded the excerpt of a declared zone-locked pool.
+        # `finish` adopts the collector's wording before the join and lists the
+        # pool under Declared intent; `remediate` reads the same wording and
+        # refuses the id as declared, instead of opening a pull request for a
+        # posture the ledger calls declared.
+        workspace = self.gitops_root / self.STOCKOUT / "acme__fleet"
+        (workspace / ".git").mkdir(parents=True)
+        audit_report.set_workspace(workspace)
+        self.patch_attr("repo_root", lambda: workspace)
+        self.harness.replies = {"issue-list": {"issues": []}}
+        Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
+        audit_report.write_run_record(self.STOCKOUT, "acme/fleet", [], searched=[f"acme/fleet@{SEARCH_SHA}"], sources=[])
+        audit_report.write_declarations(self.STOCKOUT, "acme/fleet", [self._declaration("NodePool/zonal-batch")])
+        prose = self._pool_finding("prose", "NodePool/zonal-batch", "pool pinned to one zone, autoscaling on, nothing else to fall back to")
+        doc = self._doc([prose])
+        fid = doc["findings"][0]["id"]
+        candidate = {"check": "single-zone-nodepool", "cluster": self.CLUSTER, "namespace": "", "object": "NodePool/zonal-batch", "severity": "major", "excerpt": self.ZONE_LOCKED, "command": "gcloud container node-pools list --cluster=prod-us-east --location=us-east1-b --project=acme-prod --format=json"}
+        manifest_path = self.tmp_path / "manifest_stockout.json"
+        manifest_path.write_text(json.dumps({"audit": self.STOCKOUT, "clusters": [{"name": self.CLUSTER, "outcome": "collected", "candidates": [candidate]}]}), encoding="utf-8")
+        rc = self.run_main(["remediate", "--audit", self.STOCKOUT, "--findings-file", self.write_findings(doc), "--manifest-file", str(manifest_path), "--finding", fid, "--dry-run", "--repo", "acme/fleet"])
+        self.assertEqual(rc, 2, self.err)
+        self.assertIn("a repository declaration covers this posture", self.err)
+        self.assertNotIn("opens neither 3.9 arm", self.err)
+        # Through the same call site: a `declared[]` entry the worker wrote for
+        # a pool the manifest reports at its ceiling is refused before the join.
+        full = {"check": "single-zone-nodepool", "cluster": self.CLUSTER, "namespace": "", "object": "NodePool/zonal-full", "severity": "major", "excerpt": f"{self.ZONE_LOCKED}; {self.AT_CEILING}", "command": candidate["command"]}
+        manifest_path.write_text(json.dumps({"audit": self.STOCKOUT, "clusters": [{"name": self.CLUSTER, "outcome": "collected", "candidates": [candidate, full]}]}), encoding="utf-8")
+        written = self._doc([self._quota_finding()])
+        written["declared"] = [make_declared(check="single-zone-nodepool", cluster=self.CLUSTER, namespace="", obj="NodePool/zonal-full", title="zonal-full stays in one zone by design", repo="acme/fleet", path="knowledge/zonal-pools.md", excerpt="x")]
+        quota_id = written["findings"][0]["id"]
+        rc = self.run_main(["remediate", "--audit", self.STOCKOUT, "--findings-file", self.write_findings(written), "--manifest-file", str(manifest_path), "--finding", quota_id, "--dry-run", "--repo", "acme/fleet"])
+        self.assertEqual(rc, 2, self.err)
+        self.assertIn("declared[]: NodePool/zonal-full", self.err)
+        self.assertIn(audit_report.CEILING_ARM_MARK, self.err)
 
 
 class TestDeclaredIntentSearch(HarnessTestCase):
@@ -22957,6 +23199,9 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
                 self.assertFalse(self.harness.forge_calls("proposal-create"))
                 body = "".join(self.harness.bodies_for("issue-*"))
                 self.assertIn("## Awaiting `/remediate`", body)
+                # The worker is told the direct ask still opens these: a task that asked
+                # for the fixes runs `remediate` rather than stopping at the ledger.
+                self.assertIn("when this task asks you to open fixes, run `remediate --finding", self.err)
                 self.assertIn(f"`{audit_report.AUTO_PROMOTE_ENV}={audit_report.AUTO_PROMOTE_OFF}`", body)
                 self.assertIn(derived_id(), body[body.index("## Awaiting `/remediate`"):])
 
@@ -24313,7 +24558,8 @@ metadata:
     def test_the_live_run_a_degraded_fix_names_the_planted_declaration(self):
         """The worker named a file it never wrote, so the fix degraded to
         `manual`; the planted declaration was in the repository. The paragraph
-        keeps the eval's first sentence and names the planted file."""
+        names the planted file in its first sentence, and does not say "this
+        file", because the fix's file is not the declaration."""
         self.write(self.PLANTED, self.PLANTED_DECLARATION)
         finding = self.pool_finding({"kind": "manifest", "path": "clusters/fa2-seeded-a/pinned-inference-pool.tf", "note": "Append zones."})
         audit_report.degrade_missing_remediations([finding], self.root)
@@ -24321,11 +24567,176 @@ metadata:
         declarations = audit_report.kcc_declarations(self.root)
         self.assertEqual(audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, declarations), ["pool"])
         paragraph = finding["remediation"]["note"].split("\n\n")[-1]
-        self.assertTrue(paragraph.startswith(audit_report.KCC_STALLED_NOTE_MARK), paragraph[:120])
-        self.assertIn(f"The declaration is `{self.PLANTED}`.", paragraph)
+        self.assertTrue(paragraph.startswith(f"**Config Connector is not applying `{self.PLANTED}`.**"), paragraph[:120])
+        self.assertNotIn("this file", paragraph)
         self.assertIn("`ContainerNodePool eval-kcc-stalled/pinned-inference-pool`", paragraph)
         self.assertIn("DependencyNotFound", paragraph)
         self.assertIn("pinned-inference-pool", finding[audit_report.KCC_STALLED_FINDING_FIELD])
+
+    def test_a_copied_paragraph_that_names_a_file_is_stripped_and_written_again(self):
+        """The strip-and-rewrite pattern covers the first sentence that names
+        a file, as it covers the two fixed forms."""
+        self.write(self.PLANTED, self.PLANTED_DECLARATION)
+        declarations = audit_report.kcc_declarations(self.root)
+        finding = self.pool_finding({"kind": "manual", "note": "Spread the pool."})
+        audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, declarations)
+        once = finding["remediation"]["note"]
+        self.assertEqual(audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, declarations), [])
+        self.assertEqual(finding["remediation"]["note"], once)
+        self.assertEqual(once.count(audit_report.KCC_STALLED_MARK_PREFIX), 1)
+        audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(), self.root, declarations)
+        self.assertEqual(finding["remediation"]["note"], "Spread the pool.")
+
+    def test_guard_the_workers_own_text_stays_before_the_paragraph(self):
+        """A guard, not a fix test: it passed before any change. Two live
+        ledger rows showed only the paragraph as the fix's text, because the
+        worker gave no note. The pass keeps the worker's own text, when there
+        is any, before the paragraph, for a manifest fix of the declaring
+        file, a fix of another file, a manual fix and a note long enough to
+        be cut; with no worker text, the paragraph is the whole note and
+        nothing is made up in its place."""
+        self.write(self.PLANTED, self.PLANTED_DECLARATION)
+        declarations = audit_report.kcc_declarations(self.root)
+        long_text = ("Append us-central1-b and us-central1-c to the pool's node locations. " * 40).strip()
+        for remediation, expected in (
+            ({"kind": "manifest", "path": self.PLANTED, "note": "Append zones."}, "Append zones."),
+            ({"kind": "manifest", "path": "clusters/fa2-seeded-a/other.yaml", "note": "Append zones."}, "Append zones."),
+            ({"kind": "manual", "note": "Append zones."}, "Append zones."),
+            ({"kind": "manual", "note": long_text}, long_text[:200]),
+        ):
+            with self.subTest(kind=remediation["kind"], path=remediation.get("path")):
+                finding = self.pool_finding(dict(remediation))
+                audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, declarations)
+                note = finding["remediation"]["note"]
+                self.assertTrue(note.startswith(expected), note[:200])
+                self.assertLess(note.index(expected), note.index(audit_report.KCC_STALLED_MARK_PREFIX))
+        for remediation in ({"kind": "manifest", "path": self.PLANTED, "note": ""}, {"kind": "manifest", "path": self.PLANTED}):
+            finding = self.pool_finding(dict(remediation))
+            audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, declarations)
+            self.assertTrue(finding["remediation"]["note"].startswith(audit_report.KCC_STALLED_NOTE_MARK))
+
+    def test_a_worker_sentence_with_the_same_start_is_not_stripped(self):
+        """Review finding: the strip pattern took everything after the shared
+        start of the paragraph's first sentence, so a worker sentence that
+        starts the same way lost its end. Only an exact first sentence is a
+        copied paragraph."""
+        worker = ("Raise maxNodeCount to 6 in the pool file. **Config Connector is not applying the pool's last change**, "
+                  "so check its status first, then merge the pull request.")
+        finding = self.pool_finding({"kind": "manual", "note": worker})
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            audit_report.disclose_stalled_kcc_and_log([finding], kcc_manifest(), self.root, declarations={})
+        self.assertEqual(finding["remediation"]["note"], worker)
+        self.assertNotIn("removed", err.getvalue())
+
+    def test_every_exact_first_sentence_is_stripped(self):
+        tail = " When the audit ran, Config Connector reported `Ready=False` on `X a/b` (`UpdateFailed`)."
+        for mark in (
+            audit_report.KCC_STALLED_NOTE_MARK,
+            audit_report.KCC_STALLED_OBJECT_MARK,
+            audit_report.KCC_STALLED_DECLARED_MARK.format(path="`a/b.yaml`"),
+            audit_report.KCC_STALLED_DECLARED_MARK.format(path="`a/b.yaml` in the repository `acme/infra`"),
+        ):
+            with self.subTest(mark=mark):
+                remediation = {"kind": "manual", "note": "Do it.\n\n" + mark + tail}
+                audit_report._strip_kcc_stalled_note(remediation)
+                self.assertEqual(remediation["note"], "Do it.")
+
+    def test_a_worker_sentence_with_a_code_span_is_not_stripped(self):
+        """Review finding: the first-sentence pattern took any code span, so a
+        worker sentence that names an object in one lost the sentence and the
+        rest of its line, and the log called it a copied paragraph. A copied
+        paragraph is one that goes on as `finish` writes it."""
+        worker = ("Raise maxNodeCount to 6. **Config Connector is not applying `pinned-inference-pool`.** "
+                  "Check its status first, then merge.")
+        finding = self.pool_finding({"kind": "manual", "note": worker})
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            audit_report.disclose_stalled_kcc_and_log([finding], kcc_manifest(), self.root, declarations={})
+            audit_report.disclose_manual_routes_and_log([finding], kcc_manifest(), set())
+        self.assertEqual(finding["remediation"]["note"], worker)
+        self.assertNotIn("copied", err.getvalue())
+        self.assertNotIn("removed", err.getvalue())
+
+    def test_every_paragraph_finish_writes_is_stripped(self):
+        """Every step of each paragraph form, the context-repository form
+        included, is stripped and written again."""
+        self.write(self.PLANTED, self.PLANTED_DECLARATION)
+        stalled = audit_report.kcc_health(self.live_manifest()).stalled
+        objects = audit_report.kcc_stalled_objects(stalled, stalled)
+        texts = [audit_report.KCC_STALLED_NOTE.format(objects=objects), audit_report.KCC_STALLED_NOTE_CORE.format(objects=objects)]
+        for path in ("`a/b.yaml`", "`a/b.yaml` in the repository `acme/infra`"):
+            texts += [audit_report.KCC_STALLED_DECLARED_NOTE.format(path=path, objects=objects),
+                      audit_report.KCC_STALLED_DECLARED_CORE.format(path=path, objects=objects)]
+        for search in (audit_report.KCC_DECLARATION_NOT_NAMED, audit_report.KCC_DECLARATION_SEARCH_MANY.format(count=2)):
+            texts += [audit_report.KCC_STALLED_UNDECLARED_NOTE.format(search=search, objects=objects),
+                      audit_report.KCC_STALLED_UNDECLARED_CORE.format(search=search, objects=objects)]
+        for text in texts:
+            with self.subTest(text=text[:60]):
+                remediation = {"kind": "manual", "note": "Do it.\n\n" + text}
+                audit_report._strip_kcc_stalled_note(remediation)
+                self.assertEqual(remediation["note"], "Do it.")
+
+    # The paragraph that main wrote before the first sentence named the file:
+    # "this file" and then a second sentence that names it. A previous ledger
+    # can hold it, and the carry copies it.
+    MAIN_DECLARED_CORE = ("**Config Connector is not applying this file.** The declaration is {path}. "
+                          "When the audit ran, Config Connector reported {objects}.")
+    MAIN_DECLARED_TAIL = (" Config Connector does not apply the object until that reason is gone, so a change to the "
+                          "declaration does not take effect before then, and this finding comes back on each run until "
+                          "then. If the reason rejects the declaration, correct it there.")
+
+    def carried_main_paragraph(self, path, manifest, tail=True):
+        """Run the carry with a previous ledger whose manual fix has main's
+        paragraph, then the paragraph pass on this run's manifest."""
+        self.write(self.PLANTED, self.PLANTED_DECLARATION)
+        declarations = audit_report.kcc_declarations(self.root)
+        stalled = audit_report.kcc_health(self.live_manifest()).stalled
+        objects = audit_report.kcc_stalled_objects(stalled, stalled)
+        old = self.MAIN_DECLARED_CORE.format(path=path, objects=objects) + (self.MAIN_DECLARED_TAIL if tail else "")
+        before = self.pool_finding({"kind": "manual", "note": "Spread the pool by hand.\n\n" + old})
+        now = self.pool_finding({"kind": "manual", "note": "Spread the pool."})
+        self.assertEqual(audit_report.carry_unchanged_findings([now], {"findings": [before]}), ["pool"])
+        audit_report.disclose_stalled_kcc_remediations([now], manifest, self.root, declarations)
+        return now["remediation"]["note"]
+
+    def main_paths(self):
+        return (f"`{self.PLANTED}`", f"`{self.PLANTED}` in the repository `acme/infra`")
+
+    def test_a_carried_paragraph_from_main_goes_when_the_stall_clears(self):
+        """Review finding: main's paragraph has a second sentence between
+        "this file.**" and the text that every paragraph goes on with, so the
+        strip pattern did not match it. The carry copied it, and the note
+        kept a stall that this run did not see."""
+        for path in self.main_paths():
+            for tail in (True, False):
+                with self.subTest(path=path, tail=tail):
+                    note = self.carried_main_paragraph(path, kcc_manifest(), tail)
+                    self.assertEqual(note, "Spread the pool by hand.")
+
+    def test_a_carried_paragraph_from_main_is_written_again_once_when_the_stall_continues(self):
+        """The same carry while the stall continues: the note holds one
+        paragraph, this run's, and not main's paragraph beside it."""
+        for path in self.main_paths():
+            for tail in (True, False):
+                with self.subTest(path=path, tail=tail):
+                    note = self.carried_main_paragraph(path, self.live_manifest(), tail)
+                    self.assertTrue(note.startswith("Spread the pool by hand.\n\n"), note[:120])
+                    self.assertEqual(note.count(audit_report.KCC_STALLED_MARK_PREFIX), 1, note)
+                    self.assertNotIn("The declaration is", note)
+                    self.assertNotIn(audit_report.KCC_STALLED_NOTE_MARK, note)
+
+    def test_a_worker_sentence_like_mains_first_two_sentences_is_not_stripped(self):
+        """Main's two first sentences, without the text that every paragraph
+        goes on with, are a worker's sentences and stay."""
+        worker = ("Raise maxNodeCount to 6. **Config Connector is not applying this file.** "
+                  "The declaration is `clusters/prod.yaml`. Check its status first, then merge.")
+        finding = self.pool_finding({"kind": "manual", "note": worker})
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            audit_report.disclose_stalled_kcc_and_log([finding], kcc_manifest(), self.root, declarations={})
+        self.assertEqual(finding["remediation"]["note"], worker)
+        self.assertNotIn("removed", err.getvalue())
 
     def test_no_declaration_found_gives_the_sibling_sentence(self):
         finding = self.pool_finding({"kind": "manual", "note": "Spread the pool."})
@@ -24357,10 +24768,10 @@ metadata:
         self.assertEqual(changed, ["pool"])
         self.assertEqual(finding["remediation"]["note"], command)
         paragraph = finding[audit_report.KCC_STALLED_PARAGRAPH_FIELD]
-        self.assertIn(f"The declaration is `{self.PLANTED}`.", paragraph)
+        self.assertIn(f"**Config Connector is not applying `{self.PLANTED}`.**", paragraph)
         rendered = "\n".join(audit_report.render_finding(finding))
-        self.assertLess(rendered.index(command), rendered.index(audit_report.KCC_STALLED_NOTE_MARK))
-        self.assertIn("```\n\n" + audit_report.KCC_STALLED_NOTE_MARK, rendered)
+        self.assertLess(rendered.index(command), rendered.index(audit_report.KCC_STALLED_MARK_PREFIX))
+        self.assertIn("```\n\n" + audit_report.KCC_STALLED_MARK_PREFIX, rendered)
         # A worker's copy of the field is dropped.
         finding[audit_report.KCC_STALLED_PARAGRAPH_FIELD] = "made up"
         validated = audit_report.validate_findings(make_doc(findings=[finding]), AUDIT)
@@ -24386,7 +24797,7 @@ metadata:
         scan = audit_report.kcc_declarations_via_broker("acme/fleet", self.broker(files), every_kind=True)
         finding = self.pool_finding({"kind": "manual", "note": "Spread the pool."})
         audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, scan)
-        self.assertIn(f"The declaration is `{self.PLANTED}`.", finding["remediation"]["note"])
+        self.assertIn(f"**Config Connector is not applying `{self.PLANTED}`.**", finding["remediation"]["note"])
 
     def test_content_mode_indexes_every_config_connector_kind(self):
         """A PubSubTopic, not only the container kinds, and a file whose only
@@ -24402,7 +24813,7 @@ metadata:
         finding = make_finding(fid="t", check="kcc-object-wedged", cluster="acme/us-central1/hub", obj="PubSubTopic/events",
                                namespace="infra", remediation={"kind": "manual", "note": "Grant the role."})
         audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(dict(KCC_TOPIC, name="events")), self.root, scan)
-        self.assertIn("The declaration is `pubsub/events.yaml`.", finding["remediation"]["note"])
+        self.assertIn("**Config Connector is not applying `pubsub/events.yaml`.**", finding["remediation"]["note"])
 
     def test_the_gcloud_check_reads_the_container_kinds_and_the_paragraph_every_kind(self):
         """The gcloud check reads only the files that name the container
@@ -24456,7 +24867,7 @@ metadata:
             with self.subTest(mode=label):
                 finding = self.pool_finding({"kind": "manual", "note": "Spread the pool."})
                 audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, declarations)
-                self.assertIn(f"The declaration is `{path}`.", finding["remediation"]["note"])
+                self.assertIn(f"**Config Connector is not applying `{path}`.**", finding["remediation"]["note"])
 
     def test_the_absence_sentence_is_gone(self):
         """No text the audit writes says that no file declares an object."""
@@ -24508,7 +24919,7 @@ metadata:
         self.assertEqual(
             audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(stall), self.root, declarations), ["b"]
         )
-        self.assertIn("The declaration is `projects/b/cluster.yaml`.", finding["remediation"]["note"])
+        self.assertIn("**Config Connector is not applying `projects/b/cluster.yaml`.**", finding["remediation"]["note"])
         # The gcloud check still takes the first declaration of the name, as before.
         command = make_finding(fid="g", cluster="proj-b/us-central1/prod", obj="Cluster/prod",
                                remediation={"kind": "gcloud", "note": "gcloud container clusters update prod --release-channel regular"})
@@ -24535,7 +24946,7 @@ metadata:
         audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, audit_report.kcc_declarations(self.root))
         paragraph = finding["remediation"]["note"].split("\n\n")[-1]
         self.assertEqual(paragraph, audit_report.KCC_STALLED_NOTE.format(objects=finding[audit_report.KCC_STALLED_FINDING_FIELD]))
-        self.assertNotIn("The declaration is", paragraph)
+        self.assertNotIn("**Config Connector is not applying `", paragraph)
 
     def test_both_first_sentences_are_stripped_and_written_again(self):
         finding = self.pool_finding({"kind": "manual", "note": "Spread the pool."})
@@ -24561,7 +24972,7 @@ metadata:
                 manifest = {"clusters": [{"name": "hubp/us-central1/hub", "outcome": "collected", "kcc_unready": [
                     {"kind": "PubSubTopic", "namespace": ns, "name": "events", "project": "p", "why": "UpdateFailed: 403"}]}]}
                 audit_report.disclose_stalled_kcc_remediations([finding], manifest, self.root, declarations)
-                self.assertIn(f"The declaration is `{path}`.", finding["remediation"]["note"])
+                self.assertIn(f"**Config Connector is not applying `{path}`.**", finding["remediation"]["note"])
 
     POOL_STALL = {"kind": "ContainerNodePool", "namespace": "infra", "name": "pinned-inference-pool", "cluster": "c1",
                   "project": "p", "why": "DependencyNotFound: reference ContainerCluster infra/c1 is not found"}
@@ -24597,6 +25008,36 @@ metadata:
         self.assertTrue(paragraph.startswith(audit_report.KCC_STALLED_OBJECT_MARK), paragraph[:120])
         self.assertLessEqual(len(audit_report.publishable_text(note).strip()), audit_report.MAX_NOTE_CHARS)
         self.assertEqual(audit_report.clip_text(note, audit_report.MAX_NOTE_CHARS), note.strip())
+        self.assertIn("the fix says so", err.getvalue())
+
+    def test_a_shortened_kustomize_block_keeps_the_location_note(self):
+        """The copied file fills the cap beside a declared-file note and the
+        reconciler note. The shorter block makes room for the paragraph's
+        core and for both route notes: the location note is not pushed out."""
+        reason = ("did not open a pull request for this fix. `clusters/a/provisioning/pool.yaml` is a new file in the "
+                  "Kustomize root `clusters/a`, and `clusters/a/kustomization.yaml` does not list it. "
+                  f"{audit_report.KUSTOMIZE_NOTE_MARK} To apply the fix, add the file and add the line `- provisioning/pool.yaml` "
+                  "under `resources:` in `clusters/a/kustomization.yaml`")
+        prefix = f"_(The audit {reason}.)_"
+        declared = audit_report.DECLARED_NOTE.format(path="clusters/a/provisioning/pool.yaml")
+        reconciled = audit_report.RECONCILED_NOTE.format(reconciler="the Argo CD Application `infra`")
+        routes = "\n\n" + declared + "\n\n" + reconciled
+        lines = ["apiVersion: container.cnrm.cloud.google.com/v1beta1", "kind: ContainerNodePool", "metadata:",
+                 "  name: pinned-inference-pool", "spec:", "  location: us-central1"] + [
+            f"  # a long explanatory comment line in the worker file, number {i:02d}, kept as is" for i in range(40)]
+        block = audit_report._sized_manifest_block(
+            lines, True, lambda b: len(audit_report.publishable_text(prefix + b + routes)) <= audit_report.MAX_NOTE_CHARS
+        )
+        finding = self.harness_finding(prefix + block + " Raise the cap." + routes)
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            audit_report.disclose_stalled_kcc_and_log([finding], kcc_manifest(self.POOL_STALL), self.root, declarations={})
+        note = finding["remediation"]["note"]
+        self.assertTrue(note.startswith(prefix), note[:200])
+        self.assertIn(declared, note)
+        self.assertIn(reconciled, note)
+        self.assertEqual(note.count("```") % 2, 0)
+        self.assertTrue(note.split("\n\n")[-1].startswith(audit_report.KCC_STALLED_OBJECT_MARK), note[-300:])
+        self.assertLessEqual(len(audit_report.publishable_text(note).strip()), audit_report.MAX_NOTE_CHARS)
         self.assertIn("the fix says so", err.getvalue())
 
     def test_the_paragraph_never_cuts_the_degraded_fix_text(self):
@@ -24703,12 +25144,12 @@ metadata:
         declarations = audit_report.kcc_declarations(self.root)
         finding = self.wedged("p/us-central1/hub-a", kind="manual")
         self.assertEqual(audit_report.disclose_stalled_kcc_remediations([finding], manifest, self.root, declarations), ["w"])
-        self.assertIn("The declaration is `pubsub/events.yaml`.", finding["remediation"]["note"])
+        self.assertIn("**Config Connector is not applying `pubsub/events.yaml`.**", finding["remediation"]["note"])
         # The fix of the declaring file gets the paragraph about that file.
         finding = self.wedged("p/us-central1/hub-a")
         self.assertEqual(audit_report.disclose_stalled_kcc_remediations([finding], manifest, self.root, declarations), ["w"])
         self.assertIn(audit_report.KCC_STALLED_NOTE_MARK, finding["remediation"]["note"])
-        self.assertNotIn("The declaration is", finding["remediation"]["note"])
+        self.assertNotIn("**Config Connector is not applying `", finding["remediation"]["note"])
         manifest["clusters"][0]["kcc_unready"] = [dict(self.TOPIC_STALL, project="other")]
         finding = self.wedged("p/us-central1/hub-a", kind="manual")
         self.assertEqual(audit_report.disclose_stalled_kcc_remediations([finding], manifest, self.root, declarations), [])
@@ -24770,6 +25211,26 @@ metadata:
                 self.assertIn(audit_report.KCC_DECLARATION_NOT_NAMED, note)
                 self.assertNotIn(path, note)
 
+    def test_the_paragraph_never_pushes_out_a_location_note(self):
+        """Review finding: a paragraph step was accepted as shorter although
+        it pushed out the location note (here the declared file), and only the
+        reconciler note was held. Every route note already on the note stays."""
+        prose = (f"This object is declared in the GitOps repository at `clusters/c1/pool.yaml`, whose spec sets "
+                 f"`autoscaling`. {audit_report.KCC_REVERTED_NOTE_MARK}, so the command below is reverted on the next "
+                 "reconcile and this finding returns on the next run. Make the change in that file instead.")
+        reconciled = audit_report.RECONCILED_NOTE.format(reconciler="the Argo CD Application `infra`")
+        declared = audit_report.DECLARED_NOTE.format(path="clusters/c1/pool.yaml")
+        for repeats in range(20, 40):
+            command = "gcloud container node-pools update pinned-inference-pool --cluster c1 " + "--node-locations us-central1-a " * repeats
+            note = f"{prose}\n\n```bash\n{command.strip()}\n```" + "\n\n" + declared + "\n\n" + reconciled
+            finding = self.harness_finding(note)
+            audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(self.POOL_STALL), self.root, {})
+            with self.subTest(repeats=repeats):
+                result = finding["remediation"]["note"]
+                self.assertIn(declared, result)
+                self.assertIn(reconciled, result)
+                self.assertIn(audit_report.KCC_STALLED_MARK_PREFIX, result)
+
     def test_the_paragraph_never_pushes_out_the_reconciler_note(self):
         """A note of a reverted gcloud command (about 1,400 characters), which
         `finish` wrote and never cuts, leaves room for the reconciler note or
@@ -24807,7 +25268,7 @@ metadata:
         self.write("b/prod.yaml", cluster.format(project="proj-b", location="europe-west1"))
         finding["remediation"]["note"] = "Set the channel."
         audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(stall), self.root, audit_report.kcc_declarations(self.root))
-        self.assertIn("The declaration is `b/prod.yaml`.", finding["remediation"]["note"])
+        self.assertIn("**Config Connector is not applying `b/prod.yaml`.**", finding["remediation"]["note"])
 
     def test_a_kubernetes_kind_never_takes_a_config_connector_object_of_the_same_kind_name(self):
         """A compliance `lb-world-open` finding on the Kubernetes Service
@@ -37919,6 +38380,245 @@ class TestRetiredUnlistedOnClose(HarnessTestCase):
         for answer in answers:
             self.assertNotIn("no longer reproduces", answer)
         self.assertTrue(any("not confirmed fixed" in a for a in answers))
+
+
+class TestRemediateWritesTheGeneratedBudget(HarnessTestCase):
+    """A direct ask for a declared `no-pdb` finding the worker left `manual`,
+    as the SOP tells it to: `remediate` writes the PodDisruptionBudget `finish`
+    would write and opens it, instead of refusing the finding as not a
+    `manifest`. This is the only way a chat ask reaches that budget on an
+    install whose automatic sweep is off (`KUBEAGENTS_AUDIT_AUTO_PROMOTE=false`),
+    which is every eval lane since #3439."""
+
+    SELECTOR = {"matchLabels": {"app": "checkout-gateway"}}
+    DECLARATION = "clusters/prod-us-east/payments/checkout-gateway.yaml"
+    GENERATED = "clusters/prod-us-east/payments/checkout-gateway-pdb.yaml"
+    STREAM = "obtainability-audit"
+
+    def finding(self):
+        return make_finding(
+            fid="checkout-gateway",
+            check="no-pdb",
+            severity="major",
+            obj="Deployment/checkout-gateway",
+            remediation={"kind": "manual", "note": "Let finish write the budget."},
+        )
+
+    def stream_tree(self):
+        """The obtainability stream's clone; `self.workspace` is the default stream's."""
+        return self.workspace.parent.parent / self.STREAM / self.workspace.name
+
+    def fid(self):
+        return derived_id(check="no-pdb", obj="Deployment/checkout-gateway")
+
+    def manifest_file(self, **fields):
+        candidate = {
+            "check": "no-pdb",
+            "cluster": "prod-us-east",
+            "namespace": "payments",
+            "object": "Deployment/checkout-gateway",
+            "severity": "major",
+            "excerpt": "replicas=2, no PodDisruptionBudget",
+            "impact": "x",
+            "needs_triage": None,
+            "declaration": {"path": self.DECLARATION, "directory": "clusters/prod-us-east/payments"},
+            "pod_selector": self.SELECTOR,
+            **fields,
+        }
+        path = self.tmp_path / "manifest.json"
+        path.write_text(json.dumps(_full_manifest(candidates=[candidate], audit=self.STREAM)), encoding="utf-8")
+        return str(path)
+
+    def run_remediate(self, extra=()):
+        self.record_run(context=["acme/fleet"])
+        path = self.write_findings(searched_doc(findings=[self.finding()]))
+        return self.run_main(
+            ["remediate", "--audit", self.STREAM, "--findings-file", path, "--finding", self.fid(), *extra]
+        )
+
+    def test_it_writes_the_budget_beside_the_declaration_and_opens_it(self):
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
+        }
+        rc = self.run_remediate(["--manifest-file", self.manifest_file()])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()["prs_opened"], ["https://github.com/acme/fleet/pull/8"])
+        self.assertEqual(self.stdout_json()["refused"], [])
+        self.assertIn("GENERATED: " + self.fid(), self.err)
+        document = pytest_yaml().safe_load((self.stream_tree() / self.GENERATED).read_text())
+        self.assertEqual(document["kind"], "PodDisruptionBudget")
+        self.assertEqual(document["metadata"], {"name": "checkout-gateway-pdb", "namespace": "payments"})
+        self.assertEqual(document["spec"], {"maxUnavailable": 1, "selector": self.SELECTOR})
+        self.assertEqual(len(self.harness.forge_calls("proposal-create")), 1)
+
+    def test_without_the_manifest_it_is_refused_and_says_to_pass_it(self):
+        self.assertEqual(self.run_remediate(), 2)
+        self.assertIn("pass the collector's --manifest-file", self.err)
+        self.assertEqual(self.harness.calls, [])
+        self.assertFalse((self.stream_tree() / self.GENERATED).exists())
+
+    def test_a_budget_the_planner_will_not_write_is_refused_with_its_reason(self):
+        self.harness.replies = {"issue-list": self.issue_list()}
+        rc = self.run_remediate(["--manifest-file", self.manifest_file(namespace_pdbs=["checkout-gateway-pdb"])])
+        self.assertEqual(rc, 2)
+        self.assertIn(f"REFUSED {self.fid()}: the namespace already has a PodDisruptionBudget", self.err)
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+        self.assertFalse((self.stream_tree() / self.GENERATED).exists())
+
+    def test_the_dry_run_says_it_would_write_the_budget_and_writes_nothing(self):
+        rc = self.run_remediate(["--dry-run", "--manifest-file", self.manifest_file()])
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn("the real run writes its PodDisruptionBudget beside " + self.DECLARATION, self.err)
+        self.assertEqual(self.harness.calls, [])
+        self.assertFalse((self.stream_tree() / self.GENERATED).exists())
+
+    WORKER_BUDGET = (
+        "apiVersion: policy/v1\nkind: PodDisruptionBudget\nmetadata:\n"
+        "  name: checkout-gateway-pdb\n  namespace: payments\nspec:\n  maxUnavailable: 1\n"
+    )
+
+    def run_over_declaration(self, extra=()):
+        """The worker wrote its budget over the Deployment's own file, under the
+        conventional `<workload>-pdb` name, and named that file as the fix."""
+        # An existing clone (it has `.git`), so `ensure_workspace` reuses it and the
+        # worker's file is still there when the name search runs; a first clone would
+        # remove it, and the test could not tell `probe.ignored` from its absence.
+        (self.stream_tree() / ".git").mkdir(parents=True, exist_ok=True)
+        declaration = self.stream_tree() / self.DECLARATION
+        declaration.parent.mkdir(parents=True, exist_ok=True)
+        declaration.write_text(self.WORKER_BUDGET, encoding="utf-8")
+        finding = self.finding()
+        finding["remediation"] = {"kind": "manifest", "path": self.DECLARATION, "note": "x"}
+        self.record_run(context=["acme/fleet"])
+        path = self.write_findings(searched_doc(findings=[finding]))
+        return self.run_main(
+            ["remediate", "--audit", self.STREAM, "--findings-file", path, "--finding", self.fid(),
+             "--manifest-file", self.manifest_file(), *extra]
+        )
+
+    def test_a_budget_named_over_the_declaration_is_written_beside_it(self):
+        """A merge of the worker's file would replace the workload, so it is
+        demoted and the budget written beside, as `finish` does. The name search
+        reads past the worker's file, which names nothing the repository holds."""
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/9"),
+        }
+        rc = self.run_over_declaration()
+        self.assertEqual(rc, 0, self.err)
+        self.assertNotIn("already names an object", self.err)
+        self.assertIn("the budget is planned beside it instead", self.err)
+        self.assertEqual(self.stdout_json()["prs_opened"], ["https://github.com/acme/fleet/pull/9"])
+        self.assertTrue((self.stream_tree() / self.GENERATED).is_file())
+        # The worker's file was there for the name search, so `probe.ignored` was what let it pass.
+        self.assertEqual((self.stream_tree() / self.DECLARATION).read_text(), self.WORKER_BUDGET)
+
+    def test_the_dry_run_says_so_for_a_budget_over_the_declaration(self):
+        rc = self.run_over_declaration(["--dry-run"])
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn("DRY RUN: " + self.fid() + " names its PodDisruptionBudget", self.err)
+        self.assertNotIn("the budget is planned beside it instead", self.err)
+        self.assertFalse((self.stream_tree() / self.GENERATED).exists())
+
+    def test_a_withheld_selector_over_the_declaration_is_not_announced_as_written(self):
+        self.manifest_file = lambda real=self.manifest_file: real(pod_selector_withheld="other pods match")
+        self.assertEqual(self.run_over_declaration(), 2)
+        self.assertNotIn("beside it instead", self.err)
+
+    def human_closed_own_branch(self):
+        branch = audit_report.group_branch_for(
+            self.STREAM, [{"id": self.fid(), "remediation": {"kind": "manifest", "path": self.GENERATED}}]
+        )
+        return proposals_view(
+            [
+                {
+                    **pr(8, branch, state="CLOSED", body=audit_report.delta_block([self.fid()])),
+                    "closedAt": "2026-07-15T00:00:00Z",
+                    "labels": [],
+                }
+            ]
+        )
+
+    def test_a_human_close_on_the_budgets_own_branch_is_superseded(self):
+        self.harness.replies = {"issue-list": self.issue_list(), "proposal-list": self.human_closed_own_branch()}
+        rc = self.run_remediate(["--manifest-file", self.manifest_file()])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()["superseded"], [self.fid()])
+        self.assertEqual(self.stdout_json()["refused"], [])
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+
+    def test_the_override_flag_revives_a_human_closed_budget(self):
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "proposal-list": self.human_closed_own_branch(),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/10"),
+        }
+        rc = self.run_remediate(["--manifest-file", self.manifest_file(), "--override-human-close"])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()["superseded"], [])
+        self.assertEqual(self.stdout_json()["prs_opened"], ["https://github.com/acme/fleet/pull/10"], self.err)
+
+    def test_a_withheld_selector_is_not_planned(self):
+        manifest = json.loads(pathlib.Path(self.manifest_file(pod_selector_withheld="other pods match")).read_text())
+        self.assertEqual(audit_report.requested_generated_fixes([self.finding()], manifest, [self.fid()]), {})
+
+    def test_a_refusal_names_what_the_collector_did_not_find(self):
+        """A direct ask refused as not a `manifest` says why the budget is not written."""
+        cases = {
+            "no declaration": ({"declaration": None}, "candidate for it carries no `declaration`"),
+            "withheld selector": ({"pod_selector_withheld": "other pods match"}, "withheld the workload's selector: other pods match"),
+            "no candidate": ({"object": "Deployment/other"}, "has no no-pdb candidate for"),
+        }
+        for name, (fields, phrase) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(self.run_remediate(["--manifest-file", self.manifest_file(**fields)]), 2)
+                self.assertIn(phrase, self.err)
+                self.assertEqual(self.harness.calls, [])
+
+    def budget_pr(self, branch, state="OPEN"):
+        return proposals_view([{**pr(21, branch, state=state, body=audit_report.delta_block([self.fid()])), "labels": []}])
+
+    def own_branch(self):
+        return audit_report.group_branch_for(
+            self.STREAM, [{"id": self.fid(), "remediation": {"kind": "manifest", "path": self.GENERATED}}]
+        )
+
+    def test_a_rerun_meeting_its_own_open_pull_request_reports_it_already_open(self):
+        self.harness.replies = {"issue-list": self.issue_list(), "proposal-list": self.budget_pr(self.own_branch())}
+        self.assertEqual(self.run_remediate(["--manifest-file", self.manifest_file()]), 0, self.err)
+        self.assertEqual(self.stdout_json()["already_open"], [self.fid()])
+        self.assertEqual(self.stdout_json()["prs_opened"], [])
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+
+    def test_a_pull_request_on_another_branch_carrying_the_finding_answers_it(self):
+        self.harness.replies = {"issue-list": self.issue_list(), "proposal-list": self.budget_pr("someone/their-budget")}
+        self.assertEqual(self.run_remediate(["--manifest-file", self.manifest_file()]), 2)
+        self.assertIn("already carries it", self.err)
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+
+    def test_a_budget_already_in_the_repository_reads_as_already_fixed(self):
+        (self.stream_tree() / ".git").mkdir(parents=True, exist_ok=True)
+        existing = self.stream_tree() / self.GENERATED
+        existing.parent.mkdir(parents=True, exist_ok=True)
+        existing.write_text("kind: PodDisruptionBudget\n", encoding="utf-8")
+        self.harness.replies = {"issue-list": self.issue_list()}
+        self.assertEqual(self.run_remediate(["--manifest-file", self.manifest_file()]), 2)
+        self.assertIn(f"REFUSED {self.fid()}: already fixed: {self.GENERATED} exists", self.err)
+
+    def test_only_named_findings_are_planned(self):
+        named, other = self.finding(), self.finding()
+        other["object"] = "Deployment/other"
+        manifest = json.loads(pathlib.Path(self.manifest_file()).read_text())
+        fixes = audit_report.requested_generated_fixes([named, other], manifest, [str(named["id"])])
+        self.assertEqual(list(fixes), [str(named["id"])])
+
+    def test_a_manifest_finding_is_untouched_by_the_planner(self):
+        """Only a `manual` finding is planned; a worker-written file is opened as written."""
+        finding = self.finding()
+        finding["remediation"] = {"kind": "manifest", "path": "clusters/prod-us-east/payments/own-pdb.yaml", "note": "x"}
+        manifest = json.loads(pathlib.Path(self.manifest_file()).read_text())
+        self.assertEqual(audit_report.requested_generated_fixes([finding], manifest, [str(finding["id"])]), {})
 
 
 if __name__ == "__main__":

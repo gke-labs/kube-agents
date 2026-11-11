@@ -188,6 +188,11 @@ type Config struct {
 	// KVBucket holds the in-flight registry the sweep reads (default
 	// "runtime-state", the provisioned bucket).
 	KVBucket string
+	// DurablePrecreated binds the intake to the durable the provision Job
+	// created rather than creating it (#4173): the operator sets
+	// BRIDGE_DURABLE_PRECREATED=true beside a grant that denies this
+	// principal the create on that name. Off, the bridge creates it as before.
+	DurablePrecreated bool
 	// ResultChunkSize bounds one result artifact-update's text part so a
 	// large answer never trips the client-side max-message-size gate
 	// (default 256KiB).
@@ -609,6 +614,9 @@ func (b *Bridge) Run(ctx context.Context) error {
 		Subject: fmt.Sprintf("a2a.tasks.%s.*.in", b.cfg.Profile),
 		Durable: "bridge-" + b.cfg.Profile,
 		Session: b.cfg.Profile,
+		// The provision Job creates it on a deployed install; the bind then
+		// waits for the operator rather than creating it.
+		Precreated: b.cfg.DurablePrecreated,
 	}, func(env *lib.Envelope) { b.deliver(ctx, env) })
 	if err != nil {
 		return fmt.Errorf("subscribe: %w", err)
@@ -782,7 +790,7 @@ func (b *Bridge) accept(ctx context.Context, env *lib.Envelope) {
 			b.finalize(run, lib.StateFailed, shutdownReason, nil)
 			return
 		}
-		go b.runCardStop(ctx, run)
+		go b.runCardStop(ctx, run) // #nosec G118 -- runCardStop detaches its stop context on purpose; cancel and shutdown end it through cancelReq, the way they end a turn
 		return
 	}
 	select {
@@ -1488,7 +1496,7 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 	}
 
 	argv := promptArgv(b.cfg.Command, prompt)
-	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd := exec.Command(argv[0], argv[1:]...) // #nosec G204 -- Command is the bridge's configured executor; argv goes to exec without a shell
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	// stdout is the answer, kept to the cap; stdoutTail is the last
 	// stdoutTailBytes of the same stream for a failed run's terminal, which

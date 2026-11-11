@@ -98,6 +98,9 @@
 # nothing and fails instead, per its read-only contract above. A gitignored
 # backend_override.tf points Terraform at gs://<bucket>/<KUBE_AGENTS_STATE_PREFIX,
 # default kube-agents/<cluster_name>>. Unset, state stays local as before.
+# Every input is read through that state (tfvar); a transient backend answer
+# (429/5xx, a dropped connection) is asked again, STATE_BACKEND_ATTEMPTS (4)
+# times STATE_BACKEND_WAIT_SECONDS (15) apart.
 #
 set -euo pipefail
 
@@ -229,6 +232,22 @@ readonly MINTER_KEY_ABSENT_PATTERN='NOT_FOUND|SERVICE_DISABLED|has not been used
 readonly KMS_API_PROPAGATION_PATTERN='KMS\)? API has not been used in project'
 KMS_API_PROPAGATION_ATTEMPTS="${KMS_API_PROPAGATION_ATTEMPTS:-5}"
 KMS_API_PROPAGATION_WAIT_SECONDS="${KMS_API_PROPAGATION_WAIT_SECONDS:-60}"
+# What the state backend says when it is briefly unavailable. Every tfvar read
+# below is a `terraform console` that opens the remote state, and the pre-apply
+# guards make some fifty of them, so one Cloud Storage blip has fifty chances
+# to end an apply before it starts: the promotion pipeline's provision died on
+# a 503 "Authentication backend unavailable" reading var.drift_pubsub_sink
+# (kube-agents#5349). An ERE, for grep -E, naming only what a second request
+# can change: the 429 and 5xx codes in the three spellings they arrive in (the
+# GCS JSON body, `googleapi: Error N`, and `googleapi: got HTTP response code
+# N with body:` -- the last also fronts the HTML pages the Google front end
+# serves for a 502), and a connection that dropped or timed out. A 403, a
+# missing bucket and a held lock (a 412) read the same the second time and
+# are not here. Both knobs are environment overrides so a test runs with no
+# wait; like the KMS pair above, neither is validated.
+readonly STATE_BACKEND_TRANSIENT_PATTERN='"code": ?(429|500|502|503|504)|"status": ?"(UNAVAILABLE|RESOURCE_EXHAUSTED|INTERNAL|DEADLINE_EXCEEDED)"|googleapi: (Error|got HTTP response code) (429|500|502|503|504)|connection (reset by peer|refused)|TLS handshake timeout|i/o timeout|context deadline exceeded|unexpected EOF|server sent GOAWAY|stream error: .*INTERNAL_ERROR'
+STATE_BACKEND_ATTEMPTS="${STATE_BACKEND_ATTEMPTS:-4}"
+STATE_BACKEND_WAIT_SECONDS="${STATE_BACKEND_WAIT_SECONDS:-15}"
 # Where run_apply keeps the apply's output for that grep; set per run.
 APPLY_OUTPUT_FILE=""
 # What Terraform prints when it is interrupted: it traps SIGINT, cancels the
@@ -399,13 +418,26 @@ tfvar() { tf_expr "var.$1"; }
 # of the profile table.
 tf_module_output() { tf_expr "module.gke_cluster.$1"; }
 
+# A transient answer from the state backend (STATE_BACKEND_TRANSIENT_PATTERN)
+# is asked again, up to STATE_BACKEND_ATTEMPTS times with
+# STATE_BACKEND_WAIT_SECONDS between them; any other failure, and a backend
+# still down at the end of the budget, exits as before with the terraform
+# error printed.
 tf_expr() {
-  local out value
-  if ! out=$(echo "$1" | terraform console 2>&1); then
-    printf '%s\n' "$out" >&2
-    warn "could not evaluate $1 (see the terraform error above)"
-    exit 1
-  fi
+  local out value attempt=1
+  while ! out=$(echo "$1" | terraform console 2>&1); do
+    if ! grep -Eq "$STATE_BACKEND_TRANSIENT_PATTERN" <<<"$out" || [[ "$attempt" -ge "$STATE_BACKEND_ATTEMPTS" ]]; then
+      printf '%s\n' "$out" >&2
+      warn "could not evaluate $1 (see the terraform error above)"
+      if [[ "$attempt" -gt 1 ]]; then
+        warn "this was attempt $attempt of $STATE_BACKEND_ATTEMPTS; the state backend answered a transient error before it. If this error is one too, wait a minute and run it again."
+      fi
+      exit 1
+    fi
+    attempt=$((attempt + 1))
+    warn "the state backend answered a transient error reading $1 ($(grep -Eo "$STATE_BACKEND_TRANSIENT_PATTERN" <<<"$out" | head -n1)); waiting ${STATE_BACKEND_WAIT_SECONDS}s, then asking again (attempt $attempt of $STATE_BACKEND_ATTEMPTS)"
+    sleep "$STATE_BACKEND_WAIT_SECONDS"
+  done
   value=$(printf '%s\n' "$out" | grep -vE "$STATE_LOCK_MESSAGE_PATTERN" | grep -v '^[[:space:]]*$' | tail -1 | tr -d '"')
   case "$value" in
     null | "tostring(null)" | "tonumber(null)" | "tobool(null)") value="" ;;
@@ -652,6 +684,78 @@ adoption_target_exists() { # <kind> <id>
   esac
 }
 
+# The labels the composition sets on the minter's crypto key name the install
+# that owns it (#3504): module.github_minter's owner_labels. A key ring carries
+# no labels in Cloud KMS, so the ring is owned through its key.
+readonly MINTER_OWNER_CLUSTER_LABEL="kube-agents-cluster"
+readonly MINTER_OWNER_NAMESPACE_LABEL="kube-agents-namespace"
+
+# Refuses the apply before adopt_kms imports a minter key ring or key that this
+# state doesn't hold, unless the key is this install's own (its owner labels
+# name this cluster and namespace) or the one github_minter_shared_kms_key names.
+# Importing another install's key would put it in this state, so a destroy or a
+# GitOps-off run here would schedule its versions for destruction, and this
+# install's minter would be granted signing rights on it. A key with no owner
+# labels may be another install's, from before the labels existed, so it is
+# refused too, unless github_minter_adopt_unlabelled_kms_key names it: the
+# installer sets that when the key ring and key were named explicitly, and the
+# apply then labels the key as this install's. Labels win over a name: a key
+# another install's labels claim is refused either way. A ring whose key
+# doesn't exist yet holds nothing to protect and is adopted as before. Runs
+# once per call; the ring and the key share the answer.
+guard_minter_adoption() {
+  local keyring=$1 key=$2 location=$3 project=$4
+  [[ "${MINTER_ADOPTION_CHECKED:-}" == "true" ]] && return 0
+  MINTER_ADOPTION_CHECKED=true
+  local shared cluster namespace labels owner_cluster="" owner_namespace="" pair
+  shared=$(tfvar github_minter_shared_kms_key)
+  if [[ -n "$shared" && "$shared" == "$keyring/$key" ]]; then
+    log "adopting the minter key $keyring/$key: github_minter_shared_kms_key names it as shared on purpose"
+    return 0
+  fi
+  if ! adoption_target_exists key "projects/$project/locations/$location/keyRings/$keyring/cryptoKeys/$key"; then
+    return 0
+  fi
+  if ! labels=$(gcloud kms keys describe "$key" --keyring "$keyring" --location "$location" \
+      --project "$project" --format='value(labels)' 2>/dev/null); then
+    warn "Could not read the owner labels of the minter key '$location/$keyring/$key', which exists and is not in this state."
+    warn "Refusing to adopt it without knowing whose it is. Check this identity can describe the key (cloudkms.cryptoKeys.get), then apply again."
+    exit 1
+  fi
+  # value(labels) prints the map as key=value pairs joined by ';'.
+  local IFS=';'
+  for pair in $labels; do
+    case "$pair" in
+      "$MINTER_OWNER_CLUSTER_LABEL="*)   owner_cluster=${pair#*=} ;;
+      "$MINTER_OWNER_NAMESPACE_LABEL="*) owner_namespace=${pair#*=} ;;
+    esac
+  done
+  unset IFS
+  cluster=$(tfvar cluster_name)
+  namespace=$(tfvar namespace)
+  if [[ "$owner_cluster" == "$cluster" && "$owner_namespace" == "$namespace" ]]; then
+    log "adopting the minter key $keyring/$key: its owner labels name this install"
+    return 0
+  fi
+  if [[ -z "$owner_cluster" && -z "$owner_namespace" && "$(tfvar github_minter_adopt_unlabelled_kms_key)" == "$keyring/$key" ]]; then
+    log "adopting the minter key $keyring/$key as this install's own: it carries no owner labels and was named explicitly; this apply labels it"
+    return 0
+  fi
+  if [[ -n "$owner_cluster" || -n "$owner_namespace" ]]; then
+    warn "The minter key '$location/$keyring/$key' belongs to install ${owner_cluster:-?}/${owner_namespace:-?} (its owner labels), not this one ($cluster/$namespace)."
+  else
+    warn "The minter key '$location/$keyring/$key' exists, is not in this state, and carries no owner labels, so it may be another install's."
+  fi
+  warn "Refusing to adopt it: this state would then own that install's App key, and a destroy here would schedule its versions for destruction."
+  warn "Choose other names (github_minter_kms_keyring and github_minter_kms_key), or, to share this key on purpose,"
+  warn "set github_minter_shared_kms_key = \"$keyring/$key\" in terraform.tfvars (MINTER_SHARED_KEY in install.env)."
+  if [[ -z "$owner_cluster" && -z "$owner_namespace" ]]; then
+    warn "If it is this install's own key from before the owner labels, set MINTER_ADOPT_KEY=$keyring/$key in install.env"
+    warn "(github_minter_adopt_unlabelled_kms_key in terraform.tfvars) and run again: the apply adopts it and labels it."
+  fi
+  exit 1
+}
+
 adopt_kms() {
   local project location keyring key
   load_state
@@ -751,6 +855,10 @@ adopt_kms() {
     fi
 
     adoption_target_exists "$kind" "$id" || continue
+
+    if [[ "$address" == "$MINTER_KMS_KEYRING_ADDRESS" || "$address" == "$MINTER_KMS_KEY_ADDRESS" ]]; then
+      guard_minter_adoption "$minter_keyring" "$minter_key" "$location" "$project"
+    fi
 
     log "adopting pre-existing resource: $id"
     [[ -f "$OVERRIDE_FILE" && -f "$SCOPE_OVERRIDE_FILE" ]] || with_override
@@ -1600,10 +1708,13 @@ delete_agent_cr() {
       "kubeagents:minimal:${namespace}:${agent_name}" \
       "kubeagents:tokenreview:${namespace}:${agent_name}" \
       --ignore-not-found >/dev/null 2>&1 || true
-    kubectl --context "$CLUSTER_CONTEXT" delete pvc -n "$namespace" \
-      -l "app.kubernetes.io/instance=${inst_label}" \
-      --field-selector "metadata.name=data-${agent_name}-a2a-nats-0" \
-      --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    # One JetStream claim per bus server, up to three (spec.harness.tuning.busReplicas).
+    for ordinal in 0 1 2; do
+      kubectl --context "$CLUSTER_CONTEXT" delete pvc -n "$namespace" \
+        -l "app.kubernetes.io/instance=${inst_label}" \
+        --field-selector "metadata.name=data-${agent_name}-a2a-nats-${ordinal}" \
+        --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    done
   done <<<"$names"
 }
 
@@ -1976,7 +2087,7 @@ case "${1:-}" in
     # The line range is the header comment above, so it moves whenever that
     # comment grows. It ends at the blank comment line before `set -euo
     # pipefail`.
-    sed -n '2,101p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,104p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit 1
     ;;
 esac

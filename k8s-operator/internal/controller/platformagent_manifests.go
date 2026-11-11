@@ -162,7 +162,21 @@ const (
 	// online, where the StorageClass allows expansion. install.defaults.env and
 	// the Terraform variable carry the same default, and a test pins them equal.
 	agentDataStorageSize = "50Gi"
-	credentialProxyPort  = 8765
+	// dataVolumeBaseSize and perClusterProfileStorage size the agent's data
+	// claim by spec.storage.expectedClusterProfiles: base + N x per-profile,
+	// rounded up to whole GiB (ResolveAgentDataStorageSize). Both are measured
+	// for Hermes' session store at the default 90-day retention
+	// (hack/session_retention_sim.py; results on gke-labs/kube-agents#3704):
+	//   - per profile: a fleet-average Cluster Agent profile's ceiling, 86 MiB of
+	//     live sessions x slack 4.0 = 345 MiB (measured settled: 291 MiB), plus
+	//     Hermes' log cap for two log names (40 MiB) and the scaffold, rounded up;
+	//   - base: the Platform Agent profile's ceiling (5.45 GiB, settled 3.47 GiB),
+	//     the machine home's store, kanban and caches (about 0.14 GiB measured),
+	//     plus 25%, rounded up.
+	// Re-measure both if the session store or the retention default changes.
+	dataVolumeBaseSize       = "8Gi"
+	perClusterProfileStorage = "400Mi"
+	credentialProxyPort      = 8765
 	// The Chat consumers' broker env: the project id both carry, the legacy
 	// consumer's subscription name, and the fully qualified subscription
 	// form both consumers' env carries.
@@ -812,6 +826,15 @@ func renderManagedEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agentPlugins
 	// (docs/designs/spec-mode-switch.md).
 	add(kubeagentsModeEnvKey, string(renderMode(agent, "settings")))
 
+	// The earned-autonomy switches, unconditional for the reason the chat keys
+	// are: a switch left out because it is off is one the agent could turn on
+	// with a line in the PVC .env. Normalised to a value the switch knows, else
+	// "off". Pinned here rather than on the container env, as the mode is, and
+	// read from this file by agents/platform/scripts/kubeagents_switches.py.
+	for _, name := range autonomySwitchNames {
+		add(name, autonomySwitchValue(agent, name))
+	}
+
 	// The scope path, pinned for the same reason as HERMES_HOME_MODE: the container env
 	// is the layer a line in the PVC .env outranks, and the reconcile is a cron script
 	// that inherits the gateway's environment after that file is applied. Without the
@@ -1248,6 +1271,41 @@ const clusterProfileClassKey = "profileclass-cluster" + profileOverlaySuffix
 // admitting at least this many.
 const defaultKanbanMaxInProgress = 6
 
+// The defaults for spec.harness.tuning.admission, the memory admission the kanban
+// dispatcher applies to its own workers. resolveKanbanAdmission renders the block
+// into the managed scope on every install, so the dispatcher never runs without
+// one. The budget has no constant: unset, it is the agent container's resolved
+// memory request in MiB (agentMemoryRequestMiB), the figure the kubelet evicts the
+// pod against under node pressure, so a CR that raises the request raises the
+// budget with it.
+//
+// The worker cap is three and a half times the 430 MiB a worker measured on a live
+// install (resolveResources): a fleet-wide audit that holds a large listing fits,
+// and one worker cannot take the whole of the default 2048 MiB budget by itself.
+// The queue bound is 24 ticks at kanbanDispatchIntervalSeconds: long enough for a
+// worker that is finishing to give its slot back, short enough that the thread
+// that filed the card is told it is throttled before it gives up waiting. Closed is
+// the default for an unreadable memory sample because the counters go unreadable
+// on the installs the budget exists for: a sandbox runtime that hides the cgroup
+// files also hides the pressure, and an open tick there spawns into the eviction
+// the budget was meant to prevent.
+const (
+	defaultAdmissionWorkerRssCapMiB   = 1536
+	defaultAdmissionQueueBoundSeconds = 600
+	defaultAdmissionFailClosed        = true
+	// admissionMemoryBudgetFloorMiB is the least budget the operator renders, the
+	// CRD's Minimum on memoryBudgetMiB (common_types.go) applied to the derived
+	// figure too. A request the operator cannot read as a budget (a bare "2", a
+	// 256Mi, an explicit 0) would otherwise render 0, which the dispatcher reads
+	// as no budget and answers with upstream's meminfo guard, silently. At the
+	// floor the dispatcher still admits nothing on any measured container (the
+	// idle working set is above 512 MiB) and refuses every card after the queue
+	// bound; what the clamp buys is a refusal that names its figures in the log
+	// and in every reply, instead of a silent fallback. The CR is the place to
+	// fix the request.
+	admissionMemoryBudgetFloorMiB = 512
+)
+
 // defaultSessionRetentionDays is how long an ended session is kept when
 // spec.harness.retention.sessionDays says nothing: Hermes' own default
 // (hermes_cli/config_defaults.py, sessions.retention_days), so an upgrade that
@@ -1264,6 +1322,18 @@ const defaultSessionRetentionDays = 90
 type managedSessionsConfig struct {
 	AutoPrune     bool `json:"auto_prune"`
 	RetentionDays int  `json:"retention_days"`
+}
+
+// managedKanbanAdmission is the `kanban.admission` block in the managed scope,
+// read by the dispatcher's spawn tick. Every key is rendered, defaults applied, so
+// the dispatcher reads one number per setting and never has to guess a default of
+// its own. No omitempty on fail_closed for the same reason: a false would drop the
+// key and read as whatever the reader falls back to.
+type managedKanbanAdmission struct {
+	MemoryBudgetMiB   int  `json:"memory_budget_mib"`
+	WorkerRssCapMiB   int  `json:"worker_rss_cap_mib"`
+	QueueBoundSeconds int  `json:"queue_bound_seconds"`
+	FailClosed        bool `json:"fail_closed"`
 }
 
 // resolveSessionRetentionDays is spec.harness.retention.sessionDays, or
@@ -1505,6 +1575,83 @@ func resolveKanbanMaxInProgress(agent *agentv1alpha1.PlatformAgent) int {
 		return *limits.MaxInProgress
 	}
 	return defaultKanbanMaxInProgress
+}
+
+// resolveKanbanAdmission is the live kanban.admission block: each field is the CR's
+// spec.harness.tuning.admission value where it sets one, else the operator's
+// default. The budget's default is derived from the agent container's resolved
+// memory request (agentMemoryRequestMiB); the others are the constants beside
+// defaultKanbanMaxInProgress. renderConfigYAML pins the block in the managed scope
+// next to max_in_progress, so it reaches every dispatch entry point the way the cap
+// does.
+func resolveKanbanAdmission(agent *agentv1alpha1.PlatformAgent) managedKanbanAdmission {
+	resolved := managedKanbanAdmission{
+		MemoryBudgetMiB:   agentMemoryRequestMiB(agent),
+		WorkerRssCapMiB:   defaultAdmissionWorkerRssCapMiB,
+		QueueBoundSeconds: defaultAdmissionQueueBoundSeconds,
+		FailClosed:        defaultAdmissionFailClosed,
+	}
+	tuning := agentTuning(agent)
+	if tuning == nil || tuning.Admission == nil {
+		return resolved
+	}
+	admission := tuning.Admission
+	if admission.MemoryBudgetMiB != nil {
+		resolved.MemoryBudgetMiB = int(*admission.MemoryBudgetMiB)
+	}
+	if admission.WorkerRssCapMiB != nil {
+		resolved.WorkerRssCapMiB = int(*admission.WorkerRssCapMiB)
+	}
+	if admission.QueueBoundSeconds != nil {
+		resolved.QueueBoundSeconds = int(*admission.QueueBoundSeconds)
+	}
+	if admission.FailClosed != nil {
+		resolved.FailClosed = *admission.FailClosed
+	}
+	return resolved
+}
+
+// agentMemoryRequestMiB is the agent container's memory request in whole MiB, as
+// the kubelet sees it: the CR's spec.deployment.resources request, else its limit
+// (a container that declares only a limit is given a request equal to it), else
+// the operator's default request (resolveResources). It is the default memory
+// budget for the dispatcher's admission because the kubelet evicts the pod under
+// node pressure once its usage passes this figure, whatever the limit says.
+func agentMemoryRequestMiB(agent *agentv1alpha1.PlatformAgent) int {
+	var deployment *agentv1alpha1.DeploymentSpec
+	if agent != nil {
+		deployment = agent.Spec.Deployment
+	}
+	resources := resolveResources(deployment)
+	mib, ok := memoryMiB(resources.Requests)
+	if !ok {
+		mib, ok = memoryMiB(resources.Limits)
+	}
+	if !ok {
+		mib, _ = memoryMiB(resolveResources(nil).Requests)
+	}
+	if mib < admissionMemoryBudgetFloorMiB {
+		name := ""
+		if agent != nil {
+			name = agent.Name
+		}
+		manifestsLog.Info("admission memory budget clamped to the floor: the agent container's memory request is below it",
+			"platformagent", name, "requestMiB", mib, "budgetMiB", admissionMemoryBudgetFloorMiB)
+		return admissionMemoryBudgetFloorMiB
+	}
+	return mib
+}
+
+// memoryMiB is the list's memory quantity in whole MiB, rounded down, and whether
+// the list carries one. An explicit zero is carried: the API defaults a request to
+// the limit only when the request is unset, so "0" is a request of zero, which the
+// floor clamp answers, not a missing one that the limit stands in for.
+func memoryMiB(list corev1.ResourceList) (int, bool) {
+	quantity, ok := list[corev1.ResourceMemory]
+	if !ok {
+		return 0, false
+	}
+	return int(quantity.Value() / bytesPerMiB), true
 }
 
 // frontDoorKanban renders the `kanban` subtree for the platform profile when the gateway
@@ -1992,7 +2139,7 @@ func seededGitOpsEntry(agent *agentv1alpha1.PlatformAgent) *agentv1alpha1.Manage
 // maps each one onto the TERMINAL_* environment variable tools/terminal_tool.py
 // reads, and tools/environments/ssh.py turns them into an ssh command line.
 //
-// Six of these keys are Hermes'. `cwd` is absent on purpose — it is per-profile,
+// Seven of these keys are Hermes'. `cwd` is absent on purpose — it is per-profile,
 // and a value here would replace each profile's own (see the note on
 // renderConfigYAML). `ssh_persistent` is absent because Hermes has no env var for
 // it, so rendering it would look like a setting and be one only for in-process
@@ -2015,7 +2162,17 @@ func seededGitOpsEntry(agent *agentv1alpha1.PlatformAgent) *agentv1alpha1.Manage
 // cleanup() no longer reaches the master either. The value stays because
 // reaping reclaims nothing here.
 //
-// `workspace_root` is the sixth and is NOT Hermes'. Hermes ignores it; the reader
+// `timeout` is the terminal tool's per-call limit for a command run without a
+// `timeout=` argument. Hermes' code default is 180s, but the image's first boot
+// seeds $HERMES_HOME/.env from Hermes' .env.example, which sets
+// TERMINAL_TIMEOUT=60, and .env beats the code default. So without this key every
+// install ran at 60s: a polling `sleep 60` with no `timeout=` raced it, and the
+// scripts that budget against 180s (cluster_preflight.sh) were cut short. A
+// seeded .env is never reseeded, so only a key that outranks it reaches an
+// existing install;
+// deploy/shared/terminal_env_pin.py copies it into each profile's .env.
+//
+// `workspace_root` is the eighth and is NOT Hermes'. Hermes ignores it; the reader
 // is agents/platform/scripts/sandbox_exec.py, which already parses this block for
 // ssh_host and needs one more fact about the far side — the directory a proxied
 // command must run in, which is shellSandboxDataPath, the sandbox's data volume.
@@ -2031,8 +2188,15 @@ type managedTerminalConfig struct {
 	SSHPort         int    `json:"ssh_port"`
 	SSHKey          string `json:"ssh_key"`
 	LifetimeSeconds int    `json:"lifetime_seconds"`
+	TimeoutSeconds  int    `json:"timeout"`
 	WorkspaceRoot   string `json:"workspace_root"`
 }
+
+// shellSandboxTerminalTimeoutSeconds is what the operator publishes as
+// terminal.timeout — see the note above. Hermes' own code default
+// (`_parse_env_var("TERMINAL_TIMEOUT", "180")` in tools/terminal_tool.py), which
+// cluster_preflight.sh mirrors as TERMINAL_TOOL_TIMEOUT_SECONDS.
+const shellSandboxTerminalTimeoutSeconds = 180
 
 // shellSandboxEnvLifetimeSeconds is what the operator publishes as
 // terminal.lifetime_seconds — see the note above. 30 days, not "off": Hermes
@@ -2125,9 +2289,11 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 		// declared (a2aActivityHook); absent otherwise, so a today
 		// install's config is unchanged.
 		Hooks *managedHooks `json:"hooks,omitempty"`
-		// The board-wide kanban worker cap. Always rendered; see where it is set.
+		// The board-wide kanban worker cap and the dispatcher's memory admission.
+		// Always rendered; see where they are set.
 		Kanban struct {
-			MaxInProgress int `json:"max_in_progress"`
+			MaxInProgress int                    `json:"max_in_progress"`
+			Admission     managedKanbanAdmission `json:"admission"`
 		} `json:"kanban"`
 		// Session retention, read by Hermes' own state.db auto-maintenance in every
 		// profile (cli.py and gateway/run.py: sessions.auto_prune / retention_days).
@@ -2170,6 +2336,7 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 		SSHPort:         shellSandboxPort,
 		SSHKey:          shellSandboxClientKeyFilePath(),
 		LifetimeSeconds: shellSandboxEnvLifetimeSeconds,
+		TimeoutSeconds:  shellSandboxTerminalTimeoutSeconds,
 		WorkspaceRoot:   shellSandboxDataPath,
 	}
 
@@ -2206,6 +2373,14 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 	// became 6. A pin is applied over the persisted config on every load, whatever that
 	// file's history.
 	cfg.Kanban.MaxInProgress = resolveKanbanMaxInProgress(agent)
+	// The dispatcher's memory admission, beside the cap and pinned for the same
+	// reasons: the board is shared, every dispatch entry point reads its settings
+	// from whichever profile it runs as, and the failure it prevents (a pod evicted
+	// for passing its memory request under node pressure, workers and all) is one
+	// the agent cannot see coming. The budget follows the agent container's memory
+	// request, so a CR that raises the request raises the budget on the same
+	// reconcile.
+	cfg.Kanban.Admission = resolveKanbanAdmission(agent)
 	cfg.Sessions = managedSessionsConfig{AutoPrune: true, RetentionDays: resolveSessionRetentionDays(agent)}
 
 	cfg.Display.Platforms = map[string]map[string]any{}
@@ -2358,16 +2533,16 @@ func buildPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolumeClaim 
 			StorageClassName: storageClassName,
 			Resources: corev1.VolumeResourceRequirements{
 				Requests: corev1.ResourceList{
-					corev1.ResourceStorage: ResolveDataStorageSize(agent),
+					corev1.ResourceStorage: ResolveAgentDataStorageSize(agent),
 				},
 			},
 		},
 	}
 }
 
-// ResolveDataStorageSize is the size of the agent's data claim and of the
-// sandbox's data claim: spec.storage.size when it is set and above zero, and
-// agentDataStorageSize otherwise. The admission webhook refuses a value of zero
+// ResolveDataStorageSize is the size of the sandbox's data claim, and the floor
+// of the agent's (ResolveAgentDataStorageSize): spec.storage.size when it is
+// set and above zero, and agentDataStorageSize otherwise. The admission webhook refuses a value of zero
 // or less, but the chart ships the webhook off; the fallback keeps such a CR on
 // the default rather than on a claim the API server refuses to create.
 func ResolveDataStorageSize(agent *agentv1alpha1.PlatformAgent) resource.Quantity {
@@ -2375,6 +2550,28 @@ func ResolveDataStorageSize(agent *agentv1alpha1.PlatformAgent) resource.Quantit
 		return storage.Size.DeepCopy()
 	}
 	return resource.MustParse(agentDataStorageSize)
+}
+
+// ResolveAgentDataStorageSize is the size of the agent's own data claim:
+// ResolveDataStorageSize, raised to dataVolumeBaseSize + N x
+// perClusterProfileStorage (rounded up to whole GiB) when
+// spec.storage.expectedClusterProfiles sets N. It never comes out lower than
+// ResolveDataStorageSize, so the field can only grow the claim.
+func ResolveAgentDataStorageSize(agent *agentv1alpha1.PlatformAgent) resource.Quantity {
+	size := ResolveDataStorageSize(agent)
+	storage := agent.Spec.Storage
+	if storage == nil || storage.ExpectedClusterProfiles == nil || *storage.ExpectedClusterProfiles < 1 {
+		return size
+	}
+	base := resource.MustParse(dataVolumeBaseSize)
+	perProfile := resource.MustParse(perClusterProfileStorage)
+	need := base.Value() + int64(*storage.ExpectedClusterProfiles)*perProfile.Value()
+	const gib = int64(1) << 30
+	formula := resource.NewQuantity((need+gib-1)/gib*gib, resource.BinarySI)
+	if formula.Cmp(size) > 0 {
+		return *formula
+	}
+	return size
 }
 
 func buildSystemPVC(agent *agentv1alpha1.PlatformAgent) *corev1.PersistentVolumeClaim {
@@ -6093,8 +6290,28 @@ func buildDefaultVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
 	}
 }
 
+// agentAllowsSecretsRead returns false when spec.security.disallowSecretsRead is true.
+func agentAllowsSecretsRead(agent *agentv1alpha1.PlatformAgent) bool {
+	if agent != nil && agent.Spec.Security != nil && agent.Spec.Security.DisallowSecretsRead != nil {
+		return !*agent.Spec.Security.DisallowSecretsRead
+	}
+	return true
+}
+
 // buildMinimalPlatformRole generates the minimal read-only audit ClusterRole manifest
 func buildMinimalPlatformRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.ClusterRole {
+	return buildMinimalPlatformRoleWithSecrets(agent, agentAllowsSecretsRead(agent))
+}
+
+func buildMinimalPlatformRoleWithSecrets(agent *agentv1alpha1.PlatformAgent, allowSecretsRead bool) *rbacv1.ClusterRole {
+	coreResources := []string{
+		"nodes", "namespaces", "pods", "pods/log", "services", "endpoints",
+		"events", "persistentvolumes", "persistentvolumeclaims", "resourcequotas",
+		"limitranges", "configmaps", "serviceaccounts",
+	}
+	if allowSecretsRead {
+		coreResources = append(coreResources, "secrets")
+	}
 	return &rbacv1.ClusterRole{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "rbac.authorization.k8s.io/v1",
@@ -6106,7 +6323,7 @@ func buildMinimalPlatformRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Cluste
 		Rules: []rbacv1.PolicyRule{
 			{
 				APIGroups: []string{""},
-				Resources: []string{"nodes", "namespaces", "pods", "pods/log", "services", "endpoints", "events", "persistentvolumes", "persistentvolumeclaims", "resourcequotas", "limitranges", "configmaps", "serviceaccounts"},
+				Resources: coreResources,
 				Verbs:     []string{"get", "list", "watch"},
 			},
 			{

@@ -58,7 +58,10 @@ install without the interview.
   the gateway asks for on a request that names none; `litellm_redaction`
   (off by default) redacts every request body the gateway forwards to the
   provider, and `install.sh` sets it from the `LITELLM_REDACTION_*` keys in
-  `install.env`; `platform_agent_mode` (default `"today"`, which passes the
+  `install.env`; `litellm_budget` (default `{}`, meaning no ceiling) caps what
+  the gateway spends per period, and `install.sh` sets it from
+  `LITELLM_BUDGET_USD` and `LITELLM_BUDGET_PERIOD` in `install.env`;
+  `platform_agent_mode` (default `"today"`, which passes the
   chart nothing, so the CR carries no `mode` field) sets the `PlatformAgent`'s
   `spec.mode`, and `"next"` puts the NATS bus and the A2A gateway in front of
   the agent. `install.sh` sets it from `PLATFORM_AGENT_MODE` in `install.env`,
@@ -199,7 +202,12 @@ run it again after a few minutes and it untaints the key ring or key the first
 run created, where a bare `terraform apply` would plan their replacement and 409.
 Once the project has been destroyed and re-applied even once, `make tf-apply`
 is required — it adopts the Cloud KMS resources GCP refuses to delete, which a
-bare `terraform apply` fails on. The table under
+bare `terraform apply` fails on. For the minter's key ring and key it adopts only
+this install's own, by the owner labels on the key, or the one
+`github_minter_shared_kms_key` names. A key with no owner labels is adopted as
+this install's own, and labelled, when `github_minter_adopt_unlabelled_kms_key`
+names it (the installer sets it when `KMS_KEYRING` and `KMS_KEY` were given). Any
+other, and any key another install's labels claim, refuses the apply. The table under
 [Teardown and re-apply](#teardown-and-re-apply) has both.
 
 ### Remote state
@@ -339,6 +347,13 @@ with the two overrides the BackupPlan recipe below writes — and then re-run
 front (`guard_cluster_ownership`, [below](#recovering-from-an-interrupted-apply))
 rather than 409ing on the cluster halfway through. Through `install.sh` the
 probe derives `create_cluster = false` instead and adopts the cluster.
+
+Every input the guards read goes through the remote state: each `tfvar` read
+is a `terraform console` that opens it, and the pre-apply guards make about
+fifty of them. When Cloud Storage answers a transient 429 or 5xx, or the
+connection drops, the script asks again, up to `STATE_BACKEND_ATTEMPTS` times
+(4) with `STATE_BACKEND_WAIT_SECONDS` (15) between. Any other error fails the
+read at once, as before, with the Terraform error printed.
 
 ### Asking what an apply would change
 

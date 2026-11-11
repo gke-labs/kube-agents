@@ -293,8 +293,8 @@ func TestBuildA2ANATSStatefulSet(t *testing.T) {
 	if sts.Name != "test-agent-a2a-nats" {
 		t.Errorf("statefulset name = %q", sts.Name)
 	}
-	if got := *sts.Spec.Replicas; got != 1 {
-		t.Errorf("replicas = %d, want 1 (single node R1 is the dev posture)", got)
+	if got := *sts.Spec.Replicas; got != int32(agentv1alpha1.DefaultBusReplicas) {
+		t.Errorf("replicas = %d, want %d (a three-server cluster is the default)", got, agentv1alpha1.DefaultBusReplicas)
 	}
 	if len(sts.Spec.VolumeClaimTemplates) != 1 {
 		t.Fatalf("expected one volumeClaimTemplate (JetStream file store on a PV), got %d", len(sts.Spec.VolumeClaimTemplates))
@@ -667,6 +667,15 @@ func TestBuildA2ANATSConfigWebsocketAndWebUser(t *testing.T) {
 	// principals' resources. An exact list means any widening is a review
 	// conversation, which is the only control that actually holds here.
 	pub := rest[strings.Index(rest, "publish"):strings.Index(rest, "subscribe")]
+	// The deny list follows the allow list in the block (#4173): pinned on
+	// its own below, so the allow list here is the allow list alone.
+	pubDeny := ""
+	if i := strings.Index(pub, "deny"); i >= 0 {
+		pub, pubDeny = pub[:i], pub[i:]
+	}
+	if got := quotedLines(pubDeny); !reflect.DeepEqual(got, a2aTasksFixedDurableDenyPublish()) {
+		t.Errorf("publish deny-list changed.\n got: %q\nwant: %q", got, a2aTasksFixedDurableDenyPublish())
+	}
 	var got []string
 	for _, line := range strings.Split(pub, "\n") {
 		line = strings.TrimSpace(line)
@@ -733,6 +742,15 @@ func TestBuildA2ANATSConfigConsoleUser(t *testing.T) {
 	}
 
 	pub := rest[strings.Index(rest, "publish"):strings.Index(rest, "subscribe")]
+	// The deny list follows the allow list in the block (#4173): pinned on
+	// its own below, so the allow list here is the allow list alone.
+	pubDeny := ""
+	if i := strings.Index(pub, "deny"); i >= 0 {
+		pub, pubDeny = pub[:i], pub[i:]
+	}
+	if got := quotedLines(pubDeny); !reflect.DeepEqual(got, a2aTasksFixedDurableDenyPublish()) {
+		t.Errorf("publish deny-list changed.\n got: %q\nwant: %q", got, a2aTasksFixedDurableDenyPublish())
+	}
 	sub := rest[strings.Index(rest, "subscribe"):]
 	subDeny := ""
 	if i := strings.Index(sub, "deny"); i >= 0 {
@@ -1050,10 +1068,12 @@ func TestProbeTopicIsProvisionedAndWriterless(t *testing.T) {
 
 // Without this policy every pod in the cluster reaches 4222/8222/9222 while
 // the bus grants do the real refusing. The network layer now agrees with
-// them: 4222 from exactly the enumerated bus clients, and no pod-network
-// peer at all for 8222 (monitor) or 9222 (ws) — the demo port-forward and
-// the kubelet readiness probe both enter via the node, which NetworkPolicy
-// does not govern, and that is the decided posture rather than an accident.
+// them: 4222 from exactly the enumerated bus clients, 9222 (ws) from the
+// console server, and 8222 (monitor) from the operator's pod, and only when
+// the operator knows its own namespace, which this test's environment
+// doesn't set (TestTheMonitorPortAdmitsTheOperatorAlone covers that case).
+// The demo port-forward and the kubelet readiness probe both enter via the
+// node, which NetworkPolicy does not govern.
 func TestBuildA2ANATSNetworkPolicy(t *testing.T) {
 	np := buildA2ANATSNetworkPolicy(a2aTestAgent())
 
@@ -1067,8 +1087,11 @@ func TestBuildA2ANATSNetworkPolicy(t *testing.T) {
 		t.Errorf("policy types = %v, want ingress only", np.Spec.PolicyTypes)
 	}
 
-	if len(np.Spec.Ingress) != 2 {
-		t.Fatalf("expected exactly two ingress rules (4222 for bus clients, 9222 for the console server), got %d: %+v",
+	// 4222 for bus clients, 9222 for the console server, and 6222 between the
+	// servers of the default three-server bus (TestTheBusFenceAdmitsRoutes
+	// FromItsOwnServersOnly has the third).
+	if len(np.Spec.Ingress) != 3 {
+		t.Fatalf("expected exactly three ingress rules (4222 for bus clients, 9222 for the console server, 6222 for routes), got %d: %+v",
 			len(np.Spec.Ingress), np.Spec.Ingress)
 	}
 	rule := np.Spec.Ingress[0]
@@ -1316,7 +1339,7 @@ func TestGatewayIsToldAboutTheClusterViewOnlyUnderTheFlag(t *testing.T) {
 	}
 	t.Setenv(a2aSessionClusterViewEnvVar, "")
 	off := envOf()
-	for _, name := range []string{"A2A_SESSION_CLUSTER_VIEW", "A2A_CREDENTIAL_PROXY_URL"} {
+	for _, name := range []string{"A2A_SESSION_CLUSTER_VIEW", "A2A_CREDENTIAL_PROXY_URL", "A2A_KUBE_PROXY_URL", "A2A_KUBE_PROXY_CA_CONFIGMAP", "A2A_KUBE_PROXY_HOST_CONTEXT"} {
 		if _, ok := off[name]; ok {
 			t.Errorf("%s rendered with the flag off", name)
 		}
@@ -1328,6 +1351,15 @@ func TestGatewayIsToldAboutTheClusterViewOnlyUnderTheFlag(t *testing.T) {
 	}
 	if on["A2A_CREDENTIAL_PROXY_URL"].Value != credentialProxyBaseURL(agent) {
 		t.Errorf("A2A_CREDENTIAL_PROXY_URL = %+v, want %s", on["A2A_CREDENTIAL_PROXY_URL"], credentialProxyBaseURL(agent))
+	}
+	if on["A2A_KUBE_PROXY_URL"].Value != kubeProxyURL(agent) {
+		t.Errorf("A2A_KUBE_PROXY_URL = %+v, want %s", on["A2A_KUBE_PROXY_URL"], kubeProxyURL(agent))
+	}
+	if on["A2A_KUBE_PROXY_CA_CONFIGMAP"].Value != kubeProxyCABundleName(agent) {
+		t.Errorf("A2A_KUBE_PROXY_CA_CONFIGMAP = %+v, want %s", on["A2A_KUBE_PROXY_CA_CONFIGMAP"], kubeProxyCABundleName(agent))
+	}
+	if on["A2A_KUBE_PROXY_HOST_CONTEXT"].Value != hostClusterContextName(agent) {
+		t.Errorf("A2A_KUBE_PROXY_HOST_CONTEXT = %+v, want %s", on["A2A_KUBE_PROXY_HOST_CONTEXT"], hostClusterContextName(agent))
 	}
 }
 
@@ -1442,8 +1474,8 @@ func TestSessionNetworkPolicyReachesTheBrokerOnlyUnderTheFlag(t *testing.T) {
 	}
 	t.Setenv(a2aSessionClusterViewEnvVar, "true")
 	np := buildA2ASessionNetworkPolicy(agent, []string{"10.96.0.10"})
-	if len(np.Spec.Egress) != 4 {
-		t.Fatalf("flag on: %d egress rules, want 4", len(np.Spec.Egress))
+	if len(np.Spec.Egress) != 5 {
+		t.Fatalf("flag on: %d egress rules, want 5", len(np.Spec.Egress))
 	}
 	if len(np.Spec.Ingress) != 0 {
 		t.Fatalf("the view opened ingress: %+v", np.Spec.Ingress)
@@ -1455,6 +1487,14 @@ func TestSessionNetworkPolicyReachesTheBrokerOnlyUnderTheFlag(t *testing.T) {
 	if len(broker.To) != 1 || broker.To[0].PodSelector == nil ||
 		!reflect.DeepEqual(broker.To[0].PodSelector.MatchLabels, credentialProxySelector(agent)) {
 		t.Fatalf("broker rule peer = %+v, want the broker pod selector %v", broker.To, credentialProxySelector(agent))
+	}
+	kubeProxy := np.Spec.Egress[4]
+	if len(kubeProxy.Ports) != 1 || int32(kubeProxy.Ports[0].Port.IntValue()) != kubeProxyPort {
+		t.Fatalf("kube-proxy rule ports = %+v, want %d only", kubeProxy.Ports, kubeProxyPort)
+	}
+	if len(kubeProxy.To) != 1 || kubeProxy.To[0].PodSelector == nil ||
+		!reflect.DeepEqual(kubeProxy.To[0].PodSelector.MatchLabels, kubeProxySelector(agent)) {
+		t.Fatalf("kube-proxy rule peer = %+v, want the kube-proxy pod selector %v", kubeProxy.To, kubeProxySelector(agent))
 	}
 }
 
@@ -1581,6 +1621,15 @@ func TestBuildA2ASessionQuota(t *testing.T) {
 	if want := 2 + standing + a2aDefaultChartPods + a2aQuotaTransientMargin; pods.Value() != want {
 		t.Fatalf("tuned quota = %d, want %d", pods.Value(), want)
 	}
+
+	// A single-server bus runs two NATS pods fewer, and the derived count
+	// follows the StatefulSet's replicas.
+	one := 1
+	agent.Spec.Harness.Tuning.BusReplicas = &one
+	if single := buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]; single.Value() != pods.Value()-2 {
+		t.Fatalf("single-server quota = %d, want %d (two NATS servers fewer)", single.Value(), pods.Value()-2)
+	}
+	agent.Spec.Harness.Tuning.BusReplicas = nil
 
 	// The MCP server is one more standing pod, only while its flag is on (#3869).
 	without := pods.Value()
@@ -5054,7 +5103,8 @@ func TestBridgeHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		section string
 		want    []string
 	}{
-		{"publish", capDenyPublish},
+		// The cap bucket, and the pre-created TASKS durables' names (#4173).
+		{"publish", withTasksFixedDurableDeny(capDenyPublish)},
 		{"subscribe", capDenySubscribe},
 	} {
 		deny, ok := a2aGrantDenials(t, conf, a2aBridgeUser, tc.section)
@@ -5158,6 +5208,8 @@ func TestBridgeHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	allowedShapes["$JS.API.DIRECT.GET.TASKS.>"] = true
 	allowedShapes["$JS.API.CONSUMER.MSG.NEXT.TASKS.*"] = true
 	allowedShapes["$JS.API.CONSUMER.DELETE.KV_runtime-state.*"] = true
+	// The bind on its own pre-created intake (#4173), by exact name.
+	allowedShapes["$JS.API.CONSUMER.INFO.TASKS.bridge-platform"] = true
 	for _, grant := range a2aBridgeJetStreamGrants() {
 		if !allowedShapes[grant] {
 			t.Errorf("bridge holds JetStream API grant %q, which is outside the shapes a2aBridgeJetStreamGrants argues for", grant)
@@ -5376,7 +5428,8 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		section string
 		want    []string
 	}{
-		{"publish", capDenyPublish},
+		// The cap bucket, and the pre-created TASKS durables' names (#4173).
+		{"publish", withTasksFixedDurableDeny(capDenyPublish)},
 		{"subscribe", capDenySubscribe},
 	} {
 		deny, ok := a2aGrantDenials(t, conf, "gateway", tc.section)
@@ -5496,6 +5549,8 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		"$JS.API.DIRECT.GET." + kvPeople + ".>":              true,
 		"$JS.API.CONSUMER.CREATE." + kvPeople + ".>":         true,
 		"$JS.API.CONSUMER.DELETE." + kvPeople + ".*":         true,
+		// The bind on its own pre-created relay (#4173), by exact name.
+		"$JS.API.CONSUMER.INFO." + a2aTasksStream + ".gateway-relay": true,
 	}
 	for _, grant := range a2aGatewayJetStreamGrants() {
 		if !allowedShapes[grant] {
@@ -5520,6 +5575,9 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 func TestGatewayGrantCoversEveryJetStreamSubjectItsCallersEmit(t *testing.T) {
 	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
 	grants := a2aGrantSubjects(t, conf, "gateway", "publish")
+	// A deny overrides an allow, so a subject the allow list covers and the
+	// deny list names is refused all the same.
+	denied, _ := a2aGrantDenials(t, conf, "gateway", "publish")
 
 	// The generated tokens nats.go supplies: an ordered consumer's name is
 	// nuid-derived with a serial suffix, and a KV watcher's is a hash.
@@ -5539,14 +5597,11 @@ func TestGatewayGrantCoversEveryJetStreamSubjectItsCallersEmit(t *testing.T) {
 		{"lib.TasksGet GetLastMsgForSubject (supervisor)", "$JS.API.DIRECT.GET." + a2aTasksStream + ".a2a.tasks.platform.task-0001.supervisor"},
 		{"lib.TasksGet OrderedConsumer", "$JS.API.CONSUMER.CREATE." + a2aTasksStream + "." + orderedConsumerName},
 		{"lib.TasksGet ordered Next", "$JS.API.CONSUMER.MSG.NEXT." + a2aTasksStream + "." + orderedConsumerName},
-		// gateway.Run's event relay: two filter subjects, so nats.go puts
-		// the filter in the body and the subject ends at the durable name.
-		{"lib.SubscribeDurable relay create", "$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".gateway-relay"},
+		// gateway.Run's event relay binds the durable the provision Job
+		// created (#4173): js.Consumer, an INFO on that one name, and never
+		// a create.
+		{"lib.SubscribeDurable relay bind (Precreated)", "$JS.API.CONSUMER.INFO." + a2aTasksStream + ".gateway-relay"},
 		{"relay Consume pull", "$JS.API.CONSUMER.MSG.NEXT." + a2aTasksStream + ".gateway-relay"},
-		// The same durable rebound with ONE filter subject, which is the
-		// shape every install already has on disk and the shape a rebind
-		// goes through: nats.go appends the filter to the API subject.
-		{"lib.SubscribeDurable single-filter rebind", "$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".gateway-relay." + eventsSubject},
 		// gateway.Registry, over the session-state bucket.
 		{"Registry js.KeyValue", "$JS.API.STREAM.INFO." + kvSessionState},
 		{"Registry Get / SessionForTask (kv.Get)", "$JS.API.DIRECT.GET." + kvSessionState + ".$KV." + a2aSessionStateBucket + "." + sessionKey},
@@ -5579,6 +5634,11 @@ func TestGatewayGrantCoversEveryJetStreamSubjectItsCallersEmit(t *testing.T) {
 		if !covered {
 			t.Errorf("no gateway grant covers %q (%s); that call gets no reply and the caller waits out its context",
 				tc.subject, tc.caller)
+		}
+		for _, d := range denied {
+			if subjectMatches(d, tc.subject) {
+				t.Errorf("the gateway's deny %q refuses %q (%s), which its allow list covers", d, tc.subject, tc.caller)
+			}
 		}
 	}
 }
@@ -6081,7 +6141,9 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 	rows := map[string]a2aGrantRow{
 		"gateway": {
 			streams: map[string][]string{
-				a2aTasksStream: {"ACK", "STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.MSG.NEXT", "DIRECT.GET"},
+				// CONSUMER.INFO is the bind on its pre-created relay and
+				// names only that durable (TestGatewayHoldsNoWholesaleJetStreamAPI).
+				a2aTasksStream: {"ACK", "STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.INFO", "CONSUMER.MSG.NEXT", "DIRECT.GET"},
 				kvSessionState: {"KV", "STREAM.INFO", "DIRECT.GET", "CONSUMER.CREATE", "CONSUMER.DELETE"},
 				// The profile cards' start-up read: the subject list and a
 				// direct get per card, no consumer (readDirectory).
@@ -6104,7 +6166,9 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 		},
 		a2aBridgeUser: {
 			streams: map[string][]string{
-				a2aTasksStream: {"STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.MSG.NEXT", "DIRECT.GET", "ACK"},
+				// CONSUMER.INFO is the bind on its pre-created intake and
+				// names only that durable (TestBridgeHoldsNoWholesaleJetStreamAPI).
+				a2aTasksStream: {"STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.INFO", "CONSUMER.MSG.NEXT", "DIRECT.GET", "ACK"},
 				kvRuntimeState: {"KV", "STREAM.INFO", "CONSUMER.CREATE", "CONSUMER.DELETE"},
 			},
 		},
@@ -6140,8 +6204,15 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 			accountLevel: []string{"$JS.API.INFO"},
 		},
 		"provision": {
-			callout:      true,
-			streams:      a2aSameVerbsOn(a2aProvisionedStreams, "STREAM.CREATE", "STREAM.INFO"),
+			callout: true,
+			// Plus CONSUMER.INFO and CONSUMER.CREATE on TASKS, naming only
+			// the two durables it pre-creates (#4173,
+			// TestProvisionHoldsConsumerGrantsOnlyOnTheFixedDurables).
+			streams: func() map[string][]string {
+				m := a2aSameVerbsOn(a2aProvisionedStreams, "STREAM.CREATE", "STREAM.INFO")
+				m[a2aTasksStream] = append(m[a2aTasksStream], "CONSUMER.INFO", "CONSUMER.CREATE")
+				return m
+			}(),
 			accountLevel: []string{"$JS.API.INFO", "$JS.API.STREAM.NAMES", "$JS.API.STREAM.LIST"},
 		},
 		"session": {
@@ -6187,7 +6258,10 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 	// callout issues exactly the callout rows.
 	wantUsers := append(slices.Clone(staticRows), a2aCalloutConfUser, sysUser)
 	slices.Sort(wantUsers)
-	gotUsers := a2aConfUserNames(conf)
+	// Users only: the cluster block renders none (routes authenticate by
+	// certificate, TestTheRoutesAuthenticateByCertificateOnly), and it is cut
+	// out so a stray "user:" in it would not pass for an account user.
+	gotUsers := a2aConfUserNames(a2aClusterBlockRe.ReplaceAllString(conf, ""))
 	slices.Sort(gotUsers)
 	if !slices.Equal(gotUsers, wantUsers) {
 		t.Fatalf("nats.conf users = %v, want %v; a new user needs a row in this test's table before it ships, and a row with no user is stale", gotUsers, wantUsers)
@@ -6937,9 +7011,10 @@ func TestA2AInjectBackendIsRemovedWhenTheFlagGoesOff(t *testing.T) {
 }
 
 // TestA2AInjectFlagOffRemovalReadsTheSecretUncached: the flag-off path reads
-// four objects before deleting them, and the fourth is a Secret. The operator
-// ships secrets with get only, so a cached Get of one starts an informer
-// whose LIST is forbidden and blocks the single reconcile worker for good --
+// four objects before deleting them, and the fourth is a Secret. The manager
+// does not watch Secrets, so a cached Get of one starts a cluster-wide Secret
+// informer that holds every Secret in memory and blocks the single reconcile
+// worker in WaitForCacheSync wherever list/watch on secrets is trimmed --
 // the fake client cannot show that hang (its cache is the store), so this
 // test fails the cached path outright and passes only if the Secret is read
 // through the reader the other A2A Secrets use.
@@ -6960,7 +7035,7 @@ func TestA2AInjectFlagOffRemovalReadsTheSecretUncached(t *testing.T) {
 	cached := interceptor.NewClient(base, interceptor.Funcs{
 		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 			if _, ok := obj.(*corev1.Secret); ok && strict.Load() {
-				return fmt.Errorf("cached Get of Secret %s: on the shipped RBAC this starts an informer whose LIST is forbidden, and the reconcile worker blocks in WaitForCacheSync", key)
+				return fmt.Errorf("cached Get of Secret %s: starts an unwatched cluster-wide Secret informer instead of reading through APIReader", key)
 			}
 			return c.Get(ctx, key, obj, opts...)
 		},
@@ -7645,8 +7720,10 @@ func TestTheProvisionJobRunsOnAnOldTemplateReplica(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Two pods, one ready, none on the current template: a roll in progress
-	// or wedged at maxUnavailable 0.
+	// or wedged at maxUnavailable 0. The bus is up; this test is about the
+	// callout gate alone.
 	reportCalloutStatus(t, ctx, cl, agent, 2, 1, 0)
+	reportBusRolledOut(t, ctx, cl, agent)
 	state, err := r.reconcileA2A(ctx, agent, homeChannelRecord{})
 	if err != nil {
 		t.Fatal(err)
@@ -8842,4 +8919,17 @@ func TestA2AChartPodsDiscardWarnsOncePerGenerationAndValue(t *testing.T) {
 			}
 		})
 	}
+}
+
+// quotedLines are the quoted entries of a rendered permission list, one per
+// line, in order.
+func quotedLines(block string) []string {
+	var out []string
+	for _, line := range strings.Split(block, "\n") {
+		line = strings.TrimSuffix(strings.TrimSpace(line), ",")
+		if strings.HasPrefix(line, `"`) {
+			out = append(out, strings.Trim(line, `"`))
+		}
+	}
+	return out
 }

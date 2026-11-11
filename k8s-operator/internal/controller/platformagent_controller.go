@@ -256,6 +256,12 @@ const (
 	// install without one looks healthy while every unprompted post is
 	// dropped (#3320). Written only in that state, like EventWatcher, and it
 	// leaves Ready alone: chat works, and some installs want no posts.
+	// a2aBusConversionRefusedConditionType stands while
+	// spec.harness.tuning.busReplicas asks for a server count other than the
+	// one the existing bus runs (BusConversionRefusedMessage).
+	a2aBusConversionRefusedConditionType = "A2ABusConversionRefused"
+	a2aBusConversionRefusedReason        = "ConversionNotSupported"
+
 	homeChannelUnsetConditionType = "HomeChannelUnset"
 	homeChannelUnsetReason        = "NoHomeChannel"
 	// The condition reporting that a next install has no chat platform at
@@ -414,12 +420,22 @@ const (
 	dataVolumeExpansionBlockedReason = "StorageClassCannotExpand"
 	// dataVolumeExpansionMessageFormat takes the claim, its current request,
 	// the resolved size and one of the three sentences below that say why.
-	dataVolumeExpansionMessageFormat = "Claim %s requests %s, and the data volume size (spec.storage.size, or the " +
-		"operator default) is %s. %s The operator leaves the claim at its current size."
+	dataVolumeExpansionMessageFormat = "Claim %s requests %s, and the data volume size (spec.storage.size or the " +
+		"operator default, raised for spec.storage.expectedClusterProfiles on the agent's claim) is %s. %s The " +
+		"operator leaves the claim at its current size."
 	dataVolumeNoStorageClassReason  = "The claim names no StorageClass, so it cannot expand."
 	dataVolumeStorageClassGoneFmt   = "StorageClass %q does not exist, so the claim cannot expand."
 	dataVolumeStorageClassFixedFmt  = "StorageClass %q does not allow volume expansion. Set allowVolumeExpansion: true on the class to let the claim grow."
 	dataVolumeExpansionMsgSeparator = " "
+	// The Warning Event for an agent data claim below
+	// ResolveAgentDataStorageSize that will not grow: a claim the operator does
+	// not control (made or adopted by hand), or one whose StorageClass cannot
+	// expand it, which DataVolumeNotExpanded also reports. An Event rather than
+	// a second condition reason, so the condition's API is unchanged.
+	dataVolumeUndersizedReason   = "DataVolumeUndersized"
+	dataVolumeUndersizedFormat   = "Claim %s requests %s, below the %s the data volume should have (spec.storage.size or the operator default, raised for spec.storage.expectedClusterProfiles). %s"
+	dataVolumeUnownedSentence    = "The claim is not controlled by this PlatformAgent, so the operator leaves its size to whoever made it; resize it by hand."
+	dataVolumeCannotGrowSentence = "Its StorageClass cannot expand it; see the DataVolumeNotExpanded condition."
 
 	conditionReasonInvalidGitRepoURL   = "InvalidGitRepoURL"
 	conditionReasonCorruptManagedRepos = "CorruptManagedRepos"
@@ -508,6 +524,21 @@ type PlatformAgentReconciler struct {
 	// next event. Keyed by ObjectKey, value time.Time; cleared by any write
 	// whose echo carries the field, and when the CR is deleted.
 	prunedUsageStatus sync.Map
+	// prunedBusReplicasStatus records, per CR, when a status write was last
+	// seen to come back without status.busReplicas: an operator rolled ahead
+	// of the CRD that adds the field. While a record is fresh the status
+	// writers leave the field out of their unchanged checks, so the write the
+	// API server prunes does not repeat on every pass (busReplicasStatusCurrent).
+	prunedBusReplicasStatus sync.Map
+
+	// busConversionAllowed lets resolveA2ABusReplicas convert an existing bus
+	// between one server and three. Off in every operator: a conversion
+	// empties the bus (a cluster deletes a standalone server's streams as
+	// orphans, a standalone server refuses a cluster's R3 streams), and the
+	// migration that keeps the data, #4225, lifts this in the same change. No
+	// flag, env var or constructor sets it; only tests do
+	// (TestNothingButTestsAllowsABusConversion).
+	busConversionAllowed bool
 	// prunedNewerFields records, per CR (usagePollKey) and per newer
 	// status.usage field -- the cluster gauges as one (usageNewerFieldGauges),
 	// the proposal readings as one (usageNewerFieldReadings), the two people
@@ -585,6 +616,13 @@ type PlatformAgentReconciler struct {
 	// then leave the condition as it stands. Cleared when the CR is deleted.
 	dataVolumeExpansion sync.Map
 
+	// dataVolumeUndersizedWarned records, per data claim, the
+	// DataVolumeUndersized Event this process last wrote, so a claim that stays
+	// in the same state is warned about once rather than on every pass. Keyed by
+	// the claim's ObjectKey, value string; removed when the claim is no longer
+	// undersized and cleared when the CR is deleted.
+	dataVolumeUndersizedWarned sync.Map
+
 	// gatewayLeaseSeen records each A2A gateway Lease this process has seen
 	// exist, and gatewayLeaseGoneAt when it first saw a seen one missing:
 	// a deletion's recreate is held back from then (ensureA2AGatewayLease).
@@ -630,6 +668,10 @@ type PlatformAgentReconciler struct {
 	// in the ClusterRole, which the RBAC self-check names when an image runs
 	// ahead of its role.
 	Recorder record.EventRecorder
+
+	// busConfigLoadTime stands in for reading the A2A bus's config_load_time
+	// from its monitoring endpoint (a2aBusConfigLoadTime). Nil reads it.
+	busConfigLoadTime func(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, error)
 
 	// clusterImageVolumes caches the cluster-wide ImageVolume capability. Server
 	// version cannot change without an API server restart, so resolving it once
@@ -692,23 +734,43 @@ type PlatformAgentReconciler struct {
 	otelProbedAt   time.Time
 }
 
+// The markers below are the operator's whole Kubernetes authority: controller-gen renders them
+// into config/rbac/role.yaml, and hack/sync-chart-manifests.sh copies that into the chart. Every
+// rule is cluster-scoped unless it carries `namespace=`, and each cluster-scoped rule is here for
+// one of four reasons, named on the rule or the group it sits in:
+//
+//   - CR: the PlatformAgent, AgentPlugin and AgentProfile resources, which the manager watches
+//     in every namespace because nothing fixes the namespace a CR is created in.
+//   - render: an object kind the operator creates for an agent, in that agent's namespace or
+//     the profile namespace beside it, and watches through a cluster-wide informer for drift.
+//   - escalation prevention: a read the operator never does itself but must hold, because
+//     buildMinimalPlatformRole grants it to the agent's audit ClusterRole and the API server
+//     refuses to let a subject grant a permission it does not hold.
+//   - operator read: something the operator reads by name or lists for itself.
+//
+// Secrets are split: the read verbs stay cluster-scoped, because the agent's audit ClusterRole
+// grants them and escalation prevention needs the operator to hold what it grants; the write
+// verbs are a namespaced Role (the last marker below), because the operator only ever writes a
+// Secret in the namespace of the PlatformAgent it is reconciling. The ClusterRole carries no
+// Secret write verb. tests/test_operator_secrets_grant.py and the C5 conformance test pin that
+// shape.
+//
+// CR.
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents/status,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents/finalizers,verbs=update
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentplugins,verbs=get;list;watch
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentplugins/status,verbs=get;update;patch
+// Render: the agent, broker, gateway and bus workloads; escalation prevention for the reads.
 // +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets,verbs=get;list;watch;create;update;patch;delete
+// Escalation prevention, with two operator reads on the same grant: resolveNetpolProfile
+// reads the gke-metadata-server DaemonSet to discover its port (issue #747 B4), and
+// a2aCalloutHasOlderPods lists ReplicaSets to tell an old callout pod from a new one.
 // +kubebuilder:rbac:groups=apps,resources=daemonsets;replicasets,verbs=get;list;watch
-// apps/daemonsets is also read by resolveNetpolProfile to discover the gke-metadata-server
-// DaemonSet port (issue #747 B4) — a second consumer of a grant that already existed for
-// buildMinimalPlatformRole's escalation-prevention requirement.
+// Render: the agent's ServiceAccounts, data claims, config, Services and (mode next) session
+// pods; escalation prevention for the reads.
 // +kubebuilder:rbac:groups="",resources=serviceaccounts;persistentvolumeclaims;configmaps;services;pods,verbs=get;list;watch;create;update;patch;delete
-// `secrets` and full `jobs` verbs exist for the mode-next A2A stack: the
-// generated NATS credentials/config Secrets and the provisioning Job.
-// No list/watch: the A2A code does one Get, Create, Update, apply-Patch and
-// Delete by name, and a2aReader() exists so those never go through the cache.
-// Without the enumeration verbs a cached Secret read cannot be added by accident.
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;create;update;patch;delete
+// Render: full `jobs` verbs for the mode-next provisioning Job.
 // +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
 // `dispatchjobtemplates` are the dispatcher Job admission policy's params in
 // <ns>-profiles (agentprofile_job_template.go), which the operator alone
@@ -727,28 +789,45 @@ type PlatformAgentReconciler struct {
 // as rendered (dispatcherJobPolicyInPlace). Read by name, uncached; no list,
 // watch or write. Pending @bnaylor's sign-off (#3655 PR 6).
 // +kubebuilder:rbac:groups=admissionregistration.k8s.io,resources=validatingadmissionpolicies;validatingadmissionpolicybindings,resourceNames=kube-agents-a2a-dispatcher-job,verbs=get
-// `nodes` is still required: buildMinimalPlatformRole grants it to the agent audit
-// ClusterRole, and RBAC escalation-prevention needs the operator to hold it to apply that.
+// Escalation prevention for `nodes`, `namespaces`, `events`, `persistentvolumes` and `pods/log`,
+// which buildMinimalPlatformRole grants to the agent audit ClusterRole (the operator never reads
+// an Event; the Recorder's writes are the next marker). Operator reads: `limitranges` (the sizing
+// profile reads the agent namespace's LimitRange) and `endpoints` (the control-plane endpoint for
+// the egress policy).
 // +kubebuilder:rbac:groups="",resources=namespaces;nodes;events;persistentvolumes;limitranges;endpoints;pods/log,verbs=get;list;watch
 // events create;patch: the Recorder's writes (see the field); patch is what
 // the recorder uses to bump the count on a repeat of the same Event.
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
-// Full `resourcequotas` verbs exist for the mode-next session-pod quota (the
+// Render: full `resourcequotas` verbs exist for the mode-next session-pod quota (the
 // enforcement half of the session cap); everything else only reads quotas.
 // +kubebuilder:rbac:groups="",resources=resourcequotas,verbs=get;list;watch;create;update;patch;delete
-// storageclasses get: growDataClaim reads a data claim's class by name, around
+// Operator read. storageclasses get: growDataClaim reads a data claim's class by name, around
 // the cache, to learn whether the claim can expand. Read-only, and no list or
 // watch, so a cached read cannot be added by accident.
 // +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get
+// Escalation prevention: the audit ClusterRole's read set. The operator itself reads none of
+// these but `runtimeclasses` (validateRuntimeClass resolves the sandbox's class by name).
 // +kubebuilder:rbac:groups=metrics.k8s.io,resources=nodes;pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch
 // +kubebuilder:rbac:groups=batch,resources=cronjobs;jobs,verbs=get;list;watch
-// +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=node.k8s.io,resources=runtimeclasses,verbs=get;list;watch
-// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch
+// Render: the agent's leader Role grants `leases` in its namespace, so the operator must hold
+// the verbs it grants; the operator's own election lease is in its namespace too.
+// +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
+// Render: the agent's egress and ingress policies and its disruption budget.
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=networking.gke.io,resources=fqdnnetworkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
+// Render: the agent's RBAC. The cluster-scoped objects are the audit ClusterRole and its
+// binding (kubeagents:minimal:<ns>:<name>), the broker's TokenReview ClusterRole and binding
+// (kubeagents:tokenreview:<ns>:<name>) and, under mode next, the callout's binding
+// (kubeagents:a2a-callout-tokenreview:<ns>:<name>); the namespaced ones are the local, leader,
+// gateway, callout, dispatcher and scope-publisher Roles. Every name carries the agent's
+// namespace and name, so `resourceNames` cannot pin them, and the informers that watch them for
+// drift need unscoped `list` and `watch`. What bounds this grant is the API server's escalation
+// check: the operator holds no `escalate`, so no role it authors or binds can carry a
+// permission the operator does not itself hold, and the one `bind` below is scoped by name.
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings;roles;rolebindings,verbs=get;list;watch;create;update;patch;delete
 // The split credential broker verifies its callers with a TokenReview. The operator has to
 // hold that permission in order to grant it; it confers no read access and cannot mint a token.
@@ -765,16 +844,7 @@ type PlatformAgentReconciler struct {
 // `bind` scoped by resourceNames is the narrow form — it permits granting this one role and
 // confers none of its permissions on the operator itself.
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,resourceNames="system:auth-delegator",verbs=bind
-// `get` and nothing else on secrets, for two callers. checkShellSandboxKeys asks whether
-// the sandbox's authorized-keys Secret exists so the status can say so; it never reads a
-// value out of one, and the operator creates that Secret nowhere. stampSecretEnvHash does
-// read values: it digests the Secret keys a pod consumes as environment onto that pod's
-// template, so rotating one rolls the pod (platformagent_secret_hash.go). Both read by
-// name. Both go through r.APIReader rather than the cached client on purpose: a cached Get
-// of a type the manager does not already watch starts a cluster-wide Secret informer, which
-// would both hold every Secret in the cluster in the operator's memory and, on any cluster
-// where this grant is trimmed, block WaitForCacheSync forever behind a forbidden LIST.
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=get
+// Escalation prevention: buildMinimalPlatformRole grants CRD reads to the agent.
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch
 // The GitOps reconcilers' objects, read-only, for the same escalation-prevention reason
 // as `nodes` above: buildMinimalPlatformRole grants them to the agent, so the operator
@@ -783,6 +853,36 @@ type PlatformAgentReconciler struct {
 // +kubebuilder:rbac:groups=kustomize.toolkit.fluxcd.io,resources=kustomizations,verbs=get;list;watch
 // +kubebuilder:rbac:groups=source.toolkit.fluxcd.io,resources=gitrepositories;ocirepositories,verbs=get;list;watch
 // +kubebuilder:rbac:groups=configsync.gke.io,resources=rootsyncs;reposyncs,verbs=get;list;watch
+//
+// Secrets, read, cluster-wide. `get` is for two by-name readers: checkShellSandboxKeys asks
+// whether the sandbox's authorized-keys Secret exists so the status can say so, and never reads
+// a value out of one; stampSecretEnvHash reads the values of the Secret keys a pod consumes as
+// environment and digests them onto the pod template, so rotating one rolls the pod
+// (platformagent_secret_hash.go). `list` and `watch` are escalation prevention only:
+// buildMinimalPlatformRole grants `get`/`list`/`watch` on `secrets` to the agent's audit
+// ClusterRole (read through `<agent>-kube-proxy`, where KUBE_PROXY_REDACT_SECRETS=true strips
+// `.data`, `.stringData` and `last-applied-configuration`), and the API server refuses a grant
+// the operator does not hold. The operator itself never lists or watches a Secret: every read
+// goes by name through r.APIReader (a2aReader), never the manager's cache, because a cached Get
+// of a type the manager does not watch would start a cluster-wide Secret informer and hold
+// every Secret in the cluster in memory. tests/test_operator_secrets_grant.py refuses a
+// Secret list call or a Secret informer in controller code. resolveMinimalRoleSecretsRead reads the
+// self-check's denial of these two verbs (rbacSecretsListLabel, rbacSecretsWatchLabel) to keep
+// an upgraded install's minimal role as it is, which is why this marker stays cluster-scoped:
+// a namespaced tuple is labelled differently and the match would miss.
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+//
+// Secrets, write, namespaced. The operator writes a Secret only in the namespace of the
+// PlatformAgent it reconciles (every call site builds its key from agent.Namespace), so the
+// write verbs are a Role in the install namespace: `namespace=` makes controller-gen render a
+// Role beside the ClusterRole in role.yaml, the kustomize overlay rewrites the literal to the
+// deployed namespace, and the chart renders the same rules as a Role in the release namespace.
+// A PlatformAgent in any other namespace needs that Role and a RoleBinding there. The writers:
+// ensureKubeProxyTLSSecret creates and renews the kube-proxy TLS Secret on every install; the
+// mode-next A2A stack creates, repairs, patches and deletes the NATS credentials, config, TLS,
+// callout-key, inject-token, door-token and MCP-access Secrets it generates. Because the Role
+// grants the four verbs in one namespace, the operator can write a Secret nowhere else.
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=create;update;patch;delete,namespace=kubeagents-system
 
 // isPlatformAgentConflict reports whether err is an optimistic concurrency conflict
 // (409 Conflict) specifically on a PlatformAgent custom resource (Group: kubeagents.x-k8s.io,
@@ -933,25 +1033,35 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// below), so the bus a newer CRD rendered is still standing; clearing the
 	// condition would report it gone, and rewriting it would claim this binary
 	// knows what it describes. Both are worse than leaving it.
+	//
+	// DispatcherJobMode is written on the way out for the same reasons, from
+	// the dispatcher step's verdict (syncDispatcherJobMode), or cleanupA2A's
+	// below. A pass that reached neither leaves it as it was.
 	busCredsMapVersion := ""
+	var dispatcherJobMode *metav1.Condition
 	if modeErr == nil {
 		wantNext := renderMode(instance, "nats") == ModeNext
-		defer func() {
-			if err := r.syncBusCredentialsReady(ctx, instance, wantNext, busCredsMapVersion); err != nil {
-				if retErr == nil {
-					retErr = err
-					return
-				}
-				// The reconcile is already failing and will requeue. If the
-				// failure is already a PlatformAgent conflict being requeued cleanly,
-				// a subsequent conflict writing BusCredentialsReady is the same race
-				// and should not log an Error with a stack trace.
-				if isPlatformAgentConflict(retErr) && errors.IsConflict(err) {
-					log.Info("Conflict writing BusCredentialsReady; pass already requeuing on conflict", "error", err)
-				} else {
-					log.Error(err, "could not write BusCredentialsReady")
-				}
+		exitWrite := func(condition string, err error) {
+			if err == nil {
+				return
 			}
+			if retErr == nil {
+				retErr = err
+				return
+			}
+			// The reconcile is already failing and will requeue. If the
+			// failure is already a PlatformAgent conflict being requeued cleanly,
+			// a subsequent conflict writing the condition is the same race
+			// and should not log an Error with a stack trace.
+			if isPlatformAgentConflict(retErr) && errors.IsConflict(err) {
+				log.Info("Conflict writing "+condition+"; pass already requeuing on conflict", "error", err)
+			} else {
+				log.Error(err, "could not write "+condition)
+			}
+		}
+		defer func() {
+			exitWrite(busCredentialsReadyCondition, r.syncBusCredentialsReady(ctx, instance, wantNext, busCredsMapVersion))
+			exitWrite(dispatcherJobModeCondition, r.syncDispatcherJobMode(ctx, instance, dispatcherJobMode))
 		}()
 	}
 
@@ -964,7 +1074,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if msg := ReservedServiceAccountOverride(instance); msg != "" {
 		log.Info(msg)
 		guardrailErr := r.reconcileAgentNetworkGuardrails(ctx, instance)
-		if statusErr := r.updateStatusDegraded(ctx, instance, reasonReservedServiceAccount, msg, workloadNotRendered); statusErr != nil {
+		if statusErr := r.updateStatusDegraded(ctx, instance, reasonReservedServiceAccount, msg, brokerNotReconciled); statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}
 		if guardrailErr != nil {
@@ -1048,7 +1158,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if msg := validateExtraVolumeMounts(instance, agentPlugins...); msg != "" {
 		log.Info(msg)
 		guardrailErr := r.reconcileAgentNetworkGuardrails(ctx, instance)
-		if statusErr := r.updateStatusDegraded(ctx, instance, reasonForbiddenVolumeMount, msg, workloadNotRendered); statusErr != nil {
+		if statusErr := r.updateStatusDegraded(ctx, instance, reasonForbiddenVolumeMount, msg, brokerNotReconciled); statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}
 		if guardrailErr != nil {
@@ -1067,7 +1177,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if reason, msg := validateShellSandbox(instance); reason != "" {
 		log.Info(msg)
 		guardrailErr := r.reconcileAgentNetworkGuardrails(ctx, instance)
-		if statusErr := r.updateStatusDegraded(ctx, instance, reason, msg, workloadNotRendered); statusErr != nil {
+		if statusErr := r.updateStatusDegraded(ctx, instance, reason, msg, brokerNotReconciled); statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}
 		if guardrailErr != nil {
@@ -1086,7 +1196,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			msg := fmt.Sprintf("RuntimeClass '%s' is not configured in this cluster. For GKE Standard, enable GKE Sandbox by provisioning a gVisor node pool first. In GKE Autopilot, gVisor is supported automatically.", rcName)
 			log.Info(msg)
 			guardrailErr := r.reconcileAgentNetworkGuardrails(ctx, instance)
-			if statusErr := r.updateStatusDegraded(ctx, instance, reasonRuntimeClassNotFound, msg, workloadNotRendered); statusErr != nil {
+			if statusErr := r.updateStatusDegraded(ctx, instance, reasonRuntimeClassNotFound, msg, brokerNotReconciled); statusErr != nil {
 				return ctrl.Result{}, statusErr
 			}
 			if guardrailErr != nil {
@@ -1234,12 +1344,27 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	var a2aState a2aProvisionState
 	a2aNext := a2aStackRendering(instance)
 	if a2aNext {
-		if a2aState, err = r.reconcileA2A(ctx, instance, homeRec); err != nil {
+		a2aState, err = r.reconcileA2A(ctx, instance, homeRec)
+		// For the deferred write at 2d, failed pass or not: a step after
+		// the dispatcher's failing doesn't undo what it did to Job mode.
+		dispatcherJobMode = a2aState.dispatcherJobMode
+		if err != nil {
 			return ctrl.Result{}, err
 		}
 	} else if modeErr == nil {
-		if err := r.cleanupA2A(ctx, instance); err != nil {
+		tornDown, err := r.cleanupA2AWithJobMode(ctx, instance)
+		if err != nil {
 			return ctrl.Result{}, err
+		}
+		// No bus, no server count. Telling the writers what the CR carried
+		// lets them write the cleared field once, and then find it current.
+		a2aState.busReplicasPersisted = instance.Status.BusReplicas
+		instance.Status.BusReplicas = 0
+		// The dispatcher and its Job mode went with the stack, unless their
+		// profile-namespace teardown failed: then the Jobs Role and templates
+		// are still live and the condition stays as it was.
+		if tornDown {
+			dispatcherJobMode = jobModeTornDown
 		}
 		// No callout, so no claim about its map: the condition goes.
 		removed := a2aIdentityMapRemoved
@@ -1347,11 +1472,17 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// calloutMap shares it too: a map the callouts are still loading, or
 	// pods that didn't answer, changes nothing the operator watches when it
 	// settles, so the pass that sees it settle has to be scheduled.
-	if a2aNext && a2aState.wantsRequeue() {
+	// a2aBusNeedsRecheck adds a bus server short of the count while a
+	// quorum serves, for the same reason.
+	if a2aNext && r.a2aBusNeedsRecheck(ctx, instance, a2aState) {
 		requeue := a2aPendingRequeue
 		// A held-back Lease recreate can be due sooner (ensureA2AGatewayLease).
 		if a2aState.leaseRequeue > 0 {
 			requeue = min(requeue, a2aState.leaseRequeue)
+		}
+		// So can a pending bus reload's recheck (planA2ABusReload).
+		if a2aState.busReloadRequeue > 0 {
+			requeue = min(requeue, a2aState.busReloadRequeue)
 		}
 		return ctrl.Result{RequeueAfter: requeue}, nil
 	}
@@ -1368,6 +1499,10 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// So is a stuck bus pod's replacement (replaceStuckA2ANATSPod).
 		if a2aState.busPodRequeue > 0 {
 			requeue = min(requeue, a2aState.busPodRequeue)
+		}
+		// And a bus config reload still pending (planA2ABusReload).
+		if a2aState.busReloadRequeue > 0 {
+			requeue = min(requeue, a2aState.busReloadRequeue)
 		}
 		if credentialProxyExecShort(instance) {
 			requeue = min(requeue, credentialProxyExecShortRequeue)
@@ -1423,6 +1558,11 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if a2aNext && a2aState.busPodRequeue > 0 {
 		requeueAfter = min(requeueAfter, a2aState.busPodRequeue)
 	}
+	// A bus config reload not yet confirmed: nothing watched moves when the
+	// bus's config_load_time does.
+	if a2aNext && a2aState.busReloadRequeue > 0 {
+		requeueAfter = min(requeueAfter, a2aState.busReloadRequeue)
+	}
 	// An exec tier short of its count: the scheduler's verdict lands on a pod,
 	// which is not watched, so the pass that reads it has to be asked for.
 	if credentialProxyExecShort(instance) {
@@ -1437,7 +1577,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 // record it returns the secret re-read's interval, the ceiling the caller
 // already applies, so the min it feeds leaves the caller's value alone.
 func (r *PlatformAgentReconciler) usageStatusRequeue(agent *agentv1alpha1.PlatformAgent) time.Duration {
-	if r.usageStatusPruned(agent) || r.inferencePruned(agent) {
+	if r.usageStatusPruned(agent) || r.busReplicasStatusPruned(agent) || r.inferencePruned(agent) {
 		return usageStatusReprobeInterval
 	}
 	return secretEnvReprobeInterval
@@ -1467,6 +1607,10 @@ func pluginStatusNeedsRecheck(plugins []*agentv1alpha1.AgentPlugin, agentReady b
 
 func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (ctrl.Result, error) {
 	if controllerutil.ContainsFinalizer(agent, platformAgentFinalizer) {
+		// The self-check stops probing this agent's namespace: once the agent
+		// is gone its RoleBinding may go too, and that must not stand as a
+		// denial on the agents that remain.
+		r.RBAC.Forget(agent.Namespace)
 		// Delete the credential broker's TokenReview grant, if the split ever
 		// created one. cleanupAgentRBAC's label-driven pass also reaps it under
 		// deleteAll, but only when the grant carries the instance labels — one
@@ -1533,23 +1677,30 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 			}
 		}
 
-		// The NATS StatefulSet's volumeClaimTemplate PVC has no owner
+		// The NATS StatefulSet's volumeClaimTemplate PVCs have no owner
 		// reference (nothing from a template does), so without this a
-		// deleted next-mode agent leaks its 40Gi JetStream volume. Guarded by
+		// deleted next-mode agent leaks a 40Gi JetStream volume per server.
+		// Every ordinal the bus can have, not just the current replica count:
+		// claims can outlive their servers (a StatefulSet deleted with the
+		// CR's finalizer still pending, or a scale-down, which keeps the claims
+		// it removes in this release: WhenScaled is Retain until #4225), so
+		// every ordinal is checked. Guarded by
 		// the instance label the claim template stamps, because a name is not
-		// ownership: a PVC squatting this exact name that this render did not
-		// create is left alone rather than destroyed.
-		a2aPVC := &corev1.PersistentVolumeClaim{}
-		pvcKey := client.ObjectKey{Name: a2aNATSDataClaim + "-" + a2aNATSName(agent) + "-0", Namespace: agent.Namespace}
-		switch err := r.Client.Get(ctx, pvcKey, a2aPVC); {
-		case err == nil:
-			if a2aPVC.Labels[labelInstance] == instanceLabel(agent.Namespace, agent.Name) {
-				if err := client.IgnoreNotFound(r.Delete(ctx, a2aPVC)); err != nil {
-					return ctrl.Result{}, err
+		// ownership: a PVC squatting one of these names that this render did
+		// not create is left alone rather than destroyed.
+		for ordinal := range a2aNATSMaxReplicas {
+			a2aPVC := &corev1.PersistentVolumeClaim{}
+			pvcKey := client.ObjectKey{Name: a2aNATSDataClaimName(agent, ordinal), Namespace: agent.Namespace}
+			switch err := r.Client.Get(ctx, pvcKey, a2aPVC); {
+			case err == nil:
+				if a2aPVC.Labels[labelInstance] == instanceLabel(agent.Namespace, agent.Name) {
+					if err := client.IgnoreNotFound(r.Delete(ctx, a2aPVC)); err != nil {
+						return ctrl.Result{}, err
+					}
 				}
+			case client.IgnoreNotFound(err) != nil:
+				return ctrl.Result{}, err
 			}
-		case client.IgnoreNotFound(err) != nil:
-			return ctrl.Result{}, err
 		}
 
 		// The profile namespace's quota, left behind, caps a successor's
@@ -1629,18 +1780,22 @@ func (r *PlatformAgentReconciler) reconcilePVC(ctx context.Context, agent *agent
 			return err
 		}
 	}
-	// The data claim follows ResolveDataStorageSize on an existing install too.
+	// The data claim follows ResolveAgentDataStorageSize on an existing install too.
 	// reconcilePersistentVolumeClaim is create-only, so without this a size
 	// raised to stop the volume filling would reach new installs only, and
 	// every install that already had the problem would keep it.
 	//
 	// The sandbox's claim grows first. It is the destination of the mirror, so
-	// a park, an error or a refusal between the two grows leaves the sandbox
-	// claim the larger one, never the smaller. This also runs before
+	// a park, an error or a refusal between the two grows leaves it at its full
+	// size before the agent's grows. The agent's claim can be the larger one by
+	// spec.storage.expectedClusterProfiles: that budget is for the session
+	// stores, which the mirror does not copy. This also runs before
 	// reconcileShellSandbox applies the StatefulSet.
 	r.growShellSandboxDataClaim(ctx, agent)
 	key := client.ObjectKeyFromObject(dataClaim)
-	r.noteDataClaimGrowth(key, r.growDataClaim(ctx, key, dataClaim.Spec.Resources.Requests[corev1.ResourceStorage], agent))
+	growth := r.growDataClaim(ctx, key, dataClaim.Spec.Resources.Requests[corev1.ResourceStorage], agent)
+	r.noteDataClaimGrowth(key, growth)
+	r.warnUndersizedDataClaim(agent, key, growth)
 	return nil
 }
 
@@ -2988,7 +3143,9 @@ func (r *PlatformAgentReconciler) ungatedDNSClusterIPs(ctx context.Context, agen
 	return r.resolveNetpolProfile(ctx, ungated).DNSClusterIPs
 }
 
-// growShellSandboxDataClaim widens the sandbox's data claim to match the agent's.
+// growShellSandboxDataClaim widens the sandbox's data claim to ResolveDataStorageSize:
+// the agent's claim without the per-profile budget, which covers session stores
+// the mirror does not copy.
 //
 // A StatefulSet's volumeClaimTemplate sizes only the claims it creates, so an
 // install from before the current ResolveDataStorageSize keeps the size it was
@@ -3009,6 +3166,9 @@ func (r *PlatformAgentReconciler) growShellSandboxDataClaim(ctx context.Context,
 type dataClaimGrowth struct {
 	claim      string
 	have, want resource.Quantity
+	// unowned is true for a claim the owner passed to growDataClaim does not
+	// control, which growDataClaim leaves at its size.
+	unowned bool
 	// cannotExpand is "" unless the claim is below want and its StorageClass
 	// cannot expand it. Then it is the sentence that says why.
 	cannotExpand string
@@ -3056,11 +3216,42 @@ func (r *PlatformAgentReconciler) dataVolumeExpansionMessage(agent *agentv1alpha
 func (r *PlatformAgentReconciler) forgetDataVolumeExpansion(agent *agentv1alpha1.PlatformAgent) {
 	for _, key := range dataClaimKeys(agent) {
 		r.dataVolumeExpansion.Delete(key)
+		r.dataVolumeUndersizedWarned.Delete(key)
 	}
 }
 
-// dataClaimKeys are the two claims ResolveDataStorageSize sizes: the agent's
-// own data claim and the sandbox's.
+// warnUndersizedDataClaim writes one DataVolumeUndersized Warning Event when
+// the agent's data claim is below the size it should have and will not grow,
+// and again only when what it says changes. A nil growth (the claim could not
+// be read) leaves the record alone; a claim that is not undersized, or that
+// growDataClaim patched, clears it, so a later shortfall is warned about anew.
+func (r *PlatformAgentReconciler) warnUndersizedDataClaim(agent *agentv1alpha1.PlatformAgent, key client.ObjectKey, growth *dataClaimGrowth) {
+	if growth == nil {
+		return
+	}
+	var why string
+	switch {
+	case growth.have.IsZero() || growth.have.Cmp(growth.want) >= 0:
+	case growth.unowned:
+		why = dataVolumeUnownedSentence
+	case growth.cannotExpand != "":
+		why = dataVolumeCannotGrowSentence
+	}
+	if why == "" {
+		r.dataVolumeUndersizedWarned.Delete(key)
+		return
+	}
+	msg := fmt.Sprintf(dataVolumeUndersizedFormat, growth.claim, growth.have.String(), growth.want.String(), why)
+	if previous, ok := r.dataVolumeUndersizedWarned.Load(key); ok && previous.(string) == msg {
+		return
+	}
+	r.dataVolumeUndersizedWarned.Store(key, msg)
+	r.recordEvent(agent, corev1.EventTypeWarning, dataVolumeUndersizedReason, msg)
+}
+
+// dataClaimKeys are the two data claims: the agent's own, which
+// ResolveAgentDataStorageSize sizes, and the sandbox's, which
+// ResolveDataStorageSize sizes.
 func dataClaimKeys(agent *agentv1alpha1.PlatformAgent) []client.ObjectKey {
 	return []client.ObjectKey{
 		client.ObjectKeyFromObject(buildPVC(agent)),
@@ -3167,13 +3358,14 @@ func (r *PlatformAgentReconciler) growDataClaim(ctx context.Context, key client.
 		}
 		return growth
 	}
+	have := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
+	growth.have = have
 	if owner != nil && !metav1.IsControlledBy(pvc, owner) {
 		log.Info("the data claim is not the operator's; leaving its size alone", "claim", key.Name)
+		growth.unowned = true
 		return growth
 	}
 
-	have := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
-	growth.have = have
 	if have.Cmp(want) >= 0 {
 		// The spec asks for enough. Whether the volume has it is a different
 		// question: the API server admits a resize on the StorageClass alone, and
@@ -3588,6 +3780,9 @@ func (r *PlatformAgentReconciler) reconcileAgentNetworkGuardrails(ctx context.Co
 		errs = append(errs, err)
 	}
 	if a2aStackRendering(agent) {
+		// No server count is resolved here: this path does not reconcile the
+		// bus, so it must not write status.busReplicas or announce a
+		// conversion, and the bus fence does not depend on the count.
 		if _, _, err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
 			var pnErr *profileNamespaceError
 			if goerrors.As(err, &pnErr) {
@@ -3988,21 +4183,59 @@ func (r *PlatformAgentReconciler) cleanupAgentRBAC(ctx context.Context, agent *a
 	return nil
 }
 
+func clusterRoleGrantsCoreSecrets(role *rbacv1.ClusterRole) bool {
+	if role == nil {
+		return false
+	}
+	for _, rule := range role.Rules {
+		if slices.Contains(rule.APIGroups, "") && slices.Contains(rule.Resources, "secrets") {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *PlatformAgentReconciler) resolveMinimalRoleSecretsRead(ctx context.Context, agent *agentv1alpha1.PlatformAgent, minimalRoleName string) (bool, error) {
+	if agent.Spec.Security != nil && agent.Spec.Security.DisallowSecretsRead != nil {
+		return !*agent.Spec.Security.DisallowSecretsRead, nil
+	}
+	if r.RBAC != nil {
+		denied := r.RBAC.Denied()
+		if slices.Contains(denied, rbacSecretsListLabel) || slices.Contains(denied, rbacSecretsWatchLabel) {
+			return false, nil
+		}
+	}
+	var existing rbacv1.ClusterRole
+	err := r.Get(ctx, client.ObjectKey{Name: minimalRoleName}, &existing)
+	if errors.IsNotFound(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("failed to read minimal ClusterRole %s: %w", minimalRoleName, err)
+	}
+	return clusterRoleGrantsCoreSecrets(&existing), nil
+}
+
 func (r *PlatformAgentReconciler) reconcileRBAC(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	minimalBindingName := fmt.Sprintf("kubeagents:minimal:%s:%s", agent.Namespace, agent.Name)
 	localBindingName := fmt.Sprintf("kubeagents:local:%s:%s", agent.Namespace, agent.Name)
 	leaderBindingName := fmt.Sprintf("kubeagents:leader:%s:%s", agent.Namespace, agent.Name)
 
 	// Reconcile minimal read-only audit ClusterRole and ClusterRoleBinding
-	minimalRole := buildMinimalPlatformRole(agent)
+	allowSecretsRead, err := r.resolveMinimalRoleSecretsRead(ctx, agent, minimalBindingName)
+	if err != nil {
+		return err
+	}
+	minimalRole := buildMinimalPlatformRoleWithSecrets(agent, allowSecretsRead)
 	if err := r.applyManaged(ctx, agent, minimalRole); err != nil {
 		return fmt.Errorf("failed to reconcile minimal ClusterRole: %w", err)
 	}
 
 	crbMinimal := buildClusterRoleBinding(agent, minimalBindingName, minimalRole.Name)
 	// The gateway's own ServiceAccount takes the same read-only grant: its
-	// agent-api-auth container watches and joins the management cluster with
-	// an in-cluster token. Same rules, a second principal; no new permission.
+	// operator-rendered agent-api-auth container watches and joins the
+	// management cluster with an in-cluster token, while the agent container
+	// mounts no Kubernetes token (AutomountServiceAccountToken is false).
 	crbMinimal.Subjects = append(crbMinimal.Subjects, gatewaySubject(agent))
 	if err := r.applyManaged(ctx, agent, crbMinimal); err != nil {
 		return fmt.Errorf("failed to reconcile minimal ClusterRoleBinding: %w", err)
@@ -4176,7 +4409,7 @@ func (r *PlatformAgentReconciler) readSplitWorkloads(ctx context.Context, agent 
 			provisioned = 1
 		}
 		workloads = append(workloads,
-			splitWorkloadStatus{name: natsName, kind: "StatefulSet", ready: nats.Status.ReadyReplicas},
+			splitWorkloadStatus{name: natsName, kind: "StatefulSet", ready: a2aNATSServingReplicas(nats)},
 			splitWorkloadStatus{name: calloutName, kind: "Deployment", ready: callout.Status.ReadyReplicas},
 			splitWorkloadStatus{name: jobName, kind: "Job", ready: provisioned},
 		)
@@ -4435,6 +4668,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	// Degraded still runs a gateway that drops proactive posts, and a bare
 	// helm install parks on ShellSandboxKeysMissing indefinitely (#3320).
 	homeMsg := homeChannelUnsetMessage(agent, a2a.homeRecord)
+	conversionMsg := a2aBusConversionRefusedMessage(agent)
 	noChatMsg := noChatPlatformMsg(agent)
 	// So does the sandbox pin: an old sandbox is a likely cause of the park.
 	sandboxPinnedMsg := shellSandboxImagePinnedMsg(agent)
@@ -4447,6 +4681,8 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 		a2aCalloutStalledConditionCurrent(agent, a2a.calloutStalled) &&
 		a2aIdentityMapAppliedConditionCurrent(agent, a2a.calloutMap) &&
 		scopeResolvedConditionCurrent(agent, a2a.scopeCondition) &&
+		a2aBusConversionRefusedConditionCurrent(agent, conversionMsg) &&
+		r.busReplicasStatusCurrent(agent, a2a.busReplicasPersisted) &&
 		gatewayElectedConditionCurrent(agent, gatewayElectedImage(agent, a2a.gatewayElected)) {
 		return nil
 	}
@@ -4460,6 +4696,8 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 			a2aCalloutStalledConditionCurrent(live, a2a.calloutStalled) &&
 			a2aIdentityMapAppliedConditionCurrent(live, a2a.calloutMap) &&
 			scopeResolvedConditionCurrent(live, a2a.scopeCondition) &&
+			a2aBusConversionRefusedConditionCurrent(live, conversionMsg) &&
+			(r.busReplicasStatusPruned(agent) || live.Status.BusReplicas == agent.Status.BusReplicas) &&
 			gatewayElectedConditionCurrent(live, gatewayElectedImage(live, a2a.gatewayElected))
 	}) {
 		return nil
@@ -4475,8 +4713,47 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	setA2ACalloutStalledCondition(agent, a2a.calloutStalled, now)
 	setA2AIdentityMapAppliedCondition(agent, a2a.calloutMap, now)
 	setScopeResolvedCondition(agent, a2a.scopeCondition, now)
+	setA2ABusConversionRefusedCondition(agent, conversionMsg, now)
 	setGatewayElectedCondition(agent, gatewayElectedImage(agent, a2a.gatewayElected), now)
-	return r.Status().Update(ctx, agent)
+	writtenBusReplicas := agent.Status.BusReplicas
+	if err := r.Status().Update(ctx, agent); err != nil {
+		return err
+	}
+	r.noteBusReplicasEcho(agent, writtenBusReplicas)
+	return nil
+}
+
+// busReplicasStatusCurrent reports whether status.busReplicas needs no write:
+// the CR already carried the count this pass resolved (persisted, read before
+// resolveA2ABusReplicas set the in-memory copy), or the served CRD was seen to
+// prune the field recently, in which case writing it would only be pruned
+// again and wake the next pass through the unfiltered watch.
+func (r *PlatformAgentReconciler) busReplicasStatusCurrent(agent *agentv1alpha1.PlatformAgent, persisted int32) bool {
+	return r.busReplicasStatusPruned(agent) || persisted == agent.Status.BusReplicas
+}
+
+// busReplicasStatusPruned reports a fresh record that the served CRD drops
+// status.busReplicas (noteBusReplicasEcho), reprobed on the status.usage
+// cadence.
+func (r *PlatformAgentReconciler) busReplicasStatusPruned(agent *agentv1alpha1.PlatformAgent) bool {
+	recorded, pruned := r.prunedBusReplicasStatus.Load(client.ObjectKeyFromObject(agent))
+	return pruned && time.Since(recorded.(time.Time)) < usageStatusReprobeInterval
+}
+
+// noteBusReplicasEcho reads the server's copy back after a status write. The
+// response is decoded into agent through a target-zeroing decoder (see
+// noteUsageStatusEcho), so a field the served CRD does not know comes back 0
+// although a count was written. Writing 0 says nothing either way.
+func (r *PlatformAgentReconciler) noteBusReplicasEcho(agent *agentv1alpha1.PlatformAgent, written int32) {
+	if written == 0 {
+		return
+	}
+	key := client.ObjectKeyFromObject(agent)
+	if agent.Status.BusReplicas == written {
+		r.prunedBusReplicasStatus.Delete(key)
+		return
+	}
+	r.prunedBusReplicasStatus.Store(key, time.Now())
 }
 
 // liveAgentSatisfies checks whether the uncached live object already satisfies pred.
@@ -4613,6 +4890,13 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		condMsg = "Gateway, shell sandbox and credential broker are all ready"
 		if a2aStackRendering(agent) {
 			condMsg = "Gateway, shell sandbox, credential broker, NATS, auth callout, bus provisioning and A2A gateway are all ready"
+			// A quorum serves, so Ready stands, but a server short of
+			// the configured count is a bus one failure from an outage
+			// and is said here: the pod scan below does not run on a
+			// Ready pass.
+			if note := r.a2aNATSShortNote(ctx, agent); note != "" {
+				condMsg += ". " + note
+			}
 		}
 	case errWorkload == nil:
 		// The bucket question the scan asks is "has this install ever
@@ -4817,6 +5101,11 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	sandboxPinnedMsg := shellSandboxImagePinnedMsg(agent)
 	sandboxPinnedUnchanged := shellSandboxImagePinnedConditionCurrent(agent, sandboxPinnedMsg)
 
+	// The refused conversion, from the spec and the count this pass resolved:
+	// advisory, so Ready stands on the bus that runs.
+	conversionRefusedMsg := a2aBusConversionRefusedMessage(agent)
+	conversionRefusedUnchanged := a2aBusConversionRefusedConditionCurrent(agent, conversionRefusedMsg)
+
 	// The A2AGateway condition, same class as EventWatcher and for the same
 	// reason it needs its own term: on an upgraded install, the way back
 	// from dark can leave the Ready phase and message exactly as they were
@@ -4903,6 +5192,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		degradedUnchanged &&
 		eventWatcherUnchanged &&
 		homeChannelUnsetUnchanged &&
+		conversionRefusedUnchanged &&
 		noChatPlatformUnchanged &&
 		sandboxPinnedUnchanged &&
 		hostPathDroppedUnchanged &&
@@ -4910,6 +5200,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		execReadyUnchanged &&
 		a2aGatewayUnchanged &&
 		busProvisionedUnchanged &&
+		r.busReplicasStatusCurrent(agent, a2a.busReplicasPersisted) &&
 		a2aVerifierUnchanged && a2aMCPServerUnchanged && a2aCalloutStalledUnchanged && identityMapAppliedUnchanged && scopeResolvedUnchanged &&
 		gatewayElectedUnchanged &&
 		dataVolumeExpansionUnchanged &&
@@ -4984,6 +5275,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	}
 
 	setHomeChannelUnsetCondition(agent, homeChannelUnsetMsg, now)
+	setA2ABusConversionRefusedCondition(agent, conversionRefusedMsg, now)
 	setNoChatPlatformCondition(agent, noChatPlatformMsgNow, now)
 	setShellSandboxImagePinnedCondition(agent, sandboxPinnedMsg, now)
 	setHostPathDroppedCondition(agent, hostPathDroppedMsg, now)
@@ -5000,6 +5292,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	setGatewayElectedCondition(agent, gatewayElected, now)
 	setDataVolumeExpansionCondition(agent, dataVolumeMsg, dataVolumeKnown, now)
 
+	writtenBusReplicas := agent.Status.BusReplicas
 	// Copied before the write: decoding the response may reuse the pointer's target.
 	var wroteInference *inferenceModel
 	if newInference != nil {
@@ -5009,6 +5302,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		return newPhase, err
 	}
 	r.noteUsageStatusEcho(ctx, agent, newActiveInterfaces)
+	r.noteBusReplicasEcho(agent, writtenBusReplicas)
 	r.noteInferenceEcho(ctx, agent, wroteInference)
 	return newPhase, nil
 }
@@ -5093,6 +5387,7 @@ func (r *PlatformAgentReconciler) noteUsageEcho(ctx context.Context, agent *agen
 // maps do not keep an entry per deleted name for the life of the process.
 func (r *PlatformAgentReconciler) forgetUsageStatus(agent *agentv1alpha1.PlatformAgent) {
 	r.prunedUsageStatus.Delete(client.ObjectKeyFromObject(agent))
+	r.prunedBusReplicasStatus.Delete(client.ObjectKeyFromObject(agent))
 	r.prunedSizingTier.Delete(client.ObjectKeyFromObject(agent))
 	r.steppedBackAt.Delete(client.ObjectKeyFromObject(agent))
 	r.prunedNewerFieldsMu.Lock()
@@ -5655,6 +5950,16 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 		selectors = append(selectors, map[string]string{"app": a2aVerifierName(agent)})
 	}
 
+	// The bus's servers. On a multi-server bus the StatefulSet counts toward
+	// Ready once a quorum serves (a2aNATSServingReplicas), so a server stuck
+	// Pending under the hostname spread or failing its image pull can leave
+	// the CR Ready; updateStatusReady's message names it then
+	// (a2aNATSShortNote). While the CR is not Ready, this scan carries the
+	// pod's reason to the status.
+	if a2aStackRendering(agent) {
+		selectors = append(selectors, map[string]string{"app": a2aNATSName(agent)})
+	}
+
 	pods := make([]corev1.Pod, 0)
 	// A read that failed is not a selector that matched nothing, and since
 	// podReader goes to the API server it can fail for a reason outside this
@@ -5807,7 +6112,11 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 			if cond.Type == corev1.PodScheduled && cond.Status == corev1.ConditionFalse && cond.Reason == "Unschedulable" {
 				phase = degradedPhase
 				reason = "PodUnschedulable"
-				if requested := requestedRuntimeClasses(agent); len(requested) > 0 {
+				// The CR's RuntimeClass explains a pod that asked for one. A
+				// pod that did not (the bus's servers, held Pending by the
+				// hostname spread) is unschedulable for its own reason, which
+				// is the scheduler's message.
+				if requested := requestedRuntimeClasses(agent); len(requested) > 0 && pod.Spec.RuntimeClassName != nil && *pod.Spec.RuntimeClassName != "" {
 					// Plural only when the CR really does name two, which takes
 					// the agent pod and the sandbox having deliberately been
 					// given different runtimes. Every other install reads the
@@ -5841,11 +6150,9 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 // healthy agent Degraded on a claim this function could not check.
 //
 // The read goes through r.APIReader. Secrets are the one type the manager's cache does not
-// already hold, and a cached Get of an unwatched type starts a cluster-wide informer and
-// blocks in WaitForCacheSync until it syncs. On the RBAC this operator ships that LIST is
-// forbidden, so it never syncs: the call does not fail, it hangs, and with one reconcile
-// worker that is the whole controller stopped on an install that reports success. Reading
-// live also keeps every Secret in the cluster out of the operator's memory.
+// already hold, and a cached Get of an unwatched type starts a cluster-wide informer that
+// holds every Secret in the cluster in operator memory and blocks in WaitForCacheSync
+// wherever list/watch on secrets is trimmed from manager-role.
 func (r *PlatformAgentReconciler) checkShellSandboxKeys(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, string) {
 	reader := r.APIReader
 	if reader == nil {
@@ -5901,29 +6208,37 @@ func requestedRuntimeClasses(agent *agentv1alpha1.PlatformAgent) []string {
 	return names
 }
 
-// workloadRenderState says whether the reconcile pass parking the agent on
-// Degraded reached the render, and is the argument updateStatusDegraded takes
-// to decide whether it may touch the VolumesDropped condition. Named rather
-// than a bare bool because the answer is not obvious from the call site: the
-// refusals read top to bottom and only their position in Reconcile says which
-// side of reconcileWorkload they are on.
-type workloadRenderState bool
+// workloadRenderState says how far the reconcile pass parking the agent on
+// Degraded got, and is the argument updateStatusDegraded takes to decide
+// which conditions it may touch: VolumesDropped and ReplicasLimited only after
+// the render, CredentialProxyExecReady only after the credential broker's
+// reconcile. Named rather than a bare value because the answer is not obvious
+// from the call site: the refusals read top to bottom and only their position
+// in Reconcile says which side of reconcileCredentialProxy and
+// reconcileWorkload they are on.
+type workloadRenderState int
 
 const (
+	// brokerNotReconciled is the four refusals above reconcileCredentialProxy,
+	// which return with the broker and its exec tier untouched:
+	// ReservedServiceAccountName, ForbiddenVolumeMount,
+	// ShellSandboxCannotBeDisabled, RuntimeClassNotFound.
+	brokerNotReconciled workloadRenderState = iota
+	// workloadNotRendered is the refusal between the broker's reconcile and the
+	// render, which returns with the workload untouched:
+	// EgressAllowlistRefused.
+	workloadNotRendered
 	// workloadRendered is the three refusals below the render:
 	// ModeNotRecognized, A2AProvisionFailed, ShellSandboxKeysMissing.
-	workloadRendered workloadRenderState = true
-	// workloadNotRendered is the four above it, which return with the workload
-	// untouched: ForbiddenVolumeMount, ShellSandboxCannotBeDisabled,
-	// RuntimeClassNotFound, EgressAllowlistRefused.
-	workloadNotRendered workloadRenderState = false
+	workloadRendered
 )
 
 // degradedStatusCurrent reports whether the given PlatformAgent's status matches
 // what updateStatusDegraded would write. The comparison is keyed on phase, the Ready
 // condition's status, reason, message, and observedGeneration, plus the rendered-gated
-// VolumesDropped and ReplicasLimited conditions and the DataVolumeNotExpanded and
-// CredentialProxyExecReady conditions, which are not gated on the render.
+// VolumesDropped and ReplicasLimited conditions, the DataVolumeNotExpanded condition,
+// which is not gated, and the CredentialProxyExecReady condition, which execReady
+// leaves out (known false) on a pass that did not reconcile the broker.
 func degradedStatusCurrent(agent *agentv1alpha1.PlatformAgent, reason, message string, rendered workloadRenderState, hostPathDroppedMsg, replicasLimitedMsg, dataVolumeMsg string, dataVolumeKnown bool, execReady credentialProxyExecReadyRead) bool {
 	existing := meta.FindStatusCondition(agent.Status.Conditions, "Ready")
 	if existing == nil ||
@@ -5936,7 +6251,7 @@ func degradedStatusCurrent(agent *agentv1alpha1.PlatformAgent, reason, message s
 		!credentialProxyExecReadyCurrent(agent, execReady) {
 		return false
 	}
-	if !rendered {
+	if rendered != workloadRendered {
 		return true
 	}
 	return hostPathDroppedConditionCurrent(agent, hostPathDroppedMsg) &&
@@ -5968,9 +6283,10 @@ func degradedStatusCurrent(agent *agentv1alpha1.PlatformAgent, reason, message s
 // top-level field, for the reason updateStatusReady gives: a CRD that predates
 // status.observedGeneration prunes the top-level copy on every write.
 //
-// rendered says whether the caller got as far as reconcileWorkload, and gates
-// the VolumesDropped condition alone -- everything else here is written either
-// way. See workloadRenderState.
+// rendered says how far the caller got: past reconcileWorkload gates the
+// VolumesDropped and ReplicasLimited conditions, and past
+// reconcileCredentialProxy gates CredentialProxyExecReady. See
+// workloadRenderState.
 func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agent *agentv1alpha1.PlatformAgent, reason, message string, rendered workloadRenderState) error {
 	// VolumesDropped rides along on a pass that rendered, because the strip it
 	// reports happens at render and three of the refusals that land here
@@ -5989,7 +6305,7 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 	// same reason: a term no write can satisfy would make every requeue tick a
 	// status write (#1392).
 	hostPathDroppedMsg := ""
-	if rendered {
+	if rendered == workloadRendered {
 		// Qualified the same way updateStatusReady qualifies it. That function
 		// reads the roll off the gateway workload it fetches anyway; this one
 		// is handed the CR and the refusal and nothing else, so it reads the
@@ -6013,7 +6329,7 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 	// ReplicasLimited rides along on the same terms as VolumesDropped: the cap
 	// happens at render, so only a pass that rendered writes or clears it.
 	replicasLimitedMsg := ""
-	if rendered {
+	if rendered == workloadRendered {
 		replicasLimitedMsg = replicasLimitedMessage(agent)
 	}
 	// DataVolumeNotExpanded rides along on every park, rendered or not:
@@ -6022,11 +6338,16 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 	// pass's, which still describes the claims. An unknown state (no claim
 	// read by this process yet) leaves the condition as it stands.
 	dataVolumeMsg, dataVolumeKnown := r.dataVolumeExpansionMessage(agent)
-	// CredentialProxyExecReady on every park, rendered or not: the tier is
-	// applied before the egress allowlist refusal parks unrendered, and a park
-	// can last days (ShellSandboxKeysMissing). The read reports the tier as it
-	// stands in the cluster, so it is true on any pass.
-	execReady := r.readCredentialProxyExecReady(ctx, agent)
+	// CredentialProxyExecReady on every park that reconciled the broker,
+	// rendered or not: the tier is applied before the egress allowlist refusal
+	// parks unrendered, and a park can last days (ShellSandboxKeysMissing). A
+	// park above the broker's reconcile leaves it as it stands, on the
+	// VolumesDropped reasoning: the tier was neither applied nor removed, so a
+	// read would follow exec.replicas ahead of the cluster.
+	execReady := credentialProxyExecReadyRead{}
+	if rendered != brokerNotReconciled {
+		execReady = r.readCredentialProxyExecReady(ctx, agent)
+	}
 	if degradedStatusCurrent(agent, reason, message, rendered, hostPathDroppedMsg, replicasLimitedMsg, dataVolumeMsg, dataVolumeKnown, execReady) {
 		return nil
 	}
@@ -6053,7 +6374,7 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 		LastTransitionTime: now,
 	}
 	meta.SetStatusCondition(&agent.Status.Conditions, condition)
-	if rendered {
+	if rendered == workloadRendered {
 		setHostPathDroppedCondition(agent, hostPathDroppedMsg, now)
 		setReplicasLimitedCondition(agent, replicasLimitedMsg, now)
 	}

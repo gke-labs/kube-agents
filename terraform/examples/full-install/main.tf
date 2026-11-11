@@ -1,4 +1,11 @@
 locals {
+  # A zonal Standard cluster this composition creates: one node in its default
+  # pool (standard_node_count is per zone), too few for a three-server A2A bus.
+  # An adopted cluster's node count is not known here, so it keeps the
+  # operator's default, which holds a running bus at its count. A today install
+  # runs no bus and ignores the field, so the mode does not enter into it.
+  bus_single_server = var.create_cluster && var.cluster_mode == "standard" && can(regex("^[a-z]+-[a-z]+[0-9]+-[a-z]$", var.location))
+
   # iam, monitoring, and logging are here because Terraform must enable every
   # API its own resources call, where gcloud enables them implicitly.
   base_apis = [
@@ -753,6 +760,16 @@ module "github_minter" {
   service_account_id = var.github_minter_service_account_id
   kms_keyring_name   = var.github_minter_kms_keyring
   kms_key_name       = var.github_minter_kms_key
+  # The owning install, which lifecycle.sh's adoption step checks before it
+  # imports a key ring or key this state doesn't hold (#3504). None on a key
+  # this install shares on purpose: the labels stay its owner's. `labels` on
+  # the crypto key is non-authoritative (provider 5.x), so an empty map leaves
+  # the owner's labels where they are rather than removing them.
+  owner_labels = var.github_minter_shared_kms_key == "${var.github_minter_kms_keyring}/${var.github_minter_kms_key}" ? {} : {
+    "kube-agents-cluster"   = var.cluster_name
+    "kube-agents-namespace" = var.namespace
+  }
+  owner_description = "kube-agents GitHub token minter for install ${var.cluster_name}/${var.namespace}"
 
   # module.gke_cluster for the reason module.kube_agents_iam's depends_on
   # states in full: the module's workload_identity binding names the pool as
@@ -1025,6 +1042,14 @@ resource "helm_release" "kube_agents" {
           }
           rules = [for r in var.litellm_redaction.rules : { for k, v in r : k => v if v != null }]
         }
+      } : {},
+      # Only above zero, for the same reason: an install without a spend
+      # ceiling renders the gateway ConfigMap, and its checksum, as before.
+      var.litellm_budget.usd > 0 ? {
+        budget = {
+          usd    = var.litellm_budget.usd
+          period = var.litellm_budget.period
+        }
       } : {}
     )
     # merge(), so "today" adds no key and the values this composition hands the
@@ -1074,6 +1099,14 @@ resource "helm_release" "kube_agents" {
             subscription = module.drift_pubsub[0].subscription_name
             enabled      = var.enable_drift_detector ? true : null
           }
+        } : {},
+        # A one-server A2A bus where the cluster cannot hold three: the bus's
+        # three NATS servers each need their own node, and a zonal Standard
+        # cluster's default pool is one node, so the second server would wait
+        # Pending and the bus would never form. extra_helm_values can still
+        # set busReplicas (the second document deep-merges over this one).
+        local.bus_single_server ? {
+          tuning = { busReplicas = 1 }
         } : {}
       )
       deployment = merge(
@@ -1107,6 +1140,7 @@ resource "helm_release" "kube_agents" {
         serviceAccountAnnotations = {
           "iam.gke.io/gcp-service-account" = module.kube_agents_iam.service_account_email
         }
+        disallowSecretsRead = var.disallow_secrets_read
         # The mapping the credential broker selects from, one row per project
         # the module provisioned a member for. It has to reach the cluster as
         # data rather than being recomputed there: the broker refuses a

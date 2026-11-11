@@ -126,6 +126,175 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         )
         return _run_installer_bash(setup, full_env, cwd=cwd or _REPO_ROOT)
 
+    # apply_minter_name_defaults (#3504): a name the operator gave wins; the
+    # rest come from minter_name_defaults, stubbed here to known values.
+    _MINTER_STUB = "minter_name_defaults() { printf 'derived-ring|derived-key|derived-gsa\\n'; }"
+    _MINTER_SHOW = 'echo "ring=$PARAM_KMS_KEYRING key=$PARAM_KMS_KEY gsa=$GITHUB_MINTER_GSA_NAME"'
+
+    def _apply_minter_names(self, env=None):
+        return self._run_install_func(
+            f"{self._MINTER_STUB}; apply_minter_name_defaults test-project ka-today-1; {self._MINTER_SHOW}", env=env)
+
+    def test_a_new_install_naming_nothing_gets_the_per_install_names(self):
+        proc = self._apply_minter_names()
+        self.assertIn("ring=derived-ring key=derived-key gsa=derived-gsa", proc.stdout, proc.stderr)
+
+    def test_minter_names_the_operator_gave_are_kept(self):
+        """install.env or the environment naming them: never replaced, so an
+        install that recorded its names keeps them."""
+        proc = self._apply_minter_names(env={
+            "KMS_KEYRING": "github-token-minter-keyring",
+            "KMS_KEY": "github-token-minter-key",
+            "GITHUB_MINTER_GSA_NAME": "kubeagents-github-minter-gsa",
+        })
+        self.assertIn("ring=github-token-minter-keyring key=github-token-minter-key gsa=kubeagents-github-minter-gsa",
+                      proc.stdout, proc.stderr)
+
+    def test_a_partly_named_minter_keeps_what_was_named(self):
+        proc = self._apply_minter_names(env={"KMS_KEYRING": "my-ring"})
+        self.assertIn("ring=my-ring key=derived-key gsa=derived-gsa", proc.stdout, proc.stderr)
+
+    # confirm_minter_key_owner (#3504), with the state read and the owner read stubbed.
+    def _confirm_owner(self, owner, owner_rc=0, state_names="", env=None, answer=None):
+        script = (
+            f"tf_state_minter_names() {{ printf '{state_names}'; }}; "
+            f"minter_key_owner() {{ printf '%s' '{owner}'; return {owner_rc}; }}; "
+            + ("has_controlling_tty() { return 0; }; PARAM_NON_INTERACTIVE=false; "
+               f"prompt_read() {{ printf -v \"$2\" '%s' '{answer}'; }}; " if answer is not None else
+               "PARAM_NON_INTERACTIVE=true; ")
+            # In an `if`, as the call site's `|| exit 1` is: install.sh's ERR trap
+            # would otherwise abort the shell on the refusal's return 1.
+            + 'if confirm_minter_key_owner ring key us-central1 p cluster-b; then rc=0; else rc=1; fi; '
+            + 'echo "rc=$rc shared=${MINTER_SHARED_KEY:-} adopt=${MINTER_ADOPT_KEY:-}"'
+        )
+        return self._run_install_func(script, env=env)
+
+    def test_this_installs_own_key_needs_no_question(self):
+        proc = self._confirm_owner("cluster-b/kubeagents-system")
+        self.assertIn("rc=0 shared=", proc.stdout, proc.stderr)
+
+    def test_another_installs_key_is_refused_without_a_terminal(self):
+        proc = self._confirm_owner("cluster-a/kubeagents-system")
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("belongs to install cluster-a/kubeagents-system", proc.stdout + proc.stderr)
+
+    def test_an_unlabelled_key_is_refused_without_a_terminal(self):
+        proc = self._confirm_owner("")
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("carries no owner labels", proc.stdout + proc.stderr)
+
+    def test_a_yes_at_the_terminal_shares_exactly_that_key(self):
+        proc = self._confirm_owner("cluster-a/kubeagents-system", answer="y")
+        self.assertIn("rc=0 shared=ring/key", proc.stdout, proc.stderr)
+
+    def test_a_no_at_the_terminal_stops_the_install(self):
+        proc = self._confirm_owner("", answer="n")
+        self.assertIn("rc=1 shared=", proc.stdout, proc.stderr)
+
+    def test_a_key_already_in_this_state_needs_no_question(self):
+        proc = self._confirm_owner("cluster-a/kubeagents-system", state_names="ring|key|gsa")
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+
+    def test_an_unlabelled_key_named_explicitly_is_adopted_as_this_installs_own(self):
+        """Naming the key is a choice, not the silent default adoption: adopted, and labelled at the apply."""
+        proc = self._confirm_owner("", env={"KMS_KEYRING": "ring", "KMS_KEY": "key"})
+        self.assertIn("rc=0 shared= adopt=ring/key", proc.stdout, proc.stderr)
+
+    def test_labels_win_over_an_explicit_name(self):
+        proc = self._confirm_owner("cluster-a/kubeagents-system", env={"KMS_KEYRING": "ring", "KMS_KEY": "key"})
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertNotIn("adopt=ring/key", proc.stdout)
+
+    def test_half_a_name_is_not_an_explicit_choice(self):
+        proc = self._confirm_owner("", env={"KMS_KEYRING": "ring"})
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+
+    def test_an_environment_rebuild_adopts_its_own_unlabelled_key(self):
+        """rc and nightly: uninstall, then install.sh -y with the names in the environment.
+
+        provision_environment.sh exports the project-wide names it gets from
+        minter_environment_names.sh. The state holds no minter after the
+        uninstall, and the key has no labels from before them; named explicitly
+        in the environment, it is adopted.
+        """
+        proc = self._run_install_func(
+            "tf_state_minter_names() { printf '||'; }; "
+            "minter_key_owner() { return 0; }; PARAM_NON_INTERACTIVE=true; "
+            'if confirm_minter_key_owner "$KMS_KEYRING" "$KMS_KEY" us-central1 p cluster-b; then rc=0; else rc=1; fi; '
+            'echo "rc=$rc adopt=${MINTER_ADOPT_KEY:-}"',
+            env={"KMS_KEYRING": "github-token-minter-keyring", "KMS_KEY": "github-token-minter-key",
+                 "GITHUB_APP_ID": "12345"})
+        self.assertIn("rc=0 adopt=github-token-minter-keyring/github-token-minter-key", proc.stdout, proc.stderr)
+
+    def _minter_names_given(self, file_text, env=None):
+        install_env = self._empty_install_env.parent / "minter-given.env"
+        install_env.write_text(file_text)
+        return self._run_install_func(
+            'echo "ring_given=$PARAM_KMS_KEYRING_GIVEN key_given=$PARAM_KMS_KEY_GIVEN"',
+            env={"KUBE_AGENTS_INSTALL_ENV": str(install_env), **(env or {})})
+
+    def test_an_old_install_env_s_default_names_are_not_an_explicit_choice(self):
+        """Written before per-install names, with no minter: turning one on must not adopt the shared default key."""
+        proc = self._minter_names_given(
+            "PROJECT_ID=p\nKMS_KEYRING=github-token-minter-keyring\nKMS_KEY=github-token-minter-key\n")
+        self.assertIn("ring_given=false key_given=false", proc.stdout, proc.stderr)
+
+    def test_with_no_defaults_file_a_recorded_name_waits_for_them(self):
+        """A first curl | bash run has no install.defaults.env yet: a name the file records fails closed, not open."""
+        script = ('minter_name_given my-ring "" true && echo given || echo not-given; '
+                  'minter_name_given github-token-minter-keyring "" true && echo given || echo not-given; '
+                  'minter_name_given my-ring "" false && echo given || echo not-given')
+        proc = self._run_install_func(script)
+        self.assertEqual(proc.stdout.split()[-3:], ["not-given", "not-given", "given"], proc.stderr)
+
+    def test_names_the_file_records_are_settled_once_the_defaults_load(self):
+        """curl | bash from outside the checkout: no defaults at source time, so the first reading failed closed."""
+        script = ('PARAM_KMS_KEYRING=my-ring PARAM_KMS_KEY=my-key PARAM_KMS_KEYRING_GIVEN=false PARAM_KMS_KEY_GIVEN=false '
+                  'INSTALL_ENV_RECORDS_KMS_KEYRING=true INSTALL_ENV_RECORDS_KMS_KEY=true INSTALL_ENV_RECORDS_GITHUB_APP=false; '
+                  'settle_minter_names_given; '
+                  'echo "ring_given=$PARAM_KMS_KEYRING_GIVEN key_given=$PARAM_KMS_KEY_GIVEN"; '
+                  'PARAM_KMS_KEYRING=github-token-minter-keyring PARAM_KMS_KEYRING_GIVEN=false; '
+                  'settle_minter_names_given; echo "default_given=$PARAM_KMS_KEYRING_GIVEN"')
+        proc = self._run_install_func(script)
+        self.assertIn("ring_given=true key_given=true", proc.stdout, proc.stderr)
+        # The old project-wide default from the file still isn't a choice.
+        self.assertIn("default_given=false", proc.stdout, proc.stderr)
+        # And resolve_shared_defaults settles them before it fills the defaults in.
+        text = _INSTALL_SH.read_text()
+        body = text[text.index("resolve_shared_defaults() {"):]
+        self.assertLess(body.index("settle_minter_names_given"),
+                        body.index('PARAM_KMS_KEYRING="${PARAM_KMS_KEYRING:-$DEFAULT_KMS_KEYRING}"'))
+
+    def test_a_recorded_app_does_not_make_the_file_s_default_names_a_choice(self):
+        """An older install turning the minter on by adding GITHUB_APP_ID to its install.env by hand."""
+        proc = self._minter_names_given(
+            "GITHUB_APP_ID=12345\nKMS_KEYRING=github-token-minter-keyring\nKMS_KEY=github-token-minter-key\n")
+        self.assertIn("ring_given=false key_given=false", proc.stdout, proc.stderr)
+
+    def test_names_of_its_own_or_from_the_environment_are_explicit(self):
+        proc = self._minter_names_given("KMS_KEYRING=my-ring\nKMS_KEY=my-key\n")
+        self.assertIn("ring_given=true key_given=true", proc.stdout, proc.stderr)
+        # An environment rebuild names the defaults in the environment, not the file.
+        proc = self._minter_names_given(
+            "PROJECT_ID=p\n", env={"KMS_KEYRING": "github-token-minter-keyring", "KMS_KEY": "github-token-minter-key"})
+        self.assertIn("ring_given=true key_given=true", proc.stdout, proc.stderr)
+
+    def test_both_interview_arms_check_the_key_owner(self):
+        """A -y run takes the non-interactive arm, which must refuse another install's key too."""
+        text = _INSTALL_SH.read_text()
+        start = text.index('validate_non_interactive_minter_config "$github_app_id"')
+        arm = text[start:text.index("# 9. Agent Permissions", start)]
+        self.assertIn("confirm_minter_key_owner ", arm)
+        self.assertEqual(text.count("confirm_minter_key_owner \"$kms_keyring\" \"$kms_key\""), 2)
+
+    def test_a_key_already_named_as_shared_needs_no_question(self):
+        proc = self._confirm_owner("cluster-a/kubeagents-system", env={"MINTER_SHARED_KEY": "ring/key"})
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+
+    def test_an_absent_or_undescribable_key_is_left_to_the_apply(self):
+        proc = self._confirm_owner("", owner_rc=1)
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+
     def test_validate_immutable_ref_accepts_valid_refs(self):
         for ref in VALID_IMMUTABLE_REFS:
             with self.subTest(ref=ref):
@@ -1223,7 +1392,7 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
             "MENU=(" + " ".join(quote(a) for a in menu_answers) + ")\nMENU_AT=0\n"
             'prompt_menu() { local v="${!#}"; echo "MENU: $*"; printf -v "$v" "%s" "${MENU[$MENU_AT]}"; MENU_AT=$((MENU_AT + 1)); }\n'
             "READ=(" + " ".join(quote(a) for a in read_answers) + ")\nREAD_AT=0\n"
-            'prompt_read() { echo "PROMPT: $1 default=[${3:-}]"; printf -v "$2" "%s" "${READ[$READ_AT]}"; READ_AT=$((READ_AT + 1)); }\n'
+            'prompt_read() { echo "PROMPT: $1 default=[${3:-}]"; local val="${READ[$READ_AT]}"; if [ -z "$val" ] && [ -n "${3:-}" ]; then val="$3"; fi; printf -v "$2" "%s" "$val"; READ_AT=$((READ_AT + 1)); }\n'
             + preset
             + "ask_gitops_forge\n"
             'echo "DECLINED=$GITOPS_INTERVIEW_DECLINED FORGE=$PARAM_GITOPS_FORGE HOST=[${PARAM_GITOPS_HOST:-}] CA=[${PARAM_GITOPS_CA_FILE:-}] MENUS=$MENU_AT READS=$READ_AT SECRET=[${PARAM_GITOPS_CA_SECRET:-}]"\n'
@@ -1264,14 +1433,60 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
                     proc = self._ask_gitops_forge(menus, reads)
                     self.assertEqual(proc.returncode, 0, proc.stderr)
                     self.assertIn(expected, proc.stdout, proc.stdout + proc.stderr)
-            # After a refusal the hostname prompt has no default: prompt_read
-            # substitutes a default for an empty answer, so a refused host
-            # offered again would make enter resubmit it rather than return
-            # to the menu, which INSTALL.md says an empty hostname does.
+            # After a refusal the hostname and CA prompts have no default: prompt_read
+            # substitutes a default for an empty answer, so a refused host or
+            # CA file offered again would make enter resubmit it.
             proc = self._ask_gitops_forge(["2", "2"], ["https://ghe.example.com", "", "ghe.example.com", ""])
             host_prompt = "PROMPT: GitHub Enterprise Server hostname (for example github.example.com) default=["
             self.assertEqual(proc.stdout.count(host_prompt + "]"), 2, proc.stdout)
             self.assertNotIn(host_prompt + "https://ghe.example.com]", proc.stdout)
+            # With an exported CA file, a refused host resets ghes_ca_file="" so
+            # the second attempt does not offer the CA file again as default. An
+            # empty answer on the second attempt clears the derived Secret name.
+            ca_refusal_preset = (
+                f'PARAM_GITOPS_HOST="ghe.example.com"\nPARAM_GITOPS_CA_FILE="{ca}"\n'
+                'PARAM_GITOPS_CA_SECRET="github-forge-ca"\n'
+            )
+            proc = self._ask_gitops_forge(
+                ["2", "2"],
+                ["https://ghe.example.com", "", "ghe.example.com", ""],
+                preset=ca_refusal_preset,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            ca_first_prompt = f"PROMPT: PEM CA file that signed the instance's certificate (empty keeps the file; a path replaces it) default=[{ca}]"
+            ca_second_prompt = "PROMPT: PEM CA file that signed the instance's certificate (empty if a public CA signed it) default=[]"
+            self.assertIn(ca_first_prompt, proc.stdout)
+            self.assertIn(ca_second_prompt, proc.stdout)
+            self.assertIn("DECLINED=false FORGE=github HOST=[ghe.example.com] CA=[] MENUS=2 READS=4 SECRET=[]", proc.stdout)
+            # An operator-named Secret exported alongside a CA file is restored
+            # if a subsequent attempt clears the default and is refused again.
+            operator_ca_preset = (
+                f'PARAM_GITOPS_HOST="ghe.example.com"\nPARAM_GITOPS_CA_FILE="{ca}"\n'
+                'PARAM_GITOPS_CA_SECRET="my-ca"\n'
+            )
+            proc = self._ask_gitops_forge(
+                ["2", "2", "2"],
+                ["https://ghe.example.com", "", "https://ghe.example.com", "", "ghe.example.com", str(ca)],
+                preset=operator_ca_preset,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn(
+                f"DECLINED=false FORGE=github HOST=[ghe.example.com] CA=[{ca}] MENUS=3 READS=6 SECRET=[my-ca]",
+                proc.stdout,
+                proc.stdout + proc.stderr,
+            )
+            # Typing a github.com spelling at option 2 drops an exported CA file and Secret name
+            # without prompting for a CA file (since github.com uses public CAs).
+            for g_host in ("github.com", "www.github.com", "ssh.github.com"):
+                with self.subTest(g_host):
+                    proc = self._ask_gitops_forge(
+                        ["2"],
+                        [g_host],
+                        preset=ca_refusal_preset,
+                    )
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertIn("DECLINED=false FORGE=github HOST=[] CA=[] MENUS=1 READS=1 SECRET=[]", proc.stdout)
+                    self.assertNotIn("PEM CA file", proc.stdout)
             # On a first install with GITOPS_HOST exported and --gitops-ca-file
             # given, the early flag check derives the CA Secret's name before
             # the menu. No repository drops the name with the file: nothing
@@ -1319,6 +1534,59 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
         self.assertIn("PROMPT: PEM CA file that signed the instance's certificate", proc.stdout)
         self.assertIn("Create the GitHub App on ghe.example.com, not on github.com", proc.stdout)
         self.assertIn("DECLINED=false FORGE=github HOST=[ghe.example.com] CA=[] MENUS=1 READS=2", proc.stdout)
+
+    def test_an_exported_ca_file_is_offered_as_option_2_default(self):
+        """On a first install with GITOPS_HOST and GITOPS_CA_FILE exported,
+        option 2 offers both as their prompt defaults and keeps the derived
+        CA Secret name. Before, option 2 cleared the CA file and skipped the
+        CA prompt because it read the derived name as a recorded Secret name,
+        leaving a host, no CA file, and an unfulfilled Secret name (#4018)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            ca = pathlib.Path(tmp) / "ca.pem"
+            ca.write_text("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n")
+            preset = (
+                f'PARAM_GITOPS_HOST="ghe.example.com"\nPARAM_GITOPS_CA_FILE="{ca}"\n'
+                'PARAM_GITOPS_CA_SECRET="github-forge-ca"\n'
+            )
+            # Enter at both prompts keeps the exported host and CA file defaults.
+            proc = self._ask_gitops_forge(["2"], ["", ""], preset=preset)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn(
+                f"PROMPT: PEM CA file that signed the instance's certificate (empty keeps the file; a path replaces it) default=[{ca}]",
+                proc.stdout,
+            )
+            self.assertIn(
+                f"DECLINED=false FORGE=github HOST=[ghe.example.com] CA=[{ca}] MENUS=1 READS=2 SECRET=[github-forge-ca]",
+                proc.stdout,
+                proc.stdout + proc.stderr,
+            )
+            # When only GITOPS_HOST is exported (no CA file), the CA prompt has an
+            # empty default and "(empty if a public CA signed it)". Enter leaves CA and Secret empty.
+            host_only_preset = 'PARAM_GITOPS_HOST="ghe.example.com"\n'
+            proc = self._ask_gitops_forge(["2"], ["", ""], preset=host_only_preset)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn(
+                "PROMPT: PEM CA file that signed the instance's certificate (empty if a public CA signed it) default=[]",
+                proc.stdout,
+            )
+            self.assertIn(
+                "DECLINED=false FORGE=github HOST=[ghe.example.com] CA=[] MENUS=1 READS=2 SECRET=[]",
+                proc.stdout,
+                proc.stdout + proc.stderr,
+            )
+            # An operator-named Secret exported with no CA file is preserved on Enter.
+            operator_secret_preset = 'PARAM_GITOPS_HOST="ghe.example.com"\nPARAM_GITOPS_CA_SECRET="operator-ca-secret"\n'
+            proc = self._ask_gitops_forge(["2"], ["", ""], preset=operator_secret_preset)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn(
+                "PROMPT: PEM CA file that signed the instance's certificate (empty keeps Secret 'operator-ca-secret'; a path replaces it) default=[]",
+                proc.stdout,
+            )
+            self.assertIn(
+                "DECLINED=false FORGE=github HOST=[ghe.example.com] CA=[] MENUS=1 READS=2 SECRET=[operator-ca-secret]",
+                proc.stdout,
+                proc.stdout + proc.stderr,
+            )
 
     def test_a_declined_forge_menu_skips_the_repository_menu_in_main(self):
         """main's step 8 does not ask the repository menu over an answer the
@@ -1504,6 +1772,14 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
         proc4 = self._run_install_func(cmd4)
         self.assertEqual(proc4.returncode, 1, proc4.stderr)
         self.assertIn("provided in non-interactive mode, but no ENABLED KMS key exists", proc4.stdout + proc4.stderr)
+        # Names this run didn't give: maybe an earlier run's default names, which
+        # install.env doesn't keep as a choice (#3504). Named by flag, no such hint.
+        self.assertIn("pass both again", proc4.stdout + proc4.stderr)
+        proc4g = self._run_install_func(
+            f'{_SOURCE_INSTALLER_COMMON}kms_key_enabled_version() {{ echo ""; }}; '
+            'PARAM_KMS_KEYRING_GIVEN=true PARAM_KMS_KEY_GIVEN=true; '
+            'validate_non_interactive_minter_config "12345" "" "ring" "key" "us-central1" "p1" "my-org"')
+        self.assertNotIn("pass both again", proc4g.stdout + proc4g.stderr)
 
         # 4b. The same, but the key's versions are scheduled for destruction -> the
         # restore is named instead of the import, and the run still stops.
@@ -2877,6 +3153,8 @@ print_generate_only_handoff "/tmp/test-repo" "test-proj" "test-cluster" "us-cent
         self.assertIn("GitHub App PEM Import (before apply, when GitOps minter is enabled):", out)
         self.assertIn("gcloud kms keyrings create github-token-minter-keyring --location=us-central1 --project=test-proj", out)
         self.assertIn("gcloud kms keys create github-token-minter-key --keyring=github-token-minter-keyring", out)
+        # Labelled for this install, or the handoff's lifecycle.sh apply refuses to adopt it (#3504).
+        self.assertIn("--labels=kube-agents-cluster=test-cluster,kube-agents-namespace=kubeagents-system", out)
         self.assertIn("--purpose=asymmetric-signing", out)
         self.assertIn("--import-only --skip-initial-version-creation", out)
         self.assertIn("git clone --depth 1 --branch v2.7.1 https://github.com/abcxyz/github-token-minter.git /tmp/minty", out)
@@ -5172,7 +5450,8 @@ class ImportGithubPemKmsKeyTest(unittest.TestCase):
     """
 
     def _run(self, creates_fail=False, describe_fails=True, go_version=None, git_clone_fails=False,
-             keyrings_fail_first=0, keys_fail_first=0, keys_describe_fail_first=0, fail_msg=None, env_overrides=None):
+             keyrings_fail_first=0, keys_fail_first=0, keys_describe_fail_first=0, fail_msg=None, env_overrides=None,
+             cluster=""):
         """import_github_pem against a stub gcloud that records every call.
 
         By default the stub reports no ENABLED key version, so the import is
@@ -5274,7 +5553,7 @@ class ImportGithubPemKmsKeyTest(unittest.TestCase):
                 f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
                 f'source "{_INSTALLER_COMMON}"\n'
                 "GITOPS_ORG=an-org GITOPS_REPO=a-repo GITHUB_APP_ID=12345 "
-                f'GITHUB_PEM_PATH="{pem}" import_github_pem a-project us-central1-a\n'
+                f'GITHUB_PEM_PATH="{pem}" import_github_pem a-project us-central1-a {cluster}\n'
             )
             merged_env = {"KMS_API_PROPAGATION_WAIT_SECONDS": "0"}
             if env_overrides:
@@ -5293,6 +5572,14 @@ class ImportGithubPemKmsKeyTest(unittest.TestCase):
             )
             calls = log.read_text().splitlines() if log.exists() else []
             return proc, calls
+
+    def test_the_key_is_created_with_this_installs_owner_labels(self):
+        """The apply's adoption step refuses an unlabelled key it doesn't hold (#3504)."""
+        proc, calls = self._run(cluster="ka-today-1")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        creates = [c for c in calls if "kms keys create" in c]
+        self.assertEqual(len(creates), 1, calls)
+        self.assertIn("--labels=kube-agents-cluster=ka-today-1,kube-agents-namespace=kubeagents-system", creates[0])
 
     def test_the_import_only_key_is_created_skipping_the_initial_version(self):
         proc, calls = self._run()
@@ -5558,7 +5845,7 @@ class ImportGithubPemKmsKeyTest(unittest.TestCase):
         """
         body = _INSTALL_SH.read_text()
         self.assertIn(
-            'import_github_pem "$project_id" "$region" || exit 1',
+            'import_github_pem "$project_id" "$region" "$cluster_name" || exit 1',
             body,
             "a failed PEM import must stop the run before terraform apply",
         )
@@ -6476,6 +6763,41 @@ class AlertDailyLimitsRecordedInInstallEnvTest(unittest.TestCase):
         self.assertRegex(text, re.compile(r"^ALERT_DAILY_LIMIT_WARNING=''$", re.MULTILINE))
 
 
+class LitellmBudgetPersistsThroughInstallEnvTest(unittest.TestCase):
+    """The same walk for LITELLM_BUDGET_USD and LITELLM_BUDGET_PERIOD, which
+    have no flag: the first run records what the environment exported, the
+    next run's environment reads it back for the tfvars generator, and an
+    unset pair is recorded empty, which the generator turns into the defaults
+    (0, no ceiling; 1d)."""
+
+    _bootstrap_with_export = ModelMaxTokensPersistsThroughInstallEnvTest._bootstrap_with_export
+    _read_back = ModelMaxTokensPersistsThroughInstallEnvTest._read_back
+
+    @staticmethod
+    def _env(overrides):
+        # Both keys are in SEEDED_INSTALLER_ENV_KEYS, so a developer's own
+        # exported value never stands in for the file.
+        return get_isolated_test_env(overrides=overrides)
+
+    def test_the_first_run_records_the_export_and_the_next_run_reads_it_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = self._bootstrap_with_export(tmp, 'export LITELLM_BUDGET_USD="2.50" LITELLM_BUDGET_PERIOD="7d"')
+            text = dest.read_text()
+            self.assertIn("LITELLM_BUDGET_USD=2.50\n", text)
+            self.assertIn("LITELLM_BUDGET_PERIOD=7d\n", text)
+            out = self._read_back(dest, "bash -c 'echo \"USD=[$LITELLM_BUDGET_USD] PERIOD=[$LITELLM_BUDGET_PERIOD]\"'")
+            self.assertIn("USD=[2.50] PERIOD=[7d]", out)
+
+    def test_an_unset_pair_is_recorded_empty_and_reads_back_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = self._bootstrap_with_export(tmp, ":")
+            text = dest.read_text()
+            self.assertIn("LITELLM_BUDGET_USD=''\n", text)
+            self.assertIn("LITELLM_BUDGET_PERIOD=''\n", text)
+            out = self._read_back(dest, "bash -c 'echo \"USD=[$LITELLM_BUDGET_USD] PERIOD=[$LITELLM_BUDGET_PERIOD]\"'")
+            self.assertIn("USD=[] PERIOD=[]", out)
+
+
 class LitellmRedactionPersistsThroughInstallEnvTest(unittest.TestCase):
     """The same walk for the LITELLM_REDACTION_* keys: the first run records
     what main() exported, the next run's parameter block and environment read
@@ -7134,7 +7456,7 @@ class PlatformAgentModeTest(unittest.TestCase):
             'ensure_existing_cluster_network_policy "$project_id"',
             'ensure_existing_cluster_workload_identity "$project_id"',
             'ensure_existing_cluster_cmek "$project_id"',
-            'import_github_pem "$project_id" "$region" || exit 1',
+            'import_github_pem "$project_id" "$region" "$cluster_name" || exit 1',
             'minter_enabled_version="$(kms_key_enabled_version',
             "or unset GITHUB_APP_ID to install without the minter.\"\n    exit 1\n",
             'clear_failed_initial_helm_release "$KUBE_AGENTS_HELM_RELEASE"',
@@ -7688,7 +8010,7 @@ class PlatformAgentModeTest(unittest.TestCase):
         warning = text.index('if [ "$platform_agent_mode" = "next" ] && [ -n "$third_party_registry_prefix" ]; then', main_start)
         self.assertLess(text.index('local third_party_registry_prefix=', main_start), warning)
         self.assertLess(exported, warning)
-        self.assertIn("A2A_NATS_IMAGE and A2A_PROVISION_IMAGE", text[warning : warning + 900])
+        self.assertIn("A2A_NATS_IMAGE, A2A_PROVISION_IMAGE and A2A_NATS_RELOADER_IMAGE", text[warning : warning + 900])
 
     def test_a_bad_value_from_the_shell_on_a_first_install_names_the_shell(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -9809,7 +10131,7 @@ class ChatFlagsAgreeWithInstallEnvTest(unittest.TestCase):
         )
         step_12 = text.index('print_step "12. Applying the Install', main_start)
         for gate in (
-            'import_github_pem "$project_id" "$region" || exit 1',
+            'import_github_pem "$project_id" "$region" "$cluster_name" || exit 1',
             'clear_failed_initial_helm_release "$KUBE_AGENTS_HELM_RELEASE"',
             'apply_crd_upgrades "$repo_dir"',
         ):
@@ -11191,6 +11513,7 @@ class DomainScopedFlagsTest(unittest.TestCase):
         "--enable-hermes-dashboard": "PARAM_ENABLE_WEBUI",
         "--enable-web-console": "PARAM_ENABLE_WEB_CONSOLE",
         "--enable-gke-backup-plan": "PARAM_ENABLE_GKE_BACKUP_PLAN",
+        "--disallow-secrets-read": "PARAM_DISALLOW_SECRETS_READ",
         "--enable-pubsub-platform": "PARAM_ENABLE_PUBSUB_PLATFORM",
         "--enable-stockout-investigator": "PARAM_ENABLE_STOCKOUT_INVESTIGATOR",
         "--enable-drift-detector": "PARAM_ENABLE_DRIFT_DETECTOR",
@@ -12961,6 +13284,7 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
         "--enable-google-chat",
         "--enable-slack",
         "--enable-gke-backup-plan",
+        "--disallow-secrets-read",
         "--enable-pubsub-platform",
         "--enable-stockout-investigator",
         "--enable-drift-detector",
@@ -13017,6 +13341,7 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
         "--enable-google-chat": "GOOGLE_CHAT_ENABLED",
         "--enable-slack": "SLACK_ENABLED",
         "--enable-gke-backup-plan": "ENABLE_GKE_BACKUP_PLAN",
+        "--disallow-secrets-read": "DISALLOW_SECRETS_READ",
         "--enable-pubsub-platform": "ENABLE_PUBSUB_PLATFORM",
         "--enable-stockout-investigator": "ENABLE_STOCKOUT_INVESTIGATOR",
         "--enable-drift-detector": "ENABLE_DRIFT_DETECTOR",
@@ -13080,6 +13405,7 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
             "PARAM_ENABLE_GOOGLE_CHAT",
             "PARAM_ENABLE_SLACK",
             "PARAM_ENABLE_GKE_BACKUP_PLAN",
+            "PARAM_DISALLOW_SECRETS_READ",
             "PARAM_ENABLE_PUBSUB_PLATFORM",
             "PARAM_ENABLE_STOCKOUT_INVESTIGATOR",
             "PARAM_ENABLE_DRIFT_DETECTOR",

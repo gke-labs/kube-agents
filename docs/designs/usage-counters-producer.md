@@ -12,7 +12,7 @@ event or tool call. All of those now have an in-cluster source, the watcher's pe
 serves `kubeagents_tool_invocations_total`, `kubeagents_vcs_requests_total` and
 `kubeagents_broker_execution_failures_total` on its metrics-only listener, and the event watcher serves `k8s_event_watcher_events_injected_total` and `k8s_event_watcher_triage_sessions_total` on the gateway
 pod's `agent-api-auth` sidecar, and the `chat_metrics` plugin serves
-`kubeagents_chat_messages_inbound_total`, `kubeagents_chat_sessions_total`, `kubeagents_chat_turns_errored_total`, `kubeagents_kanban_tasks_gave_up_total`, `kubeagents_chat_feedback_negative_total` and the `kubeagents_proposals_opened` gauge with its `kubeagents_proposals_opened_read_age_seconds` on the `platform-agent` container, all for the
+`kubeagents_chat_messages_inbound_total`, `kubeagents_chat_sessions_total`, `kubeagents_chat_turns_errored_total`, `kubeagents_kanban_tasks_gave_up_total`, `kubeagents_chat_feedback_negative_total`, the `kubeagents_kanban_dispatcher_failed_ticks` and `kubeagents_kanban_dispatcher_failing_seconds` gauges and the `kubeagents_proposals_opened` gauge with its `kubeagents_proposals_opened_read_age_seconds` on the `platform-agent` container, all for the
 managed-Prometheus collector. The poller reads the `kubeagents_proposals_opened` gauge into the nine
 `proposalsFrom<Origin>` readings and gates them on its read age, which
 [`proposal-origin.md`](proposal-origin.md) owns (§2.3 there).

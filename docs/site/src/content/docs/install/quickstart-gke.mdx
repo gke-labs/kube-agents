@@ -208,7 +208,7 @@ A first install runs `spec.mode: next` unless you pass `--mode=today`, or mirror
 
    | Pod                                     | How many                      | Expected state                                                                                                                                                         |
    | --------------------------------------- | ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-   | `platform-agent-a2a-nats-0`             | 1                             | `Running`                                                                                                                                                              |
+   | `platform-agent-a2a-nats-0`, `-1`, `-2` | 3; 1 with `busReplicas: 1`    | `Running`                                                                                                                                                              |
    | `platform-agent-a2a-callout-…`          | 2                             | `Running`                                                                                                                                                              |
    | `platform-agent-a2a-verifier-…`         | 2                             | `Running`                                                                                                                                                              |
    | `platform-agent-a2a-console-…`          | 1                             | `Running`                                                                                                                                                              |
@@ -281,10 +281,10 @@ Run the installer with `--help` (e.g. `./install.sh --help`) for the full list.
 
 ### Operator settings
 
-Some operator behaviour is set by environment variables on the operator's controller manager, such as `A2A_NATS_IMAGE` and `A2A_PROVISION_IMAGE`, the images a mirrored `spec.mode: next` install points at its own registry. `install.sh` has no flag for them. Set them in the chart's `operator.extraEnv` list, which is appended after the variables the chart renders and so wins over them. On an install made with `install.sh`, put the list in a `TF_VAR_extra_helm_values` line in `install.env`, which every later `install.sh` and `upgrade.sh` run reads:
+Some operator behaviour is set by environment variables on the operator's controller manager, such as `A2A_NATS_IMAGE`, `A2A_PROVISION_IMAGE` and `A2A_NATS_RELOADER_IMAGE`, the images a mirrored `spec.mode: next` install points at its own registry. `install.sh` has no flag for them. Set them in the chart's `operator.extraEnv` list, which is appended after the variables the chart renders and so wins over them. On an install made with `install.sh`, put the list in a `TF_VAR_extra_helm_values` line in `install.env`, which every later `install.sh` and `upgrade.sh` run reads:
 
 ```bash
-TF_VAR_extra_helm_values='{operator={extraEnv=[{name="A2A_NATS_IMAGE",value="<REGISTRY>/nats:<TAG>"},{name="A2A_PROVISION_IMAGE",value="<REGISTRY>/nats-box:<TAG>"}]}}'
+TF_VAR_extra_helm_values='{operator={extraEnv=[{name="A2A_NATS_IMAGE",value="<REGISTRY>/nats:<TAG>"},{name="A2A_PROVISION_IMAGE",value="<REGISTRY>/nats-box:<TAG>"},{name="A2A_NATS_RELOADER_IMAGE",value="<REGISTRY>/nats-server-config-reloader:<TAG>"}]}}'
 ```
 
 The value is an HCL object that Helm merges over the chart values the composition computes, so the same line can carry other chart keys; there is one such line, so put every extra value in it. Do not edit `terraform/examples/full-install/terraform.tfvars` for this: the installer regenerates that file on every run. Check it took after the next run:

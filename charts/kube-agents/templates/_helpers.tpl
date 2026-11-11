@@ -209,6 +209,12 @@ keeps the container's env free of a duplicate name. `| default dict` because
 - name: A2A_MCP_DOOR
   value: "true"
 {{- end -}}
+{{- with (.Values.operator.slackTestUsers | default list) }}
+{{- if not (hasKey $named "A2A_SLACK_TEST_USERS") }}
+- name: A2A_SLACK_TEST_USERS
+  value: {{ join "," . | quote }}
+{{- end -}}
+{{- end -}}
 {{- end }}
 
 {{/*
@@ -238,6 +244,74 @@ true
 {{- end -}}
 {{- else if $explicit -}}
 true
+{{- end -}}
+{{- end }}
+
+{{/*
+hindsight.api.networkPolicy.additionalEgress as NetworkPolicyEgressRule items,
+one YAML list. The values take the shape of spec.networkPolicy.additionalEgress
+on the PlatformAgent CR -- to[].cidr with an optional to[].except, and
+ports[].protocol / ports[].port -- so an install that already names a peer for
+the agent's gateway policy writes the same thing here. Peers are CIDR blocks
+only, as the CR's are, and values.schema.json bounds them the way the CRD
+does. The schema admits what the CRD admits, so each peer also goes through
+openaiCompatibleCIDRRefusal, the check the gateway's egressCIDRs take (the
+operator's own check on those upstream CIDRs): a malformed address, an
+IPv4-mapped IPv6 block, a peer in a link-local range or inside fd20:ce::/48
+fails the render rather than rendering as the whole internet or a path to
+the metadata server. A bare address, as a peer or an except, is written out
+as a /32 or /128, as the operator canonicalises one on the CR; the
+NetworkPolicy API rejects an ipBlock without a prefix. An except is widened
+but not checked: one outside its peer is rejected by the API server, as the
+values comment says. A rule without ports opens every port to its peers,
+which is the NetworkPolicy API's own reading of it.
+*/}}
+{{- define "kube-agents.hindsightAdditionalEgress" -}}
+{{- $rules := list -}}
+{{- range . -}}
+{{- $peers := list -}}
+{{- range .to -}}
+{{- $cidr := include "kube-agents.cidrWithHostPrefix" .cidr -}}
+{{- with include "kube-agents.openaiCompatibleCIDRRefusal" $cidr -}}
+{{- fail (printf "hindsight.api.networkPolicy.additionalEgress peer %q %s." $cidr .) -}}
+{{- end -}}
+{{- $block := dict "cidr" $cidr -}}
+{{- $excepts := list -}}
+{{- range .except -}}
+{{- $excepts = append $excepts (include "kube-agents.cidrWithHostPrefix" .) -}}
+{{- end -}}
+{{- with $excepts -}}
+{{- $_ := set $block "except" . -}}
+{{- end -}}
+{{- $peers = append $peers (dict "ipBlock" $block) -}}
+{{- end -}}
+{{- $rule := dict "to" $peers -}}
+{{- with .ports -}}
+{{- $ports := list -}}
+{{- range . -}}
+{{- $ports = append $ports (dict "port" .port "protocol" .protocol) -}}
+{{- end -}}
+{{- $_ := set $rule "ports" $ports -}}
+{{- end -}}
+{{- $rules = append $rules $rule -}}
+{{- end -}}
+{{- toYaml $rules -}}
+{{- end }}
+
+{{/*
+A CIDR as written, or a bare address with its host prefix appended: /32 for
+IPv4, /128 for IPv6. The NetworkPolicy API rejects an ipBlock without a
+prefix, and the operator canonicalises a bare address on the CR the same way.
+Takes the value; returns the string, trimmed.
+*/}}
+{{- define "kube-agents.cidrWithHostPrefix" -}}
+{{- $ipv4HostPrefix := 32 -}}
+{{- $ipv6HostPrefix := 128 -}}
+{{- $cidr := toString . | trim -}}
+{{- if contains "/" $cidr -}}
+{{- $cidr -}}
+{{- else -}}
+{{- printf "%s/%d" $cidr (ternary $ipv6HostPrefix $ipv4HostPrefix (contains ":" $cidr)) -}}
 {{- end -}}
 {{- end }}
 
@@ -957,6 +1031,49 @@ callbacks is the formatted list of LiteLLM callbacks, built by the caller.
 {{- if and (gt $retryAfter 0) (gt (add $gatewayHoldSeconds $firstChunkAllowanceSeconds) $workerStaleSeconds) -}}
 {{- fail (printf "litellm.fallback.numRetries %d with retryAfterSeconds %d holds a rate-limited call %ds at the gateway; with %ds for the model's first chunk that crosses the agents' %ds stale-stream bound (stale_timeout_seconds), and the agent would drop the stream before it sees the 429" $numRetries $retryAfter $gatewayHoldSeconds $firstChunkAllowanceSeconds $workerStaleSeconds) -}}
 {{- end -}}
+{{- /*
+  The spend ceiling, as router_settings.provider_budget_config for the one
+  provider every alias routes to. LiteLLM's router budget limiter
+  (litellm/router_strategy/budget_limiter.py, v1.106.0) adds each response's
+  cost to a per-provider counter in the router's cache, filters the provider's
+  deployments out once the counter reaches budget_limit, and lets the counter
+  expire time_period after the window opened (at router start for the first
+  window, at the first spend after expiry for the next); its spend comes from
+  the standard logging payload, so streamed calls count, and lands when a call
+  completes, so the calls in flight when the share is crossed are charged past
+  it. Chosen over
+  litellm_settings.max_budget, which without a database counts only
+  non-streamed calls, from the completion text alone, and exports nothing.
+  The cache is in-process (the chart runs no Redis), so the ceiling is split
+  evenly across the gateway's replicas: each replica refuses on its share, so
+  the install's spend per window is bounded by .budget.usd plus the in-flight
+  calls above, and a restarted pod starts its count over. The share is
+  rendered with four decimals, always with a
+  dot, so PyYAML reads a float; a share that rounds to 0 is refused, because
+  LiteLLM treats a budget_limit of 0 as no limit. The schema's floor of 0.01
+  (shared by the installer and the Terraform example, which refuse less before
+  any apply) keeps that out of reach up to 100 replicas; this is the backstop.
+*/}}
+{{- $budget := .budget | default dict -}}
+{{- $budgetUSD := float64 ($budget.usd | default 0) -}}
+{{- $budgetPeriod := $budget.period | default "" -}}
+{{- $budgetReplicas := max (int (.replicas | default 1)) 1 -}}
+{{- $budgetPeriodPattern := `^[1-9][0-9]*(s|m|h|d|w|mo)$` -}}
+{{- $budgetShareFormat := "%.4f" -}}
+{{- $budgetShareZero := "0.0000" -}}
+{{- $budgetShare := "" -}}
+{{- if lt $budgetUSD 0.0 -}}
+{{- fail (printf "litellm.budget.usd %v is negative; 0 turns the ceiling off" $budget.usd) -}}
+{{- end -}}
+{{- if gt $budgetUSD 0.0 -}}
+{{- if not (regexMatch $budgetPeriodPattern $budgetPeriod) -}}
+{{- fail (printf "litellm.budget.period %q is not a LiteLLM duration (a whole number and s, m, h, d, w or mo, such as 1d); litellm.budget.usd %v needs one" $budgetPeriod $budget.usd) -}}
+{{- end -}}
+{{- $budgetShare = printf $budgetShareFormat (divf $budgetUSD (float64 $budgetReplicas)) -}}
+{{- if eq $budgetShare $budgetShareZero -}}
+{{- fail (printf "litellm.budget.usd %v split across %d gateway replicas is under 0.0001 USD per replica, which LiteLLM reads as no ceiling; raise the budget or lower litellm.replicaCount" $budget.usd $budgetReplicas) -}}
+{{- end -}}
+{{- end -}}
 {{- $primaries := list "model-default" "hermes-agent" .model -}}
 {{- if and $fallbackName (has $fallbackName $primaries) -}}
 {{- fail (printf "litellm.fallback.modelName %q is already a primary alias (%s); a model cannot fall back to itself" $fallbackName (join ", " $primaries)) -}}
@@ -1024,7 +1141,7 @@ litellm_settings:
   only in its anthropic overlay; see that file for why the breakpoints live
   here rather than in the agent's own config.
 */}}
-{{- if or $claude $fallbackName (gt $timeout 0) (gt $numRetries 0) (gt $retryAfter 0) }}
+{{- if or $claude $fallbackName (gt $timeout 0) (gt $numRetries 0) (gt $retryAfter 0) $budgetShare }}
 router_settings:
   {{- if $fallbackName }}
   fallbacks:
@@ -1047,6 +1164,17 @@ router_settings:
   */}}
   {{- if gt $retryAfter 0 }}
   retry_after: {{ $retryAfter }}
+  {{- end }}
+  {{- /*
+    The spend ceiling's share for this replica; see the budget block above.
+    Keyed on the provider prefix every alias carries, which is what LiteLLM
+    resolves for the deployment and records on the logging payload.
+  */}}
+  {{- if $budgetShare }}
+  provider_budget_config:
+    {{ $litellmProvider }}:
+      budget_limit: {{ $budgetShare }}
+      time_period: {{ $budgetPeriod | quote }}
   {{- end }}
   {{- if $claude }}
   default_litellm_params:
@@ -2491,6 +2619,15 @@ autopilotRequests are the requests on GKE Autopilot (credentialProxyAutopilotCPU
 credentialProxyAutopilotMemoryRequest), where the limits are clamped to the requests and only
 the request buys CPU; the quota preflight counts them where kube-agents.gkeAutopilot holds.
 */}}
+{{- /*
+kube-agents.credentialProxyExecReplicas is
+platformAgent.deployment.credentialProxy.exec.replicas, 0 when unset: the exec
+tier's replica count, which gates the tier's scrape objects and its quota term.
+*/}}
+{{- define "kube-agents.credentialProxyExecReplicas" -}}
+{{- dig "exec" "replicas" 0 (.Values.platformAgent.deployment.credentialProxy | default dict) | int -}}
+{{- end -}}
+
 {{- define "kube-agents.credentialProxyDefaults" -}}
 {{- dict
       "requests" (dict "cpu" "500m" "memory" "1Gi")
@@ -2717,6 +2854,25 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
 {{- if not (hasKey $props .field) -}}
 {{- $crdPath := join "." (append (prepend .path "spec") .field) -}}
 {{- fail (printf "%s is set, but the installed PlatformAgent CRD predates %s and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/, or run upgrade.sh, which does). Otherwise the API server prunes the value silently while the release record keeps it" .value $crdPath) -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{- /* kube-agents.crdFieldGuard's twin for a top-level AgentProfile spec field the
+       chart renders: helm upgrade doesn't apply crds/, and an AgentProfile CRD from
+       before the field prunes it silently, which for a routing field like
+       yieldToPinned changes where tasks go with no error. */ -}}
+{{- define "kube-agents.agentProfileFieldGuard" -}}
+{{- $crd := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "agentprofiles.kubeagents.x-k8s.io" -}}
+{{- if $crd -}}
+{{- $props := dict -}}
+{{- range $crd.spec.versions -}}
+{{- if .storage -}}
+{{- $props = dig "schema" "openAPIV3Schema" "properties" "spec" "properties" (dict) . -}}
+{{- end -}}
+{{- end -}}
+{{- if not (hasKey $props .field) -}}
+{{- fail (printf "%s renders spec.%s, but the installed AgentProfile CRD predates it and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/, or run upgrade.sh, which does). Otherwise the API server prunes the field silently" .value .field) -}}
 {{- end -}}
 {{- end -}}
 {{- end }}
@@ -3131,14 +3287,55 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
     {{- end -}}
   {{- end -}}
 
+  {{- /* The credential broker's exec tier: one replica's worth from the footprint
+         (operatorRenderedPerReplica, read from the operator's one-replica golden),
+         times platformAgent.deployment.credentialProxy.exec.replicas. Outside the loop
+         above, which sums each operatorRendered entry once. A positive count with no
+         entry fails rather than counting the tier as zero. Its cpu, memory and
+         ephemeral storage are fixed (credential_proxy_exec_tier.go), so an override
+         of the broker's resources does not reach it and the entry is counted as it
+         is. No surge term: the tier rolls with maxSurge 0 and maxUnavailable 1, so
+         a rollout replaces a pod in place and adds none. This
+         counts the quota only; whether the nodes have room for a 2 CPU pod is the
+         scheduler's, which this cannot see. */ -}}
+  {{- $execReplicas := include "kube-agents.credentialProxyExecReplicas" . | int64 -}}
+  {{- if gt $execReplicas 0 -}}
+    {{- $exec := index ((index $footprint "operatorRenderedPerReplica") | default dict) "credentialProxyExecTier" | default dict -}}
+    {{- if not $exec -}}
+      {{- fail "quota preflight: platformAgent.deployment.credentialProxy.exec.replicas is set, but footprint.yaml has no operatorRenderedPerReplica.credentialProxyExecTier entry to size it. Reinstall from an intact chart, or set quotaPreflight.enabled=false to skip the check." -}}
+    {{- end -}}
+    {{- $reqPods = include "kube-agents.satAdd" (dict "a" $reqPods "b" (include "kube-agents.satMul" (dict "a" ($exec.pods | default 1 | int64) "b" $execReplicas))) | int64 -}}
+    {{- $reqCpu = include "kube-agents.satAdd" (dict "a" $reqCpu "b" (include "kube-agents.satMul" (dict "a" ($exec.cpuMillisRequest | default 0 | int64) "b" $execReplicas))) | int64 -}}
+    {{- $limCpu = include "kube-agents.satAdd" (dict "a" $limCpu "b" (include "kube-agents.satMul" (dict "a" ($exec.cpuMillisLimit | default 0 | int64) "b" $execReplicas))) | int64 -}}
+    {{- $reqMem = include "kube-agents.satAdd" (dict "a" $reqMem "b" (include "kube-agents.satMul" (dict "a" ($exec.memoryBytesRequest | default 0 | int64) "b" $execReplicas))) | int64 -}}
+    {{- $limMem = include "kube-agents.satAdd" (dict "a" $limMem "b" (include "kube-agents.satMul" (dict "a" ($exec.memoryBytesLimit | default 0 | int64) "b" $execReplicas))) | int64 -}}
+    {{- $reqEph = include "kube-agents.satAdd" (dict "a" $reqEph "b" (include "kube-agents.satMul" (dict "a" ($exec.ephemeralStorageBytesRequest | default 0 | int64) "b" $execReplicas))) | int64 -}}
+    {{- $limEph = include "kube-agents.satAdd" (dict "a" $limEph "b" (include "kube-agents.satMul" (dict "a" ($exec.ephemeralStorageBytesLimit | default 0 | int64) "b" $execReplicas))) | int64 -}}
+  {{- end -}}
   {{- /* Next mode's own workloads: NATS, the auth callouts, the verifiers, the console,
          the A2A gateway and the provisioning Job, each a total over its replicas, plus the
          JetStream claim. None has a sizing override in the chart. An entry marked `surges`
          (the callouts and verifiers, which roll RollingUpdate with maxUnavailable 0) sizes
          the patch's surge room by one of its pods: with LiteLLM off, the chart's own
          workloads may leave less room than a callout needs to roll. */ -}}
+  {{- /* footprint.yaml counts the bus at the default three NATS servers. With
+         platformAgent.harness.tuning.busReplicas: 1 the operator renders one, so the
+         a2aNats entry and the JetStream claims count a third: per pod and per claim,
+         times one. An existing one-server bus with the value unset is still counted
+         at three, since the chart cannot see what runs (the upgrade note says so). */ -}}
+  {{- $busOne := eq (toString ((((.Values.platformAgent | default dict).harness | default dict).tuning | default dict).busReplicas)) "1" -}}
   {{- range $key, $workload := $next -}}
     {{- if and (ne $key "agentPod") (ne $key "storage") -}}
+      {{- if and $busOne (eq $key "a2aNats") -}}
+        {{- $n := $workload.pods | default 1 | int64 -}}
+        {{- $workload = dict "pods" 1 "surges" $workload.surges
+              "cpuMillisRequest" (div ($workload.cpuMillisRequest | default 0 | int64) $n)
+              "cpuMillisLimit" (div ($workload.cpuMillisLimit | default 0 | int64) $n)
+              "memoryBytesRequest" (div ($workload.memoryBytesRequest | default 0 | int64) $n)
+              "memoryBytesLimit" (div ($workload.memoryBytesLimit | default 0 | int64) $n)
+              "ephemeralStorageBytesRequest" (div ($workload.ephemeralStorageBytesRequest | default 0 | int64) $n)
+              "ephemeralStorageBytesLimit" (div ($workload.ephemeralStorageBytesLimit | default 0 | int64) $n) -}}
+      {{- end -}}
       {{- $reqPods = include "kube-agents.satAdd" (dict "a" $reqPods "b" (include "kube-agents.replicaCount" $workload.pods | int64)) | int64 -}}
       {{- $reqCpu = include "kube-agents.satAdd" (dict "a" $reqCpu "b" ($workload.cpuMillisRequest | default 0 | int64)) | int64 -}}
       {{- $limCpu = include "kube-agents.satAdd" (dict "a" $limCpu "b" ($workload.cpuMillisLimit | default 0 | int64)) | int64 -}}
@@ -3288,8 +3485,14 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
     {{- end -}}
   {{- end -}}
   {{- with $next.storage -}}
-    {{- $reqPvc = add $reqPvc (.persistentVolumeClaims | default 0 | int64) -}}
-    {{- $reqStorage = add $reqStorage (.storageBytesRequest | default 0 | int64) -}}
+    {{- $claims := .persistentVolumeClaims | default 0 | int64 -}}
+    {{- $bytes := .storageBytesRequest | default 0 | int64 -}}
+    {{- if and $busOne (gt $claims (int64 1)) -}}
+      {{- $bytes = div $bytes $claims -}}
+      {{- $claims = int64 1 -}}
+    {{- end -}}
+    {{- $reqPvc = add $reqPvc $claims -}}
+    {{- $reqStorage = add $reqStorage $bytes -}}
   {{- end -}}
 
   {{- /* Claims are release-scoped rather than per-replica, so they are not multiplied. */ -}}
@@ -3304,12 +3507,30 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
          satMul/satAdd, as above: parseBytes clamps an oversized size to MaxInt64,
          and dataClaims times that would wrap the total negative. Both take a
          negative delta. */ -}}
-  {{- with (.Values.platformAgent.storage | default dict).size -}}
+  {{- $storageValues := .Values.platformAgent.storage | default dict -}}
+  {{- if or $storageValues.size $storageValues.expectedClusterProfiles -}}
     {{- if not (and (hasKey $storage "dataClaims") (hasKey $storage "dataClaimBytesRequest")) -}}
-      {{- fail "quota preflight: footprint.yaml has no dataClaims or dataClaimBytesRequest, so platformAgent.storage.size cannot be counted. Reinstall from an intact chart, or set quotaPreflight.enabled=false to skip the check." -}}
+      {{- fail "quota preflight: footprint.yaml has no dataClaims or dataClaimBytesRequest, so platformAgent.storage.size and platformAgent.storage.expectedClusterProfiles cannot be counted. Reinstall from an intact chart, or set quotaPreflight.enabled=false to skip the check." -}}
     {{- end -}}
-    {{- $dataClaimDelta := sub (include "kube-agents.parseBytes" . | int64) ($storage.dataClaimBytesRequest | int64) -}}
+    {{- $defaultBytes := $storage.dataClaimBytesRequest | int64 -}}
+    {{- $sizedBytes := $defaultBytes -}}
+    {{- with $storageValues.size -}}
+      {{- $sizedBytes = include "kube-agents.parseBytes" . | int64 -}}
+    {{- end -}}
+    {{- $dataClaimDelta := sub $sizedBytes $defaultBytes -}}
     {{- $reqStorage = include "kube-agents.satAdd" (dict "a" $reqStorage "b" (include "kube-agents.satMul" (dict "a" ($storage.dataClaims | int64) "b" $dataClaimDelta))) | int64 -}}
+    {{- /* expectedClusterProfiles raises the agent's claim alone, to at least base +
+           N x per-profile rounded up to whole GiB: the operator's dataVolumeBaseSize and
+           perClusterProfileStorage, which tests/test_chart_expected_cluster_profiles.py
+           pins equal to these. */ -}}
+    {{- with $storageValues.expectedClusterProfiles -}}
+      {{- $gib := 1073741824 -}}
+      {{- $need := add 8589934592 (mul (. | int64) 419430400) -}}
+      {{- $formula := mul (div (add $need (sub $gib 1)) $gib) $gib -}}
+      {{- if gt $formula $sizedBytes -}}
+        {{- $reqStorage = include "kube-agents.satAdd" (dict "a" $reqStorage "b" (sub $formula $sizedBytes)) | int64 -}}
+      {{- end -}}
+    {{- end -}}
   {{- end -}}
 {{- end -}}
 
@@ -3597,7 +3818,7 @@ Modeled monthly cost on GKE Autopilot (modeled from {{ include "kube-agents.foot
   Disk:     {{ printf "%.0f" $diskGiB }} GiB x ${{ include "kube-agents.footprintPriceBalancedDiskPerGiBMonth" . }}/GiB-month = ${{ printf "%.2f" $diskCost }}
   Total:    ${{ printf "%.2f" $total }}/month, plus the ${{ printf "%.2f" $clusterFee }}/month GKE cluster fee (per cluster, noted separately)
 {{- if eq (toString .Values.platformAgent.mode) "next" }}
-  Not counted: the session pods (one per delegation or /session conversation, up to maxSessions at once); the install prerequisites page sizes them. The spec.mode next workloads, the NATS bus and its 40 GiB JetStream claim among them, are in the figures above.
+  Not counted: the session pods (one per delegation or /session conversation, up to maxSessions at once); the install prerequisites page sizes them. The spec.mode next workloads, the NATS bus and its JetStream claims among them, are in the figures above.
 {{- end }}
 {{- end }}
 

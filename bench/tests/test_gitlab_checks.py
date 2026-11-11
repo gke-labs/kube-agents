@@ -476,6 +476,21 @@ def test_a_project_read_that_is_throttled_is_not_blamed_on_the_token(env, gitlab
     assert "503" in result.reason
 
 
+def test_a_project_read_outage_after_a_merge_request_404_is_marked(env, gitlab, monkeypatch):
+    """#5346: the merge request's 404 is what the project read decides, not the
+    error; the project read's 503 is, so the error is marked."""
+    configured(monkeypatch)
+    gitlab.routes[PROJECT] = (503, {"message": "unavailable"})
+    stash(f"Opened {MR3_URL}")
+    result = pr_check().verify(30)
+    assert result.status == "error"
+    assert result.reason.startswith(forges.FORGE_UNAVAILABLE_MARKER)
+    stash(f"Audit filed: {ISSUE_URL}")
+    result = ledger_check(required_phrases=["rbac-overgrant"]).verify(30)
+    assert result.status == "error"
+    assert result.reason.startswith(forges.FORGE_UNAVAILABLE_MARKER)
+
+
 def stream_env(monkeypatch, repo=REPO):
     monkeypatch.setenv(verifiers.STREAM_AUDIT_ENV_VAR, AUDIT)
     monkeypatch.setenv(verifiers.STREAM_REPO_ENV_VAR, repo)

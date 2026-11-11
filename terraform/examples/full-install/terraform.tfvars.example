@@ -141,6 +141,13 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 #   rules       = [{ name = "cluster-name", literal = "prod-eu-1", action = "pseudonym" }]
 # }
 
+# The gateway's spend ceiling, in US dollars per period (a LiteLLM duration);
+# usd 0 is no ceiling, on it is at least 0.01. See variables.tf.
+# litellm_budget = {
+#   usd    = 0
+#   period = "1d"
+# }
+
 # Vertex AI / Model Garden instead of an API-key provider — see variables.tf.
 # vertex_project_id defaults to the install's project; vertex_location defaults
 # to "global" rather than the cluster location, because a model is only callable

@@ -25,6 +25,29 @@ Production guidance is a 3-node cluster with stream replicas R3. Dev and CI run 
 node with R1 under the same config surface - the conformance suite runs against `kind`, so
 nothing here may depend on a managed control plane.
 
+**Amended 10/29 (#3274):** the production posture is the default for a new bus. The
+operator renders `spec.harness.tuning.busReplicas` servers. When the field is unset, an
+install keeps the server count its bus already runs (an install from before this change
+stays on one server), and a new bus gets three. Every stream and bucket the provision Job
+creates takes `min(3, servers)` replicas. The servers find each other through a headless
+routes Service on 6222, authenticated to each other by mutual TLS under the bus CA (the callout does not govern routes, and no route password is rendered). A `maxUnavailable: 1` budget and
+a hostname topology spread keep one drain to one server, and a lame-duck `preStop` moves
+clients off a stopping server rather than dropping them.
+
+**Changing the server count empties the bus.** A server that restarts in cluster mode
+finds its standalone streams unassigned in the new metadata layer and deletes them as
+orphans; going back, a standalone server refuses to load an R3 stream. Either way the
+provision Job then recreates every stream and bucket empty. So setting `busReplicas` on
+an install whose bus already runs another count is a conversion, and its cost is the
+bus's contents: task history, the topics journal, and the KV buckets. Converting without
+that loss is #4225 (a copy into a new cluster before the switch).
+
+**Amended 10/30 (#3274):** so the operator does not convert. An existing bus keeps the
+count it runs: a `busReplicas` that asks for another count is held to the running one,
+with an `A2ABusConversionRefused` condition and Warning, and the admission webhook
+refuses the edit with the same message. #4225 lifts that refusal in the same change that
+adds the migration, so no release can convert without it.
+
 **The customer operates this.** Server restarts - rollouts, node drains, PV failover - are
 routine operations, not incidents. That fact drives the resilience contract below more than
 any other input.
@@ -342,7 +365,8 @@ there is an offline target the day a password is hand-set. That binds every rend
 this stack, not one function - the rollout hash on the NATS pod template is over the
 config rendered with placeholders in the passwords' place plus the credentials Secret's
 `resourceVersion`, which is what lets a config change and a rotation both roll the bus
-without a credential reaching the digest.
+without a credential reaching the digest. The gateway's per-profile deny is left out of
+that hash, since a reload applies it (below).
 
 Layout:
 
@@ -366,6 +390,11 @@ Layout:
   and the read-only principals. The static user blocks are rendered per account, still from
   `platformagent_a2a_identities.go`, so where this document says the config's APP and `$SYS`
   static user blocks, read the `TRUSTED`, `CONSOLE`, `APP` and `$SYS` blocks.
+  Amended 11/9 (#4173): `TRUSTED` exports consumer create to `APP` and `CONSOLE` per stream,
+  naming only the streams a principal in those accounts may create consumers on
+  (`DIRECTORY`, `KV_runtime-state`, `TASKS`, `TOPICS-JOURNAL`, `TOPICS-STATE`), instead of
+  `$JS.API.CONSUMER.CREATE.>`. The list is derived from the identities' grants, so a new
+  grant brings its stream into the export with it.
 - **One user per agent identity** inside the account. Permissions are exact subject lists,
   deny by default: publish only to the subjects its role emits on, subscribe only to its own
   addressee prefix on the task subjects (`a2a.tasks.<its name>.>`) plus the shared topics it
@@ -539,7 +568,11 @@ Layout:
   reaches the gateway's relay durable from `bridge` too, measured on the render: one
   permitted `$JS.API.CONSUMER.CREATE.TASKS.gateway-relay` retunes its filter subject, and
   one carrying `inactive_threshold` has the server reap it, ack floor and all, with
-  `CONSUMER.DELETE` refused in the same run; and a consumer's
+  `CONSUMER.DELETE` refused in the same run (amended 11/9, #4173: no longer for the relay or
+  the bridge's intake. The provision Job pre-creates both on `TASKS`, create-only, their
+  readers bind them and never create, and every principal that may create consumers on
+  `TASKS` is denied create, update and delete on those two names. The route still reaches
+  every other consumer on the four streams); and a consumer's
   deliver subject can aim replay of stored messages at another stream's subject, which is
   a persisted write under the messages' original subjects - not forgery, since a read by
   subject never sees them, but an eviction lever against the capturing stream. Delivery
@@ -560,7 +593,9 @@ Layout:
   tokens, so a `web-*` grant matches a consumer literally named `web-*` and nothing else -
   measured, not assumed. The session principal is the case where it does work, and why:
   its consumer names are derived from the pod the API server attested rather than chosen
-  by the client, so the grant can name them exactly instead of by prefix. The real close is a
+  by the client, so the grant can name them exactly instead of by prefix. The two
+  pre-created `TASKS` durables are the other case: their names are fixed, so a deny can name
+  them exactly too. The real close is a
   separate account with an export/import, which stays open.
 
   **The probe subject.** `a2a.topics.shared.probe` is provisioned into `TOPICS-STATE`
@@ -591,7 +626,8 @@ Layout:
   `app.kubernetes.io/component: profiles` label, admitted only once that namespace's own
   fence (DNS, the bus and LiteLLM out, nothing in) is in place), and ~~**no pod-network peer for 8222 or 9222**~~ **no
   pod-network peer for 8222, and one for 9222: the console server (amended 9/24,
-  below)**. The demo's
+  below)**; **amended 11/09:** 8222 admits the operator's pod, the same peer as 4222, which
+  reads `config_load_time` there to confirm a config reload (below). The demo's
   `kubectl port-forward` and the kubelet's readiness probe both enter from the node,
   which NetworkPolicy does not govern, so the ws surface stays reachable through
   kubectl and, in-cluster, through the console server alone. The enumeration is today's client
@@ -603,9 +639,10 @@ Layout:
   happens, because established connections are already authorized and keep working
   while the fabric silently accepts no new client. Still owed as they arm: the audit
   exporter, the janitor, and the metrics scrape (the alert set above is scraped
-  series), and the NATS pods themselves on their route port the moment the deployment
-  leaves the single-node dev shape - a 3-node cluster's servers dial each other, and a
-  fence without the route peer prevents the cluster from ever forming. The topic-grant corollary that two edits
+  series). The NATS pods' own route peer, which this list used to carry as owed, landed
+  with the three-server default (amended 10/29, #3274): a separate rule admits 6222 from
+  the bus's servers and nothing else, since a fence without it keeps the cluster from
+  ever forming. The topic-grant corollary that two edits
   travel together, applied to the fence. A second policy in the same amendment
   fences the session pods' egress (DNS, 4222 by label, LiteLLM - a spawned worker has no
   other legitimate destination, save the credential broker on its one port when the
@@ -1078,7 +1115,25 @@ Every connection to the client listener on 4222 is TLS. nats.conf carries a top-
 clear; a client that dials `nats://` is told to upgrade, and one that cannot verify the
 certificate is refused. Every client the operator renders is handed `tls://` on the NATS
 Service name and trusts the bus CA. The monitoring port, 8222, stays plain HTTP: it carries
-health and stats, not payloads or tokens. The websocket listener on 9222, the console's
+health and stats, not payloads or tokens. The operator reads it for one thing, `config_load_time` in
+`/varz`.
+
+**Reloading permissions without a restart.** The bus pod runs nats-io's
+`nats-server-config-reloader` beside nats-server, in one PID namespace. When the kubelet
+writes a new `nats.conf` into the pod, the reloader sends nats-server the reload signal,
+and the server applies the new users and permissions to the connections it already holds.
+It also runs the auth callout again for each connection the callout authenticated; on
+2.10.29 those connections dropped at the reload and reconnected within a second.
+The pod template's config hash leaves out the per-profile gateway deny, so an AgentProfile
+added, removed or done draining changes the config Secret and not the template: the bus is
+reloaded, not rolled. Every other config change still rolls it. The operator records the
+reload it asked for on the Secret, with the `config_load_time` it read just before writing,
+and confirms the reload when that value moves. If it hasn't moved within three minutes, or
+can't be read, the operator deletes the bus pod so it restarts onto the new config, and
+writes a `BusConfigReloadFailed` Warning. The kubelet takes up to about a minute to write
+an updated Secret into a running pod, so a newly added profile's deny lands that long after
+the profile does. On the roll path it landed when the new pod came up, tens of seconds
+later, with the bus down for the roll. The websocket listener on 9222, the console's
 door, serves the same certificate from the same files (below).
 
 **Certificate source.** The operator mints the certificates itself, with no dependency on

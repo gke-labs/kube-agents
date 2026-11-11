@@ -526,23 +526,25 @@ class NextModeFootprintTest(unittest.TestCase):
         self.assertEqual(cli["cpuMillisRequest"], gcf.parse_cpu_millis(agent["resources"]["requests"]["cpu"]))
         self.assertEqual(cli["memoryBytesLimit"], gcf.parse_bytes(agent["resources"]["limits"]["memory"]))
 
-    def test_each_workload_is_its_golden_container_times_its_replicas(self):
-        for key, (kind, name, container) in gcf._A2A_WORKLOADS.items():
+    def test_each_workload_is_its_golden_containers_times_its_replicas(self):
+        for key, (kind, name, names) in gcf._A2A_WORKLOADS.items():
             with self.subTest(key=key):
                 doc = _find_doc(self.docs, kind, name)
                 replicas = doc["spec"].get("replicas", 1)
-                (found,) = [
+                found = [
                     c for c in doc["spec"]["template"]["spec"]["containers"]
-                    if c["name"] == container
+                    if c["name"] in names
                 ]
-                requests = found["resources"]["requests"]
+                self.assertEqual(len(found), len(names))
                 entry = self.following[key]
                 self.assertEqual(entry["pods"], replicas)
                 self.assertEqual(
-                    entry["cpuMillisRequest"], gcf.parse_cpu_millis(requests["cpu"]) * replicas
+                    entry["cpuMillisRequest"],
+                    sum(gcf.parse_cpu_millis(c["resources"]["requests"]["cpu"]) for c in found) * replicas,
                 )
                 self.assertEqual(
-                    entry["memoryBytesRequest"], gcf.parse_bytes(requests["memory"]) * replicas
+                    entry["memoryBytesRequest"],
+                    sum(gcf.parse_bytes(c["resources"]["requests"]["memory"]) for c in found) * replicas,
                 )
 
     def test_surges_follows_each_workloads_strategy(self):
@@ -572,13 +574,15 @@ class NextModeFootprintTest(unittest.TestCase):
 
     def test_the_jetstream_claim_is_next_modes_alone(self):
         storage = self.following["storage"]
-        self.assertEqual(storage["persistentVolumeClaims"], 1)
-        self.assertEqual(storage["storageBytesRequest"], 40 * _GIB)
+        # One 40Gi JetStream claim per NATS server, three by default.
+        self.assertEqual(storage["persistentVolumeClaims"], 3)
+        self.assertEqual(storage["storageBytesRequest"], 3 * 40 * _GIB)
         # And operatorRendered.storage is the today-mode figure, not the next-mode total.
         self.assertEqual(self.data["operatorRendered"]["storage"]["persistentVolumeClaims"], 4)
 
     def test_the_standing_delta_is_the_documented_figure(self):
-        """The A2A stack's standing requests, provisioning Job aside: 850m and 1472Mi."""
+        """The A2A stack's standing requests, provisioning Job aside: 1380m and 2544Mi,
+        with the default three NATS servers (860m and 1488Mi with one)."""
         standing = [k for k in self.following if k not in ("storage", "a2aProvision")]
         cpu = sum(
             self.following[k]["hermesBridge"]["cpuMillisRequest"] if k == "agentPod"
@@ -590,7 +594,7 @@ class NextModeFootprintTest(unittest.TestCase):
             else self.following[k]["memoryBytesRequest"]
             for k in standing
         )
-        self.assertEqual((cpu, memory), (850, 1472 * _MIB))
+        self.assertEqual((cpu, memory), (1380, 2544 * _MIB))
 
     def test_replicas_scale_a_workload(self):
         with _goldens_with(following=_scale_callout_deployment):
@@ -870,3 +874,42 @@ class CompletenessGuardTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExecTierFootprintTest(unittest.TestCase):
+    """The exec tier's per-replica entry, read from its one-replica golden."""
+
+    def test_the_entry_is_one_exec_replica_and_stays_out_of_operator_rendered(self):
+        data = gcf.extract_footprint()
+        self.assertNotIn("credentialProxyExecTier", data["operatorRendered"])
+        entry = data["operatorRenderedPerReplica"]["credentialProxyExecTier"]
+        golden = yaml.safe_load_all(gcf._EXEC_TIER_GOLDEN_MANIFEST.read_text())
+        container = next(
+            c
+            for doc in golden
+            if doc and doc.get("kind") == "Deployment" and doc["metadata"]["name"] == gcf._EXEC_TIER_WORKLOAD
+            for c in doc["spec"]["template"]["spec"]["containers"]
+            if c["name"] == gcf._CRED_PROXY_CONTAINER
+        )
+        res = container["resources"]
+        self.assertEqual(entry["pods"], 1)
+        self.assertEqual(entry["cpuMillisRequest"], gcf.parse_cpu_millis(res["requests"]["cpu"]))
+        self.assertEqual(entry["cpuMillisLimit"], gcf.parse_cpu_millis(res["limits"]["cpu"]))
+        self.assertEqual(entry["memoryBytesRequest"], gcf.parse_bytes(res["requests"]["memory"]))
+        self.assertEqual(entry["ephemeralStorageBytesLimit"], gcf.parse_bytes(res["limits"]["ephemeral-storage"]))
+        self.assertEqual((entry["cpuMillisRequest"], entry["memoryBytesRequest"]), (2000, 2 * _GIB))
+        self.assertGreater(entry["ephemeralStorageBytesLimit"], 0)
+
+    def test_an_extra_container_in_the_exec_pod_fails_rather_than_undercounts(self):
+        docs = list(yaml.safe_load_all(gcf._EXEC_TIER_GOLDEN_MANIFEST.read_text()))
+        for doc in docs:
+            if doc and doc.get("kind") == "Deployment" and doc["metadata"]["name"] == gcf._EXEC_TIER_WORKLOAD:
+                doc["spec"]["template"]["spec"]["containers"].append(
+                    {"name": "new-sidecar", "resources": {"requests": {"cpu": "1"}}})
+        with tempfile.TemporaryDirectory() as tmp:
+            golden = pathlib.Path(tmp) / "platformagent-exec-1.yaml"
+            golden.write_text(yaml.safe_dump_all(docs))
+            with unittest.mock.patch.object(gcf, "_EXEC_TIER_GOLDEN_MANIFEST", golden):
+                with self.assertRaises(ValueError) as caught:
+                    gcf._exec_tier_entry()
+        self.assertIn("new-sidecar", str(caught.exception))

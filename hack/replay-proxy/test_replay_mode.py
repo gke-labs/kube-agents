@@ -435,6 +435,30 @@ class RunNameTest(AnalyzeCase):
                 self.assertIsNotNone(hit)
                 self.assertEqual(hit[0]["content"], said.format(replayed, replayed))
 
+    def test_the_next_request_holding_the_served_answer_still_matches(self):
+        # The answer names the value outside the shape that bound it, so only the
+        # whole-token swap finds it; turn 2 sends each run's own text back.
+        for shown, recorded, replayed, said in (
+            ("searched gke-agentic/kube-agents-evals-3-infra@{}", "c99b1ab", "4f1e414", "git -C repo checkout {}"),
+            ("cloned into /opt/data/scratch/declared-intent-{}", "a2_elobt", "j77z8q6q", "mv clone-{} done"),
+        ):
+            with self.subTest(said=said):
+                self.setUp()
+                first = self.body(shown.format(recorded))
+                answer = {"role": "assistant", "content": said.format(recorded)}
+                self.assertEqual(self.recorded(first, answer)["unstorable"], [])
+                first["messages"] += [answer, {"role": "user", "content": "thanks"}]
+                self.recorded(first, {"role": "assistant", "content": "Done."})
+
+                replay = self.proxy()
+                echoed = self.body(shown.format(replayed))
+                hit, _ = replay.lookup(echoed, time.time())
+                self.assertEqual(hit[0]["content"], said.format(replayed))
+                echoed["messages"] += [hit[0], {"role": "user", "content": "thanks"}]
+                hit, refused = replay.lookup(echoed, time.time())
+                self.assertIsNone(refused)
+                self.assertEqual((hit[0]["content"], hit[3]), ("Done.", "exact"))
+
     def test_the_project_in_tool_arguments_is_served_with_this_runs_value(self):
         def answer(project):
             return {"role": "assistant", "content": "", "tool_calls": [{"id": "call_1", "type": "function", "function": {
@@ -712,6 +736,25 @@ class RecordTest(ProxyTestCase):
         line = self.lines(1)[0]
         self.assertFalse(line["recorded"])
         self.assertFalse(os.path.exists(os.path.join(self.cache_dir, replay_cache.ANSWERS_DIR)))
+
+
+class RecordContinuationTest(ProxyTestCase):
+    """A record line names its answer, and the next request names the answer it went on from."""
+
+    mode = "record"
+
+    def test_the_next_requests_prior_answer_is_the_recorded_answer_variant(self):
+        self.request("POST", COMPLETIONS, ReplayTest.opening("t_11111111"))
+        first = self.lines(1)[0]
+        self.assertTrue(first["recorded"])
+        self.assertNotIn("prior_answer", first, "an opening holds no answer yet")
+        self.request("POST", COMPLETIONS, ReplayTest.pickup("t_11111111", "answer 1 for t_11111111", "Latte"))
+        second = self.lines(2)[1]
+        self.assertEqual(second["prior_answer"], first["answer_variant"])
+        self.request("POST", COMPLETIONS, ReplayTest.pickup("t_11111111", "a different answer", "Latte"))
+        third = self.lines(3)[2]
+        self.assertNotEqual(third["prior_answer"], first["answer_variant"],
+                            "a conversation that went on from another answer is not evidence for this one")
 
 
 class RecordBudgetTest(ProxyTestCase):
@@ -1033,6 +1076,20 @@ class ReplayTest(ProxyTestCase):
         _, port, out = self.replay()
         self.request("POST", COMPLETIONS, chat("t_11111111", stream=False), port=port)
         self.assertEqual(self.lines(1, out)[0]["miss"]["role"], "no_saved_request")
+
+    def test_a_cache_seeded_after_start_rebuilds_the_miss_index_once_marked(self):
+        # The replay lane seeds the cache into a running proxy (collect_shadow.py).
+        _, port, out = self.replay()
+        extra = ({"role": "user", "content": "first turn"},)
+        self.record(chat("t_11111111", stream=False, extra_messages=extra))
+        changed = ({"role": "user", "content": "first turn, but the pod restarted 3 times"},)
+        self.request("POST", COMPLETIONS, chat("t_11111111", stream=False, extra_messages=changed), port=port)
+        self.assertEqual(self.lines(1, out)[0]["miss"]["role"], "no_saved_request", "not marked yet")
+        Path(self.cache_dir, replay_cache.SEED_MARKER).write_text("1")
+        self.request("POST", COMPLETIONS, chat("t_11111111", stream=False, extra_messages=changed), port=port)
+        miss = self.lines(2, out)[1]["miss"]
+        self.assertEqual(miss["closest_fingerprint"], self.lines(1, self.record_out)[0]["fingerprint"])
+        self.assertEqual((miss["index"], miss["role"]), (1, "user"))
 
     def test_an_unbound_placeholder_is_a_miss(self):
         self.record(chat("t_11111111", stream=False))

@@ -304,6 +304,12 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
     def test_the_chat_plugins_gave_up_family_is_the_one_the_poller_sums_into_kanban_tasks_gave_up(self):
         self.assertEqual(_py_const("KANBAN_GAVE_UP_METRIC", _CHAT_METRICS_PY), _go_const(_SCRAPE_GO, "kanbanGaveUpSeries"))
 
+    def test_the_chat_plugins_dispatcher_gauge_is_the_one_the_poller_reads_into_kanban_dispatcher_failing(self):
+        self.assertEqual(_py_const("KANBAN_DISPATCHER_FAILED_TICKS_METRIC", _CHAT_METRICS_PY), _go_const(_SCRAPE_GO, "kanbanDispatcherFailedTicksSeries"))
+        self.assertEqual(_py_const("BOARD_LABEL", _CHAT_METRICS_PY), _go_const(_SCRAPE_GO, "kanbanDispatcherBoardLabel"))
+        self.assertEqual(_py_const("ERROR_LABEL", _CHAT_METRICS_PY), _go_const(_SCRAPE_GO, "kanbanDispatcherErrorLabel"))
+        self.assertEqual(_py_const("KANBAN_DISPATCHER_FAILING_SECONDS_METRIC", _CHAT_METRICS_PY), _go_const(_SCRAPE_GO, "kanbanDispatcherFailingSecondsSeries"))
+
     def test_the_status_label_key_the_broker_writes_is_the_one_the_poller_filters_on(self):
         self.assertEqual(_py_const("TOOL_STATUS_LABEL"), _go_const(_SCRAPE_GO, "toolInvocationsStatusLabel"))
 

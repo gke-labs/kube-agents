@@ -51,7 +51,8 @@ The digest hour is a Toronto hour too, and "once a day" is a Toronto day.
 One side effect beyond posting: on a new OUTAGE with no tracking issue --
 none in case-notes.yaml, none open under the `presubmit-gate` label naming
 the same cases -- gate_issue.py files one with the workflow's GitHub token
-(`gh api`, GH_TOKEN), the "broken" message says "Tracking #NNN", and the
+(`gh api`, GH_TOKEN), the "broken" message says "Tracking #NNN" (the full
+URL when the issue is in the issues repository, ghcli.issue_tag), and the
 recovery comments on it. A new `lost_pods` condition (the build cluster lost
 the nodes under running jobs, #1478) files one the same way, addressed to
 the cluster owner, unless an open issue already names the lost nodes. A new `fixture_drift` condition (a seeded fixture out of its
@@ -87,6 +88,7 @@ Test: cd scripts && python3 -m unittest test_eval_dashboard_post_health
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import os
 import pathlib
@@ -188,19 +190,34 @@ DEFAULT_SLOW_BASELINE_DAYS = 7
 
 # pool-pressure.json's vocabulary (scripts/pool_pressure.py owns it), carried
 # through health.json's `pool` note. Copied rather than imported, and
-# test_integration_contracts.py fails if the copy drifts. The four causes have
-# four different remedies, one of which spends money, so the message branches
-# on them rather than printing the label.
+# test_integration_contracts.py fails if the copy drifts. The four causes call
+# for different things, one of which spends money, so the message branches on
+# them rather than printing the label.
 CAUSE_CAPACITY = "CAPACITY"
 CAUSE_CONCURRENCY_CAP = "CONCURRENCY_CAP"
+# The storm sentence names each phrasing the repetitions died with
+# (health.json incident.causes), short: the harness's "the executor's own
+# failure (<token>)" shell is peeled to the token, and a sentence-shaped
+# phrasing is cut at a word boundary. Past STORM_CHAT_PHRASINGS the rest is
+# a count, so one line stays one line.
+EXECUTOR_FAILURE_SHELL_RE = re.compile(r"^the executor's own failure \(([^()]+)\)$")
+STORM_CHAT_WORDS_MAX_CHARS = 40
+STORM_CHAT_WORDS_ELLIPSIS = "…"
+STORM_CHAT_PHRASINGS = 4
 CAUSE_CONTROL_PLANE = "CONTROL_PLANE"
-# Not a cause the periodic emits: the key `pool_causes` records when
-# CONTROL_PLANE is announced without the queue, which says something different
-# and names no build cluster. See `pool_cause_key`.
-CAUSE_CONTROL_PLANE_UNREAD = "CONTROL_PLANE:queue-unread"
 # The periodic's own "I could not tell", distinct from a label added later that
 # this file has no remedy for. Both ask for nothing; only this one knows why.
 CAUSE_UNKNOWN = "UNKNOWN"
+# Not causes the periodic emits: the keys `pool_causes` records when one of
+# QUEUE_UNREAD_CAUSES is announced without the queue, which says something
+# different (no build cluster; no live count). See `pool_cause_key`.
+QUEUE_UNREAD_KEY_SUFFIX = ":queue-unread"
+QUEUE_UNREAD_CAUSES = (CAUSE_CONTROL_PLANE, CAUSE_CONCURRENCY_CAP)
+# The cap message names the days the periodic breached on as month-day,
+# "11-05 and 11-06": the digit span after the year in the artifact's ISO day.
+DAY_MONTH_DAY = slice(5, None)
+DAYS_JOIN = ", "
+DAYS_LAST_JOIN = " and "
 
 # The kinds of message this script sends.
 KIND_CHANGE = "change"  # a new state, condition or (in an OUTAGE) case list
@@ -469,23 +486,26 @@ def pool_cause_key(pool: dict) -> str | None:
 
     `pool_causes` is what this episode has already said, and CONTROL_PLANE says
     two things: the build cluster to go and check, or that the queue could not
-    be read so nothing can be blamed. Keyed on the cause alone, an hour of
-    unreadable Deck at the start of an episode would record the vague one as
-    the remedy and the remedy would never post.
+    be read so nothing can be blamed; CONCURRENCY_CAP likewise says the live
+    queue, or the past days with the queue unread. Keyed on the cause alone, an
+    hour of unreadable Deck at the start of an episode would record the vague
+    one as the remedy and the remedy would never post.
     """
-    if pool.get("cause") == CAUSE_CONTROL_PLANE and pool.get("waiting_now") is None:
-        return CAUSE_CONTROL_PLANE_UNREAD
-    return pool.get("cause")
+    cause = pool.get("cause")
+    if cause in QUEUE_UNREAD_CAUSES and pool.get("waiting_now") is None:
+        return cause + QUEUE_UNREAD_KEY_SUFFIX
+    return cause
 
 
 def pool_told_keys(pool: dict) -> list[str]:
     """The keys a sent ⏳ marks as told, which the diagnosis widens.
 
-    Once the build cluster has been named, the unread-queue message is less
-    than the reader already has, so it is not owed later in the same episode.
+    Once the build cluster or the live queue has been named, the unread-queue
+    message is less than the reader already has, so it is not owed later in
+    the same episode.
     """
     key = pool_cause_key(pool)
-    return [key, CAUSE_CONTROL_PLANE_UNREAD] if key == CAUSE_CONTROL_PLANE else [key]
+    return [key, key + QUEUE_UNREAD_KEY_SUFFIX] if key in QUEUE_UNREAD_CAUSES else [key]
 
 
 def decide(health: dict, prev: dict | None, now: datetime, digest_hour: int, tz=LOCAL_TZ) -> list[str]:
@@ -676,9 +696,9 @@ def describe_cases(cases) -> str:
 
 
 def issue_tag(issue) -> str | None:
-    """"#1278" for an {number, url} the bot filed or found; None otherwise."""
-    number = (issue or {}).get("number") if isinstance(issue, dict) else None
-    return f"#{number}" if number else None
+    """ghcli.issue_tag: "#N" for this repository's issue, the URL for the
+    issues repository's; None for anything else."""
+    return ghcli.issue_tag(issue)
 
 
 def issue_for(issue, condition: str | None) -> dict | None:
@@ -697,15 +717,17 @@ def episode_issues(state: dict) -> list[dict]:
     out: list[dict] = []
     for candidate in [*(state.get("issues") or []), state.get("issue")]:
         tag = issue_tag(candidate)
-        if tag and tag not in {issue_tag(seen) for seen in out}:
+        if tag and not ghcli.has_issue([issue_tag(seen) for seen in out], tag):
             out.append(candidate)
     return out
 
 
 def tracking_text(issues, issue=None) -> str:
+    """The issues as the reader sees them: case-notes.yaml's as written
+    ("#N"), the bot's by URL, each issue once whichever form names it."""
     issues = list(issues or [])
     tag = issue_tag(issue)
-    if tag and tag not in issues:
+    if tag and not ghcli.has_issue(issues, tag):
         issues.append(tag)
     return ", ".join(issues) if issues else NO_ISSUE_TEXT
 
@@ -834,6 +856,18 @@ def pool_drift_retest(health: dict) -> str:
     return POOL_NO_RETEST if pool_drift_passes_leases(health) else POOL_RETEST
 
 
+def storm_words(words: str) -> str:
+    """One phrasing as the Chat sentence carries it: the executor-failure
+    shell peeled to its token, else the words cut at a word boundary."""
+    shell = EXECUTOR_FAILURE_SHELL_RE.match(words)
+    if shell:
+        return shell.group(1)
+    if len(words) <= STORM_CHAT_WORDS_MAX_CHARS:
+        return words
+    head = words[:STORM_CHAT_WORDS_MAX_CHARS]
+    return (head[: head.rfind(" ")] if " " in head else head).rstrip() + STORM_CHAT_WORDS_ELLIPSIS
+
+
 def cause_sentence(health: dict) -> str:
     """One sentence a reader can answer "is it me?" from."""
     incident = health.get("incident") or {}
@@ -861,7 +895,20 @@ def cause_sentence(health: dict) -> str:
     if condition == "storm":
         start, end = parse_iso(incident.get("window_start")), parse_iso(incident.get("window_end"))
         window = clock_range(start, end) if start and end else f"since {since}"
-        return f"quota storm {window} hit {prs} PRs."
+        # The repetitions' own words (health.json incident.causes), when the
+        # records carried any: "27 hermes-rate-limited, 1 delegated worker…".
+        # Counted by the form the reader sees, so two phrasings the cut makes
+        # identical are one item.
+        shown: Counter = Counter()
+        for words, n in (incident.get("causes") or []):
+            if isinstance(words, str) and words:
+                shown[storm_words(words)] += n
+        items = shown.most_common()
+        said = ", ".join(f"{n} {words}" for words, n in items[:STORM_CHAT_PHRASINGS])
+        rest = items[STORM_CHAT_PHRASINGS:]
+        if rest:
+            said += f", and {sum(n for _, n in rest)} reps in {len(rest)} other phrasings"
+        return f"quota storm {window} hit {prs} PRs" + (f"; reps: {said}." if said else ".")
     if condition == "setup_deaths":
         return f"{incident.get('runs', 0)} runs on {prs} PRs died during setup since {since}."
     if condition == CONDITION_FIXTURE_DRIFT:
@@ -979,10 +1026,16 @@ def pool_numbers(pool: dict) -> list[str]:
             f" against a {minutes_text(pool.get('threshold_p50_s'))} min limit;"
             f" p95 {wait_text(pool.get('p95_s'))} against {minutes_text(pool.get('threshold_p95_s'))}."
         )
-    waiting = pool.get("over_threshold") or 0
-    if waiting:
+    over = pool.get("over_threshold") or 0
+    waiting = pool.get("waiting")
+    if over and isinstance(waiting, int):
+        # The part of the live queue past the limit, against the whole of it;
+        # the cap's cause line has already said the whole.
+        lines.append(f"{over} of {waiting} waiting {plural(waiting, 'run')} {plural(over, 'is', 'are')} past the {minutes_text(pool.get('threshold_p95_s'))} min p95 limit.")
+    elif over:
+        # A note from before the live count was carried.
         lines.append(
-            f"{waiting} {plural(waiting, 'run')} waiting right now,"
+            f"{over} {plural(over, 'run')} waiting right now,"
             f" past the {minutes_text(pool.get('threshold_p95_s'))} min p95 limit."
         )
     if pool.get("lease_failures"):
@@ -998,10 +1051,21 @@ def pool_refusals(pool: dict) -> str:
     return f"{refused} {plural(refused, 'run')} refused a project{stretch}"
 
 
+def days_text(days) -> str:
+    """The artifact's ISO days as "11-05 and 11-06"; "recent days" when it
+    named none."""
+    names = [day[DAY_MONTH_DAY] for day in (days or []) if isinstance(day, str) and len(day) > DAY_MONTH_DAY.start]
+    if not names:
+        return "recent days"
+    if len(names) == 1:
+        return names[0]
+    return DAYS_JOIN.join(names[:-1]) + DAYS_LAST_JOIN + names[-1]
+
+
 def pool_cause_text(pool: dict) -> str:
-    """What to do, by cause. The four remedies differ and one of them spends
-    money, so an unrecognised cause falls through to the message that asks for
-    nothing."""
+    """What is wrong, by cause, and the remedy where there is one. The causes
+    call for different things and one of them spends money, so an unrecognised
+    cause falls through to the message that asks for nothing."""
     cause = pool.get("cause")
     if cause == CAUSE_CAPACITY:
         # The counts are this hour's Boskos reading and carry the remedy on
@@ -1023,9 +1087,33 @@ def pool_cause_text(pool: dict) -> str:
             f"{held}{queuing}. Consider onboarding a project."
         )
     if cause == CAUSE_CONCURRENCY_CAP:
+        # The presubmit sat at its own cap while runs queued. The pool is
+        # shared, so the cap's gap below the pool is the other jobs' share and
+        # the message gives no remedy: moving the cap is a human tradeoff.
+        cap = figure(pool.get("max_concurrency"))
+        live = pool.get("waiting_now")
+        if live:
+            waiting = pool.get("waiting")
+            count = f"{waiting} presubmit {plural(waiting, 'run is', 'runs are')}" if isinstance(waiting, int) else "presubmit runs are"
+            return (
+                f"*Smoke gate: queue* — {count} waiting, longest {wait_text(pool.get('waiting_longest_s'))};"
+                f" the presubmit is at its cap of {cap} slots."
+            )
+        worst = pool.get("worst_s")
+        waited = f"waited up to {wait_text(worst)}" if worst is not None else "waited past the limit"
+        # False is "no run past the p50 limit", not an empty queue: the live
+        # count says which. None is a queue Deck did not see, and "nothing
+        # waits" would assert what nothing measured.
+        waiting = pool.get("waiting")
+        if live is None or not isinstance(waiting, int):
+            now = " The job could not read the queue, so this bot cannot say whether runs still wait."
+        elif waiting:
+            now = f" {waiting} {plural(waiting, 'run waits', 'runs wait')} now, none past the limit."
+        else:
+            now = " Nothing waits now."
         return (
-            f"*Smoke gate: concurrency cap* — the pool has {figure(pool.get('total'))} projects"
-            f" but the concurrency cap is only {figure(pool.get('max_concurrency'))}. Raise the cap."
+            f"*Smoke gate: queue* — presubmit runs {waited} on {days_text(pool.get('breached_days'))};"
+            f" the presubmit was at its cap of {cap} slots.{now}"
         )
     if cause == CAUSE_CONTROL_PLANE:
         if pool.get("waiting_now") is None:
@@ -1550,7 +1638,7 @@ def render_recovery(health: dict, prev: dict, now: datetime) -> str:
     issues = list(prev.get("tracking_issues") or [])
     for each in episode_issues(prev):
         tag = issue_tag(each)
-        if tag not in issues:
+        if not ghcli.has_issue(issues, tag):
             issues.append(tag)
     if issues:
         parts.append(", ".join(issues))
@@ -1866,7 +1954,7 @@ def run(
             if tracker.is_open(each) is False:
                 log(f"tracking issue: #{each['number']} is closed; dropped")
                 dropped.append(issue_tag(each))
-                health = dict(health, tracking_issues=[tag for tag in health.get("tracking_issues") or [] if tag != issue_tag(each)])
+                health = dict(health, tracking_issues=[tag for tag in health.get("tracking_issues") or [] if not ghcli.has_issue([issue_tag(each)], tag)])
                 if issue_for(each, condition) and condition_open(health, condition) is not False and evidence_after(health, condition, tracker.closed_at(each)):
                     reopen = True
                 continue
@@ -1887,7 +1975,7 @@ def run(
     issue = next((candidate for candidate in carried if issue_for(candidate, condition) and not candidate.get(UNSETTLED_KEY)), None)
     # What the readers were told, less the issues this tick found closed:
     # the recovery names the ones still carried.
-    told = prev if prev is None else dict(prev, issues=carried, issue=None if issue_tag(prev.get("issue")) in dropped else prev.get("issue"), tracking_issues=[tag for tag in prev.get("tracking_issues") or [] if tag not in dropped])
+    told = prev if prev is None else dict(prev, issues=carried, issue=None if ghcli.has_issue(dropped, issue_tag(prev.get("issue"))) else prev.get("issue"), tracking_issues=[tag for tag in prev.get("tracking_issues") or [] if not ghcli.has_issue(dropped, tag)])
     wants_issue = (
         (KIND_CHANGE in kinds or reopen)
         and (health.get("state") == OUTAGE or condition in (CONDITION_LOST_PODS, CONDITION_FIXTURE_DRIFT, CONDITION_POOL_DRIFT))

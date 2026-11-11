@@ -182,11 +182,17 @@ func (s *SlackAdapter) uxLocked() *slackUX {
 // rather than gaining a second slot, whose older twin's eviction would
 // otherwise drop the live entry (a map entry deleted without retiring its
 // slot, then added again). The rings hold at most uxCap keys, so the
-// scan is bounded.
+// scan is bounded; a ring with a cap of its own uses rememberUpTo.
 func remember(order *[]string, key string, drop func(string)) {
+	rememberUpTo(order, key, uxCap, drop)
+}
+
+// rememberUpTo is remember with the ring's cap given: the ring holds at
+// most limit keys.
+func rememberUpTo(order *[]string, key string, limit int, drop func(string)) {
 	forget(order, key)
 	*order = append(*order, key)
-	if len(*order) > uxCap {
+	if len(*order) > limit {
 		drop((*order)[0])
 		*order = (*order)[1:]
 	}
@@ -377,7 +383,9 @@ func (s *SlackAdapter) noteHomeCandidate(msg InboundMessage, m *slackevents.Mess
 // our own member, the part after the workspace for an admitted guest's
 // "T…:U…" (slackGuestEntry). A pending turn keeps this raw id, because what it
 // feeds, the answered line's display name and the Home tab's asker, are Slack
-// API calls that take a member id.
+// API calls that take a member id. A shortcut's keeps the author id, for the
+// private notice that names a refused guest's entry, and cuts it here for the
+// Home tab.
 func slackMemberOf(author string) string {
 	if _, member, found := strings.Cut(author, slackGuestSep); found {
 		return member
@@ -567,8 +575,10 @@ func (s *SlackAdapter) InboundVerified(conversation, messageID string, verified 
 			s.mu.Unlock()
 			s.noteAsk(conversation, p.text)
 			// The clicker asked, so a question the task posts waits on them
-			// (the Home tab's "waiting on you"), as for a typed ask.
-			s.noteAsker(conversation, p.author)
+			// (the Home tab's "waiting on you"), as for a typed ask. The tab
+			// looks the asker up by member id, so a guest's "T…:U…" is cut
+			// to theirs.
+			s.noteAsker(conversation, slackMemberOf(p.author))
 			return
 		}
 		s.mu.Unlock()

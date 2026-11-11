@@ -14,9 +14,11 @@ reintroduces an errexit-fatal command ahead of the dumper.
 
 import pathlib
 import re
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
@@ -320,6 +322,135 @@ class CutOffReportTest(unittest.TestCase):
         )
         self.assertNotIn("WARNING", result.stdout)
         self.assertIn("1 of 3 cases graded", result.stdout)
+
+
+class CancelStopsModelCallsTest(unittest.TestCase):
+    """A SIGTERM to a run that grades a change cuts model access at once.
+
+    Prow cancels a presubmit for a newer push with a SIGTERM, and that
+    verdict is thrown away; the fan-out's units, the in-cluster agents and
+    the judge used to run on until the grace period ended. The TERM trap now
+    kills the stackless units and their children, takes the LiteLLM log,
+    and scales the LiteLLM Deployment to zero, in that order, before the
+    EXIT trap. A unit with a stack is left to destroy it. A main-branch run
+    keeps its old behaviour: its deadline cut-off is graded from the units
+    that finish in the grace period.
+    """
+
+    src = SCRIPT.read_text(encoding="utf-8")
+
+    def lifted(self, name: str) -> str:
+        match = re.search(rf"^{name}\(\) \{{[^\n]*\n.*?^\}}$", self.src, re.S | re.M)
+        if match is None:  # pragma: no cover
+            raise AssertionError(f"{name}() not found in {SCRIPT}")
+        return match.group(0)
+
+    def term_trap(self) -> str:
+        match = re.search(r"^trap '[^\n]*' TERM INT$", self.src, re.M)
+        if match is None:  # pragma: no cover
+            raise AssertionError(f"the TERM trap not found in {SCRIPT}")
+        return match.group(0)
+
+    def constants(self) -> str:
+        return "\n".join(re.findall(r"^readonly EVAL_CANCEL_[A-Z_]+=.*$", self.src, re.M))
+
+    def run_cancelled(
+        self, job_type: str, context: str = "gke_proj_us-central1_host"
+    ) -> tuple[int, str, list[pathlib.Path], bool]:
+        """Start one fake unit, SIGTERM the shell, and report what happened.
+
+        The unit's child stands in for its `kubectl exec` or the judge: left
+        running, it writes its own marker. If only the child died, the unit
+        would go on to "call the judge" (write the unit's marker), the leak a
+        kill of the child alone leaves open. A second unit, not recorded as
+        stackless, stands in for a unit with a stack; the last element says
+        whether it ran to its end.
+        """
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        judge = tmp / "judge-called"
+        child = tmp / "child-finished"
+        stack = tmp / "stack-destroyed"
+        script = "\n".join(
+            [
+                "set -euo pipefail",
+                self.constants(),
+                'readonly LITELLM_LOG_DEPLOYMENT="deployment/litellm"',
+                f'JOB_TYPE="{job_type}"',
+                f'AGENT_CLUSTER_CONTEXT="{context}"',
+                'PROJECT_ID="proj"',
+                'TARGET_NAMESPACE="kubeagents-system"',
+                'kubectl() { echo "called kubectl $*"; }',
+                "collect_litellm_log() { echo 'called collect_litellm_log'; }",
+                "trap 'echo \"exit trap $?\"' EXIT",
+                self.term_trap(),
+                'FANOUT_STACKLESS_UNIT_PIDS=""',
+                self.lifted("freeze_process_tree"),
+                self.lifted("stop_model_calls_on_cancel"),
+                f'( bash -c \'sleep 1; : > "{child}"\' || true; : > "{judge}" ) &',
+                'FANOUT_STACKLESS_UNIT_PIDS="${FANOUT_STACKLESS_UNIT_PIDS} $!"',
+                f'( sleep 1; : > "{stack}" ) &',
+                "echo ready",
+                "wait",
+            ]
+        )
+        proc = subprocess.Popen(
+            ["bash", "-c", script], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+        )
+        self.assertEqual(proc.stdout.readline().strip(), "ready")
+        proc.send_signal(signal.SIGTERM)
+        out, _ = proc.communicate(timeout=10)
+        # Past the unit's sleep: a unit left running has written the marker.
+        time.sleep(2)
+        return proc.returncode, out, [m for m in (child, judge) if m.exists()], stack.exists()
+
+    def test_a_cancelled_presubmit_kills_the_units_and_scales_the_gateway(self):
+        code, out, left, stack = self.run_cancelled("presubmit")
+        self.assertEqual(code, 143, out)
+        self.assertEqual(left, [], "the unit or its child outlived the cancel")
+        scale = "called kubectl --context gke_proj_us-central1_host -n kubeagents-system scale deployment/litellm --replicas=0"
+        self.assertIn(scale, out)
+        self.assertLess(out.index("called collect_litellm_log"), out.index(scale))
+        self.assertLess(out.index(scale), out.index("exit trap 143"))
+        self.assertTrue(stack, "a unit with a stack must be left to destroy it")
+
+    def test_a_batch_is_cut_the_same_way(self):
+        code, out, left, stack = self.run_cancelled("batch")
+        self.assertEqual(code, 143, out)
+        self.assertEqual(left, [])
+        self.assertIn("--replicas=0", out)
+
+    def test_a_main_branch_run_keeps_its_units_and_its_gateway(self):
+        for job_type in ("periodic", "postsubmit", ""):
+            code, out, left, stack = self.run_cancelled(job_type)
+            self.assertEqual(code, 143, out)
+            self.assertEqual(len(left), 2, f"JOB_TYPE={job_type!r}: the unit and its child should run on")
+            self.assertNotIn("called kubectl", out)
+            self.assertNotIn("called collect_litellm_log", out)
+
+    def test_a_cancel_before_the_cluster_context_still_kills_the_units(self):
+        for context in ("", "gke_other-project_us-central1_host"):
+            code, out, left, stack = self.run_cancelled("presubmit", context=context)
+            self.assertEqual(code, 143, out)
+            self.assertEqual(left, [])
+            self.assertNotIn("called kubectl", out, f"context={context!r}")
+
+    def test_every_term_trap_calls_it(self):
+        """The rollback round trips' own traps too, and the plain one they put back."""
+        traps = re.findall(r"^\s*trap '([^\n]*)' TERM INT$", self.src, re.M)
+        self.assertGreaterEqual(len(traps), 5)
+        for t in traps:
+            self.assertTrue(t.endswith("stop_model_calls_on_cancel || true; exit 143"), t)
+
+    def test_launch_units_records_each_unit(self):
+        body = self.lifted("launch_units")
+        launch = body.index('run_one_unit "${TASKS[IDX]}"')
+        # TASK_HAS_STACK (unit_takes_infra_lock) is false for a stack exempt
+        # from the infra lock, so the exemption is checked too.
+        self.assertIn(
+            'unit_takes_infra_lock "${IDX}" || infra_lock_exempt "${TASK_NAMES[IDX]}" \\\n'
+            '      || FANOUT_STACKLESS_UNIT_PIDS="${FANOUT_STACKLESS_UNIT_PIDS:-} $!"',
+            body[launch:],
+        )
 
 
 if __name__ == "__main__":

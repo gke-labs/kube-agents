@@ -115,6 +115,8 @@ class LifecycleScriptGuardTest(unittest.TestCase):
                    tfvar_kms_key='"k8s-secret-encryption-key"',
                    tfvar_cluster_name="null",
                    tfvar_enable_minter="false",
+                   tfvar_minter_shared_key='""',
+                   tfvar_minter_adopt_key='""',
                    gcloud_key_version="",
                    gcloud_scheduled_version="",
                    gcloud_scheduled_fail=False,
@@ -143,6 +145,8 @@ class LifecycleScriptGuardTest(unittest.TestCase):
                    output_stderr_noise="",
                    output_stub=None,
                    console_fail_var="",
+                   console_transient_fails=0,
+                   console_transient_error=None,
                    apply_stub="exit 0",
                    show_rc=0,
                    untaint_stub="exit 0",
@@ -228,6 +232,11 @@ fi
     exit 1"""
 
             # Stub terraform CLI to return configured state list, state show, and console outputs
+            # The transient answer console_transient_fails gives: Terraform's own
+            # wording and the Cloud Storage JSON body, as the kube-agents#5349 job
+            # log showed them, unless a test hands in another error text.
+            if console_transient_error is None:
+                console_transient_error = self._STATE_BACKEND_503
             terraform_stub = bin_dir / "terraform"
             terraform_stub.write_text(f"""#!/usr/bin/env bash
 set -e
@@ -253,6 +262,20 @@ elif [[ "$cmd" == "output" ]]; then
     {output_stub}
 elif [[ "$cmd" == "console" ]]; then
     read -r expr
+    # One line per read, for the tests that count the attempts tfvar makes.
+    echo "console $expr" >> "${{TF_STUB_LOG:-/dev/null}}"
+    # console_transient_fails models the state backend answering a transient
+    # error -- the Cloud Storage 503 that ended kube-agents#5349's provision --
+    # for the first N console reads of the run, whichever variable they ask
+    # for; the reads after that answer normally. The count lives in
+    # TF_STUB_LOG, so a test that sets console_transient_fails runs through
+    # _run_with_stub_log; without the log every read would fail.
+    if [[ {console_transient_fails} -gt 0 && -n "${{TF_STUB_LOG:-}}" && $(grep -c "^console" "$TF_STUB_LOG") -le {console_transient_fails} ]]; then
+        cat >&2 << 'EOF'
+{console_transient_error}
+EOF
+        exit 1
+    fi
     # console_fail_var models a terraform console that cannot answer -- a state
     # lock, a missing provider, a syntax error in the configuration -- for the
     # one variable named. Checked before every other branch so it wins.
@@ -279,6 +302,12 @@ elif [[ "$cmd" == "console" ]]; then
         exit 0
     elif [[ "$expr" == *"create_cluster"* ]]; then
         echo '{tfvar_create_cluster}'
+        exit 0
+    elif [[ "$expr" == *"github_minter_shared_kms_key"* ]]; then
+        echo '{tfvar_minter_shared_key}'
+        exit 0
+    elif [[ "$expr" == *"github_minter_adopt_unlabelled_kms_key"* ]]; then
+        echo '{tfvar_minter_adopt_key}'
         exit 0
     elif [[ "$expr" == *"namespace"* ]]; then
         echo '{tfvar_namespace}'
@@ -358,6 +387,9 @@ elif [[ "$cmd" == "untaint" ]]; then
     # The address is the last argument; -no-color precedes it.
     echo "untaint ${{@: -1}}" >> "${{TF_STUB_LOG:-/dev/null}}"
     {untaint_stub}
+elif [[ "$cmd" == "import" ]]; then
+    # The address, for the adoption tests (`import -input=false -no-color <addr> <id>`).
+    echo "import ${{@: -2:1}}" >> "${{TF_STUB_LOG:-/dev/null}}"
 elif [[ "$cmd" == "apply" ]]; then
     # One line per attempt, for the retry tests; apply_stub decides the outcome.
     echo "apply ${{@:2}}" >> "${{TF_STUB_LOG:-/dev/null}}"
@@ -377,7 +409,12 @@ exit 0
 KUBE_AGENTS_SOURCE_ONLY=true source "{_LIFECYCLE_SH}"
 {func_call}
 """
-            env = get_isolated_test_env(bin_dir=str(bin_dir))
+            # The retry knobs come from the test line, never from a shell that
+            # has been trying them out by hand.
+            env = get_isolated_test_env(
+                bin_dir=str(bin_dir),
+                absent=["STATE_BACKEND_ATTEMPTS", "STATE_BACKEND_WAIT_SECONDS"],
+            )
             cwd = str(_REPO_ROOT / "terraform" / "examples" / "full-install")
             if stdout_path is not None:
                 # stdout a regular file, as `./lifecycle.sh apply > apply.log`
@@ -1712,6 +1749,125 @@ resource "google_service_account" "agent" {
         self.assertIn("could not read the state for tainted resources", proc.stderr)
         self.assertIn(f"untaint {self._KEYRING}", log)
 
+    # The minter's ownership check (#3504): adopt_kms imports a minter key ring
+    # or key this state doesn't hold only when it is this install's own, or the
+    # one github_minter_shared_kms_key names.
+    _MINTER_KEYRING = "module.github_minter[0].google_kms_key_ring.minter"
+    _MINTER_KEY = "module.github_minter[0].google_kms_crypto_key.minter"
+
+    @staticmethod
+    def _minter_gcloud(labels: str | None, key_exists: bool = True, labels_fail: bool = False) -> str:
+        """gcloud for the adoption: the ring exists, the key exists or not, and
+        `kms keys describe --format=value(labels)` prints the labels (or fails)."""
+        if labels_fail:
+            labels_behavior = "exit 1"
+        else:
+            labels_behavior = f"echo '{labels or ''}'; exit 0"
+        return (
+            'if [[ "$*" == *"kms keys describe"* && "$*" == *"value(labels)"* ]]; then\n'
+            f"    {labels_behavior}\n"
+            'elif [[ "$*" == *"kms keys describe"* ]]; then\n'
+            f"    exit {0 if key_exists else 1}\n"
+            "fi\n"
+            "exit 0"
+        )
+
+    def _adopt_minter(self, labels, **kwargs):
+        kwargs.setdefault("tfvar_cluster_name", '"cluster-b"')
+        return self._run_with_stub_log(
+            "adopt_kms",
+            state_list="",
+            tfvar_create_cluster="false",
+            tfvar_enable_minter="true",
+            tfvar_enable_google_chat="false",
+            gcloud_stub=self._minter_gcloud(labels, **{k: kwargs.pop(k) for k in ("key_exists", "labels_fail") if k in kwargs}),
+            **kwargs,
+        )
+
+    def test_another_installs_minter_key_is_refused(self):
+        proc, log = self._adopt_minter("kube-agents-cluster=cluster-a;kube-agents-namespace=kubeagents-system")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("belongs to install cluster-a/kubeagents-system", proc.stderr)
+        self.assertIn("github_minter_shared_kms_key", proc.stderr)
+        self.assertNotIn("import ", log)
+
+    def test_an_unlabelled_minter_key_is_refused(self):
+        """A key from before the labels may be another install's: refused, not guessed."""
+        proc, log = self._adopt_minter("")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("carries no owner labels", proc.stderr)
+        self.assertNotIn("import ", log)
+        # The way out for an install's own key from before the labels, on the
+        # paths that never ran the interview (upgrade.sh, the Day-2 menu).
+        self.assertIn("MINTER_ADOPT_KEY=github-token-minter-keyring/github-token-minter-key in install.env", proc.stderr)
+
+    def test_this_installs_own_minter_key_is_adopted(self):
+        proc, log = self._adopt_minter("kube-agents-cluster=cluster-b;kube-agents-namespace=kubeagents-system")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("its owner labels name this install", proc.stdout)
+        self.assertIn(f"import {self._MINTER_KEYRING}", log)
+        self.assertIn(f"import {self._MINTER_KEY}", log)
+
+    def test_the_same_cluster_in_another_namespace_is_another_install(self):
+        proc, log = self._adopt_minter("kube-agents-cluster=cluster-b;kube-agents-namespace=team-two")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("belongs to install cluster-b/team-two", proc.stderr)
+
+    def test_the_key_named_as_shared_is_adopted_whatever_its_labels(self):
+        proc, log = self._adopt_minter(
+            "", tfvar_minter_shared_key='"github-token-minter-keyring/github-token-minter-key"')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("names it as shared on purpose", proc.stdout)
+        self.assertIn(f"import {self._MINTER_KEY}", log)
+
+    def test_an_unlabelled_key_named_explicitly_is_adopted_as_this_installs_own(self):
+        """The installer names it when KMS_KEYRING and KMS_KEY were given; the apply then labels it."""
+        proc, log = self._adopt_minter(
+            "", tfvar_minter_adopt_key='"github-token-minter-keyring/github-token-minter-key"')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("carries no owner labels and was named explicitly", proc.stdout)
+        self.assertIn(f"import {self._MINTER_KEY}", log)
+
+    def test_labels_win_over_an_explicit_name(self):
+        proc, log = self._adopt_minter(
+            "kube-agents-cluster=cluster-a;kube-agents-namespace=kubeagents-system",
+            tfvar_minter_adopt_key='"github-token-minter-keyring/github-token-minter-key"')
+        self.assertEqual(proc.returncode, 1)
+        self.assertNotIn("import ", log)
+
+    def test_a_shared_key_naming_another_key_adopts_nothing(self):
+        """The opt-in names one resource; it isn't a switch that lets any key in."""
+        proc, log = self._adopt_minter(
+            "kube-agents-cluster=cluster-a;kube-agents-namespace=kubeagents-system",
+            tfvar_minter_shared_key='"github-token-minter-keyring/some-other-key"')
+        self.assertEqual(proc.returncode, 1)
+        self.assertNotIn("import ", log)
+
+    def test_a_ring_whose_key_does_not_exist_yet_is_adopted(self):
+        proc, log = self._adopt_minter("", key_exists=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(f"import {self._MINTER_KEYRING}", log)
+        self.assertNotIn(f"import {self._MINTER_KEY}", log)
+
+    def test_unreadable_owner_labels_refuse_rather_than_adopt(self):
+        proc, log = self._adopt_minter(None, labels_fail=True)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("Could not read the owner labels", proc.stderr)
+        self.assertNotIn("import ", log)
+
+    def test_a_minter_key_already_in_state_is_not_checked(self):
+        """An existing install's own key is in its state: no describe, no refusal."""
+        proc, log = self._run_with_stub_log(
+            "adopt_kms",
+            state_list=f"{self._MINTER_KEYRING}\n{self._MINTER_KEY}",
+            tfvar_create_cluster="false",
+            tfvar_enable_minter="true",
+            tfvar_enable_google_chat="false",
+            gcloud_stub=self._minter_gcloud(None, labels_fail=True),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("owner labels", proc.stderr)
+
     def test_the_tainted_list_is_not_read_when_no_kms_resource_is_in_state(self):
         proc, log = self._run_with_stub_log("adopt_kms", state_list="", gcloud_stub="exit 1")
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -1782,6 +1938,31 @@ resource "google_service_account" "agent" {
         "Error: Error creating CryptoKey: googleapi: Error 403: Google Cloud KMS API "
         "has not been used in project 123 before or it is disabled."
     )
+
+    _STATE_BACKEND_503 = """╷
+│ Error: Failed to open state file at gs://test-tfstate/kube-agents/test/default.tfstate: Get "https://storage.googleapis.com/storage/v1/b/test-tfstate/o/default.tfstate?alt=json": googleapi: got HTTP response code 503 with body: {
+│   "error": {
+│     "code": 503,
+│     "message": "Authentication backend unavailable.",
+│     "status": "UNAVAILABLE"
+│   }
+│ }
+╵"""
+
+    # The Google front end answers a 502 with an HTML page, not the API's JSON.
+    _STATE_BACKEND_502_HTML = """╷
+│ Error: Failed to open state file at gs://test-tfstate/kube-agents/test/default.tfstate: Get "https://storage.googleapis.com/storage/v1/b/test-tfstate/o/default.tfstate?alt=json": googleapi: got HTTP response code 502 with body: <!DOCTYPE html>
+│ <html lang=en><title>Error 502 (Server Error)!!1</title>
+╵"""
+
+    # A 403 reads the same the second time: the identity lacks the role.
+    _STATE_BACKEND_403 = """╷
+│ Error: Failed to open state file at gs://test-tfstate/kube-agents/test/default.tfstate: googleapi: Error 403: sa@project.iam.gserviceaccount.com does not have storage.objects.get access to the Google Cloud Storage object., forbidden
+│   "error": {
+│     "code": 403,
+│     "status": "PERMISSION_DENIED"
+│   }
+╵"""
 
     def _apply_stub_failing_first(self, times, message):
         """A terraform apply that fails `times` times with `message`, then succeeds."""
@@ -1854,6 +2035,78 @@ resource "google_service_account" "agent" {
         self.assertEqual(proc.returncode, 1)
         self.assertEqual(log.count("apply -auto-approve -input=false"), 3, log)
         self.assertIn("run it again", proc.stderr)
+
+    def test_tfvar_retries_a_transient_state_backend_error(self):
+        """kube-agents#5349: the pre-apply guards read some fifty variables
+        through terraform console, each read opens the remote state, and one
+        Cloud Storage 503 ended the whole provision. A transient answer is
+        retried; the value comes back and the caller never sees the blip."""
+        proc, log = self._run_with_stub_log(
+            "STATE_BACKEND_WAIT_SECONDS=0 tfvar cluster_name",
+            tfvar_cluster_name='"platform-agent-host"',
+            console_transient_fails=2,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "platform-agent-host")
+        self.assertEqual(log.count("console var.cluster_name"), 3, log)
+        self.assertIn("attempt 2 of 4", proc.stderr)
+        self.assertIn("attempt 3 of 4", proc.stderr)
+        self.assertNotIn("could not evaluate", proc.stderr)
+
+    def test_tfvar_gives_up_after_its_attempt_budget(self):
+        """A backend that stays down is still a failure, and the terraform
+        error is printed, not swallowed: the operator reads what the backend
+        said, then how many times it was asked."""
+        proc, log = self._run_with_stub_log(
+            "STATE_BACKEND_WAIT_SECONDS=0 STATE_BACKEND_ATTEMPTS=3 tfvar cluster_name",
+            console_transient_fails=99,
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(log.count("console var.cluster_name"), 3, log)
+        self.assertIn('"code": 503', proc.stderr)
+        self.assertIn("could not evaluate var.cluster_name", proc.stderr)
+        self.assertIn("attempt 3 of 3", proc.stderr)
+        self.assertNotIn("attempt 4 of", proc.stderr)
+
+    def test_tfvar_does_not_retry_a_configuration_error(self):
+        """A console that cannot load the configuration reads the same the
+        second time; only the backend's transient answers are retried."""
+        proc, log = self._run_with_stub_log(
+            "STATE_BACKEND_WAIT_SECONDS=0 tfvar enable_drift_pubsub",
+            console_fail_var="enable_drift_pubsub",
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(log.count("console var.enable_drift_pubsub"), 1, log)
+        self.assertIn("could not evaluate var.enable_drift_pubsub", proc.stderr)
+        self.assertNotIn("attempt", proc.stderr)
+
+    def test_tfvar_retries_a_transient_error_whose_body_is_not_json(self):
+        """The Google front end serves an HTML page for a 502; only the
+        `got HTTP response code` wrapper says what happened."""
+        proc, log = self._run_with_stub_log(
+            "STATE_BACKEND_WAIT_SECONDS=0 tfvar cluster_name",
+            tfvar_cluster_name='"platform-agent-host"',
+            console_transient_fails=1,
+            console_transient_error=self._STATE_BACKEND_502_HTML,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "platform-agent-host")
+        self.assertEqual(log.count("console var.cluster_name"), 2, log)
+        self.assertIn("attempt 2 of 4", proc.stderr)
+
+    def test_tfvar_does_not_retry_a_permanent_backend_error(self):
+        """A 403 from the state bucket is the closest shape to the transient
+        answer -- same wrapper, same JSON body -- and must not be retried."""
+        proc, log = self._run_with_stub_log(
+            "STATE_BACKEND_WAIT_SECONDS=0 tfvar cluster_name",
+            console_transient_fails=99,
+            console_transient_error=self._STATE_BACKEND_403,
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(log.count("console var.cluster_name"), 1, log)
+        self.assertIn("could not evaluate var.cluster_name", proc.stderr)
+        self.assertIn("Error 403", proc.stderr)
+        self.assertNotIn("attempt", proc.stderr)
 
     def test_run_apply_keeps_a_log_file_that_stdout_points_at(self):
         """`lifecycle.sh apply > apply.log`: what the guards wrote before the
@@ -2223,7 +2476,9 @@ exit 0
         proc, _ = self._run_delete(wedged=True)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         calls = self.kubectl_args.splitlines()
-        self.assertEqual(len(calls), 7, self.kubectl_args)
+        # get, delete, patch, three RBAC deletes, and one JetStream claim
+        # delete per bus server ordinal (0, 1, 2).
+        self.assertEqual(len(calls), 9, self.kubectl_args)
         for call in calls:
             self.assertTrue(call.startswith("--context gke_test-project_us-central1_test-cluster "), call)
 
@@ -2248,10 +2503,12 @@ exit 0
             "delete clusterrole kubeagents:minimal:kubeagents-system:agent kubeagents:tokenreview:kubeagents-system:agent --ignore-not-found",
             self.kubectl_args,
         )
-        self.assertIn(
-            "delete pvc -n kubeagents-system -l app.kubernetes.io/instance=kubeagents-system-agent --field-selector metadata.name=data-agent-a2a-nats-0 --ignore-not-found --wait=false",
-            self.kubectl_args,
-        )
+        # One claim per bus server: a three-server bus has three.
+        for ordinal in (0, 1, 2):
+            self.assertIn(
+                f"delete pvc -n kubeagents-system -l app.kubernetes.io/instance=kubeagents-system-agent --field-selector metadata.name=data-agent-a2a-nats-{ordinal} --ignore-not-found --wait=false",
+                self.kubectl_args,
+            )
 
     def test_wedged_finalizer_truncates_long_instance_label_for_pvc(self):
         # Ensure that instanceLabel (>63 chars) is properly truncated to 63 chars
@@ -3174,7 +3431,7 @@ class LifecycleSubcommandFilterTest(unittest.TestCase):
         lines = [line for line in proc.stdout.splitlines() if line.strip()]
         self.assertTrue(lines[0].startswith("Makes `apply` and `destroy` repeatable"), lines[:1])
         self.assertIn("`plan`, `apply` and `destroy` hide helm_release's `metadata` block", proc.stdout)
-        self.assertEqual(lines[-1], "default kube-agents/<cluster_name>>. Unset, state stays local as before.")
+        self.assertEqual(lines[-1], "times STATE_BACKEND_WAIT_SECONDS (15) apart.")
         self.assertNotIn("set -euo pipefail", proc.stdout)
 
 
