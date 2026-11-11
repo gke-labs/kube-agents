@@ -3266,11 +3266,10 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
          (operatorRenderedPerReplica, read from the operator's one-replica golden),
          times platformAgent.deployment.credentialProxy.exec.replicas. Outside the loop
          above, which sums each operatorRendered entry once. A positive count with no
-         entry fails rather than counting the tier as zero. Its cpu and memory are
-         fixed, but the operator gives the tier the broker's other resource keys, so
-         an ephemeral-storage override on the broker moves each replica too: merged
-         as kube-agents.credentialProxyFootprint does, keeping the entry's cpu and
-         memory. No surge term: the tier rolls with maxSurge 0 and maxUnavailable 1, so
+         entry fails rather than counting the tier as zero. Its cpu, memory and
+         ephemeral storage are fixed (credential_proxy_exec_tier.go), so an override
+         of the broker's resources does not reach it and the entry is counted as it
+         is. No surge term: the tier rolls with maxSurge 0 and maxUnavailable 1, so
          a rollout replaces a pod in place and adds none. This
          counts the quota only; whether the nodes have room for a 2 CPU pod is the
          scheduler's, which this cannot see. */ -}}
@@ -3279,18 +3278,6 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
     {{- $exec := index ((index $footprint "operatorRenderedPerReplica") | default dict) "credentialProxyExecTier" | default dict -}}
     {{- if not $exec -}}
       {{- fail "quota preflight: platformAgent.deployment.credentialProxy.exec.replicas is set, but footprint.yaml has no operatorRenderedPerReplica.credentialProxyExecTier entry to size it. Reinstall from an intact chart, or set quotaPreflight.enabled=false to skip the check." -}}
-    {{- end -}}
-    {{- if $proxyOverride -}}
-      {{- /* Refused or merged against the sizing tier's row, as the broker's check is above;
-             only the ephemeral-storage figures are taken from it. */ -}}
-      {{- $execSized := include "kube-agents.sizingTierFootprintEntry" (dict "workload" $exec "tier" $sizingTier "container" "credentialProxy") | fromJson -}}
-      {{- $merged := include "kube-agents.credentialProxyFootprint" (dict "workload" $execSized "override" $proxyOverride "tier" $sizingTier) | fromJson -}}
-      {{- $exec = dict
-            "cpuMillisRequest" $exec.cpuMillisRequest "cpuMillisLimit" $exec.cpuMillisLimit
-            "memoryBytesRequest" $exec.memoryBytesRequest "memoryBytesLimit" $exec.memoryBytesLimit
-            "ephemeralStorageBytesRequest" $merged.ephemeralStorageBytesRequest
-            "ephemeralStorageBytesLimit" $merged.ephemeralStorageBytesLimit
-            "pods" $exec.pods -}}
     {{- end -}}
     {{- $reqPods = include "kube-agents.satAdd" (dict "a" $reqPods "b" (include "kube-agents.satMul" (dict "a" ($exec.pods | default 1 | int64) "b" $execReplicas))) | int64 -}}
     {{- $reqCpu = include "kube-agents.satAdd" (dict "a" $reqCpu "b" (include "kube-agents.satMul" (dict "a" ($exec.cpuMillisRequest | default 0 | int64) "b" $execReplicas))) | int64 -}}
