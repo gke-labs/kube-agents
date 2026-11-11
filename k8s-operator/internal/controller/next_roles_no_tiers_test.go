@@ -133,7 +133,15 @@ func TestNoNextModeRoleReachesTiers(t *testing.T) {
 			}
 		}
 	}
+	if len(clusterRoles.Items) == 0 {
+		t.Errorf("no ClusterRole was applied, so the ClusterRole check read nothing")
+	}
 	for _, r := range clusterRoles.Items {
+		// An aggregated ClusterRole's rules are whatever its selector picks
+		// up, which this can't read; the operator renders none.
+		if r.AggregationRule != nil {
+			t.Errorf("ClusterRole %s aggregates other roles, whose rules this test can't read", r.Name)
+		}
 		for _, rule := range r.Rules {
 			if got := ruleReachesTiers(rule); len(got) > 0 {
 				t.Errorf("ClusterRole %s reaches %v: %+v", r.Name, got, rule)
@@ -156,7 +164,12 @@ func TestNoNextModeRoleReachesTiers(t *testing.T) {
 	for _, b := range bindings.Items {
 		checkRef("RoleBinding "+b.Namespace+"/"+b.Name, b.Namespace, b.RoleRef)
 	}
+	authDelegator := false
 	for _, b := range clusterBindings.Items {
 		checkRef("ClusterRoleBinding "+b.Name, "", b.RoleRef)
+		authDelegator = authDelegator || b.RoleRef.Name == "system:auth-delegator"
+	}
+	if !authDelegator {
+		t.Errorf("no ClusterRoleBinding to system:auth-delegator was applied, so the built-in allowance went unexercised")
 	}
 }
