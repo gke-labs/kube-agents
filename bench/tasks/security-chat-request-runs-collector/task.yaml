@@ -86,8 +86,8 @@ verification_spec:
   # wrapper such as timeout or env, transparent parens (cmd), and bash -c
   # are accepted when running alone on the line; connectives, leading negation,
   # or non-propagating wrappers are not credited under succeeded: true (see
-  # WorkerRun.succeeded). compliance-audit must be a later word,
-  # scripts/eval_dashboard/collect.py do not count. The basename must be
+  # WorkerRun.succeeded). compliance-audit must be a later word, and other
+  # collector scripts such as scripts/eval_dashboard/collect.py do not count. The basename must be
   # collect.py, so test_collect.py does not count. A -h or --help call,
   # python3 -c, cat of the script, and an echo or grep that quotes the
   # command are not runs. The check requires succeeded: true (terminal call

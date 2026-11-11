@@ -8781,6 +8781,36 @@ def test_shell_argvs_split_segments_quotes_and_sh_c_strings():
     assert _shell_argvs_with_exit_propagation("./f.py --readiness --out /tmp/setsid") == [
         (["./f.py", "--readiness", "--out", "/tmp/setsid"], True),
     ]
+    assert _shell_argvs_with_exit_propagation("env -i ./f.py --readiness --out /tmp/setsid") == [
+        (["env", "-i", "./f.py", "--readiness", "--out", "/tmp/setsid"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("env -i python3 -m pkg.collect --readiness --out /tmp/setsid") == [
+        (["env", "-i", "python3", "-m", "pkg.collect", "--readiness", "--out", "/tmp/setsid"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("nice -n10 ./f.py --readiness --out /tmp/setsid") == [
+        (["nice", "-n10", "./f.py", "--readiness", "--out", "/tmp/setsid"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("nice -n 10 ./f.py --readiness --out /tmp/setsid") == [
+        (["nice", "-n", "10", "./f.py", "--readiness", "--out", "/tmp/setsid"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("command -v python3 /opt/security_auditor/collect.py compliance-audit") == [
+        (["command", "-v", "python3", "/opt/security_auditor/collect.py", "compliance-audit"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("command -V /opt/security_auditor/collect.py compliance-audit") == [
+        (["command", "-V", "/opt/security_auditor/collect.py", "compliance-audit"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("command -pv python3 f.py --readiness") == [
+        (["command", "-pv", "python3", "f.py", "--readiness"], False),
+    ]
+    assert _shell_argvs_with_exit_propagation("command -p python3 f.py --readiness") == [
+        (["command", "-p", "python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("command python3 f.py --readiness") == [
+        (["command", "python3", "f.py", "--readiness"], True),
+    ]
+    assert _shell_argvs_with_exit_propagation("command -- python3 f.py --readiness") == [
+        (["command", "--", "python3", "f.py", "--readiness"], True),
+    ]
     assert _shell_argvs_with_exit_propagation("./f.py --readiness --exclude watch") == [
         (["./f.py", "--readiness", "--exclude", "watch"], True),
     ]
@@ -8998,6 +9028,8 @@ def test_worker_commands_required_run_succeeded_flag():
         f"trap 'exit 0' EXIT; python3 {_SCRIPT_PATH} --readiness",
         f"python3(){{ :; }}; python3 {_SCRIPT_PATH} --readiness",
         f"watch python3 {_SCRIPT_PATH} --readiness",
+        f"command -v python3 {_SCRIPT_PATH} --readiness",
+        f"command -V {_SCRIPT_PATH} --readiness",
     ]:
         traj_joined = [
             {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": joined_cmd}, "result": '{"exit_code": 0, "output": "ok"}', "exit_code": 0, "status": "completed", "at": 1.0}
@@ -9094,6 +9126,8 @@ def test_worker_commands_required_run_succeeded_flag():
         f"(python3 {_SCRIPT_PATH} --readiness)",
         f'python3 {_SCRIPT_PATH} --readiness "with && and ; in quotes"',
         f"OUT=$(python3 {_SCRIPT_PATH} --readiness)",
+        f"command python3 {_SCRIPT_PATH} --readiness",
+        f"command -p python3 {_SCRIPT_PATH} --readiness",
     ]:
         traj_valid = [
             {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": valid_cmd}, "result": '{"exit_code": 0, "output": "ok"}', "exit_code": 0, "status": "completed", "at": 1.0}
@@ -9570,6 +9604,57 @@ def test_worker_commands_succeeded_with_after_result_pattern_withheld_call_besid
     assert res.status == "error"
     assert "the worker-trajectory capture was partial (the pod withheld a worker terminal call's arguments)" in res.reason
     assert "fleet_upgrade_report.py --readiness" in res.reason
+    assert "required command(s) it did not see may sit in the part it did not read: run fleet_upgrade_report.py --readiness" in res.reason
+
+    # Failed run (unrun_failed) beside a withheld call on window path reports its real status,
+    # not "did not see".
+    traj_failed_window = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "echo OPEN"}, "result": "OPEN", "status": "completed", "at": 1.0},
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": f"python3 {_SCRIPT_PATH} --readiness"}, "result": '{"exit_code": 1}', "exit_code": 1, "status": "completed", "at": 2.0},
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": worker_trajectory.WITHHELD, "status": "completed", "at": 3.0},
+    ]
+    transcript.set("ok", traj_failed_window)
+    res_failed = v.verify(5.0)
+    assert res_failed.status == "error"
+    assert (
+        "fleet_upgrade_report.py --readiness ran but exited non-zero (or its exit was not recorded); "
+        "a retry may sit in the unread part (the pod withheld a worker terminal call's arguments)"
+    ) in res_failed.reason
+    assert "did not see" not in res_failed.reason
+
+    # Masked run (unrun_masked) beside a withheld call on window path reports masked reason,
+    # not "did not see".
+    traj_masked_window = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "echo OPEN"}, "result": "OPEN", "status": "completed", "at": 1.0},
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": f"python3 {_SCRIPT_PATH} --readiness || true"}, "result": '{"exit_code": 0}', "exit_code": 0, "status": "completed", "at": 2.0},
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": worker_trajectory.WITHHELD, "status": "completed", "at": 3.0},
+    ]
+    transcript.set("ok", traj_masked_window)
+    res_masked = v.verify(5.0)
+    assert res_masked.status == "error"
+    assert (
+        "fleet_upgrade_report.py --readiness ran, but the dictated form is the command alone on its line"
+    ) in res_masked.reason
+    assert "a clean run may sit in the unread part (the pod withheld a worker terminal call's arguments)" in res_masked.reason
+    assert "did not see" not in res_masked.reason
+
+    # On window path with forbidden hit (failed=True) and partial capture, unrun_failed retains
+    # "a retry may sit in the unread part" qualifier.
+    v_forbid = WorkerCommandsVerifier(type="worker_commands", after_result_pattern=r"OPEN", forbidden_patterns=[r"^echo FORBIDDEN$"], required_runs=[run])
+    traj_forbid_hit = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "echo OPEN"}, "result": "OPEN", "status": "completed", "at": 1.0},
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": "echo FORBIDDEN"}, "result": "FORBIDDEN", "status": "completed", "at": 2.0},
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": f"python3 {_SCRIPT_PATH} --readiness"}, "result": '{"exit_code": 1}', "exit_code": 1, "status": "completed", "at": 3.0},
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": worker_trajectory.WITHHELD, "status": "completed", "at": 4.0},
+    ]
+    transcript.set("ok", traj_forbid_hit)
+    res_forbid = v_forbid.verify(5.0)
+    assert res_forbid.status == "fail"
+    assert "forbidden pattern(s) matched worker commands" in res_forbid.reason
+    assert (
+        "fleet_upgrade_report.py --readiness ran but exited non-zero (or its exit was not recorded); "
+        "a retry may sit in the unread part (the pod withheld a worker terminal call's arguments)"
+    ) in res_forbid.reason
 
 
 def test_worker_commands_after_result_pattern_withheld_call_beside_readable_passes_when_no_succeeded_run():

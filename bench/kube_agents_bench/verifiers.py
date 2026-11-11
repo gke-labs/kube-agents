@@ -107,11 +107,11 @@ from kube_agents_bench.shell_words import (
     _SHELL_ARITHMETIC_OPENER,
     _SHELL_ASSIGNMENT_RE,
     _SHELL_COUNT_RE,
+    _SHELL_EVAL,
     _SHELL_EXEC_WRAPPERS,
     _SHELL_EXPANSION_PREFIX,
     _SHELL_FLAG_PREFIX,
     _SHELL_LINE_END,
-    _SHELL_OPERATOR_CHARS,
     _SHELL_OPTIONS_END,
     _SHELL_PROGRAMS_WITH_COMMAND_STRING,
     _SHELL_RESERVED_WORDS,
@@ -2684,6 +2684,15 @@ _SUDO_LONG_VAL_LESS_OPTS = {
     "--set-home", "--preserve-groups", "--no-update",
 }
 _SETSID_VAL_LESS_FLAGS = set("cwf")
+_GENERIC_WRAPPER_VAL_OPTS = {
+    "env": frozenset(("-u", "-C", "-S", "--unset", "--chdir", "--split-string")),
+    "nice": frozenset(("-n", "--adjustment")),
+    "timeout": frozenset(("-s", "-k", "--signal", "--kill-after")),
+    "exec": frozenset(("-a",)),
+    "stdbuf": frozenset(("-i", "-o", "-e", "--input", "--output", "--error")),
+    "ionice": frozenset(("-c", "-n", "-p", "--class", "--classdata", "--pid")),
+    "chroot": frozenset(("--userspec", "--groups")),
+}
 
 
 def _has_detaching_wrapper(seg: list[str]) -> bool:
@@ -2778,22 +2787,17 @@ def _has_detaching_wrapper(seg: list[str]) -> bool:
                         continue
                     return True
                 elif w.startswith("-") and len(w) > 1:
-                    val_opt_end = False
                     for ci, c in enumerate(w[1:]):
                         if c == "b":
                             return True
                         if c in _SUDO_VAL_LESS_FLAGS:
                             continue
                         if c in _SUDO_SHORT_VAL_OPTS:
-                            val_opt_end = True
                             rest = w[1 + ci + 1:]
                             if not rest:
                                 prev_opt_takes_val = True
                             break
                         return True
-                    if val_opt_end:
-                        idx += 1
-                        continue
                     idx += 1
                     continue
                 elif _SHELL_ASSIGNMENT_RE.match(w):
@@ -2801,6 +2805,26 @@ def _has_detaching_wrapper(seg: list[str]) -> bool:
                     continue
                 else:
                     return True
+            continue
+        elif base == "command":
+            idx += 1
+            while idx < len(seg):
+                w = seg[idx]
+                if w == "--":
+                    idx += 1
+                    break
+                if w.startswith("-") and not w.startswith("--"):
+                    if any(c in "vV" for c in w[1:]):
+                        return True
+                    if all(c == "p" for c in w[1:]):
+                        idx += 1
+                        continue
+                    return True
+                elif w.startswith("-"):
+                    return True
+                if not w.startswith("-") and not _SHELL_ASSIGNMENT_RE.match(w):
+                    break
+                idx += 1
             continue
         elif base in _SHELL_EXEC_WRAPPERS:
             idx += 1
@@ -2822,8 +2846,25 @@ def _has_detaching_wrapper(seg: list[str]) -> bool:
                 if w == "--":
                     idx += 1
                     break
+                w_base = os.path.basename(w)
+                if (
+                    w_base in _SHELL_PROGRAMS_WITH_COMMAND_STRING
+                    or bool(_INTERPRETER_RE.match(w_base))
+                    or w == _SHELL_EVAL
+                    or (not w.startswith("-") and not _SHELL_ASSIGNMENT_RE.match(w) and ("." in w_base or "/" in w))
+                ):
+                    break
                 if w.startswith(_SHELL_FLAG_PREFIX):
-                    takes_val = (w != _SHELL_OPTIONS_END)
+                    if base in _GENERIC_WRAPPER_VAL_OPTS:
+                        if w.startswith("--"):
+                            opt_name, _, _ = w.partition("=")
+                            takes_val = (opt_name in _GENERIC_WRAPPER_VAL_OPTS[base] and "=" not in w)
+                        elif len(w) == 2 and w in _GENERIC_WRAPPER_VAL_OPTS[base]:
+                            takes_val = True
+                        else:
+                            takes_val = False
+                    else:
+                        takes_val = False
                     idx += 1
                     continue
                 if takes_val:
@@ -2995,20 +3036,6 @@ def _words_after_carry(words: list[str], run: WorkerRun) -> bool:
     return all(flag in words for flag in run.flags) and all(any(re.search(pattern, word) for word in words) for pattern in run.word_patterns)
 
 
-def _extract_exit_code(result: Any) -> int | None:
-    if isinstance(result, str):
-        try:
-            result = json.loads(result.strip())
-        except ValueError:
-            return None
-    if not isinstance(result, dict):
-        return None
-    code = result.get("exit_code", result.get("returncode"))
-    if isinstance(code, int) and not isinstance(code, bool):
-        return code
-    return None
-
-
 def _code_call_text_and_clip(entry: dict[str, Any]) -> tuple[str | None, bool]:
     """The command a ``terminal`` call ran, or the program an ``execute_code``
     call ran, and whether the command came from a clipped head regex; (None, False)
@@ -3081,7 +3108,7 @@ def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[str, float | Non
         result = entry.get("result")
         call_exit = entry.get("exit_code")
         if call_exit is None and isinstance(result, str):
-            call_exit = _extract_exit_code(result)
+            call_exit = worker_trajectory.extract_exit_code(result)
         call_succeeded = entry.get("status") == "completed" and call_exit == 0
         calls.append(
             (
@@ -3154,7 +3181,7 @@ def _card_lineages(parents: dict[str, str], cards: list[str]) -> dict[str, str]:
 
 
 def _format_traj_missing_reason(
-    runs: list[WorkerRun], argvs: list[list[str]], no_traj_for_succeeded: bool = False
+    runs: list[WorkerRun], argvs: list[list[str]]
 ) -> str:
     in_log = [r for r in runs if any(_argv_runs(argv, r) for argv in argvs)]
     not_in_log = [r for r in runs if not any(_argv_runs(argv, r) for argv in argvs)]
@@ -3711,7 +3738,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                     f"no worker command matched required pattern(s) {missing} "
                     f"across {len(commands)} command(s){exempted}{sources}"
                 )
-            if self.after_result_pattern is None and partial:
+            if partial:
                 unrun_missing_reported = [r for r in unrun_missing if not r.succeeded]
                 if unrun_missing_reported:
                     named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_missing_reported)
@@ -3732,7 +3759,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                     named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_clipped)
                     parts.append(_UNRUN_CLIPPED_REASON.format(named=named))
                 if traj_missing:
-                    parts.append(_format_traj_missing_reason(traj_missing, argvs, no_traj_for_succeeded))
+                    parts.append(_format_traj_missing_reason(traj_missing, argvs))
                 filtered_unseen = [r for r in unrun_missing if r.succeeded]
                 if filtered_unseen:
                     named = ", ".join(" ".join([run.script, *run.flags]) for run in filtered_unseen)
@@ -3753,7 +3780,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                     named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_clipped)
                     parts.append(_UNRUN_CLIPPED_REASON.format(named=named))
                 if traj_missing:
-                    parts.append(_format_traj_missing_reason(traj_missing, argvs, no_traj_for_succeeded))
+                    parts.append(_format_traj_missing_reason(traj_missing, argvs))
             if hits:
                 shown = "; ".join(
                     f"{p!r} matched {c[:_SHOWN_COMMAND_CHARS]!r}"
@@ -3786,12 +3813,39 @@ class WorkerCommandsVerifier(BaseVerifier):
                     if not forbidding:
                         not_seen = [f"pattern {p!r}" for p in missing] + [
                             " ".join(["run", run.script, *run.flags])
-                            for run in [*unrun_missing, *unrun_failed, *unrun_masked, *unrun_clipped, *traj_missing]
+                            for run in unrun_missing
                         ]
-                        reason = _PARTIAL_REQUIRED_CAPTURE_REASON.format(
-                            gaps=gaps_str,
-                            unseen=", ".join(not_seen),
-                        )
+                        details = []
+                        if unrun_failed:
+                            named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_failed)
+                            details.append(
+                                f"{named} ran but exited non-zero (or its exit was not recorded); "
+                                f"a retry may sit in the unread part ({gaps_str})"
+                            )
+                        if unrun_masked:
+                            named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_masked)
+                            details.append(
+                                _UNRUN_MASKED_REASON.format(named=named)
+                                + f"; a clean run may sit in the unread part ({gaps_str})"
+                            )
+                        if unrun_clipped:
+                            named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_clipped)
+                            details.append(_UNRUN_CLIPPED_REASON.format(named=named))
+                        if traj_missing:
+                            details.append(_format_traj_missing_reason(traj_missing, argvs))
+                        if not_seen:
+                            reason = _PARTIAL_REQUIRED_CAPTURE_REASON.format(
+                                gaps=gaps_str,
+                                unseen=", ".join(not_seen),
+                            )
+                            if details:
+                                reason += "; " + "; ".join(details)
+                        else:
+                            reason = (
+                                f"the worker-trajectory capture was partial ({gaps_str}), "
+                                f"so required run(s) requiring success could not be verified: "
+                                + "; ".join(details)
+                            )
                     else:
                         unrun_parts = []
                         if unrun_failed:
@@ -3807,8 +3861,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                             named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_missing)
                             unrun_parts.append(f"required run(s) {named} not seen in what was read")
                         if traj_missing:
-                            named = ", ".join(" ".join([run.script, *run.flags]) for run in traj_missing)
-                            unrun_parts.append(f"required run(s) requiring success ({named}) could not be verified")
+                            unrun_parts.append(_format_traj_missing_reason(traj_missing, argvs))
                         unrun_extra = ("; " + "; ".join(unrun_parts)) if unrun_parts else ""
                         reason = _PARTIAL_WORKER_CAPTURE_REASON.format(gaps=gaps_str) + unseen + unrun_extra + window
                     return VerificationResult(
@@ -3835,7 +3888,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                     named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_clipped)
                     details.append(_UNRUN_CLIPPED_REASON.format(named=named))
                 if traj_missing:
-                    details.append(_format_traj_missing_reason(traj_missing, argvs, no_traj_for_succeeded))
+                    details.append(_format_traj_missing_reason(traj_missing, argvs))
                 unseen_succeeded = [r for r in unrun_missing if r.succeeded]
                 if unseen_succeeded:
                     named = ", ".join(" ".join([run.script, *run.flags]) for run in unseen_succeeded)
@@ -3857,7 +3910,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                 if no_traj_for_succeeded:
                     reasons.append(_NO_WORKER_TERMINAL_CALLS_SUCCEEDED_REASON)
                 else:
-                    reasons.append(_format_traj_missing_reason(traj_missing, argvs, no_traj_for_succeeded))
+                    reasons.append(_format_traj_missing_reason(traj_missing, argvs))
             if unrun_clipped:
                 named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_clipped)
                 reasons.append(_UNRUN_CLIPPED_REASON.format(named=named))
