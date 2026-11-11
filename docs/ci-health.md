@@ -687,6 +687,15 @@ delegation-ceiling condition above: DEGRADED under its own name, its own
 message and advice, so a fleet-wide worker stall (#1879) is named here rather
 than read only as "not evaluated" on every pull request.
 
+A repetition graded `infra` under a reason that leads with
+`KUBE_AGENTS_FORGE_UNAVAILABLE` is a forge repetition: every check that errored
+did so because a forge read failed for a while during grading (a 5xx, a dropped
+connection, a GitHub rate limit on grading's own token). It is not a storm
+repetition either, so the storm rule and the pass-rate denominators leave it
+out, and a case whose ungraded repetitions are of this kind, with no storm
+repetition, is classed `forge-unavailable` on the run page (its Do is a
+retest).
+
 Three other shapes get a comment, each one line with the same marker and
 dedupe. A run the suite marked **not evaluated** — an admitted case, or every
 case, lost every repetition to infrastructure, so `hack/ci-eval-pr.sh` exited
