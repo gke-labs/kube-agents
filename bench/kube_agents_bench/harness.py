@@ -175,7 +175,7 @@ from devops_bench.agents import AgentConfig, AgentHarness, AgentResult
 from devops_bench.agents.result import empty_tokens
 
 from kube_agents_bench import inject_transport as inject
-from kube_agents_bench import board, card_wake, chat_shape, gitops, pushed_report, stop_hook, transcript, worker_trajectory
+from kube_agents_bench import a2a_door, board, card_wake, chat_shape, gitops, pushed_report, stop_hook, transcript, worker_trajectory
 from kube_agents_bench.gateway_silence import is_intentional_silence_response
 from kube_agents_bench.parsing import (
     DELEGATION_TOOL,
@@ -329,6 +329,22 @@ _LEASE_READ_TIMEOUT = 15
 # How much of a failed kubectl read's stderr the warning quotes.
 _KUBECTL_STDERR_LOG_CHARS = 300
 _INJECT_DEFAULT_LOCAL_PORT = 28099
+# The A2A door's local tunnel port for card-wait stopped asks (#5407), well
+# away from the door's own 8098 and from the inject tunnel's.
+_A2A_DOOR_DEFAULT_LOCAL_PORT = 28098
+# The trajectory entries a card-wait run records for the door: the send, and
+# the task's state once the cancel settled.
+_A2A_DOOR_SEND_ENTRY = "a2a_door.send"
+_A2A_DOOR_STATUS_ENTRY = "a2a_door.status"
+# How long after the cancel the harness waits for the task's terminal.
+_A2A_DOOR_CANCEL_SETTLE = 120.0
+# Seconds subtracted from the send time when asking the board which sessions
+# filed cards since: the board's created_at is the pod's clock, not this
+# machine's. Small next to the gap between stopped asks, which run one at a
+# time and each watch for many minutes, so an earlier case's cards stay out.
+_CARD_WAIT_CLOCK_SKEW = 30.0
+# The slowest the card-wait poll goes, whatever the delegation poll interval.
+_CARD_WAIT_POLL_CEILING = 5.0
 # The Secret the operator renders the door's bearer token into, named in the
 # message a run without the token fails with. Suffix and key, so the message
 # can spell the whole kubectl read.
@@ -2951,6 +2967,10 @@ class KubeAgentsHarness(AgentHarness):
             return AgentResult.errored(str(exc))
         if replay is not None:
             return self._execute_card_wake(replay, workspace_path)
+        if stop_hook.is_card_wait(prompt):
+            # Through the A2A door whatever the lane's transport: the door's
+            # turns hold for their cards, which is what the case stops.
+            return self._execute_card_wait(prompt)
         transport = os.environ.get("AGENT_TRANSPORT", TRANSPORT_API)
         if transport not in _TRANSPORTS:
             return AgentResult.errored(
@@ -2970,6 +2990,147 @@ class KubeAgentsHarness(AgentHarness):
                 f"{pushed_report.DIRECTIVE} needs AGENT_TRANSPORT={TRANSPORT_INJECT}, got {transport!r}"
             )
         return self._execute_api(prompt, workspace_path, opening_turn=opening_turn)
+
+    def _execute_card_wait(self, prompt: str) -> AgentResult:
+        """A card-wait stopped ask (:data:`stop_hook.CARD_WAIT_DIRECTIVE`, #5407).
+
+        Sends the ask through the gateway's A2A door (:mod:`a2a_door`), whose
+        turns hold for their cards. Then it polls the task and the board. The
+        moment a card filed since the send is on the board and the task is
+        still ``working``, it cancels the task (``tasks/cancel``), which is how
+        an A2A caller stops one. The window and its two entries are then
+        :meth:`_stop_after_first_card`'s.
+
+        The session the turn runs in is found off the board: the door doesn't
+        show the gateway's bus contextId, which names it. Stopped asks run
+        alone in the serial second phase, so the session is the one ``a2a-*``
+        session with a card created since the send (less
+        :data:`_CARD_WAIT_CLOCK_SKEW`). Two sessions is a setup error, so a
+        leftover from an earlier case can't be taken for this one: its cards
+        were created before the send.
+
+        Infrastructure, never a pass: no token, a door that won't answer, a
+        task that ends before any card, no card by the deadline, or more than
+        one candidate session. Any of those means the run never reached the
+        moment the case is about.
+        """
+        try:
+            stop = stop_hook.parse(prompt)
+            local_port = _numeric_env("AGENT_A2A_DOOR_LOCAL_PORT", str(_A2A_DOOR_DEFAULT_LOCAL_PORT), int)
+            poll_interval = _numeric_env(
+                "AGENT_DELEGATION_POLL_INTERVAL", _DEFAULT_DELEGATION_POLL_INTERVAL, float
+            )
+        except ValueError as exc:
+            return AgentResult.errored(str(exc))
+        assert stop is not None and stop.card_wait_deadline is not None
+        agent_service = os.environ.get("AGENT_SERVICE_NAME", _DEFAULT_AGENT_SERVICE_NAME)
+        service = agent_service + a2a_door.SERVICE_SUFFIX
+        token = os.environ.get("AGENT_A2A_DOOR_TOKEN", "").strip()
+        if not token:
+            return _infra_failure(
+                "AGENT_A2A_DOOR_TOKEN is unset and the A2A door authenticates every request. Read it "
+                f"from the {agent_service}{a2a_door.TOKEN_SECRET_SUFFIX} Secret's "
+                f"`{a2a_door.TOKEN_SECRET_KEY}` key in {os.environ.get('AGENT_NAMESPACE', _DEFAULT_AGENT_NAMESPACE)}"
+            )
+        base_url = os.environ.get("AGENT_A2A_DOOR_URL")
+        own_tunnel = not base_url
+        target = [f"svc/{service}"]
+
+        def _tunnel(reset: bool) -> None:
+            if not own_tunnel:
+                return
+            target[0] = _gateway_door_target(agent_service, service) or f"svc/{service}"
+            forward = _reset_port_forward if reset else _ensure_port_forward
+            forward(local_port, service=target[0], remote_port=a2a_door.REMOTE_PORT)
+
+        door = a2a_door.Door(base_url or f"http://127.0.0.1:{local_port}", token)
+
+        def _with_retries(call: Callable[[], dict[str, Any]], what: str) -> dict[str, Any]:
+            for attempt in range(1, _MAX_TRANSPORT_FAILURES + 1):
+                try:
+                    _tunnel(reset=attempt > 1)
+                    return call()
+                except RuntimeError as exc:  # a tunnel that won't come up
+                    last: Exception = exc
+                except a2a_door.DoorUnavailable as exc:
+                    if not exc.retryable:
+                        raise _TransportError(f"A2A door {what}: {exc}") from None
+                    last = exc
+                _log.warning("A2A door %s failed (%d/%d): %s", what, attempt, _MAX_TRANSPORT_FAILURES, last)
+                time.sleep(max(0.0, poll_interval))
+            raise _TransportError(f"A2A door {what}: {last}")
+
+        run_id, case_id, repetition = _inject_identity()
+        message_id = inject.message_id(run_id, case_id, repetition)
+        result = AgentResult(output="", trajectory=[], errors=[], metadata={"transport": "a2a-door"})
+        try:
+            since = time.time() - _CARD_WAIT_CLOCK_SKEW
+            task = _with_retries(lambda: door.send(stop.prompt, message_id=message_id), "message/send")
+            task_id = str(task.get("id") or "")
+            if not task_id:
+                return _infra_failure("the A2A door's message/send answered with no task id")
+            result.trajectory.append({
+                "name": _A2A_DOOR_SEND_ENTRY,
+                "args": {"task": task_id, "context": str(task.get("contextId") or "")},
+                "status": "completed",
+            })
+
+            # 1. Wait for the first card while the task works.
+            deadline = time.monotonic() + stop.card_wait_deadline
+            session = ""
+            while True:
+                task = _with_retries(lambda: door.get(task_id), "tasks/get")
+                state = a2a_door.task_state(task)
+                if state in a2a_door.TERMINAL_STATES:
+                    return _infra_failure(
+                        f"setup: the A2A door task ended {state} before any card was seen on the board, "
+                        "so the stop never landed during the card wait"
+                    )
+                sessions = board.sessions_with_cards_since(_agent_shell, since, _EXEC_TIMEOUT)
+                if sessions is not None and len(sessions) > 1:
+                    return _infra_failure(
+                        f"setup: {len(sessions)} sessions filed cards since the send ({', '.join(sessions)}); "
+                        "a card-wait stop needs to run alone to know which is the case's"
+                    )
+                if sessions and state == a2a_door.STATE_WORKING:
+                    session = sessions[0]
+                    break
+                if time.monotonic() >= deadline:
+                    return _infra_failure(
+                        f"setup: no card was seen on the board within {stop.card_wait_deadline:.0f}s "
+                        f"while the task worked (last state {state or 'unknown'})"
+                    )
+                # Faster than the delegation poll: the hold can be short, and
+                # the stop has to land inside it.
+                time.sleep(min(max(poll_interval, 1.0), _CARD_WAIT_POLL_CEILING))
+
+            # 2. The stop: the door's cancel on the task, then its terminal.
+            try:
+                door.cancel(task_id)
+                cancel = (True, "tasks/cancel accepted while the turn held for its card")
+            except a2a_door.DoorError as exc:
+                cancel = (False, f"tasks/cancel refused: {exc}")
+            final = task
+            end = time.monotonic() + _A2A_DOOR_CANCEL_SETTLE
+            while time.monotonic() < end:
+                final = _with_retries(lambda: door.get(task_id), "tasks/get")
+                if a2a_door.task_state(final) in a2a_door.TERMINAL_STATES:
+                    break
+                time.sleep(max(poll_interval, 1.0))
+            result.trajectory.append({
+                "name": _A2A_DOOR_STATUS_ENTRY,
+                "args": {"state": a2a_door.task_state(final), "final": a2a_door.task_state(final) in a2a_door.TERMINAL_STATES},
+                "status": "completed",
+            })
+            result.output = a2a_door.task_text(final)
+            result.metadata["final_message"] = result.output
+            card_wait = stop_hook.Stop(prompt=stop.prompt, observe_seconds=stop.observe_seconds)
+            self._stop_after_first_card(
+                result, session, card_wait, send_stop=lambda: cancel, poll_interval=poll_interval
+            )
+        except _TransportError as exc:
+            return _infra_failure(str(exc))
+        return result
 
     def _execute_api(
         self,

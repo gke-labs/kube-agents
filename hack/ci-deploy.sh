@@ -478,6 +478,15 @@ readonly A2A_GATEWAY_ELECTION_ON="true"
 # it onto the gateway from its own environment; only an exact "true" arms it.
 readonly A2A_CARD_STOP_ENV_VAR="A2A_CARD_STOP"
 readonly A2A_CARD_STOP_ON="true"
+# The gateway's A2A door (k8s-operator platformagent_a2a_manifests.go,
+# a2aAgentDoorEnvVar): on for the next lane, so the card-wait stopped ask
+# (bench stop_hook.CARD_WAIT_DIRECTIVE, #5407) can stop a turn while it holds
+# for its cards, which only console, MCP and A2A door turns do. A default
+# install leaves the door off; the lane diverges here on purpose. The door
+# authenticates every call with its own per-install token, which
+# hack/ci-eval-pr.sh reads from the Secret the operator renders.
+readonly A2A_AGENT_DOOR_ENV_VAR="A2A_AGENT_DOOR"
+readonly A2A_AGENT_DOOR_ON="true"
 # The bridge sidecar. The operator renders it into the agent pod under next
 # (platformagent_a2a_bridge.go): its bus identity, its env and the bus token
 # it must not mount are the operator's, not this script's. The script names
@@ -1786,6 +1795,9 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     # on by default, and set here so the lane doesn't depend on the default.
     --set-string "operator.extraEnv[9].name=${A2A_GATEWAY_ELECTION_ENV_VAR}"
     --set-string "operator.extraEnv[9].value=${A2A_GATEWAY_ELECTION_ON}"
+    # The A2A door, for the card-wait stopped ask (above).
+    --set-string "operator.extraEnv[10].name=${A2A_AGENT_DOOR_ENV_VAR}"
+    --set-string "operator.extraEnv[10].value=${A2A_AGENT_DOOR_ON}"
     # No A2A_DISPATCHER_IMAGE: the AgentProfile dispatcher is off by default
     # until profiles dispatch end to end, and the lane installs what a
     # default install does. Its image is still built (step 4) so the build

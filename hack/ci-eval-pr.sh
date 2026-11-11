@@ -210,6 +210,11 @@ readonly EVAL_VERDICT_MARKDOWN_FILE="eval-verdict.md"
 readonly EVAL_INJECT_TRANSPORT="inject"
 readonly EVAL_INJECT_TOKEN_SECRET_SUFFIX="-a2a-inject"
 readonly EVAL_INJECT_TOKEN_SECRET_KEY="token"
+# The A2A door's token Secret (k8s-operator platformagent_a2a_manifests.go),
+# rendered when hack/ci-deploy.sh turns the door on for the next lane. Only
+# the card-wait stopped ask (#5407) goes through the door.
+readonly EVAL_A2A_DOOR_TOKEN_SECRET_SUFFIX="-a2a-door"
+readonly EVAL_A2A_DOOR_TOKEN_SECRET_KEY="token"
 # The inject door's port-forward is per unit for the same reason the agent
 # API's is (run_one_unit): the harness reads AGENT_INJECT_LOCAL_PORT for it,
 # not AGENT_LOCAL_PORT, and its default (28099) would put every unit of the
@@ -2844,6 +2849,17 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ] && [ "${EVAL_ROLLBACK_LANE:-}" != "1" ]; then
   fi
   export AGENT_INJECT_TOKEN
   export AGENT_TRANSPORT="${EVAL_INJECT_TRANSPORT}"
+  # The A2A door's token, for the card-wait stopped ask alone. Missing is not
+  # fatal: the matrix goes through the inject door, and the harness records
+  # that one case as infrastructure when it has no token. The value is never
+  # echoed; only the Secret's name is.
+  EVAL_A2A_DOOR_TOKEN_SECRET="${AGENT_SERVICE_NAME}${EVAL_A2A_DOOR_TOKEN_SECRET_SUFFIX}"
+  if AGENT_A2A_DOOR_TOKEN="$(kubectl get secret "${EVAL_A2A_DOOR_TOKEN_SECRET}" -n "${TARGET_NAMESPACE}" -o jsonpath="{.data.${EVAL_A2A_DOOR_TOKEN_SECRET_KEY}}" | base64 --decode)" && [ -n "${AGENT_A2A_DOOR_TOKEN}" ]; then
+    export AGENT_A2A_DOOR_TOKEN
+  else
+    unset AGENT_A2A_DOOR_TOKEN
+    echo "WARNING: the A2A door's token Secret ${EVAL_A2A_DOOR_TOKEN_SECRET} (key ${EVAL_A2A_DOOR_TOKEN_SECRET_KEY}) is missing or empty in ${TARGET_NAMESPACE}; a card-wait stopped ask will be recorded as infrastructure." >&2
+  fi
   echo "EVAL_MODE_NEXT=1: running the matrix through the inject door (AGENT_TRANSPORT=${AGENT_TRANSPORT}, token from ${EVAL_INJECT_TOKEN_SECRET})"
 fi
 export JUDGE_API_KEY="${GEMINI_API_KEY}"

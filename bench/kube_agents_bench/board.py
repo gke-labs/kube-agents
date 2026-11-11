@@ -646,3 +646,74 @@ def read_session_cards(
         cards=cards,
         total=max(total, len(ids)),
     )
+
+
+# Line the sessions-since script prints before its JSON.
+SESSIONS_SINCE_PRESENT = "__KANBAN_SESSIONS_SINCE__"
+
+# Runs inside the agent container, read-only like the board read: the
+# distinct creator sessions of cards created at or after a time, limited to the
+# api executor's sessions (API_SESSION_PREFIX). Positional arguments: the data
+# root, the board file, the sentinel, the epoch seconds, the prefix.
+_SESSIONS_SINCE_SCRIPT = r"""
+import json, sqlite3, sys
+
+ROOT, BOARD, SENTINEL, SINCE, PREFIX = sys.argv[1:6]
+out = {"sessions": [], "error": None}
+try:
+    board = sqlite3.connect("file:%s/%s?mode=ro" % (ROOT, BOARD), uri=True, timeout=10)
+    cols = [r[1] for r in board.execute("PRAGMA table_info(tasks)")]
+    if "creator_session_id" not in cols or "created_at" not in cols:
+        out["error"] = "kanban board: tasks has no creator_session_id or created_at"
+    else:
+        rows = board.execute(
+            "SELECT DISTINCT creator_session_id FROM tasks WHERE created_at >= ? "
+            "AND substr(creator_session_id, 1, ?) = ?",
+            (float(SINCE), len(PREFIX), PREFIX))
+        out["sessions"] = sorted(str(r[0]) for r in rows if r[0])
+    board.close()
+except (sqlite3.Error, ValueError) as exc:
+    out["error"] = "kanban board: %s" % exc
+print(SENTINEL)
+print(json.dumps(out))
+"""
+
+
+def sessions_with_cards_since(
+    shell: Callable[[str, float], str], since: float, timeout: float
+) -> list[str] | None:
+    """The api executor sessions (``a2a-*``) that filed a card at or after
+    ``since`` (epoch seconds, the pod's clock), sorted; ``None`` when the read
+    failed or can't be trusted.
+
+    A card-wait stopped ask (:mod:`stop_hook`) uses this to find the session
+    its A2A door turn runs in: the door doesn't show the gateway's bus
+    contextId, which names the session. Stopped asks run alone in the eval's
+    serial second phase, so the only session filing cards in the window is
+    the case's. Counting only cards created since the send keeps a leftover
+    session from an earlier case out.
+    """
+    args = " ".join(
+        shlex.quote(a)
+        for a in [DATA_ROOT, BOARD_FILE, SESSIONS_SINCE_PRESENT, repr(float(since)), API_SESSION_PREFIX]
+    )
+    reply = shell(
+        f'PY={shlex.quote(HERMES_PYTHON)}; [ -x "$PY" ] || PY={shlex.quote(FALLBACK_PYTHON)}; '
+        f'"$PY" -c {shlex.quote(_SESSIONS_SINCE_SCRIPT)} {args}',
+        timeout,
+    )
+    marker = reply.find(SESSIONS_SINCE_PRESENT)
+    if marker < 0:
+        return None
+    try:
+        payload = json.loads(reply[marker + len(SESSIONS_SINCE_PRESENT) :].strip())
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict) or payload.get("error"):
+        if isinstance(payload, dict):
+            _log.warning("%s", payload["error"])
+        return None
+    sessions = payload.get("sessions")
+    if not isinstance(sessions, list):
+        return None
+    return [str(s) for s in sessions]

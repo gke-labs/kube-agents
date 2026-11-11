@@ -432,6 +432,14 @@ class FlagSetIsNextTest(unittest.TestCase):
             "--set-string",
             "operator.extraEnv[9].value=true",
         ]
+        # The A2A door, for the card-wait stopped ask (#5407), under the name
+        # the operator reads it by.
+        expected += [
+            "--set-string",
+            f"operator.extraEnv[10].name={go_constant(_A2A_MANIFESTS, 'a2aAgentDoorEnvVar')}",
+            "--set-string",
+            "operator.extraEnv[10].value=true",
+        ]
         # Nothing turns the AgentProfile dispatcher on: it is off by default,
         # and the lane installs what a default install does.
         self.assertNotIn(go_constant(_A2A_DISPATCHER, "a2aDispatcherImageEnvVar"), " ".join(args))
@@ -589,7 +597,8 @@ class FlagSetIsNextTest(unittest.TestCase):
         self.assertEqual(values[8], "operator.extraEnv[8].value=true")
         # The gateway's election, on for the lane on this path too.
         self.assertEqual(values[9], "operator.extraEnv[9].value=true")
-        self.assertEqual(len(values), 10, values)
+        self.assertEqual(values[10], "operator.extraEnv[10].value=true")
+        self.assertEqual(len(values), 11, values)
         self.assertNotIn(_AR_REPO, result.stdout)
         # The names are the ones the release publishes.
         common = text(_REPO_ROOT / "scripts" / "release" / "common.sh")

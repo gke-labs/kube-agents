@@ -72,8 +72,13 @@ prompt an ask the harness stops once it has filed a card
 only over the inject transport, so the case needs an entry in
 `hack/eval/api-lane-exclusions.txt`. `[bench:stop-mid-turn]`, optionally with `after=<seconds>` and
 `observe=<seconds>`, is the same stop sent while the opening turn still runs, `after` seconds after
-the harness first sees it working; a run whose stopped turn filed no card passes. The harness
-writes two entries for either case, `harness_stop_sent` and `harness_cards_stopped`, and the case's
+the harness first sees it working; a run whose stopped turn filed no card passes.
+`[bench:stop-in-card-wait]`, optionally with `deadline=<seconds>` and `observe=<seconds>`, sends the
+ask through the gateway's A2A door, whose turns hold for their cards, whatever the lane's transport.
+It cancels the door task (`tasks/cancel`) once a card filed since the send is on the board while the
+task still works. No card within `deadline`, or a task that ends before any card, is
+infrastructure, not a pass. The next lane turns the door on for it, so an eval install runs with a
+door a default install doesn't have. The harness writes two entries for any of these cases, `harness_stop_sent` and `harness_cards_stopped`, and the case's
 `tool_called` objectives name them.
 A first line of `[bench:reply-under-pushed-report]`, with `opening:`, `report:` and `reply:`
 lines under it, sends the opening as turn one, stores the report for the conversation in the

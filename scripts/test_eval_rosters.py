@@ -859,6 +859,7 @@ class InjectLaneExclusionsTest(unittest.TestCase):
 API_LANE_EXCLUDED = [
     "chat-stop-halts-delegated-remediation",  # #3263: the harness types `stop` through the door
     "chat-stop-mid-turn-files-no-card",  # #3263: the same, while the opening turn runs
+    "chat-stop-during-card-wait-a2a-door",  # #5407: the harness cancels through the A2A door, which only the next lane turns on
     "chat-question-asked-to-choose-pauses",  # #4004: grades the question only the inject lane's board read folds in
     "chat-reply-under-pushed-report",  # #4059: the harness stores the report and sends the reply through the door
 ]
@@ -1453,6 +1454,7 @@ class PresubmitWallTimeTest(unittest.TestCase):
 
         self.assertEqual(eval_rosters.STOP_DIRECTIVE, stop_hook.STOP_DIRECTIVE)
         self.assertEqual(eval_rosters.MID_TURN_DIRECTIVE, stop_hook.MID_TURN_DIRECTIVE)
+        self.assertEqual(eval_rosters.CARD_WAIT_DIRECTIVE, stop_hook.CARD_WAIT_DIRECTIVE)
         stopped = []
         alone = []
         for case in eval_rosters.presubmit_cases() + eval_rosters.nightly_cases():
