@@ -158,7 +158,8 @@ type Target struct {
 // verifier checked binds it (#4685): Name is "schedule/<name>" or a bare
 // source ("stall-watch"), Origin is "builtin", and Stream is the report stream
 // the grant binds (only ever the schedule's own name), empty when it binds none. The broker reads it
-// to decide which audit stream a task may write. Only AudienceCredentialProxy
+// to decide which audit stream a task may write (the broker's reader comes in
+// a later #4685 change). Only AudienceCredentialProxy
 // carries one.
 type Trigger struct {
 	Name   string `json:"name"`
@@ -461,7 +462,8 @@ func checkHeader(token string) error {
 }
 
 // The claim keys a credential may carry, exactly as spelled: the standard
-// claims jwt/v2's ClaimsData emits, the nats block's fields, and the target's.
+// claims jwt/v2's ClaimsData emits, the nats block's fields, the target's and
+// the trigger's.
 var (
 	topLevelClaims = map[string]bool{"jti": true, "iat": true, "iss": true, "name": true, "sub": true, "aud": true, "exp": true, "nbf": true, "nats": true}
 	natsClaims     = map[string]bool{"type": true, "version": true, "task": true, "profile": true, "tier": true, "pod": true, "pod_uid": true, "target": true, "trigger": true}

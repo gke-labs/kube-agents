@@ -123,7 +123,7 @@ type Entry struct {
 	Profile string `json:"profile,omitempty"`
 
 	// Trigger is the unattended trigger the gateway minted this grant for
-	// (#4685): set only at the unattended tier, and only on a grant a
+	// (#4685; the gateway's mint is Track 2, not yet built): set only at the unattended tier, and only on a grant a
 	// trigger's submission started. profile.run is refused unless the
 	// request names this same trigger, or none when this is nil, so the
 	// trigger the dispatcher puts in the task credential is the grant's.

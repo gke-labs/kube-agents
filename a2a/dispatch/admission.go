@@ -14,7 +14,8 @@ import (
 )
 
 // Verifier is the one verifier call the dispatcher makes: may the grant at
-// ref run profile at tier for target, started by trigger (nil for none). It is capability.Client's
+// ref run profile at tier for target, started by trigger (nil for
+// none). It is capability.Client's
 // CheckProfileRun (#3734); a nil error means permitted, an error wrapping
 // ErrVerifierUnreachable means no verifier answered, and anything else is a
 // refusal.

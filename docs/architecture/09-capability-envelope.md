@@ -249,13 +249,17 @@ narrows only to itself, and a hop (a child entry a broker writes) carries its pa
 unchanged, so no hop can relabel a human's `read` grant as `unattended` or choose which profile its
 chain may run. A profile task's child task does not hop: the gateway mints it a fresh root, naming
 the child's profile at the parent's tier, with a target inside the parent's, which is how fan-out
-crosses profiles. The dispatcher asks the verb `profile.run` with two request fields of its own,
-`profile` and `tier`, and a target scope (`project/P/location/L/cluster/C`, or the install's
+crosses profiles. An `unattended` grant may also bind a `trigger` (`{name, origin, stream}`, added
+11/11, #4685): the unattended trigger whose submission the gateway minted it for. Only that tier
+carries one, and a hop carries it unchanged, as it does `profile`. The dispatcher asks the verb
+`profile.run` with three request fields of its own, `profile`, `tier` and an optional `trigger`
+(the one the submission claims), and a target scope (`project/P/location/L/cluster/C`, or the install's
 `namespace/N` for a task with no target, never empty). The verifier allows it only when the verb is
 in the grant's tier set, the target is inside the grant's scope, `tier` is the grant's own tier and
-`profile` is the grant's profile. It still answers yes or no, and the dispatcher never reads a tier
-out of the grant. Any other verb carrying `profile` or `tier` is refused rather than having the
-fields ignored. These refusals are verb refusals, so they keep their reasons. That tells the asker
+`profile` is the grant's profile, and `trigger` equals the grant's in both directions (a claimed
+trigger the grant lacks, or a grant trigger the request omits, is refused). It still answers yes or
+no, and the dispatcher never reads a tier or a trigger out of the grant. Any other verb carrying
+`profile`, `tier` or `trigger` is refused rather than having the fields ignored. These refusals are verb refusals, so they keep their reasons. That tells the asker
 which tier and profile the grant carries, which the split above allows: the asker is the leaf
 delegate, already holding the capability.
 
@@ -829,8 +833,9 @@ server, and against the shipped render rather than a hand-written config.**
   well-formed capabilities has not been tested, and the tell is a suite where every capability was
   minted by the code under test.
 - **A profile grant cannot be relabelled or repointed:** a child that changes `read` to
-  `unattended`, or changes or drops `profile`, fails resolution; `profile.run` naming another tier or
-  profile is refused; `profile` or `tier` on any other verb is refused.
+  `unattended`, or changes or drops `profile` or `trigger`, fails resolution; `profile.run` naming
+  another tier, profile or trigger is refused; `profile`, `tier` or `trigger` on any other verb is
+  refused.
 - **Widening is refused:** a child granting a tier or scope its parent does not hold fails
   resolution, whether it widens by one field or replaces the payload wholesale.
 - **A concurrent capability belonging to another request is refused:** one agent is handed two
