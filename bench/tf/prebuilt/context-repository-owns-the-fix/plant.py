@@ -29,9 +29,13 @@ plants the three for one run, on the install the run grades:
    teardown, a later plant and the repository reset
    (hack/ci_reset_agent_pulls.py, PLANTED_STACK_FILES) know a file is the
    stack's.
-2. The live workload. `fixture/live/payments-api.yaml` applied to the
-   agent host (the `demo-shop` namespace, a Deployment, a Secret, a
-   ConfigMap and a Service), the namespace labelled as the stack's.
+2. The live workload. The `demo-shop` namespace, created with the stack's
+   labels in one apply, then `fixture/live/payments-api.yaml` (a
+   Deployment, a Secret, a ConfigMap and a Service) applied to the agent
+   host without its own Namespace document: an apply of that unlabelled
+   document after the labelled one would remove the labels, because
+   client-side apply removes a field that is in last-applied and absent
+   from the new document. The file keeps the document for a hand apply.
 3. The registration. One entry for the context repository, with its ref,
    added to the `context_repos` key of the install's GitOps state
    ConfigMap (`<agent>-gitops-state`), which the operator seeds from the
@@ -48,10 +52,12 @@ case's `fixture/context-repository/` on the ref the stack names
 
 plant:
 
-1. Refuses a planted file on the default branch that is not the stack's,
-   and a `demo-shop` namespace on the agent host that does not carry the
-   stack's label. A leftover that is the stack's (a run stopped before its
-   teardown) is written again or deleted first.
+1. Refuses, before the first write, an entry in `context_repos` for the
+   context repository that is not the stack's, a `demo-shop` namespace on
+   the agent host that does not carry the stack's label, and a planted
+   file on the default branch that is not the stack's. A leftover that is
+   the stack's (a run stopped before its teardown) is written again or
+   deleted first.
 2. Commits the four files, applies the workload, adds the registration,
    waits for the mounts.
 
@@ -138,9 +144,16 @@ GITHUB_HOST = "https://github.com"
 GITHUB_HOSTS = frozenset({"github.com", "www.github.com", "ssh.github.com"})
 GITHUB_PATH_DEPTH = 2
 GIT_SUFFIX = ".git"
-# The namespace manifest the plant applies, labels included, in one apply.
+# The namespace manifest the plant applies, labels included, in one apply,
+# and how the live manifest's own Namespace document is told apart and
+# dropped: the document separator and the top-level kind line, each matched
+# with a trailing comment stripped and nothing else (no quoting, no indent);
+# the unit test holds the fixture file to what this drops.
 NAMESPACE_API_VERSION = "v1"
 NAMESPACE_KIND = "Namespace"
+YAML_DOCUMENT_SEPARATOR = "---"
+NAMESPACE_KIND_LINE = f"kind: {NAMESPACE_KIND}"
+YAML_COMMENT = "#"
 HTTP_TIMEOUT_S = 30
 HTTP_OK = 200
 HTTP_CREATED = 201
@@ -549,6 +562,27 @@ class Stack:
             },
         })
 
+    def workload_manifest(self) -> str:
+        """The live manifest without its Namespace document.
+
+        The stack creates the namespace itself, labelled, before this goes
+        on; applying the file's unlabelled Namespace document after that
+        would remove the labels, because client-side apply removes a field
+        that is in last-applied and absent from the new document. The file
+        keeps the document so that a hand apply of it stands alone.
+        """
+        def bare(line: str) -> str:
+            return line.split(YAML_COMMENT, 1)[0].strip()
+
+        documents: list[list[str]] = [[]]
+        for line in self.fixture_file(FIXTURE_LIVE_MANIFEST).splitlines():
+            if bare(line) == YAML_DOCUMENT_SEPARATOR:
+                documents.append([])
+            else:
+                documents[-1].append(line)
+        kept = [doc for doc in documents if not any(bare(line) == NAMESPACE_KIND_LINE for line in doc)]
+        return f"\n{YAML_DOCUMENT_SEPARATOR}\n".join("\n".join(doc) for doc in kept) + "\n"
+
     def namespace_owner(self) -> str | None:
         """The namespace's managed-by label, "" when unlabelled, None when absent."""
         # --ignore-not-found: an absent namespace is an empty answer with exit
@@ -561,10 +595,19 @@ class Stack:
         labels = ((json.loads(out) or {}).get("metadata") or {}).get("labels") or {}
         return str(labels.get(MANAGED_BY_KEY) or "")
 
-    def plant_workload(self) -> None:
+    def check_namespace(self) -> str | None:
+        """The namespace's owner, after refusing one that is not the stack's.
+
+        Read before the first write, as `check_registration` is, so a
+        refusal costs no commit.
+        """
         owner = self.namespace_owner()
         if owner is not None and owner != MANAGED_BY:
             raise RuntimeError(f"namespace {WORKLOAD_NAMESPACE} exists on {self.settings.cluster} and is not labelled {MANAGED_BY_KEY}={MANAGED_BY} (found {owner!r}); this stack did not create it, so it does not write into it")
+        return owner
+
+    def plant_workload(self) -> None:
+        owner = self.check_namespace()
         if owner == MANAGED_BY:
             log(f"found a leftover {WORKLOAD_NAMESPACE} from an earlier run; deleting it before planting")
             code, _, err = self.kubectl("delete", "namespace", WORKLOAD_NAMESPACE, "--ignore-not-found", "--wait=true", f"--timeout={NAMESPACE_DELETE_WAIT_S}s")
@@ -573,11 +616,12 @@ class Stack:
         # The namespace is created with its labels in one apply, before the
         # manifest goes on: there is no moment at which it exists unlabelled,
         # so a failure anywhere after this leaves a namespace the teardown
-        # may delete.
+        # may delete. The manifest then goes on without its own Namespace
+        # document (workload_manifest), which would remove the labels.
         code, _, err = self.kubectl("apply", "-f", "-", stdin=self.namespace_manifest())
         if code != 0:
             raise RuntimeError(f"cannot create namespace {WORKLOAD_NAMESPACE}: {err.strip()}")
-        code, _, err = self.kubectl("apply", "-f", "-", stdin=self.fixture_file(FIXTURE_LIVE_MANIFEST))
+        code, _, err = self.kubectl("apply", "-f", "-", stdin=self.workload_manifest())
         if code != 0:
             raise RuntimeError(f"cannot apply the live workload to {self.settings.cluster}: {err.strip()}")
         log(f"applied the payments-api workload to {WORKLOAD_NAMESPACE} on {self.settings.cluster}")
@@ -711,6 +755,7 @@ class Stack:
         self.check_settings()
         self.check_fixture()
         self.check_registration()
+        self.check_namespace()
         self.plant_gitops()
         self.plant_workload()
         self.register()

@@ -111,11 +111,19 @@ class FakeGitHub:
 class FakeHost:
     """gcloud and kubectl against one agent host: a namespace with labels, a
     state ConfigMap, and two mounts that lag the ConfigMap by `mount_lag`
-    reads. Records every argv."""
+    reads. Records every argv.
+
+    `kubectl apply` of a Namespace document is client-side apply: the labels
+    the last applied document carried and this one does not are removed, as
+    kubectl's three-way merge removes a field that is in last-applied and
+    absent from the new configuration; `kubectl label` writes a label that
+    no apply recorded, so a later apply never removes it."""
 
     def __init__(self, namespace_labels=None, configmap=None, mount_lag=0, fail=()):
         # None: no namespace; {}: a namespace with no labels.
         self.namespace_labels = namespace_labels
+        # The labels of the last Namespace document applied, None before one.
+        self.last_applied_labels = None
         self.configmap = dict(configmap or {})
         self.mount_lag = mount_lag
         self.fail = set(fail)
@@ -143,20 +151,17 @@ class FakeHost:
             return 0, json.dumps({"metadata": {"name": NAMESPACE, "labels": self.namespace_labels}}), ""
         if verb == "delete" and args[1] == "namespace":
             self.namespace_labels = None
+            self.last_applied_labels = None
             return 0, "", ""
-        if verb == "create" and args[1] == "namespace":
-            return 0, f"apiVersion: v1\nkind: Namespace\nmetadata:\n  name: {NAMESPACE}\n", ""
         if verb == "apply":
             assert stdin
             docs = [doc for doc in yaml.safe_load_all(stdin) if doc]
-            if len(docs) == 1 and docs[0]["kind"] == "Namespace":
-                labels = (docs[0].get("metadata") or {}).get("labels") or {}
-                if self.namespace_labels is None:
-                    self.namespace_labels = dict(labels)
+            for doc in docs:
+                if doc["kind"] == "Namespace":
+                    self.apply_namespace((doc.get("metadata") or {}).get("labels") or {})
                 else:
-                    self.namespace_labels.update(labels)
-            else:
-                assert self.namespace_labels is not None, "the manifest went on before the namespace"
+                    assert self.namespace_labels is not None, "the manifest went on before the namespace"
+            if any(doc["kind"] != "Namespace" for doc in docs):
                 self.applied.append(stdin)
             return 0, "", ""
         if verb == "label":
@@ -185,6 +190,16 @@ class FakeHost:
                 return 1, "", "cat: /etc/gitops/context_repos: No such file or directory"
             return 0, value, ""
         raise AssertionError(f"unexpected kubectl {args}")
+
+    def apply_namespace(self, labels):
+        """Client-side apply of one Namespace document with `labels`."""
+        if self.namespace_labels is None:
+            self.namespace_labels = {}
+        for key in self.last_applied_labels or {}:
+            if key not in labels:
+                self.namespace_labels.pop(key, None)
+        self.namespace_labels.update(labels)
+        self.last_applied_labels = dict(labels)
 
 
 def _settings(token_file="/unused", **overrides):
@@ -255,7 +270,11 @@ def test_the_plant_labels_the_namespace_before_the_workload_and_applies_the_live
     assert host.namespace_labels == {"managed-by": "kube-agents-bench", "build-id": "local", "pull-number": "none"}
     assert len(host.applied) == 1
     docs = [doc for doc in yaml.safe_load_all(host.applied[0]) if doc]
-    assert {doc["kind"] for doc in docs} == {"Namespace", "Secret", "ConfigMap", "Deployment", "Service"}
+    # The manifest's own Namespace document is not applied: a second apply of
+    # the namespace without the labels would remove them (client-side apply
+    # removes what is in last-applied and absent from the new document).
+    assert {doc["kind"] for doc in docs} == {"Secret", "ConfigMap", "Deployment", "Service"}
+    assert all(doc["metadata"]["namespace"] == NAMESPACE for doc in docs)
     deployment = next(doc for doc in docs if doc["kind"] == "Deployment")
     env = {e["name"] for e in deployment["spec"]["template"]["spec"]["containers"][0]["env"]}
     assert "PAYMENTS_LEGACY_LEDGER_URL" in env
@@ -266,6 +285,20 @@ def test_the_plant_labels_the_namespace_before_the_workload_and_applies_the_live
     applies = [c for c in host.calls if c[0] == "kubectl" and c[3] == "apply"]
     assert len(applies) == 2
     assert verbs.index("apply") < verbs.index("rollout")
+
+
+def test_a_teardown_after_a_full_plant_deletes_the_namespace_and_the_next_plant_succeeds():
+    # The namespace keeps the stack's labels through the apply of the live
+    # manifest, so the teardown reads it as the stack's and deletes it, and a
+    # plant on the same host after that is not refused.
+    github, host = FakeGitHub(), FakeHost()
+    stack = _stack(github, host)
+    stack.plant()
+    assert host.namespace_labels["managed-by"] == "kube-agents-bench"
+    assert stack.teardown()
+    assert host.namespace_labels is None
+    _stack(FakeGitHub(), host).plant()
+    assert host.namespace_labels["managed-by"] == "kube-agents-bench"
 
 
 def test_the_plant_registers_the_context_repository_with_its_ref_and_waits_for_both_mounts():
@@ -394,16 +427,19 @@ def test_the_plant_refuses_a_file_that_is_not_the_stacks():
     assert host.applied == []
 
 
-def test_the_plant_refuses_a_namespace_that_is_not_the_stacks_after_removing_its_files():
+def test_the_plant_refuses_a_namespace_that_is_not_the_stacks_before_the_commits():
     github, host = FakeGitHub(), FakeHost(namespace_labels={})
     stack = _stack(github, host)
     with pytest.raises(RuntimeError, match="not labelled"):
         stack.plant()
+    # Read before the first write, as the docstring's step 1 says: no commit
+    # to undo, nothing applied.
+    assert github.writes == []
     assert host.applied == []
     assert host.namespace_labels == {}
-    # The teardown main() runs next leaves the foreign namespace and takes the files.
+    # The teardown main() runs next leaves the foreign namespace and writes nothing.
     assert stack.teardown()
-    assert github.files == {}
+    assert github.writes == []
     assert host.namespace_labels == {}
 
 
@@ -552,15 +588,16 @@ def test_every_fixture_file_carries_the_label_the_teardown_and_the_reset_read():
         assert doc["metadata"]["labels"]["managed-by"] == "kube-agents-bench", name
 
 
-def test_the_live_manifest_is_the_rendered_release():
+def test_the_live_manifest_is_the_rendered_release_and_the_stack_applies_it_without_its_namespace():
     docs = [doc for doc in yaml.safe_load_all((FIXTURE / plant.FIXTURE_LIVE_MANIFEST).read_text()) if doc]
+    # Whole, for a hand apply: the namespace first.
     assert docs[0]["kind"] == "Namespace" and docs[0]["metadata"]["name"] == plant.WORKLOAD_NAMESPACE
-    # The plant labels the namespace before it applies this document; apply's
-    # three-way merge keeps labels the document never carried, and would
-    # overwrite a managed-by the document did carry.
-    assert "labels" not in docs[0]["metadata"], "a managed-by label in the namespace document would overwrite the stack's at apply"
     deployment = next(doc for doc in docs if doc["kind"] == "Deployment")
     assert deployment["metadata"]["name"] == plant.WORKLOAD_DEPLOYMENT
+    # The stack creates the namespace itself, labelled, and applies the rest.
+    applied = [doc for doc in yaml.safe_load_all(_stack(FakeGitHub(), FakeHost()).workload_manifest()) if doc]
+    assert [doc["kind"] for doc in applied] == [doc["kind"] for doc in docs if doc["kind"] != "Namespace"]
+    assert applied == [doc for doc in docs if doc["kind"] != "Namespace"]
 
 
 def _variables():

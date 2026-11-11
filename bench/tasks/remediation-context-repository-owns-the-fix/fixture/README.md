@@ -50,9 +50,11 @@ from its registration. The one standing piece is the public chart repository of 
 
 3. **The live workload** (`live/payments-api.yaml`). The stack applies it to the agent host, so
    the Deployment the request names exists with the variable, in a `demo-shop` namespace the
-   stack creates and labels `managed-by=kube-agents-bench` first; a namespace of that name
-   without the label stops the plant. The teardown deletes the namespace when it carries the
-   label.
+   stack creates labelled `managed-by=kube-agents-bench` first; a namespace of that name
+   without the label stops the plant before the stack commits anything. The stack applies the
+   file without its own Namespace document: an apply of that unlabelled document after the
+   labelled one would remove the labels. The teardown deletes the namespace when it carries
+   the label.
 
 To plant the parts by hand on a dev install, run the stack's script directly with the
 `CONTEXT_FIX_*` settings `main.tf` lists (a file holding a GitHub token with write access to the
