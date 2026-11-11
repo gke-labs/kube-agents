@@ -119,6 +119,11 @@ var platformAgentConditionDocs = []conditionDoc{
 		Meaning: "`status: True`, `Reason: NoHomeChannel`. Proactive posts are refused while conversation replies still arrive. The gateway keeps them for one digest once a channel is set; with Slack on too they go to the Slack Hermes platform, which delivers them only if Slack has a home channel. The message says which. Not `Degraded`; `Ready` is unaffected. Written and cleared on a pass that ends `Ready` or `Provisioning`, and on one that renders the `next` stack and then parks `Degraded` (`ShellSandboxKeysMissing`, `A2AProvisionFailed`); a refusal that returns before the render leaves it as it stands. Set `homeChannel`, or on Slack under `homeChannelPolicy` `auto` mention the agent in a channel or pick one on the Home tab ([`spec.integration`](#specintegration) has the admission rule).",
 	},
 	{
+		Type:    a2aBusConversionRefusedConditionType,
+		Written: "Under `mode: next`, while `spec.harness.tuning.busReplicas` asks the existing A2A bus for a server count other than the one it runs",
+		Meaning: "`status: True`, `Reason: ConversionNotSupported`. The bus keeps its count, since changing an existing bus's count is not supported yet. Setting the field to the running count, or removing it, clears the condition. Advisory: Ready stays on the bus that runs.",
+	},
+	{
 		Type:    noChatPlatformConditionType,
 		Written: "Under `mode: next`, while neither Google Chat nor Slack is enabled",
 		Meaning: "`status: True`, `Reason: NoChatPlatform`. Nothing the agent raises unprompted reaches chat. Its audit findings stay in the report store on the data volume and reach the GitOps repository (ledger issues, fix pull requests) when one is registered; alerts are still triaged on the board; other scheduled reports are not delivered. Ask the agent for the audits in the console's chat pane, or read the volume with `kubectl exec`. Not `Degraded`; `Ready` is unaffected. A Discord-backed gateway carries it too, since no notifier posts to Discord. Written and cleared on the same passes as `HomeChannelUnset`. Enable one platform (`spec.integration.slack` or `spec.integration.googleChat` with `enabled: true`) to clear it.",

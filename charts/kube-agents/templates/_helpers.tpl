@@ -3318,8 +3318,24 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
          (the callouts and verifiers, which roll RollingUpdate with maxUnavailable 0) sizes
          the patch's surge room by one of its pods: with LiteLLM off, the chart's own
          workloads may leave less room than a callout needs to roll. */ -}}
+  {{- /* footprint.yaml counts the bus at the default three NATS servers. With
+         platformAgent.harness.tuning.busReplicas: 1 the operator renders one, so the
+         a2aNats entry and the JetStream claims count a third: per pod and per claim,
+         times one. An existing one-server bus with the value unset is still counted
+         at three, since the chart cannot see what runs (the upgrade note says so). */ -}}
+  {{- $busOne := eq (toString ((((.Values.platformAgent | default dict).harness | default dict).tuning | default dict).busReplicas)) "1" -}}
   {{- range $key, $workload := $next -}}
     {{- if and (ne $key "agentPod") (ne $key "storage") -}}
+      {{- if and $busOne (eq $key "a2aNats") -}}
+        {{- $n := $workload.pods | default 1 | int64 -}}
+        {{- $workload = dict "pods" 1 "surges" $workload.surges
+              "cpuMillisRequest" (div ($workload.cpuMillisRequest | default 0 | int64) $n)
+              "cpuMillisLimit" (div ($workload.cpuMillisLimit | default 0 | int64) $n)
+              "memoryBytesRequest" (div ($workload.memoryBytesRequest | default 0 | int64) $n)
+              "memoryBytesLimit" (div ($workload.memoryBytesLimit | default 0 | int64) $n)
+              "ephemeralStorageBytesRequest" (div ($workload.ephemeralStorageBytesRequest | default 0 | int64) $n)
+              "ephemeralStorageBytesLimit" (div ($workload.ephemeralStorageBytesLimit | default 0 | int64) $n) -}}
+      {{- end -}}
       {{- $reqPods = include "kube-agents.satAdd" (dict "a" $reqPods "b" (include "kube-agents.replicaCount" $workload.pods | int64)) | int64 -}}
       {{- $reqCpu = include "kube-agents.satAdd" (dict "a" $reqCpu "b" ($workload.cpuMillisRequest | default 0 | int64)) | int64 -}}
       {{- $limCpu = include "kube-agents.satAdd" (dict "a" $limCpu "b" ($workload.cpuMillisLimit | default 0 | int64)) | int64 -}}
@@ -3469,8 +3485,14 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
     {{- end -}}
   {{- end -}}
   {{- with $next.storage -}}
-    {{- $reqPvc = add $reqPvc (.persistentVolumeClaims | default 0 | int64) -}}
-    {{- $reqStorage = add $reqStorage (.storageBytesRequest | default 0 | int64) -}}
+    {{- $claims := .persistentVolumeClaims | default 0 | int64 -}}
+    {{- $bytes := .storageBytesRequest | default 0 | int64 -}}
+    {{- if and $busOne (gt $claims (int64 1)) -}}
+      {{- $bytes = div $bytes $claims -}}
+      {{- $claims = int64 1 -}}
+    {{- end -}}
+    {{- $reqPvc = add $reqPvc $claims -}}
+    {{- $reqStorage = add $reqStorage $bytes -}}
   {{- end -}}
 
   {{- /* Claims are release-scoped rather than per-replica, so they are not multiplied. */ -}}
@@ -3796,7 +3818,7 @@ Modeled monthly cost on GKE Autopilot (modeled from {{ include "kube-agents.foot
   Disk:     {{ printf "%.0f" $diskGiB }} GiB x ${{ include "kube-agents.footprintPriceBalancedDiskPerGiBMonth" . }}/GiB-month = ${{ printf "%.2f" $diskCost }}
   Total:    ${{ printf "%.2f" $total }}/month, plus the ${{ printf "%.2f" $clusterFee }}/month GKE cluster fee (per cluster, noted separately)
 {{- if eq (toString .Values.platformAgent.mode) "next" }}
-  Not counted: the session pods (one per delegation or /session conversation, up to maxSessions at once); the install prerequisites page sizes them. The spec.mode next workloads, the NATS bus and its 40 GiB JetStream claim among them, are in the figures above.
+  Not counted: the session pods (one per delegation or /session conversation, up to maxSessions at once); the install prerequisites page sizes them. The spec.mode next workloads, the NATS bus and its JetStream claims among them, are in the figures above.
 {{- end }}
 {{- end }}
 
