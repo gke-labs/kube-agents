@@ -4818,21 +4818,7 @@ metadata:
 ---
 apiVersion: v1
 data:
-  dispatch.json: |-
-    {
-      "version": "7839c8c0ddb1a702",
-      "namespace": "kubeagents-system",
-      "profileNamespace": "kubeagents-system-profiles",
-      "ceiling": 6,
-      "interactiveReserve": 2,
-      "childReserve": 2,
-      "leaseSeconds": 90,
-      "renewSeconds": 20,
-      "restartGraceSeconds": 60,
-      "acceptTimeoutSeconds": 10,
-      "submitRetentionSeconds": 259200,
-      "profiles": []
-    }
+  dispatch.json: '{"version":"7839c8c0ddb1a702","namespace":"kubeagents-system","profileNamespace":"kubeagents-system-profiles","ceiling":6,"interactiveReserve":2,"childReserve":2,"leaseSeconds":90,"renewSeconds":20,"restartGraceSeconds":60,"acceptTimeoutSeconds":10,"submitRetentionSeconds":259200,"profiles":[]}'
 kind: ConfigMap
 metadata:
   labels:

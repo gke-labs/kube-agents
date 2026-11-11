@@ -137,7 +137,7 @@ func TestADrainingProfileKeepsItsTerminalGrantAndNoDurable(t *testing.T) {
 	if gone == nil || len(gone.Durables) != 0 || gone.DrainingUntil.IsZero() {
 		t.Fatalf("the dispatch config's draining profile is %+v", gone)
 	}
-	if !strings.Contains(cm.Data[a2aDispatchConfigKey], `"drainingUntil": "2026-11-06T12:45:00Z"`) {
+	if !strings.Contains(cm.Data[a2aDispatchConfigKey], `"drainingUntil":"2026-11-06T12:45:00Z"`) {
 		t.Errorf("drainingUntil is not rendered in RFC 3339:\n%s", cm.Data[a2aDispatchConfigKey])
 	}
 

@@ -96,11 +96,6 @@ const (
 	fleetScaleProject           = "fleet-project"
 	fleetScaleLocation          = "us-central1"
 	fleetScaleProfileNameFormat = "cluster-" + fleetScaleProject + "-cluster-%04d-" + fleetScaleLocation
-	// The fix issue the one inverted check names. #4431 shrank the minter
-	// policy map and the identity map; the dispatch config, rendered only
-	// when the dispatcher image is set, is the part it left, and the issue
-	// that takes it moves this constant.
-	dispatchConfigMapFixIssue = "#4431"
 )
 
 // configMapDataSize is what the API server measures a ConfigMap by: the sum of
@@ -385,9 +380,12 @@ func TestTheIdentityMapConfigMapAtFleetScale(t *testing.T) {
 	t.Logf("identity map at N=%d: %d identities rendered across %d shards, version %s", fleetScaleProfiles, identities, len(cms), version)
 }
 
-// The dispatch config at N=2,500, rendered only when the dispatcher image is
-// set (no release sets it yet): one profile block per profile with its tiers,
-// parameters and a durable per (tier, kind), indented.
+// The dispatch config at N=2,500 with the dispatcher's own ceiling switched
+// off (fleetScaleProfileFixtures), so every profile is rendered: one compact
+// profile block per profile with its tiers, parameters and a durable per
+// (tier, kind). Writing it compact brought it under the limit; Job templates,
+// which this fixture's profiles don't carry, are gke-labs/kube-agents#5479's,
+// and the dispatcher's ceiling refuses the profiles they would push past it.
 func TestTheDispatchConfigMapAtFleetScale(t *testing.T) {
 	withDispatcher(t)
 	agent := a2aTestAgent()
@@ -403,5 +401,5 @@ func TestTheDispatchConfigMapAtFleetScale(t *testing.T) {
 	}
 	t.Logf("%s at N=%d: %d profile blocks rendered", cm.Name, fleetScaleProfiles, len(cfg.Profiles))
 
-	requireConfigMapSizeGate(t, cm, fmt.Sprintf("N=%d profiles", fleetScaleProfiles), dispatchConfigMapFixIssue)
+	requireConfigMapSizeGate(t, cm, fmt.Sprintf("N=%d profiles", fleetScaleProfiles), "")
 }

@@ -350,3 +350,110 @@ func TestBothControllersCutAtTheSameProfile(t *testing.T) {
 		t.Errorf("the AgentProfile controller refused %s, which the PlatformAgent renders: %s", boundary, c.Message)
 	}
 }
+
+// twoTierProfiles is n profiles that allow read and unattended, created a
+// second apart in name order, so oldest first is name order.
+func twoTierProfiles(agent *agentv1alpha1.PlatformAgent, n int) []agentv1alpha1.AgentProfile {
+	profiles := ceilingProfiles(agent, n)
+	start := metav1.Now()
+	for i := range profiles {
+		profiles[i].CreationTimestamp = metav1.NewTime(start.Add(time.Duration(i) * time.Second))
+	}
+	return profiles
+}
+
+// The dispatch config's shares, summed, are at least the ConfigMap the
+// operator writes for the same profiles, and only a little over: a Job
+// template is charged at the larger of its two renderings, and the first
+// entry one comma it doesn't take (gke-labs/kube-agents#5479).
+func TestTheDispatchConfigSharesCoverTheConfigMap(t *testing.T) {
+	withOperatorBusPrincipal(t)
+	t.Setenv(a2aProfileDispatcherEnvVar, "false") // no cut: measure all of them
+	t.Setenv(a2aDispatcherJobPolicyEnvVar, "true")
+	agent := a2aTestAgent()
+	profiles := twoTierProfiles(agent, 40)
+	profiles[3].Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead}
+	var ptrs []*agentv1alpha1.AgentProfile
+	for i := range profiles {
+		ptrs = append(ptrs, &profiles[i])
+	}
+	base, shares, err := a2aDispatchConfigShares(agent, ptrs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	estimate := base
+	for _, n := range shares {
+		estimate += n
+	}
+	largest := 0
+	for _, imageVolumes := range []bool{true, false} {
+		cm, err := buildA2ADispatchConfigMapWith(agent, profiles, dispatchJobTemplates(agent, profiles, imageVolumes), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		actual := len(cm.Data[a2aDispatchConfigKey])
+		if estimate < actual {
+			t.Errorf("imageVolumes=%v: the shares sum to %d bytes, under the %d the ConfigMap holds", imageVolumes, estimate, actual)
+		}
+		largest = max(largest, actual)
+	}
+	// Against the larger rendering, which is what each share is charged at,
+	// the sum is over by the first entry's comma alone.
+	if estimate-largest > 1 {
+		t.Errorf("the shares sum to %d bytes, %d over the larger ConfigMap's %d", estimate, estimate-largest, largest)
+	}
+}
+
+// Under Job mode each profile that allows unattended carries its Job
+// template in the dispatch config, so the config's limit comes before the
+// identity's: the cut refuses the newest at the ConfigMap's limit, names
+// #5479, and what the operator writes fits in one ConfigMap.
+func TestUnderJobModeTheConfigLimitCutsFirst(t *testing.T) {
+	withOperatorBusPrincipal(t)
+	t.Setenv(a2aProfileDispatcherEnvVar, "")
+	t.Setenv(a2aDispatcherJobPolicyEnvVar, "true")
+	agent := a2aTestAgent()
+	profiles := twoTierProfiles(agent, 400)
+	resolved := resolveAgentProfileIdentities(agent, profiles)
+	refused := a2aDispatcherCeilingRefused(agent, profiles)
+	if len(refused) == 0 {
+		t.Fatal("400 two-tier profiles under Job mode fit; the fixture no longer crosses the config limit")
+	}
+	fit := len(profiles) - len(refused)
+	msg := resolved[refused[0]].refused.Error()
+	if !strings.Contains(msg, "ConfigMap") || !strings.Contains(msg, "#5479") {
+		t.Errorf("the refusal doesn't name the config limit and #5479: %s", msg)
+	}
+	// What the operator writes for the bound profiles fits one ConfigMap at
+	// either rendering, and at the larger it uses most of the budget: the cut
+	// is safe and not far early.
+	for _, imageVolumes := range []bool{true, false} {
+		cm, err := buildA2ADispatchConfigMapWith(agent, profiles, dispatchJobTemplates(agent, profiles, imageVolumes), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n := len(cm.Data[a2aDispatchConfigKey])
+		if n > a2aDispatchConfigLimitBytes {
+			t.Errorf("imageVolumes=%v: the dispatch config for the %d bound profiles is %d bytes, over one ConfigMap", imageVolumes, fit, n)
+		}
+		if !imageVolumes && n < a2aDispatchConfigProfileBudget*9/10 {
+			t.Errorf("the dispatch config for the %d bound profiles is %d bytes, under nine tenths of the %d budget: the cut is early", fit, n, a2aDispatchConfigProfileBudget)
+		}
+	}
+	cond, over, err := a2aDispatcherCeiling(agent, profiles, nil)
+	if err != nil || over {
+		t.Fatalf("over=%v err=%v", over, err)
+	}
+	if cond.Reason != dispatcherCeilingReasonRefused || !strings.Contains(cond.Message, "ConfigMap") || !strings.Contains(cond.Message, "#5479") {
+		t.Errorf("condition %s: %s", cond.Reason, cond.Message)
+	}
+	// Short of the cut but past four fifths of the config, the warning
+	// names the config.
+	near, _, err := a2aDispatcherCeiling(agent, profiles[:fit*9/10], nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if near.Reason != dispatcherCeilingReasonNear || !strings.Contains(near.Message, "ConfigMap") {
+		t.Errorf("%d profiles: %s: %s", fit*9/10, near.Reason, near.Message)
+	}
+}

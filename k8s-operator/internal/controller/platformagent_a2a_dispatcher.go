@@ -610,45 +610,14 @@ func desiredDispatchConfigDraining(agent *agentv1alpha1.PlatformAgent, profiles 
 // drainingDispatchProfiles built it, with no durables and no template, since
 // nothing new is dispatched for it.
 func desiredDispatchConfigWith(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, jobTemplates map[string]*corev1.PodTemplateSpec, draining []a2aDispatchProfile) (a2aDispatchConfig, error) {
-	ceiling := resolveProfileCeiling(agent)
-	child, interactive := dispatchReserves(agent, ceiling)
-	cfg := a2aDispatchConfig{
-		Namespace:              agent.Namespace,
-		ProfileNamespace:       profileNamespaceName(agent),
-		Ceiling:                ceiling,
-		InteractiveReserve:     interactive,
-		ChildReserve:           child,
-		LeaseSeconds:           resolveProfileLeaseSeconds(agent),
-		RenewSeconds:           resolveProfileRenewSeconds(agent),
-		RestartGraceSeconds:    resolveProfileRestartGraceSeconds(agent),
-		AcceptTimeoutSeconds:   resolveProfileAcceptTimeoutSeconds(agent),
-		SubmitRetentionSeconds: dispatchSubmitRetentionSeconds(agent),
-		Profiles:               []a2aDispatchProfile{},
-	}
+	cfg := dispatchConfigHeader(agent)
 	resolved := resolveAgentProfileIdentities(agent, profiles)
 	for i := range profiles {
 		p := &profiles[i]
 		if resolved[p.Name].refused != nil {
 			continue
 		}
-		dp := a2aDispatchProfile{
-			Name:                  p.Name,
-			Tiers:                 p.AllowedTierList(),
-			Concurrency:           int(p.Spec.Concurrency),
-			QueueTimeoutSeconds:   int(p.QueueTimeout()),
-			ActiveDeadlineSeconds: func() int { d, _ := cappedTaskDeadline(agent, p); return d }(),
-			Durables:              []a2aDispatchDurable{},
-			JobTemplate:           jobTemplates[p.Name],
-		}
-		for _, param := range p.Spec.Parameters {
-			dp.Parameters = append(dp.Parameters, a2aCardParameter{Name: param.Name, Required: param.Required})
-		}
-		for _, tier := range dp.Tiers {
-			for _, kind := range a2aSubmitKinds {
-				dp.Durables = append(dp.Durables, a2aDispatchDurable{Tier: tier, Kind: kind, Name: profileDurableName(p.Name, tier, kind)})
-			}
-		}
-		cfg.Profiles = append(cfg.Profiles, dp)
+		cfg.Profiles = append(cfg.Profiles, dispatchProfileEntry(agent, p, jobTemplates[p.Name]))
 	}
 	live := map[string]bool{}
 	for _, p := range cfg.Profiles {
@@ -670,6 +639,49 @@ func desiredDispatchConfigWith(agent *agentv1alpha1.PlatformAgent, profiles []ag
 	sum := sha256.Sum256(body)
 	cfg.Version = hex.EncodeToString(sum[:8])
 	return cfg, nil
+}
+
+// dispatchConfigHeader is the dispatch config with no profiles: the
+// install-wide settings every config carries.
+func dispatchConfigHeader(agent *agentv1alpha1.PlatformAgent) a2aDispatchConfig {
+	ceiling := resolveProfileCeiling(agent)
+	child, interactive := dispatchReserves(agent, ceiling)
+	return a2aDispatchConfig{
+		Namespace:              agent.Namespace,
+		ProfileNamespace:       profileNamespaceName(agent),
+		Ceiling:                ceiling,
+		InteractiveReserve:     interactive,
+		ChildReserve:           child,
+		LeaseSeconds:           resolveProfileLeaseSeconds(agent),
+		RenewSeconds:           resolveProfileRenewSeconds(agent),
+		RestartGraceSeconds:    resolveProfileRestartGraceSeconds(agent),
+		AcceptTimeoutSeconds:   resolveProfileAcceptTimeoutSeconds(agent),
+		SubmitRetentionSeconds: dispatchSubmitRetentionSeconds(agent),
+		Profiles:               []a2aDispatchProfile{},
+	}
+}
+
+// dispatchProfileEntry is one live profile's entry in the dispatch config,
+// with its Job template when it has one.
+func dispatchProfileEntry(agent *agentv1alpha1.PlatformAgent, p *agentv1alpha1.AgentProfile, jobTemplate *corev1.PodTemplateSpec) a2aDispatchProfile {
+	dp := a2aDispatchProfile{
+		Name:                  p.Name,
+		Tiers:                 p.AllowedTierList(),
+		Concurrency:           int(p.Spec.Concurrency),
+		QueueTimeoutSeconds:   int(p.QueueTimeout()),
+		ActiveDeadlineSeconds: func() int { d, _ := cappedTaskDeadline(agent, p); return d }(),
+		Durables:              []a2aDispatchDurable{},
+		JobTemplate:           jobTemplate,
+	}
+	for _, param := range p.Spec.Parameters {
+		dp.Parameters = append(dp.Parameters, a2aCardParameter{Name: param.Name, Required: param.Required})
+	}
+	for _, tier := range dp.Tiers {
+		for _, kind := range a2aSubmitKinds {
+			dp.Durables = append(dp.Durables, a2aDispatchDurable{Tier: tier, Kind: kind, Name: profileDurableName(p.Name, tier, kind)})
+		}
+	}
+	return dp
 }
 
 // a2aDrainingMargin is how long past the longest task deadline a profile that
@@ -783,7 +795,9 @@ func buildA2ADispatchConfigMapWith(agent *agentv1alpha1.PlatformAgent, profiles 
 	if err != nil {
 		return nil, err
 	}
-	body, err := json.MarshalIndent(cfg, "", "  ")
+	// Compact, not indented: indentation roughly doubles a Job template, and
+	// the whole config has to fit one ConfigMap (gke-labs/kube-agents#5479).
+	body, err := json.Marshal(cfg)
 	if err != nil {
 		return nil, err
 	}

@@ -422,11 +422,13 @@ leave open:
   identity for one. Amended 11/10: on by default, at the release set's image (with
   `A2A_DISPATCHER_IMAGE` the override), and off only at `A2A_PROFILE_DISPATCHER=false`, which
   the chart sets from `operator.profileDispatcher.enabled`. Its identity-map entry grows with
-  the profile count, and one entry can't be split across shards, so it fills one shard near 700
-  profiles at two tiers. The operator binds profiles oldest first (creation time, then name)
-  while the entry fits, less a reserve for draining profiles, and refuses newer ones with
+  the profile count, and one entry can't be split across shards, so it fills one shard near 650
+  profiles at two tiers. The dispatch config, one ConfigMap, has its own limit: under Job mode
+  each profile that allows `unattended` carries its Job template there, which fills the
+  ConfigMap near 200 such profiles (#5479). The operator binds profiles oldest first (creation
+  time, then name) while both fit, less a reserve for draining profiles, and refuses newer ones with
   `IdentityReady` reason `DispatcherCeiling`; the dispatcher serves the rest. The PlatformAgent's
-  `DispatcherCeiling` condition warns at four fifths of the shard budget and reads
+  `DispatcherCeiling` condition warns at four fifths of either budget and reads
   `ProfilesRefused` while any profile is left out. Past the budget anyway, which only draining
   profiles can cause, the operator runs no dispatcher rather than write a map the API server
   refuses. It keeps the dispatch config, with each drain's deadline, so the dispatcher comes back

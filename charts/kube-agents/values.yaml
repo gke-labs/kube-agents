@@ -179,9 +179,10 @@ operator:
   # then publish cards that nothing dispatches. An A2A_PROFILE_DISPATCHER entry
   # in extraEnv wins. Its image is the release set's a2a-dispatcher, with
   # A2A_DISPATCHER_IMAGE (in extraEnv) the override. It has a ceiling of about
-  # 700 AgentProfiles: the operator binds them oldest first while the
-  # dispatcher's identity fits, leaves newer ones unbound, and says so in the
-  # PlatformAgent's DispatcherCeiling condition (#5381 lifts it).
+  # 200 AgentProfiles that allow unattended under Job mode, about 650 at two
+  # tiers otherwise: the operator binds them oldest first while the
+  # dispatcher's identity and config fit, leaves newer ones unbound, and says
+  # so in the PlatformAgent's DispatcherCeiling condition (#5479, #5381).
   profileDispatcher:
     enabled: true
   # The manager's own metrics listener, port 8080, plain HTTP on the pod
