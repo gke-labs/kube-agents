@@ -24,6 +24,25 @@
 # pull request.
 
 # part 1
+# Capability row: autoscaling, ComputeClass and accelerators; the stockout
+# audit on a three-replica Deployment with no compute-class nodeSelector and
+# no compute-class affinity, in a namespace with no default class, on the
+# seeded cluster whose only untainted pool is bound to ComputeClass general-ccc
+# (the fleet's app-worker-a in seeded-compute-class on slot c, role
+# untargeted-compute-class-workload; nothing planted by the run). A declared
+# gap, expected_fail: no stockout check names a workload that omits the
+# selector (the obtainability audit's 3.24 does, on its own ledger); the gap
+# is #4943.
+./tasks/ccc-prefilter-missing-nodeselector-drop/task.yaml
+# Capability row: autoscaling, ComputeClass and accelerators; the stockout
+# audit on a node pool labelled cloud.google.com/compute-class=general-ccc
+# with no matching NoSchedule taint, under a class whose auto-creation is off
+# (the fleet's default-pool on slot c, role untainted-compute-class-pool;
+# nothing planted by the run). A declared gap, expected_fail: no stockout
+# check reads a pool's taint against its class label (3.12(c) reads the
+# label alone, and the class's misconfigured status is a by-hand step); the
+# gap is #5600.
+./tasks/ccc-untainted-node-pool-absorption/task.yaml
 # Capability row: cost, idle and over-requested resources; a request cut on two
 # named workloads names the dependency each cut would change (the seeded fleet's
 # HPA-scaled inference-server in seeded-capacity and the Guaranteed-QoS
