@@ -2064,6 +2064,11 @@ does not set them, and the watch reads an empty value as its default. Each one c
 watch reads or when it alerts, so a line the agent wrote into the PVC `.env` could otherwise silence
 alerts for a namespace nobody excluded. They are not in the container env.
 
+The earned-autonomy switches `KUBEAGENTS_POST_MERGE_CHECK`, `KUBEAGENTS_AUTOMERGE` and
+`KUBEAGENTS_DIAL` are pinned the same way, on every install, from `spec.deployment.env`, each
+normalised to a value it knows or `off`. They are not in the container env; the
+[credential isolation reference](/kube-agents/reference/credential-isolation/) describes them.
+
 One consequence of the render is worth knowing: the managed overlay is a
 leaf-level merge, and a list is a leaf, so a list rendered here **replaces** the image's rather than
 unioning with it — for every profile at once. That is why the render emits no lists at all today,

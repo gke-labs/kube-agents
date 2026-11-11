@@ -118,6 +118,13 @@ const (
 	// pod, not the agent's, and deploy/sandbox/entrypoint.sh writes it to a
 	// root-owned file the script reads before the session's variable (#3439).
 	envAuditAutoPromote = "KUBEAGENTS_AUDIT_AUTO_PROMOTE"
+	// The earned-autonomy switches, each off unless spec.deployment.env names
+	// one of its other values. Forwarded for the same reason and in the same
+	// way as the audits' switch, and read by
+	// agents/platform/scripts/kubeagents_switches.py.
+	envPostMergeCheck = "KUBEAGENTS_POST_MERGE_CHECK"
+	envAutomerge      = "KUBEAGENTS_AUTOMERGE"
+	envDial           = "KUBEAGENTS_DIAL"
 
 	// Where deploy/sandbox/entrypoint.sh expects each of them. Changing either
 	// side alone starts a pod that exits with a pointed message rather than one
@@ -590,6 +597,7 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 			}
 		}
 	}
+	env = append(env, autonomySwitchEnv(agent)...)
 
 	containers := buildShellSandboxContainers(agent, env)
 	volumes := buildShellSandboxVolumes(agent, authorizedKeysSecret)
@@ -1288,4 +1296,58 @@ func buildShellSandboxClientKeyMount() corev1.VolumeMount {
 		MountPath: shellSandboxClientKeyPath,
 		ReadOnly:  true,
 	}
+}
+
+// autonomySwitchNames are the earned-autonomy switches, in the fixed order
+// they are rendered in; autonomySwitchValues lists the values each may take
+// besides "off", its default.
+var (
+	autonomySwitchNames  = []string{envPostMergeCheck, envAutomerge, envDial}
+	autonomySwitchValues = map[string][]string{
+		envPostMergeCheck: {"silent", "report"},
+		envAutomerge:      {"practice", "on"},
+		envDial:           {"on"},
+	}
+)
+
+// autonomySwitchSet returns spec.deployment.env's literal entry for the named
+// switch, and whether there is one; the last one when it is named twice, as a
+// container's env would take it. A valueFrom entry does not count: it could
+// name a credential neither pod may hold.
+func autonomySwitchSet(agent *agentv1alpha1.PlatformAgent, name string) (value string, ok bool) {
+	if agent.Spec.Deployment == nil {
+		return "", false
+	}
+	for _, v := range agent.Spec.Deployment.Env {
+		if v.Name == name && v.ValueFrom == nil {
+			value, ok = v.Value, true
+		}
+	}
+	return value, ok
+}
+
+// autonomySwitchValue is the named switch's value normalised to one it knows,
+// and "off" for anything else, unset included. The bytes on either pod are then
+// the operator's: a literal with a quote or a backslash would stop the sandbox
+// entrypoint before sshd starts.
+func autonomySwitchValue(agent *agentv1alpha1.PlatformAgent, name string) string {
+	raw, _ := autonomySwitchSet(agent, name)
+	value := strings.ToLower(strings.TrimSpace(raw))
+	if slices.Contains(autonomySwitchValues[name], value) {
+		return value
+	}
+	return "off"
+}
+
+// autonomySwitchEnv returns the switches spec.deployment.env sets, normalised,
+// for the sandbox container. An unset switch is left out; the entrypoint writes
+// "off" for it.
+func autonomySwitchEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
+	var env []corev1.EnvVar
+	for _, name := range autonomySwitchNames {
+		if _, ok := autonomySwitchSet(agent, name); ok {
+			env = append(env, corev1.EnvVar{Name: name, Value: autonomySwitchValue(agent, name)})
+		}
+	}
+	return env
 }
