@@ -5369,7 +5369,7 @@ func TestGatewayHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 	got := a2aGrantSubjects(t, conf, "gateway", "publish")
 
 	if sub, want := a2aGrantSubjects(t, conf, "gateway", "subscribe"), []string{
-		"a2a.tasks.*.*.events", "a2a.tasks.*.*.supervisor", "a2a.agents.>",
+		"a2a.tasks.*.*.events", "a2a.tasks.*.*.supervisor", "a2a.tasks.p.*.*.supervisor", "a2a.agents.>",
 		"agents.hb.>", "$KV.session-state.>", "$KV.feedback.>", "$KV.people.>", "chat.console.*.in", a2aConsoleConfirmSubject, "chat.notify.gchat", "chat.notify.slack", "chat.notify.console",
 		"chat.board.reply.gateway.>", "_INBOX.gateway.>",
 	}; !reflect.DeepEqual(sub, want) {

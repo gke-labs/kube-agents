@@ -640,6 +640,11 @@ func gatewayIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity 
 		subscribe: []string{
 			"a2a.tasks.*.*.events",
 			"a2a.tasks.*.*.supervisor",
+			// A profile task's supervisor subject in its profile form
+			// (lib.ProfileSupervisorSubject, #5301): read only. The
+			// gateway's publish grant stays five-token, so it can never
+			// write one.
+			"a2a.tasks.p.*.*.supervisor",
 			"a2a.agents.>",
 			"agents.hb.>",
 			"$KV.session-state.>",

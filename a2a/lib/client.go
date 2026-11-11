@@ -48,6 +48,28 @@ func TaskSupervisorSubject(addressee, taskID string) string {
 	return fmt.Sprintf("a2a.tasks.%s.%s.%s", addressee, taskID, TaskClassSupervisor)
 }
 
+// TaskProfileSupervisorToken marks the profile form of a supervisor subject:
+// a2a.tasks.p.{profile}.{taskId}.supervisor (gke-labs/kube-agents#5301). Six
+// tokens, so the gateway's five-token grant on a2a.tasks.*.*.supervisor can
+// never match a profile task's supervisor subject, which the dispatcher alone
+// writes, and the subject stays on TASKS (a2a.tasks.>) beside the task's
+// events, in one stream order for tasks/get. A session name is never "p" on
+// its own: session names carry hyphens.
+const TaskProfileSupervisorToken = "p"
+
+// ProfileSupervisorSubject is a profile task's supervisor subject in its
+// profile form. Nothing publishes it yet: readers accept it beside
+// TaskSupervisorSubject until the dispatcher moves to it (#5301).
+func ProfileSupervisorSubject(profile, taskID string) string {
+	return fmt.Sprintf("a2a.tasks.%s.%s.%s.%s", TaskProfileSupervisorToken, profile, taskID, TaskClassSupervisor)
+}
+
+// IsTaskSupervisorSubject reports whether subject is the task's supervisor
+// subject in either form.
+func IsTaskSupervisorSubject(subject, addressee, taskID string) bool {
+	return subject == TaskSupervisorSubject(addressee, taskID) || subject == ProfileSupervisorSubject(addressee, taskID)
+}
+
 // TaskSubmitSubject is where a new task for a profile is submitted (added
 // 10/22, #3660; moved off TASKS 10/28): a2a.submit.{profile}.{tier}.{kind}.{taskId},
 // on its own stream, ProfileSubmitStream. The tier and kind tokens exist only
@@ -96,14 +118,21 @@ func AgentSubject(profile string) string {
 }
 
 // ParseTaskSubject splits a task subject into its addressee, taskId, and
-// class (TaskClassIn, TaskClassEvents or TaskClassSupervisor). ok is false for
-// any other subject shape.
+// class (TaskClassIn, TaskClassEvents or TaskClassSupervisor). It reads the
+// profile supervisor form (ProfileSupervisorSubject) too, whose addressee is
+// the profile. ok is false for any other subject shape.
 func ParseTaskSubject(subject string) (addressee, taskID, class string, ok bool) {
 	rest, found := strings.CutPrefix(subject, "a2a.tasks.")
 	if !found {
 		return "", "", "", false
 	}
 	parts := strings.Split(rest, ".")
+	if len(parts) == 4 && parts[0] == TaskProfileSupervisorToken && parts[3] == TaskClassSupervisor {
+		if parts[1] == "" || parts[2] == "" {
+			return "", "", "", false
+		}
+		return parts[1], parts[2], TaskClassSupervisor, true
+	}
 	if len(parts) != 3 || parts[0] == "" || parts[1] == "" {
 		return "", "", "", false
 	}
@@ -659,6 +688,11 @@ type SubscribeConfig struct {
 	// provision Job's TASKS stream can trail by more than the window while a
 	// three-server bus forms). The wait is logged; see startWithRetry.
 	WaitForStream bool
+	// AcceptFilterSets are further filter sets a Precreated durable may
+	// carry and still be bound, while the operator moves it from one set to
+	// another (gke-labs/kube-agents#5301: the gateway's relay gains the profile
+	// supervisor form). The subscriber reads whatever the durable delivers.
+	AcceptFilterSets [][]string
 	// Precreated binds to a durable the operator created and never creates
 	// or updates one (#4173): the subscriber needs no consumer-create grant
 	// for it, and holds none on its name. Until the operator has made it, the
@@ -687,8 +721,15 @@ func (cfg SubscribeConfig) checkPrecreated(got jetstream.ConsumerConfig) error {
 	refuse := func(why string) error {
 		return fmt.Errorf("%w: %s on %s %s", ErrPrecreatedBindRefused, cfg.Durable, cfg.Stream, why)
 	}
+	sameSet := func(a, b []string) bool {
+		return slices.Equal(slices.Sorted(slices.Values(a)), slices.Sorted(slices.Values(b)))
+	}
+	accepted := sameSet(have, want)
+	for _, alt := range cfg.AcceptFilterSets {
+		accepted = accepted || sameSet(have, alt)
+	}
 	switch {
-	case !slices.Equal(slices.Sorted(slices.Values(have)), slices.Sorted(slices.Values(want))):
+	case !accepted:
 		return refuse(fmt.Sprintf("filters %q, not %q", have, want))
 	case got.AckPolicy != jetstream.AckExplicitPolicy:
 		return refuse(fmt.Sprintf("acks %s, not explicit", got.AckPolicy))

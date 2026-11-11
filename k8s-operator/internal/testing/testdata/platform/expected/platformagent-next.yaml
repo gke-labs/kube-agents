@@ -3634,6 +3634,7 @@ stringData:
                 allow = [
                   "a2a.tasks.*.*.events",
                   "a2a.tasks.*.*.supervisor",
+                  "a2a.tasks.p.*.*.supervisor",
                   "a2a.agents.>",
                   "agents.hb.>",
                   "$KV.session-state.>",
