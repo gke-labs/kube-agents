@@ -41,9 +41,11 @@ The reads cannot move, with one exception. The kinds the manager's cache serves 
 cluster-wide informers: the drift watches in `SetupWithManager` (`For`, `Owns` and `Watches` on
 Deployments, StatefulSets, ServiceAccounts, PVCs, ConfigMaps, Services, NetworkPolicies,
 PodDisruptionBudgets, Leases, Roles, RoleBindings, ClusterRoles and ClusterRoleBindings) and the
-cached `Get`s of Jobs, ResourceQuotas and FQDNNetworkPolicies, each of which starts an informer that
-lists and watches the kind in every namespace and blocks cache sync where the grant is narrower. The
-agent's `minimal` ClusterRole grants cluster-wide reads the operator must hold to apply it. Nothing
+cached `Get` of FQDNNetworkPolicies, which starts an informer that lists and watches the kind in
+every namespace and blocks cache sync where the grant is narrower. Jobs and ResourceQuotas are read
+uncached (`a2aReader()`), by choice, so that no informer holds every Job or quota on the cluster;
+their reads stay cluster-wide for the other reason, as Pods and Secrets do: the agent's `minimal`
+ClusterRole grants cluster-wide reads the operator must hold to apply it. Nothing
 mechanical pins a read tuple cluster-scoped today: `TestRequiredPermissionsMatchTheGeneratedRole`
 holds the probe list to the markers in both directions, so a read moved with its probe passes it,
 and only the Secret reads have a dedicated pin (`TestTheMinimalRoleSecretsReadLabelsAreTheProbesOwn`).
@@ -89,8 +91,9 @@ Writes that stay cluster-scoped, and why:
   `kubeagents:tokenreview:<ns>:<name>`, the callout's binding). The escalation check bounds them.
 - `tokenreviews` `create` and `bind` on `system:auth-delegator`: cluster-scoped.
 
-Reads that stay cluster-wide: `get`, `list` and `watch` on every kind above except
-`dispatchjobtemplates` (the informers, §1); the escalation-prevention set `buildMinimalPlatformRole`
+Reads that stay cluster-wide: `get`, `list` and `watch` on every kind above that has them, except
+`dispatchjobtemplates` (`podtemplates` has no read verb at all); the informers hold the watched
+kinds' reads and escalation prevention holds the rest (§1); the escalation-prevention set `buildMinimalPlatformRole`
 grants (nodes, namespaces, pods, pod logs, services, endpoints, events, PersistentVolumes, PVCs,
 ResourceQuotas, LimitRanges, ConfigMaps, ServiceAccounts, Secrets, metrics, the `apps` and `batch`
 kinds, NetworkPolicies, Ingresses, HorizontalPodAutoscalers, PodDisruptionBudgets, CRDs, the GitOps
