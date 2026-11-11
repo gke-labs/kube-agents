@@ -78,7 +78,7 @@ report itself and files no ranking card. The ranking worker writes `/opt/data/IN
 sandbox's volume when the shell sandbox is on. `bootstrap-inventory-delivery`
 (`bootstrap_delivery.py`) posts it once a human has spoken (`.user_aligned`, or under `spec.mode: next`
 `.user_aligned_conversation`) and claims
-`.bootstrap_completed` with `O_CREAT | O_EXCL`; a run `RETIRE_AFTER_SECONDS` (about 16 minutes)
+`.bootstrap_completed` by an exclusive link; a run `RETIRE_AFTER_SECONDS` (about 16 minutes)
 later removes both jobs. When nobody has spoken a day after the sweep was filed
 (`UNSPOKEN_FILE_AFTER_SECONDS`), the report is filed as a dated ledger issue instead, in the GitOps
 repository when it is on GitHub or else in the install's one managed GitHub repository (so a
