@@ -97,6 +97,10 @@ directories and fail on a line that carries either:
 Paths with a component beginning with a dot, `*.tfstate*` and `*.tfvars` are skipped, so a
 local `tofu apply` cannot red the check.
 
+The same check and lint reject any file committed under a case's `evidence/` directory: a run's
+record (results, rows, manifest, campaign and sweep files) stays out of the repository, and the
+case or its design document cites the run by its directory name or build id.
+
 The escape hatch is per line: append `sanitizer: allow` followed by the reason, on the line
 that carries the value, in a comment where the file format has one.
 

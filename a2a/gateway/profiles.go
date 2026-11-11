@@ -352,7 +352,7 @@ type scopeDeclaration struct {
 var errNoScopeFile = errors.New("no scope file")
 
 func loadScope(path string) (*scopeDeclaration, error) {
-	raw, err := os.ReadFile(path)
+	raw, err := os.ReadFile(path) // #nosec G304 -- the scope file the operator renders into the pod
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, errNoScopeFile
 	}
