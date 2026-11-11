@@ -172,7 +172,7 @@ operator as `PLATFORM_AGENT_IMAGE`, `AGENT_SANDBOX_IMAGE`, and
 `CREDENTIAL_PROXY_IMAGE` is deliberately not passed: the operator derives the
 broker image from the agent image by swapping the trailing name, so it follows
 the mirror on its own. The sandbox image is not derived from the agent image, so
-the chart names it, at the same tag as the agent.
+the chart names it.
 
 The prefix is not a per-image default — it replaces every image's registry and
 path, keeping the trailing name, because that is the flat layout

@@ -970,8 +970,9 @@ fluentBit:
 # the workload itself, it passes the reference to the operator as
 # AGENT_SANDBOX_IMAGE, but the pin has to live somewhere the mirror can be
 # pointed at. Unlike the credential broker — which the operator derives from the
-# agent image by swapping the trailing name — the sandbox is a separate
-# repository built from deploy/sandbox, so it has to be named.
+# agent image by swapping the trailing name — the sandbox is not derived from the
+# agent image, so it is named here, and this value wins over the operator's own
+# derivation from OPERATOR_IMAGE.
 agentSandbox:
   image:
     repository: ghcr.io/gke-labs/kube-agents/agent-sandbox
