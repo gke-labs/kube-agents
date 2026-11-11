@@ -274,7 +274,11 @@ STDIN_WRITE_CHUNK_BYTES = select.PIPE_BUF
 KILLED_COMMAND_DRAIN_SECONDS = 5
 # How often a command that has closed both its pipes but is still running is
 # looked at: nothing can wake that wait, so the deadline and the caller's
-# hang-up are checked in steps this long.
+# hang-up are checked in steps this long. Within a step the child is reaped
+# with `_reap`'s short poll, so an exit is seen within milliseconds: a child
+# closes its pipes a moment before it can be reaped (a multithreaded kubectl
+# or a Python gcloud only after every thread exits), and on a busy pod one
+# look then a sleep cost about a third of the calls a whole step (#5540).
 PIPES_CLOSED_POLL_SECONDS = 0.5
 # How often a command's `stop` check is asked while it runs (`_capture_output`).
 STOP_POLL_SECONDS = 0.5
@@ -8887,7 +8891,9 @@ def _capture_output(
                 elif stop is not None and stop():
                     abandoned = stopped = True
                 else:
-                    time.sleep(min(PIPES_CLOSED_POLL_SECONDS, remaining))
+                    # Reaped within this step if it exits within it; the
+                    # loop's own look then returns at once.
+                    _reap(process, min(PIPES_CLOSED_POLL_SECONDS, remaining))
                     continue
                 _kill_process_group(process)
                 _reap(process, None)
