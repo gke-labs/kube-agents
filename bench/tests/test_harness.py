@@ -6801,3 +6801,41 @@ def test_a_run_whose_prompt_names_the_agent_cluster_without_a_context_is_a_setup
     assert "AGENT_CLUSTER_CONTEXT" in result.errors[0]
     snap = transcript.get()
     assert snap is not None and snap.output == ""
+
+
+# ------------------------------------------------ a fleet fixture's cluster in a prompt
+
+
+def _fleet_context(tmp_path, monkeypatch, text: str):
+    (tmp_path / ".fleet-context").write_text(text, encoding="utf-8")
+    monkeypatch.setenv("BENCH_FLEET_KUBECONFIG_DIR", str(tmp_path))
+
+
+def test_the_fleet_cluster_placeholders_expand_from_the_runners_context(tmp_path, monkeypatch):
+    _fleet_context(tmp_path, monkeypatch, "project=evals-3\nslot.crashloop-workload=b\ncluster.b=seeded-b\nlocation.b=us-central1-a\n")
+    prompt = ("why does payments-api restart on {{FLEET_CLUSTER_NAME:crashloop-workload}} "
+              "(project {{FLEET_CLUSTER_PROJECT:crashloop-workload}}, location {{FLEET_CLUSTER_LOCATION:crashloop-workload}})")
+    expanded, problem = harness.expand_fleet_cluster_placeholders(prompt)
+    assert problem is None
+    assert expanded == "why does payments-api restart on seeded-b (project evals-3, location us-central1-a)"
+
+
+def test_a_prompt_without_fleet_placeholders_needs_no_fleet(monkeypatch):
+    monkeypatch.delenv("BENCH_FLEET_KUBECONFIG_DIR", raising=False)
+    assert harness.expand_fleet_cluster_placeholders("list the pods") == ("list the pods", None)
+
+
+def test_an_unresolved_fleet_role_is_a_setup_problem_not_the_models(tmp_path, monkeypatch):
+    prompt = "about {{FLEET_CLUSTER_NAME:crashloop-workload}}"
+    monkeypatch.delenv("BENCH_FLEET_KUBECONFIG_DIR", raising=False)
+    _, problem = harness.expand_fleet_cluster_placeholders(prompt)
+    assert problem is not None and "fleet" in problem
+    # A slot for another role only.
+    _fleet_context(tmp_path, monkeypatch, "project=evals-3\nslot.idle-nodepool=a\ncluster.a=seeded-a\nlocation.a=us-east1\n")
+    _, problem = harness.expand_fleet_cluster_placeholders(prompt)
+    assert problem is not None and "crashloop-workload" in problem
+    # The role's slot was recorded but never reached.
+    _fleet_context(tmp_path, monkeypatch, "project=evals-3\nslot.crashloop-workload=b\ncluster.a=seeded-a\nlocation.a=us-east1\n")
+    expanded, problem = harness.expand_fleet_cluster_placeholders(prompt)
+    assert problem is not None and "never reached" in problem
+    assert expanded == prompt

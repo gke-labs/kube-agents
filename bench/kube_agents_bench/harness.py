@@ -175,7 +175,7 @@ from devops_bench.agents import AgentConfig, AgentHarness, AgentResult
 from devops_bench.agents.result import empty_tokens
 
 from kube_agents_bench import inject_transport as inject
-from kube_agents_bench import board, card_wake, chat_shape, gitops, pushed_report, stop_hook, transcript, worker_trajectory
+from kube_agents_bench import board, card_wake, chat_shape, fleet, gitops, pushed_report, stop_hook, transcript, worker_trajectory
 from kube_agents_bench.gateway_silence import is_intentional_silence_response
 from kube_agents_bench.parsing import (
     DELEGATION_TOOL,
@@ -2669,6 +2669,51 @@ def expand_agent_cluster_placeholders(prompt: str, context: str | None) -> tuple
     )
 
 
+# Placeholders for a seeded-fleet fixture's cluster, by the role it plays:
+# {{FLEET_CLUSTER_PROJECT:crashloop-workload}} and its LOCATION and NAME
+# siblings. A single-cluster profile has to be told its target, and a case
+# names the fixture's cluster by role, never by name (kube_agents_bench.fleet).
+# Expanded from the context hack/fleet-kubeconfigs.sh writes
+# (:func:`expand_fleet_cluster_placeholders`).
+_FLEET_CLUSTER_PLACEHOLDER = re.compile(r"\{\{FLEET_CLUSTER_(PROJECT|LOCATION|NAME):([a-z0-9][a-z0-9-]*)\}\}")
+
+
+def expand_fleet_cluster_placeholders(prompt: str) -> tuple[str, str | None]:
+    """``prompt`` with each named fixture role's cluster written in, and the
+    setup problem, if any.
+
+    A role the runner didn't resolve (no fleet context, no slot for the role,
+    or a slot it never reached) is a setup failure the caller records as
+    infrastructure, never the model's: the run can't be asked about a cluster
+    nobody provisioned.
+    """
+    roles = {m.group(2) for m in _FLEET_CLUSTER_PLACEHOLDER.finditer(prompt)}
+    if not roles:
+        return prompt, None
+    project = fleet.provisioned_project()
+    if not project:
+        return prompt, (
+            "the case prompt names a fleet fixture's cluster ({{FLEET_CLUSTER_*:<role>}}), but the "
+            "runner recorded no fleet project (hack/fleet-kubeconfigs.sh did not run)"
+        )
+    clusters = fleet.recorded_clusters()
+    resolved: dict[str, tuple[str, str]] = {}
+    for role in sorted(roles):
+        try:
+            slot = fleet.slot_of_role(role)
+        except fleet.FleetRoleUnresolved as exc:
+            return prompt, f"fleet role {role!r}: {exc}"
+        if slot not in clusters:
+            return prompt, f"fleet role {role!r}: the runner never reached slot {slot!r}, so its cluster is unknown"
+        resolved[role] = clusters[slot]
+
+    def value(m: re.Match[str]) -> str:
+        name, location = resolved[m.group(2)]
+        return {"PROJECT": project, "LOCATION": location, "NAME": name}[m.group(1)]
+
+    return _FLEET_CLUSTER_PLACEHOLDER.sub(value, prompt), None
+
+
 def _infra_failure(detail: str) -> AgentResult:
     """A run where no answer can be graded, recorded as infrastructure.
 
@@ -2909,6 +2954,8 @@ class KubeAgentsHarness(AgentHarness):
         transcript.clear()
         started_at = time.time()
         prompt, setup_problem = expand_agent_cluster_placeholders(prompt, os.environ.get("AGENT_CLUSTER_CONTEXT"))
+        if setup_problem is None:
+            prompt, setup_problem = expand_fleet_cluster_placeholders(prompt)
         if setup_problem is not None:
             transcript.set("", [], prompt=prompt, started_at=started_at)
             return _infra_failure(setup_problem)
