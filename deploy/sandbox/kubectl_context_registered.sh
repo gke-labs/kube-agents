@@ -72,11 +72,14 @@ ca_file="${KUBE_PROXY_CA_FILE:-${DEFAULT_CA_FILE}}"
 token_file="${CREDENTIAL_PROXY_TOKEN_FILE:-${DEFAULT_TOKEN_FILE}}"
 
 # The entries Python checks before it leaves a kubeconfig alone (_merge_context_into_kubeconfig_file),
-# each one inside a single list item: a cluster named <ctx> with the current server and CA file; a
-# context named <ctx> for cluster <ctx> and user kube-proxy-caller; and the kube-proxy-caller user
-# with the current token file and nothing else. Lines are compared as whole strings after the indent
-# and a list item's `- ` are dropped; no regex is built from a value, so no value can widen a match.
-# A layout the parser does not follow (flow style, anchors, quotes) only means a fallback to Python.
+# each one inside a single list item: a cluster named <ctx> whose `cluster:` mapping holds the current
+# server and CA file; a context named <ctx> whose `context:` mapping holds cluster <ctx> and user
+# kube-proxy-caller; and the kube-proxy-caller user whose `user:` mapping holds the current token file
+# and nothing else. An item's own keys sit two spaces in from its `- `, a mapping's keys two more;
+# a key repeated in one mapping (YAML keeps the last) marks the item as not matching. Lines are
+# compared as whole strings after the indent and a list item's `- ` are dropped; no regex is built
+# from a value, so no value can widen a match. Any other layout (another indent, flow style, anchors,
+# quotes) only means a fallback to Python.
 awk \
   -v name="name: ${context}" \
   -v server="server: ${proxy_url}/clusters/${context}" \
@@ -86,11 +89,22 @@ awk \
   -v user_name="name: ${USER_NAME}" \
   -v token="tokenFile: ${token_file}" '
   function finish_item() {
-    if (in_item && section == "clusters" && item[name] && item[server] && item[ca]) cluster_ok = 1
-    if (in_item && section == "contexts" && item[name] && item[cluster] && item[user]) context_ok = 1
-    if (in_item && section == "users" && item[user_name] && user_fields == 1 && user_token) user_ok = 1
+    if (in_item && !repeated) {
+      if (section == "clusters" && item["|" name] && item["cluster|" server] && item["cluster|" ca]) cluster_ok = 1
+      if (section == "contexts" && item["|" name] && item["context|" cluster] && item["context|" user]) context_ok = 1
+      if (section == "users" && item["|" user_name] && user_fields == 1 && item["user|" token]) user_ok = 1
+    }
     split("", item)
-    in_item = 0; in_user = 0; user_fields = 0; user_token = 0
+    split("", keys)
+    in_item = 0; repeated = 0; parent = ""; user_fields = 0
+  }
+  # Record `line` under `path` ("" for the item, else its parent key), and note a repeated key.
+  function record(path, line,    key) {
+    key = line
+    sub(/:.*/, "", key)
+    if ((path "|" key) in keys) repeated = 1
+    keys[path "|" key] = 1
+    item[path "|" line] = 1
   }
   {
     raw = $0
@@ -115,14 +129,14 @@ awk \
     key_indent = indent + (starts_item ? 2 : 0)
     line = raw
     sub(/^ *(- )?/, "", line)
-    if (in_user && key_indent <= user_indent) in_user = 0
-    if (in_user) {
-      user_fields++
-      if (line == token) user_token = 1
-      next
+    if (key_indent == item_indent + 2) {
+      record("", line)
+      parent = line
+      if (sub(/:$/, "", parent) != 1) parent = ""  # only a key with no value opens a mapping
+    } else if (key_indent == item_indent + 4 && parent != "") {
+      record(parent, line)
+      if (parent == "user") user_fields++
     }
-    if (section == "users" && line == "user:") { in_user = 1; user_indent = key_indent; next }
-    item[line] = 1
   }
   END {
     finish_item()

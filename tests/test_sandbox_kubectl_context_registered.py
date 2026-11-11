@@ -50,6 +50,54 @@ users:
 """
 
 
+# What sandbox-entrypoint writes when an extra context is declared: clusters, then users, then contexts.
+ENTRYPOINT_LAYOUT = f"""apiVersion: v1
+kind: Config
+clusters:
+- name: {HOST_CTX}
+  cluster:
+    server: {PROXY}/clusters/{HOST_CTX}
+    certificate-authority: {CA}
+- name: {CTX}
+  cluster:
+    server: {PROXY}/clusters/{CTX}
+    certificate-authority: {CA}
+users:
+- name: kube-proxy-caller
+  user:
+    tokenFile: {TOKEN}
+contexts:
+- name: {HOST_CTX}
+  context:
+    cluster: {HOST_CTX}
+    user: kube-proxy-caller
+- name: {CTX}
+  context:
+    cluster: {CTX}
+    user: kube-proxy-caller
+current-context: {HOST_CTX}
+"""
+# Stock `kubectl config` writes each item's keys in alphabetical order.
+STOCK_KUBECTL_LAYOUT = f"""apiVersion: v1
+clusters:
+- cluster:
+    certificate-authority: {CA}
+    server: {PROXY}/clusters/{CTX}
+  name: {CTX}
+contexts:
+- context:
+    cluster: {CTX}
+    user: kube-proxy-caller
+  name: {CTX}
+current-context: {CTX}
+kind: Config
+users:
+- name: kube-proxy-caller
+  user:
+    tokenFile: {TOKEN}
+"""
+
+
 def load_client():
     spec = importlib.util.spec_from_file_location("credential_proxy_client_for_test", CLIENT)
     module = importlib.util.module_from_spec(spec)
@@ -241,6 +289,20 @@ class KubectlContextRegisteredTest(unittest.TestCase):
         self.register(path=copy)
         return copy.read_text(encoding="utf-8") != self.kubeconfig.read_text(encoding="utf-8")
 
+    def test_the_three_layouts_in_use_are_registered(self):
+        # The stricter the check, the easier it is to turn the fast path off by accident; these keep it on.
+        layouts = {"the client's": None, "sandbox-entrypoint's": ENTRYPOINT_LAYOUT,
+                   "stock kubectl's": STOCK_KUBECTL_LAYOUT}
+        for label, text in layouts.items():
+            with self.subTest(label):
+                self.kubeconfig.write_text(SEED, encoding="utf-8")
+                if text is None:
+                    self.register()
+                else:
+                    self.kubeconfig.write_text(text, encoding="utf-8")
+                self.assertFalse(self.python_would_rewrite(), label)
+                self.assert_registered("--context", CTX, "get", "ns")
+
     def test_registered_never_comes_with_a_rewrite_python_would_make(self):
         # Each case leaves a line Python wants somewhere in the file, but not in <ctx>'s own entry.
         stock_layout = (f"- cluster:\n    certificate-authority: {CA}\n    server: {PROXY}/clusters/{CTX}\n"
@@ -255,6 +317,26 @@ class KubectlContextRegisteredTest(unittest.TestCase):
             "the cluster's lines under the context, and no cluster": (
                 f"- name: {CTX}\n  cluster:\n    server: {PROXY}/clusters/{CTX}\n    certificate-authority: {CA}\n",
                 ""),
+            "the server outside the cluster mapping": (
+                f"- name: {CTX}\n  cluster:\n    server: {PROXY}/clusters/{CTX}\n    certificate-authority: {CA}\n",
+                f"- name: {CTX}\n  server: {PROXY}/clusters/{CTX}\n  cluster:\n    certificate-authority: {CA}\n"),
+            "no cluster mapping at all": (
+                f"- name: {CTX}\n  cluster:\n    server: {PROXY}/clusters/{CTX}\n    certificate-authority: {CA}\n",
+                f"- name: {CTX}\n  server: {PROXY}/clusters/{CTX}\n  certificate-authority: {CA}\n"),
+            "the server only nested deeper in the cluster": (
+                f"    server: {PROXY}/clusters/{CTX}\n    certificate-authority: {CA}\n",
+                f"    certificate-authority: {CA}\n    extensions:\n      server: {PROXY}/clusters/{CTX}\n"),
+            "the context's name only deep inside another cluster": (
+                f"- name: {CTX}\n  cluster:\n    server: {PROXY}/clusters/{CTX}\n",
+                f"- extensions:\n  - extension:\n      name: {CTX}\n  cluster:\n"
+                f"    server: {PROXY}/clusters/{CTX}\n"),
+            "a second server for the cluster": (
+                f"    server: {PROXY}/clusters/{CTX}\n    certificate-authority: {CA}\n",
+                f"    server: {PROXY}/clusters/{CTX}\n    certificate-authority: {CA}\n    server: https://elsewhere\n"),
+            "a second user key on the user": (f"    tokenFile: {TOKEN}\n", f"    tokenFile: {TOKEN}\n  user: {{}}\n"),
+            "the user's name only inside a nested list": (
+                "- name: kube-proxy-caller\n  user:",
+                "- name: other\n  extensions:\n  - name: kube-proxy-caller\n    extension: {}\n  user:"),
             "the token file on another user": (
                 f"- name: kube-proxy-caller\n  user:\n    tokenFile: {TOKEN}\n",
                 f"- name: kube-proxy-caller\n  user:\n    tokenFile: /old/token\n- name: other\n  user:\n"
