@@ -394,6 +394,14 @@ that stamp one new card's origin at insert; a ticket is spent once, and `cleanup
 removes it once it is older than `STAMP_TICKET_TTL_SECONDS` (300). The card's stamp itself is in
 `kanban.db`, in the side table `kanban_task_origins`.
 
+#### `post_merge_records` (read here, not created)
+
+`GET /v1/post-merge/clean-merges` reads the post-merge check's `post_merge_records` table, which this
+server does not create, and answers the install's clean merges per kind of fix. The rule and its
+thresholds (`REVERT_WINDOW`, `CLEAN_MERGES_NEEDED`, `DAYS_NEEDED`) live in `clean_merges.py`. A
+table that does not exist yet answers no kinds; a table missing a column the count needs, or a
+database that cannot be read, answers `503`.
+
 #### `incidents`
 
 Stores the triage report context for active incident threads:
