@@ -106,7 +106,8 @@ The no-forge path and the forge path do not read it as a memory: its `status` is
 `NO_FORGE`, and it names no issue.
 
 Both writes are atomic (`os.replace` from a temp file in the same directory). The envelope carries
-`audit_id`, `repo` and `finished_at`, the run's outcome (`status`, `issue_number`, `issue_url`,
+`audit_id`, `repo`, `finished_at` and `started_at` (when the run opened: the stamp `start` wrote
+in the run record, else the in-flight note's, else null), the run's outcome (`status`, `issue_number`, `issue_url`,
 `partial`, `coverage_gaps`, `declared`, `unaccounted`, the PR URL lists, `silent_ok`,
 `silent_floor` when set, `ledger_held_open`), the ids that this and earlier runs reported as
 dropped under a gap, or with no forge the ids that left under a gap, until a run with full coverage clears them (`reported_under_gap`, when not empty), whether the run was scheduled (`scheduled`) and the gaps of the last scheduled

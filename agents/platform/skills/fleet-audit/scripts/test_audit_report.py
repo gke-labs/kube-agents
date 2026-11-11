@@ -1376,6 +1376,73 @@ class HarnessTestCase(BaseTestCase):
 # --------------------------------------------------------------------------- #
 
 
+class TestEnvelopeStartedAt(BaseTestCase):
+    """The report-store envelope names when its run opened (#4268), so a reader
+    can refuse a report from a run that started before its own window."""
+
+    NOW = datetime(2026, 11, 10, 12, 0, tzinfo=timezone.utc)
+    RECORD_STAMP = "2026-11-10T10:00:00Z"
+    RECORD_ISO = "2026-11-10T10:00:00+00:00"
+    NOTE_EPOCH = datetime(2026, 11, 10, 11, 0, tzinfo=timezone.utc).timestamp()
+    NOTE_ISO = "2026-11-10T11:00:00+00:00"
+
+    def setUp(self):
+        super().setUp()
+        Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
+
+    def write_record(self, audit=AUDIT):
+        Path(audit_report.run_record_path_for(AUDIT)).write_text(
+            json.dumps({"audit": audit, audit_report.RUN_RECORD_STARTED_KEY: self.RECORD_STAMP})
+        )
+
+    def write_note(self):
+        Path(audit_report.inflight_path_for(AUDIT)).write_text(
+            json.dumps({"audit": AUDIT, audit_report.INFLIGHT_STARTED_KEY: self.NOTE_EPOCH})
+        )
+
+    def test_the_run_record_names_the_start_over_the_note(self):
+        self.write_record()
+        self.write_note()
+        self.assertEqual(audit_report.run_started_iso(AUDIT, self.NOW), self.RECORD_ISO)
+
+    def test_the_record_outlives_a_released_note(self):
+        self.write_record()
+        self.assertEqual(audit_report.run_started_iso(AUDIT, self.NOW), self.RECORD_ISO)
+
+    def test_the_note_stands_in_when_there_is_no_record(self):
+        self.write_note()
+        self.assertEqual(audit_report.run_started_iso(AUDIT, self.NOW), self.NOTE_ISO)
+
+    def test_another_streams_record_is_not_this_runs(self):
+        self.write_record(audit="obtainability-audit")
+        self.assertIsNone(audit_report.run_started_iso(AUDIT, self.NOW))
+
+    def test_a_record_that_does_not_parse_falls_back_to_the_note(self):
+        Path(audit_report.run_record_path_for(AUDIT)).write_text("{not json")
+        self.write_note()
+        self.assertEqual(audit_report.run_started_iso(AUDIT, self.NOW), self.NOTE_ISO)
+
+    def test_nothing_to_read_is_none(self):
+        self.assertIsNone(audit_report.run_started_iso(AUDIT, self.NOW))
+
+    def test_the_envelope_carries_the_start(self):
+        self.write_record()
+        envelope = audit_report.report_envelope(
+            AUDIT,
+            {},
+            {},
+            self.NOW,
+            repo="acme/fleet",
+            issue_number=None,
+            ledger_body="",
+            new_ids=[],
+            resolved_ids=[],
+            rendered_ids=[],
+        )
+        self.assertEqual(envelope[audit_report.ENVELOPE_STARTED_KEY], self.RECORD_ISO)
+        self.assertEqual(envelope["finished_at"], self.NOW.isoformat())
+
+
 class TestRenderBody(unittest.TestCase):
     def test_renders_scope_findings_and_footer(self):
         doc = make_doc()

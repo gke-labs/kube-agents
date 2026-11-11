@@ -59,7 +59,10 @@ def root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     transcript.clear()
 
 
-def _store(root: Path, *, status: str = "NO_FORGE", finished: datetime, ids=(BINDING_ID,)) -> None:
+_NO_KEY = object()
+
+
+def _store(root: Path, *, status: str = "NO_FORGE", finished: datetime, ids=(BINDING_ID,), started=_NO_KEY) -> None:
     directory = root / AUDIT / "no_forge" / "local"
     directory.mkdir(parents=True)
     envelope = {
@@ -70,6 +73,8 @@ def _store(root: Path, *, status: str = "NO_FORGE", finished: datetime, ids=(BIN
         "current_ids": list(ids),
         "document": {"findings": [{"id": fid} for fid in ids]},
     }
+    if started is not _NO_KEY:
+        envelope["started_at"] = started.isoformat() if isinstance(started, datetime) else started
     (directory / "latest.json").write_text(json.dumps(envelope), encoding="utf-8")
 
 
@@ -94,6 +99,48 @@ def test_no_report_is_a_fail(root):
 def test_a_previous_runs_report_is_a_fail(root):
     _store(root, finished=STARTED - timedelta(hours=1))
     assert _verify().status == "fail"
+
+
+def test_a_report_whose_run_started_in_this_window_passes(root):
+    """#4268: an envelope naming its run's start counts when that run opened in the window."""
+    _store(root, finished=STARTED + timedelta(minutes=9), started=STARTED + timedelta(minutes=1))
+    assert _verify().status == "pass"
+
+
+def test_a_report_from_a_run_that_started_in_an_earlier_repetition_fails(root):
+    """It finished inside this run, but its run opened before it: another repetition's report."""
+    _store(root, finished=STARTED + timedelta(minutes=2), started=STARTED - timedelta(minutes=30))
+    assert _verify().status == "fail"
+
+
+def test_a_report_that_could_not_name_its_start_fails(root):
+    """A new image writes the key; null is a finish whose run record and note were both gone."""
+    _store(root, finished=STARTED + timedelta(minutes=2), started=None)
+    assert _verify().status == "fail"
+
+
+def test_a_report_refused_for_its_start_says_so(root):
+    _store(root, finished=STARTED + timedelta(minutes=2), started=STARTED - timedelta(minutes=30))
+    result = _verify()
+    assert "1 finished since but came from a run that opened before then or named no start" in result.reason
+    assert result.raw["stored"][0]["started_at"] == (STARTED - timedelta(minutes=30)).isoformat()
+
+
+def test_a_start_inside_the_clock_skew_allowance_passes(root):
+    """The runner and the pod are two clocks: the start bound takes the same skew as finished_at."""
+    _store(root, finished=STARTED + timedelta(minutes=5), started=STARTED - timedelta(seconds=60))
+    assert _verify().status == "pass"
+
+
+@pytest.mark.parametrize("started", ["not a time", "2026-10-13T18:05:00"], ids=["unparseable", "naive"])
+def test_a_start_that_is_not_an_aware_time_fails(root, started):
+    _store(root, finished=STARTED + timedelta(minutes=5), started=started)
+    assert _verify().status == "fail"
+
+
+def test_an_older_images_report_with_no_start_key_is_read_by_finished_at(root):
+    _store(root, finished=STARTED + timedelta(minutes=2))
+    assert _verify().status == "pass"
 
 
 def test_a_ledger_run_is_not_a_no_forge_run(root):
@@ -284,6 +331,19 @@ def test_since_state_file_takes_the_stacks_fired_at_as_the_clock(root, monkeypat
     assert without.status == "fail"
     with_file = _verify_envelope(root, required_envelope={"precheck": "unchanged"}, since_state_file="/opt/data/.bench-x.json")
     assert with_file.status == "pass", with_file.reason
+
+
+def test_under_since_state_file_the_start_is_bound_by_the_fire(root, monkeypatch):
+    """#4268: with a state file the start takes the fire as its bound, with no skew."""
+    fired = STARTED - timedelta(hours=2)
+    monkeypatch.setattr(onboarding, "agent_shell", _state_shell({"job_id": AUDIT, "fired_at": fired.isoformat()}))
+    _store_with(root, {"precheck": "unchanged", "started_at": (fired + timedelta(minutes=1)).isoformat()}, fired + timedelta(minutes=9))
+    inside = _verify_envelope(root, required_envelope={"precheck": "unchanged"}, since_state_file="/opt/data/.bench-x.json")
+    assert inside.status == "pass", inside.reason
+    (root / AUDIT).rename(root / "old")
+    _store_with(root, {"precheck": "unchanged", "started_at": (fired - timedelta(seconds=5)).isoformat()}, fired + timedelta(minutes=9))
+    before = _verify_envelope(root, required_envelope={"precheck": "unchanged"}, since_state_file="/opt/data/.bench-x.json")
+    assert before.status == "fail"
 
 
 def test_the_planted_envelope_seconds_before_the_fire_does_not_count(root, monkeypatch):
