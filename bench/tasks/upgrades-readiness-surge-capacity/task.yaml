@@ -7,7 +7,8 @@
 # mode of fleet-upgrade-verification grades the pair with its surge-capacity
 # rule: the pool removes a node first, is not autoscaled, and the pinned pod has
 # no room on the pool's other nodes, so the pool is an other blocker. Every other
-# seeded pool is on GKE's default surge settings and is not named.
+# seeded pool keeps some surge (GKE's default, or 2 on seeded-b's default pool,
+# so its two nodes roll in one step) and is not named.
 #
 # The rule grades a pool only while it is below the target, and the target here is
 # each cluster's channel default: no-surge-pool is below it because the fleet pins

@@ -42,7 +42,7 @@ const defaultScopeFile = "/etc/kube-agents/scope.json"
 
 // defaultGchatTokenPath is where the operator projects the gateway's
 // relay-audience ServiceAccount token when the gchat backend is armed.
-const defaultGchatTokenPath = "/var/run/secrets/a2a-chat-relay/token"
+const defaultGchatTokenPath = "/var/run/secrets/a2a-chat-relay/token" // #nosec G101 -- a path, not a credential
 
 // envGchatHomeChannel carries the Chat home space the chat.notify route posts
 // to (notify.go); the operator renders it from googleChat.homeChannel.
@@ -551,6 +551,9 @@ type Config struct {
 	SessionClusterView     bool
 	CredentialProxyURL     string
 	CredentialProxyExecURL string
+	KubeProxyURL           string
+	KubeProxyCAConfigMap   string
+	KubeProxyHostContext   string
 
 	// StrictEventsWriter makes the `…events` writer-class agreement check a
 	// refusal instead of a counted advisory (A2A_STRICT_EVENTS_WRITER=true).
@@ -725,6 +728,9 @@ func FromEnv() (*Config, error) {
 		SessionClusterView:     os.Getenv("A2A_SESSION_CLUSTER_VIEW") == "true",
 		CredentialProxyURL:     os.Getenv("A2A_CREDENTIAL_PROXY_URL"),
 		CredentialProxyExecURL: os.Getenv("A2A_CREDENTIAL_PROXY_EXEC_URL"),
+		KubeProxyURL:           os.Getenv("A2A_KUBE_PROXY_URL"),
+		KubeProxyCAConfigMap:   os.Getenv("A2A_KUBE_PROXY_CA_CONFIGMAP"),
+		KubeProxyHostContext:   os.Getenv("A2A_KUBE_PROXY_HOST_CONTEXT"),
 		AuthorityTier:          capability.Tier(envOr("A2A_AUTHORITY_TIER", string(capability.TierDeveloperTeam))),
 		AuthorityScope:         capability.Scope(os.Getenv("A2A_AUTHORITY_SCOPE")),
 		CapabilityOptional:     capability.OptionalFromEnv(),

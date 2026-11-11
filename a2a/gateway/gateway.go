@@ -1177,9 +1177,10 @@ func (g *Gateway) verifySender(msg InboundMessage) (backend, principal string, o
 		// else's message, and the adapter tells the clicker privately
 		// (InboundMessage.Shortcut).
 		//
-		// Nor for a press of Slack's Stop button: it asked the bot for
-		// nothing, and the notice would land in a thread the channel reads.
-		notified := msg.Unaddressed || msg.Shortcut || isSlackStop(msg, backend)
+		// Nor for a press of a Stop button, Slack's or Google Chat's: it
+		// asked the bot for nothing, and the notice, which names the
+		// presser, would land in a thread the channel reads.
+		notified := msg.Unaddressed || msg.Shortcut || isSlackStop(msg, backend) || isChatStopPress(msg, backend)
 		if !notified {
 			key := droppedNoticeKey(backend, msg.AuthorID)
 			g.mu.Lock()
@@ -1369,19 +1370,22 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		// chattext.IsStatusQuery is a phrase set, so a real question such
 		// as "how is the deploy doing" still starts a task.
 		g.post(rec.Key, topLevelNothingRunningNotice)
-	case stopping && isSlackStop(msg, backend) &&
-		!mayStop(rec, backend, TaskRequester{Backend: backend, Subject: requesterSubject(g.ps, backend, msg.AuthorID)}):
-		// Only the people who asked for work in a Slack thread may press
-		// its Stop button (stopgate.go). Anyone else's press cancels
-		// nothing and posts nothing. A typed `stop` keeps the rule below.
-		g.log.Info("slack stop refused: not a requester in this conversation", "conversation", rec.Key)
-	case stopping && isSlackStop(msg, backend) && g.cardStopWanted(rec, msg):
-		g.slackStop(ctx, rec, authority, backend)
 	case stopping && isChatStopPress(msg, backend) && msg.TaskID != "" && (active == nil || active.TaskID != msg.TaskID):
 		// Google Chat's Stop button names its task (gchat_stop.go): a
 		// press on a task that is not the running one is a stale button,
-		// answered on its own line, and cancels nothing.
+		// answered on its own line, and cancels nothing. Read before the
+		// requester gate below: it cancels nothing, so anyone may heal a
+		// dead line.
 		g.chatStopStale(rec, msg)
+	case stopping && isStopPress(msg, backend) &&
+		!mayStop(rec, backend, TaskRequester{Backend: backend, Subject: requesterSubject(g.ps, backend, msg.AuthorID)}):
+		// Only the people who asked for work in a thread may press its Stop
+		// button, Slack's native one or the one drawn on Google Chat
+		// (stopgate.go). Anyone else's press cancels nothing and posts
+		// nothing. A typed `stop` keeps the rule below.
+		g.log.Info("stop press refused: not a requester in this conversation", "backend", backend, "conversation", rec.Key)
+	case stopping && isSlackStop(msg, backend) && g.cardStopWanted(rec, msg):
+		g.slackStop(ctx, rec, authority, backend)
 	case stopping && isChatStopPress(msg, backend) && msg.TaskID != "":
 		// A press on the running task answers on that task's own line, and
 		// posts nothing (chat_stop_press.go). With the card stop armed the

@@ -351,6 +351,13 @@ front (`guard_cluster_ownership`, [below](#recovering-from-an-interrupted-apply)
 rather than 409ing on the cluster halfway through. Through `install.sh` the
 probe derives `create_cluster = false` instead and adopts the cluster.
 
+Every input the guards read goes through the remote state: each `tfvar` read
+is a `terraform console` that opens it, and the pre-apply guards make about
+fifty of them. When Cloud Storage answers a transient 429 or 5xx, or the
+connection drops, the script asks again, up to `STATE_BACKEND_ATTEMPTS` times
+(4) with `STATE_BACKEND_WAIT_SECONDS` (15) between. Any other error fails the
+read at once, as before, with the Terraform error printed.
+
 ### Asking what an apply would change
 
 ```bash

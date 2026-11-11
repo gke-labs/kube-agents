@@ -5085,8 +5085,8 @@ adopt_live_platform_agent_mode() {
 }
 
 # A first install that mirrors its third-party images ($1, the prefix)
-# defaults to today. next's NATS bus runs two images (nats, nats-box) that
-# are the operator's compiled defaults, which neither this installer nor the
+# defaults to today. next's NATS bus runs three images (nats, nats-box,
+# nats-server-config-reloader) that are the operator's compiled defaults, which neither this installer nor the
 # chart points at a mirror, so on a cluster that pulls only from the mirror
 # the bus would sit in ImagePullBackOff. Only the fallback moves: --mode, an
 # exported PLATFORM_AGENT_MODE, a recorded key and the cluster's live mode all win.
@@ -8451,13 +8451,14 @@ main() {
   export LITELLM_REDACTION_IP_ALLOW_CIDRS="$PARAM_LITELLM_REDACTION_IP_ALLOW_CIDRS"
   platform_agent_mode="${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}"
   export PLATFORM_AGENT_MODE="$platform_agent_mode"
-  # The bus's two third-party images are the operator's compiled defaults
-  # (A2A_NATS_IMAGE and A2A_PROVISION_IMAGE in images.json), which neither
-  # this installer nor the chart points at a mirror, so a next install that
-  # mirrors its third-party images still pulls those two from Docker Hub.
+  # The bus's three third-party images are the operator's compiled defaults
+  # (A2A_NATS_IMAGE, A2A_PROVISION_IMAGE and A2A_NATS_RELOADER_IMAGE in
+  # images.json), which neither this installer nor the chart points at a
+  # mirror, so a next install that mirrors its third-party images still pulls
+  # those three from Docker Hub.
   if [ "$platform_agent_mode" = "next" ] && [ -n "$third_party_registry_prefix" ]; then
-    print_warning "spec.mode next with a third-party registry prefix: the operator still pulls the NATS bus's two images (nats, nats-box) from Docker Hub. Nothing in this install points them at ${third_party_registry_prefix}."
-    print_info "On a cluster that can pull only from the mirror, the bus stays in ImagePullBackOff until the operator's A2A_NATS_IMAGE and A2A_PROVISION_IMAGE name the mirrored copies (images.json lists both)."
+    print_warning "spec.mode next with a third-party registry prefix: the operator still pulls the NATS bus's three images (nats, nats-box, nats-server-config-reloader) from Docker Hub. Nothing in this install points them at ${third_party_registry_prefix}."
+    print_info "On a cluster that can pull only from the mirror, the bus stays in ImagePullBackOff until the operator's A2A_NATS_IMAGE, A2A_PROVISION_IMAGE and A2A_NATS_RELOADER_IMAGE name the mirrored copies (images.json lists all three)."
   fi
   export VERTEX_PROJECT_ID="$vertex_project_id"
   export VERTEX_LOCATION="$vertex_location"

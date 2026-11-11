@@ -61,6 +61,10 @@ _GOLDEN_MANIFEST = (
     / "expected"
     / "platformagent.yaml"
 )
+# The exec tier renders only at a positive spec.deployment.credentialProxy.exec.replicas,
+# so the default golden has none; its one-replica golden gives one replica's worth,
+# which the quota preflight multiplies by the chart's replica count.
+_EXEC_TIER_GOLDEN_MANIFEST = _GOLDEN_MANIFEST.with_name("platformagent-exec-1.yaml")
 _NEXT_GOLDEN_MANIFEST = _GOLDEN_MANIFEST.with_name("platformagent-next.yaml")
 _FOOTPRINT_FILE = _ROOT / "charts" / "kube-agents" / "files" / "footprint.yaml"
 
@@ -80,6 +84,7 @@ _SHELL_WORKLOAD = "platformagent-shell"
 _SHELL_CONTAINER = "shell"
 _CRED_PROXY_WORKLOAD = "platformagent-credential-proxy"
 _CRED_PROXY_CONTAINER = "envoy-credential-proxy"
+_EXEC_TIER_WORKLOAD = "platformagent-credential-proxy-exec-tier"
 _KUBE_PROXY_WORKLOAD = "platformagent-kube-proxy"
 _KUBE_PROXY_CONTAINER = "kube-proxy"
 _GATEWAY_WORKLOAD = "platformagent-gateway"
@@ -152,13 +157,14 @@ _KIND_JOB = "Job"
 _KIND_CRON_JOB = "CronJob"
 _KIND_POD = "Pod"
 
-# The A2A workloads next mode adds: footprint key -> (kind, name, the one container each runs).
+# The A2A workloads next mode adds: footprint key -> (kind, name, the containers its pod
+# runs, summed into one entry). The bus pod runs nats-server and its config reloader.
 _A2A_WORKLOADS = {
-    _A2A_NATS: (_KIND_STATEFULSET, _A2A_NATS_WORKLOAD, "nats"),
-    _A2A_CALLOUT: (_KIND_DEPLOYMENT, "platformagent-a2a-callout", "callout"),
-    _A2A_VERIFIER: (_KIND_DEPLOYMENT, "platformagent-a2a-verifier", "verifier"),
-    _A2A_CONSOLE: (_KIND_DEPLOYMENT, "platformagent-a2a-console", "console"),
-    _A2A_GATEWAY: (_KIND_DEPLOYMENT, "platformagent-a2a-gateway", "gateway"),
+    _A2A_NATS: (_KIND_STATEFULSET, _A2A_NATS_WORKLOAD, ("nats", "reloader")),
+    _A2A_CALLOUT: (_KIND_DEPLOYMENT, "platformagent-a2a-callout", ("callout",)),
+    _A2A_VERIFIER: (_KIND_DEPLOYMENT, "platformagent-a2a-verifier", ("verifier",)),
+    _A2A_CONSOLE: (_KIND_DEPLOYMENT, "platformagent-a2a-console", ("console",)),
+    _A2A_GATEWAY: (_KIND_DEPLOYMENT, "platformagent-a2a-gateway", ("gateway",)),
 }
 
 # Kinds that put pods on a cluster. Every golden document of one of these has to reach the
@@ -216,6 +222,8 @@ _BASE = "base"
 _DASHBOARD = "dashboard"
 _SHELL_SANDBOX = "shellSandbox"
 _CREDENTIAL_PROXY = "credentialProxy"
+_OPERATOR_RENDERED_PER_REPLICA = "operatorRenderedPerReplica"
+_CREDENTIAL_PROXY_EXEC_TIER = "credentialProxyExecTier"
 _KUBE_PROXY = "kubeProxy"
 _STORAGE_SECTION = "storage"
 _PERSISTENT_VOLUME_CLAIMS = "persistentVolumeClaims"
@@ -572,6 +580,35 @@ def _check_limits(pod_workloads: dict, summed_containers: set) -> None:
         )
 
 
+def _exec_tier_entry() -> dict:
+    """One exec-tier replica's footprint, from the exec tier's one-replica golden."""
+    for doc in yaml.safe_load_all(_EXEC_TIER_GOLDEN_MANIFEST.read_text()):
+        if not doc or doc.get(_KIND_FIELD) != _KIND_DEPLOYMENT:
+            continue
+        if (doc.get(_METADATA_FIELD) or {}).get(_NAME_FIELD) != _EXEC_TIER_WORKLOAD:
+            continue
+        containers = _pod_containers(_pod_spec(doc))
+        # The entry sums the broker container alone, so anything else the pod runs
+        # (a container, or an init container of either kind) would go uncounted.
+        # The tier's pod is a copy of the broker's, so a container added there lands
+        # here too; fail on it rather than undercount, as _check_completeness does
+        # for the default golden.
+        others = [c.get(_NAME_FIELD) for c in containers if c.get(_NAME_FIELD) != _CRED_PROXY_CONTAINER]
+        if others:
+            raise ValueError(
+                f"{_EXEC_TIER_WORKLOAD} in {_EXEC_TIER_GOLDEN_MANIFEST.name} runs containers"
+                f" the exec tier's footprint does not sum: {others}. {_COMPLETENESS_ADVICE}"
+            )
+        for container in containers:
+            if container.get(_NAME_FIELD) == _CRED_PROXY_CONTAINER:
+                return _workload_entry([container], pods=1)
+        raise ValueError(
+            f"container {_CRED_PROXY_CONTAINER!r} not found in {_EXEC_TIER_WORKLOAD}"
+            f" in {_EXEC_TIER_GOLDEN_MANIFEST.name}"
+        )
+    raise ValueError(f"{_EXEC_TIER_WORKLOAD} not found in {_EXEC_TIER_GOLDEN_MANIFEST.name}")
+
+
 def extract_footprint() -> dict:
     """Extract operator-rendered resource requirements from both goldens."""
     today = _extract(_GOLDEN_MANIFEST, next_mode=False)
@@ -590,7 +627,11 @@ def extract_footprint() -> dict:
             f" {', '.join(moved)}; nextMode can only record what next mode adds, so a"
             " workload that changes between the modes needs a nextMode entry of its own"
         )
-    return {_OPERATOR_RENDERED: today[_OPERATOR_RENDERED], _NEXT_MODE: following[_NEXT_MODE]}
+    return {
+        _OPERATOR_RENDERED: today[_OPERATOR_RENDERED],
+        _OPERATOR_RENDERED_PER_REPLICA: today[_OPERATOR_RENDERED_PER_REPLICA],
+        _NEXT_MODE: following[_NEXT_MODE],
+    }
 
 
 def _extract(golden: pathlib.Path, next_mode: bool) -> dict:
@@ -760,13 +801,14 @@ def _extract(golden: pathlib.Path, next_mode: bool) -> dict:
                 " blessed without RunSettledGoldenTest leaves it out"
             )
         summed_containers.add(_container_key(_GATEWAY_WORKLOAD_KEY, _BRIDGE_CONTAINER))
-        for key, (kind, name, container) in _A2A_WORKLOADS.items():
-            if key not in a2a_found or container not in a2a_found[key][0]:
-                raise ValueError(
-                    f"container {container!r} of {kind}/{name} not found in the next-mode"
-                    " golden"
-                )
-            summed_containers.add(_container_key(a2a_found[key][2], container))
+        for key, (kind, name, names) in _A2A_WORKLOADS.items():
+            for container in names:
+                if key not in a2a_found or container not in a2a_found[key][0]:
+                    raise ValueError(
+                        f"container {container!r} of {kind}/{name} not found in the next-mode"
+                        " golden"
+                    )
+                summed_containers.add(_container_key(a2a_found[key][2], container))
         if len(provision_jobs) != 1 or _A2A_PROVISION_CONTAINER not in provision_jobs[0][0]:
             raise ValueError(
                 f"expected one {_A2A_PROVISION_JOB_PREFIX}* Job running"
@@ -826,7 +868,12 @@ def _extract(golden: pathlib.Path, next_mode: bool) -> dict:
                 _DATA_CLAIM_REQUEST: format_bytes(data_claim_bytes[0]),
                 _DATA_CLAIM_BYTES_REQUEST: data_claim_bytes[0],
             },
-        }
+        },
+        # Outside operatorRendered, which the preflight sums once per entry: these are
+        # one replica's worth, multiplied by a replica count the chart holds.
+        _OPERATOR_RENDERED_PER_REPLICA: {
+            _CREDENTIAL_PROXY_EXEC_TIER: _exec_tier_entry(),
+        },
     }
     if next_mode:
         following = {
@@ -841,9 +888,11 @@ def _extract(golden: pathlib.Path, next_mode: bool) -> dict:
                 ),
             },
         }
-        for key, (_, _, container) in _A2A_WORKLOADS.items():
+        for key, (_, _, names) in _A2A_WORKLOADS.items():
             containers, replicas, _, surges = a2a_found[key]
-            following[key] = _workload_entry([containers[container]], pods=1, replicas=replicas)
+            following[key] = _workload_entry(
+                [containers[container] for container in names], pods=1, replicas=replicas
+            )
             following[key][_SURGES] = surges
         following[_A2A_PROVISION] = _workload_entry(
             [provision_jobs[0][0][_A2A_PROVISION_CONTAINER]], pods=1
