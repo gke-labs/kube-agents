@@ -1453,6 +1453,12 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// and the settled lower row sends no event for it, so the pass that
 	// measures the step again is scheduled for the hold's end.
 	requeueAfter = min(requeueAfter, r.sizingStepBackRequeue(instance))
+	// An A2A gateway waiting for TASKS on a provisioned bus turns Degraded at
+	// a threshold, and pods are not watched, so the pass that writes it is
+	// scheduled for then (a2aGatewayTasksWaitRequeue).
+	if a2aNext {
+		requeueAfter = min(requeueAfter, r.a2aGatewayTasksWaitRequeue(ctx, instance))
+	}
 	// The scope publisher's next run, or the moment its document goes stale:
 	// Jobs are not watched, so the pass that starts the run and the pass
 	// that turns ScopeResolved False have to be asked for.
@@ -4814,6 +4820,15 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	agentAPIAuthRefusal, _ := agentAPIAuthResourcesRefusal(agent)
 	sandboxResourcesRefusal, _ := shellSandboxResourcesRefusal(agent)
 	execRefusal := ValidateCredentialProxyExec(agent, nil)
+	// The A2A gateway still waiting for TASKS on a provisioned bus
+	// (a2aGatewayTasksWaitMessage). Asked only while that Deployment has no
+	// ready replica, so a settled install lists no pods for it.
+	a2aTasksWaitMsg := ""
+	for _, w := range splitWorkloads {
+		if w.name == a2aGatewayName(agent) && w.ready == 0 {
+			a2aTasksWaitMsg = r.a2aGatewayTasksWaitMessage(ctx, agent)
+		}
+	}
 
 	degradedStatus := metav1.ConditionFalse
 	degradedReason := ""
@@ -4859,6 +4874,16 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		degradedStatus = metav1.ConditionTrue
 		degradedReason = conditionReasonMinterPruningHeld
 		degradedMsg = minterHeldMessage(agent.Name+gitopsStateConfigMapSuffix, minterHeld)
+	} else if a2aTasksWaitMsg != "" {
+		// Degraded only, as the held minter entry above: Ready and the phase
+		// keep what the workload says (Provisioning, naming the gateway), and
+		// this says why the wait is not provisioning's. It reports lost
+		// function, so it ranks above the resource refusals below; a
+		// confirmed loss of the streams (A2ABusStreamsMissing, #5474) ranks
+		// above it.
+		degradedStatus = metav1.ConditionTrue
+		degradedReason = conditionReasonA2AGatewayWaitingForTasks
+		degradedMsg = a2aTasksWaitMsg
 	} else if proxyResourcesRefusal != "" {
 		// Same shape as the git refusal above: the spec is read here, on
 		// every pass, rather than carried from reconcileCredentialProxy, so
