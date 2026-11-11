@@ -398,7 +398,7 @@
 # A read-only forge question that asks for `gh` by name (#2201): the answer
 # must come through the version-control verbs, which is red on any build
 # whose sandbox still carries a forge CLI that answers. Read-only, so no
-# `requesting:` entry. Priced in unit_cost_hint.
+# `requested_pull_requests:` key. Priced in unit_cost_hint.
 ./tasks/vcs-forge-cli-request-uses-the-verbs/task.yaml
 
 # ── Moved here 2026-09-22 from the presubmit file (#1023) ───────────────────
@@ -1025,6 +1025,13 @@
 # card.
 ./tasks/chat-tabular-answer-keeps-its-table/task.yaml
 
+# A presence answer from a Cluster Agent names the missing namespace and the
+# cluster it was looked for on, and quotes no kubectl command: the card's
+# result is posted into the thread verbatim, and a command there is plumbing
+# (#5094). deployer: noop, read-only, the slot b role standing for its
+# cluster, one card.
+./tasks/chat-voice-absent-answer-quotes-no-command/task.yaml
+
 # The front door's "what can you do?" calls a per-cluster agent "the <cluster>
 # cluster agent", not its profile id (#3082). deployer: noop, transcript-only,
 # one front-door turn with no card: +3 units.
@@ -1102,6 +1109,11 @@
 # through the Session KV server's findings routes and resolves the rows on
 # destroy. No fixture; the host install only.
 ./tasks/findings-decision-leaves-unnamed-open/task.yaml
+
+# The first-install hello when the report was filed as a ledger issue before
+# anyone wrote (#4058): the greeting answers first and links the issue once,
+# never in front of the answer. Same seam, variant filed; no fixture.
+./tasks/first-install-hello-filed/task.yaml
 
 # A fleet audit on an install whose scope excludes as many clusters as it
 # manages runs, rather than cancelling with "every managed cluster is

@@ -190,8 +190,9 @@ because on an install that declares no scope the report script's own fallback
 is every project the credential can list. A roster spelling with a space, a semicolon, or a
 comma inside one project's name is not a project id or number, so it fails the tick with the
 places to correct it. Within those projects the report script
-enumerates every cluster, so a cluster `spec.scope.exclude.clusters` keeps a
-Cluster Agent from is still read here. On an install that declares a scope (a
+enumerates every cluster, so a cluster `spec.scope.exclude.clusters` excludes
+still gets its versions graded here, from `gcloud` cluster metadata, but none of
+its in-cluster reads (`--scope-readiness-excluded-clusters`). On an install that declares a scope (a
 `spec.scope` block), the report script, a fleet-audit collector, refuses a bare
 `--project` in the sandbox, so the job reads the declared scope on the agent
 pod (`fleet_scope_targets.declared_scope_targets()`) and hands the script the
@@ -207,7 +208,7 @@ for the version table and, on a report day, the readiness report's read set,
 the same as a run on request: three `gcloud` list reads per project (backend
 services, instances and GKE operations, projected to the fields the rules read)
 beside the server config per location, then one `get-credentials` and six
-`kubectl get`s per cluster (budgets, Deployments and StatefulSets; webhook configurations
+`kubectl get`s per cluster not excluded (budgets, Deployments and StatefulSets; webhook configurations
 with their Services, EndpointSlices and Namespaces; DaemonSets, CronJobs,
 claims, NetworkPolicies and Namespaces; every pod; the nodes through a
 jsonpath projection; StorageClasses and PersistentVolumes), plus

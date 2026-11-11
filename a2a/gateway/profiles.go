@@ -39,22 +39,35 @@ const (
 // prefixes for the room (refusalNotice). Each names what was asked, since the
 // asker may not know the install's profiles or scope.
 const (
-	noticeProfileUnknown      = "there is no agent profile named %q"
-	noticeProfilePinnedOther  = "%s works only on cluster %s, not %s"
-	noticeProfileNoTarget     = "%s needs a target cluster (project, location and cluster)"
-	noticeProfileTakesNone    = "%s doesn't take a target cluster"
-	noticeProfileTier         = "%s doesn't run at tier %s"
-	noticeProfileAmbiguous    = "more than one agent profile is pinned to cluster %s"
-	noticeProfileNoGeneric    = "no agent profile serves cluster %s"
-	noticeTargetExcluded      = "cluster %s is excluded from this install's scope"
-	noticeTargetOutOfScope    = "cluster %s is outside this install's scope"
-	noticeTargetUnconfirmed   = "can't confirm %s is in this install's scope yet"
+	noticeProfileUnknown     = "there is no agent profile named %q"
+	noticeProfilePinnedOther = "%s works only on cluster %s, not %s"
+	noticeProfileNoTarget    = "%s needs a target cluster (project, location and cluster)"
+	noticeProfileTakesNone   = "%s doesn't take a target cluster"
+	noticeProfileTier        = "%s doesn't run at tier %s"
+	noticeProfileAmbiguous   = "more than one agent profile is pinned to cluster %s"
+	noticeProfileNoGeneric   = "no agent profile serves cluster %s"
+	noticeTargetExcluded     = "cluster %s is excluded from this install's scope"
+	noticeTargetOutOfScope   = "cluster %s is outside this install's scope"
+	noticeTargetUnconfirmed  = "can't confirm %s is in this install's scope yet"
+	// noticeTargetStale refuses a target the resolved scope would decide,
+	// when the resolved scope is missing, stale or from another declaration.
+	noticeTargetStale = "can't confirm %s is in this install's scope yet (the resolved scope is stale)"
+	// noticeTargetUnpublished refuses a target the resolved scope would decide,
+	// when the document reads too-large or error; the second verb is that state.
+	noticeTargetUnpublished = "can't confirm %s is in this install's scope (the resolved scope reads %s)"
+	// noticeTargetUnreadable refuses a member project the publisher's probe
+	// could not read; the second verb is the probe's outcome.
+	noticeTargetUnreadable    = "can't confirm %s is in this install's scope (its project can't be read: %s)"
 	noticeTargetParamsInvalid = "the task's parameters aren't valid: %v"
+	noticeParamUndeclared     = "%s doesn't take parameter %q; it takes %s"
+	noticeParamMissing        = "%s needs parameter %s; it takes %s"
 	noticeProfileNoIdentity   = "an agent profile runs a task only for an identified requester"
 	noticeProfileRouteFailed  = "the task couldn't be routed to its agent profile"
 	// noticeProfileParentToPlatform refuses a profile task's delegation to
 	// platform, whose child would be minted wider than its parent.
 	noticeProfileParentToPlatform = "an agent profile's task delegates only to another agent profile"
+	// noticePlatformTakesNoParameters: platform takes its target from the text.
+	noticePlatformTakesNoParameters = "platform takes no parameters; put the target in the text"
 	// noticeProfileWhileRunning refuses a turn naming a profile while the
 	// conversation has a task running, which would otherwise be steered
 	// into that task with the profile dropped.
@@ -68,6 +81,15 @@ const (
 const (
 	noticeTurnNotStarted       = "⚠️ not started: "
 	noticeDelegationRefusedFor = "⚠️ delegation refused: "
+)
+
+// How noticeParamUndeclared and noticeParamMissing spell a profile's
+// declared parameters: each name, marked when a task must carry it, or
+// paramsNone for a profile that declares none.
+const (
+	paramRequiredMark = " (required)"
+	paramListSep      = ", "
+	paramsNone        = "none"
 )
 
 // childNeverStarted is a child's end when it never reached an executor.
@@ -324,6 +346,7 @@ type scopeDeclaration struct {
 	// the reconcile resolves, like folders and organizations.
 	SharedVpcHosts []string `json:"sharedVpcHosts"`
 	MetricsScopes  []string `json:"metricsScopes"`
+	MaxProjects    *int     `json:"maxProjects"`
 	Exclude        struct {
 		Projects []string `json:"projects"`
 		Clusters []struct {
@@ -339,7 +362,7 @@ type scopeDeclaration struct {
 var errNoScopeFile = errors.New("no scope file")
 
 func loadScope(path string) (*scopeDeclaration, error) {
-	raw, err := os.ReadFile(path)
+	raw, err := os.ReadFile(path) // #nosec G304 -- the scope file the operator renders into the pod
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, errNoScopeFile
 	}
@@ -356,8 +379,9 @@ func loadScope(path string) (*scopeDeclaration, error) {
 // checkTargetScope refuses a target outside the install's scope
 // (spec-profiles-dispatch.md, "Addressing", step 2). An exclusion always
 // refuses. A declared project list admits only its projects. Past that, a
-// folder or organization scope can't be confirmed without resolving
-// membership, which the gateway can't do yet, so it refuses: "not
+// project a folder, organization, Shared VPC host or Metrics Scope may reach
+// can't be confirmed from the declaration, so it refuses with errUnresolved,
+// which Gateway.checkScope settles against the resolved scope: "not
 // excluded" isn't "in scope". An install that declares no scope draws no
 // boundary, as the platform agent reads it, so only exclusions apply. A nil
 // declaration (no file rendered, or one that didn't parse) refuses every
@@ -370,6 +394,11 @@ func checkTargetScope(decl *scopeDeclaration, management string, t clusterTarget
 	// entry matching it is ignored, as the reconcile does. Its own
 	// clusters can still be excluded by name below.
 	isManagement := management != "" && t.Project == management
+	// A number entry also drops the project the number names, which the
+	// reconcile ties to an ID through Metrics Scope naming. The declaration
+	// has no number for an ID; the resolved scope does (its
+	// excludedProjects), so only a target it decides can be confirmed.
+	numberUnresolved := false
 	if !isManagement {
 		excluded, err := projectExcluded(t.Project, decl.Exclude.Projects)
 		if err != nil {
@@ -378,27 +407,27 @@ func checkTargetScope(decl *scopeDeclaration, management string, t clusterTarget
 		if excluded {
 			return refused(noticeTargetExcluded, t)
 		}
-		// A number entry also drops the project the number names, which the
-		// reconcile ties to an ID through Metrics Scope naming. The gateway
-		// has no number for an ID, so it can't confirm the target isn't the
-		// project excluded.
-		if !isProjectNumber(t.Project) && slices.ContainsFunc(decl.Exclude.Projects, isProjectNumber) {
-			return refused(noticeTargetUnconfirmed, t)
-		}
+		numberUnresolved = !isProjectNumber(t.Project) && slices.ContainsFunc(decl.Exclude.Projects, isProjectNumber)
 	}
 	for _, c := range decl.Exclude.Clusters {
 		if c.ProjectID == t.Project && c.Location == t.Location && c.ClusterName == t.Cluster {
 			return refused(noticeTargetExcluded, t)
 		}
 	}
+	explicit := slices.Contains(decl.Projects, t.Project)
+	if numberUnresolved && (!decl.Present || explicit || !declaresResolution(decl)) {
+		return refused(noticeTargetUnconfirmed, t)
+	}
 	if !decl.Present || isManagement {
 		return nil
 	}
-	if slices.Contains(decl.Projects, t.Project) {
+	if explicit {
 		return nil
 	}
-	if len(decl.Folders) > 0 || len(decl.Organizations) > 0 || len(decl.SharedVpcHosts) > 0 || len(decl.MetricsScopes) > 0 {
-		return refused(noticeTargetUnconfirmed, t)
+	if declaresResolution(decl) {
+		// Only the resolved scope can confirm a project a folder,
+		// organization or selector reaches (Gateway.checkScope).
+		return errUnresolved{errRefused{notice: fmt.Sprintf(noticeTargetUnconfirmed, t)}}
 	}
 	return refused(noticeTargetOutOfScope, t)
 }
@@ -526,12 +555,18 @@ func (g *Gateway) profileRouteFor(addressee string, params map[string]string, ti
 	// (its card's tiers), so a submission at another tier would sit with
 	// nothing to consume it until the never-started heal. A card with no
 	// tiers is from an operator that predates them, and isn't checked.
-	if card, ok := g.profiles.lookup(profile); ok && len(card.Tiers) > 0 && !slices.Contains(card.Tiers, string(tier)) {
+	card, haveCard := g.profiles.lookup(profile)
+	if haveCard && len(card.Tiers) > 0 && !slices.Contains(card.Tiers, string(tier)) {
 		return nil, refused(noticeProfileTier, profile, tier)
 	}
 	route := &profileRoute{Profile: profile, Tier: tier, Kind: kind, Params: maps.Clone(params),
 		Scope: capability.NamespaceScope(g.cfg.Namespace)}
 	if target == nil {
+		if haveCard {
+			if err := checkDeclaredParameters(profile, card, route.Params); err != nil {
+				return nil, err
+			}
+		}
 		return route, nil
 	}
 	decl, err := loadScope(g.cfg.ScopeFile)
@@ -539,7 +574,7 @@ func (g *Gateway) profileRouteFor(addressee string, params map[string]string, ti
 		g.log.Warn("scope file unreadable; refusing the target", "path", g.cfg.ScopeFile, "err", err)
 		decl = nil
 	}
-	if err := checkTargetScope(decl, g.cfg.ManagementProject, *target); err != nil {
+	if err := g.checkScope(decl, *target); err != nil {
 		return nil, err
 	}
 	if route.Params == nil {
@@ -552,8 +587,59 @@ func (g *Gateway) profileRouteFor(addressee string, params map[string]string, ti
 	if err := lib.ValidateTaskParameters(route.Params); err != nil {
 		return nil, refused(noticeTargetParamsInvalid, err)
 	}
+	if haveCard {
+		if err := checkDeclaredParameters(profile, card, route.Params); err != nil {
+			return nil, err
+		}
+	}
 	route.Scope = target.scope()
 	return route, nil
+}
+
+// checkDeclaredParameters holds a task's parameters to what the resolved
+// profile's card declares: a name it doesn't declare is refused, and so is a
+// required one the set leaves out. A pinned profile takes its own cluster's
+// three target parameters whether its card declares them or not, since
+// profileRouteFor sets them from the pin. The refusal names what the profile
+// does take, so the asker can correct the call. The dispatcher checks the
+// required ones again on admission, against the AgentProfile itself.
+func checkDeclaredParameters(profile string, card lib.AgentCard, params map[string]string) error {
+	declared := map[string]bool{}
+	for _, p := range card.Parameters {
+		declared[p.Name] = true
+	}
+	if card.ClusterRef != nil {
+		declared[paramProject], declared[paramLocation], declared[paramCluster] = true, true, true
+	}
+	names := slices.Sorted(maps.Keys(params))
+	for _, name := range names {
+		if !declared[name] {
+			return refused(noticeParamUndeclared, profile, name, declaredParameters(card))
+		}
+	}
+	for _, p := range card.Parameters {
+		if _, ok := params[p.Name]; p.Required && !ok {
+			return refused(noticeParamMissing, profile, p.Name, declaredParameters(card))
+		}
+	}
+	return nil
+}
+
+// declaredParameters is a card's parameters for a refusal: each name in the
+// card's order, marked when required.
+func declaredParameters(card lib.AgentCard) string {
+	if len(card.Parameters) == 0 {
+		return paramsNone
+	}
+	out := make([]string, 0, len(card.Parameters))
+	for _, p := range card.Parameters {
+		name := p.Name
+		if p.Required {
+			name += paramRequiredMark
+		}
+		out = append(out, name)
+	}
+	return strings.Join(out, paramListSep)
 }
 
 // deliverChildResult hands a child's end to a parent addressed to an
