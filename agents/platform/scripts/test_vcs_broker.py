@@ -4298,6 +4298,148 @@ class RouteTableTest(unittest.TestCase):
             with self.subTest(verb=verb):
                 self.assertEqual(getattr(handler, "__self__", None), self.broker)
 
+    def test_decision_override_labels_are_refused_across_forge_verbs(self):
+        cases = [
+            ("label_ensure", {"repository": "acme/infra", "name": "decision-override:DEC-2026-001"}),
+            ("proposal_create", {"repository": "acme/infra", "labels": ["Decision-Override:LES-2026-002"]}),
+            ("proposal_update", {"repository": "acme/infra", "number": 1, "labelsAdd": ["decision-override:DEC-2026-003"]}),
+            ("issue_create", {"repository": "acme/infra", "title": "t", "labels": ["decision-override:DEC-2026-005"]}),
+            ("issue_update", {"repository": "acme/infra", "number": 2, "labelsAdd": ["decision-override:LES-2026-004"]}),
+        ]
+        for method_name, payload in cases:
+            with self.subTest(method=method_name):
+                with self.assertRaises(WorkspaceError) as caught:
+                    getattr(self.broker, method_name)(payload)
+                self.assertEqual(caught.exception.status, 403)
+                self.assertEqual(caught.exception.fields.get("code"), "FORBIDDEN_LABEL")
+
+
+class DecisionMemoryBrokerPublishTest(unittest.TestCase):
+    """Out-of-sandbox OKF guard enforcement on `VcsBroker.publish`."""
+
+    REPOSITORY = "local.test/acme/infra"
+    setUp = RepositoryVerbTest.setUp
+    clone_locally = RepositoryVerbTest.clone_locally
+    bundle_of = RepositoryVerbTest.bundle_of
+
+    def _seed_guard_on_main(self, *, intent_flow: bool = False) -> None:
+        manifest_dir = self.seed / "clusters" / "prod"
+        manifest_dir.mkdir(parents=True, exist_ok=True)
+        (manifest_dir / "checkout.yaml").write_text(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: checkout\nspec:\n"
+            "  template:\n    spec:\n      containers:\n      - name: checkout\n"
+            "        resources:\n          requests:\n            memory: 2Gi\n",
+            encoding="utf-8",
+        )
+        if intent_flow:
+            (self.seed / ".kube-agents").mkdir(parents=True, exist_ok=True)
+            (self.seed / ".kube-agents" / "intent.yaml").write_text(
+                "paths: [intent/]\n", encoding="utf-8"
+            )
+            rec_dir = self.seed / "intent" / "lessons"
+        else:
+            rec_dir = self.seed / "knowledge" / "lessons"
+        rec_dir.mkdir(parents=True, exist_ok=True)
+        (rec_dir / "LES-2026-001-checkout-mem.md").write_text(
+            "---\n"
+            "type: lesson\n"
+            "id: LES-2026-001\n"
+            "title: Keep checkout memory >= 2Gi\n"
+            "status: active\n"
+            "date: 2026-11-01\n"
+            "scope:\n"
+            "  paths:\n"
+            "    - clusters/prod/checkout.yaml\n"
+            "guard:\n"
+            "  rule: Keep checkout memory >= 2Gi.\n"
+            "  severity: block\n"
+            "  expect:\n"
+            "    file: clusters/prod/checkout.yaml\n"
+            "    path: spec.template.spec.containers[name=checkout].resources.requests.memory\n"
+            "    op: '>='\n"
+            "    value: 2Gi\n"
+            "evidence:\n"
+            "  pull_request: '#10'\n"
+            "---\n\nOOMKilled below 2Gi.\n",
+            encoding="utf-8",
+        )
+        git(self.seed, "add", "-A")
+        git(self.seed, "commit", "--quiet", "-m", "seed OKF guard")
+        git(self.seed, "push", "--quiet", "origin", "main")
+
+    def test_publish_blocks_violation_against_base_branch_even_if_branch_deletes_guard(self):
+        self._seed_guard_on_main(intent_flow=True)
+        work, cloned = self.clone_locally()
+        git(work, "checkout", "--quiet", "-b", "platform-agent/lower-mem")
+        (work / "clusters" / "prod" / "checkout.yaml").write_text(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: checkout\nspec:\n"
+            "  template:\n    spec:\n      containers:\n      - name: checkout\n"
+            "        resources:\n          requests:\n            memory: 512Mi\n",
+            encoding="utf-8",
+        )
+        (work / "intent" / "lessons" / "LES-2026-001-checkout-mem.md").unlink()
+        git(work, "add", "-A")
+        git(work, "commit", "--quiet", "-m", "lower mem and delete guard")
+        bundle = self.bundle_of(work, "platform-agent/lower-mem", cloned["revision"])
+
+        with mock.patch.object(self.broker, "_resolve_curator_bin", return_value=None):
+            with self.assertRaises(WorkspaceError) as caught:
+                self.broker.publish({
+                    "repository": self.REPOSITORY,
+                    "branch": "platform-agent/lower-mem",
+                    "target": "main",
+                    "baseRevision": cloned["revision"],
+                    "bundleBase64": bundle,
+                })
+        self.assertEqual(caught.exception.status, 409)
+        self.assertEqual(caught.exception.fields.get("code"), "DECISION_MEMORY_BLOCKED")
+        self.assertIn("LES-2026-001", str(caught.exception))
+
+    def test_publish_blocks_moving_guarded_file_away_via_no_renames(self):
+        self._seed_guard_on_main()
+        work, cloned = self.clone_locally()
+        git(work, "checkout", "--quiet", "-b", "platform-agent/rename-evade")
+        git(work, "mv", "clusters/prod/checkout.yaml", "clusters/prod/checkout-moved.yaml")
+        git(work, "commit", "--quiet", "-m", "move guarded file")
+        bundle = self.bundle_of(work, "platform-agent/rename-evade", cloned["revision"])
+
+        with mock.patch.object(self.broker, "_resolve_curator_bin", return_value=None):
+            with self.assertRaises(WorkspaceError) as caught:
+                self.broker.publish({
+                    "repository": self.REPOSITORY,
+                    "branch": "platform-agent/rename-evade",
+                    "target": "main",
+                    "baseRevision": cloned["revision"],
+                    "bundleBase64": bundle,
+                })
+        self.assertEqual(caught.exception.fields.get("code"), "DECISION_MEMORY_BLOCKED")
+
+    def test_publish_returns_decision_memory_markdown_on_consistent_change(self):
+        self._seed_guard_on_main()
+        work, cloned = self.clone_locally()
+        git(work, "checkout", "--quiet", "-b", "platform-agent/raise-mem")
+        (work / "clusters" / "prod" / "checkout.yaml").write_text(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: checkout\nspec:\n"
+            "  template:\n    spec:\n      containers:\n      - name: checkout\n"
+            "        resources:\n          requests:\n            memory: 4Gi\n",
+            encoding="utf-8",
+        )
+        # Also include a binary file to verify non-UTF-8 changes never crash publish
+        (work / "clusters" / "prod" / "logo.bin").write_bytes(b"\x89PNG\r\n\x1a\n\xff\xfe\x00")
+        git(work, "add", "-A")
+        git(work, "commit", "--quiet", "-m", "raise mem to 4Gi")
+        bundle = self.bundle_of(work, "platform-agent/raise-mem", cloned["revision"])
+
+        with mock.patch.object(self.broker, "_resolve_curator_bin", return_value=None):
+            ans = self.broker.publish({
+                "repository": self.REPOSITORY,
+                "branch": "platform-agent/raise-mem",
+                "target": "main",
+                "baseRevision": cloned["revision"],
+                "bundleBase64": bundle,
+            })
+        self.assertIn("LES-2026-001", ans.get("decisionMemoryMarkdown", ""))
+
 
 if __name__ == "__main__":
     unittest.main()
