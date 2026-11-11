@@ -1394,6 +1394,21 @@ class GroupTest(Harness):
         self.assertIn("`case-reviewer` on the 2026-10-10 nightly", group)
         self.assertIn("`case-red` on the 2026-10-09 nightly", group)
 
+    def test_a_case_that_cleared_before_its_red_nights_left_the_window_still_counts_clear(self):
+        gh, _, _ = self.run_once(self.cluster())
+        [filed] = self.filed(gh)
+        issue = self.opened(filed)
+        # main clears on night 9, main-b only on night 23: by then nights 6-8
+        # are past the 14-night window and the main cases show no red at all.
+        late = [night(d, [green(c) for c in MAIN_CASES]) for d in range(10, 24)]
+        late += [night(d, [tripped(c) for c in MAIN_B_CASES], job=MAIN_B_JOB) for d in range(9, 23)]
+        doc = self.cluster(clear=(9,), clear_b=(23,), more=late)
+        gh, _, _ = self.run_once(doc, FakeGh(open_issues=[issue]))
+        [group] = [body for _, body in self.comments(gh) if "Every case here" in body]
+        self.assertIn("clear=2026-10-23", group)
+        self.assertIn("`case-noowner` on the 2026-10-23 nightly", group)
+        self.assertIn("`case-red` on the 2026-10-10 nightly", group, "its first pass the window still holds")
+
     def test_one_domain_goes_to_its_owner_with_the_case_owners_mentioned(self):
         runs = [night(d, [tripped(c) for c in MAIN_CASES]) for d in (6, 7, 8)]
         gh, _, _ = self.run_once(data(*runs))
@@ -1476,12 +1491,14 @@ class GroupTest(Harness):
         self.assertEqual(nightly_bugs.rep_checks("VerificationCatastrophic=0.0 (a-one, b.two): the agent took an action"), {"a-one", "b.two"})
         self.assertEqual(nightly_bugs.rep_checks("VerificationCatastrophic=0.0 (<unnamed>): the agent took an action"), set())
         self.assertEqual(nightly_bugs.rep_checks(check_reason("x-check", "y-check")), {"x-check", "y-check"})
-        self.assertEqual(nightly_bugs.rep_checks("VerificationCorrectness=0.5 (floor 1.0) -- bare-check; other: why [1 check(s) not applicable: z]"), {"bare-check", "other"})
+        self.assertEqual(nightly_bugs.rep_checks("VerificationCorrectness=0.5 (floor 1.0) -- bare-check; other-check: why [1 check(s) not applicable: z]"), {"bare-check", "other-check"})
+        self.assertEqual(nightly_bugs.rep_checks("VerificationCorrectness=0.0 (floor 1.0) -- pod-ready: got 0; want: 3; error: x"), {"pod-ready"},
+                         "a bare word after a `; ` inside a check's reason is not a check")
         self.assertEqual(nightly_bugs.rep_checks("replay error: the recorded transcript is missing"), set())
         self.assertEqual(nightly_bugs.rep_checks(None), set())
-        cut = ("VerificationCorrectness=0.0 (floor 1.0) -- first: " + "x" * 300)[:285] + "; second-cut-sh"
+        cut = ("VerificationCorrectness=0.0 (floor 1.0) -- first-check: " + "x" * 300)[:285] + "; second-cut-sh"
         self.assertEqual(len(cut), 300)
-        self.assertEqual(nightly_bugs.rep_checks(cut), {"first"}, "a name at the end of a cut reason may be cut short")
+        self.assertEqual(nightly_bugs.rep_checks(cut), {"first-check"}, "a name at the end of a cut reason may be cut short")
 
 
 class PublicIssueCarriesNoCaseResultsTest(Harness):

@@ -131,12 +131,12 @@ except ImportError:  # scripts/ is not on sys.path yet
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
     import case_owner
 try:
-    from eval_dashboard import classify, gate_issue, ghcli, nightly, nightly_infra
+    from eval_dashboard import classify, collect, gate_issue, ghcli, nightly, nightly_infra
     from eval_dashboard import post_health
     from eval_dashboard.post_health import NIGHTLY_URL
 except ImportError:  # run as a script: scripts/eval_dashboard/nightly_bugs.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-    from eval_dashboard import classify, gate_issue, ghcli, nightly, nightly_infra
+    from eval_dashboard import classify, collect, gate_issue, ghcli, nightly, nightly_infra
     from eval_dashboard import post_health
     from eval_dashboard.post_health import NIGHTLY_URL
 
@@ -365,7 +365,6 @@ WHY_NO_INFRA_OWNER = "`docs/designs/domains.yaml` names no `infra_owner`"
 # behind the first, while three unrelated cases breaking the same named
 # check on the same night is no coincidence.
 GROUP_MIN_CASES = 3
-KIND_GROUP = "nightly-red-group"
 # Not BOT_MARKER_RE's shape (`nightly-red-group`, not `nightly-red case=`),
 # so no reader takes it for a case's marker.
 GROUP_MARKER = "<!-- kube-agents-bot:nightly-red-group night={date} -->"
@@ -376,11 +375,11 @@ GROUP_RECOVERY_MARKER = "<!-- kube-agents-bot:nightly-red-group-recovered night=
 # (bench/kube_agents_bench/scoring.py): a tripped safeguard's
 # `VerificationCatastrophic=<x> (<name>, <name>): ...`, or a low score's
 # `VerificationCorrectness=<x> (floor <y>) -- <name>: <why>; <name>: <why>`.
+# A name after the score is read only in a check's shape, two words or more
+# joined by `-`, `_` or `.`: a `; want: 3` inside a check's own reason is not
+# a check, and a bare word shared by three cases would group them wrongly.
 CATASTROPHIC_CHECKS_RE = re.compile(r"^VerificationCatastrophic=\S+ \(([^)]*)\):")
-CHECK_NAME_RE = re.compile(r"(?:^|; )([A-Za-z0-9][A-Za-z0-9._-]*)(?=: |;|$| \[)")
-# collect.py keeps this much of a reason: a name at the very end of a reason
-# that long may be cut short, so it is not read.
-REASON_KEPT_CHARS = 300
+CHECK_NAME_RE = re.compile(r"(?:^|; )([A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)+)(?=: |;|$| \[)")
 GROUP_TITLE = "Nightly: cases red together since {date} need triage"
 GROUP_BODY = """\
 {markers}
@@ -563,7 +562,8 @@ def rep_checks(reason: str | None) -> frozenset:
     if not head:
         return frozenset()
     tail = reason[head.end():]
-    cut = len(reason) >= REASON_KEPT_CHARS
+    # A name at the very end of a reason the collector cut may be cut short.
+    cut = len(reason) >= collect.REP_REASON_MAX_CHARS
     return frozenset(m.group(1) for m in CHECK_NAME_RE.finditer(tail) if not (cut and m.end(1) == len(tail)))
 
 
@@ -613,6 +613,20 @@ def group_cases(pending: list[dict], min_cases: int = GROUP_MIN_CASES) -> tuple[
         groups.append(best)
         taken = {e["case"] for e in best[1]}
         left = [e for e in left if e["case"] not in taken]
+
+
+def group_clear_night(verdicts: list[dict], issue: dict) -> dict | None:
+    """The night a case of a group issue is clear on: its ``recovery_night``
+    after the issue opened; or, once its failing nights have left the
+    window (it cleared long before the slowest case), its first pass after
+    the issue opened, when no night in the window failed and the newest
+    passed. None while it is not clear, or has no graded night on record."""
+    if not verdicts:
+        return None
+    night = recovery_night(verdicts, lambda v: opened_before(issue, v))
+    if night or any(v["outcome"] == classify.OUTCOME_FAILED for v in verdicts) or verdicts[-1]["outcome"] != classify.OUTCOME_PASSED:
+        return night
+    return next((v for v in verdicts if v["outcome"] == classify.OUTCOME_PASSED and opened_before(issue, v)), None)
 
 
 def group_issue_cases(issue: dict) -> list[str]:
@@ -1195,8 +1209,7 @@ class Filer:
                 continue
             clear = []
             for case in cases:
-                verdicts = nights.get(case)
-                night = recovery_night(verdicts, lambda v, issue=issue: opened_before(issue, v)) if verdicts else None
+                night = group_clear_night(nights.get(case), issue)
                 if not night:
                     break
                 clear.append((case, night))

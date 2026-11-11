@@ -935,7 +935,8 @@ domain's `owner:` when the cases share a domain, and to `infra_owner` in
 per-case recovery comments treat it as each case's issue; a triager who
 deletes a case's marker line splits that case off, and it files on its own if
 it stays red. Once every case it names has a recovery night after the issue
-opened, the bot comments once more, listing each case's clear night; a part
+opened (or, once a case's red nights have left the 14-night window, a pass
+after the issue opened), the bot comments once more, listing each case's clear night; a part
 that graded nothing that night (no project, a setup death) is skipped, as for
 one case, so it does not count as clear. The issue names no check: the
 check is used to group and stays on the dashboard. Three, not two: two cases
