@@ -49,21 +49,40 @@ def test_a_bad_card_wait_directive_is_refused(first):
 # --- the board read -----------------------------------------------------------
 
 
-def test_sessions_since_counts_only_api_sessions_with_cards_created_since(tmp_path):
+# The pinned Hermes board's own columns (hermes_cli/kanban_db.py at the
+# HERMES_AGENT_TAG in tags.env): the creating session is ``session_id`` and
+# ``created_at`` is an integer. A board that spells it ``creator_session_id``
+# is read the same way.
+_HERMES_TASKS_DDL = (
+    "CREATE TABLE tasks (id TEXT PRIMARY KEY, title TEXT NOT NULL, body TEXT, assignee TEXT,"
+    " status TEXT NOT NULL, priority INTEGER DEFAULT 0, created_by TEXT,"
+    " created_at INTEGER NOT NULL, session_id TEXT)"
+)
+
+
+@pytest.mark.parametrize("ddl,column", [
+    (_HERMES_TASKS_DDL, "session_id"),
+    ("CREATE TABLE tasks (id TEXT, creator_session_id TEXT, created_at REAL)", "creator_session_id"),
+])
+def test_sessions_since_counts_only_api_sessions_with_cards_created_since(tmp_path, ddl, column):
     db = tmp_path / board.BOARD_FILE
     conn = sqlite3.connect(db)
-    conn.execute("CREATE TABLE tasks (id TEXT, creator_session_id TEXT, created_at REAL)")
-    now = 1_800_000_000.0
-    conn.executemany(
-        "INSERT INTO tasks VALUES (?,?,?)",
-        [
-            ("t1", "a2a-leftover", now - 600),  # an earlier case's
-            ("t2", "a2a-this", now + 5),
-            ("t3", "a2a-this", now + 9),
-            ("t4", "worker-card-session", now + 5),  # not an api session
-            ("t5", None, now + 5),
-        ],
-    )
+    conn.execute(ddl)
+    now = 1_800_000_000
+    rows = [
+        ("t1", "a2a-leftover", now - 600),  # an earlier case's
+        ("t2", "a2a-this", now + 5),
+        ("t3", "a2a-this", now + 9),
+        ("t4", "worker-card-session", now + 5),  # not an api session
+        ("t5", None, now + 5),
+    ]
+    if column == "session_id":
+        conn.executemany(
+            "INSERT INTO tasks (id, title, status, created_by, session_id, created_at) VALUES (?, 'card', 'todo', 'worker', ?, ?)",
+            rows,
+        )
+    else:
+        conn.executemany("INSERT INTO tasks VALUES (?,?,?)", rows)
     conn.commit()
 
     def shell(cmd: str, timeout: float) -> str:

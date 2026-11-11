@@ -653,7 +653,11 @@ SESSIONS_SINCE_PRESENT = "__KANBAN_SESSIONS_SINCE__"
 
 # Runs inside the agent container, read-only like the board read: the
 # distinct creator sessions of cards created at or after a time, limited to the
-# api executor's sessions (API_SESSION_PREFIX). Positional arguments: the data
+# api executor's sessions (API_SESSION_PREFIX). The pinned Hermes board keeps
+# the creating session in ``session_id`` (the originating HERMES_SESSION_ID,
+# hermes_cli/kanban_db.py) and ``created_at`` in epoch seconds; a board that
+# names it ``creator_session_id`` is read too, by the same rule the bridge's
+# card wait uses (a2a/hermes-bridge/kanban.go). Positional arguments: the data
 # root, the board file, the sentinel, the epoch seconds, the prefix.
 _SESSIONS_SINCE_SCRIPT = r"""
 import json, sqlite3, sys
@@ -663,12 +667,13 @@ out = {"sessions": [], "error": None}
 try:
     board = sqlite3.connect("file:%s/%s?mode=ro" % (ROOT, BOARD), uri=True, timeout=10)
     cols = [r[1] for r in board.execute("PRAGMA table_info(tasks)")]
-    if "creator_session_id" not in cols or "created_at" not in cols:
-        out["error"] = "kanban board: tasks has no creator_session_id or created_at"
+    sess = "creator_session_id" if "creator_session_id" in cols else "session_id"
+    if sess not in cols or "created_at" not in cols:
+        out["error"] = "kanban board: tasks has no session_id or created_at"
     else:
         rows = board.execute(
-            "SELECT DISTINCT creator_session_id FROM tasks WHERE created_at >= ? "
-            "AND substr(creator_session_id, 1, ?) = ?",
+            "SELECT DISTINCT %s FROM tasks WHERE created_at >= ? "
+            "AND substr(%s, 1, ?) = ?" % (sess, sess),
             (float(SINCE), len(PREFIX), PREFIX))
         out["sessions"] = sorted(str(r[0]) for r in rows if r[0])
     board.close()
