@@ -1024,6 +1024,8 @@ FLEET_RECONCILER_MEMBER = "serviceAccount:seeded-fleet-reconciler@kube-agents-pr
 FLEET_RECONCILER_ROLES = {
     # instanceAdmin.v1: the stack plants a bare VM (`startup_fail`, main.tf), and
     # the create needs instances.*, disks.*, images.useReadOnly and subnetworks.use.
+    # The reconcile's reset of that VM needs compute.instances.reset, which
+    # this role also grants.
     "roles/compute.instanceAdmin.v1",
     # loadBalancerAdmin: the stack plants a backend service and a health check on the
     # default pool's instance group (`drain_timeout`, defects-b.tf), and the create needs

@@ -153,10 +153,12 @@ resource "google_project_iam_member" "fleet_reader_container_viewer" {
 # rule and its VM; fixtures.json roles with cluster_slot null) are Compute
 # Engine objects, which container.viewer cannot read. The CI health bot's scan
 # runs every gcloud read as this account, so the presence probe and the state
-# pass list instances and firewall rules as it (#2483, #2682).
+# pass list instances and firewall rules as it (#2483, #2682), and the state
+# pass reads the startup-fail VM's serial port output as it.
 # roles/compute.viewer is get and list on Compute Engine resources, with no
-# create, update or delete. It does show instance metadata, so no secret goes
-# in this project's instance metadata.
+# create, update or delete. It does show instance metadata and serial port
+# output (compute.instances.getSerialPortOutput), so no secret goes in this
+# project's instance metadata or to a fleet VM's serial console.
 resource "google_project_iam_member" "fleet_reader_compute_viewer" {
   project = var.project_id
   role    = "roles/compute.viewer"
@@ -1002,8 +1004,12 @@ resource "google_compute_firewall" "world_open_deny_remote" {
 # compute audit's §2.1 reads the serial console of every RUNNING instance that
 # runs a startup script and flags the guest agent's failure line, which on
 # current images is `Script "startup-script" failed with error: exit status 1`.
-# The script exits 1 on every boot, so the line is on the console from the
-# first boot onward, with no age gate. The audit reads the project, not a
+# The script exits 1 on every boot, and the guest prints the line once per
+# boot. The serial buffer keeps about 1 MiB, and this VM's guest agent logs
+# two errors an hour (it has no service account), so the line rotates out
+# about three weeks after a boot. hack/fleet_reconcile.py resets the VM after
+# each reconcile to print it again, and the fixture-state scan reads the
+# console for it (fixtures.json, startup-fail-vm). The audit reads the project, not a
 # cluster, so this needs no cluster slot. No external IP and no service
 # account: the VM does nothing but fail. The name leads with `startup-fail-`
 # so the case can grade `/startup-fail-`, which only the finding's object path

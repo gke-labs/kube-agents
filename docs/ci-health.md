@@ -1425,10 +1425,12 @@ the adjudicator can ask "drifted last scan too?" from one file.
 read-only account, `seeded-fleet-reader@<project>.iam.gserviceaccount.com`
 (`bench/tf/fleet`): `CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT` makes gcloud
 impersonate it for the cluster listing, the credentials, the control-plane
-describes and the `gcloud compute instances list` and `gcloud compute
-firewall-rules list` reads of the project-scoped roles (`startup-fail-vm` and
+describes and the `gcloud compute instances list`, `gcloud compute
+firewall-rules list` and `gcloud compute instances get-serial-port-output`
+reads of the project-scoped roles (`startup-fail-vm` and
 `world-open-ingress`, which have no cluster slot; the account holds
-`roles/compute.viewer` for them), and `FLEET_READONLY_SA` makes the runner
+`roles/compute.viewer` for them, which includes
+`compute.instances.getSerialPortOutput`), and `FLEET_READONLY_SA` makes the runner
 rewrite each kubeconfig so `kubectl`'s token is minted as it too. The bot,
 `eval-dashboard-publisher@kube-agents-prow`, therefore needs exactly one grant
 per pool project — `roles/iam.serviceAccountTokenCreator` on that account, the
@@ -1507,7 +1509,9 @@ message and the health box's advice say that the pool is below that margin and i
 `bench/tf/fleet/main.tf` is the fix, rolling project by project if a size change has just
 merged, beside the re-apply line when a planted role drifts too, and the issue carries the
 same exception beside the re-apply paragraph, since a re-apply of a stack that is already
-applied changes nothing; and when every drift line on the incident is one no re-apply clears,
+applied changes nothing; a `startup-fail-vm` line reading `serial_contains`, the VM's
+failure line gone from its serial buffer, is cleared by the re-apply too, because the
+reconcile resets the VM after each project; and when every drift line on the incident is one no re-apply clears,
 keyed on its assertion rather than its role, the Chat message and the health box's advice say
 so and name the remedy instead: an `age_hours_ge` line, seeded-c's `createTime` under the
 24-hour age gate, clears itself at `createTime` plus 24 hours and the advice gives that time
