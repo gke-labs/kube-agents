@@ -110,6 +110,10 @@
             }
           }
         },
+        "slackTestUsers": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^[A-Z0-9]+$" }
+        },
         "webhooks": {
           "type": "object",
           "additionalProperties": false,
@@ -939,6 +943,11 @@
             "size": {
               "type": ["string", "null"],
               "pattern": "^$|^(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE][-+]?[0-9]+))?$"
+            },
+            "expectedClusterProfiles": {
+              "type": ["integer", "null"],
+              "minimum": 1,
+              "maximum": 20000
             }
           }
         },

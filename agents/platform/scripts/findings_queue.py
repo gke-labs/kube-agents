@@ -114,6 +114,8 @@ PACED_PUBLISHERS = ("nudge", "first_report")
 # The two classes an item is counted under when it is added. Stored with the
 # addition so a later re-score cannot move it from one day's count to the other.
 ITEM_CLASSES = ("critical", "noncritical")
+# The key of `additions_on` that names the line of each addition that day.
+ADDITIONS_LINES_KEY = "lines"
 # The first UTC hour new criticals may be added and pending ones reminded:
 # after the last daily audit, and not the middle of the night in the US.
 REMIND_HOUR = 12
@@ -1212,7 +1214,7 @@ def additions_on(conn: sqlite3.Connection, day: str) -> dict:
             "SELECT item_key FROM findings_additions WHERE day = ? ORDER BY added_at, item_key", (day,)
         )
     ]
-    return {"day": day, **counts, "lines": lines}
+    return {"day": day, **counts, ADDITIONS_LINES_KEY: lines}
 
 
 @dataclass(frozen=True)
@@ -1398,7 +1400,7 @@ def pace(
 
     # A line announced twice today with one addition on record has a second
     # addition whose marks all failed: it is still unrecorded.
-    recorded_lines = Counter(tuple(key) for key in added_today.get("lines") or ())
+    recorded_lines = Counter(tuple(key) for key in added_today.get(ADDITIONS_LINES_KEY) or ())
     times_announced = Counter(announced)
 
     def on_record(item: Item) -> bool:

@@ -54,7 +54,9 @@ Cluster Agent profile's `cluster_identity` names, which is how a project
 `spec.scope` brings in reaches the watch, and, for every namespace of every
 running or reconciling cluster that has a Cluster Agent profile and is not a
 system namespace, runs the Cluster Agent's `stall_report.py` over a bounded list
-of controller kinds, keeping a ledger of the rows it has seen. On a new stall
+of controller kinds, once per cluster (each kind read once across the cluster
+and split per namespace, clusters four at a time), keeping a ledger of the rows
+it has seen. On a new stall
 episode it sends the Session KV server a `controller-stall` inject, the route
 `k8s-event-watcher` and the drift detector use
 ([design](../../../docs/designs/stall-watch-inject.md)). The server posts the
