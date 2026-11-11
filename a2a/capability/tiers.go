@@ -1,9 +1,15 @@
 package capability
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"fmt"
+	"log/slog"
+	"os"
 	"slices"
 	"sync/atomic"
+	"time"
 )
 
 // The tier table as data (#3659): an install defines profile tiers with the
@@ -122,4 +128,119 @@ func LoadedTiers() []Tier {
 	}
 	slices.Sort(out)
 	return out
+}
+
+// IsProfileTier reports whether tier is a profile tier in the table in
+// force: a built-in one or a loaded definition.
+func IsProfileTier(tier Tier) bool { return tiers().profile[tier] }
+
+// tierFile is the operator-rendered file's shape (the <agent>-a2a-tiers
+// ConfigMap's tiers.json): every Tier resource in the install's namespace,
+// by name and mode.
+type tierFile struct {
+	Tiers []struct {
+		Name string `json:"name"`
+		Mode string `json:"mode"`
+	} `json:"tiers"`
+}
+
+// ParseTierFile reads a tiers file. A file that isn't the shape is an error,
+// so the caller falls back to the compiled-in table instead of guessing.
+func ParseTierFile(raw []byte) ([]TierDefinition, error) {
+	var f tierFile
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&f); err != nil {
+		return nil, fmt.Errorf("tiers file: %w", err)
+	}
+	out := make([]TierDefinition, 0, len(f.Tiers))
+	for _, t := range f.Tiers {
+		out = append(out, TierDefinition{Name: t.Name, Mode: TierMode(t.Mode)})
+	}
+	return out, nil
+}
+
+// LoadTierFile reads path and installs it with LoadTiers. A file that can't
+// be read or parsed installs the compiled-in table (LoadTiers(nil)), so
+// trouble with the source can only narrow the tiers, never widen them. It
+// returns the skipped definitions' reasons and the read or parse error.
+func LoadTierFile(path string) ([]string, error) {
+	raw, err := os.ReadFile(path) // #nosec G304 -- the operator-rendered tiers mount
+	if err != nil {
+		LoadTiers(nil)
+		return nil, err
+	}
+	defs, err := ParseTierFile(raw)
+	if err != nil {
+		LoadTiers(nil)
+		return nil, err
+	}
+	return LoadTiers(defs), nil
+}
+
+// WatchTierFile loads path now and again whenever its content changes,
+// checked every interval until ctx ends. The kubelet updates a ConfigMap
+// mount by swapping a symlink, so the check compares the bytes, not a
+// stamp. log may be nil.
+func WatchTierFile(ctx context.Context, path string, interval time.Duration, log *slog.Logger) {
+	if log == nil {
+		log = slog.Default()
+	}
+	var last []byte
+	load := func() {
+		raw, _ := os.ReadFile(path) // #nosec G304 -- the operator-rendered tiers mount
+		if last != nil && bytes.Equal(raw, last) {
+			return
+		}
+		last = append([]byte{}, raw...)
+		if last == nil {
+			last = []byte{}
+		}
+		skipped, err := LoadTierFile(path)
+		if err != nil {
+			log.Warn("tiers file unusable; serving the compiled-in tiers", "path", path, "err", err)
+			return
+		}
+		for _, s := range skipped {
+			log.Warn("tier definition skipped", "reason", s)
+		}
+		log.Info("tiers loaded", "path", path, "tiers", LoadedTiers())
+	}
+	load()
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			load()
+		}
+	}
+}
+
+// TiersFileEnv names the env var carrying the tiers file's path, which the
+// operator sets on the verifier, the gateway and the callout beside the
+// mount.
+const TiersFileEnv = "A2A_TIERS_FILE"
+
+// tierPollInterval is how often WatchTierFile re-reads the file: the kubelet
+// itself takes up to a minute to update a ConfigMap mount.
+const tierPollInterval = 30 * time.Second
+
+// StartTierFile loads the tiers file named by TiersFileEnv, synchronously so
+// the first request sees it, then watches it on a goroutine until ctx ends.
+// Unset, the compiled-in table serves. log may be nil.
+func StartTierFile(ctx context.Context, getenv func(string) string, log *slog.Logger) {
+	path := getenv(TiersFileEnv)
+	if path == "" {
+		return
+	}
+	if log == nil {
+		log = slog.Default()
+	}
+	if _, err := LoadTierFile(path); err != nil {
+		log.Warn("tiers file unusable at start; serving the compiled-in tiers", "path", path, "err", err)
+	}
+	go WatchTierFile(ctx, path, tierPollInterval, log)
 }

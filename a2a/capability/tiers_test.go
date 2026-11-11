@@ -1,9 +1,15 @@
 package capability
 
 import (
+	"context"
+	"io"
+	"log/slog"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func restoreTiers(t *testing.T) {
@@ -112,5 +118,69 @@ func TestNoSourceIsTheCompiledInTable(t *testing.T) {
 	}
 	if err := (Entry{Tier: "extra", Scope: "project/p", Delegate: "d", Profile: "x"}).Validate(); err == nil {
 		t.Error("a tier from an earlier load survived a reload without it")
+	}
+}
+
+func writeTiers(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The operator's file loads its tiers; a missing, unparseable or unknown-keyed
+// file installs exactly the compiled-in table, never a wider one.
+func TestTheTiersFileLoadsAndABadOneFallsBackToTheBuiltIns(t *testing.T) {
+	restoreTiers(t)
+	path := filepath.Join(t.TempDir(), "tiers.json")
+	writeTiers(t, path, `{"tiers":[{"name":"read","mode":"interactive"},{"name":"oncall","mode":"interactive"}]}`)
+	if _, err := LoadTierFile(path); err != nil || !IsProfileTier("oncall") {
+		t.Fatalf("a good file: err %v, oncall loaded %v", err, IsProfileTier("oncall"))
+	}
+	for name, body := range map[string]string{
+		"not json":    `{"tiers":[`,
+		"unknown key": `{"tiers":[{"name":"x","mode":"interactive","verbs":["cluster.mutate"]}]}`,
+		"wrong shape": `{"tiers":"oncall"}`,
+	} {
+		LoadTiers([]TierDefinition{{Name: "oncall", Mode: TierModeInteractive}})
+		writeTiers(t, path, body)
+		if _, err := LoadTierFile(path); err == nil {
+			t.Errorf("%s: no error", name)
+		}
+		if IsProfileTier("oncall") || !reflect.DeepEqual(tiers().verbs, builtinTierTable().verbs) {
+			t.Errorf("%s: the table is not the compiled-in one", name)
+		}
+	}
+	LoadTiers([]TierDefinition{{Name: "oncall", Mode: TierModeInteractive}})
+	if _, err := LoadTierFile(filepath.Join(t.TempDir(), "missing")); err == nil || IsProfileTier("oncall") {
+		t.Error("a missing file kept a loaded tier")
+	}
+}
+
+// The watch picks up an edit, as the kubelet's ConfigMap update makes one.
+func TestTheTiersFileWatchPicksUpAnEdit(t *testing.T) {
+	restoreTiers(t)
+	path := filepath.Join(t.TempDir(), "tiers.json")
+	writeTiers(t, path, `{"tiers":[]}`)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go WatchTierFile(ctx, path, 10*time.Millisecond, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	writeTiers(t, path, `{"tiers":[{"name":"nightly","mode":"unattended"}]}`)
+	deadline := time.Now().Add(5 * time.Second)
+	for !IsProfileTier("nightly") {
+		if time.Now().After(deadline) {
+			t.Fatal("the watch never loaded the edit")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+}
+
+func TestStartTierFileIsANoOpWhenUnset(t *testing.T) {
+	restoreTiers(t)
+	LoadTiers([]TierDefinition{{Name: "kept", Mode: TierModeInteractive}})
+	StartTierFile(context.Background(), func(string) string { return "" }, nil)
+	if !IsProfileTier("kept") {
+		t.Error("an unset env changed the table")
 	}
 }
