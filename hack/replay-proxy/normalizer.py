@@ -509,8 +509,18 @@ def sorted_skill_listings(text: str) -> str:
     """A skill_view result with each SKILL_LISTING_KEYS group's file list sorted; any other text as it is.
 
     Returns `text` itself when nothing moved, so a result already in order keeps its exact text.
+    A result Hermes appended a notice to (the iteration-budget warning, toolguard guidance)
+    is JSON followed by text: its JSON is sorted and written in canonical form, so two pods'
+    copies key alike whichever needed the sort, and the appended text is kept as it is.
     """
     parsed = Normalizer.parse_json_document(text)
+    tail = None
+    if parsed is None:
+        try:
+            parsed, end = json.JSONDecoder().raw_decode(text.lstrip())
+        except ValueError:
+            return text
+        tail = text.lstrip()[end:]
     if not isinstance(parsed, dict):
         return text
     moved = False
@@ -522,6 +532,8 @@ def sorted_skill_listings(text: str) -> str:
             if isinstance(files, list) and all(isinstance(f, str) for f in files) and files != sorted(files):
                 groups[group] = sorted(files)
                 moved = True
+    if tail is not None:
+        return json.dumps(parsed, sort_keys=True, ensure_ascii=False) + tail
     return json.dumps(parsed, ensure_ascii=False) if moved else text
 
 

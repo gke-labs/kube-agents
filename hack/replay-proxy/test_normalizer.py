@@ -295,6 +295,16 @@ def tool_conversation(tool_name, content, call_id="call_1__thought__QUJD"):
 
 
 class SkillViewListingTest(unittest.TestCase):
+    def test_a_notice_hermes_appended_keeps_the_listing_sorted(self):
+        # Hermes appends its iteration-budget warning to the last tool message:
+        # the content is then JSON followed by text, and the listing still keys alike.
+        notice = "\n\n[Iteration budget: 3 of 90 iterations left.]"
+        recorded = skill_result(["references/ledger.md", "references/finish.md"], ["scripts/a.py"]) + notice
+        replayed = skill_result(["references/finish.md", "references/ledger.md"], ["scripts/a.py"]) + notice
+        self.assertEqual(fp(tool_conversation("skill_view", recorded)), fp(tool_conversation("skill_view", replayed)))
+        other = skill_result(["references/finish.md", "references/ledger.md"], ["scripts/a.py"]) + "\n\nanother notice"
+        self.assertNotEqual(fp(tool_conversation("skill_view", recorded)), fp(tool_conversation("skill_view", other)))
+
     def test_linked_files_in_another_order_key_the_same(self):
         recorded = skill_result(["references/ledger.md", "references/finish.md"], ["scripts/b.py", "scripts/a.py"])
         replayed = skill_result(["references/finish.md", "references/ledger.md"], ["scripts/a.py", "scripts/b.py"])
