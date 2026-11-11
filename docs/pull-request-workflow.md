@@ -232,8 +232,10 @@ account's egress limit falls through to a cold install instead of holding the st
 **Operator code.** If you modify `k8s-operator/`, run `make` or `go build` inside that directory to
 ensure compilation succeeds.
 
-**A2A module code.** If you modify `a2a/`, run `go vet ./...` and `go test -race ./...` inside that
-directory — what the `A2A Module Tests` CI job runs. The conformance suite starts an embedded
+**A2A module code.** If you modify `a2a/`, run `make gosec` from the repository root (it scans every
+module; the CI step scans `a2a/` alone, with the same binary built from `k8s-operator/go.mod`'s
+pin), then `go vet ./...` and `go test -race ./...` inside that directory — what the
+`A2A Module Tests` CI job runs for this module. The conformance suite starts an embedded
 JetStream server, so no cluster or credentials are needed. The CI job additionally installs the
 envtest binaries and the `nats` CLI; without them the auth callout's API-server and CLI cases skip
 and the run still reports green. To match it, run with
@@ -316,8 +318,8 @@ and the installer declare, and the `validate` job runs it on the version it pins
 below includes it.
 
 **Everything at once.** `make verify` runs what a pull request must pass offline — Go build, vet
-and test, the Python suites, the conformance suite, the Terraform module tests. The per-area targets it wraps, for a faster
-loop while you work:
+and test, the Python suites, the conformance suite, the Terraform module tests; gosec is the
+exception (`make gosec`, below). The per-area targets, for a faster loop while you work:
 
 - `make shellcheck` — the `validate` job in `Validate Repo Structure` runs it after the structure
   check; see **Shell scripts** above for the release to install.
@@ -334,6 +336,8 @@ loop while you work:
 - `make docs-check`, plus `cd docs/site && npm ci && npm run build` if you touched `docs/site/`.
   `make docs-check` needs `go` on `PATH`: the CRD field pages are read from the operator's Go API
   types, and the check fails without it.
+- `make gosec` — gosec, built once from `k8s-operator/go.mod`'s pin, over every Go module; the
+  scan CI runs on each module. Not part of `make verify`: a cold build and scan take minutes.
 
 ## The automated review
 
