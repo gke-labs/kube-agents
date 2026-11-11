@@ -65,6 +65,7 @@ Run:
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import unittest
@@ -99,6 +100,21 @@ SECRET_MARKER_COUNT = 2
 CONTROLLER_DIR = REPO_ROOT / "k8s-operator" / "internal" / "controller"
 IGNORE_PATH = REPO_ROOT / ".trivyignore.yaml"
 SECRETS_MISCONFIG_ID = "KSV-0041"
+# The namespace both install paths place the PlatformAgent in, and the only
+# one where the operator's namespaced Role is bound.
+INSTALL_NAMESPACE = "kubeagents-system"
+KUSTOMIZE_DEFAULT_DIR = REPO_ROOT / "k8s-operator" / "config" / "default"
+PLATFORM_AGENT_KIND = "PlatformAgent"
+OPERATOR_DEPLOYMENT_SUFFIX = "controller-manager"
+# Tracked paths a user copies a PlatformAgent manifest from. Test fixtures and
+# the chart's templated CR are not among them.
+SHIPPED_MANIFEST_ROOTS = (
+    "docs", "INSTALL.md", "README.md", "examples",
+    "k8s-operator/examples", "k8s-operator/config/samples",
+)
+MANIFEST_SUFFIXES = (".yaml", ".yml")
+MARKDOWN_SUFFIXES = (".md", ".mdx")
+YAML_FENCE = re.compile(r"```ya?ml[^\n]*\n(.*?)```", re.S)
 
 
 def _documents() -> list[dict]:
@@ -136,7 +152,120 @@ def _secret_rules(doc: dict) -> list[dict]:
     ]
 
 
+def _tracked_files(*roots: str) -> list[Path]:
+    out = subprocess.run(
+        ["git", "ls-files", "--", *roots], cwd=REPO_ROOT, capture_output=True, text=True, check=True,
+    ).stdout.split()
+    return [REPO_ROOT / line for line in out]
+
+
+def _yaml_documents_in(text: str) -> list[dict]:
+    try:
+        return [doc for doc in yaml.safe_load_all(text) if isinstance(doc, dict)]
+    except yaml.YAMLError:
+        # A fenced block with a placeholder or a fragment is not a manifest.
+        return []
+
+
+def _shipped_platform_agents() -> list[tuple[str, dict]]:
+    found = []
+    for path in _tracked_files(*SHIPPED_MANIFEST_ROOTS):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if path.suffix in MANIFEST_SUFFIXES:
+            blocks = [text]
+        elif path.suffix in MARKDOWN_SUFFIXES:
+            blocks = YAML_FENCE.findall(text)
+        else:
+            continue
+        for block in blocks:
+            for doc in _yaml_documents_in(block):
+                if doc.get("kind") == PLATFORM_AGENT_KIND:
+                    found.append((str(path.relative_to(REPO_ROOT)), doc))
+    return found
+
+
+def _render_helm() -> list[dict]:
+    proc = subprocess.run(
+        ["helm", "template", "kube-agents", str(CHART_PATH), "-n", INSTALL_NAMESPACE, *REQUIRED_HELM_SETS],
+        capture_output=True, text=True, check=True,
+    )
+    return [d for d in yaml.safe_load_all(proc.stdout) if isinstance(d, dict)]
+
+
+def _render_kustomize() -> list[dict]:
+    proc = subprocess.run(
+        ["kubectl", "kustomize", str(KUSTOMIZE_DEFAULT_DIR)], capture_output=True, text=True, check=True,
+    )
+    return [d for d in yaml.safe_load_all(proc.stdout) if isinstance(d, dict)]
+
+
 class OperatorSecretsGrantTest(unittest.TestCase):
+    def test_no_shipped_manifest_places_a_platformagent_outside_the_install_namespace(self):
+        # The operator's Secret write verbs are bound in the install namespace
+        # only, so a PlatformAgent a user copies from the docs or samples has
+        # to be there: anywhere else its first kube-proxy TLS Secret write is
+        # forbidden and the agent sits Degraded/RBACIncomplete. This reads
+        # every tracked YAML file and every fenced YAML block under the
+        # shipped roots, so a guide that names the namespace with a typo
+        # (`kube-agents-system`) fails here rather than on a user's cluster.
+        agents = _shipped_platform_agents()
+        self.assertGreater(len(agents), 0, "no shipped PlatformAgent manifest found; the scan is broken")
+        for source, doc in agents:
+            namespace = (doc.get("metadata") or {}).get("namespace")
+            with self.subTest(source=source, name=(doc.get("metadata") or {}).get("name")):
+                self.assertIn(
+                    namespace,
+                    (None, INSTALL_NAMESPACE),
+                    f"{source} places a PlatformAgent in {namespace!r}; the operator writes Secrets "
+                    f"in {INSTALL_NAMESPACE} only",
+                )
+
+    @unittest.skipUnless(shutil.which("helm") and shutil.which("kubectl"), "helm and kubectl needed")
+    def test_the_namespaced_role_is_bound_to_the_operator_on_both_delivery_paths(self):
+        # The Role's verbs are pinned above; this pins that something binds
+        # it. On each render: exactly one RoleBinding in the Role's namespace
+        # names it, and that binding's subject is the ServiceAccount the
+        # operator Deployment runs as, in the same namespace. A typo in the
+        # binding would otherwise strip the operator's Secret writes on every
+        # install with CI green, and only the runtime self-check would say so.
+        for path, documents in (("helm", _render_helm()), ("kustomize", _render_kustomize())):
+            with self.subTest(path=path):
+                roles = [
+                    d for d in documents
+                    if d.get("kind") == ROLE_KIND
+                    and any(SECRETS_RESOURCE in (r.get("resources") or []) for r in d.get("rules") or [])
+                ]
+                self.assertEqual(1, len(roles), f"{path}: expected one Role naming secrets, found {len(roles)}")
+                role = roles[0]
+                role_name = role["metadata"]["name"]
+                role_namespace = role["metadata"].get("namespace")
+                self.assertEqual(INSTALL_NAMESPACE, role_namespace)
+                deployments = [
+                    d for d in documents
+                    if d.get("kind") == "Deployment" and d["metadata"]["name"].endswith(OPERATOR_DEPLOYMENT_SUFFIX)
+                ]
+                self.assertEqual(1, len(deployments), f"{path}: expected one operator Deployment")
+                operator_sa = deployments[0]["spec"]["template"]["spec"].get("serviceAccountName")
+                self.assertTrue(operator_sa, f"{path}: the operator Deployment names no serviceAccountName")
+                bindings = [
+                    d for d in documents
+                    if d.get("kind") == "RoleBinding"
+                    and d["metadata"].get("namespace") == role_namespace
+                    and d.get("roleRef", {}).get("kind") == ROLE_KIND
+                    and d.get("roleRef", {}).get("name") == role_name
+                ]
+                self.assertEqual(
+                    1, len(bindings),
+                    f"{path}: expected one RoleBinding in {role_namespace} to Role {role_name}, found {len(bindings)}",
+                )
+                subjects = bindings[0].get("subjects") or []
+                self.assertIn(
+                    {"kind": "ServiceAccount", "name": operator_sa, "namespace": role_namespace},
+                    subjects,
+                    f"{path}: RoleBinding {bindings[0]['metadata']['name']} does not bind the operator's "
+                    f"ServiceAccount {operator_sa} in {role_namespace}; subjects={subjects}",
+                )
+
     def test_the_cluster_role_grants_no_secret_write_verb(self):
         # The invariant the namespacing exists for: a write verb on `secrets`
         # in the ClusterRole, or a wildcard that would reach it, is write of
