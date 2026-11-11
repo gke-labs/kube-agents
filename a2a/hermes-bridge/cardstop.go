@@ -223,20 +223,24 @@ func (b *Bridge) logCardStopAnswer(msg, taskID, sessionID string, resp *cardStop
 	if logger == nil {
 		logger = slog.Default()
 	}
-	logger.Info(msg, "task", taskID, "session", sessionID, "stopped", len(resp.Stopped),
+	// A cancel's own archive runs per session, with no task id to name.
+	if taskID != "" {
+		logger = logger.With("task", taskID)
+	}
+	logger.Info(msg, "session", sessionID, "stopped", len(resp.Stopped),
 		"settled", len(resp.Settled), "failed", len(resp.Failed), "pending", len(resp.Pending),
 		"unresolved", len(resp.Unresolved), "truncated", resp.Truncated, "deadline", resp.Deadline)
 	for _, f := range resp.Failed {
-		logger.Warn("card not stopped", "task", taskID, "session", sessionID, "card", f.ID, "err", f.Error)
+		logger.Warn("card not stopped", "session", sessionID, "card", f.ID, "err", f.Error)
 	}
 	for _, c := range resp.Pending {
-		logger.Warn("card's archive still running at session-kv's deadline", "task", taskID, "session", sessionID, "card", c.ID)
+		logger.Warn("card's archive still running at session-kv's deadline", "session", sessionID, "card", c.ID)
 	}
 	for _, c := range resp.Unresolved {
-		logger.Warn("card stopped mid-claim; a worker may still start for it", "task", taskID, "session", sessionID, "card", c.ID)
+		logger.Warn("card stopped mid-claim; a worker may still start for it", "session", sessionID, "card", c.ID)
 	}
 	for _, e := range resp.Errors {
-		logger.Warn("session-kv board error during the card stop", "task", taskID, "session", sessionID, "err", e)
+		logger.Warn("session-kv board error during the card stop", "session", sessionID, "err", e)
 	}
 }
 

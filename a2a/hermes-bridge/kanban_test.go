@@ -250,6 +250,9 @@ func TestCancelSessionCards_LogsSessionKVsAnswer(t *testing.T) {
 				t.Fatal("stopSessionCards did not return")
 			}
 			got := logs.String()
+			if strings.Contains(got, "task=") {
+				t.Errorf("a cancel's archive has no task id to name, but the log carries one:\n%s", got)
+			}
 			for _, w := range tc.want {
 				if !strings.Contains(got, w) {
 					t.Errorf("log lacks %q:\n%s", w, got)

@@ -386,7 +386,9 @@ func (b *Bridge) stopSessionCards(sessionID string) {
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		logger.Warn("cancel's card stop did not reach session-kv", "session", sessionID, "err", err)
+		if !b.closing.Load() { // a shutdown ends the request; that is not a failure to report
+			logger.Warn("cancel's card stop did not reach session-kv", "session", sessionID, "err", err)
+		}
 		return
 	}
 	defer resp.Body.Close()
