@@ -330,6 +330,27 @@ class PreflightDecisionTest(unittest.TestCase):
                 self.assertEqual(req["persistentVolumeClaims"], base["persistentVolumeClaims"])
         self.assertEqual(totals["80Gi"], 162 * 1024**3)
 
+    def test_an_expected_profile_count_raises_the_agent_claim_alone(self) -> None:
+        """expectedClusterProfiles raises the agent's data claim to 8Gi + N x 400Mi, rounded
+        up to whole GiB, and only when that is above the size; the sandbox claim stays.
+
+        200 profiles is 87Gi: 102Gi + (87 - 50)Gi = 139Gi. 10 profiles is under the
+        default and adds nothing. With size 20Gi, both claims drop 30Gi and the agent's
+        rises back to 87Gi: 102 - 60 + 67 = 109Gi.
+        """
+        gib = 1024**3
+        for sets, want in (
+            (["platformAgent.storage.expectedClusterProfiles=200"], 139 * gib),
+            (["platformAgent.storage.expectedClusterProfiles=10"], _OPERATOR_STORAGE_BYTES),
+            (["platformAgent.storage.expectedClusterProfiles=200", "platformAgent.storage.size=20Gi"], 109 * gib),
+            (["platformAgent.storage.expectedClusterProfiles=200", "platformAgent.storage.size=500Gi"],
+             _OPERATOR_STORAGE_BYTES + _DATA_CLAIMS * (500 - 50) * gib),
+        ):
+            with self.subTest(sets=sets):
+                req = self._requirements(sets)
+                self.assertEqual(req["requestsStorage"], want)
+                self.assertEqual(req["persistentVolumeClaims"], _OPERATOR_PVC_COUNT)
+
     def test_a_data_volume_size_that_does_not_fit_the_quota_fails_the_render(self) -> None:
         # The default fits a 102Gi requests.storage quota exactly; 80Gi does not.
         quota = [{
