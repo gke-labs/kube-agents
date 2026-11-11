@@ -75,7 +75,9 @@ KUBECTL_TIMEOUT_SEC = 30
 
 
 def is_bot_message(msg: dict, bot_user: str) -> bool:
-    return msg.get("user") == bot_user or bool(msg.get("bot_id"))
+    """Whether the install's bot posted it: by its member id, never by a bot_id alone,
+    which another app's post, or a test user's post through one, also carries."""
+    return msg.get("user") == bot_user
 
 
 def opens_on_bold_headline(msg: dict) -> bool:

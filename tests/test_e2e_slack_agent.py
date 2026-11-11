@@ -178,6 +178,12 @@ class SlackAgentTestLogic(unittest.TestCase):
         with mock.patch.object(MOD, "install_mode", lambda: None):
             _run(FakeSlack([{"replies": [answer]}]), mode="")
 
+    def test_another_apps_post_in_the_thread_is_not_the_bots(self):
+        other = {"ts": "1800000002.000100", "user": "UOTHER", "bot_id": "BOTHER", "text": "⛔ not you, 5"}
+        fake = FakeSlack([{}, {"reaction": "eyes", "replies": [other]}, {"reaction": "eyes", "replies": [other, _ANSWER]}])
+        _run(fake, mode="next")
+        self.assertEqual(3, fake.polls)  # the preflight, the poll with only the other post, then the answer
+
     def test_timing_legs_are_measured_from_the_post(self):
         t = MOD.Timeline(posted=MOD.live.ts_value(_ASK_TS), first_reply=MOD.live.ts_value("1800000001.000100"), answer=MOD.live.ts_value(_ANSWER_TS))
         legs = t.legs()
