@@ -222,10 +222,14 @@ MUTATIONS: list[Mutation] = [
         # the operator holds full CRUD through"; the auth callout has since
         # brought bind back, scoped to one name, and A4-bind-unscoped below
         # is the mutation that covers the scoping. This one stays on escalate.
+        # The anchor is the ClusterRole's rbac rule, whose resource list ends
+        # in `clusterroles` since the Role and RoleBinding writes moved to the
+        # Role document; `roles` followed by `create` is in that document now,
+        # where C5's write-verb ceiling would catch the escalate first.
         "A4-operator-escalate",
         "k8s-operator/config/rbac/role.yaml",
-        ("      - roles\n    verbs:\n      - create\n",
-         "      - roles\n    verbs:\n      - create\n      - escalate\n"),
+        ("      - clusterroles\n    verbs:\n      - create\n",
+         "      - clusterroles\n    verbs:\n      - create\n      - escalate\n"),
         "test_A4_the_operator_cannot_escalate_its_own_grants",
         "grant the operator escalate so a reconcile can widen a role in place "
         "-- the ceiling in C5 becomes advisory",
