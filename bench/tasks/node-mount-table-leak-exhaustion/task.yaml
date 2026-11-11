@@ -24,6 +24,7 @@ id: node-mount-table-leak-exhaustion
 name: "Node mount-table leak (declared gap; planted as a propagation-mounting DaemonSet when its check lands)"
 domain: fleet-audits
 suite: certification
+certification_part: 2
 expected_fail: true
 audit_streams:
   - gce-compute-fleet-audit

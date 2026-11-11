@@ -24,6 +24,7 @@ id: node-kubelet-startup-admission-race
 name: "Kubelet startup admission race (declared gap; planted as an init DaemonSet on a pool with no startup taint when its check lands)"
 domain: fleet-audits
 suite: certification
+certification_part: 2
 expected_fail: true
 audit_streams:
   - gce-compute-fleet-audit
