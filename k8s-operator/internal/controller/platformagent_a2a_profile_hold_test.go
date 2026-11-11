@@ -544,3 +544,25 @@ func TestAFoldedReloadIsNotConfirmedByTheFirstMove(t *testing.T) {
 		t.Errorf("the wait didn't re-arm off the new load time: %v", config.Annotations)
 	}
 }
+
+// A bus whose render is one server while the StatefulSet still runs three
+// (a conversion to one server) is read as the cluster it still is: the
+// single server's Secret list from the cluster's time was never confirmed.
+func TestABusConvertingToOneServerIsReadAsACluster(t *testing.T) {
+	agent := a2aSingleServerTestAgent()
+	b := newHoldBus(agent)
+	b.sts.Status.Replicas = 3
+	b.revision(t, "bus-a", "x", true)
+	b.revision(t, "bus-b", "", true)
+	b.sts.Status.UpdateRevision = "bus-b"
+	b.pod(0, "bus-b")
+	b.pod(1, "bus-a")
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: a2aNATSConfigSecretName(agent), Namespace: agent.Namespace,
+			Annotations: map[string]string{a2aConfigProfilesAnnotation: "x,y"}},
+		Data: map[string][]byte{a2aNATSConfKey: []byte("conf")},
+	}
+	if got := loadedList(loadedOrFatal(t, b.client(secret), b.agent)); got != "" {
+		t.Errorf("loaded = %q mid-conversion, want nothing: the one-server revision records no list", got)
+	}
+}

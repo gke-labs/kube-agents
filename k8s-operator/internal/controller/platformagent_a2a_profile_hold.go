@@ -168,7 +168,10 @@ func a2aBusLoadedProfiles(ctx context.Context, reader client.Reader, agent *agen
 	}
 	var loaded map[string]bool
 	if err == nil {
-		if a2aNATSReplicas(agent) > 1 {
+		// A cluster by the render or by what runs: a bus converting to one
+		// server is read as the cluster it still is, since a single
+		// server's Secret list from the cluster's time was never confirmed.
+		if a2aNATSReplicas(agent) > 1 || a2aBusRunsAsCluster(sts) {
 			loaded, err = a2aClusterLoadedProfiles(ctx, reader, sts)
 		} else {
 			loaded, err = a2aServerLoadedProfiles(ctx, reader, agent)
@@ -181,6 +184,12 @@ func a2aBusLoadedProfiles(ctx context.Context, reader client.Reader, agent *agen
 		return a2aLoadedProfiles{}, err
 	}
 	return loadedNames(loaded), nil
+}
+
+// a2aBusRunsAsCluster reports whether the live StatefulSet asks for, or
+// still runs, more than one server.
+func a2aBusRunsAsCluster(sts *appsv1.StatefulSet) bool {
+	return (sts.Spec.Replicas != nil && *sts.Spec.Replicas > 1) || sts.Status.Replicas > 1
 }
 
 // a2aClusterLoadedProfiles reads a cluster's loaded set off its revisions:
