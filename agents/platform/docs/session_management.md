@@ -402,7 +402,8 @@ CREATE TABLE post_merge_records(    -- POST /v1/post-merge/records
   repo TEXT, number INTEGER, kind TEXT, environment TEXT,
   origin TEXT, origin_platform TEXT, opened_at TEXT,
   task_id TEXT, thread_platform TEXT, thread_chat_id TEXT, thread_id TEXT,
-  merged_at TEXT, human_edited INTEGER, reverted_at TEXT, outcome TEXT, outcome_at TEXT
+  merged_at TEXT, merge_commit TEXT, closed_at TEXT, merge_checked_at TEXT,
+  human_edited INTEGER, reverted_at TEXT, outcome TEXT, outcome_at TEXT
 );
 ```
 
