@@ -667,9 +667,15 @@ leaves the record as it was:
    over IDs, with a project number matching only an equal entry. The install's own project
    (`A2A_MANAGEMENT_PROJECT`, from `spec.harness.projectId`) is always in scope, and an
    `exclude.projects` entry matching it is ignored. A declared project list admits only its
-   projects. Under a folder or organization
-   scope the gateway can't resolve membership yet, so a target whose project the list
-   doesn't name is refused: "not excluded" isn't "in scope". An install that declares no scope
+   projects. A target whose project only a folder, organization, Shared VPC host or Metrics
+   Scope reaches is confirmed against the resolved scope: the ConfigMap the scope publisher
+   writes (`A2A_RESOLVED_SCOPE_CONFIGMAP`), read through the API and cached for 30 seconds.
+   It is admitted only from a current document (known version, state `ok`, the hash of the
+   `scope.json` the gateway reads) whose `resolvedAt` and the project's `confirmedAt` are both
+   within two publisher cycles, and only when the project's row reads `ok`. Anything else is
+   refused: as excluded when the publisher excluded the project, as stale when the document is
+   missing, old or for another declaration, and as unconfirmed otherwise. "Not excluded" isn't
+   "in scope". An install that declares no scope
    (`present: false`) draws no boundary, as the platform agent reads it, so only exclusions
    apply; a missing or unreadable file refuses every target.
 3. **Mint.** The grant names the resolved profile, the requester's tier and the target as its
