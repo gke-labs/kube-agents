@@ -215,7 +215,9 @@ type TaskParameters struct {
 	// true for a turn that arrived as a structured confirm action, never
 	// from free text or from a delegation's arguments, which are the
 	// model's; a child carries its parent's value from the gateway's own
-	// record. Absent means false.
+	// record. Both rules are the gateway's to keep (#4457): the dispatcher
+	// can't tell a parent's value from a raised one. Until the gateway sets
+	// it, nothing does. Absent means false.
 	ChangeRequested bool `json:"changeRequested,omitempty"`
 }
 

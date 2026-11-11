@@ -745,9 +745,11 @@ to the worker as `PROFILE_TASK_<NAME>`. The verifier refuses a target outside th
 and that check is what makes these message fields authoritative.
 
 The same object may carry `"changeRequested": true`: the requester asked for a change (a pull
-request) rather than an answer. Only the gateway sets it, and only for a turn that arrived as a
-structured confirm action, never from free text or a delegation's arguments. A child task carries
-its parent's value from the gateway's own record and cannot raise it. Absent means false, so a
+request) rather than an answer. Only the gateway may set it (it alone can publish a submission),
+and only for a turn that arrived as a structured confirm action, never from free text or a
+delegation's arguments. A child task carries its parent's value from the gateway's own record and
+cannot raise it. The gateway's half is #4457, which owns both rules; until it lands, nothing sets
+the field and every profile write is refused. Absent means false, so a
 submission that asks for no change is byte-identical to one written before the field existed. The
 dispatcher turns it into the `vcs:proposal-create` permit on the task's credential-proxy token.
 
