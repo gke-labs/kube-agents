@@ -33,7 +33,7 @@ does not earn it.
 ``session_kv_server.py`` serves :func:`track_record` as
 ``GET /v1/post-merge/clean-merges``. No HTTP here. It reads and never writes.
 The Slack autonomy dial (``deploy/docker/patches/slack_dial_home.py``, behind
-``KUBEAGENTS_DIAL``) shows each kind's count from that route.
+``KUBEAGENTS_DIAL``) shows each kind's count per repository from that route.
 """
 
 from __future__ import annotations

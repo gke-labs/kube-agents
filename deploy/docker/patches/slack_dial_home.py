@@ -18,12 +18,17 @@ only when the record's ``kinds`` turns it on; this page never sets ``kinds``, so
 the list here is read-only. Nothing reads the level yet, so the tab says it is
 recorded only.
 
-Each kind also shows its progress toward the auto-merge offer: "3 of 5 clean
-merges", read from Session KV's ``GET`` :data:`CLEAN_MERGES_PATH` (the counter in
-``agents/platform/scripts/clean_merges.py``) each time the tab is drawn. A kind
-with no records is 0; enough merges that the counter does not yet call
-``ready`` (too few days) says how many days; a read that fails says the count is
-unavailable rather than showing 0.
+Each kind also shows its progress toward the auto-merge offer in each
+repository that has fixes of it, since the offer is earned per repository:
+"org/infra: 3 of 5 clean merges · org/apps: 1 of 5 clean merges", read from
+Session KV's ``GET`` :data:`CLEAN_MERGES_PATH` (the counter in
+``agents/platform/scripts/clean_merges.py``, keyed by repository, kind and
+environment) each time the tab is drawn. A kind with no records anywhere is
+"0 of 5"; at most :data:`PROGRESS_REPOS_MAX` repositories are named, the rest
+counted. Enough merges that the counter does not yet call ``ready`` (too few
+days) says how many days; a read that fails says the count is unavailable
+rather than showing 0. :func:`progress_for` answers one repository's line, for
+a row that shows a single chosen repository.
 
 Who sees it and who may change it
 ---------------------------------
@@ -53,6 +58,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import tempfile
 import time
 import urllib.request
@@ -103,6 +109,10 @@ KIND_OFF = "off"
 PROGRESS = "{clean} of {needed} clean merges"
 PROGRESS_DAYS = "{clean} of {needed} clean merges, on {days} of {days_needed} days"
 PROGRESS_UNKNOWN = "clean merges unavailable"
+PROGRESS_IN = "{repo}: {progress}"
+PROGRESS_MORE = "+{count} more"
+#: The most repositories one kind's row names before it counts the rest.
+PROGRESS_REPOS_MAX = 4
 MARK_ON = "●"
 MARK_OFF = "○"
 SLACK_TIME = "<!date^{epoch}^{{date_short_pretty}} {{time}}|{fallback}>"
@@ -226,7 +236,7 @@ def read_track_record() -> dict | None:
     except Exception as exc:  # noqa: BLE001 — the tab says the count is unavailable
         logger.warning("slack_dial_home: could not read the clean merges: %r", exc)
         return None
-    if not (isinstance(record, dict) and isinstance(record.get("kinds"), dict)
+    if not (isinstance(record, dict) and isinstance(record.get("counts"), list)
             and isinstance(record.get("clean_merges_needed"), int)
             and isinstance(record.get("days_needed"), int)):
         logger.warning("slack_dial_home: the clean merges answer has an unexpected shape")
@@ -234,11 +244,40 @@ def read_track_record() -> dict | None:
     return record
 
 
-def progress(record: dict | None, kind: str) -> str:
-    """``kind``'s progress toward the offer, e.g. "3 of 5 clean merges"."""
-    if record is None:
-        return PROGRESS_UNKNOWN
-    entry = record["kinds"].get(kind)
+def repo_key(url: Any) -> str:
+    """``clean_merges.repo_key``: host and path, lower-case, no scheme, user, ``.git`` or trailing slash.
+
+    Copied rather than imported, since the gateway does not carry the agent's
+    scripts; a test pins the two together.
+    """
+    text = str(url or "").strip().lower()
+    text = re.sub(r"^[a-z+]+://", "", text)
+    if "@" in text.split("/", 1)[0]:
+        text = text.split("@", 1)[1].replace(":", "/", 1)
+    return re.sub(r"(\.git)?/*$", "", text)
+
+
+def short_repo(repo: str) -> str:
+    """``org/infra`` for ``https://github.com/org/infra.git``: the repository as a person reads it."""
+    text = str(repo).strip().removesuffix("/").removesuffix(".git")
+    if "://" in text:
+        text = text.split("://", 1)[1].split("/", 1)[-1]
+    elif "@" in text.split("/", 1)[0] and ":" in text:
+        text = text.split(":", 1)[1]
+    return text or str(repo)
+
+
+def _entries(record: dict, kind: str, environment: str) -> list[dict]:
+    """The counter's entries for ``kind`` in ``environment``, one per repository, most clean merges first."""
+    found = [
+        entry for entry in record["counts"]
+        if isinstance(entry, dict) and entry.get("kind") == kind and entry.get("environment") == environment
+        and isinstance(entry.get("repo_key"), str) and entry["repo_key"]
+    ]
+    return sorted(found, key=lambda e: (-(e.get("clean") if isinstance(e.get("clean"), int) else 0), e["repo_key"]))
+
+
+def _words(record: dict, entry: dict | None) -> str:
     entry = entry if isinstance(entry, dict) else {}
     needed, days_needed = record["clean_merges_needed"], record["days_needed"]
     clean = entry.get("clean") if isinstance(entry.get("clean"), int) else 0
@@ -246,6 +285,30 @@ def progress(record: dict | None, kind: str) -> str:
     if clean >= needed and entry.get("ready") is not True:
         return PROGRESS_DAYS.format(clean=needed, needed=needed, days=days, days_needed=days_needed)
     return PROGRESS.format(clean=min(clean, needed), needed=needed)
+
+
+def progress_for(record: dict | None, kind: str, environment: str, repo: str) -> str:
+    """``kind``'s progress in ``environment`` in one repository, e.g. "3 of 5 clean merges"; 0 with no records there."""
+    if record is None:
+        return PROGRESS_UNKNOWN
+    key = repo_key(repo)
+    return _words(record, next((e for e in _entries(record, kind, environment) if e["repo_key"] == key), None))
+
+
+def progress(record: dict | None, kind: str, environment: str) -> str:
+    """``kind``'s progress in ``environment`` in every repository with records of it, each named."""
+    if record is None:
+        return PROGRESS_UNKNOWN
+    entries = _entries(record, kind, environment)
+    if not entries:
+        return _words(record, None)
+    shown = [
+        PROGRESS_IN.format(repo=short_repo(entry.get("repo") or entry["repo_key"]), progress=_words(record, entry))
+        for entry in entries[:PROGRESS_REPOS_MAX]
+    ]
+    if len(entries) > PROGRESS_REPOS_MAX:
+        shown.append(PROGRESS_MORE.format(count=len(entries) - PROGRESS_REPOS_MAX))
+    return " · ".join(shown)
 
 
 def _section(text: str) -> dict:
@@ -285,7 +348,7 @@ def blocks(state: dict, can_change: bool, note: str = "", record: dict | None = 
             out.append(_section(f"{mark}  *{title}*\n{description}"))
     for kind, title, environment in FIX_KINDS:
         on = level == AUTOMERGE_LEVEL and state["kinds"].get(kind, False)
-        out.append(_context(f"{title} ({environment}) · {KIND_ON if on else KIND_OFF} · {progress(record, kind)}"))
+        out.append(_context(f"{title} ({environment}) · {KIND_ON if on else KIND_OFF} · {progress(record, kind, environment)}"))
     footer = [NOT_ENFORCED]
     if state["set_by"]:
         line = SET_BY.format(title=LEVEL_TITLES[level], user=state["set_by"])

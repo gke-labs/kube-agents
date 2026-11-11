@@ -25,6 +25,14 @@ import slack_dial_home as dial
 import verify_slack_dial_home as verify
 from apply_slack_dial_home import BUILD_MARKER, RELATIVE, apply
 
+REPO = "https://github.com/org/infra"
+
+
+def entry(repo, clean=0, days=0, ready=None, kind="no-pdb", environment="dev"):
+    """One ``counts`` entry as ``GET /v1/post-merge/clean-merges`` answers it."""
+    return {"repo": repo, "repo_key": dial.repo_key(repo), "kind": kind, "environment": environment, "clean": clean,
+            "days": days, "settled": 0, "ready": clean >= 5 and days >= 2 if ready is None else ready}
+
 ADAPTER_SOURCE = '''\
 """Fixture standing in for plugins/platforms/slack/adapter.py."""
 from typing import Optional
@@ -266,25 +274,57 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(seen, ["D42", "D42", "D42"])
 
 
-    def test_kind_shows_its_clean_merges_from_the_counter(self):
-        record = {"kinds": {"no-pdb": {"clean": 3, "days": 2}}, "clean_merges_needed": 5, "days_needed": 2}
+    def test_kind_shows_its_clean_merges_in_each_repository(self):
+        record = {"counts": [
+            entry("https://github.com/org/apps", clean=1, days=1),
+            entry("https://github.com/org/infra", clean=3, days=2),
+            entry("https://github.com/org/infra", clean=5, days=2, environment="prod"),
+        ], "clean_merges_needed": 5, "days_needed": 2}
         with mock.patch.object(dial, "read_track_record", return_value=record):
             run(dial.opened(self.adapter, {"user": "UMEMBER"}))
-        self.assertIn("Disruption budgets (dev) · off · 3 of 5 clean merges", shown(self.published()))
+        self.assertIn(
+            "Disruption budgets (dev) · off · org/infra: 3 of 5 clean merges · org/apps: 1 of 5 clean merges",
+            shown(self.published()),
+        )
 
     def test_progress_wording(self):
         needed = {"clean_merges_needed": 5, "days_needed": 2}
-        for kinds, expected in (
-            ({}, "0 of 5 clean merges"),
-            ({"no-pdb": {"clean": 5, "days": 1, "ready": False}}, "5 of 5 clean merges, on 1 of 2 days"),
-            ({"no-pdb": {"clean": 7, "days": 3, "ready": True}}, "5 of 5 clean merges"),
-            ({"no-pdb": "garbage"}, "0 of 5 clean merges"),
+        for counts, expected in (
+            ([], "0 of 5 clean merges"),
+            ([entry(REPO, clean=5, days=1, ready=False)], "org/infra: 5 of 5 clean merges, on 1 of 2 days"),
+            ([entry(REPO, clean=7, days=3, ready=True)], "org/infra: 5 of 5 clean merges"),
+            (["garbage", entry(REPO, kind="other")], "0 of 5 clean merges"),
         ):
-            self.assertEqual(dial.progress({"kinds": kinds, **needed}, "no-pdb"), expected, kinds)
-        self.assertEqual(dial.progress(None, "no-pdb"), dial.PROGRESS_UNKNOWN)
+            self.assertEqual(dial.progress({"counts": counts, **needed}, "no-pdb", "dev"), expected, counts)
+        self.assertEqual(dial.progress(None, "no-pdb", "dev"), dial.PROGRESS_UNKNOWN)
+
+    def test_a_long_list_of_repositories_is_capped(self):
+        counts = [entry(f"https://github.com/org/r{n}", clean=n) for n in range(1, 7)]
+        line = dial.progress({"counts": counts, "clean_merges_needed": 5, "days_needed": 2}, "no-pdb", "dev")
+        self.assertTrue(line.startswith("org/r6: 5 of 5"), line)
+        self.assertTrue(line.endswith("+2 more"), line)
+        self.assertNotIn("org/r2", line)
+
+    def test_progress_for_one_repository_never_borrows_another_s_merges(self):
+        record = {"counts": [entry(REPO, clean=5, days=2, ready=True)], "clean_merges_needed": 5, "days_needed": 2}
+        self.assertEqual(dial.progress_for(record, "no-pdb", "dev", REPO + ".git"), "5 of 5 clean merges")
+        self.assertEqual(dial.progress_for(record, "no-pdb", "dev", "https://github.com/org/apps"), "0 of 5 clean merges")
+        self.assertEqual(dial.progress_for(record, "no-pdb", "prod", REPO), "0 of 5 clean merges")
+        self.assertEqual(dial.progress_for(None, "no-pdb", "dev", REPO), dial.PROGRESS_UNKNOWN)
+
+    def test_repo_key_matches_the_counter_s(self):
+        scripts = Path(__file__).resolve().parents[3] / "agents" / "platform" / "scripts"
+        sys.path.insert(0, str(scripts))
+        try:
+            import clean_merges
+        finally:
+            sys.path.remove(str(scripts))
+        for url in (REPO, REPO + ".git/", "git@github.com:Org/infra.git", "ssh://git@github.com/org/infra", "  HTTPS://x/y  "):
+            with self.subTest(url=url):
+                self.assertEqual(dial.repo_key(url), clean_merges.repo_key(url))
 
     def test_track_record_read_from_session_kv(self):
-        answer = {"kinds": {}, "clean_merges_needed": 5, "days_needed": 2}
+        answer = {"counts": [], "clean_merges_needed": 5, "days_needed": 2}
         seen = []
 
         class Response:
@@ -308,7 +348,8 @@ class RuntimeTest(unittest.TestCase):
                 mock.patch.object(dial.urllib.request, "urlopen", urlopen):
             self.assertEqual(dial.read_track_record(), answer)
             self.assertEqual(seen, [("http://127.0.0.1:8699/v1/post-merge/clean-merges", "Bearer k", 2.0)])
-            for body in (b"[]", b"{}", b'{"kinds": {}}', b"not json"):
+            for body in (b"[]", b"{}", b'{"counts": []}', b'{"kinds": {}, "clean_merges_needed": 5, "days_needed": 2}',
+                         b"not json"):
                 with mock.patch.object(dial.urllib.request, "urlopen", lambda r, timeout: Response(body)):
                     self.assertIsNone(dial.read_track_record(), body)
 
