@@ -97,6 +97,18 @@ class ApplierTest(unittest.TestCase):
             apply(self.root)
         self.assertIn(BUILD_MARKER, str(caught.exception))
 
+    def test_the_dockerfiles_build_check_matches_what_the_applier_writes(self):
+        # The Dockerfile greps the patched adapter right after running the
+        # applier; a string the applier no longer writes fails every image build.
+        dockerfile = (HERE.parent / "Dockerfile").read_text().splitlines()
+        at = next(i for i, line in enumerate(dockerfile) if "apply_slack_dial_home.py" in line and "python3" in line)
+        check = dockerfile[at + 1]
+        self.assertIn("grep -qF", check)
+        needle = check.split('"')[1]
+        apply(self.root)
+        self.assertIn(needle, self.path.read_text())
+        self.assertNotIn(needle, ADAPTER_SOURCE)
+
     def test_moved_anchor_fails_without_writing(self):
         self.path.write_text(ADAPTER_SOURCE.replace('!= "messages"', 'not in ("messages",)'))
         before = self.path.read_text()

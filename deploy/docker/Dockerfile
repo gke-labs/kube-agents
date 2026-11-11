@@ -999,7 +999,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_unedited_chan
     grep -qF "_kage_slack_clicks.enabled()" /opt/hermes/plugins/platforms/slack/adapter.py && \
     install -m 0644 /tmp/message-surface/slack_dial_home.py /opt/hermes/gateway/slack_dial_home.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_dial_home.py /opt/hermes && \
-    grep -qF "_kage_dial_home.enabled()" /opt/hermes/plugins/platforms/slack/adapter.py && \
+    grep -qF "_kage_dial_home.register(self)" /opt/hermes/plugins/platforms/slack/adapter.py && \
     install -m 0644 /tmp/message-surface/slack_ux_moments.py /opt/hermes/gateway/slack_ux_moments.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_ux_moments.py /opt/hermes && \
     grep -qF "_kage_moments_wake_text(" /opt/hermes/gateway/kanban_watchers_notifier.py && \
