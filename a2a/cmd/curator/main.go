@@ -13,11 +13,15 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -32,6 +36,8 @@ const (
 	cliOpTimeout            = 30 * time.Second
 	indexOpTimeout          = 60 * time.Second
 	overseerTimeout         = 15 * time.Second
+	maxCheckFileBytes       = 4 << 20
+	statusReadHeaderTimeout = 5 * time.Second
 	exitCodeBlocked         = 2
 )
 
@@ -47,7 +53,7 @@ usage:
 
 environment:
   NATS_URL            NATS JetStream bus URL
-  A2A_BUS_USER        bus principal (falls back to NATS_USER, A2A_POD_NAME, then agent)
+  A2A_BUS_USER        bus principal (falls back to NATS_USER; exits "no bus identity" when both are unset)
   A2A_BUS_TOKEN_FILE  projected SA token path (default: /var/run/secrets/a2a-bus/token)
   HINDSIGHT_API_URL   Hindsight REST endpoint (for example, http://hindsight-api.kubeagents-system.svc.cluster.local:8888)
 `
@@ -102,13 +108,23 @@ func busUser() string {
 	if u := strings.TrimSpace(os.Getenv(lib.EnvBusUser)); u != "" {
 		return u
 	}
-	if u := strings.TrimSpace(os.Getenv("NATS_USER")); u != "" {
-		return u
+	return strings.TrimSpace(os.Getenv("NATS_USER"))
+}
+
+func readBoundedViaRoot(root *os.Root, rel string) ([]byte, error) {
+	f, err := root.Open(rel)
+	if err != nil {
+		return nil, err
 	}
-	if u := strings.TrimSpace(os.Getenv(lib.EnvPodName)); u != "" {
-		return u
+	defer f.Close()
+	raw, err := io.ReadAll(io.LimitReader(f, maxCheckFileBytes+1))
+	if err != nil {
+		return nil, err
 	}
-	return "agent"
+	if len(raw) > maxCheckFileBytes {
+		return nil, fmt.Errorf("file %s exceeds %d-byte limit", rel, maxCheckFileBytes)
+	}
+	return raw, nil
 }
 
 func readFileViaDirRoot(fullPath string) ([]byte, error) {
@@ -118,7 +134,7 @@ func readFileViaDirRoot(fullPath string) ([]byte, error) {
 		return nil, err
 	}
 	defer root.Close()
-	return root.ReadFile(filepath.Base(clean))
+	return readBoundedViaRoot(root, filepath.Base(clean))
 }
 
 func connectNATS(ctx context.Context, name string, log *slog.Logger) (*lib.Client, error) {
@@ -127,6 +143,9 @@ func connectNATS(ctx context.Context, name string, log *slog.Logger) (*lib.Clien
 		return nil, errors.New("NATS_URL is not set")
 	}
 	user := busUser()
+	if user == "" {
+		return nil, fmt.Errorf("no bus identity: set %s or NATS_USER", lib.EnvBusUser)
+	}
 	auth := lib.WithUserPassword(user, os.Getenv("NATS_PASSWORD"))
 	if path := os.Getenv(lib.EnvBusTokenFile); path != "" {
 		auth = lib.WithKSAToken(path, user)
@@ -234,6 +253,7 @@ func runDaemon(args []string) error {
 	hsURL := fs.String("hindsight-url", defaultHindsightURL(), "Hindsight API URL")
 	bank := fs.String("bank", memory.DefaultBankID, "Hindsight bank ID")
 	threshold := fs.Int("recurrence-threshold", defaultRecurrenceFloor, "clusters required to graduate a lesson to a fleet-wide decision")
+	statusListen := fs.String("status-listen", strings.TrimSpace(os.Getenv("CURATOR_STATUS_LISTEN")), "optional HTTP address serving /healthz and /readyz (for example, :8080)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -241,6 +261,42 @@ func runDaemon(args []string) error {
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	var ready atomic.Bool
+	var statusSrv *http.Server
+	if *statusListen != "" {
+		ln, lnErr := net.Listen("tcp", *statusListen)
+		if lnErr != nil {
+			return fmt.Errorf("listen status %s: %w", *statusListen, lnErr)
+		}
+		mux := http.NewServeMux()
+		mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok\n"))
+		})
+		mux.HandleFunc("/readyz", func(w http.ResponseWriter, _ *http.Request) {
+			if !ready.Load() {
+				http.Error(w, "not ready", http.StatusServiceUnavailable)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ready\n"))
+		})
+		statusSrv = &http.Server{
+			Handler:           mux,
+			ReadHeaderTimeout: statusReadHeaderTimeout,
+		}
+		go func() {
+			if sErr := statusSrv.Serve(ln); sErr != nil && !errors.Is(sErr, http.ErrServerClosed) {
+				log.Error("curator status server failed", "err", sErr)
+			}
+		}()
+		defer func() {
+			shCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = statusSrv.Shutdown(shCtx)
+		}()
+	}
 
 	client, err := connectNATS(ctx, "daemon", log)
 	if err != nil {
@@ -270,7 +326,11 @@ func runDaemon(args []string) error {
 	if err := cur.Start(ctx); err != nil {
 		return err
 	}
-	defer cur.Stop()
+	ready.Store(true)
+	defer func() {
+		ready.Store(false)
+		cur.Stop()
+	}()
 
 	log.Info("curator daemon started",
 		"repo_dir", *repoDir,
@@ -387,7 +447,7 @@ func runEmit(args []string) error {
 	defer client.Close()
 
 	corr := lib.NewCorrelationID()
-	outcomeRes, err := memory.PublishOutcome(ctx, client, ev)
+	outcomeRes, publishedSubj, err := memory.PublishOutcomeWithMeta(ctx, client, ev, corr)
 	if err != nil {
 		return err
 	}
@@ -398,7 +458,7 @@ func runEmit(args []string) error {
 		ev.Title = outcomeRes.Title
 	}
 	out := map[string]any{
-		"published":      memory.SubjectCuratorOutcomes,
+		"published":      publishedSubj,
 		"correlation_id": corr,
 		"event":          ev,
 	}
@@ -483,11 +543,20 @@ func runCheck(args []string) error {
 	}
 	defer repoRoot.Close()
 
+	knowledgeRepoExplicit := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "knowledge-repo" {
+			knowledgeRepoExplicit = true
+		}
+	})
+
 	kDir := *knowledgeRepo
-	if _, err := repoRoot.Stat("knowledge"); err == nil {
-		kDir = *repoDir
-	} else if _, err := repoRoot.Stat(filepath.Join(".kube-agents", "intent.yaml")); err == nil {
-		kDir = *repoDir
+	if !knowledgeRepoExplicit {
+		if _, err := repoRoot.Stat("knowledge"); err == nil {
+			kDir = *repoDir
+		} else if _, err := repoRoot.Stat(filepath.Join(".kube-agents", "intent.yaml")); err == nil {
+			kDir = *repoDir
+		}
 	}
 	records, err := memory.LoadRecords(kDir)
 	if err != nil {
@@ -507,7 +576,7 @@ func runCheck(args []string) error {
 		if cleanRel == "." || cleanRel == "" || strings.HasPrefix(cleanRel, "/") || cleanRel == ".." || strings.HasPrefix(cleanRel, "../") || strings.Contains(cleanRel, "/../") {
 			return fmt.Errorf("invalid changed file path %q", rel)
 		}
-		raw, err := repoRoot.ReadFile(filepath.FromSlash(cleanRel))
+		raw, err := readBoundedViaRoot(repoRoot, filepath.FromSlash(cleanRel))
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				changed[cleanRel] = nil
@@ -638,12 +707,15 @@ func runIndex(args []string) error {
 
 func runRecall(args []string) error {
 	fs := flag.NewFlagSet("curator recall", flag.ContinueOnError)
+	repoDir := fs.String("repo", defaultRepoDir(), "knowledge repository directory (used to enforce --cluster and --path scope filters)")
+	repoID := fs.String("repo-id", defaultRepoID(), "canonical repository identifier")
 	hsURL := fs.String("hindsight-url", defaultHindsightURL(), "Hindsight API URL (used when --direct-hindsight is set or NATS_URL is unset)")
 	bank := fs.String("bank", memory.DefaultBankID, "Hindsight bank ID")
 	tagsCSV := fs.String("tags", memory.SharedTag, "comma-separated tags filter")
 	tagsMatch := fs.String("tags-match", "all_strict", "tags match mode (all_strict|any_strict)")
 	pathFilter := fs.String("path", "", "optional repository path filter")
 	clusterFilter := fs.String("cluster", "", "optional cluster filter")
+	maxResults := fs.Int("max-results", 0, "optional maximum number of recall results")
 	queryFlag := fs.String("query", "", "optional query string (alternative to positional args)")
 	directHS := fs.Bool("direct-hindsight", false, "query Hindsight HTTP REST directly instead of NATS request-reply")
 	if err := fs.Parse(args); err != nil {
@@ -671,13 +743,14 @@ func runRecall(args []string) error {
 		if err == nil {
 			defer client.Close()
 			resp, qErr := memory.QueryViaNATS(ctx, client, memory.MemoryQueryRequest{
-				Schema:    memory.MemoryQuerySchema,
-				Query:     query,
-				Bank:      *bank,
-				Tags:      tags,
-				TagsMatch: *tagsMatch,
-				Path:      *pathFilter,
-				Cluster:   *clusterFilter,
+				Schema:     memory.MemoryQuerySchema,
+				Query:      query,
+				Bank:       *bank,
+				Tags:       tags,
+				TagsMatch:  *tagsMatch,
+				Path:       *pathFilter,
+				Cluster:    *clusterFilter,
+				MaxResults: *maxResults,
 			})
 			if qErr == nil {
 				enc := json.NewEncoder(os.Stdout)
@@ -695,10 +768,39 @@ func runRecall(args []string) error {
 	if *hsURL == "" {
 		return errors.New("NATS_URL or --hindsight-url (HINDSIGHT_API_URL) is required")
 	}
+	hsQuery := query
+	if hsQuery == "" {
+		if *pathFilter != "" {
+			hsQuery = *pathFilter
+		} else {
+			hsQuery = *clusterFilter
+		}
+	}
 	hs := memory.NewHindsightClient(*hsURL, *bank)
-	results, err := hs.Recall(ctx, query, tags, *tagsMatch)
+	results, err := hs.RecallBank(ctx, *bank, hsQuery, tags, *tagsMatch)
 	if err != nil {
 		return err
+	}
+	byID := map[string]memory.Record{}
+	byDocID := map[string]memory.Record{}
+	if localRecs, lErr := memory.LoadRecords(*repoDir); lErr == nil {
+		for _, r := range localRecs {
+			byID[r.Meta.ID] = r
+			byDocID[r.DocumentID(*repoID)] = r
+		}
+	}
+	if extRecs, eErr := memory.LoadExternalDocRecords(*repoDir); eErr == nil {
+		for _, r := range extRecs {
+			byID[r.Meta.ID] = r
+			byDocID[r.DocumentID(*repoID)] = r
+		}
+	}
+	results = memory.FilterRecallResults(results, byID, byDocID, *clusterFilter, *pathFilter)
+	if *maxResults > 0 && len(results) > *maxResults {
+		results = results[:*maxResults]
+	}
+	if results == nil {
+		results = []memory.HindsightRecallResult{}
 	}
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")

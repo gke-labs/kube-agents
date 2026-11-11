@@ -1143,4 +1143,674 @@ spec:
 			t.Fatal("redirected JetStream delivery must be rejected on SubjectCuratorOutcomes")
 		}
 	}
+
+	seqHdr := nats.Header{}
+	seqHdr.Set("Nats-Sequence", "42")
+	cur.handleCuratorOutcomeMsg(ctx, &nats.Msg{
+		Subject: SubjectCuratorOutcomes,
+		Header:  seqHdr,
+		Data:    forgedPayload,
+	}, SubjectCuratorOutcomes)
+	afterSeqForge, _ := LoadRecords(curDir)
+	for _, r := range afterSeqForge {
+		if r.Meta.ID == "DEC-2026-099" {
+			t.Fatal("Nats-Sequence header delivery must be rejected on SubjectCuratorOutcomes")
+		}
+	}
 }
+
+func TestOutcomeProposedNeverOverwritesActiveOrConflictingProposed(t *testing.T) {
+	ctx := context.Background()
+	repoDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repoDir, "clusters", "prod-eu"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "clusters", "prod-eu", "pdb.yaml"), []byte("apiVersion: policy/v1\nkind: PodDisruptionBudget\nmetadata:\n  name: web\nspec:\n  minAvailable: 1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cur, err := NewCurator(CuratorConfig{
+		RepoDir: repoDir,
+		RepoID:  "acme/gitops",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Seed an active decision DEC-2026-001.
+	_, err = cur.ProcessOutcome(ctx, OutcomeEvent{
+		Kind:       OutcomeApproved,
+		RecordID:   "DEC-2026-001",
+		RecordType: RecordTypeDecision,
+		Title:      "Keep checkout replicas at two or higher",
+		Rule:       "Keep checkout replicas >= 2",
+		Repo:       "acme/gitops",
+		PRNumber:   10,
+		Scope:      &RecordScope{Paths: []string{"apps/checkout/*.yaml"}},
+		Guard: &RecordGuard{
+			Rule:     "Keep checkout replicas >= 2",
+			Severity: "block",
+			Expect:   &GuardExpect{File: "apps/checkout/*.yaml", Path: "spec.replicas", Op: ">=", Value: 2},
+		},
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Explicit OutcomeProposed targeting DEC-2026-001 must not demote or overwrite it.
+	resActiveExplicit, err := cur.ProcessOutcome(ctx, OutcomeEvent{
+		Kind:       OutcomeProposed,
+		RecordID:   "DEC-2026-001",
+		RecordType: RecordTypeDecision,
+		Title:      "Overwrite attempt",
+		Rule:       "Allow 0 replicas",
+		Repo:       "acme/gitops",
+		PRNumber:   99,
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resActiveExplicit.Status != StatusActive {
+		t.Fatalf("explicit OutcomeProposed demoted active record: %+v", resActiveExplicit)
+	}
+
+	// Fuzzy OutcomeProposed matching DEC-2026-001's title must allocate a fresh ID rather than demoting DEC-2026-001.
+	resActiveFuzzy, err := cur.ProcessOutcome(ctx, OutcomeEvent{
+		Kind:       OutcomeProposed,
+		RecordType: RecordTypeDecision,
+		Title:      "Keep checkout replicas at two or higher",
+		Rule:       "Keep checkout replicas >= 2",
+		Repo:       "acme/gitops",
+		PRNumber:   105,
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resActiveFuzzy.RecordID == "DEC-2026-001" || resActiveFuzzy.Status != StatusProposed {
+		t.Fatalf("fuzzy OutcomeProposed collided with active DEC-2026-001: %+v", resActiveFuzzy)
+	}
+
+	// 2. Seed a PR-less proposed record DEC-2026-010 with a guard and body.
+	_, err = cur.ProcessOutcome(ctx, OutcomeEvent{
+		Kind:       OutcomeProposed,
+		RecordID:   "DEC-2026-010",
+		RecordType: RecordTypeDecision,
+		Title:      "Require memory limits on payments",
+		Summary:    "Initial synthesized body for payments.",
+		Rule:       "Set memory limits on payments",
+		Scope:      &RecordScope{Paths: []string{"apps/payments/*.yaml"}},
+		Guard: &RecordGuard{
+			Rule:     "Set memory limits on payments",
+			Severity: "block",
+			Expect:   &GuardExpect{File: "apps/payments/*.yaml", Path: "spec.limits.memory", Op: "exists"},
+		},
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Attaching PR #41 to PR-less DEC-2026-010 must preserve its Guard and Body.
+	_, err = cur.ProcessOutcome(ctx, OutcomeEvent{
+		Kind:     OutcomeProposed,
+		RecordID: "DEC-2026-010",
+		Repo:     "acme/gitops",
+		PRNumber: 41,
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A conflicting explicit OutcomeProposed for DEC-2026-010 with PR #42 must not overwrite PR #41.
+	_, err = cur.ProcessOutcome(ctx, OutcomeEvent{
+		Kind:     OutcomeProposed,
+		RecordID: "DEC-2026-010",
+		Repo:     "acme/gitops",
+		PRNumber: 42,
+		Title:    "Hijack PR link",
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A fuzzy OutcomeProposed with the same title but PR #43 must allocate a fresh ID.
+	resConflictFuzzy, err := cur.ProcessOutcome(ctx, OutcomeEvent{
+		Kind:       OutcomeProposed,
+		RecordType: RecordTypeDecision,
+		Title:      "Require memory limits on payments",
+		Rule:       "Set memory limits on payments",
+		Repo:       "acme/gitops",
+		PRNumber:   43,
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resConflictFuzzy.RecordID == "DEC-2026-010" {
+		t.Fatalf("expected fresh ID for conflicting PR #43, got %s", resConflictFuzzy.RecordID)
+	}
+
+	recs, err := LoadRecords(repoDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]Record{}
+	for _, r := range recs {
+		byID[r.Meta.ID] = r
+	}
+	if got := byID["DEC-2026-001"]; got.Meta.Status != StatusActive || got.Meta.Evidence.PullRequest != "https://github.com/acme/gitops/pull/10 (#10)" {
+		t.Fatalf("DEC-2026-001 mutated: %+v", got.Meta)
+	}
+	dec10 := byID["DEC-2026-010"]
+	if dec10.Meta.Evidence.PullRequest != "https://github.com/acme/gitops/pull/41 (#41)" {
+		t.Fatalf("DEC-2026-010 PR = %q, want https://github.com/acme/gitops/pull/41 (#41)", dec10.Meta.Evidence.PullRequest)
+	}
+	if dec10.Meta.Guard == nil || dec10.Meta.Guard.Expect == nil || !strings.Contains(dec10.Body, "Initial synthesized body") {
+		t.Fatalf("DEC-2026-010 guard or body wiped when attaching PR: meta=%+v body=%q", dec10.Meta, dec10.Body)
+	}
+}
+
+func TestHandleQueryEnforcesClusterPathMaxResultsAndBank(t *testing.T) {
+	ctx := context.Background()
+	repoDir := t.TempDir()
+
+	var mu sync.Mutex
+	banksQueried := []string{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/default/banks/kube-agents-decisions/memories/recall", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		banksQueried = append(banksQueried, "kube-agents-decisions")
+		mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"results": []HindsightRecallResult{
+				{ID: "LES-2026-001", DocumentID: "okf:acme/gitops:LES-2026-001", Text: "EU checkout lesson", Tags: []string{"scope:shared", "cluster:prod-eu"}},
+				{ID: "LES-2026-002", DocumentID: "okf:acme/gitops:LES-2026-002", Text: "US payments lesson", Tags: []string{"scope:shared", "cluster:prod-us"}},
+				{ID: "DEC-2026-003", DocumentID: "okf:acme/gitops:DEC-2026-003", Text: "Fleet-wide checkout rule", Tags: []string{"scope:shared", "cluster:*"}},
+			},
+		})
+	})
+	mux.HandleFunc("/v1/default/banks/kube-agents-memory/memories/recall", func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		banksQueried = append(banksQueried, "kube-agents-memory")
+		mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"results": []HindsightRecallResult{
+				{ID: "conv-1", Text: "Team prefers canary rollouts on Tuesdays", Tags: []string{"scope:shared"}},
+			},
+		})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	cur, err := NewCurator(CuratorConfig{
+		RepoDir:   repoDir,
+		RepoID:    "acme/gitops",
+		Hindsight: NewHindsightClient(srv.URL, DefaultBankID),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rec := range []Record{
+		{
+			Meta: RecordMeta{
+				ID: "LES-2026-001", Type: RecordTypeLesson, Status: StatusActive,
+				Title: "EU checkout lesson", Date: "2026-11-11",
+				Scope: RecordScope{Clusters: []string{"prod-eu"}, Paths: []string{"apps/checkout/**"}},
+			},
+			Body: "## Summary\nEU checkout lesson.\n",
+		},
+		{
+			Meta: RecordMeta{
+				ID: "LES-2026-002", Type: RecordTypeLesson, Status: StatusActive,
+				Title: "US payments lesson", Date: "2026-11-11",
+				Scope: RecordScope{Clusters: []string{"prod-us"}, Paths: []string{"apps/payments/**"}},
+			},
+			Body: "## Summary\nUS payments lesson.\n",
+		},
+		{
+			Meta: RecordMeta{
+				ID: "DEC-2026-003", Type: RecordTypeDecision, Status: StatusActive,
+				Title: "Fleet-wide checkout rule", Date: "2026-11-11",
+				Scope: RecordScope{Clusters: []string{"*"}, Paths: []string{"apps/checkout/**"}},
+			},
+			Body: "## Summary\nFleet-wide checkout rule.\n",
+		},
+	} {
+		rCopy := rec
+		if err := SaveRecord(repoDir, &rCopy); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// 1. Cluster + Path filtering drops prod-us payments hit.
+	r1 := cur.HandleQuery(ctx, MemoryQueryRequest{
+		Query:      "lesson",
+		Cluster:    "prod-eu",
+		Path:       "apps/checkout/deployment.yaml",
+		MaxResults: 1,
+	})
+	if len(r1.Results) != 1 {
+		t.Fatalf("MaxResults=1 returned %d results: %+v", len(r1.Results), r1.Results)
+	}
+
+	// 2. Cache key includes MaxResults so MaxResults=5 is not served the truncated MaxResults=1 entry.
+	r2 := cur.HandleQuery(ctx, MemoryQueryRequest{
+		Query:      "lesson",
+		Cluster:    "prod-eu",
+		Path:       "apps/checkout/deployment.yaml",
+		MaxResults: 5,
+	})
+	if len(r2.Results) != 2 {
+		t.Fatalf("expected 2 filtered hits (LES-2026-001 and DEC-2026-003), got %d: %+v", len(r2.Results), r2.Results)
+	}
+	for _, hit := range r2.Results {
+		if hit.ID == "LES-2026-002" {
+			t.Fatalf("HandleQuery leaked out-of-scope cluster/path record LES-2026-002: %+v", r2.Results)
+		}
+	}
+
+	// 3. Explicit Bank routes to kube-agents-memory instead of DefaultBankID.
+	rBank := cur.HandleQuery(ctx, MemoryQueryRequest{
+		Query: "canary rollouts",
+		Bank:  "kube-agents-memory",
+		Tags:  []string{"scope:shared"},
+	})
+	if rBank.Bank != "kube-agents-memory" || len(rBank.Results) == 0 || rBank.Results[0].ID != "conv-1" {
+		t.Fatalf("expected kube-agents-memory recall hit conv-1, got %+v", rBank)
+	}
+
+	// 4. Redirect responses from Hindsight are refused (ErrUseLastResponse).
+	redirSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://169.254.169.254/latest/meta-data", http.StatusFound)
+	}))
+	defer redirSrv.Close()
+	redirClient := NewHindsightClient(redirSrv.URL, DefaultBankID)
+	if _, err := redirClient.RecallBank(ctx, DefaultBankID, "test", nil, ""); err == nil {
+		t.Fatal("expected HindsightClient to reject HTTP 302 redirect")
+	}
+}
+
+func TestPublishOutcomeWithMetaSurfacesAppErrorWithoutSecondSubjectRetry(t *testing.T) {
+	natsURL := startEmbeddedJetStream(t)
+	ctx := context.Background()
+
+	serverClient, err := lib.Connect(ctx, natsURL, lib.WithName("test-responder"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverClient.Close()
+
+	callerClient, err := lib.Connect(ctx, natsURL, lib.WithName("test-caller"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer callerClient.Close()
+
+	var outcomesCalls int
+	var mu sync.Mutex
+	var gotFallbackCorr string
+
+	qSub, err := serverClient.SubscribeCore(SubjectMemoryQuery, func(msg *nats.Msg) {
+		raw, _ := json.Marshal(MemoryQueryResponse{
+			Schema: MemoryQueryReplySchema,
+			Error:  "application error: invalid transition",
+		})
+		_ = msg.Respond(raw)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oSub, err := serverClient.SubscribeCore(SubjectCuratorOutcomes, func(msg *nats.Msg) {
+		mu.Lock()
+		outcomesCalls++
+		if msg.Header != nil {
+			gotFallbackCorr = msg.Header.Get("Nats-Correlation-Id")
+		}
+		mu.Unlock()
+		raw, _ := json.Marshal(MemoryQueryResponse{
+			Schema:  MemoryQueryReplySchema,
+			Outcome: &OutcomeProcessResult{RecordID: "DEC-2026-077", Status: StatusActive},
+		})
+		_ = msg.Respond(raw)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer oSub.Stop()
+
+	// When SubjectMemoryQuery replies with an application error, PublishOutcomeWithMeta must NOT retry on SubjectCuratorOutcomes.
+	_, subj, err := PublishOutcomeWithMeta(ctx, callerClient, OutcomeEvent{
+		Kind:     OutcomeApproved,
+		RecordID: "DEC-2026-077",
+	}, "corr-app-err")
+	if err == nil || !strings.Contains(err.Error(), "invalid transition") {
+		t.Fatalf("expected application error to surface, got err=%v", err)
+	}
+	if subj != SubjectMemoryQuery {
+		t.Fatalf("expected subject %q, got %q", SubjectMemoryQuery, subj)
+	}
+	mu.Lock()
+	if outcomesCalls != 0 {
+		mu.Unlock()
+		t.Fatalf("SubjectCuratorOutcomes called %d times on application error, want 0", outcomesCalls)
+	}
+	mu.Unlock()
+
+	// When SubjectMemoryQuery has no responders, PublishOutcomeWithMeta falls back to SubjectCuratorOutcomes with CorrelationID.
+	qSub.Stop()
+	res, fallbackSubj, err := PublishOutcomeWithMeta(ctx, callerClient, OutcomeEvent{
+		Kind:     OutcomeApproved,
+		RecordID: "DEC-2026-077",
+	}, "corr-fallback-1")
+	if err != nil {
+		t.Fatalf("expected fallback to SubjectCuratorOutcomes to succeed, got %v", err)
+	}
+	if fallbackSubj != SubjectCuratorOutcomes || res.RecordID != "DEC-2026-077" {
+		t.Fatalf("unexpected fallback result: subj=%q res=%+v", fallbackSubj, res)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if gotFallbackCorr != "corr-fallback-1" {
+		t.Fatalf("expected Nats-Correlation-Id=corr-fallback-1, got %q", gotFallbackCorr)
+	}
+}
+
+func TestCheckChangedFilesResourceScopedPrecedenceMultiDocYAML(t *testing.T) {
+	records := []Record{
+		{
+			Path: "knowledge/decisions/DEC-2026-020.md",
+			Meta: RecordMeta{
+				ID: "DEC-2026-020", Type: RecordTypeDecision, Status: StatusActive,
+				Title: "Fleet Deployment replica floor", Date: "2026-11-01",
+				Scope: RecordScope{Clusters: []string{"*"}, Paths: []string{"clusters/**/*.yaml"}},
+				Guard: &RecordGuard{
+					Rule:     "All Deployments must run at least 2 replicas",
+					Severity: "block",
+					Expect:   &GuardExpect{File: "clusters/**/*.yaml", Path: "spec.replicas", Op: ">=", Value: 2},
+				},
+			},
+		},
+		{
+			Path: "knowledge/lessons/LES-2026-021.md",
+			Meta: RecordMeta{
+				ID: "LES-2026-021", Type: RecordTypeLesson, Status: StatusActive,
+				Title: "Checkout single-replica exception on prod-eu", Date: "2026-11-10",
+				Scope: RecordScope{
+					Clusters:  []string{"prod-eu"},
+					Paths:     []string{"clusters/prod-eu/*.yaml"},
+					Resources: []string{"Deployment/*/checkout"},
+				},
+				Guard: &RecordGuard{
+					Rule:     "Checkout on prod-eu may run 1 replica",
+					Severity: "warn",
+					Expect:   &GuardExpect{File: "clusters/prod-eu/*.yaml", Path: "spec.replicas", Op: ">=", Value: 1},
+				},
+			},
+		},
+	}
+
+	multiDoc := strings.Join([]string{
+		"apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: checkout\n  namespace: shop\nspec:\n  replicas: 1",
+		"apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: payments\n  namespace: shop\nspec:\n  replicas: 1",
+	}, "\n---\n")
+
+	report := CheckChangedFiles(records, map[string]*string{
+		"clusters/prod-eu/workloads.yaml": &multiDoc,
+	})
+	if report.Verdict != "block" {
+		t.Fatalf("expected fleet DEC-2026-020 to still block uncovered Deployment/payments in multi-doc YAML, got verdict=%q findings=%+v", report.Verdict, report.Findings)
+	}
+
+	// If payments satisfies replicas >= 2 while checkout has replicas: 1, the narrow checkout lesson exempts checkout and report passes!
+	compliantPayments := strings.Join([]string{
+		"apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: checkout\n  namespace: shop\nspec:\n  replicas: 1",
+		"apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: payments\n  namespace: shop\nspec:\n  replicas: 2",
+	}, "\n---\n")
+	reportPass := CheckChangedFiles(records, map[string]*string{
+		"clusters/prod-eu/workloads.yaml": &compliantPayments,
+	})
+	if reportPass.Verdict == "block" {
+		t.Fatalf("expected narrow checkout lesson to exempt Deployment/checkout when payments has replicas=2, got findings=%+v", reportPass.Findings)
+	}
+}
+
+func TestLifecycleBuildersMatchFormattedPRRefAndCheckScopedGraduation(t *testing.T) {
+	ctx := context.Background()
+
+	// Mock LLM server returning a synthesized guard for check-scoped graduation.
+	llmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{
+				"message": map[string]any{
+					"content": `{"title":"Enforce PDB minAvailable across fleet","context":"Two clusters suffered drain outages.","decision":"Keep minAvailable >= 1 on PodDisruptionBudgets.","consequences":"Prevents voluntary drain outages.","guard":{"rule":"Keep minAvailable >= 1","severity":"block","expect":{"file":"clusters/**/pdb.yaml","path":"spec.minAvailable","op":">=","value":1}}}`,
+				},
+			}},
+		})
+	}))
+	defer llmSrv.Close()
+
+	repoDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repoDir, "clusters", "prod-eu"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "clusters", "prod-eu", "pdb.yaml"), []byte("apiVersion: policy/v1\nkind: PodDisruptionBudget\nmetadata:\n  name: web\nspec:\n  minAvailable: 1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cur, err := NewCurator(CuratorConfig{
+		RepoDir:             repoDir,
+		RepoID:              "acme/gitops",
+		RecurrenceThreshold: 2,
+		LLM: LLMConfig{
+			BaseURL: llmSrv.URL,
+			Model:   "test-model",
+			Client:  &http.Client{Timeout: 5 * time.Second},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Thread 8: Propose with Repo + PRNumber, then transition via Repo + PRNumber with empty RecordID and PullRequest.
+	prop, err := cur.ProcessOutcome(ctx, OutcomeEvent{
+		Kind:       OutcomeProposed,
+		RecordType: RecordTypeDecision,
+		Repo:       "acme/gitops",
+		PRNumber:   77,
+		Title:      "Pin PDB minAvailable",
+		Rule:       "Keep minAvailable >= 1",
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	modMerged, err := cur.ProcessOutcome(ctx, OutcomeEvent{
+		Kind:        OutcomeModifiedMerged,
+		Repo:        "acme/gitops",
+		PRNumber:    77,
+		KnowledgePR: true,
+		Summary:     "Reviewer tightened wording before merge.",
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if modMerged.RecordID != prop.RecordID || modMerged.Status != StatusActive {
+		t.Fatalf("expected modified-merged via Repo+PRNumber to activate %s, got %+v", prop.RecordID, modMerged)
+	}
+
+	// Thread 10: Check-scoped lessons (no Expect.Path) across 2 clusters preserve Rule, block Severity, and synth.Guard.
+	for i, cluster := range []string{"prod-eu", "prod-us"} {
+		res, err := cur.ProcessOutcome(ctx, OutcomeEvent{
+			Kind:       OutcomeApproved,
+			RecordType: RecordTypeLesson,
+			Repo:       "acme/gitops",
+			PRNumber:   200 + i,
+			Cluster:    cluster,
+			CheckID:    "pdb-min-check",
+			Title:      "PDB drain outage on " + cluster,
+			Rule:       "Keep minAvailable >= 1 on critical services",
+			Scope:      &RecordScope{Clusters: []string{cluster}, Paths: []string{"clusters/**/pdb.yaml"}, Checks: []string{"pdb-min-check"}},
+			Guard: &RecordGuard{
+				Rule:     "Keep minAvailable >= 1 on critical services",
+				Severity: "block",
+			},
+		}, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i == 1 {
+			if len(res.GraduatedDecisions) != 1 {
+				t.Fatalf("expected check-scoped recurrence graduation on second cluster, got %+v", res)
+			}
+			gradID := res.GraduatedDecisions[0]
+			recs, _ := LoadRecords(repoDir)
+			for _, r := range recs {
+				if r.Meta.ID == gradID {
+					if r.Meta.Guard == nil || r.Meta.Guard.Severity != "block" || r.Meta.Guard.Expect == nil {
+						t.Fatalf("graduated decision %s lost block severity or synthesized guard: %+v", gradID, r.Meta.Guard)
+					}
+				}
+			}
+		}
+	}
+}
+
+func TestExternalDocDisambiguationAndWorkspaceCloneDirNames(t *testing.T) {
+	// Thread 12: workspaceCloneDirName matches gitops_workspace.py for GitHub, GitLab subgroups, ports, and SCP URLs.
+	cases := map[string]string{
+		"https://github.com/acme/infra.git":              "acme__infra",
+		"git@github.com:acme/infra.git":                  "acme__infra",
+		"https://gitlab.com/acme/platform/infra.git":     "gitlab.com%2Facme%2Fplatform%2Finfra",
+		"https://git.corp.internal:8443/ops/runbooks":    "git.corp.internal%2Fops%2Frunbooks",
+		"git@gitlab.corp.internal:ops/team/runbooks.git": "gitlab.corp.internal%2Fops%2Fteam%2Frunbooks",
+	}
+	for rawURL, want := range cases {
+		if got := workspaceCloneDirName(rawURL); got != want {
+			t.Errorf("workspaceCloneDirName(%q) = %q, want %q", rawURL, got, want)
+		}
+	}
+
+	// Thread 11: Colliding numbered external docs across directories and context repos keep distinct IDs.
+	extRepoDir := t.TempDir()
+	agentHome := t.TempDir()
+	ctxDir := filepath.Join(agentHome, "gitops", "gitlab.com%2Facme%2Fplatform%2Frunbooks")
+	if err := os.MkdirAll(filepath.Join(extRepoDir, "docs", "adr"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(extRepoDir, "adr"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(ctxDir, "docs", "adr"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(extRepoDir, "docs", "adr", "0001-ingress.md"), []byte("# ADR 1: Ingress policy\nUse Gateway API.\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(extRepoDir, "adr", "0001-egress.md"), []byte("# ADR 1: Egress policy\nDeny by default.\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ctxDir, "docs", "adr", "0001-mesh.md"), []byte("# ADR 1: Service mesh\nUse mTLS.\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stateDir := t.TempDir()
+	ctxState := filepath.Join(stateDir, "context_repos")
+	if err := os.WriteFile(ctxState, []byte(`[{"url":"https://gitlab.com/acme/platform/runbooks.git"}]`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PLATFORM_AGENT_HOME", agentHome)
+	t.Setenv("GITOPS_STATE_PATH", filepath.Join(stateDir, "managed_repos"))
+
+	ext, err := LoadExternalDocRecords(extRepoDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ext) != 3 {
+		t.Fatalf("expected all 3 colliding 0001-*.md docs to be retained with disambiguated IDs, got %d: %+v", len(ext), ext)
+	}
+	seenIDs := map[string]bool{}
+	for _, r := range ext {
+		if seenIDs[r.Meta.ID] {
+			t.Fatalf("duplicate external doc ID %q", r.Meta.ID)
+		}
+		seenIDs[r.Meta.ID] = true
+	}
+
+	// Thread 5: Oversized >4 MiB Markdown file in knowledge/decisions is bounded and skipped/rejected safely.
+	decDir := filepath.Join(extRepoDir, "knowledge", "decisions")
+	if err := os.MkdirAll(decDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	huge := "---\nid: DEC-2026-999\ntype: decision\nstatus: active\ntitle: Huge\ncreated: \"2026-11-11\"\n---\n" + strings.Repeat("x", maxRecordFileBytes+1024)
+	if err := os.WriteFile(filepath.Join(decDir, "DEC-2026-999-huge.md"), []byte(huge), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadRecords(extRepoDir); err == nil {
+		t.Fatal("expected LoadRecords to reject record exceeding 4 MiB limit")
+	}
+}
+
+func TestCuratorStartConcurrentWithProcessOutcomeNoRace(t *testing.T) {
+	natsURL := startEmbeddedJetStream(t)
+	ctx := context.Background()
+	client, err := lib.Connect(ctx, natsURL, lib.WithName("curator-race-test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	repoDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repoDir, "clusters", "prod-eu"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "clusters", "prod-eu", "pdb.yaml"), []byte("apiVersion: policy/v1\nkind: PodDisruptionBudget\nmetadata:\n  name: web\nspec:\n  minAvailable: 1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cur, err := NewCurator(CuratorConfig{
+		RepoDir: repoDir,
+		RepoID:  "acme/gitops",
+		Client:  client,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Seed one record so Start's startup-sync branch has data to inspect.
+	if _, err := cur.ProcessOutcome(ctx, OutcomeEvent{
+		Kind:       OutcomeApproved,
+		RecordID:   "DEC-2026-001",
+		RecordType: RecordTypeDecision,
+		Title:      "Seed rule",
+		Rule:       "Seed rule",
+	}, ""); err != nil {
+		t.Fatal(err)
+	}
+	// Reset outcomesProcessed to 0 on a fresh Curator sharing repoDir to exercise Start vs live ProcessOutcome.
+	cur2, err := NewCurator(CuratorConfig{
+		RepoDir: repoDir,
+		RepoID:  "acme/gitops",
+		Client:  client,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cur2.Stop()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		if err := cur2.Start(ctx); err != nil {
+			t.Errorf("Start failed: %v", err)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 5; i++ {
+			_, _ = cur2.ProcessOutcome(ctx, OutcomeEvent{
+				Kind:       OutcomeApproved,
+				RecordType: RecordTypeLesson,
+				Cluster:    "prod-eu",
+				Title:      "Concurrent outcome",
+				Rule:       "Concurrent rule",
+				PRNumber:   300 + i,
+				Repo:       "acme/gitops",
+			}, "")
+		}
+	}()
+	wg.Wait()
+}
+

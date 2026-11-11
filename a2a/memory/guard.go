@@ -571,7 +571,12 @@ func targetFileMatchesNarrowCluster(targetFile string, clusters []string) bool {
 	return false
 }
 
-func suppressedFilesByPrecedence(records []Record, targetFiles []string) map[string]map[string]bool {
+type precedenceSuppression struct {
+	wholeFile         map[string]map[string]bool
+	excludedResources map[string]map[string][]string
+}
+
+func suppressedByPrecedence(records []Record, targetFiles []string) precedenceSuppression {
 	type groupKey struct {
 		file string
 		path string
@@ -582,6 +587,9 @@ func suppressedFilesByPrecedence(records []Record, targetFiles []string) map[str
 			continue
 		}
 		exp := rec.Meta.Guard.Expect
+		if exp.Path == "" {
+			continue
+		}
 		for _, tf := range targetFiles {
 			if !MatchGlob(exp.File, tf) {
 				continue
@@ -593,32 +601,81 @@ func suppressedFilesByPrecedence(records []Record, targetFiles []string) map[str
 			grouped[k] = append(grouped[k], rec)
 		}
 	}
-	suppressed := map[string]map[string]bool{}
+	whole := map[string]map[string]bool{}
+	excl := map[string]map[string][]string{}
 	for k, grp := range grouped {
 		if len(grp) <= 1 {
 			continue
 		}
-		hasActiveNarrow := false
+		hasUnscopedActiveNarrow := false
+		var scopedNarrowResources []string
 		hasBroad := false
 		for _, r := range grp {
 			if isFleetWideClusterScope(r.Meta.Scope.Clusters) {
 				hasBroad = true
 			} else if r.Meta.Status == StatusActive {
-				hasActiveNarrow = true
-			}
-		}
-		if hasActiveNarrow && hasBroad {
-			for _, r := range grp {
-				if isFleetWideClusterScope(r.Meta.Scope.Clusters) {
-					if suppressed[r.Meta.ID] == nil {
-						suppressed[r.Meta.ID] = map[string]bool{}
-					}
-					suppressed[r.Meta.ID][k.file] = true
+				if len(r.Meta.Scope.Resources) == 0 {
+					hasUnscopedActiveNarrow = true
+				} else {
+					scopedNarrowResources = append(scopedNarrowResources, r.Meta.Scope.Resources...)
 				}
 			}
 		}
+		if !hasBroad || (!hasUnscopedActiveNarrow && len(scopedNarrowResources) == 0) {
+			continue
+		}
+		for _, r := range grp {
+			if !isFleetWideClusterScope(r.Meta.Scope.Clusters) {
+				continue
+			}
+			if hasUnscopedActiveNarrow {
+				if whole[r.Meta.ID] == nil {
+					whole[r.Meta.ID] = map[string]bool{}
+				}
+				whole[r.Meta.ID][k.file] = true
+			} else {
+				if excl[r.Meta.ID] == nil {
+					excl[r.Meta.ID] = map[string][]string{}
+				}
+				excl[r.Meta.ID][k.file] = append(excl[r.Meta.ID][k.file], scopedNarrowResources...)
+			}
+		}
 	}
-	return suppressed
+	return precedenceSuppression{wholeFile: whole, excludedResources: excl}
+}
+
+func filterYAMLContentExcludingResources(content string, excludedGlobs []string) (filtered string, anyRemaining bool) {
+	if len(excludedGlobs) == 0 {
+		return content, true
+	}
+	docs, err := parseMultiYAMLDocs(content)
+	if err != nil || len(docs) == 0 {
+		return content, true
+	}
+	var kept []string
+	for _, d := range docs {
+		covered := false
+		for _, rid := range docResourceIDs(d) {
+			for _, g := range excludedGlobs {
+				if MatchGlob(g, rid) {
+					covered = true
+					break
+				}
+			}
+			if covered {
+				break
+			}
+		}
+		if !covered {
+			if raw, mErr := yaml.Marshal(d); mErr == nil {
+				kept = append(kept, strings.TrimSpace(string(raw)))
+			}
+		}
+	}
+	if len(kept) == 0 {
+		return "", false
+	}
+	return strings.Join(kept, "\n---\n") + "\n", true
 }
 
 // CheckChangedFiles matches modified or deleted files against active and proposed records.
@@ -637,7 +694,7 @@ func CheckChangedFiles(records []Record, changed map[string]*string) CheckReport
 	}
 	sort.Strings(changedPaths)
 
-	suppressedOnFile := suppressedFilesByPrecedence(candidates, changedPaths)
+	supp := suppressedByPrecedence(candidates, changedPaths)
 	fileResources := map[string][]string{}
 	for p, content := range changed {
 		if content == nil {
@@ -653,9 +710,17 @@ func CheckChangedFiles(records []Record, changed map[string]*string) CheckReport
 	var findings []CheckFinding
 	for _, rec := range candidates {
 		hitSet := map[string]bool{}
+		filteredContentByFile := map[string]string{}
 		for _, p := range changedPaths {
-			if suppressedOnFile[rec.Meta.ID][p] {
+			if supp.wholeFile[rec.Meta.ID][p] {
 				continue
+			}
+			if exclGlobs := supp.excludedResources[rec.Meta.ID][p]; len(exclGlobs) > 0 && changed[p] != nil {
+				filt, rem := filterYAMLContentExcludingResources(*changed[p], exclGlobs)
+				if !rem {
+					continue
+				}
+				filteredContentByFile[p] = filt
 			}
 			if !isFleetWideClusterScope(rec.Meta.Scope.Clusters) && len(rec.Meta.Scope.Paths) > 0 {
 				// If a cluster-scoped record uses a wildcard file glob (such as clusters/**/app.yaml),
@@ -694,7 +759,11 @@ func CheckChangedFiles(records []Record, changed map[string]*string) CheckReport
 			var deleted []string
 			for _, p := range hits {
 				if changed[p] != nil {
-					liveFiles[p] = *changed[p]
+					if filt, ok := filteredContentByFile[p]; ok {
+						liveFiles[p] = filt
+					} else {
+						liveFiles[p] = *changed[p]
+					}
 				} else if MatchGlob(exp.File, p) {
 					deleted = append(deleted, p)
 				}

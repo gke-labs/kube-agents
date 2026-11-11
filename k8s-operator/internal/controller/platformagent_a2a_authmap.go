@@ -260,6 +260,15 @@ func renderA2AAuthMapDraining(agent *agentv1alpha1.PlatformAgent, profiles []age
 			Grants:         a2aAuthMapGrants{Publish: id.publish, Subscribe: id.subscribe},
 		})
 	}
+	if a2aCuratorEnabled() {
+		id := curatorIdentity(agent, agent.Namespace)
+		identities = append(identities, a2aAuthMapIdentity{
+			ServiceAccount: id.serviceAccount,
+			User:           id.user,
+			Account:        id.account,
+			Grants:         a2aAuthMapGrants{Publish: id.publish, Subscribe: id.subscribe},
+		})
+	}
 
 	// Refuse here what the callout would refuse there.
 	//

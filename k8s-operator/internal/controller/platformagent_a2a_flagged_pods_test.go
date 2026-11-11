@@ -152,6 +152,7 @@ func TestA2AFlaggedStandingPodsFollowTheFlags(t *testing.T) {
 	agent := a2aTestAgent()
 	t.Setenv(a2aMCPDoorEnvVar, "")
 	t.Setenv(a2aDispatcherImageEnvVar, "")
+	t.Setenv(a2aCuratorEnvVar, "")
 	if got := a2aFlaggedStandingPods(agent); got != 0 {
 		t.Errorf("every flag off: %d pods, want 0", got)
 	}
@@ -163,7 +164,12 @@ func TestA2AFlaggedStandingPodsFollowTheFlags(t *testing.T) {
 	if got := a2aFlaggedStandingPods(agent); got != 2 {
 		t.Errorf("MCP and dispatcher on: %d pods, want 2", got)
 	}
+	t.Setenv(a2aCuratorEnvVar, "true")
+	if got := a2aFlaggedStandingPods(agent); got != 3 {
+		t.Errorf("MCP, dispatcher, and curator on: %d pods, want 3", got)
+	}
 	t.Setenv(a2aMCPDoorEnvVar, "")
+	t.Setenv(a2aCuratorEnvVar, "")
 	if got := a2aFlaggedStandingPods(agent); got != 1 {
 		t.Errorf("dispatcher on: %d pods, want 1", got)
 	}

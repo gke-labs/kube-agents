@@ -111,8 +111,8 @@
       "repository": "ghcr.io/gke-labs/kube-agents/a2a-console",
       "tagPolicy": "release",
       "override": "A2A_CONSOLE_IMAGE",
-      "pulledBy": "The console server Deployment the operator renders under spec.mode: next, and nothing under spec.mode: today.",
-      "description": "The A2A console: the console page built to static files and the server that serves it, hands it its bus credential and proxies its websocket to the bus (a2a/Dockerfile.console)."
+      "pulledBy": "The console server Deployment the operator renders under spec.mode: next (and the opt-in MCP server and OKF memory curator Deployments when A2A_MCP_DOOR or A2A_CURATOR is set), and nothing under spec.mode: today.",
+      "description": "The A2A console: the console page built to static files and the server that serves it, hands it its bus credential and proxies its websocket to the bus, plus /mcp and /curator for the opt-in MCP server and OKF memory curator pods (a2a/Dockerfile.console)."
     },
     {
       "name": "a2a-verifier",

@@ -168,6 +168,7 @@ func reservedProfileServiceAccounts(agent *agentv1alpha1.PlatformAgent) map[stri
 		a2aCalloutName(agent):                 "the auth callout's ServiceAccount",
 		shellSandboxServiceAccountName(agent): "the shell sandbox's ServiceAccount",
 		a2aMCPServiceAccountName(agent):       "the A2A MCP server's ServiceAccount, the broker's mcp caller",
+		a2aCuratorName(agent):                 "the OKF memory curator's ServiceAccount",
 		scopePublisherName(agent):             "the scope publisher's ServiceAccount, the broker's scope caller",
 	}
 }

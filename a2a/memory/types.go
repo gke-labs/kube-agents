@@ -12,7 +12,9 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -71,6 +73,7 @@ const (
 	defaultContextReposFile = "context_repos"
 	recordDirPerm           = 0o750
 	recordFilePerm          = 0o600
+	maxRecordFileBytes      = 4 << 20
 )
 
 // OutcomeKind classifies a learning event processed by the Curator.
@@ -274,16 +277,17 @@ type BlueprintDigest struct {
 // MemoryQueryRequest is the NATS request payload sent to SubjectMemoryQuery
 // (or SubjectMemoryQueryPublic) to query or update the semantic memory layer over NATS.
 type MemoryQueryRequest struct {
-	Schema     string        `json:"schema,omitempty"`
-	Action     string        `json:"action,omitempty"`
-	Query      string        `json:"query"`
-	Bank       string        `json:"bank,omitempty"`
-	Tags       []string      `json:"tags,omitempty"`
-	TagsMatch  string        `json:"tags_match,omitempty"`
-	Path       string        `json:"path,omitempty"`
-	Cluster    string        `json:"cluster,omitempty"`
-	MaxResults int           `json:"max_results,omitempty"`
-	Outcome    *OutcomeEvent `json:"outcome,omitempty"`
+	Schema        string        `json:"schema,omitempty"`
+	Action        string        `json:"action,omitempty"`
+	CorrelationID string        `json:"correlation_id,omitempty"`
+	Query         string        `json:"query"`
+	Bank          string        `json:"bank,omitempty"`
+	Tags          []string      `json:"tags,omitempty"`
+	TagsMatch     string        `json:"tags_match,omitempty"`
+	Path          string        `json:"path,omitempty"`
+	Cluster       string        `json:"cluster,omitempty"`
+	MaxResults    int           `json:"max_results,omitempty"`
+	Outcome       *OutcomeEvent `json:"outcome,omitempty"`
 }
 
 // MemoryQueryResponse is the NATS reply payload returned by the Curator's
@@ -713,7 +717,7 @@ func LoadRecords(repoDir string) ([]Record, error) {
 				continue
 			}
 			seenPaths[rel] = true
-			raw, err := repoRoot.ReadFile(filepath.FromSlash(rel))
+			raw, err := readBoundedFromRoot(repoRoot, filepath.FromSlash(rel))
 			if err != nil {
 				return nil, err
 			}
@@ -791,8 +795,13 @@ func inferExternalDocTypeAndPrefix(fm map[string]any, relPath string) (RecordTyp
 
 // ParseExternalDocRecord normalizes a Markdown ADR, RFC, runbook, or OKF knowledge document into a Record.
 func ParseExternalDocRecord(text, relPath string) Record {
-	if rec, err := ParseRecord(text, relPath); err == nil && len(ValidateRecord(rec)) == 0 {
-		return rec
+	rec, _ := parseExternalDocRecord(text, relPath)
+	return rec
+}
+
+func parseExternalDocRecord(text, relPath string) (rec Record, explicitID bool) {
+	if parsed, err := ParseRecord(text, relPath); err == nil && len(ValidateRecord(parsed)) == 0 {
+		return parsed, true
 	}
 	var fm map[string]any
 	body := strings.TrimSpace(text)
@@ -807,8 +816,9 @@ func ParseExternalDocRecord(text, relPath string) Record {
 	rtype, prefix := inferExternalDocTypeAndPrefix(fm, relPath)
 	recID := ""
 	if fm != nil {
-		if idStr, ok := fm["id"].(string); ok {
+		if idStr, ok := fm["id"].(string); ok && strings.TrimSpace(idStr) != "" {
 			recID = strings.TrimSpace(idStr)
+			explicitID = true
 		}
 	}
 	if recID == "" {
@@ -906,7 +916,85 @@ func ParseExternalDocRecord(text, relPath string) Record {
 		},
 		Body: body,
 		Path: filepath.ToSlash(relPath),
+	}, explicitID
+}
+
+var (
+	reSafeRepoSegment = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
+	reSCPRemote       = regexp.MustCompile(`^(?:[^/@]+@)?([^/:]+):(.+)$`)
+	reHostname        = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$`)
+)
+
+func isSafeRepoSegment(seg string) bool {
+	if seg == "." || seg == ".." || seg == ".git" || strings.HasPrefix(seg, "-") {
+		return false
 	}
+	return reSafeRepoSegment.MatchString(seg)
+}
+
+func trimGitRepoPath(p string) string {
+	p = strings.Trim(p, "/")
+	if strings.HasSuffix(p, ".git") {
+		trimmed := strings.TrimSuffix(p, ".git")
+		if trimmed != "" && !strings.HasSuffix(trimmed, "/") {
+			p = trimmed
+		}
+	}
+	return strings.Trim(p, "/")
+}
+
+// workspaceCloneDirName mirrors agents/platform/scripts/gitops_workspace.py's
+// workspace_path naming: GitHub and bare owner/name map to owner__name, while
+// non-GitHub hosts (including URLs with ports or nested GitLab subgroups) map
+// to <host>%2F<path> without port segments.
+func workspaceCloneDirName(repoURL string) string {
+	text := strings.TrimSpace(repoURL)
+	if text == "" || len(text) > 256 {
+		return ""
+	}
+	var host, rawPath string
+	if strings.Contains(text, "://") {
+		parsed, err := url.Parse(text)
+		if err != nil || parsed.Hostname() == "" {
+			return ""
+		}
+		host = strings.ToLower(parsed.Hostname())
+		rawPath = parsed.Path
+	} else if m := reSCPRemote.FindStringSubmatch(text); len(m) == 3 {
+		host = strings.ToLower(m[1])
+		rawPath = m[2]
+	} else {
+		rawPath = text
+	}
+	rawPath = trimGitRepoPath(rawPath)
+	if host == "" && strings.Contains(rawPath, "/") {
+		first, rest, _ := strings.Cut(rawPath, "/")
+		rest = strings.Trim(rest, "/")
+		firstLower := strings.ToLower(first)
+		if rest != "" && (firstLower == "github.com" || firstLower == "gitlab.com" || firstLower == "bitbucket.org" || reHostname.MatchString(firstLower)) {
+			host = firstLower
+			rawPath = rest
+		}
+	}
+	if rawPath == "" {
+		return ""
+	}
+	segments := strings.Split(rawPath, "/")
+	if len(segments) < 2 {
+		return ""
+	}
+	for _, seg := range segments {
+		if !isSafeRepoSegment(seg) {
+			return ""
+		}
+	}
+	if host == "github.com" || host == "www.github.com" || host == "ssh.github.com" {
+		host = ""
+	}
+	if host != "" {
+		return strings.ReplaceAll(host+"/"+strings.Join(segments, "/"), "/", "%2F")
+	}
+	return strings.Join(segments, "__")
 }
 
 func contextReposStatePath() string {
@@ -917,22 +1005,8 @@ func contextReposStatePath() string {
 }
 
 func contextRepoCloneDirs(repoURL string) []string {
-	u := strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(repoURL), ".git"))
-	u = strings.TrimRight(u, "/")
-	for _, scheme := range []string{"https://", "http://", "ssh://"} {
-		u = strings.TrimPrefix(u, scheme)
-	}
-	if at := strings.Index(u, "@"); at >= 0 {
-		u = u[at+1:]
-	}
-	u = strings.ReplaceAll(u, ":", "/")
-	parts := strings.Split(u, "/")
-	if len(parts) < 3 {
-		return nil
-	}
-	slugParts := parts[1:]
-	dirName := strings.Join(slugParts, "__")
-	if strings.Contains(dirName, "..") || strings.Contains(dirName, "/") {
+	dirName := workspaceCloneDirName(repoURL)
+	if dirName == "" || strings.Contains(dirName, "..") || strings.Contains(dirName, "/") {
 		return nil
 	}
 	agentHome := strings.TrimRight(strings.TrimSpace(os.Getenv("PLATFORM_AGENT_HOME")), "/")
@@ -964,6 +1038,22 @@ func contextRepoCloneDirs(repoURL string) []string {
 	return matches
 }
 
+func readBoundedFromRoot(root *os.Root, rel string) ([]byte, error) {
+	f, err := root.Open(rel)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	raw, err := io.ReadAll(io.LimitReader(f, maxRecordFileBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) > maxRecordFileBytes {
+		return nil, fmt.Errorf("record file %s exceeds %d-byte limit", rel, maxRecordFileBytes)
+	}
+	return raw, nil
+}
+
 func readFileViaRoot(fullPath string) ([]byte, error) {
 	clean := filepath.Clean(fullPath)
 	root, err := os.OpenRoot(filepath.Dir(clean))
@@ -971,7 +1061,7 @@ func readFileViaRoot(fullPath string) ([]byte, error) {
 		return nil, err
 	}
 	defer root.Close()
-	return root.ReadFile(filepath.Base(clean))
+	return readBoundedFromRoot(root, filepath.Base(clean))
 }
 
 func configuredExtraRepos(primaryRepo string, extraRepos []string) []string {
@@ -1047,15 +1137,23 @@ func LoadExternalDocRecords(repoDir string, extraRepos ...string) ([]Record, err
 		}
 	}
 	var out []Record
+	seenFiles := map[string]bool{}
 	for _, root := range roots {
 		if root.prefix != "" {
 			if extraRecs, err := LoadRecords(root.dir); err == nil {
 				for _, r := range extraRecs {
-					if seenIDs[r.Meta.ID] {
+					absFile := filepath.Join(root.dir, filepath.FromSlash(r.Path))
+					if seenFiles[absFile] {
 						continue
 					}
+					seenFiles[absFile] = true
+					rel := filepath.ToSlash(filepath.Join(root.prefix, r.Path))
+					if seenIDs[r.Meta.ID] {
+						sum := sha256.Sum256([]byte(rel))
+						r.Meta.ID = fmt.Sprintf("%s-%s", r.Meta.ID, strings.ToUpper(hex.EncodeToString(sum[:])[:4]))
+					}
 					seenIDs[r.Meta.ID] = true
-					r.Path = filepath.ToSlash(filepath.Join(root.prefix, r.Path))
+					r.Path = rel
 					out = append(out, r)
 				}
 			}
@@ -1078,17 +1176,26 @@ func LoadExternalDocRecords(repoDir string, extraRepos ...string) ([]Record, err
 					continue
 				}
 				innerRel := filepath.ToSlash(filepath.Join(sub, e.Name()))
-				raw, err := rRoot.ReadFile(filepath.FromSlash(innerRel))
+				absFile := filepath.Join(root.dir, filepath.FromSlash(innerRel))
+				if seenFiles[absFile] {
+					continue
+				}
+				raw, err := readBoundedFromRoot(rRoot, filepath.FromSlash(innerRel))
 				if err != nil {
 					continue
 				}
+				seenFiles[absFile] = true
 				rel := innerRel
 				if root.prefix != "" {
 					rel = filepath.ToSlash(filepath.Join(root.prefix, innerRel))
 				}
-				rec := ParseExternalDocRecord(string(raw), rel)
+				rec, explicitID := parseExternalDocRecord(string(raw), rel)
 				if seenIDs[rec.Meta.ID] {
-					continue
+					if explicitID && root.prefix == "" {
+						continue
+					}
+					sum := sha256.Sum256([]byte(rel))
+					rec.Meta.ID = fmt.Sprintf("%s-%s", rec.Meta.ID, strings.ToUpper(hex.EncodeToString(sum[:])[:4]))
 				}
 				seenIDs[rec.Meta.ID] = true
 				out = append(out, rec)

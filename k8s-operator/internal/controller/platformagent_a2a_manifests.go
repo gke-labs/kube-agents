@@ -3098,8 +3098,8 @@ func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 					// whose own fence keeps them to the bus, LiteLLM and
 					// DNS (agentprofile_namespace.go).
 					profileNamespacePeer(agent),
-					// The MCP server, under its flag (a2aMCPNATSPeers).
-				}, append(a2aOperatorNATSPeers(), a2aMCPNATSPeers(agent)...)...),
+					// The MCP server and OKF curator, under their flags.
+				}, append(append(a2aOperatorNATSPeers(), a2aMCPNATSPeers(agent)...), a2aCuratorNATSPeers(agent)...)...),
 			}, {
 				// 9222 from the console server alone. See the doc comment
 				// for why it is the only one.
@@ -6084,6 +6084,9 @@ func (r *PlatformAgentReconciler) reconcileA2ANetworkFences(ctx context.Context,
 	if a2aMCPDoorEnabled() {
 		fences = append(fences, buildA2AMCPNetworkPolicy(agent))
 	}
+	if a2aCuratorEnabled() {
+		fences = append(fences, buildA2ACuratorNetworkPolicy(agent, dnsClusterIPs))
+	}
 	// The gateway's own fence, keyed on the gateway rather than a flag: the
 	// metrics listener binds every interface whenever the pod runs. Here for
 	// the refusal-path rescue, so it is applied over a gateway that exists.
@@ -6365,6 +6368,12 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 			return state, err
 		}
 		state.mcpNotRendered = a2aMCPIdentityUnownedReason
+	}
+
+	// The OKF memory curator, under A2A_CURATOR, after the fences and ahead of
+	// the gateway hold.
+	if err := r.reconcileA2ACurator(ctx, agent, state.busHeld); err != nil {
+		return state, err
 	}
 
 	// The scope publisher: its static objects, its Job on schedule, and the
@@ -7478,6 +7487,9 @@ func (r *PlatformAgentReconciler) a2aPreBusTeardown(agent *agentv1alpha1.Platfor
 		// Its broker identity (reconcileA2AMCPBrokerIdentity), after the
 		// Deployment that names it.
 		{&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPServiceAccountName(agent), Namespace: agent.Namespace}}, r.Client},
+		// The OKF memory curator (reconcileA2ACurator), Deployment before its ServiceAccount.
+		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aCuratorName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: a2aCuratorName(agent), Namespace: agent.Namespace}}, r.Client},
 		// The auth callout, before the bus it authorizes for. Its Deployment
 		// goes first so its deletion is initiated while there is still a server to
 		// answer for; the keys Secret goes with it rather than surviving like
@@ -7627,10 +7639,11 @@ func (r *PlatformAgentReconciler) a2aBusTeardown(agent *agentv1alpha1.PlatformAg
 		// fence ABOVE this entry, not below it.
 		// TestTheSessionFenceIsTheLastFenceTheTeardownDeletes pins that.
 		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aVerifierNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
-		// The MCP fence, late for the console fence's reason below, and just
-		// above it: the console fence stays directly above the session
+		// The MCP and curator fences, late for the console fence's reason below,
+		// and just above it: the console fence stays directly above the session
 		// fence, which stays last.
 		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aCuratorNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
 		// The console fence, as late as it can go for the session fence's
 		// reason: directly above the session fence, which has to stay last.
 		// The window matters more here: until the console pod exits, anything

@@ -136,7 +136,12 @@ func ResolveLLMConfig() LLMConfig {
 		BaseURL: strings.TrimRight(base, "/"),
 		Model:   model,
 		APIKey:  apiKey,
-		Client:  &http.Client{Timeout: defaultLLMTimeout},
+		Client: &http.Client{
+			Timeout: defaultLLMTimeout,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
 	}
 }
 

@@ -126,6 +126,7 @@ NEXT_NON_WORKLOADS = ("agentPod", "storage")
 FLAGGED_LABELS = {
     "mcp": "MCP server",
     "dispatcher": "Profile dispatcher",
+    "curator": "OKF memory curator",
 }
 FLAGGED_WHEN = {
     "true": "With the operator's `{env}=true`",

@@ -12,7 +12,7 @@ import (
 // doors the gateway renders, into its opposite. Tests that want a flag on set it with
 // t.Setenv, which restores this cleared state when they finish.
 func TestMain(m *testing.M) {
-	for _, name := range []string{a2aInjectBackendEnvVar, a2aAgentDoorEnvVar, a2aSessionClusterViewEnvVar, a2aMCPDoorEnvVar, a2aDispatcherImageEnvVar, a2aGatewayElectionEnvVar, a2aBridgeImageEnvVar, a2aBridgeConcurrencyOperatorEnvVar, a2aBridgeExecutorOperatorEnvVar, a2aBridgeResourcesOperatorEnvVar, operatorNamespaceEnvVar, operatorServiceAccountEnvVar} {
+	for _, name := range []string{a2aInjectBackendEnvVar, a2aAgentDoorEnvVar, a2aSessionClusterViewEnvVar, a2aMCPDoorEnvVar, a2aDispatcherImageEnvVar, a2aCuratorEnvVar, a2aGatewayElectionEnvVar, a2aBridgeImageEnvVar, a2aBridgeConcurrencyOperatorEnvVar, a2aBridgeExecutorOperatorEnvVar, a2aBridgeResourcesOperatorEnvVar, operatorNamespaceEnvVar, operatorServiceAccountEnvVar} {
 		_ = os.Unsetenv(name)
 	}
 	os.Exit(m.Run())
