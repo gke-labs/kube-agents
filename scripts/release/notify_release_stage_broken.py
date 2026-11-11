@@ -414,8 +414,9 @@ NIGHT_LENGTH = len("2026-11-04")
 COMMIT_URL = "https://github.com/{repo}/commit/{sha}"
 ISSUE_URL = "https://github.com/{repo}/issues/{number}"
 # What `poll_rc_eval_verdict.py` prints into the step-5 log once it has a
-# settled RED: the Prow build id and its Spyglass link. An empty build id
-# prints no link, and reads as unavailable.
+# settled RED: the Prow build id and its build link (Spyglass, or the
+# Console's bucket browser for a build in a private bucket). An empty build
+# id prints no link, and reads as unavailable.
 # The pattern is built from the poller's own format, so a change to the line
 # there changes what is read here.
 _LINE_FIELD = "FIELDPLACEHOLDER"
@@ -794,7 +795,8 @@ def stall_stamp_entries(body: str | None) -> list:
 
 
 def extract_red_verdict_build(log_text: str) -> tuple | None:
-    """`(build id, Spyglass link)` from the poller's settled-RED line, or None."""
+    """`(build id, build link)` from the poller's settled-RED line, or None;
+    the link is Spyglass or the Console's bucket browser, as the poller chose."""
     for raw in log_text.splitlines():
         match = _RED_VERDICT_LINE_RE.match(clean_log_line(raw).strip())
         if match:
