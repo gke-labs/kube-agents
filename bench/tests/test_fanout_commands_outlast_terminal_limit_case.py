@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Unit tests for fanout-poll-outlasts-terminal-limit's verification checks."""
+"""Unit tests for fanout-commands-outlast-terminal-limit's verification checks."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ from devops_bench.verification.spec import VerificationEntry
 
 from kube_agents_bench import transcript
 
-CASE_ID = "fanout-poll-outlasts-terminal-limit"
+CASE_ID = "fanout-commands-outlast-terminal-limit"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 TASK = REPO_ROOT / "bench" / "tasks" / CASE_ID / "task.yaml"
 
@@ -38,7 +38,6 @@ CLUSTER_B = "cluster-example-project-seeded-b-us-central1-b"
 # What the terminal tool returns, as the trajectory stores it.
 CUT = '{"output": "[Command timed out after 60s]", "exit_code": 124, "error": null}'
 SLEPT = '{"output": "", "exit_code": 0, "error": null}'
-CARD_JSON = '{"task": {"id": "t_a", "status": "running"}}'
 PODS = '{"output": "14", "exit_code": 0, "error": null}'
 
 ANSWER = "seeded-a: 14 pods running in kube-system\nseeded-b: 12 pods running in kube-system"
@@ -69,7 +68,8 @@ def _status(name: str, calls: list[dict[str, Any]], output: str = ANSWER) -> str
         final_message=output,
         worker_commands=[{"task": c["task"], "command": c["args"]["command"]} for c in calls],
         worker_capture_gaps=[],
-        worker_card_parents={"card-a": "card-platform", "card-b": "card-platform"},
+        # No card edges, as on an inject record: the check must not need them.
+        worker_card_parents={},
     )
     try:
         return VerifierAgent().run_entry(_entry(name), timeout_sec=5.0).status
@@ -79,7 +79,6 @@ def _status(name: str, calls: list[dict[str, Any]], output: str = ANSWER) -> str
 
 def _fanout(poll_result: str, cluster_result: str = PODS) -> list[dict[str, Any]]:
     return [
-        _call("card-platform", 1.0, "python3 -c 'print(1)'", CARD_JSON),
         _call("card-a", 5.0, "kubectl get pods -n kube-system --no-headers | wc -l", cluster_result, agent=CLUSTER_A),
         _call("card-b", 6.0, "kubectl get pods -n kube-system --no-headers | wc -l", PODS, agent=CLUSTER_B),
         _call("card-platform", 10.0, "sleep 60", poll_result),
@@ -99,6 +98,24 @@ def test_a_cluster_agent_command_cut_at_60s_fails():
     calls = _fanout(SLEPT)
     calls.insert(2, _call("card-a", 5.5, "python3 /opt/data/scripts/workload_triage.py", CUT, agent=CLUSTER_A))
     assert _status(NOT_CUT, calls) == "fail"
+
+
+def test_a_cut_on_the_platform_workers_first_and_only_call_fails():
+    # The platform worker's first graded call is its first polling sleep; one
+    # round, so nothing follows it.
+    calls = [c for c in _fanout(SLEPT) if c["task"] != "card-platform"]
+    calls.append(_call("card-platform", 10.0, "sleep 60", CUT))
+    assert _status(NOT_CUT, calls) == "fail"
+
+
+def test_a_cut_on_a_cluster_agents_first_call_fails():
+    calls = _fanout(SLEPT)
+    calls.insert(0, _call("card-a", 2.0, "bash /opt/data/scripts/cluster_preflight.sh --json", CUT, agent=CLUSTER_A))
+    assert _status(NOT_CUT, calls) == "fail"
+
+
+def test_a_run_with_no_worker_call_is_an_error_not_a_pass():
+    assert _status(NOT_CUT, []) == "error"
 
 
 def test_a_cut_at_another_limit_is_not_the_defect():

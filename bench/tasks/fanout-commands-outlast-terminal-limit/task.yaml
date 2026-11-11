@@ -22,17 +22,16 @@
 # runs on a dev install) is not the defect, and requiring one made the case
 # fail it.
 #
-# Limits: the window opens at each lineage's first call with a non-empty
-# result, so a cut on that first call is not read (no recorded worker opens
-# with a sleep). On an inject record the capture carries no card edges, so
-# every Cluster Agent card is a lineage of its own and its first call, the
-# preflight, is not graded there: a preflight cut at 60 s fails the case on
-# the api lane only; only terminal and execute_code calls are visible; a result
-# clipped in the pod before the timeout text is not read.
+# The check reads every tagged worker call, so the first call of each card
+# (a Cluster Agent's preflight, the platform worker's first sleep) is graded
+# like the rest, on the api and inject lanes alike. A run with no tagged
+# worker call is an error, never a pass. Limits: only terminal and
+# execute_code calls are graded; a result clipped in the pod before the
+# timeout text is not read.
 #
 # Domain: chat-and-routing. Isolation class: read-only. Eligible tier:
 # nightly.
-id: fanout-poll-outlasts-terminal-limit
+id: fanout-commands-outlast-terminal-limit
 name: A fan-out's polling sleep and worker commands are not cut at a 60 s terminal limit
 prompt: >-
   Ask the Cluster Agent on each cluster in the fleet how many pods are
@@ -60,14 +59,14 @@ verification_spec:
     # assert, not converge: the transcript is immutable once the run ends.
     mode: assert
     check:
-      type: worker_commands
-      # Any non-empty result opens the window, so every later call in the
-      # lineage is graded.
-      after_result_pattern: '\S'
-      # Hermes' wording for a call that hit its limit
-      # (tools/environments/base.py), at the seeded 60 s.
-      forbidden_result_patterns:
-        - "Command timed out after 60s"
+      type: none
+      checks:
+        # Hermes' wording for a call that hit its limit
+        # (tools/environments/base.py), at the seeded 60 s.
+        - type: tool_called
+          scope: workers
+          tool_names: ["terminal", "execute_code"]
+          result: "Command timed out after 60s"
   - name: the-answer-gives-the-counts
     role: objective
     mode: assert

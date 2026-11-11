@@ -1098,9 +1098,8 @@
 # A fan-out's polling sleep and every worker command finish inside the terminal
 # limit rather than being cut at the 60 s Hermes' seeded .env set (#5423).
 # Worker-scope check, so it grades on the api lanes and on an inject record
-# that carries the workers' calls (where each Cluster Agent's first call, the
-# preflight, goes ungraded); no fixture.
-./tasks/fanout-poll-outlasts-terminal-limit/task.yaml
+# that carries the workers' calls; no fixture.
+./tasks/fanout-commands-outlast-terminal-limit/task.yaml
 
 # The findings queue's item-wide decision when a sweep has added a finding to
 # the line since the nudge named it: the named rows are dismissed, the row no
