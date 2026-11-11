@@ -175,6 +175,7 @@ from devops_bench.agents import AgentConfig, AgentHarness, AgentResult
 from devops_bench.agents.result import empty_tokens
 
 from kube_agents_bench import inject_transport as inject
+from kube_agents_bench import slack_transport as slack
 from kube_agents_bench import board, card_wake, chat_shape, gitops, pushed_report, stop_hook, transcript, worker_trajectory
 from kube_agents_bench.gateway_silence import is_intentional_silence_response
 from kube_agents_bench.parsing import (
@@ -227,7 +228,13 @@ SKIP_REPORT_ONLY_JUDGES_ENV = "KUBE_AGENTS_SKIP_REPORT_ONLY_JUDGES"
 # stack the mode renders.
 TRANSPORT_API = "api"
 TRANSPORT_INJECT = "inject"
-_TRANSPORTS = frozenset({TRANSPORT_API, TRANSPORT_INJECT})
+# ``slack`` goes the way a person does: a test user's post in a CI channel, the
+# reply read back from the thread (slack_transport.py). Advisory, for the Slack
+# lane only (hack/eval/slack-lane.sh).
+TRANSPORT_SLACK = "slack"
+_TRANSPORTS = frozenset({TRANSPORT_API, TRANSPORT_INJECT, TRANSPORT_SLACK})
+# The Slack transport's whole-turn budget when AGENT_SLACK_TIMEOUT is unset.
+_SLACK_DEFAULT_TIMEOUT = "600"
 
 # Board management tools that do not count as substantive worker action or final answer generation.
 _BOARD_NON_ACTION_TOOLS = frozenset({
@@ -2830,6 +2837,54 @@ def _inject_result(exchange: inject.Exchange, identity: dict[str, Any]) -> Agent
     )
 
 
+def _execute_slack(prompt: str) -> AgentResult:
+    """The Slack transport: one ask as the test user, graded on the thread's last bot message.
+
+    Missing configuration is infrastructure, never graded, so the lane script's
+    skip and a half-configured run cannot read as the agent's failure. The
+    opening turn's seconds are post to answer, as Slack's timestamps show them.
+    """
+    missing = [name for name in slack.REQUIRED_ENV if not os.environ.get(name)]
+    if missing:
+        return _infra_failure(f"slack transport not configured: {', '.join(missing)} unset")
+    token = os.environ[slack.USER_TOKEN_ENV]
+    if not token.startswith(slack.USER_TOKEN_PREFIX):
+        return _infra_failure(f"{slack.USER_TOKEN_ENV} is not a user token")
+    try:
+        timeout = _numeric_env("AGENT_SLACK_TIMEOUT", _SLACK_DEFAULT_TIMEOUT, float)
+    except ValueError as exc:
+        return AgentResult.errored(str(exc))
+    turn = slack.SlackTurn(slack.SlackClient(token), os.environ[slack.CHANNEL_ENV], os.environ[slack.BOT_USER_ENV])
+    try:
+        exchange = turn.run(prompt, timeout)
+    except (slack.SlackAPIError, OSError) as exc:
+        return _infra_failure(f"slack: {exc}")
+    timing = exchange.timing()
+    slack.write_timing(timing)
+    if timing["slack_post_to_answer_s"] is not None:
+        _write_turn_timing(timing["slack_post_to_answer_s"])
+    if exchange.outcome == "no_reply":
+        return _infra_failure(f"slack: no bot reply in the thread within {timeout:g}s")
+    errors = [] if exchange.outcome == "settled" else [f"slack: the turn had not settled by {timeout:g}s"]
+    return AgentResult(
+        output=exchange.deliverable,
+        trajectory=[],
+        tokens={},
+        errors=errors,
+        metadata={
+            "transport": TRANSPORT_SLACK,
+            "final_message": exchange.deliverable,
+            "outcome": exchange.outcome,
+            "window_posts": len(exchange.posts),
+            "slack_ask_ts": exchange.ask_ts,
+            "slack_reaction": exchange.reaction or None,
+            "slack_buttons": exchange.buttons,
+            "slack_transient_errors": len(exchange.errors),
+            **timing,
+        },
+    )
+
+
 class _DelegationTransportExhausted(Exception):
     """The delegation wait lost its transport on every status-turn retry.
 
@@ -2960,6 +3015,8 @@ class KubeAgentsHarness(AgentHarness):
             result = self._execute_inject(prompt)
             _fold_worker_total(result.tokens)
             return result
+        if transport == TRANSPORT_SLACK:
+            return _execute_slack(prompt)
         if stop_hook.is_stopped_ask(prompt):
             return AgentResult.errored(
                 f"a stopped ask ({stop_hook.STOP_DIRECTIVE} or {stop_hook.MID_TURN_DIRECTIVE}) "

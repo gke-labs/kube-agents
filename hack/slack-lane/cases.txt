@@ -1,0 +1,19 @@
+# The Slack lane's cases (hack/slack-lane/run.sh): nightly cases the lane runs
+# again through real Slack (AGENT_TRANSPORT=slack) to time Slack's legs and see
+# the answer as a person sees it. Advisory: the lane gates nothing, and each case
+# keeps its own nightly record on inject. Kept small so one serial run fits a
+# nightly part; the whole chat and routing set is a weekly option for later.
+#
+# One case id per line; blank lines and # comments are ignored.
+
+# The answer's voice: the opening line, a quoted command, the ack.
+chat-voice-answer-first
+chat-voice-ack-names-target
+chat-voice-absent-answer-quotes-no-command
+chat-voice-capabilities-names-cluster-agents
+
+# A fleet-wide question, routed and answered with rows.
+chat-routing-fleet-question
+
+# A question that ends in choice buttons.
+chat-question-asked-to-choose-pauses
