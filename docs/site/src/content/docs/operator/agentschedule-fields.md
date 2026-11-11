@@ -38,6 +38,7 @@ Every field of the `AgentSchedule` resource's `spec` and `status`, generated fro
 | `observedGeneration` | `integer` | no |  |  | ObservedGeneration is the .metadata.generation last reconciled. |
 | `lastScheduleTime` | `metav1.Time` | no |  |  | LastScheduleTime is the last slot that was run. |
 | `nextScheduleTime` | `metav1.Time` | no |  |  | NextScheduleTime is the next slot due. |
+| `schedule` | `string` | no |  |  | Schedule is the cron expression NextScheduleTime was computed from. A spec.schedule that differs moves the next slot to the new schedule's. |
 | `pendingSlot` | `object` | no |  |  | PendingSlot is a claimed run not yet accepted by the gateway. |
 | `pendingSlot.slotTime` | `metav1.Time` | yes |  |  | SlotTime is the slot being run (now, for a run-now). |
 | `pendingSlot.idempotencyKey` | `string` | yes |  |  | IdempotencyKey identifies this run to the gateway. |

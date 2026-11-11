@@ -333,6 +333,11 @@ spec:
                     type: object
                   maxItems: 10
                   type: array
+                schedule:
+                  description: |-
+                    Schedule is the cron expression NextScheduleTime was computed from. A
+                    spec.schedule that differs moves the next slot to the new schedule's.
+                  type: string
                 skipCounts:
                   description: SkipCounts counts slots that did not run.
                   properties:

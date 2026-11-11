@@ -218,6 +218,10 @@ type AgentScheduleStatus struct {
 	// NextScheduleTime is the next slot due.
 	// +optional
 	NextScheduleTime *metav1.Time `json:"nextScheduleTime,omitempty"`
+	// Schedule is the cron expression NextScheduleTime was computed from. A
+	// spec.schedule that differs moves the next slot to the new schedule's.
+	// +optional
+	Schedule string `json:"schedule,omitempty"`
 	// PendingSlot is a claimed run not yet accepted by the gateway.
 	// +optional
 	PendingSlot *AgentSchedulePendingSlot `json:"pendingSlot,omitempty"`

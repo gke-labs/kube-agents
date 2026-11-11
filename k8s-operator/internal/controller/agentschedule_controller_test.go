@@ -627,3 +627,59 @@ func TestAgentScheduleSchemaEnvtest(t *testing.T) {
 		}
 	}
 }
+
+// A schedule edited while not accepted takes its new cadence once accepted;
+// an edit to anything but the schedule keeps a due slot.
+func TestAgentScheduleTheResetFollowsTheExpressionNotTheGeneration(t *testing.T) {
+	f := newScheduleFixture(t, func(s *agentv1alpha1.AgentSchedule) { s.Spec.Schedule = "0 0 1 1 *" })
+	f.at(t, hourAt(0, 45))
+	var p agentv1alpha1.AgentProfile
+	key := types.NamespacedName{Namespace: "kubeagents-system", Name: "fleet-audit"}
+	if err := f.c.Get(context.Background(), key, &p); err != nil {
+		t.Fatal(err)
+	}
+	p.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead}
+	if err := f.c.Update(context.Background(), &p); err != nil {
+		t.Fatal(err)
+	}
+	s := f.get(t)
+	s.Spec.Schedule, s.Generation = "*/5 * * * *", 2
+	if err := f.c.Update(context.Background(), s); err != nil {
+		t.Fatal(err)
+	}
+	f.at(t, hourAt(0, 46)) // not accepted: the profile disallows unattended
+	if err := f.c.Get(context.Background(), key, &p); err != nil {
+		t.Fatal(err)
+	}
+	p.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead, agentv1alpha1.AgentProfileTierUnattended}
+	if err := f.c.Update(context.Background(), &p); err != nil {
+		t.Fatal(err)
+	}
+	f.at(t, hourAt(0, 47))
+	if got := f.get(t).Status.NextScheduleTime.UTC(); !got.Equal(hourAt(0, 50)) {
+		t.Fatalf("next after an edit made while not accepted = %s, want 00:50", got)
+	}
+
+	g := newScheduleFixture(t, nil)
+	g.at(t, hourAt(0, 45))
+	gs := g.get(t)
+	gs.Spec.Prompt, gs.Generation = "A different prompt.", 2
+	if err := g.c.Update(context.Background(), gs); err != nil {
+		t.Fatal(err)
+	}
+	g.at(t, hourAt(1, 5))
+	if st := g.get(t).Status; len(g.gw.sends) != 1 || !st.LastScheduleTime.UTC().Equal(hourAt(1, 0)) {
+		t.Fatalf("a prompt edit dropped the due 01:00 slot: sends = %v, status = %+v", g.gw.sends, st)
+	}
+}
+
+// A pass that changes nothing writes nothing.
+func TestAgentScheduleAnUnchangedPassWritesNoStatus(t *testing.T) {
+	f := newScheduleFixture(t, nil)
+	f.at(t, hourAt(0, 45))
+	before := f.get(t).ResourceVersion
+	f.at(t, hourAt(0, 46))
+	if after := f.get(t).ResourceVersion; after != before {
+		t.Fatalf("an idle pass wrote status: resourceVersion %s -> %s", before, after)
+	}
+}
