@@ -499,8 +499,8 @@ def _tofu(args, runner, deadline, ok=(0,), env=None, stdout_in_errors=True):
     if result.returncode not in ok:
         # `stdout_in_errors=False` for a command whose output holds secrets
         # (`tofu show -json` of a state): its stdout never reaches a message.
-        detail = result.stderr or (result.stdout if stdout_in_errors else "")
-        raise ReconcileError("tofu %s exited %d: %s" % (args[0], result.returncode, _tail(detail) or REASON_NO_STDERR))
+        detail = (result.stderr or (result.stdout if stdout_in_errors else "")).strip()
+        raise ReconcileError("tofu %s exited %d: %s" % (args[0], result.returncode, _tail(detail) if detail else REASON_NO_STDERR))
     return result
 
 

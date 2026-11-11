@@ -2150,7 +2150,24 @@ class FixtureRefreshTest(unittest.TestCase):
         self.assertNotIn("hunter2", outcomes[P7][1])
         self.assertNotIn("hunter2", json.dumps(run.extras[P7]))
         self.assertIn("startup-fail VM not reset", outcomes[P7][1])
+        self.assertIn(reconcile.REASON_NO_STDERR, outcomes[P7][1])
         self.assertEqual(calls, [])
+
+    def test_the_reset_address_is_a_single_instance_in_the_stack(self):
+        """A renamed resource, or one made a list, would leave every state
+        read with no instance at the address, and every reset skipped."""
+        kind, name = reconcile.STARTUP_FAIL_ADDRESS.split(".")
+        header = re.compile(r'^resource\s+"%s"\s+"%s"\s*\{' % (re.escape(kind), re.escape(name)), re.M)
+        found = []
+        for path in sorted(pathlib.Path(reconcile.FLEET_DIR).glob("*.tf")):
+            text = path.read_text(encoding="utf-8")
+            for match in header.finditer(text):
+                # The block's top-level body, up to the closing brace at
+                # column 0.
+                body = text[match.end():].split("\n}", 1)[0]
+                found.append(body)
+        self.assertEqual(len(found), 1, found)
+        self.assertNotRegex(found[0], r"(?m)^\s*(count|for_each)\s*=")
 
     def test_a_state_read_that_times_out_or_cannot_start_is_a_warning(self):
         for failure in (subprocess.TimeoutExpired(["tofu", "show"], 5), OSError("tofu: not found")):

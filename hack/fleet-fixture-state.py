@@ -44,9 +44,9 @@ as JSON beside the summary so the scan need not parse the warnings. And
 `hack/ci-eval-pr.sh` runs it with `--report` against its leased project,
 where `bench/kube_agents_bench/fixture_drift.py` turns each `drifted` role
 into a `fixture-drift:<role>` infrastructure record for the cases that need
-it. Detection is this script's whole job -- nothing here acts on a drift, and
-nothing anywhere repairs one, except a `serial_contains` drift, which the next
-reconcile's reset of the VM repairs (hack/fleet_reconcile.py).
+it. Detection is this script's whole job: it repairs nothing. The reconcile's
+re-apply (hack/fleet_reconcile.py) repairs drift, and only the reconcile's
+reset of the VM repairs a rotated serial console (`serial_contains`).
 `--wait` is for a fixture that has just been rescheduled -- the crashloop needs
 its first restart before OOMKilled evidence exists -- and keeps re-reading a
 role that is positively out of shape until it converges or the deadline
