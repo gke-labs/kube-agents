@@ -57,7 +57,7 @@ Each section adds technical depth so readers can stop as soon as they have the l
 | [Background](#background)         | Platform engineers evaluating `kube-agents`            | Why fleet agents need both conversational and GitOps decision memory, and why Hindsight was selected for self-hosting    |
 | [The decision](#the-decision)     | Architects and tech leads                              | Why retrieval replaces full-file prompt injection, and why architectural decisions belong in Git with verbatim indexing  |
 | [The design](#the-design)         | Implementers and AI agents                             | Scoping, identity propagation, the 4 session states, OKF decision/lesson schemas, guard checks, and nightly `dream` jobs |
-| [The experiment](#the-experiment) | Evaluators and operators                               | Benchmarks on a 1,664-record corpus and a 500-cluster GitOps repository across 10 real-world outage scenarios            |
+| [The experiment](#the-experiment) | Evaluators and operators                               | Benchmarks on a 1,664-record corpus and a 500-cluster GitOps repository across 10 synthetic outage scenarios             |
 
 ---
 
@@ -100,7 +100,7 @@ The table below summarizes what each capability targets alongside observations f
 
 A common question from engineering teams is: _"All of our commits and pull requests are already in Git and GitHub/GitLab—why not have the agent run `git log` and search pull requests live whenever it makes a change?"_
 
-We tested this directly on a 500-cluster GitOps repository across 10 real-world outage scenarios (see [Part 2 of The experiment](#part-2--decision-memory-evaluation-on-10-real-world-kubernetes-outage-scenarios)). Pre-analyzing history into structured decision memory outperforms live per-request repository scanning across accuracy, token cost, and speed:
+We tested this directly on a 500-cluster GitOps repository across 10 synthetic outage scenarios (see [Part 2 of The experiment](#part-2--decision-memory-evaluation-on-10-synthetic-kubernetes-outage-scenarios)). Pre-analyzing history into structured decision memory outperforms live per-request repository scanning across accuracy, token cost, and speed:
 
 | Dimension                  | Scan Git and pull requests live on every task                                                                                                                                                                                            | Store decisions and lessons in long-term memory                                                                                                                                                                                                                                             | Measured advantage of decision memory                                                                                   |
 | -------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
@@ -456,7 +456,7 @@ flowchart TB
     O["Verified or Rejected PR Outcomes\n(resolved-merged | modified-merged | refused | persists)"]
     H["Day-0 Bootstrap (--since 2y)\n(Commits, Merged & Closed PRs -> severity: warn)"]
   end
-  Cur["Credential-Free Go Curator Pod (a2a/cmd/curator)\n1-Shot LLM OKF Synthesis & PR Lifecycle"]
+  Cur["Credential-Free Go Curator Pod (a2a/cmd/curator)\n1-Shot LLM OKF Synthesis & Lifecycle State Indexing"]
   subgraph Stores["2. Synchronized Layer 2 Stores"]
     Git["GitOps Repo: knowledge/decision/*.md\n& knowledge/lesson/*.md (active | superseded | retired)"]
     HD["Hindsight DB: kube-agents-decisions\nVerbatim Chunks (proposed | active | rejected | superseded | retired)"]
@@ -706,7 +706,7 @@ Every Layer 2 proposal—whether synthesized from a post-merge remediation outco
 
 Whenever `knowledge/` changes on the default branch (or during Phase 1 of the nightly `dream`), out-of-sandbox `curator index` syncs Git-backed Markdown files into the `kube-agents-decisions` Hindsight bank:
 
-- **One document per record (preserving unmerged lifecycle states)**: Retains each Git file individually with `document_id = okf:<repo>:<id>` and `update_mode: replace`, and prunes only removed `status:active` / `status:superseded` Git records so pending `status:proposed` and closed `status:rejected` records are never wiped during reconciliation.
+- **One document per record (preserving unmerged lifecycle states)**: Retains each Git file individually with `document_id = okf:<repo>:<id>` and `update_mode: replace`, and prunes only removed `status:active` / `status:superseded` / `status:retired` Git records so pending `status:proposed` and closed `status:rejected` records are never wiped during reconciliation.
 - **Verbatim chunks (`enable_observations: false`)**: Configures `retain_extraction_mode: chunks` on the `kube-agents-decisions` bank so Hindsight embeds the exact Markdown and YAML frontmatter without LLM paraphrasing or ID stripping.
 - **Structured tags**: Tags each document with `scope:shared`, `kind:<decision|lesson|runbook|cluster-blueprint|tenancy-model|metric-definition|escalation|observation>`, `status:<status>`, `id:<id>`, `cluster:<cluster>`, and `check:<check>`.
 - **Generalized OKF and read-only knowledge repository ingestion**: In addition to `knowledge/decision/*.md` (`DEC-*`) and `knowledge/lesson/*.md` (`LES-*`), `LoadExternalDocRecords` (`curator index`) ingests all standard OKF record types defined in [Architecture 06 §5](../architecture/06-api-and-data-contracts.md#5-okf-knowledge-contract) (`knowledge/runbook/*.md` [`RUN-*`], `knowledge/cluster-blueprint/*.md` [`BP-*`], `knowledge/tenancy-model/*.md` [`TEN-*`], `knowledge/metric-definition/*.md` [`MET-*`], `knowledge/escalation/*.md` [`ESC-*`], `knowledge/observation/*.md` [`OBS-*`], plus plural `<type>s/` aliases on existing repositories) as well as Markdown ADRs (`docs/adr/*.md`, `ADR-*`), RFCs (`docs/rfcs/*.md`, `RFC-*`), and runbooks (`docs/runbooks/*.md`, `docs/playbooks/*.md`) from both the primary GitOps repository and any configured read-only (`role: context`) repositories in the `context_repos` key of `$GITOPS_STATE_CONFIGMAP` (`<agent-name>-gitops-state`, read via `gitops_workspace.py`, or `DECISION_MEMORY_EXTRA_REPOS`). Every record is retained as a verbatim chunk (`document_id = okf:<repo>:<id>`), preserving document identifiers and headings for citation without requiring manual pod seeding or write permissions.
@@ -862,7 +862,7 @@ To mirror real organizational history, six policies exist in three dated version
 
 ---
 
-### Part 2 — Decision memory evaluation on 10 real-world Kubernetes outage scenarios
+### Part 2 — Decision memory evaluation on 10 synthetic Kubernetes outage scenarios
 
 #### Methodology
 
