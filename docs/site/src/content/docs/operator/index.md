@@ -13,7 +13,7 @@ Source: [`k8s-operator/`](https://github.com/gke-labs/kube-agents/tree/main/k8s-
 
 ```text
 k8s-operator/
-├── api/v1alpha1/           # PlatformAgent type definitions (Kubebuilder)
+├── api/v1alpha1/           # CRD type definitions (Kubebuilder)
 ├── cmd/                    # manager entrypoint
 ├── config/                 # Kustomize base for the operator + integrations
 ├── internal/               # controller reconciler + admission webhook logic
@@ -29,6 +29,7 @@ Custom resources in the `kubeagents.x-k8s.io/v1alpha1` API group:
 - **`PlatformAgent`** — declares a Platform Agent instance, container image, service account, chat integrations, and harness toggles.
 - **`AgentPlugin`** — declares OCI plugin extensions, secret environment variables, and allowed configuration overrides targeted to a `PlatformAgent`. The repository ships the Pub/Sub alert adapter and the GKE stockout investigator: [Shipped plugins](/kube-agents/operator/agentplugin-crd/#shipped-plugins).
 - **`AgentProfile`** — under `spec.mode: next` only, declares one kind of A2A agent pod; the operator renders its ServiceAccount, bus identity and agent card. See [AgentProfile CRD](/kube-agents/operator/agentprofile-crd/).
+- **`Tier`** — names what a task may do at a tier. The operator only reports it `Accepted`; nothing enforces it yet. See [Tier CRD](/kube-agents/operator/tier-crd/).
 
 The controller reconciles a `PlatformAgent` into:
 

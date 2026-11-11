@@ -1329,9 +1329,8 @@ though note that if a namespace ResourceQuota restricts that compute resource (s
 declare it (or a `LimitRange` to default it), and will reject the pod if omitted.
 The credential broker's exec tier is counted as `platformAgent.deployment.credentialProxy.exec.replicas`
 times one replica's footprint (`operatorRenderedPerReplica.credentialProxyExecTier`), and not at
-all at `0`. An ephemeral-storage key in `platformAgent.deployment.credentialProxy.resources`
-moves each replica too, because the operator gives the tier the broker's other resource keys; its
-cpu and memory are fixed. It needs no surge headroom: it rolls with `maxSurge: 0` and `maxUnavailable: 1`, so a
+all at `0`. Its cpu, memory and ephemeral storage are fixed: a key in
+`platformAgent.deployment.credentialProxy.resources` moves the stateful broker, not the tier. It needs no surge headroom: it rolls with `maxSurge: 0` and `maxUnavailable: 1`, so a
 rollout replaces a pod in place and adds none. The check counts the
 quota only; whether a node has room for each 2 CPU replica is the scheduler's.
 The two data claims are counted at `platformAgent.storage.size` when it is set: footprint.yaml

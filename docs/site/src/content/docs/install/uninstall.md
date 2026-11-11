@@ -88,7 +88,7 @@ A cluster the install created is deleted with everything in it. On a cluster it 
 
 ```bash
 kubectl delete namespace kubeagents-system
-kubectl delete crd platformagents.kubeagents.x-k8s.io agentplugins.kubeagents.x-k8s.io agentprofiles.kubeagents.x-k8s.io
+kubectl delete crd platformagents.kubeagents.x-k8s.io agentplugins.kubeagents.x-k8s.io agentprofiles.kubeagents.x-k8s.io tiers.kubeagents.x-k8s.io
 ```
 
 To keep the namespace and remove only the GitLab Secrets, use this command. It reads the Secret names and the namespace from the install's `install.env`, the same way the installer reads that file:
