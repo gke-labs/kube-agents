@@ -1037,6 +1037,13 @@
 # one front-door turn with no card: +3 units.
 ./tasks/chat-voice-capabilities-names-cluster-agents/task.yaml
 
+# An answer the front door draws from a card that already finished names the
+# count and when it was taken, never the card's id: a task id is plumbing
+# outside a board read (.agents/rules/chat_ux.md, "No plumbing in user text").
+# deployer: noop, read-only, one front-door turn, with a card round trip when
+# the board holds no earlier count.
+./tasks/chat-voice-reused-answer-no-card-id/task.yaml
+
 # An Autopilot compute-optimization audit recognizes gke-system-balloon-pod as
 # normal GKE Autopilot scheduling headroom without per-pod kubectl inspection or
 # documentation/web search loops (#3141). deployer: noop, read-only, no fixture,

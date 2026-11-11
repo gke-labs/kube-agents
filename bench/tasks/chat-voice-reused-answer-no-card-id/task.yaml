@@ -1,0 +1,112 @@
+# Registered in hack/eval/nightly-cases.txt. Not on the blocking roster: a
+# presubmit seat is a later pull request that cites this case's nightly record.
+#
+# Domain: chat and routing. What it grades is the voice of an answer the front
+# door draws from a card that already finished. The user asks how many GKE
+# clusters are running and says a count from earlier today will do; the front
+# door reads the board for that count (agents/chat/SOUL.md §1.5, "answer from
+# the card's result") or files a fresh card for `platform` (§3). Either way the
+# answer the user reads names the count, and when an earlier card's result is
+# what it reports, it says when that count was taken and which specialist took
+# it, and never the card's id: a task id is plumbing under
+# .agents/rules/chat_ux.md, "No plumbing in user text", whose one exception is
+# a board read, where the user asked about their tasks and may name a card
+# back. On the gkedemos install the front door answered "How many clusters do
+# you have?" from a card an hour old with "*platform reported 209 running GKE
+# clusters across the 42 GCP projects in scope on card t_7bd8e9a5.*", and the
+# fix is the wording rule in agents/chat/SOUL.md §2 ("The thread carries
+# attribution") and §1.5.
+#
+# The other chat-voice-* cases grade a fresh card's ack or result;
+# chat-routing-board-read grades the board read itself, where the ids belong.
+# None of them reaches an answer drawn from an earlier card.
+#
+# The prompt sends the front door to the board for the count: a bench session
+# starts with no thread history, so the earlier card the leak drew on has to
+# be read back rather than remembered, and a softer prompt ("a count from
+# earlier today is fine if you already have one") had main's front door file
+# a fresh card and never look. The question is still the count, not the
+# board: the user names the board as where the count may be, and the answer
+# is about clusters, so the board-read exception does not apply. On an
+# install whose board holds such a card (gkedemos ran several count cards the
+# day the leak was seen) the reuse path is the one taken and the id check is
+# the deciding one; on a board with no such card the front door files a fresh
+# card, and the same checks hold the answer that comes back. The case is not
+# vacuous on that path: the harness folds each delivered card's result under
+# its own "Result of delegated task t_…:" header, and only that header may
+# carry an id.
+#
+# The id pattern is hermes' card id shape, "t_" + 8 hex
+# (bench/kube_agents_bench/parsing.py, _TASK_ID_RE's comment). The surface the
+# patterns run over is the final message lowercased with `*`, `_` and backticks
+# dropped and line breaks kept (bench/kube_agents_bench/verifiers.py,
+# pattern_surface), so `t_7bd8e9a5` reads `t7bd8e9a5` there and the pattern
+# makes the underscore optional. The harness's own header lines are excluded by
+# a negative lookahead at the start of each line (harness.py, _RESULT_SECTION,
+# _QUESTION_SECTION and the artifact header), so a run that files a card is
+# graded on the agent's words alone.
+# bench/tests/test_chat_voice_reused_answer_patterns.py pins the patterns
+# against that surface and those headers.
+#
+# Planted defect required: none. Isolation class: read-only. deployer: noop,
+# one front-door turn, with a card round trip when the board holds no earlier
+# count. No safeguard of its own: the ask reads the fleet, and both lanes
+# append the GitHub-write safeguard.
+id: chat-voice-reused-answer-no-card-id
+name: An answer drawn from an earlier card names the count and when it was taken, not the card id
+prompt: >-
+  How many GKE clusters are running across all the projects in scope? Check
+  the board first: if a count from earlier today is already there, use it
+  instead of starting a new one.
+expected_output: >-
+  The answer gives the number of running GKE clusters as a sentence a person
+  can read on a phone. When it comes from a card that finished earlier, it
+  says which specialist counted and when (a time, or how long ago), and it
+  carries no card or task id. When the front door files a fresh card instead,
+  the ack names what is being checked and the card's result gives the count;
+  neither carries an id in the agent's own words.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml: the front door's reply to a routed ask.
+domain: chat-and-routing
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: bradhoekstra
+
+verification_spec:
+  # assert, not the converge default: the transcript is immutable once the
+  # run ends, so polling a failed check would only wait out the timeout.
+  #
+  # The defect: a card id in the agent's own words. Every line is read except
+  # the harness's delivered-section headers, which carry the id by design.
+  - name: the-answer-carries-no-card-id
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns:
+        - '(?m)^(?!result of delegated task\b|question from delegated task\b|artifact\b.*\bproduced by delegated task\b).*\bt_?[0-9a-f]{8}\b.*$'
+  # The answer still gives the count: a number within three words of
+  # "cluster(s)" ("209 running gke clusters", "209 clusters"), or "clusters:
+  # 209". A reply that only offers to count has no such line.
+  - name: the-answer-gives-the-count
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_patterns:
+        - '\b\d{1,4} (?:\S+ ){0,3}clusters?\b'
+        - '\bclusters?(?: \S+){0,2}[:=] \d{1,4}\b'
+  # An answer drawn from an earlier card says when the count was taken; a
+  # fresh card's result arrives under the harness's delivered header instead,
+  # which is the other way this check is met.
+  - name: a-reused-count-says-when-it-was-taken
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_patterns:
+        - '(?m)^result of delegated task\b'
+        - '\b(?:ago|earlier|today|yesterday|just now|this (?:morning|afternoon|evening)|last night|at \d{1,2}:\d{2}|\d{4}-\d{2}-\d{2}|utc|(?:january|february|march|april|may|june|july|august|september|october|november|december) \d{1,2})\b'
