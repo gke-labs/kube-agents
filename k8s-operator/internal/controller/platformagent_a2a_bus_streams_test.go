@@ -1167,11 +1167,16 @@ func TestAFailedRestartIsRetriedBeforeTheBusReadsPresent(t *testing.T) {
 			t.Fatalf("poll %d succeeded with the restart failing", i+1)
 		}
 		rig.now = rig.now.Add(busStreamsPollInterval)
-		if c := rig.condition(); c != nil && c.Status == metav1.ConditionTrue {
-			t.Fatalf("condition = %+v with the restart still owed, want not True", c)
+		if c := rig.condition(); c == nil || c.Status != metav1.ConditionFalse || c.Reason != busStreamsReasonReprovisioning || !strings.Contains(c.Message, "restarting the A2A gateway and the agent pod failed") {
+			t.Fatalf("condition = %+v with the restart still owed, want False/%s naming the failed restart", c, busStreamsReasonReprovisioning)
 		}
 		if last := readBusReprovisionRecord(rig.agent()).last(); last == nil || !last.Settled || !last.RestartOwed || last.Restarted {
 			t.Fatalf("record's last attempt = %+v, want settled, restart owed, not restarted", last)
+		}
+		if events := rig.events(); !slices.ContainsFunc(events, func(e string) bool {
+			return strings.HasPrefix(e, corev1.EventTypeWarning+" "+busStreamsRestartFailedEventReason)
+		}) {
+			t.Fatalf("events = %v, want a Warning %s on the failed restart", events, busStreamsRestartFailedEventReason)
 		}
 	}
 

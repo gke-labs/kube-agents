@@ -107,6 +107,7 @@ const (
 	busStreamsMissingEventReason          = "A2ABusStreamsMissing"
 	busStreamsRestoredEventReason         = "A2ABusStreamsRestored"
 	busStreamsClientsRestartedEventReason = "A2ABusClientsRestarted"
+	busStreamsRestartFailedEventReason    = "A2ABusClientsRestartFailed"
 
 	// busStreamsScrapeTimeout bounds one scrape from connect to the last byte,
 	// and busStreamsMaxLineBytes the one line of the body held at once. A
@@ -585,8 +586,19 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 	}
 	if last != nil && last.Settled && last.RestartOwed && !last.Restarted && !slices.Contains(verdict.missing, a2aTasksStream) {
 		if err := p.restartTasksClients(ctx, agent); err != nil {
+			// Said on the CR both ways: the condition names the owed
+			// restart in a fixed message (so a failing retry doesn't
+			// rewrite the status each poll), and the event carries the
+			// error. A condition write that fails here changes nothing:
+			// the restart is still owed and the next poll says it again.
+			p.r.recordEvent(agent, corev1.EventTypeWarning, busStreamsRestartFailedEventReason,
+				fmt.Sprintf("TASKS is back on the A2A bus, but restarting the A2A gateway and the agent pod failed, so their TASKS consumers are not recreated yet; retrying on the next poll: %v", err))
+			_ = p.writeCondition(ctx, agent, metav1.ConditionFalse, busStreamsReasonReprovisioning,
+				fmt.Sprintf("The provision Job's re-run brought TASKS back, but restarting the A2A gateway and the agent pod failed, so their TASKS consumers are not recreated yet. The operator retries on every poll; the %s events carry the error.", busStreamsRestartFailedEventReason))
 			return err
 		}
+		// A record that fails to write here leaves the restart owed, and the
+		// next poll restarts the clients again: twice, the safe direction.
 		last.Restarted = true
 		if err := p.writeRecord(ctx, agent, record.pruned(now)); err != nil {
 			return err
