@@ -113,6 +113,13 @@ readonly EVAL_GRADER_TREE="bench"
 readonly EVAL_GRADER_CASES_DIR="tasks"
 # The seeded fleet's catalog inside that tree, which the fleet step reads.
 readonly EVAL_FLEET_CATALOG="tf/fleet/fixtures.json"
+# Where `uv sync` builds the grader's environment inside that tree, relative
+# to it. The export may carry an entry by this name that is not a directory
+# (bench/.venv has been a committed link to a developer's machine since
+# c418002ff), and uv cannot create the directory over it;
+# drop_stray_grader_venv removes such an entry from the exported tree before
+# the sync.
+readonly EVAL_GRADER_VENV_DIR=".venv"
 
 # A repetition the launcher could not start because GitHub's token endpoint
 # failed transiently (record_unit_not_run, beside run_one_unit). The unit
@@ -1138,13 +1145,34 @@ grader_pin_applies() { # -> 0 when this run grades a change against a merge targ
   [ -n "${PULL_NUMBER:-}" ] || [ "${JOB_TYPE:-}" = "presubmit" ] || [ "${JOB_TYPE:-}" = "batch" ]
 }
 
+# Removes <bench dir>/.venv from an exported grader tree when it is not a real
+# directory (a symbolic link, dangling or not, or a file): the scratch tree's
+# venv is uv's to build, and `uv sync` fails with "failed to create directory
+# ... File exists" over anything else by that name. A real directory is left
+# alone; a fresh export never holds one, since nothing has synced there yet.
+# Prints one line saying what went and why, nothing when there was nothing.
+drop_stray_grader_venv() { # <bench dir>
+  local venv="$1/${EVAL_GRADER_VENV_DIR}" kind
+  if [ -L "${venv}" ]; then
+    kind="a symbolic link to $(readlink "${venv}")"
+  elif [ -e "${venv}" ] && [ ! -d "${venv}" ]; then
+    kind="a file"
+  else
+    return 0
+  fi
+  echo "Grader: removed ${venv} from the exported tree: it was ${kind}, not a directory, and uv sync cannot create the venv over it."
+  rm -f "${venv}"
+}
+
 # main's bench/ at <sha>, with the change's bench/tasks/ in place of main's,
 # extracted to <out>/bench. Replaced, not overlaid: a case the change deletes
-# is gone, and one it adds is there.
+# is gone, and one it adds is there. A `.venv` the archive carried goes
+# (drop_stray_grader_venv), so the sync in section 6 starts from none.
 pin_grader() { # <repo root> <sha> <out>
   local repo="$1" sha="$2" out="$3"
   git -C "${repo}" archive "${sha}" "${EVAL_GRADER_TREE}" | tar -x -C "${out}" || return 1
   [ -d "${out}/${EVAL_GRADER_TREE}" ] || return 1
+  drop_stray_grader_venv "${out}/${EVAL_GRADER_TREE}" || return 1
   rm -rf "${out:?}/${EVAL_GRADER_TREE}/${EVAL_GRADER_CASES_DIR}"
   cp -R "${repo}/${EVAL_GRADER_TREE}/${EVAL_GRADER_CASES_DIR}" "${out}/${EVAL_GRADER_TREE}/${EVAL_GRADER_CASES_DIR}"
 }
@@ -3481,9 +3509,10 @@ if [ -n "${GRADER_BENCH_DIR}" ]; then
   BENCH_DIR="${GRADER_BENCH_DIR}"
   EVAL_GRADER_SHA="${PULL_BASE_SHA}"
   echo "Grader: ${EVAL_GRADER_TREE}/ at PULL_BASE_SHA=${PULL_BASE_SHA}, with this change's ${EVAL_GRADER_TREE}/${EVAL_GRADER_CASES_DIR}/, in ${BENCH_DIR}"
-  # The scratch directory has no venv yet, and syncing one fetches over the
-  # network: one retry absorbs a transient failure, so the check below fails
-  # only on itself.
+  # The scratch directory has no venv yet (pin_grader dropped any entry the
+  # archive carried by that name), and syncing one fetches over the network:
+  # one retry absorbs a transient failure, so the check below fails only on
+  # itself.
   if ! (cd "${BENCH_DIR}" && uv sync --quiet) && ! (cd "${BENCH_DIR}" && uv sync --quiet); then
     echo "ERROR: could not sync main's grader's venv in ${BENCH_DIR} (twice, above); the run does not start." >&2
     exit 1
