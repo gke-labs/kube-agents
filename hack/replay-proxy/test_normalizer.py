@@ -85,6 +85,30 @@ class IdentifierTest(unittest.TestCase):
         out = normalizer.Normalizer(NOW, False).walk({"current_run_id": 190, "parent_run_id": 7})
         self.assertNotIn("190", json.dumps(out))
 
+    def test_kanban_comment_id_is_swapped(self):
+        # kanban_comment's result: the comment's row id counts every comment on
+        # the install's board, so each run gets a later one (41, then 43).
+        def comment(cid, task="t_57626387"):
+            return {"role": "tool", "tool_call_id": "call_1", "content": json.dumps({
+                "ok": True, "task_id": task, "comment_id": cid, "task_status": "running",
+                "comment_reaches": "the worker running this card right now", "completion_posts_to_chat": True})}
+        self.assertEqual(fp({"model": "m", "messages": [comment(41)]}),
+                         fp({"model": "m", "messages": [comment(43, task="t_f3c26f19")]}))
+        out = normalizer.Normalizer(NOW, False).walk({"comment_id": 41})
+        self.assertEqual(out, {"comment_id": "⟦NUM_1⟧"})
+        self.assertEqual(norm('comment_id: 41'), norm('comment_id: 43'))
+        self.assertEqual(norm('"comment_id": "41"'), '"comment_id": "⟦NUM_1⟧"')
+        # What the card is doing stays in the key.
+        self.assertNotEqual(norm(json.dumps({"comment_id": 41, "task_status": "running"})),
+                            norm(json.dumps({"comment_id": 41, "task_status": "done"})))
+
+    def test_comment_id_lookalikes_stay_literal(self):
+        for text in ('"comment_count": 41', '"comments": 41', 'last_comment_id: 41', 'xcomment_id=41',
+                     'comment 41'):
+            self.assertNotIn("⟦NUM", norm(text), text)
+        out = normalizer.Normalizer(NOW, False).walk({"last_comment_id": 41, "comment_count": 41, "comment_id": "c-41"})
+        self.assertEqual(out, {"comment_count": 41, "comment_id": "c-41", "last_comment_id": 41})
+
     def test_heartbeat_events_are_left_out_of_the_key(self):
         def card(events):
             return norm(json.dumps({"task": {"id": "t_11111111", "status": "running"}, "events": events}))
@@ -1021,6 +1045,33 @@ class AnswerMappingTest(unittest.TestCase):
             self.assertTrue(mapping.answer_repeats_bare_number(answer), answer)
 
 
+    def test_an_answer_repeating_a_comment_id_is_refused(self):
+        # A row id is never swapped into an answer, so one repeating it is not
+        # stored: replayed, it would name the recording's comment.
+        tool = {"role": "tool", "tool_call_id": "call_1",
+                "content": json.dumps({"ok": True, "task_id": "t_11111111", "comment_id": 41})}
+        mapping = normalizer.normalize_request({"model": "m", "messages": [tool]}, NOW).mapping
+        self.assertEqual(mapping.apply_to_answer("posted comment 41"), "posted comment 41")
+        for answer in ("posted comment 41 on the card", "comment #41", '{"comment_id": 41}', "comment_id is 41",
+                       "Comment 41 has been posted", "Comment #41:", "COMMENT 41"):
+            self.assertTrue(mapping.answer_repeats_bare_number(answer), answer)
+        for answer in ("41 pods are pending", "comments 41", "port 41", "comment_id 410", "commented 41 times"):
+            self.assertFalse(mapping.answer_repeats_bare_number(answer), answer)
+
+    def test_the_word_comment_counts_only_against_a_comment_id(self):
+        # "comment" is an ordinary word: an answer putting another key's swapped
+        # number after it (a generation, a row id) is still stored.
+        tool = {"role": "tool", "tool_call_id": "call_1",
+                "content": json.dumps({"metadata": {"generation": 2, "id": 7}, "status": {"observedGeneration": 2}})}
+        mapping = normalizer.normalize_request({"model": "m", "messages": [tool]}, NOW).mapping
+        for answer in ("I left a comment: 2 pods are pending", "Here is the comment:\n\n2. Root cause",
+                       "comment (7)", "kubectl annotate deploy/web comment=2"):
+            self.assertFalse(mapping.answer_repeats_bare_number(answer), answer)
+        self.assertTrue(mapping.answer_repeats_bare_number("generation: 2"))
+        # The same word does count once a comment id was swapped, in text as in JSON.
+        text = {"role": "tool", "tool_call_id": "call_2", "content": "posted, comment_id: 2"}
+        mapping = normalizer.normalize_request({"model": "m", "messages": [text]}, NOW).mapping
+        self.assertTrue(mapping.answer_repeats_bare_number("I left a comment: 2 pods are pending"))
 
 class HistorySwapTest(unittest.TestCase):
     """An answer comes back in the next request's history keyed as apply_to_answer stored it."""
