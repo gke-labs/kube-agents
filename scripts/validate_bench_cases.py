@@ -70,6 +70,15 @@ REQUESTED_PULL_REQUESTS_KEY = "requested_pull_requests"
 REQUESTING_CHECK_TYPES = frozenset({"pull_request_opened", "pull_request_diff_contains"})
 CHECK_CHILD_KEYS = ("checks", "check")
 TASKS_DIR = REPO_ROOT / "bench" / "tasks"
+# A run's record is never committed beside a case: a public file names the run
+# and its outcome, nothing from inside the record. The harness writes runs
+# under bench/results/, which is gitignored, so nothing legitimate lands here.
+EVIDENCE_DIR_NAME = "evidence"
+RUN_RECORD_RULE = (
+    "a run's record is not committed, and nothing goes under a case's evidence/ "
+    "directory; cite the run by its directory name or build id and leave the record "
+    "in the bucket or on the dev install"
+)
 # The tag PyYAML gives a `<<:` merge key; its pairs are merged in, not repeated.
 YAML_MERGE_TAG = "tag:yaml.org,2002:merge"
 # The rosters hack/ci-eval-pr.sh reads at startup (#1546): what the presubmit
@@ -1912,6 +1921,19 @@ def _non_documentation_addresses(text: str) -> list[tuple[int, str]]:
     return found
 
 
+def committed_run_records(tasks_dir: pathlib.Path = TASKS_DIR) -> list[str]:
+    """Every file under any case's `evidence/` directory, each a finding."""
+    found = []
+    for case_dir in sorted(p for p in tasks_dir.iterdir() if p.is_dir()):
+        evidence = case_dir / EVIDENCE_DIR_NAME
+        if not evidence.is_dir():
+            continue
+        for path in sorted(evidence.rglob("*")):
+            if path.is_file():
+                found.append(f"{_display(path)}: {RUN_RECORD_RULE}")
+    return found
+
+
 def sanitization_findings(roots: tuple[pathlib.Path, ...] = SANITIZED_ROOTS) -> list[str]:
     """Lines under `roots` that carry a real-looking address or a credential.
 
@@ -2029,6 +2051,8 @@ def main(argv: list[str] | None = None) -> int:
             if args.paths
             else SANITIZED_ROOTS
         )
+        # Repository-level too: a committed run record is a finding wherever it sits.
+        records = committed_run_records()
     except CaseError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -2054,6 +2078,10 @@ def main(argv: list[str] | None = None) -> int:
     for entry in unsanitized:
         failed += 1
         print(f"unsanitized fixture: {entry}")
+
+    for entry in records:
+        failed += 1
+        print(f"committed run record: {entry}")
 
     if failed:
         print(f"\n{failed} case(s) rejected out of {len(results)} checked.")

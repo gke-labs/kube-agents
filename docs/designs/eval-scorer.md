@@ -87,6 +87,16 @@ checks are broken, which is the state it is most likely to be in.
 through to a judged score is the silent-green path this gate exists to close. The fourth has one
 exception: when the inject lane has set aside every objective check (below), the missing
 correctness is the lane's doing and the repetition is reported not applicable rather than blocked.
+The first has one too: when every errored check's errored leaves lead with
+`KUBE_AGENTS_FORGE_UNAVAILABLE`, no check failed, no catastrophic safeguard errored, the record carries
+`VerificationCoverage`, and rung 3 is met, the repetition is `infra`. A forge-reading check puts that
+marker on its reason only when every forge read of it that failed did so transiently: a 5xx after
+the retries, a transport failure (a timeout, a reset, a dropped connection), or a 429 or a 403 whose
+message names a rate limit, the last two only on GitHub with the CI-minted grading token. That token
+is the ledger App's installation, which the agent under test cannot spend; a local token, or
+GitLab's, where the agent's token and grading's belong to one user, can be the agent's. Any other
+errored leaf, a failed check, an errored catastrophic safeguard or a parse error keeps the repetition on rung 2,
+and the verdict gives each errored check's reason, not only its name.
 
 **Rung 3's signals are what the fixtures proved are populated** — `status == "success"`, a
 non-empty `trajectory`, `tokens.total > 0`, and `latency > 0`. One exception to the token signal:
@@ -155,7 +165,7 @@ can carry the delegated workers' tagged entries and token counts. The scorer tre
 `tool_called` with a `result` pattern (the trace records no results) as blind on
 such a record unless it carries the workers, with the exceptions below; any other router-scope `tool_called` is blind only when the
 door showed no trace or a trace that lost calls, and one naming only entries the harness writes itself (`cases.HARNESS_WRITTEN_ENTRIES`: a stopped ask's, and a pushed-report replay's plant entry) is never blind: the first matrix run through the door (#2007, 2026-09-25) collapsed
-`agent-kanban-smoke` 0 of 3 with a correct answer in every repetition. `classify_rep()` therefore
+`agent-kanban-smoke` with a correct answer in every repetition. `classify_rep()` therefore
 re-reads such a record before the rungs. The condition is the record's, not the environment's: the
 trajectory carries the transport's task marker (`_inject_record()` in `scoring.py`), and for the
 router-scope `tool_called` also either no `a2a.activity` marker and nothing outside the envelope,
@@ -423,9 +433,9 @@ three repetitions an ordinary nightly produced.
   "recorded_at": "2026-08-25T00:00:00Z",
   "commit": "<the main sha this batch ran on>",
   "key": {
-    "setup_id": "gemini-3-1-pro-preview-kubeagents-mcp",
+    "setup_id": "<agent setup id>",
     "scoring_version": "v1",
-    "judge_model": "gemini-3.1-pro-preview",
+    "judge_model": "<judge model>",
     "fleet": 1,
     "verifiers": 1
   },
@@ -502,8 +512,8 @@ For example:
 ```
 gs://kube-agents-evals-bench/evidence/
   agent-kanban-smoke/
-    gemini-3-1-pro-preview-kubeagents-mcp/
-      gemini-3.1-pro-preview/
+    <agent setup id>/
+      <judge model>/
         v1-f1-v1/
           2026-08-01T02-03-04Z-12345.jsonl
 ```
@@ -524,7 +534,7 @@ judge model alone — partitioning on one component would leave a `setup_id` or 
 still piling into the same directory.
 
 It also makes the store navigable, which a content hash would not: `ls` on a case shows which
-setups have been screened, and `*/gemini-3.1-pro-preview/**` finds every case a given judge
+setups have been screened, and `*/<judge model>/**` finds every case a given judge
 scored, neither of which a hash would answer without opening a record.
 
 **The path is an index, never the truth.** Every record carries its own `key` and the reader
@@ -1094,7 +1104,7 @@ merge-rate data:
   run.
 
 Three numbers in it are priced rather than measured. The repetition count is the script's default 3
-unless the job sets `EVAL_REPETITIONS`. The timeout is `840m` on the main shards (`720m` before the gemini-4-argon window), not the presubmit's `360m`: the
+unless the job sets `EVAL_REPETITIONS`. The timeout is `840m` on the main shards (`720m` before the 2026-10-29 model window), not the presubmit's `360m`: the
 twenty-six-task matrix priced at ~532–552 serial minutes at three repetitions, and the presubmit
 realised only ~1.15× on whole-job wall clock against its serial matrix estimate on 2026-09-10 (the
 periodic's timeout comment; the fixed provision-and-deploy term is inside that figure, which is

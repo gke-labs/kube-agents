@@ -478,7 +478,7 @@ class CadenceCellTest(unittest.TestCase):
 
 
 class CRDFieldBlocksTest(unittest.TestCase):
-    """The three CRD field pages are registered, rendered as tables, and selectable."""
+    """The CRD field pages are registered, rendered as tables, and selectable."""
 
     def test_each_kind_has_a_block_on_its_own_page(self):
         for kind, page in generate_docs.CRD_KINDS.items():

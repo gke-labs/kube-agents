@@ -19,6 +19,17 @@ crash-loops at the persona step, and the cluster watcher files triage turns
 about it. Kanban to tse still works. Turn profiles.tse.enabled off, or set
 operator.profileDispatcher.enabled=false, until tse ships its persona.
 {{- end }}
+{{- if and (include "kube-agents.hindsightEnabled" .) (not (and .Values.hindsight.networkPolicy .Values.hindsight.postgresql.networkPolicy.enabled)) }}
+
+WARNING: hindsight-postgresql renders with no NetworkPolicy
+({{ if .Values.hindsight.networkPolicy }}hindsight.postgresql.networkPolicy.enabled{{ else }}hindsight.networkPolicy{{ end }}=false).
+The database takes no password, so that policy is what keeps it to the
+hindsight-api pod: without it, any pod that can reach {{ .Release.Namespace }}
+can open a connection on 5432. If hindsight-api's own policy is the one in
+the way (a gateway its egress rules do not name), set
+hindsight.api.networkPolicy.enabled=false or name the gateway in
+hindsight.api.networkPolicy.additionalEgress, and leave this one on.
+{{- end }}
 {{- if and .Values.litellm.enabled (ne .Release.Namespace "kubeagents-system") }}
 
 WARNING: this release is not in the kubeagents-system namespace, but the

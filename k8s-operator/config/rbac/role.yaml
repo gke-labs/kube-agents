@@ -157,6 +157,7 @@ rules:
       - kubeagents.x-k8s.io
     resources:
       - agentplugins
+      - tiers
     verbs:
       - get
       - list
@@ -166,6 +167,7 @@ rules:
     resources:
       - agentplugins/status
       - agentprofiles/status
+      - tiers/status
     verbs:
       - get
       - patch

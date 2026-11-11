@@ -331,7 +331,10 @@ shell words: it removes only the pattern argument of a command that is one
 grep and nothing else, and refuses a control operator, a redirect other than
 `>` to `/dev/null`, a comment, a substitution, a collapsed chain, a braced expansion other than
 `${NAME}` or `${NAME:-…}`, a read of the last argument (`$_`) or of a variable through another
-(`${!NAME}`), and an ANSI-C quote); or with `required_runs` a script by its basename and the flags that must
+(`${!NAME}`), and an ANSI-C quote; neither exemption reads a row of a card whose tagged `terminal`
+calls include one that may hold more than one line, which the row joins with a space, or of a card
+with a clipped code-tool call, and a card whose calls did not reach the trajectory is read from its
+rows alone); or with `required_runs` a script by its basename and the flags that must
 follow it on the same shell segment, read from the command's argv as the shell splits
 it, so a quoted mention of the invocation is one word and not a run, and a run made through a script file or a shell's standard input is not read, since the argv names the file or the shell; each flag is read as the exact word, so the script named is built with `allow_abbrev=False`; `word_patterns` are regular expressions each of which some later word of the segment must match on its own, and `forbidden_runs` is the same shape for a run no worker may make, such as a `kubectl get` of the objects a script grades; with `after_result_pattern` the commands come from the workers' tagged `terminal` and `execute_code` calls in the trajectory instead, with their results as the record stores them, a JSON string with newlines escaped, and the forbidden set applies only to the calls after the first whose result matched, failed or not, one window per delegated card and the cards its worker fanned out; `forbidden_result_patterns` then grade the later results too; a trajectory with no tagged call at all, none readable (every code-tool argument withheld), a call with no numeric time, or a capture with gaps and no hit, is `status: "error"`, where a worker whose tagged calls are all MCP calls grades as zero commands), `worker_agents` (regular expressions every one of which must match the
 profile at least one delegated worker ran as, read from the tags the harness puts on the
@@ -653,7 +656,9 @@ string matching the token-shaped subset of `AuditRedactor`'s patterns, with
 that rule — the ranges, the shapes, the skip list, the marker, and what review covers that
 the scan cannot. The scan is tree-level rather than per case, like the fixture-catalogue
 drift check, so `validate_all()` does not carry it; the lint asserts on
-`sanitization_findings()` in its own right.
+`sanitization_findings()` in its own right. The same way, it rejects any file committed under
+a case's `evidence/` directory (`committed_run_records()`): a run's record stays in the bucket
+or on the dev install, and the case cites the run by its directory name or build id.
 
 `scripts/test_task_registration.py` calls the same module in CI and asserts that it
 returned no findings at all, so the fast local check and the gating lint cannot disagree.

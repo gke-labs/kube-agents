@@ -219,6 +219,9 @@ type Gateway struct {
 	// profiles is the AgentProfiles this gateway can address, kept from
 	// their cards on DIRECTORY (startProfileDirectory).
 	profiles *profileDirectory
+	// resolvedScope reads the scope publisher's ConfigMap (SetResolvedScope);
+	// nil when none is configured.
+	resolvedScope resolvedScopeSource
 	// relayInFlight counts the relay batches rendering (relayBatch), which a
 	// stop waits for.
 	relayInFlight inFlight
@@ -1177,9 +1180,10 @@ func (g *Gateway) verifySender(msg InboundMessage) (backend, principal string, o
 		// else's message, and the adapter tells the clicker privately
 		// (InboundMessage.Shortcut).
 		//
-		// Nor for a press of Slack's Stop button: it asked the bot for
-		// nothing, and the notice would land in a thread the channel reads.
-		notified := msg.Unaddressed || msg.Shortcut || isSlackStop(msg, backend)
+		// Nor for a press of a Stop button, Slack's or Google Chat's: it
+		// asked the bot for nothing, and the notice, which names the
+		// presser, would land in a thread the channel reads.
+		notified := msg.Unaddressed || msg.Shortcut || isSlackStop(msg, backend) || isChatStopPress(msg, backend)
 		if !notified {
 			key := droppedNoticeKey(backend, msg.AuthorID)
 			g.mu.Lock()
