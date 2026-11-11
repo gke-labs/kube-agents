@@ -347,8 +347,9 @@ alone does not mean shown: `expire_snoozes`, a `PATCH` and a pull all set it wit
 An _item_ is the rows that share check, project and cluster, one gathered line: they are named and
 marked together, the item is pending while any of them is, and its severity is the highest among its
 pending and never-shown members. A decision (accept, snooze, dismiss) on any row of an item is
-applied to every other row of it that is still `queued` or `surfaced`, so the one id the nudge
-prints is enough to decide the line; the count the nudge prints beside that id is the number of rows
+applied to every other row of it that is still `surfaced`, so the one id the nudge
+prints is enough to decide the line it named; a `queued` row of the item, which no message has
+named, keeps its state (§7.2); the count the nudge prints beside that id is the number of rows
 the decision reaches, which includes shown rows a sweep stopped reporting; the nudge does not list
 those, and says how many of the count they are. Two consequences of the
 severity rule are accepted rather than designed around: a new critical row that joins a pending
@@ -958,7 +959,7 @@ card, written to `/opt/data/INVENTORY.limits.json`. `select` also writes the lis
 `/opt/data/INVENTORY.shown.json`, and `bootstrap_delivery.py` marks each of them shown, with
 publisher `first_report` and class `critical`, right after it claims delivery and before it posts.
 The items count as shown when the report's delivery is claimed, not when it is written, so a report
-that is never claimed leaves them new for the nudge; one claimed and then lost in posting does not. The claim ends the nudge's hold, so a nudge run in the
+that is never claimed leaves them new for the nudge, as does one retired unread a week after the sweep (`bootstrap_delivery._retire_undelivered` registers them and claims without marking); one claimed and then lost in posting does not. The claim ends the nudge's hold, so a nudge run in the
 moment between the claim and the marks can announce the report's items as new. Under
 `spec.mode: next`, where the report goes into the conversation the user first wrote in, the marks
 follow the post instead: a claim there can be released and retried (Rule 5 in the plugin README),
@@ -983,15 +984,17 @@ or, failing that, its mtime: a report still undelivered by then means onboarding
 holding on would add nothing ever again. Each run that is held, or would be but for that limit, says
 which on stderr. And a run that fails before it posts, a failed queue read included, exits non-zero,
 which the scheduler posts, at most once a UTC day; later failures that day go to stderr. The day's
-state (the daily part sent, the items added today, the failure reported) is a file in the platform
-profile home, written before the rows are marked. An addition whose mark fails is not announced
+state (the daily part sent, the items added today and the ids of the findings they named, the
+failure reported) is a file in the platform profile home, written before the rows are marked. An addition whose mark fails is not announced
 again that day and still counts against that day's limit, though `findings_additions` has no row
 for it. It also holds additions back as a pending item of its class would: a critical one holds
 non-criticals back, and a non-critical one stops every addition, though the stop-add notice does not
 name it. Unlike a recorded addition, it counts only while it stays undecided and under the class
 it has now: a decision on it the same day refunds its slot, and a re-score can move it between
-the two counts. It comes back as new the next day. If the state file cannot be written either,
-the additions and the daily part repeat every hour.
+the two counts. It comes back as new the next day. A finding that joins an added line later, which
+a decision can leave open, was not named: once no finding the addition named is still new, it is a
+new item of its own and holds nothing back. If the state file cannot be written either, the
+additions and the daily part repeat every hour.
 
 What this costs is the starvation §7.3 measured, brought back deliberately, from two sources. An
 ignored non-critical holds every new finding back until someone decides, and the daily notice is
@@ -999,7 +1002,10 @@ what makes that visible. An undecided critical holds every new non-critical back
 stays pending, while new criticals still arrive within the day's budget; the daily reminder names
 it only if it is in the day's top, and nothing says that non-criticals are waiting. On a standard
 install only a person's decision (dismiss, snooze or accept) releases a pending item: clearing one without a person needs §7.4's verification, which is not
-built. The onboarding sweep runs once, so for its rows no recurring complete sweep lowers a fixed
+built. A decision reaches only the rows of the item a message has named: the nudge marks every
+member of a line it names, so its count is what the decision covers, while a row a sweep adds to the
+line after the message stays `queued` and keeps its state, and the decision returns its id as left
+open (`item_rows_left_open`) until a later message names it. The onboarding sweep runs once, so for its rows no recurring complete sweep lowers a fixed
 row's `C` unless someone re-runs the sweep by hand; the weekly upgrade readiness review is such a
 sweep for its own `upgrade-` rows, so a shown row of that family that a Saturday no longer reports
 is not pending and is not reminded from that Saturday on, and comes back at the confidence the

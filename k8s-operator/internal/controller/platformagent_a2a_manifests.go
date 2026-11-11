@@ -43,20 +43,25 @@ import (
 	"encoding/json"
 	goerrors "errors"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"regexp"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -114,7 +119,27 @@ const (
 	a2aRuntimeStateBucket  = "runtime-state"
 	a2aSessionStateBucket  = "session-state"
 	a2aFeedbackBucket      = "feedback"
+	a2aPeopleBucket        = "people"
 	a2aKVStreamPrefix      = "KV_"
+
+	// a2aProfileSubmitStream holds the profiles' submissions, every subject
+	// under a2aProfileSubmitPrefix (lib.ProfileSubmitStream and
+	// lib.SubmitSubjectPrefix). Its consumers are the operator's alone.
+	a2aProfileSubmitStream = "PROFILE_SUBMITS"
+	a2aProfileSubmitPrefix = "a2a.submit."
+	// a2aProfileSubmitMaxAge is PROFILE_SUBMITS' max age. The dispatch
+	// config carries it too (SubmitRetentionSeconds), so the dispatcher
+	// keeps finished tasks' tombstones at least as long as a re-created
+	// durable could replay them.
+	a2aProfileSubmitMaxAge = 72 * time.Hour
+
+	// a2aDispatchStopStream holds the gateway's stop records, one per task
+	// on a2aDispatchStopPrefix<profile>.<task> (contract addendum 9; lib's
+	// names for them arrive with the gateway's stop, #4127). The gateway is its only
+	// writer, once its grant lands with #4127 (until then nothing writes it),
+	// and the dispatcher its only reader.
+	a2aDispatchStopStream = "DISPATCH_STOPS"
+	a2aDispatchStopPrefix = "a2a.stop."
 
 	// a2aNATSConfGrantLine renders one allow-list entry at the depth
 	// renderA2APermission puts them: the subject-list indent, two more for
@@ -135,8 +160,9 @@ const (
 	// agree, so they read from one name rather than four string literals.
 	a2aProvisionWritablePath = "/tmp"
 
-	// The two third-party pins. images.json carries both (as `nats` and
-	// `nats-box`), and hack/check-image-inventory.sh holds these constants
+	// Two of the three third-party pins; the bus reloader's is in
+	// platformagent_a2a_nats_reload.go. images.json carries these (as `nats`
+	// and `nats-box`), and hack/check-image-inventory.sh holds these constants
 	// to it on the normalised reference, so a bump starts there. The short
 	// Docker Hub spelling stays: it is the string the operator renders, and
 	// qualifying it to docker.io/library/... would change the pod template
@@ -253,13 +279,14 @@ const (
 	a2aInjectBackendEnvVar = "A2A_INJECT_BACKEND"
 
 	// a2aSessionClusterViewEnvVar arms the session pods' temporary read-only
-	// cluster view: the pod becomes a caller of the credential broker with
-	// the broker's `session` role (kubectl and gcloud, read-only, nothing
-	// else). A demo aid until declarative profiles (spec-subagent-profiles)
-	// carry a session's identity and tools; the flag and everything it
-	// renders go when they do. Operator-level and off by default for the
-	// reason a2aInjectBackendEnvVar is: the pod executes model output, and
-	// what widens its fence is a property of who deployed the operator.
+	// cluster view: session pods route kubectl through <agent>-kube-proxy
+	// (read-only-dry-run with Secret redaction) and reach the credential
+	// broker's `session` role for read-only gcloud. A demo aid until
+	// declarative profiles (spec-subagent-profiles) carry a session's
+	// identity and tools; the flag and everything it renders go when they
+	// do. Operator-level and off by default for the reason
+	// a2aInjectBackendEnvVar is: the pod executes model output, and what
+	// widens its fence is a property of who deployed the operator.
 	a2aSessionClusterViewEnvVar = "A2A_SESSION_CLUSTER_VIEW"
 	// The platform agent's trusted-human allowlists, handed to the gateway
 	// so a session's request to delegate to the platform agent is checked
@@ -484,13 +511,14 @@ const (
 	// a secretKeyRef — and a key that disagrees between them renders
 	// `password: ""` or mounts nothing, so they are named rather than spelled
 	// out at each site.
-	a2aGatewayPasswordKey = "gateway-password" // #nosec G101 -- Secret key name, not a credential
-	a2aBridgePasswordKey  = "bridge-password"  // #nosec G101 -- Secret key name, not a credential
-	a2aSeedPasswordKey    = "seed-password"    // #nosec G101 -- Secret key name, not a credential
-	a2aWebPasswordKey     = "web-password"     // #nosec G101 -- Secret key name, not a credential
-	a2aConsolePasswordKey = "console-password" // #nosec G101 -- Secret key name, not a credential
-	a2aSysPasswordKey     = "sys-password"     // #nosec G101 -- Secret key name, not a credential
-	a2aCalloutPasswordKey = "callout-password" // #nosec G101 -- Secret key name, not a credential
+	a2aGatewayPasswordKey    = "gateway-password"     // #nosec G101 -- Secret key name, not a credential
+	a2aBridgePasswordKey     = "bridge-password"      // #nosec G101 -- Secret key name, not a credential
+	a2aSeedPasswordKey       = "seed-password"        // #nosec G101 -- Secret key name, not a credential
+	a2aWebPasswordKey        = "web-password"         // #nosec G101 -- Secret key name, not a credential
+	a2aConsolePasswordKey    = "console-password"     // #nosec G101 -- Secret key name, not a credential
+	a2aConsoleMCPPasswordKey = "console-mcp-password" // #nosec G101 -- Secret key name, not a credential
+	a2aSysPasswordKey        = "sys-password"         // #nosec G101 -- Secret key name, not a credential
+	a2aCalloutPasswordKey    = "callout-password"     // #nosec G101 -- Secret key name, not a credential
 	// a2aBridgeActivityKey signs the gateway's tool-call deliveries to the
 	// bridge's activity door when the bridge runs tasks through the pod's API
 	// server (a2a/hermes-bridge/api.go): the agent container's hermes signs
@@ -585,6 +613,12 @@ const (
 	// slack.answerFeedback=false, carried to the gateway (a2a/gateway's
 	// envSlackAnswerFeedback): no rating buttons, nothing kept.
 	a2aSlackAnswerFeedbackEnvVar = "A2A_SLACK_ANSWER_FEEDBACK"
+	// googleChat.answerFeedback=false, carried to the gateway (a2a/gateway's
+	// envGchatAnswerFeedback): no rating buttons, nothing kept.
+	a2aGchatAnswerFeedbackEnvVar = "A2A_GOOGLE_CHAT_ANSWER_FEEDBACK"
+	// telemetry.peopleSeen=false, carried to the gateway (a2a/gateway's
+	// envPeopleSeen): no per-person key, the people bucket purged at start.
+	a2aPeopleSeenEnvVar = "A2A_PEOPLE_SEEN"
 	// The shortest Slack channel id a2aSlackHomeChannel takes: the prefix
 	// letter and at least two characters after it, as the gateway checks.
 	a2aSlackMinChannelIDLen = 3
@@ -678,8 +712,13 @@ const (
 	// remedy -- a report that could steer the remedy could steer it to any
 	// subject.
 	a2aProvisionReportTopicsStateSubjectKey = "topics_state_subject"
-	a2aProvisionReportMissingKey            = "missing"
-	a2aTopologySkewSubject                  = "a2a.topics.agent.platform.topology-skew"
+	// a2aProvisionReportSubmitMaxAgeKey is PROFILE_SUBMITS' live max age, in
+	// seconds under a2aProvisionReportLiveKey (0 for none), written when it
+	// is longer than this render's a2aProfileSubmitMaxAge: a stream an older
+	// operator created, which provisioning never edits (#4948).
+	a2aProvisionReportSubmitMaxAgeKey = "submit_max_age"
+	a2aProvisionReportMissingKey      = "missing"
+	a2aTopologySkewSubject            = "a2a.topics.agent.platform.topology-skew"
 	// a2aProvisionContainerName is the Job pod's one container, named because
 	// the report reader looks its termination state up by name.
 	a2aProvisionContainerName = "provision"
@@ -1058,6 +1097,13 @@ const (
 	// TestBridgeConcurrencyMatchesTheA2AModule reads that constant and fails
 	// if this one stops matching it.
 	a2aBridgeDefaultConcurrency = 2
+	// a2aBridgeDurablePrecreatedEnvVar tells the bridge to bind the intake
+	// durable the provision Job created rather than create it (#4173); its
+	// grant denies it the create on that name.
+	a2aBridgeDurablePrecreatedEnvVar = "BRIDGE_DURABLE_PRECREATED"
+	// a2aGatewayRelayPrecreatedEnvVar does the same for the gateway's event
+	// relay.
+	a2aGatewayRelayPrecreatedEnvVar = "A2A_GATEWAY_RELAY_PRECREATED"
 	// a2aBridgeConcurrencyEnvVar is the env key the bridge reads its worker
 	// count from (a2a/cmd/hermes-bridge/main.go), and so the key
 	// a2aBridgeConcurrency looks for on spec.deployment.sidecars.
@@ -1127,7 +1173,8 @@ const (
 // a2aGatewayMetricsPort is the A2A gateway's metrics-only listener
 // (a2a/gateway/metrics.go), the gateway's copy of credentialProxyMetricsPort:
 // its own port, so the managed-Prometheus collector is admitted to a listener
-// that serves counters and nothing else, and the doors keep their loopback
+// that serves counters and a readiness line (a2aGatewayReadyzPath) and nothing
+// else, and the doors keep their loopback
 // listeners. One constant for the container port, the value of
 // A2A_METRICS_PORT the gateway binds, and the collector's ingress rule in
 // buildA2AGatewayNetworkPolicy; the chart's PodMonitoring scrapes it by
@@ -1139,7 +1186,23 @@ const (
 	// the metrics port; the usage poller names it to find the port.
 	a2aGatewayContainerName     = "gateway"
 	a2aGatewayMetricsPortEnvVar = "A2A_METRICS_PORT"
+	// a2aGatewayReadyzPath is the gateway's readiness path on the same
+	// listener (gateway.ReadyzPath): 503 until its event relay has bound,
+	// which waits for the provision Job's TASKS stream.
+	a2aGatewayReadyzPath = "/readyz"
 )
+
+// a2aGatewayProgressDeadlineSeconds is the gateway Deployment's progress
+// deadline. With the readiness probe, a gateway waiting for TASKS holds its
+// rollout at zero available replicas, and past the deadline the Deployment
+// reads ProgressDeadlineExceeded and `kubectl rollout status` returns an error
+// however long it was asked to wait. Kubernetes' 600s default is shorter than
+// a slow provision Job (a three-server bus forming, the Job's backoff). 1800s
+// matches the Hermes gateway's gatewayProgressDeadlineSeconds and clears
+// upgrade.sh's 1500s deploy gate. The deadline stops nothing: the gateway
+// keeps waiting and binds when TASKS appears, and the CR reads Provisioning
+// throughout.
+const a2aGatewayProgressDeadlineSeconds int32 = 1800
 
 func a2aNATSImage() string {
 	if override := os.Getenv(a2aNATSImageEnvVar); override != "" {
@@ -1316,6 +1379,34 @@ func a2aSlackNotifyArmed(agent *agentv1alpha1.PlatformAgent) bool {
 	return strings.TrimSpace(agent.Spec.Integration.Slack.HomeChannel) == "" || a2aSlackHomeChannel(agent) != ""
 }
 
+// a2aGchatHomeRouted says the agent routes its home posts (alerts, drift
+// and scheduled reports) to the gateway's Chat backend: the home channel is
+// a space name, or it is empty and Slack is not enabled, so the posts have
+// nowhere else to go and the gateway keeps the refused ones for the digest
+// it posts once a channel is set (a2a/gateway/notify_refused.go). With Slack
+// enabled beside an unset Chat home the posts keep going to Slack through
+// its Hermes platform (legacySlackConsumer) rather than into the keep. A
+// malformed home channel routes nothing: the gateway refuses it at start.
+func a2aGchatHomeRouted(agent *agentv1alpha1.PlatformAgent) bool {
+	if !a2aChatArmed(agent) {
+		return false
+	}
+	if a2aGchatHomeSpace(agent) != "" {
+		return true
+	}
+	return strings.TrimSpace(agent.Spec.Integration.GoogleChat.HomeChannel) == "" && !slackEnabled(agent)
+}
+
+// a2aSlackHomeRouted is Slack's half of a2aGchatHomeRouted. Slack holds the
+// gateway only when Chat is not enabled (a2aSlackArmed), so an unset home
+// channel always routes: Slack is the install's one chat platform.
+func a2aSlackHomeRouted(agent *agentv1alpha1.PlatformAgent) bool {
+	if !a2aSlackArmed(agent) {
+		return false
+	}
+	return a2aSlackHomeChannel(agent) != "" || strings.TrimSpace(agent.Spec.Integration.Slack.HomeChannel) == ""
+}
+
 // a2aSlackHomeChannel is slack.homeChannel trimmed, when it is a public
 // ("C...") or private ("G...") channel id, and "" otherwise: the same test
 // the gateway arms its Slack chat.notify route on (a2a/gateway/notify.go,
@@ -1406,6 +1497,30 @@ func a2aSlackArmed(agent *agentv1alpha1.PlatformAgent) bool {
 // consumers cannot both render.
 func legacySlackConsumer(agent *agentv1alpha1.PlatformAgent) bool {
 	return slackEnabled(agent) && !a2aSlackArmed(agent)
+}
+
+// teamsEnabled is the enabled test for Teams, which only Hermes serves: the
+// A2A gateway has no Teams backend, so an enabled Teams is always on Hermes.
+func teamsEnabled(agent *agentv1alpha1.PlatformAgent) bool {
+	if agent == nil || agent.Spec.Integration == nil {
+		return false
+	}
+	teams := agent.Spec.Integration.Teams
+	return teams != nil && teams.Enabled != nil && *teams.Enabled
+}
+
+// peopleReadingEnabled reports whether the usage poller reads the A2A
+// gateway's people reading for the install: only while the install renders
+// the A2A stack (a2aStackRendering, the gate the gateway Deployment renders
+// under), since an install with no gateway has nothing to read, and only
+// while no chat platform it enables is served through Hermes, since the
+// gateway counts only the people who write through it, and a count beside a
+// Hermes-served platform would say nobody wrote while that platform's users
+// were writing. The legacy Chat term is already implied by the render gate
+// today (a next install arms Chat on the A2A door, never on its legacy
+// consumer); it stays so the function states the design's rule in full.
+func peopleReadingEnabled(agent *agentv1alpha1.PlatformAgent) bool {
+	return a2aStackRendering(agent) && !legacyChatConsumer(agent) && !legacySlackConsumer(agent) && !teamsEnabled(agent)
 }
 
 // slackEnabled is the enabled test the Slack render sites make, in one place.
@@ -1591,7 +1706,7 @@ func randomA2APassword() (string, error) {
 // still has a credential.
 var a2aCredsKeys = []string{
 	a2aGatewayPasswordKey, a2aBridgePasswordKey, a2aSeedPasswordKey,
-	a2aWebPasswordKey, a2aConsolePasswordKey, a2aSysPasswordKey, a2aCalloutPasswordKey,
+	a2aWebPasswordKey, a2aConsolePasswordKey, a2aConsoleMCPPasswordKey, a2aSysPasswordKey, a2aCalloutPasswordKey,
 	a2aBridgeActivityKey,
 }
 
@@ -1623,10 +1738,11 @@ var a2aWildcardListenHosts = map[string]bool{"": true, "0.0.0.0": true, "::": tr
 // than as seed, and provisionIdentity enumerates the same objects for itself
 // rather than from this slice. So the refusal the pair describes is provision's
 // to hit now; seed keeps the scoped grant because the hand-applied seed tooling
-// still connects with it. Nothing yet binds that third spelling to this list.
+// still connects with it. The same test holds that third spelling to this list.
 var a2aProvisionedStreams = []string{
 	"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL",
-	"KV_runtime-state", "KV_session-state", "KV_cap", "KV_feedback",
+	"KV_runtime-state", "KV_session-state", "KV_cap", "KV_feedback", "KV_people",
+	"KV_PROFILE_LEASES", "PROFILE_SUBMITS", "DISPATCH_STOPS",
 }
 
 // a2aSeedJetStreamGrants is seed's publish allow-list for the JetStream API,
@@ -1698,9 +1814,10 @@ func a2aSeedJetStreamGrants() []string {
 // (TestBridgeJetStreamGrantOnARealServer). Per stream:
 //
 //   - TASKS: STREAM.INFO (js.Stream in lib.TasksGet, lib.TaskInReplay,
-//     lib.LastEnvelope and the sweep), CONSUMER.CREATE (the durable through
-//     CreateOrUpdateConsumer, and the replay's ordered consumer; nats.go puts
-//     the filter subject in the API subject, so the grant ends in `>`),
+//     lib.LastEnvelope and the sweep), CONSUMER.CREATE (the replay's ordered
+//     consumer; nats.go puts the filter subject in the API subject, so the
+//     grant ends in `>`), CONSUMER.INFO on its own intake durable (the bind:
+//     the provision Job creates that durable, #4173),
 //     CONSUMER.MSG.NEXT (every pull), and DIRECT.GET (GetLastMsgForSubject:
 //     the replay horizon, the sweep's CAS baseline, the worker's look-ahead
 //     reading the in subject's newest message, and the orphan cancel reading
@@ -1729,8 +1846,8 @@ func a2aSeedJetStreamGrants() []string {
 // discovery needs), every verb on KV_session-state and KV_cap, PURGE / UPDATE /
 // DELETE / MSG.DELETE / RESTORE / SNAPSHOT on every stream, STREAM.CREATE,
 // enumeration (STREAM.NAMES, STREAM.LIST, CONSUMER.NAMES, CONSUMER.LIST),
-// account INFO (jetstream.New never asks for it), and CONSUMER.INFO (nothing
-// on the path binds to an existing consumer by name, and on nats.go v1.53.1
+// account INFO (jetstream.New never asks for it), and CONSUMER.INFO beyond its
+// intake's bind (nothing else on the path binds to a consumer by name, and on nats.go v1.53.1
 // no consumer re-verifies itself with it after a reconnect either --
 // TestBridgeConsumersSurviveABusRestart holds that across a server restart).
 //
@@ -1753,15 +1870,14 @@ func a2aSeedJetStreamGrants() []string {
 // first. CONSUMER.CREATE is create-OR-UPDATE by name -- the request's `action`
 // field is empty for both, and the server has no ownership concept for a
 // consumer name -- so within a stream the bridge may create consumers on,
-// every consumer on that stream is the bridge's to reconfigure. Measured
-// against this render, on the gateway's relay durable: one permitted
-// $JS.API.CONSUMER.CREATE.TASKS.gateway-relay carrying the durable's own
-// config with filter_subject changed retunes it, and the gateway stops seeing
-// task events with no permissions violation logged anywhere; the same subject
-// carrying inactive_threshold has the server reap the durable, ack floor and
-// all, while CONSUMER.DELETE is refused in the same run. That is the residue
-// the web block below already records for web, on the one stream where
-// another principal has a durable to aim at. It is not new -- $JS.API.>
+// every consumer on that stream is the bridge's to reconfigure, except the
+// two durables the provision Job makes, whose names are denied to it (#4173).
+// Measured against this render, on a per-task durable another principal
+// made: one permitted CONSUMER.CREATE carrying the durable's own config with
+// filter_subject changed retunes it, with no permissions violation logged
+// anywhere; the same subject carrying inactive_threshold has the server reap
+// the durable, ack floor and all, while CONSUMER.DELETE is refused in the same
+// run. That is the residue the web block below already records for web. It is not new -- $JS.API.>
 // permitted all of it -- and no narrower grant exists: nats.go's ordered
 // consumers take server-generated names, so the last token has to be `>`, and
 // NATS wildcards match whole tokens, so a per-prefix grant matches a consumer
@@ -1805,6 +1921,9 @@ func a2aBridgeJetStreamGrants() []string {
 	return []string{
 		"$JS.API.STREAM.INFO." + a2aTasksStream,
 		"$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".>",
+		// Its intake durable, which the provision Job creates (#4173):
+		// binding reads it back to check it was made as the bridge expects.
+		"$JS.API.CONSUMER.INFO." + a2aTasksStream + ".bridge-" + a2aBridgeAddressee,
 		"$JS.API.CONSUMER.MSG.NEXT." + a2aTasksStream + ".*",
 		"$JS.API.DIRECT.GET." + a2aTasksStream + ".>",
 		"$JS.API.STREAM.INFO." + kvRuntimeState,
@@ -1859,22 +1978,19 @@ func a2aAgentJetStreamGrants() []string {
 // v1.53.1 and then measured against a real server running this render
 // (TestGatewayJetStreamGrantOnARealServer). Per stream:
 //
-//   - TASKS: STREAM.INFO (js.Stream, in lib.TasksGet), CONSUMER.CREATE (the
-//     `gateway-relay` durable through CreateOrUpdateConsumer, and the
-//     replay's ordered consumer), CONSUMER.MSG.NEXT (every pull on both),
-//     and DIRECT.GET (GetLastMsgForSubject: tasks/get's replay horizon).
-//     Acks are $JS.ACK.TASKS.>, granted beside this list.
+//   - TASKS: STREAM.INFO (js.Stream, in lib.TasksGet), CONSUMER.INFO on
+//     `gateway-relay` only (the relay's bind: the provision Job creates that
+//     durable, #4173), CONSUMER.CREATE (the replay's ordered consumer),
+//     CONSUMER.MSG.NEXT (every pull on both), and DIRECT.GET
+//     (GetLastMsgForSubject: tasks/get's replay horizon). Acks are
+//     $JS.ACK.TASKS.>, granted beside this list.
 //
-//     CONSUMER.CREATE ends in `>` rather than naming the durable, and both
-//     reasons are load-bearing. The relay carries TWO filter subjects
-//     (`…events` and `…supervisor`, since the supervisor split), and nats.go
-//     puts the filter in the API subject only when there is exactly one
-//     (jetstream/consumer.go, apiConsumerCreateWithFilterSubjectT), so the
-//     relay's own create is `CONSUMER.CREATE.TASKS.gateway-relay` while a
-//     single-filter rebind would be four tokens longer. And the replay's
-//     ordered consumers take server-generated names
+//     CONSUMER.CREATE ends in `>` rather than naming a consumer because the
+//     replay's ordered consumers take server-generated names
 //     (jetstream.go, OrderedConsumer, which seeds namePrefix from nuid.Next),
-//     so no literal exists to name.
+//     so no literal exists to name. The relay's own name is denied to this
+//     principal (a2aTasksFixedDurableDenyPublish), so the wildcard doesn't
+//     reach it.
 //
 //   - KV_session-state, the session registry: STREAM.INFO (js.KeyValue binds
 //     a bucket by reading its stream), DIRECT.GET (kv.Get, which every
@@ -1891,6 +2007,13 @@ func a2aAgentJetStreamGrants() []string {
 //     reads, and the watcher's CONSUMER.CREATE and CONSUMER.DELETE for the
 //     export's key list. Put and Delete are publishes on $KV.feedback.>.
 //
+//   - KV_people, one hashed key per chat person (a2a/gateway/people.go): the
+//     same four verbs -- STREAM.INFO to bind it and read its max age at
+//     start, DIRECT.GET held to match feedback's grant set (the desk reads
+//     through its watch, not by key), and the watcher's CONSUMER.CREATE and
+//     CONSUMER.DELETE for the desk's watch and the purge's key list. Put and
+//     Delete are publishes on $KV.people.>.
+//
 // Reads go through DIRECT.GET and not STREAM.MSG.GET because every stream the
 // provision script creates has allow_direct set: the script says
 // --allow-direct on each `stream add`, and a KV bucket always has it. nats.go
@@ -1906,9 +2029,9 @@ func a2aAgentJetStreamGrants() []string {
 // enumeration (STREAM.NAMES, STREAM.LIST, CONSUMER.NAMES, CONSUMER.LIST); and
 // account INFO, which jetstream.New never asks for.
 //
-// CONSUMER.INFO is withheld, and it is worth stating because it costs
-// something. Nothing on the gateway path binds a consumer by name -- the
-// relay is CreateOrUpdateConsumer, the replay is an ordered consumer -- and on
+// CONSUMER.INFO is withheld beyond the relay's bind, and it is worth stating
+// because it costs something. Nothing else on the gateway path binds a
+// consumer by name -- the replay is an ordered consumer -- and on
 // nats.go v1.53.1 neither re-verifies itself with Info() after a reconnect
 // either: the Consume status loop re-issues a pull on CONNECTED, and the
 // ordered consumer's reset is a CONSUMER.CREATE. TestGatewayConsumersSurviveABusRestart
@@ -1972,9 +2095,13 @@ func a2aAgentJetStreamGrants() []string {
 func a2aGatewayJetStreamGrants() []string {
 	kvSessionState := a2aKVStreamPrefix + a2aSessionStateBucket
 	kvFeedback := a2aKVStreamPrefix + a2aFeedbackBucket
+	kvPeople := a2aKVStreamPrefix + a2aPeopleBucket
 	return []string{
 		"$JS.API.STREAM.INFO." + a2aTasksStream,
 		"$JS.API.CONSUMER.CREATE." + a2aTasksStream + ".>",
+		// Its relay durable, which the provision Job creates (#4173):
+		// binding reads it back to check it was made as the relay expects.
+		"$JS.API.CONSUMER.INFO." + a2aTasksStream + "." + a2aGatewayRelayDurable,
 		"$JS.API.CONSUMER.MSG.NEXT." + a2aTasksStream + ".*",
 		"$JS.API.DIRECT.GET." + a2aTasksStream + ".>",
 		"$JS.API.STREAM.INFO." + kvSessionState,
@@ -1985,6 +2112,10 @@ func a2aGatewayJetStreamGrants() []string {
 		"$JS.API.DIRECT.GET." + kvFeedback + ".>",
 		"$JS.API.CONSUMER.CREATE." + kvFeedback + ".>",
 		"$JS.API.CONSUMER.DELETE." + kvFeedback + ".*",
+		"$JS.API.STREAM.INFO." + kvPeople,
+		"$JS.API.DIRECT.GET." + kvPeople + ".>",
+		"$JS.API.CONSUMER.CREATE." + kvPeople + ".>",
+		"$JS.API.CONSUMER.DELETE." + kvPeople + ".*",
 	}
 }
 
@@ -2132,12 +2263,60 @@ func (r *PlatformAgentReconciler) ensureA2ACredsSecret(ctx context.Context, agen
 // the callout keypair would update the config Secret without rolling the
 // StatefulSet, leaving the server trusting an issuer nothing signs with any
 // more — every answer the callout gives refused, on a bus that looks healthy.
-func renderA2ANATSConf(agent *agentv1alpha1.PlatformAgent, pw func(key string) string, keys *a2aCalloutKeys) string {
+// a2aCrossAccountConsumerCreateStreams are the streams a principal in APP
+// or CONSOLE may create consumers on, which is all the TRUSTED account
+// exports the consumer-create API for (#4173): the streams its users'
+// consumer-create grants name, and TASKS for the per-task consumers the
+// callout grants sessions and profile workers (a2a/authcallout session.go).
+// Read from the grants, so a grant and the export can't drift apart.
+func a2aCrossAccountConsumerCreateStreams(agent *agentv1alpha1.PlatformAgent) []string {
+	set := map[string]bool{a2aTasksStream: true}
+	for _, id := range a2aIdentities(agent) {
+		if id.account != a2aAccountApp && id.account != a2aAccountConsole {
+			continue
+		}
+		for _, grant := range id.publish {
+			if rest, ok := strings.CutPrefix(grant, "$JS.API.CONSUMER.CREATE."); ok {
+				set[strings.SplitN(rest, ".", 2)[0]] = true
+			}
+		}
+	}
+	streams := make([]string, 0, len(set))
+	for stream := range set {
+		streams = append(streams, stream)
+	}
+	sort.Strings(streams)
+	return streams
+}
+
+// a2aConsumerCreateExportLines is TRUSTED's consumer-create export, one
+// entry per stream in a2aCrossAccountConsumerCreateStreams.
+func a2aConsumerCreateExportLines(agent *agentv1alpha1.PlatformAgent) string {
+	var b strings.Builder
+	for _, stream := range a2aCrossAccountConsumerCreateStreams(agent) {
+		fmt.Fprintf(&b, "      { service: \"$JS.API.CONSUMER.CREATE.%s.>\", accounts: [ APP, CONSOLE ] }\n", stream)
+	}
+	return b.String()
+}
+
+// a2aConsumerCreateImportLines is the matching import for APP and CONSOLE.
+func a2aConsumerCreateImportLines(agent *agentv1alpha1.PlatformAgent) string {
+	var b strings.Builder
+	for _, stream := range a2aCrossAccountConsumerCreateStreams(agent) {
+		fmt.Fprintf(&b, "      { service: { account: TRUSTED, subject: \"$JS.API.CONSUMER.CREATE.%s.>\" } }\n", stream)
+	}
+	return b.String()
+}
+
+func renderA2ANATSConf(agent *agentv1alpha1.PlatformAgent, pw func(key string) string, keys *a2aCalloutKeys, profiles []string) string {
 	return a2aPostureComment + `
 
 server_name: ` + a2aNATSName(agent) + `
 port: ` + strconv.Itoa(a2aNATSClientPort) + `
 http: ` + strconv.Itoa(a2aNATSMonitorPort) + `
+# For the reloader in the same pod, which signals this PID when the mounted
+# config changes.
+pid_file: "` + a2aNATSPIDFile + `"
 
 # TLS on the client listener, required of every connection: the server
 # advertises tls_required, so a client that dials nats:// is told to upgrade
@@ -2167,8 +2346,8 @@ max_control_line: 65536
 # the console server is encrypted and verified against the bus CA. The
 # Service is ClusterIP, so nothing OUTSIDE the cluster reaches this listener.
 # An ingress NetworkPolicy fences the pod network too: 4222 from the
-# enumerated bus clients, 9222 from the console server alone, and no
-# pod-network peer for 8222. The console server is admitted because it is the
+# enumerated bus clients, 9222 from the console server alone, and 8222 from
+# the operator's pod alone. The console server is admitted because it is the
 # page's proxy. A browser reaches it through a kubectl port-forward and it
 # forwards the websocket here over wss, with the browser's headers intact. It
 # is not an in-cluster door for anything else. A port-forward straight to
@@ -2230,15 +2409,118 @@ accounts {
       }
     ]
   }
-  APP {
+  # TRUSTED: control-plane writers (gateway, provision, verifier, operator,
+  # seed, dispatcher) and the JetStream file store. Separating the control
+  # plane's account from APP and CONSOLE scopes cross-account traffic to the
+  # explicit stream and service exports declared below.
+  TRUSTED {
     jetstream: enabled
+    # MSG.NEXT answers one pull with a batch, so its export streams
+    # responses; the default single response would cut every batch to one.
+    exports [
+      { service: "$JS.API.INFO", accounts: [ APP, CONSOLE ] }
+      { service: "$JS.API.STREAM.INFO.*", accounts: [ APP, CONSOLE ] }
+` + a2aConsumerCreateExportLines(agent) + `      { service: "$JS.API.CONSUMER.INFO.>", accounts: [ APP, CONSOLE ] }
+      { service: "$JS.API.CONSUMER.MSG.NEXT.>", accounts: [ APP, CONSOLE ], response_type: stream }
+      { service: "$JS.API.CONSUMER.DELETE.>", accounts: [ APP ] }
+      { service: "$JS.API.DIRECT.GET.>", accounts: [ APP, CONSOLE ] }
+      { service: "$JS.ACK.TASKS.>", accounts: [ APP ] }
+      { service: "$JS.FC.>", accounts: [ APP ] }
+      { service: "a2a.tasks.*.*.events", accounts: [ APP ] }
+      { service: "a2a.topics.>", accounts: [ APP ] }
+      { service: "$KV.runtime-state.>", accounts: [ APP ] }
+      { stream: "a2a.tasks.>", accounts: [ APP, CONSOLE ] }
+      { stream: "a2a.agents.>", accounts: [ APP, CONSOLE ] }
+      { stream: "a2a.topics.>", accounts: [ APP, CONSOLE ] }
+      { stream: "$KV.runtime-state.>", accounts: [ APP ] }
+      { stream: "a2a.dispatch.*.*.*", accounts: [ APP ] }
+      { stream: "a2a.cap.reply.>", accounts: [ APP ] }
+      { stream: "chat.notify.reply.agent.>", accounts: [ APP ] }
+      { stream: "chat.board", accounts: [ APP ] }
+      { stream: "_INBOX.bridge.>", accounts: [ APP ] }
+      { stream: "_INBOX.web.>", accounts: [ APP ] }
+      { stream: "chat.console.*.out", accounts: [ CONSOLE ] }
+      { stream: "_INBOX.console.>", accounts: [ CONSOLE ] }
+      { stream: "_INBOX.console-mcp.>", accounts: [ CONSOLE ] }
+    ]
+    imports [
+      { stream: { account: CONSOLE, subject: "chat.console.*.in" } }
+      { stream: { account: CONSOLE, subject: "chat.console.*.confirm" } }
+      { stream: { account: APP, subject: "a2a.dispatch.*.*.*.accept" } }
+      { stream: { account: APP, subject: "a2a.dispatch.*.*.*.lease" } }
+      { stream: { account: APP, subject: "a2a.cap.verify.*" } }
+      { stream: { account: APP, subject: "chat.notify.gchat" } }
+      { stream: { account: APP, subject: "chat.notify.slack" } }
+      { stream: { account: APP, subject: "chat.notify.console" } }
+      { stream: { account: APP, subject: "chat.board.reply.gateway.>" } }
+    ]
     users [
-` + renderA2AStaticUsers(agent, pw, a2aAccountApp) + `    ]
+` + renderA2AStaticUsers(agent, pw, a2aAccountControl, profiles) + `    ]
+  }
+  # CONSOLE: the web console and MCP server, isolated from both TRUSTED and
+  # APP so that neither can reach chat.console.*.in or chat.console.*.confirm.
+  CONSOLE {
+    exports [
+      { stream: "chat.console.*.in", accounts: [ TRUSTED ] }
+      { stream: "chat.console.*.confirm", accounts: [ TRUSTED ] }
+    ]
+    imports [
+      { service: { account: TRUSTED, subject: "$JS.API.INFO" } }
+      { service: { account: TRUSTED, subject: "$JS.API.STREAM.INFO.*" } }
+` + a2aConsumerCreateImportLines(agent) + `      { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.INFO.>" } }
+      { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.MSG.NEXT.>" } }
+      { service: { account: TRUSTED, subject: "$JS.API.DIRECT.GET.>" } }
+      { stream: { account: TRUSTED, subject: "a2a.tasks.>" } }
+      { stream: { account: TRUSTED, subject: "a2a.agents.>" } }
+      { stream: { account: TRUSTED, subject: "a2a.topics.>" } }
+      { stream: { account: TRUSTED, subject: "chat.console.*.out" } }
+      { stream: { account: TRUSTED, subject: "_INBOX.console.>" } }
+      { stream: { account: TRUSTED, subject: "_INBOX.console-mcp.>" } }
+    ]
+    users [
+` + renderA2AStaticUsers(agent, pw, a2aAccountConsole, profiles) + `    ]
+  }
+  # APP: runtime executors and readers (session, agent, bridge, web, profile-*).
+  APP {
+    exports [
+      { stream: "a2a.dispatch.*.*.*.accept", accounts: [ TRUSTED ] }
+      { stream: "a2a.dispatch.*.*.*.lease", accounts: [ TRUSTED ] }
+      { stream: "a2a.cap.verify.*", accounts: [ TRUSTED ] }
+      { stream: "chat.notify.gchat", accounts: [ TRUSTED ] }
+      { stream: "chat.notify.slack", accounts: [ TRUSTED ] }
+      { stream: "chat.notify.console", accounts: [ TRUSTED ] }
+      { stream: "chat.board.reply.gateway.>", accounts: [ TRUSTED ] }
+    ]
+    imports [
+      { service: { account: TRUSTED, subject: "$JS.API.INFO" } }
+      { service: { account: TRUSTED, subject: "$JS.API.STREAM.INFO.*" } }
+` + a2aConsumerCreateImportLines(agent) + `      { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.INFO.>" } }
+      { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.MSG.NEXT.>" } }
+      { service: { account: TRUSTED, subject: "$JS.API.CONSUMER.DELETE.>" } }
+      { service: { account: TRUSTED, subject: "$JS.API.DIRECT.GET.>" } }
+      { service: { account: TRUSTED, subject: "$JS.ACK.TASKS.>" } }
+      { service: { account: TRUSTED, subject: "$JS.FC.>" } }
+      { service: { account: TRUSTED, subject: "a2a.tasks.*.*.events" } }
+      { service: { account: TRUSTED, subject: "a2a.topics.>" } }
+      { service: { account: TRUSTED, subject: "$KV.runtime-state.>" } }
+      { stream: { account: TRUSTED, subject: "a2a.tasks.>" } }
+      { stream: { account: TRUSTED, subject: "a2a.agents.>" } }
+      { stream: { account: TRUSTED, subject: "a2a.topics.>" } }
+      { stream: { account: TRUSTED, subject: "$KV.runtime-state.>" } }
+      { stream: { account: TRUSTED, subject: "a2a.dispatch.*.*.*" } }
+      { stream: { account: TRUSTED, subject: "a2a.cap.reply.>" } }
+      { stream: { account: TRUSTED, subject: "chat.notify.reply.agent.>" } }
+      { stream: { account: TRUSTED, subject: "chat.board" } }
+      { stream: { account: TRUSTED, subject: "_INBOX.bridge.>" } }
+      { stream: { account: TRUSTED, subject: "_INBOX.web.>" } }
+    ]
+    users [
+` + renderA2AStaticUsers(agent, pw, a2aAccountApp, profiles) + `    ]
   }
   # $SYS: human operators and monitoring only; no agent authenticates here.
   SYS {
     users [
-` + renderA2AStaticUsers(agent, pw, a2aAccountSys) + `    ]
+` + renderA2AStaticUsers(agent, pw, a2aAccountSys, profiles) + `    ]
   }
 }
 system_account: SYS
@@ -2312,8 +2594,8 @@ authorization {
 // buildA2ANATSConfigSecret renders nats.conf with the real credentials from
 // the creds Secret. This Secret's Data is the one place the passwords are
 // meant to appear; a2aConfigRolloutHash covers the rest of the render.
-func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret, keys *a2aCalloutKeys) *corev1.Secret {
-	conf := renderA2ANATSConf(agent, func(key string) string { return string(creds.Data[key]) }, keys)
+func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret, keys *a2aCalloutKeys, profiles []string) *corev1.Secret {
+	conf := renderA2ANATSConf(agent, func(key string) string { return string(creds.Data[key]) }, keys, profiles)
 
 	return &corev1.Secret{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
@@ -2322,7 +2604,7 @@ func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.
 			Namespace: agent.Namespace,
 			Labels:    a2aLabels(agent, "nats-config"),
 		},
-		Data: map[string][]byte{"nats.conf": []byte(conf)},
+		Data: map[string][]byte{a2aNATSConfKey: []byte(conf)},
 	}
 }
 
@@ -2369,12 +2651,16 @@ func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.
 // The serving certificate's fingerprint is the third input, for the same
 // reason as the conf: nats-server reads its certificate at boot, so a renewed
 // one that the kubelet has already written into the mounted directory is not
-// served until the pod restarts. Until a reloader sends the reload signal
-// instead, a renewal rolls the bus once a year.
+// served until the pod restarts. A renewal rolls the bus once a year; the
+// bus pod's reloader would also apply it in place, but the hash still rolls.
+//
+// The gateway's per-profile deny is left out (renderA2ANATSConf with no
+// profiles): the config Secret carries it, the reloader applies it, and
+// planA2ABusReload confirms it, so a profile change doesn't roll the bus.
 func a2aConfigRolloutHash(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret, keys *a2aCalloutKeys, servingFingerprint string) string {
 	redacted := renderA2ANATSConf(agent, func(key string) string {
 		return fmt.Sprintf(a2aConfigHashPlaceholder, key)
-	}, keys)
+	}, keys, nil)
 	sum := sha256.Sum256([]byte(redacted + a2aConfigHashRotationSeparator + creds.ResourceVersion +
 		a2aConfigHashRotationSeparator + servingFingerprint))
 	return hex.EncodeToString(sum[:])[:a2aConfigHashLength]
@@ -2384,11 +2670,28 @@ func a2aConfigRolloutHash(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secr
 // a2aConfigRolloutHash and rides the pod template — the agent Deployment's
 // config-hash mechanism — so a changed render rolls the server instead of
 // silently diverging from it.
+// a2aConfigHashAnnotation carries the bus's config hash on its pod template.
+const a2aConfigHashAnnotation = "kubeagents.x-k8s.io/a2a-config-hash"
+
 // a2aNATSDataClaim is the StatefulSet's volumeClaimTemplate name. The claim the
 // controller stamps out is "<this>-<sts>-0", which handleDeletion reaps by name --
 // so a rename here that is not matched there turns the reap into a silent no-op
 // and leaks the PV on every CR deletion. One spelling, both sites.
 const a2aNATSDataClaim = "data"
+
+const (
+	// a2aNATSStartupScript migrates an existing single-node (R1) JetStream store
+	// directory from /data/jetstream/APP to /data/jetstream/TRUSTED on upgrade
+	// before starting nats-server, preserving streams and KV buckets across the
+	// account split. On a single-node server, stream and consumer metadata live
+	// under <store>/jetstream/<account>/streams/ with no SYS/_js_/ Raft metadata
+	// group, so moving the account directory relocates the store cleanly.
+	// When both directories exist (a rollback that skipped moving the store
+	// back), it starts on TRUSTED, leaves APP in place and says so.
+	a2aNATSStartupScript = "if [ -d /data/jetstream/APP ] && [ ! -e /data/jetstream/TRUSTED ]; then mv /data/jetstream/APP /data/jetstream/TRUSTED; " +
+		"elif [ -d /data/jetstream/APP ]; then echo 'both /data/jetstream/APP and /data/jetstream/TRUSTED exist: starting on TRUSTED, APP left in place' >&2; fi && " +
+		"exec nats-server -c /etc/nats/nats.conf"
+)
 
 // a2aProvisionResources adds the provision container's ephemeral-storage
 // request and equal limit, for the tmp emptyDir it writes
@@ -2435,10 +2738,12 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels:      podLabels,
-					Annotations: map[string]string{"kubeagents.x-k8s.io/a2a-config-hash": confHash},
+					Annotations: map[string]string{a2aConfigHashAnnotation: confHash},
 				},
 				Spec: corev1.PodSpec{
 					AutomountServiceAccountToken: ptr.To(false),
+					// The reloader signals nats-server by PID.
+					ShareProcessNamespace: ptr.To(true),
 					SecurityContext: &corev1.PodSecurityContext{
 						RunAsNonRoot:   ptr.To(true),
 						RunAsUser:      ptr.To(int64(1000)),
@@ -2446,18 +2751,19 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 					},
 					Containers: []corev1.Container{{
-						Name:  "nats",
-						Image: a2aNATSImage(),
-						Args:  []string{"-c", "/etc/nats/nats.conf"},
+						Name:    "nats",
+						Image:   a2aNATSImage(),
+						Command: []string{"/bin/sh", "-c", a2aNATSStartupScript},
 						Ports: []corev1.ContainerPort{
 							{Name: "client", ContainerPort: a2aNATSClientPort},
 							{Name: "monitor", ContainerPort: a2aNATSMonitorPort},
 							{Name: "websocket", ContainerPort: a2aNATSWebSocketPort},
 						},
 						VolumeMounts: []corev1.VolumeMount{
-							{Name: "config", MountPath: "/etc/nats", ReadOnly: true},
+							{Name: "config", MountPath: a2aNATSConfMountDir, ReadOnly: true},
 							{Name: a2aNATSTLSVolume, MountPath: a2aNATSTLSMountDir, ReadOnly: true},
 							{Name: a2aNATSDataClaim, MountPath: "/data"},
+							{Name: a2aNATSPIDVolume, MountPath: a2aNATSPIDMountDir},
 						},
 						SecurityContext: hardenedSecurityContext(),
 						Resources:       a2aResources(a2aNATSCPURequest, a2aNATSMemoryRequest, a2aNATSCPULimit, a2aNATSMemoryLimit),
@@ -2466,8 +2772,11 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 								HTTPGet: &corev1.HTTPGetAction{Path: "/healthz", Port: intstr.FromString("monitor")},
 							},
 						},
-					}},
+					}, buildA2ANATSReloaderContainer()},
 					Volumes: []corev1.Volume{{
+						Name:         a2aNATSPIDVolume,
+						VolumeSource: a2aNATSPIDVolumeSource(),
+					}, {
 						Name: "config",
 						VolumeSource: corev1.VolumeSource{
 							Secret: &corev1.SecretVolumeSource{SecretName: a2aNATSConfigSecretName(agent)},
@@ -2583,8 +2892,9 @@ func a2aSessionNetpolName(agent *agentv1alpha1.PlatformAgent) string {
 // this is the pod that executes model output.
 //
 // A worker that needs the internet is a design change, not a policy widening:
-// the broker rule below is the one admitted widening, flag-gated, and it
-// reaches a pod that authenticates the caller rather than the internet.
+// the broker and kube-proxy rules below are the only admitted widenings,
+// flag-gated, and they reach pods that authenticate the caller rather than the
+// internet.
 //
 // PolicyTypes carries Ingress with no rules on purpose: nothing dials a
 // session pod, so a listener in a worker is an accident and an accident should
@@ -2627,15 +2937,23 @@ func buildA2ASessionNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluster
 		},
 	}
 	if a2aSessionClusterViewEnabled(agent) {
-		// The credential broker, under the cluster-view flag: the one
-		// widening of this fence, to one pod on one port, and the pod on
-		// the other end authenticates the token and confers the session
-		// role. The API server stays unreachable from here; kubectl runs
-		// in the broker. Header comment: this IS the design change.
-		egress = append(egress, networkingv1.NetworkPolicyEgressRule{
-			Ports: []networkingv1.NetworkPolicyPort{tcpPort(credentialProxyPort)},
-			To:    []networkingv1.NetworkPolicyPeer{namespacedPodPeer(agent.Namespace, credentialProxySelector(agent))},
-		})
+		// The credential broker (and its exec tier while it renders) for gcloud,
+		// plus kube-proxy for kubectl, under the cluster-view flag. Both
+		// authenticate the session pod's projected token.
+		to := []networkingv1.NetworkPolicyPeer{namespacedPodPeer(agent.Namespace, credentialProxySelector(agent))}
+		if credentialProxyExecTierEnabled(agent) {
+			to = append(to, namespacedPodPeer(agent.Namespace, credentialProxyExecTierSelector(agent)))
+		}
+		egress = append(egress,
+			networkingv1.NetworkPolicyEgressRule{
+				Ports: []networkingv1.NetworkPolicyPort{tcpPort(credentialProxyPort)},
+				To:    to,
+			},
+			networkingv1.NetworkPolicyEgressRule{
+				Ports: []networkingv1.NetworkPolicyPort{tcpPort(kubeProxyPort)},
+				To:    []networkingv1.NetworkPolicyPeer{namespacedPodPeer(agent.Namespace, kubeProxySelector(agent))},
+			},
+		)
 	}
 
 	return &networkingv1.NetworkPolicy{
@@ -2674,10 +2992,13 @@ func buildA2ASessionNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluster
 // AgentProfile namespace, once that namespace's own fence is in place), 9222 from exactly the
 // console server, nothing else.
 //
-// 8222 (monitor) gets no pod-network peer at all, decided rather than
-// forgotten. The kubelet's readiness probe enters from the node, which
-// NetworkPolicy does not govern (Dataplane V2 exempts host-local traffic), so
-// denying every pod costs nothing.
+// 8222 (monitor) gets one peer, the operator's own pod, which reads
+// config_load_time there to confirm a config reload (planA2ABusReload). It's
+// the same peer 4222 admits, and nothing else on the pod network reaches the
+// port. The kubelet's readiness probe enters from the node, which
+// NetworkPolicy does not govern (Dataplane V2 exempts host-local traffic).
+// With no operator peer (a2aOperatorNATSPeers) there is no 8222 rule, a
+// reload can't be confirmed, and the operator restarts the bus pod instead.
 //
 // 9222 (ws) gets one peer, the console server. The browser reaches the console
 // server through a port-forward and the server proxies the page's websocket to
@@ -2691,7 +3012,7 @@ func buildA2ASessionNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluster
 func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1.NetworkPolicy {
 	tcp := corev1.ProtocolTCP
 
-	return &networkingv1.NetworkPolicy{
+	policy := &networkingv1.NetworkPolicy{
 		TypeMeta: metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      a2aNATSNetpolName(agent),
@@ -2754,6 +3075,10 @@ func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 					{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
 						"app": a2aVerifierName(agent),
 					}}},
+					// The dispatcher, rendered only when the operator has its
+					// image; a peer that selects no pod admits nothing, so it
+					// is here either way.
+					{PodSelector: &metav1.LabelSelector{MatchLabels: a2aDispatcherPodSelector(agent)}},
 					// Session pods, by the spawner's labels (see
 					// a2aSessionComponent above).
 					{PodSelector: &metav1.LabelSelector{MatchLabels: a2aSessionPodSelector()}},
@@ -2789,6 +3114,15 @@ func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 			}},
 		},
 	}
+	if operator := a2aOperatorNATSPeers(); len(operator) > 0 {
+		policy.Spec.Ingress = append(policy.Spec.Ingress, networkingv1.NetworkPolicyIngressRule{
+			Ports: []networkingv1.NetworkPolicyPort{
+				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(a2aNATSMonitorPort))},
+			},
+			From: operator,
+		})
+	}
+	return policy
 }
 
 // a2aOperatorNATSPeers admits the operator's own pod, which publishes
@@ -2813,7 +3147,7 @@ func a2aOperatorNATSPeers() []networkingv1.NetworkPolicyPeer {
 	}}
 }
 
-// a2aProvisionScript is the provisioning payload: the four streams, four KV
+// a2aProvisionScript is the provisioning payload: the six streams, six KV
 // buckets, and four starter topics from the deployment spec, created
 // idempotently with the nats CLI. Topics are provisioned-only (payload spec):
 // which topics exist is exactly the subject lists rendered here.
@@ -3062,6 +3396,39 @@ $NATS stream info TASKS >/dev/null 2>&1 || $NATS stream add TASKS --allow-direct
   --max-msgs-per-subject=` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + ` \
   --max-consumers=` + strconv.Itoa(a2aTasksMaxConsumers(agent)) + ` --defaults
 
+# The TASKS durables whose name and filter are fixed (#4173): the gateway's
+# event relay and the bridge's intake. Made here, so their readers bind to them
+# and create nothing, and every principal that may create consumers on TASKS is
+# denied these names (a2aTasksFixedDurableDenyPublish). Pull, explicit ack,
+# every message from the start: what the readers ask for. A consumer add on a
+# durable that exists updates it to these settings, so one an older gateway or
+# bridge made (one filter, the server's max-pending) converges here.
+#
+# When the add fails, what matters is whether the durable exists. A missing one
+# leaves its reader waiting for it, so the run fails and the Job retries
+# (a timeout, TASKS at max_consumers, a grant gone wrong): a run reported
+# complete would never be retried. One that exists but won't take these
+# settings is left as it is: its reader refuses to bind it and names the
+# difference, which is louder than anything this could report.
+fixed_durable() { # name reader [consumer add flags...]
+  name=$1
+  reader=$2
+  shift 2
+  $NATS consumer add TASKS "${name}" "$@" >/dev/null && return 0
+  if ! $NATS consumer info TASKS "${name}" >/dev/null 2>&1; then
+    echo "could not create TASKS ${name}, and it does not exist: the ${reader} waits for it, so this run fails and the Job retries" >&2
+    exit 1
+  fi
+  echo "WARN: TASKS ${name} exists but could not be brought to this render's settings; the ${reader} refuses to bind it and names the difference" >&2
+}
+fixed_durable ` + a2aGatewayRelayDurable + ` gateway --pull \
+  --filter='` + a2aGatewayEventsFilter + `' --filter='` + a2aGatewaySupervisorFilter + `' \
+  --ack=explicit --deliver=all --replay=instant --max-deliver=-1 \
+  --max-pending=` + strconv.Itoa(a2aGatewayRelayMaxAckPending) + ` --defaults
+fixed_durable ` + a2aBridgeDurable() + ` bridge --pull \
+  --filter='` + a2aBridgeIntakeFilter() + `' \
+  --ack=explicit --deliver=all --replay=instant --max-deliver=-1 --defaults
+
 # DIRECTORY: last-value — the tombstone replaces the card. 1GiB cap.
 $NATS stream info DIRECTORY >/dev/null 2>&1 || $NATS stream add DIRECTORY --allow-direct \
   --subjects='a2a.agents.>' --storage=file --retention=limits \
@@ -3124,6 +3491,45 @@ $NATS kv info cap           >/dev/null 2>&1 || $NATS kv add cap --history=1 --re
 # at their caps (ask, answer and note, about 22KB) and more at a typical
 # size; past it the write is refused, and the rating is counted but not kept.
 $NATS kv info feedback      >/dev/null 2>&1 || $NATS kv add feedback --history=1 --replicas=1 --storage=file --max-bucket-size=67108864 --ttl=720h
+
+# people: one hashed key and a last-put time per chat person the gateway has
+# seen (a2a/gateway/people.go). The max age is the retention: NATS deletes a
+# person 30 days after their last turn, and the gateway counts nobody in a
+# bucket without one. Only the gateway's user reads or writes its records
+# (provision and seed can list its keys). 32MiB holds about a hundred thousand
+# entries; past it the put is refused, and the count under-counts.
+$NATS kv info people        >/dev/null 2>&1 || $NATS kv add people --history=1 --replicas=1 --storage=file --max-bucket-size=33554432 --ttl=720h
+# PROFILE_LEASES: each profile task's liveness lease, written only by the
+# dispatcher (lib.ProfileLeaseBucket; contract on #3655). No TTL: the
+# dispatcher reads expiry from each record, so a restarted one can still read
+# every lease it has to re-adopt or fail.
+$NATS kv info PROFILE_LEASES >/dev/null 2>&1 || $NATS kv add PROFILE_LEASES --history=1 --replicas=1 --storage=file --max-bucket-size=67108864
+
+# PROFILE_SUBMITS: new tasks for AgentProfiles, one subject per task
+# (a2a.submit.<profile>.<tier>.<kind>.<task>), published by the gateway and
+# held by the dispatcher on the operator's durables (contract on #3655). It is
+# its own stream so that the operator is the only principal with a consumer
+# verb on it: on TASKS, anything that can create consumers could pull a
+# profile's queue or rewrite its durable. Follow-ups and events stay on TASKS.
+# max-consumers is the durables' allowance, two per allowed tier for 16
+# profiles; nothing else makes a consumer here.
+$NATS stream info PROFILE_SUBMITS >/dev/null 2>&1 || $NATS stream add PROFILE_SUBMITS --allow-direct \
+  --subjects='a2a.submit.>' --storage=file --retention=limits \
+  --max-age=` + strconv.Itoa(int(a2aProfileSubmitMaxAge.Hours())) + `h --max-bytes=1073741824 --discard=old --replicas=1 \
+  --max-msgs-per-subject=1 --dupe-window=2m \
+  --max-consumers=` + strconv.Itoa(a2aProfileDurablesAllowed) + ` --defaults
+
+# DISPATCH_STOPS: the gateway's stop records for AgentProfile tasks, one per
+# task (a2a.stop.<profile>.<task>), read by the dispatcher by subject (contract
+# addendum 9). It is outside a2a.dispatch. on purpose: the dispatcher publishes
+# there, and a stop must have one writer, the gateway (granted with #4127). A
+# record outlives any task (24h against the 6h deadline cap). Nothing makes a
+# consumer here; --max-consumers=1 is the tightest cap JetStream has, since 0
+# means unlimited.
+$NATS stream info DISPATCH_STOPS >/dev/null 2>&1 || $NATS stream add DISPATCH_STOPS --allow-direct \
+  --subjects='a2a.stop.>' --storage=file --retention=limits \
+  --max-age=24h --max-bytes=67108864 --discard=old --replicas=1 \
+  --max-msgs-per-subject=1 --max-consumers=1 --defaults
 
 # TASKS older than this render: the limits the create above could not apply.
 #
@@ -3221,6 +3627,28 @@ if ! printf '%s' "${topics_state_json}" | grep -Eq '"a2a\.topics\.(>|agent\.(>|p
   echo "  Provisioning does not edit an existing stream; to append the subject to its current subjects:" >&2
   echo "    nats stream edit TOPICS-STATE --subjects=\"${topics_state_subjects},` + a2aTopologySkewSubject + `\"" >&2
 fi
+#
+# PROFILE_SUBMITS older than this render: read its live max age back. The
+# dispatcher keeps a finished task's tombstone for the max age the operator
+# renders, and a submission still on the stream past its tombstone would be
+# run again; provisioning never edits the stream (lowering a max age evicts
+# queued submissions), so a stream an older operator created longer than this
+# render's ` + strconv.Itoa(int(a2aProfileSubmitMaxAge/time.Second)) + `s is reported, and the operator
+# renders the longer one (#4948). 0 is no age limit. Same stance as the
+# extractors above: an answer with no readable max_age FAILS.
+submits_json="$($NATS stream info PROFILE_SUBMITS --json | tr -d ' \t\r\n')"
+live_submit_max_age_ns="$(printf '%s' "${submits_json}" \
+  | grep -o '"max_age":[0-9]\{1,\}' | head -n1 | cut -d: -f2 || true)"
+if [ -z "${live_submit_max_age_ns}" ]; then
+  echo "could not read max_age off the PROFILE_SUBMITS stream; refusing to report this install as provisioned" >&2
+  exit 1
+fi
+live_submit_max_age=$((live_submit_max_age_ns / 1000000000))
+if [ "${live_submit_max_age_ns}" = "0" ] || [ "${live_submit_max_age}" -gt ` + strconv.Itoa(int(a2aProfileSubmitMaxAge/time.Second)) + ` ]; then
+  report_findings="${report_findings}${report_findings:+,}\"` + a2aProvisionReportSubmitMaxAgeKey + `\":{\"` + a2aProvisionReportLiveKey + `\":${live_submit_max_age}}"
+  echo "NOTE: PROFILE_SUBMITS keeps submissions for ${live_submit_max_age}s (0 is no limit); this render creates it at ` + strconv.Itoa(int(a2aProfileSubmitMaxAge/time.Second)) + `s." >&2
+  echo "  The dispatcher is told the longer one, so a finished task's tombstone outlives its submission." >&2
+fi
 report="{${report_findings}}"
 # Written only where the kubelet has mounted the file: outside a pod there is
 # nothing to write to, and a copy of a report is not a reason to fail a fully
@@ -3278,7 +3706,9 @@ if [ "${live_consumers}" != "-1" ] && [ "${live_consumers}" -lt "${required_cons
   echo "     accepting delegations and spawning session pods while relaying no events, the" >&2
   echo "     bridge dispatches nothing, and the CR reads Ready over both. Session pods" >&2
   echo "     recover by themselves, which hides it rather than helping." >&2
-  echo "     Restarting before TASKS is back only fails the subscribe, so the order holds." >&2
+  echo "     The gateway, restarted early, waits for TASKS and its durable and binds once this" >&2
+  echo "     Job has made them. The bridge can restart in a loop until TASKS is back, so restart" >&2
+  echo "     its workload after the stream is back." >&2
   # Exit 2, and the convention it establishes: 2 means "this will fail the
   # same way next time", anything else is worth retrying. The Job's
   # podFailurePolicy matches on 2 and fails the Job from the first pod
@@ -3558,6 +3988,7 @@ func (r *PlatformAgentReconciler) reportA2AProvisionFindings(ctx context.Context
 				fmt.Sprintf(topicsStateSubjectEventMessage, job.Name, a2aTopologySkewSubject, a2aTopologySkewSubject))
 			outcome = a2aProvisionReportOutcomeReported
 		}
+		r.recordProfileSubmitMaxAge(ctx, agent, findings.submitMaxAge)
 	}
 	patch := client.MergeFrom(job.DeepCopy())
 	if job.Annotations == nil {
@@ -3566,6 +3997,25 @@ func (r *PlatformAgentReconciler) reportA2AProvisionFindings(ctx context.Context
 	job.Annotations[a2aProvisionReportAnnotation] = outcome
 	if err := r.Patch(ctx, job, patch); err != nil {
 		log.Error(err, "could not stamp the A2A provision Job as reported; the next pass reports it again")
+	}
+}
+
+// recordProfileSubmitMaxAge keeps what a readable report said about
+// PROFILE_SUBMITS' live max age on the PlatformAgent's status, for
+// desiredDispatchConfig: the value when the stream is longer than this
+// render's, absent when it isn't. Only a readable report changes it; one the
+// operator could not read leaves the last value. Best effort, like the rest
+// of the report: a failed write is logged, and the Job's next run reports it
+// again.
+func (r *PlatformAgentReconciler) recordProfileSubmitMaxAge(ctx context.Context, agent *agentv1alpha1.PlatformAgent, live *int64) {
+	have := agent.Status.ProfileSubmitMaxAgeSeconds
+	if (have == nil && live == nil) || (have != nil && live != nil && *have == *live) {
+		return
+	}
+	patch := client.MergeFrom(agent.DeepCopy())
+	agent.Status.ProfileSubmitMaxAgeSeconds = live
+	if err := r.Status().Patch(ctx, agent, patch); err != nil {
+		logf.FromContext(ctx).Error(err, "could not record PROFILE_SUBMITS' live max age; the provision Job's next run reports it again")
 	}
 }
 
@@ -3599,10 +4049,13 @@ func (f *tasksSubjectCapFinding) eventMessage(jobName string) string {
 
 // a2aProvisionFindings is what parseA2AProvisionReport read out of one
 // report: each finding the reader knows, absent when the script did not
-// write it. Both nil/false is the clean report, {}.
+// write it. All nil/false is the clean report, {}.
 type a2aProvisionFindings struct {
 	tasksSubjectCap           *tasksSubjectCapFinding
 	topicsStateSubjectMissing bool
+	// submitMaxAge is PROFILE_SUBMITS' live max age in seconds when the
+	// script found it longer than this render's (0: no age limit), else nil.
+	submitMaxAge *int64
 }
 
 // parseA2AProvisionReport reads the termination message and returns the
@@ -3652,6 +4105,13 @@ func parseA2AProvisionReport(message string) (a2aProvisionFindings, error) {
 		}
 		findings.topicsStateSubjectMissing = true
 	}
+	if fields, present := report[a2aProvisionReportSubmitMaxAgeKey]; present {
+		live, ok := fields[a2aProvisionReportLiveKey]
+		if !ok || live < 0 || (live != 0 && live <= int64(a2aProfileSubmitMaxAge/time.Second)) {
+			return findings, fmt.Errorf("the provision pod's termination message %q carries a %s finding without a %s longer than %ds or 0; not a report the script writes", message, a2aProvisionReportSubmitMaxAgeKey, a2aProvisionReportLiveKey, int64(a2aProfileSubmitMaxAge/time.Second))
+		}
+		findings.submitMaxAge = &live
+	}
 	return findings, nil
 }
 
@@ -3699,18 +4159,317 @@ func a2aProvisionTerminationMessage(pods []corev1.Pod) (string, bool) {
 // playground path).
 const defaultA2AMaxSessions = 10
 
+// The namespace pod quota adds headroom above the gateway's cap, because the
+// quota is namespace-wide: that is the only shape a hostile pod-creator cannot
+// dodge (ResourceQuota scopes select on fields the creator writes), so it must
+// leave room for everything else that legitimately runs here. The headroom is
+// derived rather than a constant (#3848): a fixed 16, sized for "roughly ten
+// standing pods plus surge", stopped covering the release once the callouts,
+// verifiers and console arrived and an install could add Hindsight and the
+// GitHub minter, and the gateway's tenth session was refused by admission.
+// a2aQuotaHeadroom is the sum of three parts:
+//
+//   - a2aStandingPods: what this operator keeps running for the agent;
+//   - the chart's pods (its standing workloads in kube-agents.chartWorkloads:
+//     the operator, LiteLLM and its replay proxy, Hindsight, the GitHub minter
+//     and the web console, plus the surge pods each one's rollout can add,
+//     since a chart bump rolls several in one upgrade), which only the chart
+//     knows: it stamps them on the PlatformAgent as a2aChartPodsAnnotation,
+//     and renders them in the a2aChartPodsConfigMapName ConfigMap, which the
+//     operator reads in its own namespace for a CR without the annotation
+//     (a2aQuotaAgent);
+//   - a2aQuotaTransientMargin for what this operator starts beside the
+//     standing pods, and the gateway's overshoot.
+const (
+	// a2aChartPodsAnnotation carries the chart's pod count, standing pods
+	// plus their surges (charts/kube-agents/templates/platform-agent-cr.yaml,
+	// from kube-agents.chartQuotaPods).
+	a2aChartPodsAnnotation = "kubeagents.x-k8s.io/a2a-quota-chart-pods"
+	// a2aChartPodsConfigMapName is the ConfigMap the chart renders in its
+	// release namespace with the same count, under a2aChartPodsConfigMapKey
+	// (charts/kube-agents/templates/a2a-quota-chart-pods.yaml). The operator
+	// reads it when the CR carries no annotation: a PlatformAgent written by
+	// hand in a release with platformAgent.enabled=false (#4883).
+	a2aChartPodsConfigMapName = "a2a-quota-chart-pods"
+	a2aChartPodsConfigMapKey  = "pods"
+	// a2aDefaultChartPods stands in when neither that annotation, the chart's
+	// ConfigMap nor the chart's workloads give a usable count (a PlatformAgent
+	// in a namespace with no chart release, or an unreadable value): the
+	// chart's default release, the operator and two LiteLLM replicas, and a
+	// surge pod for each of the two Deployments. It errs high for a CR in a
+	// namespace with no chart pods, which only loosens the bound. A
+	// hand-written CR beside a chart release that runs the operator
+	// (platformAgent.enabled=false) gets the release's count from the
+	// ConfigMap in the operator's namespace (#4883); one in any other
+	// namespace, from the chart's workloads there (#5006).
+	// tests/test_quota_preflight.py ties it to a default chart render.
+	a2aDefaultChartPods = 5
+	// a2aMaxChartPods bounds what the annotation may claim. The quota is the
+	// enforcement half of the session bound, and anyone who can annotate the
+	// CR could otherwise lift it as far as an int64 goes (or wrap it); the
+	// chart's own count is a handful of pods, so a figure past this is not one
+	// it wrote, and the default stands in for it.
+	a2aMaxChartPods = 64
+	// a2aChartPodsDiscardedReason is the Warning event a CR gets when the
+	// operator does not use a chart-pods count it finds, from the annotation, the
+	// ConfigMap or the chart's workloads, once per spec generation and reason
+	// (a2aQuotaAgent): the
+	// quota then counts a2aDefaultChartPods, which can sit below what the
+	// namespace runs.
+	a2aChartPodsDiscardedReason = "A2AQuotaChartPodsDiscarded"
+	// a2aQuotaTransientMargin is room for pods this operator starts beside the
+	// standing ones, at their worst moment, a helm upgrade: two rollout surge
+	// pods (the callouts and verifiers roll together on the new operator's
+	// reconcile, each surge-first; the chart's own surges are in its count),
+	// one provisioning Job pod (at install, on any spec change and about daily
+	// after its TTL), the scope publisher's Job pods, and three for the
+	// gateway's count-then-create overshoot (a2a/gateway/spawn.go,
+	// refuseAtSessionCap).
+	a2aQuotaTransientMargin = 2 + 1 + a2aScopePublisherJobPods + 3
+	// a2aScopePublisherJobPods is the scope publisher's Job pods at once: one,
+	// started every scopePublishInterval and never while another is active
+	// (decideScopePublish). The margin counts it in next mode, the only mode
+	// this quota renders in, whether or not a scope gives the Job anything to
+	// resolve. The chart's quota preflight counts the same pod only when one
+	// does (files/transient-pods.yaml), so this may not count fewer:
+	// TestTheChartCountsTheScopePublishersJobPod.
+	a2aScopePublisherJobPods = 1
+)
+
 // a2aQuotaHeadroom is what the namespace pod quota adds above the gateway's
-// cap. The quota is namespace-wide because that is the only shape a hostile
-// pod-creator cannot dodge (ResourceQuota scopes select on fields the
-// creator writes), so it must leave room for everything else that
-// legitimately runs here: the rendered stack and its neighbors (operator,
-// agent pod, gateway, NATS, LiteLLM, dashboard), Job pods (provision, seed),
-// rollout surge doubling a Deployment for a moment, and the gateway's
-// count-then-create overshoot. Fifteen covered roughly ten standing pods plus
-// surge; the console server made it eleven, hence sixteen. If the base
-// install grows again, raise this before anything user-visible starts failing
-// admission.
-const a2aQuotaHeadroom = 16
+// cap for agent.
+func a2aQuotaHeadroom(agent *agentv1alpha1.PlatformAgent) int64 {
+	return a2aStandingPods(agent) + a2aChartPods(agent) + a2aQuotaTransientMargin
+}
+
+// a2aChartPodsWarning is what a2aChartPodsWarned last reported for a CR: the
+// spec generation and the Warning itself.
+type a2aChartPodsWarning struct {
+	generation int64
+	value      string // the Warning's message: its source and the value, truncated
+}
+
+// a2aChartPodsCount reads the CR's chart-pods annotation once (#4893): the
+// chart's pods in agent's namespace, surges included, that the session quota
+// counts, and why the annotation was discarded, "" when it was used or is
+// absent. An absent one is a CR written without the chart, which the default
+// is for (or one the chart's ConfigMap stands in for: a2aQuotaAgent). A
+// present one the operator discards is a figure the chart did not write (the
+// chart refuses to render one past the cap) or one it cannot read, and the
+// default may then sit below what the namespace runs, so the reason is
+// reported rather than silent.
+func a2aChartPodsCount(agent *agentv1alpha1.PlatformAgent) (int64, string) {
+	raw, present := agent.GetAnnotations()[a2aChartPodsAnnotation]
+	return a2aParseChartPods(raw, present, "annotation "+a2aChartPodsAnnotation)
+}
+
+// a2aParseChartPods is the one parse of a chart-pods count, wherever it was
+// read: the count, and why it was discarded, naming source.
+func a2aParseChartPods(raw string, present bool, source string) (int64, string) {
+	if !present {
+		return a2aDefaultChartPods, ""
+	}
+	v, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+	switch {
+	case err != nil:
+		return a2aDefaultChartPods, fmt.Sprintf("%s=%.64q is not a number; the session quota counts the default of %d chart pods instead", source, raw, a2aDefaultChartPods)
+	case v < 0 || v > a2aMaxChartPods:
+		return a2aDefaultChartPods, fmt.Sprintf("%s=%.64q is outside 0-%d; the session quota counts the default of %d chart pods instead, which can be fewer than the namespace runs", source, raw, a2aMaxChartPods, a2aDefaultChartPods)
+	}
+	return v, ""
+}
+
+// a2aQuotaAgent is the agent the session quota is sized for: agent itself
+// when it carries the chart-pods annotation, or when no chart ConfigMap can
+// be used; otherwise a copy carrying the ConfigMap's count as the annotation,
+// so every sizing function reads one figure (#4883). The second result is
+// why a count was not used, "" when it was, naming its source.
+//
+// The operator reads the chart's ConfigMap from its own namespace only
+// (r.OperatorNamespace, from POD_NAMESPACE through the downward API): the
+// release that runs the operator and its chart pods there, with a
+// PlatformAgent written by hand beside them. It is read uncached
+// (a2aReader), like the rest of this path's bookkeeping. In any other
+// namespace the operator counts the chart's workloads there instead
+// (a2aChartWorkloadPods, #5006), and a chart ConfigMap there is not read.
+// Either count goes through the annotation's parse, cap and Warning.
+func (r *PlatformAgentReconciler) a2aQuotaAgent(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (*agentv1alpha1.PlatformAgent, string, error) {
+	if _, ok := agent.GetAnnotations()[a2aChartPodsAnnotation]; ok {
+		_, why := a2aChartPodsCount(agent)
+		return agent, why, nil
+	}
+	key := types.NamespacedName{Namespace: agent.Namespace, Name: a2aChartPodsConfigMapName}
+	cm := &corev1.ConfigMap{}
+	if r.OperatorNamespace == "" || agent.Namespace != r.OperatorNamespace {
+		// Outside the operator's namespace the count comes from the chart's
+		// workloads there. No lookup here can fail the reconcile: a failed
+		// List counts the default and says why.
+		pods, found, err := r.a2aChartWorkloadPods(ctx, agent.Namespace)
+		source := fmt.Sprintf("the chart's Deployments and StatefulSets in namespace %s (the PlatformAgent carries no %s annotation)", agent.Namespace, a2aChartPodsAnnotation)
+		if err != nil {
+			return agent, fmt.Sprintf("%s could not be listed (%v); the session quota counts the default of %d chart pods instead", source, err, a2aDefaultChartPods), nil
+		}
+		if found {
+			raw := strconv.FormatInt(pods, 10)
+			_, why := a2aParseChartPods(raw, true, source)
+			return a2aWithChartPods(agent, raw), why, nil
+		}
+		// With no chart workloads here, a chart ConfigMap is the one sign of a
+		// release whose count the quota cannot use: say so.
+		if err := r.a2aReader().Get(ctx, key, cm); err != nil {
+			return agent, "", nil
+		}
+		if r.OperatorNamespace == "" {
+			return agent, fmt.Sprintf("ConfigMap %s in namespace %s is not read: the operator's own namespace is unknown (%s is unset or not a namespace name), so the session quota counts the default of %d chart pods; set the %s annotation on the PlatformAgent instead", a2aChartPodsConfigMapName, agent.Namespace, OperatorNamespaceEnv, a2aDefaultChartPods, a2aChartPodsAnnotation), nil
+		}
+		return agent, fmt.Sprintf("ConfigMap %s in namespace %s is not read: the operator reads the chart's pod count only from its own namespace (%s), so the session quota counts the default of %d chart pods; set the %s annotation on the PlatformAgent instead", a2aChartPodsConfigMapName, agent.Namespace, r.OperatorNamespace, a2aDefaultChartPods, a2aChartPodsAnnotation), nil
+	}
+	err := r.a2aReader().Get(ctx, key, cm)
+	if errors.IsNotFound(err) {
+		return agent, "", nil
+	}
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to read the chart's pod count from ConfigMap %s: %w", a2aChartPodsConfigMapName, err)
+	}
+	source := fmt.Sprintf("ConfigMap %s key %s (the PlatformAgent carries no %s annotation)", a2aChartPodsConfigMapName, a2aChartPodsConfigMapKey, a2aChartPodsAnnotation)
+	raw, present := cm.Data[a2aChartPodsConfigMapKey]
+	if !present {
+		// The chart always writes the key, so a ConfigMap of this name without
+		// it is not the chart's: say so rather than count the default silently.
+		return agent, fmt.Sprintf("%s is missing; the session quota counts the default of %d chart pods instead", source, a2aDefaultChartPods), nil
+	}
+	_, why := a2aParseChartPods(raw, present, source)
+	return a2aWithChartPods(agent, raw), why, nil
+}
+
+// a2aWithChartPods is a copy of agent carrying raw as the chart-pods
+// annotation, so every sizing function reads one figure. The CR itself is
+// never changed.
+func a2aWithChartPods(agent *agentv1alpha1.PlatformAgent, raw string) *agentv1alpha1.PlatformAgent {
+	sized := agent.DeepCopy()
+	annotations := sized.GetAnnotations()
+	if annotations == nil {
+		annotations = map[string]string{}
+	}
+	annotations[a2aChartPodsAnnotation] = raw
+	sized.SetAnnotations(annotations)
+	return sized
+}
+
+// a2aChartWorkloadSelector picks the chart's own Deployments and
+// StatefulSets: every one carries both labels through kube-agents.labels.
+// This operator's workloads carry its field owner as managed-by, so they are
+// not counted here; they are in a2aStandingPods.
+var a2aChartWorkloadSelector = client.MatchingLabels{
+	labelManagedBy: managedByHelm,
+	labelPartOf:    partOfKubeAgents,
+}
+
+// a2aChartWorkloadPods counts the chart's pods in namespace from its
+// workloads there (#5006), for a PlatformAgent outside the operator's
+// namespace with no chart-pods annotation. found is false when the namespace
+// holds no chart workloads. It reads the manager's cache, which holds both
+// kinds already (the controller owns them), so it adds no API call.
+func (r *PlatformAgentReconciler) a2aChartWorkloadPods(ctx context.Context, namespace string) (pods int64, found bool, err error) {
+	var deployments appsv1.DeploymentList
+	if err := r.List(ctx, &deployments, client.InNamespace(namespace), a2aChartWorkloadSelector); err != nil {
+		return 0, false, err
+	}
+	var statefulSets appsv1.StatefulSetList
+	if err := r.List(ctx, &statefulSets, client.InNamespace(namespace), a2aChartWorkloadSelector); err != nil {
+		return 0, false, err
+	}
+	return a2aChartWorkloadsCount(deployments.Items, statefulSets.Items), len(deployments.Items)+len(statefulSets.Items) > 0, nil
+}
+
+// a2aChartWorkloadsCount is the chart's pod count from its workloads, as
+// kube-agents.chartQuotaPods computes it from values: each workload's
+// replicas, and each Deployment's rollout surge pods. tests/test_quota_preflight.py
+// holds the two equal over rendered charts.
+func a2aChartWorkloadsCount(deployments []appsv1.Deployment, statefulSets []appsv1.StatefulSet) int64 {
+	var n int64
+	for i := range deployments {
+		n = a2aSatAdd(n, int64(ptr.Deref(deployments[i].Spec.Replicas, 1)))
+		n = a2aSatAdd(n, a2aDeploymentSurgePods(&deployments[i]))
+	}
+	for i := range statefulSets {
+		n = a2aSatAdd(n, int64(ptr.Deref(statefulSets[i].Spec.Replicas, 1)))
+	}
+	return n
+}
+
+// a2aDeploymentSurgePods is how many pods a rollout of d can add: its
+// maxSurge against its replicas, a percentage rounded up (Kubernetes' 25%
+// when unset), never past the replicas (so none at zero replicas), and none
+// for Recreate (#4876).
+func a2aDeploymentSurgePods(d *appsv1.Deployment) int64 {
+	replicas := int(ptr.Deref(d.Spec.Replicas, 1))
+	if d.Spec.Strategy.Type == appsv1.RecreateDeploymentStrategyType {
+		return 0
+	}
+	surge := intstr.FromString("25%")
+	if ru := d.Spec.Strategy.RollingUpdate; ru != nil && ru.MaxSurge != nil {
+		surge = *ru.MaxSurge
+	}
+	v, err := intstr.GetScaledValueFromIntOrPercent(&surge, replicas, true)
+	if err != nil || v < 0 || v > replicas {
+		v = replicas
+	}
+	return int64(v)
+}
+
+// a2aSatAdd adds two non-negative counts, stopping at math.MaxInt64.
+func a2aSatAdd(a, b int64) int64 {
+	if a > math.MaxInt64-b {
+		return math.MaxInt64
+	}
+	return a + b
+}
+
+// a2aChartPods is the count a2aChartPodsCount reads.
+func a2aChartPods(agent *agentv1alpha1.PlatformAgent) int64 {
+	n, _ := a2aChartPodsCount(agent)
+	return n
+}
+
+// a2aStandingPods is every pod the operator keeps running for agent in next
+// mode, summed from the builders that render them, so a resized workload is
+// counted at its new size. A new standing workload has to be added here:
+// TestA2AStandingPodsMatchTheNextModeGolden fails until an unconditional one
+// is, and a conditional one needs a row in
+// TestA2AStandingPodsCountTheConditionalWorkloads.
+func a2aStandingPods(agent *agentv1alpha1.PlatformAgent) int64 {
+	agentReplicas, _ := resolveDeploymentReplicasAndStrategy(agent.Spec.Deployment)
+	n := int64(agentReplicas)
+	for _, dep := range []*appsv1.Deployment{
+		buildCredentialProxyDeployment(agent, ""),
+		buildKubeProxyDeployment(agent, "", false, ""),
+		buildA2ACalloutDeployment(agent, "", 1), // the shard count changes nothing about the replicas
+		buildA2AVerifierDeployment(agent),
+		buildA2AConsoleDeployment(agent),
+		buildA2AGatewayDeployment(agent),
+	} {
+		n += int64(ptr.Deref(dep.Spec.Replicas, 1))
+	}
+	for _, sts := range []*appsv1.StatefulSet{
+		buildShellSandboxStatefulSet(agent, "", "", ""),
+		buildA2ANATSStatefulSet(agent, ""),
+	} {
+		n += int64(ptr.Deref(sts.Spec.Replicas, 1))
+	}
+	// The workloads rendered on a condition, which the next-mode golden (the
+	// example CR, no operator flags) cannot show; TestA2AStandingPodsCountThe
+	// ConditionalWorkloads names each. The credential proxy's exec tier is a CR
+	// field (spec.deployment.credentialProxy.exec.replicas, unset as 0); the
+	// workloads behind an operator flag (the MCP door, the dispatcher) come from
+	// a2aFlaggedPods, which the chart's quota preflight mirrors.
+	n += int64(credentialProxyExecTierReplicas(agent))
+	n += a2aFlaggedStandingPods(agent)
+	// The gateway's standbys and its rollout's surge pod, under the election
+	// (the builder above renders the one replica it runs before then).
+	n += a2aGatewayStandbyPods(agent)
+	return n
+}
 
 func resolveA2AMaxSessions(agent *agentv1alpha1.PlatformAgent) int {
 	if limits := agentTuning(agent); limits != nil && limits.MaxSessions != nil {
@@ -4060,6 +4819,14 @@ func a2aTasksConsumerBudget(agent *agentv1alpha1.PlatformAgent) int {
 	return resolveA2AMaxSessions(agent)*a2aSessionConsumersPerSession + a2aTasksReserve(agent)
 }
 
+// a2aProfileDurablesAllowed is PROFILE_SUBMITS's max_consumers: one durable
+// per (profile, tier, kind), so 16 profiles with both tiers. Profiles are not
+// bounded by the CRD, so this is an allowance, not a count: a profile past it
+// gets no durables (the create is refused at the stream's cap) and its
+// CardPublished condition says why. A sizing knob replaces it when the budget
+// work lands.
+const a2aProfileDurablesAllowed = 16 * 2 * 2
+
 // a2aTasksMaxConsumers is what a fresh TASKS stream is created with.
 func a2aTasksMaxConsumers(agent *agentv1alpha1.PlatformAgent) int {
 	if budget := a2aTasksConsumerBudget(agent); budget > a2aTasksMaxConsumersFloor {
@@ -4146,7 +4913,7 @@ func a2aProvisionRefusalStatus(agent *agentv1alpha1.PlatformAgent) string {
 		}
 	}
 	return fmt.Sprintf(
-		" That reason means the script exited 2, the refusal a re-run reaches again: a TASKS stream holding fewer consumers than %s. max_consumers cannot be widened in place — nats-server refuses that edit on a stream that exists — so %s and let provisioning recreate it at %d, which discards the task history it is holding. The pod log has what the stream actually holds, and therefore %s. %s Deleting the stream does not — nothing re-reads the bus until the Job runs again. Delete the Job to re-run it now, or leave it and the 24h TTL will; then, once TASKS is back, restart the clients that held a durable consumer on it: kubectl rollout restart deployment/%s -n %s, and the agent workload %s-gateway with it where a Hermes bridge sidecar runs. Deleting a stream deletes its consumers and neither client re-creates one, so skipping that leaves a gateway accepting delegations and spawning session pods while relaying no events, and a CR reading Ready over it. Restarting before the stream is back only fails the subscribe, so the order holds.",
+		" That reason means the script exited 2, the refusal a re-run reaches again: a TASKS stream holding fewer consumers than %s. max_consumers cannot be widened in place — nats-server refuses that edit on a stream that exists — so %s and let provisioning recreate it at %d, which discards the task history it is holding. The pod log has what the stream actually holds, and therefore %s. %s Deleting the stream does not — nothing re-reads the bus until the Job runs again. Delete the Job to re-run it now, or leave it and the 24h TTL will; then, once TASKS is back, restart the clients that held a durable consumer on it: kubectl rollout restart deployment/%s -n %s, and the agent workload %s-gateway with it where a Hermes bridge sidecar runs. Deleting a stream deletes its consumers and neither client re-creates one, so skipping that leaves a gateway accepting delegations and spawning session pods while relaying no events, and a CR reading Ready over it. A gateway restarted before the stream is back waits for it and for its durable, which provisioning creates with the stream, and binds once both exist; a bridge restarted early can restart in a loop until the stream is back, so restart its workload after the stream is back.",
 		need, ways, a2aTasksMaxConsumers(agent), fits, finish,
 		a2aGatewayName(agent), agent.Namespace, agent.Name)
 }
@@ -4170,7 +4937,7 @@ func a2aSessionQuotaName(agent *agentv1alpha1.PlatformAgent) string {
 // compute-resource key (requests.*) would force resource requests onto
 // every pod in the namespace, which is not this bound's mandate.
 func buildA2ASessionQuota(agent *agentv1alpha1.PlatformAgent) *corev1.ResourceQuota {
-	limit := int64(resolveA2AMaxSessions(agent) + a2aQuotaHeadroom)
+	limit := int64(resolveA2AMaxSessions(agent)) + a2aQuotaHeadroom(agent)
 	return &corev1.ResourceQuota{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ResourceQuota"},
 		ObjectMeta: metav1.ObjectMeta{
@@ -4205,23 +4972,25 @@ func buildA2AGatewayServiceAccount(agent *agentv1alpha1.PlatformAgent) *corev1.S
 // Namespaced: pods, its own Deployment and its own PlatformAgent, the last two
 // pinned by name. The gateway creates and reaps one pod per delegated task in
 // its own namespace; it reads no Secret, no ConfigMap but the one home-channel record it
-// may patch, and no other namespace.
+// may patch and, under mode next, the resolved scope, and no other namespace.
 //
 // What it does NOT bound, stated because the next reader will otherwise take
 // this rule for a ceiling: `create` on pods is a privilege-escalation
-// primitive wherever admission does not constrain the PodSpec, and nothing in
-// this repository constrains it here. A gateway that is compromised or
-// prompt-steered into building its own PodSpec can name any ServiceAccount in
-// the namespace — including the platform agent's, whose Workload Identity
-// binding then resolves for that pod — mount any Secret in it, and stamp
-// labels no NetworkPolicy selects. spawn.go declining to do any of that is
-// what the gateway CHOOSES, not what this grant PERMITS, and the two are not
-// the same claim. Narrowing it takes a ValidatingAdmissionPolicy on pod create
-// by this subject (no serviceAccountName, no secret volumes,
-// automountServiceAccountToken false); that policy does not exist yet and is
-// named in this change's PR body as the follow-up it owes.
+// primitive wherever admission does not constrain the PodSpec. A gateway that
+// is compromised or prompt-steered into building its own PodSpec could name
+// any ServiceAccount in the namespace — including the platform agent's, whose
+// Workload Identity binding then resolves for that pod — mount any Secret in
+// it, and stamp labels no NetworkPolicy selects. spawn.go declining to do any
+// of that is what the gateway CHOOSES, not what this grant PERMITS. The
+// ValidatingAdmissionPolicy kube-agents-a2a-gateway-pod
+// (config/admission/a2a-gateway-pod-policy.yaml) holds this subject's pod
+// creates to the session pod spawn.go builds: the session ServiceAccount, no
+// automount, the session token audiences, no Secret, the session labels. The
+// chart installs it only under admissionPolicy.enabled on Kubernetes >= 1.30
+// and sets A2A_GATEWAY_POD_POLICY on the operator where it does; elsewhere
+// this grant is as wide as written.
 func buildA2AGatewayRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
-	return &rbacv1.Role{
+	role := &rbacv1.Role{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "Role"},
 		ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace, Labels: a2aLabels(agent, "gateway")},
 		Rules: []rbacv1.PolicyRule{
@@ -4257,8 +5026,9 @@ func buildA2AGatewayRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
 			},
 			// The home-channel record, one named ConfigMap: the gateway's
 			// learn (a2a/gateway/slack_home_channel.go) reads and patches it,
-			// once an A2A_HOME_CHANNEL_LEARN this operator does not yet render
-			// arms it (platformagent_home_channel_record.go).
+			// and the operator reads it into the projected file both pods
+			// mount and the HomeChannelUnset condition
+			// (platformagent_home_channel_record.go).
 			{
 				APIGroups:     []string{""},
 				Resources:     []string{"configmaps"},
@@ -4267,6 +5037,31 @@ func buildA2AGatewayRole(agent *agentv1alpha1.PlatformAgent) *rbacv1.Role {
 			},
 		},
 	}
+	// The election's Lease, one named object, with the election on: the
+	// gateway reads and renews it (a2a/gateway/election.go). No create,
+	// which RBAC can't scope to a name, so the operator creates it
+	// (ensureA2AGatewayLease); no delete and no list.
+	if a2aGatewayElectionEnabled() {
+		role.Rules = append(role.Rules, rbacv1.PolicyRule{
+			APIGroups:     []string{"coordination.k8s.io"},
+			Resources:     []string{"leases"},
+			ResourceNames: []string{a2aGatewayLeaseName(agent)},
+			Verbs:         []string{"get", "update"},
+		})
+	}
+	// The resolved scope under mode next, one named ConfigMap, read only:
+	// the scope publisher writes it, for the gateway's admission check to
+	// read under the name in A2A_RESOLVED_SCOPE_CONFIGMAP. Rendered with the
+	// ConfigMap, so the grant never outlives the object it names.
+	if scopePublisherRendered(agent) {
+		role.Rules = append(role.Rules, rbacv1.PolicyRule{
+			APIGroups:     []string{""},
+			Resources:     []string{"configmaps"},
+			ResourceNames: []string{scopeResolvedConfigMapName(agent)},
+			Verbs:         []string{"get"},
+		})
+	}
+	return role
 }
 
 func buildA2AGatewayRoleBinding(agent *agentv1alpha1.PlatformAgent) *rbacv1.RoleBinding {
@@ -4677,6 +5472,7 @@ func a2aRequiredSecretRef(ref *corev1.SecretKeySelector, defaultKey string) *cor
 // on the console door alone: every next install renders it at one replica.
 func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deployment {
 	name := a2aGatewayName(agent)
+	leaseEnv := a2aGatewayLeaseEnv(agent)
 	labels := a2aLabels(agent, "gateway")
 	selector := map[string]string{"app": name}
 	podLabels := map[string]string{"app": name}
@@ -4745,11 +5541,19 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	var clusterViewEnv []corev1.EnvVar
 	if a2aSessionClusterViewEnabled(agent) {
 		// The spawner's half of the cluster view: told, and told where the
-		// broker is. Both or neither - the gateway refuses the first
-		// without the second (a2a/gateway/config.go).
+		// broker and kube-proxy are. Both or neither - the gateway refuses the
+		// first without the broker URL (a2a/gateway/config.go).
 		clusterViewEnv = []corev1.EnvVar{
 			{Name: "A2A_SESSION_CLUSTER_VIEW", Value: "true"},
 			{Name: "A2A_CREDENTIAL_PROXY_URL", Value: credentialProxyBaseURL(agent)},
+			{Name: "A2A_KUBE_PROXY_URL", Value: kubeProxyURL(agent)},
+			{Name: "A2A_KUBE_PROXY_CA_CONFIGMAP", Value: kubeProxyCABundleName(agent)},
+			{Name: "A2A_KUBE_PROXY_HOST_CONTEXT", Value: hostClusterContextName(agent)},
+		}
+		// The exec tier's address, while it renders, for the session pods'
+		// commands; the spawner passes it on as CREDENTIAL_PROXY_EXEC_URL.
+		if credentialProxyExecTierEnabled(agent) {
+			clusterViewEnv = append(clusterViewEnv, corev1.EnvVar{Name: a2aCredentialProxyExecURLEnv, Value: credentialProxyExecTierURL(agent)})
 		}
 	}
 
@@ -4803,22 +5607,32 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		if slack.AnswerFeedback != nil && !*slack.AnswerFeedback {
 			backendEnv = append(backendEnv, corev1.EnvVar{Name: a2aSlackAnswerFeedbackEnvVar, Value: strconv.FormatBool(false)})
 		}
-		// The learned-home contract (platformagent_home_channel_record.go),
-		// for a gateway that learns a home channel from the first admitted
-		// mention: whether it may, the record it would write, and its own
-		// image for the record's writer and reader keys. The gateway reads
-		// them, and learns only once A2A_HOME_CHANNEL_LEARN is rendered true,
-		// which this release does not. The gateway's home env above stays the
-		// CR's: a learned value reaches the gateway through the record, not a
-		// re-render.
+		// The learned-home contract (platformagent_home_channel_record.go):
+		// whether the gateway may learn a home channel from the first
+		// admitted mention, the record it writes, its own image for the
+		// record's writer key, and the switch that arms the learn. The
+		// operator reads the record into the projected file both pods mount
+		// and the HomeChannelUnset condition. The gateway's home env above
+		// stays the CR's: a learned value reaches the gateway through the
+		// file, not a re-render.
 		backendEnv = append(backendEnv,
 			corev1.EnvVar{Name: a2aSlackHomePolicyEnvVar, Value: slackHomeChannelPolicy(agent)},
 			corev1.EnvVar{Name: a2aHomeChannelRecordEnvVar, Value: a2aHomeChannelRecordName(agent)},
 			corev1.EnvVar{Name: a2aGatewaySelfImageEnvVar, Value: a2aGatewayImage()},
+			corev1.EnvVar{Name: a2aHomeChannelLearnEnvVar, Value: a2aHomeChannelLearnEnvValue},
 		)
 	}
 	var chatEnv []corev1.EnvVar
 	var chatMounts []corev1.VolumeMount
+	// The home-channel projection, read by the notify route and the learner
+	// (a2a/gateway/slack_home_channel.go), on a Slack gateway only: a Chat
+	// gateway's home is the CR's, and its template stays as it was.
+	var homeVolumes []corev1.Volume
+	var homeMounts []corev1.VolumeMount
+	if a2aSlackArmed(agent) {
+		homeVolumes = []corev1.Volume{homeChannelProjectionVolume(agent)}
+		homeMounts = []corev1.VolumeMount{homeChannelProjectionMount(a2aGatewayChatHomeDir)}
+	}
 	var chatVolumes []corev1.Volume
 	if a2aChatArmed(agent) {
 		gchat := agent.Spec.Integration.GoogleChat
@@ -4852,6 +5666,11 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		if home := strings.TrimSpace(gchat.HomeChannel); home != "" {
 			chatEnv = append(chatEnv, corev1.EnvVar{Name: a2aGchatHomeChannelEnvVar, Value: home})
 		}
+		// Answer feedback is on unless the install turns it off; only the
+		// off is rendered, as on Slack, so the pod is unchanged by default.
+		if gchat.AnswerFeedback != nil && !*gchat.AnswerFeedback {
+			chatEnv = append(chatEnv, corev1.EnvVar{Name: a2aGchatAnswerFeedbackEnvVar, Value: strconv.FormatBool(false)})
+		}
 		chatMounts = []corev1.VolumeMount{{Name: a2aGchatTokenVolume, MountPath: a2aGchatTokenDir, ReadOnly: true}}
 		chatVolumes = []corev1.Volume{{
 			Name: a2aGchatTokenVolume,
@@ -4882,6 +5701,12 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		}}},
 	}
 	env = append(env, backendEnv...)
+	// The people record is on unless the install turns it off, whatever
+	// backend is armed; only the off is rendered, so an install that never
+	// set the field keeps the gateway's env, and its pod, as they were.
+	if agent.Spec.Telemetry != nil && agent.Spec.Telemetry.PeopleSeen != nil && !*agent.Spec.Telemetry.PeopleSeen {
+		env = append(env, corev1.EnvVar{Name: a2aPeopleSeenEnvVar, Value: strconv.FormatBool(false)})
+	}
 	env = append(env, []corev1.EnvVar{
 		// Always on (see a2aConsoleDoorEnvVar): the gateway starts
 		// on the console door when the install configures no chat
@@ -4892,6 +5717,8 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		// the same one the session quota was sized above,
 		// so the two halves cannot drift apart silently.
 		{Name: "A2A_MAX_SESSIONS", Value: strconv.Itoa(resolveA2AMaxSessions(agent))},
+		// The relay binds the durable the provision Job created (#4173).
+		{Name: a2aGatewayRelayPrecreatedEnvVar, Value: "true"},
 		// The busy notice's threshold, rendered explicitly
 		// for the same reason: the number a reader of the
 		// live Deployment sees is the bridge worker count it
@@ -4973,6 +5800,16 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		// name, so the render and the spawner must agree
 		// or every session is refused at connect.
 		{Name: "A2A_SESSION_SERVICE_ACCOUNT", Value: a2aSessionServiceAccountName(agent)},
+		// The install's rendered spec.scope, which a profile
+		// task's target is checked against
+		// (a2aGatewayScopeVolume). Rendered at the gateway's
+		// default, so a reader of the live Deployment sees where
+		// the file comes from.
+		{Name: a2aGatewayScopeFileEnv, Value: scopeDir + "/" + scopeFileName},
+		// The install's own project, which the target check
+		// admits whatever spec.scope lists, as the reconcile
+		// does. Empty on an install with no harness block.
+		{Name: a2aGatewayManagementProjectEnv, Value: a2aManagementProject(agent)},
 		// Rendered explicitly at the gateway's default, like
 		// A2A_GCHAT_TOKEN_PATH: the path and the projected
 		// volume below are one fact, and a reader of the live
@@ -4984,24 +5821,27 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	env = append(env, injectEnv...)
 	env = append(env, clusterViewEnv...)
 	env = append(env, a2aTargetAllowlistEnv(agent)...)
+	if scopePublisherRendered(agent) {
+		env = append(env, corev1.EnvVar{Name: a2aResolvedScopeConfigMapEnvVar, Value: scopeResolvedConfigMapName(agent)})
+	}
+	// The election (a2a/gateway/election.go): the Lease the gateway
+	// campaigns for and its identity there, with the election on.
+	env = append(env, leaseEnv...)
 
 	return &appsv1.Deployment{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: agent.Namespace, Labels: labels},
 		Spec: appsv1.DeploymentSpec{
-			Replicas: ptr.To(int32(1)),
-			// Recreate, as the credential proxy is, rather than the
-			// RollingUpdate default: at one replica that default resolves
-			// maxUnavailable to 0, so a roll needs a surge Pod and stalls
-			// for good under a namespace ResourceQuota with no headroom
-			// (#977, #1267). maxUnavailable: 1 is not the fix here --
-			// gateway.FromEnv refuses a second backend because two gateways
-			// on one relay durable split event deliveries, so two instances
-			// overlapping during a roll is the wrong shape. Recreate stops
-			// the old one before the new one starts; the gap is the one
-			// the single-backend rule already implies.
-			Strategy: appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType},
-			Selector: &metav1.LabelSelector{MatchLabels: selector},
+			// One replica and Recreate until the operator knows the image
+			// runs the election (scaleOutA2AGateway): an unelected gateway
+			// beside another would split the relay durable's deliveries, so
+			// two must never overlap. Recreate stops the old one before the
+			// new one starts. Elected replicas take turns on the Lease, and
+			// scaleOutA2AGateway rolls them with a surge pod instead.
+			Replicas:                ptr.To(int32(1)),
+			Strategy:                appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType},
+			ProgressDeadlineSeconds: ptr.To(a2aGatewayProgressDeadlineSeconds),
+			Selector:                &metav1.LabelSelector{MatchLabels: selector},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
 				Spec: corev1.PodSpec{
@@ -5010,6 +5850,8 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 					// exactly that grant, nothing ambient.
 					ServiceAccountName:           a2aGatewayName(agent),
 					AutomountServiceAccountToken: ptr.To(true),
+					// Over zones, so a zone outage leaves a standby.
+					TopologySpreadConstraints: a2aGatewayTopologySpread(agent),
 					SecurityContext: &corev1.PodSecurityContext{
 						RunAsNonRoot:   ptr.To(true),
 						RunAsUser:      ptr.To(int64(1000)),
@@ -5035,12 +5877,26 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 						Ports: append(injectPorts, corev1.ContainerPort{
 							Name: a2aGatewayMetricsPortName, ContainerPort: a2aGatewayMetricsPort,
 						}),
+						// The replica holding the Lease is not ready until its
+						// event relay binds: the adapters and doors start only
+						// after it, and it waits for TASKS rather than exiting. A
+						// standby is ready once connected with the Lease read
+						// (gateway.ElectedReadiness), so a rolling update's surge
+						// pod reads Ready before an old pod stops. At one replica,
+						// Recreate stops the old pod first and the probe shows
+						// that gap, with the reason in its failure message.
+						ReadinessProbe: &corev1.Probe{
+							ProbeHandler: corev1.ProbeHandler{
+								HTTPGet: &corev1.HTTPGetAction{Path: a2aGatewayReadyzPath, Port: intstr.FromString(a2aGatewayMetricsPortName)},
+							},
+							PeriodSeconds: 5,
+						},
 						VolumeMounts: append(append([]corev1.VolumeMount{{
 							Name: a2aPrincipalMapVolume, MountPath: a2aPrincipalMapDir, ReadOnly: true,
-						}, a2aNATSCABundleMount()}, chatMounts...), injectMounts...),
+						}, a2aNATSCABundleMount(), a2aGatewayScopeMount()}, append(chatMounts, homeMounts...)...), injectMounts...),
 						SecurityContext: hardenedSecurityContext(),
 					}},
-					Volumes: append(append([]corev1.Volume{a2aPrincipalMapVolumeSource(agent), a2aNATSCABundleVolume(agent)}, chatVolumes...), injectVolumes...),
+					Volumes: append(append([]corev1.Volume{a2aPrincipalMapVolumeSource(agent), a2aNATSCABundleVolume(agent), a2aGatewayScopeVolume(agent)}, append(chatVolumes, homeVolumes...)...), injectVolumes...),
 				},
 			},
 		},
@@ -5058,10 +5914,21 @@ type a2aProvisionState struct {
 	failed  bool
 	message string
 
+	// homeRecord is the home-channel record the reconcile read once
+	// (platformagent_home_channel_record.go), carried to the projection and
+	// the status writers so the file and the HomeChannelUnset condition
+	// follow one read; the zero value is no record.
+	homeRecord homeChannelRecord
+
 	// AuthMapVersion is the identity-map version this reconcile rendered.
 	// BusCredentialsReady is the callout confirming it is serving this
 	// value, so it has to travel out of the render to the status write.
 	AuthMapVersion string
+
+	// dispatcherJobMode is what the dispatcher step made of Job mode
+	// (reconcileA2ADispatcherWithJobMode), nil when it made nothing of it,
+	// for the DispatcherJobMode condition written on the way out.
+	dispatcherJobMode *metav1.Condition
 
 	// gatewayHeld reports that the gateway Deployment was withheld this
 	// pass because BusCredentialsReady is not yet true. It exists to make
@@ -5078,6 +5945,21 @@ type a2aProvisionState struct {
 	// holds, and it shares the reconcile's requeue with gatewayHeld. It is
 	// the upgrade path only: this operator never darkens a gateway.
 	gatewayWaking bool
+	// calloutStalled is the callout Deployment's name while the Deployment
+	// controller reports its rollout past the progress deadline
+	// (a2aCalloutRolloutStalled), "" otherwise. The bus does not wait on
+	// such a rollout, and the status writers carry it as
+	// a2aCalloutStalledConditionType so the wedged rollout is visible.
+	calloutStalled string
+	// calloutMap is what the callout pods' /status said about the identity
+	// map this pass rendered (A2AIdentityMapApplied, #4487); nil on a pass
+	// that did not get as far as rendering one.
+	calloutMap *calloutMapState
+	// busHeld reports that a running bus was left on its current config
+	// this pass because a callout replica is not yet on the current spec
+	// (a2aBusWaitsForCallout). It shares the reconcile's requeue with
+	// gatewayHeld.
+	busHeld bool
 	// jobName is the provisioning Job this pass rendered, by its digest
 	// name. The status writer names it when it is what Ready waits on,
 	// and carrying it saves re-rendering the JobSpec to hash it again.
@@ -5093,6 +5975,35 @@ type a2aProvisionState struct {
 	// a2aMCPTokenUnownedReason for its token Secret (ensureA2AMCPToken), ""
 	// otherwise. The status writers carry it as a2aMCPIdentityConditionType.
 	mcpNotRendered string
+	// scopeCondition is the ScopeResolved condition reconcileScopePublisher
+	// read off the resolved-scope ConfigMap, nil for a scope with nothing to
+	// resolve; the status writers carry it. scopeRequeue is when the
+	// reconcile has to look again: the next publisher run, or the moment
+	// the document goes stale, whichever is first; zero for no deadline.
+	scopeCondition *metav1.Condition
+	scopeRequeue   time.Duration
+	// leaseRequeue is how long until a held-back recreate of the gateway's
+	// Lease is due (ensureA2AGatewayLease); zero when none is held.
+	leaseRequeue time.Duration
+	// busPodRequeue is how long until a bus pod stuck on an old revision is
+	// due for replacement (replaceStuckA2ANATSPod); zero when none waits.
+	busPodRequeue time.Duration
+	// busReloadRequeue is when to check again on a bus config reload still
+	// pending (planA2ABusReload). Zero when none is.
+	busReloadRequeue time.Duration
+	// gatewayElected is the image the pod holding the gateway's Lease runs,
+	// as this pass read it, or nil when it couldn't tell
+	// (observeA2AGatewayElection). The status writers carry it as the
+	// GatewayElected condition (gatewayElectedImage).
+	gatewayElected *string
+}
+
+// wantsRequeue reports whether a pass should come back at a2aPendingRequeue
+// rather than wait for an event: the stack is still converging, the gateway
+// or the bus is held, or the callouts haven't settled on the map (a map
+// taken changes nothing the operator watches).
+func (s a2aProvisionState) wantsRequeue() bool {
+	return !s.done || s.gatewayHeld || s.gatewayWaking || s.busHeld || s.calloutMap.unsettled()
 }
 
 // a2aSessionDNSClusterIPs is the resolved cluster DNS VIP list for the session
@@ -5212,17 +6123,20 @@ func (r *PlatformAgentReconciler) reconcileA2ANetworkFences(ctx context.Context,
 // refused, say by an admission policy scoped there) is logged and doesn't
 // stop the stack, the status writes or the requeue terms: the namespace is
 // optional (agentprofile_namespace.go, profileNamespaceFailure).
-func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (a2aProvisionState, error) {
+// homeRec is the home-channel record the reconcile read this pass: the
+// projection written with the gateway's identity carries it, and it travels
+// on the state to every status writer after the render.
+func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agentv1alpha1.PlatformAgent, homeRec homeChannelRecord) (a2aProvisionState, error) {
 	var profileErr error
-	state, err := r.reconcileA2AStack(ctx, agent, &profileErr)
+	state, err := r.reconcileA2AStack(ctx, agent, &profileErr, homeRec)
 	if profileErr != nil {
 		r.profileNamespaceFailure(ctx, agent, "render", profileErr)
 	}
 	return state, err
 }
 
-func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profileErr *error) (a2aProvisionState, error) {
-	state := a2aProvisionState{}
+func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profileErr *error, homeRec homeChannelRecord) (a2aProvisionState, error) {
+	state := a2aProvisionState{homeRecord: homeRec}
 
 	creds, err := r.ensureA2ACredsSecret(ctx, agent)
 	if err != nil {
@@ -5280,32 +6194,111 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 			profiles = nil
 		}
 	}
-	authMap, authMapVersion, err := buildA2AAuthMapConfigMap(agent, profiles)
+	// The profiles still draining (#5074), read once from the applied
+	// dispatch config for both renders: the identity map keeps their
+	// .supervisor grant exactly as long as the dispatch config lists them.
+	draining, err := r.dispatchDraining(ctx, agent, profiles)
+	if err != nil {
+		return state, err
+	}
+	authMaps, authMapVersion, err := buildA2AAuthMapConfigMaps(agent, profiles, draining)
 	if err != nil {
 		return state, fmt.Errorf("failed to render the A2A identity map: %w", err)
 	}
-	if err := ctrl.SetControllerReference(agent, authMap, r.Scheme); err != nil {
-		return state, err
+	// Every shard, in index order, then the shards the previous render had
+	// and this one does not. The callout serves a new version only once it
+	// holds every shard of it, so a pass that dies between two applies
+	// leaves the callout on the previous version, not on half of this one.
+	for _, authMap := range authMaps {
+		if err := ctrl.SetControllerReference(agent, authMap, r.Scheme); err != nil {
+			return state, err
+		}
+		if err := r.applyManaged(ctx, agent, authMap); err != nil {
+			return state, fmt.Errorf("failed to apply the A2A identity map shard %s: %w", authMap.Name, err)
+		}
 	}
-	if err := r.applyManaged(ctx, agent, authMap); err != nil {
-		return state, fmt.Errorf("failed to apply the A2A identity map: %w", err)
+	if err := r.pruneA2AAuthMapShards(ctx, agent, len(authMaps)); err != nil {
+		return state, fmt.Errorf("failed to prune stale A2A identity map shards: %w", err)
 	}
 	state.AuthMapVersion = authMapVersion
+	// Whether the callouts took that map, or refused it and serve the one
+	// they had. An unreadable answer hides a refusal, so turning unreadable
+	// is a Warning, once per transition.
+	mapState := r.readCalloutMapState(ctx, agent, authMapVersion)
+	if prev := meta.FindStatusCondition(agent.Status.Conditions, a2aIdentityMapAppliedConditionType); mapState.reason == a2aIdentityMapStatusUnreadable &&
+		(prev == nil || prev.Reason != a2aIdentityMapStatusUnreadable) {
+		r.recordEvent(agent, corev1.EventTypeWarning, a2aIdentityMapStatusUnreadable, mapState.message)
+	}
+	state.calloutMap = &mapState
 
-	config := buildA2ANATSConfigSecret(agent, creds, calloutKeys)
-	if err := ctrl.SetControllerReference(agent, config, r.Scheme); err != nil {
+	// The auth callout, before the bus's config and before anything that
+	// dials the bus. nats.conf names it as the authority for every
+	// non-exempt connection, so a bus standing up without it accepts only
+	// the static users and refuses everything else — and refuses it as an
+	// Authorization Violation, which reads exactly like a credential
+	// problem. Ahead of the config for the hold below.
+	calloutGeneration, err := r.reconcileA2ACallout(ctx, agent, taskSigningKey.Public, len(authMaps))
+	if err != nil {
 		return state, err
 	}
-	if err := r.applyManaged(ctx, agent, config); err != nil {
-		return state, fmt.Errorf("failed to apply A2A NATS config: %w", err)
-	}
 
+	// A running bus moves to a new config only once no callout pod of an
+	// older spec can answer (a2aBusWaitsForCallout). Every client
+	// reconnects when the bus restarts, and the callout that answers a
+	// reconnect decides the account it lands in, so a replica still on the
+	// previous identity map would place it by that map until it next
+	// reconnects. The config Secret is held with the StatefulSet, so a bus
+	// pod restarted for any other reason meanwhile comes back on the config
+	// it was running. A bus that is down, its pod not Ready for
+	// a2aNATSStuckPodGrace and no callout replica Ready, does not wait.
+	if stalled := (&appsv1.Deployment{}); r.Get(ctx, types.NamespacedName{Name: a2aCalloutName(agent), Namespace: agent.Namespace}, stalled) == nil &&
+		a2aCalloutRolloutStalled(stalled, calloutGeneration) {
+		state.calloutStalled = stalled.Name
+	}
+	// The profiles the dispatcher writes .supervisor for, for the gateway's
+	// deny on those subjects (gatewayProfileSupervisorDeny): the admitted
+	// ones and the ones still draining, the same names as the dispatcher's
+	// grant. A profile the controller refuses gets neither. The list is in
+	// the config but not the pod template's hash, so a profile admitted,
+	// removed or done draining reaches the running bus by a reload
+	// (planA2ABusReload) rather than a roll.
+	profileNames, _ := dispatcherGrantNames(agent, profiles, draining)
 	sts := buildA2ANATSStatefulSet(agent, a2aConfigRolloutHash(agent, creds, calloutKeys, natsTLS.ServingFingerprint))
-	if err := ctrl.SetControllerReference(agent, sts, r.Scheme); err != nil {
+	busHeld, err := r.a2aBusWaitsForCallout(ctx, agent, sts, calloutGeneration)
+	if err != nil {
 		return state, err
 	}
-	if err := r.applyManaged(ctx, agent, sts); err != nil {
-		return state, fmt.Errorf("failed to apply A2A NATS StatefulSet: %w", err)
+	if busHeld {
+		state.busHeld = true
+		logf.FromContext(ctx).Info("holding the A2A bus on its current config until no auth callout pod of an older spec is left",
+			"statefulset", sts.Name, "callout", a2aCalloutName(agent))
+	} else {
+		config := buildA2ANATSConfigSecret(agent, creds, calloutKeys, profileNames)
+		reload, err := r.planA2ABusReload(ctx, agent, config, sts, time.Now())
+		if err != nil {
+			return state, err
+		}
+		if err := r.actOnA2ABusReload(ctx, agent, sts.Name, reload); err != nil {
+			return state, err
+		}
+		if err := ctrl.SetControllerReference(agent, config, r.Scheme); err != nil {
+			return state, err
+		}
+		if err := r.applyManaged(ctx, agent, config); err != nil {
+			return state, fmt.Errorf("failed to apply A2A NATS config: %w", err)
+		}
+		if err := ctrl.SetControllerReference(agent, sts, r.Scheme); err != nil {
+			return state, err
+		}
+		if err := r.applyManaged(ctx, agent, sts); err != nil {
+			return state, fmt.Errorf("failed to apply A2A NATS StatefulSet: %w", err)
+		}
+		state.busReloadRequeue = reload.requeue
+		// A pod that never became Ready on an earlier template blocks the
+		// rolling update this apply starts (replaceStuckA2ANATSPod).
+		if state.busPodRequeue, err = r.replaceStuckA2ANATSPod(ctx, agent, sts, time.Now()); err != nil {
+			return state, err
+		}
 	}
 
 	svc := buildA2ANATSService(agent)
@@ -5314,16 +6307,6 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	}
 	if err := r.applyManaged(ctx, agent, svc); err != nil {
 		return state, fmt.Errorf("failed to apply A2A NATS Service: %w", err)
-	}
-
-	// The auth callout, before the fence and before anything that dials the
-	// bus. nats.conf now names it as the authority for every non-exempt
-	// connection, so a bus standing up without it accepts only the static
-	// users and refuses everything else — and refuses it as an Authorization
-	// Violation, which reads exactly like a credential problem.
-	calloutGeneration, err := r.reconcileA2ACallout(ctx, agent, taskSigningKey.Public)
-	if err != nil {
-		return state, err
 	}
 
 	// The capability verifier. It binds the `cap` bucket at boot, and when it
@@ -5369,7 +6352,7 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		return state, err
 	}
 	if mcpIdentityOwned {
-		reason, err := r.reconcileA2AMCP(ctx, agent)
+		reason, err := r.reconcileA2AMCP(ctx, agent, state.busHeld)
 		if err != nil {
 			return state, err
 		}
@@ -5384,10 +6367,40 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		state.mcpNotRendered = a2aMCPIdentityUnownedReason
 	}
 
+	// The scope publisher: its static objects, its Job on schedule, and the
+	// condition read off what the last Job wrote. Ahead of the gateway's
+	// hold, as the MCP server is: a held gateway does not stop resolving
+	// the scope.
+	scopeOutcome, err := r.reconcileScopePublisher(ctx, agent, time.Now())
+	if err != nil {
+		return state, err
+	}
+	state.scopeCondition = scopeOutcome.condition
+	state.scopeRequeue = scopeOutcome.requeue
+
 	// The session-pod quota, the enforcement half of the bound whose
 	// usability half is the gateway's own cap (see buildA2ASessionQuota for
 	// why both exist and why the quota sits above the cap).
-	quota := buildA2ASessionQuota(agent)
+	quotaAgent, why, err := r.a2aQuotaAgent(ctx, agent)
+	if err != nil {
+		return state, err
+	}
+	quota := buildA2ASessionQuota(quotaAgent)
+	if why != "" {
+		key := client.ObjectKeyFromObject(agent)
+		// An annotation or ConfigMap edit does not bump the generation, so what
+		// was reported is part of the key: a second bad value, or the same one
+		// from another source, warns too.
+		seen := a2aChartPodsWarning{generation: agent.Generation, value: why}
+		if warned, ok := r.a2aChartPodsWarned.Load(key); !ok || warned.(a2aChartPodsWarning) != seen {
+			r.recordEvent(agent, corev1.EventTypeWarning, a2aChartPodsDiscardedReason, why)
+			r.a2aChartPodsWarned.Store(key, seen)
+		}
+	} else {
+		// A usable count re-arms the Warning, so a bad value that returns
+		// after it warns again.
+		r.a2aChartPodsWarned.Delete(client.ObjectKeyFromObject(agent))
+	}
 	if err := ctrl.SetControllerReference(agent, quota, r.Scheme); err != nil {
 		return state, err
 	}
@@ -5399,6 +6412,17 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// it exists this renders nothing. Its fence is reconcileA2ANetworkFences'.
 	if err := r.reconcileProfileQuota(ctx, agent, profiles, profileFenced); err != nil {
 		*profileErr = goerrors.Join(*profileErr, err)
+	}
+
+	// The dispatcher (platformagent_a2a_dispatcher.go), when this operator
+	// has an image for it. Its pod-read Role lives in the profile namespace,
+	// and a failure there follows the same rule as the quota's.
+	jobMode, dispatcherProfileErr, err := r.reconcileA2ADispatcherWithJobMode(ctx, agent, profiles, profileFenced, draining)
+	state.dispatcherJobMode = jobMode
+	if err != nil {
+		return state, err
+	} else if dispatcherProfileErr != nil {
+		*profileErr = goerrors.Join(*profileErr, dispatcherProfileErr)
 	}
 
 	// Jobs are immutable, so the provision Job is create-if-absent under its
@@ -5438,11 +6462,13 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		// above went through a2aReader, so a stale NotFound cannot
 		// re-create a Job that exists. A held Job is a pass with
 		// done=false, which is already the requeue.
+		// A held bus is still on its previous config, which a Job of
+		// this one's would provision against; it waits with the bus.
 		if hold, err := r.a2aProvisionJobWaitsForCallout(ctx, agent); err != nil {
 			return state, err
-		} else if hold {
+		} else if hold || state.busHeld {
 			state.jobHeld = true
-			logf.FromContext(ctx).Info("holding the A2A provision Job until one auth callout replica is ready",
+			logf.FromContext(ctx).Info("holding the A2A provision Job until one auth callout replica is ready and the bus is on its current config",
 				"job", job.Name, "callout", a2aCalloutName(agent))
 		} else if err := r.Create(ctx, job); err != nil {
 			return state, fmt.Errorf("failed to create A2A provision Job: %w", err)
@@ -5571,14 +6597,17 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 
 	// Identity before workload: the gateway pod must not start before the
 	// ServiceAccount its pod spec names exists.
-	// The home-channel record rides with them: the Role above names it, and
-	// the teardown list, which every rendered pass must cover, lists it
-	// whatever chat backend the stack holds (platformagent_home_channel_record.go).
+	// The home-channel record and its projection ride with them: the Role
+	// above names the record, and the teardown list, which every rendered
+	// pass must cover, lists both whatever chat backend the stack holds
+	// (platformagent_home_channel_record.go). The projection carries this
+	// pass's read of the record, so the file and the condition agree.
 	for _, obj := range []client.Object{
 		buildA2AGatewayServiceAccount(agent),
 		buildA2AGatewayRole(agent),
 		buildA2AGatewayRoleBinding(agent),
 		buildHomeChannelRecord(agent),
+		buildHomeChannelProjection(agent, state.homeRecord),
 	} {
 		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
 			return state, err
@@ -5586,6 +6615,18 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		if err := r.applyManaged(ctx, agent, obj); err != nil {
 			return state, fmt.Errorf("failed to apply A2A gateway %T: %w", obj, err)
 		}
+	}
+	// The election's Lease, before the Deployment whose pods campaign for
+	// it, beside the Role that grants them it. Only with the election on;
+	// off, a Lease left from when it was on is the teardown's, and the
+	// gateway ignores it.
+	if a2aGatewayElectionEnabled() {
+		leaseWait, err := r.ensureA2AGatewayLease(ctx, agent)
+		if err != nil {
+			return state, err
+		}
+		state.leaseRequeue = leaseWait
+		state.gatewayElected = r.observeA2AGatewayElection(ctx, agent)
 	}
 
 	// The inject backend's principal map, BEFORE the Deployment that mounts
@@ -5675,6 +6716,19 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		}
 	}
 	gatewayExists := getErr == nil
+	// More than one replica only once a gateway that runs the election on
+	// this image has taken the Lease (scaleOutA2AGateway,
+	// a2aGatewayScaleOutAllowed).
+	elected := gatewayElectedImage(agent, state.gatewayElected)
+	if !a2aGatewayScaleOutAllowed(state.gatewayElected, elected, liveGateway, gatewayExists) {
+		elected = ""
+	}
+	scaleOutA2AGateway(dep, agent, elected)
+	if elected == "" && a2aGatewayElectionEnabled() && a2aGatewayReplicas(agent) > 1 {
+		// Nothing wakes the pass that sees the election: Lease updates are
+		// filtered out and pods aren't watched.
+		state.leaseRequeue = minPositive(state.leaseRequeue, a2aGatewayElectionRecheck)
+	}
 	if gatewayExists && liveGateway.Status.ReadyReplicas < 1 && a2aGatewayConditionStands(agent) {
 		state.gatewayWaking = true
 	}
@@ -5739,6 +6793,16 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	}
 	if err := r.applyA2AGatewayDeployment(ctx, agent, dep); err != nil {
 		return state, fmt.Errorf("failed to apply A2A gateway Deployment: %w", err)
+	}
+	// Its budget, after the Deployment it selects, so a drain takes one
+	// replica at a time; only while more than one is rendered and Ready. At
+	// one replica a budget protects nothing, and one applied while the
+	// standby hasn't come up (or can't: no room, a failed pull) would pin
+	// the one pod that runs. The ready count is the one read above, so the
+	// budget lands a pass after the standby is Ready.
+	scaledOut := ptr.Deref(dep.Spec.Replicas, 1) > 1 && gatewayExists && liveGateway.Status.ReadyReplicas > 1
+	if err := r.reconcileA2AGatewayPDB(ctx, agent, scaledOut); err != nil {
+		return state, err
 	}
 
 	// And the removal AFTER it, the other half of the same ordering
@@ -5831,12 +6895,13 @@ func (r *PlatformAgentReconciler) applyA2AInjectBackend(ctx context.Context, age
 // next install is the standing cost. Three are cached: Service, ConfigMap
 // and NetworkPolicy are Owns() kinds (see SetupWithManager), so their
 // informers exist. The Secret is NOT read through the cache, and this is
-// load-bearing rather than tidy: the operator ships secrets with get only,
-// and a cached Get of an unwatched kind starts a cluster-wide informer
-// whose LIST is then forbidden -- the call does not fail, it blocks in
-// WaitForCacheSync, and with one reconcile worker that is every
-// PlatformAgent in the cluster stopped (the same trap documented on the
-// gateway's own credential reads below). So the Secret goes through
+// load-bearing rather than tidy: the manager does not watch Secrets, and a
+// cached Get of an unwatched kind starts a cluster-wide Secret informer that
+// holds every Secret in the cluster in operator memory and blocks in
+// WaitForCacheSync wherever list/watch on secrets is trimmed -- with one
+// reconcile worker that stops every PlatformAgent in the cluster (the same
+// trap documented on the gateway's own credential reads below). So the Secret
+// goes through
 // a2aReader, the same uncached client the other A2A Secrets use, and the
 // entry list carries the reader beside each object so the choice is made
 // once, next to the object it is made for.
@@ -6013,6 +7078,250 @@ func (r *PlatformAgentReconciler) a2aProvisionJobWaitsForCallout(ctx context.Con
 	return !a2aCalloutServesAnyReplica(callout), nil
 }
 
+// a2aCalloutSpecObserved reports whether the copy is at least the Generation
+// this pass applied and the Deployment controller has observed it, so its
+// newest ReplicaSet is the current spec's. Readiness never starts a hold on
+// the bus: a current replica that is not ready places nobody, and a hold
+// on it would have no bound (a pod that turns NotReady in place after a
+// rollout never trips the progress deadline, and a callout cannot be ready
+// while the bus it connects to is down). What places a connection by the
+// previous map is a pod of an older ReplicaSet, which a2aCalloutHasOlderPods
+// counts.
+func a2aCalloutSpecObserved(dep *appsv1.Deployment, appliedGeneration int64) bool {
+	return dep.Generation >= appliedGeneration && dep.Status.ObservedGeneration >= dep.Generation
+}
+
+// a2aCalloutHasOlderPods reports whether any pod of the callout, terminating
+// ones included, is not on the Deployment's current ReplicaSet. A terminating
+// pod keeps its subscription until it exits, so it can still answer an
+// authorization request from the previous identity map. Read live through
+// a2aReader: neither kind is cached, and the question is only asked on a pass
+// that would move the bus to a new config.
+func (r *PlatformAgentReconciler) a2aCalloutHasOlderPods(ctx context.Context, dep *appsv1.Deployment) (bool, error) {
+	selector, err := metav1.LabelSelectorAsSelector(dep.Spec.Selector)
+	if err != nil {
+		return false, err
+	}
+	inNamespace := []client.ListOption{client.InNamespace(dep.Namespace), client.MatchingLabelsSelector{Selector: selector}}
+	sets := &appsv1.ReplicaSetList{}
+	if err := r.a2aReader().List(ctx, sets, inNamespace...); err != nil {
+		return false, err
+	}
+	// The current ReplicaSet is the newest one: a2aCalloutSpecObserved
+	// has already required the Deployment controller to have observed the
+	// current spec, and it stamps each new ReplicaSet with the next revision.
+	var current *appsv1.ReplicaSet
+	owned := map[types.UID]bool{}
+	newest := int64(0)
+	for i := range sets.Items {
+		rs := &sets.Items[i]
+		if !metav1.IsControlledBy(rs, dep) {
+			continue
+		}
+		owned[rs.UID] = true
+		revision, err := strconv.ParseInt(rs.Annotations[a2aDeploymentRevisionAnnotation], 10, 64)
+		if err == nil && revision > newest {
+			current, newest = rs, revision
+		}
+	}
+	if current == nil {
+		return true, nil
+	}
+	pods := &corev1.PodList{}
+	if err := r.a2aReader().List(ctx, pods, inNamespace...); err != nil {
+		return false, err
+	}
+	now := a2aBusGateNow()
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		// Only the callout's own pods count: one an older ReplicaSet of
+		// this Deployment controls. A pod that merely carries the labels
+		// cannot hold the bus.
+		ref := metav1.GetControllerOf(pod)
+		if ref == nil || !owned[ref.UID] || ref.UID == current.UID {
+			continue
+		}
+		// A finished pod answers nothing. A terminating one answers until
+		// the kubelet kills it, which is its deletion timestamp; past that
+		// (with a little slack for the kill) it is not counted, so a pod
+		// stuck on a finalizer cannot hold the bus.
+		if pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed {
+			continue
+		}
+		if pod.DeletionTimestamp != nil && now.After(pod.DeletionTimestamp.Add(a2aTerminatingCalloutSlack)) {
+			continue
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+// a2aTerminatingCalloutSlack is how long past its deletion timestamp a
+// terminating callout pod is still taken to be answering.
+const a2aTerminatingCalloutSlack = 10 * time.Second
+
+// a2aBusGateNow is the clock a2aCalloutHasOlderPods and a2aBusWaitsForCallout
+// read; tests set it.
+var a2aBusGateNow = time.Now
+
+// a2aCalloutRolloutStalled reports whether the Deployment controller has given
+// up on the callout's current rollout (Progressing False,
+// ProgressDeadlineExceeded). The bus does not wait on a rollout that has
+// stopped: its config can carry a credential repair or a key change, and those
+// should not wait on a callout that will not finish. The condition counts only
+// once the controller has observed the spec this pass applied, so a stall left
+// from an earlier rollout does not release the wait on this one.
+func a2aCalloutRolloutStalled(dep *appsv1.Deployment, appliedGeneration int64) bool {
+	if dep.Generation < appliedGeneration || dep.Status.ObservedGeneration < dep.Generation {
+		return false
+	}
+	for _, c := range dep.Status.Conditions {
+		if c.Type == appsv1.DeploymentProgressing && c.Status == corev1.ConditionFalse && c.Reason == a2aProgressDeadlineExceeded {
+			return true
+		}
+	}
+	return false
+}
+
+// a2aProgressDeadlineExceeded is the Deployment controller's reason on a
+// rollout that passed its progressDeadlineSeconds.
+const a2aProgressDeadlineExceeded = "ProgressDeadlineExceeded"
+
+const (
+	// a2aCalloutStalledConditionType is present, True, while the callout's
+	// rollout is past its progress deadline, and absent otherwise.
+	a2aCalloutStalledConditionType = "A2ACalloutRolloutStalled"
+	a2aCalloutStalledReason        = "ProgressDeadlineExceeded"
+)
+
+func a2aCalloutStalledMessage(callout string) string {
+	return fmt.Sprintf("the auth callout Deployment %s passed its progress deadline; the bus does not wait for it, so a bus config change applies before every callout replica is on the current identity map", callout)
+}
+
+func a2aCalloutStalledEventMessage(callout string) string {
+	return fmt.Sprintf("the bus moved to its new config without waiting for the auth callout Deployment %s, whose rollout passed its progress deadline; connections may be placed by the previous identity map until it finishes", callout)
+}
+
+// a2aCalloutStalledConditionCurrent and setA2ACalloutStalledCondition carry
+// a2aCalloutStalledConditionType on the same pattern as the MCP server's:
+// present while a2aProvisionState.calloutStalled names the Deployment, and
+// written by both status writers.
+func a2aCalloutStalledConditionCurrent(agent *agentv1alpha1.PlatformAgent, callout string) bool {
+	existing := meta.FindStatusCondition(agent.Status.Conditions, a2aCalloutStalledConditionType)
+	if callout == "" {
+		return existing == nil
+	}
+	return existing != nil && existing.Status == metav1.ConditionTrue &&
+		existing.Reason == a2aCalloutStalledReason && existing.Message == a2aCalloutStalledMessage(callout)
+}
+
+func setA2ACalloutStalledCondition(agent *agentv1alpha1.PlatformAgent, callout string, now metav1.Time) {
+	if callout == "" {
+		meta.RemoveStatusCondition(&agent.Status.Conditions, a2aCalloutStalledConditionType)
+		return
+	}
+	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+		Type:               a2aCalloutStalledConditionType,
+		Status:             metav1.ConditionTrue,
+		Reason:             a2aCalloutStalledReason,
+		Message:            a2aCalloutStalledMessage(callout),
+		ObservedGeneration: agent.Generation,
+		LastTransitionTime: now,
+	})
+}
+
+// a2aBusHoldSkippedReason is the Warning event's reason when the bus moves to
+// a new config without waiting for the auth callout, because the bus pod has
+// not been Ready for a2aNATSStuckPodGrace and no callout replica is Ready.
+const a2aBusHoldSkippedReason = "A2ABusHoldSkipped"
+
+func a2aBusHoldSkippedEventMessage(bus, callout string, down time.Duration) string {
+	return fmt.Sprintf("the bus moved to its new config without waiting for the auth callout Deployment %s, because the bus pod %s%s has not been Ready for %s; connections may be placed by the previous identity map until the callout's rollout finishes",
+		callout, bus, a2aNATSPodOrdinalSuffix, down.Truncate(time.Second))
+}
+
+// a2aDeploymentRevisionAnnotation is the Deployment controller's revision
+// stamp on each ReplicaSet it creates.
+const a2aDeploymentRevisionAnnotation = "deployment.kubernetes.io/revision"
+
+// a2aBusWaitsForCallout reports whether the bus must stay on its current
+// config this pass. Only a running bus whose config would change waits: a
+// fresh install has no bus to hold, and one whose config is unchanged has
+// nothing to apply that matters here. It waits until the Deployment
+// controller has observed the callout's current spec and no pod of an older
+// ReplicaSet can still answer. While it waits,
+// a principal that reconnects is placed by the current identity map, which
+// may name an account the running config does not have yet; that refusal
+// lasts until the bus moves, and is the direction this gate prefers to a
+// connection placed by the previous map that would stay there until it next
+// reconnects. A rollout the Deployment controller has given up on
+// (a2aCalloutRolloutStalled) does not hold it, so the wait is bounded by the
+// callout's progress deadline.
+//
+// A bus whose pod has not been Ready for a2aNATSStuckPodGrace, while no
+// callout replica is Ready, does not wait either. A callout replica is Ready
+// only while attached to the bus and holding a map, so with none Ready the
+// bus admits no new connection and the rollout cannot finish: the hold would
+// last the whole progress deadline. A Ready callout replica keeps the hold,
+// as a bus pod can fail its probe and still serve. The same holds for a
+// callout spec not yet observed. The cost is the window the stall release also opens: once the bus is back on
+// the new config, a callout pod of an older spec can answer a reconnect, and
+// place it by the identity map that pod holds, until the callout's rollout
+// finishes. A callout pod watches the current map, so that is the previous
+// map only on a pod that refused the current one.
+func (r *PlatformAgentReconciler) a2aBusWaitsForCallout(ctx context.Context, agent *agentv1alpha1.PlatformAgent, sts *appsv1.StatefulSet, calloutGeneration int64) (bool, error) {
+	live := &appsv1.StatefulSet{}
+	err := r.Get(ctx, client.ObjectKeyFromObject(sts), live)
+	if errors.IsNotFound(err) {
+		// Confirmed live, as the gateway gate does: a stale NotFound would
+		// apply the new config under a callout still rolling.
+		err = r.a2aReader().Get(ctx, client.ObjectKeyFromObject(sts), live)
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+	}
+	if err != nil {
+		return false, err
+	}
+	if live.Spec.Template.Annotations[a2aConfigHashAnnotation] == sts.Spec.Template.Annotations[a2aConfigHashAnnotation] {
+		return false, nil
+	}
+	callout := &appsv1.Deployment{}
+	if err := r.Get(ctx, types.NamespacedName{Name: a2aCalloutName(agent), Namespace: agent.Namespace}, callout); err != nil {
+		if errors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, err
+	}
+	if a2aCalloutRolloutStalled(callout, calloutGeneration) {
+		logf.FromContext(ctx).Info("not holding the A2A bus for the auth callout: its rollout passed its progress deadline",
+			"callout", callout.Name)
+		r.recordEvent(agent, corev1.EventTypeWarning, a2aCalloutStalledReason, a2aCalloutStalledEventMessage(callout.Name))
+		return false, nil
+	}
+	if a2aCalloutSpecObserved(callout, calloutGeneration) {
+		if older, err := r.a2aCalloutHasOlderPods(ctx, callout); err != nil || !older {
+			return false, err
+		}
+	}
+	// A callout replica that is Ready is attached to the bus, so the bus
+	// still serves and the hold stands.
+	if callout.Status.ReadyReplicas > 0 {
+		return true, nil
+	}
+	down, err := r.a2aNATSPodDownFor(ctx, live, a2aBusGateNow())
+	if err != nil {
+		return false, err
+	}
+	if down == 0 {
+		return true, nil
+	}
+	logf.FromContext(ctx).Info("not holding the A2A bus for the auth callout: the bus pod is not Ready and no callout replica is",
+		"statefulset", live.Name, "notReadyFor", down.Truncate(time.Second))
+	r.recordEvent(agent, corev1.EventTypeWarning, a2aBusHoldSkippedReason, a2aBusHoldSkippedEventMessage(live.Name, a2aCalloutName(agent), down))
+	return false, nil
+}
+
 // a2aGatewayWaitsForCallout reports whether the gateway Deployment must be
 // withheld this pass. See the call site for why the gate is creation-only and
 // why it computes its own answer rather than reading BusCredentialsReady.
@@ -6133,7 +7442,12 @@ func (r *PlatformAgentReconciler) a2aPreBusTeardown(agent *agentv1alpha1.Platfor
 	doorMeta := metav1.ObjectMeta{Name: a2aDoorName(agent), Namespace: agent.Namespace}
 	return []a2aTeardownEntry{
 		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.Client},
+		// Its budget, after the Deployment, as the callout's is.
+		{&policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.Client},
+		// The election's Lease, after the gateway that held it.
+		{&coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayLeaseName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aHomeChannelRecordName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aHomeChannelProjectionName(agent), Namespace: agent.Namespace}}, r.Client},
 		// The inject door's four, listed whatever the flag says: a flip to
 		// today has to clean up after an operator that WAS deployed with the
 		// flag, and the reads are cheap (three are Owns() kinds) and find
@@ -6192,6 +7506,16 @@ func (r *PlatformAgentReconciler) a2aPreBusTeardown(agent *agentv1alpha1.Platfor
 		// budget), so the read is cached.
 		{&policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: a2aVerifierName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: a2aVerifierName(agent), Namespace: agent.Namespace}}, r.Client},
+		// The dispatcher (platformagent_a2a_dispatcher.go), Deployment first so
+		// nothing is running when its identity goes, as with the verifier: a
+		// ServiceAccount left behind is a mintable bus identity that writes
+		// leases and fails tasks. Its pod-read Role in the profile namespace
+		// goes with the profile quota, below.
+		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aDispatcherName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aDispatchConfigName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
+		{&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: a2aDispatcherName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
+		{&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: a2aDispatcherName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
+		{&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: a2aDispatcherName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		{&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		{&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutName(agent), Namespace: agent.Namespace}}, r.Client},
@@ -6205,8 +7529,12 @@ func (r *PlatformAgentReconciler) a2aPreBusTeardown(agent *agentv1alpha1.Platfor
 		// In reconcileA2A the keys Secret is created first and acts as the
 		// sentinel covering the map; deleting the map first ensures that if a
 		// cleanup pass dies on the map delete, the keys Secret is still standing
-		// to prevent the next pass from early-exiting.
-		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aAuthMapName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
+		// to prevent the next pass from early-exiting. This entry is shard 0,
+		// which every render has; the shards above it, whose count this list
+		// cannot know, and the unsharded object releases before sharding
+		// rendered go in deleteA2AAuthMapShards, which cleanupA2A runs before
+		// this walk for the same sentinel reason.
+		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aAuthMapShardName(agent, 0), Namespace: agent.Namespace}}, r.a2aReader()},
 		// The task-signing key, before the keys Secret for the same reason
 		// as the map: the keys Secret is the sentinel.
 		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aTaskSigningKeyName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
@@ -6216,6 +7544,50 @@ func (r *PlatformAgentReconciler) a2aPreBusTeardown(agent *agentv1alpha1.Platfor
 		// ServiceAccount is an Owns() kind, so this read is cached and free.
 		{&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.Client},
 	}
+}
+
+// pruneA2AAuthMapShards deletes what the identity map's render no longer
+// produces: the unsharded object a release before sharding rendered, and every
+// shard at or past this pass's count.
+func (r *PlatformAgentReconciler) pruneA2AAuthMapShards(ctx context.Context, agent *agentv1alpha1.PlatformAgent, shards int) error {
+	return r.deleteA2AAuthMapObjects(ctx, agent, a2aAuthMapShardNames(agent, shards))
+}
+
+// deleteA2AAuthMapShards removes every identity-map object, the unsharded
+// legacy one and every shard, for the flip to today and the CR's deletion.
+// Shard 0 is also a walk entry (a2aPreBusTeardown), which finds it gone.
+func (r *PlatformAgentReconciler) deleteA2AAuthMapShards(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	return r.deleteA2AAuthMapObjects(ctx, agent, nil)
+}
+
+// deleteA2AAuthMapObjects deletes every identity-map ConfigMap this CR owns
+// except the names in keep. Found by label rather than by walking the names
+// up from the count: every identity-map object, legacy or shard, carries
+// a2aLabels(agent, a2aAuthMapComponent), and a walk that stopped at the first
+// absent name would stop for good at the gap one failed delete leaves,
+// stranding every shard above it. One uncached List through a2aReader, for
+// the reason every ConfigMap read here is uncached; an object under one of
+// these labels that this CR does not own is left to its owner.
+func (r *PlatformAgentReconciler) deleteA2AAuthMapObjects(ctx context.Context, agent *agentv1alpha1.PlatformAgent, keep []string) error {
+	var cms corev1.ConfigMapList
+	if err := r.a2aReader().List(ctx, &cms, client.InNamespace(agent.Namespace), client.MatchingLabels(a2aLabels(agent, a2aAuthMapComponent))); err != nil {
+		return err
+	}
+	for i := range cms.Items {
+		cm := &cms.Items[i]
+		if slices.Contains(keep, cm.Name) {
+			continue
+		}
+		if !metav1.IsControlledBy(cm, agent) {
+			logf.FromContext(ctx).V(1).Info("skipping unowned A2A object under a reserved name",
+				"kind", fmt.Sprintf("%T", cm), "namespace", cm.Namespace, "name", cm.Name)
+			continue
+		}
+		if err := client.IgnoreNotFound(r.Delete(ctx, cm)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // a2aBusTeardown returns the namespaced NATS bus objects (Service, NetworkPolicy fences,
@@ -6313,11 +7685,24 @@ func (r *PlatformAgentReconciler) a2aNamespacedTeardown(agent *agentv1alpha1.Pla
 // operator exception to the ownership rule below: the walk deletes only
 // what this CR controls and leaves the rest alone.
 func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	_, err := r.cleanupA2AWithJobMode(ctx, agent)
+	return err
+}
+
+// cleanupA2AWithJobMode is cleanupA2A, also reporting whether the pass tore
+// the dispatcher's Job mode down: true when nothing of the stack was present,
+// or when deleteDispatcherPodsRBAC (the Jobs Role, the Jobs and the
+// DispatchJobTemplates among what it deletes) succeeded. A failure there
+// leaves Job mode's resources live, so the DispatcherJobMode condition stays.
+func (r *PlatformAgentReconciler) cleanupA2AWithJobMode(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (tornDown bool, err error) {
+	// The Lease goes below with the stack; a flip back to next is a first
+	// install for it, not a deletion to hold back.
+	r.forgetA2AGatewayLease(agent)
 	// The early exit. This path runs on every reconcile of every install that
 	// is not `next` — forever, on installs that have never rendered an A2A
 	// object — so proving "nothing to do" one object at a time is a standing
-	// cost for a no-op. Twelve reads answer it instead of walking every object
-	// in the teardown sequence (the eleven below, and the profile namespace's
+	// cost for a no-op. Thirteen reads answer it instead of walking every object
+	// in the teardown sequence (the twelve below, and the profile namespace's
 	// fence, which is tested by this agent's labels):
 	//
 	//   - the StatefulSet, which is deleted LAST below, so its absence means an
@@ -6372,11 +7757,16 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	//   - the config Secret, which held that role before the callout existed.
 	//     Kept for the install whose partial render predates the keys Secret:
 	//     an operator upgraded across this change and then flipped to `today`
-	//     would otherwise step over a config Secret no later object accompanies.
+	//     would otherwise step over a config Secret no later object accompanies,
+	//   - the task-signing key Secret, which reconcileCredentialProxy ensures
+	//     (credentialProxyProfileConfigFor) in step 11, ahead of every write
+	//     of reconcileA2A and of the fence pass, whenever a profile is bound.
+	//     A next render that dies between the broker and reconcileA2A leaves
+	//     it alone, and nothing on the today path but this walk removes it.
 	//
 	// Without the Secrets and the fences the exit would step over those objects
 	// and leave an A2A object on a `today` install, which is the darkness
-	// property. The first nine are Owns kinds and free; the two Secret reads
+	// property. The first nine are Owns kinds and free; the three Secret reads
 	// are uncached and happen only when the free nine all miss.
 	//
 	// A sentinel counts only when this CR owns it: a squatted or stale-UID
@@ -6388,13 +7778,15 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// reconcile of a today install through the walk for nothing -- the shape
 	// a next CR deleted and re-created under the same name in today mode
 	// takes, while its old fences still carry the old UID.
-	// Ownership is read off the fetched object, so the exit stays at eleven
+	// Ownership is read off the fetched object, so the exit stays at twelve
 	// Gets, plus one for the profile namespace's fence below, which carries
 	// no owner reference and is tested by this agent's labels instead.
 	//
 	// Adding an object to reconcileA2A ahead of the keys Secret, or to
 	// reconcileA2ANetworkFences ahead of its first write (the profile fence,
-	// then the NATS fence), means adding it here.
+	// then the NATS fence), or an A2A object written by an earlier step
+	// (the broker's task-signing key), means adding it here.
+	// TestTheFlipToTodayRemovesALoneTaskSigningKey reds without the last.
 	// TestTheEarlyExitSeesTheResidueOfARenderThatDiedAnywhere walks every
 	// prefix of both renders and is what makes forgetting it red rather than
 	// silent: without the keys Secret below, its writes 3 and 4 fail, and
@@ -6416,6 +7808,7 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutKeysName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSConfigSecretName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
+		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aTaskSigningKeyName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 	}
 	anyPresent := false
 	for _, s := range sentinels {
@@ -6428,7 +7821,7 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 			continue
 		}
 		if client.IgnoreNotFound(err) != nil {
-			return err
+			return false, err
 		}
 	}
 	// The profile fence is the first write of reconcileA2ANetworkFences and
@@ -6436,12 +7829,12 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	if !anyPresent {
 		fence, err := r.profileFenceRendered(ctx, agent)
 		if err != nil {
-			return err
+			return false, err
 		}
 		anyPresent = fence
 	}
 	if !anyPresent {
-		return nil
+		return true, nil
 	}
 
 	// Deployment/StatefulSet/Service/ServiceAccount reads come from the cache —
@@ -6453,12 +7846,28 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// Those uncached reads are the standing cost of this path, which runs on
 	// every reconcile of every today install — see the note on the sweep below.
 
+	// 0. The scope publisher, ahead of everything the early exit reads, so a
+	// pass that dies here leaves every sentinel standing to bring it back.
+	// Its objects are written after the keys Secret, so a render that dies
+	// partway leaves a sentinel too.
+	if err := r.removeScopePublisher(ctx, agent); err != nil {
+		return false, err
+	}
+
+	// Then the identity map's shards, before the walk that deletes the
+	// callout keys Secret covering them (the sentinel argument on the walk's
+	// authmap entry). A callout still running keeps serving its last map when
+	// the objects go, so deleting them ahead of its Deployment costs nothing.
+	if err := r.deleteA2AAuthMapShards(ctx, agent); err != nil {
+		return false, err
+	}
+
 	// 1. Namespaced objects before the bus (gateway, inject, callout, session identities).
 	// Deleted first so the services built on top of the bus are initiated and stopped
 	// before the bus itself.
 	for _, entry := range r.a2aPreBusTeardown(agent) {
 		if err := r.deleteA2AObjectIfOwned(ctx, agent, entry.obj, entry.reader, nil); err != nil {
-			return err
+			return false, err
 		}
 	}
 
@@ -6467,6 +7876,14 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	profileQuotaErr := r.deleteProfileQuota(ctx, agent)
 	if profileQuotaErr != nil {
 		r.profileNamespaceFailure(ctx, agent, "delete the quota on the flip to today", profileQuotaErr)
+	}
+	// And the dispatcher's warm pools, their CA bundle copy and its pod-read
+	// Role and binding there, likewise unowned, likewise not worth stopping
+	// the flip for, and likewise kept in sight: a failure leaves the fence
+	// below as the sentinel.
+	dispatcherRBACErr := r.deleteDispatcherPodsRBAC(ctx, agent)
+	if dispatcherRBACErr != nil {
+		r.profileNamespaceFailure(ctx, agent, "delete the dispatcher's warm pools, bundle copy or pod-read Role on the flip to today", dispatcherRBACErr)
 	}
 
 	// 2. The callout's ClusterRoleBinding. Cluster-scoped, so it carries no
@@ -6491,7 +7908,7 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// entire NATS bus (Service, NetworkPolicy fences, config Secret, StatefulSet)
 	// still standing and protected, preserving the sentinel to retry next pass.
 	if err := r.deleteA2ACalloutClusterRoleBinding(ctx, agent); err != nil {
-		return err
+		return false, err
 	}
 
 	// 3. Provision Jobs carry a content hash in the name, one per generation
@@ -6500,14 +7917,14 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// that a pass dying during Job cleanup leaves the bus intact and the
 	// sentinel standing (#2216).
 	if err := r.deleteA2AProvisionJobs(ctx, agent, ""); err != nil {
-		return err
+		return false, err
 	}
 
 	// 4. The NATS bus namespaced objects (Service, NetworkPolicy fences,
 	// config Secret, ResourceQuota).
 	for _, entry := range r.a2aBusTeardown(agent) {
 		if err := r.deleteA2AObjectIfOwned(ctx, agent, entry.obj, entry.reader, nil); err != nil {
-			return err
+			return false, err
 		}
 	}
 
@@ -6515,11 +7932,14 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// namespace is gone (LiteLLM's policy dropped it earlier in the pass,
 	// when it re-rendered for today). Before the sentinel, so a failed delete
 	// leaves cleanup to resume.
-	// Skipped on a pass whose quota delete failed: the fence then stays as
-	// the sentinel that brings the teardown back for the quota, transient
-	// failure or not. A fence left behind only restricts, so a failed fence
-	// delete is logged and retried the same way, without holding the bus.
-	if profileQuotaErr == nil {
+	// Skipped on a pass whose quota delete, or the dispatcher's pod-read
+	// RBAC delete, failed: the fence then stays as the sentinel that brings
+	// the teardown back for them, transient failure or not. A pod-read
+	// binding left behind would grant a later ServiceAccount of the
+	// dispatcher's name pod read in the profile namespace. A fence left
+	// behind only restricts, so a failed fence delete is logged and retried
+	// the same way, without holding the bus.
+	if profileQuotaErr == nil && dispatcherRBACErr == nil {
 		if err := r.deleteProfileFence(ctx, agent); err != nil {
 			r.profileNamespaceFailure(ctx, agent, "delete the fence on the flip to today", err)
 		}
@@ -6528,7 +7948,7 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 	// 5. LAST, deliberately: the StatefulSet is this function's sentinel. The
 	// early exit above treats its absence as "an earlier pass reached the
 	// end", which is only true while nothing is deleted after it.
-	return r.deleteA2ANATSStatefulSet(ctx, agent)
+	return dispatcherRBACErr == nil, r.deleteA2ANATSStatefulSet(ctx, agent)
 }
 
 // deleteA2ANATSStatefulSet reaps the NATS StatefulSet.
@@ -6612,4 +8032,52 @@ func (r *PlatformAgentReconciler) deleteA2ACalloutClusterRoleBinding(ctx context
 		return nil
 	}
 	return client.IgnoreNotFound(r.Delete(ctx, crb))
+}
+
+// a2aGatewayScopeFileEnv names the gateway's scope file (A2A_SCOPE_FILE in
+// a2a/gateway/config.go).
+const a2aGatewayScopeFileEnv = "A2A_SCOPE_FILE"
+
+// a2aGatewayManagementProjectEnv names the gateway's management project
+// (A2A_MANAGEMENT_PROJECT in a2a/gateway/config.go).
+const a2aGatewayManagementProjectEnv = "A2A_MANAGEMENT_PROJECT"
+
+// a2aManagementProject is spec.harness.projectId, the project the agent
+// container gets as GKE_PROJECT_ID and the reconcile treats as always in
+// scope.
+func a2aManagementProject(agent *agentv1alpha1.PlatformAgent) string {
+	if agent.Spec.Harness == nil {
+		return ""
+	}
+	return agent.Spec.Harness.ProjectID
+}
+
+// a2aGatewayScopeVolumeName projects the install's rendered spec.scope into
+// the gateway pod.
+const a2aGatewayScopeVolumeName = "a2a-gateway-scope"
+
+// a2aGatewayScopeVolume is the agent's scope.json, from the config ConfigMap
+// the platform agent mounts it from (scopeConfigKey), so the gateway checks a
+// profile task's target against the declaration the agent reads. Optional,
+// like the agent's: a ConfigMap from an operator predating the key mounts an
+// empty directory, and the gateway then refuses every profile target rather
+// than holding the pod in ContainerCreating.
+func a2aGatewayScopeVolume(agent *agentv1alpha1.PlatformAgent) corev1.Volume {
+	return corev1.Volume{
+		Name: a2aGatewayScopeVolumeName,
+		VolumeSource: corev1.VolumeSource{
+			ConfigMap: &corev1.ConfigMapVolumeSource{
+				LocalObjectReference: corev1.LocalObjectReference{Name: agent.Name + "-config"},
+				Items:                []corev1.KeyToPath{{Key: scopeConfigKey, Path: scopeFileName}},
+				Optional:             ptr.To(true),
+				DefaultMode:          ptr.To(int32(0444)),
+			},
+		},
+	}
+}
+
+// a2aGatewayScopeMount is a directory mount, so a CR edit reaches the file
+// without a restart; the gateway reads it per routed task.
+func a2aGatewayScopeMount() corev1.VolumeMount {
+	return corev1.VolumeMount{Name: a2aGatewayScopeVolumeName, MountPath: scopeDir, ReadOnly: true}
 }

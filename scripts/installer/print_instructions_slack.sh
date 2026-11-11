@@ -60,7 +60,8 @@ if [ -n "${SLACK_STEPS_PLATFORM_AGENT_MODE+set}" ]; then
 fi
 
 # Slack on the A2A gateway: no slash commands, no pairing, and a home channel
-# that only SLACK_HOME_CHANNEL sets.
+# that SLACK_HOME_CHANNEL sets, or the first top-level mention of the agent in
+# a channel under homeChannelPolicy auto (the default).
 print_a2a_gateway_steps() {
   local ns="${NAMESPACE:-$DEFAULT_NAMESPACE}"
   local home not_an_id
@@ -82,7 +83,9 @@ print_a2a_gateway_steps() {
   if [ -z "$home" ]; then
     echo -e "[ ] 4. No home channel is configured, so the agent posts no alerts or scheduled reports to Slack."
     echo -e "       Set ${C_WHITE}SLACK_HOME_CHANNEL${C_RESET} in install.env to a channel ID (C... or G...) and re-run the installer."
-    echo -e "       A chat message or ${C_WHITE}/sethome${C_RESET} does not set it under next: ${SLACK_NEXT_HOME_CHANNEL_DOC}"
+    echo -e "       Or mention the agent once, top-level, in the channel you want: under homeChannelPolicy auto (the default) that channel becomes the home channel."
+    echo -e "       Or pick the channel on the app's Home tab (Home channel panel)."
+    echo -e "       ${C_WHITE}/sethome${C_RESET} does not set it under next: ${SLACK_NEXT_HOME_CHANNEL_DOC}"
   elif [ -n "$not_an_id" ]; then
     echo -e "[ ] 4. SLACK_HOME_CHANNEL is '${not_an_id}', which is not a channel ID, so the gateway posts no alerts or scheduled reports to Slack."
     echo -e "       Set ${C_WHITE}SLACK_HOME_CHANNEL${C_RESET} in install.env to a channel ID (C... or G...) and re-run the installer: ${SLACK_NEXT_HOME_CHANNEL_DOC}"

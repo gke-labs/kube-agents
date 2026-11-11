@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -54,6 +56,26 @@ const (
 	profileNetpolComponent = "profile-netpol"
 )
 
+// A deleted PlatformAgent's finalizer retries a refused delete of its
+// profile quota for profileQuotaReleaseAfter from the deletion, every
+// profileQuotaRetryEvery, then releases and leaves the quota for a later
+// PlatformAgent to adopt (adoptLeftoverProfileQuotas). Two minutes clears a
+// transient refusal (an API server restart, a webhook timing out) and is
+// short beside a helm uninstall's own wait; a refusal from RBAC or an
+// admission policy doesn't clear by waiting, so a longer bound only delays
+// the release. A var so tests can shorten it.
+var (
+	profileQuotaReleaseAfter = 2 * time.Minute
+	profileQuotaRetryEvery   = 10 * time.Second
+)
+
+// The Events the profile quota's removal on deletion and its adoption write
+// on the PlatformAgent.
+const (
+	reasonProfileQuotaLeft    = "ProfileQuotaLeft"
+	reasonProfileQuotaAdopted = "ProfileQuotaAdopted"
+)
+
 // The suffixes the profile namespace and the objects in it are named with.
 const (
 	profileNamespaceSuffix = "-profiles"
@@ -81,12 +103,61 @@ func agentNamespaceOfProfileServiceAccount(ns string) (string, bool) {
 	return agentNS, ok && agentNS != ""
 }
 
-// resolveProfileCeiling is spec.harness.tuning.profiles.ceiling, defaulted.
+// resolveProfileCeiling is spec.harness.tuning.profiles.ceiling, defaulted
+// to maxInProgress's resolved value: the profile ceiling replaces kanban's
+// in-progress limit, and while both exist an install's footprint shouldn't
+// jump when it moves from one to the other (spec-profiles-dispatch.md).
 func resolveProfileCeiling(agent *agentv1alpha1.PlatformAgent) int {
-	if t := agentTuning(agent); t != nil && t.Profiles != nil && t.Profiles.Ceiling != nil {
-		return *t.Profiles.Ceiling
+	if t := profileTuning(agent); t != nil && t.Ceiling != nil {
+		return *t.Ceiling
 	}
-	return agentv1alpha1.DefaultProfileCeiling
+	// maxInProgress has no maximum of its own (it only capped kanban
+	// workers); clamp it to the ceiling's, so the quota arithmetic and the
+	// reserves never see a value the ceiling field itself would refuse.
+	return min(resolveKanbanMaxInProgress(agent), agentv1alpha1.MaxProfileCeiling)
+}
+
+// profileTuning is spec.harness.tuning.profiles, or nil.
+func profileTuning(agent *agentv1alpha1.PlatformAgent) *agentv1alpha1.ProfileTuning {
+	if t := agentTuning(agent); t != nil {
+		return t.Profiles
+	}
+	return nil
+}
+
+// profileIntOr is one of the interval fields, or its default.
+func profileIntOr(agent *agentv1alpha1.PlatformAgent, field func(*agentv1alpha1.ProfileTuning) *int, def int) int {
+	if t := profileTuning(agent); t != nil {
+		if v := field(t); v != nil {
+			return *v
+		}
+	}
+	return def
+}
+
+// The dispatcher's intervals, defaulted (contract on #3655, section 5).
+func resolveProfileLeaseSeconds(agent *agentv1alpha1.PlatformAgent) int {
+	return profileIntOr(agent, func(t *agentv1alpha1.ProfileTuning) *int { return t.LeaseSeconds }, agentv1alpha1.DefaultProfileLeaseSeconds)
+}
+
+func resolveProfileRenewSeconds(agent *agentv1alpha1.PlatformAgent) int {
+	return profileIntOr(agent, func(t *agentv1alpha1.ProfileTuning) *int { return t.RenewSeconds }, agentv1alpha1.DefaultProfileRenewSeconds)
+}
+
+func resolveProfileRestartGraceSeconds(agent *agentv1alpha1.PlatformAgent) int {
+	return profileIntOr(agent, func(t *agentv1alpha1.ProfileTuning) *int { return t.RestartGraceSeconds }, agentv1alpha1.DefaultProfileRestartGraceSeconds)
+}
+
+// resolveProfileMaxTaskDeadline is the install's task deadline cap: what the
+// dispatch config clamps every profile task's deadline to, and the auth
+// callout's longest task credential. One resolver for both, so they can't
+// disagree and the dispatcher never issues a credential the callout refuses.
+func resolveProfileMaxTaskDeadline(agent *agentv1alpha1.PlatformAgent) time.Duration {
+	return time.Duration(profileIntOr(agent, func(t *agentv1alpha1.ProfileTuning) *int { return t.MaxTaskDeadlineSeconds }, agentv1alpha1.DefaultProfileMaxTaskDeadlineSeconds)) * time.Second
+}
+
+func resolveProfileAcceptTimeoutSeconds(agent *agentv1alpha1.PlatformAgent) int {
+	return profileIntOr(agent, func(t *agentv1alpha1.ProfileTuning) *int { return t.AcceptTimeoutSeconds }, agentv1alpha1.DefaultProfileAcceptTimeoutSeconds)
 }
 
 // resolveProfileWarmReplicas is spec.harness.tuning.profiles.warmReplicas,
@@ -120,13 +191,24 @@ func interactiveProfileTiers(profiles []agentv1alpha1.AgentProfile) int {
 // per warm pool, and the unattended tier's Job pods, which the dispatcher
 // holds to the ceiling. Interactive tasks run in the warm workers, so they
 // add no pods. Like the session quota, the key is `pods`, which counts
-// non-terminal pods only. It is the only key for now; requests.cpu and
+// non-terminal pods only, and a pod in its deletion grace period is not yet
+// terminal. Where Job mode can run (the chart's Job policy signal and a
+// profile allowing the unattended tier), a task's slot is free once its Job
+// is deleted, so the next Job's pod can start while the last one's still
+// terminates: a second ceiling's worth covers one terminating Job pod per
+// slot. It is the only key for now; requests.cpu and
 // requests.memory join the map once the sizing budget gives them values,
 // and adding one is a line here.
 func profileQuotaHard(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) map[corev1.ResourceName]int64 {
 	pools := interactiveProfileTiers(profiles)
+	jobs := resolveProfileCeiling(agent)
+	if dispatcherJobPolicyRendered() && slices.ContainsFunc(profiles, func(p agentv1alpha1.AgentProfile) bool {
+		return slices.Contains(p.AllowedTierList(), agentv1alpha1.AgentProfileTierUnattended)
+	}) {
+		jobs *= 2
+	}
 	return map[corev1.ResourceName]int64{
-		corev1.ResourcePods: int64(pools*resolveProfileWarmReplicas(agent) + pools + resolveProfileCeiling(agent)),
+		corev1.ResourcePods: int64(pools*resolveProfileWarmReplicas(agent) + pools + jobs),
 	}
 }
 
@@ -155,10 +237,13 @@ func profileNetpolName(agent *agentv1alpha1.PlatformAgent) string {
 }
 
 // buildProfileNetworkPolicy fences every pod in the profile namespace: no
-// ingress, and egress to DNS, the bus and LiteLLM only, the same allowlist a
-// session pod has. The credential proxy joins it with the worker PR, together
-// with the proxy's own allowed callers, so neither half lands without the
-// other.
+// ingress, and egress to DNS, the bus, LiteLLM and the credential broker's
+// credentialed port only. The broker is where a worker's kubectl and gcloud
+// run (#3889); its side admits the profile namespace, and confines each call
+// to the task's cluster, once a profile identity exists
+// (credential_proxy_profiles.go). The egress is unconditional: a namespace
+// that exists only for profiles needs no second gate, and the broker's
+// TokenReview refuses any pod the identity map doesn't name.
 func buildProfileNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsClusterIPs []string) *networkingv1.NetworkPolicy {
 	return &networkingv1.NetworkPolicy{
 		TypeMeta: metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
@@ -197,9 +282,23 @@ func buildProfileNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsClusterIPs
 						namespacedPodPeer(agent.Namespace, map[string]string{"app": "litellm"}),
 					},
 				},
+				{
+					Ports: []networkingv1.NetworkPolicyPort{tcpPort(credentialProxyPort)},
+					To:    profileBrokerPeers(agent),
+				},
 			},
 		},
 	}
+}
+
+// profileBrokerPeers is the broker in the agent's namespace, and the exec
+// tier while it renders: /v1/exec admits the profile role on both.
+func profileBrokerPeers(agent *agentv1alpha1.PlatformAgent) []networkingv1.NetworkPolicyPeer {
+	peers := []networkingv1.NetworkPolicyPeer{namespacedPodPeer(agent.Namespace, credentialProxySelector(agent))}
+	if credentialProxyExecTierEnabled(agent) {
+		peers = append(peers, namespacedPodPeer(agent.Namespace, credentialProxyExecTierSelector(agent)))
+	}
+	return peers
 }
 
 // profileNamespacePeer admits every pod in the profile namespace, for the
@@ -328,12 +427,84 @@ func (r *PlatformAgentReconciler) reconcileProfileQuota(ctx context.Context, age
 	if err := r.applyManaged(ctx, agent, buildProfileQuota(agent, profiles)); err != nil {
 		return fmt.Errorf("failed to apply the profile ResourceQuota: %w", err)
 	}
+	r.adoptLeftoverProfileQuotas(ctx, agent)
 	return nil
+}
+
+// removeProfileQuotaOnDeletion deletes this agent's profile quota while its
+// finalizer holds the PlatformAgent. A refused delete is retried until
+// profileQuotaReleaseAfter has passed since the deletion; the answer is how
+// long to wait before the next try, zero to go on releasing. Past the bound
+// it releases with a Warning naming the quota it left, so a deletion never
+// hangs on the profile namespace. The fence is left for the chart's
+// uninstall: the bus fence that admits the namespace is garbage-collected
+// after the PlatformAgent, and removing the profile fence first would admit
+// an unfenced namespace in between.
+func (r *PlatformAgentReconciler) removeProfileQuotaOnDeletion(ctx context.Context, agent *agentv1alpha1.PlatformAgent, now time.Time) time.Duration {
+	err := r.deleteProfileQuota(ctx, agent)
+	if err == nil {
+		return 0
+	}
+	ns, name := profileNamespaceName(agent), profileQuotaName(agent)
+	if agent.DeletionTimestamp != nil && now.Sub(agent.DeletionTimestamp.Time) < profileQuotaReleaseAfter {
+		logf.FromContext(ctx).Error(err, "profile namespace: the quota's delete was refused on deletion; retrying",
+			"namespace", ns, "quota", name, "releaseAfter", profileQuotaReleaseAfter)
+		return profileQuotaRetryEvery
+	}
+	logf.FromContext(ctx).Error(err, "profile namespace: releasing with the quota left", "namespace", ns, "quota", name)
+	r.recordEvent(agent, corev1.EventTypeWarning, reasonProfileQuotaLeft,
+		fmt.Sprintf("profile namespace %s: left ResourceQuota %s, whose delete was still refused %s after the deletion: %v. A later PlatformAgent in %s removes it.",
+			ns, name, profileQuotaReleaseAfter, err, agent.Namespace))
+	return 0
+}
+
+// adoptLeftoverProfileQuotas removes a profile quota a deleted PlatformAgent
+// left in this agent's profile namespace (removeProfileQuotaOnDeletion), so a
+// successor of another name isn't capped by it: Kubernetes enforces every
+// quota in a namespace. Only an operator-rendered profile quota whose
+// PlatformAgent (<ns>/<name> from <name>-profile-quota in <ns>-profiles) no
+// longer exists is removed. A failure is logged and never stops the pass.
+func (r *PlatformAgentReconciler) adoptLeftoverProfileQuotas(ctx context.Context, agent *agentv1alpha1.PlatformAgent) {
+	var quotas corev1.ResourceQuotaList
+	if err := r.a2aReader().List(ctx, &quotas, client.InNamespace(profileNamespaceName(agent)),
+		client.MatchingLabels{a2aComponentLabel: profileQuotaComponent, labelManagedBy: fieldOwner}); err != nil {
+		r.profileNamespaceFailure(ctx, agent, "list the quotas to adopt a leftover one", err)
+		return
+	}
+	for i := range quotas.Items {
+		q := &quotas.Items[i]
+		if renderedByAgent(q, agent, profileQuotaComponent) {
+			continue
+		}
+		owner, ok := strings.CutSuffix(q.Name, profileQuotaSuffix)
+		if !ok || owner == "" {
+			continue
+		}
+		err := r.a2aReader().Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: owner}, &agentv1alpha1.PlatformAgent{})
+		if !apierrors.IsNotFound(err) {
+			if err != nil {
+				r.profileNamespaceFailure(ctx, agent, "read the PlatformAgent a leftover quota names", err)
+			}
+			continue
+		}
+		// Preconditioned on what was read, so a PlatformAgent of the old name
+		// created since, which applies over the same quota, keeps it.
+		switch err := r.Delete(ctx, q, client.Preconditions{UID: &q.UID, ResourceVersion: &q.ResourceVersion}); {
+		case apierrors.IsNotFound(err) || apierrors.IsConflict(err):
+			continue
+		case err != nil:
+			r.profileNamespaceFailure(ctx, agent, "remove the leftover quota "+q.Name, err)
+			continue
+		}
+		r.recordEvent(agent, corev1.EventTypeNormal, reasonProfileQuotaAdopted,
+			fmt.Sprintf("profile namespace %s: removed ResourceQuota %s, left by deleted PlatformAgent %s", q.Namespace, q.Name, owner))
+	}
 }
 
 // deleteProfileQuota and deleteProfileFence remove what this agent rendered
 // into the profile namespace, for the flip back to today (deleting the
-// PlatformAgent doesn't remove them yet: #3827). Those objects
+// PlatformAgent removes the quota, removeProfileQuotaOnDeletion, and leaves
+// the fence for the chart's uninstall). Those objects
 // carry no owner reference, so nothing else reclaims them, and an install
 // that isn't running next should look like it never did. An object of that
 // name that this agent's labels don't mark as its own is left to its owner,

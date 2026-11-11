@@ -1,6 +1,6 @@
 """The eval rosters under hack/eval/, read the way hack/ci-eval-pr.sh reads them.
 
-Four files hold what the eval gate runs and what blocks (#1546, 2026-09-15):
+The files under hack/eval/ hold what the eval gate runs and what blocks (#1546, 2026-09-15):
 
 - ``hack/eval/presubmit-cases.txt`` -- the presubmit matrix, one
   ``./tasks/<id>/task.yaml`` path per line (the script's ``TASKS``);
@@ -9,7 +9,11 @@ Four files hold what the eval gate runs and what blocks (#1546, 2026-09-15):
 - ``hack/eval/nightly-cases.txt`` -- what ``EVAL_TIER=nightly`` appends
   (``NIGHTLY_TASKS``);
 - ``hack/eval/blocking-roster.txt`` -- one case id per line, the default of
-  ``BOOTSTRAP_ADMITTED``.
+  ``BOOTSTRAP_ADMITTED``;
+- ``hack/eval/certification-cases.txt`` -- what ``EVAL_TIER=certification``
+  runs on its own, in ``# part N`` sections, one periodic each;
+- ``hack/eval/replay-lane-cases.txt`` -- what ``EVAL_REPLAY_LANE=true`` replays
+  from the nightlies' recordings, registered cases, gating nothing.
 
 In every file ``#`` starts a comment and blank lines are skipped, which is
 exactly the ``sed | grep`` the script applies; this module is the Python copy
@@ -45,6 +49,17 @@ BLOCKING_ROSTER_FILE = EVAL_DIR / "blocking-roster.txt"
 # The GitLab lane's presubmit matrix (kube-agents#2394): what EVAL_FORGE=gitlab
 # runs on a pull request, a subset of presubmit-cases.txt.
 GITLAB_CASES_FILE = EVAL_DIR / "gitlab-cases.txt"
+# The GHES lane's matrix (kube-agents#3684): what EVAL_FORGE=ghes runs, the
+# same rules as the GitLab lane's.
+GHES_CASES_FILE = EVAL_DIR / "ghes-cases.txt"
+# The certification suite's file: what EVAL_TIER=certification runs alone,
+# never a presubmit or nightly case. `# part N` lines split it into the
+# sections the ci-kube-agents-certification periodics run one each.
+CERTIFICATION_CASES_FILE = EVAL_DIR / "certification-cases.txt"
+CERTIFICATION_SUITE = "certification"
+# The replay lane's matrix (examples/inference-replay/eval-design.md, Rollout
+# step 2): registered cases, replayed from the nightlies' recordings.
+REPLAY_LANE_CASES_FILE = EVAL_DIR / "replay-lane-cases.txt"
 # The inject lane's exclusions (#2039): case ids the script drops from TASKS
 # under AGENT_TRANSPORT=inject, each with its reason as the comment block
 # directly above it.
@@ -68,6 +83,11 @@ CASE_ENTRY_RE = re.compile(r"^\./tasks/([A-Za-z0-9_-]+)/task\.yaml$")
 # A case path anywhere on a line, comment or not: how the validator finds a
 # commented-out registration, the parking state that is retired.
 CASE_PATH_ANYWHERE_RE = re.compile(r"tasks/([A-Za-z0-9_-]+)/task\.yaml")
+# A `# part N` section marker in the certification file: the line on its
+# own, N from 1, the twin of the awk pattern in the script's
+# certification_part_entries(). `#part 2`, an indented marker and `# part 0`
+# are comments to both.
+PART_MARKER_RE = re.compile(r"^#\s+part\s+([1-9]\d*)\s*$")
 # The old script's default line, for text from before the split.
 SCRIPT_ROSTER_RE = re.compile(r'BOOTSTRAP_ADMITTED="\$\{BOOTSTRAP_ADMITTED:-([^}]*)\}"')
 # bench-gate accepts comma- or whitespace-separated ids in the variable.
@@ -158,6 +178,41 @@ def gitlab_cases(path: pathlib.Path = GITLAB_CASES_FILE) -> list[str]:
     return case_names(path.read_text(encoding="utf-8"))
 
 
+def ghes_cases(path: pathlib.Path = GHES_CASES_FILE) -> list[str]:
+    return case_names(path.read_text(encoding="utf-8"))
+
+
+def certification_cases(path: pathlib.Path = CERTIFICATION_CASES_FILE) -> list[str]:
+    return case_names(path.read_text(encoding="utf-8"))
+
+
+def replay_lane_cases(path: pathlib.Path = REPLAY_LANE_CASES_FILE) -> list[str]:
+    return case_names(path.read_text(encoding="utf-8"))
+
+
+def parse_certification_parts(text: str) -> dict[int, list[str]]:
+    """Case ids of the certification file by ``# part N`` section, in file order.
+
+    An entry above the first marker is part 1, as in the script; a section
+    that names nothing is left out, since the script refuses to run it. The
+    marker is matched on the raw line, as the script's awk does.
+    """
+    parts: dict[int, list[str]] = {}
+    part = 1
+    for raw in text.splitlines():
+        marker = PART_MARKER_RE.match(raw)
+        if marker:
+            part = int(marker.group(1))
+            continue
+        for name in case_names(raw):
+            parts.setdefault(part, []).append(name)
+    return parts
+
+
+def certification_parts(path: pathlib.Path = CERTIFICATION_CASES_FILE) -> dict[int, list[str]]:
+    return parse_certification_parts(path.read_text(encoding="utf-8"))
+
+
 def parse_lane_exclusions(text: str) -> dict[str, str]:
     """Case ids of a lane-exclusion file, each with the reason above it.
 
@@ -233,8 +288,8 @@ SETTLE_RE = re.compile(r"^readonly EVAL_GITHUB_WRITE_SETTLE_SECONDS=(\d+)$", re.
 REPETITIONS_RE = re.compile(r'^EVAL_REPETITIONS="\$\{EVAL_REPETITIONS:-(\d+)\}"', re.MULTILINE)
 # The check types that request a pull request, as
 # bench/kube_agents_bench/lane.py's REQUESTING_CHECK_TYPES names them. A
-# case with such a leaf, or with an allowance in the safeguards file's
-# `requesting:` map, runs in the fan-out's serial second phase.
+# case with such a leaf, or with a `requested_pull_requests:` key of its own,
+# runs in the fan-out's serial second phase.
 # scripts/test_eval_rosters.py holds this text read to lane.py's YAML one.
 REQUESTING_CHECK_RE = re.compile(r"\btype:\s*[\"']?(pull_request_opened|pull_request_diff_contains)\b")
 # Build, deploy and lease, outside the fan-out: "~15min of build and deploy
@@ -274,41 +329,67 @@ def _script_number(pattern: re.Pattern, script_text: str, what: str) -> int:
     return int(m.group(1))
 
 
-def parse_lane_requesting(text: str) -> dict[str, int]:
-    """The safeguards file's top-level ``requesting:`` map, read as text."""
-    out: dict[str, int] = {}
-    inside = False
-    for raw in text.splitlines():
-        line = raw.split("#", 1)[0].rstrip()
-        if not line:
-            continue
-        if not line[0].isspace():
-            inside = line == "requesting:"
-            continue
-        if inside:
-            key, _, value = line.strip().partition(":")
-            out[key.strip()] = int(value.strip())
-    return out
-
-
-# The first prompt line that makes a case a stopped ask
-# (bench/kube_agents_bench/stop_hook.py, STOP_DIRECTIVE). hack/ci-eval-pr.sh's
-# unit_phase runs a stopped ask in the serial second phase beside the
-# requesting cases; scripts/test_eval_rosters.py holds this text read to
+# The first prompt lines that make a case a stopped ask
+# (bench/kube_agents_bench/stop_hook.py, STOP_DIRECTIVE and
+# MID_TURN_DIRECTIVE). hack/ci-eval-pr.sh's unit_phase runs a stopped ask in
+# the serial second phase beside the requesting cases;
+# scripts/test_eval_rosters.py holds this text read to
 # stop_hook.is_stopped_ask.
 STOP_DIRECTIVE = "[bench:stop-after-first-card]"
+MID_TURN_DIRECTIVE = "[bench:stop-mid-turn]"
 
 
 def is_stopped_ask(case: str, tasks_dir: pathlib.Path = TASKS_DIR) -> bool:
-    """Whether the case's task.yaml carries the stop directive outside a comment."""
+    """Whether the case's task.yaml carries a stop directive outside a comment."""
     text = (tasks_dir / case / "task.yaml").read_text(encoding="utf-8")
-    return any(STOP_DIRECTIVE in line.split("#", 1)[0] for line in text.splitlines())
+    return any(
+        directive in line.split("#", 1)[0]
+        for line in text.splitlines()
+        for directive in (STOP_DIRECTIVE, MID_TURN_DIRECTIVE)
+    )
 
 
-def requests_a_pull_request(case: str, lane_requesting: dict[str, int], tasks_dir: pathlib.Path = TASKS_DIR) -> bool:
-    """Whether the case requests a pull request: its own checks, or the lane
-    file's ``requesting:`` allowance."""
-    if lane_requesting.get(case, 0) > 0:
+# A case that declares `writes_alone: true` at its top level runs in the
+# serial second phase as well (bench/kube_agents_bench/lane.py, WRITES_ALONE_KEY;
+# unit_phase reads it through STOPPED_ASK_CASES); scripts/test_eval_rosters.py
+# holds this text read to lane.runs_alone.
+WRITES_ALONE_RE = re.compile(r"^writes_alone:\s*true\s*$")
+# The task's own total of requested pull requests (bench/kube_agents_bench/lane.py's
+# REQUESTED_KEY), for a case that opens more than its checks grade.
+REQUESTED_PULL_REQUESTS_RE = re.compile(r"^requested_pull_requests:\s*(0|[1-9][0-9]*)\s*$")
+
+
+def declares_writes_alone(case: str, tasks_dir: pathlib.Path = TASKS_DIR) -> bool:
+    """Whether the case's task.yaml declares ``writes_alone: true`` at its top level."""
+    text = (tasks_dir / case / "task.yaml").read_text(encoding="utf-8")
+    return any(WRITES_ALONE_RE.match(line.split("#", 1)[0].rstrip()) for line in text.splitlines())
+
+
+def runs_alone(case: str, tasks_dir: pathlib.Path = TASKS_DIR) -> bool:
+    """Whether the case runs in the serial phase without requesting a pull
+    request: a stopped ask, or a ``writes_alone`` case (lane.runs_alone)."""
+    return is_stopped_ask(case, tasks_dir) or declares_writes_alone(case, tasks_dir)
+
+
+def declared_pull_requests_in(text: str) -> int:
+    """The count a task file's text declares under ``requested_pull_requests``
+    on a top-level line; 0 when no such line."""
+    for line in text.splitlines():
+        m = REQUESTED_PULL_REQUESTS_RE.match(line.split("#", 1)[0].rstrip())
+        if m:
+            return int(m.group(1))
+    return 0
+
+
+def declared_pull_requests(case: str, tasks_dir: pathlib.Path = TASKS_DIR) -> int:
+    """The count the case's task.yaml declares under ``requested_pull_requests``; 0 when absent."""
+    return declared_pull_requests_in((tasks_dir / case / "task.yaml").read_text(encoding="utf-8"))
+
+
+def requests_a_pull_request(case: str, tasks_dir: pathlib.Path = TASKS_DIR) -> bool:
+    """Whether the case requests a pull request: its own checks, or its own
+    ``requested_pull_requests`` key."""
+    if declared_pull_requests(case, tasks_dir) > 0:
         return True
     text = (tasks_dir / case / "task.yaml").read_text(encoding="utf-8")
     return any(REQUESTING_CHECK_RE.search(line.split("#", 1)[0]) for line in text.splitlines())
@@ -321,7 +402,8 @@ def presubmit_wall_estimate() -> dict[str, object]:
     at a time, and a case's own repetitions one after another on its task
     lock: it takes the longer of the lane time spread over the lanes and the
     longest case's chain. Phase two runs the units of the cases that request a
-    pull request, and of the stopped asks (unit_phase in the script), one at a
+    pull request, of the stopped asks and of the ``writes_alone`` cases
+    (unit_phase in the script), one at a
     time after phase one has drained, each after the settle, so it adds
     straight onto the job. Every presubmit case counts, held-out seats too,
     because they run, and the inject lane's exclusions are not taken off.
@@ -338,10 +420,9 @@ def presubmit_wall_estimate() -> dict[str, object]:
     hints, default = parse_cost_hints(script)
     parallelism = _script_number(PARALLELISM_RE, script, "EVAL_TASK_PARALLELISM default")
     settle = _script_number(SETTLE_RE, script, "EVAL_GITHUB_WRITE_SETTLE_SECONDS")
-    lane_requesting = parse_lane_requesting(INJECT_LANE_SAFEGUARDS_FILE.read_text(encoding="utf-8"))
     first, second = [], []
     for case in presubmit_cases():
-        serial = requests_a_pull_request(case, lane_requesting) or is_stopped_ask(case)
+        serial = requests_a_pull_request(case) or runs_alone(case)
         (second if serial else first).append(case)
     chain = {case: hints.get(case, default) * repetitions for case in presubmit_cases()}
     phase_one = max(-(-sum(chain[c] for c in first) // parallelism), max((chain[c] for c in first), default=0))
@@ -371,11 +452,15 @@ def summary(repetitions: int = 3) -> dict[str, int]:
         "nightly matrix units": (len(presubmit) + len(nightly)) * repetitions,
         "presubmit units": len(presubmit) * repetitions,
         "gitlab lane cases": len(gitlab_cases()),
+        "ghes lane cases": len(ghes_cases()),
+        "replay lane cases": len(replay_lane_cases()),
         "inject lane exclusions": len(inject_lane_exclusions()),
         "presubmit serial-phase cases": len(wall["requesting"]),
         "presubmit wall estimate, minutes": -(-wall["total"] // 60),
         "presubmit wall budget, minutes": PRESUBMIT_WALL_BUDGET_MINUTES,
         "api lane exclusions": len(api_lane_exclusions()),
+        "certification cases": len(certification_cases()),
+        "certification parts": len(certification_parts()),
     }
 
 

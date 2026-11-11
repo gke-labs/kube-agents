@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
+	"github.com/gke-labs/kube-agents/a2a/lib/stepmsg"
 )
 
 // The console door (a2a/gateway/console.go): a frame published on
@@ -79,6 +81,34 @@ const (
 
 	// DefaultConversation is the alias a call without one uses.
 	DefaultConversation = "default"
+
+	firstStepWaitWindow = 6 * time.Second
+	nextStepWaitWindow  = 5 * time.Second
+	minStepBatchWait    = 600 * time.Millisecond
+	stepDebounceWait    = 350 * time.Millisecond
+	stepActivityWaitMax = 1100 * time.Millisecond
+	stepPollWait        = 200 * time.Millisecond
+	stepPollIdleSleep   = 50 * time.Millisecond
+	// delegationFollowGrace is how long a streamed poll of a finished,
+	// delegating root waits for its chain to answer (chainAnswered) before
+	// it takes the answer it has: the first delegated task, and the wake
+	// task the relay mints once a child ends, can each trail the task
+	// before them by up to the gateway's relayLagGrace (10 minutes by
+	// default), and the non-streamed wait (waitForChain) waits its whole
+	// wait for them; each poll inside the grace reports the turn still
+	// running.
+	delegationFollowGrace = 10 * time.Minute
+	reportGatherBudget    = 5 * time.Second
+	stepWatchIdleRelease  = 2 * time.Second
+	// maxStepTaskWatches bounds the task watches one streamed state holds
+	// between polls, each a reader slot (maxTaskReaders): the root's, and
+	// followed tasks' up to the bound. A followed task past it is not read
+	// until a held one finishes and frees its place. The cap is per turn,
+	// not a reservation: two streamed turns at their cap still hold all
+	// maxTaskReaders slots, and a closed watch keeps its slot for
+	// reapDelay, so a poll that reopens watches inside that window can
+	// briefly take more (#5166).
+	maxStepTaskWatches = maxTaskReaders / 2
 )
 
 // ConsoleInFrame is what the console door reads (gateway.ConsoleInFrame).
@@ -91,11 +121,22 @@ type ConsoleInFrame struct {
 // (gateway.ConsoleOutFrame). Kind is unset on its notices about a turn; a
 // frame with a kind reports something else (a task's terminal result, a
 // proactive notification) and is not a notice about the turn being sent.
+// A result names its task, addressee and state; a notification names, in
+// ReplyTo, the task whose turn filed the work it reports on, and an edit
+// re-sends a notification's message id with Edit set. A chain's completed
+// result sets CardsPending when the turn handed work to kanban cards (a
+// gateway that predates the flag never sets it).
 type ConsoleOutFrame struct {
 	MessageID string `json:"messageId"`
 	Text      string `json:"text"`
 	Edit      bool   `json:"edit,omitempty"`
 	Kind      string `json:"kind,omitempty"`
+	State     string `json:"state,omitempty"`
+	Addressee string `json:"addressee,omitempty"`
+	TaskID    string `json:"taskId,omitempty"`
+	ReplyTo   string `json:"replyTo,omitempty"`
+	// CardsPending is set on a result whose chain handed work to cards.
+	CardsPending bool `json:"cardsPending,omitempty"`
 }
 
 // submissionAuthority is the part of a submission's authority block that says
@@ -127,9 +168,13 @@ type Conversations struct {
 	// running is each conversation's turn task last seen unfinished, which
 	// its next turn waits on; at most maxConversations are kept.
 	running map[string]TaskRef
+	steps   map[string]*taskStepState
 	clock   uint64
 	// now is the wall clock an alias's last use is stamped with; tests set it.
 	now func() time.Time
+	// events, when set, listens to every conversation resolved here, and
+	// is told when the table forgets one.
+	events *Events
 }
 
 // aliasEntry is one alias: its token, the description manage_session's new
@@ -164,12 +209,25 @@ var ErrConversationBusy = errors.New("conversation busy: a turn is still running
 
 // NewConversations returns an empty alias table.
 func NewConversations() *Conversations {
-	return &Conversations{byAlias: map[string]*aliasEntry{}, sending: map[string]*sendLock{}, running: map[string]TaskRef{}, now: time.Now}
+	return &Conversations{
+		byAlias: map[string]*aliasEntry{},
+		sending: map[string]*sendLock{},
+		running: map[string]TaskRef{},
+		steps:   map[string]*taskStepState{},
+		now:     time.Now,
+	}
+}
+
+// WithEvents has the table's conversations listened to by events.
+func (c *Conversations) WithEvents(events *Events) *Conversations {
+	c.events = events
+	return c
 }
 
 // Resolve returns the console token for a call: token when the caller names
 // one (to resume a conversation, after a restart of this server included),
-// otherwise the alias's, minted on first use.
+// otherwise the alias's, minted on first use. The conversation is listened
+// to from then on.
 func (c *Conversations) Resolve(alias, token string) (string, error) {
 	t, _, err := c.ResolveCall(alias, token)
 	return t, err
@@ -179,16 +237,88 @@ func (c *Conversations) Resolve(alias, token string) (string, error) {
 // conversation by token, so its answer is labelled by the token rather than
 // by a name it may not have.
 func (c *Conversations) ResolveCall(alias, token string) (string, bool, error) {
-	// A conversation's token given as its name, as list shows it
-	// (console:<token>) or bare, is the token: never a new name spelled like
-	// one, whether or not this table still knows it (after a delete, an
-	// eviction or a restart, the token is what a caller falls back to).
+	r, err := c.resolve(alias, token)
+	if err != nil {
+		return "", false, err
+	}
+	if err := c.listen(r.token, r.named, r.evicted); err != nil {
+		// A name whose conversation is not listened to is not kept, as
+		// Create does not keep one, so a retry is not refused as existing.
+		if r.created != "" {
+			c.mu.Lock()
+			if e, ok := c.byAlias[r.created]; ok && e.token == r.token {
+				delete(c.byAlias, r.created)
+			}
+			c.mu.Unlock()
+		}
+		return "", false, err
+	}
+	return r.token, r.byToken, nil
+}
+
+// listen tells events of a conversation resolved and of one the table
+// evicted for it.
+func (c *Conversations) listen(token string, named bool, evicted string) error {
+	c.events.Unname(evicted)
+	if _, err := c.events.Watch(token, named); err != nil {
+		return fmt.Errorf("listen to the conversation's posts: %w", err)
+	}
+	return nil
+}
+
+// resolve is ResolveCall's table work: the token, whether the table holds it
+// by a name, whether the call named it by token, and the token of an alias
+// forgotten to make room.
+func (c *Conversations) resolve(alias, token string) (resolved, error) {
+	alias, token, err := nameOrToken(alias, token)
+	if err != nil {
+		return resolved{}, err
+	}
+	if token != "" {
+		// A call by token is a use of the name that holds it, if any.
+		c.mu.Lock()
+		if a, ok := c.aliasOfTokenLocked(token); ok {
+			c.touchLocked(c.byAlias[a])
+		}
+		c.mu.Unlock()
+		return resolved{token: token, byToken: true}, nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if e, ok := c.byAlias[alias]; ok {
+		c.touchLocked(e)
+		return resolved{token: e.token, named: true}, nil
+	}
+	t, evicted, err := c.addLocked(alias, "")
+	if err != nil {
+		return resolved{}, err
+	}
+	return resolved{token: t, named: true, created: alias, evicted: evicted}, nil
+}
+
+// resolved is what resolve found: the token, whether a name in the table
+// holds it, whether the call named it by token, the name it created (if it
+// did), and the token of an alias forgotten to make room.
+type resolved struct {
+	token   string
+	named   bool
+	byToken bool
+	created string
+	evicted string
+}
+
+// nameOrToken sorts a call's conversation into a name or a token, by the
+// rules every tool shares: a conversation's token given as its name, as list
+// shows it (console:<token>) or bare, is the token, never a new name spelled
+// like one, whether or not this table still knows it (after a delete, an
+// eviction or a restart, the token is what a caller falls back to); and
+// console:<x> in a name's place is a token only when x is one. A token comes
+// back without its prefix and checked; a name comes back checked, default
+// when none was given.
+func nameOrToken(alias, token string) (string, string, error) {
 	if token == "" && (strings.HasPrefix(alias, consoleConversationPrefix) || isMintedToken(alias)) {
-		// console:<x> in a name's place is a token only when x is one, as
-		// list shows tokens; console:<name> is neither, not a conversation
-		// nobody minted.
 		if rest := strings.TrimPrefix(alias, consoleConversationPrefix); !isMintedToken(rest) {
-			return "", false, fmt.Errorf("%s is neither a conversation name nor a conversation's token (list shows a token as console:<token>)", cell(alias))
+			return "", "", fmt.Errorf("%s is neither a conversation name nor a conversation's token (list shows a token as console:<token>)", cell(alias))
 		}
 		alias, token = "", alias
 	}
@@ -197,30 +327,17 @@ func (c *Conversations) ResolveCall(alias, token string) (string, bool, error) {
 		// names it.
 		token = strings.TrimPrefix(token, consoleConversationPrefix)
 		if !lib.ValidSubjectToken(token) {
-			return "", false, fmt.Errorf("%q is not a conversation token", token)
+			return "", "", fmt.Errorf("%q is not a conversation token", token)
 		}
-		// A call by token is a use of the name that holds it, if any.
-		c.mu.Lock()
-		if a, ok := c.aliasOfTokenLocked(token); ok {
-			c.touchLocked(c.byAlias[a])
-		}
-		c.mu.Unlock()
-		return token, true, nil
+		return "", token, nil
 	}
 	if alias == "" {
 		alias = DefaultConversation
 	}
 	if err := checkAlias(alias); err != nil {
-		return "", false, err
+		return "", "", err
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if e, ok := c.byAlias[alias]; ok {
-		c.touchLocked(e)
-		return e.token, false, nil
-	}
-	t, err := c.addLocked(alias, "")
-	return t, false, err
+	return alias, "", nil
 }
 
 // isMintedToken reports whether s is spelled as this server mints tokens.
@@ -254,11 +371,50 @@ func (c *Conversations) Create(alias, description string) (string, error) {
 		return "", err
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if _, ok := c.byAlias[alias]; ok {
+		c.mu.Unlock()
 		return "", fmt.Errorf("%w: %s", ErrConversationExists, cell(alias))
 	}
-	return c.addLocked(alias, description)
+	t, evicted, err := c.addLocked(alias, description)
+	c.mu.Unlock()
+	if err != nil {
+		return "", err
+	}
+	if err := c.listen(t, true, evicted); err != nil {
+		// A name whose conversation is not listened to is not created, so
+		// that a retry with the same name is not refused as existing.
+		c.mu.Lock()
+		if e, ok := c.byAlias[alias]; ok && e.token == t {
+			delete(c.byAlias, alias)
+		}
+		c.mu.Unlock()
+		return "", err
+	}
+	return t, nil
+}
+
+// lookup is resolve for a reader: the token of a conversation the caller
+// names by token, or by a name the table already holds, and whether the
+// table holds it by a name. An unknown name is refused, not created.
+func (c *Conversations) lookup(alias, token string) (string, bool, error) {
+	alias, token, err := nameOrToken(alias, token)
+	if err != nil {
+		return "", false, err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if token != "" {
+		// A call by token is a use of the name that holds it, if any.
+		if a, ok := c.aliasOfTokenLocked(token); ok {
+			c.touchLocked(c.byAlias[a])
+		}
+		return token, false, nil
+	}
+	if e, ok := c.byAlias[alias]; ok {
+		c.touchLocked(e)
+		return e.token, true, nil
+	}
+	return "", false, fmt.Errorf("no conversation named %s; send a turn first or pass conversation_token", cell(alias))
 }
 
 // Forget drops the name holding token, or else alias (a name, or a token in
@@ -266,23 +422,29 @@ func (c *Conversations) Create(alias, description string) (string, error) {
 // itself is untouched: it stays reachable by its token.
 func (c *Conversations) Forget(alias, token string) (string, bool) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	// A token wins over a name, as it does in ResolveCall.
-	if token != "" {
-		alias = ""
-	} else if _, ok := c.byAlias[alias]; ok {
-		delete(c.byAlias, alias)
-		return alias, true
-	} else {
-		// Named by its token in a name's place, as list shows it, or bare.
-		token = alias
+	name := ""
+	if token == "" {
+		if _, ok := c.byAlias[alias]; ok {
+			name = alias
+		} else {
+			// Named by its token in a name's place, as list shows it, or bare.
+			token = alias
+		}
 	}
-	a, found := c.aliasOfTokenLocked(strings.TrimPrefix(token, consoleConversationPrefix))
-	if !found {
-		return "", false
+	if name == "" {
+		a, found := c.aliasOfTokenLocked(strings.TrimPrefix(token, consoleConversationPrefix))
+		if !found {
+			c.mu.Unlock()
+			return "", false
+		}
+		name = a
 	}
-	delete(c.byAlias, a)
-	return a, true
+	forgotten := c.byAlias[name].token
+	delete(c.byAlias, name)
+	c.mu.Unlock()
+	c.events.Unname(forgotten)
+	return name, true
 }
 
 // List returns the aliases, most recently used first.
@@ -311,19 +473,21 @@ func (c *Conversations) touchLocked(e *aliasEntry) {
 }
 
 // addLocked mints a token for a new alias, forgetting the least recently
-// used alias first if the table is full.
-func (c *Conversations) addLocked(alias, description string) (string, error) {
+// used alias first if the table is full, and returns the forgotten alias's
+// token too.
+func (c *Conversations) addLocked(alias, description string) (string, string, error) {
 	t, err := mintConversationToken()
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
+	evicted := ""
 	if len(c.byAlias) >= maxConversations {
-		c.forgetOldestLocked()
+		evicted = c.forgetOldestLocked()
 	}
 	e := &aliasEntry{token: t, description: description}
 	c.touchLocked(e)
 	c.byAlias[alias] = e
-	return t, nil
+	return t, evicted, nil
 }
 
 func mintConversationToken() (string, error) {
@@ -362,14 +526,16 @@ func checkAlias(alias string) error {
 	return nil
 }
 
-func (c *Conversations) forgetOldestLocked() {
+func (c *Conversations) forgetOldestLocked() string {
 	oldest, at := "", uint64(0)
 	for a, e := range c.byAlias {
 		if oldest == "" || e.used < at {
 			oldest, at = a, e.used
 		}
 	}
+	token := c.byAlias[oldest].token
 	delete(c.byAlias, oldest)
+	return token
 }
 
 // lock takes the conversation's send lock, or gives up when ctx does.
@@ -444,6 +610,581 @@ func (c *Conversations) runningTask(token string) (TaskRef, bool) {
 	return ref, ok
 }
 
+type taskStepState struct {
+	mu                   sync.Mutex
+	active               atomic.Bool
+	ref                  TaskRef
+	token                string
+	alias                string
+	byToken              bool
+	notices              []string
+	startedAt            time.Time
+	prevReportedSteps    int
+	lastReportedSteps    int
+	prevReportedActs     int
+	lastReportedActs     int
+	lastWaitStepTitle    string
+	awaitAnswerSince     time.Time
+	settledDelegationsAt time.Time
+	settledFollowedCount int
+	followedRefs         []TaskRef
+	// seenStepKeys holds the steps already reported: true once a step was
+	// reported whole, false while it was reported as a plan step before
+	// any of its activities arrived (the api executor publishes the plan
+	// step when a call starts and its activity only when it ends), so the
+	// step is reported again once they do.
+	seenStepKeys map[string]bool
+	watch        *turnWatch
+	watchTimer   *time.Timer
+	taskWatches  map[TaskRef]*taskWatch
+	finalTasks   map[TaskRef]*lib.Task
+	failedTasks  map[TaskRef]error
+	// idleTimer releases the task watches a streamed poll kept once no
+	// poll has followed within stepWatchIdleRelease; idleGen is bumped by
+	// every arm and disarm, and a firing that finds another generation is
+	// stale (it was waiting on mu while a new poll ran) and does nothing,
+	// so it cannot close the watches that poll just kept.
+	idleTimer *time.Timer
+	idleGen   uint64
+	// superseded is set when a newer turn on the conversation found this
+	// state's tasks finished (awaitRunningTurn). A client may still be
+	// streaming it, so it stays for that client's own settle, but it no
+	// longer counts as the conversation's running turn or records one.
+	superseded atomic.Bool
+	// cancelPoll cancels the in-flight poll (WaitForTurnStep holds mu for
+	// all of it), so a stop need not wait out the poll window for mu.
+	// cancelMu guards it, not mu.
+	cancelMu   sync.Mutex
+	cancelPoll context.CancelFunc
+	// evicted are the states this poll's aliasTaskStepState evicted, for
+	// WaitForTurnStep to close once it has released mu.
+	evicted []*taskStepState
+}
+
+func (s *taskStepState) setCancelPoll(cancel context.CancelFunc) {
+	s.cancelMu.Lock()
+	s.cancelPoll = cancel
+	s.cancelMu.Unlock()
+}
+
+// cancelInFlightPoll cuts short the poll holding mu, if there is one.
+func (s *taskStepState) cancelInFlightPoll() {
+	s.cancelMu.Lock()
+	cancel := s.cancelPoll
+	s.cancelMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// armIdleReleaseLocked schedules the task watches' release after
+// stepWatchIdleRelease, superseding any earlier schedule. Caller holds s.mu.
+func (s *taskStepState) armIdleReleaseLocked() {
+	s.disarmIdleReleaseLocked()
+	gen := s.idleGen
+	s.idleTimer = time.AfterFunc(stepWatchIdleRelease, func() { s.releaseIdleWatches(gen) })
+}
+
+// disarmIdleReleaseLocked cancels the scheduled release and retires its
+// generation, so a firing already past Stop finds itself stale. Caller
+// holds s.mu.
+func (s *taskStepState) disarmIdleReleaseLocked() {
+	if s.idleTimer != nil {
+		s.idleTimer.Stop()
+		s.idleTimer = nil
+	}
+	s.idleGen++
+}
+
+// releaseIdleWatches is the idle timer's body: it closes the task watches
+// only when gen is still the armed generation.
+func (s *taskStepState) releaseIdleWatches(gen uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.idleGen != gen {
+		return
+	}
+	s.closeTaskWatchesLocked()
+}
+
+func (s *taskStepState) isUnsubmittedRootLocked(ref TaskRef) bool {
+	return ref == s.ref && s.watch == nil && s.lastReportedSteps == 0 && s.lastReportedActs == 0 && s.finalTasks[ref] == nil && s.failedTasks[ref] == nil
+}
+
+func (s *taskStepState) syncFollowedTasksLocked() []TaskRef {
+	if s.watch != nil {
+		for _, ref := range s.watch.followedTasks() {
+			if ref.TaskID != "" && !slices.Contains(s.followedRefs, ref) {
+				s.followedRefs = append(s.followedRefs, ref)
+			}
+		}
+	}
+	return slices.Clone(s.followedRefs)
+}
+
+func (s *taskStepState) followedTasks() []TaskRef {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.syncFollowedTasksLocked()
+}
+
+func (s *taskStepState) hasFollowedTaskID(wantIDs map[string]bool) bool {
+	for _, f := range s.followedTasks() {
+		if wantIDs[f.TaskID] {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *taskStepState) attachWatch(w *turnWatch) {
+	if w == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.watch == nil {
+		if w.release != nil {
+			w.release()
+		}
+		s.watch = w
+		s.active.Store(true)
+		s.watchTimer = time.AfterFunc(MaxTurnWait, s.closeAll)
+	}
+	s.mu.Unlock()
+}
+
+func (s *taskStepState) closeTaskWatchesLocked() {
+	s.disarmIdleReleaseLocked()
+	for k, tw := range s.taskWatches {
+		tw.close()
+		delete(s.taskWatches, k)
+	}
+}
+
+func (s *taskStepState) closeTaskWatches() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closeTaskWatchesLocked()
+}
+
+func (s *taskStepState) closeAllLocked() {
+	s.active.Store(false)
+	s.syncFollowedTasksLocked()
+	s.closeTaskWatchesLocked()
+	if s.watchTimer != nil {
+		s.watchTimer.Stop()
+		s.watchTimer = nil
+	}
+	if s.watch != nil {
+		s.watch.close()
+		s.watch = nil
+	}
+}
+
+func (s *taskStepState) closeAll() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closeAllLocked()
+}
+
+func (c *Conversations) removeStepStateKeysLocked(target *taskStepState) {
+	if target == nil {
+		return
+	}
+	for k, cur := range c.steps {
+		if cur == target {
+			delete(c.steps, k)
+		}
+	}
+}
+
+func (c *Conversations) evictStepStateLocked(keep *taskStepState) *taskStepState {
+	for k, old := range c.steps {
+		if old == nil {
+			delete(c.steps, k)
+			return nil
+		}
+		if old != keep && !old.active.Load() {
+			c.removeStepStateKeysLocked(old)
+			return old
+		}
+	}
+	for k, old := range c.steps {
+		if old != keep {
+			if old != nil {
+				c.removeStepStateKeysLocked(old)
+			} else {
+				delete(c.steps, k)
+			}
+			return old
+		}
+	}
+	return nil
+}
+
+func (c *Conversations) initTaskStepState(ref TaskRef, token, alias string, byToken bool, notices []string, w *turnWatch) *taskStepState {
+	if w != nil && w.release != nil {
+		// Release the submission-matching sendLock now that ownSubmission has
+		// matched and c.setRunning(token, &ref) is recorded.
+		w.release()
+	}
+	var toClose []*taskStepState
+	defer func() {
+		for _, s := range toClose {
+			s.closeAll()
+		}
+	}()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.steps == nil {
+		c.steps = map[string]*taskStepState{}
+	}
+	if old, ok := c.steps[ref.TaskID]; ok && old != nil {
+		c.removeStepStateKeysLocked(old)
+		toClose = append(toClose, old)
+	}
+	for len(c.steps) >= maxConversations {
+		evicted := c.evictStepStateLocked(nil)
+		if evicted != nil {
+			toClose = append(toClose, evicted)
+		} else if len(c.steps) >= maxConversations {
+			break
+		}
+	}
+	now := time.Now()
+	if c.now != nil {
+		now = c.now()
+	}
+	st := &taskStepState{
+		ref:         ref,
+		token:       token,
+		alias:       alias,
+		byToken:     byToken,
+		notices:     slices.Clone(notices),
+		startedAt:   now,
+		watch:       w,
+		taskWatches: map[TaskRef]*taskWatch{},
+		finalTasks:  map[TaskRef]*lib.Task{},
+		failedTasks: map[TaskRef]error{},
+	}
+	if w != nil {
+		st.active.Store(true)
+		st.watchTimer = time.AfterFunc(MaxTurnWait, st.closeAll)
+	}
+	c.steps[ref.TaskID] = st
+	return st
+}
+
+func (c *Conversations) getOrCreateTaskStepState(ref TaskRef, w *turnWatch) *taskStepState {
+	c.mu.Lock()
+	if c.steps == nil {
+		c.steps = map[string]*taskStepState{}
+	}
+	if st, ok := c.steps[ref.TaskID]; ok && st != nil {
+		c.mu.Unlock()
+		st.attachWatch(w)
+		return st
+	}
+	var toClose []*taskStepState
+	for len(c.steps) >= maxConversations {
+		evicted := c.evictStepStateLocked(nil)
+		if evicted != nil {
+			toClose = append(toClose, evicted)
+		} else if len(c.steps) >= maxConversations {
+			break
+		}
+	}
+	now := time.Now()
+	if c.now != nil {
+		now = c.now()
+	}
+	if w != nil && w.release != nil {
+		w.release()
+	}
+	st := &taskStepState{
+		ref:         ref,
+		startedAt:   now,
+		watch:       w,
+		taskWatches: map[TaskRef]*taskWatch{},
+		finalTasks:  map[TaskRef]*lib.Task{},
+		failedTasks: map[TaskRef]error{},
+	}
+	if w != nil {
+		st.active.Store(true)
+		st.watchTimer = time.AfterFunc(MaxTurnWait, st.closeAll)
+	}
+	c.steps[ref.TaskID] = st
+	c.mu.Unlock()
+	for _, s := range toClose {
+		s.closeAll()
+	}
+	return st
+}
+
+// aliasTaskStepState keys st under child too. It returns the states it
+// evicted to make room, or that child was keyed to, for the caller to close
+// (closeEvicted) once it no longer holds st.mu: closing one takes its mu,
+// and two polls each closing the other's state while holding their own
+// would deadlock.
+func (c *Conversations) aliasTaskStepState(child TaskRef, st *taskStepState) []*taskStepState {
+	if c == nil || st == nil || child.TaskID == "" {
+		return nil
+	}
+	var toClose []*taskStepState
+	c.mu.Lock()
+	if c.steps == nil {
+		c.steps = map[string]*taskStepState{}
+	}
+	if c.steps[child.TaskID] != st {
+		if old := c.steps[child.TaskID]; old != nil {
+			c.removeStepStateKeysLocked(old)
+			toClose = append(toClose, old)
+		}
+		for len(c.steps) >= maxConversations {
+			evicted := c.evictStepStateLocked(st)
+			if evicted != nil {
+				toClose = append(toClose, evicted)
+			} else {
+				break
+			}
+		}
+		c.steps[child.TaskID] = st
+	}
+	c.mu.Unlock()
+	return toClose
+}
+
+// closeEvicted closes states aliasTaskStepState evicted, cutting short any
+// poll in flight on one first (as stopTaskStepState does) rather than wait
+// out its window for its mu. The caller holds no state's mu.
+func closeEvicted(states []*taskStepState) {
+	for _, s := range states {
+		s.cancelInFlightPoll()
+		s.closeAll()
+	}
+}
+
+func (c *Conversations) knownTaskRef(taskID string) (TaskRef, bool) {
+	if c == nil || taskID == "" {
+		return TaskRef{}, false
+	}
+	c.mu.Lock()
+	st := c.steps[taskID]
+	if st != nil && st.ref.TaskID == taskID && st.ref.Addressee != "" {
+		c.mu.Unlock()
+		return st.ref, true
+	}
+	var runningRef TaskRef
+	hasRunning := false
+	for _, ref := range c.running {
+		if ref.TaskID == taskID && ref.Addressee != "" {
+			runningRef = ref
+			hasRunning = true
+			break
+		}
+	}
+	c.mu.Unlock()
+	if st != nil {
+		for _, f := range st.followedTasks() {
+			if f.TaskID == taskID && f.Addressee != "" {
+				return f, true
+			}
+		}
+	}
+	if hasRunning {
+		return runningRef, true
+	}
+	return TaskRef{}, false
+}
+
+// stopTaskStepState closes token's step states for refs (all of token's with
+// no refs) after a stop went out: it cuts short any poll in flight and closes
+// their watches. The states stay keyed, inactive, so the stopped turn's
+// closing poll still knows the steps it reported and does not repeat them;
+// that poll removes them once the turn settles, or eviction does.
+func (c *Conversations) stopTaskStepState(token string, refs ...TaskRef) {
+	matched := c.matchTaskStepStates(token, refs...)
+	if len(matched) == 0 {
+		return
+	}
+	for st := range matched {
+		st.cancelInFlightPoll()
+	}
+	for st := range matched {
+		st.closeAll()
+	}
+}
+
+// supersedeTaskStepState marks the conversation's step states for refs
+// superseded (see taskStepState.superseded) without closing them: a client
+// still streaming one settles it, with its delegated tasks' answer, itself.
+func (c *Conversations) supersedeTaskStepState(token string, refs ...TaskRef) {
+	for st := range c.matchTaskStepStates(token, refs...) {
+		st.superseded.Store(true)
+	}
+}
+
+// matchTaskStepStates returns token's step states keyed under, rooted at or
+// following one of refs, or all of token's with no refs.
+func (c *Conversations) matchTaskStepStates(token string, refs ...TaskRef) map[*taskStepState]bool {
+	if c == nil || (token == "" && len(refs) == 0) {
+		return nil
+	}
+	wantIDs := make(map[string]bool, len(refs))
+	for _, r := range refs {
+		if r.TaskID != "" {
+			wantIDs[r.TaskID] = true
+		}
+	}
+	c.mu.Lock()
+	matched := map[*taskStepState]bool{}
+	seenUnmatched := map[*taskStepState]bool{}
+	var unmatched []*taskStepState
+	for k, st := range c.steps {
+		if st == nil || (token != "" && st.token != token) {
+			continue
+		}
+		if len(wantIDs) == 0 || wantIDs[k] || wantIDs[st.ref.TaskID] {
+			matched[st] = true
+		} else if !seenUnmatched[st] {
+			seenUnmatched[st] = true
+			unmatched = append(unmatched, st)
+		}
+	}
+	c.mu.Unlock()
+	for _, st := range unmatched {
+		if !matched[st] && st.hasFollowedTaskID(wantIDs) {
+			matched[st] = true
+		}
+	}
+	return matched
+}
+
+func (c *Conversations) deleteTaskStepState(ref TaskRef, st *taskStepState) {
+	if c == nil || ref.TaskID == "" {
+		return
+	}
+	c.mu.Lock()
+	if c.steps[ref.TaskID] == st {
+		delete(c.steps, ref.TaskID)
+	}
+	c.mu.Unlock()
+}
+
+func (c *Conversations) removeTaskStepState(st *taskStepState) {
+	if c == nil || st == nil {
+		return
+	}
+	c.mu.Lock()
+	c.removeStepStateKeysLocked(st)
+	c.mu.Unlock()
+}
+
+func (c *Conversations) activeStepFollowedTasks(token string, ref TaskRef) []TaskRef {
+	if c == nil || (token == "" && ref.TaskID == "") {
+		return nil
+	}
+	var wantRef map[string]bool
+	if ref.TaskID != "" {
+		wantRef = map[string]bool{ref.TaskID: true}
+	}
+	c.mu.Lock()
+	seenState := map[*taskStepState]bool{}
+	directMatch := map[*taskStepState]bool{}
+	var candidates []*taskStepState
+	for k, st := range c.steps {
+		if st == nil || (token != "" && st.token != token) {
+			continue
+		}
+		if ref.TaskID == "" || k == ref.TaskID || st.ref.TaskID == ref.TaskID || c.steps[ref.TaskID] == st {
+			directMatch[st] = true
+		}
+		if !seenState[st] {
+			seenState[st] = true
+			candidates = append(candidates, st)
+		}
+	}
+	c.mu.Unlock()
+	seenRef := map[string]bool{}
+	if ref.TaskID != "" {
+		seenRef[ref.TaskID] = true
+	}
+	var out []TaskRef
+	for _, st := range candidates {
+		st.mu.Lock()
+		followed := st.syncFollowedTasksLocked()
+		matched := directMatch[st]
+		if !matched && len(wantRef) > 0 {
+			for _, f := range followed {
+				if wantRef[f.TaskID] {
+					matched = true
+					break
+				}
+			}
+		}
+		if matched {
+			st.closeTaskWatchesLocked()
+			for _, f := range followed {
+				if f.TaskID == "" || seenRef[f.TaskID] {
+					continue
+				}
+				if st.finalTasks[f] != nil || st.failedTasks[f] != nil {
+					continue
+				}
+				seenRef[f.TaskID] = true
+				out = append(out, f)
+			}
+		}
+		st.mu.Unlock()
+	}
+	return out
+}
+
+func (c *Conversations) closeTaskStepState(ref TaskRef) {
+	if c == nil || ref.TaskID == "" {
+		return
+	}
+	c.mu.Lock()
+	st := c.steps[ref.TaskID]
+	if st != nil {
+		for k, cur := range c.steps {
+			if cur == st {
+				delete(c.steps, k)
+			}
+		}
+	}
+	c.mu.Unlock()
+	if st != nil {
+		st.closeAll()
+	}
+}
+
+func (c *Conversations) hasActiveStepState(token string) (TaskRef, bool) {
+	if c == nil || token == "" {
+		return TaskRef{}, false
+	}
+	c.mu.Lock()
+	seen := map[*taskStepState]bool{}
+	var candidates []*taskStepState
+	for _, st := range c.steps {
+		if st != nil && !seen[st] && st.token == token && !st.superseded.Load() {
+			seen[st] = true
+			candidates = append(candidates, st)
+		}
+	}
+	c.mu.Unlock()
+	for _, st := range candidates {
+		st.mu.Lock()
+		active := st.watch != nil
+		ref := st.ref
+		st.mu.Unlock()
+		if active {
+			return ref, true
+		}
+	}
+	return TaskRef{}, false
+}
+
 // release drops one holder or waiter, and the lock with the last of them.
 func (c *Conversations) release(token string, l *sendLock) {
 	c.mu.Lock()
@@ -494,10 +1235,19 @@ func turnFate(text string) (settled bool, texts []string) {
 // turn's own task once it appears, then the tasks delegated from it.
 type turnWatch struct {
 	conversation string
+	token        string
 	texts        []string
-	subs         chan *nats.Msg
-	notices      chan *nats.Msg
-	unsubscribe  func()
+	// since is the event cursor before the turn was sent: a card's report
+	// on this turn comes after it.
+	since       uint64
+	subs        chan *nats.Msg
+	notices     chan *nats.Msg
+	unsubscribe func()
+	// unpin releases the conversation's buffer, which the turn holds while
+	// it gathers from it.
+	unpin func()
+	// resultSeen is signalled on each result frame recorded in results.
+	resultSeen chan struct{}
 	// release hands back the conversation's send lock. A turn holds it from
 	// before it is sent until the watch closes, after its answer is read, so
 	// a second turn on the conversation is sent only once this one is done:
@@ -511,6 +1261,68 @@ type turnWatch struct {
 	followed []TaskRef
 	known    map[string]bool
 	stop     chan struct{}
+	// results is the result frames heard on the conversation, by the task
+	// each names (its taskId, or the r-<task> of its message id): whether
+	// any said cards are pending. Bounded by maxTurnResults.
+	results map[string]bool
+}
+
+// maxTurnResults bounds the result frames one turn records; past it a new
+// task's is not recorded, and the turn falls back to its quiet period.
+const maxTurnResults = 64
+
+// resultMessagePrefix is the gateway's message id prefix for a chain's
+// result frame: r-<root task id>-<state> (r-<root task id> before the
+// gateway named the state in it). The frame's taskId field says the same
+// and is read first; the id is the fallback.
+const resultMessagePrefix = "r-"
+
+// resultIDTask is the task a result frame's message id names, with the
+// state suffix the gateway adds stripped.
+func resultIDTask(messageID string) (string, bool) {
+	id, ok := strings.CutPrefix(messageID, resultMessagePrefix)
+	if !ok {
+		return "", false
+	}
+	if i := strings.LastIndex(id, "-"); i > 0 && lib.TaskState(id[i+1:]).Terminal() {
+		id = id[:i]
+	} else if i := strings.LastIndex(id, "-input-required"); i > 0 && id[i:] == "-input-required" {
+		id = id[:i]
+	}
+	return id, lib.ValidSubjectToken(id)
+}
+
+// noteResult records a result frame heard on the conversation.
+func (w *turnWatch) noteResult(f ConsoleOutFrame) {
+	var ids []string
+	if lib.ValidSubjectToken(f.TaskID) {
+		ids = append(ids, f.TaskID)
+	}
+	if id, ok := resultIDTask(f.MessageID); ok && id != f.TaskID {
+		ids = append(ids, id)
+	}
+	w.mu.Lock()
+	for _, id := range ids {
+		if _, ok := w.results[id]; ok || len(w.results) < maxTurnResults {
+			// Once any result said cards are pending, a later one without
+			// the flag does not undo it.
+			w.results[id] = w.results[id] || f.CardsPending
+		}
+	}
+	w.mu.Unlock()
+	select {
+	case w.resultSeen <- struct{}{}:
+	default:
+	}
+}
+
+// rootResult reports whether a result frame for root was heard, and whether
+// one said cards are pending.
+func (w *turnWatch) rootResult(root string) (seen, pending bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	pending, seen = w.results[root]
+	return seen, pending
 }
 
 // openTurn subscribes to the conversation's submissions and notices, live on
@@ -519,11 +1331,14 @@ func (b *NATSBus) openTurn(token string, texts []string, submissions bool) (*tur
 	nc := b.client.Conn()
 	w := &turnWatch{
 		conversation: fmt.Sprintf(consoleConversationOf, token),
+		token:        token,
 		texts:        texts,
 		subs:         make(chan *nats.Msg, 256),
 		notices:      make(chan *nats.Msg, 64),
 		known:        map[string]bool{},
 		stop:         make(chan struct{}),
+		results:      map[string]bool{},
+		resultSeen:   make(chan struct{}, 1),
 	}
 	// Submissions are every addressee's .in traffic, drained by the turn's
 	// matcher and then its follower. A settled turn has neither, and an
@@ -536,7 +1351,30 @@ func (b *NATSBus) openTurn(token string, texts []string, submissions bool) (*tur
 			return nil, err
 		}
 	}
-	nsub, err := nc.ChanSubscribe(fmt.Sprintf(consoleOutSubject, token), w.notices)
+	// Notices are read only until the turn's task appears, and a card's
+	// posts can come in bursts while the turn is followed (Events keeps
+	// those), so a notice that finds the channel full is dropped rather
+	// than left to back up into a slow consumer. A result frame is
+	// recorded, for whether the chain handed work to cards. Nothing but a
+	// notice takes a slot: a burst of reports must not crowd out the
+	// turn's notice.
+	nsub, err := nc.Subscribe(fmt.Sprintf(consoleOutSubject, token), func(m *nats.Msg) {
+		var f ConsoleOutFrame
+		if json.Unmarshal(m.Data, &f) != nil {
+			return
+		}
+		if f.Kind == frameKindResult {
+			w.noteResult(f)
+			return
+		}
+		if noticeText(m) == "" {
+			return
+		}
+		select {
+		case w.notices <- m:
+		default:
+		}
+	})
 	if err != nil {
 		if sub != nil {
 			_ = sub.Unsubscribe()
@@ -591,11 +1429,23 @@ func (b *NATSBus) SendTurn(ctx context.Context, convs *Conversations, token, tex
 		unlock()
 		return res, nil, err
 	}
-	w, err := b.openTurn(token, texts, true)
+	// The conversation's reports are listened to before the turn goes,
+	// so none on it is missed, whether or not its name was resolved here,
+	// and its buffer is held until the turn is done gathering, whatever
+	// drops the name meanwhile.
+	unpin, err := b.events.Pin(token)
 	if err != nil {
 		unlock()
 		return res, nil, err
 	}
+	w, err := b.openTurn(token, texts, true)
+	if err != nil {
+		unpin()
+		unlock()
+		return res, nil, err
+	}
+	w.unpin = unpin
+	w.since = b.events.Cursor()
 	// From here the watch holds the lock, and closing it releases it.
 	var once sync.Once
 	w.release = func() { once.Do(unlock) }
@@ -665,30 +1515,65 @@ func (w *turnWatch) settleNotices(ctx context.Context, notices []string) []strin
 // awaitRunningTurn waits, within ctx, for the conversation's unfinished turn
 // task, if it has one, to finish.
 func (b *NATSBus) awaitRunningTurn(ctx context.Context, convs *Conversations, token string) error {
-	ref, ok := convs.runningTask(token)
-	if !ok {
-		return nil
+	for {
+		ref, ok := convs.runningTask(token)
+		if !ok {
+			if stepRef, active := convs.hasActiveStepState(token); active {
+				ref = stepRef
+			} else {
+				return nil
+			}
+		}
+		t, err := b.waitForSubmittedTask(ctx, ref, time.Until(deadlineOf(ctx)))
+		switch {
+		case errors.Is(err, ErrTaskNotFound), err == nil && t != nil && t.Final:
+			for _, fRef := range convs.activeStepFollowedTasks(token, ref) {
+				if err := b.awaitSingleTask(ctx, convs, token, fRef); err != nil {
+					return err
+				}
+			}
+			convs.clearRunning(token, ref)
+			convs.supersedeTaskStepState(token, ref)
+			if _, active := convs.hasActiveStepState(token); active {
+				continue
+			}
+			return nil
+		case tooLargeToRead(err):
+			// The task can't be read here, now or later, so it can't be waited
+			// on either. Holding the conversation for it would refuse every
+			// later message, so let this one go.
+			convs.clearRunning(token, ref)
+			convs.supersedeTaskStepState(token, ref)
+			if _, active := convs.hasActiveStepState(token); active {
+				continue
+			}
+			return nil
+		case ctx.Err() != nil:
+			return convs.busy(token, ctx.Err())
+		case errors.Is(err, context.DeadlineExceeded):
+			// The read's own deadline, ctx's, passed a moment before ctx's did.
+			return convs.busy(token, err)
+		case err != nil:
+			return fmt.Errorf("reading the conversation's running task %s: %w", ref, err)
+		}
+		return convs.busy(token, context.DeadlineExceeded)
 	}
+}
+
+func (b *NATSBus) awaitSingleTask(ctx context.Context, convs *Conversations, token string, ref TaskRef) error {
 	t, err := b.waitForSubmittedTask(ctx, ref, time.Until(deadlineOf(ctx)))
 	switch {
-	case errors.Is(err, ErrTaskNotFound), err == nil && t != nil && t.Final:
-		convs.clearRunning(token, ref)
-		return nil
-	case tooLargeToRead(err):
-		// The task can't be read here, now or later, so it can't be waited
-		// on either. Holding the conversation for it would refuse every
-		// later message, so let this one go.
-		convs.clearRunning(token, ref)
+	case errors.Is(err, ErrTaskNotFound), err == nil && t != nil && t.Final, tooLargeToRead(err):
 		return nil
 	case ctx.Err() != nil:
 		return convs.busy(token, ctx.Err())
 	case errors.Is(err, context.DeadlineExceeded):
-		// The read's own deadline, ctx's, passed a moment before ctx's did.
 		return convs.busy(token, err)
 	case err != nil:
 		return fmt.Errorf("reading the conversation's running task %s: %w", ref, err)
+	default:
+		return convs.busy(token, context.DeadlineExceeded)
 	}
-	return convs.busy(token, context.DeadlineExceeded)
 }
 
 // SendStop sends the console door's stop word.
@@ -782,6 +1667,9 @@ func (w *turnWatch) close() {
 	case <-w.stop:
 	default:
 		close(w.stop)
+		if w.unpin != nil {
+			w.unpin()
+		}
 	}
 }
 
@@ -844,6 +1732,14 @@ func (w *turnWatch) follow() {
 	}
 }
 
+// inChain reports whether id is a task of this turn: its own, or one
+// delegated from it, directly or not.
+func (w *turnWatch) inChain(id string) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return id != "" && w.known[id]
+}
+
 func (w *turnWatch) followedTasks() []TaskRef {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -861,7 +1757,61 @@ type TurnOutcome struct {
 	// task that wakes the delegator), else the root.
 	AnswerFrom *TaskRef
 	Answer     *lib.Task
+	// Reports are the cards' posts on the turn, in arrival order, an edit
+	// in its post's place; ReportsEnd says why gathering them stopped, and
+	// ReportCursor is the event cursor then, for poll_events.
+	Reports      []EventFrame
+	ReportsEnd   reportsEnd
+	ReportCursor uint64
+	// ReportsDropped: the conversation's buffer dropped a frame posted
+	// after the turn was sent, which may have been one of its reports.
+	ReportsDropped bool
+	// Cards is what the gateway's result for the root said about cards,
+	// as last read while gathering.
+	Cards cardsSignal
+	// Unfollowed: the root delegated, but this read of the finished turn
+	// had no watch to find its delegated tasks, so none was followed and
+	// the root's own artifact is not the turn's whole answer.
+	Unfollowed bool
 }
+
+// cardsSignal is what the gateway's result frame for a turn's root said
+// about work handed to kanban cards.
+type cardsSignal int
+
+const (
+	// cardsUnknown: no result frame for the root was heard (a gateway that
+	// predates the flag, or one whose heal path missed it).
+	cardsUnknown cardsSignal = iota
+	// cardsNone: the root's result came without cardsPending.
+	cardsNone
+	// cardsPending: the root's result said work was handed to cards.
+	cardsPending
+)
+
+// reportsEnd is why a turn's report gathering stopped.
+type reportsEnd int
+
+const (
+	// reportsNotGathered: no listener (a bus without events).
+	reportsNotGathered reportsEnd = iota
+	// reportsRunning: the wait ended before the turn's tasks did.
+	reportsRunning
+	// reportsQuiet: reportQuiet passed with no new post on the turn.
+	reportsQuiet
+	// reportsWaitOver: the wait ended while gathering.
+	reportsWaitOver
+	// reportsNoCards: the root's result said no work went to cards.
+	reportsNoCards
+	// reportsNoCardSignal: a streamed turn ended with no handoff, card
+	// step or result frame heard, so gathering stopped at once.
+	reportsNoCardSignal
+)
+
+// reportQuiet is how long, once a turn's tasks have ended, gathering waits
+// for a card's next post on it before it stops: counted from the end, then
+// from each post.
+var reportQuiet = 15 * time.Second
 
 // Unfinished is a task of the turn last read as not yet final, the one the
 // conversation's next turn waits on, or nil when the turn is done.
@@ -885,31 +1835,556 @@ type FollowedTask struct {
 	Err  error
 }
 
-// delegationSettle is how long, once every followed task has finished,
-// WaitForTurn waits for another delegation before taking the last answer.
+// delegationSettle is how long, once every followed task has finished and
+// the chain has answered (chainAnswered), a wait (WaitForTurn, or a
+// streamed WaitForTurnStep) waits for another delegation before taking the
+// last answer.
 const delegationSettle = 2 * time.Second
+
+// chainAnswered is the rule both waits end a delegated chain on, together
+// with delegationSettle: a followed task other than the root has finished
+// with a result. (A streamed poll also ends it on the root's result frame,
+// see pollTurnStepSnapshotLocked.) A child's own result is only interim while the relay has
+// yet to mint the task that wakes the delegator with it.
+func chainAnswered(out TurnOutcome) bool {
+	return out.AnswerFrom != nil && *out.AnswerFrom != out.Root &&
+		out.Answer != nil && out.Answer.Final && out.Answer.Artifact(lib.ArtifactResult) != nil
+}
 
 // WaitForTurn waits, within wait, for the turn's task to finish and, when it
 // delegated (it carries a delegate artifact; a handoff to kanban cards is
 // not followed, see delegated), for the tasks
 // delegated from it: the answer of a delegation lands on the task that wakes
 // the delegator, which may come minutes after the delegator itself finished.
-// Followed tasks are read one at a time on one reader slot. It closes the
-// watch.
+// Followed tasks are read one at a time on one reader slot. Then, in what is
+// left of wait, it gathers the cards' reports on the turn (gatherReports).
+// It closes the watch.
 func (b *NATSBus) WaitForTurn(ctx context.Context, w *turnWatch, root TaskRef, wait time.Duration) (TurnOutcome, error) {
 	defer w.close()
 	ctx, cancel := context.WithTimeout(ctx, wait)
 	defer cancel()
-	out := TurnOutcome{Root: root}
-	t, err := b.waitForSubmittedTask(ctx, root, wait)
-	if err != nil && !errors.Is(err, ErrTaskNotFound) {
+	out, ended, err := b.waitForChain(ctx, w, root)
+	if err != nil {
 		return out, err
+	}
+	b.gatherReports(ctx, w, &out, ended)
+	return out, nil
+}
+
+// WaitForTurnStep advances a streaming turn by one or more live steps (or waits
+// up to a short step window for the next step or task completion) and returns a
+// TurnStepOutcome suitable for FormatTurnCustomToolEnvelope.
+func (b *NATSBus) WaitForTurnStep(ctx context.Context, convs *Conversations, w *turnWatch, root TaskRef, wait time.Duration) (TurnStepOutcome, error) {
+	if convs == nil {
+		convs = NewConversations()
+	}
+	st := convs.getOrCreateTaskStepState(root, w)
+	st.mu.Lock()
+	defer func() {
+		evicted := st.evicted
+		st.evicted = nil
+		st.mu.Unlock()
+		closeEvicted(evicted)
+	}()
+
+	st.disarmIdleReleaseLocked()
+	if st.watch != nil && st.watchTimer != nil {
+		st.watchTimer.Reset(MaxTurnWait)
+	}
+
+	window := nextStepWaitWindow
+	if st.lastReportedSteps == 0 {
+		window = firstStepWaitWindow
+	}
+	if wait > 0 && wait < window {
+		window = wait
+	}
+	// A stop cancels pollCtx (cancelInFlightPoll) rather than wait for mu.
+	pollCtx, pollCancel := context.WithCancel(ctx)
+	defer pollCancel()
+	st.setCancelPoll(pollCancel)
+	defer st.setCancelPoll(nil)
+	stepCtx, cancel := context.WithTimeout(pollCtx, window)
+	defer cancel()
+
+	prevSteps := st.lastReportedSteps
+	prevActs := st.lastReportedActs
+	callStart := time.Now()
+	firstNewStepAt := time.Time{}
+
+	var (
+		out          TurnOutcome
+		details      []StepDetail
+		totalActs    int
+		chainSettled bool
+		collected    bool
+		prevOut      TurnOutcome
+	)
+
+	for {
+		var (
+			waitedOnBus bool
+			err         error
+		)
+		unsubmittedRoot := st.isUnsubmittedRootLocked(root)
+		out, chainSettled, waitedOnBus, err = b.pollTurnStepSnapshotLocked(stepCtx, convs, st)
+		if err != nil && (unsubmittedRoot || (!errors.Is(err, ErrTaskNotFound) && stepCtx.Err() == nil)) {
+			if unsubmittedRoot || tooLargeToRead(err) {
+				st.closeAllLocked()
+				if unsubmittedRoot {
+					convs.deleteTaskStepState(root, st)
+				}
+			} else {
+				st.armIdleReleaseLocked()
+			}
+			return TurnStepOutcome{}, err
+		}
+		// Tasks read final are cached, so a snapshot of nothing but them
+		// is the last one again: its steps need not be parsed anew while
+		// the poll waits out a settle.
+		if !collected || !sameTurnSnapshot(prevOut, out) {
+			details, totalActs = collectTurnStepDetails(out)
+			collected, prevOut = true, out
+		}
+		unseen := unseenStepDetails(details, st.seenStepKeys)
+
+		if len(unseen) > 0 {
+			if firstNewStepAt.IsZero() {
+				firstNewStepAt = time.Now()
+			}
+			latestStep := unseen[len(unseen)-1]
+			stepReady := stepReadyForDisplay(latestStep)
+			if chainSettled {
+				break
+			}
+			if stepReady && time.Since(callStart) >= minStepBatchWait && time.Since(firstNewStepAt) >= stepDebounceWait {
+				break
+			}
+			if time.Since(firstNewStepAt) >= stepActivityWaitMax {
+				break
+			}
+		} else if chainSettled {
+			break
+		}
+
+		if stepCtx.Err() != nil {
+			break
+		}
+		if !waitedOnBus {
+			idleTimer := time.NewTimer(stepPollIdleSleep)
+			select {
+			case <-idleTimer.C:
+			case <-stepCtx.Done():
+				idleTimer.Stop()
+			}
+		}
+	}
+
+	if chainSettled && st.watch != nil {
+		gatherBudget := reportGatherBudget
+		if wait > 0 && wait < gatherBudget {
+			gatherBudget = wait
+		}
+		reportCtx, reportCancel := context.WithTimeout(pollCtx, gatherBudget)
+		b.gatherStepReports(reportCtx, st.watch, &out, details)
+		reportCancel()
+	}
+	// A caller cut off mid-poll never sees this outcome: leave the state
+	// as it was, its steps unseen and a settled turn not torn down, so the
+	// caller's retry reads the same steps and answer.
+	if ctx.Err() != nil {
+		if len(st.taskWatches) > 0 {
+			st.armIdleReleaseLocked()
+		}
+		return TurnStepOutcome{}, ctx.Err()
+	}
+
+	newDetails := unseenStepDetails(details, st.seenStepKeys)
+	if newDetails == nil {
+		newDetails = []StepDetail{}
+	}
+	if st.seenStepKeys == nil {
+		st.seenStepKeys = map[string]bool{}
+	}
+	nextSteps := prevSteps
+	for _, d := range newDetails {
+		if d.StepKey == "" {
+			nextSteps++
+			continue
+		}
+		if _, reported := st.seenStepKeys[d.StepKey]; !reported {
+			nextSteps++
+		}
+		st.seenStepKeys[d.StepKey] = len(d.Activities) > 0 || !isPlanStep(d)
+	}
+
+	if chainSettled && len(details) > nextSteps {
+		nextSteps = len(details)
+	}
+	nextActs := totalActs
+
+	stillRunning := !chainSettled
+	elapsed := time.Since(st.startedAt)
+	if elapsed < 0 {
+		elapsed = 0
+	}
+
+	waitTitle := ""
+	if stillRunning && len(newDetails) == 0 {
+		waitTitle = synthesizeWaitStepTitle(out, details, elapsed, st.lastWaitStepTitle)
+		st.lastWaitStepTitle = waitTitle
+	}
+
+	// Only pass gateway notices on the first step so they are not repeated on every poll.
+	var notices []string
+	if prevSteps == 0 && len(st.notices) > 0 {
+		notices = slices.Clone(st.notices)
+	}
+
+	st.prevReportedSteps = prevSteps
+	st.lastReportedSteps = nextSteps
+	st.prevReportedActs = prevActs
+	st.lastReportedActs = nextActs
+
+	if !stillRunning {
+		if st.token != "" && !st.superseded.Load() {
+			convs.setRunning(st.token, nil)
+		}
+		st.closeAllLocked()
+		convs.removeTaskStepState(st)
+	} else {
+		if len(st.taskWatches) > 0 {
+			st.armIdleReleaseLocked()
+		}
+		if st.token != "" && !st.superseded.Load() {
+			if unf := out.Unfinished(); unf != nil {
+				convs.setRunning(st.token, unf)
+			} else {
+				convs.setRunning(st.token, &st.ref)
+			}
+		}
+	}
+
+	return TurnStepOutcome{
+		Outcome:           out,
+		Token:             st.token,
+		Alias:             st.alias,
+		ByToken:           st.byToken,
+		Notices:           notices,
+		StepDetails:       details,
+		NewStepDetails:    newDetails,
+		TotalActivities:   totalActs,
+		PrevReportedSteps: prevSteps,
+		LastReportedSteps: nextSteps,
+		PrevReportedActs:  prevActs,
+		LastReportedActs:  nextActs,
+		Elapsed:           elapsed,
+		StillRunning:      stillRunning,
+		WaitStepTitle:     waitTitle,
+	}, nil
+}
+
+// collectTurnStepDetails is CollectTurnStepDetails, a variable for tests to
+// count the polls that parse a snapshot's steps.
+var collectTurnStepDetails = CollectTurnStepDetails
+
+// sameTurnSnapshot reports whether b read the very tasks a did, which is all
+// CollectTurnStepDetails reads: a task read live is folded anew each time, so
+// only cached tasks compare equal.
+func sameTurnSnapshot(a, b TurnOutcome) bool {
+	if a.Root != b.Root || a.Task != b.Task || len(a.Followed) != len(b.Followed) {
+		return false
+	}
+	for i := range a.Followed {
+		if a.Followed[i].Ref != b.Followed[i].Ref || a.Followed[i].Task != b.Followed[i].Task {
+			return false
+		}
+	}
+	return true
+}
+
+// unseenStepDetails returns the steps not yet reported, and a plan step
+// reported before its activities (seen false) once they have arrived.
+func unseenStepDetails(details []StepDetail, seen map[string]bool) []StepDetail {
+	var out []StepDetail
+	for _, d := range details {
+		if whole, reported := seen[d.StepKey]; d.StepKey != "" && reported && (whole || len(d.Activities) == 0) {
+			continue
+		}
+		out = append(out, d)
+	}
+	return out
+}
+
+func stepReadyForDisplay(d StepDetail) bool {
+	return len(d.Activities) > 0 || !isPlanStep(d)
+}
+
+func isPlanStep(d StepDetail) bool {
+	return d.Step.Kind == "" || d.Step.Kind == stepmsg.KindPlan
+}
+
+func (b *NATSBus) pollTurnStepSnapshotLocked(ctx context.Context, convs *Conversations, st *taskStepState) (TurnOutcome, bool, bool, error) {
+	root := st.ref
+	out := TurnOutcome{Root: root}
+	unsubmittedRoot := st.isUnsubmittedRootLocked(root)
+
+	t, waitedRoot, err := b.pollSingleTaskLocked(ctx, st, root)
+	if err != nil && (!errors.Is(err, ErrTaskNotFound) || unsubmittedRoot) {
+		return out, false, waitedRoot, err
 	}
 	out.Task = t
 	out.AnswerFrom, out.Answer = &out.Root, t
-	if t == nil || !t.Final || !delegated(t) {
-		return out, nil
+
+	if t == nil || !t.Final {
+		return out, false, waitedRoot, nil
 	}
+	if !delegated(t) {
+		return out, true, waitedRoot, nil
+	}
+
+	waitedAny := waitedRoot
+	followedRefs := st.syncFollowedTasksLocked()
+	if len(followedRefs) == 0 && st.watch == nil {
+		out.Unfollowed = true
+		return out, true, waitedAny, nil
+	}
+
+	allFollowedFinal := true
+	unreadable := false
+	for _, fRef := range followedRefs {
+		st.evicted = append(st.evicted, convs.aliasTaskStepState(fRef, st)...)
+		ft, waitedChild, ferr := b.pollSingleTaskLocked(ctx, st, fRef)
+		if waitedChild {
+			waitedAny = true
+		}
+		out.Followed = append(out.Followed, FollowedTask{Ref: fRef, Task: ft, Err: ferr})
+		if tooLargeToRead(ferr) {
+			st.failedTasks[fRef] = ferr
+			unreadable = true
+			continue
+		}
+		if ferr != nil {
+			allFollowedFinal = false
+			continue
+		}
+		if ft == nil || !ft.Final {
+			allFollowedFinal = false
+			continue
+		}
+		r := fRef
+		if ft.Artifact(lib.ArtifactResult) != nil || out.AnswerFrom == nil || *out.AnswerFrom == root {
+			out.AnswerFrom, out.Answer = &r, ft
+		}
+	}
+
+	// The chain ends as waitForChain ends it: on an answer with a result
+	// (chainAnswered) and delegationSettle with nothing new. Three cases
+	// end it without one, where waiting on could not bring one into view:
+	// the gateway's result frame for the root was heard (it publishes that
+	// frame once, at the chain's end, so a child that ended with no result
+	// and no wake -- canceled from another surface, or failed when the
+	// wake could not start -- has nothing more coming); a state with no
+	// watch finds no further delegated task; and a followed task too large
+	// to read is never read again. A child's interim answer before its
+	// wake task brings no root result frame, so it still waits.
+	ended := chainAnswered(out) || st.rootResultHeardLocked() || st.watch == nil || unreadable
+	if allFollowedFinal && !ended {
+		st.settledFollowedCount = 0
+		st.settledDelegationsAt = time.Time{}
+		if st.awaitAnswerSince.IsZero() {
+			st.awaitAnswerSince = time.Now()
+		}
+		return out, time.Since(st.awaitAnswerSince) >= delegationFollowGrace, waitedAny, nil
+	}
+	st.awaitAnswerSince = time.Time{}
+	if allFollowedFinal {
+		if st.settledDelegationsAt.IsZero() || len(followedRefs) != st.settledFollowedCount {
+			st.settledFollowedCount = len(followedRefs)
+			st.settledDelegationsAt = time.Now()
+		}
+		if time.Since(st.settledDelegationsAt) >= delegationSettle {
+			return out, true, waitedAny, nil
+		}
+	} else {
+		st.settledFollowedCount = 0
+		st.settledDelegationsAt = time.Time{}
+	}
+	return out, false, waitedAny, nil
+}
+
+// rootResultHeardLocked reports whether the state's watch heard the
+// gateway's result frame for the turn's root, the chain's end.
+func (st *taskStepState) rootResultHeardLocked() bool {
+	if st.watch == nil {
+		return false
+	}
+	seen, _ := st.watch.rootResult(st.ref.TaskID)
+	return seen
+}
+
+func (b *NATSBus) pollSingleTaskLocked(ctx context.Context, st *taskStepState, ref TaskRef) (*lib.Task, bool, error) {
+	if ft, ok := st.finalTasks[ref]; ok && ft != nil {
+		return ft, false, nil
+	}
+	if fErr, ok := st.failedTasks[ref]; ok && fErr != nil {
+		return nil, false, fErr
+	}
+	unsubmittedRoot := st.isUnsubmittedRootLocked(ref)
+	tw, ok := st.taskWatches[ref]
+	if !ok || tw == nil {
+		if ref != st.ref && len(st.taskWatches) >= maxStepTaskWatches {
+			// Not read yet: it waits, as a task with no events does,
+			// for a held watch to free its place.
+			return nil, false, nil
+		}
+		var err error
+		tw, err = b.watchTask(ctx, ref)
+		if err != nil {
+			return nil, false, err
+		}
+		st.taskWatches[ref] = tw
+	}
+	if tw.pending == 0 && len(tw.events) == 0 && unsubmittedRoot {
+		tw.close()
+		delete(st.taskWatches, ref)
+		return nil, false, ErrTaskNotFound
+	}
+
+	waited := false
+	for tw.pending > 0 {
+		waited = true
+		if err := tw.nextWait(ctx, stepPollWait); err != nil {
+			if ctx.Err() != nil {
+				break
+			}
+			tw.close()
+			delete(st.taskWatches, ref)
+			if tooLargeToRead(err) {
+				st.failedTasks[ref] = err
+			}
+			return nil, waited, err
+		}
+	}
+	if unsubmittedRoot && len(tw.events) == 0 {
+		tw.close()
+		delete(st.taskWatches, ref)
+		return nil, waited, ErrTaskNotFound
+	}
+
+	var t *lib.Task
+	if len(tw.events) > 0 {
+		t, _ = tw.fold()
+	}
+	if t != nil && t.Final {
+		st.finalTasks[ref] = t
+		tw.close()
+		delete(st.taskWatches, ref)
+		return t, waited, nil
+	}
+
+	if ctx.Err() == nil {
+		waited = true
+		if err := tw.nextWait(ctx, stepPollWait); err != nil && ctx.Err() == nil {
+			tw.close()
+			delete(st.taskWatches, ref)
+			if tooLargeToRead(err) {
+				st.failedTasks[ref] = err
+			}
+			return nil, waited, err
+		}
+		if len(tw.events) > 0 {
+			t, _ = tw.fold()
+			if t != nil && t.Final {
+				st.finalTasks[ref] = t
+				tw.close()
+				delete(st.taskWatches, ref)
+			}
+		}
+	}
+	if t == nil && len(tw.events) == 0 {
+		return nil, waited, ErrTaskNotFound
+	}
+	return t, waited, nil
+}
+
+func (b *NATSBus) gatherStepReports(ctx context.Context, w *turnWatch, out *TurnOutcome, details []StepDetail) {
+	if b.events == nil || w == nil {
+		return
+	}
+	seen, pending := w.rootResult(out.Root.TaskID)
+	hasCards := pending || (out.Task != nil && out.Task.Artifact(lib.ArtifactHandoff) != nil) || len(extractKanbanCards(details)) > 0
+	if !hasCards {
+		for _, f := range out.Followed {
+			if f.Task != nil && f.Task.Artifact(lib.ArtifactHandoff) != nil {
+				hasCards = true
+				break
+			}
+		}
+	}
+	if !hasCards {
+		page, _ := b.events.snapshot(w.token)
+		out.Reports, out.ReportCursor = nil, page.Cursor
+		out.ReportsDropped = page.Dropped > 0 && page.DroppedNewest > w.since
+		for _, f := range page.Frames {
+			if f.Kind == frameKindNotify && f.Cursor > w.since && w.inChain(f.ReplyTo) {
+				out.Reports = append(out.Reports, f)
+			}
+		}
+		// The step poll often sees the root end before the gateway's
+		// result frame arrives: name that frame only when it was heard.
+		if seen {
+			out.Cards, out.ReportsEnd = cardsNone, reportsNoCards
+		} else {
+			out.ReportsEnd = reportsNoCardSignal
+		}
+		return
+	}
+	b.gatherReports(ctx, w, out, true)
+}
+
+func synthesizeWaitStepTitle(out TurnOutcome, details []StepDetail, elapsed time.Duration, lastTitle string) string {
+	activeRef, activeTask := selectActiveTurnTask(out, true)
+	if activeTask != nil {
+		if p := artifactText(activeTask, lib.ArtifactProgress); p != "" {
+			line := truncateInlineText(collapseInlineWhitespace(lastLine(p)), maxWaitProgressLen)
+			if line != "" && line != lastTitle {
+				return line
+			}
+		}
+	}
+	if len(details) > 0 && (activeTask != nil || activeRef == out.Root) {
+		last := details[len(details)-1]
+		base := humanizeStepTitle(last)
+		candidate := fmt.Sprintf("%s (elapsed %s)", base, elapsed.Round(time.Second))
+		if candidate != lastTitle {
+			return candidate
+		}
+	}
+	agent := strings.TrimSpace(activeRef.Addressee)
+	if agent == "" {
+		agent = defaultStepAgent
+	}
+	return fmt.Sprintf("Waiting for @%s response (elapsed %s)", agent, elapsed.Round(time.Second))
+}
+
+// waitForChain is WaitForTurn's task wait. ended is a turn whose tasks all
+// finished inside the wait.
+func (b *NATSBus) waitForChain(ctx context.Context, w *turnWatch, root TaskRef) (TurnOutcome, bool, error) {
+	out := TurnOutcome{Root: root}
+	t, err := b.waitForSubmittedTask(ctx, root, time.Until(deadlineOf(ctx)))
+	if err != nil && !errors.Is(err, ErrTaskNotFound) {
+		return out, false, err
+	}
+	out.Task = t
+	out.AnswerFrom, out.Answer = &out.Root, t
+	if t == nil || !t.Final {
+		return out, false, nil
+	}
+	if !delegated(t) {
+		return out, true, nil
+	}
+	ended := false
 	read := map[string]FollowedTask{}
 	var order []TaskRef
 	settledAt := time.Time{}
@@ -940,10 +2415,11 @@ func (b *NATSBus) WaitForTurn(ctx context.Context, w *turnWatch, root TaskRef, w
 			settledAt = time.Time{}
 			continue
 		}
-		if out.AnswerFrom != nil && *out.AnswerFrom != root {
+		if chainAnswered(out) {
 			if settledAt.IsZero() {
 				settledAt = time.Now()
 			} else if time.Since(settledAt) >= delegationSettle {
+				ended = true
 				break
 			}
 		}
@@ -955,7 +2431,73 @@ func (b *NATSBus) WaitForTurn(ctx context.Context, w *turnWatch, root TaskRef, w
 	for _, ref := range order {
 		out.Followed = append(out.Followed, read[ref.TaskID])
 	}
-	return out, nil
+	return out, ended, nil
+}
+
+// gatherReports collects the cards' posts on the turn: notify frames heard
+// since the turn was sent whose ReplyTo is one of its tasks (a current
+// gateway names the root; an older one, through a session pod, the platform
+// task it delegated to). When the turn's tasks ended, the gateway's result
+// frame for the root decides: without cardsPending, gathering stops at once;
+// with it, or when no result was heard, gathering goes on until reportQuiet
+// passes with no new post on the turn, or the wait ends. A card's post says
+// nothing reliable about whether it is the last, so nothing in its text ends
+// the gathering. When the tasks had not ended, it takes what is already
+// here.
+func (b *NATSBus) gatherReports(ctx context.Context, w *turnWatch, out *TurnOutcome, ended bool) {
+	if b.events == nil {
+		return
+	}
+	quiet := time.NewTimer(reportQuiet)
+	defer quiet.Stop()
+	var last uint64
+	for {
+		page, changed := b.events.snapshot(w.token)
+		out.Reports, out.ReportCursor = nil, page.Cursor
+		out.ReportsDropped = page.Dropped > 0 && page.DroppedNewest > w.since
+		newest := last
+		for _, f := range page.Frames {
+			if f.Kind == frameKindNotify && f.Cursor > w.since && w.inChain(f.ReplyTo) {
+				out.Reports = append(out.Reports, f)
+				newest = max(newest, f.Cursor)
+			}
+		}
+		// A new post on the turn, or an edit of one, starts the quiet
+		// period again; a post on another turn, or a result, does not.
+		if newest > last {
+			last = newest
+			quiet.Reset(reportQuiet)
+		}
+		if !ended {
+			out.ReportsEnd = reportsRunning
+			return
+		}
+		// The root's result says whether the chain handed work to cards:
+		// without it nothing more is coming, with it a card's report may
+		// take a while. With no result heard, the quiet period decides.
+		seen, pending := w.rootResult(out.Root.TaskID)
+		if pending {
+			out.Cards = cardsPending
+		}
+		switch {
+		case seen && !pending:
+			out.Cards, out.ReportsEnd = cardsNone, reportsNoCards
+			return
+		case ctx.Err() != nil:
+			out.ReportsEnd = reportsWaitOver
+			return
+		}
+		select {
+		case <-changed:
+		case <-w.resultSeen:
+		case <-quiet.C:
+			out.ReportsEnd = reportsQuiet
+			return
+		case <-ctx.Done():
+			out.ReportsEnd = reportsWaitOver
+			return
+		}
+	}
 }
 
 // delegated reports whether a finished task delegated its work to another

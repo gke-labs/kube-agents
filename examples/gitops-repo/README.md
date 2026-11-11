@@ -51,12 +51,19 @@ gitops-repo/
   policy (`fleet_wide_cost_analysis_sop.md` §3a, object as the finding names it, and `namespace`
   empty for a node pool, an idle namespace and the project-scoped disk, address and registry
   repository; a namespace written on any of those five is read as empty; a cost declaration
-  covers the object at any size, and the Declared intent row shows the size the collector measured).
+  covers the object at any size, and the Declared intent row shows the size the collector measured),
+  and a node pool kept in one zone on purpose (`stockout_prevention_sop.md` §4a, object
+  `NodePool/<pool>` with `namespace: ""`, a namespace written on the item read as empty; the
+  declaration covers the zone-locked arm of 3.9 alone, and a pool at its autoscaling ceiling stays a
+  finding).
   A choice HCL cannot express — a workload meant to run one replica — goes in an OKF document
   (`type` frontmatter, 06 §5) under `knowledge/` as a `declares:` list in the frontmatter, one item
   per posture with `check` (the slug, `single-replica`), `namespace`, `object` as `Kind/name`, and
   `cluster` when the choice is one cluster's rather than fleet-wide, spelled as the qualified
-  `<project>/<location>/<name>` every stream's findings carry, never the bare name; the audit reads the
+  `<project>/<location>/<name>` every stream's findings carry, never the bare name, and `expires`
+  (`YYYY-MM-DD`, UTC) when the choice is to be renewed rather than kept until withdrawn: the last day
+  the item stands, after which the posture returns as a finding with a _Declared intent expired_
+  line naming the note and the date; the audit reads the
   frontmatter, never the prose, and lists a match under _Declared intent_ with the file's path
   instead of reporting it. `.kube-agents/intent.yaml` names the paths the audit reads for such
   notes (`knowledge/` here); without it, or when a named path has nothing behind it, the whole

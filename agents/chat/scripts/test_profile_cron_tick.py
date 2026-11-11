@@ -31,6 +31,8 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
+import cron_catch_up_policy as ccp  # noqa: E402
+import cron_idle_policy as cip  # noqa: E402
 import profile_cron_tick as pct  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[3]
@@ -196,6 +198,14 @@ class DispatchTest(unittest.TestCase):
         # unless a test turns it on.
         self._patch_env("CREDENTIAL_PROXY_WORKSPACE_ROOT", None)
         self._patch(pct, "hermes_bin", lambda: self.fake_hermes())
+        # The idle policy runs first in main() and would otherwise read the
+        # PlatformAgent through whatever kubeconfig this machine has. An
+        # active install, read from a stub, keeps these tests about dispatch.
+        self._patch(cip, "read_signal", lambda environ=None: (datetime.now(timezone.utc), cip.SIGNAL_SOURCE_HUMAN))
+        # The catch-up policy runs next and would skip these fixtures' jobs,
+        # which are model-run entries years overdue on a minute-ly schedule.
+        # Off, so these tests stay about dispatch; the policy has its own.
+        self._patch_env(ccp.STAGGER_MINUTES_ENV, "0")
 
     def _patch(self, obj, attr, value):
         original = getattr(obj, attr)
@@ -836,6 +846,319 @@ class HomeTargetEnvTest(unittest.TestCase):
             set(restored),
         )
         self.assertNotIn("GOOGLE_CHAT_ALLOWED_USERS", restored)
+
+
+class ThroughMainCase(unittest.TestCase):
+    """A scratch install driven through main() with a stub `hermes`.
+
+    The idle signal reader is stubbed; everything else is the real path: a
+    policy rewrites the store under the lock, then the spawn filter reads it,
+    so a job a policy moved neither reaches the stub `hermes` nor stays due.
+    """
+
+    IDLE_DAY = datetime(2026, 8, 6, 6, 20, 30, tzinfo=timezone.utc)
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+        self.home = self.tmp / "data"
+        self.platform = self.home / "profiles" / "platform"
+        (self.platform / "cron").mkdir(parents=True)
+        self.store = self.platform / "cron" / "jobs.json"
+        self.record = self.tmp / "invocations"
+        self.now = self.IDLE_DAY
+        for key, value in (
+            ("HERMES_HOME", str(self.home)),
+            ("PROFILE_CRON_TICK_RECORD", str(self.record)),
+            ("CREDENTIAL_PROXY_WORKSPACE_ROOT", None),
+            (cip.THROTTLE_DAYS_ENV, None),
+            (cip.HIBERNATE_DAYS_ENV, None),
+            (cip.TIMEZONE_ENV, None),  # the slots below are UTC instants
+        ):
+            self._patch_env(key, value)
+        stub = self.tmp / "hermes"
+        stub.write_text(
+            '#!/bin/sh\nprintf "%s|%s\\n" "$HERMES_HOME" "$*" >> "$PROFILE_CRON_TICK_RECORD"\nexit 0\n',
+            encoding="utf-8",
+        )
+        stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
+        self._patch(pct, "hermes_bin", lambda: stub)
+        # main() reads the clock; the scenarios need to move it.
+        self._patch(pct, "datetime", _FrozenClock(self))
+        self.set_signal(self.now - timedelta(days=1))
+
+    def _patch(self, obj, attr, value):
+        original = getattr(obj, attr)
+        setattr(obj, attr, value)
+        self.addCleanup(setattr, obj, attr, original)
+
+    def _patch_env(self, key, value):
+        original = os.environ.get(key)
+
+        def restore():
+            if original is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = original
+
+        self.addCleanup(restore)
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+
+    def set_signal(self, when, source=cip.SIGNAL_SOURCE_HUMAN):
+        self._patch(cip, "read_signal", lambda environ=None: (when, source))
+
+    def prompt(self, job_id, expr, next_run_at, last_run_at=None):
+        entry = job(job_id, next_run_at.isoformat(), schedule={"kind": "cron", "expr": expr}, max_turns=250)
+        if last_run_at is not None:
+            entry["last_run_at"] = last_run_at.isoformat()
+        return entry
+
+    def script(self, job_id, expr, next_run_at):
+        return job(job_id, next_run_at.isoformat(), schedule={"kind": "cron", "expr": expr}, no_agent=True, script=f"{job_id}.py")
+
+    def write(self, *jobs):
+        write_store(self.platform, *jobs)
+
+    def jobs(self):
+        return {j["id"]: j for j in json.loads(self.store.read_text(encoding="utf-8"))["jobs"]}
+
+    def run_main(self):
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = pct.main()
+        return code, buffer.getvalue()
+
+    def invocations(self):
+        if not self.record.exists():
+            return []
+        return [line.split("|") for line in self.record.read_text().splitlines()]
+
+
+
+class IdlePolicyThroughMainTest(ThroughMainCase):
+    """The idle policy's five scenarios, end to end."""
+
+    def roster(self):
+        return (
+            self.prompt("compliance-audit", "20 6 * * *", self.now, self.now - timedelta(days=2)),
+            self.prompt("obtainability-audit", "20 6 * * *", self.now, self.now - timedelta(days=8)),
+            self.script("stall-watch", "*/30 * * * *", self.now),
+        )
+
+    def test_active_install_fires_every_due_job_unchanged(self):
+        self.write(*self.roster())
+        before = self.store.read_text()
+        code, out = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.invocations()), 1)
+        self.assertEqual(self.store.read_text(), before)
+        self.assertNotIn("idle policy", out)
+        self.assertIn("ticked 3 due job(s)", out)
+
+    def test_eight_days_idle_throttles_the_recent_audit_and_fires_the_rest(self):
+        self.set_signal(self.now - timedelta(days=8))
+        self.write(*self.roster())
+        code, out = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertIn("stage unset -> throttle", out)
+        self.assertIn("held compliance-audit until 2026-08-11T06:20:00+00:00 (throttle)", out)
+        self.assertIn("ticked 2 due job(s) — obtainability-audit, stall-watch", out)
+        jobs = self.jobs()
+        self.assertEqual(jobs["compliance-audit"]["next_run_at"], "2026-08-11T06:20:00+00:00")
+        self.assertEqual(jobs["obtainability-audit"]["next_run_at"], self.now.isoformat())
+        self.assertEqual(jobs["stall-watch"]["next_run_at"], self.now.isoformat())
+
+    def test_fifteen_days_idle_holds_the_audits_while_scripts_keep_firing(self):
+        self.set_signal(self.now - timedelta(days=15), cip.SIGNAL_SOURCE_CREATED)
+        self.write(*self.roster())
+        code, out = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertIn("stage unset -> hibernate", out)
+        self.assertIn("ticked 1 due job(s) — stall-watch", out)
+        jobs = self.jobs()
+        self.assertEqual(jobs["compliance-audit"]["next_run_at"], "2026-08-07T06:20:00+00:00")
+        self.assertEqual(jobs["obtainability-audit"]["next_run_at"], "2026-08-07T06:20:00+00:00")
+        self.assertEqual(jobs["stall-watch"]["next_run_at"], self.now.isoformat())
+
+        # With only audits due, nothing spawns at all.
+        self.write(*self.roster()[:2])
+        self.now += timedelta(minutes=6)
+        code, out = self.run_main()
+        self.assertEqual((code, len(self.invocations())), (0, 1))
+        self.assertIn("held compliance-audit", out)
+        self.assertNotIn("ticked", out)
+
+    def test_a_missing_hermes_still_reports_the_holds(self):
+        def boom():
+            raise FileNotFoundError("no `hermes` anywhere")
+
+        self.set_signal(self.now - timedelta(days=15))
+        self.write(*self.roster())
+        self._patch(pct, "hermes_bin", boom)
+        code, out = self.run_main()
+        self.assertEqual(code, 1)
+        # The holds were written before the binary was looked for; this
+        # output is the only place they are reported.
+        self.assertIn("held compliance-audit until 2026-08-07T06:20:00+00:00 (hibernate)", out)
+        self.assertIn("cannot tick platform", out)
+        self.assertEqual(self.jobs()["compliance-audit"]["next_run_at"], "2026-08-07T06:20:00+00:00")
+
+    def test_a_chat_message_resumes_the_audits_on_the_next_tick(self):
+        self.set_signal(self.now - timedelta(days=15))
+        self.write(*self.roster())
+        self.run_main()
+        held = self.jobs()["compliance-audit"]["next_run_at"]
+        self.assertEqual(held, "2026-08-07T06:20:00+00:00")
+
+        self.now += timedelta(minutes=6)
+        self.set_signal(self.now - timedelta(minutes=1))
+        code, out = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertIn("stage hibernate -> active", out)
+        self.assertIn("released compliance-audit; next run 2026-08-07T06:20:00+00:00", out)
+        self.assertIn("released obtainability-audit; next run 2026-08-07T06:20:00+00:00", out)
+        state = json.loads((self.platform / "cron" / cip.STATE_FILE_NAME).read_text())
+        self.assertEqual(state["held"], {})
+
+        # The next natural slot is tomorrow 06:20, and it fires then.
+        self.now = datetime(2026, 8, 7, 6, 20, 10, tzinfo=timezone.utc)
+        self.set_signal(self.now - timedelta(days=1, minutes=7))
+        code, out = self.run_main()
+        self.assertIn("ticked 3 due job(s) — compliance-audit, obtainability-audit, stall-watch", out)
+
+    def test_zero_throttle_days_disables_both_stages(self):
+        os.environ[cip.THROTTLE_DAYS_ENV] = "0"
+        self.set_signal(self.now - timedelta(days=400), cip.SIGNAL_SOURCE_CREATED)
+        self.write(*self.roster())
+        before = self.store.read_text()
+        code, out = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.store.read_text(), before)
+        self.assertIn("ticked 3 due job(s)", out)
+        self.assertNotIn("held", out)
+
+    def test_a_policy_fault_is_one_line_and_the_tick_goes_on(self):
+        self.write(*self.roster())
+
+        def explode(home, now):
+            raise RuntimeError("torn state")
+
+        self._patch(cip, "apply", explode)
+        code, out = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertIn("cron idle policy skipped: RuntimeError: torn state", out)
+        self.assertIn("ticked 3 due job(s)", out)
+
+
+class CatchUpPolicyThroughMainTest(ThroughMainCase):
+    """The reported episode end to end through main(): two days at scaleToZero.
+
+    Everything but the `hermes` binary is the real path: the catch-up policy
+    rewrites the store under the lock, then the spawn filter reads it, so a
+    skipped audit neither reaches the stub `hermes` nor stays due, and a
+    deferred one comes back at its turn.
+    """
+
+    # A Wednesday 09:25:30; the install stopped on Monday at the same time.
+    RESUME = datetime(2026, 8, 5, 9, 25, 30, tzinfo=timezone.utc)
+
+    def setUp(self):
+        super().setUp()
+        self.now = self.RESUME
+        self.set_signal(self.now - timedelta(days=3))  # the pause is not idleness
+        self._patch_env(ccp.STAGGER_MINUTES_ENV, None)
+
+    def paused_roster(self):
+        stopped = self.RESUME - timedelta(days=2)
+        return (
+            self.prompt("compliance-audit", "20 6 * * *", datetime(2026, 8, 3, 6, 20, tzinfo=timezone.utc), stopped - timedelta(days=1)),
+            self.prompt("ai-security-audit", "50 8 * * *", datetime(2026, 8, 3, 8, 50, tzinfo=timezone.utc), stopped - timedelta(days=1)),
+            self.prompt("security-patch-orchestrator", "20 7 * * 1", datetime(2026, 8, 3, 7, 20, tzinfo=timezone.utc), stopped - timedelta(days=7)),
+            self.prompt("fleet-wide-cost-analysis", "50 7 * * 1", datetime(2026, 8, 3, 7, 50, tzinfo=timezone.utc), stopped - timedelta(days=7)),
+            self.script("stall-watch", "*/30 * * * *", datetime(2026, 8, 3, 9, 0, tzinfo=timezone.utc)),
+        )
+
+    def test_resume_skips_the_dailies_fires_one_weekly_and_defers_the_other(self):
+        self.write(*self.paused_roster())
+        code, out = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertIn("skipped the catch-up of compliance-audit: 3 occurrence(s) missed since 2026-08-03T06:20:00+00:00, 2d 3h overdue on a 1d period; next run 2026-08-06T06:20:00+00:00", out)
+        # Its newest slot, today's 08:50, came inside Hermes' grace: that run
+        # stays and fires on this tick; the two before it are the skip.
+        self.assertIn("skipped the catch-up of ai-security-audit: 2 occurrence(s) missed since 2026-08-03T08:50:00+00:00, 2d overdue on a 1d period; next run 2026-08-05T08:50:00+00:00", out)
+        self.assertIn("deferred the catch-up of fleet-wide-cost-analysis to 2026-08-05T09:55:30+00:00 (1 occurrence(s) missed since 2026-08-03T07:50:00+00:00); held at 2026-08-10T07:50:00+00:00 until then", out)
+        # The tick spawned for what is still due: the oldest weekly and the script.
+        self.assertIn("ticked 3 due job(s) — ai-security-audit, security-patch-orchestrator, stall-watch", out)
+        self.assertEqual(len(self.invocations()), 1)
+        jobs = self.jobs()
+        self.assertEqual(jobs["compliance-audit"]["next_run_at"], "2026-08-06T06:20:00+00:00")
+        self.assertEqual(jobs["ai-security-audit"]["next_run_at"], "2026-08-05T08:50:00+00:00")
+        self.assertEqual(jobs["security-patch-orchestrator"]["next_run_at"], "2026-08-03T07:20:00+00:00")
+        self.assertEqual(jobs["fleet-wide-cost-analysis"]["next_run_at"], "2026-08-10T07:50:00+00:00")
+        state = json.loads((self.platform / "cron" / ccp.STATE_FILE_NAME).read_text())
+        self.assertEqual(list(state["deferred"]), ["fleet-wide-cost-analysis"])
+
+    def test_the_deferred_weekly_comes_back_at_its_turn(self):
+        self.write(*self.paused_roster())
+        self.run_main()
+        # Hermes ran the two it was handed and advanced them.
+        jobs = self.jobs()
+        jobs["security-patch-orchestrator"]["next_run_at"] = "2026-08-10T07:20:00+00:00"
+        jobs["stall-watch"]["next_run_at"] = "2026-08-05T10:00:00+00:00"
+        jobs["ai-security-audit"]["next_run_at"] = "2026-08-06T08:50:00+00:00"
+        self.write(*jobs.values())
+
+        self.now = self.RESUME + timedelta(minutes=29)
+        code, out = self.run_main()
+        self.assertEqual((code, out), (0, ""))
+        self.assertEqual(len(self.invocations()), 1)
+
+        self.now = self.RESUME + timedelta(minutes=30)
+        code, out = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertIn("released fleet-wide-cost-analysis for its catch-up of 2026-08-03T07:50:00+00:00", out)
+        self.assertIn("ticked 1 due job(s) — fleet-wide-cost-analysis", out)
+        self.assertEqual(self.jobs()["fleet-wide-cost-analysis"]["next_run_at"], "2026-08-03T07:50:00+00:00")
+        state = json.loads((self.platform / "cron" / ccp.STATE_FILE_NAME).read_text())
+        self.assertEqual(state["deferred"], {})
+
+    def test_the_idle_policy_goes_first_so_a_held_job_is_not_a_catch_up(self):
+        self.set_signal(self.now - timedelta(days=15))
+        self.write(*self.paused_roster())
+        code, out = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertIn("stage unset -> hibernate", out)
+        self.assertNotIn("catch-up", out)
+        self.assertIn("ticked 1 due job(s) — stall-watch", out)
+
+    def test_a_policy_fault_is_one_line_and_the_tick_goes_on(self):
+        self.write(*self.paused_roster())
+
+        def explode(home, now):
+            raise RuntimeError("torn state")
+
+        self._patch(ccp, "apply", explode)
+        code, out = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertIn("cron catch-up policy skipped: RuntimeError: torn state", out)
+        self.assertIn("ticked 5 due job(s)", out)
+
+
+class _FrozenClock:
+    """Stands in for `datetime` inside profile_cron_tick: `now()` is the test's clock."""
+
+    def __init__(self, test):
+        self._test = test
+
+    def now(self, tz=None):
+        return self._test.now
+
+    def __getattr__(self, name):
+        return getattr(datetime, name)
 
 
 if __name__ == "__main__":

@@ -693,7 +693,8 @@ class Cause(unittest.TestCase):
             self._pool(10, 5), pp.LiveQueue([], {str(n) for n in range(10)}), 10
         )
         self.assertEqual(pp.CAUSE_CONCURRENCY_CAP, label)
-        self.assertIn("Raise the cap", " ".join(text))
+        self.assertIn("the share the nightly, today, GitLab and reconcile jobs lease from", " ".join(text))
+        self.assertNotIn("Raise the cap", " ".join(text), "the pool is shared; moving the cap is a human tradeoff")
         self.assertIn("Deck confirms it: 10 run(s) running", " ".join(text))
 
     def test_the_deck_confirmation_is_left_out_when_deck_does_not_confirm(self):
@@ -1090,7 +1091,7 @@ class IndexCopy(unittest.TestCase):
         argv = cmd.call_args.args[0]
         self.assertEqual(["gcloud", "storage", "cp"], argv[:3])
         self.assertEqual(
-            "gs://kube-agents-prow/pr-logs/directory/pull-kube-agents-smoke-test/[0-9]*.txt",
+            "gs://kube-agents-evals-presubmit-logs/pr-logs/directory/pull-kube-agents-smoke-test/[0-9]*.txt",
             argv[3],
         )
         # Parallel copies already carry on past one failed object; the flag
@@ -1104,7 +1105,7 @@ class IndexCopy(unittest.TestCase):
     # (the object name comes back percent-encoded) among the `Copying` ones:
     # builds 2110421170670014464 and 2110451369931444224 on 2026-10-14.
     VANISHED = (
-        "ERROR: gs://kube-agents-prow/pr-logs%2Fdirectory%2Fpull-kube-agents-smoke-test"
+        "ERROR: gs://kube-agents-evals-presubmit-logs/pr-logs%2Fdirectory%2Fpull-kube-agents-smoke-test"
         "%2F2110431553740869632.txt not found: 404."
     )
 
@@ -1198,7 +1199,7 @@ class IndexCopy(unittest.TestCase):
         self.assertLess(err.index("403"), err.index("not found: 404"))
 
     def test_a_404_outside_the_index_is_not_a_vanished_pointer(self):
-        other = "ERROR: gs://kube-agents-prow/pr-logs%2Fdirectory%2Fother-job%2F2110431553740869632.txt not found: 404."
+        other = "ERROR: gs://kube-agents-evals-presubmit-logs/pr-logs%2Fdirectory%2Fother-job%2F2110431553740869632.txt not found: 404."
         entries, err, vanished = self._copy(1, other)
         self.assertEqual({}, entries)
         self.assertIn("other-job", err)

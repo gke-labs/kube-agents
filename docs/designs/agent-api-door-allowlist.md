@@ -324,6 +324,14 @@ model.
 
 ### 4.4 Session origin
 
+> Note (2026-11-03): [`proposal-origin.md`](proposal-origin.md) writes a per-unit `origin` record
+> for telemetry (`chat`, `console`, `api`, `event`, `drift`, `audit`, `scheduled`, `issue`,
+> `other`), fail-open to `other`, and reads it in the agent pod. The scoping record this section
+> proposes is an authorization fact about the caller's key, fail-closed. Whether the two share the
+> `origin` key with one vocabulary, or this section's record takes another key, is this design's
+> call when it lands; until then nothing reads this section's record, and `proposal-origin.md`
+> writes `api` for agent-API turns only through this door.
+
 Scoping `session.read` and `session.list` needs to know which class a session belongs to. Today
 nothing records that durably:
 

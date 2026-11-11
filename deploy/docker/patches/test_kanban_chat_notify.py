@@ -14,6 +14,7 @@ import sys
 import tempfile
 import types
 import unittest
+from types import SimpleNamespace
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -67,6 +68,70 @@ from gateway.config import Platform  # noqa: E402
 
 ROUTED = {kanban_chat_notify.NOTIFY_PLATFORM_ENV: "google_chat"}
 UNROUTED = {kanban_chat_notify.NOTIFY_PLATFORM_ENV: ""}
+
+
+class SharedHomeFileContractTest(unittest.TestCase):
+    """The patch imports nothing of ours, so it carries its own copy of the
+    projected file's mount path and key; the two copies must stay one file.
+    Outside the fixture above, which patches the directory per test."""
+
+    def test_the_stand_in_reads_the_same_file_as_chat_notify(self):
+        scripts = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "agents", "platform", "scripts")
+        sys.path.insert(0, os.path.abspath(scripts))
+        try:
+            import chat_notify
+        finally:
+            sys.path.pop(0)
+        self.assertEqual(kanban_chat_notify.HOME_FILE_DIR, chat_notify.HOME_FILE_DIR)
+        self.assertEqual(kanban_chat_notify.HOME_FILE_KEY, chat_notify.HOME_FILE_KEY)
+
+
+class RoutedPlatformFromTheFileTest(unittest.TestCase):
+    """A learned Slack home channel reaches the stand-in through the operator's
+    projected file, not the env: routed when the gateway holds Slack and the
+    file names a channel, and the env still wins when it is set."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", self.dir], check=False))
+        env = mock.patch.dict(os.environ, {
+            kanban_chat_notify.NOTIFY_PLATFORM_ENV: "",
+            kanban_chat_notify.NOTIFY_CONVERSATIONS_ENV: "slack",
+        })
+        env.start()
+        self.addCleanup(env.stop)
+        directory = mock.patch.object(kanban_chat_notify, "HOME_FILE_DIR", self.dir)
+        directory.start()
+        self.addCleanup(directory.stop)
+
+    def _write(self, text):
+        with open(os.path.join(self.dir, kanban_chat_notify.HOME_FILE_KEY), "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def test_the_file_routes_slack(self):
+        self.assertEqual(kanban_chat_notify.routed_platform(), "")
+        self._write("")
+        self.assertEqual(kanban_chat_notify.routed_platform(), "")
+        self._write("C0FILE\n")
+        self.assertEqual(kanban_chat_notify.routed_platform(), "slack")
+        self.assertTrue(kanban_chat_notify.routes("slack"))
+        self.assertIn("slack", kanban_chat_notify.served_platforms())
+
+    def test_a_file_that_is_not_text_routes_nothing(self):
+        with open(os.path.join(self.dir, kanban_chat_notify.HOME_FILE_KEY), "wb") as handle:
+            handle.write(b"\xff\xfe\x00C0")
+        self.assertEqual(kanban_chat_notify.routed_platform(), "")
+
+    def test_the_env_wins_and_another_platform_ignores_the_file(self):
+        self._write("C0FILE\n")
+        with mock.patch.dict(os.environ, {kanban_chat_notify.NOTIFY_PLATFORM_ENV: "google_chat"}):
+            self.assertEqual(kanban_chat_notify.routed_platform(), "google_chat")
+        with mock.patch.dict(os.environ, {kanban_chat_notify.NOTIFY_CONVERSATIONS_ENV: "google_chat"}):
+            self.assertEqual(kanban_chat_notify.routed_platform(), "")
+
+    def test_an_absent_directory_routes_nothing(self):
+        with mock.patch.object(kanban_chat_notify, "HOME_FILE_DIR", os.path.join(self.dir, "absent")):
+            self.assertEqual(kanban_chat_notify.routed_platform(), "")
 
 
 class _Runner:
@@ -487,6 +552,10 @@ class SendTest(unittest.TestCase):
         result, _ = self._send(kanban_chat_notify.NOTIFY_OUTCOME_UNKNOWN)
         self.assertTrue(result.success)
 
+    def test_kept_by_the_gateway_is_not_a_failure(self):
+        result, _ = self._send(kanban_chat_notify.NOTIFY_KEPT, err=b"kept for the digest")
+        self.assertTrue(result.success)
+
     def test_route_unavailable_fails_and_marks_the_route_down(self):
         adapter = kanban_chat_notify.ChatNotifyAdapter(Platform.GOOGLE_CHAT, _Runner())
 
@@ -627,6 +696,7 @@ class ContractTest(unittest.TestCase):
         self.assertEqual(kanban_chat_notify.A2A_CLI, chat_notify.A2A_CLI)
         self.assertEqual(kanban_chat_notify.NOTIFY_OUTCOME_UNKNOWN, chat_notify.NOTIFY_OUTCOME_UNKNOWN)
         self.assertEqual(kanban_chat_notify.NOTIFY_ROUTE_UNAVAILABLE, chat_notify.NOTIFY_ROUTE_UNAVAILABLE)
+        self.assertEqual(kanban_chat_notify.NOTIFY_KEPT, chat_notify.NOTIFY_KEPT)
         self.assertEqual(kanban_chat_notify.NOTIFY_WAIT_SECONDS, chat_notify.NOTIFY_WAIT_SECONDS)
         self.assertEqual(kanban_chat_notify.NOTIFY_CONNECT_SECONDS, chat_notify.NOTIFY_CONNECT_SECONDS)
         self.assertEqual(kanban_chat_notify.NOTIFY_MARGIN_SECONDS, chat_notify.NOTIFY_MARGIN_SECONDS)
@@ -738,6 +808,18 @@ class FoldsIntoRowTest(unittest.TestCase):
         with mock.patch.object(kanban_notifier, "slack_ux_on", return_value=False):
             self.assertFalse(kanban_chat_notify._folds_into_row(self.conn, self.SUB))
 
+    def test_a_child_beneath_an_open_fan_out_on_google_chat_folds_under_next(self):
+        # The gateway draws the plan on Google Chat under next (kanban_notifier.chat_ux_on),
+        # so a child's answer folds into its row there as on Slack; under today it does not.
+        gsub = {"platform": "google_chat", "chat_id": "spaces/H", "thread_id": "spaces/H/threads/T", "task_id": "t_c1"}
+        self.conn.execute("INSERT INTO kanban_notify_subs VALUES ('t_parent', 'google_chat', ?, ?)", (gsub["chat_id"], gsub["thread_id"]))
+        fake = SimpleNamespace(enabled=lambda: True)
+        modules = {"gateway": SimpleNamespace(slack_ux_reactions=fake), "gateway.slack_ux_reactions": fake}
+        with mock.patch.dict(sys.modules, modules), mock.patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "google_chat", "A2A_NOTIFY_CONVERSATIONS": "google_chat"}):
+            self.assertTrue(kanban_chat_notify._folds_into_row(self.conn, gsub))
+        with mock.patch.dict(sys.modules, modules), mock.patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "", "A2A_NOTIFY_CONVERSATIONS": ""}):
+            self.assertFalse(kanban_chat_notify._folds_into_row(self.conn, gsub))
+
 
 class FoldFanoutTest(unittest.TestCase):
     """A fanned-out child's answer folds into its parent's on the routed path.
@@ -830,8 +912,13 @@ class FoldFanoutTest(unittest.TestCase):
             self.assertIsNone(self.fold(self.claim(_Ev(7, "completed", 1900))))
 
     def test_no_plan_fold_without_the_slack_flag(self):
-        # This class's thread is Google Chat, which has no plan: the hold stands.
+        # This class's thread is Google Chat; with the flag off, or under today where
+        # the gateway serves nothing, it has no plan: the hold stands.
         self.assertFalse(kanban_chat_notify._folds_into_row(self.conn, dict(self.THREAD, task_id="t_child")))
+        fake = SimpleNamespace(enabled=lambda: True)
+        with mock.patch.dict(sys.modules, {"gateway": SimpleNamespace(slack_ux_reactions=fake), "gateway.slack_ux_reactions": fake}), \
+                mock.patch.dict(os.environ, {kanban_chat_notify.NOTIFY_PLATFORM_ENV: "", kanban_chat_notify.NOTIFY_CONVERSATIONS_ENV: ""}):
+            self.assertFalse(kanban_chat_notify._folds_into_row(self.conn, dict(self.THREAD, task_id="t_child")))
 
     def test_a_hold_under_the_committed_claim_rewinds(self):
         self.assertIsNone(self.fold(self.claim(_Ev(7, "completed", 1900), committed=True)))

@@ -246,6 +246,7 @@ for _shared_dir in SHARED_SCRIPT_DIRS:
         sys.path.append(_shared_dir)
 import fleet_scope_args  # noqa: E402
 import collector_run  # noqa: E402
+import broker_admission  # noqa: E402
 
 # The install's declared scope, handed in by the SOP from the platform_control
 # `fleet_scope` tool (`--scope-projects`, `--scope-unread`), one holder per
@@ -357,9 +358,15 @@ SINCE_DAYS_RE = re.compile(r"^(\d+)d?$")
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 REPORT_DATE_FORMAT = "%Y-%m-%d"
 
+# Neither cap holds more than one broker admission wait and one run, so a read reaches the
+# shim with a retry deadline under which no retry fits: collector_run.default_run derives it
+# from the cap for every read, inherited environment or a `{**os.environ, "KUBECONFIG": ...}`
+# built at the read alike.
 GCLOUD_TIMEOUT_S = 120
 KUBECTL_TIMEOUT_S = 120
-MAX_WORKERS = 4
+# How many clusters a sweep reads at once is broker_admission.sweep_width(),
+# resolved in collect_fleet: what the credential broker admits, less headroom
+# for chat (collect.py's comment above its own collect_fleet has the reasoning).
 ERROR_EXCERPT_CHARS = 300
 # How much of a message a symptom keeps: enough for the signature and the
 # object it names, short enough that one FailedScheduling does not fill a page.
@@ -720,18 +727,23 @@ CONTROLLER_FAILURE_CONDITIONS = (("ReplicaSet", "ReplicaFailure", "True"), ("Job
 # The reads per cluster. `owners` is the intermediates a pod's
 # ownerReferences stop at: a ReplicaSet names its Deployment and a Job its
 # CronJob only in their own metadata.
+# Each read is `(name, kinds, query)`: the kinds as kubectl spells them, read
+# one kind at a time in pages through `paged_json` (collector_run.paged_dump)
+# rather than as one `-A -o json` dump, which a cluster of a few hundred nodes
+# takes past the credential proxy's output cap; `query` is the list
+# parameter the read narrows by, the events' field selector.
 KUBECTL_READS = (
-    ("pods", ["kubectl", "get", "pods", "-A", "-o", "json"]),
-    ("nodes", ["kubectl", "get", "nodes", "-o", "json"]),
-    ("events", ["kubectl", "get", "events", "-A", "--field-selector", "type=Warning", "-o", "json"]),
-    ("pdbs", ["kubectl", "get", "pdb", "-A", "-o", "json"]),
-    ("owners", ["kubectl", "get", "replicasets,jobs", "-A", "-o", "json"]),
+    ("pods", "pods", None),
+    ("nodes", "nodes", None),
+    ("events", "events", {"fieldSelector": "type=Warning"}),
+    ("pdbs", "pdb", None),
+    ("owners", "replicasets,jobs", None),
     # The four below feed the shape detectors only; a failure there loses
     # the risks table, not the review.
-    ("workloads", ["kubectl", "get", "deploy,ds,sts,cronjobs", "-A", "-o", "json"]),
-    ("storage", ["kubectl", "get", "pv,storageclasses", "-o", "json"]),
-    ("webhooks", ["kubectl", "get", "validatingwebhookconfigurations,mutatingwebhookconfigurations", "-o", "json"]),
-    ("endpointslices", ["kubectl", "get", "endpointslices", "-A", "-o", "json"]),
+    ("workloads", "deploy,ds,sts,cronjobs", None),
+    ("storage", "pv,storageclasses", None),
+    ("webhooks", "validatingwebhookconfigurations,mutatingwebhookconfigurations", None),
+    ("endpointslices", "endpointslices", None),
 )
 SHAPE_READS = ("workloads", "storage", "webhooks", "endpointslices")
 # The reads that cost Info alone, the risks table and the next-upgrade line:
@@ -1439,6 +1451,9 @@ def is_system_namespace(namespace: str) -> bool:
 Run = collector_run.Run
 TIMEOUT_RC = collector_run.TIMEOUT_RC
 default_run = functools.partial(collector_run.default_run, timeout=GCLOUD_TIMEOUT_S)
+paged_dump = collector_run.paged_dump
+paged_command_text = collector_run.paged_command_text
+failed_page_text = collector_run.failed_page_text
 
 
 RunFn = Callable[..., Run]
@@ -1457,6 +1472,26 @@ def run_json(argv: list[str], *, run: RunFn, timeout: int = GCLOUD_TIMEOUT_S, en
         return json.loads(result.stdout or "null"), None
     except json.JSONDecodeError as exc:
         return None, f"{argv[0]} {argv[1]} {argv[2]} returned non-JSON: {exc}"
+
+
+def paged_json(kinds: str, query: dict[str, str] | None, *, run: RunFn, timeout: int, env: dict | None) -> tuple[list | None, str | None]:
+    """`run_json` for a kubectl read: the kinds read one at a time in pages, the
+    merged items, or the error that stands for them, worded as `run_json`
+    words a failed read so the rc still leads. The command named is the page
+    that failed (`collector_run.failed_page_text`, a later page's `continue`
+    token elided), not the read's kind list: a multi-kind read's list does not
+    say which kind's page failed, and a failed read's command is recorded
+    nowhere else (the manifest's `commands` carry successful reads only). A
+    page that exited 0 and still failed carries the paged reader's own reason
+    (empty, not JSON, not a list, a repeated token) in its stderr, so that is
+    what the error quotes."""
+    parsed, result = paged_dump(kinds.split(","), run=run, query=query, timeout=timeout, env=env)
+    if parsed is not None:
+        return parsed.get("items") or [], None
+    page = failed_page_text(result.argv)
+    if result.rc != 0:
+        return None, f"{page} rc={result.rc}: {_excerpt(result)}"
+    return None, f"{page} failed: {_excerpt(result)}"
 
 
 # --------------------------------------------------------------------------- #
@@ -2035,13 +2070,13 @@ def read_cluster(kubeconfig: Path, *, run: RunFn) -> tuple[dict[str, list], list
     env = {**os.environ, "KUBECONFIG": str(kubeconfig)}
     out: dict[str, list] = {}
     errors: list[str] = []
-    for name, argv in KUBECTL_READS:
-        parsed, error = run_json(argv, run=run, timeout=KUBECTL_TIMEOUT_S, env=env)
+    for name, kinds, query in KUBECTL_READS:
+        items, error = paged_json(kinds, query, run=run, timeout=KUBECTL_TIMEOUT_S, env=env)
         if error:
             errors.append(f"{name}: {error}")
             out[name] = []
             continue
-        out[name] = (parsed.get("items") or []) if isinstance(parsed, dict) else []
+        out[name] = items
     return out, errors
 
 
@@ -4506,16 +4541,16 @@ def recheck_cluster(key: str, cluster: dict, cluster_guards: list[dict], *, run:
         return result
     env = {**os.environ, "KUBECONFIG": str(kubeconfig)}
     reads: dict[str, list] = {}
-    for name, argv in KUBECTL_READS:
+    for name, kinds, query in KUBECTL_READS:
         if name not in needed:
             continue
-        parsed, read_error = run_json(argv, run=run, timeout=KUBECTL_TIMEOUT_S, env=env)
+        items, read_error = paged_json(kinds, query, run=run, timeout=KUBECTL_TIMEOUT_S, env=env)
         if read_error:
             result["errors"].append(f"{name}: {read_error}")
             result["failed_reads"].append(name)
             continue
-        reads[name] = (parsed.get("items") or []) if isinstance(parsed, dict) else []
-        result["commands"][name] = command_text(argv, kubeconfig)
+        reads[name] = items
+        result["commands"][name] = paged_command_text(kinds.split(","), query=query, kubeconfig=kubeconfig)
     answered = set(reads)
     # A budget still allowing no disruption keeps its entry-1 failure guard:
     # the drain it held cannot be re-observed without the operation.
@@ -5047,7 +5082,7 @@ def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: s
     reads, errors = read_cluster(kubeconfig, run=run)
     review["read_errors"].extend(errors)
     failed = {e.split(":")[0] for e in errors}
-    review["answered"] = [name for name, _ in KUBECTL_READS if name not in failed]
+    review["answered"] = [name for name, _, _ in KUBECTL_READS if name not in failed]
     review["partial"] = [name for name in CORE_READS if name in failed]
     if len(review["partial"]) == len(CORE_READS):
         # Nothing was evaluated, so nothing counts as answered: no guard of
@@ -5056,7 +5091,7 @@ def review_cluster(selection: Selection, ledger: dict, *, run: RunFn, seen_at: s
         review["gate"] = _pending_gate(gate_window, GATE_REASON_PARTIAL.format(reads=", ".join(review["partial"])))
         review["reads_not_made"] = [LOG_VOLUME_READ] if gate_window else []
         return review
-    commands = {name: command_text(argv, kubeconfig) for name, argv in KUBECTL_READS if name not in failed}
+    commands = {name: paged_command_text(kinds.split(","), query=query, kubeconfig=kubeconfig) for name, kinds, query in KUBECTL_READS if name not in failed}
     if operations_command:
         commands[OPERATIONS_READ] = operations_command
     review["commands"] = checks_run(commands)
@@ -5283,7 +5318,7 @@ def triage(reviews: list[dict], unchanged: list[dict], failed_reads: list[str], 
     # The reads a stale guard could not be re-observed through: a partial
     # review's core reads, or a reviewed cluster's failed shape read (an
     # entry-3 guard needs `workloads`).
-    read_names = {name for name, _ in KUBECTL_READS}
+    read_names = {name for name, _, _ in KUBECTL_READS}
     partial_reads = {r["cluster"]: r["partial"] for r in reviews if r.get("partial") and not r["reviewed"]}
     for r in reviews:
         if r["reviewed"]:
@@ -6162,10 +6197,11 @@ def _listing_error(project: str, failed_reads: list[str]) -> str:
     return line.split(": ", 1)[-1]
 
 
-def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime | None = None, max_workers: int = MAX_WORKERS, discovery: tuple[list[str], list[str], str | None] | None = None, clock: Callable[[], float] = time.monotonic, started: float | None = None, session: SessionFn | None = None, session_factory: Callable[[], SessionFn] | None = None) -> dict:
+def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: datetime | None = None, max_workers: int | None = None, discovery: tuple[list[str], list[str], str | None] | None = None, clock: Callable[[], float] = time.monotonic, started: float | None = None, session: SessionFn | None = None, session_factory: Callable[[], SessionFn] | None = None) -> dict:
     """The run. `max_workers` sizes every pool the run opens (the server
-    configs, the reviews, the re-checks); the default is the figure the
-    sibling collectors pin to the credential proxy's admitted count.
+    configs, the reviews, the re-checks); unset, it is what the credential
+    broker admits at once, less chat headroom, as for the sibling collectors
+    (broker_admission.sweep_width()).
     `discovery` is `discover_fleet`'s answer when the caller resolved it
     already (`main` does, before the lock, so an exit line can name the
     projects); without it the run resolves the projects itself. `clock`
@@ -6176,6 +6212,7 @@ def collect_fleet(args: argparse.Namespace, *, run: RunFn | None = None, now: da
     cluster needs it (`main` passes `default_monitoring_session`); with
     neither, every gate that needs the read is pending and no read is made,
     which is what a test without a fake session gets."""
+    max_workers = max_workers or broker_admission.sweep_width()
     # Resolved at call time, so a test that patches `default_run` is honoured.
     run = run or default_run
     clock_fixed = now is not None  # a caller-fixed clock also stamps the finish

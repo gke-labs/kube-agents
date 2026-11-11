@@ -282,7 +282,7 @@ func TestDataVolumeNotExpandedFollowsTheStorageClass(t *testing.T) {
 // rendered or not, and a second parked pass writes nothing. A reconciler that
 // has read no claim yet leaves a condition already on the CR as it stands.
 func TestTheDegradedPathCarriesDataVolumeNotExpanded(t *testing.T) {
-	for _, rendered := range []workloadRenderState{workloadRendered, workloadNotRendered} {
+	for _, rendered := range []workloadRenderState{workloadRendered, workloadNotRendered, brokerNotReconciled} {
 		agent := sizedAgent("80Gi")
 		r, cl := sizeFixture(t, agent,
 			storageClass(testStorageClassName, false),

@@ -10,7 +10,11 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+# fleet-audit's harness, which writes the reports this module reads; appended, so
+# this directory's modules still win.
+sys.path.append(str(Path(__file__).resolve().parent.parent / "skills" / "fleet-audit" / "scripts"))
 
+import audit_report
 import slack_audit_report as sar
 
 LEDGER = "https://github.com/acme/fleet-config/issues/231"
@@ -1357,6 +1361,26 @@ class SummaryCardTest(unittest.TestCase):
         second = "Security & RBAC Posture Audit: 1 critical finding.\n`critical` seeded-b: control plane is public\n" + sar.NO_LEDGER_NOTES[0]
         report = f"{first}\n\nRe-run in this audit; counts are against the report above.\n{second}"
         self.assertIsNone(sar.summary_card(report))
+
+    def test_a_rerun_label_above_the_summary_is_dropped(self):
+        for label in (audit_report.CHAT_REPORT_RERUN_RELATIVE_LABEL, audit_report.CHAT_REPORT_RERUN_LABEL):
+            with self.subTest(label=label[-30:]):
+                report = f"{label}\n{SUMMARY}"
+                self.assertEqual(sar.summary_card(report), sar.summary_card(SUMMARY))
+                self.assertEqual(sar.headline_from_summary(report), sar.headline_from_summary(SUMMARY))
+                self.assertEqual(sar.chat_from_summary(report)[0], sar.chat_from_summary(SUMMARY)[0])
+                self.assertNotIn(label, sar.blocks_from_summary(report)[1])
+
+    def test_a_rerun_label_alone_or_over_another_shape_posts_as_written(self):
+        label = audit_report.CHAT_REPORT_RERUN_LABEL
+        for report in (label, f"{label}\nHere's the audit.\n{sar.NO_LEDGER_NOTES[0]}"):
+            with self.subTest(report=report[-20:]):
+                self.assertIsNone(sar.summary_card(report))
+
+    def test_a_namespaced_row_is_a_row(self):
+        summary = SUMMARY.replace("seeded-a: control plane is public", "seeded-a/payments: payments-api runs a privileged container")
+        card = sar.summary_card(summary)
+        self.assertEqual(card.rows[0], {"severity": "critical", "text": "seeded-a/payments: payments-api runs a privileged container"})
 
     def test_another_shape_posts_as_written(self):
         for report in ("", "Here's the audit.", "## What's wrong\nThe audit could not write its ledger.", REPORT):

@@ -43,6 +43,14 @@ The collector (§2) applies all of this itself: it sweeps the `--scope-projects`
 python3 /opt/data/profiles/platform/skills/gcp-networking-fabric-audit/scripts/networking_audit.py <collector_args from the fleet_scope tool, verbatim, or nothing on an install that declares no scope> --output /opt/data/scratch/manifest_gcp-networking-fabric-audit.json && python3 /opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py draft --audit gcp-networking-fabric-audit --manifest-file /opt/data/scratch/manifest_gcp-networking-fabric-audit.json --out /opt/data/scratch/findings_gcp-networking-fabric-audit.json
 ```
 
+**Then run the precheck on the manifest, before reading it or evaluating any check by hand.**
+
+```bash
+python3 /opt/data/profiles/platform/skills/fleet-audit/scripts/audit_report.py precheck --audit gcp-networking-fabric-audit --manifest-file /opt/data/scratch/manifest_gcp-networking-fabric-audit.json
+```
+
+The cron prompt of a scheduled run names the flag to add to this command, the same one it names for `finish`; on a run a person asked for, add it to neither. It prints one JSON line. A line carrying `precheck: unchanged` is `finish`'s own line: the collector found the fleet exactly as the last scheduled run left it, so the run has been closed from that run's stored findings document, and nothing in the rest of this SOP is left for you to do — read `silent_ok` from that line and report as the closing step of this SOP says (exactly `[SILENT]` when it is `true`). Any other line (`verdict` with `closed: false`) means nothing was closed: continue this SOP from here as on any run. A `BROKER UNAVAILABLE` line means the credential proxy did not answer: wait for it and run the same `precheck` again. An exit 1 (`FATAL`) means the close died partway, with your findings file put back as it was: run the same `precheck` once more, and if it fails again continue this SOP from here.
+
 `draft` writes the findings document from the manifest: the scope, `checks_run`, and one finding for each candidate with its evidence. Write each `recommendation` and `remediation` in that file, then give it to `finish` as `--findings-file`. Never give the manifest as `--findings-file`. The collector sweeps §1's scope once: the `--scope-projects` you pass from `fleet_scope`, else the scope it resolves itself. Pass `--project-id <id>` only to scope a run to one project the tool lists, with the `collector_args` beside it; the narrowing is recorded as `project/UNENUMERATED_PROJECTS`. On this install's sandbox the collector knows whether a scope is declared and, if it is, refuses a run without the `collector_args`, so the fall-through cannot cross the boundary. Read the manifest before doing anything else:
 
 - Every entry in `manifest.clusters` is one target, carrying one `outcome`. `"collected"` means the collector read that target. A check whose read failed is in the target's `checks_unevaluated`, and its `limitations` names that check. Do not list that check in `checks_run` or `checks_not_applicable`. Do not run the other checks again by hand, except a rule that `limitations` names as undecided (§2.6). `"gate-failed"` means a read the whole target depends on failed: put it in `scope.skipped` with its `error` as the reason. `project/UNENUMERATED_PROJECTS`, `<project>/UNENUMERATED_SUBNETS` (a project whose subnets could not be listed, or whose listing warned that it may be incomplete and returned no subnet this check counts) and `<project>/UNREAD_SUBNET_USAGE` (a project whose usage reads failed but which owns no subnet entry to name them on) are always `gate-failed` and go in `scope.skipped` the same way. You may instead check a `gate-failed` project target by hand with this section's commands; then record what you ran in its `checks_run` and say in its `limitations` that the collector could not read it.
@@ -151,7 +159,7 @@ Every finding must conform to the full findings schema:
         "checks_run": [
           {
             "check": "cloud-nat-exhaustion",
-            "command": "gcloud compute routers list --project=proj-1 --format=json && gcloud compute routers get-status nat-router --region=us-central1 --project=proj-1 --format=json"
+            "command": "gcloud compute routers list --project=proj-1 '--format=json(name,region,nats)' && gcloud compute routers get-status nat-router --region=us-central1 --project=proj-1 --format=json"
           },
           {
             "check": "psc-routing-deadlock",
@@ -159,11 +167,11 @@ Every finding must conform to the full findings schema:
           },
           {
             "check": "mtu-packet-fragmentation",
-            "command": "gcloud compute networks list --project=proj-1 --format=json"
+            "command": "gcloud compute networks list --project=proj-1 '--format=json(name,selfLink,mtu,peerings)'"
           },
           {
             "check": "cloud-armor-false-positive",
-            "command": "gcloud compute security-policies list --project=proj-1 --format=json && gcloud compute backend-services list --project=proj-1 --format=json"
+            "command": "gcloud compute security-policies list --project=proj-1 '--format=json(name,rules)' && gcloud compute backend-services list --project=proj-1 '--format=json(name,securityPolicy)'"
           },
           {
             "check": "firewall-world-open-ingress",

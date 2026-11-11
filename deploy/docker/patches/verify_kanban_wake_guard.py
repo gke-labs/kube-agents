@@ -204,8 +204,9 @@ if found is not None:
 print("the executor thread:")
 import inspect  # noqa: E402
 
+# The prefix alone: apply_api_session_stop.py wraps _run inside the carry.
 check("the patched _run_agent carries the mark to its executor",
-      "run_in_executor(None, _kanban_wake_carry(_run))" in inspect.getsource(api.APIServerAdapter._run_agent))
+      "run_in_executor(None, _kanban_wake_carry(" in inspect.getsource(api.APIServerAdapter._run_agent))
 
 
 async def on_executor(carry):

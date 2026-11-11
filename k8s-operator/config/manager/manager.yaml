@@ -75,6 +75,15 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: spec.serviceAccountName
+            # This container's memory limit in bytes, which the manager turns
+            # into the Go runtime's soft memory limit (nine tenths of it; an
+            # explicit GOMEMLIMIT wins). Read from the container itself so it
+            # follows the limit below, and on Autopilot the limit the cluster
+            # admitted rather than the one written here.
+            - name: OPERATOR_MEMORY_LIMIT_BYTES
+              valueFrom:
+                resourceFieldRef:
+                  resource: limits.memory
             # Private-registry installs: uncomment (or patch via kustomize) to
             # point the images the operator deploys at your own registry.
             # OPERATOR_IMAGE is this container's own image; the A2A next-stack
@@ -159,13 +168,29 @@ spec:
           # replaces: on a 3-node install the store holds 675 objects in
           # 3.7 MiB of live heap, in a process of 22 MiB RSS. Keep in step
           # with charts/kube-agents/values.yaml's operator.resources.
+          #
+          # The requests are sized to be livable as the limits: GKE Autopilot
+          # without Pod bursting (a cluster or compute class with bursting
+          # off) sets each limit equal to its request, so the request is
+          # what the manager then runs under, and 128Mi, right for the
+          # measurement above, left no room for the cache to grow with the
+          # cluster before the manager was OOM-killed. 256Mi holds a cluster
+          # several times the measured one; the manager reads whichever limit
+          # was admitted through OPERATOR_MEMORY_LIMIT_BYTES. requests.cpu is
+          # 100m rather than the 10m the manager needs because Autopilot
+          # admits a pod unchanged only at 50m or more and between 1 and
+          # 6.5 GiB of memory per vCPU on the requests pair, and raises the
+          # smaller request into that band; 100m beside 256Mi is 2.5 GiB per
+          # vCPU, inside it. Where Autopilot raises a pod to its per-pod
+          # minimums (250m CPU, 512 MiB) the admitted pod is still larger
+          # than this manifest; where it does not, this is the pod it admits.
           resources:
             limits:
               cpu: 500m
               memory: 512Mi
             requests:
-              cpu: 10m
-              memory: 128Mi
+              cpu: 100m
+              memory: 256Mi
           volumeMounts:
             - mountPath: /tmp/k8s-webhook-server/serving-certs
               name: cert

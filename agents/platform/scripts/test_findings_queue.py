@@ -1336,14 +1336,24 @@ class TestDecisionCoversItem(QueueTestCase):
         for fid in self.member_ids[:2]:
             fq.mark_surfaced(self.conn, fid, publisher="nudge")
 
-    def test_a_decision_on_one_id_decides_the_line(self):
+    def test_a_decision_on_one_id_decides_the_named_rows_of_the_line(self):
         result = fq.patch_finding(self.conn, self.member_ids[0], {"state": "snoozed", "snoozed_until": "2026-12-01"})
-        self.assertEqual(sorted(result["item_rows_decided"]), sorted(self.member_ids[1:]))
-        for fid in self.member_ids:
+        self.assertEqual(result["item_rows_decided"], [self.member_ids[1]])
+        for fid in self.member_ids[:2]:
             row = fq.get_finding(self.conn, fid)
             self.assertEqual(row["state"], "snoozed")
             self.assertIsNotNone(row["snoozed_until"])
         self.assertEqual(fq.get_finding(self.conn, fq.validate_finding(self.other)["id"])["state"], "queued")
+
+    def test_a_queued_sibling_no_message_named_stays_open(self):
+        # member 2 joined the line and was never named: the user has not seen it.
+        result = fq.patch_finding(self.conn, self.member_ids[0], {"state": "dismissed"})
+        self.assertEqual(result["item_rows_left_open"], [self.member_ids[2]])
+        row = fq.get_finding(self.conn, self.member_ids[2])
+        self.assertEqual((row["state"], row["snoozed_until"]), ("queued", None))
+        # Once a message names it, the next decision on the line reaches it.
+        fq.mark_surfaced(self.conn, self.member_ids[2])
+        self.assertEqual(fq.patch_finding(self.conn, self.member_ids[1], {"state": "dismissed"})["item_rows_left_open"], [])
 
     def test_deciding_the_named_id_clears_stop_add(self):
         rows = fq.ranked_findings(self.conn)
@@ -1357,7 +1367,7 @@ class TestDecisionCoversItem(QueueTestCase):
         self.assertEqual(fq.pace(rows, at(6, 12), fq.PacingLimits(), NONE_ADDED).blocking, [])
 
     def test_decided_rows_and_other_transitions_stay_per_row(self):
-        # A never-shown member of the line is in the item too.
+        # A decision on the never-named member itself still reaches the named ones.
         accepted = fq.patch_finding(self.conn, self.member_ids[2], {"state": "accepted"})
         self.assertEqual(sorted(accepted["item_rows_decided"]), sorted(self.member_ids[:2]))
         # Rows already decided keep their decision.
@@ -1546,6 +1556,29 @@ class TestPace(QueueTestCase):
         plan = fq.pace(rows, at(6, 16), self.LIMITS, NONE_ADDED, announced=announced[:1])
         self.assertEqual(ids(plan.add), [["c-new"]])
         plan = fq.pace(rows[1:2] + rows[3:], at(6, 16), self.LIMITS, NONE_ADDED, announced=announced[:1])
+        self.assertEqual(plan.add, [])
+
+    def test_a_row_that_joined_an_announced_line_later_is_a_new_item(self):
+        # #4262: K was announced with m0, whose decision left m1 (queued) open.
+        # m1 was never announced, so it is added and named like any new item,
+        # and it holds nothing back.
+        rows = [row("m1", "major", check="K"), row("n0", "major", score=80)]
+        key = fq.item_key(rows[0])
+        plan = fq.pace(rows, at(6, 17), self.LIMITS, {"critical": 0, "noncritical": 1}, announced=[key], announced_ids=["m0"])
+        self.assertEqual(ids(plan.add), [["m1"], ["n0"]])
+
+    def test_an_announced_member_still_new_keeps_its_line_unrecorded(self):
+        # Every mark of m0 failed, and m1 joined the line since: the line is
+        # still the announced item, which stops additions as before.
+        rows = [row("m0", "major", check="K"), row("m1", "major", check="K"), row("n0", "major", score=80)]
+        plan = fq.pace(rows, at(6, 17), self.LIMITS, NONE_ADDED, announced=[fq.item_key(rows[0])], announced_ids=["m0"])
+        self.assertEqual(plan.add, [])
+        self.assertEqual(ids(plan.waiting), [["n0"]])
+
+    def test_announced_keys_without_ids_match_on_the_key_alone(self):
+        # A record from before the ids were kept: the joined row is held back, as it was.
+        rows = [row("m1", "major", check="K"), row("n0", "major", score=80)]
+        plan = fq.pace(rows, at(6, 17), self.LIMITS, {"critical": 0, "noncritical": 1}, announced=[fq.item_key(rows[0])])
         self.assertEqual(plan.add, [])
 
     def test_an_announced_but_unrecorded_noncritical_stops_every_addition(self):

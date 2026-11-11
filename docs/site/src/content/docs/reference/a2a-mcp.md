@@ -5,19 +5,23 @@ sidebar:
   order: 11
 ---
 
-The MCP server is a [Model Context Protocol](https://modelcontextprotocol.io) endpoint for one `spec.mode: next` install, so an external coding agent or IDE host can talk to it. It is a console client of the install's message bus: it holds the `console` bus credential and nothing else, and it can do on the bus exactly what the [A2A console](/kube-agents/reference/user-interfaces/#a2a-console) page can. It is off by default and renders nothing under `today`.
+The MCP server is a [Model Context Protocol](https://modelcontextprotocol.io) endpoint for one `spec.mode: next` install, so an external coding agent or IDE host can talk to it. It is a console client of the install's message bus: it holds its own bus credential, `console-mcp`, and nothing else. On the bus it reads what the [A2A console](/kube-agents/reference/user-interfaces/#a2a-console) page reads and sends messages the way the page does, but it can't publish on the console's confirmation subject. It is off by default and renders nothing under `today`.
 
 ## Turning it on
 
-The server is rendered only while the operator runs with `A2A_MCP_DOOR=true`, an operator setting like the ones [Operator settings](/kube-agents/install/quickstart-gke/#operator-settings) describes, on top of `spec.mode: next`. With it set, the operator renders beside the console server:
+The server is rendered only while the operator runs with `A2A_MCP_DOOR=true`, on top of `spec.mode: next`. The chart value `operator.mcpServer.enabled: true` sets it. An `A2A_MCP_DOOR` entry in `operator.extraEnv`, as [Operator settings](/kube-agents/install/quickstart-gke/#operator-settings) describes, also works and wins over the value. With it set, the operator renders beside the console server:
 
 - `<name>-a2a-mcp`: a Deployment running the MCP binary from the `a2a-console` image, a ClusterIP Service on port 8089, and the ServiceAccount of the same name;
 - `<name>-a2a-mcp-netpol`: a deny-all ingress NetworkPolicy on that pod, so the only way in is `kubectl port-forward`;
 - `<name>-a2a-mcp-token`: a Secret holding the bearer token callers present, minted once by the operator.
 
-If a ServiceAccount or Secret of those names already exists and the `PlatformAgent` does not own it, the server is not rendered and the resource carries the `A2AMCPServer` condition ([status conditions](/kube-agents/operator/platformagent-crd/#status)). Unset the flag and all of it is removed, the token included.
+If a ServiceAccount or Secret of those names already exists and the `PlatformAgent` does not own it, the server is not rendered and the resource carries the `A2AMCPServer` condition ([status conditions](/kube-agents/operator/platformagent-crd/#status)). Turn the flag off and all of it is removed, the token included.
+
+Its pod adds one to the namespace's session pod quota, and the chart's quota check counts it whenever the flag is on and `platformAgent.mode` is `next` ([Prerequisites](/kube-agents/install/prerequisites/)).
 
 ## Connecting a client
+
+To connect Antigravity or another local MCP host through the workstation bridge, which reads the token and opens the port-forward itself, follow [Using kube-agents from Antigravity](/kube-agents/install/antigravity-mcp/). A client that talks to the server directly connects as below.
 
 Forward the Service, and read the token into your client's configuration without printing it, for example into an environment variable the client reads:
 
@@ -31,6 +35,18 @@ export KUBE_AGENTS_MCP_TOKEN="$(kubectl -n kubeagents-system get secret platform
 
 Reading the Secret needs `get` on it, and the port-forward needs `pods/portforward`; together they are the access gate. Point the MCP client at `http://localhost:8089/mcp` with the header `Authorization: Bearer <token>`. The endpoint takes JSON-RPC 2.0 over `POST`, one JSON answer per request. It refuses any request that carries an `Origin` header, so a browser page cannot use it, and `GET /healthz` answers without a token. A request naming an MCP revision the server does not speak (the `MCP-Protocol-Version` header) gets a 400; one without the header is served.
 
+The workstation bridge (`kube-agents-mcp`) reads `KUBE_AGENTS_MCP_TOKEN` too. Set `KUBE_AGENTS_MCP_TOKEN_DEPLOYMENT` to the saved name of the deployment the token belongs to. The bridge matches it exactly, never by a base name or kube context. When it is set, the token goes only to the deployment saved under exactly that name, even with one deployment saved. If it names none of them, the bridge sends the token nowhere and logs a warning. When it is unset, the token goes to the only saved deployment, or nowhere, with a warning, when several are saved.
+
+The match fails closed. The bridge renames a deployment to `<kube-context>/<name>` when another context holds one called `<name>`. After that rename, or after the deployment is removed, the old value names nothing. The token is not sent until you set the variable to the new saved name. If a different deployment is later saved under the same name, the variable names that one, so update or unset it when you remove an install.
+
+The bridge's token belongs to the deployment's saved target, not its name. A connection whose kube context, namespace or direct MCP URL differs from the saved deployment's does not get it, such as a `connect_deployment` call that overrides `kube_context` or `namespace`. The bridge reads that target's own token Secret instead, where there is one, and logs a warning. Such an override applies to that connection only: the bridge doesn't save it or make it the active deployment, and reconnects to it until the next `connect_deployment`.
+
+When a turn call carries `_meta.conversation_id` or `stream_steps: true`, `send_message` and `task_control` (`get`) return a `_custom_tool_result` JSON envelope (`title`, `markdown`, `result`) after each step window on the task's `steps` artifact. The workstation bridge sets `stream_steps: true` only when its host passes `_meta.conversation_id` (or a vendor-prefixed `*/conversation_id`); a host that sends only `_meta.progressToken` keeps the single-answer form. With streaming on, each step's `title` and `markdown` reach the host. While the task is still running, `result` starts with ``STREAMING_STEP_CONTINUE: Task `<addressee>/<task-id>` is actively running``, prompting the host to call `task_control` (`get`) for the next step.
+
+A streamed `get` can re-read a finished turn that delegated, outside the stream that sent it. With no live watch of its chain, it settles at once. It returns the root's own answer and a note that the delegated tasks were not followed.
+
+The bridge offers `poll_events` too and forwards it to this server, so card reports that arrive after a `send_message` answer can be read with the `conversation_token` and `since` the answer gives.
+
 To rotate the token, write a new value into the Secret. The server reads the mounted file on every request, so the new token is accepted and the old one refused as soon as the kubelet updates the mount, usually within a minute. A blank value, or one holding a byte no request header could carry, is replaced: the operator mints a new token over it.
 
 ## The tools
@@ -40,9 +56,10 @@ To rotate the token, write a new value into the Secret. The server reads the mou
 | `connection_status` | Reports the bus endpoint and identity, whether the connection is TLS, the size of the four message streams, whether the gateway and the Platform Agent are consuming, and the agents registered on the directory. Answered from a cache at most once every five seconds.                           |
 | `read_topics`       | Reads the install's standing topics and agent cards: `list` shows every provisioned topic with its newest entry, `read` shows one topic, and `cards` shows the agent cards. Entries are shown as quoted data, capped per block.                                                                    |
 | `send_message`      | Sends one message to the install as a console user and waits for the answer, on a named conversation so that later turns continue it. A turn still running when the wait ends returns its task, to be read later with `task_control`.                                                              |
-| `task_control`      | Reads a task's state and answer (`get`, optionally waiting for it to finish), or stops a conversation's running task (`stop`).                                                                                                                                                                     |
+| `task_control`      | Reads a task's state and answer (`get`, optionally waiting for it to finish), or stops a conversation's running task (`stop`). `task_id` is an alias for `task`, and `wait_timeout_seconds` for `wait_seconds`.                                                                                    |
 | `inspect_pr`        | Reads one pull or merge request, with its comments and diff, from a repository the install manages, through the credential broker; the pod holds no forge credential. The operator wires the broker in whenever it renders the server, so the tool is always offered.                              |
 | `manage_session`    | Keeps the names of this server's conversations and sends the console's control turns: `list`, `new` and `delete` manage the names, and `session_on`, `session_off` and `help` send `/session`, `/session off` or `help` on a conversation and return the answer ([Conversations](#conversations)). |
+| `poll_events`       | Reads the card reports the gateway posted to a conversation since a cursor, waiting up to 60 s for a new one. `send_message` gathers a turn's card reports itself; this is for reports that come later.                                                                                            |
 
 A message sent through `send_message` reaches the A2A gateway through its console door, the same path the A2A console's chat pane takes, so the Planning Agent answers it or files kanban cards as for any chat message ([Conversations under `spec.mode: next`](/kube-agents/concepts/chatops/#conversations-under-specmode-next)). Everything `inspect_pr` returns that a pull request's authors wrote is shown as data: fenced, capped on line boundaries with a count of what was cut, and introduced by a line saying it is the authors' content.
 

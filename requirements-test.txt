@@ -68,11 +68,24 @@ mcp>=2.3.0
 python-dotenv
 pyyaml
 
+# agents/platform/scripts/task_credential.py verifies the dispatcher's task
+# credentials (Ed25519) for the credential broker's profile role. The broker
+# runs on the Hermes venv, which carries it through hermes-agent's own
+# dependencies; listed here so the test sweep has it without leaning on mcp's
+# transitive pull.
+cryptography
+
 # deploy/docker/check_skill_commands.py and tests/test_skill_inline_commands.py
 # parse SKILL.md with markdown-it-py.
 # The image build runs it under /opt/hermes/.venv, which gets the package from
 # hermes-agent through rich; nothing above pulls it in.
 markdown-it-py
+
+# agents/chat/scripts/cron_idle_policy.py and cron_catch_up_policy.py compute a
+# held job's next slot with croniter, which the runtime image gets from hermes-agent's own dependencies
+# (its scheduler reads cron expressions with it). Listed here so the ticker's
+# tests run the real schedule arithmetic rather than a stand-in.
+croniter
 
 # `make coverage`, which the CI `test-shard` jobs run (the `test` job joins their
 # data with `make coverage-merge`). coverage runs the unittest suite

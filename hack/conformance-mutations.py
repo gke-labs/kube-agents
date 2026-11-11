@@ -65,6 +65,73 @@ class Mutation:
 MUTATIONS: list[Mutation] = [
     # ---- A. Authority ---------------------------------------------------
     Mutation(
+        "A3-profile-context-unchecked",
+        "agents/platform/scripts/task_confinement.py",
+        ("    for value in contexts:\n        if value != target.context_name:\n",
+         "    for value in contexts:\n        if False:\n"),
+        "test_A3_a_profile_call_outside_its_tasks_target_is_refused",
+        "trust a profile worker's --context, since the managed kubeconfig only "
+        "holds one context anyway -- until the broker regenerates the one it names",
+    ),
+    Mutation(
+        "A3-profile-no-credential-runs",
+        "agents/platform/scripts/task_confinement.py",
+        ("    if target is None:\n        if not local:\n            raise ConfinementRefusal(\n"
+         "                \"this profile task has no target cluster",
+         "    if target is None:\n        if False:\n            raise ConfinementRefusal(\n"
+         "                \"this profile task has no target cluster"),
+        "test_A3_a_profile_caller_without_a_task_credential_reaches_no_cluster",
+        "let a profile worker with no credential run as a session would, on "
+        "the host cluster, so a task the dispatcher gave no target still works",
+    ),
+    Mutation(
+        "A3-profile-reaches-vcs",
+        "agents/platform/scripts/credential_proxy.py",
+        ('    ("/v1/vcs/", (CALLER_ROLE_SHELL, CALLER_ROLE_MCP)),\n',
+         '    ("/v1/vcs/", (CALLER_ROLE_SHELL, CALLER_ROLE_MCP, CALLER_ROLE_PROFILE)),\n'),
+        "test_A3_the_profile_role_reaches_exec_and_the_mcp_relay_alone",
+        "let a profile worker read a proposal the way the MCP pod does -- a "
+        "forge read no task target confines",
+    ),
+    Mutation(
+        "A3-profile-reaches-gke-mcp",
+        "agents/platform/scripts/mcp_policy.py",
+        ('    "developer_knowledge": frozenset({"get_documents", "search_documents"}),\n}',
+         '    "developer_knowledge": frozenset({"get_documents", "search_documents"}),\n'
+         '    "gke": GKE_READ_TOOLS,\n}'),
+        "test_A3_a_profile_worker_reaches_no_cluster_through_mcp",
+        "let a profile worker call the gke MCP server, whose tools name any "
+        "project and cluster in their arguments, so a task confined to one "
+        "cluster could read every other",
+    ),
+    Mutation(
+        "A3-profile-mcp-without-task",
+        "agents/platform/scripts/credential_proxy.py",
+        ("    if principal.task is None:\n        return (\n",
+         "    if False:\n        return (\n"),
+        "test_A3_a_profile_worker_reaches_no_cluster_through_mcp",
+        "let a warm profile pod between tasks read through the MCP relay "
+        "with no task credential",
+    ),
+    Mutation(
+        "A3-profile-mcp-uses-the-table",
+        "agents/platform/scripts/credential_proxy.py",
+        ("    return mcp_policy.evaluate_for_profile(server_name, message), offered\n",
+         "    return mcp_policy.evaluate(server_name, message), offered\n"),
+        "test_A3_a_profile_worker_reaches_no_cluster_through_mcp",
+        "decide a profile worker's call on the relay's whole table, so every "
+        "gke read and answer_query reach it",
+    ),
+    Mutation(
+        "A3-profile-mcp-full-offer",
+        "agents/platform/scripts/credential_proxy.py",
+        ('    offered = mcp_policy.PROFILE_SERVER_TOOLS.get(server_name, frozenset())\n',
+         '    offered = None\n'),
+        "test_A3_a_profile_worker_reaches_no_cluster_through_mcp",
+        "offer a profile worker the table's whole tool list, answer_query "
+        "and every gke read among it",
+    ),
+    Mutation(
         "A3-inject-auth",
         "agents/platform/scripts/session_kv_server.py",
         ('"/sessions/{session_id}/inject", dependencies=[Depends(verify_api_key)])',
@@ -497,8 +564,8 @@ Mutation(
     Mutation(
         "B1-mcp-relay-opened-to-the-sandbox",
         "agents/platform/scripts/credential_proxy.py",
-        ("    (mcp_policy.MCP_RELAY_PREFIX, (CALLER_ROLE_CHAT,)),\n",
-         "    (mcp_policy.MCP_RELAY_PREFIX, (CALLER_ROLE_CHAT, CALLER_ROLE_SHELL)),\n"),
+        ("    (mcp_policy.MCP_RELAY_PREFIX, (CALLER_ROLE_CHAT, CALLER_ROLE_PROFILE)),\n",
+         "    (mcp_policy.MCP_RELAY_PREFIX, (CALLER_ROLE_CHAT, CALLER_ROLE_PROFILE, CALLER_ROLE_SHELL)),\n"),
         "test_B1_only_the_gateway_reaches_the_mcp_relay",
         "let the shell sandbox call MCP tools too, for a skill script -- every "
         "model-authored command then has a GKE read path it never had",
@@ -675,7 +742,7 @@ Mutation(
         "agents/platform/scripts/watcher_policy.py",
         ('_EVENTS_LIST = re.compile(r"api/v1/events")\n',
          '_EVENTS_LIST = re.compile(r"api/v1/(events|pods)")\n'),
-        "test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_and_named_reads",
+        "test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_named_reads_and_count_lists",
         "let the watcher list pods too, for a richer triage message -- the "
         "events-only route becomes a fleet-wide pod dump on the broker's credential",
     ),
@@ -684,7 +751,7 @@ Mutation(
         "agents/platform/scripts/watcher_policy.py",
         ('REFUSED_PATH_SEGMENTS = frozenset({"watch", "proxy"})\n',
          'REFUSED_PATH_SEGMENTS = frozenset({"proxy"})\n'),
-        "test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_and_named_reads",
+        "test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_named_reads_and_count_lists",
         "drop `watch` from the refused segments as a leftover of an older API -- "
         "the server still serves watch/secrets, and the named-GET rule reads it "
         "as an object called `secrets`",
@@ -694,7 +761,7 @@ Mutation(
         "agents/platform/scripts/watcher_policy.py",
         ('        ("", "configmaps"),\n',
          '        ("", "configmaps"),\n        ("", "nodes"),\n'),
-        "test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_and_named_reads",
+        "test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_named_reads_and_count_lists",
         "add nodes to the watcher's kind table so drift on a node label is "
         "enriched -- every fleet node, its addresses and taints, becomes "
         "readable on the broker's credential for a kind no person edits",
@@ -704,7 +771,7 @@ Mutation(
         "agents/platform/scripts/watcher_policy.py",
         ('    if (group, match.group("resource")) not in WATCHER_NAMED_READS:\n',
          '    if match.group("resource") not in {r for _, r in WATCHER_NAMED_READS}:\n'),
-        "test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_and_named_reads",
+        "test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_named_reads_and_count_lists",
         "match the table on the plural alone to save a parse -- any CRD that "
         "names its plural `deployments` or `roles` is then read as if it were "
         "the built-in kind",
@@ -714,10 +781,69 @@ Mutation(
         "agents/platform/scripts/watcher_policy.py",
         ('REFUSED_RESOURCES = frozenset({"secrets"})\n',
          'REFUSED_RESOURCES = frozenset()\n'),
-        "test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_and_named_reads",
+        "test_C1_the_watcher_kubernetes_route_refuses_writes_and_everything_but_events_named_reads_and_count_lists",
         "drop the separate Secrets refusal as redundant now that the kind table "
         "exists -- it is the only rule that refuses a Secret under a group the "
         "table may one day list, and the import check leans on it",
+    ),
+    Mutation(
+        "C1-watcher-count-list-accepts-a-full-body",
+        "agents/platform/scripts/watcher_policy.py",
+        ('        if not accepts_metadata_only(accept):\n',
+         '        if accept and not accepts_metadata_only(accept):\n'),
+        "test_C1_the_watcher_count_list_is_five_cluster_scoped_kinds_one_item_metadata_only",
+        "let a count list through when the caller sends no Accept at all, for an "
+        "older watcher -- the one item then comes back as the whole object, spec "
+        "and status beside the ObjectMeta the metadata Accept already relays, on "
+        "the broker's credential",
+    ),
+    Mutation(
+        "C1-watcher-pod-metadata-accepts-a-full-body",
+        "agents/platform/scripts/watcher_policy.py",
+        ('        if not accepts_metadata_only(accept, POD_METADATA_ACCEPT_PARAMS, POD_METADATA_MEDIA_TYPE):\n',
+         '        if accept and not accepts_metadata_only(accept, POD_METADATA_ACCEPT_PARAMS, POD_METADATA_MEDIA_TYPE):\n'),
+        "test_C1_the_watcher_reads_a_named_pod_as_metadata_and_never_whole",
+        "let a named Pod read through when the caller sends no Accept at all -- the "
+        "Pod then comes back whole, spec, env and status, on the broker's credential",
+    ),
+    Mutation(
+        "C1-watcher-pod-metadata-any-group",
+        "agents/platform/scripts/watcher_policy.py",
+        ('    if match.re is _NAMED_CORE and match.group("ns") and match.group("resource") == POD_RESOURCE:\n',
+         '    if match.groupdict().get("ns") and match.group("resource") == POD_RESOURCE:\n'),
+        "test_C1_the_watcher_reads_a_named_pod_as_metadata_and_never_whole",
+        "drop the core-group guard on the named Pod rule, so any API group's "
+        "resource called pods (metrics.k8s.io's PodMetrics, a CRD's plural) is "
+        "relayed on the broker's credential",
+    ),
+    Mutation(
+        "C1-watcher-pod-metadata-unprojected-labels",
+        "agents/platform/scripts/watcher_policy.py",
+        ('                projected["labels"] = {POD_METADATA_HASH_LABEL: hash_value}\n',
+         '                projected["labels"] = dict(labels)\n'),
+        "test_C1_the_watcher_reads_a_named_pod_as_metadata_and_never_whole",
+        "relay every label of a named Pod instead of the owner lookup's one, "
+        "widening what the watcher token reads of any Pod in the fleet",
+    ),
+    Mutation(
+        "C1-watcher-pod-metadata-any-controller-kind",
+        "agents/platform/scripts/watcher_policy.py",
+        ('        if kind in POD_METADATA_OWNER_KINDS and (kind != POD_METADATA_HASH_OWNER_KIND or has_hash):\n',
+         '        if kind != POD_METADATA_HASH_OWNER_KIND or has_hash:\n'),
+        "test_C1_the_watcher_reads_a_named_pod_as_metadata_and_never_whole",
+        "relay a named Pod's controller whatever its kind (a static Pod's Node, a "
+        "custom controller), which the owner lookup never folds on",
+    ),
+    Mutation(
+        "C1-watcher-count-list-widened-to-secrets",
+        "agents/platform/scripts/watcher_policy.py",
+        ('        "apis/batch/v1/cronjobs",\n    }\n)\n',
+         '        "apis/batch/v1/cronjobs",\n        "api/v1/secrets",\n    }\n)\n'),
+        "test_C1_the_watcher_count_list_is_five_cluster_scoped_kinds_one_item_metadata_only",
+        "count Secrets too, for a sizing figure -- the first-sorted Secret's "
+        "ObjectMeta, its last-applied-configuration annotation and the data an "
+        "applied manifest carries in it included, becomes readable on the "
+        "broker's credential",
     ),
     Mutation(
         "C1-watcher-subscription-unpinned",
@@ -1286,6 +1412,15 @@ Mutation(
         "the one-line edit B3 names: 'unblock apply during upgrade window'",
     ),
     Mutation(
+        "C5-gateway-pod-policy-any-account",
+        "k8s-operator/config/admission/a2a-gateway-pod-policy.yaml",
+        ('    - expression: "has(object.spec.serviceAccountName) && object.spec.serviceAccountName == variables.sessionAccount"',
+         '    - expression: "has(object.spec.serviceAccountName)"'),
+        "test_C5_the_gateway_pod_policy_holds_its_pods_to_the_session_account",
+        "widen the identity rule to any ServiceAccount, which reopens the "
+        "gateway's pod create to every identity in its namespace",
+    ),
+    Mutation(
         "C1-broker-colocation-flag-restored",
         "k8s-operator/internal/controller/platformagent_manifests.go",
         ("// buildPodTemplateSpec generates the shared PodTemplateSpec for Deployment and StatefulSet\n",
@@ -1445,10 +1580,12 @@ Mutation(
     Mutation(
         "D1-platform-role-reaches-secrets",
         "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
-        ("      - configmaps\n      - serviceaccounts", "      - configmaps\n      - secrets\n      - serviceaccounts"),
+        (
+            "      - serviceaccounts\n      - secrets\n    verbs:\n      - get\n      - list\n      - watch",
+            "      - serviceaccounts\n      - secrets\n    verbs:\n      - get\n      - list\n      - watch\n      - patch",
+        ),
         "test_D1_no_product_role_can_write_the_identity_table",
-        "add secrets to the platform agent's minimal ClusterRole in the default golden, "
-        "beside the configmaps it already reads",
+        "grant a write verb on secrets in the platform agent's minimal ClusterRole",
     ),
     Mutation(
         "D2-workflow-mode",
@@ -2023,6 +2160,16 @@ Mutation(
         "each module's test compares its constant to itself",
     ),
     Mutation(
+        "C1-session-audience-env-renamed-in-kube-proxy",
+        "k8s-api-proxy/cmd/k8s-api-proxy/main.go",
+        ('sessionAudienceEnv      = "CREDENTIAL_PROXY_SESSION_AUDIENCE"',
+         'sessionAudienceEnv      = "KUBE_PROXY_SESSION_AUDIENCE"'),
+        "test_C1_the_session_broker_audience_and_view_env_agree_across_the_module_boundary",
+        "rename the session-audience env var in k8s-api-proxy while "
+        "k8s-operator still renders CREDENTIAL_PROXY_SESSION_AUDIENCE: both Go "
+        "suites pass while session kubectl fails with 401",
+    ),
+    Mutation(
         "C1-shim-token-env-renamed-in-the-spawner",
         "a2a/gateway/spawn.go",
         ('Name: "CREDENTIAL_PROXY_TOKEN_FILE"', 'Name: "CREDENTIAL_PROXY_TOKEN_PATH"'),
@@ -2143,8 +2290,8 @@ Mutation(
     Mutation(
         "C1-delegate-schema-property-renamed",
         "a2a/worker-adapter/mcp.go",
-        ('"addressee": map[string]any{"type": "string", "description": "The agent to hand the task to. Today only \\"platform\\"."},',
-         '"target": map[string]any{"type": "string", "description": "The agent to hand the task to. Today only \\"platform\\"."},'),
+        ('"addressee": map[string]any{"type": "string", "description": addresseeDescription(targets)},',
+         '"target": map[string]any{"type": "string", "description": addresseeDescription(targets)},'),
         "test_C1_the_delegate_tool_schema_names_agree_with_the_wire_shape",
         "rename the schema's addressee property to target without touching "
         "lib.DelegateRequest: the model calls the tool exactly as the schema "
@@ -2236,7 +2383,7 @@ Mutation(
     Mutation(
         "C1-rendered-bridge-inherits-the-agent-bus-user",
         "k8s-operator/internal/controller/platformagent_a2a_bridge.go",
-        ("\ta2aBusUserEnv:               true,\n", ""),
+        ("\ta2aBusUserEnv:                    true,\n", ""),
         "test_C1_the_rendered_bridge_is_not_the_agent_principal",
         "let the rendered bridge inherit A2A_BUS_USER=agent, the agent "
         "principal's name and inbox prefix",
@@ -2251,6 +2398,36 @@ Mutation(
         "helpful-looking change that lets a worker adapter finalise itself "
         "after a harness crash. An executor can then declare itself dead as "
         "infrastructure",
+    ),
+    Mutation(
+        "A3-bridge-writes-stop-records",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ('\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"$KV.runtime-state.>",',
+         '\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"a2a.stop.*.*",\n\t\t"$KV.runtime-state.>",'),
+        "test_A3_the_stop_record_has_exactly_one_writer",
+        "grant the static bridge publish on profiles' stop records, so the "
+        "platform agent can stop a profile task it delegated. It can then stop "
+        "tasks other requesters started",
+    ),
+    Mutation(
+        "A3-bridge-submits-profile-tasks",
+        "k8s-operator/internal/controller/platformagent_a2a_identities.go",
+        ('\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"$KV.runtime-state.>",',
+         '\t\t"a2a.tasks." + a2aBridgeAddressee + ".*.events",\n\t\t"a2a.submit.*.*.*.*",\n\t\t"$KV.runtime-state.>",'),
+        "test_A3_the_submit_subject_has_exactly_one_writer",
+        "grant the static bridge publish on profiles' submit subject, so the "
+        "platform agent can hand a profile work without a gateway hop. It "
+        "then starts tasks under grants the gateway never minted for them",
+    ),
+    Mutation(
+        "A3-session-submits-profile-tasks",
+        "a2a/authcallout/session.go",
+        ('\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t},',
+         '\t\tPublish: []string{\n\t\t\tlib.TaskEventsSubject(addressee, task),\n\t\t\tlib.TaskSubmitSubject("*", "*", "*", "*"),\n\t\t},'),
+        "test_A3_the_submit_subject_has_exactly_one_writer",
+        "derive every executor a grant on profiles' submit subject, the "
+        "shortcut a worker delegating straight to a profile would take. A "
+        "worker can then start tasks of its own outside the gateway's checks",
     ),
     Mutation(
         "A3-bridge-sends-a-notify",

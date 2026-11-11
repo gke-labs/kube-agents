@@ -1,4 +1,4 @@
-"""The nightly section of the 9 AM digest: what last night changed, and who
+"""The nightly section of the 11 AM digest: what last night changed, and who
 answers for it.
 
 ``post_health.py`` posts the digest; this builds its nightly part from the
@@ -19,15 +19,17 @@ the section and the bugs cannot disagree::
                           from running last night with an infra issue or streak
     ⏱ Latency            last night's timing against its typical, and the
                           cases that slowed down (``nightly_latency.py``)
+    🗣 Reply shape        how last night's answers read against their
+                          typical (``nightly_tone.py``)
     Owners: reply in this thread ...
 
 Each list holds at most LIST_MAX_LINES lines, the rest behind a link to the
 Nightly page. A night with no new or newly owed bug, no first-night red, no
 recovery, no infra item and no part cut off is one summary line
 (QUIET_LINE), which counts what is still red, followed by the latency
-block. Every form of the section, a night cut off at the deadline included,
+block and the reply-shape line. Every form of the section, a night cut off at the deadline included,
 carries the latency block after the infra list when the night carried
-timing.
+timing, and the reply-shape line after it when the night measured a reply.
 
 The header's counts are the Nightly page's (``header_counts``): cases that
 passed every graded repetition, of the cases recorded. The lists' verdicts
@@ -66,11 +68,11 @@ except ImportError:  # build() says so; post_health stays importable without it
     yaml = None
 
 try:
-    from eval_dashboard import classify, nightly, nightly_bugs, nightly_infra, nightly_latency
+    from eval_dashboard import classify, nightly, nightly_bugs, nightly_infra, nightly_latency, nightly_tone
     from eval_dashboard.post_health import NIGHTLY_URL
 except ImportError:  # imported with scripts/eval_dashboard/ on sys.path
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-    from eval_dashboard import classify, nightly, nightly_bugs, nightly_infra, nightly_latency
+    from eval_dashboard import classify, nightly, nightly_bugs, nightly_infra, nightly_latency, nightly_tone
     from eval_dashboard.post_health import NIGHTLY_URL
 
 # The env var holding the GitHub-login -> Chat-user-id map (JSON object).
@@ -281,12 +283,11 @@ class Builder:
             if not ok:
                 raise Skipped(SKIP_BAD_LINK.format(url=url or "empty"))
 
-    def latency_block(self, fields: dict) -> list[str]:
+    def latency_block(self, fields: dict, nights: list[dict]) -> list[str]:
         """The night line and the slow cases (``nightly_latency.py``), or
-        nothing when last night carried no timing."""
-        # ``last_night``'s night is the newest of these: the same reports,
-        # read further back for the typicals.
-        nights = nightly.night_reports(self.data, running=nightly.running_nights(self.data, self.now))
+        nothing when last night carried no timing. ``nights`` is
+        ``nightly.night_dates``: ``last_night``'s night is the newest of
+        them, read further back for the typicals."""
         line = nightly_latency.night_line(nights)
         if not line:
             return []
@@ -312,6 +313,14 @@ class Builder:
             owner = self.owner_of(case, f, nightly_bugs.tracking_issue(self.open_issues, case))
             items.append(((-entry["ratio"], case), nightly_latency.slow_text(entry, name, self.who(owner))))
         return [line, *self.capped(nightly_latency.SLOW_HEADING, items)]
+
+    def trend_blocks(self, fields: dict) -> list[str]:
+        """The latency block, then the reply-shape lines (``nightly_tone.py``,
+        every case and the chat-and-routing cases) when last night measured
+        a reply, over one build of the reports."""
+        nights = nightly.night_dates(self.data, running=nightly.running_nights(self.data, self.now))
+        tone = [line for line in (nightly_tone.night_line(nights), nightly_tone.focus_line(nights)) if line]
+        return [*self.latency_block(fields, nights), *tone]
 
     # ---- the night
 
@@ -366,9 +375,9 @@ class Builder:
         if night.get("truncated") or self.run_event(night):
             body = TRUNCATED_BODY if night.get("truncated") else RUN_EVENT_BODY
             lines = [header(body), *(self.capped(INFRA_HEADING, infra) or [INFRA_NONE])]
-            latency = self.latency_block(fields)
-            if latency:
-                lines += ["", *latency]
+            trends = self.trend_blocks(fields)
+            if trends:
+                lines += ["", *trends]
             self.check_links()
             return Section(lines, quiet=False)
 
@@ -379,7 +388,7 @@ class Builder:
         if ungraded:
             notes.append(NOT_GRADED_NOTE.format(count=ungraded))
         cut = [PART_CUT_NOTE.format(part=nightly.PART_WORDS.get(p.get("part"), p.get("part"))) for p in night.get("parts") or [] if p.get("truncated")]
-        # A writers part missing or still running is named too (main halves
+        # A writers part missing or still running is named too (main shards
         # held the section back above), and keeps the night from being quiet.
         cut += nightly.part_notes(night, cut=False)
         notes += cut
@@ -438,7 +447,7 @@ class Builder:
             line = QUIET_LINE.format(glyph=nightly.DIGEST_GLYPH, date=short, passed=passed, recorded=recorded,
                                      ungraded=QUIET_UNGRADED.format(count=ungraded) if ungraded else "",
                                      still=QUIET_STILL.format(count=red) if red else "", page=self.page())
-            lines = [line, *self.latency_block(fields)]
+            lines = [line, *self.trend_blocks(fields)]
             self.check_links()
             return Section(lines, quiet=True)
         lines = [header(nightly.SEP.join(notes))]
@@ -447,9 +456,9 @@ class Builder:
             if block:
                 lines += ["", *block]
         lines += ["", *(self.capped(INFRA_HEADING, infra) or [INFRA_NONE])]
-        latency = self.latency_block(fields)
-        if latency:
-            lines += ["", *latency]
+        trends = self.trend_blocks(fields)
+        if trends:
+            lines += ["", *trends]
         lines += ["", FOOTER]
         self.check_links()
         return Section(lines, quiet=False)

@@ -8,6 +8,7 @@ deleted.
 """
 
 import json
+import random
 import time
 from datetime import datetime, timezone
 import os
@@ -25,6 +26,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import chat_platforms  # noqa: E402
 import cluster_agent_profile as cap  # noqa: E402
 import cluster_agent_reconcile as rec  # noqa: E402
+
+
+def _delete_each(names):
+    """The prune's batch, forwarded to delete_profile one name at a time in the
+    batch's order, so these tests' patches of delete_profile see every prune.
+    delete_profiles itself is tested in test_cluster_agent_profile.py, and
+    PruneBatchTest below checks the reconcile hands it the whole prune at once."""
+    return {name: rec.delete_profile(name) or "deleted" for name in sorted(set(names))}
+
+
+rec.delete_profiles = _delete_each
 
 # The ScopeTest timing tests prove "these lookups overlapped" and "the run went on without
 # this one" by synchronising with the stubbed lookups rather than timing them: a stub meets
@@ -64,6 +76,21 @@ class _Stall:
         self._case.assertFalse(self.finished.is_set(), f"the run waited out {what}")
         self.release.set()
 
+
+
+# The relay helper runs in the sandbox, which no test has: every test starts from the
+# gcloud path (the fallback when the helper cannot run), and the relay tests patch
+# `_relay_reads` themselves.
+_no_relay = mock.patch.object(rec, "_relay_reads", return_value=None)
+_real_relay_reads = rec._relay_reads
+
+
+def setUpModule():
+    _no_relay.start()
+
+
+def tearDownModule():
+    _no_relay.stop()
 
 def _identity(project="p", cluster="c", location="us-central1"):
     return {"project": project, "cluster": cluster, "location": location}
@@ -201,6 +228,27 @@ def _name_for(identity_kwargs, identities):
             return name
     raise KeyError(identity_kwargs)
 
+
+class PruneBatchTest(HomesMixin):
+    """The reconcile hands its whole prune to delete_profiles in one call (#4574)."""
+
+    def test_every_pruned_name_goes_in_one_batch(self):
+        profiles = ["cluster-a", "cluster-b", "cluster-c", "cluster-live"]
+        identities = {n: _identity(cluster=n.split("-", 1)[1]) for n in profiles}
+        existence = {"cluster-a": False, "cluster-b": False, "cluster-c": False, "cluster-live": True}
+        batches = []
+        with mock.patch.object(rec, "delete_profiles", side_effect=lambda names: batches.append(list(names)) or {}):
+            report, deleted = ReconcileTest._run(self, profiles, identities, existence)
+        self.assertEqual(batches, [["cluster-a", "cluster-b", "cluster-c"]])
+        self.assertEqual(deleted, [])  # not one delete_profile per name
+        self.assertEqual(sorted(report["pruned"]), ["cluster-a", "cluster-b", "cluster-c"])
+
+    def test_a_dry_run_deletes_nothing(self):
+        profiles = ["cluster-a"]
+        identities = {"cluster-a": _identity(cluster="a")}
+        with mock.patch.object(rec, "delete_profiles", side_effect=AssertionError("a dry run deleted")):
+            report, _ = ReconcileTest._run(self, profiles, identities, {"cluster-a": False}, dry_run=True)
+        self.assertEqual(report["pruned"], ["cluster-a"])
 
 class CreateDirectionTest(HomesMixin):
     def test_creates_missing_including_the_management_cluster(self):
@@ -587,6 +635,32 @@ class ClusterExistsTest(unittest.TestCase):
     def test_unknown_on_timeout(self):
         with self._stub(side_effect=subprocess.TimeoutExpired("gcloud", 30)):
             self.assertIsNone(rec._cluster_exists("p", "c", "us-central1"))
+
+    def test_the_describe_tells_the_shim_a_deadline_under_which_no_retry_fits(self):
+        # The cap holds no admission wait, but the watermark gate's 429 is answered
+        # at once and the shim's default admits three or four of its waits, so the
+        # describe passes its cap less the broker's gcloud run bound: 0 at the
+        # default and at any prune budget under the run bound, and the gate's
+        # refusal is logged with its reason instead of as a timeout.
+        client = rec.credential_proxy_client
+        with mock.patch.object(rec.sandbox_exec, "run", return_value=mock.Mock(stdout="{}")) as run:
+            self.assertIs(rec._cluster_exists("p", "c", "us-central1"), True)
+        self.assertEqual(run.call_args.kwargs["timeout"], rec.DESCRIBE_TIMEOUT_SECONDS)
+        deadline = max(0, rec.DESCRIBE_TIMEOUT_SECONDS - rec.BROKER_GCLOUD_RUN_SECONDS)
+        self.assertEqual({client.RETRY_DEADLINE_ENV: str(deadline)}, run.call_args.kwargs["remote_env"])
+        self.assertEqual("0", run.call_args.kwargs["remote_env"][client.RETRY_DEADLINE_ENV])
+        shortest = client.BROKER_ADMISSION_WAIT_SECONDS + client.RETRY_JITTER_FLOOR * client.RETRY_BACKOFF_BASE_SECONDS
+        self.assertGreater(shortest, deadline)
+        self.assertIsNone(client.retry_wait(1, 0.0, None, random.Random(1), lambda: 0.0, deadline=float(deadline)))
+        # The gate's shortest wait, half a 5 s Retry-After, does not fit it either.
+        self.assertIsNone(client.retry_wait(1, 0.0, "5", random.Random(1), lambda: 0.0, deadline=float(deadline)))
+        # A describe under the prune budget derives the deadline from the cap it is given.
+        with mock.patch.object(rec.sandbox_exec, "run", return_value=mock.Mock(stdout="{}")) as run:
+            rec._cluster_exists("p", "c", "us-central1", timeout=7.5)
+        self.assertEqual({client.RETRY_DEADLINE_ENV: "0"}, run.call_args.kwargs["remote_env"])
+        with mock.patch.object(rec.sandbox_exec, "run", return_value=mock.Mock(stdout="{}")) as run:
+            rec._cluster_exists("p", "c", "us-central1", timeout=rec.BROKER_GCLOUD_RUN_SECONDS + 20)
+        self.assertEqual({client.RETRY_DEADLINE_ENV: "20"}, run.call_args.kwargs["remote_env"])
 
 
 class ReadClusterIdentityTest(unittest.TestCase):
@@ -2015,12 +2089,66 @@ class ScopeTest(HomesMixin):
         with mock.patch.object(rec.sandbox_exec, "run", return_value=cut), mock.patch.object(rec, "log") as logged:
             self.assertEqual(rec._search_container(self.FOLDER), (None, rec.OUTCOME_UNREACHABLE))
         self.assertIn("cut the search output at its cap", " ".join(str(c) for c in logged.call_args_list))
+        # The shipped shim exits 74 on a cut reply, which `check=True` raises; the marker is
+        # still read first, so the log names the cap rather than a failed call.
+        cut_74 = subprocess.CalledProcessError(74, ["gcloud"], output='[{"name": "//container.googleapis.com/projects/a/locations/l/clu',
+                                               stderr="credential proxy output truncated at 8388608 bytes (kept 8388608 bytes of stdout; exit 74)")
+        with mock.patch.object(rec.sandbox_exec, "run", side_effect=cut_74), mock.patch.object(rec, "log") as logged:
+            self.assertEqual(rec._search_container(self.FOLDER), (None, rec.OUTCOME_UNREACHABLE))
+        self.assertIn("cut the search output at its cap", " ".join(str(c) for c in logged.call_args_list))
+        self.assertNotIn("Cloud Asset Inventory failed", " ".join(str(c) for c in logged.call_args_list))
         for stderr, want in (("PERMISSION_DENIED", rec.OUTCOME_DENIED),
                              ("Cloud Asset API has not been used in project 1 before or it is disabled", rec.OUTCOME_API_DISABLED),
                              ("connection reset", rec.OUTCOME_UNREACHABLE)):
             err = subprocess.CalledProcessError(1, ["gcloud"], stderr=stderr)
             with mock.patch.object(rec.sandbox_exec, "run", side_effect=err):
                 self.assertEqual(rec._search_container(self.FOLDER), (None, want), stderr)
+
+    def test_the_scope_lookups_go_through_the_command_runner_when_one_is_set(self):
+        # The scope publisher runs these four lookups with its broker runner; unset, they keep
+        # the sandbox route, so the reconcile's own path does not change.
+        lookups = (
+            (lambda: rec._list_project("team-a"),
+             ["gcloud", "container", "clusters", "list", "--project", "team-a", "--format=value(name,location)"]),
+            (lambda: rec._search_container(self.FOLDER),
+             ["gcloud", "asset", "search-all-resources", f"--scope={self.FOLDER}",
+              "--asset-types=container.googleapis.com/Cluster", "--format=json(name,location)"]),
+            (lambda: rec._resolve_selector("sharedVpcHosts/host-project"),
+             ["gcloud", "compute", "shared-vpc", "list-associated-resources", "host-project", "--format=json(id,type)"]),
+            (lambda: rec._resolve_selector("metricsScopes/scope-project"),
+             ["gcloud", "beta", "monitoring", "metrics-scopes", "describe",
+              "locations/global/metricsScopes/scope-project", "--format=json(name,monitoredProjects)"]),
+            (lambda: rec._project_id_of("123456789012"),
+             ["gcloud", "projects", "describe", "123456789012", "--format=value(projectId)"]),
+        )
+        for lookup, argv in lookups:
+            runner = mock.Mock(return_value=mock.Mock(stdout="", stderr=""))
+            with mock.patch.object(rec, "COMMAND_RUNNER", runner), \
+                    mock.patch.object(rec.sandbox_exec, "run") as sandboxed, mock.patch.object(rec, "log"):
+                lookup()
+            self.assertEqual(runner.call_args[0][0], argv)
+            self.assertTrue(runner.call_args[1]["check"])
+            # A COMMAND_RUNNER sets the shim's deadline in its own environment (scope_publisher).
+            self.assertNotIn("remote_env", runner.call_args[1])
+            sandboxed.assert_not_called()
+            with mock.patch.object(rec.sandbox_exec, "run", return_value=mock.Mock(stdout="", stderr="")) as sandboxed, \
+                    mock.patch.object(rec, "log"):
+                lookup()
+            self.assertEqual(sandboxed.call_args[0][0], argv)
+            self.assertEqual(
+                {rec.credential_proxy_client.RETRY_DEADLINE_ENV: str(rec.SHIM_RETRY_DEADLINE_SECONDS)},
+                sandboxed.call_args[1]["remote_env"],
+            )
+
+    def test_the_lookups_cap_leaves_the_shim_no_retry(self):
+        # The cap holds one admission wait and part of one gcloud run, so the
+        # deadline the lookups pass admits not even a refusal answered at once.
+        client = rec.credential_proxy_client
+        deadline = float(rec.SHIM_RETRY_DEADLINE_SECONDS)
+        self.assertEqual(max(0, rec.LIST_TIMEOUT_SECONDS - rec.BROKER_GCLOUD_RUN_SECONDS), deadline)
+        shortest = client.BROKER_ADMISSION_WAIT_SECONDS + client.RETRY_JITTER_FLOOR * client.RETRY_BACKOFF_BASE_SECONDS
+        self.assertGreater(shortest, deadline)
+        self.assertIsNone(client.retry_wait(1, 0.0, None, random.Random(1), lambda: 0.0, deadline=deadline))
 
     def test_the_notification_counts_unlisted_projects_past_a_limit_and_names_containers(self):
         report = {"created": ["cluster-x"], "pruned": [], "create_failed": [], "skipped_error": [],
@@ -3131,6 +3259,364 @@ class ScopeTest(HomesMixin):
         self.assertEqual(report["kept"], ["cluster-prod"])
 
 
+    # #3703 at scale: many clusters in one project cost that project's one list, not a
+    # describe each, and absence from the list is still never proof of absence. The call
+    # counts are the pins; the run is also given a loose time bound, a smoke check on the
+    # whole reconcile rather than a measurement, since every call here is a stub.
+
+    PRUNE_SCALE_COUNTS = (50, 500)
+
+    def _scale_run(self, count, unlisted=None):
+        """Reconcile count profiles in one project whose list names all but unlisted, a map of
+        cluster -> its describe answer (False gone, True live, None unknown). Returns
+        (report, deleted, lists, describes, seconds)."""
+        unlisted = unlisted or {}
+        clusters = [f"c{i:04d}" for i in range(count)]
+        profiles, identities = self._profiles(*clusters)
+        listed = [(self.MGMT, c, "us-central1") for c in clusters if c not in unlisted]
+        lists: list[str] = []
+
+        def lister(project, timeout=None):
+            lists.append(project)
+            return listed, rec.OUTCOME_OK
+        asked, exists = self._describes({c: unlisted.get(c, True) for c in clusters})
+        started = time.monotonic()
+        report, _, deleted = self._run(None, lister, profiles=profiles, identities=identities, exists=exists)
+        return report, deleted, lists, asked, time.monotonic() - started
+
+    @staticmethod
+    def _every_tenth(count, answer_of):
+        """Every tenth cluster, each mapped to answer_of(its position among them)."""
+        picked = [f"c{i:04d}" for i in range(0, count, 10)]
+        return {c: answer_of(k) for k, c in enumerate(picked)}
+
+    def test_prune_at_scale_lists_the_project_once_and_describes_nothing(self):
+        for count in self.PRUNE_SCALE_COUNTS:
+            with self.subTest(clusters=count):
+                report, deleted, lists, asked, seconds = self._scale_run(count)
+                self.assertEqual(lists, [self.MGMT], "the project is listed once")
+                self.assertEqual(asked, [], "a listed cluster is not described")
+                self.assertEqual(deleted, [])
+                self.assertEqual(len(report["kept"]), count)
+                self.assertLess(seconds, 30, f"the reconcile over {count} clusters took {seconds:.1f}s")
+
+    def test_prune_at_scale_describes_only_what_the_list_left_out(self):
+        # A tenth of the clusters are missing from the list, and they answer gone, live or
+        # unknown in turn: only the gone ones are deleted. A partial list cannot delete.
+        answers = (False, True, None)
+        for count in self.PRUNE_SCALE_COUNTS:
+            with self.subTest(clusters=count):
+                unlisted = self._every_tenth(count, lambda k: answers[k % 3])
+                report, deleted, lists, asked, _ = self._scale_run(count, unlisted=unlisted)
+                gone = sorted(c for c, a in unlisted.items() if a is False)
+                unsure = sorted(c for c, a in unlisted.items() if a is None)
+                self.assertEqual(lists, [self.MGMT])
+                self.assertEqual(sorted(asked), sorted(unlisted))
+                self.assertEqual(sorted(deleted), [f"cluster-{c}" for c in gone])
+                self.assertEqual(sorted(report["skipped_error"]), [f"cluster-{c}" for c in unsure])
+                self.assertEqual(len(report["kept"]), count - len(gone) - len(unsure))
+
+    def test_prune_at_scale_through_the_relay_is_one_list_batch_and_gets_only_the_unlisted(self):
+        for count in self.PRUNE_SCALE_COUNTS:
+            with self.subTest(clusters=count):
+                clusters = [f"c{i:04d}" for i in range(count)]
+                unlisted = self._every_tenth(count, lambda k: k % 2 == 0)
+                profiles, identities = self._profiles(*clusters)
+                # A get answer for every cluster, so a regression that sends a listed one
+                # fails the assertion below rather than the stub.
+                gets = {self._key(c): ({"status": 200} if unlisted.get(c, True)
+                                        else {"status": 404, "error": self.NOT_FOUND}) for c in clusters}
+                batches, relay = self._relay(lists={self.MGMT: self._ok_list(*(c for c in clusters if c not in unlisted))},
+                                             gets=gets)
+                report, deleted, lists, describes = self._relayed_run(relay, profiles, identities)
+                self.assertEqual(([], []), (lists, describes), "no gcloud at all")
+                self.assertEqual([[self.MGMT]], [b.get("projects") for b in batches if b.get("projects")])
+                self.assertEqual(sorted(unlisted), sorted(c[2] for b in batches for c in b.get("clusters", [])),
+                                 "only the unlisted clusters reach a get")
+                self.assertEqual(sorted(deleted), sorted(f"cluster-{c}" for c, live in unlisted.items() if not live))
+
+
+    # #3703 step 2: the GKE reads go through the broker's relay, one sandbox process a batch.
+
+    NOT_FOUND = {"error": {"code": 404, "status": "NOT_FOUND", "message": "Not found: cluster"}}
+
+    def _relay(self, lists=None, gets=None):
+        """A `_relay_reads` stub over canned rows, recording each batch it was sent."""
+        batches: list = []
+
+        def relay(request, timeout):
+            batches.append(request)
+            return {"lists": {p: (lists or {})[p] for p in request.get("projects", [])},
+                    "gets": {"/".join(c): (gets or {})["/".join(c)] for c in request.get("clusters", [])}}
+        return batches, relay
+
+    @staticmethod
+    def _ok_list(*clusters, location="us-central1"):
+        return {"status": 200, "clusters": [[c, location] for c in clusters]}
+
+    def _key(self, cluster, project=None):
+        return f"{project or self.MGMT}/us-central1/{cluster}"
+
+    def _relayed_run(self, relay, profiles, identities, lister=None, scope=None):
+        gcloud_lists: list = []
+        gcloud_describes: list = []
+
+        def gcloud_list(project, timeout=None):
+            gcloud_lists.append(project)
+            return (lister or {}).get(project, ([], rec.OUTCOME_OK))
+
+        def gcloud_describe(project, cluster, location, timeout=None):
+            gcloud_describes.append(cluster)
+            return True
+        with mock.patch.object(rec, "_relay_reads", side_effect=relay):
+            report, _, deleted = self._run(scope, gcloud_list, profiles=profiles, identities=identities,
+                                           exists=gcloud_describe)
+        return report, deleted, gcloud_lists, gcloud_describes
+
+    def test_the_relay_lists_and_describes_with_no_gcloud(self):
+        profiles, identities = self._profiles("a", "gone")
+        batches, relay = self._relay(lists={self.MGMT: self._ok_list("a")},
+                                     gets={self._key("gone"): {"status": 404, "error": self.NOT_FOUND}})
+        report, deleted, lists, describes = self._relayed_run(relay, profiles, identities)
+        self.assertEqual(([], []), (lists, describes))
+        self.assertEqual(deleted, ["cluster-gone"])
+        self.assertEqual(report["kept"], ["cluster-a"])
+        # The listed cluster is not looked up: only the unlisted one reaches a get.
+        self.assertEqual([[self.MGMT, "us-central1", "gone"]], [c for b in batches for c in b.get("clusters", [])])
+
+    def test_a_relayed_partial_list_cannot_delete_a_live_cluster(self):
+        profiles, identities = self._profiles("a", "omitted")
+        _, relay = self._relay(lists={self.MGMT: self._ok_list("a")},
+                               gets={self._key("omitted"): {"status": 200}})
+        report, deleted, _, _ = self._relayed_run(relay, profiles, identities)
+        self.assertEqual(deleted, [])
+        self.assertEqual(sorted(report["kept"]), ["cluster-a", "cluster-omitted"])
+
+    def test_only_the_apis_own_notfound_deletes(self):
+        # A 404 that is not a Google NOT_FOUND (the broker's, a proxy's) is unknown.
+        profiles, identities = self._profiles("broker404", "denied", "unreached")
+        _, relay = self._relay(lists={self.MGMT: self._ok_list()}, gets={
+            self._key("broker404"): {"status": 404, "error": {"text": "<html>not here</html>"}},
+            self._key("denied"): {"status": 403, "error": {"error": {"code": 403, "status": "PERMISSION_DENIED"}}},
+            self._key("unreached"): {"status": 0, "error": {"exception": "ConnectTimeout"}},
+        })
+        report, deleted, _, _ = self._relayed_run(relay, profiles, identities)
+        self.assertEqual(deleted, [])
+        self.assertEqual(sorted(report["skipped_error"]), ["cluster-broker404", "cluster-denied", "cluster-unreached"])
+
+    def test_a_relayed_list_failure_is_classified_as_gcloud_would_be(self):
+        _, relay = self._relay(lists={self.MGMT: {"status": 403, "error": {"error": {
+            "code": 403, "status": "PERMISSION_DENIED", "message": "does not have permission"}}}})
+        report, _, lists, _ = self._relayed_run(relay, [], {})
+        self.assertEqual([], lists)
+        self.assertEqual(report["projects"], {self.MGMT: rec.OUTCOME_DENIED})
+
+    def test_a_broker_refusal_falls_back_to_gcloud_for_the_run(self):
+        # A broker older than the routes answers SECURITY_POLICY_BLOCKED: that says nothing
+        # about the clusters, so the tick lists and describes with gcloud instead.
+        profiles, identities = self._profiles("a")
+        _, relay = self._relay(lists={self.MGMT: {"status": 403, "error": {
+            "code": "SECURITY_POLICY_BLOCKED", "rule": "gcp.api.host"}}})
+        report, deleted, lists, describes = self._relayed_run(
+            relay, profiles, identities, lister={self.MGMT: ([], rec.OUTCOME_OK)})
+        self.assertEqual([self.MGMT], lists)
+        self.assertEqual(["a"], describes)
+        self.assertEqual(deleted, [])
+        self.assertEqual(report["kept"], ["cluster-a"])
+
+    def test_a_refused_role_falls_back_to_gcloud_for_the_run(self):
+        profiles, identities = self._profiles("a")
+        _, relay = self._relay(lists={self.MGMT: {"status": 403, "error": {"code": "CALLER_ROLE_FORBIDDEN"}}})
+        report, deleted, lists, describes = self._relayed_run(
+            relay, profiles, identities, lister={self.MGMT: ([], rec.OUTCOME_OK)})
+        self.assertEqual(([self.MGMT], ["a"]), (lists, describes))
+        self.assertEqual(deleted, [])
+
+    def test_an_unknown_relayed_describe_names_its_cluster_in_the_log(self):
+        logged: list = []
+        row = {"status": 500, "error": {"error": {"code": 500, "status": "INTERNAL", "message": "Internal error"}}}
+        with mock.patch.object(rec, "log", side_effect=logged.append):
+            self.assertIsNone(rec._read_get("p", "us-central1", "seeded-a", row))
+        self.assertIn("seeded-a (p/us-central1)", logged[0])
+
+    def test_a_not_found_body_under_another_status_is_unknown(self):
+        profiles, identities = self._profiles("odd")
+        _, relay = self._relay(lists={self.MGMT: self._ok_list()},
+                               gets={self._key("odd"): {"status": 400, "error": self.NOT_FOUND}})
+        report, deleted, _, _ = self._relayed_run(relay, profiles, identities)
+        self.assertEqual(deleted, [])
+        self.assertEqual(report["skipped_error"], ["cluster-odd"])
+
+    def test_an_answer_the_broker_could_not_project_goes_to_gcloud(self):
+        profiles, identities = self._profiles("a")
+        _, relay = self._relay(lists={self.MGMT: self._ok_list()},
+                               gets={self._key("a"): {"status": 502, "error": {"code": "UPSTREAM_UNEXPECTED"}}})
+        report, deleted, _, describes = self._relayed_run(relay, profiles, identities)
+        self.assertEqual(["a"], describes)
+        self.assertEqual(report["kept"], ["cluster-a"])
+
+    def test_a_helper_that_cannot_run_falls_back_to_gcloud(self):
+        profiles, identities = self._profiles("a")
+        report, _, lists, describes = self._relayed_run(lambda request, timeout: None, profiles, identities)
+        self.assertEqual(([self.MGMT], ["a"]), (lists, describes))
+        self.assertEqual(report["kept"], ["cluster-a"])
+
+    def test_a_batch_that_failed_in_the_relay_falls_back_to_gcloud(self):
+        # No HTTP answer, a 401, or the broker's own transport code on every row is the
+        # relay failing as a whole (an unreadable token, no broker), not an answer about
+        # the projects: gcloud lists and describes, as it would have before the relay.
+        for failed in ({"status": 0, "error": {"exception": "ConnectionError"}},
+                       {"status": 401, "error": {"error": "unauthorized"}},
+                       {"status": 503, "error": {"code": "RELAY_CREDENTIAL_UNAVAILABLE"}}):
+            with self.subTest(failed=failed):
+                profiles, identities = self._profiles("a")
+                _, relay = self._relay(lists={self.MGMT: failed})
+                report, deleted, lists, describes = self._relayed_run(
+                    relay, profiles, identities, lister={self.MGMT: ([], rec.OUTCOME_OK)})
+                self.assertEqual(([self.MGMT], ["a"]), (lists, describes))
+                self.assertEqual(report["projects"], {self.MGMT: rec.OUTCOME_OK})
+                self.assertEqual(deleted, [])
+
+    def test_one_call_google_did_not_answer_is_that_reads_unknown_and_the_relay_stays_on(self):
+        # The management project is a batch of one. An UPSTREAM_* answer comes after the
+        # broker accepted the read and is about that call to Google, so it is that list's
+        # failure, as a timed-out gcloud list is, and PRUNE still describes through the relay.
+        profiles, identities = self._profiles("a")
+        batches, relay = self._relay(
+            lists={self.MGMT: {"status": 504, "error": {"code": "UPSTREAM_TIMEOUT", "error": "upstream timed out"}}},
+            gets={self._key("a"): {"status": 200}})
+        report, deleted, lists, describes = self._relayed_run(relay, profiles, identities)
+        self.assertEqual(([], []), (lists, describes))
+        self.assertNotEqual(report["projects"][self.MGMT], rec.OUTCOME_OK)
+        self.assertEqual(deleted, [])
+        self.assertEqual(report["kept"], ["cluster-a"])
+        self.assertEqual(2, len(batches))
+
+    def test_calls_the_broker_was_slow_to_answer_are_unknown_and_the_relay_stays_on(self):
+        # A ReadTimeout means the broker took the connection: those reads are unknown, as
+        # UPSTREAM_TIMEOUT is, and PRUNE still describes through the relay.
+        profiles, identities = self._profiles("a")
+        batches, relay = self._relay(
+            lists={self.MGMT: {"status": 0, "error": {"exception": "ReadTimeout", "text": "read timed out"}}},
+            gets={self._key("a"): {"status": 200}})
+        report, deleted, lists, describes = self._relayed_run(relay, profiles, identities)
+        self.assertEqual(([], []), (lists, describes))
+        self.assertEqual(report["projects"][self.MGMT], rec.OUTCOME_UNREACHABLE)
+        self.assertEqual(report["kept"], ["cluster-a"])
+        self.assertEqual(2, len(batches))
+
+    def test_the_whole_batch_fallback_logs_why(self):
+        logged: list = []
+        profiles, identities = self._profiles("a")
+        _, relay = self._relay(lists={self.MGMT: {"status": 0, "error": {
+            "exception": "RuntimeError", "text": "CREDENTIAL_PROXY_URL is not set"}}})
+        with mock.patch.object(rec, "log", side_effect=logged.append):
+            self._relayed_run(relay, profiles, identities, lister={self.MGMT: ([], rec.OUTCOME_OK)})
+        self.assertTrue(any("CREDENTIAL_PROXY_URL is not set" in line and "not usable" in line for line in logged))
+
+    def test_a_describe_batch_that_failed_in_the_relay_falls_back_to_gcloud(self):
+        profiles, identities = self._profiles("a", "b")
+        _, relay = self._relay(lists={self.MGMT: self._ok_list()}, gets={
+            self._key("a"): {"status": 0, "error": {"exception": "ConnectTimeout"}},
+            self._key("b"): {"status": 401, "error": {"error": "unauthorized"}}})
+        report, deleted, lists, describes = self._relayed_run(relay, profiles, identities)
+        self.assertEqual([], lists)
+        self.assertEqual(["a", "b"], sorted(describes))
+        self.assertEqual(sorted(report["kept"]), ["cluster-a", "cluster-b"])
+
+    def test_the_helper_gets_a_share_of_the_budget_and_its_own_deadline_under_it(self):
+        # A stalled helper leaves gcloud the rest; the helper's own deadline sits under
+        # the wait, so a slow call is one row's "unknown" and the batch comes back whole.
+        with mock.patch.object(rec.time, "monotonic", return_value=1000.0):
+            wait, helper = rec._relay_budget(1100.0)
+            self.assertIsNone(rec._relay_budget(1000.0 + 2 * (rec.RELAY_MIN_BATCH_SECONDS + rec.RELAY_STARTUP_SECONDS) - 1))
+        self.assertEqual((100.0 * rec.RELAY_BUDGET_SHARE, 100.0 * rec.RELAY_BUDGET_SHARE - rec.RELAY_STARTUP_SECONDS),
+                         (wait, helper))
+        waits: list = []
+        profiles, identities = self._profiles("gone")
+        batches, relay = self._relay(lists={self.MGMT: self._ok_list()},
+                                     gets={self._key("gone"): {"status": 404, "error": self.NOT_FOUND}})
+
+        def timed(request, timeout):
+            waits.append(timeout)
+            return relay(request, timeout)
+        self._relayed_run(timed, profiles, identities)
+        self.assertEqual(2, len(batches))
+        for request, wait in zip(batches, waits):
+            self.assertLess(request["budget_seconds"], wait)
+
+    def test_a_spent_budget_skips_the_relay_and_leaves_it_on(self):
+        with mock.patch.object(rec, "_relay_reads", side_effect=AssertionError("relay tried")):
+            rec._relay_unusable_this_run = False
+            self.assertIsNone(rec._relay_lists(["p"], time.monotonic()))
+        self.assertFalse(rec._relay_unusable_this_run)
+
+    def test_a_read_the_broker_refused_alone_goes_to_gcloud_and_the_relay_stays_on(self):
+        # An over-cap list (a project with hundreds of clusters) and a path the table does
+        # not take are answers about one read: that read goes to gcloud, the batch's other
+        # answers stand, and PRUNE still describes through the relay.
+        profiles, identities = self._profiles("a", "b", "c")
+        identities["cluster-c"] = dict(identities["cluster-c"], project="p2")
+        batches, relay = self._relay(
+            lists={self.MGMT: {"status": 502, "error": {"code": "UPSTREAM_RESPONSE_TOO_LARGE"}},
+                   "p2": self._ok_list()},
+            gets={self._key("a"): {"status": 403, "error": {"code": "SECURITY_POLICY_BLOCKED", "rule": "gcp.api.path"}},
+                  self._key("b"): {"status": 200}, self._key("c", "p2"): {"status": 200}})
+        report, deleted, lists, describes = self._relayed_run(
+            relay, profiles, identities, lister={self.MGMT: ([], rec.OUTCOME_OK)}, scope={"projects": ["p2"]})
+        self.assertEqual([self.MGMT], lists)
+        self.assertEqual(["a"], describes)
+        self.assertEqual(deleted, [])
+        self.assertEqual(sorted(report["kept"]), ["cluster-a", "cluster-b", "cluster-c"])
+        self.assertTrue(any(b.get("clusters") for b in batches))
+
+    def test_a_malformed_identity_is_read_with_gcloud_not_the_relay(self):
+        # `x/../y`, `y?a=b` or `y#f` would reach the API as cluster `y`; such an identity is
+        # never put in a relay URL, and gcloud reads it as before.
+        profiles, identities = self._profiles("ok", "dots", "query", "frag")
+        identities["cluster-dots"] = dict(identities["cluster-dots"], cluster="x/../y")
+        identities["cluster-query"] = dict(identities["cluster-query"], cluster="y?a=b")
+        identities["cluster-frag"] = dict(identities["cluster-frag"], cluster="y#f")
+        batches, relay = self._relay(lists={self.MGMT: self._ok_list()}, gets={self._key("ok"): {"status": 200}})
+        report, deleted, _, describes = self._relayed_run(relay, profiles, identities)
+        self.assertEqual(["x/../y", "y#f", "y?a=b"], sorted(describes))
+        self.assertEqual([[self.MGMT, "us-central1", "ok"]], [c for b in batches for c in b.get("clusters", [])])
+        self.assertEqual(deleted, [])
+        self.assertFalse(rec._relayable("p", "us-central1", "a/b"))
+        self.assertTrue(rec._relayable("example.com:proj", "us-central1-a", "seeded-a"))
+
+    def test_a_read_the_helper_never_started_goes_to_gcloud(self):
+        profiles, identities = self._profiles("a", "b")
+        _, relay = self._relay(lists={self.MGMT: self._ok_list()}, gets={
+            self._key("a"): {"status": 0, "error": {"skipped": "budget"}},
+            self._key("b"): {"status": 200}})
+        report, _, _, describes = self._relayed_run(relay, profiles, identities)
+        self.assertEqual(["a"], describes)
+        self.assertEqual(sorted(report["kept"]), ["cluster-a", "cluster-b"])
+
+    def test_a_helper_out_of_time_costs_the_batch_and_one_that_cannot_run_the_run(self):
+        logged: list = []
+        broken = subprocess.CalledProcessError(1, ["python3"], output="",
+                                               stderr="Traceback ...\nModuleNotFoundError: No module named 'requests'\n")
+        with mock.patch.object(rec, "log", side_effect=logged.append):
+            for failure, off in ((subprocess.TimeoutExpired(["python3"], 30), False), (broken, True)):
+                with self.subTest(failure=type(failure).__name__), \
+                        mock.patch.object(rec.sandbox_exec, "run", side_effect=failure):
+                    rec._relay_unusable_this_run = False
+                    self.assertIsNone(_real_relay_reads({}, 30))
+                    self.assertEqual(off, rec._relay_unusable_this_run)
+        rec._relay_unusable_this_run = False
+        self.assertIn("No module named 'requests'", logged[-1])
+
+    def test_a_list_with_no_http_answer_is_logged_with_its_reason(self):
+        logged: list = []
+        with mock.patch.object(rec, "log", side_effect=logged.append):
+            self.assertEqual((None, rec.OUTCOME_UNREACHABLE),
+                             rec._read_list("p2", {"status": 0, "error": {"exception": "ConnectTimeout"}}))
+        self.assertIn("p2", logged[0])
+        self.assertIn("ConnectTimeout", logged[0])
+
+
 class ProjectSourceTest(unittest.TestCase):
     """The management project comes from the operator before the metadata server.
 
@@ -3163,6 +3649,176 @@ class ProjectSourceTest(unittest.TestCase):
                     mock.patch.object(rec, "_project_id_of", return_value=(None, outcome)), \
                     mock.patch.object(rec.sandbox_exec, "run", side_effect=AssertionError("gcloud config asked")):
                 self.assertEqual(rec._project_source(), (None, False))
+
+    def test_the_gcloud_config_fallback_tells_the_shim_a_deadline_under_which_no_retry_fits(self):
+        # With no operator project the fallback asks the broker's gcloud config under a
+        # 30 s cap, which holds no admission wait; the watermark gate's 429 chain would
+        # still carry it past the cap on a high Retry-After draw, so the lookup passes
+        # its cap less the broker's gcloud run bound and a refusal fails at once.
+        client = rec.credential_proxy_client
+        with mock.patch.dict(os.environ, {"GKE_PROJECT_ID": "", "RECONCILE_PROJECT": ""}), \
+                mock.patch.object(rec.sandbox_exec, "run", return_value=mock.Mock(stdout="from-config\n")) as run:
+            self.assertEqual(rec._project_source(), ("from-config", False))
+        self.assertEqual(run.call_args.args[0], ["gcloud", "config", "get-value", "project"])
+        self.assertEqual(run.call_args.kwargs["timeout"], rec.PROJECT_LOOKUP_TIMEOUT_SECONDS)
+        deadline = rec.PROJECT_LOOKUP_SHIM_RETRY_DEADLINE_SECONDS
+        self.assertEqual(max(0, rec.PROJECT_LOOKUP_TIMEOUT_SECONDS - rec.BROKER_GCLOUD_RUN_SECONDS), deadline)
+        self.assertEqual({client.RETRY_DEADLINE_ENV: "0"}, run.call_args.kwargs["remote_env"])
+        shortest = client.BROKER_ADMISSION_WAIT_SECONDS + client.RETRY_JITTER_FLOOR * client.RETRY_BACKOFF_BASE_SECONDS
+        self.assertGreater(shortest, deadline)
+        self.assertIsNone(client.retry_wait(1, 0.0, None, random.Random(1), lambda: 0.0, deadline=float(deadline)))
+        self.assertIsNone(client.retry_wait(1, 0.0, "5", random.Random(1), lambda: 0.0, deadline=float(deadline)))
+
+
+class CreateCapTest(unittest.TestCase):
+    """The per-run create cap: a fleet too large for one run arrives in batches.
+
+    The bootstrap gate runs this script under a ceiling and SIGKILLs it on expiry,
+    so a run that tries to scaffold every missing profile at once on a large fleet
+    dies mid-run every tick. The cap bounds the run; the rest is deferred to the
+    next one, which finds those clusters still without a profile. Under
+    `--require-create-pass` a run that deferred exits EXIT_CREATES_DEFERRED, which
+    the gate reads as "ask again", never as a failed attempt.
+    """
+
+    CAP = 100
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.created: list[str] = []
+        self.clusters = [("p", f"c{i:03d}", "us-central1") for i in range(250)]
+
+    def _identity_of(self, home: Path):
+        name = home.name
+        if name not in self.created:
+            return None
+        return _identity(cluster=name[len("cluster-"):])
+
+    def _run(self, argv=("x", "--require-create-pass"), create=None, dry_run=False):
+        """One reconcile over the fleet, with the profiles earlier runs made still there.
+
+        Returns (exit code or None, report); `create` may replace the scaffold stub.
+        """
+        report: dict = {}
+        real = rec.reconcile
+
+        def recording(dry_run=False):
+            report.update(real(dry_run=dry_run))
+            return report
+
+        def scaffold(pr, c, l):
+            name = f"cluster-{c}"
+            self.created.append(name)
+            return name
+
+        with mock.patch.dict(os.environ, {"HERMES_HOME": self.tmp}), \
+             mock.patch.object(rec, "MAX_CREATES_PER_RUN", self.CAP), \
+             mock.patch.object(rec, "list_profiles", side_effect=lambda: list(self.created)), \
+             mock.patch.object(rec, "profile_home", side_effect=lambda name: Path(self.tmp) / name), \
+             mock.patch.object(rec, "read_cluster_identity", side_effect=self._identity_of), \
+             mock.patch.object(rec, "_scaffold_gaps", return_value=[]), \
+             mock.patch.object(rec, "_project_source", return_value=("p", True)), \
+             mock.patch.object(rec, "_list_project", return_value=_listing(self.clusters)), \
+             mock.patch.object(rec, "_cluster_exists", return_value=True), \
+             mock.patch.object(rec, "delete_profile", side_effect=AssertionError("nothing is pruned here")), \
+             mock.patch.object(rec, "create_profile", side_effect=create or scaffold), \
+             mock.patch.object(rec, "reconcile", side_effect=recording), \
+             mock.patch.object(rec.sys, "argv", list(argv) + (["--dry-run"] if dry_run else [])), \
+             mock.patch.object(rec, "_notify"), \
+             mock.patch.object(rec, "log"):
+            try:
+                rec.main()
+            except SystemExit as e:
+                return e.code, report
+        return None, report
+
+    def test_250_missing_clusters_arrive_100_100_50_over_three_runs(self):
+        outcomes = [self._run() for _ in range(3)]
+        self.assertEqual([code for code, _ in outcomes], [rec.EXIT_CREATES_DEFERRED, rec.EXIT_CREATES_DEFERRED, None])
+        self.assertEqual([len(report["created"]) for _, report in outcomes], [100, 100, 50])
+        self.assertEqual([len(report["create_deferred"]) for _, report in outcomes], [150, 50, 0])
+        self.assertEqual(len(set(self.created)), 250, "a cluster was scaffolded twice or not at all")
+        # The deferred list names the clusters the next run will take, in listing order.
+        self.assertEqual(outcomes[0][1]["create_deferred"][:2], ["c100/us-central1", "c101/us-central1"])
+        self.assertEqual(outcomes[0][1]["create_failed"], [])
+
+    def test_a_run_under_the_cap_defers_nothing_and_exits_zero(self):
+        self.clusters = self.clusters[:self.CAP]
+        code, report = self._run()
+        self.assertIsNone(code)
+        self.assertEqual(len(report["created"]), self.CAP)
+        self.assertEqual(report["create_deferred"], [])
+
+    def test_failed_creates_do_not_take_a_place_in_the_batch(self):
+        # Every create fails: all 250 are attempted, as they were before the cap, none is
+        # deferred, and the exit is the failed-roster one, which the gate counts as an
+        # attempt and can give up on.
+        def failing(pr, c, l):
+            raise SystemExit("ERROR: failed to fetch credentials")
+
+        code, report = self._run(create=failing)
+        self.assertEqual(len(report["create_failed"]), 250)
+        self.assertEqual(report["create_deferred"], [])
+        self.assertEqual(code, rec.EXIT_CREATE_PASS_SKIPPED)
+
+    def test_a_failing_batch_beside_a_kept_profile_does_not_starve_the_rest(self):
+        # The starvation shape: one profile already on the roster, the first hundred clusters
+        # in listing order fail for good, and the rest can be made. The failures must not
+        # fill the batch, or the rest would be deferred on every run, each run exiting 5,
+        # and the gate would wait forever without spending an attempt.
+        self.created.append("cluster-kept")
+        self.clusters = [("p", "kept", "us-central1")] + self.clusters[:150]
+        scaffolded: list[str] = []
+
+        def failing_first_hundred(pr, c, l):
+            if int(c[1:]) < 100:
+                raise SystemExit("ERROR: failed to fetch credentials")
+            name = f"cluster-{c}"
+            self.created.append(name)
+            scaffolded.append(name)
+            return name
+
+        code, report = self._run(create=failing_first_hundred)
+        self.assertEqual(len(report["create_failed"]), 100)
+        self.assertEqual(len(scaffolded), 50, "the clusters behind the failing ones were never tried")
+        self.assertEqual(report["create_deferred"], [])
+        self.assertIsNone(code, "a partial failure beside a scaffolded roster reconciles, as before the cap")
+
+    def test_the_cron_path_exits_zero_and_defers_the_same(self):
+        code, report = self._run(argv=("x",))
+        self.assertIsNone(code)
+        self.assertEqual((len(report["created"]), len(report["create_deferred"])), (100, 150))
+
+    def test_a_dry_run_shows_the_cap_and_names_the_deferred(self):
+        code, report = self._run(dry_run=True)
+        self.assertEqual(code, rec.EXIT_CREATES_DEFERRED)
+        self.assertEqual(self.created, [], "a dry run scaffolded a profile")
+        self.assertEqual((len(report["created"]), len(report["create_deferred"])), (100, 150))
+
+    def test_the_notification_names_the_deferred_and_counts_the_rest(self):
+        text = rec._format_notification({"created": ["cluster-a"],
+                                         "create_deferred": [f"c{i}/us-central1" for i in range(rec.NOTIFY_UNLISTED_LIMIT + 2)]})
+        self.assertIn(f"{rec.NOTIFY_UNLISTED_LIMIT + 2} cluster(s) deferred to the next run", text)
+        self.assertIn("and 2 more", text)
+
+    def test_the_cap_is_read_from_the_environment_and_falls_back_on_nonsense(self):
+        # Read at import, so each value is checked in a fresh interpreter.
+        def cap_under(value):
+            env = {k: v for k, v in os.environ.items() if k != rec.MAX_CREATES_PER_RUN_ENV}
+            if value is not None:
+                env[rec.MAX_CREATES_PER_RUN_ENV] = value
+            proc = subprocess.run(
+                [sys.executable, "-c", "import cluster_agent_reconcile as r; print(r.MAX_CREATES_PER_RUN)"],
+                cwd=Path(__file__).parent, capture_output=True, text=True, env=env, timeout=120)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            return int(proc.stdout.strip())
+
+        self.assertEqual(cap_under(None), rec.MAX_CREATES_PER_RUN_DEFAULT)
+        self.assertEqual(cap_under("25"), 25)
+        for nonsense in ("", "many", "0", "-3"):
+            with self.subTest(value=nonsense):
+                self.assertEqual(cap_under(nonsense), rec.MAX_CREATES_PER_RUN_DEFAULT)
 
 
 if __name__ == "__main__":

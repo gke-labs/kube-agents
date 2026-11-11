@@ -58,6 +58,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
 import command_policy  # noqa: E402
 import credential_proxy  # noqa: E402
 import mcp_policy  # noqa: E402
+import task_confinement  # noqa: E402
 import watcher_policy  # noqa: E402
 
 # The name the gateway redactor is registered under in sys.modules when a test
@@ -191,6 +192,14 @@ SOURCES: dict[str, Source] = {
         ("buildCredentialBrokerTokenReviewRole", "tokenreviews", "mcpRelayURLEnvVar", "mcpRelayPath =",
          "driftDetectorDefaultSubscription =", "credentialProxyWatcherAudience ="),
     ),
+    "kube_proxy_manifests_go": Source(
+        "k8s-operator/internal/controller/kube_proxy_manifests.go",
+        ("func buildKubeProxyDeployment(", "CREDENTIAL_PROXY_SESSION_AUDIENCE", "CREDENTIAL_PROXY_SESSION_CALLERS"),
+    ),
+    "k8s_api_proxy_main_go": Source(
+        "k8s-api-proxy/cmd/k8s-api-proxy/main.go",
+        ("sessionAudienceEnv", "sessionCallersEnv", "func parseSessionAudienceCallers("),
+    ),
     "manifest_helpers_go": Source(
         "k8s-operator/internal/controller/manifest_helpers.go",
         ("DefaultPlatformAgentVersion",),
@@ -230,6 +239,14 @@ SOURCES: dict[str, Source] = {
     "chart_admission_policy": Source(
         "charts/kube-agents/templates/agent-rbac-admission-policy.yaml",
         ("policyName",),
+    ),
+    "gateway_pod_policy": Source(
+        "k8s-operator/config/admission/a2a-gateway-pod-policy.yaml",
+        ("kube-agents-a2a-gateway-pod", "failurePolicy", "variables.sessionAccount"),
+    ),
+    "chart_gateway_pod_policy": Source(
+        "charts/kube-agents/templates/a2a-gateway-pod-admission-policy.yaml",
+        ("kube-agents.a2aGatewayPodPolicyEnabled", "policyName"),
     ),
     # --- rendered output the operator is asserted against -----------------
     "shell_sandbox_manifests_go": Source(
@@ -290,7 +307,8 @@ SOURCES: dict[str, Source] = {
     # The A2A gateway's rendered ingress: its three fences and the gateway
     # container's declared ports, written by an operator Go test
     # (TestRenderedA2AGatewayIngressMatchesTheConformanceFixture) because no
-    # golden renders mode next. The anchors are the collector's namespace and
+    # golden renders mode next with both doors armed (the next-mode golden is
+    # the example CR, which arms neither). The anchors are the collector's namespace and
     # the metrics port's name: lose either and C1's assertion has nothing to
     # hold the fences to.
     "a2a_gateway_ingress_fixture": Source(
@@ -380,18 +398,26 @@ SOURCES: dict[str, Source] = {
         "a2a/gateway/spawn.go",
         ("partOfValue", "sessionRole", "AutomountServiceAccountToken", "credentialProxySessionAudience"),
     ),
-    # The broker's shim, which the worker image carries as kubectl/gcloud and
-    # the spawner configures through three env names it spells itself.
+    # The broker's shim, which the worker image carries as gcloud (alongside
+    # stock kubectl wired to kube-proxy) and the spawner configures through env
+    # names it spells itself.
     "credential_proxy_client": Source(
         "agents/platform/scripts/credential_proxy_client.py",
-        ("CREDENTIAL_PROXY_URL", "CREDENTIAL_PROXY_TOKEN_FILE", "HERMES_HOME"),
+        ("CREDENTIAL_PROXY_URL", "CREDENTIAL_PROXY_TOKEN_FILE", "HERMES_HOME", "KUBE_PROXY_URL", "KUBE_PROXY_CA_FILE", "KUBE_PROXY_HOST_CONTEXT"),
     ),
     # The gateway's env contract with the operator (module a2a reading what
     # module k8s-operator renders). C1 pins the cluster-view names across the
-    # boundary; the anchors are the two names and a long-standing neighbour.
+    # boundary; the anchors are the cluster-view names and a long-standing neighbour.
     "a2a_gateway_config": Source(
         "a2a/gateway/config.go",
-        ("A2A_DEFAULT_ADDRESSEE", "A2A_SESSION_CLUSTER_VIEW", "A2A_CREDENTIAL_PROXY_URL"),
+        (
+            "A2A_DEFAULT_ADDRESSEE",
+            "A2A_SESSION_CLUSTER_VIEW",
+            "A2A_CREDENTIAL_PROXY_URL",
+            "A2A_KUBE_PROXY_URL",
+            "A2A_KUBE_PROXY_CA_CONFIGMAP",
+            "A2A_KUBE_PROXY_HOST_CONTEXT",
+        ),
     ),
     # The platform agent's allowlists as the gateway reads them: the per-target
     # check a session's delegation is held to. The names cross the module
@@ -449,6 +475,14 @@ SOURCES: dict[str, Source] = {
     # file also holds one half of a contract neither module can import: the
     # operator renders an env var naming the agent's principal, and the `a2a`
     # CLI reads it back to pin its inbox prefix.
+    # The AgentProfile dispatcher's identity is built in its own file. It
+    # authenticates through the callout, so it is in no served config, and
+    # its publish list is appended to a per-profile slice that the identity
+    # reader above can't parse; the writer tests read its body directly.
+    "a2a_dispatcher": Source(
+        "k8s-operator/internal/controller/platformagent_a2a_dispatcher.go",
+        ("func dispatcherIdentity(", "a2a.dispatch.*.*.*"),
+    ),
     "a2a_identities": Source(
         "k8s-operator/internal/controller/platformagent_a2a_identities.go",
         (
@@ -589,7 +623,7 @@ SOURCES: dict[str, Source] = {
     # test can hold them equal.
     "a2a_worker_adapter_mcp": Source(
         "a2a/worker-adapter/mcp.go",
-        ("var delegateToolSchema", '"required": []string{"addressee", "text"}'),
+        ("func delegateToolSchema(", '"required": []string{"addressee", "text"}'),
     ),
     # The gateway's side of the delegate artifact: the switch that routes it
     # off the ordinary chat-rendering path, and the gateway's own copy of the

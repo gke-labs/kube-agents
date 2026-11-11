@@ -106,6 +106,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess  # noqa: F401 -- the tests patch subprocess.run through this module's name
 import sys
 import time
@@ -127,16 +128,14 @@ CHECKS_REVISION = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[
 ]
 
 DEFAULT_TIMEOUT_S = 60
-# How many projects this audit reads at once. Each is a run of gcloud compute
-# reads through the credential proxy, which admits four requests at once under
-# its child memory budget at the operator's default 1Gi limit
-# (docs/designs/credential-proxy-child-memory-budget.md §2.2). A wider pool only
-# queues the rest at the proxy, where a read still waiting at its 60 s admission
-# bound is refused busy, or hits DEFAULT_TIMEOUT_S here first and reads its
-# project as gate-failed -- the SOP's cue to re-read it by hand through the same
-# proxy. So the pool is the admitted count, as the fleet-audit collectors and
-# stall_watch.py's and cluster_agent_reconcile.py's listing pools are.
-MAX_WORKERS = 4
+# How many projects this audit reads at once: broker_admission.sweep_width(),
+# resolved in collect_fleet. Each project is a run of gcloud compute reads
+# through the credential broker, and a pool wider than the broker admits only
+# queues the rest, where a read still waiting at its 60 s admission bound is
+# refused busy, or hits DEFAULT_TIMEOUT_S here first and reads its project as
+# gate-failed -- the SOP's cue to re-read it by hand through the same broker.
+# The fleet-audit collectors resolve the same width (collect.py has the
+# reasoning).
 # `audit_report.validate_check_command`'s ceiling, restated rather than
 # imported because this script ships standalone. An over-length `command` is
 # not a clipped field: `finish` refuses the whole document, so a project with
@@ -202,6 +201,7 @@ for _shared_dir in SHARED_SCRIPT_DIRS:
         sys.path.append(_shared_dir)
 import fleet_scope_args  # noqa: E402
 import collector_run  # noqa: E402
+import broker_admission  # noqa: E402
 
 # The scope this collector was handed, set by main from the scope flags.
 declared_scope = fleet_scope_args.DeclaredScope()
@@ -263,6 +263,24 @@ SNAPSHOT_SCHEDULE_KEYS = ("sourceSnapshotSchedulePolicy", "sourceSnapshotSchedul
 
 # §2.4's threshold, as a percentage of the node group's aggregate capacity.
 SOLE_TENANT_UTILISATION_PCT = 90
+
+# `--format=json(...)` projections of the five list reads, each the fields
+# its reader names in the contract above and nothing else. An instance's
+# whole resource (network interfaces, disks, labels, scheduling, shielded-VM
+# config) is tens of times the four fields §2.1 reads, and a project with
+# thousands of instances took the list past the credential proxy's output cap;
+# the projection keeps the reply and this process at a few fields per object.
+# A field under a list is spelled through it with `[]`: in a `json()`
+# projection a plain dotted component applied to a list projects nothing (the
+# implicit map over a list is `--filter`'s and `value()`'s, not the JSON
+# printer's), and `metadata.items.key` would drop `metadata` from every item,
+# so §2.1 would read no console on any project whose common metadata sets no
+# startup script.
+INSTANCES_FORMAT = "--format=json(name,status,zone,metadata.items[].key)"
+MIGS_FORMAT = "--format=json(name,size,targetSize,status,currentActions,zone,region)"
+NODE_GROUPS_FORMAT = "--format=json(name,size,zone,region,autoscalingPolicy)"
+DISKS_FORMAT = "--format=json(name,selfLink)"
+SNAPSHOTS_FORMAT = "--format=json(name,sourceDisk,creationTimestamp,sourceSnapshotSchedulePolicy,sourceSnapshotSchedulePolicyId)"
 
 # The two `NodeGroup.autoscalingPolicy.mode` values that actually add nodes, out
 # of the four the Compute v1 discovery document defines. The other two --
@@ -1184,13 +1202,13 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
                 f"{slug}: {' '.join(argv)} returned "
                 f"{type(parsed).__name__}, not a JSON array"
             )
-        reads.setdefault(slug, SlugReads()).add(" ".join(argv), result)
+        reads.setdefault(slug, SlugReads()).add(shlex.join(argv), result)
         return parsed
 
     try:
         # --- 2.1 startup script failures ---------------------------------- #
         instances = gated(
-            ["gcloud", "compute", "instances", "list", "--project", project, "--format=json"],
+            ["gcloud", "compute", "instances", "list", "--project", project, INSTANCES_FORMAT],
             STARTUP_SLUG,
         )
         running = running_instances(instances)
@@ -1210,7 +1228,7 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
         ]
         info_parsed, info_result = run_and_gate(info_argv, run=run)
         if isinstance(info_parsed, dict):
-            reads.setdefault(STARTUP_SLUG, SlugReads()).add(" ".join(info_argv), info_result)
+            reads.setdefault(STARTUP_SLUG, SlugReads()).add(shlex.join(info_argv), info_result)
         project_wide = (
             True
             if not isinstance(info_parsed, dict)
@@ -1233,9 +1251,9 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
                 unread.append(f"{instance_name} ({zone})")
                 continue
             hit = check_startup_script(instance_name, zone, result.stdout)
-            reads.setdefault(STARTUP_SLUG, SlugReads()).add(" ".join(argv), result)
+            reads.setdefault(STARTUP_SLUG, SlugReads()).add(shlex.join(argv), result)
             if hit:
-                candidates.append(_emit(STARTUP_SLUG, hit, " ".join(argv)))
+                candidates.append(_emit(STARTUP_SLUG, hit, shlex.join(argv)))
 
         if not instances:
             not_applicable.append(
@@ -1279,7 +1297,7 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
         migs = gated(
             [
                 "gcloud", "compute", "instance-groups", "managed", "list",
-                "--project", project, "--format=json",
+                "--project", project, MIGS_FORMAT,
             ],
             MIG_SLUG,
         )
@@ -1297,7 +1315,7 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
         groups = gated(
             [
                 "gcloud", "compute", "sole-tenancy", "node-groups", "list",
-                "--project", project, "--format=json",
+                "--project", project, NODE_GROUPS_FORMAT,
             ],
             SOLE_TENANT_SLUG,
         )
@@ -1334,13 +1352,13 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
                 if not isinstance(parsed, list):
                     unmeasured.append(f"{group_name} ({_scope_of(group)})")
                     continue
-                reads.setdefault(SOLE_TENANT_SLUG, SlugReads()).add(" ".join(nodes_argv), result)
+                reads.setdefault(SOLE_TENANT_SLUG, SlugReads()).add(shlex.join(nodes_argv), result)
                 hit, measured = check_sole_tenant_headroom(group, parsed)
                 measured_any = measured_any or measured
                 if not measured:
                     unmeasured.append(f"{group_name} ({_scope_of(group)})")
                 if hit:
-                    candidates.append(_emit(SOLE_TENANT_SLUG, hit, " ".join(nodes_argv)))
+                    candidates.append(_emit(SOLE_TENANT_SLUG, hit, shlex.join(nodes_argv)))
             if not measured_any:
                 unevaluated.append(
                     {
@@ -1364,11 +1382,11 @@ def collect_project(project: str, *, run: RunFn = default_run) -> dict | None:
         # check and no sign that the other had been abandoned. It is now what
         # it is — a read that failed, and a project the run could not cover.
         disks = gated(
-            ["gcloud", "compute", "disks", "list", "--project", project, "--format=json"],
+            ["gcloud", "compute", "disks", "list", "--project", project, DISKS_FORMAT],
             SNAPSHOT_SLUG,
         )
         snapshots = gated(
-            ["gcloud", "compute", "snapshots", "list", "--project", project, "--format=json"],
+            ["gcloud", "compute", "snapshots", "list", "--project", project, SNAPSHOTS_FORMAT],
             SNAPSHOT_SLUG,
         )
         active = active_disk_index(disks)
@@ -1490,8 +1508,9 @@ def collect_fleet(
     project: str | None = None,
     *,
     run: RunFn = default_run,
-    max_workers: int = MAX_WORKERS,
+    max_workers: int | None = None,
 ) -> dict:
+    max_workers = max_workers or broker_admission.sweep_width()
     started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     notes: list[str] = []
     projects = get_target_projects(project, notes, run=run)

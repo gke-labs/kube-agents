@@ -350,8 +350,7 @@ def rightsizing_rule(
         metadata = {**(metadata or {}), METADATA_KEY: stored}
     if not shown:
         return [], result, metadata
-    section = render(shown, hidden)
-    return [], (f"{body}\n\n{section}" if body else section), metadata
+    return [], gate.append_section(result, render(shown, hidden)), metadata
 
 
 def apply_schema(schema: dict) -> dict:

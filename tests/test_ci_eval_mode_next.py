@@ -357,8 +357,8 @@ class NextModeRecordsUnderItsOwnKeyTest(unittest.TestCase):
 
     def test_the_record_step_says_why_a_today_lane_periodic_did_not_record(self) -> None:
         """The record step's else-chain, run with the recorder stubbed: the
-        today lane's periodic logs its line and never calls bench-gate; a
-        flagged periodic without it records, as the unflagged one does; a
+        hypothetical today-lane periodic on main logs its line and never
+        calls bench-gate; a flagged periodic without it records, as the unflagged one does; a
         flagged presubmit keeps the line PULL_NUMBER already earned it."""
         for mode_next, rollback, job_type, pull, expect_record, expect_line in (
             ("1", "1", "periodic", "", False, "Today-lane run (EVAL_ROLLBACK_LANE=1, JOB_TYPE=periodic): the baseline store is read, never written"),

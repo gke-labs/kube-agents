@@ -26,7 +26,8 @@ hard enum — add new types by PR):
 
 An entry of any type may also carry `declares:`, a list of `{check, namespace, object}` items (`namespace: ""`
 written out for a cluster-scoped object; plus `cluster` for a one-cluster choice, as the qualified `<project>/<location>/<name>` every stream's
-findings carry) naming a posture a declaring audit stream (`obtainability-audit`, `compliance-audit`, `security-patch-orchestrator`, `fleet-wide-cost-analysis`) lists under
+findings carry, and `expires`, a `YYYY-MM-DD` UTC date that is the last day the item stands: past it the posture
+returns as a finding with a _Declared intent expired_ line naming the note and the date) naming a posture a declaring audit stream (`obtainability-audit`, `compliance-audit`, `security-patch-orchestrator`, `fleet-wide-cost-analysis`, `stockout-prevention`) lists under
 _Declared intent_ instead of reporting (`../README.md`, "Declared intent").
 
 ## Entries

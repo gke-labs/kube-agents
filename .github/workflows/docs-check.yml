@@ -30,9 +30,23 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The upgrade-table check reads the commits that added each row and
+          # the release tags; fetch-depth 0 fetches all history and tags, and a
+          # shallow, tagless clone would fail it.
+          fetch-depth: 0
 
-      # Tables that mirror jobs.json, images.json, the skill frontmatter, or
-      # the provisioning scripts must match their source.
+      # The install footprint tables are rendered from the chart. Pinned to
+      # the action commit and helm release chart-check uses (validate.yml), so
+      # the two cannot render the chart differently.
+      - name: Set up Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: v4.2.3
+
+      # Tables that mirror jobs.json, images.json, the skill frontmatter, the
+      # provisioning scripts, the operator's Go source or the chart must match
+      # their source.
       - name: Generated tables are current
         run: make docs-check-generated
 
@@ -67,3 +81,18 @@ jobs:
       # days before anyone noticed.
       - name: Agent instruction files fit the context budget
         run: make docs-check-context-budget
+
+      # A template section that says "otherwise delete this section" draws a
+      # description thread on every pull request that obeys it, because the
+      # readers hold a body to every heading (.agents/rules/pre_pr_review.md).
+      # A conditional section names the one-line answer the rest write instead.
+      - name: Every pull-request template section is answerable
+        run: make docs-check-pr-template
+
+      # Each row of the upgrade page's breaking-changes table names the release
+      # an operator first meets the change in, or says `pending` until that
+      # release ships. A label written before its release is cut can name a
+      # release that was cut from an earlier commit; once that release is
+      # tagged, the row must be in it, and a `pending` row must be relabelled.
+      - name: Upgrade-table rows name a release that contains them
+        run: make docs-check-upgrade-releases

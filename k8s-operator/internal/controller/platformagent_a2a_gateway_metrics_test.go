@@ -46,7 +46,8 @@ import (
 // ports, nothing else. The conformance suite reads it
 // (tests/conformance, C1) to hold the policies to "the collector and the
 // operator, on the metrics port, and nobody else": the suite cannot run Go, and no golden
-// renders mode next, so this file is the contract between the two.
+// renders mode next with both doors armed (the next-mode golden is the example
+// CR, which arms neither), so this file is the contract between the two.
 //
 // Compared as parsed YAML, as the goldens are, because the file is kept in
 // prettier's style for CI's prettier check and the marshaller's is not.
@@ -155,6 +156,34 @@ func TestTheA2AGatewayDeclaresItsMetricsListener(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// The gateway is not ready until its event relay binds (a2a/gateway's
+// ReadyzPath on the metrics listener), so the Deployment shows a gateway
+// waiting for the provision Job's TASKS stream instead of a crash loop. The
+// probe is served by the gateway's own listener on its named port, and
+// Recreate is what keeps it from opening a gap in a roll.
+func TestTheA2AGatewayIsReadyOnlyOnceItsRelayBinds(t *testing.T) {
+	dep := buildA2AGatewayDeployment(a2aTestAgent())
+	c := dep.Spec.Template.Spec.Containers[0]
+	if c.ReadinessProbe == nil || c.ReadinessProbe.HTTPGet == nil {
+		t.Fatalf("the gateway container has no HTTP readinessProbe: %+v", c.ReadinessProbe)
+	}
+	get := c.ReadinessProbe.HTTPGet
+	if get.Path != "/readyz" || get.Port.String() != a2aGatewayMetricsPortName {
+		t.Errorf("readinessProbe GET %s on %s, want /readyz on %s", get.Path, get.Port.String(), a2aGatewayMetricsPortName)
+	}
+	if c.LivenessProbe != nil {
+		t.Errorf("a liveness probe would restart a gateway that is only waiting for TASKS: %+v", c.LivenessProbe)
+	}
+	if dep.Spec.Strategy.Type != appsv1.RecreateDeploymentStrategyType {
+		t.Errorf("strategy %s: the probe was argued safe under Recreate", dep.Spec.Strategy.Type)
+	}
+	// A wait for TASKS past the 600s default would read ProgressDeadlineExceeded
+	// and end every `kubectl rollout status` early.
+	if pd := dep.Spec.ProgressDeadlineSeconds; pd == nil || *pd < 1800 {
+		t.Errorf("progressDeadlineSeconds %v: a gateway waiting on a slow provision Job outlives the 600s default", pd)
 	}
 }
 
@@ -399,7 +428,7 @@ func TestTheA2AGatewayFenceComesAndGoesWithTheGateway(t *testing.T) {
 		agent := a2aTestAgent()
 		r, cl, _ := a2aGateTestReconciler(t, agent)
 		theCalloutIsServing(t, ctx, cl, r, agent)
-		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 			t.Fatal(err)
 		}
 		gatewayRendered(t, cl, agent)
@@ -417,7 +446,7 @@ func TestTheA2AGatewayFenceComesAndGoesWithTheGateway(t *testing.T) {
 		agent := gchatTestAgent("next", true)
 		r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
 		theCalloutIsServing(t, ctx, cl, r, agent)
-		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 			t.Fatal(err)
 		}
 		gatewayRendered(t, cl, agent)
@@ -430,7 +459,7 @@ func TestTheA2AGatewayFenceComesAndGoesWithTheGateway(t *testing.T) {
 		agent := a2aTestAgent()
 		r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
 		theCalloutIsServing(t, ctx, cl, r, agent)
-		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 			t.Fatal(err)
 		}
 		gatewayRendered(t, cl, agent)
@@ -450,7 +479,7 @@ func TestTheA2AGatewayFenceComesAndGoesWithTheGateway(t *testing.T) {
 		agent := a2aTestAgent()
 		r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
 		theCalloutIsServing(t, ctx, cl, r, agent)
-		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 			t.Fatal(err)
 		}
 		gatewayRendered(t, cl, agent)
@@ -462,7 +491,7 @@ func TestTheA2AGatewayFenceComesAndGoesWithTheGateway(t *testing.T) {
 		t.Setenv(a2aAgentDoorEnvVar, "")
 		agent := a2aTestAgent()
 		r, cl, _ := a2aGateTestReconciler(t, agent)
-		state, err := r.reconcileA2A(ctx, agent)
+		state, err := r.reconcileA2A(ctx, agent, homeChannelRecord{})
 		if err != nil || !state.gatewayHeld {
 			t.Fatalf("precondition: want a held gateway (state=%+v err=%v)", state, err)
 		}
@@ -480,13 +509,13 @@ func TestTheA2AGatewayFenceComesAndGoesWithTheGateway(t *testing.T) {
 		agent := a2aTestAgent()
 		r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
 		theCalloutIsServing(t, ctx, cl, r, agent)
-		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 			t.Fatal(err)
 		}
 		gatewayRendered(t, cl, agent)
 		assertA2AGatewayFence(t, ctx, cl, agent)
 		t.Setenv(a2aInjectBackendEnvVar, "")
-		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 			t.Fatal(err)
 		}
 		dep := &appsv1.Deployment{}
@@ -510,7 +539,7 @@ func TestTheA2AGatewayFenceComesAndGoesWithTheGateway(t *testing.T) {
 		agent := a2aTestAgent()
 		r, cl, _ := a2aGateTestReconcilerWithoutABackend(t, agent)
 		theCalloutIsServing(t, ctx, cl, r, agent)
-		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 			t.Fatal(err)
 		}
 		gatewayRendered(t, cl, agent)
@@ -530,7 +559,7 @@ func TestTheA2AGatewayFenceComesAndGoesWithTheGateway(t *testing.T) {
 		gatewayKey := types.NamespacedName{Name: a2aGatewayName(agent), Namespace: agent.Namespace}
 		r.APIReader = cl
 		r.Client = staleDeploymentClient{Client: cl, key: gatewayKey}
-		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 			t.Fatal(err)
 		}
 		dep := &appsv1.Deployment{}
@@ -552,7 +581,7 @@ func TestTheA2AGatewayFenceComesAndGoesWithTheGateway(t *testing.T) {
 		agent := a2aTestAgent()
 		r, cl, _ := a2aGateTestReconciler(t, agent)
 		theCalloutIsServing(t, ctx, cl, r, agent)
-		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 			t.Fatal(err)
 		}
 		gatewayRendered(t, cl, agent)
@@ -562,7 +591,7 @@ func TestTheA2AGatewayFenceComesAndGoesWithTheGateway(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		state, err := r.reconcileA2A(ctx, agent)
+		state, err := r.reconcileA2A(ctx, agent, homeChannelRecord{})
 		if err != nil || !state.gatewayHeld {
 			t.Fatalf("precondition: want a held pass (state=%+v err=%v)", state, err)
 		}
@@ -580,7 +609,7 @@ func TestTheA2AGatewayFenceComesAndGoesWithTheGateway(t *testing.T) {
 		agent := a2aTestAgent()
 		r, cl, _ := a2aGateTestReconciler(t, agent)
 		theCalloutIsServing(t, ctx, cl, r, agent)
-		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 			t.Fatal(err)
 		}
 		gatewayRendered(t, cl, agent)
@@ -615,7 +644,7 @@ func TestTheA2AGatewayFenceComesAndGoesWithTheGateway(t *testing.T) {
 		agent := a2aTestAgent()
 		r, cl, _ := a2aGateTestReconciler(t, agent)
 		theCalloutIsServing(t, ctx, cl, r, agent)
-		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 			t.Fatal(err)
 		}
 		gatewayRendered(t, cl, agent)
@@ -704,7 +733,7 @@ func TestTheA2AGatewayFenceIsAppliedOncePerPass(t *testing.T) {
 	want := []string{"fence", "deployment"}
 	for _, pass := range []string{"first render", "running install"} {
 		applies = nil
-		if _, err := r.reconcileA2A(ctx, agent); err != nil {
+		if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 			t.Fatalf("%s: reconcileA2A: %v", pass, err)
 		}
 		if !reflect.DeepEqual(applies, want) {

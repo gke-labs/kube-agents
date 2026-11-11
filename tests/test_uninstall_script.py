@@ -1143,6 +1143,11 @@ class GvisorFloorCannotBlockTheTeardownTest(unittest.TestCase):
         env_secret_at = text.find('export LITELLM_ENV_SECRET_NAME=""')
         self.assertNotEqual(env_secret_at, -1, "uninstall.sh must blank LITELLM_ENV_SECRET_NAME")
         self.assertLess(env_secret_at, call_at)
+        # The minter's adoption keys (#3504): terraform validates their shape,
+        # and an operator types them into install.env by hand.
+        minter_at = text.find('export MINTER_SHARED_KEY="" MINTER_ADOPT_KEY=""')
+        self.assertNotEqual(minter_at, -1, "uninstall.sh must blank MINTER_SHARED_KEY and MINTER_ADOPT_KEY")
+        self.assertLess(minter_at, call_at)
         provider_at = text.find('export MODEL_PROVIDER="$DEFAULT_MODEL_PROVIDER" MODEL_DEFAULT_NAME=""')
         self.assertNotEqual(provider_at, -1, "uninstall.sh must reset an openai_compatible provider")
         self.assertLess(provider_at, call_at)
@@ -1157,11 +1162,20 @@ class GvisorFloorCannotBlockTheTeardownTest(unittest.TestCase):
         )
         self.assertNotEqual(redaction_at, -1, "uninstall.sh must blank the LITELLM_REDACTION_* keys")
         self.assertLess(redaction_at, call_at)
+        # The spend ceiling too: the generator refuses an amount or a period it
+        # cannot read, and a teardown must not stop on either.
+        budget_at = text.find('export LITELLM_BUDGET_USD="" LITELLM_BUDGET_PERIOD=""')
+        self.assertNotEqual(budget_at, -1, "uninstall.sh must blank the LITELLM_BUDGET_* keys")
+        self.assertLess(budget_at, call_at)
         # And the mode: the generator refuses a value outside the CRD's enum,
         # and a teardown must not stop on a typo in install.env.
         mode_at = text.find('export PLATFORM_AGENT_MODE=""')
         self.assertNotEqual(mode_at, -1, "uninstall.sh must blank PLATFORM_AGENT_MODE")
         self.assertLess(mode_at, call_at)
+        # And the Slack home channel policy, refused outside the same kind of enum.
+        policy_at = text.find('export SLACK_HOME_CHANNEL_POLICY=""')
+        self.assertNotEqual(policy_at, -1, "uninstall.sh must blank SLACK_HOME_CHANNEL_POLICY")
+        self.assertLess(policy_at, call_at)
         # The data volume size likewise: the generator refuses a malformed size.
         storage_at = text.find('export PLATFORM_AGENT_STORAGE_SIZE=""')
         self.assertNotEqual(storage_at, -1, "uninstall.sh must blank PLATFORM_AGENT_STORAGE_SIZE")
@@ -1171,6 +1185,16 @@ class GvisorFloorCannotBlockTheTeardownTest(unittest.TestCase):
         pool_at = text.find('export SCOPED_SA_POOL_ENABLED="false" SCOPED_SA_POOL_MAX_ACCOUNTS=""')
         self.assertNotEqual(pool_at, -1, "uninstall.sh must blank the SCOPED_SA_POOL_* keys")
         self.assertLess(pool_at, call_at)
+        # The serving-project switch likewise: the generator refuses a
+        # misspelt value, and the destroy removes what is in state either way.
+        vertex_at = text.find('export VERTEX_MANAGE_SERVING_PROJECT=""')
+        self.assertNotEqual(vertex_at, -1, "uninstall.sh must blank VERTEX_MANAGE_SERVING_PROJECT")
+        self.assertLess(vertex_at, call_at)
+        # The release's upgrade_install switch too: the generator refuses a
+        # misspelt HELM_UPGRADE_INSTALL, and a teardown must not stop on it.
+        helm_at = text.find('export HELM_UPGRADE_INSTALL=""')
+        self.assertNotEqual(helm_at, -1, "uninstall.sh must blank HELM_UPGRADE_INSTALL")
+        self.assertLess(helm_at, call_at)
         # And the daily alert ceilings: the generator refuses a value that is
         # not a whole number, and a teardown must not stop on it. The names
         # come from the generator's own list, so a key added there and not

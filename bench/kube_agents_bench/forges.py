@@ -15,8 +15,8 @@
 """Which forge a case's GitOps repository is on, and how its URLs read.
 
 The checks that grade what a run wrote to its repository --
-``ledger_issue_contains``, ``pull_request_opened`` and ``github_writes`` --
-read the forge from ``BENCH_FORGE``: ``github`` (the default, and every pool
+``ledger_issue_contains``, ``forge_issue_state``, ``pull_request_opened`` and
+``github_writes`` -- read the forge from ``BENCH_FORGE``: ``github`` (the default, and every pool
 project today) or ``gitlab``. The forge decides four things and nothing
 else lives here: the grading credential's environment variable, which web
 URLs in a reply point at an issue or a proposal of the repository, the API

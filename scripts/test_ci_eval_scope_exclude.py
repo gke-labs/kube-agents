@@ -45,7 +45,7 @@ ENV = textwrap.dedent(
     """
 )
 
-FUNCTIONS = ["scope_exclude_target", "scope_exclude_helper", "scope_exclude_kubectl", "scope_exclude_cr", "scope_exclude_apply", "scope_exclude_restore"]
+FUNCTIONS = ["scope_slots_shown", "scope_exclude_target", "scope_exclude_helper", "scope_exclude_kubectl", "scope_exclude_cr", "scope_exclude_apply", "scope_exclude_restore"]
 
 
 def run_bash(body: str, cwd: str) -> subprocess.CompletedProcess:
@@ -92,6 +92,7 @@ class UnitPhaseTest(unittest.TestCase):
                 "SCOPE_EXCLUDE_NAMES=scoped,scoped-writer",
                 "INJECT_LANE_REQUESTING=writer,scoped-writer",
                 "STOPPED_ASK_CASES=",
+                "WRITES_ALONE_CASES=alone",
                 f"unit_phase {name}",
             ]
         )
@@ -103,6 +104,8 @@ class UnitPhaseTest(unittest.TestCase):
 
     def test_the_other_phases_are_unchanged(self):
         self.assertEqual(self.phase("writer"), "1")
+        # A writes_alone case runs in the serial phase with the writers.
+        self.assertEqual(self.phase("alone"), "1")
         self.assertEqual(self.phase("plain"), "0")
         # A name that only contains a scoped case's name is not one.
         self.assertEqual(self.phase("scope"), "0")
@@ -131,6 +134,14 @@ class ApplyRestoreTest(unittest.TestCase):
         self.assertIn("SETTLED case-x", result.stdout)
         self.assertEqual(len(ops), 1)
         self.assertEqual(ops[0][-1], {"op": "add", "path": "/spec/scope", "value": {"exclude": {"clusters": [SEEDED_B]}}})
+
+    def test_apply_passes_the_absent_count_through_to_the_patch(self):
+        # `cases` prints `b +1`; the runner splices it into scope_exclude_apply as is.
+        result, ops = self.run_functions({"metadata": {}, "spec": {}}, "scope_exclude_apply case-x b +1; echo rc=$?")
+        self.assertIn("rc=0", result.stdout, result.stderr)
+        self.assertIn("now excludes slot(s) b, absent: 1", result.stdout)
+        absent = {**SEEDED_B, "clusterName": "seeded-e"}
+        self.assertEqual(ops[0][-1], {"op": "add", "path": "/spec/scope", "value": {"exclude": {"clusters": [SEEDED_B, absent]}}})
 
     def test_apply_without_the_fleet_context_patches_nothing(self):
         result, ops = self.run_functions({"metadata": {}, "spec": {}}, "scope_exclude_apply case-x b; echo rc=$?", context=None)
@@ -250,15 +261,30 @@ class SettleTest(unittest.TestCase):
     """scope_exclude_settle waits for the operator, the rollout and the mounted
     file, then runs one reconcile and waits out a run that holds its lock."""
 
-    def settle(self, file_clusters: list, reconcile_rcs: str, seconds: int = 5, failure_pause: int = 0) -> tuple[subprocess.CompletedProcess, str]:
+    def settle(self, file_clusters: list, reconcile_rcs: str, seconds: int = 5, failure_pause: int = 0, tick_before_first_call: bool = False) -> tuple[subprocess.CompletedProcess, str]:
         cr = {"metadata": {"generation": 3}, "status": {"observedGeneration": 3}, "spec": {"scope": {"exclude": {"clusters": [SEEDED_B]}}}}
         rendered = {"present": True, "exclude": {"projects": [], "clusters": file_clusters}}
+        # A tick landing between the deadline's computation and the stub's first
+        # read, the gap a spin from the stub's own baseline would mistake for a
+        # phase it still has to wait out. Measured from the deadline's second,
+        # not from the stub's clock: a tick the clock took on its own in that
+        # gap already is the tick, and a spin from the stub's clock would wait
+        # out a second one, the very flaw the case guards against.
+        gap_tick = 'while [ "$SECONDS" -le "$((deadline - EVAL_SCOPE_SETTLE_SECONDS))" ]; do sleep 0.01; done' if tick_before_first_call else ""
         stub = textwrap.dedent(
             f"""\
             echo {reconcile_rcs} > rcs
             kubectl() {{
               case " $* " in
-                *" jsonpath="*) printf '3 3' ;;
+                *" jsonpath="*)
+                  {gap_tick}
+                  # The first call spins until SECONDS is past the second the
+                  # deadline was computed in (the settle's local, which this
+                  # subshell inherits), so the steps before the rollout wait
+                  # always run exactly one tick in, whether or not the clock
+                  # turned between the function's entry and this call.
+                  while [ "$SECONDS" -le "$((deadline - EVAL_SCOPE_SETTLE_SECONDS))" ]; do sleep 0.01; done
+                  printf '3 3' ;;
                 *" get platformagent "*) printf '%s' '{json.dumps(cr)}' ;;
                 *" get deployment/"*) echo deployment/platform-agent-gateway ;;
                 *" get statefulset/platform-agent-shell "*) echo statefulset/platform-agent-shell ;;
@@ -299,17 +325,35 @@ class SettleTest(unittest.TestCase):
         self.assertIn("rollout status statefulset/platform-agent-shell", self.rollouts)
         self.assertIn("env HERMES_HOME=/opt/data python3 /opt/data/scripts/cluster_agent_reconcile.py", reconciles)
 
+    # The settle's deadline is bash's SECONDS, which ticks on whole wall-clock
+    # seconds, so a budget of N leaves between N-1 and N seconds. The stub's
+    # forced tick puts the rollout wait exactly one tick in on every run, the
+    # worst phase: the two short budgets below are 2, not 1, because 1 then
+    # leaves no time there and the settle fails with "no time left" instead of
+    # the message asserted on.
     def test_a_file_that_never_matches_fails_without_a_reconcile(self):
-        result, reconciles = self.settle([], "0", seconds=1)
+        result, reconciles = self.settle([], "0", seconds=2)
         self.assertIn("rc=1", result.stdout)
         self.assertIn("still reads []", result.stderr)
         self.assertEqual(reconciles, "")
 
     def test_reconcile_retries_stop_at_the_settle_bound(self):
-        result, reconciles = self.settle([SEEDED_B], "3 3 3", seconds=1, failure_pause=2)
+        # The reconcile's pause is the whole budget, so the bound is crossed after one attempt.
+        result, reconciles = self.settle([SEEDED_B], "3 3 3", seconds=2, failure_pause=2)
         self.assertIn("rc=1", result.stdout)
         self.assertIn("settle bound", result.stderr)
         self.assertEqual(len(reconciles.splitlines()), 1)
+
+    def test_a_tick_before_the_first_call_still_leaves_the_budget_a_second(self):
+        # The clock turns between the settle's entry and its first kubectl call,
+        # as it does when bash starts in the last milliseconds of a second. The
+        # stub's forced tick is measured from the deadline, not from that call,
+        # so the rollout wait still sees one second of the two and the settle
+        # reaches the message asserted on rather than "no time left".
+        result, reconciles = self.settle([], "0", seconds=2, tick_before_first_call=True)
+        self.assertIn("rc=1", result.stdout)
+        self.assertIn("still reads []", result.stderr)
+        self.assertEqual(reconciles, "")
 
     def test_a_reconcile_that_keeps_failing_fails_the_settle(self):
         result, reconciles = self.settle([SEEDED_B], "3 3 3")
@@ -351,7 +395,7 @@ class WiringTest(unittest.TestCase):
         self.assertLess(launch, log)
         self.assertLess(log, restore)
         # A scope edit that did not take effect records each repetition as infrastructure.
-        self.assertIn('"scope-exclude: slot(s) ${SCOPE_SLOTS} could not be excluded', body)
+        self.assertIn('"scope-exclude: slot(s) $(scope_slots_shown "${SCOPE_SLOTS}") could not be excluded', body)
 
 
 if __name__ == "__main__":

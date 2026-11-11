@@ -8,12 +8,11 @@
 > `providers/github/` and `providers/gitlab/` behind it; the `version-control` skill drives those verbs from a
 > sandbox that holds a credential-free git; and the consumers reach the forge
 > through those verbs rather than by naming GitHub. The sandbox carries no `gh`
-> and no credential shim named `git`. One thing is deliberately left behind and
-> is not a scheduling slip: `inspect_repository.py` stays on the broker's
-> content-workspace route rather than moving to the verbs, because it reads
-> repositories this install does not manage and does it with a shallow clone —
-> neither of which the verbs offer, the second on purpose
-> ([The seam](#3-the-seam)). The CRD declares forges and repositories in `spec.integration.forges`
+> and no credential shim named `git`. `inspect_repository.py` reads repositories
+> this install does not manage, and context repositories, through the `snapshot`
+> verb: one revision with no history, which `clone` does not offer, on purpose
+> ([The seam](#3-the-seam)). The broker's content workspace (`/v1/workspace/*`)
+> is retired (#4243); every read it served goes through `snapshot`. The CRD declares forges and repositories in `spec.integration.forges`
 > and `spec.integration.repositories`; each provider states its own hosts, grammar and credential.
 > This is the design for driving any forge, and the order the rest has to
 > happen in.
@@ -131,12 +130,11 @@ The coupling runs through five layers, each with a different owner and a differe
    `forge.py`; three shelled `gh` directly — `resolver.py`, `submit_suggestion.py` and
    `audit_report.py`, two behind a private runner of their own and one inline. A seventh,
    `inspect_repository.py`, reaches a repository rather than an API, and does it through the
-   broker's content-workspace route, which clones on the credential side and honours `--depth`.
+   `snapshot` verb, which clones one revision on the credential side and sends its tree.
    (`github_token_refresh.py` and
    `credential_proxy.py` also run `gh`, but for credentials rather than for forge work; they are
-   layer 3.) All six go through the verbs, and `forge.py` with them — it holds typed values and
-   three policy rules and no forge implementation. `inspect_repository.py` does not move: see the
-   status banner.
+   layer 3.) All seven go through the verbs, and `forge.py` with them — it holds typed values and
+   three policy rules and no forge implementation.
 2. **Repository identity.** `owner/repo` — exactly two path segments — was asserted in seven places
    across Python and Go, one regex expressing it copy-pasted into six modules. The widest assumption
    and the one least visible from any single file. Each language now runs its assertions through
@@ -277,7 +275,9 @@ The two designs it was measured against are the shared-volume credential proxy
 and content passing, on identical probes and identical corpora: twenty
 read probes at three repository sizes, plus a four-probe write rung. It was also
 the only one of the three that never reached past its own interface. Full method
-and results in [The experiment](#10-the-experiment).
+and results in [The experiment](#10-the-experiment). Content passing shipped as
+the broker's content workspace (`/v1/workspace/*`). It is retired (#4243), and
+the reads it served go through `snapshot`.
 
 Those numbers are a sanity check, not the justification. The justification is
 the customer requirement above. What the measurement establishes is that meeting
@@ -581,10 +581,10 @@ without a pull request (`PROTECTED_BRANCH`, status 409).
 `/v1/vcs/branch-delete` refuses to remove any of them, whatever proposals exist:
 outside `platform-agent/` as `BRANCH_NOT_OURS`, inside it (a default branch,
 base override or pinned base under the prefix) as `PROTECTED_BRANCH`.
-Across the broker's other write doors, protected branch policy is enforced under
-their respective protocols: the content workspace door (`/v1/workspace/*`) refuses
-with `ContentWorkspaceError` (HTTP 400 `workspace.invalid`), and the command
-execution door (`/v1/exec`) refuses with HTTP 403 `SECURITY_POLICY_BLOCKED`.
+On the broker's other write door, the command execution door (`/v1/exec`),
+protected branch policy is enforced under its own protocol: it refuses with
+HTTP 403 `SECURITY_POLICY_BLOCKED`. The content workspace door
+(`/v1/workspace/*`) was a third write door; it is retired (#4243).
 
 The branch a proposal must target is configuration the agent cannot reach.
 A `gitops` or `managed` repository entry names it in `baseBranch`
@@ -613,10 +613,7 @@ A first-round `publish` refuses one too, before the bundle is read. A publish wi
 can retarget that proposal, and refusing would only strand follow-ups on a
 proposal a person opened onto another branch. A `clone` that names no branch
 checks out the base instead of the remote's default, and refuses a base the
-remote does not hold with `BASE_BRANCH_MISSING` rather than a git failure. The
-content door's `open` uses the base as the workspace base when the caller names
-none, and refuses a missing one with `workspace.base-branch-missing` (409),
-shallow opens included.
+remote does not hold with `BASE_BRANCH_MISSING` rather than a git failure.
 `clone` and `capabilities` answer `baseBranch` so the client can default to it.
 The command execution door needs no rule of its own: `/v1/exec` runs only
 `gcloud` and `kubectl`, so no proposal can be opened through it. With no base
@@ -647,7 +644,8 @@ them a route. A protocol that answers from the credential side has to grow a
 verb for each such narrowing and a cap on each verb's response, and a caller
 that hits the cap gets a truncated list rather than a smaller question. This
 design has no cap on a history question, because a history question never
-crosses the seam. The one transfer it does make is bounded, once, at `clone`.
+crosses the seam. The transfers it does make are bounded once each, at `clone`
+and at `snapshot`.
 
 ### The broker is already in its own pod
 
@@ -685,6 +683,26 @@ clone from it fails with `remote did not send all necessary objects`. Naming a
 single-branch. The two ceilings — `CREDENTIAL_PROXY_MAX_CLONE_BYTES` (256 MiB
 of working tree) and `CREDENTIAL_PROXY_MAX_BUNDLE_BYTES` (64 MiB of bundle, both
 directions) — say so in their refusals.
+
+`snapshot` clones with `--depth 1` and has no boundary problem, because no
+history leaves the broker. It runs `git archive` on the one revision of a bare,
+single-branch clone and sends the tree as a tar. A tar has no commits, so it
+has no parent for the receiver to miss, and the answer says `history: "none"`.
+The clone stays under `CREDENTIAL_PROXY_MAX_CLONE_BYTES`: it is measured while
+git writes, about every half second, and killed past the ceiling, because the
+repository can be anyone's and a clone left to finish could fill the scratch
+volume first. The tar stays under
+`CREDENTIAL_PROXY_MAX_SNAPSHOT_BYTES` (32 MiB, refused as `SNAPSHOT_TOO_LARGE`),
+and its files under the request's `maxBytes` when the caller sends one: `vcs_client`
+sends its unpack bound, so a tree it would refuse after the transfer is refused here
+first, with entries.
+The tar is smaller than the bundle ceiling because the answer is base64 inside
+one JSON body, and the broker holds several copies of it. The tar is sized from
+`git ls-tree` before `git archive` writes it, because the clone ceiling measures
+a compressed pack: a few MB of repeated bytes can be GB as a tar, on the volume
+the broker shares with its own state. The clone's `info/attributes` unsets
+`export-subst`, `export-ignore`, `ident`, `text` and `working-tree-encoding`, so the tar holds every file of the tree as it was
+committed, and the measured size holds.
 
 ### One git in the sandbox
 
@@ -733,9 +751,10 @@ directory's own profile.d entry always has. A missed prepend is a
 other thing deleting the shim buys.
 
 The wrapper gives the agent's own `git` `core.hooksPath` pointed at an empty,
-root-owned directory, `core.fsmonitor` off, `protocol.ext.allow=never`, and no
-system config — the hooks, `ext` and system-config settings `vcs.py` gives its
-own calls, plus `fsmonitor`. `-c` outranks every
+root-owned directory, `core.fsmonitor` off, `protocol.ext.allow=never`,
+`safe.bareRepository=explicit`, and no system config — the hooks, `ext`,
+bare-repository and system-config settings `vcs.py` gives its own calls, plus
+`fsmonitor`. `-c` outranks every
 config file, so a working copy that sets its own `core.hooksPath` — the step an
 injected `CONTRIBUTING.md` asked for — still gets the empty one. It is not a
 boundary, and does not claim to be. A repository-local `filter.<name>.clean`
@@ -809,7 +828,7 @@ about git.
 
 `vcs.py` runs that binary with `GIT_CONFIG_NOSYSTEM=1`,
 `GIT_CONFIG_GLOBAL=/dev/null`, `core.hooksPath` pointed at an empty directory,
-`protocol.ext.allow=never`, and no `origin`. The clone's only config is the one
+`protocol.ext.allow=never`, `safe.bareRepository=explicit`, and no `origin`. The clone's only config is the one
 git just wrote, so a `.gitattributes` naming `filter.foo.clean` finds no `foo`
 defined and is inert.
 
@@ -856,12 +875,12 @@ names a repository, does one thing, and keeps nothing. There is no session, no
 handle, and no state on the broker that a later call depends on — a caller that
 crashes between two verbs leaves nothing behind to reconcile, and two agents
 calling the same verb on the same repository do not have to be ordered against
-each other. `clone` is the only route that hands back something durable, and it
-hands it to the sandbox as a bundle rather than keeping a tree.
+each other. `proposal-claim` is the one exception, stated below the next paragraph. `clone` and `snapshot` are the only routes that hand back something
+durable: a bundle and a tar, never a tree the broker keeps.
 
 That is a constraint on what the verbs may be, not just a description of them.
 It is why `publish` carries `baseRevision` instead of remembering what `clone`
-served, and why nothing in the table takes an identifier the broker minted. It
+served, and why no verb in the table but `proposal-claim` takes an identifier the broker minted. It
 is also why the routes take no lock at all. Each request gets a fresh directory
 under the broker's own scratch volume, named from a counter rather than from
 anything the caller sent, and deletes it on the way out; two requests share
@@ -870,12 +889,37 @@ class. There is no shared tree here to serialise access to, and serialising
 whole requests anyway would make a clone of one repository wait on a publish of
 another for no property gained.
 
+`proposal-claim` is the one exception. `proposal-create` mints a one-time claim
+token with each answer that names its proposal, and the broker keeps it, with
+the proposal's url, number and repository, in an in-memory store under its own
+lock. The first `proposal-claim` that presents the token burns it, whatever the
+forge check then answers. A token lives 15 minutes, the window the forge check
+holds the proposal's creation time to. The store is per process, so a broker
+restart drops every unclaimed token, and a claim after it answers 404. The
+state is that small on purpose: the claim proves that this install opened the
+proposal, which no caller-supplied field can prove.
+
+The broker checks what the create kept with the token, never a repository or
+number the caller sends. The claim answers 200 with `{url, number, title}` when
+the forge confirms the proposal: open, at that url, authored by this
+credential, and created inside the window. It answers 404 `CLAIM_UNKNOWN` for a
+token that is unknown, already burned or expired, or whose `url` does not
+match. It answers 409 `CLAIM_NOT_CONFIRMED` when the forge check fails, 502
+`FORGE_IDENTITY_UNKNOWN` when the forge cannot name the credential's account and
+no `identity` is configured, and 403 when the repository is no longer on the
+managed list. A forge failure that
+persists after the one retry answers the forge's own code, and the token is
+spent either way. The `shell` role can call
+it; `ROLE_VCS_VERBS` refuses it to the `mcp` role.
+
 | Verb                                 | Request                                                              | Response                                                                                 |
 | ------------------------------------ | -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
 | `capabilities`                       | `{repository}`                                                       | `{forge, repo, proposalNoun, verbs, acknowledge, labels, missing, baseBranch, fileUrl?}` |
 | `clone`                              | `{repository, branch?}`                                              | `{forge, repo, branch, revision, size, bundleBase64, baseBranch}`                        |
+| `snapshot`                           | `{repository, ref?, paths?, maxBytes?}`                              | `{forge, repo, role, ref, revision, size, archiveBase64, history: "none"}`               |
 | `publish`                            | `{repository, branch, target, baseRevision, bundleBase64, advance?}` | `{forge, repo, branch, revision}`                                                        |
-| `proposal-create`                    | `{repository, source, target, title, body?, draft?}`                 | `{proposal}`                                                                             |
+| `proposal-create`                    | `{repository, source, target, title, body?, draft?}`                 | `{proposal, forge, repo, claim?}`                                                        |
+| `proposal-claim`                     | `{claim, url}`                                                       | `{url, number, title}`                                                                   |
 | `proposal-list`                      | `{repository, state?, limit?, page?, labels?, source?, target?}`     | `{proposals, count, truncated}`                                                          |
 | `issue-list`                         | `{repository, state?, limit?, labels?, excludeLabels?, query?}`      | `{issues, count, truncated}`                                                             |
 | `proposal-view` / `issue-view`       | `{repository, number, comments?, diff?, limit?}`                     | `{proposal\|issue, comments?, commentCount?, commentsTruncated?, diff?}`                 |
@@ -917,7 +961,11 @@ labels serves `label-ensure`, and a forge without them does not: the two say one
 thing, and the contract test holds them together. The issue verbs come as one
 group in the same way, all or none.
 
-The rows down to `issue-create`, and the two branch rows, are the version-control skill's. The rest are the union of
+The rows down to `issue-create` except `snapshot` and `proposal-claim`, and the two branch rows, are the
+version-control skill's. `snapshot` and `proposal-claim` are the library verbs (`LIBRARY_VERBS` in
+`providers/base.py`), which `capabilities` leaves out of `verbs`. `snapshot` is served to library callers
+(`vcs_client.snapshot`), which `inspect-repository` is. `proposal-claim` is served to the `pr_opened` plugin,
+which presents the token from a proposal record line. The rest are the union of
 what the shipped consumers do to a forge — edit and close what they opened, read
 a proposal's commits, acknowledge a comment, keep a label in existence, ask who
 the credential is and whether a login may write — decided by the callers rather
@@ -1004,8 +1052,15 @@ instruction, not the broker's refusal.
 tip is not in the fresh copy, so no caller has to know which setting the
 repository has.
 
-Refusals carry a code: 501 `FORGE_UNSUPPORTED`, 413 `CLONE_TOO_LARGE` and
-`BUNDLE_TOO_LARGE`, 409 `NOT_FAST_FORWARD`, `BASE_MOVED`, `BRANCH_DIVERGED`,
+Refusals carry a code: 501 `FORGE_UNSUPPORTED`, 413 `CLONE_TOO_LARGE`,
+`BUNDLE_TOO_LARGE` and `SNAPSHOT_TOO_LARGE` (when the measure listed the tree, the
+refusal carries `ceiling`, the `revision` it measured, and `entries`: each entry one
+level below what was asked, with its `path`, its `type`, its count of `manifests`, and
+the `bytes` a snapshot of it alone measures; past 4096 entries it carries none; a request's
+`maxBytes`, the bytes the caller unpacks at most, refuses a tree whose files pass it the same
+way, with the install's `ceiling`),
+400 `PATH_NOT_FOUND` (a `snapshot` path that names nothing at the ref; the refusal
+carries the `revision` it read), 409 `NOT_FAST_FORWARD`, `BASE_MOVED`, `BRANCH_DIVERGED`,
 `TARGET_IS_BRANCH`, `CLONED_BRANCH`, `PROTECTED_BRANCH`, `TARGET_NOT_BASE`,
 `BASE_BRANCH_MISSING`, `BRANCH_NOT_OURS`, `OPEN_PROPOSAL`, `BRANCH_MOVED`,
 `NOT_SPENT` and `DELETE_REFUSED`, 501 `LABELS_UNSUPPORTED`, 502 `GIT_FAILED`,
@@ -2074,19 +2129,19 @@ ways this design did not anticipate. It is also two products, Bitbucket Cloud
 and Bitbucket Data Center, with two APIs ([8. Bitbucket](#8-bitbucket)). The
 table is about both:
 
-| Bitbucket is different in                                                        | Absorbed by                                                                                                                                                     | Shared file changed      |
-| -------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------ |
-| `workspace/repo` slugs and a UUID form (Cloud); `KEY/repo` and `~user/repo` (DC) | `parse`, `clone_url` in its own package                                                                                                                         | none                     |
-| pull requests, not MRs; comments are on an `/comments` sub-resource              | `translate.py` in its own package                                                                                                                               | none                     |
-| access tokens and API tokens, all static, all sent as `Authorization: Bearer`    | `StaticFileCredential` with the username `x-token-auth`, as it is                                                                                               | none                     |
-| no issue tracker at all                                                          | `verbs` omitting the six issue verbs, `ForgeUnsupported` for free; the ledgers that need issues read the omission — **[below](#not-every-provider-is-a-forge)** | the consumers            |
-| no labels on a pull request                                                      | the `labels` capability, refused by name in the broker; callers use a branch prefix and a body marker                                                           | `base.py`, the consumers |
-| no current-user route for some tokens                                            | `Forge.whoami` and `identity_required`                                                                                                                          | `base.py`, the broker    |
-| `values` pagination with an opaque `next` link (Cloud), or `start`/`limit` (DC)  | its own translation of listings                                                                                                                                 | none                     |
-| 401 from git over HTTPS on a hidden repository, where the REST API answers 404   | `error_overrides`, and clone text that says "or the token cannot see it"                                                                                        | none                     |
-| the `/scm/` clone path, a context path and a port (DC)                           | the root path on port 443 only; the other forms refused with a reason                                                                                           | none                     |
+| Bitbucket is different in                                                       | Absorbed by                                                                                                                                                     | Shared file changed       |
+| ------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------- |
+| `workspace/repo` (Cloud); `KEY/repo` (DC); `~user/repo` refused by name         | `parse`, `clone_url` in its own package                                                                                                                         | none                      |
+| pull requests, not MRs; comments are on an `/comments` sub-resource             | `translate.py` in its own package                                                                                                                               | none                      |
+| access tokens and API tokens, all static, all sent as `Authorization: Bearer`   | `StaticFileCredential`; git gets the username `x-token-auth` on Cloud, and the token as a bearer on Data Center                                                 | the token-file git helper |
+| no issue tracker at all                                                         | `verbs` omitting the six issue verbs, `ForgeUnsupported` for free; the ledgers that need issues read the omission — **[below](#not-every-provider-is-a-forge)** | the consumers             |
+| no labels on a pull request                                                     | the `labels` capability, refused by name in the broker; callers use a branch prefix and a body marker                                                           | `base.py`, the consumers  |
+| no current-user route for some tokens                                           | `Forge.whoami` and `identity_required`                                                                                                                          | `base.py`, the broker     |
+| `values` pagination with an opaque `next` link (Cloud), or `start`/`limit` (DC) | its own translation of listings                                                                                                                                 | none                      |
+| 401 from git over HTTPS on a hidden repository, where the REST API answers 404  | `error_overrides`, and clone text that says "or the token cannot see it"                                                                                        | none                      |
+| the `/scm/` clone path, a context path and a port (DC)                          | the root path on port 443 only; the other forms refused with a reason                                                                                           | none                      |
 
-The table has three rows that change shared code, and each is at an edge, not in
+The table has four rows that change shared code, and each is at an edge, not in
 the middle. Every API difference lands in the forge's own directory. What does
 not land there is what the callers assumed about every forge: that it has
 issues, that it has labels, and that its token can name its own account. Each
@@ -2560,6 +2615,7 @@ side of each.
 | `url`               | `web_url`                         |                                                                                        |
 | `created`/`updated` | `created_at` / `updated_at`       | both ISO-8601, same as GitHub                                                          |
 | `closed` (proposal) | `merged_at`, else `closed_at`     | GitLab leaves `closed_at` empty on a merge; `""` while open                            |
+| `mergeCommit`       | `merge_commit_sha`                | else `squash_commit_sha`; `null` unless merged, and for a fast-forward merge           |
 | `body`              | `description`                     | GitLab's name for it                                                                   |
 | `labels`            | `labels`                          | plain strings, not GitHub's `{name: …}` dicts                                          |
 
@@ -2718,13 +2774,16 @@ problem from the administrator who set it. On a GitHub Enterprise Server the
 token minter reads the same CA too: see
 [GitHub Enterprise Server](#github-enterprise-server).
 
-### GitLab in the content workspace
+### GitLab in the snapshot verb
 
-The broker's content workspace (`/v1/workspace/*`) opens a repository on any forge
-the install serves. The caller names a repository and never a host or a URL:
+The broker's `snapshot` verb (`/v1/vcs/snapshot`) reads a repository on any forge
+the install serves. It took over these reads from the content workspace
+(`/v1/workspace/*`), which is retired (#4243). The caller names a repository and
+never a host or a URL:
 
-- **A bare `owner/name` is GitHub's,** and the workspace composes its github.com URL
-  as it always has.
+- **A bare `owner/name` is GitHub's,** and the verb composes its github.com URL
+  ([What this does not fix](#11-what-this-does-not-fix) covers an install with no
+  GitHub forge).
 - **A host-qualified name is resolved through the forges the install serves.** The
   forge parses it (nested groups, `allowed_paths`) and composes the clone URL with
   `clone_url`. A name no served forge owns is refused before anything is cloned.
@@ -2733,13 +2792,11 @@ What a clone presents follows the forge's credential:
 
 - **GitHub is unchanged.** A context repository gets a read-only minted token. A
   managed repository rides the write credential the CLI installed in the broker,
-  so its clone, fetch and push carry no credential of their own.
+  so its clone carries no credential of its own.
 - **GitLab's credential is a stored token, with nothing ambient behind it.** A
-  managed repository's clone, fetch and push present it through the forge's
-  credential helper, so the token never enters argv, the environment or the tree.
-  The token is asked for again before every fetch and push, so a repository
-  unregistered after `open` stops receiving it. An unregistered repository
-  presents nothing, as on GitHub.
+  managed repository's clone presents it through the forge's credential helper,
+  so the token never enters argv, the environment or the tree. An unregistered
+  repository presents nothing, with the ambient helper cleared, as on GitHub.
 
 **A context repository never receives the write token.** It gets the forge's
 read-only credential when the forge offers one. On GitLab that is a second stored
@@ -2753,7 +2810,7 @@ or one that does not hold one line of printable ASCII (the rule the git helper a
 returns `NoCredential`, and the clone presents nothing. That reads a public project and
 refuses a private one at the clone, with a log line saying why. The
 recommended token is a project or group access token with the Reporter role and
-only the `read_repository` scope. The write gate is unchanged: `commit`, `push`,
+only the `read_repository` scope. The write gate is unchanged: the write verbs,
 the API routes and the refresh route resolve the repository's own forge, refuse
 anything that forge's managed list does not hold, and present only the write
 credential.
@@ -2865,9 +2922,12 @@ self-managed GitLab does, and it can name a CA bundle for that host.
 ### The Bitbucket credential
 
 Every recommended token is a static string. The broker sends it as
-`Authorization: Bearer <token>` to the REST API, and git sends it with the
-username `x-token-auth`. `StaticFileCredential` takes all of them as it is, so
-Bitbucket adds no credential strategy and no refresh step.
+`Authorization: Bearer <token>` to the REST API. On Cloud, git sends it with the
+username `x-token-auth`. Data Center refuses an HTTP access token as a Basic
+password with any shared username, so git sends it as a bearer too: the
+token-file helper answers with `authtype=Bearer`, which git 2.46 and later
+support. `StaticFileCredential` takes all of them, so Bitbucket adds no
+credential strategy and no refresh step.
 
 | Product | Token                                                    | Use it when                                                               |
 | ------- | -------------------------------------------------------- | ------------------------------------------------------------------------- |
@@ -3033,11 +3093,21 @@ that account:
   account's `uuid`, because a Cloud `nickname` is not unique.
 - A Cloud workspace, project or repository access token has no account
   permission, so `/2.0/user` is expected to refuse it.
-- DC has no current-user resource for a token, and a project or repository
-  token is not a user. The login is a user `slug`.
+- DC has no current-user resource in its REST API. A project or repository
+  token acts as a service user, `access-token-user/<project>/<token>`. The login
+  is the user `name`, which every authenticated answer names, URL-encoded, in
+  its `X-AUSERNAME` header. The instance's `whoami` servlet
+  (`/plugins/servlet/applinks/whoami`, outside the REST API) answers a personal
+  token's user, but answers a project token with nothing. The participant
+  filter of the pull-request list finds no proposal of a token user, so the
+  readings filter the author in the broker.
 
 So the forge names the login (`Forge.whoami`, in [The protocol](#the-protocol)):
-from an identity configured on its forge entry, or from a lookup of its own.
+from the `identity` field of its forge entry, or from a lookup of its own. The
+field is for the two Bitbucket providers only; GitHub, GitLab and Gitea refuse it,
+because their API names the account. The configured value answers first, with
+no call. On Cloud it is the account `uuid`, which the package writes with its
+braces, as Bitbucket writes every author, and any other value is refused.
 Both packages declare `identity_required`. An unknown login is then
 `FORGE_IDENTITY_UNKNOWN`, and the ownership checks refuse. They never fall back
 to "do not compare". Which source each token uses is the one a recorded
@@ -3073,8 +3143,11 @@ A DC host is supported at its root path on port 443. A context path
 them. The broker's loader takes no port, and it builds the API root from the
 host alone, so a context path needs a new field on the forge entry. A repository is named `KEY/repo`. A full DC URL
 (`https://host/scm/KEY/repo.git` or `https://host/projects/KEY/repos/repo`)
-has more path segments than a repository, so the package reads it or refuses it
-with a reason. A draft proposal needs DC 8.18 or later.
+has more path segments than a repository. The broker's package reads both forms
+as `KEY/repo`, because git reports the clone URL as the remote. A declared
+repository on the CR is refused in that form, with the form to write, so that
+the state ConfigMap holds one spelling. The broker refuses a personal repository
+(`~user/repo`) by name, and the operator refuses `~user` as a project key. A draft proposal needs DC 8.18 or later.
 
 ### Installing with Bitbucket
 
@@ -3334,7 +3407,9 @@ and only on a repository the install manages.
 
 `clone` pulls a whole branch's history, which is the wrong shape for a one-off
 read of a large upstream repository, and there is no shallow option to make it
-cheaper.
+cheaper. `snapshot` is the one-off read: one revision's tree, with no history
+(see the end of this section). A tree larger than its ceiling is refused, and
+`paths` is the size control that works.
 
 Throttling is legible to the agent and only partly to an operator.
 [Where the error contract splits](#where-the-error-contract-splits) puts the
@@ -3391,22 +3466,50 @@ case that will arrive first — are named in
 ---
 
 **Reads of repositories the install does not manage.** The broker refuses every
-verb but `capabilities` at the route for a repository the install does not
-manage, reads included, so the managed list is a visibility control as well as
-a write one on every forge, whatever its credential strategy. A token an
+verb but `capabilities` and `snapshot` at the route for a repository the install
+does not manage, reads included, so the managed list is a visibility control as
+well as a write one on every forge, whatever its credential strategy. A token an
 administrator stored is one token for every repository it can see, so nothing
-downstream of the route would refuse on its behalf. The intent that reading a
-repository this install does not write to should work — a public upstream, read
-with no credential — is real and not served. Opening those reads needs a
-credential-less path — a clone with no token, a read API call with
-none — that the provider can take when the repository is public, which is a
-change to the credential strategy and not to the verbs, and is not designed
-here.
+downstream of the route would refuse on its behalf.
+
+`snapshot` is the read that does not take that gate. The route still resolves
+the repository, so the host allowlist holds, and the verb chooses the
+credential by the repository's role in the broker's ConfigMap:
+
+| Role                                      | Credential on the clone                                                           |
+| ----------------------------------------- | --------------------------------------------------------------------------------- |
+| managed                                   | The forge's managed credential, made current as `clone` makes it current.         |
+| context                                   | `read_credential(repo)`, never the write token, with `credential.helper` cleared. |
+| unregistered, or the lists cannot be read | None, with `credential.helper` cleared.                                           |
+
+The clear goes into the same per-invocation config layer as the credential. An
+empty `credential.helper` there resets every helper git read before it,
+including a URL-scoped one in the global file, so a clone that must not ride
+the ambient write credential cannot fall back to it. A private repository that
+nobody registered therefore fails as `GIT_FAILED` instead of being read on a
+token that reaches more than the install lists. The clone is bare and one
+revision deep, and nothing is checked out. `git archive` does not write a
+`.git` path, and `vcs_client.snapshot` refuses one again on unpack (in any
+case), together with absolute paths, `..`, a path through a symbolic link, hard
+links out of the tree and device files. Two things are not written, and the
+answer names them under `skipped`: a symbolic link that points out of the tree,
+and every member of a directory laid out as a bare repository (`HEAD` with
+`objects/` and `refs/`, or with `commondir`), which git would open and whose
+`config` it would read. Git tooling commits such directories as test fixtures,
+so one of them does not cost the rest of the tree. Both of the
+sandbox's gits also run with `safe.bareRepository=explicit`, so git opens a bare
+repository only when it is named. A bare `owner/name` is GitHub's, as it was to
+the retired content workspace. On an install with a GitHub forge it is read on that
+forge. On an install with none it is read from github.com with no credential,
+because github.com is not in that install's host table and a URL cannot name
+it, unless the install's own forge lists the name as managed or context; then
+it is read there, as `clone` reads it. The MCP role cannot call `snapshot`. The verb is reachable to the `shell` role;
+`capabilities` does not list it (`LIBRARY_VERBS`), because no `vcs.py` command runs it.
+The `inspect-repository` skill's `clone` and `fleet-upgrade-verification`'s `api_deprecation_scan.py` read through it.
 
 **Registered context repositories** are the one unmanaged read the install does
-grant a credential for, and the shape is the credential-strategy change above
-for one case. A repository under `context_repos` is read for declared intent and
-never written, and it is usually private. The broker's content-mode `open`
+grant a credential for. A repository under `context_repos` is read for declared intent and
+never written, and it is usually private. The broker's `snapshot`
 resolves the repository's registered role from the ConfigMap — `managed`,
 `context`, or neither, decided by the broker and never by a forge — and for a
 context repository asks the forge for `read_credential(repo)`: a credential that
@@ -3417,14 +3520,14 @@ helper cleared in that same layer so the write token is never tried in its
 place. On GitHub it is a `contents: read` App installation token minted from the
 repository's own minter policy, which the operator renders per context
 repository. On GitLab it is the stored `read-token` beside the write token
-(§7, "GitLab in the content workspace"). It is not minted per repository: GitLab
+(§7, "GitLab in the snapshot verb"). It is not minted per repository: GitLab
 sets its reach, a project or a group. The broker still presents it only for a
 registered context repository inside the forge's `allowedPaths`. A forge without a read-only
 credential answers `NoCredential` and the clone proceeds as before.
 The write gate does not consult the role, so a context repository stays refused
-by every `/v1/vcs` verb but `capabilities`, by `commit` and `push`, and by the
-refresh route; the verbs' credential-less read path for public repositories
-remains open as above.
+by every `/v1/vcs` verb but `capabilities` and `snapshot`, and by the refresh
+route. The read-only credential is minted under the request's own memory
+reservation.
 
 ## 12. Open questions
 

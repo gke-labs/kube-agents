@@ -131,7 +131,8 @@ The Platform Agent runs these audits on a schedule and posts each report to chat
 | Reliability | `fleet-upgrade-verification`, `gke-reliability`, `gke-upgrades`, `topology-drift`, `upgrade-readiness-brief` |
 | Manifests and remediation | `gcp-config-connector`, `gcp-terraform`, `gitops-helm-chart`, `gke-manifest-generation`, `submit-suggestion` |
 | Meta | `fleet-audit`, `fleet-audit-reports`, `github-issue-resolver`, `inspect-repository`, `kube-agents-feedback`, `pr-conversation`, `version-control` |
-| Cluster Agent (per-cluster runtime) | `gke-load-bearing-change`, `gke-observability`, `gke-reliability`, `gke-rightsizing-checks`, `gke-stall-detection`, `gke-storage`, `gke-workload-scaling`, `gke-workload-security`, `gke-workload-troubleshooting`, `topology-drift` |
+| Cluster Agent (per-cluster runtime) | `gke-load-bearing-change`, `gke-observability`, `gke-reliability`, `gke-rightsizing-checks`, `gke-stall-detection`, `gke-storage`, `gke-workload-scaling`, `gke-workload-security`, `gke-workload-troubleshooting`, `pod-container-creating`, `pod-crashloop-oom`, `pod-pending-scheduling`, `service-connectivity`, `topology-drift`, `workload-triage-scan` |
+| GKE Support Agent (tse) | `support-escalation-bundle` |
 
 <!-- prettier-ignore-end -->
 <!-- END GENERATED: capabilities -->
@@ -142,7 +143,7 @@ The Platform Agent runs these audits on a schedule and posts each report to chat
 
 `kube-agents` is designed for enterprise fleets where agents must be powerful _and_ provably contained:
 
-- **Least-privilege RBAC** — the agent's Kubernetes identity is read-only and cannot read Secrets.
+- **Least-privilege RBAC** — the agent's Kubernetes identity is read-only and cannot read Secret values (enforced by RBAC and `<agent>-kube-proxy`).
 - **Credential isolation** — model-authored code runs in a shell sandbox pod that holds no API keys or tokens; an Envoy credential broker in a pod of its own injects them at the network boundary.
 - **At-rest database encryption & state security** — GKE etcd database encryption (CMEK) via Cloud KMS, strict state file permissions (`umask 077`), and mandatory encryption pre-flight gates.
 - **Kernel-level sandboxing** — agent workloads run under a gVisor RuntimeClass (GKE Sandbox) by default; `--enable-gvisor=false` opts out.

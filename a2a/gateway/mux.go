@@ -116,6 +116,23 @@ func (m *MultiAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 	return err
 }
 
+// Close closes every backend that holds a connection of its own to close.
+// Gateway.Run calls it after the relay's stop drain, so a batch still
+// rendering when ingress stopped can post through the backend.
+func (m *MultiAdapter) Close() {
+	for _, a := range m.byPrefix {
+		closeAdapter(a)
+	}
+}
+
+// closeAdapter closes an adapter that holds a connection of its own; the
+// rest have nothing to close.
+func closeAdapter(a Adapter) {
+	if c, ok := a.(interface{ Close() }); ok {
+		c.Close()
+	}
+}
+
 // stopped names why a backend's Run returned: nil if ctx ended it, its own
 // error otherwise, and an error of our own if it returned nil early.
 func stopped(ctx context.Context, name string, err error) error {
@@ -315,10 +332,28 @@ func (m *MultiAdapter) SetBoardActor(actor BoardActor) {
 	}
 }
 
+func (m *MultiAdapter) SetBoardAdmits(admits BoardAdmits) {
+	for _, a := range m.byPrefix {
+		if sink, ok := a.(BoardAdmitSink); ok {
+			sink.SetBoardAdmits(admits)
+		}
+	}
+}
+
 func (m *MultiAdapter) SetSessionLookup(lookup SessionLookup, idleTTL time.Duration) {
 	for _, a := range m.byPrefix {
 		if sink, ok := a.(SessionLookupSink); ok {
 			sink.SetSessionLookup(lookup, idleTTL)
+		}
+	}
+}
+
+// SetSenderAdmission hands the gateway's admission gate to every backend
+// that reads it (SenderAdmissionSink), as SetSessionLookup does.
+func (m *MultiAdapter) SetSenderAdmission(admits SenderAdmission) {
+	for _, a := range m.byPrefix {
+		if sink, ok := a.(SenderAdmissionSink); ok {
+			sink.SetSenderAdmission(admits)
 		}
 	}
 }

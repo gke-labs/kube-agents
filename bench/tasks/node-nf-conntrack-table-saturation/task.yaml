@@ -1,0 +1,57 @@
+# Node OS, kubelet and auto-repair (gce-compute-fleet-audit): connection
+# tracking on a node reaches 80 to 100 percent of nf_conntrack_max under
+# short-lived connection churn with default netfilter sysctls, and the kernel
+# drops new connections. A declared gap: expected_fail until the check lands
+# (gke-labs/kube-agents#5409, which proposes `node-conntrack-saturation`).
+# Nothing is planted, and no honest plant exists: the customer's shape is a
+# default sysctl on every pool, the churn itself is the fault, which a fixture
+# may not cause on a shared cluster, and a synthetic node condition exists on
+# no customer node. Two flip conditions, in order: a reader of node conntrack
+# counts (a node-exporter series under Managed Prometheus, or the node's
+# kernel log), then a bounded plant that raises the count to a stated ceiling
+# under 10 percent on one dedicated node; the pull request that lands both
+# rebinds this case to the plant's role and flips the marker in the same diff.
+# `fixtures: []`: the run plants nothing and reads no fixture, so no
+# fixture's drift may excuse it; no safeguard reads a fixture because none
+# exists. Domain `fleet-audits` as the
+# other GCE compute cases.
+# Isolation class: fleet-read-only, GitOps-repo write (the audit's ledger).
+id: node-nf-conntrack-table-saturation
+name: "Node conntrack table saturation (declared gap; nothing planted until a reader of conntrack counts exists)"
+domain: fleet-audits
+suite: certification
+expected_fail: true
+audit_streams:
+  - gce-compute-fleet-audit
+fixtures: []
+prompt: >-
+  Run the gce-compute-fleet-audit audit across the fleet, following the
+  gce-compute-fleet-audit SOP.
+expected_output: >-
+  Nothing planted. Customer failure: a node's conntrack table full, packets
+  dropped. Certified needs a reader of node conntrack counts and then a
+  bounded plant; the ledger issue would then carry a finding that names the
+  node's pool `default-pool` at or above 80 percent of nf_conntrack_max. The
+  closing response is the SOP's one line with the ledger URL.
+infrastructure:
+  deployer: noop
+validated: false
+
+verification_spec:
+  # One finding must carry both the check and the node's pool: the object of a
+  # node finding carries the pool name inside the GKE node name. The three
+  # slugs are the names the case accepts; the first is the one #5409 proposes.
+  - name: ledger-files-conntrack-saturation-on-a-default-pool-node
+    role: objective
+    mode: assert
+    check:
+      type: ledger_issue_contains
+      audit: gce-compute-fleet-audit
+      scope: finding
+      finding_check:
+        [
+          "node-conntrack-saturation",
+          "nf-conntrack-exhaustion",
+          "conntrack-table-full",
+        ]
+      any_of_phrases: ["default-pool"]

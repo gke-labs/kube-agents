@@ -1,4 +1,4 @@
-"""nightly_digest.py: the 9 AM digest's nightly section -- new bugs, still
+"""nightly_digest.py: the daily digest's nightly section (these tests pin the digest hour at 9; the product posts at 11) -- new bugs, still
 red, first-time reds, recoveries and infra from last night, capped lists,
 the one-line quiet day, a truncated night labelled and not counted, Chat
 mentions from CI_HEALTH_CHAT_MENTIONS (plain text for a login it lacks), and
@@ -31,7 +31,7 @@ FAIL_REASON = "VerificationCorrectness=0.0 (floor 1.0) -- names-the-pool: requir
 STORM_REASON = "agent run failed: http 429 RESOURCE_EXHAUSTED"
 CASES = ["case-red", "case-red-extended", "case-maint", "case-outsider", "case-reviewer", "case-noowner", "case-xfail", "case-xfail-cap", "case-green"]
 FILLER = ("filler-1", "filler-2", "filler-3", "filler-4")
-# The digest goes out Tue 2026-10-20 9:05 AM ET; last night started 00:00Z.
+# The digest goes out Tue 2026-10-20 9:05 AM ET (the hour these tests pin); last night started 00:00Z.
 NOW = datetime(2026, 10, 20, 13, 5, tzinfo=timezone.utc)
 # Fake Chat user ids.
 MENTIONS = {"alice": "1001", "dave": "1002"}
@@ -213,7 +213,7 @@ class FullSectionTest(Harness):
 
         environ = {post_health.SPACE_ENV: "spaces/AAAAtest", post_health.TOKEN_ENV: "fake-token", post_health.ghcli.TOKEN_ENV: "fake-gh",
                    nightly_digest.MENTIONS_ENV: json.dumps(MENTIONS)}
-        argv = ["--health", str(tmp / "health.json"), "--state", str(tmp / "state.json"), "--data", str(tmp / "data.json"), "--now", NOW.isoformat()]
+        argv = ["--health", str(tmp / "health.json"), "--state", str(tmp / "state.json"), "--data", str(tmp / "data.json"), "--now", NOW.isoformat(), "--digest-hour", "9"]
         with mock.patch.object(nightly_digest.nightly_bugs, "REPO_ROOT", self.root), contextlib.redirect_stderr(io.StringIO()):
             rc = post_health.main(argv, environ=environ, opener=Opener(), gh_runner=gh_runner)
         self.assertEqual(rc, 0)
@@ -468,7 +468,7 @@ class SkipTest(Harness):
         half.update(job="ci-kube-agents-eval-nightly-main-b", build_id="3000000000000019003")
         with self.assertRaisesRegex(nightly_digest.Skipped, "^last night's main-b part is missing"):
             self.build(data(night(19, [green("case-green")]), half, night(20, [green("case-green")]), extra_cases=(("case-b", "capacity"),)))
-        # main-b still in flight at 9 AM: held back, not built on half the matrix.
+        # main-b still in flight at the digest hour: held back, not built on half the matrix.
         running = data(night(19, [green("case-green")]), half, night(20, [green("case-green")]), extra_cases=(("case-b", "capacity"),))
         running["pending_builds"] = [{"build_id": "3000000000000020003", "tier": "nightly", "job": "ci-kube-agents-eval-nightly-main-b",
                                       "log_url": f"{LOGS}/ci-kube-agents-eval-nightly-main-b/3000000000000020003", "first_seen": "2026-10-20T05:00:00+00:00"}]
@@ -507,6 +507,43 @@ def timed(t, agent_s, turn1_s=None):
         if turn1_s is not None:
             rep["turn1_s"] = turn1_s
     return t
+
+
+def shaped(t, opens_on_verdict=True, answer_words=60):
+    """``t`` with every rep carrying a reply shape."""
+    for rep in t["reps"]:
+        rep["shape"] = {"opens_on_verdict": opens_on_verdict, "apology": False, "bot_messages": 2,
+                        "words_before_answer": 0, "answer_words": answer_words}
+    return t
+
+
+class ToneBlockTest(Harness):
+    """The reply-shape line (nightly_tone.py) as the section carries it."""
+
+    def shaped_nights(self, last_verdict=True, timed_too=False):
+        def tasks(verdict):
+            ts = [shaped(green("case-green")), shaped(green("case-red"), opens_on_verdict=verdict)]
+            return [timed(t, 100.0, 10.0) for t in ts] if timed_too else ts
+
+        nights = [night(day, tasks(True)) for day in range(13, 20)]
+        nights.append(night(20, tasks(last_verdict)))
+        return data(*nights)
+
+    def test_a_quiet_day_carries_the_line_without_a_latency_block(self):
+        section = self.build(self.shaped_nights())
+        self.assertTrue(section.quiet)
+        self.assertEqual(len(section.lines), 2)
+        self.assertTrue(section.lines[1].startswith("🗣 *Reply shape*: 100% of "), section.lines[1])
+
+    def test_it_follows_the_latency_block_and_marks_a_regression(self):
+        lines = self.build(self.shaped_nights(last_verdict=False, timed_too=True)).lines
+        latency = next(i for i, line in enumerate(lines) if line.startswith("⏱ *Latency*"))
+        self.assertTrue(lines[latency + 1].startswith("🗣 *Reply shape*: 50% of "), lines[latency + 1])
+        self.assertIn("open on the answer ⚠ (typical 100%)", lines[latency + 1])
+
+    def test_no_line_when_no_reply_was_measured(self):
+        nights = [night(day, [green("case-green")]) for day in range(13, 21)]
+        self.assertFalse([line for line in self.build(data(*nights)).lines if line.startswith("🗣")])
 
 
 class LatencyBlockTest(Harness):
@@ -577,13 +614,31 @@ class LatencyBlockTest(Harness):
         reports = nightly.night_reports(doc)
         for key in ("running_parts", "missing_parts"):
             partial = [{**reports[0], key: ["main-b"]}, *reports[1:]]
-            with mock.patch.object(post_health.nightly, "night_reports", return_value=partial):
+            with mock.patch.object(post_health.nightly, "night_dates", return_value=partial):
                 self.assertTrue(post_health.nightly_latency_line(doc, NOW).endswith("(partial: over the cases on record)"))
         self.assertNotIn("partial", post_health.nightly_latency_line(doc, NOW))
 
     def test_the_one_line_fallback_carries_the_night_line(self):
         text = post_health.render_digest({"state": "GREEN", "metrics": {}}, NOW, self.timed_nights(), section="a reason")
         self.assertIn("⏱ *Latency*: turn 1 p50 10.0 s", text)
+
+    def test_same_date_re_runs_do_not_push_a_date_out_of_the_typicals(self):
+        """A cron run on 10-13 to 10-20 and a 09:00 re-run on 10-14 to 10-20
+        are 15 runs. Taken in runs, the newest 14 reach back to 10-14 only:
+        case-red's typical reads 550 s and the night's 325 s. Taken in dates,
+        both blocks see seven earlier dates."""
+        agent = {13: 1000.0, 14: 1000.0, 15: 1000.0, 16: 1000.0, 17: 100.0, 18: 100.0, 19: 100.0, 20: 2500.0}
+        runs = []
+        for day, red_s in agent.items():
+            for rerun in (False, True) if day > 13 else (False,):
+                run = night(day, [timed(green("case-green"), 100.0, 10.0), timed(green("case-red"), red_s, 10.0)])
+                if rerun:
+                    run.update(build_id=f"30000000000000{day:02d}0009", started=f"2026-10-{day:02d}T09:00:00+00:00",
+                               finished=f"2026-10-{day:02d}T09:59:00+00:00")
+                runs.append(run)
+        doc = data(*runs)
+        self.assertIn("• Capacity: case-red 1000 s → 2500 s (2.5×) · <users/1001>", self.build(doc).lines)
+        self.assertIn("(typical 550 s)", post_health.nightly_latency_line(doc, NOW))
 
 if __name__ == "__main__":
     unittest.main()

@@ -34,33 +34,37 @@ func TestSplitClusterPath(t *testing.T) {
 	tests := []struct {
 		name        string
 		target      string
-		defaultID   string
 		wantCluster string
 		wantPath    string
 		wantErr     bool
+		wantMsg     string // a substring of the refusal, so a case can't pass for another rule's reason
 	}{
-		{name: "default cluster", target: "/api/v1/pods", defaultID: gkeHost, wantCluster: gkeHost, wantPath: "/api/v1/pods"},
-		{name: "no default is in-cluster", target: "/api/v1/pods", wantCluster: InClusterID, wantPath: "/api/v1/pods"},
-		{name: "gke prefix", target: "/clusters/" + gkeFleet + "/api/v1/namespaces/default/pods", defaultID: gkeHost, wantCluster: gkeFleet, wantPath: "/api/v1/namespaces/default/pods"},
+		// No prefix is refused (#4739): kubectl before 1.34 drops the kubeconfig server's
+		// /clusters/<ctx> base path on `get --raw`, and a default cluster answered that
+		// fleet read with the host's data.
+		{name: "no prefix", target: "/api/v1/pods", wantErr: true, wantMsg: "name a cluster"},
+		{name: "no prefix, discovery", target: "/apis/metrics.k8s.io/v1beta1/nodes", wantErr: true, wantMsg: "name a cluster"},
+		{name: "no prefix, root", target: "/", wantErr: true, wantMsg: "name a cluster"},
+		{name: "gke prefix", target: "/clusters/" + gkeFleet + "/api/v1/namespaces/default/pods", wantCluster: gkeFleet, wantPath: "/api/v1/namespaces/default/pods"},
 		{name: "in-cluster prefix", target: "/clusters/in-cluster/apis/apps/v1/deployments", wantCluster: InClusterID, wantPath: "/apis/apps/v1/deployments"},
 		{name: "domain-scoped gke prefix", target: "/clusters/gke_example.com:proj_us-central1_c/api/v1/pods", wantCluster: "gke_example.com:proj_us-central1_c", wantPath: "/api/v1/pods"},
 		{name: "kind prefix", target: "/clusters/kind-dev.1/version", wantCluster: "kind-dev.1", wantPath: "/version"},
 		{name: "prefix alone is the root", target: "/clusters/in-cluster", wantCluster: InClusterID, wantPath: "/"},
-		{name: "encoded slash", target: "/api/v1/namespaces/default%2fsecrets/pods", wantErr: true},
-		{name: "encoded upper-case slash", target: "/api/v1/namespaces/default%2Fsecrets/pods", wantErr: true},
-		{name: "encoded dots", target: "/api/v1/namespaces/%2e%2e/secrets", wantErr: true},
-		{name: "encoded backslash", target: "/api/v1/namespaces/a%5cb/pods", wantErr: true},
-		{name: "encoded NUL", target: "/api/v1/namespaces/a%00/pods", wantErr: true},
-		{name: "encoded control character", target: "/api/v1/namespaces/a%0a/pods", wantErr: true},
-		{name: "dot-dot", target: "/api/v1/namespaces/default/pods/../../secrets", wantErr: true},
-		{name: "single dot", target: "/api/v1/./pods", wantErr: true},
-		{name: "double slash", target: "//api/v1/pods", wantErr: true},
-		{name: "inner double slash", target: "/api/v1//pods", wantErr: true},
-		{name: "missing cluster ID", target: "/clusters/", wantErr: true},
-		{name: "invalid cluster ID", target: "/clusters/bad$cluster/api/v1/pods", wantErr: true},
-		{name: "gke ID with too few parts", target: "/clusters/gke_proj_cluster/api", wantErr: true},
-		{name: "gke project with a dot and no domain", target: "/clusters/gke_example.com_us-central1_c/api", wantErr: true},
-		{name: "upper-case cluster ID", target: "/clusters/kind-Dev/api", wantErr: true},
+		{name: "encoded slash", target: "/clusters/in-cluster/api/v1/namespaces/default%2fsecrets/pods", wantErr: true, wantMsg: "percent-encoded"},
+		{name: "encoded upper-case slash", target: "/clusters/in-cluster/api/v1/namespaces/default%2Fsecrets/pods", wantErr: true, wantMsg: "percent-encoded"},
+		{name: "encoded dots", target: "/clusters/in-cluster/api/v1/namespaces/%2e%2e/secrets", wantErr: true, wantMsg: "percent-encoded"},
+		{name: "encoded backslash", target: "/clusters/in-cluster/api/v1/namespaces/a%5cb/pods", wantErr: true, wantMsg: "percent-encoded"},
+		{name: "encoded NUL", target: "/clusters/in-cluster/api/v1/namespaces/a%00/pods", wantErr: true, wantMsg: "control characters"},
+		{name: "encoded control character", target: "/clusters/in-cluster/api/v1/namespaces/a%0a/pods", wantErr: true, wantMsg: "control characters"},
+		{name: "dot-dot", target: "/clusters/in-cluster/api/v1/namespaces/default/pods/../../secrets", wantErr: true, wantMsg: "dot segments"},
+		{name: "single dot", target: "/clusters/in-cluster/api/v1/./pods", wantErr: true, wantMsg: "dot segments"},
+		{name: "double slash", target: "//clusters/in-cluster/api/v1/pods", wantErr: true, wantMsg: "empty path segments"},
+		{name: "inner double slash", target: "/clusters/in-cluster/api/v1//pods", wantErr: true, wantMsg: "empty path segments"},
+		{name: "missing cluster ID", target: "/clusters/", wantErr: true, wantMsg: "missing cluster ID"},
+		{name: "invalid cluster ID", target: "/clusters/bad$cluster/api/v1/pods", wantErr: true, wantMsg: "invalid cluster ID"},
+		{name: "gke ID with too few parts", target: "/clusters/gke_proj_cluster/api", wantErr: true, wantMsg: "invalid cluster ID"},
+		{name: "gke project with a dot and no domain", target: "/clusters/gke_example.com_us-central1_c/api", wantErr: true, wantMsg: "invalid cluster ID"},
+		{name: "upper-case cluster ID", target: "/clusters/kind-Dev/api", wantErr: true, wantMsg: "invalid cluster ID"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -68,13 +72,16 @@ func TestSplitClusterPath(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parse %q: %v", tc.target, err)
 			}
-			cluster, apiPath, perr := SplitClusterPath(u, tc.defaultID)
+			cluster, apiPath, perr := SplitClusterPath(u)
 			if tc.wantErr {
 				if perr == nil {
 					t.Fatalf("accepted (cluster=%q, path=%q)", cluster, apiPath)
 				}
 				if perr.Code != http.StatusBadRequest || perr.RejectionReason != ReasonInvalidRoute {
 					t.Errorf("refusal = %d %q, want 400 %q", perr.Code, perr.RejectionReason, ReasonInvalidRoute)
+				}
+				if !strings.Contains(perr.Error(), tc.wantMsg) {
+					t.Errorf("refusal %q, want it to say %q", perr.Error(), tc.wantMsg)
 				}
 				return
 			}
@@ -86,10 +93,10 @@ func TestSplitClusterPath(t *testing.T) {
 			}
 		})
 	}
-	if _, _, perr := SplitClusterPath(&url.URL{Path: "api"}, ""); perr == nil {
+	if _, _, perr := SplitClusterPath(&url.URL{Path: "api"}); perr == nil {
 		t.Error("accepted a relative path")
 	}
-	if _, _, perr := SplitClusterPath(nil, ""); perr == nil {
+	if _, _, perr := SplitClusterPath(nil); perr == nil {
 		t.Error("accepted a nil URL")
 	}
 }
@@ -122,7 +129,9 @@ func TestPolicyEvaluate(t *testing.T) {
 		{name: "discovery HEAD /version", method: http.MethodHead, target: "/version", want: every("")},
 		{name: "openapi v3 document", method: http.MethodGet, target: "/openapi/v3/apis/apps/v1", want: every("")},
 		{name: "openapi v3 bare prefix with slash", method: http.MethodGet, target: "/openapi/v3/", want: every(ReasonDiscoveryPathBlocked)},
-		{name: "metrics", method: http.MethodGet, target: "/metrics", want: every(ReasonDiscoveryPathBlocked)},
+		{name: "metrics", method: http.MethodGet, target: "/metrics", want: every("")},
+		{name: "HEAD /metrics", method: http.MethodHead, target: "/metrics", want: every("")},
+		{name: "POST to /metrics", method: http.MethodPost, target: "/metrics", want: every(ReasonDiscoveryPathBlocked)},
 		{name: "pprof", method: http.MethodGet, target: "/debug/pprof", want: every(ReasonDiscoveryPathBlocked)},
 		{name: "POST to discovery", method: http.MethodPost, target: "/api", want: every(ReasonDiscoveryPathBlocked)},
 		{name: "upgrade on discovery", method: http.MethodGet, target: "/api", headers: upgradeHeaders, want: every(ReasonProtocolUpgradeBlocked)},
@@ -334,7 +343,8 @@ func TestRefusalWithoutMarkers(t *testing.T) {
 		{http.MethodGet, "/api/v1/namespaces/default/pods/p/ephemeralcontainers"},
 		{http.MethodGet, "/api/v1/namespaces/default/pods/p/exec?command=sh"},
 		{http.MethodOptions, "/api/v1/namespaces/default/pods"},
-		{http.MethodGet, "/metrics"},
+		{http.MethodGet, "/debug/pprof"},
+		{http.MethodPost, "/metrics"},
 		{http.MethodGet, "/apis/certificates.k8s.io/v1/certificatesigningrequests/c/approval"},
 		{http.MethodOptions, "/apis/certificates.k8s.io/v1/certificatesigningrequests/c/approval"},
 	}

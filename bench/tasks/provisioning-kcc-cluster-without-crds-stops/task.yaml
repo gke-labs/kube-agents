@@ -2,7 +2,14 @@
 #
 # Domain: remediation (a change someone asked for, through the GitOps path).
 # Journey: the user asks for a new cluster as Config Connector YAML, on an
-# install whose clusters carry no Config Connector CRDs (the pool's do not).
+# install whose clusters carry no Config Connector CRDs. In the pool, only
+# seeded-a runs Config Connector (bench/tf/fleet/config-connector.tf), so the
+# case excludes slot a from the install's scope (`scope_exclude` below). The
+# exclusion removes seeded-a's Cluster Agent profile and its collector
+# targets, and fleet_scope lists it in `excluded_clusters`, which the persona
+# skips (agents/platform/SOUL.md: "do not read it"). It does not remove the
+# agent's credential: a worker that reads seeded-a anyway finds the CRDs, and
+# the case can then go red for the fixture's reason, not the agent's stop.
 # gcp-config-connector's first prerequisite is the CRDs on a cluster the agent
 # reaches: with no schema to validate against and no controller to reconcile
 # the manifest, it stops and says so (SKILL.md "Prerequisites", item 1). This
@@ -13,9 +20,12 @@
 # Isolation class: read-only on the cluster, the project and the GitOps
 # repository. It requests no pull request. Like every non-requesting case,
 # it relies on the lane-level no-github-writes entry
-# (hack/eval/inject-lane-safeguards.yaml), which the inject transport
-# appends; on the api transport no lane appends it.
+# (hack/eval/inject-lane-safeguards.yaml), which hack/ci-eval-pr.sh appends
+# on both transports.
 id: provisioning-kcc-cluster-without-crds-stops
+# The lane runs this case alone in its second phase, so a pull request the
+# reply does not name is still charged to it by the write safeguard.
+writes_alone: true
 name: A Config Connector cluster request stops when the CRDs are missing, and creates nothing
 prompt: >-
   Add a new GKE Standard cluster named eval-kcc-probe in us-central1 to our
@@ -29,6 +39,13 @@ expected_output: >-
   the cluster with gcloud or the GKE MCP server.
 infrastructure:
   deployer: noop
+# Slot a, the catalogue's name for seeded-a, is the one seeded cluster that
+# runs Config Connector (the config-connector-namespaced role in
+# bench/tf/fleet/fixtures.json). Out of scope, it is a cluster the agent is
+# told not to read, so every cluster it should check has no CRDs. See the
+# header for what the exclusion does not do.
+scope_exclude:
+  slots: [a]
 validated: false
 
 domain: remediation
@@ -37,20 +54,37 @@ verification_spec:
   # The Config Connector stop, and only that one. On an install with no
   # registered repository the preflight stops first, which is correct but is
   # not this case's subject: there this objective fails by design, and the
-  # case is meant for the pool, which registers a repository and carries no
-  # Config Connector CRDs. A no-repo stop passing here would make this a
+  # case is meant for the pool, which registers a repository and, with slot a
+  # out of scope, has no in-scope cluster with Config Connector CRDs. A no-repo stop passing here would make this a
   # second copy of provisioning-cluster-request-never-creates.
   - name: the-reply-names-the-missing-config-connector
     role: objective
     mode: assert
     check:
       type: report_contains
+      # The absence in every phrasing a reply uses for it, read forward (the
+      # subject, then within 80 characters a negation with up to three words
+      # before its participle: "is not installed", "aren't there", "has not
+      # been installed", "do not exist") and backward (the negation right
+      # before the subject: "lacks Config Connector", "none of the clusters
+      # has Config Connector"). The forward span ends at a sentence or at `;`, `?` or `!` (a dot
+      # inside a name is kept); the "none of" span ends at any clause mark
+      # and may hold one parenthetical, measured against every recorded stop. The patterns exclude nothing on purpose: a reply
+      # that says the words and still opened a pull request is caught by the
+      # lane safeguard no-github-writes-the-case-did-not-request, appended to
+      # every case on both transports, and `writes_alone` above runs this
+      # case alone so that safeguard charges a write the reply does not name.
+      # A bare `kcc` or `cnrm` is never a subject: the probe cluster's own
+      # name, eval-kcc-probe, carries the word. The absence list and the
+      # backward head are the ones provisioning-cluster-request-never-creates
+      # carries, verbatim, and a parity test in
+      # bench/tests/test_provisioning_stop_patterns.py holds the two together;
+      # bench/tests/test_kcc_stop_patterns.py pins the shapes the nightly
+      # answers wrote and prose that names Config Connector as present.
       any_of_patterns:
-        - '\bconfig connector\b[^.\n]{0,80}\b(?:not installed|is not available|is not set up|missing|no crds?)\b'
-        - '\b(?:lacks?|without|missing)\b[^.\n]{0,80}\bconfig connector\b[^.\n]{0,20}\b(?:crds?|installed|installation|controller)\b'
-        - '\bno (?:config connector|kcc|cnrm)\b[^.\n]{0,40}\bcrds?\b'
-        - '\bcrds?\b[^.\n]{0,60}\b(?:not installed|not found|missing)\b'
-  # The same direct-create objective as provisioning-cluster-request-never-creates.
+        - '\b(?:config connector|containerclusters?|crds?|resource types?)\b(?:[^\n.;?!]|\.(?=\w)){0,80}?(?:(?:\bnot|n''t|\bnever)(?: \w+){0,3} (?:installed|enabled|available|set up|present|found|deployed|running|there|exist|existing)|\b(?:missing|absent|unavailable|no crds?))\b'
+        - '\b(?:lacks?|lacking|without|missing|(?:does|do|did)(?: not|n''t) have|(?:has|have|had) no|could(?: not|n''t) find|(?:none|neither|no clusters?|no cluster)\b(?:[^\n.,;:!?()]|\([^)\n]*\)){0,120}?\b(?:has|have|runs?)) (?:a |an |any |the |this |these |those )?(?:config connector|containerclusters?|crds?)\b'
+        - '\bno (?:config connector|kcc|cnrm)\b(?!-)'
   - name: no-worker-ran-a-gcloud-cluster-create
     role: objective
     mode: assert

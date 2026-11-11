@@ -1,6 +1,8 @@
 // Package k8sapiproxy holds the Kubernetes API proxy that sits between the agent sandbox and
-// cluster API servers. So far it has the request policy: Policy.Evaluate decides from the
-// API server's own classification of a request (NewRequestInfoFactory) whether it may be
-// forwarded, and SplitClusterPath picks the target cluster from the path. See the module
-// README.
+// cluster API servers. NewHandler authenticates each request through a CallerAuthenticator,
+// picks the target cluster from the path (SplitClusterPath), decides from the API server's
+// own classification of the request (NewRequestInfoFactory, Policy.Evaluate) whether it may
+// be forwarded, strips the caller's credentials and identity headers, and forwards it through
+// an UpstreamTransport, recording an AuditEvent for each request. NewTokenReviewAuthenticator
+// is the CallerAuthenticator. See the module README.
 package k8sapiproxy

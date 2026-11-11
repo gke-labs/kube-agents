@@ -30,9 +30,12 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
+import yaml
+
 import command_policy
 import credential_proxy
 import scoped_sa_pool
+import vcs_readings
 from credential_proxy import (
     CommandExecutor,
     CredentialProxyHandler,
@@ -51,6 +54,10 @@ _STATUS_CODE_LABEL = re.compile(r"^[0-9]{3}$")
 _SERIES = re.compile(r"^(?P<name>[a-z_]+)(?:\{(?P<labels>[^}]*)\})? (?P<value>-?[0-9.]+(?:e[+-]?[0-9]+)?)$")
 _LABEL_PAIR = re.compile(r'([a-z_]+)="((?:[^"\\]|\\.)*)"')
 _STUB_FAILING_EXIT = 3
+# The host serve() is handed for the metrics and health listeners: not the
+# loopback address, so an assertion that the listener bound on it cannot be
+# satisfied by a hard-coded loopback bind.
+_PROBE_HOST = "10.96.0.9"
 
 
 def _parse(exposition):
@@ -71,6 +78,11 @@ def _parse(exposition):
         base = re.sub(r"_(bucket|sum|count)$", "", name)
         assert base in typed, f"{name} has no # TYPE line"
     return families
+
+
+# The class label the broker puts on the admission and duration series; every
+# caller these tests drive is interactive.
+INTERACTIVE = {credential_proxy.CLASS_LABEL: credential_proxy.CLASS_INTERACTIVE}
 
 
 def _series(families, name, **labels):
@@ -166,8 +178,8 @@ class ToolInvocationCountingTest(_BrokerFixture):
         self.assertEqual(
             1, _series(families, "kubeagents_tool_invocations_total", tool="kubectl", subcommand="get", status="success")
         )
-        self.assertEqual(1, _series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl"))
-        self.assertEqual(1, _series(families, "kubeagents_tool_execution_duration_seconds_bucket", tool="kubectl", le="+Inf"))
+        self.assertEqual(1, _series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl", **INTERACTIVE))
+        self.assertEqual(1, _series(families, "kubeagents_tool_execution_duration_seconds_bucket", tool="kubectl", le="+Inf", **INTERACTIVE))
 
     def test_a_non_zero_exit_counts_as_error(self):
         # The response still says `completed`: it reports that the broker ran
@@ -234,7 +246,7 @@ class ToolInvocationCountingTest(_BrokerFixture):
         self.assertIn("kubernetes.no-secrets", json.dumps(body))
         families = self.families()
         self.assertEqual(1, _series(families, "kubeagents_tool_invocations_total", tool="kubectl", subcommand="get", status="blocked"))
-        self.assertIsNone(_series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl"))
+        self.assertIsNone(_series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl", **INTERACTIVE))
 
     def routed_git(self):
         # `/v1/exec` refuses `git` before either git gate, so admit it to count
@@ -269,7 +281,7 @@ class ToolInvocationCountingTest(_BrokerFixture):
         self.assertEqual(400, status)
         families = self.families()
         self.assertEqual(1, _series(families, "kubeagents_tool_invocations_total", tool="kubectl", subcommand="get", status="error"))
-        self.assertIsNone(_series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl"))
+        self.assertIsNone(_series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl", **INTERACTIVE))
         self.assertEqual(1, _series(families, "kubeagents_credential_proxy_requests_total", endpoint="/v1/exec", status_code="400"))
 
 
@@ -315,7 +327,7 @@ class AbandonedCommandTest(unittest.TestCase):
             urllib.request.urlopen(request, timeout=5)
         families = _parse(CredentialProxyHandler.metrics.render())
         self.assertEqual(1, _series(families, "kubeagents_tool_invocations_total", tool="kubectl", subcommand="get", status="abandoned"))
-        self.assertEqual(1, _series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl"))
+        self.assertEqual(1, _series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl", **INTERACTIVE))
         self.assertIsNone(_series(families, "kubeagents_credential_proxy_requests_total", endpoint="/v1/exec", status_code="200"))
 
 
@@ -374,7 +386,6 @@ def _budgeted_executor(case, admits, metrics, max_output_bytes=1024):
     )
     limit = (
         credential_proxy.BROKER_RESIDENT_RESERVE_BYTES
-        + credential_proxy.CONTENT_WORKSPACE_RESERVE_BYTES
         + admits * per_request
     )
     floor = min(admits, credential_proxy.BUDGET_MINIMUM_ADMITTED_REQUESTS)
@@ -426,9 +437,9 @@ class AdmissionMetricsTest(unittest.TestCase):
         with executor.request_slot():
             pass
         families = self.families()
-        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="none"))
-        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_bucket", bound="none", le="0.1"))
-        self.assertIsNone(_series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="slot"))
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="none", **INTERACTIVE))
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_bucket", bound="none", le="0.1", **INTERACTIVE))
+        self.assertIsNone(_series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="slot", **INTERACTIVE))
 
     def test_an_unwaited_admission_is_none_whether_the_budget_is_on_or_off(self):
         # The label an idle broker shows does not flip with the memory limit:
@@ -438,9 +449,9 @@ class AdmissionMetricsTest(unittest.TestCase):
             with executor.request_slot():
                 pass
         families = self.families()
-        self.assertEqual(2, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="none"))
-        self.assertIsNone(_series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="budget"))
-        self.assertIsNone(_series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="slot"))
+        self.assertEqual(2, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="none", **INTERACTIVE))
+        self.assertIsNone(_series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="budget", **INTERACTIVE))
+        self.assertIsNone(_series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="slot", **INTERACTIVE))
 
     def test_a_wait_for_a_slot_is_observed_under_the_slot_bound(self):
         executor = self.executor(max_concurrent_commands=1)
@@ -451,22 +462,22 @@ class AdmissionMetricsTest(unittest.TestCase):
         families = self.families()
         # Two admissions: the holder's, which waited for nothing and is `none`,
         # and this one, under the slot cap.
-        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="none"))
-        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="slot"))
-        self.assertIsNone(_series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="budget"))
-        total = _series(families, "kubeagents_credential_proxy_admission_wait_seconds_sum", bound="slot")
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="none", **INTERACTIVE))
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="slot", **INTERACTIVE))
+        self.assertIsNone(_series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="budget", **INTERACTIVE))
+        total = _series(families, "kubeagents_credential_proxy_admission_wait_seconds_sum", bound="slot", **INTERACTIVE)
         self.assertGreaterEqual(total, 0.5)
         self.assertLessEqual(total, waited + 0.1)
         # Cumulative buckets in bound order: this wait is past the first edge
         # and inside the last; the holder's zero sits in `none`'s first bucket.
         buckets = [
-            _series(families, "kubeagents_credential_proxy_admission_wait_seconds_bucket", bound="slot", le=str(bound))
+            _series(families, "kubeagents_credential_proxy_admission_wait_seconds_bucket", bound="slot", le=str(bound), **INTERACTIVE)
             for bound in credential_proxy.ADMISSION_WAIT_BUCKETS
         ]
         self.assertEqual(buckets, sorted(buckets))
         self.assertEqual(0, buckets[0])
         self.assertEqual(1, buckets[-1])
-        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_bucket", bound="none", le="0.1"))
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_bucket", bound="none", le="0.1", **INTERACTIVE))
 
     def test_a_wait_for_the_budget_is_observed_under_the_budget_bound(self):
         # Eight slots, a budget for one: the second request waits for the
@@ -480,10 +491,10 @@ class AdmissionMetricsTest(unittest.TestCase):
         # The holder's admission waited for nothing (`none`); this one waited
         # under the budget: with the budget on and no slot ever full, the
         # budget is what the queue is for.
-        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="none"))
-        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="budget"))
-        self.assertIsNone(_series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="slot"))
-        self.assertGreaterEqual(_series(families, "kubeagents_credential_proxy_admission_wait_seconds_sum", bound="budget"), 0.5)
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="none", **INTERACTIVE))
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="budget", **INTERACTIVE))
+        self.assertIsNone(_series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="slot", **INTERACTIVE))
+        self.assertGreaterEqual(_series(families, "kubeagents_credential_proxy_admission_wait_seconds_sum", bound="budget", **INTERACTIVE), 0.5)
 
     def test_the_buckets_put_the_preflight_cap_and_the_refusal_bound_on_an_edge(self):
         # 15 s is the cap the Cluster Agent preflight puts on one brokered
@@ -589,15 +600,15 @@ class AdmissionMetricsTest(unittest.TestCase):
                 self.fail("admitted instead of yielding")
         arrival = raised.exception.queued_at
         # Only the holder's own (unwaited, `none`) admission is observed so far.
-        self.assertIsNone(_series(_parse(self.metrics.render()), "kubeagents_credential_proxy_admission_wait_seconds_count", bound="budget"))
+        self.assertIsNone(_series(_parse(self.metrics.render()), "kubeagents_credential_proxy_admission_wait_seconds_count", bound="budget", **INTERACTIVE))
         holder.join()
         with executor.reserve_child_memory(deadline=time.monotonic() + 5, queued_at=arrival):
             pass
         families = _parse(self.metrics.render())
         # The second leg was admitted at once, but it carries the first leg's
         # arrival, so it is a waited admission under the budget, not `none`.
-        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="budget"))
-        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="none"))
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="budget", **INTERACTIVE))
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_wait_seconds_count", bound="none", **INTERACTIVE))
         # Measured from the first leg's arrival, which comes after the holder
         # took its slot, so the wait is at least the time from arrival to the
         # earliest the slot could come free -- not the whole 0.4 s hold, which
@@ -609,7 +620,7 @@ class AdmissionMetricsTest(unittest.TestCase):
         # falls under.
         earliest_release = holder.held_at + 0.4
         self.assertGreaterEqual(
-            _series(families, "kubeagents_credential_proxy_admission_wait_seconds_sum", bound="budget"),
+            _series(families, "kubeagents_credential_proxy_admission_wait_seconds_sum", bound="budget", **INTERACTIVE),
             earliest_release - arrival - 1e-6,
         )
 
@@ -639,18 +650,19 @@ class AdmissionMetricsTest(unittest.TestCase):
         self.metrics.record_refusal(credential_proxy.ADMISSION_BOUND_SLOT)
         self.metrics.record_refusal(credential_proxy.ADMISSION_BOUND_BUDGET)
         families = self.families()
-        self.assertEqual(2, _series(families, "kubeagents_credential_proxy_admission_refusals_total", bound="slot"))
-        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_refusals_total", bound="budget"))
+        self.assertEqual(2, _series(families, "kubeagents_credential_proxy_admission_refusals_total", bound="slot", **INTERACTIVE))
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_refusals_total", bound="budget", **INTERACTIVE))
         for labels in families["kubeagents_credential_proxy_admission_refusals_total"]:
-            self.assertEqual({"bound"}, {key for key, _ in labels})
+            self.assertEqual({"bound", "class"}, {key for key, _ in labels})
             self.assertRegex(dict(labels)["bound"], _WORD_LABEL)
+            self.assertIn(dict(labels)["class"], credential_proxy.CLASSES)
 
     def test_a_refusal_bound_outside_the_vocabulary_is_counted_as_other(self):
         # The label set is closed: a bound the code does not name counts under
         # `other` rather than opening a series per message.
         self.metrics.record_refusal("something a caller wrote")
         families = self.families()
-        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_refusals_total", bound="other"))
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_refusals_total", bound="other", **INTERACTIVE))
         self.assertNotIn("something a caller wrote", self.metrics.render())
 
     def test_the_gauges_read_the_slots_and_bytes_in_use_against_each_cap(self):
@@ -700,7 +712,7 @@ class BusyRouteCountingTest(_BrokerFixture):
             status, body = self.post(["kubectl", "get", "pods"])
         self.assertEqual((503, "busy", "CREDENTIAL_PROXY_BUSY"), (status, body["status"], body["code"]))
         families = self.families()
-        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_refusals_total", bound="slot"))
+        self.assertEqual(1, _series(families, "kubeagents_credential_proxy_admission_refusals_total", bound="slot", **INTERACTIVE))
         self.assertEqual(1, _series(families, "kubeagents_tool_invocations_total", tool="kubectl", subcommand="get", status="busy"))
 
 
@@ -755,10 +767,10 @@ class VcsProviderLabelsTest(unittest.TestCase):
 
     def test_a_provider_outside_the_known_set_is_folded_to_other(self):
         metrics = ProxyMetrics()
-        metrics.record_vcs("proposal-create", "success", "bitbucket")
+        metrics.record_vcs("proposal-create", "success", "gogs")
         families = _parse(metrics.render())
         self.assertEqual(1, _series(families, self.FAMILY, verb="proposal-create", status="success", provider="other"))
-        self.assertNotIn("bitbucket", metrics.render())
+        self.assertNotIn("gogs", metrics.render())
 
     def test_a_status_outside_the_closed_set_is_folded_to_error(self):
         # An exit that named no outcome (a bare return) or an unlisted word
@@ -867,10 +879,9 @@ class BrokerFailureCountingTest(_BrokerFixture):
             ("/v1/chat/post", "502", None),
             ("/v1/chat/api/x", "500", None),
             ("/v1/chat/a2a/events", "502", None),
-            ("/v1/workspace/lease", "500", "other_failed"),
             ("/v1/feedback/report", "502", "other_failed"),
             ("/no/such/route", "500", "other_failed"),
-            ("/v1/workspace/lease", "404", None),
+            ("/no/such/route", "404", None),
         ]
         for path, status, want in cases:
             with self.subTest(path=path, status=status):
@@ -1051,7 +1062,7 @@ class VcsRequestCountingTest(_BrokerFixture):
 
     def test_a_broker_at_its_cap_counts_as_busy(self):
         @contextlib.contextmanager
-        def no_slot_free(caller=None):
+        def no_slot_free(caller=None, klass=None):
             raise credential_proxy.CommandSlotUnavailable("limit of 8 concurrent commands")
             yield  # pragma: no cover
 
@@ -1087,7 +1098,7 @@ class VcsRequestCountingTest(_BrokerFixture):
 
     def test_a_caller_that_leaves_the_queue_counts_as_abandoned(self):
         @contextlib.contextmanager
-        def caller_gone(caller=None):
+        def caller_gone(caller=None, klass=None):
             raise credential_proxy.CallerHungUp()
             yield  # pragma: no cover
 
@@ -1197,32 +1208,152 @@ class VcsRequestCountingTest(_BrokerFixture):
         self.assertEqual(set(credential_proxy.vcs_broker.route_table(mock.Mock())), set(credential_proxy.vcs_broker.VCS_VERBS))
 
 
-class MergedProposalMetricTest(_BrokerFixture):
-    def test_merged_proposals_render_as_one_unlabelled_counter(self):
-        CredentialProxyHandler.metrics.record_merged(2)
-        CredentialProxyHandler.metrics.record_merged(1)
+class ReadingsMetricTest(_BrokerFixture):
+    """The sweep's two readings and its failure counter, as the broker renders them."""
+
+    def outcomes(self, taken_at=None):
+        return vcs_readings.OutcomesReading(
+            open=3, merged=5, closed=2, taken_at=time.time() if taken_at is None else taken_at
+        )
+
+    def details(self, taken_at=None):
+        inf = float("inf")
+        return vcs_readings.DetailsReading(
+            closed_by={"install": 1, "human": 1, "bot": 0},
+            touches={
+                vcs_readings.Touch("review_approved", "human"): 4,
+                vcs_readings.Touch("commit", "bot"): 1,
+            },
+            buckets={
+                "merged": {0.0: 2, 1.0: 3, 2.0: 3, 3.0: 4, 5.0: 4, 8.0: 5, 13.0: 5, 21.0: 5, inf: 5},
+                "closed": {0.0: 1, 1.0: 1, 2.0: 2, 3.0: 2, 5.0: 2, 8.0: 2, 13.0: 2, 21.0: 2, inf: 2},
+            },
+            ignored=1,
+            taken_at=time.time() if taken_at is None else taken_at,
+        )
+
+    def test_set_readings_renders_the_outcomes_and_details_families_as_gauges(self):
+        metrics = CredentialProxyHandler.metrics
+        before = metrics.render()
+        for name in ("kubeagents_vcs_proposals", "kubeagents_vcs_readings_age_seconds", "kubeagents_vcs_readings_failures_total"):
+            self.assertNotIn(name, before, "a family rendered before its first reading")
+        metrics.set_readings(self.outcomes(), self.details())
+        text = metrics.render()
+        families = _parse(text)
+        for state, value in (("open", 3), ("merged", 5), ("closed", 2)):
+            self.assertEqual(value, _series(families, "kubeagents_vcs_proposals", state=state))
+        for actor, value in (("install", 1), ("human", 1), ("bot", 0)):
+            self.assertEqual(value, _series(families, "kubeagents_vcs_proposals_closed_by", actor=actor))
+        self.assertEqual(4, _series(families, "kubeagents_vcs_proposal_touches", kind="review_approved", actor="human"))
+        self.assertEqual(1, _series(families, "kubeagents_vcs_proposal_touches", kind="commit", actor="bot"))
+        per = "kubeagents_vcs_proposal_touches_per_proposal"
+        self.assertEqual(2, _series(families, per, outcome="merged", le="0"))
+        self.assertEqual(4, _series(families, per, outcome="merged", le="3"))
+        self.assertEqual(5, _series(families, per, outcome="merged", le="+Inf"))
+        self.assertEqual(2, _series(families, per, outcome="closed", le="+Inf"))
+        self.assertEqual(9, len([k for k in families[per] if ("outcome", "merged") in k]))
+        self.assertEqual(1, _series(families, "kubeagents_vcs_proposals_ignored"))
+        for reading in ("outcomes", "details"):
+            age = _series(families, "kubeagents_vcs_readings_age_seconds", reading=reading)
+            self.assertIsNotNone(age)
+            self.assertGreaterEqual(age, 0)
+            self.assertLess(age, 60)
+        for name in (
+            "kubeagents_vcs_proposals",
+            "kubeagents_vcs_proposals_closed_by",
+            "kubeagents_vcs_proposal_touches",
+            per,
+            "kubeagents_vcs_proposals_ignored",
+            "kubeagents_vcs_readings_age_seconds",
+        ):
+            self.assertIn(f"# TYPE {name} gauge", text)
+        self.assertNotIn(f"{per}_bucket", text)
+        self.assertNotIn(f"{per}_count", text)
+
+    def test_a_withheld_reading_keeps_the_previous_one(self):
+        metrics = CredentialProxyHandler.metrics
+        metrics.set_readings(self.outcomes(), self.details())
+        metrics.set_readings(vcs_readings.OutcomesReading(open=4, merged=6, closed=2, taken_at=time.time()), None)
         families = self.families()
-        self.assertEqual(3, _series(families, "kubeagents_vcs_proposals_merged_total"))
-        self.assertIn("# TYPE kubeagents_vcs_proposals_merged_total counter", CredentialProxyHandler.metrics.render())
+        self.assertEqual(6, _series(families, "kubeagents_vcs_proposals", state="merged"))
+        self.assertEqual(1, _series(families, "kubeagents_vcs_proposals_ignored"), "a withheld details reading was dropped")
 
-    def test_the_broker_built_for_the_handler_reports_merges_into_its_metrics(self):
-        broker = credential_proxy.build_vcs_broker(CredentialProxyHandler.executor)
-        broker.merge_observer(2)
-        self.assertEqual(2, _series(self.families(), "kubeagents_vcs_proposals_merged_total"))
-        self.assertEqual(credential_proxy.PROCESS_START_TIME_SECONDS, broker.started_at)
-
-    def test_proposals_closed_unmerged_render_as_one_unlabelled_counter(self):
-        CredentialProxyHandler.metrics.record_closed_unmerged(1)
-        CredentialProxyHandler.metrics.record_closed_unmerged(2)
+    def test_a_withheld_outcomes_reading_keeps_the_previous_one(self):
+        # The other half of the rule: a sweep whose tally failed publishes the
+        # details alone, and the last outcomes reading stays served until it
+        # is an hour old, not blanked at once.
+        metrics = CredentialProxyHandler.metrics
+        metrics.set_readings(self.outcomes(), self.details())
+        metrics.set_readings(None, self.details())
         families = self.families()
-        self.assertEqual(3, _series(families, "kubeagents_vcs_proposals_closed_unmerged_total"))
-        self.assertEqual(0, _series(families, "kubeagents_vcs_proposals_merged_total"), "a close moved the merged series")
-        self.assertIn("# TYPE kubeagents_vcs_proposals_closed_unmerged_total counter", CredentialProxyHandler.metrics.render())
+        self.assertEqual(5, _series(families, "kubeagents_vcs_proposals", state="merged"))
+        self.assertIsNotNone(_series(families, "kubeagents_vcs_readings_age_seconds", reading="outcomes"))
 
-    def test_the_broker_built_for_the_handler_reports_closes_into_its_metrics(self):
+    def test_an_unknown_failure_reason_is_counted_as_other(self):
+        metrics = CredentialProxyHandler.metrics
+        metrics.record_reading_failure("a-reason-nobody-declared")
+        families = self.families()
+        self.assertEqual(1, _series(families, "kubeagents_vcs_readings_failures_total", reason="other"))
+        labels = {dict(key).get("reason") for key in families["kubeagents_vcs_readings_failures_total"]}
+        self.assertIn("other", labels)
+        self.assertNotIn("a-reason-nobody-declared", labels, "an undeclared reason must never become a label")
+
+    def test_only_the_reading_taken_is_rendered(self):
+        CredentialProxyHandler.metrics.set_readings(self.outcomes(), None)
+        families = self.families()
+        self.assertEqual(5, _series(families, "kubeagents_vcs_proposals", state="merged"))
+        self.assertIsNotNone(_series(families, "kubeagents_vcs_readings_age_seconds", reading="outcomes"))
+        self.assertIsNone(_series(families, "kubeagents_vcs_readings_age_seconds", reading="details"))
+        for name in ("kubeagents_vcs_proposals_closed_by", "kubeagents_vcs_proposal_touches", "kubeagents_vcs_proposals_ignored"):
+            self.assertNotIn(name, families)
+
+    def test_a_stale_reading_is_omitted_and_its_age_gauge_is_not(self):
+        stale = time.time() - vcs_readings.VCS_READINGS_STALE_SECONDS - 10
+        CredentialProxyHandler.metrics.set_readings(self.outcomes(taken_at=stale), self.details())
+        families = self.families()
+        self.assertNotIn("kubeagents_vcs_proposals", families, "an hour-old outcomes reading was rendered as current")
+        age = _series(families, "kubeagents_vcs_readings_age_seconds", reading="outcomes")
+        self.assertGreaterEqual(age, vcs_readings.VCS_READINGS_STALE_SECONDS)
+        self.assertEqual(1, _series(families, "kubeagents_vcs_proposals_ignored"), "a fresh details reading went with the stale one")
+
+        CredentialProxyHandler.metrics.set_readings(None, self.details(taken_at=stale))
+        families = self.families()
+        for name in (
+            "kubeagents_vcs_proposals_closed_by",
+            "kubeagents_vcs_proposal_touches",
+            "kubeagents_vcs_proposal_touches_per_proposal",
+            "kubeagents_vcs_proposals_ignored",
+        ):
+            self.assertNotIn(name, families)
+        self.assertIsNotNone(_series(families, "kubeagents_vcs_readings_age_seconds", reading="details"))
+
+    def test_the_failure_counter_carries_every_reason(self):
+        metrics = CredentialProxyHandler.metrics
+        reasons = ("forge", "identity", "truncated", "detail_truncated", "rate_limited", "warming", "quota_floor")
+        for reason in reasons:
+            metrics.record_reading_failure(reason)
+        metrics.record_reading_failure("rate_limited")
+        text = metrics.render()
+        families = _parse(text)
+        self.assertIn("# TYPE kubeagents_vcs_readings_failures_total counter", text)
+        for reason in reasons:
+            expected = 2 if reason == "rate_limited" else 1
+            self.assertEqual(expected, _series(families, "kubeagents_vcs_readings_failures_total", reason=reason))
+        self.assertNotIn("kubeagents_vcs_readings_age_seconds", families, "a failure rendered an age with no reading")
+
+    def test_the_two_old_counters_are_gone(self):
+        metrics = CredentialProxyHandler.metrics
+        metrics.set_readings(self.outcomes(), self.details())
+        text = metrics.render()
+        self.assertNotIn("kubeagents_vcs_proposals_merged_total", text)
+        self.assertNotIn("kubeagents_vcs_proposals_closed_unmerged_total", text)
+        for name in ("VCS_MERGED_METRIC", "VCS_CLOSED_UNMERGED_METRIC"):
+            self.assertFalse(hasattr(credential_proxy, name), name)
+        for name in ("record_merged", "record_closed_unmerged"):
+            self.assertFalse(hasattr(metrics, name), name)
         broker = credential_proxy.build_vcs_broker(CredentialProxyHandler.executor)
-        broker.close_observer(3)
-        self.assertEqual(3, _series(self.families(), "kubeagents_vcs_proposals_closed_unmerged_total"))
+        for name in ("merge_observer", "close_observer", "started_at"):
+            self.assertFalse(hasattr(broker, name), name)
 
 
 class MetricsListenerTest(unittest.TestCase):
@@ -1248,14 +1379,14 @@ class MetricsListenerTest(unittest.TestCase):
         self.assertEqual(1, _series(families, "kubeagents_tool_invocations_total", tool="kubectl", subcommand="get", status="success"))
         # Cumulative buckets, in bound order, ending at the count.
         buckets = [
-            _series(families, "kubeagents_tool_execution_duration_seconds_bucket", tool="kubectl", le=str(bound))
+            _series(families, "kubeagents_tool_execution_duration_seconds_bucket", tool="kubectl", le=str(bound), **INTERACTIVE)
             for bound in credential_proxy.TOOL_DURATION_BUCKETS
         ]
         self.assertEqual(buckets, sorted(buckets))
         self.assertEqual(0, buckets[0])
         self.assertEqual(1, buckets[-1])
-        self.assertEqual(1, _series(families, "kubeagents_tool_execution_duration_seconds_bucket", tool="kubectl", le="+Inf"))
-        self.assertAlmostEqual(0.24, _series(families, "kubeagents_tool_execution_duration_seconds_sum", tool="kubectl"))
+        self.assertEqual(1, _series(families, "kubeagents_tool_execution_duration_seconds_bucket", tool="kubectl", le="+Inf", **INTERACTIVE))
+        self.assertAlmostEqual(0.24, _series(families, "kubeagents_tool_execution_duration_seconds_sum", tool="kubectl", **INTERACTIVE))
         self.assertIn("# HELP kubeagents_credential_proxy_requests_total", body)
 
     def test_the_listener_serves_nothing_else(self):
@@ -1264,6 +1395,21 @@ class MetricsListenerTest(unittest.TestCase):
                 with self.assertRaises(urllib.error.HTTPError) as caught:
                     urllib.request.urlopen(self.endpoint + path)
                 self.assertEqual(404, caught.exception.code)
+
+    def test_a_scrape_starts_nothing(self):
+        """The readings are taken on the sweep's timer; a scrape only renders
+        what the last attempt left, so it never starts an attempt or a forge call."""
+        with mock.patch.object(vcs_readings.ReadingsSweep, "run_once", autospec=True) as run_once, \
+                mock.patch.object(vcs_readings.ReadingsSweep, "start", autospec=True) as start, \
+                mock.patch.object(credential_proxy, "sweep_transport_for") as transport_for:
+            before = {thread.name for thread in threading.enumerate()}
+            for _ in range(3):
+                urllib.request.urlopen(self.endpoint + "/metrics").read()
+            after = {thread.name for thread in threading.enumerate()}
+        run_once.assert_not_called()
+        start.assert_not_called()
+        transport_for.assert_not_called()
+        self.assertNotIn(vcs_readings.THREAD_NAME, after - before)
 
     def test_a_scrape_writes_no_access_log_line(self):
         captured = io.StringIO()
@@ -1480,11 +1626,15 @@ class OperatorContractTest(unittest.TestCase):
         # args.port has to be the port Envoy binds in front of the socket. The
         # operator sets it from credentialProxyPort, Envoy's config carries the
         # literal, and the runtime's default is the fallback for a hand run:
-        # one number, or the refusal guards the wrong port.
+        # one number, or the refusal guards the wrong port. The config has two
+        # listeners, so the number is read off the credentialed one by name
+        # rather than off whichever port_value comes first.
         manifests = _OPERATOR_MANIFESTS.read_text()
         self.assertRegex(manifests, r'credentialProxyPortEnv\s*=\s*"CREDENTIAL_PROXY_PORT"')
         operator_port = int(re.search(r"^\s*credentialProxyPort\s*=\s*(\d+)", manifests, re.MULTILINE).group(1))
-        envoy_port = int(re.search(r"port_value:\s*(\d+)", _ENVOY_CONFIG.read_text()).group(1))
+        listeners = yaml.safe_load(_ENVOY_CONFIG.read_text())["static_resources"]["listeners"]
+        credentialed = next(listener for listener in listeners if listener["name"] == "credential_proxy")
+        envoy_port = int(credentialed["address"]["socket_address"]["port_value"])
         with mock.patch.object(sys, "argv", ["credential_proxy.py"]), mock.patch.dict(os.environ):
             os.environ.pop("CREDENTIAL_PROXY_PORT", None)
             runtime_default = credential_proxy.parse_args().port
@@ -1534,7 +1684,6 @@ class LabelDerivationTest(unittest.TestCase):
             "/v1/watcher/gcp/pubsub.googleapis.com/v1/projects/p/subscriptions/s:pull": "/v1/watcher/gcp",
             "/v1/pubsub/gcp/pubsub.googleapis.com/v1/projects/p/subscriptions/s:pull": "/v1/pubsub/gcp",
             "/v1/vcs/push": "/v1/vcs",
-            "/v1/workspace/acquire": "/v1/workspace",
             "/v1/forge/refresh": "/v1/forge",
             "/healthz": "/healthz",
             "/metrics": "other",
@@ -1564,7 +1713,7 @@ class RegistryTest(unittest.TestCase):
             worker.join()
         families = _parse(metrics.render())
         self.assertEqual(per_thread * threads, _series(families, "kubeagents_tool_invocations_total", tool="kubectl", subcommand="get", status="success"))
-        self.assertEqual(per_thread * threads, _series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl"))
+        self.assertEqual(per_thread * threads, _series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl", **INTERACTIVE))
         self.assertEqual(per_thread * threads, _series(families, "kubeagents_credential_proxy_requests_total", endpoint="/v1/exec", status_code="200"))
 
     def test_label_values_are_escaped(self):
@@ -1609,7 +1758,7 @@ class NeverStartedCommandTest(unittest.TestCase):
         CredentialProxyHandler.max_request_bytes = 65536
         CredentialProxyHandler.enforce_read_only = True
         CredentialProxyHandler.authenticator = credential_proxy.NullAuthenticator()
-        CredentialProxyHandler._request_slot = lambda handler: _refusing_slot(exc)
+        CredentialProxyHandler._request_slot = lambda handler, klass=None: _refusing_slot(exc)
         server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.server_close)
@@ -1628,7 +1777,7 @@ class NeverStartedCommandTest(unittest.TestCase):
         self.assertEqual(503, caught.exception.code)
         families = _parse(CredentialProxyHandler.metrics.render())
         self.assertEqual(1, _series(families, "kubeagents_tool_invocations_total", tool="kubectl", subcommand="get", status="busy"))
-        self.assertIsNone(_series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl"))
+        self.assertIsNone(_series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl", **INTERACTIVE))
         self.assertEqual(1, _series(families, "kubeagents_credential_proxy_requests_total", endpoint="/v1/exec", status_code="503"))
 
     def test_a_caller_that_leaves_the_queue_is_counted_as_abandoned(self):
@@ -1638,7 +1787,7 @@ class NeverStartedCommandTest(unittest.TestCase):
             urllib.request.urlopen(request, timeout=5)
         families = _parse(CredentialProxyHandler.metrics.render())
         self.assertEqual(1, _series(families, "kubeagents_tool_invocations_total", tool="kubectl", subcommand="get", status="abandoned"))
-        self.assertIsNone(_series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl"))
+        self.assertIsNone(_series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl", **INTERACTIVE))
 
 
 class FaultOutcomeTest(unittest.TestCase):
@@ -1692,14 +1841,14 @@ class FaultOutcomeTest(unittest.TestCase):
         self.assertEqual("gcp.scoped-sa.unmapped-scope", body.get("rule"))
         families = _parse(CredentialProxyHandler.metrics.render())
         self.assertEqual(1, _series(families, "kubeagents_tool_invocations_total", tool="kubectl", subcommand="get", status="blocked"))
-        self.assertIsNone(_series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl"))
+        self.assertIsNone(_series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl", **INTERACTIVE))
 
     def test_a_broker_fault_counts_as_error(self):
         status, _ = self._post_with(RuntimeError("boom"))
         self.assertEqual(500, status)
         families = _parse(CredentialProxyHandler.metrics.render())
         self.assertEqual(1, _series(families, "kubeagents_tool_invocations_total", tool="kubectl", subcommand="get", status="error"))
-        self.assertIsNone(_series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl"))
+        self.assertIsNone(_series(families, "kubeagents_tool_execution_duration_seconds_count", tool="kubectl", **INTERACTIVE))
         self.assertEqual(1, _series(families, "kubeagents_credential_proxy_requests_total", endpoint="/v1/exec", status_code="500"))
 
 
@@ -1724,11 +1873,9 @@ class PolicyReadCoverageTest(unittest.TestCase):
         self.assertFalse(vocabulary & command_policy._GCLOUD_RELEASE_TRACKS, "a release track is never a label")
 
     def test_every_git_verb_a_gate_reads_labels_as_itself(self):
-        # The lease gate's list and the workspace's list are the vocabulary's
+        # The lease gate's list and the vcs door's list are the vocabulary's
         # sources, so a verb either refuses or runs under its own name.
-        import content_workspace
-
-        verbs = (credential_proxy.GIT_MUTATING_SUBCOMMANDS | content_workspace.WORKSPACE_GIT_SUBCOMMANDS
+        verbs = (credential_proxy.GIT_MUTATING_SUBCOMMANDS
                  | credential_proxy.VCS_GIT_SUBCOMMANDS | credential_proxy.GIT_READ_SUBCOMMANDS)
         for verb in sorted(verbs):
             with self.subTest(verb=verb):
@@ -1754,14 +1901,14 @@ class ServeWiringTest(unittest.TestCase):
     class _Stop(Exception):
         pass
 
-    def _serve(self, metrics_port, env_value=None, started=None, unix_server=None):
+    def _serve(self, metrics_port, env_value=None, started=None, unix_server=None, health_port=0, health_started=None, host="127.0.0.1"):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         policy_path = Path(tmp.name) / "policy.json"
         policy_path.write_text(json.dumps({"blockedMessage": "blocked", "rules": []}), encoding="utf-8")
         args = types.SimpleNamespace(
             policy=str(policy_path),
-            host="127.0.0.1",
+            host=host,
             port=0,
             unix_socket=str(Path(tmp.name) / "backend.sock"),
             timeout_seconds=5,
@@ -1770,6 +1917,7 @@ class ServeWiringTest(unittest.TestCase):
             state_dir=str(Path(tmp.name) / "state"),
             role="full",
             metrics_port=metrics_port,
+            health_port=health_port,
         )
         environment = {
             "API_SERVER_EXTERNAL_KEY": "external",
@@ -1793,6 +1941,7 @@ class ServeWiringTest(unittest.TestCase):
                 pass
 
         started = started if started is not None else mock.MagicMock(return_value=None)
+        health_started = health_started if health_started is not None else mock.MagicMock(return_value=None)
         unix_server = unix_server if unix_server is not None else credential_proxy.ThreadingUnixHTTPServer
         try:
             with mock.patch.dict(os.environ, environment, clear=True), \
@@ -1801,6 +1950,7 @@ class ServeWiringTest(unittest.TestCase):
                     mock.patch.object(credential_proxy.threading, "Thread", FakeThread), \
                     mock.patch.object(credential_proxy.ThreadingUnixHTTPServer, "serve_forever", stop), \
                     mock.patch.object(credential_proxy, "start_metrics_listener", started), \
+                    mock.patch.object(credential_proxy, "start_health_listener", health_started), \
                     self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
                 with self.assertRaises(self._Stop):
                     credential_proxy.serve(args)
@@ -1810,8 +1960,8 @@ class ServeWiringTest(unittest.TestCase):
         return started, logs.output
 
     def test_the_parsed_port_reaches_the_listener(self):
-        started, _ = self._serve(8766)
-        started.assert_called_once_with("127.0.0.1", 8766)
+        started, _ = self._serve(8766, host=_PROBE_HOST)
+        started.assert_called_once_with(_PROBE_HOST, 8766)
 
     def test_a_value_that_is_no_port_is_refused_by_name_and_never_bound(self):
         started, logs = self._serve(70000)
@@ -1839,12 +1989,31 @@ class ServeWiringTest(unittest.TestCase):
         # The harness serves on the socket, where Envoy holds port 8765 in the
         # shipped layout; the refusal has to hold there too.
         args_port = 8765
-        refusal = credential_proxy._metrics_port_refusal(args_port, types.SimpleNamespace(port=args_port, unix_socket="/run/backend.sock"))
+        envoy = {8765: "credential_proxy", 8768: "credential_health"}
+        refusal = credential_proxy._metrics_port_refusal(args_port, types.SimpleNamespace(port=args_port, unix_socket="/run/backend.sock"), envoy)
         self.assertIn("8765", refusal)
         self.assertIn("credentialed", refusal)
-        self.assertIsNone(credential_proxy._metrics_port_refusal(8766, types.SimpleNamespace(port=args_port, unix_socket="")))
-        self.assertIn("credentialed", credential_proxy._metrics_port_refusal(args_port, types.SimpleNamespace(port=args_port, unix_socket="")))
-        self.assertIn("1-65535", credential_proxy._metrics_port_refusal(70000, types.SimpleNamespace(port=args_port, unix_socket="")))
+        self.assertIsNone(credential_proxy._metrics_port_refusal(8766, types.SimpleNamespace(port=args_port, unix_socket=""), envoy))
+        self.assertIn("credentialed", credential_proxy._metrics_port_refusal(args_port, types.SimpleNamespace(port=args_port, unix_socket=""), envoy))
+        self.assertIn("1-65535", credential_proxy._metrics_port_refusal(70000, types.SimpleNamespace(port=args_port, unix_socket=""), envoy))
+        # Envoy's other listener, the readiness probe's: refused by Envoy's
+        # name for it, and not refused when no config told the broker of it.
+        refusal = credential_proxy._metrics_port_refusal(8768, types.SimpleNamespace(port=args_port, unix_socket=""), envoy)
+        self.assertIn("Envoy", refusal)
+        self.assertIn("credential_health", refusal)
+        self.assertIsNone(credential_proxy._metrics_port_refusal(8768, types.SimpleNamespace(port=args_port, unix_socket=""), {}))
+
+    def test_a_metrics_port_envoy_holds_is_refused_by_name_and_never_bound(self):
+        # serve() reads the ports off the shipped config itself; 8768 is the
+        # readiness probe's listener there, which the operator never gives the
+        # metrics listener, so this is the hand-edit case the refusal is for.
+        with mock.patch.object(credential_proxy, "ENVOY_CONFIG_PATHS", (_ENVOY_CONFIG,)):
+            started, logs = self._serve(8768)
+        started.assert_not_called()
+        self.assertTrue(
+            any("ALERT" in line and credential_proxy.METRICS_PORT_ENV in line and "credential_health" in line and "8768" in line for line in logs),
+            logs,
+        )
 
     def test_a_zero_or_refused_port_is_reported_as_what_it_is(self):
         # Three ways to arrive at 0, three different things an operator
@@ -1855,7 +2024,51 @@ class ServeWiringTest(unittest.TestCase):
                 started.assert_not_called()
                 self.assertTrue(any("metrics listener disabled" in line and expected in line for line in logs), logs)
                 if env_value is not None:
-                    self.assertFalse(any("is unset" in line for line in logs), logs)
+                    self.assertFalse(any("metrics listener disabled" in line and "is unset" in line for line in logs), logs)
+
+    def test_the_health_port_reaches_its_listener_after_the_credentialed_server(self):
+        order = []
+
+        class _Recording(credential_proxy.ThreadingUnixHTTPServer):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                order.append("credentialed")
+
+        health_started = mock.MagicMock(side_effect=lambda *args: order.append("health"))
+        # A host that is not loopback: the listener binds on the metrics
+        # host, the pod IP in the operator's layout, which is what a kubelet
+        # probe reaches; a regression to a hard-coded loopback bind would
+        # pass an assertion made with the loopback address.
+        self._serve(8766, unix_server=_Recording, health_port=8767, health_started=health_started, host=_PROBE_HOST)
+        health_started.assert_called_once_with(_PROBE_HOST, 8767)
+        self.assertEqual(["credentialed", "health"], order)
+
+    def test_a_health_port_the_other_listeners_hold_is_refused_by_name_and_never_bound(self):
+        for health_port, named in ((8766, "metrics"), (8768, "credential_health"), (0, None), (70000, "1-65535")):
+            with self.subTest(health_port=health_port):
+                health_started = mock.MagicMock()
+                with mock.patch.object(credential_proxy, "ENVOY_CONFIG_PATHS", (_ENVOY_CONFIG,)):
+                    started, logs = self._serve(8766, health_port=health_port, health_started=health_started)
+                health_started.assert_not_called()
+                if named is None:
+                    self.assertTrue(any("health listener disabled" in line for line in logs), logs)
+                else:
+                    self.assertTrue(
+                        any("ALERT" in line and credential_proxy.HEALTH_PORT_ENV in line and named in line for line in logs),
+                        logs,
+                    )
+
+    def test_serve_sets_the_thread_cap_and_leaves_the_stack_size_alone(self):
+        # _serve clears the environment, so the reader is stood in for; the
+        # reader itself is ThreadCapTest's. The stack size stays the
+        # platform's: a smaller one overflows under the C recursion the
+        # shipped interpreter permits on a nested JSON body.
+        with mock.patch.object(credential_proxy.threading, "stack_size") as stack_size, \
+                mock.patch.object(credential_proxy, "thread_cap_from_env", return_value=12):
+            self.addCleanup(setattr, credential_proxy.ThreadCap, "max_threads", credential_proxy.ThreadCap.max_threads)
+            self._serve(8766)
+        stack_size.assert_not_called()
+        self.assertEqual(12, credential_proxy.ThreadCap.max_threads)
 
 
 if __name__ == "__main__":

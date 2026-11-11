@@ -25,6 +25,30 @@ STATUS_TOOL = "kanban_show"
 # kind ``kanban_block`` records for it.
 BLOCKED_STATUS = "blocked"
 NEEDS_INPUT_KIND = "needs_input"
+#: Run outcomes whose ``summary`` is a hand-off, not an answer: the worker ran
+#: out of its iteration budget (``timed_out``), or did so on the attempt that
+#: tripped the card's failure limit (``gave_up``). The image's budget hand-off
+#: (``deploy/docker/patches/kanban_guardrail_exit.py``) saves the worker's
+#: partial notes there for the next worker; the bench must not grade them as
+#: the card's delivered result.
+HANDOFF_RUN_OUTCOMES = frozenset({"timed_out", "gave_up"})
+
+RATE_LIMIT_REASON_PREFIX = "provider rate limit: API retries exhausted"
+_FAILURE_REASON_PATTERN = re.compile(r"\bfailure_reason=([a-zA-Z0-9_]+)\b")
+_INFRA_FAILURE_REASONS = frozenset({"rate_limit", "billing"})
+
+
+def extract_infra_failure_reason(text: str | None) -> str | None:
+    """Extract an infrastructure failure reason if text opens with the hermes failure prefix."""
+    if not text:
+        return None
+    text = text.strip()
+    if text.startswith(RATE_LIMIT_REASON_PREFIX):
+        match = _FAILURE_REASON_PATTERN.search(text)
+        if match:
+            return match.group(1) if match.group(1) in _INFRA_FAILURE_REASONS else None
+        return "rate_limit"
+    return None
 
 _TOOL_ERROR_PREFIX = "Error executing tool"
 
@@ -311,16 +335,38 @@ def delivered_results(trajectory: list[dict[str, Any]], task_ids: list[str]) -> 
         payload = _json_object(entry.get("result"))
         listed = payload.get("tasks")
         shown = payload.get("task")
+
+        shown_is_triage_infra = False
+        if isinstance(shown, dict) and str(shown.get("status") or "") == "triage":
+            shown_text = shown.get("result")
+            runs = payload.get("runs")
+            run_summary = (
+                runs[-1].get("summary")
+                if isinstance(runs, list) and runs and isinstance(runs[-1], dict)
+                else None
+            )
+            if (isinstance(shown_text, str) and extract_infra_failure_reason(shown_text)) or (
+                isinstance(run_summary, str) and extract_infra_failure_reason(run_summary)
+            ):
+                shown_is_triage_infra = True
+                if shown.get("id") is not None:
+                    delivered.pop(str(shown["id"]), None)
+
         for task in [shown, *(listed if isinstance(listed, list) else [])]:
             if not isinstance(task, dict):
                 continue
+            if task is shown and shown_is_triage_infra:
+                continue
             task_id, text = task.get("id"), task.get("result")
             if task_id in task_ids and isinstance(text, str) and text.strip():
+                status = str(task.get("status") or "")
+                if status == "triage" and extract_infra_failure_reason(text):
+                    continue
                 delivered[task_id] = text
         # ``runs`` sits beside ``task``, not inside it, so it can only be
         # attributed to the card that payload showed, and only when the card
         # carries no explicit deliverable of its own.
-        if not isinstance(shown, dict) or shown.get("id") not in task_ids:
+        if not isinstance(shown, dict) or shown.get("id") not in task_ids or shown_is_triage_infra:
             continue
         task_id = str(shown["id"])
         if delivered.get(task_id, "").strip():
@@ -331,6 +377,13 @@ def delivered_results(trajectory: list[dict[str, Any]], task_ids: list[str]) -> 
             if isinstance(last_run, dict):
                 summary = last_run.get("summary")
                 if isinstance(summary, str) and summary.strip():
+                    status = str(shown.get("status") or "")
+                    if status == "triage" and extract_infra_failure_reason(summary):
+                        continue
+                    # A run the budget ended carries the worker's hand-off as
+                    # its summary; the card has no answer yet.
+                    if str(last_run.get("outcome") or "") in HANDOFF_RUN_OUTCOMES:
+                        continue
                     delivered[task_id] = summary
     return delivered
 

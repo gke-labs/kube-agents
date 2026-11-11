@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 from devops_bench.agents import AgentResult
-from kube_agents_bench import card_wake
+from kube_agents_bench import card_wake, scoring
 
 REPO = Path(__file__).resolve().parents[2]
 MOMENTS = REPO / "deploy" / "docker" / "patches" / "slack_ux_moments.py"
@@ -971,3 +971,120 @@ def test_the_settled_card_rides_on_the_trajectory_for_the_verifier() -> None:
         "result": {"status": "ready", "comments": [{"author": "default", "body": "seeded-b"}]},
         "status": "harness",
     }
+
+
+# --- Block replays: a card blocked on something other than a question ---------
+
+BLOCK_PROMPT = """[bench:card-block-wake]
+title: Health check for checkout-gateway on seeded-a
+kind: transient
+reason: provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429
+"""
+BLOCK_REASON = "provider rate limit: API retries exhausted (failure_reason=rate_limit): HTTP 429"
+
+
+def test_parse_reads_a_block_replay() -> None:
+    replay = card_wake.parse(BLOCK_PROMPT)
+
+    assert replay == card_wake.Replay(
+        title="Health check for checkout-gateway on seeded-a",
+        question="",
+        options=(),
+        answer="",
+        kind="transient",
+        block_reason=BLOCK_REASON,
+    )
+    assert replay.reason == BLOCK_REASON
+    # The card's body is the work, not the failure.
+    assert replay.body == "Health check for checkout-gateway on seeded-a"
+    assert not replay.answered
+    assert card_wake.parse(PROMPT).answered
+
+
+@pytest.mark.parametrize("kind", card_wake.BLOCK_KINDS)
+def test_parse_accepts_every_documented_block_kind(kind: str) -> None:
+    prompt = BLOCK_PROMPT.replace("kind: transient", f"kind: {kind}")
+    assert card_wake.parse(prompt).kind == kind
+
+
+@pytest.mark.parametrize("field", ["title", "kind", "reason"])
+def test_a_block_replay_missing_a_field_is_an_authoring_error(field: str) -> None:
+    prompt = "\n".join(line for line in BLOCK_PROMPT.splitlines() if not line.startswith(f"{field}:"))
+    with pytest.raises(ValueError, match=field):
+        card_wake.parse(prompt)
+
+
+@pytest.mark.parametrize("kind", ["needs_input", "rate_limit"])
+def test_a_block_replay_of_a_question_or_an_unknown_kind_is_an_authoring_error(kind: str) -> None:
+    with pytest.raises(ValueError, match="kind"):
+        card_wake.parse(BLOCK_PROMPT.replace("kind: transient", f"kind: {kind}"))
+
+
+def test_a_question_field_in_a_block_replay_is_an_authoring_error() -> None:
+    with pytest.raises(ValueError, match="answer"):
+        card_wake.parse(BLOCK_PROMPT + "answer: seeded-b\n")
+
+
+def test_a_block_plant_files_the_kind_and_reason_and_posts_nothing(hermes_root: Path, tmp_path: Path) -> None:
+    planted = _plant(_shell_for(hermes_root, tmp_path, BLOCK_PROMPT), BLOCK_PROMPT)
+
+    assert planted.posted == 0
+    assert planted.wake == (
+        f"[kanban] Task {planted.card} blocked; needs attention.\nAssignee: @{card_wake.WAKE_ASSIGNEE}"
+    )
+    card = _board(tmp_path)["tasks"][planted.card]
+    assert card["status"] == "blocked"
+    assert card["body"] == "Health check for checkout-gateway on seeded-a"
+    assert _board(tmp_path)["events"][0]["payload"] == {"reason": BLOCK_REASON, "kind": "transient"}
+
+
+@needs_moments
+def test_a_block_plant_on_an_image_with_moments_is_not_broken_for_posting_nothing(
+    hermes_root: Path, tmp_path: Path
+) -> None:
+    """needs_you posts only a question; a transient block posting nothing is the image working."""
+    shell = _shell_for(_with_moments(hermes_root), tmp_path, BLOCK_PROMPT)
+
+    planted = _plant(shell, BLOCK_PROMPT)
+
+    assert planted.posted == 0
+    assert planted.post is None
+    assert _board(tmp_path)["tasks"][planted.card]["status"] == "blocked"
+
+
+def test_merge_keeps_a_same_session_split_beside_the_wake_turns_workers() -> None:
+    # The wake turn delegated; the answer turn on the same session did not, and
+    # its row was read: the merged record is still a trustworthy split.
+    wake = _result("[SILENT]", [], {"input": 10, "cached": 90, "output": 1, "total": 101,
+                                    "workers": {"input": 5, "cached": 50, "output": 2, "total": 57},
+                                    "front_door": {"input": 10, "cached": 90}}, session_id="s")
+    answer = _result("done", [], {"input": 30, "cached": 300, "output": 5, "total": 335}, session_id="s")
+
+    merged = card_wake.merge(_PLANTED, wake, answer)
+
+    assert merged.tokens["front_door"]["cached"] == 300
+    assert merged.tokens["cached"] == 350
+    assert scoring._tokens_split(merged.tokens) is True
+
+
+def test_merge_drops_the_split_across_sessions_when_one_turn_has_none() -> None:
+    # session: fresh, and the answer turn's row lookup failed: its input still
+    # counts its cache reads, so the summed cached must not read as a split.
+    wake = _result("[SILENT]", [], {"input": 10, "cached": 90, "output": 1, "total": 101})
+    answer = _result("done", [], {"input": 330, "cached": None, "output": 5, "total": 335}, session_id="s2")
+
+    merged = card_wake.merge(_PLANTED, wake, answer)
+
+    assert merged.tokens["cached"] is None
+    assert scoring._tokens_split(merged.tokens) is False
+
+
+def test_merge_keeps_the_split_across_sessions_when_both_turns_have_one() -> None:
+    wake = _result("[SILENT]", [], {"input": 10, "cached": 90, "output": 1, "total": 101})
+    answer = _result("done", [], {"input": 30, "cached": 300, "output": 5, "total": 335}, session_id="s2")
+
+    merged = card_wake.merge(_PLANTED, wake, answer)
+
+    assert merged.tokens["cached"] == 390
+    assert scoring._tokens_split(merged.tokens) is True
+

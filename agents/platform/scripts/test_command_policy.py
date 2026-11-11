@@ -67,6 +67,16 @@ HELM_INVOCATION = re.compile(
     r"(?im)(?:^|[;&|(`]|-c\s+['\"]|\$|/|\b\w+=\S*\s|\b(?:sudo|env|timeout\s+\d+|xargs|exec|command|nohup)\s)\s*helm\s"
 )
 SHIPPED_SKILL_DIRS = sorted(Path(__file__).resolve().parents[2].glob("*/skills/*/"))
+# The bench seeds that onboard a per-run cluster prove the Cluster Agent's
+# path by running kubectl through the shim as the sandbox user under the
+# profile's kubeconfig, under `set -e`: a probe the policy refuses fails the
+# seed before the agent's turn. Each probe is a `KUBECONFIG=<path> kubectl …`
+# word run inside the seed's remote shell command, up to its redirect.
+PREBUILT_SEED_SCRIPTS = sorted(Path(__file__).resolve().parents[3].glob("bench/tf/prebuilt/*/scripts/*.sh"))
+SEED_SHIM_PROBE = re.compile(r"KUBECONFIG=\S+\s+kubectl\s+(?P<args>[^;>|&]*)")
+# Fewer probes than this means a seed reworded its probe lines and the test
+# would pass by finding nothing; the gitops-fix-cycle seed runs one per layout.
+MIN_SEED_SHIM_PROBES = 2
 MIN_HELM_CHART_FENCED_COMMANDS = 6
 
 
@@ -337,6 +347,313 @@ class GcloudNearestReadHintTest(unittest.TestCase):
         decision = evaluate(["gcloud", "container", "fleet", "foo", "list"])
         self.assertFalse(decision.allowed)
         self.assertNotIn("nearest admitted read", decision.message)
+
+
+class KubectlRawPathTest(unittest.TestCase):
+    """`kubectl get --raw` is one shape: a relative collection path on an
+    allowlisted kind, with the list verb's query keys, on `get` alone."""
+
+    RULE = "kubernetes.raw-path"
+
+    def refused(self, argv):
+        decision = evaluate(argv)
+        self.assertFalse(decision.allowed, argv)
+        self.assertEqual(self.RULE, decision.rule_id, argv)
+        self.assertEqual("--raw", decision.offending_flag)
+        self.assertIn("Refused:", decision.message)
+        return decision
+
+    def test_the_probes_the_bench_seeds_run_through_the_shim_are_admitted(self):
+        """The gitops-fix-cycle seed proves a Cluster Agent profile from the
+        shell sandbox with one kubectl through the shim under the pinned
+        kubeconfig; a probe this rule refuses fails the seed before the agent's
+        turn. Its `get --raw=/readyz` did once `--raw` was held to paged
+        collection reads and /metrics; the probe is `version` now."""
+        probes = []
+        for path in PREBUILT_SEED_SCRIPTS:
+            for match in SEED_SHIM_PROBE.finditer(path.read_text(encoding="utf-8")):
+                probes.append((path.parent.parent.name, shlex.split(match.group("args"))))
+        self.assertGreaterEqual(len(probes), MIN_SEED_SHIM_PROBES, probes)
+        for stack, args in probes:
+            argv = ["kubectl", *args]
+            with self.subTest(stack=stack, argv=argv):
+                decision = evaluate(argv)
+                self.assertTrue(decision.allowed, decision.message)
+
+    def test_the_paged_reads_the_collectors_issue_are_allowed(self):
+        for argv in (
+            ["kubectl", "get", "--raw", "/api/v1/pods?limit=500"],
+            ["kubectl", "get", "--raw=/apis/apps/v1/deployments?limit=500"],
+            ["kubectl", "get", "--raw", "/apis/batch/v1/cronjobs?limit=500&continue=eyJ2IjoibWV0YS5rOHMuaW8vdjEifQ"],
+            ["kubectl", "get", "--raw", "/api/v1/events?limit=500&fieldSelector=type%3DWarning"],
+            ["kubectl", "get", "--raw", "/api/v1/pods?labelSelector=app.kubernetes.io/name%3Dweb,tier%20in%20(a,b)"],
+            ["kubectl", "get", "--raw", "/api/v1/namespaces/kube-system/pods?limit=10"],
+            ["kubectl", "--context", "gke_p_l_c", "get", "--raw", "/api/v1/nodes?limit=100"],
+            ["kubectl", "get", "--raw", "/apis/rbac.authorization.k8s.io/v1/clusterrolebindings"],
+            ["kubectl", "get", "--raw", "/apis/admissionregistration.k8s.io/v1/validatingwebhookconfigurations?resourceVersion=0&resourceVersionMatch=NotOlderThan"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertTrue(evaluate(argv).allowed, evaluate(argv).message)
+
+    def test_secrets_are_never_a_raw_collection(self):
+        for argv in (
+            ["kubectl", "get", "--raw", "/api/v1/secrets?limit=1"],
+            ["kubectl", "get", "--raw", "/api/v1/namespaces/default/secrets"],
+            ["kubectl", "get", "--raw", "/api/v1/%73ecrets"],
+            ["kubectl", "get", "--raw", "/api/v1/pods", "--raw", "/api/v1/secrets"],
+            # The `=` spelling is the one profile confinement rewrites argv into.
+            ["kubectl", "get", "--raw=/api/v1/secrets?limit=1"],
+            ["kubectl", "get", "--raw=/api/v1/namespaces/default/secrets"],
+            ["kubectl", "get", "--raw=/api/v1/pods", "--raw=/api/v1/secrets"],
+        ):
+            with self.subTest(argv=argv):
+                self.refused(argv)
+        self.assertNotIn("/api/v1/secrets", command_policy.KUBECTL_RAW_COLLECTIONS)
+        self.assertFalse(any(path.endswith("/secrets") for path in command_policy.KUBECTL_RAW_COLLECTIONS))
+
+    def test_subresources_single_objects_and_traversal_are_refused(self):
+        for argv in (
+            ["kubectl", "get", "--raw", "/api/v1/pods/x/log"],
+            ["kubectl", "get", "--raw", "/api/v1/namespaces/default/pods/x/exec"],
+            ["kubectl", "get", "--raw", "/api/v1/nodes/n/proxy/metrics"],
+            ["kubectl", "get", "--raw", "/api/v1/namespaces/default/pods/x/portforward"],
+            ["kubectl", "get", "--raw", "/api/v1/namespaces/default/serviceaccounts/sa/token"],
+            ["kubectl", "get", "--raw", "/apis/apps/v1/namespaces/default/deployments/d/scale"],
+            ["kubectl", "get", "--raw", "/api/v1/namespaces/default/pods/x"],
+            ["kubectl", "get", "--raw", "/api/v1/namespaces/kube-system"],
+            ["kubectl", "get", "--raw", "/api/v1/../v1/pods"],
+            ["kubectl", "get", "--raw", "/api/v1/%2e%2e/v1/pods"],
+            ["kubectl", "get", "--raw", "/api/v1//pods"],
+            ["kubectl", "get", "--raw", "/api/v1\\pods"],
+            ["kubectl", "get", "--raw", "/api/v1/pods%2Fx%2Flog"],
+            ["kubectl", "get", "--raw", "/api/v1/pods/"],
+            ["kubectl", "get", "--raw", "api/v1/pods"],
+            ["kubectl", "get", "--raw", "/API/v1/pods"],
+            ["kubectl", "get", "--raw", "/healthz"],
+            ["kubectl", "get", "--raw", "/apis/evil.example.com/v1/pods"],
+            ["kubectl", "get", "--raw", "/apis/apps/v1beta1/deployments"],
+            ["kubectl", "get", "--raw=/api/v1/pods/x/log"],
+            ["kubectl", "get", "--raw=/api/v1/nodes/n/proxy/metrics"],
+            ["kubectl", "get", "--raw=/api/v1/namespaces/default/pods/x"],
+        ):
+            with self.subTest(argv=argv):
+                self.refused(argv)
+
+    def test_a_scheme_or_host_is_refused(self):
+        for argv in (
+            ["kubectl", "get", "--raw", "https://example.com/api/v1/pods"],
+            ["kubectl", "get", "--raw", "//example.com/api/v1/pods"],
+            ["kubectl", "get", "--raw", "http:/api/v1/pods"],
+            ["kubectl", "get", "--raw", "/api/v1/pods?limit=1#frag"],
+            ["kubectl", "get", "--raw", "/api/v1/pods%3Flimit=1"],
+            ["kubectl", "get", "--raw=https://example.com/api/v1/pods"],
+            ["kubectl", "get", "--raw=//example.com/api/v1/pods"],
+        ):
+            with self.subTest(argv=argv):
+                self.refused(argv)
+
+    def test_a_raw_after_a_flag_that_took_the_separator_as_its_value_is_judged(self):
+        # pflag reads the next argv element as a value-taking flag's value even
+        # when it is `--`, so `-n -- --raw <path>` is a namespace of `--` and a
+        # parsed `--raw`; a scan that stopped at `--` never saw it, and a local
+        # kubectl sent the request. A real `--` on `get` makes a later `--raw` an
+        # unresolvable resource name, so judging it refuses nothing that ran.
+        for argv in (
+            ["kubectl", "get", "-n", "--", "--raw", "/api/v1/nodes/n1/proxy/configz"],
+            ["kubectl", "get", "-n", "--", "--raw", "/api/v1/secrets"],
+            ["kubectl", "get", "-n", "--", "--raw=https://example.com/api/v1/pods"],
+            ["kubectl", "get", "-o", "--", "--raw", "/api/v1/namespaces/default/pods/x/exec"],
+            ["kubectl", "get", "pods", "--", "--raw", "/api/v1/secrets"],
+            ["kubectl", "get", "--raw", "--", "/api/v1/pods"],
+        ):
+            with self.subTest(argv=argv):
+                self.refused(argv)
+        self.assertEqual(
+            ["/api/v1/secrets"],
+            command_policy._kubectl_raw_values(["kubectl", "get", "-n", "--", "--raw", "/api/v1/secrets"]),
+        )
+        # A permitted page keeps passing through the same spelling.
+        self.assertTrue(evaluate(["kubectl", "get", "-n", "--", "--raw", "/api/v1/pods?limit=500"]).allowed)
+
+    def test_only_the_list_query_keys_pass(self):
+        for argv in (
+            ["kubectl", "get", "--raw", "/api/v1/pods?watch=true"],
+            ["kubectl", "get", "--raw", "/api/v1/pods?limit=500&pretty=true"],
+            ["kubectl", "get", "--raw", "/api/v1/pods?limit=5&limit=6"],
+            ["kubectl", "get", "--raw", "/api/v1/pods?limit=-1"],
+            ["kubectl", "get", "--raw", "/api/v1/pods?limit=abc"],
+            ["kubectl", "get", "--raw", "/api/v1/pods?=500"],
+            ["kubectl", "get", "--raw", "/api/v1/pods?labelSelector=a%3Db%26watch%3Dtrue%23"],
+            ["kubectl", "get", "--raw", "/api/v1/pods?continue=%00"],
+        ):
+            with self.subTest(argv=argv):
+                self.refused(argv)
+
+    def test_raw_on_any_read_verb_but_get_is_refused(self):
+        for argv in (
+            ["kubectl", "describe", "--raw", "/api/v1/pods"],
+            ["kubectl", "auth", "can-i", "--raw", "/api/v1/pods"],
+            ["kubectl", "top", "--raw", "/api/v1/nodes"],
+        ):
+            with self.subTest(argv=argv):
+                self.refused(argv)
+
+    def test_raw_on_a_write_is_refused_as_the_write(self):
+        # The verb is the problem there, and the refusal says so; `config
+        # view --raw` keeps its token-disclosure refusal the same way.
+        for argv in (
+            ["kubectl", "delete", "--raw", "/api/v1/pods"],
+            ["kubectl", "create", "--raw", "/api/v1/namespaces/default/pods", "-f", "pod.json"],
+        ):
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertFalse(decision.allowed)
+                self.assertEqual("kubernetes.read-only", decision.rule_id)
+
+    def test_raw_with_no_path_is_refused(self):
+        self.refused(["kubectl", "get", "--raw"])
+
+    def test_the_endpoints_shipped_skills_name_stay_admitted(self):
+        # gke-upgrades reads /metrics; capacity-obtainability reads the
+        # metrics API's node collection. Both ran on main and keep running.
+        for argv in (
+            ["kubectl", "get", "--raw", "/metrics"],
+            ["kubectl", "get", "--raw", "/apis/metrics.k8s.io/v1beta1/nodes"],
+            ["kubectl", "get", "--raw", "/apis/metrics.k8s.io/v1beta1/pods?limit=500"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertTrue(evaluate(argv).allowed, evaluate(argv).message)
+        for argv in (
+            ["kubectl", "get", "--raw", "/metrics?watch=true"],
+            ["kubectl", "get", "--raw", "/metrics/"],
+            ["kubectl", "get", "--raw", "/healthz"],
+            ["kubectl", "get", "--raw", "/.well-known/openid-configuration"],
+        ):
+            with self.subTest(argv=argv):
+                self.refused(argv)
+
+    def test_the_endpoint_reader_decodes_the_path_and_leaves_the_query(self):
+        # The broker's session walker and the profile confinement keep the
+        # endpoints to the shell role through this reader, so it decodes as
+        # the rule does and reads the path alone; the rule refuses the query.
+        for value in ("/metrics", "/%6detrics", "/%6Detrics", "/metrics?watch=true"):
+            with self.subTest(value=value):
+                self.assertEqual("/metrics", command_policy.kubectl_raw_endpoint(value))
+        for value in ("/api/v1/pods?limit=500", "/metrics/", "/metricsx", "/healthz", "/", ""):
+            with self.subTest(value=value):
+                self.assertIsNone(command_policy.kubectl_raw_endpoint(value))
+
+    def test_the_grammar_is_anchored_at_both_ends(self):
+        # `re.match(..., "$")` would pass a trailing newline; fullmatch does not,
+        # and limit=0 asks for the unpaged list this rule exists to avoid.
+        for argv in (
+            ["kubectl", "get", "--raw", "/api/v1/pods\n"],
+            ["kubectl", "get", "--raw", "/api/v1/pods?labelSelector=a%0A"],
+            ["kubectl", "get", "--raw", "/api/v1/pods?limit=0"],
+            ["kubectl", "get", "--raw", "/api/v1/pods?limit=00"],
+        ):
+            with self.subTest(argv=argv):
+                self.refused(argv)
+
+    def test_a_limit_past_int64_is_refused_without_raising(self):
+        # `int()` on a string past `sys.int_info.default_max_str_digits` raises
+        # under Python 3.11; the policy never raises, so the length is bounded
+        # at an int64's widest decimal before the conversion.
+        widest = "9" * command_policy._RAW_LIMIT_MAX_DIGITS
+        self.assertTrue(evaluate(["kubectl", "get", "--raw", f"/api/v1/pods?limit={widest}"]).allowed)
+        for digits in (command_policy._RAW_LIMIT_MAX_DIGITS + 1, 4301):
+            argv = ["kubectl", "get", "--raw", f"/api/v1/pods?limit={'1' * digits}"]
+            with self.subTest(digits=digits):
+                decision = self.refused(argv)
+                self.assertIn("limit is not a positive integer", decision.message)
+
+    def test_the_refusal_names_the_boundary_and_the_shape(self):
+        decision = self.refused(["kubectl", "get", "--raw", "/api/v1/secrets"])
+        self.assertIn("relative /api/v1/<resource>", decision.message)
+        self.assertIn("permission boundary", decision.message)
+        self.assertEqual(("get",), decision.verb_tuple)
+
+    def test_the_allowlist_is_canonical_cluster_wide_paths(self):
+        for path in command_policy.KUBECTL_RAW_COLLECTIONS:
+            with self.subTest(path=path):
+                self.assertIsNotNone(command_policy._RAW_PATH_RE.match(path))
+                self.assertNotIn("/namespaces/", path.replace("/api/v1/namespaces", ""))
+
+    def test_a_read_without_raw_is_untouched(self):
+        self.assertTrue(evaluate(["kubectl", "get", "pods", "-A", "-o", "json"]).allowed)
+        self.assertIsNone(command_policy._kubectl_raw_refusal(["kubectl", "get", "pods"], ("get",)))
+
+    def test_the_raw_decoders_read_as_urllib_does_without_importing_it(self):
+        # The conformance suite (tests/conformance, C3) holds the policy module
+        # to imports that cannot read a file or a socket, and `urllib` is on
+        # its list, so the module decodes percent escapes and splits the query
+        # itself. This pins the two decoders to the stdlib's reading of the
+        # same strings: a drift here would admit or refuse a different path
+        # than the one kubectl sends.
+        import urllib.parse
+
+        corpus = (
+            "", "/api/v1/pods", "/api/v1/pods%2Fx%2Flog", "/api/v1/%2e%2e/v1/pods", "%E2%9C%93",
+            "%FF%FE", "%zz%4%", "a%20b+c", "limit=500", "limit=500&continue=eyJ2IjoibWV0YS5rOHMuaW8vdjEifQ",
+            "labelSelector=app.kubernetes.io/name%3Dweb,tier%20in%20(a,b)", "labelSelector=a%3Db%26watch%3Dtrue%23",
+            "watch", "watch=", "=x", "&&limit=1&", "a=b=c", "k+e+y=v+a+l", "a;b=c",
+        )
+        for text in corpus:
+            with self.subTest(text=text):
+                self.assertEqual(urllib.parse.unquote(text), command_policy._percent_decode(text))
+                self.assertEqual(urllib.parse.parse_qsl(text, keep_blank_values=True), command_policy._query_pairs(text))
+
+
+class KubectlSecretReadRefusalTest(unittest.TestCase):
+    """The credential broker does not strip Secret data, so command_policy refuses Secret reads."""
+
+    RULE = command_policy.KUBERNETES_SECRET_READ_RULE
+
+    def test_secret_reads_are_refused_across_read_verbs_and_spellings(self):
+        for argv in (
+            ["kubectl", "get", "secret"],
+            ["kubectl", "get", "secrets"],
+            ["kubectl", "get", "Secret", "my-secret", "-o", "yaml"],
+            ["kubectl", "get", "secrets/my-secret", "-o", "json"],
+            ["kubectl", "get", "secret.v1.", "-n", "default"],
+            ["kubectl", "get", "secrets.v1./my-secret"],
+            ["kubectl", "get", "pods,secrets"],
+            ["kubectl", "get", "po,secret/my-secret"],
+            ["kubectl", "describe", "secret", "my-secret"],
+            ["kubectl", "describe", "secrets/my-secret"],
+            ["kubectl", "events", "--for=secret/my-secret"],
+            ["kubectl", "events", "--for", "secrets/my-secret"],
+            ["kubectl", "wait", "--for=jsonpath={.data.token}", "secret/my-secret"],
+        ):
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertFalse(decision.allowed, argv)
+                self.assertEqual(self.RULE, decision.rule_id, argv)
+
+    def test_manifest_input_flags_are_refused_on_resource_read_verbs(self):
+        for argv, expected_flag in (
+            (["kubectl", "get", "-f", "secret.yaml"], "-f"),
+            (["kubectl", "get", "--filename=secret.yaml"], "--filename"),
+            (["kubectl", "get", "-Rf", "."], "-f"),
+            (["kubectl", "describe", "-k", "."], "-k"),
+            (["kubectl", "wait", "--kustomize=.", "--for=condition=Ready"], "--kustomize"),
+        ):
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertFalse(decision.allowed, argv)
+                self.assertEqual(self.RULE, decision.rule_id, argv)
+                self.assertEqual(expected_flag, decision.offending_flag)
+
+    def test_non_secret_reads_and_logs_follow_remain_allowed(self):
+        for argv in (
+            ["kubectl", "get", "pods"],
+            ["kubectl", "get", "configmaps/my-cm"],
+            ["kubectl", "describe", "pod", "my-pod"],
+            ["kubectl", "events", "--for=pod/my-pod"],
+            ["kubectl", "logs", "-f", "my-pod"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertTrue(evaluate(argv).allowed, argv)
 
 
 class KubectlKubercTest(unittest.TestCase):
@@ -991,6 +1308,25 @@ class GcloudReadOnlyTest(unittest.TestCase):
         )
         self.assertFalse(decision.allowed)
         self.assertEqual("gcp.read-only", decision.rule_id)
+
+    def test_a_help_flag_with_a_false_value_grants_nothing(self):
+        """Only a bare --help/-h, or one valued true, is a help request."""
+        for flag in ("--help=false", "--help=0", "--help=no", "-h=false", "--help="):
+            with self.subTest(flag=flag):
+                decision = evaluate(["gcloud", "container", "clusters", "delete", "c", flag])
+                self.assertFalse(decision.allowed)
+                self.assertEqual("gcp.read-only", decision.rule_id)
+        for flag in ("--help", "-h", "--help=true", "--help=True"):
+            with self.subTest(flag=flag):
+                self.assertTrue(evaluate(["gcloud", "container", "clusters", "delete", "c", flag]).allowed)
+
+    def test_a_false_help_past_an_unknown_flag_does_not_invite_a_retry(self):
+        """A --help=false past an unknown flag is no help request, so the refusal doesn't hold the retry open."""
+        argv = ["gcloud", "container", "clusters", "delete", "c", "--async-x", "--timeout-x=5", "--help=false"]
+        self.assertTrue(command_policy._gcloud_prefix_write(argv))
+        self.assertIn("still refused", evaluate(argv).message)
+        with_help = argv[:-1] + ["--help"]
+        self.assertFalse(command_policy._gcloud_prefix_write(with_help))
 
     def test_help_after_an_unknown_flag_is_still_unreadable(self):
         """An unknown flag's arity is unknown, so nothing after it is trusted.

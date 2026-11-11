@@ -63,13 +63,15 @@ import math
 import pathlib
 import re
 import sys
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 try:
-    from . import fixture_state, periodics, pool_state, tiers
+    from . import collect, fixture_state, periodics, pool_state, tiers
 except ImportError:  # run as a script: python3 scripts/eval_dashboard/health.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    import collect
     import fixture_state
     import periodics
     import pool_state
@@ -187,6 +189,12 @@ SHARED_BREAK_MIN_RED_SHARE = 0.5
 # Rule 4 without a same-base pass: this many red runs of the one pull request
 # (a retest, or a new push) before its case is called the pull request's.
 PR_CAUSED_MIN_RUNS = 2
+# A case counts as failing on a pull request only on a record with at least
+# this many graded repetitions, all failed. One graded repetition beside two
+# infra ones (2026-10-30: a throttled run under a quota storm) is the storm's
+# shape, not a collapse the pull request owns; a record without
+# per-repetition detail grades as one and is never thick enough.
+PR_CAUSED_MIN_GRADED_REPS = 2
 PR_CAUSED_SAME_BASE = "same_base"
 PR_CAUSED_REPEATED = "repeated"
 
@@ -208,6 +216,56 @@ PR_CAUSED_REPEATED = "repeated"
 STORM_WINDOW = timedelta(hours=2)
 STORM_MIN_REPS = 15
 STORM_MIN_PRS = 3
+# The storm's evidence line and Chat sentence end with the repetitions' own
+# words for how they died (2026-10-30: 26 reps said `hermes-rate-limited`
+# and the line said "infra deaths"). Two fixed wrappers are peeled first:
+# the scorer's (bench/kube_agents_bench/scoring.py, "the harness recorded an
+# infrastructure condition ... no answer in it to grade (<detail>)") and,
+# inside it, the harness's "task <id> ended <terminal>: " prefix
+# (bench/kube_agents_bench/harness.py; the terminal is failed, canceled or
+# rejected). What is left is the detail, cut before the harness's "(reason:"
+# echo, scrubbed like the periodics' quoted log line, and cut at a word
+# boundary at a length a Chat line can carry. Nothing maps the words to a
+# meaning: the reader does. test_eval_dashboard_health.py pins the wrapper
+# phrases against the two sources.
+SCORER_INFRA_WRAPPER_RE = re.compile(
+    r"^(?:the harness (?:recorded an infrastructure condition or )?exhausted its retries without reaching the agent"
+    r" \(KUBE_AGENTS_INFRA_FAILURE\):\s*(?:the record is scored, but there is no answer in it to grade(?: \(|$))?"
+    r"|KUBE_AGENTS_INFRA_FAILURE: the record holds no scored run, so there is nothing to grade \("
+    r"|KUBE_AGENTS_INFRA_FAILURE: the repetition ended on infrastructure and its only catastrophic trip is"
+    r" .*? because the empty report could not name them \()",
+    re.S,
+)
+# The scorer closes the detail it opened with ")"; the detail keeps its own
+# parentheses, so the wrapper's is the one unmatched close at the end.
+SCORER_WRAPPER_OPEN, SCORER_WRAPPER_CLOSE = "(", ")"
+HARNESS_TERMINAL_PREFIX_RE = re.compile(r"^task \S+ ended (?:failed|canceled|rejected): ")
+# The harness's other task phrasings keep the task id mid-sentence ("task
+# <id> on <conversation> sat queued", "no executor took task <id> on"); the id
+# is the repetition's, so it gives way to a placeholder like the run id.
+HARNESS_TASK_ID_RE = re.compile(r"\btask \S+(?= (?:on|was|did|ended) )")
+HARNESS_TASK_ID_FORM = "task [id]"
+# The board's card ids ("still waiting on: t_3f67a81e"), hermes's "t_" + 8
+# hex, are the repetition's as well.
+KANBAN_CARD_ID_RE = re.compile(r"\bt_[0-9a-f]{8}\b")
+KANBAN_CARD_ID_FORM = "[card]"
+# The agent API's session id, "a2a-" + the conversation's contextId
+# (bench/kube_agents_bench/board.py API_SESSION_PREFIX), per repetition too;
+# only where the harness writes it ("the session store for <id>"), since
+# "-a2a-" is also inside the inject Service's and Secret's names.
+HERMES_SESSION_ID_RE = re.compile(r"(?<=the session store for )a2a-[A-Za-z0-9_.:-]+")
+HERMES_SESSION_ID_FORM = "[session]"
+# The harness names a run's conversation `devops-bench-<hex>/<case>/<rep>`
+# (bench/kube_agents_bench/harness.py); a phrasing that carries it would be
+# its own phrasing on every repetition, so the run id and the repetition
+# number give way to placeholders and the case stays.
+HARNESS_CONVERSATION_KEY_RE = re.compile(r"\bdevops-bench-[0-9a-f]+/([A-Za-z0-9._-]+)/\d+\b")
+HARNESS_CONVERSATION_KEY_FORM = r"[run]/\1/[rep]"
+SCORER_NO_DETAIL = "no reason given"
+STORM_CAUSE_STOP = " (reason"
+STORM_CAUSE_MAX_CHARS = 80
+STORM_CAUSE_ELLIPSIS = "…"
+STORM_CAUSES_SHOWN = 2
 STORM_REASON_RE = re.compile(
     r"KUBE_AGENTS_INFRA_FAILURE"
     r"|no agent ever ran"
@@ -267,9 +325,10 @@ REPLAY_ERROR_RE = re.compile(
     r"|ReplayMismatch"
     r"|failure wake:"
     r"|question wake:"
+    r"|block wake:"
     r"|thread context:"
     r"|replay declares"
-    r"|\[bench:(?:card-failure|slack-question)-wake\]",
+    r"|\[bench:(?:card-failure|slack-question|card-block)-wake\]",
     re.IGNORECASE,
 )
 
@@ -590,6 +649,20 @@ DASHBOARD_URL = "https://storage.cloud.google.com/kube-agents-dashboards/evals/i
 # Cause and advice text. Plain language: the reader is whoever is deciding
 # whether to type /retest.
 CAUSE_SHARED_BREAK = "shared fixture/environment break: {cases}"
+# The same cause as the public tracking issue states it (gate_issue.py):
+# the failing cases stay on the incident brief, since the repository is
+# public.
+CAUSE_SHARED_BREAK_PUBLIC = "shared fixture/environment break"
+# The fixed text of the evidence lines that grade a case (shared_break's
+# per-case collapse line, its coverage line, and the PR-caused lines).
+# gate_issue.public_evidence drops a line carrying one of these from every
+# public issue body, so the lines below are built on them.
+EVIDENCE_CASE_COLLAPSE = " failed all graded reps on "
+EVIDENCE_CASES_EXPLAIN = "these cases explain "
+EVIDENCE_PR_CAUSED = "PR-caused: "
+# The fixed start of lost_pods' evidence line; the lost-pods issue body
+# keeps only the lines that start with it (gate_issue.public_evidence).
+EVIDENCE_LOST_PODS = "lost pods: "
 CAUSE_STORM = "quota storm window {start}–{end} UTC"
 CAUSE_SETUP = "setup/clone failures on {count} runs ({prs})"
 CAUSE_LOST_PODS = "lost pods: {count} runs on {prs} PRs died with their build node {start}–{end} UTC"
@@ -713,6 +786,14 @@ UTC = timezone.utc
 # --------------------------------------------------------------------------- #
 
 
+def public_cause(health_doc: dict) -> str:
+    """``health["cause"]`` as a public text may carry it: a shared break
+    names no case (CAUSE_SHARED_BREAK_PUBLIC); every other cause as is."""
+    if health_doc.get("condition") == SHARED_BREAK:
+        return CAUSE_SHARED_BREAK_PUBLIC
+    return health_doc.get("cause") or CAUSE_SHARED_BREAK_PUBLIC
+
+
 def parse_iso(value) -> datetime | None:
     """ISO 8601 to an aware UTC datetime; None for anything unparseable."""
     if not value or not isinstance(value, str):
@@ -768,12 +849,65 @@ def rep_kind(rep: dict) -> str:
     return REP_FAIL
 
 
+def storm_cause(rep: dict) -> str:
+    """A storm repetition's own words for how it died: the reason with the
+    scorer's wrapper and the harness's "task <id> ended <terminal>: " prefix
+    peeled, the task, card and session ids and the conversation key reduced to
+    placeholders, cut
+    before the "(reason:" echo, scrubbed (periodics.quotable) and cut at
+    STORM_CAUSE_MAX_CHARS on a word boundary. "" when the record has no words
+    (no reason, or the scorer's "no reason given")."""
+    reason = str(rep.get("reason") or "")
+    wrapper = SCORER_INFRA_WRAPPER_RE.match(reason)
+    detail = reason[wrapper.end() :] if wrapper else reason
+    text = HARNESS_TERMINAL_PREFIX_RE.sub("", detail, count=1)
+    text = HARNESS_TASK_ID_RE.sub(HARNESS_TASK_ID_FORM, text)
+    text = KANBAN_CARD_ID_RE.sub(KANBAN_CARD_ID_FORM, text)
+    text = HERMES_SESSION_ID_RE.sub(HERMES_SESSION_ID_FORM, text)
+    text = HARNESS_CONVERSATION_KEY_RE.sub(HARNESS_CONVERSATION_KEY_FORM, text)
+    whole = STORM_CAUSE_STOP not in text
+    text = text.split(STORM_CAUSE_STOP, 1)[0]
+    # The collector's 300-character cut can land inside the echo: a trailing
+    # " (rea" is the echo's head, not words.
+    tail = text.rfind(STORM_CAUSE_STOP[:2])
+    if tail != -1 and ")" not in text[tail:] and STORM_CAUSE_STOP[2:].startswith(text[tail + 2 :]):
+        text = text[:tail]
+        whole = False
+    text = text.strip()
+    if text.rstrip(")") == SCORER_NO_DETAIL:
+        return ""
+    # The wrapper's own close, when the wrapper opened one and the collector's
+    # cut did not take it: the one ")" more than the detail opened.
+    wrapper_closed = bool(
+        wrapper
+        and wrapper.group(0).endswith(SCORER_WRAPPER_OPEN)
+        and text.endswith(SCORER_WRAPPER_CLOSE)
+        and text.count(SCORER_WRAPPER_CLOSE) > text.count(SCORER_WRAPPER_OPEN)
+    )
+    if wrapper_closed:
+        text = text[: -len(SCORER_WRAPPER_CLOSE)]
+    # The collector keeps collect.REP_REASON_MAX_CHARS of the reason. A cut
+    # that lands in the words leaves a bare fragment, and in the run id an
+    # unreduced one: the cut word goes and the ellipsis says so. A reason at
+    # the cap that still carries the wrapper's close is whole.
+    cut_by_collector = len(reason) >= collect.REP_REASON_MAX_CHARS and whole and bool(text) and not wrapper_closed
+    text = periodics.quotable(text)
+    if len(text) > STORM_CAUSE_MAX_CHARS:
+        head = text[:STORM_CAUSE_MAX_CHARS]
+        text = (head[: head.rfind(" ")] if " " in head else head).rstrip() + STORM_CAUSE_ELLIPSIS
+    elif cut_by_collector:
+        text = (text[: text.rfind(" ")] if " " in text else text).rstrip() + STORM_CAUSE_ELLIPSIS
+    return text
+
+
 class Task:
-    __slots__ = ("ceilings", "fails", "fixtures", "name", "passes", "storms")
+    __slots__ = ("ceilings", "fails", "fixtures", "name", "passes", "storm_causes", "storms")
 
     def __init__(self, task: dict):
         self.name = task.get("name") or ""
         self.passes = self.fails = self.storms = self.ceilings = self.fixtures = 0
+        # Each storm repetition's own words, counted (storm_cause).
+        self.storm_causes: Counter = Counter()
         reps = task.get("reps")
         if reps is None:
             # No per-rep detail (SCHEMA.md: absence means unknown); the
@@ -785,6 +919,9 @@ class Task:
                 self.passes += 1
             elif kind == REP_STORM:
                 self.storms += 1
+                cause = storm_cause(rep)
+                if cause:
+                    self.storm_causes[cause] += 1
             elif kind == REP_CEILING:
                 self.ceilings += 1
             elif kind == REP_FIXTURE:
@@ -803,11 +940,14 @@ class Task:
 
 
 class Run:
-    __slots__ = ("base_sha", "build_id", "duration", "eval_verdict", "eval_verdict_recorded", "finished", "has_build_log", "merge_conflict", "not_evaluated", "not_evaluated_cases", "pod_last_event", "pod_node", "pr", "result", "started", "tasks")
+    __slots__ = ("base_sha", "build_id", "duration", "eval_verdict", "eval_verdict_recorded", "finished", "gcs_base", "has_build_log", "merge_conflict", "not_evaluated", "not_evaluated_cases", "pod_last_event", "pod_node", "pr", "result", "started", "tasks")
 
     def __init__(self, run: dict):
         self.build_id = str(run.get("build_id") or "")
         self.pr = run.get("pr")
+        # The build directory the run was read from (SCHEMA.md, optional):
+        # the comment's build link follows it. Absent on older documents.
+        self.gcs_base = run.get("gcs_base") if isinstance(run.get("gcs_base"), str) else None
         # The main commit the run was built on (SCHEMA.md, optional): rule 4
         # compares a PR's red with passes on the same base. Absent is unknown.
         self.base_sha = run.get("base_sha") if isinstance(run.get("base_sha"), str) else None
@@ -857,6 +997,13 @@ class Run:
     @property
     def storm_reps(self) -> int:
         return sum(task.storms for task in self.tasks)
+
+    def storm_causes(self) -> Counter:
+        """The run's storm repetitions' own words, counted across its cases."""
+        causes: Counter = Counter()
+        for task in self.tasks:
+            causes.update(task.storm_causes)
+        return causes
 
     @property
     def ceiling_reps(self) -> int:
@@ -919,6 +1066,10 @@ class Run:
 
     def collapsed_cases(self) -> set[str]:
         return {task.name for task in self.tasks if task.collapsed}
+
+    def graded_reps(self, case: str) -> int:
+        """How many of `case`'s repetitions this run graded (pass or fail)."""
+        return sum(task.graded for task in self.tasks if task.name == case)
 
     def passing_cases(self) -> set[str]:
         return {task.name for task in self.tasks if task.passes > 0}
@@ -1016,28 +1167,31 @@ def _in_window(runs, now: datetime, window: timedelta):
     return [run for run in runs if now - window < run.finished <= now]
 
 
-def pr_caused_path(case: str, runs, population) -> tuple[str | None, list]:
+def pr_caused_path(case: str, runs, population) -> tuple[str | None, list, list]:
     """Rule 4 for one case: `runs` are the runs that collapsed it, all of one
-    pull request or the case is nobody's. It is that pull request's when the
+    pull request or the case is nobody's (a thin record on a second pull
+    request still makes it nobody's). It is that pull request's when the
     evidence rules out a flake and a moving main: the case passed on another
     pull request's run built on the same main commit (PR_CAUSED_SAME_BASE,
     with those runs), or it failed on PR_CAUSED_MIN_RUNS of the pull request's
     runs (a retest counts) while passing on another pull request
-    (PR_CAUSED_REPEATED, with the passing runs). One red run and no same-base
-    pass says nothing: (None, [])."""
+    (PR_CAUSED_REPEATED, with the passing runs). Only runs whose record of the
+    case is thick enough (PR_CAUSED_MIN_GRADED_REPS) count, and they come back
+    third. One red run and no same-base pass says nothing: (None, [], [])."""
     prs = _prs(runs)
     if len(prs) != 1:
-        return None, []
+        return None, [], []
+    solid = [run for run in runs if run.graded_reps(case) >= PR_CAUSED_MIN_GRADED_REPS]
     elsewhere = [run for run in population if case in run.passing_cases() and run.pr != prs[0]]
-    if not elsewhere:
-        return None, []
-    bases = {run.base_sha for run in runs if run.base_sha}
+    if not solid or not elsewhere:
+        return None, [], []
+    bases = {run.base_sha for run in solid if run.base_sha}
     same_base = [run for run in elsewhere if run.base_sha and run.base_sha in bases]
     if same_base:
-        return PR_CAUSED_SAME_BASE, same_base
-    if len({run.build_id for run in runs}) >= PR_CAUSED_MIN_RUNS:
-        return PR_CAUSED_REPEATED, elsewhere
-    return None, []
+        return PR_CAUSED_SAME_BASE, same_base, solid
+    if len({run.build_id for run in solid}) >= PR_CAUSED_MIN_RUNS:
+        return PR_CAUSED_REPEATED, elsewhere, solid
+    return None, [], []
 
 
 def shared_break(full_runs, now: datetime, roster: Roster) -> dict:
@@ -1057,17 +1211,19 @@ def shared_break(full_runs, now: datetime, roster: Roster) -> dict:
     )
     # Rule 4 (pr_caused_path): a case failing on exactly one pull request is
     # that pull request's, and carries no state.
-    pr_caused = []
+    pr_caused, pr_caused_latest = [], []
     for case, runs in sorted(collapses.items()):
-        path, others = pr_caused_path(case, runs, window)
+        path, others, solid = pr_caused_path(case, runs, window)
         if path == PR_CAUSED_SAME_BASE:
             pr_caused.append(
-                f"PR-caused: {case} failing only on #{_prs(runs)[0]} (passing on {len(_prs(others))} other PRs built on the same main commit)"
+                f"{EVIDENCE_PR_CAUSED}{case} failing only on #{_prs(runs)[0]} (passing on {len(_prs(others))} other PRs built on the same main commit)"
             )
         elif path == PR_CAUSED_REPEATED:
             pr_caused.append(
-                f"PR-caused: {case} failing on {len(runs)} runs of #{_prs(runs)[0]} (passing on {len(_prs(others))} other PRs)"
+                f"{EVIDENCE_PR_CAUSED}{case} failing on {len(solid)} runs of #{_prs(runs)[0]} (passing on {len(_prs(others))} other PRs)"
             )
+        if path is not None:
+            pr_caused_latest.append(max(run.finished for run in solid))
 
     concluded = [run for run in window if run.result in (RUN_SUCCESS, RUN_FAILURE)]
     reds = [run for run in concluded if run.result == RUN_FAILURE]
@@ -1084,12 +1240,12 @@ def shared_break(full_runs, now: datetime, roster: Roster) -> dict:
         runs = collapses[case]
         prs = _prs(runs)
         evidence.append(
-            f"{case} failed all graded reps on {len(runs)} runs from {len(prs)} PRs ({_pr_list(prs)})"
+            f"{case}{EVIDENCE_CASE_COLLAPSE}{len(runs)} runs from {len(prs)} PRs ({_pr_list(prs)})"
         )
     if cases and reds:
         hours = int(SHARED_BREAK_WINDOW.total_seconds() // 3600)
         evidence.append(
-            f"these cases explain {len(covered)} of {len(reds)} red runs"
+            f"{EVIDENCE_CASES_EXPLAIN}{len(covered)} of {len(reds)} red runs"
             f" ({len(reds)} of {len(concluded)} concluded runs red) in the last {hours}h"
         )
     return {
@@ -1097,6 +1253,9 @@ def shared_break(full_runs, now: datetime, roster: Roster) -> dict:
         "cases": cases,
         "evidence": evidence,
         "pr_caused": pr_caused,
+        # The latest finish among each line's solid runs, in the same order:
+        # assess drops the lines a storm window reaches.
+        "pr_caused_latest": pr_caused_latest,
         "signature_runs": {run.build_id for run in covered},
         "prs": _prs(covered),
         "runs": len(covered),
@@ -1168,9 +1327,18 @@ def storm(full_runs, now: datetime, vertex: dict | None = None) -> dict:
     rate = vertex_429_rate(vertex, now, start, end)
     confirmed = rate["read"] and rate["peak"] >= STORM_429_MIN_RATE
     fires = reps_fire and (confirmed or not rate["read"])
+    causes: Counter = Counter()
+    for run in hit:
+        causes.update(run.storm_causes())
     evidence = []
     if hit:
         line = f"quota storm: {reps} infra/empty-record reps across {len(prs)} PRs in runs finishing {hhmm(start)}–{hhmm(end)} UTC"
+        # The repetitions' own words, commonest first, before any judgement.
+        shown = causes.most_common(STORM_CAUSES_SHOWN)
+        if shown:
+            line += "; the reps say: " + ", ".join(f"{cause} ×{n}" for cause, n in shown)
+            if len(causes) > len(shown):
+                line += f", and {len(causes) - len(shown)} other phrasing(s)"
         if reps_fire and rate["read"]:
             share = f"{rate['peak'] * 100:.1f} % of {rate['requests']} Vertex calls in the hour to {hhmm(rate['hour_end'])} UTC"
             line += f"; the pool's peak 429 share was {share}" + ("" if confirmed else f", under the {STORM_429_MIN_RATE * 100:.0f} % a storm needs: infra deaths, not a quota storm")
@@ -1179,6 +1347,7 @@ def storm(full_runs, now: datetime, vertex: dict | None = None) -> dict:
         evidence.append(line)
     return {
         "fires": fires,
+        "reps_fire": reps_fire,
         "reps": reps,
         "prs": prs,
         "start": start,
@@ -1187,6 +1356,9 @@ def storm(full_runs, now: datetime, vertex: dict | None = None) -> dict:
         "signature_runs": {run.build_id for run in hit if run.storm_reps >= STORM_RUN_SIGNATURE_REPS},
         "runs": len(hit),
         "rate": rate,
+        # Every phrasing with its count, commonest first, for the incident
+        # the Chat sentence reads (it names each one, short).
+        "causes": [[cause, n] for cause, n in causes.most_common()],
     }
 
 
@@ -1294,7 +1466,7 @@ def lost_pods(runs, now: datetime) -> dict:
     evidence = []
     if lost:
         line = (
-            f"lost pods: {len(lost)} runs on {len(prs)} PRs died with their build node"
+            f"{EVIDENCE_LOST_PODS}{len(lost)} runs on {len(prs)} PRs died with their build node"
             f" {hhmm(start)}–{hhmm(end)} UTC (nodes {node_list(nodes)}; {_pr_list(prs)})"
         )
         more = len(recent) - len(lost)
@@ -1540,7 +1712,9 @@ def pr_caused_reds(full_runs, roster: Roster) -> int:
         if run.result != RUN_FAILURE or run.deadline_kill or run.not_evaluated:
             continue
         mine = run.collapsed_cases() & roster.at(run.started or run.finished)
-        if mine and all(pr_caused_path(case, collapses[case], full_runs)[0] is not None for case in mine):
+        # The run itself must be one of the case's solid runs: a thin run of
+        # a pull request that also has a real collapse is still the gate's.
+        if mine and all(run in pr_caused_path(case, collapses[case], full_runs)[2] for case in mine):
             count += 1
     return count
 
@@ -1949,11 +2123,25 @@ def pool_note(artifact: dict | None, now: datetime, prev: dict | None) -> dict |
         "lease_failures_hours": _count(recent.get("hours")),
         "no_build_id": _held_count(artifact.get("no_build_id")),
         "cause": artifact.get("cause"),
-        # The cap the newest run in the window ran under. Only the
-        # CONCURRENCY_CAP message quotes it, and without it that message
-        # cannot say what to raise the cap from.
+        # The cap the newest run in the window ran under; the CONCURRENCY_CAP
+        # message names it as the limit the presubmit ran at.
         "max_concurrency": artifact.get("max_concurrency"),
+        # What that message says about the harm: the days the periodic
+        # breached on, the longest wait among them (the window's when none
+        # is a day's), and how many runs are queued right now.
+        "breached_days": [d for d in _rows(trend, "breached_days") if isinstance(d, str)],
+        "worst_s": _worst_breached_s(trend),
+        "waiting": _count(_section(artifact, "queue").get("waiting")),
     }
+
+
+def _worst_breached_s(trend: dict) -> int | None:
+    """The longest wait among the days that breached, else the window's; each
+    value through `_as_seconds`, as the neighbouring readers do, so a bad one
+    neither wins nor blocks the fallback."""
+    days = [d for d in _rows(trend) if isinstance(d, dict) and d.get("breached")]
+    worst = [s for d in days if (s := _as_seconds(d.get("worst_minutes"))) is not None]
+    return max(worst) if worst else _as_seconds(trend.get("worst_minutes"))
 
 
 def _count(value) -> int | None:
@@ -2285,6 +2473,14 @@ def assess(
     full_runs = [run for run in visible if run.full]
     r1 = shared_break(full_runs, now, roster)
     r2 = storm(full_runs, now, vertex_429)
+    # While the storm's repetitions are firing (confirmed or not), a thin
+    # record on one pull request is the storm's symptom: rule 4 says nothing
+    # about a collapse the storm's reach covers (its first hit run's finish,
+    # less the calls before it). A collapse that finished before that is
+    # named as usual: it cannot be the storm's.
+    if r2["reps_fire"]:
+        reach = r2["start"] - STORM_429_LOOKBACK
+        r1["pr_caused"] = [line for line, latest in zip(r1["pr_caused"], r1["pr_caused_latest"]) if latest < reach]
     r2b = delegation_ceiling(full_runs, now)
     r3 = setup_deaths(visible, now)
     r3b = lost_pods(visible, now)
@@ -2354,7 +2550,7 @@ def assess(
     if condition == SHARED_BREAK:
         incident = {"prs": r1["prs"], "runs": r1["runs"], "window_start": None, "window_end": None}
     elif condition == STORM:
-        incident = {"prs": r2["prs"], "runs": r2["runs"], "window_start": iso(r2["start"]), "window_end": iso(r2["end"])}
+        incident = {"prs": r2["prs"], "runs": r2["runs"], "window_start": iso(r2["start"]), "window_end": iso(r2["end"]), "causes": r2["causes"]}
     elif condition == DELEGATION_CEILING:
         # `reps` beside the storm's keys: the message says how many
         # repetitions ended at the wait, not only how many runs held one.
@@ -2874,7 +3070,7 @@ def adjudicate(
     # against the time it is, not data.json's horizon, which a stalled
     # archive freezes together with the jobs.
     # Per job, consecutive failed checks (and per project, for the message),
-    # so a ten-minute job's single flap is not news and two in a row are. The
+    # so the hourly sweep's single flap is not news and two in a row are. The
     # counts live in the previous health.json; a tick that could not fetch it
     # starts them over, which would hide a told, still-failing job for a tick
     # or two, so on that tick the thresholds are off: a failed build is a note,

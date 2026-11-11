@@ -145,6 +145,7 @@ class LedgerMintRetryTest(unittest.TestCase):
                     "EVAL_LEDGER_APP_ID": "4739812",
                     "EVAL_LEDGER_INSTALLATION_ID": "157029058",
                     "BENCH_GITHUB_TOKEN": "the-mounted-pat",
+                    "EVAL_GRADING_LOG": str(self.tmp / "eval-grading.log"),
                 }
             ),
         )
@@ -327,6 +328,7 @@ class LedgerTokenRenewalTest(unittest.TestCase):
             "BENCH_GITHUB_TOKEN": "tok-at-launch",
             "TOKEN_FILE": str(self.tmp / "unit.ledger-token"),
             "COUNT_FILE": str(self.tmp / "mint-count"),
+            "EVAL_GRADING_LOG": str(self.tmp / "eval-grading.log"),
             "RENEWER_LOG": str(log_file),
         }
         overrides.update(env)
@@ -563,6 +565,7 @@ class UnitNotRunTest(unittest.TestCase):
                 _lift_line(r"^readonly EVAL_INFLIGHT_GRACE_SECONDS=.*$", "EVAL_INFLIGHT_GRACE_SECONDS"),
                 _lift_line(r"^readonly EVAL_INJECT_LOCAL_PORT_BASE=.*$", "EVAL_INJECT_LOCAL_PORT_BASE"),
                 _lift_line(r"^readonly EVAL_TIMING_FILE=.*$", "EVAL_TIMING_FILE"),
+                _lift_line(r"^readonly EVAL_SHAPE_FILE=.*$", "EVAL_SHAPE_FILE"),
                 _lift_line(r"^readonly EVAL_GATEWAY_GONE_RC=.*$", "EVAL_GATEWAY_GONE_RC"),
                 _lift_line(r"^readonly EVAL_INSTALL_GONE_MARKER=.*$", "EVAL_INSTALL_GONE_MARKER"),
                 # run_one_unit writes the rep log here; a private one per run.
@@ -645,6 +648,7 @@ class UnitNotRunTest(unittest.TestCase):
                     "EVAL_DEFAULT_LOCATION": "l",
                     "EVAL_LEDGER_APP_KEY_FILE": str(self.key),
                     "EVAL_LEDGER_APP_ID": "4739812",
+                    "EVAL_GRADING_LOG": str(self.tmp / "eval-grading.log"),
                     "EVAL_LEDGER_INSTALLATION_ID": "157029058",
                     "EVAL_LEDGER_REPO": "gke-agentic/kube-agents-evals-2-infra",
                     "PROJECT_ID": "kube-agents-evals-2",
@@ -886,6 +890,7 @@ class LedgerMintRequestTest(unittest.TestCase):
                     "MINT_CAPTURE_FILE": str(self.capture),
                     "EVAL_LEDGER_APP_KEY_FILE": str(self.key),
                     "BENCH_GITHUB_TOKEN": "the-mounted-pat",
+                    "EVAL_GRADING_LOG": str(self.tmp / "eval-grading.log"),
                     **exported,
                 },
                 # A shell that has run the harness exports both ids; an id the
