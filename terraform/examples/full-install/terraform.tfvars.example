@@ -99,12 +99,6 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # namespace. Only for a long-lived install whose own state owns the release.
 # helm_upgrade_install = true
 
-# The PlatformAgent's spec.mode: "today" (the default, which renders no mode
-# field) or "next", which puts the NATS bus and the A2A gateway in front of
-# the agent, and is what install.sh records on a first install. Changing it
-# later is a mode switch; see variables.tf.
-# platform_agent_mode = "today"
-
 # The PlatformAgent's spec.storage.size: the agent's data volume and the shell
 # sandbox's, which the operator gives the same size. The default passes
 # nothing, so the operator default applies. Raising it grows both claims; a lower value is

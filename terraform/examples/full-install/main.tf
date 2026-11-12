@@ -2,8 +2,7 @@ locals {
   # A zonal Standard cluster this composition creates: one node in its default
   # pool (standard_node_count is per zone), too few for a three-server A2A bus.
   # An adopted cluster's node count is not known here, so it keeps the
-  # operator's default, which holds a running bus at its count. A today install
-  # runs no bus and ignores the field, so the mode does not enter into it.
+  # operator's default, which holds a running bus at its count.
   bus_single_server = var.create_cluster && var.cluster_mode == "standard" && can(regex("^[a-z]+-[a-z]+[0-9]+-[a-z]$", var.location))
 
   # iam, monitoring, and logging are here because Terraform must enable every
@@ -380,13 +379,13 @@ locals {
 # A warning rather than a precondition: setting image_registry without
 # third_party_image_registry is a valid configuration if the operator only
 # intends to mirror first-party images. But third-party images (cert-manager,
-# LiteLLM, fluent-bit, the GitHub token minter, Hindsight, and the cleanup hook)
+# LiteLLM, fluent-bit, the NATS bus, the GitHub token minter, Hindsight, and the cleanup hook)
 # will remain on upstream public registries. On restricted or air-gapped clusters,
 # operators must be informed so deployments do not fail on ImagePullBackOff.
 check "unmirrored_third_party_images" {
   assert {
     condition     = trimsuffix(var.image_registry, "/") == "" || local.third_party_registry != ""
-    error_message = "var.image_registry is set (${var.image_registry}), but var.third_party_image_registry is empty. Third-party images (cert-manager, LiteLLM, fluent-bit, the GitHub token minter, Hindsight, and the cleanup hook) will still be pulled from their upstream public registries. If this cluster is restricted or air-gapped, set var.third_party_image_registry (commonly the same prefix) to pull third-party images from your mirror too."
+    error_message = "var.image_registry is set (${var.image_registry}), but var.third_party_image_registry is empty. Third-party images (cert-manager, LiteLLM, fluent-bit, the NATS bus, the GitHub token minter, Hindsight, and the cleanup hook) will still be pulled from their upstream public registries. If this cluster is restricted or air-gapped, set var.third_party_image_registry (commonly the same prefix) to pull third-party images from your mirror too."
   }
 }
 
@@ -1079,10 +1078,7 @@ resource "helm_release" "kube_agents" {
         }
       } : {}
     )
-    # merge(), so "today" adds no key and the values this composition hands the
-    # chart stay what they were before platform_agent_mode existed; the chart
-    # leaves spec.mode out of the CR while its value is null. The storage size
-    # works the same way: the default adds no key, and the CR carries no
+    # merge(), so the default storage size adds no key and the CR carries no
     # spec.storage.
     platformAgent = merge({
       # The durable record of an adoption that accepted a cluster with no
@@ -1217,8 +1213,6 @@ resource "helm_release" "kube_agents" {
       integration = local.platform_agent_integration
       }, var.platform_agent_storage_size == local.platform_agent_default_storage_size ? {} : {
       storage = { size = var.platform_agent_storage_size }
-      }, var.platform_agent_mode == "today" ? {} : {
-      mode = var.platform_agent_mode
     })
     # The minter's Kubernetes half (Deployment, Service, NetworkPolicy, KSA,
     # minty rule ConfigMap, github-app-credentials Secret); the GCP half is

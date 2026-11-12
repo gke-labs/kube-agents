@@ -1,6 +1,6 @@
 # This template renders the built-in optional `tse` (GKE Support Agent)
-# AgentProfile custom resource for `spec.mode: next` installations when both
-# `.Values.platformAgent.enabled` and `.Values.profiles.tse.enabled` are true.
+# AgentProfile custom resource when both `.Values.platformAgent.enabled` and
+# `.Values.profiles.tse.enabled` are true.
 {{- if and .Values.platformAgent.enabled .Values.profiles .Values.profiles.tse .Values.profiles.tse.enabled }}
 {{- $tse := .Values.profiles.tse -}}
 {{- $defaultTag := (.Values.platformAgent.deployment.image.tag | default .Chart.AppVersion) | toString -}}

@@ -1167,11 +1167,6 @@ class GvisorFloorCannotBlockTheTeardownTest(unittest.TestCase):
         budget_at = text.find('export LITELLM_BUDGET_USD="" LITELLM_BUDGET_PERIOD=""')
         self.assertNotEqual(budget_at, -1, "uninstall.sh must blank the LITELLM_BUDGET_* keys")
         self.assertLess(budget_at, call_at)
-        # And the mode: the generator refuses a value outside the CRD's enum,
-        # and a teardown must not stop on a typo in install.env.
-        mode_at = text.find('export PLATFORM_AGENT_MODE=""')
-        self.assertNotEqual(mode_at, -1, "uninstall.sh must blank PLATFORM_AGENT_MODE")
-        self.assertLess(mode_at, call_at)
         # And the Slack home channel policy, refused outside the same kind of enum.
         policy_at = text.find('export SLACK_HOME_CHANNEL_POLICY=""')
         self.assertNotEqual(policy_at, -1, "uninstall.sh must blank SLACK_HOME_CHANNEL_POLICY")

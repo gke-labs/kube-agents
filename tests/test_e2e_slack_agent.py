@@ -83,8 +83,8 @@ class FakeSlack:
         raise AssertionError(method)
 
 
-def _run(fake, mode="next", listed=None):
-    env = {"E2E_SLACK_MODE": mode}
+def _run(fake, path="gateway", listed=None):
+    env = {"E2E_SLACK_PATH": path}
     with mock.patch.dict("os.environ", env), mock.patch.object(MOD.time, "sleep", lambda s: None), \
             mock.patch.object(MOD, "gateway_test_users", lambda: listed):
         MOD.test_slack_agent_math_response((fake, _CHANNEL, _BOT))
@@ -109,20 +109,20 @@ class SlackAgentTestLogic(unittest.TestCase):
         _run(fake)
         self.assertTrue(fake.posted[0]["text"].startswith(f"<@{_BOT}> "))
 
-    def test_no_reaction_is_the_expected_failure_on_next_and_a_failure_on_today(self):
+    def test_no_reaction_is_the_expected_failure_on_the_gateway_and_a_failure_on_hermes(self):
         step = [{"replies": [_ANSWER]}]
-        _run(FakeSlack(step), mode="next")
+        _run(FakeSlack(step), path="gateway")
         with self.assertRaises(AssertionError) as caught:
-            _run(FakeSlack(step), mode="today")
+            _run(FakeSlack(step), path="hermes")
         self.assertIn("reacted", str(caught.exception))
 
-    def test_a_plain_text_answer_fails_only_on_next(self):
+    def test_a_plain_text_answer_fails_only_on_the_gateway(self):
         answer = {"ts": _ANSWER_TS, "user": _BOT, "text": "It is 5."}
         step = [{"reaction": "eyes", "replies": [answer]}]
         with self.assertRaises(AssertionError) as caught:
-            _run(FakeSlack(step), mode="next")
+            _run(FakeSlack(step), path="gateway")
         self.assertIn("headline", str(caught.exception))
-        _run(FakeSlack(step), mode="today")
+        _run(FakeSlack(step), path="hermes")
 
     def test_no_answer_times_out(self):
         with mock.patch.object(MOD, "TEST_TIMEOUT_SEC", 0), self.assertRaises(AssertionError):
@@ -147,49 +147,52 @@ class SlackAgentTestLogic(unittest.TestCase):
         self.assertIn("allowlist", str(caught.exception))
         self.assertEqual(2, fake.polls)  # the preflight's read-back, then the poll that saw it
 
-    def test_mode_comes_from_the_env_then_the_platform_agent(self):
-        with mock.patch.dict("os.environ", {"E2E_SLACK_MODE": "today"}), \
-                mock.patch.object(MOD, "_kubectl_json", lambda *a: {"items": [{"spec": {"mode": "next"}}]}):
-            self.assertEqual("today", MOD.install_mode())
-        with mock.patch.dict("os.environ", {"E2E_SLACK_MODE": ""}):
-            with mock.patch.object(MOD, "_kubectl_json", lambda *a: {"items": [{"spec": {"mode": "next"}}]}):
-                self.assertEqual("next", MOD.install_mode())
+    def test_path_comes_from_the_env_then_the_platform_agents_integrations(self):
+        both = {"items": [{"spec": {"integration": {"googleChat": {"enabled": True}, "slack": {"enabled": True}}}}]}
+        with mock.patch.dict("os.environ", {"E2E_SLACK_PATH": "gateway"}), \
+                mock.patch.object(MOD, "_kubectl_json", lambda *a: both):
+            self.assertEqual("gateway", MOD.slack_path())
+        with mock.patch.dict("os.environ", {"E2E_SLACK_PATH": ""}):
+            with mock.patch.object(MOD, "_kubectl_json", lambda *a: both):
+                self.assertEqual("hermes", MOD.slack_path())
+            with mock.patch.object(MOD, "_kubectl_json", lambda *a: {"items": [{"spec": {"integration": {"slack": {"enabled": True}}}}]}):
+                self.assertEqual("gateway", MOD.slack_path())
             with mock.patch.object(MOD, "_kubectl_json", lambda *a: {"items": [{"spec": {}}]}):
-                self.assertEqual("", MOD.install_mode())
+                self.assertEqual("gateway", MOD.slack_path())
             with mock.patch.object(MOD, "_kubectl_json", lambda *a: None):
-                self.assertIsNone(MOD.install_mode())
+                self.assertIsNone(MOD.slack_path())
 
-    def test_on_next_a_status_line_quoting_the_result_is_not_the_answer(self):
+    def test_on_the_gateway_a_status_line_quoting_the_result_is_not_the_answer(self):
         working = {"ts": "1800000001.000100", "user": _BOT, "bot_id": "B1", "text": "⚙️ *working* — 2 + 3 = 5"}
         done = dict(working, text="✅ *completed*")
         fake = FakeSlack([{}, {"replies": [working]}, {"reaction": "eyes", "replies": [done, _ANSWER]}])
-        _run(fake, mode="next")
+        _run(fake, path="gateway")
         self.assertGreaterEqual(fake.polls, 3)  # the preflight, the working line, then the answer
 
-    def test_on_next_a_failed_turn_fails_at_once(self):
+    def test_on_the_gateway_a_failed_turn_fails_at_once(self):
         failed = {"ts": "1800000001.000100", "user": _BOT, "bot_id": "B1", "text": "❌ *failed*"}
         notice = {"ts": "1800000002.000100", "user": _BOT, "bot_id": "B1", "text": "❌ failed: the model returned 5xx"}
         fake = FakeSlack([{"replies": [failed, notice]}])
         with self.assertRaises(_Failed) as caught:
-            _run(fake, mode="next")
+            _run(fake, path="gateway")
         self.assertIn("failure", str(caught.exception))
         self.assertIn("the model returned 5xx", str(caught.exception))
 
-    def test_on_a_lineless_next_thread_a_notice_before_the_answer_is_not_it(self):
+    def test_on_a_lineless_gateway_thread_a_notice_before_the_answer_is_not_it(self):
         note = {"ts": "1800000001.000100", "user": _BOT, "bot_id": "B1", "text": "ℹ️ looking at the cluster"}
         fake = FakeSlack([{}, {"reaction": "eyes", "replies": [note]}, {"reaction": "eyes", "replies": [note, _ANSWER]}])
-        _run(fake, mode="next")
+        _run(fake, path="gateway")
         self.assertEqual(3, fake.polls)  # the preflight, the poll with only the notice, then the answer
 
-    def test_an_unknown_mode_skips_the_modes_own_checks(self):
+    def test_an_unknown_path_skips_the_paths_own_checks(self):
         answer = {"ts": _ANSWER_TS, "user": _BOT, "text": "It is 5."}
-        with mock.patch.object(MOD, "install_mode", lambda: None):
-            _run(FakeSlack([{"replies": [answer]}]), mode="")
+        with mock.patch.object(MOD, "slack_path", lambda: None):
+            _run(FakeSlack([{"replies": [answer]}]), path="")
 
     def test_another_apps_post_in_the_thread_is_not_the_bots(self):
         other = {"ts": "1800000002.000100", "user": "UOTHER", "bot_id": "BOTHER", "text": "⛔ not you, 5"}
         fake = FakeSlack([{}, {"reaction": "eyes", "replies": [other]}, {"reaction": "eyes", "replies": [other, _ANSWER]}])
-        _run(fake, mode="next")
+        _run(fake, path="gateway")
         self.assertEqual(3, fake.polls)  # the preflight, the poll with only the other post, then the answer
 
     def test_timing_legs_are_measured_from_the_post(self):

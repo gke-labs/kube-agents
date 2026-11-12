@@ -155,14 +155,14 @@ class FootprintSummaryTest(unittest.TestCase):
         self._assert_summary_matches(notes, req)
         # The stock install's figures, the ones the prerequisites page quotes, in the
         # words the notes use, so a wording change is a deliberate one here too.
-        self.assertIn("CPU requests:        2.756 cores", notes)
-        self.assertIn("Memory requests:     11.81 GiB", notes)
-        self.assertIn("Persistent storage:  102 GiB over 4 claims", notes)
+        self.assertIn("CPU requests:        4.386 cores", notes)
+        self.assertIn("Memory requests:     14.70 GiB", notes)
+        self.assertIn("Persistent storage:  222 GiB over 7 claims", notes)
         self.assertIn("$0.0445/vCPU-hour", notes)
         self.assertIn("$0.0049225/GiB-hour", notes)
         self.assertIn("$0.10/GiB-month", notes)
         self.assertIn("$73.00/month GKE cluster fee", notes)
-        self.assertNotIn("Not counted", notes)
+        self.assertIn("Not counted: the session pods", notes)
         # The disk is the balanced class on the footprint line and on the cost line alike.
         self.assertIn("balanced persistent disk", notes)
         self.assertNotIn("SSD", notes)
@@ -173,33 +173,38 @@ class FootprintSummaryTest(unittest.TestCase):
         self._assert_summary_matches(notes, req)
         for key in ("requestsCpu", "requestsMemory", "requestsStorage", "pods", "persistentVolumeClaims"):
             self.assertGreater(req[key], defaults[key], key)
-        # 200Gi on two data claims (150Gi over the default each) plus Hindsight's 8Gi claim.
-        self.assertIn("Persistent storage:  410 GiB over 5 claims", notes)
+        # 200Gi on two data claims (150Gi over the default each), the three 40Gi JetStream
+        # claims, the 2Gi image-tree cache and Hindsight's 8Gi claim.
+        self.assertIn("Persistent storage:  530 GiB over 8 claims", notes)
 
     def test_storage_size_alone_moves_the_ssd_line_and_the_total(self) -> None:
         default_notes, default_req = self._render()
         notes, req = self._render(["platformAgent.storage.size=80Gi"])
         self.assertEqual(req["requestsCpu"], default_req["requestsCpu"])
         self.assertEqual(req["requestsStorage"], default_req["requestsStorage"] + 2 * 30 * _GIB)
-        self.assertIn("Persistent storage:  162 GiB over 4 claims", notes)
+        self.assertIn("Persistent storage:  282 GiB over 7 claims", notes)
         self.assertIn(_expected_lines(req)["total"], notes)
         self.assertNotEqual(_expected_lines(req)["total"], _expected_lines(default_req)["total"])
         self.assertIn(_expected_lines(default_req)["total"], default_notes)
 
-    def test_next_mode_names_what_the_summary_leaves_out(self) -> None:
-        notes, req = self._render(["platformAgent.mode=next"])
+    def test_the_summary_names_what_it_leaves_out(self) -> None:
+        notes, req = self._render()
         self._assert_summary_matches(notes, req)
-        # The preflight sums the next-mode workloads (footprint.yaml's nextMode), so
-        # the figures carry them, the NATS bus's JetStream claim included, and only
-        # the session pods are left out.
+        # The preflight sums the A2A stack with the operator's other workloads, so the
+        # figures carry it, the NATS bus's JetStream claims included, and only the
+        # session pods are left out.
         self.assertIn("Not counted: the session pods", notes)
         self.assertIn("its JetStream claims among them, are in the figures above", notes)
-        today_notes, today = self._render(["platformAgent.mode=today"])
-        self.assertNotIn("Not counted", today_notes)
-        # One 40 GiB JetStream claim per NATS server, three by default.
-        self.assertEqual(req["persistentVolumeClaims"], today["persistentVolumeClaims"] + 3)
-        self.assertEqual(req["requestsStorage"], today["requestsStorage"] + 3 * 40 * _GIB)
-        self.assertGreater(req["pods"], today["pods"])
+        # One 40 GiB JetStream claim per NATS server, three by default; one server keeps one.
+        one_notes, one = self._render(["platformAgent.harness.tuning.busReplicas=1"])
+        self._assert_summary_matches(one_notes, one)
+        self.assertEqual(req["persistentVolumeClaims"], one["persistentVolumeClaims"] + 2)
+        self.assertEqual(req["requestsStorage"], one["requestsStorage"] + 2 * 40 * _GIB)
+        self.assertEqual(req["pods"], one["pods"] + 2)
+        # A leftover platformAgent.mode value changes nothing.
+        for spelling in ("platformAgent.mode=today", "platformAgent.mode=next"):
+            with self.subTest(spelling):
+                self.assertEqual(self._render([spelling]), (notes, req))
 
     def test_summary_follows_the_quota_preflight_switch(self) -> None:
         # The summary shares the preflight's arithmetic, and the preflight's refusals name

@@ -261,8 +261,6 @@ class InstallerCommonTest(unittest.TestCase):
                     # pool in every file the cases read.
                     "SCOPED_SA_POOL_ENABLED": "",
                     "SCOPED_SA_POOL_MAX_ACCOUNTS": "",
-                    # And the mode, refused on a value outside the CRD's enum.
-                    "PLATFORM_AGENT_MODE": "",
                     "WEB_CONSOLE_ENABLED": "",
                     "ACCEPT_NO_NETWORK_POLICY": "",
                     # And the data volume size, refused when malformed.
@@ -1592,18 +1590,15 @@ class InstallerCommonTest(unittest.TestCase):
         self.assertIn("rc=1 out=[]", proc.stdout)
         self.assertIn("LITELLM_REDACTION_RULES is not valid JSON", proc.stderr)
 
-    # ── PLATFORM_AGENT_MODE: the PlatformAgent's spec.mode ──────────────────
+    # ── PLATFORM_AGENT_MODE: read and ignored ────────────────────────────────
 
-    def test_tfvars_carry_the_platform_agent_mode(self):
-        # Written on every run, the default included, so upgrade.sh carries the
-        # recorded mode forward; the composition renders nothing for "today".
+    def test_tfvars_carry_no_platform_agent_mode_whatever_the_key_says(self):
+        # The key once chose the component stack; every install runs the A2A
+        # stack, so the generator writes nothing for it and refuses no value.
         with tempfile.TemporaryDirectory() as out_dir:
             dest = pathlib.Path(out_dir) / "terraform.tfvars"
-            for env, expected in (
-                ({}, 'platform_agent_mode = "today"\n'),
-                ({"PLATFORM_AGENT_MODE": "today"}, 'platform_agent_mode = "today"\n'),
-                ({"PLATFORM_AGENT_MODE": "next"}, 'platform_agent_mode = "next"\n'),
-            ):
+            for env in ({}, {"PLATFORM_AGENT_MODE": "today"}, {"PLATFORM_AGENT_MODE": "next"},
+                        {"PLATFORM_AGENT_MODE": "later"}):
                 with self.subTest(env=env):
                     proc = self._run(
                         f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
@@ -1611,63 +1606,40 @@ class InstallerCommonTest(unittest.TestCase):
                         describe_stub="printf '\\n'; exit 0",
                     )
                     self.assertIn("rc=0", proc.stdout, proc.stderr)
-                    self.assertIn(expected, dest.read_text())
+                    self.assertNotIn("platform_agent_mode", dest.read_text())
+                    self.assertNotIn("PLATFORM_AGENT_MODE", proc.stderr)
 
-    def test_tfvars_refuse_a_platform_agent_mode_outside_the_crd_enum(self):
-        # upgrade.sh and the menu regenerate from install.env without
-        # install.sh's check: the generator names the key and writes nothing.
-        with tempfile.TemporaryDirectory() as out_dir:
-            dest = pathlib.Path(out_dir) / "terraform.tfvars"
-            for value in ("Next", "later", "today "):
-                with self.subTest(value=value):
-                    proc = self._run(
-                        f'rc=0; write_tfvars_from_state "{dest}" || rc=$?; echo "rc=$rc"',
-                        env={"API_SERVER_KEY": "k", "PLATFORM_AGENT_MODE": value},
-                        describe_stub="printf '\\n'; exit 0",
-                    )
-                    self.assertIn("rc=1", proc.stdout, proc.stderr)
-                    self.assertIn(f"PLATFORM_AGENT_MODE='{value}' is not one of today, next. Fix it in install.env.", proc.stderr)
-                    self.assertFalse(dest.exists(), "no tfvars is written for a value Terraform would refuse")
-
-    def test_load_install_env_reads_the_mode_from_the_file_alone(self):
-        # An inherited PLATFORM_AGENT_MODE would switch the install for one run;
-        # the file's own key still loads.
+    def test_load_install_env_says_once_that_a_recorded_mode_is_ignored(self):
+        # A file from before every install ran the A2A stack still assigns the
+        # key. It loads, the variable is unset, and the run says so once; a
+        # file without the key, or a shell export alone, says nothing.
+        loud = 'print_info() { echo "INFO: $*"; }; '
         with tempfile.TemporaryDirectory() as tmp:
             silent = pathlib.Path(tmp) / "silent.env"
             silent.write_text("PROJECT_ID=p\n")
             recorded = pathlib.Path(tmp) / "recorded.env"
-            recorded.write_text("PLATFORM_AGENT_MODE=next\n")
-            for file, expected in ((silent, "MODE=[]"), (recorded, "MODE=[next]")):
-                with self.subTest(file=file.name):
+            for spelling in ("PLATFORM_AGENT_MODE=next", "PLATFORM_AGENT_MODE=today", "PLATFORM_AGENT_MODE=",
+                             "export PLATFORM_AGENT_MODE=next"):
+                recorded.write_text(f"PROJECT_ID=p\n{spelling}\n")
+                with self.subTest(spelling=spelling):
                     proc = self._run(
-                        f'load_install_env "{file}"; echo "MODE=[${{PLATFORM_AGENT_MODE:-}}]"',
-                        env={"PLATFORM_AGENT_MODE": "next" if file is silent else "today"},
+                        f'{loud}rc=0; load_install_env "{recorded}" || rc=$?; echo "rc=$rc MODE=[${{PLATFORM_AGENT_MODE:-}}]"',
+                        env={"PLATFORM_AGENT_MODE": "today"},
                     )
-                    self.assertIn(expected, proc.stdout, proc.stderr)
-
-    def test_a_recorded_mode_is_carried_into_the_regenerated_tfvars(self):
-        # upgrade.sh's full path, and the menu's: load install.env, then
-        # regenerate. The recorded mode reaches the tfvars; an exported one
-        # over a file that records none does not.
-        with tempfile.TemporaryDirectory() as tmp:
-            dest = pathlib.Path(tmp) / "terraform.tfvars"
-            recorded = pathlib.Path(tmp) / "recorded.env"
-            recorded.write_text("PLATFORM_AGENT_MODE=next\n")
-            silent = pathlib.Path(tmp) / "silent.env"
-            silent.write_text("PROJECT_ID=test-project\n")
-            for file, exported, expected in (
-                (recorded, "", 'platform_agent_mode = "next"\n'),
-                (recorded, "today", 'platform_agent_mode = "next"\n'),
-                (silent, "next", 'platform_agent_mode = "today"\n'),
-            ):
-                with self.subTest(file=file.name, exported=exported):
-                    proc = self._run(
-                        f'load_install_env "{file}"; write_tfvars_from_state "{dest}"; echo "rc=$?"',
-                        env={"API_SERVER_KEY": "k", "PLATFORM_AGENT_MODE": exported},
-                        describe_stub="printf '\\n'; exit 0",
+                    self.assertIn("rc=0 MODE=[]", proc.stdout, proc.stderr)
+                    self.assertIn(
+                        f"{recorded} still sets PLATFORM_AGENT_MODE, which is no longer read: every install runs the A2A stack",
+                        proc.stdout + proc.stderr,
                     )
-                    self.assertIn("rc=0", proc.stdout, proc.stderr)
-                    self.assertIn(expected, dest.read_text())
+                    self.assertIn("You may remove the key.", proc.stdout + proc.stderr)
+            proc = self._run(f'{loud}load_install_env "{recorded}"; load_install_env "{recorded}"; echo "rc=$?"')
+            self.assertEqual((proc.stdout + proc.stderr).count("still sets PLATFORM_AGENT_MODE"), 1, proc.stdout + proc.stderr)
+            proc = self._run(
+                f'{loud}load_install_env "{silent}"; echo "rc=$? MODE=[${{PLATFORM_AGENT_MODE:-}}]"',
+                env={"PLATFORM_AGENT_MODE": "next"},
+            )
+            self.assertIn("rc=0 MODE=[]", proc.stdout, proc.stderr)
+            self.assertNotIn("PLATFORM_AGENT_MODE", proc.stdout + proc.stderr)
 
     # ── PLATFORM_AGENT_STORAGE_SIZE: the PlatformAgent's spec.storage.size ──
 
@@ -1751,381 +1723,6 @@ class InstallerCommonTest(unittest.TestCase):
                     )
                     self.assertIn("rc=0", proc.stdout, proc.stderr)
                     self.assertIn(expected, dest.read_text())
-
-    _CONTEXT_KUBECTL = '#!/usr/bin/env bash\ncase "$*" in *"config get-contexts"*) exit 0 ;; esac\nexit 1\n'
-
-    # A CR list as `kubectl get platformagents -o json` prints it: no CR, a CR
-    # with no mode, or a CR with the mode given.
-    @staticmethod
-    def _cr_list(mode=None, present=True):
-        if not present:
-            return '{"items": []}'
-        spec = f'{{"mode": "{mode}"}}' if mode else "{}"
-        return f'{{"items": [{{"metadata": {{"name": "platform-agent"}}, "spec": {spec}}}]}}'
-
-    _NO_TYPE = "error: the server doesn't have a resource type platformagents"
-    _UNREACHABLE = "Unable to connect to the server: dial tcp: i/o timeout"
-
-    @staticmethod
-    def _cr_kubectl(listing, exit_code=0, stderr=""):
-        """A kubectl with this cluster's context whose CR read prints
-        `listing` (and `stderr`) and exits `exit_code`. Every CR read leaves a
-        line in $KUBECTL_LOG when the caller sets one."""
-        return (
-            "#!/usr/bin/env bash\n"
-            'case "$*" in\n'
-            '  *"config get-contexts"*) exit 0 ;;\n'
-            '  *"get platformagents"*) [ -n "${KUBECTL_LOG:-}" ] && echo cr >> "$KUBECTL_LOG"\n'
-            f"    printf '%s' '{listing}'; printf '%s' \"{stderr}\" >&2; exit {exit_code} ;;\n"
-            "esac\nexit 1\n"
-        )
-
-    # A helm stub, as a function: `history` prints the revisions given, `get
-    # values` the values of the revision asked for, or `latest` without
-    # --revision. A value of None fails that read; `latest="norelease"` is
-    # Helm's missing-release answer. Each call leaves a line in $HELM_LOG.
-    @staticmethod
-    def _helm(history, values_by_revision, latest="{}"):
-        history_arm = (
-            "echo 'Error: Kubernetes cluster unreachable' >&2; return 1"
-            if history is None else f"printf '%s' '{history}'"
-        )
-
-        def arm(vals):
-            if vals is None:
-                return "echo 'Error: Kubernetes cluster unreachable' >&2; return 1"
-            if vals == "norelease":
-                return "echo 'Error: release: not found' >&2; return 1"
-            return f"printf '%s' '{vals}'"
-        cases = "".join(
-            f'      *"--revision {rev}"*) {arm(vals)} ;;\n' for rev, vals in values_by_revision.items()
-        )
-        return (
-            "helm() {\n"
-            '  [ -n "${HELM_LOG:-}" ] && echo "$*" >> "$HELM_LOG"\n'
-            '  case "$1" in\n'
-            f"    history) {history_arm} ;;\n"
-            '    get) case "$*" in\n'
-            f"{cases}"
-            '      *"--revision"*) return 1 ;;\n'
-            f"      *) {arm(latest)} ;;\n"
-            "    esac ;;\n"
-            "    *) return 1 ;;\n"
-            "  esac\n"
-            "}\n"
-        )
-
-    _HEALTHY = '[{"revision": 1, "status": "superseded"}, {"revision": 2, "status": "deployed"}]'
-
-    @staticmethod
-    def _no_helm(log):
-        """A helm that must not run: each call leaves a line in `log`, which
-        a command substitution cannot swallow the way it swallows stdout, so
-        the case asserts `log` was never created."""
-        return f'helm() {{ echo "$*" >> "{log}"; return 99; }}\n'
-    _LOUD_PRINTS = 'print_warning() { echo "WARN: $*"; }\nprint_info() { echo "INFO: $*"; }\n'
-
-    def _announce(self, kubectl, helm_stub, key="next", call=None):
-        call = call or f"announce_platform_agent_mode_for_apply kubeagents-system {key}"
-        return self._run(f"{self._LOUD_PRINTS}{helm_stub}{call}", kubectl_script=kubectl)
-
-    def test_the_notice_compares_the_cr_with_the_served_revision(self):
-        failed_latest = '[{"revision": 1, "status": "deployed"}, {"revision": 2, "status": "failed"}]'
-        for kubectl, helm_stub, expect in (
-            # Installed today; the key now asks for next.
-            (self._cr_kubectl(self._cr_list()), self._helm(self._HEALTHY, {}, latest="{}"),
-             "WARN: This apply switches the install from spec.mode today to next"),
-            # A failed latest revision records next, but Helm patches from the
-            # one that served, which has no mode: still a switch.
-            (self._cr_kubectl(self._cr_list()),
-             self._helm(failed_latest, {1: "{}"}, latest='{"platformAgent":{"mode":"next"}}'),
-             "WARN: This apply switches the install from spec.mode today to next"),
-            # Recorded and running next: a re-apply says nothing.
-            (self._cr_kubectl(self._cr_list("next")),
-             self._helm(self._HEALTHY, {}, latest='{"platformAgent":{"mode":"next"}}'), None),
-        ):
-            with self.subTest(helm_stub=helm_stub, kubectl=kubectl):
-                proc = self._announce(kubectl, helm_stub)
-                if expect is None:
-                    self.assertEqual(proc.stdout, "", proc.stderr)
-                else:
-                    self.assertIn(expect, proc.stdout, proc.stderr)
-
-    def test_a_first_install_is_quiet(self):
-        # Nothing to switch: no PlatformAgent type, no CR, or no release. A
-        # first install's missing cluster is the TFVARS_CLUSTER_EXISTS=false
-        # case below, which reads nothing.
-        with tempfile.TemporaryDirectory() as tmp:
-            log = pathlib.Path(tmp) / "helm-must-not-run.log"
-            for kubectl, helm_stub, helm_runs in (
-                (self._cr_kubectl("", exit_code=1, stderr=self._NO_TYPE), self._no_helm(log), False),
-                (self._cr_kubectl(self._cr_list(present=False)), self._helm(self._HEALTHY, {}, latest="norelease"), True),
-                (self._cr_kubectl(self._cr_list()), self._helm(self._HEALTHY, {}, latest="norelease"), True),
-            ):
-                with self.subTest(kubectl=kubectl, helm_stub=helm_stub):
-                    log.unlink(missing_ok=True)
-                    proc = self._announce(kubectl, helm_stub)
-                    self.assertEqual(proc.stdout, "", proc.stderr)
-                    if not helm_runs:
-                        self.assertFalse(log.exists(), log.read_text() if log.exists() else "")
-
-    def test_a_cluster_with_no_context_says_the_check_did_not_run(self):
-        # The generator found the cluster, but the kubeconfig has no context
-        # for it (kubectl absent, or a get-credentials that did not land, on
-        # the --dry-run and --generate-only routes the scope check skips). Not
-        # a first install, so the notice says it did not run, with the fix.
-        with tempfile.TemporaryDirectory() as tmp:
-            hlog = pathlib.Path(tmp) / "helm.log"
-            proc = self._run(
-                f"{self._LOUD_PRINTS}{self._no_helm(hlog)}"
-                "TFVARS_CLUSTER_EXISTS=true announce_platform_agent_mode_for_apply kubeagents-system next\n",
-                kubectl_script=None,
-            )
-            self.assertIn("WARN: The mode-switch check did not run: the kubeconfig has no context", proc.stdout, proc.stderr)
-            self.assertIn("gcloud container clusters get-credentials", proc.stdout)
-            self.assertFalse(hlog.exists())
-
-    def test_a_cluster_the_generator_found_absent_is_not_read(self):
-        # A reinstall under a name used before: the tfvars generator's describe
-        # said NOT_FOUND (TFVARS_CLUSTER_EXISTS=false), but the kubeconfig
-        # still has the old install's context, whose endpoint is gone. Nothing
-        # is asked and nothing is said; with the cluster there, the same
-        # failed read still says the check did not run.
-        unreachable = self._cr_kubectl("", exit_code=1, stderr=self._UNREACHABLE)
-        with tempfile.TemporaryDirectory() as tmp:
-            klog = pathlib.Path(tmp) / "kubectl.log"
-            hlog = pathlib.Path(tmp) / "helm.log"
-            proc = self._run(
-                f'export KUBECTL_LOG="{klog}"\n{self._LOUD_PRINTS}{self._no_helm(hlog)}'
-                "TFVARS_CLUSTER_EXISTS=false announce_platform_agent_mode_for_apply kubeagents-system next\n",
-                kubectl_script=unreachable,
-            )
-            self.assertEqual(proc.stdout, "", proc.stderr)
-            self.assertFalse(klog.exists(), "the PlatformAgent was read through a stale context")
-            self.assertFalse(hlog.exists())
-            loud = self._run(
-                f"{self._LOUD_PRINTS}{self._no_helm(hlog)}"
-                "TFVARS_CLUSTER_EXISTS=true announce_platform_agent_mode_for_apply kubeagents-system next\n",
-                kubectl_script=unreachable,
-            )
-            self.assertIn("WARN: The mode-switch check did not run: the PlatformAgent", loud.stdout, loud.stderr)
-
-    def test_a_read_that_fails_says_the_check_did_not_run(self):
-        # Told apart from no CR by kubectl's and helm's exit status: the apply
-        # goes on, so the run says the notice was not weighed.
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        log = pathlib.Path(tmp.name) / "helm-must-not-run.log"
-        failed_next = '{"platformAgent":{"mode":"next"}}'
-        for kubectl, helm_stub, what in (
-            (self._cr_kubectl("", exit_code=1, stderr=self._UNREACHABLE),
-             self._no_helm(log),
-             "the PlatformAgent in namespace 'kubeagents-system' could not be read (Unable to connect to the server"),
-            (self._cr_kubectl(self._cr_list()), self._helm(self._HEALTHY, {}, latest=None),
-             "the values of release 'kube-agents' in namespace 'kubeagents-system' could not be read (Error: Kubernetes cluster unreachable"),
-            (self._cr_kubectl(self._cr_list()),
-             self._helm('[{"revision": 1, "status": "deployed"}, {"revision": 2, "status": "failed"}]', {1: None}),
-             "the values of release 'kube-agents' in namespace 'kubeagents-system' could not be read (revision 1, the last one that served, did not answer)"),
-            # The history that names the served revision: without it the
-            # notice would model from the latest revision (a failed one that
-            # recorded next) and announce a switch to today that Helm, diffing
-            # the served revision, does not make.
-            (self._cr_kubectl(self._cr_list("next")), self._helm(None, {}, latest=failed_next),
-             "the values of release 'kube-agents' in namespace 'kubeagents-system' could not be read (the release history did not answer: Error: Kubernetes cluster unreachable)"),
-            (self._cr_kubectl(self._cr_list("next")), self._helm("not json", {}, latest=failed_next),
-             "the values of release 'kube-agents' in namespace 'kubeagents-system' could not be read (the release history did not answer: Traceback"),
-        ):
-            with self.subTest(what=what):
-                log.unlink(missing_ok=True)
-                proc = self._announce(kubectl, helm_stub, key="today")
-                self.assertIn(f"WARN: The mode-switch check did not run: {what}", proc.stdout, proc.stderr)
-                self.assertIn("renders spec.mode from PLATFORM_AGENT_MODE=today in install.env", proc.stdout)
-                # The by-hand check names the context the reads asked.
-                self.assertIn(
-                    "kubectl get platformagents -n kubeagents-system"
-                    " --context gke_test-project_us-central1_test-cluster -o jsonpath=",
-                    proc.stdout,
-                )
-                self.assertNotIn("This apply switches", proc.stdout)
-                self.assertFalse(log.exists(), log.read_text() if log.exists() else "")
-
-    def test_the_reads_ask_this_clusters_context(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            log = pathlib.Path(tmp) / "helm.log"
-            self._announce(
-                self._cr_kubectl(self._cr_list()),
-                f'HELM_LOG="{log}"\n'
-                + self._helm('[{"revision": 1, "status": "deployed"}, {"revision": 2, "status": "failed"}]', {1: "{}"}),
-            )
-            calls = log.read_text()
-        ctx = "--kube-context gke_test-project_us-central1_test-cluster"
-        self.assertIn(f"get values kube-agents -n kubeagents-system {ctx} -o json", calls)
-        self.assertIn(f"history kube-agents -n kubeagents-system {ctx} -o json", calls)
-        self.assertIn(f"get values kube-agents -n kubeagents-system {ctx} --revision 1 -o json", calls)
-
-    def test_the_notice_takes_the_scope_checks_reads(self):
-        # The scope check beside it has just read the CR and the release: the
-        # notice asks neither again, and a later notice (the menu's next
-        # apply) reads afresh.
-        with tempfile.TemporaryDirectory() as tmp:
-            klog = pathlib.Path(tmp) / "kubectl.log"
-            hlog = pathlib.Path(tmp) / "helm.log"
-            proc = self._run(
-                f'export KUBECTL_LOG="{klog}"; HELM_LOG="{hlog}"\n'
-                + self._LOUD_PRINTS
-                + 'print_error() { echo "ERR: $*"; }\n'
-                + self._helm(self._HEALTHY, {}, latest="{}")
-                + "refuse_apply_over_undeclared_scope kubeagents-system; echo \"scope rc=$?\"\n"
-                + 'echo "after scope: $(wc -l < "$KUBECTL_LOG") $(wc -l < "$HELM_LOG")"\n'
-                + "announce_platform_agent_mode_for_apply kubeagents-system next\n"
-                + 'echo "after notice: $(wc -l < "$KUBECTL_LOG") $(wc -l < "$HELM_LOG")"\n'
-                + "announce_platform_agent_mode_for_apply kubeagents-system next >/dev/null\n"
-                + 'echo "after second notice: $(wc -l < "$KUBECTL_LOG") $(wc -l < "$HELM_LOG")"\n',
-                kubectl_script=self._cr_kubectl(self._cr_list()),
-            )
-        out = proc.stdout
-        self.assertIn("scope rc=0", out, proc.stderr)
-        before = re.search(r"after scope: +(\d+) +(\d+)", out)
-        after = re.search(r"after notice: +(\d+) +(\d+)", out)
-        again = re.search(r"after second notice: +(\d+) +(\d+)", out)
-        self.assertIsNotNone(before, out)
-        self.assertEqual(before.groups(), after.groups(), out)
-        self.assertIn("WARN: This apply switches the install from spec.mode today to next", out)
-        self.assertGreater(int(again.group(1)), int(after.group(1)), out)
-
-    def test_the_notice_names_the_extra_helm_values_caveat(self):
-        for args in ("unset unset next", "unset next today"):
-            with self.subTest(args=args):
-                proc = self._run(f"{self._LOUD_PRINTS}announce_platform_agent_mode_switch {args}")
-                self.assertIn("This compares PLATFORM_AGENT_MODE in install.env with the cluster.", proc.stdout)
-                self.assertIn("extra_helm_values wins over the key", proc.stdout)
-        proc = self._run(f"{self._LOUD_PRINTS}note_platform_agent_mode_not_applied unset unset next harness")
-        self.assertIn("extra_helm_values wins over the key", proc.stdout)
-
-    def test_a_mode_switch_is_announced_from_what_the_cr_runs(self):
-        # record, live CR, key -> what the warning says.
-        for args, expect in (
-            # Installed today through the installer; the key now asks for next.
-            ("unset unset next", ("WARN: This apply switches the install from spec.mode today to next",
-                                  "renders the NATS bus and the A2A gateway", "chat moves from the agent to the A2A gateway: Google Chat, or Slack")),
-            # Installed next through the installer; the key now asks for today,
-            # which renders nothing and so removes the recorded field.
-            ("next next today", ("WARN: This apply switches the install from spec.mode next to today",
-                                 "retires the A2A stack", "set PLATFORM_AGENT_MODE=next in install.env")),
-            # A render that drops a recorded today removes the field from a CR
-            # patched to next since.
-            ("today next today", ("WARN: This apply switches the install from spec.mode next to today",)),
-        ):
-            with self.subTest(args=args):
-                proc = self._run(f"{self._LOUD_PRINTS}announce_platform_agent_mode_switch {args}")
-                for line in expect:
-                    self.assertIn(line, proc.stdout)
-                self.assertIn("https://gke-labs.github.io/kube-agents/install/upgrade/#switching-specmode", proc.stdout)
-
-    def test_an_ungated_switch_does_not_offer_run_again(self):
-        # upgrade.sh's full arm, the menu's apply and install.sh -y apply with
-        # no confirmation after the notice: "run again" is not a way out there.
-        for args in ("next next today", "unset unset next"):
-            with self.subTest(args=args):
-                gated = self._run(f"{self._LOUD_PRINTS}announce_platform_agent_mode_switch {args}")
-                self.assertIn("in install.env and run again.", gated.stdout)
-                ungated = self._run(
-                    f'{self._LOUD_PRINTS}announce_platform_agent_mode_switch {args} "$PLATFORM_AGENT_MODE_NOTICE_UNGATED"'
-                )
-                self.assertIn("WARN: This apply switches the install", ungated.stdout)
-                self.assertIn("This run applies it without asking first", ungated.stdout)
-                self.assertIn("stop it now (Ctrl-C)", ungated.stdout)
-                self.assertIn("./upgrade.sh --plan previews", ungated.stdout)
-                self.assertNotIn("run again", ungated.stdout)
-        # And through the front door's call, which passes its third argument on.
-        proc = self._announce(
-            self._cr_kubectl(self._cr_list()),
-            self._helm(self._HEALTHY, {}, latest="{}"),
-            call='announce_platform_agent_mode_for_apply kubeagents-system next "$PLATFORM_AGENT_MODE_NOTICE_UNGATED"',
-        )
-        self.assertIn("This run applies it without asking first", proc.stdout, proc.stderr)
-
-    def test_a_re_apply_and_an_unread_install_are_silent(self):
-        for args in ("unset unset today", "next next next", "unset next next", '"" unset next', 'unset "" next'):
-            with self.subTest(args=args):
-                proc = self._run(f"{self._LOUD_PRINTS}announce_platform_agent_mode_switch {args}")
-                self.assertEqual(proc.stdout, "")
-
-    def test_a_mode_set_by_hand_is_named_rather_than_announced_as_a_switch(self):
-        # The release renders the key already, so Helm sends no change and a
-        # mode set on the CR by hand stays: a CR patched to next under a
-        # record with no mode, and one patched back to today under a record
-        # of next (a rollback round trip's state).
-        for args, running, key in (("unset next today", "next", "today"), ("next today next", "today", "next"), ("next unset next", "today", "next")):
-            with self.subTest(args=args):
-                proc = self._run(f"{self._LOUD_PRINTS}announce_platform_agent_mode_switch {args}")
-                self.assertNotIn("This apply switches", proc.stdout)
-                self.assertIn(
-                    f"WARN: install.env sets PLATFORM_AGENT_MODE={key}, but the PlatformAgent carries spec.mode {running}, set outside this installer",
-                    proc.stdout,
-                )
-
-    def test_the_mode_after_the_apply_is_kept_for_the_chat_checklists(self):
-        # The chat checklists follow the mode the CR is left on: the key,
-        # unless the CR carries a mode set by hand that the apply leaves there.
-        # Every early return, a first install's included, leaves the key.
-        echo = '; echo "AFTER=$PLATFORM_AGENT_MODE_AFTER_APPLY"'
-        for listing, latest, key, after in (
-            (self._cr_list("next"), "{}", "today", "next"),
-            (self._cr_list(), '{"platformAgent":{"mode":"next"}}', "next", "today"),
-            (self._cr_list(), "{}", "next", "next"),
-            (self._cr_list("next"), '{"platformAgent":{"mode":"next"}}', "next", "next"),
-            (self._cr_list(), "norelease", "next", "next"),
-        ):
-            with self.subTest(listing=listing, latest=latest, key=key):
-                proc = self._announce(self._cr_kubectl(listing), self._helm(self._HEALTHY, {}, latest=latest),
-                                      call=f"announce_platform_agent_mode_for_apply kubeagents-system {key}{echo}")
-                self.assertIn(f"AFTER={after}\n", proc.stdout, proc.stderr)
-        first = self._run(f"{self._LOUD_PRINTS}PLATFORM_AGENT_MODE_AFTER_APPLY=stale; TFVARS_CLUSTER_EXISTS=false "
-                          f"announce_platform_agent_mode_for_apply kubeagents-system today{echo}", kubectl_script=None)
-        self.assertIn("AFTER=today\n", first.stdout, first.stderr)
-
-    def test_a_retag_says_what_a_full_upgrade_would_do(self):
-        proc = self._run(f"{self._LOUD_PRINTS}note_platform_agent_mode_not_applied unset unset next harness")
-        self.assertIn("WARN: install.env sets PLATFORM_AGENT_MODE=next, but this --upgrade-mode=harness run", proc.stdout)
-        self.assertIn("leaves it at spec.mode today", proc.stdout)
-        self.assertIn("A full upgrade applies the switch to next", proc.stdout)
-        # Quiet where a full upgrade would not move the CR either: the same
-        # mode, a hand-set mode the key cannot reach, or nothing read.
-        for args in ("next next next harness", "unset unset today operator", "unset next today harness", "next today next harness", '"" unset next operator', 'unset "" next operator'):
-            with self.subTest(args=args):
-                quiet = self._run(f"{self._LOUD_PRINTS}note_platform_agent_mode_not_applied {args}")
-                self.assertEqual(quiet.stdout, "")
-
-    def test_the_retag_note_reads_the_record_from_the_retag_values(self):
-        # The values the retag re-applies are the record a later full upgrade
-        # diffs against, so they are passed in and helm is not asked again.
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        log = pathlib.Path(tmp.name) / "helm-must-not-run.log"
-        no_helm = self._no_helm(log)
-        for kubectl, values, key, expect in (
-            (self._cr_kubectl(self._cr_list()), "{}", "next", "WARN: install.env sets PLATFORM_AGENT_MODE=next, but this --upgrade-mode=harness run"),
-            (self._cr_kubectl(self._cr_list("next")), '{"platformAgent":{"mode":"next"}}', "next", None),
-            # The record decides here: a recorded next that the key drops is a
-            # switch a full upgrade makes; with no recorded mode it would make none.
-            (self._cr_kubectl(self._cr_list("next")), '{"platformAgent":{"mode":"next"}}', "today", "A full upgrade applies the switch to today"),
-            (self._cr_kubectl(self._cr_list("next")), "{}", "today", None),
-            (self._cr_kubectl(self._cr_list(present=False)), "{}", "next", None),
-            (self._cr_kubectl("", exit_code=1, stderr=self._UNREACHABLE), "{}", "next",
-             "INFO: Whether a full upgrade would switch spec.mode was not checked: the PlatformAgent in namespace 'kubeagents-system' could not be read (Unable to connect"),
-        ):
-            with self.subTest(values=values, key=key, kubectl=kubectl):
-                log.unlink(missing_ok=True)
-                proc = self._announce(
-                    kubectl, no_helm,
-                    call=f"note_platform_agent_mode_for_retag kubeagents-system {key} harness '{values}'",
-                )
-                self.assertFalse(log.exists(), log.read_text() if log.exists() else "")
-                if expect is None:
-                    self.assertEqual(proc.stdout, "", proc.stderr)
-                else:
-                    self.assertIn(expect, proc.stdout, proc.stderr)
 
     def test_tfvars_gvisor_on_autopilot_asks_for_runtime_class_only(self):
         # enable_gvisor_node_pool fails the plan on Autopilot, which ships the
@@ -5759,11 +5356,10 @@ class ScopeExportSinkPreflightTest(unittest.TestCase):
                 self.assertNotIn("noglob-left-on", proc.stdout)
 
 
-class NextSlackGatewaySettingsRefusalTest(unittest.TestCase):
-    """refuse_next_slack_gateway_settings (#2812). Under spec.mode next with
-    Slack on and Google Chat off, the A2A gateway takes Slack
-    (a2aSlackArmed in k8s-operator), and three settings that the today path
-    accepts break it:
+class SlackGatewaySettingsRefusalTest(unittest.TestCase):
+    """refuse_slack_gateway_settings (#2812). With Slack on and Google Chat
+    off, the A2A gateway takes Slack (a2aSlackArmed in k8s-operator), and
+    three settings that the Hermes Slack platform accepts break it:
 
     - an email in SLACK_ALLOWED_USERS matches nobody, because the list is
       matched against member IDs exactly;
@@ -5772,21 +5368,21 @@ class NextSlackGatewaySettingsRefusalTest(unittest.TestCase):
     - a comma-separated SLACK_BOT_TOKEN list makes the Slack backend fail
       at connect.
 
-    With Chat on too, Chat holds the gateway and Slack stays on the today
-    path, so nothing is refused."""
+    With Chat on too, Chat holds the gateway and Slack stays on the Hermes
+    Slack platform, so nothing is refused."""
 
     _DOC = "https://gke-labs.github.io/kube-agents/install/slack-app/#allowed-users"
     _TOKEN = "xoxb-1-secretpart"
 
-    def _run(self, mode="next", slack="true", chat="false", allowlist="", home="", token="", flags=False, cwd=None):
-        args = " ".join(shlex.quote(a) for a in (mode, slack, chat, allowlist, home, token) + (("flags",) if flags else ()))
+    def _run(self, slack="true", chat="false", allowlist="", home="", token="", flags=False, cwd=None):
+        args = " ".join(shlex.quote(a) for a in (slack, chat, allowlist, home, token) + (("flags",) if flags else ()))
         script = (
             'print_info() { echo "INFO: $*"; }\n'
             'print_success() { :; }\n'
             'print_warning() { echo "WARN: $*"; }\n'
             'print_error() { echo "ERROR: $*"; }\n'
             f'source "{_INSTALLER_COMMON}"\n'
-            f'rc=0; refuse_next_slack_gateway_settings {args} || rc=$?; echo "rc=$rc"\n'
+            f'rc=0; refuse_slack_gateway_settings {args} || rc=$?; echo "rc=$rc"\n'
             'case "$-" in *f*) echo "noglob-left-on" ;; esac\n'
         )
         return subprocess.run(
@@ -5806,7 +5402,7 @@ class NextSlackGatewaySettingsRefusalTest(unittest.TestCase):
         self.assertIn("rc=1", proc.stdout, out)
         self.assertIn(
             "ERROR: SLACK_ALLOWED_USERS holds entries that look like emails: alice@example.com. "
-            "Under spec.mode next the A2A gateway matches this allowlist against Slack member IDs "
+            "The A2A gateway matches this allowlist against Slack member IDs "
             "exactly (such as U0123ABCD), so an email matches nobody and the person it names "
             "would be locked out after this apply.",
             out,
@@ -5814,7 +5410,7 @@ class NextSlackGatewaySettingsRefusalTest(unittest.TestCase):
         self.assertIn(
             "INFO: Find each person's member ID in Slack: open their profile, choose \u22ee (More), "
             "then Copy member ID. Replace the emails with those IDs in install.env and run again. "
-            f"Slack app setup for next: {self._DOC}",
+            f"Slack app setup for the A2A gateway: {self._DOC}",
             out,
         )
 
@@ -5881,7 +5477,7 @@ class NextSlackGatewaySettingsRefusalTest(unittest.TestCase):
                 self.assertIn("rc=1", proc.stdout, out)
                 self.assertIn(
                     f"ERROR: SLACK_HOME_CHANNEL is '{home}', which is not a Slack channel id (C... or G...). "
-                    "Under spec.mode next the A2A gateway does not arm its notify route with it, so the "
+                    "The A2A gateway does not arm its notify route with it, so the "
                     "agent's proactive posts and every board card's report back stop.",
                     out,
                 )
@@ -5905,29 +5501,28 @@ class NextSlackGatewaySettingsRefusalTest(unittest.TestCase):
                 out = proc.stdout + proc.stderr
                 self.assertIn("rc=1", proc.stdout, out)
                 self.assertIn(
-                    f"ERROR: SLACK_BOT_TOKEN holds {count} tokens, a list for several workspaces. Under "
-                    "spec.mode next the A2A gateway's Slack backend takes one workspace's bot token, "
+                    f"ERROR: SLACK_BOT_TOKEN holds {count} tokens, a list for several workspaces. The "
+                    "A2A gateway's Slack backend takes one workspace's bot token, "
                     "and Slack refuses a list, so that backend retries without end and nothing answers on Slack.",
                     out,
                 )
                 self.assertIn(
                     "INFO: Set SLACK_BOT_TOKEN to one workspace's bot token (xoxb-...) in install.env "
-                    "and run again, or keep this install on PLATFORM_AGENT_MODE=today.",
+                    "and run again.",
                     out,
                 )
                 self.assertNotIn("secretpart", out)
 
-    def test_a_list_of_bot_tokens_through_flags_names_the_mode_flag(self):
-        # A first install is next by default, so the way to keep the list is --mode=today.
+    def test_a_list_of_bot_tokens_through_flags_names_the_flag(self):
         proc = self._run(token="xoxb-1-secretpart,xoxb-2-secretpart", flags=True)
         out = proc.stdout + proc.stderr
         self.assertIn("rc=1", proc.stdout, out)
         self.assertIn(
             "INFO: Set SLACK_BOT_TOKEN to one workspace's bot token (xoxb-...) in install.env or "
-            "--slack-bot-token and run again, or keep this install on PLATFORM_AGENT_MODE=today "
-            "(--mode=today on a first install with no install.env).",
+            "--slack-bot-token and run again.",
             out,
         )
+        self.assertNotIn("PLATFORM_AGENT_MODE", out)
 
     def test_one_bot_token_or_none_passes(self):
         for token in (self._TOKEN, f" {self._TOKEN} ", ""):
@@ -5955,12 +5550,12 @@ class NextSlackGatewaySettingsRefusalTest(unittest.TestCase):
     def test_warn_mode_names_every_setting_and_refuses_nothing(self):
         # upgrade.sh --plan and install.sh --dry-run apply nothing, so they
         # warn the way the scope check does.
-        args = " ".join(shlex.quote(a) for a in ("next", "true", "false", "alice@example.com", "D0DM", "a,b", "", "warn"))
+        args = " ".join(shlex.quote(a) for a in ("true", "false", "alice@example.com", "D0DM", "a,b", "", "warn"))
         script = (
             'print_info() { echo "INFO: $*"; }\nprint_success() { :; }\n'
             'print_warning() { echo "WARN: $*"; }\nprint_error() { echo "ERROR: $*"; }\n'
             f'source "{_INSTALLER_COMMON}"\n'
-            f'rc=0; refuse_next_slack_gateway_settings {args} || rc=$?; echo "rc=$rc"\n'
+            f'rc=0; refuse_slack_gateway_settings {args} || rc=$?; echo "rc=$rc"\n'
         )
         proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=get_isolated_test_env(), cwd=str(_REPO_ROOT))
         self.assertIn("rc=0", proc.stdout, proc.stderr)
@@ -5975,12 +5570,10 @@ class NextSlackGatewaySettingsRefusalTest(unittest.TestCase):
     def test_nothing_is_refused_unless_slack_moves_to_the_gateway(self):
         bad = dict(allowlist="alice@example.com", home="D0DM", token="xoxb-a,xoxb-b")
         for gate in (
-            dict(mode="today"),
-            dict(mode=""),
             dict(slack="false"),
             dict(slack=""),
             dict(slack="no"),
-            # Chat holds the gateway; Slack stays on the today path.
+            # Chat holds the gateway; Slack stays on the Hermes Slack platform.
             dict(chat="true"),
             dict(chat="True"),
         ):
@@ -6056,28 +5649,28 @@ class GchatHomeChannelRuleMatchesTheGatewayTest(unittest.TestCase):
         self.assertEqual(proc.stdout.splitlines(), [f"[{v}]" for v in cases.values()])
 
 
-class NextHomeChannelUnsetWarningTest(unittest.TestCase):
-    """warn_next_home_channel_unset (#3320). Under spec.mode next the A2A
-    gateway makes the proactive posts and arms them only on a home channel,
+class GatewayHomeChannelUnsetWarningTest(unittest.TestCase):
+    """warn_gateway_home_channel_unset (#3320). The A2A gateway makes the
+    proactive posts and arms them only on a home channel,
     so a chat backend the gateway holds with none refuses and keeps every
     alert for a digest while conversations keep working. The front doors warn, never refuse, and the
     closing summary says it again. The backend follows the operator's
     a2aChatArmed / a2aSlackArmed: Chat holds the gateway when enabled."""
 
-    def _run(self, mode="next", slack="true", chat="false", slack_home="", chat_home="", flags=False, summary=False):
-        args = " ".join(shlex.quote(a) for a in (mode, slack, chat, slack_home, chat_home) + (("flags",) if flags else ()))
+    def _run(self, slack="true", chat="false", slack_home="", chat_home="", flags=False, summary=False):
+        args = " ".join(shlex.quote(a) for a in (slack, chat, slack_home, chat_home) + (("flags",) if flags else ()))
         script = (
             'print_info() { echo "INFO: $*"; }\n'
             'print_warning() { echo "WARN: $*"; }\n'
             'print_error() { echo "ERROR: $*"; }\n'
             f'source "{_INSTALLER_COMMON}"\n'
-            f'rc=0; warn_next_home_channel_unset {args} || rc=$?; echo "rc=$rc key=$NEXT_HOME_CHANNEL_UNSET_KEY"\n'
-            + (f'print_next_home_channel_unset_summary {"flags" if flags else ""}\n' if summary else "")
+            f'rc=0; warn_gateway_home_channel_unset {args} || rc=$?; echo "rc=$rc key=$GATEWAY_HOME_CHANNEL_UNSET_KEY"\n'
+            + (f'print_gateway_home_channel_unset_summary {"flags" if flags else ""}\n' if summary else "")
         )
         return subprocess.run(["bash", "-c", script], capture_output=True, text=True,
                               env=get_isolated_test_env(), cwd=str(_REPO_ROOT))
 
-    def test_next_slack_without_a_home_channel_warns_and_names_the_key(self):
+    def test_slack_without_a_home_channel_warns_and_names_the_key(self):
         proc = self._run()
         self.assertIn("rc=0 key=SLACK_HOME_CHANNEL", proc.stdout, proc.stderr)
         self.assertIn("WARN: SLACK_HOME_CHANNEL is empty", proc.stdout)
@@ -6086,13 +5679,13 @@ class NextHomeChannelUnsetWarningTest(unittest.TestCase):
         self.assertIn("INFO: Set SLACK_HOME_CHANNEL to a channel id", proc.stdout)
         self.assertIn("slack-app/#home-channel", proc.stdout)
 
-    def test_next_chat_without_a_home_channel_names_the_chat_key(self):
+    def test_chat_without_a_home_channel_names_the_chat_key(self):
         proc = self._run(slack="false", chat="true")
         self.assertIn("rc=0 key=GOOGLE_CHAT_HOME_CHANNEL", proc.stdout, proc.stderr)
         self.assertIn("INFO: Set GOOGLE_CHAT_HOME_CHANNEL to a space name", proc.stdout)
 
     def test_chat_holds_the_gateway_when_both_are_on(self):
-        # Slack stays on the today path then, so only Chat's home counts.
+        # Slack stays on the Hermes Slack platform then, so only Chat's home counts.
         self.assertIn("key=GOOGLE_CHAT_HOME_CHANNEL", self._run(chat="true", slack_home="C0123ABCD").stdout)
         self.assertEqual(self._run(chat="true", chat_home="spaces/AAA").stdout, "rc=0 key=\n")
 
@@ -6101,7 +5694,7 @@ class NextHomeChannelUnsetWarningTest(unittest.TestCase):
         self.assertIn("install.env or --google-chat-home-channel", self._run(slack="false", chat="true", flags=True).stdout)
 
     def test_silent_when_nothing_is_dropped(self):
-        for kw in ({"slack_home": "C0123ABCD"}, {"slack_home": "  ", "mode": "today"}, {"mode": "today"},
+        for kw in ({"slack_home": "C0123ABCD"},
                    {"slack": "false"}, {"slack": "false", "chat": "true", "chat_home": "spaces/AAA"}):
             with self.subTest(**kw):
                 self.assertEqual(self._run(**kw).stdout, "rc=0 key=\n")
@@ -6115,12 +5708,12 @@ class NextHomeChannelUnsetWarningTest(unittest.TestCase):
         # C locale [[:space:]] matches none of them, and glibc's UTF-8 locales
         # leave U+00A0 out, so the result must not depend on the locale.
         for locale in ("C", "en_US.UTF-8"):
-            for args, key in (('next false true "" "\u00a0"', "GOOGLE_CHAT_HOME_CHANNEL"),
-                              ('next true false "\u3000\u202f" ""', "SLACK_HOME_CHANNEL")):
+            for args, key in (('false true "" "\u00a0"', "GOOGLE_CHAT_HOME_CHANNEL"),
+                              ('true false "\u3000\u202f" ""', "SLACK_HOME_CHANNEL")):
                 with self.subTest(locale=locale, key=key):
                     proc = subprocess.run(
                         ["bash", "-c", f'source "{_INSTALLER_COMMON}"; export LC_ALL={locale}; '
-                         f'echo "key=$(next_home_channel_unset_key {args})"'],
+                         f'echo "key=$(gateway_home_channel_unset_key {args})"'],
                         capture_output=True, text=True, env=get_isolated_test_env(), cwd=str(_REPO_ROOT),
                     )
                     self.assertIn(f"key={key}", proc.stdout, proc.stderr)
@@ -6239,7 +5832,6 @@ enable_github_minter = true
 hermes_dashboard_enabled = false
 web_console_enabled      = true   # trailing comment
 memory_provider          = "kube_agents_memory"
-platform_agent_mode = "next"
 cluster_mode = "autopilot"
 namespace    = "agents-ns"
 """
@@ -6254,10 +5846,9 @@ _FOOTPRINT_EXPECTED_SETS = [
     "--set platformAgent.harness.hermes.dashboardEnabled=false",
     "--set webConsole.enabled=true",
     "--set githubMinter.enabled=true",
-    "--set platformAgent.mode=next",
 ]
 
-# The chart keys kube-agents.quotaRequirements (and the summary's own mode read) take
+# The chart keys kube-agents.quotaRequirements take
 # their figures from and the composition can set from a tfvar: a `var.` the composition
 # puts under one of these, or under a `resources` subtree of a summed workload, has to
 # be a line in FOOTPRINT_TFVARS_VALUE_MAP, or the installer's figure drifts from the
@@ -6268,7 +5859,7 @@ _FOOTPRINT_READ_KEYS = {
     "hindsight.enabled", "hindsight.postgresql.storage",
     "githubMinter.enabled", "githubMinter.replicaCount",
     "webConsole.enabled",
-    "platformAgent.enabled", "platformAgent.mode", "platformAgent.cleanupHook.enabled",
+    "platformAgent.enabled", "platformAgent.cleanupHook.enabled",
     "platformAgent.storage.size",
     "platformAgent.harness.memory.provider",
     "platformAgent.harness.hermes.dashboardEnabled",
@@ -6384,7 +5975,6 @@ _NOTES_SETS = [
     "--set", "platformAgent.integration.github.gitRepo=foo/bar",
     "--set", "platformAgent.integration.github.org=foo",
     "--set", "webConsole.enabled=true",
-    "--set", "platformAgent.mode=next",
 ]
 
 

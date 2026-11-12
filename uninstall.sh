@@ -943,9 +943,6 @@ main() {
   # The release's upgrade_install switch, likewise: the generator refuses a
   # misspelt value, and the destroy removes the release however it renders.
   export HELM_UPGRADE_INSTALL=""
-  # The mode, likewise: the generator refuses a value outside the CRD's enum,
-  # and the destroy removes the release whichever mode it renders.
-  export PLATFORM_AGENT_MODE=""
   # The Slack home channel policy, likewise: the generator refuses a value
   # outside the CRD's enum, and the destroy removes the release whatever it says.
   export SLACK_HOME_CHANNEL_POLICY=""

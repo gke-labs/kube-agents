@@ -23,8 +23,6 @@ their own copies:
 | `DEFAULT_CLUSTER_NAME`                                                    | GKE cluster name (`platform-agent-host`)                                               |
 | `DEFAULT_REGION`                                                          | GCP region (`us-central1`)                                                             |
 | `DEFAULT_CLUSTER_MODE`                                                    | Shape a fresh install creates (`autopilot`); a live cluster's probed shape always wins |
-| `DEFAULT_PLATFORM_AGENT_MODE`                                             | What an `install.env` with no mode, and a CR with none, resolve to (`today`)           |
-| `DEFAULT_FIRST_INSTALL_PLATFORM_AGENT_MODE`                               | A first install's `spec.mode` (`next`); `install.sh` alone applies it                  |
 | `DEFAULT_PLATFORM_AGENT_STORAGE_SIZE`                                     | The data volume size (`50Gi`), the operator's default; it renders no `spec.storage`    |
 | `DEFAULT_VERTEX_LOCATION`                                                 | Vertex AI serving location (`global`)                                                  |
 | `DEFAULT_VERTEX_MANAGE_SERVING_PROJECT`                                   | Enable the API and grant the gateway's role in the serving project (`true`)            |
@@ -54,7 +52,6 @@ their own copies:
 | `is_valid_permission_set <set>`                                           | Accepted GCP IAM permission sets: `read-only`, `custom`                                |
 | `require_supported_permission_set <set>`                                  | The same check, reporting why a rejected value is rejected                             |
 | `is_valid_cluster_mode <mode>`                                            | Accepted cluster shapes: `autopilot`, `standard`                                       |
-| `is_valid_platform_agent_mode <mode>`                                     | Accepted modes, the CRD's `spec.mode` enum: `today`, `next`                            |
 | `derive_kms_location <region>`                                            | Region for Cloud KMS (strips a zone suffix)                                            |
 | `derive_chat_sub_name [topic] [sub]`                                      | Derive Google Chat Pub/Sub subscription (`<topic>-sub`) when topic is custom           |
 | `tf_state_chat_subscription_name`                                         | The subscription name managed by module.chat_pubsub, or empty                          |
@@ -64,7 +61,8 @@ their own copies:
 | `check_service_account_ownership`                                         | Refuses an apply that would 409 on a service account another install owns              |
 | `minter_name_defaults <project> <cluster>`                                | The minter's names: its state's, else derived from the cluster                         |
 | `write_tfvars_from_state <dest> [tag]`                                    | The `terraform.tfvars` generator (reads the loaded `install.env` variable set)         |
-| `read_platform_agent_install_state [namespace]`                           | The CR and release reads shared by the scope check and the mode notice                 |
+| `read_platform_agent_install_state [namespace]`                           | The CR and release reads the scope check makes                                         |
+| `note_ignored_platform_agent_mode_key <file>`                             | Says once that a `PLATFORM_AGENT_MODE` the file still assigns is not read              |
 
 **The token minter's names.** A new install gets a key ring, key and GSA named after its cluster (`<cluster>-minter-keyring`, `<cluster>-minter-key`, `<cluster>-minter`, from `minter_derived_names`). An install whose state already holds a minter keeps those names, because a KMS key can't be deleted and renaming one plans a replacement. A name set in `install.env` (`KMS_KEYRING`, `KMS_KEY`, `GITHUB_MINTER_GSA_NAME`) always wins. `lifecycle.sh` refuses to adopt a minter key ring or key that another install's owner labels claim, unless `MINTER_SHARED_KEY` names it as `<keyring>/<key>`. A key with no owner labels is adopted as this install's own, and labelled, only when its names were given explicitly (`KMS_KEYRING` and `KMS_KEY`, from `install.env`, the environment or the flags); labels win over a name. The project-wide default names don't count when `install.env` records them, since a file from before per-install names records them whether or not the install ran a minter. A GitHub environment's rebuild passes them in the environment (`scripts/release/minter_environment_names.sh`), so it adopts the environment's own key.
 
@@ -122,7 +120,7 @@ reach `write_tfvars_from_state` and the `TF_VAR_*` handoff, both of which read t
 environment. Order of authority is **flag, then file, then an exported variable, then
 the defaults above** — `set -a` sourcing means a key the file carries overwrites an
 export of the same name, so a flag is what overrides a recorded value for one run. The chat
-flags and `--mode` are the exception: on an existing file they are held to it, as described below.
+flags are the exception: on an existing file they are held to it, as described below.
 One key ignores the environment in every front door: `install.sh`, `upgrade.sh`, and
 `uninstall.sh` clear a shell-exported `NAMESPACE` before reading the file, because kubectl
 tooling exports that name and the value now reaches the Helm release's namespace. The file
@@ -154,7 +152,7 @@ standing in, not whichever one that shared checkout belongs to. The one addition
 commits (the apply, or the `--generate-only` handoff; never a declined run or `--dry-run`):
 
 - it creates one at the end of a first install, when there is nothing there;
-- it appends a chat key or `PLATFORM_AGENT_MODE` the file lacks, under the rule below;
+- it appends a chat key the file lacks, under the rule below;
 - it records the GitOps keys described under [The GitOps forge](#the-gitops-forge): the forge
   keys when the run applies a different forge (apply only), and `GITOPS_ORG`, `GITOPS_REPO` and
   `GITHUB_APP_ID` when one is missing or this run applies a different value (that line only).
@@ -171,8 +169,6 @@ one-run override would be undone by the next full upgrade without a word. They a
 `--slack-home-channel-name`, `--slack-home-channel-policy`, `--google-chat-allowed-users`,
 `--google-chat-home-channel`,
 `--google-chat-mode`, `--chat-topic-name`, `--slack-bot-token` and `--slack-app-token`.
-`--mode` follows the same rule, for the same reason, with `PLATFORM_AGENT_MODE` (below); it
-is not a chat key and brings no other settings with it.
 Against an existing `install.env`, a flag that disagrees with the key the file assigns is
 refused before anything is applied, naming the file and the key: edit the key (or, for
 `GOOGLE_CHAT_ENABLED` and the Google Chat allowlist and home channel, use the Day-2 menu) and
@@ -262,8 +258,7 @@ folder, organisation or selector member it named and retires those projects' Clu
 reconcile's next two clean runs; `SCOPE_MAX_PROJECTS` absent writes no cap, so the default of 100
 returns and the projects past it read `over-cap` (or the plan is refused, while a selector is declared);
 `SCOPED_SA_POOL_ENABLED` absent disarms the scoped service account pool, deleting its accounts
-and putting the broker back on the agent's own identity; `PLATFORM_AGENT_MODE` absent resolves
-to `today`, which switches a `next` install back and retires its A2A stack.
+and putting the broker back on the agent's own identity.
 The file `install.sh` writes at the end of a first install carries every one of these, so
 the hazard is a hand edit that deletes a line rather than setting it to `false`. Run
 `./upgrade.sh --plan` before a full upgrade and read any `destroy` line as missing
@@ -608,58 +603,16 @@ switch, or a cap that is not a whole number of at least 1, stops every front doo
 `uninstall.sh`, which exports the switch off and the cap empty before it regenerates, so a typo
 cannot refuse a teardown.
 
-`PLATFORM_AGENT_MODE` is the `PlatformAgent`'s `spec.mode`, `today` or `next`
-([`docs/designs/spec-mode-switch.md`](../../docs/designs/spec-mode-switch.md) says what each
-renders). An `install.sh` run that chooses no mode (no `--mode`, no `PLATFORM_AGENT_MODE` in
-`install.env`, whose line `install.env.example` leaves commented out, and on a first install none
-exported) settles it from the target cluster. A cluster already running a `PlatformAgent` keeps
-its `spec.mode` (absent is `today`); one whose `PlatformAgent` was deleted while the
-`kube-agents` release is still installed keeps the mode the release records. Only a cluster with
-neither, or none yet, is a first install, which gets `next`
-(`DEFAULT_FIRST_INSTALL_PLATFORM_AGENT_MODE`), or `today` when it mirrors its third-party images
-with `--third-party-registry-prefix`, because nothing points `next`'s NATS images at the mirror;
-`--mode=next` overrides that. The read uses a kubeconfig of its own, so `--dry-run` and
-`--generate-only` leave the current context alone. Only gcloud's NOT_FOUND is no cluster: one
-that cannot be described or read is never taken for a first install, and over an `install.env`
-with no key the run renders `today`; with no `install.env`, `--dry-run` and `--generate-only`
-render `today` with a warning and an applying run is refused until `--mode` names one. `install.sh` then records the mode it settled on in an
-`install.env` that assigns none, unless it was that unread guess. The Day-2 menu's Save & Apply
-settles and saves a missing key the same way. `upgrade.sh` and the generator read a file with no
-key, or an empty one, as `today` (`DEFAULT_PLATFORM_AGENT_MODE`, the name released scripts read as
-an existing install's mode), and a full `upgrade.sh` over a file with no key is refused unless
-its reads show no install on `next` (a read that failed shows nothing), rather than apply a
-switch nobody chose. The generator writes `platform_agent_mode` on every run, and the
-composition passes the chart nothing for `today`, so the CR carries no mode field. `install.sh`
-takes `--mode` and records it, or the settled mode, on a first install. Over an existing
-`install.env` it is held to the file by the chat flags' rule above: a `--mode` that disagrees
-with what the file resolves to (an empty key is `today`) is refused rather than applied for one
-run, because the next run, and every `upgrade.sh`, which takes no `--mode`, would switch the
-install back; one the file does not assign at all is appended at the same points as a chat key
-(a refused, `--dry-run` or failed-before-apply run leaves the file as it was, and `n` at the
-step-11 confirmation prints the `PLATFORM_AGENT_MODE=` line instead of writing it). From then on the file is the only way in: `bootstrap_install_env` and `load_install_env` drop a value inherited from the
-shell. A switch is an edit to the key. Before an apply the front doors
-read the mode the live CR runs and the one the release's last served revision carries, and say
-when the apply moves the CR (`announce_platform_agent_mode_switch`), from the reads the scope
-check beside it made (`read_platform_agent_install_state`). No cluster (the generator found
-none, so a kubeconfig context an earlier install of that name left is not read), no CR or no
-release is a first install and is quiet; a read that fails, or a kubeconfig with no context for
-a cluster that exists, says the check did not run. Where no confirmation follows the notice
-(`upgrade.sh`'s full arm, the menu's apply, `install.sh -y`) it says the run applies the switch
-without asking, rather than offering "run again". The notice models the
-render from the key alone, so a `platformAgent.mode` in the composition's `extra_helm_values`,
-which wins, is not seen, and every notice says so. Helm patches the CR from
-the difference between that revision's render and the new one, and `today` renders no field,
-so the key removes a recorded mode, and sends no change at all when the record already renders
-it; a mode set on the CR by hand then stays, and the front doors name it rather than announce a
-switch. Only full mode applies the key; the `harness` and `operator` retags reuse the recorded
-values and say when a full upgrade would move the mode. They keep the mode only onto a chart
-whose schema declares `platformAgent.mode`: onto an older one, this `upgrade.sh` refuses a
-recorded `next` rather than drop it (`--drop-undeclared-values` included), since the chart would
-render no mode and Helm would take `spec.mode` off the CR. A full upgrade onto such a chart
-refuses `PLATFORM_AGENT_MODE=next` in `install.env` for the same reason. An older release's own `upgrade.sh`,
-the release rollback runbook's route, has no such refusal and drops it with its generic
-"Dropping" line, so roll a `next` install back only after switching it to `today` on purpose. A value outside the enum stops every front door but `uninstall.sh`, which exports it empty
-before it regenerates.
+`PLATFORM_AGENT_MODE` is read and ignored. It once chose the `PlatformAgent`'s `spec.mode`,
+which picked between two component stacks; every install now runs the A2A stack (the NATS bus
+and the A2A gateway in front of the agent), the generator writes no `platform_agent_mode`, and
+the composition passes the chart no `platformAgent.mode`. An `install.env` that still assigns
+the key, with any value or none, is loaded as before: `bootstrap_install_env` and
+`load_install_env` unset the variable, and the run says once that the key is not read and may
+be removed (`note_ignored_platform_agent_mode_key`). No front door refuses the file over it,
+and `install.sh` takes no `--mode`. A release whose recorded values still carry
+`platformAgent.mode` re-tags onto the chart as before: the chart keeps the key declared, and
+ignored, in its schema for that reason.
 
 `PLATFORM_AGENT_STORAGE_SIZE` is the `PlatformAgent`'s `spec.storage.size`, the size of the
 agent's data claim and of the shell sandbox's. Empty takes `DEFAULT_PLATFORM_AGENT_STORAGE_SIZE`,
@@ -672,9 +625,10 @@ leaving the claims larger than the CR says. A value that is not a whole number o
 `Ti` above zero and at most `64Ti` stops every front door but `uninstall.sh`, which exports it empty before it
 regenerates.
 
-When `next` hands Slack to the A2A gateway (Slack on, Google Chat off: the operator's
-`a2aSlackArmed`), `install.sh`, the menu's apply and a full upgrade refuse, before their apply,
-three settings the gateway cannot use (`refuse_next_slack_gateway_settings`):
+When the A2A gateway holds Slack (Slack on, Google Chat off: the operator's `a2aSlackArmed`;
+beside Google Chat, Slack stays on the Hermes Slack platform), `install.sh`, the menu's apply
+and a full upgrade refuse, before their apply, three settings the gateway cannot use
+(`refuse_slack_gateway_settings`):
 
 - a `SLACK_ALLOWED_USERS` entry with an `@`, split as the tfvars render the list. The gateway
   matches member IDs exactly.

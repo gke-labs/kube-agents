@@ -57,8 +57,8 @@ metadata:
   {{- end }}
   {{- /*
     The chart's pods in this namespace, with the surge pods each one's
-    rollout can add (kube-agents.chartQuotaPods), which share the next-mode
-    namespace pod quota with the session pods; the operator sizes that quota's
+    rollout can add (kube-agents.chartQuotaPods), which share the namespace
+    pod quota with the session pods; the operator sizes that quota's
     headroom from it (#3848). Stamped on the CR rather than the operator, because
     the CR is in the namespace those pods run in and the chart renders it even
     when an operator installed elsewhere reconciles it. Chart-derived like the
@@ -69,11 +69,8 @@ metadata:
   {{- /* The operator discards a count past its cap (a2aMaxChartPods) for its
          default (a2aDefaultChartPods), which would size the session quota
          below what the namespace runs; refuse to stamp one rather than let it
-         be dropped. The quota renders only in next mode, so only a next-mode
-         render is refused; as for the quota preflight, the mode is read from
-         the values, and the operator's A2AQuotaChartPodsDiscarded Warning
-         covers a mode set on the PlatformAgent by hand. */}}
-  {{- if and (eq (toString .Values.platformAgent.mode) "next") (gt (int $chartPods) 64) }}
+         be dropped. */}}
+  {{- if gt (int $chartPods) 64 }}
   {{- fail (printf "the chart would run %s pods at once in this namespace, counting each workload's rollout surge pods, past the operator's cap of 64 for the session quota's chart count (a2aMaxChartPods); the quota would fall back to the default of 5 and refuse pods the release needs. Lower the replica counts or a workload's rollingUpdate.maxSurge, or run some of these components in another namespace." $chartPods) }}
   {{- end }}
   {{- with get $annotations $chartPodsKey }}
@@ -88,18 +85,7 @@ metadata:
   {{- end }}
 spec:
   {{- /*
-    `with`, so the null default renders no field at all: the operator reads an
-    absent mode as "today", and leaving it out keeps the CR of an install that
-    never set the value what it was before the chart knew the key. Helm patches a
-    custom resource from the difference between its renders, so a mode set on the
-    CR by hand survives an upgrade that leaves this null, and a value set here
-    and later cleared removes the field again, which is "today".
-  */}}
-  {{- with .Values.platformAgent.mode }}
-  mode: {{ . | quote }}
-  {{- end }}
-  {{- /*
-    `with`, as for mode: the null default renders no field, and the operator
+    `with`, so the null default renders no field, and the operator
     sizes both data claims from its own default. The schema checks the
     quantity's grammar only, so the range fails here, as the webhook (off by
     default) would refuse it. Zero passes the grammar, and the operator would
