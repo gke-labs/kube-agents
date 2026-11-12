@@ -2309,7 +2309,7 @@ class DeliveryWithoutThreadTest(unittest.TestCase):
 
     def test_at_the_cap_an_issue_a_failed_create_opened_is_found_and_recorded(self):
         """The fifth create opened the issue and then failed: no record, no home line, and day seven
-        would retire a filed report. The cap still gets one lookup per retry wait."""
+        would retire a filed report. The cap still gets one lookup, after the last retry wait."""
         self._at_the_cap(bootstrap_delivery.CONVERSATION_RETRY_WAITS_SECONDS[-1] + 5)
         sweep = bootstrap_delivery.oobe.scan_filed(self.d)[0]
         mine = {"number": 11, "body": bootstrap_delivery.REPORT_ISSUE_SWEEP_MARKER.format(sweep=sweep),
@@ -2331,6 +2331,48 @@ class DeliveryWithoutThreadTest(unittest.TestCase):
         record = bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE)
         self.assertEqual(bootstrap_delivery._attempt_count(record), bootstrap_delivery.CONVERSATION_MAX_ATTEMPTS)
         self.assertIn("no more tries", record.get(bootstrap_delivery.ATTEMPTS_REASON, ""))
+
+    def test_at_the_cap_a_missed_lookup_is_not_repeated_each_tick(self):
+        """A miss records nothing counted, so nothing moved the wait: the listing ran every tick."""
+        self._at_the_cap(bootstrap_delivery.CONVERSATION_RETRY_WAITS_SECONDS[-1] + 5)
+        self.assertEqual(self._main(), 0)
+        self.assertEqual(self._main(), 0)
+        self.assertEqual([c[0] for c in self.forge_calls], ["issue-list", "issue-list"], "one lookup, two ticks")
+        record = bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE)
+        self.assertTrue(record.get(bootstrap_delivery.REPORT_CAP_LOOKUP_DONE))
+        self.assertEqual(record.get(bootstrap_delivery.ATTEMPTS_REASON), bootstrap_delivery.REPORT_NO_ISSUE_AT_CAP_REASON.format(repo="example-org/gitops"))
+        self.assertEqual(bootstrap_delivery._attempt_count(record), bootstrap_delivery.CONVERSATION_MAX_ATTEMPTS)
+
+    def test_the_retire_drops_the_lookup_flag(self):
+        self._at_the_cap(8 * self.DAY)
+        self._filed(8 * self.DAY)
+        path = self.d / bootstrap_delivery.REPORT_ATTEMPTS_FILE
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record[bootstrap_delivery.REPORT_CAP_LOOKUP_DONE] = True
+        path.write_text(json.dumps(record), encoding="utf-8")
+        self.assertEqual(self._main(), 0)
+        self.assertTrue((self.d / bootstrap_delivery.REPORT_RETIRED_FILE).exists())
+        record = bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE)
+        self.assertNotIn(bootstrap_delivery.REPORT_CAP_LOOKUP_DONE, record)
+        self.assertEqual(bootstrap_delivery._attempt_count(record), bootstrap_delivery.CONVERSATION_MAX_ATTEMPTS)
+
+    def test_at_the_cap_a_refused_lookup_waits_out_the_last_retry_wait_again(self):
+        """A listing the repository refuses (a lost token scope, a server error) is not a miss: no
+        done flag, but the refusal moves the wait, so the next lookup is six hours on, not next tick."""
+        self._at_the_cap(bootstrap_delivery.CONVERSATION_RETRY_WAITS_SECONDS[-1] + 5)
+        self.forge_refusals["issue-list"] = "FORGE_FORBIDDEN"
+        self.assertEqual(self._main(), 0)
+        self.assertEqual(self._main(), 0)
+        self.assertEqual([c[0] for c in self.forge_calls], ["issue-list"], "one refused lookup, two ticks")
+        record = bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE)
+        self.assertNotIn(bootstrap_delivery.REPORT_CAP_LOOKUP_DONE, record, "a refusal does not end the lookups")
+        self.assertIn("issue-list on", record.get(bootstrap_delivery.ATTEMPTS_REASON, ""))
+        self.assertAlmostEqual(record[bootstrap_delivery.ATTEMPTS_AT], time.time(), delta=30)
+        self.assertEqual(bootstrap_delivery._attempt_count(record), bootstrap_delivery.CONVERSATION_MAX_ATTEMPTS, "not counted")
+        record[bootstrap_delivery.ATTEMPTS_AT] = time.time() - bootstrap_delivery.CONVERSATION_RETRY_WAITS_SECONDS[-1] - 5
+        (self.d / bootstrap_delivery.REPORT_ATTEMPTS_FILE).write_text(json.dumps(record), encoding="utf-8")
+        self.assertEqual(self._main(), 0)
+        self.assertEqual([c[0] for c in self.forge_calls], ["issue-list", "issue-list"], "asked again after the wait")
 
     def test_at_the_cap_the_lookup_waits_out_the_last_retry_wait(self):
         self._at_the_cap(60)
