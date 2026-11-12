@@ -1933,9 +1933,16 @@ func scrubMarkdownTables(s string, sink secretSink) string {
 					cols[c] = class
 				}
 			}
-			if h := block[0].cells; kubectlSecretListingHeader(s, h) {
+			if h := block[0].cells; kubectlSecretListingHeader(s, h) && kubectlSecretListingRows(s, func() (cells [][][2]int) {
+				for _, r := range block[2:] {
+					cells = append(cells, r.cells)
+				}
+				return cells
+			}()) {
 				// `kubectl get secrets` as a table lists Secrets, never their
-				// values: its DATA is a key count.
+				// values: its DATA is a key count. Only when every row reads
+				// as kubectl's own, so the header alone can't carry a value
+				// past the scrub.
 				block = block[:0]
 				return
 			}
@@ -2121,6 +2128,27 @@ func kubectlSecretListingHeader(s string, h [][2]int) bool {
 	}
 	return true
 }
+
+// kubectlSecretListingRows says whether every row reads as kubectl's
+// listing of Secrets: a name, a Secret type (one token, no spaces), a whole
+// number of keys, and an age (5d, 3h12m, <unknown>).
+func kubectlSecretListingRows(s string, rows [][][2]int) bool {
+	for _, r := range rows {
+		if len(r) != 4 {
+			return false
+		}
+		cell := func(i int) string { n, _ := normalizeMarkdown(s[r[i][0]:r[i][1]]); return strings.TrimSpace(n) }
+		if !kubectlSecretTypePattern.MatchString(cell(1)) || !isAllDigits(cell(2)) || cell(2) == "" || !kubectlAgePattern.MatchString(cell(3)) {
+			return false
+		}
+	}
+	return true
+}
+
+var (
+	kubectlSecretTypePattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9._/-]*$`)
+	kubectlAgePattern        = regexp.MustCompile(`^(?:(?:\d+[smhdy])+|<unknown>|<invalid>)$`)
+)
 
 // tableHeaderIsValue says whether a header names a column of values
 // (tableValueHeaderWords).

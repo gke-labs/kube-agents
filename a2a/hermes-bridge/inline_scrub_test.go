@@ -682,6 +682,13 @@ func TestAKubectlSecretListingKeepsItsTypeColumn(t *testing.T) {
 	if got := scrubInlineSecrets(listing); got != listing {
 		t.Errorf("the listing changed:\n%s", got)
 	}
+	// The header alone doesn't carry a value past the scrub: a row that
+	// isn't kubectl's (a value where the key count goes) is scrubbed as
+	// before.
+	disguised := "| NAME | TYPE | DATA | AGE |\n|---|---|---|---|\n| db-password | Synth3tic-Pass-0042 | Synth3tic-Pass-0043 | 5d |\n"
+	if got := scrubInlineSecrets(disguised); strings.Contains(got, "Synth3tic-Pass-0043") {
+		t.Errorf("a value under a kubectl-shaped header leaked: %q", got)
+	}
 	kv := "| Key | Value |\n|---|---|\n| db-password | Synth3tic-Pass-0042 |\n"
 	if got := scrubInlineSecrets(kv); strings.Contains(got, "Synth3tic-Pass-0042") {
 		t.Errorf("a key/value table leaked: %q", got)
