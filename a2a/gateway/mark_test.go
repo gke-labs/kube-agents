@@ -415,8 +415,9 @@ func TestMarkArrivalDrawsTheAsksKindAtOnce(t *testing.T) {
 	}
 }
 
-// A continued chain keeps the mark it carried, a child or a wake draws
-// nothing, and a task with no ask message draws nothing.
+// A continued chain keeps the mark it carried, and a task with no ask
+// message draws nothing. (A child or a wake never calls it: startTaskWith
+// draws only for a task with no role.)
 func TestMarkArrivalLeavesAnythingButAFreshAsk(t *testing.T) {
 	g, obs := markRig()
 	held := &MarkState{Ask: "question", Settle: markSettleBlocked}
@@ -425,11 +426,11 @@ func TestMarkArrivalLeavesAnythingButAFreshAsk(t *testing.T) {
 	}}
 	rec2 := chainRecord()
 	rec3 := &SessionRecord{Key: "slack:C1/40.0", Tasks: []TaskRef{{ID: "n", RootTaskID: "n"}}}
-	if g.drawArrivalMark(rec, "a", "why is checkout slow?") || g.drawArrivalMark(rec2, "c", "x") ||
-		g.drawArrivalMark(rec2, "w", "x") || g.drawArrivalMark(rec3, "n", "why?") {
+	if g.drawArrivalMark(rec, "a", "why is checkout slow?") || g.drawArrivalMark(rec2, "h", "x") ||
+		g.drawArrivalMark(rec3, "n", "why?") {
 		t.Fatal("drew on something that is not a fresh ask")
 	}
 	if got := obs.reactionCalls(); len(got) != 0 {
-		t.Errorf("reactions = %v, want none", got)
+		t.Errorf("reactions = %v, want none (a held mark, a minting turn, no ask message)", got)
 	}
 }
