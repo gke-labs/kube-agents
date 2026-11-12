@@ -32,6 +32,8 @@ Each size is its own state, in the project's `<project>-tf-state` bucket under t
 
 ## One-time setup in a project
 
+`hack/sized_fleet_testbed.sh --project-id=<project>` does all of this section, idempotently, and labels the host cluster `purpose=harness-scale` once kube-agents is installed on it. The steps by hand:
+
 The nodes run as a service account created once, outside the stack, so the identity that applies the stack needs no right to create service accounts. Its roles are the node-agent minimum, as the seeded fleet's nodes have:
 
 ```bash
