@@ -299,7 +299,7 @@ def test_the_path_spells_out_the_version_key(gcloud, monkeypatch):
 
 
 def test_a_next_key_files_under_its_own_directory(gcloud):
-    """The mode suffixes the last segment for next only, so every today
+    """The mode suffixes the last segment for next only, so every legacy today
     directory is the one it always was and a next window is its own prefix."""
     backend = GcsBackend("gs://b/e")
     today = backend.append("case-a", line("case-a", key=KEY))
@@ -309,7 +309,7 @@ def test_a_next_key_files_under_its_own_directory(gcloud):
     assert backend.append("case-a", line("case-a", at="2026-08-02T00:00:00Z", key={**KEY, "mode": "today"})).rsplit("/", 1)[0] == today.rsplit("/", 1)[0]
 
 
-def test_the_default_mode_is_the_baselines_today():
+def test_the_legacy_mode_is_the_baselines_today():
     from kube_agents_bench import baselines, evidence_store
 
     assert evidence_store.DEFAULT_KEY_MODE == baselines.MODE_TODAY

@@ -981,7 +981,7 @@ def _inject_record(trajectory: list[Any]) -> bool:
     )
 
 
-#: The public name ``gate`` reads the version key's mode with.
+#: The public name of the inject-record check, for callers outside this module.
 is_inject_record = _inject_record
 
 
@@ -2133,7 +2133,7 @@ def grade_case(
                 False,
                 f"expected_fail: true, and it passed all {len(scored)} repetitions "
                 f"on the checks this transport can see, with {', '.join(set_aside)} "
-                f"{NOT_APPLICABLE_PHRASE}; the marker stays until the api lane "
+                f"{NOT_APPLICABLE_PHRASE}; the marker stays until a run "
                 "passes it whole",
             )
         return verdict(
@@ -2251,8 +2251,7 @@ class SuiteVerdict:
     #: The case ids the inject lane could not grade (rung
     #: NOT_GRADED_ON_TRANSPORT): evaluated, so never in ``not_evaluated``,
     #: and outside the aggregate's denominator. Its own key so the
-    #: dashboard's next-mode view can read them apart (#2008). Empty on the
-    #: api transport.
+    #: dashboard can read them apart (#2008).
     not_graded: list[str] = field(default_factory=list)
     #: ``{case id: [fixture-drift:<role>, ...]}`` for the cases not run
     #: because the lease-time scan saw a fixture they need drifted. Outside

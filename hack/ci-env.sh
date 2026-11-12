@@ -129,7 +129,7 @@ readonly LITELLM_LOG_CONTAINER="litellm-container"
 # ─── Agent pod diagnostics ───────────────────────────────────────────────────
 # collect_agent_pod_diagnostics keeps, on every eval run, what says why a pod
 # in the install was replaced or a container restarted mid-run: the Hermes
-# bridge sidecar's log (the executor under EVAL_MODE_NEXT=1), the previous
+# bridge sidecar's log (the executor), the previous
 # instance of the agent and bridge containers, each pod's restart counts and
 # last termination, and the namespace's events. The gateway log alone cannot:
 # a replaced pod starts a fresh log, so a green run whose repetitions ended
@@ -148,7 +148,7 @@ readonly AGENT_DIAG_LOG_MAX_BYTES=$((8 * 1024 * 1024))
 # Events are one line each; the namespace's whole retained window fits.
 readonly AGENT_DIAG_EVENTS_TAIL_LINES=5000
 # The agent's own container, and the bridge sidecar the operator renders
-# beside it under EVAL_MODE_NEXT=1 (hack/ci-deploy.sh's BRIDGE_SIDECAR_NAME).
+# beside it (hack/ci-deploy.sh's BRIDGE_SIDECAR_NAME).
 # Named apart from that constant because ci-deploy.sh sources this file and
 # both are readonly.
 readonly AGENT_DIAG_AGENT_CONTAINER="platform-agent"
@@ -409,9 +409,9 @@ last_bytes() {
 # cannot be reached costs the run its gateway log and nothing else. The
 # failure dumper below calls this rather than taking its own, shorter tail, so
 # the failure path never overwrites the every-run capture with less.
-# Once per process, like collect_agent_pod_diagnostics: ci-eval-pr.sh takes it
-# before a next-mode run's rollback round trip replaces the pod, and the EXIT
-# trap's call after that must not overwrite the eval's log with the new pod's.
+# Once per process, like collect_agent_pod_diagnostics: a later call in the
+# same process (the failure dumper's through the EXIT trap) must not
+# overwrite the eval's log with a replacement pod's.
 # Read with a default, so the function alone, without this assignment, still
 # runs under `set -u` (the test suites lift it that way).
 GATEWAY_LOG_COLLECTED=""
@@ -997,7 +997,7 @@ start_replay_shadow_collector() {
     args+=(--mode "${mode}" --keep-dir "${REPLAY_KEEP_DIR}" --cache-subdir "${REPLAY_CACHE_SUBDIR}"
       --publish-bucket "${REPLAY_CACHE_BUCKET}" --verdicts-dir "${artifact_dir}"
       --publish-interval "${REPLAY_RECORD_PUBLISH_INTERVAL_SECONDS}"
-      --job-name "${JOB_NAME:-}" --eval-mode-next "${EVAL_MODE_NEXT:-}" --forge "${EVAL_FORGE:-}")
+      --job-name "${JOB_NAME:-}" --forge "${EVAL_FORGE:-}")
     ;;
   "${REPLAY_MODE_REPLAY}")
     args+=(--mode "${mode}" --keep-dir "${REPLAY_KEEP_DIR}" --cache-subdir "${REPLAY_CACHE_SUBDIR}"
@@ -1049,7 +1049,7 @@ prepare_replay_lane_cache() {
   mkdir -p "${REPLAY_KEEP_DIR}" "${REPLAY_LANE_SEED_DIR}" || return 1
   if ! python3 "${REPLAY_CACHE_FETCH_SCRIPT}" --bucket "${REPLAY_CACHE_BUCKET}" --dest "${REPLAY_LANE_SEED_DIR}" \
     --runs-out "${REPLAY_LANE_NIGHTLY_RUNS}" --max-age-hours "${REPLAY_LANE_CACHE_MAX_AGE_HOURS}" \
-    --max-bytes "${REPLAY_LANE_CACHE_MAX_BYTES}" --eval-mode-next "${EVAL_MODE_NEXT:-}" --forge "${EVAL_FORGE:-}" \
+    --max-bytes "${REPLAY_LANE_CACHE_MAX_BYTES}" --forge "${EVAL_FORGE:-}" \
     < /dev/null; then
     echo "ERROR: the replay lane found nothing to replay in gs://${REPLAY_CACHE_BUCKET} from the last ${REPLAY_LANE_CACHE_MAX_AGE_HOURS}h of nightlies at this checkout's normalizer version, refused what it found, or could not list it (the summary line above says which, by its error class)." >&2
     return 1
@@ -1188,16 +1188,12 @@ _stop_agent_pod_watch() {
 # pinned to AGENT_CLUSTER_CONTEXT for the same reason. A `--previous` read of
 # a container that never restarted writes kubectl's "not found" into its file,
 # which is the answer, not an error. The bridge files are written only when
-# the Deployment declares the sidecar, so a today-mode run gains no empty ones.
+# the Deployment declares the sidecar, so a pod without one gains no empty files.
 # Runs once per process: the eval's trap takes it and the failure dumper's
 # second call returns at once, rather than repeating every read against a
-# cluster that may be what failed, inside the deadline's grace.
-#
-# `--keep-watch` snapshots and leaves the watch running, for a caller that
-# replaces pods after it (ci-eval-pr.sh's rollback round trip). That caller
-# then clears AGENT_DIAG_COLLECTED and sets AGENT_DIAG_PREFIX, so the trap's
-# call stops the watch, whose tails then cover the replacement too, and
-# writes a second snapshot under the prefix beside the first.
+# cluster that may be what failed, inside the deadline's grace. A caller
+# that clears AGENT_DIAG_COLLECTED and sets AGENT_DIAG_PREFIX gets a second
+# snapshot under the prefix beside the first.
 AGENT_DIAG_COLLECTED=""
 AGENT_DIAG_PREFIX=""
 collect_agent_pod_diagnostics() {
@@ -1211,9 +1207,7 @@ collect_agent_pod_diagnostics() {
     kctl+=(--context "${AGENT_CLUSTER_CONTEXT}")
   fi
   mkdir -p "${artifact_dir}" || true
-  if [ "${1:-}" != "--keep-watch" ]; then
-    _stop_agent_pod_watch "${artifact_dir}"
-  fi
+  _stop_agent_pod_watch "${artifact_dir}"
 
   "${kctl[@]}" get pods -n "${ns}" -o jsonpath="${AGENT_DIAG_POD_STATUS_JSONPATH}" \
     > "${artifact_dir}/${prefix}agent-pod-status.txt" 2>&1 || true
@@ -1250,8 +1244,8 @@ collect_agent_pod_diagnostics() {
 # The A2A_DIAG_ constants above say what and why. Called by
 # collect_agent_pod_diagnostics, so it inherits that function's once-per-run
 # guard, its artifact prefix and its context pin; `$4...` is that function's
-# kubectl command line. Same contract: every command ends in `|| true`. A
-# today-mode install has no pods under either selector and gains no log files.
+# kubectl command line. Same contract: every command ends in `|| true`. An
+# install with no pods under either selector gains no log files.
 # The pod list goes to a2a-component-pods.txt, so a list that failed (an
 # unreachable cluster) is on record rather than looking like no A2A stack.
 #

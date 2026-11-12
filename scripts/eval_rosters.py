@@ -60,15 +60,12 @@ CERTIFICATION_SUITE = "certification"
 # The replay lane's matrix (examples/inference-replay/eval-design.md, Rollout
 # step 2): registered cases, replayed from the nightlies' recordings.
 REPLAY_LANE_CASES_FILE = EVAL_DIR / "replay-lane-cases.txt"
-# The inject lane's exclusions (#2039): case ids the script drops from TASKS
-# under AGENT_TRANSPORT=inject, each with its reason as the comment block
-# directly above it.
+# The inject lane's exclusions (#2039): case ids the script drops from TASKS,
+# each with its reason as the comment block directly above it; every matrix
+# goes through the inject door, so a listed case runs on no lane.
 INJECT_LANE_EXCLUSIONS_FILE = EVAL_DIR / "inject-lane-exclusions.txt"
-# Its mirror (#3263): the cases every lane but the inject one drops, because
-# their premise needs the inject door. Same shape, same reason rule.
-API_LANE_EXCLUSIONS_FILE = EVAL_DIR / "api-lane-exclusions.txt"
 # The lane safeguards (#2079): the verification_spec entries the script
-# appends to every case it runs, on the api and inject lanes alike (#2611;
+# appends to every case it runs (#2611;
 # the file keeps the inject lane's name). YAML, so this
 # stdlib-only module names the path and bench/kube_agents_bench/lane.py
 # reads it; scripts/test_eval_rosters.py pins its shape.
@@ -242,10 +239,6 @@ def parse_lane_exclusions(text: str) -> dict[str, str]:
 
 
 def inject_lane_exclusions(path: pathlib.Path = INJECT_LANE_EXCLUSIONS_FILE) -> dict[str, str]:
-    return parse_lane_exclusions(path.read_text(encoding="utf-8"))
-
-
-def api_lane_exclusions(path: pathlib.Path = API_LANE_EXCLUSIONS_FILE) -> dict[str, str]:
     return parse_lane_exclusions(path.read_text(encoding="utf-8"))
 
 
@@ -458,7 +451,6 @@ def summary(repetitions: int = 3) -> dict[str, int]:
         "presubmit serial-phase cases": len(wall["requesting"]),
         "presubmit wall estimate, minutes": -(-wall["total"] // 60),
         "presubmit wall budget, minutes": PRESUBMIT_WALL_BUDGET_MINUTES,
-        "api lane exclusions": len(api_lane_exclusions()),
         "certification cases": len(certification_cases()),
         "certification parts": len(certification_parts()),
     }

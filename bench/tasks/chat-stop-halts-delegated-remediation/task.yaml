@@ -1,7 +1,6 @@
-# Registered in hack/eval/nightly-cases.txt (nightly tier), and in
-# hack/eval/api-lane-exclusions.txt: it needs the inject door, so it runs on
-# the inject lane only (AGENT_TRANSPORT=inject; hack/ci-deploy.sh arms the card
-# stop on every EVAL_MODE_NEXT=1 install).
+# Registered in hack/eval/nightly-cases.txt (nightly tier). It needs the
+# inject door, which every CI lane grades through (AGENT_TRANSPORT=inject;
+# hack/ci-deploy.sh arms the card stop on every eval install).
 #
 # Domain: chat-and-routing.
 # Journey: a person asks for a change the Planning Agent hands to a kanban card

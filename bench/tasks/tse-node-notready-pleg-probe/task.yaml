@@ -2,9 +2,9 @@
 # healthy) escalation request to the optional GKE Support Agent (tse) specialist
 # and verify it produces the 5-section Google Cloud Support Escalation Bundle.
 #
-# Precondition: a spec.mode: next install with the optional AgentProfile/tse
-# bound (profiles.tse.enabled=true, set on EVAL_MODE_NEXT=1 installs by
-# MODE_NEXT_ENV_ARGS in hack/ci-deploy.sh, so the operator projects
+# Precondition: an install with the optional AgentProfile/tse
+# bound (profiles.tse.enabled=true, set on every eval install by
+# hack/ci-deploy.sh's step 5, so the operator projects
 # KUBE_AGENTS_ENABLED_PROFILES=tse and the entrypoint scaffolds
 # /opt/data/profiles/tse). Registered in hack/eval/nightly-cases.txt (#3492).
 id: tse-node-notready-pleg-probe

@@ -96,7 +96,7 @@ class CiDeployImageBuildTest(unittest.TestCase):
         script = "\n".join(
             [
                 "set -euo pipefail",
-                "unset RC_COMMIT_SHA EVAL_MODE_NEXT",
+                "unset RC_COMMIT_SHA",
                 'export AR_REPO="us-central1-docker.pkg.dev/p/r"',
                 'export TAG="pr-1-abc"',
                 'export PROJECT_ID="kube-agents-evals-36"',
@@ -104,6 +104,8 @@ class CiDeployImageBuildTest(unittest.TestCase):
                 "BUILD_WORKER_ARGS=(--machine-type=e2-highcpu-8)",
                 region_args,
                 "A2A_OPERATOR_ENV_ARGS=()",
+                # Section 2b-ii admits the bridge concurrency; section 4 hands it to the operator.
+                'MODE_NEXT_BRIDGE_CONCURRENCY="4"',
                 _constants_block(),
                 _build_section(),
                 'echo "REACHED SECTION 5"',

@@ -683,7 +683,7 @@ class SplitLostNothingTest(unittest.TestCase):
 INJECT_LANE_EXCLUDED = [
     "chat-question-typed-answer-fresh-session",  # #4004: its answer turn is today's Slack thread context, which next's door does not send
 ]
-# Each exclusion's api-lane tier, pinned beside it: an entry is not a
+# Each exclusion's roster tier, pinned beside it: an entry is not a
 # demotion, so a case that leaves its tier's file while still excluded reds.
 INJECT_LANE_EXCLUDED_TIER = {
     "chat-question-typed-answer-fresh-session": "nightly",
@@ -785,8 +785,8 @@ class GitLabLaneTest(unittest.TestCase):
 class InjectLaneExclusionsTest(unittest.TestCase):
     """hack/eval/inject-lane-exclusions.txt: the lane-level list, checked here.
 
-    A per-case marker would change what the api lane does to the case; a
-    list read only under AGENT_TRANSPORT=inject changes nothing there. The
+    Every matrix goes through the inject door, so a listed case runs on no
+    lane until its entry goes; the rosters are untouched. The
     shape is FIXTURE_NOT_READY's -- an exclusion with a reason -- and every
     entry must name a registered case, carry a reason, and cite the issue
     that decides when the entry goes.
@@ -817,11 +817,9 @@ class InjectLaneExclusionsTest(unittest.TestCase):
         self.assertEqual(list(eval_rosters.inject_lane_exclusions()), INJECT_LANE_EXCLUDED)
 
     def test_the_blocking_roster_cases_it_excludes_are_the_pinned_set(self):
-        # The merge-blocking presubmit runs on the inject lane, so a roster
-        # case listed here leaves what can red a pull request: hack/ci-eval-pr.sh
-        # drops it from the matrix and from BOOTSTRAP_ADMITTED there. It keeps
-        # its seat on the today lane, which grades over the api transport but
-        # gates nothing. Adding another is that decision, made here and in
+        # A roster case listed here leaves what can red a pull request:
+        # hack/ci-eval-pr.sh drops it from the matrix and from
+        # BOOTSTRAP_ADMITTED. Adding one is that decision, made here and in
         # docs/eval-gate-roster.md ("The inject lane"), not a side effect of an
         # exclusion entry.
         roster = set(eval_rosters.blocking_roster())
@@ -841,9 +839,8 @@ class InjectLaneExclusionsTest(unittest.TestCase):
                 self.assertRegex(reason, eval_rosters.ISSUE_REFERENCE_RE, f"{case}: the reason names no issue")
 
     def test_an_exclusion_keeps_the_case_on_its_roster(self):
-        # An entry here leaves the case on its roster: the today lane still
-        # grades an excluded presubmit case, and an excluded nightly case runs
-        # nowhere in CI until it can go through the inject door.
+        # An entry here leaves the case on its roster; it runs nowhere in CI
+        # until it can go through the inject door.
         self.assertEqual(sorted(INJECT_LANE_EXCLUDED_TIER), sorted(INJECT_LANE_EXCLUDED))
         for case, tier in INJECT_LANE_EXCLUDED_TIER.items():
             with self.subTest(case=case, tier=tier):
@@ -852,99 +849,6 @@ class InjectLaneExclusionsTest(unittest.TestCase):
                     self.assertIn(case, eval_rosters.blocking_roster())
                 else:
                     self.assertIn(case, eval_rosters.nightly_cases())
-
-
-# The api lane's exclusions at their introduction (#3263): the cases only the
-# inject door can carry. An edit to the file edits this set.
-API_LANE_EXCLUDED = [
-    "chat-stop-halts-delegated-remediation",  # #3263: the harness types `stop` through the door
-    "chat-stop-mid-turn-files-no-card",  # #3263: the same, while the opening turn runs
-    "chat-question-asked-to-choose-pauses",  # #4004: grades the question only the inject lane's board read folds in
-    "chat-reply-under-pushed-report",  # #4059: the harness stores the report and sends the reply through the door
-]
-
-
-class ApiLaneExclusionsTest(unittest.TestCase):
-    """hack/eval/api-lane-exclusions.txt: the inject lane's mirror, checked the same way."""
-
-    def test_the_file_is_the_pinned_set(self):
-        self.assertEqual(list(eval_rosters.api_lane_exclusions()), API_LANE_EXCLUDED)
-
-    def test_every_exclusion_names_a_registered_nightly_case(self):
-        # Not a presubmit case: the presubmit matrix also runs on the today
-        # lane over api, where a case excluded here would hold a seat it
-        # never fills, and a case new to the inject door earns its record in
-        # the nightly first.
-        for case in eval_rosters.api_lane_exclusions():
-            with self.subTest(case=case):
-                self.assertTrue((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").is_file(), f"{case} has no task.yaml")
-                self.assertIn(case, eval_rosters.nightly_cases())
-                self.assertNotIn(case, eval_rosters.presubmit_cases())
-                self.assertNotIn(case, eval_rosters.blocking_roster())
-
-    def test_every_exclusion_carries_a_reason_that_names_an_issue(self):
-        for case, reason in eval_rosters.api_lane_exclusions().items():
-            with self.subTest(case=case):
-                self.assertTrue(reason, f"{case}: no reason in the comment block above it")
-                self.assertRegex(reason, eval_rosters.ISSUE_REFERENCE_RE, f"{case}: the reason names no issue")
-
-    def test_no_case_is_excluded_on_both_lanes(self):
-        self.assertFalse(set(eval_rosters.api_lane_exclusions()) & set(eval_rosters.inject_lane_exclusions()))
-
-    def test_every_registered_stopped_ask_is_excluded(self):
-        # A stopped ask errors on the api transport, so an unlisted one would
-        # error there every repetition. The directive is read from the module
-        # the harness reads it from, so the two cannot disagree.
-        import yaml
-
-        sys.path.insert(0, str(REPO_ROOT / "bench"))
-        from kube_agents_bench.stop_hook import is_stopped_ask
-
-        excluded = eval_rosters.api_lane_exclusions()
-        for case in set(eval_rosters.presubmit_cases()) | set(eval_rosters.nightly_cases()):
-            doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
-            if is_stopped_ask(str(doc.get("prompt") or "")):
-                with self.subTest(case=case):
-                    self.assertIn(case, excluded, f"{case} is a stopped ask but is not in {eval_rosters.API_LANE_EXCLUSIONS_FILE.name}")
-
-    def test_every_registered_reply_under_pushed_report_is_excluded(self):
-        # The same rule for the pushed-report replay: it errors on the api
-        # transport, and its directive is read from the harness's module.
-        import yaml
-
-        sys.path.insert(0, str(REPO_ROOT / "bench"))
-        from kube_agents_bench.pushed_report import is_reply_under_pushed_report
-
-        excluded = eval_rosters.api_lane_exclusions()
-        found = []
-        for case in set(eval_rosters.presubmit_cases()) | set(eval_rosters.nightly_cases()):
-            doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
-            if is_reply_under_pushed_report(str(doc.get("prompt") or "")):
-                found.append(case)
-                with self.subTest(case=case):
-                    self.assertIn(case, excluded, f"{case} replays a pushed report but is not in {eval_rosters.API_LANE_EXCLUSIONS_FILE.name}")
-        self.assertIn("chat-reply-under-pushed-report", found)
-
-    def test_every_registered_case_grading_delegated_to_is_excluded(self):
-        # delegated_to reads the inject read route's childAddressees, which
-        # the api transport has no chain to report, so the check errors
-        # there; a case that uses it anywhere in its spec runs on the inject
-        # lane only.
-        import yaml
-
-        def uses_delegated_to(node) -> bool:
-            if isinstance(node, dict):
-                return node.get("type") == "delegated_to" or any(uses_delegated_to(v) for v in node.values())
-            if isinstance(node, list):
-                return any(uses_delegated_to(v) for v in node)
-            return False
-
-        excluded = eval_rosters.api_lane_exclusions()
-        for case in set(eval_rosters.presubmit_cases()) | set(eval_rosters.nightly_cases()):
-            doc = yaml.safe_load((REPO_ROOT / "bench" / "tasks" / case / "task.yaml").read_text(encoding="utf-8"))
-            if uses_delegated_to(doc.get("verification_spec")):
-                with self.subTest(case=case):
-                    self.assertIn(case, excluded, f"{case} grades delegated_to but is not in {eval_rosters.API_LANE_EXCLUSIONS_FILE.name}")
 
 
 # The inject lane's safeguards at their introduction (#2079, 2026-09-28): the
