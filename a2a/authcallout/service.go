@@ -609,17 +609,23 @@ func (s *Service) authorize(ctx context.Context, req *jwt.AuthorizationRequestCl
 			// profiles (validateIdentities), but not against the static
 			// principals and addressees this callout was started with. Nor
 			// can it check the draining names against them, and a draining
-			// name becomes a2a.tasks.<name>.*.supervisor. So both are
-			// checked here, and a hit refuses the connection.
+			// name becomes a2a.tasks.<name>.*.supervisor. A bucket user that
+			// is a reserved name refuses the connection. A draining name
+			// that is one is left out of the grants rather than refusing:
+			// one such name must not stop every bucket (#5553, round 1).
 			if kind, ok := s.reserved[user]; ok {
 				return decision{}, fmt.Errorf("%s asked for dispatcher bucket user %q, which is the name of %s", att.ServiceAccount, user, kind)
 			}
+			kept := id
+			kept.Draining = nil
 			for _, p := range id.Draining {
 				if kind, ok := s.reserved[p]; ok {
-					return decision{}, fmt.Errorf("%s's entry lists draining profile %q, which is the name of %s; its grants would be that name's", att.ServiceAccount, p, kind)
+					s.log.Warn("dispatcher draining profile left out of its bucket grants: it is a reserved name", "profile", p, "reserved", kind)
+					continue
 				}
+				kept.Draining = append(kept.Draining, p)
 			}
-			grants = dispatcherBucketGrants(m, id, bucket)
+			grants = dispatcherBucketGrants(m, kept, bucket)
 		}
 	} else if id.Narrowing != "" {
 		// A narrowed entry holds no grants; they are built here from what

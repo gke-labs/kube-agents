@@ -227,3 +227,108 @@ func TestAReservedAddresseeIsNeverADrainingProfile(t *testing.T) {
 		t.Fatal("the mirror accepted a draining reserved addressee")
 	}
 }
+
+// A static principal's name (gateway, bridge, ...) is not carried into the
+// draining set, though a live profile may hold one: the callout would leave
+// it out of every bucket's grants anyway. The mirror refuses a draining name
+// that is an entry's user, so the operator never publishes such a map as
+// healthy (#5553, round 1).
+func TestAStaticPrincipalIsNeverADrainingProfile(t *testing.T) {
+	withDispatcher(t)
+	withBucketedGrants(t)
+	withOperatorBusPrincipal(t)
+	agent := authMapTestAgent()
+	principals := a2aStaticPrincipalNames(agent)
+	if len(principals) < 2 {
+		t.Fatalf("static principals %v", principals)
+	}
+	named := principals[1] // a static identity's user
+	now := time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)
+	applied := &a2aDispatchConfig{Profiles: []a2aDispatchProfile{
+		{Name: named, Tiers: []string{"read"}},
+		{Name: "gone", Tiers: []string{"read"}},
+	}}
+	got := drainingDispatchProfiles(applied, map[string]bool{}, now, principals...)
+	if len(got) != 1 || got[0].Name != "gone" {
+		t.Fatalf("draining = %+v, want gone alone", got)
+	}
+	doc, err := renderA2AAuthMap(agent, []agentv1alpha1.AgentProfile{testAgentProfile(agent.Namespace, "tse")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := doc.Identities
+	i := slices.IndexFunc(ids, func(id a2aAuthMapIdentity) bool { return id.User == a2aDispatcherUser })
+	ids[i].Draining = []string{named}
+	if err := validateA2AAuthMapIdentities(ids, principals...); err == nil {
+		t.Fatalf("the mirror accepted draining principal %q", named)
+	}
+}
+
+// With bucketed grants, a profile named for a dispatcher bucket user is
+// refused on its own, with a condition, instead of failing the map for every
+// principal. With them off, the name is free (#5553, round 1).
+func TestAProfileNamedForABucketUserIsRefusedAlone(t *testing.T) {
+	for name, want := range map[string]bool{
+		"dispatcher-b0": true, "dispatcher-b31": true, "dispatcher-b32": false,
+		"dispatcher-b07": false, "dispatcher-b": false, "dispatcher-bx": false, "dispatcher": false,
+	} {
+		if got := isDispatcherBucketUser(name); got != want {
+			t.Errorf("isDispatcherBucketUser(%q) = %v, want %v", name, got, want)
+		}
+	}
+	withOperatorBusPrincipal(t)
+	agent := authMapTestAgent()
+	profiles := []agentv1alpha1.AgentProfile{testAgentProfile(agent.Namespace, "dispatcher-b5"), testAgentProfile(agent.Namespace, "tse")}
+	withDispatcher(t)
+	t.Setenv(a2aDispatcherBucketedGrantsEnvVar, "")
+	if res := resolveAgentProfileIdentities(agent, profiles)["dispatcher-b5"]; res.refused != nil {
+		t.Errorf("with bucketed grants off, dispatcher-b5 was refused: %v", res.refused)
+	}
+	withBucketedGrants(t)
+	resolved := resolveAgentProfileIdentities(agent, profiles)
+	if res := resolved["dispatcher-b5"]; res.refused == nil || !strings.Contains(res.refused.Error(), "bucket users") {
+		t.Errorf("with bucketed grants on, dispatcher-b5: %+v", res)
+	}
+	if resolved["tse"].refused != nil {
+		t.Errorf("a neighbour was refused: %v", resolved["tse"].refused)
+	}
+	if _, err := renderA2AAuthMap(agent, profiles); err != nil {
+		t.Errorf("the map failed for every principal: %v", err)
+	}
+}
+
+// Every name the map's mirror refuses as a draining name is also one
+// drainingDispatchProfiles doesn't carry: a callout-authenticated map user
+// (agent, session, the dispatcher itself), a static principal, the callout's
+// user, and a bucket user whatever the switch says. So a profile that held
+// one while live leaves without failing the map for its drain window
+// (#5553, round 2).
+func TestNoNameCarriedIntoDrainingFailsTheMap(t *testing.T) {
+	withDispatcher(t)
+	withBucketedGrants(t)
+	withOperatorBusPrincipal(t)
+	agent := authMapTestAgent()
+	excluded := a2aDrainingNameExclusions(agent)
+	var applied a2aDispatchConfig
+	for _, name := range append(append([]string{}, excluded...), "dispatcher-b3", "gone") {
+		if isDNS1123LabelToken(name) {
+			applied.Profiles = append(applied.Profiles, a2aDispatchProfile{Name: name, Tiers: []string{"read"}})
+		}
+	}
+	draining := drainingDispatchProfiles(&applied, map[string]bool{}, time.Now(), excluded...)
+	if len(draining) != 1 || draining[0].Name != "gone" {
+		var got []string
+		for _, d := range draining {
+			got = append(got, d.Name)
+		}
+		t.Fatalf("draining = %v, want gone alone", got)
+	}
+	for _, want := range []string{a2aDispatcherUser, "dispatcher-b3"} {
+		if a2aCanDrainAs(want, excluded) {
+			t.Errorf("%q can drain", want)
+		}
+	}
+	if _, err := renderA2AAuthMapDraining(agent, []agentv1alpha1.AgentProfile{testAgentProfile(agent.Namespace, "tse")}, draining); err != nil {
+		t.Errorf("the map failed with the carried draining set: %v", err)
+	}
+}
