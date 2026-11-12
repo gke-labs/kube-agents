@@ -503,7 +503,9 @@ single child, which takes the active task as before. Width bounds what one conve
 not what runs at once: children queue at the dispatcher, held to each profile's concurrency. At the
 `cluster` profile's default concurrency of 2, ten children run two at a time, about five rounds
 of one cluster task. A stop that cancels every child is the next step of fan-out and isn't built
-yet. The batch's plan, how many children it asked for, goes on the delegating turn's entry in one
+yet. Until it is, a stop during a fan-out cancels only the delegating turn, so no wake follows,
+while its children run on; a child that then never starts never ends, and the stopped turn keeps
+the conversation (a heal leaves a stopped turn alone) until that tree-wide stop exists. The batch's plan, how many children it asked for, goes on the delegating turn's entry in one
 record write before any child is submitted, so a gateway that stops partway through leaves a
 record that says so: the request, redelivered or read back from the stream by the relay or the
 heal, finishes the batch with every check applied again, minting only the entries not yet on the
@@ -605,7 +607,8 @@ addressee and its parameters (`cluster (cluster=web-1, location=…, project=…
 failed or ran out of time (the supervisor's `failed`) is listed with that outcome and its reason,
 never left out. Each child's text is cut to the single child's budget divided by the number of
 children, the cut named in the text, so the wake is no larger than a single child's. Its reply
-guide is the single child's, the full-answer one when any child's result was found by a heal. A
+guide is the single child's, the full-answer one when the chain's answer goes to a program behind a door or when any child's
+result was found by a heal. A
 canceled child counts as ended for the last-child rule, but a batch whose every child was canceled
 by the gateway wakes nothing, and nor does one whose delegating turn was stopped while it ran, or a
 batch that was withdrawn: the chain then ends canceled at the last child. The delegating turn
