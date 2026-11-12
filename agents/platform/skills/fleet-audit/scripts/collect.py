@@ -21,8 +21,9 @@ opening them (`TRIAGE_BY_SLUG`). Other streams have their own
 collectors (`fleet_drift.py`, `patch_readiness.py`) or none. The three streams
 collect in different shapes: obtainability answers every check from one
 workload dump plus the reads its declaration fields need; compliance issues
-several distinct `kubectl` and `gcloud` reads per cluster, four of them
-best-effort because their CRDs are not installed everywhere; ai-security reads
+several distinct `kubectl` and `gcloud` reads per cluster, six of them
+best-effort (four because their CRDs are not installed everywhere, two because
+an identity may not list webhook configurations or EndpointSlices); ai-security reads
 a workload dump and a Service dump, the second backing exactly one check
 (`inference-endpoint-public`) that joins it against the first.
 `collect_cluster` is a thin dispatcher over a per-stream *context builder* for
