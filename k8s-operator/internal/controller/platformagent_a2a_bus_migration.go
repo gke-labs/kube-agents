@@ -359,6 +359,17 @@ func (r *PlatformAgentReconciler) observeBusMigration(ctx context.Context, agent
 		}
 	}
 	if work := busMigrationRunWork(run); work.name != "" {
+		if work.name == "snapshot" {
+			// The snapshot goes only to this PlatformAgent's live claim
+			// (ensureBusMigrationWorkloadFor creates nothing else).
+			pvc := &corev1.PersistentVolumeClaim{}
+			switch err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: busMigrationStageClaim(agent, run.RunID)}, pvc); {
+			case err == nil && !busStageClaimUsable(pvc, agent):
+				return foreign("PersistentVolumeClaim " + pvc.Name + " (or it is being deleted)")
+			case err != nil && !errors.IsNotFound(err):
+				return busMigrationPending, false, err
+			}
+		}
 		// The phase's identity must be this PlatformAgent's own: a
 		// ServiceAccount someone else made under its name is never adopted.
 		sa := &corev1.ServiceAccount{}
@@ -956,7 +967,19 @@ func (r *PlatformAgentReconciler) ensureBusMigrationWorkloadFor(ctx context.Cont
 			return err
 		}
 		withCommonLabels(pvc, agent)
-		if err := r.Create(ctx, pvc); err != nil && !errors.IsAlreadyExists(err) {
+		if err := r.Create(ctx, pvc); errors.IsAlreadyExists(err) {
+			// Only this PlatformAgent's live claim takes the snapshot: one
+			// made under the run's name by anything else would be handed
+			// every stream. Nothing more is created; the phase fails on it
+			// (observeBusMigration).
+			existing := &corev1.PersistentVolumeClaim{}
+			if err := r.Get(ctx, client.ObjectKeyFromObject(pvc), existing); err != nil {
+				return err
+			}
+			if !busStageClaimUsable(existing, agent) {
+				return nil
+			}
+		} else if err != nil {
 			return err
 		}
 	}
@@ -1172,6 +1195,12 @@ func busMigrationStageSize() resource.Quantity {
 // one pod at a time holds it: the snapshot pod writes it, then the hashing
 // pod reads it, then a restore pod does, and no second pod can open it in
 // between. The cluster's default StorageClass, as the bus's own claims use.
+// busStageClaimUsable reports a staging claim the snapshot may write to:
+// this PlatformAgent controls it and it is not being deleted.
+func busStageClaimUsable(pvc *corev1.PersistentVolumeClaim, agent *agentv1alpha1.PlatformAgent) bool {
+	return metav1.IsControlledBy(pvc, agent) && pvc.DeletionTimestamp == nil
+}
+
 func buildBusStagePVC(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus) *corev1.PersistentVolumeClaim {
 	return &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{

@@ -2087,6 +2087,33 @@ func TestARunTrustsOnlyItsOwnObjects(t *testing.T) {
 	if _, _, ok := sa.workload("snapshot"); ok {
 		t.Error("the snapshot pod ran under a planted ServiceAccount")
 	}
+
+	// A planted staging claim is never handed the snapshot: the pass that
+	// creates the work makes no ServiceAccount or pod against it, and the
+	// phase fails on it, naming it.
+	c := newMigrationRig(t, busMigrationGrow, busMigrationSnapshot, 1, time.Now().Add(time.Hour))
+	claim := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: busMigrationStageClaim(c.agent, "3-1"), Namespace: c.agent.Namespace}}
+	if err := c.cl.Create(ctx, claim); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.r.ensureBusMigrationWorkload(ctx, c.agent, c.agent.Status.BusMigration, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := c.workload("snapshot"); ok {
+		t.Error("the snapshot pod was created against a planted staging claim")
+	}
+	if err := c.cl.Get(ctx, client.ObjectKey{Namespace: c.agent.Namespace, Name: busMigrationWorkloadName(c.agent, busMigrationStreamIdentity, "3-1")}, &corev1.ServiceAccount{}); err == nil {
+		t.Error("the snapshot's ServiceAccount was created against a planted staging claim")
+	}
+	if err := c.r.resolveA2ABusReplicas(ctx, c.agent); err != nil {
+		t.Fatal(err)
+	}
+	if run := c.agent.Status.BusMigration; !strings.Contains(run.Cause, "PersistentVolumeClaim") {
+		t.Errorf("a planted staging claim: phase %s cause %q", run.Phase, run.Cause)
+	}
+	if _, _, ok := c.workload("snapshot"); ok {
+		t.Error("the snapshot pod ran against a planted staging claim")
+	}
 }
 
 // The pass that enters a phase creates its work in the same pass; a
