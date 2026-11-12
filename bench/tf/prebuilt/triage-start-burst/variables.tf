@@ -52,12 +52,17 @@ variable "agent_deployment" {
   default     = "platform-agent-gateway"
 }
 
-# k8s-event-watcher is a peer process inside this container, not a container of
-# its own (deploy/shared/start-services.sh).
 variable "agent_container" {
-  type        = string
-  description = "Container inside agent_deployment that k8s-event-watcher runs alongside"
-  default     = "envoy-credential-proxy"
+  type = string
+  # k8s-event-watcher is not a container of its own: it runs inside the
+  # agent-api-auth sidecar of the gateway pod (buildAgentAPIAuthSidecar in
+  # k8s-operator/internal/controller/platformagent_manifests.go). The watcher
+  # wait below reads this container's log with kubectl's stderr discarded, so
+  # a container the pod does not carry reads as "no fire" for the whole wait
+  # (#4223, the same defect as #3681). tests/test_prebuilt_watcher_container.py
+  # pins the default to the operator's agentAPIAuthContainerName.
+  description = "Container inside agent_deployment that k8s-event-watcher runs inside"
+  default     = "agent-api-auth"
 }
 
 # ---------------------------------------------------------------------------
