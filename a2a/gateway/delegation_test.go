@@ -865,9 +865,10 @@ func TestAChildThatCannotReachTheBusLeavesNoChain(t *testing.T) {
 }
 
 // TestOneLiveChildPerConversation: one live child at a time holds per
-// conversation, whichever turn asked. A stop
-// detaches the child without ending it; a later turn's request is refused,
-// after that turn's answer, naming the running child.
+// conversation, whichever turn asked. A child that no longer holds the
+// conversation's active task but still runs (released, not stopped: a
+// stopped child no longer counts) refuses a later turn's request, after
+// that turn's answer, naming the running child.
 func TestOneLiveChildPerConversation(t *testing.T) {
 	r, spawn := startRigWithSpawner(t)
 	ctx := context.Background()
@@ -876,11 +877,11 @@ func TestOneLiveChildPerConversation(t *testing.T) {
 	_ = exec.PublishArtifact(ctx, delegateArtifact(t, "platform", "first"))
 	child := r.awaitTask(t, targetPlatform)
 	_ = exec.PublishStatus(ctx, lib.StateCompleted, true)
-	sessionRigTurn(r, conv, "stop-1", "stop")
-	waitFor(t, "child detached", func() bool {
+	waitFor(t, "child active", func() bool {
 		rec, _ := r.g.reg.Get(ctx, conv)
-		return rec.ActiveTask != nil && rec.ActiveTask.TaskID == child.TaskID && rec.ActiveTask.Detached
+		return rec.ActiveTask != nil && rec.ActiveTask.TaskID == child.TaskID
 	})
+	putRecord(t, r, conv, func(rec *SessionRecord) { rec.ActiveTask = nil })
 
 	exec2, origin2, _ := sessionTurn(t, r, spawn, conv, "again")
 	_ = exec2.PublishArtifact(ctx, delegateArtifact(t, "platform", "second"))
@@ -893,7 +894,36 @@ func TestOneLiveChildPerConversation(t *testing.T) {
 	// Retiring the delegating turn's pod is not the child's end: the child
 	// ran on platform, not in that pod, so no supervisor terminal is owed.
 	if key, _ := r.g.reg.SessionForTask(ctx, child.TaskID); key != conv {
-		t.Fatalf("the detached child was retired with the pod: index=%q", key)
+		t.Fatalf("the released child was retired with the pod: index=%q", key)
+	}
+}
+
+// TestAStoppedChildNoLongerBlocksADelegation: a child its requester stopped
+// doesn't count as the conversation's live delegation, though its terminal
+// hasn't come: a later turn's request mints.
+func TestAStoppedChildNoLongerBlocksADelegation(t *testing.T) {
+	r, spawn := startRigWithSpawner(t)
+	ctx := context.Background()
+	conv := "discord:g1/t-stopped-child-frees"
+	exec, _, _ := sessionTurn(t, r, spawn, conv, "x")
+	_ = exec.PublishArtifact(ctx, delegateArtifact(t, "platform", "first"))
+	child := r.awaitTask(t, targetPlatform)
+	_ = exec.PublishStatus(ctx, lib.StateCompleted, true)
+	sessionRigTurn(r, conv, "stop-1", "stop")
+	waitFor(t, "child detached", func() bool {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		return rec.ActiveTask != nil && rec.ActiveTask.TaskID == child.TaskID && rec.ActiveTask.Detached
+	})
+	exec2, origin2, _ := sessionTurn(t, r, spawn, conv, "again")
+	_ = exec2.PublishArtifact(ctx, delegateArtifact(t, "platform", "second"))
+	second := awaitSubmission(t, r, targetPlatform, 1)
+	waitFor(t, "second child on the record", func() bool {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		pref, _ := rec.TaskRefFor(origin2.TaskID)
+		return len(pref.Children) == 1 && pref.Children[0] == second.TaskID
+	})
+	if loggedContaining(r, "delegation refused", "rule="+ruleDelegationBusy)() {
+		t.Fatalf("a stopped child refused the next delegation:\n%s", r.logs.String())
 	}
 }
 
@@ -1151,17 +1181,19 @@ func TestAHumanStopOnTheChildDoesNotWake(t *testing.T) {
 		name string
 		end  func(t *testing.T, r *rig, child *lib.Envelope)
 	}{
+		// Nothing a stopped child writes reaches the room: each end is
+		// dropped, and logged.
 		{"canceled", func(t *testing.T, r *rig, child *lib.Envelope) {
 			_ = r.execFor(t, child, targetPlatform).PublishStatus(context.Background(), lib.StateCanceled, true)
-			waitFor(t, "canceled relayed", postedContaining(r, "🛑 canceled"))
+			waitFor(t, "canceled dropped", loggedContaining(r, "dropped a canceled task's write", child.TaskID))
 		}},
 		{"completed", func(t *testing.T, r *rig, child *lib.Envelope) {
 			completeTask(t, r.execFor(t, child, targetPlatform), "fleet is green")
-			waitFor(t, "result relayed", postedContaining(r, "fleet is green"))
+			waitFor(t, "result dropped", loggedContaining(r, "dropped a canceled task's write", child.TaskID, "what=result"))
 		}},
 		{"failed", func(t *testing.T, r *rig, child *lib.Envelope) {
 			publishFinal(t, r, child, targetPlatform, lib.StateFailed, "the fleet is on fire")
-			waitFor(t, "failure relayed", postedContaining(r, "the fleet is on fire"))
+			waitFor(t, "failure dropped", loggedContaining(r, "dropped a canceled task's write", child.TaskID))
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1188,6 +1220,11 @@ func TestAHumanStopOnTheChildDoesNotWake(t *testing.T) {
 			}
 			assertOnlyRoot(t, obs, origin.TaskID)
 			assertNoDelivery(t, obs)
+			for _, late := range []string{"🛑 canceled", "fleet is green", "the fleet is on fire"} {
+				if postedContaining(r, late)() {
+					t.Fatalf("a stopped child's end was posted: %q", late)
+				}
+			}
 		})
 	}
 }

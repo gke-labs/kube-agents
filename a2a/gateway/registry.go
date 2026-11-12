@@ -305,12 +305,21 @@ type TaskRef struct {
 	// same block a pre-mint gateway sent, and no executor checks a cancel.
 	Capability *capability.Ref `json:"capability,omitempty"`
 	// Canceled records that the gateway published a cancel for this task —
-	// set only after the publish succeeded, so a true here means the cancel
-	// is on the stream. It is what lets a supervisor path reached long
+	// for the task holding the conversation, set only after the publish
+	// succeeded. It is what lets a supervisor path reached long
 	// after ActiveTask moved on (Sweep, routinely) tell "finishing a cancel
 	// the requester asked for" (terminal `canceled`) from "the executor
 	// died mid-work" (terminal `failed`) — assertion 13's distinction.
+	// Two writers set it whether or not the cancel went out: a withdrawn
+	// batch child (withdrawBatch) and a task the tree-wide stop reached
+	// (stopTree), so a task that may still run stays on record as canceled,
+	// where the heal and its batch can still end it.
 	Canceled bool `json:"canceled,omitempty"`
+	// StopPending marks a task the tree-wide stop canceled (stopTree) whose
+	// terminal the relay hasn't delivered: relayTerminal clears it, and the
+	// heal ends a task still marked once its terminal is on the stream or it
+	// has produced nothing past FirstEventGrace (healStoppedTasks).
+	StopPending bool `json:"stopPending,omitempty"`
 	// QuietCancel marks a cancel that answers for itself (cancelTaskVoiced):
 	// Slack's Stop button with one reply of its own, Google Chat's button
 	// and typed stop on the task's line (chat_stop_press.go), so the relay

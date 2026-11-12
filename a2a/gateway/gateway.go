@@ -1689,6 +1689,13 @@ func (g *Gateway) principalMapFor(backend string) *PrincipalMap {
 // nothing to heal and, for a detached task, the cancel already published is
 // the answer the conversation is waiting on.
 func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
+	// Tasks a stop canceled whose terminal never came are ended first,
+	// whatever holds the conversation now (healStoppedTasks).
+	if g.healStoppedTasks(ctx, rec) {
+		if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
+			g.log.Error("healed record write failed", "conversation", rec.Key, "err", err)
+		}
+	}
 	active := rec.ActiveTask
 	if active == nil || active.Detached {
 		return
@@ -3498,6 +3505,9 @@ func (g *Gateway) cancelTaskVoiced(ctx context.Context, rec *SessionRecord, auth
 		g.publishDispatchStop(ctx, ref)
 	}
 	g.cancelWaitingProfileParents(ctx, rec, active.TaskID, authority)
+	// And down: every other live task of the tree, a fan-out's children
+	// included, so one stop stops them all, with this one notice.
+	g.stopTree(ctx, rec, active.TaskID, authority, quiet)
 	return true
 }
 

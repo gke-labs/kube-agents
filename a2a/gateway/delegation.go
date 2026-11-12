@@ -1019,7 +1019,10 @@ func breakBacktickRuns(body string, n int) string {
 // refused request can be asked again, a second live child cannot be undone.
 func (g *Gateway) liveChild(ctx context.Context, rec *SessionRecord) string {
 	for _, ref := range rec.Tasks {
-		if ref.Role != taskRoleChild {
+		// A child the gateway canceled doesn't hold the conversation: its
+		// writes are dropped (applyCanceledEvent), and the heal ends one
+		// that never confirms (healStoppedTasks).
+		if ref.Role != taskRoleChild || ref.Canceled {
 			continue
 		}
 		key, err := g.lookupTaskSession(ctx, ref.ID)

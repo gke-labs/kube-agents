@@ -366,7 +366,10 @@ func (g *Gateway) healBatchChild(ctx context.Context, rec *SessionRecord, kid Ta
 			source = TerminalFromSupervisor
 		}
 		g.log.Info("healing a fan-out child whose terminal the relay never delivered", "conversation", rec.Key, "taskId", kid.ID, "state", task.State)
-		g.post(rec.Key, formatTaskStatus(task, "", kid.StartedAt))
+		// A canceled child writes nothing to the room (applyCanceledEvent).
+		if !kid.Canceled {
+			g.post(rec.Key, formatTaskStatus(task, "", kid.StartedAt))
+		}
 		g.logTaskTerminal(rec, kid.Addressee, kid.ID, task.State, source, finalMessageText(task))
 		rec.MarkTerminalObserved(kid.ID)
 		var terminal chatmsg.Reading
@@ -396,7 +399,9 @@ func (g *Gateway) healBatchChild(ctx context.Context, rec *SessionRecord, kid Ta
 	case noFirstEventPastGrace(&ActiveTask{SubmittedAt: kid.StartedAt}, isTaskNotFound(err), g.cfg.FirstEventGrace, time.Now()):
 		g.log.Info("healing a fan-out child with no first event inside the grace", "conversation", rec.Key, "taskId", kid.ID,
 			"addressee", kid.Addressee, "grace", g.cfg.FirstEventGrace)
-		g.post(rec.Key, fmt.Sprintf(noticeBatchChildNeverStarted, kid.ID, g.cfg.FirstEventGrace))
+		if !kid.Canceled {
+			g.post(rec.Key, fmt.Sprintf(noticeBatchChildNeverStarted, kid.ID, g.cfg.FirstEventGrace))
+		}
 		g.logTaskTerminal(rec, kid.Addressee, kid.ID, lib.StateFailed, TerminalNeverStarted, "")
 		g.publishDispatchStop(ctx, kid)
 		g.retireTaskRoute(ctx, kid.ID)

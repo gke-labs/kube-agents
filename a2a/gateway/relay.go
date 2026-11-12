@@ -611,6 +611,11 @@ func (g *Gateway) applyEvent(ctx context.Context, rec *SessionRecord, item relay
 		g.retireTaskRoute(ctx, env.TaskID)
 		return
 	}
+	// A task the gateway canceled writes nothing more to the room.
+	if ref, ok := rec.TaskRefFor(env.TaskID); ok && ref.Canceled {
+		g.applyCanceledEvent(ctx, rec, rs, item)
+		return
+	}
 
 	switch env.Kind {
 	case lib.KindStatusUpdate:
@@ -627,6 +632,120 @@ func (g *Gateway) applyEvent(ctx context.Context, rec *SessionRecord, item relay
 			return
 		}
 		g.applyArtifact(ctx, rec, rs, item.subject, env.TaskID, a, render)
+	}
+}
+
+// What a canceled task's dropped write was, as the drop's log line names it
+// (dropCanceledWrite).
+const (
+	droppedStatusNote   = "status note"
+	droppedQuestion     = "question"
+	droppedSteerNotice  = "steer notice"
+	droppedRollingLine  = "rolling line"
+	droppedProgress     = "progress"
+	droppedTurnAnswer   = "turn answer"
+	droppedNotice       = "notice"
+	droppedResult       = "result"
+	droppedTerminal     = "terminal notice"
+	droppedSteerSummary = "steer shortfall"
+	droppedGatewayNote  = "deferred notice"
+)
+
+// applyCanceledEvent is applyEvent for a task the gateway canceled (a stop,
+// a withdrawn batch, a fan-out child that asked): nothing it writes reaches
+// the room, so the stop's own notice is the only output
+// (spec-chatops-gateway.md, "Stop"). A status note, a question, a steer
+// notice, a progress line, a turn's answer and a notice are each dropped and
+// logged (dropCanceledWrite); its terminal still ends it (relayTerminal,
+// which posts nothing for it either, and closes its line); and what the
+// gateway keeps as state rather than renders (the result, a handoff, a
+// delegate request, which the stopped-turn guard ignores) is applied as
+// for any task.
+func (g *Gateway) applyCanceledEvent(ctx context.Context, rec *SessionRecord, rs *relayState, item relayItem) {
+	env := item.env
+	switch env.Kind {
+	case lib.KindStatusUpdate:
+		var s lib.StatusUpdate
+		if err := json.Unmarshal(env.Payload, &s); err != nil {
+			g.log.Error("relay: malformed status-update", "taskId", env.TaskID, "err", err)
+			return
+		}
+		rs.state = s.Status.State
+		if s.Final {
+			g.relayTerminal(ctx, rec, rs, env.TaskID, s, terminalSourceOf(item.subject))
+			return
+		}
+		what := droppedRollingLine
+		switch {
+		case s.Status.State == lib.StateInputRequired:
+			what = droppedQuestion
+		case s.Status.Message == nil:
+		case isSteerNotice(s.Status.Message.Parts):
+			what = droppedSteerNotice
+		case joinTextParts(s.Status.Message.Parts) != "":
+			what = droppedStatusNote
+		}
+		g.dropCanceledWrite(rec, env.TaskID, what)
+	case lib.KindArtifactUpdate:
+		var a lib.ArtifactUpdate
+		if err := json.Unmarshal(env.Payload, &a); err != nil {
+			g.log.Error("relay: malformed artifact-update", "taskId", env.TaskID, "err", err)
+			return
+		}
+		switch a.Artifact.Name {
+		case lib.ArtifactProgress:
+			g.dropCanceledWrite(rec, env.TaskID, droppedProgress)
+		case lib.ArtifactTurn:
+			g.dropCanceledWrite(rec, env.TaskID, droppedTurnAnswer)
+		case lib.ArtifactNotice:
+			g.dropCanceledWrite(rec, env.TaskID, droppedNotice)
+		default:
+			g.applyArtifact(ctx, rec, rs, item.subject, env.TaskID, a, false)
+		}
+	}
+}
+
+// dropCanceledNotices is the end of a canceled task for the lines that
+// would follow its deliverable: the gateway's deferred notices for it and
+// the steer shortfall, each dropped and logged rather than posted.
+func (g *Gateway) dropCanceledNotices(rec *SessionRecord, rs *relayState, taskID string) {
+	g.mu.Lock()
+	notices := len(rs.notices)
+	rs.notices = nil
+	shortfall := rs.steersSent > len(rs.answered) || len(rs.ended)+max(0, len(rs.queued)-rs.turnsStarted) > 0
+	g.mu.Unlock()
+	if notices > 0 {
+		g.logCanceledDrop(rec, taskID, droppedGatewayNote)
+	}
+	if shortfall {
+		g.logCanceledDrop(rec, taskID, droppedSteerSummary)
+	}
+}
+
+// logCanceledDrop is the log line for a canceled task's dropped write. At
+// its terminal it is the whole of the drop: the terminal's own edit closes
+// the line.
+func (g *Gateway) logCanceledDrop(rec *SessionRecord, taskID, what string) {
+	g.log.Info("relay: dropped a canceled task's write", "taskId", taskID, "conversation", rec.Key, "what", what)
+}
+
+// isSteerNotice reports a status message that is a steer notice.
+func isSteerNotice(parts []lib.Part) bool {
+	_, ok := lib.SteerNoticeOf(parts)
+	return ok
+}
+
+// dropCanceledWrite logs a canceled task's write the room won't get. The
+// first drop for the task holding the conversation closes its line, so a
+// typed stop's line doesn't keep its Stop control while the task runs on:
+// edited to "cancel sent" with the control gone, and left so
+// (ActiveTask.LineClosed) until the terminal's edit.
+func (g *Gateway) dropCanceledWrite(rec *SessionRecord, taskID, what string) {
+	g.logCanceledDrop(rec, taskID, what)
+	if a := rec.ActiveTask; a != nil && a.TaskID == taskID && a.StatusMsgID != "" && !a.LineClosed {
+		if g.editLine(rec.Key, a.StatusMsgID, withLineNote(cancelSentNotice, a.LineNote), "") {
+			a.LineClosed = true
+		}
 	}
 }
 
@@ -803,7 +922,16 @@ func reasonInPlainWords(reason string) (string, bool) {
 // the durable record; the index only exists to route live events. source is
 // whose word the terminal is, read off the subject it arrived on.
 func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *relayState, taskID string, s lib.StatusUpdate, source TerminalSource) {
+	ref, _ := rec.TaskRefFor(taskID)
+	// A task the gateway canceled posts nothing at its end: no turn answer,
+	// result, notice or steer shortfall (applyCanceledEvent). Its line is
+	// still closed below, once, and its end logged and observed.
+	muted := ref.Canceled
 	// A turn answer still assembling posts before the deliverable it led to.
+	if muted && rs.turnPending {
+		rs.turn, rs.turnChunks, rs.turnPending = nil, nil, false
+		g.logCanceledDrop(rec, taskID, droppedTurnAnswer)
+	}
 	g.flushTurn(rec, rs, taskID)
 	result := joinTextParts(rs.result)
 	// The console never posts the deliverable as a notice (see the
@@ -812,7 +940,6 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	// stream whatever the conversation, except for a console task whose
 	// terminal the heal already observed: it gets no second frame, so the
 	// replay would buy nothing.
-	ref, _ := rec.TaskRefFor(taskID)
 	needResult := result == "" && s.Status.State == lib.StateCompleted &&
 		!(isConsoleConversation(rec.Key) && ref.TerminalObserved)
 	// A child's turn answers feed its wake too, however it ended. The render
@@ -943,7 +1070,10 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		// The other terminal arms below are notices, not answers, and go to
 		// every backend. Chat backends have no TASKS view, so for them this
 		// post IS the answer.
-		if !isConsoleConversation(rec.Key) {
+		if muted {
+			g.logCanceledDrop(rec, taskID, droppedResult)
+			answerChat = chatmsg.Reading{}
+		} else if !isConsoleConversation(rec.Key) {
 			if ref.TerminalObserved && result == completedNonTextResult {
 				// The heal already posted the status card; skip completedNonTextResult.
 			} else if doneLine != "" && toCards && result != completedNonTextResult {
@@ -968,7 +1098,10 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		// A Stop button answers for itself: Slack's with one reply
 		// (slack_stop.go), Google Chat's on the line, as does a stop typed
 		// on Google Chat with a line (chat_stop_press.go).
-		if s.Status.State != lib.StateCanceled || !ref.QuietCancel {
+		switch {
+		case muted:
+			g.logCanceledDrop(rec, taskID, droppedTerminal)
+		case s.Status.State != lib.StateCanceled || !ref.QuietCancel:
 			g.post(rec.Key, terminalNotice(s.Status.State, reason))
 		}
 	case lib.StateRejected:
@@ -983,10 +1116,18 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		if s.Status.Message != nil {
 			reason = joinTextParts(s.Status.Message.Parts)
 		}
-		g.post(rec.Key, terminalNotice(s.Status.State, reason))
+		if muted {
+			g.logCanceledDrop(rec, taskID, droppedTerminal)
+		} else {
+			g.post(rec.Key, terminalNotice(s.Status.State, reason))
+		}
 	}
-	g.postSteerShortfall(rec, rs, taskID)
-	g.flushNotices(rec.Key, rs)
+	if muted {
+		g.dropCanceledNotices(rec, rs, taskID)
+	} else {
+		g.postSteerShortfall(rec, rs, taskID)
+		g.flushNotices(rec.Key, rs)
+	}
 	g.terminalMark(rec, taskID, s.Status.State, terminal)
 
 	if active := rec.ActiveTask; active != nil && active.TaskID == taskID {
@@ -1050,6 +1191,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	// and the fold; the gateway's job is only to never replay the result at
 	// the room).
 	g.retireTaskRoute(ctx, taskID)
+	rec.setStopPending(taskID, false)
 	// Last, after the deliverable is posted and the rolling line edited, so
 	// an observer that treats this as "the task is over" has already been
 	// handed everything the conversation received for it. See TaskObserver.
