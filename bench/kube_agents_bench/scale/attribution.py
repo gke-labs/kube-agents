@@ -14,8 +14,10 @@ tested on its own; :func:`read_stores` does the reading.
 
 from __future__ import annotations
 
+import base64
 import json
 import re
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -27,6 +29,9 @@ ROSTERS = (REPO / "agents" / "platform" / "cron" / "jobs.json",
            REPO / "agents" / "chat" / "defaults" / "cron" / "jobs.json")
 DATA_ROOT = "/opt/data"
 READ_TIMEOUT_SECONDS = 120
+# The read takes sessions and cards from this long before the run's start, so a parent or
+# creator session that started earlier is still there to join through.
+READ_SLACK_SECONDS = 6 * 3600
 
 # The rows beyond the two cron rosters (the design's "The capability list").
 FIRST_RUN = "first-run-flow"
@@ -57,10 +62,12 @@ FIRST_RUN_KEY_PREFIX = "bootstrap-"
 RUN_START_SLACK_SECONDS = 60
 
 # Runs in the gateway pod under hermes' venv: every profile's sessions and the kanban
-# board, as one JSON object on stdout. Read only.
+# board since argv[2], as one JSON object, zlib-compressed and base64-encoded on stdout.
+# kubectl exec into the sandboxed pod cuts stdout at 64 KiB, and a busy install's records
+# pass that; compressed, they are about a tenth. Read only.
 READ_SCRIPT = r"""
-import glob, json, os, sqlite3, sys
-root = sys.argv[1]
+import base64, glob, json, os, sqlite3, sys, zlib
+root, since = sys.argv[1], float(sys.argv[2])
 def ro(path):
     conn = sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=30)
     conn.row_factory = sqlite3.Row
@@ -72,7 +79,7 @@ for profile, path in stores:
     try:
         for r in ro(path).execute(
                 "SELECT id, source, started_at, parent_session_id, input_tokens, output_tokens, "
-                "cache_read_tokens, reasoning_tokens FROM sessions"):
+                "cache_read_tokens, reasoning_tokens FROM sessions WHERE started_at >= ?", (since,)):
             out["sessions"].append(dict(r, profile=profile))
     except sqlite3.Error as exc:
         out["errors"].append("%s: %s" % (path, exc))
@@ -84,14 +91,15 @@ if os.path.exists(board):
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='kanban_task_origins'").fetchone()
         join = " LEFT JOIN kanban_task_origins o ON o.task_id = t.id" if has_origins else ""
         origin = "o.origin" if has_origins else "NULL"
-        for r in conn.execute("SELECT t.id, t.title, t.body, t.session_id, t.idempotency_key, %s AS origin FROM tasks t%s"
-                              % (origin, join)):
+        for r in conn.execute("SELECT t.id, t.title, t.body, t.session_id, t.idempotency_key, %s AS origin "
+                              "FROM tasks t%s WHERE t.created_at >= ?" % (origin, join), (since,)):
             out["cards"].append(dict(r))
-        for r in conn.execute("SELECT task_id, profile, started_at, metadata FROM task_runs"):
+        for r in conn.execute("SELECT task_id, profile, started_at, metadata FROM task_runs WHERE started_at >= ?",
+                              (since,)):
             out["runs"].append(dict(r))
     except sqlite3.Error as exc:
         out["errors"].append("%s: %s" % (board, exc))
-print(json.dumps(out))
+print(base64.b64encode(zlib.compress(json.dumps(out).encode())).decode())
 """
 
 
@@ -103,14 +111,24 @@ def capabilities() -> tuple[str, ...]:
     return tuple(jobs) + EXTRA_ROWS
 
 
-def read_stores(context: str, namespace: str) -> dict[str, Any]:
-    """The sessions, cards and card runs the gateway pod's stores hold."""
+def read_stores(context: str, namespace: str, since: float = 0.0) -> dict[str, Any]:
+    """The sessions, cards and card runs the gateway pod's stores hold, from ``since`` less the slack."""
     pod = operations._gateway_pod(context, namespace)
     if not pod:
         raise kube.CommandError("no gateway pod to read the session records in")
     out = kube.kubectl(context, "exec", "-n", namespace, pod, "-c", operations.AGENT_CONTAINER, "--",
-                       operations.JOB_PYTHON, "-c", READ_SCRIPT, DATA_ROOT, timeout=READ_TIMEOUT_SECONDS)
-    return json.loads(out)
+                       operations.JOB_PYTHON, "-c", READ_SCRIPT, DATA_ROOT, str(max(0.0, since - READ_SLACK_SECONDS)),
+                       timeout=READ_TIMEOUT_SECONDS)
+    return decode(out)
+
+
+def decode(out: str) -> dict[str, Any]:
+    """The read script's output; a cut-off read is an error that says so, not a JSON parse failure."""
+    try:
+        return json.loads(zlib.decompress(base64.b64decode(out.strip())))
+    except (ValueError, zlib.error) as exc:
+        raise kube.CommandError(f"the session records' read came back incomplete ({len(out)} characters): {exc}") \
+            from exc
 
 
 def tokens(session: dict[str, Any]) -> dict[str, int]:
