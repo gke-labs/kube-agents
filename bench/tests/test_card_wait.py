@@ -366,3 +366,10 @@ def test_a_refused_cancel_does_not_wait_out_the_cancel_settle(card_wait):
     result, door, seen = card_wait(["working"], [["a2a-x"]], cancel_error=a2a_door.DoorError(-32002, "not cancelable"))
     assert seen["sent"][0] is False and door.gets <= 3
 
+
+def test_the_scorers_door_entry_name_agrees_with_the_harness():
+    from kube_agents_bench import scoring
+
+    assert scoring.A2A_DOOR_SEND_EVENT == harness._A2A_DOOR_SEND_ENTRY
+    assert scoring.is_next_lane_record([{"name": harness._A2A_DOOR_SEND_ENTRY}])
+    assert not scoring.is_inject_record([{"name": harness._A2A_DOOR_SEND_ENTRY}])
