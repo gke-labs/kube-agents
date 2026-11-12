@@ -112,8 +112,11 @@ for good; the ledger's ``unreadable`` entry for the namespace says so while
 it lasts. The discovery lists every namespace in one request (metadata
 only), but only the namespaces the watch reads reach its record: the system
 namespaces, ``STALL_WATCH_EXCLUDE_NAMESPACES`` and the exempt annotation
-keep theirs out of it. An explicit ``STALL_WATCH_KINDS`` replaces the
-wildcard with the rest of the default list, and may name it.
+keep theirs out of it. A cluster with no namespace to watch asks for no
+kind, so it gets no discovery: its record stays as it was, and is redone
+when the cluster has a namespace to watch again and the refresh is due. An
+explicit ``STALL_WATCH_KINDS`` replaces the wildcard with the rest of the
+default list, and may name it.
 
 What an install can tune. The CR's ``spec.harness.stallWatch`` reaches this
 script as three variables the operator pins in the managed .env on every
@@ -337,7 +340,8 @@ NAMESPACES_ARGV = (
 #: kubectl did), so the listing reads the marker before the exit code.
 PROXY_TRUNCATED_TEXT = "credential proxy output truncated"
 #: The kind list is filtered to what a cluster serves, from one
-#: `kubectl api-resources` per cluster, so a warning from the report script
+#: `kubectl api-resources` per cluster that has a namespace to watch, so a
+#: warning from the report script
 #: about a kind it could not scan is always a failure and never "this cluster
 #: has no cert-manager".
 API_RESOURCES_ARGV = ("kubectl", "api-resources", "--namespaced=true", "--verbs=list", "-o", "name")
@@ -1923,9 +1927,10 @@ class SweepContext:
 
 
 def read_cluster(ctx: SweepContext, cid: str) -> ClusterPart:
-    """One cluster's sweep, on a worker: its credentials, its namespaces and
-    served kinds, its wildcard discovery when due, then the cluster-wide
-    read, and the per-namespace read for whatever that could not read whole.
+    """One cluster's sweep, on a worker: its credentials and its namespaces,
+    then, when it has a namespace to watch, its served kinds, its wildcard
+    discovery when due, the cluster-wide read, and the per-namespace read for
+    whatever that could not read whole.
     Returns the part; raises only for a lost sandbox, which ends the tick: the
     raising worker lowers the budget flag itself, so every other worker stops
     at its next check rather than when the main thread sees the exception."""
@@ -1984,19 +1989,25 @@ def read_cluster_part(ctx: SweepContext, cid: str) -> ClusterPart:
         readable = True
         if fetched:
             part.credential = CREDENTIAL_SET
-        served = served_kinds(kubeconfig)
-        kinds, dropped = kinds_for(served)
+        kinds, dropped = None, set()
         # The wildcard's kinds, per namespace, from this cluster's
         # discovery record, redone when due. A discovery that fails holds
         # the kinds it could not read; it never makes the cluster unreadable.
         extra_kinds, held, cut, next_turns = {}, set(), {}, {}
-        candidates = wildcard_candidates(served, ctx.wildcards)
         record = ctx.discoveries.get(cid)
-        if candidates and not sweep.out_of_budget(ctx.started) and ctx.claim_refresh(record, candidates):
-            record = discover_kinds(kubeconfig, candidates, now, record, set(namespaces))
-            part.discovery = record
-        if ctx.wildcards and (candidates or record is not None):
-            extra_kinds, held, cut, next_turns = wildcard_kinds_for(record, candidates, ctx.wildcards, cluster_label(cid))
+        # A cluster with no namespace to watch asks for no kind, so the
+        # served-kinds call and the wildcard discovery are skipped. It is
+        # still read: its listing stands, with 0 namespaces. Its discovery
+        # record stays as it was until it has a namespace to watch again.
+        if namespaces:
+            served = served_kinds(kubeconfig)
+            kinds, dropped = kinds_for(served)
+            candidates = wildcard_candidates(served, ctx.wildcards)
+            if candidates and not sweep.out_of_budget(ctx.started) and ctx.claim_refresh(record, candidates):
+                record = discover_kinds(kubeconfig, candidates, now, record, set(namespaces))
+                part.discovery = record
+            if ctx.wildcards and (candidates or record is not None):
+                extra_kinds, held, cut, next_turns = wildcard_kinds_for(record, candidates, ctx.wildcards, cluster_label(cid))
     except sandbox_exec.SandboxUnavailable:
         raise
     except READ_FAILURES as exc:
