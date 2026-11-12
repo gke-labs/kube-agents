@@ -113,6 +113,7 @@ class EvalTest(unittest.TestCase):
         self.assertLess(lane, text.index("# ─── Parallel fan-out"))
         block = text[lane:text.index("\nfi\n", lane)]
         self.assertIn("slack-lane/run.sh", block)
+        self.assertIn("spec.integration.slack.enabled", block, "the lane runs only on an install with Slack on")
         self.assertIn("exit 0", block)
 
     def test_the_lane_publishes_no_dashboard(self):

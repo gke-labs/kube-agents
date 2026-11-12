@@ -44,8 +44,13 @@ readonly TIMING_FILE_NAME="timing.json"
 readonly SLACK_TIMING_FILE_NAME="slack-timing.json"
 readonly SUMMARY_FILE_NAME="summary.jsonl"
 
-read_secret() { # <name> -> the value on stdout, newline stripped; empty when unreadable
-  gcloud secrets versions access latest --secret="$1" --project="${SLACK_LANE_SECRETS_PROJECT}" 2>/dev/null | tr -d '\r\n'
+read_secret() { # <name> -> the value on stdout, newline stripped; empty when unreadable, its error class on stderr
+  local err
+  err="$(mktemp)"
+  gcloud secrets versions access latest --secret="$1" --project="${SLACK_LANE_SECRETS_PROJECT}" 2>"${err}" | tr -d '\r\n'
+  # The error names the failure, never the value: NOT_FOUND or PERMISSION_DENIED.
+  grep -oE 'NOT_FOUND|PERMISSION_DENIED|UNAUTHENTICATED' "${err}" | head -n 1 | sed "s|^|slack lane: $1: |" >&2 || true
+  rm -f -- "${err}"
 }
 
 main() {

@@ -1048,8 +1048,10 @@ export SLACK_ENABLED="false"
 # gateway; the CI channel as the home channel; the test user on the allowlist
 # and on operator.slackTestUsers, so the gateway reads its user-token posts as
 # its own. The tokens reach Helm as --set-file from a 0700 directory, never on
-# argv. Any secret unreadable: Slack stays off, and the lane (which reads its own
-# three values from the same project) skips. Empty on every other run.
+# argv, removed beside the sandbox key once the release is in. Any secret
+# unreadable: Slack stays off, the error's class (not found, permission denied)
+# is logged, and hack/ci-eval-pr.sh, which checks the installed CR, skips the
+# lane. Empty on every other run.
 SLACK_LANE_HELM_ARGS=()
 if [ "${EVAL_SLACK_LANE:-}" = "1" ]; then
   if [ "${EVAL_MODE_NEXT:-}" != "1" ]; then
@@ -1060,9 +1062,11 @@ if [ "${EVAL_SLACK_LANE:-}" = "1" ]; then
   chmod 700 "${SLACK_LANE_DIR}"
   slack_lane_missing=()
   for slack_lane_secret in "${SLACK_LANE_BOT_TOKEN_SECRET}" "${SLACK_LANE_APP_TOKEN_SECRET}" "${SLACK_LANE_CHANNEL_SECRET}" "${SLACK_LANE_TEST_USER_SECRET}"; do
-    slack_lane_value="$(gcloud secrets versions access latest --secret="${slack_lane_secret}" --project="${SLACK_LANE_SECRETS_PROJECT}" 2>/dev/null | tr -d '[:space:]')" || slack_lane_value=""
+    slack_lane_value="$(gcloud secrets versions access latest --secret="${slack_lane_secret}" --project="${SLACK_LANE_SECRETS_PROJECT}" 2>"${SLACK_LANE_DIR}/err" | tr -d '[:space:]')" || slack_lane_value=""
     if [ -z "${slack_lane_value}" ]; then
-      slack_lane_missing+=("${slack_lane_secret}")
+      # gcloud's error names the failure, never the value: NOT_FOUND until the
+      # secret exists, PERMISSION_DENIED while the runner lacks the grant.
+      slack_lane_missing+=("${slack_lane_secret} ($(grep -oE 'NOT_FOUND|PERMISSION_DENIED|UNAUTHENTICATED' "${SLACK_LANE_DIR}/err" | head -n 1 || true))")
       continue
     fi
     printf '%s' "${slack_lane_value}" >"${SLACK_LANE_DIR}/${slack_lane_secret}"
@@ -2250,6 +2254,7 @@ rm -f "${HELM_INSTALL_OUT}"
 # A failed install leaves the directory behind in a pod prow destroys with the
 # lease, and nothing uploads it — /logs/artifacts is the only path off this box.
 rm -rf "${SANDBOX_KEY_DIR}"
+if [ -n "${SLACK_LANE_DIR:-}" ]; then rm -rf -- "${SLACK_LANE_DIR}"; fi
 echo "✓ Chart deployment finished in $((SECONDS - STEP_START))s"
 
 # ─── 6. Readiness Verification ────────────────────────────────────────────────

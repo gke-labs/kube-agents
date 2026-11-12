@@ -570,12 +570,12 @@ cluster, not from their public job config: `kube-agents-eval-model` in namespace
 one pair of keys per kind of lane, and every Prow job that runs `hack/ci-deploy.sh` reads
 one:
 
-| Pair                          | Jobs                                                                                                                                                                                                                                                                      |
-| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `gate.provider` / `gate.name` | `pull-kube-agents-smoke-test`, `pull-kube-agents-smoke-test-today`, `pull-kube-agents-smoke-test-gitlab`, `pull-kube-agents-smoke-test-ghes`, `pull-kube-agents-smoke-test-gitlab-ce`, `post-kube-agents-eval-rc`                                                         |
-| `nightly.*`                   | `ci-kube-agents-eval-nightly`, `-main-b`, `-main-c`, `-main-d`, `-main-e`, `-gitlab`, `-writers`, `-writers-b`, `-writers-c`, `-gitlab-next`, `ci-kube-agents-eval-weekly-ghes-next`, `ci-kube-agents-eval-weekly-gitlab-ce-next`, `ci-kube-agents-certification-1` (5.9) |
-| `flash.*`                     | `pull-kube-agents-smoke-test-flash`                                                                                                                                                                                                                                       |
-| `alt.*`                       | `pull-kube-agents-smoke-test-alt`                                                                                                                                                                                                                                         |
+| Pair                          | Jobs                                                                                                                                                                                                                                                                                                           |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `gate.provider` / `gate.name` | `pull-kube-agents-smoke-test`, `pull-kube-agents-smoke-test-today`, `pull-kube-agents-smoke-test-gitlab`, `pull-kube-agents-smoke-test-ghes`, `pull-kube-agents-smoke-test-gitlab-ce`, `post-kube-agents-eval-rc`                                                                                              |
+| `nightly.*`                   | `ci-kube-agents-eval-nightly`, `-main-b`, `-main-c`, `-main-d`, `-main-e`, `-gitlab`, `-writers`, `-writers-b`, `-writers-c`, `-gitlab-next`, `ci-kube-agents-eval-weekly-ghes-next`, `ci-kube-agents-eval-weekly-gitlab-ce-next`, `ci-kube-agents-certification-1` (5.9), `ci-kube-agents-eval-nightly-slack` |
+| `flash.*`                     | `pull-kube-agents-smoke-test-flash`                                                                                                                                                                                                                                                                            |
+| `alt.*`                       | `pull-kube-agents-smoke-test-alt`                                                                                                                                                                                                                                                                              |
 
 A lane reads its pair at the top of its script, before the image build, and stops on a
 missing or empty key; `hack/ci-deploy.sh` refuses a Prow job that arrives without the
@@ -616,6 +616,22 @@ explains each. Any edit to `hack/replay-proxy/normalizer.py` changes the cache's
 version, so a change that merges after the nightlies check out `main` (00:00 UTC) and before the
 lane does (06:00 UTC) leaves the lane nothing recorded under its version that morning: expect one
 red, cleared by the next night's recordings.
+
+### 5.12 The Slack lane's secrets
+
+The Slack lane's nightly, `ci-kube-agents-eval-nightly-slack` (`EVAL_SLACK_LANE=1`), reads its
+own secrets from the same project's Secret Manager. It runs as the nightly runner
+(`eval-baseline-recorder`), which needs `roles/secretmanager.secretAccessor` on each of them; a
+missing grant reads like a missing secret, and the deploy's log names which (`PERMISSION_DENIED` or
+`NOT_FOUND`). `hack/ci-deploy.sh` reads four to put Slack on the install through a dedicated eval
+Slack app: `slack-eval-bot-token` (`xoxb-`), `slack-eval-app-token` (`xapp-`),
+`slack-eval-channel-id` (the CI channel, made the home channel) and `slack-eval-test-user-id` (the
+test user's member id, put on the allowlist and on `operator.slackTestUsers`).
+`hack/slack-lane/run.sh` reads three to post as the test user: `slack-eval-user-token` (`xoxp-` or
+`xoxe.xoxp-`), `slack-eval-channel-id` and `slack-eval-bot-user-id`. With any of the deploy's four
+unreadable the install has no Slack and the lane skips; with any of the lane's three unreadable it
+logs one skip line. The eval app serves this lane alone, since Socket Mode splits an app's events
+across every install connected to it, and the test user is a dedicated account, never a person's.
 
 ## 6. The seeded dirty fleet
 

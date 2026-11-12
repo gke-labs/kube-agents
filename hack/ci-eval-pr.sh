@@ -4444,16 +4444,23 @@ EVAL_RECORDED_MANIFEST="${ARTIFACT_DIR}/baseline-recorded.jsonl"
 # ─── The Slack lane (EVAL_SLACK_LANE=1) ──────────────────────────────────────
 # ci-kube-agents-eval-nightly-slack runs hack/slack-lane/run.sh in place of the
 # matrix: each case in hack/slack-lane/cases.txt once, through real Slack
-# (AGENT_TRANSPORT=slack), with the environment exported above. The lane reads
-# its token, channel and bot id from Secret Manager itself and skips without
-# them; the deploy armed Slack (hack/ci-deploy.sh, 2a) on the same condition.
-# Advisory: whatever its cases did, the job reports green, and nothing here
-# records a baseline or a verdict. Its results and Slack timings land under
-# ${ARTIFACTS}/slack-lane.
+# (AGENT_TRANSPORT=slack), with the environment exported above. It runs only
+# when the installed PlatformAgent has Slack on, which the deploy sets only when
+# every one of its secrets read (hack/ci-deploy.sh, 2a); the lane reads its own
+# three (the test user's token, the channel, the bot's id) and skips without
+# them. Advisory: the lane's cases never red this job, and nothing here records
+# a baseline or a verdict; a failure in a step above still does. Its results and
+# Slack timings land under ${ARTIFACTS}/slack-lane.
 if [ "${EVAL_SLACK_LANE:-}" = "1" ]; then
   profile_begin "slack lane: hack/slack-lane/run.sh"
-  SLACK_LANE_ARTIFACTS="${ARTIFACTS:-/tmp/artifacts}/slack-lane" "${SCRIPT_DIR}/slack-lane/run.sh" || true
-  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Slack lane finished; it is advisory, so this job reports green whatever its cases did ==="
+  slack_lane_on="$(kubectl --context "${AGENT_CLUSTER_CONTEXT}" -n "${TARGET_NAMESPACE:-${NAMESPACE:-kubeagents-system}}" \
+    get platformagents -o jsonpath='{.items[0].spec.integration.slack.enabled}' 2>/dev/null || true)"
+  if [ "${slack_lane_on}" != "true" ]; then
+    echo "slack lane: skipped: the install has no Slack (the deploy's log says which slack-eval-* secret it could not read)"
+  else
+    SLACK_LANE_ARTIFACTS="${ARTIFACTS:-/tmp/artifacts}/slack-lane" "${SCRIPT_DIR}/slack-lane/run.sh" || true
+  fi
+  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Slack lane finished; its cases never red this job ==="
   exit 0
 fi
 
