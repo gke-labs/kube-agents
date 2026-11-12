@@ -23348,6 +23348,9 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
             with patch.object(audit_report, "AUTO_PROMOTE_FILE", switch):
                 self.assertEqual(self.run_finish(doc), 2)
                 self.assertIn("need their fix written before a `/remediate`", self.err)
+                # Writing the fix is not an ask to open it (#2953): a worker wrote three
+                # and then ran `remediate` on them.
+                self.assertIn("Writing a fix opens nothing", self.err)
                 self.assertNotIn("automatic pull request", self.err, "no sweep opens one on this install")
                 self.touch(doc["findings"][0]["remediation"]["path"])
                 self.assertEqual(self.run_finish(doc), 0, self.err)
@@ -29370,6 +29373,9 @@ class TestFinishManifestFlag(HarnessTestCase):
         self.assertIn("Read these before asking", body)
         self.assertIn(f"`{derived_id()}`", body)
         self.assertIn("the sweep will not open a pull request", self.err)
+        # Addressed to a person: the worker reads this line too (#2953).
+        self.assertIn("A person who has read it and wants one comments `/remediate", self.err)
+        self.assertIn("never you.", self.err)
 
     def test_a_triage_marked_critical_is_published_but_not_auto_promoted(self):
         self.promotion_replies()
