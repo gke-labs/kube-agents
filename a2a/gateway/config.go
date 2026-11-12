@@ -43,9 +43,10 @@ type backendArm struct {
 	armed func(*Config) bool
 }
 
-// backendArms lists the real chat backends in Backends' order. Adding a real
-// backend is one row here: Backends and the mux's direct-message refusal
-// (knownBackendName) both read it.
+// backendArms lists the real chat backends in Backends' order. Backends and
+// the mux's direct-message refusal (knownBackendName) both read it; the
+// adapter switch in cmd/gateway, the metrics platform labels and the people
+// reading each name their backends on their own.
 var backendArms = []backendArm{
 	{name: gchatBackend, armed: func(c *Config) bool { return c.GchatRelayURL != "" }},
 	{name: slackBackend, armed: func(c *Config) bool { return c.SlackBotToken != "" }},
@@ -702,8 +703,8 @@ type Config struct {
 	BusyNoticeAt int
 }
 
-// Backends lists every REAL chat backend this config arms, in the fixed
-// order gchat, slack, discord (BackendGchat, BackendSlack, BackendDiscord),
+// Backends lists every REAL chat backend this config arms, in backendArms'
+// order (gchat, slack, discord: BackendGchat, BackendSlack, BackendDiscord),
 // or nil when none is armed. The doors are not among the answers, for the
 // reason Backend gives.
 func (c *Config) Backends() []string {
