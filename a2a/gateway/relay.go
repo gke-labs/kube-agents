@@ -20,6 +20,11 @@ import (
 // discordChunk leaves headroom under Discord's 2000-char message cap.
 const discordChunk = 1900
 
+// lineDoneMark ends a completed task's live message on a backend that
+// answers on the line (LineAnswerer, doneTerminalLine): the glyph alone,
+// where the terminal edit elsewhere reads "✅ completed".
+const lineDoneMark = "✅"
+
 // progressCap bounds the progress text embedded in rolling lines and status
 // answers, so one artifact can't blow a chat edit past the backend cap.
 const progressCap = 300
@@ -42,7 +47,92 @@ const (
 	reasonPrefix         = "reason: "
 	reasonTokenCap       = 64 // the longest executor token today is 34 bytes
 	reasonTokenMalformed = "(malformed)"
+	// reasonDetailSeparator is what the executors put between the token
+	// and the detail.
+	reasonDetailSeparator = " - "
+	// reasonSessionMarker opens the session id an executor appends to a
+	// reason's detail for the operator; the user's reading stops before it.
+	reasonSessionMarker = "; session: "
 )
+
+// The notices a conversation reads when a task ends other than completed.
+// The user-facing text carries the executor's detail in plain words and
+// never the `reason:` prefix or the token (.agents/rules/chat_ux.md, "No
+// plumbing in user text" and "A failure is one plain line"). A reason in the
+// executors' shape is rendered as `<prefix> — <detail>`; one that is plain
+// text already (a supervisor's note) is rendered as `<prefix>: <text>`, as
+// it always was; an empty one is the bare line.
+const (
+	noticeFailed          = "❌ failed"
+	noticeFailedBare      = "❌ the task failed"
+	noticeCanceled        = "🛑 canceled"
+	noticeRejected        = "🚫 the executor rejected the task"
+	noticeDetailSeparator = " — "
+	noticePlainSeparator  = ": "
+)
+
+// reasonSentences is the person's reading of each failure token the
+// executors, the dispatcher and the gateway write whose detail is written
+// for an operator (an HTTP status, a session id, a body or stderr tail, a
+// Go error, a pod or profile name): one plain line per token, shown in the
+// detail's place. "Ask again" is said only where the fault is transient;
+// a fault that repeats is for the operator. A token in neither this map
+// nor reasonDetailShown reads as the bare notice, so a token added later
+// leaks nothing until someone writes its line.
+var reasonSentences = map[string]string{
+	// The agent did not get to run the request.
+	"bridge-shutdown":                    "the agent was restarted while it worked on this; ask again",
+	"bridge-queue-overflow":              "the agent had too many requests waiting; ask again in a moment",
+	"bus-publish-failed":                 "the agent could not send its update over the message bus",
+	"bus-subscribe-failed":               "the agent could not listen on the message bus",
+	"spawn-failed":                       "the agent could not be started",
+	"bridge-died-without-terminal-event": "the agent stopped without reporting a result; ask again",
+	"worker-evicted":                     "the agent's worker was restarted before it finished; ask again",
+	"session-busy":                       "the agent was still busy with an earlier request when time ran out; ask again",
+	"hermes-rate-limited":                "the agent's server or the model provider is rate-limiting requests; ask again in a few minutes",
+	"hermes-api-unreachable":             "the agent's server did not answer; ask again",
+	"hermes-api-refused":                 "the agent's server refused the request before it ran",
+	"request-encode-failed":              "the request could not be prepared for the agent",
+	"request-build-failed":               "the request could not be prepared for the agent",
+	"harness-config-failed":              "the agent's worker could not be configured",
+	"harness-settings-failed":            "the agent's worker could not be configured",
+	"delegate-socket-failed":             "the agent's worker could not open its delegation channel",
+	"no-worker":                          "no worker on this install can run this request",
+	"tier-not-allowed":                   "this agent is not allowed to run requests of this kind",
+	"lease-expired":                      "the worker that took this request stopped responding; ask again",
+	// The agent ran and produced no answer.
+	"hermes-exited-nonzero":         "the agent stopped with an error before it answered",
+	"stream-ended-without-result":   "the agent stopped before it produced an answer",
+	"deadline-exceeded":             "the task ran out of time before it finished; ask again with a smaller task",
+	"hermes-api-failed":             "the agent's server reported an error during the turn",
+	"hermes-api-unreadable":         "the agent's server sent an answer that could not be read",
+	"hermes-api-read-failed":        "the agent's answer broke off before it arrived; ask again",
+	"hermes-api-oversize":           "the agent's answer was too large to relay; ask for a shorter answer",
+	"hermes-cli-oversize":           "the agent's output was too large to relay; ask for a shorter answer",
+	"hermes-unstructured-reasoning": "the agent's reply was its thinking, not an answer; whatever it did this turn already happened, so check that before you ask again",
+	"card-stop-unavailable":         "the agent could not reach its board to stop the cards",
+	"card-stop-unsupported":         "this agent runs no cards, so there was nothing to stop",
+	// The worker adapter passes the harness's own result subtype through as the token.
+	"error_max_turns":        "the agent used up its turns before it answered; ask again with a smaller task",
+	"error_during_execution": "the agent hit an error while it worked and produced no answer",
+	// A delegation the gateway could not carry through.
+	"delegation-refused": "the agent could not hand this to another agent",
+	"wake-not-started":   "the agent could not pick the delegated work back up",
+	// The refusals both executors publish before a task runs.
+	"no-text-parts": "the request carried no text",
+}
+
+// reasonDetailShown names the tokens whose detail is written for the
+// person: the verifier's rule (capability.Reason), the dispatcher's
+// admission wording, a delegation's own why. That detail is shown, cut
+// before any session id (reasonSessionMarker).
+var reasonDetailShown = map[string]bool{
+	"capability-refused":     true,
+	"verifier-refused":       true,
+	"parameters-invalid":     true,
+	"queue-timeout":          true,
+	"delegation-not-started": true,
+}
 
 // KV access rides withRetry with these shapes: enough to ride out a
 // connection rebuild window without inventing a second resilience layer,
@@ -642,24 +732,62 @@ func (g *Gateway) applyArtifact(ctx context.Context, rec *SessionRecord, rs *rel
 const completedNonTextResult = "(completed with a non-text result; see the stream)"
 
 // terminalNotice is the line a conversation is told when a task ends other
-// than completed, with the executor's reason when it gave one: the relay's
-// notice, and the text of a console conversation's terminal frame.
+// than completed, with the executor's reason in plain words when it gave
+// one (reasonInPlainWords): the relay's notice, and the text of a console
+// conversation's terminal frame.
 func terminalNotice(state lib.TaskState, reason string) string {
+	text, shaped := reasonInPlainWords(reason)
 	switch state {
 	case lib.StateFailed:
-		if reason != "" {
-			return "❌ failed: " + reason
-		}
-		return "❌ the task failed"
+		return noticeWithReason(noticeFailed, noticeFailedBare, text, shaped)
 	case lib.StateCanceled:
-		return "🛑 canceled"
+		return noticeCanceled
 	case lib.StateRejected:
-		if reason != "" {
-			return "🚫 the executor rejected the task: " + reason
-		}
-		return "🚫 the executor rejected the task"
+		return noticeWithReason(noticeRejected, noticeRejected, text, shaped)
 	}
 	return string(state)
+}
+
+// noticeWithReason joins a notice's prefix to the reason's text: bare when
+// there is none, after a dash when it came out of the executors' shape, and
+// after a colon when it was plain text already.
+func noticeWithReason(prefix, bare, text string, shaped bool) string {
+	switch {
+	case text == "":
+		return bare
+	case shaped:
+		return prefix + noticeDetailSeparator + text
+	}
+	return prefix + noticePlainSeparator + text
+}
+
+// reasonInPlainWords is the user's reading of a terminal reason, and whether
+// the reason was in the executors' `reason: <token>[ - detail]` shape. In
+// that shape a token in reasonSentences reads as its sentence whatever
+// detail follows it; a token in reasonDetailShown reads as its detail, cut
+// before the session id an executor appends (reasonSessionMarker); any
+// other token reads as nothing, so the notice is the bare line and a token
+// nobody has written a line for leaks no plumbing. A reason outside the
+// shape is plain text already and is returned as it is.
+func reasonInPlainWords(reason string) (string, bool) {
+	rest, ok := strings.CutPrefix(reason, reasonPrefix)
+	if !ok {
+		return reason, false
+	}
+	token := reasonToken(reason)
+	if sentence, known := reasonSentences[token]; known {
+		return sentence, true
+	}
+	if !reasonDetailShown[token] {
+		return "", true
+	}
+	if _, detail, found := strings.Cut(rest, reasonDetailSeparator); found {
+		detail, _, _ = strings.Cut(detail, reasonSessionMarker)
+		if detail = strings.TrimSpace(detail); detail != "" {
+			return detail, true
+		}
+	}
+	return "", true
 }
 
 // relayTerminal posts the deliverable (or the failure), releases the
@@ -766,6 +894,12 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		rec.markCardsAnswer(taskID)
 	}
 
+	// doneLine is the task's live message on a backend that answers on the
+	// line (LineAnswerer): a hand-off acknowledgement is edited onto it
+	// (answerOnLine), which sets lineAnswered so the terminal edit below
+	// leaves it be, and any other completed task ends it as lineDoneMark.
+	doneLine := g.answerLineFor(rec, taskID)
+	lineAnswered := false
 	switch s.Status.State {
 	case lib.StateCompleted:
 		// Whole, to the adapter whose caller is a program, before the chunked
@@ -802,6 +936,15 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		if !isConsoleConversation(rec.Key) {
 			if ref.TerminalObserved && result == completedNonTextResult {
 				// The heal already posted the status card; skip completedNonTextResult.
+			} else if doneLine != "" && toCards && result != completedNonTextResult {
+				// The task's live message becomes the acknowledgement,
+				// and takes no terminal edit below (LineAnswerer); an
+				// edit that does not land posts it instead. An answer
+				// posts, so it notifies: a Chat edit raises none, and
+				// the acknowledgement is followed by the plan and the
+				// report, which do. The stand-in for a non-text result is
+				// a notice, not an answer, and posts.
+				lineAnswered = g.answerOnLine(rec.Key, doneLine, answer)
 			} else {
 				g.postMessage(rec.Key, answer)
 			}
@@ -837,14 +980,14 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	g.terminalMark(rec, taskID, s.Status.State, terminal)
 
 	if active := rec.ActiveTask; active != nil && active.TaskID == taskID {
-		if active.StatusMsgID != "" {
+		if active.StatusMsgID != "" && !lineAnswered {
 			// The same display gate as the rolling line: under default the
 			// terminal edit carries the state and never the narration.
 			progress := rs.progress
 			if g.cfg.DisplayMode == displayModeDefault {
 				progress = ""
 			}
-			g.renderLine(rec.Key, active.StatusMsgID, withLineNote(terminalLine(s.Status.State, progress), active.LineNote), rs, "")
+			g.renderLine(rec.Key, active.StatusMsgID, withLineNote(doneTerminalLine(s.Status.State, progress, doneLine != ""), active.LineNote), rs, "")
 		}
 		unmarkOnSupervisorTerminal(rec, taskID, source)
 		rec.ActiveTask = nil
@@ -872,11 +1015,13 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		// that kept it. Its answer ("delegated to platform") is task
 		// activity for the session-thread rule all the same; LastActivity
 		// stays the active task's business.
-		progress := rs.progress
-		if g.cfg.DisplayMode == displayModeDefault {
-			progress = ""
+		if !lineAnswered {
+			progress := rs.progress
+			if g.cfg.DisplayMode == displayModeDefault {
+				progress = ""
+			}
+			g.renderLine(rec.Key, parent.StatusMsgID, doneTerminalLine(s.Status.State, progress, doneLine != ""), rs, "")
 		}
-		g.renderLine(rec.Key, parent.StatusMsgID, terminalLine(s.Status.State, progress), rs, "")
 		setParentLine(rec, taskID, "")
 		if source == TerminalFromExecutor {
 			rec.LastTaskActivity = time.Now().UTC()
@@ -905,7 +1050,9 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	// the worker adapter write `reason: <token>[ - detail]` there, and a
 	// program classifying a failed terminal reads the token. Passed through
 	// rather than parsed here, because the tokens are the executors'
-	// definitions and the gateway has no business knowing them.
+	// definitions and a program grading off the door keys on them; only the
+	// notice the conversation read (terminalNotice) puts the reason in plain
+	// words.
 	reason := ""
 	if s.Status.Message != nil {
 		reason = joinTextParts(s.Status.Message.Parts)
@@ -1183,6 +1330,17 @@ func statusLine(state lib.TaskState, progress string) string {
 		line += " — " + progress
 	}
 	return line
+}
+
+// doneTerminalLine is terminalLine, or on a backend that answers on the
+// line (onLine) the bare lineDoneMark for a completed task: its answer has
+// posted, and the line ends as the ask's reaction comes off on Slack,
+// rather than reading as a verdict under the question.
+func doneTerminalLine(state lib.TaskState, progress string, onLine bool) string {
+	if onLine && state == lib.StateCompleted {
+		return lineDoneMark
+	}
+	return terminalLine(state, progress)
 }
 
 func terminalLine(state lib.TaskState, progress string) string {

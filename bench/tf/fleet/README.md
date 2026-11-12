@@ -56,7 +56,15 @@ reason, reviewed in the pull request that needs it and removed by its follow-up;
 pool's replace on a minor roll, the scaled-zero gateway's status writer and seeded-a's ConfigConnector writer are the three standing ones). Its two Prow
 entries in `oss-test-infra` run `main` only: a postsubmit on every merge that changes the stack's files
 here, and a daily pass at 08:30 UTC (`docs/ci-pool-projects.md` §6.2, which says which files, and states
-the rule for a fixture pull request and for proving a branch on one leased project). A hand
+the rule for a fixture pull request and for proving a branch on one leased project). After each
+project whose state it read, whatever the plan outcome, the script also resets the `startup-fail` VM
+(`gcloud compute instances reset`, on the one instance the state records at
+`google_compute_instance.startup_fail`), so the guest prints the startup-script failure line again:
+it prints it once per boot, and the serial buffer of about 1 MiB rotates it out within about three
+weeks. A state read that fails is recorded as `startup_fail_reset` with result `failed`, and no reset
+is tried; an interrupted project is not reset. A reset that fails is a warning on that project's
+outcome, not a failure;
+`--no-fixture-refresh` turns it off. A hand
 run goes through the script too (`--project <id>`), never `tofu apply` from a branch, and
 never from a laptop while a run holds the project. The four hand recoveries (`seeded_b`'s
 cluster, a targeted destroy; `inventory_api`, a replace; `-replace=terraform_data.scaled_zero_status`,
@@ -198,12 +206,12 @@ is not fully assertable on the day it is applied. Recreating a fixture restarts 
 clock — `creationTimestamp` is server-set and immutable, so backdating is impossible;
 do not try.
 
-| Day  | What becomes detectable                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| ---- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| D0   | RBAC over-grant, missing PDB, OOM crashloop, stockout, the six ComputeClass roles on slot c, version lag, deprecated-API caller (its first-run Job completes inside the apply, so the audit trail starts on apply day), the four upgrade-readiness drain defects, the CapacityBuffer-gating webhook on slot b, the eleven upgrade-failure shapes (ten in `seeded-shapes`, one in `seeded-defaults`), the three zonal-skew fixtures, the `startup-fail` VM (its script fails on every boot, from the first), the world-open firewall rule |
-| D+1  | The drift outlier, and the hourly scan's hold on the pool-level outlier (`drift-pool-outlier`), which no facet reads until the `boot-disk` and `kubelet-config` facets land. The drift SOP excludes a cluster whose `createTime` is under 24 hours old "from every cohort" (§1), so on apply day the `(standard, seeded)` cohort has zero members, and §2.4's floor ("a cohort of fewer than **3** clusters produces no findings, ever") would floor it out with any two of the four still new                                           |
-| D+7  | `idle-batch-pool` (the idle-nodepool check refuses pools created under 7 days ago)                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| D+30 | `orphan-pd-*` (the unattached-disk collector filters `creationTimestamp<-P30D` server-side)                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| Day  | What becomes detectable                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| ---- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| D0   | RBAC over-grant, missing PDB, OOM crashloop, stockout, the six ComputeClass roles on slot c, version lag, deprecated-API caller (its first-run Job completes inside the apply, so the audit trail starts on apply day), the four upgrade-readiness drain defects, the CapacityBuffer-gating webhook on slot b, the eleven upgrade-failure shapes (ten in `seeded-shapes`, one in `seeded-defaults`), the three zonal-skew fixtures, the `startup-fail` VM (fails each boot; each reconcile resets it), the world-open firewall rule |
+| D+1  | The drift outlier, and the hourly scan's hold on the pool-level outlier (`drift-pool-outlier`), which no facet reads until the `boot-disk` and `kubelet-config` facets land. The drift SOP excludes a cluster whose `createTime` is under 24 hours old "from every cohort" (§1), so on apply day the `(standard, seeded)` cohort has zero members, and §2.4's floor ("a cohort of fewer than **3** clusters produces no findings, ever") would floor it out with any two of the four still new                                      |
+| D+7  | `idle-batch-pool` (the idle-nodepool check refuses pools created under 7 days ago)                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| D+30 | `orphan-pd-*` (the unattached-disk collector filters `creationTimestamp<-P30D` server-side)                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 
 So `consistency-drift-outlier` must stay dormant until D+1, and `fleet-cost-idle-pool`
 until D+30, when both of its fixtures are visible.
@@ -368,7 +376,10 @@ The chain, end to end:
    on its own. A project-scoped role's probes are `<kind>/<name-prefix>*`
    (`instance/startup-fail-*`): the runner lists them in the project with
    `gcloud compute ... list`, publishes the role as `<role>.confirmed` with no
-   kubeconfig, and the state pass reads them the same way.
+   kubeconfig, and the state pass reads them the same way. The `startup-fail-vm` role also
+   asserts that the VM's serial port 1 output still holds the failure line
+   (`serial_contains`, read with `gcloud compute instances get-serial-port-output`), so a
+   buffer that has rotated past the boot reads as drift, not as a healthy fixture.
 3. A check in a `task.yaml` uses the `fleet_resource_property` verifier and names
    `fixture_role: crashloop-workload`.
 4. `kube_agents_bench.fleet.kubeconfig_for_role` turns the role into that path, and the

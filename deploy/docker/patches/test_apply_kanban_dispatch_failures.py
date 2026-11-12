@@ -30,6 +30,7 @@ DISPATCHER_STUB = '''"""Embedded kanban dispatcher."""
 from __future__ import annotations
 
 import contextlib
+import os
 import time
 from dataclasses import asdict, dataclass
 from typing import Any, Optional
@@ -73,6 +74,42 @@ class _Dispatcher:
             if conn is not None:
                 with contextlib.suppress(Exception):
                     conn.close()
+
+    def _board_slugs(self):
+        return ["default"]
+
+    def ready_nonempty(self) -> bool:
+        kbd = _kbd()
+        for slug in self._board_slugs():
+            conn = None
+            try:
+                conn = _kbc().connect(board=slug)
+                if kbd.has_spawnable_ready(conn):
+                    return True
+            except Exception:
+                continue
+            finally:
+                if conn is not None:
+                    with contextlib.suppress(Exception):
+                        conn.close()
+        return False
+
+    def auto_decompose_tick(self, auto_decompose_per_tick: int) -> int:
+        with contextlib.nullcontext():
+            for slug in self._board_slugs():
+                prev_env = os.environ.get("HERMES_KANBAN_BOARD")
+                try:
+                    os.environ["HERMES_KANBAN_BOARD"] = slug
+                    try:
+                        triage_ids = []
+                    except Exception as exc:
+                        triage_ids = []
+                finally:
+                    if prev_env is None:
+                        os.environ.pop("HERMES_KANBAN_BOARD", None)
+                    else:
+                        os.environ["HERMES_KANBAN_BOARD"] = prev_env
+        return 0
 '''
 
 
@@ -110,6 +147,12 @@ class ApplierTest(unittest.TestCase):
         self.assertEqual(1, source.count("_kage_dispatch_failures.record_tick(slug, exc)"))
         # The failure is recorded after the corrupt-board branch has returned.
         self.assertLess(source.index("is_corrupt_board_db_error(exc)"), source.index("record_tick(slug, exc)"))
+        # The tick's start comes before connect(), and its end opens the finally block.
+        self.assertLess(source.index("record_tick_start(slug)"), source.index("_kbc().connect(board=slug)"))
+        self.assertIn("finally:\n            _kage_dispatch_failures.record_tick_end(slug)", source)
+        # The ready probe and auto-decompose mark their per-board connects as tries too.
+        self.assertEqual(3, source.count("_kage_dispatch_failures.record_tick_start(slug)"))
+        self.assertEqual(3, source.count("_kage_dispatch_failures.record_tick_end(slug)"))
         compile(source, str(self.dispatcher), "exec")
 
     def test_a_patched_tree_is_refused(self):
@@ -142,7 +185,12 @@ class PatchedTickTest(unittest.TestCase):
             applier.apply(root)
         self.recorded = []
         self.outcome = None
-        helper = _module("gateway.kanban_dispatch_failures", record_tick=lambda board, exc=None: self.recorded.append((board, type(exc).__name__ if exc else None)))
+        helper = _module(
+            "gateway.kanban_dispatch_failures",
+            record_tick=lambda board, exc=None: self.recorded.append((board, type(exc).__name__ if exc else None)),
+            record_tick_start=lambda board: self.recorded.append(("start", board)),
+            record_tick_end=lambda board: self.recorded.append(("end", board)),
+        )
         common = _module("gateway.kanban_watchers_common", _board_slugs=None, _positive_int_setting=None, logger=logging.getLogger("dispatcher-under-test"))
         gateway = _module("gateway", kanban_dispatch_failures=helper, kanban_watchers_common=common)
         conn = SimpleNamespace(close=lambda: None)
@@ -173,19 +221,30 @@ class PatchedTickTest(unittest.TestCase):
     def test_a_good_tick_is_recorded_and_its_result_returned(self):
         self.outcome = "spawned"
         self.assertEqual("spawned", self.dispatcher.tick_once_for_board("default"))
-        self.assertEqual([("default", None)], self.recorded)
+        self.assertEqual([("start", "default"), ("default", None), ("end", "default")], self.recorded)
 
     def test_a_failed_tick_is_recorded_with_its_class(self):
         self.outcome = OSError("disk I/O error")
         with self.assertLogs("dispatcher-under-test", level=logging.ERROR):
             self.assertIsNone(self.dispatcher.tick_once_for_board("default"))
-        self.assertEqual([("default", "OSError")], self.recorded)
+        self.assertEqual([("start", "default"), ("default", "OSError"), ("end", "default")], self.recorded)
 
-    def test_the_corrupt_board_branch_records_nothing(self):
+    def test_the_ready_probe_on_a_locked_board_is_a_try_with_no_failure(self):
+        self.outcome = OSError("database is locked")
+        connect = sys.modules["hermes_cli.kanban_db_connect"]
+        with mock.patch.object(connect, "connect", side_effect=OSError("database is locked")):
+            self.assertFalse(self.dispatcher.ready_nonempty())
+        self.assertEqual([("start", "default"), ("end", "default")], self.recorded)
+
+    def test_auto_decompose_marks_its_board_as_tried(self):
+        self.dispatcher.auto_decompose_tick(3)
+        self.assertEqual([("start", "default"), ("end", "default")], self.recorded)
+
+    def test_the_corrupt_board_branch_records_no_failure_and_ends_its_tick(self):
         self.outcome = ValueError("database disk image is malformed")
         with self.assertLogs("dispatcher-under-test", level=logging.ERROR):
             self.assertIsNone(self.dispatcher.tick_once_for_board("default"))
-        self.assertEqual([], self.recorded)
+        self.assertEqual([("start", "default"), ("end", "default")], self.recorded)
 
 
 class HelperTest(unittest.TestCase):
@@ -213,6 +272,14 @@ class HelperTest(unittest.TestCase):
             self.helper.record_tick("default", OSError("disk I/O error"))
             self.helper.record_tick("default")
         self.assertEqual([mock.call("default", "OSError"), mock.call("default", "")], registry.record_dispatch_tick.call_args_list)
+
+    def test_a_ticks_start_and_end_reach_the_registry(self):
+        registry = mock.Mock()
+        with self._with_registry(registry):
+            self.helper.record_tick_start("default")
+            self.helper.record_tick_end("default")
+        registry.record_dispatch_tick_start.assert_called_once_with("default")
+        registry.record_dispatch_tick_end.assert_called_once_with("default")
 
     def test_a_gateway_without_the_plugin_records_nothing(self):
         temp = tempfile.TemporaryDirectory()

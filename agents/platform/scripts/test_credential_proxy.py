@@ -37,6 +37,7 @@ import credential_proxy_client
 import feedback_broker
 import gke_endpoint
 import providers
+import scope_exclude
 import vcs_broker
 from credential_proxy import (
     MAX_REPOSITORY_LENGTH,
@@ -5805,6 +5806,22 @@ class CommandExecutorTest(unittest.TestCase):
                 self.assertLess(time.monotonic() - started, 10)
                 self.assertGreaterEqual(len(asked), 2)
 
+    def test_a_child_that_exits_just_after_closing_its_pipes_is_reaped_at_once(self):
+        # #5540: a child closes its pipes a moment before it can be reaped.
+        # This one closes both, then exits 50 ms later, so the first look
+        # always misses; one look then a PIPES_CLOSED_POLL_SECONDS sleep cost
+        # half a second here, the short reap poll costs about the 50 ms.
+        process = subprocess.Popen(
+            ["sh", "-c", "exec >&- 2>&-; sleep 0.05"], stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+        )
+        started = time.monotonic()
+        captured = credential_proxy._capture_output(process, None, 1 << 16, 30)
+        elapsed = time.monotonic() - started
+        self.assertEqual(0, process.returncode)
+        self.assertFalse(captured.timed_out)
+        self.assertLess(elapsed, credential_proxy.PIPES_CLOSED_POLL_SECONDS / 2)
+
     def test_a_hang_up_after_the_pipes_close_still_ends_the_command(self):
         # With both pipes closed the read loop has nothing to watch, so the
         # wait that follows has to look at the caller itself, or a hang-up in
@@ -11095,6 +11112,29 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
     def test_serve_arms_the_gate_by_default(self):
         CredentialProxyHandler.enforce_read_only = False
         self.assertTrue(self._serve_with(None))
+
+    def test_serve_turns_gcloud_file_logging_off_in_the_exec_role_only(self):
+        # An exec pod's state volume is sized for no gcloud log files; the
+        # broker and the sidecar roles keep gcloud's default.
+        for role, off in (
+            (credential_proxy_client.EXEC_ROLE, True),
+            ("broker", False),
+            ("combined", False),
+        ):
+            with self.subTest(role=role):
+                self._serve_with(None, extra_env={"CREDENTIAL_PROXY_ROLE": role})
+                env = CredentialProxyHandler.executor.environment
+                self.assertEqual(
+                    "1" if off else None, env.get(credential_proxy.GCLOUD_FILE_LOGGING_OFF_ENV)
+                )
+
+    def test_serve_gives_only_the_exec_role_the_kubectl_cache_reclaimer(self):
+        for role, wired in ((credential_proxy_client.EXEC_ROLE, True), ("broker", False)):
+            with self.subTest(role=role):
+                self._serve_with(None, extra_env={"CREDENTIAL_PROXY_ROLE": role})
+                executor = CredentialProxyHandler.executor
+                reclaimers = CredentialProxyHandler.watermark_gate._reclaimers
+                self.assertEqual(wired, executor.reclaim_kubectl_cache in reclaimers)
 
     def test_serve_hands_the_executor_the_container_limit(self):
         # The derivation runs in `serve`, not in the executor, so a test that
@@ -18672,6 +18712,56 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
         status, headers, body = self._request(*args, **kwargs)
         return status, headers, json.loads(body)
 
+    def _exclude(self, project, location, cluster):
+        """Point the handler's exclusions at a scope file that excludes one cluster."""
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        scope = directory / "scope.json"
+        scope.write_text(json.dumps({"exclude": {"clusters": [
+            {"projectId": project, "location": location, "clusterName": cluster}]}}), encoding="utf-8")
+        self.addCleanup(
+            self._restore, "exclusions", "exclusions" in CredentialProxyHandler.__dict__,
+            CredentialProxyHandler.__dict__.get("exclusions"),
+        )
+        CredentialProxyHandler.exclusions = scope_exclude.Exclusions(path=lambda: str(scope))
+
+    EXCLUDABLE_GET = "/v1/gcp/container.googleapis.com/v1/projects/acme-prod/locations/us-central1/clusters/{name}"
+    CHECK_HEADERS = {credential_proxy.GET_CREDENTIALS_CHECK_HEADER: "1"}
+
+    def test_the_get_credentials_check_is_refused_for_an_excluded_cluster(self):
+        # The shim then sends get-credentials to /v1/exec, whose own
+        # excluded-cluster refusal answers (#5305); nothing reaches GKE here.
+        self._exclude("acme-prod", "us-central1", "secret-cluster")
+        self.reply["body"] = b'{"name":"secret-cluster","location":"us-central1","status":"RUNNING"}'
+        status, _, body = self._json_request(self.EXCLUDABLE_GET.format(name="secret-cluster"), headers=self.CHECK_HEADERS)
+        self.assertEqual(403, status)
+        self.assertEqual(scope_exclude.RULE_EXCLUDED_CLUSTER, body["rule"])
+        self.assertEqual([], self.upstream_requests)
+
+    def test_without_the_check_header_an_excluded_clusters_read_is_unchanged(self):
+        # #5305 keeps control-plane reads allowed: the reconcile's existence
+        # check sends no header and is answered as before.
+        self._exclude("acme-prod", "us-central1", "secret-cluster")
+        self.reply["body"] = b'{"name":"secret-cluster","location":"us-central1","status":"RUNNING"}'
+        status, _, _ = self._request(self.EXCLUDABLE_GET.format(name="secret-cluster"))
+        self.assertEqual(200, status)
+        self.assertEqual(1, len(self.upstream_requests))
+
+    def test_the_check_header_leaves_a_cluster_that_is_not_excluded_alone(self):
+        self._exclude("acme-prod", "us-central1", "secret-cluster")
+        self.reply["body"] = b'{"name":"ka-a","location":"us-central1","status":"RUNNING"}'
+        status, _, _ = self._request(self.EXCLUDABLE_GET.format(name="ka-a"), headers=self.CHECK_HEADERS)
+        self.assertEqual(200, status)
+        self.assertEqual(1, len(self.upstream_requests))
+        # The header is the broker's to read, not the upstream's: the relay
+        # sends exactly its own two headers.
+        self.assertNotIn(credential_proxy.GET_CREDENTIALS_CHECK_HEADER, self.upstream_requests[0][1])
+
+    def test_the_shim_and_the_broker_name_the_check_header_alike(self):
+        self.assertEqual(
+            credential_proxy_client.GET_CREDENTIALS_CHECK_HEADER, credential_proxy.GET_CREDENTIALS_CHECK_HEADER
+        )
+
     def test_a_get_carrying_a_body_on_a_direct_write_route_announces_its_close(self):
         # The passthrough and the MCP 405 write their response without _json.
         # A GET drains nothing, so a body on it is unread when the response is
@@ -19546,6 +19636,14 @@ class KubeProxyClientTest(unittest.TestCase):
                     credential_proxy_client,
                     "open_broker_request",
                     return_value=contextlib.nullcontext(fake_resp),
+                ),
+                # This argv names its cluster in full, which the shim answers
+                # itself with the kube-api proxy in use (#5447); this test is
+                # the broker answer's path.
+                mock.patch.object(
+                    credential_proxy_client,
+                    "answer_get_credentials_locally",
+                    return_value=None,
                 ),
             ):
                 rc = credential_proxy_client.execute(

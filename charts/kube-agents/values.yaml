@@ -170,6 +170,14 @@ operator:
   # "MCP server" reference page.
   mcpServer:
     enabled: false
+  # Slack member ids of end-to-end test users, meant for CI and eval installs;
+  # integration.slack.allowedUsers is still the gate on who is served.
+  # A post such a user makes with a user token through an app carries the
+  # app's bot_id, which the A2A gateway otherwise drops as bot traffic; from a
+  # listed member it is read as theirs. The allowlist still has to admit them.
+  # Rendered as the operator's A2A_SLACK_TEST_USERS, which it hands the
+  # gateway; an A2A_SLACK_TEST_USERS entry in extraEnv wins.
+  slackTestUsers: []
   # The manager's own metrics listener, port 8080, plain HTTP on the pod
   # network: controller-runtime's series plus the operator's view of every
   # PlatformAgent, status.usage and status.phase as three gauge families
@@ -239,8 +247,8 @@ operator:
   # were. What stays: Deployments, StatefulSets,
   # Services, ServiceAccounts, ConfigMaps, PersistentVolumeClaims,
   # NetworkPolicies and PodDisruptionBudgets; ClusterRoles,
-  # ClusterRoleBindings, Roles and RoleBindings; and the three custom
-  # resources themselves (PlatformAgent always, AgentPlugin and AgentProfile
+  # ClusterRoleBindings, Roles and RoleBindings; and the custom resources
+  # themselves (PlatformAgent always, AgentPlugin, AgentProfile and Tier
   # where their CRDs are installed). Deployments, StatefulSets, Services and
   # PersistentVolumeClaims grow with the cluster's workloads, a Deployment
   # carrying a whole pod template, so a cluster with thousands of them is the
@@ -1292,6 +1300,13 @@ platformAgent:
       # maxSessions caps the A2A session pods a "next" install runs at once;
       # the operator's default applies when it is unset, and "today" ignores it.
       # maxSessions: 10
+      # busReplicas is how many NATS servers run a "next" install's bus: 3 runs a
+      # cluster with R3 streams that rides out a node drain, 1 a single server
+      # that is down for each pod restart. A cluster needs three nodes; set 1 on a
+      # cluster that cannot have them (kind, a one-node Standard pool), before the
+      # first install: an existing bus keeps its count, and a different value is
+      # refused rather than converting it.
+      # busReplicas: 3
       # admission is the memory admission the kanban dispatcher applies to its
       # own workers, board-wide: past the budget it refuses a card rather than
       # spawn a worker, blocking the card with kind "capacity" and telling its
@@ -1812,10 +1827,8 @@ platformAgent:
     #
     # forges:
     #   - name: github            # what repositories[].forge refers to
-    #     provider: github        # github (default), gitlab, or gitea; required when host is not github.com
-    #                             # (bitbucket and bitbucket-datacenter forges are declared on the
-    #                             # PlatformAgent resource's spec.integration.forges; the chart does
-    #                             # not render them yet)
+    #     provider: github        # github (default), gitlab, gitea, bitbucket (Cloud) or
+    #                             # bitbucket-datacenter; required when host is not github.com
     #     host: ""                # empty is the provider's default (github.com), or a GitHub Enterprise
     #                             # Server hostname; required for gitea, which has none
     #     scheme: https           # https (default); http only for gitea on an
@@ -1835,6 +1848,22 @@ platformAgent:
     #       key: ca.crt           # created out of band; the broker trusts it for this host only. On a
     #                             # GitHub Enterprise Server forge, the token minter also gets it and trusts
     #                             # it for all of its calls
+    #   - name: bitbucket
+    #     provider: bitbucket     # Bitbucket Cloud, at bitbucket.org only: no host, port or caBundleRef
+    #     namespace: my-workspace # the workspace ID
+    #     credentialsRef:         # required: a Secret with the token under `token`, and an optional
+    #       name: bitbucket-forge-token # read-only token for context repositories under `read-token`
+    #     identity: ""            # only for a workspace, project or repository access token: the
+    #                             # account UUID that token acts as, from the author of a pull
+    #                             # request it opened. An API token names its own account
+    #   - name: bitbucket-dc
+    #     provider: bitbucket-datacenter
+    #     host: bitbucket.example.com # required; served at the root path on port 443
+    #     namespace: INFRA        # the project key
+    #     credentialsRef:         # required: a Secret with a project HTTP access token under `token`
+    #       name: bitbucket-dc-token
+    #     caBundleRef:            # optional: the private CA that signed the instance's certificate
+    #       name: bitbucket-dc-ca
     forges: []
     # repositories:
     #   - forge: github

@@ -259,6 +259,11 @@ type SlackAdapter struct {
 	// as "T…:U…" entries (SetAllowedGuests). foreignSender admits exactly
 	// these; set before Run, read-only after.
 	guests map[string]bool
+	// testUsers are the end-to-end test users' member ids (SetTestUsers),
+	// whose app-attributed posts are read as theirs; set before Run,
+	// read-only after. Meant for CI and eval installs; the allowlist still
+	// decides who is served.
+	testUsers map[string]bool
 
 	// sessionsAPI drives Agent Sessions (slack_sessions.go); nil in a test
 	// that does not fake it, which then sends no status. sessionStates holds
@@ -1367,6 +1372,25 @@ func (s *SlackAdapter) connected(auth *slack.AuthTestResponse) {
 	}
 }
 
+// SetTestUsers takes the end-to-end test users' member ids (Config.SlackTestUsers).
+// A message from one of them that carries an app's bot_id, as a post with a
+// user token through an app does, is read as the member's rather than dropped
+// as bot traffic; nothing else about it changes, so the allowlist, the
+// foreign-workspace refusal and the dedupe still apply, and the bot's own
+// member id is refused whatever the list says. Call before Run.
+func (s *SlackAdapter) SetTestUsers(ids []string) {
+	s.testUsers = map[string]bool{}
+	for _, id := range ids {
+		if id = strings.TrimSpace(id); id != "" {
+			s.testUsers[id] = true
+		}
+	}
+	if len(s.testUsers) > 0 {
+		s.log.Warn("slack: end-to-end test users' app-attributed posts are read as theirs; this belongs on CI and eval installs only",
+			"testUsers", len(s.testUsers))
+	}
+}
+
 // SetAllowedGuests takes the Slack allowlist (integration.slack.allowedUsers)
 // and keeps its team-qualified entries, "T…:U…": the members of other
 // workspaces this install serves in a Slack Connect channel. A plain "U…"
@@ -1561,9 +1585,19 @@ func slackParentUserID(payload json.RawMessage) string {
 // inboundEvent is inbound with the thread root's author, when the event
 // carried one (slackParentUserID).
 func (s *SlackAdapter) inboundEvent(ctx context.Context, m *slackevents.MessageEvent, parentUserID string) (InboundMessage, bool) {
-	if !slackTurnSubtypes[m.SubType] || m.BotID != "" || m.User == "" || m.User == s.botUserID ||
+	if !slackTurnSubtypes[m.SubType] || m.User == "" || m.User == s.botUserID ||
 		m.Channel == "" || m.TimeStamp == "" {
 		return InboundMessage{}, false
+	}
+	if m.BotID != "" {
+		if !s.testUsers[m.User] {
+			return InboundMessage{}, false
+		}
+		// A listed test user's post through their driver app: Slack attributes
+		// it to the app (bot_id), and it is read as the member's own. Logged
+		// every time, so no such turn is ever silent.
+		s.log.Info("slack: reading an app-attributed post from a listed test user as theirs",
+			"user", m.User, "botId", m.BotID, "channel", m.Channel, "ts", m.TimeStamp)
 	}
 	refused, author := s.foreignSender(m)
 	if refused {

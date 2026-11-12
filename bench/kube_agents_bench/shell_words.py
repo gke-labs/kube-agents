@@ -101,6 +101,9 @@ _GREP_OUTPUT_SINK = "/dev/null"
 # typed line onto it with a space, so a comment there would hide that line from the grading.
 _COMMENT_CHAR = "#"
 _COLLAPSED_CHAIN_RE = re.compile(r"\s\+\s\d+\scommand(?:s|\(s\))?\s*$")
+# A backslash before a blank in a stored typed call: an escaped space or tab, or what the pod's
+# scrub leaves of an escaped backslash at a line end (`worker_transcript.fold_shell_command`).
+_ESCAPED_BLANK_RE = re.compile(r"\\[ \t]")
 # The checks below read the line as the shell reader keeps it, quotes in place and line
 # continuations gone, so a quote or a backslash that ends a name in bash ends it here too.
 # A word that reads the last argument back (`$_`, `${_}`), or a variable through another
@@ -387,6 +390,19 @@ def _command_word_index(
             continue
         return None
     return None
+
+
+def _typed_call_may_join(command: str) -> bool:
+    """Whether a typed command, as the pod stores it, may hold more than one line, which a card
+    log row joins with a space: a newline outside quotes once the ends are trimmed, a backslash
+    before a blank (an escaped blank, or what the pod's scrub leaves of an escaped backslash at
+    a line end once it folds the continuation), or a line the shell reader cannot split."""
+    if _ESCAPED_BLANK_RE.search(command):
+        return True
+    words, _ = _shell_words_and_spans(command.strip())
+    if not words:
+        return bool(command.strip())
+    return any(isinstance(word, _ShellOperator) and word == _SHELL_LINE_END for word in words)
 
 
 def _can_read_a_word_back(line: str) -> bool:

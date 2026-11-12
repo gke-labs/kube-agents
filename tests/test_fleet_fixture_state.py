@@ -139,6 +139,21 @@ if value == "UNREACHABLE":
 print(json.dumps(value))
 '''
 
+# The startup-fail VM's console around a boot, and the same console after
+# three weeks of guest-agent output pushed that boot out of the buffer; both
+# shortened from real reads of the planted VM.
+_FRESH_SERIAL = (
+    "2026-10-07T02:18:03.055302+00:00 startup-fail-seeded google_metadata_script_runner[845]: "
+    'Running metadata script runner (version 20260715.00) for "startup" event\n'
+    "2026-10-07T02:18:03.065033+00:00 startup-fail-seeded google_metadata_script_runner[845]: "
+    'Script "startup-script" failed with error: exit status 1\n'
+)
+_WRAPPED_SERIAL = (
+    "-seeded mwlid_extension[723]: MWLID credential refresh is not enabled, skipping run\n"
+    "2026-10-17T02:48:17.439738+00:00 startup-fail-seeded mwlid_extension[723]: "
+    "MWLID credential refresh is not enabled, skipping run\n"
+)
+
 _STUB_GCLOUD = r'''#!/usr/bin/env python3
 import json, os, sys
 args = sys.argv[1:]
@@ -161,6 +176,13 @@ if args[:3] == ["container", "clusters", "describe"]:
         print("ERROR: (gcloud.container.clusters.describe) ResponseError: code=503", file=sys.stderr)
         sys.exit(1)
     print(json.dumps(doc))
+elif args[:3] == ["compute", "instances", "get-serial-port-output"]:
+    # `compute instances get-serial-port-output NAME --zone=Z --port=1 --project=P`
+    text = world.get("serial", {}).get(args[3])
+    if text is None or text == "UNREACHABLE":
+        print(f"ERROR: (gcloud.compute.instances.get-serial-port-output) Required 'compute.instances.getSerialPortOutput' permission for {args[3]}", file=sys.stderr)
+        sys.exit(1)
+    sys.stdout.write(text)
 elif args[0] == "compute" and args[2] == "list":
     # `compute <collection> list --project P --filter=name ~ ^<prefix> --format json`
     answer = world.get("compute", {}).get(args[1], [])
@@ -522,7 +544,7 @@ def _healthy_world() -> dict:
         # The project-scoped roles: Compute Engine objects no cluster carries.
         "compute": {
             "instances": [
-                {"name": "startup-fail-seeded", "status": "RUNNING", "metadata": {"items": [{"key": "startup-script", "value": "exit 1"}]}},
+                {"name": "startup-fail-seeded", "status": "RUNNING", "zone": "https://www.googleapis.com/compute/v1/projects/kube-agents-evals/zones/us-central1-a", "metadata": {"items": [{"key": "startup-script", "value": "exit 1"}]}},
                 {"name": "world-open-seeded", "status": "RUNNING", "networkInterfaces": [{"accessConfigs": [{"type": "ONE_TO_ONE_NAT", "natIP": "203.0.113.7"}]}]},
             ],
             "firewall-rules": [
@@ -530,6 +552,9 @@ def _healthy_world() -> dict:
                 {"name": "world-open-deny-remote-seeded", "disabled": False, "sourceRanges": ["0.0.0.0/0"], "denied": [{"IPProtocol": "tcp", "ports": ["22", "3389"]}]},
             ],
         },
+        # Each instance's serial port 1 output, by name. The startup-fail VM's
+        # holds the boot that ran its script.
+        "serial": {"startup-fail-seeded": _FRESH_SERIAL},
         "describe": {
             "seeded-a": _peer(),
             "seeded-b": _cluster_b(),
@@ -1611,6 +1636,78 @@ class ProjectScopedRoleTest(_Harness):
         world["compute"]["instances"][0]["metadata"] = {"items": []}
         self.run_script(world)
         assert set(self.drift_files()) == {"startup-fail-vm"}
+
+    def test_the_vms_serial_console_is_read_for_the_failure_line(self):
+        done = self.run_script(_healthy_world())
+        assert self.drift_files() == {}, done.stderr
+        assert (
+            "gcloud compute instances get-serial-port-output startup-fail-seeded --zone=us-central1-a --port=1 --project=kube-agents-evals"
+            in self.log.read_text()
+        )
+
+    def test_a_console_that_lost_the_failure_line_is_drift(self):
+        """The 2026-11-08 and -09 nightlies: the VM was RUNNING with its
+        script set, the scan read it healthy, and the audit found nothing to
+        file because the line had rotated out of the buffer."""
+        world = _healthy_world()
+        world["serial"]["startup-fail-seeded"] = _WRAPPED_SERIAL
+        done = self.run_script(world)
+        assert set(self.drift_files()) == {"startup-fail-vm"}, done.stderr
+        body = self.drift_files()["startup-fail-vm"]
+        assert 'instance/startup-fail-* serial_contains "Script \\"startup-script\\" failed with error"' in body, body
+        assert "not in the serial port 1 output of startup-fail-seeded (us-central1-a," in body, body
+
+    def test_an_instance_name_with_a_double_hyphen_is_read(self):
+        """GCE allows `--` inside a name; a flag or a newline is still refused."""
+        calls = []
+
+        def run(cmd, timeout):
+            calls.append(cmd)
+            return 0, "boot output", ""
+
+        with mock.patch.object(ffs, "_run", run):
+            self.assertEqual(ffs.read_serial("p", "startup-fail--x", "us-central1-a"), "boot output")
+            for bad in ("--zone=x", "startup-fail-x\n", "1vm"):
+                with self.subTest(bad), self.assertRaises(ffs.Unreadable):
+                    ffs.read_serial("p", bad, "us-central1-a")
+        self.assertEqual(len(calls), 1)
+
+    def test_a_rotated_console_does_not_hold_the_wait(self):
+        """Only a reboot puts the line back, so a wait would be spent for
+        nothing: one pass, then drift."""
+        world = _healthy_world()
+        world["serial"]["startup-fail-seeded"] = _WRAPPED_SERIAL
+        started = datetime.now(timezone.utc)
+        done = self.run_script(world, "--wait", "60", "--interval", "1")
+        assert (datetime.now(timezone.utc) - started).total_seconds() < 30, done.stderr
+        assert self.log.read_text().count("get-serial-port-output startup-fail-seeded") == 1, done.stderr
+        assert set(self.drift_files()) == {"startup-fail-vm"}, done.stderr
+
+    def test_a_refused_serial_read_is_not_checked_and_leaves_no_drift_file(self):
+        world = _healthy_world()
+        world["serial"]["startup-fail-seeded"] = "UNREACHABLE"
+        done = self.run_script(world)
+        assert self.drift_files() == {}, done.stderr
+        assert "fixture role 'startup-fail-vm' could not be checked" in done.stderr
+        assert "compute.instances.getSerialPortOutput" in done.stderr
+
+    def test_serial_contains_is_for_a_project_instance_subject_only(self):
+        for role, change in (
+            ("world-open-ingress", {"subject": "firewall/world-open-2379-*"}),
+            ("crashloop-workload", {"subject": "pod?app=payments-api"}),
+            ("startup-fail-vm", {"path": "status"}),
+            ("startup-fail-vm", {"value": ""}),
+            ("startup-fail-vm", {"value": 1}),
+        ):
+            with self.subTest(role=role, change=change):
+                catalog = json.loads(_CATALOG.read_text())
+                entry = {"subject": "instance/startup-fail-*", "op": "serial_contains", "value": "failed with error"}
+                entry.update(change)
+                catalog["roles"][role]["state"].append(entry)
+                path = self.tmp / "bad.json"
+                path.write_text(json.dumps(catalog))
+                with self.assertRaises(ffs.CatalogError):
+                    ffs.load_assertions(path)
 
     def test_a_narrowed_or_disabled_rule_is_drift(self):
         for change in ({"sourceRanges": ["10.0.0.0/8"]}, {"disabled": True}, {"allowed": [{"IPProtocol": "tcp", "ports": ["2380"]}]}):

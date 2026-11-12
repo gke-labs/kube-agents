@@ -247,7 +247,11 @@ def merge(opening: AgentResult, reply: AgentResult, entry: dict) -> AgentResult:
     record's tokens are the chain's usage as the door reported it, null
     where it reported none, and a null bucket adds nothing).
     """
+    from kube_agents_bench import worker_trajectory  # devops_bench-bound, like the import below
     from kube_agents_bench.card_wake import _add_tokens  # devops_bench-bound; imported where a result exists
+
+    def _no_worker_calls(trajectory: list) -> bool:
+        return any(isinstance(e, dict) and e.get("name") == worker_trajectory.NO_WORKER_CALLS_ENTRY for e in trajectory)
 
     tokens = dict(reply.tokens)
     _add_tokens(tokens, opening.tokens)
@@ -257,10 +261,15 @@ def merge(opening: AgentResult, reply: AgentResult, entry: dict) -> AgentResult:
         "opening_task_id": opening.metadata.get("task_id"),
         "plant": entry["args"],
     }
+    # A no-worker-calls entry speaks for the cards of the turn that wrote it;
+    # beside a turn without one it would grade that turn's cards too.
+    trajectory = [*opening.trajectory, entry, *reply.trajectory]
+    if not (_no_worker_calls(opening.trajectory) and _no_worker_calls(reply.trajectory)):
+        trajectory = [e for e in trajectory if not (isinstance(e, dict) and e.get("name") == worker_trajectory.NO_WORKER_CALLS_ENTRY)]
     # The result's own class, so this module never imports devops_bench.
     return type(reply)(
         output=reply.output,
-        trajectory=[*opening.trajectory, entry, *reply.trajectory],
+        trajectory=trajectory,
         tokens=tokens,
         errors=[*opening.errors, *reply.errors],
         metadata=metadata,

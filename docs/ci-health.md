@@ -687,6 +687,15 @@ delegation-ceiling condition above: DEGRADED under its own name, its own
 message and advice, so a fleet-wide worker stall (#1879) is named here rather
 than read only as "not evaluated" on every pull request.
 
+A repetition graded `infra` under a reason that leads with
+`KUBE_AGENTS_FORGE_UNAVAILABLE` is a forge repetition: every check that errored
+did so because a forge read failed for a while during grading (a 5xx, a dropped
+connection, a GitHub rate limit on grading's own token). It is not a storm
+repetition either, so the storm rule and the pass-rate denominators leave it
+out, and a case whose ungraded repetitions are of this kind, with no storm
+repetition, is classed `forge-unavailable` on the run page (its Do is a
+retest).
+
 Three other shapes get a comment, each one line with the same marker and
 dedupe. A run the suite marked **not evaluated** — an admitted case, or every
 case, lost every repetition to infrastructure, so `hack/ci-eval-pr.sh` exited
@@ -939,6 +948,32 @@ issue for the tick, so a recovery or night comment is not posted twice. When a c
 repetition on a graded night after its last failing one, and that night
 finished after the issue was opened, the bot comments with that night's run link, keyed on the night so it comments once per recovery. It
 never closes an issue; the triager does.
+
+When one change breaks many cases, they get one issue. Before filing, the
+cases that would each file are grouped by the night their current run of red
+nights began and a check that every graded failing repetition of that run
+names (read from the grading line's tripped safeguards, or the failed checks
+after a low score). Three or more cases on one such key file one issue in
+place of one each, labelled `nightly-red`, each case's `domain:<slug>` and
+`needs-triage`, and listing each case's nights as a per-case issue does. It goes to the
+domain's `owner:` when the cases share a domain, and to `infra_owner` in
+`domains.yaml` when they span domains, with each case's effective owner
+@-mentioned. The issue carries every case's marker, so the dedupe treats it as each
+case's issue (matched on those markers alone, never on a case named in its
+text); a triager who
+deletes a case's marker line splits that case off, and it files on its own if
+it stays red. Once every case it names has a recovery night after the issue
+opened (or, once a case's red nights have left the 14-night window, a pass
+after the issue opened), the bot comments once, listing each case's clear
+night; a group issue gets no per-case recovery comment. A part
+that graded nothing that night (no project, a setup death) is skipped, as for
+one case, so it does not count as clear. A case that reaches 3 red nights a
+tick after its group was filed files on its own. The issue names no check: the
+check is used to group and stays on the dashboard. Three, not two: two cases
+sharing a check from one night are often a probe and its audit in one domain,
+one owner either way, and three unrelated cases breaking the same check the
+same night are rarely a coincidence. On 2026-11-09 one grader change (#4973)
+filed ten per-case issues to five owners.
 
 Two infrastructure shapes file an issue labelled `nightly-red`, `Infra` and
 `needs-triage` instead of a domain label, assigned to `infra_owner` in
@@ -1390,10 +1425,12 @@ the adjudicator can ask "drifted last scan too?" from one file.
 read-only account, `seeded-fleet-reader@<project>.iam.gserviceaccount.com`
 (`bench/tf/fleet`): `CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT` makes gcloud
 impersonate it for the cluster listing, the credentials, the control-plane
-describes and the `gcloud compute instances list` and `gcloud compute
-firewall-rules list` reads of the project-scoped roles (`startup-fail-vm` and
+describes and the `gcloud compute instances list`, `gcloud compute
+firewall-rules list` and `gcloud compute instances get-serial-port-output`
+reads of the project-scoped roles (`startup-fail-vm` and
 `world-open-ingress`, which have no cluster slot; the account holds
-`roles/compute.viewer` for them), and `FLEET_READONLY_SA` makes the runner
+`roles/compute.viewer` for them, which includes
+`compute.instances.getSerialPortOutput`), and `FLEET_READONLY_SA` makes the runner
 rewrite each kubeconfig so `kubectl`'s token is minted as it too. The bot,
 `eval-dashboard-publisher@kube-agents-prow`, therefore needs exactly one grant
 per pool project — `roles/iam.serviceAccountTokenCreator` on that account, the
@@ -1472,7 +1509,9 @@ message and the health box's advice say that the pool is below that margin and i
 `bench/tf/fleet/main.tf` is the fix, rolling project by project if a size change has just
 merged, beside the re-apply line when a planted role drifts too, and the issue carries the
 same exception beside the re-apply paragraph, since a re-apply of a stack that is already
-applied changes nothing; and when every drift line on the incident is one no re-apply clears,
+applied changes nothing; a `startup-fail-vm` line reading `serial_contains`, the VM's
+failure line gone from its serial buffer, is cleared by the re-apply too, because the
+reconcile resets the VM after each project; and when every drift line on the incident is one no re-apply clears,
 keyed on its assertion rather than its role, the Chat message and the health box's advice say
 so and name the remedy instead: an `age_hours_ge` line, seeded-c's `createTime` under the
 24-hour age gate, clears itself at `createTime` plus 24 hours and the advice gives that time

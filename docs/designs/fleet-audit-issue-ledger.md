@@ -470,7 +470,7 @@ Three of the rendered rows are easy to misread, and two of them were wrong in an
   works from. Labels only — no push, no rewritten body — so the promise above still holds.
 - **`refused` is a human decision, not a rejected command.** It is what a finding looks like when
   someone closed its fix without merging — a considered "no" the harness must not overrule by
-  re-proposing the same fix tomorrow. (A refused `/remediate` is a _reply_, not a finding state;
+  re-proposing the same fix tomorrow. In the proposed Decision Memory ingestion pipeline ([`memory.md`](memory.md)), only a collaborator close (`can_write`) carrying a non-situational technical reason records an advisory `status:rejected` lesson (superseded when a later PR merges on that path), whereas uncommented, situational, or non-writer closes retire the pending lesson candidate (`status:retired`). (A refused `/remediate` is a _reply_, not a finding state;
   there is no finding to put in a state, which is why the draft's condition for this row did not
   correspond to anything the renderer could compute.)
 - **`withdrawn` is the other half of that row**, and splitting the two is not cosmetic. A closed
@@ -1233,7 +1233,7 @@ against that cluster, as `{check, command}` — the backticked slug from the SOP
 the check, and the literal invocation that ran it. `AUDITS` carries the roster per stream as an
 `AuditSpec`, which makes four things enforceable that were not: an unknown or duplicated slug is
 rejected; an absent field is rejected outright; an entry whose `command` is missing, is a call back
-into this harness, or names none of `kubectl`/`gcloud`/`gsutil`/`bq`/`helm`/`curl` (or the upgrade audit's
+into this harness, or names none of `kubectl`/`gcloud`/`bq`/`helm`/`curl` (or the upgrade audit's
 readiness reporter, `fleet_upgrade_report.py`) is rejected; and
 an empty list is rejected unless that cluster's `limitations` says why nothing ran, or, on a stream
 in `COLLECTOR_AUDITS` whose manifest names the target as collected, every check the target answers
