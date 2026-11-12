@@ -21,7 +21,9 @@
 #               images, at the size's tier
 #   3. up       build the fleet and its workloads
 #   4. run      the burst and soak windows and the verdict; --down deletes the fleet
-#               whatever happens, and the records go to $ARTIFACTS and the bucket
+#               whatever happens, and the records go to $ARTIFACTS and the bucket.
+#               The soak window runs the eval cases hack/eval/sized-fleet-cases.txt
+#               lists, once each; SCALE_EVAL_CASES=false skips them
 #
 # Runs main only, as its own identity, sized-fleet-runner: never a presubmit. The
 # identity's roles on the scale project are in the design, "How the fleet is built,
@@ -38,6 +40,7 @@ PROJECT="${SCALE_PROJECT_ID:?SCALE_PROJECT_ID must name the scale project}"
 HOST_CLUSTER="${SCALE_HOST_CLUSTER:-scale-host}"
 HOST_LOCATION="${SCALE_HOST_LOCATION:-us-central1-c}"
 RESULTS_BUCKET="${SCALE_RESULTS_BUCKET:-}"
+EVAL_CASES="${SCALE_EVAL_CASES:-true}"
 # Prow sets BUILD_ID; a run by hand gets the time. Both are valid GCP label values.
 RUN_ID="nightly-${BUILD_ID:-manual-$(date -u +%Y%m%d%H%M%S)}"
 OUT="${ARTIFACTS:-$(mktemp -d)}/scale"
@@ -48,7 +51,8 @@ HELM_INSTALLER_URL="https://raw.githubusercontent.com/helm/helm/main/scripts/get
 
 log() { printf '%s ci-scale-nightly: %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 
-# The CI image has gcloud, kubectl and python3; OpenTofu, Helm and PyYAML arrive here.
+# The CI image has gcloud, kubectl and python3; OpenTofu, Helm, PyYAML and uv (the eval
+# harness's runner) arrive here.
 ensure_tools() {
   if ! command -v tofu >/dev/null; then
     log "installing OpenTofu"
@@ -63,6 +67,10 @@ ensure_tools() {
   if ! python3 -c 'import yaml' 2>/dev/null; then
     log "installing PyYAML"
     python3 -m pip install --quiet pyyaml
+  fi
+  if [[ "$EVAL_CASES" == "true" ]] && ! command -v uv >/dev/null; then
+    log "installing uv"
+    python3 -m pip install --quiet uv
   fi
   command -v gke-gcloud-auth-plugin >/dev/null
 }
@@ -86,9 +94,10 @@ main() {
     fleet down || true
     exit 2
   fi
-  local bucket=()
-  if [[ -n "$RESULTS_BUCKET" ]]; then bucket=(--results-bucket "$RESULTS_BUCKET"); fi
-  fleet run --down --out "$OUT" ${bucket[@]+"${bucket[@]}"} || rc=$?
+  local extra=()
+  if [[ -n "$RESULTS_BUCKET" ]]; then extra=(--results-bucket "$RESULTS_BUCKET"); fi
+  if [[ "$EVAL_CASES" == "true" ]]; then extra+=(--eval-cases); fi
+  fleet run --down --out "$OUT" ${extra[@]+"${extra[@]}"} || rc=$?
   log "run $RUN_ID finished with $rc; records in $OUT"
   exit "$rc"
 }
