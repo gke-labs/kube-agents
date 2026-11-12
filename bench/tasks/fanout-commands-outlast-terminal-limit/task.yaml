@@ -1,0 +1,82 @@
+# A fan-out's polling sleep and the workers' commands finish inside the
+# terminal's limit instead of being cut at 60 s (#5423).
+#
+# Every install ran its terminal at 60 s, not Hermes' 180 s code default:
+# Hermes' first boot seeds $HERMES_HOME/.env from its .env.example, whose
+# TERMINAL_TIMEOUT=60 beats the default, and nothing the operator rendered
+# outranked it. The persona's fan-out wait was `sleep 60` with no `timeout`
+# argument, so the sleep raced its own limit: in 46 saved CI transcripts it
+# was cut 17 times out of 38 ("[Command timed out after 60s]", exit 124) and
+# finished the other 21, and 9 other commands without `timeout=` were cut
+# the same way. The fix is both halves: the operator pins terminal.timeout to
+# 180 in the managed config, and the polling guidance passes
+# `timeout=90` (`timeout=150` for the doubled sleep).
+#
+# The prompt asks for each cluster's Cluster Agent, which SOUL.md §6
+# answers with one card per cluster and a platform worker that waits on them
+# with the polling sleep; the read is in-cluster (kube-system pods), so no
+# fleet-wide read stands in for the cards. Graded is every delegated
+# worker's terminal result, the platform worker's and the Cluster Agents',
+# from the trajectory's tagged calls: none may be cut at 60 s. A sleep is
+# not required: a platform worker that waits without one (1 of 10 correct
+# runs on a dev install) is not the defect, and requiring one made the case
+# fail it.
+#
+# The check reads every tagged worker call, so the first call of each card
+# (a Cluster Agent's preflight, the platform worker's first sleep) is graded
+# like the rest, on the api and inject lanes alike. A run with no tagged
+# worker call is an error, never a pass. Limits: only terminal and
+# execute_code calls are graded; a result clipped in the pod before the
+# timeout text is not read.
+#
+# Domain: chat-and-routing. Isolation class: read-only. Eligible tier:
+# nightly.
+id: fanout-commands-outlast-terminal-limit
+name: A fan-out's polling sleep and worker commands are not cut at a 60 s terminal limit
+prompt: >-
+  Ask the Cluster Agent on each cluster in the fleet how many pods are
+  running in the kube-system namespace on its cluster, then give me one line
+  per cluster with its name and that count. Do not change anything.
+expected_output: >-
+  One line per managed cluster, each naming the cluster and the number of
+  pods running in its kube-system namespace, read live by that cluster's
+  Cluster Agent. While waiting for the per-cluster cards the platform worker
+  polls them with a sleep between rounds, and no sleep or other worker
+  command comes back timed out after 60 seconds. Nothing is changed.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: chat-and-routing
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: stalhaali
+
+verification_spec:
+  - name: no-worker-command-cut-at-60s
+    role: objective
+    # assert, not converge: the transcript is immutable once the run ends.
+    mode: assert
+    check:
+      type: none
+      checks:
+        # Hermes' wording for a call that hit its limit
+        # (tools/environments/base.py), at the seeded 60 s.
+        - type: tool_called
+          scope: workers
+          tool_names: ["terminal", "execute_code"]
+          result: "Command timed out after 60s"
+  - name: the-answer-gives-the-counts
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # A count beside the word pods on one line ("140 running pods",
+      # "pods: 58"), or a table row whose second cell is a number, the shape
+      # a per-cluster answer takes ("| cluster-1 | 58 |"). A count stands
+      # alone: the digit of a name (`cluster-1`) is not one, and neither is a
+      # list number (`1.`) ahead of the word.
+      required_patterns:
+        - '\bkube-system\b'
+        - '(?m)(?<![\w-])\d+(?![\w.-])[^\n]{0,30}?\bpods?\b|\bpods?\b[^\n]{0,40}?(?<![\w-])\d+(?![\w-])|^\|[^|\n]+\|\s*\d+\b'
