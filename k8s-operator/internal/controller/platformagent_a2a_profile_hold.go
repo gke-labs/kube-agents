@@ -74,6 +74,13 @@ const (
 	// known to have loaded before this config was written.
 	a2aBusPreviousProfilesAnnotation = "kubeagents.x-k8s.io/a2a-reload-previous-profiles"
 
+	// a2aBusPreviousUntilHashAnnotation rides beside the previous list: the
+	// pod template's config hash the server has to be running before the
+	// list can clear. The StatefulSet is applied after the config Secret, so
+	// a roll that pass starts (or an apply of it that failed) is invisible in
+	// the live StatefulSet's status; the hash is not.
+	a2aBusPreviousUntilHashAnnotation = "kubeagents.x-k8s.io/a2a-reload-previous-until-hash"
+
 	// a2aConfigProfilesSeparator joins the names in both annotations. A
 	// profile's name is a DNS-1123 label, which never contains it.
 	a2aConfigProfilesSeparator = ","
@@ -305,7 +312,7 @@ func a2aServerLoadedFrom(ctx context.Context, reader client.Reader, agent *agent
 	if !recorded {
 		return loaded, nil
 	}
-	settled, err := a2aSingleBusSettled(ctx, reader, agent)
+	settled, err := a2aSingleBusSettledOn(ctx, reader, agent, live.Annotations[a2aBusPreviousUntilHashAnnotation])
 	if err != nil {
 		return nil, err
 	}
@@ -321,12 +328,22 @@ func a2aServerLoadedFrom(ctx context.Context, reader client.Reader, agent *agent
 // pod deleted for a failed reload still serves its old config until it
 // exits). No StatefulSet, or no pod, runs nothing older.
 func a2aSingleBusSettled(ctx context.Context, reader client.Reader, agent *agentv1alpha1.PlatformAgent) (bool, error) {
+	return a2aSingleBusSettledOn(ctx, reader, agent, "")
+}
+
+// a2aSingleBusSettledOn is a2aSingleBusSettled that also requires the live
+// pod template to carry hash, when one is given: a StatefulSet still on an
+// earlier template has a roll to come, however settled it reads.
+func a2aSingleBusSettledOn(ctx context.Context, reader client.Reader, agent *agentv1alpha1.PlatformAgent, hash string) (bool, error) {
 	sts := &appsv1.StatefulSet{}
 	if err := reader.Get(ctx, types.NamespacedName{Name: a2aNATSName(agent), Namespace: agent.Namespace}, sts); err != nil {
 		if apierrors.IsNotFound(err) {
 			return true, nil
 		}
 		return false, err
+	}
+	if hash != "" && sts.Spec.Template.Annotations[a2aConfigHashAnnotation] != hash {
+		return false, nil
 	}
 	replicas := int32(1)
 	if sts.Spec.Replicas != nil {
@@ -369,8 +386,12 @@ func a2aBusPodsLeft(ctx context.Context, reader client.Reader, agent *agentv1alp
 // loaded, for as long as it may run an earlier config: from the pass that
 // changes the config until a pending reload is confirmed and the server is
 // settled on it. planA2ABusReload runs first, so config already carries any
-// reload it stamped. A cluster records nothing here: its revisions say it.
-func (r *PlatformAgentReconciler) stampA2ABusPreviousProfiles(ctx context.Context, agent *agentv1alpha1.PlatformAgent, config *corev1.Secret) error {
+// reload it stamped. sts is the StatefulSet this pass is about to apply: while
+// its template differs from the live one, a roll is coming (or an earlier
+// pass's apply of it failed), so the live StatefulSet reading as settled says
+// nothing yet and the record stays. A cluster records nothing here: its
+// revisions say it.
+func (r *PlatformAgentReconciler) stampA2ABusPreviousProfiles(ctx context.Context, agent *agentv1alpha1.PlatformAgent, config *corev1.Secret, sts *appsv1.StatefulSet) error {
 	if a2aNATSReplicas(agent) > 1 {
 		return nil
 	}
@@ -385,8 +406,14 @@ func (r *PlatformAgentReconciler) stampA2ABusPreviousProfiles(ctx context.Contex
 	_, reloadPending := config.Annotations[a2aBusReloadRequestedAnnotation]
 	_, recorded := live.Annotations[a2aBusPreviousProfilesAnnotation]
 	changed := string(live.Data[a2aNATSConfKey]) != string(config.Data[a2aNATSConfKey])
-	if !changed && !reloadPending && recorded {
-		settled, err := a2aSingleBusSettled(ctx, r.podReader(), agent)
+	rollComing, err := r.a2aBusRollComing(ctx, sts)
+	if err != nil {
+		return err
+	}
+	if !changed && !reloadPending && recorded && !rollComing {
+		// loaded already says whether the server is settled on the hash
+		// the record waits for.
+		settled, err := a2aSingleBusSettledOn(ctx, r.podReader(), agent, sts.Spec.Template.Annotations[a2aConfigHashAnnotation])
 		if err != nil {
 			return err
 		}
@@ -395,11 +422,30 @@ func (r *PlatformAgentReconciler) stampA2ABusPreviousProfiles(ctx context.Contex
 	if !changed && !reloadPending && !recorded {
 		return nil
 	}
+	if recorded && rollComing {
+		// The live server reads as settled on the template being replaced,
+		// which loaded took as the new list; what it is known to have is
+		// still the recorded intersection.
+		loaded = intersectProfileSets(decodeA2AConfigProfiles(live.Annotations[a2aConfigProfilesAnnotation]),
+			decodeA2AConfigProfiles(live.Annotations[a2aBusPreviousProfilesAnnotation]))
+	}
 	if config.Annotations == nil {
 		config.Annotations = map[string]string{}
 	}
 	config.Annotations[a2aBusPreviousProfilesAnnotation] = encodeA2AConfigProfiles(setNames(loaded))
+	config.Annotations[a2aBusPreviousUntilHashAnnotation] = sts.Spec.Template.Annotations[a2aConfigHashAnnotation]
 	return nil
+}
+
+// a2aBusRollComing reports whether the StatefulSet about to be applied differs
+// from the live one in its pod template's config hash: the apply will roll
+// the server. No live StatefulSet has nothing to roll.
+func (r *PlatformAgentReconciler) a2aBusRollComing(ctx context.Context, sts *appsv1.StatefulSet) (bool, error) {
+	live := &appsv1.StatefulSet{}
+	if err := r.a2aReader().Get(ctx, types.NamespacedName{Name: sts.Name, Namespace: sts.Namespace}, live); err != nil {
+		return false, client.IgnoreNotFound(err)
+	}
+	return live.Spec.Template.Annotations[a2aConfigHashAnnotation] != sts.Spec.Template.Annotations[a2aConfigHashAnnotation], nil
 }
 
 // setNames is a set's members, in no particular order.

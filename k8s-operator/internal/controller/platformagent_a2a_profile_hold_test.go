@@ -270,7 +270,7 @@ func TestTheConfigSecretRecordsThePreviousListUntilTheServerIsOnTheNewOne(t *tes
 	// A new config: the previous list is what the server has now.
 	config := a2aDesiredConfig(agent, "new")
 	config.Annotations = map[string]string{a2aConfigProfilesAnnotation: "x,y"}
-	if err := r.stampA2ABusPreviousProfiles(ctx, agent, config); err != nil {
+	if err := r.stampA2ABusPreviousProfiles(ctx, agent, config, b.sts); err != nil {
 		t.Fatal(err)
 	}
 	if got, ok := config.Annotations[a2aBusPreviousProfilesAnnotation]; !ok || got != "x" {
@@ -285,7 +285,7 @@ func TestTheConfigSecretRecordsThePreviousListUntilTheServerIsOnTheNewOne(t *tes
 		t.Fatal(err)
 	}
 	config = a2aDesiredConfig(agent, "new")
-	if err := r.stampA2ABusPreviousProfiles(ctx, agent, config); err != nil {
+	if err := r.stampA2ABusPreviousProfiles(ctx, agent, config, b.sts); err != nil {
 		t.Fatal(err)
 	}
 	if got, ok := config.Annotations[a2aBusPreviousProfilesAnnotation]; ok {
@@ -299,11 +299,73 @@ func TestTheConfigSecretRecordsThePreviousListUntilTheServerIsOnTheNewOne(t *tes
 	if err := c.Update(ctx, live); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.stampA2ABusPreviousProfiles(ctx, agent, config); err != nil {
+	if err := r.stampA2ABusPreviousProfiles(ctx, agent, config, b.sts); err != nil {
 		t.Fatal(err)
 	}
 	if got := config.Annotations[a2aBusPreviousProfilesAnnotation]; got != "x" {
 		t.Fatalf("previous = %q while the reload is pending, want \"x\"", got)
+	}
+}
+
+// A roll about to start (the StatefulSet this pass applies carries a new
+// config hash) keeps the previous list, though the live StatefulSet still
+// reads as settled: until the roll replaces the pod, it may run the earlier
+// config. So does a retry after the StatefulSet's apply failed, which reads
+// the same way.
+func TestTheSecretKeepsThePreviousListWhileARollIsComing(t *testing.T) {
+	agent := a2aSingleServerTestAgent()
+	b := newHoldBus(agent)
+	b.sts.Generation, b.sts.Status.ObservedGeneration, b.sts.Status.UpdatedReplicas = 1, 1, 1
+	b.pod(0, "bus-a")
+	live := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: a2aNATSConfigSecretName(agent), Namespace: agent.Namespace,
+			Annotations: map[string]string{a2aConfigProfilesAnnotation: "x,y", a2aBusPreviousProfilesAnnotation: "x"}},
+		Data: map[string][]byte{a2aNATSConfKey: []byte("new")},
+	}
+	r := &PlatformAgentReconciler{Client: b.client(live), Scheme: setupScheme()}
+	desired := b.sts.DeepCopy()
+	desired.Spec.Template.Annotations = map[string]string{a2aConfigHashAnnotation: "h2"}
+	config := a2aDesiredConfig(agent, "new")
+	if err := r.stampA2ABusPreviousProfiles(context.Background(), agent, config, desired); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := config.Annotations[a2aBusPreviousProfilesAnnotation]; !ok || got != "x" {
+		t.Fatalf("previous = %q (recorded %v) with a roll coming, want \"x\" kept", got, ok)
+	}
+	// The same template as the live one: no roll, and a settled server
+	// drops the record.
+	config = a2aDesiredConfig(agent, "new")
+	if err := r.stampA2ABusPreviousProfiles(context.Background(), agent, config, b.sts); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := config.Annotations[a2aBusPreviousProfilesAnnotation]; ok {
+		t.Fatalf("previous = %q still recorded with no roll coming on a settled server", got)
+	}
+}
+
+// The read side waits for the hash the record names: a StatefulSet that
+// reads as settled on an earlier template (its apply failed, or the roll
+// hasn't started) still holds the new profile back.
+func TestASingleServerOnAnEarlierTemplateHasNotLoadedTheNewList(t *testing.T) {
+	agent := a2aSingleServerTestAgent()
+	b := newHoldBus(agent)
+	b.sts.Generation, b.sts.Status.ObservedGeneration, b.sts.Status.UpdatedReplicas = 1, 1, 1
+	b.pod(0, "bus-a")
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: a2aNATSConfigSecretName(agent), Namespace: agent.Namespace, Annotations: map[string]string{
+			a2aConfigProfilesAnnotation: "x,y", a2aBusPreviousProfilesAnnotation: "x", a2aBusPreviousUntilHashAnnotation: "h2",
+		}},
+		Data: map[string][]byte{a2aNATSConfKey: []byte("conf")},
+	}
+	if got := loadedList(loadedOrFatal(t, b.client(secret), b.agent)); got != "x" {
+		t.Errorf("loaded = %q on template h1 with the record waiting for h2, want \"x\"", got)
+	}
+	b2 := newHoldBus(agent.DeepCopy())
+	b2.sts.Spec.Template.Annotations[a2aConfigHashAnnotation] = "h2"
+	b2.sts.Generation, b2.sts.Status.ObservedGeneration, b2.sts.Status.UpdatedReplicas = 1, 1, 1
+	b2.pod(0, "bus-a")
+	if got := loadedList(loadedOrFatal(t, b2.client(secret.DeepCopy()), b2.agent)); got != "x,y" {
+		t.Errorf("loaded = %q settled on h2, want \"x,y\"", got)
 	}
 }
 
