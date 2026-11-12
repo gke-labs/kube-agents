@@ -141,6 +141,7 @@ func TestTheTiersFileLoadsAndABadOneFallsBackToTheBuiltIns(t *testing.T) {
 		"not json":    `{"tiers":[`,
 		"unknown key": `{"tiers":[{"name":"x","mode":"interactive","verbs":["cluster.mutate"]}]}`,
 		"wrong shape": `{"tiers":"oncall"}`,
+		"trailing":    `{"tiers":[{"name":"oncall","mode":"interactive"}]}{"tiers":[]}`,
 	} {
 		LoadTiers([]TierDefinition{{Name: "oncall", Mode: TierModeInteractive}})
 		writeTiers(t, path, body)
