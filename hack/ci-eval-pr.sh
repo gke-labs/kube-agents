@@ -61,11 +61,13 @@ readonly EVAL_NIGHTLY_WRITERS_C_FILE="eval/nightly-writers-c.txt"
 # into (the cksum shifted right by NIGHTLY_MAIN_CKSUM_SHIFT, modulo this: 0
 # main-a, 1 main-b, 2 main-c, 3 main-d, 4 main-e): a coin toss per name. The
 # shift picks the coin: shift 3 dealt the matrix of 2026-11-06 32/29/29/25/31
-# where no shift dealt it 37/38/21/30/20. scripts/test_ci_eval_nightly.py
+# where no shift dealt it 37/38/21/30/20; shift 4 deals the matrix of
+# 2026-11-10, the two chat-feedback usage-summary cases added, 34/31/31/32/28
+# where shift 3 dealt it 35/31/32/27/31. scripts/test_ci_eval_nightly.py
 # holds the spread within a quarter of a shard's share; if the matrix
 # drifts past that, change it.
 readonly NIGHTLY_MAIN_SHARDS=5
-readonly NIGHTLY_MAIN_CKSUM_SHIFT=3
+readonly NIGHTLY_MAIN_CKSUM_SHIFT=4
 # A fifth file, read beside them and applied on one lane only (#2039): the
 # cases the inject lane does not run, because their premise needs the chat
 # front door. The lane is the one EVAL_INJECT_TRANSPORT below names.
@@ -121,8 +123,10 @@ readonly EVAL_FLEET_CATALOG="tf/fleet/fixtures.json"
 # the sync.
 readonly EVAL_GRADER_VENV_DIR=".venv"
 
-# A repetition the launcher could not start because GitHub's token endpoint
-# failed transiently (record_unit_not_run, beside run_one_unit). The unit
+# A repetition the launcher could not start (record_unit_not_run, beside
+# run_one_unit): GitHub's token endpoint failed transiently, a fixture it needs
+# drifted, its card fence could not run, and the other skips that function's
+# callers name. The unit
 # writes a record in place of the run that carries the harness's own
 # infrastructure marker -- bench/kube_agents_bench/harness.py's and
 # scoring.py's INFRA_FAILURE_MARKER, which tests/test_ci_eval_ledger_mint.py
@@ -148,6 +152,11 @@ readonly EVAL_LEASE_FIXTURE_SCAN_TIMEOUT_SECONDS=300
 readonly EVAL_FIXTURE_STATE_PUBLISHED="gs://kube-agents-dashboards/evals/fixture-state.json"
 readonly EVAL_FIXTURE_STATE_PUBLISHED_COPY="fixture-state-published.json"
 readonly EVAL_FIXTURE_DRIFT_DIR="fixture-drift"
+# Where a second-phase unit whose card fence could not reach the gateway is
+# noted (fence_live_cards), one file per unit, read by run_one_unit, which
+# records the unit as infrastructure rather than launching it into a window the
+# fence did not clear.
+readonly EVAL_FENCE_UNFENCED_DIR="fence-unfenced"
 readonly EVAL_FIXTURE_DRIFT_CHANGED_FILES="fixture-drift-changed-files.txt"
 # The opening chat turn's seconds beside results.json, where
 # bench/kube_agents_bench/scoring.py (_TIMING_FILE) reads them.
@@ -324,10 +333,27 @@ readonly EVAL_INSTALL_GONE_MARKER="install-gone"
 # kubectl, not the helper in the pod, so the helper must end by itself first or
 # a later pass could archive the card of the unit launched next. The margin
 # covers the exec's setup, the interpreter's start and the last board read; a
-# helper that runs out names the cards it did not reach, and the warning says so.
+# helper that runs out names the cards it did not reach, exits
+# EVAL_FENCE_DECIDED_EXIT (its EXIT_LEFT_LIVE; scripts/test_ci_fence_cards.py
+# holds the two equal), and the warning says so: the fence ran, and the unit
+# launches as it did before the fence.
 readonly EVAL_FENCE_CARD_PASSES=3
 readonly EVAL_FENCE_TIMEOUT_SECONDS=180
 readonly EVAL_FENCE_BUDGET_MARGIN_SECONDS=30
+readonly EVAL_FENCE_DECIDED_EXIT=3
+# Any other exit is a fence that did not run to its verdict, most often an exec
+# that did not reach the container (#5508): a gateway preempted or rolled during
+# the second phase has no pod for some minutes, and a fence that ran against none
+# would let the earlier unit's card, retried on the new pod, write into the next
+# window. So each attempt first waits for a Ready gateway pod, the way the
+# scheduled-audits exec does, and a fence that still could not run after its
+# attempts marks the unit unfenced (EVAL_FENCE_UNFENCED_DIR) instead of launching
+# it. Once a unit has gone unfenced the latch below holds the next fences
+# to one attempt each, until one succeeds: an outage that outlasts the phase then
+# costs one wait per unit, not three.
+readonly EVAL_FENCE_ATTEMPTS=3
+readonly EVAL_FENCE_POD_WAIT_SECONDS=300
+readonly EVAL_FENCE_GATEWAY_AWAY_LATCH=".gateway-away"
 # scheduled_audits: how long one exec that pauses or resumes the clock-started audits
 # may take. Each is a `hermes cron` call of a few seconds, bounded at 30s by the
 # script, so five stalled calls still finish and name themselves inside this.
@@ -1221,8 +1247,10 @@ echo "✓ Seeded-fleet credentials finished in $((SECONDS - STEP_START))s"
 # kubectl read per assertion and one describe per control-plane role.
 # Read-only: every call is a `kubectl get` through the role kubeconfigs (the
 # fleet reader's token), a `gcloud container clusters describe` on this job's
-# own credential, which already lists the same clusters above, or a `gcloud
-# compute ... list` of a project-scoped role's objects on the same credential.
+# own credential, which already lists the same clusters above, a `gcloud
+# compute ... list` of a project-scoped role's objects, or a `gcloud compute
+# instances get-serial-port-output` of the startup-fail VM, on the same
+# credential.
 #
 # What it feeds: kube_agents_bench.fixture_drift, before the fan-out, marks each
 # case whose grade depends on a role the scan positively saw drifted, and the
@@ -2301,15 +2329,19 @@ wait_platform_runs() { # <label> <space-separated audit ids>
 # exchange is cut and the harness cannot send the cancel over the failed
 # transport (pull-kube-agents-smoke-test 2116235582324609024 on #4323 and
 # 2117358437963665408 on #3846), at the delegation ceiling, and through a
-# worker's own fan-out. The exec goes to the gateway pod, not through the
+# worker's own fan-out. The exec goes to a Ready gateway pod (ready_gateway_pod), not through the
 # port-forward the cut exchange used. hack/ci_fence_cards.py does the work and
 # says what it archived; the settle that follows in launch_units covers a push
 # already in flight when a worker stops. Pinned to AGENT_CLUSTER_CONTEXT and
 # refused for a context that does not name PROJECT_ID, as wait_platform_runs
-# is. Returns 0 whatever happens: a fence that fails is a warning, and the
-# unit runs as it did before the fence.
-fence_live_cards() { # <label>
-  local label="$1" ns ctx out rc=0
+# is. Returns 0 whatever happens. A fence skipped for a missing prerequisite or
+# a foreign context, or one that ran and left cards it names (the helper's
+# decided exit), is a warning, and the unit runs as it did before the fence. A
+# fence that could not run to its verdict after its attempts notes the unit
+# under FENCE_UNFENCED_DIR, and run_one_unit records it as infrastructure
+# instead of launching it (#5508).
+fence_live_cards() { # <label> [<task-name> <rep>]
+  local label="$1" name="${2:-}" rep="${3:-}" ns ctx out rc=0 pod attempt
   ns="${TARGET_NAMESPACE:-}"
   ctx="${AGENT_CLUSTER_CONTEXT:-}"
   if [ -z "${PROJECT_ID:-}" ] || [ -z "${ctx}" ] || [ -z "${ns}" ] || [ -z "${EVAL_FANOUT_STARTED_EPOCH:-}" ] || ! command -v kubectl >/dev/null 2>&1; then
@@ -2324,17 +2356,55 @@ fence_live_cards() { # <label>
   esac
   local bound=(timeout --foreground "${EVAL_FENCE_TIMEOUT_SECONDS}")
   command -v timeout >/dev/null 2>&1 || bound=()
-  out="$(${bound[@]+"${bound[@]}"} kubectl --context "${ctx}" -n "${ns}" exec -i "deployment/${AGENT_SERVICE_NAME}-gateway" \
-    -c "${EVAL_GATEWAY_CONTAINER}" --request-timeout="${EVAL_SANDBOX_EXEC_TIMEOUT}" -- \
-    "${EVAL_GATEWAY_PYTHON}" - "${EVAL_GATEWAY_HOME}" "${EVAL_FANOUT_STARTED_EPOCH}" "${EVAL_FENCE_CARD_PASSES}" \
-    "$((EVAL_FENCE_TIMEOUT_SECONDS - EVAL_FENCE_BUDGET_MARGIN_SECONDS))" \
-    < "${SCRIPT_DIR}/ci_fence_cards.py" 2>&1)" || rc=$?
-  if [ "${rc}" -eq 0 ]; then
-    echo "Card fence (${label}): ${out}"
-    return 0
+  # Each attempt first waits for a Ready gateway pod and execs into that pod, as the
+  # scheduled-audits exec does: a gateway preempted or rolled mid-phase (#5508) has no
+  # container to exec into for some minutes, and the card the earlier unit left runs
+  # again on the pod that replaces it. After a unit has gone unfenced, the latch holds
+  # each later fence to one attempt until one succeeds.
+  local attempts="${EVAL_FENCE_ATTEMPTS}" latch=""
+  if [ -n "${FENCE_UNFENCED_DIR:-}" ]; then
+    latch="${FENCE_UNFENCED_DIR}/${EVAL_FENCE_GATEWAY_AWAY_LATCH}"
+    [ ! -e "${latch}" ] || attempts=1
   fi
-  [ "${rc}" -eq 124 ] && out="timed out after ${EVAL_FENCE_TIMEOUT_SECONDS}s${out:+; ${out}}"
-  echo "WARNING: Card fence (${label}): kubectl exec into ${ns}/${AGENT_SERVICE_NAME}-gateway exited ${rc} (${out}); a card an earlier unit left running may still open a pull request in this unit's window, where the GitHub-write safeguard charges it (#4425)" >&2
+  for attempt in $(seq 1 "${attempts}"); do
+    rc=0
+    pod="$(ready_gateway_pod "${ctx}" "${ns}" "${EVAL_FENCE_POD_WAIT_SECONDS}")" || {
+      rc=1
+      out="no Ready gateway pod within ${EVAL_FENCE_POD_WAIT_SECONDS}s"
+      [ "${attempt}" -lt "${attempts}" ] && sleep "${EVAL_PLATFORM_RUN_POLL_SECONDS}"
+      continue
+    }
+    out="$(${bound[@]+"${bound[@]}"} kubectl --context "${ctx}" -n "${ns}" exec -i "${pod}" \
+      -c "${EVAL_GATEWAY_CONTAINER}" --request-timeout="${EVAL_SANDBOX_EXEC_TIMEOUT}" -- \
+      "${EVAL_GATEWAY_PYTHON}" - "${EVAL_GATEWAY_HOME}" "${EVAL_FANOUT_STARTED_EPOCH}" "${EVAL_FENCE_CARD_PASSES}" \
+      "$((EVAL_FENCE_TIMEOUT_SECONDS - EVAL_FENCE_BUDGET_MARGIN_SECONDS))" \
+      < "${SCRIPT_DIR}/ci_fence_cards.py" 2>&1)" || rc=$?
+    if [ "${rc}" -eq 0 ]; then
+      echo "Card fence (${label}): ${out}"
+      [ -z "${latch}" ] || rm -f "${latch}" 2>/dev/null || true
+      return 0
+    fi
+    if [ "${rc}" -eq "${EVAL_FENCE_DECIDED_EXIT}" ]; then
+      # The helper ran and says what it could not archive: the fence did its work,
+      # and the unit launches as it did before the fence existed.
+      echo "WARNING: Card fence (${label}): ${out}; a card still live may open a pull request in this unit's window, where the GitHub-write safeguard charges it (#4425)" >&2
+      [ -z "${latch}" ] || rm -f "${latch}" 2>/dev/null || true
+      return 0
+    fi
+    [ "${rc}" -eq 124 ] && out="timed out after ${EVAL_FENCE_TIMEOUT_SECONDS}s${out:+; ${out}}"
+    echo "WARNING: Card fence (${label}): kubectl exec into ${pod} exited ${rc} on attempt ${attempt} of ${attempts} (${out})" >&2
+    [ "${attempt}" -lt "${attempts}" ] && sleep "${EVAL_PLATFORM_RUN_POLL_SECONDS}"
+  done
+  # Not launched into a window the fence did not clear: run_one_unit records the
+  # unit as infrastructure from this note (#4425, #5508). A caller that named no
+  # unit gets the warning alone.
+  echo "WARNING: Card fence (${label}): could not run after ${attempts} attempt(s) (${out}); a card an earlier unit left running may still open a pull request in this unit's window, where the GitHub-write safeguard charges it, so the unit is not launched (#4425, #5508)" >&2
+  if [ -n "${name}" ] && [ -n "${rep}" ] && [ -n "${FENCE_UNFENCED_DIR:-}" ]; then
+    mkdir -p "${FENCE_UNFENCED_DIR}" 2>/dev/null || true
+    printf '%s\n' "the card fence could not run before this unit (${out}); not launched into a window it did not clear (#5508)" \
+      > "${FENCE_UNFENCED_DIR}/${name}.rep${rep}" 2>/dev/null || true
+    : > "${latch}" 2>/dev/null || true
+  fi
   return 0
 }
 
@@ -2915,6 +2985,31 @@ export AGENT_PROVIDER="google"
 # Secret; hack/ci-deploy.sh, which runs first in every lane, refuses a Prow
 # job without it, so the default here serves local runs only.
 export AGENT_MODEL="${AGENT_MODEL_OVERRIDE:-gemini-3.1-pro-preview}"
+# --- reasoning effort: begin
+# The reasoning effort the install's gateway asks for, the same variable
+# hack/ci-deploy.sh passed to the chart (litellm.reasoningEffort): low, medium
+# or high, or empty for the model default. `bench-gate case` reads it, with
+# MODEL_PROVIDER, from the environment and stamps every case record with the
+# provider, the model and the effort it was graded under; a flag would not do,
+# because a pull request is graded with main's bench (pin_grader above). The
+# value is checked before the first unit rather than hours later at grading.
+# MODEL_DEFAULT_NAME is the model the install serves and AGENT_MODEL the one
+# the records name (devops-bench's setupId): a run whose two differ would file
+# its records under a model the install never ran, so it stops here.
+export EVAL_REASONING_EFFORT="${EVAL_REASONING_EFFORT:-}"
+case "${EVAL_REASONING_EFFORT}" in
+  "" | low | medium | high) ;;
+  *)
+    echo "ERROR: EVAL_REASONING_EFFORT='${EVAL_REASONING_EFFORT}' is not low, medium, high or empty (the model default)." >&2
+    exit 1
+    ;;
+esac
+if [ -n "${MODEL_DEFAULT_NAME:-}" ] && [ "${MODEL_DEFAULT_NAME}" != "${AGENT_MODEL}" ]; then
+  echo "ERROR: MODEL_DEFAULT_NAME=${MODEL_DEFAULT_NAME} (the model the install serves) differs from AGENT_MODEL=${AGENT_MODEL} (the model the records name); set AGENT_MODEL_OVERRIDE to the served model." >&2
+  exit 1
+fi
+echo "Agent model for this run: ${MODEL_PROVIDER:-unset provider}/${AGENT_MODEL}, reasoning effort: ${EVAL_REASONING_EFFORT:-model default}"
+# --- reasoning effort: end
 
 # Unset NAMESPACE so devops-bench OpenTofu deployer does not pass -var namespace=... to stacks that don't declare it
 unset NAMESPACE
@@ -4319,6 +4414,14 @@ fi
 if [ "${EVAL_TIER}" = "certification" ]; then
   EVAL_IS_MAIN_RUN="false"
 fi
+# A run at a named reasoning effort never appends either: the version key
+# (setup_id, scoring_version, judge_model, fleet, verifiers, mode) carries no
+# effort, so its lines would pool with the default-effort nights under one key.
+# The effort in the key is a later change; until then such a run reads the
+# store like a presubmit.
+if [ -n "${EVAL_REASONING_EFFORT:-}" ]; then
+  EVAL_IS_MAIN_RUN="false"
+fi
 # The commit each line is stamped with. A postsubmit carries it as
 # PULL_BASE_SHA; a periodic carries neither that nor PULL_PULL_SHA (Prow's
 # EnvForSpec returns before setting them for JOB_TYPE=periodic), so
@@ -4807,6 +4910,11 @@ echo "Infra lock: ${STACK_CONTENDERS} stack-bearing task(s); a unit waits up to 
 # silently un-gate transcript-read checks.
 STATE_DIR="$(mktemp -d)"
 
+# The units the card fence could not run before (fence_live_cards): one reason
+# file each under EVAL_FENCE_UNFENCED_DIR, read by run_one_unit beside the
+# fixture-drift marks below. Set apart from them: tests lift the drift step
+# from its first assignment to its closing fi.
+FENCE_UNFENCED_DIR="${STATE_DIR}/${EVAL_FENCE_UNFENCED_DIR}"
 # The cases that need a fixture the lease-time scan saw drifted
 # (scan_lease_fixtures): one reason file each under EVAL_FIXTURE_DRIFT_DIR,
 # read by run_one_unit. The module grades every case as usual, and says so,
@@ -5239,6 +5347,22 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
     lock_release "${STATE_DIR}/lock-task-${name}"
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} did not run: a fixture it needs drifted on the leased project" >&2
     if [ "${drift_reps}" -ge "${EVAL_REPETITIONS}" ]; then
+      finish_case "${task}" "${name}"
+    fi
+    return 0
+  fi
+  # The card fence before this second-phase unit could not reach the gateway
+  # (fence_live_cards, #5508): the unit is recorded as infrastructure under the
+  # fence's note and never launched, since a card an earlier unit left running
+  # would write into its exclusive window and be charged to it. Unwound as the
+  # drift skip above is.
+  local unfenced_file="${FENCE_UNFENCED_DIR:-}/${name}.rep${rep}" unfenced_reps=0
+  if [ -n "${FENCE_UNFENCED_DIR:-}" ] && [ -s "${unfenced_file}" ]; then
+    record_unit_not_run "${name}" "${rep}" "$(head -n 1 "${unfenced_file}")"
+    unfenced_reps="$(finished_rep_count "${name}")"
+    lock_release "${STATE_DIR}/lock-task-${name}"
+    echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} did not run: its card fence could not run before it" >&2
+    if [ "${unfenced_reps}" -ge "${EVAL_REPETITIONS}" ]; then
       finish_case "${task}" "${name}"
     fi
     return 0
@@ -5711,11 +5835,13 @@ EOF_UNIT_QUEUE
     # Staggered, so N units do not open their first model call in the same
     # second -- burst 429s at the model quota are the fan-out's failure mode;
     # in the second phase the pause is the writer pause instead (the settle).
-    # A unit of a case marked for a drifted fixture makes no model call and no
-    # write, so it skips the pause.
+    # A unit of a case marked for a drifted fixture, or one its fence left
+    # unfenced, makes no model call and no write, so it skips the pause.
     if [ -z "${FIXTURE_DRIFT_DIR:-}" ] || [ ! -s "${FIXTURE_DRIFT_DIR}/${TASK_NAMES[IDX]}" ]; then
-      [ -z "${fence}" ] || fence_live_cards "${TASK_NAMES[IDX]} rep ${REP}"
-      sleep "${pause}"
+      [ -z "${fence}" ] || fence_live_cards "${TASK_NAMES[IDX]} rep ${REP}" "${TASK_NAMES[IDX]}" "${REP}"
+      if [ -z "${FENCE_UNFENCED_DIR:-}" ] || [ ! -s "${FENCE_UNFENCED_DIR}/${TASK_NAMES[IDX]}.rep${REP}" ]; then
+        sleep "${pause}"
+      fi
     fi
     echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] launching ${TASK_NAMES[IDX]} rep ${REP}/${EVAL_REPETITIONS}"
     UNIT_SEQ=$((${UNIT_SEQ:-0} + 1))
@@ -5931,6 +6057,8 @@ elif [ -n "${RC_COMMIT_SHA:-}" ]; then
   echo "Release-candidate run (RC_COMMIT_SHA=${RC_COMMIT_SHA}): the baseline store is read, never written — the candidate is judged against main's window, not added to it."
 elif [ "${EVAL_ROLLBACK_LANE:-}" = "1" ] && [ -z "${PULL_NUMBER:-}" ]; then
   echo "Today-lane run (EVAL_ROLLBACK_LANE=1, JOB_TYPE=${JOB_TYPE:-unset}): the baseline store is read, never written — a rolled-back install is not what today's window measures."
+elif [ -n "${EVAL_REASONING_EFFORT:-}" ] && [ -z "${PULL_NUMBER:-}" ]; then
+  echo "Reasoning-effort run (EVAL_REASONING_EFFORT=${EVAL_REASONING_EFFORT}, JOB_TYPE=${JOB_TYPE:-unset}): the baseline store is read, never written; the version key carries no effort, so the lines would pool with the default-effort window."
 else
   echo "Not a main-branch recorder run (JOB_TYPE=${JOB_TYPE:-unset}): the baseline store is read, never written."
 fi

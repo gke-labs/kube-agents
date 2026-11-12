@@ -1382,6 +1382,25 @@ func TestPodUsageSource_ReadsTheDispatchersFailingBoards(t *testing.T) {
 		t.Fatalf("a streak past int64: err %v, want a sample error", err)
 	}
 
+	reading, err = scrape(chat(
+		`kubeagents_kanban_dispatcher_failed_ticks{board="default",error="OperationalError"} 3`,
+		"# TYPE kubeagents_kanban_dispatcher_failing_seconds gauge",
+		`kubeagents_kanban_dispatcher_failing_seconds{board="default",error="OperationalError"} 375`,
+		`kubeagents_kanban_dispatcher_failing_seconds{board="gone",error="OSError"} 900`,
+	), usageChatCounters)
+	if err != nil {
+		t.Fatalf("Scrape with ages: %v", err)
+	}
+	wantAged := []usageDispatcherFailure{{Board: "default", Error: "OperationalError", Ticks: 3, Seconds: 375, HasAge: true}}
+	if !reflect.DeepEqual(reading.Dispatcher.Failing, wantAged) {
+		t.Fatalf("aged dispatcher = %+v, want %+v (an age with no ticks ignored)", reading.Dispatcher.Failing, wantAged)
+	}
+	_, err = scrape(chat(`kubeagents_kanban_dispatcher_failing_seconds{board="default",error="OSError"} 1e20`), usageChatCounters)
+	var ageErr *usageScrapeError
+	if !errors.As(err, &ageErr) || ageErr.Kind != usageScrapeKindSample {
+		t.Fatalf("an age past int64: err %v, want a sample error", err)
+	}
+
 	many := make([]string, 0, usageDispatcherBoardCeiling+1)
 	for i := 0; i <= usageDispatcherBoardCeiling; i++ {
 		many = append(many, fmt.Sprintf(`kubeagents_kanban_dispatcher_failed_ticks{board="b%d",error="OSError"} 1`, i))

@@ -107,7 +107,10 @@ it is a periodic with no `PULL_NUMBER`, so it satisfies both conditions exactly.
 places. `EVAL_ROLLBACK_LANE=1` is the fourth, also enforced in both: the today
 lane deploys `next` and rolls it back to `today` before its
 matrix, so its key reads `today`, but a rolled-back install is not the fresh
-`today` install that window measures. The third has to be enforced twice,
+`today` install that window measures. A run at a named reasoning effort
+(`EVAL_REASONING_EFFORT` set) is the fifth, enforced in both as well: the key
+carries no effort, so its lines would pool with the default-effort window.
+The third has to be enforced twice,
 because the mistake is not correctable afterwards:
 `VersionKey` names the setup, the scoring version, the judge, the two content
 versions and the mode, and nothing about which build produced a sample, so a
