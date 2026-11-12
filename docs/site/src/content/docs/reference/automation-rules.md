@@ -78,29 +78,6 @@ cannot leave the allow rules beside it in force:
 - A rule is missing `fix` or `environments`, an environment is not a label value, or an allow rule
   uses `*`.
 
-## When an auto-merged fix is still broken
-
-With the switch `on`, kube-agents marks a fix your pipeline may merge on its own with the
-`kube-agents:auto-merge` label. When such a fix has merged and kube-agents' after-merge check finds
-the problem still there, it opens two pull requests against the branch the fix merged into, and
-comments once on the fix to link them:
-
-- `platform-agent/revert-<number>` undoes the fix's changes, whether it merged as a merge commit, a
-  squash or a rebase.
-- `platform-agent/automerge-step-down-<number>` adds a deny rule for that kind of fix in that
-  environment to this file. It edits the file in place and keeps everything else you wrote; in a
-  block-style file a comment above the rule names the fix. Delete the rule later to allow those
-  fixes again.
-
-Both go through your normal review; kube-agents merges neither. Until the second one merges, fixes of
-that kind can still merge on their own. With the switch `off` or `practice`, nothing merged
-unattended, so the after-merge report is the only response.
-
-When one of the two cannot be made, the comment says why and the other still opens. The revert is
-skipped when the fix's changes no longer undo cleanly, for example because someone already reverted
-it. The rules change is skipped when the file is absent or refused on that branch, or is laid out in
-a way kube-agents cannot add a rule to.
-
 ## Check a file
 
 In the install's shell sandbox (the `<name>-shell` Pod), where the agent's checkouts live:
