@@ -204,7 +204,11 @@ func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 	profilesNS := profileNamespaceOf(&profile)
 	if resolution.refused == nil {
-		foreign, err := agentProfileServiceAccountIsForeign(ctx, r.Client, &profile)
+		// Checked on the tiers that render: a refused or unknown tier gets
+		// no ServiceAccount, so a hand-made one under its name collides
+		// with nothing until the tier renders, when the next pass checks it.
+		checked := narrowedCopy(&profile, verdict)
+		foreign, err := agentProfileServiceAccountIsForeign(ctx, r.Client, checked)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
