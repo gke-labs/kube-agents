@@ -117,9 +117,9 @@ Settings with no default: `churn_pod_lifetime_seconds`, `fixture_machine_type`, 
 - `cluster_create_parallelism`: how many clusters or node pools change at once;
 - `watcher_wait_seconds`: how long the event watcher may take to report every test cluster; the
   runner looks every 30 s and stops at the first match, but gives up no sooner than 180 s, one
-  profile rescan plus the new cluster's initial list. Runs recorded before #4496 started on a
-  gateway restart when the watch set differed; runs after it do not, and an error marks a run whose
-  watch set never matched;
+  profile rescan plus the new cluster's initial list. Runs recorded before the runner waited for
+  the rescan (before `restart_unwatched_watcher` existed) started on a gateway restart when the
+  watch set differed; later runs do not, and an error marks a run whose watch set never matched;
 - `restart_unwatched_watcher`: restart the gateway Pod when the event watcher still does not watch
   every test cluster after that wait, and record that a restart was needed (default off: the
   mismatch is recorded as an error instead);
