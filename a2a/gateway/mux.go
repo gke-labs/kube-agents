@@ -20,13 +20,24 @@ const (
 	// token settles into one attempt a minute.
 	muxRestartBase = time.Second
 	muxRestartMax  = time.Minute
+
+	// muxUnknownBackendFormat refuses a direct-message user id whose
+	// backend prefix names no backend the mux runs.
+	muxUnknownBackendFormat = "multi adapter: no backend %q for a direct message"
 )
+
+// errNoPrimaryBackend refuses a bare direct-message user id when the mux runs
+// more than one real backend and so has no primary to send it to.
+var errNoPrimaryBackend = errors.New("multi adapter: a direct message needs a backend-qualified user id (<backend>:<id>) when no single backend is primary")
 
 // MultiAdapter presents several backends to the gateway as one Adapter.
 // Conversation ids are backend-qualified by convention (discord:…, gchat:…,
 // console:…), so every per-conversation operation dispatches on the prefix.
-// OpenDirect takes a user id with no prefix and goes to the primary backend,
-// the one the process was configured for.
+// OpenDirect takes a backend-qualified user id (slack:U1) and goes to that
+// backend with the bare id. A bare id goes to the primary backend, the one
+// real backend when the process runs only one, and is refused when there is
+// no primary. Run stamps every inbound message that names no backend with
+// the key of the backend that delivered it.
 //
 // One backend is essential: when it stops, Run returns and the process
 // restarts. Every other backend is contained: when it stops, Run logs it and
@@ -44,10 +55,10 @@ type MultiAdapter struct {
 	after                   func(time.Duration) <-chan time.Time
 }
 
-// NewMultiAdapter builds the mux. primary and essential must both be keys of
-// byPrefix.
+// NewMultiAdapter builds the mux. essential must be a key of byPrefix, and so
+// must primary unless it is "", which means no single backend is primary.
 func NewMultiAdapter(primary, essential string, byPrefix map[string]Adapter, log *slog.Logger) (*MultiAdapter, error) {
-	if _, ok := byPrefix[primary]; !ok {
+	if _, ok := byPrefix[primary]; primary != "" && !ok {
 		return nil, fmt.Errorf("multi adapter: primary backend %q is not configured", primary)
 	}
 	if _, ok := byPrefix[essential]; !ok {
@@ -99,11 +110,17 @@ func (m *MultiAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 		wg.Add(1)
 		go func(name string, a Adapter) {
 			defer wg.Done()
+			stamped := func(msg InboundMessage) {
+				if msg.Backend == "" {
+					msg.Backend = name
+				}
+				handler(msg)
+			}
 			if name == m.essential {
-				essentialDone <- stopped(ctx, name, a.Run(ctx, handler))
+				essentialDone <- stopped(ctx, name, a.Run(ctx, stamped))
 				return
 			}
-			m.runContained(ctx, name, a, handler)
+			m.runContained(ctx, name, a, stamped)
 		}(name, a)
 	}
 	var err error
@@ -210,6 +227,16 @@ func (m *MultiAdapter) Roster(conversation string) ([]string, bool, error) {
 }
 
 func (m *MultiAdapter) OpenDirect(userID string) (string, error) {
+	if backend, id, ok := strings.Cut(userID, ":"); ok {
+		a, known := m.byPrefix[backend]
+		if !known {
+			return "", fmt.Errorf(muxUnknownBackendFormat, backend)
+		}
+		return a.OpenDirect(id)
+	}
+	if m.primary == "" {
+		return "", errNoPrimaryBackend
+	}
 	return m.byPrefix[m.primary].OpenDirect(userID)
 }
 

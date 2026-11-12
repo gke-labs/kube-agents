@@ -289,3 +289,74 @@ func TestMultiAdapterRoutesATerminalToItsBackend(t *testing.T) {
 		t.Error("a terminal for an unknown backend was accepted")
 	}
 }
+
+func TestMultiAdapterStampsTheBackendOnInbound(t *testing.T) {
+	s, g, c := newFakeAdapter(), newFakeAdapter(), newFakeAdapter()
+	m, err := NewMultiAdapter("", "console", map[string]Adapter{"slack": s, "gchat": g, "console": c}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make(chan InboundMessage, 3)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go m.Run(ctx, func(msg InboundMessage) { got <- msg })
+	s.inbox <- InboundMessage{Conversation: "slack:C1/1.1", AuthorID: "U1"}
+	g.inbox <- InboundMessage{Conversation: "gchat:spaces/A", AuthorID: "a@x"}
+	c.inbox <- InboundMessage{Conversation: "console:tab", AuthorID: "me", Backend: consoleBackend}
+	want := map[string]string{"slack:C1/1.1": "slack", "gchat:spaces/A": "gchat", "console:tab": "console"}
+	for range want {
+		select {
+		case msg := <-got:
+			if msg.Backend != want[msg.Conversation] {
+				t.Errorf("%s stamped %q, want %q", msg.Conversation, msg.Backend, want[msg.Conversation])
+			}
+		case <-time.After(time.Second):
+			t.Fatal("inbound not delivered")
+		}
+	}
+}
+
+func TestMultiAdapterOpenDirectResolvesPerBackend(t *testing.T) {
+	s, g, c := newFakeAdapter(), newFakeAdapter(), newFakeAdapter()
+	m, err := NewMultiAdapter("", "console", map[string]Adapter{"slack": s, "gchat": g, "console": c}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.OpenDirect("slack:U1"); err != nil {
+		t.Errorf("prefixed id refused: %v", err)
+	}
+	if _, err := m.OpenDirect("U1"); err == nil {
+		t.Error("a bare id with two real backends was accepted")
+	}
+	if _, err := m.OpenDirect("nosuch:U1"); err == nil || !strings.Contains(err.Error(), "nosuch") {
+		t.Errorf("unknown prefix: err = %v, want one naming nosuch", err)
+	}
+	one := newTestMux(t, map[string]Adapter{"discord": newFakeAdapter(), "console": c})
+	if _, err := one.OpenDirect("1001"); err != nil {
+		t.Errorf("bare id with one real backend: %v", err)
+	}
+}
+
+func TestMultiAdapterRestartsOneBackendWhileTheOtherServes(t *testing.T) {
+	// Slack fails at every start; gchat and the console keep serving.
+	bad := &flakyAdapter{err: errors.New("auth.test: invalid_auth")}
+	g, c := newFakeAdapter(), newFakeAdapter()
+	m, err := NewMultiAdapter("", "console", map[string]Adapter{"slack": bad, "gchat": g, "console": c}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.restartBase, m.restartMax = time.Millisecond, 4*time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go m.Run(ctx, func(InboundMessage) {})
+	deadline := time.Now().Add(time.Second)
+	for bad.runs.Load() < 3 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if bad.runs.Load() < 3 {
+		t.Fatalf("slack restarted %d times, want at least 3", bad.runs.Load())
+	}
+	if _, err := m.Post("gchat:spaces/A", "still here"); err != nil {
+		t.Errorf("gchat stopped serving while slack restarts: %v", err)
+	}
+}
