@@ -411,17 +411,7 @@ func (rig *busStreamsRig) recreateJob(state batchv1.JobConditionType) {
 	}
 }
 
-func (rig *busStreamsRig) events() []string {
-	var out []string
-	for {
-		select {
-		case e := <-rig.recorder.Events:
-			out = append(out, e)
-		default:
-			return out
-		}
-	}
-}
+func (rig *busStreamsRig) events() []string { return drainEvents(rig.recorder) }
 
 func TestABusWithEveryStreamReadsPresent(t *testing.T) {
 	for _, replicas := range []int{1, 3} {
@@ -1441,5 +1431,85 @@ func TestPruningKeepsTheLastAttempt(t *testing.T) {
 	}
 	if ok, _ := got.allows(now); !ok {
 		t.Errorf("a kept attempt outside the window blocked a re-run")
+	}
+}
+
+// A delete that failed leaves an unsettled attempt on the live Job. If the
+// streams come back before the retry, the attempt settles with no restart
+// owed, so a later re-run of that Job (its TTL) restarts nothing.
+func TestAnAttemptWhoseDeleteFailedSettlesWhenTheStreamsComeBack(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	rig.serve(1, allStreamsBut("TASKS")...)
+	rig.poll()
+	rig.poll()
+	rig.jobDeleteErr = errors.New("etcdserver: request timed out")
+	if err := rig.poller.pollAgent(context.Background(), rig.agent()); err == nil {
+		t.Fatalf("poll succeeded with the Job delete failing")
+	}
+	rig.now = rig.now.Add(busStreamsPollInterval)
+	rig.jobDeleteErr = nil
+
+	rig.serve(1, a2aProvisionedStreams...)
+	rig.poll()
+	last := readBusReprovisionRecord(rig.agent()).last()
+	if last == nil || !last.Settled || !last.Restored || last.RestartOwed {
+		t.Fatalf("attempt = %+v, want settled as restored with no restart owed", last)
+	}
+	if c := rig.condition(); c == nil || c.Reason != busStreamsReasonAllPresent {
+		t.Fatalf("condition = %+v, want AllPresent", c)
+	}
+
+	// A day later the Job's TTL removes it and the reconcile runs a new one.
+	job := buildA2AProvisionJob(rig.agent())
+	if err := rig.cl.Delete(context.Background(), &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: job.Name, Namespace: job.Namespace}}); err != nil {
+		t.Fatal(err)
+	}
+	rig.now = rig.now.Add(24 * time.Hour)
+	rig.recreateJob(batchv1.JobComplete)
+	rig.events()
+	rig.poll()
+	for _, pod := range []string{"test-agent-a2a-gateway-abc", "test-agent-gateway-xyz"} {
+		if slices.Contains(rig.deleted, pod) {
+			t.Errorf("deleted %s on a healthy bus after a routine re-run of the provision Job", pod)
+		}
+	}
+	for _, e := range rig.events() {
+		if strings.Contains(e, busStreamsRestoredEventReason) {
+			t.Errorf("event %q for a re-run no attempt asked for", e)
+		}
+	}
+}
+
+// TASKS lost after a failed delete and before its retry is remembered on the
+// attempt, so the retried re-run still owes its readers the restart.
+func TestTasksLostBeforeARetriedDeleteStillRestartsItsClients(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	rig.serve(1, allStreamsBut("KV_cap")...)
+	rig.poll()
+	rig.poll()
+	rig.jobDeleteErr = errors.New("etcdserver: request timed out")
+	if err := rig.poller.pollAgent(context.Background(), rig.agent()); err == nil {
+		t.Fatalf("poll succeeded with the Job delete failing")
+	}
+	rig.now = rig.now.Add(busStreamsPollInterval)
+	rig.jobDeleteErr = nil
+
+	rig.serve(1, allStreamsBut("KV_cap", "TASKS")...)
+	rig.poll()
+	if rig.jobExists() {
+		t.Fatalf("the delete was not retried")
+	}
+	if last := readBusReprovisionRecord(rig.agent()).last(); last == nil || !last.TasksMissing {
+		t.Fatalf("attempt = %+v, want TASKS remembered as missing before the retry", last)
+	}
+	rig.recreateJob(batchv1.JobComplete)
+	rig.serve(1, a2aProvisionedStreams...)
+	rig.poll()
+	for _, pod := range []string{"test-agent-a2a-gateway-abc", "test-agent-gateway-xyz"} {
+		if !slices.Contains(rig.deleted, pod) {
+			t.Errorf("deleted %v, want %s restarted after the retried re-run recreated TASKS", rig.deleted, pod)
+		}
 	}
 }

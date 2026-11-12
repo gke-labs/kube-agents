@@ -55,10 +55,11 @@ import (
 // the CR reading as before, with nothing re-provisioning until the completed
 // Job's 24-hour TTL ran out, and nothing ever restarting the two clients that
 // hold a TASKS durable. The operator has no bus identity that may read stream
-// info, and the monitor port 8222 has no pod-network peer by design, so the
-// read goes through the exporter, which reads 8222 over loopback inside the
-// NATS pod (a2aNATSExporterContainer). The bus fence admits the operator to
-// the exporter's port and nothing else (buildA2ANATSNetworkPolicy).
+// info, so the read goes through the exporter, which reads 8222 over loopback
+// inside the NATS pod (a2aNATSExporterContainer). The bus fence admits the
+// operator to the exporter's port for this, and to 8222 only for confirming a
+// config reload (planA2ABusReload), which this check doesn't use
+// (buildA2ANATSNetworkPolicy).
 //
 // Every scrape of the exporter makes it fetch /jsz?all from its server again,
 // whose cost grows with the bus's consumer count (#5339; about 12 s of CPU at
@@ -594,6 +595,16 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 			p.r.recordEvent(agent, corev1.EventTypeNormal, busStreamsRestoredEventReason,
 				fmt.Sprintf("Re-running the A2A provision Job restored %s.", strings.Join(last.Missing, ", ")))
 		}
+	} else if last != nil && !last.Settled && jobState == busJobComplete && job.UID == last.JobUID && len(verdict.missing) == 0 {
+		// An attempt whose Job delete didn't land, and the streams are back
+		// before its retry: the Job never re-ran, so it recreated nothing
+		// and no client lost a consumer to it. Settle it as restored, with
+		// no restart owed, so a later re-run of that Job (its TTL, a spec
+		// change) isn't taken for this attempt's.
+		last.Settled, last.Restored = true, true
+		if err := p.writeRecord(ctx, agent, record.pruned(now)); err != nil {
+			return err
+		}
 	} else if last != nil && last.Settled && !last.Restored && !overlaps(last.Missing, verdict.missing) {
 		// The names a re-run did not bring back are back now (a fix by hand,
 		// say): lift the stop, so a later loss of them is re-provisioned.
@@ -671,8 +682,16 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 		// The last attempt is recorded but its Job is still the completed
 		// one it was to delete: the delete didn't land (an API error after
 		// the record was written). Retry the delete under the same attempt,
-		// rather than spend the rate limit on a new one.
-		return p.deleteProvisionJob(ctx, agent, job, last.Missing, streak)
+		// rather than spend the rate limit on a new one. TASKS lost since
+		// the failed delete is remembered on the attempt first, so its
+		// readers are owed the restart once the re-run recreates it.
+		if streak.tasksMissing && !last.TasksMissing {
+			last.TasksMissing = true
+			if err := p.writeRecord(ctx, agent, record.pruned(now)); err != nil {
+				return err
+			}
+		}
+		return p.deleteProvisionJob(ctx, agent, job, last.Missing, last.TasksMissing, streak)
 	}
 	if jobState != busJobComplete {
 		return p.writeCondition(ctx, agent, metav1.ConditionFalse, busStreamsReasonMissing,
@@ -690,7 +709,7 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 	if err := p.writeRecord(ctx, agent, record); err != nil {
 		return err
 	}
-	return p.deleteProvisionJob(ctx, agent, job, confirmed, streak)
+	return p.deleteProvisionJob(ctx, agent, job, confirmed, streak.tasksMissing, streak)
 }
 
 // deleteProvisionJob writes the Reprovisioning condition and deletes the
@@ -699,10 +718,10 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 // that fails doesn't hold the delete back: the next poll writes it again. A
 // delete that fails returns its error, and the next poll retries it under the
 // same attempt.
-func (p *BusStreamPoller) deleteProvisionJob(ctx context.Context, agent *agentv1alpha1.PlatformAgent, job *batchv1.Job, missing []string, streak *busStreamStreak) error {
+func (p *BusStreamPoller) deleteProvisionJob(ctx context.Context, agent *agentv1alpha1.PlatformAgent, job *batchv1.Job, missing []string, tasksMissing bool, streak *busStreamStreak) error {
 	names := strings.Join(missing, ", ")
 	restart := ""
-	if slices.Contains(missing, a2aTasksStream) {
+	if tasksMissing || slices.Contains(missing, a2aTasksStream) {
 		restart = " Once TASKS is back, the A2A gateway and the agent pod are restarted, so their TASKS consumers are recreated."
 	}
 	log := logf.FromContext(ctx).WithName(busStreamsPollerLogName)

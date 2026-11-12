@@ -9108,10 +9108,11 @@ func TestTheNATSExporterIsHardened(t *testing.T) {
 	}
 }
 
-// The collector reaches the exporter and nothing else on the NATS pod: one
-// rule names a2aNATSMetricsPort, its one port is that TCP port, and its one
-// peer is every pod in the managed-Prometheus namespace, the selector the A2A
-// gateway's metrics rule uses.
+// The collector and the operator reach the exporter, and the collector
+// nothing else on the NATS pod: one rule names a2aNATSMetricsPort, its one
+// port is that TCP port, and its peers are every pod in the managed-Prometheus
+// namespace (the selector the A2A gateway's metrics rule uses) and, when the
+// operator knows its own identity, the operator's pod.
 func TestTheBusFenceAdmitsTheCollectorAndTheOperatorOnTheExporterPortAlone(t *testing.T) {
 	for _, tc := range []struct {
 		replicas     int
