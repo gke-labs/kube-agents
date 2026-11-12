@@ -218,3 +218,17 @@ class RunCaseInterruptTest(unittest.TestCase):
                 cli.run_case("./tasks/a/task.yaml", "a", {}, Path(tmp))
             self.assertEqual((Path(tmp) / "a.log").read_text(), "partial")
         killpg.assert_called_once_with(4242, cli.signal.SIGTERM)
+
+
+class CapabilityUsageTest(unittest.TestCase):
+    def test_each_window_is_attributed_from_one_read_with_its_own_counters(self):
+        windows = {"burst": {"start": "2026-11-11T19:00:00+00:00", "seconds": 3600, "tokens": {"tokens_input": 1}},
+                   "soak": {"start": "2026-11-11T20:00:00+00:00", "seconds": 3600, "tokens": {}}}
+        seen = []
+        with mock.patch.object(cli.attribution, "read_stores", return_value={"sessions": []}) as read, \
+                mock.patch.object(cli.attribution, "attribute",
+                                  side_effect=lambda s, start, end, litellm: seen.append((end - start, litellm)) or {}):
+            usage = cli.capability_usage("ctx", "ns", windows)
+        read.assert_called_once()
+        self.assertEqual(list(usage), ["burst", "soak"])
+        self.assertEqual(seen, [(3600, {"tokens_input": 1}), (3600, {})])
