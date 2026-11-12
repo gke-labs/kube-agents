@@ -405,6 +405,14 @@ CLAUSE_HEADLINE_MIN = 20
 #: A clause cut never falls inside a parenthetical or a link's label or url.
 CLAUSE_OPENERS = "(["
 CLAUSE_CLOSERS = ")]"
+# A word cut steps back from a head that ends on one of these: a connector leaves the headline
+# hanging ("…overnight and…") and a bare number loses its unit ("…found 209…"). It also prefers a
+# cut outside a bracket, so a parenthetical opens the detail whole when a word before it fits.
+WORD_CUT_HOLDS = frozenset(("a", "an", "and", "as", "at", "but", "by", "for", "from", "in", "into", "of", "on", "or",
+                            "the", "to", "with"))
+# A word cut never falls inside a link, whose label and url read as one word: a Markdown link, or
+# an mrkdwn one (``<url|label>``), which this token also covers for a mention.
+WORD_CUT_LINKS = (MD_LINK, re.compile(r"<[^<>]*>"))
 
 
 def enabled() -> bool:
@@ -818,9 +826,12 @@ def word_cut(sentence: str) -> tuple[str, str] | None:
     A sentence with no clause break outside a bracket, a code span or an emphasis run (one long
     parenthetical, say) used to be clipped at the cap with the clipped words dropped. The cut is
     the last space outside a code span and a bold or italic run that leaves a headline of
-    :data:`CLAUSE_HEADLINE_MIN` to ``HEADLINE_MAX`` characters once plain, the ellipsis counted;
-    the headline ends on the ellipsis and the rest opens with one, so the sentence reads on in the
-    detail as written. A sentence bold from end to end is cut inside the bold, each half bold.
+    :data:`CLAUSE_HEADLINE_MIN` to ``HEADLINE_MAX`` characters once plain, the ellipsis counted,
+    outside a bracket when one such space exists and inside one otherwise, never inside a link
+    (:data:`WORD_CUT_LINKS`) and never after a word in :data:`WORD_CUT_HOLDS` or a bare number; the
+    headline ends on the ellipsis and the rest
+    opens with one, so the sentence reads on in the detail as written. A sentence bold from end
+    to end is cut inside the bold, each half bold.
     """
     for marker in BOLD_MARKERS:
         inner = sentence[len(marker) : -len(marker)]
@@ -835,9 +846,15 @@ def word_cut(sentence: str) -> tuple[str, str] | None:
         return (cut[0], cut[1] + sentence[end:]) if cut else None
     held, spans = _hold_code(sentence)
     limit = HEADLINE_MAX - len(ELLIPSIS)
-    found = None
+    links = [match.span() for pattern in WORD_CUT_LINKS for match in pattern.finditer(held)]
+    outside = inside = None
+    depth = 0
     for offset, char in enumerate(held):
-        if char != " ":
+        if char in CLAUSE_OPENERS:
+            depth += 1
+        elif char in CLAUSE_CLOSERS and depth:
+            depth -= 1
+        if char != " " or any(start < offset < end for start, end in links):
             continue
         head, rest = held[:offset].rstrip(), held[offset:].strip()
         if not rest or any(head.count(marker) % 2 for marker in BOLD_MARKERS):
@@ -848,12 +865,19 @@ def word_cut(sentence: str) -> tuple[str, str] | None:
         title = len(_plain(_restore_code(head, spans)))
         if title > limit:
             break
-        if title >= CLAUSE_HEADLINE_MIN:
-            found = head, rest
+        last = head.rsplit(" ", 1)[-1].strip("*_")
+        if title < CLAUSE_HEADLINE_MIN or last.lower() in WORD_CUT_HOLDS or last.isdigit():
+            continue
+        if depth:
+            inside = head, rest
+        else:
+            outside = head, rest
+    found = outside or inside
     if found is None:
         return None
     head, rest = (_restore_code(part, spans) for part in found)
-    return head + ELLIPSIS, ELLIPSIS + rest
+    # A sentence that carries its own ellipsis at the cut is not given a second one.
+    return (head if head.endswith(ELLIPSIS) else head + ELLIPSIS), (rest if rest.startswith(ELLIPSIS) else ELLIPSIS + rest)
 
 
 def split_lead(markdown: str, cut: bool = True, word: bool = False) -> tuple[str, list[str]]:
