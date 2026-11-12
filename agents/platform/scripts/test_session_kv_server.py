@@ -14314,13 +14314,13 @@ class TestCleanMergesRoute(unittest.TestCase):
         os.environ["SESSION_KV_API_KEY"] = API_KEY
         self.addCleanup(lambda: os.environ.pop("SESSION_KV_API_KEY", None))
         self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
-        # The server creates the table at start; these tests shape it themselves.
-        self._drop_table()
         self.addCleanup(self._drop_table)
 
     def _drop_table(self):
         with closing_db() as conn, conn:
             conn.execute("DROP TABLE IF EXISTS post_merge_records")
+        # Put the server's own table back for the tests that write records.
+        session_kv_server.init_db()
 
     def test_no_records_table_yet_is_an_empty_list(self):
         resp = self.client.get("/v1/post-merge/clean-merges")
@@ -14330,6 +14330,7 @@ class TestCleanMergesRoute(unittest.TestCase):
 
     def test_counts_the_clean_merges_per_repository_and_narrows_to_one(self):
         with closing_db() as conn, conn:
+            conn.execute("DROP TABLE IF EXISTS post_merge_records")
             conn.execute(
                 "CREATE TABLE post_merge_records (url TEXT PRIMARY KEY, repo TEXT, kind TEXT, environment TEXT, "
                 "outcome TEXT, outcome_at TEXT, merged_at TEXT, human_edited INTEGER, reverted_at TEXT)"
@@ -14353,6 +14354,9 @@ class TestCleanMergesRoute(unittest.TestCase):
 
     def test_a_table_missing_a_counted_column_is_a_503(self):
         with closing_db() as conn, conn:
+            # The server creates the full table at start; replace it with one
+            # missing the counted columns, as an older schema would be.
+            conn.execute("DROP TABLE IF EXISTS post_merge_records")
             conn.execute("CREATE TABLE post_merge_records (url TEXT PRIMARY KEY, outcome TEXT, outcome_at TEXT)")
         resp = self.client.get("/v1/post-merge/clean-merges")
         self.assertEqual(resp.status_code, 503, resp.text)
