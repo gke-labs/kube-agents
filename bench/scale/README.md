@@ -41,7 +41,10 @@ console's Harness limits page reads `harness-limits.json`.
   ([`sized-test-fleet.md`](../../docs/designs/sized-test-fleet.md)). `bench/tf/sized-fleet/` builds the
   clusters from it; `kube_agents_bench/scale/sized_fleet.py` (the workloads and the designed-state
   check), `sized_run.py` (the burst and soak windows and the verdict) and `sized_records.py` (the
-  measurements and the cost record) run on it, and `hack/sized_fleet.py` drives them.
+  measurements and the cost record) run on it, and `hack/sized_fleet.py` drives them. After each
+  run, `attribution.py` splits each window's model tokens by capability from the session records
+  ([`capability-usage-attribution.md`](../../docs/designs/capability-usage-attribution.md)), into
+  `capability-usage.json` and `capability-usage.md` beside the verdict.
 - `harness-limits.json`: every measured run. A run merges its records in and replaces only a record with the same key; a record leaves the file only by hand, as Phase 1's runs spoiled by an outside IAM change did before their re-runs.
 - `harness-limits.sample.json`: a small fake data set the console page and its tests use when
   `harness-limits.json` does not exist.

@@ -52,7 +52,7 @@ import yaml  # noqa: E402
 
 from kube_agents_bench.scale import collect, kube  # noqa: E402
 from kube_agents_bench.scale import sized_fleet as sf  # noqa: E402
-from kube_agents_bench.scale import operations, runner, sized_records, sized_run  # noqa: E402
+from kube_agents_bench.scale import attribution, operations, runner, sized_records, sized_run  # noqa: E402
 
 LOG = logging.getLogger("sized-fleet")
 STACK_DIR = REPO / "bench" / "tf" / "sized-fleet"
@@ -101,6 +101,8 @@ JUDGE_MODEL = "gemini-3.1-pro-preview"
 RESULTS_LINE = re.compile(r"results: (\S+results\.json)")
 KUBECONFIG_FORMAT = "sized-fleet-{size}.kubeconfig"
 VERDICT_FILE = "scale-verdict.json"
+USAGE_FILE = "capability-usage.json"
+USAGE_REPORT = "capability-usage.md"
 # The label a host cluster carries when its install exists to be measured: a run resets the
 # install's state volumes, and refuses a host without it, as the scale runner does.
 HOST_LABEL = "purpose=harness-scale"
@@ -509,6 +511,16 @@ def run_evals(args: argparse.Namespace, host_context: str, out: Path) -> dict:
     return summary
 
 
+def capability_usage(host_context: str, namespace: str, windows: dict[str, dict]) -> dict[str, dict]:
+    """Each window's tokens by capability (docs/designs/capability-usage-attribution.md), from one read."""
+    stores = attribution.read_stores(host_context, namespace)
+    usage = {}
+    for name, window in windows.items():
+        start = datetime.fromisoformat(window["start"]).timestamp()
+        usage[name] = attribution.attribute(stores, start, start + window["seconds"], litellm=window.get("tokens"))
+    return usage
+
+
 def run_once(args: argparse.Namespace) -> tuple[int, Path]:
     fleet = sf.fleet(args.size)
     credentials(args, fleet)
@@ -534,6 +546,8 @@ def run_once(args: argparse.Namespace) -> tuple[int, Path]:
     cost = sized_records.safe(
         lambda: sized_records.cost_record(args.project, args.run_id, record.windows, region=region_of(args.zone)),
         record.errors, "cost record")
+    usage = sized_records.safe(lambda: capability_usage(host_context, args.namespace, record.windows),
+                               record.errors, "capability usage") or {}
     result["errors"] = list(record.errors)
     records = {
         # The chat questions are eval records beside the verdict; they do not change it.
@@ -541,12 +555,15 @@ def run_once(args: argparse.Namespace) -> tuple[int, Path]:
                        "evals": evals},
         MEASUREMENTS_FILE: {"size": args.size, "run_id": args.run_id, "windows": record.windows},
         COST_FILE: cost,
+        USAGE_FILE: usage,
     }
     for name, body in records.items():
         (out / name).write_text(json.dumps(body, indent=2) + "\n")
         LOG.info("%s: %s", name, summary(name, body))
+    (out / USAGE_REPORT).write_text(attribution.markdown(usage) if usage else "No capability usage was read.\n")
     if args.results_bucket:
-        kube.run([kube.GCLOUD, "storage", "cp", *[str(out / n) for n in records], results_prefix(args)])
+        kube.run([kube.GCLOUD, "storage", "cp", *[str(out / n) for n in (*records, USAGE_REPORT)],
+                  results_prefix(args)])
         if (out / EVALS_DIR).is_dir():
             kube.run([kube.GCLOUD, "storage", "cp", "--recursive", str(out / EVALS_DIR), results_prefix(args)])
     print(json.dumps(records[VERDICT_FILE], indent=2))
@@ -559,6 +576,9 @@ def summary(name: str, body: dict) -> str:
     if name == VERDICT_FILE:
         failed = [c for c, v in body.get("checks", {}).items() if not v["passed"]]
         return f"{'green' if body.get('green') else 'red'}; failed: {', '.join(failed) or 'none'}"
+    if name == USAGE_FILE:
+        return "; ".join(f"{w}: unattributed {v['checks']['unattributed']['share']:.1%}, "
+                         f"sum {'sound' if v['checks']['sum']['passed'] else 'unsound'}" for w, v in body.items())
     if name == COST_FILE:
         return f"${body.get('usd', '?')} (infrastructure ${body.get('infrastructure', {}).get('usd', '?')})"
     windows = body.get("windows", {})
