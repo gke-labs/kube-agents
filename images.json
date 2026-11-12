@@ -171,7 +171,7 @@
       "name": "nats",
       "origin": "third-party",
       "repository": "docker.io/library/nats",
-      "tag": "2.10-alpine",
+      "tag": "2.10.29-alpine@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927",
       "override": "A2A_NATS_IMAGE",
       "pulledBy": "The NATS StatefulSet the operator renders under spec.mode: next, and nothing under spec.mode: today.",
       "description": "The JetStream bus behind the A2A next stack. The pin is the operator's compiled default; the env var is the only override, since the chart does not set it."
