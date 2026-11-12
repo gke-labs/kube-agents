@@ -21,7 +21,7 @@ the list here is read-only. Nothing reads the level yet, so the tab says it is
 recorded only.
 
 Each kind also shows its progress toward the auto-merge offer in each
-repository that has fixes of it, since the offer is earned per repository:
+repository that has fixes of it in that kind's environment, since the offer is earned per repository:
 "org/infra: 3 of 5 clean merges · org/apps: 1 of 5 clean merges", read from
 Session KV's ``GET`` :data:`CLEAN_MERGES_PATH` (the counter in
 ``agents/platform/scripts/clean_merges.py``, keyed by repository, kind and
@@ -251,6 +251,7 @@ _REPO_SEGMENT = re.compile(r"[A-Za-z0-9_.-]+")
 _SCP_REMOTE = re.compile(r"^(?:[^/@]+@)?(?P<host>[^/:]+):(?P<path>.+)$")
 _GITHUB_HOSTS = frozenset({"github.com", "www.github.com", "ssh.github.com"})
 _KNOWN_HOSTS = frozenset({"github.com", "gitlab.com", "bitbucket.org"})
+_GITHUB_HOSTS_CANONICAL = "github.com"
 
 
 def repo_key(url: Any) -> str:
@@ -296,14 +297,14 @@ def repo_key(url: Any) -> str:
     return f"{'github.com' if host in _GITHUB_HOSTS else host}/{path}".lower()
 
 
-def short_repo(repo: str) -> str:
-    """``org/infra`` for ``https://github.com/org/infra.git``: the repository as a person reads it."""
-    text = str(repo).strip().removesuffix("/").removesuffix(".git")
-    if "://" in text:
-        text = text.split("://", 1)[1].split("/", 1)[-1]
-    elif "@" in text.split("/", 1)[0] and ":" in text:
-        text = text.split(":", 1)[1]
-    return text or str(repo)
+def short_repo(key: str) -> str:
+    """``org/infra`` for the key ``github.com/org/infra``; any other host stays, so two hosts never share a name.
+
+    Built from the counter's ``repo_key`` rather than the recorded url, which can carry a query or
+    fragment the key ignores, and escaped for Slack mrkdwn.
+    """
+    text = str(key).removeprefix(_GITHUB_HOSTS_CANONICAL + "/")
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def _entries(record: dict, kind: str, environment: str) -> list[dict]:
@@ -342,7 +343,7 @@ def progress(record: dict | None, kind: str, environment: str) -> str:
     if not entries:
         return _words(record, None)
     shown = [
-        PROGRESS_IN.format(repo=short_repo(entry.get("repo") or entry["repo_key"]), progress=_words(record, entry))
+        PROGRESS_IN.format(repo=short_repo(entry["repo_key"]), progress=_words(record, entry))
         for entry in entries[:PROGRESS_REPOS_MAX]
     ]
     if len(entries) > PROGRESS_REPOS_MAX:

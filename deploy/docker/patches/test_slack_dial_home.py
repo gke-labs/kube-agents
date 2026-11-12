@@ -317,6 +317,17 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(seen, ["D42", "D42", "D42"])
 
 
+    def test_repository_names_come_from_the_key_and_keep_other_hosts(self):
+        record = {"counts": [
+            entry("https://github.com/org/infra?<https://evil.example|org/infra>", clean=2, days=1),
+            entry("https://ghe.corp/org/infra", clean=1, days=1),
+        ], "clean_merges_needed": 5, "days_needed": 2}
+        line = dial.progress(record, "no-pdb", "dev")
+        self.assertIn("org/infra: 2 of 5 clean merges", line)
+        self.assertIn("ghe.corp/org/infra: 1 of 5 clean merges", line)
+        self.assertNotIn("evil", line)
+        self.assertEqual(dial.short_repo("ghe.corp/a<b>&c/x"), "ghe.corp/a&lt;b&gt;&amp;c/x")
+
     def test_kind_shows_its_clean_merges_in_each_repository(self):
         record = {"counts": [
             entry("https://github.com/org/apps", clean=1, days=1),
