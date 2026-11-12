@@ -139,9 +139,10 @@ every project's listing fails, when no management project resolves, when
 
 Every `gcloud`, `kubectl` and `stall_report.py` call runs in the shell sandbox
 through `sandbox_exec`, because the agent container carries no kubectl (with the
-sandbox switched off the calls run locally and fail with `No such file or
-directory: 'gcloud'`, the same failure every `sandbox_exec` caller sees in that
-state). The script itself travels on the command's stdin, read from the agent
+sandbox switched off the calls run locally, under the watch's coreutils `timeout`
+wrapper, and fail with its exit 127, `failed to run command 'gcloud'`: no
+management project resolves and the tick reports a sweep failure). The script
+itself travels on the command's stdin, read from the agent
 image's copy in `/opt/defaults/scripts` and run with `python3 -I -`: what the
 `hermes` login executes is never a file under the sandbox's agent-owned
 `/opt/data`, and isolated mode keeps that directory, which is the command's
@@ -986,7 +987,7 @@ SOP and a roster entry, not a restore.
 ## Adding a watchdog: the repository steps
 
 The site's [Autonomous watchdogs](../../../docs/site/src/content/docs/concepts/autonomous-watchdogs.md#adding-a-watchdog)
-page lists what an entry needs. Two steps belong to this repository rather than
+page lists what an entry needs. Three steps belong to this repository rather than
 to an install:
 
 - Run `make docs-generate` after editing either roster. The site's cron
@@ -995,6 +996,10 @@ to an install:
   `compliance-audit` entry is also rendered in full as the job-schema example
   on the watchdogs, skills and cron-jobs pages, so an edit to it changes those
   three pages too.
+- Add, change or remove the job's row in
+  [`scheduling-on-profiles-inventory.md`](../../../docs/designs/scheduling-on-profiles-inventory.md)
+  in the same PR, saying where the job lives once Hermes cron retires (profile,
+  trigger kind, report sink). TBD with a linked open question is an answer.
 - For a dev workspace, `scripts/dev/dev_rebuild_agent.sh` rebuilds and restarts
   the agent image without a release; `./upgrade.sh --upgrade-mode=harness
 --image-tag=<ref>` is the path for an installed cluster.

@@ -157,6 +157,14 @@
         "seccompProfile": {
           "type": "RuntimeDefault"
         }
+      },
+      "dnsConfig": {
+        "options": [
+          {
+            "name": "ndots",
+            "value": "3"
+          }
+        ]
       }
     },
     "status": {}
@@ -341,6 +349,14 @@
         "seccompProfile": {
           "type": "RuntimeDefault"
         }
+      },
+      "dnsConfig": {
+        "options": [
+          {
+            "name": "ndots",
+            "value": "3"
+          }
+        ]
       }
     },
     "status": {}
@@ -508,6 +524,14 @@
         "seccompProfile": {
           "type": "RuntimeDefault"
         }
+      },
+      "dnsConfig": {
+        "options": [
+          {
+            "name": "ndots",
+            "value": "3"
+          }
+        ]
       }
     },
     "status": {}
@@ -735,6 +759,14 @@
         "seccompProfile": {
           "type": "RuntimeDefault"
         }
+      },
+      "dnsConfig": {
+        "options": [
+          {
+            "name": "ndots",
+            "value": "3"
+          }
+        ]
       }
     },
     "status": {}

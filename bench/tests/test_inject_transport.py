@@ -1023,7 +1023,7 @@ def test_a_failed_task_is_graded_rather_than_classified(
     stub_gateway.entries = [
         entry(1, inject.ENTRY_TASK, taskId=stub_gateway.task_id),
         entry(2, inject.ENTRY_POST, text=PLACEHOLDER, messageId=PLACEHOLDER_ID),
-        entry(3, inject.ENTRY_POST, text="❌ failed: the cluster is unreachable", messageId=RESULT_ID),
+        entry(3, inject.ENTRY_POST, text="❌ failed — the cluster is unreachable", messageId=RESULT_ID),
         entry(4, inject.ENTRY_TERMINAL, taskId=stub_gateway.task_id, state="failed",
               source=inject.TERMINAL_SOURCE_EXECUTOR,
               reason="reason: hermes-exited-nonzero - exit status 1"),
@@ -1048,7 +1048,7 @@ def test_an_executors_own_failure_is_infrastructure(
     stub_gateway.entries = [
         entry(1, inject.ENTRY_TASK, taskId=stub_gateway.task_id),
         entry(2, inject.ENTRY_POST, text=PLACEHOLDER, messageId=PLACEHOLDER_ID),
-        entry(3, inject.ENTRY_POST, text=f"❌ failed: reason: {token}", messageId=RESULT_ID),
+        entry(3, inject.ENTRY_POST, text="❌ failed — detail here", messageId=RESULT_ID),
         entry(4, inject.ENTRY_TERMINAL, taskId=stub_gateway.task_id, state="failed",
               source=inject.TERMINAL_SOURCE_EXECUTOR, reason=f"reason: {token} - detail here"),
     ]

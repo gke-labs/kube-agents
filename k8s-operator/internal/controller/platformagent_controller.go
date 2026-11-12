@@ -543,7 +543,8 @@ type PlatformAgentReconciler struct {
 	// status.usage field -- the cluster gauges as one (usageNewerFieldGauges),
 	// the proposal readings as one (usageNewerFieldReadings), the two people
 	// readings as one (usageNewerFieldPeople), the nine origin readings as one
-	// (usageNewerFieldOrigins), lastHumanActiveTime, and each
+	// (usageNewerFieldOrigins), the three inference totals as one
+	// (usageNewerFieldInference), lastHumanActiveTime, and each other
 	// counter after the first schema by its name -- the last poll in which the usage counters poller wrote the field
 	// and it came back absent: a served CRD at a previous schema, which has
 	// the first-schema counters and not every later field. A record per field
@@ -1681,6 +1682,20 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 			if err := r.deleteManagedLiteLLMPolicy(ctx, agent); err != nil {
 				return ctrl.Result{}, err
 			}
+		}
+
+		// The bus StatefulSet is marked for deletion first, and its claims
+		// reaped only once it is. The CR's finalizer keeps the StatefulSet
+		// alive (its owner isn't deleted yet), and a claim deleted under a
+		// live StatefulSet is recreated with its pod: a fresh claim, provisioned in whatever zone
+		// that pod lands, which then outlives the StatefulSet (WhenDeleted is
+		// Retain). A reinstall reuses it pinned to that zone, and on a
+		// three-server bus that zone's node can already hold another server,
+		// so the third never schedules (the hostname spread refuses it).
+		if wait, err := r.deleteA2ANATSStatefulSetFirst(ctx, agent); err != nil {
+			return ctrl.Result{}, err
+		} else if wait {
+			return ctrl.Result{RequeueAfter: a2aNATSDeletionRecheck}, nil
 		}
 
 		// The NATS StatefulSet's volumeClaimTemplate PVCs have no owner

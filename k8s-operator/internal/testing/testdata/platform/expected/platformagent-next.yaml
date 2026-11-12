@@ -421,6 +421,7 @@ data:
     KUBEAGENTS_AUTOMERGE=off
     KUBEAGENTS_DIAL=off
     KUBEAGENTS_SCOPE_FILE=/etc/kube-agents/scope.json
+    KUBEAGENTS_RESOLVED_SCOPE_FILE=/etc/kube-agents-resolved/resolved-scope.json
     RECONCILE_PROJECT=
     GKE_PROJECT_ID=example-project
     STALL_WATCH_EXCLUDE_NAMESPACES=
@@ -1186,6 +1187,10 @@ spec:
               name: data
               readOnly: true
               subPath: profiles/platform/governance
+      dnsConfig:
+        options:
+          - name: ndots
+            value: "3"
       enableServiceLinks: false
       initContainers:
         - args:
@@ -1566,6 +1571,10 @@ spec:
             - mountPath: /etc/kube-agents/scope
               name: platform-agent-scope-vol
               readOnly: true
+      dnsConfig:
+        options:
+          - name: ndots
+            value: "3"
       securityContext:
         fsGroup: 10000
         runAsNonRoot: true
@@ -1817,6 +1826,8 @@ spec:
               value: /etc/hermes
             - name: KUBEAGENTS_SCOPE_FILE
               value: /etc/kube-agents/scope.json
+            - name: KUBEAGENTS_RESOLVED_SCOPE_FILE
+              value: /etc/kube-agents-resolved/resolved-scope.json
             - name: RECONCILE_PROJECT
             - name: HERMES_HOME_MODE
               value: "2770"
@@ -1937,6 +1948,9 @@ spec:
               readOnly: true
             - mountPath: /tmp
               name: tmp-scratch
+            - mountPath: /etc/kube-agents-resolved
+              name: platform-agent-resolved-scope-vol
+              readOnly: true
             - mountPath: /etc/sandbox-ssh
               name: sandbox-ssh
               readOnly: true
@@ -2099,6 +2113,8 @@ spec:
               value: /etc/hermes
             - name: KUBEAGENTS_SCOPE_FILE
               value: /etc/kube-agents/scope.json
+            - name: KUBEAGENTS_RESOLVED_SCOPE_FILE
+              value: /etc/kube-agents-resolved/resolved-scope.json
             - name: RECONCILE_PROJECT
             - name: HERMES_HOME_MODE
               value: "2770"
@@ -2208,6 +2224,9 @@ spec:
               readOnly: true
             - mountPath: /tmp
               name: tmp-scratch
+            - mountPath: /etc/kube-agents-resolved
+              name: platform-agent-resolved-scope-vol
+              readOnly: true
             - mountPath: /etc/sandbox-ssh
               name: sandbox-ssh
               readOnly: true
@@ -2445,6 +2464,14 @@ spec:
         - emptyDir:
             sizeLimit: 2Gi
           name: tmp-scratch
+        - configMap:
+            defaultMode: 292
+            items:
+              - key: resolved-scope.json
+                path: resolved-scope.json
+            name: platformagent-resolved-scope
+            optional: true
+          name: platform-agent-resolved-scope-vol
         - emptyDir:
             sizeLimit: 2Gi
           name: credential-proxy-tmp
@@ -4263,6 +4290,66 @@ spec:
             - mountPath: /var/run/nats
               name: nats-pid
               readOnly: true
+        - args:
+            - -port=7777
+            - -varz
+            - -jsz=all
+            - http://127.0.0.1:8222
+          command:
+            - /bin/sh
+            - -c
+            - |-
+              trap 'kill -TERM "$pid" 2>/dev/null; exit 0' TERM INT
+              max=$(cat /sys/fs/cgroup/memory.max 2>/dev/null)
+              case "$max" in
+                '' | *[!0-9]*) ;;
+                *) GOMEMLIMIT=$((max / 5 * 4)) && export GOMEMLIMIT ;;
+              esac
+              echo "prometheus-nats-exporter GOMEMLIMIT=$GOMEMLIMIT" >&2
+              delay=1
+              while :; do
+                started=$(date +%s)
+                "$0" "$@" &
+                pid=$!
+                wait "$pid"
+                rc=$?
+                if [ $(($(date +%s) - started)) -ge 60 ]; then delay=1; fi
+                echo "prometheus-nats-exporter exited with code $rc; restarting in ${delay}s" >&2
+                sleep "$delay" &
+                pid=$!
+                wait "$pid"
+                delay=$((delay * 2))
+                if [ "$delay" -gt 30 ]; then delay=30; fi
+              done
+            - /prometheus-nats-exporter
+          env:
+            - name: GOMEMLIMIT
+              value: 153MiB
+          image: natsio/prometheus-nats-exporter:0.20.3@sha256:4b8ddc1c86fec360b5cd3d5e1fbc6fb52bdafd5805bba3901cc52926538af255
+          name: nats-exporter
+          ports:
+            - containerPort: 7777
+              name: nats-metrics
+          resources:
+            limits:
+              cpu: 500m
+              ephemeral-storage: 64Mi
+              memory: 192Mi
+            requests:
+              cpu: 50m
+              ephemeral-storage: 64Mi
+              memory: 96Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsGroup: 65534
+            runAsNonRoot: true
+            runAsUser: 65534
+            seccompProfile:
+              type: RuntimeDefault
       securityContext:
         fsGroup: 1000
         runAsNonRoot: true
@@ -4640,6 +4727,13 @@ spec:
               app: platformagent-a2a-console
       ports:
         - port: 9222
+          protocol: TCP
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gke-gmp-system
+      ports:
+        - port: 7777
           protocol: TCP
     - from:
         - podSelector:

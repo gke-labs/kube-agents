@@ -48,6 +48,18 @@ func TestRepositoryURLHandlesEveryRemoteSpelling(t *testing.T) {
 		{repositoryInfo{Provider: "bitbucket-datacenter", Repository: "OPS/infra"}, ""},
 		{repositoryInfo{Provider: "bitbucket-datacenter", Host: bbdc, Repository: "OPS/sub/infra"}, ""},
 		{repositoryInfo{Provider: "bitbucket-datacenter", Host: bbdc, Repository: "infra"}, ""},
+		// A host links as the forge's operator reads it: lowercased, and a
+		// provider's own spellings folded to its default host.
+		{repositoryInfo{Provider: "github", Host: "www.github.com", Repository: "org/r"}, "https://github.com/org/r"},
+		{repositoryInfo{Provider: "github", Host: "ssh.github.com", Repository: "org/r"}, "https://github.com/org/r"},
+		{repositoryInfo{Host: "WWW.GitHub.com", Repository: "org/r"}, "https://github.com/org/r"},
+		{repositoryInfo{Provider: "github", Host: "www.github.com", Repository: "github.com/org/r1"}, "https://github.com/org/r1"},
+		{repositoryInfo{Provider: "github", Repository: "git@ssh.github.com:org/r.git"}, "https://github.com/org/r"},
+		{repositoryInfo{Provider: "gitlab", Host: "www.gitlab.com", Repository: "grp/sub/r"}, "https://gitlab.com/grp/sub/r"},
+		{repositoryInfo{Provider: "bitbucket", Host: "www.bitbucket.org", Repository: "acme/infra"}, "https://bitbucket.org/acme/infra"},
+		{repositoryInfo{Provider: "gitea", Host: "Gitea.Example.com", Repository: "ops/app"}, "https://gitea.example.com/ops/app"},
+		{repositoryInfo{Provider: "gitea", Host: "Gitea.Example.com", Repository: "gitea.example.com/ops/app"}, "https://gitea.example.com/ops/app"},
+		{repositoryInfo{Provider: "bitbucket-datacenter", Host: "Bitbucket.Corp.Example", Repository: "OPS/infra"}, "https://bitbucket.corp.example/projects/OPS/repos/infra"},
 	}
 	for _, c := range cases {
 		if got := repositoryURL(c.in); got != c.want {
