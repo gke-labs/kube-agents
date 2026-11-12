@@ -1245,8 +1245,10 @@ echo "✓ Seeded-fleet credentials finished in $((SECONDS - STEP_START))s"
 # kubectl read per assertion and one describe per control-plane role.
 # Read-only: every call is a `kubectl get` through the role kubeconfigs (the
 # fleet reader's token), a `gcloud container clusters describe` on this job's
-# own credential, which already lists the same clusters above, or a `gcloud
-# compute ... list` of a project-scoped role's objects on the same credential.
+# own credential, which already lists the same clusters above, a `gcloud
+# compute ... list` of a project-scoped role's objects, or a `gcloud compute
+# instances get-serial-port-output` of the startup-fail VM, on the same
+# credential.
 #
 # What it feeds: kube_agents_bench.fixture_drift, before the fan-out, marks each
 # case whose grade depends on a role the scan positively saw drifted, and the

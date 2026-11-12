@@ -124,6 +124,14 @@ if args[:3] == ["container", "clusters", "describe"]:
 if args[:2] == ["container", "get-server-config"]:
     print(json.dumps(world.get("server_config", {})))
     sys.exit(0)
+if args[:3] == ["compute", "instances", "get-serial-port-output"]:
+    # The startup-fail role's serial assertion: world["serial"][project][name].
+    text = world.get("serial", {}).get(project, {}).get(args[3])
+    if text is None:
+        print(f"ERROR: (gcloud.compute.instances.get-serial-port-output) Required 'compute.instances.getSerialPortOutput' permission for {args[3]}", file=sys.stderr)
+        sys.exit(1)
+    sys.stdout.write(text)
+    sys.exit(0)
 if args[0] == "compute" and args[2] == "list":
     # A project-scoped role's probe (`--format=value(name)`) or state read
     # (`--format json`): the objects of world["compute"][project][collection]
@@ -286,7 +294,7 @@ def healthy_world(*projects):
     fleet = [["seeded-a", "us-central1-a"], ["seeded-b", "us-central1-a"], ["seeded-c", "us-central1-a"], ["seeded-d", "us-central1-a"]]
     compute = {
         "instances": [
-            {"name": "startup-fail-seeded", "status": "RUNNING", "metadata": {"items": [{"key": "startup-script", "value": "exit 1"}]}},
+            {"name": "startup-fail-seeded", "status": "RUNNING", "zone": "https://x/zones/us-central1-a", "metadata": {"items": [{"key": "startup-script", "value": "exit 1"}]}},
             {"name": "world-open-seeded", "status": "RUNNING", "networkInterfaces": [{"accessConfigs": [{"type": "ONE_TO_ONE_NAT"}]}]},
         ],
         "firewall-rules": [
@@ -297,6 +305,8 @@ def healthy_world(*projects):
     return {
         "clusters": {project: fleet for project in projects},
         "compute": {project: compute for project in projects},
+        # The startup-fail VM's console still holds the boot that ran its script.
+        "serial": {project: {"startup-fail-seeded": 'Script "startup-script" failed with error: exit status 1\n'} for project in projects},
         "kubectl": {
             "namespace/seeded-debug": {"metadata": {"name": "seeded-debug"}},
             "namespace/seeded-capacity": {"metadata": {"name": "seeded-capacity"}},
