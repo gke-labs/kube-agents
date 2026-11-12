@@ -95,11 +95,60 @@ Most failures turn the run back on its own. Three to one, before the bus has gon
 A failed way back stops for a person, and so does a failure with no way back (below). The run is then `Failed`, `status.busMigration.failedIn` names where, and the condition names the step to take. A `Failed` run blocks any other migration, and spec changes leave the bus as it is, until a person acts with an annotation on the PlatformAgent that names the run:
 
 - **Retry:** `kubectl annotate platformagent <name> -n <namespace> kubeagents.x-k8s.io/bus-migration-retry=<run>-<attempt>`, with the value the condition gives. It runs the failed step again with a fresh deadline: the clear (from `Clearing`, keeping what it already deleted), the rollback (from `RollingBack` or `RollbackRestoring`) or the unpin (from `Unpinning`). A run may be retried three times; each attempt is recorded in `status.busMigration.retries`.
-- **Give up:** `kubectl annotate platformagent <name> -n <namespace> kubeagents.x-k8s.io/bus-migration-abandon=<run>`. For a run that failed during the freeze, this lifts the freeze, deletes the staging claim and its snapshot, and runs the provision Job again at once, which recreates, empty, every stream the run did not put back. Ready waits for it.
+- **Give up:** `kubectl annotate platformagent <name> -n <namespace> kubeagents.x-k8s.io/bus-migration-abandon=<run>`. For a run that failed during the freeze, this lifts the freeze and runs the provision Job again at once, which recreates, empty, every stream the run did not put back. Ready waits for it. It deletes the staging claim and its snapshot, unless the claim holds the streams' only copy ([below](#recovering-a-given-up-runs-staging-claim)).
 
 A rollback that failed keeps the write freeze, the staging claim and the operator's digests until then, so a retry restores the same snapshot. Before retrying, check the `<agent>-a2a-nats-0` pod, and the restore pod's termination message (`kubectl get pod <agent>-bus-rollback-<run> -o jsonpath='{.status.containerStatuses[0].state.terminated.message}'`), which names the stream and the check that failed.
 
 A run that failed in `Shrinking` (server 0 did not come up on its own) or in `Releasing` (the servers did not come back with their static users) has no way back to retry. The bus stays at the count it reached. Fix the `<agent>-a2a-nats` pods, then give the run up to allow the next migration.
+
+#### Recovering a given-up run's staging claim
+
+A one to three run that failed after its clear emptied the single server, and before any restore started, has the streams' only copy on its staging claim: `failedIn` is `Clearing`, `RollingBack` or `RollbackRestoring`, and `status.busMigration.restoreStarted` is unset. Retry such a run rather than give it up while retries are left: a retry restores the snapshot into one server on its own.
+
+If it is given up anyway, the operator lifts the freeze, the bus runs one server, and the provision Job recreates every stream empty. It keeps the staging claim `<agent>-bus-stage-<run>` and the run Secret `<agent>-bus-run-<run>`, which holds each snapshot file's SHA-256, and the `A2ABusMigrating` condition names both. It does not restore the snapshot, and it does not delete either object; both are owned by the PlatformAgent, so deleting the PlatformAgent deletes them. Find them by their labels (the instance label is `<namespace>-<name>`, cut to 63 characters):
+
+```bash
+kubectl get platformagent <name> -n <namespace> \
+  -o jsonpath='{.status.busMigration.runID} {.status.busMigration.failedIn} givenUp={.status.busMigration.givenUp} restoreStarted={.status.busMigration.restoreStarted}{"\n"}'
+kubectl get pvc,secret -n <namespace> \
+  -l kubeagents.x-k8s.io/a2a-component=bus-migration,app.kubernetes.io/instance=<namespace>-<name>
+```
+
+To keep the data past the PlatformAgent, keep the volume when its claim is deleted, and take the claim out of the PlatformAgent's ownership:
+
+```bash
+PV=$(kubectl get pvc <claim> -n <namespace> -o jsonpath='{.spec.volumeName}')
+kubectl patch pv "$PV" -p '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}'
+kubectl patch pvc <claim> -n <namespace> --type=json -p '[{"op":"remove","path":"/metadata/ownerReferences"}]'
+kubectl get secret <agent>-bus-run-<run> -n <namespace> -o jsonpath='{.data.run\.json}' | base64 -d > run.json
+```
+
+The claim holds one directory per stream, each with `stream.tar.s2` (the server's snapshot of the stream) and `meta.json` (its config and state when snapshotted). To copy it out, mount it read-only in a pod of your own (the claim is `ReadWriteOncePod`, so nothing else may hold it):
+
+```bash
+kubectl apply -n <namespace> -f - <<'YAML'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bus-stage-reader
+spec:
+  securityContext: { runAsNonRoot: true, runAsUser: 65532, fsGroup: 65532, seccompProfile: { type: RuntimeDefault } }
+  containers:
+    - name: reader
+      image: busybox:1.37
+      command: ["sleep", "3600"]
+      securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+      volumeMounts: [{ name: stage, mountPath: /stage, readOnly: true }]
+  volumes:
+    - name: stage
+      persistentVolumeClaim: { claimName: <claim>, readOnly: true }
+YAML
+kubectl exec -n <namespace> bus-stage-reader -- sh -c 'cd /stage && sha256sum */stream.tar.s2 */meta.json'
+kubectl cp <namespace>/bus-stage-reader:/stage ./bus-stage-<run>
+kubectl delete pod bus-stage-reader -n <namespace>
+```
+
+The checksums should match the `data` and `meta` digests in `run.json`. The bus already runs one server, so set `busReplicas: 1` to match it; while the field asks for three, no new run starts unless the `bus-migration-start` annotation names the given-up run, and a new run would snapshot the empty streams onto a claim of its own. Putting the old data back is manual: the operator has no command for it, and restoring a stream takes a bus client allowed `$JS.API.STREAM.RESTORE` on it, which only a migration's own identity holds, and only during its restore. Delete the claim once the data is safe or not needed.
 
 Disabling Google Chat afterwards, with no other backend configured, leaves the gateway running on the console door alone. Flipping back to `today` tears that stack down, keeping the generated credentials Secret and the JetStream PVCs. The callout's keys Secret is **not** kept: a stale issuer key would make every answer the callout gives be refused, so it is deleted with the rest. The task-signing key Secret is deleted with it.
 

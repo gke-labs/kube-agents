@@ -2955,6 +2955,14 @@ type BusMigrationStatus struct {
 	// +optional
 	Cleared []string `json:"cleared,omitempty"`
 
+	// RestoreStarted is set when the one to three leg enters Restoring: from
+	// then the three servers may hold copies of the streams. A run given up
+	// before that, after its forward clear emptied the single server, keeps
+	// its staging claim and run Secret, since the claim holds the streams'
+	// only copy.
+	// +optional
+	RestoreStarted bool `json:"restoreStarted,omitempty"`
+
 	// FreezeConfirmed is set once every callout replica serves the write
 	// freeze's identity map, and only then does the bus render without its
 	// static application users and restart into the freeze.

@@ -1878,7 +1878,84 @@ func failedRig(t *testing.T, leg busMigrationLeg, failedIn busMigrationPhase, ru
 	run.FailedIn, run.Abandoning, run.Cause = string(failedIn), true, "the "+string(failedIn)+" phase failed"
 	run.Cleared = a2aProvisionedStreams // the way back cleared the cluster first
 	run.FreezeConfirmed = leg == busMigrationGrow
+	run.RestoreStarted = leg == busMigrationGrow // after a failed restore
 	return m
+}
+
+// A one to three run given up where its staging claim holds the streams'
+// only copy keeps the claim and the run Secret: the forward clear emptied
+// the single server and no restore ever started (it failed in the forward
+// clear, or on the way back from a failed conversion). Its pods go, so a
+// person can mount the claim, and the condition names it. Once a restore
+// started, or before the forward clear, the give-up deletes them as before.
+func TestAGiveUpBeforeAnyRestoreKeepsTheStage(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	for _, tc := range []struct {
+		failedIn       busMigrationPhase
+		abandoning     bool
+		restoreStarted bool
+		keep           bool
+	}{
+		{busMigrationClearing, false, false, true},
+		{busMigrationRollingBack, true, false, true},
+		{busMigrationRollbackRestoring, true, false, true},
+		{busMigrationRollingBack, true, true, false},
+		{busMigrationRollbackRestoring, true, true, false},
+		{busMigrationClearing, true, true, false},
+		{busMigrationReleasing, true, false, false},
+	} {
+		m := failedRig(t, busMigrationGrow, tc.failedIn, 1)
+		m.agent.Spec.Harness.Tuning.BusReplicas = ptr.To(1)
+		run := m.agent.Status.BusMigration
+		run.Abandoning, run.RestoreStarted = tc.abandoning, tc.restoreStarted
+		stage := []client.Object{
+			&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: busMigrationRunSecret(m.agent, "3-1"), Namespace: m.agent.Namespace}},
+			&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: busMigrationStageClaim(m.agent, "3-1"), Namespace: m.agent.Namespace}},
+		}
+		for _, o := range stage {
+			m.own(o)
+			if err := m.cl.Create(context.Background(), o); err != nil {
+				t.Fatal(err)
+			}
+		}
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkloadName(m.agent, "snapshot", "3-1"), Namespace: m.agent.Namespace, Labels: a2aLabels(m.agent, busMigrationComponent)}}
+		m.own(pod)
+		if err := m.cl.Create(context.Background(), pod); err != nil {
+			t.Fatal(err)
+		}
+		m.agent.Annotations = map[string]string{a2aBusMigrationAbandonAnnotation: "3-1"}
+		if err := m.r.resolveA2ABusReplicas(context.Background(), m.agent); err != nil {
+			t.Fatal(err)
+		}
+		for _, o := range stage {
+			err := m.cl.Get(context.Background(), client.ObjectKeyFromObject(o), o)
+			if kept := err == nil; kept != tc.keep {
+				t.Errorf("given up in %s (abandoning %v, restore started %v): %T %s kept %v, want %v", tc.failedIn, tc.abandoning, tc.restoreStarted, o, o.GetName(), kept, tc.keep)
+			}
+		}
+		if err := m.cl.Get(context.Background(), client.ObjectKey{Namespace: m.agent.Namespace, Name: busMigrationWorkloadName(m.agent, "snapshot", "3-1")}, &corev1.Pod{}); err == nil {
+			t.Errorf("given up in %s: the snapshot pod is left holding the stage", tc.failedIn)
+		}
+		cond, _ := busMigratingCondition(m.agent)
+		if names := strings.Contains(cond.Message, busMigrationStageClaim(m.agent, "3-1")); names != tc.keep {
+			t.Errorf("given up in %s: the condition names the kept claim %v, want %v: %q", tc.failedIn, names, tc.keep, cond.Message)
+		}
+	}
+}
+
+// Entering Restoring records that a restore started, so a later give-up no
+// longer treats the stage as the only copy.
+func TestEnteringRestoringRecordsTheRestore(t *testing.T) {
+	m := newMigrationRig(t, busMigrationGrow, busMigrationConverting, 3, time.Now().Add(time.Hour))
+	m.pass(busMigrationConverting, 3)
+	if m.agent.Status.BusMigration.RestoreStarted {
+		t.Fatal("a restore recorded before Restoring")
+	}
+	m.rollOut(3)
+	m.pass(busMigrationRestoring, 3)
+	if !m.agent.Status.BusMigration.RestoreStarted {
+		t.Error("entering Restoring recorded no restore")
+	}
 }
 
 // A retry annotation naming the run's next attempt puts the run back on the

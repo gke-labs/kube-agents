@@ -560,6 +560,9 @@ func (r *PlatformAgentReconciler) advanceBusMigration(ctx context.Context, agent
 				run.PhaseDeadline = ptr.To(metav1.NewTime(now.Add(busMigrationConvertDeadline)))
 			}
 		}
+		if step.next == busMigrationRestoring {
+			run.RestoreStarted = true
+		}
 		run.Phase, run.Abandoning = string(step.next), step.abandoning
 		if step.manual != "" {
 			run.Message = step.manual
@@ -1262,12 +1265,15 @@ func buildBusStagePVC(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.Bus
 // per-run ServiceAccount, and, unless the run Failed and was not given up,
 // the staging volume and the run Secret. A Failed run keeps those two for a
 // retry, which needs the snapshot and its digests; its ServiceAccounts go
-// regardless, since the map no longer names them. With the stage go the
-// run's pods that mount it (snapshot, hash, restore and rollback, every
-// attempt): a claim stays bound while a pod that names it exists, finished
-// or not, so leaving them would pin the stage for good. Their outcomes are
-// already in status. The pin and unpin Jobs stay for their logs until their
-// TTL.
+// regardless, since the map no longer names them. A run given up while the
+// stage holds the streams' only copy keeps them too
+// (busMigrationStageIsTheOnlyCopy), for a person to recover from. With the
+// end of the run go the run's pods that mount the stage (snapshot, hash,
+// restore and rollback, every attempt): a claim stays bound while a pod that
+// names it exists, finished or not, so leaving them would pin the stage for
+// good, and a kept one would refuse the pod a person mounts it in. Their
+// outcomes are already in status. The pin and unpin Jobs stay for their logs
+// until their TTL.
 func (r *PlatformAgentReconciler) cleanupBusMigration(ctx context.Context, agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus) error {
 	// Each object is deleted only if this PlatformAgent controls it: one
 	// someone else made under a run's name was never used, and isn't the
@@ -1288,9 +1294,11 @@ func (r *PlatformAgentReconciler) cleanupBusMigration(ctx context.Context, agent
 				objs = append(objs, pod)
 			}
 		}
-		owned = append(owned,
-			&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: busMigrationRunSecret(agent, run.RunID), Namespace: agent.Namespace}},
-			&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: busMigrationStageClaim(agent, run.RunID), Namespace: agent.Namespace}})
+		if !busMigrationStageIsTheOnlyCopy(run) {
+			owned = append(owned,
+				&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: busMigrationRunSecret(agent, run.RunID), Namespace: agent.Namespace}},
+				&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: busMigrationStageClaim(agent, run.RunID), Namespace: agent.Namespace}})
+		}
 	}
 	for _, obj := range objs { // the pods, already checked
 		if err := r.Delete(ctx, obj); err != nil && !errors.IsNotFound(err) {
@@ -1305,10 +1313,29 @@ func (r *PlatformAgentReconciler) cleanupBusMigration(ctx context.Context, agent
 	return nil
 }
 
+// busMigrationStageIsTheOnlyCopy reports a one to three run given up where
+// its staging claim holds the streams' only copy: its forward clear emptied
+// the single server (it failed in that clear, or on the way back from the
+// conversion) and no restore ever started, so neither the cluster nor the
+// single server has the data. The give-up recreates the streams empty;
+// deleting the claim then would lose the data for good, so it is kept with
+// the run Secret's digests, and the condition names it.
+func busMigrationStageIsTheOnlyCopy(run *agentv1alpha1.BusMigrationStatus) bool {
+	if busMigrationLeg(run.Leg) != busMigrationGrow || !run.GivenUp || run.RestoreStarted {
+		return false
+	}
+	switch busMigrationPhase(run.FailedIn) {
+	case busMigrationClearing, busMigrationRollingBack, busMigrationRollbackRestoring:
+		return true
+	}
+	return false
+}
+
 // busMigrationTornDown is a switch to today's word on the bus migration
 // record: a run that ended, or a Failed run given up, goes, with every
 // object it left (its ServiceAccounts, pods, Jobs, run Secret and staging
-// claim), so a later switch back to next starts with no record and its
+// claim, but for a stage that holds the only copy, which cleanupBusMigration
+// keeps), so a later switch back to next starts with no record and its
 // bridge waits for its own provisioning. A run still under way, or Failed
 // and not given up, is left as it is: the webhook refuses that switch, since
 // the run's staging claim can hold the only copy of the bus, and an install
@@ -1566,6 +1593,10 @@ func busMigrationActOnFailed(agent *agentv1alpha1.PlatformAgent, now metav1.Time
 func busMigrationFailedActions(agent *agentv1alpha1.PlatformAgent) string {
 	run := agent.Status.BusMigration
 	if run.GivenUp {
+		if busMigrationStageIsTheOnlyCopy(run) {
+			return fmt.Sprintf(" It was given up: the freeze is lifted, and streams it did not put back are recreated empty. Their data is only on the staging claim %s, which is kept, with the run Secret %s, until a person deletes it, or the PlatformAgent is deleted.",
+				busMigrationStageClaim(agent, run.RunID), busMigrationRunSecret(agent, run.RunID))
+		}
 		if busMigrationLeg(run.Leg) == busMigrationGrow {
 			return " It was given up: the freeze is lifted, and streams it did not put back are recreated empty."
 		}
