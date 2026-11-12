@@ -45,6 +45,7 @@ _CALL_SITES = (
     "check_operator_pin fluent-bit k8s-operator/internal/controller/manifest_helpers.go fallbackFluentBitImage",
     "check_operator_pin nats k8s-operator/internal/controller/platformagent_a2a_manifests.go defaultA2ANATSImage",
     "check_operator_pin nats-box k8s-operator/internal/controller/platformagent_a2a_manifests.go defaultA2AProvisionImage",
+    "check_operator_pin nats-server-config-reloader k8s-operator/internal/controller/platformagent_a2a_nats_reload.go defaultA2ANATSReloaderImage",
     "check_compiled_image_name a2a-gateway k8s-operator/internal/controller/platformagent_a2a_manifests.go a2aGatewayImageName",
     "check_compiled_image_name a2a-worker k8s-operator/internal/controller/platformagent_a2a_manifests.go a2aWorkerImageName",
     "check_compiled_image_name a2a-authcallout k8s-operator/internal/controller/platformagent_a2a_callout.go a2aCalloutImageName",

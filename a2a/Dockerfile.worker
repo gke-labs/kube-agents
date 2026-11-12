@@ -53,33 +53,71 @@ WORKDIR /app
 RUN npm install @anthropic-ai/claude-agent-sdk@0.3.236 \
     && npm cache clean --force
 
-# The temporary cluster view (operator flag A2A_SESSION_CLUSTER_VIEW): kubectl
-# and gcloud on PATH are the credential broker's shim, which forwards an argv
-# to the broker and prints its refusal as `policy rule: <rule>`. The shim is
-# Python, so python3 is installed, with python3-yaml beside it: the shim parses
-# the kubeconfig `gcloud container clusters get-credentials` returns, and any
+# The temporary cluster view (operator flag A2A_SESSION_CLUSTER_VIEW): stock
+# kubectl at /usr/local/libexec/kubectl with a /usr/local/bin/kubectl wrapper
+# that routes through <agent>-kube-proxy when KUBE_PROXY_URL is set, and gcloud
+# on PATH as the credential broker's shim, which forwards an argv to the broker
+# and prints its refusal as `policy rule: <rule>`. The shim is Python, so
+# python3 is installed, with python3-yaml beside it: the shim parses the
+# kubeconfig `gcloud container clusters get-credentials` returns, and any
 # kubeconfig a `kubectl --kubeconfig=` or KUBECONFIG names, and without PyYAML
 # those crash after the broker has already run the command. jq is installed
 # too, because the cluster agent's persona requires it (requires.commands in
 # agents/cluster/persona/persona.yaml): its skills filter gcloud and kubectl
-# JSON with it. It holds no credential. Nothing else is installed; no native
-# kubectl, gcloud, gh or git exist in this image, and the guard below keeps it
-# so. With the flag off the pod has no
-# CREDENTIAL_PROXY_URL and the shim refuses with that name. gh and git are
-# deliberately not linked: the broker's session role refuses them anyway, and
-# a name that is not on PATH is a clearer answer. The forwarder itself lives
-# under libexec, off PATH, so the only names a shell finds are the two shims.
+# JSON with it. It holds no credential. No native gcloud, gh or git exist in
+# this image, and the guard below keeps it so. With the flag off the pod has no
+# KUBE_PROXY_URL or CREDENTIAL_PROXY_URL. gh and git are deliberately not
+# linked: the broker's session role refuses them anyway, and a name that is not
+# on PATH is a clearer answer. The forwarder itself lives under libexec, off
+# PATH, so the only shim on PATH is gcloud.
+ARG KUBECTL_VERSION=1.35.10
+ARG KUBECTL_SHA256_AMD64=c49a28f1f4efc4d475ed05f47f2ce8e563bf7bef69ed77fe1b924ea6d83b6327
+ARG KUBECTL_SHA256_ARM64=283f1be6a46b3695b625e25030106b8ffe18bd0d3a900f5b65c259ca407f04f5
+COPY deploy/sandbox/check_kubectl_base_path.py /tmp/check_kubectl_base_path.py
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends python3 python3-yaml jq \
+    && apt-get install -y --no-install-recommends ca-certificates curl python3 python3-yaml jq \
     && rm -rf /var/lib/apt/lists/* \
     && python3 -c 'import yaml' \
-    && jq --version
+    && jq --version \
+    && ARCH=$(dpkg --print-architecture) \
+    && case "${ARCH}" in \
+         amd64) KUBECTL_SHA256="${KUBECTL_SHA256_AMD64}" ;; \
+         arm64) KUBECTL_SHA256="${KUBECTL_SHA256_ARM64}" ;; \
+         *) echo "no kubectl checksum pinned for ${ARCH}" >&2; exit 1 ;; \
+       esac \
+    && install -d -m 0755 /usr/local/libexec \
+    && curl -sSLf --retry 5 --retry-all-errors -o /usr/local/libexec/kubectl "https://dl.k8s.io/release/v${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl" \
+    && echo "${KUBECTL_SHA256}  /usr/local/libexec/kubectl" | sha256sum -c - \
+    && chmod 0755 /usr/local/libexec/kubectl \
+    && python3 -I /tmp/check_kubectl_base_path.py /usr/local/libexec/kubectl \
+    && rm /tmp/check_kubectl_base_path.py \
+    && printf '%s\n' \
+         '#!/bin/sh' \
+         'if [ -n "${KUBE_PROXY_URL:-}" ]; then' \
+         '  case " $* " in' \
+         '  *" --context"*)' \
+         '    PYTHONDONTWRITEBYTECODE=1 python3 -I /opt/credential-proxy/libexec/credential-proxy-exec --ensure-kubectl-context "$@" 2>/dev/null || true' \
+         '    ;;' \
+         '  *)' \
+         '    if [ ! -f "${HOME}/.kube/config" ]; then' \
+         '      PYTHONDONTWRITEBYTECODE=1 python3 -I /opt/credential-proxy/libexec/credential-proxy-exec --ensure-kubectl-context "$@" 2>/dev/null || true' \
+         '    fi' \
+         '    ;;' \
+         '  esac' \
+         '  exec /usr/local/libexec/kubectl "$@"' \
+         'fi' \
+         'if [ -n "${CREDENTIAL_PROXY_URL:-}" ] || [ -n "${CREDENTIAL_PROXY_EXEC_URL:-}" ]; then' \
+         '  exec /opt/credential-proxy/libexec/credential-proxy-exec kubectl "$@"' \
+         'fi' \
+         'exec /usr/local/libexec/kubectl "$@"' \
+         >/usr/local/bin/kubectl \
+    && chmod 0755 /usr/local/bin/kubectl
 COPY --chmod=0755 agents/platform/scripts/credential_proxy_client.py /opt/credential-proxy/libexec/credential-proxy-exec
 RUN mkdir -p /opt/credential-proxy/bin \
-    && for binary in kubectl gcloud; do \
+    && for binary in gcloud; do \
          ln -s /opt/credential-proxy/libexec/credential-proxy-exec "/opt/credential-proxy/bin/${binary}"; \
        done \
-    && for binary in gcloud kubectl gh git; do \
+    && for binary in gcloud gh git; do \
          if command -v "${binary}" >/dev/null 2>&1; then \
            echo "unexpected credential-aware CLI in the worker image: ${binary}" >&2; exit 1; \
          fi; \

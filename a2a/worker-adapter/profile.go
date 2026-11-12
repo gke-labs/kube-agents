@@ -58,6 +58,10 @@ type ProfileWorkerConfig struct {
 	PersonaDir string
 	// Harness is the persona adapter to render with (persona.ClaudeCode).
 	Harness persona.Harness
+	// Relay is how the rendered persona's MCP servers reach the broker's
+	// relay (ProfileRelay, #5495). Empty drops every MCP server the persona
+	// declares, and the render says so.
+	Relay persona.Relay
 	// ConfigRoot is where each task's config directory is made: its own
 	// emptyDir, not the harness's working directory.
 	ConfigRoot string
@@ -188,7 +192,7 @@ func renderPersona(pw ProfileWorkerConfig) (*persona.Output, error) {
 	if err != nil {
 		return nil, fmt.Errorf("the persona at %s: %w", pw.PersonaDir, err)
 	}
-	out, err := adapter.Render(p, persona.Target{})
+	out, err := adapter.Render(p, persona.Target{Relay: pw.Relay})
 	if err != nil {
 		return nil, fmt.Errorf("rendering the persona: %w", err)
 	}
@@ -239,7 +243,7 @@ func (w *profileWorker) taskConfigDir(task string) (string, func(), error) {
 		// removed.
 		_ = filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
 			if err == nil && d.IsDir() {
-				_ = os.Chmod(p, 0o755)
+				_ = os.Chmod(p, 0o755) // #nosec G122 G302 -- gives the owner write back on the worker's own temp tree so it can be removed
 			}
 			return nil
 		})
@@ -267,7 +271,7 @@ func lockRendered(dir string) error {
 			return err
 		}
 		if d.IsDir() {
-			return os.Chmod(p, 0o555)
+			return os.Chmod(p, 0o555) // #nosec G122 G302 -- 0555 locks the worker's own rendered tree read-only; that is the point
 		}
 		info, err := d.Info()
 		if err != nil {
@@ -277,7 +281,7 @@ func lockRendered(dir string) error {
 		if info.Mode()&0o100 != 0 {
 			mode = 0o555
 		}
-		return os.Chmod(p, mode)
+		return os.Chmod(p, mode) // #nosec G122 -- the worker's own rendered tree, as above
 	})
 }
 
@@ -656,7 +660,7 @@ func (w *profileWorker) resetTimeout() time.Duration {
 func removeAllWritable(path string) error {
 	_ = filepath.WalkDir(path, func(p string, d fs.DirEntry, err error) error {
 		if err == nil && d.IsDir() {
-			_ = os.Chmod(p, 0o700)
+			_ = os.Chmod(p, 0o700) // #nosec G122 G302 -- gives the owner write back on the worker's own tree so it can be removed
 		}
 		return nil
 	})

@@ -302,6 +302,7 @@ _FRONT_DOOR_NON_ACTION_TOOLS = frozenset({
     inject.EVENT_ENTRY_STATUS,
     inject.EVENT_ENTRY_ACTIVITY,
     worker_trajectory.GAP_ENTRY,
+    worker_trajectory.NO_WORKER_CALLS_ENTRY,
 })
 
 # Character ceiling for card detail quoted in infrastructure failure errors.
@@ -1010,6 +1011,18 @@ _SESSION_ID_HEADER = "X-Hermes-Session-Id"
 _FAILURE_REASON_HEADER = "X-Hermes-Failure-Reason"
 
 
+def _closed_explicitly(card: board.BoardCard | None) -> bool:
+    """Whether the board holds ``card`` closed by an agent (:data:`_CLOSED_STATUS`,
+    or blocked with one of :data:`_CLOSING_BLOCK_KINDS`)."""
+    if card is None:
+        return False
+    # A breaker trip keeps an earlier block's kind and records the spawn's
+    # failure: a block with a failure error is the platform's, not a close.
+    return card.status == _CLOSED_STATUS or (
+        card.status == _BLOCKED_STATUS and card.block_kind in _CLOSING_BLOCK_KINDS and not card.error
+    )
+
+
 def _guardrail_blocked_cards(
     awaited: Sequence[str],
     on_board: dict[str, board.BoardCard] | None,
@@ -1133,6 +1146,14 @@ def _canonical_session_tokens(
 # set would run the wait to its ceiling and grade as the harness's, not the
 # worker's.
 _TERMINAL_STATUSES = frozenset({"done", "archived", "blocked", "failed", "cancelled"})
+# A card ended by an explicit close, which only an agent makes: completed, or
+# blocked with one of ``kanban_block``'s own kinds. The breaker's gave_up, the
+# rate-limit guardrail's ``transient`` block and the admission patch's
+# capacity block are the platform's, not a close, and neither is a card left
+# archived, failed or cancelled.
+_CLOSED_STATUS = "done"
+_BLOCKED_STATUS = "blocked"
+_CLOSING_BLOCK_KINDS = frozenset({"needs_input", "dependency", "capability"})
 _BOARD_INFRA_STATUSES = frozenset({"blocked", "triage"})
 
 
@@ -2627,6 +2648,48 @@ def _post_turn(
     return parse_response(payload), session_id
 
 
+# Placeholders a case prompt may use for the cluster the agent itself runs on,
+# expanded from AGENT_CLUSTER_CONTEXT before the prompt is sent
+# (:func:`expand_agent_cluster_placeholders`). The runner substitutes only
+# {{CLUSTER_NAME}} and {{PROJECT_ID}}; a delegation to the generic cluster
+# profile needs the location too.
+AGENT_CLUSTER_PROJECT_PLACEHOLDER = "{{AGENT_CLUSTER_PROJECT}}"
+AGENT_CLUSTER_LOCATION_PLACEHOLDER = "{{AGENT_CLUSTER_LOCATION}}"
+AGENT_CLUSTER_NAME_PLACEHOLDER = "{{AGENT_CLUSTER_NAME}}"
+_AGENT_CLUSTER_PLACEHOLDERS = (
+    AGENT_CLUSTER_PROJECT_PLACEHOLDER,
+    AGENT_CLUSTER_LOCATION_PLACEHOLDER,
+    AGENT_CLUSTER_NAME_PLACEHOLDER,
+)
+_GKE_CONTEXT_PARTS = re.compile(r"gke_(?P<project>[^_]+)_(?P<location>[^_]+)_(?P<cluster>[^_]+)")
+
+
+def expand_agent_cluster_placeholders(prompt: str, context: str | None) -> tuple[str, str | None]:
+    """``prompt`` with the agent's own cluster written in, and the setup problem, if any.
+
+    A prompt that names none of the placeholders is returned as it is,
+    whatever the context. One that names any needs ``context`` to be a GKE
+    kubectl context (``gke_<project>_<location>_<cluster>``); otherwise the
+    second value says why, and the caller records the run as a setup failure,
+    never as the model's.
+    """
+    if not any(p in prompt for p in _AGENT_CLUSTER_PLACEHOLDERS):
+        return prompt, None
+    match = _GKE_CONTEXT_PARTS.fullmatch((context or "").strip())
+    if match is None:
+        return prompt, (
+            "the case prompt names the agent's cluster ({{AGENT_CLUSTER_*}}), but "
+            f"AGENT_CLUSTER_CONTEXT is {'unset' if not context else repr(context)}, "
+            "not a gke_<project>_<location>_<cluster> context"
+        )
+    return (
+        prompt.replace(AGENT_CLUSTER_PROJECT_PLACEHOLDER, match["project"])
+        .replace(AGENT_CLUSTER_LOCATION_PLACEHOLDER, match["location"])
+        .replace(AGENT_CLUSTER_NAME_PLACEHOLDER, match["cluster"]),
+        None,
+    )
+
+
 def _infra_failure(detail: str) -> AgentResult:
     """A run where no answer can be graded, recorded as infrastructure.
 
@@ -2866,6 +2929,10 @@ class KubeAgentsHarness(AgentHarness):
         """
         transcript.clear()
         started_at = time.time()
+        prompt, setup_problem = expand_agent_cluster_placeholders(prompt, os.environ.get("AGENT_CLUSTER_CONTEXT"))
+        if setup_problem is not None:
+            transcript.set("", [], prompt=prompt, started_at=started_at)
+            return _infra_failure(setup_problem)
         # The GitOps wait uses it as a lower bound on PR creation time: a rerun
         # that reuses a cluster name reuses the run branch, and the previous
         # run's merged PR is still listed against it.
@@ -4443,7 +4510,12 @@ class KubeAgentsHarness(AgentHarness):
             # _settle's own gap entry stays, with its reasons; only what it
             # added besides is withheld.
             added = result.trajectory[before:]
-            kept = [e for e in added if isinstance(e, dict) and e.get("name") == worker_trajectory.GAP_ENTRY]
+            kept = [
+                e
+                for e in added
+                if isinstance(e, dict)
+                and e.get("name") in (worker_trajectory.GAP_ENTRY, worker_trajectory.NO_WORKER_CALLS_ENTRY)
+            ]
             withheld = [e for e in added if e not in kept]
             result.trajectory[before:] = kept
             if withheld:
@@ -4848,6 +4920,19 @@ class KubeAgentsHarness(AgentHarness):
 
         trajectory_clean = captured is not None and not bool(worker_trajectory.gaps(captured.summary))
         logs_clean = logs is None or all(l is not None for l in logs.values())
+        # Every awaited card closed, a clean read, and not one worker entry or
+        # logged command: the workers made no call, which the workers-scope
+        # checks grade rather than set aside (worker_trajectory.NO_WORKER_CALLS_ENTRY).
+        if (
+            awaited
+            and trajectory_clean
+            and logs_clean
+            and on_board is not None
+            and not result.metadata.get("worker_commands")
+            and not any(isinstance(e, dict) and e.get("agent") for e in captured.entries)
+            and all(_closed_explicitly(on_board.get(t)) for t in awaited)
+        ):
+            result.trajectory.append(worker_trajectory.no_worker_calls_entry(awaited))
         worker_acted = (
             any(
                 isinstance(e, dict)

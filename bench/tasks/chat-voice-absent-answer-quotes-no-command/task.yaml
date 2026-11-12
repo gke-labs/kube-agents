@@ -1,0 +1,177 @@
+# Registered in hack/eval/nightly-cases.txt. Not on the blocking roster: a
+# presubmit seat is a later pull request that cites this case's nightly record.
+#
+# Domain: chat and routing. What it grades is the voice of a presence answer:
+# the user asks whether a namespace is on a named cluster, the front door
+# routes the ask to that cluster's Cluster Agent (agents/chat/SOUL.md §2 step
+# 2, a named cluster), the namespace is not there, and the card's `result` is
+# posted into the thread verbatim (agents/chat/SOUL.md §2 step 5). The Cluster
+# Agent persona's presence rule ("Absent is an answer when presence was the
+# question", agents/cluster/SOUL.md) told the worker to make the absence its
+# one-line finding and to quote the command that showed it, so the answer the
+# user read carried a `kubectl get ...` line: plumbing under
+# .agents/rules/chat_ux.md, "No plumbing in user text" (#5094). The intended
+# answer names what was looked for and the cluster it was looked for on, and
+# no command: "no namespace ledger-archive on seeded-b".
+#
+# None of the other chat-voice-* cases reach the presence path: their asks are
+# about things that exist. fanout-absent-cluster-cards-complete reaches it on
+# a fan-out's children and grades that the cards completed, not how the answer
+# reads.
+#
+# The namespace name is invented, so it is absent by construction on every
+# pool project: nothing under bench/tf/fleet/ creates a `ledger-archive`
+# namespace, and the fleet is read-only (.agents/rules/
+# eval_driven_development.md, "Finding a case"). The slot b
+# role below stands for its cluster rather than for a planted defect
+# (docs/designs/bench-case-format.md, `fixtures`): `fixture_roles` grounds
+# the objective in the runner having reached slot b, and `{cluster:b}` is
+# that cluster's recorded name, so an answer that names it in full passes
+# the same as one that says seeded-b.
+#
+# The prompt names the project as well as the cluster, in the words
+# chat-tabular-answer-keeps-its-table uses ("in project {{PROJECT_ID}}";
+# the runner substitutes the placeholder in the prompt, bench/CUSTOM-TASKS.md
+# "3. Write the task"). A CI pool project has one seeded-b, but an install whose
+# scope spans many pool projects has one per project: on such an install
+# (gkedemos, 41 projects) the front door answered an unqualified ask with
+# "which GCP project's seeded-b cluster did you mean?" and filed no card.
+# The question back is forbidden below in both of its forms, cluster and
+# project, so a run that stalls on it is red rather than vacuously green on
+# the no-command check.
+#
+# The check reads the worker's own finding: the delivered result up to the
+# first "Evidence for verified claims" header. That section is
+# kanban_complete's, not the worker's (deploy/docker/patches/
+# kanban_verified_claims.py): when the worker lists a claim in
+# `verified_claims`, the tool checks it against a command the card ran and
+# renders the command and its output below the finding, so a `$ kubectl`
+# fence there is the evidence the gate asked for, by design, and no wording
+# can stop a worker from submitting a claim. The red run on main 675114dd3
+# had both: `kubectl get namespaces` quoted inside the finding (the defect)
+# and the evidence section under it. Only the first is graded.
+# report_contains normalizes backticks away, so a fenced command and an
+# inline one read the same to the patterns.
+# bench/tests/test_chat_voice_absent_answer_patterns.py pins the scoped
+# patterns against the section the gate really renders, and the heading
+# literal the lookaheads stop at.
+#
+# The worker-scope objective pins the path: the card completed on the
+# seeded-b Cluster Agent, not on `platform` (which has its own absent-target
+# rule, agents/platform/SOUL.md §0). The inject lane sets worker-scope checks
+# aside on every record (bench/kube_agents_bench/cases.py,
+# WORKER_BLIND_CHECK_TYPES and `tool_called` in the workers scope), so on the
+# presubmit lane this case grades the answer alone; on the api lanes it also
+# grades who answered.
+#
+# Planted defect required: none. Isolation class: read-only. deployer: noop,
+# one front-door turn plus the card round trip. No safeguard of its own: the
+# ask reads one namespace, and both lanes append the GitHub-write safeguard.
+id: chat-voice-absent-answer-quotes-no-command
+name: A presence answer names the missing namespace and the cluster, not the command that showed it
+prompt: >-
+  Is there a namespace called ledger-archive on the seeded-b cluster in
+  project {{PROJECT_ID}}?
+expected_output: >-
+  The front door files a card for the Cluster Agent of seeded-b in the named
+  project and acks it, without asking which cluster or which project is
+  meant. The answer that comes back is one line saying there is no namespace
+  ledger-archive on seeded-b, in words: it names the namespace and the
+  cluster, and the finding itself carries no kubectl or gcloud command and
+  no command fence. An evidence section kanban_complete renders below the
+  finding, from the worker's verified_claims, is the tool's and may hold the
+  command.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml: the front door's reply to a routed ask.
+domain: chat-and-routing
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: bradhoekstra
+
+# The slot b role stands for its cluster: nothing here reads the version
+# laggard itself. Listed so the fleet owner replacing seeded-b finds this case.
+fixtures:
+  - version-laggard
+
+verification_spec:
+  # assert, not the converge default: the transcript is immutable once the
+  # run ends, so polling a failed check would only wait out the timeout.
+  #
+  # The answer says what is absent and where: the namespace by name, the
+  # cluster by its recorded name or its short form, and an absence shape on
+  # the same line as the namespace, in either order. The absence clause is
+  # tied to the subject ("no namespace", "not on", "not among", "is not",
+  # "does not exist", "none", "absent", "missing"), not any negation: an
+  # ability negation ("couldn't confirm", "was not able to verify", "can't
+  # tell which") repeats the prompt's terms and a "not" and would otherwise
+  # grade as the finding, and a blocklist of failure phrasings cannot be
+  # complete. The text is lowercased before the patterns run, line breaks
+  # kept, and the apostrophe is normalized to the straight one. No question
+  # back, whatever it asks about (the prompt names the cluster and the
+  # project): the inject lane sets check 3 aside, so without these a run
+  # that never reached the cluster would grade green on the answer alone.
+  - name: the-answer-names-the-missing-namespace-and-the-cluster
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["ledger-archive"]
+      any_of_patterns:
+        - "{cluster:b}"
+        - '\bseeded-b\b'
+      required_patterns:
+        - '(?m)^(?=.*\bledger-archive\b)(?=.*(?:\bno (?:namespace|such)\b|\bnot (?:on|in|among|present|found|there)\b|\b(?:isn''t|is not|doesn''t exist|does not exist|not exist|none|absent|missing)\b)).*$'
+      forbidden_patterns:
+        # A question back, in any wording: a line that asks about a cluster
+        # or a project, or says "did you mean". A finding may end on an
+        # offer ("Want me to check the other clusters?"), so a bare question
+        # mark is not enough; the stall names what it cannot pick.
+        - '(?im)^.*\b(?:which|cluster|project)\b.*\?\s*$'
+        - '(?im)^.*\bdid you mean\b.*$'
+        # A failure to check: a modal or ability negation, then within three
+        # words a checking verb ("couldn't confirm", "was not able to
+        # verify", "can't tell which"), or its passive ("could not be
+        # checked"). Apostrophes are straight after normalization. The
+        # required pattern above is the main guard (an ability negation is
+        # not an absence shape); this names the failure for the record.
+        - '(?i)\b(?:can''?t|cannot|could not|couldn''?t|was not able|wasn''?t able|unable|failed|didn''?t|did not)\b(?: \S+){0,3} (?:to )?(?:tell|check|verify|confirm|reach|read|access|connect|look|query|determine)\b'
+        - '(?i)\bcould not be (?:checked|verified|read|reached|confirmed|queried)\b'
+      fixture_roles:
+        - version-laggard
+  # The defect: a command in the worker's own finding. `kubectl` is the one
+  # the presence rule produced; `gcloud` is the same defect through the other
+  # CLI the worker has; a line opening on `$ ` is a quoted shell command
+  # whatever the tool. Each pattern is scoped to the text before the first
+  # "Evidence for verified claims" header (the section kanban_complete
+  # renders below the finding, by design; see the header comment): a
+  # tempered lookahead from `\A`, so a command after that header never
+  # matches. The surface the patterns run over is the whole final message,
+  # lowercased, with `**` and backticks dropped and line breaks kept
+  # (bench/kube_agents_bench/verifiers.py, pattern_surface), so the header
+  # is spelled lowercase here and the `$ ` line is anchored per line.
+  # One card is delivered, so the first header is the finding's end.
+  - name: the-answer-quotes-no-command
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      forbidden_patterns:
+        - '(?s)\A(?:(?!evidence for verified claims).)*?\bkubectl\b'
+        - '(?s)\A(?:(?!evidence for verified claims).)*?\bgcloud\b'
+        - '(?sm)\A(?:(?!evidence for verified claims).)*?^\s*\$ \S'
+  # The path: the seeded-b Cluster Agent completed the card. The agent
+  # pattern anchors on the cluster name between dashes, so seeded-b cannot
+  # match a profile named for seeded-bb. Set aside on the inject lane (see
+  # the header); graded on the api lanes.
+  - name: the-seeded-b-cluster-agent-completed-the-card
+    role: objective
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["kanban_complete"]
+      scope: workers
+      agent: "cluster-.*-seeded-b-.*"
+      require_success: true

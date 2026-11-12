@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -173,6 +174,7 @@ func agentProfileSpecPaths() []string {
 		p.Spec.Tools = []agentv1alpha1.AgentProfileTool{{Name: "jq", Image: "registry.example/jq:1"}}
 		p.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead}
 		p.Spec.Parameters = []agentv1alpha1.AgentProfileParameter{{Name: "cluster", Required: true}}
+		p.Spec.YieldToPinned = true
 	})
 	raw, _ := json.Marshal(p.Spec)
 	var top map[string]json.RawMessage
@@ -613,10 +615,11 @@ func checkFixture(t *testing.T, path, rendered string) {
 // holds its hand-built envelope to the protocol.
 func TestTheAgentCardFixtureIsWhatTheOperatorRenders(t *testing.T) {
 	at := time.Date(2026, 10, 6, 0, 0, 0, 0, time.UTC)
-	// With declared parameters, so the a2a contract test can hold the
-	// routing fields' names to lib.AgentCard's.
+	// With declared parameters and yieldToPinned, so the a2a contract test
+	// can hold the routing fields' names to lib.AgentCard's.
 	card := desiredAgentCard(ptr.To(testAgentProfile("ns", "auditor", func(p *agentv1alpha1.AgentProfile) {
 		p.Spec.Parameters = []agentv1alpha1.AgentProfileParameter{{Name: "project", Required: true}, {Name: "location", Required: true}, {Name: "cluster", Required: true}}
+		p.Spec.YieldToPinned = true
 	})))
 	body, err := renderDirectoryEnvelope("auditor", &card, at, "000000000000000000000000")
 	if err != nil {
@@ -1625,15 +1628,20 @@ func TestAProfileServiceAccountChangeWakesTheAgentBesideIt(t *testing.T) {
 	}
 }
 
-// The card carries the profile's tiers, its pinned cluster and its declared
-// parameters, which is what the gateway routes on.
+// The card carries the profile's tiers, its pinned cluster, its declared
+// parameters and whether it yields to pinned profiles, which is what the
+// gateway routes on.
 func TestTheCardCarriesWhatTheGatewayRoutesOn(t *testing.T) {
 	p := testAgentProfile("ns", "prod-a", func(p *agentv1alpha1.AgentProfile) {
 		p.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead, agentv1alpha1.AgentProfileTierUnattended}
 		p.Spec.ClusterRef = &agentv1alpha1.AgentProfileClusterRef{ProjectID: "p", Location: "us-central1", Cluster: "a"}
 		p.Spec.Parameters = []agentv1alpha1.AgentProfileParameter{{Name: "namespace"}}
+		p.Spec.YieldToPinned = true
 	})
 	card := desiredAgentCard(&p)
+	if !card.YieldToPinned {
+		t.Error("yieldToPinned didn't reach the card")
+	}
 	if !slices.Equal(card.Tiers, []string{"read", "unattended"}) {
 		t.Errorf("tiers = %v", card.Tiers)
 	}
@@ -1645,7 +1653,7 @@ func TestTheCardCarriesWhatTheGatewayRoutesOn(t *testing.T) {
 	}
 	// A profile with neither: read alone, no pin, no parameters.
 	bare := desiredAgentCard(ptr.To(testAgentProfile("ns", "bare")))
-	if !slices.Equal(bare.Tiers, []string{"read"}) || bare.ClusterRef != nil || bare.Parameters != nil {
+	if !slices.Equal(bare.Tiers, []string{"read"}) || bare.ClusterRef != nil || bare.Parameters != nil || bare.YieldToPinned {
 		t.Errorf("bare card = %+v", bare)
 	}
 }
@@ -1772,5 +1780,61 @@ func TestTheClusterProfileExampleIsAGenericAndAPinnedProfile(t *testing.T) {
 	}
 	if pinned != 1 {
 		t.Errorf("%d documents set clusterRef, want exactly the pinned one", pinned)
+	}
+}
+
+// The finalizer is written as a merge patch of metadata alone, never as an
+// Update of the whole profile: an Update sends the spec back as this
+// operator's Go type knows it, which drops any field a newer CRD added (an
+// older operator stripped yieldToPinned from a profile created in the same
+// upgrade, #5435). Both the add and the release are checked.
+func TestTheFinalizerIsPatchedWithoutTouchingTheSpec(t *testing.T) {
+	withOperatorBusPrincipal(t)
+	agent := a2aTestAgent()
+	p := testAgentProfile(agent.Namespace, "auditor")
+	h := newProfileHarness(t, agent, &p)
+	var updates int
+	var patches []map[string]json.RawMessage
+	inner := h.c
+	h.c = interceptor.NewClient(inner.(client.WithWatch), interceptor.Funcs{
+		Update: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			if _, ok := obj.(*agentv1alpha1.AgentProfile); ok {
+				updates++
+			}
+			return cl.Update(ctx, obj, opts...)
+		},
+		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if _, ok := obj.(*agentv1alpha1.AgentProfile); ok && patch.Type() == types.MergePatchType {
+				data, err := patch.Data(obj)
+				if err != nil {
+					return err
+				}
+				var top map[string]json.RawMessage
+				if err := json.Unmarshal(data, &top); err != nil {
+					return err
+				}
+				patches = append(patches, top)
+			}
+			return cl.Patch(ctx, obj, patch, opts...)
+		},
+	})
+	h.r.Client = h.c
+
+	h.reconcile(agent.Namespace, "auditor")
+	if err := h.c.Delete(context.Background(), h.profile(agent.Namespace, "auditor")); err != nil {
+		t.Fatal(err)
+	}
+	h.reconcile(agent.Namespace, "auditor")
+
+	if updates != 0 {
+		t.Errorf("the profile was written with Update %d time(s); a finalizer change must not send the spec", updates)
+	}
+	if len(patches) != 2 {
+		t.Fatalf("got %d merge patch(es) on the profile, want the finalizer's add and release", len(patches))
+	}
+	for i, top := range patches {
+		if _, ok := top["spec"]; ok || len(top) != 1 || top["metadata"] == nil {
+			t.Errorf("patch %d touches more than metadata: %v", i, slices.Sorted(maps.Keys(top)))
+		}
 	}
 }

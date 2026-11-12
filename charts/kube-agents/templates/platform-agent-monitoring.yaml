@@ -87,6 +87,30 @@ spec:
       path: /metrics
       interval: 30s
 ---
+{{- if gt (include "kube-agents.credentialProxyExecReplicas" . | int) 0 }}
+{{- /*
+The credential broker's exec tier, while spec.deployment.credentialProxy.exec.replicas
+is above 0: the same metrics-only port on the tier's own selector, which does
+not match the stateful broker's.
+*/}}
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: {{ .Values.platformAgent.name }}-credential-proxy-exec-tier-monitoring
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ .Values.platformAgent.name }}-credential-proxy-exec-tier
+      kubeagents.x-k8s.io/component: credential-proxy-exec-tier
+  endpoints:
+    - port: 8766
+      path: /metrics
+      interval: 30s
+---
+{{- end }}
 {{- /*
 The A2A gateway's metrics-only listener (a2aGatewayMetricsPort in the
 operator): task terminals by state and source, and Google Chat pulls by
@@ -249,6 +273,45 @@ spec:
       path: /metrics
       interval: 30s
 ---
+{{- if gt (include "kube-agents.credentialProxyExecReplicas" . | int) 0 }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.platformAgent.name }}-cred-metrics-exec-tier
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Values.platformAgent.name }}-cred-metrics-exec-tier
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    app: {{ .Values.platformAgent.name }}-credential-proxy-exec-tier
+    kubeagents.x-k8s.io/component: credential-proxy-exec-tier
+  ports:
+    - name: cred-metrics
+      port: 8766
+      targetPort: 8766
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ .Values.platformAgent.name }}-cred-metrics-exec-tier
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+    {{- with .Values.platformAgent.serviceMonitorLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ .Values.platformAgent.name }}-cred-metrics-exec-tier
+  endpoints:
+    - port: cred-metrics
+      path: /metrics
+      interval: 30s
+---
+{{- end }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -387,6 +450,28 @@ spec:
       path: /metrics
       interval: 30s
 ---
+{{- if gt (include "kube-agents.credentialProxyExecReplicas" . | int) 0 }}
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMPodScrape
+metadata:
+  name: {{ .Values.platformAgent.name }}-cred-metrics-exec-tier
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+    {{- with .Values.platformAgent.vmPodScrapeLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ .Values.platformAgent.name }}-credential-proxy-exec-tier
+      kubeagents.x-k8s.io/component: credential-proxy-exec-tier
+  podMetricsEndpoints:
+    - port: cred-metrics
+      path: /metrics
+      interval: 30s
+---
+{{- end }}
 apiVersion: operator.victoriametrics.com/v1beta1
 kind: VMPodScrape
 metadata:
@@ -512,6 +597,30 @@ spec:
         - protocol: TCP
           port: 8766
 ---
+{{- if gt (include "kube-agents.credentialProxyExecReplicas" . | int) 0 }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Values.platformAgent.name }}-cred-mon-exec-tier-netpol
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app: {{ .Values.platformAgent.name }}-credential-proxy-exec-tier
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.platformAgent.monitoringScraperNamespace | quote }}
+      ports:
+        - protocol: TCP
+          port: 8766
+---
+{{- end }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

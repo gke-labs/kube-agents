@@ -22,6 +22,7 @@ import "testing"
 // link a browser can open.
 func TestRepositoryURLHandlesEveryRemoteSpelling(t *testing.T) {
 	gitea := "gitea-http.gitea.svc.cluster.local:3000"
+	bbdc := "bitbucket.corp.example"
 	cases := []struct {
 		in   repositoryInfo
 		want string
@@ -37,6 +38,16 @@ func TestRepositoryURLHandlesEveryRemoteSpelling(t *testing.T) {
 		{repositoryInfo{Provider: "gitea", Host: gitea, Repository: "ops/gitops-repo"}, "http://" + gitea + "/ops/gitops-repo"},
 		{repositoryInfo{Provider: "gitea", Repository: gitea + "/ops/gitops-repo"}, "http://" + gitea + "/ops/gitops-repo"},
 		{repositoryInfo{Provider: "gitea", Repository: "ops/gitops-repo"}, ""},
+		{repositoryInfo{Provider: "bitbucket", Repository: "acme/infra"}, "https://bitbucket.org/acme/infra"},
+		{repositoryInfo{Provider: "bitbucket", Repository: "git@bitbucket.org:acme/infra.git"}, "https://bitbucket.org/acme/infra"},
+		{repositoryInfo{Provider: "bitbucket-datacenter", Host: bbdc, Repository: "OPS/infra"}, "https://" + bbdc + "/projects/OPS/repos/infra"},
+		{repositoryInfo{Provider: "bitbucket-datacenter", Host: bbdc, Repository: "ssh://git@" + bbdc + ":7999/OPS/infra.git"}, "https://" + bbdc + "/projects/OPS/repos/infra"},
+		{repositoryInfo{Provider: "bitbucket-datacenter", Host: bbdc, Repository: "https://" + bbdc + "/OPS/infra.git"}, "https://" + bbdc + "/projects/OPS/repos/infra"},
+		{repositoryInfo{Provider: "bitbucket-datacenter", Host: bbdc, Repository: "https://" + bbdc + ":7990/OPS/infra"}, "https://" + bbdc + ":7990/projects/OPS/repos/infra"},
+		{repositoryInfo{Provider: "bitbucket", Repository: "https://bitbucket.org/acme/infra"}, "https://bitbucket.org/acme/infra"},
+		{repositoryInfo{Provider: "bitbucket-datacenter", Repository: "OPS/infra"}, ""},
+		{repositoryInfo{Provider: "bitbucket-datacenter", Host: bbdc, Repository: "OPS/sub/infra"}, ""},
+		{repositoryInfo{Provider: "bitbucket-datacenter", Host: bbdc, Repository: "infra"}, ""},
 	}
 	for _, c := range cases {
 		if got := repositoryURL(c.in); got != c.want {

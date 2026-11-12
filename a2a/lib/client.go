@@ -186,7 +186,7 @@ func fullJitterBackoff(attempt int) time.Duration {
 			ceil = d
 		}
 	}
-	return rand.N(ceil)
+	return rand.N(ceil) // #nosec G404 -- backoff jitter, not a secret
 }
 
 // msgIDHeaderOverhead is the wire cost of the Nats-Msg-Id header beyond the

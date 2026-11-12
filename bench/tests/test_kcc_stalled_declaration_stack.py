@@ -238,9 +238,21 @@ def test_the_note_finish_writes_for_the_plant_carries_the_cases_phrases(tmp_path
     task = yaml.safe_load(TASK.read_text(encoding="utf-8"))
     [deciding] = [e for e in task["verification_spec"] if e["name"] == "the-fix-says-config-connector-is-not-applying-its-file"]
     declarations = audit_report.kcc_declarations(tmp_path)
+    check = deciding["check"]
+
+    def passes(row):
+        # As LedgerIssueContainsVerifier matches its phrases: a case-folded
+        # substring of the body, with no other normalisation.
+        text = row.lower()
+        return (
+            all(phrase.lower() in text for phrase in check["required_phrases"])
+            and any(phrase.lower() in text for phrase in check["any_of_phrases"])
+            and not any(phrase.lower() in text for phrase in check["forbidden_phrases"])
+        )
+
     # A manifest fix of the planted file, and the live run's case: the worker
     # named a file it never wrote, so the fix degraded to manual. The ledger
-    # row carries every phrase either way.
+    # row passes the check either way.
     for remediation in (
         {"kind": "manifest", "path": path, "note": "Spread the pool over three zones."},
         {"kind": "manifest", "path": "clusters/acme-seeded-a/pinned-inference-pool.tf", "note": "Spread the pool over three zones."},
@@ -249,11 +261,16 @@ def test_the_note_finish_writes_for_the_plant_carries_the_cases_phrases(tmp_path
         audit_report.degrade_missing_remediations([case], tmp_path)
         assert audit_report.disclose_stalled_kcc_remediations([case], collected, tmp_path, declarations) == ["pool-single-zone"]
         row = "\n".join(audit_report.render_finding({**case, "severity": "major", "title": "Single-zone pool", "evidence": {}}))
-        for phrase in deciding["check"]["required_phrases"]:
-            assert phrase in row, (case["remediation"]["kind"], phrase)
-    # Red on main: the worker's note alone carries no phrase.
-    for phrase in deciding["check"]["required_phrases"]:
-        assert phrase not in "Spread the pool over three zones."
+        assert passes(row), (case["remediation"]["kind"], row)
+    # Red on main: the old paragraph of the degraded fix said "this file" and
+    # then named the declaration, and the worker's note alone passes nothing.
+    old = (
+        "Spread the pool over three zones.\n\n**Config Connector is not applying this file.** The declaration is "
+        f"`{path}`. When the audit ran, Config Connector reported `Ready=False` on "
+        "`ContainerNodePool eval-kcc-stalled/pinned-inference-pool` (`DependencyNotFound: x`)."
+    )
+    assert not passes(old)
+    assert not passes("Spread the pool over three zones.")
 
 
 def test_the_plant_writes_the_object_and_the_declaration():

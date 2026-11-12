@@ -9,8 +9,10 @@
 > findings blocking; sections 1, 4 and 8 keep the original plan as history. On 2026-11-06
 > `post-kube-agents-eval-rc` (GoogleCloudPlatform/oss-test-infra#2774) and the two Argon smoke
 > presubmits `pull-kube-agents-smoke-test` and `-today` (GoogleCloudPlatform/oss-test-infra#2775)
-> moved the same way, so "Presubmits stay on Vertex" below is history too: only the Claude and
-> Flash smoke jobs and the forge smoke variants stay on Vertex AI. One item stays open: the
+> moved the same way, so "Presubmits stay on Vertex" below is history too. Since then each
+> lane reads its provider and model from the build cluster's eval-model Secret
+> (`docs/ci-pool-projects.md` 5.10), and a Prow job without them stops at the deploy instead of
+> falling through to the scripts' default. One item stays open: the
 > version key does not carry the serving provider (#4932). The one precondition that could
 > have made the design moot was probed on 2026-11-04 (see "What the probe showed").
 

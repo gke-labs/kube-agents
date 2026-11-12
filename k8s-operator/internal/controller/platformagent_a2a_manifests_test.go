@@ -293,8 +293,8 @@ func TestBuildA2ANATSStatefulSet(t *testing.T) {
 	if sts.Name != "test-agent-a2a-nats" {
 		t.Errorf("statefulset name = %q", sts.Name)
 	}
-	if got := *sts.Spec.Replicas; got != 1 {
-		t.Errorf("replicas = %d, want 1 (single node R1 is the dev posture)", got)
+	if got := *sts.Spec.Replicas; got != int32(agentv1alpha1.DefaultBusReplicas) {
+		t.Errorf("replicas = %d, want %d (a three-server cluster is the default)", got, agentv1alpha1.DefaultBusReplicas)
 	}
 	if len(sts.Spec.VolumeClaimTemplates) != 1 {
 		t.Fatalf("expected one volumeClaimTemplate (JetStream file store on a PV), got %d", len(sts.Spec.VolumeClaimTemplates))
@@ -1068,10 +1068,12 @@ func TestProbeTopicIsProvisionedAndWriterless(t *testing.T) {
 
 // Without this policy every pod in the cluster reaches 4222/8222/9222 while
 // the bus grants do the real refusing. The network layer now agrees with
-// them: 4222 from exactly the enumerated bus clients, and no pod-network
-// peer at all for 8222 (monitor) or 9222 (ws) — the demo port-forward and
-// the kubelet readiness probe both enter via the node, which NetworkPolicy
-// does not govern, and that is the decided posture rather than an accident.
+// them: 4222 from exactly the enumerated bus clients, 9222 (ws) from the
+// console server, and 8222 (monitor) from the operator's pod, and only when
+// the operator knows its own namespace, which this test's environment
+// doesn't set (TestTheMonitorPortAdmitsTheOperatorAlone covers that case).
+// The demo port-forward and the kubelet readiness probe both enter via the
+// node, which NetworkPolicy does not govern.
 func TestBuildA2ANATSNetworkPolicy(t *testing.T) {
 	np := buildA2ANATSNetworkPolicy(a2aTestAgent())
 
@@ -1085,8 +1087,11 @@ func TestBuildA2ANATSNetworkPolicy(t *testing.T) {
 		t.Errorf("policy types = %v, want ingress only", np.Spec.PolicyTypes)
 	}
 
-	if len(np.Spec.Ingress) != 2 {
-		t.Fatalf("expected exactly two ingress rules (4222 for bus clients, 9222 for the console server), got %d: %+v",
+	// 4222 for bus clients, 9222 for the console server, and 6222 between the
+	// servers of the default three-server bus (TestTheBusFenceAdmitsRoutes
+	// FromItsOwnServersOnly has the third).
+	if len(np.Spec.Ingress) != 3 {
+		t.Fatalf("expected exactly three ingress rules (4222 for bus clients, 9222 for the console server, 6222 for routes), got %d: %+v",
 			len(np.Spec.Ingress), np.Spec.Ingress)
 	}
 	rule := np.Spec.Ingress[0]
@@ -1334,7 +1339,7 @@ func TestGatewayIsToldAboutTheClusterViewOnlyUnderTheFlag(t *testing.T) {
 	}
 	t.Setenv(a2aSessionClusterViewEnvVar, "")
 	off := envOf()
-	for _, name := range []string{"A2A_SESSION_CLUSTER_VIEW", "A2A_CREDENTIAL_PROXY_URL"} {
+	for _, name := range []string{"A2A_SESSION_CLUSTER_VIEW", "A2A_CREDENTIAL_PROXY_URL", "A2A_KUBE_PROXY_URL", "A2A_KUBE_PROXY_CA_CONFIGMAP", "A2A_KUBE_PROXY_HOST_CONTEXT"} {
 		if _, ok := off[name]; ok {
 			t.Errorf("%s rendered with the flag off", name)
 		}
@@ -1346,6 +1351,15 @@ func TestGatewayIsToldAboutTheClusterViewOnlyUnderTheFlag(t *testing.T) {
 	}
 	if on["A2A_CREDENTIAL_PROXY_URL"].Value != credentialProxyBaseURL(agent) {
 		t.Errorf("A2A_CREDENTIAL_PROXY_URL = %+v, want %s", on["A2A_CREDENTIAL_PROXY_URL"], credentialProxyBaseURL(agent))
+	}
+	if on["A2A_KUBE_PROXY_URL"].Value != kubeProxyURL(agent) {
+		t.Errorf("A2A_KUBE_PROXY_URL = %+v, want %s", on["A2A_KUBE_PROXY_URL"], kubeProxyURL(agent))
+	}
+	if on["A2A_KUBE_PROXY_CA_CONFIGMAP"].Value != kubeProxyCABundleName(agent) {
+		t.Errorf("A2A_KUBE_PROXY_CA_CONFIGMAP = %+v, want %s", on["A2A_KUBE_PROXY_CA_CONFIGMAP"], kubeProxyCABundleName(agent))
+	}
+	if on["A2A_KUBE_PROXY_HOST_CONTEXT"].Value != hostClusterContextName(agent) {
+		t.Errorf("A2A_KUBE_PROXY_HOST_CONTEXT = %+v, want %s", on["A2A_KUBE_PROXY_HOST_CONTEXT"], hostClusterContextName(agent))
 	}
 }
 
@@ -1460,8 +1474,8 @@ func TestSessionNetworkPolicyReachesTheBrokerOnlyUnderTheFlag(t *testing.T) {
 	}
 	t.Setenv(a2aSessionClusterViewEnvVar, "true")
 	np := buildA2ASessionNetworkPolicy(agent, []string{"10.96.0.10"})
-	if len(np.Spec.Egress) != 4 {
-		t.Fatalf("flag on: %d egress rules, want 4", len(np.Spec.Egress))
+	if len(np.Spec.Egress) != 5 {
+		t.Fatalf("flag on: %d egress rules, want 5", len(np.Spec.Egress))
 	}
 	if len(np.Spec.Ingress) != 0 {
 		t.Fatalf("the view opened ingress: %+v", np.Spec.Ingress)
@@ -1473,6 +1487,14 @@ func TestSessionNetworkPolicyReachesTheBrokerOnlyUnderTheFlag(t *testing.T) {
 	if len(broker.To) != 1 || broker.To[0].PodSelector == nil ||
 		!reflect.DeepEqual(broker.To[0].PodSelector.MatchLabels, credentialProxySelector(agent)) {
 		t.Fatalf("broker rule peer = %+v, want the broker pod selector %v", broker.To, credentialProxySelector(agent))
+	}
+	kubeProxy := np.Spec.Egress[4]
+	if len(kubeProxy.Ports) != 1 || int32(kubeProxy.Ports[0].Port.IntValue()) != kubeProxyPort {
+		t.Fatalf("kube-proxy rule ports = %+v, want %d only", kubeProxy.Ports, kubeProxyPort)
+	}
+	if len(kubeProxy.To) != 1 || kubeProxy.To[0].PodSelector == nil ||
+		!reflect.DeepEqual(kubeProxy.To[0].PodSelector.MatchLabels, kubeProxySelector(agent)) {
+		t.Fatalf("kube-proxy rule peer = %+v, want the kube-proxy pod selector %v", kubeProxy.To, kubeProxySelector(agent))
 	}
 }
 
@@ -1599,6 +1621,15 @@ func TestBuildA2ASessionQuota(t *testing.T) {
 	if want := 2 + standing + a2aDefaultChartPods + a2aQuotaTransientMargin; pods.Value() != want {
 		t.Fatalf("tuned quota = %d, want %d", pods.Value(), want)
 	}
+
+	// A single-server bus runs two NATS pods fewer, and the derived count
+	// follows the StatefulSet's replicas.
+	one := 1
+	agent.Spec.Harness.Tuning.BusReplicas = &one
+	if single := buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]; single.Value() != pods.Value()-2 {
+		t.Fatalf("single-server quota = %d, want %d (two NATS servers fewer)", single.Value(), pods.Value()-2)
+	}
+	agent.Spec.Harness.Tuning.BusReplicas = nil
 
 	// The MCP server is one more standing pod, only while its flag is on (#3869).
 	without := pods.Value()
@@ -6227,7 +6258,10 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 	// callout issues exactly the callout rows.
 	wantUsers := append(slices.Clone(staticRows), a2aCalloutConfUser, sysUser)
 	slices.Sort(wantUsers)
-	gotUsers := a2aConfUserNames(conf)
+	// Users only: the cluster block renders none (routes authenticate by
+	// certificate, TestTheRoutesAuthenticateByCertificateOnly), and it is cut
+	// out so a stray "user:" in it would not pass for an account user.
+	gotUsers := a2aConfUserNames(a2aClusterBlockRe.ReplaceAllString(conf, ""))
 	slices.Sort(gotUsers)
 	if !slices.Equal(gotUsers, wantUsers) {
 		t.Fatalf("nats.conf users = %v, want %v; a new user needs a row in this test's table before it ships, and a row with no user is stale", gotUsers, wantUsers)
@@ -7686,8 +7720,10 @@ func TestTheProvisionJobRunsOnAnOldTemplateReplica(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Two pods, one ready, none on the current template: a roll in progress
-	// or wedged at maxUnavailable 0.
+	// or wedged at maxUnavailable 0. The bus is up; this test is about the
+	// callout gate alone.
 	reportCalloutStatus(t, ctx, cl, agent, 2, 1, 0)
+	reportBusRolledOut(t, ctx, cl, agent)
 	state, err := r.reconcileA2A(ctx, agent, homeChannelRecord{})
 	if err != nil {
 		t.Fatal(err)

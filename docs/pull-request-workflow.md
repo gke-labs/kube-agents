@@ -135,7 +135,9 @@ fails; see `.agents/skills/edit-mirrored-skill/SKILL.md`.
 every namespace as full objects (`-A -o json|yaml`), because the credential proxy cuts such a reply
 at its output cap on a large cluster. Read one kind per call, project the fields with
 `-o jsonpath=` or `custom-columns=`, or read per namespace; the reads already in the tree are pinned
-with a reason in `scripts/cluster_reads_allowlist.txt`, which only shrinks. A Markdown span that
+with a reason in `scripts/cluster_reads_allowlist.txt`, which only shrinks, except for an
+`unresolved-kinds` read of one runtime kind per call that falls back when the broker cuts it, which
+is pinned with a reason that says so. A Markdown span that
 quotes the shape only to warn against it carries `<!-- cluster-reads-check: warning -->` on its
 line, and the check skips the spans on that line. CI runs the same check through
 `scripts/test_check_cluster_reads.py`.
@@ -232,8 +234,10 @@ account's egress limit falls through to a cold install instead of holding the st
 **Operator code.** If you modify `k8s-operator/`, run `make` or `go build` inside that directory to
 ensure compilation succeeds.
 
-**A2A module code.** If you modify `a2a/`, run `go vet ./...` and `go test -race ./...` inside that
-directory — what the `A2A Module Tests` CI job runs. The conformance suite starts an embedded
+**A2A module code.** If you modify `a2a/`, run `make gosec` from the repository root (it scans every
+module; the CI step scans `a2a/` alone, with the same binary built from `k8s-operator/go.mod`'s
+pin), then `go vet ./...` and `go test -race ./...` inside that directory — what the
+`A2A Module Tests` CI job runs for this module. The conformance suite starts an embedded
 JetStream server, so no cluster or credentials are needed. The CI job additionally installs the
 envtest binaries and the `nats` CLI; without them the auth callout's API-server and CLI cases skip
 and the run still reports green. To match it, run with
@@ -316,8 +320,8 @@ and the installer declare, and the `validate` job runs it on the version it pins
 below includes it.
 
 **Everything at once.** `make verify` runs what a pull request must pass offline — Go build, vet
-and test, the Python suites, the conformance suite, the Terraform module tests. The per-area targets it wraps, for a faster
-loop while you work:
+and test, the Python suites, the conformance suite, the Terraform module tests; gosec is the
+exception (`make gosec`, below). The per-area targets, for a faster loop while you work:
 
 - `make shellcheck` — the `validate` job in `Validate Repo Structure` runs it after the structure
   check; see **Shell scripts** above for the release to install.
@@ -325,7 +329,8 @@ loop while you work:
   live under `agents/*/defaults/skills/` instead of `agents/*/skills/`.
 - `make -C k8s-operator test` — manifests, generate, fmt, vet, the Python suite under
   `k8s-operator/internal/controller` (the gateway's leader-election wrapper; `make test-python`
-  runs it too), then the envtest download and `go test`; what the `Operator Tests` job runs.
+  runs it too), then the envtest download and `go test`; what the `Operator Tests` job runs
+  after its gosec step, which the target does not include (`make gosec`, below, does).
 - `make test-integration` — the seam tier only, for a component another one talks to across a
   process or protocol boundary. Install a Go toolchain first: the injector seam compiles the real
   Go event-watcher client, and without `go` on `PATH` its tests skip and the run still prints
@@ -334,6 +339,8 @@ loop while you work:
 - `make docs-check`, plus `cd docs/site && npm ci && npm run build` if you touched `docs/site/`.
   `make docs-check` needs `go` on `PATH`: the CRD field pages are read from the operator's Go API
   types, and the check fails without it.
+- `make gosec` — gosec, built once from `k8s-operator/go.mod`'s pin, over every Go module; the
+  scan CI runs on each module. Not part of `make verify`: a cold build and scan take minutes.
 
 ## The automated review
 

@@ -169,7 +169,7 @@ class NudgeHarness(unittest.TestCase):
         for name in fq.PACING_ENV.values():
             os.environ.pop(name, None)
 
-    def run_at(self, now, ranked, added=None, fail=None, surfaced_error=None):
+    def run_at(self, now, ranked, added=None, fail=None, surfaced_error=None, failing_marks=()):
         """Drive `main` at `now` against a stubbed queue, recording every request."""
         self.out.seek(0)
         self.out.truncate()
@@ -189,6 +189,8 @@ class NudgeHarness(unittest.TestCase):
             if path.endswith("/surfaced"):
                 if surfaced_error:
                     raise surfaced_error
+                if path.split("/")[3] in failing_marks:
+                    raise urllib.error.URLError("refused")
                 self.marks.append((path.split("/")[3], body))
                 return {}
             raise AssertionError(f"unexpected request {path}")
@@ -367,6 +369,22 @@ class MainTests(NudgeHarness):
         self.assertIn("m1", self.out.getvalue())
         self.assertEqual(sorted(fid for fid, _ in self.marks), ["m1", "n0"])
         self.assertEqual(self.state()[nudge.ANNOUNCED_KEY]["ids"], ["m0", "m1", "n0"])
+
+    def test_a_line_whose_marks_partly_failed_does_not_stop_the_days_additions(self):
+        # #5329: the nudge adds K (m0, m1); the mark of m1 fails, so the queue
+        # holds K's addition and m1 is still new. The user decides m0, which
+        # leaves m1 open. The next run adds another item and does not name K.
+        m0 = finding(id="m0", check_slug="K", severity="major", object="api")
+        m1 = finding(id="m1", check_slug="K", severity="major", object="web")
+        self.run_at(at(6, 16), [m0, m1], failing_marks={"m1"})
+        self.assertIn("New: 1 finding, none of them critical.", self.out.getvalue())
+        self.assertEqual([fid for fid, _ in self.marks], ["m0"])
+        n0 = finding(id="n0", check_slug="N", severity="major", rank_score=80, title="no memory limit on orders")
+        added = {"critical": 0, "noncritical": 1, "lines": [list(fq.item_key(m0))]}
+        self.run_at(at(6, 17), [m1, n0], added=added)
+        self.assertIn("New: 1 finding, none of them critical.", self.out.getvalue())
+        self.assertIn("no memory limit on orders", self.out.getvalue())
+        self.assertEqual([fid for fid, _ in self.marks], ["n0"])
 
     def test_a_record_an_older_build_wrote_today_keeps_the_key_rule_until_the_day_ends(self):
         m1 = finding(id="m1", check_slug="K", severity="major", object="web")
