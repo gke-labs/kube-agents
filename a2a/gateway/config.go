@@ -39,6 +39,11 @@ const defaultDelegationDepthMax = 3
 // field's comment carries the rationale.
 const defaultDelegationWidthMax = 1
 
+// delegationWidthBuiltMax is the widest A2A_DELEGATION_WIDTH_MAX FromEnv
+// accepts: one, until a batch's aggregated wake and its stop are built
+// (#5682). Raising it is what turns fan-out on.
+const delegationWidthBuiltMax = 1
+
 // defaultScopeFile is where the operator projects the install's rendered
 // spec.scope into the gateway pod: the same scope.json, at the same path, the
 // platform agent reads.
@@ -652,9 +657,12 @@ type Config struct {
 	// what runs at once: the dispatcher queues children to each profile's
 	// concurrency.
 	//
-	// Zero means 1, a single child, until the batch's aggregated wake and
-	// its stop exist. FromEnv refuses a value under 1, as it does the depth
-	// bound, and one over lib.DelegateBatchMax, which no reader accepts.
+	// Zero means 1, a single child. FromEnv accepts only 1 for now: a batch's
+	// children can't yet be stopped together, and each would wake the
+	// session on its own, so an operator can't turn fan-out on until its
+	// results and stop are built (delegationWidthBuiltMax). Tests and
+	// embedders that build Config directly may set more, to exercise the
+	// mint. FromEnv also refuses a value under 1, as it does the depth bound.
 	DelegationWidthMax int
 
 	// ScopeFile is the rendered spec.scope a profile task's target is
@@ -960,6 +968,9 @@ func FromEnv() (*Config, error) {
 	wm, err := strconv.Atoi(widthMax)
 	if err != nil || wm < 1 || wm > lib.DelegateBatchMax {
 		return nil, fmt.Errorf("A2A_DELEGATION_WIDTH_MAX %q: need an integer from 1 to %d", widthMax, lib.DelegateBatchMax)
+	}
+	if wm > delegationWidthBuiltMax {
+		return nil, fmt.Errorf("A2A_DELEGATION_WIDTH_MAX %q: at most %d for now; fan-out's results and stop are not built yet (#5682)", widthMax, delegationWidthBuiltMax)
 	}
 	cfg.DelegationWidthMax = wm
 	busyAt := envOr(busyNoticeAtEnv, strconv.Itoa(defaultBusyNoticeAt))

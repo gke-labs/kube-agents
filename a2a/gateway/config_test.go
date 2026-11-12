@@ -1073,9 +1073,11 @@ func TestDelegationDepthMaxFromEnv(t *testing.T) {
 	}
 }
 
-// TestDelegationWidthMaxFromEnv: unset means 1, a delegation of one child,
-// until fan-out's stop and aggregated wake land; a value below 1, above the
-// batch ceiling, or a non-integer refuses the boot, as the depth bound does.
+// TestDelegationWidthMaxFromEnv: unset or 1 means a delegation of one child.
+// Anything over 1 is refused at boot for now, naming the variable and why:
+// a batch's children can't yet be stopped together or report back in one
+// wake. A value below 1 or a non-integer refuses the boot, as the depth bound
+// does.
 func TestDelegationWidthMaxFromEnv(t *testing.T) {
 	setBaseEnv(t)
 	cfg, err := FromEnv()
@@ -1086,13 +1088,20 @@ func TestDelegationWidthMaxFromEnv(t *testing.T) {
 		t.Fatalf("default DelegationWidthMax = %d, want 1", cfg.DelegationWidthMax)
 	}
 
-	t.Setenv("A2A_DELEGATION_WIDTH_MAX", "10")
-	cfg, err = FromEnv()
-	if err != nil {
-		t.Fatal(err)
+	t.Setenv("A2A_DELEGATION_WIDTH_MAX", "1")
+	if cfg, err = FromEnv(); err != nil || cfg.DelegationWidthMax != 1 {
+		t.Fatalf("A2A_DELEGATION_WIDTH_MAX=1: %v, %v", cfg, err)
 	}
-	if cfg.DelegationWidthMax != 10 {
-		t.Fatalf("DelegationWidthMax = %d, want 10", cfg.DelegationWidthMax)
+
+	for _, wide := range []string{"2", "10", strconv.Itoa(lib.DelegateBatchMax)} {
+		t.Setenv("A2A_DELEGATION_WIDTH_MAX", wide)
+		_, err := FromEnv()
+		if err == nil {
+			t.Fatalf("A2A_DELEGATION_WIDTH_MAX=%q accepted before fan-out's results and stop exist", wide)
+		}
+		if !strings.Contains(err.Error(), "A2A_DELEGATION_WIDTH_MAX") || !strings.Contains(err.Error(), "not built yet") {
+			t.Fatalf("A2A_DELEGATION_WIDTH_MAX=%q: error %q does not name the variable and why", wide, err)
+		}
 	}
 
 	for _, bad := range []string{"0", "-1", "junk", strconv.Itoa(lib.DelegateBatchMax + 1)} {

@@ -768,7 +768,7 @@ chat session's turn ends when it delegates, so a session parent keeps the chatop
 turn on the session that carries the child's result, and it doesn't deliver a `childResult` to the
 finished turn's `…in`. A session's request may mint a batch of children (`tasks`), which run side by
 side and queue at the dispatcher like any child. Gathering a batch's results into one wake is the
-next step of fan-out and isn't built yet, which is why the width defaults to one.
+next step of fan-out and isn't built yet, which is why the gateway accepts no width but one for now.
 
 **Delegate targets.** A turn the gateway submits to a conversation's own session pod carries
 `{"delegateTargets": {"targets": [{"name", "description"?, "parameters"?}, …], "truncated"?, "widthMax"?}}`: the
@@ -789,7 +789,8 @@ listed, and a turn with none reads as `platform` only.
   `truncated`; a card whose parameters break the rules is left out.
 - `widthMax` is how many children one `delegate` request from the turn may ask for, the gateway's
   `A2A_DELEGATION_WIDTH_MAX`. The gateway sets it only when it is over one; absent means one, the
-  single shape, so the tool offers `tasks` only when it is present. It is at most 16
+  single shape, so the tool offers `tasks` only when it is present. The gateway accepts no width but
+  one until fan-out's results and stop are built, so no part carries it yet. It is at most 16
   (`lib.DelegateBatchMax`), the ceiling every reader holds a batch to; each entry's text has the
   single shape's 16 KiB cap.
 - A reader that finds a part breaking these bounds ignores it (`lib.DelegateTargetsOf`), as though
