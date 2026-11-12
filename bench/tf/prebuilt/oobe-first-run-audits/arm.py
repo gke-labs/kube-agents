@@ -32,10 +32,11 @@ it (hack/ci_pause_scheduled_audits.py), and the stage skips a paused audit, so t
 resumes the ones that script recorded pausing. Those alone: an operator's pause on a
 long-lived install stays. The script leaves the five alone while the state file is
 there, but a pause it decided before the file appeared can still land, within one
-Hermes call, so the arm reads them again after RESUME_SETTLE_SECONDS and resumes any
-it finds paused. The stage reaches its second audit only after the first one's run has
-ended, minutes later. Nothing pauses them again here: the script does, once this chain
-has had its run of each.
+Hermes call, so in an eval run (the script's record is there) the arm reads them again
+after RESUME_SETTLE_SECONDS, whether or not the first read found any paused, and resumes
+any it finds. Both come before the stand-in cards and markers, so the stage's first
+tick cannot hold the first audit in between. Nothing pauses them again here: the
+script does, once this chain has had its run of each.
 """
 
 import ast
@@ -173,7 +174,13 @@ state = {
     "resumed": [],
 }
 save(state)
-resumed = resume_ci_paused(state)
+resume_ci_paused(state)
+if os.path.exists(CI_PAUSED):
+    # Before anything arms the stage: its first tick reads the first audit's hold.
+    time.sleep(RESUME_SETTLE_SECONDS)
+    resume_ci_paused(state)
+if state["resumed"]:
+    print(f"resumed {', '.join(dict.fromkeys(state['resumed']))}, which the eval run had paused")
 
 sweep = archived_card(state, SWEEP_KEY, "oobe eval: stand-in onboarding sweep")
 ranking = archived_card(state, RANKING_KEY, "oobe eval: stand-in onboarding ranking card")
@@ -202,8 +209,4 @@ else:
             state["job_added"] = True
     save(state)
     print(f"put back the shipped {JOB_ID} job" if state["job_added"] else f"{JOB_ID} is already in the cron store")
-if resumed:
-    time.sleep(RESUME_SETTLE_SECONDS)
-    resume_ci_paused(state)
-    print(f"resumed {', '.join(dict.fromkeys(state['resumed']))}, which the eval run had paused")
 print(f"armed at {state['applied_at']}: sweep {sweep}, ranking {ranking}")

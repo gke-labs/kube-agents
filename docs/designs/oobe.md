@@ -317,8 +317,9 @@ off the infra lock; each repetition waits for the previous one's five audits to 
 finish, so it never cuts across a fresh install's real scan, then re-arms the stage: it files an
 archived stand-in sweep card and an archived ranking card after it, points `.bootstrap_scan_filed`
 at the sweep and the hand-off's `.bootstrap_handoff_filed` at the ranking card, clears
-`.oobe_audits_fired`, and puts back the `oobe` job when the image ships one; the teardown restores
-the markers and the job as it found them.
+`.oobe_audits_fired`, resumes the five audits an eval run paused once the install's own chain had
+run them (the stage skips a paused audit), and puts back the `oobe` job when the image ships one;
+the teardown restores the markers and the job as it found them.
 The stack then waits, up to an hour, for the stage to finish its chain, so the verifier's two-minute window opens after the last audit has started. The verifier reads the Platform Agent's cron run records and
 passes when the stage's `.oobe_audits_fired` lists all five audits as marked due and each has a run claimed since the stage marked it that got going (running, completed, or ended after its start) (a skipped row is passed over), so a scheduled run that falls in the window does not count, and each started only after the one before it in the chain ended. An audit the stage recorded as adopted (a run completed since the sweep) counts as had, and stays out of that order; at least one audit must be the stage's own. That is stricter than the stage: a mark that lands on a scheduled run it did not see start, a race the runner's wait for running audits makes rare, reads as no run. Red: on
 an image without the job, no audit runs. Green, from the verifier on a dev install: four, in three repetitions, before the retrospective joined the stage; the five-audit stage's green is the case's nightly record, not this document's. The case's runs are

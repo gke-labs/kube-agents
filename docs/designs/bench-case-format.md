@@ -177,7 +177,7 @@ lock for the whole unit, beside the stream a `ledger_issue_contains` check names
 (`hack/ci-eval-pr.sh`, `task_streams`, reading the key with the YAML parser the lint uses), and
 releases them when devops-bench returns. A run that outlasts the unit is covered by the next
 unit on the stream, which waits for it first (`wait_platform_runs`), so an audit case does not
-run beside the case's runs and grade their ledger. `oobe-first-run-audits` carries the four it
+run beside the case's runs and grade their ledger. `oobe-first-run-audits` carries the five it
 starts. devops-bench ignores the key.
 
 `scope_exclude` is for a case whose precondition is an install that leaves some seeded
@@ -203,10 +203,11 @@ The runner pauses most of the Platform Agent's clock-started audits at lease tim
 right before the fan-out (`scheduled_audits`, #3020), so their scheduled runs can't write to the GitOps
 repository in the middle of an eval and be charged to whichever cases are running. It leaves the
 `no_agent` jobs and any job the image doesn't ship. The five audits the `oobe` stage starts on a
-fresh install are left until the stage has had its run of each, since the stage holds a paused
-audit rather than starting it; through the fan-out the runner then pauses each one whose run has
-ended, so a clock run after the chain doesn't repeat it. Until then a write from one of them
-mid-eval is still possible. An audit case starts its own run from its
+fresh install are paused only once the stage has had its run of each and no run of it is due or
+under way, since the stage holds a paused audit rather than starting it; every pause pass applies
+that, and a watch through the fan-out repeats it every few minutes, except while the
+`oobe-first-run-audits` stack has the stage armed. Until then a write from one of them mid-eval
+is still possible. `hack/ci_pause_scheduled_audits.py`'s header has the rule in full. An audit case starts its own run from its
 prompt, which a paused schedule doesn't affect. A pause that still fails after its attempts
 stops the run as an infrastructure failure rather than letting a scheduled audit's writes be
 charged to the cases.
@@ -384,7 +385,7 @@ line on a row scanned in full, so an audit relayed empty does not pass).
 completed cluster cards has a block line) or `ranking_card_filed` (the newest unarchived card keyed
 `bootstrap-inventory-prioritize` filed at or after the sweep carries the hand-off's own body and is
 not `blocked`, `triage`, `failed` or `cancelled`) or `raw_report_no_first_run_audit_checks` (the
-same parse, and no block line carries a check from the roster of one of the four audits the `oobe`
+same parse, and no block line carries a check from the roster of one of the five audits the `oobe`
 stage runs after the scan).
 
 `bootstrap_findings` reads the shell sandbox of the install under test:
@@ -427,7 +428,7 @@ open ledger, or no record before the turn) passes on the mention alone; which au
 to is the judge's to grade. `oobe_audits_started`, in its own module
 (`bench/kube_agents_bench/oobe.py`), reads the stack's state file and the Platform Agent's
 `cron/executions.db` in the agent pod, and passes when the stage's `.oobe_audits_fired` lists each
-of the four first-run audits as marked due and each has a run claimed since the stage marked it
+of the five first-run audits as marked due and each has a run claimed since the stage marked it
 that got going (running, completed, or ended after its start), each starting only after the one before it in the chain ended.
 `workload_incident_folded`, in its own module (`bench/kube_agents_bench/incidents.py`), reads a
 workload's rows of one object `kind` (default `Pod`) from the Session KV server's event ledger in the agent pod and passes when at least

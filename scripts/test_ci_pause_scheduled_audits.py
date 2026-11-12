@@ -391,6 +391,25 @@ class ChainTest(unittest.TestCase):
         for audit in STAGE_FIVE:
             self.assertEqual(store[audit]["state"], "paused", audit)
 
+    def test_a_done_stage_has_the_audits_it_never_fired_paused_too(self):
+        # A stage skipped whole writes no `fired`; one that gave up on an audit leaves it out.
+        for state in ({"done": True, "skipped": True, "reason": "x"},
+                      {"done": True, "fired": list(STAGE_FIVE[:2]), "gave_up": list(STAGE_FIVE[2:])}):
+            with self.subTest(state=state):
+                self.write_roster(self.five())
+                (self.home / ".oobe_audits_fired").write_text(json.dumps(state))
+                _, store = self.run_script(chain=True)
+                for audit in STAGE_FIVE:
+                    self.assertEqual(store[audit]["state"], "paused", audit)
+
+    def test_a_stage_under_way_leaves_what_it_has_not_reached(self):
+        self.write_roster(self.five())
+        self.write_stage(fired=STAGE_FIVE[:1], done=False)
+        _, store = self.run_script(chain=True)
+        self.assertEqual(store[STAGE_FIVE[0]]["state"], "paused")
+        for audit in STAGE_FIVE[1:]:
+            self.assertTrue(store[audit]["enabled"], audit)
+
     def test_none_is_paused_while_the_stack_has_the_stage_armed(self):
         self.write_roster(self.five())
         self.write_stage(fired=STAGE_FIVE, done=True)
@@ -658,40 +677,61 @@ class ChainWatchTest(unittest.TestCase):
         stop = trap.index("declare -F stop_chain_audits_watch >/dev/null && stop_chain_audits_watch")
         self.assertLess(stop, trap.index('scheduled_audits resume "exit"'))
 
-    def test_the_watch_loop_runs_and_stops(self):
-        # The two functions as the runner defines them, with scheduled_audits stubbed.
+    def run_watch(self, interval, stub, steps):
+        """The two functions as the runner defines them, scheduled_audits stubbed, then <steps>."""
         with tempfile.TemporaryDirectory() as tmp:
             log = pathlib.Path(tmp) / "calls"
             script = "\n".join([
                 "set -euo pipefail",
                 f'STATE_DIR="{tmp}"',
-                'readonly EVAL_CHAIN_AUDITS_INTERVAL_SECONDS=3',
+                f"readonly EVAL_CHAIN_AUDITS_INTERVAL_SECONDS={interval}",
                 'readonly EVAL_CHAIN_AUDITS_PID_FILE="watch.pid"',
-                f'scheduled_audits() {{ echo "$1 $2" >> "{log}"; }}',
+                'readonly EVAL_CHAIN_AUDITS_RUNNING_FILE="watch.running"',
+                "readonly EVAL_CHAIN_AUDITS_STOP_WAIT_SECONDS=20",
+                f'LOG="{log}"',
+                f"scheduled_audits() {{ {stub}; }}",
                 "start_chain_audits_watch() {" + self.body("start_chain_audits_watch") + "\n}",
                 "stop_chain_audits_watch() {" + self.body("stop_chain_audits_watch") + "\n}",
                 "start_chain_audits_watch",
                 # Not a job of this shell: a bare wait returns at once.
                 'test -z "$(jobs -rp)"',
                 "wait",
-                "sleep 7",
-                f'pid=$(cat "{tmp}/watch.pid")',
-                "stop_chain_audits_watch",
-                f'n=$(wc -l < "{log}")',
-                # Gone at once, not at its next wake-up.
-                "sleep 0.2",
-                # `!` would not trip errexit.
-                'if kill -0 "$pid" 2>/dev/null; then echo "watch still running" >&2; exit 9; fi',
-                "sleep 4",
-                f'[ "$(wc -l < "{log}")" -eq "$n" ]',
-                f'[ ! -e "{tmp}/watch.pid" ]',
+                *[step.replace("{tmp}", tmp) for step in steps],
             ])
-            result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60)
+            result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=90)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            calls = log.read_text().splitlines()
-            self.assertGreaterEqual(len(calls), 2)
-            self.assertEqual(set(calls), {"chain fan-out watch"})
+            return log.read_text().splitlines() if log.exists() else []
 
+    def test_the_watch_runs_passes_and_a_stop_ends_its_nap_at_once(self):
+        calls = self.run_watch(2, 'echo "$1 $2" >> "$LOG"', [
+            "sleep 5",
+            'start=$SECONDS',
+            "stop_chain_audits_watch",
+            # The nap ended at once, not at its next wake-up.
+            '[ $((SECONDS - start)) -le 1 ] || { echo "stop waited out the nap" >&2; exit 9; }',
+            '[ ! -e "{tmp}/watch.running" ] && [ ! -e "{tmp}/watch.pid" ]',
+            'n=$(wc -l < "$LOG")',
+            "sleep 3",
+            '[ "$(wc -l < "$LOG")" -eq "$n" ]',
+        ])
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertEqual(set(calls), {"chain fan-out watch"})
+
+    def test_a_stop_leaves_no_nap_holding_the_log_open(self):
+        # An orphaned `sleep` would keep the job's stdout open for the rest of its interval.
+        start = time.monotonic()
+        self.run_watch(60, 'echo "$1" >> "$LOG"', ["sleep 1", "stop_chain_audits_watch"])
+        self.assertLess(time.monotonic() - start, 30)
+
+    def test_a_stop_waits_for_a_pass_under_way(self):
+        # The pass's pauses land before the EXIT trap's resume reads the record.
+        calls = self.run_watch(1, 'echo started >> "$LOG"; sleep 3; echo landed >> "$LOG"', [
+            "sleep 2",
+            "stop_chain_audits_watch",
+            'tail -1 "$LOG" | grep -qx landed || { echo "stop returned mid-pass" >&2; exit 9; }',
+            '[ ! -e "{tmp}/watch.running" ]',
+        ])
+        self.assertEqual(calls, ["started", "landed"])
 
 if __name__ == "__main__":
     unittest.main()

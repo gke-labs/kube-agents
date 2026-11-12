@@ -15,7 +15,7 @@
 # The scenario driver for bench/tasks/oobe-first-run-audits: put a long-lived
 # install where a fresh one is when its onboarding inventory scan settles, so the
 # `oobe` job's first-run audits stage fires, and let the verifier read whether the
-# four audits were started.
+# five audits were started.
 #
 # arm.py (beside this file) files two archived stand-in cards, a sweep and a
 # ranking card after it, points `.bootstrap_scan_filed` at the sweep and the
@@ -33,7 +33,7 @@
 # job there is nothing to wait for.
 #
 # Waiting on running audits is the runner's job, not this stack's: it holds the
-# four streams' locks for the unit (the case's `audit_streams`), and every unit on
+# five streams' locks for the unit (the case's `audit_streams`), and every unit on
 # one of them, the next repetition of this case included, first waits, up to its
 # bound, for a run the install started there or a pending stage has still to start
 # (hack/ci-eval-pr.sh: wait_platform_runs). Run by hand, without the runner, the

@@ -311,6 +311,35 @@ class PlantScriptsTest(unittest.TestCase):
         self.assertEqual(self._platform_paused(), set())
         self.assertIn(late, done.stdout)
 
+    def test_arm_sweeps_again_even_when_the_first_sweep_found_nothing(self):
+        late = STAGE_FIVE[0]
+        self._platform([{"id": a, "enabled": True} for a in STAGE_FIVE], list(STAGE_FIVE))
+        # The late pause lands during the settle, after a first sweep with nothing to resume.
+        self.env["OOBE_ARM_RESUME_SETTLE_SECONDS"] = "2"
+        stub = self.home / "late.py"
+        stub.write_text(
+            "import json, sys, time\n"
+            f"time.sleep(1)\np = {str(self.platform_roster)!r}\n"
+            "s = json.load(open(p))\n"
+            f"[j.update(enabled=False, state='paused', paused_at='x') for j in s['jobs'] if j['id'] == {late!r}]\n"
+            "json.dump(s, open(p, 'w'))\n"
+        )
+        lander = subprocess.Popen([sys.executable, str(stub)])
+        try:
+            done = self._arm()
+        finally:
+            lander.wait(timeout=30)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self._platform_paused(), set())
+
+    def test_arm_resumes_before_it_touches_the_stage(self):
+        self._platform([{"id": a, **PAUSED} for a in STAGE_FIVE], list(STAGE_FIVE))
+        self._arm()
+        calls = self._hermes_calls()
+        last_resume = max(i for i, c in enumerate(calls) if c[:4] == ["-p", "platform", "cron", "resume"])
+        first_card = min(i for i, c in enumerate(calls) if c[:2] == ["kanban", "create"])
+        self.assertLess(last_resume, first_card)
+
     def test_arm_stops_when_a_resume_fails(self):
         self._platform([{"id": a, **PAUSED} for a in STAGE_FIVE], list(STAGE_FIVE))
         self.hermes.write_text("#!/bin/sh\necho nope >&2\nexit 1\n")

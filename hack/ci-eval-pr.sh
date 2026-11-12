@@ -374,6 +374,14 @@ readonly EVAL_CHAIN_AUDITS_INTERVAL_SECONDS=300
 # Where the watch's pid goes: it runs outside the job table, where the fan-out's
 # `jobs -rp` count and its bare `wait` would take it for a unit.
 readonly EVAL_CHAIN_AUDITS_PID_FILE="chain-audits-watch.pid"
+# There while the watch runs; it removes it as it ends. stop_chain_audits_watch waits on
+# it rather than on the pid, which a container whose PID 1 reaps nothing leaves answering.
+readonly EVAL_CHAIN_AUDITS_RUNNING_FILE="chain-audits-watch.running"
+# How long stop_chain_audits_watch waits for a pass under way to finish, so its pauses
+# are recorded before the EXIT trap's resume reads the record. One pass is a gateway
+# check and an exec of a few seconds; this keeps most of Prow's five-minute grace for
+# the artifacts.
+readonly EVAL_CHAIN_AUDITS_STOP_WAIT_SECONDS=60
 readonly EVAL_PAUSE_AUDITS_POD_POLL_SECONDS=5
 # The bound on one exec that reads a gateway pod's PID 1 (ready_gateway_pod).
 readonly EVAL_PAUSE_AUDITS_PROBE_TIMEOUT=20s
@@ -956,7 +964,8 @@ profile_and_dump_on_exit() {
   collect_credential_proxy_evidence
   wait_replay_shadow_collector
   # Defined further down; a run that died before then paused nothing. The watch
-  # stops first, so no pass of it pauses again what the resume lifts.
+  # stops first, and a pass of it under way finishes, so none pauses after the
+  # resume what the resume would lift.
   declare -F stop_chain_audits_watch >/dev/null && stop_chain_audits_watch
   declare -F scheduled_audits >/dev/null && scheduled_audits resume "exit"
   # Without the wait: the next lease's preflight waits for it instead.
@@ -2495,29 +2504,48 @@ scheduled_audits() { # <pause|chain|resume> <label>
 # EVAL_CHAIN_AUDITS_INTERVAL_SECONDS from the fan-out to its end: after that a clock
 # run would be a second full run nothing grades. Started outside the job table
 # (a subshell that exits at once leaves it to init), since launch_units counts
-# `jobs -rp` as running units and the phases end on a bare `wait`. It stops when
+# `jobs -rp` as running units and the phases end on a bare `wait`. It ends when
 # this script does, if nothing has stopped it first: the pid file goes, or the
 # script's pid is gone.
+#
+# stop_chain_audits_watch sends TERM. A nap ends at once; a pass under way runs to its
+# end, since bash runs a trap only once the foreground command returns, and killing
+# the subshell alone would leave that pass's exec running to pause after the EXIT
+# trap's resume, with no record left to name what it paused.
 start_chain_audits_watch() {
-  local pidfile="${STATE_DIR}/${EVAL_CHAIN_AUDITS_PID_FILE}" owner=$$
+  local pidfile="${STATE_DIR}/${EVAL_CHAIN_AUDITS_PID_FILE}" running="${STATE_DIR}/${EVAL_CHAIN_AUDITS_RUNNING_FILE}" owner=$$
+  : > "${running}"
   (
     (
-      # Sleeps first: the pid file is written while it does.
-      while sleep "${EVAL_CHAIN_AUDITS_INTERVAL_SECONDS}"; do
-        [ -e "${pidfile}" ] && kill -0 "${owner}" 2>/dev/null || break
+      stopping="" nap=""
+      trap 'stopping=1; [ -z "${nap}" ] || kill "${nap}" 2>/dev/null' TERM
+      # Naps first: the pid file is written while it does.
+      while [ -z "${stopping}" ]; do
+        sleep "${EVAL_CHAIN_AUDITS_INTERVAL_SECONDS}" &
+        nap=$!
+        wait "${nap}" 2>/dev/null || true
+        nap=""
+        [ -z "${stopping}" ] && [ -e "${pidfile}" ] && kill -0 "${owner}" 2>/dev/null || break
         scheduled_audits chain "fan-out watch"
       done
+      rm -f "${running}"
     ) </dev/null &
     echo "$!" > "${pidfile}"
   )
 }
 
 stop_chain_audits_watch() {
-  local pidfile="${STATE_DIR:-}/${EVAL_CHAIN_AUDITS_PID_FILE}" pid
+  local pidfile="${STATE_DIR:-}/${EVAL_CHAIN_AUDITS_PID_FILE}" running="${STATE_DIR:-}/${EVAL_CHAIN_AUDITS_RUNNING_FILE}" pid waited=0
   [ -n "${STATE_DIR:-}" ] && [ -e "${pidfile}" ] || return 0
   pid="$(cat "${pidfile}" 2>/dev/null || true)"
   rm -f "${pidfile}"
   [ -z "${pid}" ] || kill "${pid}" 2>/dev/null || true
+  while [ -e "${running}" ] && [ "${waited}" -lt "${EVAL_CHAIN_AUDITS_STOP_WAIT_SECONDS}" ]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+  [ ! -e "${running}" ] || echo "WARNING: Scheduled audits: the fan-out watch's pass was still running after ${EVAL_CHAIN_AUDITS_STOP_WAIT_SECONDS}s; a first-run audit it pauses after the resume stays paused on this install until resumed by hand" >&2
+  return 0
 }
 
 # A pod of the gateway, once it has settled: as many Ready, non-terminating pods as

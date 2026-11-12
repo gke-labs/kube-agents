@@ -35,8 +35,8 @@ audit rather than starting it, since Hermes' `trigger_job` would unpause it, so 
 pause before the stage reaches an audit takes that audit out of the chain the eval
 grades. The stage reads pauses only for audits it has not reached
 (`oobe.py`, `pending`), and a clock run that lands first is adopted rather than
-repeated, so an audit is paused once the stage has fired or adopted it and no run of
-it is due or under way: from then on a clock run would be a second full run that
+repeated, so an audit is paused once the stage has fired or adopted it, or is done,
+and no run of it is due or under way: from then on a clock run would be a second full run that
 nothing grades (#5570). A due mark is left too because a case that triggered the
 job (`hermes cron run`) waits on that run, and a pause before the tick claims it would
 drop it. While the oobe-first-run-audits stack has the stage armed (its state file is
@@ -151,7 +151,8 @@ def stamp(value):
 def stage_finished(stage, jobs):
     """The stage's audits it has had its run of, with none due or under way now.
 
-    Fired (adopted runs included) and, while the stage is under way, not the mark awaiting its run; no run claimed or
+    All five once the stage is done; before that, fired (adopted runs included) and not the
+    mark awaiting its run. Then no run claimed or
     running younger than STALE_SECONDS; and not marked due and unclaimed, whoever marked
     it. Raises on a marker or ledger it cannot read, which the caller takes as none.
     """
@@ -160,9 +161,13 @@ def stage_finished(stage, jobs):
             state = json.load(fh)
     except FileNotFoundError:
         return set()
-    fired = {str(audit) for audit in state.get("fired", [])} & stage
-    # A done stage leaves `current` on its last audit, whose run is long over.
-    if not state.get("done"):
+    if state.get("done"):
+        # It reads no hold again: the five it fired, and any it skipped, gave up on or never
+        # reached (a stage skipped whole), are all past it. It also leaves `current` on its
+        # last audit, whose run is long over.
+        fired = set(stage)
+    else:
+        fired = {str(audit) for audit in state.get("fired", [])} & stage
         fired.discard((state.get("current") or {}).get("job"))
     if not fired:
         return set()
