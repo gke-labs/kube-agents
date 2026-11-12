@@ -460,6 +460,10 @@ readonly MODE_NEXT_HELM_TIMEOUT="600s"
 readonly MODE_NEXT_GENERATION_ATTEMPTS=60
 readonly MODE_NEXT_POLL_SECONDS=5
 readonly MODE_NEXT_ROLLOUT_TIMEOUT="600s"
+# The bus's servers past its quorum: each waits Pending for a node of its own
+# (the operator's hostname spread), and on Autopilot that node is a scale-up
+# that can take longer than one rollout budget (gate_mode_next_bus).
+readonly MODE_NEXT_BUS_FULL_TIMEOUT="900s"
 # The inject door: one name for its Service, token Secret, principal map and
 # NetworkPolicy, and the key the token sits under (a2aInjectName,
 # a2aInjectTokenKey). hack/ci-eval-pr.sh reads the same Secret for the
@@ -988,6 +992,26 @@ resolve_agent_gemini_api_key() {
 # --- agent key: end
 resolve_agent_gemini_api_key
 export MODEL_DEFAULT_NAME="${MODEL_DEFAULT_NAME:-gemini-3.1-pro-preview}"
+# --- reasoning effort: begin
+# The reasoning effort the gateway asks the model for on every request, the
+# chart's litellm.reasoningEffort: low, medium or high, or empty for the
+# model's own default. A certification run names it beside the model, and
+# hack/ci-eval-pr.sh stamps the same variable on every case record, so a
+# record says which effort the agent ran at and a window never pools two
+# efforts. Checked here, before the lease is spent on a deploy the chart's
+# schema would refuse at step 5c. The deploy never sets litellm.dropParams,
+# so an effort a provider does not take fails its requests loudly rather
+# than being dropped in silence. The FATAL line names the effort only.
+export EVAL_REASONING_EFFORT="${EVAL_REASONING_EFFORT:-}"
+case "${EVAL_REASONING_EFFORT}" in
+  "" | low | medium | high) ;;
+  *)
+    echo "FATAL: EVAL_REASONING_EFFORT='${EVAL_REASONING_EFFORT}' is not low, medium, high or empty (the model default)." >&2
+    exit 1
+    ;;
+esac
+echo "Agent model for this install: ${MODEL_PROVIDER}/${MODEL_DEFAULT_NAME}, reasoning effort: ${EVAL_REASONING_EFFORT:-model default}"
+# --- reasoning effort: end
 # Default to enforcing CMEK database encryption on CI evaluation clusters.
 # Set ALLOW_UNENCRYPTED_SECRETS=true to bypass CMEK checks on unencrypted test clusters.
 export ALLOW_UNENCRYPTED_SECRETS="${ALLOW_UNENCRYPTED_SECRETS:-false}"
@@ -2102,6 +2126,7 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set-file "platformAgent.credentials.data.SANDBOX_SSH_PUBLIC_KEY=${SANDBOX_KEY_DIR}/id_sandbox.pub" \
     --set-string "litellm.modelProvider=${MODEL_PROVIDER}" \
     --set-string "litellm.modelDefaultName=${MODEL_DEFAULT_NAME}" \
+    --set-string "litellm.reasoningEffort=${EVAL_REASONING_EFFORT:-}" \
     --set "litellm.fallback.numRetries=${EVAL_LITELLM_NUM_RETRIES}" \
     --set "litellm.fallback.retryAfterSeconds=${EVAL_LITELLM_RETRY_AFTER_SECONDS}" \
     --set-string "litellm.vertex.serviceAccountAnnotations.iam\.gke\.io/gcp-service-account=${LITELLM_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
@@ -2353,6 +2378,59 @@ gate_mode_next_rollout() {
     exit 1
   fi
   echo "✓ ${workload} rolled out $((gate_start - MODE_NEXT_START))s..$((SECONDS - MODE_NEXT_START))s after the mode switch"
+}
+
+# Waits for the A2A bus, then for the rest of its servers; on failure
+# describes it, dumps the stack and stops the deploy. A multi-server bus
+# serves once a quorum of its servers (two of three) is Ready, and each
+# server waits Pending for a node of its own (the operator's hostname spread
+# is DoNotSchedule, so two servers never share a node): on Autopilot every
+# further server waits on a node scale-up, which can outlast one rollout
+# budget. So the bus passes at a quorum within MODE_NEXT_ROLLOUT_TIMEOUT, and
+# the remaining servers get MODE_NEXT_BUS_FULL_TIMEOUT more. Meanwhile the
+# PlatformAgent's Ready message names each server that is not Ready and the
+# scheduler's reason (a2aNATSShortNote), which the dump prints on failure.
+gate_mode_next_bus() {
+  local workload="$1"
+  local gate_start=$SECONDS want ready quorum deadline
+  for _ in $(seq 1 "${MODE_NEXT_GENERATION_ATTEMPTS}"); do
+    kubectl get "${workload}" -n "${NAMESPACE}" >/dev/null 2>&1 && break
+    sleep "${MODE_NEXT_POLL_SECONDS}"
+  done
+  want="$(kubectl get "${workload}" -n "${NAMESPACE}" -o jsonpath='{.spec.replicas}' 2>/dev/null)" || want=""
+  want="${want:-1}"
+  quorum=$(( want / 2 + 1 ))
+  deadline=$(( gate_start + ${MODE_NEXT_ROLLOUT_TIMEOUT%s} ))
+  while :; do
+    # A read the API drops is one more poll, not the end of the deploy.
+    ready="$(kubectl get "${workload}" -n "${NAMESPACE}" -o jsonpath='{.status.readyReplicas}' 2>/dev/null)" || ready=""
+    ready="${ready:-0}"
+    [ "${ready}" -ge "${quorum}" ] && break
+    if [ "${SECONDS}" -ge "${deadline}" ]; then
+      echo "ERROR: ${workload} has ${ready} of ${want} servers Ready, short of its quorum of ${quorum}, after ${MODE_NEXT_ROLLOUT_TIMEOUT} under mode: next"
+      kubectl describe "${workload}" -n "${NAMESPACE}" || true
+      dump_mode_next_state
+      exit 1
+    fi
+    sleep "${MODE_NEXT_POLL_SECONDS}"
+  done
+  echo "✓ ${workload} serving on ${ready} of ${want} servers (quorum ${quorum}) $((gate_start - MODE_NEXT_START))s..$((SECONDS - MODE_NEXT_START))s after the mode switch"
+  if [ "${ready}" -lt "${want}" ]; then
+    deadline=$(( SECONDS + ${MODE_NEXT_BUS_FULL_TIMEOUT%s} ))
+    while :; do
+      ready="$(kubectl get "${workload}" -n "${NAMESPACE}" -o jsonpath='{.status.readyReplicas}' 2>/dev/null)" || ready=""
+      ready="${ready:-0}"
+      [ "${ready}" -ge "${want}" ] && break
+      if [ "${SECONDS}" -ge "${deadline}" ]; then
+        echo "ERROR: ${workload} still has ${ready} of ${want} servers Ready ${MODE_NEXT_BUS_FULL_TIMEOUT} after reaching its quorum under mode: next; the PlatformAgent's Ready message names the missing server and why"
+        kubectl describe "${workload}" -n "${NAMESPACE}" || true
+        dump_mode_next_state
+        exit 1
+      fi
+      sleep "${MODE_NEXT_POLL_SECONDS}"
+    done
+  fi
+  echo "✓ ${workload} rolled out: ${want} of ${want} servers Ready $((SECONDS - MODE_NEXT_START))s after the mode switch"
 }
 
 # Waits for the agent Deployment's generation to move past the one given,
@@ -2664,7 +2742,7 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   kubectl get configmap "${PLATFORM_AGENT_CR_NAME}-config" -n "${NAMESPACE}" -o jsonpath='{.data.managed\.env}' || true
   echo
 
-  gate_mode_next_rollout "statefulset/${PLATFORM_AGENT_CR_NAME}-a2a-nats"
+  gate_mode_next_bus "statefulset/${PLATFORM_AGENT_CR_NAME}-a2a-nats"
   gate_mode_next_rollout "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-callout"
 
   # The one run, against a bus with no streams. Its budget already counts

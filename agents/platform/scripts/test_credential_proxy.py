@@ -5806,6 +5806,22 @@ class CommandExecutorTest(unittest.TestCase):
                 self.assertLess(time.monotonic() - started, 10)
                 self.assertGreaterEqual(len(asked), 2)
 
+    def test_a_child_that_exits_just_after_closing_its_pipes_is_reaped_at_once(self):
+        # #5540: a child closes its pipes a moment before it can be reaped.
+        # This one closes both, then exits 50 ms later, so the first look
+        # always misses; one look then a PIPES_CLOSED_POLL_SECONDS sleep cost
+        # half a second here, the short reap poll costs about the 50 ms.
+        process = subprocess.Popen(
+            ["sh", "-c", "exec >&- 2>&-; sleep 0.05"], stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+        )
+        started = time.monotonic()
+        captured = credential_proxy._capture_output(process, None, 1 << 16, 30)
+        elapsed = time.monotonic() - started
+        self.assertEqual(0, process.returncode)
+        self.assertFalse(captured.timed_out)
+        self.assertLess(elapsed, credential_proxy.PIPES_CLOSED_POLL_SECONDS / 2)
+
     def test_a_hang_up_after_the_pipes_close_still_ends_the_command(self):
         # With both pipes closed the read loop has nothing to watch, so the
         # wait that follows has to look at the caller itself, or a hang-up in

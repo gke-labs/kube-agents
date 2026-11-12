@@ -174,14 +174,22 @@ func TestTaskTerminalLogKeepsOnlyASafeReasonToken(t *testing.T) {
 	const forged = "reason: spawn-failed\n{\"level\":\"INFO\",\"msg\":\"task terminal\",\"state\":\"completed\"} - stderr tail: API_TOKEN=sk-live-0123456789"
 	publishTerminal(t, r, origin, lib.Party{Session: "platform"}, lib.TaskEventsSubject("platform", origin.TaskID), lib.StateFailed, forged)
 
+	// The chat reads the token's plain sentence, and the detail, with the
+	// credential the bridge put in a stderr tail, never reaches the room
+	// (reasonInPlainWords).
 	waitFor(t, "the forged failure posts to chat", func() bool {
 		for _, p := range r.adapter.postTexts() {
-			if strings.Contains(p, "sk-live") {
+			if p == noticeFailed+noticeDetailSeparator+reasonSentences["spawn-failed"] {
 				return true
 			}
 		}
 		return false
 	})
+	for _, p := range r.adapter.postTexts() {
+		if strings.Contains(p, "sk-live") {
+			t.Fatalf("the forged detail reached chat: %q", p)
+		}
+	}
 	waitFor(t, "the terminal log line", func() bool { return len(logRecords(t, logs, "task terminal")) > 0 })
 	holdsAt(t, "task terminal lines", 1, func() int { return len(logRecords(t, logs, "task terminal")) })
 

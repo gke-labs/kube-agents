@@ -215,12 +215,135 @@ run "a_gitlab_host_needs_the_gitlab_forge" {
   expect_failures = [helm_release.kube_agents]
 }
 
-run "the_forge_is_github_or_gitlab" {
+run "the_forge_is_a_registered_one" {
+  command = plan
+  variables {
+    gitops_forge = "gogs"
+  }
+  expect_failures = [var.gitops_forge]
+}
+
+run "bitbucket_cloud_renders_the_lists" {
+  command = plan
+  variables {
+    gitops_forge     = "bitbucket"
+    gitops_repo_path = "acme/infra"
+    gitops_identity  = "{0b3c1f2e-5d6a-4b7c-8d9e-0f1a2b3c4d5e}"
+  }
+  assert {
+    condition = jsonencode(local.platform_agent_integration) == jsonencode({
+      forges = [{
+        credentialsRef = { name = "bitbucket-forge-token" }
+        identity       = "{0b3c1f2e-5d6a-4b7c-8d9e-0f1a2b3c4d5e}"
+        name           = "bitbucket"
+        namespace      = "acme"
+        provider       = "bitbucket"
+      }]
+      repositories = [{ forge = "bitbucket", repository = "infra", role = "gitops" }]
+    })
+    error_message = "integration: ${jsonencode(local.platform_agent_integration)}"
+  }
+}
+
+run "bitbucket_datacenter_renders_its_host_and_ca" {
+  command = plan
+  variables {
+    gitops_forge             = "bitbucket-datacenter"
+    gitops_host              = "bitbucket.example.com"
+    gitops_repo_path         = "INFRA/gitops"
+    gitops_token_secret_name = "bbdc-token"
+    gitops_ca_secret_name    = "bbdc-ca"
+  }
+  assert {
+    condition = jsonencode(local.platform_agent_integration) == jsonencode({
+      forges = [{
+        caBundleRef    = { name = "bbdc-ca" }
+        credentialsRef = { name = "bbdc-token" }
+        host           = "bitbucket.example.com"
+        name           = "bitbucket-datacenter"
+        namespace      = "INFRA"
+        provider       = "bitbucket-datacenter"
+      }]
+      repositories = [{ forge = "bitbucket-datacenter", repository = "gitops", role = "gitops" }]
+    })
+    error_message = "integration: ${jsonencode(local.platform_agent_integration)}"
+  }
+}
+
+run "bitbucket_needs_a_repo_path" {
   command = plan
   variables {
     gitops_forge = "bitbucket"
   }
-  expect_failures = [var.gitops_forge]
+  expect_failures = [helm_release.kube_agents]
+}
+
+run "bitbucket_refuses_an_uppercase_workspace" {
+  command = plan
+  variables {
+    gitops_forge     = "bitbucket"
+    gitops_repo_path = "Acme/infra"
+  }
+  expect_failures = [helm_release.kube_agents]
+}
+
+run "bitbucket_cloud_refuses_a_host" {
+  command = plan
+  variables {
+    gitops_forge     = "bitbucket"
+    gitops_repo_path = "acme/infra"
+    gitops_host      = "bitbucket.example.com"
+  }
+  expect_failures = [helm_release.kube_agents]
+}
+
+run "bitbucket_cloud_refuses_an_identity_that_is_not_a_uuid" {
+  command = plan
+  variables {
+    gitops_forge     = "bitbucket"
+    gitops_repo_path = "acme/infra"
+    gitops_identity  = "svc-bot"
+  }
+  expect_failures = [helm_release.kube_agents]
+}
+
+run "bitbucket_datacenter_needs_a_host" {
+  command = plan
+  variables {
+    gitops_forge     = "bitbucket-datacenter"
+    gitops_repo_path = "INFRA/gitops"
+  }
+  expect_failures = [helm_release.kube_agents]
+}
+
+run "bitbucket_datacenter_refuses_an_atlassian_host" {
+  command = plan
+  variables {
+    gitops_forge     = "bitbucket-datacenter"
+    gitops_host      = "acme.atlassian.net"
+    gitops_repo_path = "INFRA/gitops"
+  }
+  expect_failures = [helm_release.kube_agents]
+}
+
+run "bitbucket_refuses_a_minter" {
+  command = plan
+  variables {
+    gitops_forge         = "bitbucket"
+    gitops_repo_path     = "acme/infra"
+    enable_github_minter = true
+    github_repo          = "acme/infra"
+    github_app_id        = "1"
+  }
+  expect_failures = [helm_release.kube_agents]
+}
+
+run "bitbucket_inputs_need_a_bitbucket_forge" {
+  command = plan
+  variables {
+    gitops_repo_path = "acme/infra"
+  }
+  expect_failures = [helm_release.kube_agents]
 }
 
 run "the_host_is_bare" {
@@ -303,3 +426,33 @@ run "web_console_refuses_no_network_policy" {
   expect_failures = [helm_release.kube_agents]
 }
 
+
+run "bitbucket_datacenter_refuses_an_identity_outside_the_crd_pattern" {
+  command = plan
+  variables {
+    gitops_forge     = "bitbucket-datacenter"
+    gitops_host      = "bitbucket.example.com"
+    gitops_repo_path = "INFRA/gitops"
+    gitops_identity  = "svc bot"
+  }
+  expect_failures = [helm_release.kube_agents]
+}
+
+run "bitbucket_datacenter_refuses_a_github_service_host" {
+  command = plan
+  variables {
+    gitops_forge     = "bitbucket-datacenter"
+    gitops_host      = "acme.ghe.com"
+    gitops_repo_path = "INFRA/gitops"
+  }
+  expect_failures = [helm_release.kube_agents]
+}
+
+run "ghes_refuses_an_atlassian_host" {
+  command = plan
+  variables {
+    github_repo = "acme/infra"
+    gitops_host = "git.atlassian.net"
+  }
+  expect_failures = [helm_release.kube_agents]
+}

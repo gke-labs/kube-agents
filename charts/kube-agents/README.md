@@ -786,12 +786,13 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   preserved across `upgrade.sh` upgrades via `TF_VAR_extra_helm_values`.
 - **Git forges and repositories** — `platformAgent.integration.forges` lists
   the forges the agent talks to (`name`, `provider`, optional `host`,
-  `scheme`, `port`, `namespace` and `credentialsRef`), and
+  `scheme`, `port`, `namespace`, `credentialsRef`, `caBundleRef` and
+  `identity`), and
   `platformAgent.integration.repositories` the repositories on them (`forge`,
   `repository`, optional `namespace`, and `role`: `gitops` for the one the
   agent publishes to, `managed` for others it may change, `context` for
-  read-only reference). `provider` is `github`, `gitlab` or `gitea`. If you omit it, it is `github`. A forge at a host other than github.com must name it. `credentialsRef` is
-  ignored for `github` and required for `gitlab` and `gitea`: a Secret holding the access
+  read-only reference). `provider` is `github`, `gitlab`, `gitea`, `bitbucket` (Bitbucket Cloud) or `bitbucket-datacenter`. If you omit it, it is `github`. A forge at a host other than github.com must name it. `credentialsRef` is
+  ignored for `github` and required for `gitlab`, `gitea`, `bitbucket` and `bitbucket-datacenter`: a Secret holding the access
   token under the key `token`, mounted into the credential broker only. A
   `gitlab` forge's `host` is gitlab.com by default or a self-managed instance,
   never a GitHub name, and one `gitlab` forge per host. A `github` forge's
@@ -809,9 +810,9 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   the CA for all of its outbound calls (see the token minter guide). A Secret, so
   changing the CA needs the same rights as changing the token. It is for a
   forge at a self-managed host, GitLab, GitHub Enterprise Server, or `https`
-  Gitea, never gitlab.com or github.com. With a `gitlab` or `gitea` forge
+  Gitea, never gitlab.com or github.com. With a `gitlab`, `gitea` or Bitbucket forge
   declared beside GitHub, a bare `owner/name` still works for a GitHub
-  repository that the install registered by URL. Name a GitLab or Gitea repository, or
+  repository that the install registered by URL. Name a GitLab, Gitea or Bitbucket repository, or
   a GitHub repository that the install did not register, by its URL. Apply `crds/` before upgrading
   to a release that adds a provider, since `helm upgrade` does not update CRDs. A GitHub forge's
   `host` is a spelling of github.com (`github.com`, `www.github.com`,
@@ -820,12 +821,21 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   `host` is required, `scheme` may be `http` only for an in-cluster Service
   (`*.svc` or `*.svc.cluster.local`), `port` is set when the forge is not on
   the scheme's default port, and `credentialsRef` names the Secret holding its
-  API token under the key `token`. A repository must name a declared forge.
+  API token under the key `token`. A `bitbucket` forge is at bitbucket.org
+  only: it takes no `host` other than that, no `port`, no `scheme` and no
+  `caBundleRef`, its `namespace` is a lowercase workspace ID, and one
+  `bitbucket` forge per install. A `bitbucket-datacenter` forge needs `host`
+  (the instance, served at the root path on port 443, so no `port` and no
+  `scheme: http`), may set `caBundleRef`, and its `namespace` is a project key.
+  `identity` is for these two providers only: the account the token acts as,
+  1 to 255 letters, digits and `. _ @ + { } -`; on `bitbucket` it is the
+  account UUID, which a workspace, project or repository access token needs.
+  A repository must name a declared forge.
   `platformAgent.integration.github.org` / `.gitRepo` remain as a deprecated
   alias for one GitHub forge and its gitops repository — set the lists or the
   alias, not both. For a github.com GitOps repository, the alias is still what
   `install.sh` and the `full-install` Terraform composition write. For a
-  GitLab or GitHub Enterprise Server GitOps repository, they write the
+  GitLab, Bitbucket or GitHub Enterprise Server GitOps repository, they write the
   `forges` and `repositories` lists. One GitHub forge with no
   `credentialsRef`, no `caBundleRef`, no host other than a spelling of
   github.com, and at most one repository, the gitops one, with no
@@ -879,6 +889,16 @@ manages. It defaults to `false`, and under `today` the operator renders nothing 
 still works and wins over the value. The
 [MCP server page](https://gke-labs.github.io/kube-agents/reference/a2a-mcp/) is canonical for
 what it renders and how a client connects.
+
+### Slack end-to-end test users (`operator.slackTestUsers`)
+
+Meant for CI and eval installs. `operator.slackTestUsers` lists Slack member ids (`U…`) whose
+posts the A2A gateway reads as theirs even though they carry an app's `bot_id`, which a post
+made with a user token through an app does; the gateway otherwise drops those as bot traffic.
+It renders as `A2A_SLACK_TEST_USERS` on the controller manager, which hands it to the gateway
+when the gateway runs the Slack adapter under `next`. Empty by default, and an `operator.extraEnv` entry of that name wins. A listed
+user still has to be on `integration.slack.allowedUsers`. Nothing but the value itself keeps it
+off a real install, and a listed member's posts through any app in the workspace read as theirs.
 
 ### Data volume size (`platformAgent.storage.size`)
 
@@ -1524,6 +1544,8 @@ No pod runs it until the profile dispatcher, worker and pool land and the
 operator runs them, though enabling it already gets the profile its
 ServiceAccounts, bus identity and agent card. A cluster that needs its own
 persona or tier gets a second `AgentProfile` with `clusterRef` set (`k8s-operator/examples/agentprofile-cluster.yaml`).
+The chart sets `yieldToPinned: true` on `cluster`, so that second profile receives
+the cluster's tasks; a specialist such as `tse` keeps the tasks addressed to it.
 
 ## Uninstalling
 
