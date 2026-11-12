@@ -226,4 +226,7 @@ func TestTheOperatorsCardCarriesTheRoutingFieldsLibReads(t *testing.T) {
 	if card.ClusterRef != nil {
 		t.Errorf("an unpinned profile's card has clusterRef %+v", card.ClusterRef)
 	}
+	if !card.YieldToPinned {
+		t.Error("yieldToPinned didn't decode: the operator's JSON name and lib's differ")
+	}
 }
