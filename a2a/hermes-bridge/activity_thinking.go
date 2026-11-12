@@ -1466,11 +1466,32 @@ func closingBacktickOutside(s string, lo, hi int) int {
 		// closing punctuation: the value's own, redacted whole.
 		return hi
 	}
+	// The closing delimiter is the whole run of backticks the value ends
+	// in (a span may open with two, "``--password=x``"), and a span is open
+	// before the value when an odd number of backtick runs precede it on
+	// the line.
+	for k > 0 && s[lo+k-1] == '`' {
+		k--
+	}
+	if k < 1 {
+		return hi
+	}
 	line := strings.LastIndexByte(s[:lo], '\n') + 1
-	if strings.Count(s[line:lo], "`")%2 == 1 {
+	if backtickRuns(s[line:lo])%2 == 1 {
 		return lo + k
 	}
 	return hi
+}
+
+// backtickRuns counts the maximal runs of backticks in s.
+func backtickRuns(s string) int {
+	runs := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == '`' && (i == 0 || s[i-1] != '`') {
+			runs++
+		}
+	}
+	return runs
 }
 
 // authSchemeCredentialRedacted says whether a credential after a scheme

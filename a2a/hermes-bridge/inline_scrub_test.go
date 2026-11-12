@@ -642,6 +642,10 @@ func TestScrubInlineSecretsKeepsACodeSpansClosingBacktick(t *testing.T) {
 		// A key=value rule stops at the backtick itself; only the flag
 		// rules, whose value runs to whitespace, hand one back.
 		{"see `password=synthetic-pass-0001`), then", "see `password=[redacted]`), then"},
+		// A double-backtick span keeps both closing backticks (#5311
+		// review, bradhoekstra).
+		{"run ``app --password=hunter2-Xq9z71`` then", "run ``app --password=[redacted]`` then"},
+		{"``--token synthetic-token-0001``.", "``--token [redacted]``."},
 	}
 	for _, tc := range cases {
 		if got := scrubInlineSecrets(tc.in); got != tc.want {
