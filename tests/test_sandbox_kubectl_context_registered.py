@@ -225,9 +225,12 @@ class KubectlContextRegisteredTest(unittest.TestCase):
         self.assert_not_registered("--context", CTX, "get", "ns")
 
     def test_a_symlinked_kubeconfig_falls_back(self):
+        # Python records nothing for a symlink, so place a record that would match beside the link:
+        # only the helper's own symlink check stands between it and "registered".
         self.register()
         link = self.home / "link"
         link.symlink_to(self.kubeconfig)
+        self.marker(link).write_text(self.marker().read_text(encoding="utf-8"), encoding="utf-8")
         self.assert_not_registered("--context", CTX, "get", "ns", KUBECONFIG=str(link))
 
     def test_a_missing_kubeconfig_is_not(self):
