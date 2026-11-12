@@ -134,6 +134,21 @@ describe("parseSubject", () => {
       taskId: "task-1",
       dir: "supervisor",
     });
+    // The profile form of a supervisor subject (#5301): the addressee is the
+    // profile. A five-token subject for an addressee named "p" stays five.
+    expect(parseSubject("a2a.tasks.p.fleet-audit.task-9.supervisor")).toEqual({
+      plane: "tasks",
+      addressee: "fleet-audit",
+      taskId: "task-9",
+      dir: "supervisor",
+    });
+    expect(parseSubject("a2a.tasks.p.task-9.events")).toEqual({
+      plane: "tasks",
+      addressee: "p",
+      taskId: "task-9",
+      dir: "events",
+    });
+    expect(parseSubject("a2a.tasks.p.fleet-audit.task-9.events")).toEqual({ plane: "other" });
   });
 
   it("parses the directory and both topic scopes", () => {
