@@ -393,8 +393,9 @@ readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 # volumeClaimTemplates materialise, <template>-<statefulset>-<ordinal>
 # (a2aNATSName and a2aNATSDataClaim in platformagent_a2a_manifests.go). A
 # claim left by an earlier lease pins its server to the old disk's zone, where
-# topology spread can leave it unschedulable (#5658); 5b″ deletes such claims
-# while no StatefulSet owns them. The delete is bounded like the teardown's.
+# topology spread can leave it unschedulable (#5658); 5b″ and 6b delete such
+# claims while no StatefulSet owns them. The delete is bounded like the
+# teardown's.
 readonly A2A_NATS_STATEFULSET_NAME="${PLATFORM_AGENT_CR_NAME}-a2a-nats"
 readonly A2A_NATS_CLAIM_NAME_RE="^persistentvolumeclaim/data-${A2A_NATS_STATEFULSET_NAME}-[0-9]+\$"
 readonly A2A_NATS_CLAIM_DELETE_TIMEOUT="60s"
@@ -2115,6 +2116,12 @@ echo "✓ CRDs applied from ${CHART_CRD_DIR}"
 # deploy's NATS gate on it. With no StatefulSet the claims are unowned and
 # unmounted; with one, they are its data and stay. Never fatal: a failure here
 # leaves the run where it was, and the NATS gate reports it.
+#
+# Called twice. Here it takes claims a teardown left. A next-mode run killed
+# before its teardown leaves its StatefulSet standing, so this call skips;
+# 5c's install then renders mode today, cleanupA2A deletes the StatefulSet and
+# keeps its claims (WhenDeleted: Retain), and 6b's flip back to next would
+# bind them. 6b calls it again before that flip, once the StatefulSet is gone.
 delete_orphaned_nats_claims() {
   local sts claims
   if ! sts="$(kubectl get statefulset "${A2A_NATS_STATEFULSET_NAME}" -n "${NAMESPACE}" \
@@ -2762,6 +2769,9 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   STEP_START=$SECONDS
   MODE_NEXT_START=$SECONDS
   echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Switching ${PLATFORM_AGENT_CR_NAME} to mode: next through platformAgent.mode (EVAL_MODE_NEXT=1) ==="
+  # Claims a killed next-mode lease left, which 5c's flip to today released
+  # from their StatefulSet but kept (5b″ says why), before next binds them.
+  delete_orphaned_nats_claims
   # The mode and the session cap in one values document, so the first render
   # -- and the first provisioning Job -- sees both. Section 2b sized the cap so
   # the budget that Job measures, which counts the rendered bridge's workers,

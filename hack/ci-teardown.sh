@@ -85,7 +85,7 @@ readonly KUBECTL_REQUEST_TIMEOUT="${CI_TEARDOWN_KUBECTL_REQUEST_TIMEOUT:-30s}"
 # a2aNATSDataClaim and the StatefulSet's a2aNATSName in
 # k8s-operator/internal/controller/platformagent_a2a_manifests.go, for the CR
 # name ci-deploy.sh installs (PLATFORM_AGENT_CR_NAME). Matched whole with an
-# ordinal, so no other claim can match.
+# ordinal, so no other claim can match; the same name handleDeletion reaps.
 readonly NATS_CLAIM_NAME_RE='^persistentvolumeclaim/data-platform-agent-a2a-nats-[0-9]+$'
 
 # Endpoint and owner convention the Prow wrapper leases with
@@ -422,10 +422,11 @@ echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 5: Sweeping namespaced kube-ag
 #
 # The claims the operator creates itself are labelled and swept; the ones it
 # materialises from a StatefulSet's volumeClaimTemplates are not, because that
-# ObjectMeta carries a name and nothing else. That is hindsight's claim, any
-# RWO custom storage and the NATS JetStream claims, and deleting the
-# StatefulSet leaves them behind — no selector reaches them. Step 6 deletes
-# the NATS claims by name; hindsight's and custom storage are still left.
+# ObjectMeta carries a name and nothing else. That is hindsight's claim and any
+# RWO custom storage, and deleting the StatefulSet leaves them behind — no
+# selector reaches either. The NATS bus (mode: next) is labelled, but with
+# part-of=a2a-next, so this selector misses its StatefulSet and its claims;
+# Step 6 deletes the claims.
 # PVCs sweep last so the workloads releasing them are already deleted, or
 # kubernetes.io/pvc-protection holds the delete open.
 SWEEP_NAMESPACED_KINDS=(
@@ -451,11 +452,15 @@ STEP_START=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 6: Deleting the NATS JetStream claims ==="
 # A leftover claim's zonal disk pins its NATS server to one zone, and the next
 # mode: next install's topology spread can rule that zone out, so the server
-# never schedules and the deploy fails before any case runs (#5658). Listed
-# and matched by name because the claims carry no labels (Step 5's comment);
-# after Step 5, so the StatefulSet that mounts them is already gone. Its pods
-# may still be in their grace period, holding kubernetes.io/pvc-protection, so
-# the delete does not wait: a claim marked deleted goes once its pod does.
+# never schedules and the deploy fails before any case runs (#5658). The
+# operator's handleDeletion reaps them with the CR, but only while the
+# operator is alive to run it, and the StatefulSet keeps them on deletion
+# (WhenDeleted: Retain). Matched by the exact names handleDeletion uses rather
+# than by part-of=a2a-next, which also selects the bus's other objects. The
+# StatefulSet is usually gone by now (owner GC after Step 2 or 3 removes the
+# CR), but not when the CR is stuck on its finalizer; either way the delete
+# does not wait: a claim its pod still holds (kubernetes.io/pvc-protection)
+# goes once the pod does, and the install is being torn down regardless.
 # Failures are counted like the sweeps' and never fatal.
 nats_claims_failed=0
 nats_claims_total=0

@@ -1,19 +1,22 @@
 """Leftover NATS JetStream claims are deleted by name, in teardown and before deploy (#5658).
 
-The NATS StatefulSet that mode: next renders takes its claims from
-volumeClaimTemplates, which carry no labels, so the teardown's part-of sweep
-never reaches them. A claim left behind pins its server to the old disk's zone,
-and the next install's topology spread can leave that server unschedulable,
-failing the deploy before any case runs.
+The NATS StatefulSet that mode: next renders keeps its claims on deletion
+(WhenDeleted: Retain), and labels them part-of=a2a-next, which the teardown's
+part-of=kube-agents sweep does not select. Only the operator's handleDeletion
+reaps them, and only while the operator is alive. A claim left behind pins its
+server to the old disk's zone, and the next install's topology spread can leave
+that server unschedulable, failing the deploy before any case runs.
 
-Two fixes, two tests:
+What these tests pin:
 
 * ``hack/ci-teardown.sh`` Step 6 deletes ``data-platform-agent-a2a-nats-<n>``
-  claims after the namespaced sweep, and no other claim; a failing kubectl is
-  counted, never fatal.
-* ``hack/ci-deploy.sh``'s ``delete_orphaned_nats_claims`` deletes them before
-  the chart install only when no ``platform-agent-a2a-nats`` StatefulSet
-  exists, and never stops the deploy.
+  claims after the uninstall and the sweeps, and no other claim; a failing
+  kubectl is counted, never fatal.
+* ``hack/ci-deploy.sh``'s ``delete_orphaned_nats_claims`` deletes them only
+  when no ``platform-agent-a2a-nats`` StatefulSet exists, and never stops the
+  deploy. It runs before the chart install (claims a teardown left) and again
+  in 6b before the flip to next (claims a killed next-mode lease left, which
+  5c's today render released from their StatefulSet but kept).
 
 Both run the script's own text under bash against a kubectl stub on PATH, the
 approach of tests/test_ci_teardown_sweep.py.
@@ -48,6 +51,9 @@ _OTHER_CLAIMS = (
 _STATEFULSET = "statefulset.apps/platform-agent-a2a-nats"
 
 _TEARDOWN_STEPS_START = "START_TIME=$SECONDS"
+# 6b: the EVAL_MODE_NEXT block and the helm upgrade that flips the CR to next.
+_MODE_NEXT_BLOCK = 'if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then\n  STEP_START=$SECONDS\n  MODE_NEXT_START=$SECONDS'
+_MODE_NEXT_FLIP = "--reuse-values --values -"
 _DEPLOY_FUNCTION_RE = re.compile(r"^delete_orphaned_nats_claims\(\) \{\n.*?^\}\n", re.MULTILINE | re.DOTALL)
 _DEPLOY_CONSTANTS = (
     "PLATFORM_AGENT_CR_NAME",
@@ -159,12 +165,15 @@ class TeardownNatsClaimsTest(unittest.TestCase):
             with self.subTest(claim=claim):
                 self.assertFalse([c for c in deletes if claim in c.split()], deletes)
 
-    def test_claims_are_deleted_after_the_statefulset_sweep(self):
+    def test_claims_are_deleted_after_every_other_teardown_delete(self):
+        """Last, so the CR delete (and the owner GC of the StatefulSet that
+        follows it) has had every earlier step's time to land."""
         proc, calls = _run(_teardown_script(), _NATS_CLAIMS)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        sts_sweep = next(i for i, c in enumerate(calls) if c.startswith("kubectl delete statefulsets.apps"))
-        first_claim = next(i for i, c in enumerate(calls) if c in _claim_deletes(calls))
-        self.assertLess(sts_sweep, first_claim, calls)
+        claim_deletes = _claim_deletes(calls)
+        first_claim = calls.index(claim_deletes[0])
+        pvc_sweep = next(i for i, c in enumerate(calls) if c.startswith("kubectl delete persistentvolumeclaims"))
+        self.assertLess(pvc_sweep, first_claim, calls)
 
     def test_failure_is_counted_and_never_fatal(self):
         for label, kwargs in (("delete", {"kubectl_exit": 1}), ("list", {"get_exit": 1})):
@@ -223,6 +232,21 @@ class DeployOrphanedNatsClaimsTest(unittest.TestCase):
         self.assertIsNotNone(call, "delete_orphaned_nats_claims is never called")
         self.assertNotEqual(install, -1)
         self.assertLess(call.start(), install)
+
+    def test_6b_calls_it_again_before_the_flip_to_next(self):
+        """A killed next-mode lease leaves its StatefulSet standing, so the
+        first call skips. 5c's today render then deletes the StatefulSet and
+        keeps the claims; only a second call between that and the flip back
+        to next can take them before the new StatefulSet binds them."""
+        text = _CI_DEPLOY.read_text(encoding="utf-8")
+        block_start = text.find(_MODE_NEXT_BLOCK)
+        self.assertNotEqual(block_start, -1, f"{_MODE_NEXT_BLOCK!r} not found")
+        flip = text.find(_MODE_NEXT_FLIP, block_start)
+        self.assertNotEqual(flip, -1, f"{_MODE_NEXT_FLIP!r} not found in 6b")
+        call = re.compile(r"^\s+delete_orphaned_nats_claims$", re.MULTILINE).search(text, block_start, flip)
+        self.assertIsNotNone(call, "6b must call delete_orphaned_nats_claims before its helm upgrade to next")
+        install = text.find('helm upgrade --install "${HELM_RELEASE_NAME}"')
+        self.assertLess(install, block_start)
 
 
 if __name__ == "__main__":
