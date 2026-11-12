@@ -22,8 +22,8 @@ wait it out.
 Merges are counted per ``(repository, kind, environment)``: a customer keeps a
 workload repository, a cluster repository and many more per business group, and
 trust earned in one of them says nothing about another. Repositories are compared
-by :func:`repo_key`, so ``https://github.com/org/infra.git`` and
-``https://github.com/org/infra`` are one. A record without a repository or a kind
+by :func:`repo_key`, so ``https://github.com/org/infra.git``,
+``git@github.com:org/infra`` and ``https://github.com/org/infra`` are one. A record without a repository or a kind
 is not counted; one without an environment counts under ``""``. Environments
 are compared lower-case and stripped, as the post-merge check stores them.
 
@@ -38,10 +38,11 @@ and nothing user-visible depends on it until a caller does.
 
 from __future__ import annotations
 
-import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any
+
+import repo_ref
 
 RECORDS_TABLE = "post_merge_records"
 VERIFIED_FIXED = "verified_fixed"
@@ -59,12 +60,13 @@ class SchemaIncomplete(RuntimeError):
 
 
 def repo_key(url: Any) -> str:
-    """A repository url as one comparable key: host and path, lower-case, no scheme, user, ``.git`` or trailing slash."""
-    text = str(url or "").strip().lower()
-    text = re.sub(r"^[a-z+]+://", "", text)
-    if "@" in text.split("/", 1)[0]:
-        text = text.split("@", 1)[1].replace(":", "/", 1)
-    return re.sub(r"(\.git)?/*$", "", text)
+    """A repository url as one comparable key: host and path, lower-case, as :mod:`repo_ref` parses it.
+
+    No scheme, user, port, ``.git`` or trailing slash, and scp remotes read as urls do. A value
+    :mod:`repo_ref` refuses (no path, a traversal segment) is ``""``, which :func:`count` skips.
+    """
+    ref = repo_ref.try_parse(str(url or ""))
+    return str(ref).lower() if ref is not None else ""
 
 
 def _environment(value: Any) -> str:

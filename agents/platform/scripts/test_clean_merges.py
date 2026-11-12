@@ -71,6 +71,33 @@ class IsCleanTest(unittest.TestCase):
         self.assertTrue(clean_merges.is_clean(record("2026-11-19T12:00:00Z"), NOW))
 
 
+class RepoKeyTest(unittest.TestCase):
+    def test_one_key_for_every_spelling_of_a_repository(self):
+        spellings = [
+            "https://github.com/Org/Infra.git",
+            "https://github.com/org/infra/",
+            "git@github.com:org/infra.git",
+            "github.com:org/infra.git",
+            "ssh://git@github.com/org/infra",
+        ]
+        self.assertEqual({clean_merges.repo_key(s) for s in spellings}, {"github.com/org/infra"})
+
+    def test_a_port_and_a_user_do_not_split_the_key(self):
+        self.assertEqual(
+            clean_merges.repo_key("https://user@gitea.example.com:3000/org/infra"),
+            clean_merges.repo_key("https://gitea.example.com:3000/org/infra"),
+        )
+
+    def test_a_value_with_no_repository_path_has_no_key(self):
+        for value in ("https://github.com/", "https://github.com/org/..", "", None):
+            with self.subTest(value=value):
+                self.assertEqual(clean_merges.repo_key(value), "")
+
+    def test_a_record_without_a_key_is_not_counted(self):
+        rows = [record(days_ago(1), repo="https://github.com/")]
+        self.assertEqual(clean_merges.count(rows, NOW), {})
+
+
 class CountTest(unittest.TestCase):
     def test_five_clean_merges_on_two_days_are_ready(self):
         rows = [record(days_ago(2, hours=h)) for h in range(3)] + [record(days_ago(1, hours=h)) for h in range(2)]
