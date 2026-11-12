@@ -223,7 +223,10 @@ func (r *PlatformAgentReconciler) readCalloutMapState(ctx context.Context, agent
 
 // unsettled reports whether the state is one the next pass should look at
 // again soon: a map still loading, or pods that didn't answer. Nothing the
-// operator watches changes when a callout takes a map.
+// operator watches changes when a callout takes a map. A refusal isn't
+// re-read soon: most need an edit, and polling them would spin. One that the
+// callout clears alone (a map naming a custom tier taken once the tiers file
+// arrives, Revalidate) shows on the next steady pass.
 func (s *calloutMapState) unsettled() bool {
 	return s != nil && (s.reason == a2aIdentityMapPending || s.reason == a2aIdentityMapStatusUnreadable)
 }

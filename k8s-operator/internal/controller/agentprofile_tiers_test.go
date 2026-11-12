@@ -5,6 +5,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -221,5 +222,51 @@ func TestTheDispatchConfigNamesACustomUnattendedTier(t *testing.T) {
 	}
 	if got["tse"] != "nightly" || got["aud"] != "" {
 		t.Errorf("unattendedTier = %v, want tse:nightly and aud unset", got)
+	}
+}
+
+// A draining profile keeps its own unattended-mode tier in the dispatch
+// config, so the dispatcher still cleans up that tier's Jobs and counts its
+// adopted tasks as unattended; one that isn't among the entry's tiers is not
+// carried.
+func TestADrainingProfileKeepsItsUnattendedTier(t *testing.T) {
+	now := time.Now()
+	applied := &a2aDispatchConfig{Profiles: []a2aDispatchProfile{
+		{Name: "gone", Tiers: []string{"read", "nightly"}, UnattendedTier: "nightly"},
+		{Name: "odd", Tiers: []string{"read"}, UnattendedTier: "weekly"},
+	}}
+	got := drainingDispatchProfiles(applied, map[string]bool{}, now)
+	byName := map[string]a2aDispatchProfile{}
+	for _, p := range got {
+		byName[p.Name] = p
+	}
+	if byName["gone"].UnattendedTier != "nightly" {
+		t.Errorf("gone drains with unattendedTier %q, want nightly", byName["gone"].UnattendedTier)
+	}
+	if byName["odd"].UnattendedTier != "" {
+		t.Errorf("odd carried unattendedTier %q, which isn't one of its tiers", byName["odd"].UnattendedTier)
+	}
+}
+
+// A hand-made ServiceAccount under a refused tier's name doesn't refuse the
+// profile: the operator renders nothing for that tier, so nothing collides.
+// The profile's renderable tiers render as usual.
+func TestAForeignServiceAccountForARefusedTierDoesNotRefuseTheProfile(t *testing.T) {
+	withOperatorBusPrincipal(t)
+	agent := a2aTestAgent()
+	p := testAgentProfile(agent.Namespace, "tse", func(p *agentv1alpha1.AgentProfile) { p.Spec.AllowedTiers = []string{"read", "ghost"} })
+	foreign := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "agentprofile-tse-ghost", Namespace: profileNamespaceName(agent)}}
+	h := newProfileHarness(t, agent, &p, foreign)
+	h.reconcile(agent.Namespace, "tse")
+	got := h.profile(agent.Namespace, "tse")
+	if c := condition(got, agentv1alpha1.AgentProfileConditionIdentityReady); c.Status != metav1.ConditionTrue {
+		t.Errorf("IdentityReady = %s/%s: %s; the foreign ServiceAccount is for a tier that doesn't render", c.Status, c.Reason, c.Message)
+	}
+	bound, err := boundAgentProfiles(context.Background(), h.c, agent, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(bound) != 1 || bound[0].Name != "tse" {
+		t.Errorf("bound profiles %v, want tse", bound)
 	}
 }

@@ -48,8 +48,8 @@ import (
 // inverted one turns itself into the forward check at the moment the fix
 // lands. The minter policy map and the identity map are forward checks now:
 // the policies name one repository each and the map is cut into shards, every
-// one of which is gated below. The dispatch config is still over the limit and
-// stays inverted.
+// one of which is gated below. The dispatch config is a forward check too
+// now: compact JSON brings the fleet's config under the limit.
 //
 // Each check first confirms its fixture is the fleet the gate names, and does
 // so on the renderer's input (the repositories the sync parses, the profiles
@@ -96,12 +96,6 @@ const (
 	fleetScaleProject           = "fleet-project"
 	fleetScaleLocation          = "us-central1"
 	fleetScaleProfileNameFormat = "cluster-" + fleetScaleProject + "-cluster-%04d-" + fleetScaleLocation
-	// The fix issue the dispatch config's size check names, empty now that it
-	// is under the limit at N: #4431 shrank the minter policy map and the
-	// identity map, and #5479 the dispatch config (compact, with the durables
-	// and the Job template name derived by the dispatcher). Empty, the gate
-	// holds the config under the limit from here on.
-	dispatchConfigMapFixIssue = ""
 )
 
 // configMapDataSize is what the API server measures a ConfigMap by: the sum of
@@ -226,6 +220,11 @@ func shippedProfileSubscribeTopics(t *testing.T) []string {
 // reach the gate.
 func fleetScaleProfileFixtures(t *testing.T, agent *agentv1alpha1.PlatformAgent) []agentv1alpha1.AgentProfile {
 	t.Helper()
+	// With the dispatcher off: on, only the profiles its identity can carry
+	// are bound (refuseOverDispatcherCeiling, gke-labs/kube-agents#5381), so
+	// the gate would measure some 800 profiles rather than 2,500.
+	// TestTheDispatcherCeiling holds the dispatcher's side.
+	t.Setenv(a2aProfileDispatcherEnvVar, "false")
 	topics := shippedProfileSubscribeTopics(t)
 	profiles := make([]agentv1alpha1.AgentProfile, 0, fleetScaleProfiles)
 	for i := 1; i <= fleetScaleProfiles; i++ {
@@ -357,9 +356,8 @@ func TestTheMinterPolicyConfigMapAtFleetScale(t *testing.T) {
 // check. The shard count and the placement of the entries are
 // TestTheIdentityMapShardsStayUnderTheConfigMapLimitAtFleetScale's.
 func TestTheIdentityMapConfigMapAtFleetScale(t *testing.T) {
-	// The shipped shape: no install sets the dispatcher image today, and
-	// its identity would add every durable's name to the map on top.
-	t.Setenv(a2aDispatcherImageEnvVar, "")
+	// The dispatcher is off for the whole fleet render
+	// (fleetScaleProfileFixtures says why).
 	agent := a2aTestAgent()
 	profiles := fleetScaleProfileFixtures(t, agent)
 
@@ -382,9 +380,12 @@ func TestTheIdentityMapConfigMapAtFleetScale(t *testing.T) {
 	t.Logf("identity map at N=%d: %d identities rendered across %d shards, version %s", fleetScaleProfiles, identities, len(cms), version)
 }
 
-// The dispatch config at N=2,500, rendered only when the dispatcher image is
-// set (no release sets it yet): one profile block per profile with its tiers,
-// parameters, written compact with no durables (#5479).
+// The dispatch config at N=2,500 with the dispatcher's own ceiling switched
+// off (fleetScaleProfileFixtures), so every profile is rendered: one compact
+// profile block per profile with its tiers and parameters, and no durables,
+// which the dispatcher derives (#5479). Job templates, which this fixture's
+// profiles don't carry, are named by hash only, and the dispatcher's ceiling
+// refuses the profiles they would push past it.
 func TestTheDispatchConfigMapAtFleetScale(t *testing.T) {
 	withDispatcher(t)
 	agent := a2aTestAgent()
@@ -400,7 +401,7 @@ func TestTheDispatchConfigMapAtFleetScale(t *testing.T) {
 	}
 	t.Logf("%s at N=%d: %d profile blocks rendered", cm.Name, fleetScaleProfiles, len(cfg.Profiles))
 
-	requireConfigMapSizeGate(t, cm, fmt.Sprintf("N=%d profiles", fleetScaleProfiles), dispatchConfigMapFixIssue)
+	requireConfigMapSizeGate(t, cm, fmt.Sprintf("N=%d profiles", fleetScaleProfiles), "")
 }
 
 // jobModeScaleProfiles is past where an inline Job template per profile put

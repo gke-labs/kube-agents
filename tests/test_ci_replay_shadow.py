@@ -354,6 +354,12 @@ class RecordModeResolveTest(unittest.TestCase):
         shape = re.search(r"^readonly REPLAY_SHADOW_BUILD_RE='\^(.*)\$'$", _CI_ENV.read_text(), re.MULTILINE)
         self.assertEqual(shape.group(1), publish_cache.BUILD_PATTERN)
 
+    def test_the_commit_shape_is_the_publishers(self):
+        sys.path.insert(0, str(_ROOT / "hack" / "replay-proxy"))
+        import publish_cache
+        shape = re.search(r"^readonly REPLAY_COMMIT_RE='\^(.*)\$'$", _CI_ENV.read_text(), re.MULTILINE)
+        self.assertEqual(shape.group(1), publish_cache.COMMIT_PATTERN)
+
     def test_without_gcloud_it_never_records(self):
         path = os.pathsep.join(p for p in os.environ.get("PATH", "").split(os.pathsep) if not os.path.exists(os.path.join(p, "gcloud")))
         values, err = _resolve(FAKE_GCLOUD_ACCOUNT=_RECORDER, PATH=path)
@@ -593,6 +599,7 @@ class _LifecycleBase(unittest.TestCase):
         assert count == 1, f"expected one REPLAY_SHADOW_COLLECTOR_STOP_WAIT_SECONDS in {_CI_ENV}, replaced {count}"
         functions = "".join(lift_function(n, text, _CI_ENV) for n in (
             *_RESOLVE, "_replay_shadow_deployed_env", "_replay_shadow_deployed_mode", "_replay_shadow_deployed_kind",
+            "_replay_checkout_commit", "_replay_lane_commit_source",
             "start_replay_shadow_collector", "signal_replay_shadow_collector", "wait_replay_shadow_collector"))
         return ("set -euo pipefail\n" + constants + f"REPLAY_SHADOW_COLLECTOR_SCRIPT={str(self.fake)!r}\n"
                 + 'REPLAY_SHADOW_COLLECTOR_PID=""\n' + functions + body)
@@ -783,6 +790,26 @@ class ModeCollectorTest(_LifecycleBase):
         self.assertNotIn(str(self.artifacts), pairs["--keep-dir"], "kept answers stay out of the public artifacts")
         self.assertIn("wait=255", proc.stdout)
 
+    def test_only_a_recording_collector_names_the_checkouts_commit(self):
+        head = subprocess.run(["git", "-C", str(_ROOT), "rev-parse", "HEAD"], capture_output=True, text=True,
+                              check=True).stdout.strip()
+        self._start(FAKE_GCLOUD_ACCOUNT=_RECORDER, FAKE_DEPLOYED="record", REPLAY_CHECKOUT_DIR=str(_ROOT))
+        _, pairs = self._argv_pairs()
+        self.assertEqual((pairs["--mode"], pairs["--commit"]), ("record", head))
+        for overrides in ({"FAKE_DEPLOYED": "shadow"}, {"EVAL_REPLAY_LANE": "true", "FAKE_DEPLOYED": "replay"}):
+            with self.subTest(**overrides):
+                self.argv.unlink(missing_ok=True)
+                self._start(FAKE_GCLOUD_ACCOUNT=_RECORDER, REPLAY_CHECKOUT_DIR=str(_ROOT), **overrides)
+                argv, _ = self._argv_pairs()
+                self.assertNotIn("--commit", argv)
+
+    def test_a_checkout_git_cannot_name_records_an_empty_commit(self):
+        # Not a repository: the collector is told none, rather than a value it would refuse.
+        self._start(FAKE_GCLOUD_ACCOUNT=_RECORDER, FAKE_DEPLOYED="record", REPLAY_CHECKOUT_DIR=str(self.tmp))
+        argv, pairs = self._argv_pairs()
+        self.assertIn("--commit", argv)
+        self.assertEqual(pairs["--commit"], "")
+
     def test_a_recording_proxy_is_always_collected_in_record_mode(self):
         # The deploy filed a trusted night and decided record; this shell's own
         # account check now fails (gcloud auth list flaked). The collector takes
@@ -848,6 +875,23 @@ class ModeCollectorTest(_LifecycleBase):
         _, pairs = self._argv_pairs()
         self.assertEqual((pairs["--mode"], pairs["--kind"], pairs["--keep-dir"], pairs["--seed-dir"],
                           pairs["--nightly-runs"], pairs["--pr"]), ("replay", "replay-lane", "/k", "/s", "/r.json", ""))
+
+    def test_the_lane_names_the_commit_it_replays_and_where_it_came_from(self):
+        head = subprocess.run(["git", "-C", str(_ROOT), "rev-parse", "HEAD"], capture_output=True, text=True,
+                              check=True).stdout.strip()
+        body = ('REPLAY_KEEP_DIR=/k\nREPLAY_LANE_SEED_DIR=/s\nREPLAY_LANE_NIGHTLY_RUNS=/r.json\n'
+                'start_replay_shadow_collector\n' + _AWAIT_ARGV + 'wait_replay_shadow_collector\n')
+        for exported, source in (("recording", "recording"), ("main", "main"), (None, ""), ("nightly", "")):
+            with self.subTest(exported=exported):
+                self.argv.unlink(missing_ok=True)
+                self._fake_collector()
+                proc = self._run(body, stop_wait=1, EVAL_REPLAY_LANE="true", ARGV=str(self.argv), FAKE_DEPLOYED="replay",
+                                 REPLAY_CHECKOUT_DIR=str(_ROOT), REPLAY_LANE_COMMIT_SOURCE=exported)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                _, pairs = self._argv_pairs()
+                self.assertEqual((pairs["--lane-commit"], pairs["--lane-commit-source"]), (head, source))
+                if exported == "nightly":
+                    self.assertIn("leaves it unstated", proc.stderr)
 
 
 class PrepareLaneCacheTest(_LifecycleBase):

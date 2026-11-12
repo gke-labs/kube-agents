@@ -3145,15 +3145,18 @@ def _failed_entry(name):
     }
 
 
-def _worker_lane_run(inject_run, *, workers=True, gap=False, loss=None):
+def _worker_lane_run(inject_run, *, workers=True, gap=False, loss=None, no_calls=False):
     """The captured inject repetition with the activity marker (reporting
     ``loss``), a tagged worker entry when ``workers``, a capture-gap entry
-    when ``gap``, and every worker-reading entry recorded as failed."""
+    when ``gap``, the harness's no-worker-calls entry when ``no_calls``, and
+    every worker-reading entry recorded as failed."""
 
     def mutate(rec):
         rec["trajectory"].append({**ACTIVITY_MARKER, "args": {"calls": 0, "dropped": 0, **(loss or {})}})
         if workers:
             rec["trajectory"].append(dict(TAGGED_WORKER_ENTRY))
+        if no_calls:
+            rec["trajectory"].append(worker_trajectory.no_worker_calls_entry(["t_1"]))
         if gap:
             rec["trajectory"].append(worker_trajectory.gap_entry(["session store for cluster-a: locked"]))
         names = [WORKER_ONLY_CHECK, WORKER_AND_ROUTER_CHECK, *WORKER_UNTRACED_CHECKS]
@@ -3207,6 +3210,144 @@ def test_a_worker_check_stays_set_aside_on_a_capture_with_a_gap(worker_lane_spec
     assert rep.not_applicable_checks == [WORKER_ONLY_CHECK, WORKER_AND_ROUTER_CHECK, *WORKER_UNTRACED_CHECKS]
     assert rep.outcome == "pass" and rep.correctness == 1.0
     assert worker_trajectory.GAP_ENTRY in HARNESS_WRITTEN_ENTRIES
+
+
+WORKER_CALLS_CHECK = "the-worker-ended-its-card"
+
+
+@pytest.fixture
+def worker_calls_spec(write_task):
+    """A case with a check that reads only the workers' calls (a workers-scope
+    ``tool_called``) beside one that reads their commands."""
+    return load_case(
+        write_task(
+            "worker-calls",
+            {
+                "id": "worker-calls",
+                "name": "Worker calls",
+                "verification_spec": [
+                    {
+                        "name": ANSWER_CHECK,
+                        "role": "objective",
+                        "check": {"type": "report_contains", "required_phrases": ["seeded"]},
+                    },
+                    {
+                        "name": WORKER_CALLS_CHECK,
+                        "role": "objective",
+                        "check": {
+                            "type": "tool_called",
+                            "tool_names": ["kanban_complete", "kanban_block"],
+                            "scope": "workers",
+                        },
+                    },
+                    {
+                        "name": WORKER_ONLY_CHECK,
+                        "role": "objective",
+                        "check": {"type": "worker_commands", "required_patterns": ["kubectl"]},
+                    },
+                ],
+            },
+        )
+    )
+
+
+def _worker_calls_run(inject_run, *, gap=False, tagged=False):
+    """The captured inject repetition with the activity marker, the harness's
+    no-worker-calls entry, a gap entry when ``gap``, a tagged worker entry
+    when ``tagged``, and both worker-reading entries recorded as failed."""
+
+    def mutate(rec):
+        rec["trajectory"].append({**ACTIVITY_MARKER, "args": {"calls": 0, "dropped": 0}})
+        rec["trajectory"].append(worker_trajectory.no_worker_calls_entry(["t_1"]))
+        if tagged:
+            rec["trajectory"].append(dict(TAGGED_WORKER_ENTRY))
+        if gap:
+            rec["trajectory"].append(worker_trajectory.gap_entry(["session store for cluster-a: locked"]))
+        rec["verification_report"] = [
+            e for e in rec["verification_report"] if e.get("name") != BLIND_CHECK
+        ] + [_failed_entry(WORKER_CALLS_CHECK), _failed_entry(WORKER_ONLY_CHECK)]
+        rec["scores"]["VerificationCorrectness"] = 1 / 3
+
+    return inject_run(mutate=mutate)
+
+
+def test_the_worker_calls_set_holds_only_workers_scope_tool_called(worker_calls_spec):
+    assert worker_calls_spec.worker_calls_checks == {WORKER_CALLS_CHECK}
+    assert worker_calls_spec.worker_blind_checks == {WORKER_CALLS_CHECK, WORKER_ONLY_CHECK}
+
+
+_WORKERS_CALL = {"type": "tool_called", "tool_names": ["kanban_complete"], "scope": "workers"}
+
+
+@pytest.mark.parametrize(
+    "check, graded",
+    [
+        (_WORKERS_CALL, True),
+        ({"type": "all", "checks": [_WORKERS_CALL, dict(_WORKERS_CALL, tool_names=["kanban_block"])]}, True),
+        (dict(_WORKERS_CALL, result="spilled"), False),
+        (dict(_WORKERS_CALL, scope="all"), False),
+        ({"type": "all", "checks": [_WORKERS_CALL, {"type": "worker_commands", "required_patterns": ["kubectl"]}]}, False),
+    ],
+    ids=["workers-leaf", "workers-compound", "result-pattern", "all-scope", "mixed-compound"],
+)
+def test_the_worker_calls_set_holds_a_check_only_when_every_leaf_qualifies(write_task, check, graded):
+    """A worker-reading check joins ``worker_calls_checks`` only when every
+    leaf is a workers-scope ``tool_called`` with no ``result`` pattern, the
+    leaves the verifier also grades on the entry, so both transports agree."""
+    spec = load_case(
+        write_task(
+            "worker-calls-membership",
+            {
+                "id": "worker-calls-membership",
+                "name": "Worker calls membership",
+                "verification_spec": [
+                    {
+                        "name": ANSWER_CHECK,
+                        "role": "objective",
+                        "check": {"type": "report_contains", "required_phrases": ["seeded"]},
+                    },
+                    {"name": WORKER_CALLS_CHECK, "role": "objective", "check": check},
+                ],
+            },
+        )
+    )
+    assert WORKER_CALLS_CHECK in spec.worker_blind_checks
+    assert (WORKER_CALLS_CHECK in spec.worker_calls_checks) == graded
+
+
+def test_a_workers_calls_check_grades_when_the_cards_closed_with_no_worker_call(worker_calls_spec, inject_run):
+    """#5371: the harness writes ``worker_trajectory.NO_WORKER_CALLS_ENTRY``
+    when every awaited card was closed and a clean capture holds no worker
+    entry. A check that reads only the workers' calls grades that as zero
+    calls, so the run fails; a check that reads their commands has nothing to
+    read and stays set aside."""
+    rep = classify_rep(worker_calls_spec, _worker_calls_run(inject_run), 1)
+    assert rep.not_applicable_checks == [WORKER_ONLY_CHECK], rep.reason
+    assert rep.outcome == "fail"
+    assert {f.split(":")[0] for f in rep.failed_checks} == {WORKER_CALLS_CHECK}
+    assert worker_trajectory.NO_WORKER_CALLS_ENTRY in HARNESS_WRITTEN_ENTRIES
+
+
+def test_a_capture_gap_still_sets_the_worker_checks_aside_beside_the_no_calls_entry(worker_calls_spec, inject_run):
+    """A gap entry means the read was incomplete, so the set-aside holds even
+    with a no-worker-calls entry on the record."""
+    rep = classify_rep(worker_calls_spec, _worker_calls_run(inject_run, gap=True), 1)
+    assert rep.not_applicable_checks == [WORKER_CALLS_CHECK, WORKER_ONLY_CHECK]
+    assert rep.outcome == "pass"
+
+
+def test_the_no_calls_entry_does_not_change_a_record_that_carries_the_workers(worker_calls_spec, inject_run):
+    """With a tagged worker entry the record carries the workers, as before."""
+    rep = classify_rep(worker_calls_spec, _worker_calls_run(inject_run, tagged=True), 1)
+    assert rep.not_applicable_checks == [], rep.reason
+    assert {f.split(":")[0] for f in rep.failed_checks} == {WORKER_CALLS_CHECK, WORKER_ONLY_CHECK}
+
+
+def test_the_worker_lane_case_stays_set_aside_on_the_no_calls_entry(worker_lane_spec, inject_run):
+    """No entry there reads only the workers' calls, so all stay set aside."""
+    rep = classify_rep(worker_lane_spec, _worker_lane_run(inject_run, workers=False, no_calls=True), 1)
+    assert rep.not_applicable_checks == [WORKER_ONLY_CHECK, WORKER_AND_ROUTER_CHECK, *WORKER_UNTRACED_CHECKS]
+    assert rep.outcome == "pass"
 
 
 def test_a_worker_check_that_reads_the_router_stays_set_aside_on_a_lossy_trace(

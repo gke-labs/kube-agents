@@ -312,7 +312,7 @@ func TestDispatcherJobModeIsAbsentWithoutTheSignal(t *testing.T) {
 	})
 	for name, turnOff := range map[string]func(t *testing.T, f *jobModeFixture){
 		"the signal off":     func(t *testing.T, _ *jobModeFixture) { t.Setenv(a2aDispatcherJobPolicyEnvVar, "") },
-		"the dispatcher off": func(t *testing.T, _ *jobModeFixture) { t.Setenv(a2aDispatcherImageEnvVar, "") },
+		"the dispatcher off": func(t *testing.T, _ *jobModeFixture) { t.Setenv(a2aProfileDispatcherEnvVar, "false") },
 		"the mode back to today": func(t *testing.T, f *jobModeFixture) {
 			agent := f.agent(t)
 			agent.Spec.Mode = nil
@@ -459,7 +459,7 @@ func TestDispatcherJobModeWritesStatusOnlyOnAChange(t *testing.T) {
 func TestARefusedPassLeavesDispatcherJobModeStanding(t *testing.T) {
 	for name, turnOff := range map[string]func(t *testing.T, f *jobModeFixture){
 		"the signal off":     func(t *testing.T, _ *jobModeFixture) { t.Setenv(a2aDispatcherJobPolicyEnvVar, "") },
-		"the dispatcher off": func(t *testing.T, _ *jobModeFixture) { t.Setenv(a2aDispatcherImageEnvVar, "") },
+		"the dispatcher off": func(t *testing.T, _ *jobModeFixture) { t.Setenv(a2aProfileDispatcherEnvVar, "false") },
 		"the mode back to today": func(t *testing.T, f *jobModeFixture) {
 			agent := f.agent(t)
 			agent.Spec.Mode = nil
