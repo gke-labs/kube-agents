@@ -220,6 +220,10 @@ type busStreamsRig struct {
 	patchErr error
 	// podDeleteErr, when set, fails every pod delete.
 	podDeleteErr error
+	// jobDeleteErr fails every Job delete, and statusPatchErr every status
+	// patch, while set.
+	jobDeleteErr   error
+	statusPatchErr error
 }
 
 func busStreamsAgent(replicas int) *agentv1alpha1.PlatformAgent {
@@ -335,6 +339,9 @@ func newBusStreamsRig(t *testing.T, replicas int, objs ...client.Object) *busStr
 				if _, isPod := obj.(*corev1.Pod); isPod && rig.podDeleteErr != nil {
 					return rig.podDeleteErr
 				}
+				if _, isJob := obj.(*batchv1.Job); isJob && rig.jobDeleteErr != nil {
+					return rig.jobDeleteErr
+				}
 				rig.deleted = append(rig.deleted, obj.GetName())
 				return c.Delete(ctx, obj, opts...)
 			},
@@ -343,6 +350,12 @@ func newBusStreamsRig(t *testing.T, replicas int, objs ...client.Object) *busStr
 					return rig.patchErr
 				}
 				return c.Patch(ctx, obj, patch, opts...)
+			},
+			SubResourcePatch: func(ctx context.Context, c client.Client, subResource string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+				if subResource == "status" && rig.statusPatchErr != nil {
+					return rig.statusPatchErr
+				}
+				return c.SubResource(subResource).Patch(ctx, obj, patch, opts...)
 			},
 		}).
 		Build()
@@ -1290,5 +1303,55 @@ func TestALookAlikeDeploymentsPodsAreNotRestarted(t *testing.T) {
 	}
 	if !slices.Contains(rig.deleted, "test-agent-gateway-xyz") {
 		t.Errorf("deleted %v, want the agent pod still restarted", rig.deleted)
+	}
+}
+
+// A Job delete that fails after the attempt is recorded is retried on the
+// next poll under the same attempt: the rate limit isn't spent on it.
+func TestAFailedJobDeleteIsRetriedUnderTheSameAttempt(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	rig.serve(1, allStreamsBut("KV_cap")...)
+	rig.poll()
+	rig.poll()
+	rig.jobDeleteErr = errors.New("etcdserver: request timed out")
+	if err := rig.poller.pollAgent(context.Background(), rig.agent()); err == nil {
+		t.Fatalf("poll succeeded with the Job delete failing")
+	}
+	rig.now = rig.now.Add(busStreamsPollInterval)
+	if !rig.jobExists() {
+		t.Fatalf("the Job is gone though its delete failed")
+	}
+	if n := len(readBusReprovisionRecord(rig.agent()).Attempts); n != 1 {
+		t.Fatalf("%d attempts recorded after the failed delete, want 1", n)
+	}
+
+	rig.jobDeleteErr = nil
+	rig.poll()
+	if rig.jobExists() {
+		t.Fatalf("the delete was not retried; condition %+v", rig.condition())
+	}
+	if n := len(readBusReprovisionRecord(rig.agent()).Attempts); n != 1 {
+		t.Errorf("%d attempts after the retry, want the same 1", n)
+	}
+	if c := rig.condition(); c == nil || c.Reason != busStreamsReasonReprovisioning {
+		t.Errorf("condition = %+v, want %s, not a rate-limit wait", c, busStreamsReasonReprovisioning)
+	}
+}
+
+// The Reprovisioning condition is only a report: a status write that fails
+// doesn't hold back the delete.
+func TestAConditionWriteThatFailsDoesNotHoldTheDelete(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	rig.serve(1, allStreamsBut("KV_cap")...)
+	rig.poll()
+	rig.poll()
+	rig.statusPatchErr = errors.New("the object has been modified")
+	if err := rig.poller.pollAgent(context.Background(), rig.agent()); err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	if rig.jobExists() {
+		t.Errorf("the Job was not deleted when only the condition write failed")
 	}
 }

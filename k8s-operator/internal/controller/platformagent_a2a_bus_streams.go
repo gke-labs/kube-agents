@@ -117,6 +117,11 @@ const (
 	// series), so it is read line by line and kept nowhere.
 	busStreamsScrapeTimeout = 45 * time.Second
 	busStreamsMaxLineBytes  = 64 * 1024
+	// busStreamsReadBufferBytes is the reader's buffer: the body's lines are
+	// short, and ReadLine hands a longer one over in pieces. An overlong line
+	// keeps its first busStreamsTooLongPrefixBytes, enough to name its metric.
+	busStreamsReadBufferBytes    = 4 * 1024
+	busStreamsTooLongPrefixBytes = 256
 
 	// The exporter's series this reads (prometheus-nats-exporter v0.20.3,
 	// collector/jsz.go). The jsz collector writes nothing for a server whose
@@ -193,7 +198,7 @@ func (s *podBusStreamSource) Scrape(ctx context.Context, addr string) (busServer
 // fails the scrape; any other overlong line is skipped.
 func foldBusStreamsBody(body io.Reader) (busServerReading, error) {
 	reading := busServerReading{streams: map[string]bool{}}
-	reader := bufio.NewReaderSize(body, 4*1024)
+	reader := bufio.NewReaderSize(body, busStreamsReadBufferBytes)
 	for {
 		line, tooLong, err := readBusStreamsLine(reader)
 		if len(line) > 0 || tooLong {
@@ -224,7 +229,7 @@ func readBusStreamsLine(reader *bufio.Reader) (line []byte, tooLong bool, err er
 		chunk, isPrefix, rerr := reader.ReadLine()
 		if len(line)+len(chunk) > busStreamsMaxLineBytes {
 			if !tooLong {
-				line = append(line, chunk[:min(len(chunk), 256)]...)
+				line = append(line, chunk[:min(len(chunk), busStreamsTooLongPrefixBytes)]...)
 			}
 			tooLong = true
 		} else if !tooLong {
@@ -646,6 +651,13 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 			fmt.Sprintf("Missing from the A2A bus: %s. The operator re-ran the provision Job at %s and they were still missing after it, so it will not re-run it again for them. Read the provision Job's logs and the NATS servers' logs; once fixed, remove the %s annotation to let the operator re-run it.",
 				names, last.At.UTC().Format(time.RFC3339), busStreamsReprovisionAnnotation))
 	}
+	if last != nil && !last.Settled && jobState == busJobComplete && job.UID == last.JobUID {
+		// The last attempt is recorded but its Job is still the completed
+		// one it was to delete: the delete didn't land (an API error after
+		// the record was written). Retry the delete under the same attempt,
+		// rather than spend the rate limit on a new one.
+		return p.deleteProvisionJob(ctx, agent, job, last.Missing, streak)
+	}
 	if jobState != busJobComplete {
 		return p.writeCondition(ctx, agent, metav1.ConditionFalse, busStreamsReasonMissing,
 			fmt.Sprintf("Missing from the A2A bus: %s. The provision Job %s failed, so the operator does not re-run it; see the PlatformAgent's events.",
@@ -657,26 +669,38 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 				names, next.UTC().Format(time.RFC3339)))
 	}
 
-	restart := ""
-	if slices.Contains(confirmed, a2aTasksStream) {
-		restart = " Once TASKS is back, the A2A gateway and the agent pod are restarted, so their TASKS consumers are recreated."
-	}
 	record = record.pruned(now)
 	record.Attempts = append(record.Attempts, busReprovisionAttempt{At: now, Missing: confirmed, JobUID: job.UID})
 	if err := p.writeRecord(ctx, agent, record); err != nil {
 		return err
 	}
+	return p.deleteProvisionJob(ctx, agent, job, confirmed, streak)
+}
+
+// deleteProvisionJob writes the Reprovisioning condition and deletes the
+// completed provision Job (UID precondition), so the reconcile runs it again.
+// The attempt is already recorded. The condition is only a report, so a write
+// that fails doesn't hold the delete back: the next poll writes it again. A
+// delete that fails returns its error, and the next poll retries it under the
+// same attempt.
+func (p *BusStreamPoller) deleteProvisionJob(ctx context.Context, agent *agentv1alpha1.PlatformAgent, job *batchv1.Job, missing []string, streak *busStreamStreak) error {
+	names := strings.Join(missing, ", ")
+	restart := ""
+	if slices.Contains(missing, a2aTasksStream) {
+		restart = " Once TASKS is back, the A2A gateway and the agent pod are restarted, so their TASKS consumers are recreated."
+	}
+	log := logf.FromContext(ctx).WithName(busStreamsPollerLogName)
 	if err := p.writeCondition(ctx, agent, metav1.ConditionFalse, busStreamsReasonReprovisioning,
 		fmt.Sprintf("Missing from the A2A bus: %s. The provision Job is running again to recreate them.%s", names, restart)); err != nil {
-		return err
+		log.Error(err, "writing the Reprovisioning condition; deleting the provision Job anyway", "platformagent", client.ObjectKeyFromObject(agent))
 	}
 	uid := job.UID
 	if err := p.r.Delete(ctx, job, client.Preconditions{UID: &uid}, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("failed to delete the completed A2A provision Job %s: %w", job.Name, err)
 	}
 	streak.missing, streak.misses = nil, 0
-	logf.FromContext(ctx).WithName(busStreamsPollerLogName).Info("re-running the A2A provision Job: provisioned streams are missing from the bus",
-		"platformagent", client.ObjectKeyFromObject(agent), "missing", confirmed, "job", job.Name)
+	log.Info("re-running the A2A provision Job: provisioned streams are missing from the bus",
+		"platformagent", client.ObjectKeyFromObject(agent), "missing", missing, "job", job.Name)
 	p.r.recordEvent(agent, corev1.EventTypeWarning, busStreamsMissingEventReason,
 		fmt.Sprintf("Missing from the A2A bus on %d polls in a row: %s. Deleted the completed provision Job %s so it runs again and recreates them.%s",
 			busStreamsConfirmPolls, names, job.Name, restart))
