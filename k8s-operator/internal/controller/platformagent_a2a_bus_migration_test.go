@@ -116,6 +116,39 @@ func TestAOneToThreeFailureAfterTheConversionRollsBack(t *testing.T) {
 	}
 }
 
+// A failed conversion rolls straight back: no restore has run, so the
+// three servers hold no copy to clear, and a clear on servers that never all
+// came up would need a quorum they may not have. Through the pass, the
+// rollback's restore starts on the forward clear's record, with nothing
+// cleared again.
+func TestAFailedConversionRollsBackWithoutAClear(t *testing.T) {
+	seen, last := walkBusMigration(busMigrationGrow, busMigrationConverting, false)
+	want := []busMigrationPhase{busMigrationFreezing, busMigrationSnapshot, busMigrationHashing, busMigrationClearing, busMigrationConverting,
+		busMigrationRollingBack, busMigrationRollbackRestoring, busMigrationReleasing, busMigrationAbandoned}
+	if !slices.Equal(seen, want) {
+		t.Fatalf("phases %v, want %v", seen, want)
+	}
+	if !last.abandoning {
+		t.Error("a rolled-back conversion does not read as abandoned")
+	}
+
+	t.Setenv(operatorImageEnvVar, "operator:test")
+	m := newMigrationRig(t, busMigrationGrow, busMigrationClearing, 1, time.Now().Add(time.Hour))
+	m.snapshotKept()
+	m.clearedAll()
+	m.pass(busMigrationConverting, 3)
+	m.agent.Status.BusMigration.PhaseDeadline = ptr.To(metav1.NewTime(time.Now().Add(-time.Second)))
+	m.pass(busMigrationRollingBack, 1)
+	if _, _, ok := m.workload(busMigrationClearBackWork); ok {
+		t.Error("a failed conversion started a clear on the cluster")
+	}
+	m.rollOut(1)
+	m.pass(busMigrationRollbackRestoring, 1)
+	if _, _, ok := m.workload("rollback"); !ok {
+		t.Error("the rollback's restore did not start after a failed conversion")
+	}
+}
+
 // A pending pass changes nothing, and three to one never freezes.
 func TestABusMigrationWaitsAndThreeToOneNeverFreezes(t *testing.T) {
 	for _, phase := range []busMigrationPhase{busMigrationPinning, busMigrationShrinking, busMigrationUnpinning} {
@@ -471,7 +504,7 @@ func TestAOneToThreeMigrationRunsThroughThePass(t *testing.T) {
 	}
 
 	late := newMigrationRig(t, busMigrationGrow, busMigrationConverting, 3, time.Now().Add(-time.Minute))
-	late.pass(busMigrationClearing, 3) // still three servers: their copies go before the shrink
+	late.pass(busMigrationRollingBack, 1) // no restore ran: nothing on the cluster to clear
 }
 
 // Converting has fifteen minutes of its own to get three servers Ready, on
@@ -493,7 +526,7 @@ func TestAConversionThatCannotFinishTurnsBackAtItsOwnDeadline(t *testing.T) {
 	}
 	m.pass(busMigrationConverting, 3) // servers 1 and 2 Pending, within the phase's time
 	m.agent.Status.BusMigration.PhaseDeadline = ptr.To(metav1.NewTime(time.Now().Add(-time.Second)))
-	m.pass(busMigrationClearing, 3)
+	m.pass(busMigrationRollingBack, 1)
 	run := m.agent.Status.BusMigration
 	if !run.Abandoning || !strings.Contains(run.Cause, "the Converting phase was still running at its own deadline") {
 		t.Errorf("abandoning %v, cause %q", run.Abandoning, run.Cause)

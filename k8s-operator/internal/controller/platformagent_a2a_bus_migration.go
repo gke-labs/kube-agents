@@ -67,10 +67,10 @@ const (
 	busMigrationFreezing          busMigrationPhase = "Freezing"          // grow: only the migration's principals admitted
 	busMigrationSnapshot          busMigrationPhase = "Snapshotting"      // grow: the snapshot pod stages every stream
 	busMigrationHashing           busMigrationPhase = "Hashing"           // grow: the operator's hashing pod digests the stage
-	busMigrationClearing          busMigrationPhase = "Clearing"          // grow: the streams deleted ahead of the conversion, or of the rollback
+	busMigrationClearing          busMigrationPhase = "Clearing"          // grow: the streams deleted ahead of the conversion, or of the rollback after a failed restore
 	busMigrationConverting        busMigrationPhase = "Converting"        // grow: three servers rendered, waiting for them
 	busMigrationRestoring         busMigrationPhase = "Restoring"         // grow: the restore pod restores and raises to R3
-	busMigrationRollingBack       busMigrationPhase = "RollingBack"       // grow failed after the conversion: one server rendered again
+	busMigrationRollingBack       busMigrationPhase = "RollingBack"       // grow failed in or after the conversion: one server rendered again
 	busMigrationRollbackRestoring busMigrationPhase = "RollbackRestoring" // grow: the same snapshot restored into one server
 	busMigrationReleasing         busMigrationPhase = "Releasing"         // grow: the freeze lifted
 	busMigrationDone              busMigrationPhase = "Done"              // converted, data kept
@@ -102,9 +102,10 @@ type busMigrationStep struct {
 //     R3 and the bus stays three servers (Abandoned).
 //   - One to three, failing before the conversion: the freeze is lifted and
 //     the bus stays one server (Abandoned); nothing has changed.
-//   - One to three, failing after the conversion: one server is rendered
-//     again and the same snapshot restored into it, then the freeze is
-//     lifted (Abandoned).
+//   - One to three, failing in the conversion or after it: one server is
+//     rendered again and the same snapshot restored into it, then the
+//     freeze is lifted (Abandoned). A failed restore first clears the
+//     cluster's partial copies; a failed conversion has none to clear.
 //   - A failed undo or rollback stops at Failed, frozen for one to three,
 //     with the step a person has to take; so does a failure with no way
 //     back, after the shrink or in Releasing, where the bus stays at the
@@ -167,11 +168,20 @@ func nextBusMigrationPhase(leg busMigrationLeg, phase busMigrationPhase, abandon
 				return busMigrationStep{next: busMigrationFailed, abandoning: true, manual: "deleting the partial streams on the three servers before the rollback failed; the bus is write-frozen at three servers and the snapshot is kept on the staging volume"}
 			}
 			return busMigrationStep{next: busMigrationFailed, manual: "deleting the single server's streams before the conversion failed; the bus is write-frozen at one server and the snapshot is kept on the staging volume"}
-		case busMigrationConverting, busMigrationRestoring:
+		case busMigrationConverting:
 			if ok {
-				if phase == busMigrationConverting {
-					return busMigrationStep{next: busMigrationRestoring}
-				}
+				return busMigrationStep{next: busMigrationRestoring}
+			}
+			// No restore has run, so the cluster holds no stream to clear (the
+			// forward clear emptied server 0 and the provision Job is held),
+			// and a clear on three servers that never all came up would need
+			// a quorum they may not have. Straight back to one server, whose
+			// init step removes the cluster metadata it kept
+			// (a2aNATSStaleMetaContainer); the forward clear's record still
+			// names every stream, which lets the rollback's restore start.
+			return busMigrationStep{next: busMigrationRollingBack, abandoning: true}
+		case busMigrationRestoring:
+			if ok {
 				return busMigrationStep{next: busMigrationReleasing}
 			}
 			return busMigrationStep{next: busMigrationClearing, abandoning: true}

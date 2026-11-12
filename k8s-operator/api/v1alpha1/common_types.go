@@ -2948,9 +2948,10 @@ type BusMigrationStatus struct {
 	// +optional
 	GivenUp bool `json:"givenUp,omitempty"`
 
-	// Cleared lists the provisioned streams the current Clearing phase has
-	// deleted, ahead of the conversion or the rollback. A restore starts
-	// only once it names every one.
+	// Cleared lists the provisioned streams the latest Clearing phase has
+	// deleted, ahead of the conversion or of the rollback after a failed
+	// restore (a failed conversion rolls back on the forward clear's
+	// record). A restore starts only once it names every one.
 	// +optional
 	Cleared []string `json:"cleared,omitempty"`
 
