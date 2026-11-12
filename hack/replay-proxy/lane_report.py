@@ -24,7 +24,8 @@ which the Prow job exports). It writes, into `--out`:
   `unknown_reasons`. The recording night is the one that first wrote the
   answer, which can be as old as the bucket's lifecycle; the fetch reads runs
   that far back;
-- `summary.txt`: the commit replayed and the counts, for the job log.
+- `summary.txt`: the commit replayed and the counts. Its lines also go to the job log, where the
+  collector masks long hex runs, the commit included; the file in the bucket keeps it whole.
 
 `verdicts.json` and `summary.txt` both name the commit replayed (`commit`,
 empty when git could not say) and its source (`commit_source`: `recording`,

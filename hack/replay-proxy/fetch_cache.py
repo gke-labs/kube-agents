@@ -94,10 +94,13 @@ TIME_FORMAT = "%Y-%m-%dT%H:%M:%S"
 SECONDS_PER_HOUR = 3600
 DEFAULT_MAX_AGE_HOURS = 30.0
 # How far before the newest build's start a build may have started and still
-# be the same night (--print-commit): longer than one night's run (the
-# nightly's 8-hour deadline, its builds publishing as they grade), shorter than
-# the 24 hours between two nights.
-NIGHT_SPAN_HOURS = 12.0
+# be the same night (--print-commit). A build's start is its first record, and
+# a night's shards all start from the 00:00 UTC schedule: their first records
+# land within the first hour or so (00:27-00:47 UTC on 2026-11-11 and -12),
+# a shard that waited for a pool project somewhat later. Four hours covers that
+# and leaves out a nightly rerun from Deck later in the day, which records too
+# and would otherwise compete for the night with a day-old commit.
+NIGHT_SPAN_HOURS = 4.0
 # --print-commit's staging: each build's newest record, then a contested night's records.
 NEWEST_RECORDS_DIR = "newest"
 NIGHT_RECORDS_DIR = "night"

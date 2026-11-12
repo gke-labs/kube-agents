@@ -382,6 +382,24 @@ class PrintCommitTest(FetchTest):
         self.assertEqual((status, out), (0, COMMIT_B + "\n"))
         self.assertIn(f"name 2 commits; printing {COMMIT_B}", err)
 
+    def test_a_rerun_from_earlier_in_the_day_is_not_tonights_night(self):
+        # A Deck rerun of a nightly 11 hours before tonight's shards records under
+        # its own (older) commit, with more answers; it is not part of tonight.
+        self.record("190", 1, {VERSION: [f"answers/{fp(1)}.json", f"answers/{fp(2)}.json"]},
+                    created=NOW - 12 * HOUR, job=self.job(COMMIT_C))
+        self.record("200", 1, {VERSION: [f"answers/{fp(3)}.json"]}, created=NOW - 1 * HOUR, job=self.job(COMMIT_B))
+        night = self.fetcher().night_commit()
+        self.assertEqual((night.commit, night.builds), (COMMIT_B, ["200"]))
+
+    def test_an_answer_two_builds_of_one_commit_confirmed_counts_once(self):
+        # Two shards of commit B both confirm fp(1); commit C confirms two answers.
+        self.record("202", 1, {VERSION: [f"answers/{fp(5)}.json", f"answers/{fp(6)}.json"]},
+                    created=NOW - 3 * HOUR, job=self.job(COMMIT_C))
+        self.record("200", 1, {VERSION: [f"answers/{fp(1)}.json"]}, created=NOW - 2 * HOUR, job=self.job(COMMIT_B))
+        self.record("201", 1, {VERSION: [f"answers/{fp(1)}.json"]}, created=NOW - 1 * HOUR, job=self.job(COMMIT_B))
+        night = self.fetcher().night_commit()
+        self.assertEqual((night.commit, night.answers), (COMMIT_C, {COMMIT_B: 1, COMMIT_C: 2}))
+
     def test_no_commit_prints_nothing_and_exits_1(self):
         for name, records in (("empty bucket", ()),
                               ("records before the commit", (("200", None), ("201", ""))),
