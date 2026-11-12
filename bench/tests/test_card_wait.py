@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import http.server
 import json
+import re
 import sqlite3
 import subprocess
 import threading
@@ -365,6 +366,46 @@ def test_a_refused_cancel_then_a_task_that_finished_on_its_own_is_a_setup_error(
 def test_a_refused_cancel_does_not_wait_out_the_cancel_settle(card_wait):
     result, door, seen = card_wait(["working"], [["a2a-x"]], cancel_error=a2a_door.DoorError(-32002, "not cancelable"))
     assert seen["sent"][0] is False and door.gets <= 3
+
+
+_ALREADY_CANCELED = a2a_door.DoorError(a2a_door.ERR_TASK_NOT_CANCELABLE, "task t-1 is already canceled")
+
+
+def test_a_retried_cancel_refused_as_already_canceled_on_a_canceled_task_is_a_sent_stop(card_wait):
+    """A cancel retried after a lost response, once the bridge has emitted the
+    terminal, is refused "already canceled": the first one took, so the run
+    goes through the normal stop and is not an error."""
+    result, door, seen = card_wait(["working", "working", "canceled"], [["a2a-x"]], cancel_error=_ALREADY_CANCELED)
+    assert not _infra(result), result.errors
+    assert seen["sent"][0] is True, seen["sent"]
+    assert not any("refused" in e for e in result.errors)
+
+
+@pytest.mark.parametrize(
+    "refusal, after",
+    [
+        # The terminal reason, but the task reads as something other than canceled.
+        (_ALREADY_CANCELED, "working"),
+        # Canceled, but refused for another reason (the cancel was never published).
+        (a2a_door.DoorError(a2a_door.ERR_TASK_NOT_CANCELABLE, "cancel not published"), "canceled"),
+        # Another task's terminal reason.
+        (a2a_door.DoorError(a2a_door.ERR_TASK_NOT_CANCELABLE, "task t-1 is already completed"), "canceled"),
+        # The right words under another code.
+        (a2a_door.DoorError(-32001, "task t-1 is already canceled"), "canceled"),
+    ],
+    ids=["already-canceled-but-working", "other-reason", "already-completed", "other-code"],
+)
+def test_any_other_refused_cancel_stays_refused(card_wait, refusal, after):
+    _, _, seen = card_wait(["working", "working", after], [["a2a-x"]], cancel_error=refusal)
+    assert seen.get("sent", (False,))[0] is False
+
+
+def test_the_already_canceled_refusal_matches_the_gateways_words():
+    """The harness reads the gateway's refusal text; pin it to the source."""
+    go = (Path(__file__).resolve().parents[2] / "a2a" / "gateway" / "a2adoor.go").read_text()
+    assert 'rpcFail(req.ID, a2aErrTaskNotCancelable, "task "+params.ID+" is already "+string(task.state), nil)' in go
+    wire = (Path(__file__).resolve().parents[2] / "a2a" / "gateway" / "a2awire.go").read_text()
+    assert re.search(rf"a2aErrTaskNotCancelable\s*=\s*{a2a_door.ERR_TASK_NOT_CANCELABLE}\b", wire)
 
 
 def test_the_scorers_door_entry_name_agrees_with_the_harness():

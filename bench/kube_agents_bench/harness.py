@@ -3320,11 +3320,12 @@ class KubeAgentsHarness(AgentHarness):
             # (send_stop raises it there), so the cards are archived and
             # purged and the run is infrastructure.
             cancel_error: Exception | None = None
+            refusal: a2a_door.DoorError | None = None
             try:
                 _with_retries(lambda: door.cancel(task_id), "tasks/cancel")
                 cancel = (True, "tasks/cancel accepted after the turn filed its card")
             except a2a_door.DoorError as exc:
-                cancel = (False, f"tasks/cancel refused: {exc}")
+                cancel, refusal = (False, f"tasks/cancel refused: {exc}"), exc
             except _TransportError as exc:
                 cancel, cancel_error = (False, str(exc)), exc
             final = task
@@ -3339,6 +3340,16 @@ class KubeAgentsHarness(AgentHarness):
                 # A refused cancel settles nothing: one read, to tell a task
                 # that finished on its own from one still working.
                 final = _with_retries(lambda: door.get(task_id), "tasks/get")
+                # A cancel retried after a lost response is refused "already
+                # canceled" once the bridge has emitted the terminal (the
+                # gateway checks the terminal first): the first one took, and
+                # the task shows it. Any other refusal stays one.
+                if (
+                    refusal is not None
+                    and a2a_door.refused_as_already_canceled(refusal)
+                    and a2a_door.task_state(final) == a2a_door.STATE_CANCELED
+                ):
+                    cancel = (True, "tasks/cancel accepted: a retry was refused as already canceled, and the task is canceled")
             final_state = a2a_door.task_state(final)
             final_seen = final_state in a2a_door.TERMINAL_STATES
             result.trajectory.append({

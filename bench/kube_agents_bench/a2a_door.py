@@ -42,6 +42,12 @@ TOKEN_SECRET_KEY = "token"  # a Secret key name, not a credential
 TERMINAL_STATES = frozenset({"completed", "failed", "canceled", "rejected"})
 #: The state of a task an executor is running.
 STATE_WORKING = "working"
+#: The state of a task its cancel ended.
+STATE_CANCELED = "canceled"
+#: The JSON-RPC code the door refuses a cancel with (the gateway's
+#: a2aErrTaskNotCancelable): a task already ended, or a cancel it could not
+#: publish.
+ERR_TASK_NOT_CANCELABLE = -32002
 
 
 class DoorUnavailable(RuntimeError):
@@ -60,6 +66,15 @@ class DoorError(RuntimeError):
     def __init__(self, code: int, message: str) -> None:
         super().__init__(f"A2A door error {code}: {message}")
         self.code = code
+        self.reason = message
+
+
+def refused_as_already_canceled(exc: DoorError) -> bool:
+    """Whether a cancel was refused because the task is already canceled: the
+    gateway checks a task's terminal before the cancel it already published,
+    so a cancel retried after a lost response, once the bridge has emitted
+    the terminal, is refused this way though the first one took."""
+    return exc.code == ERR_TASK_NOT_CANCELABLE and exc.reason.endswith(f" is already {STATE_CANCELED}")
 
 
 @dataclass
