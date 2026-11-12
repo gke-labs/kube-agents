@@ -250,6 +250,33 @@ func TestASingleServerHasLoadedTheSecretsListOnceTheReloadLands(t *testing.T) {
 	}
 }
 
+// The AgentProfile reconciler reads the CR as stored, never resolved. With
+// no server count recorded (a served CRD that prunes status.busReplicas, or
+// before the first status write) and none asked for, a single server is read
+// by the shape its StatefulSet was rendered for, not as the default three:
+// otherwise every new profile's card would wait on a cluster annotation a
+// single server never carries.
+func TestAnUnrecordedSingleServerIsReadByItsRenderedShape(t *testing.T) {
+	rendered := a2aSingleServerTestAgent()
+	b := newHoldBus(rendered) // a one-server template
+	b.sts.Generation = 1
+	b.sts.Status.ObservedGeneration = 1
+	b.sts.Status.UpdatedReplicas = 1
+	b.sts.Status.CurrentRevision, b.sts.Status.UpdateRevision = "bus-a", "bus-a"
+	b.pod(0, "bus-a")
+	stored := a2aTestAgent() // no record, no tuning
+	stored.Status.BusReplicas = 0
+	b.agent = stored
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: a2aNATSConfigSecretName(stored), Namespace: stored.Namespace,
+			Annotations: map[string]string{a2aConfigProfilesAnnotation: "x,y"}},
+		Data: map[string][]byte{a2aNATSConfKey: []byte("conf")},
+	}
+	if got := loadedList(loadedOrFatal(t, b.client(secret), stored)); got != "x,y" {
+		t.Errorf("loaded = %q, want the single server's Secret list x,y", got)
+	}
+}
+
 // The config Secret records the server's previous list from the pass that
 // changes the config, carries it while the server may still run the earlier
 // one, and drops it once the server is settled with no reload pending.
@@ -431,6 +458,97 @@ func TestANewlyBoundProfileIsHeldUntilTheBusHasLoadedIt(t *testing.T) {
 	}
 }
 
+// A refused profile is neither dispatchable nor held: nothing will ever load
+// it, so holding it would requeue every pass for as long as it exists. And
+// the split is over the profiles the identity map resolves to: a live
+// profile whose ServiceAccount an older one now claims is refused there, so
+// it leaves the dispatcher too, rather than staying in it while the callout
+// maps its ServiceAccount to the older profile.
+func TestTheSplitLeavesRefusedProfilesOut(t *testing.T) {
+	agent := a2aTestAgent()
+	agent.Status.BusReplicas = 3
+	b := newHoldBus(agent)
+	b.revision(t, "bus-a", "x,newer", true)
+	b.sts.Status.UpdateRevision = "bus-a"
+	b.pod(0, "bus-a")
+	applied, err := json.Marshal(a2aDispatchConfig{Profiles: []a2aDispatchProfile{{Name: "x"}, {Name: "newer"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: a2aDispatchConfigName(agent), Namespace: agent.Namespace},
+		Data:       map[string]string{a2aDispatchConfigKey: string(applied)},
+	}
+	r := &PlatformAgentReconciler{Client: b.client(cm), Scheme: setupScheme()}
+	early, late := metav1.NewTime(time.Now().Add(-time.Hour)), metav1.NewTime(time.Now())
+	shared := func(p *agentv1alpha1.AgentProfile) { p.Spec.Identity.ServiceAccountName = "shared-sa" }
+	profiles := []agentv1alpha1.AgentProfile{
+		testAgentProfile(agent.Namespace, "x"),
+		testAgentProfile(agent.Namespace, "bad.name"), // refused: not a dot-free label
+		testAgentProfile(agent.Namespace, "newer", shared, func(p *agentv1alpha1.AgentProfile) { p.CreationTimestamp = late }),
+		testAgentProfile(agent.Namespace, "older", shared, func(p *agentv1alpha1.AgentProfile) { p.CreationTimestamp = early }),
+	}
+	dispatchable, held, err := r.a2aDispatchableProfiles(context.Background(), agent, profiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, p := range dispatchable {
+		names = append(names, p.Name)
+	}
+	if !slices.Equal(names, []string{"x"}) || !slices.Equal(held, []string{"older"}) {
+		t.Errorf("dispatchable %v, held %v; want [x] and [older]", names, held)
+	}
+}
+
+// A profile still draining that is bound again before the bus has loaded it
+// is held, and keeps draining until it is dispatchable: its drain and its
+// supervisor grant don't end the moment it is re-created.
+func TestADrainingProfileBoundAgainKeepsDrainingWhileHeld(t *testing.T) {
+	withDispatcher(t)
+	withOperatorBusPrincipal(t)
+	agent := a2aTestAgent()
+	b := newHoldBus(agent)
+	b.revision(t, "bus-a", "", true)
+	b.sts.Status.UpdateRevision = "bus-a"
+	b.pod(0, "bus-a")
+	until := metav1.NewTime(time.Now().Add(time.Hour).Truncate(time.Second))
+	applied, err := json.Marshal(a2aDispatchConfig{Profiles: []a2aDispatchProfile{{Name: "auditor", Tiers: []string{"read"}, Concurrency: 1, DrainingUntil: until.Time}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: a2aDispatchConfigName(agent), Namespace: agent.Namespace},
+		Data:       map[string]string{a2aDispatchConfigKey: string(applied)},
+	}
+	p := testAgentProfile(agent.Namespace, "auditor")
+	extra := append([]client.Object{b.sts, chartProfileNamespace(agent), &p, cm}, b.objs...)
+	r, cl, req := a2aGateTestReconciler(t, agent, extra...)
+	ctx := context.Background()
+	for i := range 3 {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d: %v", i+1, err)
+		}
+	}
+	got := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aDispatchConfigName(agent)}, got); err != nil {
+		t.Fatal(err)
+	}
+	var cfg a2aDispatchConfig
+	if err := json.Unmarshal([]byte(got.Data[a2aDispatchConfigKey]), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range cfg.Profiles {
+		if e.Name == "auditor" {
+			if e.DrainingUntil.IsZero() {
+				t.Errorf("the re-bound held profile is listed live before the bus has it: %+v", e)
+			}
+			return
+		}
+	}
+	t.Errorf("the re-bound held profile left the dispatch config, ending its drain: %s", got.Data[a2aDispatchConfigKey])
+}
+
 // A held profile keeps its own identities in the map, but the dispatcher's
 // grant leaves out its supervisor subjects until it is dispatchable.
 func TestAHeldProfileIsOutOfTheDispatchersGrantOnly(t *testing.T) {
@@ -604,6 +722,46 @@ func TestAFoldedReloadIsNotConfirmedByTheFirstMove(t *testing.T) {
 	}
 	if config.Annotations[a2aBusReloadBaselineAnnotation] != "t1" || config.Annotations[a2aBusReloadFoldedAnnotation] != "" {
 		t.Errorf("the wait didn't re-arm off the new load time: %v", config.Annotations)
+	}
+}
+
+// A second config written after the first had already landed, before the
+// recheck saw it, is not folded: the bus owes one reload, for the new write,
+// and its move confirms it rather than re-arming a wait nothing ends but the
+// bound's restart of the only server.
+func TestAWriteAfterTheEarlierReloadLandedIsNotFolded(t *testing.T) {
+	r, agent, sts, _ := a2aReloadFixture(t, "v1", map[string]string{
+		a2aBusReloadRequestedAnnotation: time.Date(2026, 11, 9, 22, 0, 0, 0, time.UTC).Format(time.RFC3339Nano),
+		a2aBusReloadBaselineAnnotation:  "t0",
+	})
+	now := time.Date(2026, 11, 9, 22, 0, 10, 0, time.UTC)
+	r.busConfigLoadTime = func(context.Context, *agentv1alpha1.PlatformAgent) (string, error) { return "t1", nil } // v1 landed
+	config := a2aDesiredConfig(agent, "v2")
+	if _, err := r.planA2ABusReload(context.Background(), agent, config, sts.DeepCopy(), now); err != nil {
+		t.Fatal(err)
+	}
+	if config.Annotations[a2aBusReloadFoldedAnnotation] != "" {
+		t.Fatalf("a write after the earlier reload landed is marked folded: %v", config.Annotations)
+	}
+	if config.Annotations[a2aBusReloadBaselineAnnotation] != "t1" {
+		t.Fatalf("baseline %q, want the load time v1 left, t1", config.Annotations[a2aBusReloadBaselineAnnotation])
+	}
+
+	live := &corev1.Secret{}
+	if err := r.Get(context.Background(), types.NamespacedName{Name: config.Name, Namespace: config.Namespace}, live); err != nil {
+		t.Fatal(err)
+	}
+	live.Data[a2aNATSConfKey], live.Annotations = []byte("v2"), config.Annotations
+	if err := r.Update(context.Background(), live); err != nil {
+		t.Fatal(err)
+	}
+	r.busConfigLoadTime = func(context.Context, *agentv1alpha1.PlatformAgent) (string, error) { return "t2", nil } // v2 landed
+	plan, err := r.planA2ABusReload(context.Background(), agent, a2aDesiredConfig(agent, "v2"), sts.DeepCopy(), now.Add(20*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plan.reloaded {
+		t.Errorf("plan = %+v: v2's move did not confirm its reload", plan)
 	}
 }
 

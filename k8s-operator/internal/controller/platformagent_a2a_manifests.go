@@ -6772,13 +6772,6 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 			profiles = nil
 		}
 	}
-	// The profiles still draining (#5074), read once from the applied
-	// dispatch config for both renders: the identity map keeps their
-	// .supervisor grant exactly as long as the dispatch config lists them.
-	draining, err := r.dispatchDraining(ctx, agent, profiles)
-	if err != nil {
-		return state, err
-	}
 	// The profiles the dispatcher may take: a newly bound one waits until
 	// every bus server has loaded its config entry, the gateway's deny on its
 	// supervisor subjects (platformagent_a2a_profile_hold.go). The bus config
@@ -6786,6 +6779,16 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// dispatch config carry only these. While any waits, the pass looks again
 	// at the reload's recheck.
 	dispatchable, held, err := r.a2aDispatchableProfiles(ctx, agent, profiles)
+	if err != nil {
+		return state, err
+	}
+	// The profiles still draining (#5074), read once from the applied
+	// dispatch config for both renders: the identity map keeps their
+	// .supervisor grant exactly as long as the dispatch config lists them.
+	// Against the dispatchable set, not every bound profile: a draining
+	// profile bound again before the bus has loaded it is held, so it keeps
+	// draining until it is dispatchable.
+	draining, err := r.dispatchDraining(ctx, agent, dispatchable)
 	if err != nil {
 		return state, err
 	}

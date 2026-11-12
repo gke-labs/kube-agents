@@ -184,8 +184,15 @@ func (r *PlatformAgentReconciler) planA2ABusReload(ctx context.Context, agent *a
 			baseline = ""
 		}
 		stampA2ABusReload(config, now.UTC().Format(time.RFC3339Nano), baseline)
+		// Folded only while the earlier write is still unloaded: a load time
+		// already off the pending record's baseline is that write landing
+		// before the recheck saw it, and the bus then owes one reload, this
+		// one, which its next move confirms. A load time that couldn't be
+		// read, now or then, can't tell, and folds.
 		if _, pending := live.Annotations[a2aBusReloadRequestedAnnotation]; pending {
-			config.Annotations[a2aBusReloadFoldedAnnotation] = "true"
+			if prior := live.Annotations[a2aBusReloadBaselineAnnotation]; baseline == "" || prior == "" || baseline == prior {
+				config.Annotations[a2aBusReloadFoldedAnnotation] = "true"
+			}
 		}
 		return a2aBusReload{requeue: a2aBusReloadRecheck, busUID: busUID}, nil
 	}

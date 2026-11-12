@@ -178,7 +178,7 @@ func a2aBusLoadedProfiles(ctx context.Context, reader client.Reader, agent *agen
 		// A cluster by the render or by what runs: a bus converting to one
 		// server is read as the cluster it still is, since a single
 		// server's Secret list from the cluster's time was never confirmed.
-		if a2aNATSReplicas(agent) > 1 || a2aBusRunsAsCluster(sts) {
+		if a2aBusRenderedAsCluster(agent, sts) || a2aBusRunsAsCluster(sts) {
 			loaded, err = a2aClusterLoadedProfiles(ctx, reader, sts)
 		} else {
 			loaded, err = a2aServerLoadedProfiles(ctx, reader, agent)
@@ -191,6 +191,20 @@ func a2aBusLoadedProfiles(ctx context.Context, reader client.Reader, agent *agen
 		return a2aLoadedProfiles{}, err
 	}
 	return loadedNames(loaded), nil
+}
+
+// a2aBusRenderedAsCluster reports whether the bus is rendered as a cluster:
+// by the server count recorded in status, or, with none recorded, by the
+// shape the live StatefulSet's template was rendered for, as
+// resolveA2ABusReplicas does before it renders. The AgentProfile reconciler
+// reads the CR as stored, never resolved, and a served CRD that prunes
+// status.busReplicas, or a pass before the first status write, leaves no
+// record; the default count would then read a single server as a cluster.
+func a2aBusRenderedAsCluster(agent *agentv1alpha1.PlatformAgent, sts *appsv1.StatefulSet) bool {
+	if r := agent.Status.BusReplicas; r == 1 || r == 3 {
+		return r > 1
+	}
+	return a2aNATSRenderedReplicas(sts) > 1
 }
 
 // a2aBusRunsAsCluster reports whether the live StatefulSet asks for, or
@@ -289,7 +303,7 @@ func controllerRevisionProfiles(rev *appsv1.ControllerRevision) (map[string]bool
 // a2aServerLoadedProfiles reads a single server's loaded set off its config
 // Secret: the list the Secret renders, narrowed to the previous list while a
 // reload is pending or the server isn't yet settled on this config
-// (a2aSingleBusSettled). A pending reload with no previous list recorded (one
+// (a2aSingleBusSettledOn). A pending reload with no previous list recorded (one
 // stamped before this was) loads nothing new.
 func a2aServerLoadedProfiles(ctx context.Context, reader client.Reader, agent *agentv1alpha1.PlatformAgent) (map[string]bool, error) {
 	live := &corev1.Secret{}
@@ -322,17 +336,12 @@ func a2aServerLoadedFrom(ctx context.Context, reader client.Reader, agent *agent
 	return loaded, nil
 }
 
-// a2aSingleBusSettled reports whether a single server can only be running
+// a2aSingleBusSettledOn reports whether a single server can only be running
 // the config Secret as it is now: the StatefulSet has observed its template
 // and rolled every replica onto it, and the server pod is not terminating (a
 // pod deleted for a failed reload still serves its old config until it
-// exits). No StatefulSet, or no pod, runs nothing older.
-func a2aSingleBusSettled(ctx context.Context, reader client.Reader, agent *agentv1alpha1.PlatformAgent) (bool, error) {
-	return a2aSingleBusSettledOn(ctx, reader, agent, "")
-}
-
-// a2aSingleBusSettledOn is a2aSingleBusSettled that also requires the live
-// pod template to carry hash, when one is given: a StatefulSet still on an
+// exits). No StatefulSet, or no pod, runs nothing older. When hash is given,
+// the live pod template must also carry it: a StatefulSet still on an
 // earlier template has a roll to come, however settled it reads.
 func a2aSingleBusSettledOn(ctx context.Context, reader client.Reader, agent *agentv1alpha1.PlatformAgent, hash string) (bool, error) {
 	sts := &appsv1.StatefulSet{}
@@ -482,10 +491,10 @@ func (r *PlatformAgentReconciler) dispatchConfigLiveProfiles(ctx context.Context
 	return live, nil
 }
 
-// a2aDispatchableProfiles splits the bound profiles into the ones the
-// dispatcher may take (every bus server has loaded the profile's config, or
-// the dispatch config already lists it live) and the names of the ones
-// held until the bus has.
+// a2aDispatchableProfiles splits the bound profiles the identity map admits
+// into the ones the dispatcher may take (every bus server has loaded the
+// profile's config, or the dispatch config already lists it live) and the
+// names of the ones held until the bus has. A refused profile is in neither.
 func (r *PlatformAgentReconciler) a2aDispatchableProfiles(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) ([]agentv1alpha1.AgentProfile, []string, error) {
 	if len(profiles) == 0 {
 		return profiles, nil, nil
@@ -498,9 +507,17 @@ func (r *PlatformAgentReconciler) a2aDispatchableProfiles(ctx context.Context, a
 	if err != nil {
 		return nil, nil, err
 	}
+	// Over the profiles the identity map resolves to: a refused one is
+	// neither, since nothing will load it and the dispatch config skips it
+	// anyway, and a live one an older profile's claim has displaced leaves
+	// the dispatcher with its map entry.
+	resolved := resolveAgentProfileIdentities(agent, profiles)
 	dispatchable := make([]agentv1alpha1.AgentProfile, 0, len(profiles))
 	var held []string
 	for _, p := range profiles {
+		if resolved[p.Name].refused != nil {
+			continue
+		}
 		if loaded.has(p.Name) || live[p.Name] {
 			dispatchable = append(dispatchable, p)
 		} else {
