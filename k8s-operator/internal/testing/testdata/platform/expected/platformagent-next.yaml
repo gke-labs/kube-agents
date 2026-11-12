@@ -2927,6 +2927,30 @@ metadata:
 ---
 apiVersion: v1
 data:
+  tiers.json: |
+    {
+      "tiers": []
+    }
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: tiers
+  name: platformagent-a2a-tiers
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
+apiVersion: v1
+data:
   identities.json: |
     {
       "version": "97c8c35dd2e8d6af",
@@ -5274,30 +5298,6 @@ metadata:
       name: platformagent
       uid: ""
 spec: {}
----
-apiVersion: v1
-data:
-  tiers.json: |
-    {
-      "tiers": []
-    }
-kind: ConfigMap
-metadata:
-  labels:
-    app.kubernetes.io/instance: kubeagents-system-platformagent
-    app.kubernetes.io/managed-by: platformagent-controller
-    app.kubernetes.io/name: platform-agent
-    app.kubernetes.io/part-of: a2a-next
-    kubeagents.x-k8s.io/a2a-component: tiers
-  name: platformagent-a2a-tiers
-  namespace: kubeagents-system
-  ownerReferences:
-    - apiVersion: kubeagents.x-k8s.io/v1alpha1
-      blockOwnerDeletion: true
-      controller: true
-      kind: PlatformAgent
-      name: platformagent
-      uid: ""
 ---
 apiVersion: batch/v1
 kind: Job

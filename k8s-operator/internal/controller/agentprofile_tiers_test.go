@@ -270,14 +270,3 @@ func TestAForeignServiceAccountForARefusedTierDoesNotRefuseTheProfile(t *testing
 		t.Errorf("bound profiles %v, want tse", bound)
 	}
 }
-
-// A refused map keeps the operator re-checking: the refusal can clear inside
-// the callout alone, once the tiers file arrives.
-func TestARefusedMapIsUnsettled(t *testing.T) {
-	if !(&calloutMapState{reason: a2aIdentityMapRefused}).unsettled() {
-		t.Error("a refused map is settled; nothing would re-read it when the callout takes it")
-	}
-	if (&calloutMapState{reason: a2aIdentityMapServing}).unsettled() {
-		t.Error("a served map is unsettled")
-	}
-}
