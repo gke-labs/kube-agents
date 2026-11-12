@@ -41,25 +41,50 @@ class TagGoModulesScriptTest(unittest.TestCase):
         self.temp_dir, self.repo_dir, self.git = create_mock_git_repo()
         self.addCleanup(self.temp_dir.cleanup)
 
-    def _run_script(self, args, env=None):
+    def _run_script(self, args, env=None, bin_dir=None):
         return subprocess.run(
             ["bash", str(_TAG_GO_MODULES_SH)] + args,
             capture_output=True,
             text=True,
-            env=get_isolated_test_env(overrides={**_NO_PROXY, **(env or {})}),
+            env=get_isolated_test_env(overrides={**_NO_PROXY, **(env or {})}, bin_dir=bin_dir),
             cwd=self.repo_dir,
         )
 
-    def _commit_module(self):
+    def _commit_module(self, module_path=_MODULE_PATH):
         module = pathlib.Path(self.repo_dir) / _MODULE_DIR
         module.mkdir()
-        (module / "go.mod").write_text(f"module {_MODULE_PATH}\n\ngo 1.27.0\n")
+        (module / "go.mod").write_text(f"module {module_path}\n\ngo 1.27.0\n")
         self.git("add", ".")
         self.git("commit", "-m", "feat: add module")
         return self.git("rev-parse", "HEAD").stdout.strip()
 
-    def _tag_ga(self, commit):
-        self.git("tag", "-a", MOCK_TARGET_RELEASE_TAG, commit, "-m", f"Release {MOCK_TARGET_RELEASE_TAG}")
+    def _tag_ga(self, commit, version=MOCK_TARGET_RELEASE_TAG):
+        self.git("tag", "-a", version, commit, "-m", f"Release {version}")
+
+    def _tags(self):
+        return self.git("tag", "-l").stdout.split()
+
+    def _ci_origin(self):
+        """A bare origin standing in for the release repository, as test_tag_ga_release.py does."""
+        bare = pathlib.Path(self.repo_dir).parent / "origin.git"
+        self.git("init", "--bare", str(bare))
+        self.git("remote", "add", "origin", str(bare))
+        self.git(
+            "config",
+            f"url.{bare}.insteadOf",
+            f"https://github.com/{_FAKE_RELEASE_REPO['GH_ORG']}/{_FAKE_RELEASE_REPO['GH_REPO']}.git",
+        )
+        return bare
+
+    def _stub_curl(self, exit_code):
+        """A curl on PATH that records its arguments and exits with exit_code."""
+        bin_dir = pathlib.Path(self.repo_dir).parent / "bin"
+        bin_dir.mkdir()
+        log = bin_dir / "curl.log"
+        curl = bin_dir / "curl"
+        curl.write_text(f'#!/usr/bin/env bash\necho "$@" >> "{log}"\nexit {exit_code}\n')
+        curl.chmod(0o755)
+        return bin_dir, log
 
     def _commit_after(self):
         (pathlib.Path(self.repo_dir) / "later.txt").write_text("after the release\n")
@@ -116,13 +141,32 @@ class TagGoModulesScriptTest(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn(f"Tag '{_MODULE_TAG}' already exists but points to commit {other}", proc.stderr)
 
-    def test_refuses_when_the_module_is_absent_at_the_release_commit(self):
+    def test_skips_a_module_absent_at_the_release_commit(self):
+        # A patch on a line cut before the module existed: the GA tag is already
+        # pushed, so failing would hold the release short on every re-run.
         self._tag_ga(self.git("rev-parse", "HEAD").stdout.strip())
         self._commit_module()
 
         proc = self._run_script([MOCK_TARGET_RELEASE_TAG])
-        self.assertNotEqual(proc.returncode, 0)
-        self.assertIn(f"{_MODULE_DIR}/go.mod does not exist at release commit", proc.stderr)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(f"{_MODULE_DIR}/go.mod does not exist at release commit", proc.stdout)
+        self.assertNotIn(_MODULE_TAG, self._tags())
+
+    def test_skips_a_module_whose_path_does_not_match_its_directory(self):
+        self._tag_ga(self._commit_module(module_path="example.com/elsewhere"))
+
+        proc = self._run_script([MOCK_TARGET_RELEASE_TAG])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("declares module 'example.com/elsewhere'", proc.stdout)
+        self.assertNotIn(_MODULE_TAG, self._tags())
+
+    def test_tags_nothing_past_major_zero(self):
+        self._tag_ga(self._commit_module(), version="1.0.0")
+
+        proc = self._run_script(["1.0.0"])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("past major 0", proc.stdout)
+        self.assertNotIn(f"{_MODULE_DIR}/v1.0.0", self._tags())
 
     def test_off_ci_nothing_is_pushed(self):
         self._tag_ga(self._commit_module())
@@ -139,18 +183,38 @@ class TagGoModulesScriptTest(unittest.TestCase):
     def test_in_ci_pushes_the_module_tag(self):
         release_commit = self._commit_module()
         self._tag_ga(release_commit)
-        bare = pathlib.Path(self.repo_dir).parent / "origin.git"
-        self.git("init", "--bare", str(bare))
-        self.git("remote", "add", "origin", str(bare))
-        self.git(
-            "config",
-            f"url.{bare}.insteadOf",
-            f"https://github.com/{_FAKE_RELEASE_REPO['GH_ORG']}/{_FAKE_RELEASE_REPO['GH_REPO']}.git",
-        )
+        bare = self._ci_origin()
 
         proc = self._run_script([MOCK_TARGET_RELEASE_TAG], env={"CI": "true", **_FAKE_RELEASE_REPO})
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self._tag_commit(_MODULE_TAG, git_dir=bare), release_commit)
+
+    def test_in_ci_asks_the_module_proxy_for_the_new_version(self):
+        self._tag_ga(self._commit_module())
+        self._ci_origin()
+        bin_dir, log = self._stub_curl(0)
+
+        proc = self._run_script(
+            [MOCK_TARGET_RELEASE_TAG],
+            env={"CI": "true", "GO_MODULE_PROXY_URL": "https://proxy.test", **_FAKE_RELEASE_REPO},
+            bin_dir=bin_dir,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(f"https://proxy.test/{_MODULE_PATH}/@v/v{MOCK_TARGET_RELEASE_TAG}.info", log.read_text())
+
+    def test_a_module_proxy_failure_is_a_warning(self):
+        self._tag_ga(self._commit_module())
+        bare = self._ci_origin()
+        bin_dir, _ = self._stub_curl(22)
+
+        proc = self._run_script(
+            [MOCK_TARGET_RELEASE_TAG],
+            env={"CI": "true", "GO_MODULE_PROXY_URL": "https://proxy.test", **_FAKE_RELEASE_REPO},
+            bin_dir=bin_dir,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("fetches the tag on first request", proc.stderr)
+        self.assertTrue(self._tag_commit(_MODULE_TAG, git_dir=bare))
 
 
 class PublishedGoModulesTest(unittest.TestCase):

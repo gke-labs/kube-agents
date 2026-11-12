@@ -98,6 +98,6 @@ go get github.com/gke-labs/kube-agents/k8s-api-proxy@latest  # or @vX.Y.Z
 ```
 
 The module is v0: `Config`, `Policy` and its modes, `CallerAuthenticator`, `UpstreamTransport`,
-`AuditSink`, `CacheStore` and `AuditEvent` may change in any release. The binary's flags and
-environment variables are stable. The version moves with every kube-agents release, whether or not
-this module changed.
+`AuditSink`, `CacheStore` and `AuditEvent` may change in any release. The version moves with every
+kube-agents release, whether or not this module changed; a release at `1.0.0` or later tags no
+module until the module's own versioning is decided.
