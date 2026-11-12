@@ -1355,3 +1355,91 @@ func TestAConditionWriteThatFailsDoesNotHoldTheDelete(t *testing.T) {
 		t.Errorf("the Job was not deleted when only the condition write failed")
 	}
 }
+
+// TASKS lost partway through a confirmation run is dropped by the run's
+// intersection, so the attempt doesn't name it, yet the re-run recreates it.
+// Its readers are still owed the restart.
+func TestTasksLostPartwayThroughARunStillRestartsItsClients(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	rig.serve(1, allStreamsBut("KV_cap")...)
+	rig.poll()
+	rig.serve(1, allStreamsBut("KV_cap", "TASKS")...)
+	rig.poll()
+	rig.poll()
+	last := readBusReprovisionRecord(rig.agent()).last()
+	if last == nil || slices.Contains(last.Missing, "TASKS") || !last.TasksMissing {
+		t.Fatalf("attempt = %+v, want KV_cap confirmed and TASKS remembered as missing", last)
+	}
+	rig.recreateJob(batchv1.JobComplete)
+	rig.serve(1, a2aProvisionedStreams...)
+	rig.poll()
+	for _, pod := range []string{"test-agent-a2a-gateway-abc", "test-agent-gateway-xyz"} {
+		if !slices.Contains(rig.deleted, pod) {
+			t.Errorf("deleted %v, want %s restarted after the re-run recreated TASKS", rig.deleted, pod)
+		}
+	}
+	if c := rig.condition(); c == nil || c.Reason != busStreamsReasonAllPresent {
+		t.Errorf("condition = %+v, want AllPresent once the restart is done", c)
+	}
+}
+
+// A run whose polls never saw TASKS missing owes no restart.
+func TestAKVOnlyRunOwesNoRestart(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	rig.serve(1, allStreamsBut("KV_cap")...)
+	rig.poll()
+	rig.poll()
+	rig.poll()
+	rig.recreateJob(batchv1.JobComplete)
+	rig.serve(1, a2aProvisionedStreams...)
+	rig.poll()
+	if slices.Contains(rig.deleted, "test-agent-a2a-gateway-abc") || slices.Contains(rig.deleted, "test-agent-gateway-xyz") {
+		t.Errorf("deleted %v: no poll of the run saw TASKS missing", rig.deleted)
+	}
+}
+
+// A re-run that settles more than the rate-limit window after its attempt
+// keeps the attempt: an owed restart that fails on the settling poll is still
+// owed, and retried, on the next.
+func TestALateSettlementKeepsItsAttempt(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	rig.serve(1, allStreamsBut("TASKS")...)
+	rig.poll()
+	rig.poll()
+	rig.poll()
+	// The re-run doesn't complete for seven hours (no Job: every poll is gated).
+	rig.now = rig.now.Add(7 * time.Hour)
+	rig.recreateJob(batchv1.JobComplete)
+	rig.serve(1, a2aProvisionedStreams...)
+	rig.podDeleteErr = errors.New("etcdserver: request timed out")
+	if err := rig.poller.pollAgent(context.Background(), rig.agent()); err == nil {
+		t.Fatalf("poll succeeded with the restart failing")
+	}
+	rig.now = rig.now.Add(busStreamsPollInterval)
+	last := readBusReprovisionRecord(rig.agent()).last()
+	if last == nil || !last.Settled || !last.RestartOwed || last.Restarted {
+		t.Fatalf("attempt after the late settlement = %+v, want it kept, settled, restart owed", last)
+	}
+	rig.podDeleteErr = nil
+	rig.poll()
+	if !slices.Contains(rig.deleted, "test-agent-gateway-xyz") {
+		t.Errorf("deleted %v: the owed restart was lost with the attempt", rig.deleted)
+	}
+}
+
+// The last attempt survives pruning whatever its age; older ones outside the
+// window go, and only attempts inside it count toward the rate limit.
+func TestPruningKeepsTheLastAttempt(t *testing.T) {
+	now := busStreamsTestNow
+	rec := busReprovisionRecord{Attempts: []busReprovisionAttempt{{At: now.Add(-9 * time.Hour)}, {At: now.Add(-8 * time.Hour), Missing: []string{"TASKS"}}}}
+	got := rec.pruned(now)
+	if len(got.Attempts) != 1 || !got.Attempts[0].At.Equal(now.Add(-8*time.Hour)) {
+		t.Fatalf("pruned = %+v, want only the last attempt", got.Attempts)
+	}
+	if ok, _ := got.allows(now); !ok {
+		t.Errorf("a kept attempt outside the window blocked a re-run")
+	}
+}

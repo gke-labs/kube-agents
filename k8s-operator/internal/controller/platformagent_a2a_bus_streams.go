@@ -360,7 +360,10 @@ type busReprovisionAttempt struct {
 	// restarted. Owed and not yet restarted is retried on every poll that
 	// finds TASKS present, and holds the condition back from AllPresent.
 	RestartOwed bool `json:"restartOwed,omitempty"`
-	Restarted   bool `json:"restarted,omitempty"`
+	// TasksMissing is whether any poll of the run that confirmed the loss
+	// found TASKS missing, whether or not TASKS is in Missing.
+	TasksMissing bool `json:"tasksMissing,omitempty"`
+	Restarted    bool `json:"restarted,omitempty"`
 }
 
 func readBusReprovisionRecord(agent *agentv1alpha1.PlatformAgent) busReprovisionRecord {
@@ -402,8 +405,13 @@ func (rec busReprovisionRecord) allows(now time.Time) (bool, time.Time) {
 
 func (rec busReprovisionRecord) pruned(now time.Time) busReprovisionRecord {
 	var kept []busReprovisionAttempt
-	for _, attempt := range rec.Attempts {
-		if now.Sub(attempt.At) < busStreamsReprovisionWindow {
+	for i, attempt := range rec.Attempts {
+		// The last attempt is kept whatever its age: it may still be in
+		// force (unsettled, a restart owed, or a stop), and a re-run that
+		// took longer than the window to settle must not lose it. allows
+		// counts only attempts inside the window, so keeping it costs no
+		// rate limit.
+		if now.Sub(attempt.At) < busStreamsReprovisionWindow || i == len(rec.Attempts)-1 {
 			kept = append(kept, attempt)
 		}
 	}
@@ -415,6 +423,11 @@ type busStreamStreak struct {
 	// missing is the set every poll in the current run found missing.
 	missing map[string]bool
 	misses  int
+	// tasksMissing is whether any poll in the current run found TASKS
+	// missing, even one the run's intersection later dropped it from: a
+	// re-run recreates every stream, TASKS included, so its readers are
+	// owed a restart whenever TASKS was lost before the re-run.
+	tasksMissing bool
 	// unknown counts polls in a row that had nothing to judge by.
 	unknown int
 }
@@ -541,14 +554,14 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 		// No verdict while the bus rolls, converts or provisions: a stream
 		// the Job is about to create, or a server still joining, is not a
 		// loss. The run starts again afterwards.
-		streak.missing, streak.misses, streak.unknown = nil, 0, 0
+		streak.missing, streak.misses, streak.unknown, streak.tasksMissing = nil, 0, 0, false
 		return nil
 	}
 
 	readings := p.scrapeServers(ctx, agent, sts)
 	verdict := busStreamsVerdictFor(int(busServers(sts)), readings)
 	if !verdict.known {
-		streak.missing, streak.misses = nil, 0
+		streak.missing, streak.misses, streak.tasksMissing = nil, 0, false
 		streak.unknown++
 		if streak.unknown < busStreamsConfirmPolls {
 			return nil
@@ -571,7 +584,7 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 	if reRan {
 		// TASKS is back whatever else still isn't: its two durable readers
 		// need restarting now, not once every stream returns.
-		last.RestartOwed = slices.Contains(last.Missing, a2aTasksStream) && !slices.Contains(verdict.missing, a2aTasksStream)
+		last.RestartOwed = (slices.Contains(last.Missing, a2aTasksStream) || last.TasksMissing) && !slices.Contains(verdict.missing, a2aTasksStream)
 		last.Restored = !overlaps(last.Missing, verdict.missing)
 		last.Settled = true
 		if err := p.writeRecord(ctx, agent, record.pruned(now)); err != nil {
@@ -611,7 +624,7 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 	}
 
 	if len(verdict.missing) == 0 {
-		streak.missing, streak.misses = nil, 0
+		streak.missing, streak.misses, streak.tasksMissing = nil, 0, false
 		return p.writeCondition(ctx, agent, metav1.ConditionTrue, busStreamsReasonAllPresent,
 			fmt.Sprintf("All %d streams and KV buckets the provision Job creates were seen on the A2A bus.", len(a2aProvisionedStreams)))
 	}
@@ -626,13 +639,16 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 		}
 	}
 	if len(shared) == 0 {
-		streak.misses = 0
+		streak.misses, streak.tasksMissing = 0, false
 		for _, name := range verdict.missing {
 			shared[name] = true
 		}
 	}
 	streak.missing = shared
 	streak.misses++
+	if slices.Contains(verdict.missing, a2aTasksStream) {
+		streak.tasksMissing = true
+	}
 	if streak.misses < busStreamsConfirmPolls {
 		return nil
 	}
@@ -670,7 +686,7 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 	}
 
 	record = record.pruned(now)
-	record.Attempts = append(record.Attempts, busReprovisionAttempt{At: now, Missing: confirmed, JobUID: job.UID})
+	record.Attempts = append(record.Attempts, busReprovisionAttempt{At: now, Missing: confirmed, JobUID: job.UID, TasksMissing: streak.tasksMissing})
 	if err := p.writeRecord(ctx, agent, record); err != nil {
 		return err
 	}
@@ -698,7 +714,7 @@ func (p *BusStreamPoller) deleteProvisionJob(ctx context.Context, agent *agentv1
 	if err := p.r.Delete(ctx, job, client.Preconditions{UID: &uid}, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("failed to delete the completed A2A provision Job %s: %w", job.Name, err)
 	}
-	streak.missing, streak.misses = nil, 0
+	streak.missing, streak.misses, streak.tasksMissing = nil, 0, false
 	log.Info("re-running the A2A provision Job: provisioned streams are missing from the bus",
 		"platformagent", client.ObjectKeyFromObject(agent), "missing", missing, "job", job.Name)
 	p.r.recordEvent(agent, corev1.EventTypeWarning, busStreamsMissingEventReason,
