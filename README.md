@@ -130,7 +130,7 @@ The Platform Agent runs these audits on a schedule and posts each report to chat
 | Observability | `gke-alert-configuration`, `gke-basics`, `gke-observability`, `kube-agents-observability` |
 | Reliability | `fleet-upgrade-verification`, `gke-reliability`, `gke-upgrades`, `topology-drift`, `upgrade-readiness-brief` |
 | Manifests and remediation | `gcp-config-connector`, `gcp-terraform`, `gitops-helm-chart`, `gke-manifest-generation`, `submit-suggestion` |
-| Meta | `fleet-audit`, `fleet-audit-reports`, `github-issue-resolver`, `inspect-repository`, `kube-agents-feedback`, `pr-conversation`, `version-control` |
+| Meta | `decision-memory`, `fleet-audit`, `fleet-audit-reports`, `github-issue-resolver`, `inspect-repository`, `kube-agents-feedback`, `pr-conversation`, `version-control` |
 | Cluster Agent (per-cluster runtime) | `gke-load-bearing-change`, `gke-observability`, `gke-reliability`, `gke-rightsizing-checks`, `gke-stall-detection`, `gke-storage`, `gke-workload-scaling`, `gke-workload-security`, `gke-workload-troubleshooting`, `pod-container-creating`, `pod-crashloop-oom`, `pod-pending-scheduling`, `service-connectivity`, `topology-drift`, `workload-triage-scan` |
 | GKE Support Agent (tse) | `support-escalation-bundle` |
 
