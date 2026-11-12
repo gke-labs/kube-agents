@@ -842,6 +842,11 @@ func renderManagedEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agentPlugins
 	// would hand it a declaration it authored; with it, save_env_value refuses the key
 	// and the ConfigMap stays the only answer to "what is declared".
 	add(scopeFileEnvKey, scopeDir+"/"+scopeFileName)
+	// The resolved scope's path, pinned for the same reason, under mode next only
+	// (the scope publisher's ConfigMap exists only there; #5621).
+	if scopePublisherRendered(agent) {
+		add(resolvedScopeFileEnvKey, resolvedScopeDir+"/"+scopeResolvedDataKey)
+	}
 
 	// RECONCILE_PROJECT, pinned empty. The reconcile reads it as the management project
 	// first, and since the scope prune exists a management identity that changes
@@ -3486,6 +3491,9 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		Name:  scopeFileEnvKey,
 		Value: scopeDir + "/" + scopeFileName,
 	})
+	if scopePublisherRendered(agent) {
+		envVars = append(envVars, corev1.EnvVar{Name: resolvedScopeFileEnvKey, Value: resolvedScopeDir + "/" + scopeResolvedDataKey})
+	}
 	// The managed .env pins RECONCILE_PROJECT empty (renderManagedEnv says why), and the
 	// two renders must agree, so the container env carries the same empty value.
 	envVars = append(envVars, corev1.EnvVar{Name: reconcileProjectEnvKey, Value: ""})
@@ -5761,6 +5769,9 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 		userVolumeMounts = append(userVolumeMounts, extraVolumeMounts...)
 	}
 	volumeMounts := append(dropTmpScratchIfClaimed(buildDefaultVolumeMounts(homeDir), userVolumeMounts), userVolumeMounts...)
+	if scopePublisherRendered(agent) {
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{Name: resolvedScopeVolumeName, MountPath: resolvedScopeDir, ReadOnly: true})
+	}
 	// The staged SSH key, read-only. Only the emptyDir the init container wrote —
 	// the container that opens the connection has no reason to see the Secret mount
 	// the init container read from.
@@ -6168,7 +6179,7 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 
 // buildDefaultVolumes generates the default volumes for PlatformAgent
 func buildDefaultVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
-	return []corev1.Volume{
+	vols := []corev1.Volume{
 		{
 			Name: "platform-agent-data-vol",
 			VolumeSource: corev1.VolumeSource{
@@ -6288,6 +6299,22 @@ func buildDefaultVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
 			},
 		},
 	}
+	// The scope publisher's resolved scope, under mode next only (#5621): optional,
+	// since the publisher writes the ConfigMap after the agent starts.
+	if scopePublisherRendered(agent) {
+		vols = append(vols, corev1.Volume{
+			Name: resolvedScopeVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{Name: scopeResolvedConfigMapName(agent)},
+					Items:                []corev1.KeyToPath{{Key: scopeResolvedDataKey, Path: scopeResolvedDataKey}},
+					Optional:             ptr.To(true),
+					DefaultMode:          ptr.To(int32(0444)),
+				},
+			},
+		})
+	}
+	return vols
 }
 
 // agentAllowsSecretsRead returns false when spec.security.disallowSecretsRead is true.

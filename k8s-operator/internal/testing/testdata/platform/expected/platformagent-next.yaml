@@ -421,6 +421,7 @@ data:
     KUBEAGENTS_AUTOMERGE=off
     KUBEAGENTS_DIAL=off
     KUBEAGENTS_SCOPE_FILE=/etc/kube-agents/scope.json
+    KUBEAGENTS_RESOLVED_SCOPE_FILE=/etc/kube-agents-resolved/resolved-scope.json
     RECONCILE_PROJECT=
     GKE_PROJECT_ID=example-project
     STALL_WATCH_EXCLUDE_NAMESPACES=
@@ -1817,6 +1818,8 @@ spec:
               value: /etc/hermes
             - name: KUBEAGENTS_SCOPE_FILE
               value: /etc/kube-agents/scope.json
+            - name: KUBEAGENTS_RESOLVED_SCOPE_FILE
+              value: /etc/kube-agents-resolved/resolved-scope.json
             - name: RECONCILE_PROJECT
             - name: HERMES_HOME_MODE
               value: "2770"
@@ -1937,6 +1940,9 @@ spec:
               readOnly: true
             - mountPath: /tmp
               name: tmp-scratch
+            - mountPath: /etc/kube-agents-resolved
+              name: platform-agent-resolved-scope-vol
+              readOnly: true
             - mountPath: /etc/sandbox-ssh
               name: sandbox-ssh
               readOnly: true
@@ -2099,6 +2105,8 @@ spec:
               value: /etc/hermes
             - name: KUBEAGENTS_SCOPE_FILE
               value: /etc/kube-agents/scope.json
+            - name: KUBEAGENTS_RESOLVED_SCOPE_FILE
+              value: /etc/kube-agents-resolved/resolved-scope.json
             - name: RECONCILE_PROJECT
             - name: HERMES_HOME_MODE
               value: "2770"
@@ -2208,6 +2216,9 @@ spec:
               readOnly: true
             - mountPath: /tmp
               name: tmp-scratch
+            - mountPath: /etc/kube-agents-resolved
+              name: platform-agent-resolved-scope-vol
+              readOnly: true
             - mountPath: /etc/sandbox-ssh
               name: sandbox-ssh
               readOnly: true
@@ -2445,6 +2456,14 @@ spec:
         - emptyDir:
             sizeLimit: 2Gi
           name: tmp-scratch
+        - configMap:
+            defaultMode: 292
+            items:
+              - key: resolved-scope.json
+                path: resolved-scope.json
+            name: platformagent-resolved-scope
+            optional: true
+          name: platform-agent-resolved-scope-vol
         - emptyDir:
             sizeLimit: 2Gi
           name: credential-proxy-tmp
