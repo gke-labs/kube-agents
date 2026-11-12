@@ -1191,16 +1191,16 @@ func busMigrationStageSize() resource.Quantity {
 	return *resource.NewQuantity(n*gib, resource.BinarySI)
 }
 
-// buildBusStagePVC is the run's staging volume, ReadWriteOncePod so only
-// one pod at a time holds it: the snapshot pod writes it, then the hashing
-// pod reads it, then a restore pod does, and no second pod can open it in
-// between. The cluster's default StorageClass, as the bus's own claims use.
 // busStageClaimUsable reports a staging claim the snapshot may write to:
 // this PlatformAgent controls it and it is not being deleted.
 func busStageClaimUsable(pvc *corev1.PersistentVolumeClaim, agent *agentv1alpha1.PlatformAgent) bool {
 	return metav1.IsControlledBy(pvc, agent) && pvc.DeletionTimestamp == nil
 }
 
+// buildBusStagePVC is the run's staging volume, ReadWriteOncePod so only
+// one pod at a time holds it: the snapshot pod writes it, then the hashing
+// pod reads it, then a restore pod does, and no second pod can open it in
+// between. The cluster's default StorageClass, as the bus's own claims use.
 func buildBusStagePVC(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus) *corev1.PersistentVolumeClaim {
 	return &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
