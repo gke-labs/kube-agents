@@ -345,7 +345,7 @@ class RuntimeTest(unittest.TestCase):
         needed = {"clean_merges_needed": 5, "days_needed": 2}
         for counts, expected in (
             ([], "0 of 5 clean merges"),
-            ([entry(REPO, clean=5, days=1, ready=False)], "org/infra: 5 of 5 clean merges, on 1 of 2 days"),
+            ([entry(REPO, clean=5, days=1, ready=False)], "org/infra: 5 of 5 clean merges, on 1 of 2 separate days"),
             ([entry(REPO, clean=7, days=3, ready=True)], "org/infra: 5 of 5 clean merges"),
             (["garbage", entry(REPO, kind="other")], "0 of 5 clean merges"),
         ):
