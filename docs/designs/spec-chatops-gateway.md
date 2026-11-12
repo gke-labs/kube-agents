@@ -498,7 +498,7 @@ checked (target, parameters, the lists, depth) before it mints any, so one entry
 the whole batch with nothing minted. Its children don't take the conversation's active task or
 its addressee: the delegating turn keeps both, and each child records its parent, which lists them
 all. A child that can't be submitted partway through withdraws the batch: the children already
-submitted are canceled and every child of the batch is dropped from the record. A batch of one is a
+submitted are canceled and dropped from the record, except one whose cancel couldn't be published, which stays on it, marked canceled, so a stop and the reaper can still find it. A batch of one is a
 single child, which takes the active task as before. Width bounds what one conversation asks for,
 not what runs at once: children queue at the dispatcher, held to each profile's concurrency. At the
 `cluster` profile's default concurrency of 2, ten children run two at a time, about five rounds

@@ -1038,7 +1038,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			if g.cfg.DisplayMode == displayModeDefault {
 				progress = ""
 			}
-			g.renderLine(rec.Key, parent.StatusMsgID, doneTerminalLine(s.Status.State, progress, doneLine != ""), rs, "")
+			g.renderLine(rec.Key, parent.StatusMsgID, withLineNote(doneTerminalLine(s.Status.State, progress, doneLine != ""), parent.LineNote), rs, "")
 		}
 		setParentLine(rec, taskID, "")
 		if source == TerminalFromExecutor {

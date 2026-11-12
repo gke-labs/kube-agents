@@ -3200,7 +3200,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		ref.RootTaskID = taskID
 	}
 	if ts.KeepActive {
-		ref.StatusMsgID = statusMsgID
+		ref.StatusMsgID, ref.LineNote = statusMsgID, ts.LineNote
 	}
 	ref.BatchIndex, ref.Target = ts.BatchIndex, ts.Target
 	if ts.Role == "" {
