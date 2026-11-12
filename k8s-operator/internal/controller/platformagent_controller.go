@@ -1459,7 +1459,8 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// workload is written, and Pods are not watched here. Requeue while the picture is
 	// still incomplete so both the failure and the later recovery reach plugin status.
 	if pluginStatusNeedsRecheck(agentPlugins, phase == "Ready") {
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		// The TASKS wait's threshold pass may be due sooner (below).
+		return ctrl.Result{RequeueAfter: minPositive(tasksWaitRequeue, 30*time.Second)}, nil
 	}
 
 	// A2A provisioning still running — Jobs are not watched (see a2aReader),
@@ -1498,7 +1499,8 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if a2aState.busReloadRequeue > 0 {
 			requeue = min(requeue, a2aState.busReloadRequeue)
 		}
-		return ctrl.Result{RequeueAfter: requeue}, nil
+		// So can the TASKS wait's threshold pass (a2aGatewayTasksWaitMessage).
+		return ctrl.Result{RequeueAfter: minPositive(tasksWaitRequeue, requeue)}, nil
 	}
 
 	// An out-of-date ClusterRole is fixed by someone re-applying the manifests,
@@ -1521,7 +1523,8 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if credentialProxyExecShort(instance) {
 			requeue = min(requeue, credentialProxyExecShortRequeue)
 		}
-		return ctrl.Result{RequeueAfter: requeue}, nil
+		// And the TASKS wait's threshold pass (a2aGatewayTasksWaitMessage).
+		return ctrl.Result{RequeueAfter: minPositive(tasksWaitRequeue, requeue)}, nil
 	}
 
 	// Secret material reaches the gateway as environment, and a container's
