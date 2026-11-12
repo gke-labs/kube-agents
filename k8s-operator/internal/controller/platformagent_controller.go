@@ -665,9 +665,9 @@ type PlatformAgentReconciler struct {
 	// busConfigLoadTime stands in for reading the A2A bus's config_load_time
 	// from its monitoring endpoint (a2aBusConfigLoadTime). Nil reads it.
 	busConfigLoadTime func(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, error)
-	// busStreamBytes stands in for reading each bus stream's stored bytes
-	// from the monitoring endpoint (a2aBusStreamBytes), in tests.
-	busStreamBytes func(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (map[string]int64, error)
+	// busStreamState stands in for reading each bus stream's state from the
+	// monitoring endpoint (a2aBusStreamState), in tests.
+	busStreamState func(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error)
 
 	// clusterImageVolumes caches the cluster-wide ImageVolume capability. Server
 	// version cannot change without an API server restart, so resolving it once

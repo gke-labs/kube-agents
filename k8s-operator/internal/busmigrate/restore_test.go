@@ -67,7 +67,7 @@ func TestOneToThreeKeepsTheBus(t *testing.T) {
 
 	tampered := append([]byte(nil), data["TASKS"]...)
 	tampered[len(tampered)/2] ^= 0xff
-	if err := RestoreVerified(ctx, nc, metas["TASKS"].Config, metas["TASKS"].State, opener(tampered), digests["TASKS"], policyOf(withReplicas(rendered["TASKS"], 1))); !errors.Is(err, ErrDigestMismatch) {
+	if err := RestoreVerified(ctx, nc, metas["TASKS"].Config, metas["TASKS"].State, metas["TASKS"].TakenAt, opener(tampered), digests["TASKS"], policyOf(withReplicas(rendered["TASKS"], 1))); !errors.Is(err, ErrDigestMismatch) {
 		t.Fatalf("a snapshot changed after hashing: %v, want ErrDigestMismatch", err)
 	}
 	if _, err := streamInfo(ctx, nc, "TASKS"); err == nil {
@@ -85,7 +85,7 @@ func TestOneToThreeKeepsTheBus(t *testing.T) {
 		return io.NopCloser(bytes.NewReader(tampered)), nil
 	}
 	for i := 0; ; i++ {
-		err := RestoreVerified(ctx, nc, metas["TASKS"].Config, metas["TASKS"].State, late, digests["TASKS"], policyOf(withReplicas(rendered["TASKS"], 1)))
+		err := RestoreVerified(ctx, nc, metas["TASKS"].Config, metas["TASKS"].State, metas["TASKS"].TakenAt, late, digests["TASKS"], policyOf(withReplicas(rendered["TASKS"], 1)))
 		if errors.Is(err, ErrDigestMismatch) {
 			break
 		}
@@ -102,7 +102,7 @@ func TestOneToThreeKeepsTheBus(t *testing.T) {
 	for _, n := range streams {
 		var err error
 		for i := 0; i < 30; i++ {
-			if err = RestoreVerified(ctx, nc, metas[n].Config, metas[n].State, opener(data[n]), digests[n], policyOf(withReplicas(rendered[n], 1))); err == nil {
+			if err = RestoreVerified(ctx, nc, metas[n].Config, metas[n].State, metas[n].TakenAt, opener(data[n]), digests[n], policyOf(withReplicas(rendered[n], 1))); err == nil {
 				break
 			}
 			t.Logf("restore %s attempt %d: %v", n, i, err)
@@ -218,7 +218,7 @@ func TestASnapshotConfigOutsideThePolicySendsNothing(t *testing.T) {
 	defer sub.Unsubscribe()
 	widened := meta.Config
 	widened.Subjects = []string{"a2a.>"}
-	if err := RestoreVerified(ctx, nc, widened, meta.State, opener(buf.Bytes()), Digest(buf.Bytes()), policy); !errors.Is(err, ErrOutsidePolicy) {
+	if err := RestoreVerified(ctx, nc, widened, meta.State, meta.TakenAt, opener(buf.Bytes()), Digest(buf.Bytes()), policy); !errors.Is(err, ErrOutsidePolicy) {
 		t.Fatalf("a widened snapshot config: %v, want ErrOutsidePolicy", err)
 	}
 	if err := nc.Flush(); err != nil {
@@ -227,7 +227,7 @@ func TestASnapshotConfigOutsideThePolicySendsNothing(t *testing.T) {
 	if sent != 0 {
 		t.Errorf("%d RESTORE requests sent for a config outside the policy", sent)
 	}
-	if err := RestoreVerified(ctx, nc, meta.Config, meta.State, opener(buf.Bytes()), Digest(buf.Bytes()), policy); err != nil {
+	if err := RestoreVerified(ctx, nc, meta.Config, meta.State, meta.TakenAt, opener(buf.Bytes()), Digest(buf.Bytes()), policy); err != nil {
 		t.Fatalf("the snapshot's own config, inside the policy: %v", err)
 	}
 }

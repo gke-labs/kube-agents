@@ -689,7 +689,7 @@ func TestTheBusServerCountIsStickyAndAChangeStartsAMigration(t *testing.T) {
 			objs := append([]client.Object{agent}, tc.objects(agent)...)
 			agent.Status.BusReplicas = tc.recorded
 			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).Build(), Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8),
-				busStreamBytes: emptyBusStreams}
+				busStreamState: emptyBusStreams}
 			if err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
 				t.Fatal(err)
 			}
@@ -1262,7 +1262,7 @@ func TestStrayClaimsDoNotOutvoteTheRecordedServerCount(t *testing.T) {
 			}
 			rec := record.NewFakeRecorder(8)
 			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).Build(), Scheme: setupScheme(), Recorder: rec,
-				busStreamBytes: emptyBusStreams}
+				busStreamState: emptyBusStreams}
 			if err := r.resolveA2ABusReplicas(context.Background(), agent); err != nil {
 				t.Fatal(err)
 			}
@@ -1426,7 +1426,7 @@ func TestAFieldChangeStartsAMigration(t *testing.T) {
 			agent := a2aTestAgent()
 			agent.Generation = 4
 			agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(tc.spec)}}
-			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(append([]client.Object{agent}, tc.objects(agent)...)...).Build(), Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8), busStreamBytes: emptyBusStreams}
+			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(append([]client.Object{agent}, tc.objects(agent)...)...).Build(), Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8), busStreamState: emptyBusStreams}
 			if err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
 				t.Fatal(err)
 			}
@@ -1716,10 +1716,14 @@ func TestAClusterRollsOntoAProfileChangeInsteadOfReloading(t *testing.T) {
 	}
 }
 
-// emptyBusStreams is a bus whose streams hold nothing: no stream is over its
-// cap, so a one to three migration may start.
-func emptyBusStreams(context.Context, *agentv1alpha1.PlatformAgent) (map[string]int64, error) {
-	return map[string]int64{}, nil
+// emptyBusStreams is a bus whose provisioned streams hold nothing: none is
+// over a limit, so a one to three migration may start.
+func emptyBusStreams(context.Context, *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error) {
+	streams := map[string]a2aBusStream{}
+	for _, p := range a2aStreamPolicies(1) {
+		streams[p.Name] = a2aBusStream{}
+	}
+	return streams, nil
 }
 
 // One server to three restores every stream under the cap this operator
@@ -1729,26 +1733,34 @@ func emptyBusStreams(context.Context, *agentv1alpha1.PlatformAgent) (map[string]
 // A stream at its cap exactly, and a shrink, start as before.
 func TestAStreamOverItsCapRefusesAGrowBeforeTheFreeze(t *testing.T) {
 	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
-	tasksCap := int64(0)
+	var tasks busmigratePolicy
 	for _, p := range a2aStreamPolicies(1) {
 		if p.Name == "TASKS" {
-			tasksCap = p.MaxBytes
+			tasks = busmigratePolicy{p.MaxBytes, p.MaxAge}
 		}
 	}
+	with := func(name string, st a2aBusStream) map[string]a2aBusStream {
+		m, _ := emptyBusStreams(context.Background(), nil)
+		m[name] = st
+		return m
+	}
+	now := time.Now()
 	for _, tc := range []struct {
 		name      string
 		single    bool
 		ask       int
-		streams   map[string]int64
+		streams   map[string]a2aBusStream
 		readErr   error
 		wantStart bool
 		wantWarn  string
 	}{
-		{"TASKS over its cap", true, 3, map[string]int64{"TASKS": tasksCap + 1}, nil, false, "TASKS holds"},
+		{"TASKS over its cap", true, 3, with("TASKS", a2aBusStream{Bytes: tasks.maxBytes + 1}), nil, false, "TASKS holds"},
+		{"TASKS keeps a message past its max age", true, 3, with("TASKS", a2aBusStream{Bytes: 1, Msgs: 1, FirstTime: now.Add(-tasks.maxAge - time.Hour)}), nil, false, "older than its"},
 		{"the sizes can't be read", true, 3, nil, errors.NewServiceUnavailable("no monitor"), false, "could not be read"},
-		{"TASKS at its cap", true, 3, map[string]int64{"TASKS": tasksCap}, nil, true, ""},
-		{"a stream the policies don't name", true, 3, map[string]int64{"SOMETHING_ELSE": 1 << 40}, nil, true, ""},
-		{"a shrink isn't checked", false, 1, map[string]int64{"TASKS": tasksCap + 1}, nil, true, ""},
+		{"a report listing none of the streams", true, 3, map[string]a2aBusStream{}, nil, false, "lists none"},
+		{"TASKS at its cap, inside its age", true, 3, with("TASKS", a2aBusStream{Bytes: tasks.maxBytes, Msgs: 1, FirstTime: now.Add(-time.Hour)}), nil, true, ""},
+		{"a stream the policies don't name", true, 3, with("SOMETHING_ELSE", a2aBusStream{Bytes: 1 << 40}), nil, true, ""},
+		{"a shrink isn't checked", false, 1, with("TASKS", a2aBusStream{Bytes: tasks.maxBytes + 1}), nil, true, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			agent := a2aTestAgent()
@@ -1760,14 +1772,13 @@ func TestAStreamOverItsCapRefusesAGrowBeforeTheFreeze(t *testing.T) {
 			agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(tc.ask)}}
 			rec := record.NewFakeRecorder(8)
 			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent, sts).Build(), Scheme: setupScheme(), Recorder: rec,
-				busStreamBytes: func(context.Context, *agentv1alpha1.PlatformAgent) (map[string]int64, error) {
+				busStreamState: func(context.Context, *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error) {
 					return tc.streams, tc.readErr
 				}}
 			if err := r.resolveA2ABusReplicas(context.Background(), agent); err != nil {
 				t.Fatal(err)
 			}
-			started := agent.Status.BusMigration != nil
-			if started != tc.wantStart {
+			if started := agent.Status.BusMigration != nil; started != tc.wantStart {
 				t.Fatalf("migration %+v, want started=%v", agent.Status.BusMigration, tc.wantStart)
 			}
 			if tc.wantWarn == "" {
@@ -1782,5 +1793,29 @@ func TestAStreamOverItsCapRefusesAGrowBeforeTheFreeze(t *testing.T) {
 				t.Error("no Warning saying why the migration did not start")
 			}
 		})
+	}
+}
+
+// busmigratePolicy is the two limits the pre-check reads off a policy.
+type busmigratePolicy struct {
+	maxBytes int64
+	maxAge   time.Duration
+}
+
+// The decoder reads the fields nats-server's /jsz?streams=true reports, in
+// a body captured from nats-server v2.14.5 (account and stream trimmed to
+// one each): bytes, messages and the oldest message's time per stream.
+func TestTheJszReportDecodesEachStreamsState(t *testing.T) {
+	body := `{"server_id":"x","now":"2026-11-12T00:20:12Z","config":{},"memory":0,"storage":55,"streams":1,
+		"account_details":[{"name":"TRUSTED","id":"TRUSTED","stream_detail":[{"name":"TASKS","created":"2026-11-12T00:20:12Z",
+		"state":{"messages":1,"bytes":55,"first_seq":1,"first_ts":"2026-11-12T00:20:12.227001Z","last_seq":1,
+		"last_ts":"2026-11-12T00:20:12.227001Z","num_subjects":1,"consumer_count":0}}]}]}`
+	got, err := decodeA2AJsz("jsz", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := a2aBusStream{Bytes: 55, Msgs: 1, FirstTime: time.Date(2026, 11, 12, 0, 20, 12, 227001000, time.UTC)}
+	if got["TASKS"] != want {
+		t.Errorf("TASKS = %+v, want %+v", got["TASKS"], want)
 	}
 }

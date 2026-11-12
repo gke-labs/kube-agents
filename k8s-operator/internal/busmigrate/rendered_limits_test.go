@@ -49,7 +49,7 @@ func restoreTasksUnder(t *testing.T, meta *Metadata, data []byte, policy StreamP
 		t.Fatal(err)
 	}
 	defer sub.Unsubscribe()
-	err = RestoreVerified(context.Background(), nc, meta.Config, meta.State, opener(data), Digest(data), policy)
+	err = RestoreVerified(context.Background(), nc, meta.Config, meta.State, meta.TakenAt, opener(data), Digest(data), policy)
 	if ferr := nc.Flush(); ferr != nil {
 		t.Fatal(ferr)
 	}
@@ -105,7 +105,8 @@ func TestASnapshotOverTheRenderedBytesIsRefused(t *testing.T) {
 	}
 }
 
-// A snapshot whose oldest message is older than the rendered max_age is
+// A snapshot whose oldest message was already older than the rendered
+// max_age when it was taken (a stream an earlier install kept longer) is
 // refused the same way.
 func TestASnapshotOlderThanTheRenderedAgeIsRefused(t *testing.T) {
 	meta, data := snapshotTasks(t)
@@ -115,12 +116,40 @@ func TestASnapshotOlderThanTheRenderedAgeIsRefused(t *testing.T) {
 	policy := policyOf(meta.Config)
 	policy.MaxAge = time.Second
 	time.Sleep(1100 * time.Millisecond)
+	meta.TakenAt = time.Now().UTC() // taken once the oldest message was past max_age
 	err, sent, _ := restoreTasksUnder(t, meta, data, policy)
 	if !errors.Is(err, ErrOverRenderedLimits) {
 		t.Fatalf("err = %v, want ErrOverRenderedLimits", err)
 	}
 	if sent != 0 {
 		t.Errorf("%d RESTORE requests sent for a snapshot older than the rendered max_age", sent)
+	}
+}
+
+// A stream inside the rendered max_age when its snapshot was taken is
+// restored though its oldest message ages past it during the freeze: the
+// live bus trims to the same age, so the restored stream's own max_age
+// trims only what the bus would have dropped anyway.
+func TestAStreamThatAgedDuringTheFreezeIsRestored(t *testing.T) {
+	meta, data := snapshotTasks(t)
+	if meta.TakenAt.IsZero() || meta.State.FirstTime.IsZero() {
+		t.Fatal("the snapshot records no time, or the seed no oldest message")
+	}
+	policy := policyOf(meta.Config)
+	policy.MaxAge = 3 * time.Minute // at least the stream's 2m duplicate window
+	// Taken a minute after the oldest message: inside max_age then, so it
+	// is restored whatever the time is now.
+	inside := meta
+	inside.TakenAt = meta.State.FirstTime.Add(time.Minute)
+	if err, _, _ := restoreTasksUnder(t, inside, data, policy); err != nil {
+		t.Fatalf("taken inside max_age: err = %v, want the stream restored", err)
+	}
+	// Taken four minutes after it: past max_age then, so it is refused,
+	// though only seconds have passed since the seed.
+	past := meta
+	past.TakenAt = meta.State.FirstTime.Add(4 * time.Minute)
+	if err, _, _ := restoreTasksUnder(t, past, data, policy); !errors.Is(err, ErrOverRenderedLimits) {
+		t.Fatalf("taken past max_age: err = %v, want ErrOverRenderedLimits", err)
 	}
 }
 
@@ -167,7 +196,7 @@ func TestTheWayBackRestoresAStreamThatDoesNotFitTheRender(t *testing.T) {
 	}
 	defer nc.Close()
 	ctx := context.Background()
-	if err := RestoreVerified(ctx, nc, meta.Config, meta.State, opener(data), Digest(data), policy); !errors.Is(err, ErrOverRenderedLimits) {
+	if err := RestoreVerified(ctx, nc, meta.Config, meta.State, meta.TakenAt, opener(data), Digest(data), policy); !errors.Is(err, ErrOverRenderedLimits) {
 		t.Fatalf("forward: %v, want ErrOverRenderedLimits", err)
 	}
 	if err := RestoreAsItWas(ctx, nc, meta.Config, meta.State, opener(data), Digest(data), policy); err != nil {

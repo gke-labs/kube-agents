@@ -232,7 +232,7 @@ func newMigrationRig(t *testing.T, leg busMigrationLeg, phase busMigrationPhase,
 	sts := buildA2ANATSStatefulSet(agent, "h")
 	sts.Spec.Replicas = ptr.To(running)
 	cl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent, sts).WithStatusSubresource(&appsv1.StatefulSet{}, &batchv1.Job{}, &corev1.Pod{}).Build()
-	return &migrationRig{t: t, agent: agent, cl: cl, r: &PlatformAgentReconciler{Client: cl, Scheme: setupScheme(), Recorder: record.NewFakeRecorder(16)}, sts: sts}
+	return &migrationRig{t: t, agent: agent, cl: cl, r: &PlatformAgentReconciler{Client: cl, Scheme: setupScheme(), Recorder: record.NewFakeRecorder(16), busStreamState: emptyBusStreams}, sts: sts}
 }
 
 // pass runs the resolver and checks the phase and the count it renders.

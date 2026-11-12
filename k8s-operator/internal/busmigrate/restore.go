@@ -41,6 +41,11 @@ const restoreFinishTimeout = 10 * time.Minute
 type Metadata struct {
 	Config nats.StreamConfig `json:"config"`
 	State  nats.StreamState  `json:"state"`
+	// TakenAt is when the snapshot pod took the snapshot, by its clock: the
+	// moment State describes, which the restore measures the oldest
+	// message's age from. Pinned with the rest of the file by the
+	// operator's digest. Absent in a snapshot taken before the field.
+	TakenAt time.Time `json:"takenAt,omitzero"`
 }
 
 // Digest is the hex SHA-256 of a snapshot's data, the value the operator
@@ -96,6 +101,7 @@ func Snapshot(ctx context.Context, nc *nats.Conn, name string, w io.Writer) (*Me
 	if err := request(ctx, nc, fmt.Sprintf(streamSnapshotSubject, name), body, &meta); err != nil {
 		return nil, err
 	}
+	meta.TakenAt = time.Now().UTC()
 	if meta.Config.Name != name {
 		return nil, errors.New("snapshot names another stream")
 	}
@@ -134,8 +140,11 @@ func withRenderedLimits(cfg nats.StreamConfig, policy StreamPolicy) nats.StreamC
 }
 
 // fitsRenderedLimits refuses a snapshot whose state, as its pinned metadata
-// records it, does not fit the rendered limits at now. A limit of zero or
-// less is no limit.
+// records it, does not fit the rendered limits at now: the moment the
+// snapshot was taken. Measured then, a stream the live bus already trims to
+// the rendered max_age fits, though its oldest message ages past it during
+// the freeze (the restored stream's own max_age trims that); one an earlier
+// install kept longer does not. A limit of zero or less is no limit.
 func fitsRenderedLimits(name string, state nats.StreamState, policy StreamPolicy, now time.Time) error {
 	if policy.MaxBytes > 0 && state.Bytes > uint64(policy.MaxBytes) {
 		return fmt.Errorf("stream %s: %w: the snapshot holds %d bytes, over the rendered max_bytes of %d", name, ErrOverRenderedLimits, state.Bytes, policy.MaxBytes)
@@ -168,12 +177,16 @@ type Opener func() (io.ReadCloser, error)
 // they match too. On a late mismatch it withholds that message and deletes
 // the name, which a clustered server keeps reserved after a stalled restore.
 // state is the snapshot's, which the server uses only to size the restore.
-func RestoreVerified(ctx context.Context, nc *nats.Conn, cfg nats.StreamConfig, state nats.StreamState, open Opener, wantDigest string, policy StreamPolicy) error {
+func RestoreVerified(ctx context.Context, nc *nats.Conn, cfg nats.StreamConfig, state nats.StreamState, takenAt time.Time, open Opener, wantDigest string, policy StreamPolicy) error {
 	cfg = withRenderedLimits(cfg, policy)
 	if d := policy.Check(cfg); len(d) != 0 {
 		return fmt.Errorf("stream %s: %w: %s", cfg.Name, ErrOutsidePolicy, strings.Join(d, "; "))
 	}
-	if err := fitsRenderedLimits(cfg.Name, state, policy, time.Now()); err != nil {
+	at := takenAt
+	if at.IsZero() {
+		at = time.Now()
+	}
+	if err := fitsRenderedLimits(cfg.Name, state, policy, at); err != nil {
 		return err
 	}
 	return restoreChecked(ctx, nc, cfg, state, open, wantDigest, policy)

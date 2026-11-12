@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	goerrors "errors"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"os"
@@ -1580,35 +1581,59 @@ const reasonA2ABusMigrationStreamsOverCap = "A2ABusMigrationStreamsOverCap"
 // stream's state.
 const a2aBusJszPath = "/jsz?streams=true"
 
+// a2aBusStream is one stream's state as the bus's /jsz reports it: what
+// the restore's rendered-limit check reads from the snapshot.
+type a2aBusStream struct {
+	Bytes     int64
+	Msgs      int64
+	FirstTime time.Time
+}
+
 // busMigrationStreamsOverCap says why a one to three migration can't start,
 // or "": each provisioned stream that holds more bytes than the max_bytes
-// a2aStreamPolicies renders for it, which the restore would refuse with the
-// bus already frozen. The staging volume is sized from the same caps. A
-// report the operator can't read refuses too: the check fails closed. A
-// stream the policies don't name, or one the report lacks, isn't judged here;
-// the restore's own checks hold it.
+// a2aStreamPolicies renders for it, or whose oldest message is already older
+// than the rendered max_age (a stream an earlier install kept longer). The
+// restore refuses either with the bus already frozen (busmigrate's
+// fitsRenderedLimits, which measures age at the snapshot), and the staging
+// volume is sized from the same caps. A report the operator can't read, or
+// one listing none of the provisioned streams, refuses too: the check fails
+// closed. A stream the policies don't name isn't judged here; the restore's
+// own checks hold it.
 func (r *PlatformAgentReconciler) busMigrationStreamsOverCap(ctx context.Context, agent *agentv1alpha1.PlatformAgent) string {
-	live, err := r.a2aBusStreamBytes(ctx, agent)
+	live, err := r.a2aBusStreamState(ctx, agent)
 	if err != nil {
-		return "the bus's stream sizes could not be read (" + err.Error() + "), and a stream over the cap the restore puts on it would fail the run with writes frozen"
+		return "the bus's stream sizes could not be read (" + err.Error() + "), and a stream over the limits the restore puts on it would fail the run with writes frozen"
 	}
+	now := time.Now()
 	var over []string
+	listed := 0
 	for _, p := range a2aStreamPolicies(1) {
-		if bytes, ok := live[p.Name]; ok && bytes > p.MaxBytes {
-			over = append(over, fmt.Sprintf("%s holds %d bytes, over its %d-byte cap", p.Name, bytes, p.MaxBytes))
+		st, ok := live[p.Name]
+		if !ok {
+			continue
 		}
+		listed++
+		if p.MaxBytes > 0 && st.Bytes > p.MaxBytes {
+			over = append(over, fmt.Sprintf("%s holds %d bytes, over its %d-byte cap", p.Name, st.Bytes, p.MaxBytes))
+		}
+		if p.MaxAge > 0 && st.Msgs > 0 && !st.FirstTime.IsZero() && now.Sub(st.FirstTime) > p.MaxAge {
+			over = append(over, fmt.Sprintf("%s keeps a message from %s, older than its %s max age", p.Name, st.FirstTime.UTC().Format(time.RFC3339), p.MaxAge))
+		}
+	}
+	if listed == 0 {
+		return "the bus's stream report lists none of its provisioned streams, so their sizes are unknown"
 	}
 	if len(over) == 0 {
 		return ""
 	}
-	return strings.Join(over, "; ") + ". The restore puts each stream under that cap, so wait for the stream to age under it, or lower what it holds"
+	return strings.Join(over, "; ") + ". The restore puts each stream under these limits, so wait for the stream to age under them, or lower what it holds"
 }
 
-// a2aBusStreamBytes reads each stream's stored bytes from the bus's
-// monitoring endpoint, as nats-server reports them in /jsz.
-func (r *PlatformAgentReconciler) a2aBusStreamBytes(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (map[string]int64, error) {
-	if r.busStreamBytes != nil {
-		return r.busStreamBytes(ctx, agent)
+// a2aBusStreamState reads each stream's state from the bus's monitoring
+// endpoint, as nats-server reports it in /jsz.
+func (r *PlatformAgentReconciler) a2aBusStreamState(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error) {
+	if r.busStreamState != nil {
+		return r.busStreamState(ctx, agent)
 	}
 	ctx, cancel := context.WithTimeout(ctx, a2aBusVarzTimeout)
 	defer cancel()
@@ -1625,24 +1650,32 @@ func (r *PlatformAgentReconciler) a2aBusStreamBytes(ctx context.Context, agent *
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("%s answered %s", url, resp.Status)
 	}
+	return decodeA2AJsz(url, resp.Body)
+}
+
+// decodeA2AJsz reads /jsz's per-stream state, keyed by stream name. Only one
+// account (TRUSTED) runs JetStream, so names don't collide across accounts.
+func decodeA2AJsz(url string, body io.Reader) (map[string]a2aBusStream, error) {
 	var jsz struct {
 		AccountDetails []struct {
 			Streams []struct {
 				Name  string `json:"name"`
 				State struct {
-					Bytes int64 `json:"bytes"`
+					Bytes     int64     `json:"bytes"`
+					Msgs      int64     `json:"messages"`
+					FirstTime time.Time `json:"first_ts"`
 				} `json:"state"`
 			} `json:"stream_detail"`
 		} `json:"account_details"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&jsz); err != nil {
+	if err := json.NewDecoder(body).Decode(&jsz); err != nil {
 		return nil, fmt.Errorf("decoding %s: %w", url, err)
 	}
-	bytes := map[string]int64{}
+	streams := map[string]a2aBusStream{}
 	for _, account := range jsz.AccountDetails {
 		for _, stream := range account.Streams {
-			bytes[stream.Name] = stream.State.Bytes
+			streams[stream.Name] = a2aBusStream{Bytes: stream.State.Bytes, Msgs: stream.State.Msgs, FirstTime: stream.State.FirstTime}
 		}
 	}
-	return bytes, nil
+	return streams, nil
 }

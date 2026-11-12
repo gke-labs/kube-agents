@@ -299,7 +299,7 @@ func restoreAll(ctx context.Context, nc *nats.Conn, streams []string, dir string
 			// and a snapshot that does not fit them refused. Into one, the
 			// way back: the stream as it was.
 			if replicas > 1 {
-				err = RestoreVerified(ctx, nc, meta.Config, meta.State, open, want.Data, policy)
+				err = RestoreVerified(ctx, nc, meta.Config, meta.State, meta.TakenAt, open, want.Data, policy)
 			} else {
 				err = RestoreAsItWas(ctx, nc, meta.Config, meta.State, open, want.Data, policy)
 			}
