@@ -85,8 +85,9 @@ ROW_CONFIRMED_AT = "confirmedAt"
 DOC_NUMBERS = rec.NUMBERS_KEY
 DOC_CARRIED = "carried"
 # A third optional key the gateway and the operator do not read (#5621): the clusters of each
-# **member project** a probe listed, for the agent's helper scripts, which read them through
-# `fleet_scope_targets.py`. Member projects only: the management project and explicit projects
+# **member project** a probe listed, for the agent's helper scripts (their reader in
+# `fleet_scope_targets.py` comes next, #5621). It counts toward the document's budget, and goes
+# first when the document is over it (encode_document). Member projects only: the management project and explicit projects
 # are never probed here (the broker's `scope` role runs `clusters list` only for a project an
 # earlier lookup returned), so a reader lists those itself. Keyed by project ID:
 # {"at": <when the listing was read>, "clusters": [[location, name], ...]}. A probe that fails
@@ -402,6 +403,10 @@ def _clean_clusters(value) -> dict:
         if not (isinstance(project, str) and isinstance(entry, dict) and isinstance(entry.get(CLUSTERS_AT), str)
                 and isinstance(entry.get(CLUSTERS_LIST), list)):
             continue
+        try:
+            datetime.strptime(entry[CLUSTERS_AT], rec.SNAPSHOT_TIME_FORMAT)
+        except ValueError:
+            continue
         pairs = entry[CLUSTERS_LIST]
         if not all(isinstance(p, list) and len(p) == 2 and all(isinstance(v, str) for v in p) for p in pairs):
             continue
@@ -451,10 +456,22 @@ def write_document(namespace: str, name: str, text: str, resource_version: str |
 
 
 def encode_document(document: dict) -> str:
-    """The document as compact JSON, or the `too-large` document when it is over the budget."""
+    """The document as compact JSON, or the `too-large` document when it is over the budget.
+
+    The `clusters` map goes first: it is for the helper scripts, and the rows are what the
+    gateway admits on, so a document whose rows fit is published without the map rather than
+    as `too-large` with no rows. A reader then finds every member unread until a run fits.
+    """
     text = json.dumps(document, separators=(",", ":"), ensure_ascii=False)
     if len(text.encode("utf-8")) <= MAX_DOCUMENT_BYTES:
         return text
+    if DOC_CLUSTERS in document:
+        rows_only = {key: value for key, value in document.items() if key != DOC_CLUSTERS}
+        text = json.dumps(rows_only, separators=(",", ":"), ensure_ascii=False)
+        if len(text.encode("utf-8")) <= MAX_DOCUMENT_BYTES:
+            log(f"the resolved scope with the clusters map is over the {MAX_DOCUMENT_BYTES}-byte budget; "
+                f"publishing the rows without it, so every member's cluster list reads unread.")
+            return text
     log(f"the resolved scope is {len(text.encode('utf-8'))} bytes, over the {MAX_DOCUMENT_BYTES}-byte "
         f"budget; publishing {STATE_TOO_LARGE} with no rows.")
     # The number memo rides along: it is what keeps a number entry excluding its project on

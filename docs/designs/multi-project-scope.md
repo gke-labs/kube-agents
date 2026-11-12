@@ -399,7 +399,8 @@ probe listed, `{"<project>": {"at": <when>, "clusters": [[location, name], ...]}
 agent's helper scripts ([`scheduling-on-profiles.md`](scheduling-on-profiles.md), section 8). It
 covers member projects only, since the management project and explicit projects are never
 probed. A probe that fails keeps the previous entry, `at` included, and never writes an empty list
-for a project it could not read. The `projects` rows don't change with it. The operator starts
+for a project it could not read. The `projects` rows don't change with it. The map counts toward the 900 KiB budget, but it is
+dropped first: a document whose rows fit is published without it rather than as `too-large`. The operator starts
 it as a Job every 15 minutes, when the membership fields change, and at creation. The broker's
 `scope` caller role admits only the lookups' five argv shapes, each on an argument the broker's
 own copy of `scope.json` declares or an earlier lookup returned. The gateway checks a profile

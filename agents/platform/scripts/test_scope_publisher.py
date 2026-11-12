@@ -99,7 +99,9 @@ class FakeBroker:
     holds the arguments whose call times out. Every call is recorded in `calls`.
     """
 
-    def __init__(self, assets=None, xpn=None, scopes=None, names=None, probes=None, fail=None, timeouts=()):
+    def __init__(self, assets=None, xpn=None, scopes=None, names=None, probes=None, fail=None, timeouts=(),
+                 listings=None):
+        self.listings = listings or {}
         self.assets, self.xpn, self.scopes = assets or {}, xpn or {}, scopes or {}
         self.names, self.probes, self.fail = names or {}, probes or {}, fail or {}
         self.timeouts = set(timeouts)
@@ -121,7 +123,7 @@ class FakeBroker:
         if shape == SHAPE_PROBE:
             if argument in self.probes:
                 return self._answer(argv, check, "", self.probes[argument], 1)
-            return self._answer(argv, check, "prod us-central1\n", "", 0)
+            return self._answer(argv, check, self.listings.get(argument, "prod us-central1\n"), "", 0)
         if shape == SHAPE_ASSET_SEARCH:
             projects = self.assets.get(argument, [])
             self.window.update(projects)
@@ -1457,11 +1459,43 @@ class ClustersMapTest(unittest.TestCase):
             "bad-pair": {"at": PREVIOUS_TIME, "clusters": [["us-east1"]]},
             "bad-type": {"at": PREVIOUS_TIME, "clusters": "us-east1/a"},
             "not-a-dict": ["us-east1", "a"],
+            "bad-at": {"at": "yesterday", "clusters": [["us-east1", "a"]]},
         }})
         self.assertEqual(pub.parse_document(raw)["clusters"],
                          {"ok": {"at": PREVIOUS_TIME, "clusters": [["us-east1", "a"]]}})
         self.assertNotIn("clusters", pub.parse_document(json.dumps(
             {"v": 1, "resolvedAt": PREVIOUS_TIME, "state": "ok", "projects": []})))
+
+    def test_the_map_is_dropped_before_the_rows_are(self):
+        # The map is for helper scripts. Past the budget it goes first, so it
+        # can never cost the gateway the rows it admits on.
+        rows = [{"id": f"p{i:029d}", "via": ["folders/111111111111"], "outcome": "ok",
+                 "confirmedAt": PREVIOUS_TIME} for i in range(4000)]
+        clusters = {r["id"]: {"at": PREVIOUS_TIME, "clusters": [["us-central1", f"cluster-{j:02d}"] for j in range(10)]}
+                    for r in rows}
+        doc = {"v": 1, "resolvedAt": PREVIOUS_TIME, "memberHash": MEMBER_HASH_VECTOR_HASH,
+               "state": pub.STATE_OK, "excludedProjects": [], "projects": rows, "clusters": clusters}
+        with mock.patch.object(pub, "log") as log:
+            published = json.loads(pub.encode_document(doc))
+        self.assertEqual(published["state"], pub.STATE_OK)
+        self.assertEqual(len(published["projects"]), 4000)
+        self.assertNotIn("clusters", published)
+        self.assertTrue(any("cluster" in str(c) for c in log.call_args_list), "dropping the map is logged")
+
+    def test_an_ok_probe_with_no_clusters_writes_an_empty_list(self):
+        previous = {"v": 1, "resolvedAt": PREVIOUS_TIME, "state": "ok", "projects": [
+            {"id": "team-a", "via": [FOLDER_A], "outcome": "ok", "confirmedAt": PREVIOUS_TIME}],
+            "clusters": {"team-a": {"at": PREVIOUS_TIME, "clusters": [["us-east1", "gone"]]}}}
+        broker = FakeBroker(assets={FOLDER_A: ["team-a"]}, listings={"team-a": ""})
+        document = self._build(broker, _scope(folders=[FOLDER_A.split("/")[1]]), previous)
+        self.assertEqual(document["clusters"]["team-a"], {"at": document["resolvedAt"], "clusters": []})
+
+    def test_the_listing_is_sorted(self):
+        broker = FakeBroker(assets={FOLDER_A: ["team-a"]},
+                            listings={"team-a": "zeta us-west1\nalpha us-west1\nbeta asia-east1\n"})
+        document = self._build(broker, _scope(folders=[FOLDER_A.split("/")[1]]))
+        self.assertEqual(document["clusters"]["team-a"]["clusters"],
+                         [["asia-east1", "beta"], ["us-west1", "alpha"], ["us-west1", "zeta"]])
 
     def test_a_thousand_clusters_fit_well_inside_the_budget(self):
         # The design's target: about 40 bytes a cluster, so 1,000 clusters across 100
