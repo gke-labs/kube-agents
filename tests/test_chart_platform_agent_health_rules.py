@@ -232,11 +232,17 @@ class HealthRulesRenderTest(unittest.TestCase):
         image = ["--set", "operator.extraEnv[0].name=A2A_NATS_IMAGE", "--set", "operator.extraEnv[0].value=mirror/nats:2"]
         exporter = ["--set", "operator.extraEnv[1].name=A2A_NATS_EXPORTER_IMAGE", "--set", "operator.extraEnv[1].value=mirror/exporter:0.20.3"]
         empty = ["--set", "operator.extraEnv[0].name=A2A_NATS_IMAGE", "--set-string", "operator.extraEnv[0].value="]
+        # The last entry for a name wins, as in the operator container's env:
+        # a later empty entry clears an earlier one.
+        image_then_cleared = image + ["--set", "operator.extraEnv[1].name=A2A_NATS_IMAGE", "--set-string", "operator.extraEnv[1].value="]
+        exporter_then_cleared = image + exporter + ["--set", "operator.extraEnv[2].name=A2A_NATS_EXPORTER_IMAGE", "--set-string", "operator.extraEnv[2].value="]
         for name, extra, rendered in (
             ("default", [], True),
             ("nats image overridden alone", image, False),
             ("both overridden", image + exporter, True),
             ("nats image empty", empty, True),
+            ("nats image set, then cleared by a later entry", image_then_cleared, True),
+            ("exporter image set, then cleared by a later entry", exporter_then_cleared, False),
         ):
             with self.subTest(name):
                 docs = _render(*_ON, *extra)
