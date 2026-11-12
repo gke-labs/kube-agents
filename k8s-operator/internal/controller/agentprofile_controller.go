@@ -197,25 +197,41 @@ func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if err := r.deleteOwnServiceAccount(ctx, &profile); err != nil {
 		return ctrl.Result{}, err
 	}
-	// Each profile narrowed to the tiers it renders (agentprofile_tiers.go).
-	renderable, verdicts, err := renderableAgentProfiles(ctx, r.Client, agent, all.Items, r.TiersUnreadable)
+	// Each profile narrowed to the tiers it renders (agentprofile_tiers.go),
+	// over the same set the platform reconciler renders (boundAgentProfiles):
+	// profiles on a foreign ServiceAccount dropped first, so relative
+	// refusals, the dispatch budget among them, come out the same in both.
+	bound, err := withoutForeignServiceAccounts(ctx, r.Client, all.Items)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	verdict := verdicts[profile.Name]
-	resolution := resolveAgentProfileIdentities(agent, renderable)[profile.Name]
-	if len(verdict.renderable) == 0 {
-		resolution = agentProfileResolution{refused: errors.New(verdict.message()), reason: verdict.reason()}
-	}
 	profilesNS := profileNamespaceOf(&profile)
-	if resolution.refused == nil {
-		foreign, err := agentProfileServiceAccountIsForeign(ctx, r.Client, &profile)
+	foreign, err := agentProfileServiceAccountIsForeign(ctx, r.Client, &profile)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	renderable, verdicts, err := renderableAgentProfiles(ctx, r.Client, agent, bound, r.TiersUnreadable)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	verdict, ok := verdicts[profile.Name]
+	if !ok {
+		// A foreign profile isn't in the bound set: its tier verdict is
+		// its own (tiers are judged per profile), for the status it writes.
+		_, own, err := renderableAgentProfiles(ctx, r.Client, agent, []agentv1alpha1.AgentProfile{profile}, r.TiersUnreadable)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		if foreign != "" {
-			resolution = agentProfileResolution{refused: fmt.Errorf("ServiceAccount %s/%s already exists and is not this profile's; the operator does not adopt it", profilesNS, foreign), reason: reasonAgentProfileRefused}
-		}
+		verdict = own[profile.Name]
+	}
+	var resolution agentProfileResolution
+	switch {
+	case foreign != "":
+		resolution = agentProfileResolution{refused: fmt.Errorf("ServiceAccount %s/%s already exists and is not this profile's; the operator does not adopt it", profilesNS, foreign), reason: reasonAgentProfileRefused}
+	case len(verdict.renderable) == 0:
+		resolution = agentProfileResolution{refused: errors.New(verdict.message()), reason: verdict.reason()}
+	default:
+		resolution = resolveAgentProfileIdentities(agent, renderable)[profile.Name]
 	}
 
 	if resolution.refused != nil {

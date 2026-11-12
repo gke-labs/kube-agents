@@ -610,6 +610,55 @@ func dispatchSubmitRetentionSeconds(agent *agentv1alpha1.PlatformAgent) int {
 	return int(retention)
 }
 
+// dispatchConfigCapBytes is the most the dispatch config may hold: a ConfigMap
+// holds 1 MiB with its metadata, so this leaves room for that. The live
+// profiles are held to the smaller dispatchConfigBudgetBytes when their
+// identities resolve; this cap catches the profiles still draining, which
+// aren't counted there (#5479). A var so tests can shrink it.
+var dispatchConfigCapBytes = 1000 << 10
+
+// capDrainingEntries drops the draining profiles that end soonest until cfg
+// fits dispatchConfigCapBytes. Only under churn of thousands of profiles does
+// it drop any. A dropped entry loses its .supervisor grant early, so a task
+// that profile still holds may end with its terminal unrelayed; a config past
+// the cap would leave every profile on a stale config instead. Live entries
+// are never touched.
+func capDrainingEntries(cfg *a2aDispatchConfig) {
+	body, err := json.Marshal(cfg)
+	if err != nil || len(body) <= dispatchConfigCapBytes {
+		return
+	}
+	excess := len(body) - dispatchConfigCapBytes
+	var draining []int
+	for i, p := range cfg.Profiles {
+		if !p.DrainingUntil.IsZero() {
+			draining = append(draining, i)
+		}
+	}
+	slices.SortFunc(draining, func(a, b int) int {
+		return cfg.Profiles[a].DrainingUntil.Compare(cfg.Profiles[b].DrainingUntil)
+	})
+	drop := map[int]bool{}
+	for _, i := range draining {
+		if excess <= 0 {
+			break
+		}
+		entry, err := json.Marshal(cfg.Profiles[i])
+		if err != nil {
+			continue
+		}
+		drop[i] = true
+		excess -= len(entry) + 1
+	}
+	kept := cfg.Profiles[:0:0]
+	for i, p := range cfg.Profiles {
+		if !drop[i] {
+			kept = append(kept, p)
+		}
+	}
+	cfg.Profiles = kept
+}
+
 // dispatchConfigEnvelope is the dispatch config with every install-wide value
 // resolved and no profiles. The dispatch budget counts it before any profile
 // (newDispatchBudget), which is why it resolves no profiles itself.
@@ -714,6 +763,7 @@ func desiredDispatchConfigWith(agent *agentv1alpha1.PlatformAgent, profiles []ag
 	if len(jobTemplates) > 0 {
 		cfg.JobLabels = dispatchJobLabels(agent)
 	}
+	capDrainingEntries(&cfg)
 	body, err := json.Marshal(cfg)
 	if err != nil {
 		return cfg, err

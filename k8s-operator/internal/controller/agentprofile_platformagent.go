@@ -59,15 +59,9 @@ func boundAgentProfiles(ctx context.Context, c client.Reader, agent *agentv1alph
 		}
 		return nil, err
 	}
-	var bound []agentv1alpha1.AgentProfile
-	for i := range profiles.Items {
-		foreign, err := agentProfileServiceAccountIsForeign(ctx, c, &profiles.Items[i])
-		if err != nil {
-			return nil, err
-		}
-		if foreign == "" {
-			bound = append(bound, profiles.Items[i])
-		}
+	bound, err := withoutForeignServiceAccounts(ctx, c, profiles.Items)
+	if err != nil {
+		return nil, err
 	}
 	// Each profile narrowed to the tiers it renders (agentprofile_tiers.go):
 	// an unknown or conflicting tier renders nothing downstream.
@@ -84,6 +78,26 @@ func boundAgentProfiles(ctx context.Context, c client.Reader, agent *agentv1alph
 // whatever RoleBindings they gave it. The operator neither adopts it nor
 // renders a bus identity for it. It returns the first such name, or "". A
 // ServiceAccount spec.identity names is foreign on purpose and not checked.
+// withoutForeignServiceAccounts drops each profile whose default
+// ServiceAccount already exists and isn't the operator's: the operator renders
+// nothing for it. The platform reconciler (boundAgentProfiles) and the
+// AgentProfile controller both resolve identities over the set this returns,
+// so the dispatch budget, which counts profiles oldest first, counts the same
+// profiles in both and they agree on which it refuses (#5479).
+func withoutForeignServiceAccounts(ctx context.Context, c client.Reader, profiles []agentv1alpha1.AgentProfile) ([]agentv1alpha1.AgentProfile, error) {
+	var bound []agentv1alpha1.AgentProfile
+	for i := range profiles {
+		foreign, err := agentProfileServiceAccountIsForeign(ctx, c, &profiles[i])
+		if err != nil {
+			return nil, err
+		}
+		if foreign == "" {
+			bound = append(bound, profiles[i])
+		}
+	}
+	return bound, nil
+}
+
 func agentProfileServiceAccountIsForeign(ctx context.Context, c client.Reader, p *agentv1alpha1.AgentProfile) (string, error) {
 	profilesNS := profileNamespaceOf(p)
 	if p.Spec.Identity.ServiceAccountName != "" {

@@ -479,6 +479,12 @@ leave open:
   such profiles. A dispatcher older than this reads only an inline template, so it refuses
   unattended tasks `no-worker` under an operator that sends the reference: move the
   dispatcher's image with the operator.
+  The config has a byte budget too (#5479). Written compact with the durables derived, 2,500
+  two-tier profiles come to about 445 KB. Profiles are admitted oldest first, and one whose entry
+  would push the live entries past 900 KiB is refused with the `IdentityReady` reason
+  `DispatchConfigFull`, as any identity refusal is, so the newest profiles lose and the config
+  never reaches the API server's limit. The profiles still draining aren't counted there. Past a
+  hard cap of 1,000 KiB, the draining entries that end soonest are dropped until the config fits.
   Without a Job runner or a Job template, an unattended task has no worker (the operator builds
   warm pools for the read tier only), so admission refuses it at once, `no-worker` ("no runner
   for unattended on this install: Job mode is off"), rather than leave it queued until its
