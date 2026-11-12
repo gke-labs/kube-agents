@@ -333,9 +333,14 @@ class PlantScriptsTest(unittest.TestCase):
         self.assertEqual(self._platform_paused(), set())
 
     def test_arm_resumes_before_it_touches_the_stage(self):
-        self._platform([{"id": a, **PAUSED} for a in STAGE_FIVE], list(STAGE_FIVE))
-        self._arm()
+        # The late pause is resumed by the second sweep, and that too comes before any card.
+        first, late = STAGE_FIVE[0], STAGE_FIVE[3]
+        self._platform([{"id": first, **PAUSED}] + [{"id": a, "enabled": True} for a in STAGE_FIVE[1:]], list(STAGE_FIVE))
+        self.env["STUB_LATE_PAUSE"] = late
+        done = self._arm()
+        self.assertEqual(done.returncode, 0, done.stderr)
         calls = self._hermes_calls()
+        self.assertIn(["-p", "platform", "cron", "resume", late], calls)
         last_resume = max(i for i, c in enumerate(calls) if c[:4] == ["-p", "platform", "cron", "resume"])
         first_card = min(i for i, c in enumerate(calls) if c[:2] == ["kanban", "create"])
         self.assertLess(last_resume, first_card)

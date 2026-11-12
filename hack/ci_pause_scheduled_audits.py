@@ -25,8 +25,8 @@ by the image's copy of each. Leaves alone:
 - the `no_agent` jobs, which are plumbing (workspace GC, board health, delivery watch)
   and write nothing to the repository;
 - the audits the Chat Agent's `oobe` stage starts on a fresh install
-  (`FIRST_RUN_AUDITS`, read from the image's copy of oobe.py) until the stage has had
-  its run of each (below);
+  (`FIRST_RUN_AUDITS`, read from the image's copy of oobe.py) until the stage is past
+  them (below);
 - a job already disabled, which has nothing to pause.
 
 The stage's five audits are three of the clock's (06:20, 06:50, 09:20 UTC) plus cost
@@ -35,8 +35,9 @@ audit rather than starting it, since Hermes' `trigger_job` would unpause it, so 
 pause before the stage reaches an audit takes that audit out of the chain the eval
 grades. The stage reads pauses only for audits it has not reached
 (`oobe.py`, `pending`), and a clock run that lands first is adopted rather than
-repeated, so an audit is paused once the stage has fired or adopted it, or is done,
-and no run of it is due or under way: from then on a clock run would be a second full run that
+repeated, so an audit is paused once the stage has fired or adopted it, or the stage is
+done (a done stage reads no hold again, so the audits it skipped or gave up on count
+too), and no run of it is due or under way: from then on a clock run would be a second full run that
 nothing grades (#5570). A due mark is left too because a case that triggered the
 job (`hermes cron run`) waits on that run, and a pause before the tick claims it would
 drop it. While the oobe-first-run-audits stack has the stage armed (its state file is

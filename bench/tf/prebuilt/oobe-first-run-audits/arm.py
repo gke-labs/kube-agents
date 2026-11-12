@@ -27,8 +27,8 @@ nothing starts the audits, which is the case's red.
 The state file is written first and after every change, so the disarm restores what
 this run changed even when it stopped part-way.
 
-An eval run pauses each first-run audit once the install's own chain has had its run of
-it (hack/ci_pause_scheduled_audits.py), and the stage skips a paused audit, so the arm
+An eval run pauses each first-run audit once the install's own stage is past it
+(hack/ci_pause_scheduled_audits.py), and the stage skips a paused audit, so the arm
 resumes the ones that script recorded pausing. Those alone: an operator's pause on a
 long-lived install stays. The script leaves the five alone while the state file is
 there, but a pause it decided before the file appeared can still land, within one
@@ -36,7 +36,7 @@ Hermes call, so in an eval run (the script's record is there) the arm reads them
 after RESUME_SETTLE_SECONDS, whether or not the first read found any paused, and resumes
 any it finds. Both come before the stand-in cards and markers, so the stage's first
 tick cannot hold the first audit in between. Nothing pauses them again here: the
-script does, once this chain has had its run of each.
+script does, once this stage is past them.
 """
 
 import ast

@@ -203,8 +203,9 @@ The runner pauses most of the Platform Agent's clock-started audits at lease tim
 right before the fan-out (`scheduled_audits`, #3020), so their scheduled runs can't write to the GitOps
 repository in the middle of an eval and be charged to whichever cases are running. It leaves the
 `no_agent` jobs and any job the image doesn't ship. The five audits the `oobe` stage starts on a
-fresh install are paused only once the stage has had its run of each and no run of it is due or
-under way, since the stage holds a paused audit rather than starting it; every pause pass applies
+fresh install are paused once the stage is done, or before that once it has fired or adopted the
+audit, and no run of it is due or under way, since the stage holds a paused audit rather than
+starting it; every pause pass applies
 that, and a watch through the fan-out repeats it every few minutes, except while the
 `oobe-first-run-audits` stack has the stage armed. Until then a write from one of them mid-eval
 is still possible. `hack/ci_pause_scheduled_audits.py`'s header has the rule in full. An audit case starts its own run from its

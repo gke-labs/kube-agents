@@ -7328,7 +7328,8 @@ class GitHubWritesVerifier(BaseVerifier):
     except one on a branch the fleet audits' remediation sweep names
     (``platform-agent/fix-<audit-id>-...-<digest>``,
     :data:`kube_agents_bench.github_writes.SWEEP_BRANCH`): the api lane
-    keeps the sweep on and the four first-run audits keep their clock, so
+    keeps the sweep on and the five first-run audits keep their clock until
+    the install's own chain has run them, so
     such a pull request is unattributed there as in a shared window.
     Otherwise a write no repetition names is graded by none (a reply that
     does not link it from a run whose workers' calls were not read back --

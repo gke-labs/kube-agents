@@ -62,8 +62,8 @@ locals {
   arm_b64    = base64encode(file("${path.module}/arm.py"))
   disarm_b64 = base64encode(file("${path.module}/disarm.py"))
   own_b64    = base64encode(file("${path.module}/own_stage.py"))
-  # A fresh CI install's scan settles about 17 minutes after boot, then its chain runs three
-  # audits and claims the fourth (one to 45 minutes each). The runner holds the onboarding
+  # A fresh CI install's scan settles about 17 minutes after boot, then its chain runs four
+  # audits and claims the fifth (one to 45 minutes each). The runner holds the onboarding
   # state lock while this waits, and hack/ci-eval-pr.sh sizes that lock's deadline from
   # own_wait plus chain_wait (STATE_LOCK_HOLD_SECONDS), so a change here changes that too.
   own_wait = 3600

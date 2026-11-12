@@ -368,7 +368,7 @@ readonly EVAL_PAUSE_AUDITS_POD_WAIT_SECONDS=300
 # the pause, which the next lease's pause repeats anyway.
 readonly EVAL_RESUME_AUDITS_POD_WAIT_SECONDS=20
 # chain_audits_watch: how often, through the fan-out, the first-run stage's audits
-# are paused once the stage has had its run of each (#5570). The clock fires them
+# are paused once the stage is past them (#5570). The clock fires them
 # hours apart, so a few minutes' lag costs at most a run that lands in it.
 readonly EVAL_CHAIN_AUDITS_INTERVAL_SECONDS=300
 # Where the watch's pid goes: it runs outside the job table, where the fan-out's
@@ -378,9 +378,9 @@ readonly EVAL_CHAIN_AUDITS_PID_FILE="chain-audits-watch.pid"
 # it rather than on the pid, which a container whose PID 1 reaps nothing leaves answering.
 readonly EVAL_CHAIN_AUDITS_RUNNING_FILE="chain-audits-watch.running"
 # How long stop_chain_audits_watch waits for a pass under way to finish, so its pauses
-# are recorded before the EXIT trap's resume reads the record. One pass is a gateway
-# check and an exec of a few seconds; this keeps most of Prow's five-minute grace for
-# the artifacts.
+# are recorded before the EXIT trap's resume reads the record. One pass is typically a
+# gateway check and an exec of a few seconds, though its retries can take longer; this
+# keeps most of Prow's five-minute grace for the artifacts.
 readonly EVAL_CHAIN_AUDITS_STOP_WAIT_SECONDS=60
 readonly EVAL_PAUSE_AUDITS_POD_POLL_SECONDS=5
 # The bound on one exec that reads a gateway pod's PID 1 (ready_gateway_pod).
@@ -2500,7 +2500,8 @@ scheduled_audits() { # <pause|chain|resume> <label>
 
 # The first-run stage's audits are three of the clock-started ones plus two more, and
 # the stage skips one that is paused, so the lease and fan-out pauses leave them on
-# (#5570). This pauses each once the stage has had its run of it, every
+# (#5570). This pauses each once the stage is past it (hack/ci_pause_scheduled_audits.py
+# says when), every
 # EVAL_CHAIN_AUDITS_INTERVAL_SECONDS from the fan-out to its end: after that a clock
 # run would be a second full run nothing grades. Started outside the job table
 # (a subshell that exits at once leaves it to init), since launch_units counts
@@ -2511,7 +2512,7 @@ scheduled_audits() { # <pause|chain|resume> <label>
 # stop_chain_audits_watch sends TERM. A nap ends at once; a pass under way runs to its
 # end, since bash runs a trap only once the foreground command returns, and killing
 # the subshell alone would leave that pass's exec running to pause after the EXIT
-# trap's resume, with no record left to name what it paused.
+# trap's resume, which may already have removed the record that names it.
 start_chain_audits_watch() {
   local pidfile="${STATE_DIR}/${EVAL_CHAIN_AUDITS_PID_FILE}" running="${STATE_DIR}/${EVAL_CHAIN_AUDITS_RUNNING_FILE}" owner=$$
   : > "${running}"
@@ -2523,6 +2524,8 @@ start_chain_audits_watch() {
       while [ -z "${stopping}" ]; do
         sleep "${EVAL_CHAIN_AUDITS_INTERVAL_SECONDS}" &
         nap=$!
+        # A TERM between the fork and the line above found no nap to end.
+        [ -z "${stopping}" ] || kill "${nap}" 2>/dev/null || true
         wait "${nap}" 2>/dev/null || true
         nap=""
         [ -z "${stopping}" ] && [ -e "${pidfile}" ] && kill -0 "${owner}" 2>/dev/null || break
@@ -2544,7 +2547,7 @@ stop_chain_audits_watch() {
     sleep 1
     waited=$((waited + 1))
   done
-  [ ! -e "${running}" ] || echo "WARNING: Scheduled audits: the fan-out watch's pass was still running after ${EVAL_CHAIN_AUDITS_STOP_WAIT_SECONDS}s; a first-run audit it pauses after the resume stays paused on this install until resumed by hand" >&2
+  [ ! -e "${running}" ] || echo "WARNING: Scheduled audits: the fan-out watch's pass was still running after ${EVAL_CHAIN_AUDITS_STOP_WAIT_SECONDS}s; a first-run audit it pauses after the resume stays paused until the next eval run's resume or the oobe-first-run-audits arm lifts it, both from the record it wrote first" >&2
   return 0
 }
 
