@@ -716,11 +716,14 @@ func buildShellSandboxStatefulSet(agent *agentv1alpha1.PlatformAgent, authorized
 			// claims running throughout.
 			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
 				{
-					// Sized from the agent's own /opt/data claim, not independently.
+					// Sized like the agent's own /opt/data claim, not independently.
 					// sandbox_mirror.py copies a subset of that volume into this one
 					// on upgrade, so matching them makes the migration fit by
 					// construction — see agentDataStorageSize. spec.storage.size
-					// moves both, through ResolveDataStorageSize.
+					// moves both, through ResolveDataStorageSize. The agent's claim
+					// alone adds the per-profile budget for
+					// spec.storage.expectedClusterProfiles: it covers the session
+					// stores, which the mirror does not copy.
 					ObjectMeta: metav1.ObjectMeta{Name: shellSandboxDataVolume},
 					Spec: corev1.PersistentVolumeClaimSpec{
 						AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
@@ -1295,36 +1298,55 @@ func buildShellSandboxClientKeyMount() corev1.VolumeMount {
 	}
 }
 
-// autonomySwitchValues lists the values each earned-autonomy switch may take
+// autonomySwitchNames are the earned-autonomy switches, in the fixed order
+// they are rendered in; autonomySwitchValues lists the values each may take
 // besides "off", its default.
-var autonomySwitchValues = map[string][]string{
-	envPostMergeCheck: {"silent", "report"},
-	envAutomerge:      {"practice", "on"},
-	envDial:           {"on"},
+var (
+	autonomySwitchNames  = []string{envPostMergeCheck, envAutomerge, envDial}
+	autonomySwitchValues = map[string][]string{
+		envPostMergeCheck: {"silent", "report"},
+		envAutomerge:      {"practice", "on"},
+		envDial:           {"on"},
+	}
+)
+
+// autonomySwitchSet returns spec.deployment.env's literal entry for the named
+// switch, and whether there is one; the last one when it is named twice, as a
+// container's env would take it. A valueFrom entry does not count: it could
+// name a credential neither pod may hold.
+func autonomySwitchSet(agent *agentv1alpha1.PlatformAgent, name string) (value string, ok bool) {
+	if agent.Spec.Deployment == nil {
+		return "", false
+	}
+	for _, v := range agent.Spec.Deployment.Env {
+		if v.Name == name && v.ValueFrom == nil {
+			value, ok = v.Value, true
+		}
+	}
+	return value, ok
 }
 
-// autonomySwitchEnv returns the earned-autonomy switches spec.deployment.env
-// sets, each normalised to one of its known values and anything else to "off",
-// so the bytes on the pod are the operator's: a literal with a quote or a
-// backslash would stop the sandbox entrypoint before sshd starts, and a
-// valueFrom could name a credential this pod must never hold. An unset switch
-// is left out; the entrypoint writes "off" for it.
-func autonomySwitchEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
-	if agent.Spec.Deployment == nil {
-		return nil
+// autonomySwitchValue is the named switch's value normalised to one it knows,
+// and "off" for anything else, unset included. The bytes on either pod are then
+// the operator's: a literal with a quote or a backslash would stop the sandbox
+// entrypoint before sshd starts.
+func autonomySwitchValue(agent *agentv1alpha1.PlatformAgent, name string) string {
+	raw, _ := autonomySwitchSet(agent, name)
+	value := strings.ToLower(strings.TrimSpace(raw))
+	if slices.Contains(autonomySwitchValues[name], value) {
+		return value
 	}
+	return "off"
+}
+
+// autonomySwitchEnv returns the switches spec.deployment.env sets, normalised,
+// for the sandbox container. An unset switch is left out; the entrypoint writes
+// "off" for it.
+func autonomySwitchEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 	var env []corev1.EnvVar
-	for _, name := range []string{envPostMergeCheck, envAutomerge, envDial} {
-		for _, v := range agent.Spec.Deployment.Env {
-			if v.Name != name || v.ValueFrom != nil {
-				continue
-			}
-			value := strings.ToLower(strings.TrimSpace(v.Value))
-			if !slices.Contains(autonomySwitchValues[name], value) {
-				value = "off"
-			}
-			env = append(env, corev1.EnvVar{Name: name, Value: value})
-			break
+	for _, name := range autonomySwitchNames {
+		if _, ok := autonomySwitchSet(agent, name); ok {
+			env = append(env, corev1.EnvVar{Name: name, Value: autonomySwitchValue(agent, name)})
 		}
 	}
 	return env

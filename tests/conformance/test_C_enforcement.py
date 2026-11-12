@@ -1025,8 +1025,8 @@ class C1IsolationIsStructural(unittest.TestCase):
         """The premise the fence's rule set rests on.
 
         The fence grants DNS, the bus and LiteLLM and nothing else (plus, under
-        the operator's cluster-view flag, the credential broker on its one
-        port) -- no API-server rule, no 443, no metadata rule beyond DNS -- and that is
+        the operator's cluster-view flag, kube-proxy on 8443 and the credential
+        broker on 8765) -- no API-server rule, no 443, no metadata rule beyond DNS -- and that is
         only safe while a session pod holds no credential it could use against
         the API server if it found a route.
 
@@ -1042,11 +1042,11 @@ class C1IsolationIsStructural(unittest.TestCase):
           server accepts -- is never mounted.
         - Every token that is mounted is a projected token naming an audience
           that is not the API server's: the bus, and, under the operator's
-          A2A_SESSION_CLUSTER_VIEW flag, the credential broker's session
-          audience. The API server refuses both for anything else, so neither
-          is a cluster credential even though both are Kubernetes ones; the
-          broker token reaches one pod on one port, where TokenReview and the
-          broker's role table decide what it may run.
+          A2A_SESSION_CLUSTER_VIEW flag, the session audience accepted by
+          kube-proxy and the credential broker. The API server refuses both for
+          anything else, so neither is a cluster credential even though both
+          are Kubernetes ones; TokenReview and each proxy's per-audience policy
+          decide what the session token may run.
         - The ServiceAccount it is minted for is bound to nothing, so even a
           token that reached the API server would authenticate as a principal
           holding no permissions.
@@ -1566,22 +1566,25 @@ class C1IsolationIsStructural(unittest.TestCase):
     ) -> None:
         """The cluster view's contract, which sits astride the same boundary.
 
-        The operator renders `credentialProxySessionAudience` into the broker's
-        CREDENTIAL_PROXY_SESSION_AUDIENCE and the gateway projects its own
+        The operator renders `credentialProxySessionAudience` into both the
+        broker's and kube-proxy's CREDENTIAL_PROXY_SESSION_AUDIENCE (alongside
+        CREDENTIAL_PROXY_SESSION_CALLERS) and the gateway projects its own
         constant of the same name as the audience of every session pod's
-        broker token; the two modules cannot import each other, and each one's
-        tests compare its constant to itself. A rename on either side ships
-        with both Go suites green and every session pod's `kubectl` answered
-        401, because the token names an audience the broker never asks the
-        TokenReview about. The two env names the operator renders onto the
-        gateway and the gateway reads back are the same kind of pair, and a
-        drift there is quieter still: the view reads as off and nothing says
-        so. Both pairs are pinned here. The broker has no constant to pin: it
-        reads CREDENTIAL_PROXY_SESSION_AUDIENCE raw, so the operator's render
-        is the only spelling it ever sees.
+        broker/kube-proxy token; the three Go modules cannot import each other,
+        and each one's tests compare its constant to itself. A rename on any
+        side ships with every Go suite green and every session pod's `kubectl`
+        or `gcloud` answered 401, because the token names an audience the proxy
+        never asks TokenReview about. The env names the operator renders onto
+        the gateway and kube-proxy are the same kind of pair, and a drift there
+        is quieter still: the view or session auth reads as off and nothing says
+        so. All pairs are pinned here. The Python broker reads
+        CREDENTIAL_PROXY_SESSION_AUDIENCE raw, while k8s-api-proxy reads
+        sessionAudienceEnv and sessionCallersEnv.
         """
         operator = h.text("broker_split_go")
         manifests = h.text("manifests_go")
+        kube_proxy_manifests = h.text("kube_proxy_manifests_go")
+        kube_proxy_main = h.text("k8s_api_proxy_main_go")
         a2a_manifests = h.text("a2a_session_fence")
         spawner = h.text("a2a_spawner")
         config = h.text("a2a_gateway_config")
@@ -1606,23 +1609,61 @@ class C1IsolationIsStructural(unittest.TestCase):
             "the broker env render of the session audience",
         )
         self._one_match(
+            r'Name:\s*"CREDENTIAL_PROXY_SESSION_AUDIENCE",\s*Value:\s*credentialProxySessionAudience',
+            kube_proxy_manifests,
+            "kube-proxy's env render of the session audience",
+        )
+        self._one_match(
             r"Audience:\s+credentialProxySessionAudience,",
             spawner,
             "the spawner's projection of the session audience",
         )
+        for const_name, env_literal in (
+            ("sessionAudienceEnv", "CREDENTIAL_PROXY_SESSION_AUDIENCE"),
+            ("sessionCallersEnv", "CREDENTIAL_PROXY_SESSION_CALLERS"),
+        ):
+            with self.subTest(kube_proxy_env=const_name):
+                self._one_match(
+                    r'Name:\s*"%s"' % env_literal,
+                    kube_proxy_manifests,
+                    "kube-proxy's operator render of %s" % env_literal,
+                )
+                read_name = self._one_match(
+                    r'%s\s*=\s*"([^"]+)"' % const_name,
+                    kube_proxy_main,
+                    "k8s-api-proxy's %s" % const_name,
+                )
+                self.assertEqual(
+                    env_literal,
+                    read_name,
+                    "kube-proxy manifests render %r while k8s-api-proxy reads %r" % (env_literal, read_name),
+                )
 
-        for name in ("A2A_SESSION_CLUSTER_VIEW", "A2A_CREDENTIAL_PROXY_URL"):
+        for name in (
+            "A2A_SESSION_CLUSTER_VIEW",
+            "A2A_CREDENTIAL_PROXY_URL",
+            "A2A_KUBE_PROXY_URL",
+            "A2A_KUBE_PROXY_CA_CONFIGMAP",
+            "A2A_KUBE_PROXY_HOST_CONTEXT",
+        ):
             with self.subTest(env=name):
                 self._one_match(r'Name:\s*"%s"' % name, a2a_manifests, "the operator's render of %s" % name)
                 self._one_match(r'os\.Getenv\("%s"\)' % name, config, "the gateway's read of %s" % name)
 
-        # The shim's half: the spawner sets three names and the client reads
-        # three names, in a Go module and a Python script that share nothing.
-        # A rename on either side ships green and the first kubectl of the
-        # first flag-on session fails with "CREDENTIAL_PROXY_URL is not
-        # configured", a 401, or a kubeconfig filed under /opt/data.
+        # The shim's half: the spawner sets the broker and kube-proxy names and
+        # the client reads them, in a Go module and a Python script that share
+        # nothing. A rename on either side ships green and the first gcloud or
+        # kubectl of the first flag-on session fails with "CREDENTIAL_PROXY_URL
+        # is not configured", a 401, or a kubeconfig filed under /opt/data.
         shim = h.text("credential_proxy_client")
-        for name in ("CREDENTIAL_PROXY_URL", "CREDENTIAL_PROXY_TOKEN_FILE", "HERMES_HOME"):
+        for name in (
+            "CREDENTIAL_PROXY_URL",
+            "CREDENTIAL_PROXY_TOKEN_FILE",
+            "HERMES_HOME",
+            "KUBE_PROXY_URL",
+            "KUBE_PROXY_CA_FILE",
+            "KUBE_PROXY_HOST_CONTEXT",
+        ):
             with self.subTest(env=name):
                 self._one_match(r'Name:\s*"%s"' % name, spawner, "the spawner's render of %s" % name)
                 self.assertTrue(
@@ -1750,12 +1791,13 @@ class C1IsolationIsStructural(unittest.TestCase):
             self.assertNotRegex(body, magic_number, f"{what} hand-spells the delegate text cap")
 
     def test_C1_the_delegate_tool_schema_names_agree_with_the_wire_shape(self) -> None:
-        """The MCP tool schema and `lib.DelegateRequest` spell the same fields, bar `parameters`.
+        """The MCP tool schema and `lib.DelegateRequest` spell the same fields.
 
         The session's harness speaks MCP to the worker-adapter's own server,
-        which answers `tools/list` with `delegateToolSchema` -- a
-        `map[string]any` literal, because that is what an MCP tool definition
-        is on the wire, so it cannot reference `lib.DelegateRequest`'s json
+        which answers `tools/list` with `delegateToolSchema` -- built from
+        `map[string]any` literals (per turn, to name that turn's delegate
+        targets), because that is what an MCP tool definition is on the
+        wire, so it cannot reference `lib.DelegateRequest`'s json
         tags the way Go code can. The two are independent spellings of one
         shape: the model calls the tool using the schema's field names, the
         adapter decodes the call straight into `lib.DelegateRequest`
@@ -1774,30 +1816,22 @@ class C1IsolationIsStructural(unittest.TestCase):
             all_tags,
             "lib.DelegateRequest's wire shape changed; this test compared nothing",
         )
-        # `parameters` is on the wire struct but not the tool: the worker
-        # adapter refuses a request carrying any until a gateway reads them
-        # (validateDelegate), so the model is not offered the field. The
-        # exemption holds only while that refusal does.
-        self.assertIn(
-            "if len(req.Parameters) > 0 {",
-            h.text("a2a_worker_adapter_delegate"),
-            "the adapter no longer refuses delegate parameters; declare them in delegateToolSchema",
-        )
-        tags = [t for t in all_tags if t != "parameters"]
-
         mcp = h.text("a2a_worker_adapter_mcp")
-        schema = mcp.split("var delegateToolSchema")[1].split("\n}\n")[0]
-        properties = sorted(re.findall(r'"(\w+)":\s*map\[string\]any\{"type": "string"', schema))
+        schema = mcp.split("func delegateToolSchema(")[1].split("\n}\n")[0]
+        # A property opens its own line; `additionalProperties` inside one doesn't.
+        properties = sorted(re.findall(r'^\s*"(\w+)":\s*map\[string\]any\{"type": "(?:string|object)"', schema, re.M))
         self.assertEqual(
-            tags,
+            all_tags,
             properties,
             "the tool schema's declared properties no longer match lib.DelegateRequest's json tags",
         )
+        # `parameters` is optional on both sides: platform takes none, and the
+        # wire struct's tag is omitempty.
         required_block = re.search(r'"required":\s*\[\]string\{([^}]*)\}', schema)
         self.assertIsNotNone(required_block, "delegateToolSchema's required list moved or changed shape")
         required = sorted(re.findall(r'"(\w+)"', required_block.group(1)))
         self.assertEqual(
-            tags,
+            [t for t in all_tags if t != "parameters"],
             required,
             "the tool schema's required list no longer matches lib.DelegateRequest's json tags",
         )
@@ -2160,6 +2194,68 @@ class C1IsolationIsStructural(unittest.TestCase):
             "shares with the agent container, so both would resolve to one map "
             "entry holding the union of their grants, which is `worker` rebuilt",
         )
+
+    def test_C1_the_passwordless_postgres_guard_answers_to_its_own_values_alone(self) -> None:
+        """No value set for the gateway's sake unguards the Hindsight database.
+
+        hindsight-postgresql takes no password; its NetworkPolicy, which admits
+        the hindsight-api pod on 5432 and nobody else, is the whole of its
+        access control. The chart renders that policy and hindsight-api's
+        under separate guards because a bring-your-own gateway install has to
+        widen or drop the api policy, and one boolean over both would take the
+        database guard along with it. The refusal asserted: the guard on this
+        policy is built from hindsight.networkPolicy and
+        hindsight.postgresql.networkPolicy.enabled and nothing else -- not
+        litellm.enabled, not the api toggle, not additionalEgress -- and the
+        block it opens holds the policy that admits only the api component, so
+        no other peer is rendered into it.
+
+        The template carries multi-line Helm comments, which helm_documents()
+        cannot read, so the policy's block is sliced out by its guard and
+        stripped of directive lines the way tests/test_hindsight_network_policy.py
+        does; that file holds the rendered-output tests behind a helm binary.
+        """
+        template = h.text("chart_hindsight")
+        umbrella = self._one_match(
+            r"\{\{-\s*\$hindsightNetworkPolicy\s*:=\s*(.+?)\s*\}\}", template, "the umbrella definition"
+        )
+        self.assertEqual(".Values.hindsight.networkPolicy", umbrella)
+        guard = self._one_match(
+            r"\{\{-\s*\$postgresqlNetworkPolicy\s*:=\s*(.+?)\s*\}\}", template, "the postgres guard definition"
+        )
+        self.assertEqual(
+            "and $hindsightNetworkPolicy .Values.hindsight.postgresql.networkPolicy.enabled",
+            guard,
+            "the postgres guard reads a value set for another component's sake",
+        )
+        block = self._one_match(
+            r"(?s)\{\{-\s*if \$postgresqlNetworkPolicy\s*\}\}\n(.*?)\n\{\{-\s*end\s*\}\}",
+            template,
+            "the postgres policy block",
+        )
+        body = "\n".join(line for line in block.splitlines() if "{{" not in line)
+        documents = [d for d in yaml.safe_load_all(body) if isinstance(d, dict)]
+        self.assertEqual(["hindsight-postgresql"], [d["metadata"]["name"] for d in documents])
+        (policy,) = documents
+        self.assertEqual("NetworkPolicy", policy["kind"])
+        spec = policy["spec"]
+        self.assertIn("Ingress", spec["policyTypes"])
+        self.assertTrue(spec["ingress"], "the policy admits no peer at all; the invariant is exactly one peer, not none")
+        for rule in spec["ingress"]:
+            self.assertEqual([{"port": 5432, "protocol": "TCP"}], rule["ports"])
+            for peer in rule["from"]:
+                self.assertEqual(
+                    {
+                        "podSelector": {
+                            "matchLabels": {
+                                "app.kubernetes.io/name": "hindsight",
+                                "app.kubernetes.io/component": "api",
+                            }
+                        }
+                    },
+                    peer,
+                    "a peer other than the hindsight-api pod reaches the passwordless database",
+                )
 
 
 class C2FailClosed(unittest.TestCase):

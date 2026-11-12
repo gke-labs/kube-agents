@@ -50,11 +50,11 @@ const (
 	BusTokenAudience = "a2a-bus"
 
 	// BusTokenPath is where the projected volume delivers the token.
-	BusTokenPath = "/var/run/secrets/a2a-bus/token"
+	BusTokenPath = "/var/run/secrets/a2a-bus/token" // #nosec G101 -- a path, not a credential
 
 	// EnvBusTokenFile lets a client be pointed at a token somewhere else
 	// (local runs, tests). Unset means BusTokenPath.
-	EnvBusTokenFile = "A2A_BUS_TOKEN_FILE"
+	EnvBusTokenFile = "A2A_BUS_TOKEN_FILE" // #nosec G101 -- an env var name, not a credential
 
 	// EnvBusUser carries the principal name the operator authenticated this
 	// container as, for a client whose inbox owner is a fixed user rather
@@ -181,7 +181,7 @@ func TaskCredentialNATSOptions(path, credential, pod, task string) ([]nats.Optio
 // trailing newline; a hand-written one may carry it, and a newline inside a
 // CONNECT frame is a protocol error rather than an auth failure.
 func readToken(path string) (string, error) {
-	raw, err := os.ReadFile(path)
+	raw, err := os.ReadFile(path) // #nosec G304 -- the bus token mount (BusTokenPath or A2A_BUS_TOKEN_FILE)
 	if err != nil {
 		return "", fmt.Errorf("reading the bus token: %w", err)
 	}

@@ -17,6 +17,7 @@ paths:
   - "deploy/docker/patches/kanban_notifier.py"
   - "deploy/docker/patches/kanban_progress_lines.py"
   - "deploy/docker/patches/kanban_chat_notify.py"
+  - "deploy/docker/patches/kanban_verified_claims.py"
   - "deploy/docker/patches/slack_*.py"
 trigger: model_decision
 description: "Chat UX rules for anything a user reads in Slack or Google Chat: answer first, named acks, one live status line, no plumbing, buttons for choices, one-line failures, speaking up only when it matters, confirmed destructive actions, and renderers that never compose."
@@ -81,7 +82,12 @@ exit code, or roster id used as a name (`cluster-foo` where "the foo cluster age
 identifier the user can act on — a cluster, a workload, a pull request as a link — is content, not
 plumbing, and so is a specialist's name where `SOUL.md` asks for attribution. A board read is the
 exception for ids: [`agents/chat/SOUL.md`](../../agents/chat/SOUL.md) §1.5 gives each card a short
-task id, because the user asked about the board and may name a card back.
+task id, because the user asked about the board and may name a card back. In the evidence section
+`kanban_complete` adds to a card's `result` from `verified_claims`, each claim's command and output
+excerpt, in their fences, are content: evidence the reader can check and run again, which
+[`agents/platform/SOUL.md`](../../agents/platform/SOUL.md) §0 and
+[`agents/cluster/SOUL.md`](../../agents/cluster/SOUL.md) §6 require. Every other line of the
+section, the tag above each claim included, is bound by this rule like any renderer's text.
 
 Why: plumbing is noise to the person who asked, and an internal name tells them nothing they can
 use.
@@ -90,6 +96,11 @@ Today: [`agents/chat/SOUL.md`](../../agents/chat/SOUL.md) §1 ("Don't re-say wha
 says", "Handle pure conversation yourself") and §2 steps 4 and 5. In code,
 `deploy/docker/patches/slack_boilerplate.py` strips Hermes' cron wrapper and its job id from Slack,
 and `busyNotice*` in `a2a/gateway/busy.go` is worded without a task id.
+[`agents/cluster/SOUL.md`](../../agents/cluster/SOUL.md) §6 ("Absent is an answer when presence was the
+question") keeps the command out of a one-line presence finding and sends it to `verified_claims`.
+The evidence section is rendered by `deploy/docker/patches/kanban_verified_claims.py`, which checks
+each claim's command and excerpt against the calls the card ran, or a claim the gate already
+accepted on a card it created, before it adds them.
 
 ## Choices are buttons
 
@@ -146,8 +157,8 @@ cluster.
 
 Today: [`agents/chat/SOUL.md`](../../agents/chat/SOUL.md) §1.6 ("state the resolved target back to
 them and wait for a yes") and §3's `/feedback` confirmation, which shows the exact submission and waits for a yes. In the
-gateway, `mayStop` in `a2a/gateway/stopgate.go` lets only a requester of the thread press Slack's
-Stop button; a typed `stop`, and Stop on other backends, are not gated.
+gateway, `mayStop` in `a2a/gateway/stopgate.go` lets only a requester of the thread press its Stop
+button, Slack's native one or the one drawn on Google Chat; a typed `stop` is not gated.
 
 ## Renderers never compose
 

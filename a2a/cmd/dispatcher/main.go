@@ -52,7 +52,7 @@ const (
 	// envTaskCredentialMaxLifetime caps those credentials' expiry: the
 	// callout's setting of the same name, parsed by the callout's parser so
 	// the two never disagree on what a value means.
-	envTaskCredentialMaxLifetime = "A2A_TASK_CREDENTIAL_MAX_LIFETIME"
+	envTaskCredentialMaxLifetime = "A2A_TASK_CREDENTIAL_MAX_LIFETIME" // #nosec G101 -- an env var name, not a credential
 
 	// configWait bounds the wait for the first config at startup: past it
 	// the process exits and the kubelet's restart says so.

@@ -71,9 +71,12 @@ concurrency:
   cancel-in-progress: false
 
 # Step 5's only inputs, and the same two values ci-health.yml declares for the
-# same purpose: the eval's artifacts land in a bucket owned by kube-agents-prow,
-# and github-actions@kube-agents-prow is the read-only identity that project
-# exposes for reading them from GitHub Actions. Literals rather than repository
+# same purpose: the eval's artifacts land in two buckets, the lane's private
+# gs://kube-agents-evals-presubmit-logs (kube-agents-owned) and the Prow
+# cluster's default owned by kube-agents-prow that it logged to before, and
+# github-actions@kube-agents-prow is the read-only identity that reads both
+# from GitHub Actions (objectViewer on the first, that project's own grant on
+# the second). Literals rather than repository
 # variables, matching ci-health.yml — an unset variable resolves to empty in
 # silence, and an empty provider fails with an authentication error that says
 # nothing about which value went missing.
@@ -448,10 +451,11 @@ jobs:
       - name: Set up gcloud
         uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
 
-      # The Prow archive lives in kube-agents-prow, a project this repository does
-      # not own; github-actions@kube-agents-prow is the read-only identity it
-      # exposes for exactly this. ci-health.yml reaches the same bucket the same
-      # way.
+      # The Prow archive is two buckets: the default of kube-agents-prow, a
+      # project this repository does not own, and the lane's private
+      # kube-agents bucket; github-actions@kube-agents-prow is the read-only
+      # identity that reads both. ci-health.yml reaches the same buckets the
+      # same way.
       - name: Authenticate to the Prow archive project
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
         with:

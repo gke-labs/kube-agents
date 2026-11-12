@@ -100,6 +100,9 @@ field reference pages under `docs/site/src/content/docs/operator/` from the API 
 from one process ([its README](cmd/k8s-event-watcher/README.md) has the numbers); `go test -short ./...`
 skips it.
 
+`make test` does not run gosec; `make gosec` at the repository root does, over every Go module in
+the tree, from this module's pin.
+
 `make build`, `make run` and `make test` all run `manifests`, `generate`, `fmt` and `vet` first, so
 generated code and manifests stay in sync automatically. `make install`, `make uninstall` and
 `make deploy` deliberately do not: they apply the manifests exactly as committed, so a deploy ships

@@ -23199,6 +23199,9 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
                 self.assertFalse(self.harness.forge_calls("proposal-create"))
                 body = "".join(self.harness.bodies_for("issue-*"))
                 self.assertIn("## Awaiting `/remediate`", body)
+                # The worker is told the direct ask still opens these: a task that asked
+                # for the fixes runs `remediate` rather than stopping at the ledger.
+                self.assertIn("when this task asks you to open fixes, run `remediate --finding", self.err)
                 self.assertIn(f"`{audit_report.AUTO_PROMOTE_ENV}={audit_report.AUTO_PROMOTE_OFF}`", body)
                 self.assertIn(derived_id(), body[body.index("## Awaiting `/remediate`"):])
 
@@ -24555,7 +24558,8 @@ metadata:
     def test_the_live_run_a_degraded_fix_names_the_planted_declaration(self):
         """The worker named a file it never wrote, so the fix degraded to
         `manual`; the planted declaration was in the repository. The paragraph
-        keeps the eval's first sentence and names the planted file."""
+        names the planted file in its first sentence, and does not say "this
+        file", because the fix's file is not the declaration."""
         self.write(self.PLANTED, self.PLANTED_DECLARATION)
         finding = self.pool_finding({"kind": "manifest", "path": "clusters/fa2-seeded-a/pinned-inference-pool.tf", "note": "Append zones."})
         audit_report.degrade_missing_remediations([finding], self.root)
@@ -24563,11 +24567,176 @@ metadata:
         declarations = audit_report.kcc_declarations(self.root)
         self.assertEqual(audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, declarations), ["pool"])
         paragraph = finding["remediation"]["note"].split("\n\n")[-1]
-        self.assertTrue(paragraph.startswith(audit_report.KCC_STALLED_NOTE_MARK), paragraph[:120])
-        self.assertIn(f"The declaration is `{self.PLANTED}`.", paragraph)
+        self.assertTrue(paragraph.startswith(f"**Config Connector is not applying `{self.PLANTED}`.**"), paragraph[:120])
+        self.assertNotIn("this file", paragraph)
         self.assertIn("`ContainerNodePool eval-kcc-stalled/pinned-inference-pool`", paragraph)
         self.assertIn("DependencyNotFound", paragraph)
         self.assertIn("pinned-inference-pool", finding[audit_report.KCC_STALLED_FINDING_FIELD])
+
+    def test_a_copied_paragraph_that_names_a_file_is_stripped_and_written_again(self):
+        """The strip-and-rewrite pattern covers the first sentence that names
+        a file, as it covers the two fixed forms."""
+        self.write(self.PLANTED, self.PLANTED_DECLARATION)
+        declarations = audit_report.kcc_declarations(self.root)
+        finding = self.pool_finding({"kind": "manual", "note": "Spread the pool."})
+        audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, declarations)
+        once = finding["remediation"]["note"]
+        self.assertEqual(audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, declarations), [])
+        self.assertEqual(finding["remediation"]["note"], once)
+        self.assertEqual(once.count(audit_report.KCC_STALLED_MARK_PREFIX), 1)
+        audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(), self.root, declarations)
+        self.assertEqual(finding["remediation"]["note"], "Spread the pool.")
+
+    def test_guard_the_workers_own_text_stays_before_the_paragraph(self):
+        """A guard, not a fix test: it passed before any change. Two live
+        ledger rows showed only the paragraph as the fix's text, because the
+        worker gave no note. The pass keeps the worker's own text, when there
+        is any, before the paragraph, for a manifest fix of the declaring
+        file, a fix of another file, a manual fix and a note long enough to
+        be cut; with no worker text, the paragraph is the whole note and
+        nothing is made up in its place."""
+        self.write(self.PLANTED, self.PLANTED_DECLARATION)
+        declarations = audit_report.kcc_declarations(self.root)
+        long_text = ("Append us-central1-b and us-central1-c to the pool's node locations. " * 40).strip()
+        for remediation, expected in (
+            ({"kind": "manifest", "path": self.PLANTED, "note": "Append zones."}, "Append zones."),
+            ({"kind": "manifest", "path": "clusters/fa2-seeded-a/other.yaml", "note": "Append zones."}, "Append zones."),
+            ({"kind": "manual", "note": "Append zones."}, "Append zones."),
+            ({"kind": "manual", "note": long_text}, long_text[:200]),
+        ):
+            with self.subTest(kind=remediation["kind"], path=remediation.get("path")):
+                finding = self.pool_finding(dict(remediation))
+                audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, declarations)
+                note = finding["remediation"]["note"]
+                self.assertTrue(note.startswith(expected), note[:200])
+                self.assertLess(note.index(expected), note.index(audit_report.KCC_STALLED_MARK_PREFIX))
+        for remediation in ({"kind": "manifest", "path": self.PLANTED, "note": ""}, {"kind": "manifest", "path": self.PLANTED}):
+            finding = self.pool_finding(dict(remediation))
+            audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, declarations)
+            self.assertTrue(finding["remediation"]["note"].startswith(audit_report.KCC_STALLED_NOTE_MARK))
+
+    def test_a_worker_sentence_with_the_same_start_is_not_stripped(self):
+        """Review finding: the strip pattern took everything after the shared
+        start of the paragraph's first sentence, so a worker sentence that
+        starts the same way lost its end. Only an exact first sentence is a
+        copied paragraph."""
+        worker = ("Raise maxNodeCount to 6 in the pool file. **Config Connector is not applying the pool's last change**, "
+                  "so check its status first, then merge the pull request.")
+        finding = self.pool_finding({"kind": "manual", "note": worker})
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            audit_report.disclose_stalled_kcc_and_log([finding], kcc_manifest(), self.root, declarations={})
+        self.assertEqual(finding["remediation"]["note"], worker)
+        self.assertNotIn("removed", err.getvalue())
+
+    def test_every_exact_first_sentence_is_stripped(self):
+        tail = " When the audit ran, Config Connector reported `Ready=False` on `X a/b` (`UpdateFailed`)."
+        for mark in (
+            audit_report.KCC_STALLED_NOTE_MARK,
+            audit_report.KCC_STALLED_OBJECT_MARK,
+            audit_report.KCC_STALLED_DECLARED_MARK.format(path="`a/b.yaml`"),
+            audit_report.KCC_STALLED_DECLARED_MARK.format(path="`a/b.yaml` in the repository `acme/infra`"),
+        ):
+            with self.subTest(mark=mark):
+                remediation = {"kind": "manual", "note": "Do it.\n\n" + mark + tail}
+                audit_report._strip_kcc_stalled_note(remediation)
+                self.assertEqual(remediation["note"], "Do it.")
+
+    def test_a_worker_sentence_with_a_code_span_is_not_stripped(self):
+        """Review finding: the first-sentence pattern took any code span, so a
+        worker sentence that names an object in one lost the sentence and the
+        rest of its line, and the log called it a copied paragraph. A copied
+        paragraph is one that goes on as `finish` writes it."""
+        worker = ("Raise maxNodeCount to 6. **Config Connector is not applying `pinned-inference-pool`.** "
+                  "Check its status first, then merge.")
+        finding = self.pool_finding({"kind": "manual", "note": worker})
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            audit_report.disclose_stalled_kcc_and_log([finding], kcc_manifest(), self.root, declarations={})
+            audit_report.disclose_manual_routes_and_log([finding], kcc_manifest(), set())
+        self.assertEqual(finding["remediation"]["note"], worker)
+        self.assertNotIn("copied", err.getvalue())
+        self.assertNotIn("removed", err.getvalue())
+
+    def test_every_paragraph_finish_writes_is_stripped(self):
+        """Every step of each paragraph form, the context-repository form
+        included, is stripped and written again."""
+        self.write(self.PLANTED, self.PLANTED_DECLARATION)
+        stalled = audit_report.kcc_health(self.live_manifest()).stalled
+        objects = audit_report.kcc_stalled_objects(stalled, stalled)
+        texts = [audit_report.KCC_STALLED_NOTE.format(objects=objects), audit_report.KCC_STALLED_NOTE_CORE.format(objects=objects)]
+        for path in ("`a/b.yaml`", "`a/b.yaml` in the repository `acme/infra`"):
+            texts += [audit_report.KCC_STALLED_DECLARED_NOTE.format(path=path, objects=objects),
+                      audit_report.KCC_STALLED_DECLARED_CORE.format(path=path, objects=objects)]
+        for search in (audit_report.KCC_DECLARATION_NOT_NAMED, audit_report.KCC_DECLARATION_SEARCH_MANY.format(count=2)):
+            texts += [audit_report.KCC_STALLED_UNDECLARED_NOTE.format(search=search, objects=objects),
+                      audit_report.KCC_STALLED_UNDECLARED_CORE.format(search=search, objects=objects)]
+        for text in texts:
+            with self.subTest(text=text[:60]):
+                remediation = {"kind": "manual", "note": "Do it.\n\n" + text}
+                audit_report._strip_kcc_stalled_note(remediation)
+                self.assertEqual(remediation["note"], "Do it.")
+
+    # The paragraph that main wrote before the first sentence named the file:
+    # "this file" and then a second sentence that names it. A previous ledger
+    # can hold it, and the carry copies it.
+    MAIN_DECLARED_CORE = ("**Config Connector is not applying this file.** The declaration is {path}. "
+                          "When the audit ran, Config Connector reported {objects}.")
+    MAIN_DECLARED_TAIL = (" Config Connector does not apply the object until that reason is gone, so a change to the "
+                          "declaration does not take effect before then, and this finding comes back on each run until "
+                          "then. If the reason rejects the declaration, correct it there.")
+
+    def carried_main_paragraph(self, path, manifest, tail=True):
+        """Run the carry with a previous ledger whose manual fix has main's
+        paragraph, then the paragraph pass on this run's manifest."""
+        self.write(self.PLANTED, self.PLANTED_DECLARATION)
+        declarations = audit_report.kcc_declarations(self.root)
+        stalled = audit_report.kcc_health(self.live_manifest()).stalled
+        objects = audit_report.kcc_stalled_objects(stalled, stalled)
+        old = self.MAIN_DECLARED_CORE.format(path=path, objects=objects) + (self.MAIN_DECLARED_TAIL if tail else "")
+        before = self.pool_finding({"kind": "manual", "note": "Spread the pool by hand.\n\n" + old})
+        now = self.pool_finding({"kind": "manual", "note": "Spread the pool."})
+        self.assertEqual(audit_report.carry_unchanged_findings([now], {"findings": [before]}), ["pool"])
+        audit_report.disclose_stalled_kcc_remediations([now], manifest, self.root, declarations)
+        return now["remediation"]["note"]
+
+    def main_paths(self):
+        return (f"`{self.PLANTED}`", f"`{self.PLANTED}` in the repository `acme/infra`")
+
+    def test_a_carried_paragraph_from_main_goes_when_the_stall_clears(self):
+        """Review finding: main's paragraph has a second sentence between
+        "this file.**" and the text that every paragraph goes on with, so the
+        strip pattern did not match it. The carry copied it, and the note
+        kept a stall that this run did not see."""
+        for path in self.main_paths():
+            for tail in (True, False):
+                with self.subTest(path=path, tail=tail):
+                    note = self.carried_main_paragraph(path, kcc_manifest(), tail)
+                    self.assertEqual(note, "Spread the pool by hand.")
+
+    def test_a_carried_paragraph_from_main_is_written_again_once_when_the_stall_continues(self):
+        """The same carry while the stall continues: the note holds one
+        paragraph, this run's, and not main's paragraph beside it."""
+        for path in self.main_paths():
+            for tail in (True, False):
+                with self.subTest(path=path, tail=tail):
+                    note = self.carried_main_paragraph(path, self.live_manifest(), tail)
+                    self.assertTrue(note.startswith("Spread the pool by hand.\n\n"), note[:120])
+                    self.assertEqual(note.count(audit_report.KCC_STALLED_MARK_PREFIX), 1, note)
+                    self.assertNotIn("The declaration is", note)
+                    self.assertNotIn(audit_report.KCC_STALLED_NOTE_MARK, note)
+
+    def test_a_worker_sentence_like_mains_first_two_sentences_is_not_stripped(self):
+        """Main's two first sentences, without the text that every paragraph
+        goes on with, are a worker's sentences and stay."""
+        worker = ("Raise maxNodeCount to 6. **Config Connector is not applying this file.** "
+                  "The declaration is `clusters/prod.yaml`. Check its status first, then merge.")
+        finding = self.pool_finding({"kind": "manual", "note": worker})
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            audit_report.disclose_stalled_kcc_and_log([finding], kcc_manifest(), self.root, declarations={})
+        self.assertEqual(finding["remediation"]["note"], worker)
+        self.assertNotIn("removed", err.getvalue())
 
     def test_no_declaration_found_gives_the_sibling_sentence(self):
         finding = self.pool_finding({"kind": "manual", "note": "Spread the pool."})
@@ -24599,10 +24768,10 @@ metadata:
         self.assertEqual(changed, ["pool"])
         self.assertEqual(finding["remediation"]["note"], command)
         paragraph = finding[audit_report.KCC_STALLED_PARAGRAPH_FIELD]
-        self.assertIn(f"The declaration is `{self.PLANTED}`.", paragraph)
+        self.assertIn(f"**Config Connector is not applying `{self.PLANTED}`.**", paragraph)
         rendered = "\n".join(audit_report.render_finding(finding))
-        self.assertLess(rendered.index(command), rendered.index(audit_report.KCC_STALLED_NOTE_MARK))
-        self.assertIn("```\n\n" + audit_report.KCC_STALLED_NOTE_MARK, rendered)
+        self.assertLess(rendered.index(command), rendered.index(audit_report.KCC_STALLED_MARK_PREFIX))
+        self.assertIn("```\n\n" + audit_report.KCC_STALLED_MARK_PREFIX, rendered)
         # A worker's copy of the field is dropped.
         finding[audit_report.KCC_STALLED_PARAGRAPH_FIELD] = "made up"
         validated = audit_report.validate_findings(make_doc(findings=[finding]), AUDIT)
@@ -24628,7 +24797,7 @@ metadata:
         scan = audit_report.kcc_declarations_via_broker("acme/fleet", self.broker(files), every_kind=True)
         finding = self.pool_finding({"kind": "manual", "note": "Spread the pool."})
         audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, scan)
-        self.assertIn(f"The declaration is `{self.PLANTED}`.", finding["remediation"]["note"])
+        self.assertIn(f"**Config Connector is not applying `{self.PLANTED}`.**", finding["remediation"]["note"])
 
     def test_content_mode_indexes_every_config_connector_kind(self):
         """A PubSubTopic, not only the container kinds, and a file whose only
@@ -24644,7 +24813,7 @@ metadata:
         finding = make_finding(fid="t", check="kcc-object-wedged", cluster="acme/us-central1/hub", obj="PubSubTopic/events",
                                namespace="infra", remediation={"kind": "manual", "note": "Grant the role."})
         audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(dict(KCC_TOPIC, name="events")), self.root, scan)
-        self.assertIn("The declaration is `pubsub/events.yaml`.", finding["remediation"]["note"])
+        self.assertIn("**Config Connector is not applying `pubsub/events.yaml`.**", finding["remediation"]["note"])
 
     def test_the_gcloud_check_reads_the_container_kinds_and_the_paragraph_every_kind(self):
         """The gcloud check reads only the files that name the container
@@ -24698,7 +24867,7 @@ metadata:
             with self.subTest(mode=label):
                 finding = self.pool_finding({"kind": "manual", "note": "Spread the pool."})
                 audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, declarations)
-                self.assertIn(f"The declaration is `{path}`.", finding["remediation"]["note"])
+                self.assertIn(f"**Config Connector is not applying `{path}`.**", finding["remediation"]["note"])
 
     def test_the_absence_sentence_is_gone(self):
         """No text the audit writes says that no file declares an object."""
@@ -24750,7 +24919,7 @@ metadata:
         self.assertEqual(
             audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(stall), self.root, declarations), ["b"]
         )
-        self.assertIn("The declaration is `projects/b/cluster.yaml`.", finding["remediation"]["note"])
+        self.assertIn("**Config Connector is not applying `projects/b/cluster.yaml`.**", finding["remediation"]["note"])
         # The gcloud check still takes the first declaration of the name, as before.
         command = make_finding(fid="g", cluster="proj-b/us-central1/prod", obj="Cluster/prod",
                                remediation={"kind": "gcloud", "note": "gcloud container clusters update prod --release-channel regular"})
@@ -24777,7 +24946,7 @@ metadata:
         audit_report.disclose_stalled_kcc_remediations([finding], self.live_manifest(), self.root, audit_report.kcc_declarations(self.root))
         paragraph = finding["remediation"]["note"].split("\n\n")[-1]
         self.assertEqual(paragraph, audit_report.KCC_STALLED_NOTE.format(objects=finding[audit_report.KCC_STALLED_FINDING_FIELD]))
-        self.assertNotIn("The declaration is", paragraph)
+        self.assertNotIn("**Config Connector is not applying `", paragraph)
 
     def test_both_first_sentences_are_stripped_and_written_again(self):
         finding = self.pool_finding({"kind": "manual", "note": "Spread the pool."})
@@ -24803,7 +24972,7 @@ metadata:
                 manifest = {"clusters": [{"name": "hubp/us-central1/hub", "outcome": "collected", "kcc_unready": [
                     {"kind": "PubSubTopic", "namespace": ns, "name": "events", "project": "p", "why": "UpdateFailed: 403"}]}]}
                 audit_report.disclose_stalled_kcc_remediations([finding], manifest, self.root, declarations)
-                self.assertIn(f"The declaration is `{path}`.", finding["remediation"]["note"])
+                self.assertIn(f"**Config Connector is not applying `{path}`.**", finding["remediation"]["note"])
 
     POOL_STALL = {"kind": "ContainerNodePool", "namespace": "infra", "name": "pinned-inference-pool", "cluster": "c1",
                   "project": "p", "why": "DependencyNotFound: reference ContainerCluster infra/c1 is not found"}
@@ -24839,6 +25008,36 @@ metadata:
         self.assertTrue(paragraph.startswith(audit_report.KCC_STALLED_OBJECT_MARK), paragraph[:120])
         self.assertLessEqual(len(audit_report.publishable_text(note).strip()), audit_report.MAX_NOTE_CHARS)
         self.assertEqual(audit_report.clip_text(note, audit_report.MAX_NOTE_CHARS), note.strip())
+        self.assertIn("the fix says so", err.getvalue())
+
+    def test_a_shortened_kustomize_block_keeps_the_location_note(self):
+        """The copied file fills the cap beside a declared-file note and the
+        reconciler note. The shorter block makes room for the paragraph's
+        core and for both route notes: the location note is not pushed out."""
+        reason = ("did not open a pull request for this fix. `clusters/a/provisioning/pool.yaml` is a new file in the "
+                  "Kustomize root `clusters/a`, and `clusters/a/kustomization.yaml` does not list it. "
+                  f"{audit_report.KUSTOMIZE_NOTE_MARK} To apply the fix, add the file and add the line `- provisioning/pool.yaml` "
+                  "under `resources:` in `clusters/a/kustomization.yaml`")
+        prefix = f"_(The audit {reason}.)_"
+        declared = audit_report.DECLARED_NOTE.format(path="clusters/a/provisioning/pool.yaml")
+        reconciled = audit_report.RECONCILED_NOTE.format(reconciler="the Argo CD Application `infra`")
+        routes = "\n\n" + declared + "\n\n" + reconciled
+        lines = ["apiVersion: container.cnrm.cloud.google.com/v1beta1", "kind: ContainerNodePool", "metadata:",
+                 "  name: pinned-inference-pool", "spec:", "  location: us-central1"] + [
+            f"  # a long explanatory comment line in the worker file, number {i:02d}, kept as is" for i in range(40)]
+        block = audit_report._sized_manifest_block(
+            lines, True, lambda b: len(audit_report.publishable_text(prefix + b + routes)) <= audit_report.MAX_NOTE_CHARS
+        )
+        finding = self.harness_finding(prefix + block + " Raise the cap." + routes)
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            audit_report.disclose_stalled_kcc_and_log([finding], kcc_manifest(self.POOL_STALL), self.root, declarations={})
+        note = finding["remediation"]["note"]
+        self.assertTrue(note.startswith(prefix), note[:200])
+        self.assertIn(declared, note)
+        self.assertIn(reconciled, note)
+        self.assertEqual(note.count("```") % 2, 0)
+        self.assertTrue(note.split("\n\n")[-1].startswith(audit_report.KCC_STALLED_OBJECT_MARK), note[-300:])
+        self.assertLessEqual(len(audit_report.publishable_text(note).strip()), audit_report.MAX_NOTE_CHARS)
         self.assertIn("the fix says so", err.getvalue())
 
     def test_the_paragraph_never_cuts_the_degraded_fix_text(self):
@@ -24945,12 +25144,12 @@ metadata:
         declarations = audit_report.kcc_declarations(self.root)
         finding = self.wedged("p/us-central1/hub-a", kind="manual")
         self.assertEqual(audit_report.disclose_stalled_kcc_remediations([finding], manifest, self.root, declarations), ["w"])
-        self.assertIn("The declaration is `pubsub/events.yaml`.", finding["remediation"]["note"])
+        self.assertIn("**Config Connector is not applying `pubsub/events.yaml`.**", finding["remediation"]["note"])
         # The fix of the declaring file gets the paragraph about that file.
         finding = self.wedged("p/us-central1/hub-a")
         self.assertEqual(audit_report.disclose_stalled_kcc_remediations([finding], manifest, self.root, declarations), ["w"])
         self.assertIn(audit_report.KCC_STALLED_NOTE_MARK, finding["remediation"]["note"])
-        self.assertNotIn("The declaration is", finding["remediation"]["note"])
+        self.assertNotIn("**Config Connector is not applying `", finding["remediation"]["note"])
         manifest["clusters"][0]["kcc_unready"] = [dict(self.TOPIC_STALL, project="other")]
         finding = self.wedged("p/us-central1/hub-a", kind="manual")
         self.assertEqual(audit_report.disclose_stalled_kcc_remediations([finding], manifest, self.root, declarations), [])
@@ -25012,6 +25211,26 @@ metadata:
                 self.assertIn(audit_report.KCC_DECLARATION_NOT_NAMED, note)
                 self.assertNotIn(path, note)
 
+    def test_the_paragraph_never_pushes_out_a_location_note(self):
+        """Review finding: a paragraph step was accepted as shorter although
+        it pushed out the location note (here the declared file), and only the
+        reconciler note was held. Every route note already on the note stays."""
+        prose = (f"This object is declared in the GitOps repository at `clusters/c1/pool.yaml`, whose spec sets "
+                 f"`autoscaling`. {audit_report.KCC_REVERTED_NOTE_MARK}, so the command below is reverted on the next "
+                 "reconcile and this finding returns on the next run. Make the change in that file instead.")
+        reconciled = audit_report.RECONCILED_NOTE.format(reconciler="the Argo CD Application `infra`")
+        declared = audit_report.DECLARED_NOTE.format(path="clusters/c1/pool.yaml")
+        for repeats in range(20, 40):
+            command = "gcloud container node-pools update pinned-inference-pool --cluster c1 " + "--node-locations us-central1-a " * repeats
+            note = f"{prose}\n\n```bash\n{command.strip()}\n```" + "\n\n" + declared + "\n\n" + reconciled
+            finding = self.harness_finding(note)
+            audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(self.POOL_STALL), self.root, {})
+            with self.subTest(repeats=repeats):
+                result = finding["remediation"]["note"]
+                self.assertIn(declared, result)
+                self.assertIn(reconciled, result)
+                self.assertIn(audit_report.KCC_STALLED_MARK_PREFIX, result)
+
     def test_the_paragraph_never_pushes_out_the_reconciler_note(self):
         """A note of a reverted gcloud command (about 1,400 characters), which
         `finish` wrote and never cuts, leaves room for the reconciler note or
@@ -25049,7 +25268,7 @@ metadata:
         self.write("b/prod.yaml", cluster.format(project="proj-b", location="europe-west1"))
         finding["remediation"]["note"] = "Set the channel."
         audit_report.disclose_stalled_kcc_remediations([finding], kcc_manifest(stall), self.root, audit_report.kcc_declarations(self.root))
-        self.assertIn("The declaration is `b/prod.yaml`.", finding["remediation"]["note"])
+        self.assertIn("**Config Connector is not applying `b/prod.yaml`.**", finding["remediation"]["note"])
 
     def test_a_kubernetes_kind_never_takes_a_config_connector_object_of_the_same_kind_name(self):
         """A compliance `lb-world-open` finding on the Kubernetes Service
@@ -38161,6 +38380,245 @@ class TestRetiredUnlistedOnClose(HarnessTestCase):
         for answer in answers:
             self.assertNotIn("no longer reproduces", answer)
         self.assertTrue(any("not confirmed fixed" in a for a in answers))
+
+
+class TestRemediateWritesTheGeneratedBudget(HarnessTestCase):
+    """A direct ask for a declared `no-pdb` finding the worker left `manual`,
+    as the SOP tells it to: `remediate` writes the PodDisruptionBudget `finish`
+    would write and opens it, instead of refusing the finding as not a
+    `manifest`. This is the only way a chat ask reaches that budget on an
+    install whose automatic sweep is off (`KUBEAGENTS_AUDIT_AUTO_PROMOTE=false`),
+    which is every eval lane since #3439."""
+
+    SELECTOR = {"matchLabels": {"app": "checkout-gateway"}}
+    DECLARATION = "clusters/prod-us-east/payments/checkout-gateway.yaml"
+    GENERATED = "clusters/prod-us-east/payments/checkout-gateway-pdb.yaml"
+    STREAM = "obtainability-audit"
+
+    def finding(self):
+        return make_finding(
+            fid="checkout-gateway",
+            check="no-pdb",
+            severity="major",
+            obj="Deployment/checkout-gateway",
+            remediation={"kind": "manual", "note": "Let finish write the budget."},
+        )
+
+    def stream_tree(self):
+        """The obtainability stream's clone; `self.workspace` is the default stream's."""
+        return self.workspace.parent.parent / self.STREAM / self.workspace.name
+
+    def fid(self):
+        return derived_id(check="no-pdb", obj="Deployment/checkout-gateway")
+
+    def manifest_file(self, **fields):
+        candidate = {
+            "check": "no-pdb",
+            "cluster": "prod-us-east",
+            "namespace": "payments",
+            "object": "Deployment/checkout-gateway",
+            "severity": "major",
+            "excerpt": "replicas=2, no PodDisruptionBudget",
+            "impact": "x",
+            "needs_triage": None,
+            "declaration": {"path": self.DECLARATION, "directory": "clusters/prod-us-east/payments"},
+            "pod_selector": self.SELECTOR,
+            **fields,
+        }
+        path = self.tmp_path / "manifest.json"
+        path.write_text(json.dumps(_full_manifest(candidates=[candidate], audit=self.STREAM)), encoding="utf-8")
+        return str(path)
+
+    def run_remediate(self, extra=()):
+        self.record_run(context=["acme/fleet"])
+        path = self.write_findings(searched_doc(findings=[self.finding()]))
+        return self.run_main(
+            ["remediate", "--audit", self.STREAM, "--findings-file", path, "--finding", self.fid(), *extra]
+        )
+
+    def test_it_writes_the_budget_beside_the_declaration_and_opens_it(self):
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8"),
+        }
+        rc = self.run_remediate(["--manifest-file", self.manifest_file()])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()["prs_opened"], ["https://github.com/acme/fleet/pull/8"])
+        self.assertEqual(self.stdout_json()["refused"], [])
+        self.assertIn("GENERATED: " + self.fid(), self.err)
+        document = pytest_yaml().safe_load((self.stream_tree() / self.GENERATED).read_text())
+        self.assertEqual(document["kind"], "PodDisruptionBudget")
+        self.assertEqual(document["metadata"], {"name": "checkout-gateway-pdb", "namespace": "payments"})
+        self.assertEqual(document["spec"], {"maxUnavailable": 1, "selector": self.SELECTOR})
+        self.assertEqual(len(self.harness.forge_calls("proposal-create")), 1)
+
+    def test_without_the_manifest_it_is_refused_and_says_to_pass_it(self):
+        self.assertEqual(self.run_remediate(), 2)
+        self.assertIn("pass the collector's --manifest-file", self.err)
+        self.assertEqual(self.harness.calls, [])
+        self.assertFalse((self.stream_tree() / self.GENERATED).exists())
+
+    def test_a_budget_the_planner_will_not_write_is_refused_with_its_reason(self):
+        self.harness.replies = {"issue-list": self.issue_list()}
+        rc = self.run_remediate(["--manifest-file", self.manifest_file(namespace_pdbs=["checkout-gateway-pdb"])])
+        self.assertEqual(rc, 2)
+        self.assertIn(f"REFUSED {self.fid()}: the namespace already has a PodDisruptionBudget", self.err)
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+        self.assertFalse((self.stream_tree() / self.GENERATED).exists())
+
+    def test_the_dry_run_says_it_would_write_the_budget_and_writes_nothing(self):
+        rc = self.run_remediate(["--dry-run", "--manifest-file", self.manifest_file()])
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn("the real run writes its PodDisruptionBudget beside " + self.DECLARATION, self.err)
+        self.assertEqual(self.harness.calls, [])
+        self.assertFalse((self.stream_tree() / self.GENERATED).exists())
+
+    WORKER_BUDGET = (
+        "apiVersion: policy/v1\nkind: PodDisruptionBudget\nmetadata:\n"
+        "  name: checkout-gateway-pdb\n  namespace: payments\nspec:\n  maxUnavailable: 1\n"
+    )
+
+    def run_over_declaration(self, extra=()):
+        """The worker wrote its budget over the Deployment's own file, under the
+        conventional `<workload>-pdb` name, and named that file as the fix."""
+        # An existing clone (it has `.git`), so `ensure_workspace` reuses it and the
+        # worker's file is still there when the name search runs; a first clone would
+        # remove it, and the test could not tell `probe.ignored` from its absence.
+        (self.stream_tree() / ".git").mkdir(parents=True, exist_ok=True)
+        declaration = self.stream_tree() / self.DECLARATION
+        declaration.parent.mkdir(parents=True, exist_ok=True)
+        declaration.write_text(self.WORKER_BUDGET, encoding="utf-8")
+        finding = self.finding()
+        finding["remediation"] = {"kind": "manifest", "path": self.DECLARATION, "note": "x"}
+        self.record_run(context=["acme/fleet"])
+        path = self.write_findings(searched_doc(findings=[finding]))
+        return self.run_main(
+            ["remediate", "--audit", self.STREAM, "--findings-file", path, "--finding", self.fid(),
+             "--manifest-file", self.manifest_file(), *extra]
+        )
+
+    def test_a_budget_named_over_the_declaration_is_written_beside_it(self):
+        """A merge of the worker's file would replace the workload, so it is
+        demoted and the budget written beside, as `finish` does. The name search
+        reads past the worker's file, which names nothing the repository holds."""
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/9"),
+        }
+        rc = self.run_over_declaration()
+        self.assertEqual(rc, 0, self.err)
+        self.assertNotIn("already names an object", self.err)
+        self.assertIn("the budget is planned beside it instead", self.err)
+        self.assertEqual(self.stdout_json()["prs_opened"], ["https://github.com/acme/fleet/pull/9"])
+        self.assertTrue((self.stream_tree() / self.GENERATED).is_file())
+        # The worker's file was there for the name search, so `probe.ignored` was what let it pass.
+        self.assertEqual((self.stream_tree() / self.DECLARATION).read_text(), self.WORKER_BUDGET)
+
+    def test_the_dry_run_says_so_for_a_budget_over_the_declaration(self):
+        rc = self.run_over_declaration(["--dry-run"])
+        self.assertEqual(rc, 0, self.err)
+        self.assertIn("DRY RUN: " + self.fid() + " names its PodDisruptionBudget", self.err)
+        self.assertNotIn("the budget is planned beside it instead", self.err)
+        self.assertFalse((self.stream_tree() / self.GENERATED).exists())
+
+    def test_a_withheld_selector_over_the_declaration_is_not_announced_as_written(self):
+        self.manifest_file = lambda real=self.manifest_file: real(pod_selector_withheld="other pods match")
+        self.assertEqual(self.run_over_declaration(), 2)
+        self.assertNotIn("beside it instead", self.err)
+
+    def human_closed_own_branch(self):
+        branch = audit_report.group_branch_for(
+            self.STREAM, [{"id": self.fid(), "remediation": {"kind": "manifest", "path": self.GENERATED}}]
+        )
+        return proposals_view(
+            [
+                {
+                    **pr(8, branch, state="CLOSED", body=audit_report.delta_block([self.fid()])),
+                    "closedAt": "2026-07-15T00:00:00Z",
+                    "labels": [],
+                }
+            ]
+        )
+
+    def test_a_human_close_on_the_budgets_own_branch_is_superseded(self):
+        self.harness.replies = {"issue-list": self.issue_list(), "proposal-list": self.human_closed_own_branch()}
+        rc = self.run_remediate(["--manifest-file", self.manifest_file()])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()["superseded"], [self.fid()])
+        self.assertEqual(self.stdout_json()["refused"], [])
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+
+    def test_the_override_flag_revives_a_human_closed_budget(self):
+        self.harness.replies = {
+            "issue-list": self.issue_list(),
+            "proposal-list": self.human_closed_own_branch(),
+            "proposal-create": created("proposal", "https://github.com/acme/fleet/pull/10"),
+        }
+        rc = self.run_remediate(["--manifest-file", self.manifest_file(), "--override-human-close"])
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(self.stdout_json()["superseded"], [])
+        self.assertEqual(self.stdout_json()["prs_opened"], ["https://github.com/acme/fleet/pull/10"], self.err)
+
+    def test_a_withheld_selector_is_not_planned(self):
+        manifest = json.loads(pathlib.Path(self.manifest_file(pod_selector_withheld="other pods match")).read_text())
+        self.assertEqual(audit_report.requested_generated_fixes([self.finding()], manifest, [self.fid()]), {})
+
+    def test_a_refusal_names_what_the_collector_did_not_find(self):
+        """A direct ask refused as not a `manifest` says why the budget is not written."""
+        cases = {
+            "no declaration": ({"declaration": None}, "candidate for it carries no `declaration`"),
+            "withheld selector": ({"pod_selector_withheld": "other pods match"}, "withheld the workload's selector: other pods match"),
+            "no candidate": ({"object": "Deployment/other"}, "has no no-pdb candidate for"),
+        }
+        for name, (fields, phrase) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(self.run_remediate(["--manifest-file", self.manifest_file(**fields)]), 2)
+                self.assertIn(phrase, self.err)
+                self.assertEqual(self.harness.calls, [])
+
+    def budget_pr(self, branch, state="OPEN"):
+        return proposals_view([{**pr(21, branch, state=state, body=audit_report.delta_block([self.fid()])), "labels": []}])
+
+    def own_branch(self):
+        return audit_report.group_branch_for(
+            self.STREAM, [{"id": self.fid(), "remediation": {"kind": "manifest", "path": self.GENERATED}}]
+        )
+
+    def test_a_rerun_meeting_its_own_open_pull_request_reports_it_already_open(self):
+        self.harness.replies = {"issue-list": self.issue_list(), "proposal-list": self.budget_pr(self.own_branch())}
+        self.assertEqual(self.run_remediate(["--manifest-file", self.manifest_file()]), 0, self.err)
+        self.assertEqual(self.stdout_json()["already_open"], [self.fid()])
+        self.assertEqual(self.stdout_json()["prs_opened"], [])
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+
+    def test_a_pull_request_on_another_branch_carrying_the_finding_answers_it(self):
+        self.harness.replies = {"issue-list": self.issue_list(), "proposal-list": self.budget_pr("someone/their-budget")}
+        self.assertEqual(self.run_remediate(["--manifest-file", self.manifest_file()]), 2)
+        self.assertIn("already carries it", self.err)
+        self.assertEqual(self.harness.forge_calls("proposal-create"), [])
+
+    def test_a_budget_already_in_the_repository_reads_as_already_fixed(self):
+        (self.stream_tree() / ".git").mkdir(parents=True, exist_ok=True)
+        existing = self.stream_tree() / self.GENERATED
+        existing.parent.mkdir(parents=True, exist_ok=True)
+        existing.write_text("kind: PodDisruptionBudget\n", encoding="utf-8")
+        self.harness.replies = {"issue-list": self.issue_list()}
+        self.assertEqual(self.run_remediate(["--manifest-file", self.manifest_file()]), 2)
+        self.assertIn(f"REFUSED {self.fid()}: already fixed: {self.GENERATED} exists", self.err)
+
+    def test_only_named_findings_are_planned(self):
+        named, other = self.finding(), self.finding()
+        other["object"] = "Deployment/other"
+        manifest = json.loads(pathlib.Path(self.manifest_file()).read_text())
+        fixes = audit_report.requested_generated_fixes([named, other], manifest, [str(named["id"])])
+        self.assertEqual(list(fixes), [str(named["id"])])
+
+    def test_a_manifest_finding_is_untouched_by_the_planner(self):
+        """Only a `manual` finding is planned; a worker-written file is opened as written."""
+        finding = self.finding()
+        finding["remediation"] = {"kind": "manifest", "path": "clusters/prod-us-east/payments/own-pdb.yaml", "note": "x"}
+        manifest = json.loads(pathlib.Path(self.manifest_file()).read_text())
+        self.assertEqual(audit_report.requested_generated_fixes([finding], manifest, [str(finding["id"])]), {})
 
 
 if __name__ == "__main__":

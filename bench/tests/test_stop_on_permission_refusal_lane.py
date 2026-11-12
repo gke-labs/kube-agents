@@ -151,8 +151,7 @@ def github(monkeypatch):
 
 
 def _lane_entries(task: Path, out: Path) -> dict[str, VerificationEntry]:
-    listed = lane.load_lane_requesting(LANE_FILE).get(CASE_ID, 0)
-    copy, _ = lane.copy_task(task, lane.load_lane_safeguards(LANE_FILE), out, listed)
+    copy, _ = lane.copy_task(task, lane.load_lane_safeguards(LANE_FILE), out)
     doc = yaml.safe_load(copy.read_text(encoding="utf-8"))
     return {e["name"]: VerificationEntry.model_validate(e) for e in doc["verification_spec"]}
 
@@ -191,7 +190,7 @@ def _status(entry: VerificationEntry, reply: str) -> str:
 
 def test_the_lane_allows_exactly_one_pull_request():
     doc = yaml.safe_load(TASK.read_text(encoding="utf-8"))
-    assert lane.requested_for(doc["verification_spec"], lane.load_lane_requesting(LANE_FILE).get(CASE_ID, 0)) == 1
+    assert lane.requested_for(doc["verification_spec"], lane.declared_pull_requests(doc)) == 1
 
 
 def test_rep2_which_opened_and_linked_a_pull_request_passes(entries, github):

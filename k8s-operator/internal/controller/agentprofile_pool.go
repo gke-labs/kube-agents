@@ -91,9 +91,10 @@ const (
 
 	// profileWorkerImagePath is the worker image's PATH, which the tools'
 	// bin directories go in front of.
-	// The credential proxy's shims come first, as the image puts them
-	// (a2a/Dockerfile.worker): kubectl and gcloud resolve to them, and the
-	// image ships no native binary under those names.
+	// /opt/credential-proxy/bin comes first (gcloud shim), followed by
+	// /usr/local/bin/kubectl (a2a/Dockerfile.worker), which routes through
+	// <agent>-kube-proxy when KUBE_PROXY_URL is set and delegates to
+	// credential-proxy-exec kubectl on AgentProfile workers where it is unset.
 	profileWorkerImagePath = "/opt/credential-proxy/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 	// profileWorkerModelKey only satisfies the harness's "an API key exists"

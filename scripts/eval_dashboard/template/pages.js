@@ -94,6 +94,11 @@ const PAGE = {
   gcsObject: "https://storage.cloud.google.com/",
   job: "pull-kube-agents-smoke-test",
   prUrl: "https://github.com/gke-labs/kube-agents/pull",
+  // A bare "#N" is an issue of the source repository (case-notes.yaml's,
+  // the allowlist's); the bots' own issues arrive as full URLs and may live
+  // in another repository (health.json's issues_repo), which the link text
+  // then names.
+  sourceRepo: "gke-labs/kube-agents",
   issueUrl: "https://github.com/gke-labs/kube-agents/issues",
   rulesUrl: "https://github.com/gke-labs/kube-agents/blob/main/scripts/eval_dashboard/classify.py",
   rosterUrl: "https://github.com/gke-labs/kube-agents/blob/main/docs/eval-gate-roster.md",
@@ -487,8 +492,12 @@ const transcriptUrl = (run, kase, n = 1) => {
 // rep_n); rep 1, as the pages always linked, when the row names none.
 const repOf = (c) => (Number.isInteger(c.rep_n) && c.rep_n > 0 ? c.rep_n : 1);
 const issueLink = (issue) => {
-  const match = /^#(\d+)$/.exec(String(issue).trim());
-  return match ? `<a href="${PAGE.issueUrl}/${match[1]}">${esc(issue)}</a>` : esc(issue);
+  const text = String(issue).trim();
+  const bare = /^#(\d+)$/.exec(text);
+  if (bare) return `<a href="${PAGE.issueUrl}/${bare[1]}">${esc(text)}</a>`;
+  const full = /^https:\/\/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/issues\/(\d+)$/.exec(text);
+  if (full) return `<a href="${esc(text)}">${esc(full[1] === PAGE.sourceRepo ? `#${full[2]}` : `${full[1]}#${full[2]}`)}</a>`;
+  return esc(text);
 };
 const projectShort = (project) => (project ? String(project).replace(/^kube-agents-/, "") : "unknown");
 

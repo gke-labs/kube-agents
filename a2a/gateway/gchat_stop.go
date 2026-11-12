@@ -15,15 +15,16 @@ import (
 // terminal edit arrives without Stop and takes the button off, as Edit does.
 // A click on it sends the cancel a typed `stop` sends: it lands on the
 // gateway as IntentCancel with no text, naming the task the button carries
-// and bound to the conversation it carries, for anyone the allowlist admits,
-// and the gateway answers it on the line itself rather than with the typed
-// stop's posts, or, for a task that is not the running one, on the stale
-// line with nothing cancelled (chat_stop_press.go). Slack's Stop is native to
-// its Agent Sessions (slack_stop.go); this one is drawn, since Chat has no
-// such control, and a text line Chat refuses with it is posted or patched
-// once more without it, so the line itself never fails for the button (a
-// laid-out line's refusal is the layout's, and the relay falls back to the
-// text, which then takes the same path).
+// and bound to the conversation it carries, for anyone the allowlist admits.
+// The gateway then takes it from a requester of the thread alone (mayStop in
+// stopgate.go, the rule Slack's button has) and answers it on the line itself
+// rather than with the typed stop's posts, or, for a task that is not the
+// running one, on the stale line with nothing cancelled (chat_stop_press.go).
+// Slack's Stop is native to its Agent Sessions (slack_stop.go); this one is
+// drawn, since Chat has no such control, and a text line Chat refuses with it
+// is posted or patched once more without it, so the line itself never fails
+// for the button (a laid-out line's refusal is the layout's, and the relay
+// falls back to the text, which then takes the same path).
 const (
 	// gchatStopFunction is the onClick action the Stop button sends, with
 	// two parameters: the conversation its line belongs to, since the

@@ -801,7 +801,11 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
         `auto-enqueue.yml` alone also mints Pull requests write, for the
         enqueue sweep above: it turns auto-merge on and off and dequeues, and
         the script scan holds it to that. Its key is read nowhere else, so no
-        other workflow can mint the same token. A new grant is a red test and
+        other workflow can mint the same token. `ci-health.yml` mints Issues
+        write for the bots' issue repository (`KUBE_AGENTS_ISSUES_REPO`, a
+        different App and key, `ISSUES_APP_PRIVATE_KEY`), scoped to that one
+        repository; it files, edits and closes the bots' own issues and
+        nothing else. A new grant is a red test and
         a conversation, as for the holder list above, and so is a minting step
         that names no scope, which gets every permission the App holds.
         """
@@ -832,6 +836,7 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
             "staging-promotion-pipeline.yml",
         ) for scope in release}
         expected |= {("auto-enqueue.yml", scope) for scope in release | {"permission-pull-requests"}}
+        expected.add(("ci-health.yml", "permission-issues"))
         self.assertEqual(expected, grants)
         self.assertEqual({"auto-enqueue.yml"}, key_readers)
 

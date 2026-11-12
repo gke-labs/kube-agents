@@ -581,6 +581,18 @@
             ],
             "defaultMode": 292
           }
+        },
+        {
+          "name": "kube-proxy-ca",
+          "configMap": {
+            "name": "pa-kube-proxy-ca-bundle",
+            "items": [
+              {
+                "key": "ca.crt",
+                "path": "ca.crt"
+              }
+            ]
+          }
         }
       ],
       "containers": [
@@ -648,6 +660,18 @@
             {
               "name": "A2A_CLUSTER_VIEW",
               "value": "true"
+            },
+            {
+              "name": "KUBE_PROXY_URL",
+              "value": "https://pa-kube-proxy.a2a-pod-policy.svc.cluster.local:8443"
+            },
+            {
+              "name": "KUBE_PROXY_HOST_CONTEXT",
+              "value": "in-cluster"
+            },
+            {
+              "name": "KUBE_PROXY_CA_FILE",
+              "value": "/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt"
             }
           ],
           "resources": {
@@ -681,6 +705,11 @@
               "name": "credential-proxy-token",
               "readOnly": true,
               "mountPath": "/var/run/secrets/kubeagents/credential-proxy"
+            },
+            {
+              "name": "kube-proxy-ca",
+              "readOnly": true,
+              "mountPath": "/var/run/secrets/kubeagents/kube-proxy-ca"
             }
           ],
           "securityContext": {

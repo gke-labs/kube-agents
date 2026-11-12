@@ -209,6 +209,10 @@ def parse(text: str) -> Rules:
             )
     except RulesError as exc:
         return Rules(status=INVALID, error=str(exc))
+    except ValueError as exc:
+        # A key too large to print (a YAML 1.1 base-60 integer past Python's
+        # 4300-digit str limit) fails while the error message is built.
+        return Rules(status=INVALID, error=f"not a rules file ({exc})")
     return Rules(status=LOADED, allow=parsed["allow"], deny=parsed["deny"], warnings=tuple(warnings))
 
 
@@ -286,7 +290,9 @@ def decide(rules: Rules, fix_type: str, environment: str) -> Decision:
         if rule.matches(fix_type, environment):
             return Decision(False, f"denied by automerge.deny[{index}]")
     for index, rule in enumerate(rules.allow):
-        if rule.matches(fix_type, environment):
+        # An allow rule for a fix type kube-agents does not know never matches,
+        # even when asked about that type: the parser's warning says so.
+        if rule.fix in KNOWN_FIX_TYPES and rule.matches(fix_type, environment):
             return Decision(True, f"allowed by automerge.allow[{index}]")
     return Decision(False, f"no allow rule names {fix_type} in {environment}")
 

@@ -27,6 +27,8 @@ const (
 	metricsUnavailableAlert = "ALERT metrics listener unavailable; kube-proxy serves no /metrics until it restarts, and API proxying is unaffected"
 	metricsPortEnv          = "KUBE_PROXY_METRICS_PORT"
 	metricsPortFlag         = "metrics-port"
+	sessionAudienceEnv      = "CREDENTIAL_PROXY_SESSION_AUDIENCE"
+	sessionCallersEnv       = "CREDENTIAL_PROXY_SESSION_CALLERS"
 	maxInFlightEnv          = "KUBE_PROXY_MAX_IN_FLIGHT"
 
 	// defaultMaxInFlight keeps a replica under its 512Mi limit (kubeProxyMemoryLimit in
@@ -143,6 +145,18 @@ func parseAllowedCallers(raw string) ([]string, error) {
 	return callers, nil
 }
 
+func parseSessionAudienceCallers(sessionAud, sessionCallersRaw string) (map[string][]string, error) {
+	aud := strings.TrimSpace(sessionAud)
+	if aud == "" {
+		return nil, nil
+	}
+	callers, err := parseAllowedCallers(sessionCallersRaw)
+	if err != nil {
+		return nil, errors.New(sessionCallersEnv + " is required when " + sessionAudienceEnv + " is set")
+	}
+	return map[string][]string{aud: callers}, nil
+}
+
 func main() {
 	var (
 		listenAddr               = flag.String("listen-addr", envOrDefault("KUBE_PROXY_LISTEN_ADDR", ":8443"), "TCP address to listen on")
@@ -161,6 +175,8 @@ func main() {
 		cacheMaxBytes            = flag.Int64("cache-max-bytes", envInt64OrDefault("KUBE_PROXY_CACHE_MAX_BYTES", k8sapiproxy.DefaultCacheMaxBytes), "Maximum bytes for the in-memory response cache (0 disables caching)")
 		cacheMaxEntryBytes       = flag.Int64("cache-max-entry-bytes", envInt64OrDefault("KUBE_PROXY_CACHE_MAX_ENTRY_BYTES", k8sapiproxy.DefaultCacheMaxEntryBytes), "Maximum response body bytes eligible for caching")
 		cacheResourceTTL         = flag.Duration("cache-resource-ttl", envDurationOrDefault("KUBE_PROXY_CACHE_RESOURCE_TTL", k8sapiproxy.DefaultResourceCacheTTL), "Default TTL for cached resource get and list responses (0s coalesces in-flight requests without post-flight storage)")
+		scopeFile                = flag.String("scope-file", envOrDefault("KUBE_PROXY_SCOPE_FILE", ""), "The install's scope.json; every request to a cluster its exclude.clusters names is refused (empty excludes nothing)")
+		excludeHostCluster       = flag.String("exclude-host-cluster-id", envOrDefault("KUBE_PROXY_EXCLUDE_HOST_CLUSTER_ID", ""), "gke_ ID of the cluster the proxy runs in, which in-cluster is checked against the exclusions as; routing is unaffected")
 		cacheDiscoveryTTL        = flag.Duration("cache-discovery-ttl", envDurationOrDefault("KUBE_PROXY_CACHE_DISCOVERY_TTL", k8sapiproxy.DefaultDiscoveryCacheTTL), "Default TTL for cached discovery responses (0s uses the default)")
 		maxInFlight              = flag.Int("max-in-flight", envIntOrDefault(maxInFlightEnv, defaultMaxInFlight), "Forwarded requests in flight before kube-proxy answers 429 with Retry-After; watches and long-running subresources do not count (0 disables the cap)")
 	)
@@ -192,10 +208,16 @@ func main() {
 
 	inCluster := inClusterConfig(*kubeAPIServer, *kubeCAFile, *kubeTokenFile)
 
+	audienceCallers, err := parseSessionAudienceCallers(os.Getenv(sessionAudienceEnv), os.Getenv(sessionCallersEnv))
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	authn, err := k8sapiproxy.NewTokenReviewAuthenticator(k8sapiproxy.TokenReviewConfig{
-		Kubernetes:     inCluster,
-		Audience:       *audience,
-		AllowedCallers: callers,
+		Kubernetes:      inCluster,
+		Audience:        *audience,
+		AllowedCallers:  callers,
+		AudienceCallers: audienceCallers,
 	})
 	if err != nil {
 		log.Fatalf("failed to initialize TokenReview authenticator: %v", err)
@@ -257,6 +279,7 @@ func main() {
 			AllowUpgradeSubresources: *allowUpgradeSubresources,
 		},
 		Cache:          cacheCfg,
+		Exclusions:     k8sapiproxy.NewExclusions(*scopeFile, *excludeHostCluster),
 		Logger:         logger,
 		Metrics:        metrics,
 		TracerProvider: tp,
