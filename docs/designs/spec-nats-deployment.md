@@ -73,8 +73,11 @@ The record is an annotation the operator writes before the delete, with its own 
 StatefulSet's server-side apply leaves it. A new bus starts without one. A server still outside after
 its one restart stays named in the condition, for a person.
 
-If a server's view can't be read, the verdict is unknown: nothing is held or restarted, and the
-condition names the unreadable server. The check also runs when the provision Job is re-created on a running bus (its 24 h TTL, or a
+If a server isn't running while the others are (its pod absent, being deleted, or not Running,
+as the restarted one is for a while), the Job waits for it under `ServerNotRunning`, and nothing
+is restarted on that account. If a running server's view can't be read, or no server is
+running at all, the verdict is unknown: nothing is held or restarted, and the condition names
+the unreadable server. The check also runs when the provision Job is re-created on a running bus (its 24 h TTL, or a
 digest change). There it can hold that re-run and set the condition, but it never restarts anything on a bus that
 has been provisioned. It doesn't repair a server that drops out of a running bus.
 

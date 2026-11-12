@@ -68,6 +68,9 @@ const (
 	// cannot be read: nothing is held or repaired on it, but the condition
 	// says which server, so a failing run stays diagnosable.
 	a2aBusMetaUnknownReason = "MetaGroupUnknown"
+	// a2aBusMetaDownReason: a bus server's pod is absent, being deleted, or
+	// not Running, so provisioning waits for it.
+	a2aBusMetaDownReason = "ServerNotRunning"
 	// a2aBusMetaRestartedReason is the Warning Event on the one restart.
 	a2aBusMetaRestartedReason = "A2ABusServerRestarted"
 	// a2aBusMetaRestartedAnnotation, on the bus StatefulSet, lists the pods
@@ -105,6 +108,9 @@ type a2aBusServerView struct {
 	Streams   int
 	Consumers int
 	Err       error
+	// Down: the ordinal's pod is absent, being deleted, or not Running, so
+	// there was nothing to read (readA2ABusServerViews).
+	Down bool
 }
 
 type a2aBusMetaPeer struct {
@@ -113,20 +119,23 @@ type a2aBusMetaPeer struct {
 	Offline bool
 }
 
-// a2aBusMetaVerdict is what the views say about the meta group. Known is
-// false when any server could not be read: then nothing is held or repaired
-// on its account.
+// a2aBusMetaVerdict is what the views say about the meta group. Down lists
+// servers not running (absent, being deleted, or not Running): the bus isn't
+// up, so provisioning waits, and none is restarted on that account. Known is
+// false when a running server could not be read: then nothing is held or
+// repaired on its account.
 type a2aBusMetaVerdict struct {
 	Known      bool
 	Formed     bool
 	Leader     string
 	Outside    []string
 	Unreadable []string
+	Down       []string
 }
 
 // a2aBusMetaState is what a pass found, carried to the status writers.
-// Checked is false on a pass that did not look (the provision Job exists
-// already, or the bus is one server): the condition is then left as it is.
+// Checked with no message removes the condition. Checked is false only on a
+// pass that leaves the condition as it is.
 type a2aBusMetaState struct {
 	checked bool
 	reason  string
@@ -137,7 +146,10 @@ type a2aBusMetaState struct {
 // have no per-pod DNS names (the StatefulSet's serviceName is the client
 // Service), and the client Service would answer from one server at random.
 // Pods come from the uncached reader, and only ones this StatefulSet controls
-// are read.
+// are read. An ordinal with no pod, a pod being deleted, or one not Running
+// is a view marked Down rather than left out: right after the one restart the
+// stray is terminating, and a verdict that dropped it would read as unknown
+// and let the provision Job through on a group still short.
 func (r *PlatformAgentReconciler) readA2ABusServerViews(ctx context.Context, agent *agentv1alpha1.PlatformAgent, sts *appsv1.StatefulSet) ([]a2aBusServerView, error) {
 	if r.busServerViews != nil {
 		return r.busServerViews(ctx, agent, sts)
@@ -152,15 +164,26 @@ func (r *PlatformAgentReconciler) readA2ABusServerViews(ctx context.Context, age
 			ordinals[sts.Name+"-"+strconv.Itoa(int(i))] = true
 		}
 	}
+	seen := map[string]bool{}
 	var views []a2aBusServerView
 	for i := range pods.Items {
 		pod := &pods.Items[i]
 		// Only the StatefulSet's own ordinal pods: a pod that copies its
 		// labels and owner reference adds no view.
-		if owner := metav1.GetControllerOf(pod); owner == nil || owner.UID != sts.UID || pod.DeletionTimestamp != nil || !ordinals[pod.Name] {
+		if owner := metav1.GetControllerOf(pod); owner == nil || owner.UID != sts.UID || !ordinals[pod.Name] {
+			continue
+		}
+		seen[pod.Name] = true
+		if pod.DeletionTimestamp != nil || pod.Status.Phase != corev1.PodRunning {
+			views = append(views, a2aBusServerView{Pod: pod.Name, Down: true})
 			continue
 		}
 		views = append(views, readA2ABusServerView(ctx, pod))
+	}
+	for name := range ordinals {
+		if !seen[name] {
+			views = append(views, a2aBusServerView{Pod: name, Down: true})
+		}
 	}
 	slices.SortFunc(views, func(a, b a2aBusServerView) int { return strings.Compare(a.Pod, b.Pod) })
 	return views, nil
@@ -226,9 +249,26 @@ func decodeA2ABusServerView(podName string, resp *http.Response) a2aBusServerVie
 // judgeA2ABusMeta reads the views for a bus of replicas servers. The leader is
 // the one a quorum of the servers report; a server is outside when it reports
 // another or none, or when the leader does not list it as a current, online
-// peer. A missing server (fewer views than replicas) or an unreadable one
-// makes the verdict unknown.
+// peer. A server not running while another is holds, ahead of everything
+// else; none running, a missing view (fewer views than replicas) or an
+// unreadable server makes the verdict unknown.
 func judgeA2ABusMeta(views []a2aBusServerView, replicas int) a2aBusMetaVerdict {
+	var down []string
+	for _, v := range views {
+		if v.Down {
+			down = append(down, v.Pod)
+		}
+	}
+	// With no server running at all there is nothing to judge, and the bus's
+	// rollout hold (a2aProvisionJobWaitsForBus) covers a bus that hasn't
+	// started; that stays unknown, below. Some servers up and one not is the
+	// window the restart opens, or a server that can't start: that holds.
+	if len(down) > 0 && len(down) < len(views) {
+		return a2aBusMetaVerdict{Known: true, Down: down}
+	}
+	if len(down) == len(views) && len(views) > 0 {
+		return a2aBusMetaVerdict{Unreadable: []string{fmt.Sprintf("%d of %d servers not running", len(down), replicas)}}
+	}
 	var unreadable []string
 	for _, v := range views {
 		if v.Err != nil {
@@ -437,6 +477,13 @@ func (r *PlatformAgentReconciler) checkA2ABusMeta(ctx context.Context, agent *ag
 		msg := "verdict unknown: " + strings.Join(v.Unreadable, ", ") + " unreadable; stream provisioning is not held on it"
 		logf.FromContext(ctx).Info("A2A bus meta group "+msg, "unreadable", v.Unreadable)
 		return false, a2aBusMetaState{checked: true, reason: a2aBusMetaUnknownReason, message: msg}, nil
+	}
+	if len(v.Down) > 0 {
+		// The bus isn't up: a server is starting, being restarted, or can't
+		// be scheduled. R3 streams can't be placed without it, so the Job
+		// waits; restarting is the StatefulSet's business, not this check's.
+		return true, a2aBusMetaState{checked: true, reason: a2aBusMetaDownReason,
+			message: strings.Join(v.Down, ", ") + verbFor(len(v.Down)) + " not running; stream provisioning waits for every server"}, nil
 	}
 	if v.Formed {
 		return false, a2aBusMetaState{checked: true}, nil

@@ -420,6 +420,90 @@ func TestTheProvisionJobWaitsForTheMetaGroup(t *testing.T) {
 	if err := cl.Get(ctx, jobKey, &batchv1.Job{}); err != nil {
 		t.Errorf("the provision Job was not created once the meta group formed: %v", err)
 	}
+
+	// The pass that created the Job may fail later and never write the clear,
+	// leaving a ServerOutsideMetaGroup condition: once the Job exists, any
+	// pass clears it, whatever the views say now.
+	setA2ABusMetaCondition(agent, a2aBusMetaState{checked: true, reason: a2aBusMetaOutsideReason, message: "stale"}, metav1.Now())
+	views = lateJoinerViews()
+	if state, err = r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+		t.Fatal(err)
+	}
+	if !state.busMeta.checked || state.busMeta.message != "" {
+		t.Errorf("meta %+v with the Job existing; want the condition cleared", state.busMeta)
+	}
+}
+
+// Right after the one restart the stray is terminating, then absent, then
+// Pending: a server not running while the others are holds provisioning
+// (never unknown, which would let the Job through on a group still short),
+// and is never restarted on that account. No server running at all stays
+// unknown: the bus's rollout hold covers a bus that hasn't started.
+func TestAServerNotRunningHoldsProvisioningAndIsNeverRestarted(t *testing.T) {
+	down := []a2aBusServerView{leaderView(metaN0, current(metaN1)), followerView(metaN1, metaN0), {Pod: metaN2, Down: true}}
+	v := judgeA2ABusMeta(down, 3)
+	if !v.Known || v.Formed || !slices.Equal(v.Down, []string{metaN2}) {
+		t.Errorf("one down: verdict %+v, want known, not formed, %s down", v, metaN2)
+	}
+	all := []a2aBusServerView{{Pod: metaN0, Down: true}, {Pod: metaN1, Down: true}, {Pod: metaN2, Down: true}}
+	if v := judgeA2ABusMeta(all, 3); v.Known || !slices.Contains(v.Unreadable, "3 of 3 servers not running") {
+		t.Errorf("all down: verdict %+v, want unknown", v)
+	}
+
+	m := newMetaRig(t, nil)
+	m.r.busServerViews = func(context.Context, *agentv1alpha1.PlatformAgent, *appsv1.StatefulSet) ([]a2aBusServerView, error) {
+		return down, nil
+	}
+	// Long past the restart's bound, with the condition's clock started.
+	setA2ABusMetaCondition(m.agent, a2aBusMetaState{checked: true, reason: a2aBusMetaOutsideReason, message: "earlier"}, metav1.NewTime(time.Now().Add(-time.Hour)))
+	hold, state, err := m.r.checkA2ABusMeta(context.Background(), m.agent, m.sts, 3, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hold || state.reason != a2aBusMetaDownReason || !strings.Contains(state.message, metaN2+" is not running") {
+		t.Errorf("hold %v state %+v; want held, %s naming %s", hold, state, a2aBusMetaDownReason, metaN2)
+	}
+	if !m.podExists(metaN2) || len(m.restartedRecord()) != 0 {
+		t.Error("a server not running was restarted")
+	}
+}
+
+// The read marks an ordinal Down when its pod is being deleted, isn't
+// Running, or doesn't exist, rather than leaving it out.
+func TestTheReadMarksAServerNotRunningDown(t *testing.T) {
+	m := newMetaRig(t, func(m *metaRig, objs []client.Object) []client.Object {
+		var kept []client.Object
+		for _, o := range objs {
+			pod, isPod := o.(*corev1.Pod)
+			switch {
+			case !isPod:
+				kept = append(kept, o)
+			case pod.Name == metaN0:
+				pod.Status.Phase = corev1.PodRunning
+				pod.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+				pod.Finalizers = []string{"test/hold"}
+				kept = append(kept, pod)
+			case pod.Name == metaN1:
+				pod.Status.Phase = corev1.PodPending
+				kept = append(kept, pod)
+			}
+			// metaN2 is left out: no pod.
+		}
+		return kept
+	})
+	views, err := m.r.readA2ABusServerViews(context.Background(), m.agent, m.sts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, v := range views {
+		if v.Down {
+			got = append(got, v.Pod)
+		}
+	}
+	if !slices.Equal(got, []string{metaN0, metaN1, metaN2}) {
+		t.Errorf("down %v, want every server: terminating, Pending, absent", got)
+	}
 }
 
 // Never on a bus that has been provisioned: a running bus's server is

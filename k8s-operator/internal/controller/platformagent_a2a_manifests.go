@@ -7345,11 +7345,11 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 			return state, fmt.Errorf("failed to create A2A provision Job: %w", err)
 		}
 	} else {
-		// With the Job created, an unknown verdict ("not held on it") no
-		// longer says anything about provisioning.
-		if c := meta.FindStatusCondition(agent.Status.Conditions, a2aBusMetaConditionType); c != nil && c.Reason == a2aBusMetaUnknownReason {
-			state.busMeta = a2aBusMetaState{checked: true}
-		}
+		// With the Job created, the condition no longer says anything about
+		// provisioning, whatever it says: the Job is created only past the
+		// check (or on an unknown verdict), and a pass that created it but
+		// failed later never wrote the clear.
+		state.busMeta = a2aBusMetaState{checked: true}
 		for _, cond := range existing.Status.Conditions {
 			if cond.Status != corev1.ConditionTrue {
 				continue
