@@ -460,6 +460,10 @@ readonly MODE_NEXT_HELM_TIMEOUT="600s"
 readonly MODE_NEXT_GENERATION_ATTEMPTS=60
 readonly MODE_NEXT_POLL_SECONDS=5
 readonly MODE_NEXT_ROLLOUT_TIMEOUT="600s"
+# The bus's servers past its quorum: each waits Pending for a node of its own
+# (the operator's hostname spread), and on Autopilot that node is a scale-up
+# that can take longer than one rollout budget (gate_mode_next_bus).
+readonly MODE_NEXT_BUS_FULL_TIMEOUT="900s"
 # The inject door: one name for its Service, token Secret, principal map and
 # NetworkPolicy, and the key the token sits under (a2aInjectName,
 # a2aInjectTokenKey). hack/ci-eval-pr.sh reads the same Secret for the
@@ -511,10 +515,8 @@ readonly EVAL_TASK_PARALLELISM_DEFAULT=4
 readonly BRIDGE_QUEUE_CAPACITY=1024
 # The TASKS consumer budget's terms, as the operator sizes it
 # (k8s-operator/internal/controller/platformagent_a2a_manifests.go): a fresh
-# stream is created at max(budget, A2A_TASKS_FLOOR) - plus 64 for the
-# AgentProfile durables when the operator renders the dispatcher, which this
-# lane leaves off (no A2A_DISPATCHER_IMAGE, step 4), as a default install
-# does - where the budget is
+# stream is created at max(budget, A2A_TASKS_FLOOR) - the AgentProfile
+# dispatcher's durables are on PROFILE_SUBMITS, not TASKS - where the budget is
 # maxSessions * A2A_SESSION_CONSUMERS + A2A_RESERVE_FIXED +
 # A2A_RESERVE_PER_WORKER * (the bridge workers the pod runs, rendered or
 # declared); provisioning never edits a stream that exists, and a later
@@ -621,14 +623,14 @@ readonly MODE_NEXT_ENTRYPOINT_MATCH_LINES=40
 # platformagent_a2a_manifests.go, a2aCalloutImage in platformagent_a2a_callout.go,
 # a2aVerifierImage in platformagent_a2a_verifier.go, a2aConsoleImage in
 # platformagent_a2a_console.go) and the repository names step 4 pushes the
-# builds under. The AgentProfile dispatcher's image is built and pushed too
-# (A2A_DISPATCHER_IMAGE_NAME), but its override, A2A_DISPATCHER_IMAGE, is not
-# set: the dispatcher is off by default until profiles dispatch end to end.
+# builds under, and the AgentProfile dispatcher's (a2aDispatcherImage in
+# platformagent_a2a_dispatcher.go), which runs by default.
 readonly A2A_GATEWAY_IMAGE_ENV_VAR="A2A_GATEWAY_IMAGE"
 readonly A2A_CALLOUT_IMAGE_ENV_VAR="A2A_CALLOUT_IMAGE"
 readonly A2A_WORKER_IMAGE_ENV_VAR="A2A_WORKER_IMAGE"
 readonly A2A_VERIFIER_IMAGE_ENV_VAR="A2A_VERIFIER_IMAGE"
 readonly A2A_CONSOLE_IMAGE_ENV_VAR="A2A_CONSOLE_IMAGE"
+readonly A2A_DISPATCHER_IMAGE_ENV_VAR="A2A_DISPATCHER_IMAGE"
 # Two of the rendered bridge's four operator settings (a2aBridgeImageEnvVar
 # and a2aBridgeConcurrencyOperatorEnvVar in platformagent_a2a_bridge.go): its
 # image and its BRIDGE_CONCURRENCY. The operator reads them from its own
@@ -645,6 +647,10 @@ readonly A2A_WORKER_IMAGE_NAME="a2a-worker"
 readonly A2A_VERIFIER_IMAGE_NAME="a2a-verifier"
 readonly A2A_CONSOLE_IMAGE_NAME="a2a-console"
 readonly A2A_DISPATCHER_IMAGE_NAME="a2a-dispatcher"
+# The cluster AgentProfile's persona image (a2a/Dockerfile.persona-cluster,
+# context agents/cluster/persona), built beside the A2A images so the lane runs
+# this tree's persona.
+readonly PERSONA_CLUSTER_IMAGE_NAME="persona-cluster"
 # The bridge image goes to the operator too (A2A_BRIDGE_IMAGE_ENV_VAR), which
 # renders the bridge sidecar from it.
 readonly A2A_BRIDGE_IMAGE_NAME="hermes-bridge"
@@ -788,8 +794,11 @@ A2A_OPERATOR_ENV_ARGS=()
 # first-run chain included) writes one whenever a pool repository declares a
 # workload with a major finding (#3439). spec.deployment.env carries the
 # switch; the operator forwards it to the shell sandbox, where finish runs.
-# It also enables the optional `tse` AgentProfile so `mode: next` eval lanes
-# scaffold `/opt/data/profiles/tse` (#3492). Empty on the today lane, so that
+# It also enables the `cluster` AgentProfile, which the profile dispatcher
+# serves (its images are set with the A2A overrides below). Not the optional
+# `tse` one: its chart persona image is a placeholder a dispatched worker can't
+# stage, so the lane leaves it off, and its case parked, until #3842 gives it a
+# real one (#3492 enabled it here for the Kanban scaffold). Empty on the today lane, so that
 # release stays byte-for-byte the same.
 # env[3], set on every lane in the install below, turns the broker's proposal
 # readings sweep off (CREDENTIAL_PROXY_VCS_READINGS=off). Its hourly forge
@@ -801,7 +810,7 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   MODE_NEXT_ENV_ARGS=(
     --set-string "platformAgent.deployment.env[4].name=KUBEAGENTS_AUDIT_AUTO_PROMOTE"
     --set-string "platformAgent.deployment.env[4].value=false"
-    --set "profiles.tse.enabled=true"
+    --set "profiles.cluster.enabled=true"
   )
 fi
 
@@ -988,6 +997,26 @@ resolve_agent_gemini_api_key() {
 # --- agent key: end
 resolve_agent_gemini_api_key
 export MODEL_DEFAULT_NAME="${MODEL_DEFAULT_NAME:-gemini-3.1-pro-preview}"
+# --- reasoning effort: begin
+# The reasoning effort the gateway asks the model for on every request, the
+# chart's litellm.reasoningEffort: low, medium or high, or empty for the
+# model's own default. A certification run names it beside the model, and
+# hack/ci-eval-pr.sh stamps the same variable on every case record, so a
+# record says which effort the agent ran at and a window never pools two
+# efforts. Checked here, before the lease is spent on a deploy the chart's
+# schema would refuse at step 5c. The deploy never sets litellm.dropParams,
+# so an effort a provider does not take fails its requests loudly rather
+# than being dropped in silence. The FATAL line names the effort only.
+export EVAL_REASONING_EFFORT="${EVAL_REASONING_EFFORT:-}"
+case "${EVAL_REASONING_EFFORT}" in
+  "" | low | medium | high) ;;
+  *)
+    echo "FATAL: EVAL_REASONING_EFFORT='${EVAL_REASONING_EFFORT}' is not low, medium, high or empty (the model default)." >&2
+    exit 1
+    ;;
+esac
+echo "Agent model for this install: ${MODEL_PROVIDER}/${MODEL_DEFAULT_NAME}, reasoning effort: ${EVAL_REASONING_EFFORT:-model default}"
+# --- reasoning effort: end
 # Default to enforcing CMEK database encryption on CI evaluation clusters.
 # Set ALLOW_UNENCRYPTED_SECRETS=true to bypass CMEK checks on unencrypted test clusters.
 export ALLOW_UNENCRYPTED_SECRETS="${ALLOW_UNENCRYPTED_SECRETS:-false}"
@@ -1756,6 +1785,7 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   A2A_CONSOLE_URI="${A2A_IMAGE_PREFIX}/${A2A_CONSOLE_IMAGE_NAME}:${TAG}"
   A2A_BRIDGE_URI="${A2A_IMAGE_PREFIX}/${A2A_BRIDGE_IMAGE_NAME}:${TAG}"
   A2A_DISPATCHER_URI="${A2A_IMAGE_PREFIX}/${A2A_DISPATCHER_IMAGE_NAME}:${TAG}"
+  PERSONA_CLUSTER_URI="${A2A_IMAGE_PREFIX}/${PERSONA_CLUSTER_IMAGE_NAME}:${TAG}"
   A2A_OPERATOR_ENV_ARGS=(
     --set-string "operator.extraEnv[0].name=${A2A_GATEWAY_IMAGE_ENV_VAR}"
     --set-string "operator.extraEnv[0].value=${A2A_GATEWAY_URI}"
@@ -1786,10 +1816,19 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     # on by default, and set here so the lane doesn't depend on the default.
     --set-string "operator.extraEnv[9].name=${A2A_GATEWAY_ELECTION_ENV_VAR}"
     --set-string "operator.extraEnv[9].value=${A2A_GATEWAY_ELECTION_ON}"
-    # No A2A_DISPATCHER_IMAGE: the AgentProfile dispatcher is off by default
-    # until profiles dispatch end to end, and the lane installs what a
-    # default install does. Its image is still built (step 4) so the build
-    # stays green; setting the override here is how the lane would turn it on.
+    # The AgentProfile dispatcher runs by default, so the lane runs it too,
+    # from this build: unoverridden, the operator derives its image from the
+    # operator's registry, as it would the verifier's.
+    --set-string "operator.extraEnv[10].name=${A2A_DISPATCHER_IMAGE_ENV_VAR}"
+    --set-string "operator.extraEnv[10].value=${A2A_DISPATCHER_URI}"
+    # The profiles' images. Unset, the chart takes each from ghcr at the agent
+    # image's tag, which on this lane is a CI tag ghcr never has, and the
+    # profile's worker never pulls. The cluster profile runs this build's
+    # persona and worker.
+    --set-string "profiles.cluster.persona.image.repository=${A2A_IMAGE_PREFIX}/${PERSONA_CLUSTER_IMAGE_NAME}"
+    --set-string "profiles.cluster.persona.image.tag=${TAG}"
+    --set-string "profiles.cluster.harness.image.repository=${A2A_IMAGE_PREFIX}/${A2A_WORKER_IMAGE_NAME}"
+    --set-string "profiles.cluster.harness.image.tag=${TAG}"
   )
 fi
 
@@ -1801,7 +1840,7 @@ fi
 if [ -n "${RC_COMMIT_SHA:-}" ]; then
   echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Skipping image builds: installing published images at ${RC_COMMIT_SHA:0:7} ==="
   if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
-    echo "EVAL_MODE_NEXT=1: the A2A gateway, auth callout, worker, verifier, dispatcher and console images and the Hermes bridge sidecar are the candidate's published ones, from ${A2A_IMAGE_PREFIX}"
+    echo "EVAL_MODE_NEXT=1: the A2A gateway, auth callout, worker, verifier, dispatcher and console images, the cluster persona and the Hermes bridge sidecar are the candidate's published ones, from ${A2A_IMAGE_PREFIX}"
   fi
 else
   STEP_START=$SECONDS
@@ -1834,7 +1873,7 @@ else
     echo "Shadow replay proxy: also building its image"
   fi
   if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
-    A2A_BUILD_SUBSTITUTIONS=",_A2A_GATEWAY_URI=${A2A_GATEWAY_URI},_A2A_CALLOUT_URI=${A2A_CALLOUT_URI},_A2A_WORKER_URI=${A2A_WORKER_URI},_A2A_VERIFIER_URI=${A2A_VERIFIER_URI},_A2A_CONSOLE_URI=${A2A_CONSOLE_URI},_A2A_BRIDGE_URI=${A2A_BRIDGE_URI},_A2A_DISPATCHER_URI=${A2A_DISPATCHER_URI}"
+    A2A_BUILD_SUBSTITUTIONS=",_A2A_GATEWAY_URI=${A2A_GATEWAY_URI},_A2A_CALLOUT_URI=${A2A_CALLOUT_URI},_A2A_WORKER_URI=${A2A_WORKER_URI},_A2A_VERIFIER_URI=${A2A_VERIFIER_URI},_A2A_CONSOLE_URI=${A2A_CONSOLE_URI},_A2A_BRIDGE_URI=${A2A_BRIDGE_URI},_A2A_DISPATCHER_URI=${A2A_DISPATCHER_URI},_PERSONA_CLUSTER_URI=${PERSONA_CLUSTER_URI}"
     echo "EVAL_MODE_NEXT=1: also building the A2A gateway, auth callout, worker, verifier, dispatcher and console images and the Hermes bridge sidecar"
   fi
   # Submitted asynchronously and polled, never streamed (#3129). Without
@@ -2102,6 +2141,7 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set-file "platformAgent.credentials.data.SANDBOX_SSH_PUBLIC_KEY=${SANDBOX_KEY_DIR}/id_sandbox.pub" \
     --set-string "litellm.modelProvider=${MODEL_PROVIDER}" \
     --set-string "litellm.modelDefaultName=${MODEL_DEFAULT_NAME}" \
+    --set-string "litellm.reasoningEffort=${EVAL_REASONING_EFFORT:-}" \
     --set "litellm.fallback.numRetries=${EVAL_LITELLM_NUM_RETRIES}" \
     --set "litellm.fallback.retryAfterSeconds=${EVAL_LITELLM_RETRY_AFTER_SECONDS}" \
     --set-string "litellm.vertex.serviceAccountAnnotations.iam\.gke\.io/gcp-service-account=${LITELLM_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
@@ -2353,6 +2393,59 @@ gate_mode_next_rollout() {
     exit 1
   fi
   echo "✓ ${workload} rolled out $((gate_start - MODE_NEXT_START))s..$((SECONDS - MODE_NEXT_START))s after the mode switch"
+}
+
+# Waits for the A2A bus, then for the rest of its servers; on failure
+# describes it, dumps the stack and stops the deploy. A multi-server bus
+# serves once a quorum of its servers (two of three) is Ready, and each
+# server waits Pending for a node of its own (the operator's hostname spread
+# is DoNotSchedule, so two servers never share a node): on Autopilot every
+# further server waits on a node scale-up, which can outlast one rollout
+# budget. So the bus passes at a quorum within MODE_NEXT_ROLLOUT_TIMEOUT, and
+# the remaining servers get MODE_NEXT_BUS_FULL_TIMEOUT more. Meanwhile the
+# PlatformAgent's Ready message names each server that is not Ready and the
+# scheduler's reason (a2aNATSShortNote), which the dump prints on failure.
+gate_mode_next_bus() {
+  local workload="$1"
+  local gate_start=$SECONDS want ready quorum deadline
+  for _ in $(seq 1 "${MODE_NEXT_GENERATION_ATTEMPTS}"); do
+    kubectl get "${workload}" -n "${NAMESPACE}" >/dev/null 2>&1 && break
+    sleep "${MODE_NEXT_POLL_SECONDS}"
+  done
+  want="$(kubectl get "${workload}" -n "${NAMESPACE}" -o jsonpath='{.spec.replicas}' 2>/dev/null)" || want=""
+  want="${want:-1}"
+  quorum=$(( want / 2 + 1 ))
+  deadline=$(( gate_start + ${MODE_NEXT_ROLLOUT_TIMEOUT%s} ))
+  while :; do
+    # A read the API drops is one more poll, not the end of the deploy.
+    ready="$(kubectl get "${workload}" -n "${NAMESPACE}" -o jsonpath='{.status.readyReplicas}' 2>/dev/null)" || ready=""
+    ready="${ready:-0}"
+    [ "${ready}" -ge "${quorum}" ] && break
+    if [ "${SECONDS}" -ge "${deadline}" ]; then
+      echo "ERROR: ${workload} has ${ready} of ${want} servers Ready, short of its quorum of ${quorum}, after ${MODE_NEXT_ROLLOUT_TIMEOUT} under mode: next"
+      kubectl describe "${workload}" -n "${NAMESPACE}" || true
+      dump_mode_next_state
+      exit 1
+    fi
+    sleep "${MODE_NEXT_POLL_SECONDS}"
+  done
+  echo "✓ ${workload} serving on ${ready} of ${want} servers (quorum ${quorum}) $((gate_start - MODE_NEXT_START))s..$((SECONDS - MODE_NEXT_START))s after the mode switch"
+  if [ "${ready}" -lt "${want}" ]; then
+    deadline=$(( SECONDS + ${MODE_NEXT_BUS_FULL_TIMEOUT%s} ))
+    while :; do
+      ready="$(kubectl get "${workload}" -n "${NAMESPACE}" -o jsonpath='{.status.readyReplicas}' 2>/dev/null)" || ready=""
+      ready="${ready:-0}"
+      [ "${ready}" -ge "${want}" ] && break
+      if [ "${SECONDS}" -ge "${deadline}" ]; then
+        echo "ERROR: ${workload} still has ${ready} of ${want} servers Ready ${MODE_NEXT_BUS_FULL_TIMEOUT} after reaching its quorum under mode: next; the PlatformAgent's Ready message names the missing server and why"
+        kubectl describe "${workload}" -n "${NAMESPACE}" || true
+        dump_mode_next_state
+        exit 1
+      fi
+      sleep "${MODE_NEXT_POLL_SECONDS}"
+    done
+  fi
+  echo "✓ ${workload} rolled out: ${want} of ${want} servers Ready $((SECONDS - MODE_NEXT_START))s after the mode switch"
 }
 
 # Waits for the agent Deployment's generation to move past the one given,
@@ -2664,7 +2757,7 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   kubectl get configmap "${PLATFORM_AGENT_CR_NAME}-config" -n "${NAMESPACE}" -o jsonpath='{.data.managed\.env}' || true
   echo
 
-  gate_mode_next_rollout "statefulset/${PLATFORM_AGENT_CR_NAME}-a2a-nats"
+  gate_mode_next_bus "statefulset/${PLATFORM_AGENT_CR_NAME}-a2a-nats"
   gate_mode_next_rollout "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-callout"
 
   # The one run, against a bus with no streams. Its budget already counts
