@@ -105,9 +105,10 @@ const (
 	// restart.
 	busStreamsReprovisionAnnotation = "kubeagents.x-k8s.io/a2a-bus-reprovision"
 
-	busStreamsMissingEventReason        = "A2ABusStreamsMissing"
-	busStreamsRestoredEventReason       = "A2ABusStreamsRestored"
-	busStreamsTasksRecreatedEventReason = "A2ABusTasksRecreated"
+	busStreamsMissingEventReason          = "A2ABusStreamsMissing"
+	busStreamsRestoredEventReason         = "A2ABusStreamsRestored"
+	busStreamsClientsRestartedEventReason = "A2ABusClientsRestarted"
+	busStreamsRestartFailedEventReason    = "A2ABusClientsRestartFailed"
 
 	// busStreamsScrapeTimeout bounds one scrape from connect to the last byte,
 	// and busStreamsMaxLineBytes the one line of the body held at once. A
@@ -341,6 +342,13 @@ func busStreamsVerdictFor(replicas int, readings []busServerReading) busStreamsV
 // inside busStreamsReprovisionWindow only.
 type busReprovisionRecord struct {
 	Attempts []busReprovisionAttempt `json:"attempts"`
+	// TasksLostAt is the poll that first saw the latest loss of TASKS, and
+	// TasksBack whether a poll has seen TASKS present since. A TASKS client
+	// container that started before TasksLostAt lost its durable with the
+	// stream and is restarted once TASKS is back (restartTasksClients); one
+	// that started since waits for the stream and its durable, then binds.
+	TasksLostAt *time.Time `json:"tasksLostAt,omitempty"`
+	TasksBack   bool       `json:"tasksBack,omitempty"`
 }
 
 type busReprovisionAttempt struct {
@@ -356,11 +364,6 @@ type busReprovisionAttempt struct {
 	// stops the re-runs for its names; seeing them back lifts the stop.
 	Settled  bool `json:"settled,omitempty"`
 	Restored bool `json:"restored,omitempty"`
-	// TasksMissing is whether any poll of the run that confirmed the loss
-	// found TASKS missing, whether or not TASKS is in Missing: the re-run
-	// recreates every stream, TASKS included, and TASKS' two durable readers
-	// don't recreate their consumers on their own (tasksRecreatedNote).
-	TasksMissing bool `json:"tasksMissing,omitempty"`
 }
 
 func readBusReprovisionRecord(agent *agentv1alpha1.PlatformAgent) busReprovisionRecord {
@@ -412,7 +415,7 @@ func (rec busReprovisionRecord) pruned(now time.Time) busReprovisionRecord {
 			kept = append(kept, attempt)
 		}
 	}
-	return busReprovisionRecord{Attempts: kept}
+	return busReprovisionRecord{Attempts: kept, TasksLostAt: rec.TasksLostAt, TasksBack: rec.TasksBack}
 }
 
 // busStreamStreak is one CR's run of polls, per process.
@@ -420,10 +423,9 @@ type busStreamStreak struct {
 	// missing is the set every poll in the current run found missing.
 	missing map[string]bool
 	misses  int
-	// tasksMissing is whether any poll in the current run found TASKS
-	// missing, even one the run's intersection later dropped it from: a
-	// re-run recreates every stream, TASKS included.
-	tasksMissing bool
+	// restartWarnedFor is the TasksLostAt whose failed restart has already
+	// raised its Warning, so a restart that keeps failing warns once per loss.
+	restartWarnedFor time.Time
 	// unknown counts polls in a row that had nothing to judge by.
 	unknown int
 }
@@ -511,7 +513,7 @@ func (p *BusStreamPoller) streak(agent *agentv1alpha1.PlatformAgent) *busStreamS
 
 // pollAgent is one CR's poll. It writes BusStreamsPresent and nothing else of
 // the status, re-runs the provision Job when a loss is confirmed, and says
-// when a re-run has recreated TASKS (tasksRecreatedNote).
+// restarts TASKS' clients once TASKS is back after a loss (restartTasksClients).
 func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	if agent.DeletionTimestamp != nil || !a2aStackRendering(agent) || !busProvisioned(agent) {
 		delete(p.streaks, agent.UID)
@@ -550,14 +552,14 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 		// No verdict while the bus rolls, converts or provisions: a stream
 		// the Job is about to create, or a server still joining, is not a
 		// loss. The run starts again afterwards.
-		streak.missing, streak.misses, streak.unknown, streak.tasksMissing = nil, 0, 0, false
+		streak.missing, streak.misses, streak.unknown = nil, 0, 0
 		return nil
 	}
 
 	readings := p.scrapeServers(ctx, agent, sts)
 	verdict := busStreamsVerdictFor(int(busServers(sts)), readings)
 	if !verdict.known {
-		streak.missing, streak.misses, streak.tasksMissing = nil, 0, false
+		streak.missing, streak.misses = nil, 0
 		streak.unknown++
 		if streak.unknown < busStreamsConfirmPolls {
 			return nil
@@ -583,9 +585,6 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 			p.r.recordEvent(agent, corev1.EventTypeNormal, busStreamsRestoredEventReason,
 				fmt.Sprintf("Re-running the A2A provision Job restored %s.", strings.Join(last.Missing, ", ")))
 		}
-		if note := tasksRecreatedNote(agent, last, job, jobState, verdict.missing); note != "" {
-			p.r.recordEvent(agent, corev1.EventTypeWarning, busStreamsTasksRecreatedEventReason, strings.TrimSpace(note))
-		}
 	} else if last != nil && !last.Settled && jobState == busJobComplete && job.UID == last.JobUID && len(verdict.missing) == 0 {
 		// An attempt whose Job delete didn't land, and the streams are back
 		// before its retry: the Job never re-ran, so it recreated nothing.
@@ -593,7 +592,7 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 		// spec change) isn't taken for this attempt's, and clear what it
 		// named: nothing was re-run for it, so no TASKS note may come of it.
 		last.Settled, last.Restored = true, true
-		last.Missing, last.TasksMissing = nil, false
+		last.Missing = nil
 		if err := p.writeRecord(ctx, agent, record.pruned(now)); err != nil {
 			return err
 		}
@@ -606,10 +605,43 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 		}
 	}
 
+	// TASKS' loss episode, and its clients' restart once it's back: decided
+	// from the clients' own start times, not from any attempt, so a re-run
+	// that failed, a delete that didn't land, a loss mid-run or a fix by hand
+	// all end the same way.
+	if slices.Contains(verdict.missing, a2aTasksStream) {
+		if record.TasksLostAt == nil || record.TasksBack {
+			lostAt := now
+			record.TasksLostAt, record.TasksBack = &lostAt, false
+			if err := p.writeRecord(ctx, agent, record.pruned(now)); err != nil {
+				return err
+			}
+		}
+	} else if record.TasksLostAt != nil {
+		if !record.TasksBack {
+			record.TasksBack = true
+			if err := p.writeRecord(ctx, agent, record.pruned(now)); err != nil {
+				return err
+			}
+		}
+		if err := p.restartTasksClients(ctx, agent, *record.TasksLostAt); err != nil {
+			// Warned once per loss; the condition says so in a fixed
+			// message, so a restart that keeps failing rewrites nothing,
+			// and the next poll retries it.
+			if !streak.restartWarnedFor.Equal(*record.TasksLostAt) {
+				streak.restartWarnedFor = *record.TasksLostAt
+				p.r.recordEvent(agent, corev1.EventTypeWarning, busStreamsRestartFailedEventReason,
+					fmt.Sprintf("TASKS is back on the A2A bus, but restarting the A2A gateway and the agent pod failed, so their TASKS consumers are not recreated yet; the operator retries on every poll: %v", err))
+			}
+			return p.writeCondition(ctx, agent, metav1.ConditionFalse, busStreamsReasonReprovisioning,
+				fmt.Sprintf("TASKS is back on the A2A bus, but restarting the A2A gateway and the agent pod failed, so their TASKS consumers are not recreated yet. The operator retries on every poll; the %s event carries the error.", busStreamsRestartFailedEventReason))
+		}
+	}
+
 	if len(verdict.missing) == 0 {
-		streak.missing, streak.misses, streak.tasksMissing = nil, 0, false
+		streak.missing, streak.misses = nil, 0
 		return p.writeCondition(ctx, agent, metav1.ConditionTrue, busStreamsReasonAllPresent,
-			fmt.Sprintf("All %d streams and KV buckets the provision Job creates were seen on the A2A bus.%s", len(a2aProvisionedStreams), tasksRecreatedNote(agent, last, job, jobState, verdict.missing)))
+			fmt.Sprintf("All %d streams and KV buckets the provision Job creates were seen on the A2A bus.", len(a2aProvisionedStreams)))
 	}
 
 	// Missing on this poll: confirm across busStreamsConfirmPolls in a row,
@@ -622,16 +654,13 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 		}
 	}
 	if len(shared) == 0 {
-		streak.misses, streak.tasksMissing = 0, false
+		streak.misses = 0
 		for _, name := range verdict.missing {
 			shared[name] = true
 		}
 	}
 	streak.missing = shared
 	streak.misses++
-	if slices.Contains(verdict.missing, a2aTasksStream) {
-		streak.tasksMissing = true
-	}
 	if streak.misses < busStreamsConfirmPolls {
 		return nil
 	}
@@ -647,68 +676,146 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 		// whatever keeps them off the bus, another delete of the Job will
 		// not fix it. A restore, or removing the annotation, clears this.
 		return p.writeCondition(ctx, agent, metav1.ConditionFalse, busStreamsReasonDidNotRestore,
-			fmt.Sprintf("Missing from the A2A bus: %s. The operator re-ran the provision Job at %s and they were still missing after it, so it will not re-run it again for them. Read the provision Job's logs and the NATS servers' logs; once fixed, remove the %s annotation to let the operator re-run it.%s",
-				names, last.At.UTC().Format(time.RFC3339), busStreamsReprovisionAnnotation, tasksRecreatedNote(agent, last, job, jobState, verdict.missing)))
+			fmt.Sprintf("Missing from the A2A bus: %s. The operator re-ran the provision Job at %s and they were still missing after it, so it will not re-run it again for them. Read the provision Job's logs and the NATS servers' logs; once fixed, remove the %s annotation to let the operator re-run it.",
+				names, last.At.UTC().Format(time.RFC3339), busStreamsReprovisionAnnotation))
 	}
 	if last != nil && !last.Settled && jobState == busJobComplete && job.UID == last.JobUID {
 		// The last attempt is recorded but its Job is still the completed
 		// one it was to delete: the delete didn't land (an API error after
 		// the record was written). Retry the delete under the same attempt,
 		// rather than spend the rate limit on a new one. The attempt takes
-		// this run's confirmed set, and TASKS seen missing in it, first: the
-		// streams missing now may not be the ones missing when the delete
-		// failed, and the condition, the events and the settlement name them.
-		if !slices.Equal(last.Missing, confirmed) || (streak.tasksMissing && !last.TasksMissing) {
+		// this run's confirmed set first: the streams missing now may not be
+		// the ones missing when the delete failed, and the condition, the
+		// events and the settlement name them.
+		if !slices.Equal(last.Missing, confirmed) {
 			last.Missing = confirmed
-			last.TasksMissing = last.TasksMissing || streak.tasksMissing
 			if err := p.writeRecord(ctx, agent, record.pruned(now)); err != nil {
 				return err
 			}
 		}
-		return p.deleteProvisionJob(ctx, agent, job, last.Missing, last.TasksMissing, streak)
+		return p.deleteProvisionJob(ctx, agent, job, last.Missing, streak)
 	}
 	if jobState != busJobComplete {
 		return p.writeCondition(ctx, agent, metav1.ConditionFalse, busStreamsReasonMissing,
-			fmt.Sprintf("Missing from the A2A bus: %s. The provision Job %s failed, so the operator does not re-run it; see the PlatformAgent's events.%s",
-				names, job.Name, tasksRecreatedNote(agent, last, job, jobState, verdict.missing)))
+			fmt.Sprintf("Missing from the A2A bus: %s. The provision Job %s failed, so the operator does not re-run it; see the PlatformAgent's events.",
+				names, job.Name))
 	}
 	if ok, next := record.allows(now); !ok {
 		return p.writeCondition(ctx, agent, metav1.ConditionFalse, busStreamsReasonMissing,
-			fmt.Sprintf("Missing from the A2A bus: %s. The provision Job's next re-run is allowed at %s.%s",
-				names, next.UTC().Format(time.RFC3339), tasksRecreatedNote(agent, last, job, jobState, verdict.missing)))
+			fmt.Sprintf("Missing from the A2A bus: %s. The provision Job's next re-run is allowed at %s.",
+				names, next.UTC().Format(time.RFC3339)))
 	}
 
 	record = record.pruned(now)
-	record.Attempts = append(record.Attempts, busReprovisionAttempt{At: now, Missing: confirmed, JobUID: job.UID, TasksMissing: streak.tasksMissing})
+	record.Attempts = append(record.Attempts, busReprovisionAttempt{At: now, Missing: confirmed, JobUID: job.UID})
 	if err := p.writeRecord(ctx, agent, record); err != nil {
 		return err
 	}
-	return p.deleteProvisionJob(ctx, agent, job, confirmed, streak.tasksMissing, streak)
+	return p.deleteProvisionJob(ctx, agent, job, confirmed, streak)
 }
 
-// tasksRecreatedNote is the sentence the condition and a Warning carry while
-// the last attempt's re-run has recreated TASKS: it named TASKS, or saw it
-// missing, and TASKS is back. The two clients holding a TASKS durable, the A2A
-// gateway's relay and the agent pod's bridge, don't recreate their consumers
-// on their own, and the operator doesn't restart them, so the user has to. It
-// stays, with the attempt's time, until another attempt replaces it; "" when
-// it doesn't apply.
-func tasksRecreatedNote(agent *agentv1alpha1.PlatformAgent, last *busReprovisionAttempt, job *batchv1.Job, jobState busJobState, missing []string) string {
-	if last == nil || job == nil || job.UID == last.JobUID || (jobState != busJobComplete && jobState != busJobFailed) {
-		return ""
+// restartTasksClients deletes the pods of TASKS' two clients, the A2A
+// gateway (its relay) and the agent pod (the bridge), whose client container
+// has been running since before lostAt: their durable went with the stream,
+// and neither recreates it on its own (lib.Client.SubscribeDurable). A
+// container that started since waits for the stream and its durable and then
+// binds (both bind Precreated, lib.SubscribeConfig), and one not running yet
+// is left to start. One delete per pod, with its UID; a pod already gone or
+// replaced is skipped.
+func (p *BusStreamPoller) restartTasksClients(ctx context.Context, agent *agentv1alpha1.PlatformAgent, lostAt time.Time) error {
+	clients := []struct {
+		name, container string
+		selector        map[string]string
+	}{
+		{a2aGatewayName(agent), a2aGatewayContainerName, a2aGatewayPodSelector(agent)},
+		{agent.Name + gatewayAppSuffix, a2aBridgeContainerName, gatewayPodSelector(agent)},
 	}
-	if !slices.Contains(last.Missing, a2aTasksStream) && !last.TasksMissing {
-		return ""
+	var restarted []string
+	for _, c := range clients {
+		pods, err := p.tasksClientPods(ctx, agent, c.name, c.selector)
+		if err != nil {
+			return err
+		}
+		for i := range pods {
+			pod := &pods[i]
+			if pod.DeletionTimestamp != nil || !boundBefore(pod, c.container, lostAt) {
+				continue
+			}
+			uid := pod.UID
+			if err := p.r.Delete(ctx, pod, client.Preconditions{UID: &uid}); err != nil {
+				if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
+					continue
+				}
+				return fmt.Errorf("failed to restart %s: %w", pod.Name, err)
+			}
+			restarted = append(restarted, pod.Name)
+		}
 	}
-	if slices.Contains(missing, a2aTasksStream) {
-		return ""
+	if len(restarted) > 0 {
+		p.r.recordEvent(agent, corev1.EventTypeNormal, busStreamsClientsRestartedEventReason,
+			fmt.Sprintf("Restarted %s: TASKS was lost and is back, so they recreate their TASKS consumers.", strings.Join(restarted, ", ")))
 	}
-	agentKind := "deployment"
-	if useStatefulSet(agent) {
-		agentKind = "statefulset"
+	return nil
+}
+
+// boundBefore reports whether pod's container has been running since before
+// at, and so may hold a consumer bound to a stream lost since.
+func boundBefore(pod *corev1.Pod, container string, at time.Time) bool {
+	for _, st := range append(append([]corev1.ContainerStatus{}, pod.Status.InitContainerStatuses...), pod.Status.ContainerStatuses...) {
+		if st.Name == container {
+			return st.State.Running != nil && st.State.Running.StartedAt.Time.Before(at)
+		}
 	}
-	return fmt.Sprintf(" The provision Job's re-run for the loss at %s recreated TASKS. The A2A gateway and the agent pod don't recreate their TASKS consumers on their own: restart them (kubectl -n %s rollout restart deployment/%s %s/%s%s) so they consume TASKS again.",
-		last.At.UTC().Format(time.RFC3339), agent.Namespace, a2aGatewayName(agent), agentKind, agent.Name, gatewayAppSuffix)
+	return false
+}
+
+// tasksClientPods lists one TASKS client's pods: those with its app label that
+// its workload of that name, controlled by the CR, controls. A StatefulSet
+// controls its pods directly, a Deployment through its ReplicaSets. A pod that
+// only carries the label is left alone.
+func (p *BusStreamPoller) tasksClientPods(ctx context.Context, agent *agentv1alpha1.PlatformAgent, name string, selector map[string]string) ([]corev1.Pod, error) {
+	reader := p.r.a2aReader()
+	key := types.NamespacedName{Namespace: agent.Namespace, Name: name}
+	inNamespace := []client.ListOption{client.InNamespace(agent.Namespace), client.MatchingLabels(selector)}
+	owners := map[types.UID]bool{}
+	var dep appsv1.Deployment
+	if err := reader.Get(ctx, key, &dep); err == nil {
+		if metav1.IsControlledBy(&dep, agent) {
+			var sets appsv1.ReplicaSetList
+			if err := reader.List(ctx, &sets, inNamespace...); err != nil {
+				return nil, err
+			}
+			for i := range sets.Items {
+				if metav1.IsControlledBy(&sets.Items[i], &dep) {
+					owners[sets.Items[i].UID] = true
+				}
+			}
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return nil, err
+	}
+	var sts appsv1.StatefulSet
+	if err := reader.Get(ctx, key, &sts); err == nil {
+		if metav1.IsControlledBy(&sts, agent) {
+			owners[sts.UID] = true
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return nil, err
+	}
+	if len(owners) == 0 {
+		return nil, nil
+	}
+	var pods corev1.PodList
+	if err := p.r.podReader().List(ctx, &pods, inNamespace...); err != nil {
+		return nil, err
+	}
+	var own []corev1.Pod
+	for _, pod := range pods.Items {
+		if ref := metav1.GetControllerOf(&pod); ref != nil && owners[ref.UID] {
+			own = append(own, pod)
+		}
+	}
+	return own, nil
 }
 
 // deleteProvisionJob writes the Reprovisioning condition and deletes the
@@ -717,11 +824,11 @@ func tasksRecreatedNote(agent *agentv1alpha1.PlatformAgent, last *busReprovision
 // that fails doesn't hold the delete back: the next poll writes it again. A
 // delete that fails returns its error, and the next poll retries it under the
 // same attempt.
-func (p *BusStreamPoller) deleteProvisionJob(ctx context.Context, agent *agentv1alpha1.PlatformAgent, job *batchv1.Job, missing []string, tasksMissing bool, streak *busStreamStreak) error {
+func (p *BusStreamPoller) deleteProvisionJob(ctx context.Context, agent *agentv1alpha1.PlatformAgent, job *batchv1.Job, missing []string, streak *busStreamStreak) error {
 	names := strings.Join(missing, ", ")
 	restart := ""
-	if tasksMissing || slices.Contains(missing, a2aTasksStream) {
-		restart = " Once TASKS is back, the A2A gateway and the agent pod need restarting, so they recreate their TASKS consumers."
+	if slices.Contains(missing, a2aTasksStream) {
+		restart = " Once TASKS is back, the A2A gateway and the agent pod are restarted, so they recreate their TASKS consumers."
 	}
 	log := logf.FromContext(ctx).WithName(busStreamsPollerLogName)
 	if err := p.writeCondition(ctx, agent, metav1.ConditionFalse, busStreamsReasonReprovisioning,
@@ -732,7 +839,7 @@ func (p *BusStreamPoller) deleteProvisionJob(ctx context.Context, agent *agentv1
 	if err := p.r.Delete(ctx, job, client.Preconditions{UID: &uid}, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("failed to delete the completed A2A provision Job %s: %w", job.Name, err)
 	}
-	streak.missing, streak.misses, streak.tasksMissing = nil, 0, false
+	streak.missing, streak.misses = nil, 0
 	log.Info("re-running the A2A provision Job: provisioned streams are missing from the bus",
 		"platformagent", client.ObjectKeyFromObject(agent), "missing", missing, "job", job.Name)
 	p.r.recordEvent(agent, corev1.EventTypeWarning, busStreamsMissingEventReason,

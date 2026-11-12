@@ -296,8 +296,22 @@ func busStreamsPod(agent *agentv1alpha1.PlatformAgent, ordinal int) *corev1.Pod 
 
 func busStreamsAddr(ordinal int) string { return fmt.Sprintf("10.0.0.%d:7777", ordinal+1) }
 
+// clientPod is a TASKS client's pod whose client containers (the A2A
+// gateway's and the bridge) have been running since clientStartedAt.
 func clientPod(agent *agentv1alpha1.PlatformAgent, name string, selector map[string]string) *corev1.Pod {
-	return &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: agent.Namespace, Labels: selector, UID: types.UID(name)}}
+	return clientPodStarted(agent, name, selector, clientStartedAt)
+}
+
+var clientStartedAt = busStreamsTestNow.Add(-2 * time.Hour)
+
+func clientPodStarted(agent *agentv1alpha1.PlatformAgent, name string, selector map[string]string, started time.Time) *corev1.Pod {
+	running := func(c string) corev1.ContainerStatus {
+		return corev1.ContainerStatus{Name: c, State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{StartedAt: metav1.NewTime(started)}}}
+	}
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: agent.Namespace, Labels: selector, UID: types.UID(name)},
+		Status:     corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{running(a2aGatewayContainerName), running(a2aBridgeContainerName)}},
+	}
 }
 
 func controlledBy(owner client.Object, kind, apiVersion string) []metav1.OwnerReference {
@@ -474,9 +488,9 @@ func TestAMissingBucketIsConfirmedOnThreePollsThenTheJobRunsAgain(t *testing.T) 
 }
 
 // TASKS has the two fixed durables, and their readers don't recreate them on
-// their own. A re-run that recreates TASKS says so, once as a Warning and on
-// the condition, and restarts nothing itself.
-func TestARecreatedTasksStreamIsReportedForARestart(t *testing.T) {
+// their own: once TASKS is back, both clients running since before the loss
+// are restarted, once.
+func TestARecreatedTasksStreamRestartsItsClientsOnce(t *testing.T) {
 	agent := busStreamsAgent(1)
 	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
 	rig.serve(1, allStreamsBut("TASKS")...)
@@ -487,24 +501,21 @@ func TestARecreatedTasksStreamIsReportedForARestart(t *testing.T) {
 	rig.serve(1, a2aProvisionedStreams...)
 	rig.events()
 	rig.poll()
-	if n := countEvents(rig.events(), busStreamsTasksRecreatedEventReason); n != 1 {
-		t.Errorf("%d %s events on the settling poll, want 1", n, busStreamsTasksRecreatedEventReason)
-	}
-	c := rig.condition()
-	if c == nil || c.Reason != busStreamsReasonAllPresent || !strings.Contains(c.Message, "recreated TASKS") || !strings.Contains(c.Message, "rollout restart deployment/test-agent-a2a-gateway deployment/test-agent-gateway") {
-		t.Fatalf("condition = %+v, want AllPresent naming the recreated TASKS and the restart", c)
-	}
 	for _, pod := range []string{"test-agent-a2a-gateway-abc", "test-agent-gateway-xyz"} {
-		if slices.Contains(rig.deleted, pod) {
-			t.Errorf("deleted %s: the operator doesn't restart TASKS' clients", pod)
+		if !slices.Contains(rig.deleted, pod) {
+			t.Errorf("deleted %v, want %s restarted", rig.deleted, pod)
 		}
 	}
-	rig.poll()
-	if n := countEvents(rig.events(), busStreamsTasksRecreatedEventReason); n != 0 {
-		t.Errorf("%d more %s events on a later poll, want none", n, busStreamsTasksRecreatedEventReason)
+	if n := countEvents(rig.events(), busStreamsClientsRestartedEventReason); n != 1 {
+		t.Errorf("%d %s events, want 1", n, busStreamsClientsRestartedEventReason)
 	}
-	if c := rig.condition(); c == nil || !strings.Contains(c.Message, "recreated TASKS") {
-		t.Errorf("condition = %+v, want the note kept while the attempt is the last", c)
+	if c := rig.condition(); c == nil || c.Reason != busStreamsReasonAllPresent {
+		t.Errorf("condition = %+v, want AllPresent", c)
+	}
+	before := len(rig.deleted)
+	rig.poll()
+	if len(rig.deleted) != before {
+		t.Errorf("a later poll deleted %v again", rig.deleted[before:])
 	}
 }
 
@@ -517,6 +528,7 @@ func countEvents(events []string, reason string) int {
 	}
 	return n
 }
+
 
 // A re-run that completes without bringing the stream back stops the
 // re-runs: the condition says why, and the Job is left alone.
@@ -949,9 +961,9 @@ func TestAReRunInTheSameSecondStillCounts(t *testing.T) {
 	}
 }
 
-// TASKS back while another stream isn't: the Warning goes out on the settling
-// poll, and the other stream stops the re-runs.
-func TestTasksBackIsReportedEvenWithAnotherStreamStillMissing(t *testing.T) {
+// TASKS back while another stream isn't: its readers restart now, and the
+// other stream stops the re-runs.
+func TestTasksBackRestartsItsClientsEvenWithAnotherStreamStillMissing(t *testing.T) {
 	agent := busStreamsAgent(1)
 	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
 	rig.serve(1, allStreamsBut("TASKS", "KV_cap")...)
@@ -960,16 +972,17 @@ func TestTasksBackIsReportedEvenWithAnotherStreamStillMissing(t *testing.T) {
 	rig.poll()
 	rig.recreateJob(batchv1.JobComplete)
 	rig.serve(1, allStreamsBut("KV_cap")...)
-	rig.events()
 	rig.poll()
-	if n := countEvents(rig.events(), busStreamsTasksRecreatedEventReason); n != 1 {
-		t.Errorf("%d %s events, want 1 though KV_cap is still missing", n, busStreamsTasksRecreatedEventReason)
+	for _, pod := range []string{"test-agent-a2a-gateway-abc", "test-agent-gateway-xyz"} {
+		if !slices.Contains(rig.deleted, pod) {
+			t.Errorf("deleted %v, want %s restarted", rig.deleted, pod)
+		}
 	}
 	rig.poll()
 	rig.poll()
 	rig.poll()
-	if c := rig.condition(); c == nil || c.Reason != busStreamsReasonDidNotRestore || !strings.Contains(c.Message, busStreamsReprovisionAnnotation) || !strings.Contains(c.Message, "recreated TASKS") {
-		t.Errorf("condition = %+v, want %s naming the annotation to clear and the recreated TASKS", c, busStreamsReasonDidNotRestore)
+	if c := rig.condition(); c == nil || c.Reason != busStreamsReasonDidNotRestore {
+		t.Errorf("condition = %+v, want %s", c, busStreamsReasonDidNotRestore)
 	}
 }
 
@@ -1222,10 +1235,9 @@ func TestAConditionWriteThatFailsDoesNotHoldTheDelete(t *testing.T) {
 	}
 }
 
-// TASKS lost partway through a confirmation run is dropped by the run's
-// intersection, so the attempt doesn't name it, yet the re-run recreates it.
-// It's still reported.
-func TestTasksLostPartwayThroughARunIsStillReported(t *testing.T) {
+// TASKS lost partway through a confirmation run, so the attempt doesn't name
+// it: the clients are restarted all the same.
+func TestTasksLostPartwayThroughARunStillRestartsItsClients(t *testing.T) {
 	agent := busStreamsAgent(1)
 	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
 	rig.serve(1, allStreamsBut("KV_cap")...)
@@ -1233,21 +1245,21 @@ func TestTasksLostPartwayThroughARunIsStillReported(t *testing.T) {
 	rig.serve(1, allStreamsBut("KV_cap", "TASKS")...)
 	rig.poll()
 	rig.poll()
-	last := readBusReprovisionRecord(rig.agent()).last()
-	if last == nil || slices.Contains(last.Missing, "TASKS") || !last.TasksMissing {
-		t.Fatalf("attempt = %+v, want KV_cap confirmed and TASKS remembered as missing", last)
+	if last := readBusReprovisionRecord(rig.agent()).last(); last == nil || slices.Contains(last.Missing, "TASKS") {
+		t.Fatalf("attempt = %+v, want KV_cap alone confirmed", last)
 	}
 	rig.recreateJob(batchv1.JobComplete)
 	rig.serve(1, a2aProvisionedStreams...)
-	rig.events()
 	rig.poll()
-	if n := countEvents(rig.events(), busStreamsTasksRecreatedEventReason); n != 1 {
-		t.Errorf("%d %s events, want 1", n, busStreamsTasksRecreatedEventReason)
+	for _, pod := range []string{"test-agent-a2a-gateway-abc", "test-agent-gateway-xyz"} {
+		if !slices.Contains(rig.deleted, pod) {
+			t.Errorf("deleted %v, want %s restarted", rig.deleted, pod)
+		}
 	}
 }
 
-// A run whose polls never saw TASKS missing reports nothing about it.
-func TestAKVOnlyRunReportsNoTasksRecreation(t *testing.T) {
+// A loss that never reached TASKS restarts nothing.
+func TestAKVOnlyLossRestartsNothing(t *testing.T) {
 	agent := busStreamsAgent(1)
 	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
 	rig.serve(1, allStreamsBut("KV_cap")...)
@@ -1256,13 +1268,11 @@ func TestAKVOnlyRunReportsNoTasksRecreation(t *testing.T) {
 	rig.poll()
 	rig.recreateJob(batchv1.JobComplete)
 	rig.serve(1, a2aProvisionedStreams...)
-	rig.events()
 	rig.poll()
-	if n := countEvents(rig.events(), busStreamsTasksRecreatedEventReason); n != 0 {
-		t.Errorf("%d %s events for a KV-only loss", n, busStreamsTasksRecreatedEventReason)
-	}
-	if c := rig.condition(); c == nil || strings.Contains(c.Message, "TASKS") {
-		t.Errorf("condition = %+v, want no TASKS note", c)
+	for _, pod := range []string{"test-agent-a2a-gateway-abc", "test-agent-gateway-xyz"} {
+		if slices.Contains(rig.deleted, pod) {
+			t.Errorf("deleted %s, want it left alone", pod)
+		}
 	}
 }
 
@@ -1328,11 +1338,19 @@ func TestAnAttemptWhoseDeleteFailedSettlesWhenTheStreamsComeBack(t *testing.T) {
 	rig.poll()
 	last := readBusReprovisionRecord(rig.agent()).last()
 	if last == nil || !last.Settled || !last.Restored {
-		t.Fatalf("attempt = %+v, want settled as restored with no restart owed", last)
+		t.Fatalf("attempt = %+v, want settled as restored", last)
 	}
 	if c := rig.condition(); c == nil || c.Reason != busStreamsReasonAllPresent {
 		t.Fatalf("condition = %+v, want AllPresent", c)
 	}
+	// TASKS was lost and is back, so its clients are restarted, once, by
+	// the loss rule, whatever became of the attempt.
+	for _, pod := range []string{"test-agent-a2a-gateway-abc", "test-agent-gateway-xyz"} {
+		if !slices.Contains(rig.deleted, pod) {
+			t.Errorf("deleted %v, want %s restarted once TASKS was back", rig.deleted, pod)
+		}
+	}
+	rig.deleted = nil
 
 	// A day later the Job's TTL removes it and the reconcile runs a new one.
 	job := buildA2AProvisionJob(rig.agent())
@@ -1349,18 +1367,15 @@ func TestAnAttemptWhoseDeleteFailedSettlesWhenTheStreamsComeBack(t *testing.T) {
 		}
 	}
 	for _, e := range rig.events() {
-		if strings.Contains(e, busStreamsRestoredEventReason) || strings.Contains(e, busStreamsTasksRecreatedEventReason) {
+		if strings.Contains(e, busStreamsRestoredEventReason) {
 			t.Errorf("event %q for a re-run no attempt asked for", e)
 		}
 	}
-	if c := rig.condition(); c == nil || strings.Contains(c.Message, "recreated TASKS") {
-		t.Errorf("condition = %+v: a TASKS note for a re-run no attempt caused", c)
-	}
 }
 
-// TASKS lost after a failed delete and before its retry is remembered on the
-// attempt, so the retried re-run still reports it.
-func TestTasksLostBeforeARetriedDeleteIsStillReported(t *testing.T) {
+// TASKS lost after a failed delete and before its retry: the clients are
+// restarted once it's back.
+func TestTasksLostBeforeARetriedDeleteStillRestartsItsClients(t *testing.T) {
 	agent := busStreamsAgent(1)
 	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
 	rig.serve(1, allStreamsBut("KV_cap")...)
@@ -1372,21 +1387,15 @@ func TestTasksLostBeforeARetriedDeleteIsStillReported(t *testing.T) {
 	}
 	rig.now = rig.now.Add(busStreamsPollInterval)
 	rig.jobDeleteErr = nil
-
 	rig.serve(1, allStreamsBut("KV_cap", "TASKS")...)
 	rig.poll()
-	if rig.jobExists() {
-		t.Fatalf("the delete was not retried")
-	}
-	if last := readBusReprovisionRecord(rig.agent()).last(); last == nil || !last.TasksMissing {
-		t.Fatalf("attempt = %+v, want TASKS remembered as missing before the retry", last)
-	}
 	rig.recreateJob(batchv1.JobComplete)
 	rig.serve(1, a2aProvisionedStreams...)
-	rig.events()
 	rig.poll()
-	if n := countEvents(rig.events(), busStreamsTasksRecreatedEventReason); n != 1 {
-		t.Errorf("%d %s events after the retried re-run, want 1", n, busStreamsTasksRecreatedEventReason)
+	for _, pod := range []string{"test-agent-a2a-gateway-abc", "test-agent-gateway-xyz"} {
+		if !slices.Contains(rig.deleted, pod) {
+			t.Errorf("deleted %v, want %s restarted", rig.deleted, pod)
+		}
 	}
 }
 
@@ -1421,9 +1430,9 @@ func TestARetriedDeleteNamesThisRunsStreams(t *testing.T) {
 	}
 }
 
-// A re-run that recreates TASKS and then ends Failed (a later step) still
-// reports TASKS, on the failed-Job condition, without settling the attempt.
-func TestARerunThatFailsAfterRecreatingTasksStillReportsIt(t *testing.T) {
+// A re-run that recreates TASKS and then ends Failed (a later step): the
+// clients are restarted all the same, though the attempt never settles.
+func TestARerunThatFailsAfterRecreatingTasksStillRestartsItsClients(t *testing.T) {
 	agent := busStreamsAgent(1)
 	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
 	rig.serve(1, allStreamsBut("TASKS", "KV_cap")...)
@@ -1433,11 +1442,10 @@ func TestARerunThatFailsAfterRecreatingTasksStillReportsIt(t *testing.T) {
 	rig.recreateJob(batchv1.JobFailed)
 	rig.serve(1, allStreamsBut("KV_cap")...)
 	rig.poll()
-	rig.poll()
-	rig.poll()
-	c := rig.condition()
-	if c == nil || c.Reason != busStreamsReasonMissing || !strings.Contains(c.Message, "failed") || !strings.Contains(c.Message, "recreated TASKS") {
-		t.Fatalf("condition = %+v, want the failed-Job message with the TASKS note", c)
+	for _, pod := range []string{"test-agent-a2a-gateway-abc", "test-agent-gateway-xyz"} {
+		if !slices.Contains(rig.deleted, pod) {
+			t.Errorf("deleted %v, want %s restarted", rig.deleted, pod)
+		}
 	}
 	if last := readBusReprovisionRecord(rig.agent()).last(); last == nil || last.Settled {
 		t.Errorf("attempt = %+v, want it unsettled: a failed re-run doesn't settle", last)
@@ -1453,5 +1461,235 @@ func TestATabSeparatedServerLineIsRead(t *testing.T) {
 	}
 	if !reading.jsz {
 		t.Errorf("a tab-separated jetstream_server_total_streams line was skipped")
+	}
+}
+
+// A client container that started after the loss was first seen waits for
+// the stream and its durable, and binds: it isn't restarted. The other,
+// running since before the loss, is.
+func TestAClientStartedDuringTheLossIsNotRestarted(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	rig.serve(1, allStreamsBut("TASKS")...)
+	rig.poll()
+	lostAt := *readBusReprovisionRecord(rig.agent()).TasksLostAt
+	ctx := context.Background()
+	old := &corev1.Pod{}
+	if err := rig.cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: "test-agent-a2a-gateway-abc"}, old); err != nil {
+		t.Fatal(err)
+	}
+	fresh := clientPodStarted(agent, "test-agent-a2a-gateway-new", a2aGatewayPodSelector(agent), lostAt.Add(time.Minute))
+	fresh.OwnerReferences = old.OwnerReferences
+	if err := rig.cl.Delete(ctx, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := rig.cl.Create(ctx, fresh); err != nil {
+		t.Fatal(err)
+	}
+	rig.deleted = nil
+	rig.serve(1, a2aProvisionedStreams...)
+	rig.poll()
+	if slices.Contains(rig.deleted, "test-agent-a2a-gateway-new") {
+		t.Errorf("restarted the gateway pod that started during the loss")
+	}
+	if !slices.Contains(rig.deleted, "test-agent-gateway-xyz") {
+		t.Errorf("deleted %v, want the agent pod, running since before the loss, restarted", rig.deleted)
+	}
+}
+
+// A client container that isn't running isn't restarted yet: once it runs, it
+// binds or the next poll judges it.
+func TestAClientContainerNotRunningIsLeftToStart(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	ctx := context.Background()
+	pod := &corev1.Pod{}
+	if err := rig.cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: "test-agent-gateway-xyz"}, pod); err != nil {
+		t.Fatal(err)
+	}
+	waiting := pod.DeepCopy()
+	waiting.ResourceVersion = ""
+	waiting.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: a2aBridgeContainerName, State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff"}}}}
+	if err := rig.cl.Delete(ctx, pod); err != nil {
+		t.Fatal(err)
+	}
+	if err := rig.cl.Create(ctx, waiting); err != nil {
+		t.Fatal(err)
+	}
+	rig.deleted = nil
+	rig.serve(1, allStreamsBut("TASKS")...)
+	rig.poll()
+	rig.serve(1, a2aProvisionedStreams...)
+	rig.poll()
+	if slices.Contains(rig.deleted, "test-agent-gateway-xyz") {
+		t.Errorf("restarted an agent pod whose bridge isn't running")
+	}
+	if !slices.Contains(rig.deleted, "test-agent-a2a-gateway-abc") {
+		t.Errorf("deleted %v, want the running gateway restarted", rig.deleted)
+	}
+}
+
+// TASKS lost and restored by hand, with no re-run at all: the clients are
+// restarted once it's back.
+func TestTasksRestoredByHandStillRestartsItsClients(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	rig.serve(1, allStreamsBut("TASKS")...)
+	rig.poll()
+	rig.serve(1, a2aProvisionedStreams...)
+	rig.poll()
+	for _, pod := range []string{"test-agent-a2a-gateway-abc", "test-agent-gateway-xyz"} {
+		if !slices.Contains(rig.deleted, pod) {
+			t.Errorf("deleted %v, want %s restarted", rig.deleted, pod)
+		}
+	}
+	if n := len(readBusReprovisionRecord(rig.agent()).Attempts); n != 0 {
+		t.Errorf("%d attempts, want none: nothing was re-run", n)
+	}
+}
+
+// A restart that fails warns once per loss, keeps the condition off
+// AllPresent, and is retried until it succeeds.
+func TestAFailedRestartWarnsOnceAndIsRetried(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	rig.serve(1, allStreamsBut("TASKS")...)
+	rig.poll()
+	rig.serve(1, a2aProvisionedStreams...)
+	rig.podDeleteErr = errors.New("etcdserver: request timed out")
+	rig.events()
+	rig.poll()
+	rig.poll()
+	if n := countEvents(rig.events(), busStreamsRestartFailedEventReason); n != 1 {
+		t.Errorf("%d %s events over two failing polls, want 1", n, busStreamsRestartFailedEventReason)
+	}
+	if c := rig.condition(); c == nil || c.Reason != busStreamsReasonReprovisioning || !strings.Contains(c.Message, "restarting the A2A gateway and the agent pod failed") {
+		t.Fatalf("condition = %+v, want Reprovisioning naming the failed restart", c)
+	}
+	rig.podDeleteErr = nil
+	rig.poll()
+	for _, pod := range []string{"test-agent-a2a-gateway-abc", "test-agent-gateway-xyz"} {
+		if !slices.Contains(rig.deleted, pod) {
+			t.Errorf("deleted %v, want %s restarted", rig.deleted, pod)
+		}
+	}
+	if c := rig.condition(); c == nil || c.Reason != busStreamsReasonAllPresent {
+		t.Errorf("condition = %+v, want AllPresent once restarted", c)
+	}
+}
+
+// The loss outlives an operator restart: a fresh poller reads it from the
+// annotation and restarts the clients once TASKS is back.
+func TestTheLossOutlivesAnOperatorRestart(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	rig.serve(1, allStreamsBut("TASKS")...)
+	rig.poll()
+	rig.poller.streaks = map[types.UID]*busStreamStreak{}
+	rig.serve(1, a2aProvisionedStreams...)
+	rig.poll()
+	for _, pod := range []string{"test-agent-a2a-gateway-abc", "test-agent-gateway-xyz"} {
+		if !slices.Contains(rig.deleted, pod) {
+			t.Errorf("deleted %v, want %s restarted", rig.deleted, pod)
+		}
+	}
+}
+
+// A second loss after a restart is a new episode: the clients, running since
+// the first restart, are restarted again.
+func TestASecondLossRestartsTheClientsAgain(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	rig.serve(1, allStreamsBut("TASKS")...)
+	rig.poll()
+	rig.serve(1, a2aProvisionedStreams...)
+	rig.poll()
+	ctx := context.Background()
+	// The restarted clients come back, started now.
+	for _, c := range []struct {
+		name  string
+		sel   map[string]string
+		owner string
+	}{
+		{"test-agent-a2a-gateway-abc", a2aGatewayPodSelector(agent), a2aGatewayName(agent) + "-5d9c"},
+		{"test-agent-gateway-xyz", gatewayPodSelector(agent), agent.Name + gatewayAppSuffix + "-5d9c"},
+	} {
+		rs := &appsv1.ReplicaSet{}
+		if err := rig.cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: c.owner}, rs); err != nil {
+			t.Fatal(err)
+		}
+		p := clientPodStarted(agent, c.name, c.sel, rig.now)
+		p.OwnerReferences = controlledBy(rs, "ReplicaSet", "apps/v1")
+		if err := rig.cl.Create(ctx, p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rig.deleted = nil
+	rig.now = rig.now.Add(time.Hour)
+	rig.serve(1, allStreamsBut("TASKS")...)
+	rig.poll()
+	rig.serve(1, a2aProvisionedStreams...)
+	rig.poll()
+	for _, pod := range []string{"test-agent-a2a-gateway-abc", "test-agent-gateway-xyz"} {
+		if !slices.Contains(rig.deleted, pod) {
+			t.Errorf("deleted %v, want %s restarted", rig.deleted, pod)
+		}
+	}
+}
+
+// Only each client's own pods are restarted: a pod that carries a client's app
+// label without its workload controlling it is left alone, and so is a
+// look-alike Deployment's.
+func TestOnlyTheClientsOwnPodsAreRestarted(t *testing.T) {
+	agent := busStreamsAgent(1)
+	stray := clientPod(agent, "test-agent-a2a-gateway-stray", a2aGatewayPodSelector(agent))
+	foreignRS := &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Name: "other-rs", Namespace: agent.Namespace, UID: "other-rs", Labels: gatewayPodSelector(agent),
+		OwnerReferences: []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "Deployment", Name: "other", UID: "other-dep", Controller: ptr.To(true)}}}}
+	foreign := clientPod(agent, "test-agent-gateway-foreign", gatewayPodSelector(agent))
+	foreign.OwnerReferences = controlledBy(foreignRS, "ReplicaSet", "apps/v1")
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete), stray, foreignRS, foreign)
+	rig.serve(1, allStreamsBut("TASKS")...)
+	rig.poll()
+	rig.serve(1, a2aProvisionedStreams...)
+	rig.poll()
+	for _, pod := range []string{"test-agent-a2a-gateway-abc", "test-agent-gateway-xyz"} {
+		if !slices.Contains(rig.deleted, pod) {
+			t.Errorf("deleted %v, want %s restarted", rig.deleted, pod)
+		}
+	}
+	for _, pod := range []string{stray.Name, foreign.Name} {
+		if slices.Contains(rig.deleted, pod) {
+			t.Errorf("deleted %s, which no client workload of the CR controls", pod)
+		}
+	}
+}
+
+// The agent pod can run under a StatefulSet; its pods are its own directly.
+func TestAStatefulSetClientsPodsAreRestarted(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	ctx := context.Background()
+	if err := rig.cl.Delete(ctx, &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: agent.Name + gatewayAppSuffix, Namespace: agent.Namespace}}); err != nil {
+		t.Fatal(err)
+	}
+	sts := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: agent.Name + gatewayAppSuffix, Namespace: agent.Namespace, UID: "agent-gw-sts",
+		OwnerReferences: controlledBy(agent, "PlatformAgent", agentv1alpha1.GroupVersion.String())}}
+	pod := clientPod(agent, "test-agent-gateway-0", gatewayPodSelector(agent))
+	pod.OwnerReferences = controlledBy(sts, "StatefulSet", "apps/v1")
+	for _, obj := range []client.Object{sts, pod} {
+		if err := rig.cl.Create(ctx, obj); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rig.deleted = nil
+	rig.serve(1, allStreamsBut("TASKS")...)
+	rig.poll()
+	rig.serve(1, a2aProvisionedStreams...)
+	rig.poll()
+	if !slices.Contains(rig.deleted, "test-agent-gateway-0") {
+		t.Errorf("deleted %v, want the StatefulSet's pod restarted", rig.deleted)
+	}
+	if slices.Contains(rig.deleted, "test-agent-gateway-xyz") {
+		t.Errorf("deleted the old ReplicaSet's pod, whose Deployment is gone")
 	}
 }
