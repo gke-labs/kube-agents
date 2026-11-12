@@ -2919,9 +2919,18 @@ class C5PrivilegedControllersAreBounded(unittest.TestCase):
                 self.assertTrue(cluster_roles, f"{source} renders no operator ClusterRole")
                 for role in cluster_roles:
                     for rule in role.get("rules") or []:
-                        self.assertNotIn("*", rule.get("resources") or [])
-                        self.assertNotIn("*", rule.get("apiGroups") or [])
-                        reached = rule_kinds(rule) & self.OPERATOR_NAMESPACED_WRITE_KINDS
+                        # A wildcard counts for the kinds it reaches: `*` as the
+                        # resource reaches every inventory kind in that group,
+                        # `*` as the group reaches the inventory kinds of that
+                        # name in any group. A wildcard that reaches none is A4's
+                        # to judge, not this test's.
+                        reached = {
+                            kind
+                            for kind in self.OPERATOR_NAMESPACED_WRITE_KINDS
+                            for group in (rule.get("apiGroups") or [])
+                            for resource in (rule.get("resources") or [])
+                            if group in ("*", kind[0]) and resource in ("*", kind[1])
+                        }
                         if not reached:
                             continue
                         self.assertTrue(
