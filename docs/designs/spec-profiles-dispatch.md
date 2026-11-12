@@ -358,7 +358,9 @@ leave open:
   admission, and a task that names no cluster gets none. When the submission's
   `taskParameters.changeRequested` is true, the `proxyToken` also carries
   `permits: ["vcs:proposal-create"]`, which admits the worker's version-control writes at the
-  broker (#3993); otherwise it carries no `permits` key at all, never an empty list, so its
+  broker (#3993). A permit-carrying task runs in its own one-pod Job, never on a pool pod: one
+  whose tier has no Job runner is refused at admission (`change-needs-job`), and the permit is
+  minted only for a task on a Job (#5646). Otherwise it carries no `permits` key at all, never an empty list, so its
   claims are those of a token minted before the claim existed. The `taskCredential` never
   carries one, and the callout refuses one that does. Both name the task, its profile and
   tier, the pod, and the pod's UID as the pool saw it at the offer. Both expire at the
@@ -435,7 +437,8 @@ leave open:
   under an agreement policy that names the dispatcher (`lib.DispatcherSession`) as a
   supervisor beside the gateway. The codes are
   `tier-not-allowed`, `no-worker` (an unattended task with no runner, under Job mode below),
-  `verifier-refused`, `parameters-invalid` and `queue-timeout` at admission, and `lease-expired`
+  `change-needs-job` (a confirmed change whose tier has no Job runner), `verifier-refused`,
+  `parameters-invalid` and `queue-timeout` at admission, and `lease-expired`
   and `deadline-exceeded` while it holds. A terminal is retried until it lands, except for a
   profile that has left the install config: its `.supervisor` grant goes at the next reconnect,
   so after `DroppedTerminalGiveUp` (fifteen minutes, well past a brief drop from the config) the

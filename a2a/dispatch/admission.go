@@ -78,13 +78,31 @@ var errHeldBack = errors.New("held back at admission")
 // listed its pods yet says nothing, so a dispatcher just started refuses
 // nothing on it.
 func (d *Dispatcher) noRunner(prof lib.DispatchProfile, tier string) bool {
-	if !d.cfg.unattended(tier) || (d.jobs != nil && len(prof.JobTemplate) > 0) {
+	if !d.cfg.unattended(tier) || d.jobRunner(prof, tier) {
 		return false
 	}
 	if p, ok := d.pool.(interface{ Synced() bool }); ok && !p.Synced() {
 		return false
 	}
 	return len(d.pool.Pods(prof.Name, tier)) == 0
+}
+
+// jobRunner reports whether a task of prof's at tier runs in a Job of its
+// own: Job mode (a JobRunner and the profile's Job template, which the
+// operator renders only where the chart installed the Job admission policy)
+// at an unattended tier. Placement and the permit refusal both read it, so
+// a task admitted for a permit is one placement puts on a Job.
+func (d *Dispatcher) jobRunner(prof lib.DispatchProfile, tier string) bool {
+	return d.cfg.unattended(tier) && d.jobs != nil && len(prof.JobTemplate) > 0
+}
+
+// carriesPermit reports whether a task's credential-proxy credential would
+// carry the vcs:proposal-create permit: a confirmed change (changeRequested,
+// which only the gateway sets, on a structured confirm) on a task with a
+// cluster, the only tasks a proxy credential is minted for. The mint and the
+// refusal read this one predicate.
+func carriesPermit(changeRequested bool, cluster *taskcred.Target) bool {
+	return changeRequested && cluster != nil
 }
 
 // admit runs the admission checks in order, cheapest first: the tier, a runner
@@ -135,6 +153,12 @@ func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.Dispa
 	target, cluster, changeRequested, bad := taskTarget(env, prof, snap.Namespace)
 	if bad != "" {
 		return admitted{}, &refusal{ReasonParametersInvalid, bad}, nil
+	}
+	// A task whose credential would carry a write permit runs in its own
+	// one-pod Job, never on a pool pod: with no Job runner for its tier it
+	// is refused, not run without one.
+	if carriesPermit(changeRequested, cluster) && !d.jobRunner(prof, tier) {
+		return admitted{}, &refusal{ReasonChangeNeedsJob, fmt.Sprintf("this change runs in its own Job, and profile %s has no Job runner at tier %s", prof.Name, tier)}, nil
 	}
 	ref, present, err := capability.RefFromAuthority(env.Authority)
 	switch {

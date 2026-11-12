@@ -753,7 +753,7 @@ func (d *Dispatcher) handle(ctx context.Context, del lib.Delivery) {
 	// didn't install the Job admission policy) the task goes to the (profile,
 	// tier)'s pool. The operator builds pools for the read tier only, so an
 	// unattended task with no pool pod was refused at admission (noRunner).
-	if h.unattended && d.jobs != nil && len(prof.JobTemplate) > 0 {
+	if h.unattended && d.jobRunner(prof, h.tier) {
 		h.onJob = true
 		var ended bool
 		rec, key, ended, err = d.runJob(ctx, log, del, snap, prof, h)
@@ -1186,9 +1186,9 @@ func (d *Dispatcher) offerTo(ctx context.Context, log *slog.Logger, envelope []b
 // nothing. Both expire at the offer's deadline plus the callout's clock-skew
 // allowance, capped at the max lifetime from now so the callout never
 // refuses one as too long-lived. The proxy token carries the
-// vcs:proposal-create permit when the submission asked for a change, and no
-// permits claim at all otherwise (#3993); the bus credential never carries
-// one. Each is read back with the key's public
+// vcs:proposal-create permit when the submission asked for a change and the
+// task runs on a Job of its own (#5646), and no permits claim at all
+// otherwise (#3993); the bus credential never carries one. Each is read back with the key's public
 // half before it is used, and only its jti is logged, never the token.
 func (d *Dispatcher) taskCredentials(log *slog.Logger, h *holding, pod, uid string, deadline time.Time) (natsToken, proxyToken string, err error) {
 	if now := d.pool.PodUID(h.profile, h.tier, pod); now != uid {
@@ -1206,8 +1206,16 @@ func (d *Dispatcher) taskCredentials(log *slog.Logger, h *holding, pod, uid stri
 	}
 	if h.cluster != nil {
 		proxy := base
-		if h.changeRequested {
-			proxy.Permits = []taskcred.Permit{taskcred.PermitVCSProposalCreate}
+		// The permit goes only on a Job's pod, the task's alone. A pool
+		// pod runs the next task too, so a permit task that reached one
+		// (admission refuses it) is minted no permit, and its writes are
+		// refused.
+		if carriesPermit(h.changeRequested, h.cluster) {
+			if h.onJob {
+				proxy.Permits = []taskcred.Permit{taskcred.PermitVCSProposalCreate}
+			} else {
+				log.Error("a task with a confirmed change reached a pool pod; minting no write permit", "task", h.taskID, "profile", h.profile, "tier", h.tier)
+			}
 		}
 		proxyToken, err = d.mintOne(log, proxy, taskcred.AudienceCredentialProxy, h.cluster, now)
 		if err != nil {

@@ -22,6 +22,10 @@ const (
 	ReasonLeaseExpired      = "lease-expired"
 	ReasonDeadlineExceeded  = "deadline-exceeded"
 	ReasonStopped           = "stopped"
+	// ReasonChangeNeedsJob refuses a task whose confirmed change would put
+	// a write permit on its credential while its tier has no Job runner: a
+	// permit-carrying task runs in its own one-pod Job, never on a pool pod.
+	ReasonChangeNeedsJob = "change-needs-job"
 )
 
 // waitBreaker is why a submission held back by a breaker is shown waiting.
