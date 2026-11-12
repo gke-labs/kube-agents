@@ -72,6 +72,13 @@ CONSOLE_ALLOWLIST_VARS = ("usageCounters", "usageOriginFields", "usageTotalField
 CONSOLE_ALLOWLIST_CONSTANTS = ("usageActiveInterfacesField", "usageTopToolsKey")
 
 QUOTED_RE = re.compile(r'"([A-Za-z0-9]+)"')
+# The render's format strings: the gateway's renderTopTools is the console's line for line, and
+# the usage and performance lines of the gateway's render are among the console's.
+FORMAT_RE = re.compile(r'fmt\.Sprintf\("([^"]*)"')
+TOOLS_RENDER_FUNCS = ("func renderTopTools(", "func renderTopTools(")
+USAGE_RENDER_FUNCS = (("func renderUsageSummary(", "func usageSummaryOriginLine("), ("func renderUsageLines(", "func usageOriginLine("))
+# Lines the gateway's render spells as literals and the console names as constants.
+LITERAL_LABELS = (('"  lastActive: "', "usageLastActiveLabel"), ('"  lastHumanActive: "', "usageLastHumanActiveLabel"))
 IDENT_RE = re.compile(r"\b(usage\w+)\b")
 
 
@@ -152,6 +159,22 @@ class ConsoleCopyTest(unittest.TestCase):
         for gateway_name, console_name in RENAMED_NUMBERS:
             with self.subTest(gateway_name):
                 self.assertEqual(_number(self.gateway, gateway_name), _number(self.console, console_name))
+
+    def test_the_console_prints_the_same_line_shapes(self):
+        gateway_tools, console_tools = TOOLS_RENDER_FUNCS
+        self.assertEqual(
+            FORMAT_RE.findall(_func_body(self.gateway, gateway_tools)),
+            FORMAT_RE.findall(_func_body(self.console, console_tools)),
+        )
+        gateway_funcs, console_funcs = USAGE_RENDER_FUNCS
+        gateway_formats = {f for sig in gateway_funcs for f in FORMAT_RE.findall(_func_body(self.gateway, sig))}
+        console_formats = {f for sig in console_funcs for f in FORMAT_RE.findall(_func_body(self.console, sig))}
+        self.assertEqual(sorted(console_formats - gateway_formats), [], "line shapes the console prints and the gateway does not")
+        self.assertGreaterEqual(len(console_formats), 5)
+        render = _func_body(self.gateway, "func renderUsageSummary(")
+        for literal, console_name in LITERAL_LABELS:
+            self.assertIn(literal, render)
+            self.assertEqual(literal.strip('"'), _constant(self.console, console_name))
 
     def test_every_field_the_gateway_renders_is_on_the_console_allowlist(self):
         """A field the gateway's render reads by name, through a list, a constant or a literal,

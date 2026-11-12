@@ -21,7 +21,8 @@ limitations under the License.
 // versions (Kubernetes, kube-agents chart and images, Hermes), dates (when
 // kube-agents was installed, when it last rolled out), counts (nodes,
 // namespaces, workloads, pods), and the PlatformAgent's status.usage block
-// (usage.go: counters, the broker's tool vocabulary and totals, nothing
+// (usage.go: counters, proposal origins, the broker's tool vocabulary,
+// totals, the interface words and the two last-active timestamps, nothing
 // else). It never returns the name of the customer's
 // cluster, project, namespaces or workloads. The one exception is the
 // install block's ownership fields: the kube-agents Helm release, the
@@ -439,6 +440,7 @@ func (s *server) readEnvironment(ctx context.Context) environmentResponse {
 	k := s.kube
 	if k == nil {
 		out.Unavailable["kubernetes"] = "no service account token is mounted; the chart grants one when webConsole.environment.enabled is true"
+		out.Unavailable["usage"] = out.Unavailable["kubernetes"]
 		return out
 	}
 	var ver struct {

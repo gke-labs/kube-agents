@@ -47,8 +47,9 @@ limitations under the License.
 // those, through a route limited to this console's own session IDs.
 //
 // Three read routes sit beside the chat. GET /api/insights (insights.go)
-// returns the model, LiteLLM's token and spend counters, the agent's identity
-// as recorded at install, and the cluster. GET /api/sessions/{id}/transcript
+// returns the model, the token and spend totals (the operator's since-install
+// figures off the PlatformAgent status when readable, LiteLLM's own counters
+// otherwise), the agent's identity as recorded at install, and the cluster. GET /api/sessions/{id}/transcript
 // (activity.go) returns the text of an event triage, scheduled check or
 // console session, and refuses every other session, Slack and Google Chat
 // included. GET /api/channels/{name}/posts (channels.go) lists the event
@@ -480,8 +481,9 @@ type server struct {
 
 	summaries summaryCache
 
-	// kube reads the Kubernetes API for /api/environment; nil when the pod
-	// has no service account token. environment caches the last read.
+	// kube reads the Kubernetes API for /api/environment and the
+	// PlatformAgent's usage totals for /api/insights; nil when the pod has no
+	// service account token. environment caches the last read.
 	kube        *kubeClient
 	environment environmentCache
 

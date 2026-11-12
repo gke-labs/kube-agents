@@ -3092,8 +3092,10 @@
             <input type="checkbox" id="feedback-include-context" checked />
             Attach environment context: versions, install and upgrade dates,
             node/namespace/workload counts, skills seen, and the agent's usage
-            counters, top tools and token totals from the PlatformAgent status.
-            No names (cluster, project, namespace, workload, user) are included.
+            block from the PlatformAgent status: usage counters, proposal
+            origins, top tools, token and spend totals, the enabled chat
+            interfaces and the times the agent and a person were last active. No
+            names (cluster, project, namespace, workload, user) are included.
           </label>
           <div
             class="skill-card"
@@ -6345,7 +6347,7 @@
             "ins-cost",
             formatUSD(u.spend_usd),
             sinceInstall
-              ? "Estimated by LiteLLM from its price table; kept across its restarts by the operator"
+              ? "Estimated by LiteLLM from its price table; the operator polls it every few minutes and keeps the total across its restarts"
               : "Estimated by LiteLLM from its price table",
           );
           const partial = u.replicas_read < u.replicas_found;
@@ -6355,7 +6357,7 @@
           const note = setText(
             "ins-usage-note",
             sinceInstall
-              ? `Since install (PlatformAgent status) · live: ${replicas}`
+              ? `Since install, as of the operator's last poll · live: ${replicas}`
               : `Since LiteLLM last restarted · ${replicas}`,
             u.error,
           );
@@ -9006,9 +9008,11 @@
         if (missing.length)
           lines.push(`- Not readable by the console: ${missing.join(", ")}`);
         // The PlatformAgent's status.usage block as GET /api/environment
-        // renders it: the same usage, tools and performance lines as
-        // "/feedback summary" in chat. Counters, the broker's tool vocabulary
-        // and totals; the server copies nothing else off the status.
+        // renders it: the usage, tools and performance lines of the block
+        // "/feedback summary" prints in chat. Counters, proposal origins, the
+        // broker's tool vocabulary, totals, the interface words and the two
+        // last-active timestamps; the server copies nothing else off the
+        // status.
         if (
           env.usage &&
           Array.isArray(env.usage.lines) &&
@@ -9016,7 +9020,7 @@
         ) {
           lines.push("");
           lines.push(
-            "**Agent usage** (PlatformAgent status: counters, tool vocabulary and totals; no names)",
+            "**Agent usage** (PlatformAgent status: counters, proposal origins, tool vocabulary, totals, interfaces and last-active times; no names)",
           );
           lines.push("```");
           lines.push(...env.usage.lines);
@@ -9050,10 +9054,10 @@
         const lines = ["## Usage statistics", ""];
         if (u.source === "platformagent") {
           lines.push(
-            `- Tokens since install (PlatformAgent status): ${formatCount(u.total_tokens)} (${formatCount(u.input_tokens)} in / ${formatCount(u.output_tokens)} out)`,
+            `- Tokens since install (PlatformAgent status, as of the operator's last poll): ${formatCount(u.total_tokens)} (${formatCount(u.input_tokens)} in / ${formatCount(u.output_tokens)} out)`,
           );
           lines.push(
-            `- Estimated spend since install (LiteLLM price table): ${formatUSD(u.spend_usd)}`,
+            `- Estimated spend since install (LiteLLM price table, same reading): ${formatUSD(u.spend_usd)}`,
           );
           if (u.live && u.replicas_read)
             lines.push(

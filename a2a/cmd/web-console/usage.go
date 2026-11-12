@@ -30,7 +30,9 @@ limitations under the License.
 // before, so a status field that one day holds a name cannot leak into a
 // report. The render is the gateway block's usage, tools and performance
 // lines, verbatim, less the latency note that points at the workstation
-// script.
+// script; the block's environment lines, chat-turns roll-up and feedback
+// template are the gateway's alone. The totals are as of the operator's last
+// poll of LiteLLM, so a live scrape can run ahead of them.
 
 package main
 
