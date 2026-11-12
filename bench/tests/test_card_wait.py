@@ -188,6 +188,7 @@ class _FakeDoor:
     def __init__(self, states, cancel_error=None, after_cancel="canceled", send_errors=()):
         self.states = list(states)
         self.cancels = 0
+        self.gets = 0
         self.sends = []
         self.cancel_error = cancel_error
         self.after_cancel = after_cancel
@@ -200,6 +201,7 @@ class _FakeDoor:
         return {"id": "t-1", "contextId": context_id, "status": {"state": "submitted"}}
 
     def get(self, task_id):
+        self.gets += 1
         state = self.states.pop(0) if len(self.states) > 1 else self.states[0]
         return {"id": task_id, "status": {"state": state, "message": {"parts": [{"kind": "text", "text": "on it"}]}}}
 
@@ -332,3 +334,35 @@ def test_an_abandoned_run_cancels_its_task_and_purges_its_cards(card_wait):
     result, door, seen = card_wait(["working"], [["a2a-a", "a2a-b"]])
     assert _infra(result) and door.cancels == 1
     assert seen["cleaned"]["archived"] and seen["cleaned"]["purged"]
+
+
+def test_a_completed_card_wait_record_is_a_real_run_at_rung_3(card_wait, make_run):
+    """The door reports no token usage, so the record's liveness is the task's
+    terminal, which the harness writes the way the inject transport does."""
+    from kube_agents_bench.cases import load_case
+    from kube_agents_bench.scoring import Rung, classify_rep
+
+    result, _, _ = card_wait(["working"], [["a2a-x"]])
+    assert not _infra(result)
+
+    def as_recorded(rec):
+        rec["tokens"] = {k: None for k in rec["tokens"]}
+        rec["trajectory"] = result.trajectory
+
+    task = Path(__file__).resolve().parents[1] / "tasks" / "chat-stop-during-card-wait-a2a-door" / "task.yaml"
+    rep = classify_rep(load_case(task), make_run(mutate=as_recorded), 1)
+    assert rep.rung is not Rung.NOT_A_REAL_RUN, rep.reason
+
+
+def test_a_refused_cancel_then_a_task_that_finished_on_its_own_is_a_setup_error(card_wait):
+    result, door, _ = card_wait(
+        ["working", "working", "completed"], [["a2a-x"]],
+        cancel_error=a2a_door.DoorError(-32002, "not cancelable"),
+    )
+    assert _infra(result) and "setup" in result.errors[0] and "completed" in result.errors[0]
+
+
+def test_a_refused_cancel_does_not_wait_out_the_cancel_settle(card_wait):
+    result, door, seen = card_wait(["working"], [["a2a-x"]], cancel_error=a2a_door.DoorError(-32002, "not cancelable"))
+    assert seen["sent"][0] is False and door.gets <= 3
+

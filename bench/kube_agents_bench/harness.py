@@ -3278,23 +3278,40 @@ class KubeAgentsHarness(AgentHarness):
             except _TransportError as exc:
                 cancel, cancel_error = (False, str(exc)), exc
             final = task
-            if cancel_error is None:
+            if cancel[0]:
                 end = time.monotonic() + _A2A_DOOR_CANCEL_SETTLE
                 while time.monotonic() < end:
                     final = _with_retries(lambda: door.get(task_id), "tasks/get")
                     if a2a_door.task_state(final) in a2a_door.TERMINAL_STATES:
                         break
                     time.sleep(max(poll_interval, 1.0))
+            elif cancel_error is None:
+                # A refused cancel settles nothing: one read, to tell a task
+                # that finished on its own from one still working.
+                final = _with_retries(lambda: door.get(task_id), "tasks/get")
             final_state = a2a_door.task_state(final)
+            final_seen = final_state in a2a_door.TERMINAL_STATES
             result.trajectory.append({
                 "name": _A2A_DOOR_STATUS_ENTRY,
-                "args": {"state": final_state, "final": final_state in a2a_door.TERMINAL_STATES},
+                "args": {"state": final_state, "final": final_seen},
                 "status": "completed",
             })
-            if cancel[0] and final_state in a2a_door.TERMINAL_STATES and final_state != "canceled":
-                # The turn finished on its own before the cancel took: the
-                # stop never landed, which is the setup's miss, not the agent's.
-                return _abandon(f"setup: the A2A door task ended {final_state}, not canceled, after the cancel was accepted")
+            if final_seen or final_state == a2a_door.STATE_WORKING:
+                # The door reports no token usage, so rung 3 reads the run off
+                # the task's status, in the inject transport's entry shape
+                # (scoring._a2a_run_evidence).
+                result.trajectory.append({
+                    "name": inject.EVENT_ENTRY_STATUS,
+                    "args": {"state": final_state, "final": final_seen},
+                    "result": None,
+                    "status": "completed",
+                })
+            if final_seen and final_state != "canceled":
+                # The turn finished on its own before the cancel took, or
+                # before a refused cancel could matter: the stop never
+                # landed, which is the setup's miss, not the agent's.
+                how = "after the cancel was accepted" if cancel[0] else f"and the cancel was refused ({cancel[1]})"
+                return _abandon(f"setup: the A2A door task ended {final_state}, not canceled, {how}")
             result.output = a2a_door.task_text(final)
             result.metadata["final_message"] = result.output
 
