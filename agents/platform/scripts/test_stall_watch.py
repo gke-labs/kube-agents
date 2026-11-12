@@ -40,6 +40,13 @@ def completed(argv, stdout="", returncode=0, stderr=""):
     return subprocess.CompletedProcess(argv, returncode, stdout=stdout, stderr=stderr)
 
 
+def setUpModule():
+    # The tests below drive the gcloud listing through their run_sandbox fakes,
+    # which read every `python3` call as a namespace scan. The relay listing has
+    # its own tests (RelayListing), which turn it back on.
+    stall_watch._relay_off = True
+
+
 def finding(namespace, obj, heuristic, detail, stalled_for="20m", stalled_seconds=1200):
     # The shape stall_report.py emits per row.
     return {
@@ -2158,6 +2165,47 @@ class ClusterRead(Base):
             stall_watch.run_sandbox(["kubectl", "version"], timeout=300, deadline=1000.0 - 5)
         self.assertEqual(seen, [300, 40, stall_watch.SCAN_TIMEOUT_FLOOR_SECONDS], "no deadline: as asked; a deadline: the time left to it; past it: the floor")
 
+    def test_a_timed_out_hop_ends_the_remote_reader_too(self):
+        # The sandbox is this machine: the fake runs the remote argv as a
+        # process, with a local timeout far past the hop's, so only the
+        # `timeout` wrapper the hop carries can end the reader. It does, at
+        # the hop's bound plus the grace, with coreutils' exit code.
+        seen = {}
+
+        def local_sandbox(argv, *, remote_env=None, timeout=None, check=False, stdin=None):
+            seen["argv"], seen["timeout"] = list(argv), timeout
+            return subprocess.run(argv, capture_output=True, text=True, timeout=timeout + 30, check=False)
+
+        bound = 0.2
+        started = stall_watch.time.perf_counter()
+        with patch.object(stall_watch.sandbox_exec, "run", local_sandbox):
+            r = stall_watch.run_sandbox(["sleep", "30"], timeout=bound)
+        elapsed = stall_watch.time.perf_counter() - started
+        self.assertEqual(seen["argv"][:4], [stall_watch.REMOTE_TIMEOUT_COMMAND, stall_watch.REMOTE_TIMEOUT_KILL_FLAG, str(stall_watch.REMOTE_TIMEOUT_KILL_AFTER_SECONDS), f"{bound + stall_watch.REMOTE_TIMEOUT_GRACE_SECONDS:g}"])
+        self.assertEqual(seen["argv"][4:], ["sleep", "30"])
+        self.assertEqual(seen["timeout"], bound, "the local bound is the hop's own")
+        self.assertEqual(r.returncode, 124, "coreutils timeout ended the reader")
+        self.assertLess(elapsed, bound + stall_watch.REMOTE_TIMEOUT_GRACE_SECONDS + stall_watch.REMOTE_TIMEOUT_KILL_AFTER_SECONDS, "within the grace, not the reader's 30 s")
+
+    def test_the_local_timeout_fires_before_the_remote_bound(self):
+        # The fake sandbox honours the local bound: the hop raises
+        # TimeoutExpired, as read_cluster_part relies on at the budget, and
+        # the remote bound it carries is past the local one. A grace of zero
+        # or less would let the remote `timeout` win and the hop return 124
+        # instead of raising.
+        seen = {}
+
+        def local_sandbox(argv, *, remote_env=None, timeout=None, check=False, stdin=None):
+            seen["argv"] = list(argv)
+            return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
+
+        bound = 0.2
+        with patch.object(stall_watch.sandbox_exec, "run", local_sandbox):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                stall_watch.run_sandbox(["sleep", "3"], timeout=bound)
+        self.assertGreater(float(seen["argv"][3]), bound, "the remote bound is past the local one")
+        self.assertGreater(stall_watch.REMOTE_TIMEOUT_GRACE_SECONDS, 0)
+
     def test_the_ledger_rows_are_the_same_whichever_path_read_them(self):
         now = "2026-11-10T12:00:00+00:00"
         rows = {"checkout": [DEPLOYMENT_ROW, finding("checkout", "Deployment/cart", "generation-lag", "generation 3, observedGeneration 2")], "storefront": GATEWAY_ROWS, "web": []}
@@ -3336,6 +3384,146 @@ class Output(Base):
         with patch.object(stall_watch, "run_sandbox", FakeFleet({"c": {"checkout": []}})), redirect_stdout(out):
             stall_watch.main(["--state", str(self.state)])
         self.assertIn(stall_watch.CLEARED_PREFIX, out.getvalue())
+
+
+
+class RelayListing(unittest.TestCase):
+    """The cluster list read through the relay helper first, gcloud as the fallback."""
+
+    GCLOUD_LIST = [{"name": "a", "location": "us-central1", "status": "RUNNING", "nodePools": []},
+                   {"name": "b", "location": "us-east1-b", "status": "PROVISIONING"}]
+
+    def setUp(self):
+        patcher = patch.object(stall_watch, "_relay_off", False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def relay_answer(self, row):
+        return json.dumps({"lists": {"p1": row}})
+
+    def fake(self, relay_stdout=None, relay_rc=0, gcloud_stdout=None):
+        calls = []
+
+        def run(argv, **kw):
+            calls.append(argv)
+            if argv[:2] == ["python3", stall_watch.GKE_READS_HELPER]:
+                return completed(argv, relay_stdout or "", returncode=relay_rc)
+            return completed(argv, json.dumps(self.GCLOUD_LIST) if gcloud_stdout is None else gcloud_stdout)
+        return run, calls
+
+    def test_the_relay_answer_is_the_same_rows_as_gcloud_and_starts_no_gcloud(self):
+        run, calls = self.fake(self.relay_answer({
+            "status": 200, "clusters": [["a", "us-central1"], ["b", "us-east1-b"]],
+            "statuses": ["RUNNING", "PROVISIONING"]}))
+        with patch.object(stall_watch, "run_sandbox", run):
+            relayed = stall_watch.list_clusters("p1")
+        stall_watch._relay_off = True
+        gcloud_run, _ = self.fake()
+        with patch.object(stall_watch, "run_sandbox", gcloud_run):
+            listed = stall_watch.list_clusters("p1")
+        self.assertEqual(listed, relayed)
+        self.assertEqual([c[0] for c in calls], ["python3"])
+
+    def test_missing_zones_mark_the_listing_incomplete(self):
+        run, _ = self.fake(self.relay_answer({
+            "status": 200, "clusters": [["a", "us-central1"]], "statuses": ["RUNNING"],
+            "missingZones": ["europe-west1-b"]}))
+        with patch.object(stall_watch, "run_sandbox", run):
+            clusters, incomplete = stall_watch.list_clusters("p1")
+        self.assertEqual([c["name"] for c in clusters], ["a"])
+        self.assertIn("europe-west1-b", incomplete)
+
+    def test_a_relay_error_or_an_older_helper_falls_back_to_gcloud(self):
+        cases = {
+            "an error status": {"status": 403, "error": {"text": "denied"}},
+            "statuses that do not match the rows": {"status": 200, "clusters": [["a", "us-central1"]], "statuses": []},
+        }
+        for name, row in cases.items():
+            with self.subTest(name):
+                run, calls = self.fake(self.relay_answer(row))
+                with patch.object(stall_watch, "run_sandbox", run):
+                    clusters, _ = stall_watch.list_clusters("p1")
+                self.assertEqual([c["name"] for c in clusters], ["a", "b"])
+                self.assertEqual(calls[-1][:3], ["gcloud", "container", "clusters"])
+                self.assertFalse(stall_watch._relay_off)
+
+    def test_a_helper_that_cannot_run_turns_the_relay_off_for_the_process(self):
+        run, calls = self.fake("", relay_rc=127)
+        with patch.object(stall_watch, "run_sandbox", run):
+            first = stall_watch.list_clusters("p1")
+            second = stall_watch.list_clusters("p1")
+        self.assertEqual(first, second)
+        self.assertTrue(stall_watch._relay_off)
+        self.assertEqual([c[0] for c in calls], ["python3", "gcloud", "gcloud"])
+
+    def test_a_gcloud_failure_after_a_relay_fallback_still_raises(self):
+        run, _ = self.fake(self.relay_answer({"status": 500, "error": {}}), gcloud_stdout="not json")
+
+        def failing(argv, **kw):
+            result = run(argv, **kw)
+            if argv[0] == "gcloud":
+                return completed(argv, "", returncode=1, stderr="boom")
+            return result
+        with patch.object(stall_watch, "run_sandbox", failing), self.assertRaises(RuntimeError):
+            stall_watch.list_clusters("p1")
+
+    def test_the_helper_path_is_the_helpers_own(self):
+        import gke_cluster_reads
+        self.assertEqual(stall_watch.GKE_READS_HELPER, gke_cluster_reads.SANDBOX_GKE_READS)
+
+    def test_a_timeout_falls_back_to_gcloud_with_the_time_left(self):
+        timeouts = {}
+
+        def run(argv, **kw):
+            timeouts[argv[0]] = kw["timeout"]
+            if argv[0] == "python3":
+                raise subprocess.TimeoutExpired(argv, kw["timeout"])
+            return completed(argv, json.dumps(self.GCLOUD_LIST))
+        clock = iter([100.0, 100.0 + 20.0])
+        with patch.object(stall_watch, "run_sandbox", run), \
+                patch.object(stall_watch.time, "monotonic", lambda: next(clock)):
+            clusters, _ = stall_watch.list_clusters("p1", timeout=80.0)
+        self.assertEqual([c["name"] for c in clusters], ["a", "b"])
+        self.assertFalse(stall_watch._relay_off)
+        # The relay gets its share (at most half, capped), and gcloud the rest:
+        # 80 s less the 20 s the relay spent.
+        self.assertEqual(timeouts["python3"], min(stall_watch.RELAY_LIST_TIMEOUT_SECONDS, 80.0 * stall_watch.RELAY_LIST_BUDGET_SHARE))
+        self.assertEqual(timeouts["gcloud"], 60.0)
+
+    def test_output_that_is_not_json_turns_the_relay_off_and_gcloud_lists(self):
+        run, calls = self.fake("not json")
+        with patch.object(stall_watch, "run_sandbox", run):
+            clusters, _ = stall_watch.list_clusters("p1")
+        self.assertEqual([c["name"] for c in clusters], ["a", "b"])
+        self.assertTrue(stall_watch._relay_off)
+
+    def test_a_malformed_project_is_listed_with_gcloud_never_the_relay(self):
+        run, calls = self.fake(self.relay_answer({"status": 200, "clusters": [], "statuses": []}))
+        with patch.object(stall_watch, "run_sandbox", run):
+            stall_watch.list_clusters("p1/locations/x/clusters/c#")
+        self.assertEqual([c[0] for c in calls], ["gcloud"])
+
+    def test_a_refusal_of_the_relay_itself_or_an_older_helper_turns_it_off(self):
+        cases = {
+            "a caller role it does not serve": {"status": 403, "error": {"code": "CALLER_ROLE_FORBIDDEN"}},
+            "a host it does not take": {"status": 403, "error": {"code": "SECURITY_POLICY_BLOCKED", "rule": "gcp.api.host"}},
+            "a helper with no statuses": {"status": 200, "clusters": [["a", "us-central1"]]},
+            "a row that is not an object": None,
+        }
+        for name, row in cases.items():
+            with self.subTest(name):
+                stall_watch._relay_off = False
+                run, calls = self.fake(self.relay_answer(row))
+                with patch.object(stall_watch, "run_sandbox", run):
+                    clusters, _ = stall_watch.list_clusters("p1")
+                self.assertEqual([c["name"] for c in clusters], ["a", "b"])
+                self.assertTrue(stall_watch._relay_off)
+
+    def test_the_relay_off_sets_are_the_reconciles(self):
+        import cluster_agent_reconcile
+        self.assertEqual(stall_watch.RELAY_OFF_CODES, cluster_agent_reconcile._RELAY_OFF_CODES)
+        self.assertEqual(stall_watch.RELAY_OFF_RULES, cluster_agent_reconcile._RELAY_OFF_RULES)
+        self.assertEqual(stall_watch.RELAY_SEGMENT.pattern, cluster_agent_reconcile._RELAY_SEGMENT.pattern)
 
 
 if __name__ == "__main__":
