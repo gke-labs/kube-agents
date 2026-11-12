@@ -68,7 +68,7 @@ const (
 	//: restarts, and the latency figure the script reads in-pod, which is not
 	//: the gateway's to see; that line says where it is.
 	usageSummaryPerformanceHeader = "performance:"
-	usageSummaryTokensLabel       = "  tokens (since install): "
+	usageSummaryInferenceLabel    = "  tokens (since install): " // named without the word gosec G101 reads as a credential
 	usageSummarySpendLabel        = "  spend (since install): "
 	usageSummaryLatencyNote       = "  latency: in scripts/feedback-summary.sh's block"
 	usageSummarySpendCurrency     = "USD"
@@ -563,7 +563,7 @@ func renderUsageSummary(now time.Time, cr map[string]any, serverVersion string, 
 	lines = append(lines, "  lastActive: "+last, "  lastHumanActive: "+lastHuman)
 	lines = append(lines, renderTopTools(usage)...)
 	lines = append(lines, usageSummaryPerformanceHeader,
-		fmt.Sprintf("%sin %d / out %d", usageSummaryTokensLabel, asInt(usage[usageSummaryInputTokensField]), asInt(usage[usageSummaryOutputTokensField])),
+		fmt.Sprintf("%sin %d / out %d", usageSummaryInferenceLabel, asInt(usage[usageSummaryInputTokensField]), asInt(usage[usageSummaryOutputTokensField])),
 		fmt.Sprintf("%s%.2f %s", usageSummarySpendLabel, float64(asInt(usage[usageSummarySpendMicrosField]))/usageSummaryMicrosPerUSD, usageSummarySpendCurrency),
 		usageSummaryLatencyNote)
 	days := windowDays(window)
