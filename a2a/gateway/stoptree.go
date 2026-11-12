@@ -77,8 +77,14 @@ func (g *Gateway) stopTree(ctx context.Context, rec *SessionRecord, stoppedID st
 // already canceled, no end recorded, and still routed (the relay retires a
 // task's route at its terminal). A lookup that errors can't rule the task
 // out, so it counts as live: a cancel to a task that has ended is harmless.
+//
+// A task marked canceled whose cancel never went out (CancelUnsent) is live
+// while it is routed, so a later stop sends its cancel again.
 func (g *Gateway) liveNode(ctx context.Context, rec *SessionRecord, ref TaskRef) bool {
-	if ref.Canceled || ref.BatchEnd != nil || ref.ChainEnd != nil || ref.TerminalObserved {
+	if ref.ChainEnd != nil || ref.TerminalObserved {
+		return false
+	}
+	if !ref.CancelUnsent && (ref.Canceled || ref.BatchEnd != nil) {
 		return false
 	}
 	key, err := g.lookupTaskSession(ctx, ref.ID)
@@ -99,12 +105,13 @@ func (g *Gateway) cancelTreeNode(ctx context.Context, rec *SessionRecord, ref Ta
 		err = g.client.Publish(ctx, lib.TaskInSubject(addressee, ref.ID), env)
 	}
 	if err != nil {
-		g.log.Error("cancel publish failed for a task in the stopped tree; it stays marked canceled",
+		g.log.Error("cancel publish failed for a task in the stopped tree; it stays marked canceled, its cancel unsent",
 			"taskId", ref.ID, "conversation", rec.Key, "addressee", addressee, "err", err)
 	} else {
 		g.log.Info("stop: canceled a task in the tree", "taskId", ref.ID, "conversation", rec.Key, "addressee", addressee)
 	}
 	rec.MarkCanceled(ref.ID)
+	rec.setCancelUnsent(ref.ID, err != nil)
 	rec.setStopPending(ref.ID, true)
 	if quiet {
 		rec.markQuietCancel(ref.ID)
@@ -116,28 +123,89 @@ func (g *Gateway) cancelTreeNode(ctx context.Context, rec *SessionRecord, ref Ta
 	}
 }
 
-// endStoppedBatch ends a stopped fan-out: each child the stop canceled whose
-// end isn't recorded is recorded as stopped (batchChildEnded), so the last
-// ends the batch. Its delegating turn was stopped, so no wake runs
+// endStoppedBatch ends a stopped fan-out: each child whose cancel went out
+// and whose end isn't recorded is recorded as stopped (batchChildEnded), so
+// the last ends the batch. Its delegating turn was stopped, so no wake runs
 // (wakeBatch), and the chain ends once, canceled. A batch the stop caught
 // partway through minting mints no more (DelegationEnd), so only the
-// children on the record count. A child that was neither canceled nor
-// ended (none, after stopTree) would still hold the batch.
+// children on the record count. A child whose cancel never reached the bus
+// (CancelUnsent) may still run, so it holds the batch, and with it the
+// conversation, until a re-sent cancel goes out (healStoppedTasks) or the
+// child ends. Only a stopped parent's batch is ended here: a withdrawn
+// batch's kept children end at their own terminals.
 func (g *Gateway) endStoppedBatch(ctx context.Context, rec *SessionRecord, parentID string) {
 	parent, ok := rec.TaskRefFor(parentID)
-	if !ok || !parent.fanOut() {
+	if !ok || !parent.fanOut() || !parent.Canceled {
 		return
 	}
 	if !parent.batchComplete() {
 		rec.markDelegationEnd(parentID, notStartedEnd(whyTurnStopped))
 	}
 	for _, kid := range rec.batchChildren(parentID) {
-		if kid.BatchEnd != nil || !kid.Canceled {
+		if kid.BatchEnd != nil || !kid.Canceled || kid.CancelUnsent {
 			continue
 		}
 		g.batchChildEnded(ctx, rec, kid, BatchEnd{State: lib.StateCanceled, Text: reasonStopped, Source: TerminalFromGateway}, stoppedEndReason)
 	}
 }
+
+// setCancelUnsent sets or clears a task's CancelUnsent mark.
+func (rec *SessionRecord) setCancelUnsent(taskID string, unsent bool) {
+	for i := range rec.Tasks {
+		if rec.Tasks[i].ID == taskID {
+			rec.Tasks[i].CancelUnsent = unsent
+		}
+	}
+}
+
+// resendUnsentCancels sends again the cancel of each task marked canceled
+// whose cancel never reached the bus (CancelUnsent) and which is still
+// routed, under its delegation's authority as a withdrawal's cancel is. One
+// that goes out is cleared, marked StopPending (so the heal ends it if it
+// never confirms), and its batch, when its delegating turn was stopped,
+// is ended once every child's cancel has gone out (endStoppedBatch). One
+// that has ended (no route) is cleared. It reports whether the record
+// changed.
+func (g *Gateway) resendUnsentCancels(ctx context.Context, rec *SessionRecord) bool {
+	changed := false
+	var batches []string
+	for _, ref := range rec.Tasks {
+		if !ref.CancelUnsent {
+			continue
+		}
+		key, err := g.lookupTaskSession(ctx, ref.ID)
+		if err != nil {
+			g.log.Error("task index lookup failed; re-sending the cancel anyway", "taskId", ref.ID, "conversation", rec.Key, "err", err)
+		} else if key == "" {
+			rec.setCancelUnsent(ref.ID, false)
+			changed = true
+			continue
+		}
+		parent, _ := rec.TaskRefFor(ref.ParentTaskID)
+		authority, _ := delegationAuthority(parent)
+		if authority.Via == nil {
+			authority.Via = &AuthorityVia{TaskID: parent.ID, Session: parent.Addressee}
+		}
+		if !g.publishBatchCancel(ctx, rec, ref, authority, cancelResent) {
+			continue
+		}
+		g.log.Info("re-sent the cancel of a task whose first cancel never went out", "taskId", ref.ID, "conversation", rec.Key)
+		g.publishDispatchStop(ctx, ref)
+		rec.setCancelUnsent(ref.ID, false)
+		rec.setStopPending(ref.ID, true)
+		changed = true
+		if ref.BatchIndex > 0 {
+			batches = append(batches, ref.ParentTaskID)
+		}
+	}
+	for _, id := range batches {
+		g.endStoppedBatch(ctx, rec, id)
+	}
+	return changed
+}
+
+// cancelResent names a re-sent cancel in publishBatchCancel's log lines.
+const cancelResent = "a task whose first cancel never went out"
 
 // setStopPending sets or clears a task's StopPending mark.
 func (rec *SessionRecord) setStopPending(taskID string, pending bool) {
@@ -156,7 +224,7 @@ func (rec *SessionRecord) setStopPending(taskID string, pending bool) {
 // writes nothing to the room. A task still running is left for its
 // terminal. It reports whether the record changed.
 func (g *Gateway) healStoppedTasks(ctx context.Context, rec *SessionRecord) bool {
-	changed := false
+	changed := g.resendUnsentCancels(ctx, rec)
 	for _, ref := range rec.Tasks {
 		if !ref.StopPending {
 			continue
@@ -181,6 +249,15 @@ func (g *Gateway) healStoppedTasks(ctx context.Context, rec *SessionRecord) bool
 		g.retireTaskRoute(ctx, ref.ID)
 		rec.setStopPending(ref.ID, false)
 		changed = true
+		// A fan-out child not yet counted ended (a withdrawn batch's kept
+		// child) ends its batch here, as its terminal would have.
+		if fresh, _ := rec.TaskRefFor(ref.ID); fresh.BatchEnd == nil && rec.fanOutChild(fresh) {
+			state := lib.StateCanceled
+			if err == nil && task.Final {
+				state = task.State
+			}
+			g.batchChildEnded(ctx, rec, fresh, BatchEnd{State: state, Text: reasonStopped, Source: TerminalFromGateway}, stoppedEndReason)
+		}
 	}
 	return changed
 }

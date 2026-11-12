@@ -312,9 +312,17 @@ type TaskRef struct {
 	// died mid-work" (terminal `failed`) — assertion 13's distinction.
 	// Two writers set it whether or not the cancel went out: a withdrawn
 	// batch child (withdrawBatch) and a task the tree-wide stop reached
-	// (stopTree), so a task that may still run stays on record as canceled,
-	// where the heal and its batch can still end it.
+	// (stopTree), so its writes are dropped either way; CancelUnsent says
+	// which, and a task with it set is not counted stopped.
 	Canceled bool `json:"canceled,omitempty"`
+	// CancelUnsent marks a task the gateway marked Canceled whose cancel
+	// never reached the bus (a withdrawn batch child, a task the tree-wide
+	// stop reached): it may still run. Its writes are dropped as any
+	// canceled task's are, but it isn't counted stopped: it still holds the
+	// conversation's one live delegation (liveChild) and its batch
+	// (endStoppedBatch), and a later stop, or the next turn's heal,
+	// re-sends its cancel (healStoppedTasks), which clears the mark.
+	CancelUnsent bool `json:"cancelUnsent,omitempty"`
 	// StopPending marks a task the tree-wide stop canceled (stopTree) whose
 	// terminal the relay hasn't delivered: relayTerminal clears it, and the
 	// heal ends a task still marked once its terminal is on the stream or it

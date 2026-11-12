@@ -1192,6 +1192,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	// the room).
 	g.retireTaskRoute(ctx, taskID)
 	rec.setStopPending(taskID, false)
+	rec.setCancelUnsent(taskID, false)
 	// Last, after the deliverable is posted and the rolling line edited, so
 	// an observer that treats this as "the task is over" has already been
 	// handed everything the conversation received for it. See TaskObserver.

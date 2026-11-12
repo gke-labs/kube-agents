@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 )
 
 // The tree-wide stop (#5682 PR 3): one stop cancels every live task of the
@@ -128,31 +130,114 @@ func TestAStopCancelsTheWholeFanOut(t *testing.T) {
 	}
 }
 
-// TestAStopWhoseChildCancelFailsLeavesItCanceled: a child whose cancel could
-// not be published stays marked canceled on the record, so the batch still
-// counts it ended.
-func TestAStopWhoseChildCancelFailsLeavesItCanceled(t *testing.T) {
+// tasksSubjects reads the TASKS stream's subjects, so a test that narrows
+// them (narrowTasksStream) can put them back (setTasksSubjects).
+func tasksSubjects(t *testing.T, url string) []string {
+	t.Helper()
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stream, err := js.Stream(ctx, lib.TasksStream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return stream.CachedInfo().Config.Subjects
+}
+
+// setTasksSubjects sets the TASKS stream's subjects.
+func setTasksSubjects(t *testing.T, url string, subjects []string) {
+	t.Helper()
+	nc, err := nats.Connect(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stream, err := js.Stream(ctx, lib.TasksStream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := stream.CachedInfo().Config
+	cfg.Subjects = subjects
+	if _, err := js.UpdateStream(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestAStopWhoseChildCancelFailsHoldsUntilResent: a stop whose cancels to the
+// children can't be published marks them canceled (their writes are
+// dropped) but not as stopped: they may still run. So the batch doesn't end,
+// the chain doesn't end, and a new delegation is refused naming one of them.
+// A second stop re-sends the cancels; once they go out, the batch ends, the
+// chain ends once, canceled, and the next delegation mints.
+func TestAStopWhoseChildCancelFailsHoldsUntilResent(t *testing.T) {
 	r, spawn, obs := startStopRig(t, nil)
 	ctx := context.Background()
 	conv := "discord:g1/t-stop-tree-nocancel"
 	f := fanOut(t, r, spawn, conv, platformTask("one"), platformTask("two"))
 	// platform's .in refuses, so the children's cancels fail; the parent's,
 	// on its session's .in, goes.
+	wide := tasksSubjects(t, r.url)
 	narrowTasksStream(t, r.url, f.session)
 	sessionRigTurn(r, conv, "stop-1", "stop")
 	waitFor(t, "the parent's cancel", postedContaining(r, "cancel sent"))
-	waitFor(t, "the children canceled on the record", func() bool {
+	waitFor(t, "the children marked canceled, their cancels unsent", func() bool {
 		rec, _ := r.g.reg.Get(ctx, conv)
 		for _, k := range f.kids {
-			if ref, _ := rec.TaskRefFor(k.ID); !ref.Canceled {
+			if ref, _ := rec.TaskRefFor(k.ID); !ref.Canceled || !ref.CancelUnsent || ref.BatchEnd != nil {
 				return false
 			}
 		}
 		return true
 	})
+	if _, ok := obs.terminalFor(f.origin.TaskID); ok {
+		t.Fatalf("the chain ended while children whose cancel never went out may run: %v", obs.kinds())
+	}
+
+	// Each still counts as the conversation's live delegation, which is the
+	// check a new delegation is refused on.
+	rec, _ := r.g.reg.Get(ctx, conv)
+	if live := r.g.liveChild(ctx, rec); live != f.kids[0].ID && live != f.kids[1].ID {
+		t.Fatalf("liveChild = %q, want a child whose cancel never went out", live)
+	}
+
+	setTasksSubjects(t, r.url, wide)
+	sessionRigTurn(r, conv, "stop-2", "stop")
+	for _, k := range f.kids {
+		waitFor(t, "the re-sent cancel for "+k.ID, func() bool { return cancelSentTo(t, r, targetPlatform, k.ID) })
+	}
 	waitFor(t, "the root's terminal", func() bool { _, ok := obs.terminalFor(f.origin.TaskID); return ok })
 	if end, _ := obs.terminalFor(f.origin.TaskID); end.state != lib.StateCanceled {
 		t.Fatalf("root terminal = %+v, want canceled", end)
+	}
+	exec3, origin3, _ := sessionTurn(t, r, spawn, conv, "and again")
+	_ = exec3.PublishArtifact(ctx, delegateArtifact(t, "platform", "next"))
+	waitFor(t, "the next child on the record", func() bool {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		pref, _ := rec.TaskRefFor(origin3.TaskID)
+		return len(pref.Children) == 1
+	})
+	terminals := 0
+	for _, e := range obs.events() {
+		if e.task == f.origin.TaskID && e.kind == "terminal" {
+			terminals++
+		}
+	}
+	if terminals != 1 || wakeEntries(t, r, conv) != 0 {
+		t.Fatalf("root terminals = %d, wakes = %d; want 1 and 0", terminals, wakeEntries(t, r, conv))
 	}
 }
 

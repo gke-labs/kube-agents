@@ -168,11 +168,15 @@ by construction. Three interceptors run on each turn, ahead of the routing above
   and, walking down from the chain's root through each task's children, every
   other task of the tree the gateway hasn't seen end, a fan-out's children
   included. Each gets a cancel on its own addressee's `…in`, is marked canceled on
-  its history entry (even when the cancel couldn't be published, so the heal and
-  its batch can still end it), and gets its `DISPATCH_STOPS` record when it is a
+  its history entry, and gets its `DISPATCH_STOPS` record when it is a
   profile task; a batch child's own line is closed on "🛑 stopped". A task that has
   already ended is left alone. The stop posts its one notice for the conversation,
   never one per task.
+  A task whose cancel couldn't be published is marked canceled all the same, so its
+  writes are dropped, but also `CancelUnsent`: it may still run, so it keeps
+  counting as the conversation's live delegation and keeps its batch open, and the
+  next turn's heal (a second `stop` included) sends its cancel again, under its
+  delegation's authority, until one goes out or the task ends.
   **No late writes:** nothing a task the gateway canceled writes afterwards reaches
   the room, whether it detached or not and whichever chain it is in, a single
   delegation's included. Its status notes, questions (`input-required`), notices,
@@ -506,7 +510,7 @@ the next cold start, which fails closed. A turn whose requester is no longer on
 record (cleared at `A2A_ASK_TTL`, with its text) is left out of the primer whole, so the pod never
 reads text whose authors the check can't count. The bound is the conversation as the primer
 carries it, not one incarnation. What else a session carries across incarnations is
-#2370. One live delegation per conversation, a child the gateway has canceled no longer counting (its writes are dropped, and the heal ends one that never confirms):
+#2370. One live delegation per conversation, a child whose cancel has gone out no longer counting (its writes are dropped, and the heal ends one that never confirms), while one whose cancel couldn't be published still does:
 the delegating turn's own repeat, a batch included, is ignored and logged, while a later turn's
 request reaching the gateway while any child of an earlier request still runs is refused with a
 notice naming the running task (`delegation.busy`) - a human asking again deserves an answer, the
@@ -515,13 +519,14 @@ checked (target, parameters, the lists, depth) before it mints any, so one entry
 the whole batch with nothing minted. Its children don't take the conversation's active task or
 its addressee: the delegating turn keeps both, and each child records its parent, which lists them
 all. A child that can't be submitted partway through withdraws the batch: the children already
-submitted are canceled and dropped from the record, except one whose cancel couldn't be published, which stays on it, marked canceled, so a stop and the reaper can still find it. A batch of one is a
+submitted are canceled and dropped from the record, except one whose cancel couldn't be published, which stays on it, marked canceled with its cancel unsent, so it still counts as live and the next turn's heal sends its cancel again. A batch of one is a
 single child, which takes the active task as before. Width bounds what one conversation asks for,
 not what runs at once: children queue at the dispatcher, held to each profile's concurrency. At the
 `cluster` profile's default concurrency of 2, ten children run two at a time, about five rounds
 of one cluster task. A stop during a fan-out cancels the delegating turn and every child still
-running or queued (Stop, above), and ends the batch there: each child it canceled counts as ended,
-stopped, so the conversation is released at once, no wake runs, and the chain ends once, canceled,
+running or queued (Stop, above), and ends the batch there: each child whose cancel went out counts
+as ended, stopped, so the conversation is released at once (a child whose cancel couldn't be
+published holds the batch until a re-sent cancel goes out or it ends), no wake runs, and the chain ends once, canceled,
 without waiting on a child that may never start. A child's own terminal arriving later changes
 nothing and posts nothing. A stopped child whose terminal never comes is ended by the next turn's
 heal once its terminal is on the stream or it has produced nothing within
