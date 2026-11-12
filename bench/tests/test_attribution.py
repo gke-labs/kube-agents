@@ -130,3 +130,43 @@ class AttributeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReadScriptTest(unittest.TestCase):
+    """The in-pod read script itself, run here on stores of the live schema's shape."""
+
+    def make_stores(self, root):
+        import os
+        import sqlite3
+        os.makedirs(os.path.join(root, "profiles", "platform"))
+        for path in (os.path.join(root, "state.db"), os.path.join(root, "profiles", "platform", "state.db")):
+            conn = sqlite3.connect(path)
+            conn.execute("CREATE TABLE sessions (id TEXT, source TEXT, started_at REAL, parent_session_id TEXT, "
+                         "input_tokens INT, output_tokens INT, cache_read_tokens INT, reasoning_tokens INT)")
+            conn.executemany("INSERT INTO sessions VALUES (?, 'cron', ?, NULL, 1, 2, 3, 0)",
+                             [("old", 10.0)] + [(f"cron_stall-watch_20261112_{i:06d}", 100000.0 + i) for i in range(3000)])
+            conn.commit()
+        conn = sqlite3.connect(os.path.join(root, "kanban.db"))
+        conn.execute("CREATE TABLE tasks (id TEXT, title TEXT, body TEXT, session_id TEXT, idempotency_key TEXT, "
+                     "created_at REAL)")
+        conn.execute("CREATE TABLE task_runs (task_id TEXT, profile TEXT, started_at REAL, metadata TEXT)")
+        conn.execute("INSERT INTO tasks VALUES ('t1', 'x', ?, NULL, NULL, 100000.0)", ("b" * 100000,))
+        conn.commit()
+
+    def test_a_read_past_64_kib_comes_back_whole_and_starts_at_since(self):
+        import subprocess
+        import sys
+        import tempfile
+        with tempfile.TemporaryDirectory() as root:
+            self.make_stores(root)
+            out = subprocess.run([sys.executable, "-c", at.READ_SCRIPT, root, "1000"], capture_output=True,
+                                 text=True, check=True).stdout
+        self.assertLess(len(out), 65536)
+        stores = at.decode(out)
+        self.assertEqual(len(stores["sessions"]), 6000)
+        self.assertNotIn("old", {s["id"] for s in stores["sessions"]})
+        self.assertEqual(len(stores["cards"][0]["body"]), 100000)
+
+    def test_a_cut_off_read_is_an_error_that_says_so(self):
+        with self.assertRaises(at.kube.CommandError):
+            at.decode("eJzLSM3JyQcABiwCFQ"[:10])
