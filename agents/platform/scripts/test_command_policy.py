@@ -2964,6 +2964,28 @@ class CloudStorageReadsTest(unittest.TestCase):
                 self.assertTrue(decision.allowed, (argv, decision.rule_id))
 
     def test_the_storage_writes_are_refused(self):
+        # Every argument is a cloud URL and every flag is listed, so the only
+        # rule left to refuse these is the allowlist itself: a write added to
+        # the table turns one of them green.
+        for argv in (
+            ["gcloud", "storage", "cp", "gs://fleet-logs/a", "gs://fleet-logs/b"],
+            ["gcloud", "storage", "mv", "gs://fleet-logs/a", "gs://fleet-logs/b"],
+            ["gcloud", "storage", "rm", "gs://fleet-logs/a"],
+            ["gcloud", "storage", "rsync", "gs://fleet-logs/a/", "gs://fleet-logs/b/"],
+            ["gcloud", "storage", "objects", "update", "gs://fleet-logs/a"],
+            ["gcloud", "storage", "objects", "delete", "gs://fleet-logs/a"],
+            ["gcloud", "storage", "objects", "compose", "gs://fleet-logs/a", "gs://fleet-logs/b"],
+            ["gcloud", "storage", "buckets", "create", "gs://fleet-logs-2"],
+            ["gcloud", "storage", "buckets", "update", "gs://fleet-logs"],
+            ["gcloud", "storage", "buckets", "delete", "gs://fleet-logs"],
+            ["gcloud", "storage", "sign-url", "gs://fleet-logs/a"],
+            ["gcloud", "storage", "hash", "gs://fleet-logs/a"],
+        ):
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertFalse(decision.allowed, argv)
+                self.assertEqual(decision.rule_id, "gcp.read-only", argv)
+        # The same writes with the flags and arguments a caller would type.
         for argv in (
             ["gcloud", "storage", "cp", "gs://fleet-logs/report.txt", "/tmp/"],
             ["gcloud", "storage", "cp", "/etc/hostname", "gs://fleet-logs/"],

@@ -318,9 +318,12 @@ _TOOL_READ_VERBS = {
     "bq": {"ls", "show", "head"},
 }
 
-# The broker's gcloud tables, read paths and flag arities alike, so a cron
-# prompt is classified by the same spellings the broker will execute: a flag
+# The broker's gcloud tables, read paths and flag arities alike, so a flag
 # the broker learns is a flag this gate learns, with no second copy to drift.
+# The gate still reads a superset: it classifies verbs and flags, not the
+# arguments, so a spelling the broker refuses on its arguments (a local path
+# to `storage cat`, paths on stdin) is a read here and refused there. The
+# broker enforces; this gate only decides whether a high-risk job may try.
 try:
     from tools.command_policy import (
         GCLOUD_READ_COMMANDS,
