@@ -1159,8 +1159,9 @@ cert-manager, which the chart does not install. Three objects, all owned by the
 | Secret `<name>-a2a-nats-tls` (`kubernetes.io/tls`) | the serving pair, one year, with `ca.crt` beside it    |
 | ConfigMap `<name>-a2a-nats-ca-bundle`              | the CA's public certificate alone, which clients mount |
 
-The serving certificate names the NATS Service's in-cluster names and nothing else: no
-localhost, no IP, no external host. Tooling that reaches the bus through a port-forward
+The serving certificate names the in-cluster names of the NATS client Service, the routes
+Service and each server's route Service (`<bus>-route0` to `-route2`, for every server count),
+and nothing else: no localhost, no IP, no external host. Tooling that reaches the bus through a port-forward
 sets the TLS server name to the Service name (`NATS_TLS_SERVER_NAME` for clients built on
 `a2a/lib`). Both Secrets are on the webhook's bus-credential list: a user volume mounting
 either is refused, since the serving key lets a pod impersonate the bus and the CA key

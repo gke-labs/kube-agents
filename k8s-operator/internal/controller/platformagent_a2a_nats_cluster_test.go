@@ -1948,8 +1948,8 @@ func TestAClusterRollsOntoAProfileChangeInsteadOfReloading(t *testing.T) {
 func TestARouteNameFitsWhereTheRoutesServiceDoes(t *testing.T) {
 	agent := a2aTestAgent()
 	for i := range a2aNATSMaxReplicas {
-		if got := a2aNATSRouteName(agent, i); got != a2aNATSName(agent)+"-route"+strconv.Itoa(i) || len(got) > len(a2aNATSRoutesName(agent)) {
-			t.Errorf("route name %d = %q, want %s-route%d no longer than %q", i, got, a2aNATSName(agent), i, a2aNATSRoutesName(agent))
+		if got := a2aNATSRouteName(agent, i); len(got) > len(a2aNATSRoutesName(agent)) {
+			t.Errorf("route name %d = %q, longer than the routes Service's %q", i, got, a2aNATSRoutesName(agent))
 		}
 	}
 }

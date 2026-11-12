@@ -491,3 +491,50 @@ func TestADeclaredBridgeTrustsTheBundle(t *testing.T) {
 		t.Errorf("the rendered bridge has %d bundle mounts, want 1", n)
 	}
 }
+
+// A serving certificate from before the route names (the client and routes
+// Services' names alone) is reissued with them on upgrade, not kept: kept, a
+// later switch to routes by name would be refused by every server still
+// presenting it (#5708).
+func TestAServingCertificateWithoutTheRouteNamesIsReissued(t *testing.T) {
+	agent := a2aTestAgent()
+	r, cl := a2aTLSTestReconciler(t, agent)
+	now := time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)
+	a2aTLSTestClock(t, now)
+	ctx := context.Background()
+	if _, err := r.ensureA2ANATSTLS(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	caCert, caKey, ok := readA2ANATSCA(a2aGetSecret(t, cl, agent, agentv1alpha1.A2ANATSCASecretName(agent.Name)), now)
+	if !ok {
+		t.Fatal("the CA just issued does not read back")
+	}
+	var oldNames []string
+	for _, svc := range []string{a2aNATSName(agent), a2aNATSRoutesName(agent)} {
+		oldNames = append(oldNames, svc, svc+"."+agent.Namespace, svc+"."+agent.Namespace+".svc", svc+"."+agent.Namespace+".svc."+a2aNATSClusterDomain)
+	}
+	oldDER, certPEM, keyPEM, err := generateA2ANATSServing(caCert, caKey, oldNames, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serving := a2aGetSecret(t, cl, agent, agentv1alpha1.A2ANATSTLSSecretName(agent.Name))
+	serving.Data[a2aNATSTLSCertKey], serving.Data[a2aNATSTLSKeyKey] = certPEM, keyPEM
+	if err := cl.Update(ctx, serving); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := r.ensureA2ANATSTLS(ctx, agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ServingFingerprint == a2aCertFingerprint(oldDER) {
+		t.Fatal("a certificate without the route names was kept")
+	}
+	cert, err := parseA2ACert(a2aGetSecret(t, cl, agent, agentv1alpha1.A2ANATSTLSSecretName(agent.Name)).Data[a2aNATSTLSCertKey])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := a2aNATSRouteName(agent, 2) + "." + agent.Namespace + ".svc"; !slices.Contains(cert.DNSNames, want) {
+		t.Errorf("the reissued certificate lacks %q: %v", want, cert.DNSNames)
+	}
+}
