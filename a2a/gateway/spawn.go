@@ -129,9 +129,9 @@ const (
 	// 1000 (the shell sandbox's buildShellSandboxCredentialProxyTokenVolume
 	// argues the same). Spelled identically in credential_proxy.py and the
 	// operator's platformagent_broker_split.go.
-	credentialProxySessionAudience        = "kubeagents-credential-proxy-session" // #nosec G101 -- audience name
-	credentialProxyTokenVolume            = "credential-proxy-token"              // #nosec G101 -- volume name
-	credentialProxyTokenMountPath         = "/var/run/secrets/kubeagents/credential-proxy"
+	credentialProxySessionAudience        = "kubeagents-credential-proxy-session"          // #nosec G101 -- audience name
+	credentialProxyTokenVolume            = "credential-proxy-token"                       // #nosec G101 -- volume name
+	credentialProxyTokenMountPath         = "/var/run/secrets/kubeagents/credential-proxy" // #nosec G101 -- mount path
 	credentialProxyTokenFile              = "token"
 	credentialProxyTokenMode              = 0444
 	credentialProxyTokenExpirationSeconds = 3600

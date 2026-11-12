@@ -51,7 +51,7 @@ const (
 
 	// AudienceCredentialProxy is the credential proxy's: what a task's tool
 	// calls may reach. Only this audience may carry a Target.
-	AudienceCredentialProxy Audience = "credential-proxy"
+	AudienceCredentialProxy Audience = "credential-proxy" // #nosec G101 -- an audience name, not a credential
 )
 
 // known reports whether a is an audience this package mints and verifies.
@@ -64,7 +64,7 @@ const (
 	// TokenType is the nats.type claim. jwt/v2 decodes any well-signed JWT as
 	// a GenericClaims, a user or account JWT included, so the type is what
 	// says this one was minted as a task credential.
-	TokenType = "kube-agents-task"
+	TokenType = "kube-agents-task" // #nosec G101 -- a token type label, not a credential
 
 	// MaxTrustedKeys is how many public keys a verifier may trust at once:
 	// the current key and the one it replaces, for one deadline ceiling

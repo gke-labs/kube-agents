@@ -50,11 +50,15 @@ const (
 	noticeTargetOutOfScope    = "cluster %s is outside this install's scope"
 	noticeTargetUnconfirmed   = "can't confirm %s is in this install's scope yet"
 	noticeTargetParamsInvalid = "the task's parameters aren't valid: %v"
+	noticeParamUndeclared     = "%s doesn't take parameter %q; it takes %s"
+	noticeParamMissing        = "%s needs parameter %s; it takes %s"
 	noticeProfileNoIdentity   = "an agent profile runs a task only for an identified requester"
 	noticeProfileRouteFailed  = "the task couldn't be routed to its agent profile"
 	// noticeProfileParentToPlatform refuses a profile task's delegation to
 	// platform, whose child would be minted wider than its parent.
 	noticeProfileParentToPlatform = "an agent profile's task delegates only to another agent profile"
+	// noticePlatformTakesNoParameters: platform takes its target from the text.
+	noticePlatformTakesNoParameters = "platform takes no parameters; put the target in the text"
 	// noticeProfileWhileRunning refuses a turn naming a profile while the
 	// conversation has a task running, which would otherwise be steered
 	// into that task with the profile dropped.
@@ -68,6 +72,15 @@ const (
 const (
 	noticeTurnNotStarted       = "⚠️ not started: "
 	noticeDelegationRefusedFor = "⚠️ delegation refused: "
+)
+
+// How noticeParamUndeclared and noticeParamMissing spell a profile's
+// declared parameters: each name, marked when a task must carry it, or
+// paramsNone for a profile that declares none.
+const (
+	paramRequiredMark = " (required)"
+	paramListSep      = ", "
+	paramsNone        = "none"
 )
 
 // childNeverStarted is a child's end when it never reached an executor.
@@ -339,7 +352,7 @@ type scopeDeclaration struct {
 var errNoScopeFile = errors.New("no scope file")
 
 func loadScope(path string) (*scopeDeclaration, error) {
-	raw, err := os.ReadFile(path)
+	raw, err := os.ReadFile(path) // #nosec G304 -- the scope file the operator renders into the pod
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, errNoScopeFile
 	}
@@ -526,12 +539,18 @@ func (g *Gateway) profileRouteFor(addressee string, params map[string]string, ti
 	// (its card's tiers), so a submission at another tier would sit with
 	// nothing to consume it until the never-started heal. A card with no
 	// tiers is from an operator that predates them, and isn't checked.
-	if card, ok := g.profiles.lookup(profile); ok && len(card.Tiers) > 0 && !slices.Contains(card.Tiers, string(tier)) {
+	card, haveCard := g.profiles.lookup(profile)
+	if haveCard && len(card.Tiers) > 0 && !slices.Contains(card.Tiers, string(tier)) {
 		return nil, refused(noticeProfileTier, profile, tier)
 	}
 	route := &profileRoute{Profile: profile, Tier: tier, Kind: kind, Params: maps.Clone(params),
 		Scope: capability.NamespaceScope(g.cfg.Namespace)}
 	if target == nil {
+		if haveCard {
+			if err := checkDeclaredParameters(profile, card, route.Params); err != nil {
+				return nil, err
+			}
+		}
 		return route, nil
 	}
 	decl, err := loadScope(g.cfg.ScopeFile)
@@ -552,8 +571,59 @@ func (g *Gateway) profileRouteFor(addressee string, params map[string]string, ti
 	if err := lib.ValidateTaskParameters(route.Params); err != nil {
 		return nil, refused(noticeTargetParamsInvalid, err)
 	}
+	if haveCard {
+		if err := checkDeclaredParameters(profile, card, route.Params); err != nil {
+			return nil, err
+		}
+	}
 	route.Scope = target.scope()
 	return route, nil
+}
+
+// checkDeclaredParameters holds a task's parameters to what the resolved
+// profile's card declares: a name it doesn't declare is refused, and so is a
+// required one the set leaves out. A pinned profile takes its own cluster's
+// three target parameters whether its card declares them or not, since
+// profileRouteFor sets them from the pin. The refusal names what the profile
+// does take, so the asker can correct the call. The dispatcher checks the
+// required ones again on admission, against the AgentProfile itself.
+func checkDeclaredParameters(profile string, card lib.AgentCard, params map[string]string) error {
+	declared := map[string]bool{}
+	for _, p := range card.Parameters {
+		declared[p.Name] = true
+	}
+	if card.ClusterRef != nil {
+		declared[paramProject], declared[paramLocation], declared[paramCluster] = true, true, true
+	}
+	names := slices.Sorted(maps.Keys(params))
+	for _, name := range names {
+		if !declared[name] {
+			return refused(noticeParamUndeclared, profile, name, declaredParameters(card))
+		}
+	}
+	for _, p := range card.Parameters {
+		if _, ok := params[p.Name]; p.Required && !ok {
+			return refused(noticeParamMissing, profile, p.Name, declaredParameters(card))
+		}
+	}
+	return nil
+}
+
+// declaredParameters is a card's parameters for a refusal: each name in the
+// card's order, marked when required.
+func declaredParameters(card lib.AgentCard) string {
+	if len(card.Parameters) == 0 {
+		return paramsNone
+	}
+	out := make([]string, 0, len(card.Parameters))
+	for _, p := range card.Parameters {
+		name := p.Name
+		if p.Required {
+			name += paramRequiredMark
+		}
+		out = append(out, name)
+	}
+	return strings.Join(out, paramListSep)
 }
 
 // deliverChildResult hands a child's end to a parent addressed to an

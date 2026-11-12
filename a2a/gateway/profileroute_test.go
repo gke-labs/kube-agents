@@ -173,6 +173,9 @@ func TestProfileTurn_ARefusalPostsWhyAndSubmitsNothing(t *testing.T) {
 		{"out of scope", "cluster", targetParams("p9", "us-east1", "prod"), "outside this install's scope"},
 		{"pinned for another cluster", "prod-east", targetParams("p1", "us-east1", "dev"), "works only on cluster"},
 		{"unknown profile", "nope", nil, `no agent profile named "nope"`},
+		{"a parameter the profile doesn't declare", "cluster",
+			map[string]string{"project": "p1", "location": "us-east1", "cluster": "dev", "namespace": "web"},
+			`cluster doesn't take parameter "namespace"; it takes project (required), location (required), cluster (required)`},
 	}
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -717,5 +720,97 @@ func TestAStopLeavesAProfileParentTheRelayEndedAlone(t *testing.T) {
 	r.g.cancelWaitingProfileParents(context.Background(), rec, "task-child", Authority{})
 	if p, _ := rec.TaskRefFor("task-parent"); p.Canceled {
 		t.Fatal("the cascade cancelled a parent that had ended")
+	}
+}
+
+// TestAProfileParentDelegatesWithTheTargetsParameters: a delegate request's
+// parameters reach the child's submission as its taskParameters part, and a
+// name the target profile doesn't declare refuses the delegation, naming
+// what the profile takes, with nothing submitted.
+func TestAProfileParentDelegatesWithTheTargetsParameters(t *testing.T) {
+	cases := []struct {
+		name      string
+		params    map[string]string
+		wantEnd   string
+		wantChild map[string]string
+	}{
+		{name: "declared", params: targetParams("p1", "us-east1", "dev"), wantChild: targetParams("p1", "us-east1", "dev")},
+		{name: "undeclared", params: map[string]string{"project": "p1", "location": "us-east1", "cluster": "dev", "zone": "b"},
+			wantEnd: `cluster doesn't take parameter "zone"`},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := startProfileRig(t)
+			r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
+			ctx := context.Background()
+			conv := "console:tab-params-" + string(rune('a'+i))
+			turn := profileTurn(conv, "chat", nil)
+			turn.Backend, turn.AuthorID = consoleBackend, consoleAuthor
+			r.adapter.inbox <- turn
+			origin := submissionOn(t, r, "chat")
+			parent := r.execFor(t, origin, "chat")
+			if err := parent.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+				t.Fatal(err)
+			}
+			data, err := json.Marshal(lib.DelegateRequest{Addressee: "cluster", Text: "look at dev", Parameters: tc.params})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := parent.PublishArtifact(ctx, lib.Artifact{ArtifactID: "artifact-p-" + lib.ArtifactDelegate, Name: lib.ArtifactDelegate,
+				Parts: []lib.Part{{Kind: "data", Data: data}}}); err != nil {
+				t.Fatal(err)
+			}
+			if tc.wantEnd != "" {
+				waitFor(t, "the refusal on the parent's entry", func() bool {
+					rec, _ := r.g.reg.Get(ctx, conv)
+					ref, ok := rec.TaskRefFor(origin.TaskID)
+					return ok && strings.Contains(ref.DelegationEnd, tc.wantEnd)
+				})
+				if envs := streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+"cluster.>"); len(envs) != 0 {
+					t.Fatalf("%d submission(s) for a refused delegation", len(envs))
+				}
+				return
+			}
+			child := submissionOn(t, r, "cluster")
+			params, found, err := lib.TaskParametersOf(messageParts(t, child))
+			if err != nil || !found || !mapsEqual(params.Parameters, tc.wantChild) {
+				t.Fatalf("child parameters = %v (found=%v err=%v), want %v", params.Parameters, found, err, tc.wantChild)
+			}
+		})
+	}
+}
+
+// A profile that takes no target goes down profileRouteFor's no-target path,
+// which holds parameters to its card too: one it doesn't declare is refused
+// before any submission, not handed on to a profile that ignores it.
+func TestADelegationToANoTargetProfileIsHeldToItsCard(t *testing.T) {
+	r := startProfileRig(t)
+	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
+	r.g.profiles.put("triage", &lib.AgentCard{Name: "triage"})
+	ctx := context.Background()
+	const conv = "console:tab-notarget-params"
+	turn := profileTurn(conv, "chat", nil)
+	turn.Backend, turn.AuthorID = consoleBackend, consoleAuthor
+	r.adapter.inbox <- turn
+	origin := submissionOn(t, r, "chat")
+	parent := r.execFor(t, origin, "chat")
+	if err := parent.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(lib.DelegateRequest{Addressee: "triage", Text: "look at web", Parameters: map[string]string{"namespace": "web"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := parent.PublishArtifact(ctx, lib.Artifact{ArtifactID: "artifact-nt-" + lib.ArtifactDelegate, Name: lib.ArtifactDelegate,
+		Parts: []lib.Part{{Kind: "data", Data: data}}}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the refusal on the parent's entry", func() bool {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		ref, ok := rec.TaskRefFor(origin.TaskID)
+		return ok && strings.Contains(ref.DelegationEnd, `triage doesn't take parameter "namespace"`)
+	})
+	if envs := streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+"triage.>"); len(envs) != 0 {
+		t.Fatalf("%d submission(s) for a refused delegation", len(envs))
 	}
 }

@@ -123,6 +123,13 @@ const (
 	envGitOpsRepos = "GITOPS_REPOS"
 	// maxGitOpsRepos bounds the list read from the environment.
 	maxGitOpsRepos = 50
+	// The Bitbucket providers repositoryURL browses on their own rules:
+	// Bitbucket Cloud on bitbucket.org, and Data Center, which has no default
+	// host, on its project and repository path.
+	providerBitbucket           = "bitbucket"
+	providerBitbucketDataCenter = "bitbucket-datacenter"
+	bitbucketCloudHost          = "bitbucket.org"
+	bitbucketDataCenterRepoPath = "/projects/%s/repos/%s"
 
 	// turnTimeout matches the in-tree callers of the same endpoint
 	// (session_kv_server.py's _start_agent_turn): a diagnostic turn that
@@ -375,11 +382,15 @@ func parseRepositories(raw string) []repositoryInfo {
 // ssh:// or git:// remote, an scp remote (git@host:owner/repo) and a
 // schemeless host/owner/repo are reduced to host and path and browsed over
 // https; owner/name goes on the declared host or the provider's default.
+// Bitbucket Data Center has no default host and browses at
+// /projects/<PROJECT>/repos/<repo>; no link when either is missing.
 func repositoryURL(r repositoryInfo) string {
 	repo := strings.TrimSuffix(r.Repository, ".git")
 	host := r.Host
+	browseScheme := ""
 	if scheme, _, isURL := strings.Cut(repo, "://"); isURL {
-		if browseSchemes[strings.ToLower(scheme)] {
+		web := browseSchemes[strings.ToLower(scheme)]
+		if web && r.Provider != providerBitbucketDataCenter {
 			return repo
 		}
 		u, err := url.Parse(repo)
@@ -387,6 +398,11 @@ func repositoryURL(r repositoryInfo) string {
 			return ""
 		}
 		host, repo = u.Hostname(), u.Path
+		if web {
+			// A Data Center clone URL (https://<host>/<PROJECT>/<repo>) is
+			// browsed on the same scheme and port, at its browse path.
+			browseScheme, host = strings.ToLower(u.Scheme), u.Host
+		}
 	} else if m := scpRemotePattern.FindStringSubmatch(repo); m != nil && !portPathPattern.MatchString(m[2]) {
 		host, repo = m[1], m[2]
 	} else if first, rest, ok := strings.Cut(repo, "/"); ok && strings.Contains(first, ".") && strings.Contains(rest, "/") && (host == "" || first == host) {
@@ -397,14 +413,28 @@ func repositoryURL(r repositoryInfo) string {
 		switch r.Provider {
 		case "gitlab":
 			host = "gitlab.com"
-		case "gitea":
+		case "gitea", providerBitbucketDataCenter:
 			return ""
+		case providerBitbucket:
+			host = bitbucketCloudHost
 		default:
 			host = "github.com"
 		}
 	}
 	if strings.HasSuffix(host, ".svc.cluster.local") || strings.Contains(host, ".svc.cluster.local:") {
 		scheme = "http"
+	}
+	if browseScheme != "" {
+		scheme = browseScheme
+	}
+	if r.Provider == providerBitbucketDataCenter {
+		// Data Center browses a repository by project key and slug, so the
+		// path has to be exactly those two.
+		project, slug, ok := strings.Cut(strings.Trim(repo, "/"), "/")
+		if !ok || project == "" || slug == "" || strings.Contains(slug, "/") {
+			return ""
+		}
+		return scheme + "://" + host + fmt.Sprintf(bitbucketDataCenterRepoPath, project, slug)
 	}
 	return scheme + "://" + host + "/" + strings.Trim(repo, "/")
 }
@@ -1419,7 +1449,7 @@ func (s *server) hermes(ctx context.Context, method, path string, body any) (*ht
 		}
 		reader = bytes.NewReader(b)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, s.cfg.HermesURL+path, reader)
+	req, err := http.NewRequestWithContext(ctx, method, s.cfg.HermesURL+path, reader) // #nosec G704 -- the host is HERMES_URL, the console's own gateway address; a request-supplied path segment is PathEscape'd by its caller
 	if err != nil {
 		return nil, err
 	}
@@ -1429,7 +1459,7 @@ func (s *server) hermes(ctx context.Context, method, path string, body any) (*ht
 	if s.cfg.APIServerKey != "" {
 		req.Header.Set("Authorization", bearerPrefix+s.cfg.APIServerKey)
 	}
-	return s.client.Do(req)
+	return s.client.Do(req) // #nosec G704 -- same URL as above
 }
 
 type upstreamError struct {

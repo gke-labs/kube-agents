@@ -260,6 +260,15 @@ TAR_RECORD_BYTES = 20 * TAR_BLOCK_BYTES
 MAX_SNAPSHOT_ENTRIES = 4096
 SNAPSHOT_ENTRY_TREE = "tree"
 SNAPSHOT_ENTRY_BLOB = "blob"
+# The git runner decodes `ls-tree` with replacement, so a name that is not
+# UTF-8 is listed with U+FFFD and names nothing when a caller asks for it.
+# Such an entry carries SNAPSHOT_ENTRY_UNNAMED, saying why, so a caller lists
+# it as not read and does not ask for it; its directory, asked for, still
+# holds it. A name that holds U+FFFD itself is marked too: it is then not
+# read, never read as something else.
+SNAPSHOT_ENTRY_UNNAMED = "unnamed"
+SNAPSHOT_UNNAMED_REASON = "its name is not UTF-8, so the broker's listing could not name it to ask for"
+REPLACEMENT_CHARACTER = "\ufffd"
 # Each entry also counts the files under it a manifest reader reads, so a
 # caller can leave out a part of vendored archives or images without asking
 # for it. A link with such a name counts too, so the caller still sees it (and
@@ -481,7 +490,8 @@ def _snapshot_entries(listing: str, paths: list[str]) -> list[dict[str, Any]] | 
     `*.yaml`, `*.yml` or `*.json`, and ``bytes``: what `_tar_bytes` measures for a
     snapshot of that entry alone, its parent directories included, as `ls-tree`
     lists them and `archive` writes them. So a snapshot of the entry is refused
-    exactly when ``bytes`` is over the ceiling. None past `MAX_SNAPSHOT_ENTRIES`.
+    exactly when ``bytes`` is over the ceiling. An entry whose own name did not
+    decode also carries `SNAPSHOT_ENTRY_UNNAMED`. None past `MAX_SNAPSHOT_ENTRIES`.
     """
     entries = [entry for entry in listing.split("\0") if entry]
     directories = {
@@ -519,12 +529,15 @@ def _snapshot_entries(listing: str, paths: list[str]) -> list[dict[str, Any]] | 
         parts = child.split("/")
         parents = [directories["/".join(parts[:depth])] for depth in range(1, len(parts))
                    if "/".join(parts[:depth]) in directories]
-        answer.append({
+        listed = {
             "path": child,
             "type": SNAPSHOT_ENTRY_TREE if child in trees else SNAPSHOT_ENTRY_BLOB,
             "manifests": manifests[child],
             "bytes": _tar_bytes("\0".join(parents + own)),
-        })
+        }
+        if REPLACEMENT_CHARACTER in child.rpartition("/")[2]:
+            listed[SNAPSHOT_ENTRY_UNNAMED] = SNAPSHOT_UNNAMED_REASON
+        answer.append(listed)
     return answer
 
 

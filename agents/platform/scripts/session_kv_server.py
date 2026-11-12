@@ -8419,10 +8419,13 @@ def _bounded_text(request_data: Dict[str, Any], field: str) -> str:
 
 
 def _cluster_coordinates(cluster: str) -> tuple[str, str]:
-    """``(project, location)`` of the managed cluster named ``cluster``; empty when no profile, or more than one, names it.
+    """``(project, location)`` of the managed cluster named ``cluster``; empty when no profile names it or they disagree.
 
-    Read from the Cluster Agent profiles' ``cluster_identity`` stamp, the fleet's
-    own record of each cluster, rather than from the caller.
+    ``cluster`` is the bare GKE name or the fleet audit's qualified
+    ``<project>/<location>/<name>``; a qualified name matches only the profile
+    whose identity has all three. Read from the Cluster Agent profiles'
+    ``cluster_identity`` stamp, the fleet's own record of each cluster, rather
+    than from the caller.
     """
     import cluster_agent_profile
 
@@ -8430,12 +8433,19 @@ def _cluster_coordinates(cluster: str) -> tuple[str, str]:
     profiles = board_snapshot.PROFILES_DIR
     if not cluster or not profiles.is_dir():
         return "", ""
+    parts = cluster.split("/")
+    if len(parts) == 3 and all(parts):
+        want = {"project": parts[0], "location": parts[1], "cluster": parts[2]}
+    elif len(parts) == 1:
+        want = {"cluster": cluster}
+    else:
+        return "", ""
     for home in sorted(profiles.iterdir()):
         try:
             identity = cluster_agent_profile.read_cluster_identity(home)
         except Exception:  # noqa: BLE001 — an unreadable profile names no cluster
             continue
-        if identity and identity["cluster"] == cluster:
+        if identity and all(identity[key] == value for key, value in want.items()):
             found.add((identity["project"], identity["location"]))
     return found.pop() if len(found) == 1 else ("", "")
 
@@ -8455,11 +8465,10 @@ def post_post_merge_record(request_data: Dict[str, Any]) -> Dict[str, bool]:
     match = PROPOSAL_URL_RE.match(url.strip()) if isinstance(url, str) and len(url) <= PROPOSAL_URL_MAX_CHARS else None
     if match is None:
         raise HTTPException(status_code=400, detail="url must be a pull request url")
-    number = request_data.get("number")
-    if number is None:
-        number = int(match.group(2))
-    if not isinstance(number, int) or isinstance(number, bool) or number < 1:
-        raise HTTPException(status_code=400, detail="number must be a positive integer")
+    number = int(match.group(2))
+    sent_number = request_data.get("number")
+    if sent_number is not None and sent_number != number:
+        raise HTTPException(status_code=400, detail="number must match the pull request url")
     finding_id = _bounded_text(request_data, "finding_id")
     kind = finding_id.split(".", 1)[0]
     if kind not in POST_MERGE_KINDS:
@@ -11026,7 +11035,7 @@ def mark_finding_surfaced(finding_id: str, body: Dict[str, Any] | None = None) -
 
 @app.get("/v1/findings/additions", dependencies=[Depends(verify_api_key)])
 def get_finding_additions(day: str = "") -> Dict[str, Any]:
-    """Items added on a UTC day (default today) by class, across every state (§7.2)."""
+    """Items added on a UTC day (default today) by class, and the line of each, across every state (§7.2)."""
     day = day or datetime.now(timezone.utc).date().isoformat()
     try:
         with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:

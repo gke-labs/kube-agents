@@ -29,6 +29,12 @@ BUILD_ID = "2095176282760286208"
 EXPECTED_DECK_URL = (
     f"https://oss.gprow.dev/view/gs/kube-agents-prow/logs/{JOB_NAME}/{BUILD_ID}"
 )
+# The same build once the job's decoration uploads to the presubmit lanes'
+# private bucket, which Deck cannot read: the driver links the Console.
+PRIVATE_LOG_BUCKET = "kube-agents-evals-presubmit-logs"
+EXPECTED_CONSOLE_URL = (
+    f"https://console.cloud.google.com/storage/browser/{PRIVATE_LOG_BUCKET}/logs/{JOB_NAME}/{BUILD_ID}"
+)
 
 # A stub ci-deploy.sh has to carry this for the driver's predates-the-RC-path
 # guard to let it through; the real marker is the variable ci-deploy.sh reads.
@@ -240,6 +246,8 @@ class RcEvalDriverFixture:
         }
         environ.pop("PULL_NUMBER", None)
         environ.pop("RC_TAG", None)
+        # The bucket the link follows comes from the test, not the machine.
+        environ.pop("JOB_SPEC", None)
         for key, value in env.items():
             if value is None:
                 environ.pop(key, None)

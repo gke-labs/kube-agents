@@ -4024,6 +4024,21 @@ class SnapshotTest(unittest.TestCase):
             with self.subTest(entry=entry["path"]):
                 self.assertEqual(vcs_broker._tar_bytes(self._listing_for([entry["path"]])), entry["bytes"])
 
+    def test_an_entry_whose_name_did_not_decode_is_marked_unnamed(self):
+        # The runner decodes `ls-tree` with replacement: b"caf\xe9" arrives as "caf\ufffd".
+        listing = "\0".join([
+            "040000 - caf\ufffd", "100644 8 caf\ufffd/a.yaml",
+            "040000 - ok", "100644 8 ok/caf\ufffd.yaml",
+            "100644 8 top.yaml",
+        ]) + "\0"
+        entries = {entry["path"]: entry for entry in vcs_broker._snapshot_entries(listing, [])}
+        self.assertEqual(vcs_broker.SNAPSHOT_UNNAMED_REASON, entries["caf\ufffd"][vcs_broker.SNAPSHOT_ENTRY_UNNAMED])
+        # A name below an entry does not mark it: asking for the entry reads it.
+        self.assertNotIn(vcs_broker.SNAPSHOT_ENTRY_UNNAMED, entries["ok"])
+        self.assertNotIn(vcs_broker.SNAPSHOT_ENTRY_UNNAMED, entries["top.yaml"])
+        asked = vcs_broker._snapshot_entries(listing, ["ok"])
+        self.assertEqual(vcs_broker.SNAPSHOT_UNNAMED_REASON, asked[0][vcs_broker.SNAPSHOT_ENTRY_UNNAMED])
+
     def test_past_the_entry_cap_the_refusal_carries_no_entries(self):
         self.broker.max_snapshot_bytes = 1
         with mock.patch.object(vcs_broker, "MAX_SNAPSHOT_ENTRIES", 1), self.assertRaises(WorkspaceError) as caught:

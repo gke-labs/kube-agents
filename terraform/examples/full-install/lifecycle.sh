@@ -98,6 +98,9 @@
 # nothing and fails instead, per its read-only contract above. A gitignored
 # backend_override.tf points Terraform at gs://<bucket>/<KUBE_AGENTS_STATE_PREFIX,
 # default kube-agents/<cluster_name>>. Unset, state stays local as before.
+# Every input is read through that state (tfvar); a transient backend answer
+# (429/5xx, a dropped connection) is asked again, STATE_BACKEND_ATTEMPTS (4)
+# times STATE_BACKEND_WAIT_SECONDS (15) apart.
 #
 set -euo pipefail
 
@@ -229,6 +232,22 @@ readonly MINTER_KEY_ABSENT_PATTERN='NOT_FOUND|SERVICE_DISABLED|has not been used
 readonly KMS_API_PROPAGATION_PATTERN='KMS\)? API has not been used in project'
 KMS_API_PROPAGATION_ATTEMPTS="${KMS_API_PROPAGATION_ATTEMPTS:-5}"
 KMS_API_PROPAGATION_WAIT_SECONDS="${KMS_API_PROPAGATION_WAIT_SECONDS:-60}"
+# What the state backend says when it is briefly unavailable. Every tfvar read
+# below is a `terraform console` that opens the remote state, and the pre-apply
+# guards make some fifty of them, so one Cloud Storage blip has fifty chances
+# to end an apply before it starts: the promotion pipeline's provision died on
+# a 503 "Authentication backend unavailable" reading var.drift_pubsub_sink
+# (kube-agents#5349). An ERE, for grep -E, naming only what a second request
+# can change: the 429 and 5xx codes in the three spellings they arrive in (the
+# GCS JSON body, `googleapi: Error N`, and `googleapi: got HTTP response code
+# N with body:` -- the last also fronts the HTML pages the Google front end
+# serves for a 502), and a connection that dropped or timed out. A 403, a
+# missing bucket and a held lock (a 412) read the same the second time and
+# are not here. Both knobs are environment overrides so a test runs with no
+# wait; like the KMS pair above, neither is validated.
+readonly STATE_BACKEND_TRANSIENT_PATTERN='"code": ?(429|500|502|503|504)|"status": ?"(UNAVAILABLE|RESOURCE_EXHAUSTED|INTERNAL|DEADLINE_EXCEEDED)"|googleapi: (Error|got HTTP response code) (429|500|502|503|504)|connection (reset by peer|refused)|TLS handshake timeout|i/o timeout|context deadline exceeded|unexpected EOF|server sent GOAWAY|stream error: .*INTERNAL_ERROR'
+STATE_BACKEND_ATTEMPTS="${STATE_BACKEND_ATTEMPTS:-4}"
+STATE_BACKEND_WAIT_SECONDS="${STATE_BACKEND_WAIT_SECONDS:-15}"
 # Where run_apply keeps the apply's output for that grep; set per run.
 APPLY_OUTPUT_FILE=""
 # What Terraform prints when it is interrupted: it traps SIGINT, cancels the
@@ -399,13 +418,26 @@ tfvar() { tf_expr "var.$1"; }
 # of the profile table.
 tf_module_output() { tf_expr "module.gke_cluster.$1"; }
 
+# A transient answer from the state backend (STATE_BACKEND_TRANSIENT_PATTERN)
+# is asked again, up to STATE_BACKEND_ATTEMPTS times with
+# STATE_BACKEND_WAIT_SECONDS between them; any other failure, and a backend
+# still down at the end of the budget, exits as before with the terraform
+# error printed.
 tf_expr() {
-  local out value
-  if ! out=$(echo "$1" | terraform console 2>&1); then
-    printf '%s\n' "$out" >&2
-    warn "could not evaluate $1 (see the terraform error above)"
-    exit 1
-  fi
+  local out value attempt=1
+  while ! out=$(echo "$1" | terraform console 2>&1); do
+    if ! grep -Eq "$STATE_BACKEND_TRANSIENT_PATTERN" <<<"$out" || [[ "$attempt" -ge "$STATE_BACKEND_ATTEMPTS" ]]; then
+      printf '%s\n' "$out" >&2
+      warn "could not evaluate $1 (see the terraform error above)"
+      if [[ "$attempt" -gt 1 ]]; then
+        warn "this was attempt $attempt of $STATE_BACKEND_ATTEMPTS; the state backend answered a transient error before it. If this error is one too, wait a minute and run it again."
+      fi
+      exit 1
+    fi
+    attempt=$((attempt + 1))
+    warn "the state backend answered a transient error reading $1 ($(grep -Eo "$STATE_BACKEND_TRANSIENT_PATTERN" <<<"$out" | head -n1)); waiting ${STATE_BACKEND_WAIT_SECONDS}s, then asking again (attempt $attempt of $STATE_BACKEND_ATTEMPTS)"
+    sleep "$STATE_BACKEND_WAIT_SECONDS"
+  done
   value=$(printf '%s\n' "$out" | grep -vE "$STATE_LOCK_MESSAGE_PATTERN" | grep -v '^[[:space:]]*$' | tail -1 | tr -d '"')
   case "$value" in
     null | "tostring(null)" | "tonumber(null)" | "tobool(null)") value="" ;;
@@ -2052,7 +2084,7 @@ case "${1:-}" in
     # The line range is the header comment above, so it moves whenever that
     # comment grows. It ends at the blank comment line before `set -euo
     # pipefail`.
-    sed -n '2,101p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,104p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit 1
     ;;
 esac

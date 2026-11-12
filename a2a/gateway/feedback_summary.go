@@ -59,7 +59,7 @@ const (
 	serverVersionPath      = "/version"
 	//: The characters a block token is made of; the audit's boundary is the
 	//: complement, as the script's IDENTIFIER_BOUNDARY is.
-	usageSummaryTokenClass = `[A-Za-z0-9_.-]`
+	usageSummaryTokenClass = `[A-Za-z0-9_.-]` // #nosec G101 -- a character class, not a credential
 	//: The window never drops below one day, so the label never reads "0 days"
 	//: on an install with a sub-day SessionTTL.
 	usageSummaryWindowFloor = hoursPerDay * time.Hour

@@ -754,15 +754,13 @@ func (r *PlatformAgentReconciler) scopePublisherIdentityOwned(ctx context.Contex
 	return metav1.IsControlledBy(existing, agent), nil
 }
 
-// scopeBrokerEnv is the broker's side of the publisher. Under mode next the
-// declaration's path, which the scope role reads to bound every argument;
+// scopeBrokerEnv is the broker's side of the publisher. In every mode the
+// declaration's path, from which the broker refuses an excluded cluster to
+// every caller and which the scope role reads to bound every argument;
 // while a publisher may run (scopePublisherMayRun), the audience and the
 // publisher's username bound to it both ways, as a2aMCPBrokerEnv binds the mcp role. Without the
 // pair the broker confers the scope role to nobody.
 func scopeBrokerEnv(agent *agentv1alpha1.PlatformAgent, owned bool) []corev1.EnvVar {
-	if !scopePublisherRendered(agent) {
-		return nil
-	}
 	env := []corev1.EnvVar{{Name: credentialProxyScopeFileEnvVar, Value: path.Join(brokerScopeDir, scopeFileName)}}
 	if scopePublisherMayRun(agent, owned) {
 		env = append(env,

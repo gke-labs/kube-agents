@@ -168,6 +168,12 @@ DELEGATION_CEILING_MARKER = "KUBE_AGENTS_DELEGATION_CEILING"
 FIXTURE_DRIFT_LABEL = "fixture-drift"
 FIXTURE_DRIFT_MARKER = f"({FIXTURE_DRIFT_LABEL}:"
 
+# A rung-2 block's reason: the scorer gives each errored check's reason after
+# this phrase, and a check's reason can quote a rate limit or a 429 from the
+# forge it read. The repetition was graded, and blocked, so it is a fail,
+# never a storm rep; STORM_REASON_RE is not asked about it.
+RUNG_2_ERRORED_PHRASE = "checks errored rather than ran"
+
 # --- Replay errors (#2328) ---------------------------------------------------
 # A card-wake replay whose plant or turn failed in the image (ReplayBroken) or
 # whose directive/prompt was invalid returns an errored result; at bench-gate
@@ -346,6 +352,8 @@ def rep_kind(rep: dict) -> str:
         return REP_FAIL
     if result == "infra":
         return REP_STORM
+    if RUNG_2_ERRORED_PHRASE in reason:
+        return REP_FAIL
     if STORM_REASON_RE.search(reason):
         return REP_STORM
     return REP_FAIL
