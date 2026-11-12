@@ -602,6 +602,16 @@ func TestScrubInlineSecretsKeepsACodeSpansClosingBacktick(t *testing.T) {
 		// Not a closing backtick: it's inside the value.
 		{"app --password=synthetic`pass-0001 x", "app --password=[redacted] x"},
 		{"run `mysql -ufoo -psynth`etic9x` then", "run `mysql -ufoo -p[redacted]` then"},
+		// Outside a code span a trailing backtick is the value's own.
+		{"app --password=synthetic-pass-0001` x", "app --password=[redacted] x"},
+		// A quoted value followed by punctuation is still redacted.
+		{`app --password="synthetic-pass-0001".`, `app --password=[redacted].`},
+		{`app --password='synthetic-pass-0001'),`, `app --password=[redacted]),`},
+		{"`app --password=\"synthetic-pass-0001\"`.", "`app --password=[redacted]`."},
+		{"(`app --token synthetic-token-0001`), then", "(`app --token [redacted]`), then"},
+		// Inside a span, a backtick with more value after it is the
+		// value's own: redacted whole, nothing of it handed back.
+		{"`app --password=synthetic`pass-0001 more`", "`app --password=[redacted] more`"},
 	}
 	for _, tc := range cases {
 		if got := scrubInlineSecrets(tc.in); got != tc.want {

@@ -52,16 +52,16 @@ var (
 	// answer (2026-10-28T03:56:05Z-03:59:15Z) puts where a host would be.
 	timestampHostPattern    = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt ][0-9]{2}$`)
 	cliUserPassPattern      = regexp.MustCompile(`(?i)(\b(?:curl|wget|mysql|mysqldump|mariadb|mysqladmin|(?:docker|helm)\s+login)\b[^\r\n]*?\s(?:-u|--user)(?:=|[ \t]+)?)(["']?)([^"'\s:]+):([^"'\s]+)(["']?)`)
-	cliAttachedPassPattern  = regexp.MustCompile(`(?i)(\b(?:mysql|mysqldump|mariadb|mysqladmin|sshpass|mongosh|mongo)\b[^\r\n]*?\s-p)("[^"\r\n]*"|'[^'\r\n]*'|[^\s"';|&]+?)(\x60?(?:[\s"';|&]|$))`)
-	cliSpacedPassPattern    = regexp.MustCompile(`(?i)(\b(?:mysql|mysqldump|mariadb|mysqladmin|sshpass|mongosh|mongo|redis-cli|az\s+login|(?:docker|helm)\s+login)\b[^\r\n]*?\s-[pa][ \t]+)("[^"\r\n]*"|'[^'\r\n]*'|[^-\s"';|&][^\s"';|&]*?)(\x60?(?:[\s"';|&]|$))`)
-	cliLDAPPassPattern      = regexp.MustCompile(`(?i)(\bldap(?:search|modify|add|delete|whoami|passwd|compare|exop|modrdn)\b[^\r\n]*?\s-w[ \t]+)("[^"\r\n]*"|'[^'\r\n]*'|[^-\s"';|&][^\s"';|&]*?)(\x60?(?:[\s"';|&]|$))`)
+	cliAttachedPassPattern  = regexp.MustCompile(`(?i)(\b(?:mysql|mysqldump|mariadb|mysqladmin|sshpass|mongosh|mongo)\b[^\r\n]*?\s-p)("[^"\r\n]*"|'[^'\r\n]*'|[^\s"';|&]+)`)
+	cliSpacedPassPattern    = regexp.MustCompile(`(?i)(\b(?:mysql|mysqldump|mariadb|mysqladmin|sshpass|mongosh|mongo|redis-cli|az\s+login|(?:docker|helm)\s+login)\b[^\r\n]*?\s-[pa][ \t]+)("[^"\r\n]*"|'[^'\r\n]*'|[^-\s"';|&][^\s"';|&]*)`)
+	cliLDAPPassPattern      = regexp.MustCompile(`(?i)(\bldap(?:search|modify|add|delete|whoami|passwd|compare|exop|modrdn)\b[^\r\n]*?\s-w[ \t]+)("[^"\r\n]*"|'[^'\r\n]*'|[^-\s"';|&][^\s"';|&]*)`)
 	cliPassphraseArgPattern = regexp.MustCompile(`(?i)(\s-pass(?:in|out|word)?[ \t]+pass:)([^\s"';|&]+)`)
 	// A flag's unquoted value never starts with a dash, so a flag with no
 	// value of its own does not take the next flag as its value and hide
 	// that flag's; a value after = or : that does start with one is read
 	// by the Dashed patterns, which take no spaced value.
-	cliLongSecretFlagPattern       = regexp.MustCompile(`(--([A-Za-z0-9_.-]+)(=|[ \t]+))("[^"\r\n]*"|'[^'\r\n]*'|[^-\s"';|&][^\s"';|&]*?)(\x60?(?:[\s"';|&]|$))`)
-	cliLongSecretFlagDashedPattern = regexp.MustCompile(`(--([A-Za-z0-9_.-]+)(=))(-[^\s"';|&]*?)(\x60?(?:[\s"';|&]|$))`)
+	cliLongSecretFlagPattern       = regexp.MustCompile(`(--([A-Za-z0-9_.-]+)(=|[ \t]+))("[^"\r\n]*"|'[^'\r\n]*'|[^-\s"';|&][^\s"';|&]*)`)
+	cliLongSecretFlagDashedPattern = regexp.MustCompile(`(--([A-Za-z0-9_.-]+)(=))(-[^\s"';|&]*)`)
 	// A single-dash long flag (-password x, -Password x, -token=x), the
 	// spelling Go's flag package, Java tools and PowerShell take.
 	cliSingleDashSecretFlagPattern       = regexp.MustCompile(`(?:^|[\s"'(\[,])(-([A-Za-z][A-Za-z0-9_.-]{2,})(=|:|[ \t]+))("[^"\r\n]*"|'[^'\r\n]*'|[^-\s"';|&][^\s"';|&]*)`)
@@ -1415,6 +1415,7 @@ func redactNamedSubmatch(re *regexp.Regexp, s string, group, keyGroup int, keep 
 		if lo < last || hi <= lo || s[lo:hi] == redactedValue || (keep != nil && !keep(s, m)) {
 			continue
 		}
+		hi = closingBacktickOutside(s, lo, hi)
 		sb.WriteString(s[last:lo])
 		sb.WriteString(redactedValue)
 		if keyGroup < 0 || keyClearlyNamesSecret(s[m[2*keyGroup]:m[2*keyGroup+1]]) {
@@ -1427,6 +1428,34 @@ func redactNamedSubmatch(re *regexp.Regexp, s string, group, keyGroup int, keep 
 	}
 	sb.WriteString(s[last:])
 	return sb.String()
+}
+
+// closingPunctuation is what may follow a code span's closing backtick and
+// still be handed back to the text with it (closingBacktickOutside).
+const closingPunctuation = ").,;:!?]}"
+
+// closingBacktickOutside gives the text back from the backtick that closes
+// a markdown code span the value sits in: an unquoted value inside an open
+// span (an odd count of backticks earlier on its line) ends at its last
+// backtick, and that backtick and whatever the value rule took after it
+// (closingPunctuation only) stay in the text. Everything before it is still
+// redacted, a backtick inside the value included. Outside a code span, or
+// for a quoted value, the span is unchanged.
+func closingBacktickOutside(s string, lo, hi int) int {
+	if hi-lo < 2 || s[lo] == '"' || s[lo] == '\'' {
+		return hi
+	}
+	k := strings.LastIndexByte(s[lo:hi], '`')
+	if k < 1 || strings.Trim(s[lo+k+1:hi], closingPunctuation) != "" {
+		// No backtick, or one with more of the value after it than
+		// closing punctuation: the value's own, redacted whole.
+		return hi
+	}
+	line := strings.LastIndexByte(s[:lo], '\n') + 1
+	if strings.Count(s[line:lo], "`")%2 == 1 {
+		return lo + k
+	}
+	return hi
 }
 
 // authSchemeCredentialRedacted says whether a credential after a scheme
