@@ -583,7 +583,9 @@ NAMESPACE_SCAN_TIMEOUT_SECONDS = 300
 #: One cluster's read in stall_report.py's cluster mode: one kubectl per
 #: kind across every namespace (pages, for the kinds the broker pages), one
 #: for the Warning events, and one per referent kind the dangling-reference
-#: heuristic resolves, at most five. The broker ends a one-shot kubectl at
+#: heuristic resolves, at most five (a referent kind whose cluster-wide
+#: listing failed adds one listing per namespace with a reference, until
+#: one is refused too). The broker ends a one-shot kubectl at
 #: 60 s, so ten minutes holds ten such calls at the bound, past the default
 #: list's eight kinds plus events; a cluster that outruns it is read per
 #: namespace under the cursor instead, so a slow cluster is still read, a
@@ -594,8 +596,9 @@ NAMESPACE_SCAN_TIMEOUT_SECONDS = 300
 #: budget.
 CLUSTER_SCAN_TIMEOUT_SECONDS = 600
 SCAN_TIMEOUT_FLOOR_SECONDS = 1
-#: Every hop's remote command runs under coreutils `timeout` (in the sandbox
-#: image's base) at the hop's own bound plus this grace, TERM then KILL after
+#: Every hop through `run_sandbox` runs its remote command under coreutils
+#: `timeout` (in the sandbox image's base; the endpoint helper's own hop in
+#: `gke_endpoint` is not wrapped) at the hop's own bound plus this grace, TERM then KILL after
 #: REMOTE_TIMEOUT_KILL_AFTER_SECONDS. A local timeout ends the ssh and frees
 #: the broker slot, but not the `stall_report.py` or `kubectl` it started on
 #: the other side; without the wrapper a few timeouts leave more readers in

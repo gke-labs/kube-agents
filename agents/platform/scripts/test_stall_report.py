@@ -1063,9 +1063,14 @@ class ClusterMode(unittest.TestCase):
         self.assertFalse(resolver.exists("Service", NAMESPACE, "gone"))
         self.assertIsNone(resolver.exists("Secret", NAMESPACE, "tls"), "a kind neither listing can read stays unresolved")
         self.assertIsNone(resolver.exists("Secret", BILLING, "tls"))
+        self.assertIsNone(resolver.exists("Secret", BILLING, "other"))
         self.assertIsNone(resolver.exists("Thing", NAMESPACE, "x"), "a kind with no resource is left alone")
         self.assertEqual(calls, ["configmaps", "services", "secrets"], "one cluster-wide listing per kind")
-        self.assertEqual(namespaced, [("services", NAMESPACE), ("secrets", NAMESPACE), ("secrets", BILLING)], "the per-namespace listing once per kind and namespace it fell back for")
+        self.assertEqual(
+            namespaced,
+            [("services", NAMESPACE), ("secrets", NAMESPACE)],
+            "the per-namespace listing once per kind and namespace it fell back for; a kind refused there too is not asked for in the next namespace",
+        )
 
     def test_a_cut_referent_listing_leaves_references_unresolved(self):
         with patch.object(stall_report, "run_kubectl", return_value=(0, "payments   present\n", "credential proxy output truncated\n")):

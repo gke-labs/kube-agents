@@ -1111,13 +1111,18 @@ class ClusterNameResolver(NameResolver):
     listing, as the namespace read resolves it: the cluster-wide read saves
     calls and never leaves a reference unchecked that the namespace read
     would have checked, so a dangling-reference row does not clear on a
-    listing that failed. A kind neither listing can read (Secrets on the
-    read-only permission set) stays unresolved, as before."""
+    listing that failed. A kind neither listing can read stays unresolved,
+    as before, and is not asked for again: Secrets are refused at both
+    scopes on the read-only permission set (the admission policy lets no
+    agent Role grant them), and a Secret reference is the common one, so
+    without that memory every namespace with one would cost a refused call,
+    the per-namespace cost the cluster read exists to remove."""
 
     def __init__(self, lister=kubectl_names_cluster_wide, namespace_lister=kubectl_names):
         super().__init__(lister=namespace_lister)
         self._cluster_lister = lister
         self._names: dict[str, set[tuple[str, str]] | None] = {}
+        self._unlistable: set[str] = set()
 
     def exists(self, kind: str, namespace: str, name: str) -> bool | None:
         resource = REFERENT_RESOURCES.get(kind)
@@ -1126,9 +1131,14 @@ class ClusterNameResolver(NameResolver):
         if resource not in self._names:
             self._names[resource] = self._cluster_lister(resource)
         names = self._names[resource]
-        if names is None:
-            return super().exists(kind, namespace, name)
-        return (namespace, name) in names
+        if names is not None:
+            return (namespace, name) in names
+        if resource in self._unlistable:
+            return None
+        answer = super().exists(kind, namespace, name)
+        if self._cache.get((resource, namespace)) is None:
+            self._unlistable.add(resource)
+        return answer
 
 
 def collect_cluster(kinds: list[str]) -> tuple[dict[str, dict[str, list[dict]]], dict[str, list[dict]] | None, list[str]]:

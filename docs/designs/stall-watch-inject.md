@@ -201,7 +201,8 @@ watch now runs `stall_report.py` once per cluster, in a cluster mode (`--namespa
 is read once across the cluster and split per namespace in Python, through the same `analyze`,
 so the rows a namespace gets are the rows its own read gave. A cluster costs kinds-plus-one reads
 plus one per referent kind the dangling-reference heuristic resolves, whatever its namespace
-count.
+count (a referent kind whose cluster-wide listing failed adds one per-namespace listing per
+namespace with a reference to it, until one of those is refused too; see below).
 
 Two shapes of read, because the broker has two rules. The kinds in the broker's raw-path
 allowlist (`command_policy.KUBECTL_RAW_COLLECTIONS`: the workload kinds, Jobs, Services and the
@@ -224,10 +225,13 @@ per-namespace path throughout. The referents of the dangling-reference heuristic
 from one name-only listing per kind across the cluster (`-o custom-columns` of namespace and
 name, never a body); a kind whose cluster-wide listing failed or was cut is resolved per
 namespace through the namespace read's own `-o name` listing, so a failed listing clears no
-dangling-reference row, and only a kind neither listing can read (Secrets on the read-only
-permission set) stays unresolved. The cursor keeps its two grains: a tick that runs out before a
+dangling-reference row; a kind neither listing can read (Secrets on the read-only permission set,
+which the admission policy lets no agent Role grant) stays unresolved and is not asked for in the
+next namespace, so the fallback costs a kind at most one refused call rather than one per
+namespace with a reference. The cursor keeps its two grains: a tick that runs out before a
 cluster's read resumes at the cluster; one that runs out between per-namespace reads resumes at
-the namespace. Every hop's remote command runs under coreutils `timeout` at the hop's bound plus
+the namespace. Every hop the watch makes through `run_sandbox` (the endpoint helper's own hop
+is not among them) runs its remote command under coreutils `timeout` at the hop's bound plus
 a two-second grace: a local timeout frees the broker slot but not the `stall_report.py` it
 started in the sandbox, and without the wrapper a few timeouts would leave more readers running
 than `SCAN_WORKERS` admits; the grace keeps the local timeout first, so a timed-out hop still
@@ -304,8 +308,10 @@ unreadable cluster timed with no scans while a cluster gone from the listing is 
 (an excluded one absent), the served kinds (one api-resources does not list absent, its rows held)
 and a Config Connector kind only where discovery found it; a kind or the events left over read per
 namespace; a failed, unparseable or timed-out cluster read read per namespace; a timeout at the
-budget as the resume point; the scan timeout cut to the budget left; and the same ledger rows
-whichever path read them. `Parallel` holds four reads in flight at once and checks the width, that
+budget as the resume point; the scan timeout cut to the budget left; a timed-out hop ending the
+remote reader too (the fake sandbox runs the argv as a process, and only the `timeout` wrapper
+can end it); and the same ledger rows whichever path read them. `Parallel` holds four reads in
+flight at once and checks the width, that
 the ledger a parallel sweep leaves matches a serial one's, that clusters no worker had started when
 the budget ran out are the resume point, and that a lost sandbox on one worker is one sweep
 failure. `test_stall_report.py`'s `ClusterMode` drives the cluster mode over recorded kubectl
@@ -313,7 +319,8 @@ output, two raw pages of Deployments without item kinds, a chunked Gateway listi
 and name-only referent listings, and asserts each namespace's findings equal, byte for byte, what
 the namespace path gives from the same objects; and a cut chunked reply, a cut raw page halved and
 retried, a page cut at the floor, a failed raw read, cut events and a `kind/name` each landing in
-`fallback`.
+`fallback`; and a failed cluster-wide referent listing resolved per namespace, the
+dangling-reference row standing.
 
 **Eval.** `autoops-controller-stall-triage`, modelled on `gitops-drift-out-of-band-triage`, covers the
 daemon end of the chain and everything after it, not the stall watch, which its unit tests cover. Its

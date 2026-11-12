@@ -139,9 +139,10 @@ every project's listing fails, when no management project resolves, when
 
 Every `gcloud`, `kubectl` and `stall_report.py` call runs in the shell sandbox
 through `sandbox_exec`, because the agent container carries no kubectl (with the
-sandbox switched off the calls run locally and fail with `No such file or
-directory: 'gcloud'`, the same failure every `sandbox_exec` caller sees in that
-state). The script itself travels on the command's stdin, read from the agent
+sandbox switched off the calls run locally, under the watch's coreutils `timeout`
+wrapper, and fail with its exit 127, `failed to run command 'gcloud'`: no
+management project resolves and the tick reports a sweep failure). The script
+itself travels on the command's stdin, read from the agent
 image's copy in `/opt/defaults/scripts` and run with `python3 -I -`: what the
 `hermes` login executes is never a file under the sandbox's agent-owned
 `/opt/data`, and isolated mode keeps that directory, which is the command's
