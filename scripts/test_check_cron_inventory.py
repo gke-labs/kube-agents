@@ -182,12 +182,70 @@ class DiffCheckTest(unittest.TestCase):
         self.assertEqual(self.problems(), [])
 
 
+class ComparisonBaseTest(unittest.TestCase):
+    """The step stays one `make` line (tests/test_docs_check_workflow.py), so the
+    script finds its own base from the GitHub event, as check_upgrade_table_releases does."""
+
+    def setUp(self):
+        self.repo = Repo(self)
+        self.repo.write(roster(job("tick")), roster(), inventory(("tick", "x")))
+        self.base = self.repo.commit("base")
+
+    def test_a_push_has_no_base(self):
+        self.assertIsNone(cci.comparison_base(self.repo.root, {"GITHUB_EVENT_NAME": "push"}))
+
+    def test_a_pull_request_merge_commit_compares_with_its_first_parent(self):
+        self.repo.git("checkout", "-q", "-b", "topic")
+        (self.repo.root / "y").write_text("y")
+        self.repo.commit("topic")
+        self.repo.git("checkout", "-q", "main")
+        (self.repo.root / "z").write_text("z")
+        main_tip = self.repo.commit("main moved")
+        self.repo.git("merge", "-q", "--no-ff", "-m", "merge", "topic")
+        self.assertEqual(cci.comparison_base(self.repo.root, {"GITHUB_EVENT_NAME": "pull_request"}), main_tip)
+
+    def test_a_pull_request_without_a_merge_commit_reads_the_payload(self):
+        payload = self.repo.root / "event.json"
+        payload.write_text(json.dumps({"pull_request": {"base": {"sha": self.base}}}))
+        env = {"GITHUB_EVENT_NAME": "pull_request", "GITHUB_EVENT_PATH": str(payload)}
+        self.assertEqual(cci.comparison_base(self.repo.root, env), self.base)
+
+    def test_a_merge_group_reads_its_base_sha(self):
+        payload = self.repo.root / "event.json"
+        payload.write_text(json.dumps({"merge_group": {"base_sha": self.base}}))
+        env = {"GITHUB_EVENT_NAME": "merge_group", "GITHUB_EVENT_PATH": str(payload)}
+        self.assertEqual(cci.comparison_base(self.repo.root, env), self.base)
+
+    def test_a_local_run_compares_with_main_when_it_has_one(self):
+        self.repo.git("update-ref", "refs/remotes/upstream/main", self.base)
+        (self.repo.root / "y").write_text("y")
+        self.repo.commit("local work")
+        self.assertEqual(cci.comparison_base(self.repo.root, {}), self.base)
+
+    def test_a_local_run_with_no_main_has_no_base(self):
+        self.assertIsNone(cci.comparison_base(self.repo.root, {}))
+
+    def test_a_pull_request_run_finds_a_roster_change_without_its_row(self):
+        self.repo.git("checkout", "-q", "-b", "topic")
+        self.repo.write(roster(job("tick", "*/5 * * * *")), roster(), inventory(("tick", "x")))
+        self.repo.commit("schedule change, no row")
+        payload = self.repo.root.parent / (self.repo.root.name + "-event.json")
+        payload.write_text(json.dumps({"pull_request": {"base": {"sha": self.base}}}))
+        self.addCleanup(payload.unlink)
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GITHUB_")}
+        env.update({"GITHUB_EVENT_NAME": "pull_request", "GITHUB_EVENT_PATH": str(payload)})
+        result = subprocess.run([sys.executable, str(Path(cci.__file__)), "--root", str(self.repo.root)],
+                                capture_output=True, text=True, env=env)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("`tick`", result.stderr)
+
+
 class MainTest(unittest.TestCase):
     def test_main_without_a_base_runs_the_static_check_only(self):
         repo = Repo(self)
         repo.write(roster(job("tick")), roster(), inventory(("tick", "x")))
         repo.commit()
-        env = {k: v for k, v in os.environ.items() if k != "BASE_REF"}
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GITHUB_")}
         result = subprocess.run([sys.executable, str(Path(cci.__file__)), "--root", str(repo.root)],
                                 capture_output=True, text=True, env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -197,7 +255,7 @@ class MainTest(unittest.TestCase):
         repo.write(roster(job("tick")), roster(), inventory())
         repo.commit()
         result = subprocess.run([sys.executable, str(Path(cci.__file__)), "--root", str(repo.root)],
-                                capture_output=True, text=True, env={k: v for k, v in os.environ.items() if k != "BASE_REF"})
+                                capture_output=True, text=True, env={k: v for k, v in os.environ.items() if not k.startswith("GITHUB_")})
         self.assertEqual(result.returncode, 1)
         self.assertIn("`tick`", result.stderr)
 

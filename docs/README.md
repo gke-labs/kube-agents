@@ -227,6 +227,12 @@ CI enforcement: `make docs-check` runs the same checks as
   on any other pull request it is a warning. It reads the history and the
   release tags, so it fails on a shallow or tagless clone; run
   `git fetch --tags --unshallow` first.
+- `docs-check-cron-inventory` — `scripts/check_cron_inventory.py`; every job on
+  the two Hermes cron rosters (`agents/chat/defaults/cron/jobs.json`,
+  `agents/platform/cron/jobs.json`) has a row in
+  `docs/designs/scheduling-on-profiles-inventory.md`, and every row names a job.
+  On a pull request or in the merge queue, a job added, removed, or with its
+  schedule, script, `no_agent` or `deliver` changed must change its row too.
 
 ### Identifier sources
 

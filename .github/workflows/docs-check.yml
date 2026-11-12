@@ -100,11 +100,8 @@ jobs:
       # Every Hermes cron job is migrating to profiles and dispatch (#4685),
       # and its plan is one row of the scheduling inventory. A pull request
       # that adds, removes, or changes a roster job's schedule, script,
-      # no_agent or deliver has to update that row (#5626). On a push to main
-      # BASE_REF is empty and only the job-to-row comparison runs.
+      # no_agent or deliver has to update that row (#5626). The script reads
+      # its comparison base from the event; on a push to main only the
+      # job-to-row comparison runs.
       - name: Cron roster changes update the scheduling inventory
-        env:
-          BASE_REF: ${{ github.base_ref }}
-        run: |
-          if [ -n "$BASE_REF" ]; then git fetch --no-tags origin "$BASE_REF"; fi
-          make docs-check-cron-inventory
+        run: make docs-check-cron-inventory

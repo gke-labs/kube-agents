@@ -8,9 +8,11 @@ fails:
 
 - always, when a roster job has no inventory row, or a row names a job no roster
   has;
-- on a pull request (a base ref given, or BASE_REF in the environment), when a
-  job is added, removed, or has its schedule, script, no_agent or deliver changed
-  and its inventory row didn't change with it.
+- on a pull request or in the merge queue (or locally, against upstream/main or
+  origin/main, or a --base you name), when a job is added, removed, or has its
+  schedule, script, no_agent or deliver changed and its inventory row didn't
+  change with it. On a push to main only the first check runs, since the pull
+  request already ran the second.
 
 A job moving between the two rosters, or a change to a field the inventory doesn't
 track (its prompt, say), needs no row change. Each failure names the job and the
@@ -33,6 +35,15 @@ CHAT_ROSTER = "agents/chat/defaults/cron/jobs.json"
 PLATFORM_ROSTER = "agents/platform/cron/jobs.json"
 INVENTORY = "docs/designs/scheduling-on-profiles-inventory.md"
 ROSTERS = (CHAT_ROSTER, PLATFORM_ROSTER)
+
+# How the run finds the commit it compares with (as check_upgrade_table_releases.py does), so the
+# workflow step stays one `make` line (tests/test_docs_check_workflow.py).
+EVENT_NAME_ENV = "GITHUB_EVENT_NAME"
+EVENT_PATH_ENV = "GITHUB_EVENT_PATH"
+PUSH_EVENT = "push"
+PULL_REQUEST_EVENT = "pull_request"
+MERGE_GROUP_EVENT = "merge_group"
+LOCAL_BASE_REFS = ("upstream/main", "origin/main")
 
 # A row of an inventory table: its first cell is the job ID in backticks.
 ROW = re.compile(r"^\|\s*`([^`]+)`\s*\|")
@@ -131,6 +142,25 @@ def check(root: Path, base: str | None) -> list[str]:
     return problems
 
 
+def comparison_base(root: Path, env) -> str | None:
+    """The commit this run compares with, or None for the static check alone."""
+    event = env.get(EVENT_NAME_ENV, "")
+    if event == PUSH_EVENT:
+        return None
+    if event in (PULL_REQUEST_EVENT, MERGE_GROUP_EVENT):
+        # A pull request runs on its merge commit, whose first parent is the base it merges into.
+        if event == PULL_REQUEST_EVENT and len(_git(root, "rev-list", "--parents", "-n", "1", "HEAD").split()) > 2:
+            return _git(root, "rev-parse", "HEAD^1").strip()
+        payload = json.loads(Path(env.get(EVENT_PATH_ENV, "")).read_text(encoding="utf-8"))
+        if event == MERGE_GROUP_EVENT:
+            return payload["merge_group"]["base_sha"]
+        return payload["pull_request"]["base"]["sha"]
+    for ref in LOCAL_BASE_REFS:
+        if subprocess.run(["git", "rev-parse", "--verify", "-q", ref], cwd=root, capture_output=True).returncode == 0:
+            return _git(root, "merge-base", "HEAD", ref).strip()
+    return None
+
+
 def _read(path: Path) -> str | None:
     try:
         return path.read_text(encoding="utf-8")
@@ -150,12 +180,12 @@ def _show(root: Path, ref: str, rel: str) -> str | None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--root", default=str(Path(__file__).resolve().parents[1]))
-    parser.add_argument("--base", default=None, help="the ref a pull request merges into (default: origin/$BASE_REF)")
+    parser.add_argument("--base", default=None,
+                        help="the ref to compare with (default: the GitHub event's base, else upstream/main or origin/main)")
     args = parser.parse_args(argv)
-    base = args.base
-    if base is None and os.environ.get("BASE_REF", "").strip():
-        base = "origin/" + os.environ["BASE_REF"].strip()
-    problems = check(Path(args.root), base)
+    root = Path(args.root)
+    base = args.base if args.base is not None else comparison_base(root, os.environ)
+    problems = check(root, base)
     for problem in problems:
         print(problem, file=sys.stderr)
     if problems:

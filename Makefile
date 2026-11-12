@@ -889,7 +889,7 @@ docs-check-generated:
 docs-check-links:
 	@python3 scripts/check_docs_links.py
 
-docs-check-cron-inventory: ## Fail when a cron roster job has no row in docs/designs/scheduling-on-profiles-inventory.md, or (with BASE_REF set, as on a pull request) a roster change didn't update its row (#5626).
+docs-check-cron-inventory: ## Fail when a cron roster job has no row in docs/designs/scheduling-on-profiles-inventory.md, or (on a pull request, the merge queue, or locally against main) a roster change didn't update its row (#5626).
 	@python3 scripts/check_cron_inventory.py
 
 docs-check-terminology:
