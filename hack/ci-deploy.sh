@@ -389,6 +389,15 @@ readonly CHART_CRD_DIR="charts/kube-agents/crds/"
 # operator to clear its finalizer before uninstallation. Matches
 # charts/kube-agents/values.yaml cleanupHook.timeout (120s).
 readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
+# The NATS StatefulSet mode: next renders, and the claims its
+# volumeClaimTemplates materialise, <template>-<statefulset>-<ordinal>
+# (a2aNATSName and a2aNATSDataClaim in platformagent_a2a_manifests.go). A
+# claim left by an earlier lease pins its server to the old disk's zone, where
+# topology spread can leave it unschedulable (#5658); 5b″ deletes such claims
+# while no StatefulSet owns them. The delete is bounded like the teardown's.
+readonly A2A_NATS_STATEFULSET_NAME="${PLATFORM_AGENT_CR_NAME}-a2a-nats"
+readonly A2A_NATS_CLAIM_NAME_RE="^persistentvolumeclaim/data-${A2A_NATS_STATEFULSET_NAME}-[0-9]+\$"
+readonly A2A_NATS_CLAIM_DELETE_TIMEOUT="60s"
 # The Prow jobs that deploy under the flag with no PULL_NUMBER: the
 # merge-blocking presubmit in a batch Tide ran (it grades next since next became
 # the mode new installs get, #2007, "The cutover itself"); the main nightly's
@@ -2099,6 +2108,41 @@ fi
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Applying the chart's CRDs (server-side) ==="
 kubectl apply --server-side --force-conflicts -f "${SCRIPT_DIR}/../${CHART_CRD_DIR}" >/dev/null
 echo "✓ CRDs applied from ${CHART_CRD_DIR}"
+
+# ─── 5b″. Delete NATS claims no StatefulSet owns ───────────────────────────
+# Teardown deletes them (hack/ci-teardown.sh Step 6), but a pool project that
+# already holds one, or a run killed before its teardown, would fail this
+# deploy's NATS gate on it. With no StatefulSet the claims are unowned and
+# unmounted; with one, they are its data and stay. Never fatal: a failure here
+# leaves the run where it was, and the NATS gate reports it.
+delete_orphaned_nats_claims() {
+  local sts claims
+  if ! sts="$(kubectl get statefulset "${A2A_NATS_STATEFULSET_NAME}" -n "${NAMESPACE}" \
+    --ignore-not-found -o name 2>&1)"; then
+    echo "WARNING: could not check for statefulset/${A2A_NATS_STATEFULSET_NAME} (${sts}); leaving any NATS claims in place."
+    return 0
+  fi
+  if [ -n "${sts}" ]; then
+    echo "statefulset/${A2A_NATS_STATEFULSET_NAME} exists; leaving its claims in place."
+    return 0
+  fi
+  if ! claims="$(kubectl get persistentvolumeclaims -n "${NAMESPACE}" -o name 2>&1)"; then
+    echo "WARNING: could not list claims in ${NAMESPACE} (${claims}); leaving any NATS claims in place."
+    return 0
+  fi
+  claims="$(grep -E "${A2A_NATS_CLAIM_NAME_RE}" <<<"${claims}" || true)"
+  if [ -z "${claims}" ]; then
+    return 0
+  fi
+  while IFS= read -r claim; do
+    echo "WARNING: ${claim} outlived its StatefulSet (a previous lease left it, #5658); deleting it."
+    if ! kubectl delete -n "${NAMESPACE}" "${claim}" --ignore-not-found \
+      --timeout="${A2A_NATS_CLAIM_DELETE_TIMEOUT}"; then
+      echo "WARNING: could not delete ${claim}; the NATS server that mounts it may not schedule."
+    fi
+  done <<<"${claims}"
+}
+delete_orphaned_nats_claims
 
 # ─── 5c. Deploy the chart ─────────────────────────────────────────────────────
 # Named in the build log so a run's dispatcher behaviour can be read against

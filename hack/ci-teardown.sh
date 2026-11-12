@@ -18,7 +18,8 @@
 # *with the part-of label*
 # — because a run killed mid-install leaves objects with no Helm release record
 # for `helm uninstall` to act on, and Helm then refuses to adopt them on the
-# project's next lease (#1006). Step 5 names the kinds the label cannot reach.
+# project's next lease (#1006). Step 5 names the kinds the label cannot reach,
+# and Step 6 deletes the NATS claims among them by name.
 #
 # Step 0 asks Boskos whether the project is still this run's before any of
 # it: a run that outlived its lease finds its project free or leased to
@@ -56,7 +57,7 @@ readonly SECRET_NAME_PREFIX_RE='^secret/'
 # defaults to waiting forever, and deleting a CRD blocks on
 # customresourcecleanup.apiextensions.k8s.io until every CR of that kind is
 # gone — which a PlatformAgent finalizer no live operator can clear never is.
-# Unbounded, that hangs teardown until Prow's job timeout and Steps 4 and 5
+# Unbounded, that hangs teardown until Prow's job timeout and Steps 4 to 6
 # never run, leaving exactly the orphans they exist to sweep. Five minutes is
 # well clear of the 206s a healthy-but-slow delete has been observed to take.
 readonly CHART_CRD_DIR="charts/kube-agents/crds/"
@@ -73,12 +74,19 @@ readonly BENCH_PLANT_SWEEP_SCRIPT="${CI_TEARDOWN_BENCH_SWEEP_SCRIPT:-hack/ci_swe
 # overrides, and the step tests lift `readonly ` head lines along.
 readonly CI_TEARDOWN_STRICT="${CI_TEARDOWN_STRICT:-0}"
 
-# Bounds for the sweep deletes in Steps 4 and 5 (Steps 2 and 3 carry their
+# Bounds for the sweep deletes in Steps 4 to 6 (Steps 2 and 3 carry their
 # own budgets above). --timeout bounds the wait-for-deletion phase; the
 # request timeout bounds each API call, the phase an unreachable control
 # plane hangs — where the 2026-09-01 incident spent 546s.
 readonly SWEEP_DELETE_TIMEOUT="${CI_TEARDOWN_SWEEP_TIMEOUT:-60s}"
 readonly KUBECTL_REQUEST_TIMEOUT="${CI_TEARDOWN_KUBECTL_REQUEST_TIMEOUT:-30s}"
+# Step 6: the claims the NATS StatefulSet's volumeClaimTemplates materialise
+# under mode: next, <template>-<statefulset>-<ordinal>. The template name is
+# a2aNATSDataClaim and the StatefulSet's a2aNATSName in
+# k8s-operator/internal/controller/platformagent_a2a_manifests.go, for the CR
+# name ci-deploy.sh installs (PLATFORM_AGENT_CR_NAME). Matched whole with an
+# ordinal, so no other claim can match.
+readonly NATS_CLAIM_NAME_RE='^persistentvolumeclaim/data-platform-agent-a2a-nats-[0-9]+$'
 
 # Endpoint and owner convention the Prow wrapper leases with
 # (BOSKOS_OWNER="${JOB_NAME}-${BUILD_ID}", oss-test-infra
@@ -311,7 +319,7 @@ if RELEASE_RECORD_NAMES="$(kubectl get secret -n "${NAMESPACE}" \
     CRD_STEP_RESULT="deleted"
   else
     # Bounded rather than hung: the CRDs may be left Terminating, which the
-    # next lease's fresh install can still collide with, but Steps 4 and 5
+    # next lease's fresh install can still collide with, but Steps 4 to 6
     # now run and the log says which happened.
     echo "WARNING: the CRD delete did not finish within ${CRD_DELETE_TIMEOUT}; continuing so the sweeps still run (#1172)"
     CRD_STEP_RESULT="delete timed out or failed after ${CRD_DELETE_TIMEOUT}"
@@ -414,10 +422,12 @@ echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 5: Sweeping namespaced kube-ag
 #
 # The claims the operator creates itself are labelled and swept; the ones it
 # materialises from a StatefulSet's volumeClaimTemplates are not, because that
-# ObjectMeta carries a name and nothing else. That is hindsight's claim and any
-# RWO custom storage, and deleting the StatefulSet leaves them behind — no
-# selector reaches either. PVCs sweep last so the workloads releasing them are
-# already deleted, or kubernetes.io/pvc-protection holds the delete open.
+# ObjectMeta carries a name and nothing else. That is hindsight's claim, any
+# RWO custom storage and the NATS JetStream claims, and deleting the
+# StatefulSet leaves them behind — no selector reaches them. Step 6 deletes
+# the NATS claims by name; hindsight's and custom storage are still left.
+# PVCs sweep last so the workloads releasing them are already deleted, or
+# kubernetes.io/pvc-protection holds the delete open.
 SWEEP_NAMESPACED_KINDS=(
   deployments.apps
   statefulsets.apps
@@ -436,6 +446,33 @@ SWEEP_NAMESPACED_KINDS=(
   persistentvolumeclaims
 )
 sweep_kinds "Namespaced sweep" "${NAMESPACE}" "${SWEEP_NAMESPACED_KINDS[@]}"
+
+STEP_START=$SECONDS
+echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 6: Deleting the NATS JetStream claims ==="
+# A leftover claim's zonal disk pins its NATS server to one zone, and the next
+# mode: next install's topology spread can rule that zone out, so the server
+# never schedules and the deploy fails before any case runs (#5658). Listed
+# and matched by name because the claims carry no labels (Step 5's comment);
+# after Step 5, so the StatefulSet that mounts them is already gone. Its pods
+# may still be in their grace period, holding kubernetes.io/pvc-protection, so
+# the delete does not wait: a claim marked deleted goes once its pod does.
+# Failures are counted like the sweeps' and never fatal.
+nats_claims_failed=0
+nats_claims_total=0
+if nats_claims_out="$(kubectl get persistentvolumeclaims -n "${NAMESPACE}" -o name \
+  --request-timeout="${KUBECTL_REQUEST_TIMEOUT}" 2>&1)"; then
+  while IFS= read -r claim; do
+    nats_claims_total=$((nats_claims_total + 1))
+    if ! kubectl delete -n "${NAMESPACE}" "${claim}" --ignore-not-found --wait=false \
+      --request-timeout="${KUBECTL_REQUEST_TIMEOUT}" 2>&1; then
+      nats_claims_failed=$((nats_claims_failed + 1))
+    fi
+  done < <(grep -E "${NATS_CLAIM_NAME_RE}" <<<"${nats_claims_out}" || true)
+else
+  echo "${nats_claims_out}"
+  nats_claims_failed=1
+fi
+finish_step "NATS claim delete (${nats_claims_failed} failed of ${nats_claims_total} found)" "${nats_claims_failed}"
 
 TOTAL_DURATION=$((SECONDS - START_TIME))
 if [ "${FAILED_STEPS}" -eq 0 ]; then
