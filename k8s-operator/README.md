@@ -359,7 +359,9 @@ When modifying or deprecating RBAC roles or rolebindings in the operator:
    than into the ClusterRole; the Secret write verbs are the one such marker, and
    `tests/test_operator_secrets_grant.py` refuses them anywhere else. Add the verbs to
    `requiredPermissions` in `rbac_selfcheck.go` too, with `Namespaced: true` for a namespaced
-   marker, then `make chart-sync` to copy both documents into the chart.
+   marker, then `make chart-sync` to copy both documents into the chart. Which other write verbs
+   can leave the ClusterRole for a namespaced grant, and in what object, is
+   [`docs/designs/operator-namespaced-write-verbs.md`](../docs/designs/operator-namespaced-write-verbs.md).
 
 ---
 

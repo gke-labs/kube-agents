@@ -12,7 +12,7 @@ The shipping install path targets GKE. You'll need one working GCP project plus 
 - **Terraform** — **1.5 or newer, below 2.0** (the configurations pin `~> 1.5`, which `terraform init` enforces; run from a checkout or release archive, the installer also checks for 1.5.0 before it touches any cloud resource). The install engine is the [`terraform/examples/full-install`](https://github.com/gke-labs/kube-agents/tree/main/terraform/examples/full-install) composition; the installer (`install.sh`) pre-flights `terraform` and offers to install it from HashiCorp's tap (Homebrew) or apt repository. It is equally the _teardown_ engine, and `./uninstall.sh` installs nothing on your behalf — with an install to tear down and no terraform, it refuses with exit 1, so a machine that has only ever run the installer's auto-install cannot tear the install down. (Against a target with no Terraform state there is nothing to destroy, so it exits 3 without needing terraform at all.)
 - **`kubectl`** — [install](https://kubernetes.io/docs/tasks/tools/). The installer points it at the GKE cluster it creates.
 - **Docker or Podman** — required for manual deployments that build images (`make -C k8s-operator docker-build`, Method 2) and the local development workflow (`make dev-rebuild-agent`, Method 3). Not required for stock installs (Methods 0 & 1).
-- **Go** (`1.27+`) — required for development workflows (running tests, building binaries, bootstrapping `controller-gen`/`kustomize` for Method 2). Importing a GitHub App private key (`.pem`) during GitOps installation also needs Go on the host machine, but only `1.21+`: that path builds the Minty CLI, not the operator. Not required if the Cloud KMS key is pre-provisioned, GitOps is not enabled, or the GitOps repository is on GitLab or Gitea.
+- **Go** (`1.27+`) — required for development workflows (running tests, building binaries, bootstrapping `controller-gen`/`kustomize` for Method 2). Importing a GitHub App private key (`.pem`) during GitOps installation also needs Go on the host machine, but only `1.21+`: that path builds the Minty CLI, not the operator. Not required if the Cloud KMS key is pre-provisioned, GitOps is not enabled, or the GitOps repository is on GitLab, Gitea or Bitbucket.
 - **Bash** — the installer scripts are bash (including the `/bin/bash` macOS ships).
 - **`jq`, `gh`, `helm`, `git`, `python3`** — the rest of the CLI set the installer pre-flights up front and offers to install when missing. The installer checks only that these and `kubectl` are present. It holds three tools to a minimum version: gcloud and Terraform, above, and Go 1.21 when it imports a GitHub App key. The `curl … | bash` one-liner skips the gcloud and Terraform checks, because there is no checkout yet to read the minimums from.
 - **`gcloud beta` component** — required when adopting an existing unencrypted cluster for CMEK (`gcloud beta services identity create`) or purging backup plans during teardown (`gcloud beta container backup-restore`). Not required for standard fresh installs.
@@ -146,10 +146,10 @@ Totals by install profile, as the chart's quota preflight sums them (the operato
 | ------- | ---- | ------------ | --------------- | ---------- | ------------- | ----------------------------------- | ------ | ------------------ | -------------------- |
 | `today`, GKE Standard | 9 | 2756m | 12096Mi | 13200m | 25472Mi | 14912Mi / 14912Mi | 4 | 102Gi | — |
 | `today`, GKE Autopilot | 9 | 4256m | 13120Mi | 13200m | 25472Mi | 14912Mi / 14912Mi | 4 | 102Gi | — |
-| `next`, GKE Standard | 20 | 4386m | 15056Mi | 22550m | 32800Mi | 15232Mi / 15232Mi | 7 | 222Gi | 38 |
-| `next`, GKE Autopilot | 20 | 5886m | 16080Mi | 22550m | 32800Mi | 15232Mi / 15232Mi | 7 | 222Gi | 38 |
-| `next` with one NATS server, GKE Standard | 18 | 3766m | 13808Mi | 19450m | 30304Mi | 15104Mi / 15104Mi | 5 | 142Gi | 36 |
-| `next` with Hindsight and the GitHub minter, GKE Standard | 24 | 5236m | 17488Mi | 28550m | 38432Mi | 16Gi / 16Gi | 8 | 230Gi | 44 |
+| `next`, GKE Standard | 20 | 4386m | 15056Mi | 22550m | 32800Mi | 15424Mi / 15424Mi | 7 | 222Gi | 38 |
+| `next`, GKE Autopilot | 20 | 5886m | 16080Mi | 22550m | 32800Mi | 15424Mi / 15424Mi | 7 | 222Gi | 38 |
+| `next` with one NATS server, GKE Standard | 18 | 3766m | 13808Mi | 19450m | 30304Mi | 15168Mi / 15168Mi | 5 | 142Gi | 36 |
+| `next` with Hindsight and the GitHub minter, GKE Standard | 24 | 5236m | 17488Mi | 28550m | 38432Mi | 16576Mi / 16576Mi | 8 | 230Gi | 44 |
 
 The session quota is `spec.harness.tuning.maxSessions` (10 by default) plus the pods the operator runs for the agent, the chart's pods in the namespace with their rollout surges (5 when the operator cannot read the chart's count), and a margin of 7 for the operator's rollout surges, its Jobs and the gateway's count-then-create overshoot.
 
@@ -157,7 +157,7 @@ Under `spec.mode: next`, per pod:
 
 | Workload | Pods | CPU request | Memory request | CPU limit | Memory limit | Ephemeral storage request / limit | Runs |
 | -------- | ---- | ----------- | -------------- | --------- | ------------ | --------------------------------- | ---- |
-| NATS server | 3 | 310m | 624Mi | 1550m | 1248Mi | 64Mi / 64Mi | Standing, each on its own node, with one JetStream claim each (40Gi); one with `spec.harness.tuning.busReplicas: 1` |
+| NATS server | 3 | 310m | 624Mi | 1550m | 1248Mi | 128Mi / 128Mi | Standing, each on its own node, with one JetStream claim each (40Gi); one with `spec.harness.tuning.busReplicas: 1` |
 | Auth callout | 2 | 50m | 64Mi | 500m | 256Mi | — | Standing |
 | Capability verifier | 2 | 50m | 64Mi | 500m | 256Mi | — | Standing |
 | A2A gateway | 2 | 50m | 64Mi | 500m | 512Mi | — | Standing; one fewer with the operator's `A2A_GATEWAY_ELECTION=false` |
@@ -308,7 +308,7 @@ Or route one of these keys through a self-hosted LiteLLM gateway — see [`examp
 
 ## GitOps repo & GitHub token minter (for `submit-suggestion`)
 
-This section is for a GitOps repository on GitHub only. For GitLab, see [GitOps repo on GitLab](#gitops-repo-on-gitlab); for Gitea, see [GitOps repo on Gitea](#gitops-repo-on-gitea).
+This section is for a GitOps repository on GitHub only. For GitLab, see [GitOps repo on GitLab](#gitops-repo-on-gitlab); for Bitbucket, see [GitOps repo on Bitbucket](#gitops-repo-on-bitbucket); for Gitea, see [GitOps repo on Gitea](#gitops-repo-on-gitea).
 
 The declarative workflow routes infrastructure mutations through pull requests via the GitHub token minter (Minty). When GitOps is enabled, prepare:
 
@@ -333,6 +333,18 @@ When the GitOps repository is on GitLab (gitlab.com or a self-managed instance),
 - **Certificate:** a self-managed instance must present a certificate that the broker trusts. See [Before you start](/kube-agents/install/gitlab/#before-you-start).
 
 See [GitLab as the GitOps forge](/kube-agents/install/gitlab/) for the installer flags and where the token goes.
+
+## GitOps repo on Bitbucket
+
+When the GitOps repository is on Bitbucket Cloud or on a Bitbucket Data Center instance, you need none of the GitHub items above: a Bitbucket install has no GitHub App, no token minter and no Cloud KMS key. Prepare these:
+
+- **Bitbucket repository:** the GitOps repository, created before the install, with one commit on its default branch. Note its path: `workspace/repo-slug` on Cloud, `PROJECTKEY/repo-slug` on Data Center.
+- **Token:** on Cloud, the API token (with scopes) of an account that exists only for this install, a workspace access token (Premium), or a repository access token for an install with one repository. On Data Center, a project HTTP access token with Repository write.
+- **Identity:** a Cloud workspace, project or repository access token needs the account UUID that it acts as.
+- **Network access:** the credential broker pod must reach `bitbucket.org` and `api.bitbucket.org`, or the Data Center host, over HTTPS on port 443. A Data Center instance must serve at the root path on port 443.
+- **Certificate:** a Data Center instance behind a private CA needs the CA's PEM file.
+
+See [Bitbucket as the GitOps forge](/kube-agents/install/bitbucket/) for the installer flags and where the token goes.
 
 ## GitOps repo on Gitea
 

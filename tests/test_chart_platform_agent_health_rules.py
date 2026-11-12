@@ -34,6 +34,7 @@ _AT_RISK = {
     "KubeAgentsChatTurnsErroring",
     "KubeAgentsBrokerFailing",
     "KubeAgentsBackgroundTasksGivingUp",
+    "KubeAgentsSlackDisconnected",
 }
 _FRICTION = {
     "KubeAgentsStalledOnboarding",
@@ -44,6 +45,12 @@ _FRICTION = {
     "KubeAgentsScrapeBroken",
 }
 _SCRAPE_ALERT = "KubeAgentsScrapeBroken"
+_SLACK_ALERT = "KubeAgentsSlackDisconnected"
+_A2A_METRICS_GO = _REPO_ROOT / "a2a" / "gateway" / "metrics.go"
+# Thresholds added after the schema's required list, which the template
+# defaults instead, so `helm upgrade --reuse-values` from a release without
+# them keeps rendering.
+_OPTIONAL_THRESHOLDS = {"slackDisconnectedFor"}
 _READING = "kubeagents:platformagent:usage_reading:max"
 
 
@@ -126,6 +133,8 @@ class HealthRulesRenderTest(unittest.TestCase):
             if name == _SCRAPE_ALERT:
                 self.assertIn("up{", rule["expr"], name)
                 continue
+            if name == _SLACK_ALERT:
+                continue
             self.assertIn(_GAUGE_PREFIX, _expand(rule["expr"], records), name)
             self.assertIn(_GROUPING, rule["expr"], f"{name} does not group by the agent's labels")
 
@@ -167,6 +176,41 @@ class HealthRulesRenderTest(unittest.TestCase):
         self.assertTrue(jobs)
         for job in jobs:
             self.assertIn(job, expr, f"the scrape alert does not watch {job}")
+
+    def test_the_slack_alert_reads_the_a2a_gateways_gauge_by_its_scrape_job(self):
+        """The series name is hand-copied from the gateway's metrics.go, and the job
+        is the chart's A2A gateway PodMonitoring; a `max` keeps a standby, which
+        serves no sample, and a stale old pod from deciding it."""
+        import re
+
+        go = _A2A_METRICS_GO.read_text()
+        consts = dict(re.findall(r'^\s*(metricsNamespace|metricsSubsystem|slackConnectedName)\s*=\s*"([a-z_0-9]+)"', go, re.MULTILINE))
+        series = "_".join((consts["metricsNamespace"], consts["metricsSubsystem"], consts["slackConnectedName"]))
+        docs = _render(*_ON, "--set", "platformAgent.healthRules.thresholds.slackDisconnectedFor=7m")
+        agent = next(d for d in docs if d.get("kind") == "PlatformAgent")["metadata"]["name"]
+        job = f"{agent}-a2a-gateway-monitoring"
+        self.assertIn(job, {d["metadata"]["name"] for d in docs if d.get("kind") == "PodMonitoring"})
+        rule = _alerts(_rules(docs)[0])[_SLACK_ALERT]
+        self.assertEqual(f'max by (namespace, job) (max_over_time({series}{{job="{job}"}}[7m])) == 0', rule["expr"])
+        self.assertIn("7m", rule["annotations"]["summary"])
+
+    # promtool is on neither the host nor the CI image, so the gappy series is
+    # held by the rule's text: the window carries the threshold and the `for`
+    # stays short, since a `for` over an instant value resets at every gap in
+    # the series (a missed scrape, a rescheduled pod).
+    def test_the_slack_alert_survives_a_gappy_series(self):
+        rule = _alerts(_rules(_render(*_ON))[0])[_SLACK_ALERT]
+        self.assertIn("max_over_time(", rule["expr"])
+        self.assertIn("[5m]", rule["expr"])
+        self.assertEqual("1m", rule["for"])
+
+    def test_a_thresholds_block_without_the_slack_window_still_renders(self):
+        """What `--reuse-values` from an older release hands the template: the key
+        absent. A null in --set deletes it from the merged values."""
+        docs = _render(*_ON, "--set", "platformAgent.healthRules.thresholds.slackDisconnectedFor=null")
+        rule = _alerts(_rules(docs)[0])[_SLACK_ALERT]
+        self.assertIn("[5m]", rule["expr"])
+        self.assertEqual("5m", yaml.safe_load((_CHART / "values.yaml").read_text())["platformAgent"]["healthRules"]["thresholds"]["slackDisconnectedFor"], "the template's default and values.yaml's must agree")
 
     def test_the_scrape_alert_watches_the_exec_tier_only_while_it_renders(self):
         exec_set = ["--set", "platformAgent.deployment.credentialProxy.exec.replicas=2"]
@@ -258,6 +302,14 @@ class HealthRulesRenderTest(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(subprocess.CalledProcessError):
                 _render(*_ON, "--set", f"platformAgent.healthRules.thresholds.ratiosFor={bad}")
 
+    def test_the_slack_window_refuses_a_zero_duration(self):
+        """`[0s]` is no PromQL range, so Managed Prometheus would refuse the whole rule."""
+        for bad in ("0s", "0m", "00m", "0h0m"):
+            with self.subTest(bad=bad), self.assertRaises(subprocess.CalledProcessError):
+                _render(*_ON, "--set", f"platformAgent.healthRules.thresholds.slackDisconnectedFor={bad}")
+        rule = _alerts(_rules(_render(*_ON, "--set", "platformAgent.healthRules.thresholds.slackDisconnectedFor=1h0m"))[0])[_SLACK_ALERT]
+        self.assertIn("[1h0m]", rule["expr"])
+
     def test_metric_names_and_fields_are_the_operators(self):
         """The template hand-copies the gauge families and field names; hold them to
         the operator's declarations in usage_gauges.go."""
@@ -299,7 +351,7 @@ class HealthRulesRenderTest(unittest.TestCase):
         declared = set(yaml.safe_load((_CHART / "values.yaml").read_text())["platformAgent"]["healthRules"]["thresholds"])
         read = set(re.findall(r"\$t\.([A-Za-z0-9]+)", (_CHART / "templates" / "platform-agent-health-rules.yaml").read_text()))
         self.assertEqual(declared, set(thresholds["properties"]), "schema properties differ from values.yaml")
-        self.assertEqual(declared, set(thresholds["required"]), "every threshold is required when the rules are on")
+        self.assertEqual(declared - _OPTIONAL_THRESHOLDS, set(thresholds["required"]), "every threshold but the defaulted ones is required when the rules are on")
         self.assertEqual(read, declared, "the template reads a threshold values.yaml does not declare, or declares one it never reads")
 
     def test_no_increase_remains_on_a_reading_field(self):

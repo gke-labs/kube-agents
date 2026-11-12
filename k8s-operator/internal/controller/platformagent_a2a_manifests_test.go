@@ -9090,7 +9090,7 @@ func TestTheNATSExporterIsHardened(t *testing.T) {
 			if sc.Privileged != nil && *sc.Privileged {
 				t.Error("exporter is privileged")
 			}
-			for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory} {
+			for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory, corev1.ResourceEphemeralStorage} {
 				if _, ok := exporter.Resources.Requests[name]; !ok {
 					t.Errorf("exporter has no %s request", name)
 				}
