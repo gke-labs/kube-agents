@@ -459,8 +459,11 @@ READ_FILE_ERROR_KEY = "error"
 READ_FILE_NOT_FOUND_PREFIX = "File not found:"
 SIMILAR_FILES_KEY = "similar_files"
 # A dropped file's name counts in an answer where no word character, `.` or `-`
-# comes before it and no word character or `-` follows it.
-DROPPED_FILE_BEFORE = r"(?<![\w.-])"
+# comes before it and no word character or `-` follows it. A JSON escape
+# (`\n`, `\t`, `\r`) also counts as a boundary before it: a tool call's
+# `arguments` is a JSON string, so a name starting a line of a `write_file`'s
+# content is written `...\nINVENTORY.md`, with a word character before it.
+DROPPED_FILE_BEFORE = r"(?:(?<![\w.-])|(?<=\\[ntr]))"
 DROPPED_FILE_AFTER = r"(?![\w-])"
 
 # A string that may hold a JSON document (a tool result usually does).

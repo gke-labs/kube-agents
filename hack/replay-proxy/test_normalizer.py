@@ -1012,7 +1012,11 @@ class SimilarFilesTest(unittest.TestCase):
 
     def test_a_dropped_file_counts_against_an_answer_by_its_name(self):
         mapping = normalizer.normalize_request(read_file_conversation(not_found(similar=self.WITH_INVENTORY)), NOW).mapping
-        for answer in ('{"path": "/opt/data/INVENTORY.md"}', "cd /opt/data && cat INVENTORY.md", "SETTINGS.md."):
+        # A tool call's arguments are a JSON string: a name starting a line follows an escaped `\n`.
+        escaped = json.dumps({"content": "Files:\nINVENTORY.md lists the fleet\n\tSETTINGS.md\r\nINVENTORY.raw.md"})
+        for answer in ('{"path": "/opt/data/INVENTORY.md"}', "cd /opt/data && cat INVENTORY.md", "SETTINGS.md.",
+                       escaped, json.dumps({"content": "x\nINVENTORY.md"}), json.dumps({"content": "x\tSETTINGS.md"}),
+                       json.dumps({"content": "x\rSETTINGS.md"})):
             with self.subTest(answer=answer):
                 self.assertTrue(mapping.answer_names_dropped_file(answer))
         self.assertEqual(mapping.dropped_files, {"INVENTORY.md", "INVENTORY.raw.md", "SETTINGS.md"})
