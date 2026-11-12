@@ -355,7 +355,11 @@ type TaskRef struct {
 	// the child takes ActiveTask, and with it the only other copy, so the
 	// parent's line is kept here to close on the parent's terminal. A batch
 	// child, which never takes ActiveTask, keeps its own line here too.
-	StatusMsgID  string   `json:"statusMsgId,omitempty"`
+	StatusMsgID string `json:"statusMsgId,omitempty"`
+	// LineNote is a batch child's "(delegated to <addressee>)" note, kept
+	// with its line because the child never holds the active task, whose
+	// LineNote the single-child path reads.
+	LineNote     string   `json:"lineNote,omitempty"`
 	Role         string   `json:"role,omitempty"`
 	ParentTaskID string   `json:"parentTaskId,omitempty"`
 	Children     []string `json:"children,omitempty"`

@@ -3174,7 +3174,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		ref.RootTaskID = taskID
 	}
 	if ts.KeepActive {
-		ref.StatusMsgID = statusMsgID
+		ref.StatusMsgID, ref.LineNote = statusMsgID, ts.LineNote
 	}
 	if ts.Role == "" {
 		ref.Request = capAsk(strings.TrimSpace(ts.Text))

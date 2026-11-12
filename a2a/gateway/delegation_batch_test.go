@@ -533,3 +533,34 @@ func TestAWithdrawnChildWhoseCancelFailedStaysOnRecord(t *testing.T) {
 		t.Fatal("no stop record for the kept child")
 	}
 }
+
+// TestABatchChildsFinishedLineKeepsItsNote: a batch child's rolling line
+// carries "(delegated to <addressee>)" from its placeholder through its
+// terminal edit, so closed sibling lines can still be told apart.
+func TestABatchChildsFinishedLineKeepsItsNote(t *testing.T) {
+	r, spawn := startBatchRig(t, 2)
+	ctx := context.Background()
+	conv := "discord:g1/t-batch-note"
+	exec, _, _ := sessionTurn(t, r, spawn, conv, "check two things")
+	if err := exec.PublishArtifact(ctx, delegateBatchArtifact(t, platformTask("one"), platformTask("two"))); err != nil {
+		t.Fatal(err)
+	}
+	first := awaitSubmission(t, r, targetPlatform, 0)
+	awaitSubmission(t, r, targetPlatform, 1)
+	note := fmt.Sprintf(delegatedProfileLineNote, targetPlatform)
+	if targetPlatform == "platform" {
+		note = delegatedLineNote
+	}
+	child := r.execFor(t, first, targetPlatform)
+	if err := child.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the child's line closed with its note", func() bool {
+		for _, e := range r.adapter.editTexts() {
+			if strings.HasPrefix(e, terminalLine(lib.StateCompleted, "")) && strings.HasSuffix(e, " "+note) {
+				return true
+			}
+		}
+		return false
+	})
+}
