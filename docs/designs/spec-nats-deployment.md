@@ -34,6 +34,12 @@ routes Service on 6222, authenticated to each other by mutual TLS under the bus 
 a hostname topology spread keep one drain to one server, and a lame-duck `preStop` moves
 clients off a stopping server rather than dropping them.
 
+**Amended 11/12 (#5708):** the serving certificate also names `<bus>-route0`, `-route1` and
+`-route2`, the per-server route Services a later change dials. A route checks its peer against
+the name it dialled. If the certificate and the route list changed in one roll, a server
+already on the new routes would be refused by a peer still serving the old certificate.
+Naming them a release ahead makes the later switch a config change alone.
+
 **Changing the server count empties the bus.** A server that restarts in cluster mode
 finds its standalone streams unassigned in the new metadata layer and deletes them as
 orphans; going back, a standalone server refuses to load an R3 stream. Either way the

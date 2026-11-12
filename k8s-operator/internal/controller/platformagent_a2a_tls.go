@@ -174,11 +174,17 @@ var a2aNATSServingExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x
 // The routes names are what a server checks its peer against on a cluster
 // route (renderA2ANATSCluster), including the peers it reaches by IP. They
 // are on every certificate, single server or not, so changing busReplicas
-// does not reissue the certificate and roll the bus a second time.
+// does not reissue the certificate and roll the bus a second time. So are
+// each server's own route name (a2aNATSRouteName), for every server the bus
+// could run, ahead of routes that dial them.
 func a2aNATSDNSNames(agent *agentv1alpha1.PlatformAgent) []string {
 	ns := agent.Namespace
 	var names []string
-	for _, svc := range []string{a2aNATSName(agent), a2aNATSRoutesName(agent)} {
+	svcs := []string{a2aNATSName(agent), a2aNATSRoutesName(agent)}
+	for i := range a2aNATSMaxReplicas {
+		svcs = append(svcs, a2aNATSRouteName(agent, i))
+	}
+	for _, svc := range svcs {
 		names = append(names, svc, svc+"."+ns, svc+"."+ns+".svc", svc+"."+ns+".svc."+a2aNATSClusterDomain)
 	}
 	return names

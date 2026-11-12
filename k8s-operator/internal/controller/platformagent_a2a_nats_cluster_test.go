@@ -302,6 +302,11 @@ func TestTheServingCertificateCoversTheRoutesAndClientAuth(t *testing.T) {
 	for _, want := range []string{
 		a2aNATSRoutesName(agent) + "." + agent.Namespace + ".svc." + a2aNATSClusterDomain,
 		a2aNATSName(agent) + "." + agent.Namespace + ".svc." + a2aNATSClusterDomain,
+		// Each server's own route name, the one a route by name dials and
+		// checks, for every server a bus can run.
+		a2aNATSRouteName(agent, 0) + "." + agent.Namespace + ".svc",
+		a2aNATSRouteName(agent, 1) + "." + agent.Namespace + ".svc",
+		a2aNATSRouteName(agent, 2) + "." + agent.Namespace + ".svc",
 	} {
 		if !slices.Contains(names, want) {
 			t.Errorf("serving SANs lack %q: %v", want, names)
@@ -1935,5 +1940,16 @@ func TestAClusterRollsOntoAProfileChangeInsteadOfReloading(t *testing.T) {
 	}
 	if plan != (a2aBusReload{}) || desired.Annotations[a2aBusReloadRequestedAnnotation] != "" {
 		t.Errorf("a cluster's reload plan = %+v, annotations %v; want nothing tracked", plan, desired.Annotations)
+	}
+}
+
+// A server's own route name is no longer than the routes Service's, so no
+// agent name that fits the routes Service is too long for it.
+func TestARouteNameFitsWhereTheRoutesServiceDoes(t *testing.T) {
+	agent := a2aTestAgent()
+	for i := range a2aNATSMaxReplicas {
+		if got := a2aNATSRouteName(agent, i); got != a2aNATSName(agent)+"-route"+strconv.Itoa(i) || len(got) > len(a2aNATSRoutesName(agent)) {
+			t.Errorf("route name %d = %q, want %s-route%d no longer than %q", i, got, a2aNATSName(agent), i, a2aNATSRoutesName(agent))
+		}
 	}
 }
