@@ -11,7 +11,8 @@ import (
 // Answer feedback on Google Chat (feedback.go): two rating buttons, 👍 then
 // 👎, at the end of the final answer's one button list, after its choice and
 // link buttons. They are drawn only once the gateway has handed over its
-// recorder, and only on an answer in a conversation, never on a home post.
+// recorder: on an answer in a conversation, and on a post the agent made on
+// its own in the home space (an alert, a report, feedback.go).
 // A layout Chat refuses with them is posted once more without them. The
 // buttons each rated message carries are remembered in this process; after
 // a restart a click reads them from the event's copy of the message.
@@ -155,9 +156,10 @@ func gchatRatingButtons(r gchatRating) []map[string]any {
 		}
 		return b
 	}
+	good, bad := feedbackLabels(r.task)
 	return []map[string]any{
-		button(gchatFeedbackUpText, feedbackGoodLabel, FeedbackUp),
-		button(gchatFeedbackDownText, feedbackBadLabel, FeedbackDown),
+		button(gchatFeedbackUpText, good, FeedbackUp),
+		button(gchatFeedbackDownText, bad, FeedbackDown),
 	}
 }
 
@@ -196,6 +198,20 @@ func gchatWithRating(widgets []map[string]any, r gchatRating) []map[string]any {
 		out = append(out, map[string]any{gchatButtonListKey: map[string]any{gchatButtonsKey: gchatRatingButtons(r)}})
 	}
 	return out
+}
+
+// gchatHasRating reports whether widgets already carry rating buttons.
+func gchatHasRating(widgets []map[string]any) bool {
+	for _, w := range widgets {
+		list, _ := w[gchatButtonListKey].(map[string]any)
+		buttons, _ := list[gchatButtonsKey].([]map[string]any)
+		for _, b := range buttons {
+			if gchatButtonFunction(b) == gchatFeedbackFunction {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // classifyGchatButton tells what a decoded button does by its function, or
@@ -344,17 +360,25 @@ func (a *GoogleChatAdapter) postRatedText(conversation string, m OutMessage) (st
 	if !ok {
 		return "", fmt.Errorf("gchat: not a gchat conversation: %q", conversation)
 	}
+	message, _, err := a.createRatedText(space, thread, m)
+	return message, err
+}
+
+// createRatedText creates m's text with the rating buttons in space, as a
+// reply on thread when one is given, and returns the message and the thread
+// it landed in. When Chat refuses the buttons the text is created alone.
+func (a *GoogleChatAdapter) createRatedText(space, thread string, m OutMessage) (message, landed string, err error) {
 	rating := gchatRating{task: m.Feedback}
 	body := map[string]any{"text": toGchatText(m.Text), "accessoryWidgets": gchatWithRating(nil, rating)}
-	message, _, err := a.create(space, thread, body)
+	message, landed, err = a.create(space, thread, body)
 	if err != nil {
 		if errors.Is(gchatLayoutError(err, false), ErrLayoutRefused) {
-			return a.Post(conversation, m.Text)
+			return a.create(space, thread, map[string]any{"text": toGchatText(m.Text)})
 		}
-		return "", err
+		return "", "", err
 	}
 	a.rememberRating(message, rating)
-	return message, nil
+	return message, landed, nil
 }
 
 // feedbackClick takes a tap on a rating button. It is never a turn: it
@@ -543,7 +567,7 @@ func gchatNoteCard(task string, days int, askKept bool) map[string]any {
 			"hintText":   fmt.Sprintf(gchatNoteHint, feedbackNoteChars),
 			"validation": map[string]any{"characterLimit": feedbackNoteChars},
 		}},
-		map[string]any{gchatTextParagraphKey: map[string]any{"text": feedbackKeptText(days, askKept)}},
+		map[string]any{gchatTextParagraphKey: map[string]any{"text": feedbackKeptTextFor(task, days, askKept)}},
 		map[string]any{gchatButtonListKey: map[string]any{gchatButtonsKey: []map[string]any{
 			{"text": feedbackNoteSend, "onClick": gchatNoteAction(task)},
 			{"text": feedbackNoteCancel, "onClick": gchatNoteAction(task,
@@ -559,7 +583,13 @@ func gchatCollapsedCard(text string) map[string]any {
 
 // gchatNoteThanks is the line a kept note collapses its card to.
 func gchatNoteThanks() string {
-	return feedbackThanks(fmt.Sprintf(gchatCardLink, feedbackFormURL, feedbackFormURL))
+	return gchatNoteThanksFor("")
+}
+
+// gchatNoteThanksFor is the line a kept note on the message rated under
+// task collapses its card to.
+func gchatNoteThanksFor(task string) string {
+	return feedbackThanksFor(task, fmt.Sprintf(gchatCardLink, feedbackFormURL, feedbackFormURL))
 }
 
 // createCard posts card in space, on thread when set, private to viewer
@@ -656,7 +686,7 @@ func (a *GoogleChatAdapter) feedbackNoteClick(ev *gchatEvent) string {
 	a.goRewrite(func() {
 		switch {
 		case cancel:
-			a.collapseNoteCard(snapshot, gchatNoteThanks())
+			a.collapseNoteCard(snapshot, gchatNoteThanksFor(task))
 			return
 		case !present:
 			a.log.Warn("gchat: a note Send carried no inputs; the 👎 is kept without a note", "message", snapshot.Message.Name, "taskId", task)
@@ -666,7 +696,7 @@ func (a *GoogleChatAdapter) feedbackNoteClick(ev *gchatEvent) string {
 		err := recorder.Note(rating, gchatNoteText(note))
 		switch {
 		case err == nil:
-			a.collapseNoteCard(snapshot, gchatNoteThanks())
+			a.collapseNoteCard(snapshot, gchatNoteThanksFor(task))
 		case errors.Is(err, errFeedbackNotKept):
 			a.collapseNoteCard(snapshot, gchatNoteReplaced)
 		default:

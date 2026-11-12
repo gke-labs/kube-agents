@@ -2,6 +2,8 @@ package gateway
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -38,6 +40,14 @@ import (
 // 👍 as a good answer to keep. Logs carry ids and the rating, and the metric
 // the platform, the rating and what kind of answer was rated, one count per
 // rating change; neither carries the text.
+//
+// A post the agent made on its own (an alert or a report on the chat.notify
+// route, notify.go) is rated the same way, under an id of its own in place of
+// a task id (postFeedbackTarget): its prefix says what kind of post it was,
+// so the rating is kept with that kind and counted apart from answers
+// (Metrics.postRated), and a 👎 on a noisy alert reads as noise rather than
+// as a bad answer. Such a post answers no question, so its record keeps no
+// ask.
 const (
 	// FeedbackUp and FeedbackDown are the two ratings, as the metric's
 	// rating label and the record carry them.
@@ -80,6 +90,16 @@ const (
 	// feedbackDay converts the bucket's max age to the days the rater is
 	// told it is kept.
 	feedbackDay = 24 * time.Hour
+
+	// feedbackPostAlertPrefix and feedbackPostReportPrefix front the id a
+	// post the agent made on its own is rated under, one per kind. A task
+	// id starts "task-", so neither is ever taken for one. Followed by
+	// feedbackPostIDHex hex digits: a hash of the post's update key when it
+	// has one, so the edit that rewrites the post keeps the same id, and
+	// random otherwise.
+	feedbackPostAlertPrefix  = postKindAlert + "-"
+	feedbackPostReportPrefix = postKindReport + "-"
+	feedbackPostIDHex        = 16
 )
 
 // feedbackRetryInterval is how often the gateway looks again for a feedback
@@ -119,7 +139,9 @@ type FeedbackRating struct {
 	Answer string
 }
 
-// FeedbackRecord is a kept rating, as the feedback bucket holds it.
+// FeedbackRecord is a kept rating, as the feedback bucket holds it. Kind is
+// what the rated post was when the agent made it on its own (postKindAlert,
+// postKindReport), and empty for an answer.
 type FeedbackRecord struct {
 	Rating       string    `json:"rating"`
 	Note         string    `json:"note,omitempty"`
@@ -128,6 +150,7 @@ type FeedbackRecord struct {
 	Conversation string    `json:"conversation"`
 	MessageID    string    `json:"messageId"`
 	TaskID       string    `json:"taskId"`
+	Kind         string    `json:"kind,omitempty"`
 	ContextID    string    `json:"contextId,omitempty"`
 	Ask          string    `json:"ask,omitempty"`
 	Answer       string    `json:"answer,omitempty"`
@@ -313,9 +336,41 @@ func (rec *SessionRecord) markCardsAnswer(taskID string) {
 	}
 }
 
-// Tally counts the ratings kept that were given at or after since, by
-// rating, reading every current record over one watcher rather than a
-// request per key; a record that does not parse is skipped.
+// postFeedbackTarget is the id a post the agent made on its own is rated
+// under, or "" when feedback is off: kind's prefix (postKindAlert,
+// postKindReport) and a hash of key when the post has an update key, so the
+// edit that rewrites it carries the same id, or random hex when it has none.
+func (g *Gateway) postFeedbackTarget(kind, key string) string {
+	if g.feedback.Load() == nil {
+		return ""
+	}
+	prefix := feedbackPostReportPrefix
+	if kind == postKindAlert {
+		prefix = feedbackPostAlertPrefix
+	}
+	if key == "" {
+		return prefix + randHex(feedbackPostIDHex/2)
+	}
+	sum := sha256.Sum256([]byte(key))
+	return prefix + hex.EncodeToString(sum[:])[:feedbackPostIDHex]
+}
+
+// postKindOf is the kind of post id names (postFeedbackTarget), or "" for a
+// task id.
+func postKindOf(id string) string {
+	switch {
+	case strings.HasPrefix(id, feedbackPostAlertPrefix):
+		return postKindAlert
+	case strings.HasPrefix(id, feedbackPostReportPrefix):
+		return postKindReport
+	}
+	return ""
+}
+
+// Tally counts the answer ratings kept that were given at or after since,
+// by rating, reading every current record over one watcher rather than a
+// request per key; a record that does not parse is skipped, and so is the
+// rating of a post the agent made on its own, which is not an answer.
 func (d *feedbackDesk) Tally(ctx context.Context, since time.Time) (up, down int, err error) {
 	kv, err := d.g.client.KV(ctx, lib.FeedbackBucket)
 	if err != nil {
@@ -336,7 +391,7 @@ func (d *feedbackDesk) Tally(ctx context.Context, since time.Time) (up, down int
 				return up, down, nil
 			}
 			var rec FeedbackRecord
-			if json.Unmarshal(entry.Value(), &rec) != nil || rec.RatedAt.Before(since) {
+			if json.Unmarshal(entry.Value(), &rec) != nil || rec.RatedAt.Before(since) || rec.Kind != "" {
 				continue
 			}
 			switch rec.Rating {
@@ -382,18 +437,11 @@ func (d *feedbackDesk) Rate(r FeedbackRating) (bool, error) {
 	// The same root says what answered the ask, for the metric's answer
 	// label; without one it is other.
 	contextID, ask, answer := "", "", metricsLabelOther
-	if session, err := g.reg.Get(ctx, r.Conversation); err != nil {
-		g.log.Warn("answer feedback: the session record could not be read; the rating is kept without its ask", "conversation", r.Conversation, "err", err)
-	} else if session != nil {
-		contextID = session.ContextID
-		if root, ok := session.TaskRefFor(r.TaskID); ok {
-			// As written, line breaks kept: a pasted manifest stays one.
-			ask = root.Request
-			answer = answerReply
-			if root.CardsAnswer {
-				answer = answerCard
-			}
-		}
+	// A post the agent made on its own answers no ask and has no session
+	// record to read one from.
+	kind := postKindOf(r.TaskID)
+	if kind == "" {
+		contextID, ask, answer = g.ratedAsk(ctx, r)
 	}
 	kv, err := g.client.KV(ctx, lib.FeedbackBucket)
 	if err != nil {
@@ -430,6 +478,7 @@ func (d *feedbackDesk) Rate(r FeedbackRating) (bool, error) {
 			Conversation: r.Conversation,
 			MessageID:    r.MessageID,
 			TaskID:       r.TaskID,
+			Kind:         kind,
 			ContextID:    contextID,
 			Ask:          truncateRunes(ask, feedbackAskMax),
 			Answer:       truncateRunes(r.Answer, feedbackAnswerMax),
@@ -443,11 +492,45 @@ func (d *feedbackDesk) Rate(r FeedbackRating) (bool, error) {
 	// changed: a first rating, or a 👍 after a 👎 and the reverse. A repeat
 	// tap of the same rating, or a rating the bucket did not keep, is not.
 	if prior != rating {
-		g.metrics.answerRated(r.Platform, rating, answer)
+		if kind != "" {
+			g.metrics.postRated(r.Platform, rating, kind)
+		} else {
+			g.metrics.answerRated(r.Platform, rating, answer)
+		}
 	}
-	g.log.Info("answer rated", "platform", r.Platform, "rating", r.Rating, "taskId", r.TaskID,
+	what := "answer rated"
+	if kind != "" {
+		what = "post rated"
+	}
+	g.log.Info(what, "platform", r.Platform, "rating", r.Rating, "taskId", r.TaskID, "kind", kind,
 		"conversation", r.Conversation, "kept", true)
 	return askKept, nil
+}
+
+// ratedAsk is what the session record says of the answer r rates: the
+// conversation's context id, the ask that started the rated chain, and what
+// answered it (answerReply, answerCard, or metricsLabelOther when no record
+// names the rated task). Best effort: a reaped session has none of them.
+func (g *Gateway) ratedAsk(ctx context.Context, r FeedbackRating) (contextID, ask, answer string) {
+	answer = metricsLabelOther
+	session, err := g.reg.Get(ctx, r.Conversation)
+	if err != nil {
+		g.log.Warn("answer feedback: the session record could not be read; the rating is kept without its ask", "conversation", r.Conversation, "err", err)
+		return "", "", answer
+	}
+	if session == nil {
+		return "", "", answer
+	}
+	contextID = session.ContextID
+	if root, ok := session.TaskRefFor(r.TaskID); ok {
+		// As written, line breaks kept: a pasted manifest stays one.
+		ask = root.Request
+		answer = answerReply
+		if root.CardsAnswer {
+			answer = answerCard
+		}
+	}
+	return contextID, ask, answer
 }
 
 // Note adds the rater's note (empty: none) to their kept 👎 on r's answer.

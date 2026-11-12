@@ -29,20 +29,60 @@ const (
 	feedbackFormLine = "To tell the kube-agents maintainers as well, use %s. It opens a public issue, so leave out cluster names and other details from your install."
 	// feedbackFormURL is the form the chat commands name too.
 	feedbackFormURL = chattext.FeedbackFormURL
+
+	// The same words for a post the agent made on its own (an alert, a
+	// report), which answers no question: it is rated useful or not, and
+	// only the post is kept.
+	feedbackPostGoodLabel  = "Useful"
+	feedbackPostBadLabel   = "Not useful"
+	feedbackPostKeptLine   = "This post is kept on your install for %s so an operator can turn it into a test."
+	feedbackPostThanksLine = "Thanks. I kept this post for your team to review."
 )
+
+// feedbackLabels are the two rating controls' labels for the message rated
+// under task: a post's when task names one (postKindOf), an answer's
+// otherwise.
+func feedbackLabels(task string) (good, bad string) {
+	if postKindOf(task) != "" {
+		return feedbackPostGoodLabel, feedbackPostBadLabel
+	}
+	return feedbackGoodLabel, feedbackBadLabel
+}
+
+// feedbackKeptTextFor is feedbackKeptText for the message rated under task:
+// a post's own line when task names one.
+func feedbackKeptTextFor(task string, days int, askKept bool) string {
+	if postKindOf(task) == "" {
+		return feedbackKeptText(days, askKept)
+	}
+	return fmt.Sprintf(feedbackPostKeptLine, feedbackKeptFor(days))
+}
+
+// feedbackKeptFor is how long a rating is kept, in words.
+func feedbackKeptFor(days int) string {
+	if days == 1 {
+		return feedbackKeptOneDay
+	}
+	return fmt.Sprintf(feedbackKeptDays, days)
+}
+
+// feedbackThanksFor is feedbackThanks for the message rated under task: a
+// post's own line when task names one.
+func feedbackThanksFor(task, link string) string {
+	if postKindOf(task) == "" {
+		return feedbackThanks(link)
+	}
+	return feedbackPostThanksLine + " " + fmt.Sprintf(feedbackFormLine, link)
+}
 
 // feedbackKeptText is the line under the note a 👎 asks for: how long the
 // install keeps the rated answer, naming the question only when askKept.
 func feedbackKeptText(days int, askKept bool) string {
-	kept := fmt.Sprintf(feedbackKeptDays, days)
-	if days == 1 {
-		kept = feedbackKeptOneDay
-	}
 	line := feedbackKeptLine
 	if !askKept {
 		line = feedbackKeptNoAsk
 	}
-	return fmt.Sprintf(line, kept)
+	return fmt.Sprintf(line, feedbackKeptFor(days))
 }
 
 // feedbackThanks is the line a kept note is thanked with; link is the

@@ -12,7 +12,9 @@ import (
 )
 
 // Answer feedback on Slack (feedback.go): Slack's own feedback buttons, a
-// context_actions block under the final answer of an ask, the last block of
+// context_actions block under the final answer of an ask, and under a post
+// the agent made on its own in the home channel, after its action buttons;
+// the last block of
 // the message (inside its side bar when it has one, where Slack draws it as
 // well). A tap is never a turn. A 👍 is handed to the gateway and Slack
 // fills the icon; nothing posts. A 👎 is kept with the rated answer (the
@@ -108,14 +110,15 @@ func slackFeedbackBlock(taskID string) map[string]any {
 		return map[string]any{"text": map[string]any{"type": slackPlainText, "text": label},
 			"value": value, "accessibility_label": label}
 	}
+	good, bad := feedbackLabels(taskID)
 	return map[string]any{
 		"type":     slackContextActionsBlock,
 		"block_id": slackFeedbackBlockPrefix + taskID,
 		"elements": []any{map[string]any{
 			"type":            slackFeedbackButtons,
 			"action_id":       slackFeedbackAction,
-			"positive_button": button(feedbackGoodLabel, FeedbackUp),
-			"negative_button": button(feedbackBadLabel, FeedbackDown),
+			"positive_button": button(good, FeedbackUp),
+			"negative_button": button(bad, FeedbackDown),
 		}},
 	}
 }
@@ -138,6 +141,24 @@ func withFeedback(layout slackChatLayout, taskID string) slackChatLayout {
 		layout.Blocks = append(layout.Blocks, block)
 	}
 	return layout
+}
+
+// slackWithFeedbackBlock is raw, a Block Kit array, with the rating controls
+// for taskID as its last block; raw as it is when it is already at Slack's
+// block cap.
+func slackWithFeedbackBlock(raw json.RawMessage, taskID string) (json.RawMessage, error) {
+	var blocks []json.RawMessage
+	if err := json.Unmarshal(raw, &blocks); err != nil {
+		return nil, err
+	}
+	if len(blocks) >= slackChatBlocksMax {
+		return raw, nil
+	}
+	block, err := json.Marshal(slackFeedbackBlock(taskID))
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(append(blocks, block))
 }
 
 // slackRatedOptions is slackMessageOptions for an answer drawn with rating
@@ -259,7 +280,13 @@ func (s *SlackAdapter) feedbackClick(p slackClickPayload, actionType, blockID, v
 
 // slackFeedbackThanks is the line a kept note is thanked with.
 func slackFeedbackThanks() string {
-	return feedbackThanks(fmt.Sprintf(slackFeedbackFormLink, feedbackFormURL))
+	return slackFeedbackThanksFor("")
+}
+
+// slackFeedbackThanksFor is the line a kept note on the message rated under
+// task is thanked with.
+func slackFeedbackThanksFor(task string) string {
+	return feedbackThanksFor(task, fmt.Sprintf(slackFeedbackFormLink, feedbackFormURL))
 }
 
 // slackFeedbackModal is the note a 👎 asks for; its kept line names the
@@ -278,7 +305,7 @@ func slackFeedbackModal(meta slackFeedbackMeta, days int, askKept bool) slack.Mo
 		PrivateMetadata: string(raw),
 		Blocks: slack.Blocks{BlockSet: []slack.Block{
 			input,
-			slack.NewContextBlock("", slack.NewTextBlockObject(slackPlainText, feedbackKeptText(days, askKept), false, false)),
+			slack.NewContextBlock("", slack.NewTextBlockObject(slackPlainText, feedbackKeptTextFor(meta.Task, days, askKept), false, false)),
 		}},
 	}
 }
@@ -314,7 +341,7 @@ func (s *SlackAdapter) feedbackNote(raw json.RawMessage) {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), slackFeedbackDeadline)
 		defer cancel()
-		opts := []slack.MsgOption{slack.MsgOptionText(slackFeedbackThanks(), false)}
+		opts := []slack.MsgOption{slack.MsgOptionText(slackFeedbackThanksFor(meta.Task), false)}
 		if meta.Thread != "" {
 			opts = append(opts, slack.MsgOptionTS(meta.Thread))
 		}

@@ -303,17 +303,26 @@ func asksQuestion(choices []chatmsg.Choice) bool {
 // question already answered: the same layout with the answered line added
 // where slackAnsweredLayout would put it, or, for text alone, the text as a
 // section with the line under it (text past a section's cap posts as text
-// alone, without the line).
+// alone, without the line). A message marked for rating (m.Feedback, which
+// the caller clears when the controls are off) keeps its rating controls as
+// the last block, under the line.
 func slackAnsweredOptions(m OutMessage, line string) ([]slack.MsgOption, error) {
 	text := toMrkdwn(m.Text)
 	note := map[string]any{"type": slackContextBlock, "elements": []any{
 		map[string]any{"type": slackPlainText, "text": line, "emoji": true}}}
 	if m.Chat == nil {
 		if utf8.RuneCountInString(text) > slackChatSectionMax {
+			if m.Feedback != "" {
+				return slackRatedTextOptions(m)
+			}
 			return slackMessageOptions(m)
 		}
-		set, err := slackRawBlocks([]map[string]any{
-			{"type": slackSectionBlock, "text": map[string]any{"type": slackMrkdwnText, "text": text}}, note})
+		blocks := []map[string]any{
+			{"type": slackSectionBlock, "text": map[string]any{"type": slackMrkdwnText, "text": text}}, note}
+		if m.Feedback != "" {
+			blocks = append(blocks, slackFeedbackBlock(m.Feedback))
+		}
+		set, err := slackRawBlocks(blocks)
 		if err != nil {
 			return nil, err
 		}
@@ -335,6 +344,9 @@ func slackAnsweredOptions(m OutMessage, line string) ([]slack.MsgOption, error) 
 		last["blocks"] = append(inner, note)
 	} else {
 		layout.Blocks = append(layout.Blocks, note)
+	}
+	if m.Feedback != "" {
+		layout = withFeedback(layout, m.Feedback)
 	}
 	return slackChatOptions(layout, text)
 }

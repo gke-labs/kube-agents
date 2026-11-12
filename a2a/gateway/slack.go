@@ -913,10 +913,17 @@ func (s *SlackAdapter) PostNotify(channel, thread, text string) (message, landed
 // PostNotifyBlocks is PostNotify for a Block Kit message: blocks as given,
 // text as the notification and fallback. The blocks are decoded into
 // slack-go's types to be sent; one it does not know travels as Slack wrote
-// it, and Slack's own refusal (invalid_blocks) comes back as the error.
-func (s *SlackAdapter) PostNotifyBlocks(channel, thread, text string, raw json.RawMessage) (message, landed string, err error) {
+// it, and Slack's own refusal (invalid_blocks) comes back as the error. A
+// post marked for rating (feedback, a post the agent made on its own) ends
+// with the rating controls when the blocks leave room for them.
+func (s *SlackAdapter) PostNotifyBlocks(channel, thread, text string, raw json.RawMessage, feedback string) (message, landed string, err error) {
 	if !slackIsHomeChannelID(channel) {
 		return "", "", fmt.Errorf("slack: not a channel id: %q", channel)
+	}
+	if s.rates(OutMessage{Feedback: feedback}) {
+		if raw, err = slackWithFeedbackBlock(raw, feedback); err != nil {
+			return "", "", fmt.Errorf("slack: blocks: %w", err)
+		}
 	}
 	var blocks slack.Blocks
 	if err := json.Unmarshal(raw, &blocks); err != nil {
@@ -939,14 +946,21 @@ func (s *SlackAdapter) PostNotifyBlocks(channel, thread, text string, raw json.R
 
 // PostNotifyMessage is PostNotify for a message value: a chat message laid
 // out as Block Kit (renderSlackChat), its text as the notification and
-// fallback, link and media previews off. A layout the renderer will not send,
-// or that Slack refuses, is an error wrapped in ErrLayoutRefused and nothing
-// is posted; the Notifier posts the text instead.
+// fallback, link and media previews off. A post marked for rating
+// (m.Feedback, a post the agent made on its own) ends with the rating
+// controls, under its action buttons, laid out or as text alone. A layout the
+// renderer will not send, or that Slack refuses, is an error wrapped in
+// ErrLayoutRefused and nothing is posted; the Notifier posts the text instead.
 func (s *SlackAdapter) PostNotifyMessage(channel, thread string, m OutMessage) (message, landed string, err error) {
 	if !slackIsHomeChannelID(channel) {
 		return "", "", fmt.Errorf("slack: not a channel id: %q", channel)
 	}
-	opts, err := slackMessageOptions(m)
+	var opts []slack.MsgOption
+	if s.rates(m) {
+		opts, err = slackRatedOptions(m)
+	} else {
+		opts, err = slackMessageOptions(m)
+	}
 	if err != nil {
 		return "", "", err
 	}
@@ -1093,13 +1107,29 @@ func slackLayoutError(err error) error {
 
 // EditMessage replaces a posted message with a message value. Without a chat
 // message the text replaces the layout too: the blocks and the side bar are
-// sent empty, since chat.update keeps whatever it is not sent.
+// sent empty, since chat.update keeps whatever it is not sent. A message
+// marked for rating (m.Feedback: a home alert its triage rewrites) keeps its
+// rating controls as the last block.
 func (s *SlackAdapter) EditMessage(conversation, messageID string, m OutMessage) error {
 	channel, _, ok := slackChannelThread(conversation)
 	if !ok {
 		return fmt.Errorf("malformed conversation id %q", conversation)
 	}
-	opts, err := slackMessageOptions(m)
+	if !s.rates(m) {
+		m.Feedback = ""
+	}
+	var opts []slack.MsgOption
+	var err error
+	if m.Feedback != "" {
+		opts, err = slackRatedOptions(m)
+		if m.Chat == nil {
+			// The side bar a laid-out version had is cleared, as
+			// slackMessageOptions clears it for text.
+			opts = append(opts, slack.MsgOptionAttachments([]slack.Attachment{}...))
+		}
+	} else {
+		opts, err = slackMessageOptions(m)
+	}
 	if line := s.answeredLine(channel, messageID); line != "" && (m.Chat == nil || !asksQuestion(m.Chat.Choices)) {
 		// An answered question edited again without its choices (the card
 		// settling it on the notify route, laid out or as text) keeps the
