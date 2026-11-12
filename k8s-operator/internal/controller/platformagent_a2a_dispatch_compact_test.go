@@ -59,7 +59,11 @@ func TestTheDispatchConfigIsWrittenCompactWithNoDerivedFields(t *testing.T) {
 // cluster agents, with Job mode on: the design's target (#4440). The config
 // has to fit one ConfigMap (1 MiB) with room to spare.
 func TestTheDispatchConfigFitsTwentyFiveHundredTwoTierProfiles(t *testing.T) {
-	withDispatcher(t)
+	withOperatorBusPrincipal(t)
+	// With the dispatcher off, as fleetScaleProfileFixtures has it: on, its
+	// identity ceiling binds only the oldest few hundred (#5381), and this
+	// is the config's own size at the target.
+	t.Setenv(a2aProfileDispatcherEnvVar, "false")
 	t.Setenv(a2aDispatcherJobPolicyEnvVar, "true")
 	agent := a2aTestAgent()
 	profiles := make([]agentv1alpha1.AgentProfile, 0, 2500)
@@ -72,6 +76,19 @@ func TestTheDispatchConfigFitsTwentyFiveHundredTwoTierProfiles(t *testing.T) {
 	cm, err := buildA2ADispatchConfigMapWith(agent, profiles, templates, nil)
 	if err != nil {
 		t.Fatal(err)
+	}
+	var cfg a2aDispatchConfig
+	if err := json.Unmarshal([]byte(cm.Data[a2aDispatchConfigKey]), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	refs := 0
+	for _, p := range cfg.Profiles {
+		if p.JobTemplateRef != nil {
+			refs++
+		}
+	}
+	if len(cfg.Profiles) != len(profiles) || refs != len(profiles) {
+		t.Fatalf("%d entries, %d with a Job template reference, for %d profiles: the fixture isn't the target", len(cfg.Profiles), refs, len(profiles))
 	}
 	size := len(cm.Data[a2aDispatchConfigKey])
 	const configMapLimit = 1 << 20
