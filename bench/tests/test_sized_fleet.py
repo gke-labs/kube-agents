@@ -173,3 +173,11 @@ class ChurnMessageTest(unittest.TestCase):
         result = sf.check(f, designed, 44.9)
         self.assertFalse(result["sound"])
         self.assertIn("churn 44.9", result["findings"][0])
+
+
+class TransientTest(unittest.TestCase):
+    def test_kubectls_refused_wording_is_transient(self):
+        from kube_agents_bench.scale import kube
+        message = "The connection to the server 136.119.233.207 was refused - did you specify the right host or port?"
+        self.assertTrue(kube.TRANSIENT_RE.search(message))
+        self.assertFalse(kube.TRANSIENT_RE.search('Error from server (NotFound): pods "x" not found'))

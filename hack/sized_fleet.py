@@ -232,7 +232,13 @@ def measure_churn(args: argparse.Namespace, fleet: sf.Fleet, minutes: int) -> fl
     seen: set[str] = set()
 
     def names(context: str) -> set[str]:
-        pods = kube.kubectl_json(context, "get", "pods", "-A", "-l", selector)["items"]
+        try:
+            pods = kube.kubectl_json(context, "get", "pods", "-A", "-l", selector)["items"]
+        except kube.CommandError as exc:
+            # A control plane away past the retries (a new zonal cluster's resize) misses this poll
+            # only: a client Pod lives longer than a poll, so the next one still sees most of them.
+            LOG.warning("churn poll missed %s: %s", context, str(exc)[:200])
+            return set()
         out = set()
         for p in pods:
             created = sf.epoch(p["metadata"]["creationTimestamp"])
