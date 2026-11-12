@@ -1,5 +1,5 @@
 {
-  "version": "84037acf34fcd90f",
+  "version": "48abb21788df6a64",
   "shard": 0,
   "shards": 1,
   "identities": [
@@ -163,22 +163,6 @@
       "account": "TRUSTED",
       "grants": {
         "publish": [
-          "$JS.API.CONSUMER.INFO.PROFILE_SUBMITS.profile-auditor-read-top",
-          "$JS.API.CONSUMER.MSG.NEXT.PROFILE_SUBMITS.profile-auditor-read-top",
-          "$JS.ACK.PROFILE_SUBMITS.profile-auditor-read-top.>",
-          "$JS.API.CONSUMER.INFO.PROFILE_SUBMITS.profile-auditor-read-child",
-          "$JS.API.CONSUMER.MSG.NEXT.PROFILE_SUBMITS.profile-auditor-read-child",
-          "$JS.ACK.PROFILE_SUBMITS.profile-auditor-read-child.>",
-          "$JS.API.CONSUMER.INFO.PROFILE_SUBMITS.profile-cluster-a-read-top",
-          "$JS.API.CONSUMER.MSG.NEXT.PROFILE_SUBMITS.profile-cluster-a-read-top",
-          "$JS.ACK.PROFILE_SUBMITS.profile-cluster-a-read-top.>",
-          "$JS.API.CONSUMER.INFO.PROFILE_SUBMITS.profile-cluster-a-read-child",
-          "$JS.API.CONSUMER.MSG.NEXT.PROFILE_SUBMITS.profile-cluster-a-read-child",
-          "$JS.ACK.PROFILE_SUBMITS.profile-cluster-a-read-child.>",
-          "a2a.tasks.auditor.*.supervisor",
-          "$JS.API.DIRECT.GET.DISPATCH_STOPS.a2a.stop.auditor.*",
-          "a2a.tasks.cluster-a.*.supervisor",
-          "$JS.API.DIRECT.GET.DISPATCH_STOPS.a2a.stop.cluster-a.*",
           "$KV.PROFILE_LEASES.>",
           "$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
           "$JS.API.DIRECT.GET.KV_PROFILE_LEASES.>",
@@ -190,14 +174,13 @@
           "_INBOX.dispatcher.>"
         ],
         "subscribe": [
-          "a2a.stop.auditor.*",
-          "a2a.stop.cluster-a.*",
           "a2a.dispatch.*.*.*.accept",
           "a2a.dispatch.*.*.*.lease",
           "a2a.cap.reply.dispatcher.>",
           "_INBOX.dispatcher.>"
         ]
-      }
+      },
+      "narrowing": "dispatcher"
     }
   ]
 }
