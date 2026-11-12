@@ -3,6 +3,7 @@ package hermesbridge
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // The shape classes scrubInlineSecrets must catch, and the ordinary ops text
@@ -646,5 +647,25 @@ func TestScrubInlineSecretsKeepsACodeSpansClosingBacktick(t *testing.T) {
 		if got := scrubInlineSecrets(tc.in); got != tc.want {
 			t.Errorf("scrubInlineSecrets(%q)\n got %q\nwant %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+// One long line (minified JSON, a fetched page) full of scheme words is
+// scrubbed in linear time: the authorization lead is read from a bounded
+// tail before each match, not from the line's start (#5311 review). 256 KiB
+// took about two minutes before; it must stay far inside the hook's 10s.
+func TestALongLineOfSchemeWordsScrubsInLinearTime(t *testing.T) {
+	var b strings.Builder
+	for b.Len() < 256*1024 {
+		b.WriteString(`{"reason":"token basic digest refresh","message":"bearer token rotated"},`)
+	}
+	start := time.Now()
+	scrubInlineSecrets(b.String())
+	if took := time.Since(start); took > 3*time.Second {
+		t.Errorf("a 256 KiB line took %s to scrub", took)
+	}
+	// The lead is still honoured inside the window.
+	if got := scrubInlineSecrets(`"authorization": "Bearer abcdEFGH1234ijkl5678"`); strings.Contains(got, "abcdEFGH1234ijkl5678") {
+		t.Errorf("the authorization value leaked: %q", got)
 	}
 }

@@ -1484,8 +1484,15 @@ func closingBacktickOutside(s string, lo, hi int) int {
 // other scheme words, which are ordinary English too (a token, a digest),
 // only a token-shaped one.
 func authSchemeCredentialRedacted(s string, m []int) bool {
-	lineStart := strings.LastIndexByte(s[:m[0]], '\n') + 1
-	if authHeaderKVLeadPattern.MatchString(s[lineStart:m[0]]) {
+	// The lead pattern ends at the match and is short ("authorization", an
+	// optional quote, a separator, spaces), so only a bounded tail of the
+	// line is read: reading back to the line's start for every match made a
+	// long single line (minified JSON) cost the square of its length.
+	tail := s[max(0, m[0]-authHeaderLeadWindow):m[0]]
+	if i := strings.LastIndexByte(tail, '\n'); i >= 0 {
+		tail = tail[i+1:]
+	}
+	if authHeaderKVLeadPattern.MatchString(tail) {
 		return false
 	}
 	cred := trimValueEdges(s[m[4]:m[5]])
@@ -1495,6 +1502,11 @@ func authSchemeCredentialRedacted(s string, m []int) bool {
 	}
 	return valueTokenShaped(cred)
 }
+
+// authHeaderLeadWindow bounds how far before a scheme word the
+// authorization key is looked for: far more than the key, its quotes and
+// separator take.
+const authHeaderLeadWindow = 256
 
 // authSchemeProseWords are the dictionary words of eight letters or more
 // that prose puts after Bearer or Basic as an adjective. A shorter word is
