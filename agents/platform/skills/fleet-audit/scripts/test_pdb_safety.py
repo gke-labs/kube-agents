@@ -119,14 +119,14 @@ class CheckFixTest(unittest.TestCase):
                 self.assertFalse(answer["eligible"])
 
     def test_an_autoscaler_floor_below_two_is_not_eligible(self):
-        for floor, eligible in ((None, False), (1, False), (2, True)):
+        for floor, eligible in ((None, False), (0, False), (1, False), (2, True)):
             with self.subTest(floor=floor):
                 autoscaler = hpa(min_replicas=floor)
                 if floor is None:
                     del autoscaler["spec"]["minReplicas"]
                 answer = checked([ready(deployment()), autoscaler])
                 self.assertEqual(answer["eligible"], eligible, answer)
-                self.assertIn(f"autoscaler floor={floor or 1}", by_name(answer)[pdb_safety.REPLICAS_READY]["detail"])
+                self.assertIn(f"autoscaler floor={1 if floor is None else floor}", by_name(answer)[pdb_safety.REPLICAS_READY]["detail"])
 
     def test_a_kubeconfig_path_with_a_space_or_quote_is_dropped_whole(self):
         for path in ("/home/jane doe/.kubeconfigs/kc.yaml", "/home/o'neil/kc.yaml"):

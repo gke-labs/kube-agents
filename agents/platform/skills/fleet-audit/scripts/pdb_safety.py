@@ -142,7 +142,9 @@ def judge(target: recheck.Target, selector: dict, dump: dict) -> list[dict]:
     # An autoscaler can take the workload down to its floor after this read,
     # so the floor is what has to reach MIN_REPLICAS (as `blocking-pdb` does).
     hpa = collect._hpa_targeting(workload, subject.context)
-    floor = ((hpa.get("spec") or {}).get("minReplicas") or collect.DEFAULT_HPA_MIN_REPLICAS) if hpa else wanted
+    declared = (hpa.get("spec") or {}).get("minReplicas") if hpa else None
+    # None, not falsy, as `collect` reads it: a scale-to-zero floor is 0.
+    floor = (collect.DEFAULT_HPA_MIN_REPLICAS if declared is None else declared) if hpa else wanted
     ready = int(status.get("readyReplicas") or 0)
     generation = (raw.get("metadata") or {}).get("generation")
     observed = status.get("observedGeneration")
