@@ -416,13 +416,23 @@ func TestTheOperatorsBucketedDispatcherMapParsesAndDerives(t *testing.T) {
 
 // A draining name the callout reserves (an addressee such as the bridge's,
 // or a static principal) would grant the bucket that name's .supervisor
-// subject and stop grants. The map can't see the callout's reserved names,
-// so the mint refuses the bucket instead.
-func TestADrainingNameTheCalloutReservesRefusesTheBucket(t *testing.T) {
+// subject. The map can't see the callout's reserved names, so the mint
+// leaves that name out of the bucket's grants. Every bucket is still served,
+// the one the name hashes to included: one such name must not stop dispatch
+// for every profile (#5553, round 1).
+func TestADrainingNameTheCalloutReservesIsLeftOutNotRefused(t *testing.T) {
 	for _, reserved := range append(renderedFixtureAddressees(t)[:1], renderedFixtureAuthUsers(t)[0]) {
 		svc := newDispatcherTestService(t, renderMap(t, dispatcherEntry(reserved), profileEntry("a", "read")), dispatcherTokens())
-		if _, err := connect(svc, dispatcherToken, lib.DispatcherBucketCredential(lib.DispatcherBucket(reserved))); err == nil || !strings.Contains(err.Error(), reserved) {
-			t.Errorf("draining %q: %v", reserved, err)
+		for b := 0; b < lib.DispatcherBuckets; b++ {
+			d, err := connect(svc, dispatcherToken, lib.DispatcherBucketCredential(b))
+			if err != nil {
+				t.Fatalf("draining %q refused bucket %d: %v", reserved, b, err)
+			}
+			for _, s := range append(allowed(d).Publish, allowed(d).Subscribe...) {
+				if strings.Contains(s, "."+reserved+".") {
+					t.Errorf("draining %q: bucket %d holds %q", reserved, b, s)
+				}
+			}
 		}
 		// The control connection doesn't derive from the draining names.
 		if _, err := connect(svc, dispatcherToken, ""); err != nil {

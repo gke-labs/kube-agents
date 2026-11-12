@@ -281,7 +281,7 @@ func renderA2AAuthMapDraining(agent *agentv1alpha1.PlatformAgent, profiles []age
 	// enforcement point and cannot be removed; this one exists so the failure
 	// surfaces as a reconcile error naming the offending entry, at the moment
 	// it is introduced, instead of as a condition that quietly lies.
-	if err := validateA2AAuthMapIdentities(identities); err != nil {
+	if err := validateA2AAuthMapIdentities(identities, a2aStaticPrincipalNames(agent)...); err != nil {
 		return a2aAuthMapDocument{}, err
 	}
 
@@ -464,7 +464,10 @@ func encodeA2AJSONPrefixed(v any, prefix, indent string) ([]byte, error) {
 //   - Duplicate ServiceAccounts make the grant set a function of map order,
 //     and duplicate users re-create the shared-credential problem and collide
 //     on each other's inbox prefix.
-func validateA2AAuthMapIdentities(identities []a2aAuthMapIdentity) error {
+//
+// principals are the static principal names the callout reserves
+// (a2aStaticPrincipalNames); a draining profile may not be one.
+func validateA2AAuthMapIdentities(identities []a2aAuthMapIdentity, principals ...string) error {
 	if len(identities) == 0 {
 		return fmt.Errorf("the rendered identity map serves no identities; the callout would refuse it and every bus connection with it")
 	}
@@ -549,8 +552,9 @@ func validateA2AAuthMapIdentities(identities []a2aAuthMapIdentity) error {
 			}
 			seenDraining := map[string]bool{}
 			for _, p := range id.Draining {
-				if !isDNS1123LabelToken(p) || seenDraining[p] || slices.Contains(a2aReservedAddressees(), p) {
-					return fmt.Errorf("identity %d: user %q lists draining profile %q, which is not a dot-free DNS-1123 label, is listed twice, or is a reserved addressee", i, id.User, p)
+				if !isDNS1123LabelToken(p) || seenDraining[p] || slices.Contains(a2aReservedAddressees(), p) ||
+					slices.Contains(principals, p) || slices.ContainsFunc(identities, func(o a2aAuthMapIdentity) bool { return o.User == p }) {
+					return fmt.Errorf("identity %d: user %q lists draining profile %q, which is not a dot-free DNS-1123 label, is listed twice, or is a reserved addressee or a principal's name", i, id.User, p)
 				}
 				seenDraining[p] = true
 			}

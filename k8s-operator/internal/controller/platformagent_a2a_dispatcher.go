@@ -750,7 +750,7 @@ const a2aDrainingWindow = time.Duration(agentv1alpha1.DefaultProfileMaxTaskDeadl
 // deadline under its 6h ceiling), and a time no later than the window from
 // now; nothing else of the entry. An entry that isn't is
 // dropped, and grants nothing.
-func drainingDispatchProfiles(applied *a2aDispatchConfig, live map[string]bool, now time.Time) []a2aDispatchProfile {
+func drainingDispatchProfiles(applied *a2aDispatchConfig, live map[string]bool, now time.Time, reserved ...string) []a2aDispatchProfile {
 	if applied == nil {
 		return nil
 	}
@@ -760,9 +760,13 @@ func drainingDispatchProfiles(applied *a2aDispatchConfig, live map[string]bool, 
 		// A reserved addressee is no profile's name (the operator refuses a
 		// live profile named for one), so an applied entry naming one is
 		// not one this operator wrote, and would grant the dispatcher that
-		// addressee's .supervisor subject.
+		// addressee's .supervisor subject. A static principal's name (the
+		// callout's reserved principals, reserved) is not carried either: a
+		// live profile may hold one, but the callout refuses a draining
+		// name that is a principal's, so carrying it would only cost the
+		// drain grant (#5553, round 1).
 		if live[a.Name] || seen[a.Name] || !isDNS1123LabelToken(a.Name) || len(a.Tiers) == 0 ||
-			slices.Contains(a2aReservedAddressees(), a.Name) ||
+			slices.Contains(a2aReservedAddressees(), a.Name) || slices.Contains(reserved, a.Name) ||
 			slices.ContainsFunc(a.Tiers, func(t string) bool { return !isDNS1123LabelToken(t) }) {
 			continue
 		}
@@ -820,7 +824,7 @@ func (r *PlatformAgentReconciler) dispatchDraining(ctx context.Context, agent *a
 	for _, p := range cfg.Profiles {
 		live[p.Name] = true
 	}
-	return drainingDispatchProfiles(&applied, live, time.Now()), nil
+	return drainingDispatchProfiles(&applied, live, time.Now(), a2aStaticPrincipalNames(agent)...), nil
 }
 
 // reasonDispatchConfigUnreadable is the Warning when the applied dispatch
