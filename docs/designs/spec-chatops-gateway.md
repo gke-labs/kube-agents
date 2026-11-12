@@ -2370,13 +2370,17 @@ question, sanitised. That state is process
 memory too, so after a restart the next verified ask in a thread may title it again. `assistant_thread_started`, and `app_home_opened` on the Messages tab, get today's
 three suggested prompts. `agent_session_stopped` is the Stop button, above.
 
-**One backend per gateway process.** The relay binds one durable, and two gateways on
-one durable split event deliveries - so config counts the armed backends and refuses
-any combination but exactly one: a Slack pair, a Discord token, and a gchat relay URL
-are mutually exclusive, and none of the three is also a refusal. A second backend is a
-second Deployment with its own durable, when we want one. The inject side door is not
-in that count - it may sit beside any one of the three, for the reason the inject
-section gives - and neither is the console adapter, which has no durable to split.
+**Every armed backend in one gateway process.** Config lists the armed backends
+(`Backends()`: gchat, slack and discord, in that order) and refuses only half a Slack
+pair or no ingress at all. The backends share no transport: each is its own connection,
+the Chat relay durable belongs to the process, and the election keeps one leader per
+Deployment, so two backends split no deliveries. The mux stamps each inbound message
+with the backend that delivered it, and a direct message names its backend as
+`<backend>:<id>`. The console stays the essential backend: when it stops, the process
+restarts, while a chat backend that stops is run again after a backoff and the rest
+keep going. The inject and A2A doors sit beside the backends, for the reason the inject
+section gives. The operator renders one backend into the gateway today, Chat ahead of
+Slack. Decided 2026-11-12.
 
 `verifiedBy` is `slack-socket-mode+principal-map` when our table joined the sender to a
 principal, and `slack-socket-mode` when it did not: either way Slack authenticated the
