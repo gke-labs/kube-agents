@@ -663,9 +663,15 @@ func TestALongLineOfSchemeWordsScrubsInLinearTime(t *testing.T) {
 	for b.Len() < 256*1024 {
 		b.WriteString(`{"reason":"token basic digest refresh","message":"bearer token rotated"},`)
 	}
+	// CI runs go test -race, which slows this loop about 20x (0.2s becomes
+	// 4s); the quadratic version took minutes, so 10x still separates them.
+	budget := 3 * time.Second
+	if raceEnabled {
+		budget *= 10
+	}
 	start := time.Now()
 	scrubInlineSecrets(b.String())
-	if took := time.Since(start); took > 3*time.Second {
+	if took := time.Since(start); took > budget {
 		t.Errorf("a 256 KiB line took %s to scrub", took)
 	}
 	// The lead is still honoured inside the window.
