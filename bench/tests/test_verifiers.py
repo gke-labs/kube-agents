@@ -9969,6 +9969,74 @@ def test_worker_commands_succeeded_with_after_result_pattern_withheld_call_besid
     ) in res_forbid.reason
 
 
+def test_code_call_text_and_clip_withheld_args_not_clipped():
+    from kube_agents_bench.verifiers import _code_call_text_and_clip
+    import kube_agents_bench.worker_trajectory as worker_trajectory
+
+    # Withheld bare string
+    cmd, is_clipped = _code_call_text_and_clip({"name": "terminal", "args": worker_trajectory.WITHHELD})
+    assert cmd is None
+    assert is_clipped is False
+
+    # Withheld raw dict from parsing._call_args
+    cmd, is_clipped = _code_call_text_and_clip({"name": "terminal", "args": {"raw": worker_trajectory.WITHHELD}})
+    assert cmd is None
+    assert is_clipped is False
+
+    cmd, is_clipped = _code_call_text_and_clip({"name": "execute_code", "args": {"raw": worker_trajectory.WITHHELD}})
+    assert cmd is None
+    assert is_clipped is False
+
+
+def test_worker_commands_after_result_pattern_all_withheld_raw_is_error():
+    import kube_agents_bench.worker_trajectory as worker_trajectory
+    from kube_agents_bench.verifiers import _NO_WORKER_TERMINAL_CALLS_REASON
+
+    v = WorkerCommandsVerifier(type="worker_commands", after_result_pattern=r"OPEN", forbidden_patterns=[r"never_matches"])
+    traj = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"raw": worker_trajectory.WITHHELD}, "status": "completed", "at": 1.0},
+    ]
+    transcript.set("ok", traj)
+    res = v.verify(5.0)
+    assert not res.success
+    assert res.status == "error"
+    assert res.reason == _NO_WORKER_TERMINAL_CALLS_REASON
+
+
+def test_worker_commands_succeeded_withheld_raw_call_does_not_claim_clipped():
+    from kube_agents_bench.verifiers import WorkerRun
+    import kube_agents_bench.worker_trajectory as worker_trajectory
+
+    run = WorkerRun(script="fleet_upgrade_report.py", flags=["--readiness"], succeeded=True)
+    v = WorkerCommandsVerifier(type="worker_commands", required_runs=[run])
+    traj = [
+        {
+            "agent": "worker",
+            "name": "terminal",
+            "task": "t_1",
+            "args": {"command": "kubectl get nodes"},
+            "result": '{"output": "", "exit_code": 0}',
+            "status": "completed",
+            "at": 1.0,
+        },
+        {
+            "agent": "worker",
+            "name": "terminal",
+            "task": "t_1",
+            "args": {"raw": worker_trajectory.WITHHELD},
+            "result": '{"output": "", "exit_code": 0}',
+            "status": "completed",
+            "at": 2.0,
+        },
+    ]
+    transcript.set("ok", traj, worker_commands=[{"task": "t_1", "command": "kubectl get nodes"}])
+    res = v.verify(5.0)
+    assert not res.success
+    assert res.status == "error"
+    assert "the pod withheld a worker terminal call's arguments" in res.reason
+    assert "the pod clipped a worker terminal call's arguments" not in res.reason
+
+
 def test_worker_commands_after_result_pattern_withheld_call_beside_readable_passes_when_no_succeeded_run():
     import kube_agents_bench.worker_trajectory as worker_trajectory
 

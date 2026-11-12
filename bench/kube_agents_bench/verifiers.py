@@ -2879,6 +2879,8 @@ def _code_call_text_and_clip(entry: dict[str, Any]) -> tuple[str | None, bool]:
     for any other tool or a call that carries neither."""
     if entry.get("name") not in _CODE_TOOLS:
         return None, False
+    if _args_withheld(entry):
+        return None, False
     args = entry.get("args")
     if not isinstance(args, dict):
         return None, False
