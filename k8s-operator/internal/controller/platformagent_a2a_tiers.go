@@ -92,7 +92,12 @@ func buildA2ATiersConfigMap(agent *agentv1alpha1.PlatformAgent, tiers []agentv1a
 // applyA2ATiers renders the Tier resources in the agent's namespace into the
 // tiers ConfigMap. With the Tier CRD not installed, or unreadable, it renders
 // an empty list, which serves the compiled-in tiers.
-func (r *PlatformAgentReconciler) applyA2ATiers(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+// profiles are the bound profiles reconcileA2AStack already resolved and
+// narrowed (nil when AgentProfiles are unreadable): their draining tiers are
+// the ones a deleted Tier keeps in the file. Passed in rather than listed
+// again, so the map and the file read one drain decision, and so a role that
+// can't list AgentProfiles is never made to (#1009's case).
+func (r *PlatformAgentReconciler) applyA2ATiers(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile) error {
 	var list agentv1alpha1.TierList
 	// A role that can't read Tiers lists nothing: a cached List would start
 	// an informer that never syncs and hold the reconcile (#1009's case).
@@ -103,10 +108,6 @@ func (r *PlatformAgentReconciler) applyA2ATiers(ctx context.Context, agent *agen
 	}
 	var kept []a2aTierEntry
 	if !r.tiersUnreadable {
-		profiles, err := boundAgentProfiles(ctx, r.Client, agent, r.tiersUnreadable)
-		if err != nil {
-			return fmt.Errorf("deciding the profiles' draining tiers: %w", err)
-		}
 		kept = keptDrainingTiers(profiles)
 	}
 	cm, err := buildA2ATiersConfigMap(agent, list.Items, kept...)

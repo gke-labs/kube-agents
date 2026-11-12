@@ -7486,7 +7486,7 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	}
 	// The install's tiers, which the verifier, the gateway and the callout
 	// mount (optional, so ordering against their Deployments doesn't matter).
-	if err := r.applyA2ATiers(ctx, agent); err != nil {
+	if err := r.applyA2ATiers(ctx, agent, profiles); err != nil {
 		return state, err
 	}
 
