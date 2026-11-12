@@ -1479,10 +1479,14 @@ the link the message is built from, from `WATCHED`. The reconcile's report,
 `{schema_version, mode, dry_run, commit, fleet_tree, build, job, workers,
 budget_seconds, ceiling_seconds, main_ref, main_check_error, started_at,
 finished_at, exit, exit_code, error, mapped, visited, outcomes{project:
-{outcome, detail, started_at?, finished_at?, allowlist_unused[]?}}, summary}`
+{outcome, detail, started_at?, finished_at?, allowlist_unused[]?,
+startup_fail_reset?}}, summary}`
 (`mapped` is how many projects the run set out to visit and `visited` how
 many it held; a held project carries its times, and `allowlist_unused` only
-when its plan was read; `fleet_tree` is the hash `hack/fleet_reconcile.py` computes
+when its plan was read; `startup_fail_reset` is `{result: reset|failed|skipped,
+instance?, zone?, detail?}`, with the fixture refresh on and not on a dry run: the run resets
+the VM after each project whose state it read, whatever the plan outcome; after a failed
+state read it records `failed` and tries no reset; an interrupted project is not reset; `fleet_tree` is the hash `hack/fleet_reconcile.py` computes
 over the stack's inputs (`docs/ci-pool-projects.md` §6.2 names them; reports
 from before #2645 carry the git tree id of `bench/tf/fleet` instead);
 `main_check_error` is set when the moved-check could

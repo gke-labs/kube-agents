@@ -61,11 +61,13 @@ readonly EVAL_NIGHTLY_WRITERS_C_FILE="eval/nightly-writers-c.txt"
 # into (the cksum shifted right by NIGHTLY_MAIN_CKSUM_SHIFT, modulo this: 0
 # main-a, 1 main-b, 2 main-c, 3 main-d, 4 main-e): a coin toss per name. The
 # shift picks the coin: shift 3 dealt the matrix of 2026-11-06 32/29/29/25/31
-# where no shift dealt it 37/38/21/30/20. scripts/test_ci_eval_nightly.py
+# where no shift dealt it 37/38/21/30/20; shift 4 deals the matrix of
+# 2026-11-10, the two chat-feedback usage-summary cases added, 34/31/31/32/28
+# where shift 3 dealt it 35/31/32/27/31. scripts/test_ci_eval_nightly.py
 # holds the spread within a quarter of a shard's share; if the matrix
 # drifts past that, change it.
 readonly NIGHTLY_MAIN_SHARDS=5
-readonly NIGHTLY_MAIN_CKSUM_SHIFT=3
+readonly NIGHTLY_MAIN_CKSUM_SHIFT=4
 # A fifth file, read beside them and applied on one lane only (#2039): the
 # cases the inject lane does not run, because their premise needs the chat
 # front door. The lane is the one EVAL_INJECT_TRANSPORT below names.
@@ -1245,8 +1247,10 @@ echo "✓ Seeded-fleet credentials finished in $((SECONDS - STEP_START))s"
 # kubectl read per assertion and one describe per control-plane role.
 # Read-only: every call is a `kubectl get` through the role kubeconfigs (the
 # fleet reader's token), a `gcloud container clusters describe` on this job's
-# own credential, which already lists the same clusters above, or a `gcloud
-# compute ... list` of a project-scoped role's objects on the same credential.
+# own credential, which already lists the same clusters above, a `gcloud
+# compute ... list` of a project-scoped role's objects, or a `gcloud compute
+# instances get-serial-port-output` of the startup-fail VM, on the same
+# credential.
 #
 # What it feeds: kube_agents_bench.fixture_drift, before the fan-out, marks each
 # case whose grade depends on a role the scan positively saw drifted, and the
@@ -2981,6 +2985,31 @@ export AGENT_PROVIDER="google"
 # Secret; hack/ci-deploy.sh, which runs first in every lane, refuses a Prow
 # job without it, so the default here serves local runs only.
 export AGENT_MODEL="${AGENT_MODEL_OVERRIDE:-gemini-3.1-pro-preview}"
+# --- reasoning effort: begin
+# The reasoning effort the install's gateway asks for, the same variable
+# hack/ci-deploy.sh passed to the chart (litellm.reasoningEffort): low, medium
+# or high, or empty for the model default. `bench-gate case` reads it, with
+# MODEL_PROVIDER, from the environment and stamps every case record with the
+# provider, the model and the effort it was graded under; a flag would not do,
+# because a pull request is graded with main's bench (pin_grader above). The
+# value is checked before the first unit rather than hours later at grading.
+# MODEL_DEFAULT_NAME is the model the install serves and AGENT_MODEL the one
+# the records name (devops-bench's setupId): a run whose two differ would file
+# its records under a model the install never ran, so it stops here.
+export EVAL_REASONING_EFFORT="${EVAL_REASONING_EFFORT:-}"
+case "${EVAL_REASONING_EFFORT}" in
+  "" | low | medium | high) ;;
+  *)
+    echo "ERROR: EVAL_REASONING_EFFORT='${EVAL_REASONING_EFFORT}' is not low, medium, high or empty (the model default)." >&2
+    exit 1
+    ;;
+esac
+if [ -n "${MODEL_DEFAULT_NAME:-}" ] && [ "${MODEL_DEFAULT_NAME}" != "${AGENT_MODEL}" ]; then
+  echo "ERROR: MODEL_DEFAULT_NAME=${MODEL_DEFAULT_NAME} (the model the install serves) differs from AGENT_MODEL=${AGENT_MODEL} (the model the records name); set AGENT_MODEL_OVERRIDE to the served model." >&2
+  exit 1
+fi
+echo "Agent model for this run: ${MODEL_PROVIDER:-unset provider}/${AGENT_MODEL}, reasoning effort: ${EVAL_REASONING_EFFORT:-model default}"
+# --- reasoning effort: end
 
 # Unset NAMESPACE so devops-bench OpenTofu deployer does not pass -var namespace=... to stacks that don't declare it
 unset NAMESPACE
@@ -4383,6 +4412,14 @@ fi
 # none of its cases is on the blocking roster, so the admission window has
 # nothing to decide for them. It reads the store like a presubmit.
 if [ "${EVAL_TIER}" = "certification" ]; then
+  EVAL_IS_MAIN_RUN="false"
+fi
+# A run at a named reasoning effort never appends either: the version key
+# (setup_id, scoring_version, judge_model, fleet, verifiers, mode) carries no
+# effort, so its lines would pool with the default-effort nights under one key.
+# The effort in the key is a later change; until then such a run reads the
+# store like a presubmit.
+if [ -n "${EVAL_REASONING_EFFORT:-}" ]; then
   EVAL_IS_MAIN_RUN="false"
 fi
 # The commit each line is stamped with. A postsubmit carries it as
@@ -6020,6 +6057,8 @@ elif [ -n "${RC_COMMIT_SHA:-}" ]; then
   echo "Release-candidate run (RC_COMMIT_SHA=${RC_COMMIT_SHA}): the baseline store is read, never written — the candidate is judged against main's window, not added to it."
 elif [ "${EVAL_ROLLBACK_LANE:-}" = "1" ] && [ -z "${PULL_NUMBER:-}" ]; then
   echo "Today-lane run (EVAL_ROLLBACK_LANE=1, JOB_TYPE=${JOB_TYPE:-unset}): the baseline store is read, never written — a rolled-back install is not what today's window measures."
+elif [ -n "${EVAL_REASONING_EFFORT:-}" ] && [ -z "${PULL_NUMBER:-}" ]; then
+  echo "Reasoning-effort run (EVAL_REASONING_EFFORT=${EVAL_REASONING_EFFORT}, JOB_TYPE=${JOB_TYPE:-unset}): the baseline store is read, never written; the version key carries no effort, so the lines would pool with the default-effort window."
 else
   echo "Not a main-branch recorder run (JOB_TYPE=${JOB_TYPE:-unset}): the baseline store is read, never written."
 fi

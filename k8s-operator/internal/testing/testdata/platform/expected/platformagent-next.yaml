@@ -1186,6 +1186,10 @@ spec:
               name: data
               readOnly: true
               subPath: profiles/platform/governance
+      dnsConfig:
+        options:
+          - name: ndots
+            value: "3"
       enableServiceLinks: false
       initContainers:
         - args:
@@ -1566,6 +1570,10 @@ spec:
             - mountPath: /etc/kube-agents/scope
               name: platform-agent-scope-vol
               readOnly: true
+      dnsConfig:
+        options:
+          - name: ndots
+            value: "3"
       securityContext:
         fsGroup: 10000
         runAsNonRoot: true
@@ -4297,9 +4305,11 @@ spec:
           resources:
             limits:
               cpu: 500m
+              ephemeral-storage: 64Mi
               memory: 192Mi
             requests:
               cpu: 50m
+              ephemeral-storage: 64Mi
               memory: 96Mi
           securityContext:
             allowPrivilegeEscalation: false

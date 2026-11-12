@@ -1307,6 +1307,17 @@ func a2aNATSExporterOmitted() bool {
 	return os.Getenv(a2aNATSImageEnvVar) != "" && os.Getenv(a2aNATSExporterImageEnvVar) == ""
 }
 
+// a2aNATSExporterResources adds an ephemeral-storage request and equal limit,
+// for the container's own log (the supervisor loop's lines and the
+// exporter's), to its CPU and memory, as a2aNATSReloaderResources does. It
+// writes nothing else: its root filesystem is read-only and it mounts nothing.
+func a2aNATSExporterResources() corev1.ResourceRequirements {
+	resources := a2aResources(a2aNATSExporterCPURequest, a2aNATSExporterMemoryRequest, a2aNATSExporterCPULimit, a2aNATSExporterMemoryLimit)
+	resources.Requests[corev1.ResourceEphemeralStorage] = resource.MustParse(emptyDirLogsAllowance)
+	resources.Limits[corev1.ResourceEphemeralStorage] = resource.MustParse(emptyDirLogsAllowance)
+	return resources
+}
+
 // a2aNATSContainers is the NATS pod's containers: the server, the config
 // reloader (buildA2ANATSReloaderContainer), and the metrics sidecar unless
 // a2aNATSExporterOmitted.
@@ -5101,7 +5112,7 @@ func a2aNATSExporterContainer() corev1.Container {
 			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 			SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 		},
-		Resources: a2aResources(a2aNATSExporterCPURequest, a2aNATSExporterMemoryRequest, a2aNATSExporterCPULimit, a2aNATSExporterMemoryLimit),
+		Resources: a2aNATSExporterResources(),
 	}
 }
 

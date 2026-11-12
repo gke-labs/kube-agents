@@ -12,7 +12,7 @@ Every image an install pulls or a rebuild needs, and how their tags are managed.
 [`images.json`](https://github.com/gke-labs/kube-agents/blob/main/images.json) at the repository root is the source of truth for this list. It is what `make mirror-images` copies from, what the chart and the dev tooling resolve their third-party pins from, and what the table below is generated from — so there is one pin per image, not one per install path.
 
 The A2A `next` stack pulls NATS, nats-box, the NATS config reloader, its metrics exporter, the gateway, the session worker, the auth callout,
-the capability verifier, the AgentProfile dispatcher, the console server and the Hermes bridge sidecar, and each is in the
+the capability verifier, the AgentProfile dispatcher, the console server and the Hermes bridge sidecar. Each is in the
 tables below. The first-party ones (`a2a-gateway`, `a2a-worker`, `a2a-authcallout`,
 `a2a-verifier`, `a2a-dispatcher`, `a2a-console`, `hermes-bridge`) are built and tagged with the rest of the
 release.
@@ -314,14 +314,16 @@ when a prefix is in effect:
 - `AGENT_SANDBOX_IMAGE` — the shell sandbox StatefulSet rendered beside every agent pod.
 - `FLUENT_BIT_IMAGE` — the logging sidecar injected into every agent pod.
 
-`CREDENTIAL_PROXY_IMAGE` and `KUBE_PROXY_IMAGE` need nothing: the operator derives them from the agent image
-by swapping the trailing name (`platform-agent` to `credential-proxy` and `kube-proxy`), which lands on the mirror
-on its own. The A2A `next` images the operator renders (`a2a-gateway`, `a2a-worker`,
-`a2a-authcallout`, `a2a-verifier`, `a2a-console`) follow `OPERATOR_IMAGE`, else `PLATFORM_AGENT_IMAGE`, the same way, so they need
-no env of their own on a mirror. The sandbox is a separate repository, so it gets no such
-derivation. Setting it explicitly still wins, which is why `install.sh` leaves it unset. One
-explicit value pins the sidecar for every agent in the cluster, and the per-CR derivation is what
-otherwise keeps each sidecar in step with its own agent's image.
+`CREDENTIAL_PROXY_IMAGE` and `KUBE_PROXY_IMAGE` need nothing on a mirror. The operator derives
+the credential proxy from each agent's own image by swapping the trailing name (`platform-agent` to
+`credential-proxy`). It derives `kube-proxy`, and the A2A `next` images it renders (`a2a-gateway`,
+`a2a-worker`, `a2a-authcallout`, `a2a-verifier`, `a2a-console`), from `OPERATOR_IMAGE`, else
+`PLATFORM_AGENT_IMAGE`, the same way. The sandbox follows `AGENT_SANDBOX_IMAGE`, else
+`OPERATOR_IMAGE` with the repository swapped to `agent-sandbox`, else the ghcr.io default; the
+chart always sets `AGENT_SANDBOX_IMAGE`. Setting `CREDENTIAL_PROXY_IMAGE` or `KUBE_PROXY_IMAGE`
+explicitly still wins, which is why `install.sh` leaves them unset: one explicit
+`CREDENTIAL_PROXY_IMAGE` pins the broker for every agent in the cluster, where the per-CR
+derivation keeps each broker in step with its own agent's image.
 
 Per-agent, `spec.deployment.image` / `spec.deployment.tag` on a `PlatformAgent` override all of
 the above for that agent's containers — see the

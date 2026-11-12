@@ -120,7 +120,7 @@ Do not run `--reset-ledger` yourself: it is an operator's remedy, the second aft
 }
 ```
 
-`check` is the backticked slug from the heading below; `command` is the read as it ran. The validator rejects an unknown slug, a duplicate and a command under eight characters. It also rejects a command naming none of `kubectl`, `gcloud`, `gsutil`, `bq`, `helm` or `curl`, and a call back into `audit_report.py`. Leave the list as `draft` wrote it. A check added by hand fails the cross-check, and a check the collector left out did not run there.
+`check` is the backticked slug from the heading below; `command` is the read as it ran. The validator rejects an unknown slug, a duplicate and a command under eight characters. It also rejects a command naming none of `kubectl`, `gcloud`, `bq`, `helm` or `curl`, and a call back into `audit_report.py`. Leave the list as `draft` wrote it. A check added by hand fails the cross-check, and a check the collector left out did not run there.
 
 #### 3.1 GKE reported an upgrade operation as failed (`upgrade-operation-failed`)
 
