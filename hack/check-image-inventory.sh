@@ -482,12 +482,12 @@ image_refs() {
 # registry port (host:5000/name) is not mistaken for one. ref_pin keeps the
 # digest (tag@sha256:...), because that is the form images.json pins a tag and
 # a digest together with and what the chart's default render must match byte for
-# byte. No render reaches that branch today: images.json pins five entries as
+# byte. No render reaches that branch today: images.json pins six entries as
 # tag@digest — hindsight-api, hindsight-postgresql, busybox,
-# prometheus-nats-exporter and, through tags.env, the Hermes base. busybox and
-# the Hermes base are build-time, the Hindsight pair sits behind
-# hindsight.enabled, which no render below turns on, and the exporter is the
-# operator's to render, not the chart's.
+# nats-server-config-reloader, prometheus-nats-exporter and, through tags.env,
+# the Hermes base. busybox and the Hermes base are build-time, the Hindsight
+# pair sits behind hindsight.enabled, which no render below turns on, and the
+# reloader and the exporter are the operator's to render, not the chart's.
 # The branch is what keeps the comparison right when one of them does reach a
 # render.
 split_ref() {

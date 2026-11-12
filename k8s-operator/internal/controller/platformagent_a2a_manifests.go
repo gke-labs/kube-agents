@@ -5121,9 +5121,12 @@ const a2aNATSExporterBinary = "/prometheus-nats-exporter"
 // restarts it whenever it exits, logging the exit code, after a pause that
 // doubles from 1s to 30s and starts again at 1s once a run has lasted a
 // minute, so a crashing exporter cannot spin. The shell is the container's
-// PID 1, which gets no default signal handling: the trap kills the exporter
-// (or the pause) and exits at once on TERM or INT, so a pod delete or a
-// NATS drain is not held for the grace period. The image is alpine, so sh,
+// main process, the one the kubelet's TERM reaches. The pod shares one
+// process namespace for the config reloader, so the shell isn't PID 1 (the
+// pause process is), and the trap is what ends the run cleanly: it kills the
+// exporter (or the pause) and exits at once on TERM or INT, so a pod delete
+// or a NATS drain is not held for the grace period, and no exporter is left
+// running past its shell. The image is alpine, so sh,
 // sleep, date and cat are busybox's.
 //
 // Before the first run it sets GOMEMLIMIT to 80% of the container's actual

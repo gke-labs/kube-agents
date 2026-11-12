@@ -222,14 +222,19 @@ Whether the A2A bus's pods carry the NATS exporter sidecar, so its PodMonitoring
 scrape-alert job render: "true" unless the operator omits the sidecar, which it does when
 operator.extraEnv sets A2A_NATS_IMAGE and not A2A_NATS_EXPORTER_IMAGE
 (a2aNATSExporterOmitted). An entry counts as set when it has a non-empty value or a
-valueFrom. Without the sidecar the scrape would only ever read down.
+valueFrom, and the last entry for a name wins, as it does in the operator container's env
+(operator-deployment.yaml appends extraEnv in order): a later empty entry clears an earlier
+one. Without the sidecar the scrape would only ever read down.
 */}}
 {{- define "kube-agents.a2aNATSExporterRendered" -}}
 {{- $set := dict -}}
 {{- range $e := (.Values.operator.extraEnv | default list) -}}
 {{- $e = $e | default dict -}}
+{{- $name := toString (index $e "name") -}}
 {{- if or (ne (toString (index $e "value" | default "")) "") (index $e "valueFrom") -}}
-{{- $_ := set $set (toString (index $e "name")) true -}}
+{{- $_ := set $set $name true -}}
+{{- else -}}
+{{- $_ := unset $set $name -}}
 {{- end -}}
 {{- end -}}
 {{- if or (not (hasKey $set "A2A_NATS_IMAGE")) (hasKey $set "A2A_NATS_EXPORTER_IMAGE") -}}
