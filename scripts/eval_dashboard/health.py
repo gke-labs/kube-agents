@@ -1426,11 +1426,17 @@ def _run_name(run) -> str:
 
 
 def _death_words(death: dict) -> str:
-    """"every pod Killing" from a death's reasons, commonest first, scrubbed
-    like any quoted line; "every pod deleted" when the record names none."""
+    """The death's reasons, scrubbed like any quoted line: "every pod Killing"
+    for a reason that reached every dead pod, "every pod deleted" when none
+    did, and the commonest of the rest with their counts ("; 1 Preempted"),
+    STORM_CAUSES_SHOWN of them."""
     reasons = death.get("reasons") if isinstance(death.get("reasons"), dict) else {}
-    names = [periodics.quotable(str(reason)) for reason, _ in sorted(reasons.items(), key=lambda kv: (-kv[1], str(kv[0])))[:STORM_CAUSES_SHOWN]]
-    return "every pod " + (", ".join(names) if names else "deleted")
+    pods = death.get("pods") if isinstance(death.get("pods"), int) else 0
+    ranked = sorted(((periodics.quotable(str(reason)), n) for reason, n in reasons.items() if isinstance(n, int)), key=lambda kv: (-kv[1], kv[0]))
+    every = [reason for reason, n in ranked if pods and n >= pods]
+    rest = [f"{n} {reason}" for reason, n in ranked if not (pods and n >= pods)][:STORM_CAUSES_SHOWN]
+    words = "every pod " + (", ".join(every[:STORM_CAUSES_SHOWN]) if every else "deleted")
+    return words + ("; " + ", ".join(rest) if rest else "")
 
 
 def _install_death_line(run) -> str:

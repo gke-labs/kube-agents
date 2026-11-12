@@ -408,6 +408,9 @@ EVENT_WATCH_FIRST, EVENT_WATCH_LAST, EVENT_WATCH_EVENT, EVENT_WATCH_REASON, EVEN
 # An event's time: lastTimestamp, else eventTime (events.k8s.io/v1 emitters
 # such as the scheduler fill only that one), else firstTimestamp.
 EVENT_WATCH_TIME_COLUMNS = (EVENT_WATCH_LAST, EVENT_WATCH_EVENT, EVENT_WATCH_FIRST)
+# The scheduler's reason on a pod's one scheduling event: a replacement
+# generation's first event, seconds before its startTime.
+POD_SCHEDULED_REASON = "Scheduled"
 WATCH_NONE = "<none>"
 WATCH_COLUMN_GAP = re.compile(r"\s{2,}")
 POD_PHASES_DONE = frozenset({"Succeeded", "Failed"})
@@ -1094,6 +1097,13 @@ def _watch_time(value) -> datetime | None:
         return None
 
 
+def _replaced_by(pods: dict, key: tuple, at: datetime) -> bool:
+    """Whether a newer generation of the same pod name had started by `at`."""
+    name, _ = key
+    started = pods[key][0]
+    return any(other_name == name and other_started and started < other_started <= at for (other_name, _), (other_started, _, _, _) in pods.items())
+
+
 def parse_install_deaths(pods_text: str | None, read_events) -> list[dict] | None:
     """The moments the install died, from the pods watch: every pod alive at
     one moment deleted within INSTALL_DEATH_SPAN. `None` when there is no
@@ -1128,11 +1138,17 @@ def parse_install_deaths(pods_text: str | None, read_events) -> list[dict] | Non
         dead = sorted(key for key, (started, deleting, _, _) in pods.items() if started and started <= at and deleting and at <= deleting < window_end)
         # A pod being deleted counts whatever its phase reads: an evicted
         # pod's last line can say Failed. Only a pod that finished on its own
-        # and stays (a Job's) is out of the set.
+        # and stays (a Job's) is out of the set, and so is a generation a
+        # newer one under the same name has replaced by `at` (two pods of
+        # one name cannot coexist; the watch can miss the older's deletion).
         alive = sorted(
             key
             for key, (started, deleting, phase, _) in pods.items()
-            if started and started <= at and (deleting is None or deleting >= at) and (deleting is not None or phase not in POD_PHASES_DONE)
+            if started
+            and started <= at
+            and (deleting is None or deleting >= at)
+            and (deleting is not None or phase not in POD_PHASES_DONE)
+            and not _replaced_by(pods, key, at)
         )
         if len(dead) < INSTALL_DEATH_MIN_PODS or dead != alive:
             continue
@@ -1142,7 +1158,14 @@ def parse_install_deaths(pods_text: str | None, read_events) -> list[dict] | Non
             reason = pods[key][3]
             if reason:
                 reasons[reason] = reasons.get(reason, 0) + 1
-        dead_names = {name for name, _ in dead}
+        # Events of a replacement generation (its own Scheduled, Pulled,
+        # Started) are not the dead pod's: an event at or after the rebirth
+        # is dropped. The rebirth is the newer same-name start, or its
+        # Scheduled event, which comes seconds earlier.
+        reborn = {}
+        for (name, _), (started, _, _, _) in pods.items():
+            if started and started > at and any(name == dead_name for dead_name, _ in dead):
+                reborn[name] = min(started, reborn.get(name, started))
         messages: dict[str, int] = {}
         if events is None:
             # A reopened watch re-lists every event, so one event is many
@@ -1151,7 +1174,15 @@ def parse_install_deaths(pods_text: str | None, read_events) -> list[dict] | Non
             events = [row for row in _watch_rows(read_events() or "") if tuple(sorted(row.items())) not in seen and not seen.add(tuple(sorted(row.items())))]
         for row in events:
             when = next((t for t in (_watch_time(row.get(column)) for column in EVENT_WATCH_TIME_COLUMNS) if t), None)
-            if row.get(EVENT_WATCH_NAME) not in dead_names or not when or not (at - INSTALL_DEATH_SPAN <= when < window_end):
+            name = row.get(EVENT_WATCH_NAME)
+            if name in reborn and row.get(EVENT_WATCH_REASON) == POD_SCHEDULED_REASON and when and at < when < reborn[name]:
+                reborn[name] = when
+        for row in events:
+            when = next((t for t in (_watch_time(row.get(column)) for column in EVENT_WATCH_TIME_COLUMNS) if t), None)
+            name = row.get(EVENT_WATCH_NAME)
+            if not any(name == dead_name for dead_name, _ in dead) or not when or not (at - INSTALL_DEATH_SPAN <= when < window_end):
+                continue
+            if name in reborn and when >= reborn[name]:
                 continue
             reason = row.get(EVENT_WATCH_REASON)
             if reason:

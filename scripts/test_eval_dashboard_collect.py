@@ -3370,6 +3370,28 @@ class InstallDeathTest(unittest.TestCase):
         self.assertEqual(pods.split(",")[0].split(":")[0], collect.POD_WATCH_NAME)
         self.assertEqual(events.split(",")[0].split(":")[0], collect.EVENT_WATCH_FIRST)
 
+    def test_a_newer_generation_under_the_same_name_ends_the_older_one(self):
+        # The watch missed shell-0's first deletion (a reopen gap): its first
+        # generation keeps a row with no DELETING, a second generation started
+        # before the drain and died in it. The first is not alive at the
+        # drain, so the death still reads.
+        text = self.text("drained-pods-watch.txt")
+        gap = text.replace(f"{'platform-agent-shell-0':<50} {'Running':<11} {'<none>':<11} {'2026-10-29T01:04:00Z':<22} {'2026-10-29T02:02:08Z':<22}", f"{'platform-agent-shell-0':<50} {'Running':<11} {'<none>':<11} {'2026-10-29T02:01:00Z':<22} {'2026-10-29T02:02:08Z':<22}")
+        self.assertNotEqual(gap, text)
+        deaths = collect.parse_install_deaths(gap, lambda: self.text("drained-events-watch.txt"))
+        self.assertEqual((len(deaths), deaths[0]["pods"]), (1, 8), deaths)
+
+    def test_a_replacement_generations_own_events_are_not_the_dead_pods(self):
+        # The replacement's Scheduled and Pulled come seconds before its
+        # startTime (02:02:30): neither is the dead pod's.
+        rows = [
+            f"{'2026-10-29T02:02:25Z':<22} {'2026-10-29T02:02:25Z':<22} {'<nil>':<22} 1       Normal    Scheduled                        Pod                     {'platform-agent-a2a-nats-0':<50} Successfully assigned kubeagents-system/platform-agent-a2a-nats-0 to gk3-node",
+            f"{'2026-10-29T02:02:27Z':<22} {'2026-10-29T02:02:27Z':<22} {'<nil>':<22} 1       Normal    Pulled                           Pod                     {'platform-agent-a2a-nats-0':<50} Container image already present on machine",
+        ]
+        events = self.text("drained-events-watch.txt") + "\n".join(rows) + "\n"
+        death = collect.parse_install_deaths(self.text("drained-pods-watch.txt"), lambda: events)[0]
+        self.assertEqual(death["reasons"], {"Killing": 8, "Preempted": 1})
+
     def test_a_pod_born_and_deleted_inside_the_span_is_neither_alive_nor_dead(self):
         text = self.text("drained-pods-watch.txt")
         extra = f"{'platform-agent-a2a-gateway-7c95444d84-short':<50} {'Running':<11} {'<none>':<11} {'2026-10-29T02:02:20Z':<22} {'2026-10-29T02:02:50Z':<22} c                            0          <none>   <none>   <none>\n"

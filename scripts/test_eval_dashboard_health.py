@@ -753,6 +753,9 @@ class Storm(unittest.TestCase):
         self.assertEqual(result["incident"]["causes"], [["the executor's own failure (hermes-rate-limited)", 18]])
         self.assertEqual(result["incident"]["prs"], [5000, 5001, 5002])
         self.assertIn("install died: PR #4158 on kube-agents-evals-18 at 02:02 UTC, every pod Killing; 8 case attempts not counted as a storm", result["evidence"])
+        # A reason that did not reach every pod is counted, not generalised.
+        mixed = run_with(100, 4158, 0, board, 8, project="kube-agents-evals-18", install_deaths=[{"at": "2026-10-29T02:02:08Z", "pods": 8, "reasons": {"Killing": 8, "Preempted": 1}, "messages": []}])
+        self.assertIn("install died: PR #4158 on kube-agents-evals-18 at 02:02 UTC, every pod Killing; 1 Preempted; 8 case attempts not counted as a storm", assess(data(mixed, *others), T0)["evidence"])
         # A death with no reasons recorded still reads as a death.
         bare = run_with(100, 4158, 0, board, 8, project="kube-agents-evals-18", install_deaths=[{"at": "2026-10-29T02:02:08Z", "pods": 12, "reasons": {}, "messages": []}])
         self.assertIn("install died: PR #4158 on kube-agents-evals-18 at 02:02 UTC, every pod deleted; 8 case attempts not counted as a storm", assess(data(bare, *others), T0)["evidence"])

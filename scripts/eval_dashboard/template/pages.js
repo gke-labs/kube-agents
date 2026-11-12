@@ -609,7 +609,10 @@ function breakFacts(inc, inWindow) {
   const mergeFact = mergesFact(inc, inWindow);
   if (mergeFact) facts.push(mergeFact);
   let reps = 0, storm = 0;
-  for (const run of hit) for (const c of run.cases || []) { reps += repTotal(c.reps); storm += c.reps.infra; }
+  for (const run of hit) {
+    for (const c of run.cases || []) reps += repTotal(c.reps);
+    storm += runStormReps(run);
+  }
   const quiet = reps > 0 && storm / reps < PAGE.stormNoiseShare;
   facts.push(fact(!quiet, quiet
     ? `Not a quota storm: the agent ran and was graded on ${pct(1 - storm / reps)} of repetitions in these runs.`
@@ -617,14 +620,22 @@ function breakFacts(inc, inWindow) {
   return facts;
 }
 
+// The run's storm losses as classify.py and health.py count them: none from
+// a run whose install died (`storm_reps` is 0 there); the per-case sum is the
+// fallback for a run row written before the field existed.
+function runStormReps(run) {
+  if (typeof run.storm_reps === "number") return run.storm_reps;
+  return (run.cases || []).reduce((n, c) => n + (c.cls === "install-died" ? 0 : (c.reps.infra || 0)), 0);
+}
+
 function stormFacts(inc, inWindow) {
   let reps = 0, storm = 0;
   const prs = new Set();
   const projects = new Set();
   for (const run of inWindow) {
-    let mine = 0;
-    // A dead install's lost attempts are repetitions that ran, not the storm's.
-    for (const c of run.cases || []) { reps += repTotal(c.reps); if (c.cls === "install-died") continue; storm += c.reps.infra; mine += c.reps.infra; }
+    for (const c of run.cases || []) reps += repTotal(c.reps);
+    const mine = runStormReps(run);
+    storm += mine;
     if (mine) { if (run.pr != null) prs.add(run.pr); if (run.project) projects.add(run.project); }
   }
   const graded = inWindow.flatMap((r) => (r.cases || []).filter((c) => c.admitted && c.outcome !== "infra"));
