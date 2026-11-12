@@ -173,9 +173,9 @@ const (
 	// Docker Hub spelling stays: it is the string the operator renders, and
 	// qualifying it to docker.io/library/... would change the pod template
 	// on every running next install, rolling the NATS pod and minting a new
-	// provision Job for the same image. Pinned by exact version and digest,
-	// the OCI index (amd64 and arm64), like the reloader and the exporter: a
-	// floating tag would let two installs a day apart run different servers.
+	// provision Job for the same image. Pinned by exact version and the
+	// digest of its multi-arch OCI index, like the reloader and the exporter:
+	// a floating tag would let two installs a day apart run different servers.
 	// A bump changes this string, images.json and the docs table together,
 	// and rolls every running bus once.
 	a2aNATSImageEnvVar      = "A2A_NATS_IMAGE"
