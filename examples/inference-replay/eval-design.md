@@ -277,7 +277,7 @@ they are when a network range is in the request.
 
 ## Measurements
 
-All on one dev install, `spec.mode: next`, Gemini 3.1 Pro via LiteLLM. Each row is one recording
+All on one dev install, `spec.mode: next`, the agent model via LiteLLM. Each row is one recording
 followed by replays of that same recording minutes later; "tokens" is the share of prompt tokens
 served from the cache.
 
