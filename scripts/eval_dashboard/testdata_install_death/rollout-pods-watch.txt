@@ -1,0 +1,14 @@
+NAME                                               PHASE       REASON      STARTED                DELETING               CONTAINERS                   RESTARTS   LAST     EXIT     FINISHED
+platform-agent-a2a-gateway-7c95444d84-sp869        Running     <none>      2026-10-29T01:00:00Z   <none>                 c                            0          <none>   <none>   <none>
+platform-agent-a2a-verifier-5775f4f954-zj489       Running     <none>      2026-10-29T01:03:30Z   <none>                 c                            0          <none>   <none>   <none>
+platform-agent-a2a-nats-0                          Running     <none>      2026-10-29T01:01:00Z   <none>                 c                            0          <none>   <none>   <none>
+platform-agent-a2a-provision-7fffc6c8-7ql6w        Running     <none>      2026-10-29T01:02:00Z   <none>                 c                            0          <none>   <none>   <none>
+platform-agent-a2a-verifier-5775f4f954-zhsds       Running     <none>      2026-10-29T01:03:00Z   <none>                 c                            0          <none>   <none>   <none>
+platform-agent-shell-0                             Running     <none>      2026-10-29T01:04:00Z   <none>                 c                            0          <none>   <none>   <none>
+platform-agent-credential-proxy-b99b94477-x726p    Running     <none>      2026-10-29T01:05:00Z   <none>                 c                            0          <none>   <none>   <none>
+kube-agents-controller-manager-65c567bfbf-62sw7    Running     <none>      2026-10-29T01:06:00Z   <none>                 c                            0          <none>   <none>   <none>
+github-token-minter-5fd6c5fbcc-48srh               Running     <none>      2026-10-29T01:07:00Z   <none>                 c                            0          <none>   <none>   <none>
+platform-agent-a2a-gateway-7c95444d84-sp869        Running     <none>      2026-10-29T01:00:00Z   2026-10-29T02:02:08Z   c                            0          <none>   <none>   <none>
+platform-agent-credential-proxy-b99b94477-x726p    Running     <none>      2026-10-29T01:05:00Z   2026-10-29T02:03:30Z   c                            0          <none>   <none>   <none>
+platform-agent-a2a-verifier-5775f4f954-zhsds       Running     <none>      2026-10-29T01:03:00Z   2026-10-29T02:10:00Z   c                            0          <none>   <none>   <none>
+platform-agent-a2a-verifier-5775f4f954-zj489       Running     <none>      2026-10-29T01:03:30Z   2026-10-29T02:10:04Z   c                            0          <none>   <none>   <none>

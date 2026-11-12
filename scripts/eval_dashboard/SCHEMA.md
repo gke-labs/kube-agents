@@ -122,6 +122,19 @@ layout and are collected from the moment they start running.
   a document written before the collector recorded it has no key.
 - `project` — from the `Successfully leased project: <name>` log line;
   `null` when the log never got that far.
+- `install_deaths` — **optional, additive**: the moments the run's install
+  died, from the job's watch of the install's pods
+  (`artifacts/agent-pods-watch.txt`): every pod alive at one moment (two or
+  more) deleted within 60 seconds, as a node upgrade or an autoscaler
+  scale-down does to a single-node install; a rollout never empties the set.
+  Each is `{at, pods, reasons, messages}`: when, how many pods, the pods' own
+  status reasons and the namespace events' reasons for them in the minute
+  either side of the first deletion, counted (`{"Killing": 12}`), and up to
+  two of those events' messages, each cut to 160 characters. `[]` when the
+  watch shows none; absent when the build has no watch to read (a record from
+  before the job kept one), which `health.py` counts as no death. The storm
+  rule leaves such a run's attempts out of its count (`docs/ci-health.md`,
+  the storm paragraph).
 - `started` / `finished` — `started.json` / `finished.json` timestamps as
   ISO 8601 UTC; `null` when unparseable.
 - `result` — `finished.json`'s `result` verbatim: `SUCCESS`, `FAILURE` or

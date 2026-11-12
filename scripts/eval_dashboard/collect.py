@@ -386,6 +386,32 @@ PRIVATE_LOG_BUCKETS = links.PRIVATE_LOG_BUCKETS
 # scoring.py's SUITE_OUTCOME_NOT_EVALUATED and hack/ci-eval-pr.sh's
 # EVAL_VERDICT_OUTCOME_NOT_EVALUATED.
 EVAL_VERDICT_FILE = "artifacts/eval-verdict.json"
+# hack/ci-env.sh's watches of the install's own namespace, kept for the whole
+# eval (started once the host cluster is known, so the install's own rollout
+# is not in them): the pods, one line per change with the pod's deletion
+# timestamp, and the namespace's events. Read for every build (the pods file
+# is a few KB); the events file only for a build whose pods file shows the
+# install dying, to quote what Kubernetes said about those pods.
+POD_WATCH_FILE = "artifacts/agent-pods-watch.txt"
+EVENT_WATCH_FILE = "artifacts/agent-events-watch.txt"
+# An install died when every pod alive at one moment was deleted within this
+# span (a node upgrade, an autoscaler scale-down: the whole single-node
+# install goes at once). A rollout replaces pods one at a time and never
+# empties the set.
+INSTALL_DEATH_SPAN = timedelta(seconds=60)
+INSTALL_DEATH_MIN_PODS = 2
+# The watch columns (AGENT_DIAG_WATCH_POD_COLUMNS / _EVENT_COLUMNS there),
+# by header name; a reprinted header or a reworded column leaves the field
+# unread rather than misread.
+POD_WATCH_NAME, POD_WATCH_PHASE, POD_WATCH_REASON, POD_WATCH_STARTED, POD_WATCH_DELETING = "NAME", "PHASE", "REASON", "STARTED", "DELETING"
+EVENT_WATCH_FIRST, EVENT_WATCH_LAST, EVENT_WATCH_REASON, EVENT_WATCH_NAME, EVENT_WATCH_MESSAGE = "FIRST", "LAST", "REASON", "NAME", "MESSAGE"
+WATCH_NONE = "<none>"
+WATCH_COLUMN_GAP = re.compile(r"\s{2,}")
+POD_PHASES_DONE = frozenset({"Succeeded", "Failed"})
+# How many of the dead pods' distinct event messages a death record keeps,
+# commonest first, each cut to this many characters.
+INSTALL_DEATH_MESSAGES = 2
+INSTALL_DEATH_MESSAGE_CHARS = 160
 NOT_EVALUATED_MARKER = "NOT EVALUATED"
 EVAL_OUTCOME_NOT_EVALUATED = "not_evaluated"
 # The artifact's two lists (scoring.py, SuiteVerdict.to_dict). Two writers
@@ -1035,6 +1061,106 @@ def parse_clone_records(text: str | None) -> bool | None:
     return conflict
 
 
+def _watch_rows(text: str) -> list[dict]:
+    """A watch file's data rows as {column: value}, `<none>` as None. The
+    file is a `kubectl get --watch -o custom-columns` stream that reprints
+    its header (and every object) each time the watch is reopened."""
+    rows: list[dict] = []
+    columns: list[str] = []
+    for line in (text or "").splitlines():
+        cells = WATCH_COLUMN_GAP.split(line.rstrip())
+        if not cells or not cells[0]:
+            continue
+        if cells[0] in (POD_WATCH_NAME, EVENT_WATCH_FIRST):
+            columns = cells
+            continue
+        if not columns:
+            continue
+        rows.append({name: (None if value == WATCH_NONE else value) for name, value in zip(columns, cells)})
+    return rows
+
+
+def _watch_time(value) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def parse_install_deaths(pods_text: str | None, read_events) -> list[dict] | None:
+    """The moments the install died, from the pods watch: every pod alive at
+    one moment deleted within INSTALL_DEATH_SPAN. `None` when there is no
+    pods watch to read (an older build); `[]` when it shows no death.
+    `read_events()` is called at most once, on the first death, for the
+    events watch, whose reasons and messages for the dead pods are quoted as
+    Kubernetes wrote them: `{at, pods, reasons: {reason: n}, messages: [..]}`."""
+    if pods_text is None:
+        return None
+    last: dict[str, dict] = {}
+    for row in _watch_rows(pods_text):
+        name = row.get(POD_WATCH_NAME)
+        if name:
+            last[name] = row
+    pods = {
+        name: (_watch_time(row.get(POD_WATCH_STARTED)), _watch_time(row.get(POD_WATCH_DELETING)), row.get(POD_WATCH_PHASE), row.get(POD_WATCH_REASON))
+        for name, row in last.items()
+    }
+    deletions = sorted((deleting, name) for name, (_, deleting, _, _) in pods.items() if deleting)
+    deaths: list[dict] = []
+    events: list[dict] | None = None
+    until = None
+    for at, _ in deletions:
+        if until and at < until:
+            continue
+        window_end = at + INSTALL_DEATH_SPAN
+        # Both sets are the pods alive at `at`: a pod created and deleted
+        # inside the span (a replacement a drain caught) is neither.
+        dead = sorted(name for name, (started, deleting, _, _) in pods.items() if started and started <= at and deleting and at <= deleting < window_end)
+        # A pod being deleted counts whatever its phase reads: an evicted
+        # pod's last line can say Failed. Only a pod that finished on its own
+        # and stays (a Job's) is out of the set.
+        alive = sorted(
+            name
+            for name, (started, deleting, phase, _) in pods.items()
+            if started and started <= at and (deleting is None or deleting >= at) and (deleting is not None or phase not in POD_PHASES_DONE)
+        )
+        if len(dead) < INSTALL_DEATH_MIN_PODS or dead != alive:
+            continue
+        until = window_end
+        reasons: dict[str, int] = {}
+        for name in dead:
+            reason = pods[name][3]
+            if reason:
+                reasons[reason] = reasons.get(reason, 0) + 1
+        messages: dict[str, int] = {}
+        if events is None:
+            # A reopened watch re-lists every event, so one event is many
+            # rows: count each distinct row once.
+            seen: set = set()
+            events = [row for row in _watch_rows(read_events() or "") if tuple(sorted(row.items())) not in seen and not seen.add(tuple(sorted(row.items())))]
+        for row in events:
+            when = _watch_time(row.get(EVENT_WATCH_LAST))
+            if row.get(EVENT_WATCH_NAME) not in dead or not when or not (at - INSTALL_DEATH_SPAN <= when < window_end):
+                continue
+            reason = row.get(EVENT_WATCH_REASON)
+            if reason:
+                reasons[reason] = reasons.get(reason, 0) + 1
+            message = (row.get(EVENT_WATCH_MESSAGE) or "")[:INSTALL_DEATH_MESSAGE_CHARS]
+            if message:
+                messages[message] = messages.get(message, 0) + 1
+        deaths.append(
+            {
+                "at": at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "pods": len(dead),
+                "reasons": dict(sorted(reasons.items(), key=lambda kv: (-kv[1], kv[0]))),
+                "messages": [m for m, _ in sorted(messages.items(), key=lambda kv: (-kv[1], kv[0]))[:INSTALL_DEATH_MESSAGES]],
+            }
+        )
+    return deaths
+
+
 def build_run(
     build_id: str,
     read,
@@ -1160,6 +1286,10 @@ def build_run(
     else:
         ended = {"has_build_log": True}
 
+    # The install's own deaths (SCHEMA.md `install_deaths`): absent when the
+    # build has no pods watch to read.
+    install_deaths = parse_install_deaths(read(POD_WATCH_FILE), lambda: read(EVENT_WATCH_FILE))
+
     pr = pr_hint
     pull = started.get("pull")
     if isinstance(pull, (int, str)) and str(pull).isdigit():
@@ -1197,6 +1327,7 @@ def build_run(
         "head_sha": head_sha,
         "base_sha": base_sha,
         "project": parsed["project"],
+        **({"install_deaths": install_deaths} if install_deaths is not None else {}),
         "started": _iso(started_ts),
         "finished": _iso(finished_ts),
         "result": result,
