@@ -935,6 +935,16 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	if muted {
 		endState = lib.StateCanceled
 	}
+	// Toward its observers and its mark, a turn whose request minted no child
+	// keeps the hand-off rule (handOffEnd): it ends failed with the reason on
+	// its entry, the turn having been stopped, and delivers nothing. Read
+	// once settleHandOff below has written what the stream shows.
+	observedEnd := func() lib.TaskState {
+		if _, _, handOff := rec.handOffEnd(taskID, s.Status.State); handOff {
+			return s.Status.State
+		}
+		return endState
+	}
 	// A turn answer still assembling posts before the deliverable it led to.
 	if muted && rs.turnPending {
 		rs.turn, rs.turnChunks, rs.turnPending = nil, nil, false
@@ -1140,7 +1150,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		// An executor's own mark is a write like any other.
 		terminal = chatmsg.Reading{}
 	}
-	g.terminalMark(rec, taskID, endState, terminal)
+	g.terminalMark(rec, taskID, observedEnd(), terminal)
 
 	if active := rec.ActiveTask; active != nil && active.TaskID == taskID {
 		if active.StatusMsgID != "" && !lineAnswered {
@@ -1251,7 +1261,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			root, _ := rec.observedAs(taskID)
 			rec.markCardsPending(root)
 		}
-		g.observeEnded(rec, taskID, endState, source, reason)
+		g.observeEnded(rec, taskID, observedEnd(), source, reason)
 	}
 
 	// A fan-out child's end is kept until its last sibling's, which wakes
