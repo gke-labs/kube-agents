@@ -317,6 +317,12 @@ STACK_KUSTOMIZATION = textwrap.dedent("""\
       - checkout-gateway.yaml
     """)
 FOREIGN_KUSTOMIZATION = STACK_KUSTOMIZATION.replace("managed-by: kube-agents-bench", "team: reliability")
+# The four files bench/tf/prebuilt/context-repository-owns-the-fix plants
+# under the pool's host cluster directory, in the order the stack writes them.
+CONTEXT_FIX_FILES = tuple(
+    f"clusters/platform-agent-host/demo-shop/payments/{name}"
+    for name in ("source.yaml", "release.yaml", "values.enc.yaml", "legacy-env.yaml")
+)
 
 
 class PlantedStackFileTest(unittest.TestCase):
@@ -342,13 +348,26 @@ class PlantedStackFileTest(unittest.TestCase):
         self.assertTrue(record["clean"])
         self.assertEqual([m for m, _, _ in github.calls if m == "DELETE"], [])
 
-    def test_no_file_is_a_quiet_clean_and_only_the_stack_paths_are_read(self):
+    def test_no_file_is_a_quiet_clean_and_only_the_planted_paths_are_read(self):
         github = FakeGitHub()
         record, _, err = run_reset(github)
         self.assertTrue(record["clean"])
         contents = [path for m, path, _ in github.calls if "/contents/" in path]
-        self.assertEqual(contents, [f"/repos/{REPO}/contents/{path}?ref=main" for path in (PLANTED, KCC_PLANTED)] * 2)
+        # The fixed paths, then the Config Connector declaration under the
+        # default seeded-a name.
+        reads = [f"/repos/{REPO}/contents/{path}?ref=main" for path in (*helper.PLANTED_STACK_FILES, KCC_PLANTED)]
+        self.assertEqual(contents, reads * 2)
         self.assertEqual(err, "")
+
+    def test_the_payments_directory_the_context_stack_left_is_deleted(self):
+        planted = {path: "kind: Fixture\nmetadata:\n  labels:\n    managed-by: kube-agents-bench\n" for path in CONTEXT_FIX_FILES}
+        github = FakeGitHub(files={**planted, "clusters/platform-agent-host/demo-shop/checkout.yaml": "kind: Deployment\n"})
+        record, _, _ = run_reset(github)
+        for path in CONTEXT_FIX_FILES:
+            self.assertNotIn(path, github.files)
+        self.assertIn("clusters/platform-agent-host/demo-shop/checkout.yaml", github.files)
+        self.assertEqual(record["stack_files_deleted"], list(CONTEXT_FIX_FILES))
+        self.assertTrue(record["clean"])
 
     def test_a_delete_github_refuses_leaves_the_repository_not_clean(self):
         github = FakeGitHub(files={PLANTED: STACK_KUSTOMIZATION}, fail={("DELETE", PLANTED): _http_error(409)})
@@ -367,7 +386,12 @@ class PlantedStackFileTest(unittest.TestCase):
 
     def test_the_path_and_the_label_are_the_stacks(self):
         stack = (REPO_ROOT / "bench" / "tf" / "prebuilt" / "kustomize-overlay-declaration")
-        self.assertEqual(helper.PLANTED_STACK_FILES, (PLANTED,))
+        self.assertEqual(helper.PLANTED_STACK_FILES, (PLANTED, *CONTEXT_FIX_FILES))
+        # The context stack plants under the host cluster hack/ci-eval-pr.sh
+        # exports from hack/ci-env.sh; the reset's copy of that name has to be
+        # the same, or a killed unit's four files stay while the reset reads clean.
+        ci_env = (REPO_ROOT / "hack" / "ci-env.sh").read_text()
+        self.assertIn(f'HOST_CLUSTER_NAME="{helper.POOL_HOST_CLUSTER}"', ci_env)
         self.assertIn('default     = "clusters/seeded-a/seeded-reliability"', (stack / "variables.tf").read_text())
         plant = (stack / "plant.py").read_text()
         self.assertIn(f'MANAGED_BY_KEY = "{helper.STACK_LABEL_KEY}"', plant)
@@ -453,7 +477,7 @@ class PlantedConfigConnectorDeclarationTest(unittest.TestCase):
         self.assertIn('seeded_pool: "pinned-inference-pool"', task)
         self.assertIn('seeded_slot: "a"', task)
         self.assertEqual(helper.KCC_DECLARATION_PATH, "clusters/{cluster}/provisioning/pinned-inference-pool.yaml")
-        self.assertEqual(helper.planted_stack_files(), (PLANTED, KCC_PLANTED))
+        self.assertEqual(helper.planted_stack_files(), (PLANTED, *CONTEXT_FIX_FILES, KCC_PLANTED))
         self.assertIn('KCC_FLEET_SLOT="a"', SCRIPT.read_text(encoding="utf-8"))
         prefix = re.search(r'variable "cluster_prefix" \{(.*?)\n\}', (REPO_ROOT / "bench" / "tf" / "fleet" / "variables.tf").read_text(), re.DOTALL)
         self.assertIsNotNone(prefix, "the fleet's cluster_prefix variable")

@@ -5,7 +5,7 @@
 # all 40 pool projects. provisioning-kcc-cluster-without-crds-stops keeps
 # slot a out of its scope, so it still sees no Config Connector. A tofu case
 # that declares writes_alone (below), so it runs in the nightly's writers
-# part (writers-a, on neither writers list).
+# part (writers-b, listed in hack/eval/nightly-writers-b.txt).
 #
 # WHAT THIS GRADES. That a fix of a pool whose declaration Config Connector
 # does not apply says so in the ledger. The stockout collector reads Config

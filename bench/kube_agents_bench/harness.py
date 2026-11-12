@@ -302,6 +302,7 @@ _FRONT_DOOR_NON_ACTION_TOOLS = frozenset({
     inject.EVENT_ENTRY_STATUS,
     inject.EVENT_ENTRY_ACTIVITY,
     worker_trajectory.GAP_ENTRY,
+    worker_trajectory.NO_WORKER_CALLS_ENTRY,
 })
 
 # Character ceiling for card detail quoted in infrastructure failure errors.
@@ -1010,6 +1011,18 @@ _SESSION_ID_HEADER = "X-Hermes-Session-Id"
 _FAILURE_REASON_HEADER = "X-Hermes-Failure-Reason"
 
 
+def _closed_explicitly(card: board.BoardCard | None) -> bool:
+    """Whether the board holds ``card`` closed by an agent (:data:`_CLOSED_STATUS`,
+    or blocked with one of :data:`_CLOSING_BLOCK_KINDS`)."""
+    if card is None:
+        return False
+    # A breaker trip keeps an earlier block's kind and records the spawn's
+    # failure: a block with a failure error is the platform's, not a close.
+    return card.status == _CLOSED_STATUS or (
+        card.status == _BLOCKED_STATUS and card.block_kind in _CLOSING_BLOCK_KINDS and not card.error
+    )
+
+
 def _guardrail_blocked_cards(
     awaited: Sequence[str],
     on_board: dict[str, board.BoardCard] | None,
@@ -1133,6 +1146,14 @@ def _canonical_session_tokens(
 # set would run the wait to its ceiling and grade as the harness's, not the
 # worker's.
 _TERMINAL_STATUSES = frozenset({"done", "archived", "blocked", "failed", "cancelled"})
+# A card ended by an explicit close, which only an agent makes: completed, or
+# blocked with one of ``kanban_block``'s own kinds. The breaker's gave_up, the
+# rate-limit guardrail's ``transient`` block and the admission patch's
+# capacity block are the platform's, not a close, and neither is a card left
+# archived, failed or cancelled.
+_CLOSED_STATUS = "done"
+_BLOCKED_STATUS = "blocked"
+_CLOSING_BLOCK_KINDS = frozenset({"needs_input", "dependency", "capability"})
 _BOARD_INFRA_STATUSES = frozenset({"blocked", "triage"})
 
 
@@ -4489,7 +4510,12 @@ class KubeAgentsHarness(AgentHarness):
             # _settle's own gap entry stays, with its reasons; only what it
             # added besides is withheld.
             added = result.trajectory[before:]
-            kept = [e for e in added if isinstance(e, dict) and e.get("name") == worker_trajectory.GAP_ENTRY]
+            kept = [
+                e
+                for e in added
+                if isinstance(e, dict)
+                and e.get("name") in (worker_trajectory.GAP_ENTRY, worker_trajectory.NO_WORKER_CALLS_ENTRY)
+            ]
             withheld = [e for e in added if e not in kept]
             result.trajectory[before:] = kept
             if withheld:
@@ -4894,6 +4920,19 @@ class KubeAgentsHarness(AgentHarness):
 
         trajectory_clean = captured is not None and not bool(worker_trajectory.gaps(captured.summary))
         logs_clean = logs is None or all(l is not None for l in logs.values())
+        # Every awaited card closed, a clean read, and not one worker entry or
+        # logged command: the workers made no call, which the workers-scope
+        # checks grade rather than set aside (worker_trajectory.NO_WORKER_CALLS_ENTRY).
+        if (
+            awaited
+            and trajectory_clean
+            and logs_clean
+            and on_board is not None
+            and not result.metadata.get("worker_commands")
+            and not any(isinstance(e, dict) and e.get("agent") for e in captured.entries)
+            and all(_closed_explicitly(on_board.get(t)) for t in awaited)
+        ):
+            result.trajectory.append(worker_trajectory.no_worker_calls_entry(awaited))
         worker_acted = (
             any(
                 isinstance(e, dict)

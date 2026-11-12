@@ -36,16 +36,18 @@ What goes, and what stays:
   bench/tf/prebuilt/kustomize-overlay-declaration plants for
   obtainability-pdb-kustomize-overlay; a leftover makes
   obtainability-major-pdb-auto-pr's fix manual on that project at every run.
-  It also names the Config Connector declaration that
-  bench/tf/prebuilt/kcc-stalled-declaration plants for
-  fleet-audit-manifest-fix-names-stalled-config-connector, at
+  It names the four files of the payments HelmRelease directory that
+  bench/tf/prebuilt/context-repository-owns-the-fix plants for
+  remediation-context-repository-owns-the-fix. It also names the Config
+  Connector declaration that bench/tf/prebuilt/kcc-stalled-declaration
+  plants for fleet-audit-manifest-fix-names-stalled-config-connector, at
   clusters/<seeded-a cluster>/provisioning/pinned-inference-pool.yaml; a
   leftover gives every other stockout audit on that project a declaration
   for the pool. Its path holds the real name of the seeded-a cluster, which
   the caller gives as --kcc-cluster (the .fleet-context that
   hack/fleet-kubeconfigs.sh wrote, as the stack's own inputs); without it,
   the name the fleet's default cluster_prefix gives. Each stack removes its
-  file at its destroy. Two things leave it: a unit killed before that
+  own files at its destroy. Two things leave them: a unit killed before that
   destroy, and a teardown that failed (devops-bench logs a teardown error and
   goes on, and the state is the run's own, so nothing applies the destroy
   again). A file at such a path without the label stays. The GitHub path
@@ -104,10 +106,21 @@ RETRYABLE_STATUS_FLOOR = 500
 CALL_FAULTS = (urllib.error.HTTPError, OSError, http.client.HTTPException)
 # The files a case stack plants on the default branch and that this reset
 # deletes when a killed unit left them, and the label that makes such a file
-# the stack's. bench/tf/prebuilt/kustomize-overlay-declaration/plant.py and
-# bench/tf/prebuilt/kcc-stalled-declaration/plant.py write the same paths and
-# label; scripts/test_ci_eval_agent_pulls_reset.py holds them equal.
-PLANTED_STACK_FILES = ("clusters/seeded-a/seeded-reliability/kustomization.yaml",)
+# the stack's. bench/tf/prebuilt/kustomize-overlay-declaration/plant.py writes
+# the first path, bench/tf/prebuilt/context-repository-owns-the-fix/plant.py
+# the four under the pool's host cluster directory, and
+# bench/tf/prebuilt/kcc-stalled-declaration/plant.py the Config Connector
+# declaration (KCC_DECLARATION_PATH), each with the label;
+# scripts/test_ci_eval_agent_pulls_reset.py holds them equal.
+POOL_HOST_CLUSTER = "platform-agent-host"
+CONTEXT_FIX_DIRECTORY = f"clusters/{POOL_HOST_CLUSTER}/demo-shop/payments"
+PLANTED_STACK_FILES = (
+    "clusters/seeded-a/seeded-reliability/kustomization.yaml",
+    f"{CONTEXT_FIX_DIRECTORY}/source.yaml",
+    f"{CONTEXT_FIX_DIRECTORY}/release.yaml",
+    f"{CONTEXT_FIX_DIRECTORY}/values.enc.yaml",
+    f"{CONTEXT_FIX_DIRECTORY}/legacy-env.yaml",
+)
 # The Config Connector declaration's path, by the name of the seeded cluster
 # that runs Config Connector (KCC_FLEET_SLOT in hack/ci-eval-pr.sh), and that
 # name under the fleet's default cluster_prefix (bench/tf/fleet/variables.tf).

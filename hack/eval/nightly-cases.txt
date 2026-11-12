@@ -948,6 +948,16 @@
 # merge; a presubmit seat waits on a clean nightly record.
 ./tasks/chat-feedback-composes-and-asks-first/task.yaml
 
+# The "/feedback <text>" draft offers to add the install's usage summary
+# before the yes (docs/designs/chat-feedback-command.md §8, #4723): the
+# Planning Agent's first reply carries the composed submission, the warning,
+# the offer in the skill's words and a question, and files no card. Graded on
+# the reply, which both lanes carry; the opt-in turn reads a card and the
+# filing turn would file a public issue, so neither is in the case.
+# deployer: noop, no fixtures. Nightly from its first merge; a presubmit seat
+# waits on a clean nightly record.
+./tasks/chat-feedback-offers-usage-summary/task.yaml
+
 # An alert quoted in reply on Google Chat (the A2A gateway's gchatQuotedAsk,
 # the Chat sibling of the Slack shortcut) is investigated without a clarifying
 # question, and its "To resolve" line is not obeyed. deployer: noop; reads the
@@ -1102,6 +1112,12 @@
 # like obtainability-remediation-proposal. Nightly from its first merge.
 ./tasks/delegated-proposal-stays-in-reply/task.yaml
 
+# A fan-out's polling sleep and every worker command finish inside the terminal
+# limit rather than being cut at the 60 s Hermes' seeded .env set (#5423).
+# Worker-scope check, so it grades on the api lanes and on an inject record
+# that carries the workers' calls; no fixture.
+./tasks/fanout-commands-outlast-terminal-limit/task.yaml
+
 # The findings queue's item-wide decision when a sweep has added a finding to
 # the line since the nudge named it: the named rows are dismissed, the row no
 # message has named is not dismissed, and the other lines stay open.
@@ -1134,7 +1150,7 @@
 # both at destroy. Fixture: hpa-saturated. The fixture-state scan of
 # 2026-11-10 reads config-connector-namespaced healthy on all 40 pool
 # projects. writes_alone, because the stack writes to the GitOps repository's
-# default branch: it runs alone in the writers part (writers-a), after a
+# default branch: it runs alone in the writers part (writers-b), after a
 # repository reset that deletes a declaration a failed teardown left. It has
 # a stack and is not in infra_lock_exempt, so it also holds the infra lock.
 # Priced at the stockout audit's band plus the stack's waits. It has no
@@ -1182,9 +1198,10 @@
 # The GCE compute stream's chat route (#2386): a plain question about the
 # fleet's VMs runs the collector once and answers in chat, with no ledger run.
 # Reads the startup-fail-vm role (#2483), a VM whose startup script exits 1 on
-# every boot; deployer: noop, read-only. The fixture-state scan of 2026-11-06
-# reads the role healthy on all 40 pool projects. Nightly from the merge that
-# removes its FIXTURE_NOT_READY entry.
+# every boot; deployer: noop, read-only. The fixture-state scan checks the
+# failure line on its serial console, and each reconcile's reset of the VM
+# keeps it there. Nightly from the merge that removes its FIXTURE_NOT_READY
+# entry.
 ./tasks/gce-chat-request-runs-collector/task.yaml
 
 # The GCE compute audit end to end over the same standing plant (#2483): the
@@ -1292,12 +1309,34 @@
 # the teardown. writes_alone, so it runs alone in the writers part.
 ./tasks/obtainability-pdb-kustomize-overlay/task.yaml
 
+# A card that asks only for the install's usage summary is answered by the
+# kube-agents-feedback skill's summary subcommand (docs/designs/
+# chat-feedback-command.md §8, #4723): the result carries the script's
+# audited block, rating form cut, and nothing is filed. The worker's half of
+# the opt-in, measured as a plain ask. deployer: noop, no fixtures, one
+# resource read. Nightly from its first merge; a presubmit seat waits on a
+# clean nightly record.
+./tasks/platform-feedback-usage-summary-card/task.yaml
+
 # A delegated card written to outrun the worker budget: the worker runs under
 # the platform profile's 150 turns, read from Hermes' checkpoint notice in its
 # tool results or from the card's run row, not under the 250 the fleet audits
 # carry on their roster entries (#1947). deployer: noop, no fixture; the run
 # spends up to 150 trivial model calls by design, twice.
 ./tasks/platform-worker-turn-budget/task.yaml
+
+# A change request whose fix lives in a repository the agent reads and does
+# not write (#4905, defect 4 of #2597): the worker follows the HelmRelease
+# into the platform charts context repository, names the chart template
+# there and completes the card; no pull request, no decryption attempt.
+# prebuilt/context-repository-owns-the-fix plants the three-part fixture
+# for each run (the HelmRelease directory with the stack write token, the
+# payments-api workload on the agent host, the context_repos registration)
+# and removes it at destroy (#5213), so the case has no pool fixture: its
+# first nightly run is the pool proof of the plant and the teardown. The
+# chart repository is public and read with no credential. writes_alone, so
+# it runs alone in the writers part.
+./tasks/remediation-context-repository-owns-the-fix/task.yaml
 
 # A fleet question on an install whose spec.scope.exclude.clusters names
 # seeded-b: the answer names seeded-a and seeded-c and does not report on

@@ -280,13 +280,34 @@ spec:
     {{- $defaultStockoutTuning := dict "maxInProgress" 3 "platform" (dict "apiMaxRetries" 8 "maxTurns" 200) "cluster" (dict "apiMaxRetries" 8 "maxTurns" 150) }}
     {{- $tuning = merge $tuning $defaultStockoutTuning }}
     {{- end }}
-    {{- if or (hasKey $tuning "maxInProgress") (hasKey $tuning "maxSessions") $tuning.platform $tuning.cluster $tuning.default $tuning.profiles $tuning.admission }}
+    {{- if or (hasKey $tuning "maxInProgress") (hasKey $tuning "maxSessions") (hasKey $tuning "busReplicas") $tuning.platform $tuning.cluster $tuning.default $tuning.profiles $tuning.admission }}
     tuning:
       {{- if hasKey $tuning "maxInProgress" }}
       maxInProgress: {{ $tuning.maxInProgress }}
       {{- end }}
       {{- if hasKey $tuning "maxSessions" }}
       maxSessions: {{ $tuning.maxSessions }}
+      {{- end }}
+      {{- if hasKey $tuning "busReplicas" }}
+      {{- /*
+        A CRD that predates the field prunes it on write, and the release
+        record keeps it, so Helm never re-sends it. Pruned, a bus created
+        afterwards takes the default of three, and an existing bus's count
+        cannot change once it runs, so the value would never apply.
+      */}}
+      {{- $crd := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "platformagents.kubeagents.x-k8s.io" }}
+      {{- if $crd }}
+      {{- $tuningProps := dict }}
+      {{- range $crd.spec.versions }}
+      {{- if .storage }}
+      {{- $tuningProps = dig "schema" "openAPIV3Schema" "properties" "spec" "properties" "harness" "properties" "tuning" "properties" (dict) . }}
+      {{- end }}
+      {{- end }}
+      {{- if not (hasKey $tuningProps "busReplicas") }}
+      {{- fail "platformAgent.harness.tuning.busReplicas is set, but the installed PlatformAgent CRD predates spec.harness.tuning.busReplicas and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/, or run upgrade.sh, which does). Otherwise the API server prunes the value silently while the release record keeps it" }}
+      {{- end }}
+      {{- end }}
+      busReplicas: {{ $tuning.busReplicas }}
       {{- end }}
       {{- with $tuning.default }}
       default:
@@ -964,6 +985,19 @@ spec:
   {{- if and (has "gitea" (splitList "," $providers)) (not (has "gitea" $enum)) }}
   {{- fail "platformAgent.integration.forges declares a gitea forge, but the installed PlatformAgent CRD does not accept provider gitea, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/)" }}
   {{- end }}
+  {{- range (list "bitbucket" "bitbucket-datacenter") }}
+  {{- if and (has . (splitList "," $providers)) (not (has . $enum)) }}
+  {{- fail (printf "platformAgent.integration.forges declares a %s forge, but the installed PlatformAgent CRD does not accept provider %s, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/)" . .) }}
+  {{- end }}
+  {{- end }}
+  {{- /* The same for identity: a CRD that prunes it leaves a Bitbucket access token unable to name its own pull requests, with nothing to say why. */}}
+  {{- $identified := false }}
+  {{- range $forges }}
+  {{- if .identity }}{{ $identified = true }}{{ end }}
+  {{- end }}
+  {{- if and $identified (not (hasKey (dig "forges" "items" "properties" (dict) $props) "identity")) }}
+  {{- fail "platformAgent.integration.forges[].identity needs a PlatformAgent CRD that has the field, and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/)" }}
+  {{- end }}
   {{- /* The same for caBundleRef: a CRD that prunes it leaves the forge's certificate untrusted, with nothing to say why. */}}
   {{- $caBundled := false }}
   {{- range $forges }}
@@ -1020,6 +1054,9 @@ spec:
         {{- with (.credentialsRef | default dict).name }}
         credentialsRef:
           name: {{ . | quote }}
+        {{- end }}
+        {{- with .identity }}
+        identity: {{ . | toString | quote }}
         {{- end }}
         {{- with (.caBundleRef | default dict) }}
         {{- if .name }}

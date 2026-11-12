@@ -146,20 +146,20 @@ nextMode:
       pods: 0
   a2aNats:
     requests:
-      cpu: 260m
-      memory: 528Mi
-      ephemeral-storage: 64Mi
+      cpu: 780m
+      memory: 1584Mi
+      ephemeral-storage: 192Mi
     limits:
-      cpu: 1050m
-      memory: 1056Mi
-      ephemeral-storage: 64Mi
-    cpuMillisRequest: 260
-    cpuMillisLimit: 1050
-    memoryBytesRequest: 553648128
-    memoryBytesLimit: 1107296256
-    ephemeralStorageBytesRequest: 67108864
-    ephemeralStorageBytesLimit: 67108864
-    pods: 1
+      cpu: 3150m
+      memory: 3168Mi
+      ephemeral-storage: 192Mi
+    cpuMillisRequest: 780
+    cpuMillisLimit: 3150
+    memoryBytesRequest: 1660944384
+    memoryBytesLimit: 3321888768
+    ephemeralStorageBytesRequest: 201326592
+    ephemeralStorageBytesLimit: 201326592
+    pods: 3
     surges: false
   a2aCallout:
     requests:
@@ -246,6 +246,6 @@ nextMode:
     ephemeralStorageBytesLimit: 134217728
     pods: 1
   storage:
-    persistentVolumeClaims: 1
-    storageRequest: 40Gi
-    storageBytesRequest: 42949672960
+    persistentVolumeClaims: 3
+    storageRequest: 120Gi
+    storageBytesRequest: 128849018880

@@ -1018,6 +1018,29 @@ type TuningSpec struct {
 	// +optional
 	MaxSessions *int `json:"maxSessions,omitempty"`
 
+	// BusReplicas is how many NATS servers run the A2A bus under mode: next,
+	// and so how many copies JetStream keeps of every stream and bucket: 3
+	// runs a cluster with R3 streams, which keeps the bus up through a node
+	// drain, upgrade or eviction that moves one server; 1 runs a single
+	// server with R1 streams, which is down for as long as its pod restarts.
+	// 1 is for a throwaway, single-node or cost-bound install that accepts
+	// that outage; it saves two NATS pods and two 40Gi volumes.
+	//
+	// Unset, an install keeps the count its bus already runs, so an install
+	// whose next-mode bus predates the three-server default stays on one
+	// server, and a new bus gets three, including the one a today install's
+	// first switch to next creates (status.busReplicas shows which applies).
+	//
+	// Set, it decides the count of a bus that does not exist yet. An existing
+	// bus keeps the count it runs: NATS cannot carry a single server's streams
+	// into a cluster or a cluster's into a single server, and the migration
+	// that would keep them is not here yet, so a count that differs is refused
+	// (the A2ABusConversionRefused condition; the admission webhook refuses the
+	// edit) rather than emptying the bus (docs/designs/spec-nats-deployment.md).
+	// +kubebuilder:validation:Enum=1;3
+	// +optional
+	BusReplicas *int `json:"busReplicas,omitempty"`
+
 	// Profiles sizes AgentProfile work (#3655): the install-wide ceiling on
 	// concurrent profile tasks and the warm workers kept per interactive
 	// (profile, tier). Until the sizing budget exists these are fixed,
@@ -1111,6 +1134,11 @@ type ProfileTuning struct {
 	// +optional
 	WarmReplicas *int `json:"warmReplicas,omitempty"`
 }
+
+// DefaultBusReplicas is the NATS server count of a new bus when
+// spec.harness.tuning.busReplicas is absent: a three-server cluster with R3
+// streams. An existing bus keeps its own count.
+const DefaultBusReplicas = 3
 
 // MaxProfileCeiling is ProfileTuning.Ceiling's maximum, which the ceiling
 // also holds to when it defaults to maxInProgress.
@@ -2762,6 +2790,14 @@ type AgentStatus struct {
 	// +optional
 	StorageStatus StorageStatus `json:"storageStatus,omitempty"`
 
+	// BusReplicas is the A2A bus's NATS server count under spec.mode: next:
+	// the count the bus already runs, which spec.harness.tuning.busReplicas
+	// does not change; for a new bus, that field, or 3. Re-derived from the
+	// cluster on every reconcile, so it is a reading of the bus rather than a
+	// setting.
+	// +optional
+	BusReplicas int32 `json:"busReplicas,omitempty"`
+
 	// Note, deliberately not a doc comment — the blank line below keeps it out of the
 	// CRD description that `kubectl explain` prints. As on the three status structs
 	// above, omitempty does nothing here: encoding/json has no notion of an empty
@@ -2827,7 +2863,8 @@ type AgentStatus struct {
 // ChatMessagesInboundTotal, LastActiveTime, LastHumanActiveTime,
 // ClustersRegistered and ClustersMonitored from the broker's, the event watcher's, the chat
 // plugin's and, on a next install, the A2A gateway's metrics
-// listeners, and the six proposal readings (RemediationsMergedTotal,
+// listeners, InputTokensTotal, OutputTokensTotal and SpendMicrosUSDTotal from
+// the inference gateway's (LiteLLM's), and the six proposal readings (RemediationsMergedTotal,
 // RemediationsOpen, ProposalsAuthored, RemediationsClosedUnmergedTotal,
 // ProposalHumanTouches and ProposalsMergedUntouched) from the broker's, and
 // the two people readings (PeopleSeen7d and PeopleSeen30d) from the A2A
@@ -3047,6 +3084,37 @@ type AgentUsageStatus struct {
 	// person rated already did.
 	// +optional
 	PositiveFeedbackTotal int64 `json:"positiveFeedbackTotal,omitempty"`
+	// InputTokensTotal is the cumulative count of prompt tokens the inference
+	// gateway (LiteLLM) billed for the install's model calls, every model and
+	// every caller together. Read every five minutes from each LiteLLM pod's
+	// litellm_input_tokens_metric_total (or litellm_input_tokens_metric on a
+	// release that names it so), summed over its labels and across pods, and
+	// kept monotonic the same way as ToolExecutionsTotal, so a LiteLLM restart,
+	// which starts the pod's own counter at zero again, does not reset it. A
+	// per-poll delta ceiling sized for tokens applies, far above the one the
+	// other counters take. Does not move LastActiveTime: memory consolidation
+	// and the scheduled jobs bill through LiteLLM with nobody asking. Absent
+	// while the served CRD predates it.
+	// +optional
+	InputTokensTotal int64 `json:"inputTokensTotal,omitempty"`
+	// OutputTokensTotal is the cumulative count of completion tokens the
+	// inference gateway billed for the install's model calls: LiteLLM's
+	// litellm_output_tokens_metric_total (or litellm_output_tokens_metric),
+	// read, summed and kept monotonic as InputTokensTotal is. Does not move
+	// LastActiveTime. Absent while the served CRD predates it.
+	// +optional
+	OutputTokensTotal int64 `json:"outputTokensTotal,omitempty"`
+	// SpendMicrosUSDTotal is the cumulative spend the inference gateway
+	// attributes to the install's model calls, in micro-dollars (one USD is
+	// 1,000,000 micros), so the field stays an integer: LiteLLM's
+	// litellm_spend_metric_total (or litellm_spend_metric), a dollar figure
+	// LiteLLM computes from its own price map, summed over its labels, scaled
+	// and rounded to micros before it is folded, and kept monotonic as
+	// InputTokensTotal is. A model LiteLLM has no price for adds nothing here
+	// while its tokens still count above. Does not move LastActiveTime. Absent
+	// while the served CRD predates it.
+	// +optional
+	SpendMicrosUSDTotal int64 `json:"spendMicrosUSDTotal,omitempty"`
 	// RemediationsClosedUnmergedTotal is the forge's count now of this
 	// install's proposals closed without a merge by a person or a bot:
 	// kubeagents_vcs_proposals_closed_by under actor human plus actor bot. A
@@ -3229,8 +3297,9 @@ type AgentUsageStatus struct {
 	// moved: a brokered command ran or was refused, a proposal was opened, a
 	// chat message reached the gateway, or an event was accepted for triage;
 	// BrokerFailuresTotal, ChatTurnsErroredTotal, BackgroundTasksGaveUpTotal,
-	// NegativeFeedbackTotal and PositiveFeedbackTotal alone leave it where it
-	// was, and the six proposal readings never move it.
+	// NegativeFeedbackTotal, PositiveFeedbackTotal and the three inference
+	// totals (InputTokensTotal, OutputTokensTotal, SpendMicrosUSDTotal) alone
+	// leave it where it was, and the six proposal readings never move it.
 	// Scheduled maintenance jobs that run brokered commands move it too --
 	// the Controller Stall Watch cron runs some every 30 minutes by default
 	// -- so it marks agent activity of any origin, not human or operator use

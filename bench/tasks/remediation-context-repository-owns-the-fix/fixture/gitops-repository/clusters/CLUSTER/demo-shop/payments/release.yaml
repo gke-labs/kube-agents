@@ -3,6 +3,8 @@ kind: HelmRelease
 metadata:
   name: payments
   namespace: demo-shop
+  labels:
+    managed-by: kube-agents-bench
 spec:
   interval: 10m
   releaseName: payments
