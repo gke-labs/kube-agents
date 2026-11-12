@@ -3016,12 +3016,14 @@ as above, and an elected gateway's term waits for the `session-state` bucket the
 (`waiting for the bus: ...`), but only for 60 seconds: past that it gives the Lease up, so a
 standby whose bus works can take it, and stands back for a lease's duration before campaigning
 again in the same process (it doesn't exit, so a bus outage puts no replica into
-CrashLoopBackOff). A term already under way does the same once its connection has been down for
-those 60 seconds without a break; a reconnect starts the count again. And a leader whose relay has
-bound reads not Ready while its connection is down (`waiting for the bus: the NATS connection is
-down, so the bound event relay ... can't deliver`), since the relay delivers nothing then. In a full
-outage every replica reads not Ready, and the Lease passes between them about every 84 seconds (60
-of waiting, 24 of standing back), writing no term number, until the bus answers. A standby answers 200 once it is connected and has read
+CrashLoopBackOff). A term already under way gives the Lease up too once its connection has been
+down for those 60 seconds without a break (a reconnect starts the count again), and then the process
+exits as it does on a lost Lease, so the restarted container stands by with fresh adapters and
+doors. And a leader whose relay has bound reads not Ready while its connection is down (`waiting
+for the bus: the NATS connection is down, so the bound event relay ... can't deliver`), since the
+relay delivers nothing then. In a full outage every replica reads not Ready, the leader exits once,
+and the Lease then passes between the replicas about every 84 seconds (60 of waiting, 24 of
+standing back) without any of them exiting or writing a term number, until the bus answers. A standby answers 200 once it is connected and has read
 the Lease (`standby: connected, lease held by <pod>`), so a rolling update's new pod reads Ready
 as a standby before an old one stops ([gateway-replicas.md](gateway-replicas.md)). So at two
 replicas a Ready standby keeps the Deployment, and the CR, Ready while the leader waits; the

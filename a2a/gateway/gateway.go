@@ -109,6 +109,13 @@ var termWaitBusMax = 60 * time.Second
 // errTermBusGaveUp is a term start that waited termWaitBusMax on the bus.
 var errTermBusGaveUp = errors.New("the bus didn't answer")
 
+// ErrTermBusLost is a term under way whose connection was down for
+// termWaitBusMax (RunOptions.BusDownLimit). It is a lost leadership, not a
+// term-start give-up: the campaign releases the lease, and the process exits
+// as on a lost lease, so the restarted container stands by with fresh
+// adapters and doors (a gateway's run closes them for good when it stops).
+var ErrTermBusLost = fmt.Errorf("%w: its connection to the bus was down mid-term", ErrLeadershipLost)
+
 // noticeBusUnreachable says a task's publish failed: on its rolling line, or
 // posted when the backend keeps none (StatusShower).
 const noticeBusUnreachable = "❌ could not reach the bus; try again"
@@ -775,7 +782,7 @@ type RunOptions struct {
 	// relay batches still rendering; nil means relayStopDrainTimeout. A
 	// lost lease has less time than SIGTERM.
 	StopDrain func() time.Duration
-	// BusDownLimit, when positive, ends the run with errTermBusGaveUp once
+	// BusDownLimit, when positive, ends the run with ErrTermBusLost once
 	// the NATS connection has been down that long without a break, so an
 	// elected gateway whose own path to the bus failed mid-term gives the
 	// lease to a replica whose bus may answer, as a term start already does
@@ -788,7 +795,7 @@ type RunOptions struct {
 // connection. A var so tests can shorten it.
 var busWatchEvery = time.Second
 
-// watchBus ends the run with errTermBusGaveUp, through cancel, once the
+// watchBus ends the run with ErrTermBusLost, through cancel, once the
 // connection has been down for limit without a break. It returns when ctx
 // ends or it has given up, and reports the error it ended the run with.
 func (g *Gateway) watchBus(ctx context.Context, limit time.Duration, cancel context.CancelCauseFunc) error {
@@ -814,7 +821,7 @@ func (g *Gateway) watchBus(ctx context.Context, limit time.Duration, cancel cont
 			// Once per give-up, at Info: during a full outage the lease
 			// cycles between replicas, and each cycle logs this once.
 			g.log.Info("gateway term: the bus has been down mid-term; giving the lease up so a replica whose bus answers can lead", "down", down.Round(time.Second).String(), "giveUpAfter", limit.String())
-			err := fmt.Errorf("%w for %s mid-term, so the lease goes to a replica whose bus may", errTermBusGaveUp, down.Round(time.Second))
+			err := fmt.Errorf("%w for %s, so the lease goes to a replica whose bus may", ErrTermBusLost, down.Round(time.Second))
 			cancel(err)
 			return err
 		}
@@ -862,6 +869,13 @@ func (g *Gateway) RunWith(ctx context.Context, o RunOptions) error {
 	if o.RelayBindDelay <= 0 {
 		var err error
 		if sub, err = g.bindRelay(ctx); err != nil {
+			// A bind still waiting when the watchdog gave up fails on the
+			// cancel; the give-up is the reason.
+			cancel(nil)
+			<-watched
+			if busErr != nil {
+				return busErr
+			}
 			return err
 		}
 		afterBind()
@@ -900,7 +914,7 @@ func (g *Gateway) RunWith(ctx context.Context, o RunOptions) error {
 		}
 		// A run that gave up on the bus can't ack what it renders anyway,
 		// and the lease is waiting: the lost-lease bound.
-		if errors.Is(context.Cause(ctx), errTermBusGaveUp) {
+		if errors.Is(context.Cause(ctx), ErrTermBusLost) {
 			drain = min(drain, lostLeaseRelayDrain)
 		}
 		g.relayInFlight.drain(drain)
@@ -926,7 +940,8 @@ func (g *Gateway) RunWith(ctx context.Context, o RunOptions) error {
 	cancel(nil)
 	<-bound
 	<-watched
-	if busErr != nil {
+	// The adapter's own failure wins over a give-up that raced it.
+	if busErr != nil && (err == nil || errors.Is(err, context.Canceled)) {
 		return busErr
 	}
 	if bindErr != nil {

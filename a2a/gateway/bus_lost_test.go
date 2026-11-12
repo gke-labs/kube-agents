@@ -23,11 +23,12 @@ import (
 // start again on the same port and store, so the gateway's client loses the
 // bus and gets it back.
 type busLostRig struct {
-	g      *Gateway
-	client *lib.Client
-	url    string
-	opts   *natsserver.Options
-	srv    *natsserver.Server
+	g       *Gateway
+	client  *lib.Client
+	url     string
+	mapFile string
+	opts    *natsserver.Options
+	srv     *natsserver.Server
 }
 
 func newBusLostRig(t *testing.T) *busLostRig {
@@ -49,15 +50,36 @@ func newBusLostRig(t *testing.T) *busLostRig {
 		t.Fatalf("gateway client: %v", err)
 	}
 	t.Cleanup(client.Close)
+	r.mapFile = mapFile
+	r.client = client
+	r.g = r.gatewayOn(t, client)
+	return r
+}
+
+func (r *busLostRig) gatewayOn(t *testing.T, client *lib.Client) *Gateway {
+	t.Helper()
 	g, err := New(Options{Client: client, Adapter: newFakeAdapter(), Backend: "discord", Config: &Config{
-		NATSURL: r.url, PrincipalMapPath: mapFile, DefaultAddressee: "platform",
+		NATSURL: r.url, PrincipalMapPath: r.mapFile, DefaultAddressee: "platform",
 		IdleTTL: 30 * time.Minute, AttributionSalt: []byte("test-salt"),
 	}})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	r.g, r.client = g, client
-	return r
+	return g
+}
+
+// newGateway is a second gateway on its own client, as a restarted
+// container's process has. Made while the bus is up: lib.Connect dials once.
+func (r *busLostRig) newGateway(t *testing.T) *Gateway {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	client, err := lib.Connect(ctx, r.url, lib.WithName("gateway-test-2"), lib.WithAgreementPolicy(SupervisorAgreement(nil)))
+	if err != nil {
+		t.Fatalf("second gateway client: %v", err)
+	}
+	t.Cleanup(client.Close)
+	return r.gatewayOn(t, client)
 }
 
 func (r *busLostRig) start(t *testing.T) {
@@ -155,8 +177,8 @@ func TestABoundGatewayOffTheBusIsNotReady(t *testing.T) {
 	waitFor(t, "readiness to return with the bus", func() bool { ready, _ := r.g.Readiness(); return ready })
 }
 
-// An elected run off the bus for the limit ends with errTermBusGaveUp, the
-// error Election.Run releases the lease and stands back on.
+// An elected run off the bus for the limit ends with ErrTermBusLost, a lost
+// leadership: the process exits once the campaign has released the lease.
 func TestARunOffTheBusForTheLimitGivesUp(t *testing.T) {
 	shortBusWatch(t, time.Second)
 	r := newBusLostRig(t)
@@ -165,8 +187,8 @@ func TestARunOffTheBusForTheLimitGivesUp(t *testing.T) {
 	waitFor(t, "the relay to bind", func() bool { ready, _ := r.g.Readiness(); return ready })
 	r.stop(t)
 	err := receive(t, done, 10*time.Second, "the run to give up on the bus")
-	if !errors.Is(err, errTermBusGaveUp) {
-		t.Fatalf("run off the bus = %v, want errTermBusGaveUp", err)
+	if !errors.Is(err, ErrTermBusLost) || !errors.Is(err, ErrLeadershipLost) || errors.Is(err, errTermBusGaveUp) {
+		t.Fatalf("run off the bus = %v, want ErrTermBusLost (a lost leadership, not a term-start give-up)", err)
 	}
 }
 
@@ -217,61 +239,105 @@ func TestARunWithoutALimitWaitsOutTheBus(t *testing.T) {
 	_ = receive(t, done, 10*time.Second, "the run to stop")
 }
 
-// A full outage under the election: the leader gives its term up, and the
-// lease cycles (released, retaken, the term start waits out the bus and
-// gives up again) without a term number being written; the first term once
-// the bus is back is the next number, not one per cycle.
+// A full outage under the election. The leader gives its term up, releases
+// the lease and Run returns a lost leadership, so the process exits as on a
+// lost lease. The restarted container (a fresh gateway here) campaigns, and
+// the lease cycles (retaken, the term start waits out the bus, released)
+// without a term number being written; the first term once the bus is back
+// is the next number, not one per cycle.
 func TestAFullOutageCyclesTheLeaseAndWritesNoTerm(t *testing.T) {
 	shortBusWatch(t, time.Second)
 	r := newBusLostRig(t)
 	cs := fake.NewClientset(heldLease("", 1))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	e := Election{
-		Client: cs, Namespace: testNamespace, Lease: testLease, Identity: "pod-a",
-		LeaseDuration: testLeaseDuration, RenewDeadline: testRenewDeadline, RetryPeriod: testRetryPeriod,
+	elect := func(identity string) Election {
+		return Election{
+			Client: cs, Namespace: testNamespace, Lease: testLease, Identity: identity,
+			LeaseDuration: testLeaseDuration, RenewDeadline: testRenewDeadline, RetryPeriod: testRetryPeriod,
+		}
 	}
-	leads := make(chan struct{}, 16)
-	done := make(chan error, 1)
-	go func() {
-		done <- e.Run(ctx, r.g, func(work context.Context, o RunOptions) error {
-			leads <- struct{}{}
-			return r.g.RunWith(work, o)
-		})
-	}()
-	receive(t, leads, 10*time.Second, "the first term")
+	first := make(chan error, 1)
+	go func() { first <- elect("pod-a").Run(ctx, r.g, r.g.RunWith) }()
 	waitFor(t, "the relay to bind", func() bool { ready, _ := r.g.Readiness(); return ready })
 	before := r.term(t)
 	if before == 0 {
 		t.Fatal("precondition: the first term wrote no term number")
 	}
 
+	// The restarted container's gateway, made now because its client dials
+	// once; it campaigns only after the first process has exited.
+	g2 := r.newGateway(t)
 	r.stop(t)
-	// The run gives up, the lease is released, and the replica campaigns
-	// again: at least two releases while the bus is down.
+	err := receive(t, first, 15*time.Second, "the leader to give its term up")
+	if !errors.Is(err, ErrTermBusLost) || !errors.Is(err, ErrLeadershipLost) {
+		t.Fatalf("Run after a mid-term outage = %v, want ErrTermBusLost", err)
+	}
+	if h := leaseHolder(t, cs); h != "" {
+		t.Fatalf("lease holder after the give-up = %q, want it released", h)
+	}
+
+	second := make(chan error, 1)
+	go func() { second <- elect("pod-a").Run(ctx, g2, g2.RunWith) }()
 	released := 0
 	deadline := time.Now().Add(20 * time.Second)
 	for released < 2 && time.Now().Before(deadline) {
-		if leaseHolder(t, cs) == "" {
-			released++
-			for leaseHolder(t, cs) == "" && time.Now().Before(deadline) {
-				time.Sleep(testRetryPeriod / 4)
-			}
+		for leaseHolder(t, cs) != "" && time.Now().Before(deadline) {
+			time.Sleep(testRetryPeriod / 4)
 		}
-		time.Sleep(testRetryPeriod / 4)
+		for leaseHolder(t, cs) == "" && time.Now().Before(deadline) {
+			time.Sleep(testRetryPeriod / 4)
+		}
+		released++
 	}
 	if released < 2 {
 		t.Fatalf("lease released %d times during the outage, want at least 2", released)
 	}
 	select {
-	case err := <-done:
-		t.Fatalf("Run returned during the outage: %v", err)
+	case err := <-second:
+		t.Fatalf("the restarted gateway's Run returned during the outage: %v", err)
 	default:
 	}
 
 	r.restart(t)
-	waitFor(t, "a term once the bus is back", func() bool { ready, _ := r.g.Readiness(); return ready })
+	waitFor(t, "a term once the bus is back", func() bool { ready, _ := g2.Readiness(); return ready })
 	if after := r.term(t); after != before+1 {
 		t.Fatalf("term after the outage = %d, want %d: a term number was written while the bus was down", after, before+1)
+	}
+	select {
+	case err := <-second:
+		t.Fatalf("the restarted gateway's Run returned once the bus was back: %v", err)
+	default:
+	}
+}
+
+// A give-up while the relay's bind is still waiting (here for a TASKS that
+// doesn't exist yet) is reported as the give-up, not as the bind's failure
+// on the cancel: the bind error would be fatal rather than a lost leadership.
+func TestAGiveUpDuringTheBindIsTheGiveUp(t *testing.T) {
+	shortBusWatch(t, time.Second)
+	r := newBusLostRig(t)
+	nc, err := nats.Connect(r.url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	js, err := jetstream.New(nc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := js.DeleteStream(context.Background(), lib.TasksStream); err != nil {
+		t.Fatalf("delete TASKS: %v", err)
+	}
+	nc.Close()
+	done := make(chan error, 1)
+	go func() { done <- r.g.RunWith(context.Background(), RunOptions{BusDownLimit: termWaitBusMax}) }()
+	waitFor(t, "the relay to wait for its stream", func() bool {
+		_, why := r.g.Readiness()
+		return strings.Contains(why, "waiting for stream")
+	})
+	r.stop(t)
+	err = receive(t, done, 10*time.Second, "the run to give up during the bind")
+	if !errors.Is(err, ErrTermBusLost) {
+		t.Fatalf("run that gave up during the bind = %v, want ErrTermBusLost", err)
 	}
 }
