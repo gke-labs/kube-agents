@@ -53,8 +53,8 @@ import (
 // BusProvisioned is a provisioned-once record, so before this a bus that lost
 // its streams after provisioning (server 0's data volume replaced, say) left
 // the CR reading as before, with nothing re-provisioning until the completed
-// Job's 24-hour TTL ran out, and nothing ever restarting the two clients that
-// hold a TASKS durable. The operator has no bus identity that may read stream
+// Job's 24-hour TTL ran out, and nothing ever saying that the two clients that
+// hold a TASKS durable need a restart. The operator has no bus identity that may read stream
 // info, so the read goes through the exporter, which reads 8222 over loopback
 // inside the NATS pod (a2aNATSExporterContainer). The bus fence admits the
 // operator to the exporter's port for this, and to 8222 only for confirming a
@@ -510,8 +510,8 @@ func (p *BusStreamPoller) streak(agent *agentv1alpha1.PlatformAgent) *busStreamS
 }
 
 // pollAgent is one CR's poll. It writes BusStreamsPresent and nothing else of
-// the status, re-runs the provision Job when a loss is confirmed, and restarts
-// the TASKS clients once a re-run has restored TASKS.
+// the status, re-runs the provision Job when a loss is confirmed, and says
+// when a re-run has recreated TASKS (tasksRecreatedNote).
 func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	if agent.DeletionTimestamp != nil || !a2aStackRendering(agent) || !busProvisioned(agent) {
 		delete(p.streaks, agent.UID)
@@ -590,8 +590,10 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 		// An attempt whose Job delete didn't land, and the streams are back
 		// before its retry: the Job never re-ran, so it recreated nothing.
 		// Settle it as restored, so a later re-run of that Job (its TTL, a
-		// spec change) isn't taken for this attempt's.
+		// spec change) isn't taken for this attempt's, and clear what it
+		// named: nothing was re-run for it, so no TASKS note may come of it.
 		last.Settled, last.Restored = true, true
+		last.Missing, last.TasksMissing = nil, false
 		if err := p.writeRecord(ctx, agent, record.pruned(now)); err != nil {
 			return err
 		}
@@ -645,8 +647,8 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 		// whatever keeps them off the bus, another delete of the Job will
 		// not fix it. A restore, or removing the annotation, clears this.
 		return p.writeCondition(ctx, agent, metav1.ConditionFalse, busStreamsReasonDidNotRestore,
-			fmt.Sprintf("Missing from the A2A bus: %s. The operator re-ran the provision Job at %s and they were still missing after it, so it will not re-run it again for them. Read the provision Job's logs and the NATS servers' logs; once fixed, remove the %s annotation to let the operator re-run it.",
-				names, last.At.UTC().Format(time.RFC3339), busStreamsReprovisionAnnotation))
+			fmt.Sprintf("Missing from the A2A bus: %s. The operator re-ran the provision Job at %s and they were still missing after it, so it will not re-run it again for them. Read the provision Job's logs and the NATS servers' logs; once fixed, remove the %s annotation to let the operator re-run it.%s",
+				names, last.At.UTC().Format(time.RFC3339), busStreamsReprovisionAnnotation, tasksRecreatedNote(agent, last, job, jobState, verdict.missing)))
 	}
 	if last != nil && !last.Settled && jobState == busJobComplete && job.UID == last.JobUID {
 		// The last attempt is recorded but its Job is still the completed
@@ -672,8 +674,8 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 	}
 	if ok, next := record.allows(now); !ok {
 		return p.writeCondition(ctx, agent, metav1.ConditionFalse, busStreamsReasonMissing,
-			fmt.Sprintf("Missing from the A2A bus: %s. The provision Job's next re-run is allowed at %s.",
-				names, next.UTC().Format(time.RFC3339)))
+			fmt.Sprintf("Missing from the A2A bus: %s. The provision Job's next re-run is allowed at %s.%s",
+				names, next.UTC().Format(time.RFC3339), tasksRecreatedNote(agent, last, job, jobState, verdict.missing)))
 	}
 
 	record = record.pruned(now)
@@ -843,7 +845,7 @@ func (p *BusStreamPoller) busSettled(ctx context.Context, agent *agentv1alpha1.P
 // names the StatefulSet gives them, <name>-0 to <name>-(replicas-1), one per
 // ordinal, rather than listed by label: the label is one any pod in the
 // namespace can carry, and what a pod serves on the port decides whether the
-// operator deletes the provision Job and restarts the gateway pods. A name
+// operator deletes the provision Job. A name
 // can't be shared, so no other pod can stand in for a server or crowd one out.
 // A pod also counts only when the StatefulSet controls it (by UID), it runs
 // the StatefulSet's current revision, and it isn't on the host network. A pod

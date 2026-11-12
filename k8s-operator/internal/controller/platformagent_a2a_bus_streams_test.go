@@ -968,8 +968,8 @@ func TestTasksBackIsReportedEvenWithAnotherStreamStillMissing(t *testing.T) {
 	rig.poll()
 	rig.poll()
 	rig.poll()
-	if c := rig.condition(); c == nil || c.Reason != busStreamsReasonDidNotRestore || !strings.Contains(c.Message, busStreamsReprovisionAnnotation) {
-		t.Errorf("condition = %+v, want %s naming the annotation to clear", c, busStreamsReasonDidNotRestore)
+	if c := rig.condition(); c == nil || c.Reason != busStreamsReasonDidNotRestore || !strings.Contains(c.Message, busStreamsReprovisionAnnotation) || !strings.Contains(c.Message, "recreated TASKS") {
+		t.Errorf("condition = %+v, want %s naming the annotation to clear and the recreated TASKS", c, busStreamsReasonDidNotRestore)
 	}
 }
 
@@ -1349,9 +1349,12 @@ func TestAnAttemptWhoseDeleteFailedSettlesWhenTheStreamsComeBack(t *testing.T) {
 		}
 	}
 	for _, e := range rig.events() {
-		if strings.Contains(e, busStreamsRestoredEventReason) {
+		if strings.Contains(e, busStreamsRestoredEventReason) || strings.Contains(e, busStreamsTasksRecreatedEventReason) {
 			t.Errorf("event %q for a re-run no attempt asked for", e)
 		}
+	}
+	if c := rig.condition(); c == nil || strings.Contains(c.Message, "recreated TASKS") {
+		t.Errorf("condition = %+v: a TASKS note for a re-run no attempt caused", c)
 	}
 }
 
