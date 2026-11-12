@@ -59,23 +59,26 @@ func boundAgentProfiles(ctx context.Context, c client.Reader, agent *agentv1alph
 		}
 		return nil, err
 	}
+	// Each profile narrowed to the tiers it renders (agentprofile_tiers.go):
+	// an unknown or conflicting tier renders nothing downstream. The
+	// foreign-ServiceAccount check then runs on the narrowed tiers, as the
+	// AgentProfile controller's does: a refused tier gets no ServiceAccount,
+	// so a hand-made one under its name doesn't refuse the profile.
+	renderable, _, err := renderableAgentProfiles(ctx, c, agent.Namespace, profiles.Items, tiersUnreadable)
+	if err != nil {
+		return nil, err
+	}
 	var bound []agentv1alpha1.AgentProfile
-	for i := range profiles.Items {
-		foreign, err := agentProfileServiceAccountIsForeign(ctx, c, &profiles.Items[i])
+	for i := range renderable {
+		foreign, err := agentProfileServiceAccountIsForeign(ctx, c, &renderable[i])
 		if err != nil {
 			return nil, err
 		}
 		if foreign == "" {
-			bound = append(bound, profiles.Items[i])
+			bound = append(bound, renderable[i])
 		}
 	}
-	// Each profile narrowed to the tiers it renders (agentprofile_tiers.go):
-	// an unknown or conflicting tier renders nothing downstream.
-	renderable, _, err := renderableAgentProfiles(ctx, c, agent.Namespace, bound, tiersUnreadable)
-	if err != nil {
-		return nil, err
-	}
-	return renderable, nil
+	return bound, nil
 }
 
 // agentProfileServiceAccountIsForeign reports whether a profile with no

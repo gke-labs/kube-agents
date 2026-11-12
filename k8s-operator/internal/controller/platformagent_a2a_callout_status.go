@@ -222,10 +222,13 @@ func (r *PlatformAgentReconciler) readCalloutMapState(ctx context.Context, agent
 }
 
 // unsettled reports whether the state is one the next pass should look at
-// again soon: a map still loading, or pods that didn't answer. Nothing the
-// operator watches changes when a callout takes a map.
+// again soon: a map still loading, pods that didn't answer, or a map
+// refused. Nothing the operator watches changes when a callout takes a map,
+// and a refusal can clear inside the callout alone: a map naming a custom
+// tier is refused until the kubelet delivers the tiers file, and the
+// callout's Revalidate then takes it (#3659), with no object changing.
 func (s *calloutMapState) unsettled() bool {
-	return s != nil && (s.reason == a2aIdentityMapPending || s.reason == a2aIdentityMapStatusUnreadable)
+	return s != nil && (s.reason == a2aIdentityMapPending || s.reason == a2aIdentityMapStatusUnreadable || s.reason == a2aIdentityMapRefused)
 }
 
 // truncateForCondition caps s at n bytes, on a rune boundary, marking a cut.

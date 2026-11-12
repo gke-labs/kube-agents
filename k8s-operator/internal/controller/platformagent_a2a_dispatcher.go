@@ -720,10 +720,19 @@ func drainingDispatchProfiles(applied *a2aDispatchConfig, live map[string]bool, 
 		} else if !now.Before(until) {
 			continue
 		}
+		// The profile's own unattended-mode tier, while it drains too: the
+		// dispatcher reads it to clean up that tier's Jobs and to count its
+		// adopted tasks on the unattended side (unattendedFor). Carried only
+		// when it is one of the entry's tiers.
+		unattendedTier := ""
+		if slices.Contains(a.Tiers, a.UnattendedTier) {
+			unattendedTier = a.UnattendedTier
+		}
 		out = append(out, a2aDispatchProfile{
-			Name:        a.Name,
-			Tiers:       slices.Clone(a.Tiers),
-			Concurrency: max(a.Concurrency, 1),
+			Name:           a.Name,
+			Tiers:          slices.Clone(a.Tiers),
+			UnattendedTier: unattendedTier,
+			Concurrency:    max(a.Concurrency, 1),
 			// The limits within the render's own range, so the dispatcher's
 			// Validate takes the entry whatever was written into it.
 			QueueTimeoutSeconds:   min(max(a.QueueTimeoutSeconds, 0), math.MaxInt32),

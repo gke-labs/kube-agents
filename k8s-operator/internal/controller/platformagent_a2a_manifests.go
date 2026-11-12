@@ -7028,6 +7028,14 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	if err != nil {
 		return state, err
 	}
+	// The install's tiers, which the verifier, the gateway and the callout
+	// mount (optional, so ordering against their Deployments doesn't
+	// matter), before the identity map that may name one of them: an early
+	// return between the two then never leaves a map naming a tier whose
+	// file was not written.
+	if err := r.applyA2ATiers(ctx, agent); err != nil {
+		return state, err
+	}
 	authMaps, authMapVersion, err := buildA2AAuthMapConfigMaps(agent, profiles, draining)
 	if err != nil {
 		return state, fmt.Errorf("failed to render the A2A identity map: %w", err)
@@ -7482,11 +7490,6 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		return state, err
 	}
 	if err := r.applyA2AAgentDoor(ctx, agent); err != nil {
-		return state, err
-	}
-	// The install's tiers, which the verifier, the gateway and the callout
-	// mount (optional, so ordering against their Deployments doesn't matter).
-	if err := r.applyA2ATiers(ctx, agent); err != nil {
 		return state, err
 	}
 
