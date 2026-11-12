@@ -55,6 +55,11 @@ const (
 	a2aClusterFormDeadline = 90 * time.Second
 	// a2aClusterFormPoll is how often the formation loop re-reads the servers.
 	a2aClusterFormPoll = 100 * time.Millisecond
+	// a2aClusterRouteSettle is how long, once the cluster has formed, each
+	// server gets to settle on exactly one route connection per peer. A pair
+	// that dialled each other at once drops the duplicate within a round
+	// trip; a count still wrong after this is a pooling regression.
+	a2aClusterRouteSettle = 5 * time.Second
 	// a2aClusterDeliveryDeadline is how long one publisher gets to reach one
 	// subscriber across the routes; each publisher-to-subscriber pair gets
 	// its own.
@@ -472,16 +477,14 @@ func TestTheRenderedClusterFormsOverVerifiedRoutes(t *testing.T) {
 
 	servers := []*natsserver.Server{start(0, ""), start(1, ""), start(2, "")}
 	// Formed means every server holds a route to each of its two peers and
-	// exactly one connection per peer (pool_size -1: two, not a pool of
-	// four), runs clustered JetStream, and one of them is meta leader. All
-	// of it is polled under one deadline: a duplicate route while a pair
-	// settles on one connection, or a server reporting clustered a tick
-	// after its peers, is a moment in formation, not a verdict.
+	// runs clustered JetStream, and one of them is meta leader. All of it is
+	// polled under one deadline: a server reporting clustered a tick after
+	// its peers is a moment in formation, not a verdict.
 	deadline := time.Now().Add(a2aClusterFormDeadline)
 	for {
 		formed := true
 		for _, s := range servers {
-			if len(a2aRoutePeers(t, s)) != 2 || s.NumRoutes() != 2 || !s.JetStreamIsClustered() {
+			if len(a2aRoutePeers(t, s)) != 2 || !s.JetStreamIsClustered() {
 				formed = false
 			}
 		}
@@ -494,6 +497,23 @@ func TestTheRenderedClusterFormsOverVerifiedRoutes(t *testing.T) {
 				t.Logf("server %d: peers %v, routes=%d, clustered=%v, leader=%v", i, a2aRoutePeers(t, s), s.NumRoutes(), s.JetStreamIsClustered(), s.JetStreamIsLeader())
 			}
 			t.Fatalf("the rendered cluster did not form with a JetStream meta leader within %s", a2aClusterFormDeadline)
+		}
+		time.Sleep(a2aClusterFormPoll)
+	}
+	// One route per peer (pool_size -1): two, not a pool of four. A pair
+	// that dialled each other at once holds a duplicate for a moment while
+	// it settles on one, so the count gets a short window of its own rather
+	// than a place in the formation deadline: a count that never reaches two
+	// is a pooling regression and is named as one, not as a slow election.
+	settled := time.Now().Add(a2aClusterRouteSettle)
+	for slices.ContainsFunc(servers, func(s *natsserver.Server) bool { return s.NumRoutes() != 2 }) {
+		if time.Now().After(settled) {
+			for i, s := range servers {
+				if n := s.NumRoutes(); n != 2 {
+					t.Errorf("server %d holds %d route connections after %s, want exactly one per peer (2)", i, n, a2aClusterRouteSettle)
+				}
+			}
+			break
 		}
 		time.Sleep(a2aClusterFormPoll)
 	}
@@ -529,14 +549,19 @@ func TestTheRenderedClusterFormsOverVerifiedRoutes(t *testing.T) {
 			}
 			pc := connect(pub)
 			got := false
+			// Only this pair's payload counts: a retry from the previous
+			// publisher that arrived after its wait is still on the
+			// channel, and reading it as this publisher's would pass a
+			// route that carried nothing.
+			want := fmt.Sprintf("%d->%d", j, i)
 			deadline := time.Now().Add(a2aClusterDeliveryDeadline)
 			for !got && time.Now().Before(deadline) {
-				if err := pc.Publish(subject, []byte(fmt.Sprintf("%d->%d", j, i))); err != nil {
+				if err := pc.Publish(subject, []byte(want)); err != nil {
 					t.Fatal(err)
 				}
 				select {
-				case <-ch:
-					got = true
+				case m := <-ch:
+					got = string(m.Data) == want
 				case <-time.After(a2aClusterDeliveryPoll):
 				}
 			}
