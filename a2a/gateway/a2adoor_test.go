@@ -1154,6 +1154,59 @@ func TestA2ACancelPublishesAKindCancel(t *testing.T) {
 	}
 }
 
+// TestA2ACancelRetriedAfterTheTerminalIsAnsweredWithTheTask: a cancel whose
+// response was lost is retried; by then the executor may have ended the task
+// canceled. The retry gets the task back, canceled, not -32002 "already
+// canceled" for a cancel that took.
+func TestA2ACancelRetriedAfterTheTerminalIsAnsweredWithTheTask(t *testing.T) {
+	r := startA2ARig(t)
+	ctx := context.Background()
+
+	task := taskOf(t, r.rpc(t, a2aTestCaller, a2aMethodSend, sendParams("long job", "m-1", "", false)))
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	if err := exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	r.getUntil(t, a2aTestCaller, task.ID, "the working event to reach the door", func(task a2aTaskObject) bool {
+		return task.Status.State == lib.StateWorking
+	})
+	if first := r.rpc(t, a2aTestCaller, a2aMethodCancel, map[string]any{"id": task.ID}); first.Error != nil {
+		t.Fatalf("the first cancel was refused: %d %s", first.Error.Code, first.Error.Message)
+	}
+	if err := exec.PublishStatus(ctx, lib.StateCanceled, true); err != nil {
+		t.Fatal(err)
+	}
+	r.getUntil(t, a2aTestCaller, task.ID, "the canceled terminal to reach the door", func(task a2aTaskObject) bool {
+		return task.Status.State == lib.StateCanceled
+	})
+	again := r.rpc(t, a2aTestCaller, a2aMethodCancel, map[string]any{"id": task.ID})
+	if again.Error != nil {
+		t.Fatalf("a cancel retried after the terminal was refused: %d %s", again.Error.Code, again.Error.Message)
+	}
+	if got := taskOf(t, again); got.ID != task.ID || got.Status.State != lib.StateCanceled {
+		t.Errorf("the retried cancel answered with task %q in %q, want %q canceled", got.ID, got.Status.State, task.ID)
+	}
+}
+
+// TestA2ACancelOnATaskThatCompletedIsRefused: a task that ended on its own,
+// with no cancel published, refuses a cancel.
+func TestA2ACancelOnATaskThatCompletedIsRefused(t *testing.T) {
+	r := startA2ARig(t)
+	task := taskOf(t, r.rpc(t, a2aTestCaller, a2aMethodSend, sendParams("short job", "m-1", "", false)))
+	r.complete(t, r.awaitTask(t, "platform"), "done")
+	r.getUntil(t, a2aTestCaller, task.ID, "the completed terminal to reach the door", func(task a2aTaskObject) bool {
+		return task.Status.State == lib.StateCompleted
+	})
+	refused := r.rpc(t, a2aTestCaller, a2aMethodCancel, map[string]any{"id": task.ID})
+	if refused.Error == nil || refused.Error.Code != a2aErrTaskNotCancelable {
+		t.Fatalf("a cancel on a task that completed on its own: %+v, want %d", refused, a2aErrTaskNotCancelable)
+	}
+	if want := "is already " + string(lib.StateCompleted); !strings.Contains(refused.Error.Message, want) {
+		t.Errorf("the refusal says %q, want it to contain %q", refused.Error.Message, want)
+	}
+}
+
 // TestA2AProtocolRefusals: the door answers in JSON-RPC's own terms for a
 // method it does not have, a stream it does not serve yet, and a part it
 // cannot route.

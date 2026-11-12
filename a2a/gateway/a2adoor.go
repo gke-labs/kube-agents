@@ -854,13 +854,16 @@ func (d *A2ADoor) cancel(r *http.Request, verified string, handler func(InboundM
 	if !ok {
 		return rpcFail(req.ID, a2aErrTaskNotFound, "no such task for this caller: "+params.ID, nil)
 	}
-	if task.terminal {
-		return rpcFail(req.ID, a2aErrTaskNotCancelable, "task "+params.ID+" is already "+string(task.state), nil)
-	}
 	if task.cancelPublished {
 		// A retry (a lost response, a client timeout during the claim):
 		// the cancel is on the bus already, which is what this call asks.
+		// Checked before the terminal, so a retry that arrives after the
+		// executor's terminal still gets the task back, now ended, and not
+		// a refusal for a cancel that took.
 		return rpcOK(req.ID, d.taskObject(params.ID))
+	}
+	if task.terminal {
+		return rpcFail(req.ID, a2aErrTaskNotCancelable, "task "+params.ID+" is already "+string(task.state), nil)
 	}
 	key, contextID := task.key, task.contextID
 	messageID := a2aInboundIDPrefix + randHex(messageIDHexWidth)
