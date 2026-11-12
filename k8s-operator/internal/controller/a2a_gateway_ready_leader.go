@@ -39,8 +39,10 @@ const (
 	a2aGatewayLeaseSkew = 2 * time.Second
 	// a2aGatewayLeaderRecheck is how soon a pass that followed a not-ready
 	// leader comes back when the Lease says nothing sooner. Lease updates
-	// reconcile nothing (a2aGatewayLeaseEvents), so a handover to a Ready
-	// standby is seen only by a scheduled pass.
+	// reconcile nothing (a2aGatewayLeaseEvents), and a handover from a
+	// not-ready leader to a Ready standby leaves the Deployment's ready
+	// count where it was, so a scheduled pass is the only thing that sees
+	// it. 15 s is the Lease's duration on the gateway (20 s) less a margin.
 	a2aGatewayLeaderRecheck = 15 * time.Second
 )
 
@@ -80,7 +82,9 @@ func (r *PlatformAgentReconciler) a2aGatewayReadyByLeader(ctx context.Context, a
 	// skew margin; a Lease without one gives no grace to wait out.
 	if !leader.AcquiredAt.IsZero() {
 		if left := leader.AcquiredAt.Add(a2aGatewayLeaderReadyGrace + a2aGatewayLeaseSkew).Sub(now); left > 0 {
-			return ready, "", left
+			// Bounded: an acquireTime ahead of the operator's clock does not
+			// stretch the wait past one grace.
+			return ready, "", min(left, a2aGatewayLeaderReadyGrace+a2aGatewayLeaseSkew)
 		}
 	}
 	recheck := a2aGatewayLeaderRecheck

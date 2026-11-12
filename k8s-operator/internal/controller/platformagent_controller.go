@@ -1420,7 +1420,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// workload is written, and Pods are not watched here. Requeue while the picture is
 	// still incomplete so both the failure and the later recovery reach plugin status.
 	if pluginStatusNeedsRecheck(agentPlugins, phase == "Ready") {
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		return ctrl.Result{RequeueAfter: statusPassRequeue(30*time.Second, tasksWaitRequeue)}, nil
 	}
 
 	// A2A provisioning still running — Jobs are not watched (see a2aReader),
@@ -1457,7 +1457,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if a2aState.busReloadRequeue > 0 {
 			requeue = min(requeue, a2aState.busReloadRequeue)
 		}
-		return ctrl.Result{RequeueAfter: requeue}, nil
+		return ctrl.Result{RequeueAfter: statusPassRequeue(requeue, tasksWaitRequeue)}, nil
 	}
 
 	// An out-of-date ClusterRole is fixed by someone re-applying the manifests,
@@ -1480,12 +1480,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if credentialProxyExecShort(instance) {
 			requeue = min(requeue, credentialProxyExecShortRequeue)
 		}
-		// And the status pass's own: the TASKS wait's threshold and the A2A
-		// gateway leader's grace or recheck, which no event announces.
-		if tasksWaitRequeue > 0 {
-			requeue = min(requeue, tasksWaitRequeue)
-		}
-		return ctrl.Result{RequeueAfter: requeue}, nil
+		return ctrl.Result{RequeueAfter: statusPassRequeue(requeue, tasksWaitRequeue)}, nil
 	}
 
 	// Secret material reaches the gateway as environment, and a container's
@@ -1553,6 +1548,16 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		requeueAfter = min(requeueAfter, credentialProxyExecShortRequeue)
 	}
 	return ctrl.Result{RequeueAfter: requeueAfter}, nil
+}
+
+// statusPassRequeue folds the status pass's own requeue (the TASKS wait's
+// threshold, the A2A gateway leader's grace or recheck: reads of pods and a
+// Lease that send no event) into an early return's, so no return drops it.
+func statusPassRequeue(requeue, statusPass time.Duration) time.Duration {
+	if statusPass > 0 && statusPass < requeue {
+		return statusPass
+	}
+	return requeue
 }
 
 // usageStatusRequeue is how soon the steady-state requeue has to fire for the

@@ -294,3 +294,21 @@ func TestAFailedLeaderReadFallsBackToTheDeployment(t *testing.T) {
 		t.Errorf("gateway counted %d ready on a failed leader read, want the Deployment's 1", w.ready)
 	}
 }
+
+// Every early return in Reconcile keeps the status pass's requeue when it
+// is sooner: the leader's grace and recheck, and the TASKS wait, announce
+// themselves to nothing else.
+func TestEarlyReturnsKeepTheStatusPassRequeue(t *testing.T) {
+	for _, tc := range []struct {
+		own, status, want time.Duration
+	}{
+		{30 * time.Second, 15 * time.Second, 15 * time.Second},
+		{30 * time.Second, 0, 30 * time.Second},
+		{5 * time.Minute, 3 * time.Second, 3 * time.Second},
+		{10 * time.Second, 15 * time.Second, 10 * time.Second},
+	} {
+		if got := statusPassRequeue(tc.own, tc.status); got != tc.want {
+			t.Errorf("statusPassRequeue(%s, %s) = %s, want %s", tc.own, tc.status, got, tc.want)
+		}
+	}
+}
