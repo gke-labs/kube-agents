@@ -18,11 +18,10 @@ untested. This suite reads the output side instead:
                                                emit (golden_test.go keeps these
                                                equal to the operator's output)
 
-The golden half reaches only what the golden cases render. The
-`platformagent-next.yaml` case renders the `mode: next` stack at its steady
-state, so the A2A gateway, the console and the two surge-first pairs -- the
-A2A auth callout and the capability verifier, two replicas each -- are in this
-sweep.
+The golden half reaches only what the golden cases render. Every case renders
+the A2A stack, so the A2A gateway, the console and the two surge-first pairs --
+the A2A auth callout and the capability verifier, two replicas each -- are in
+this sweep.
 
 Every Deployment in both must be `Recreate` or resolve `maxUnavailable >= 1`,
 unless its name is in `_SURGE_FIRST_BY_DESIGN`, where the entry carries the
@@ -76,17 +75,18 @@ _HELM_SET_VALUES = (
 # offenders", so the count is asserted, and a new chart Deployment fails here
 # until its author looks at its strategy and bumps the number.
 _EXPECTED_RENDERED_DEPLOYMENTS = 4
-# Thirteen golden cases, each emitting an agent gateway, a credential proxy and a
-# kube-proxy, the next-mode case adding the A2A callout, verifier, console and
-# gateway, and the two exec-tier cases the exec tier's Deployment.
-_EXPECTED_GOLDEN_DEPLOYMENTS = 45
+# Thirteen golden cases, each emitting an agent gateway, a credential proxy, a
+# kube-proxy, the A2A callout, verifier and console; the settled case the A2A
+# gateway as well (the callout gate holds it on a first pass), and the two
+# exec-tier cases the exec tier's Deployment.
+_EXPECTED_GOLDEN_DEPLOYMENTS = 81
 
 # Workloads that deliberately keep `maxUnavailable: 0` and so need a surge Pod
 # to roll, which a zero-headroom quota refuses. The two chart workloads are
 # single-replica; their reasons are the ones `test_deployments_rollout_quota.py`
 # documents, and the chart exposes `operator.rollingUpdate.maxUnavailable` and
 # `hindsight.api.rollingUpdate.maxUnavailable` as the override for installs that
-# would rather take the outage. The two operator-rendered next-mode workloads run
+# would rather take the outage. The two operator-rendered A2A workloads run
 # two replicas and have no override. Keys are rendered names, so the operator's
 # is bound to `_RELEASE_NAME`.
 _SURGE_FIRST_BY_DESIGN = {
@@ -99,7 +99,7 @@ _SURGE_FIRST_BY_DESIGN = {
         "maxUnavailable 1 terminates the only webhook server before its replacement "
         "is Ready, and every guarded write in the namespace fails until it is"
     ),
-    # Operator-rendered under spec.mode: next, so these are golden names. The quota
+    # Operator-rendered, so these are golden names. The quota
     # preflight's patch leaves room for one surge Pod of either (footprint.yaml marks
     # both `surges`, and kube-agents.quotaRequirements sizes the room from them).
     "platformagent-a2a-callout": (
@@ -209,8 +209,8 @@ class RenderedDeploymentsRollUnderAFullQuota(unittest.TestCase):
     def test_every_exception_is_still_rendered_surge_first(self):
         """An entry whose workload no longer surges first is stale; drop it.
 
-        The chart render carries two of the listed workloads and the next-mode
-        golden the other two, so both are read; a missing helm skips this the
+        The chart render carries two of the listed workloads and the operator
+        goldens the other two, so both are read; a missing helm skips this the
         same way; with CI set the render raises.
         """
         rendered = _render_chart()

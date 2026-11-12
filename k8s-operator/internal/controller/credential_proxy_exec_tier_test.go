@@ -487,7 +487,7 @@ func TestTheExecTierFenceAdmitsItsCallersOnly(t *testing.T) {
 		}
 	}
 	// The session pods only under the cluster view, which points them at the
-	// tier; the agent is already mode next.
+	// tier.
 	for _, view := range []string{"true", ""} {
 		t.Setenv(a2aSessionClusterViewEnvVar, view)
 		admitted := false

@@ -967,8 +967,7 @@ func (p *UsageCounterPoller) targets(ctx context.Context, agent *agentv1alpha1.P
 		// The chat listener also serves the origins reading, from the proposals
 		// ledger, on the same gate as its counters.
 		{gatewayPodSelector(agent), usageChatCounters, []usageReadingKind{usageReadingOrigins}, platformAgentContainerName, chatMetricsPortName, true, runsGateway, 0, usageMetricsPath},
-		// The A2A gateway, a pod a next-mode install runs and a today install
-		// does not: the chat counter again, from the gateway that owns Chat
+		// The A2A gateway: the chat counter again, from the gateway that owns Chat
 		// ingress there, and the people reading. The selector matches no pod
 		// elsewhere.
 		{a2aGatewayPodSelector(agent), usageA2AChatCounters, []usageReadingKind{usageReadingPeople}, a2aGatewayContainerName, a2aGatewayMetricsPortName, true, everyPod, 0, usageMetricsPath},

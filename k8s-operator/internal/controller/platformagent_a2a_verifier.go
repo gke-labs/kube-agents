@@ -308,8 +308,7 @@ func buildA2AVerifierDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Depl
 // budget cannot be left selecting pods a later edit relabelled; the test
 // asserts equality with the Deployment's selector rather than that a budget
 // exists. maxUnavailable: 1, never minAvailable — the constant's comment has
-// the argument. Labelled as a verifier object so the teardown's residue sweep
-// sees it and the flip to today removes it with the Deployment.
+// the argument. Labelled as a verifier object so a residue sweep sees it.
 //
 // The budget counts READY pods, and this workload's readiness is borrowed
 // from a sibling, which is why the unhealthy-pod policy below is not left at

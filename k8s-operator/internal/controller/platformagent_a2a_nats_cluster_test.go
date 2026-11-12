@@ -36,7 +36,6 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/utils/ptr"
-	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
@@ -1176,44 +1175,6 @@ func TestAConversionDropsBusProvisioned(t *testing.T) {
 	}
 	if busProvisioned(agent) {
 		t.Error("BusProvisioned survived converting the bus, which empties it")
-	}
-}
-
-// A flip to today clears status.busReplicas: a today CR has no bus.
-func TestAFlipToTodayClearsTheBusServerCount(t *testing.T) {
-	scheme := setupScheme()
-	agent := a2aTestAgent()
-	keys := sandboxKeysSecret(agent)
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, keys).
-		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
-		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
-	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
-	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
-	ctx := context.Background()
-	for i := 0; i < 2; i++ {
-		if _, err := r.Reconcile(ctx, req); err != nil {
-			t.Fatalf("Reconcile %d under next: %v", i+1, err)
-		}
-	}
-	fresh := &agentv1alpha1.PlatformAgent{}
-	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
-		t.Fatal(err)
-	}
-	if fresh.Status.BusReplicas == 0 {
-		t.Fatal("precondition: status.busReplicas not written under next")
-	}
-	fresh.Spec.Mode = ptr.To("today")
-	if err := cl.Update(ctx, fresh); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := r.Reconcile(ctx, req); err != nil {
-		t.Fatalf("Reconcile after flip: %v", err)
-	}
-	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
-		t.Fatal(err)
-	}
-	if fresh.Status.BusReplicas != 0 {
-		t.Errorf("status.busReplicas = %d after the flip to today, want 0", fresh.Status.BusReplicas)
 	}
 }
 

@@ -48,9 +48,9 @@ import (
 // PlatformAgent reconciler's (agentprofile_platformagent.go), because it lives
 // in the one identity map that reconciler already owns.
 //
-// Everything is dark unless the PlatformAgent in the profile's namespace runs
-// `spec.mode: next`. On today, the reconciler removes what it rendered and
-// renders nothing.
+// Everything is dark unless a PlatformAgent is bound in the profile's
+// namespace: without one the reconciler removes what it rendered and renders
+// nothing.
 //
 // Deletion is finalizer-ordered: the tombstone is published before the
 // finalizer comes off, so a profile never disappears from the cluster while its
@@ -89,12 +89,10 @@ const (
 // Condition reasons.
 const (
 	reasonAgentProfileRendered        = "Rendered"
-	reasonAgentProfileNotNext         = "ModeNotNext"
 	reasonAgentProfileNoAgent         = "NoPlatformAgent"
 	reasonAgentProfileManyAgents      = "MultiplePlatformAgents"
 	reasonAgentProfileRefused         = "ServiceAccountRefused"
 	reasonAgentProfileInvalid         = "InvalidProfile"
-	reasonAgentProfileModeUnknown     = "ModeNotRecognized"
 	reasonAgentProfileSANotFound      = "ServiceAccountNotFound"
 	reasonAgentProfilePublished       = "Published"
 	reasonAgentProfileBusUnconfigured = "OperatorBusIdentityUnconfigured"
@@ -139,26 +137,9 @@ func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if agent == nil || !a2aStackRendering(agent) {
-		if agent != nil {
-			reason, msg = reasonAgentProfileNotNext, "the PlatformAgent "+agent.Name+" does not run spec.mode: next; an AgentProfile renders nothing until it does"
-			if _, modeErr := resolveMode(agent); modeErr != nil {
-				// Version skew freezes the bus rather than tearing it
-				// down; freeze the profile's objects with it. A deletion
-				// still runs: the frozen bus is running, so the tombstone
-				// can be tried, and holding the finalizer would hang the
-				// delete until the operator is rolled forward.
-				if !profile.DeletionTimestamp.IsZero() {
-					return r.finalize(ctx, &profile, agent)
-				}
-				return ctrl.Result{}, r.writeStatus(ctx, &profile, agent, "", reasonAgentProfileModeUnknown, modeErr.Error(), reasonAgentProfileModeUnknown, modeErr.Error(), false)
-			}
-		}
+	if agent == nil {
 		// No bus to talk to: drop any connection held for this namespace's
-		// agent rather than let it reconnect to a dead Service forever. Not
-		// under version skew above, where the bus is frozen and still
-		// running, and a deletion still needs the connection for its
-		// tombstone.
+		// agent rather than let it reconnect to a dead Service forever.
 		r.forgetBus(profile.Namespace)
 		return ctrl.Result{}, r.renderNothing(ctx, &profile, agent, reason, msg)
 	}
@@ -295,9 +276,9 @@ func (r *AgentProfileReconciler) boundAgent(ctx context.Context, namespace strin
 	}
 }
 
-// renderNothing is the today path: remove what this reconciler rendered and
-// release the finalizer. There is no bus to tombstone on, and on a flip to
-// today the PlatformAgent reconciler tears down the directory with the bus.
+// renderNothing is the path with no bound PlatformAgent: remove what this
+// reconciler rendered and release the finalizer. There is no bus to tombstone
+// on.
 func (r *AgentProfileReconciler) renderNothing(ctx context.Context, p *agentv1alpha1.AgentProfile, agent *agentv1alpha1.PlatformAgent, reason, msg string) error {
 	if err := r.deleteOwnServiceAccount(ctx, p); err != nil {
 		return err

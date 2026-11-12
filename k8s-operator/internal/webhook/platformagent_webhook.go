@@ -129,6 +129,15 @@ func (d *PlatformAgentCustomDefaulter) Default(ctx context.Context, platformAgen
 			platformAgent.Spec.Harness.Memory.UserProfileEnabled = ptr.To(false)
 		}
 	}
+	// The retired mode. An apply that still says "today" (an install.env or a
+	// manifest from before the removal) is moved, not refused: the object it
+	// writes is the one the operator runs anyway.
+	if platformAgent.Spec.Mode == nil || *platformAgent.Spec.Mode != agentv1alpha1.PlatformAgentModeNext {
+		if platformAgent.Spec.Mode != nil {
+			platformagentlog.Info("rewriting the retired spec.mode", "name", platformAgent.Name, "from", *platformAgent.Spec.Mode, "to", agentv1alpha1.PlatformAgentModeNext)
+		}
+		platformAgent.Spec.Mode = ptr.To(agentv1alpha1.PlatformAgentModeNext)
+	}
 
 	return nil
 }
@@ -373,15 +382,12 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 // bus runs, with the operator's own message (controller.BusConversionRefusedMessage):
 // converting a bus empties it until #4225 brings the migration. Best effort:
 // the running count is the stored object's status.busReplicas, which an older
-// CRD prunes and a flip to today clears, so the operator's refusal on every
-// pass is the enforcement and this only refuses the edit early. An update that
-// leaves the field as it was is let through, so a CR the operator already
-// holds to its count can still be edited otherwise.
+// CRD prunes, so the operator's refusal on every pass is the enforcement and
+// this only refuses the edit early. An update that leaves the field as it was
+// is let through, so a CR the operator already holds to its count can still
+// be edited otherwise.
 func validateBusReplicas(oldObj, platformAgent *agentv1alpha1.PlatformAgent) field.ErrorList {
-	// Under today the field is inert and the bus is torn down, so an edit
-	// that flips to today, or edits a today CR whose count is not yet
-	// cleared, converts nothing.
-	if oldObj == nil || platformAgent.Spec.Mode == nil || *platformAgent.Spec.Mode != "next" {
+	if oldObj == nil {
 		return nil
 	}
 	running := oldObj.Status.BusReplicas

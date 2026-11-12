@@ -137,8 +137,10 @@ func TestBuildConfigMap(t *testing.T) {
 	if !strings.Contains(yamlContent, "api_mode: chat_completions") {
 		t.Errorf("expected config to pin the wire protocol, got:\n%s", yamlContent)
 	}
-	if !strings.Contains(yamlContent, "enabled: true") {
-		t.Errorf("expected config to enable google_chat platform, got:\n%s", yamlContent)
+	// The A2A gateway consumes Chat; the Hermes google_chat platform stays off
+	// so one Chat app never has two consumers.
+	if !strings.Contains(yamlContent, "google_chat:\n    enabled: false") {
+		t.Errorf("expected config to leave the google_chat platform off (the gateway consumes Chat), got:\n%s", yamlContent)
 	}
 	if !strings.Contains(yamlContent, "cron_mode: approve") {
 		t.Errorf("expected config to contain cron_mode: approve, got:\n%s", yamlContent)
@@ -820,21 +822,12 @@ func TestBuildDeployment(t *testing.T) {
 	if _, ok := envMap["GEMINI_API_KEY"]; ok {
 		t.Errorf("expected GEMINI_API_KEY to not be set on platform agent container")
 	}
-	if envMap["GOOGLE_CHAT_PROJECT_ID"].Value != "my-gcp-project" {
-		t.Errorf("expected GOOGLE_CHAT_PROJECT_ID my-gcp-project, got %s", envMap["GOOGLE_CHAT_PROJECT_ID"].Value)
-	}
-	if envMap["GOOGLE_CHAT_SUBSCRIPTION_NAME"].Value != "projects/my-gcp-project/subscriptions/chat-sub" {
-		t.Errorf("expected GOOGLE_CHAT_SUBSCRIPTION_NAME project sub, got %s", envMap["GOOGLE_CHAT_SUBSCRIPTION_NAME"].Value)
-	}
-	if envMap["GOOGLE_CHAT_ALLOWED_USERS"].Value != "alice,bob" {
-		t.Errorf("expected GOOGLE_CHAT_ALLOWED_USERS alice,bob, got %s", envMap["GOOGLE_CHAT_ALLOWED_USERS"].Value)
-	}
-	// Emitted with the real answer rather than omitted. Omitting it is what let a
-	// leftover GOOGLE_CHAT_ALLOW_ALL_USERS=true from an earlier, allowlist-free spec
-	// survive on the PVC's .env and beat the allowlist this CR sets — the authz check
-	// reads the per-platform allow-all before it reads any allowlist at all.
-	if got, ok := envMap["GOOGLE_CHAT_ALLOW_ALL_USERS"]; !ok || got.Value != "false" {
-		t.Errorf("expected GOOGLE_CHAT_ALLOW_ALL_USERS=false when allowed users is populated, got %#v", got)
+	// The A2A gateway consumes Chat (TestChatConsumerIsChosenByTheChatConfig),
+	// so the agent container carries none of the legacy Chat consumer's env.
+	for _, name := range []string{"GOOGLE_CHAT_PROJECT_ID", "GOOGLE_CHAT_SUBSCRIPTION_NAME", "GOOGLE_CHAT_ALLOWED_USERS", "GOOGLE_CHAT_ALLOW_ALL_USERS"} {
+		if got, ok := envMap[name]; ok {
+			t.Errorf("expected no %s on the agent container (the gateway consumes Chat), got %#v", name, got)
+		}
 	}
 	if envMap["API_SERVER_ENABLED"].Value != "true" {
 		t.Errorf("expected API_SERVER_ENABLED true, got %s", envMap["API_SERVER_ENABLED"].Value)
@@ -2320,14 +2313,19 @@ func TestBuildDeploymentGoogleChatAllowedUsersEmpty(t *testing.T) {
 		envMap[env.Name] = env
 	}
 
-	if envMap["GOOGLE_CHAT_ALLOWED_USERS"].Value != "" {
-		t.Errorf("expected GOOGLE_CHAT_ALLOWED_USERS empty, got %s", envMap["GOOGLE_CHAT_ALLOWED_USERS"].Value)
-	}
-	if envMap["GOOGLE_CHAT_ALLOW_ALL_USERS"].Value != "true" {
-		t.Errorf("expected GOOGLE_CHAT_ALLOW_ALL_USERS true, got %s", envMap["GOOGLE_CHAT_ALLOW_ALL_USERS"].Value)
+	// The gateway consumes Chat and reads the allowlist itself
+	// (TestTheAllowlistIsNormalizedTheWayTheGatewayReadsIt); the agent
+	// container carries neither the allowlist nor the allow-all.
+	for _, name := range []string{"GOOGLE_CHAT_ALLOWED_USERS", "GOOGLE_CHAT_ALLOW_ALL_USERS"} {
+		if got, ok := envMap[name]; ok {
+			t.Errorf("expected no %s on the agent container (the gateway consumes Chat), got %#v", name, got)
+		}
 	}
 }
 
+// With Google Chat on as well, the A2A gateway takes Chat and Slack stays on
+// its legacy consumer (legacySlackConsumer): the broker's relay and the
+// Hermes slack platform, which is what this test renders.
 func TestBuildDeploymentSlackIntegration(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{
@@ -2336,6 +2334,7 @@ func TestBuildDeploymentSlackIntegration(t *testing.T) {
 		},
 		Spec: agentv1alpha1.PlatformAgentSpec{
 			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				GoogleChat: &agentv1alpha1.GoogleChatSpec{Enabled: ptr.To(true)},
 				Slack: &agentv1alpha1.SlackSpec{
 					Enabled: ptr.To(true),
 					BotTokenSecretRef: &corev1.SecretKeySelector{
@@ -2396,6 +2395,8 @@ func TestBuildDeploymentSlackIntegration(t *testing.T) {
 	}
 }
 
+// With Google Chat on as well, Slack stays on its legacy consumer
+// (legacySlackConsumer), which is the render this test is about.
 func TestBuildDeploymentSlackAllowAllUsers(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{
@@ -2404,6 +2405,7 @@ func TestBuildDeploymentSlackAllowAllUsers(t *testing.T) {
 		},
 		Spec: agentv1alpha1.PlatformAgentSpec{
 			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				GoogleChat: &agentv1alpha1.GoogleChatSpec{Enabled: ptr.To(true)},
 				Slack: &agentv1alpha1.SlackSpec{
 					Enabled:      ptr.To(true),
 					AllowedUsers: []string{""},
@@ -2432,6 +2434,8 @@ func TestBuildDeploymentSlackAllowAllUsers(t *testing.T) {
 	}
 }
 
+// With Google Chat on as well, Slack stays on its legacy consumer: the
+// Hermes slack platform is enabled in the rendered config.
 func TestBuildConfigMapSlackEnabled(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{
@@ -2440,6 +2444,7 @@ func TestBuildConfigMapSlackEnabled(t *testing.T) {
 		},
 		Spec: agentv1alpha1.PlatformAgentSpec{
 			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				GoogleChat: &agentv1alpha1.GoogleChatSpec{Enabled: ptr.To(true)},
 				Slack: &agentv1alpha1.SlackSpec{
 					Enabled: ptr.To(true),
 				},
@@ -4029,12 +4034,15 @@ func TestManagedConfigPinsModelAndPlatformsButNotHomeChannel(t *testing.T) {
 // The home-channel vars are excluded on purpose. They stay ordinary container env, which
 // the PVC .env (also override=True) beats, so the CR value seeds the home channel and
 // `/sethome` wins from then on.
+//
+// The Chat keys are not among the pins: the A2A gateway consumes Chat and
+// the Hermes google_chat platform renders nothing for it
+// (TestTheLegacyChatConsumerIsNotRendered). With Chat on, Slack stays on its
+// legacy consumer, so its keys are pinned.
 func TestManagedEnvPinsPlatformKeysButNotHome(t *testing.T) {
 	env := renderManagedEnv(chatAgent())
 
 	for _, key := range []string{
-		"GOOGLE_CHAT_RELAY_URL", "GOOGLE_CHAT_PROJECT_ID", "GOOGLE_CHAT_SUBSCRIPTION_NAME",
-		"GOOGLE_CHAT_ALLOWED_USERS", "GOOGLE_CHAT_ALLOW_ALL_USERS",
 		"SLACK_RELAY_URL", "SLACK_ALLOWED_USERS", "SLACK_ALLOW_ALL_USERS",
 		"GATEWAY_ALLOWED_USERS", "GATEWAY_ALLOW_ALL_USERS",
 	} {
@@ -4054,19 +4062,19 @@ func TestManagedEnvPinsPlatformKeysButNotHome(t *testing.T) {
 	// integration has no platform credential worth freezing, and a pin invented for one
 	// would only be a key the agent is refused permission to set. What survives is the
 	// fourteen unconditional pins, none of which is about chat: the loopback bearer (see
-	// the next test), the PVC's directory mode, the mode switch, the three
-	// earned-autonomy switches, the scope path, the resolved scope's path (empty outside
-	// next), the empty management-project override, the stall watch's three knobs, empty, the
+	// the next test), the PVC's directory mode, the mode pin (always next), the three
+	// earned-autonomy switches, the scope path, the resolved scope's path, the empty
+	// management-project override, the stall watch's three knobs, empty, the
 	// Pub/Sub platform relay URL, empty, and the project that qualifies its routes.
 	bare := renderManagedEnv(newTestPlatformAgent())
 	want := "API_SERVER_KEY=" + loopbackAgentAPIKey + "\n" +
 		"HERMES_HOME_MODE=" + hermesHomeMode + "\n" +
-		kubeagentsModeEnvKey + "=today\n" +
+		kubeagentsModeEnvKey + "=" + kubeagentsModeValue + "\n" +
 		envPostMergeCheck + "=off\n" +
 		envAutomerge + "=off\n" +
 		envDial + "=off\n" +
 		scopeFileEnvKey + "=" + scopeDir + "/" + scopeFileName + "\n" +
-		resolvedScopeFileEnvKey + "=\n" +
+		resolvedScopeFileEnvKey + "=" + resolvedScopeDir + "/" + scopeResolvedDataKey + "\n" +
 		reconcileProjectEnvKey + "=\n" +
 		stallWatchExcludeNamespacesEnvKey + "=\n" +
 		stallWatchMinAgeEnvKey + "=\n" +
@@ -7754,47 +7762,31 @@ func TestBuildPluginStagingInitContainer_AssertsNonEmptyAndFailsOnErrors(t *test
 	}
 }
 
-// The mode pin (docs/designs/spec-mode-switch.md): the managed key is the only
-// way the mode reaches the agent runtime, and it is emitted always, with the
-// real value, per this file's pin doctrine — an absent key is a key the agent
-// may write into the PVC .env, and the mode must not be the agent's to fake.
+// The mode pin: the managed key is emitted always, as "next", whatever
+// spec.mode says, per this file's pin doctrine — an absent key is a key the
+// agent may write into the PVC .env, and an agent image from before the
+// removal of spec.mode today still reads it.
 func TestManagedEnvPinsTheMode(t *testing.T) {
-	bare := newTestPlatformAgent()
-	if env := renderManagedEnv(bare); !strings.Contains(env, kubeagentsModeEnvKey+"=today") {
-		t.Errorf("mode absent must pin today, got:\n%s", env)
-	}
-
-	next := newTestPlatformAgent()
-	next.Spec.Mode = ptr.To("next")
-	if env := renderManagedEnv(next); !strings.Contains(env, kubeagentsModeEnvKey+"=next") {
-		t.Errorf("mode next must pin next, got:\n%s", env)
-	}
-
-	// Flipping the mode rolls the agent pod: the managed .env feeds the config
-	// ConfigMap, whose hash is a pod-template annotation (config-hash). Same
-	// mechanism as every other config change; this asserts the mode rides it.
-	todayHash, err := getConfigMapHash(buildConfigMap(bare, nil))
-	if err != nil {
-		t.Fatalf("hashing today's config: %v", err)
-	}
-	nextHash, err := getConfigMapHash(buildConfigMap(next, nil))
-	if err != nil {
-		t.Fatalf("hashing next's config: %v", err)
-	}
-	if todayHash == nextHash {
-		t.Error("flipping the mode does not move the config hash, so the pod never rolls and the running agent keeps the old mode")
+	for name, mode := range map[string]*string{"mode absent": nil, "mode next": ptr.To("next"), "a stored today": ptr.To("today")} {
+		agent := newTestPlatformAgent()
+		agent.Spec.Mode = mode
+		if env := renderManagedEnv(agent); !strings.Contains(env, kubeagentsModeEnvKey+"=next") {
+			t.Errorf("%s must pin next, got:\n%s", name, env)
+		}
 	}
 }
 
 func TestManagedEnvValuesCannotSmuggleALine(t *testing.T) {
+	// Chat on the gateway and Slack beside it on its legacy consumer: the
+	// Slack allowlist is a CR value the managed .env pins.
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
 		Spec: agentv1alpha1.PlatformAgentSpec{
 			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
-				GoogleChat: &agentv1alpha1.GoogleChatSpec{
+				GoogleChat: &agentv1alpha1.GoogleChatSpec{Enabled: ptr.To(true)},
+				Slack: &agentv1alpha1.SlackSpec{
 					Enabled:      ptr.To(true),
-					ProjectID:    "p",
-					AllowedUsers: []string{"someone\nKUBEAGENTS_MODE=next"},
+					AllowedUsers: []string{"someone\nKUBEAGENTS_MODE=today"},
 				},
 			},
 		},
@@ -7808,7 +7800,7 @@ func TestManagedEnvValuesCannotSmuggleALine(t *testing.T) {
 	for _, line := range strings.Split(rendered, "\n") {
 		if strings.HasPrefix(line, "KUBEAGENTS_MODE=") {
 			modeLines++
-			if line != "KUBEAGENTS_MODE=today" {
+			if line != kubeagentsModeEnvKey+"="+kubeagentsModeValue {
 				t.Errorf("a CR value smuggled a mode line: %q", line)
 			}
 		}

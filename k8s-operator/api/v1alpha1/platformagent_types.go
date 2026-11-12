@@ -22,6 +22,13 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// PlatformAgentModeNext is the one value spec.mode takes. The field is
+// deprecated: "today" named a stack no release renders any more, so the
+// admission webhook rewrites it, and an absent field, to this value, and the
+// operator patches a stored "today" to it. The CRD markers on Mode below
+// spell the same value by hand, since a marker cannot name a constant.
+const PlatformAgentModeNext = "next"
+
 // PlatformAgentSpec defines the desired state of PlatformAgent
 type PlatformAgentSpec struct {
 	AgentSpec `json:",inline"`
@@ -34,10 +41,14 @@ type PlatformAgentSpec struct {
 	// +optional
 	Integration *PlatformAgentIntegrationSpec `json:"integration,omitempty"`
 
-	// Mode selects which component stack the operator renders.  "today" is the
-	// current architecture.  "next" additionally renders the NATS and A2A
-	// gateway components, which are otherwise dark.  Absent means "today".
+	// Mode is deprecated and ignored: every install runs the A2A stack (the
+	// NATS bus, the A2A gateway and the tiers), which "next" once selected.
+	// The field stays so a stored object that still carries "today" remains
+	// valid; the admission webhook rewrites "today" to "next", the schema
+	// defaults an absent field to "next", and the operator patches a stored
+	// "today" to "next" on its first pass. A later release removes the field.
 	// +kubebuilder:validation:Enum=today;next
+	// +kubebuilder:default=next
 	// +optional
 	Mode *string `json:"mode,omitempty"`
 

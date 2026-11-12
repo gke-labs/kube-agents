@@ -945,8 +945,7 @@ type TuningSpec struct {
 	Admission *AdmissionSpec `json:"admission,omitempty"`
 
 	// MaxSessions caps how many A2A session pods run concurrently, install-wide.
-	// It only means something under mode: next - a today install renders neither
-	// the gateway that spawns session pods nor this bound. "Delegate:" makes pod
+	// "Delegate:" makes pod
 	// creation user-triggerable from chat and threads are free, so the principal
 	// map bounds WHO can spawn and this bounds HOW MANY.
 	//
@@ -1028,8 +1027,7 @@ type TuningSpec struct {
 	//
 	// Unset, an install keeps the count its bus already runs, so an install
 	// whose next-mode bus predates the three-server default stays on one
-	// server, and a new bus gets three, including the one a today install's
-	// first switch to next creates (status.busReplicas shows which applies).
+	// server, and a new bus gets three (status.busReplicas shows which applies).
 	//
 	// Set, it decides the count of a bus that does not exist yet. An existing
 	// bus keeps the count it runs: NATS cannot carry a single server's streams
@@ -2879,8 +2877,8 @@ type AgentUsageStatus struct {
 	// delivered (its k8s_event_watcher_triage_sessions_total; a session
 	// whose inject was filtered, suppressed or failed is not counted) plus
 	// the chat conversations the gateway opened a session for (the session_store
-	// plugin's kubeagents_chat_sessions_total on a today install, that plus the
-	// A2A gateway's kubeagents_a2a_gateway_sessions_total on a next install). A
+	// plugin's kubeagents_chat_sessions_total plus the A2A gateway's
+	// kubeagents_a2a_gateway_sessions_total). A
 	// chat conversation that resumes after the session store's retention
 	// window (seven days by default) counts again. Read every five minutes
 	// and kept monotonic across restarts, like toolExecutionsTotal.
@@ -2889,9 +2887,9 @@ type AgentUsageStatus struct {
 
 	// ChatSessionsTotal is the chat half of SessionsTotal: the chat
 	// conversations the gateway opened a session for (the session_store
-	// plugin's kubeagents_chat_sessions_total on a today install, that plus
-	// the A2A gateway's kubeagents_a2a_gateway_sessions_total on a next
-	// install), without the event watcher's triage sessions. A re-seed from
+	// plugin's kubeagents_chat_sessions_total plus the A2A gateway's
+	// kubeagents_a2a_gateway_sessions_total), without the event watcher's
+	// triage sessions. A re-seed from
 	// a status that carries no chatSessionsTotal (an install with triage
 	// sessions and no chat yet, or a served CRD that holds the field back)
 	// seeds those triage sessions into the chat half, and the counter keeps
@@ -3079,8 +3077,8 @@ type AgentUsageStatus struct {
 	// so a repeated tap adds nothing:
 	// kubeagents_a2a_gateway_answer_feedback_total under rating up, summed
 	// over its other labels; read every five minutes and kept monotonic the
-	// same way as ToolExecutionsTotal. Next mode only: the Hermes gateway counts no thumbs-up, so on a today-mode
-	// install this stays at 0. Does not move LastActiveTime: the message the
+	// same way as ToolExecutionsTotal. The Hermes gateway counts no thumbs-up,
+	// so only ratings through the A2A gateway move it. Does not move LastActiveTime: the message the
 	// person rated already did.
 	// +optional
 	PositiveFeedbackTotal int64 `json:"positiveFeedbackTotal,omitempty"`

@@ -48,9 +48,8 @@ func TestTheGatewayReplicaCountDefaultsToTwo(t *testing.T) {
 }
 
 // TestTheElectedImageFollowsTheRunningGateway: the condition names what the
-// Lease holder runs, survives a pass that can't tell, and is dropped under
-// today, with the election off, or on a roll to a pinned image no elected
-// pod has run.
+// Lease holder runs, survives a pass that can't tell, and is dropped with
+// the election off, or on a roll to a pinned image no elected pod has run.
 func TestTheElectedImageFollowsTheRunningGateway(t *testing.T) {
 	const pinned, other = "example.com/a2a-gateway:pin", "example.com/a2a-gateway:older"
 	t.Setenv(a2aGatewayImageEnvVar, pinned)
@@ -67,11 +66,6 @@ func TestTheElectedImageFollowsTheRunningGateway(t *testing.T) {
 	}
 	if got := gatewayElectedImage(a2aTestAgent(), ptr.To(other)); got != "" {
 		t.Errorf("a holder on another image than the pin counted: %q", got)
-	}
-	today := withGatewayElected(a2aTestAgent(), pinned)
-	today.Spec.Mode = ptr.To("today")
-	if got := gatewayElectedImage(today, ptr.To(pinned)); got != "" {
-		t.Errorf("under today: %q", got)
 	}
 	t.Setenv(a2aGatewayElectionEnvVar, "false")
 	if got := gatewayElectedImage(withGatewayElected(a2aTestAgent(), pinned), ptr.To(pinned)); got != "" {

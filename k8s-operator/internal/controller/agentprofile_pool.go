@@ -476,8 +476,8 @@ func (r *PlatformAgentReconciler) deleteProfilePoolsExcept(ctx context.Context, 
 }
 
 // deleteProfilePools removes every warm pool of this agent's, and the CA
-// bundle's copy, from the profile namespace: the gate turned off, the flip to
-// today, and PlatformAgent deletion (through deleteDispatcherPodsRBAC).
+// bundle's copy, from the profile namespace: the gate turned off, and
+// PlatformAgent deletion (through deleteDispatcherPodsRBAC).
 func (r *PlatformAgentReconciler) deleteProfilePools(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	return goerrors.Join(r.deleteProfilePoolsExcept(ctx, agent, nil), r.deleteProfileCABundle(ctx, agent))
 }

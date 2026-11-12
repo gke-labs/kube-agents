@@ -788,32 +788,6 @@ func condition(p *agentv1alpha1.AgentProfile, typ string) metav1.Condition {
 	return metav1.Condition{}
 }
 
-// On a today install the same CR renders nothing: no ServiceAccount, no card,
-// and conditions that say why.
-func TestAnAgentProfileOnATodayInstallRendersNothing(t *testing.T) {
-	withOperatorBusPrincipal(t)
-	agent := a2aTestAgent()
-	agent.Spec.Mode = ptr.To("today")
-	p := testAgentProfile(agent.Namespace, "auditor")
-	h := newProfileHarness(t, agent, &p)
-
-	h.reconcile(agent.Namespace, "auditor")
-
-	if _, ok := h.serviceAccount(profileNamespaceName(agent), "agentprofile-auditor-read"); ok {
-		t.Error("a today install created the profile's ServiceAccount")
-	}
-	if len(h.dir.publishes) != 0 {
-		t.Errorf("a today install published %v", h.dir.publishes)
-	}
-	got := h.profile(agent.Namespace, "auditor")
-	if c := condition(got, agentv1alpha1.AgentProfileConditionIdentityReady); c.Status != metav1.ConditionFalse || c.Reason != reasonAgentProfileNotNext {
-		t.Errorf("IdentityReady = %s/%s, want False/%s", c.Status, c.Reason, reasonAgentProfileNotNext)
-	}
-	if slices.Contains(got.Finalizers, agentProfileFinalizer) {
-		t.Error("a today install holds the profile with a finalizer it will never need")
-	}
-}
-
 // On a next install: the ServiceAccount (owned, no automount), the card, the
 // finalizer, and both conditions True. A second reconcile publishes nothing.
 func TestAnAgentProfileOnANextInstallRendersItsServiceAccountAndCard(t *testing.T) {
@@ -955,36 +929,6 @@ func TestARefusedProfileRendersNothingAndWithdrawsItsCard(t *testing.T) {
 	}
 	if e := h.dir.entries["sneaky"]; e.kind != a2aKindAgentClosed {
 		t.Errorf("a refused profile's card is still on the directory: %+v", e)
-	}
-}
-
-// A flip to today removes the operator-created ServiceAccount and nothing it
-// does not own.
-func TestAFlipToTodayRemovesTheProfilesServiceAccount(t *testing.T) {
-	withOperatorBusPrincipal(t)
-	agent := a2aTestAgent()
-	p := testAgentProfile(agent.Namespace, "auditor")
-	h := newProfileHarness(t, agent, &p)
-	h.reconcile(agent.Namespace, "auditor")
-	if _, ok := h.serviceAccount(profileNamespaceName(agent), "agentprofile-auditor-read"); !ok {
-		t.Fatal("precondition: no ServiceAccount on next")
-	}
-
-	var live agentv1alpha1.PlatformAgent
-	if err := h.c.Get(context.Background(), types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name}, &live); err != nil {
-		t.Fatal(err)
-	}
-	live.Spec.Mode = ptr.To("today")
-	if err := h.c.Update(context.Background(), &live); err != nil {
-		t.Fatal(err)
-	}
-	h.reconcile(agent.Namespace, "auditor")
-	if _, ok := h.serviceAccount(profileNamespaceName(agent), "agentprofile-auditor-read"); ok {
-		t.Error("the profile's ServiceAccount survived a flip to today")
-	}
-	// today tears the bus down, so the connection held for it goes too.
-	if !slices.Contains(h.dir.forgets, agent.Namespace) {
-		t.Errorf("the bus connection was kept after a flip to today: forgets = %v", h.dir.forgets)
 	}
 }
 
@@ -1232,42 +1176,6 @@ func TestAMalformedProfileIsReportedAsInvalid(t *testing.T) {
 	}
 }
 
-// Under version skew the bus is frozen, not torn down: a deleting profile
-// still gets its tombstone and its finalizer released.
-func TestAProfileDeletedUnderVersionSkewIsStillFinalized(t *testing.T) {
-	withOperatorBusPrincipal(t)
-	agent := a2aTestAgent()
-	p := testAgentProfile(agent.Namespace, "auditor")
-	h := newProfileHarness(t, agent, &p)
-	h.reconcile(agent.Namespace, "auditor")
-
-	var live agentv1alpha1.PlatformAgent
-	if err := h.c.Get(context.Background(), types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name}, &live); err != nil {
-		t.Fatal(err)
-	}
-	live.Spec.Mode = ptr.To("later")
-	if err := h.c.Update(context.Background(), &live); err != nil {
-		t.Fatal(err)
-	}
-	if err := h.c.Delete(context.Background(), h.profile(agent.Namespace, "auditor")); err != nil {
-		t.Fatal(err)
-	}
-	h.dir.forgets = nil
-	h.reconcile(agent.Namespace, "auditor")
-	if e := h.dir.entries["auditor"]; e.kind != a2aKindAgentClosed {
-		t.Errorf("no tombstone under skew: %+v", e)
-	}
-	// The frozen bus is still running and the tombstone needs it, so the
-	// connection is kept; dropping it here redials on every retry.
-	if len(h.dir.forgets) != 0 {
-		t.Errorf("the bus connection was dropped under skew: %v", h.dir.forgets)
-	}
-	var gone agentv1alpha1.AgentProfile
-	if err := h.c.Get(context.Background(), types.NamespacedName{Namespace: agent.Namespace, Name: "auditor"}, &gone); !apierrors.IsNotFound(err) {
-		t.Errorf("the profile is still held under skew: %v", err)
-	}
-}
-
 // With no profile left in a namespace, an event there enqueues the
 // namespace-only request that drops the bus connection.
 func TestAnEmptyNamespaceEnqueuesTheConnectionDrop(t *testing.T) {
@@ -1393,24 +1301,12 @@ func TestEnabledAgentProfileNamesAndPodEnvWiring(t *testing.T) {
 		t.Errorf("heldEnabledProfiles = %v, %v; want [tse], nil", held, err)
 	}
 
-	// 2. Delete the `tse` AgentProfile from the fake client, then verify both hold branches
-	// (mode skew and agentProfilesUnreadable) preserve KUBE_AGENTS_ENABLED_PROFILES=tse on
-	// the live gateway Deployment before the healthy removal pass clears it.
+	// 2. Delete the `tse` AgentProfile from the fake client, then verify the hold branch
+	// (agentProfilesUnreadable) preserves KUBE_AGENTS_ENABLED_PROFILES=tse on the live
+	// gateway Deployment before the healthy removal pass clears it.
 	if err := h.c.Delete(context.Background(), &tse); err != nil {
 		t.Fatalf("deleting tse AgentProfile: %v", err)
 	}
-	skewedAgent := agent.DeepCopy()
-	skewedAgent.Spec.Mode = ptr.To("quantum")
-	if err := reconciler.reconcileWorkload(context.Background(), skewedAgent, "cfg", "fb", "set", "pol", nil, "", false); err != nil {
-		t.Fatalf("reconcileWorkload under mode skew: %v", err)
-	}
-	if err := h.c.Get(context.Background(), client.ObjectKey{Namespace: agent.Namespace, Name: agent.Name + gatewayAppSuffix}, &liveDep); err != nil {
-		t.Fatalf("getting applied gateway Deployment after skew reconcile: %v", err)
-	}
-	if got, _ := envValue(containerNamed(t, &liveDep, appNamePlatformAgent), enabledProfilesEnvVar); got != "tse" {
-		t.Errorf("gateway Deployment %s after mode-skew reconcileWorkload = %q, want %q", enabledProfilesEnvVar, got, "tse")
-	}
-
 	reconciler.agentProfilesUnreadable = true
 	if err := reconciler.reconcileWorkload(context.Background(), agent, "cfg", "fb", "set", "pol", nil, "", false); err != nil {
 		t.Fatalf("reconcileWorkload under agentProfilesUnreadable: %v", err)

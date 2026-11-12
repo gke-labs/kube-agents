@@ -473,8 +473,8 @@ func TestReconcileWritesNoVolumesDroppedConditionWithoutAHostPath(t *testing.T) 
 }
 
 // TestADroppedHostPathIsReportedOnAReconcileThatParksDegraded is the gap the
-// Ready-only condition write left. Three refusals render the workload in full
-// and then park the CR on Degraded (ModeNotRecognized, A2AProvisionFailed,
+// Ready-only condition write left. Two refusals render the workload in full
+// and then park the CR on Degraded (A2AProvisionFailed,
 // ShellSandboxKeysMissing), and on those passes updateStatusReady never runs.
 // The one used here is the one a chart-default install sits on indefinitely:
 // the chart renders the sandbox's authorized-keys Secret only when a public

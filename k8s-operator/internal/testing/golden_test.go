@@ -210,11 +210,12 @@ func TestAgentsGolden(t *testing.T) {
 			},
 		},
 		{
-			// spec.mode: next renders the A2A stack beside the agent; the chart's
-			// footprint.yaml sums it from this golden for a next-mode install.
-			name:         "PlatformAgentNextMode",
-			inputPath:    filepath.Join("testdata", "platform", "platformagent-next.yaml"),
-			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-next.yaml"),
+			// The default example CR reconciled until settled, so the golden
+			// carries what later passes add (the bridge's activity hook); the
+			// chart's footprint.yaml sums the A2A stack from this golden.
+			name:         "PlatformAgentSettled",
+			inputPath:    filepath.Join("testdata", "platform", "platformagent-settled.yaml"),
+			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-settled.yaml"),
 			settled:      true,
 			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
 			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {

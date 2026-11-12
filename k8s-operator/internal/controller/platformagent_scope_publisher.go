@@ -64,7 +64,7 @@ import (
 // publisher's identity and its patch grant render only while a Job may run
 // (scopePublisherMayRun), because without the gateway pod admission policy a
 // pod could run under that identity and write the document the gateway
-// trusts. A today install renders none of it.
+// trusts.
 const (
 	scopeResolvedConfigMapSuffix = "-resolved-scope"
 	// scopeResolvedDataKey is the one key the publisher writes.
@@ -225,13 +225,13 @@ func scopePublisherBrokerCaller(agent *agentv1alpha1.PlatformAgent) string {
 	return fmt.Sprintf("system:serviceaccount:%s:%s", agent.Namespace, scopePublisherName(agent))
 }
 
-// scopePublisherRendered is whether the publisher's objects render: mode next.
+// scopePublisherRendered is whether the publisher's objects render: always.
 func scopePublisherRendered(agent *agentv1alpha1.PlatformAgent) bool {
-	return renderMode(agent, "a2a-scope-publisher") == ModeNext
+	return true
 }
 
-// scopeBrokerRoleEnabled is whether the broker confers the scope role: mode
-// next and the gateway pod admission policy rendered
+// scopeBrokerRoleEnabled is whether the broker confers the scope role: the
+// gateway pod admission policy rendered
 // (a2aGatewayPodPolicyEnvVar).
 func scopeBrokerRoleEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 	return scopePublisherRendered(agent) && os.Getenv(a2aGatewayPodPolicyEnvVar) == "true"
@@ -805,8 +805,7 @@ type scopePublisherOutcome struct {
 
 // reconcileScopePublisher applies the ConfigMap, applies the publisher's
 // identity while a Job may run and removes it otherwise, starts a publisher
-// Job when the schedule says so, and reads the ConfigMap for the condition. reconcileA2AStack runs it under next only; cleanupA2A removes
-// what it rendered.
+// Job when the schedule says so, and reads the ConfigMap for the condition.
 func (r *PlatformAgentReconciler) reconcileScopePublisher(ctx context.Context, agent *agentv1alpha1.PlatformAgent, now time.Time) (scopePublisherOutcome, error) {
 	owned, err := r.scopePublisherIdentityOwned(ctx, agent)
 	if err != nil {
@@ -940,7 +939,7 @@ func (r *PlatformAgentReconciler) removeScopePublisherIdentity(ctx context.Conte
 // scopeResolvedConditionCurrent and setScopeResolvedCondition carry the
 // ScopeResolved condition through both status writers, as the MCP server
 // condition is carried: the condition reconcileScopePublisher computed, or
-// none (a today install, or a scope with nothing to resolve).
+// none (a scope with nothing to resolve).
 func scopeResolvedConditionCurrent(agent *agentv1alpha1.PlatformAgent, want *metav1.Condition) bool {
 	existing := meta.FindStatusCondition(agent.Status.Conditions, scopeResolvedConditionType)
 	if want == nil {

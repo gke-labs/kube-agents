@@ -585,7 +585,7 @@ func resolveResources(deployment *agentv1alpha1.DeploymentSpec) corev1.ResourceR
 	// evicts a Burstable pod whose working set is above its request, and the
 	// gateway was evicted three times in four days at 3.1 to 3.5 GiB against
 	// 2Gi. And the kanban dispatcher's memory admission takes the request as
-	// its default budget: a gateway under spec.mode next idles at about
+	// its default budget: the A2A gateway idles at about
 	// 1.5 GiB of working set, so a 2Gi budget admitted no worker at all on the
 	// presubmit install and refused every card after the queue bound. 4Gi
 	// holds the idle set and about five or six workers at 430 MiB, the count

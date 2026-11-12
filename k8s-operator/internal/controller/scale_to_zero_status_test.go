@@ -96,7 +96,7 @@ func TestScaleToZeroReportsPausedNotProvisioning(t *testing.T) {
 // Deployment controller has taken it away.
 func TestScaleToZeroWithAReplicaStillServingIsStillReady(t *testing.T) {
 	agent := scaledToZeroAgent()
-	phase, _ := settleStatus(t, agent, readyGateway(agent), shellSandbox(agent, 1), credentialBroker(agent, 1))
+	phase, _ := settleStatus(t, agent, append(a2aStackUp(agent), readyGateway(agent), shellSandbox(agent, 1), credentialBroker(agent, 1), a2aGatewayWorkload(agent, 1))...)
 
 	if phase != "Ready" {
 		t.Errorf("got phase %q, want Ready: a replica is still serving while the scale-down drains", phase)
@@ -123,7 +123,7 @@ func TestClearingScaleToZeroRestoresTheNormalPhase(t *testing.T) {
 		t.Errorf("Ready reason still ScaledToZero after the field was cleared")
 	}
 
-	phase, _ = settleStatus(t, agent, readyGateway(agent), shellSandbox(agent, 1), credentialBroker(agent, 1))
+	phase, _ = settleStatus(t, agent, append(a2aStackUp(agent), readyGateway(agent), shellSandbox(agent, 1), credentialBroker(agent, 1), a2aGatewayWorkload(agent, 1))...)
 	if phase != "Ready" {
 		t.Errorf("got phase %q once the gateway is back, want Ready", phase)
 	}

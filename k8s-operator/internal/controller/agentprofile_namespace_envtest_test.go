@@ -299,10 +299,9 @@ func TestAnUnmarkedNamespaceIsNotTheProfileNamespace(t *testing.T) {
 	}
 }
 
-// The delete helpers the flip and the deletion use remove the agent's quota
-// and fence from the profile namespace, and leave an object of the same name
-// that isn't its. (The flip's call sites are in
-// TestTheProfileFenceAloneDrivesTheTeardown, which runs cleanupA2A.)
+// The delete helpers the deletion uses remove the agent's quota and fence
+// from the profile namespace, and leave an object of the same name that
+// isn't its.
 func TestTheProfileDeleteHelpersTakeOnlyTheAgentsOwn(t *testing.T) {
 	c, scheme := startEnvtest(t)
 	ctx := context.Background()
