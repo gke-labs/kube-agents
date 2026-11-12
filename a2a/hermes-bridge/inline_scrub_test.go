@@ -673,3 +673,17 @@ func TestALongLineOfSchemeWordsScrubsInLinearTime(t *testing.T) {
 		t.Errorf("the authorization value leaked: %q", got)
 	}
 }
+
+// `kubectl get secrets` as a markdown table lists Secrets, never their
+// values: a name ending in a credential word keeps its TYPE (#5311 review,
+// Fuxiao-Gao). A key/value table with a value column is still redacted.
+func TestAKubectlSecretListingKeepsItsTypeColumn(t *testing.T) {
+	listing := "| NAME | TYPE | DATA | AGE |\n|---|---|---|---|\n| db-password | Opaque | 1 | 5d |\n| api-token | kubernetes.io/service-account-token | 3 | 9d |\n"
+	if got := scrubInlineSecrets(listing); got != listing {
+		t.Errorf("the listing changed:\n%s", got)
+	}
+	kv := "| Key | Value |\n|---|---|\n| db-password | Synth3tic-Pass-0042 |\n"
+	if got := scrubInlineSecrets(kv); strings.Contains(got, "Synth3tic-Pass-0042") {
+		t.Errorf("a key/value table leaked: %q", got)
+	}
+}

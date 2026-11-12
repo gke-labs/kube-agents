@@ -1933,6 +1933,12 @@ func scrubMarkdownTables(s string, sink secretSink) string {
 					cols[c] = class
 				}
 			}
+			if h := block[0].cells; kubectlSecretListingHeader(s, h) {
+				// `kubectl get secrets` as a table lists Secrets, never their
+				// values: its DATA is a key count.
+				block = block[:0]
+				return
+			}
 			if h := block[0].cells; len(h) >= 2 {
 				hasValue := false
 				for c := 1; c < len(h); c++ {
@@ -2099,6 +2105,21 @@ func tableHeaderWords(s string, cell [2]int) []string {
 		}
 	}
 	return words
+}
+
+// kubectlSecretListingHeader says whether a table's header is kubectl's
+// listing of Secrets, NAME | TYPE | DATA | AGE, in any case and markdown.
+func kubectlSecretListingHeader(s string, h [][2]int) bool {
+	want := []string{"name", "type", "data", "age"}
+	if len(h) != len(want) {
+		return false
+	}
+	for i, cell := range h {
+		if words := tableHeaderWords(s, cell); len(words) != 1 || words[0] != want[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // tableHeaderIsValue says whether a header names a column of values
