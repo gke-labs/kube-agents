@@ -42,8 +42,8 @@ verification_spec:
     check:
       type: report_contains
       required_patterns:
-        - 'sized-[sml]-01'
-        - 'sized-[sml]-02'
-        - 'sized-[sml]-03'
-        - 'sized-[sml]-04'
+        - "sized-[sml]-01"
+        - "sized-[sml]-02"
+        - "sized-[sml]-03"
+        - "sized-[sml]-04"
         - '(?<![\w.$])v?1\.\d{2}\.\d+(?!\d|\.\d)'
