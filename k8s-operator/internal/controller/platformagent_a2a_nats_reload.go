@@ -60,12 +60,13 @@ const (
 	// (platformagent_a2a_profile_hold.go relies on that).
 	a2aBusReloadFoldedAnnotation = "kubeagents.x-k8s.io/a2a-reload-folded"
 	// a2aBusReloadRearmedAnnotation marks a wait re-armed off a folded
-	// reload's move. That move shows the kubelet and the reloader delivering
-	// a write, and the kubelet writes the Secret as it is when it syncs, so
-	// a newer write still undelivered moves the load time again within a
-	// sync. A re-armed wait that reaches a2aBusReloadBound with no further
-	// move is the newest write having been in that move: confirmed, not
-	// restarted. Only a write the pod could still lack is restarted onto.
+	// reload's move. Writes seconds apart usually reach the pod in one
+	// kubelet write, so a re-armed wait often sees no further move, and
+	// nothing the server reports can say whether the newest write was in the
+	// one it saw. Past a2aBusReloadBound it is restarted onto the newest,
+	// as any unconfirmed reload is: confirming by the move's absence would
+	// admit a profile whose deny the server might not hold. The mark only
+	// makes that restart a Normal Event rather than a failure Warning.
 	a2aBusReloadRearmedAnnotation = "kubeagents.x-k8s.io/a2a-reload-rearmed"
 
 	// How long a reload may take before the operator restarts the bus pod
@@ -81,7 +82,10 @@ const (
 	a2aBusVarzTimeout = 3 * time.Second
 
 	a2aBusConfigReloadedReason = "BusConfigReloaded"
-	a2aBusReloadFailedReason   = "BusConfigReloadFailed"
+	// a2aBusConfigReloadFoldedReason is the Normal Event for a restart onto
+	// a folded config change (a2aBusReloadRearmedAnnotation).
+	a2aBusConfigReloadFoldedReason = "BusConfigReloadFolded"
+	a2aBusReloadFailedReason       = "BusConfigReloadFailed"
 )
 
 // a2aBusVarzClient reads the bus's monitoring endpoint directly: an
@@ -146,6 +150,10 @@ type a2aBusReload struct {
 	requeue time.Duration
 	// reloaded: the pending reload landed on this pass.
 	reloaded bool
+	// folded: restartPod is for a wait re-armed off a folded reload's move,
+	// whose newest write can't be confirmed in place, not a reload that
+	// failed (a2aBusReloadRearmedAnnotation).
+	folded bool
 	// busUID is the live StatefulSet's, which a restarted pod must belong to.
 	busUID types.UID
 }
@@ -229,12 +237,9 @@ func (r *PlatformAgentReconciler) planA2ABusReload(ctx context.Context, agent *a
 	_, rearmed := live.Annotations[a2aBusReloadRearmedAnnotation]
 	since, perr := time.Parse(time.RFC3339Nano, requestedAt)
 	if perr != nil || now.Sub(since) >= a2aBusReloadBound {
-		if rearmed && perr == nil && err == nil && loaded == baseline {
-			// A full bound since a delivered move, and nothing newer moved
-			// the load time: the newest write was in that move.
-			return a2aBusReload{reloaded: true, busUID: busUID}, nil
-		}
-		return a2aBusReload{restartPod: true, busUID: busUID}, nil
+		// A re-armed fold the server still answers for is the expected
+		// shape, not a failed reload; it restarts all the same.
+		return a2aBusReload{restartPod: true, folded: rearmed && perr == nil && err == nil, busUID: busUID}, nil
 	}
 	stampA2ABusReload(config, requestedAt, baseline)
 	if _, folded := live.Annotations[a2aBusReloadFoldedAnnotation]; folded {
@@ -284,6 +289,13 @@ func (r *PlatformAgentReconciler) actOnA2ABusReload(ctx context.Context, agent *
 			return nil
 		}
 		return fmt.Errorf("failed to restart A2A bus pod %s after a failed reload: %w", pod.Name, err)
+	}
+	if plan.folded {
+		logf.FromContext(ctx).Info("restarted the A2A bus pod onto a folded config change", "pod", pod.Name, "bound", a2aBusReloadBound)
+		r.recordEvent(agent, corev1.EventTypeNormal, a2aBusConfigReloadFoldedReason,
+			fmt.Sprintf("Restarted A2A bus pod %s: two config changes reached it together, and the newer one can't be confirmed in place, so it restarts onto it.",
+				pod.Name))
+		return nil
 	}
 	logf.FromContext(ctx).Info("restarted the A2A bus pod: its config reload wasn't confirmed in time", "pod", pod.Name, "bound", a2aBusReloadBound)
 	r.recordEvent(agent, corev1.EventTypeWarning, a2aBusReloadFailedReason,

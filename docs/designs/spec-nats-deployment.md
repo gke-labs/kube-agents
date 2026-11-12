@@ -320,7 +320,9 @@ Status (amended 9/4, the callout armed; amended 9/8, sessions moved; amended 9/1
 callout**, by presenting a projected ServiceAccount token: the bus provisioning Job,
 every spawned session pod, the platform agent container, the capability verifier, and
 (amended 10/28, #3655) the AgentProfile dispatcher, when the operator has its image
-(`A2A_DISPATCHER_IMAGE`; off by default until profiles dispatch end to end).
+(`A2A_DISPATCHER_IMAGE`; off by default until profiles dispatch end to end). Amended
+11/10: on by default, at the release set's image, and off at `A2A_PROFILE_DISPATCHER=false`
+(the chart's `operator.profileDispatcher.enabled`).
 The dispatcher's grants name each profile durable it reads on `PROFILE_SUBMITS` and each
 profile it dispatches for; it reconnects when its config adds one, and tasks it holds keep
 running across the reconnect. With a dispatcher the
@@ -639,8 +641,11 @@ Layout:
   one peer every new connection depends on - and nothing looks broken when that
   happens, because established connections are already authorized and keep working
   while the fabric silently accepts no new client. Still owed as they arm: the audit
-  exporter, the janitor, and the metrics scrape (the alert set above is scraped
-  series). The NATS pods' own route peer, which this list used to carry as owed, landed
+  exporter and the janitor. The metrics scrape landed (amended 11/9, #4477) without a
+  new peer on 8222, whose one peer stays the operator's pod (for reload
+  confirmation): a `prometheus-nats-exporter` sidecar in each NATS pod reads 8222 over
+  loopback and serves on 7777, and a separate rule admits the managed collector's
+  namespace (`gke-gmp-system`) to 7777 and nothing else. The NATS pods' own route peer, which this list used to carry as owed, landed
   with the three-server default (amended 10/29, #3274): a separate rule admits 6222 from
   the bus's servers and nothing else, since a fence without it keeps the cluster from
   ever forming. The topic-grant corollary that two edits
@@ -1132,12 +1137,13 @@ reload it asked for on the Secret, with the `config_load_time` it read just befo
 and confirms the reload when that value moves. A config written while a reload is still
 pending can't be confirmed by that move, which may be the earlier write landing, so the move
 restarts the wait from the new value. Writes a few seconds apart usually reach the pod in one
-kubelet write, so a restarted wait usually sees no further move. It is confirmed at three
-minutes: the move showed the kubelet delivering, and the kubelet writes the Secret as it is
-when it syncs, so a write still undelivered would move the value again within one sync. If
-a wait that never saw a move hasn't moved within three minutes, or the value can't be read,
-the operator deletes the bus pod so it restarts onto the new config, and writes a
-`BusConfigReloadFailed` Warning. The kubelet takes up to about a minute to write
+kubelet write, so a restarted wait usually sees no further move, and nothing the server
+reports says whether the newest write was in the one it saw. If the value hasn't moved
+within three minutes, or can't be read, the operator deletes the bus pod so it restarts onto
+the new config. That is a `BusConfigReloadFailed` Warning, or a Normal
+`BusConfigReloadFolded` Event for a restarted wait the server still answers for. The
+restart is kept even then: confirming by the absence of a move would admit a profile whose
+deny the server might not hold. The kubelet takes up to about a minute to write
 an updated Secret into a running pod, so a newly added profile's deny lands that long after
 the profile does. On the roll path it landed when the new pod came up, tens of seconds
 later, with the bus down for the roll. The websocket listener on 9222, the console's

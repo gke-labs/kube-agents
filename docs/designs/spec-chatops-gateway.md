@@ -2329,8 +2329,9 @@ as `slack:<user_id>`, the principal they get as a requester.
 
 **Reactions, clicks and Agent Sessions.** The adapter draws a chat message's `mark`
 (spec-a2a-payloads.md) as reactions on the asking message: today's emoji per ask kind, ⏸️ for
-`blocked`, ❌ for `failed`, nothing for `done`. The gateway owns the state (the chain's newest
-task's mark, the terminal default, a conversation notify's mark) and records what it drew on
+`blocked`, ❌ for `failed`, nothing for `done`. The gateway owns the state (the ask's kind drawn
+when its first task is accepted, `a2a/lib/askkind`; the chain's newest task's mark, the terminal
+default, a conversation notify's mark) and records what it drew on
 the chain's root history entry, so a mark draws only its difference, across a restart too; the
 adapter owns which emoji a token shows, and removes only its own reactions. A delegated child's
 terminal takes no default, since it is relayed before the wake that digests it exists: the
