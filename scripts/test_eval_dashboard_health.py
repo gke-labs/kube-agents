@@ -773,6 +773,15 @@ class Storm(unittest.TestCase):
         self.assertEqual(adjudicate(doc, later, held)["state"], "GREEN")
 
 
+    def test_trim_keeps_the_project_and_the_install_deaths(self):
+        # A fixture cut from a data.json holding a dead install replays it set
+        # aside, as the live tick did.
+        death = [{"at": "2026-10-29T02:02:08Z", "pods": 12, "reasons": {"Killing": 12}, "messages": []}]
+        doc = data(dict(run(100, 4158, T0 - timedelta(minutes=5), result="SUCCESS", tasks=[task("case-0", "iii")]), project="kube-agents-evals-18", install_deaths=death), run(101, 1, T0 - timedelta(minutes=6), result="SUCCESS", tasks=[task("case-0", "ppp")]))
+        trimmed = {r["build_id"]: r for r in health.trim(doc, T0 - timedelta(hours=1), T0, "test")["runs"]}
+        self.assertEqual((trimmed["100"]["project"], trimmed["100"]["install_deaths"]), ("kube-agents-evals-18", death))
+        self.assertNotIn("install_deaths", trimmed["101"])
+
     def test_a_dead_install_among_the_newest_runs_does_not_hold_the_storm_open(self):
         # Rule 6's exit reads the storm's signature off the newest runs; a run
         # set aside for a dead install carries none, whatever it lost.

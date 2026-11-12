@@ -623,7 +623,8 @@ function stormFacts(inc, inWindow) {
   const projects = new Set();
   for (const run of inWindow) {
     let mine = 0;
-    for (const c of run.cases || []) { reps += repTotal(c.reps); storm += c.reps.infra; mine += c.reps.infra; }
+    // A dead install's lost attempts are repetitions that ran, not the storm's.
+    for (const c of run.cases || []) { reps += repTotal(c.reps); if (c.cls === "install-died") continue; storm += c.reps.infra; mine += c.reps.infra; }
     if (mine) { if (run.pr != null) prs.add(run.pr); if (run.project) projects.add(run.project); }
   }
   const graded = inWindow.flatMap((r) => (r.cases || []).filter((c) => c.admitted && c.outcome !== "infra"));

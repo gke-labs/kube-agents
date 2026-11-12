@@ -404,7 +404,10 @@ INSTALL_DEATH_MIN_PODS = 2
 # by header name; a reprinted header or a reworded column leaves the field
 # unread rather than misread.
 POD_WATCH_NAME, POD_WATCH_PHASE, POD_WATCH_REASON, POD_WATCH_STARTED, POD_WATCH_DELETING = "NAME", "PHASE", "REASON", "STARTED", "DELETING"
-EVENT_WATCH_FIRST, EVENT_WATCH_LAST, EVENT_WATCH_REASON, EVENT_WATCH_NAME, EVENT_WATCH_MESSAGE = "FIRST", "LAST", "REASON", "NAME", "MESSAGE"
+EVENT_WATCH_FIRST, EVENT_WATCH_LAST, EVENT_WATCH_EVENT, EVENT_WATCH_REASON, EVENT_WATCH_NAME, EVENT_WATCH_MESSAGE = "FIRST", "LAST", "EVENT", "REASON", "NAME", "MESSAGE"
+# An event's time: lastTimestamp, else eventTime (events.k8s.io/v1 emitters
+# such as the scheduler fill only that one), else firstTimestamp.
+EVENT_WATCH_TIME_COLUMNS = (EVENT_WATCH_LAST, EVENT_WATCH_EVENT, EVENT_WATCH_FIRST)
 WATCH_NONE = "<none>"
 WATCH_COLUMN_GAP = re.compile(r"\s{2,}")
 POD_PHASES_DONE = frozenset({"Succeeded", "Failed"})
@@ -1076,6 +1079,8 @@ def _watch_rows(text: str) -> list[dict]:
             continue
         if not columns:
             continue
+        # The last column (an event's message) keeps its own double spaces.
+        cells = WATCH_COLUMN_GAP.split(line.rstrip(), maxsplit=len(columns) - 1)
         rows.append({name: (None if value == WATCH_NONE else value) for name, value in zip(columns, cells)})
     return rows
 
@@ -1098,16 +1103,19 @@ def parse_install_deaths(pods_text: str | None, read_events) -> list[dict] | Non
     Kubernetes wrote them: `{at, pods, reasons: {reason: n}, messages: [..]}`."""
     if pods_text is None:
         return None
-    last: dict[str, dict] = {}
+    # One entry per pod generation: a StatefulSet brings its replacement
+    # back under the same name, with a new start time, so the deleted
+    # generation keeps its row.
+    last: dict[tuple, dict] = {}
     for row in _watch_rows(pods_text):
         name = row.get(POD_WATCH_NAME)
         if name:
-            last[name] = row
+            last[(name, row.get(POD_WATCH_STARTED))] = row
     pods = {
-        name: (_watch_time(row.get(POD_WATCH_STARTED)), _watch_time(row.get(POD_WATCH_DELETING)), row.get(POD_WATCH_PHASE), row.get(POD_WATCH_REASON))
-        for name, row in last.items()
+        key: (_watch_time(row.get(POD_WATCH_STARTED)), _watch_time(row.get(POD_WATCH_DELETING)), row.get(POD_WATCH_PHASE), row.get(POD_WATCH_REASON))
+        for key, row in last.items()
     }
-    deletions = sorted((deleting, name) for name, (_, deleting, _, _) in pods.items() if deleting)
+    deletions = sorted((deleting, key) for key, (_, deleting, _, _) in pods.items() if deleting)
     deaths: list[dict] = []
     events: list[dict] | None = None
     until = None
@@ -1117,23 +1125,24 @@ def parse_install_deaths(pods_text: str | None, read_events) -> list[dict] | Non
         window_end = at + INSTALL_DEATH_SPAN
         # Both sets are the pods alive at `at`: a pod created and deleted
         # inside the span (a replacement a drain caught) is neither.
-        dead = sorted(name for name, (started, deleting, _, _) in pods.items() if started and started <= at and deleting and at <= deleting < window_end)
+        dead = sorted(key for key, (started, deleting, _, _) in pods.items() if started and started <= at and deleting and at <= deleting < window_end)
         # A pod being deleted counts whatever its phase reads: an evicted
         # pod's last line can say Failed. Only a pod that finished on its own
         # and stays (a Job's) is out of the set.
         alive = sorted(
-            name
-            for name, (started, deleting, phase, _) in pods.items()
+            key
+            for key, (started, deleting, phase, _) in pods.items()
             if started and started <= at and (deleting is None or deleting >= at) and (deleting is not None or phase not in POD_PHASES_DONE)
         )
         if len(dead) < INSTALL_DEATH_MIN_PODS or dead != alive:
             continue
         until = window_end
         reasons: dict[str, int] = {}
-        for name in dead:
-            reason = pods[name][3]
+        for key in dead:
+            reason = pods[key][3]
             if reason:
                 reasons[reason] = reasons.get(reason, 0) + 1
+        dead_names = {name for name, _ in dead}
         messages: dict[str, int] = {}
         if events is None:
             # A reopened watch re-lists every event, so one event is many
@@ -1141,8 +1150,8 @@ def parse_install_deaths(pods_text: str | None, read_events) -> list[dict] | Non
             seen: set = set()
             events = [row for row in _watch_rows(read_events() or "") if tuple(sorted(row.items())) not in seen and not seen.add(tuple(sorted(row.items())))]
         for row in events:
-            when = _watch_time(row.get(EVENT_WATCH_LAST))
-            if row.get(EVENT_WATCH_NAME) not in dead or not when or not (at - INSTALL_DEATH_SPAN <= when < window_end):
+            when = next((t for t in (_watch_time(row.get(column)) for column in EVENT_WATCH_TIME_COLUMNS) if t), None)
+            if row.get(EVENT_WATCH_NAME) not in dead_names or not when or not (at - INSTALL_DEATH_SPAN <= when < window_end):
                 continue
             reason = row.get(EVENT_WATCH_REASON)
             if reason:

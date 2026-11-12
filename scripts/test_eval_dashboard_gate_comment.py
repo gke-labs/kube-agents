@@ -798,6 +798,13 @@ class NotEvaluatedComment(Harness):
         box = self.gh.bodies()[0].split("\n")[3]
         self.assertTrue(box.startswith("> Some cases could not be graded: the run's install died under them, every pod deleted at once."), box)
         self.assertNotIn("evals-", self.gh.bodies()[0])
+        # Beside a ceiling case the agent did not run for the dead install's
+        # cases, so the mix keeps the never-ran wording, not "the agent ran".
+        lost = ("agent-kanban-smoke", "security-overgrant-probe")
+        mixed = not_evaluated(101, 1301, NOW - timedelta(minutes=5), lost=lost, letters={lost[0]: "ccc", lost[1]: "iii"}, install_deaths=[{"at": "2026-10-29T02:02:08Z", "pods": 12, "reasons": {"Killing": 12}, "messages": []}])
+        self.tick(data(mixed, *green_others()), green_health())
+        box = self.gh.bodies()[-1].split("\n")[3]
+        self.assertTrue(box.startswith("> Some cases could not be graded: infrastructure failed before the agent ran."), box)
 
     def test_a_mix_of_causes_names_one_stage_only_when_it_is_shared(self):
         """Forge beside the ceiling: the agent ran for both. Forge beside a

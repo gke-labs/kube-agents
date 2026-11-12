@@ -608,7 +608,9 @@ what the renderer does with them.
   `KUBE_AGENTS_DELEGATION_CEILING` is also excluded from the storm counts
   (`storm_reps`, `health.json`'s `infra_reps`) and reported under
   `metrics.ceiling_reps` instead; one whose `reason` leads with
-  `KUBE_AGENTS_FORGE_UNAVAILABLE` is excluded from the storm counts too. When `reps` is absent the task's single
+  `KUBE_AGENTS_FORGE_UNAVAILABLE` is excluded from the storm counts too; a
+  storm rep in a run whose install died (`install_deaths`) leaves the run's
+  `storm_reps` and the storm rule but stays in `infra_reps`. When `reps` is absent the task's single
   `result` stands in for one rep.
 - `runs[].lane_excluded` — the case ids `hack/ci-eval-pr.sh` dropped from
   the matrix before the fan-out on the inject lane

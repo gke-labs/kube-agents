@@ -215,6 +215,9 @@ class RepAndOutcomeTest(unittest.TestCase):
         alive = run(100, 4158, T0 - timedelta(minutes=5), tasks=tasks)
         self.assertFalse(classify.run_is_storm(dead))
         self.assertTrue(classify.run_is_storm(alive))
+        # The Brief's storm facts read the same count: none from a dead install.
+        self.assertEqual((classify.storm_reps(dead), classify.storm_reps(alive)), (0, 6))
+        self.assertEqual(classify_run(dead, [dead])["storm_reps"], 0)
         name = sorted(ADMITTED)[0]
         row = case(classify_run(dead, [dead]), name)
         self.assertEqual((row["cls"], row["do"]), (classify.CLS_INSTALL_DIED, classify.DO_INSTALL_DIED))

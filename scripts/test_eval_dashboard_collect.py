@@ -3318,8 +3318,15 @@ class InstallDeathTest(unittest.TestCase):
         return (INSTALL_DEATH_TESTDATA / name).read_text(encoding="utf-8")
 
     def test_every_pod_deleted_within_the_span_is_a_death_with_the_events_words(self):
+        # The drain: the two StatefulSet pods go first and nats-0 is back
+        # under its own name before the last deletion (a new generation, not
+        # the deleted one); the scheduler's Preempted event carries only an
+        # eventTime and a message with two spaces inside.
         deaths = collect.parse_install_deaths(self.text("drained-pods-watch.txt"), lambda: self.text("drained-events-watch.txt"))
-        self.assertEqual(deaths, [{"at": "2026-10-29T02:02:08Z", "pods": 8, "reasons": {"Killing": 8}, "messages": ["Stopping container platform-agent"]}])
+        self.assertEqual(
+            deaths,
+            [{"at": "2026-10-29T02:02:08Z", "pods": 8, "reasons": {"Killing": 8, "Preempted": 1}, "messages": ["Stopping container platform-agent", "Preempted by kube-system/konnectivity-agent-59d786d895-zgzd5  on node gk3-pool-1"]}],
+        )
 
     def test_a_rollout_and_a_quiet_run_are_no_death_and_read_no_events(self):
         def no_events():
@@ -3331,7 +3338,7 @@ class InstallDeathTest(unittest.TestCase):
         events = self.text("drained-events-watch.txt")
         twice = events + events
         death = collect.parse_install_deaths(self.text("drained-pods-watch.txt"), lambda: twice)[0]
-        self.assertEqual(death["reasons"], {"Killing": 8})
+        self.assertEqual(death["reasons"], {"Killing": 8, "Preempted": 1})
 
     def test_no_pods_watch_is_unknown_not_no_death(self):
         self.assertIsNone(collect.parse_install_deaths(None, lambda: ""))
@@ -3344,7 +3351,7 @@ class InstallDeathTest(unittest.TestCase):
         twice = text + text
         self.assertEqual(collect.parse_install_deaths(twice, lambda: self.text("drained-events-watch.txt"))[0]["pods"], 8)
         # The dead pods' own status reason is counted beside the events'.
-        preempted = text.replace("Running     <none>      2026-10-29T01:00:00Z   2026-10-29T02:02:08Z", "Failed      Preempted   2026-10-29T01:00:00Z   2026-10-29T02:02:08Z")
+        preempted = text.replace("Running     <none>      2026-10-29T01:01:00Z   2026-10-29T02:02:08Z", "Failed      Preempted   2026-10-29T01:01:00Z   2026-10-29T02:02:08Z")
         self.assertNotEqual(preempted, text)
         death = collect.parse_install_deaths(preempted, lambda: "")[0]
         self.assertEqual(death["reasons"], {"Preempted": 1})

@@ -239,9 +239,10 @@ BOX_NOT_EVALUATED_EVERY = (
     " Retest once the environment is healthy."
 )
 # What lost the cases, by the class classify.py gave every lost one: the
-# agent ran in both named shapes, so "before the agent ran" would blame the
-# wrong stage. Anything else, a storm case among them included, keeps the
-# never-ran wording. A stage, never a case or a reason: the PR is public.
+# agent ran in the forge and ceiling shapes, so "before the agent ran" would
+# blame the wrong stage, and a dead install is its own stage. Anything else, a
+# storm case among them included, keeps the never-ran wording. A stage, never
+# a case or a reason: the PR is public.
 NOT_EVALUATED_CAUSE = "infrastructure failed before the agent ran"
 NOT_EVALUATED_CAUSE_BY_CLASS = {
     CLS_FORGE: "a forge read failed during grading, so the checks that read it could not be evaluated",
@@ -249,7 +250,9 @@ NOT_EVALUATED_CAUSE_BY_CLASS = {
     CLS_INSTALL_DIED: "the run's install died under them, every pod deleted at once",
 }
 # Lost cases that all ran the agent, but not of one class: a forge outage on
-# some and the delegation ceiling on others.
+# some and the delegation ceiling on others. A dead install is not one of
+# them: its cases never reached the agent.
+NOT_EVALUATED_CAUSES_RAN = frozenset({CLS_FORGE, CLS_CEILING})
 NOT_EVALUATED_CAUSE_RAN = "the agent ran, but the harness could not grade the result"
 # While health.json's condition is storm: the same line post_health.py
 # draws, so the comment and the brief agree on what the weather is.
@@ -508,7 +511,7 @@ def not_evaluated_cause(lost: list[str], verdict: dict) -> str:
     found = {classes.get(name) for name in lost}
     if len(found) == 1:
         return NOT_EVALUATED_CAUSE_BY_CLASS.get(found.pop(), NOT_EVALUATED_CAUSE)
-    if found and found <= set(NOT_EVALUATED_CAUSE_BY_CLASS):
+    if found and found <= NOT_EVALUATED_CAUSES_RAN:
         return NOT_EVALUATED_CAUSE_RAN
     return NOT_EVALUATED_CAUSE
 

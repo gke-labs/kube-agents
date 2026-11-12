@@ -451,14 +451,15 @@ def collapsed_cases(run: dict) -> set[str]:
 
 def run_is_storm(run: dict) -> bool:
     """Whether the run's dead repetitions read as the storm's: enough of
-    them, and not a run whose install died under them (`install_deaths`,
-    SCHEMA.md), whose losses are that install's and not the pool's, as the
-    health rule counts them."""
-    return storm_reps(run) >= STORM_RUN_SIGNATURE_REPS and not run.get("install_deaths")
+    them, counted as `storm_reps` counts them."""
+    return storm_reps(run) >= STORM_RUN_SIGNATURE_REPS
 
 
 def storm_reps(run: dict) -> int:
-    return _run_facts(run)["storm"]
+    """The run's storm repetitions as the weather counts them: none from a
+    run whose install died under them (`install_deaths`, SCHEMA.md), whose
+    losses are that install's and not the pool's, as health.py counts."""
+    return 0 if run.get("install_deaths") else _run_facts(run)["storm"]
 
 
 def ceiling_reps(run: dict) -> int:
