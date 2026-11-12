@@ -1317,10 +1317,11 @@ func TestAnEditCannotConvertAnExistingBus(t *testing.T) {
 		{"the count it runs", agent(nil, 3), agent(ptr.To(3), 3), false},
 		{"removing the field", agent(ptr.To(3), 1), agent(nil, 1), false},
 		{"a field the operator already holds, left as it was", agent(ptr.To(3), 1), agent(ptr.To(3), 1), false},
-		{"no recorded count (pruned, or today)", agent(nil, 0), agent(ptr.To(1), 0), false},
+		{"no recorded count (pruned by an older CRD)", agent(nil, 0), agent(ptr.To(1), 0), false},
 		{"a create", nil, agent(ptr.To(1), 0), false},
 		{"a flip to today with the field set to the other count", agent(nil, 3), today(agent(ptr.To(1), 3)), false},
-		{"a today CR whose count is not cleared yet", today(agent(nil, 1)), today(agent(ptr.To(3), 1)), false},
+		{"a today CR, which keeps its count", today(agent(nil, 1)), today(agent(ptr.To(3), 1)), false},
+		{"from today to next with the other count: the operator decides from the claims", today(agent(nil, 1)), agent(ptr.To(3), 1), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			errs := validateBusReplicas(tc.old, tc.new)

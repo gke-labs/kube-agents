@@ -12162,12 +12162,12 @@ spec:
                   description: |-
                     BusReplicas is the A2A bus's NATS server count under spec.mode: next:
                     the count the bus already runs, which spec.harness.tuning.busReplicas
-                    does not change; for a new bus, that field, or 3. Re-derived from the
-                    cluster on every reconcile, so it is a reading of the bus rather than a
-                    setting. Kept through a flip to spec.mode: today, while the bus's data
-                    claims are kept for the flip back, so that the bus returns at the count
-                    it ran rather than the count its claims imply; it is not a claim that a
-                    bus is running.
+                    does not change; for a new bus, that field, or 3. Re-derived on every
+                    reconcile under next, so it is a reading of the bus rather than a
+                    setting. Under spec.mode: today it is left at the count the bus last
+                    ran, so that a flip back returns the bus at that count rather than the
+                    count its kept data claims imply; it is not a claim that a bus is
+                    running, and with the claims deleted it no longer decides anything.
                   format: int32
                   type: integer
                 conditions:
