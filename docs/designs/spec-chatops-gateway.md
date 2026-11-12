@@ -169,22 +169,28 @@ by construction. Three interceptors run on each turn, ahead of the routing above
   other task of the tree the gateway hasn't seen end, a fan-out's children
   included. Each gets a cancel on its own addressee's `…in`, is marked canceled on
   its history entry, and gets its `DISPATCH_STOPS` record when it is a
-  profile task; a batch child's own line is closed on "🛑 stopped". A task that has
-  already ended is left alone. The stop posts its one notice for the conversation,
-  never one per task.
-  A task whose cancel couldn't be published is marked canceled all the same, so its
-  writes are dropped, but also `CancelUnsent`: it may still run, so it keeps
-  counting as the conversation's live delegation and keeps its batch open, and the
-  next turn's heal (a second `stop` included) sends its cancel again, under its
-  delegation's authority, until one goes out or the task ends.
+  profile task; a task that keeps its own line on its history entry (a batch child,
+  a delegating turn) has it closed on "🛑 stopped". A task that has already ended is
+  left alone. The stop posts its one notice for the conversation, never one per task.
+  A cancel doesn't end a task: a stopped task may work on until its executor reads
+  the cancel, so it counts as running, for the conversation's one live delegation and
+  for its batch, until its terminal arrives or the heal ends it (nothing within
+  `A2A_FIRST_EVENT_GRACE`). A task whose cancel couldn't be published is marked
+  canceled all the same, so its writes are dropped, and also `CancelUnsent`: the
+  next stop, or the next turn's heal, sends its cancel again (under the delegation's
+  authority at the heal, with an empty requester and a logged warning when that
+  attribution can't be read), until one goes out or the task ends.
   **No late writes:** nothing a task the gateway canceled writes afterwards reaches
   the room, whether it detached or not and whichever chain it is in, a single
   delegation's included. Its status notes, questions (`input-required`), notices,
   turn answers, result, terminal notice and steer shortfall are dropped, each with a
   log line (`relay: dropped a canceled task's write`). Its rolling line loses its
   Stop control at the first drop, edited to "🛑 cancel sent — the task ends when the
-  executor confirms", and is closed by the terminal's edit. The stop's own reply is
-  the only output; a program's observer still hears the chain's end.
+  executor confirms", and is closed by the terminal's edit, which reads stopped
+  ("🛑 canceled") whatever the task ended with; nor does its executor's terminal mark
+  draw. The stop's own reply is the only output. A program's observer hears the
+  chain end canceled and is handed no deliverable, and a console's terminal frame says
+  canceled with no answer text.
 
   **Stopping the cards (gke-labs#3263).** Under `next` the front door's turn often ends
   seconds after it files a kanban card, and the card is not a task the gateway holds. With
@@ -510,7 +516,7 @@ the next cold start, which fails closed. A turn whose requester is no longer on
 record (cleared at `A2A_ASK_TTL`, with its text) is left out of the primer whole, so the pod never
 reads text whose authors the check can't count. The bound is the conversation as the primer
 carries it, not one incarnation. What else a session carries across incarnations is
-#2370. One live delegation per conversation, a child whose cancel has gone out no longer counting (its writes are dropped, and the heal ends one that never confirms), while one whose cancel couldn't be published still does:
+#2370. One live delegation per conversation, a detached-but-still-running child counting as live until its terminal arrives or the heal ends it:
 the delegating turn's own repeat, a batch included, is ignored and logged, while a later turn's
 request reaching the gateway while any child of an earlier request still runs is refused with a
 notice naming the running task (`delegation.busy`) - a human asking again deserves an answer, the
@@ -524,14 +530,14 @@ single child, which takes the active task as before. Width bounds what one conve
 not what runs at once: children queue at the dispatcher, held to each profile's concurrency. At the
 `cluster` profile's default concurrency of 2, ten children run two at a time, about five rounds
 of one cluster task. A stop during a fan-out cancels the delegating turn and every child still
-running or queued (Stop, above), and ends the batch there: each child whose cancel went out counts
-as ended, stopped, so the conversation is released at once (a child whose cancel couldn't be
-published holds the batch until a re-sent cancel goes out or it ends), no wake runs, and the chain ends once, canceled,
-without waiting on a child that may never start. A child's own terminal arriving later changes
-nothing and posts nothing. A stopped child whose terminal never comes is ended by the next turn's
-heal once its terminal is on the stream or it has produced nothing within
-`A2A_FIRST_EVENT_GRACE`: its end logged and its route retired, with nothing posted
-(`TaskRef.StopPending`). The batch's plan, how many children it asked for, goes on the delegating turn's entry in one
+running or queued (Stop, above). The batch ends, and the conversation's next delegation can
+mint, once every child has ended: each stopped child's terminal counts it ended, stopped, and
+posts nothing, and when the last has ended no wake runs and the chain ends once, canceled. A
+stopped batch caught partway through minting mints no more, so only the children on the record
+count. A stopped child whose terminal never comes is ended by the next turn's heal once its
+terminal is on the stream or it has produced nothing within `A2A_FIRST_EVENT_GRACE`: its end
+logged and its route retired, with nothing posted (`TaskRef.StopPending`), so a child that never
+starts doesn't hold the conversation for good. The batch's plan, how many children it asked for, goes on the delegating turn's entry in one
 record write before any child is submitted, so a gateway that stops partway through leaves a
 record that says so: the request, redelivered or read back from the stream by the relay or the
 heal, finishes the batch with every check applied again, minting only the entries not yet on the
@@ -637,8 +643,7 @@ guide is the single child's, the full-answer one when the chain's answer goes to
 result was found by a heal. A
 canceled child counts as ended for the last-child rule, but a batch whose every child was canceled
 by the gateway wakes nothing, and nor does one whose delegating turn was stopped while it ran, or a
-batch that was withdrawn: the chain then ends canceled at the last child, which for a stop is the
-stop itself (Stop, above). The delegating turn
+batch that was withdrawn: the chain then ends canceled at the last child. The delegating turn
 keeps the conversation's active task while its children run, its line closed at its own terminal,
 and gives it up when the last child ends. Meanwhile a status ask lists each child still running by
 its addressee and parameters with the state its stream shows (`waiting to start` for one queued
