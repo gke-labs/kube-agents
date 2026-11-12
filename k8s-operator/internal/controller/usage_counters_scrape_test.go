@@ -21,6 +21,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"reflect"
 	"slices"
 	"strconv"
@@ -803,6 +804,39 @@ func TestPodUsageSource_FailedScrapes(t *testing.T) {
 			t.Errorf("a stalled body: %v, want kind %q", err, usageScrapeKindBodyTimeout)
 		}
 	})
+}
+
+// The accept-then-close case above reaches the classifier two ways, by a race
+// inside the transport: as an EOF wrapped in a net error, or -- when the close
+// reaches the transport's read loop before the request is registered with it
+// -- as the plain closed-idle sentinel. The second is matched on the innermost
+// cause's text, by equality: a wrapper's text that quotes the sentinel around
+// bytes a peer chose is a malformed response, not a connection the peer never
+// answered on.
+func TestUsageConnectKind_TheClosedIdleSentinelIsConnect(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		kind string
+	}{
+		{
+			"the transport's closed-idle sentinel, as client.Do wraps it",
+			&url.Error{Op: "Get", URL: "http://10.0.0.1:9090" + usageMetricsPath, Err: errors.New(usageClosedIdleErrorText)},
+			usageScrapeKindConnect,
+		},
+		{
+			"a malformed status line whose quoted bytes are the sentinel's text",
+			&url.Error{Op: "Get", URL: "http://10.0.0.1:9090" + usageMetricsPath, Err: fmt.Errorf("malformed HTTP response %q", usageClosedIdleErrorText)},
+			usageScrapeKindMalformed,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := usageConnectKind(tc.err); got != tc.kind {
+				t.Errorf("usageConnectKind(%v) = %q, want %q", tc.err, got, tc.kind)
+			}
+		})
+	}
 }
 
 // A line past the bound in a family the poller does not read is skipped, not a
