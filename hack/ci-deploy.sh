@@ -472,6 +472,7 @@ readonly WEB_CONSOLE_DIAG_LOG_LINES=100
 # How many reads, WEB_CONSOLE_POLL_SECONDS apart, a Degraded CR phase gets to
 # clear after the turn before the gate fails on it: the operator rewrites the
 # status on its next pass, which the agent Deployment's status moving starts.
+# A read that returns no phase spends one of them too and never passes.
 readonly WEB_CONSOLE_CR_ATTEMPTS=12
 # Section 7b: the Pub/Sub platform adapter must pull through the credential
 # broker. The adapter logs the first line when it connects; the broker logs
@@ -2404,7 +2405,7 @@ dump_web_console_state() {
 
 # <label> names the mode in the log and the status artifact (today, next).
 gate_web_console() {
-  local label="$1" attempt rc pair phase="" gate_start=$SECONDS
+  local label="$1" attempt rc read_pair pair="" phase="" gate_start=$SECONDS
   echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Verifying the web console under ${label} ==="
   for _ in $(seq 1 "${WEB_CONSOLE_EXISTS_ATTEMPTS}"); do
     kubectl get "deployment/${WEB_CONSOLE_NAME}" -n "${NAMESPACE}" >/dev/null 2>&1 && break
@@ -2457,19 +2458,33 @@ gate_web_console() {
 
   # The CR after the turn: a console that drove something on the bus side
   # Degraded shows up here. The operator's status can lag a pod by one pass,
-  # so a Degraded is re-read a bounded number of times before it fails.
+  # so a Degraded is re-read a bounded number of times before it fails. A
+  # read that returns no phase (the read swallows a failed GET, and the CR
+  # carries a status once its provisioning Job has run, so nothing read is
+  # no answer) is one more read against the same bound, never a pass, as in
+  # gate_cr_not_degraded; phase and pair keep the last read that answered,
+  # so a window that ends unread fails on that answer, or, with none, as
+  # unread.
   for _ in $(seq 1 "${WEB_CONSOLE_CR_ATTEMPTS}"); do
-    pair="$(kubectl get platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" -o jsonpath="${CR_PHASE_READY_JSONPATH}" 2>/dev/null || true)"
-    phase="${pair%%$'\t'*}"
-    [ "${phase}" = "${CR_PHASE_DEGRADED}" ] || break
+    read_pair="$(kubectl get platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" -o jsonpath="${CR_PHASE_READY_JSONPATH}" 2>/dev/null || true)"
+    if [ -n "${read_pair%%$'\t'*}" ]; then
+      pair="${read_pair}"
+      phase="${pair%%$'\t'*}"
+      [ "${phase}" = "${CR_PHASE_DEGRADED}" ] || break
+    fi
     sleep "${WEB_CONSOLE_POLL_SECONDS}"
   done
+  if [ -z "${phase}" ]; then
+    echo "ERROR: ${PLATFORM_AGENT_CR_NAME} is unread with the web console on under ${label}: all ${WEB_CONSOLE_CR_ATTEMPTS} reads after the turn returned no phase, so there is no phase or Ready condition to judge"
+    dump_web_console_state "${label}"
+    exit 1
+  fi
   if [ "${phase}" = "${CR_PHASE_DEGRADED}" ]; then
     echo "ERROR: ${PLATFORM_AGENT_CR_NAME} is ${phase} with the web console on under ${label}; Ready condition: ${pair#*$'\t'}"
     dump_web_console_state "${label}"
     exit 1
   fi
-  echo "✓ web console verified under ${label} in $((SECONDS - gate_start))s (attempt ${attempt}/${WEB_CONSOLE_GATE_ATTEMPTS}; ${PLATFORM_AGENT_CR_NAME} is ${phase:-unread}: ${pair#*$'\t'})"
+  echo "✓ web console verified under ${label} in $((SECONDS - gate_start))s (attempt ${attempt}/${WEB_CONSOLE_GATE_ATTEMPTS}; ${PLATFORM_AGENT_CR_NAME} is ${phase}: ${pair#*$'\t'})"
 }
 
 gate_web_console today

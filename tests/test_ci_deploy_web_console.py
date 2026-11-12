@@ -15,7 +15,9 @@ flags. The gate runs against a local HTTP server standing in for the
 port-forward, with `kubectl` stubbed: every route answering passes; a 403 on
 the chat route fails at once naming it; a 504 followed by a 200 is retried
 through a fresh tunnel; a read route whose body lacks a key the page reads,
-or is not JSON, fails naming the route; a Degraded CR after the turn fails;
+or is not JSON, fails naming the route; a Degraded CR after the turn fails, and
+so does a CR read that returns nothing for the whole window, while one that
+answers after empty reads is judged on the answer;
 a rollout that never finishes fails before any request. The requests
 themselves are hack/web-console-probe.sh's, which hack/rollback-roundtrip.sh
 sources too; its routes, keys, header and session shape are pinned against
@@ -463,7 +465,7 @@ class GateTest(unittest.TestCase):
         self.calls = pathlib.Path(self.tmp.name) / "kubectl-calls"
         self.calls.write_text("")
 
-    def run_gate(self, cr: str = _CR_READY, rollout_rc: int = 0, **scenario) -> subprocess.CompletedProcess:
+    def run_gate(self, cr: str = _CR_READY, rollout_rc: int = 0, cr_first: str = "", cr_first_reads: int = 0, **scenario) -> subprocess.CompletedProcess:
         self.scenario.update(scenario)
         script = "\n".join(
             [
@@ -471,13 +473,17 @@ class GateTest(unittest.TestCase):
                 f'export ARTIFACTS="{self.tmp.name}"',
                 # The stub records every call; `rollout status` answers as the
                 # case says; a port-forward is a sleep the gate kills; the CR
-                # read answers the phase and condition the case gives.
+                # read answers the phase and condition the case gives, with
+                # `cr_first` for the first `cr_first_reads` reads (the call
+                # is logged before it is counted, so the count includes it).
                 'kubectl() {',
                 '  echo "kubectl $*" >>"${KUBECTL_CALLS}"',
                 '  case "$1" in',
                 '    port-forward) exec sleep 600 ;;',
                 f'    rollout) return {rollout_rc} ;;',
-                '    get) case "$*" in *platformagent*jsonpath*) printf "%s" "${FAKE_CR}" ;; esac ;;',
+                '    get) case "$*" in *platformagent*jsonpath*)',
+                '      if [ "$(grep -c "^kubectl get platformagent" "${KUBECTL_CALLS}")" -le "${FAKE_CR_FIRST_READS}" ]; then printf "%s" "${FAKE_CR_FIRST}"; else printf "%s" "${FAKE_CR}"; fi ;;',
+                '    esac ;;',
                 '  esac',
                 '  return 0',
                 '}',
@@ -494,7 +500,7 @@ class GateTest(unittest.TestCase):
                 'echo "REACHED 6b"',
             ]
         )
-        env = {**os.environ, "KUBECTL_CALLS": str(self.calls), "FAKE_CR": cr}
+        env = {**os.environ, "KUBECTL_CALLS": str(self.calls), "FAKE_CR": cr, "FAKE_CR_FIRST": cr_first, "FAKE_CR_FIRST_READS": str(cr_first_reads)}
         return run_bash(script, env=env)
 
     def kubectl_calls(self, prefix: str) -> list[str]:
@@ -592,6 +598,30 @@ class GateTest(unittest.TestCase):
         self.assertIn("ERROR: platform-agent is Degraded with the web console on under today; Ready condition: PodUnschedulable: Pod platform-agent-gateway-x cannot be scheduled", result.stdout)
         # Re-read the bounded number of times before failing.
         self.assertEqual(len(self.kubectl_calls("get platformagent platform-agent")), 12 + 2, "12 reads, then report_cr_status's two")
+
+    def test_a_cr_read_that_returns_nothing_is_re_read_and_never_passes(self) -> None:
+        # The read swallows a failed GET, so a dropped request and a status
+        # with no phase both come back empty; neither is a pass.
+        result = self.run_gate(cr="")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("shows the user and assistant rows", result.stdout, "the CR is read after the turn, not instead of it")
+        self.assertIn("ERROR: platform-agent is unread with the web console on under today: all 12 reads after the turn returned no phase", result.stdout)
+        self.assertNotIn("✓ web console verified", result.stdout)
+        self.assertEqual(len(self.kubectl_calls("get platformagent platform-agent")), 12 + 2, "12 reads, then report_cr_status's two")
+
+    def test_a_cr_read_that_returns_nothing_then_answers_is_judged_on_the_answer(self) -> None:
+        # Two empty reads, then Ready: the answer passes the gate.
+        result = self.run_gate(cr_first="", cr_first_reads=2)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("platform-agent is Ready: Reconciled: all workloads ready)", result.stdout)
+        self.assertEqual(len(self.kubectl_calls("get platformagent platform-agent")), 3)
+        # Two empty reads, then Degraded for the rest of the window: the
+        # last answering read is what the failure names.
+        self.calls.write_text("")
+        result = self.run_gate(cr=_CR_DEGRADED, cr_first="", cr_first_reads=2)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("ERROR: platform-agent is Degraded with the web console on under today; Ready condition: PodUnschedulable: Pod platform-agent-gateway-x cannot be scheduled", result.stdout)
+        self.assertEqual(len(self.kubectl_calls("get platformagent platform-agent")), 12 + 2)
 
     def test_a_rollout_that_fails_stops_before_any_request(self) -> None:
         result = self.run_gate(rollout_rc=1)
