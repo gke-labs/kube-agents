@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"slices"
@@ -152,6 +154,11 @@ func ParseTierFile(raw []byte) ([]TierDefinition, error) {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&f); err != nil {
 		return nil, fmt.Errorf("tiers file: %w", err)
+	}
+	// One object and nothing after it: trailing data (a second object, a
+	// stray brace) means the file isn't the shape either.
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return nil, errors.New("tiers file: data after the tiers object")
 	}
 	out := make([]TierDefinition, 0, len(f.Tiers))
 	for _, t := range f.Tiers {
