@@ -1,0 +1,49 @@
+# Registered in scripts/validate_bench_cases.py's FIXTURE_NOT_READY, and run by
+# the sized test fleet's nightly from hack/eval/sized-fleet-cases.txt in its soak
+# window (docs/designs/sized-test-fleet.md, "The scripted chat questions").
+#
+# Domain: chat and routing. The same question as chat-routing-fleet-question,
+# asked of the install that watches the sized test fleet: the answer must come
+# from the live fleet, at fleet scale.
+#
+# Planted defect required: none. Needs the sized fleet (bench/tf/sized-fleet/)
+# in the install's project. Every size has at least four clusters, named
+# sized-<size>-01 onward, so the checks name the first four of any size. The
+# fixture is not on the eval pool; FIXTURE_NOT_READY holds it until the pool
+# carries the fleet (the design's rollout, stage 2).
+# Isolation class: read-only.
+#
+# The original stays on the eval nightlies, on the seeded fleet. The front door
+# holds no infrastructure tools (agents/chat/SOUL.md), so an answer naming the
+# live sized clusters can only come from the specialist it routed to.
+id: chat-routing-fleet-question-sized
+name: Front door routes a fleet question to a specialist, on the sized fleet
+prompt: >-
+  How many GKE clusters are in my fleet right now, and what versions are
+  they running?
+expected_output: >-
+  The front door acknowledges with one line naming what is being checked. The
+  answer the user receives, the platform specialist's, states the cluster count
+  and versions as read from the live fleet, the sized clusters among them;
+  where the front door restates the specialist's work in its own words, it
+  names the specialist in that sentence.
+infrastructure:
+  deployer: noop
+validated: false
+
+domain: chat-and-routing
+
+verification_spec:
+  # The answer names the sized clusters, read from the live fleet, and a
+  # Kubernetes version with its patch component, as the original asks.
+  - name: the-answer-names-the-sized-fleet-and-a-version
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_patterns:
+        - 'sized-[sml]-01'
+        - 'sized-[sml]-02'
+        - 'sized-[sml]-03'
+        - 'sized-[sml]-04'
+        - '(?<![\w.$])v?1\.\d{2}\.\d+(?!\d|\.\d)'

@@ -1,7 +1,10 @@
-"""hack/sized_fleet.py's own logic: the region, the host check, the teardown record and the churn warm-up. The cloud calls are stubbed; nothing here creates or deletes a resource."""
+"""hack/sized_fleet.py's own logic: the region, the host check, the teardown record, the churn warm-up, the image lookup, the sweep and the soak window's eval cases. The cloud calls are stubbed; nothing here creates or deletes a resource."""
 
 import argparse
 import importlib.util
+
+
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -77,3 +80,54 @@ class CredentialsTest(unittest.TestCase):
             self.assertEqual(cli.os.environ[cli.kube.KUBECONFIG_ENV], str(Path(tmp) / "k"))
         self.assertEqual(calls[-1], "scale-host")
         self.assertEqual(len(calls), len(cli.sf.fleet("S").clusters) + 1)
+
+
+class PublishedTest(unittest.TestCase):
+    def test_the_newest_commit_with_images_is_chosen(self):
+        log = mock.Mock(stdout="aaa\nbbb\nccc\n")
+        with mock.patch.object(cli.subprocess, "run", return_value=log), \
+                mock.patch.object(cli, "image_published", side_effect=lambda sha: sha != "aaa"):
+            self.assertEqual(cli.newest_published(), "bbb")
+
+    def test_no_published_commit_stops_the_run(self):
+        with mock.patch.object(cli.subprocess, "run", return_value=mock.Mock(stdout="aaa\n")), \
+                mock.patch.object(cli, "image_published", return_value=False):
+            with self.assertRaises(SystemExit):
+                cli.newest_published()
+
+
+class SweepTest(unittest.TestCase):
+    def test_only_sizes_with_a_cluster_older_than_the_limit_are_deleted(self):
+        clusters = [
+            {"createTime": "2026-11-10T00:00:00Z", "resourceLabels": {cli.SIZE_LABEL: "m"}},
+            {"createTime": "2026-11-11T09:00:00Z", "resourceLabels": {cli.SIZE_LABEL: "s"}},
+        ]
+        deleted = []
+        now = cli.datetime.fromisoformat("2026-11-11T10:00:00+00:00").timestamp()
+        with mock.patch.object(cli.kube, "gcloud", return_value=json.dumps(clusters)), \
+                mock.patch.object(cli.time, "time", return_value=now), \
+                mock.patch.object(cli, "cmd_down", side_effect=lambda a: deleted.append(a.size)):
+            cli.cmd_sweep(args())
+        self.assertEqual(deleted, ["M"])
+
+
+class EvalTest(unittest.TestCase):
+    def test_the_cases_file_lists_paths_and_skips_comments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cases.txt"
+            path.write_text("# header\n\n./tasks/a/task.yaml\n  ./tasks/b/task.yaml  \n")
+            self.assertEqual(cli.eval_cases(path), ["./tasks/a/task.yaml", "./tasks/b/task.yaml"])
+
+    def test_the_shipped_cases_file_names_cases_that_exist(self):
+        cases = cli.eval_cases(cli.EVAL_CASES_FILE)
+        self.assertTrue(cases)
+        for case in cases:
+            self.assertTrue((cli.BENCH_DIR / case).is_file(), case)
+
+    def test_a_case_passes_only_when_every_objective_passed(self):
+        passed = {"role": "objective", "success": True}
+        failed = {"role": "objective", "success": False}
+        safeguard = {"role": "safeguard", "success": False}
+        self.assertTrue(cli.case_passed({"verification_report": [passed, safeguard]}))
+        self.assertFalse(cli.case_passed({"verification_report": [passed, failed]}))
+        self.assertFalse(cli.case_passed({"verification_report": []}))

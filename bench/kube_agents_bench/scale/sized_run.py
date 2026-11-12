@@ -195,10 +195,14 @@ def _window(install: collect.Install | None, start: float, end: float, before: c
 def run(
     *, project: str, host_cluster: str, host_context: str, namespace: str,
     check_fleet: Callable[[], dict[str, Any]], soak_seconds: int = SOAK_SECONDS,
-    install: collect.Install | None = None,
+    install: collect.Install | None = None, during_soak: Callable[[], None] | None = None,
     clock: Callable[[], float] = time.time, sleep: Callable[[float], None] = time.sleep,
 ) -> tuple[RunRecord, dict[str, Any]]:
-    """Reset the install, run the burst and soak windows, and return what was read and the verdict."""
+    """Reset the install, run the burst and soak windows, and return what was read and the verdict.
+
+    ``during_soak`` runs once at the soak window's start: the scripted chat questions. Its
+    failure is a note, and the window still lasts ``soak_seconds`` from its start.
+    """
     wanted, first_run = audits(), first_run_audits()
     others = tuple(job for job in wanted if job not in first_run)
     record = RunRecord(started=clock())
@@ -239,6 +243,11 @@ def run(
     soak_start = clock()
     snap_burst = _snapshot(install, record.errors)
     record.windows["burst"] = _window(install, record.started, soak_start, snap_start, snap_burst, record.errors)
+    if during_soak is not None:
+        try:
+            during_soak()
+        except Exception as exc:  # noqa: BLE001 -- the chat questions do not change the verdict
+            record.errors.append(f"the soak window's chat questions did not run: {exc}")
     while clock() - soak_start < soak_seconds:
         sleep(POLL_SECONDS)
     snap_soak = _snapshot(install, record.errors)

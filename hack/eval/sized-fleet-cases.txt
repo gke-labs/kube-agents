@@ -1,0 +1,6 @@
+# The cases the sized test fleet's nightly runs in its soak window, once each,
+# against the install that watches the fleet (docs/designs/sized-test-fleet.md,
+# "The scripted chat questions"). hack/sized_fleet.py run --eval-cases reads
+# this file. Their results are eval records; they do not change the scale
+# verdict.
+./tasks/chat-routing-fleet-question-sized/task.yaml

@@ -29,10 +29,14 @@ A run by hand goes through this script, from a `main` checkout, never through
 from __future__ import annotations
 
 import argparse
+import base64
+import contextlib
 import json
 import logging
 import os
+import re
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -84,6 +88,26 @@ HELM_TIMEOUT = "20m"
 HELM_TIMEOUT_SECONDS = 25 * 60
 DEFAULT_MAX_AGE_HOURS = 8
 SIZE_LABEL = "kube-agents-scale-size"
+# The soak window's chat questions: eval cases run once each through the eval harness.
+EVAL_CASES_FILE = REPO / "hack" / "eval" / "sized-fleet-cases.txt"
+BENCH_DIR = REPO / "bench"
+EVALS_DIR = "evals"
+EVAL_SUMMARY_FILE = "summary.json"
+# The agent runs under GKE Sandbox, which a port-forward cannot reach, so the harness rides
+# the exec relay (bench/README.md, "Sandboxed installs").
+RELAY_SCRIPT = REPO / "scripts" / "hermes-dashboard-tunnel.py"
+RELAY_CONTAINER = "agent-api-auth"
+RELAY_REMOTE_PORT = 8643
+EVAL_LOCAL_PORT = 18642
+RELAY_START_SECONDS = 60
+RELAY_POLL_SECONDS = 2
+EVAL_TIMEOUT_SECONDS = 30 * 60
+AGENT_SECRET = "platform-agent-secrets"
+AGENT_TOKEN_KEY = "API_SERVER_KEY"
+AGENT_SERVICE = "platform-agent"
+JUDGE_PROVIDER = "google"
+JUDGE_MODEL = "gemini-3.1-pro-preview"
+RESULTS_LINE = re.compile(r"results: (\S+results\.json)")
 KUBECONFIG_FORMAT = "sized-fleet-{size}.kubeconfig"
 VERDICT_FILE = "scale-verdict.json"
 # The label a host cluster carries when its install exists to be measured: a run resets the
@@ -425,6 +449,77 @@ def results_prefix(args: argparse.Namespace) -> str:
     return f"{args.results_bucket.rstrip('/')}/{args.size.lower()}/{args.run_id}/"
 
 
+def eval_cases(path: Path) -> list[str]:
+    """The case paths a cases file lists, relative to bench/, comments and blank lines skipped."""
+    lines = (line.strip() for line in path.read_text().splitlines())
+    return [line for line in lines if line and not line.startswith("#")]
+
+
+def case_passed(result: dict) -> bool:
+    """A case passes when every objective check passed, as the eval gate reads it."""
+    objectives = [c for c in result.get("verification_report") or [] if c.get("role") == "objective"]
+    return bool(objectives) and all(c.get("success") for c in objectives)
+
+
+@contextlib.contextmanager
+def agent_relay(args: argparse.Namespace, host_context: str, workdir: Path):
+    """Hold the exec relay to the agent API open on EVAL_LOCAL_PORT, on its own kubeconfig."""
+    kubeconfig = workdir / "host.kubeconfig"
+    kubeconfig.write_text(kube.run(["kubectl", "config", "view", "--minify", "--flatten", "--context", host_context]))
+    relay = subprocess.Popen(
+        [sys.executable, str(RELAY_SCRIPT), "--namespace", args.namespace, "--container", RELAY_CONTAINER,
+         "--remote-port", str(RELAY_REMOTE_PORT), "--local-port", str(EVAL_LOCAL_PORT)],
+        env={**os.environ, "KUBECONFIG": str(kubeconfig)}, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        deadline = time.time() + RELAY_START_SECONDS
+        while True:
+            with contextlib.suppress(OSError), socket.create_connection(("127.0.0.1", EVAL_LOCAL_PORT), timeout=1):
+                break
+            if relay.poll() is not None or time.time() > deadline:
+                raise RuntimeError("the relay to the agent API did not open")
+            time.sleep(RELAY_POLL_SECONDS)
+        yield
+    finally:
+        relay.terminate()
+        relay.wait()
+
+
+def run_evals(args: argparse.Namespace, host_context: str, out: Path) -> dict:
+    """Run each listed case once against the host install; write each result and a summary under out/evals."""
+    evals = out / EVALS_DIR
+    evals.mkdir(parents=True, exist_ok=True)
+    token = base64.b64decode(kube.run(["kubectl", "--context", host_context, "-n", args.namespace, "get", "secret",
+                                       AGENT_SECRET, "-o", f"jsonpath={{.data.{AGENT_TOKEN_KEY}}}"])).decode()
+    env = {**os.environ, "PROJECT_ID": args.project, "GCP_PROJECT_ID": args.project, "CLUSTER_NAME": args.host_cluster,
+           "AGENT_CLUSTER_CONTEXT": host_context, "AGENT_NAMESPACE": args.namespace,
+           "AGENT_SERVICE_NAME": AGENT_SERVICE, "AGENT_LOCAL_PORT": str(EVAL_LOCAL_PORT),
+           "PLATFORM_AGENT_TOKEN": token, "BENCH_TF_ROOT": "./tf",
+           "JUDGE_PROVIDER": os.environ.get("JUDGE_PROVIDER", JUDGE_PROVIDER),
+           "JUDGE_MODEL": os.environ.get("JUDGE_MODEL", JUDGE_MODEL)}
+    summary: dict[str, dict] = {}
+    with agent_relay(args, host_context, evals):
+        for case in eval_cases(Path(args.eval_cases)):
+            name = Path(case).parent.name
+            LOG.info("eval case %s", name)
+            started = time.time()
+            proc = subprocess.run(["uv", "run", "devops-bench", case, "--agent-type", "kubeagents"], cwd=BENCH_DIR,
+                                  env=env, capture_output=True, text=True, timeout=EVAL_TIMEOUT_SECONDS, check=False)
+            (evals / f"{name}.log").write_text(proc.stdout + proc.stderr)
+            found = RESULTS_LINE.search(proc.stdout + proc.stderr)
+            entry: dict = {"seconds": round(time.time() - started), "exit": proc.returncode}
+            if found:
+                result = json.loads(Path(found.group(1)).read_text())[0]
+                (evals / f"{name}.results.json").write_text(json.dumps(result, indent=2) + "\n")
+                entry.update(passed=case_passed(result), checks={c["name"]: c.get("status") for c in
+                                                                 result.get("verification_report") or []})
+            else:
+                entry["passed"] = False
+            LOG.info("eval case %s: %s", name, "passed" if entry["passed"] else "failed")
+            summary[name] = entry
+    (evals / EVAL_SUMMARY_FILE).write_text(json.dumps(summary, indent=2) + "\n")
+    return summary
+
+
 def run_once(args: argparse.Namespace) -> tuple[int, Path]:
     fleet = sf.fleet(args.size)
     credentials(args, fleet)
@@ -434,27 +529,37 @@ def run_once(args: argparse.Namespace) -> tuple[int, Path]:
         churn = measure_churn(args, fleet, args.churn_minutes) if args.churn_minutes > 0 else None
         return sf.check(fleet, observe_all(args, fleet), churn)
 
+    out = Path(args.out or tempfile.mkdtemp(prefix=f"sized-run-{args.run_id}-"))
+    out.mkdir(parents=True, exist_ok=True)
+    evals: dict = {}
+
+    def chat_questions() -> None:
+        evals.update(run_evals(args, host_context, out))
+
     install = collect.Install(args.project, host_context, args.namespace, args.host_cluster, args.host_location)
     record, result = sized_run.run(project=args.project, host_cluster=args.host_cluster, host_context=host_context,
                                    namespace=args.namespace, check_fleet=check_fleet, install=install,
-                                   soak_seconds=args.soak_minutes * SECONDS_PER_MINUTE)
+                                   soak_seconds=args.soak_minutes * SECONDS_PER_MINUTE,
+                                   during_soak=chat_questions if args.eval_cases else None)
     # Before `down`: the cost record reads the fleet's own instances and clusters.
     cost = sized_records.safe(
         lambda: sized_records.cost_record(args.project, args.run_id, record.windows, region=region_of(args.zone)),
         record.errors, "cost record")
     result["errors"] = list(record.errors)
     records = {
-        VERDICT_FILE: {"size": args.size, "run_id": args.run_id, "fleet": record.fleet_check, **result},
+        # The chat questions are eval records beside the verdict; they do not change it.
+        VERDICT_FILE: {"size": args.size, "run_id": args.run_id, "fleet": record.fleet_check, **result,
+                       "evals": evals},
         MEASUREMENTS_FILE: {"size": args.size, "run_id": args.run_id, "windows": record.windows},
         COST_FILE: cost,
     }
-    out = Path(args.out or tempfile.mkdtemp(prefix=f"sized-run-{args.run_id}-"))
-    out.mkdir(parents=True, exist_ok=True)
     for name, body in records.items():
         (out / name).write_text(json.dumps(body, indent=2) + "\n")
         LOG.info("%s: %s", name, summary(name, body))
     if args.results_bucket:
         kube.run([kube.GCLOUD, "storage", "cp", *[str(out / n) for n in records], results_prefix(args)])
+        if (out / EVALS_DIR).is_dir():
+            kube.run([kube.GCLOUD, "storage", "cp", "--recursive", str(out / EVALS_DIR), results_prefix(args)])
     print(json.dumps(records[VERDICT_FILE], indent=2))
     LOG.info("records in %s", out)
     return (0 if result["green"] else EXIT_UNSOUND), out
@@ -580,6 +685,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--soak-minutes", type=int, default=sized_run.SOAK_SECONDS // SECONDS_PER_MINUTE)
     parser.add_argument("--out", help="run: the folder for the three records; default a new temp folder")
     parser.add_argument("--results-bucket", help="run: also copy the records to <bucket>/<size>/<run id>/")
+    parser.add_argument("--eval-cases", nargs="?", const=str(EVAL_CASES_FILE), default=None,
+                        help="run: run the cases this file lists in the soak window "
+                             f"(default file {EVAL_CASES_FILE.relative_to(REPO)})")
     parser.add_argument("--sha", help="install: the commit to install; default the newest published one")
     parser.add_argument("--max-age-hours", type=float, default=DEFAULT_MAX_AGE_HOURS,
                         help="sweep: delete a fleet with a cluster older than this")
