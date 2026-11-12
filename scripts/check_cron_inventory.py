@@ -44,6 +44,10 @@ PUSH_EVENT = "push"
 PULL_REQUEST_EVENT = "pull_request"
 MERGE_GROUP_EVENT = "merge_group"
 LOCAL_BASE_REFS = ("upstream/main", "origin/main")
+# `git rev-list --parents -n 1` prints the commit and its parents: three fields for a merge commit.
+MERGE_COMMIT_FIELDS = 3
+# A schedule's display label, which doesn't change when the job runs.
+SCHEDULE_LABEL_KEY = "display"
 
 # A row of an inventory table: its first cell is the job ID in backticks.
 ROW = re.compile(r"^\|\s*`([^`]+)`\s*\|")
@@ -54,7 +58,7 @@ def tracked(entry: dict) -> tuple:
     schedule (any kind) less its display label, the script, no_agent and deliver."""
     schedule = entry.get("schedule")
     if isinstance(schedule, dict):
-        schedule = json.dumps({k: v for k, v in schedule.items() if k != "display"}, sort_keys=True)
+        schedule = json.dumps({k: v for k, v in schedule.items() if k != SCHEDULE_LABEL_KEY}, sort_keys=True)
     return (schedule, entry.get("script"), bool(entry.get("no_agent")), entry.get("deliver"))
 
 
@@ -163,7 +167,7 @@ def comparison_base(root: Path, env) -> str | None:
         return None
     if event in (PULL_REQUEST_EVENT, MERGE_GROUP_EVENT):
         # A pull request runs on its merge commit, whose first parent is the base it merges into.
-        if event == PULL_REQUEST_EVENT and len(_git(root, "rev-list", "--parents", "-n", "1", "HEAD").split()) > 2:
+        if event == PULL_REQUEST_EVENT and len(_git(root, "rev-list", "--parents", "-n", "1", "HEAD").split()) >= MERGE_COMMIT_FIELDS:
             return _git(root, "rev-parse", "HEAD^1").strip()
         payload = json.loads(Path(env.get(EVENT_PATH_ENV, "")).read_text(encoding="utf-8"))
         if event == MERGE_GROUP_EVENT:
