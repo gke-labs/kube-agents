@@ -118,8 +118,24 @@ func isStreamNotFound(err error) bool {
 	return errors.As(err, &e) && e.code == jsStreamNotFound
 }
 
+// jsRestoreNameInUse is the JetStream API's error code for a restore into a
+// name the server already holds: a stream, or a clustered restore's
+// assignment, which the meta group keeps once proposed whether or not the
+// client heard the answer.
+const jsRestoreNameInUse = 10130
+
+func isRestoreNameInUse(err error) bool {
+	var e *jsAPIError
+	return errors.As(err, &e) && e.code == jsRestoreNameInUse
+}
+
 func request(ctx context.Context, nc *nats.Conn, subject string, body []byte, into any) error {
-	rctx, cancel := context.WithTimeout(ctx, apiTimeout)
+	return requestWithin(ctx, nc, subject, body, into, apiTimeout)
+}
+
+// requestWithin is request with its own wait.
+func requestWithin(ctx context.Context, nc *nats.Conn, subject string, body []byte, into any, wait time.Duration) error {
+	rctx, cancel := context.WithTimeout(ctx, wait)
 	defer cancel()
 	msg, err := nc.RequestWithContext(rctx, subject, body)
 	if err != nil {

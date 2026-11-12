@@ -243,9 +243,14 @@ func writeReport(path string, r Report) error {
 }
 
 // restoreRetries bounds the attempts at one stream's restore when the server
-// is not ready for it (a name the conversion's orphan cleanup still holds);
+// is not ready for it (a name the conversion's orphan cleanup still holds, or
+// an earlier attempt's unfinished restore, freed before the next);
 // a digest or policy refusal is never retried.
 const restoreRetries = 30
+
+// restoreLog takes each failed attempt's error, which the run's report
+// otherwise loses to the last one.
+var restoreLog io.Writer = os.Stderr
 
 // restoreAll restores every named stream from dir, checking each staged
 // metadata file against the operator's digest before reading it, then
@@ -305,6 +310,19 @@ func restoreAll(ctx context.Context, nc *nats.Conn, streams []string, dir string
 			}
 			if err == nil || errors.Is(err, ErrDigestMismatch) || errors.Is(err, ErrOutsidePolicy) || errors.Is(err, ErrOverRenderedLimits) || attempt == restoreRetries {
 				break
+			}
+			fmt.Fprintf(restoreLog, "stream %s: attempt %d: %v\n", name, attempt, err)
+			if isRestoreNameInUse(err) {
+				// The name is held by something that is not this snapshot's
+				// stream (alreadyRestored said so): an earlier attempt's
+				// restore that never finished, most likely, whose answer came
+				// after the client stopped waiting. The streams were cleared
+				// before the conversion and the freeze admits only the
+				// migration, so it holds nothing the snapshot does not; free
+				// the name and try again.
+				if derr := request(ctx, nc, fmt.Sprintf(streamDeleteSubject, name), nil, nil); derr != nil && !isStreamNotFound(derr) {
+					fmt.Fprintf(restoreLog, "stream %s: freeing the name: %v\n", name, derr)
+				}
 			}
 			select {
 			case <-ctx.Done():

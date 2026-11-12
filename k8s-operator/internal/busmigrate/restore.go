@@ -36,6 +36,13 @@ const restoreChunkSize = 64 * 1024
 // once the last chunk is in.
 const restoreFinishTimeout = 10 * time.Minute
 
+// restoreStartTimeout is the wait for a restore's first answer. A clustered
+// server answers only once the meta group has placed the stream and its
+// group has a leader, which on servers that formed moments ago takes longer
+// than an ordinary API call; the assignment stands either way, so a client
+// that gives up early holds the name against its own retries.
+const restoreStartTimeout = 30 * time.Second
+
 // Metadata is what a snapshot records beside its data: the stream's config
 // and state as the server reported them when the snapshot began.
 type Metadata struct {
@@ -272,7 +279,7 @@ func restore(ctx context.Context, nc *nats.Conn, cfg nats.StreamConfig, state na
 	var resp struct {
 		ChunkSubject string `json:"deliver_subject"`
 	}
-	if err := request(ctx, nc, fmt.Sprintf(streamRestoreSubject, cfg.Name), body, &resp); err != nil {
+	if err := requestWithin(ctx, nc, fmt.Sprintf(streamRestoreSubject, cfg.Name), body, &resp, restoreStartTimeout); err != nil {
 		return err
 	}
 	if resp.ChunkSubject == "" {

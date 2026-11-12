@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -280,5 +281,47 @@ func TestTheRestorePodPicksItsRestoreByLeg(t *testing.T) {
 	}
 	if info.Config.MaxBytes != meta.Config.MaxBytes || info.State.Msgs != meta.State.Msgs {
 		t.Errorf("way back: max_bytes %d msgs %d, want the snapshot's %d and %d", info.Config.MaxBytes, info.State.Msgs, meta.Config.MaxBytes, meta.State.Msgs)
+	}
+}
+
+// A name held by something that is not the snapshot's stream (on the live
+// run, an earlier attempt's clustered restore whose answer came after the
+// client stopped waiting) is freed and the stream restored, not retried into
+// the same refusal until the attempts run out; each failed attempt is logged.
+func TestARestoreFreesANameHeldByAnUnfinishedRestore(t *testing.T) {
+	meta, data := snapshotTasks(t)
+	dir, run := stageTasks(t, meta, data, policyOf(meta.Config))
+	dst := startServer(t, "a2a-nats-0", t.TempDir(), 0)
+	defer shutdown(dst)
+	nc, err := nats.Connect(dst.ClientURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	js, _ := nc.JetStream()
+	held := meta.Config
+	if _, err := js.AddStream(&held); err != nil { // the name, without the snapshot's messages
+		t.Fatal(err)
+	}
+	var logged bytes.Buffer
+	restoreLog = &logged
+	defer func() { restoreLog = os.Stderr }()
+
+	start := time.Now()
+	if _, err := restoreAll(context.Background(), nc, []string{"TASKS"}, dir, run, 1); err != nil {
+		t.Fatalf("restore onto a held name: %v", err)
+	}
+	if took := time.Since(start); took > 15*time.Second {
+		t.Errorf("the restore took %v; the held name was retried rather than freed", took)
+	}
+	info, err := js.StreamInfo("TASKS")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.State.Msgs != meta.State.Msgs || info.State.LastSeq != meta.State.LastSeq {
+		t.Errorf("restored msgs %d last %d, want the snapshot's %d and %d", info.State.Msgs, info.State.LastSeq, meta.State.Msgs, meta.State.LastSeq)
+	}
+	if !strings.Contains(logged.String(), "attempt 1") || !strings.Contains(logged.String(), "10130") {
+		t.Errorf("the failed attempt was not logged: %q", logged.String())
 	}
 }
