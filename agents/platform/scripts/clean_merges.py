@@ -62,11 +62,15 @@ class SchemaIncomplete(RuntimeError):
 def repo_key(url: Any) -> str:
     """A repository url as one comparable key: host and path, lower-case, as :mod:`repo_ref` parses it.
 
-    No scheme, user, port, ``.git`` or trailing slash, and scp remotes read as urls do. A value
-    :mod:`repo_ref` refuses (no path, a traversal segment) is ``""``, which :func:`count` skips.
+    No scheme, user, port, ``.git`` or trailing slash; scp remotes read as urls do, and GitHub's
+    host aliases fold to ``github.com``. A value with no host, fewer than two path segments, a
+    traversal segment, or that is not a string is ``""``, which :func:`count` skips.
     """
-    ref = repo_ref.try_parse(str(url or ""))
-    return str(ref).lower() if ref is not None else ""
+    ref = repo_ref.try_parse(url)
+    if ref is None or not ref.host or len(ref.segments) < 2:
+        return ""
+    host = repo_ref.GITHUB_CANONICAL_HOST if ref.is_github else ref.host
+    return f"{host}/{ref.path}".lower()
 
 
 def _environment(value: Any) -> str:

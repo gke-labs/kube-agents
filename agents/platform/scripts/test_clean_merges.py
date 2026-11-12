@@ -79,6 +79,8 @@ class RepoKeyTest(unittest.TestCase):
             "git@github.com:org/infra.git",
             "github.com:org/infra.git",
             "ssh://git@github.com/org/infra",
+            "ssh://git@ssh.github.com/org/infra.git",
+            "https://www.github.com/org/infra",
         ]
         self.assertEqual({clean_merges.repo_key(s) for s in spellings}, {"github.com/org/infra"})
 
@@ -89,7 +91,8 @@ class RepoKeyTest(unittest.TestCase):
         )
 
     def test_a_value_with_no_repository_path_has_no_key(self):
-        for value in ("https://github.com/", "https://github.com/org/..", "", None):
+        for value in ("https://github.com/", "github.com/", "https://github.com/org", "org/infra",
+                      "https://github.com/org/..", "", None, 123, True):
             with self.subTest(value=value):
                 self.assertEqual(clean_merges.repo_key(value), "")
 
