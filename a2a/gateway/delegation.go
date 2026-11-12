@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"maps"
+	"slices"
 	"strings"
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
@@ -57,6 +59,12 @@ const (
 	whyNoChild          = "the request minted no child"
 	whyRequestUnread    = "the delegate request could not be read from the stream"
 	whyProfileBatch     = "a profile task can't hand out a batch yet"
+	// whyBatchPlanUnwritten: the batch's plan could not be written to the
+	// record before its first child, so none was minted (mintBatch).
+	whyBatchPlanUnwritten = "the batch could not be recorded before its tasks were started"
+	// whyBatchCutShort: a gateway stopped partway through the batch, and
+	// its request could not finish it when it came back.
+	whyBatchCutShort = "the batch was cut short and could not be finished"
 )
 
 // notStartedEnd is the DelegationEnd for a request that minted no child for
@@ -175,9 +183,27 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	// or a batch: a parent with any child has had its request. Checked
 	// before the active task, so a repeat from the parent logs as what it
 	// is.
+	//
+	// The exception is a batch a gateway stopped partway through: its plan
+	// (BatchSize) is on the record with fewer children than it names. Its
+	// request, redelivered or read back from the stream, finishes it, every
+	// check applying again; anything that stops it here withdraws the
+	// children already on the bus, so a batch is whole or not run. minting
+	// is set once the request reaches mintBatch, which then finishes the
+	// batch or withdraws it itself.
+	resuming, minting := false, false
 	if len(parent.Children) > 0 {
-		ignore(ruleDelegationBusy, "child", parent.Children[len(parent.Children)-1])
-		return
+		if parent.batchComplete() || parent.DelegationEnd != "" {
+			ignore(ruleDelegationBusy, "child", parent.Children[len(parent.Children)-1])
+			return
+		}
+		resuming = true
+		defer func() {
+			if !minting {
+				g.withdrawCutShortBatch(ctx, rec, taskID, log)
+			}
+		}()
+		log.Info("finishing a batch cut short", "minted", len(parent.Children), "tasks", parent.BatchSize)
 	}
 	if active := rec.ActiveTask; active == nil || active.TaskID != taskID {
 		ignore(ruleDelegationStale)
@@ -211,7 +237,7 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	}
 	// The adapter holds the same shape and cap and refuses blank text; a
 	// request that breaks any of them reached the bus some other way.
-	if !parsed || lib.ValidateDelegateRequest(req) != nil {
+	if !parsed || lib.ValidateDelegateRequest(req) != nil || (resuming && len(req.Tasks) != parent.BatchSize) {
 		ignore(ruleDelegationMalformed, "textBytes", len(req.Text), "tasks", len(req.Tasks))
 		noChild(notStartedEnd(whyRequestMalformed))
 		return
@@ -225,7 +251,8 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 
 	// One live child per conversation, whichever turn asked
 	// for it: a stop detaches a child without ending it.
-	if live := g.liveChild(ctx, rec); live != "" {
+	// A batch being finished has its own children live.
+	if live := g.liveChild(ctx, rec); live != "" && !resuming {
 		refuse(ruleDelegationBusy, fmt.Sprintf("⚠️ delegation refused: a delegated task is still running (task %s)", live), "child", live)
 		return
 	}
@@ -335,6 +362,7 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	}
 	authority.Via = &AuthorityVia{TaskID: taskID, Session: session}
 	if len(routes) > 1 {
+		minting = true
 		g.mintBatch(ctx, rec, taskID, parent, req.Tasks, routes, authority, noChild, log)
 		return
 	}
@@ -399,8 +427,11 @@ const noticeBatchChildWithdrawn = "🛑 not run: another task in the same delega
 // mintBatch mints a checked batch of two or more children of taskID. Unlike a
 // single child, none takes the active slot or the record's addressee: the
 // parent keeps both, and each child carries its own addressee on its entry
-// (AddresseeFor) and its rolling line there too. Each is linked from the
-// parent in the record write that adds it. A mint that fails partway
+// (AddresseeFor) and its rolling line there too. The batch's plan
+// (BatchSize) is written on the parent before any child is published, and
+// each child is linked from the parent in the record write that adds it, so
+// a batch cut short by a restart is finished by its request coming back,
+// which skips the entries already minted (BatchIndex). A mint that fails partway
 // withdraws the batch (withdrawBatch): each child already on the bus is sent
 // a cancel and dropped, and the parent records that its request minted no
 // child, so the record is as it was before the request. A child whose cancel
@@ -408,8 +439,36 @@ const noticeBatchChildWithdrawn = "🛑 not run: another task in the same delega
 func (g *Gateway) mintBatch(ctx context.Context, rec *SessionRecord, taskID string, parent TaskRef, tasks []lib.DelegateTask,
 	routes []*profileRoute, authority Authority, noChild func(string), log *slog.Logger) {
 	correlationID := rec.ActiveTask.CorrelationID
+	// The plan goes on the parent before any child is published, in its own
+	// record write: from here a restart partway through leaves a record that
+	// says the batch is unfinished (BatchSize over the children linked), and
+	// the request's redelivery or the heal finishes or withdraws it
+	// (handleDelegateRequest's resuming case). A plan that can't be written
+	// mints nothing.
+	if parent.BatchSize == 0 {
+		rec.setBatchSize(taskID, len(tasks))
+		if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
+			g.log.Error("session record write failed for a batch's plan; nothing minted", "conversation", rec.Key, "err", err)
+			rec.setBatchSize(taskID, 0)
+			noChild(notStartedEnd(whyBatchPlanUnwritten))
+			return
+		}
+	}
+	// A batch being finished skips the entries already minted.
 	var minted []string
+	have := map[int]bool{}
+	for _, k := range rec.batchChildren(taskID) {
+		have[k.BatchIndex] = true
+		minted = append(minted, k.ID)
+	}
 	for i, e := range tasks {
+		if have[i+1] {
+			continue
+		}
+		if g.beforeBatchChild != nil && g.beforeBatchChild(i) {
+			log.Warn("delegation batch cut short", "parent", taskID, "minted", len(minted), "tasks", len(tasks))
+			return
+		}
 		addressee, lineNote := strings.TrimSpace(e.Addressee), delegatedLineNote
 		if routes[i] != nil {
 			addressee, lineNote = routes[i].Profile, fmt.Sprintf(delegatedProfileLineNote, routes[i].Profile)
@@ -430,13 +489,15 @@ func (g *Gateway) mintBatch(ctx context.Context, rec *SessionRecord, taskID stri
 			LinkParent:           true,
 			Addressee:            addressee,
 			KeepActive:           true,
+			BatchIndex:           i + 1,
+			Target:               batchTarget(e.Parameters),
 		})
 		if !ok {
-			if kept := g.withdrawBatch(ctx, rec, taskID, minted, authority); kept == 0 {
-				noChild(notStartedEnd(whyChildOffBus))
-			} else if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
-				g.log.Error("session record write failed after a batch was withdrawn", "conversation", rec.Key, "err", err)
-			}
+			// The parent records that its request ran nothing, whether or
+			// not a child whose cancel failed stays on the record: a
+			// withdrawn batch wakes nothing (batchChildEnded).
+			g.withdrawBatch(ctx, rec, taskID, minted, authority)
+			noChild(notStartedEnd(whyChildOffBus))
 			log.Warn("delegation batch withdrawn: a child could not be started", "parent", taskID, "minted", len(minted), "tasks", len(tasks))
 			return
 		}
@@ -461,7 +522,7 @@ func (g *Gateway) withdrawBatch(ctx context.Context, rec *SessionRecord, taskID 
 			continue
 		}
 		g.publishDispatchStop(ctx, ref)
-		if !g.publishBatchCancel(ctx, rec, ref, authority) {
+		if !g.publishBatchCancel(ctx, rec, ref, authority, batchCancelWithdrawn) {
 			rec.MarkCanceled(id)
 			kept[id] = true
 			continue
@@ -496,22 +557,88 @@ func (g *Gateway) withdrawBatch(ctx context.Context, rec *SessionRecord, taskID 
 	return len(kept)
 }
 
-// publishBatchCancel sends a withdrawn batch child its cancel, on its own
-// .in under the delegation's authority, and reports whether it went out.
-func (g *Gateway) publishBatchCancel(ctx context.Context, rec *SessionRecord, ref TaskRef, authority Authority) bool {
+// publishBatchCancel sends a batch child its cancel, on its own .in under
+// the delegation's authority, and reports whether it went out. what names
+// the child in the log lines: batchCancelWithdrawn or batchCancelAsked.
+func (g *Gateway) publishBatchCancel(ctx context.Context, rec *SessionRecord, ref TaskRef, authority Authority, what string) bool {
 	env, err := lib.NewCancelEnvelope(gatewayParty, ref.ID, rec.ContextID, ref.CorrelationID,
 		lib.WithTo(lib.Party{Session: ref.Addressee}),
 		lib.WithAuthority(authority.Render(ref.Capability)))
 	if err != nil {
-		g.log.Error("cancel envelope build failed for a withdrawn batch child", "taskId", ref.ID, "err", err)
+		g.log.Error("cancel envelope build failed for "+what, "taskId", ref.ID, "err", err)
 		return false
 	}
 	if err := g.client.Publish(ctx, lib.TaskInSubject(ref.Addressee, ref.ID), env); err != nil {
-		g.log.Error("cancel publish failed for a withdrawn batch child", "taskId", ref.ID, "err", err)
+		g.log.Error("cancel publish failed for "+what, "taskId", ref.ID, "err", err)
 		return false
 	}
 	return true
 }
+
+// withdrawCutShortBatch withdraws a batch a gateway stopped partway through
+// when its request, back again, can't finish it: the turn was stopped, a
+// check now refuses an entry, or the request no longer matches the plan.
+// Each child already on the bus is sent a cancel (withdrawBatch), and the
+// parent records why its request ran nothing. Called under the session
+// lock; it writes the record.
+func (g *Gateway) withdrawCutShortBatch(ctx context.Context, rec *SessionRecord, taskID string, log *slog.Logger) {
+	parent, ok := rec.TaskRefFor(taskID)
+	if !ok {
+		return
+	}
+	// The cancels ride the delegation's own authority, as the mint's did;
+	// an attribution that can't be read leaves the block empty, and no
+	// executor checks a cancel's grants.
+	authority, _ := AuthorityFromAttribution(parent.Attribution)
+	authority.Via = &AuthorityVia{TaskID: taskID, Session: parent.Addressee}
+	kept := g.withdrawBatch(ctx, rec, taskID, parent.Children, authority)
+	rec.markDelegationEnd(taskID, notStartedEnd(whyBatchCutShort))
+	if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
+		g.log.Error("session record write failed after a cut-short batch was withdrawn", "conversation", rec.Key, "err", err)
+	}
+	log.Warn("delegation batch withdrawn: it was cut short and could not be finished", "parent", taskID,
+		"minted", len(parent.Children), "tasks", parent.BatchSize, "kept", kept)
+}
+
+// setBatchSize records a batch's plan on its parent's entry (BatchSize).
+func (rec *SessionRecord) setBatchSize(taskID string, n int) {
+	for i := range rec.Tasks {
+		if rec.Tasks[i].ID == taskID {
+			rec.Tasks[i].BatchSize = n
+		}
+	}
+}
+
+// batchTargetCap bounds a batch child's Target, in bytes: it names the child
+// in the wake and a status, and an entry's parameters are the session's to
+// write.
+const batchTargetCap = 160
+
+// batchTargetSep and batchTargetKV join a child's parameters in its Target.
+const (
+	batchTargetSep = ", "
+	batchTargetKV  = "="
+)
+
+// batchTarget is a batch entry's parameters as the wake and a status name
+// the child: each name=value, sorted by name, held to batchTargetCap. Empty
+// for an entry with none (platform).
+func batchTarget(params map[string]string) string {
+	if len(params) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(params))
+	for _, k := range slices.Sorted(maps.Keys(params)) {
+		parts = append(parts, k+batchTargetKV+params[k])
+	}
+	return truncateRunes(strings.Join(parts, batchTargetSep), batchTargetCap)
+}
+
+// What publishBatchCancel's log lines call the child it cancels.
+const (
+	batchCancelWithdrawn = "a withdrawn batch child"
+	batchCancelAsked     = "a batch child that asked for input"
+)
 
 // delegateEvidence is what a reader of a task knows about a delegate request
 // on its stream.
@@ -984,25 +1111,52 @@ func (g *Gateway) wakeSession(ctx context.Context, rec *SessionRecord, child Tas
 		log.Info("no wake: another task holds the conversation", "active", rec.ActiveTask.TaskID)
 		return false, "another task holds the conversation"
 	}
+	parent, authority, why, ok := g.wakeParent(rec, child, log)
+	if !ok {
+		return false, why
+	}
+	// The delegating turn's request, carried down a longer chain: the
+	// human's question, not an intermediate wake's gateway-authored text.
+	text := wakeText(state, child.ID, parent.Request, turns, result, reason, wakeNeedsFullAnswer(&parent, resultPosted), cardsPending)
+	// The wake reads the child's result, which steers into the child
+	// shaped, and continues the parent's turn: it carries both entries'
+	// steer authors, so a delegation from it is checked against them.
+	var steered TaskRef
+	steered.carrySteerAuthors(parent)
+	steered.carrySteerAuthors(child)
+	return g.startWake(ctx, rec, child, parent, authority, steered, text, log)
+}
+
+// wakeParent is what a wake needs from the turn that delegated: its entry,
+// and its stored attribution as the wake's authority, with a via naming
+// child, whose end starts the wake. false, with the reason for the chain
+// root's terminal, when there is no spawner to start a session, or the
+// delegating turn's requester is no longer on record (which posts the
+// notice saying so).
+func (g *Gateway) wakeParent(rec *SessionRecord, child TaskRef, log *slog.Logger) (TaskRef, Authority, string, bool) {
 	if g.spawner == nil {
 		log.Warn("no wake: no session spawner")
-		return false, "no session spawner"
+		return TaskRef{}, Authority{}, "no session spawner", false
 	}
 	parent, ok := rec.TaskRefFor(child.ParentTaskID)
 	authority, err := AuthorityFromAttribution(parent.Attribution)
 	if !ok || parent.Requester == nil || len(parent.Attribution) == 0 || err != nil {
 		log.Warn("no wake: the delegating turn's requester is not on record", "parent", child.ParentTaskID)
 		g.post(rec.Key, noticeWakeNoRequester)
-		return false, "the delegating turn's " + requesterGone
+		return TaskRef{}, Authority{}, "the delegating turn's " + requesterGone, false
 	}
 	// The session that delegated: the parent's addressee is the incarnation
 	// it ran on, which the mint checked was the record's bus session.
 	authority.Via = &AuthorityVia{TaskID: child.ID, Session: parent.Addressee}
+	return parent, authority, "", true
+}
 
-	// The delegating turn's request, carried down a longer chain: the
-	// human's question, not an intermediate wake's gateway-authored text.
-	text := wakeText(state, child.ID, parent.Request, turns, result, reason, wakeNeedsFullAnswer(&parent, resultPosted), cardsPending)
-
+// startWake starts the wake turn with text on the parent's live pod or a
+// fresh incarnation, continuing child's chain: wakeSession's for one child,
+// wakeBatch's for a fan-out, whose last child to end is child. steered
+// carries the steer authors the wake inherits. It reports whether the wake
+// reached the bus, and when it did not, why.
+func (g *Gateway) startWake(ctx context.Context, rec *SessionRecord, child, parent TaskRef, authority Authority, steered TaskRef, text string, log *slog.Logger) (bool, string) {
 	if rec.Profile == "" {
 		rec.Profile = sessionProfile
 	}
@@ -1029,12 +1183,6 @@ func (g *Gateway) wakeSession(ctx context.Context, rec *SessionRecord, child Tas
 	// The wake is the delegating turn's successor: the chain's correlation
 	// id (a task spawned in service of another inherits it) and the child's
 	// depth, so depth counts delegations rather than turns.
-	// The wake reads the child's result, which steers into the child
-	// shaped, and continues the parent's turn: it carries both entries'
-	// steer authors, so a delegation from it is checked against them.
-	var steered TaskRef
-	steered.carrySteerAuthors(parent)
-	steered.carrySteerAuthors(child)
 	wakeID, ok := g.startTaskWith(ctx, rec, taskStart{
 		Text:                 text,
 		Requester:            *parent.Requester,
@@ -1069,8 +1217,15 @@ func (g *Gateway) wakeSession(ctx context.Context, rec *SessionRecord, child Tas
 // not woken and why. Nothing is delivered: the child's result is the wake's
 // to digest, and it was posted to the conversation.
 func (g *Gateway) observeChildEnd(rec *SessionRecord, child TaskRef, state lib.TaskState, source TerminalSource, reason, why string) {
+	g.observeChainEnd(rec, child, child.Canceled, state, source, reason, why)
+}
+
+// observeChainEnd is observeChildEnd with whether the chain was stopped
+// given rather than read off the child: a fan-out's is its parent's stop, or
+// every child's (batchChildEnded).
+func (g *Gateway) observeChainEnd(rec *SessionRecord, child TaskRef, stopped bool, state lib.TaskState, source TerminalSource, reason, why string) {
 	end := ChainEnd{State: lib.StateCanceled, Source: source, Reason: reason}
-	if !child.Canceled {
+	if !stopped {
 		end = ChainEnd{State: lib.StateFailed, Source: source,
 			Reason: fmt.Sprintf("reason: %s - %s; the delegated task %s ended %s", reasonWakeNotStarted, why, child.ID, state)}
 	}

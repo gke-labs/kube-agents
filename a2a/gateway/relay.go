@@ -645,6 +645,14 @@ func (g *Gateway) applyStatus(ctx context.Context, rec *SessionRecord, rs *relay
 		if ask == "" {
 			ask = "the task needs input to continue"
 		}
+		// A child of a batch of two or more ends on its question, which
+		// goes back to the session with the batch's results, rather than
+		// pausing the conversation (batchChildAsks). Anything else asks the
+		// room.
+		if ref, ok := rec.TaskRefFor(taskID); ok && rec.fanOutChild(ref) {
+			g.batchChildAsks(ctx, rec, ref, ask)
+			return
+		}
 		g.postMessage(rec.Key, OutMessage{Text: "❓ " + ask, Chat: layoutOf(question)})
 		g.markFrom(rec, taskID, question)
 		g.updateRollingLine(rec, taskID, rs)
@@ -812,7 +820,9 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	// otherwise a restart may have lost some, and the stream has them all. A
 	// child its requester stopped wakes nothing, so it needs none.
 	turns := rs.turnAnswers
-	needTurns := ref.Role == taskRoleChild && !ref.Canceled && !rs.local
+	// A fan-out child takes no steers (refuseFanOutSteer), so it has no
+	// turns to read.
+	needTurns := ref.Role == taskRoleChild && !ref.Canceled && !rs.local && !rec.fanOutChild(ref)
 	turnsUnread := false
 	// A session turn that ends completed may have asked to delegate in an
 	// event this process never ran: the artifact's delivery was acked and
@@ -990,7 +1000,15 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			g.renderLine(rec.Key, active.StatusMsgID, withLineNote(doneTerminalLine(s.Status.State, progress, doneLine != ""), active.LineNote), rs, "")
 		}
 		unmarkOnSupervisorTerminal(rec, taskID, source)
-		rec.ActiveTask = nil
+		if !active.Detached && rec.fanOutPending(taskID) {
+			// A turn whose batch is still running keeps the conversation
+			// until the last child ends (wakeBatch releases it): a stop
+			// reaches it, a steer is refused and a status lists the
+			// children. Its line is closed above.
+			active.StatusMsgID = ""
+		} else {
+			rec.ActiveTask = nil
+		}
 		// An executor's end of a live task is activity. The Slack adapter's
 		// session-thread rule (hasSession, through LastTaskActivity) counts
 		// from here, not from the ask that started the task; the reap does
@@ -1076,11 +1094,21 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		// wake runs) takes it in consoleFrame.
 		if isConsoleConversation(rec.Key) && handedOff(s.Status.State, rs.handoff) {
 			root, _ := rec.observedAs(taskID)
-			g.consoleCardsPending.put(root, "")
+			rec.markCardsPending(root)
 		}
 		g.observeEnded(rec, taskID, s.Status.State, source, reason)
 	}
 
+	// A fan-out child's end is kept until its last sibling's, which wakes
+	// the session once with all of them (batchChildEnded).
+	if ref, ok := rec.TaskRefFor(taskID); ok && rec.fanOutChild(ref) {
+		text := reason
+		if s.Status.State == lib.StateCompleted {
+			text = result
+		}
+		g.batchChildEnded(ctx, rec, ref, BatchEnd{State: s.Status.State, Text: text, Source: source, Cards: toCards}, reason)
+		return
+	}
 	// A delegated child's end wakes the session that asked, or reaches a
 	// parent addressed to an AgentProfile, which waits open, on its .in.
 	if ref, ok := rec.TaskRefFor(taskID); ok && ref.Role == taskRoleChild && !g.deliverChildResult(ctx, rec, ref, s.Status.State, result, reason) {

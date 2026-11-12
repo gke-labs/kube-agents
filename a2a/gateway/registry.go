@@ -419,6 +419,158 @@ type TaskRef struct {
 	// what bounds an older ask's hold on the Agent Session (sessionMark).
 	NotifyKeys []string  `json:"notifyKeys,omitempty"`
 	MarkedAt   time.Time `json:"markedAt,omitzero"`
+	// CardsPending, on a console chain's root entry, records that a task of
+	// the chain handed work to kanban cards (lib.ArtifactHandoff) and the
+	// chain's end has not been framed yet: the end's terminal frame tells the
+	// console client to wait for the cards' reports (consoleFrame), and
+	// takes the mark. On the record, beside CardsAnswer, so several children
+	// can set it, the chain's end takes it once, and a gateway restarted in
+	// between still frames the end with it. False otherwise.
+	CardsPending bool `json:"cardsPending,omitempty"`
+	// BatchSize, on a turn whose delegate request was a batch of two or
+	// more, is how many children the batch asked for. It is written in one
+	// record write before any child is published (mintBatch), so a record
+	// with fewer children than this is a batch a gateway stopped partway
+	// through, which the request's redelivery, or the heal's read of it from
+	// the stream, finishes or withdraws (resumeBatch). Zero on every other
+	// turn, a batch of one included.
+	BatchSize int `json:"batchSize,omitempty"`
+	// BatchIndex, Target and BatchEnd are a batch child's, for a batch of
+	// two or more: its entry's place in the batch, from 1; its parameters as
+	// the wake and a status name it (cluster=web-1, ...), empty for a child
+	// with none; and how it ended, written when it ends, which the wake
+	// reads once every sibling has one (batchChildEnded). Zero and nil on
+	// every other entry.
+	BatchIndex int       `json:"batchIndex,omitempty"`
+	Target     string    `json:"target,omitempty"`
+	BatchEnd   *BatchEnd `json:"batchEnd,omitempty"`
+}
+
+// BatchEnd is how a fan-out child ended, kept on its entry until the wake
+// that carries every sibling's (batchChildEnded). Text is the child's result
+// for completed, its question for input-required, and its reason otherwise,
+// already cut to the child's share of the wake (batchShare) and marked when
+// cut, so the record holds at most one wake's worth across the batch.
+// Stopped is a child the gateway had sent a cancel to before it ended, which
+// does not wake the session on its own. Unposted is a result the room was
+// not shown whole (the heal found it), and Cards a child that handed work to
+// kanban cards, both read by the wake as a single child's are.
+type BatchEnd struct {
+	State    lib.TaskState  `json:"state"`
+	Text     string         `json:"text,omitempty"`
+	Source   TerminalSource `json:"source,omitempty"`
+	Stopped  bool           `json:"stopped,omitempty"`
+	Unposted bool           `json:"unposted,omitempty"`
+	Cards    bool           `json:"cards,omitempty"`
+}
+
+// fanOut reports a turn whose request was a batch of two or more children.
+func (ref TaskRef) fanOut() bool {
+	return ref.BatchSize >= 2
+}
+
+// batchChildren is the record's entries for the children of a fan-out
+// parent, in the order they are on the record.
+func (rec *SessionRecord) batchChildren(parentID string) []TaskRef {
+	var out []TaskRef
+	for _, ref := range rec.Tasks {
+		if ref.Role == taskRoleChild && ref.ParentTaskID == parentID && ref.BatchIndex > 0 {
+			out = append(out, ref)
+		}
+	}
+	return out
+}
+
+// batchLeft is how many of a fan-out parent's planned children have not
+// ended: those still to be minted and those on record with no BatchEnd.
+func (rec *SessionRecord) batchLeft(parent TaskRef) int {
+	left := parent.BatchSize
+	for _, k := range rec.batchChildren(parent.ID) {
+		if k.BatchEnd != nil {
+			left--
+		}
+	}
+	return max(left, 0)
+}
+
+// fanOutPending reports a fan-out parent whose batch is still running: a
+// batch of two or more, not withdrawn (DelegationEnd), with a child still to
+// end or to mint. Its parent holds the conversation's active slot until the
+// last child ends (relayTerminal, batchChildEnded).
+func (rec *SessionRecord) fanOutPending(taskID string) bool {
+	ref, ok := rec.TaskRefFor(taskID)
+	return ok && ref.fanOut() && ref.DelegationEnd == "" && rec.batchLeft(ref) > 0
+}
+
+// batchComplete reports a turn whose batch has every planned child on the
+// record: true for any turn that did not ask for a batch of two or more.
+func (ref TaskRef) batchComplete() bool {
+	return !ref.fanOut() || len(ref.Children) >= ref.BatchSize
+}
+
+// setBatchEnd records how the batch child taskID ended.
+func (rec *SessionRecord) setBatchEnd(taskID string, end *BatchEnd) {
+	for i := range rec.Tasks {
+		if rec.Tasks[i].ID == taskID {
+			rec.Tasks[i].BatchEnd = end
+		}
+	}
+}
+
+// markCardsPending marks a console chain's root (CardsPending).
+func (rec *SessionRecord) markCardsPending(rootID string) {
+	for i := range rec.Tasks {
+		if rec.Tasks[i].ID == rootID {
+			rec.Tasks[i].CardsPending = true
+		}
+	}
+}
+
+// takeCardsPending reports the root's CardsPending mark and clears it, so
+// the chain's end frames it once.
+func (rec *SessionRecord) takeCardsPending(rootID string) bool {
+	for i := range rec.Tasks {
+		if rec.Tasks[i].ID == rootID && rec.Tasks[i].CardsPending {
+			rec.Tasks[i].CardsPending = false
+			return true
+		}
+	}
+	return false
+}
+
+// trimHistory holds rec.Tasks to taskHistoryCap, dropping the oldest entries
+// first, but never a live node of a fan-out still running: its parent, the
+// chain's root and every child, ended or not, since the wake reads each
+// child's end and the root carries the chain's mark. Nor the active task's
+// entry. A history whose live nodes alone pass the cap keeps them all; a
+// batch holds at most lib.DelegateBatchMax children, so that is bounded.
+func (rec *SessionRecord) trimHistory() {
+	over := len(rec.Tasks) - taskHistoryCap
+	if over <= 0 {
+		return
+	}
+	live := map[string]bool{}
+	if rec.ActiveTask != nil {
+		live[rec.ActiveTask.TaskID] = true
+	}
+	for _, ref := range rec.Tasks {
+		if !rec.fanOutPending(ref.ID) {
+			continue
+		}
+		live[ref.ID], live[ref.rootID()] = true, true
+		for _, k := range rec.batchChildren(ref.ID) {
+			live[k.ID] = true
+		}
+	}
+	kept := make([]TaskRef, 0, len(rec.Tasks)-over)
+	for _, ref := range rec.Tasks {
+		if over > 0 && !live[ref.ID] {
+			over--
+			continue
+		}
+		kept = append(kept, ref)
+	}
+	rec.Tasks = kept
 }
 
 // handOffEnd is the one rule for a session turn's own end when it asked to
@@ -580,19 +732,23 @@ func (rec *SessionRecord) observedAs(taskID string) (id string, ends bool) {
 // minted none (DelegationEnd). Both are written to the record when they are
 // made (startTaskWith's write for a mint, handleDelegateRequest's for the
 // rest), so the record holds either from the moment the request is decided.
+//
+// A batch is handled once every child it planned is on the record
+// (BatchSize): one a gateway stopped partway through is still to finish, so
+// its request is read again (resumeBatch).
 func (rec *SessionRecord) delegationHandled(taskID string) bool {
 	ref, ok := rec.TaskRefFor(taskID)
-	return ok && (len(ref.Children) > 0 || ref.DelegationEnd != "")
+	return ok && ((len(ref.Children) > 0 && ref.batchComplete()) || ref.DelegationEnd != "")
 }
 
 // mayHaveUnhandledDelegate reports whether the task is a session turn - not
 // a child, addressed to the record's own bus session - whose entry shows no
 // delegate request handled: the only kind of task whose fold can carry a
-// delegate request still to run.
+// delegate request still to run, a batch cut short by a restart included.
 func (rec *SessionRecord) mayHaveUnhandledDelegate(taskID string) bool {
 	ref, ok := rec.TaskRefFor(taskID)
 	return ok && ref.Role != taskRoleChild && rec.BusSession != "" && ref.Addressee == rec.BusSession &&
-		len(ref.Children) == 0 && ref.DelegationEnd == ""
+		!rec.delegationHandled(taskID)
 }
 
 // chainLast follows a delegation chain from the turn that started it to its
@@ -600,9 +756,25 @@ func (rec *SessionRecord) mayHaveUnhandledDelegate(taskID string) bool {
 // a turn that did not delegate (the wake that ends the chain) or a child no
 // wake followed. false when root did not delegate, or a link has fallen off
 // the history cap.
+//
+// A fan-out turn's children share one wake, started by whichever ended last,
+// so its step is that wake; with none yet, the child carrying the chain's
+// end (observeChainEnd) when the chain ended without one, or else a child
+// still running.
 func (rec *SessionRecord) chainLast(root TaskRef) (TaskRef, bool) {
 	cur := root
 	for steps := 0; len(cur.Children) > 0 && steps <= taskHistoryCap; steps++ {
+		if cur.fanOut() {
+			next, wake, ok := rec.fanOutStep(cur)
+			if !ok {
+				return TaskRef{}, false
+			}
+			if !wake {
+				return next, true
+			}
+			cur = next
+			continue
+		}
 		child, ok := rec.TaskRefFor(cur.Children[len(cur.Children)-1])
 		if !ok {
 			return TaskRef{}, false
@@ -614,6 +786,30 @@ func (rec *SessionRecord) chainLast(root TaskRef) (TaskRef, bool) {
 		cur = wake
 	}
 	return cur, cur.ID != root.ID
+}
+
+// fanOutStep is chainLast's step from a fan-out turn: the wake one of its
+// children started (wake true), or else the child to report, the one with
+// the chain's end or the last still running. false when a child has fallen
+// off the history cap.
+func (rec *SessionRecord) fanOutStep(parent TaskRef) (TaskRef, bool, bool) {
+	var running TaskRef
+	for _, id := range parent.Children {
+		child, ok := rec.TaskRefFor(id)
+		if !ok {
+			return TaskRef{}, false, false
+		}
+		if wake, ok := rec.wakeOf(id); ok {
+			return wake, true, true
+		}
+		if child.ChainEnd != nil {
+			return child, false, true
+		}
+		if child.BatchEnd == nil || running.ID == "" {
+			running = child
+		}
+	}
+	return running, false, true
 }
 
 // wakeOf is the wake a child's end started, if any.
