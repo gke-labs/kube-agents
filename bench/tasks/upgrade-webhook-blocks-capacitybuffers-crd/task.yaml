@@ -52,13 +52,14 @@
 # namespaceSelector, clientConfig pointing at Service
 # seeded-upgrade/nonexistent-crd-gate, which does not exist (role
 # readiness-crd-webhook in bench/tf/fleet/fixtures.json). Nothing is planted
-# by the run: the case observes the fleet. Parked in FIXTURE_NOT_READY until
-# the reconcile plants the gate on every pool project; the un-park pull
-# request adds `suite: certification` and the roster line.
+# by the run: the case observes the fleet. Un-parked once the fleet reconcile
+# had planted the gate on every pool project and the hourly scan read the
+# role healthy on each.
 # Isolation class: fleet-read-only, GitOps-repo write (the audit's ledger).
 id: upgrade-webhook-blocks-capacitybuffers-crd
 name: "Fail-Closed Admission Webhook With No Backend Whose Rule Reaches the autoscaling.x-k8s.io Group (system CRD webhook check)"
 domain: upgrades
+suite: certification
 expected_fail: true
 audit_streams:
   - security-patch-orchestrator
