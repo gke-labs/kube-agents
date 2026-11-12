@@ -1,8 +1,9 @@
-"""Route a proactive chat post through the A2A gateway when the next stack owns the chat backend.
+"""Route a proactive chat post through the A2A gateway when the gateway holds the chat backend.
 
-Under ``spec.mode: next`` the operator stops rendering the Hermes chat platform
-that ``hermes send`` posts through, because the A2A gateway consumes the chat
-backend instead. Every caller that posts unprompted (the alert path, the cron
+The operator does not render the Hermes chat platform that ``hermes send``
+posts through for a backend the A2A gateway consumes: Google Chat always, and
+Slack unless Google Chat is enabled beside it, when the Hermes Slack adapter
+keeps Slack. Every caller that posts unprompted (the alert path, the cron
 relay, the Cluster Agent reconcile notice, ``send_notification``) would then post
 nowhere. The operator names the platform the gateway now holds in
 ``A2A_NOTIFY_PLATFORM``, and for that platform these callers run
@@ -47,7 +48,8 @@ NOTIFY_CONVERSATIONS_ENV = "A2A_NOTIFY_CONVERSATIONS"
 # channel the gateway learned) into a ConfigMap mounted as a directory in the
 # agent pod, so a learned channel reaches the pod without a restart. One file,
 # the Slack channel id or empty; the directory is absent on an operator older
-# than the projection and in today mode. No env override: the agent's own
+# than the projection and where the gateway does not hold Slack. No env
+# override: the agent's own
 # .env is loaded into its environment, so a seam there would let a line on
 # the writable volume point the readers at a file of its own.
 HOME_FILE_DIR = "/etc/kube-agents/chat-home"
@@ -74,7 +76,7 @@ ROUTE_CONVERSATION = "conversation"
 ROUTE_CONTEXT = "context_id"
 # The bus CLI in the agent image (a2a/cmd/a2a), on PATH.
 A2A_CLI = "a2a"
-# The Hermes CLI the today path posts through.
+# The Hermes CLI a platform the gateway does not hold posts through.
 HERMES_CLI = "hermes"
 # The exit status `a2a notify` uses when the gateway did not answer in time: the
 # post may or may not have landed, so a caller must not post it again.
@@ -102,9 +104,10 @@ NOTIFY_MARGIN_SECONDS = 15
 NOTIFY_SUBPROCESS_TIMEOUT_SECONDS = NOTIFY_WAIT_SECONDS + NOTIFY_CONNECT_SECONDS + NOTIFY_MARGIN_SECONDS
 # The `a2a notify --update` key an event alert is posted under, one per alert
 # (its event session's id): the gateway edits the message it posted with that
-# key, which is how the alert's triage replaces the alert in place under next
-# (slack_ux_incident's chat route, which finds the session by the alert's
-# thread). Hermes's send has no such key, so the today path posts as before.
+# key, which is how the alert's triage replaces the alert in place through
+# the gateway (slack_ux_incident's chat route, which finds the session by the
+# alert's thread). Hermes's send has no such key, so a platform the gateway
+# does not hold posts as before.
 ALERT_UPDATE_FORMAT = "alert-{session}"
 # A Google Chat message name and the thread it starts: spaces/S/messages/M.M is
 # in thread spaces/S/threads/M when Hermes posted it.
@@ -126,7 +129,8 @@ def home_file() -> tuple[str, bool]:
     restarts for it. Mounted means the directory is there: the Optional
     volume gives an empty directory until the operator writes the ConfigMap,
     and in that gap the home is still the operator's to say. No directory at
-    all is today mode, or an operator older than the projection: ("", False).
+    all is an install where the gateway does not hold Slack, or an operator
+    older than the projection: ("", False).
     """
     try:
         with open(os.path.join(HOME_FILE_DIR, HOME_FILE_KEY), encoding="utf-8") as handle:
@@ -267,8 +271,8 @@ def command(target: str, message: str, json_output: bool = True, hermes_bin: str
     if thread:
         # A Slack thread is a bare ts, which names no channel: it goes out
         # qualified by the target's own channel, and the gateway posts it only
-        # when that channel is home. A today-era DM or other channel's thread
-        # is then refused rather than followed up in home.
+        # when that channel is home. A DM or other channel's thread the Hermes
+        # Slack adapter opened is then refused rather than followed up in home.
         if platform == SLACK_PLATFORM and chat:
             thread = f"{chat}/{thread}"
         argv += ["--thread", thread]
@@ -283,9 +287,9 @@ def chat_command(platform: str, thread: str, text: str, chat_path: str, timeout_
 
     ``chat_path`` names a file holding the chat message's JSON object; ``text``
     is its fallback, which the gateway posts when it does not lay the message
-    out. Only for a platform :func:`routes` sends through the gateway; the
-    today path posts Block Kit through the broker's Slack relay
-    (slack_blocks_post.py).
+    out. Only for a platform :func:`routes` sends through the gateway; a
+    platform the gateway does not hold posts Block Kit through the broker's
+    Slack relay (slack_blocks_post.py).
     """
     argv = [A2A_CLI, "notify", "--platform", platform, "--chat-file", chat_path]
     if thread:

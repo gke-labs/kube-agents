@@ -1450,8 +1450,8 @@ fi
 # there puts the original back rather than leaving the gap.
 #
 # $3 is an OPTIONAL second source directory, overlaid onto the staged copy
-# before the swap. It exists for the A2A skill (step 2.6a-bis's gate decides
-# whether to pass it), and it goes through here rather than writing into the
+# before the swap. It exists for the A2A skill (step 2.6a-bis passes it when
+# the image ships it), and it goes through here rather than writing into the
 # live directory afterwards for the reason the staging exists at all: a
 # non-staged writer that lands in another replica's swap window recreates
 # $_dst holding only ITS files, which sends the other pod down the
@@ -1570,89 +1570,19 @@ sync_profile_skills() {
     rm -rf "$_old" 2>/dev/null || true
     return 0
 }
-# 2.6a-bis The A2A topics skill, overlaid into the platform profile only when
-# this install runs the next stack. The skill ships OUTSIDE the platform
-# template (/opt/a2a-template, see the Dockerfile) so that 2.6a's replace
-# never installs it on a today install: the mode switch's promise is that a
-# normal install cannot tell the feature exists, and a skill file in the
-# template would break it on day one. It rides 2.6a's staging as the overlay
-# argument rather than being copied in afterwards — see the note on $3 — so
-# the composed tree lands in one rename. A flip back to today self-cleans:
-# the next boot stages the template alone and renames that over the profile.
-#
-# The gate asks runtime_mode.py, the one agent-side reader the mode spec
-# allows. The mode rides the managed .env, which Hermes applies at load time
-# — it is NOT in this shell's environment — so the helper hands the managed
-# file to Python and lets runtime_mode read it from there.
-#
-# Parsed as the strict KEY=value lines renderManagedEnv writes, never sourced:
-# `.` in a shell would execute anything a value with a space grew, and this
-# script is pid 1.
-#
-# os.environ is CLEARED first, so the managed file is the only thing that can
-# answer. Without that the inherited container env would be a second delivery
-# path for the mode — an AgentPlugin's spec.env is copied into the container
-# verbatim — and the spec's whole point is that one delivery path means one
-# answer. Clearing also keeps this file from naming the key a third time,
-# which is what the grep rule forbids.
-#
-# Exit meanings: 0 next, 1 today (or no managed scope at all — a compose or
-# `docker run` start, not a fault), 2 the managed scope exists but its .env
-# could not be read or the reader is missing. Only 0 overlays; 2 warns,
-# because on an operator-managed install that is a real fault the skill's
-# silent absence would otherwise hide. Guarded like 2.6a: nothing here ever
+# 2.6a-bis The A2A topics skill, overlaid into the platform profile. The skill
+# ships OUTSIDE the platform template (/opt/a2a-template, see the Dockerfile)
+# and rides 2.6a's staging as the overlay argument rather than being copied in
+# afterwards — see the note on $3 — so the composed tree lands in one rename.
+# Every install runs the A2A stack, so nothing gates the overlay: an image
+# with the template overlays it, and one without (no /opt/a2a-template/skills)
+# syncs the platform template alone. Guarded like 2.6a: nothing here ever
 # kills the boot.
-a2a_mode_probe() {
-    [ -n "${HERMES_MANAGED_DIR:-}" ] || return 1
-    "$INSTALL_DIR/.venv/bin/python3" - "$HERMES_MANAGED_DIR/.env" <<'A2A_PYEOF'
-import os, sys
-
-try:
-    with open(sys.argv[1]) as f:
-        lines = f.readlines()
-except OSError:
-    sys.exit(2)
-
-os.environ.clear()
-for line in lines:
-    line = line.strip()
-    if not line or line.startswith("#") or "=" not in line:
-        continue
-    key, _, value = line.partition("=")
-    key = key.strip()
-    # An empty key is not a pin and os.environ refuses it; skipping keeps a
-    # malformed line from being reported as an unreadable file.
-    if key:
-        os.environ[key] = value.strip()
-
-try:
-    sys.path.insert(0, "/opt/defaults/scripts")
-    import runtime_mode
-except Exception:
-    # A missing or broken reader is not "today" — it is an image fault, and
-    # exit 2 is what says so instead of a bare traceback read as a decision.
-    sys.exit(2)
-
-sys.exit(0 if runtime_mode.is_next() else 1)
-A2A_PYEOF
-}
-
 if [ -d "$TARGET_DIR/profiles/platform" ] && [ -d "$PLATFORM_TEMPLATE" ]; then
-    # `|| rc=$?` keeps the non-zero answers out of set -e's reach — "today"
-    # is a return value here, not a failure.
     a2a_overlay=""
     if [ -d /opt/a2a-template/skills ]; then
-        a2a_probe_rc=0
-        a2a_mode_probe || a2a_probe_rc=$?
-        case $a2a_probe_rc in
-            0)
-                a2a_overlay=/opt/a2a-template/skills
-                echo "Next stack: overlaying the A2A topics skill into the platform profile"
-                ;;
-            2)
-                echo "WARN: the managed scope has no readable .env; treating the mode as today and skipping the A2A skill overlay" >&2
-                ;;
-        esac
+        a2a_overlay=/opt/a2a-template/skills
+        echo "Overlaying the A2A topics skill into the platform profile"
     fi
     sync_profile_skills "$PLATFORM_TEMPLATE" "$TARGET_DIR/profiles/platform" "$a2a_overlay"
 fi
@@ -1931,8 +1861,7 @@ fi
 
 # 2.6c Reconcile optional built-in specialist profiles declared in KUBE_AGENTS_ENABLED_PROFILES.
 #
-# In `mode: next` (and when explicitly opted in via KUBE_AGENTS_ENABLED_PROFILES),
-# the operator populates KUBE_AGENTS_ENABLED_PROFILES from bound AgentProfile
+# The operator populates KUBE_AGENTS_ENABLED_PROFILES from bound AgentProfile
 # custom resources whose names match a built-in optional specialist template
 # baked into the image (currently `tse`, backed by /opt/tse-template).
 # Profiles marked with `.optional-profile` that are removed from KUBE_AGENTS_ENABLED_PROFILES

@@ -61,11 +61,11 @@ not post (in a recorded conversation, a card that did not post is posted again o
 later tick, below). On a Slack
 origin with the credential proxy's Slack relay in the environment it is posted
 here as Block Kit through ``slack_blocks_post``, because the scheduler's delivery
-takes text only. Under ``spec.mode: next``, on an install whose job was linked to a Slack chat before
-the switch and that has a Slack home channel, the same card goes through the A2A gateway as a chat message instead
+takes text only. On an install whose job was linked to a Slack chat before the gateway
+held Slack and that has a Slack home channel, the same card goes through the A2A gateway as a chat message instead
 (``_posted_through_gateway``).
 
-Under ``spec.mode: next`` the plugin may instead have recorded the conversation the user first
+The plugin may instead have recorded the conversation the user first
 wrote in (``CONVERSATION_FILE``, with ``CONVERSATION_ALIGNED_MARKER`` as the human-present marker).
 That record wins over a job origin. The run then never prints the report, since the scheduler
 cannot reach a gateway conversation: it checks before the claim that this child's env carries the
@@ -249,8 +249,8 @@ REMOTE_MV = "/bin/mv"
 
 # The only surface the reshaped report is written for; every other one gets it as written.
 PRESENTED_PLATFORM = "slack"
-# Google Chat's platform name. Its card goes only through the gateway (spec.mode: next),
-# which lays the chat message out; Hermes's own Chat adapter under today takes text.
+# Google Chat's platform name. Its card goes only through the gateway, which lays the
+# chat message out; Hermes's own Chat adapter takes text.
 GCHAT_PLATFORM = "google_chat"
 # Why the first report went as text and not as the card, one line in the oobe stage log
 # (_stage_note), which an operator reads; the scheduler keeps a zero-exit run's stderr nowhere.
@@ -430,7 +430,7 @@ RESENT_FILE = ".oobe_summaries_resent.json"
 RESENT_TRIES_KEY = "tries"
 RESENT_POSTED_KEY = "posted"
 
-# Under spec.mode next the plugin records the conversation the report goes to (its
+# On the conversation path the plugin records the conversation the report goes to (its
 # CONVERSATION_FILE) and touches CONVERSATION_ALIGNED_MARKER in place of .user_aligned. Either one
 # present puts the run on the conversation path, which never prints the report: the scheduler
 # cannot post to a gateway conversation.
@@ -1289,7 +1289,7 @@ def _origin() -> dict:
 
 def _card_platform(platform: str | None) -> bool:
     """Whether the first report's card goes to ``platform``: Slack, or Google Chat where the
-    gateway serves it (``spec.mode: next``), home posts or conversations, and lays the card out."""
+    gateway serves it, home posts or conversations, and lays the card out."""
     if platform == PRESENTED_PLATFORM:
         return True
     return platform == GCHAT_PLATFORM and (chat_notify.routes(platform) or chat_notify.gateway_platform() == platform)
@@ -1717,10 +1717,10 @@ def resend_lost_summaries(data_dir: Path, now: float) -> None:
     """The ``oobe`` stage that posts the first-run audit summaries the want of a home channel lost.
 
     A first-run audit that ends before anyone has opened the chat finds no home channel: under
-    ``spec.mode: next`` the gateway keeps the post for its digest, the run is recorded failed, and
+    the gateway keeps the post for its digest, the run is recorded failed, and
     nothing posts the summary once the channel is learned minutes later. This stage watches the home
-    channel the operator projects into the pod (``chat_notify.home_file``: Slack under next; today mode
-    and Google Chat project none, and get no re-send) and, once it names a channel, asks the chat relay
+    channel the operator projects into the pod (``chat_notify.home_file``: Slack where the gateway holds
+    it; Google Chat, and Slack on the Hermes adapter, project none, and get no re-send) and, once it names a channel, asks the chat relay
     to post each pending run's report through the route a scheduled run's delivery leg takes, so the
     relay reads the audit's own chat report record, posts it the same way, and records the post. The
     relay's answer settles the audit in ``RESENT_FILE``; for a request whose answer was lost the relay's
@@ -1762,7 +1762,7 @@ def _first_report_card(
     why the text goes instead.
 
     The card needs all of: ``KAGE_SLACK_UX`` on; a card platform as the destination (``platform``:
-    Slack, or Google Chat through the gateway under ``spec.mode: next``); a hand-off
+    Slack, or Google Chat through the gateway); a hand-off
     that filed a prioritization card (``no_ranking`` False: otherwise the files beside the report
     are an earlier sweep's, or that cannot be told); the items and shown files there and readable,
     and the scores file readable when an item is listed; and a card the builder accepts, which recomputes
@@ -1803,7 +1803,7 @@ def _first_report_card(
 
 def _posted_as_blocks(data_dir: Path, card: inventory_card.Card | None) -> bool:
     """Whether the report was posted as the card, to Slack or to Google Chat through
-    the gateway under ``spec.mode: next``; False posts nothing.
+    the gateway; False posts nothing.
 
     False, and the caller prints the text, with no card (``_first_report_card``
     said why), an origin that is not a card platform with a chat id, or no relay. Any
@@ -1845,7 +1845,7 @@ def _posted_as_blocks(data_dir: Path, card: inventory_card.Card | None) -> bool:
 
 
 def _posted_through_gateway(data_dir: Path, card: inventory_card.Card, platform: str, channel: str, thread: str) -> bool:
-    """Under ``spec.mode: next``, whether the card posted as a chat message through the gateway.
+    """Whether the card posted as a chat message through the gateway.
 
     The gateway holds the chat platform there, Slack or Google Chat, and the
     broker's relay is gone, so the card goes as ``a2a notify --chat-file``

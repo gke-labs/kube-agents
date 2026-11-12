@@ -1,8 +1,8 @@
 # CI-only build of the four core first-party images (platform-agent,
 # credential-proxy, agent-sandbox, k8s-operator) in a single Cloud Build, plus,
-# when hack/ci-deploy.sh runs under EVAL_MODE_NEXT=1, the four A2A images of
-# the next stack and the Hermes bridge sidecar (the `a2a` and `a2a-bridge`
-# steps at the end, no-ops otherwise), and under EVAL_REPLAY_SHADOW=true the
+# when hack/ci-deploy.sh passes their URIs, the A2A stack's images and the
+# Hermes bridge sidecar (the `a2a` and `a2a-bridge` steps at the end, no-ops
+# otherwise), and under EVAL_REPLAY_SHADOW=true the
 # shadow-mode replay proxy (the `replay-shadow-proxy` step, a no-op otherwise).
 #
 # Why this exists next to cloudbuild.yaml rather than replacing it: that config
@@ -211,9 +211,9 @@ steps:
           docker push "$$uri"
         done
 
-  # The next stack's six first-party images (a2a/Dockerfile.gateway,
+  # The A2A stack's six first-party images (a2a/Dockerfile.gateway,
   # .authcallout, .worker, .verifier, .console, .dispatcher), built only when hack/ci-deploy.sh
-  # runs under EVAL_MODE_NEXT=1 and passes their URIs. With the substitutions at their
+  # passes their URIs. With the substitutions at their
   # empty defaults the step prints one line and exits, and the `images:` list
   # below stays the four it was: that list cannot be conditional and an empty
   # entry fails the build, which is why this step pushes from inside itself.
@@ -243,7 +243,7 @@ steps:
       - "-c"
       - |
         if [ -z "$_A2A_GATEWAY_URI" ]; then
-          echo "A2A images not requested (EVAL_MODE_NEXT unset); skipping"
+          echo "A2A images not requested (no _A2A_*_URI substitutions); skipping"
           exit 0
         fi
         set -e
@@ -281,7 +281,7 @@ steps:
       - "-c"
       - |
         if [ -z "$_A2A_BRIDGE_URI" ]; then
-          echo "bridge image not requested (EVAL_MODE_NEXT unset); skipping"
+          echo "bridge image not requested (no _A2A_BRIDGE_URI substitution); skipping"
           exit 0
         fi
         set -e
@@ -352,7 +352,7 @@ substitutions:
   _KUBE_AGENTS_VERSION: "dev"
   _REQUIRE_CACHE: "false"
   # Empty means the a2a and a2a-bridge steps are no-ops; hack/ci-deploy.sh
-  # sets all seven together under EVAL_MODE_NEXT=1. The a2a step gates on
+  # sets all seven together. The a2a step gates on
   # _A2A_GATEWAY_URI alone, so they are set as a set or not at all.
   _A2A_GATEWAY_URI: ""
   _A2A_CALLOUT_URI: ""

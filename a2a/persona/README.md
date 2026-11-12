@@ -3,30 +3,27 @@
 What lives here: the platform agent's `a2a-topics` skill, which is how a
 running agent reads and writes the topic blackboard, and the session agent's
 persona ([`session/persona.md`](session/persona.md), below). The skill sits under `a2a/`
-rather than in `agents/platform/skills/` on purpose — a skill copied into the
-shipped persona tree would appear in the agent's skill list on every install,
-including the ones where the bus does not exist. "A normal install cannot tell
-this feature exists" is the mode switch's promise
-(`docs/designs/spec-mode-switch.md`), and a skill file is the easiest way to
-break it.
+rather than in `agents/platform/skills/` because the bus's content is owned
+here, beside the bus's code; the image ships it from here and the entrypoint
+overlays it into the platform profile.
 
 This directory is the SOURCE the agent image builds from: the Dockerfile
 copies `platform/skills/` to `/opt/a2a-template/skills/`, deliberately outside
 `/opt/platform-template`, and the entrypoint overlays it into the platform
-profile only on a `next` install (below).
+profile on every boot (below).
 
 ## The three pieces, and where each one lives
 
-| Piece                                                 | Home                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| ----------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| The `a2a` client binary                               | built from `a2a/cmd/a2a` in the image's `a2a-builder` stage and `COPY`d to `/usr/local/bin/a2a` — the `k8s-event-watcher` pattern. Ungated: a binary is inert until something invokes it, and the thing that invokes it is what ships dark                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| `SKILL.md`                                            | shipped at `/opt/a2a-template/skills/`, overlaid into the profile by `docker-entrypoint.sh` step 2.6a-bis only when `runtime_mode.is_next()`. The overlay rides step 2.6a's staged swap, which is what makes it stick — and what cleans it off on the first boot after a flip back to `today`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| `NATS_URL` / `A2A_BUS_USER` / the projected bus token | rendered by the operator into the agent container under `next`. The container holds no password: `A2A_BUS_USER` names the principal (`agent`) and the credential is a ServiceAccount token projected at `/var/run/secrets/a2a-bus/token`, audience `a2a-bus`, which the auth callout resolves to that principal's grants. A bridge sidecar declared in `spec.deployment.sidecars` cannot use it: its route would be a `volumeMounts` entry naming the operator's own `a2a-bus-token` volume, and that name is reserved — refused at admission and stripped from the render. Mounting it would not give the sidecar an identity of its own anyway, since the callout resolves the pod's ServiceAccount and would return the same entry. So the bridge stays on `NATS_USER`/`NATS_PASSWORD` as `bridge`, read through `env.valueFrom.secretKeyRef` against the `<agent>-a2a-nats-creds` Secret |
+| Piece                                                 | Home                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| The `a2a` client binary                               | built from `a2a/cmd/a2a` in the image's `a2a-builder` stage and `COPY`d to `/usr/local/bin/a2a` — the `k8s-event-watcher` pattern. Ungated: a binary is inert until something invokes it, and the thing that invokes it is what ships dark                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `SKILL.md`                                            | shipped at `/opt/a2a-template/skills/`, overlaid into the profile by `docker-entrypoint.sh` step 2.6a-bis on every boot. The overlay rides step 2.6a's staged swap, which is what makes it stick                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `NATS_URL` / `A2A_BUS_USER` / the projected bus token | rendered by the operator into the agent container. The container holds no password: `A2A_BUS_USER` names the principal (`agent`) and the credential is a ServiceAccount token projected at `/var/run/secrets/a2a-bus/token`, audience `a2a-bus`, which the auth callout resolves to that principal's grants. A bridge sidecar declared in `spec.deployment.sidecars` cannot use it: its route would be a `volumeMounts` entry naming the operator's own `a2a-bus-token` volume, and that name is reserved — refused at admission and stripped from the render. Mounting it would not give the sidecar an identity of its own anyway, since the callout resolves the pod's ServiceAccount and would return the same entry. So the bridge stays on `NATS_USER`/`NATS_PASSWORD` as `bridge`, read through `env.valueFrom.secretKeyRef` against the `<agent>-a2a-nats-creds` Secret |
 
 The binary has a second caller: the agent-side notification callers
 (`agents/platform/scripts/chat_notify.py`) run `a2a notify` to post proactive messages
 through the gateway, and so does the Hermes kanban notifier for card events
-(`deploy/docker/patches/kanban_chat_notify.py`). Both run it only under `next`: proactive posts
+(`deploy/docker/patches/kanban_chat_notify.py`). Both run it only where the gateway routes: proactive posts
 when the operator renders `A2A_NOTIFY_PLATFORM`, and the report of a card filed in a gateway
 conversation, back to that conversation, when it renders `A2A_NOTIFY_CONVERSATIONS`. Onboarding's
 first report goes the same way, into the conversation the user first wrote in
@@ -42,10 +39,8 @@ image roll cannot leave a profile running stale skills. A skill that exists
 only on the PVC is therefore deleted by the next restart, silently.
 
 So there is no supported way to add a skill to a running agent without going
-through the image. That constraint is why the mode-gated overlay exists: it is
-not a nicety, it is the only route — and it is also what makes the gate
-honest, since the same replace that would delete a hand-copied skill is what
-removes the overlaid one the first boot after the mode leaves `next`.
+through the image. That constraint is why the overlay exists: it is not a
+nicety, it is the only route.
 
 ## The shell sandbox does not carry the client, on purpose
 
@@ -65,10 +60,9 @@ entry to resolve it at all.
 
 ## Nothing to install by hand
 
-On a `next` install the operator and the image do all three placements; a
-fresh pod roll is the whole procedure. If you find yourself copying anything
-onto the PVC to make the reader work, the install is not actually running
-`mode: next`, and that is the thing to fix.
+The operator and the image do all three placements; a fresh pod roll is the
+whole procedure. If you find yourself copying anything onto the PVC to make
+the reader work, the install is behind, and that is the thing to fix.
 
 ## The session agent's persona and skills
 

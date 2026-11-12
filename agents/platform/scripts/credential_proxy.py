@@ -2169,7 +2169,7 @@ DEFAULT_CREDENTIAL_PROXY_CHAT_AUDIENCE = "kubeagents-credential-proxy-chat"
 # not known", rather than with some other role's reach.
 DEFAULT_CREDENTIAL_PROXY_MCP_AUDIENCE = "kubeagents-credential-proxy-mcp"
 
-# The scope publisher's audience (#4119). A next-mode Job with no gcloud of its
+# The scope publisher's audience (#4119). A Job with no gcloud of its
 # own: it runs five read-only lookups through /v1/exec, and scope_policy holds
 # it to them. Bound to its callers both ways, and conferred to nobody when no
 # callers are named, as the mcp audience is.

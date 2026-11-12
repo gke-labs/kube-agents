@@ -6,8 +6,8 @@ wired into ``gateway/kanban_watchers_notifier.py`` by
 
 The gap
 -------
-Under ``spec.mode: next`` the operator does not render the Hermes Google Chat
-platform: the A2A gateway consumes the Chat backend. A card an alert's triage
+The operator does not render the Hermes Google Chat platform: the A2A
+gateway consumes the Chat backend. A card an alert's triage
 creates still subscribes to the alert's Google Chat thread
 (``kanban_event_routing`` resolves the api_server session to it), and the
 notifier only collects subscriptions whose platform has a connected adapter
@@ -73,10 +73,10 @@ attachments are not posted (there is no file route), and say so in the log.
 
 Chat messages
 -------------
-Under ``next`` the gateway lays a card's post out from a
+The gateway lays a card's post out from a
 ``kube-agents.chat/v1`` object and composes nothing
 (``docs/designs/spec-a2a-payloads.md``, "Card work after the task ends"). The
-``today`` presenters' gateway patches (``slack_ux_status``, ``slack_ux_moments``,
+Block Kit presenters' gateway patches (``slack_ux_status``, ``slack_ux_moments``,
 ``slack_ux_incident``, ``slack_ux_failure``, ``kanban_progress_lines``) reach a
 Slack card through this stand-in as well, and :func:`chat_route` tells them
 they can: instead of ``chat.postMessage``/``chat.update`` they compose the same
@@ -244,8 +244,8 @@ def _chat_ux_platforms() -> tuple:
     """The platforms whose cards the stand-in lays out (kanban_notifier.CHAT_UX_PLATFORMS).
 
     A stand-in exists only where the gateway serves the platform, so a Google
-    Chat one is always under ``spec.mode: next``, where the gateway renders the
-    message. Read when a send runs, as the notifier module is elsewhere; an
+    Chat one always posts a message the gateway renders. Read when a send
+    runs, as the notifier module is elsewhere; an
     image without it lays out Slack's alone, as before.
     """
     try:
@@ -767,8 +767,8 @@ class ChatNotifyAdapter(BasePlatformAdapter):
         A Slack thread is a bare ts, which names no channel, so it goes out
         qualified by the card's own channel ("<channel>/<ts>"); the gateway
         posts it only when that channel is home. Without that, a card filed in
-        a DM or another channel (under today, delivered after the switch to
-        next) would report into home. A Slack thread with no channel is not
+        a DM or another channel (through the Hermes Slack adapter, delivered
+        once the gateway held Slack) would report into home. A Slack thread with no channel is not
         sent at all. Chat's thread names its space, which the gateway checks.
         """
         if not thread:

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-# scope_publisher.py - Publish the resolved scope the A2A gateway reads (spec.mode: next).
+# scope_publisher.py - Publish the resolved scope the A2A gateway reads.
 #
 # A folder-, organisation- or selector-scoped install cannot tell from `spec.scope` alone
 # whether a project is inside it; the gateway refuses such a target until something it can
 # trust has resolved the membership. This program is that resolver. The operator starts it
-# as a Job (every 15 minutes, when the membership fields change, and at creation) under
-# `spec.mode: next` only, from the agent image, with a ServiceAccount whose one Kubernetes
+# as a Job (every 15 minutes, when the membership fields change, and at creation),
+# from the agent image, with a ServiceAccount whose one Kubernetes
 # grant is `get` and `patch` on the `<name>-resolved-scope` ConfigMap. Nothing an agent turn
 # runs can write that ConfigMap.
 #

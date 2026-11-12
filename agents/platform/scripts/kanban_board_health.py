@@ -216,7 +216,7 @@ OMISSION_LINE_RESERVE = 120
 
 # The stuck tasks, in plain words: the task's own title and how long it has
 # waited, no ids, reasons or commands. Standard markdown, which the relay's
-# chat adapters (and the gateway under `spec.mode: next`) turn into each
+# chat adapters (and the gateway) turn into each
 # platform's bold.
 STUCK_HEADLINE = (
     "{count} task is stuck and needs someone to decide.",

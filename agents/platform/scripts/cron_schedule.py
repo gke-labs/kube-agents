@@ -2,8 +2,8 @@
 
 A failed run's chat line ends "It will try again tomorrow." only for such a
 job, and "It will try again at its next scheduled run." for any other or for
-one whose schedule cannot be read. No clock time: under `spec.mode: next`,
-the default for a first install, the gateway escapes Slack's date token, and a
+one whose schedule cannot be read. No clock time: the gateway escapes
+Slack's date token, and a
 time in one zone is wrong for most readers. Callers: the chat relay
 (`session_kv_server.scheduler_failure_line`) and `upgrade_readiness_watch.py`.
 """

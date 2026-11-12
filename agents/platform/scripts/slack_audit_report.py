@@ -800,7 +800,7 @@ def blocks_from_issue(issue: dict, ref: LedgerRef, report: str = "") -> tuple[li
 
 
 def chat_from_issue(issue: dict, ref: LedgerRef, report: str = "") -> tuple[dict, str] | None:
-    """:func:`blocks_from_issue`'s card as a ``kube-agents.chat/v1`` message, for ``spec.mode: next``.
+    """:func:`blocks_from_issue`'s card as a ``kube-agents.chat/v1`` message, for the gateway.
 
     ``(chat, text)``, or None whenever :func:`blocks_from_issue` is. The same
     headline, rows, lines under them, "Look at the first one" and ledger link,
@@ -890,7 +890,7 @@ def blocks_from_summary(report: str) -> tuple[list[dict], str] | None:
 
 
 def chat_from_summary(report: str) -> tuple[dict, str] | None:
-    """:func:`summary_card` as a ``kube-agents.chat/v1`` message for ``spec.mode: next``: ``(chat, text)``, or None.
+    """:func:`summary_card` as a ``kube-agents.chat/v1`` message for the gateway: ``(chat, text)``, or None.
 
     ``text`` is :func:`headline_from_summary`'s markdown, the fallback the
     gateway posts when it does not lay the message out.
@@ -942,11 +942,11 @@ def failed_line(report: str) -> str | None:
 
 
 def failed_chat(report: str) -> tuple[dict, str] | None:
-    """:func:`failed_line` as a ``kube-agents.chat/v1`` message for ``spec.mode: next``: ``(chat, text)``, or None.
+    """:func:`failed_line` as a ``kube-agents.chat/v1`` message for the gateway: ``(chat, text)``, or None.
 
-    The line is the message, and the whole report folds under it ("why"): under
-    next a reply in the thread reaches the gateway, which cannot replay the
-    report the way ``incident_context`` does under today. ``text`` is the
+    The line is the message, and the whole report folds under it ("why"): a
+    reply in the thread reaches the gateway, which cannot replay the report
+    the way ``incident_context`` does on the Hermes Slack adapter. ``text`` is the
     report itself, the fallback the gateway posts when it does not lay the
     message out. None for a report past the fold's cap: the fold would be its only
     Slack copy, so it goes out whole as text rather than clipped.

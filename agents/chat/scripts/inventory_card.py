@@ -13,8 +13,8 @@ the queue line, the scan's checks folded, and the buttons. Nothing here reads
 with its reason, and the caller posts the text instead.
 
 :func:`chat` is the card as a ``kube-agents.chat/v1`` message for
-``spec.mode: next``, :func:`blocks` the same card as Block Kit for the
-today door, each with the fallback text the door posts when it cannot lay the
+the gateway, :func:`blocks` the same card as Block Kit for the
+Slack relay door, each with the fallback text the door posts when it cannot lay the
 card out.
 
 ``FIX_FIRST``, ``FIX_ONLY`` and ``COUNT_WORDS`` are ``inventory_presenter``'s
