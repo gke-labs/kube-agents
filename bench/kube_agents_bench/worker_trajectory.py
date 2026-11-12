@@ -191,6 +191,12 @@ CLIP_GAPS = {"cards": TRUNCATED_GAP, "calls": CALL_CAP_GAP}
 # ``results.json``, so this entry is how the scorer learns that a record's
 # worker entries are incomplete (``scoring._inject_lane_view``).
 GAP_ENTRY = "harness_worker_capture_gaps"
+# What ``_settle`` writes when every card it awaited ended by an explicit
+# close (done, or a ``kanban_block`` kind), the capture and the logs are
+# clean, and the capture holds no worker entry: the workers made no call at
+# all, so a check scoped to them grades zero calls rather than an
+# unobservable subject. Harness-written, like GAP_ENTRY.
+NO_WORKER_CALLS_ENTRY = "harness_no_worker_calls"
 # What the inject wait records under it when it keeps a turn's worker
 # entries off the trajectory (``harness.KubeAgentsHarness`` withholds them on
 # a turn whose door showed no trace).
@@ -733,6 +739,11 @@ def gaps(summary: dict[str, Any] | None) -> list[str] | None:
 def gap_entry(problems: list[str]) -> dict[str, Any]:
     """The :data:`GAP_ENTRY` trajectory entry for a capture's gaps."""
     return {"name": GAP_ENTRY, "args": {"gaps": list(problems)}, "status": "completed"}
+
+
+def no_worker_calls_entry(card_ids: list[str]) -> dict[str, Any]:
+    """The :data:`NO_WORKER_CALLS_ENTRY` trajectory entry for the cards that ended with no worker call."""
+    return {"name": NO_WORKER_CALLS_ENTRY, "args": {"cards": list(card_ids)}, "status": "completed"}
 
 
 def parents(summary: dict[str, Any] | None) -> dict[str, str] | None:
