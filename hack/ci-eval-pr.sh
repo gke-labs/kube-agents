@@ -2512,9 +2512,11 @@ scheduled_audits() { # <pause|chain|resume> <label>
 # stop_chain_audits_watch sends TERM. A nap ends at once; a pass under way runs to its
 # end, since bash runs a trap only once the foreground command returns, and killing
 # the subshell alone would leave that pass's exec running to pause after the EXIT
-# trap's resume. A pass that outlasts the wait still leaves its pauses recorded: the
-# script writes the record again after each pause, and the resume keeps the record,
-# and asks for its retry, while any job it names is paused.
+# trap's resume. A pass that outlasts the wait almost always leaves its pauses
+# recorded, for the next run's resume or the oobe-first-run-audits arm to lift: the
+# script writes the record again after each pause, and a resume that sees a job it
+# names paused at its read-back keeps the record and asks for its retry. Only a pause
+# landing between that read-back and the record's removal goes unrecorded.
 start_chain_audits_watch() {
   local pidfile="${STATE_DIR}/${EVAL_CHAIN_AUDITS_PID_FILE}" running="${STATE_DIR}/${EVAL_CHAIN_AUDITS_RUNNING_FILE}" owner=$$
   : > "${running}"

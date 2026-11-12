@@ -68,6 +68,11 @@ FAKE_HERMES = textwrap.dedent('''\
             os.remove(os.path.join(home, ".ci-paused-audits.json"))
         except FileNotFoundError:
             pass
+    if mode.startswith("block-record-at:") and sys.argv[4] == "pause" and sys.argv[5] == mode.split(":", 1)[1]:
+        record = os.path.join(home, ".ci-paused-audits.json")
+        os.remove(record)
+        os.mkdir(record)
+        os.mkdir(record + ".tmp")
     if mode.startswith("late-pause:") and sys.argv[4] == "resume":
         # A watch pass still under way pauses this job while the resume runs.
         late = mode.split(":", 1)[1]
@@ -483,6 +488,14 @@ class ChainTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(store[STAGE_FIVE[2]]["state"], "paused")
         self.assertIn(STAGE_FIVE[2], json.loads((self.home / ".ci-paused-audits.json").read_text()))
+
+    def test_a_record_that_cannot_be_written_again_is_named(self):
+        self.write_roster(self.five())
+        self.write_stage(fired=STAGE_FIVE, done=True)
+        # The first write lands; the record is then made a directory, so the rewrite fails.
+        result, store = self.run_script(mode=f"block-record-at:{STAGE_FIVE[1]}", chain=True)
+        self.assertEqual(store[STAGE_FIVE[1]]["state"], "paused")
+        self.assertIn(f"record not written again after pausing {STAGE_FIVE[1]}", result.stdout)
 
     def test_a_pause_landing_during_the_resume_keeps_the_record_for_the_retry(self):
         first, late = STAGE_FIVE[:2]

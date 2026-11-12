@@ -58,7 +58,8 @@ outlives it would otherwise leave five audits off for good.
 Prints one line naming what it did. Exit codes, which the caller's retry reads:
 0 done; 1 worth another try (a pause that timed out, a store it couldn't read
 back, a marker still missing after the last round, which is another writer
-still at work); 3 decided, so a retry would only repeat it (its inputs are
+still at work; on --resume, a recorded job paused while it ran, by a pass still
+under way); 3 decided, so a retry would only repeat it (its inputs are
 unreadable, or Hermes refused a pause).
 """
 
@@ -288,6 +289,7 @@ def pause():
     # what it dropped is paused again. A clean read on the last round stands.
     failed, failed_ids, retryable = [], set(), False
     dropped = []
+    unrecorded = []
     pending = list(targets)
     clean_reads = 0
     for round_no in range(PAUSE_ROUNDS):
@@ -311,8 +313,8 @@ def pause():
                 # job not yet paused and may have removed the record, which must still name it.
                 try:
                     write_record(set(read_record()) | {jid})
-                except OSError:
-                    pass
+                except OSError as exc:
+                    unrecorded.append(f"{jid} ({exc})")
         try:
             after = {job["id"]: job for job in jobs_in(ROSTER)}
         except (OSError, ValueError) as exc:
@@ -332,6 +334,7 @@ def pause():
     print(
         f"paused {', '.join(done) or 'nothing'}; left {', '.join(left) or 'nothing'}"
         + (f"; FAILED {', '.join(failed)}" if failed else "")
+        + (f"; record not written again after pausing {', '.join(unrecorded)}" if unrecorded else "")
     )
     if not failed:
         return OK
