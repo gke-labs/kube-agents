@@ -56,8 +56,9 @@ const (
 	// prompt is how that trigger reaches the agent. %s is the kind.
 	feedbackPostTrigger = "TODO: nobody asked; this rates %s the agent posted on its own. Plant the trigger the post reports (the event, the drift, the schedule) as the case's fixture, and write the prompt the way that trigger reaches the agent"
 	// feedbackPostNoTrigger is the transcript's trigger section for such a
-	// post: the trigger is in the post itself.
-	feedbackPostNoTrigger = "Nobody asked: the agent posted this %s on its own. Its trigger is named in the post below."
+	// post. A long report posts in several messages and only the last, which
+	// carries the controls, is kept, so its trigger may be in one before it.
+	feedbackPostNoTrigger = "Nobody asked: the agent posted this %s on its own. The rated message is below. A long report posts in several messages and only the last one, which carries the buttons, is kept, so its trigger may be in an earlier one."
 
 	// The characters JSON writes raw and YAML refuses in a stream, and the
 	// two Unicode separators YAML reads as line breaks.

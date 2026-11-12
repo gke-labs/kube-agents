@@ -240,6 +240,24 @@ func TestGchatHomePostDrawsRatingButtonsAfterItsOwn(t *testing.T) {
 	}
 }
 
+// An edit Chat refuses with the rating buttons is patched once more without
+// them, its own buttons kept, and is not remembered as rated.
+func TestGchatRefusedRatedEditKeepsItsLayout(t *testing.T) {
+	const post = feedbackPostAlertPrefix + "2"
+	a, f, _ := newFeedbackGchatAdapter(t)
+	f.queue["spaces.messages/patch"] = []any{fakeChatAPIError{status: 400, reason: "too many buttons"}, map[string]any{}}
+	if err := a.EditNotifyMessage("spaces/S1", "", "spaces/S1/messages/m9", OutMessage{Text: "x", Chat: gchatFeedbackQuestion(), Feedback: post}); err != nil {
+		t.Fatal(err)
+	}
+	buttons := bodyButtons(t, callBody(t, f.call(1)))
+	if len(buttons) != 3 {
+		t.Fatalf("second patch buttons = %+v, want the 3 drawn alone", buttons)
+	}
+	if r := a.ratingOf("spaces/S1/messages/m9"); r.task != "" {
+		t.Errorf("an edit without the buttons is remembered as rated: %+v", r)
+	}
+}
+
 // A plain text home report is its text and the rating buttons, and the
 // edit that rewrites a rated home alert keeps them.
 func TestGchatHomeTextPostAndItsEditKeepTheRating(t *testing.T) {

@@ -1155,14 +1155,16 @@ func (n *Notifier) postHome(job notifyJob) bool {
 
 // postHomeText posts m's text as one home message: with its rating controls
 // when it is marked for rating and the backend draws them on a home post
-// (notifyChatPoster), and as plain text otherwise or when that post fails.
+// (notifyChatPoster), and as plain text otherwise or when the backend
+// refuses the controls. Any other failure is returned as it is: the post
+// may have landed, and a second one would post it twice.
 func (n *Notifier) postHomeText(home, thread string, m OutMessage) (message, landed string, err error) {
 	if poster, lays := n.poster.(notifyChatPoster); lays && m.Feedback != "" {
 		message, landed, err = poster.PostNotifyMessage(home, thread, OutMessage{Text: m.Text, Feedback: m.Feedback})
-		if err == nil {
-			return message, landed, nil
+		if !errors.Is(err, ErrLayoutRefused) {
+			return message, landed, err
 		}
-		n.log.Warn("notify: the rated home post failed; posting it without rating controls", "home", home, "thread", thread, "err", err)
+		n.log.Warn("notify: the rated home post was refused; posting it without rating controls", "home", home, "thread", thread, "err", err)
 	}
 	return n.poster.PostNotify(home, thread, m.Text)
 }

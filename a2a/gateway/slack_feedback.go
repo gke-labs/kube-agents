@@ -299,7 +299,7 @@ func slackFeedbackModal(meta slackFeedbackMeta, days int, askKept bool) slack.Mo
 	return slack.ModalViewRequest{
 		Type:            slack.VTModal,
 		CallbackID:      slackFeedbackCallback,
-		Title:           slack.NewTextBlockObject(slackPlainText, feedbackNoteTitle, false, false),
+		Title:           slack.NewTextBlockObject(slackPlainText, feedbackNoteTitleFor(meta.Task), false, false),
 		Submit:          slack.NewTextBlockObject(slackPlainText, feedbackNoteSend, false, false),
 		Close:           slack.NewTextBlockObject(slackPlainText, feedbackNoteCancel, false, false),
 		PrivateMetadata: string(raw),

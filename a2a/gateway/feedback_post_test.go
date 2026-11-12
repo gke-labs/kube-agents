@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -236,5 +237,53 @@ func TestPostRatingWordsAreAPosts(t *testing.T) {
 	}
 	if got := slackFeedbackThanksFor(feedbackPostAlertPrefix + "0"); !strings.HasPrefix(got, feedbackPostThanksLine) {
 		t.Errorf("post thanks = %q", got)
+	}
+	if feedbackNoteTitleFor(feedbackPostAlertPrefix+"0") != feedbackPostNoteTitle || feedbackNoteTitleFor("task-1") != feedbackNoteTitle {
+		t.Error("the note's title must be a post's for a post and an answer's for an answer")
+	}
+	// Slack caps a modal's title at 24 characters.
+	if n := len([]rune(feedbackPostNoteTitle)); n > 24 {
+		t.Errorf("post note title is %d characters, over Slack's 24", n)
+	}
+}
+
+// failingRatedPoster lays home posts out but fails every rated one with err.
+type failingRatedPoster struct {
+	*fakeNotifyPoster
+	err   error
+	tries int
+}
+
+func (f *failingRatedPoster) PostNotifyMessage(space, thread string, m OutMessage) (string, string, error) {
+	if m.Feedback != "" {
+		f.tries++
+		return "", "", f.err
+	}
+	return f.PostNotify(space, thread, m.Text)
+}
+
+// A rated home post the backend refuses posts as plain text; one that fails
+// for any other reason (a timeout, an outage) may have landed, so it is not
+// posted a second time.
+func TestNotifyRatedHomePostFallsBackOnlyOnARefusal(t *testing.T) {
+	for _, c := range []struct {
+		name      string
+		err       error
+		wantPosts int
+		wantError bool
+	}{
+		{"refused", fmt.Errorf("%w: fake", ErrLayoutRefused), 1, false},
+		{"timed out", errors.New("context deadline exceeded"), 0, true},
+	} {
+		p := &failingRatedPoster{fakeNotifyPoster: &fakeNotifyPoster{landsIn: testHomeThread}, err: c.err}
+		n, err := NewGchatNotifier(p, testHome, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n.SetConversations(&postFeedbackConversations{fakeConversations: &fakeConversations{}})
+		got := serveJSON(t, n, lib.NotifyRequest{Text: "Nightly: 3 clusters healthy."})
+		if p.tries != 1 || len(p.all()) != c.wantPosts || (got.Error != "") != c.wantError {
+			t.Errorf("%s: rated tries = %d, plain posts = %d, reply = %+v; want 1, %d, error %v", c.name, p.tries, len(p.all()), got, c.wantPosts, c.wantError)
+		}
 	}
 }

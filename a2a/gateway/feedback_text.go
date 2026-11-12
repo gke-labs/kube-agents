@@ -35,6 +35,7 @@ const (
 	// only the post is kept.
 	feedbackPostGoodLabel  = "Useful"
 	feedbackPostBadLabel   = "Not useful"
+	feedbackPostNoteTitle  = "What made it not useful?"
 	feedbackPostKeptLine   = "This post is kept on your install for %s so an operator can turn it into a test."
 	feedbackPostThanksLine = "Thanks. I kept this post for your team to review."
 )
@@ -47,6 +48,15 @@ func feedbackLabels(task string) (good, bad string) {
 		return feedbackPostGoodLabel, feedbackPostBadLabel
 	}
 	return feedbackGoodLabel, feedbackBadLabel
+}
+
+// feedbackNoteTitleFor is the title of the note a 👎 on the message rated
+// under task asks for: a post's own when task names one.
+func feedbackNoteTitleFor(task string) string {
+	if postKindOf(task) != "" {
+		return feedbackPostNoteTitle
+	}
+	return feedbackNoteTitle
 }
 
 // feedbackKeptTextFor is feedbackKeptText for the message rated under task:

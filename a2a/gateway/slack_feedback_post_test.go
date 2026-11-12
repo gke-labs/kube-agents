@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/slack-go/slack"
+
 	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
 )
 
@@ -109,6 +111,44 @@ func TestSlackHomeBlocksReportCarriesTheRating(t *testing.T) {
 	got := decodedBlocks(t, blocks)
 	if len(got) != 2 || got[1]["type"] != slackContextActionsBlock {
 		t.Errorf("blocks = %s, want the report then the rating controls", blocks)
+	}
+}
+
+// refusingRatedSlackAPI is fakeSlackAPI refusing, as invalid_blocks, every
+// post that carries the rating controls.
+type refusingRatedSlackAPI struct {
+	*fakeSlackAPI
+	refused int
+}
+
+func (f *refusingRatedSlackAPI) PostMessage(channelID string, options ...slack.MsgOption) (string, string, error) {
+	if blocks := sentUpdateForm(channelID, "", options...).Get("blocks"); strings.Contains(blocks, slackContextActionsBlock) {
+		f.refused++
+		return "", "", slack.SlackErrorResponse{Err: "invalid_blocks"}
+	}
+	return f.fakeSlackAPI.PostMessage(channelID, options...)
+}
+
+// A rated home post Slack refuses posts once more without the controls, its
+// own layout and buttons kept; so does a rated Block Kit report.
+func TestSlackRefusedRatedHomePostKeepsItsLayout(t *testing.T) {
+	a, api := newRatedHomeSlackAdapter()
+	refusing := &refusingRatedSlackAPI{fakeSlackAPI: api}
+	a.api = refusing
+	if _, _, err := a.PostNotifyMessage("C0HOME", "", testDriftAlert()); err != nil {
+		t.Fatal(err)
+	}
+	raw := json.RawMessage(`[{"type":"section","text":{"type":"mrkdwn","text":"x"}}]`)
+	if _, _, err := a.PostNotifyBlocks("C0HOME", "", "x", raw, feedbackPostReportPrefix+"4"); err != nil {
+		t.Fatal(err)
+	}
+	if refusing.refused != 2 || len(api.postOptions) != 2 {
+		t.Fatalf("refused = %d, posted = %d; want each refused once and posted once without the controls", refusing.refused, len(api.postOptions))
+	}
+	blocks, _ := sentBlocks(t, api.postOptions[0])
+	got := decodedBlocks(t, blocks)
+	if got[len(got)-1]["type"] != slackBlockActionsT {
+		t.Errorf("the alert reposted as %s, want its layout with its own buttons", blocks)
 	}
 }
 

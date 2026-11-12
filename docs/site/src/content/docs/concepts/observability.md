@@ -225,10 +225,11 @@ The agent's labels are `agent_namespace` and `agent`, not `namespace` and `name`
 
 #### Answer feedback across installs
 
-Two metric series carry answer ratings as counts, read by a collector you run. Neither carries a note, a question, an answer or a user; the collector adds the project, location and cluster it scraped. The text of a rating stays on the install unless you take it out with the gateway's [feedback export](/kube-agents/concepts/chatops/#answer-feedback), which writes the question, answer and note:
+Three metric series carry ratings as counts, read by a collector you run. Neither carries a note, a question, an answer or a user; the collector adds the project, location and cluster it scraped. The text of a rating stays on the install unless you take it out with the gateway's [feedback export](/kube-agents/concepts/chatops/#answer-feedback), which writes the question, answer and note:
 
 - `kubeagents_platformagent_usage{field="negativeFeedbackTotal"}` and `{field="positiveFeedbackTotal"}`, the operator's gauges of each install's thumbs-downs and thumbs-ups, beside `{field="chatMessagesInboundTotal"}` for its chat messages. On `today` the thumbs-downs are Slack reactions through the Hermes gateway and there is no thumbs-up count; on `next` both come from the answer feedback controls below. `{field="autonomousNegativeFeedbackTotal"}` and `{field="autonomousPositiveFeedbackTotal"}` are the same ratings on the posts the agent made on its own, alerts and reports, kept out of the answer counts (`next` only). One scrape of the operator covers every install in its cluster.
 - `kubeagents_a2a_gateway_answer_feedback_total{platform, rating, answer}`, the 👍 and 👎 on a `next` install's [answer feedback](/kube-agents/concepts/chatops/#answer-feedback) controls, straight from its A2A gateway, one count per rating change; `answer` splits the agent's own replies from card reports.
+- `kubeagents_a2a_gateway_post_feedback_total{platform, rating, kind}`, the same controls on the alerts (`kind="alert"`) and reports (`kind="report"`) a `next` install's agent posts on its own, counted apart from answers.
 
 Managed Prometheus writes every cluster's samples to its project with `project_id`, `location` and `cluster` labels. A Cloud Monitoring [metrics scope](https://cloud.google.com/monitoring/settings) that monitors several projects lets one PromQL query read all of them. These queries give a fleet view:
 

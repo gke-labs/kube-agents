@@ -921,10 +921,23 @@ func (s *SlackAdapter) PostNotifyBlocks(channel, thread, text string, raw json.R
 		return "", "", fmt.Errorf("slack: not a channel id: %q", channel)
 	}
 	if s.rates(OutMessage{Feedback: feedback}) {
-		if raw, err = slackWithFeedbackBlock(raw, feedback); err != nil {
-			return "", "", fmt.Errorf("slack: blocks: %w", err)
+		// Blocks that do not decode with the controls added post as they
+		// came, and so does a report Slack refuses with them: the rating
+		// must not cost the report its post.
+		var probe slack.Blocks
+		if rated, err := slackWithFeedbackBlock(raw, feedback); err == nil && json.Unmarshal(rated, &probe) == nil {
+			message, landed, err = s.postNotifyBlocks(channel, thread, text, rated)
+			if !errors.Is(slackLayoutError(err), ErrLayoutRefused) {
+				return message, landed, err
+			}
+			s.log.Warn("slack: a rated Block Kit home post was refused; posting it without the rating controls", "channel", channel, "err", err)
 		}
 	}
+	return s.postNotifyBlocks(channel, thread, text, raw)
+}
+
+// postNotifyBlocks is one PostNotifyBlocks attempt with raw as the blocks.
+func (s *SlackAdapter) postNotifyBlocks(channel, thread, text string, raw json.RawMessage) (message, landed string, err error) {
 	var blocks slack.Blocks
 	if err := json.Unmarshal(raw, &blocks); err != nil {
 		return "", "", fmt.Errorf("slack: blocks: %w", err)
@@ -955,8 +968,25 @@ func (s *SlackAdapter) PostNotifyMessage(channel, thread string, m OutMessage) (
 	if !slackIsHomeChannelID(channel) {
 		return "", "", fmt.Errorf("slack: not a channel id: %q", channel)
 	}
+	if !s.rates(m) {
+		m.Feedback = ""
+	}
+	message, landed, err = s.postNotifyMessage(channel, thread, m)
+	if m.Feedback != "" && errors.Is(err, ErrLayoutRefused) {
+		// The rating controls must not cost the post its layout (a drift
+		// alert's own buttons): the same message once more without them.
+		s.log.Warn("slack: a rated home post was refused; posting it without the rating controls", "channel", channel, "err", err)
+		m.Feedback = ""
+		message, landed, err = s.postNotifyMessage(channel, thread, m)
+	}
+	return message, landed, err
+}
+
+// postNotifyMessage is one PostNotifyMessage attempt, with the rating
+// controls when m is marked for rating.
+func (s *SlackAdapter) postNotifyMessage(channel, thread string, m OutMessage) (message, landed string, err error) {
 	var opts []slack.MsgOption
-	if s.rates(m) {
+	if m.Feedback != "" {
 		opts, err = slackRatedOptions(m)
 	} else {
 		opts, err = slackMessageOptions(m)

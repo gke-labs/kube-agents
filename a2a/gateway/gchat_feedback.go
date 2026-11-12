@@ -559,7 +559,7 @@ func gchatNoteCardOf(widgets ...map[string]any) map[string]any {
 // Cancel.
 func gchatNoteCard(task string, days int, askKept bool) map[string]any {
 	return gchatNoteCardOf(
-		map[string]any{gchatTextParagraphKey: map[string]any{"text": feedbackNoteTitle}},
+		map[string]any{gchatTextParagraphKey: map[string]any{"text": feedbackNoteTitleFor(task)}},
 		map[string]any{gchatTextInputKey: map[string]any{
 			"name":       gchatNoteInputName,
 			"label":      feedbackNoteLabel,
