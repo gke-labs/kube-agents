@@ -1,12 +1,11 @@
 # The Operator's Namespaced Write Verbs
 
-> **STATUS — proposed; awaiting a ruling.** Pull request #5145 (open at the time of writing; it
-> closes #4906) moves the Secret write verbs off the operator ClusterRole into a namespaced Role in
-> the install namespace; on `main` before it merges, the ClusterRole still carries them. This
-> document is the follow-up that change named: the write verbs on every other namespaced kind the
-> operator renders. It lays out the two shapes the review thread raised, the guard each needs, and a
-> recommendation. Nothing here ships until an owner rules; the implementation is prepared on a
-> branch and opens after #5145 merges.
+> **STATUS — proposed; awaiting a ruling.** Pull request #5145 (merged 2026-11-11 as `e5285b4a4`;
+> it closes #4906) moved the Secret write verbs off the operator ClusterRole into a namespaced Role
+> in the install namespace. This document is the follow-up that change named: the write verbs on
+> every other namespaced kind the operator renders. It lays out the two shapes the review thread
+> raised, the guard each needs, and a recommendation. Nothing here ships until an owner rules; the
+> implementation is prepared on a branch and opens after the ruling.
 
 **Scope:** which verbs on the operator's ClusterRole (`k8s-operator/config/rbac/role.yaml`,
 rendered from the `+kubebuilder:rbac` markers in
@@ -120,23 +119,33 @@ each kind stays without `namespace=`.
 
 Objects. In the install namespace: the Role (`kubeagents-manager-role` under kustomize,
 `<release>-operator-namespaced-role` under Helm) and its RoleBinding, both existing. In the profile
-namespace: a second Role with the same rules and a RoleBinding, new. The chart renders the rules
-block once, inside a named template, and ranges over the two namespaces (the profile namespace only
-under `mode: next`, where `profiles-namespace.yaml` creates it); `hack/sync-chart-manifests.sh`
-keeps splicing one block between the `GENERATED NAMESPACED RULES` markers. Kustomize's
-`config/default` rewrites every namespaced object to the install namespace, so the profile
-namespace's copy cannot live there: it is a `config/profiles` kustomization (the namespace with the
-markers the operator requires, the Role, the RoleBinding) that `make deploy` applies after
-`config/default`. Today kustomize renders no profile namespace at all, so this is the first time
-that path carries one.
+namespace: a second Role with the same rules and a RoleBinding, new. The chart renders the Role and
+its RoleBinding once per namespace from one `range` over the namespaces (the profile namespace only
+under `mode: next`, where `profiles-namespace.yaml` creates it), with the spliced rules block
+inline rather than in a named template: `hack/sync-chart-manifests.sh` keeps splicing one block
+between the `GENERATED NAMESPACED RULES` markers, and the conformance harness's text reader would
+drop an `include` line (§3 Guard). Kustomize's `config/default` rewrites every namespaced object to
+the install namespace, so the profile namespace's copy cannot live there: it is a `config/profiles`
+kustomization (the namespace with the markers the operator requires, the Role, the RoleBinding)
+that `make deploy` applies after `config/default`. Kustomize also refuses a resource above the
+kustomization's own directory, so that Role is a copy of the Role document,
+`config/profiles/role.yaml`, written by `make chart-sync` and diffed by `make chart-check`: shape
+(a)'s one generated artefact beyond `role.yaml` itself. Today kustomize renders no profile
+namespace at all, so this is the first time that path carries one.
 
 Guard. `test_C5_the_operators_secret_grant_is_namespaced` becomes
-`test_C5_the_operators_write_verbs_are_namespaced`: on both sources (`operator_clusterrole`,
-`chart_operator_rbac`), no ClusterRole rule names a kind in the inventory, or `*`, with a verb
-outside `get`/`list`/`watch`; the set of kinds the Role document names equals the inventory
-(equality, not a subset, or a kind dropped from the Role passes), and its verbs are write verbs
-only (plus `get` and `list` on `dispatchjobtemplates`); and the chart renders the Role in the
-profile namespace as well. `hack/conformance-mutations.py` re-cuts
+`test_C5_the_operators_write_verbs_are_namespaced`. Its sources are `role.yaml`
+(`operator_clusterrole`) and a rendered chart: `helm template` with `platformAgent.mode=next`,
+through a new harness helper. The existing `chart_operator_rbac` source goes through
+`helm_documents`, which reads the template as text and drops every template line, so a `range`
+collapses to one Role and a Role whose rules arrive through an `include` reads as a Role with no
+rules; a text read cannot check the chart half, and the rendered read is what the kustomize half
+already uses in `tests/test_operator_secrets_grant.py`. On both sources: no ClusterRole rule names
+a kind in the inventory, or `*`, with a verb outside `get`/`list`/`watch`; the set of kinds the Role
+document names equals the inventory (equality, not a subset, or a kind dropped from the Role
+passes), and its verbs are write verbs only (plus `get` and `list` on `dispatchjobtemplates`); and
+the rendered chart carries the Role and its RoleBinding in the install namespace and the profile
+namespace. `hack/conformance-mutations.py` re-cuts
 `C5-operator-secrets-cluster-wide`: its anchor is the adjacent pair `configmaps`,
 `persistentvolumeclaims`, which controller-gen sorts apart on the ClusterRole's read rule once the
 write verbs leave and keeps adjacent in the Role document, so the first-occurrence replace would
@@ -166,12 +175,14 @@ it cannot render a second ClusterRole. So the markers keep `namespace=` (the Rol
 generated source of the write rules and `TestRequiredPermissionsMatchTheGeneratedRole` keeps
 parsing it), and each delivery path renders those rules under a different kind: the chart's
 template changes `kind: Role` to `kind: ClusterRole` around the spliced block and names it
-`<release>-<namespace>-operator-write-role`; kustomize needs a generated file, because kustomize
-cannot change a kind — a step in `make manifests` writes
-`config/rbac/write_clusterrole.yaml` from the Role document, and a test holds the two equal.
-RoleBindings in the install namespace and the profile namespace reference the ClusterRole; the
-profile namespace's binding has the same `config/profiles` home on the kustomize path as in shape
-(a), but with no rules to keep in step.
+`<release>-<namespace>-operator-write-role`; kustomize changes the kind in place, with a patch on
+the Role document in `config/rbac` under `patches[].options.allowKindChange: true`, which the
+pinned kustomize v5.4.2 (`KUSTOMIZE_VERSION` in `k8s-operator/Makefile`) supports: a build of the
+Role document with that patch emits `kind: ClusterRole` carrying the Role's rules, verified against
+that binary. No generated file, no extra `make` step and no parity test. RoleBindings in the
+install namespace and the profile namespace reference the ClusterRole; the profile namespace's
+binding has the same `config/profiles` home on the kustomize path as in shape (a), and that
+kustomization holds the RoleBinding alone: no Role copy, because a binding carries no rules.
 
 Guard. The C5 test becomes `test_C5_the_operators_write_clusterrole_is_never_bound_cluster_wide`:
 exactly one ClusterRole carries a write verb on an inventory kind (the write ClusterRole, by name),
@@ -184,9 +195,11 @@ RoleBinding's `kind` to `ClusterRoleBinding` in `namespaced_role_binding.yaml` a
 template (the bound the test exists for), one plants a write verb on the manager ClusterRole as
 today. Both `KILLED`. `tests/test_operator_secrets_grant.py`'s
 `test_the_cluster_role_grants_no_secret_write_verb` inverts: the write ClusterRole must carry the
-Secret verbs and must not be cluster-bound. Trivy flags the write ClusterRole under KSV-0041
-regardless of its bindings; the path-scoped exemption on `k8s-operator/config/rbac/**` already
-covers the generated file, so only its comment changes, and it has to say the object is unbound.
+Secret verbs and must not be cluster-bound. Trivy flags a ClusterRole that names Secrets under
+KSV-0041 regardless of its bindings; under kustomize the kind changes at build time and the source
+stays a Role document, which the exemption on `k8s-operator/config/rbac/**` covers already, while
+the chart template says `kind: ClusterRole` in text, so a scan of `charts/` would need the
+exemption widened to it, with a comment that says the object is never bound cluster-wide.
 
 What it costs. The object exists cluster-wide under a name one `kubectl create clusterrolebinding`
 away from the pre-change shape, and the guard holds shipped manifests only. An auditor reading
@@ -247,23 +260,37 @@ again.
 ## 7. Recommendation
 
 Shape (a), extended to the whole inventory, with the profile namespace rendered by the chart and by
-a `config/profiles` kustomization.
+a `config/profiles` kustomization — by a narrower margin than the first version of this document
+claimed. That version charged shape (b) with a generated ClusterRole file, an extra `make` step and
+a parity test, on the claim that kustomize cannot change a kind; it can (§4), so those costs are
+gone, and shape (a) carries a generated copy of its own (§3, `config/profiles/role.yaml`). The
+comparison with both costs stated:
 
-- It is the mechanism that already ships and that controller-gen renders natively: one marker
-  attribute, one generated Role document, no second generator and no kind swap. Shape (b) adds a
-  generated ClusterRole file and a parity test to hold it to the Role document.
-- Its invariant is the one an auditor can check by reading one object: no ClusterRole grants a write
-  verb on a namespaced kind. Shape (b)'s invariant is about bindings, which is the same bound held
-  one object further from the grant, and leaves a cluster-wide write ClusterRole in the tree for the
-  next audit to file again.
-- The stale-copy case shape (b) removes is the `PlatformAgent` outside the install namespace, which
-  no install path produces, no shipped manifest places, and the webhook does not require. For the
-  profile namespace, which the chart creates, the chart renders the copy from the same generated
-  block, so it cannot drift.
+- Generated artefacts. (a): the Role document plus its copy for `config/profiles`, written and
+  checked by the chart-sync pair. (b): the Role document alone; the kind changes at render time on
+  both paths. (b) is simpler here.
+- Stale copies. (a): a hand-managed namespace (a `PlatformAgent` outside the install namespace, or
+  a profile namespace made by hand before `make deploy` carried one) holds a Role copy that is stale
+  the next time a marker gains a verb; the self-check reports it and nothing else does. (b): one
+  RoleBinding per namespace, which has nothing to go stale. (b) wins, on a case no install path
+  produces, no shipped manifest places, and the webhook does not require.
+- What an auditor sees. (a): no ClusterRole grants a write verb on a namespaced kind; reading the
+  ClusterRoles and running `kubectl auth can-i --all-namespaces` give the same answer. (b): a
+  ClusterRole that grants cluster-wide `create` on Secrets, Pods and ServiceAccounts exists on every
+  install; `can-i --all-namespaces` says `no`, and a reader has to find the bindings to learn why,
+  while a scanner that reads roles (Trivy's KSV-0041 is CRITICAL on it, and the audit that filed
+  #4906 read the ClusterRole) flags it on every run. (a) wins, on every install.
+- Guard. The same bound held one object apart; both halves need a rendered chart source. Tie.
+- Continuity. (a) is the shape #5145 shipped and the shape #4906 asked for in words ("a
+  Role/RoleBinding in the Helm chart instead of a cluster-wide ClusterRole grant"). (a), weakly.
 
-Switch to shape (b) if a `PlatformAgent` outside the install namespace becomes a supported shape, or
-if the operator ever writes into a namespace the chart does not create. The switch is a kind change
-in two templates and the guard flip in §4.
+The recommendation holds because the cost shape (b) removes falls on a namespace nobody ships, and
+the cost it adds falls on every audit of every install. It is a judgment about weights, and the
+ruling is the owners': if a `PlatformAgent` outside the install namespace is a shape to support, or
+hand-managed namespaces weigh more than the scanner surface, shape (b) is the right choice. The
+switch is a kind change in the chart template, a kustomize patch, the guard flip in §4, and the
+removal of the `config/profiles` Role copy; nothing in the prepared implementation stands in its
+way.
 
 ## 8. Decisions for the owner
 
