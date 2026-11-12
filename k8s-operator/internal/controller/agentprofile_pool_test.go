@@ -216,7 +216,7 @@ func TestWarmPoolsFollowTheProfilesInteractiveTiers(t *testing.T) {
 	}
 
 	reconcile(profile)
-	t.Setenv(a2aDispatcherImageEnvVar, "")
+	t.Setenv(a2aProfileDispatcherEnvVar, "false")
 	reconcile(profile)
 	if err := pool("read"); !apierrors.IsNotFound(err) {
 		t.Errorf("a pool survived the dispatcher being turned off: %v", err)
@@ -507,7 +507,7 @@ func TestGateOffRemovesThePoolsWhateverElseFails(t *testing.T) {
 		t.Fatalf("setup: no pool: %v", err)
 	}
 
-	t.Setenv(a2aDispatcherImageEnvVar, "")
+	t.Setenv(a2aProfileDispatcherEnvVar, "false")
 	if _, err := r.reconcileA2ADispatcher(ctx, agent, []agentv1alpha1.AgentProfile{p}, true); err == nil {
 		t.Error("the refused dispatcher delete wasn't reported")
 	}

@@ -37,6 +37,7 @@ from agent_common_server import _run_env, CONFIG_PATH, DOTENV_PATH
 import board_health_card
 import board_snapshot
 import chat_notify
+import clean_merges
 import cron_schedule
 import findings_queue
 import gitops_workspace
@@ -11028,6 +11029,21 @@ def get_board() -> Dict[str, Any]:
                 return board_snapshot.snapshot(session_db, kanban, datetime.now(timezone.utc))
     except Exception as exc:  # noqa: BLE001 — a source that cannot be read is a 503, whatever raised
         raise HTTPException(status_code=503, detail=f"the board could not be read: {exc}") from None
+
+
+@app.get("/v1/post-merge/clean-merges", dependencies=[Depends(verify_api_key)])
+def get_clean_merges(repo: str = "") -> Dict[str, Any]:
+    """Clean merges per repository, kind of fix and environment (`clean_merges.py`), for the offer and the dial.
+
+    `repo` narrows the answer to one repository. A database that cannot be read,
+    or a records table without a column the count needs, is a 503, never zero
+    clean merges.
+    """
+    try:
+        with closing(_read_only(SESSION_KV_DB_PATH)) as conn:
+            return clean_merges.track_record(conn, datetime.now(timezone.utc), repo=repo.strip() or None)
+    except (sqlite3.Error, clean_merges.SchemaIncomplete) as exc:
+        raise HTTPException(status_code=503, detail=f"the post-merge records could not be read: {exc}") from None
 
 
 @app.get("/v1/findings/ranked", dependencies=[Depends(verify_api_key)])
