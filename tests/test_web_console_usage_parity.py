@@ -64,19 +64,30 @@ RENAMED_CONSTANTS = (
     ("usageSummaryUnavailable", "usageUnavailable"),
 )
 RENAMED_NUMBERS = (("usageSummaryMicrosPerUSD", "usageMicrosPerUSD"),)
-# Every function of the gateway file that reads status.usage by a literal key, and the
-# console's lists that together are its allowlist.
+# Every function of the gateway file that reads status.usage by a literal key or through a
+# constant (any `usage`-prefixed identifier, whatever its suffix), and the console's lists and
+# its decoder's constant reads, which together are its allowlist.
 GATEWAY_USAGE_READERS = ("func renderUsageSummary(", "func renderTopTools(", "func usageSummaryOriginLine(")
 LITERAL_READ_RE = re.compile(r'usage\["([A-Za-z0-9]+)"\]')
+CONSTANT_READ_RE = re.compile(r"usage\[(usage\w+)\]")
 CONSOLE_ALLOWLIST_VARS = ("usageCounters", "usageOriginFields", "usageTotalFields", "usageTimestampFields")
-CONSOLE_ALLOWLIST_CONSTANTS = ("usageActiveInterfacesField", "usageTopToolsKey")
+CONSOLE_DECODER = "func decodeUsage("
+DECODER_READ_RE = re.compile(r"raw\[(usage\w+)\]")
 
 QUOTED_RE = re.compile(r'"([A-Za-z0-9]+)"')
-# The render's format strings: the gateway's renderTopTools is the console's line for line, and
-# the usage and performance lines of the gateway's render are among the console's.
+# The render's format strings: the gateway's renderTopTools is the console's line for line. The
+# gateway's render prints an environment section before its usage lines and the chat-turns
+# roll-up after its performance lines; the console prints neither, so its render's format strings
+# are the gateway's between the two markers, in order, and its origin line's are the gateway's
+# origin function's. Equality in both directions: a line shape added to or changed in either file
+# fails here until the other carries it.
 FORMAT_RE = re.compile(r'fmt\.Sprintf\("([^"]*)"')
 TOOLS_RENDER_FUNCS = ("func renderTopTools(", "func renderTopTools(")
-USAGE_RENDER_FUNCS = (("func renderUsageSummary(", "func usageSummaryOriginLine("), ("func renderUsageLines(", "func usageOriginLine("))
+GATEWAY_USAGE_RENDER = "func renderUsageSummary("
+GATEWAY_USAGE_SLICE = ('lines = append(lines, "usage:")', "usageSummaryLatencyNote")
+CONSOLE_USAGE_RENDER = "func renderUsageLines("
+ORIGIN_FUNCS = ("func usageSummaryOriginLine(", "func usageOriginLine(")
+USAGE_RENDER_FORMATS_AT_LEAST = 4
 # Lines the gateway's render spells as literals and the console names as constants.
 LITERAL_LABELS = (('"  lastActive: "', "usageLastActiveLabel"), ('"  lastHumanActive: "', "usageLastHumanActiveLabel"))
 IDENT_RE = re.compile(r"\b(usage\w+)\b")
@@ -166,12 +177,17 @@ class ConsoleCopyTest(unittest.TestCase):
             FORMAT_RE.findall(_func_body(self.gateway, gateway_tools)),
             FORMAT_RE.findall(_func_body(self.console, console_tools)),
         )
-        gateway_funcs, console_funcs = USAGE_RENDER_FUNCS
-        gateway_formats = {f for sig in gateway_funcs for f in FORMAT_RE.findall(_func_body(self.gateway, sig))}
-        console_formats = {f for sig in console_funcs for f in FORMAT_RE.findall(_func_body(self.console, sig))}
-        self.assertEqual(sorted(console_formats - gateway_formats), [], "line shapes the console prints and the gateway does not")
-        self.assertGreaterEqual(len(console_formats), 5)
-        render = _func_body(self.gateway, "func renderUsageSummary(")
+        render = _func_body(self.gateway, GATEWAY_USAGE_RENDER)
+        start_marker, end_marker = GATEWAY_USAGE_SLICE
+        usage_slice = render[render.index(start_marker) : render.index(end_marker)]
+        gateway_formats = FORMAT_RE.findall(usage_slice)
+        self.assertEqual(gateway_formats, FORMAT_RE.findall(_func_body(self.console, CONSOLE_USAGE_RENDER)))
+        self.assertGreaterEqual(len(gateway_formats), USAGE_RENDER_FORMATS_AT_LEAST)
+        gateway_origin, console_origin = ORIGIN_FUNCS
+        self.assertEqual(
+            FORMAT_RE.findall(_func_body(self.gateway, gateway_origin)),
+            FORMAT_RE.findall(_func_body(self.console, console_origin)),
+        )
         for literal, console_name in LITERAL_LABELS:
             self.assertIn(literal, render)
             self.assertEqual(literal.strip('"'), _constant(self.console, console_name))
@@ -179,41 +195,43 @@ class ConsoleCopyTest(unittest.TestCase):
     def test_every_field_the_gateway_renders_is_on_the_console_allowlist(self):
         """A field the gateway's render reads by name, through a list, a constant or a literal,
         is one the console's decoder copies; a new one fails here until usage.go carries it."""
-        rendered = set()
-        for signature in GATEWAY_USAGE_READERS:
-            body = _func_body(self.gateway, signature)
-            rendered.update(LITERAL_READ_RE.findall(body))
-            rendered.update(_constant(self.gateway, name) for name in TOTALS_RENDER_READ_RE.findall(body))
-        for var in ("usageSummaryCounters", "usageSummaryOriginFields"):
-            rendered.update(_go_strings(self.gateway, var))
-        rendered.add(_constant(self.gateway, "usageTopToolsKey"))
+        rendered = self._gateway_rendered_fields()
         self.assertIn("lastHumanActiveTime", rendered)
         self.assertIn("activeInterfaces", rendered)
         self.assertIn("inputTokensTotal", rendered)
-
-        allowed = set()
-        for var in CONSOLE_ALLOWLIST_VARS:
-            body = _var_body(self.console, var)
-            allowed.update(QUOTED_RE.findall(body))
-            allowed.update(_constant(self.console, n) for n in IDENT_RE.findall(body) if n != var and n.endswith("Field"))
-        allowed.update(_constant(self.console, name) for name in CONSOLE_ALLOWLIST_CONSTANTS)
+        self.assertIn("topTools", rendered)
+        allowed = self._console_allowlist()
         self.assertEqual(sorted(rendered - allowed), [], "status.usage fields the gateway renders and the console does not read")
 
     def test_the_console_reads_only_what_the_gateway_renders(self):
         """The copy is not wider than the original: the console's lists name no field the gateway
         does not print, so the allowlist cannot drift into fields nobody audits for names."""
-        gateway_fields = set(_go_strings(self.gateway, "usageSummaryCounters")) | set(_go_strings(self.gateway, "usageSummaryOriginFields"))
-        gateway_fields.update(_constant(self.gateway, n) for n in TOTALS_RENDER_READ_RE.findall(_func_body(self.gateway, TOTALS_RENDER_FUNC)))
+        self.assertEqual(sorted(self._console_allowlist() - self._gateway_rendered_fields()), [])
+
+    def _gateway_rendered_fields(self) -> set[str]:
+        """Every status.usage field the gateway's render reads: by a literal key, through any
+        `usage`-prefixed constant (the three totals, topTools, and whatever is added next), or
+        from its two field lists."""
+        rendered = set()
         for signature in GATEWAY_USAGE_READERS:
-            gateway_fields.update(LITERAL_READ_RE.findall(_func_body(self.gateway, signature)))
-        gateway_fields.add(_constant(self.gateway, "usageTopToolsKey"))
-        console_fields = set()
+            body = _func_body(self.gateway, signature)
+            rendered.update(LITERAL_READ_RE.findall(body))
+            rendered.update(_constant(self.gateway, name) for name in CONSTANT_READ_RE.findall(body))
+        for var in ("usageSummaryCounters", "usageSummaryOriginFields"):
+            rendered.update(_go_strings(self.gateway, var))
+        return rendered
+
+    def _console_allowlist(self) -> set[str]:
+        """Every status.usage field the console's decoder copies: the four lists, and the
+        constants the decoder reads off the raw status by name."""
+        allowed = set()
         for var in CONSOLE_ALLOWLIST_VARS:
             body = _var_body(self.console, var)
-            console_fields.update(QUOTED_RE.findall(body))
-            console_fields.update(_constant(self.console, n) for n in IDENT_RE.findall(body) if n != var and n.endswith("Field"))
-        console_fields.update(_constant(self.console, name) for name in CONSOLE_ALLOWLIST_CONSTANTS)
-        self.assertEqual(sorted(console_fields - gateway_fields), [])
+            allowed.update(QUOTED_RE.findall(body))
+            allowed.update(_constant(self.console, n) for n in IDENT_RE.findall(body) if n != var and n.endswith("Field"))
+        decoder = _func_body(self.console, CONSOLE_DECODER)
+        allowed.update(_constant(self.console, name) for name in DECODER_READ_RE.findall(decoder))
+        return allowed
 
 
 if __name__ == "__main__":
