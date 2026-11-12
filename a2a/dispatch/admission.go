@@ -92,7 +92,7 @@ func (d *Dispatcher) admit(ctx context.Context, del lib.Delivery, snap lib.Dispa
 	env := del.Envelope()
 	tier := hk.tier
 	if prof.DrainsTier(tier) {
-		return nil, &refusal{ReasonTierWithdrawn, fmt.Sprintf("profile %s no longer runs tier %s; it is draining, so tasks already running at it finish and nothing new starts", prof.Name, tier)}, nil
+		return admitted{}, &refusal{ReasonTierWithdrawn, fmt.Sprintf("profile %s no longer runs tier %s; it is draining, so tasks already running at it finish and nothing new starts", prof.Name, tier)}, nil
 	}
 	if !allowsTier(prof, tier) {
 		return admitted{}, &refusal{ReasonTierNotAllowed, fmt.Sprintf("profile %s does not allow tier %s", prof.Name, tier)}, nil
