@@ -2,6 +2,8 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	goerrors "errors"
 	"fmt"
@@ -43,6 +45,11 @@ import (
 // staging claim, so a conversion that cannot finish turns back in this
 // time rather than at the run's two-hour deadline.
 const busMigrationConvertDeadline = 15 * time.Minute
+
+// busMigrationNameHashLength is how many hex characters of a hash stand in
+// for the run in an object name that would otherwise be too long
+// (busMigrationWorkloadName).
+const busMigrationNameHashLength = 10
 
 // busMigrationLeg is the direction of a run.
 type busMigrationLeg string
@@ -317,17 +324,36 @@ func withDeadline(outcome busMigrationOutcome, deadline, now time.Time) busMigra
 // ServiceAccounts, staging claim and run Secret keep the run's name, which a
 // retry reuses.
 func busMigrationWorkName(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus, name string) string {
-	id := run.RunID
-	if n := len(run.Retries); n > 0 {
-		id = fmt.Sprintf("%s-r%d", id, n)
+	return busMigrationWorkloadName(agent, name, busMigrationAttemptID(run.RunID, len(run.Retries)))
+}
+
+// busMigrationAttemptID is the ID a run's attempt names its work with: the
+// run's own for the first, suffixed with the retry after.
+func busMigrationAttemptID(runID string, retry int) string {
+	if retry == 0 {
+		return runID
 	}
-	return busMigrationWorkloadName(agent, name, id)
+	return fmt.Sprintf("%s-r%d", runID, retry)
 }
 
 // busMigrationWorkloadName names a run's objects: its Jobs and pods (through
 // busMigrationWorkName), its ServiceAccounts, staging claim and run Secret.
+// A Job's name goes into its pods' job-name label, which takes 63
+// characters, and the run ID alone is about 15, so a long agent name made a
+// Job the API server refused. A name past 63 keeps the agent name's start
+// and the step, and ends in a hash of the whole name in place of the run:
+// still one name per agent, step, run and attempt, the same on every pass.
+// A name that fits is unchanged, so a run under way keeps its objects
+// across an upgrade.
 func busMigrationWorkloadName(agent *agentv1alpha1.PlatformAgent, step, runID string) string {
-	return fmt.Sprintf("%s-bus-%s-%s", agent.Name, step, runID)
+	name := fmt.Sprintf("%s-bus-%s-%s", agent.Name, step, runID)
+	if len(name) <= maxLabelValueLength {
+		return name
+	}
+	sum := sha256.Sum256([]byte(name))
+	suffix := fmt.Sprintf("-bus-%s-%s", step, hex.EncodeToString(sum[:])[:busMigrationNameHashLength])
+	prefix := agent.Name[:min(len(agent.Name), max(maxLabelValueLength-len(suffix), 0))]
+	return strings.TrimRight(prefix, "-.") + suffix
 }
 
 // busNATSRolledOutAt reports the bus StatefulSet rolled out at replicas: the
@@ -1642,10 +1668,14 @@ func busMigrationRequeue(agent *agentv1alpha1.PlatformAgent) time.Duration {
 // busMigrationPodOfRun reports a pod name as one of the run's work pods
 // (snapshot, hash, the clears, restore and rollback), any attempt.
 func busMigrationPodOfRun(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus, name string) bool {
+	// Each attempt's name is compared whole (busMigrationWorkName): a
+	// shortened name carries a hash, which no prefix of the first attempt's
+	// matches.
 	for _, kind := range []string{"snapshot", "hash", "restore", "rollback", busMigrationClearWork, busMigrationClearBackWork} {
-		base := busMigrationWorkloadName(agent, kind, run.RunID)
-		if name == base || strings.HasPrefix(name, base+"-r") {
-			return true
+		for attempt := 0; attempt <= max(busMigrationMaxRetries, len(run.Retries)); attempt++ {
+			if name == busMigrationWorkloadName(agent, kind, busMigrationAttemptID(run.RunID, attempt)) {
+				return true
+			}
 		}
 	}
 	return false

@@ -2681,6 +2681,57 @@ func TestEachClearingStartsItsOwnRecord(t *testing.T) {
 // the way back) and per attempt (each retry), so no work is ever read off
 // another's finished object. (Found live twice: a retry reading the failed
 // attempt's pod, and the way back's clear reading the forward one's.)
+// A long agent name still yields Job and pod names within the 63
+// characters their job-name label takes: unique per step and attempt, the
+// same on every call, and recognised as the run's pods by the cleanup. A
+// name that fits is unchanged, so a run under way across an upgrade keeps
+// its objects.
+func TestALongAgentNameKeepsRunNamesWithinALabel(t *testing.T) {
+	agent := a2aTestAgent()
+	agent.Name = "platform-agent-for-the-payments-team"
+	run := &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), RunID: "12-1767225600"}
+	steps := []string{"pin", "unpin", "snapshot", "hash", "restore", "rollback", busMigrationClearWork, busMigrationClearBackWork, busMigrationStreamIdentity, "stage", "run"}
+	seen := map[string]string{}
+	for _, step := range steps {
+		for attempt := 0; attempt <= busMigrationMaxRetries; attempt++ {
+			id := busMigrationAttemptID(run.RunID, attempt)
+			name := busMigrationWorkloadName(agent, step, id)
+			if len(name) > maxLabelValueLength {
+				t.Errorf("%s attempt %d: %q is %d characters, over %d", step, attempt, name, len(name), maxLabelValueLength)
+			}
+			if errs := validation.IsDNS1123Label(name); len(errs) > 0 {
+				t.Errorf("%q is not a DNS label: %v", name, errs)
+			}
+			if name != busMigrationWorkloadName(agent, step, id) {
+				t.Errorf("%s attempt %d: the name differs between calls", step, attempt)
+			}
+			key := fmt.Sprintf("%s/%d", step, attempt)
+			if other, ok := seen[name]; ok {
+				t.Errorf("%q names both %s and %s", name, other, key)
+			}
+			seen[name] = key
+			if slices.Contains([]string{"snapshot", "hash", "restore", "rollback", busMigrationClearWork, busMigrationClearBackWork}, step) && !busMigrationPodOfRun(agent, run, name) {
+				t.Errorf("the cleanup does not recognise %q as the run's pod", name)
+			}
+		}
+	}
+	retried := run.DeepCopy()
+	retried.Retries = make([]agentv1alpha1.BusMigrationRetry, 2)
+	if job := buildBusMigrationJob(agent, retried, "unpin", time.Now()); len(job.Name) > maxLabelValueLength {
+		t.Errorf("the unpin Job's name %q is over %d characters", job.Name, maxLabelValueLength)
+	}
+	other := run.DeepCopy()
+	other.RunID = "12-1767225601"
+	if busMigrationPodOfRun(agent, other, busMigrationWorkloadName(agent, "snapshot", run.RunID)) {
+		t.Error("another run's pod is recognised as this run's")
+	}
+
+	short := a2aTestAgent()
+	if got, want := busMigrationWorkloadName(short, "pin", "3-1"), short.Name+"-bus-pin-3-1"; got != want {
+		t.Errorf("a name that fits changed: %q, want %q", got, want)
+	}
+}
+
 func TestEveryRunWorkNameIsUnique(t *testing.T) {
 	agent := a2aTestAgent()
 	seen := map[string]string{}
