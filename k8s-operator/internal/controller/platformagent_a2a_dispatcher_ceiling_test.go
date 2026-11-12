@@ -363,17 +363,18 @@ func twoTierProfiles(agent *agentv1alpha1.PlatformAgent, n int) []agentv1alpha1.
 }
 
 // parameterHeavyProfiles is twoTierProfiles with each profile declaring the
-// most parameters it can, at the longest names. A parameter costs the
-// dispatch config bytes and the dispatcher's identity entry nothing, so the
-// config's limit cuts before the identity's. Since #5485 a Job template is a
-// reference in the config, not the template itself, so Job mode alone no
-// longer reaches that limit first.
+// most parameters it can, at the longest names, each required. A parameter
+// costs the dispatch config bytes and the dispatcher's identity entry
+// nothing, so the config's limit cuts before the identity's. Since #5485 a
+// Job template is a reference in the config, not the template itself, so Job
+// mode alone no longer reaches that limit first, and since #5479 the config
+// doesn't list durables, so only parameters at their largest still do.
 func parameterHeavyProfiles(agent *agentv1alpha1.PlatformAgent, n int) []agentv1alpha1.AgentProfile {
 	profiles := twoTierProfiles(agent, n)
 	for i := range profiles {
 		for j := 0; j < 16; j++ {
 			name := fmt.Sprintf("p%02d_%s", j, strings.Repeat("x", 59))
-			profiles[i].Spec.Parameters = append(profiles[i].Spec.Parameters, agentv1alpha1.AgentProfileParameter{Name: name})
+			profiles[i].Spec.Parameters = append(profiles[i].Spec.Parameters, agentv1alpha1.AgentProfileParameter{Name: name, Required: true})
 		}
 	}
 	return profiles
@@ -495,7 +496,7 @@ func TestDrainingPastTheConfigLimitTearsDownWithAConfigThatFits(t *testing.T) {
 	profiles = profiles[:len(profiles)-len(a2aDispatcherCeilingRefused(agent, profiles))]
 	until := time.Now().Add(a2aDrainingWindow).Truncate(time.Second).UTC()
 	var draining []a2aDispatchProfile
-	for i := 0; i < 600; i++ {
+	for i := 0; i < 300; i++ {
 		draining = append(draining, a2aDispatchProfile{Name: fmt.Sprintf("gone-%04d", i), Tiers: []string{agentv1alpha1.AgentProfileTierRead}, DrainingUntil: until})
 	}
 	entry, _ := a2aDispatcherMapEntry(agent, profiles, draining)
@@ -504,7 +505,7 @@ func TestDrainingPastTheConfigLimitTearsDownWithAConfigThatFits(t *testing.T) {
 	}
 	cond, over, err := a2aDispatcherCeiling(agent, profiles, draining)
 	if err != nil || !over {
-		t.Fatalf("over=%v err=%v: 600 draining entries past the config's reserve didn't read as over", over, err)
+		t.Fatalf("over=%v err=%v: 300 draining entries past the config's reserve didn't read as over", over, err)
 	}
 	if cond.Reason != dispatcherCeilingReasonOver || !strings.Contains(cond.Message, "ConfigMap") || !strings.Contains(cond.Message, "#5479") {
 		t.Errorf("condition %s: %s", cond.Reason, cond.Message)
