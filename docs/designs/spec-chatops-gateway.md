@@ -3042,11 +3042,29 @@ text, so nothing a chat user or an executor sends can mint a series:
 
 The body also carries `process_start_time_seconds`, captured once at start and never
 re-derived, which the operator's usage poller reads to tell an in-place restart from a counter
-that fell. Every series is created at zero, so a `rate()` over a state that has not happened reads 0
-rather than no data. A pull carries at most one event today, so `gchat_events_received_total`
-equals `gchat_pulls_total{outcome="events"}`; they are separate so the first keeps its meaning if a
-pull ever returns more than one. An install that Chat publishes nothing to shows `empty` rising
-and `events` flat; a refused relay shows `failed` rising.
+that fell. Every counter is created at zero, so a `rate()` over a state that has not happened
+reads 0 rather than no data. A pull carries at most one event today, so
+`gchat_events_received_total` equals `gchat_pulls_total{outcome="events"}`; they are separate so
+the first keeps its meaning if a pull ever returns more than one. An install that Chat publishes
+nothing to shows `empty` rising and `events` flat; a refused relay shows `failed` rising.
+
+A Slack gateway adds two unlabelled gauges that are not created at zero, set by the adapter's
+event pump from socketmode's own connection events, which share the channel with the envelopes and
+so arrive in order. `kubeagents_a2a_gateway_slack_connected` is 0 from Run's start and from every
+`connecting` (each dial, the first and every reconnect) and 1 on `connected`;
+`kubeagents_a2a_gateway_slack_last_event_timestamp_seconds` is the time of the last Events API or
+interactive envelope. Neither serves a sample until a Slack adapter runs, and both are disarmed
+when Run ends with its context, as it does on a replica that loses the lease, so a gateway on
+another backend and a standby add nothing to the chart's `KubeAgentsSlackDisconnected` alert,
+which reads the gauge's `max_over_time` over `slackDisconnectedFor`, then its `max` by scrape job.
+A Run that ends in a failure (an `invalid_auth`) leaves the gauge armed at 0, and the process
+stays up: the Slack backend is a contained one in `MultiAdapter`, which runs it again after a
+backoff from a second up to a minute while the console stays up, so a rejected token reads 0 for
+as long as it lasts. The window's maximum also reads 0 across a gap in the series (a missed scrape,
+a pod rescheduled mid-outage), where a `for` over the instant value would reset at it. The Slack connection does not
+feed `/readyz`: a Slack outage would otherwise take the pod, which also serves the doors, out of
+Ready, the `PlatformAgent` with it, and the gateway's PodDisruptionBudget away, for no failover,
+since the lease rather than readiness picks the leader.
 
 The terminal counter counts every terminal the gateway hands its adapter, not only the relay's.
 It counts in `observeTaskTerminal`, the funnel each route ends in once: the relay; the stale-task

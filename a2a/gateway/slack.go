@@ -316,6 +316,18 @@ type SlackAdapter struct {
 	// (slack_feedback.go); nil in a test that does not fake it.
 	feedback    FeedbackRecorder
 	feedbackAPI slackFeedbackAPI
+
+	// metrics is the gateway's counters, where the pump reports the Socket
+	// Mode connection and each event it receives (SetMetrics); nil counts
+	// nothing.
+	metrics *Metrics
+}
+
+// SetMetrics gives the adapter the gateway's counters, so the Socket Mode
+// connection's state and the last event's time are served beside them.
+// Called once, before Run.
+func (s *SlackAdapter) SetMetrics(m *Metrics) {
+	s.metrics = m
 }
 
 // slackLinkRE matches the markdown links the relay emits, for rewriteLinks
@@ -574,6 +586,22 @@ func newSlackAdapter(botToken, appToken string, log *slog.Logger, extra ...slack
 // sweepLoop. So "Run returned" means the pump is finished — not that the
 // gateway is.
 func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) error {
+	// Down from the start until Socket Mode says it is connected, so a
+	// stalled auth.test or a first dial that keeps failing reads as down.
+	// Once Run returns nothing holds the socket: ended by its caller's
+	// context (a replica that lost the lease, or a shutdown), the gauges are
+	// disarmed, since this replica is no longer the one to report Slack;
+	// ended by a failure, they read down. Registered first so it runs last,
+	// after the pump below has exited and can write no state after it.
+	parent := ctx
+	s.metrics.slackDown()
+	defer func() {
+		if parent.Err() != nil {
+			s.metrics.slackStopped()
+			return
+		}
+		s.metrics.slackDown()
+	}()
 	// Deferred calls run LIFO, so the order these two are REGISTERED in is
 	// the reverse of the order they run in, and it matters: wg.Wait is
 	// registered first so that it runs last, after cancel has told the pump
@@ -631,6 +659,18 @@ func (s *SlackAdapter) Run(ctx context.Context, handler func(InboundMessage)) er
 			// at-least-once, and Slack redelivers it to whoever is still up.
 			if ctx.Err() != nil {
 				return
+			}
+			// The connection's state rides the same channel as the events,
+			// in order: socketmode sends connecting before every dial, the
+			// first and each one after a drop, a ping timeout or Slack's own
+			// disconnect request alike, and connected once the websocket is up.
+			switch evt.Type {
+			case socketmode.EventTypeConnected:
+				s.metrics.slackUp()
+			case socketmode.EventTypeConnecting, socketmode.EventTypeConnectionError, socketmode.EventTypeInvalidAuth:
+				s.metrics.slackDown()
+			case socketmode.EventTypeEventsAPI, socketmode.EventTypeInteractive:
+				s.metrics.slackEvent(time.Now())
 			}
 			if evt.Type != socketmode.EventTypeEventsAPI && evt.Type != socketmode.EventTypeInteractive {
 				// Everything that is neither an EventsAPI nor an interactive
