@@ -1742,7 +1742,7 @@ class ResolvedScopeTests(unittest.TestCase):
                 "exclude": {"clusters": [{"projectId": "mgmt", "location": "us-east1", "clusterName": "m-old"}]},
             }), encoding="utf-8")
             (root / "resolved-scope.json").write_text(json.dumps({
-                "v": 1, "resolvedAt": "2026-11-10T12:00:00Z", "state": "ok", "memberHash": "sha256:x", "excludedProjects": [],
+                "v": 1, "resolvedAt": "2026-11-10T12:00:00Z", "state": "ok", "memberHash": __import__("scope_publisher").member_hash(json.loads((root / "scope.json").read_text())), "excludedProjects": [],
                 "projects": [{"id": p, "via": ["folders/1"], "outcome": o} for p, o in (("member-a", "ok"), ("member-b", "denied"), ("member-empty", "ok"))],
                 "clusters": {"member-a": {"at": "2026-11-10T12:00:00Z", "clusters": [["us-central1", "a1"]]},
                              "member-empty": {"at": "2026-11-10T12:00:00Z", "clusters": []}},

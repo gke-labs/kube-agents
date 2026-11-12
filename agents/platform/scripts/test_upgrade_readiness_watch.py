@@ -2669,7 +2669,7 @@ class Projects(unittest.TestCase):
                 "cluster_identity:\n  project: ghost-proj\n  cluster: g\n  location: l\n", encoding="utf-8")
             (root / "scope.json").write_text(json.dumps({"present": True, "projects": ["explicit-a"], "folders": ["1"]}), encoding="utf-8")
             (root / "resolved-scope.json").write_text(json.dumps({
-                "v": 1, "resolvedAt": "2026-11-10T12:00:00Z", "state": "ok", "memberHash": "sha256:x", "excludedProjects": [],
+                "v": 1, "resolvedAt": "2026-11-10T12:00:00Z", "state": "ok", "memberHash": __import__("scope_publisher").member_hash(json.loads((root / "scope.json").read_text())), "excludedProjects": [],
                 "projects": [{"id": "member-a", "via": ["folders/1"], "outcome": "ok"}, {"id": "member-b", "via": ["folders/1"], "outcome": "denied"}],
                 "clusters": {"member-a": {"at": "2026-11-10T12:00:00Z", "clusters": [["l", "c"]]}},
             }), encoding="utf-8")

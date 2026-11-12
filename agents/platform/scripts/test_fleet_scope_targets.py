@@ -479,7 +479,12 @@ class ListScopeClustersTest(unittest.TestCase):
         return path
 
     def _next(self, document, render=None, management="mgmt"):
-        self._render(render if render is not None else {"present": True, "projects": ["explicit-a"], "folders": ["1"]})
+        render = render if render is not None else {"present": True, "projects": ["explicit-a"], "folders": ["1"]}
+        self._render(render)
+        if isinstance(document, dict) and document.get("memberHash") == "sha256:x":
+            # Resolved for this declaration, as the publisher stamps it.
+            import scope_publisher
+            document = {**document, "memberHash": scope_publisher.member_hash(render)}
         self._resolved_file(document)
         return fst.list_scope_clusters(self.home, management_project=management)
 
@@ -519,6 +524,24 @@ class ListScopeClustersTest(unittest.TestCase):
         self.assertIsNone(entry.clusters)
         self.assertIn("denied", entry.reason)
         self.assertIsNone(got.note)
+
+    def test_a_document_resolved_for_another_declaration_leaves_members_unread(self):
+        # The gateway refuses a stale document; so does the reader, or a scope
+        # edit would be read through the old membership until the next publish.
+        document = _resolved([("member-a", "ok")], clusters={"member-a": {"at": "2026-11-10T12:00:00Z", "clusters": [["us-central1", "web"]]}})
+        document["memberHash"] = "sha256:" + "0" * 64
+        got = self._next(document)
+        self.assertEqual(got.by_project()["member-a"].status, fst.STATUS_UNREAD)
+        self.assertIn("another declaration", got.note)
+        self.assertEqual(got.by_project()["explicit-a"].status, fst.STATUS_LIST_LIVE)
+
+    def test_an_api_disabled_member_is_listed_empty(self):
+        # A project whose clusters API is off has no GKE clusters: listed empty,
+        # not unread, so every run doesn't read as partial.
+        got = self._next(_resolved([("member-a", "api-disabled")]))
+        entry = got.by_project()["member-a"]
+        self.assertEqual(entry.status, fst.STATUS_LISTED)
+        self.assertEqual(entry.clusters, ())
 
     def test_a_malformed_entry_is_unread(self):
         got = self._next(_resolved([("member-a", "ok")], clusters={"member-a": {"at": "2026-11-10T12:00:00Z", "clusters": [["only-one"]]}}))

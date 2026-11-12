@@ -640,6 +640,21 @@ def _listed_entry(project: str, entry: object, excluded: set) -> ProjectClusters
     return ProjectClusters(project, STATUS_LISTED, tuple(sorted(triples)), at=entry[RESOLVED_AT_KEY])
 
 
+def _stale_problem(document: dict, render: dict) -> str | None:
+    """Why the document can't be used for this declaration, or None. The publisher
+    stamps `memberHash` over the declaration's membership fields, and the gateway
+    refuses a document whose hash isn't the current one; so does this reader, or a
+    scope edit would be read through the old membership until the next publish.
+    The hash is the publisher's own (imported here, not spelled twice)."""
+    try:
+        import scope_publisher  # beside this file; heavy, so only in next mode
+    except ImportError as e:
+        return f"can't be checked against the declaration ({e})"
+    if document.get("memberHash") != scope_publisher.member_hash(render):
+        return "was resolved for another declaration (its memberHash isn't the current scope.json's)"
+    return None
+
+
 def _from_resolved(path: str, management_project: str | None) -> ScopeClusters:
     """Next mode's answer: the management project and the explicit projects to
     list live, and each member project's clusters from the resolved scope's
@@ -649,6 +664,10 @@ def _from_resolved(path: str, management_project: str | None) -> ScopeClusters:
     excluded_clusters = _excluded_clusters(render)
     excluded = set(excluded_clusters)
     document, rows, problem = _read_resolved(path)
+    if document is not None and render:
+        problem = _stale_problem(document, render)
+        if problem:
+            document = None
     dropped = {p for p in ((document or {}).get(EXCLUDED_KEY) or []) if isinstance(p, str)}
 
     def left_out(project: str) -> bool:
@@ -674,6 +693,10 @@ def _from_resolved(path: str, management_project: str | None) -> ScopeClusters:
             continue
         seen.add(project)
         listed = None if note else _listed_entry(project, clusters_map.get(project), excluded)
+        if listed is None and not note and row.get("outcome") == OUTCOME_API_DISABLED:
+            # The clusters API is off, so the project has no GKE clusters: an
+            # empty list the publisher answered, not one invented here.
+            listed = ProjectClusters(project, STATUS_LISTED, (), at=document.get("resolvedAt"))
         if listed is not None:
             entries.append(listed)
         else:

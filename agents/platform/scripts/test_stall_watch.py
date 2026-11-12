@@ -2877,7 +2877,7 @@ class ResolvedScope(Base):
         render = {"present": True, "projects": [], "folders": ["1"],
                   "exclude": {"clusters": [{"projectId": p, "location": l, "clusterName": c} for p, l, c in exclude_clusters]}}
         (self.home / "scope.json").write_text(json.dumps(render))
-        document = {"v": 1, "resolvedAt": "2026-11-10T12:00:00Z", "state": "ok", "memberHash": "sha256:x", "excludedProjects": [],
+        document = {"v": 1, "resolvedAt": "2026-11-10T12:00:00Z", "state": "ok", "memberHash": __import__("scope_publisher").member_hash(json.loads((self.home / "scope.json").read_text())), "excludedProjects": [],
                     "projects": [{"id": self.MEMBER, "via": ["folders/1"], "outcome": "ok"}, {"id": self.UNREAD, "via": ["folders/1"], "outcome": "denied"}],
                     "clusters": {self.MEMBER: {"at": "2026-11-10T12:00:00Z", "clusters": [[LOCATION, "m"]]}}}
         (self.home / "resolved-scope.json").write_text(json.dumps(document))
