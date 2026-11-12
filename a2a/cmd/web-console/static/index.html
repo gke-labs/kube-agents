@@ -6354,12 +6354,19 @@
           const replicas = u.replicas_found
             ? `${u.replicas_read} of ${u.replicas_found} replicas`
             : "no replica read";
+          // The tile clips its note to one line, so the since-install note
+          // keeps the live replica reading in its tooltip.
+          const liveNote = u.live
+            ? `Live LiteLLM reading since its last restart: ${formatCount(u.live.total_tokens)} tokens, ${formatUSD(u.live.spend_usd)} · ${replicas}`
+            : `Live LiteLLM reading: ${replicas}`;
           const note = setText(
             "ins-usage-note",
             sinceInstall
-              ? `Since install, as of the operator's last poll · live: ${replicas}`
+              ? "Since install, as of the operator's last poll"
               : `Since LiteLLM last restarted · ${replicas}`,
-            u.error,
+            sinceInstall
+              ? [liveNote, u.error].filter(Boolean).join(" · ")
+              : u.error,
           );
           note.classList.toggle("warn", partial);
         }
