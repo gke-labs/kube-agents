@@ -313,9 +313,6 @@ readonly DRIFT_ADOPTION_TARGETS=(
 # subscriptions, sinks -- so the array needs no fourth spelling of it.
 readonly DRIFT_IMPORT_ID_FORMAT='projects/%s/%s/%s'
 readonly K8S_LABEL_VALUE_MAX_LENGTH=63
-# How long the uninstall fallback waits for the bus StatefulSet (and its
-# pods, in the foreground) to go before it deletes the bus's claims.
-readonly NATS_STATEFULSET_DELETE_TIMEOUT=180s
 
 #
 # One argument, "readonly", suppresses the bucket creation for `plan`. A plan
@@ -1711,14 +1708,15 @@ delete_agent_cr() {
       "kubeagents:minimal:${namespace}:${agent_name}" \
       "kubeagents:tokenreview:${namespace}:${agent_name}" \
       --ignore-not-found >/dev/null 2>&1 || true
-    # The bus StatefulSet goes first, and its claims only once it is gone: a
-    # claim deleted while the StatefulSet lives is recreated with its pod and
-    # outlives it, pinned to that pod's zone, where a reinstall's server may
-    # never fit (the operator's handleDeletion keeps the same order).
+    # The bus StatefulSet is marked for deletion before its claims go: a
+    # claim deleted while the StatefulSet still creates pods is recreated with
+    # one and outlives it, pinned to that pod's zone, where a reinstall's
+    # server may never fit. Once marked, it creates none, so there is no need
+    # to wait for its pods (the operator's handleDeletion keeps the same order).
     kubectl --context "$CLUSTER_CONTEXT" delete statefulset -n "$namespace" \
       -l "app.kubernetes.io/instance=${inst_label}" \
       --field-selector "metadata.name=${agent_name}-a2a-nats" \
-      --cascade=foreground --ignore-not-found --wait=true --timeout="${NATS_STATEFULSET_DELETE_TIMEOUT}" >/dev/null 2>&1 || true
+      --cascade=foreground --ignore-not-found --wait=false >/dev/null 2>&1 || true
     # One JetStream claim per bus server, up to three (spec.harness.tuning.busReplicas).
     for ordinal in 0 1 2; do
       kubectl --context "$CLUSTER_CONTEXT" delete pvc -n "$namespace" \

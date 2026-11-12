@@ -1677,10 +1677,10 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 			}
 		}
 
-		// The bus StatefulSet goes first, and its claims only once it is
-		// gone. The CR's finalizer keeps the StatefulSet alive (its owner
-		// isn't deleted yet), and a claim deleted under a live StatefulSet is
-		// recreated with its pod: a fresh claim, provisioned in whatever zone
+		// The bus StatefulSet is marked for deletion first, and its claims
+		// reaped only once it is. The CR's finalizer keeps the StatefulSet
+		// alive (its owner isn't deleted yet), and a claim deleted under a
+		// live StatefulSet is recreated with its pod: a fresh claim, provisioned in whatever zone
 		// that pod lands, which then outlives the StatefulSet (WhenDeleted is
 		// Retain). A reinstall reuses it pinned to that zone, and on a
 		// three-server bus that zone's node can already hold another server,

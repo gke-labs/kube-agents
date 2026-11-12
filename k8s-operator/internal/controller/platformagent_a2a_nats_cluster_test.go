@@ -377,12 +377,13 @@ func TestHandleDeletionReapsEveryServersJetStreamPVC(t *testing.T) {
 	}
 }
 
-// The claims wait for the bus StatefulSet: a claim reaped while it lives is
-// recreated with its pod and outlives it, pinned to a zone (handleDeletion).
-// The first pass deletes the StatefulSet and leaves every claim; the pass
-// after it is gone reaps them. A StatefulSet of that name the agent doesn't
-// control holds nothing back.
-func TestHandleDeletionReapsTheBusClaimsOnlyOnceItsStatefulSetIsGone(t *testing.T) {
+// The claims wait for the bus StatefulSet's deletion mark: a claim reaped
+// while it still creates pods is recreated with one and outlives it, pinned
+// to a zone (handleDeletion). The first pass marks the StatefulSet and
+// leaves every claim; a pass that finds it marked (still terminating, its
+// pods going) or gone reaps them, so a stuck pod holds nothing. A
+// StatefulSet of that name the agent doesn't control holds nothing back.
+func TestHandleDeletionReapsTheBusClaimsOnlyOnceItsStatefulSetIsMarked(t *testing.T) {
 	scheme := setupScheme()
 	agent := a2aTestAgent()
 	agent.UID = "agent-uid"
@@ -430,6 +431,29 @@ func TestHandleDeletionReapsTheBusClaimsOnlyOnceItsStatefulSetIsGone(t *testing.
 	}
 	if n := claimsLeft(); n != 0 {
 		t.Errorf("%d claims left once the StatefulSet was gone, want none", n)
+	}
+
+	// Already marked and still terminating (its pods held by a lost node,
+	// say): the claims go on the first pass, and nothing is deleted again.
+	agent3 := a2aTestAgent()
+	agent3.UID = "agent-uid"
+	agent3.Finalizers = []string{platformAgentFinalizer}
+	agent3.DeletionTimestamp = &now
+	terminating := sts.DeepCopy()
+	terminating.ResourceVersion = ""
+	terminating.Finalizers = []string{metav1.FinalizerDeleteDependents}
+	terminating.DeletionTimestamp = &now
+	cl3 := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{agent3, terminating}, objs[2:]...)...).Build()
+	r3 := &PlatformAgentReconciler{Client: cl3, Scheme: scheme}
+	res3, err := r3.handleDeletion(ctx, agent3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res3.RequeueAfter == a2aNATSDeletionRecheck {
+		t.Error("a pass held the reap for a StatefulSet already marked for deletion")
+	}
+	if err := cl3.Get(ctx, types.NamespacedName{Name: a2aNATSDataClaimName(agent, 0), Namespace: agent.Namespace}, &corev1.PersistentVolumeClaim{}); !errors.IsNotFound(err) {
+		t.Errorf("a StatefulSet already marked held back the claim reap (err=%v)", err)
 	}
 
 	// A StatefulSet of that name the agent doesn't control: the claims go
