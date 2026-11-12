@@ -9762,6 +9762,15 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
             "printf secret/db | xargs kubectl get -n prod -o yaml",
             "aws secretsmanager batch-get-secret-value --secret-id-list db",
             "gcloud secrets list | xargs -I{} gcloud secrets versions access latest --secret={}",
+            # a token print, and a dump of the environment (#5484)
+            "gcloud auth print-access-token",
+            "gcloud config config-helper --format=json",
+            "env | grep PATH",
+            "printenv GITHUB_TOKEN",
+            "kubectl exec deploy/api -- env",
+            "cat /proc/self/environ",
+            'echo "$(env)"',
+            "sh -c env arg0",
         ]
         served = [
             "kubectl get secrets -n kube-system",
@@ -9780,6 +9789,10 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
             "az keyvault secret list --vault-name kv",
             "kubectl exec deploy/api -- cat /opt/data/report.txt",
             "kubectl exec deploy/secrets-api -- cat /opt/data/report.txt",
+            "gcloud auth list",
+            "env FOO=1 python3 x.py",
+            "printenv HOME",
+            "kubectl get pods -n env",
         ]
         for cmd in withheld:
             with self.subTest(cmd=cmd):
@@ -9886,6 +9899,41 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
         steps = self.client.get("/v1/tasks/t_d1c3323e").json()["steps"]
         self.assertEqual([s["preview"] for s in steps if s["kind"] == "tool_result"], [session_kv_server.WORKER_STEP_WITHHELD])
         self.assertNotIn(secret_val, json.dumps(steps))
+
+    def test_a_token_print_and_an_environment_dump_are_withheld(self):
+        # The output of `gcloud auth print-access-token` and of `env` is the
+        # credential itself; the feed withholds it whatever shape it has.
+        token_val = "opaque-token-with-no-known-shape-0042"
+        print_args = json.dumps({"command": "gcloud auth print-access-token"})
+        dump_args = json.dumps({"command": "env | sort"})
+        self._write_profile_store(
+            "platform",
+            [
+                ("sess-print", "user", "work kanban task t_d1c3323e", None, None, 101.0, None, None),
+                (
+                    "sess-print",
+                    "assistant",
+                    None,
+                    None,
+                    [
+                        {"id": "c1", "function": {"name": "terminal", "arguments": print_args}},
+                        {"id": "c2", "function": {"name": "terminal", "arguments": dump_args}},
+                    ],
+                    102.0,
+                    None,
+                    None,
+                ),
+                ("sess-print", "tool", f"{token_val}\n", "terminal", None, 103.0, None, "c1"),
+                ("sess-print", "tool", f"HOME=/root\nSERVICE_CREDENTIAL={token_val}\n", "terminal", None, 104.0, None, "c2"),
+            ],
+            with_tool_call_id=True,
+        )
+        steps = self.client.get("/v1/tasks/t_d1c3323e").json()["steps"]
+        self.assertEqual(
+            [s["preview"] for s in steps if s["kind"] == "tool_result"],
+            [session_kv_server.WORKER_STEP_WITHHELD, session_kv_server.WORKER_STEP_WITHHELD],
+        )
+        self.assertNotIn(token_val, json.dumps(steps))
 
     def test_steps_truncated_is_true_when_sql_row_window_clips_older_rows(self):
         rows: list[tuple] = [
