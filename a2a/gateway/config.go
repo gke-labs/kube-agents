@@ -189,11 +189,11 @@ type Config struct {
 
 	// SlackBotToken and SlackAppToken arm the Slack backend: Socket Mode
 	// needs both (xoxb- drives the Web API, xapp- the outbound websocket —
-	// no inbound endpoint, nothing to expose). Exactly one backend may be
-	// configured per gateway process: two gateways bound to one relay
-	// durable split event deliveries (Options.RelayDurable), so a second
-	// backend is a second Deployment with its own durable, not a second
-	// adapter here.
+	// no inbound endpoint, nothing to expose). Slack may run beside the
+	// other backends in one gateway process: each backend is its own
+	// transport, and only Chat reads the relay durable
+	// (Options.RelayDurable), which the election gives one leader per
+	// Deployment.
 	SlackBotToken string
 	SlackAppToken string
 
@@ -281,11 +281,10 @@ type Config struct {
 	TargetAllowedUsers map[string]map[string][]string
 
 	// InjectListen is the inject side door's HTTP listen address, and setting
-	// it arms the door. DEV AND EVAL ONLY. The door is not a backend in the
-	// one-backend guard's sense (see FromEnv): it may sit beside exactly one
-	// real backend, because a local HTTP door has no silent-stop failure mode
-	// of the kind that guard exists for. The operator renders it only under
-	// its eval flag.
+	// it arms the door. DEV AND EVAL ONLY. The door is not a backend (see
+	// FromEnv): it may sit beside any real backends, because a local HTTP
+	// door consumes nothing and competes for nothing. The operator renders it
+	// only under its eval flag.
 	InjectListen string
 
 	// InjectToken is the bearer token the door requires on every request
@@ -676,14 +675,30 @@ type Config struct {
 	BusyNoticeAt int
 }
 
-// Backend names the REAL chat backend this config arms: "gchat", "slack",
+// Backends lists every REAL chat backend this config arms, in the fixed
+// order gchat, slack, discord, or nil when none is armed. The doors are not
+// among the answers, for the reason Backend gives.
+func (c *Config) Backends() []string {
+	var backends []string
+	if c.GchatRelayURL != "" {
+		backends = append(backends, gchatBackend)
+	}
+	if c.SlackBotToken != "" {
+		backends = append(backends, slackBackend)
+	}
+	if c.DiscordToken != "" {
+		backends = append(backends, discordBackend)
+	}
+	return backends
+}
+
+// Backend names the first REAL chat backend of Backends: "gchat", "slack",
 // "discord", or "" when a side door (inject, A2A, or both) or the console
-// door alone is the only way in. FromEnv
-// refuses more than one real backend, so the order here only decides what a
-// hand-built Config means.
+// door alone is the only way in. It stays for the authority default and the
+// boot line.
 //
 // The doors are deliberately not among the answers. Either can be armed
-// beside any one backend, so "which backend is this gateway" and "is a door
+// beside any backend, so "which backend is this gateway" and "is a door
 // open" are two questions, and collapsing them is what would make a door
 // exclusive again.
 func (c *Config) Backend() string {
@@ -711,12 +726,12 @@ func (c *Config) Backend() string {
 func (c *Config) InjectArmed() bool { return c.InjectListen != "" }
 
 // HomeLearnArmed reports whether the gateway may learn the Slack home channel
-// from the first admitted channel mention and record it: the backend is
-// Slack, the CR names no home channel (a set one is the CR's, malformed or
-// not), the policy is auto, a record is named, and the operator has armed the
-// learn. Every gate holds, or nothing is read, written or posted.
+// from the first admitted channel mention and record it: the Slack backend
+// is armed (beside any other), the CR names no home channel (a set one is
+// the CR's, malformed or not), the policy is auto, a record is named, and the
+// operator has armed the learn. Every gate holds, or nothing is read, written or posted.
 func (c *Config) HomeLearnArmed() bool {
-	return c.Backend() == slackBackend && c.SlackHomeChannel == "" &&
+	return c.SlackBotToken != "" && c.SlackHomeChannel == "" &&
 		c.SlackHomePolicy != slackHomePolicyManual && c.HomeChannelRecord != "" && c.HomeChannelLearn
 }
 
@@ -841,13 +856,12 @@ func FromEnv() (*Config, error) {
 	if (cfg.SlackBotToken != "") != (cfg.SlackAppToken != "") {
 		return nil, fmt.Errorf("SLACK_BOT_TOKEN and SLACK_APP_TOKEN arm Slack together; only one is set")
 	}
-	// One REAL backend per gateway process, chosen by which credential is
-	// set. A silent default here would make a two-backend misconfiguration a
-	// working Discord gateway that quietly never consumes Chat — refuse both
-	// directions instead. Counted rather than enumerated pairwise: with three
-	// backends the pairs are the easy thing to leave a hole in, and a fourth
-	// must not be addable with a combination nobody checked. Adding a backend
-	// is one entry in this list.
+	// The gateway runs every REAL backend whose credential is set. Several
+	// in one process share no transport: each backend is its own
+	// connection, and the Chat relay durable is the gateway's alone, with
+	// the election keeping one leader per Deployment, so no delivery is
+	// split. What the guard still refuses is half a Slack pair (above) and
+	// no ingress at all (below). Adding a backend is one entry in this list.
 	var armed []string
 	if cfg.GchatRelayURL != "" {
 		armed = append(armed, "A2A_GCHAT_RELAY_URL")
@@ -860,17 +874,9 @@ func FromEnv() (*Config, error) {
 	}
 	// The doors (inject, A2A) are NOT in that list, decided 2026-09-17 on
 	// the design doc's review for the inject door and holding for its
-	// sibling. The guard exists so that arming two backends cannot leave
-	// one of them silently unconsumed: two processes on one Chat relay
-	// durable split its event deliveries, and the symptom is a gateway that
-	// looks healthy and answers half the messages. A local HTTP door has no
-	// such failure mode — it consumes nothing and competes for nothing — so
-	// counting it would buy no safety and would cost the thing stage 2 needs,
-	// which is the eval door and the Chat relay on one install so the two
-	// transports can be compared against it.
-	switch len(armed) {
-	case 1:
-	case 0:
+	// sibling. A local HTTP door consumes nothing and competes for nothing,
+	// so it is a way in beside the backends rather than one of them.
+	if len(armed) == 0 {
 		// The door alone is enough to start. Decided, not assumed: the A2A
 		// owner's decision of 2026-09-17 on the eval transport's design doc
 		// (eval-next-transport.md) is that an eval install with neither a
@@ -886,8 +892,6 @@ func FromEnv() (*Config, error) {
 		if cfg.InjectListen == "" && cfg.A2ADoorListen == "" && !cfg.ConsoleDoor {
 			return nil, fmt.Errorf("no chat backend: set DISCORD_TOKEN (W0's discord-bot Secret), A2A_GCHAT_RELAY_URL (the credential proxy's chat relay), the SLACK_BOT_TOKEN+SLACK_APP_TOKEN pair (Socket Mode), A2A_INJECT_LISTEN (the dev-only inject side door), A2A_DOOR_LISTEN (the A2A door for agent callers), or A2A_CONSOLE_DOOR=true (the console door alone)")
 		}
-	default:
-		return nil, fmt.Errorf("more than one chat backend is configured (%s): one backend per gateway process — two gateways on one relay durable split event deliveries; run a second Deployment for a second backend. The side doors (A2A_INJECT_LISTEN, A2A_DOOR_LISTEN, A2A_CONSOLE_DOOR) are not backends in this sense and may sit beside any one of them", strings.Join(armed, ", "))
 	}
 	// Fail closed: a door with no token would be reachable by anything that
 	// reaches the listener, and the port-forward path the runner uses is
