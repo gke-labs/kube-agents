@@ -182,6 +182,12 @@ def _drop_bridge(docs):
     spec["containers"] = [c for c in spec["containers"] if c["name"] != "hermes-bridge"]
 
 
+def _drop_nats_exporter(docs):
+    doc = _find_doc(docs, "StatefulSet", "platformagent-a2a-nats")
+    spec = doc["spec"]["template"]["spec"]
+    spec["containers"] = [c for c in spec["containers"] if c["name"] != "nats-exporter"]
+
+
 def _drop_console_cpu_limit(docs):
     doc = _find_doc(docs, "Deployment", "platformagent-a2a-console")
     for container in doc["spec"]["template"]["spec"]["containers"]:
@@ -547,6 +553,9 @@ class NextModeFootprintTest(unittest.TestCase):
                     sum(gcf.parse_bytes(c["resources"]["requests"]["memory"]) for c in found) * replicas,
                 )
 
+    def test_the_nats_entry_counts_the_exporter_sidecar(self):
+        self.assertEqual(gcf._A2A_WORKLOADS["a2aNats"][2], ("nats", "reloader", "nats-exporter"))
+
     def test_surges_follows_each_workloads_strategy(self):
         for key, (kind, name, _) in gcf._A2A_WORKLOADS.items():
             with self.subTest(key=key):
@@ -581,8 +590,9 @@ class NextModeFootprintTest(unittest.TestCase):
         self.assertEqual(self.data["operatorRendered"]["storage"]["persistentVolumeClaims"], 4)
 
     def test_the_standing_delta_is_the_documented_figure(self):
-        """The A2A stack's standing requests, provisioning Job aside: 1380m and 2544Mi,
-        with the default three NATS servers (860m and 1488Mi with one)."""
+        """The A2A stack's standing requests, provisioning Job aside: 1530m and 2832Mi,
+        with the default three NATS servers (910m and 1584Mi with one); each server
+        carries the JetStream metrics exporter beside it (#4477)."""
         standing = [k for k in self.following if k not in ("storage", "a2aProvision")]
         cpu = sum(
             self.following[k]["hermesBridge"]["cpuMillisRequest"] if k == "agentPod"
@@ -594,7 +604,7 @@ class NextModeFootprintTest(unittest.TestCase):
             else self.following[k]["memoryBytesRequest"]
             for k in standing
         )
-        self.assertEqual((cpu, memory), (1380, 2544 * _MIB))
+        self.assertEqual((cpu, memory), (1530, 2832 * _MIB))
 
     def test_replicas_scale_a_workload(self):
         with _goldens_with(following=_scale_callout_deployment):
@@ -625,6 +635,14 @@ class NextModeFootprintTest(unittest.TestCase):
         message = str(caught.exception)
         self.assertIn("'console'", message)
         self.assertIn("declares no cpu limit", message)
+
+    def test_a_missing_a2a_container_is_an_error(self):
+        """A golden without one of a workload's listed containers (here the NATS
+        exporter, #4477) must not pass as a smaller footprint."""
+        with _goldens_with(following=_drop_nats_exporter):
+            with self.assertRaises(ValueError) as caught:
+                gcf.extract_footprint()
+        self.assertIn("container 'nats-exporter' of StatefulSet/", str(caught.exception))
 
     def test_an_unaccounted_a2a_container_is_an_error(self):
         with _goldens_with(following=_add_callout_container):
