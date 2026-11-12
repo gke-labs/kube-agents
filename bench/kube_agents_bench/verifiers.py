@@ -2892,10 +2892,10 @@ def _code_call_text_and_clip(entry: dict[str, Any]) -> tuple[str | None, bool]:
             if target in args_parsed and isinstance(args_parsed[target], str):
                 command = args_parsed[target]
             else:
+                is_clipped = True
                 head_re = _CLIPPED_COMMAND_HEAD_RE if target == _COMMAND_ARG else _CLIPPED_CODE_HEAD_RE
                 head = head_re.search(raw)
                 if head is not None:
-                    is_clipped = True
                     try:
                         command = json.loads('"' + head.group(1) + '"')
                     except ValueError:
@@ -2918,7 +2918,7 @@ def _code_call_text(entry: dict[str, Any]) -> str | None:
     return command
 
 
-def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[str, float | None, str, str, bool, bool]]:
+def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[str, float | None, str | None, str, bool, bool]]:
     """``(card, at, command, result, succeeded, is_clipped)`` per tagged ``terminal`` or ``execute_code`` call, in call-time order.
 
     ``card`` is the entry's ``task`` tag (its ``session`` when a card is not
@@ -2931,19 +2931,20 @@ def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[str, float | Non
     turn issued together share it. An argument object clipped in the pod
     arrives as ``{"raw": text}`` and the command is read out of the text, as
     ``tool_called`` reads its arguments, and one clipped inside the command
-    itself keeps the head that survived, which carries the verb. A result
-    that is not text reads as empty; ``succeeded`` is whether the pod recorded
-    a completed result with an exit code of 0 (``status == "completed"`` and an
-    integer exit code of 0, from ``exit_code`` or parsed from JSON ``result``;
-    a non-zero or unrecorded exit is ``False``; ``is_clipped`` is whether the
-    command came from a clipped head regex).
+    itself keeps the head that survived, which carries the verb (or ``None``
+    if clipped before the command value opened). A result that is not text
+    reads as empty; ``succeeded`` is whether the pod recorded a completed
+    result with an exit code of 0 (``status == "completed"`` and an integer
+    exit code of 0, from ``exit_code`` or parsed from JSON ``result``; a
+    non-zero or unrecorded exit is ``False``; ``is_clipped`` is whether the
+    arguments were clipped by the pod).
     """
-    calls: list[tuple[str, float | None, str, str, bool, bool]] = []
+    calls: list[tuple[str, float | None, str | None, str, bool, bool]] = []
     for entry in trajectory:
         if not isinstance(entry, dict) or not entry.get("agent"):
             continue
         command, is_clipped = _code_call_text_and_clip(entry)
-        if command is None:
+        if command is None and not is_clipped:
             continue
         at = entry.get("at")
         result = entry.get("result")
@@ -3349,14 +3350,14 @@ class WorkerCommandsVerifier(BaseVerifier):
             logged = {str(row.get("task") or "") for row in snap.worker_commands}
             calls = _worker_terminal_calls(snap.trajectory)
             if "" in logged:
-                children = [command for _, _, command, _, _, _ in calls]
+                children = [command for _, _, command, _, _, _ in calls if command is not None]
                 if children:
                     sources = (
                         f" ({len(logged_commands)} from the filed cards' logs and {len(children)} tagged calls,"
                         " unjoined because a log row names no card, so a command may be counted twice)"
                     )
             else:
-                children = [command for card, _, command, _, _, _ in calls if card not in logged]
+                children = [command for card, _, command, _, _, _ in calls if card not in logged and command is not None]
                 # A log row shows a chain as its first command only (``printenv X + 1
                 # command``), so a run chained behind it is on no row (#4620). The
                 # required patterns and runs also read the logged cards' calls as
@@ -3367,7 +3368,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                 # still takes an exempt call out of the required read, as it does a row.
                 if self.required_patterns or self.required_runs:
                     rows = set(logged_commands)
-                    beside_rows = [command for card, _, command, _, _, _ in calls if card in logged and command not in rows]
+                    beside_rows = [command for card, _, command, _, _, _ in calls if card in logged and command is not None and command not in rows]
                 joined = []
                 if children:
                     joined.append(f"{len(children)} from the tagged calls of cards with no log line")
@@ -3415,7 +3416,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                         elapsed_time=time.monotonic() - start,
                         reason=_NO_WORKER_TERMINAL_CALLS_REASON,
                     )
-            typed = [command for _, _, command, _, _, _ in calls]
+            typed = [command for _, _, command, _, _, _ in calls if command is not None]
             # The ordered check reads the calls alone: a log row has no time.
             # A check with no forbidden set keeps the card log as a source for
             # its required checks: the trajectory can be the narrower read (two
@@ -3427,7 +3428,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                 typed += joined
                 if joined:
                     sources = f" ({len(calls)} tagged calls as typed and {len(joined)} from the card log)"
-            untimed = [command for _, at, command, _, _, _ in calls if at is None]
+            untimed = [command for _, at, command, _, _, _ in calls if at is None and command is not None]
             # Only the window orders calls; a check with no forbidden set
             # grades nothing by time, so an untimed call cannot mislead it.
             if untimed and forbidding:
@@ -3450,10 +3451,12 @@ class WorkerCommandsVerifier(BaseVerifier):
                     continue
                 opened_at = mine[opener][1]
                 later = [call for call in mine[opener + 1 :] if call[1] > opened_at]
-                windowed.extend(command for _, _, command, _, _, _ in later)
+                windowed.extend(command for _, _, command, _, _, _ in later if command is not None)
                 for _, _, command, result, _, _ in later:
-                    result_hits.extend((p, command) for p in self.forbidden_result_patterns if re.search(p, result))
-                opened.append(f"{len(later)} in the lineage of card {root} after {mine[opener][2][:_SHOWN_COMMAND_CHARS]!r}")
+                    if command is not None:
+                        result_hits.extend((p, command) for p in self.forbidden_result_patterns if re.search(p, result))
+                opener_cmd = mine[opener][2] or ""
+                opened.append(f"{len(later)} in the lineage of card {root} after {opener_cmd[:_SHOWN_COMMAND_CHARS]!r}")
             if not forbidding:
                 window = ""
             elif not opened:
@@ -3481,7 +3484,7 @@ class WorkerCommandsVerifier(BaseVerifier):
         argvs = [argv for c in commands for argv in _shell_argvs(c)]
         typed_argvs = [argv for c in typed for argv in _shell_argvs(c)]
 
-        traj_eligible = [(cmd, succ, is_clipped) for _, _, cmd, _, succ, is_clipped in traj_calls if self._without_exempt_text(cmd) == cmd]
+        traj_eligible = [(cmd, succ, is_clipped) for _, _, cmd, _, succ, is_clipped in traj_calls if cmd is not None and self._without_exempt_text(cmd) == cmd]
         traj_argv_entries = [
             (argv, call_succeeded, carries_exit, is_clipped)
             for cmd_text, call_succeeded, is_clipped in traj_eligible
@@ -3552,6 +3555,9 @@ class WorkerCommandsVerifier(BaseVerifier):
         for _, _, cmd, _, call_succeeded, is_clipped in traj_calls:
             if not is_clipped or not call_succeeded:
                 continue
+            if cmd is None:
+                clipped_unmatched = True
+                break
             argv_entries = _shell_argvs_with_exit_propagation(cmd)
             if any(
                 not any(_argv_runs(argv, run) for argv, _ in argv_entries)
@@ -4456,7 +4462,7 @@ class VerifiedClaimsBackedVerifier(BaseVerifier):
             what = "calls claims verified with" if labelled else "has"
             return done("fail", f"the reply {what} {len(blocks)} evidence block(s) (a $ command fence, then an "
                         f"output fence); at least {self.min_blocks} required")
-        calls = [(command, result) for _, _, command, result, *_ in _worker_terminal_calls(snap.trajectory)]
+        calls = [(command, result) for _, _, command, result, *_ in _worker_terminal_calls(snap.trajectory) if command is not None]
         withheld = any(
             entry.get("agent") and entry.get("name") in _CODE_TOOLS and _args_withheld(entry)
             for entry in snap.trajectory if isinstance(entry, dict)

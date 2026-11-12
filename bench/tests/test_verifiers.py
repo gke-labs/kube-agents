@@ -10003,6 +10003,61 @@ def test_worker_commands_clipped_decoy_or_repeated_args_do_not_bypass_is_clipped
     assert res.status == "error"
     assert "the call's command was clipped in the pod" in res.reason
 
+    # 3. Call cut before command value opens (entry_no_depth1):
+    # A succeeded: true run on a worker-filed card with empty card log must error naming clipped arguments.
+    traj_cut_before_command = [
+        {
+            "agent": "worker",
+            "name": "terminal",
+            "task": "t_1",
+            "args": {
+                "raw": '{"env": {"command": "true"}, "other": "val ...[clipped 15 chars]',
+            },
+            "result": '{"exit_code": 0}',
+            "status": "completed",
+            "at": 1.0,
+        }
+    ]
+    transcript.set("ok", traj_cut_before_command, worker_commands=[])
+    res_cut = v.verify(5.0)
+    assert not res_cut.success
+    assert res_cut.status == "error"
+    assert "the pod clipped a worker terminal call's arguments" in res_cut.reason
+
+    # An earlier unclipped non-zero run whose exit-0 retry is cut before command opens must error naming retry possibility.
+    traj_retry_cut = [
+        {
+            "agent": "worker",
+            "name": "terminal",
+            "task": "t_1",
+            "args": {"command": "python3 /opt/chat-collector/collect.py compliance-audit"},
+            "result": '{"exit_code": 1}',
+            "status": "completed",
+            "at": 1.0,
+        },
+        {
+            "agent": "worker",
+            "name": "terminal",
+            "task": "t_1",
+            "args": {
+                "raw": '{"env": {"command": "true"}, "other": "val ...[clipped 15 chars]',
+            },
+            "result": '{"exit_code": 0}',
+            "status": "completed",
+            "at": 2.0,
+        },
+    ]
+    transcript.set(
+        "ok",
+        traj_retry_cut,
+        worker_commands=[{"task": "t_1", "command": "python3 /opt/chat-collector/collect.py compliance-audit"}],
+    )
+    res_retry = v.verify(5.0)
+    assert not res_retry.success
+    assert res_retry.status == "error"
+    assert "a retry may sit in the unread part" in res_retry.reason
+    assert "the pod clipped a worker terminal call's arguments" in res_retry.reason
+
 
 # ------------------------------- the retrospective's drained-budget case's line
 #
