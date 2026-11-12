@@ -496,8 +496,11 @@ reaches the delegation ceiling or when the wait falls back, nor a card whose exc
 transport cut before the wait began. A write from one of those that lands in a later first-phase
 unit's window is unattributed there. A second-phase unit (a requesting case, a stopped ask, a
 `writes_alone` case) runs alone and its window is marked exclusive, so the CI script archives
-every card still live before each such unit, then settles. A fence that could not run is a
-`Card fence` warning in the run log; read a block on that unit after one as transport. Parity in
+every card still live before each such unit, then settles. A fence that ran and left a card live is a
+`Card fence` warning in the run log; read a block on that unit after one as transport. A fence skipped for a missing
+prerequisite warns and the unit runs. A fence that could not run to its verdict after its attempts, no
+Ready gateway pod or an exec that did not reach the container, leaves the unit unlaunched and recorded
+as infrastructure, so no block follows it. Parity in
 [#2007](https://github.com/gke-labs/kube-agents/issues/2007) (phase 2) is this lane's record on
 `api` being acceptable per case and stable across the on-demand runs, not the api lane's numbers.
 Two things follow for the lane. A case that grades the delegation

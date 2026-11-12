@@ -29,6 +29,20 @@ import (
 // switch; a setting, not surgery (retarget 8/26).
 const RouteSession = "session"
 
+// sessionPodNdots is the resolver's ndots on a session pod. Kubernetes'
+// default is 5, so the 4-dot broker and kube-api proxy URLs
+// (<svc>.<ns>.svc.cluster.local) would go through all six search domains
+// first: up to 14 A/AAAA queries per lookup (#5590). With 3 they are asked
+// as written first, and the 2-dot NATS_URL host keeps the search list order
+// (musl libc does not fall back to it for a name with ndots or more dots).
+// The operator sets the same value on the sandbox, worker and broker pods
+// (brokerCallerPodNdots in k8s-operator/internal/controller/pod_dns.go);
+// keep the two in step.
+const sessionPodNdots = "3"
+
+// resolverNdotsOption is the resolv.conf option sessionPodNdots sets.
+const resolverNdotsOption = "ndots"
+
 const (
 	// sweepInterval paces the orphan sweep; sweepPassTimeout bounds one
 	// pass, so a hung stream or API call cannot make passes pile up.
@@ -388,6 +402,11 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 		},
 		Spec: corev1.PodSpec{
 			RestartPolicy: corev1.RestartPolicyNever,
+			// ndots:3, so the broker and kube-api proxy URLs (4 dots) are
+			// asked as written first: 2 DNS queries, not up to 14 (#5590).
+			DNSConfig: &corev1.PodDNSConfig{
+				Options: []corev1.PodDNSConfigOption{{Name: resolverNdotsOption, Value: ptr.To(sessionPodNdots)}},
+			},
 			// The session ServiceAccount, which holds no RBAC at all: it
 			// exists so the kubelet can mint the bus token below against an
 			// identity the callout's map is keyed on.

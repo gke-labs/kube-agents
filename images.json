@@ -195,6 +195,15 @@
       "description": "Signals nats-server to reload its config when the operator changes only the bus's permissions, so an AgentProfile added or removed doesn't restart the bus. From nats-io, the same publisher as nats. Pinned by digest as well as tag; same override arrangement as nats."
     },
     {
+      "name": "prometheus-nats-exporter",
+      "origin": "third-party",
+      "repository": "docker.io/natsio/prometheus-nats-exporter",
+      "tag": "0.20.3@sha256:4b8ddc1c86fec360b5cd3d5e1fbc6fb52bdafd5805bba3901cc52926538af255",
+      "override": "A2A_NATS_EXPORTER_IMAGE",
+      "pulledBy": "The metrics sidecar in each pod of that NATS StatefulSet under spec.mode: next, and nothing under spec.mode: today.",
+      "description": "Reads the NATS server's monitor port over the pod's loopback and serves its JetStream stream and storage figures for Managed Prometheus to scrape. Same override arrangement as nats; pinned by digest as well as tag."
+    },
+    {
       "name": "k8s",
       "origin": "third-party",
       "repository": "docker.io/alpine/k8s",

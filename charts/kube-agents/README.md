@@ -171,8 +171,8 @@ operator as `PLATFORM_AGENT_IMAGE`, `AGENT_SANDBOX_IMAGE`, and
 `ghcr.io` and Docker Hub minutes after `helm install` reported success.
 `CREDENTIAL_PROXY_IMAGE` is deliberately not passed: the operator derives the
 broker image from the agent image by swapping the trailing name, so it follows
-the mirror on its own. The sandbox image cannot be derived that way — it is a
-separate repository — which is why it has to be named.
+the mirror on its own. The sandbox image is not derived from the agent image, so
+the chart names it.
 
 The prefix is not a per-image default — it replaces every image's registry and
 path, keeping the trailing name, because that is the flat layout
@@ -695,7 +695,8 @@ a release that predates `operator.metrics` renders with the listener off until t
 
 `platformAgent.healthRules.enabled: true` renders `<name>-health-rules`, a Managed Prometheus
 `Rules` object in the release namespace with the install's At-Risk and Friction alerts over the
-operator's gauges, and the recording rules for their ratios; the alerts are listed on
+operator's gauges (plus one over the A2A gateway's Slack connection gauge and one over the scrape
+jobs' `up`), and the recording rules for their ratios; the alerts are listed on
 [Observability](https://gke-labs.github.io/kube-agents/concepts/observability/#health-cohorts-and-alerts).
 Off by default, and a plain boolean rather than the tri-state above: on means alerts fire,
 into Managed Prometheus's managed Alertmanager, which routes them by the `alertmanager` Secret
@@ -706,7 +707,9 @@ sample floor is a value under `platformAgent.healthRules.thresholds`, with its d
 string, which the schema refuses). A `helm upgrade --reuse-values` from a release that predates
 the key keeps the rules off; turning them on from such a release needs `--reset-then-reuse-values`, which applies the new
 defaults and keeps the release's values, or every threshold set; the schema requires the whole
-block and the template says so when it is missing. The rules read the operator's scrape, so
+block and the template says so when it is missing. `slackDisconnectedFor` is the exception: it is
+optional and defaults to `5m`, so a `--reuse-values` upgrade from a release without it keeps
+rendering. The rules read the operator's scrape, so
 enabling them with `operator.metrics` off, or where the `PodMonitoring` CRD is absent, fails at
 render with a message. The two proposal alerts read the forge's proposal readings, and a fall in
 `proposalsAuthored` (a repository leaving the managed list, or a deleted proposal) silences them for two weeks; see
@@ -786,12 +789,13 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   preserved across `upgrade.sh` upgrades via `TF_VAR_extra_helm_values`.
 - **Git forges and repositories** — `platformAgent.integration.forges` lists
   the forges the agent talks to (`name`, `provider`, optional `host`,
-  `scheme`, `port`, `namespace` and `credentialsRef`), and
+  `scheme`, `port`, `namespace`, `credentialsRef`, `caBundleRef` and
+  `identity`), and
   `platformAgent.integration.repositories` the repositories on them (`forge`,
   `repository`, optional `namespace`, and `role`: `gitops` for the one the
   agent publishes to, `managed` for others it may change, `context` for
-  read-only reference). `provider` is `github`, `gitlab` or `gitea`. If you omit it, it is `github`. A forge at a host other than github.com must name it. `credentialsRef` is
-  ignored for `github` and required for `gitlab` and `gitea`: a Secret holding the access
+  read-only reference). `provider` is `github`, `gitlab`, `gitea`, `bitbucket` (Bitbucket Cloud) or `bitbucket-datacenter`. If you omit it, it is `github`. A forge at a host other than github.com must name it. `credentialsRef` is
+  ignored for `github` and required for `gitlab`, `gitea`, `bitbucket` and `bitbucket-datacenter`: a Secret holding the access
   token under the key `token`, mounted into the credential broker only. A
   `gitlab` forge's `host` is gitlab.com by default or a self-managed instance,
   never a GitHub name, and one `gitlab` forge per host. A `github` forge's
@@ -809,9 +813,9 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   the CA for all of its outbound calls (see the token minter guide). A Secret, so
   changing the CA needs the same rights as changing the token. It is for a
   forge at a self-managed host, GitLab, GitHub Enterprise Server, or `https`
-  Gitea, never gitlab.com or github.com. With a `gitlab` or `gitea` forge
+  Gitea, never gitlab.com or github.com. With a `gitlab`, `gitea` or Bitbucket forge
   declared beside GitHub, a bare `owner/name` still works for a GitHub
-  repository that the install registered by URL. Name a GitLab or Gitea repository, or
+  repository that the install registered by URL. Name a GitLab, Gitea or Bitbucket repository, or
   a GitHub repository that the install did not register, by its URL. Apply `crds/` before upgrading
   to a release that adds a provider, since `helm upgrade` does not update CRDs. A GitHub forge's
   `host` is a spelling of github.com (`github.com`, `www.github.com`,
@@ -820,12 +824,21 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   `host` is required, `scheme` may be `http` only for an in-cluster Service
   (`*.svc` or `*.svc.cluster.local`), `port` is set when the forge is not on
   the scheme's default port, and `credentialsRef` names the Secret holding its
-  API token under the key `token`. A repository must name a declared forge.
+  API token under the key `token`. A `bitbucket` forge is at bitbucket.org
+  only: it takes no `host` other than that, no `port`, no `scheme` and no
+  `caBundleRef`, its `namespace` is a lowercase workspace ID, and one
+  `bitbucket` forge per install. A `bitbucket-datacenter` forge needs `host`
+  (the instance, served at the root path on port 443, so no `port` and no
+  `scheme: http`), may set `caBundleRef`, and its `namespace` is a project key.
+  `identity` is for these two providers only: the account the token acts as,
+  1 to 255 letters, digits and `. _ @ + { } -`; on `bitbucket` it is the
+  account UUID, which a workspace, project or repository access token needs.
+  A repository must name a declared forge.
   `platformAgent.integration.github.org` / `.gitRepo` remain as a deprecated
   alias for one GitHub forge and its gitops repository — set the lists or the
   alias, not both. For a github.com GitOps repository, the alias is still what
   `install.sh` and the `full-install` Terraform composition write. For a
-  GitLab or GitHub Enterprise Server GitOps repository, they write the
+  GitLab, Bitbucket or GitHub Enterprise Server GitOps repository, they write the
   `forges` and `repositories` lists. One GitHub forge with no
   `credentialsRef`, no `caBundleRef`, no host other than a spelling of
   github.com, and at most one repository, the gitops one, with no
@@ -879,6 +892,16 @@ manages. It defaults to `false`, and under `today` the operator renders nothing 
 still works and wins over the value. The
 [MCP server page](https://gke-labs.github.io/kube-agents/reference/a2a-mcp/) is canonical for
 what it renders and how a client connects.
+
+### Slack end-to-end test users (`operator.slackTestUsers`)
+
+Meant for CI and eval installs. `operator.slackTestUsers` lists Slack member ids (`U…`) whose
+posts the A2A gateway reads as theirs even though they carry an app's `bot_id`, which a post
+made with a user token through an app does; the gateway otherwise drops those as bot traffic.
+It renders as `A2A_SLACK_TEST_USERS` on the controller manager, which hands it to the gateway
+when the gateway runs the Slack adapter under `next`. Empty by default, and an `operator.extraEnv` entry of that name wins. A listed
+user still has to be on `integration.slack.allowedUsers`. Nothing but the value itself keeps it
+off a real install, and a listed member's posts through any app in the workspace read as theirs.
 
 ### Data volume size (`platformAgent.storage.size`)
 
@@ -1329,9 +1352,8 @@ though note that if a namespace ResourceQuota restricts that compute resource (s
 declare it (or a `LimitRange` to default it), and will reject the pod if omitted.
 The credential broker's exec tier is counted as `platformAgent.deployment.credentialProxy.exec.replicas`
 times one replica's footprint (`operatorRenderedPerReplica.credentialProxyExecTier`), and not at
-all at `0`. An ephemeral-storage key in `platformAgent.deployment.credentialProxy.resources`
-moves each replica too, because the operator gives the tier the broker's other resource keys; its
-cpu and memory are fixed. It needs no surge headroom: it rolls with `maxSurge: 0` and `maxUnavailable: 1`, so a
+all at `0`. Its cpu, memory and ephemeral storage are fixed: a key in
+`platformAgent.deployment.credentialProxy.resources` moves the stateful broker, not the tier. It needs no surge headroom: it rolls with `maxSurge: 0` and `maxUnavailable: 1`, so a
 rollout replaces a pod in place and adds none. The check counts the
 quota only; whether a node has room for each 2 CPU replica is the scheduler's.
 The two data claims are counted at `platformAgent.storage.size` when it is set: footprint.yaml
@@ -1525,6 +1547,8 @@ No pod runs it until the profile dispatcher, worker and pool land and the
 operator runs them, though enabling it already gets the profile its
 ServiceAccounts, bus identity and agent card. A cluster that needs its own
 persona or tier gets a second `AgentProfile` with `clusterRef` set (`k8s-operator/examples/agentprofile-cluster.yaml`).
+The chart sets `yieldToPinned: true` on `cluster`, so that second profile receives
+the cluster's tasks; a specialist such as `tse` keeps the tasks addressed to it.
 
 ## Uninstalling
 

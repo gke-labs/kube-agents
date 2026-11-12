@@ -377,7 +377,7 @@ class PreflightDecisionTest(unittest.TestCase):
     def test_exec_tier_replicas_add_one_replica_each(self) -> None:
         """platformAgent.deployment.credentialProxy.exec.replicas adds that many exec-tier
         pods, each at the footprint's per-replica entry (2 CPU and 2Gi requests and limits,
-        and the broker's ephemeral storage); 0 adds nothing."""
+        and the tier's own 2Gi of ephemeral storage); 0 adds nothing."""
         base = self._requirements()
         self.assertEqual(self._requirements([f"{_EXEC_VALUE}=0"]), base)
         three = self._requirements([f"{_EXEC_VALUE}=3"])
@@ -390,35 +390,35 @@ class PreflightDecisionTest(unittest.TestCase):
         self.assertEqual(per["cpuMillisRequest"], 2000)
         self.assertEqual(three["persistentVolumeClaims"], base["persistentVolumeClaims"])
 
-    def test_exec_tier_follows_a_broker_ephemeral_storage_override(self) -> None:
-        """The operator gives the tier the broker's other resource keys, so a broker
-        ephemeral-storage limit moves every replica (request and limit, as the API server
-        defaults the request to it); the tier's cpu and memory do not move with a cpu or
-        memory override."""
-        ten_gib = 10 * 1024**3
+    def test_a_broker_ephemeral_storage_override_does_not_reach_the_exec_tier(self) -> None:
+        """The tier's ephemeral storage is its own and fixed (#4536), so a broker
+        ephemeral-storage limit leaves every replica at the footprint's 2Gi, request and
+        limit; nor does a cpu or memory override move the tier's cpu and memory."""
+        two_gib = 2 * 1024**3
         override = [f"{_PROXY_VALUE}.limits.ephemeral-storage=10Gi"]
         base = self._requirements(override)
         three = self._requirements(override + [f"{_EXEC_VALUE}=3"])
-        self.assertEqual(three["limitsEphemeral"] - base["limitsEphemeral"], 3 * ten_gib)
-        self.assertEqual(three["requestsEphemeral"] - base["requestsEphemeral"], 3 * ten_gib)
+        self.assertEqual(three["limitsEphemeral"] - base["limitsEphemeral"], 3 * two_gib)
+        self.assertEqual(three["requestsEphemeral"] - base["requestsEphemeral"], 3 * two_gib)
         cpu_override = [f"{_PROXY_VALUE}.limits.cpu=3", f"{_PROXY_VALUE}.limits.memory=4Gi"]
         cpu_base = self._requirements(cpu_override)
         cpu_three = self._requirements(cpu_override + [f"{_EXEC_VALUE}=3"])
         self.assertEqual(cpu_three["limitsCpu"] - cpu_base["limitsCpu"], 3 * 2000)
         self.assertEqual(cpu_three["limitsMemory"] - cpu_base["limitsMemory"], 3 * 2 * 1024**3)
 
-    def test_exec_tier_follows_an_ephemeral_storage_override_the_sizing_row_admits(self) -> None:
+    def test_an_ephemeral_storage_override_the_sizing_row_admits_does_not_reach_the_exec_tier(self) -> None:
         """Under fleet, a broker override with a memory request alone above the small
-        row's 2Gi limit (admitted on the fleet row) and an ephemeral-storage limit: the
-        operator gives each exec replica that ephemeral-storage, so the preflight counts
-        it, rather than treating the override as refused against the small row."""
-        ten_gib = 10 * 1024**3
+        row's 2Gi limit (admitted on the fleet row) and an ephemeral-storage limit: each
+        exec replica still counts the footprint's 2Gi of ephemeral storage and 2Gi of
+        memory, and the override is not refused against the small row on the tier's
+        account."""
+        two_gib = 2 * 1024**3
         override = [f"{_SIZING_VALUE}=fleet", f"{_PROXY_VALUE}.requests.memory=4Gi",
                     f"{_PROXY_VALUE}.limits.ephemeral-storage=10Gi"]
         base = self._requirements(override)
         three = self._requirements(override + [f"{_EXEC_VALUE}=3"])
-        self.assertEqual(three["limitsEphemeral"] - base["limitsEphemeral"], 3 * ten_gib)
-        self.assertEqual(three["requestsEphemeral"] - base["requestsEphemeral"], 3 * ten_gib)
+        self.assertEqual(three["limitsEphemeral"] - base["limitsEphemeral"], 3 * two_gib)
+        self.assertEqual(three["requestsEphemeral"] - base["requestsEphemeral"], 3 * two_gib)
         self.assertEqual(three["limitsMemory"] - base["limitsMemory"], 3 * 2 * 1024**3)
 
     def test_exec_tier_without_its_footprint_entry_fails_the_render(self) -> None:
@@ -1036,6 +1036,24 @@ class PreflightDecisionTest(unittest.TestCase):
             delta[out] = sum(w[key] for w in workloads) + bridge[key] * agent_replicas
         return delta
 
+    def test_a_single_server_bus_is_counted_as_one_server(self) -> None:
+        """footprint.yaml counts the bus at three NATS servers; with
+        platformAgent.harness.tuning.busReplicas: 1 the preflight counts one, so a
+        one-server install is not asked for two more pods' and claims' room."""
+        nats = yaml.safe_load(_FOOTPRINT.read_text())["nextMode"]["a2aNats"]
+        claims = yaml.safe_load(_FOOTPRINT.read_text())["nextMode"]["storage"]
+        n = int(nats["pods"])
+        self.assertEqual(n, 3)
+        three = self._requirements(["platformAgent.mode=next"])
+        one = self._requirements(["platformAgent.mode=next", "platformAgent.harness.tuning.busReplicas=1"])
+        self.assertEqual(three["pods"] - one["pods"], n - 1)
+        self.assertEqual(three["persistentVolumeClaims"] - one["persistentVolumeClaims"], int(claims["persistentVolumeClaims"]) - 1)
+        self.assertEqual(three["requestsStorage"] - one["requestsStorage"], int(claims["storageBytesRequest"]) * (n - 1) // n)
+        self.assertEqual(three["requestsCpu"] - one["requestsCpu"], int(nats["cpuMillisRequest"]) * (n - 1) // n)
+        self.assertEqual(three["requestsMemory"] - one["requestsMemory"], int(nats["memoryBytesRequest"]) * (n - 1) // n)
+        # Set to 3, or unset, it counts three.
+        self.assertEqual(self._requirements(["platformAgent.mode=next", "platformAgent.harness.tuning.busReplicas=3"]), three)
+
     def test_mode_next_adds_the_next_mode_footprint(self) -> None:
         """A next-mode install runs the A2A stack beside the today-mode one (#3753)."""
         base = self._requirements()
@@ -1045,7 +1063,8 @@ class PreflightDecisionTest(unittest.TestCase):
                 self.assertEqual(following[key] - base[key], value)
         # Not a vacuous zero: the stack is several pods and a JetStream claim.
         self.assertGreaterEqual(following["pods"] - base["pods"], 7)
-        self.assertEqual(following["persistentVolumeClaims"] - base["persistentVolumeClaims"], 1)
+        # One JetStream claim per NATS server, three by default.
+        self.assertEqual(following["persistentVolumeClaims"] - base["persistentVolumeClaims"], 3)
 
     def test_mode_next_counts_no_gateway_standby_with_the_election_off(self) -> None:
         """A2A_GATEWAY_ELECTION=false on the operator runs one unelected gateway, so the
