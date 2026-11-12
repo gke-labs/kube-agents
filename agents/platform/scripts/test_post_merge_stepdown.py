@@ -22,11 +22,12 @@ automerge:
 
 class FakeForge:
     def __init__(self, *, state="merged", labels=(ar.AUTOMERGE_LABEL,), comments=(), existing=None,
-                 viewer="kube-agents-app[bot]", truncated=False):
+                 viewer="kube-agents-app[bot]", truncated=False, merge_commit="abc123"):
         self.calls = []
         self.state, self.labels, self.comments = state, list(labels), list(comments)
         self.existing = existing or {}
         self.viewer, self.truncated = viewer, truncated
+        self.merge_commit = merge_commit
 
     def __call__(self, verb, payload):
         self.calls.append((verb, payload))
@@ -38,7 +39,7 @@ class FakeForge:
             return {"proposal": {
                 "number": 7, "title": "fix(pdb): add a budget for api", "state": self.state,
                 "labels": self.labels, "url": "https://github.com/acme/gitops/pull/7",
-                "target": "main", "mergeCommit": "abc123" if self.state == "merged" else None,
+                "target": "main", "mergeCommit": self.merge_commit if self.state == "merged" else None,
             }}
         if verb == "identity":
             return {"identity": {"login": self.viewer}}
@@ -55,12 +56,13 @@ class FakeForge:
 
 class FakeOpen:
     def __init__(self, fail=()):
-        self.opened, self.fail = [], set(fail)
+        self.opened, self.fail, self.bodies = [], set(fail), []
 
     def __call__(self, forge, repo, branch, base, title, body, write):
         if branch in self.fail:
             raise pms.StepDownError(f"{branch} broke")
         self.opened.append((branch, base, title))
+        self.bodies.append(body)
         return f"https://github.com/acme/gitops/pull/{len(self.opened) + 7}"
 
 
@@ -140,6 +142,15 @@ class TestStepDown(unittest.TestCase):
         self.assertNotIn("errors", result)
         for verb in ("proposal-update", "proposal-close", "label-ensure"):
             self.assertNotIn(verb, forge.verbs())
+
+    def test_fast_forward_merge_without_a_merge_commit(self):
+        # GitLab leaves mergeCommit empty after a fast-forward merge.
+        forge, opener = FakeForge(merge_commit=None), FakeOpen()
+        result = run(forge, opener)
+        self.assertEqual(result["action"], "stepped-down")
+        self.assertEqual(len(opener.opened), 2)
+        self.assertIn("This undoes its changes.", opener.bodies[0])
+        self.assertNotIn("None", opener.bodies[0])
 
     def test_existing_pull_requests_are_reused(self):
         forge = FakeForge(existing={"platform-agent/revert-7": "R", "platform-agent/automerge-step-down-7": "S"})
@@ -266,6 +277,17 @@ class TestWriters(unittest.TestCase):
     def test_empty_diff_is_refused(self):
         with self.assertRaises(pms.StepDownError):
             pms._revert_writer(self.fix, 7, "  \n")(self.tree, self.vcs, REPO, "b")
+
+    def test_a_forge_note_in_the_diff_is_retried_not_refused(self):
+        diff = self._fix_branch(commits=1)
+        _git(self.tree, "merge", "-q", "--no-ff", "-m", "merge fix", "fix")
+        for text in (diff + "# diff cut short: only the first 1 files are shown\n",
+                     "# Bitbucket did not name both commits of this pull request, so no diff is shown\n"):
+            with self.subTest(text[-40:]):
+                with self.assertRaises(RuntimeError) as caught:
+                    pms._revert_writer(self.fix, 7, text)(self.tree, self.vcs, REPO, "b")
+                self.assertNotIsInstance(caught.exception, pms.StepDownError)
+        self.assertTrue((self.tree / "pdb-0.yaml").exists())
 
     def test_step_down_adds_a_deny_rule(self):
         pms._step_down_writer("no-pdb", "dev", "https://x/pull/7")(self.tree, self.vcs, REPO, "b")

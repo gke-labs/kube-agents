@@ -117,6 +117,12 @@ def _open(forge: Forge, repo: str, branch: str, base: str, title: str, body: str
     return str(answer["proposal"]["url"])
 
 
+def _merge_commit(fix: dict) -> str:
+    """` (merge commit <sha>)`, or nothing: a GitLab fast-forward merge has none."""
+    sha = fix.get("mergeCommit")
+    return f" (merge commit {sha})" if sha else ""
+
+
 def _revert_writer(fix: dict, number: int, diff: str) -> Callable[[Path, Any, str, str], None]:
     """Undo the pull request's own diff, rather than `git revert` its merge commit.
 
@@ -129,6 +135,12 @@ def _revert_writer(fix: dict, number: int, diff: str) -> Callable[[Path, Any, st
     def write(tree: Path, vcs_client: Any, repo: str, branch: str) -> None:
         if not diff.strip():
             raise StepDownError(f"#{number} has no diff to undo")
+        if any(line.startswith("#") for line in diff.splitlines()):
+            # A forge adapter's note in place of changes it withheld or cut
+            # short. No line of a real diff starts with `#`, so applying this
+            # would undo part of the fix or fail as a false conflict. Not a
+            # refusal: the forge may return the whole diff on the next run.
+            raise RuntimeError(f"the forge returned only part of #{number}'s diff")
         with tempfile.NamedTemporaryFile("w", suffix=".diff", delete=False, encoding="utf-8") as handle:
             handle.write(diff if diff.endswith("\n") else diff + "\n")
         try:
@@ -145,8 +157,7 @@ def _revert_writer(fix: dict, number: int, diff: str) -> Callable[[Path, Any, st
             raise StepDownError("its changes are already gone from the base branch")
         vcs_client.commit(
             f'Revert "{fix.get("title") or f"#{number}"}"\n\n'
-            f"This undoes the changes of {fix.get('url') or f'#{number}'} "
-            f"(merge commit {fix.get('mergeCommit')}).",
+            f"This undoes the changes of {fix.get('url') or f'#{number}'}{_merge_commit(fix)}.",
             spec=repo,
             key=branch,
         )
@@ -203,7 +214,7 @@ def step_down(
     forge = forge or _forge(repo)
     open_proposal = open_proposal or _open
     fix = forge("proposal-view", {"number": number}).get("proposal") or {}
-    if fix.get("state") != "merged" or not fix.get("mergeCommit"):
+    if fix.get("state") != "merged":
         return {"action": "none", "reason": f"#{number} is {fix.get('state') or 'unknown'}, not merged"}
     if automation_rules.AUTOMERGE_LABEL not in (fix.get("labels") or []):
         return {"action": "none", "reason": f"#{number} has no {automation_rules.AUTOMERGE_LABEL} label; a person merged it"}
@@ -239,7 +250,7 @@ def step_down(
                 forge, repo, revert_branch, base,
                 f'Revert "{fix.get("title") or f"#{number}"}"',
                 f"{fix_url} merged without a human review, and the post-merge check found the "
-                f"problem still there. This undoes its changes (merge commit {fix['mergeCommit']}).\n\n"
+                f"problem still there. This undoes its changes{_merge_commit(fix)}.\n\n"
                 "Review it like any other change. kube-agents does not merge it.",
                 _revert_writer(fix, number, diff),
             )

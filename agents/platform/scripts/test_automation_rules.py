@@ -292,6 +292,8 @@ class TestWithDeny(unittest.TestCase):
         "flow deny": "version: 1\nautomerge:\n  allow: [{fix: no-pdb, environments: [dev]}]\n  deny: [{fix: '*', environments: [prod]}]\n",
         "flow automerge, no newline": "version: 1\nautomerge: {allow: [{fix: no-pdb, environments: [dev]}]}",
         "deny first, wide dash": "version: 1\nautomerge:\n  deny:\n  -   fix: '*'\n      environments: [prod]\n  allow:\n  - fix: no-pdb\n    environments: [dev]\n",
+        "bare dash": "version: 1\nautomerge:\n  allow: [{fix: no-pdb, environments: [dev]}]\n  deny:\n    -\n      fix: '*'\n      environments: [prod]\n",
+        "comment after dash": "version: 1\nautomerge:\n  allow: [{fix: no-pdb, environments: [dev]}]\n  deny:\n  - # why\n    fix: '*'\n    environments: [prod]\n",
         "numeric environment": "version: 1\nautomerge:\n  allow: [{fix: no-pdb, environments: ['1']}]\n",
     }
 

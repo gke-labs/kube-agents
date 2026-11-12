@@ -331,10 +331,9 @@ def with_deny(text: str, fix_type: str, environment: str, note: str = "") -> str
         insert = flow_item if not deny.value else f", {flow_item}"
         out = text[:close] + insert + text[close:]
     elif isinstance(deny, yaml.SequenceNode) and deny.value:
-        first = deny.value[0].start_mark
-        line_start = text.rfind("\n", 0, first.index) + 1
-        dash = text.rfind("-", line_start, first.index)
-        out = _insert_after_line(text, _exact_end(deny), block_item(" " * (dash - line_start)))
+        # The sequence's own mark is its first `-`; the first rule's mark is its
+        # first key, which may sit on the next line after a bare `-`.
+        out = _insert_after_line(text, _exact_end(deny), block_item(" " * deny.start_mark.column))
     elif automerge.flow_style:
         if deny is not None:
             raise RulesError("`automerge.deny` is not a list")
