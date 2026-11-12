@@ -280,7 +280,9 @@ The rules that keep this safe:
   between otherwise identical runs. In those sentences only, the revision
   is bound like any commit, and the number gets a placeholder that, like a `pid`, is never put back
   in an answer: an answer that holds the number with no digit beside it (`proposal view 1399`,
-  `PR #1399`) isn't saved. A proposal number or a run of hex anywhere else stays literal.
+  `PR #1399`) isn't saved. A proposal number or a run of hex anywhere else stays literal,
+  including the broker's error a refused delete quotes in parentheses, so two runs refused alike
+  still key apart there.
 - **A time of day on its own is left as written.** A bare `13:44` is in 43% of requests, but
   without a date it can't be turned into how far from now it is: it may be yesterday's, another
   time zone's, or a duration (`ps` prints CPU time as `0:47`). Any token for it would give

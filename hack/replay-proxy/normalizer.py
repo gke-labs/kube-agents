@@ -368,7 +368,11 @@ HEX_LETTER_RE = re.compile(r"[a-f]")
 # the branch at <12 hex>" and "The repository still holds the branch at <12
 # hex>". The number and revision are read only in those sentences, the number
 # in a GitHub (`/pull/<n>`) or GitLab (`/-/merge_requests/<n>`) proposal URL,
-# the forms the broker's proposals carry. The revision is bound as a commit. The
+# the forms the broker's proposals carry. A refusal also quotes the broker's own
+# error in parentheses, which can repeat the revision ("is at <12 hex>"), name
+# another revision or a proposal URL in other words; that text is left as
+# written, so two runs refused alike still key apart there (a miss, not a
+# wrong answer). The revision is bound as a commit. The
 # number gets a placeholder in the key and is never put back in an answer: it
 # is a bare number, and an unrelated `175` in an answer must not become this
 # run's. An answer that holds it with no digit beside it is not saved instead
@@ -459,12 +463,14 @@ READ_FILE_ERROR_KEY = "error"
 READ_FILE_NOT_FOUND_PREFIX = "File not found:"
 SIMILAR_FILES_KEY = "similar_files"
 # A dropped file's name counts in an answer where no word character, `.` or `-`
-# comes before it and no word character or `-` follows it. A JSON escape
+# comes before it and no word character, `-`, or `.` and a word character
+# follows it (`config` is not `config.yaml`; a sentence's closing
+# `INVENTORY.md.` still counts). A JSON escape
 # (`\n`, `\t`, `\r`) also counts as a boundary before it: a tool call's
 # `arguments` is a JSON string, so a name starting a line of a `write_file`'s
 # content is written `...\nINVENTORY.md`, with a word character before it.
 DROPPED_FILE_BEFORE = r"(?:(?<![\w.-])|(?<=\\[ntr]))"
-DROPPED_FILE_AFTER = r"(?![\w-])"
+DROPPED_FILE_AFTER = r"(?![\w-]|\.\w)"
 
 # A string that may hold a JSON document (a tool result usually does).
 JSON_OPENERS = "{["

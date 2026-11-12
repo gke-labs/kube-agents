@@ -1020,9 +1020,14 @@ class SimilarFilesTest(unittest.TestCase):
             with self.subTest(answer=answer):
                 self.assertTrue(mapping.answer_names_dropped_file(answer))
         self.assertEqual(mapping.dropped_files, {"INVENTORY.md", "INVENTORY.raw.md", "SETTINGS.md"})
-        for answer in ('{"path": "/opt/data/AGENTS.md"}', "OLD_INVENTORY.md", "INVENTORY.mdx", "an inventory"):
+        for answer in ('{"path": "/opt/data/AGENTS.md"}', "OLD_INVENTORY.md", "INVENTORY.mdx", "an inventory",
+                       "cp INVENTORY.md.bak /tmp"):
             with self.subTest(answer=answer):
                 self.assertFalse(mapping.answer_names_dropped_file(answer))
+        # A name with no extension is not the start of a longer file name.
+        bare = normalizer.normalize_request(read_file_conversation(not_found(similar=["/opt/data/config"])), NOW).mapping
+        self.assertTrue(bare.answer_names_dropped_file("cat config."))
+        self.assertFalse(bare.answer_names_dropped_file("cat config.yaml"))
         self.assertEqual(normalizer.normalize_request(
             read_file_conversation(not_found(similar=self.WITH_INVENTORY), tool_name="terminal"), NOW).mapping.dropped_files,
             set(), "nothing is dropped from another tool's result, so nothing counts")
