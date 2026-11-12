@@ -2838,9 +2838,11 @@ every message through either stamps its own backend.
   caller's own task the door dropped to stay inside its bounds, and `not-held-since-serving`
   for anything else: a task submitted before `servingSince`, the caller's own task evicted so long
   ago that the door no longer remembers it (it keeps 4096 such ids), and equally another caller's
-  id or one no door minted, so the answer still confirms nothing. A client that resubmits starts
-  the task again and should expect possible duplicate work: the `messageId` dedupe lives in
-  the same memory, so a repeated `messageId` doesn't dedupe across a restart.
+  id or one no door minted, so the answer still confirms nothing. A client that resubmits with a
+  new `messageId` starts the task again and should expect possible duplicate work: the
+  `messageId` dedupe lives in the same memory, so a repeated `messageId` doesn't dedupe across a
+  restart. On the same gateway a repeated `messageId` still names the original task, so
+  resubmitting an evicted task with its original `messageId` doesn't start a new run.
 - `tasks/cancel` is a cancel turn on the task's conversation - the same `kind: cancel` envelope
   the inject door's cancel route and the chat path's `stop` publish - answered once the cancel is
   on the bus (`TaskObserver.CancelPublished`) with the `Task` as it stands. The executor decides

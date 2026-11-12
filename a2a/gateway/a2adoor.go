@@ -1476,9 +1476,11 @@ func (d *A2ADoor) rememberEvictedLocked(taskID, caller string) {
 // a2aNotHeldData is the data of a door not-found error: why the door
 // doesn't hold the task, when this gateway started serving the door, and
 // that the task's outcome is unknown here (MayHaveRun): a caller that
-// resubmits starts it again, possibly twice. The door's messageId dedupe
-// is in the same memory, so a repeated messageId doesn't dedupe across a
-// restart either.
+// resubmits with a new messageId starts it again, possibly twice. The
+// door's messageId dedupe is in the same memory, so a repeated messageId
+// doesn't dedupe across a restart either; on the same gateway it still
+// names the original task, so reusing an evicted task's messageId doesn't
+// start a fresh run.
 type a2aNotHeldData struct {
 	Reason       string `json:"reason"`
 	ServingSince string `json:"servingSince"`
@@ -1500,7 +1502,8 @@ func (d *A2ADoor) a2aTaskNotHeld(id json.RawMessage, taskID, caller string) rpcR
 		data.Reason = a2aNotHeldEvicted
 		return rpcFail(id, a2aErrTaskNotFound, "no such task for this caller: "+taskID+
 			"; the door held it and evicted it to stay inside its bounds, so its outcome is unknown here: "+
-			"it may have run or may still be running, and resubmitting starts it again", data)
+			"it may have run or may still be running. Resubmitting with a new messageId starts it again; "+
+			"reusing the original messageId does not", data)
 	}
 	return rpcFail(id, a2aErrTaskNotFound, "no such task for this caller: "+taskID+
 		"; the A2A door keeps tasks in the active gateway's memory only, and this gateway has served the door since "+
