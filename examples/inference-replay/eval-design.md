@@ -325,7 +325,7 @@ replace it.
 ### Replay lane trials
 
 The table above replays a recording minutes later. To test what the replay lane would do, we ran
-the lane's record and replay modes on the same dev install (2026-11-04 and 05, `gemini-4-argon`, the
+the lane's record and replay modes on the same dev install (2026-11-04 and 05, the
 inject door, as the presubmit runs). Four cases were recorded once, the way the nightly would, and
 then each was replayed three times. "Reused" is the share of prompt tokens served from saved
 answers instead of the model.
@@ -787,7 +787,7 @@ before stage 3 of the rollout (turning replay on):
      tool), and the result of that action differs too. Under replay the saved action would run
      and return the same result.
 
-   The dev-install dry run (2026-11-04, `gemini-4-argon`, four phases standing in for a nightly,
+   The dev-install dry run (2026-11-04, four phases standing in for a nightly,
    two builds of one pull request and a second pull request) showed how big the gap is: the
    replayed estimate (then called simulated) was 12%, ignoring other agents' kanban text as well
    raised it to 22%, and most of the remaining misses were tool results after a differently chosen
@@ -816,7 +816,8 @@ before stage 3 of the rollout (turning replay on):
 
 2. **A replay lane that gates nothing.** Real replay can't run in the presubmit or the nightly
    without changing their results, so it gets its own job: a periodic, non-blocking job that runs a
-   set of cases on `main`'s code with replay on, served from the nightly's recordings. Its results
+   set of cases with replay on, served from the nightly's recordings, on the commit the newest
+   recording night ran. Its results
    don't block anything and aren't written to the evidence store. For this the nightly saves its
    answers, keyed by fingerprint, as the trusted writer in "Who can write to the cache"; the lane
    only reads them. For each conversation it records
@@ -835,8 +836,11 @@ before stage 3 of the rollout (turning replay on):
    as `eval-baseline-recorder` records, and uploads the answers whose runs passed to a bucket only
    that account can write. It works out which run each answer came from after the fact, from the
    cards each request and each run's results name ("Telling the runs in a build apart"). A
-   periodic on `main`, at 06:00 UTC, replays the previous nights' complete recordings plus
-   tonight's partial ones, gating nothing. It reports what was
+   periodic at 06:00 UTC replays the previous nights' complete recordings plus tonight's partial
+   ones, gating nothing. It checks out the commit the newest recording night ran (each record names
+   it), or `main` when no record does, so what merged between 00:00 and 06:00 doesn't change what
+   it asks: it measures replay on unchanged code, and the drift `main` takes overnight is shadow
+   mode's to measure. A regression in the lane's own code is then caught a night later. It reports what was
    served before each first miss, the miss causes, and each case's verdicts beside the nightly's.
    The bucket's grants say who uploaded, not that nothing touched the night. A presubmit leased
    into the same pool project as a running nightly can reach the nightly's proxy, or the LiteLLM
@@ -872,7 +876,7 @@ rest live, and compare the two groups.
     needs (the shared cache, who can write to it, and the gate rules).
 
 Our staged plan answers the same questions without touching anyone's pull request until we know:
-shadow mode measures how often pull requests could hit, at no risk; the replay lane replays the nightly's own recordings of the same cases on `main`'s code, which is the like-for-like comparison an A/B test
+shadow mode measures how often pull requests could hit, at no risk; the replay lane replays the nightly's own recordings of the same cases on the code that recorded them, which is the like-for-like comparison an A/B test
 can't give; and only then do presubmits turn on. Its weakness is that the lane isn't real pull
 request traffic, and stage 3 turns replay on for everyone at once. If we want a ramp at stage 3, we
 would turn replay on case by case rather than by coin flip: the same cases replay for every pull

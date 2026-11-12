@@ -427,6 +427,12 @@ kanban worker, which includes the scheduled audits. `environment` is stored if a
 outcome columns are left for the check to fill. `cleanup_old_records` leaves the table: each row is
 a durable record of a fix pull request, not idle-session state.
 
+`GET /v1/post-merge/clean-merges` reads this table and answers the clean merges per repository, kind of
+fix and environment, as a `counts` list; `?repo=<url>` narrows it to one repository. The rule and its
+thresholds (`REVERT_WINDOW`, `CLEAN_MERGES_NEEDED`, `DAYS_NEEDED`) live in `clean_merges.py`. A table
+that does not exist yet answers an empty list; a table missing a column the count needs, or a database
+that cannot be read, answers `503`.
+
 #### `incidents`
 
 Stores the triage report context for active incident threads:

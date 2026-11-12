@@ -73,6 +73,7 @@ from kube_agents_bench.cases import HARNESS_WRITTEN_ENTRIES, NOOP_DEPLOYER, Case
 from kube_agents_bench.fixture_drift import FIXTURE_DRIFT_LABEL
 from kube_agents_bench.forges import FORGE_UNAVAILABLE_MARKER
 from kube_agents_bench.worker_trajectory import GAP_ENTRY as WORKER_CAPTURE_GAP_ENTRY
+from kube_agents_bench.worker_trajectory import NO_WORKER_CALLS_ENTRY
 
 __all__ = [
     "DEFAULT_AGGREGATE_MARGIN",
@@ -282,7 +283,8 @@ A2A_STATE_WORKING = "working"
 #: that happened, and a ``none``-wrapped safeguard could pass over one. A
 #: check that reads the delegated workers or a call's result is set aside
 #: on every inject record that does not carry the workers' tagged entries
-#: in full, marker or not: the trace carries no card ids, no worker's
+#: in full, marker or not (a ``workers``-scope ``tool_called`` grades on zero
+#: calls beside :data:`NO_WORKER_CALLS_ENTRY`, ``_inject_lane_view``): the trace carries no card ids, no worker's
 #: entries and no results (``cases.py``, ``worker_blind_checks``). The names are duplicated rather than imported,
 #: like the status entry, and so are the marker's four loss arguments
 #: (``inject_transport.ACTIVITY_LOSS_ARGS``); ``test_scoring.py`` asserts
@@ -1138,6 +1140,20 @@ def _inject_workers_carried(trajectory: list[Any]) -> bool:
     )
 
 
+def _inject_no_worker_calls(trajectory: list[Any]) -> bool:
+    """Whether an inject record says the workers made no call: it carries the
+    harness's :data:`NO_WORKER_CALLS_ENTRY` (every awaited card closed, a clean
+    capture holding no worker entry), no tagged worker entry and no
+    :data:`WORKER_CAPTURE_GAP_ENTRY`."""
+    entries = [entry for entry in trajectory if isinstance(entry, dict)]
+    names = {entry.get("name") for entry in entries}
+    return (
+        NO_WORKER_CALLS_ENTRY in names
+        and WORKER_CAPTURE_GAP_ENTRY not in names
+        and not any(entry.get("agent") for entry in entries)
+    )
+
+
 def _inject_blind(trajectory: list[Any]) -> bool:
     """Whether the trajectory is the inject transport's and cannot vouch for
     the delegating turn's tool calls.
@@ -1280,6 +1296,10 @@ def _inject_lane_view(spec: CaseSpec, record: RunRecord) -> _LaneView | None:
     that does not carry the workers (:func:`_inject_workers_carried`: no
     tagged worker entry, or a capture gap), marker or not, since the trace
     carries no card ids, no worker's entries and no results. On a record
+    carrying :data:`NO_WORKER_CALLS_ENTRY`, no tagged entry and no gap
+    (:func:`_inject_no_worker_calls`), the entries in
+    :attr:`CaseSpec.worker_calls_checks` grade on zero worker calls and the
+    rest stay set aside. On a record
     that carries them it grades, except an entry that also reads the
     router's calls (:attr:`CaseSpec.worker_router_checks`) on a record whose
     door did not vouch for them, and an entry that reads what the trace
@@ -1302,6 +1322,10 @@ def _inject_lane_view(spec: CaseSpec, record: RunRecord) -> _LaneView | None:
         set_aside = set(spec.worker_untraced_checks)
         if trace_blind:
             set_aside |= spec.worker_router_checks
+    elif _inject_no_worker_calls(record.trajectory):
+        # The workers made no call: the checks that read only their calls
+        # grade that as zero calls, and the rest still have nothing to read.
+        set_aside = set(spec.worker_blind_checks) - spec.worker_calls_checks
     else:
         set_aside = set(spec.worker_blind_checks)
     if trace_blind:

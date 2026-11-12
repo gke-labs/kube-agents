@@ -90,7 +90,7 @@ the Result column says whether the data confirms the prediction.
 
 | Item                             | Value                                                                                                                                                                                                                                                                                                                                                                  |
 | -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Build                            | `main` at `0108e59d`, `spec.mode: next`, model `vertex_ai/gemini-3.5-flash`                                                                                                                                                                                                                                                                                            |
+| Build                            | `main` at `0108e59d`, `spec.mode: next`, the install's default model on Vertex AI                                                                                                                                                                                                                                                                                      |
 | Install                          | New install with `install.sh` on 2026-10-29 (uninstall first), no GitOps repository. The first-run window starts from a reset: the runner deleted and re-created the agent's data volumes, which clears all agent state and starts the first-run flow again. The operator, credential proxy and A2A Pods ran from the install on 2026-10-29; they hold no agent state. |
 | Host cluster                     | `scale-host`, zonal Standard, 2 × e2-standard-4 (default and gVisor pools)                                                                                                                                                                                                                                                                                             |
 | Agent                            | limit 8 CPU, 16 GB                                                                                                                                                                                                                                                                                                                                                     |
@@ -477,8 +477,8 @@ measure it without the cost of real nodes.
 ## Cost
 
 Prices are on-demand list prices for `us-central1`. Token prices are from LiteLLM's model cost
-map for `vertex_ai/gemini-3.5-flash`: $1.50 per million input tokens, $0.15 per million cached
-input tokens, $9.00 per million output tokens.
+map for the install's model: $1.50 per million input tokens, $0.15 per million cached input
+tokens, $9.00 per million output tokens.
 
 | Item                                                                           | Per hour      |
 | ------------------------------------------------------------------------------ | ------------- |
