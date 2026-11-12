@@ -145,6 +145,16 @@ def _tokens(text):
 class PrOpenedTest(unittest.TestCase):
     def setUp(self):
         self.ledger = []
+        # The switch's root-owned files win over the variable; on a pod or in
+        # the sandbox the host's own files would decide these tests.
+        plugin._on_scripts_path()
+        import kubeagents_switches
+
+        missing = Path(tempfile.mkdtemp()) / "absent"
+        for name in ("MANAGED_DOTENV_PATH", "SWITCH_DIR"):
+            patcher = mock.patch.object(kubeagents_switches, name, missing)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def run_hook(self, output, kanban, task=TASK, broker=None, origins=None):
         env = {plugin.TASK_ENV: task} if task else {}
