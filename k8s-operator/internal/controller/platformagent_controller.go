@@ -1356,10 +1356,17 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		// No bus, no server count. Telling the writers what the CR carried
-		// lets them write the cleared field once, and then find it current.
+		// The bus is torn down but its data claims are kept, so that a flip
+		// back reuses them, and so is the count it last ran at (#5451): with
+		// no record, the flip back reads the claims, and a single server once
+		// scaled by hand keeps claims -1 and -2 under WhenScaled Retain,
+		// which read as three servers over a one-server store and recreate
+		// every stream empty. resolveA2ABusReplicas reads the record only
+		// while a bus exists to keep (a StatefulSet or labelled claims), so a
+		// record kept here cannot bring back a bus whose claims are gone.
+		// The writers are told the value the CR carries, so the kept field
+		// reads current and no pass writes status on its account.
 		a2aState.busReplicasPersisted = instance.Status.BusReplicas
-		instance.Status.BusReplicas = 0
 		// The dispatcher and its Job mode went with the stack, unless their
 		// profile-namespace teardown failed: then the Jobs Role and templates
 		// are still live and the condition stays as it was.

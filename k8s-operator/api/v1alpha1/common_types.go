@@ -2794,7 +2794,10 @@ type AgentStatus struct {
 	// the count the bus already runs, which spec.harness.tuning.busReplicas
 	// does not change; for a new bus, that field, or 3. Re-derived from the
 	// cluster on every reconcile, so it is a reading of the bus rather than a
-	// setting.
+	// setting. Kept through a flip to spec.mode: today, while the bus's data
+	// claims are kept for the flip back, so that the bus returns at the count
+	// it ran rather than the count its claims imply; it is not a claim that a
+	// bus is running.
 	// +optional
 	BusReplicas int32 `json:"busReplicas,omitempty"`
 

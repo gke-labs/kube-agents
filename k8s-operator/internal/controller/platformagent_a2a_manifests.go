@@ -4770,8 +4770,9 @@ func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, age
 		case running == 2:
 			// No record: claims for ordinals 0 and 1 and not 2 are a
 			// three-server bus that lost one, not a two-server bus, which
-			// never existed. A flip to today clears the record, so a bus
-			// coming back from today reads its claims.
+			// never existed. A flip to today keeps the record (#5451), so a
+			// bus back from today resolves through the case above; this one
+			// is for a record lost another way (a served CRD that prunes it).
 			running = 3
 		}
 	default:

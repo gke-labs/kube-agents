@@ -1024,41 +1024,135 @@ func TestAConversionDropsBusProvisioned(t *testing.T) {
 	}
 }
 
-// A flip to today clears status.busReplicas: a today CR has no bus.
-func TestAFlipToTodayClearsTheBusServerCount(t *testing.T) {
+// flipRig is a next install reconciled through Reconcile, with the fake
+// client's status subresource and server-side apply.
+func flipRig(t *testing.T, agent *agentv1alpha1.PlatformAgent) (*PlatformAgentReconciler, client.Client, ctrl.Request) {
+	t.Helper()
 	scheme := setupScheme()
-	agent := a2aTestAgent()
-	keys := sandboxKeysSecret(agent)
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, keys).
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, sandboxKeysSecret(agent)).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
-	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
-	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
-	ctx := context.Background()
-	for i := 0; i < 2; i++ {
-		if _, err := r.Reconcile(ctx, req); err != nil {
-			t.Fatalf("Reconcile %d under next: %v", i+1, err)
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(64)}
+	return r, cl, ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+}
+
+func reconcileN(t *testing.T, r *PlatformAgentReconciler, req ctrl.Request, n int, when string) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		if _, err := r.Reconcile(context.Background(), req); err != nil {
+			t.Fatalf("Reconcile %d %s: %v", i+1, when, err)
 		}
 	}
+}
+
+func setMode(t *testing.T, cl client.Client, req ctrl.Request, mode string) {
+	t.Helper()
+	fresh := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(context.Background(), req.NamespacedName, fresh); err != nil {
+		t.Fatal(err)
+	}
+	fresh.Spec.Mode = ptr.To(mode)
+	if err := cl.Update(context.Background(), fresh); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A flip to today keeps status.busReplicas (#5451): the bus's claims are
+// kept for the flip back, and so is the count it ran at. The status writers
+// read the kept field as current, so no today pass writes status for it.
+func TestAFlipToTodayKeepsTheBusServerCount(t *testing.T) {
+	r, cl, req := flipRig(t, a2aTestAgent())
+	ctx := context.Background()
+	reconcileN(t, r, req, 2, "under next")
 	fresh := &agentv1alpha1.PlatformAgent{}
 	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
 		t.Fatal(err)
 	}
-	if fresh.Status.BusReplicas == 0 {
+	before := fresh.Status.BusReplicas
+	if before == 0 {
 		t.Fatal("precondition: status.busReplicas not written under next")
 	}
-	fresh.Spec.Mode = ptr.To("today")
-	if err := cl.Update(ctx, fresh); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := r.Reconcile(ctx, req); err != nil {
-		t.Fatalf("Reconcile after flip: %v", err)
-	}
+	setMode(t, cl, req, "today")
+	reconcileN(t, r, req, 2, "after the flip to today")
 	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
 		t.Fatal(err)
 	}
-	if fresh.Status.BusReplicas != 0 {
-		t.Errorf("status.busReplicas = %d after the flip to today, want 0", fresh.Status.BusReplicas)
+	if fresh.Status.BusReplicas != before {
+		t.Errorf("status.busReplicas = %d after the flip to today, want the %d it ran at", fresh.Status.BusReplicas, before)
+	}
+	rv := fresh.ResourceVersion
+	reconcileN(t, r, req, 2, "settled under today")
+	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
+		t.Fatal(err)
+	}
+	if fresh.ResourceVersion != rv {
+		t.Errorf("settled today passes wrote the CR (resourceVersion %s -> %s); the kept field must read current", rv, fresh.ResourceVersion)
+	}
+}
+
+// TestABusComesBackFromTodayAtItsCount is #5451's round trip through
+// Reconcile: a bus at a count, with data claims, flipped to today and back,
+// comes back at the count it ran, not the count its claims imply. A single
+// server once scaled by hand keeps claims 1 and 2 under WhenScaled Retain;
+// read alone they say three, over a one-server store. A bus whose claims are
+// gone has nothing to keep and comes back at the default.
+func TestABusComesBackFromTodayAtItsCount(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		single bool
+		claims []int
+		want   int32
+	}{
+		{"one server with stray claims 1 and 2", true, []int{0, 1, 2}, 1},
+		{"three servers with claims 0-2", false, []int{0, 1, 2}, 3},
+		{"one server, claims gone under today: a new bus", true, nil, agentv1alpha1.DefaultBusReplicas},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := a2aTestAgent()
+			if tc.single {
+				agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(1)}}
+			}
+			r, cl, req := flipRig(t, agent)
+			ctx := context.Background()
+			reconcileN(t, r, req, 2, "under next")
+			fresh := &agentv1alpha1.PlatformAgent{}
+			if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
+				t.Fatal(err)
+			}
+			if tc.single {
+				// The field goes; the record keeps the bus at one server.
+				fresh.Spec.Harness.Tuning.BusReplicas = nil
+				if err := cl.Update(ctx, fresh); err != nil {
+					t.Fatal(err)
+				}
+				reconcileN(t, r, req, 1, "with the field removed")
+			}
+			labels := buildA2ANATSStatefulSet(agent, "h").Spec.VolumeClaimTemplates[0].Labels
+			for _, o := range tc.claims {
+				if err := cl.Create(ctx, &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+					Name: a2aNATSDataClaimName(agent, o), Namespace: agent.Namespace, Labels: labels,
+				}}); err != nil && !errors.IsAlreadyExists(err) {
+					t.Fatal(err)
+				}
+			}
+			setMode(t, cl, req, "today")
+			reconcileN(t, r, req, 2, "under today")
+			if err := cl.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aNATSName(agent)}, &appsv1.StatefulSet{}); !errors.IsNotFound(err) {
+				t.Fatalf("precondition: the bus StatefulSet survived the flip to today (err %v)", err)
+			}
+			setMode(t, cl, req, "next")
+			reconcileN(t, r, req, 2, "back under next")
+			if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
+				t.Fatal(err)
+			}
+			sts := &appsv1.StatefulSet{}
+			if err := cl.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aNATSName(agent)}, sts); err != nil {
+				t.Fatal(err)
+			}
+			if fresh.Status.BusReplicas != tc.want || sts.Spec.Replicas == nil || *sts.Spec.Replicas != tc.want {
+				t.Errorf("back from today: status.busReplicas = %d, StatefulSet replicas = %v; want %d", fresh.Status.BusReplicas, sts.Spec.Replicas, tc.want)
+			}
+		})
 	}
 }
 
@@ -1168,7 +1262,8 @@ func TestTheBusBudgetRecoversFromAForeignBudgetField(t *testing.T) {
 // OrderedReady creates server 1 and its claim only once server 0 is Ready, so
 // a new cluster's StatefulSet deleted before then leaves only claim 0, as a
 // single server does. The recorded count tells them apart; with nothing
-// recorded (a bus back from today) the lone claim reads as one server.
+// recorded (a record lost to a served CRD that prunes it; a flip to today
+// keeps it since #5451) the lone claim reads as one server.
 func TestALoneClaimKeepsTheRecordedServerCount(t *testing.T) {
 	for _, tc := range []struct {
 		recorded, want int32

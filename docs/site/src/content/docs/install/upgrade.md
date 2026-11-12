@@ -694,7 +694,8 @@ command gets Slack's timeout error.
 2. The operator restarts the credential broker with the Slack tokens and deletes the A2A stack,
    the gateway with it. For the seconds the gateway pod takes to stop, both can hold a
    connection, and a message the stopping gateway takes gets no answer. The bus volume and its
-   credentials Secret stay; [Uninstall](/kube-agents/install/uninstall/#what-specmode-next-leaves-behind)
+   credentials Secret stay, and the CR keeps `status.busReplicas`, the server count the bus ran, so
+   a switch back to `next` brings the bus back at that count; [Uninstall](/kube-agents/install/uninstall/#what-specmode-next-leaves-behind)
    says how to remove them. Wait for the broker, for up to 5 minutes:
 
    ```bash
