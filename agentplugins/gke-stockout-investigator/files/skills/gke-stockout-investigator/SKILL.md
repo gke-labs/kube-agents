@@ -354,6 +354,7 @@ python3 "$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py sub
 ````
 
 The evidence file follows **submit-suggestion** Step 3: commands you ran, each with the output lines that show the constraint, as JSON.
+For `cluster-autoscaler-status`, quote only the `backoffInfo` and `scaleUp` lines, never the whole ConfigMap: the full `-o yaml` output is refused as secret data.
 
 The quoted `<<'EOF'` matters as much as `--body-file`: unquoted, the heredoc expands the same constructs the argument would have.
 
