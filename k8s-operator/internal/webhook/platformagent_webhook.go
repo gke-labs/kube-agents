@@ -378,7 +378,13 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 // count on an existing bus is otherwise how a migration starts (#4225).
 // Best effort: the run is read from the stored object's status.
 func validateBusReplicas(oldObj, platformAgent *agentv1alpha1.PlatformAgent) field.ErrorList {
+	// Under today, or coming from it, there is no bus migration to turn
+	// around: the switch to today tears a run down with the bus, and the
+	// webhook refuses that switch while one is under way.
 	if oldObj == nil || platformAgent.Spec.Mode == nil || *platformAgent.Spec.Mode != "next" {
+		return nil
+	}
+	if oldObj.Spec.Mode == nil || *oldObj.Spec.Mode != "next" {
 		return nil
 	}
 	run := oldObj.Status.BusMigration

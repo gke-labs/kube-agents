@@ -23354,9 +23354,18 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
                 self.assertFalse(self.harness.forge_calls("proposal-create"))
                 body = "".join(self.harness.bodies_for("issue-*"))
                 self.assertIn("## Awaiting `/remediate`", body)
-                # The worker is told the direct ask still opens these: a task that asked
-                # for the fixes runs `remediate` rather than stopping at the ledger.
-                self.assertIn("when this task asks you to open fixes, run `remediate --finding", self.err)
+                # The worker is told a direct ask still opens these: a request that itself
+                # asks for the fixes, by id or as a set, runs `remediate`.
+                self.assertIn("only when the request itself asks for fixes to be opened", self.err)
+                self.assertIn("for each fix it asks for, by id or as a set", self.err)
+                self.assertIn("run `remediate --finding", self.err)
+                # ...and that an audit-only ask is not one. Worded loosely, a worker read
+                # its card's "remediation PRs required by the SOP" as the ask and opened an
+                # unrequested pull request (nightly 2026-11-11, obtainability-planted-pdb;
+                # #5093's smoke, compliance-rbac-overgrant).
+                self.assertIn("A request only to run an audit or follow its SOP is not that ask", self.err)
+                self.assertIn("a line that attributes remediation pull requests to the SOP", self.err)
+                self.assertIn("stop at the ledger and name the findings it lists as awaiting a fix", self.err)
                 self.assertIn(f"`{audit_report.AUTO_PROMOTE_ENV}={audit_report.AUTO_PROMOTE_OFF}`", body)
                 self.assertIn(derived_id(), body[body.index("## Awaiting `/remediate`"):])
 

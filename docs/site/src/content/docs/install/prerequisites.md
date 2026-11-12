@@ -99,7 +99,7 @@ The first command omits a key whose value is unset, so a requirement that is not
 
 The chart's quota check counts the `spec.mode: next` additions in the capacity row above when `platformAgent.mode` is `next`, but not the session pods. Autopilot sizes nodes to fit; on a Standard cluster, check the free allocatable against those figures, or a session pod stays `Pending` when one is asked for.
 
-Two next-mode workloads run only behind an operator flag, and the check counts each while its flag is set. With `A2A_MCP_DOOR=true` (the chart's `operator.mcpServer.enabled`, or an `operator.extraEnv` entry), the MCP server adds one pod. With `A2A_DISPATCHER_IMAGE` set through `operator.extraEnv`, the profile dispatcher adds one pod. The footprint's per-pod table gives both. Both run in the release namespace. AgentProfile workers don't: they run in the profile namespace, `<release-namespace>-profiles`, under a pod quota the operator renders there.
+One next-mode workload runs only behind an operator flag, and the check counts it while its flag is set: with `A2A_MCP_DOOR=true` (the chart's `operator.mcpServer.enabled`, or an `operator.extraEnv` entry), the MCP server adds one pod. The profile dispatcher runs by default and is counted with the standing pods. Switched off (`operator.profileDispatcher.enabled: false`), it is still counted, an over-count of one pod. The footprint's per-pod table gives both. Both run in the release namespace. AgentProfile workers don't: they run in the profile namespace, `<release-namespace>-profiles`, under a pod quota the operator renders there.
 
 With `platformAgent.deployment.credentialProxy.exec.replicas` above 0, each exec-tier replica is one more pod with 2 CPU and 2 GiB in requests and limits, plus the broker's ephemeral storage, and the chart's check counts them. It does not check node room. On a Standard cluster whose nodes lack 2 free CPU, a replica stays `Pending`. Turning the tier on also restarts the shell sandbox, which then needs its own room again.
 
@@ -108,6 +108,10 @@ The scope publisher's Job runs in the release namespace too, one pod at a time e
 The `install.sh` pre-flight summary prints the release's requested CPU, memory, pods and persistent storage, with a monthly cost modeled from us-central1 list prices, model tokens excluded, before anything is applied. The apply shows no chart notes; `helm get notes kube-agents -n <NAMESPACE>` prints the same figures afterwards.
 
 A new bus runs three NATS servers on separate nodes, so that one node drain or upgrade takes one server and the bus stays up. An install from before that default keeps its one server. Changing an existing bus between one server and three is a migration that keeps its data; one server to three freezes writes for its window ([Changing the bus's server count](/kube-agents/operator/platformagent-crd/#changing-the-buss-server-count)). With fewer than three nodes, the third waits `Pending` until a node joins. Autopilot and an autoscaled pool add one.
+
+A bus server can also wait `Pending` on a cluster with room for it, when its volume was left behind by an earlier `PlatformAgent` of the same name in the same namespace. Its events say `didn't match PersistentVolume's node affinity`: the volume is zonal and pins the server to its zone, whose nodes are taken by the other servers or have no room for it.
+
+On a three-server bus, and only while the other two servers are Ready, delete that server's claim, then its pod: `kubectl delete pvc data-platform-agent-a2a-nats-N -n kubeagents-system --wait=false` and `kubectl delete pod platform-agent-a2a-nats-N -n kubeagents-system`. The StatefulSet recreates both, and with a `WaitForFirstConsumer` storage class (GKE's default `standard-rwo` is one) the new volume is provisioned in the zone the new pod is scheduled to. The server comes back empty and copies its stream replicas from the other two, which keep quorum (two of three) while it does. Never do this on a one-server bus: its one claim holds the only copy of every stream.
 
 A `today` install has no bus, so its first switch to `next` creates one with three servers, like a new install. The chart's quota check cannot see the bus that runs, so it counts three servers unless `platformAgent.harness.tuning.busReplicas` is `1`. An install that keeps one server under a namespace quota should set that value before it upgrades. Otherwise the check asks for room for two more pods and two more claims.
 
@@ -146,10 +150,10 @@ Totals by install profile, as the chart's quota preflight sums them (the operato
 | ------- | ---- | ------------ | --------------- | ---------- | ------------- | ----------------------------------- | ------ | ------------------ | -------------------- |
 | `today`, GKE Standard | 9 | 2756m | 12096Mi | 13200m | 25472Mi | 14912Mi / 14912Mi | 4 | 102Gi | — |
 | `today`, GKE Autopilot | 9 | 4256m | 13120Mi | 13200m | 25472Mi | 14912Mi / 14912Mi | 4 | 102Gi | — |
-| `next`, GKE Standard | 20 | 4386m | 15056Mi | 22550m | 32800Mi | 15424Mi / 15424Mi | 7 | 222Gi | 38 |
-| `next`, GKE Autopilot | 20 | 5886m | 16080Mi | 22550m | 32800Mi | 15424Mi / 15424Mi | 7 | 222Gi | 38 |
-| `next` with one NATS server, GKE Standard | 18 | 3766m | 13808Mi | 19450m | 30304Mi | 15168Mi / 15168Mi | 5 | 142Gi | 36 |
-| `next` with Hindsight and the GitHub minter, GKE Standard | 24 | 5236m | 17488Mi | 28550m | 38432Mi | 16576Mi / 16576Mi | 8 | 230Gi | 44 |
+| `next`, GKE Standard | 21 | 4436m | 15120Mi | 23050m | 33056Mi | 15488Mi / 15488Mi | 7 | 222Gi | 39 |
+| `next`, GKE Autopilot | 21 | 5936m | 16144Mi | 23050m | 33056Mi | 15488Mi / 15488Mi | 7 | 222Gi | 39 |
+| `next` with one NATS server, GKE Standard | 19 | 3816m | 13872Mi | 19950m | 30560Mi | 15232Mi / 15232Mi | 5 | 142Gi | 37 |
+| `next` with Hindsight and the GitHub minter, GKE Standard | 25 | 5286m | 17552Mi | 29050m | 38688Mi | 16640Mi / 16640Mi | 8 | 230Gi | 45 |
 
 The session quota is `spec.harness.tuning.maxSessions` (10 by default) plus the pods the operator runs for the agent, the chart's pods in the namespace with their rollout surges (5 when the operator cannot read the chart's count), and a margin of 7 for the operator's rollout surges, its Jobs and the gateway's count-then-create overshoot.
 
@@ -162,10 +166,10 @@ Under `spec.mode: next`, per pod:
 | Capability verifier | 2 | 50m | 64Mi | 500m | 256Mi | — | Standing |
 | A2A gateway | 2 | 50m | 64Mi | 500m | 512Mi | — | Standing; one fewer with the operator's `A2A_GATEWAY_ELECTION=false` |
 | Console | 1 | 100m | 128Mi | 500m | 256Mi | — | Standing |
+| Profile dispatcher | 1 | 50m | 64Mi | 500m | 256Mi | 64Mi / 64Mi | Standing, unless `operator.profileDispatcher.enabled` is `false`, when the quota check still counts it |
 | Bus provisioning Job | 1 | 50m | 64Mi | 200m | 256Mi | 128Mi / 128Mi | At install, again whenever its spec changes, and about daily |
 | `hermes-bridge` container | in the agent pod | 250m | 512Mi | 1 | 1Gi | — | Under the default `api` executor; `A2A_BRIDGE_EXECUTOR=cli` raises it to 1 CPU and 4Gi memory (limits 3 and 8Gi), and `A2A_BRIDGE_RESOURCES` overrides either |
 | MCP server | 1 | 100m | 128Mi | 500m | 256Mi | — | With the operator's `A2A_MCP_DOOR=true` |
-| Profile dispatcher | 1 | 50m | 64Mi | 500m | 256Mi | — | With the operator's `A2A_DISPATCHER_IMAGE` set |
 | Scope publisher Job | 1 | 50m | 192Mi | 500m | 512Mi | — | One pod at a time, every 15 minutes, where `platformAgent.scope` names a folder, organization, Shared VPC host or Metrics Scope |
 | `a2a-worker` session pod | up to `maxSessions` | 250m | 512Mi | 2 | 2Gi | 1088Mi / 1088Mi | One per `delegate:` from chat and per conversation moved to `/session` |
 

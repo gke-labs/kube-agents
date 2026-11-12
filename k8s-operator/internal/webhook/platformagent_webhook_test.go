@@ -1343,6 +1343,10 @@ func TestBusReplicasCannotChangeMidMigration(t *testing.T) {
 		pa.Status.BusReplicas = 1
 		return pa
 	}
+	today := func(pa *agentv1alpha1.PlatformAgent) *agentv1alpha1.PlatformAgent {
+		pa.Spec.Mode = ptr.To("today")
+		return pa
+	}
 	for _, tc := range []struct {
 		name     string
 		old, new *agentv1alpha1.PlatformAgent
@@ -1354,6 +1358,8 @@ func TestBusReplicasCannotChangeMidMigration(t *testing.T) {
 		{"other edits mid-migration", agent(ptr.To(3), "Hashing"), agent(ptr.To(3), "Hashing"), false},
 		{"after a migration ended", agent(ptr.To(3), "Abandoned"), agent(ptr.To(1), "Abandoned"), false},
 		{"a create", nil, agent(ptr.To(3), ""), false},
+		{"from today to next with the other count", today(agent(ptr.To(3), "")), agent(ptr.To(1), ""), false},
+		{"a today CR's edit", today(agent(nil, "")), today(agent(ptr.To(3), "")), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			errs := validateBusReplicas(tc.old, tc.new)

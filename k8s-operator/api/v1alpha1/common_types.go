@@ -2794,8 +2794,12 @@ type AgentStatus struct {
 	// BusReplicas is the A2A bus's NATS server count under spec.mode: next:
 	// the count the bus runs, which only a migration changes (BusMigration);
 	// for a new bus, spec.harness.tuning.busReplicas, or 3. Re-derived from
-	// the cluster on every reconcile, so it is a reading of the bus rather
-	// than a setting.
+	// the cluster on every reconcile under next, so it is a reading of the
+	// bus rather than a setting. Under spec.mode: today it is left at the
+	// count the bus last ran, so that a flip back returns the bus at that
+	// count rather than the count its kept data claims imply; it is not a
+	// claim that a bus is running, and with the claims deleted it no longer
+	// decides anything.
 	// +optional
 	BusReplicas int32 `json:"busReplicas,omitempty"`
 

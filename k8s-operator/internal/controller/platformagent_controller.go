@@ -1056,7 +1056,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// the dispatcher step's verdict (syncDispatcherJobMode), or cleanupA2A's
 	// below. A pass that reached neither leaves it as it was.
 	busCredsMapVersion := ""
-	var dispatcherJobMode *metav1.Condition
+	var dispatcherJobMode, dispatcherCeiling *metav1.Condition
 	if modeErr == nil {
 		wantNext := renderMode(instance, "nats") == ModeNext
 		exitWrite := func(condition string, err error) {
@@ -1079,6 +1079,9 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 		defer func() {
 			exitWrite(busCredentialsReadyCondition, r.syncBusCredentialsReady(ctx, instance, wantNext, busCredsMapVersion))
+			exitWrite(dispatcherCeilingCondition, r.syncDispatcherCeiling(ctx, instance, dispatcherCeiling))
+			// Last, so it outlives every status writer of its pass
+			// (TestDispatcherJobModeOutlivesTheStatusWritersOfItsPass).
 			exitWrite(dispatcherJobModeCondition, r.syncDispatcherJobMode(ctx, instance, dispatcherJobMode))
 		}()
 	}
@@ -1366,6 +1369,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// For the deferred write at 2d, failed pass or not: a step after
 		// the dispatcher's failing doesn't undo what it did to Job mode.
 		dispatcherJobMode = a2aState.dispatcherJobMode
+		dispatcherCeiling = a2aState.dispatcherCeiling
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -1374,10 +1378,17 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		// No bus, no server count. Telling the writers what the CR carried
-		// lets them write the cleared field once, and then find it current.
+		// The bus is torn down but its data claims are kept, so that a flip
+		// back reuses them, and so is the count it last ran at (#5451): with
+		// no record, the flip back reads the claims, and a single server once
+		// scaled by hand keeps claims -1 and -2 under WhenScaled Retain,
+		// which read as three servers over a one-server store and recreate
+		// every stream empty. resolveA2ABusReplicas reads the record only
+		// while a bus exists to keep (a StatefulSet or labelled claims), so a
+		// record kept here cannot bring back a bus whose claims are gone.
+		// The writers are told the value the CR carries, so the kept field
+		// reads current and no pass writes status on its account.
 		a2aState.busReplicasPersisted = instance.Status.BusReplicas
-		instance.Status.BusReplicas = 0
 		// Nor a bus migration: a run that ended, or was given up, goes with
 		// what it left behind (busMigrationTornDown).
 		a2aState.busMigrationPersisted, a2aState.busMigrationCaptured = instance.Status.BusMigration.DeepCopy(), true
@@ -1390,6 +1401,8 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if tornDown {
 			dispatcherJobMode = jobModeTornDown
 		}
+		// No dispatcher without the stack, so no ceiling to report.
+		dispatcherCeiling = dispatcherCeilingRemoved
 		// No callout, so no claim about its map: the condition goes.
 		removed := a2aIdentityMapRemoved
 		a2aState.calloutMap = &removed
@@ -5076,6 +5089,15 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		degradedStatus = metav1.ConditionTrue
 		degradedReason = conditionReasonMinterPruningHeld
 		degradedMsg = minterHeldMessage(agent.Name+gitopsStateConfigMapSuffix, minterHeld)
+	} else if busStreams := busStreamsMissingCondition(agent); busStreams != nil {
+		// Degraded only, as the held minter entry above: the bus-stream
+		// poller owns BusStreamsPresent and the recovery
+		// (platformagent_a2a_bus_streams.go); this names the loss on the
+		// condition a reader looks at first. Ahead of the resource
+		// refusals, because it reports lost function.
+		degradedStatus = metav1.ConditionTrue
+		degradedReason = conditionReasonA2ABusStreamsMissing
+		degradedMsg = busStreams.Message
 	} else if proxyResourcesRefusal != "" {
 		// Same shape as the git refusal above: the spec is read here, on
 		// every pass, rather than carried from reconcileCredentialProxy, so
