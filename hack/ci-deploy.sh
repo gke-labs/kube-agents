@@ -1110,6 +1110,16 @@ gitops_repo_for_project() {
     kube-agents-evals-38) echo "gke-agentic/kube-agents-evals-38-infra" ;;
     kube-agents-evals-39) echo "gke-agentic/kube-agents-evals-39-infra" ;;
     kube-agents-evals-40) echo "gke-agentic/kube-agents-evals-40-infra" ;;
+    kube-agents-evals-41) echo "gke-agentic/kube-agents-evals-41-infra" ;;
+    kube-agents-evals-42) echo "gke-agentic/kube-agents-evals-42-infra" ;;
+    kube-agents-evals-43) echo "gke-agentic/kube-agents-evals-43-infra" ;;
+    kube-agents-evals-44) echo "gke-agentic/kube-agents-evals-44-infra" ;;
+    kube-agents-evals-45) echo "gke-agentic/kube-agents-evals-45-infra" ;;
+    kube-agents-evals-46) echo "gke-agentic/kube-agents-evals-46-infra" ;;
+    kube-agents-evals-47) echo "gke-agentic/kube-agents-evals-47-infra" ;;
+    kube-agents-evals-48) echo "gke-agentic/kube-agents-evals-48-infra" ;;
+    kube-agents-evals-49) echo "gke-agentic/kube-agents-evals-49-infra" ;;
+    kube-agents-evals-50) echo "gke-agentic/kube-agents-evals-50-infra" ;;
     *) return 1 ;;
   esac
 }
@@ -1161,6 +1171,16 @@ gitlab_project_for_project() {
     kube-agents-evals-38) echo "gke-agentic/kube-agents-evals-38-infra" ;;
     kube-agents-evals-39) echo "gke-agentic/kube-agents-evals-39-infra" ;;
     kube-agents-evals-40) echo "gke-agentic/kube-agents-evals-40-infra" ;;
+    kube-agents-evals-41) echo "gke-agentic/kube-agents-evals-41-infra" ;;
+    kube-agents-evals-42) echo "gke-agentic/kube-agents-evals-42-infra" ;;
+    kube-agents-evals-43) echo "gke-agentic/kube-agents-evals-43-infra" ;;
+    kube-agents-evals-44) echo "gke-agentic/kube-agents-evals-44-infra" ;;
+    kube-agents-evals-45) echo "gke-agentic/kube-agents-evals-45-infra" ;;
+    kube-agents-evals-46) echo "gke-agentic/kube-agents-evals-46-infra" ;;
+    kube-agents-evals-47) echo "gke-agentic/kube-agents-evals-47-infra" ;;
+    kube-agents-evals-48) echo "gke-agentic/kube-agents-evals-48-infra" ;;
+    kube-agents-evals-49) echo "gke-agentic/kube-agents-evals-49-infra" ;;
+    kube-agents-evals-50) echo "gke-agentic/kube-agents-evals-50-infra" ;;
     *) return 1 ;;
   esac
 }
