@@ -1376,6 +1376,73 @@ class HarnessTestCase(BaseTestCase):
 # --------------------------------------------------------------------------- #
 
 
+class TestEnvelopeStartedAt(BaseTestCase):
+    """The report-store envelope names when its run opened (#4268), so a reader
+    can refuse a report from a run that started before its own window."""
+
+    NOW = datetime(2026, 11, 10, 12, 0, tzinfo=timezone.utc)
+    RECORD_STAMP = "2026-11-10T10:00:00Z"
+    RECORD_ISO = "2026-11-10T10:00:00+00:00"
+    NOTE_EPOCH = datetime(2026, 11, 10, 11, 0, tzinfo=timezone.utc).timestamp()
+    NOTE_ISO = "2026-11-10T11:00:00+00:00"
+
+    def setUp(self):
+        super().setUp()
+        Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
+
+    def write_record(self, audit=AUDIT):
+        Path(audit_report.run_record_path_for(AUDIT)).write_text(
+            json.dumps({"audit": audit, audit_report.RUN_RECORD_STARTED_KEY: self.RECORD_STAMP})
+        )
+
+    def write_note(self):
+        Path(audit_report.inflight_path_for(AUDIT)).write_text(
+            json.dumps({"audit": AUDIT, audit_report.INFLIGHT_STARTED_KEY: self.NOTE_EPOCH})
+        )
+
+    def test_the_run_record_names_the_start_over_the_note(self):
+        self.write_record()
+        self.write_note()
+        self.assertEqual(audit_report.run_started_iso(AUDIT, self.NOW), self.RECORD_ISO)
+
+    def test_the_record_outlives_a_released_note(self):
+        self.write_record()
+        self.assertEqual(audit_report.run_started_iso(AUDIT, self.NOW), self.RECORD_ISO)
+
+    def test_the_note_stands_in_when_there_is_no_record(self):
+        self.write_note()
+        self.assertEqual(audit_report.run_started_iso(AUDIT, self.NOW), self.NOTE_ISO)
+
+    def test_another_streams_record_is_not_this_runs(self):
+        self.write_record(audit="obtainability-audit")
+        self.assertIsNone(audit_report.run_started_iso(AUDIT, self.NOW))
+
+    def test_a_record_that_does_not_parse_falls_back_to_the_note(self):
+        Path(audit_report.run_record_path_for(AUDIT)).write_text("{not json")
+        self.write_note()
+        self.assertEqual(audit_report.run_started_iso(AUDIT, self.NOW), self.NOTE_ISO)
+
+    def test_nothing_to_read_is_none(self):
+        self.assertIsNone(audit_report.run_started_iso(AUDIT, self.NOW))
+
+    def test_the_envelope_carries_the_start(self):
+        self.write_record()
+        envelope = audit_report.report_envelope(
+            AUDIT,
+            {},
+            {},
+            self.NOW,
+            repo="acme/fleet",
+            issue_number=None,
+            ledger_body="",
+            new_ids=[],
+            resolved_ids=[],
+            rendered_ids=[],
+        )
+        self.assertEqual(envelope[audit_report.ENVELOPE_STARTED_KEY], self.RECORD_ISO)
+        self.assertEqual(envelope["finished_at"], self.NOW.isoformat())
+
+
 class TestRenderBody(unittest.TestCase):
     def test_renders_scope_findings_and_footer(self):
         doc = make_doc()
@@ -13928,6 +13995,15 @@ class TestRemediateSubcommand(HarnessTestCase):
             },
         )
 
+    def test_an_explain_only_install_is_refused_before_anything_is_cloned(self):
+        # Review: at writeMode none this cloned, was refused at the publish, and
+        # still printed REMEDIATED.
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.harness.replies = {"capabilities": {"forge": "github", "writeMode": "none"}}
+        self.assertEqual(self.run_remediate(make_doc(), [derived_id()]), 2)
+        self.assertIn("explain-only", self.err)
+        self.assertEqual(["capabilities"], [call[1] for call in self.harness.calls])
+
     def human_closed_pr_reply(self, doc):
         """A pull request on this finding's own branch, closed by a person."""
         branch = audit_report.group_branch_for(AUDIT, doc["findings"])
@@ -17471,6 +17547,85 @@ class TestContentWorkspaceReachesEveryForge(unittest.TestCase):
             refusal = audit_report.remediation_refusal("gitlab.example.com/acme/infra")
         self.assertIn("not a forge this install serves", refusal)
         self.assertIn("a retry will not change this", refusal)
+
+
+class TestExplainOnlyInstallTakesNoRemediation(unittest.TestCase):
+    """Review: on an install at writeMode none, remediation cloned per group, and
+    /remediate was answered with a retry the broker would refuse every time."""
+
+    def setUp(self):
+        audit_report._CAPABILITIES.clear()
+        self.addCleanup(audit_report._CAPABILITIES.clear)
+
+    def _broker(self, write_mode):
+        asked = []
+
+        def forge(verb, repo, payload):
+            asked.append(verb)
+            if verb != "capabilities":
+                raise AssertionError(f"{verb} reached the broker on an explain-only install")
+            answer = {"forge": "github", "verbs": ["issue-list"]}
+            if write_mode is not None:
+                answer["writeMode"] = write_mode
+            return answer
+
+        return forge, asked
+
+    def test_none_is_a_refusal_with_no_retry(self):
+        forge, _ = self._broker("none")
+        with patch.object(audit_report, "forge", forge):
+            refusal = audit_report.write_mode_refusal("acme/fleet")
+        self.assertIn("explain-only", refusal)
+        self.assertIn("a retry will not change this", refusal)
+
+    def test_a_misspelt_value_carries_the_brokers_reason(self):
+        def forge(verb, repo, payload):
+            return {"forge": "github", "writeMode": "none", "writeModeDetail": "KUBEAGENTS_WRITE_MODE is set to a value that is neither none nor propose"}
+
+        with patch.object(audit_report, "forge", forge):
+            refusal = audit_report.write_mode_refusal("acme/fleet")
+        self.assertIn("explain-only", refusal)
+        self.assertIn("neither none nor propose", refusal)
+
+    def test_the_reply_to_remediate_names_the_write_mode_and_promises_no_retry(self):
+        forge, _ = self._broker("none")
+        requests = type("R", (), {"targets": ["f1"]})()
+        plan = type("P", (), {"already_open": set(), "superseded": set()})()
+        with patch.object(audit_report, "forge", forge):
+            refusal = audit_report.write_mode_refusal("acme/fleet")
+        outcomes = audit_report._remediation_outcomes(requests, plan, {}, [], "pull request", refusal)
+        self.assertIn("explain-only", outcomes["f1"])
+        self.assertNotIn("will retry", outcomes["f1"])
+
+    def test_promoted_groups_are_not_cloned_at_none(self):
+        forge, asked = self._broker("none")
+        with patch.object(audit_report, "forge", forge):
+            opened = audit_report._open_promoted_prs(
+                "acme/fleet",
+                "compliance-audit",
+                [{"id": "f1"}],
+                ["f1"],
+                {},
+                root=Path("/nonexistent"),
+                issue_number=None,
+                generated_at=datetime(2026, 11, 11, tzinfo=timezone.utc),
+            )
+        self.assertEqual([], opened)
+        self.assertEqual(["capabilities"], asked)
+
+    def test_propose_or_an_older_broker_refuses_nothing(self):
+        for mode in ("propose", None):
+            audit_report._CAPABILITIES.clear()
+            forge, _ = self._broker(mode)
+            with self.subTest(mode=mode), patch.object(audit_report, "forge", forge):
+                self.assertEqual("", audit_report.write_mode_refusal("acme/fleet"))
+
+    def test_an_unreadable_answer_refuses_nothing(self):
+        def forge(verb, repo, payload):
+            raise audit_report.ForgeError("broker down")
+
+        with patch.object(audit_report, "forge", forge):
+            self.assertEqual("", audit_report.write_mode_refusal("acme/fleet"))
 
 
 class TestWorkspaceGetsGitHubsBareSlug(unittest.TestCase):
@@ -23199,9 +23354,18 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
                 self.assertFalse(self.harness.forge_calls("proposal-create"))
                 body = "".join(self.harness.bodies_for("issue-*"))
                 self.assertIn("## Awaiting `/remediate`", body)
-                # The worker is told the direct ask still opens these: a task that asked
-                # for the fixes runs `remediate` rather than stopping at the ledger.
-                self.assertIn("when this task asks you to open fixes, run `remediate --finding", self.err)
+                # The worker is told a direct ask still opens these: a request that itself
+                # asks for the fixes, by id or as a set, runs `remediate`.
+                self.assertIn("only when the request itself asks for fixes to be opened", self.err)
+                self.assertIn("for each fix it asks for, by id or as a set", self.err)
+                self.assertIn("run `remediate --finding", self.err)
+                # ...and that an audit-only ask is not one. Worded loosely, a worker read
+                # its card's "remediation PRs required by the SOP" as the ask and opened an
+                # unrequested pull request (nightly 2026-11-11, obtainability-planted-pdb;
+                # #5093's smoke, compliance-rbac-overgrant).
+                self.assertIn("A request only to run an audit or follow its SOP is not that ask", self.err)
+                self.assertIn("a line that attributes remediation pull requests to the SOP", self.err)
+                self.assertIn("stop at the ledger and name the findings it lists as awaiting a fix", self.err)
                 self.assertIn(f"`{audit_report.AUTO_PROMOTE_ENV}={audit_report.AUTO_PROMOTE_OFF}`", body)
                 self.assertIn(derived_id(), body[body.index("## Awaiting `/remediate`"):])
 
@@ -32787,6 +32951,36 @@ class TestNoForge(BaseTestCase):
         self.assertEqual(len(latest["current_ids"]), 4)
         self.assertEqual(len(latest["document"]["findings"]), 4)
         self.assertEqual(self.recorder.calls, [])
+
+    def test_a_later_start_while_this_run_publishes_does_not_stamp_its_envelope(self):
+        """#4268: `finish` reads its run's start before its checks. A later
+        `start` that rewrites the run record as soon as `findings_predate_run`
+        has passed leaves the envelope with this run's own start, so a read
+        placed anywhere after that check fails here."""
+        self.start()
+        record = Path(audit_report.run_record_path_for(AUDIT))
+        own = json.loads(record.read_text())[audit_report.RUN_RECORD_STARTED_KEY]
+        real = audit_report.findings_predate_run
+
+        def next_start_lands_after_the_check(*args, **kwargs):
+            stale_since = real(*args, **kwargs)
+            data = json.loads(record.read_text())
+            data[audit_report.RUN_RECORD_STARTED_KEY] = "2099-01-01T00:00:00Z"
+            record.write_text(json.dumps(data))
+            return stale_since
+
+        self.patch_attr("findings_predate_run", next_start_lands_after_the_check)
+        path = audit_report.findings_path_for(AUDIT)
+        Path(path).write_text(json.dumps(make_doc(findings=THREE_SEVERITIES)), encoding="utf-8")
+        self.assertEqual(self.run_main(["finish", "--audit", AUDIT, "--findings-file", path, "--scheduled"]), 0, self.err)
+
+        later = json.loads(record.read_text())[audit_report.RUN_RECORD_STARTED_KEY]
+        self.assertEqual(later, "2099-01-01T00:00:00Z", "the later start did not land")
+        latest = json.loads((self.store() / "latest.json").read_text())
+        self.assertEqual(
+            latest[audit_report.ENVELOPE_STARTED_KEY],
+            datetime.fromtimestamp(audit_report._utc_seconds(own), timezone.utc).isoformat(),
+        )
 
     def test_the_delta_runs_against_the_previous_no_forge_report(self):
         doc = make_doc(findings=THREE_SEVERITIES)

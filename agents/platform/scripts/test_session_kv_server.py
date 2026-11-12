@@ -1351,6 +1351,7 @@ class TestSessionKvServerAuth(unittest.TestCase):
         ("GET", "/v1/cron/jobs/j-1/origin", None),
         ("POST", "/v1/proposals/opened", {"url": "https://example.invalid/pull/1", "origin": "other"}),
         ("GET", "/v1/proposals/opened/counts", None),
+        ("GET", "/v1/post-merge/clean-merges", None),
         ("POST", "/v1/board/stamp-tickets", {"origin": "issue"}),
         ("POST", "/v1/board/stamp-tickets/tk-1/redeem", None),
     )
@@ -9715,6 +9716,9 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
         # test_worker_transcript.py; this test reads it through the wrapper).
         withheld = [
             "kubectl get secret db -o jsonpath='{.data.password}' | base64 -d",
+            # An escaped backslash before the newline is not a continuation, so
+            # the read on the next line is its own command.
+            "echo done\\\\\nkubectl get secret db -o yaml",
             "kubectl get secret db -o=go-template='{{.data.password}}'",
             "kubectl get secret db --output=go-template='{{index .data \"password\"}}'",
             "kubectl get secret db -o json | jq -r '.data.password | @base64d'",
@@ -9862,6 +9866,24 @@ class TestTaskWorkerStepsFeed(unittest.TestCase):
             [s["preview"] for s in steps if s["kind"] == "tool_result"],
             [session_kv_server.WORKER_STEP_WITHHELD, "pod-a Running", session_kv_server.WORKER_STEP_WITHHELD],
         )
+        self.assertNotIn(secret_val, json.dumps(steps))
+
+    def test_a_secret_read_after_an_even_backslash_run_is_withheld(self):
+        # The read sits on its own line after an escaped backslash; the fold
+        # used to join it onto the line above, so its output was served.
+        secret_val = "even-run-secret-hunter2-value"
+        read_args = json.dumps({"command": "echo done\\\\\nkubectl get secret db -o yaml"})
+        self._write_profile_store(
+            "platform",
+            [
+                ("sess-even", "user", "work kanban task t_d1c3323e", None, None, 101.0, None, None),
+                ("sess-even", "assistant", None, None, [{"id": "c1", "function": {"name": "terminal", "arguments": read_args}}], 102.0, None, None),
+                ("sess-even", "tool", f"done\\\ndata:\n  password: {secret_val}\n", "terminal", None, 103.0, None, "c1"),
+            ],
+            with_tool_call_id=True,
+        )
+        steps = self.client.get("/v1/tasks/t_d1c3323e").json()["steps"]
+        self.assertEqual([s["preview"] for s in steps if s["kind"] == "tool_result"], [session_kv_server.WORKER_STEP_WITHHELD])
         self.assertNotIn(secret_val, json.dumps(steps))
 
     def test_steps_truncated_is_true_when_sql_row_window_clips_older_rows(self):
@@ -14165,6 +14187,58 @@ class TestKeptRefusals(unittest.TestCase):
                 patch.object(session_kv_server, "_chat_platforms_disabled", return_value=False), \
                 patch.object(session_kv_server, "_post_initial_alert", return_value=session_kv_server.ALERT_KEPT_FOR_DIGEST):
             self.assertTrue(session_kv_server._post_data_volume_warning("data volume at 90%"))
+
+
+class TestCleanMergesRoute(unittest.TestCase):
+    """GET /v1/post-merge/clean-merges serves clean_merges.track_record over the Session KV database."""
+
+    def setUp(self):
+        from fastapi.testclient import TestClient
+
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        self.addCleanup(lambda: os.environ.pop("SESSION_KV_API_KEY", None))
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+        self.addCleanup(self._drop_table)
+
+    def _drop_table(self):
+        with closing_db() as conn, conn:
+            conn.execute("DROP TABLE IF EXISTS post_merge_records")
+
+    def test_no_records_table_yet_is_an_empty_list(self):
+        resp = self.client.get("/v1/post-merge/clean-merges")
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json()["counts"], [])
+        self.assertEqual(resp.json()["clean_merges_needed"], 5)
+
+    def test_counts_the_clean_merges_per_repository_and_narrows_to_one(self):
+        with closing_db() as conn, conn:
+            conn.execute(
+                "CREATE TABLE post_merge_records (url TEXT PRIMARY KEY, repo TEXT, kind TEXT, environment TEXT, "
+                "outcome TEXT, outcome_at TEXT, merged_at TEXT, human_edited INTEGER, reverted_at TEXT)"
+            )
+            for url, repo in (("https://github.com/a/b/pull/1", "https://github.com/a/b"),
+                              ("https://github.com/a/c/pull/2", "https://github.com/a/c"),
+                              ("https://github.com/a/c/pull/3", "https://github.com/a/c")):
+                conn.execute(
+                    "INSERT INTO post_merge_records VALUES (?, ?, 'no-pdb', 'dev', 'verified_fixed', "
+                    "'2026-11-01T10:30:00+00:00', '2026-11-01T10:00:00+00:00', 0, NULL)",
+                    (url, repo),
+                )
+        resp = self.client.get("/v1/post-merge/clean-merges")
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(
+            [(c["repo"], c["kind"], c["environment"], c["clean"]) for c in resp.json()["counts"]],
+            [("https://github.com/a/b", "no-pdb", "dev", 1), ("https://github.com/a/c", "no-pdb", "dev", 2)],
+        )
+        resp = self.client.get("/v1/post-merge/clean-merges", params={"repo": "https://github.com/a/c.git"})
+        self.assertEqual([c["clean"] for c in resp.json()["counts"]], [2])
+
+    def test_a_table_missing_a_counted_column_is_a_503(self):
+        with closing_db() as conn, conn:
+            conn.execute("CREATE TABLE post_merge_records (url TEXT PRIMARY KEY, outcome TEXT, outcome_at TEXT)")
+        resp = self.client.get("/v1/post-merge/clean-merges")
+        self.assertEqual(resp.status_code, 503, resp.text)
+        self.assertIn("human_edited", resp.json()["detail"])
 
 
 if __name__ == "__main__":

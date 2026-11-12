@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import pathlib
 import shutil
 import subprocess
@@ -313,6 +314,11 @@ class HelmProfilesTemplatingTest(unittest.TestCase):
             'image: "us-docker.pkg.dev/my-proj/my-mirror/a2a-worker:v2026.10.20"',
             proc.stdout,
         )
+        # A specialist: a tse task for a pinned cluster stays tse (#5435).
+        tse = [d for d in yaml.safe_load_all(proc.stdout)
+               if d and d.get("kind") == "AgentProfile" and d["metadata"]["name"] == "tse"]
+        self.assertEqual(len(tse), 1)
+        self.assertNotIn("yieldToPinned", tse[0]["spec"])
         self.assertIn('resources: ["platformagents", "agentprofiles"]', proc.stdout)
         self.assertIn("kubectl delete agentprofile --all", proc.stdout)
         self.assertIn("--timeout=30s", proc.stdout)
@@ -429,6 +435,8 @@ class HelmClusterProfileTest(unittest.TestCase):
         self.assertEqual(spec["allowedTiers"], ["read"])
         self.assertNotIn("clusterRef", spec)
         self.assertNotIn("bus", spec)
+        # Its pinned profiles are its per-cluster variants, so they take its tasks.
+        self.assertIs(spec["yieldToPinned"], True)
 
     @unittest.skipUnless(shutil.which("helm"), "helm is not installed")
     def test_parameters_are_the_personas(self):
@@ -451,6 +459,35 @@ class HelmClusterProfileTest(unittest.TestCase):
         )
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("allowedTiers", proc.stderr)
+
+
+class AgentProfileFieldGuardTest(unittest.TestCase):
+    """helm upgrade doesn't apply crds/, so an AgentProfile CRD from before
+    yieldToPinned would prune it and the generic cluster profile would stop
+    handing pinned clusters' tasks to their pinned profiles, with no error.
+    `lookup` is empty under `helm template`, so the guard is pinned as text, as
+    CrdGuardTest pins kube-agents.crdFieldGuard."""
+
+    def setUp(self):
+        self.template = (_CHART / "templates" / "profiles.yaml").read_text()
+        helpers = (_CHART / "templates" / "_helpers.tpl").read_text()
+        body = re.search(r'\{\{- define "kube-agents.agentProfileFieldGuard" -\}\}\n(.*?)\n\{\{- end \}\}', helpers, re.DOTALL)
+        self.assertIsNotNone(body, "kube-agents.agentProfileFieldGuard is missing from _helpers.tpl")
+        self.guard = body.group(1)
+
+    def test_the_cluster_profile_guards_yield_to_pinned(self):
+        self.assertRegex(
+            self.template,
+            r'\{\{- include "kube-agents.agentProfileFieldGuard" \(dict "value" "profiles.cluster.enabled" "field" "yieldToPinned"\) \}\}\n\s*yieldToPinned: true',
+        )
+
+    def test_the_guard_reads_the_installed_agentprofile_crd(self):
+        self.assertIn('lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "agentprofiles.kubeagents.x-k8s.io"', self.guard)
+        self.assertIn("{{- if .storage -}}", self.guard)
+        self.assertIn('{{- if not (hasKey $props .field) -}}', self.guard)
+        for want in ("installed AgentProfile CRD predates it", "helm upgrade does not update CRDs",
+                     "charts/kube-agents/crds/", "upgrade.sh", "prunes the field silently"):
+            self.assertIn(want, self.guard)
 
 
 if __name__ == "__main__":

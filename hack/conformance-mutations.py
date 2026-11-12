@@ -231,6 +231,19 @@ MUTATIONS: list[Mutation] = [
         "-- the ceiling in C5 becomes advisory",
     ),
     Mutation(
+        # The operator's Secret write verbs are a namespaced Role, the second
+        # document in role.yaml; the ClusterRole holds the reads only. This
+        # puts `secrets` on the ClusterRole's core-group write rule as well,
+        # which is the pre-#4906 shape: write of every Secret on the cluster.
+        "C5-operator-secrets-cluster-wide",
+        "k8s-operator/config/rbac/role.yaml",
+        ("      - configmaps\n      - persistentvolumeclaims\n",
+         "      - configmaps\n      - persistentvolumeclaims\n      - secrets\n"),
+        "test_C5_the_operators_secret_grant_is_namespaced",
+        "add secrets to the operator ClusterRole's core write rule, beside the "
+        "configmaps it manages, so one marker edit makes the operator cluster-admin in effect",
+    ),
+    Mutation(
         "A1-refusal-emptied",
         "agents/platform/scripts/command_policy.py",
         ('    return Decision(allowed=False, rule_id=rule_id, message=" ".join(parts), offending_flag=flag)\n',
@@ -334,6 +347,33 @@ MUTATIONS: list[Mutation] = [
          "    resources:\n      - '*'\n    verbs:\n      - create"),
         "test_A4_only_cluster_administrators_write_tiers",
         "reach tiers through a wildcard resource, which a resource-name match misses",
+    ),
+    Mutation(
+        # Next mode reads tiers through an operator-rendered ConfigMap, so no
+        # role it mints needs them. A builder that grants them shows up in the
+        # next golden when it is regenerated, which is what this edits.
+        "A4-next-gateway-reads-tiers",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent-next.yaml",
+        ("rules:\n  - apiGroups:\n      - \"\"\n    resources:\n      - pods\n    verbs:\n"
+         "      - create\n      - get\n      - list\n      - watch\n      - delete",
+         "rules:\n  - apiGroups:\n      - kubeagents.x-k8s.io\n    resources:\n      - tiers\n"
+         "    verbs:\n      - get\n      - list\n      - watch\n"
+         "  - apiGroups:\n      - \"\"\n    resources:\n      - pods\n    verbs:\n"
+         "      - create\n      - get\n      - list\n      - watch\n      - delete"),
+        "test_A4_only_cluster_administrators_write_tiers",
+        "let the next-mode A2A gateway read tiers directly, as tier-aware "
+        "routing might, instead of through the operator's ConfigMap",
+    ),
+    Mutation(
+        "A4-next-callout-wildcard-resource",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent-next.yaml",
+        ("rules:\n  - apiGroups:\n      - \"\"\n    resourceNames:\n      - platformagent-a2a-authmap-0\n",
+         "rules:\n  - apiGroups:\n      - kubeagents.x-k8s.io\n    resources:\n      - '*'\n"
+         "    verbs:\n      - get\n"
+         "  - apiGroups:\n      - \"\"\n    resourceNames:\n      - platformagent-a2a-authmap-0\n"),
+        "test_A4_only_cluster_administrators_write_tiers",
+        "give the next-mode auth callout a wildcard read on the operator's API "
+        "group, which reaches tiers without naming them",
     ),
     Mutation(
         "A4-operator-tiers-wildcard-subresource",

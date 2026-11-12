@@ -135,7 +135,9 @@ fails; see `.agents/skills/edit-mirrored-skill/SKILL.md`.
 every namespace as full objects (`-A -o json|yaml`), because the credential proxy cuts such a reply
 at its output cap on a large cluster. Read one kind per call, project the fields with
 `-o jsonpath=` or `custom-columns=`, or read per namespace; the reads already in the tree are pinned
-with a reason in `scripts/cluster_reads_allowlist.txt`, which only shrinks. A Markdown span that
+with a reason in `scripts/cluster_reads_allowlist.txt`, which only shrinks, except for an
+`unresolved-kinds` read of one runtime kind per call that falls back when the broker cuts it, which
+is pinned with a reason that says so. A Markdown span that
 quotes the shape only to warn against it carries `<!-- cluster-reads-check: warning -->` on its
 line, and the check skips the spans on that line. CI runs the same check through
 `scripts/test_check_cluster_reads.py`.
@@ -250,7 +252,7 @@ for — a chart value, a Dockerfile `ARG` default, a compiled constant in the op
 default and a mirrored install, and what `githubMinter.enabled=true` adds to each; the build-time
 bases against their Dockerfile `ARG` defaults; the Go builder pin against the `go` directive in
 `k8s-operator/go.mod`; the pins and repositories compiled into the operator binary (the fluent-bit
-fallback, the NATS and nats-box pins, the A2A `next`-stack image names) and the gateway binary's
+fallback, the NATS, NATS exporter and nats-box pins, the A2A `next`-stack image names) and the gateway binary's
 worker repository; the example manifests; and the kustomize integrations, which it requires to name a variable the file owns
 rather than a literal. Two copies it does not reach, where a stale pin passes every check:
 Hindsight's images sit behind `hindsight.enabled` — unset by default, and then following
@@ -327,7 +329,8 @@ exception (`make gosec`, below). The per-area targets, for a faster loop while y
   live under `agents/*/defaults/skills/` instead of `agents/*/skills/`.
 - `make -C k8s-operator test` — manifests, generate, fmt, vet, the Python suite under
   `k8s-operator/internal/controller` (the gateway's leader-election wrapper; `make test-python`
-  runs it too), then the envtest download and `go test`; what the `Operator Tests` job runs.
+  runs it too), then the envtest download and `go test`; what the `Operator Tests` job runs
+  after its gosec step, which the target does not include (`make gosec`, below, does).
 - `make test-integration` — the seam tier only, for a component another one talks to across a
   process or protocol boundary. Install a Go toolchain first: the injector seam compiles the real
   Go event-watcher client, and without `go` on `PATH` its tests skip and the run still prints
@@ -864,7 +867,10 @@ only the pull request's own runs: a head commit that is also a commit on `main` 
 carries that line's push runs too, and a red one of those is named and left alone. It reads the best state per check name, so a run a newer success superseded is not re-run, except
 under a check name the base branch requires: GitHub still counts that red run and keeps the pull request out
 of the queue, so it is re-run once no run of its workflow on the pull request is still going, one run per workflow per `/retest`. A run cancelled while still queued made no check run and is never
-re-run. GitHub's own re-run button needs Write access, which most
+re-run. A run still `queued` an hour after it started, which is what a run GitHub lost during an
+Actions incident looks like, is cancelled (force-cancelled if a cancel does not take) and re-run
+whole; when a newer run of its workflow on the pull request carries its checks, it is cancelled
+and not re-run. That clears the checks without the push that would restart the smoke test. GitHub's own re-run button needs Write access, which most
 collaborators here do not hold. The comment gets 👀 when something was re-run and 😕 when nothing
 was, with the reason on the workflow run (a `Retest Actions Checks` run in the Actions tab; it is
 red, carrying GitHub's message, when GitHub refused every re-run, which is what a token that cannot
