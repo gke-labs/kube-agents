@@ -105,6 +105,18 @@ class ApplierTest(unittest.TestCase):
             apply(self.root)
         self.assertIn(BUILD_MARKER, str(caught.exception))
 
+    def test_the_dockerfiles_build_check_matches_what_the_applier_writes(self):
+        # The Dockerfile greps the patched adapter right after running the
+        # applier; a string the applier no longer writes fails every image build.
+        dockerfile = (HERE.parent / "Dockerfile").read_text().splitlines()
+        at = next(i for i, line in enumerate(dockerfile) if "apply_slack_dial_home.py" in line and "python3" in line)
+        check = dockerfile[at + 1]
+        self.assertIn("grep -qF", check)
+        needle = check.split('"')[1]
+        apply(self.root)
+        self.assertIn(needle, self.path.read_text())
+        self.assertNotIn(needle, ADAPTER_SOURCE)
+
     def test_moved_anchor_fails_without_writing(self):
         self.path.write_text(ADAPTER_SOURCE.replace('!= "messages"', 'not in ("messages",)'))
         before = self.path.read_text()
@@ -265,6 +277,37 @@ class RuntimeTest(unittest.TestCase):
             self.pick("UADMIN", "explain")
         self.assertEqual(self.published(), [dial._section(dial.OFF)])
         self.assertFalse((Path(self.home) / dial.STATE_NAME).exists())
+
+    def test_picking_the_default_level_is_recorded_or_says_not_saved(self):
+        self.pick("UADMIN", "propose")
+        self.assertEqual(json.loads((Path(self.home) / dial.STATE_NAME).read_text())["set_by"], "UADMIN")
+        (Path(self.home) / dial.STATE_NAME).write_text("{broken")
+        self.pick("UADMIN", "propose")
+        self.assertIn(dial.NOT_SAVED, shown(self.published()))
+        self.assertEqual((Path(self.home) / dial.STATE_NAME).read_text(), "{broken")
+
+    def test_open_with_the_switch_off_clears_a_stale_dial(self):
+        run(dial.opened(self.adapter, {"user": "UADMIN", "channel": "D1", "tab": "home"}))
+        self.assertIn("actions", [b["type"] for b in self.published()])
+        for value in ("off", "", "yes"):
+            with mock.patch.dict(os.environ, {dial.FLAG_ENV: value}):
+                run(dial.opened(self.adapter, {"user": "UMEMBER", "tab": "home"}))
+            self.assertEqual(self.published(), [dial._section(dial.OFF)], value)
+        self.assertFalse((Path(self.home) / dial.STATE_NAME).exists())
+
+    def test_open_with_the_switch_off_checks_no_one(self):
+        self.adapter._is_interactive_user_authorized = mock.Mock(side_effect=AssertionError("checked"))
+        with mock.patch.dict(os.environ, {dial.FLAG_ENV: "off"}):
+            run(dial.opened(self.adapter, {"user": "USTRANGER", "tab": "home"}))
+        self.assertEqual(self.published(), [dial._section(dial.OFF)])
+
+    def test_open_with_the_switch_off_survives_a_publish_failure(self):
+        async def boom(user_id, view):
+            raise RuntimeError("not_enabled")
+
+        self.adapter.client.views_publish = boom
+        with mock.patch.dict(os.environ, {dial.FLAG_ENV: "off"}):
+            run(dial.opened(self.adapter, {"user": "UADMIN", "tab": "home"}))
 
     def test_pick_is_authorized_as_the_dm_it_was_opened_in(self):
         seen = []

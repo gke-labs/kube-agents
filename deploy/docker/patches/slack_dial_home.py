@@ -1,13 +1,15 @@
 """The autonomy dial on the Slack app's Home tab, when ``KUBEAGENTS_DIAL`` is on.
 
 Installed into the image at ``/opt/hermes/gateway/slack_dial_home.py``.
-``apply_slack_dial_home.py`` makes the Slack adapter hand an
-``app_home_opened`` on the Home tab to :func:`opened` only when the switch is
-on, and always wire :func:`register`'s one listener, for this module's own
-action id. With the switch off (the default, and any value but ``on``) the Home
-tab is ignored, as upstream ignores it; a click on a dial Slack still shows from
-before the switch went off is acknowledged and answered with :data:`OFF`, so it
-never errors.
+``apply_slack_dial_home.py`` makes the Slack adapter hand every
+``app_home_opened`` on the Home tab to :func:`opened`, and always wire
+:func:`register`'s one listener, for this module's own action id. With the
+switch off (the default, and any value but ``on``) opening the tab publishes the
+one line :data:`OFF`, so a dial drawn before the switch went off does not
+linger, and a click on a dial Slack still shows is acknowledged and answered
+with the same line, so it never errors. Nothing is read or recorded while the
+switch is off. An app without the Home tab turned on never sends the event, so
+nothing changes for it.
 
 What the tab shows
 ------------------
@@ -445,12 +447,24 @@ async def publish(adapter: Any, team_id: str, user_id: str, note: str = "") -> N
         logger.warning("slack_dial_home: views.publish failed for %s: %s", user_id, exc)
 
 
+async def publish_off(adapter: Any, team_id: str, user_id: str) -> None:
+    """Replace ``user_id``'s Home tab with the one line :data:`OFF`."""
+    view = {"type": "home", "blocks": [_section(OFF)]}
+    try:
+        await adapter._get_client("", team_id=team_id).views_publish(user_id=user_id, view=view)
+    except Exception as exc:  # noqa: BLE001 — the tab stays as it was
+        logger.warning("slack_dial_home: views.publish failed for %s: %s", user_id, exc)
+
+
 async def opened(adapter: Any, event: dict, body: dict | None = None) -> None:
-    """Answer the Home tab opening with the dial."""
+    """Answer the Home tab opening with the dial, or with :data:`OFF` when the switch is off."""
     user_id = str(event.get("user") or "")
     if not user_id:
         return
     team_id = adapter._event_team_id(event, body)
+    if not enabled():
+        await publish_off(adapter, team_id, user_id)
+        return
     _remember_dm(team_id, user_id, str(event.get("channel") or ""))
     await publish(adapter, team_id, user_id)
 
@@ -461,14 +475,10 @@ async def on_level(adapter: Any, ack: Any, body: dict, action: dict) -> None:
     user_id = str((body.get("user") or {}).get("id") or "")
     if not user_id:
         return
-    if not enabled():
-        view = {"type": "home", "blocks": [_section(OFF)]}
-        try:
-            await adapter._get_client("", team_id=adapter._event_team_id({}, body)).views_publish(user_id=user_id, view=view)
-        except Exception as exc:  # noqa: BLE001 — the tab stays as it was
-            logger.warning("slack_dial_home: views.publish failed for %s: %s", user_id, exc)
-        return
     team_id = adapter._event_team_id({}, body)
+    if not enabled():
+        await publish_off(adapter, team_id, user_id)
+        return
     level = str((action.get("selected_option") or {}).get("value") or "")
     note = ""
     if not await _authorized(adapter, user_id, team_id):
@@ -478,13 +488,15 @@ async def on_level(adapter: Any, ack: Any, body: dict, action: dict) -> None:
     else:
         admin = await is_admin(adapter, user_id)
         if admin is True:
-            if read_state()["level"] != level:
-                try:
+            # Compared with the stored record, not read_state(): that reads a
+            # missing or unreadable file as Propose, which would skip the write.
+            try:
+                if _read_raw().get("level") != level:
                     write_level(level, user_id)
                     logger.info("slack_dial_home: dial set to %s by %s", level, user_id)
-                except (UnreadableRecord, OSError) as exc:
-                    logger.warning("slack_dial_home: not recording %s by %s: %s", level, user_id, exc)
-                    note = NOT_SAVED
+            except (UnreadableRecord, OSError) as exc:
+                logger.warning("slack_dial_home: not recording %s by %s: %s", level, user_id, exc)
+                note = NOT_SAVED
         else:
             logger.warning("slack_dial_home: ignoring a dial pick of %s by %s, who is not an install admin", level, user_id)
             note = READ_ONLY if admin is False else NOT_CHECKED
