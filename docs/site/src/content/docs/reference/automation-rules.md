@@ -14,8 +14,15 @@ kube-agents reads the file only when the install's `KUBEAGENTS_AUTOMERGE` switch
 `on`. The switch is an entry in the PlatformAgent's `spec.deployment.env`, and it defaults to `off`
 ([credential isolation](/kube-agents/reference/credential-isolation/) lists where it reaches). On a
 chart, `install.sh` or Terraform install, set it through the chart value
-`platformAgent.deployment.env`, as [Operator settings](/kube-agents/install/quickstart-gke/#operator-settings)
-shows; a hand edit of the CR can be lost at the next chart apply. With
+`platformAgent.deployment.env`. On an `install.sh` install, that is a line in `install.env`:
+
+```bash
+TF_VAR_extra_helm_values='{platformAgent={deployment={env=[{name="KUBEAGENTS_AUTOMERGE",value="practice"}]}}}'
+```
+
+There is one such line for every extra chart value, so merge this entry into one already there
+([Operator settings](/kube-agents/install/quickstart-gke/#operator-settings) covers the line and a
+hand-driven Terraform or Helm install). A hand edit of the CR can be lost at the next chart apply. With
 it off the file is never opened. Adding the file changes nothing until the switch is turned on.
 kube-agents never merges a pull request itself: the file is input to your own pipeline's merge
 decision.
@@ -39,8 +46,8 @@ file with only `version: 1` is valid and allows nothing.
 Each rule has exactly two keys:
 
 - `fix`: the kind of fix, named by the audit check that finds the problem. The one kind today is
-  `no-pdb`, which adds a missing PodDisruptionBudget. A rule naming any other kind is kept but never
-  matches, and the check command below warns about it.
+  `no-pdb`, which adds a missing PodDisruptionBudget. A rule naming any other kind refuses the
+  whole file.
 - `environments`: a non-empty list of environment names, written as GKE label values (lowercase
   letters, digits, `_` and `-`, at most 63 characters).
 
@@ -68,15 +75,16 @@ these labels has no environment, and no rule matches it.
 
 ## When the file is refused
 
-Any one of these refuses the whole file, never just the rule it is in, so a typo in a deny rule
-cannot leave the allow rules beside it in force:
+Any one of these refuses the whole file, never just the rule it is in, so a misspelt key or fix
+kind in a deny rule cannot leave the allow rules beside it in force. A misspelt environment name
+cannot be caught this way: it is a valid label value that matches no cluster.
 
 - It is not YAML, is larger than 64 KiB, or is not UTF-8.
 - `.kube-agents` or the file is a symbolic link.
 - `version` is missing or is not the number `1`.
 - A key is unknown or appears twice, at any level. YAML merge keys (`<<`) are not supported.
-- A rule is missing `fix` or `environments`, an environment is not a label value, or an allow rule
-  uses `*`.
+- A rule is missing `fix` or `environments`, names a fix kind kube-agents does not open, has an
+  environment that is not a label value, or is an allow rule that uses `*`.
 
 ## Check a file
 
@@ -86,7 +94,7 @@ In the install's shell sandbox (the `<name>-shell` Pod), where the agent's check
 python3 /opt/defaults/scripts/automation_rules.py <checkout> --fix no-pdb --environment dev
 ```
 
-It prints the parsed rules, any warnings, the reason a file was refused, and the decision for the
+It prints the parsed rules, the reason a file was refused, and the decision for the
 fix and environment given, as JSON. It exits 1 when the file is refused. With the switch `off` it
 reports `switch-off` without reading the file.
 
