@@ -30,6 +30,7 @@ Custom resources in the `kubeagents.x-k8s.io/v1alpha1` API group:
 - **`AgentPlugin`** — declares OCI plugin extensions, secret environment variables, and allowed configuration overrides targeted to a `PlatformAgent`. The repository ships the Pub/Sub alert adapter and the GKE stockout investigator: [Shipped plugins](/kube-agents/operator/agentplugin-crd/#shipped-plugins).
 - **`AgentProfile`** — under `spec.mode: next` only, declares one kind of A2A agent pod; the operator renders its ServiceAccount, bus identity and agent card. See [AgentProfile CRD](/kube-agents/operator/agentprofile-crd/).
 - **`Tier`** — names what a task may do at a tier. The operator only reports it `Accepted`; nothing enforces it yet. See [Tier CRD](/kube-agents/operator/tier-crd/).
+- **`AgentSchedule`** — runs a prompt on an `AgentProfile` on a cron schedule, each run an `Unattended` task. Off by default, and nothing fires yet. See [AgentSchedule CRD](/kube-agents/operator/agentschedule-crd/).
 
 The controller reconciles a `PlatformAgent` into:
 
