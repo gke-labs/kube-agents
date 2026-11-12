@@ -82,8 +82,9 @@ func startStopRig(t *testing.T, tweak func(*Config)) (*rig, *fakeSpawner, *recor
 // TestAStopCancelsTheWholeFanOut: a stop while a fan-out of three profile
 // tasks runs, one of them already ended, sends each live child its cancel on
 // its own addressee's .in and its stop record, and marks it canceled; the
-// ended child gets neither. The room reads one "cancel sent", nothing wakes
-// though a child completed, and the chain ends once, canceled.
+// ended child gets neither. The room reads one "cancel sent". The chain
+// doesn't end until the stopped children have; then it ends once, canceled,
+// and nothing wakes though a child completed.
 func TestAStopCancelsTheWholeFanOut(t *testing.T) {
 	r, spawn, obs := startStopRig(t, nil)
 	ctx := context.Background()
@@ -117,6 +118,12 @@ func TestAStopCancelsTheWholeFanOut(t *testing.T) {
 	rec, _ := r.g.reg.Get(ctx, conv)
 	if ref, _ := rec.TaskRefFor(f.kids[0].ID); ref.Canceled {
 		t.Fatal("the ended child is marked canceled")
+	}
+	if _, ok := obs.terminalFor(f.origin.TaskID); ok {
+		t.Fatal("the chain ended before its stopped children did")
+	}
+	for _, i := range []int{1, 2} {
+		_ = r.execFor(t, f.envs[i], "cluster").PublishStatus(ctx, lib.StateCanceled, true)
 	}
 	waitFor(t, "the root's terminal", func() bool { _, ok := obs.terminalFor(f.origin.TaskID); return ok })
 	if end, _ := obs.terminalFor(f.origin.TaskID); end.state != lib.StateCanceled {
@@ -219,6 +226,9 @@ func TestAStopWhoseChildCancelFailsHoldsUntilResent(t *testing.T) {
 	for _, k := range f.kids {
 		waitFor(t, "the re-sent cancel for "+k.ID, func() bool { return cancelSentTo(t, r, targetPlatform, k.ID) })
 	}
+	for i := range f.kids {
+		_ = r.execFor(t, f.envs[i], targetPlatform).PublishStatus(ctx, lib.StateCanceled, true)
+	}
 	waitFor(t, "the root's terminal", func() bool { _, ok := obs.terminalFor(f.origin.TaskID); return ok })
 	if end, _ := obs.terminalFor(f.origin.TaskID); end.state != lib.StateCanceled {
 		t.Fatalf("root terminal = %+v, want canceled", end)
@@ -242,8 +252,9 @@ func TestAStopWhoseChildCancelFailsHoldsUntilResent(t *testing.T) {
 }
 
 // TestAStoppedFanOutReleasesTheConversation: a fan-out of three is stopped,
-// two children confirm and one never starts. The chain ends once, canceled,
-// nothing wakes, and the conversation's next delegation mints.
+// two children confirm and one never starts. The one that never started
+// holds the batch until the heal ends it past FirstEventGrace; then the
+// chain ends once, canceled, nothing wakes, and the next delegation mints.
 func TestAStoppedFanOutReleasesTheConversation(t *testing.T) {
 	r, spawn, obs := startStopRig(t, nil)
 	ctx := context.Background()
@@ -255,13 +266,28 @@ func TestAStoppedFanOutReleasesTheConversation(t *testing.T) {
 	})
 	for _, i := range []int{0, 1} {
 		_ = r.execFor(t, f.envs[i], targetPlatform).PublishStatus(ctx, lib.StateCanceled, true)
+		childEndedLogged(t, r, f.kids[i].ID)
 	}
+	if _, ok := obs.terminalFor(f.origin.TaskID); ok {
+		t.Fatal("the chain ended while a stopped child was still on the bus")
+	}
+	rec, _ := r.g.reg.Get(ctx, conv)
+	if live := r.g.liveChild(ctx, rec); live != f.kids[2].ID {
+		t.Fatalf("liveChild = %q, want the child that never started", live)
+	}
+	putRecord(t, r, conv, func(rec *SessionRecord) {
+		for i := range rec.Tasks {
+			if rec.Tasks[i].ID == f.kids[2].ID {
+				rec.Tasks[i].StartedAt = time.Now().Add(-r.g.cfg.FirstEventGrace - time.Minute)
+			}
+		}
+	})
+
+	exec2, origin2, _ := sessionTurn(t, r, spawn, conv, "again")
 	waitFor(t, "the root's terminal", func() bool { _, ok := obs.terminalFor(f.origin.TaskID); return ok })
 	if end, _ := obs.terminalFor(f.origin.TaskID); end.state != lib.StateCanceled {
 		t.Fatalf("root terminal = %+v, want canceled", end)
 	}
-
-	exec2, origin2, _ := sessionTurn(t, r, spawn, conv, "again")
 	_ = exec2.PublishArtifact(ctx, delegateArtifact(t, "platform", "next"))
 	next := awaitSubmission(t, r, targetPlatform, 3)
 	waitFor(t, "the next child on the record", func() bool {

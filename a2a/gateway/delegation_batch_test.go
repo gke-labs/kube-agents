@@ -239,9 +239,8 @@ func TestARedeliveredBatchMintsNothing(t *testing.T) {
 }
 
 // TestABatchIsRefusedWhileAnEarlierChildIsLive: one live delegation per
-// conversation still holds; a batch while an earlier turn's child runs,
-// released from the active task but not stopped, is refused, naming that
-// child.
+// conversation still holds; a batch while an earlier turn's child runs is
+// refused, naming that child.
 func TestABatchIsRefusedWhileAnEarlierChildIsLive(t *testing.T) {
 	r, spawn := startBatchRig(t, 3)
 	ctx := context.Background()
@@ -250,11 +249,11 @@ func TestABatchIsRefusedWhileAnEarlierChildIsLive(t *testing.T) {
 	_ = exec.PublishArtifact(ctx, delegateArtifact(t, targetPlatform, "first"))
 	child := r.awaitTask(t, targetPlatform)
 	_ = exec.PublishStatus(ctx, lib.StateCompleted, true)
-	waitFor(t, "child active", func() bool {
+	sessionRigTurn(r, conv, "stop-1", "stop")
+	waitFor(t, "child detached", func() bool {
 		rec, _ := r.g.reg.Get(ctx, conv)
-		return rec.ActiveTask != nil && rec.ActiveTask.TaskID == child.TaskID
+		return rec.ActiveTask != nil && rec.ActiveTask.TaskID == child.TaskID && rec.ActiveTask.Detached
 	})
-	putRecord(t, r, conv, func(rec *SessionRecord) { rec.ActiveTask = nil })
 
 	exec2, origin2, _ := sessionTurn(t, r, spawn, conv, "again")
 	_ = exec2.PublishArtifact(ctx, delegateBatchArtifact(t, platformTask("a"), platformTask("b")))

@@ -865,10 +865,9 @@ func TestAChildThatCannotReachTheBusLeavesNoChain(t *testing.T) {
 }
 
 // TestOneLiveChildPerConversation: one live child at a time holds per
-// conversation, whichever turn asked. A child that no longer holds the
-// conversation's active task but still runs (released, not stopped: a
-// stopped child no longer counts) refuses a later turn's request, after
-// that turn's answer, naming the running child.
+// conversation, whichever turn asked. A stop
+// detaches the child without ending it; a later turn's request is refused,
+// after that turn's answer, naming the running child.
 func TestOneLiveChildPerConversation(t *testing.T) {
 	r, spawn := startRigWithSpawner(t)
 	ctx := context.Background()
@@ -877,11 +876,11 @@ func TestOneLiveChildPerConversation(t *testing.T) {
 	_ = exec.PublishArtifact(ctx, delegateArtifact(t, "platform", "first"))
 	child := r.awaitTask(t, targetPlatform)
 	_ = exec.PublishStatus(ctx, lib.StateCompleted, true)
-	waitFor(t, "child active", func() bool {
+	sessionRigTurn(r, conv, "stop-1", "stop")
+	waitFor(t, "child detached", func() bool {
 		rec, _ := r.g.reg.Get(ctx, conv)
-		return rec.ActiveTask != nil && rec.ActiveTask.TaskID == child.TaskID
+		return rec.ActiveTask != nil && rec.ActiveTask.TaskID == child.TaskID && rec.ActiveTask.Detached
 	})
-	putRecord(t, r, conv, func(rec *SessionRecord) { rec.ActiveTask = nil })
 
 	exec2, origin2, _ := sessionTurn(t, r, spawn, conv, "again")
 	_ = exec2.PublishArtifact(ctx, delegateArtifact(t, "platform", "second"))
@@ -894,17 +893,18 @@ func TestOneLiveChildPerConversation(t *testing.T) {
 	// Retiring the delegating turn's pod is not the child's end: the child
 	// ran on platform, not in that pod, so no supervisor terminal is owed.
 	if key, _ := r.g.reg.SessionForTask(ctx, child.TaskID); key != conv {
-		t.Fatalf("the released child was retired with the pod: index=%q", key)
+		t.Fatalf("the detached child was retired with the pod: index=%q", key)
 	}
 }
 
-// TestAStoppedChildNoLongerBlocksADelegation: a child its requester stopped
-// doesn't count as the conversation's live delegation, though its terminal
-// hasn't come: a later turn's request mints.
-func TestAStoppedChildNoLongerBlocksADelegation(t *testing.T) {
+// TestAStoppedChildBlocksUntilItEnds: a stop doesn't end a child, so one
+// still running after its cancel is the conversation's live delegation and a
+// later turn's request is refused, naming it; once its terminal arrives the
+// next request mints.
+func TestAStoppedChildBlocksUntilItEnds(t *testing.T) {
 	r, spawn := startRigWithSpawner(t)
 	ctx := context.Background()
-	conv := "discord:g1/t-stopped-child-frees"
+	conv := "discord:g1/t-stopped-child-blocks"
 	exec, _, _ := sessionTurn(t, r, spawn, conv, "x")
 	_ = exec.PublishArtifact(ctx, delegateArtifact(t, "platform", "first"))
 	child := r.awaitTask(t, targetPlatform)
@@ -916,15 +916,21 @@ func TestAStoppedChildNoLongerBlocksADelegation(t *testing.T) {
 	})
 	exec2, origin2, _ := sessionTurn(t, r, spawn, conv, "again")
 	_ = exec2.PublishArtifact(ctx, delegateArtifact(t, "platform", "second"))
-	second := awaitSubmission(t, r, targetPlatform, 1)
-	waitFor(t, "second child on the record", func() bool {
-		rec, _ := r.g.reg.Get(ctx, conv)
-		pref, _ := rec.TaskRefFor(origin2.TaskID)
-		return len(pref.Children) == 1 && pref.Children[0] == second.TaskID
+	waitFor(t, "busy refusal", loggedContaining(r, "delegation refused", "rule="+ruleDelegationBusy, origin2.TaskID, "child="+child.TaskID))
+	_ = exec2.PublishStatus(ctx, lib.StateCompleted, true)
+
+	_ = r.execFor(t, child, targetPlatform).PublishStatus(ctx, lib.StateCanceled, true)
+	waitFor(t, "the stopped child's route retired", func() bool {
+		key, err := r.g.reg.SessionForTask(ctx, child.TaskID)
+		return err == nil && key == ""
 	})
-	if loggedContaining(r, "delegation refused", "rule="+ruleDelegationBusy)() {
-		t.Fatalf("a stopped child refused the next delegation:\n%s", r.logs.String())
-	}
+	exec3, origin3, _ := sessionTurn(t, r, spawn, conv, "and again")
+	_ = exec3.PublishArtifact(ctx, delegateArtifact(t, "platform", "third"))
+	waitFor(t, "the next child on the record", func() bool {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		pref, _ := rec.TaskRefFor(origin3.TaskID)
+		return len(pref.Children) == 1
+	})
 }
 
 // ---- the wake-up turn after the child's end ------------------------------

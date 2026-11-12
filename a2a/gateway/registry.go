@@ -79,8 +79,8 @@ type ActiveTask struct {
 	Capability *capability.Ref `json:"capability,omitempty"`
 	// Detached means the user said stop but no terminal event has arrived
 	// (the executor may be dead and platform tasks have no janitor yet, W3
-	// retarget). A detached task no longer serializes the session; its events,
-	// if they ever arrive, still relay.
+	// retarget). A detached task no longer serializes the session, and
+	// nothing it writes afterwards reaches the room (applyCanceledEvent).
 	Detached bool `json:"detached,omitempty"`
 	// NoFirstEventNoticeAt is when the reap scan told the conversation that
 	// this task had produced nothing past FirstEventGrace. Zero until then.
@@ -313,17 +313,17 @@ type TaskRef struct {
 	// Two writers set it whether or not the cancel went out: a withdrawn
 	// batch child (withdrawBatch) and a task the tree-wide stop reached
 	// (stopTree), so its writes are dropped either way; CancelUnsent says
-	// which, and a task with it set is not counted stopped.
+	// which. Either way the task counts as running until it ends.
 	Canceled bool `json:"canceled,omitempty"`
 	// CancelUnsent marks a task the gateway marked Canceled whose cancel
 	// never reached the bus (a withdrawn batch child, a task the tree-wide
-	// stop reached): it may still run. Its writes are dropped as any
-	// canceled task's are, but it isn't counted stopped: it still holds the
-	// conversation's one live delegation (liveChild) and its batch
-	// (endStoppedBatch), and a later stop, or the next turn's heal,
-	// re-sends its cancel (healStoppedTasks), which clears the mark.
+	// stop reached). Its writes are dropped as any canceled task's are, and
+	// a later stop (stopTree), or the next turn's heal (healStoppedTasks),
+	// re-sends its cancel, which clears the mark, as its terminal does. The
+	// history cap never evicts it (trimHistory).
 	CancelUnsent bool `json:"cancelUnsent,omitempty"`
-	// StopPending marks a task the tree-wide stop canceled (stopTree) whose
+	// StopPending marks a task the tree-wide stop canceled (stopTree), or
+	// whose re-sent cancel went out, whose
 	// terminal the relay hasn't delivered: relayTerminal clears it, and the
 	// heal ends a task still marked once its terminal is on the stream or it
 	// has produced nothing past FirstEventGrace (healStoppedTasks).
@@ -568,7 +568,8 @@ func (rec *SessionRecord) takeCardsPending(rootID string) bool {
 // first, but never a live node of a fan-out still running: its parent, the
 // chain's root and every child, ended or not, since the wake reads each
 // child's end and the root carries the chain's mark. Nor the active task's
-// entry. A history whose live nodes alone pass the cap keeps them all; a
+// entry, nor a stopped task not yet seen to end (CancelUnsent, or Canceled
+// with StopPending), which may still run. A history whose live nodes alone pass the cap keeps them all; a
 // batch holds at most lib.DelegateBatchMax children, so that is bounded.
 func (rec *SessionRecord) trimHistory() {
 	over := len(rec.Tasks) - taskHistoryCap
@@ -580,6 +581,11 @@ func (rec *SessionRecord) trimHistory() {
 		live[rec.ActiveTask.TaskID] = true
 	}
 	for _, ref := range rec.Tasks {
+		// A stopped task not yet seen to end may still run: its cancel to
+		// re-send (CancelUnsent), or its end to heal (StopPending).
+		if ref.CancelUnsent || (ref.Canceled && ref.StopPending) {
+			live[ref.ID] = true
+		}
 		if !rec.fanOutPending(ref.ID) {
 			continue
 		}

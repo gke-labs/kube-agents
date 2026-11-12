@@ -927,6 +927,14 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	// result, notice or steer shortfall (applyCanceledEvent). Its line is
 	// still closed below, once, and its end logged and observed.
 	muted := ref.Canceled
+	// endState is how the task's end reads to the room's line, its marks and
+	// its observers: a canceled task ends canceled whatever its executor
+	// said, so its line keeps reading stopped and no program is handed an
+	// answer the room was not (logTaskTerminal keeps the executor's state).
+	endState := s.Status.State
+	if muted {
+		endState = lib.StateCanceled
+	}
 	// A turn answer still assembling posts before the deliverable it led to.
 	if muted && rs.turnPending {
 		rs.turn, rs.turnChunks, rs.turnPending = nil, nil, false
@@ -1042,7 +1050,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		// Whole, to the adapter whose caller is a program, before the chunked
 		// posts below (DeliverableObserver). A non-text result hands over
 		// nothing: the notice that replaces it is not the deliverable.
-		if result != "" {
+		if result != "" && !muted {
 			g.observeDelivered(rec, taskID, result)
 		}
 		// A chat message needs its text fallback, so a non-text result
@@ -1128,7 +1136,11 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		g.postSteerShortfall(rec, rs, taskID)
 		g.flushNotices(rec.Key, rs)
 	}
-	g.terminalMark(rec, taskID, s.Status.State, terminal)
+	if muted {
+		// An executor's own mark is a write like any other.
+		terminal = chatmsg.Reading{}
+	}
+	g.terminalMark(rec, taskID, endState, terminal)
 
 	if active := rec.ActiveTask; active != nil && active.TaskID == taskID {
 		if active.StatusMsgID != "" && !lineAnswered {
@@ -1138,7 +1150,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			if g.cfg.DisplayMode == displayModeDefault {
 				progress = ""
 			}
-			g.renderLine(rec.Key, active.StatusMsgID, withLineNote(doneTerminalLine(s.Status.State, progress, doneLine != ""), active.LineNote), rs, "")
+			g.renderLine(rec.Key, active.StatusMsgID, withLineNote(doneTerminalLine(endState, progress, doneLine != ""), active.LineNote), rs, "")
 		}
 		unmarkOnSupervisorTerminal(rec, taskID, source)
 		if !active.Detached && rec.fanOutPending(taskID) {
@@ -1179,7 +1191,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			if g.cfg.DisplayMode == displayModeDefault {
 				progress = ""
 			}
-			g.renderLine(rec.Key, parent.StatusMsgID, withLineNote(doneTerminalLine(s.Status.State, progress, doneLine != ""), parent.LineNote), rs, "")
+			g.renderLine(rec.Key, parent.StatusMsgID, withLineNote(doneTerminalLine(endState, progress, doneLine != ""), parent.LineNote), rs, "")
 		}
 		setParentLine(rec, taskID, "")
 		if source == TerminalFromExecutor {
@@ -1239,7 +1251,7 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 			root, _ := rec.observedAs(taskID)
 			rec.markCardsPending(root)
 		}
-		g.observeEnded(rec, taskID, s.Status.State, source, reason)
+		g.observeEnded(rec, taskID, endState, source, reason)
 	}
 
 	// A fan-out child's end is kept until its last sibling's, which wakes
