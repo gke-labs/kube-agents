@@ -120,9 +120,10 @@ func TestTheExporterSupervisorRestartsTheExporterWithBackoff(t *testing.T) {
 	}
 }
 
-// The shell is PID 1 in the container, so the trap is its only signal
-// handling: TERM or INT ends it at once, exporter and all, whether the
-// exporter is running or the loop is pausing between runs.
+// The shell is the container's main process, the one TERM reaches (not
+// PID 1: the pod shares a process namespace for the config reloader), and
+// the trap is what ends the run: TERM or INT ends it at once, exporter and
+// all, whether the exporter is running or the loop is pausing between runs.
 func TestTheExporterSupervisorExitsAtOnceOnASignal(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -154,9 +155,10 @@ func TestTheExporterSupervisorExitsAtOnceOnASignal(t *testing.T) {
 				if waited := time.Since(sent); waited > 2*time.Second {
 					t.Errorf("exited %s after the signal, want at once", waited)
 				}
-				// In the container the kernel kills what PID 1 leaves
-				// behind; here, nothing the trap should have killed may
-				// be left in the group.
+				// In the container the runtime kills what the main
+				// process leaves behind when it stops the container;
+				// here, nothing the trap should have killed may be left
+				// in the group.
 				waitForSupervisor(t, "the exporter or the pause to be killed with the supervisor", time.Second, func() bool { return groupGone(cmd) })
 			case <-time.After(5 * time.Second):
 				t.Fatalf("still running 5s after %s: %s", tc.signal, out.String())
