@@ -3024,6 +3024,16 @@ class CloudStorageReadsTest(unittest.TestCase):
                 decision = evaluate(argv)
                 self.assertFalse(decision.allowed, argv)
                 self.assertIn(decision.rule_id, ("gcp.storage-cloud-url-required", "gcp.unreadable-command"), argv)
+        # The refusal names the matched read and never the caller's value.
+        for argv, verb in (
+            (["gcloud", "storage", "cat", "/etc/hostname"], ("storage", "cat")),
+            (["gcloud", "storage", "cat", "gs://fleet-logs/a", "/etc/hostname"], ("storage", "cat")),
+            (["gcloud", "storage", "objects", "describe", "/dev/zero"], ("storage", "objects", "describe")),
+        ):
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertEqual(decision.rule_id, "gcp.storage-cloud-url-required")
+                self.assertEqual(decision.verb_tuple, verb)
         # A storage read with no positional lists the project and is allowed.
         self.assertTrue(evaluate(["gcloud", "storage", "ls"]).allowed)
         self.assertTrue(evaluate(["gcloud", "storage", "buckets", "list", "--project=acme-fleet-host"]).allowed)

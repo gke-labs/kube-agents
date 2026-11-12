@@ -2107,7 +2107,10 @@ def _evaluate(argv: list[str], readings: bool = True) -> Decision:
                         "in the container holding the credentials, so a local path "
                         "would read that container, not the sandbox."
                     ),
-                    verb_tuple=_gcloud_verb_tuple(words),
+                    # The matched read's own words: the first positional is the
+                    # caller's value and stays out of the log hint and the
+                    # `verb` the shim prints.
+                    verb_tuple=tuple(words[:_gcloud_read_length(words)]),
                 )
         return _ALLOWED
 
