@@ -208,6 +208,22 @@ readonly A2A_DIAG_LOG_MAX_BYTES=$((4 * 1024 * 1024))
 # into hundreds of files. The operator renders under a dozen pods and the
 # gateway caps sessions at A2A_MAX_SESSIONS, so a healthy install is well under.
 readonly A2A_DIAG_MAX_PODS=40
+# Each bus server's own view, read from its monitoring port inside its pod:
+# /jsz carries the JetStream meta cluster, and on its leader every peer with
+# current and offline, the state a stream placement counts (a create refused
+# "no suitable peers for placement" on three servers that all serve is
+# otherwise undiagnosable from logs: #5644's today smoke run); /routez the
+# routes the server holds; /varz its version and build. The image each
+# server's containers ran goes to a2a-nats-images.txt, so servers on
+# different builds of a floating tag show. Bounded per read, and a read that
+# hangs gives up at the request timeout.
+readonly A2A_DIAG_NATS_COMPONENT="nats"
+readonly A2A_DIAG_NATS_CONTAINER="nats"
+readonly A2A_DIAG_NATS_MONITOR_URL="http://127.0.0.1:8222"
+readonly A2A_DIAG_NATS_MONITOR_PATHS="jsz routez varz"
+readonly A2A_DIAG_NATS_READ_MAX_BYTES=$((1024 * 1024))
+readonly A2A_DIAG_NATS_REQUEST_TIMEOUT="20s"
+readonly A2A_DIAG_NATS_IMAGES_JSONPATH='{range .items[*]}{.metadata.name}{"\t"}{range .status.containerStatuses[*]}{.name}={.imageID}{" "}{end}{"\n"}{end}'
 
 # ─── Inference-replay shadow mode ────────────────────────────────────────────
 # On by default (EVAL_REPLAY_SHADOW=false turns it off), this puts the shadow-mode replay proxy
@@ -1273,7 +1289,7 @@ collect_a2a_component_logs() {
       -o jsonpath="${A2A_DIAG_PODS_JSONPATH}" 2>&1 || true
   } > "${listing}" || true
 
-  local line rest pod component restarts base read_pods=0
+  local line rest pod component restarts base read_pods=0 read_nats=
   while IFS= read -r line; do
     # Only pod lines: an error kubectl wrote into the listing has no tab.
     [[ "${line}" == *$'\t'* ]] || continue
@@ -1303,7 +1319,33 @@ collect_a2a_component_logs() {
           | last_bytes "${A2A_DIAG_LOG_MAX_BYTES}" "${artifact_dir}/${prefix}${base}-previous.log" || true
         ;;
     esac
+    if [ "${component}" = "${A2A_DIAG_NATS_COMPONENT}" ]; then
+      collect_a2a_nats_monitor "${artifact_dir}" "${prefix}" "${ns}" "${pod}" "${base}" "${kctl[@]}"
+      read_nats=1
+    fi
   done < <(cat "${listing}" 2>/dev/null || true)
+  if [ -n "${read_nats:-}" ]; then
+    "${kctl[@]}" get pods -n "${ns}" -l "${A2A_DIAG_COMPONENT_LABEL}=${A2A_DIAG_NATS_COMPONENT}" \
+      -o jsonpath="${A2A_DIAG_NATS_IMAGES_JSONPATH}" > "${artifact_dir}/${prefix}a2a-nats-images.txt" 2>&1 || true
+  fi
+  return 0
+}
+
+# collect_a2a_nats_monitor reads one bus server's monitoring endpoints
+# (A2A_DIAG_NATS_MONITOR_PATHS) from inside its pod, one file each:
+# <base>-<path>.json. Same contract as its caller: every command ends in
+# `|| true`, so a server that doesn't answer leaves the error in its file.
+collect_a2a_nats_monitor() {
+  local artifact_dir="$1" prefix="$2" ns="$3" pod="$4" base="$5"
+  shift 5
+  local kctl=("$@")
+  local path
+  for path in ${A2A_DIAG_NATS_MONITOR_PATHS}; do
+    "${kctl[@]}" exec "pod/${pod}" -n "${ns}" -c "${A2A_DIAG_NATS_CONTAINER}" \
+      --request-timeout="${A2A_DIAG_NATS_REQUEST_TIMEOUT}" -- \
+      wget -qO- -T 10 "${A2A_DIAG_NATS_MONITOR_URL}/${path}" 2>&1 \
+      | last_bytes "${A2A_DIAG_NATS_READ_MAX_BYTES}" "${artifact_dir}/${prefix}${base}-${path}.json" || true
+  done
   return 0
 }
 
