@@ -169,7 +169,12 @@ class SplitAnswerTest(unittest.TestCase):
         md = sentence + " It needs more.\n\nScale it."
         lead, body = sp.split_lead(md)
         self.assertEqual((lead, body), (sentence, ["It needs more.", "Scale it."]))
-        self.assertEqual((sp._clip(sp._plain(lead), sp.HEADLINE_MAX), body), sp.split_answer(md))
+        # split_answer cuts the same sentence at a word, so its clip drops nothing: the headline ends
+        # on the ellipsis the body's first section opens with, and that section carries the rest.
+        headline, sections = sp.split_answer(md)
+        self.assertTrue(headline.endswith(sp.ELLIPSIS), headline)
+        self.assertEqual(sections[1:], ["Scale it."])
+        self.assertTrue(sections[0].startswith(sp.ELLIPSIS + "busy") and sections[0].endswith(" It needs more."), sections)
 
     def test_empty(self):
         self.assertEqual(sp.split_answer(""), ("", []))
@@ -195,6 +200,41 @@ class SplitAnswerTest(unittest.TestCase):
     def test_a_headline_is_not_cut_after_etc(self):
         headline, _body = sp.split_answer("Deployments, StatefulSets, etc. All fail readiness. Node-a is cordoned.")
         self.assertEqual(headline, "Deployments, StatefulSets, etc. All fail readiness.")
+
+    def test_a_long_first_sentence_with_no_clause_keeps_its_tail(self):
+        # One long parenthetical: no clause break outside the bracket, so clause_cut cannot cut it.
+        # The headline ends on an ellipsis at the last word that fits, and the rest of the sentence
+        # follows in the body, opening on the ellipsis, with no word dropped.
+        sentence = ("platform is currently running the live cluster count and will post the result here when it "
+                    "finishes (its last completed count 14 hours ago found 209 running GKE clusters across all 42 GCP "
+                    "projects in scope).")
+        headline, body = sp.split_answer(sentence)
+        self.assertTrue(headline.endswith(sp.ELLIPSIS), headline)
+        self.assertLessEqual(len(headline), sp.HEADLINE_MAX)
+        self.assertEqual(len(body), 1)
+        self.assertTrue(body[0].startswith(sp.ELLIPSIS), body)
+        rejoined = headline[: -len(sp.ELLIPSIS)] + " " + body[0][len(sp.ELLIPSIS):]
+        self.assertEqual(rejoined, sentence)
+
+    def test_a_bold_long_first_sentence_with_no_clause_keeps_its_tail_bold(self):
+        sentence = ("**platform counted 209 running GKE clusters across the 42 GCP projects in scope (1 in "
+                    "bhoekstra-gkedemos, 8 in devops-bench-complex-evals, and 5 in each of the 40 kube-agents-evals "
+                    "projects).**")
+        headline, body = sp.split_answer(sentence + "\n\nWant a fresh count?")
+        self.assertTrue(headline.endswith(sp.ELLIPSIS), headline)
+        self.assertEqual(body[1], "Want a fresh count?")
+        self.assertTrue(body[0].startswith("**" + sp.ELLIPSIS) and body[0].endswith("**"), body)
+
+    def test_word_cut_leaves_a_code_span_whole(self):
+        sentence = ("The `inference-gateway` deployment in `seeded-capacity` cannot schedule its replica because the "
+                    "node pool has no node with the 16Gi of memory the pod requests (every node holds 15Gi allocatable).")
+        cut = sp.word_cut(sentence)
+        self.assertIsNotNone(cut)
+        for part in cut:
+            self.assertEqual(part.count("`") % 2, 0, part)
+
+    def test_word_cut_declines_one_unbroken_word(self):
+        self.assertIsNone(sp.word_cut("x" * (sp.HEADLINE_MAX + 40)))
 
     def test_a_soft_wrapped_first_sentence_is_the_whole_headline(self):
         md = "payments-api keeps crashing: secret\npayments-db-creds is missing. Since 14:02.\n- one"

@@ -196,6 +196,75 @@ func clauseCut(sentence string) (string, string, bool) {
 	return head, rest, true
 }
 
+// wordCut is slack_presenter.word_cut: the headline and the rest for a first
+// sentence longer than the headline cap that clauseCut cannot cut (one long
+// parenthetical, say), which the clip used to end at the cap with the clipped
+// words dropped. The cut is the last space outside a code span and a bold or
+// italic run that leaves a headline of clauseHeadlineMin to chatHeadlineMax
+// code points once plain, the ellipsis counted; the headline ends on the
+// ellipsis and the rest opens with one, so the sentence reads on in the
+// detail as written. A sentence bold end to end is cut inside the bold.
+func wordCut(sentence string) (string, string, bool) {
+	for _, marker := range []string{"**", "__"} {
+		if len(sentence) > 2*len(marker) && strings.HasPrefix(sentence, marker) && strings.HasSuffix(sentence, marker) &&
+			!strings.Contains(sentence[len(marker):len(sentence)-len(marker)], marker) {
+			head, rest, ok := wordCut(sentence[len(marker) : len(sentence)-len(marker)])
+			if !ok {
+				return "", "", false
+			}
+			return marker + head + marker, marker + rest + marker, true
+		}
+	}
+	if rs := []rune(sentence); len(rs) > clauseScanMax {
+		end := clauseScanMax
+		for i := clauseScanMax - 1; i > 0; i-- {
+			if rs[i] == ' ' {
+				end = i
+				break
+			}
+		}
+		head, rest, ok := wordCut(string(rs[:end]))
+		if !ok {
+			return "", "", false
+		}
+		return head, rest + string(rs[end:]), true
+	}
+	held, spans := holdCode(sentence)
+	limit := chatHeadlineMax - runeLen(chatEllipsis)
+	var head, rest string
+	found := false
+	for i := 0; i < len(held); i++ {
+		if held[i] != ' ' {
+			continue
+		}
+		h := strings.TrimRightFunc(held[:i], isPySpace)
+		r := pyStrip(held[i:])
+		if r == "" || strings.Count(h, "**")%2 == 1 || strings.Count(h, "__")%2 == 1 {
+			continue
+		}
+		italic := false
+		for _, marker := range []string{"*", "_"} {
+			lone := strings.Count(strings.ReplaceAll(h, marker+marker, ""), marker)
+			italic = italic || (lone%2 == 1 && openerIn(h, marker))
+		}
+		if italic {
+			continue
+		}
+		n := runeLen(plainLine(restoreCode(h, spans, false)))
+		if n > limit {
+			// Every later space leaves a longer headline.
+			break
+		}
+		if n >= clauseHeadlineMin {
+			head, rest, found = h, r, true
+		}
+	}
+	if !found {
+		return "", "", false
+	}
+	return restoreCode(head, spans, false) + chatEllipsis, chatEllipsis + restoreCode(rest, spans, false), true
+}
+
 // lowerWordAt is LOWER_WORD's match at the start of s: a run of ASCII
 // lowercase letters followed by neither a word character nor a dash.
 func lowerWordAt(s string) bool {
