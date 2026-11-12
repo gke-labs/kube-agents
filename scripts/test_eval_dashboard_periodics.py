@@ -970,6 +970,58 @@ class AssessTest(unittest.TestCase):
         # Without streaks (a caller that has none), a failed build is a note as before.
         self.assertIn(SWEEP.job, periodics.assess({SWEEP.job: reading("1", False, {"kube-agents-evals-3": fail})}, NOW, None))
 
+    def test_a_reconcile_failure_the_next_run_retries_is_news_once_a_project_fails_twice(self):
+        def reading(build, outcomes, **report):
+            return {"job": DAILY.job, "build": build, "finished_at": NOW.isoformat(timespec="seconds"), "passed": False, "result": "FAILURE",
+                    "artifact": dict({"exit": "failed", "mode": "all", "outcomes": outcomes, "error": "%d project(s) not reconciled" % len(outcomes)}, **report)}
+        token = {"outcome": "failed", "detail": "tofu apply exit 1: Error: Invalid credentials (plan token expired)"}
+        stockout = {"outcome": "failed", "detail": "tofu apply exit 1: ZONE_RESOURCE_POOL_EXHAUSTED"}
+        self.assertEqual({p.job for p in periodics.WATCHED if p.actionable_or_persistent}, {DAILY.job, POST.job})
+        # Run 1: one project's failure the next run retries is not news, but it is counted.
+        readings = {DAILY.job: reading("1", {"kube-agents-evals-40": token, "kube-agents-evals-2": {"outcome": "applied", "detail": "2 to add"}})}
+        streaks = periodics.streaks(readings, None)
+        self.assertEqual(periodics.assess(readings, NOW, None, streaks=streaks), {})
+        self.assertEqual(streaks[DAILY.job]["projects"], {"kube-agents-evals-40": 1})
+        # Run 2 failing a different project, evals-40 applied: still not news.
+        readings = {DAILY.job: reading("2", {"kube-agents-evals-2": stockout, "kube-agents-evals-40": {"outcome": "applied", "detail": "1 to add"}})}
+        streaks = periodics.streaks(readings, streaks)
+        self.assertEqual(periodics.assess(readings, NOW, None, streaks=streaks), {})
+        # Run 3 failing evals-2 again: news, led by the project and its count.
+        readings = {DAILY.job: reading("3", {"kube-agents-evals-2": stockout, "kube-agents-evals-40": token})}
+        streaks = periodics.streaks(readings, streaks)
+        note = periodics.assess(readings, NOW, None, streaks=streaks)[DAILY.job]
+        self.assertEqual(note["detail"][0], f"kube-agents-evals-2: failed in 2 consecutive checks (failed (tofu apply exit 1: ZONE_RESOURCE_POOL_EXHAUSTED)); next: {periodics.RECONCILE_NEXT_STEP['failed']}")
+        self.assertEqual(note["detail"][1], f"kube-agents-evals-40: failed (tofu apply exit 1: Error: Invalid credentials (plan token expired)); next: {periodics.RECONCILE_NEXT_STEP['failed']}")
+        # A hand step beside a persisting project keeps its own next step.
+        locked = {"outcome": "failed", "detail": "Error acquiring the state lock: ID 1"}
+        both = periodics.assess({DAILY.job: reading("3", {"kube-agents-evals-2": stockout, "kube-agents-evals-3": locked})}, NOW, None, streaks=streaks)[DAILY.job]
+        self.assertEqual(both["detail"][1], f"kube-agents-evals-3: failed (Error acquiring the state lock: ID 1); next: {periodics.RECONCILE_NEXT_STEP_LOCKED}")
+        self.assertEqual(note["detail"][-1], "run: 2 project(s) not reconciled")
+        # A clean run clears the counts; the next one-off is silent again.
+        streaks = periodics.streaks({DAILY.job: dict(reading("4", {}), passed=True)}, streaks)
+        readings = {DAILY.job: reading("5", {"kube-agents-evals-2": stockout})}
+        streaks = periodics.streaks(readings, streaks)
+        self.assertEqual(periodics.assess(readings, NOW, None, streaks=streaks), {})
+        # Shapes that owe a hand step are news on their first build, with the report's own lines.
+        first = periodics.streaks({DAILY.job: reading("6", {})}, None)
+        for name, outcomes, report in (
+            ("refused", {"kube-agents-evals-3": {"outcome": "refused", "detail": "delete x"}}, {}),
+            ("locked", {"kube-agents-evals-3": {"outcome": "failed", "detail": "Error acquiring the state lock: ID 1"}}, {}),
+            ("unmapped", {"kube-agents-evals-99": {"outcome": "failed", "detail": "not a mapped pool project"}}, {}),
+            ("runner", {"kube-agents-evals-3": {"outcome": "failed", "detail": "could not run tofu (No such file)"}}, {}),
+            ("no project reached", {"kube-agents-evals-3": {"outcome": "not_reached", "detail": "Boskos unreachable"}}, {"visited": 0}),
+            ("main check", {"kube-agents-evals-3": stockout}, {"main_check_error": "git fetch failed"}),
+            ("unreadable", None, None),
+        ):
+            with self.subTest(name):
+                r = reading("6", outcomes, **report) if outcomes is not None else dict(reading("6", {}), artifact={"error": periodics.REPORT_UNREADABLE})
+                self.assertIn(DAILY.job, periodics.assess({DAILY.job: r}, NOW, None, streaks=first), name)
+        self.assertEqual(periodics.assess({DAILY.job: reading("6", {"kube-agents-evals-3": {"outcome": "refused", "detail": "delete x"}})}, NOW, None, streaks=first)[DAILY.job]["detail"][0],
+                         f"kube-agents-evals-3: refused (delete x); next: {periodics.RECONCILE_NEXT_STEP['refused']}")
+        # A run that wrote no report, and a tick with no counts to carry, note a one-off as before.
+        self.assertIn(DAILY.job, periodics.assess({DAILY.job: dict(reading("6", {}), artifact=None)}, NOW, None, streaks=first))
+        self.assertIn(DAILY.job, periodics.assess({DAILY.job: reading("1", {"kube-agents-evals-40": token})}, NOW, None))
+
 
 class WorkflowWiring(unittest.TestCase):
     def test_the_15_minute_tick_fetches_the_readings_and_hands_them_to_health(self):

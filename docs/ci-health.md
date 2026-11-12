@@ -567,8 +567,14 @@ Like the pool note it rides beside the state and never becomes one. A job whose
 latest finished build failed is a `FAILED` note, once it is news: the sweep runs
 hourly and this tick reads its latest finished build every fifteen minutes, so
 every build is read and counted once, and one failed build followed by a clean
-one is a flap. The sweep's note waits until two consecutive checks have failed;
-the reconciles' first failed build is the news. Any project's failure fails a
+one is a flap. The sweep's note waits until two consecutive checks have failed.
+A reconcile's first failed build is the news only when it owes a hand step (a
+refused plan, a locked state, an unmapped project or a runner fault, a run that
+failed before reaching a project or whose check of `main` failed, or a report it
+wrote none of or could not read); a failure the next run retries (a stockout, a
+409, an expired plan token)
+is noted once the same project has failed in two consecutive runs, and a silent
+one still advances the counts. Any project's failure fails a
 sweep run, so a per-project threshold could never fire before the run's; the
 per-project counts name, in the message, the projects that failed in this check
 and the ones before it.
@@ -589,7 +595,8 @@ message is built from (where the job acts, what stops happening when it fails
 and resumes when it recovers, what it does and how often, what a failure costs),
 a one-line summary of what the run did from its report, and the report's detail
 lines, up to five: for the reconcile the projects it refused, failed or was
-interrupted in, each with its reason and its one next step, then how many it
+interrupted in, each with its reason and its one next step (a project that
+failed in consecutive runs leads, with its count), then how many it
 did not reach and why, and the allowlist entries no plan needed; for the sweep the projects whose sweep
 failed with GitHub's answer, what the run left for the next one under its write
 budget, the projects it did not reach after stopping, and why it stopped if it

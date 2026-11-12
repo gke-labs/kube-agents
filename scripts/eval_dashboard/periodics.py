@@ -161,9 +161,11 @@ SCOPE_LINE = "CI eval infrastructure only."
 # counted once, and one failed build followed by a clean one is a flap: the
 # sweep is said once it has failed this many consecutive checks. The
 # reconciles run daily and on every merge: their first failed build is the
-# news. Any project's failure fails a run, so a per-project threshold could
-# never fire before the run's; the per-project counts name the projects that
-# have failed in every one of those checks.
+# news when it owes a hand step, and otherwise once the same project has
+# failed in PERSISTENT_AFTER consecutive runs (`actionable_or_persistent`,
+# kube-agents#5685). Any project's failure fails a run, so a per-project
+# threshold could never fire before the run's; the per-project counts name
+# the projects that have failed in every one of those checks.
 SWEEP_RUN_ALERT_AFTER = 2
 FIRST_FAILURE = 1
 # A project named as persisting in the message: failed in this many consecutive
@@ -199,6 +201,14 @@ RECONCILE_UNMAPPED_MARKER = "not a mapped pool project"
 RECONCILE_NEXT_STEP_UNMAPPED = "add its gitops_repo_for_project row in hack/ci-deploy.sh, or remove the Boskos registration"
 RECONCILE_RUNNER_MARKER = "could not run tofu ("
 RECONCILE_NEXT_STEP_RUNNER = "a runner fault (tofu missing or unrunnable), not the project's: fix the job image or the machine"
+# The next steps that owe nothing by hand: a `failed` or `interrupted` the
+# next run retries (a stockout, a 409 from a hand-made pool, an expired plan
+# token). A failed build whose every named project has one of these is not
+# news on its own; every other shape (a refused plan, a locked state, an
+# unmapped project, a runner fault, a run that failed before reaching a
+# project or on its main check, a report that cannot be read) is.
+RECONCILE_RETRY_STEPS = (RECONCILE_NEXT_STEP["failed"], RECONCILE_NEXT_STEP["interrupted"])
+REPORT_KEY_MAIN_CHECK_ERROR = "main_check_error"
 RECONCILE_OUTCOME_NOT_REACHED = "not_reached"
 RECONCILE_OUTCOME_BUSY = "busy"
 # The report's outcome names as the message says them.
@@ -325,6 +335,11 @@ class Periodic:
     # A failed build is a note once the job has failed this many consecutive
     # checks; FIRST_FAILURE for a job whose every run is news.
     run_alert_after: int = FIRST_FAILURE
+    # A reconcile whose failed build is news on its first check only when it
+    # owes a hand step (actionable_failure), and otherwise once a project has
+    # failed in PERSISTENT_AFTER consecutive runs; a silenced build still
+    # advances the streaks.
+    actionable_or_persistent: bool = False
     # Reports the job writes beside `artifact`, read into the reading when
     # present and absent otherwise; their lines ride in the note's detail.
     extra_artifacts: tuple = ()
@@ -356,12 +371,14 @@ WATCHED = (
         "Eval seeded fleet", "planted defects are not being re-applied", "planted defects are being re-applied again",
         "runs daily at 08:30 UTC and re-applies the seeded-fleet stack in every pool project, waiting for the leased ones", RECONCILE_EFFECT,
         f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#62-the-scheduled-reconcile",
+        actionable_or_persistent=True,
     ),
     Periodic(
         RECONCILE_POSTSUBMIT_JOB, "seeded-fleet reconcile (postsubmit)", None, RECONCILE_ARTIFACT,
         "Eval seeded fleet", "planted defects are not being re-applied", "planted defects are being re-applied again",
         "runs on every merge to main that changes the stack under bench/tf/fleet and applies it to every pool project", RECONCILE_EFFECT,
         f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#62-the-scheduled-reconcile",
+        actionable_or_persistent=True,
     ),
     # The certification lane's first slice: weekly and on Rerun, graded on
     # the newest GA release, recorded for the certified-capabilities page from its logs
@@ -680,17 +697,7 @@ def reconcile_detail(artifact: dict | None) -> list[str]:
         if outcome not in RECONCILE_NAMED_OUTCOMES:
             continue
         detail = str(entry.get(REPORT_KEY_DETAIL) or "no detail")
-        step = RECONCILE_NEXT_STEP[outcome]
-        if outcome == "failed":
-            if any(marker in detail for marker in RECONCILE_LOCK_MARKERS):
-                step = RECONCILE_NEXT_STEP_LOCKED
-            elif RECONCILE_CEILING_MARKER in detail:
-                step = RECONCILE_NEXT_STEP["interrupted"]
-            elif RECONCILE_UNMAPPED_MARKER in detail:
-                step = RECONCILE_NEXT_STEP_UNMAPPED
-            elif RECONCILE_RUNNER_MARKER in detail:
-                step = RECONCILE_NEXT_STEP_RUNNER
-        lines.append(f"{project}: {outcome} ({detail}); next: {step}")
+        lines.append(f"{project}: {outcome} ({detail}); next: {_reconcile_step(outcome, detail)}")
     # The cap counts projects; the lines after it are one each.
     if len(lines) > DETAIL_LIMIT:
         lines = lines[:DETAIL_LIMIT] + [f"and {len(lines) - DETAIL_LIMIT} more"]
@@ -711,6 +718,34 @@ def reconcile_detail(artifact: dict | None) -> list[str]:
     if artifact.get(REPORT_KEY_ERROR):
         lines.append(f"run: {artifact[REPORT_KEY_ERROR]}")
     return lines
+
+
+def _reconcile_step(outcome: str, detail: str) -> str:
+    """The one next step for a named outcome, read from its detail."""
+    if outcome != "failed":
+        return RECONCILE_NEXT_STEP[outcome]
+    if any(marker in detail for marker in RECONCILE_LOCK_MARKERS):
+        return RECONCILE_NEXT_STEP_LOCKED
+    if RECONCILE_CEILING_MARKER in detail:
+        return RECONCILE_NEXT_STEP["interrupted"]
+    if RECONCILE_UNMAPPED_MARKER in detail:
+        return RECONCILE_NEXT_STEP_UNMAPPED
+    if RECONCILE_RUNNER_MARKER in detail:
+        return RECONCILE_NEXT_STEP_RUNNER
+    return RECONCILE_NEXT_STEP["failed"]
+
+
+def actionable_failure(artifact) -> bool:
+    """Whether a failed reconcile build owes a hand step now: a report that
+    is absent or unreadable, a main check that failed, a run that failed
+    before naming a project, or a named project whose next step is not the
+    next run's retry (RECONCILE_RETRY_STEPS)."""
+    if not isinstance(artifact, dict) or artifact.get(REPORT_KEY_ERROR) == REPORT_UNREADABLE or artifact.get(REPORT_KEY_MAIN_CHECK_ERROR):
+        return True
+    named = [e for e in (_outcomes(artifact) or {}).values() if isinstance(e, dict) and e.get(REPORT_KEY_OUTCOME) in RECONCILE_NAMED_OUTCOMES]
+    if not named:
+        return True
+    return any(_reconcile_step(e[REPORT_KEY_OUTCOME], str(e.get(REPORT_KEY_DETAIL) or "")) not in RECONCILE_RETRY_STEPS for e in named)
 
 
 def _allowlist_verdict(entry: dict) -> set[str] | None:
@@ -973,6 +1008,14 @@ def _failure_text(periodic: Periodic, entry: dict) -> str:
     return f"{entry.get(REPORT_KEY_OUTCOME)} ({entry.get(REPORT_KEY_DETAIL) or 'no detail'})"
 
 
+def _next_step(periodic: Periodic, entry: dict) -> str:
+    """The reconcile's `; next: <step>` clause for a failed project; the
+    sweep's lines carry none."""
+    if periodic.artifact == SWEEP_ARTIFACT:
+        return ""
+    return f"; next: {_reconcile_step(entry.get(REPORT_KEY_OUTCOME), str(entry.get(REPORT_KEY_DETAIL) or 'no detail'))}"
+
+
 def _thresholded_detail(periodic: Periodic, persistent: dict, artifact: dict | None, extras: dict | None = None) -> list[str]:
     """The persisting projects first with their count, then this build's other
     failed projects, capped together; then the run's own lines."""
@@ -980,10 +1023,10 @@ def _thresholded_detail(periodic: Periodic, persistent: dict, artifact: dict | N
     outcomes = outcomes if isinstance(outcomes, dict) else {}
     lines = []
     for project in sorted(persistent, key=lambda p: (-persistent[p], p)):
-        lines.append(f"{project}: failed in {persistent[project]} consecutive checks ({_failure_text(periodic, outcomes[project])})")
+        lines.append(f"{project}: failed in {persistent[project]} consecutive checks ({_failure_text(periodic, outcomes[project])}){_next_step(periodic, outcomes[project])}")
     for project in sorted(outcomes):
         if project not in persistent and _project_failed(periodic, outcomes[project]):
-            lines.append(f"{project}: {_failure_text(periodic, outcomes[project])}")
+            lines.append(f"{project}: {_failure_text(periodic, outcomes[project])}{_next_step(periodic, outcomes[project])}")
     if len(lines) > DETAIL_LIMIT:
         lines = lines[:DETAIL_LIMIT] + [f"and {len(lines) - DETAIL_LIMIT} more"]
     project_prefixes = tuple(f"{p}:" for p in outcomes)
@@ -1027,6 +1070,8 @@ def assess(readings: dict[str, dict], now: datetime, prev_notes: dict | None, wa
             if (streak.get(KEY_STREAK_RUNS) or 0) < periodic.run_alert_after:
                 continue
             persistent = _persistent(periodic, streak, artifact)
+            if periodic.actionable_or_persistent and not persistent and not actionable_failure(artifact):
+                continue
         notes[periodic.job] = {
             KEY_JOB: periodic.job,
             KEY_LABEL: periodic.label,
@@ -1038,8 +1083,9 @@ def assess(readings: dict[str, dict], now: datetime, prev_notes: dict | None, wa
             KEY_STALE_AFTER_H: int(periodic.stale_after.total_seconds() // SECONDS_PER_HOUR) if periodic.stale_after is not None else None,
             KEY_DRY_RUN: bool(artifact.get(KEY_DRY_RUN)) if artifact else None,
             # A job whose first failure is news keeps the report's own lines; a
-            # thresholded job leads with the projects that keep failing.
-            KEY_DETAIL: token_lines if verdict == VERDICT_TOKEN else ((_thresholded_detail(periodic, persistent, artifact, extras) if periodic.run_alert_after > FIRST_FAILURE else detail_lines(periodic, artifact, extras)) if verdict == VERDICT_FAILED else []),
+            # thresholded job, or a build said for a project that keeps
+            # failing, leads with those projects.
+            KEY_DETAIL: token_lines if verdict == VERDICT_TOKEN else ((_thresholded_detail(periodic, persistent, artifact, extras) if periodic.run_alert_after > FIRST_FAILURE or persistent else detail_lines(periodic, artifact, extras)) if verdict == VERDICT_FAILED else []),
             KEY_SUMMARY: f"the run passed; {len(token_lines)} token(s) to rotate" if verdict == VERDICT_TOKEN else (run_summary(periodic, artifact, bool(reading.get(KEY_PASSED)), extras) if verdict == VERDICT_FAILED else None),
             KEY_HISTORY_URL: history_url(periodic.job, periodic.logs_root),
             KEY_PLACE: periodic.place,
