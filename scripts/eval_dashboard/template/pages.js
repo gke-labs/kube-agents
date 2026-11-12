@@ -94,6 +94,11 @@ const PAGE = {
   gcsObject: "https://storage.cloud.google.com/",
   job: "pull-kube-agents-smoke-test",
   prUrl: "https://github.com/gke-labs/kube-agents/pull",
+  // A bare "#N" is an issue of the source repository (case-notes.yaml's,
+  // the allowlist's); the bots' own issues arrive as full URLs and may live
+  // in another repository (health.json's issues_repo), which the link text
+  // then names.
+  sourceRepo: "gke-labs/kube-agents",
   issueUrl: "https://github.com/gke-labs/kube-agents/issues",
   rulesUrl: "https://github.com/gke-labs/kube-agents/blob/main/scripts/eval_dashboard/classify.py",
   rosterUrl: "https://github.com/gke-labs/kube-agents/blob/main/docs/eval-gate-roster.md",
@@ -487,8 +492,12 @@ const transcriptUrl = (run, kase, n = 1) => {
 // rep_n); rep 1, as the pages always linked, when the row names none.
 const repOf = (c) => (Number.isInteger(c.rep_n) && c.rep_n > 0 ? c.rep_n : 1);
 const issueLink = (issue) => {
-  const match = /^#(\d+)$/.exec(String(issue).trim());
-  return match ? `<a href="${PAGE.issueUrl}/${match[1]}">${esc(issue)}</a>` : esc(issue);
+  const text = String(issue).trim();
+  const bare = /^#(\d+)$/.exec(text);
+  if (bare) return `<a href="${PAGE.issueUrl}/${bare[1]}">${esc(text)}</a>`;
+  const full = /^https:\/\/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)\/issues\/(\d+)$/.exec(text);
+  if (full) return `<a href="${esc(text)}">${esc(full[1] === PAGE.sourceRepo ? `#${full[2]}` : `${full[1]}#${full[2]}`)}</a>`;
+  return esc(text);
 };
 const projectShort = (project) => (project ? String(project).replace(/^kube-agents-/, "") : "unknown");
 
@@ -833,7 +842,7 @@ function agentSawHtml(inc, inWindow) {
   let pick = null;
   for (const run of [...inWindow].reverse()) {
     for (const c of run.cases || []) {
-      if (inc.condition === "storm" || inc.condition === "delegation_ceiling" ? c.outcome === "infra" && c.reason : (cases.size ? cases.has(c.case) : c.admitted) && c.outcome === "failed" && c.reason) {
+      if (inc.condition === "storm" || inc.condition === "delegation_ceiling" ? c.outcome === "infra" && c.cls === (inc.condition === "storm" ? "storm" : "delegation-ceiling") && c.reason : (cases.size ? cases.has(c.case) : c.admitted) && c.outcome === "failed" && c.reason) {
         pick = { run, c };
         break;
       }
@@ -1212,6 +1221,7 @@ function tagFor(c) {
   if (c.cls === "storm") return '<span class="tag storm">quota storm</span>';
   if (c.cls === "delegation-ceiling") return '<span class="tag storm">delegation ceiling</span>';
   if (c.cls === "fixture-drift") return '<span class="tag storm">fixture drifted</span>';
+  if (c.cls === "forge-unavailable") return '<span class="tag storm">forge unavailable</span>';
   return '<span class="tag unclear">unexplained</span>';
 }
 
@@ -1220,22 +1230,30 @@ function tagFor(c) {
 // (#1874): ungraded like a storm-lost rep, counted apart from it, and part of
 // the total or a three-rep case would read "all 0 reps lost". `fixture` is
 // the repetitions never run because the lease-time scan saw a fixture the
-// case needs drifted (classify.py's REP_FIXTURE), counted apart the same way.
-function repTotal(reps) { return reps.pass + reps.fail + reps.infra + (reps.ceiling || 0) + (reps.fixture || 0); }
+// case needs drifted (classify.py's REP_FIXTURE), counted apart the same way,
+// and `forge` the repetitions whose checks errored on a forge read that failed
+// during grading (REP_FORGE).
+function repTotal(reps) { return reps.pass + reps.fail + reps.infra + (reps.ceiling || 0) + (reps.fixture || 0) + (reps.forge || 0); }
 function lostText(reps) {
   const parts = [];
   if (reps.infra) parts.push(`${reps.infra} lost`);
   if (reps.ceiling) parts.push(`${reps.ceiling} at the delegation ceiling`);
   if (reps.fixture) parts.push(`${reps.fixture} not run, fixture drifted`);
+  if (reps.forge) parts.push(`${reps.forge} not graded, forge unavailable`);
   return parts.length ? ` (${parts.join(", ")})` : "";
 }
 function ungradedText(reps) {
   const total = plural(repTotal(reps), "rep");
-  if (reps.fixture && !reps.infra && !reps.ceiling) return `all ${total} not run: a seeded-fleet fixture this case needs had drifted on the leased project`;
-  if (reps.ceiling && !reps.infra) return `all ${total} hit the delegation ceiling with the worker still running`;
-  const fixture = reps.fixture ? `, ${reps.fixture} not run, fixture drifted` : "";
-  if (reps.ceiling) return `all ${total} ungraded: ${reps.infra} lost before grading, ${reps.ceiling} at the delegation ceiling${fixture}`;
-  if (reps.fixture) return `all ${total} ungraded: ${reps.infra} lost before grading${fixture}`;
+  if (reps.fixture && !reps.infra && !reps.ceiling && !reps.forge) return `all ${total} not run: a seeded-fleet fixture this case needs had drifted on the leased project`;
+  if (reps.ceiling && !reps.infra && !reps.forge) return `all ${total} hit the delegation ceiling with the worker still running`;
+  if (reps.forge && !reps.infra && !reps.ceiling && !reps.fixture) return `all ${total} not graded: a forge read failed during grading`;
+  // A mix: each kind that has repetitions, in lostText's order.
+  const parts = [];
+  if (reps.infra) parts.push(`${reps.infra} lost before grading`);
+  if (reps.ceiling) parts.push(`${reps.ceiling} at the delegation ceiling`);
+  if (reps.fixture) parts.push(`${reps.fixture} not run, fixture drifted`);
+  if (reps.forge) parts.push(`${reps.forge} not graded, forge unavailable`);
+  if (parts.length > 1) return `all ${total} ungraded: ${parts.join(", ")}`;
   return `all ${total} lost before grading`;
 }
 

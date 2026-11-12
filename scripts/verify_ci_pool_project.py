@@ -821,11 +821,9 @@ NIGHTLY_RUNNER_MEMBER = "serviceAccount:eval-baseline-recorder@kube-agents-prow.
 # GEMINI_KEY_ACCESSOR_ROLE on it.
 GEMINI_KEY_SECRET_ACCESSORS = (PROW_RUNNER_MEMBER, NIGHTLY_RUNNER_MEMBER)
 # Every finding check_gemini_api_key emits. None is lease-silent: the health
-# bot classes a run that leased a project with one as the pool's. The runs that
-# export MODEL_PROVIDER=gemini read the key: the five eval nightlies, the RC
-# postsubmit and the two Argon smoke presubmits (pull-kube-agents-smoke-test
-# and -today). pull-kube-agents-smoke-test-claude, -flash and the forge smoke variants
-# stay on Vertex AI and do not read it. A missing secret or accessor grant
+# bot classes a run that leased a project with one as the pool's. The runs whose
+# eval-model pair names provider gemini read the key (docs/ci-pool-projects.md
+# 5.10); a lane whose pair names vertex_ai does not. A missing secret or accessor grant
 # stops hack/ci-deploy.sh at its FATAL line before Helm; a restriction finding,
 # or a key deleted while its secret remains, fails at the first agent call.
 GEMINI_KEY_FINDINGS = frozenset(
@@ -1026,6 +1024,8 @@ FLEET_RECONCILER_MEMBER = "serviceAccount:seeded-fleet-reconciler@kube-agents-pr
 FLEET_RECONCILER_ROLES = {
     # instanceAdmin.v1: the stack plants a bare VM (`startup_fail`, main.tf), and
     # the create needs instances.*, disks.*, images.useReadOnly and subnetworks.use.
+    # The reconcile's reset of that VM needs compute.instances.reset, which
+    # this role also grants.
     "roles/compute.instanceAdmin.v1",
     # loadBalancerAdmin: the stack plants a backend service and a health check on the
     # default pool's instance group (`drain_timeout`, defects-b.tf), and the create needs
@@ -1769,8 +1769,8 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
     # "vertex_ai" (provision_ci_pool_project.sh writes it into the tfvars).
     # hack/ci-deploy.sh's per-lease helm upgrade annotates the
     # kubeagents-litellm KSA with this GSA, so a project missing the pair
-    # reds every run on Vertex AI that leases it (the Claude and Flash smoke
-    # jobs and the forge smoke variants) at the deploy's model-call gate (#1097).
+    # reds every run on Vertex AI that leases it (the lanes whose eval-model pair
+    # names vertex_ai, docs/ci-pool-projects.md 5.10) at the deploy's model-call gate (#1097).
     litellm_gsa_email = f"kubeagents-litellm-gsa@{project_id}.iam.gserviceaccount.com"
     rc, out, err = run_cmd([
         "gcloud", "iam", "service-accounts", "get-iam-policy",

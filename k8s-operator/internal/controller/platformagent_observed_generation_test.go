@@ -202,7 +202,7 @@ func TestRBACSkewConditionCarriesTheGenerationButDoesNotClaimIt(t *testing.T) {
 	agent := observedGenerationAgent(4)
 	r := observedGenerationReconciler(agent, &statusWriteCounter{})
 	authorizer := &fakeAuthorizer{deny: denyPDBPatch}
-	r.RBAC = NewRBACChecker(authorizer.reviews())
+	r.RBAC = NewRBACChecker(authorizer.reviews(), "")
 	ctx := context.Background()
 	if _, err := r.RBAC.Probe(ctx); err != nil {
 		t.Fatalf("boot probe: %v", err)

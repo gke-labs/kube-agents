@@ -48,6 +48,7 @@ func summaryCR() map[string]any {
 				"proposalsFromChat": int64(3), "proposalsFromConsole": int64(0), "proposalsFromApi": int64(0),
 				"proposalsFromEvent": int64(0), "proposalsFromDrift": int64(1), "proposalsFromAudit": int64(0),
 				"proposalsFromScheduled": int64(0), "proposalsFromIssue": int64(0), "proposalsFromOther": int64(0),
+				"inputTokensTotal": int64(1200100), "outputTokensTotal": int64(34000), "spendMicrosUSDTotal": int64(3030457),
 				"lastActiveTime":      "2026-10-21T11:34:06Z",
 				"lastHumanActiveTime": "2026-10-20T09:15:00Z",
 				"activeInterfaces":    []any{"slack", "googlechat"},
@@ -151,7 +152,7 @@ func TestRenderUsageSummaryHasTheScriptsShapeAndNoIdentifier(t *testing.T) {
 		"  peopleSeen7d: 3 (as the gateway reports)\n", "  peopleSeen30d: 11 (as the gateway reports)\n",
 		"  lastActive: 2026-10-21T11:34:06Z\n  lastHumanActive: 2026-10-20T09:15:00Z",
 		"chat turns (14 days): 6 (ended 3, cancelled 2, active 1)",
-		"performance: " + usageSummaryPerformanceNote,
+		"performance:\n  tokens (since install): in 1200100 / out 34000\n  spend (since install): 3.03 USD\n" + usageSummaryLatencyNote + "\n",
 		"  Rating:", "  What worked well:", "  What failed or was slow:",
 	} {
 		if !strings.Contains(text, want) {
@@ -271,7 +272,7 @@ func TestUsageSummaryOriginFieldsAreTheNineStatusFieldsInTheTableOrder(t *testin
 
 func TestRenderUsageSummaryDegradesWhenSourcesAreMissing(t *testing.T) {
 	text := renderUsageSummary(summaryNow, map[string]any{}, "", 7*24*time.Hour, taskRollup{}, false)
-	for _, want := range []string{"  version: unknown", "  mode: today", "  kubernetes: unavailable", "  installed: unknown; ready: unknown", "  interfaces: none", "  toolExecutionsTotal: 0", "  toolExecutionsBlockedTotal: 0", "  brokerFailuresTotal: 0", "  chatTurnsErroredTotal: 0", "  backgroundTasksGaveUpTotal: 0", "  lastActive: never", "  lastHumanActive: never", "chat turns (7 days): unavailable"} {
+	for _, want := range []string{"  version: unknown", "  mode: today", "  kubernetes: unavailable", "  installed: unknown; ready: unknown", "  interfaces: none", "  toolExecutionsTotal: 0", "  toolExecutionsBlockedTotal: 0", "  brokerFailuresTotal: 0", "  chatTurnsErroredTotal: 0", "  backgroundTasksGaveUpTotal: 0", "  lastActive: never", "  lastHumanActive: never", "performance:\n  tokens (since install): in 0 / out 0\n  spend (since install): 0.00 USD\n", "chat turns (7 days): unavailable"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("block lacks %q:\n%s", want, text)
 		}
@@ -612,7 +613,7 @@ func TestRenderUsageSummaryPrintsTheTopToolsFromTheStatus(t *testing.T) {
 	cr := summaryCR()
 	cr["status"].(map[string]any)["usage"].(map[string]any)["topTools"] = rows
 	text := renderUsageSummary(summaryNow, cr, "v1.33.4-gke.1234000", usageSummaryWindow, rollup(t, summaryRecords(), summaryNow, usageSummaryWindow), true)
-	block := "  lastHumanActive: 2026-10-20T09:15:00Z\n" + strings.Join(want, "\n") + "\nperformance: "
+	block := "  lastHumanActive: 2026-10-20T09:15:00Z\n" + strings.Join(want, "\n") + "\n" + usageSummaryPerformanceHeader + "\n"
 	if !strings.Contains(text, block) {
 		t.Fatalf("block lacks the fixture's tools lines in place:\n%s", text)
 	}
@@ -630,7 +631,7 @@ func TestRenderUsageSummaryPrintsTheTopToolsFromTheStatus(t *testing.T) {
 func TestRenderUsageSummaryTopToolsDegrade(t *testing.T) {
 	cr := summaryCR()
 	text := renderUsageSummary(summaryNow, cr, "", usageSummaryWindow, taskRollup{}, false)
-	if want := "\ntools (top 5, since broker start): unavailable\nperformance: "; !strings.Contains(text, want) {
+	if want := "\ntools (top 5, since broker start): unavailable\n" + usageSummaryPerformanceHeader + "\n"; !strings.Contains(text, want) {
 		t.Errorf("block lacks %q:\n%s", want, text)
 	}
 	usage := cr["status"].(map[string]any)["usage"].(map[string]any)

@@ -188,6 +188,8 @@ func startLiveHarness(t *testing.T) *liveHarness {
 		t.Fatalf("the rendered nats.conf was refused: %v", err)
 	}
 	opts.NoLog, opts.NoSigs = true, true
+	// The rendered pid_file is the bus pod's path.
+	opts.PidFile = t.TempDir() + "/nats.pid"
 	serverConnectBudget(opts)
 	// Every port the render pins moves to a free one, the monitor included;
 	// see startHarness.

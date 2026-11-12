@@ -393,8 +393,8 @@ const (
 // per incarnation and no grant can enumerate; NATS wildcards match whole
 // tokens, so the profiles are subtracted by name instead, which leaves the
 // dispatcher the one direct publisher there. The list rides nats.conf, so a
-// profile bound or unbound re-renders it and rolls the bus, whether or not the
-// dispatcher runs. A name that isn't one subject token addresses no task and
+// profile bound or unbound re-renders it, whether or not the dispatcher runs,
+// and the bus reloads it in place (planA2ABusReload). A name that isn't one subject token addresses no task and
 // is skipped.
 func gatewayProfileSupervisorDeny(profiles []string) []string {
 	var out []string

@@ -7422,7 +7422,7 @@ class TestFindingsQueueApi(unittest.TestCase):
         day = added["first_shown_at"][:10]
         self.assertEqual(
             self.client.get(f"/v1/findings/additions?day={day}").json(),
-            {"day": day, "critical": 0, "noncritical": 1},
+            {"day": day, "critical": 0, "noncritical": 1, "lines": [["probes-readiness", "acme-prod", "prod-eu"]]},
         )
 
     def test_the_first_report_marks_a_critical_addition(self):
@@ -7436,7 +7436,7 @@ class TestFindingsQueueApi(unittest.TestCase):
         day = added["first_shown_at"][:10]
         self.assertEqual(
             self.client.get(f"/v1/findings/additions?day={day}").json(),
-            {"day": day, "critical": 1, "noncritical": 0},
+            {"day": day, "critical": 1, "noncritical": 0, "lines": [["probes-readiness", "acme-prod", "prod-eu"]]},
         )
 
     def test_the_first_report_may_not_mark_a_dismissed_finding(self):

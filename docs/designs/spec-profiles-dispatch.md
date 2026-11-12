@@ -130,7 +130,9 @@ What a one-per-cluster design would have bought, and where it lives instead:
   strength of memory alone.
 - **A different persona or tier for one cluster:** a **pinned profile** with `clusterRef` set
   (already in the CRD), for example a production cluster that allows only some tiers. That is
-  a handful of CRs, not one per cluster.
+  a handful of CRs, not one per cluster. A pinned profile stands in for the generic cluster
+  agent, which opts in with `yieldToPinned`, not for a specialist such as `tse`: a task
+  addressed to a specialist by name keeps that specialist's persona on a pinned cluster.
 
 ## Scale rules
 
@@ -220,7 +222,9 @@ own children (or a coordinator's children of the same profile).
 - **Which tier a task runs at.** A task runs at the requester's tier. Each AgentProfile lists
   the tiers it allows, and the dispatcher refuses a task whose tier the resolved profile
   doesn't allow (a pinned production profile might allow only Read). Tier is authority, so it
-  lives on the CR, never in the persona.
+  lives on the CR, never in the persona. A pin's tiers cap every task for its cluster: a
+  specialist that keeps a pinned cluster's task (it doesn't set `yieldToPinned`) keeps its
+  persona there, and the gateway refuses the task at a tier the pin doesn't allow.
 - **Membership:** which tier a human is in comes from a mapping on the PlatformAgent (groups or
   user ids to tier), defaulting to Read. Admission refuses a mapping that assigns Unattended to
   a human. In a multi-author thread, the task runs at the minimum tier across the authors,
@@ -228,6 +232,8 @@ own children (or a coordinator's children of the same profile).
 
 Gaps on main that the build closes (#3659):
 
+- The `Tier` CRD exists, but nothing reads it: the verifier and the gateway keep their built-in
+  tiers, and `allowedTiers` is an enum of `read` and `unattended`.
 - The gateway mints every grant with the install-wide `AuthorityTier`, so the membership
   mapping has to feed the mint.
 - The capability library ranks a hard-coded tier list and refuses unknown tiers. That becomes
@@ -244,8 +250,10 @@ Gaps on main that the build closes (#3659):
    clients discover what they can address.
 2. A client names a profile and, for cluster work, a target cluster.
 3. The gateway resolves the address:
-   1. for cluster work, a pinned profile whose `clusterRef` matches the target gets the task,
-      otherwise the generic cluster agent does; a pinned profile addressed for any other
+   1. for cluster work, a task addressed to a profile that sets `yieldToPinned` (the generic
+      cluster agent) goes to a pinned profile whose `clusterRef` matches the target, otherwise
+      to the addressed profile; a task addressed to a profile that takes a target and doesn't
+      set it (a specialist) stays with that profile; a pinned profile addressed for any other
       cluster is refused;
    2. it checks that the target is in scope (`spec.scope`, including `exclude.clusters`);
    3. it mints the task's grant against the **resolved** profile, with the requester's tier
@@ -419,7 +427,22 @@ leave open:
   stream when the dispatcher restarts mid-drain has no durable to come back on.
 - **Off by default.** The operator renders the dispatcher only when its `A2A_DISPATCHER_IMAGE`
   is set, until profiles dispatch end to end; with it unset there is no dispatcher and no
-  identity for one.
+  identity for one. Amended 11/10: on by default, at the release set's image (with
+  `A2A_DISPATCHER_IMAGE` the override), and off only at `A2A_PROFILE_DISPATCHER=false`, which
+  the chart sets from `operator.profileDispatcher.enabled`. Its identity-map entry grows with
+  the profile count, and one entry can't be split across shards, so it fills one shard near 650
+  profiles at two tiers. The dispatch config, one ConfigMap, has its own limit: under Job mode
+  each profile that allows `unattended` carries its Job template there, which fills the
+  ConfigMap near 200 such profiles (#5479). The operator binds profiles oldest first (creation
+  time, then name) while both fit, less a reserve for draining profiles, and refuses newer ones with
+  `IdentityReady` reason `DispatcherCeiling`; the dispatcher serves the rest. The PlatformAgent's
+  `DispatcherCeiling` condition warns at four fifths of either budget and reads
+  `ProfilesRefused` while any profile is left out. Past either budget anyway, which only draining
+  profiles can cause, the operator runs no dispatcher rather than write a map or a ConfigMap the
+  API server refuses. It rewrites the dispatch config with the draining profiles alone and each
+  drain's deadline, so the dispatcher comes back once those drains run out. Adding a tier to an older profile can leave the newest one out. #5381 lifts the
+  ceiling, by deriving the grants per connection as sessions are, and blocks the 2,500-profile
+  target.
 - **Terminal notice.** A task the dispatcher ends gets a final status on its `.supervisor`
   subject (`lib.TaskSupervisorSubject`, contract addendum 6), never its `.events`, which stays
   the executor's alone: `rejected` when it is refused at admission (nothing ran), `failed`

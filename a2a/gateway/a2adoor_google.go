@@ -55,7 +55,7 @@ const (
 
 	// a2aGoogleTokeninfoURL is Google's token introspection endpoint for
 	// access tokens.
-	a2aGoogleTokeninfoURL = "https://oauth2.googleapis.com/tokeninfo"
+	a2aGoogleTokeninfoURL = "https://oauth2.googleapis.com/tokeninfo" // #nosec G101 -- a URL, not a credential
 	// a2aGoogleAccessTokenPrefix is how every Google OAuth access token
 	// begins. A bearer without it is refused here, never sent to Google: a
 	// mistyped static token, another door's token or any other secret a

@@ -49,6 +49,9 @@ func TestSpawnedSessionPodsMatchTheAdmissionFixture(t *testing.T) {
 		{"cluster-view", func(c *Config, _ *SessionRecord) {
 			c.SessionClusterView = true
 			c.CredentialProxyURL = "http://pa-credential-proxy." + ns + ".svc.cluster.local:8765"
+			c.KubeProxyURL = "https://pa-kube-proxy." + ns + ".svc.cluster.local:8443"
+			c.KubeProxyCAConfigMap = "pa-kube-proxy-ca-bundle"
+			c.KubeProxyHostContext = "in-cluster"
 		}},
 	}
 	var pods []corev1.Pod

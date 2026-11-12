@@ -22,8 +22,8 @@ wait it out.
 Merges are counted per ``(repository, kind, environment)``: a customer keeps a
 workload repository, a cluster repository and many more per business group, and
 trust earned in one of them says nothing about another. Repositories are compared
-by :func:`repo_key`, so ``https://github.com/org/infra.git`` and
-``https://github.com/org/infra`` are one. A record without a repository or a kind
+by :func:`repo_key`, so ``https://github.com/org/infra.git``,
+``git@github.com:org/infra`` and ``https://github.com/org/infra`` are one. A record without a repository or a kind
 is not counted; one without an environment counts under ``""``. Environments
 are compared lower-case and stripped, as the post-merge check stores them.
 
@@ -39,10 +39,11 @@ The Slack autonomy dial (``deploy/docker/patches/slack_dial_home.py``, behind
 
 from __future__ import annotations
 
-import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any
+
+import repo_ref
 
 RECORDS_TABLE = "post_merge_records"
 VERIFIED_FIXED = "verified_fixed"
@@ -60,12 +61,17 @@ class SchemaIncomplete(RuntimeError):
 
 
 def repo_key(url: Any) -> str:
-    """A repository url as one comparable key: host and path, lower-case, no scheme, user, ``.git`` or trailing slash."""
-    text = str(url or "").strip().lower()
-    text = re.sub(r"^[a-z+]+://", "", text)
-    if "@" in text.split("/", 1)[0]:
-        text = text.split("@", 1)[1].replace(":", "/", 1)
-    return re.sub(r"(\.git)?/*$", "", text)
+    """A repository url as one comparable key: host and path, lower-case, as :mod:`repo_ref` parses it.
+
+    No scheme, user, port, ``.git`` or trailing slash; scp remotes read as urls do, and GitHub's
+    host aliases fold to ``github.com``. A value with no host, fewer than two path segments, a
+    traversal segment, or that is not a string is ``""``, which :func:`count` skips.
+    """
+    ref = repo_ref.try_parse(url)
+    if ref is None or not ref.host or len(ref.segments) < 2:
+        return ""
+    host = repo_ref.GITHUB_CANONICAL_HOST if ref.is_github else ref.host
+    return f"{host}/{ref.path}".lower()
 
 
 def _environment(value: Any) -> str:

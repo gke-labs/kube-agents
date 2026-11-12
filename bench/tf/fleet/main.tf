@@ -129,8 +129,8 @@ resource "google_project_iam_member" "fleet_nodes_artifact_registry_reader" {
 # this account cannot read a Secret on platform-agent-host either. It is
 # project-scoped because IAM is where GKE authorization starts; the fleet
 # stack configures a kubernetes provider only for the clusters it plants
-# objects on, and seeded-c has none, so an RBAC-level grant could not cover
-# every cluster.
+# objects on (seeded-a, seeded-c and seeded-d; seeded-b carries none), so an
+# RBAC-level grant could not cover every cluster.
 #
 # hack/fleet-kubeconfigs.sh binds it by minting an access token
 # (FLEET_READONLY_SA), which is why the token-creator grant below exists.
@@ -153,10 +153,12 @@ resource "google_project_iam_member" "fleet_reader_container_viewer" {
 # rule and its VM; fixtures.json roles with cluster_slot null) are Compute
 # Engine objects, which container.viewer cannot read. The CI health bot's scan
 # runs every gcloud read as this account, so the presence probe and the state
-# pass list instances and firewall rules as it (#2483, #2682).
+# pass list instances and firewall rules as it (#2483, #2682), and the state
+# pass reads the startup-fail VM's serial port output as it.
 # roles/compute.viewer is get and list on Compute Engine resources, with no
-# create, update or delete. It does show instance metadata, so no secret goes
-# in this project's instance metadata.
+# create, update or delete. It does show instance metadata and serial port
+# output (compute.instances.getSerialPortOutput), so no secret goes in this
+# project's instance metadata or to a fleet VM's serial console.
 resource "google_project_iam_member" "fleet_reader_compute_viewer" {
   project = var.project_id
   role    = "roles/compute.viewer"
@@ -679,11 +681,38 @@ resource "google_container_cluster" "seeded_b" {
 }
 
 resource "google_container_node_pool" "seeded_b_default" {
-  name       = "default-pool"
-  location   = var.zone
-  cluster    = google_container_cluster.seeded_b.name
-  node_count = 1
+  name     = "default-pool"
+  location = var.zone
+  cluster  = google_container_cluster.seeded_b.name
+  # Two nodes, so GKE's own kube-system pods have room. seeded-b has a second
+  # node (no-surge-pool, defects-b.tf) that only pinned-batch-runner
+  # tolerates, so kube-dns's autoscaler asks for two replicas and a system
+  # Deployment's rolling update needs surge room; one e2-small at about 92%
+  # requested left kube-dns's second replica and event-exporter Pending,
+  # which workload_triage.py reports as `system unhealthy` and the fleet
+  # health triage case cannot call a healthy cluster. A node_count change is
+  # an in-place resize. No planted fixture reads this pool's node count: the
+  # surge and drain fixtures live on no-surge-pool, and the LB drain fixture
+  # reads the pool's instance group, which keeps its URL.
+  node_count = 2
   version    = local.lagging_version
+
+  # Each node's step waits out the LB drain fixture's 720 seconds
+  # (defects-b.tf), about 18 minutes. GKE's default surge of 1 would roll
+  # the two nodes one after the other, about 36 minutes, which beside a
+  # master update in the same apply can pass the reconcile's one-hour
+  # ceiling. Surging both at once keeps the roll one step. This is not a
+  # node-first pool, so the readiness surge-capacity rule names only
+  # no-surge-pool.
+  upgrade_settings {
+    max_surge       = 2
+    max_unavailable = 0
+  }
+
+  # Headroom over the one-step roll for the provider's 30-minute default.
+  timeouts {
+    update = "45m"
+  }
 
   # The pool takes the SAME derived pin as the master, and is deliberately
   # not ignore_changes'd: min_master_version moves the control plane at a
@@ -774,6 +803,22 @@ resource "google_container_cluster" "seeded_c" {
   workload_identity_config {
     workload_pool = "${var.project_id}.svc.id.goog"
   }
+
+  # Defect (networking): NodeLocal DNSCache off. GKE turns the add-on on by
+  # default on Standard from 1.34.1, and Autopilot cannot turn it off, so this
+  # is the one cluster in a pool project without it; every pod DNS lookup
+  # here crosses a kube-dns conntrack entry. Inert for the fixtures (pods
+  # resolve through kube-dns as before) and not a drift facet. An in-place
+  # cluster update that re-creates the pool's node: GKE documents the roll as
+  # one that honours the maintenance window above; on the dev fleet it ran
+  # during the apply (that apply also moved the pool's disk size, which rolls
+  # nodes too). The slot-c roles read absent for those minutes either way.
+  # Addressed by the no-nodelocal-dnscache role.
+  addons_config {
+    dns_cache_config {
+      enabled = false
+    }
+  }
 }
 
 # Defect (consistency, pool-level): the same cluster's default pool is the
@@ -796,12 +841,50 @@ resource "google_container_node_pool" "seeded_c_default" {
   cluster    = google_container_cluster.seeded_c.name
   node_count = 1
 
+  # Autoscaling held at one node (the pinned-inference-pool shape on slot a):
+  # a ComputeClass `nodepools` rule names only pools with autoscaling on, and
+  # without it GKE marks the class CrdMisconfigured ("Nodepool default-pool
+  # specified by name has autoscaling disabled", read 11-10 on a dev fleet),
+  # which stockout 3.12(b) would file on every project. One to one, so the
+  # autoscaler can neither add a node nor remove the one. Drift's
+  # pool-autoscaling facet flags only a cluster with LESS autoscaling than its
+  # peers (`_flag_less_only`), so the extra vote changes no drift finding.
+  # The stockout audit's 3.9 `single-zone-nodepool` does read a zonal
+  # autoscaled pool with no fallback, as it reads pinned-inference-pool on
+  # slot a; README.md's accepted-background table declares it.
+  autoscaling {
+    min_node_count = 1
+    max_node_count = 1
+  }
+
   node_config {
-    machine_type    = "e2-small"
+    # e2-medium since the ComputeClass fixtures (defects-c.tf): GKE's system
+    # pods request about 99 percent of an e2-small's allocatable memory
+    # (1,420 of 1,424 MiB, read 11-10 on a dev fleet at 1.36), so three of the
+    # five fixture pods sat Pending on it at 8Mi each. Memory, not CPU, is the
+    # binding constraint here, the same wall seeded-a hit (#1278, #3607). The
+    # provider updates machine_type in place and GKE re-creates the one node
+    # under the pool's surge settings; no reconcile-allow.json entry.
+    machine_type    = "e2-medium"
     disk_size_gb    = 50
     resource_labels = local.fleet_labels
     service_account = google_service_account.fleet_nodes.email
     oauth_scopes    = ["https://www.googleapis.com/auth/cloud-platform"]
+
+    # Defect (stockout): the pool is bound to ComputeClass general-ccc
+    # (defects-c.tf) by this label and carries no matching
+    # `cloud.google.com/compute-class=general-ccc:NoSchedule` taint, so the
+    # scheduler places untargeted pods on it until it is full and the
+    # autoscaler's pre-filter then drops them. With this the cluster has no
+    # untainted pool without a class label, which is what lets the
+    # obtainability audit's 3.24 file the untargeted workloads in
+    # defects-c.tf. A label change is an in-place pool update on provider 8.x
+    # (GKE relabels the node without re-creating it); the disk and kubelet
+    # settings around it stay the drift-pool-outlier fixture.
+    # Addressed by the untainted-compute-class-pool role.
+    labels = {
+      "cloud.google.com/compute-class" = "general-ccc"
+    }
 
     kubelet_config {
       cpu_cfs_quota = false
@@ -921,8 +1004,12 @@ resource "google_compute_firewall" "world_open_deny_remote" {
 # compute audit's §2.1 reads the serial console of every RUNNING instance that
 # runs a startup script and flags the guest agent's failure line, which on
 # current images is `Script "startup-script" failed with error: exit status 1`.
-# The script exits 1 on every boot, so the line is on the console from the
-# first boot onward, with no age gate. The audit reads the project, not a
+# The script exits 1 on every boot, and the guest prints the line once per
+# boot. The serial buffer keeps about 1 MiB, and this VM's guest agent logs
+# two errors an hour (it has no service account), so the line rotates out
+# about three weeks after a boot. hack/fleet_reconcile.py resets the VM after
+# each reconcile to print it again, and the fixture-state scan reads the
+# console for it (fixtures.json, startup-fail-vm). The audit reads the project, not a
 # cluster, so this needs no cluster slot. No external IP and no service
 # account: the VM does nothing but fail. The name leads with `startup-fail-`
 # so the case can grade `/startup-fail-`, which only the finding's object path

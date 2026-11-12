@@ -93,6 +93,23 @@ operatorRendered:
     dataClaims: 2
     dataClaimRequest: 50Gi
     dataClaimBytesRequest: 53687091200
+operatorRenderedPerReplica:
+  credentialProxyExecTier:
+    requests:
+      cpu: "2"
+      memory: 2Gi
+      ephemeral-storage: 2Gi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+      ephemeral-storage: 2Gi
+    cpuMillisRequest: 2000
+    cpuMillisLimit: 2000
+    memoryBytesRequest: 2147483648
+    memoryBytesLimit: 2147483648
+    ephemeralStorageBytesRequest: 2147483648
+    ephemeralStorageBytesLimit: 2147483648
+    pods: 1
 nextMode:
   agentPod:
     hermesBridge:
@@ -129,20 +146,20 @@ nextMode:
       pods: 0
   a2aNats:
     requests:
-      cpu: 250m
-      memory: 512Mi
-      ephemeral-storage: "0"
+      cpu: 930m
+      memory: 1872Mi
+      ephemeral-storage: 384Mi
     limits:
-      cpu: "1"
-      memory: 1Gi
-      ephemeral-storage: "0"
-    cpuMillisRequest: 250
-    cpuMillisLimit: 1000
-    memoryBytesRequest: 536870912
-    memoryBytesLimit: 1073741824
-    ephemeralStorageBytesRequest: 0
-    ephemeralStorageBytesLimit: 0
-    pods: 1
+      cpu: 4650m
+      memory: 3744Mi
+      ephemeral-storage: 384Mi
+    cpuMillisRequest: 930
+    cpuMillisLimit: 4650
+    memoryBytesRequest: 1962934272
+    memoryBytesLimit: 3925868544
+    ephemeralStorageBytesRequest: 402653184
+    ephemeralStorageBytesLimit: 402653184
+    pods: 3
     surges: false
   a2aCallout:
     requests:
@@ -212,6 +229,23 @@ nextMode:
     ephemeralStorageBytesLimit: 0
     pods: 1
     surges: false
+  a2aDispatcher:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+      ephemeral-storage: 64Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+      ephemeral-storage: 64Mi
+    cpuMillisRequest: 50
+    cpuMillisLimit: 500
+    memoryBytesRequest: 67108864
+    memoryBytesLimit: 268435456
+    ephemeralStorageBytesRequest: 67108864
+    ephemeralStorageBytesLimit: 67108864
+    pods: 1
+    surges: false
   a2aProvision:
     requests:
       cpu: 50m
@@ -229,6 +263,6 @@ nextMode:
     ephemeralStorageBytesLimit: 134217728
     pods: 1
   storage:
-    persistentVolumeClaims: 1
-    storageRequest: 40Gi
-    storageBytesRequest: 42949672960
+    persistentVolumeClaims: 3
+    storageRequest: 120Gi
+    storageBytesRequest: 128849018880

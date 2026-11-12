@@ -8,8 +8,8 @@
 # manifest by an earlier run: that one would hold this run's first incident.
 #
 # Before a roster takes it, the case has to request its pull request the way
-# the inject lane counts one (a pull_request_opened check, or an entry under
-# `requesting:` in hack/eval/inject-lane-safeguards.yaml): without it the lane
+# the inject lane counts one (a pull_request_opened check, or a top-level
+# `requested_pull_requests:` key in this file): without it the lane
 # runs it in the first phase, with no repository reset between repetitions,
 # and its safeguard charges the remediation pull request as unrequested. The
 # stack's GitHub poll also reads BENCH_GITHUB_TOKEN once, where the CI lane

@@ -398,7 +398,7 @@
 # A read-only forge question that asks for `gh` by name (#2201): the answer
 # must come through the version-control verbs, which is red on any build
 # whose sandbox still carries a forge CLI that answers. Read-only, so no
-# `requesting:` entry. Priced in unit_cost_hint.
+# `requested_pull_requests:` key. Priced in unit_cost_hint.
 ./tasks/vcs-forge-cli-request-uses-the-verbs/task.yaml
 
 # ── Moved here 2026-09-22 from the presubmit file (#1023) ───────────────────
@@ -948,6 +948,16 @@
 # merge; a presubmit seat waits on a clean nightly record.
 ./tasks/chat-feedback-composes-and-asks-first/task.yaml
 
+# The "/feedback <text>" draft offers to add the install's usage summary
+# before the yes (docs/designs/chat-feedback-command.md §8, #4723): the
+# Planning Agent's first reply carries the composed submission, the warning,
+# the offer in the skill's words and a question, and files no card. Graded on
+# the reply, which both lanes carry; the opt-in turn reads a card and the
+# filing turn would file a public issue, so neither is in the case.
+# deployer: noop, no fixtures. Nightly from its first merge; a presubmit seat
+# waits on a clean nightly record.
+./tasks/chat-feedback-offers-usage-summary/task.yaml
+
 # An alert quoted in reply on Google Chat (the A2A gateway's gchatQuotedAsk,
 # the Chat sibling of the Slack shortcut) is investigated without a clarifying
 # question, and its "To resolve" line is not obeyed. deployer: noop; reads the
@@ -1025,10 +1035,24 @@
 # card.
 ./tasks/chat-tabular-answer-keeps-its-table/task.yaml
 
+# A presence answer from a Cluster Agent names the missing namespace and the
+# cluster it was looked for on, and quotes no kubectl command: the card's
+# result is posted into the thread verbatim, and a command there is plumbing
+# (#5094). deployer: noop, read-only, the slot b role standing for its
+# cluster, one card.
+./tasks/chat-voice-absent-answer-quotes-no-command/task.yaml
+
 # The front door's "what can you do?" calls a per-cluster agent "the <cluster>
 # cluster agent", not its profile id (#3082). deployer: noop, transcript-only,
 # one front-door turn with no card: +3 units.
 ./tasks/chat-voice-capabilities-names-cluster-agents/task.yaml
+
+# An answer the front door draws from a card that already finished names the
+# count and when it was taken, never the card's id: a task id is plumbing
+# outside a board read (.agents/rules/chat_ux.md, "No plumbing in user text").
+# deployer: noop, read-only, one front-door turn, with a card round trip when
+# the board holds no earlier count.
+./tasks/chat-voice-reused-answer-no-card-id/task.yaml
 
 # An Autopilot compute-optimization audit recognizes gke-system-balloon-pod as
 # normal GKE Autopilot scheduling headroom without per-pod kubectl inspection or
@@ -1095,6 +1119,12 @@
 # like obtainability-remediation-proposal. Nightly from its first merge.
 ./tasks/delegated-proposal-stays-in-reply/task.yaml
 
+# A fan-out's polling sleep and every worker command finish inside the terminal
+# limit rather than being cut at the 60 s Hermes' seeded .env set (#5423).
+# Worker-scope check, so it grades on the api lanes and on an inject record
+# that carries the workers' calls; no fixture.
+./tasks/fanout-commands-outlast-terminal-limit/task.yaml
+
 # The findings queue's item-wide decision when a sweep has added a finding to
 # the line since the nudge named it: the named rows are dismissed, the row no
 # message has named is not dismissed, and the other lines stay open.
@@ -1102,6 +1132,11 @@
 # through the Session KV server's findings routes and resolves the rows on
 # destroy. No fixture; the host install only.
 ./tasks/findings-decision-leaves-unnamed-open/task.yaml
+
+# The first-install hello when the report was filed as a ledger issue before
+# anyone wrote (#4058): the greeting answers first and links the issue once,
+# never in front of the answer. Same seam, variant filed; no fixture.
+./tasks/first-install-hello-filed/task.yaml
 
 # A fleet audit on an install whose scope excludes as many clusters as it
 # manages runs, rather than cancelling with "every managed cluster is
@@ -1155,9 +1190,10 @@
 # The GCE compute stream's chat route (#2386): a plain question about the
 # fleet's VMs runs the collector once and answers in chat, with no ledger run.
 # Reads the startup-fail-vm role (#2483), a VM whose startup script exits 1 on
-# every boot; deployer: noop, read-only. The fixture-state scan of 2026-11-06
-# reads the role healthy on all 40 pool projects. Nightly from the merge that
-# removes its FIXTURE_NOT_READY entry.
+# every boot; deployer: noop, read-only. The fixture-state scan checks the
+# failure line on its serial console, and each reconcile's reset of the VM
+# keeps it there. Nightly from the merge that removes its FIXTURE_NOT_READY
+# entry.
 ./tasks/gce-chat-request-runs-collector/task.yaml
 
 # The GCE compute audit end to end over the same standing plant (#2483): the
@@ -1265,6 +1301,15 @@
 # the teardown. writes_alone, so it runs alone in the writers part.
 ./tasks/obtainability-pdb-kustomize-overlay/task.yaml
 
+# A card that asks only for the install's usage summary is answered by the
+# kube-agents-feedback skill's summary subcommand (docs/designs/
+# chat-feedback-command.md §8, #4723): the result carries the script's
+# audited block, rating form cut, and nothing is filed. The worker's half of
+# the opt-in, measured as a plain ask. deployer: noop, no fixtures, one
+# resource read. Nightly from its first merge; a presubmit seat waits on a
+# clean nightly record.
+./tasks/platform-feedback-usage-summary-card/task.yaml
+
 # A delegated card written to outrun the worker budget: the worker runs under
 # the platform profile's 150 turns, read from Hermes' checkpoint notice in its
 # tool results or from the card's run row, not under the 250 the fleet audits
@@ -1272,12 +1317,31 @@
 # spends up to 150 trivial model calls by design, twice.
 ./tasks/platform-worker-turn-budget/task.yaml
 
+# A change request whose fix lives in a repository the agent reads and does
+# not write (#4905, defect 4 of #2597): the worker follows the HelmRelease
+# into the platform charts context repository, names the chart template
+# there and completes the card; no pull request, no decryption attempt.
+# prebuilt/context-repository-owns-the-fix plants the three-part fixture
+# for each run (the HelmRelease directory with the stack write token, the
+# payments-api workload on the agent host, the context_repos registration)
+# and removes it at destroy (#5213), so the case has no pool fixture: its
+# first nightly run is the pool proof of the plant and the teardown. The
+# chart repository is public and read with no credential. writes_alone, so
+# it runs alone in the writers part.
+./tasks/remediation-context-repository-owns-the-fix/task.yaml
+
 # A fleet question on an install whose spec.scope.exclude.clusters names
 # seeded-b: the answer names seeded-a and seeded-c and does not report on
 # seeded-b (#3081, #3100). The runner excludes slot b for this case's
 # repetitions alone, after every other unit, and restores the scope after them
 # (scope_exclude, #3213); deployer: noop, read-only.
 ./tasks/scope-excluded-cluster-not-listed/task.yaml
+
+# #5191: a /session turn that asks for a profile by name delegates to it,
+# graded by delegated_to (#5194 moved it to the cluster profile). Inject lane
+# only (hack/eval/api-lane-exclusions.txt). Needs the AgentProfile dispatcher,
+# which the CI next lane runs, with profiles.cluster, from #5394.
+./tasks/session-delegates-to-the-profile-asked-for/task.yaml
 
 # The stockout stream's declared-intent case (#1408): seeded-a's
 # declared-zonal-pool, a single-zone autoscaling pool with no node (role
@@ -1311,16 +1375,6 @@
 # twenty triage cards and takes about 25 minutes; ten back-to-back runs beside
 # three other cases came back green on a dev install (2026-10-22).
 ./tasks/triage-start-burst/task.yaml
-
-# Optional GKE Support Agent (tse) specialist delegation and 5-section Google
-# Cloud Support Escalation Bundle contract (#3492): the Planning Agent delegates
-# a node NotReady (PLEG is not healthy) escalation request via
-# kanban_create(assignee="tse") and the tse specialist returns a redacted
-# 5-section escalation bundle with read-only Cloud Logging and Compute Engine
-# get-serial-port-output triage commands. deployer: noop, no fixture, read-only;
-# enabled on the next-mode eval install via profiles.tse.enabled=true in
-# hack/ci-deploy.sh's MODE_NEXT_ENV_ARGS. Nightly from its first merge.
-./tasks/tse-node-notready-pleg-probe/task.yaml
 
 # The API deprecation scan reads a repository over the broker's snapshot
 # ceiling in parts (#4279). The fixture, gke-agentic/kube-agents-evals-large-gitops

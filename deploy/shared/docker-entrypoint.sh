@@ -521,7 +521,7 @@ fi
 # they produce: a stale copy would grade an old prompt against the image's checks.
 if [ -d "/opt/defaults" ]; then
     for f in SOUL.md AGENTS.md CAPABILITIES.md hindsight/config.json \
-        onboarding/scan_in_progress.md onboarding/scan_completed.md; do
+        onboarding/scan_in_progress.md onboarding/scan_completed.md onboarding/report_filed.md; do
         if [ -f "/opt/defaults/$f" ]; then
             # Nested paths need their parent: step 2's recursive copy creates it
             # on a fresh PVC, but the force-sync must not depend on that.
