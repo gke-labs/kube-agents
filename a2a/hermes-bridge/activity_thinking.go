@@ -1404,6 +1404,14 @@ func redactSubmatchTo(re *regexp.Regexp, s string, group int, keep func(s string
 // where the key in keyGroup names a credential outright
 // (keyClearlyNamesSecret); keyGroup -1 hands every value.
 func redactNamedSubmatch(re *regexp.Regexp, s string, group, keyGroup int, keep func(s string, m []int) bool, sink secretSink) string {
+	return redactNamedSubmatchSpan(re, s, group, keyGroup, keep, sink, false)
+}
+
+// redactNamedSubmatchSpan is redactNamedSubmatch that, with codeSpan, gives
+// a code span's closing backtick back to the text (closingBacktickOutside).
+// Only the command-line flag rules pass it: their value runs to whitespace,
+// so it alone takes a span's closing backtick.
+func redactNamedSubmatchSpan(re *regexp.Regexp, s string, group, keyGroup int, keep func(s string, m []int) bool, sink secretSink, codeSpan bool) string {
 	ms := re.FindAllStringSubmatchIndex(s, -1)
 	if ms == nil {
 		return s
@@ -1415,7 +1423,9 @@ func redactNamedSubmatch(re *regexp.Regexp, s string, group, keyGroup int, keep 
 		if lo < last || hi <= lo || s[lo:hi] == redactedValue || (keep != nil && !keep(s, m)) {
 			continue
 		}
-		hi = closingBacktickOutside(s, lo, hi)
+		if codeSpan {
+			hi = closingBacktickOutside(s, lo, hi)
+		}
 		sb.WriteString(s[last:lo])
 		sb.WriteString(redactedValue)
 		if keyGroup < 0 || keyClearlyNamesSecret(s[m[2*keyGroup]:m[2*keyGroup+1]]) {
@@ -1544,26 +1554,26 @@ func scrubCLISecretFlags(s string, sink secretSink) string {
 	notAFlag := func(group int) func(s string, m []int) bool {
 		return func(s string, m []int) bool { return !strings.HasPrefix(s[m[2*group]:m[2*group+1]], "-") }
 	}
-	s = redactSubmatchTo(cliUserPassPattern, s, 4, nil, sink)
-	s = redactSubmatchTo(cliSpacedPassPattern, s, 2, notAFlag(2), sink)
-	s = redactSubmatchTo(cliAttachedPassPattern, s, 2, nil, sink)
-	s = redactSubmatchTo(cliLDAPPassPattern, s, 2, notAFlag(2), sink)
-	s = redactSubmatchTo(cliPassphraseArgPattern, s, 2, nil, sink)
+	s = redactNamedSubmatchSpan(cliUserPassPattern, s, 4, -1, nil, sink, true)
+	s = redactNamedSubmatchSpan(cliSpacedPassPattern, s, 2, -1, notAFlag(2), sink, true)
+	s = redactNamedSubmatchSpan(cliAttachedPassPattern, s, 2, -1, nil, sink, true)
+	s = redactNamedSubmatchSpan(cliLDAPPassPattern, s, 2, -1, notAFlag(2), sink, true)
+	s = redactNamedSubmatchSpan(cliPassphraseArgPattern, s, 2, -1, nil, sink, true)
 	// A flag whose name is a credential key (flagValueRedacted).
 	flagValue := func(s string, m []int) bool {
 		return flagValueRedacted(s[m[4]:m[5]], s[m[6]:m[7]], s[m[8]:m[9]])
 	}
 	// A flag's value is handed to sink only under a name that names a
 	// credential outright.
-	s = redactNamedSubmatch(cliLongSecretFlagPattern, s, 4, 2, flagValue, sink)
-	s = redactNamedSubmatch(cliLongSecretFlagDashedPattern, s, 4, 2, flagValue, sink)
-	s = redactNamedSubmatch(cliSingleDashSecretFlagPattern, s, 4, 2, flagValue, sink)
-	s = redactNamedSubmatch(cliSingleDashSecretFlagDashedPattern, s, 4, 2, flagValue, sink)
+	s = redactNamedSubmatchSpan(cliLongSecretFlagPattern, s, 4, 2, flagValue, sink, true)
+	s = redactNamedSubmatchSpan(cliLongSecretFlagDashedPattern, s, 4, 2, flagValue, sink, true)
+	s = redactNamedSubmatchSpan(cliSingleDashSecretFlagPattern, s, 4, 2, flagValue, sink, true)
+	s = redactNamedSubmatchSpan(cliSingleDashSecretFlagDashedPattern, s, 4, 2, flagValue, sink, true)
 	argListValue := func(s string, m []int) bool {
 		return flagValueRedacted(s[m[2]:m[3]], " ", s[m[4]:m[5]])
 	}
-	s = redactNamedSubmatch(cliArgListJSONPattern, s, 2, 1, argListValue, sink)
-	return redactNamedSubmatch(cliArgListYAMLPattern, s, 2, 1, argListValue, sink)
+	s = redactNamedSubmatchSpan(cliArgListJSONPattern, s, 2, 1, argListValue, sink, true)
+	return redactNamedSubmatchSpan(cliArgListYAMLPattern, s, 2, 1, argListValue, sink, true)
 }
 
 // flagValueRedacted says whether a flag's value is redacted: the flag's

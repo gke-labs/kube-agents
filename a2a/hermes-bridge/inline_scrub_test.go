@@ -612,6 +612,9 @@ func TestScrubInlineSecretsKeepsACodeSpansClosingBacktick(t *testing.T) {
 		// Inside a span, a backtick with more value after it is the
 		// value's own: redacted whole, nothing of it handed back.
 		{"`app --password=synthetic`pass-0001 more`", "`app --password=[redacted] more`"},
+		// A key=value rule stops at the backtick itself; only the flag
+		// rules, whose value runs to whitespace, hand one back.
+		{"see `password=synthetic-pass-0001`), then", "see `password=[redacted]`), then"},
 	}
 	for _, tc := range cases {
 		if got := scrubInlineSecrets(tc.in); got != tc.want {
