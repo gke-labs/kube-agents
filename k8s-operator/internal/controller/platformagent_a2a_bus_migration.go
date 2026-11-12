@@ -24,6 +24,7 @@ import (
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 	"github.com/gke-labs/kube-agents/k8s-operator/internal/busmigrate"
@@ -1255,6 +1256,39 @@ func (r *PlatformAgentReconciler) cleanupBusMigration(ctx context.Context, agent
 	return nil
 }
 
+// busMigrationTornDown is a switch to today's word on the bus migration
+// record: a run that ended, or a Failed run given up, goes, with every
+// object it left (its ServiceAccounts, pods, Jobs, run Secret and staging
+// claim), so a later switch back to next starts with no record and its
+// bridge waits for its own provisioning. A run still under way, or Failed
+// and not given up, is left as it is: the webhook refuses that switch, since
+// the run's staging claim can hold the only copy of the bus, and an install
+// without the webhook keeps the record and the claim for a person. Nothing
+// requeues it off next.
+func (r *PlatformAgentReconciler) busMigrationTornDown(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	run := agent.Status.BusMigration
+	if run == nil {
+		return nil
+	}
+	phase := busMigrationPhase(run.Phase)
+	if !busMigrationTerminal(phase) || (phase == busMigrationFailed && !run.GivenUp) {
+		logf.FromContext(ctx).Info("the A2A stack is off while a bus migration is under way or Failed; its record and staging claim are kept for a person",
+			"run", run.RunID, "phase", run.Phase)
+		return nil
+	}
+	if err := r.cleanupBusMigration(ctx, agent, run); err != nil {
+		return err
+	}
+	for _, step := range []string{"pin", "unpin"} {
+		job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkName(agent, run, step), Namespace: agent.Namespace}}
+		if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !errors.IsNotFound(err) {
+			return err
+		}
+	}
+	agent.Status.BusMigration = nil
+	return nil
+}
+
 // busMigrationFreezeActive reports the one to three leg's write freeze in
 // force: from Freezing until Releasing begins. While it is, the identity map
 // holds only busMigrationFrozenIdentities, and, once the callout serves that
@@ -1328,10 +1362,14 @@ func busMigrationFrozenMapVersion(agent *agentv1alpha1.PlatformAgent) string {
 }
 
 // busMigrationFreezeCallout renders the callout for the write freeze: its
-// pod template carries the run's ID, so every replica is replaced, and the
-// frozen map's version as the one its readiness requires
-// (A2A_EXPECT_MAP_VERSION), so a ready replica is one serving the frozen
-// map itself. Outside the freeze it does nothing.
+// pod template carries the run's ID, so every replica is replaced, and,
+// until the freeze is confirmed, the frozen map's version as the one its
+// readiness requires (A2A_EXPECT_MAP_VERSION), so a ready replica is one
+// serving the frozen map itself. Once confirmed nothing reads that
+// readiness, and the version changes with each phase's identities, so it is
+// dropped: kept, it would roll the callout on every phase and fail each
+// replica's readiness as it loaded the next phase's map. Outside the freeze
+// it does nothing.
 func busMigrationFreezeCallout(agent *agentv1alpha1.PlatformAgent, dep *appsv1.Deployment) {
 	if !busMigrationFreezeActive(agent) {
 		return
@@ -1341,6 +1379,9 @@ func busMigrationFreezeCallout(agent *agentv1alpha1.PlatformAgent, dep *appsv1.D
 		tmpl.Annotations = map[string]string{}
 	}
 	tmpl.Annotations[a2aBusFreezeAnnotation] = agent.Status.BusMigration.RunID
+	if agent.Status.BusMigration.FreezeConfirmed {
+		return
+	}
 	for i := range tmpl.Spec.Containers {
 		tmpl.Spec.Containers[i].Env = append(tmpl.Spec.Containers[i].Env,
 			corev1.EnvVar{Name: a2aCalloutExpectMapVersionEnv, Value: busMigrationFrozenMapVersion(agent)})

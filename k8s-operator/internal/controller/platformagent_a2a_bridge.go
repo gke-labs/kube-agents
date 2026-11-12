@@ -200,11 +200,15 @@ func a2aBridgeRendered(agent *agentv1alpha1.PlatformAgent) bool {
 //
 // A bus migration drops BusProvisioned when it changes the server count, so
 // Ready waits for the provision Job after it (reconcileA2AStack). The bridge
-// does not wait with it: a run only starts on a provisioned bus, the streams
-// come through it, and withholding the bridge for the run's length would roll
-// the agent pod out and back in for nothing.
+// does not wait with it: the streams come through a run, and withholding the
+// bridge for the run's length would roll the agent pod out and back in for
+// nothing. A run given up is the exception: the provision Job recreates,
+// empty, the streams it did not put back, so the bridge waits for that. The
+// record goes when the stack is torn down (a switch to today), so a later
+// bring-up waits for its own provisioning.
 func a2aBridgeInPod(agent *agentv1alpha1.PlatformAgent) bool {
-	return a2aBridgeRendered(agent) && (busProvisioned(agent) || agent.Status.BusMigration != nil)
+	run := agent.Status.BusMigration
+	return a2aBridgeRendered(agent) && (busProvisioned(agent) || (run != nil && !run.GivenUp))
 }
 
 // a2aRenderedBridgeSettings is the part of the rendered bridge's environment

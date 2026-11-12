@@ -281,6 +281,13 @@ func TestTheBridgeStaysInThePodThroughABusMigration(t *testing.T) {
 			t.Errorf("%s: the agent container lost %s with the bridge kept", phase, a2aActivitySecretEnvVar)
 		}
 	}
+	// A run given up waits, like a first bring-up, for the provision Job
+	// that recreates what it did not put back.
+	agent := a2aTestAgent()
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), RunID: "1-1", Phase: string(busMigrationFailed), GivenUp: true}
+	if got := containersNamed(bridgeTestPod(agent), a2aBridgeContainerName); len(got) != 0 {
+		t.Errorf("a given-up run on an unprovisioned bus has %d bridge containers, want 0", len(got))
+	}
 }
 
 // The bridge image is swapped in beside the agent's only for the release

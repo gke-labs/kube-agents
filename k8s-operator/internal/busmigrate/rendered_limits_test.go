@@ -325,3 +325,53 @@ func TestARestoreFreesANameHeldByAnUnfinishedRestore(t *testing.T) {
 		t.Errorf("the failed attempt was not logged: %q", logged.String())
 	}
 }
+
+// The forward restore pod run again (deleted mid-Restoring and recreated)
+// takes a stream it already restored and raised to three replicas as done,
+// rather than deleting and restoring it again.
+func TestARestoreRunAgainKeepsAStreamItAlreadyRaised(t *testing.T) {
+	meta, data := snapshotTasks(t)
+	dir, run := stageTasks(t, meta, data, policyOf(meta.Config))
+	base := t.TempDir()
+	s0 := startServer(t, "a2a-nats-0", filepath.Join(base, "0"), 16251)
+	s1 := startServer(t, "a2a-nats-1", filepath.Join(base, "1"), 16252)
+	s2 := startServer(t, "a2a-nats-2", filepath.Join(base, "2"), 16253)
+	defer shutdown(s2, s1, s0)
+	nc, err := nats.Connect(s1.ClientURL())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nc.Close()
+	ctx := context.Background()
+	js, _ := nc.JetStream()
+	for deadline := time.Now().Add(30 * time.Second); ; time.Sleep(250 * time.Millisecond) {
+		if _, err := js.AccountInfo(); err == nil {
+			break
+		} else if time.Now().After(deadline) {
+			t.Fatalf("the cluster's JetStream never came up: %v", err)
+		}
+	}
+	if _, err := restoreAll(ctx, nc, []string{"TASKS"}, dir, run, 3); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	first, err := streamInfo(ctx, nc, "TASKS")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Config.Replicas != 3 {
+		t.Fatalf("first run left %d replicas, want 3", first.Config.Replicas)
+	}
+	if _, err := restoreAll(ctx, nc, []string{"TASKS"}, dir, run, 3); err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+	second, err := streamInfo(ctx, nc, "TASKS")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !second.Created.Equal(first.Created) {
+		t.Errorf("the second run re-created the stream (created %v, then %v)", first.Created, second.Created)
+	}
+	if second.Config.Replicas != 3 || second.State.Msgs != meta.State.Msgs {
+		t.Errorf("after the second run: %d replicas, %d msgs; want 3 and %d", second.Config.Replicas, second.State.Msgs, meta.State.Msgs)
+	}
+}

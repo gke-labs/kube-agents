@@ -63,6 +63,8 @@ The verifier's and the callout's topology spreads are `ScheduleAnyway`, so a sin
 
 On a bus that already runs, changing `busReplicas` between 1 and 3 starts a migration that keeps the bus's data. The operator runs it in phases, shown in `status.busMigration` and reported by the `A2ABusMigrating` condition. The admission webhook refuses another change to `busReplicas` while one runs. A run has two hours going forward; a phase still running then counts as failed, and the way back gets two hours of its own. Objects under a run's names that the PlatformAgent does not own are never used: a phase that finds one fails and names it.
 
+The webhook also refuses a switch of `spec.mode` off `next` while a migration runs, or while a `Failed` run waits to be retried or given up, since the run's staging claim can hold the bus's only copy. A switch after a run ended removes `status.busMigration` and what the run left.
+
 The operator runs the migration's work in pods of its own image, so it needs `OPERATOR_IMAGE` set, as the chart does. Without it a `busReplicas` change starts no migration: the bus keeps its count, and an `A2ABusMigrationUnavailable` Warning Event says why.
 
 **Three servers to one** happens in place. A Job of the operator's moves each stream's leader to server 0 and scales the stream to one replica while the bus is still a cluster; then the bus renders one server. Writes keep flowing, with brief stalls as leaders move and while server 0 restarts on its own.

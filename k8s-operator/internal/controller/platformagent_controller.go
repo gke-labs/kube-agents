@@ -1357,6 +1357,12 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// lets them write the cleared field once, and then find it current.
 		a2aState.busReplicasPersisted = instance.Status.BusReplicas
 		instance.Status.BusReplicas = 0
+		// Nor a bus migration: a run that ended, or was given up, goes with
+		// what it left behind (busMigrationTornDown).
+		a2aState.busMigrationPersisted, a2aState.busMigrationCaptured = instance.Status.BusMigration.DeepCopy(), true
+		if err := r.busMigrationTornDown(ctx, instance); err != nil {
+			return ctrl.Result{}, err
+		}
 		// The dispatcher and its Job mode went with the stack, unless their
 		// profile-namespace teardown failed: then the Jobs Role and templates
 		// are still live and the condition stays as it was.
@@ -1481,6 +1487,11 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if a2aState.busReloadRequeue > 0 {
 			requeue = min(requeue, a2aState.busReloadRequeue)
 		}
+		// And a bus migration's next read of its Jobs and pods, which nothing
+		// watched wakes (busMigrationRequeue).
+		if d := busMigrationRequeue(instance); d > 0 {
+			requeue = min(requeue, d)
+		}
 		return ctrl.Result{RequeueAfter: requeue}, nil
 	}
 
@@ -1503,6 +1514,13 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 		if credentialProxyExecShort(instance) {
 			requeue = min(requeue, credentialProxyExecShortRequeue)
+		}
+		// And a bus migration under way, which would otherwise advance one
+		// phase per reprobe.
+		if a2aNext {
+			if d := busMigrationRequeue(instance); d > 0 {
+				requeue = min(requeue, d)
+			}
 		}
 		return ctrl.Result{RequeueAfter: requeue}, nil
 	}
@@ -1537,8 +1555,10 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	requeueAfter = min(requeueAfter, r.usageStatusRequeue(instance))
 	// A bus migration's Jobs and pods are not watched, so while one runs the
 	// pass that reads their outcome has to be scheduled.
-	if d := busMigrationRequeue(instance); d > 0 {
-		requeueAfter = min(requeueAfter, d)
+	if a2aNext {
+		if d := busMigrationRequeue(instance); d > 0 {
+			requeueAfter = min(requeueAfter, d)
+		}
 	}
 	// A sizing step back's hold ends at a time (sizingStepBackHoldInterval),
 	// and the settled lower row sends no event for it, so the pass that

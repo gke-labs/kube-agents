@@ -292,7 +292,7 @@ func restoreAll(ctx context.Context, nc *nats.Conn, streams []string, dir string
 			built.MaxBytes, built.MaxAge = meta.Config.MaxBytes, meta.Config.MaxAge
 		}
 		for attempt := 1; ; attempt++ {
-			if alreadyRestored(ctx, nc, built, meta.State) {
+			if alreadyRestored(ctx, nc, built, meta.State, replicas) {
 				// Built by an earlier attempt (a finish that timed out
 				// after the server built the stream, or this pod run
 				// again): the server builds a stream only on the final
@@ -344,11 +344,15 @@ func restoreAll(ctx context.Context, nc *nats.Conn, streams []string, dir string
 
 // alreadyRestored reports the stream already there as this snapshot built
 // it: inside its policy, with the snapshot's message count and last
-// sequence.
-func alreadyRestored(ctx context.Context, nc *nats.Conn, policy StreamPolicy, state nats.StreamState) bool {
+// sequence. A stream a run of this pod already raised to replicas counts:
+// the raise is the only change made after the restore, and it is repeated.
+func alreadyRestored(ctx context.Context, nc *nats.Conn, policy StreamPolicy, state nats.StreamState, replicas int) bool {
 	info, err := streamInfo(ctx, nc, policy.Name)
 	if err != nil {
 		return false
+	}
+	if info.Config.Replicas == replicas {
+		policy.Replicas = replicas
 	}
 	return len(policy.Check(info.Config)) == 0 && info.State.Msgs == state.Msgs && info.State.LastSeq == state.LastSeq
 }

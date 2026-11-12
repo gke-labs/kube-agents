@@ -22,8 +22,10 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -431,6 +433,40 @@ var a2aIdentityMapSchemaKeys = map[string][]string{
 	"3": {"account", "grants", "identities", "narrowing", "profile", "publish", "serviceAccount", "subscribe", "topics", "user", "version"},
 	"4": {"account", "grants", "identities", "narrowing", "profile", "publish", "serviceAccount", "subscribe", "tier", "topics", "user", "version"},
 	"5": {"account", "grants", "identities", "narrowing", "profile", "publish", "serviceAccount", "shard", "shards", "subscribe", "tier", "topics", "user", "version"},
+	// 6 is #5553's (the dispatcher's bucketed entry); once it merges, 7 is
+	// its key set plus notAfter.
+	"7": {"account", "grants", "identities", "narrowing", "notAfter", "profile", "publish", "serviceAccount", "shard", "shards", "subscribe", "tier", "topics", "user", "version"},
+}
+
+// The schema constant is the newest version the table records, and each
+// version's keys include every key of the one before it: a map shape is only
+// ever extended. Two pull requests that each claim the next number for
+// different fields meet here (or as a duplicate map key) rather than in a
+// callout that refuses the merged map.
+func TestTheIdentityMapSchemaTableOnlyGrows(t *testing.T) {
+	var versions []int
+	for v := range a2aIdentityMapSchemaKeys {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			t.Fatalf("schema version %q is not a number", v)
+		}
+		versions = append(versions, n)
+	}
+	slices.Sort(versions)
+	if got := strconv.Itoa(versions[len(versions)-1]); got != a2aIdentityMapSchema {
+		t.Errorf("a2aIdentityMapSchema is %q, but the newest version recorded is %s", a2aIdentityMapSchema, got)
+	}
+	for i := 1; i < len(versions); i++ {
+		prev, cur := a2aIdentityMapSchemaKeys[strconv.Itoa(versions[i-1])], a2aIdentityMapSchemaKeys[strconv.Itoa(versions[i])]
+		for _, k := range prev {
+			if !slices.Contains(cur, k) {
+				t.Errorf("schema %d drops %q, which %d had", versions[i], k, versions[i-1])
+			}
+		}
+		if len(cur) <= len(prev) {
+			t.Errorf("schema %d adds no key over %d", versions[i], versions[i-1])
+		}
+	}
 }
 
 // a2aJSONKeys walks a decoded document and collects every object key in it.
@@ -458,6 +494,12 @@ func a2aJSONKeys(v any, into map[string]bool) {
 // read it.
 func TestTheIdentityMapShapeMatchesTheSchemaTheCalloutPodTemplatePins(t *testing.T) {
 	agent := a2aTestAgent()
+	// With a three-to-one run in its pin phase, so the per-run principal and
+	// its notAfter are rendered too; the run does not freeze, so the profile
+	// below is still in the map.
+	agent.Status.BusReplicas = 3
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationShrink), RunID: "3-1", Phase: string(busMigrationPinning),
+		StartedAt: metav1.Now(), Deadline: metav1.NewTime(time.Now().Add(time.Hour))}
 
 	// With a profile that has topics, so every key the renderer can emit is
 	// emitted: a map rendered with no profiles would pass on the old schema

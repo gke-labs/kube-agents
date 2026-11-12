@@ -1661,15 +1661,18 @@ func TestTheFreezeRenders(t *testing.T) {
 	agent := a2aTestAgent()
 	normalConf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), keys, nil).Data["nats.conf"])
 	normalReserved := renderA2AReservedPrincipals(agent)
+	// The callout carries the run's annotation through the freeze, and the
+	// frozen map's version for its readiness only until the freeze is
+	// confirmed: after that the version moves with each phase's identities.
 	for _, tc := range []struct {
-		phase                     busMigrationPhase
-		confirmed                 bool
-		calloutFrozen, confFrozen bool
+		phase                                   busMigrationPhase
+		confirmed                               bool
+		calloutAnnotated, expectEnv, confFrozen bool
 	}{
-		{busMigrationFreezing, false, true, false},
-		{busMigrationFreezing, true, true, true},
-		{busMigrationRestoring, true, true, true},
-		{busMigrationReleasing, true, false, false},
+		{busMigrationFreezing, false, true, true, false},
+		{busMigrationFreezing, true, true, false, true},
+		{busMigrationRestoring, true, true, false, true},
+		{busMigrationReleasing, true, false, false, false},
 	} {
 		a := a2aTestAgent()
 		a.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), RunID: "3-1", Phase: string(tc.phase),
@@ -1684,8 +1687,11 @@ func TestTheFreezeRenders(t *testing.T) {
 			}
 		}
 		frozenVersion, _ := renderA2AAuthMap(a, nil)
-		if got := dep.Spec.Template.Annotations[a2aBusFreezeAnnotation] == "3-1" && env == frozenVersion.Version && env != ""; got != tc.calloutFrozen {
-			t.Errorf("%s: callout frozen %v (annotation %q, expect %q of %q)", name, got, dep.Spec.Template.Annotations[a2aBusFreezeAnnotation], env, frozenVersion.Version)
+		if got := dep.Spec.Template.Annotations[a2aBusFreezeAnnotation] == "3-1"; got != tc.calloutAnnotated {
+			t.Errorf("%s: callout annotated %v (%q)", name, got, dep.Spec.Template.Annotations[a2aBusFreezeAnnotation])
+		}
+		if got := env != "" && env == frozenVersion.Version; got != tc.expectEnv || (!tc.expectEnv && env != "") {
+			t.Errorf("%s: expected-version env %q (frozen map %q), want set=%v", name, env, frozenVersion.Version, tc.expectEnv)
 		}
 
 		conf := string(buildA2ANATSConfigSecret(a, a2aTestCreds(), keys, nil).Data["nats.conf"])
@@ -1729,6 +1735,27 @@ func TestTheFreezeRenders(t *testing.T) {
 		}
 		if busNATSFrozenFor(sts) != "3-1" {
 			t.Errorf("%s: the bus template is not stamped for the run", name)
+		}
+	}
+}
+
+// Past the confirmation the callout's pod template is the same in every
+// phase of the freeze, so the callout is not rolled at each phase while its
+// pods connect.
+func TestTheConfirmedFreezeDoesNotRollTheCalloutPerPhase(t *testing.T) {
+	var first string
+	for _, phase := range []busMigrationPhase{busMigrationSnapshot, busMigrationHashing, busMigrationClearing, busMigrationConverting, busMigrationRestoring, busMigrationRollingBack, busMigrationRollbackRestoring} {
+		a := a2aTestAgent()
+		a.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), RunID: "3-1", Phase: string(phase),
+			Deadline: metav1.NewTime(time.Now().Add(time.Hour)), FreezeConfirmed: true}
+		b, err := json.Marshal(buildA2ACalloutDeployment(a, "pub", 1).Spec.Template)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if first == "" {
+			first = string(b)
+		} else if string(b) != first {
+			t.Errorf("%s: the callout's pod template differs from the freeze's first confirmed phase, so it rolls", phase)
 		}
 	}
 }
@@ -2452,4 +2479,113 @@ func TestTheWayBacksClearIsNotTheForwardOnes(t *testing.T) {
 	}
 	m.clearedAll()
 	m.pass(busMigrationRollingBack, 1)
+}
+
+// A run under way is polled at the migration's interval whichever return
+// the pass takes: a pass that holds the provision Job for the run, or sees
+// the callout map unsettled, returns early, and the run's Jobs and pods wake
+// nothing.
+func TestEveryReconcileReturnPollsAMigrationUnderWay(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	agent := a2aTestAgent()
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(1)}}
+	agent.Status.BusReplicas = 3
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationShrink), RunID: "3-1", Phase: string(busMigrationPinning),
+		StartedAt: metav1.Now(), Deadline: metav1.NewTime(time.Now().Add(time.Hour))}
+	r, _, req := a2aGateTestReconciler(t, agent)
+	r.busStreamState = emptyBusStreams
+	ctx := context.Background()
+	for i := range 3 {
+		res, err := r.Reconcile(ctx, req)
+		if err != nil {
+			t.Fatalf("Reconcile %d: %v", i+1, err)
+		}
+		if i == 0 {
+			continue // the finalizer pass
+		}
+		if res.RequeueAfter <= 0 || res.RequeueAfter > busMigrationRequeueInterval {
+			t.Fatalf("Reconcile %d: RequeueAfter %v, want at most %v with a run under way", i+1, res.RequeueAfter, busMigrationRequeueInterval)
+		}
+	}
+}
+
+// A switch to today removes a run that ended, or was given up, with what it
+// left: its record, its Jobs, ServiceAccounts, run Secret and staging claim.
+// A run under way, or Failed and not given up, is kept whole, record and
+// claim, since the claim can hold the bus's only copy.
+func TestASwitchToTodayRemovesOnlyAnEndedRun(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name    string
+		phase   busMigrationPhase
+		givenUp bool
+		removed bool
+	}{
+		{"done", busMigrationDone, false, true},
+		{"abandoned", busMigrationAbandoned, false, true},
+		{"failed, given up", busMigrationFailed, true, true},
+		{"failed", busMigrationFailed, false, false},
+		{"under way", busMigrationRestoring, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newMigrationRig(t, busMigrationGrow, tc.phase, 1, time.Now().Add(time.Hour))
+			run := m.agent.Status.BusMigration
+			run.GivenUp = tc.givenUp
+			owned := func(o client.Object) client.Object {
+				o.SetOwnerReferences([]metav1.OwnerReference{*metav1.NewControllerRef(m.agent, agentv1alpha1.GroupVersion.WithKind("PlatformAgent"))})
+				return o
+			}
+			left := []client.Object{
+				owned(&batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkName(m.agent, run, "pin"), Namespace: m.agent.Namespace}}),
+				owned(&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkloadName(m.agent, busMigrationStreamIdentity, run.RunID), Namespace: m.agent.Namespace}}),
+				owned(&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: busMigrationRunSecret(m.agent, run.RunID), Namespace: m.agent.Namespace}}),
+				owned(&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: busMigrationStageClaim(m.agent, run.RunID), Namespace: m.agent.Namespace}}),
+			}
+			for _, o := range left {
+				if err := m.cl.Create(ctx, o); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := m.r.busMigrationTornDown(ctx, m.agent); err != nil {
+				t.Fatal(err)
+			}
+			if got := m.agent.Status.BusMigration == nil; got != tc.removed {
+				t.Errorf("record removed %v, want %v", got, tc.removed)
+			}
+			claim := &corev1.PersistentVolumeClaim{}
+			kept := m.cl.Get(ctx, client.ObjectKey{Namespace: m.agent.Namespace, Name: busMigrationStageClaim(m.agent, run.RunID)}, claim) == nil
+			if kept == tc.removed {
+				t.Errorf("staging claim kept %v, want %v", kept, !tc.removed)
+			}
+			if tc.removed {
+				for _, o := range left {
+					if err := m.cl.Get(ctx, client.ObjectKeyFromObject(o), o); err == nil {
+						t.Errorf("%T %s survived the switch", o, o.GetName())
+					}
+				}
+			}
+		})
+	}
+}
+
+// The pass that tears the A2A stack down on a switch to today writes the
+// removed record, so a switch back to next starts with none.
+func TestTheTodayPassWritesTheRemovedRecord(t *testing.T) {
+	agent := a2aTestAgent()
+	agent.Spec.Mode = ptr.To("today")
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), RunID: "124-1", Phase: string(busMigrationDone)}
+	r, cl, req := a2aGateTestReconciler(t, agent)
+	ctx := context.Background()
+	for i := range 2 {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d: %v", i+1, err)
+		}
+	}
+	got := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.BusMigration != nil {
+		t.Errorf("status.busMigration after the switch to today: %+v, want none", got.Status.BusMigration)
+	}
 }
