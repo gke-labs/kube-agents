@@ -25,6 +25,7 @@ import functools
 import json
 import re
 import shlex
+import subprocess
 import sys
 import unittest
 from dataclasses import dataclass, field
@@ -847,6 +848,20 @@ def site_pages() -> list[Path]:
 
 _HELM_DIRECTIVE = re.compile(r"^\s*\{\{-?.*-?\}\}\s*$")
 
+# A rendered chart, for the assertions a text read of a template cannot make:
+# `helm_documents` drops every template line, so a `range` collapses to one
+# object and rules that arrive through an `include` vanish. The release name
+# and namespace are the install defaults; the three harness values are the
+# ones the chart's schema requires before it renders at all.
+HELM_CHART_DIR = "charts/kube-agents"
+HELM_RELEASE_NAME = "kube-agents"
+HELM_RENDER_NAMESPACE = "kubeagents-system"
+HELM_REQUIRED_SETS = (
+    "platformAgent.harness.clusterName=ci-cluster",
+    "platformAgent.harness.location=us-central1",
+    "platformAgent.harness.projectId=ci-project",
+)
+
 
 @functools.lru_cache(maxsize=None)
 def yaml_documents(name: str) -> tuple[dict, ...]:
@@ -902,6 +917,27 @@ def helm_documents(name: str) -> tuple[dict, ...]:
     )
     body = _HELM_EXPRESSION.sub(HELM_PLACEHOLDER, body)
     return tuple(d for d in yaml.safe_load_all(body) if isinstance(d, dict))
+
+
+@functools.lru_cache(maxsize=None)
+def helm_rendered(*sets: str) -> tuple[dict, ...]:
+    """Every object `helm template` renders for the chart, with `sets` as extra `--set` values.
+
+    The rendered form, where the text reader above cannot see: a Role rendered
+    once per namespace from a `range`, or rules that come through an `include`.
+    Raises rather than returning () when helm is missing or refuses the values,
+    so a test asserting on the render never passes on nothing.
+    """
+    command = ["helm", "template", HELM_RELEASE_NAME, str(REPO_ROOT / HELM_CHART_DIR), "-n", HELM_RENDER_NAMESPACE]
+    for value in (*HELM_REQUIRED_SETS, *sets):
+        command += ["--set", value]
+    proc = subprocess.run(command, capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        raise AssertionError(f"helm template failed ({proc.returncode}): {proc.stderr.strip()}")
+    documents = tuple(d for d in yaml.safe_load_all(proc.stdout) if isinstance(d, dict))
+    if not documents:
+        raise AssertionError("helm template rendered no object; the chart is empty or the values gate everything off")
+    return documents
 
 
 def golden_documents() -> dict[str, tuple[dict, ...]]:
