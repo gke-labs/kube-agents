@@ -862,6 +862,7 @@ API_LANE_EXCLUDED = [
     "chat-stop-during-card-wait-a2a-door",  # #5407: the harness cancels through the A2A door, which only the next lane turns on
     "chat-question-asked-to-choose-pauses",  # #4004: grades the question only the inject lane's board read folds in
     "chat-reply-under-pushed-report",  # #4059: the harness stores the report and sends the reply through the door
+    "session-delegates-to-the-profile-asked-for",  # #5191: delegated_to reads the inject read route
 ]
 
 

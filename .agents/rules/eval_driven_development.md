@@ -79,7 +79,7 @@ export BENCH_TF_ROOT=./tf
 export GCP_PROJECT_ID="$PROJECT_ID"   # the judge: Vertex AI through your gcloud ADC, as in CI
 PLATFORM_AGENT_TOKEN=$(kubectl --context "$AGENT_CLUSTER_CONTEXT" get secret platform-agent-secrets \
   -n kubeagents-system -o jsonpath='{.data.API_SERVER_KEY}' | base64 --decode) \
-  JUDGE_PROVIDER=google JUDGE_MODEL=gemini-3.1-pro-preview \
+  JUDGE_PROVIDER=google JUDGE_MODEL=<judge model> \
   uv run devops-bench ./tasks/<id> --agent-type kubeagents
 ```
 

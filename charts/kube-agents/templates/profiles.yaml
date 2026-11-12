@@ -47,7 +47,7 @@ with the target named per task by the project, location and cluster
 parameters. Its persona is agents/cluster/persona, published as the
 persona-cluster image, and its worker pods come from the profile dispatcher,
 so no pod runs it until the dispatcher, the worker and the pool land (#4148,
-#4483, #4484) and the operator runs them (A2A_DISPATCHER_IMAGE). The parameters
+#4483, #4484) and the operator runs them (on by default; operator.profileDispatcher). The parameters
 are the persona's own (agents/cluster/persona/persona.yaml), in its order, and
 not values: the design has the worker refuse a task when the two lists differ
 (docs/designs/spec-subagent-profiles.md), and tests/test_optional_profiles.py
