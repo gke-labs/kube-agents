@@ -842,10 +842,13 @@ func renderManagedEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agentPlugins
 	// would hand it a declaration it authored; with it, save_env_value refuses the key
 	// and the ConfigMap stays the only answer to "what is declared".
 	add(scopeFileEnvKey, scopeDir+"/"+scopeFileName)
-	// The resolved scope's path, pinned for the same reason, under mode next only
-	// (the scope publisher's ConfigMap exists only there; #5621).
+	// The resolved scope's path, pinned for the same reason (#5621): under mode next to
+	// the mounted ConfigMap, and empty elsewhere, since an absent key is one the agent
+	// may write and the publisher's ConfigMap exists only under next.
 	if scopePublisherRendered(agent) {
 		add(resolvedScopeFileEnvKey, resolvedScopeDir+"/"+scopeResolvedDataKey)
+	} else {
+		add(resolvedScopeFileEnvKey, "")
 	}
 
 	// RECONCILE_PROJECT, pinned empty. The reconcile reads it as the management project

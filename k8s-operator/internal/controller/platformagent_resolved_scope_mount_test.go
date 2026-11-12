@@ -5,8 +5,6 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/utils/ptr"
-
-	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
 func resolvedScopeVolume(vols []corev1.Volume) *corev1.Volume {
@@ -71,11 +69,17 @@ func TestATodayInstallGetsNoResolvedScope(t *testing.T) {
 		t.Error("a today install mounts the resolved scope")
 	}
 	gateway := containerNamed(t, dep, "platform-agent")
-	if _, ok := envValue(gateway, resolvedScopeFileEnvKey); ok {
-		t.Errorf("a today install sets %s", resolvedScopeFileEnvKey)
+	for _, m := range gateway.VolumeMounts {
+		if m.Name == resolvedScopeVolumeName || m.MountPath == resolvedScopeDir {
+			t.Errorf("a today install mounts %+v", m)
+		}
 	}
-	if _, ok := managedEnvValue(renderManagedEnv(agent), resolvedScopeFileEnvKey); ok {
-		t.Errorf("a today install pins %s", resolvedScopeFileEnvKey)
+	if _, ok := envValue(gateway, resolvedScopeFileEnvKey); ok {
+		t.Errorf("a today install sets %s in the container env", resolvedScopeFileEnvKey)
+	}
+	// Pinned empty, not left out: an absent key is one the agent may write.
+	if got, ok := managedEnvValue(renderManagedEnv(agent), resolvedScopeFileEnvKey); !ok || got != "" {
+		t.Errorf("a today install pins %s = %q (set %v); want it pinned empty", resolvedScopeFileEnvKey, got, ok)
 	}
 }
 
@@ -85,7 +89,16 @@ func TestTheSandboxGetsNoResolvedScope(t *testing.T) {
 	agent := a2aTestAgent()
 	sts := buildShellSandboxStatefulSet(agent, "sandbox-ssh", "", "settings-hash")
 	if resolvedScopeVolume(sts.Spec.Template.Spec.Volumes) != nil {
-		t.Error("the shell sandbox mounts the resolved scope")
+		t.Error("the shell sandbox has the resolved scope's volume")
 	}
-	var _ agentv1alpha1.PlatformAgent
+	for _, c := range append(sts.Spec.Template.Spec.InitContainers, sts.Spec.Template.Spec.Containers...) {
+		for _, m := range c.VolumeMounts {
+			if m.Name == resolvedScopeVolumeName || m.MountPath == resolvedScopeDir {
+				t.Errorf("sandbox container %s mounts %+v", c.Name, m)
+			}
+		}
+		if _, ok := envValue(c, resolvedScopeFileEnvKey); ok {
+			t.Errorf("sandbox container %s sets %s", c.Name, resolvedScopeFileEnvKey)
+		}
+	}
 }
