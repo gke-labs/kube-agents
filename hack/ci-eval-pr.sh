@@ -3062,8 +3062,8 @@ export JUDGE_PROVIDER="google"
 # distinct judge model is blocked on one
 # fact this repository cannot prove: that kube-agents-gemini-api-key serves a
 # second model. The tree says it should -- the chart's default for the same
-# GEMINI_API_KEY family is gemini-3.5-flash (charts/kube-agents/templates/
-# litellm.yaml, docs/site .../inference-gateway.md) -- so the switch is one
+# GEMINI_API_KEY family is gemini-3.8-flash (charts/kube-agents/templates/
+# _helpers.tpl, docs/site .../inference-gateway.md) -- so the switch is one
 # verified run away: confirm the key against the candidate model, then set
 # JUDGE_MODEL_OVERRIDE in the Prow job env (or flip the default here) without
 # touching the agent line.

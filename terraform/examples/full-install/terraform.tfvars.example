@@ -154,7 +154,7 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # from a location that serves it. Set a region for a data-residency requirement,
 # or for a Model Garden partner model served only from specific regions.
 # model_provider     = "vertex_ai"
-# model_default_name = "gemini-3.5-flash"
+# model_default_name = "gemini-3.8-flash"
 # vertex_project_id  = ""
 # vertex_location    = ""
 # false when vertex_project_id is a project you cannot administer: you enable the

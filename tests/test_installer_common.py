@@ -3567,6 +3567,18 @@ class InstallDefaultsFileTest(unittest.TestCase):
         self.assertIsNotNone(table, "_helpers.tpl no longer declares $defaultModels")
         chart_models = dict(re.findall(r'"(\w+)" "([^"]+)"', table.group(1)))
         self.assertEqual(chart_models, defaults)
+        # Two more copies of the Gemini default: the operator's providers file,
+        # which the admin console shows, and the web console's fallback.
+        providers = json.loads(
+            (_REPO_ROOT / "k8s-operator" / "config" / "integrations" / "litellm" / "providers.json").read_text()
+        )["providers"]
+        for provider in providers:
+            if provider["id"] in ("gemini", "vertex_ai"):
+                self.assertEqual(provider["defaultModel"], defaults[provider["id"]], provider["id"])
+        console = (_REPO_ROOT / "a2a" / "cmd" / "web-console" / "models.go").read_text()
+        fallback = re.search(r'defaultGeminiModel = "([^"]+)"', console)
+        self.assertIsNotNone(fallback, "models.go no longer declares defaultGeminiModel")
+        self.assertEqual(fallback.group(1), defaults["gemini"])
 
     def test_the_state_location_derives_from_the_defaults(self):
         """installer_common.sh and lifecycle.sh both derive the bucket and the
