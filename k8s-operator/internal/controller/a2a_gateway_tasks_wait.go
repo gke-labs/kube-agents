@@ -39,8 +39,8 @@ import (
 // rather than exiting: its pod reads not ready (the readinessProbe on
 // /readyz is the relay bind and nothing else). The gateway is leader-elected
 // and only the leader binds, so with two replicas the standby reads Ready
-// while the leader waits, and the CR reads Ready over a gateway relaying
-// nothing (whether Ready should follow the leader is #5593). Once
+// while the leader waits. Ready follows the leader rather than the standby
+// (a2aGatewayReadyByLeader); this reason says why the leader waits. Once
 // BusProvisioned is True the Job has created the stream, so a leader still
 // waiting is not seeing a stream that exists, or one that was lost since:
 // its NATS identity lands in another account, its credentials are wrong, or

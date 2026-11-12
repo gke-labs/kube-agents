@@ -1480,6 +1480,11 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if credentialProxyExecShort(instance) {
 			requeue = min(requeue, credentialProxyExecShortRequeue)
 		}
+		// And the status pass's own: the TASKS wait's threshold and the A2A
+		// gateway leader's grace or recheck, which no event announces.
+		if tasksWaitRequeue > 0 {
+			requeue = min(requeue, tasksWaitRequeue)
+		}
 		return ctrl.Result{RequeueAfter: requeue}, nil
 	}
 

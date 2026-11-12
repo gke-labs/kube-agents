@@ -34,8 +34,8 @@ const (
 	// up to this long.
 	a2aGatewayLeaderReadyGrace = 30 * time.Second
 	// a2aGatewayLeaseSkew is added to the Lease's duration before its holder
-	// counts as stale: renewTime is the gateway pod's clock, compared here
-	// with the operator's.
+	// counts as stale, and to the grace: renewTime and acquireTime are the
+	// gateway pod's clock, compared here with the operator's.
 	a2aGatewayLeaseSkew = 2 * time.Second
 	// a2aGatewayLeaderRecheck is how soon a pass that followed a not-ready
 	// leader comes back when the Lease says nothing sooner. Lease updates
@@ -76,8 +76,12 @@ func (r *PlatformAgentReconciler) a2aGatewayReadyByLeader(ctx context.Context, a
 	if leader == nil || leader.Ready || a2aGatewayLeaderStale(leader, now) {
 		return ready, "", 0
 	}
-	if left := leader.AcquiredAt.Add(a2aGatewayLeaderReadyGrace).Sub(now); left > 0 {
-		return ready, "", left
+	// The grace runs from acquireTime, the gateway's clock, with the same
+	// skew margin; a Lease without one gives no grace to wait out.
+	if !leader.AcquiredAt.IsZero() {
+		if left := leader.AcquiredAt.Add(a2aGatewayLeaderReadyGrace + a2aGatewayLeaseSkew).Sub(now); left > 0 {
+			return ready, "", left
+		}
 	}
 	recheck := a2aGatewayLeaderRecheck
 	if !leader.RenewedAt.IsZero() && leader.LeaseDuration > 0 {
