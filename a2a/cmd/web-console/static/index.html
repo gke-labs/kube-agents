@@ -8959,6 +8959,16 @@
           lines.push(
             `- Model: ${model.name}${model.provider ? ` via ${model.provider}` : ""}`,
           );
+        // The enabled chat interfaces, off status.usage.activeInterfaces as
+        // GET /api/environment copies and sorts it: the gateway's block
+        // prints them in its environment section, so they sit with the
+        // versions here, not in the Agent usage section below.
+        const interfaces =
+          env.usage && env.usage.fields
+            ? env.usage.fields.activeInterfaces
+            : undefined;
+        if (Array.isArray(interfaces))
+          lines.push(`- Chat interfaces: ${interfaces.join(", ") || "none"}`);
         const consoleBuild =
           [
             v.image_tag && `image ${v.image_tag}`,
@@ -9017,9 +9027,9 @@
         // The PlatformAgent's status.usage block as GET /api/environment
         // renders it: the usage, tools and performance lines of the block
         // "/feedback summary" prints in chat. Counters, proposal origins, the
-        // broker's tool vocabulary, totals, the interface words and the two
-        // last-active timestamps; the server copies nothing else off the
-        // status.
+        // broker's tool vocabulary, totals and the two last-active timestamps;
+        // the interface words are the Chat interfaces line above, and the
+        // server copies nothing else off the status.
         if (
           env.usage &&
           Array.isArray(env.usage.lines) &&
@@ -9027,7 +9037,7 @@
         ) {
           lines.push("");
           lines.push(
-            "**Agent usage** (PlatformAgent status: counters, proposal origins, tool vocabulary, totals, interfaces and last-active times; no names)",
+            "**Agent usage** (PlatformAgent status: counters, proposal origins, tool vocabulary, totals and last-active times; no names)",
           );
           lines.push("```");
           lines.push(...env.usage.lines);

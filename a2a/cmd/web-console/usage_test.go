@@ -230,3 +230,20 @@ func TestUsageTotalsOfReadsThePresentTotals(t *testing.T) {
 		t.Error("nil fields have no totals")
 	}
 }
+
+// The page is the reader of what GET /api/environment carries for a bug
+// report: the rendered lines go into the Agent usage section and the sorted
+// interface words into the Chat interfaces line beside the versions. Without
+// the second read the response would carry activeInterfaces and no report
+// would show it.
+func TestThePageAttachesTheUsageLinesAndTheInterfaces(t *testing.T) {
+	page, err := staticFS.ReadFile("static/index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, read := range []string{"...env.usage.lines", "env.usage.fields.activeInterfaces", "- Chat interfaces: "} {
+		if !strings.Contains(string(page), read) {
+			t.Errorf("the page does not read %q", read)
+		}
+	}
+}
