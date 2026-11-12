@@ -61,6 +61,7 @@ import os
 import re
 import tempfile
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -244,17 +245,53 @@ def read_track_record() -> dict | None:
     return record
 
 
+_REPO_SEGMENT = re.compile(r"[A-Za-z0-9_.-]+")
+_SCP_REMOTE = re.compile(r"^(?:[^/@]+@)?(?P<host>[^/:]+):(?P<path>.+)$")
+_GITHUB_HOSTS = frozenset({"github.com", "www.github.com", "ssh.github.com"})
+_KNOWN_HOSTS = frozenset({"github.com", "gitlab.com", "bitbucket.org"})
+
+
 def repo_key(url: Any) -> str:
-    """``clean_merges.repo_key``: host and path, lower-case, no scheme, user, ``.git`` or trailing slash.
+    """``clean_merges.repo_key``: ``host/path`` lower-case, parsed as ``repo_ref.parse`` does.
 
     Copied rather than imported, since the gateway does not carry the agent's
-    scripts; a test pins the two together.
+    scripts; a test pins the two together. ``""`` for anything with no host,
+    fewer than two path segments, or an unsafe segment.
     """
-    text = str(url or "").strip().lower()
-    text = re.sub(r"^[a-z+]+://", "", text)
-    if "@" in text.split("/", 1)[0]:
-        text = text.split("@", 1)[1].replace(":", "/", 1)
-    return re.sub(r"(\.git)?/*$", "", text)
+    if not isinstance(url, str):
+        return ""
+    text = url.strip()
+    if not text or len(text) > 256:
+        return ""
+    if "://" in text:
+        try:
+            split = urllib.parse.urlsplit(text)
+            host, path = (split.hostname or ""), split.path
+        except ValueError:
+            return ""
+        if not host:
+            return ""
+    else:
+        scp = _SCP_REMOTE.match(text)
+        host, path = (scp.group("host"), scp.group("path")) if scp else ("", text)
+    path = path.strip("/")
+    name = path[:-4] if path.endswith(".git") else path
+    if name != path and name and not name.endswith("/"):
+        path = name
+    path = path.strip("/")
+    if not host and "/" in path:
+        first, _, rest = path.partition("/")
+        rest = rest.strip("/")
+        if first.lower() in _KNOWN_HOSTS and rest:
+            host, path = first, rest
+    segments = path.split("/")
+    if not host or len(segments) < 2 or not all(
+        _REPO_SEGMENT.fullmatch(s) and s not in (".", "..", ".git") and not s.startswith("-")
+        for s in segments
+    ):
+        return ""
+    host = host.lower()
+    return f"{'github.com' if host in _GITHUB_HOSTS else host}/{path}".lower()
 
 
 def short_repo(repo: str) -> str:

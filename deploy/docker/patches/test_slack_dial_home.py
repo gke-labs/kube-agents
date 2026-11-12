@@ -319,7 +319,10 @@ class RuntimeTest(unittest.TestCase):
             import clean_merges
         finally:
             sys.path.remove(str(scripts))
-        for url in (REPO, REPO + ".git/", "git@github.com:Org/infra.git", "ssh://git@github.com/org/infra", "  HTTPS://x/y  "):
+        for url in (REPO, REPO + ".git/", "git@github.com:Org/infra.git", "ssh://git@github.com/org/infra", "  HTTPS://x/y  ",
+                    "https://www.github.com:443/Org/infra/", "github.com/org/infra", "gitlab.com/g/sub/p.git",
+                    "https://github.com/org/..", "https://github.com/org", "file:///github.com/o/r",
+                    "https://[::1/x", "org/infra", "", None, 7, "https://ghe.example/a/b.git"):
             with self.subTest(url=url):
                 self.assertEqual(dial.repo_key(url), clean_merges.repo_key(url))
 
