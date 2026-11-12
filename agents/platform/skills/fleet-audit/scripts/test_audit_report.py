@@ -32945,24 +32945,28 @@ class TestNoForge(BaseTestCase):
 
     def test_a_later_start_while_this_run_publishes_does_not_stamp_its_envelope(self):
         """#4268: `finish` reads its run's start before its checks. A later
-        `start` that rewrites the run record before the envelope is built
-        leaves the envelope with this run's own start."""
+        `start` that rewrites the run record as soon as `findings_predate_run`
+        has passed leaves the envelope with this run's own start, so a read
+        placed anywhere after that check fails here."""
         self.start()
         record = Path(audit_report.run_record_path_for(AUDIT))
         own = json.loads(record.read_text())[audit_report.RUN_RECORD_STARTED_KEY]
-        real = audit_report.report_envelope
+        real = audit_report.findings_predate_run
 
-        def next_start_lands_first(*args, **kwargs):
+        def next_start_lands_after_the_check(*args, **kwargs):
+            stale_since = real(*args, **kwargs)
             data = json.loads(record.read_text())
             data[audit_report.RUN_RECORD_STARTED_KEY] = "2099-01-01T00:00:00Z"
             record.write_text(json.dumps(data))
-            return real(*args, **kwargs)
+            return stale_since
 
-        self.patch_attr("report_envelope", next_start_lands_first)
+        self.patch_attr("findings_predate_run", next_start_lands_after_the_check)
         path = audit_report.findings_path_for(AUDIT)
         Path(path).write_text(json.dumps(make_doc(findings=THREE_SEVERITIES)), encoding="utf-8")
         self.assertEqual(self.run_main(["finish", "--audit", AUDIT, "--findings-file", path, "--scheduled"]), 0, self.err)
 
+        later = json.loads(record.read_text())[audit_report.RUN_RECORD_STARTED_KEY]
+        self.assertEqual(later, "2099-01-01T00:00:00Z", "the later start did not land")
         latest = json.loads((self.store() / "latest.json").read_text())
         self.assertEqual(
             latest[audit_report.ENVELOPE_STARTED_KEY],
