@@ -92,6 +92,20 @@ def duplicate_problems(entries: list[tuple[str, dict]]) -> list[str]:
     return problems
 
 
+def duplicate_rows(text: str) -> list[str]:
+    """A job ID in the first cell of two rows, across the inventory's tables: one
+    would otherwise hide the other from both checks."""
+    seen: set[str] = set()
+    problems = []
+    for line in text.splitlines():
+        match = ROW.match(line)
+        if match and match.group(1) in seen:
+            problems.append(f"{INVENTORY} has two rows for `{match.group(1)}`: keep one (a job moving tables moves its row)")
+        elif match:
+            seen.add(match.group(1))
+    return problems
+
+
 def inventory_rows(text: str) -> dict[str, str]:
     """Each inventory row's text, by the job ID in its first cell."""
     rows: dict[str, str] = {}
@@ -130,7 +144,7 @@ def check(root: Path, base: str | None) -> list[str]:
     head_jobs = read_rosters(root)
     head_text = _read(root / INVENTORY) or ""
     head_rows = inventory_rows(head_text)
-    problems = duplicate_problems(entries) + static_problems(head_jobs, head_rows)
+    problems = duplicate_problems(entries) + duplicate_rows(head_text) + static_problems(head_jobs, head_rows)
     if base:
         try:
             merge_base = _git(root, "merge-base", base, "HEAD").strip()

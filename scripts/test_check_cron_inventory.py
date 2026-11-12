@@ -87,6 +87,15 @@ class RobustnessTest(unittest.TestCase):
         repo.write(roster(job("a")), roster(job("a", "1 1 * * *")), inventory(("a", "x")))
         self.assertTrue(any("`a`" in p and "twice" in p for p in cci.check(repo.root, None)))
 
+    def test_a_job_with_two_inventory_rows_fails(self):
+        # A row copied with its ID unchanged, or left behind when a job moved tables.
+        repo = Repo(self)
+        inv = inventory(("a", "x")) + "\n| Job | Schedule |\n| --- | --- |\n| `a` | stale |\n"
+        repo.write(roster(job("a")), roster(), inv)
+        repo.commit()
+        problems = cci.check(repo.root, None)
+        self.assertTrue(any("`a`" in p and "two rows" in p for p in problems), problems)
+
     def test_no_roster_jobs_at_all_fails(self):
         repo = Repo(self)
         (repo.root / "x").write_text("x")
