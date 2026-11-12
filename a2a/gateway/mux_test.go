@@ -407,3 +407,23 @@ func TestMultiAdapterRestartsOneBackendWhileTheOtherServes(t *testing.T) {
 		t.Errorf("gchat stopped dispatching while slack restarts: %v", err)
 	}
 }
+
+// knownBackendNames is a hand-kept list beside Config.Backends; a backend
+// added there without the map would let OpenDirect hand an unarmed backend's
+// id whole to the primary.
+func TestKnownBackendNamesCoverEveryBackend(t *testing.T) {
+	for _, name := range []string{BackendGchat, BackendSlack, BackendDiscord, BackendConsole} {
+		if !knownBackendNames[name] {
+			t.Errorf("knownBackendNames lacks %q", name)
+		}
+	}
+	all := (&Config{GchatRelayURL: "http://relay", SlackBotToken: "xoxb-1", SlackAppToken: "xapp-1", DiscordToken: "x"}).Backends()
+	if len(all) == 0 {
+		t.Fatal("Backends returned nothing for a config that arms every backend")
+	}
+	for _, name := range all {
+		if !knownBackendNames[name] {
+			t.Errorf("Backends arms %q, which knownBackendNames lacks", name)
+		}
+	}
+}
