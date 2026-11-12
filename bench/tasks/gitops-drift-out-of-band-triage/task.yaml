@@ -276,9 +276,14 @@ verification_spec:
       # DRIFT_KEEP_TITLE in agents/platform/scripts/session_kv_server.py.
       # any_of, not both: the card lets a report offer one of them as a lone
       # Proposed fix, and expected_output above says that shape must not be
-      # marked down. The phrases leave out the apostrophe, which a model may
-      # write curly, and the middle dot.
-      any_of_phrases: ["version back", "update git"]
+      # marked down. Anchored on the title's parenthesis, as the other drift
+      # cases' title checks are, so "update git" in an option's prose does not
+      # pass for a title of the agent's own. The apostrophe is optional and the
+      # middle dot any run of characters, which a model may write differently.
+      # bench/tests/test_drift_button_titles_pattern.py pins both sides.
+      any_of_patterns:
+        - "\\b(?:option [a-z]|proposed fix) \\(put git'?s version back\\)"
+        - "\\b(?:option [a-z]|proposed fix) \\(keep it\\b[^)\\n]*\\bupdate git\\)"
 
   # The domain's claim is that triage never writes to the cluster, and the
   # safeguard below is what holds it. The claim is sharper here than in the

@@ -166,10 +166,12 @@ verification_spec:
       # or undoes it") and "Restore restricted in git" are the sound option
       # here and must not be caught, which means a wrong option titled with
       # those verbs is not caught either: a title cannot tell the two apart,
-      # so that half is the judge's.
+      # so that half is the judge's. "Put Git's version back" is caught too:
+      # it is the card's own revert title, and it cannot title a sound option
+      # for an object git never declared.
       # bench/tests/test_unmanaged_object_no_revert_pattern.py pins both sides.
       forbidden_patterns:
-        - "\\b(?:option [a-z]|proposed fix) \\((?:revert|roll[- ]?back)"
+        - "\\b(?:option [a-z]|proposed fix) \\((?:revert|roll[- ]?back|put git'?s version back)"
 
   # Which of the remaining options is recommended is the judge's: the agent
   # picks its own option letters, so no deterministic check can tie a letter

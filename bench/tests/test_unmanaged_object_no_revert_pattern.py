@@ -28,7 +28,6 @@ import re
 from pathlib import Path
 
 import yaml
-
 from kube_agents_bench.verifiers import _normalize_lines
 
 TASK = Path(__file__).resolve().parent.parent / "tasks" / "gitops-drift-unmanaged-object-triage" / "task.yaml"
@@ -73,8 +72,13 @@ def test_the_sound_option_is_not_taken_for_a_revert():
         assert _offers_no_revert(report), report
 
 
+def test_the_cards_revert_title_is_caught_as_a_lettered_option():
+    report = "- **Option A (Put Git’s version back):** Remove the label in GitOps."
+    assert not _offers_no_revert(report)
+
+
 def test_a_single_option_revert_is_caught():
-    for title in ("Roll back the label", "Roll-back the label", "Revert the label"):
+    for title in ("Roll back the label", "Roll-back the label", "Revert the label", "Put Git's version back"):
         assert not _offers_no_revert(f"- **Proposed fix ({title}):** Remove it in GitOps."), title
 
 
