@@ -3494,9 +3494,12 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		Name:  scopeFileEnvKey,
 		Value: scopeDir + "/" + scopeFileName,
 	})
+	// The resolved scope's path, as the managed .env pins it (empty outside next).
+	resolvedScopeFile := ""
 	if scopePublisherRendered(agent) {
-		envVars = append(envVars, corev1.EnvVar{Name: resolvedScopeFileEnvKey, Value: resolvedScopeDir + "/" + scopeResolvedDataKey})
+		resolvedScopeFile = resolvedScopeDir + "/" + scopeResolvedDataKey
 	}
+	envVars = append(envVars, corev1.EnvVar{Name: resolvedScopeFileEnvKey, Value: resolvedScopeFile})
 	// The managed .env pins RECONCILE_PROJECT empty (renderManagedEnv says why), and the
 	// two renders must agree, so the container env carries the same empty value.
 	envVars = append(envVars, corev1.EnvVar{Name: reconcileProjectEnvKey, Value: ""})

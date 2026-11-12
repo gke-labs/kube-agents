@@ -2196,6 +2196,7 @@ spec:
               value: /etc/hermes
             - name: KUBEAGENTS_SCOPE_FILE
               value: /etc/kube-agents/scope.json
+            - name: KUBEAGENTS_RESOLVED_SCOPE_FILE
             - name: RECONCILE_PROJECT
             - name: HERMES_HOME_MODE
               value: "2770"

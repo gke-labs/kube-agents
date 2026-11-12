@@ -74,8 +74,8 @@ func TestATodayInstallGetsNoResolvedScope(t *testing.T) {
 			t.Errorf("a today install mounts %+v", m)
 		}
 	}
-	if _, ok := envValue(gateway, resolvedScopeFileEnvKey); ok {
-		t.Errorf("a today install sets %s in the container env", resolvedScopeFileEnvKey)
+	if got, ok := envValue(gateway, resolvedScopeFileEnvKey); !ok || got != "" {
+		t.Errorf("a today install's container env has %s = %q (set %v); want it empty, as the managed .env pins it", resolvedScopeFileEnvKey, got, ok)
 	}
 	// Pinned empty, not left out: an absent key is one the agent may write.
 	if got, ok := managedEnvValue(renderManagedEnv(agent), resolvedScopeFileEnvKey); !ok || got != "" {
