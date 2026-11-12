@@ -202,9 +202,11 @@ excludes every slot. devops-bench ignores the key.
 The runner pauses most of the Platform Agent's clock-started audits at lease time and again
 right before the fan-out (`scheduled_audits`, #3020), so their scheduled runs can't write to the GitOps
 repository in the middle of an eval and be charged to whichever cases are running. It leaves the
-four the `oobe` stage starts (the stage holds a paused audit rather than starting it), the
-`no_agent` jobs, and any job the image doesn't ship. Those four still run on their clock, so a
-write from one of them mid-eval is still possible. An audit case starts its own run from its
+`no_agent` jobs and any job the image doesn't ship. The five audits the `oobe` stage starts on a
+fresh install are left until the stage has had its run of each, since the stage holds a paused
+audit rather than starting it; through the fan-out the runner then pauses each one whose run has
+ended, so a clock run after the chain doesn't repeat it. Until then a write from one of them
+mid-eval is still possible. An audit case starts its own run from its
 prompt, which a paused schedule doesn't affect. A pause that still fails after its attempts
 stops the run as an infrastructure failure rather than letting a scheduled audit's writes be
 charged to the cases.

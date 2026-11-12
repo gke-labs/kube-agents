@@ -20,7 +20,8 @@
 # arm.py (beside this file) files two archived stand-in cards, a sweep and a
 # ranking card after it, points `.bootstrap_scan_filed` at the sweep and the
 # hand-off's `.bootstrap_handoff_filed` at the ranking card, removes
-# `.oobe_audits_fired`, and puts back the `oobe` job when the deployed image ships
+# `.oobe_audits_fired`, resumes the audits an eval run paused after the install's own
+# chain (arm.py says why), and puts back the `oobe` job when the deployed image ships
 # one: an install that finished onboarding before the job existed never got it.
 # An image without the job gets nothing put back, so nothing starts the audits.
 #

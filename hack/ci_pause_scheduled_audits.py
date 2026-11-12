@@ -1,9 +1,10 @@
 """Pause the Platform Agent's clock-started audits for an eval run. Runs in the agent container.
 
-Usage: python3 - <home> [--resume] < ci_pause_scheduled_audits.py
+Usage: python3 - <home> [--resume | --chain] < ci_pause_scheduled_audits.py
 
 hack/ci-eval-pr.sh pipes this into the gateway at lease time and again right before
-the fan-out (scheduled_audits pause; the EXIT trap runs scheduled_audits resume). The governance watchdogs fire on the clock between 06:20 and
+the fan-out (scheduled_audits pause), every few minutes through the fan-out with
+`--chain` (scheduled_audits chain), and the EXIT trap runs scheduled_audits resume. The governance watchdogs fire on the clock between 06:20 and
 09:20 UTC, and a run that writes to the GitOps repository mid-eval is charged to
 whichever cases are running when it lands: `no-github-writes-the-case-did-not-request`
 dates a write, it doesn't attribute it (#2611). The 08:00 networking audit's
@@ -24,13 +25,29 @@ by the image's copy of each. Leaves alone:
 - the `no_agent` jobs, which are plumbing (workspace GC, board health, delivery watch)
   and write nothing to the repository;
 - the audits the Chat Agent's `oobe` stage starts on a fresh install
-  (`FIRST_RUN_AUDITS`, read from the image's copy of oobe.py). The stage holds a
-  paused audit rather than starting it, and the oobe cases grade that chain.
+  (`FIRST_RUN_AUDITS`, read from the image's copy of oobe.py) until the stage has had
+  its run of each (below);
 - a job already disabled, which has nothing to pause.
 
-Those four still fire on their clock (06:20, 06:50, Mondays 07:50, 09:20 UTC), and
-their `finish` can open remediation pull requests like any audit's, so a write from
-one of them mid-eval is still possible (#3020 tracks it).
+The stage's five audits are three of the clock's (06:20, 06:50, 09:20 UTC) plus cost
+(Mondays 07:50) and the upgrade retrospective (Sundays 18:00). The stage holds a paused
+audit rather than starting it, since Hermes' `trigger_job` would unpause it, so a
+pause before the stage reaches an audit takes that audit out of the chain the eval
+grades. The stage reads pauses only for audits it has not reached
+(`oobe.py`, `pending`), and a clock run that lands first is adopted rather than
+repeated, so an audit is paused once the stage has fired or adopted it and no run of
+it is due or under way: from then on a clock run would be a second full run that
+nothing grades (#5570). A due mark is left too because a case that triggered the
+job (`hermes cron run`) waits on that run, and a pause before the tick claims it would
+drop it. While the oobe-first-run-audits stack has the stage armed (its state file is
+there), none of the five is paused: the stack's own chain is starting them, and its
+arm.py resumes those this script paused. The state file is read again before each
+pause, so a pause decided before the arm is not made after it.
+
+`--chain` does that for the stage's five alone. It leaves every other job as it finds
+it: a case that triggered one of them (bench/tf/prebuilt/unchanged-manifest-digest)
+pauses it again itself, and a pause here between its mark and the tick's claim would
+drop its run.
 
 Records what it paused in `<home>/.ci-paused-audits.json`, and `--resume` resumes
 exactly those. ci-eval-pr.sh runs the resume from its EXIT trap: a Prow lease's
@@ -47,15 +64,29 @@ unreadable, or Hermes refused a pause).
 import ast
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 
 home = sys.argv[1]
 RESUME = sys.argv[2:] == ["--resume"]
+CHAIN_ONLY = sys.argv[2:] == ["--chain"]
 PROFILE = "platform"
 ROSTER = os.path.join(home, "profiles", PROFILE, "cron", "jobs.json")
+LEDGER = os.path.join(home, "profiles", PROFILE, "cron", "executions.db")
 RECORD = os.path.join(home, ".ci-paused-audits.json")
+# agents/chat/scripts/oobe.py: AUDITS_MARKER, with its `fired` list (adopted runs included)
+# and `current` (the mark awaiting its run).
+STAGE_MARKER = os.path.join(home, ".oobe_audits_fired")
+# bench/tf/prebuilt/oobe-first-run-audits/arm.py writes it; disarm.py removes it.
+STACK_STATE = os.path.join(home, ".bench-oobe.json")
+IN_FLIGHT = ("claimed", "running")
+# hack/ci_platform_runs.py: STALE_SECONDS. A row claimed longer ago is a run a gateway restart
+# cut off, left at running for good.
+STALE_SECONDS = 2 * 60 * 60
+SQLITE_BUSY_TIMEOUT_SECONDS = 10
 # The image's copy, not the volume's: the volume is the agent's to write.
 STAGE_SOURCE = os.environ.get("OOBE_STAGE_SOURCE", "/opt/defaults/scripts/oobe.py")
 STAGE_AUDITS = "FIRST_RUN_AUDITS"
@@ -104,6 +135,64 @@ def paused(job):
     return job.get("state") == PAUSED_STATE or bool(job.get("paused_at"))
 
 
+def armed():
+    return os.path.exists(STACK_STATE)
+
+
+def stamp(value):
+    """An ISO timestamp as an aware datetime, None when it does not parse (ci_platform_runs.stamp)."""
+    try:
+        when = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    return when.astimezone() if when.tzinfo is None else when
+
+
+def stage_finished(stage, jobs):
+    """The stage's audits it has had its run of, with none due or under way now.
+
+    Fired (adopted runs included) and, while the stage is under way, not the mark awaiting its run; no run claimed or
+    running younger than STALE_SECONDS; and not marked due and unclaimed, whoever marked
+    it. Raises on a marker or ledger it cannot read, which the caller takes as none.
+    """
+    try:
+        with open(STAGE_MARKER, encoding="utf-8") as fh:
+            state = json.load(fh)
+    except FileNotFoundError:
+        return set()
+    fired = {str(audit) for audit in state.get("fired", [])} & stage
+    # A done stage leaves `current` on its last audit, whose run is long over.
+    if not state.get("done"):
+        fired.discard((state.get("current") or {}).get("job"))
+    if not fired:
+        return set()
+    now = datetime.now(timezone.utc)
+    by_id = {job["id"]: job for job in jobs}
+    due = set()
+    for jid in fired:
+        job = by_id.get(jid, {})
+        if paused(job) or not job.get("enabled", True):
+            continue
+        next_run = job.get("next_run_at")
+        if isinstance(next_run, str) and next_run and ((when := stamp(next_run)) is None or when <= now):
+            due.add(jid)
+    going = set()
+    if os.path.exists(LEDGER):
+        since = now - timedelta(seconds=STALE_SECONDS)
+        ids = sorted(fired)
+        conn = sqlite3.connect(f"file:{LEDGER}?mode=ro", uri=True, timeout=SQLITE_BUSY_TIMEOUT_SECONDS)
+        try:
+            rows = conn.execute(
+                f"SELECT job_id, claimed_at FROM executions WHERE job_id IN ({','.join('?' * len(ids))})"
+                f" AND status IN ({','.join('?' * len(IN_FLIGHT))})",
+                (*ids, *IN_FLIGHT),
+            ).fetchall()
+        finally:
+            conn.close()
+        going = {str(jid) for jid, claimed in rows if (when := stamp(claimed)) is None or when >= since}
+    return fired - due - going
+
+
 def hermes(action, jid):
     """One `hermes cron <action>`; returns (retryable, failure line) or (False, None)."""
     try:
@@ -144,16 +233,27 @@ def pause():
     except (OSError, ValueError, SyntaxError) as exc:
         print(f"nothing paused: {exc}")
         return DECIDED
+    stage_armed = armed()
+    unread = ""
+    try:
+        finished = set() if stage_armed else stage_finished(held_by_stage, jobs)
+    except (OSError, ValueError, TypeError, AttributeError, sqlite3.Error) as exc:
+        # Unread is unfinished: a pause the stage then holds would cost the chain an audit.
+        finished, unread = set(), f": {exc}"
     targets, left = [], []
     for job in jobs:
         jid = job["id"]
+        if CHAIN_ONLY and jid not in held_by_stage:
+            continue
         if jid not in shipped:
             left.append(f"{jid} (not shipped)")
             continue
         if shipped[jid].get("no_agent"):
             continue
-        if jid in held_by_stage:
-            left.append(f"{jid} (oobe stage)")
+        if jid in held_by_stage and stage_armed:
+            left.append(f"{jid} (oobe stage armed)")
+        elif jid in held_by_stage and not paused(job) and jid not in finished:
+            left.append(f"{jid} (oobe stage{unread})")
         elif paused(job):
             left.append(f"{jid} (already paused)")
         elif not job.get("enabled", True):
@@ -181,12 +281,20 @@ def pause():
     # stale copy lands after the first clean read is caught by the second, and
     # what it dropped is paused again. A clean read on the last round stands.
     failed, failed_ids, retryable = [], set(), False
+    dropped = []
     pending = list(targets)
     clean_reads = 0
     for round_no in range(PAUSE_ROUNDS):
         if round_no:
             time.sleep(PAUSE_ROUND_SLEEP_SECONDS)
         for jid in pending:
+            # The stack can arm between the decision and here; its chain needs the five
+            # runnable, so a stage audit not yet paused is left from then on.
+            if jid in held_by_stage and armed():
+                if jid not in dropped:
+                    dropped.append(jid)
+                    left.append(f"{jid} (oobe stage armed)")
+                continue
             again, failure = hermes("pause", jid)
             retryable |= again
             if failure and jid not in failed_ids:
@@ -197,7 +305,9 @@ def pause():
         except (OSError, ValueError) as exc:
             print(f"asked to pause {', '.join(targets) or 'nothing'}, but the roster could not be read back: {exc}")
             return RETRY
-        pending = [jid for jid in targets if not paused(after.get(jid, {})) and jid not in failed_ids]
+        pending = [
+            jid for jid in targets if not paused(after.get(jid, {})) and jid not in failed_ids and jid not in dropped
+        ]
         clean_reads = clean_reads + 1 if not pending else 0
         if clean_reads == 2 or not targets:
             break

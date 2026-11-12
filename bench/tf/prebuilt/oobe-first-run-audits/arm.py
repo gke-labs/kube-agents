@@ -26,12 +26,24 @@ nothing starts the audits, which is the case's red.
 
 The state file is written first and after every change, so the disarm restores what
 this run changed even when it stopped part-way.
+
+An eval run pauses each first-run audit once the install's own chain has had its run of
+it (hack/ci_pause_scheduled_audits.py), and the stage skips a paused audit, so the arm
+resumes the ones that script recorded pausing. Those alone: an operator's pause on a
+long-lived install stays. The script leaves the five alone while the state file is
+there, but a pause it decided before the file appeared can still land, within one
+Hermes call, so the arm reads them again after RESUME_SETTLE_SECONDS and resumes any
+it finds paused. The stage reaches its second audit only after the first one's run has
+ended, minutes later. Nothing pauses them again here: the script does, once this chain
+has had its run of each.
 """
 
+import ast
 import json
 import os
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 
 from cron.jobs import _jobs_lock, compute_next_run, is_job_runnable, load_jobs, save_jobs
@@ -48,6 +60,16 @@ JOB_ID = "oobe"
 RANKING_KEY = "bootstrap-inventory-prioritize-oobe-eval-" + run
 SWEEP_KEY = "oobe-eval-sweep-" + run
 TMP_SUFFIX = ".tmp"
+# hack/ci_pause_scheduled_audits.py: RECORD, the ids it paused.
+CI_PAUSED = os.path.join(home, ".ci-paused-audits.json")
+PLATFORM = "platform"
+PLATFORM_ROSTER = os.path.join(home, "profiles", PLATFORM, "cron", "jobs.json")
+# The image's copy of the stage, read as that script reads it.
+STAGE_SOURCE = os.environ.get("OOBE_STAGE_SOURCE", "/opt/defaults/scripts/oobe.py")
+STAGE_AUDITS = "FIRST_RUN_AUDITS"
+# Past that script's HERMES_TIMEOUT_SECONDS (30), the longest one pause call it made can take.
+RESUME_SETTLE_SECONDS = int(os.environ.get("OOBE_ARM_RESUME_SETTLE_SECONDS", "35"))
+PAUSED_STATE = "paused"
 
 
 def read(path):
@@ -85,6 +107,44 @@ def archived_card(state, key, title):
     return card
 
 
+def ci_paused_stage_audits():
+    """The stage's audits the eval run recorded pausing that the Platform roster shows paused."""
+    try:
+        with open(CI_PAUSED, encoding="utf-8") as fh:
+            recorded = {str(jid) for jid in json.load(fh)}
+    except FileNotFoundError:
+        return []
+    tree = ast.parse(open(STAGE_SOURCE, encoding="utf-8").read())
+    stage = next(
+        (ast.literal_eval(node.value) for node in tree.body
+         if isinstance(node, ast.Assign) and any(getattr(t, "id", "") == STAGE_AUDITS for t in node.targets)),
+        None,
+    )
+    if stage is None:
+        raise ValueError(f"{STAGE_SOURCE} names no {STAGE_AUDITS}")
+    with open(PLATFORM_ROSTER, encoding="utf-8") as fh:
+        stored = json.load(fh)
+    jobs = {str(j.get("id")): j for j in (stored.get("jobs", []) if isinstance(stored, dict) else stored)}
+    return [
+        jid for jid in stage
+        if jid in recorded and (jobs.get(jid, {}).get("state") == PAUSED_STATE or jobs.get(jid, {}).get("paused_at"))
+    ]
+
+
+def resume_ci_paused(state):
+    try:
+        held = ci_paused_stage_audits()
+    except (OSError, ValueError, SyntaxError) as exc:
+        sys.exit(f"could not read which first-run audits the eval run paused: {exc}")
+    for jid in held:
+        done = subprocess.run([hermes, "-p", PLATFORM, "cron", "resume", jid], capture_output=True, text=True)
+        if done.returncode != 0:
+            sys.exit(f"could not resume {jid}, which the eval run paused: {(done.stderr or done.stdout).strip()}")
+        state["resumed"].append(jid)
+        save(state)
+    return held
+
+
 def shipped_job():
     with open(SHIPPED_JOBS, encoding="utf-8") as fh:
         jobs = json.load(fh).get("jobs", [])
@@ -110,8 +170,10 @@ state = {
     # disarm puts this record back if it did.
     "job_present": None,
     "cards": [],
+    "resumed": [],
 }
 save(state)
+resumed = resume_ci_paused(state)
 
 sweep = archived_card(state, SWEEP_KEY, "oobe eval: stand-in onboarding sweep")
 ranking = archived_card(state, RANKING_KEY, "oobe eval: stand-in onboarding ranking card")
@@ -140,4 +202,8 @@ else:
             state["job_added"] = True
     save(state)
     print(f"put back the shipped {JOB_ID} job" if state["job_added"] else f"{JOB_ID} is already in the cron store")
+if resumed:
+    time.sleep(RESUME_SETTLE_SECONDS)
+    resume_ci_paused(state)
+    print(f"resumed {', '.join(dict.fromkeys(state['resumed']))}, which the eval run had paused")
 print(f"armed at {state['applied_at']}: sweep {sweep}, ranking {ranking}")

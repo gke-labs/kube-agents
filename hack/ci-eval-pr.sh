@@ -367,6 +367,13 @@ readonly EVAL_PAUSE_AUDITS_POD_WAIT_SECONDS=300
 # five-minute grace, so it waits only briefly; a gateway that is down then keeps
 # the pause, which the next lease's pause repeats anyway.
 readonly EVAL_RESUME_AUDITS_POD_WAIT_SECONDS=20
+# chain_audits_watch: how often, through the fan-out, the first-run stage's audits
+# are paused once the stage has had its run of each (#5570). The clock fires them
+# hours apart, so a few minutes' lag costs at most a run that lands in it.
+readonly EVAL_CHAIN_AUDITS_INTERVAL_SECONDS=300
+# Where the watch's pid goes: it runs outside the job table, where the fan-out's
+# `jobs -rp` count and its bare `wait` would take it for a unit.
+readonly EVAL_CHAIN_AUDITS_PID_FILE="chain-audits-watch.pid"
 readonly EVAL_PAUSE_AUDITS_POD_POLL_SECONDS=5
 # The bound on one exec that reads a gateway pod's PID 1 (ready_gateway_pod).
 readonly EVAL_PAUSE_AUDITS_PROBE_TIMEOUT=20s
@@ -948,7 +955,9 @@ profile_and_dump_on_exit() {
   collect_litellm_log
   collect_credential_proxy_evidence
   wait_replay_shadow_collector
-  # Defined further down; a run that died before then paused nothing.
+  # Defined further down; a run that died before then paused nothing. The watch
+  # stops first, so no pass of it pauses again what the resume lifts.
+  declare -F stop_chain_audits_watch >/dev/null && stop_chain_audits_watch
   declare -F scheduled_audits >/dev/null && scheduled_audits resume "exit"
   # Without the wait: the next lease's preflight waits for it instead.
   declare -F scope_exclude_restore >/dev/null && scope_exclude_restore "exit"
@@ -2409,21 +2418,24 @@ fence_live_cards() { # <label> [<task-name> <rep>]
 }
 
 # The Platform Agent's clock-started audits, paused at lease time and again right
-# before the fan-out (#3020), and resumed from the EXIT trap.
-# hack/ci_pause_scheduled_audits.py does both in the gateway with Hermes' own `cron
+# before the fan-out (#3020), the first-run stage's audits paused through the
+# fan-out once the stage has had its run of each (`chain`, from chain_audits_watch;
+# #5570), and resumed from the EXIT trap.
+# hack/ci_pause_scheduled_audits.py does all three in the gateway with Hermes' own `cron
 # pause`/`cron resume`, and its header owns which jobs, why the pause outlives a
 # gateway restart, and its exit codes. A Prow lease's teardown sweeps the volume
 # anyway; the resume is for a run against an install that outlives it. A pause that
 # still fails after its attempts stops the run as an infrastructure failure, since a
-# scheduled audit on its clock would charge its writes to the cases; a resume that
-# fails only warns. Pinned to AGENT_CLUSTER_CONTEXT and refused for a context that
+# scheduled audit on its clock would charge its writes to the cases; a `chain` pass or
+# a resume that fails only warns: the next pass tries again. Pinned to AGENT_CLUSTER_CONTEXT and refused for a context that
 # does not name PROJECT_ID, as wait_platform_runs is; without kubectl, a context or a
 # project it returns 0 and does nothing.
-scheduled_audits() { # <pause|resume> <label>
+scheduled_audits() { # <pause|chain|resume> <label>
   local mode="$1" label="$2" ns ctx out rc=0 args=()
   ns="${TARGET_NAMESPACE:-}"
   ctx="${AGENT_CLUSTER_CONTEXT:-}"
   [ "${mode}" = "resume" ] && args=(--resume)
+  [ "${mode}" = "chain" ] && args=(--chain)
   if [ -z "${PROJECT_ID:-}" ] || [ -z "${ctx}" ] || [ -z "${ns}" ] || ! command -v kubectl >/dev/null 2>&1; then
     echo "WARNING: Scheduled audits (${label}): no ${mode}, PROJECT_ID, AGENT_CLUSTER_CONTEXT, TARGET_NAMESPACE or kubectl is missing" >&2
     return 0
@@ -2445,7 +2457,7 @@ scheduled_audits() { # <pause|resume> <label>
   local bound=(timeout --foreground "${EVAL_PAUSE_AUDITS_TIMEOUT_SECONDS}")
   command -v timeout >/dev/null 2>&1 || bound=()
   local attempt pod wait="${EVAL_PAUSE_AUDITS_POD_WAIT_SECONDS}"
-  [ "${mode}" = "pause" ] || wait="${EVAL_RESUME_AUDITS_POD_WAIT_SECONDS}"
+  [ "${mode}" != "resume" ] || wait="${EVAL_RESUME_AUDITS_POD_WAIT_SECONDS}"
   for attempt in $(seq 1 "${EVAL_PAUSE_AUDITS_ATTEMPTS}"); do
     rc=0
     pod="$(ready_gateway_pod "${ctx}" "${ns}" "${wait}")" || {
@@ -2475,6 +2487,37 @@ scheduled_audits() { # <pause|resume> <label>
   fi
   echo "WARNING: Scheduled audits (${label}): ${mode} exited ${rc} on attempt ${attempt}: ${out}; any audit not named as ${mode}d keeps its state" >&2
   return 0
+}
+
+# The first-run stage's audits are three of the clock-started ones plus two more, and
+# the stage skips one that is paused, so the lease and fan-out pauses leave them on
+# (#5570). This pauses each once the stage has had its run of it, every
+# EVAL_CHAIN_AUDITS_INTERVAL_SECONDS from the fan-out to its end: after that a clock
+# run would be a second full run nothing grades. Started outside the job table
+# (a subshell that exits at once leaves it to init), since launch_units counts
+# `jobs -rp` as running units and the phases end on a bare `wait`. It stops when
+# this script does, if nothing has stopped it first: the pid file goes, or the
+# script's pid is gone.
+start_chain_audits_watch() {
+  local pidfile="${STATE_DIR}/${EVAL_CHAIN_AUDITS_PID_FILE}" owner=$$
+  (
+    (
+      # Sleeps first: the pid file is written while it does.
+      while sleep "${EVAL_CHAIN_AUDITS_INTERVAL_SECONDS}"; do
+        [ -e "${pidfile}" ] && kill -0 "${owner}" 2>/dev/null || break
+        scheduled_audits chain "fan-out watch"
+      done
+    ) </dev/null &
+    echo "$!" > "${pidfile}"
+  )
+}
+
+stop_chain_audits_watch() {
+  local pidfile="${STATE_DIR:-}/${EVAL_CHAIN_AUDITS_PID_FILE}" pid
+  [ -n "${STATE_DIR:-}" ] && [ -e "${pidfile}" ] || return 0
+  pid="$(cat "${pidfile}" 2>/dev/null || true)"
+  rm -f "${pidfile}"
+  [ -z "${pid}" ] || kill "${pid}" 2>/dev/null || true
 }
 
 # A pod of the gateway, once it has settled: as many Ready, non-terminating pods as
@@ -5650,6 +5693,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
 # Again, right before the fan-out: idempotent, and it catches a gateway that an
 # outside event (an autoscaler scale-down) restarted between lease setup and here.
 scheduled_audits pause "fan-out"
+start_chain_audits_watch
 
 # Case by case, cost-descending: every repetition of a case is queued before
 # the next case's first, so a night cut off by its deadline holds whole cases,
@@ -5913,6 +5957,7 @@ for SCOPE_LINE in ${SCOPE_EXCLUDE_LINES[@]+"${SCOPE_EXCLUDE_LINES[@]}"}; do
   scope_exclude_restore "${SCOPE_CASE}" settle \
     || echo "WARNING: Scope exclusion (${SCOPE_CASE}): the restore did not settle; the next lease's preflight repeats it" >&2
 done
+stop_chain_audits_watch
 
 # ─── What the run left on GitHub (#2079) ─────────────────────────────────────
 # On both lanes, once every unit is done: every pull request and branch

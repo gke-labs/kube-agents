@@ -24,6 +24,7 @@ is syntax-checked as Terraform renders it, and the teardown is run against faili
 stubs.
 """
 
+import ast
 import json
 import os
 import pathlib
@@ -39,6 +40,9 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 STACK = REPO / "bench" / "tf" / "prebuilt" / "oobe-first-run-audits"
 OOBE_JOB = {"id": "oobe", "script": "oobe.py", "no_agent": True, "schedule": {"kind": "cron", "expr": "* * * * *"}}
 OTHER_JOB = {"id": "profile-cron-tick", "schedule": {"kind": "cron", "expr": "* * * * *"}}
+STAGE_SOURCE = REPO / "agents" / "chat" / "scripts" / "oobe.py"
+STAGE_FIVE = ast.literal_eval(re.search(r"FIRST_RUN_AUDITS = (\([^)]*\))", STAGE_SOURCE.read_text(), re.S).group(1))
+PAUSED = {"enabled": False, "state": "paused", "paused_at": "2026-11-12T00:00:00+00:00"}
 HEREDOC = re.compile(r"command\s+=\s+<<-EOT\n(.*?)\n\s*EOT", re.S)
 
 
@@ -131,6 +135,18 @@ HERMES_STUB = textwrap.dedent(
     if sys.argv[1:3] == ["kanban", "create"]:
         n = sum(1 for _ in open(log))
         print("Created\\n" + json.dumps({"id": "t_%d" % n}))
+    if sys.argv[1:5] == ["-p", "platform", "cron", "resume"]:
+        path = os.environ["STUB_PLATFORM_ROSTER"]
+        store = json.load(open(path))
+        late = os.environ.get("STUB_LATE_PAUSE", "")
+        for job in store["jobs"]:
+            if job["id"] == sys.argv[5]:
+                job.update(enabled=True, state="scheduled", paused_at=None)
+            elif job["id"] == late and not os.path.exists(path + ".late"):
+                # A pause the eval run decided before the arm, landing after its first sweep.
+                job.update(enabled=False, state="paused", paused_at="x")
+                open(path + ".late", "w").close()
+        json.dump(store, open(path, "w"))
     """
 )
 
@@ -154,11 +170,17 @@ class PlantScriptsTest(unittest.TestCase):
         self.hermes.write_text(HERMES_STUB)
         self.hermes.chmod(self.hermes.stat().st_mode | stat.S_IXUSR)
         self.hermes_log = root / "hermes.log"
+        self.platform_roster = self.home / "profiles" / "platform" / "cron" / "jobs.json"
+        self.platform_roster.parent.mkdir(parents=True)
+        self.platform_roster.write_text(json.dumps({"jobs": [{"id": a, "enabled": True} for a in STAGE_FIVE]}))
         self.env = {
             **os.environ,
             "PYTHONPATH": str(self.stubs),
             "STUB_JOB_STORE": str(self.store),
             "STUB_HERMES_LOG": str(self.hermes_log),
+            "STUB_PLATFORM_ROSTER": str(self.platform_roster),
+            "OOBE_STAGE_SOURCE": str(STAGE_SOURCE),
+            "OOBE_ARM_RESUME_SETTLE_SECONDS": "0",
         }
 
     def tearDown(self):
@@ -241,6 +263,62 @@ class PlantScriptsTest(unittest.TestCase):
                 self.assertIn("paused or disabled", done.stderr)
                 self.assertFalse((self.home / ".bench-oobe.json").exists())
                 self.assertFalse((self.home / ".bootstrap_scan_filed").exists())
+
+    def _platform(self, jobs, recorded):
+        self.platform_roster.write_text(json.dumps({"jobs": jobs}))
+        (self.home / ".ci-paused-audits.json").write_text(json.dumps(recorded))
+
+    def _platform_paused(self) -> set[str]:
+        return {j["id"] for j in json.loads(self.platform_roster.read_text())["jobs"] if j.get("paused_at")}
+
+    def test_arm_resumes_the_first_run_audits_the_eval_run_paused(self):
+        first, second = STAGE_FIVE[:2]
+        self._platform(
+            [{"id": a, **PAUSED} for a in STAGE_FIVE] + [{"id": "other-audit", **PAUSED}],
+            # The eval run paused all six; an operator paused nothing here.
+            [*STAGE_FIVE, "other-audit"],
+        )
+        done = self._arm()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        # The five the chain needs, and not the audit the eval run paused for #3020.
+        self.assertEqual(self._platform_paused(), {"other-audit"})
+        self.assertEqual(self._state()["resumed"], list(STAGE_FIVE))
+        resumes = [c for c in self._hermes_calls() if c[:4] == ["-p", "platform", "cron", "resume"]]
+        self.assertEqual([c[4] for c in resumes], list(STAGE_FIVE))
+        self.assertIn("resumed " + first, done.stdout)
+        self.assertNotIn(second + ", " + second, done.stdout)
+
+    def test_arm_leaves_a_pause_the_eval_run_did_not_record(self):
+        first = STAGE_FIVE[0]
+        self._platform([{"id": first, **PAUSED}] + [{"id": a, "enabled": True} for a in STAGE_FIVE[1:]], [])
+        done = self._arm()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self._platform_paused(), {first})
+        self.assertFalse(any(c[:4] == ["-p", "platform", "cron", "resume"] for c in self._hermes_calls()))
+
+    def test_arm_without_an_eval_record_resumes_nothing(self):
+        self.platform_roster.write_text(json.dumps({"jobs": [{"id": a, **PAUSED} for a in STAGE_FIVE]}))
+        done = self._arm()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self._platform_paused(), set(STAGE_FIVE))
+
+    def test_arm_resumes_a_pause_that_lands_after_its_first_sweep(self):
+        first, late = STAGE_FIVE[0], STAGE_FIVE[3]
+        self._platform([{"id": first, **PAUSED}] + [{"id": a, "enabled": True} for a in STAGE_FIVE[1:]], list(STAGE_FIVE))
+        self.env["STUB_LATE_PAUSE"] = late
+        done = self._arm()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self._platform_paused(), set())
+        self.assertIn(late, done.stdout)
+
+    def test_arm_stops_when_a_resume_fails(self):
+        self._platform([{"id": a, **PAUSED} for a in STAGE_FIVE], list(STAGE_FIVE))
+        self.hermes.write_text("#!/bin/sh\necho nope >&2\nexit 1\n")
+        done = self._arm()
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("could not resume", done.stderr)
+        # The state file is there, so the stack's exit trap disarms.
+        self.assertTrue((self.home / ".bench-oobe.json").exists())
 
     def test_arm_refuses_when_already_armed(self):
         (self.home / ".bench-oobe.json").write_text("{}")
