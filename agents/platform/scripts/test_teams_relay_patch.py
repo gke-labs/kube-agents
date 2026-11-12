@@ -348,6 +348,44 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(shebang_blocks), 1)
         self.assertIsNone(shebang_blocks[0].get("weight"))
 
+    def test_markdown_table_becomes_an_adaptive_card_table(self):
+        text = (
+            "Clusters:\n\n"
+            "| Cluster Name | Location | Status |\n"
+            "|---|---|---|\n"
+            "| platform-agent-host | us-central1 | RUNNING |\n\n"
+            "Done."
+        )
+        body = markdown_to_adaptive_card(text)["body"]
+        tables = [block for block in body if block["type"] == "Table"]
+        self.assertEqual(len(tables), 1)
+        table = tables[0]
+        self.assertTrue(table["firstRowAsHeader"])
+        self.assertEqual(len(table["columns"]), 3)
+        self.assertEqual(len(table["rows"]), 2)  # the --- separator is dropped
+        header = table["rows"][0]["cells"][0]["items"][0]
+        self.assertEqual(header["text"], "Cluster Name")
+        self.assertEqual(header["weight"], "Bolder")
+        self.assertEqual(
+            table["rows"][1]["cells"][2]["items"][0]["text"], "RUNNING"
+        )
+        texts = [block.get("text") for block in body if block["type"] == "TextBlock"]
+        self.assertEqual(texts, ["Clusters:", "Done."])
+        # A pipe inside a code block is code, not a table.
+        code_body = markdown_to_adaptive_card("```\n| a | b |\n```")["body"]
+        self.assertEqual([b["type"] for b in code_body], ["TextBlock"])
+
+    def test_card_activity_carries_a_plain_summary(self):
+        payload = format_teams_activity_payload(
+            "# Report\n\n| a | b |\n|---|---|\n| **1** | `2` |",
+            use_adaptive_cards=True,
+        )
+        self.assertEqual(payload["summary"], "Report a b 1 2")
+        self.assertNotIn(
+            "summary",
+            format_teams_activity_payload("plain", use_adaptive_cards=False),
+        )
+
     def test_format_teams_activity_payload(self):
         payload = format_teams_activity_payload(
             "# Title\nDetails",

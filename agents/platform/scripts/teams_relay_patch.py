@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -164,6 +165,22 @@ def is_tenant_allowed(
     return activity_tenant_id.strip().lower() == configured_tenant_id.strip().lower()
 
 
+_TABLE_SEPARATOR_RE = re.compile(r"^\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?$")
+
+
+def _is_table_row(stripped: str) -> bool:
+    """A Markdown pipe-table line: starts with | and has at least one more |."""
+    return stripped.startswith("|") and stripped.count("|") >= 2
+
+
+def _is_table_separator(stripped: str) -> bool:
+    return bool(_TABLE_SEPARATOR_RE.match(stripped))
+
+
+def _split_table_row(stripped: str) -> list[str]:
+    return [cell.strip() for cell in stripped.strip("|").split("|")]
+
+
 def markdown_to_adaptive_card(text: str, title: str | None = None) -> dict[str, Any]:
     """Convert Markdown text into a Microsoft Teams Adaptive Card v1.5 schema."""
     body_elements: list[dict[str, Any]] = []
@@ -182,9 +199,52 @@ def markdown_to_adaptive_card(text: str, title: str | None = None) -> dict[str, 
     lines = text.split("\n")
     in_code_block = False
     code_lines: list[str] = []
+    table_rows: list[list[str]] = []
+
+    def flush_table() -> None:
+        # A pipe table becomes an Adaptive Card 1.5 Table; the separator row
+        # (---) is dropped and the first row is the header. Without this
+        # every table line arrived as a TextBlock with the pipes left in.
+        if not table_rows:
+            return
+        width = max(len(row) for row in table_rows)
+        body_elements.append(
+            {
+                "type": "Table",
+                "firstRowAsHeader": True,
+                "columns": [{"width": 1} for _ in range(width)],
+                "rows": [
+                    {
+                        "type": "TableRow",
+                        "cells": [
+                            {
+                                "type": "TableCell",
+                                "items": [
+                                    {
+                                        "type": "TextBlock",
+                                        "text": row[i] if i < len(row) else "",
+                                        "wrap": True,
+                                        **({"weight": "Bolder"} if r == 0 else {}),
+                                    }
+                                ],
+                            }
+                            for i in range(width)
+                        ],
+                    }
+                    for r, row in enumerate(table_rows)
+                ],
+            }
+        )
+        table_rows.clear()
 
     for line in lines:
         stripped = line.strip()
+        if not in_code_block and _is_table_row(stripped):
+            if _is_table_separator(stripped):
+                continue
+            table_rows.append(_split_table_row(stripped))
+            continue
+        flush_table()
         if stripped.startswith("```"):
             if in_code_block:
                 in_code_block = False
@@ -239,6 +299,7 @@ def markdown_to_adaptive_card(text: str, title: str | None = None) -> dict[str, 
                 }
             )
 
+    flush_table()
     if in_code_block and code_lines:
         body_elements.append(
             {
@@ -370,6 +431,9 @@ def format_teams_activity_payload(
 
     return {
         "type": "message",
+        # Chat-list previews and notifications show the summary; without one
+        # Teams prints "Card - access it on .../cards.unsupported".
+        "summary": activity_summary(message),
         "attachments": [
             {
                 "contentType": "application/vnd.microsoft.card.adaptive",
@@ -377,6 +441,17 @@ def format_teams_activity_payload(
             }
         ],
     }
+
+
+def activity_summary(message: str, limit: int = 140) -> str:
+    """One line of plain text for a card activity's preview."""
+    flat = " ".join(message.split())
+    for mark in ("#", "*", "`", "|", "_", ">"):
+        flat = flat.replace(mark, "")
+    # Table separator cells (---, :---:) carry nothing worth previewing.
+    words = [w for w in flat.split() if w.strip("-:")]
+    flat = " ".join(words)
+    return flat[:limit].rstrip() if flat else "Kage reply"
 
 
 def _resolve_base_classes() -> tuple[type, Any, Any, Any, Any, Any]:
