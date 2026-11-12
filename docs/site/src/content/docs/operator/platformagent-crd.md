@@ -80,6 +80,8 @@ A one-server bus starts its server with a `stale-cluster-meta` init step. A serv
 
 The freeze lasts as long as the copy, the conversion and the restore together, which is expected to be minutes. The staging claim is `ReadWriteOncePod`, on the default StorageClass, sized for every stream full to its cap plus 10% (32Gi today), so the default StorageClass must support that access mode.
 
+Before a one to three run starts, the operator reads each stream's size from the bus's monitoring endpoint. If a stream holds more than the cap the restore puts on it, or the sizes can't be read, no run starts and nothing freezes. The bus keeps its one server, and an `A2ABusMigrationStreamsOverCap` Warning Event names each stream and its size against its cap. The operator checks again on later passes and starts the run once every stream is under its cap.
+
 A stream the restore put back that differs from a fresh install of it, on a field outside its policy, is listed in `status.busMigration.warnings` and reported once as a `BusMigrationDrift` Warning Event.
 
 #### When a migration fails

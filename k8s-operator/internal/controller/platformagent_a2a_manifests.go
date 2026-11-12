@@ -4905,6 +4905,17 @@ func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, age
 				r.recordEvent(agent, corev1.EventTypeWarning, reasonA2ABusMigrationUnavailable,
 					fmt.Sprintf("spec.harness.tuning.busReplicas asks for %d NATS servers and the bus runs %d, but this operator was deployed without OPERATOR_IMAGE, which runs the migration; the bus keeps %d", want, running, running))
 			}
+		} else if want > running && busMigrationWouldStart(agent, want) {
+			// One server to three restores every stream from a snapshot
+			// under the caps this operator renders, behind a write freeze.
+			// A stream already over its cap would fail the restore with the
+			// bus frozen, so the run is refused before anything freezes.
+			if refusal := r.busMigrationStreamsOverCap(ctx, agent); refusal != "" {
+				r.recordEvent(agent, corev1.EventTypeWarning, reasonA2ABusMigrationStreamsOverCap,
+					fmt.Sprintf("spec.harness.tuning.busReplicas asks for %d NATS servers and the bus runs %d, but no migration starts: %s; the bus keeps %d", want, running, refusal, running))
+			} else {
+				startBusMigration(agent, running, want, metav1.Now())
+			}
 		} else {
 			startBusMigration(agent, running, want, metav1.Now())
 		}
@@ -4954,22 +4965,8 @@ const busMigrationRunDeadline = 2 * time.Hour
 // one is under way, or the last one ended without converting at this same
 // generation (it would only fail or abandon again until the spec changes).
 func startBusMigration(agent *agentv1alpha1.PlatformAgent, running, want int, now metav1.Time) {
-	if run := agent.Status.BusMigration; run != nil {
-		if !busMigrationTerminal(busMigrationPhase(run.Phase)) {
-			return
-		}
-		if busMigrationPhase(run.Phase) == busMigrationFailed && !run.GivenUp {
-			// A Failed run waits for a person to retry or give it up.
-			return
-		}
-		// The last run ended without converting the bus (or converted it
-		// and the count was asked back). A new one starts only when the
-		// field asks for a count other than the last run's target, or a
-		// person asks for another try at the same one by naming the last
-		// run: an edit to anything else, or a GitOps sync, starts nothing.
-		if want == busMigrationTarget(run) && agent.Annotations[a2aBusMigrationStartAnnotation] != run.RunID {
-			return
-		}
+	if !busMigrationWouldStart(agent, want) {
+		return
 	}
 	leg, first := busMigrationGrow, busMigrationFreezing
 	if want < running {
@@ -4983,6 +4980,30 @@ func startBusMigration(agent *agentv1alpha1.PlatformAgent, running, want int, no
 		Deadline:           metav1.NewTime(now.Add(busMigrationRunDeadline)),
 		ObservedGeneration: agent.Generation,
 	}
+}
+
+// busMigrationWouldStart reports whether startBusMigration would start a run
+// toward want: none is under way, and the last one isn't a Failed run
+// waiting for a person, or one that ended at this same target with no
+// request to try it again.
+func busMigrationWouldStart(agent *agentv1alpha1.PlatformAgent, want int) bool {
+	run := agent.Status.BusMigration
+	if run == nil {
+		return true
+	}
+	if !busMigrationTerminal(busMigrationPhase(run.Phase)) {
+		return false
+	}
+	if busMigrationPhase(run.Phase) == busMigrationFailed && !run.GivenUp {
+		// A Failed run waits for a person to retry or give it up.
+		return false
+	}
+	// The last run ended without converting the bus (or converted it and
+	// the count was asked back). A new one starts only when the field asks
+	// for a count other than the last run's target, or a person asks for
+	// another try at the same one by naming the last run: an edit to
+	// anything else, or a GitOps sync, starts nothing.
+	return want != busMigrationTarget(run) || agent.Annotations[a2aBusMigrationStartAnnotation] == run.RunID
 }
 
 // a2aNATSRenderedReplicas is the server count a NATS StatefulSet's template

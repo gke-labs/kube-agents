@@ -688,7 +688,8 @@ func TestTheBusServerCountIsStickyAndAChangeStartsAMigration(t *testing.T) {
 			}
 			objs := append([]client.Object{agent}, tc.objects(agent)...)
 			agent.Status.BusReplicas = tc.recorded
-			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).Build(), Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8)}
+			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).Build(), Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8),
+				busStreamBytes: emptyBusStreams}
 			if err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
 				t.Fatal(err)
 			}
@@ -1260,7 +1261,8 @@ func TestStrayClaimsDoNotOutvoteTheRecordedServerCount(t *testing.T) {
 				}})
 			}
 			rec := record.NewFakeRecorder(8)
-			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).Build(), Scheme: setupScheme(), Recorder: rec}
+			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).Build(), Scheme: setupScheme(), Recorder: rec,
+				busStreamBytes: emptyBusStreams}
 			if err := r.resolveA2ABusReplicas(context.Background(), agent); err != nil {
 				t.Fatal(err)
 			}
@@ -1424,7 +1426,7 @@ func TestAFieldChangeStartsAMigration(t *testing.T) {
 			agent := a2aTestAgent()
 			agent.Generation = 4
 			agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(tc.spec)}}
-			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(append([]client.Object{agent}, tc.objects(agent)...)...).Build(), Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8)}
+			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(append([]client.Object{agent}, tc.objects(agent)...)...).Build(), Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8), busStreamBytes: emptyBusStreams}
 			if err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
 				t.Fatal(err)
 			}
@@ -1711,5 +1713,74 @@ func TestAClusterRollsOntoAProfileChangeInsteadOfReloading(t *testing.T) {
 	}
 	if plan != (a2aBusReload{}) || desired.Annotations[a2aBusReloadRequestedAnnotation] != "" {
 		t.Errorf("a cluster's reload plan = %+v, annotations %v; want nothing tracked", plan, desired.Annotations)
+	}
+}
+
+// emptyBusStreams is a bus whose streams hold nothing: no stream is over its
+// cap, so a one to three migration may start.
+func emptyBusStreams(context.Context, *agentv1alpha1.PlatformAgent) (map[string]int64, error) {
+	return map[string]int64{}, nil
+}
+
+// One server to three restores every stream under the cap this operator
+// renders, behind a write freeze. A stream already over its cap, or a bus
+// whose stream sizes can't be read, refuses the run before anything freezes:
+// no migration starts, the bus keeps its one server, and a Warning says why.
+// A stream at its cap exactly, and a shrink, start as before.
+func TestAStreamOverItsCapRefusesAGrowBeforeTheFreeze(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	tasksCap := int64(0)
+	for _, p := range a2aStreamPolicies(1) {
+		if p.Name == "TASKS" {
+			tasksCap = p.MaxBytes
+		}
+	}
+	for _, tc := range []struct {
+		name      string
+		single    bool
+		ask       int
+		streams   map[string]int64
+		readErr   error
+		wantStart bool
+		wantWarn  string
+	}{
+		{"TASKS over its cap", true, 3, map[string]int64{"TASKS": tasksCap + 1}, nil, false, "TASKS holds"},
+		{"the sizes can't be read", true, 3, nil, errors.NewServiceUnavailable("no monitor"), false, "could not be read"},
+		{"TASKS at its cap", true, 3, map[string]int64{"TASKS": tasksCap}, nil, true, ""},
+		{"a stream the policies don't name", true, 3, map[string]int64{"SOMETHING_ELSE": 1 << 40}, nil, true, ""},
+		{"a shrink isn't checked", false, 1, map[string]int64{"TASKS": tasksCap + 1}, nil, true, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := a2aTestAgent()
+			render := agent
+			if tc.single {
+				render = a2aSingleServerTestAgent()
+			}
+			sts := buildA2ANATSStatefulSet(render, "h")
+			agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(tc.ask)}}
+			rec := record.NewFakeRecorder(8)
+			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent, sts).Build(), Scheme: setupScheme(), Recorder: rec,
+				busStreamBytes: func(context.Context, *agentv1alpha1.PlatformAgent) (map[string]int64, error) {
+					return tc.streams, tc.readErr
+				}}
+			if err := r.resolveA2ABusReplicas(context.Background(), agent); err != nil {
+				t.Fatal(err)
+			}
+			started := agent.Status.BusMigration != nil
+			if started != tc.wantStart {
+				t.Fatalf("migration %+v, want started=%v", agent.Status.BusMigration, tc.wantStart)
+			}
+			if tc.wantWarn == "" {
+				return
+			}
+			select {
+			case ev := <-rec.Events:
+				if !strings.Contains(ev, reasonA2ABusMigrationStreamsOverCap) || !strings.Contains(ev, tc.wantWarn) {
+					t.Errorf("event %q, want %s naming %q", ev, reasonA2ABusMigrationStreamsOverCap, tc.wantWarn)
+				}
+			default:
+				t.Error("no Warning saying why the migration did not start")
+			}
+		})
 	}
 }
