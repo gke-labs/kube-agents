@@ -13,7 +13,7 @@ import (
 var provisionedStreams = []string{
 	"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL",
 	"KV_runtime-state", "KV_session-state", "KV_cap", "KV_feedback",
-	"KV_PROFILE_LEASES", "PROFILE_SUBMITS",
+	"KV_PROFILE_LEASES", "PROFILE_SUBMITS", "KV_people", "DISPATCH_STOPS",
 }
 
 func policyOf(cfg nats.StreamConfig) StreamPolicy {

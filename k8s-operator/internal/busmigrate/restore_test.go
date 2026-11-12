@@ -169,8 +169,8 @@ func TestARestoredStreamOutsideItsPolicyIsDeleted(t *testing.T) {
 	si, _ := js.StreamInfo("TASKS")
 	policy := policyOf(withReplicas(si.Config, 1))
 	policy.Subjects = want.Subjects
-	if err := verifyOrDelete(ctx, nc, policy); err == nil || !strings.Contains(err.Error(), "deleted") {
-		t.Fatalf("verifyOrDelete: %v, want the mismatch deleted", err)
+	if err := verifyOrDelete(ctx, nc, policy); err == nil || !strings.Contains(err.Error(), "deleted") || !errors.Is(err, ErrOutsidePolicy) {
+		t.Fatalf("verifyOrDelete: %v, want the mismatch deleted as ErrOutsidePolicy, which the restore never retries", err)
 	}
 	if _, err := js.StreamInfo("TASKS"); err == nil {
 		t.Fatal("the mismatched stream is still there")

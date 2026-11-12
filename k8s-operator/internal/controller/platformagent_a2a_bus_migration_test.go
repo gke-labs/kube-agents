@@ -1471,9 +1471,16 @@ func TestARunsEndCleansUpWhatItMade(t *testing.T) {
 				&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: busMigrationStageClaim(m.agent, "3-1"), Namespace: ns}},
 			}
 			for _, o := range made {
+				m.own(o)
 				if err := m.cl.Create(context.Background(), o); err != nil {
 					t.Fatal(err)
 				}
+			}
+			// One under a run identity's name that someone else made: never
+			// the run's, so never its to delete.
+			planted := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkloadName(m.agent, "pin", "3-1"), Namespace: ns}}
+			if err := m.cl.Create(context.Background(), planted); err != nil {
+				t.Fatal(err)
 			}
 			tc.finish(m)
 			if err := m.r.resolveA2ABusReplicas(context.Background(), m.agent); err != nil {
@@ -1495,6 +1502,9 @@ func TestARunsEndCleansUpWhatItMade(t *testing.T) {
 				if !keep && err == nil {
 					t.Errorf("%T %s is still there after the run ended %s", o, o.GetName(), tc.end)
 				}
+			}
+			if err := m.cl.Get(context.Background(), client.ObjectKeyFromObject(planted), planted); err != nil {
+				t.Errorf("a ServiceAccount the PlatformAgent doesn't control was deleted by the cleanup: %v", err)
 			}
 		})
 	}
@@ -1869,7 +1879,12 @@ func TestOnlyAnAbandonNamingTheRunLiftsAFailedFreeze(t *testing.T) {
 	// new starts until a person asks, naming the run.
 	m.agent.Annotations = map[string]string{a2aBusMigrationAbandonAnnotation: "3-1"}
 	m.pass(busMigrationFailed, 1)
+	// Asked to start again, it waits for the bus's provisioning after the
+	// give-up, then starts.
 	m.agent.Annotations[a2aBusMigrationStartAnnotation] = "3-1"
+	meta.RemoveStatusCondition(&m.agent.Status.Conditions, busProvisionedConditionType)
+	m.pass(busMigrationFailed, 1)
+	setBusProvisionedCondition(m.agent, true, "provision-job", metav1.Now())
 	m.pass(busMigrationFreezing, 1)
 	if m.agent.Status.BusMigration.RunID == "3-1" {
 		t.Error("no new run after giving the failed one up")
@@ -1884,6 +1899,7 @@ func TestOnlyAnAbandonNamingTheRunLiftsAFailedFreeze(t *testing.T) {
 		&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: busMigrationStageClaim(g.agent, "3-1"), Namespace: g.agent.Namespace}},
 	}
 	for _, o := range kept {
+		g.own(o)
 		if err := g.cl.Create(context.Background(), o); err != nil {
 			t.Fatal(err)
 		}
@@ -2492,7 +2508,13 @@ func TestEveryReconcileReturnPollsAMigrationUnderWay(t *testing.T) {
 	agent.Status.BusReplicas = 3
 	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationShrink), RunID: "3-1", Phase: string(busMigrationPinning),
 		StartedAt: metav1.Now(), Deadline: metav1.NewTime(time.Now().Add(time.Hour))}
-	r, _, req := a2aGateTestReconciler(t, agent)
+	// With a plugin, so a not-yet-Ready pass takes the plugin recheck's
+	// early return too.
+	plugin := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: agent.Namespace},
+		Spec:       agentv1alpha1.AgentPluginSpec{AgentRef: agent.Name, Image: "gcr.io/p:v1"},
+	}
+	r, _, req := a2aGateTestReconciler(t, agent, plugin)
 	r.busStreamState = emptyBusStreams
 	ctx := context.Background()
 	for i := range 3 {
@@ -2536,7 +2558,11 @@ func TestASwitchToTodayRemovesOnlyAnEndedRun(t *testing.T) {
 				return o
 			}
 			left := []client.Object{
-				owned(&batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkName(m.agent, run, "pin"), Namespace: m.agent.Namespace}}),
+				owned(&batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkName(m.agent, run, "pin"), Namespace: m.agent.Namespace,
+					Labels: map[string]string{a2aComponentLabel: busMigrationComponent}}}),
+				// An earlier attempt's unpin, which the current name misses.
+				owned(&batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkloadName(m.agent, "unpin", run.RunID+"-r1"), Namespace: m.agent.Namespace,
+					Labels: map[string]string{a2aComponentLabel: busMigrationComponent}}}),
 				owned(&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkloadName(m.agent, busMigrationStreamIdentity, run.RunID), Namespace: m.agent.Namespace}}),
 				owned(&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: busMigrationRunSecret(m.agent, run.RunID), Namespace: m.agent.Namespace}}),
 				owned(&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: busMigrationStageClaim(m.agent, run.RunID), Namespace: m.agent.Namespace}}),
@@ -2546,8 +2572,16 @@ func TestASwitchToTodayRemovesOnlyAnEndedRun(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			foreign := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "someone-elses", Namespace: m.agent.Namespace,
+				Labels: map[string]string{a2aComponentLabel: busMigrationComponent}}}
+			if err := m.cl.Create(ctx, foreign); err != nil {
+				t.Fatal(err)
+			}
 			if err := m.r.busMigrationTornDown(ctx, m.agent); err != nil {
 				t.Fatal(err)
+			}
+			if err := m.cl.Get(ctx, client.ObjectKeyFromObject(foreign), foreign); err != nil {
+				t.Errorf("a migration-labelled Job the PlatformAgent doesn't control was deleted: %v", err)
 			}
 			if got := m.agent.Status.BusMigration == nil; got != tc.removed {
 				t.Errorf("record removed %v, want %v", got, tc.removed)
@@ -2587,5 +2621,39 @@ func TestTheTodayPassWritesTheRemovedRecord(t *testing.T) {
 	}
 	if got.Status.BusMigration != nil {
 		t.Errorf("status.busMigration after the switch to today: %+v, want none", got.Status.BusMigration)
+	}
+}
+
+// A one-to-three run that failed partway through its forward clear, and is
+// given up, leaves streams it deleted and never put back, on a count that
+// never changed. Giving it up drops BusProvisioned and deletes the provision
+// Job that earned it, so the Job runs again and recreates them, and Ready and
+// the bridge wait for it; a Job still being deleted counts as nothing done.
+func TestGivingUpAClearThatFailedReprovisionsTheBus(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	ctx := context.Background()
+	m := failedRig(t, busMigrationGrow, busMigrationClearing, 1)
+	m.agent.Spec.Harness.Tuning.BusReplicas = ptr.To(1)
+	setBusProvisionedCondition(m.agent, true, "provision-job", metav1.Now())
+	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "platform-agent-a2a-provision-abc", Namespace: m.agent.Namespace,
+		Labels: map[string]string{a2aComponentLabel: a2aProvisionComponent, labelInstance: instanceLabel(m.agent.Namespace, m.agent.Name)}}}
+	job.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(m.agent, agentv1alpha1.GroupVersion.WithKind("PlatformAgent"))}
+	job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
+	if err := m.cl.Create(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	m.agent.Annotations = map[string]string{a2aBusMigrationAbandonAnnotation: "3-1"}
+	m.pass(busMigrationFailed, 1)
+	if !m.agent.Status.BusMigration.GivenUp {
+		t.Fatal("the run was not given up")
+	}
+	if busProvisioned(m.agent) {
+		t.Error("BusProvisioned stands after giving up a run that cleared streams")
+	}
+	if err := m.cl.Get(ctx, client.ObjectKeyFromObject(job), &batchv1.Job{}); err == nil {
+		t.Error("the completed provision Job survived; it would count as done and nothing would recreate the streams")
+	}
+	if a2aBridgeInPod(m.agent) {
+		t.Error("the bridge is in the pod before the bus is provisioned again")
 	}
 }

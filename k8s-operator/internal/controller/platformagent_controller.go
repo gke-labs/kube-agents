@@ -934,6 +934,17 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+	// A bus migration's Jobs and pods are not watched, so while one runs
+	// every return polls it (busMigrationRequeue), whichever branch it takes;
+	// a clean requeue and an error keep their own retry.
+	defer func() {
+		if retErr != nil || result.Requeue || !a2aStackRendering(instance) {
+			return
+		}
+		if d := busMigrationRequeue(instance); d > 0 && (result.RequeueAfter == 0 || result.RequeueAfter > d) {
+			result.RequeueAfter = d
+		}
+	}()
 	// The gauges carry the CR as read, on every reconcile: an operator restart
 	// serves the fleet on its first pass, and a status write by any writer is
 	// published on the reconcile it re-enqueues, so no writer publishes itself.
@@ -1487,11 +1498,6 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if a2aState.busReloadRequeue > 0 {
 			requeue = min(requeue, a2aState.busReloadRequeue)
 		}
-		// And a bus migration's next read of its Jobs and pods, which nothing
-		// watched wakes (busMigrationRequeue).
-		if d := busMigrationRequeue(instance); d > 0 {
-			requeue = min(requeue, d)
-		}
 		return ctrl.Result{RequeueAfter: requeue}, nil
 	}
 
@@ -1514,13 +1520,6 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 		if credentialProxyExecShort(instance) {
 			requeue = min(requeue, credentialProxyExecShortRequeue)
-		}
-		// And a bus migration under way, which would otherwise advance one
-		// phase per reprobe.
-		if a2aNext {
-			if d := busMigrationRequeue(instance); d > 0 {
-				requeue = min(requeue, d)
-			}
 		}
 		return ctrl.Result{RequeueAfter: requeue}, nil
 	}
@@ -1553,13 +1552,6 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// event — the same pairing rbacDegraded has above. Without this the record
 	// would expire and sit until the fifteen-minute requeue.
 	requeueAfter = min(requeueAfter, r.usageStatusRequeue(instance))
-	// A bus migration's Jobs and pods are not watched, so while one runs the
-	// pass that reads their outcome has to be scheduled.
-	if a2aNext {
-		if d := busMigrationRequeue(instance); d > 0 {
-			requeueAfter = min(requeueAfter, d)
-		}
-	}
 	// A sizing step back's hold ends at a time (sizingStepBackHoldInterval),
 	// and the settled lower row sends no event for it, so the pass that
 	// measures the step again is scheduled for the hold's end.

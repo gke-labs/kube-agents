@@ -74,8 +74,10 @@ func splitStreams(s string) ([]string, error) {
 
 // Main runs `bus-migrate <leg> [flags]`: pin (three to one: lead every stream
 // from --target and scale it to R1), unpin (undo a pin before the shrink),
-// or snapshot (one to three: stage every stream under --dir). It returns the
-// process's exit code.
+// snapshot (one to three: stage every stream under --dir), restore (put the
+// staged streams back from --dir under --run-file's digests and policies,
+// raising each to --replicas), or clear (delete the named streams ahead of a
+// conversion or a rollback). It returns the process's exit code.
 func Main(ctx context.Context, args []string, stderr io.Writer) int {
 	if len(args) == 0 {
 		fmt.Fprintln(stderr, "usage: bus-migrate pin|unpin|snapshot|restore|clear [flags]")
@@ -233,7 +235,11 @@ func writeReport(path string, r Report) error {
 			return os.WriteFile(path, b, 0o600)
 		}
 	}
-	r.Warnings = []string{fmt.Sprintf("%d warnings", len(all))}
+	if len(all) > 0 {
+		r.Warnings = []string{fmt.Sprintf("%d warnings", len(all))}
+	} else {
+		r.Warnings = nil
+	}
 	r.Error = r.Error[:min(len(r.Error), terminationMessageLimit/2)]
 	b, err := json.Marshal(r)
 	if err != nil {

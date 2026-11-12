@@ -746,6 +746,7 @@ func TestTheBusServerCountIsStickyAndAChangeStartsAMigration(t *testing.T) {
 			agent.Status.BusReplicas = tc.recorded
 			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).Build(), Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8),
 				busStreamState: emptyBusStreams}
+			setBusProvisionedCondition(agent, true, "provision-job", metav1.Now()) // an existing, provisioned bus
 			if err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
 				t.Fatal(err)
 			}
@@ -767,6 +768,7 @@ func TestTheBusServerCountIsStickyAndAChangeStartsAMigration(t *testing.T) {
 			}
 			// Once: a second pass carries the same run on.
 			id := run.RunID
+			setBusProvisionedCondition(agent, true, "provision-job", metav1.Now()) // an existing, provisioned bus
 			if err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
 				t.Fatal(err)
 			}
@@ -1319,6 +1321,7 @@ func TestStrayClaimsDoNotOutvoteTheRecordedServerCount(t *testing.T) {
 			rec := record.NewFakeRecorder(8)
 			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).Build(), Scheme: setupScheme(), Recorder: rec,
 				busStreamState: emptyBusStreams}
+			setBusProvisionedCondition(agent, true, "provision-job", metav1.Now()) // an existing, provisioned bus
 			if err := r.resolveA2ABusReplicas(context.Background(), agent); err != nil {
 				t.Fatal(err)
 			}
@@ -1483,6 +1486,7 @@ func TestAFieldChangeStartsAMigration(t *testing.T) {
 			agent.Generation = 4
 			agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(tc.spec)}}
 			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(append([]client.Object{agent}, tc.objects(agent)...)...).Build(), Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8), busStreamState: emptyBusStreams}
+			setBusProvisionedCondition(agent, true, "provision-job", metav1.Now()) // an existing, provisioned bus
 			if err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
 				t.Fatal(err)
 			}
@@ -1658,6 +1662,7 @@ func TestABusScaledByHandKeepsItsRecordedCount(t *testing.T) {
 				}})
 			}
 			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).Build(), Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8)}
+			setBusProvisionedCondition(agent, true, "provision-job", metav1.Now()) // an existing, provisioned bus
 			if err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
 				t.Fatal(err)
 			}
@@ -1707,6 +1712,7 @@ func TestNoOperatorImageStartsNoMigration(t *testing.T) {
 	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(3)}}
 	rec := record.NewFakeRecorder(8)
 	r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent, sts).Build(), Scheme: setupScheme(), Recorder: rec}
+	setBusProvisionedCondition(agent, true, "provision-job", metav1.Now()) // an existing, provisioned bus
 	if err := r.resolveA2ABusReplicas(context.Background(), agent); err != nil {
 		t.Fatal(err)
 	}
@@ -1831,6 +1837,7 @@ func TestAStreamOverItsCapRefusesAGrowBeforeTheFreeze(t *testing.T) {
 				busStreamState: func(context.Context, *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error) {
 					return tc.streams, tc.readErr
 				}}
+			setBusProvisionedCondition(agent, true, "provision-job", metav1.Now()) // an existing, provisioned bus
 			if err := r.resolveA2ABusReplicas(context.Background(), agent); err != nil {
 				t.Fatal(err)
 			}
@@ -1873,5 +1880,47 @@ func TestTheJszReportDecodesEachStreamsState(t *testing.T) {
 	want := a2aBusStream{Bytes: 55, Msgs: 1, FirstTime: time.Date(2026, 11, 12, 0, 20, 12, 227001000, time.UTC)}
 	if got["TASKS"] != want {
 		t.Errorf("TASKS = %+v, want %+v", got["TASKS"], want)
+	}
+}
+
+// A bus never provisioned, with no migration behind it, takes a changed
+// count as asked: no run starts against a bus with no streams, and on a
+// cluster that can't schedule three servers this is how the count comes
+// down. A bus whose last migration changed the count waits for the
+// provisioning after it before the next run starts.
+func TestNoMigrationStartsBeforeTheBusIsProvisioned(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	threeServers := func() (*agentv1alpha1.PlatformAgent, *PlatformAgentReconciler) {
+		agent := a2aTestAgent()
+		agent.Status.BusReplicas = 3
+		sts := buildA2ANATSStatefulSet(agent, "h")
+		agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(1)}}
+		r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent, sts).Build(),
+			Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8), busStreamState: emptyBusStreams}
+		return agent, r
+	}
+
+	agent, r := threeServers()
+	if err := r.resolveA2ABusReplicas(context.Background(), agent); err != nil {
+		t.Fatal(err)
+	}
+	if agent.Status.BusMigration != nil || agent.Status.BusReplicas != 1 {
+		t.Errorf("never provisioned: migration %+v, busReplicas %d; want none and the asked 1", agent.Status.BusMigration, agent.Status.BusReplicas)
+	}
+
+	agent, r = threeServers()
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), RunID: "2-1", Phase: string(busMigrationDone)}
+	if err := r.resolveA2ABusReplicas(context.Background(), agent); err != nil {
+		t.Fatal(err)
+	}
+	if agent.Status.BusMigration.RunID != "2-1" || agent.Status.BusReplicas != 3 {
+		t.Errorf("not yet provisioned after a run: run %s, busReplicas %d; want the old run and 3", agent.Status.BusMigration.RunID, agent.Status.BusReplicas)
+	}
+	setBusProvisionedCondition(agent, true, "provision-job", metav1.Now())
+	if err := r.resolveA2ABusReplicas(context.Background(), agent); err != nil {
+		t.Fatal(err)
+	}
+	if agent.Status.BusMigration.RunID == "2-1" || busMigrationLeg(agent.Status.BusMigration.Leg) != busMigrationShrink {
+		t.Errorf("once provisioned: run %+v, want a new three-to-one run", agent.Status.BusMigration)
 	}
 }

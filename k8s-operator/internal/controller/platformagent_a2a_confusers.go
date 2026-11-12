@@ -49,7 +49,7 @@ const a2aCalloutConfUser = "callout"
 //
 // It is deliberately not a row of a2aIdentities(): the callout is exempt from
 // the callout, so it must not reach the identity map, and a2aStaticPrincipalNames
-// lists it by hand for auth_users and the reserved principals.
+// lists it by hand for the callout's reserved principal names.
 var a2aCalloutConfIdentity = a2aIdentity{
 	user:     a2aCalloutConfUser,
 	auth:     a2aAuthStatic,
@@ -68,8 +68,8 @@ const (
 	a2aSubjectListIndent = a2aUserBlockIndent + "    "
 )
 
-// The separators the two renders of the static principal names join with.
-// auth_users is nats.conf syntax and its spacing is hashed into
+// The separators auth_users and the callout's reserved principal names join
+// with. auth_users is nats.conf syntax and its spacing is hashed into
 // a2aConfigRolloutHash, so it keeps the spacing it always had; the callout's
 // list is parsed by authcallout.ParseReservedPrincipals, which splits on a bare
 // comma.

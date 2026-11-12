@@ -63,6 +63,8 @@ The verifier's and the callout's topology spreads are `ScheduleAnyway`, so a sin
 
 On a bus that already runs, changing `busReplicas` between 1 and 3 starts a migration that keeps the bus's data. The operator runs it in phases, shown in `status.busMigration` and reported by the `A2ABusMigrating` condition. The admission webhook refuses another change to `busReplicas` while one runs. A run has two hours going forward; a phase still running then counts as failed, and the way back gets two hours of its own. Objects under a run's names that the PlatformAgent does not own are never used: a phase that finds one fails and names it.
 
+A migration starts only on a bus whose provisioning has completed (`BusProvisioned`). A bus never provisioned, with no migration behind it, takes a changed count as asked, since it holds no data yet. That is how the count comes down on a cluster that can't schedule three servers. After a migration, the next one waits for the provisioning that follows it.
+
 The webhook also refuses a switch of `spec.mode` off `next` while a migration runs, or while a `Failed` run waits to be retried or given up, since the run's staging claim can hold the bus's only copy. A switch after a run ended removes `status.busMigration` and what the run left.
 
 The operator runs the migration's work in pods of its own image, so it needs `OPERATOR_IMAGE` set, as the chart does. Without it a `busReplicas` change starts no migration: the bus keeps its count, and an `A2ABusMigrationUnavailable` Warning Event says why.
@@ -93,7 +95,7 @@ Most failures turn the run back on its own. Three to one, before the bus has gon
 A failed way back stops for a person, and so does a failure with no way back (below). The run is then `Failed`, `status.busMigration.failedIn` names where, and the condition names the step to take. A `Failed` run blocks any other migration, and spec changes leave the bus as it is, until a person acts with an annotation on the PlatformAgent that names the run:
 
 - **Retry:** `kubectl annotate platformagent <name> -n <namespace> kubeagents.x-k8s.io/bus-migration-retry=<run>-<attempt>`, with the value the condition gives. It runs the failed step again with a fresh deadline: the clear (from `Clearing`, keeping what it already deleted), the rollback (from `RollingBack` or `RollbackRestoring`) or the unpin (from `Unpinning`). A run may be retried three times; each attempt is recorded in `status.busMigration.retries`.
-- **Give up:** `kubectl annotate platformagent <name> -n <namespace> kubeagents.x-k8s.io/bus-migration-abandon=<run>`. For a run that failed during the freeze, this lifts the freeze, deletes the staging claim and its snapshot, and lets the provision Job recreate, empty, every stream the run did not put back.
+- **Give up:** `kubectl annotate platformagent <name> -n <namespace> kubeagents.x-k8s.io/bus-migration-abandon=<run>`. For a run that failed during the freeze, this lifts the freeze, deletes the staging claim and its snapshot, and runs the provision Job again at once, which recreates, empty, every stream the run did not put back. Ready waits for it.
 
 A rollback that failed keeps the write freeze, the staging claim and the operator's digests until then, so a retry restores the same snapshot. Before retrying, check the `<agent>-a2a-nats-0` pod, and the restore pod's termination message (`kubectl get pod <agent>-bus-rollback-<run> -o jsonpath='{.status.containerStatuses[0].state.terminated.message}'`), which names the stream and the check that failed.
 

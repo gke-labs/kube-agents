@@ -264,9 +264,9 @@ func verifyOrDelete(ctx context.Context, nc *nats.Conn, policy StreamPolicy) err
 	}
 	if d := policy.Check(info.Config); len(d) != 0 {
 		if derr := request(ctx, nc, fmt.Sprintf(streamDeleteSubject, policy.Name), nil, nil); derr != nil {
-			return fmt.Errorf("stream %s: restored config is outside its policy (%s), and deleting it failed: %w", policy.Name, strings.Join(d, "; "), derr)
+			return fmt.Errorf("stream %s: restored %w (%s), and deleting it failed: %w", policy.Name, ErrOutsidePolicy, strings.Join(d, "; "), derr)
 		}
-		return fmt.Errorf("stream %s: restored config is outside its policy (%s); deleted", policy.Name, strings.Join(d, "; "))
+		return fmt.Errorf("stream %s: restored %w (%s); deleted", policy.Name, ErrOutsidePolicy, strings.Join(d, "; "))
 	}
 	return nil
 }

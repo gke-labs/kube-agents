@@ -306,3 +306,24 @@ func TestTheClearLegDeletesTheStreamsAndCanRunAgain(t *testing.T) {
 		}
 	}
 }
+
+// An error that alone overflows the termination log, with no warnings, is
+// cut to fit and reports no warnings: a "0 warnings" entry would read as
+// drift on a restore that failed.
+func TestAnOverflowingErrorReportsNoInventedWarning(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "report")
+	if err := writeReport(p, Report{Error: strings.Repeat("x", 3*terminationMessageLimit)}); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var r Report
+	if err := json.Unmarshal(b, &r); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Warnings) != 0 || len(b) > terminationMessageLimit || r.Error == "" {
+		t.Errorf("report %d bytes, warnings %v, error %d bytes; want no warnings, the error cut to fit", len(b), r.Warnings, len(r.Error))
+	}
+}

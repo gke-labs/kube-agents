@@ -1229,10 +1229,14 @@ func buildBusStagePVC(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.Bus
 // already in status. The pin and unpin Jobs stay for their logs until their
 // TTL.
 func (r *PlatformAgentReconciler) cleanupBusMigration(ctx context.Context, agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus) error {
-	var objs []client.Object
+	// Each object is deleted only if this PlatformAgent controls it: one
+	// someone else made under a run's name was never used, and isn't the
+	// run's to remove (deleteA2AObjectIfOwned).
+	var owned []client.Object
 	for _, identity := range []string{"pin", "unpin", "hash", busMigrationStreamIdentity} {
-		objs = append(objs, &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkloadName(agent, identity, run.RunID), Namespace: agent.Namespace}})
+		owned = append(owned, &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkloadName(agent, identity, run.RunID), Namespace: agent.Namespace}})
 	}
+	var objs []client.Object
 	if busMigrationPhase(run.Phase) != busMigrationFailed || run.GivenUp {
 		pods := &corev1.PodList{}
 		if err := r.List(ctx, pods, client.InNamespace(agent.Namespace), client.MatchingLabels{a2aComponentLabel: busMigrationComponent}); err != nil {
@@ -1244,12 +1248,17 @@ func (r *PlatformAgentReconciler) cleanupBusMigration(ctx context.Context, agent
 				objs = append(objs, pod)
 			}
 		}
-		objs = append(objs,
+		owned = append(owned,
 			&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: busMigrationRunSecret(agent, run.RunID), Namespace: agent.Namespace}},
 			&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: busMigrationStageClaim(agent, run.RunID), Namespace: agent.Namespace}})
 	}
-	for _, obj := range objs {
+	for _, obj := range objs { // the pods, already checked
 		if err := r.Delete(ctx, obj); err != nil && !errors.IsNotFound(err) {
+			return err
+		}
+	}
+	for _, obj := range owned {
+		if err := r.deleteA2AObjectIfOwned(ctx, agent, obj, r.a2aReader(), nil); err != nil {
 			return err
 		}
 	}
@@ -1279,8 +1288,17 @@ func (r *PlatformAgentReconciler) busMigrationTornDown(ctx context.Context, agen
 	if err := r.cleanupBusMigration(ctx, agent, run); err != nil {
 		return err
 	}
-	for _, step := range []string{"pin", "unpin"} {
-		job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkName(agent, run, step), Namespace: agent.Namespace}}
+	// Every migration Job this PlatformAgent controls, any run's and any
+	// attempt's: the pin and unpin Jobs otherwise stay for their TTL.
+	var jobs batchv1.JobList
+	if err := r.a2aReader().List(ctx, &jobs, client.InNamespace(agent.Namespace), client.MatchingLabels{a2aComponentLabel: busMigrationComponent}); err != nil {
+		return err
+	}
+	for i := range jobs.Items {
+		job := &jobs.Items[i]
+		if !metav1.IsControlledBy(job, agent) || job.DeletionTimestamp != nil {
+			continue
+		}
 		if err := r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !errors.IsNotFound(err) {
 			return err
 		}
