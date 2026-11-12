@@ -289,6 +289,19 @@ func (s *sideDoorAdapter) ShowsTaskStatus(conversation string) bool {
 	return ok && shower.ShowsTaskStatus(conversation)
 }
 
+// PostPrivate goes to the primary for its own conversations (PrivatePoster);
+// a door's conversation has one reader, its caller, and no private post.
+func (s *sideDoorAdapter) PostPrivate(conversation, viewer, text string) error {
+	if s.doorFor(conversation) != nil || s.primary == nil {
+		return errNoPrivatePosts
+	}
+	poster, ok := s.primary.(PrivatePoster)
+	if !ok {
+		return errNoPrivatePosts
+	}
+	return poster.PostPrivate(conversation, viewer, text)
+}
+
 // AnswersOnLine answers for the primary's own conversations; a door keeps
 // the terminal edit, which its caller reads.
 func (s *sideDoorAdapter) AnswersOnLine(conversation string) bool {

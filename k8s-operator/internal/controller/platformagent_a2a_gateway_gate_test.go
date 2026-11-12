@@ -59,6 +59,37 @@ func reportCalloutServing(t *testing.T, ctx context.Context, cl client.Client, a
 	if err := cl.Status().Update(ctx, dep); err != nil {
 		t.Fatalf("update callout status: %v", err)
 	}
+	reportBusRolledOut(t, ctx, cl, agent)
+}
+
+// reportBusRolledOut reports the NATS StatefulSet as rolled out at its current
+// generation, every replica updated and Ready. The provision Job's creation
+// waits on that as well as on the callout (a2aProvisionJobWaitsForBus), and
+// the fake client runs no StatefulSet controller, so reportCalloutServing
+// reports both: every rig that serves the callout means the bus to be up too.
+// Absent StatefulSet, nothing to report.
+func reportBusRolledOut(t *testing.T, ctx context.Context, cl client.Client, agent *agentv1alpha1.PlatformAgent) {
+	t.Helper()
+	sts := &appsv1.StatefulSet{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: a2aNATSName(agent), Namespace: agent.Namespace}, sts); err != nil {
+		if errors.IsNotFound(err) {
+			return
+		}
+		t.Fatalf("get NATS StatefulSet: %v", err)
+	}
+	replicas := int32(1)
+	if sts.Spec.Replicas != nil {
+		replicas = *sts.Spec.Replicas
+	}
+	sts.Status.ObservedGeneration = sts.Generation
+	sts.Status.Replicas = replicas
+	sts.Status.ReadyReplicas = replicas
+	sts.Status.UpdatedReplicas = replicas
+	sts.Status.CurrentRevision = "r"
+	sts.Status.UpdateRevision = "r"
+	if err := cl.Status().Update(ctx, sts); err != nil {
+		t.Fatalf("update NATS StatefulSet status: %v", err)
+	}
 }
 
 // reportCalloutStatus puts the callout Deployment into an arbitrary counted
