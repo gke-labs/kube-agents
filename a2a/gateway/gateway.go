@@ -699,8 +699,11 @@ func (g *Gateway) Metrics() *Metrics { return g.metrics }
 // Readiness reports whether Run has bound the event relay, and why not. The
 // adapters and doors start only after the bind, so until then the gateway
 // takes no turns (its chat.notify routes are already up). The metrics
-// listener answers ReadyzPath from it. It latches: once bound it stays ready,
-// and a later loss of TASKS is the rebuild path's to recover, as before.
+// listener answers ReadyzPath from it. The bind latches, and a later loss of
+// TASKS is the rebuild path's to recover, as before; but a bound relay whose
+// NATS connection is down delivers nothing, so readiness also needs the
+// connection. Off the bus for longer than termWaitBusMax, an elected gateway
+// gives its term up (RunOptions.BusDownLimit).
 func (g *Gateway) Readiness() (bool, string) {
 	if g.termWaiting.Load() {
 		if g.termWaitBus.Load() {
@@ -709,6 +712,9 @@ func (g *Gateway) Readiness() (bool, string) {
 		return false, fmt.Sprintf("waiting for bucket %s: the gateway's term can't start until the provision Job creates it", lib.SessionStateBucket)
 	}
 	if g.relayBound.Load() {
+		if g.client != nil && !g.client.Connected() {
+			return false, fmt.Sprintf("waiting for the bus: the NATS connection is down, so the bound event relay durable %s can't deliver", g.relayDurable)
+		}
 		return true, "ready"
 	}
 	if g.relayHeldBack.Load() {
@@ -769,6 +775,50 @@ type RunOptions struct {
 	// relay batches still rendering; nil means relayStopDrainTimeout. A
 	// lost lease has less time than SIGTERM.
 	StopDrain func() time.Duration
+	// BusDownLimit, when positive, ends the run with errTermBusGaveUp once
+	// the NATS connection has been down that long without a break, so an
+	// elected gateway whose own path to the bus failed mid-term gives the
+	// lease to a replica whose bus may answer, as a term start already does
+	// (BeginTerm). A reconnect starts the count again. The election sets it
+	// to termWaitBusMax; zero, the default, never gives up.
+	BusDownLimit time.Duration
+}
+
+// busWatchEvery is how often a run with a BusDownLimit looks at the
+// connection. A var so tests can shorten it.
+var busWatchEvery = time.Second
+
+// watchBus ends the run with errTermBusGaveUp, through cancel, once the
+// connection has been down for limit without a break. It returns when ctx
+// ends or it has given up, and reports the error it ended the run with.
+func (g *Gateway) watchBus(ctx context.Context, limit time.Duration, cancel context.CancelCauseFunc) error {
+	t := time.NewTicker(busWatchEvery)
+	defer t.Stop()
+	var downSince time.Time
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-t.C:
+		}
+		if g.client.Connected() {
+			downSince = time.Time{}
+			continue
+		}
+		now := time.Now()
+		if downSince.IsZero() {
+			downSince = now
+			continue
+		}
+		if down := now.Sub(downSince); down >= limit {
+			// Once per give-up, at Info: during a full outage the lease
+			// cycles between replicas, and each cycle logs this once.
+			g.log.Info("gateway term: the bus has been down mid-term; giving the lease up so a replica whose bus answers can lead", "down", down.Round(time.Second).String(), "giveUpAfter", limit.String())
+			err := fmt.Errorf("%w for %s mid-term, so the lease goes to a replica whose bus may", errTermBusGaveUp, down.Round(time.Second))
+			cancel(err)
+			return err
+		}
+	}
 }
 
 // RunWith is Run with the elected gateway's options.
@@ -778,6 +828,17 @@ func (g *Gateway) RunWith(ctx context.Context, o RunOptions) error {
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	g.runCtx = ctx
+	// busErr is the bus watchdog's give-up, read once watched is closed.
+	var busErr error
+	watched := make(chan struct{})
+	if o.BusDownLimit > 0 && g.client != nil {
+		go func() {
+			defer close(watched)
+			busErr = g.watchBus(ctx, o.BusDownLimit, cancel)
+		}()
+	} else {
+		close(watched)
+	}
 	// Its first try before the relay starts, so on an install with the
 	// bucket every answer the relay posts is marked alike. Their retries
 	// start once the relay binds (afterBind): the provision Job creates both
@@ -837,6 +898,11 @@ func (g *Gateway) RunWith(ctx context.Context, o RunOptions) error {
 		if o.StopDrain != nil {
 			drain = o.StopDrain()
 		}
+		// A run that gave up on the bus can't ack what it renders anyway,
+		// and the lease is waiting: the lost-lease bound.
+		if errors.Is(context.Cause(ctx), errTermBusGaveUp) {
+			drain = min(drain, lostLeaseRelayDrain)
+		}
 		g.relayInFlight.drain(drain)
 		if sub != nil {
 			sub.Stop()
@@ -855,9 +921,14 @@ func (g *Gateway) RunWith(ctx context.Context, o RunOptions) error {
 	// not the backend's.
 	err := g.adapter.Run(ctx, g.enqueueInbound)
 	// Ingress has stopped, so a bind still held back won't happen; once the
-	// bind goroutine is done, bindErr is safe to read.
+	// bind goroutine is done, bindErr is safe to read, and busErr once the
+	// watchdog is.
 	cancel(nil)
 	<-bound
+	<-watched
+	if busErr != nil {
+		return busErr
+	}
 	if bindErr != nil {
 		return bindErr
 	}

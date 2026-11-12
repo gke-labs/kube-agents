@@ -269,6 +269,10 @@ func (e Election) lead(ctx, leaseCtx context.Context, afterCrash bool, leader Le
 	if afterCrash {
 		opts.RelayBindDelay = relayAckWait
 	}
+	// The term start's bound on the bus applies for the whole term: off the
+	// bus that long, the run ends with errTermBusGaveUp and Run releases the
+	// lease and stands back, as for a term start that gave up.
+	opts.BusDownLimit = termWaitBusMax
 	log.Info("gateway election: leading", "lease", e.Lease, "identity", e.Identity, "term", term, "afterCrash", afterCrash)
 	err = lead(work, opts)
 	if cause := lost(); cause != nil {
