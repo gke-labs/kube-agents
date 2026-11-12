@@ -524,8 +524,12 @@ def capability_usage(host_context: str, namespace: str, windows: dict[str, dict]
     stores = attribution.read_stores(host_context, namespace)
     usage = {}
     for name, window in windows.items():
-        start = datetime.fromisoformat(window["start"]).timestamp()
-        usage[name] = attribution.attribute(stores, start, start + window["seconds"], litellm=window.get("tokens"))
+        try:
+            start = datetime.fromisoformat(window["start"]).timestamp()
+            usage[name] = attribution.attribute(stores, start, start + window["seconds"], litellm=window.get("tokens"))
+        except (KeyError, ValueError) as exc:
+            # A window whose measurements were not read costs only its own record.
+            usage[name] = {"error": f"window not attributed: {exc!r}"}
     return usage
 
 
@@ -585,7 +589,8 @@ def summary(name: str, body: dict) -> str:
         failed = [c for c, v in body.get("checks", {}).items() if not v["passed"]]
         return f"{'green' if body.get('green') else 'red'}; failed: {', '.join(failed) or 'none'}"
     if name == USAGE_FILE:
-        return "; ".join(f"{w}: unattributed {v['checks']['unattributed']['share']:.1%}, "
+        return "; ".join(f"{w}: {v['error']}" if "error" in v else
+                         f"{w}: unattributed {v['checks']['unattributed']['share']:.1%}, "
                          f"sum {'sound' if v['checks']['sum']['passed'] else 'unsound'}" for w, v in body.items())
     if name == COST_FILE:
         return f"${body.get('usd', '?')} (infrastructure ${body.get('infrastructure', {}).get('usd', '?')})"

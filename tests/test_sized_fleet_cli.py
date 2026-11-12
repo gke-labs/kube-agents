@@ -232,3 +232,13 @@ class CapabilityUsageTest(unittest.TestCase):
         read.assert_called_once()
         self.assertEqual(list(usage), ["burst", "soak"])
         self.assertEqual(seen, [(3600, {"tokens_input": 1}), (3600, {})])
+
+
+class UsageWindowTest(unittest.TestCase):
+    def test_a_window_that_was_not_measured_costs_only_its_own_record(self):
+        windows = {"burst": {"start": "2026-11-11T19:00:00+00:00", "seconds": 3600, "tokens": {}}, "soak": {}}
+        with mock.patch.object(cli.attribution, "read_stores", return_value={"sessions": []}):
+            usage = cli.capability_usage("ctx", "ns", windows)
+        self.assertIn("overview", usage["burst"])
+        self.assertIn("error", usage["soak"])
+        self.assertIn("soak window (not read)", cli.attribution.markdown(usage))

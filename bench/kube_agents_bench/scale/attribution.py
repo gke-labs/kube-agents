@@ -220,10 +220,32 @@ def attribute(stores: dict[str, Any], start: float, end: float, litellm: dict[st
         if cap == UNATTRIBUTED:
             rule = joined.rules[session["id"]]
             unattributed_rules[rule] = unattributed_rules.get(rule, 0) + 1
+    session_total = sum(r["input"] + r["cached"] + r["output"] for r in rows.values())
+    sum_check = sum_against_litellm(rows, litellm)
+    # Model calls made outside any Hermes session (the memory service's, for one) appear in
+    # LiteLLM's counters only; the design counts them in Unattributed.
+    outside = outside_sessions(rows, litellm)
+    if any(outside.values()):
+        row = rows.setdefault(UNATTRIBUTED, {**dict.fromkeys(TOKEN_FIELDS, 0), "sessions": 0})
+        for name, value in outside.items():
+            row[name] += value
+        unattributed_rules["outside any session"] = 0
     total = sum(r["input"] + r["cached"] + r["output"] for r in rows.values())
     return {"capabilities": rows, "overview": overview(rows, total), "total_tokens": total,
-            "unattributed_reasons": unattributed_rules, "checks": checks(rows, total, litellm),
+            "session_tokens": session_total, "outside_sessions": outside,
+            "unattributed_reasons": unattributed_rules,
+            "checks": {"unattributed": unattributed_check(rows, total), "sum": sum_check},
             "errors": list(stores.get("errors", []))}
+
+
+def outside_sessions(rows: dict[str, dict[str, int]], litellm: dict[str, float] | None) -> dict[str, int]:
+    """LiteLLM's tokens beyond the session rows' sums: input (cached apart) and output."""
+    if not litellm:
+        return {"input": 0, "cached": 0, "output": 0}
+    cached = max(0, int(litellm.get("tokens_cached", 0)) - sum(r["cached"] for r in rows.values()))
+    uncached = int(litellm.get("tokens_input", 0)) - int(litellm.get("tokens_cached", 0))
+    return {"input": max(0, uncached - sum(r["input"] for r in rows.values())), "cached": cached,
+            "output": max(0, int(litellm.get("tokens_output", 0)) - sum(r["output"] for r in rows.values()))}
 
 
 def overview(rows: dict[str, dict[str, int]], total: int) -> list[dict[str, Any]]:
@@ -239,29 +261,34 @@ def overview(rows: dict[str, dict[str, int]], total: int) -> list[dict[str, Any]
     return lines
 
 
-def checks(rows: dict[str, dict[str, int]], total: int, litellm: dict[str, float] | None) -> dict[str, Any]:
-    """The design's two checks. The sum is compared input and output apart, cached input counted once."""
+def unattributed_check(rows: dict[str, dict[str, int]], total: int) -> dict[str, Any]:
+    """The Unattributed share of the window's tokens, outside-session tokens included, under 5 %."""
     unattributed = rows.get(UNATTRIBUTED, {})
     share = (unattributed.get("input", 0) + unattributed.get("cached", 0) + unattributed.get("output", 0)) / total \
         if total else 0.0
-    result: dict[str, Any] = {"unattributed": {"share": round(share, 4), "passed": share < UNATTRIBUTED_LIMIT}}
+    return {"share": round(share, 4), "passed": share < UNATTRIBUTED_LIMIT}
+
+
+def sum_against_litellm(rows: dict[str, dict[str, int]], litellm: dict[str, float] | None) -> dict[str, Any]:
+    """The session rows against LiteLLM's counters, input and output apart, cached input counted once."""
     if litellm is None:
-        result["sum"] = {"passed": False, "reason": "no LiteLLM counters for the window"}
-        return result
+        return {"passed": False, "reason": "no LiteLLM counters for the window"}
     ours = {"input": sum(r["input"] + r["cached"] for r in rows.values()),
             "output": sum(r["output"] for r in rows.values())}
     theirs = {"input": float(litellm.get("tokens_input", 0)), "output": float(litellm.get("tokens_output", 0))}
     # No traffic on either side is a sound window; traffic on one side only is not.
     ratios = {k: round(ours[k] / theirs[k], 4) if theirs[k] else (1.0 if not ours[k] else None) for k in ours}
     passed = all(r is not None and abs(r - 1) <= SUM_TOLERANCE for r in ratios.values())
-    result["sum"] = {"sessions": ours, "litellm": theirs, "ratio": ratios, "passed": passed}
-    return result
+    return {"sessions": ours, "litellm": theirs, "ratio": ratios, "passed": passed}
 
 
 def markdown(record: dict[str, dict[str, Any]]) -> str:
     """The token overview and a row for every capability, for each window in ``record``."""
     lines = ["# Model tokens by capability", ""]
     for window, body in record.items():
+        if "error" in body:
+            lines += [f"## {window} window (not read)", "", body["error"], ""]
+            continue
         sound = all(c.get("passed") for c in body["checks"].values())
         lines += [f"## {window} window ({'sound' if sound else 'unsound'})", "",
                   "| Capability | Tokens | Share |", "| --- | ---: | ---: |"]
