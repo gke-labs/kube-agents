@@ -20,6 +20,11 @@ import (
 // discordChunk leaves headroom under Discord's 2000-char message cap.
 const discordChunk = 1900
 
+// lineDoneMark ends a completed task's live message on a backend that
+// answers on the line (LineAnswerer, doneTerminalLine): the glyph alone,
+// where the terminal edit elsewhere reads "✅ completed".
+const lineDoneMark = "✅"
+
 // progressCap bounds the progress text embedded in rolling lines and status
 // answers, so one artifact can't blow a chat edit past the backend cap.
 const progressCap = 300
@@ -766,6 +771,12 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		rec.markCardsAnswer(taskID)
 	}
 
+	// doneLine is the task's live message on a backend that answers on the
+	// line (LineAnswerer): a hand-off acknowledgement is edited onto it
+	// (answerOnLine), which sets lineAnswered so the terminal edit below
+	// leaves it be, and any other completed task ends it as lineDoneMark.
+	doneLine := g.answerLineFor(rec, taskID)
+	lineAnswered := false
 	switch s.Status.State {
 	case lib.StateCompleted:
 		// Whole, to the adapter whose caller is a program, before the chunked
@@ -802,6 +813,15 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		if !isConsoleConversation(rec.Key) {
 			if ref.TerminalObserved && result == completedNonTextResult {
 				// The heal already posted the status card; skip completedNonTextResult.
+			} else if doneLine != "" && toCards && result != completedNonTextResult {
+				// The task's live message becomes the acknowledgement,
+				// and takes no terminal edit below (LineAnswerer); an
+				// edit that does not land posts it instead. An answer
+				// posts, so it notifies: a Chat edit raises none, and
+				// the acknowledgement is followed by the plan and the
+				// report, which do. The stand-in for a non-text result is
+				// a notice, not an answer, and posts.
+				lineAnswered = g.answerOnLine(rec.Key, doneLine, answer)
 			} else {
 				g.postMessage(rec.Key, answer)
 			}
@@ -837,14 +857,14 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	g.terminalMark(rec, taskID, s.Status.State, terminal)
 
 	if active := rec.ActiveTask; active != nil && active.TaskID == taskID {
-		if active.StatusMsgID != "" {
+		if active.StatusMsgID != "" && !lineAnswered {
 			// The same display gate as the rolling line: under default the
 			// terminal edit carries the state and never the narration.
 			progress := rs.progress
 			if g.cfg.DisplayMode == displayModeDefault {
 				progress = ""
 			}
-			g.renderLine(rec.Key, active.StatusMsgID, withLineNote(terminalLine(s.Status.State, progress), active.LineNote), rs, "")
+			g.renderLine(rec.Key, active.StatusMsgID, withLineNote(doneTerminalLine(s.Status.State, progress, doneLine != ""), active.LineNote), rs, "")
 		}
 		unmarkOnSupervisorTerminal(rec, taskID, source)
 		rec.ActiveTask = nil
@@ -872,11 +892,13 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		// that kept it. Its answer ("delegated to platform") is task
 		// activity for the session-thread rule all the same; LastActivity
 		// stays the active task's business.
-		progress := rs.progress
-		if g.cfg.DisplayMode == displayModeDefault {
-			progress = ""
+		if !lineAnswered {
+			progress := rs.progress
+			if g.cfg.DisplayMode == displayModeDefault {
+				progress = ""
+			}
+			g.renderLine(rec.Key, parent.StatusMsgID, doneTerminalLine(s.Status.State, progress, doneLine != ""), rs, "")
 		}
-		g.renderLine(rec.Key, parent.StatusMsgID, terminalLine(s.Status.State, progress), rs, "")
 		setParentLine(rec, taskID, "")
 		if source == TerminalFromExecutor {
 			rec.LastTaskActivity = time.Now().UTC()
@@ -1183,6 +1205,17 @@ func statusLine(state lib.TaskState, progress string) string {
 		line += " — " + progress
 	}
 	return line
+}
+
+// doneTerminalLine is terminalLine, or on a backend that answers on the
+// line (onLine) the bare lineDoneMark for a completed task: its answer has
+// posted, and the line ends as the ask's reaction comes off on Slack,
+// rather than reading as a verdict under the question.
+func doneTerminalLine(state lib.TaskState, progress string, onLine bool) string {
+	if onLine && state == lib.StateCompleted {
+		return lineDoneMark
+	}
+	return terminalLine(state, progress)
 }
 
 func terminalLine(state lib.TaskState, progress string) string {

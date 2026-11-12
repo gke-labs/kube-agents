@@ -402,6 +402,7 @@ data:
       ssh_key: /etc/sandbox-ssh/id_ed25519
       ssh_port: 2222
       ssh_user: agent
+      timeout: 180
       workspace_root: /opt/data
   managed.env: |
     API_SERVER_KEY=cluster-internal-trusted

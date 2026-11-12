@@ -5572,11 +5572,12 @@ NON_INSPECTING_COMMAND_RE = re.compile(
 # A command has to reach a cluster or the cloud API to have checked anything.
 # An allowlist rather than a deny-list because the failure mode being closed is
 # an agent inventing plausible-looking filler; a new SOP that needs another
-# binary adds it here and `test_check_commands_use_an_inspection_binary` says so.
+# binary adds it here; `test_a_command_naming_no_inspection_binary_is_rejected`
+# holds the other side.
 # fleet_upgrade_report.py is the fleet-upgrade-verification skill's read-only
 # reporter; the upgrade audit's 3.11 records its invocation as the command that
-# ran, and that invocation names none of the six binaries.
-INSPECTION_BINARIES = ("kubectl", "gcloud", "gsutil", "bq", "helm", "curl", "fleet_upgrade_report.py")
+# ran, and that invocation names none of the five binaries.
+INSPECTION_BINARIES = ("kubectl", "gcloud", "bq", "helm", "curl", "fleet_upgrade_report.py")
 
 MIN_CHECK_COMMAND_CHARS = 8
 

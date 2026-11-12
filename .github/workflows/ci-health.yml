@@ -369,14 +369,15 @@ jobs:
       # and it runs before either auth step. `gcloud auth login --cred-file`
       # is what setup-gcloud would have done: it makes the credential the
       # active account for every gcloud call in the job, the `gcloud storage`
-      # reads and `gcloud auth print-access-token` alike. (The reads were
-      # gsutil's until 2026-10; gsutil ignored the credential file the auth
-      # step exports, and without this login every call ran as an anonymous
-      # caller: 401 on the bucket, 40 failed ticks on 2026-09-10.) Moving
-      # setup-gcloud below this auth step would fix only this half; the
-      # publisher half below needs the same login (or a second SDK download),
-      # so one mechanism serves both. An empty path would send gcloud to the
-      # interactive browser flow and hang the job, hence the `:?` guard.
+      # reads and `gcloud auth print-access-token` alike. (Until 2026-10 the
+      # reads used the legacy storage client, which ignored the credential
+      # file the auth step exports, and without this login every call ran as
+      # an anonymous caller: 401 on the bucket, 40 failed ticks on
+      # 2026-09-10.) Moving setup-gcloud below this auth step would fix only
+      # this half; the publisher half below needs the same login (or a second
+      # SDK download), so one mechanism serves both. An empty path would send
+      # gcloud to the interactive browser flow and hang the job, hence the
+      # `:?` guard.
       - name: Make the Prow-archive reader credential the active account
         run: gcloud auth login --cred-file="${GOOGLE_GHA_CREDS_PATH:?the auth step exported no credential file}" --quiet
 

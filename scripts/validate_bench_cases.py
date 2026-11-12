@@ -464,15 +464,6 @@ FIXTURE_NOT_READY = {
         "registers it, so the context check fails with the repository absent, "
         "which is broken rather than red"
     ),
-    "remediation-context-repository-owns-the-fix": (
-        "#5213: needs the three-part fixture its fixture/README.md describes in each "
-        "pool install: a context repository holding the payments chart, registered "
-        "in context_repos at a pinned ref (the registration #4243 also waits for), "
-        "the clusters/<cluster>/demo-shop/payments/ HelmRelease directory on the "
-        "GitOps repository, and the rendered workload on the agent host; no pool "
-        "install carries them, so the objective fails with the chart repository "
-        "absent, which is broken rather than red"
-    ),
     "obtainability-untargeted-compute-class-manifest": (
         "#2540: needs a ComputeClass cluster without default ComputeClass and with "
         "an untargeted workload (untargeted-worker) in each pool project, so 3.24's "

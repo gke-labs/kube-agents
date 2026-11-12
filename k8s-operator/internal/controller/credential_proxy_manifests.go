@@ -304,7 +304,8 @@ const (
 	// figure follows a raised ephemeral-storage override the way the volume
 	// does (credentialProxyEmptyDirSizeLimit), /tmp keeps its cap, and an
 	// override lowered under the two caps together splits the limit between
-	// them (credentialProxyEvictionBytes). In the
+	// them (credentialProxyEvictionBytes). The exec tier rewrites both to its
+	// own fixed caps (credentialProxyExecTierStateSizeLimit). In the
 	// base env list and so reserved in mergeCredentialProxyEnv, because a CR
 	// that could set either would detach the gate from the eviction threshold.
 	credentialProxyStateLimitEnv = "CREDENTIAL_PROXY_STATE_LIMIT_BYTES" // #nosec G101 -- Env var name, not a credential

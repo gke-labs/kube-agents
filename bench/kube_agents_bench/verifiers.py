@@ -102,7 +102,7 @@ from kube_agents_bench import (
     worker_trajectory,
 )
 from kube_agents_bench.parsing import DELEGATION_TOOL
-from kube_agents_bench.shell_words import _INTERPRETER_RE, _command_word_index, _shell_argvs, _without_grep_patterns
+from kube_agents_bench.shell_words import _INTERPRETER_RE, _command_word_index, _shell_argvs, _typed_call_may_join, _without_grep_patterns
 from kube_agents_bench.fleet import (
     ROLE_PATTERN,
     FleetRoleUnresolved,
@@ -2013,7 +2013,18 @@ class ToolCalledVerifier(BaseVerifier):
                 reason=_NO_TRANSCRIPT_REASON,
             )
         entries = [entry for entry in snap.trajectory if isinstance(entry, dict)]
-        if self.scope != "router" and not any(entry.get("agent") for entry in entries):
+        # The harness's NO_WORKER_CALLS_ENTRY says the workers ran and made no
+        # call, on a clean capture: grade zero calls instead of an unobservable subject.
+        names = {entry.get("name") for entry in entries}
+        # Only the leaves the scorer grades beside the entry (cases.worker_calls_checks):
+        # workers scope, no result pattern, so both transports agree.
+        no_worker_calls = (
+            self.scope == "workers"
+            and self.result is None
+            and worker_trajectory.NO_WORKER_CALLS_ENTRY in names
+            and worker_trajectory.GAP_ENTRY not in names
+        )
+        if self.scope != "router" and not no_worker_calls and not any(entry.get("agent") for entry in entries):
             return VerificationResult(
                 success=False,
                 status="error",
@@ -2548,6 +2559,8 @@ _TERMINAL_TOOL = "terminal"
 _CODE_TOOLS = frozenset({_TERMINAL_TOOL, "execute_code"})
 _CODE_ARG = "code"
 _COMMAND_ARG = "command"
+# The one key of an argument object the pod clipped: ``{"raw": text}``.
+_CLIPPED_ARGS_KEY = "raw"
 # The head of a ``"command"`` literal the pod clipped before its closing quote:
 # what is there is still the command's start, which is where its verb is.
 _CLIPPED_COMMAND_HEAD_RE = re.compile(r'"command"\s*:\s*"((?:[^"\\]|\\.)*)')
@@ -2702,6 +2715,31 @@ def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[str, float | Non
     return calls
 
 
+def _terminal_call_texts(trajectory: list[Any]) -> list[tuple[str, str]]:
+    """``(card, command)`` per tagged ``terminal`` call, as :func:`_worker_terminal_calls` reads it."""
+    texts: list[tuple[str, str]] = []
+    for entry in trajectory:
+        if isinstance(entry, dict) and entry.get("agent") and entry.get("name") == _TERMINAL_TOOL:
+            command = _code_call_text(entry)
+            if command is not None:
+                texts.append((str(entry.get("task") or entry.get("session") or ""), command))
+    return texts
+
+
+def _clipped_cards(trajectory: list[Any]) -> set[str]:
+    """The cards with a code-tool call whose arguments the pod clipped (``{"raw": text}``):
+    the lines the clip cut off are not in the typed text."""
+    return {
+        str(entry.get("task") or entry.get("session") or "")
+        for entry in trajectory
+        if isinstance(entry, dict)
+        and entry.get("agent")
+        and entry.get("name") in _CODE_TOOLS
+        and isinstance(entry.get("args"), dict)
+        and set(entry["args"]) == {_CLIPPED_ARGS_KEY}
+    }
+
+
 def _card_lineages(parents: dict[str, str], cards: list[str]) -> dict[str, str]:
     """Each card to the one name of the lineage it belongs to.
 
@@ -2820,6 +2858,19 @@ class WorkerCommandsVerifier(BaseVerifier):
     as well. Another way to
     read the word back from a joined line (``declare -p``, ``history``) is
     not seen.
+    A dangling grep's pattern slot can also
+    hold the next typed line's first word (``grep -rn`` over ``U=<url>`` and
+    ``curl "$U"``), which the cut would remove, and so would a pattern
+    exemption that removes a piped grep's pattern. So no exemption reads a row
+    of a card whose tagged ``terminal`` calls, as the pod stores them, include
+    one that may hold more than one line: a newline outside quotes, a
+    backslash before a blank (an escaped blank, or what the pod's scrub
+    leaves of an escaped backslash at a line end), or a line the shell reader
+    cannot split (an open quote, but also a heredoc body with an apostrophe);
+    nor a row of a card with a clipped code-tool call (#5237). This is a
+    spurious red for an honest grep for a forbidden word, or an exempt query,
+    on a card that also typed any multi-line command, such as a heredoc. A
+    card whose calls did not reach the trajectory is read from the row alone.
     ``required_runs``: each names a script (by basename, or module stem under
     ``-m``), flags and word patterns; some command's shell segment, read as an
     argv, must run it with those flags after it, a word matching each pattern,
@@ -2945,7 +2996,13 @@ class WorkerCommandsVerifier(BaseVerifier):
             raise ValueError("forbidden_result_patterns read results inside the window after_result_pattern opens; set both")
         return self
 
-    def _without_exempt_text(self, command: str) -> str:
+    def _without_exempt_text(self, command: str, joined: bool = False) -> str:
+        # ``joined``: the row's card typed a call the row may have joined lines of
+        # (see the grep cut), so no exemption reads it and it is graded whole
+        # (#5237): a pattern exemption can remove a joined line as a grep's
+        # pattern too (a pip query piped into a dangling grep).
+        if joined:
+            return command
         if self.exempt_grep_patterns:
             command = _without_grep_patterns(command) or command
         for pattern in self.exempt_patterns:
@@ -2967,6 +3024,8 @@ class WorkerCommandsVerifier(BaseVerifier):
         result_hits: list[tuple[str, str]] = []
         # Logged cards' calls only the required checks read (see the log-row branch).
         beside_rows: list[str] = []
+        # The log rows of a card that typed a call the row may have joined lines of.
+        joined_rows: set[str] = set()
         forbidding = bool(self.forbidden_patterns or self.forbidden_runs or self.forbidden_result_patterns)
         if self.after_result_pattern is None:
             # ``None`` stays an error even when the trajectory carries tagged calls: it
@@ -3030,6 +3089,19 @@ class WorkerCommandsVerifier(BaseVerifier):
                     joined.append(f"{count} tagged call{'' if count == 1 else 's'} of the logged cards, read by the required checks only")
                 if joined:
                     sources = f" ({len(logged_commands)} from the filed cards' logs, " + ", ".join(joined) + ")"
+            if self.exempt_grep_patterns:
+                # A row joins a typed newline into a space, so a dangling grep's
+                # pattern slot can hold the next line's first word, which the cut
+                # would remove. A card whose stored terminal calls include one that
+                # may hold more than one line, or a clipped one, keeps every grep
+                # row whole. An ``execute_code`` program is not shell.
+                joined = _clipped_cards(snap.trajectory) | {
+                    card for card, command in _terminal_call_texts(snap.trajectory) if _typed_call_may_join(command)
+                }
+                if "" in logged:
+                    joined_rows = set(logged_commands) if joined else set()
+                else:
+                    joined_rows = {str(row.get("command", "")) for row in snap.worker_commands if str(row.get("task") or "") in joined}
             typed = logged_commands + children
             windowed = typed
         else:
@@ -3103,9 +3175,9 @@ class WorkerCommandsVerifier(BaseVerifier):
         # exemption touched is out of the required list. The forbidden list
         # reads the windowed commands (every command without a window).
         with_calls = typed + beside_rows
-        commands = [c for c in with_calls if self._without_exempt_text(c) == c]
+        commands = [c for c in with_calls if self._without_exempt_text(c, c in joined_rows) == c]
         exempted = f" ({len(with_calls) - len(commands)} exempted)" if len(commands) < len(with_calls) else ""
-        graded = [(c, self._without_exempt_text(c)) for c in windowed]
+        graded = [(c, self._without_exempt_text(c, c in joined_rows)) for c in windowed]
         missing = [p for p in self.required_patterns if not any(re.search(p, c) for c in commands)]
         hits = [(p, c, rest) for p in self.forbidden_patterns for c, rest in graded if re.search(p, rest)]
         hits += [(p, f"the result of {c[:_SHOWN_COMMAND_CHARS]}", f"the result of {c[:_SHOWN_COMMAND_CHARS]}") for p, c in result_hits]
@@ -4271,7 +4343,8 @@ def _forge_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
     is not transient. Every other non-2xx answer or OSError (a 404, a
     permission 403, a redirect, a certificate failure, a host that does not
     resolve or refuses the connection, an unknown forge) is noted as not
-    transient, and keeps the check's error plain."""
+    transient, and keeps the check's error plain unless the check drops it as
+    not behind the error."""
     try:
         status, payload = _http_get_json(url, token, timeout)
     except OSError as exc:
@@ -4312,6 +4385,48 @@ def _note_forge_read(transient: bool, what: str) -> None:
         noted.append((transient, what))
 
 
+def _forge_reads_mark() -> int:
+    """Where the current candidate's forge reads start in the decision's list."""
+    noted = _forge_unavailable.get()
+    return len(noted) if noted is not None else 0
+
+
+def _forge_read_handled(status: int) -> None:
+    """The caller read the non-2xx answer of the read it just made as control
+    flow (a fallback, a page that is not there), so that read explains no
+    error: its entry leaves the decision. Only that read's own entry, and only
+    when it was not transient."""
+    noted = _forge_unavailable.get()
+    if noted and noted[-1] == (False, f"answered {status}"):
+        noted.pop()
+
+
+class _RejectedCandidates(list):
+    """A forge-reading check's rejected candidates. A rejection is a verdict,
+    so a rejected candidate's reads explain no error and leave the decision,
+    when every one of them was a plain answer (a 404, say). When one was
+    transient, the rejection may rest on an outage the code cannot tell from
+    a verdict, so the entries stay and a plain one is added: the check's error
+    stays on rung 2."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._since = 0
+
+    def begin(self) -> None:
+        """Start a candidate: only reads noted after this count for it."""
+        self._since = _forge_reads_mark()
+
+    def append(self, reason: str) -> None:
+        noted = _forge_unavailable.get()
+        if noted is not None:
+            if any(transient for transient, _ in noted[self._since:]):
+                noted.append((False, "a candidate rejected beside a transient read"))
+            else:
+                del noted[self._since:]
+        super().append(reason)
+
+
 class _UnresolvedCandidates(list):
     """pull_request_opened's unevaluable candidates. One left unevaluable with
     no transient forge read behind it (a malformed answer, a clause not
@@ -4324,8 +4439,7 @@ class _UnresolvedCandidates(list):
 
     def begin(self) -> None:
         """Start a candidate: only reads noted after this count for it."""
-        noted = _forge_unavailable.get()
-        self._since = len(noted) if noted is not None else 0
+        self._since = _forge_reads_mark()
 
     def append(self, reason: str) -> None:
         noted = _forge_unavailable.get()
@@ -4339,8 +4453,10 @@ def _marks_forge_unavailable(verify: Callable[[Any, float], VerificationResult])
     the check's forge reads that did not answer 2xx were all transient
     (:func:`_forge_get_json`), and there was at least one.
 
-    One read that failed for another reason keeps the error plain, whichever
-    read the error came from. Only an ``error`` is marked: a pass or a fail
+    One read that failed for another reason keeps the error plain, unless the
+    check showed it did not produce the error: a read it answered as control
+    flow (:func:`_forge_read_handled`), or a candidate it rejected
+    (:class:`_RejectedCandidates`). Only an ``error`` is marked: a pass or a fail
     was decided on what the reads did return. The marker leads, so the reason
     the check gave is kept whole."""
 
@@ -4785,9 +4901,10 @@ class LedgerIssueContainsVerifier(BaseVerifier):
 
         budget = single_call_timeout(timeout_sec)
         matches: list[dict[str, Any]] = []
-        rejected: list[str] = []
+        rejected = _RejectedCandidates()
         unseen: list[str] = []
         for repo, number in seen:
+            rejected.begin()
             slug = f"{repo}#{number}"
             url = _issue_api_url(forge, repo, number)
             try:
@@ -4801,6 +4918,8 @@ class LedgerIssueContainsVerifier(BaseVerifier):
                 )
             if status_code == 404:
                 if forge == forges.FORGE_GITLAB and _is_configured_gitlab_project(repo):
+                    # The project read decides what the 404 means.
+                    _forge_read_handled(status_code)
                     try:
                         why = _gitlab_project_unseen(repo, token, budget)
                     except OSError as exc:
@@ -5195,8 +5314,9 @@ class ForgeIssueStateVerifier(BaseVerifier):
         started = datetime.fromtimestamp(snap.started_at, tz=timezone.utc)
         window_start = started - timedelta(seconds=self.max_clock_skew_sec)
         budget = single_call_timeout(timeout_sec)
-        rejected: list[str] = []
+        rejected = _RejectedCandidates()
         for repo, number in seen:
+            rejected.begin()
             slug = f"{repo}#{number}"
             if _gitlab_path_key(repo) != _gitlab_path_key(gitops_repo):
                 rejected.append(
@@ -5215,6 +5335,8 @@ class ForgeIssueStateVerifier(BaseVerifier):
                 )
             if status_code == 404:
                 if forge == forges.FORGE_GITLAB and _is_configured_gitlab_project(repo):
+                    # The project read decides what the 404 means.
+                    _forge_read_handled(status_code)
                     try:
                         why = _gitlab_project_unseen(repo, token, budget)
                     except OSError as exc:
@@ -6278,6 +6400,10 @@ class PullRequestOpenedVerifier(BaseVerifier):
         base = f"{forges.github_api_root()}/repos/{owner}/{repo}"
         first, payload = _forge_get_json(f"{base}/issues/{number}", token, budget)
         status_code = first
+        if first in (403, 404):
+            # The pulls endpoint answers for the same number; the issues
+            # endpoint's refusal is a route, not the error.
+            _forge_read_handled(first)
         if first in (401, 403, 404):
             status_code, payload = _forge_get_json(f"{base}/pulls/{number}", token, budget)
         if 401 in (first, status_code):
@@ -6395,6 +6521,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
             budget,
         )
         if status == 404:
+            _forge_read_handled(status)
             return changed, None, payload, None, None
         if status == 401:
             return (
@@ -6470,11 +6597,11 @@ class PullRequestOpenedVerifier(BaseVerifier):
         slug = f"{repo}!{number}"
         status, mr = _forge_get_json(f"{base}/merge_requests/{number}", token, budget)
         if status == 404:
-            why = (
-                _gitlab_project_unseen(repo, token, budget)
-                if _is_configured_gitlab_project(repo)
-                else None
-            )
+            why = None
+            if _is_configured_gitlab_project(repo):
+                # The project read decides what the 404 means.
+                _forge_read_handled(status)
+                why = _gitlab_project_unseen(repo, token, budget)
             if why:
                 return "unresolved", f"{slug}: {why}", None
             return "reject", f"{slug}: no such merge request (404)", None
@@ -6528,7 +6655,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 ), None
             if status == 200 and isinstance(commit, dict):
                 pushed = _parse_github_time(commit.get("committed_date"))
-            elif status != 404:
+            elif status == 404:
+                _forge_read_handled(status)
+            else:
                 return "unresolved", (
                     f"unexpected GitLab response {status} for {slug}'s head commit; "
                     "this check could not be evaluated"
@@ -6775,13 +6904,14 @@ class PullRequestOpenedVerifier(BaseVerifier):
                     "before this run, so the window was not widened)"
                 )
         budget = single_call_timeout(timeout_sec)
-        rejected: list[str] = []
+        rejected = _RejectedCandidates()
         # A candidate the API cannot answer for only ends the check if nothing
         # else resolves. An agent that mistypes a repository slug beside the
         # real URL would otherwise error, and an error is rung 2, which reds the
         # eval job for every open pull request.
         unresolved = _UnresolvedCandidates()
         for owner, repo, number in seen:
+            rejected.begin()
             unresolved.begin()
             slug = f"{owner}/{repo}#{number}"
             if self.owner and owner.lower() != self.owner.lower():

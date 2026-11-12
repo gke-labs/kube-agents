@@ -441,7 +441,8 @@ WATERMARK_LEAVE_BAND_PCT = 3
 PERCENT = 100
 # The scratch volumes' caps, in bytes, as the operator renders their emptyDir
 # sizeLimits (credential_proxy_manifests.go, credentialProxyStateLimitEnv and
-# credentialProxyTmpLimitEnv; tests/test_credential_proxy_sizing_parity.py
+# credentialProxyTmpLimitEnv; on an exec pod, the tier's fixed caps from
+# credential_proxy_exec_tier.go; tests/test_credential_proxy_sizing_parity.py
 # holds the names equal). An emptyDir is a directory on the node's filesystem,
 # so statvfs on it reports the node's fill, not the cap the kubelet evicts on,
 # and the kubelet's image GC keeps a busy node's fill between its own
@@ -654,6 +655,21 @@ SHUTDOWN_DRAIN_SECONDS = 30
 # credentialProxyExecTierTerminationGraceSeconds (380 s) are literals too, and a
 # drain that followed a longer timeout would outlast them.
 EXEC_SHUTDOWN_DRAIN_SECONDS = 360
+# The variable that stops gcloud writing a log file for each command, set in
+# the commands an exec pod runs. gcloud logs under CLOUDSDK_CONFIG on the
+# state volume and keeps 30 days; at the tier's 8-slot cap that measured about
+# 386 KiB a command, some 3.3 GiB a day, past any emptyDir the pod could carry
+# (#4536). The caller still gets the command's stderr and the audit line; only
+# the pod's own log files, for debugging a gcloud failure on the pod, are lost.
+GCLOUD_FILE_LOGGING_OFF_ENV = "CLOUDSDK_CORE_DISABLE_FILE_LOGGING"
+# kubectl's disk cache under the command HOME (discovery and HTTP responses),
+# which kubectl rebuilds on the next command. On an exec pod nothing else
+# frees it: a sweep reaches every cluster on every replica, at about 0.3 MiB a
+# cluster (1.9 MiB with the OpenAPI schemas), so it is the soft watermark's
+# reclaimer there (CommandExecutor.reclaim_kubectl_cache).
+KUBECTL_CACHE_DIR_NAME = "cache"
+# The prefix a reclaimed cache is renamed to before it is removed.
+KUBECTL_CACHE_RECLAIMED_PREFIX = "cache.reclaimed-"
 # After the drain, how long the stop waits for the requests whose commands it
 # ended to write their answers: KILL_GRACE_SECONDS and KILL_SETTLE_SECONDS for
 # the process group, the poll that notices the stop, and the write. A request
@@ -789,6 +805,15 @@ WATCHER_K8S_ACCEPT_SHAPE = re.compile(r"^[\x20-\x7e]{1,256}\Z")
 # rather than relayed in part.
 WATCHER_POD_METADATA_MAX_BYTES = 1 << 20
 WATCHER_GCP_CONTENT_TYPE = "application/json"
+# The header the shim's get-credentials check sends on its one relay read
+# (credential_proxy_client.GET_CREDENTIALS_CHECK_HEADER, held equal by a test).
+# It only narrows: with it, a clusters-get for a cluster that
+# spec.scope.exclude.clusters names is refused, so the shim sends the command
+# on to /v1/exec and that route's excluded-cluster refusal answers (#5305).
+# Without it the read is unchanged, so the reconcile's existence check and
+# every other control-plane read stay allowed. A caller that sets it can only
+# be refused more, never reach more.
+GET_CREDENTIALS_CHECK_HEADER = "X-Kube-Agents-Get-Credentials-Check"
 # The caller's host segment is held to `api_policy.HOST_SHAPE` -- a lower-case
 # DNS name, no scheme, port, user info or percent-encoding -- before the
 # policy sees it. Anything else is a 400, not something to normalise: the
@@ -8942,6 +8967,7 @@ class CommandExecutor:
         max_concurrent_commands: int = DEFAULT_MAX_CONCURRENT_COMMANDS,
         memory_limit_bytes: int | None = None,
         metrics: "ProxyMetrics | None" = None,
+        gcloud_file_logging: bool = True,
         exclusions: "scope_exclude.Exclusions | None" = None,
     ) -> None:
         self.timeout_seconds = timeout_seconds
@@ -9234,6 +9260,10 @@ class CommandExecutor:
         ):
             if name in os.environ:
                 self.environment[name] = os.environ[name]
+        # After the forwarded names, so the pod's environment cannot turn it
+        # back on (GCLOUD_FILE_LOGGING_OFF_ENV).
+        if not gcloud_file_logging:
+            self.environment[GCLOUD_FILE_LOGGING_OFF_ENV] = "1"
         # Read here rather than forwarded into `self.environment`: this decides
         # which kubeconfig a request resolves to, and a subprocess has no
         # business reading it or overriding it.
@@ -9337,6 +9367,28 @@ class CommandExecutor:
         slot or for room under the child memory budget."""
         with self._slot_condition:
             return len(self._slot_queue)
+
+    def reclaim_kubectl_cache(self) -> int:
+        """Remove kubectl's disk cache under the command HOME: an exec pod's
+        reclaimer for the resource watermark gate. The cache is renamed first
+        and the renamed folder removed, so a kubectl reading it on another
+        slot keeps its open files and the next command builds a new cache.
+        A renamed folder an earlier call left behind goes too. Returns how
+        many folders this call removed."""
+        kube_dir = self.home_dir / ".kube"
+        removed = 0
+        cache = kube_dir / KUBECTL_CACHE_DIR_NAME
+        if cache.is_dir():
+            target = kube_dir / f"{KUBECTL_CACHE_RECLAIMED_PREFIX}{uuid.uuid4().hex}"
+            try:
+                cache.rename(target)
+            except FileNotFoundError:
+                pass
+        if kube_dir.is_dir():
+            for stale in kube_dir.glob(f"{KUBECTL_CACHE_RECLAIMED_PREFIX}*"):
+                shutil.rmtree(stale, ignore_errors=True)
+                removed += not stale.exists()
+        return removed
 
     def admission_snapshot(self) -> "AdmissionSnapshot":
         """What is in use against each cap, read under the lock at scrape time:
@@ -14417,6 +14469,19 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 },
             )
             return
+        if decision.rule_id == api_policy.GKE_CLUSTER_GET_RULE and self.headers.get(GET_CREDENTIALS_CHECK_HEADER):
+            # The route's pattern has fixed the path's shape:
+            # v1/projects/<project>/locations/<location>/clusters/<cluster>.
+            segments = path.split("/")
+            try:
+                self.exclusions.check(segments[2], segments[4], segments[6])
+            except scope_exclude.ExcludedCluster as exc:
+                LOGGER.warning("api excluded cluster refused request_id=%s rule=%s", request_id, exc.rule)
+                self._json(
+                    HTTPStatus.FORBIDDEN,
+                    {"status": "blocked", "code": "SECURITY_POLICY_BLOCKED", "rule": exc.rule, "message": str(exc)},
+                )
+                return
         if self.api_relay is None:
             LOGGER.warning("api disabled request_id=%s rule=%s", request_id, decision.rule_id)
             self._json(
@@ -16553,6 +16618,9 @@ def serve(args: argparse.Namespace) -> None:
         # or the cgroup file; None, and the budget is off (design §2.4).
         memory_limit_bytes=child_memory_limit_bytes(cgroup_path=CGROUP_MEMORY_MAX_PATH),
         metrics=CredentialProxyHandler.metrics,
+        # An exec pod's state volume is sized for no gcloud log files
+        # (GCLOUD_FILE_LOGGING_OFF_ENV); the other roles keep gcloud's default.
+        gcloud_file_logging=role != EXEC_ROLE,
     )
     CredentialProxyHandler.metrics.set_admission_gauges(executor.admission_snapshot)
     memory_reader = MemoryReader(executor.child_peaks)
@@ -16609,11 +16677,14 @@ def serve(args: argparse.Namespace) -> None:
             pinned_bases=CredentialProxyHandler.pinned_bases,
         )
     # What the gate's soft watermark reclaims: vcs scratch no request of this
-    # process holds (the vcs broker swept a dead process's at start). An exec
-    # pod has none.
+    # process holds (the vcs broker swept a dead process's at start), and on
+    # an exec pod, whose state volume is sized for the command HOME alone,
+    # kubectl's disk cache (KUBECTL_CACHE_DIR_NAME).
     reclaimers: list[Callable[[], int]] = []
     if CredentialProxyHandler.vcs is not None:
         reclaimers.append(CredentialProxyHandler.vcs.reclaim_orphan_scratch)
+    if role == EXEC_ROLE:
+        reclaimers.append(executor.reclaim_kubectl_cache)
     gate.set_reclaimers(reclaimers)
     if role in BROKER_ROLES:
         start_readings_sweep(executor, CredentialProxyHandler.vcs)
