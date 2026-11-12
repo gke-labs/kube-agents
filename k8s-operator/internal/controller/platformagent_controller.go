@@ -531,6 +531,16 @@ type PlatformAgentReconciler struct {
 	// writers leave the field out of their unchanged checks, so the write the
 	// API server prunes does not repeat on every pass (busReplicasStatusCurrent).
 	prunedBusReplicasStatus sync.Map
+	// prunedBusMigrationStatus records, per CR, that a status write carrying
+	// status.busMigration came back without it: the served CRD predates the
+	// field. A run the API server drops is gone by the next pass, which would
+	// start another, so while a record is held no run starts
+	// (resolveA2ABusReplicas). Unlike prunedBusReplicasStatus it is not
+	// reprobed on a timer: the only probe is starting a run, whose first
+	// pass already rolls the callout into the freeze or runs the pin Job.
+	// Cleared by an echo that carries the field, and when the CR is deleted;
+	// a restart of the operator after the CRD is applied clears it too.
+	prunedBusMigrationStatus sync.Map
 
 	// prunedNewerFields records, per CR (usagePollKey) and per newer
 	// status.usage field -- the cluster gauges as one (usageNewerFieldGauges),
@@ -4745,11 +4755,12 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	setA2AIdentityMapAppliedCondition(agent, a2a.calloutMap, now)
 	setScopeResolvedCondition(agent, a2a.scopeCondition, now)
 	setGatewayElectedCondition(agent, gatewayElectedImage(agent, a2a.gatewayElected), now)
-	writtenBusReplicas := agent.Status.BusReplicas
+	writtenBusReplicas, wroteBusMigration := agent.Status.BusReplicas, agent.Status.BusMigration != nil
 	if err := r.Status().Update(ctx, agent); err != nil {
 		return err
 	}
 	r.noteBusReplicasEcho(agent, writtenBusReplicas)
+	r.noteBusMigrationEcho(agent, wroteBusMigration)
 	return nil
 }
 
@@ -4784,6 +4795,28 @@ func (r *PlatformAgentReconciler) noteBusReplicasEcho(agent *agentv1alpha1.Platf
 		return
 	}
 	r.prunedBusReplicasStatus.Store(key, time.Now())
+}
+
+// noteBusMigrationEcho reads status.busMigration back after a status write,
+// as noteBusReplicasEcho does status.busReplicas: written says the write
+// carried a run, and an echo without one is the served CRD pruning it.
+func (r *PlatformAgentReconciler) noteBusMigrationEcho(agent *agentv1alpha1.PlatformAgent, written bool) {
+	if !written {
+		return
+	}
+	key := client.ObjectKeyFromObject(agent)
+	if agent.Status.BusMigration != nil {
+		r.prunedBusMigrationStatus.Delete(key)
+		return
+	}
+	r.prunedBusMigrationStatus.Store(key, time.Now())
+}
+
+// busMigrationStatusPruned reports a record that the served CRD drops
+// status.busMigration (noteBusMigrationEcho).
+func (r *PlatformAgentReconciler) busMigrationStatusPruned(agent *agentv1alpha1.PlatformAgent) bool {
+	_, pruned := r.prunedBusMigrationStatus.Load(client.ObjectKeyFromObject(agent))
+	return pruned
 }
 
 // liveAgentSatisfies checks whether the uncached live object already satisfies pred.
@@ -5323,7 +5356,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	setGatewayElectedCondition(agent, gatewayElected, now)
 	setDataVolumeExpansionCondition(agent, dataVolumeMsg, dataVolumeKnown, now)
 
-	writtenBusReplicas := agent.Status.BusReplicas
+	writtenBusReplicas, wroteBusMigration := agent.Status.BusReplicas, agent.Status.BusMigration != nil
 	// Copied before the write: decoding the response may reuse the pointer's target.
 	var wroteInference *inferenceModel
 	if newInference != nil {
@@ -5334,6 +5367,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	}
 	r.noteUsageStatusEcho(ctx, agent, newActiveInterfaces)
 	r.noteBusReplicasEcho(agent, writtenBusReplicas)
+	r.noteBusMigrationEcho(agent, wroteBusMigration)
 	r.noteInferenceEcho(ctx, agent, wroteInference)
 	return newPhase, nil
 }
@@ -5419,6 +5453,7 @@ func (r *PlatformAgentReconciler) noteUsageEcho(ctx context.Context, agent *agen
 func (r *PlatformAgentReconciler) forgetUsageStatus(agent *agentv1alpha1.PlatformAgent) {
 	r.prunedUsageStatus.Delete(client.ObjectKeyFromObject(agent))
 	r.prunedBusReplicasStatus.Delete(client.ObjectKeyFromObject(agent))
+	r.prunedBusMigrationStatus.Delete(client.ObjectKeyFromObject(agent))
 	r.prunedSizingTier.Delete(client.ObjectKeyFromObject(agent))
 	r.steppedBackAt.Delete(client.ObjectKeyFromObject(agent))
 	r.prunedNewerFieldsMu.Lock()

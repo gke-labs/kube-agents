@@ -542,6 +542,47 @@ func TestAConversionThatCannotFinishTurnsBackAtItsOwnDeadline(t *testing.T) {
 	}
 }
 
+// A status write whose echo comes back without status.busMigration (the
+// served CRD predates it) stops runs from starting, with a Warning Event:
+// the dropped run would otherwise be started again on every pass, rolling
+// the callout each time. An echo that carries the field clears the record.
+func TestAPrunedBusMigrationStatusStartsNoRun(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	m := newMigrationRig(t, busMigrationShrink, busMigrationPinning, 3, time.Now().Add(time.Hour))
+	setBusProvisionedCondition(m.agent, true, "provision-job", metav1.Now())
+	recorder := record.NewFakeRecorder(16)
+	m.r.Recorder = recorder
+	m.agent.Status.BusMigration = nil // the echo of a write that carried the run
+	m.r.noteBusMigrationEcho(m.agent, true)
+	if err := m.r.resolveA2ABusReplicas(context.Background(), m.agent); err != nil {
+		t.Fatal(err)
+	}
+	if run := m.agent.Status.BusMigration; run != nil {
+		t.Fatalf("a run started while the served CRD drops status.busMigration: %+v", run)
+	}
+	if m.agent.Status.BusReplicas != 3 {
+		t.Errorf("status.busReplicas %d, want the 3 the bus runs", m.agent.Status.BusReplicas)
+	}
+	select {
+	case e := <-recorder.Events:
+		if !strings.Contains(e, "Warning "+reasonA2ABusMigrationUnavailable) || !strings.Contains(e, "drops status.busMigration") {
+			t.Errorf("event %q", e)
+		}
+	default:
+		t.Error("no Warning Event for the pruned field")
+	}
+
+	m.agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{RunID: "9-9"} // an echo that carries the field
+	m.r.noteBusMigrationEcho(m.agent, true)
+	m.agent.Status.BusMigration = nil
+	if err := m.r.resolveA2ABusReplicas(context.Background(), m.agent); err != nil {
+		t.Fatal(err)
+	}
+	if m.agent.Status.BusMigration == nil {
+		t.Error("no run started after an echo carried status.busMigration")
+	}
+}
+
 // A hashing pod whose report is not exactly the provisioned streams' digest
 // pairs writes no run Secret, and the run turns back naming why.
 func TestARefusedDigestReportTurnsTheRunBack(t *testing.T) {
@@ -785,6 +826,36 @@ func TestTheStatusWriteCarriesTheMigration(t *testing.T) {
 	}
 	if live.Status.BusMigration == nil || live.Status.BusMigration.Phase != string(busMigrationDone) {
 		t.Errorf("the Done run was not written: %+v", live.Status.BusMigration)
+	}
+}
+
+// The status writer reads its echo for status.busMigration: a write the
+// served CRD prunes it from is recorded, so the next pass starts no run.
+func TestTheStatusWriteNotesAPrunedMigration(t *testing.T) {
+	ctx := context.Background()
+	agent := a2aTestAgent()
+	base := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent).WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).Build()
+	cl := interceptor.NewClient(base, interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			// What an older CRD's structural schema does: the unknown field
+			// is dropped on the way in, so the echo has none.
+			if pa, ok := obj.(*agentv1alpha1.PlatformAgent); ok {
+				pa.Status.BusMigration = nil
+			}
+			return c.SubResource(subResourceName).Update(ctx, obj, opts...)
+		},
+	})
+	r := &PlatformAgentReconciler{Client: cl, Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8)}
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationShrink), RunID: "1-1", Phase: string(busMigrationPinning), ObservedGeneration: 1}
+	if err := r.syncA2AConditions(ctx, agent, a2aProvisionState{done: true}); err != nil {
+		t.Fatal(err)
+	}
+	if !r.busMigrationStatusPruned(agent) {
+		t.Error("a write whose echo dropped status.busMigration was not recorded")
+	}
+	r.forgetUsageStatus(agent)
+	if r.busMigrationStatusPruned(agent) {
+		t.Error("the pruned busMigration record outlived forgetUsageStatus")
 	}
 }
 

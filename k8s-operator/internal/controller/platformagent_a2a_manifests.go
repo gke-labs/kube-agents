@@ -5083,6 +5083,12 @@ func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, age
 				r.recordEvent(agent, corev1.EventTypeWarning, reasonA2ABusMigrationUnavailable,
 					fmt.Sprintf("spec.harness.tuning.busReplicas asks for %d NATS servers and the bus runs %d, but this operator was deployed without OPERATOR_IMAGE, which runs the migration; the bus keeps %d", want, running, running))
 			}
+		} else if run == nil && r.busMigrationStatusPruned(agent) {
+			// The served CRD drops status.busMigration, so a run started here
+			// would be gone by the next pass, which would start another and
+			// roll the callout again, every pass.
+			r.recordEvent(agent, corev1.EventTypeWarning, reasonA2ABusMigrationUnavailable,
+				fmt.Sprintf("spec.harness.tuning.busReplicas asks for %d NATS servers and the bus runs %d, but the served PlatformAgent CRD drops status.busMigration, so no migration starts and the bus keeps %d; apply this release's CRD, then restart the operator", want, running, running))
 		} else if want > running && busMigrationWouldStart(agent, want) {
 			// One server to three restores every stream from a snapshot
 			// under the caps this operator renders, behind a write freeze.
