@@ -249,7 +249,19 @@ class StanzaTest(unittest.TestCase):
         )
         self.assertNotIn("even when it ends", flat)
         # A root-cause card ending "Report the findings." keeps its sections.
-        self.assertIn("on a yes-or-no or status card, a closing request to report or summarize is not that ask.", flat)
+        self.assertIn("on a yes-or-no or status card, a closing request to report or summarize is not that ask", flat)
+
+    def test_a_propose_only_line_does_not_turn_a_question_into_a_report(self):
+        # The Platform ends every no-change card with this line; on a status card it drew a Sources list.
+        flat = " ".join(REPORT_FORMAT_STANZA.split())
+        self.assertIn(
+            'Neither does a closing "Propose only: put the fix in result; do not open a pull request." line: it '
+            "only rules out opening a pull request or making the change, and never turns a question into a "
+            "request for a fix, a report, "
+            "claims or a Sources list, so a yes-or-no or status card that carries it still gets the short answer.",
+            flat,
+        )
+        self.assertIn('summarize is not that ask, and neither is a "Propose only" line.', flat)
 
     def test_the_question_budget_is_the_cases(self):
         """The stanza's question rule and ``chat-voice-answer-first`` name one budget.
