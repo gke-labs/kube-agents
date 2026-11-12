@@ -1949,36 +1949,36 @@ func failedRig(t *testing.T, leg busMigrationLeg, failedIn busMigrationPhase, ru
 	run.FailedIn, run.Abandoning, run.Cause = string(failedIn), true, "the "+string(failedIn)+" phase failed"
 	run.Cleared = a2aProvisionedStreams // the way back cleared the cluster first
 	run.FreezeConfirmed = leg == busMigrationGrow
-	run.RestoreStarted = leg == busMigrationGrow // after a failed restore
 	return m
 }
 
-// A one to three run given up where its staging claim holds the streams'
-// only copy keeps the claim and the run Secret: the forward clear emptied
-// the single server and no restore ever started (it failed in the forward
-// clear, or on the way back from a failed conversion). Its pods go, so a
-// person can mount the claim, and the condition names it. Once a restore
-// started, or before the forward clear, the give-up deletes them as before.
-func TestAGiveUpBeforeAnyRestoreKeepsTheStage(t *testing.T) {
+// A one to three run given up at or after its forward clear keeps the staging
+// claim and the run Secret: the clear emptied the single server, and whatever
+// a restore put back may be partial, so the claim may hold the only full copy.
+// Its pods go, so a person can mount the claim, and the condition names it.
+// Before the forward clear the single server still has every stream, and the
+// give-up deletes them as before.
+func TestAGiveUpAfterTheForwardClearKeepsTheStage(t *testing.T) {
 	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
 	for _, tc := range []struct {
-		failedIn       busMigrationPhase
-		abandoning     bool
-		restoreStarted bool
-		keep           bool
+		failedIn   busMigrationPhase
+		abandoning bool
+		keep       bool
 	}{
-		{busMigrationClearing, false, false, true},
-		{busMigrationRollingBack, true, false, true},
-		{busMigrationRollbackRestoring, true, false, true},
-		{busMigrationRollingBack, true, true, false},
-		{busMigrationRollbackRestoring, true, true, false},
-		{busMigrationClearing, true, true, false},
-		{busMigrationReleasing, true, false, false},
+		{busMigrationClearing, false, true},
+		{busMigrationClearing, true, true},
+		{busMigrationRollingBack, true, true},
+		{busMigrationRollbackRestoring, true, true},
+		{busMigrationRestoring, false, true},
+		{busMigrationReleasing, true, true},
+		{busMigrationFreezing, false, false},
+		{busMigrationSnapshot, false, false},
+		{busMigrationHashing, false, false},
 	} {
 		m := failedRig(t, busMigrationGrow, tc.failedIn, 1)
 		m.agent.Spec.Harness.Tuning.BusReplicas = ptr.To(1)
 		run := m.agent.Status.BusMigration
-		run.Abandoning, run.RestoreStarted = tc.abandoning, tc.restoreStarted
+		run.Abandoning = tc.abandoning
 		stage := []client.Object{
 			&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: busMigrationRunSecret(m.agent, "3-1"), Namespace: m.agent.Namespace}},
 			&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: busMigrationStageClaim(m.agent, "3-1"), Namespace: m.agent.Namespace}},
@@ -2001,7 +2001,7 @@ func TestAGiveUpBeforeAnyRestoreKeepsTheStage(t *testing.T) {
 		for _, o := range stage {
 			err := m.cl.Get(context.Background(), client.ObjectKeyFromObject(o), o)
 			if kept := err == nil; kept != tc.keep {
-				t.Errorf("given up in %s (abandoning %v, restore started %v): %T %s kept %v, want %v", tc.failedIn, tc.abandoning, tc.restoreStarted, o, o.GetName(), kept, tc.keep)
+				t.Errorf("given up in %s (abandoning %v): %T %s kept %v, want %v", tc.failedIn, tc.abandoning, o, o.GetName(), kept, tc.keep)
 			}
 		}
 		if err := m.cl.Get(context.Background(), client.ObjectKey{Namespace: m.agent.Namespace, Name: busMigrationWorkloadName(m.agent, "snapshot", "3-1")}, &corev1.Pod{}); err == nil {
@@ -2011,21 +2011,6 @@ func TestAGiveUpBeforeAnyRestoreKeepsTheStage(t *testing.T) {
 		if names := strings.Contains(cond.Message, busMigrationStageClaim(m.agent, "3-1")); names != tc.keep {
 			t.Errorf("given up in %s: the condition names the kept claim %v, want %v: %q", tc.failedIn, names, tc.keep, cond.Message)
 		}
-	}
-}
-
-// Entering Restoring records that a restore started, so a later give-up no
-// longer treats the stage as the only copy.
-func TestEnteringRestoringRecordsTheRestore(t *testing.T) {
-	m := newMigrationRig(t, busMigrationGrow, busMigrationConverting, 3, time.Now().Add(time.Hour))
-	m.pass(busMigrationConverting, 3)
-	if m.agent.Status.BusMigration.RestoreStarted {
-		t.Fatal("a restore recorded before Restoring")
-	}
-	m.rollOut(3)
-	m.pass(busMigrationRestoring, 3)
-	if !m.agent.Status.BusMigration.RestoreStarted {
-		t.Error("entering Restoring recorded no restore")
 	}
 }
 
@@ -2126,7 +2111,9 @@ func TestOnlyAnAbandonNamingTheRunLiftsAFailedFreeze(t *testing.T) {
 	}
 
 	// Given up with nothing more asked: the freeze and the hold lift, and
-	// the map is the install's again.
+	// the map is the install's again. The staging claim and run Secret stay:
+	// a give-up after the forward clear keeps them
+	// (TestAGiveUpAfterTheForwardClearKeepsTheStage).
 	g := failedRig(t, busMigrationGrow, busMigrationRollbackRestoring, 1)
 	g.agent.Spec.Harness.Tuning.BusReplicas = ptr.To(1)
 	kept := []client.Object{
@@ -2142,8 +2129,8 @@ func TestOnlyAnAbandonNamingTheRunLiftsAFailedFreeze(t *testing.T) {
 	g.agent.Annotations = map[string]string{a2aBusMigrationAbandonAnnotation: "3-1"}
 	g.pass(busMigrationFailed, 1)
 	for _, o := range kept {
-		if err := g.cl.Get(context.Background(), client.ObjectKeyFromObject(o), o); err == nil {
-			t.Errorf("%T %s kept after the run was given up", o, o.GetName())
+		if err := g.cl.Get(context.Background(), client.ObjectKeyFromObject(o), o); err != nil {
+			t.Errorf("%T %s deleted by a give-up after the forward clear: %v", o, o.GetName(), err)
 		}
 	}
 	if !g.agent.Status.BusMigration.GivenUp || busMigrationFreezeActive(g.agent) || busMigrationHoldsProvision(g.agent) {

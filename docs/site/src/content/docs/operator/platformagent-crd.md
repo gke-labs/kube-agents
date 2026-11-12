@@ -105,13 +105,13 @@ A run that failed in `Shrinking` (server 0 did not come up on its own) or in `Re
 
 #### Recovering a given-up run's staging claim
 
-A one to three run that failed after its clear emptied the single server, and before any restore started, has the streams' only copy on its staging claim: `failedIn` is `Clearing`, `RollingBack` or `RollbackRestoring`, and `status.busMigration.restoreStarted` is unset. Retry such a run rather than give it up while retries are left: a retry restores the snapshot into one server on its own.
+A one to three run that failed at or after its clear, which emptied the single server, may have the streams' only full copy on its staging claim. Its `failedIn` is then any phase from `Clearing` on: `Clearing`, `Converting`, `Restoring`, `RollingBack`, `RollbackRestoring` or `Releasing`. Retry such a run rather than give it up while retries are left: a retry restores the snapshot into one server on its own.
 
 If it is given up anyway, the operator lifts the freeze, the bus runs one server, and the provision Job recreates every stream empty. It keeps the staging claim `<agent>-bus-stage-<run>` and the run Secret `<agent>-bus-run-<run>`, which holds each snapshot file's SHA-256, and the `A2ABusMigrating` condition names both. It does not restore the snapshot, and it does not delete either object; both are owned by the PlatformAgent, so deleting the PlatformAgent deletes them. A run's object name that would pass 63 characters ends in a hash in place of the run. Find them by their labels (the instance label is `<namespace>-<name>`, cut to 63 characters):
 
 ```bash
 kubectl get platformagent <name> -n <namespace> \
-  -o jsonpath='{.status.busMigration.runID} {.status.busMigration.failedIn} givenUp={.status.busMigration.givenUp} restoreStarted={.status.busMigration.restoreStarted}{"\n"}'
+  -o jsonpath='{.status.busMigration.runID} {.status.busMigration.failedIn} givenUp={.status.busMigration.givenUp}{"\n"}'
 kubectl get pvc,secret -n <namespace> \
   -l kubeagents.x-k8s.io/a2a-component=bus-migration,app.kubernetes.io/instance=<namespace>-<name>
 ```
@@ -151,6 +151,8 @@ kubectl delete pod bus-stage-reader -n <namespace>
 ```
 
 The checksums should match the `data` and `meta` digests in `run.json`. The bus already runs one server, so set `busReplicas: 1` to match it. While the field asks for three, no new run starts unless the `bus-migration-start` annotation names the given-up run. A new run would snapshot the empty streams onto a claim of its own. Putting the old data back is manual: the operator has no command for it, and restoring a stream takes a bus client allowed `$JS.API.STREAM.RESTORE` on it, which only a migration's own identity holds, and only during its restore. Delete the claim once the data is safe or not needed.
+
+The operator keeps the claim on every such give-up, including one where a restore or a rollback restore had already put every stream back. A claim left over then is the accepted cost of never deleting a copy that might be the only one. To tell whether it's safe to delete, compare each stream's `state.messages` and `state.last_seq` in its `meta.json` on the claim with the same stream on the bus. If every stream on the bus has at least as many messages, and the same last sequence or a later one, the bus holds everything the claim does.
 
 Disabling Google Chat afterwards, with no other backend configured, leaves the gateway running on the console door alone. Flipping back to `today` tears that stack down, keeping the generated credentials Secret and the JetStream PVCs. The callout's keys Secret is **not** kept: a stale issuer key would make every answer the callout gives be refused, so it is deleted with the rest. The task-signing key Secret is deleted with it.
 

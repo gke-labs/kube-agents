@@ -586,9 +586,6 @@ func (r *PlatformAgentReconciler) advanceBusMigration(ctx context.Context, agent
 				run.PhaseDeadline = ptr.To(metav1.NewTime(now.Add(busMigrationConvertDeadline)))
 			}
 		}
-		if step.next == busMigrationRestoring {
-			run.RestoreStarted = true
-		}
 		run.Phase, run.Abandoning = string(step.next), step.abandoning
 		if step.manual != "" {
 			run.Message = step.manual
@@ -1340,21 +1337,24 @@ func (r *PlatformAgentReconciler) cleanupBusMigration(ctx context.Context, agent
 }
 
 // busMigrationStageIsTheOnlyCopy reports a one to three run given up where
-// its staging claim holds the streams' only copy: its forward clear emptied
-// the single server (it failed in that clear, or on the way back from the
-// conversion) and no restore ever started, so neither the cluster nor the
-// single server has the data. The give-up recreates the streams empty;
-// deleting the claim then would lose the data for good, so it is kept with
-// the run Secret's digests, and the condition names it.
+// its staging claim may hold the streams' only full copy: it failed at or
+// after its forward clear, which emptied the single server. Whatever a
+// restore put on the cluster, or a rollback restore put back on one server,
+// may be partial, and the give-up recreates missing streams empty; deleting
+// the claim then could lose the data for good. So it is kept, with the run
+// Secret's digests, and the condition names it. A run that turns out to have
+// put everything back leaves a claim a person deletes: that leak is the
+// accepted cost. Before the forward clear the single server still holds every
+// stream, and the claim goes as before.
 func busMigrationStageIsTheOnlyCopy(run *agentv1alpha1.BusMigrationStatus) bool {
-	if busMigrationLeg(run.Leg) != busMigrationGrow || !run.GivenUp || run.RestoreStarted {
+	if busMigrationLeg(run.Leg) != busMigrationGrow || !run.GivenUp {
 		return false
 	}
 	switch busMigrationPhase(run.FailedIn) {
-	case busMigrationClearing, busMigrationRollingBack, busMigrationRollbackRestoring:
-		return true
+	case "", busMigrationFreezing, busMigrationSnapshot, busMigrationHashing:
+		return false
 	}
-	return false
+	return true
 }
 
 // busMigrationTornDown is a switch to today's word on the bus migration
