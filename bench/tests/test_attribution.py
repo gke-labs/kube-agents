@@ -105,6 +105,15 @@ class AttributeTest(unittest.TestCase):
         self.assertTrue(at.attribute(stores(), 2000, 3000, litellm=empty, caps=CAPS)["checks"]["sum"]["passed"])
         self.assertFalse(at.attribute(stores(), 0, 500, litellm=empty, caps=CAPS)["checks"]["sum"]["passed"])
 
+    def test_tokens_litellm_counted_outside_any_session_are_unattributed(self):
+        # The sessions in [0, 500) hold input 90, cached 720, output 90; LiteLLM saw 100 more of each.
+        litellm = {"tokens_input": 1010, "tokens_cached": 820, "tokens_output": 190}
+        record = at.attribute(stores(), 0, 500, litellm=litellm, caps=CAPS)
+        self.assertEqual(record["outside_sessions"], {"input": 100, "cached": 100, "output": 100})
+        self.assertEqual(record["total_tokens"], record["session_tokens"] + 300)
+        self.assertEqual(sum(r["tokens"] for r in record["overview"]), record["total_tokens"])
+        self.assertIn("outside any session", record["unattributed_reasons"])
+
     def test_no_counters_fail_the_sum_check_rather_than_pass_it(self):
         self.assertFalse(at.attribute(stores(), 0, 500, caps=CAPS)["checks"]["sum"]["passed"])
 
