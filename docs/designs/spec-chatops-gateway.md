@@ -2796,13 +2796,15 @@ becomes one inbound subject per principal and nothing else here changes.
 
 **Backend per message.** One gateway process runs every armed chat backend and the console
 together, through a mux that dispatches `post`/`edit`/`roster` on the conversation prefix.
-The mux stamps every inbound message that names no backend with the key of the adapter that
-delivered it, console and chat backends alike, and the inject door stamps its own beside the
-mux. So `authority.requester.backend`, the drop notice and verification name the backend the
-message came in on. Where there is no message to ask (the relay holding a session record), the
-conversation prefix answers the same question. `openDirect` takes a user id as
-`<backend>:<id>` and goes to that backend with the bare id. A bare id goes to the only real
-backend when exactly one is armed, and is refused otherwise. With no real backend, as on an inject-only eval
+The console stamps its own messages, the mux stamps every chat-backend message that names no
+backend with the key of the adapter that delivered it, and the inject and A2A doors each stamp
+their own beside the mux. So `authority.requester.backend`, the drop notice and verification
+name the backend the message came in on. Where there is no message to ask (the relay holding a
+session record), the conversation prefix answers the same question. `openDirect` takes a user
+id as `<backend>:<id>` and goes to that backend with the bare id. A known backend name that is
+not armed is refused by name. With exactly one real backend armed, any id without a known
+backend prefix goes whole to it; with several, a bare or unknown-prefixed id is refused. With
+no real backend, as on an inject-only eval
 install, the console is the only chat backend and runs without a mux. With no backend and no
 door, `A2A_CONSOLE_DOOR=true` lets the gateway start on the console alone; the operator renders
 it on every next gateway (2026-10-22), so every `mode: next` install runs one.

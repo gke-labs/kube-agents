@@ -868,8 +868,9 @@ func FromEnv() (*Config, error) {
 	// a Pub/Sub pull through the broker, Slack a Socket Mode connection,
 	// Discord its gateway websocket) and none shares a durable with another.
 	// The task-event relay durable is the gateway process's own, bound once
-	// per process, and the election keeps one leader per Deployment. What the guard still refuses is half a Slack pair (above) and
-	// no ingress at all (below).
+	// per process, and the election keeps one leader per Deployment. What
+	// the guard still refuses is half a Slack pair (above) and no ingress at
+	// all (below).
 	//
 	// The doors (inject, A2A) are NOT among Backends, decided 2026-09-17 on
 	// the design doc's review for the inject door and holding for its

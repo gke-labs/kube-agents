@@ -30,14 +30,21 @@ const (
 // more than one real backend and so has no primary to send it to.
 var errNoPrimaryBackend = errors.New("multi adapter: a direct message needs a backend-qualified user id (<backend>:<id>) when no single backend is primary")
 
+// knownBackendNames are the backend prefixes OpenDirect refuses by name when
+// the mux does not run them, rather than hand the id whole to the primary.
+var knownBackendNames = map[string]bool{
+	BackendGchat: true, BackendSlack: true, BackendDiscord: true, BackendConsole: true,
+}
+
 // MultiAdapter presents several backends to the gateway as one Adapter.
 // Conversation ids are backend-qualified by convention (discord:…, gchat:…,
 // console:…), so every per-conversation operation dispatches on the prefix.
 // OpenDirect takes a backend-qualified user id (slack:U1) and goes to that
-// backend with the bare id. Any other id goes whole to the primary backend,
-// the one real backend when the process runs only one, and is refused when
-// there is no primary. Run stamps every inbound message that names no backend with
-// the key of the backend that delivered it.
+// backend with the bare id. A prefix that names a chat backend the mux does
+// not run is refused by name. Any other id goes whole to the primary
+// backend, the one real backend when the process runs only one, and is
+// refused when there is no primary. Run stamps every inbound message that
+// names no backend with the key of the backend that delivered it.
 //
 // One backend is essential: when it stops, Run returns and the process
 // restarts. Every other backend is contained: when it stops, Run logs it and
@@ -227,17 +234,22 @@ func (m *MultiAdapter) Roster(conversation string) ([]string, bool, error) {
 }
 
 // OpenDirect opens a direct message with a backend-qualified user id
-// (<backend>:<id>) on that backend, with the bare id. On a mux with several
-// real backends a caller must qualify the id: a bare id, or one whose prefix
-// names no backend the mux runs, is refused. A mux with a single real backend
-// takes any id that backend understands: an id whose prefix names no backend
-// (a Slack guest id from another workspace is itself T…:U…) goes whole to
-// the primary, as a bare id does.
+// (<backend>:<id>) on that backend, with the bare id. A prefix that names a
+// known backend the mux does not run (slack:U1 on a gateway without Slack)
+// is refused by name, on any mux. On a mux with several real backends a
+// caller must qualify the id: a bare id, or one whose prefix names no
+// backend the mux runs, is refused. A mux with a single real backend takes
+// any id that backend understands: an id whose prefix is no backend name (a
+// Slack guest id from another workspace is itself T…:U…) goes whole to the
+// primary, as a bare id does.
 func (m *MultiAdapter) OpenDirect(userID string) (string, error) {
 	backend, id, qualified := strings.Cut(userID, ":")
 	if qualified {
-		if a, known := m.byPrefix[backend]; known {
+		if a, armed := m.byPrefix[backend]; armed {
 			return a.OpenDirect(id)
+		}
+		if knownBackendNames[backend] {
+			return "", fmt.Errorf(muxUnknownBackendFormat, backend)
 		}
 	}
 	if m.primary == "" {

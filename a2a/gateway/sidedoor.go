@@ -323,10 +323,12 @@ func (s *sideDoorAdapter) InboundVerified(conversation, messageID string, verifi
 // OpenDirect goes to the chat stack, because the DM switch is a chat
 // affordance: the caller that will one day use it is a classifier deciding to
 // move a reply out of a room, which only a room has. Behind the mux a user id
-// may name its backend as <backend>:<id>, and the mux routes it there; a bare
-// id goes to the one real backend, and the mux refuses it when several are
-// armed. With no chat stack the first door answers, as the inject door alone
-// did when it was the gateway's only ingress.
+// may name its backend as <backend>:<id>, and the mux routes it there with
+// the bare id. A known backend name that is not armed is refused by name. On
+// a one-backend mux any id without a known backend prefix goes whole to that
+// backend; with several backends armed, a bare or unknown-prefixed id is
+// refused. With no chat stack the first door answers, as the inject door
+// alone did when it was the gateway's only ingress.
 func (s *sideDoorAdapter) OpenDirect(userID string) (string, error) {
 	if s.primary != nil {
 		return s.primary.OpenDirect(userID)

@@ -486,9 +486,9 @@ func (a *ConsoleAdapter) inbound(m *nats.Msg) (InboundMessage, string, bool) {
 		return InboundMessage{}, "", false
 	}
 	// Backend is stamped here rather than left to the gateway's configured
-	// one: the console runs beside whichever chat backend the process was
-	// configured for, so a frame that said nothing would be attributed to
-	// that backend and verified against its mapping table (Gateway.backendFor).
+	// one: the console runs beside every chat backend the process arms, so a
+	// frame that said nothing would be attributed to the configured backend
+	// and verified against its mapping table (Gateway.backendFor).
 	// The addressee is sender-chosen and becomes a subject token, so it is
 	// held to a profile name's shape here; the parameters are checked where
 	// the turn is routed (resolveProfile), which says why in the room.

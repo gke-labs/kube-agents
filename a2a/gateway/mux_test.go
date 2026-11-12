@@ -361,6 +361,11 @@ func TestMultiAdapterOpenDirectResolvesPerBackend(t *testing.T) {
 	if got, err := one.OpenDirect("T1:U1"); err != nil || got != "discord:dm:T1:U1" {
 		t.Errorf("bare guest id with one real backend: got %q, %v; want discord:dm:T1:U1", got, err)
 	}
+	// A known backend the mux does not run is refused by name, not handed to
+	// the primary.
+	if _, err := one.OpenDirect("slack:U1"); err == nil || !strings.Contains(err.Error(), "slack") {
+		t.Errorf("unarmed backend with one real backend: err = %v, want one naming slack", err)
+	}
 }
 
 func TestMultiAdapterRestartsOneBackendWhileTheOtherServes(t *testing.T) {

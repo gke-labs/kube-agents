@@ -222,8 +222,8 @@ infrastructure paragraph below says what the harness does with it.
 
 **The door is not a backend in the one-backend guard's sense (decided 2026-09-17).** The guard in
 `a2a/gateway/config.go` exists so a two-backend misconfiguration cannot silently stop consuming
-Chat; a localhost door has no silent-stop failure mode, so it is a side door that may sit beside
-exactly one real backend, and the guard refused two real ones at the time. The door beside a real
+Chat; a localhost door has no silent-stop failure mode, so it was a side door that could sit beside
+exactly one real backend then, and the guard refused two real ones at the time. The door beside a real
 backend is therefore not a refusal, which is what lets stage 2 run the inject and Chat transports
 against one install and compare them, and meets the A2A owner's condition that the guard change
 be coordinated with the Slack adapter in flight. The guard was narrowed on 2026-11-12, so the
