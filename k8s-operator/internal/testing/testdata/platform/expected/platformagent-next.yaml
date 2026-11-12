@@ -5173,7 +5173,7 @@ metadata:
     app.kubernetes.io/name: platform-agent
     app.kubernetes.io/part-of: a2a-next
     kubeagents.x-k8s.io/a2a-component: provision
-  name: platformagent-a2a-provision-ab53cd7e
+  name: platformagent-a2a-provision-26fb2759
   namespace: kubeagents-system
   ownerReferences:
     - apiVersion: kubeagents.x-k8s.io/v1alpha1
@@ -5358,9 +5358,9 @@ spec:
               add TOPICS-STATE --allow-direct \\\n  --subjects='a2a.topics.agent.platform.upgrade-readiness,a2a.topics.agent.platform.topology-skew,a2a.topics.shared.blueprint,a2a.topics.shared.probe'
               \\\n  --storage=file --retention=limits \\\n  --max-msgs-per-subject=8 --max-bytes=1073741824
               --discard=old --replicas=\"${STREAM_REPLICAS}\" --max-consumers=64 --defaults\n\n#
-              TOPICS-JOURNAL: append-only, ages out at 30d. 5GiB cap.\n# Journal-class
-              topics: annotations.\n$NATS stream info TOPICS-JOURNAL >/dev/null 2>&1 ||
-              $NATS stream add TOPICS-JOURNAL --allow-direct \\\n  --subjects='a2a.topics.shared.annotations'
+              TOPICS-JOURNAL: append-only, ages out at 30d. 1GiB cap (a2aTopicsJournalMaxBytes).\n#
+              Journal-class topics: annotations.\n$NATS stream info TOPICS-JOURNAL >/dev/null
+              2>&1 || $NATS stream add TOPICS-JOURNAL --allow-direct \\\n  --subjects='a2a.topics.shared.annotations'
               --storage=file --retention=limits \\\n  --max-age=720h --max-bytes=1073741824
               --discard=old --replicas=\"${STREAM_REPLICAS}\" --max-consumers=64 --defaults\n\n#
               Heartbeats (agents.hb.>) are core NATS, outside JetStream — no stream.\n\n#

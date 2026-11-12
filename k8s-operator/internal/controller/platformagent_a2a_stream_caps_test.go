@@ -38,7 +38,7 @@ func streamInfoJSON(name string, maxBytes, held int64) string {
 // runCapScript runs the provision script with the stub answering the given
 // per-read files under dir/streams, and returns the exit, stderr, the report
 // and the nats call log.
-func runCapScript(t *testing.T, files map[string]string, editExit int) (int, string, string, string) {
+func runCapScript(t *testing.T, files map[string]string) (int, string, string, string) {
 	t.Helper()
 	agent := a2aTestAgent()
 	dir := t.TempDir()
@@ -55,11 +55,6 @@ func runCapScript(t *testing.T, files map[string]string, editExit int) (int, str
 		profileSubmitsInfoJSON(a2aProfileSubmitMaxAge))
 	for name, body := range files {
 		if err := os.WriteFile(filepath.Join(dir, "streams", name), []byte(body), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if editExit != 0 {
-		if err := os.WriteFile(filepath.Join(dir, "streams", "edit-exit"), []byte(fmt.Sprint(editExit)), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -119,7 +114,7 @@ func TestTheProvisionScriptReportsAStreamAboveItsCap(t *testing.T) {
 			for k, v := range tc.files {
 				files[k] = strings.Replace(v, `"config":{`, fmt.Sprintf(`"config":{"max_consumers":%d,"max_msgs_per_subject":%d,`, a2aTasksConsumerBudget(a2aTestAgent()), a2aTasksMaxMsgsPerSubject), 1)
 			}
-			exit, stderr, report, calls := runCapScript(t, files, 0)
+			exit, stderr, report, calls := runCapScript(t, files)
 			if exit != tc.wantExit {
 				t.Fatalf("exit %d, want %d\nstderr:\n%s", exit, tc.wantExit, stderr)
 			}
@@ -145,7 +140,7 @@ func TestTheProvisionScriptReportsAStreamAboveItsCap(t *testing.T) {
 // TOPICS-JOURNAL goes through the same report under its own key and cap.
 func TestTheProvisionScriptReportsTheJournalCap(t *testing.T) {
 	old := int64(5) << 30
-	exit, stderr, report, calls := runCapScript(t, map[string]string{"TOPICS-JOURNAL.json": streamInfoJSON("TOPICS-JOURNAL", old, 4096)}, 0)
+	exit, stderr, report, calls := runCapScript(t, map[string]string{"TOPICS-JOURNAL.json": streamInfoJSON("TOPICS-JOURNAL", old, 4096)})
 	if exit != 0 {
 		t.Fatalf("exit %d\n%s", exit, stderr)
 	}

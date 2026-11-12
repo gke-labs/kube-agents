@@ -1248,10 +1248,8 @@ func profileSubmitsInfoJSON(maxAge time.Duration) string {
 // "max_bytes" is a test shaping some other field, so the stub gives it the
 // render's cap and nothing held, and the cap step stays out of its way.
 //
-// A test of the cap step puts its own answers in dir/streams: <STREAM>.N.json
-// is the stream's Nth --json answer (1-based), <STREAM>.json any answer
-// without a numbered file. A `stream edit` call answers with the exit status
-// in dir/streams/edit-exit, 0 without one.
+// A test of the cap step puts its own answer for a stream in
+// dir/streams/<STREAM>.json.
 func stubNatsAnswering(t *testing.T, dir, liveJSON, topicsStateJSON, submitsJSON string) string {
 	t.Helper()
 	bin := filepath.Join(dir, "bin")
@@ -1270,26 +1268,15 @@ func stubNatsAnswering(t *testing.T, dir, liveJSON, topicsStateJSON, submitsJSON
 	stub := fmt.Sprintf(`#!/bin/sh
 echo "$*" >> %q
 json=0
-edit=0
 stream=""
 for a in "$@"; do
   case "$a" in
     --json) json=1 ;;
-    edit) edit=1 ;;
     TASKS|TOPICS-STATE|DIRECTORY|TOPICS-JOURNAL|PROFILE_SUBMITS) stream="$a" ;;
   esac
 done
-if [ "$edit" = "1" ]; then
-  if [ -f %q/edit-exit ]; then exit "$(cat %q/edit-exit)"; fi
-  exit 0
-fi
 if [ "$json" = "1" ]; then
-  if [ -n "$stream" ]; then
-    n=$(( $(cat %q/"$stream".count 2>/dev/null || echo 0) + 1 ))
-    echo "$n" > %q/"$stream".count
-    if [ -f %q/"$stream"."$n".json ]; then cat %q/"$stream"."$n".json; exit 0; fi
-    if [ -f %q/"$stream".json ]; then cat %q/"$stream".json; exit 0; fi
-  fi
+  if [ -n "$stream" ] && [ -f %q/"$stream".json ]; then cat %q/"$stream".json; exit 0; fi
   if [ "$stream" = "TOPICS-STATE" ]; then
     cat <<'JSON'
 %s
@@ -1310,7 +1297,7 @@ JSON
   exit 0
 fi
 exit 0
-`, log, streams, streams, streams, streams, streams, streams, streams, streams, topicsStateJSON, submitsJSON, journalJSON, liveJSON)
+`, log, streams, streams, topicsStateJSON, submitsJSON, journalJSON, liveJSON)
 	if err := os.WriteFile(filepath.Join(bin, "nats"), []byte(stub), 0o700); err != nil {
 		t.Fatal(err)
 	}

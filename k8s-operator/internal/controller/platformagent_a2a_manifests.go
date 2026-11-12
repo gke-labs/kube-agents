@@ -3693,7 +3693,7 @@ $NATS stream info TOPICS-STATE >/dev/null 2>&1 || $NATS stream add TOPICS-STATE 
   --storage=file --retention=limits \
   --max-msgs-per-subject=8 --max-bytes=1073741824 --discard=old --replicas="${STREAM_REPLICAS}" --max-consumers=64 --defaults
 
-# TOPICS-JOURNAL: append-only, ages out at 30d. 5GiB cap.
+# TOPICS-JOURNAL: append-only, ages out at 30d. 1GiB cap (a2aTopicsJournalMaxBytes).
 # Journal-class topics: annotations.
 $NATS stream info TOPICS-JOURNAL >/dev/null 2>&1 || $NATS stream add TOPICS-JOURNAL --allow-direct \
   --subjects='a2a.topics.shared.annotations' --storage=file --retention=limits \
@@ -3910,8 +3910,8 @@ cap_check() { # stream want
     cap_over=1
   fi
 }
-` + a2aProvisionCapLowerBlock("TASKS", a2aProvisionReportTasksMaxBytesKey, a2aTasksMaxBytes) +
-		a2aProvisionCapLowerBlock("TOPICS-JOURNAL", a2aProvisionReportTopicsJournalMaxBytesKey, a2aTopicsJournalMaxBytes) + `report="{${report_findings}}"
+` + a2aProvisionCapLowerBlock(a2aTasksStream, a2aProvisionReportTasksMaxBytesKey, a2aTasksMaxBytes) +
+		a2aProvisionCapLowerBlock(a2aTopicsJournalStream, a2aProvisionReportTopicsJournalMaxBytesKey, a2aTopicsJournalMaxBytes) + `report="{${report_findings}}"
 # Written only where the kubelet has mounted the file: outside a pod there is
 # nothing to write to, and a copy of a report is not a reason to fail a fully
 # provisioned bus. Nor is a write that fails (a full or faulting disk under
@@ -4464,7 +4464,7 @@ func parseA2AProvisionReport(message string) (a2aProvisionFindings, error) {
 		findings.submitMaxAge = &live
 	}
 	if fields, present := report[a2aProvisionReportTasksMaxBytesKey]; present {
-		f, err := parseStreamCapFinding(message, a2aProvisionReportTasksMaxBytesKey, "TASKS", a2aTasksMaxBytes, fields)
+		f, err := parseStreamCapFinding(message, a2aProvisionReportTasksMaxBytesKey, a2aTasksStream, a2aTasksMaxBytes, fields)
 		if err != nil {
 			return findings, err
 		}
