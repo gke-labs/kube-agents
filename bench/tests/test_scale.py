@@ -318,6 +318,29 @@ def test_record_round_trips_through_its_dict():
     assert again.key == record.key and again.metrics[1].container == "agent-api-auth"
 
 
+def test_reset_empties_every_bus_server_at_once(monkeypatch):
+    # On a three-server bus, a server left running copies its streams back to an emptied one.
+    calls = []
+
+    def fake_kubectl(context, *args, **kwargs):
+        calls.append(args)
+        if args[:2] == ("get", "pod"):
+            return f"pod/{args[2]}" if args[2] in operations.NATS_PODS else ""
+        return ""
+
+    monkeypatch.setattr(operations.kube, "kubectl", fake_kubectl)
+    waited = []
+    monkeypatch.setattr(operations, "_wait_pod_ready", lambda c, n, pod: waited.append(pod))
+    monkeypatch.setattr(operations, "_wait_provisioned", lambda *a: None)
+    monkeypatch.setattr(operations, "restart", lambda *a: None)
+    operations.reset("ctx", "ns")
+    deleted_claims = {a[2] for a in calls if a[:2] == ("delete", "pvc")}
+    assert {f"data-platform-agent-a2a-nats-{i}" for i in range(3)} <= deleted_claims
+    nats_deletes = [a for a in calls if a[:2] == ("delete", "pod") and any(p in a for p in operations.NATS_PODS)]
+    assert len(nats_deletes) == 1 and all(p in nats_deletes[0] for p in operations.NATS_PODS)
+    assert waited == list(operations.NATS_PODS)
+
+
 def test_reset_is_refused_without_the_host_label(monkeypatch):
     plan = load_plan(PHASE1, environ=ENV)
     run = runner.Runner(plan, Path("/nonexistent/harness-limits.json"))

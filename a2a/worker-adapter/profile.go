@@ -58,6 +58,10 @@ type ProfileWorkerConfig struct {
 	PersonaDir string
 	// Harness is the persona adapter to render with (persona.ClaudeCode).
 	Harness persona.Harness
+	// Relay is how the rendered persona's MCP servers reach the broker's
+	// relay (ProfileRelay, #5495). Empty drops every MCP server the persona
+	// declares, and the render says so.
+	Relay persona.Relay
 	// ConfigRoot is where each task's config directory is made: its own
 	// emptyDir, not the harness's working directory.
 	ConfigRoot string
@@ -188,7 +192,7 @@ func renderPersona(pw ProfileWorkerConfig) (*persona.Output, error) {
 	if err != nil {
 		return nil, fmt.Errorf("the persona at %s: %w", pw.PersonaDir, err)
 	}
-	out, err := adapter.Render(p, persona.Target{})
+	out, err := adapter.Render(p, persona.Target{Relay: pw.Relay})
 	if err != nil {
 		return nil, fmt.Errorf("rendering the persona: %w", err)
 	}

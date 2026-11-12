@@ -4053,10 +4053,10 @@ func TestManagedEnvPinsPlatformKeysButNotHome(t *testing.T) {
 	// A deployment with no chat integration pins no PLATFORM key — an agent with no chat
 	// integration has no platform credential worth freezing, and a pin invented for one
 	// would only be a key the agent is refused permission to set. What survives is the
-	// thirteen unconditional pins, none of which is about chat: the loopback bearer (see
+	// fourteen unconditional pins, none of which is about chat: the loopback bearer (see
 	// the next test), the PVC's directory mode, the mode switch, the three
-	// earned-autonomy switches, the scope path, the
-	// empty management-project override, the stall watch's three knobs, empty, the
+	// earned-autonomy switches, the scope path, the resolved scope's path (empty outside
+	// next), the empty management-project override, the stall watch's three knobs, empty, the
 	// Pub/Sub platform relay URL, empty, and the project that qualifies its routes.
 	bare := renderManagedEnv(newTestPlatformAgent())
 	want := "API_SERVER_KEY=" + loopbackAgentAPIKey + "\n" +
@@ -4066,6 +4066,7 @@ func TestManagedEnvPinsPlatformKeysButNotHome(t *testing.T) {
 		envAutomerge + "=off\n" +
 		envDial + "=off\n" +
 		scopeFileEnvKey + "=" + scopeDir + "/" + scopeFileName + "\n" +
+		resolvedScopeFileEnvKey + "=\n" +
 		reconcileProjectEnvKey + "=\n" +
 		stallWatchExcludeNamespacesEnvKey + "=\n" +
 		stallWatchMinAgeEnvKey + "=\n" +

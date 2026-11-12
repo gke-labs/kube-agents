@@ -458,9 +458,27 @@ func (b *Bridge) runTaskAPI(ctx context.Context, run *taskRun) {
 		if waitKanbanInTurn {
 			act.cardsFiled.Store(false)
 		}
-		text, ok := b.apiTurn(run, taskCtx, sessionID, prompt, steer, turn, prev)
+		key := apiTurnKey(run.origin.TaskID, steer)
+		text, ok := b.apiTurn(run, taskCtx, sessionID, prompt, steer, turn, prev, key)
 		if !ok {
 			return
+		}
+		if leaksCardID(prompt, text) {
+			// A card id where the user asked about no task (card_id_leak.go):
+			// one more message to the session asks for the reply without
+			// it, under its own key; what comes back is the turn's answer,
+			// id or not.
+			b.cfg.Logger.Warn("answer names a card id outside a board read; asking the agent to restate it",
+				"task", run.origin.TaskID, "turn", turn, "reason", cardIDRestateLog)
+			restated, ok := b.apiTurn(run, taskCtx, sessionID, cardIDRestatePrompt, nil, turn, text, key+cardIDRestateKeySuffix)
+			if !ok {
+				return
+			}
+			if leaksCardID(prompt, restated) {
+				b.cfg.Logger.Warn("the restated answer still names a card id; delivered as it is",
+					"task", run.origin.TaskID, "turn", turn, "reason", cardIDRestateLog)
+			}
+			text = restated
 		}
 		if waitKanbanInTurn {
 			text, ok = b.waitForKanbanCards(run, taskCtx, act, sessionID, taskStartUnix, turn, text)
@@ -512,7 +530,9 @@ func apiTurnKey(taskID string, steer *lib.Envelope) string {
 // canceled, past its deadline or the bridge stopping, which sends nothing
 // and ends the task with prev still attached as the result
 // (finalizeTurnNotSent).
-func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, prompt string, steer *lib.Envelope, turn int, prev string) (string, bool) {
+// key is the turn's Idempotency-Key (apiTurnKey), or that key with a suffix
+// for a second request the same turn makes (card_id_leak.go).
+func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, prompt string, steer *lib.Envelope, turn int, prev, key string) (string, bool) {
 	body, err := json.Marshal(apiChatRequest{
 		Model:    b.cfg.APIModel,
 		Messages: []apiChatMessage{{Role: "user", Content: prompt}},
@@ -530,7 +550,7 @@ func (b *Bridge) apiTurn(run *taskRun, taskCtx context.Context, sessionID, promp
 	req.Header.Set("Authorization", "Bearer "+b.cfg.APIKey)
 	req.Header.Set(apiSessionKeyHeader, sessionID)
 	req.Header.Set(apiSessionIDHeader, sessionID)
-	req.Header.Set(apiIdempotencyHeader, apiTurnKey(run.origin.TaskID, steer))
+	req.Header.Set(apiIdempotencyHeader, key)
 
 	if steer != nil {
 		run.mu.Lock()

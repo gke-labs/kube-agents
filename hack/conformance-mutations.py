@@ -231,6 +231,19 @@ MUTATIONS: list[Mutation] = [
         "-- the ceiling in C5 becomes advisory",
     ),
     Mutation(
+        # The operator's Secret write verbs are a namespaced Role, the second
+        # document in role.yaml; the ClusterRole holds the reads only. This
+        # puts `secrets` on the ClusterRole's core-group write rule as well,
+        # which is the pre-#4906 shape: write of every Secret on the cluster.
+        "C5-operator-secrets-cluster-wide",
+        "k8s-operator/config/rbac/role.yaml",
+        ("      - configmaps\n      - persistentvolumeclaims\n",
+         "      - configmaps\n      - persistentvolumeclaims\n      - secrets\n"),
+        "test_C5_the_operators_secret_grant_is_namespaced",
+        "add secrets to the operator ClusterRole's core write rule, beside the "
+        "configmaps it manages, so one marker edit makes the operator cluster-admin in effect",
+    ),
+    Mutation(
         "A1-refusal-emptied",
         "agents/platform/scripts/command_policy.py",
         ('    return Decision(allowed=False, rule_id=rule_id, message=" ".join(parts), offending_flag=flag)\n',
