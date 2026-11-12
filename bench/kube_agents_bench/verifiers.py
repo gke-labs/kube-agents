@@ -1862,6 +1862,47 @@ def _read_clipped_arg_head(text: str, target: str) -> str | None:
     return None
 
 
+def _read_clipped_closed_top_level(text: str, target: str) -> str | None:
+    """The last closed top-level string value for target, even if a later cut key dropped it from parsed args."""
+    depth = 0
+    key: str | None = None
+    last_val: str | None = None
+    i = 0
+    while i < len(text):
+        char = text[i]
+        if char == '"':
+            literal = _JSON_STRING.match(text, i)
+            if literal is None:
+                return last_val
+            string = _json_string_body(literal.group(1))
+            colon = _JSON_KEY_COLON.match(text, literal.end())
+            if colon is not None:
+                key = string if depth == 1 else None
+                i = colon.end()
+                continue
+            if key == target and depth == 1:
+                last_val = string
+            key = None
+            i = literal.end()
+            continue
+        if char in "{[":
+            depth += 1
+            key = None
+        elif char in "}]":
+            depth -= 1
+            key = None
+        elif char == ",":
+            key = None
+        elif key is not None and not char.isspace():
+            scalar = _JSON_SCALAR.match(text, i)
+            if scalar is not None:
+                key = None
+                i = scalar.end()
+                continue
+        i += 1
+    return last_val
+
+
 def _args_withheld(entry: dict[str, Any]) -> bool:
     """Whether the pod withheld this call's arguments, so a filter on them cannot decide it."""
     args = entry.get("args")
@@ -2900,6 +2941,10 @@ def _code_call_text_and_clip(entry: dict[str, Any]) -> tuple[str | None, bool]:
                 head = _read_clipped_arg_head(text, target)
                 if head is not None:
                     command = head
+                else:
+                    closed = _read_clipped_closed_top_level(text, target)
+                    if closed is not None:
+                        command = closed
         else:
             args_parsed = _clipped_string_args(raw, {_COMMAND_ARG: "", _CODE_ARG: ""})
             if target in args_parsed and isinstance(args_parsed[target], str):
@@ -3416,7 +3461,7 @@ class WorkerCommandsVerifier(BaseVerifier):
         else:
             no_traj_for_succeeded = False
             calls = _worker_terminal_calls(snap.trajectory)
-            if not calls:
+            if not calls or (forbidding and not any(call[2] is not None for call in calls)):
                 # Tagged MCP calls beside an empty card log mean the worker typed nothing.
                 # No tagged entry at all, a card log that was not read or that shows commands
                 # the capture did not carry, or a withheld code-tool argument, is an error.
@@ -3441,7 +3486,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                 typed += joined
                 if joined:
                     sources = f" ({len(calls)} tagged calls as typed and {len(joined)} from the card log)"
-            untimed = [command for _, at, command, _, _, _ in calls if at is None and command is not None]
+            untimed = [command or "<clipped>" for _, at, command, _, _, _ in calls if at is None]
             # Only the window orders calls; a check with no forbidden set
             # grades nothing by time, so an untimed call cannot mislead it.
             if untimed and forbidding:
@@ -3463,7 +3508,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                 if opener is None:
                     continue
                 opened_at = mine[opener][1]
-                later = [call for call in mine[opener + 1 :] if call[1] > opened_at]
+                later = [call for call in mine[opener + 1 :] if opened_at is not None and call[1] is not None and call[1] > opened_at]
                 windowed.extend(command for _, _, command, _, _, _ in later if command is not None)
                 for _, _, command, result, _, _ in later:
                     if command is not None:
@@ -3566,11 +3611,13 @@ class WorkerCommandsVerifier(BaseVerifier):
             gaps.append("the pod withheld a worker terminal call's arguments")
         clipped_unmatched = False
         for _, _, cmd, _, call_succeeded, is_clipped in traj_calls:
-            if not is_clipped or not call_succeeded:
+            if not is_clipped:
                 continue
             if cmd is None:
                 clipped_unmatched = True
                 break
+            if not call_succeeded:
+                continue
             argv_entries = _shell_argvs_with_exit_propagation(cmd)
             if any(
                 not any(_argv_runs(argv, run) for argv, _ in argv_entries)
@@ -3578,7 +3625,7 @@ class WorkerCommandsVerifier(BaseVerifier):
             ):
                 clipped_unmatched = True
                 break
-        if clipped_unmatched and uncredited_succeeded:
+        if clipped_unmatched and (uncredited_succeeded or (self.after_result_pattern is not None and forbidding)):
             gaps.append("the pod clipped a worker terminal call's arguments")
         gaps_str = "; ".join(gaps)
 

@@ -310,7 +310,7 @@ _SUDO_LONG_VAL_LESS_OPTS = {
 }
 _SETSID_VAL_LESS_FLAGS = set("cwf")
 _GENERIC_WRAPPER_VAL_OPTS = {
-    "env": frozenset(("-u", "-C", "-S", "--unset", "--chdir", "--split-string")),
+    "env": frozenset(("-u", "-C", "-a", "--unset", "--chdir", "--argv0")),
     "nice": frozenset(("-n", "--adjustment")),
     "timeout": frozenset(("-s", "-k", "--signal", "--kill-after")),
     "exec": frozenset(("-a",)),
@@ -318,7 +318,7 @@ _GENERIC_WRAPPER_VAL_OPTS = {
     "ionice": frozenset(("-c", "-n", "-p", "--class", "--classdata", "--pid")),
     "chroot": frozenset(("--userspec", "--groups")),
     "watch": frozenset(("-n", "--interval")),
-    "xargs": frozenset(("-I", "-i", "-n", "-s", "-L", "-d", "-E", "-a")),
+    "xargs": frozenset(("-I", "-P", "-n", "-s", "-L", "-d", "-E", "-a", "--max-procs")),
     "flock": frozenset(("-w", "-E", "--wait", "--timeout", "--conflict-exit-code")),
     "time": frozenset(("-o", "-f", "--output", "--format")),
 }
@@ -391,23 +391,26 @@ def _extract_shell_command_string(
         if word.startswith(("-", "+")) and len(word) > 1:
             is_plus = word.startswith("+")
             idx += 1
-            val_needed = None
+            vals_needed: list[tuple[str, bool]] = []
             for c in word[1:]:
                 if c == "c" and not is_plus:
                     saw_c = True
                 elif c in ("n", "D") and not is_plus:
                     has_noexec = True
                 elif c == "o":
-                    val_needed = "set_o"
+                    vals_needed.append(("set_o", is_plus))
                 elif c == "O":
-                    val_needed = "shopt_O"
+                    vals_needed.append(("shopt_O", is_plus))
 
-            if val_needed is not None:
-                val_word, idx = _next_shell_arg(argv, idx)
+            for val_kind, val_is_plus in vals_needed:
+                val_word, next_idx = _next_shell_arg(argv, idx)
                 if val_word is not None:
-                    idx += 1
-                    if val_needed == "set_o" and not is_plus and val_word == "noexec":
-                        has_noexec = True
+                    idx = next_idx + 1
+                    if val_kind == "set_o":
+                        if not val_is_plus and val_word == "noexec":
+                            has_noexec = True
+                        elif val_is_plus and val_word == "noexec":
+                            has_noexec = False
             continue
 
         if saw_c:
@@ -500,6 +503,46 @@ def _scan_command_prefix(
                     options_ended = True
                     idx += 1
                     continue
+
+                if wrapper_name == "env":
+                    split_val = None
+                    if w in ("-S", "--split-string"):
+                        val_word, next_idx = _next_shell_arg(argv, idx + 1)
+                        if val_word is not None:
+                            split_val = val_word
+                            del argv[idx:next_idx + 1]
+                    elif w.startswith("--split-string="):
+                        split_val = w.partition("=")[2]
+                        del argv[idx]
+                    elif w.startswith("-") and not w.startswith("--") and "S" in w[1:]:
+                        s_idx = w.index("S")
+                        rest = w[s_idx + 1:]
+                        prefix = w[:s_idx]
+                        if rest:
+                            split_val = rest
+                            if prefix == "-":
+                                del argv[idx]
+                            else:
+                                argv[idx] = prefix
+                                idx += 1
+                        else:
+                            val_word, next_idx = _next_shell_arg(argv, idx + 1)
+                            if val_word is not None:
+                                split_val = val_word
+                                if prefix == "-":
+                                    del argv[idx:next_idx + 1]
+                                else:
+                                    argv[idx] = prefix
+                                    del argv[idx + 1:next_idx + 1]
+                                    idx += 1
+
+                    if split_val is not None:
+                        try:
+                            split_words = shlex.split(split_val)
+                        except ValueError:
+                            split_words = split_val.split()
+                        argv[idx:idx] = split_words
+                        continue
 
                 takes_val = False
                 if wrapper_name == "setsid":
