@@ -2787,6 +2787,31 @@ const (
 // enum's top value), and so the ordinals handleDeletion reaps claims for.
 const a2aNATSMaxReplicas = 3
 
+// a2aNATSDeletionRecheck is how often a CR's deletion looks again while
+// its bus StatefulSet is still going (deleteA2ANATSStatefulSetFirst).
+const a2aNATSDeletionRecheck = 5 * time.Second
+
+// deleteA2ANATSStatefulSetFirst deletes the bus StatefulSet this agent
+// controls, in the foreground so its pods go with it, and reports whether
+// the deletion has to wait for it: claims reaped before it is gone would be
+// recreated with its pods (handleDeletion). A StatefulSet of that name the
+// agent doesn't control isn't its to delete, and doesn't hold the reap.
+func (r *PlatformAgentReconciler) deleteA2ANATSStatefulSetFirst(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (bool, error) {
+	sts := &appsv1.StatefulSet{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aNATSName(agent)}, sts); err != nil {
+		return false, client.IgnoreNotFound(err)
+	}
+	if !metav1.IsControlledBy(sts, agent) {
+		return false, nil
+	}
+	if sts.DeletionTimestamp.IsZero() {
+		if err := r.Delete(ctx, sts, client.PropagationPolicy(metav1.DeletePropagationForeground)); client.IgnoreNotFound(err) != nil {
+			return false, fmt.Errorf("deleting the A2A bus StatefulSet before its claims: %w", err)
+		}
+	}
+	return true, nil
+}
+
 // a2aNATSDataClaimName is the claim the StatefulSet controller creates for
 // the server at ordinal.
 func a2aNATSDataClaimName(agent *agentv1alpha1.PlatformAgent, ordinal int) string {

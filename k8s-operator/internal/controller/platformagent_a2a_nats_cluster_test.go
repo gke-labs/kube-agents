@@ -377,6 +377,81 @@ func TestHandleDeletionReapsEveryServersJetStreamPVC(t *testing.T) {
 	}
 }
 
+// The claims wait for the bus StatefulSet: a claim reaped while it lives is
+// recreated with its pod and outlives it, pinned to a zone (handleDeletion).
+// The first pass deletes the StatefulSet and leaves every claim; the pass
+// after it is gone reaps them. A StatefulSet of that name the agent doesn't
+// control holds nothing back.
+func TestHandleDeletionReapsTheBusClaimsOnlyOnceItsStatefulSetIsGone(t *testing.T) {
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+	agent.UID = "agent-uid"
+	agent.Finalizers = []string{platformAgentFinalizer}
+	now := metav1.Now()
+	agent.DeletionTimestamp = &now
+	sts := buildA2ANATSStatefulSet(a2aTestAgent(), "h")
+	sts.OwnerReferences = []metav1.OwnerReference{{APIVersion: agentv1alpha1.GroupVersion.String(), Kind: "PlatformAgent",
+		Name: agent.Name, UID: agent.UID, Controller: ptr.To(true)}}
+	labels := sts.Spec.VolumeClaimTemplates[0].Labels
+	objs := []client.Object{agent, sts}
+	for ordinal := range a2aNATSMaxReplicas {
+		objs = append(objs, &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+			Name: a2aNATSDataClaimName(agent, ordinal), Namespace: agent.Namespace, Labels: labels,
+		}})
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+	claimsLeft := func() int {
+		n := 0
+		for ordinal := range a2aNATSMaxReplicas {
+			if cl.Get(ctx, types.NamespacedName{Name: a2aNATSDataClaimName(agent, ordinal), Namespace: agent.Namespace}, &corev1.PersistentVolumeClaim{}) == nil {
+				n++
+			}
+		}
+		return n
+	}
+
+	res, err := r.handleDeletion(ctx, agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.RequeueAfter != a2aNATSDeletionRecheck {
+		t.Errorf("RequeueAfter = %v with the StatefulSet just deleted, want %v", res.RequeueAfter, a2aNATSDeletionRecheck)
+	}
+	if n := claimsLeft(); n != a2aNATSMaxReplicas {
+		t.Fatalf("%d of %d claims left after the first pass, want all: they wait for the StatefulSet", n, a2aNATSMaxReplicas)
+	}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(sts), &appsv1.StatefulSet{}); !errors.IsNotFound(err) {
+		t.Fatalf("the bus StatefulSet survived the first pass (err=%v)", err)
+	}
+	if _, err := r.handleDeletion(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	if n := claimsLeft(); n != 0 {
+		t.Errorf("%d claims left once the StatefulSet was gone, want none", n)
+	}
+
+	// A StatefulSet of that name the agent doesn't control: the claims go
+	// on the first pass, and the StatefulSet stays.
+	agent2 := a2aTestAgent()
+	agent2.UID = "agent-uid"
+	agent2.Finalizers = []string{platformAgentFinalizer}
+	agent2.DeletionTimestamp = &now
+	foreign := buildA2ANATSStatefulSet(a2aTestAgent(), "h")
+	cl2 := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{agent2, foreign}, objs[2:]...)...).Build()
+	r2 := &PlatformAgentReconciler{Client: cl2, Scheme: scheme}
+	if _, err := r2.handleDeletion(ctx, agent2); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl2.Get(ctx, client.ObjectKeyFromObject(foreign), &appsv1.StatefulSet{}); err != nil {
+		t.Errorf("a StatefulSet the agent doesn't control was deleted (err=%v)", err)
+	}
+	if err := cl2.Get(ctx, types.NamespacedName{Name: a2aNATSDataClaimName(agent, 0), Namespace: agent.Namespace}, &corev1.PersistentVolumeClaim{}); !errors.IsNotFound(err) {
+		t.Errorf("a foreign StatefulSet held back the claim reap (err=%v)", err)
+	}
+}
+
 // Every stream and bucket the provision script creates takes the configured
 // replica count, never a literal. A stream added with --replicas=1 (or any
 // number) fails here, so a new stream cannot quietly ship R1 on a cluster.

@@ -1677,6 +1677,20 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 			}
 		}
 
+		// The bus StatefulSet goes first, and its claims only once it is
+		// gone. The CR's finalizer keeps the StatefulSet alive (its owner
+		// isn't deleted yet), and a claim deleted under a live StatefulSet is
+		// recreated with its pod: a fresh claim, provisioned in whatever zone
+		// that pod lands, which then outlives the StatefulSet (WhenDeleted is
+		// Retain). A reinstall reuses it pinned to that zone, and on a
+		// three-server bus that zone's node can already hold another server,
+		// so the third never schedules (the hostname spread refuses it).
+		if wait, err := r.deleteA2ANATSStatefulSetFirst(ctx, agent); err != nil {
+			return ctrl.Result{}, err
+		} else if wait {
+			return ctrl.Result{RequeueAfter: a2aNATSDeletionRecheck}, nil
+		}
+
 		// The NATS StatefulSet's volumeClaimTemplate PVCs have no owner
 		// reference (nothing from a template does), so without this a
 		// deleted next-mode agent leaks a 40Gi JetStream volume per server.
