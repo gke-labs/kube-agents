@@ -305,14 +305,16 @@ when a prefix is in effect:
 - `AGENT_SANDBOX_IMAGE` — the shell sandbox StatefulSet rendered beside every agent pod.
 - `FLUENT_BIT_IMAGE` — the logging sidecar injected into every agent pod.
 
-`CREDENTIAL_PROXY_IMAGE` and `KUBE_PROXY_IMAGE` need nothing: the operator derives them from the agent image
-by swapping the trailing name (`platform-agent` to `credential-proxy` and `kube-proxy`), which lands on the mirror
-on its own. The A2A `next` images the operator renders (`a2a-gateway`, `a2a-worker`,
-`a2a-authcallout`, `a2a-verifier`, `a2a-console`) follow `OPERATOR_IMAGE`, else `PLATFORM_AGENT_IMAGE`, the same way, so they need
-no env of their own on a mirror. The sandbox is a separate repository, so it gets no such
-derivation. Setting it explicitly still wins, which is why `install.sh` leaves it unset. One
-explicit value pins the sidecar for every agent in the cluster, and the per-CR derivation is what
-otherwise keeps each sidecar in step with its own agent's image.
+`CREDENTIAL_PROXY_IMAGE` and `KUBE_PROXY_IMAGE` need nothing on a mirror. The operator derives
+the credential proxy from each agent's own image by swapping the trailing name (`platform-agent` to
+`credential-proxy`). It derives `kube-proxy`, and the A2A `next` images it renders (`a2a-gateway`,
+`a2a-worker`, `a2a-authcallout`, `a2a-verifier`, `a2a-console`), from `OPERATOR_IMAGE`, else
+`PLATFORM_AGENT_IMAGE`, the same way. The sandbox follows `AGENT_SANDBOX_IMAGE`, else
+`OPERATOR_IMAGE` with the repository swapped to `agent-sandbox`, else the ghcr.io default; the
+chart always sets `AGENT_SANDBOX_IMAGE`. Setting `CREDENTIAL_PROXY_IMAGE` or `KUBE_PROXY_IMAGE`
+explicitly still wins, which is why `install.sh` leaves them unset: one explicit
+`CREDENTIAL_PROXY_IMAGE` pins the broker for every agent in the cluster, where the per-CR
+derivation keeps each broker in step with its own agent's image.
 
 Per-agent, `spec.deployment.image` / `spec.deployment.tag` on a `PlatformAgent` override all of
 the above for that agent's containers — see the

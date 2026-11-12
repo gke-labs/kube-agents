@@ -79,10 +79,10 @@
 #     holds ca.crt, the GitOps repository on that forge, and the token minter
 #     pointed at the same host and CA ("GitHub Enterprise Server" in
 #     INSTALL.md). The GitHub App is the github.com App of the repository,
-#     because the data is on github.com. Use the model of the eval lanes
-#     (hack/ci-deploy.sh: MODEL_PROVIDER=vertex_ai,
-#     MODEL_DEFAULT_NAME=gemini-3.1-pro-preview, the Vertex location
-#     `global`); with an older model the workers misread the fleet before
+#     because the data is on github.com. Use the model the eval lanes run
+#     (the gate pair of the build cluster's eval-model Secret,
+#     docs/ci-pool-projects.md 5.10; the Vertex location `global` when the
+#     provider is vertex_ai); with an older model the workers misread the fleet before
 #     they reach the forge.
 #  3. Seed the workload's declaration, if the repository does not hold it,
 #     at clusters/<slot-a cluster>/seeded-reliability/checkout-gateway.yaml

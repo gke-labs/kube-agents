@@ -47,5 +47,5 @@ pods:
     cpuMillisLimit: 500
     memoryBytesRequest: 67108864
     memoryBytesLimit: 268435456
-    ephemeralStorageBytesRequest: 0
-    ephemeralStorageBytesLimit: 0
+    ephemeralStorageBytesRequest: 134217728
+    ephemeralStorageBytesLimit: 134217728

@@ -45,7 +45,7 @@ _AR_REPO = "us-central1-docker.pkg.dev/kube-agents-evals/kube-agents"
 _GHCR_PREFIX = "ghcr.io/gke-labs/kube-agents"
 
 # The two sections under test, delimited by the banner that follows each.
-_IMAGE_SOURCE_SECTION = (r"^# ─── 2a\. Image Source.*?", r"^export MODEL_PROVIDER=")
+_IMAGE_SOURCE_SECTION = (r"^# ─── 2a\. Image Source.*?", r"^# --- agent model required in a Prow job: begin")
 _BUILD_SECTION = (r"^# ─── 4\. Build Container Images.*?", r"^# ─── 5\. Chart Deployment")
 
 

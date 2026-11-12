@@ -90,6 +90,9 @@ def _clean_env(monkeypatch):
         "EVAL_BASELINE_STORE",
         "EVAL_BASELINE_MAX_OBJECTS",
         "EVAL_BASELINE_CAT_WORKERS",
+        # The agent stamp reads these; the golden was captured without them.
+        "MODEL_PROVIDER",
+        "EVAL_REASONING_EFFORT",
     ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("JUDGE_MODEL", JUDGE)

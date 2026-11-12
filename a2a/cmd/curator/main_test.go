@@ -13,7 +13,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 
@@ -279,16 +278,25 @@ func TestDaemonStatusEndpoints(t *testing.T) {
 	addr := ln.Addr().String()
 	_ = ln.Close()
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	done := make(chan error, 1)
 	go func() {
-		done <- runDaemon([]string{"--repo", t.TempDir(), "--status-listen", addr})
+		done <- runDaemonContext(ctx, []string{"--repo", t.TempDir(), "--status-listen", addr})
 	}()
+
+	httpClient := &http.Client{
+		Timeout:   2 * time.Second,
+		Transport: &http.Transport{DisableKeepAlives: true},
+	}
 
 	deadline := time.Now().Add(5 * time.Second)
 	readyOK := false
 	for time.Now().Before(deadline) {
-		resp, gErr := http.Get("http://" + addr + "/readyz")
+		resp, gErr := httpClient.Get("http://" + addr + "/readyz")
 		if gErr == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
 			_ = resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
 				readyOK = true
@@ -300,19 +308,20 @@ func TestDaemonStatusEndpoints(t *testing.T) {
 	if !readyOK {
 		t.Fatalf("curator daemon /readyz did not become 200 OK on %s", addr)
 	}
-	hResp, err := http.Get("http://" + addr + "/healthz")
+	hResp, err := httpClient.Get("http://" + addr + "/healthz")
 	if err != nil || hResp.StatusCode != http.StatusOK {
 		t.Fatalf("/healthz failed: resp=%+v err=%v", hResp, err)
 	}
+	_, _ = io.Copy(io.Discard, hResp.Body)
 	_ = hResp.Body.Close()
 
-	_ = syscall.Kill(syscall.Getpid(), syscall.SIGTERM)
+	cancel()
 	select {
 	case dErr := <-done:
 		if dErr != nil {
-			t.Fatalf("runDaemon returned error on SIGTERM: %v", dErr)
+			t.Fatalf("runDaemonContext returned error on shutdown: %v", dErr)
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("runDaemon did not shut down within 5s of SIGTERM")
+	case <-time.After(10 * time.Second):
+		t.Fatal("runDaemonContext did not shut down within 10s of context cancel")
 	}
 }

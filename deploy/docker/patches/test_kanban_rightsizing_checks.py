@@ -146,6 +146,43 @@ class OwnEntriesTest(RuleTestCase):
         self.assertEqual([e["workload"] for e in metadata[krc.METADATA_KEY]], ["queue-worker"])
         self.assertNotIn("`api-server`", result)
 
+    def test_entries_past_the_limit_are_counted_on_the_retry_and_the_limit_is_stated(self):
+        many = [{**HPA_ENTRY, "workload": f"w{i}"} for i in range(krc.MAX_ENTRIES + 2)]
+        self.assertTrue(self.rule(CHILD, many)[0])
+        with self.assertLogs(krc.logger, "WARNING"):
+            reasons, result, _ = self.rule(CHILD, many, retry=True)
+        self.assertEqual(reasons, [])
+        self.assertEqual(result.count(": dependency: "), krc.MAX_ENTRIES)
+        self.assertIn(f"- 2 of this card's entries past the limit of {krc.MAX_ENTRIES} not shown.", result)
+        self.assertIn(f"At most {krc.MAX_ENTRIES} entries.", krc.PARAM_DESCRIPTION)
+
+    def test_a_repeat_past_the_limit_is_not_counted(self):
+        many = [{**HPA_ENTRY, "workload": f"w{i}"} for i in range(krc.MAX_ENTRIES)] + [{**HPA_ENTRY, "workload": "w0"}]
+        with self.assertLogs(krc.logger, "WARNING"):
+            result = self.rule(CHILD, many, retry=True)[1]
+        self.assertNotIn("past the limit", result)
+
+    def test_a_redacted_or_repeated_entry_past_the_limit_is_counted_once(self):
+        many = [{**HPA_ENTRY, "workload": f"w{i}"} for i in range(krc.MAX_ENTRIES)]
+        many += [{**HPA_ENTRY, "workload": "w0"}, {**HPA_ENTRY, "workload": "x9"}, {**HPA_ENTRY, "workload": "x9"}]
+        redact = lambda value: value.replace("w0", "REDACTED")
+        with self.assertLogs(krc.logger, "WARNING"):
+            result = krc.rightsizing_rule(task_id=CHILD, args={krc.PARAM: many}, result="**Answer.**", metadata=None,
+                                          calls=[], retry=True, redact=redact, connect=self.connect)[1]
+        self.assertIn(f"- 1 of this card's entries past the limit of {krc.MAX_ENTRIES} not shown.", result)
+
+    def test_past_the_limit_is_said_when_every_entry_failed(self):
+        bad = [{**HPA_ENTRY, "dependency_kind": "maybe"}] * (krc.MAX_ENTRIES + 1)
+        with self.assertLogs(krc.logger, "WARNING"):
+            reasons, result, metadata = self.rule(CHILD, bad, retry=True)
+        self.assertEqual(reasons, [])
+        self.assertIn(f"- 1 of this card's entries past the limit of {krc.MAX_ENTRIES} not shown.", result)
+        self.assertEqual(metadata[krc.PAST_LIMIT_KEY], 1)
+
+    def test_the_skill_states_the_same_limit(self):
+        skill = (pathlib.Path(__file__).resolve().parents[3] / "agents" / "cluster" / "skills" / krc.SKILL_NAME / "SKILL.md").read_text()
+        self.assertIn(f"Pass at most {krc.MAX_ENTRIES} entries.", skill)
+
     def test_not_on_cluster_needs_no_checks(self):
         gone = {"workload": "api-server", "dependency_kind": "not_on_cluster", "dependency": "No such deployment here."}
         reasons, result, _ = self.rule(CHILD, [gone])
@@ -260,6 +297,46 @@ class InheritedEntriesTest(RuleTestCase):
         self.assertEqual(result.count(": dependency: "), krc.MAX_SHOWN)
         self.assertIn("- 3 more entries not shown;", result)
 
+    def test_a_parent_says_how_many_entries_its_cards_dropped_past_the_limit(self):
+        conn = sqlite3.connect(self.path)
+        conn.execute("UPDATE task_runs SET metadata = ? WHERE task_id = ?",
+                     (json.dumps({krc.METADATA_KEY: [HPA_ENTRY, QOS_ENTRY], krc.PAST_LIMIT_KEY: 3}), CHILD))
+        conn.commit()
+        conn.close()
+        result = self.rule(PARENT)[1]
+        self.assertIn(f"- 3 entries of the cards below past the limit of {krc.MAX_ENTRIES} not shown.", result)
+
+    def test_a_card_that_quotes_the_past_limit_line_gets_no_second_section(self):
+        conn = sqlite3.connect(self.path)
+        conn.execute("UPDATE task_runs SET metadata = ? WHERE task_id = ?",
+                     (json.dumps({krc.METADATA_KEY: [HPA_ENTRY, QOS_ENTRY], krc.PAST_LIMIT_KEY: 3}), CHILD))
+        conn.commit()
+        conn.close()
+        quoted = "Result of delegated task:\n\n" + krc.render(
+            [{**HPA_ENTRY, "card": CHILD}, {**QOS_ENTRY, "card": CHILD}], inherited_past_limit=3)
+        result = self.rule(PARENT, result=quoted)[1]
+        self.assertEqual(result, quoted)
+
+    def test_a_model_written_past_limit_key_is_dropped(self):
+        metadata = self.rule(CHILD, [HPA_ENTRY], metadata={krc.PAST_LIMIT_KEY: 99})[2]
+        self.assertNotIn(krc.PAST_LIMIT_KEY, metadata)
+
+    def test_two_cards_that_report_the_same_words_render_two_lines(self):
+        self.card("t_seeded_b", body=SKILL_BODY, creator=PARENT, stored=[HPA_ENTRY])
+        result = self.rule(PARENT)[1]
+        self.assertIn(f"- `api-server` (card {CHILD}): dependency: HPA.", result)
+        self.assertIn("- `api-server` (card t_seeded_b): dependency: HPA.", result)
+
+    def test_own_and_inherited_drops_are_counted_apart(self):
+        legs = [{**HPA_ENTRY, "workload": f"hpa{i}"} for i in range(krc.MAX_SHOWN)]
+        self.card("t_aaaa", body=SKILL_BODY, creator=PARENT, stored=legs)
+        own = [{"workload": "mine", "dependency_kind": "none", "dependency": "Nothing blocks a cut.", "checks": dict(CHECKS)}]
+        with self.assertLogs(krc.logger, "WARNING"):
+            result = self.rule(PARENT, own)[1]
+        self.assertIn("- 1 more of this card's entries not shown.", result)
+        self.assertIn("- 2 more entries not shown; the cards below this one hold them.", result)
+        self.assertNotIn("`mine`", result)
+
     def test_the_shown_entries_are_capped(self):
         many = [{**HPA_ENTRY, "workload": f"w{i}"} for i in range(krc.MAX_SHOWN + 2)]
         self.card("t_many", body=SKILL_BODY, creator=PARENT, stored=many)
@@ -291,6 +368,18 @@ class PlatformCutRequestTest(RuleTestCase):
             "Propose resource request reductions for inference-server.",
             "Can we reduce the memory limit on api-server?",
             "Shrink the pool's machine type to e2-standard-2.",
+            # A bare noun a workload owns, or with a quantity (#4051).
+            "Lower the requests of inference-server.",
+            "Reduce ledger-writer's limits.",
+            "Lower inference-server's requests to 200m CPU.",
+            "Cut its limits to 512Mi.",
+            "Lower the requests of api-server.",
+            "Reduce ledger-writer’s limits.",
+            "Reduce the limits of http-echo.",
+            # A workload name in backticks, as the cards write it.
+            "Lower the requests of `inference-server`.",
+            "Reduce `ledger-writer`'s limits.",
+            "Lower `inference-server`'s requests to 200m.",
         ):
             self.assertTrue(krc.asks_for_cut("", ask), ask)
         self.assertTrue(krc.asks_for_cut("Calculate resource request reductions for api-server",
@@ -306,6 +395,14 @@ class PlatformCutRequestTest(RuleTestCase):
             "Investigate why checkout sees reduced requests since Monday.",
             "We are hitting reduced API limits on the ingress.",
             "Lower the request latency of checkout.",
+            "Reduce the HTTP requests of the frontend.",
+            "Lower the rate limits of the API gateway.",
+            "Lower the limits of the quota for team-a.",
+            "After we cut over to the new cluster, the requests time out.",
+            "Since we reduced replicas, the requests pile up on checkout.",
+            "Reduce the requests to the database.",
+            "Lower the error rate of the requests to checkout.",
+            "Lower the limits of the budget alert.",
             f"Why is payments-api crashlooping?\n\n{krc.FORMAT_MARKER}\n\nLower the requests if needed.",
             "A report of cost opportunities (e.g., underutilized nodes, right-sizing recommendations, idle resources).",
         ):

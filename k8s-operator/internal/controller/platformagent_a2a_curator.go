@@ -202,8 +202,10 @@ func buildA2ACuratorDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 						a2aBusTokenVolumeSource(),
 						a2aNATSCABundleVolume(agent),
 						{
-							Name:         a2aCuratorStateVolume,
-							VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+							Name: a2aCuratorStateVolume,
+							VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{
+								SizeLimit: ptr.To(resource.MustParse(a2aCuratorStateSizeLimit)),
+							}},
 						},
 					},
 					Containers: []corev1.Container{{
@@ -227,21 +229,28 @@ func buildA2ACuratorDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 							a2aNATSCABundleMount(),
 							{Name: a2aCuratorStateVolume, MountPath: a2aCuratorStateMountPath},
 						},
-						StartupProbe:   probe(a2aCuratorHealthPath, a2aCuratorStartupPeriod, a2aCuratorStartupFailure),
-						ReadinessProbe: probe(a2aCuratorReadyPath, a2aCuratorReadinessPeriod, a2aCuratorReadinessFailure),
-						LivenessProbe:  probe(a2aCuratorHealthPath, a2aCuratorLivenessPeriod, a2aCuratorLivenessFailure),
-						Resources: a2aResources(
-							a2aCuratorCPURequest,
-							a2aCuratorMemoryRequest,
-							a2aCuratorCPULimit,
-							a2aCuratorMemoryLimit,
-						),
+						StartupProbe:    probe(a2aCuratorHealthPath, a2aCuratorStartupPeriod, a2aCuratorStartupFailure),
+						ReadinessProbe:  probe(a2aCuratorReadyPath, a2aCuratorReadinessPeriod, a2aCuratorReadinessFailure),
+						LivenessProbe:   probe(a2aCuratorHealthPath, a2aCuratorLivenessPeriod, a2aCuratorLivenessFailure),
+						Resources:       a2aCuratorResources(),
 						SecurityContext: hardenedSecurityContext(),
 					}},
 				},
 			},
 		},
 	}
+}
+
+func a2aCuratorResources() corev1.ResourceRequirements {
+	resources := a2aResources(
+		a2aCuratorCPURequest,
+		a2aCuratorMemoryRequest,
+		a2aCuratorCPULimit,
+		a2aCuratorMemoryLimit,
+	)
+	resources.Requests[corev1.ResourceEphemeralStorage] = resource.MustParse(a2aCuratorEphemeralRequest)
+	resources.Limits[corev1.ResourceEphemeralStorage] = resource.MustParse(a2aCuratorEphemeralRequest)
+	return resources
 }
 
 // buildA2ACuratorNetworkPolicy denies all ingress to the curator pod and limits

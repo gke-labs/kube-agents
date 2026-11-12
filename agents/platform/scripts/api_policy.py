@@ -164,6 +164,11 @@ def project_gke_cluster_list(body: bytes) -> bytes | None:
     return json.dumps(kept, separators=(",", ":")).encode()
 
 
+# The cluster read the shim's get-credentials check uses; the broker refuses it
+# for an excluded cluster when the check's header is set
+# (credential_proxy.GET_CREDENTIALS_CHECK_HEADER).
+GKE_CLUSTER_GET_RULE = "gcp.api.container.clusters-get"
+
 API_READ_ROUTES: tuple[ApiRoute, ...] = (
     # Per-container usage history for the cost stream's collector
     # (`skills/fleet-audit/scripts/fleet_waste.py`, sections 3.1, 3.11,
@@ -214,7 +219,8 @@ API_READ_ROUTES: tuple[ApiRoute, ...] = (
     # The Cluster Agent reconcile's two reads (#3703, approved by @bnaylor 10-28 as
     # exactly these two read-only routes): every cluster in a project, and whether one
     # cluster still exists. Both answers are projected to name, location, status and
-    # id; node pools, operations and every write stay refused.
+    # id; node pools, operations and every write stay refused. The get is also the
+    # shim's check before it answers a get-credentials itself (#5447).
     ApiRoute(
         "container.googleapis.com",
         API_READ_METHOD,
@@ -226,7 +232,7 @@ API_READ_ROUTES: tuple[ApiRoute, ...] = (
         "container.googleapis.com",
         API_READ_METHOD,
         re.compile(rf"^v1/projects/{PROJECT}/locations/{GKE_LOCATION}/clusters/{GKE_CLUSTER}$"),
-        "gcp.api.container.clusters-get",
+        GKE_CLUSTER_GET_RULE,
         project_gke_cluster,
     ),
 )

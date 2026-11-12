@@ -72,6 +72,18 @@ func TestEmptyDirWritersRequestTheirVolumePlusLogs(t *testing.T) {
 	if tmp == nil || tmp.EmptyDir == nil || tmp.EmptyDir.SizeLimit == nil || tmp.EmptyDir.SizeLimit.Cmp(resource.MustParse(a2aProvisionTmpSizeLimit)) != 0 {
 		t.Errorf("a2a provision tmp volume = %+v, want an emptyDir with sizeLimit %s", tmp, a2aProvisionTmpSizeLimit)
 	}
+
+	cur := buildA2ACuratorDeployment(a2aTestAgent())
+	assertWriterEphemeral(t, "a2a curator container", cur.Spec.Template.Spec.Containers[0], a2aCuratorEphemeralRequest)
+	var curVol *corev1.Volume
+	for i := range cur.Spec.Template.Spec.Volumes {
+		if cur.Spec.Template.Spec.Volumes[i].Name == a2aCuratorStateVolume {
+			curVol = &cur.Spec.Template.Spec.Volumes[i]
+		}
+	}
+	if curVol == nil || curVol.EmptyDir == nil || curVol.EmptyDir.SizeLimit == nil || curVol.EmptyDir.SizeLimit.Cmp(resource.MustParse(a2aCuratorStateSizeLimit)) != 0 {
+		t.Errorf("a2a curator state volume = %+v, want an emptyDir with sizeLimit %s", curVol, a2aCuratorStateSizeLimit)
+	}
 }
 
 // TestEmptyDirWriterRequestsAreTheVolumePlusTheAllowance holds the
@@ -82,6 +94,7 @@ func TestEmptyDirWriterRequestsAreTheVolumePlusTheAllowance(t *testing.T) {
 		{pluginStagingEphemeralRequest, pluginStagingSizeLimit},
 		{a2aProvisionEphemeralRequest, a2aProvisionTmpSizeLimit},
 		{shellSandboxClientKeyEphemeralRequest, shellSandboxClientKeySizeLimit},
+		{a2aCuratorEphemeralRequest, a2aCuratorStateSizeLimit},
 	} {
 		want := resource.MustParse(tc.sizeLimit)
 		want.Add(resource.MustParse(emptyDirLogsAllowance))

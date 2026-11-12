@@ -247,6 +247,12 @@ func defaultHindsightURL() string {
 }
 
 func runDaemon(args []string) error {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	return runDaemonContext(ctx, args)
+}
+
+func runDaemonContext(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("curator daemon", flag.ContinueOnError)
 	repoDir := fs.String("repo", defaultRepoDir(), "knowledge repository directory")
 	repoID := fs.String("repo-id", defaultRepoID(), "canonical repository identifier")
@@ -259,8 +265,6 @@ func runDaemon(args []string) error {
 	}
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 
 	var ready atomic.Bool
 	var statusSrv *http.Server
@@ -292,9 +296,10 @@ func runDaemon(args []string) error {
 			}
 		}()
 		defer func() {
-			shCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			shCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
 			_ = statusSrv.Shutdown(shCtx)
+			_ = statusSrv.Close()
 		}()
 	}
 
