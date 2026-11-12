@@ -530,7 +530,7 @@ def render_not_evaluated_comment(run: health.Run, verdict: dict, health_doc: dic
     if collapsed:
         box += BOX_NOT_EVALUATED_COLLAPSED
     links = [LINK_DETAILS.format(url=post_health.run_link(run.build_id))]
-    if in_storm:
+    if storm:
         links.append(LINK_BRIEF.format(url=brief_link(health_doc)))
     wall = run.wall_clock
     minutes = int(wall.total_seconds() // 60) if wall else "?"

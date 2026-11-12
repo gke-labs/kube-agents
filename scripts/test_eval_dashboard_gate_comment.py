@@ -813,6 +813,7 @@ class NotEvaluatedComment(Harness):
         box = self.gh.bodies()[0].split("\n")[3]
         self.assertIn("a forge read failed during grading", box)
         self.assertNotIn("quota storm", box)
+        self.assertNotIn("Incident brief", box, "the storm brief is not this outage's")
 
     def test_inside_a_declared_storm_the_box_names_it_and_links_the_brief(self):
         mine = not_evaluated(100, 1300, NOW - timedelta(minutes=5))
