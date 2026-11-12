@@ -68,14 +68,22 @@ func boundAgentProfiles(ctx context.Context, c client.Reader, agent *agentv1alph
 	if err != nil {
 		return nil, err
 	}
+	return withoutForeignServiceAccounts(ctx, c, renderable)
+}
+
+// withoutForeignServiceAccounts drops the profiles that would land on a
+// ServiceAccount that isn't theirs. Both controllers resolve identities over
+// what it returns, so they make the same dispatcher-ceiling cut: a profile
+// counted on one side and not the other would move the cut by one.
+func withoutForeignServiceAccounts(ctx context.Context, c client.Reader, profiles []agentv1alpha1.AgentProfile) ([]agentv1alpha1.AgentProfile, error) {
 	var bound []agentv1alpha1.AgentProfile
-	for i := range renderable {
-		foreign, err := agentProfileServiceAccountIsForeign(ctx, c, &renderable[i])
+	for i := range profiles {
+		foreign, err := agentProfileServiceAccountIsForeign(ctx, c, &profiles[i])
 		if err != nil {
 			return nil, err
 		}
 		if foreign == "" {
-			bound = append(bound, renderable[i])
+			bound = append(bound, profiles[i])
 		}
 	}
 	return bound, nil
