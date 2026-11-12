@@ -858,8 +858,8 @@ func buildA2ADispatchConfigMapWith(agent *agentv1alpha1.PlatformAgent, profiles 
 	if err != nil {
 		return nil, err
 	}
-	// Compact: indented, the config roughly doubled, and it has to fit one
-	// ConfigMap at the 2,500-profile target (#5479).
+	// Compact, not indented: indentation roughly doubles a Job template, and
+	// the whole config has to fit one ConfigMap (gke-labs/kube-agents#5479).
 	body, err := json.Marshal(cfg)
 	if err != nil {
 		return nil, err

@@ -434,9 +434,7 @@ leave open:
   `A2A_DISPATCHER_IMAGE` the override), and off only at `A2A_PROFILE_DISPATCHER=false`, which
   the chart sets from `operator.profileDispatcher.enabled`. Its identity-map entry grows with
   the profile count, and one entry can't be split across shards, so it fills one shard near 650
-  profiles at two tiers. The dispatch config, one ConfigMap, has its own limit: under Job mode
-  each profile that allows `unattended` carries its Job template there, which fills the
-  ConfigMap near 200 such profiles (#5479). The operator binds profiles oldest first (creation
+  profiles at two tiers. The dispatch config, one ConfigMap, has its own limit. Since #5485 an unattended profile's Job template is its own `DispatchJobTemplate`, and the config carries only a reference to it, so that limit is reached first only by profiles that declare many parameters (#5479). The operator binds profiles oldest first (creation
   time, then name) while both fit, less a reserve for draining profiles, and refuses newer ones with
   `IdentityReady` reason `DispatcherCeiling`; the dispatcher serves the rest. The PlatformAgent's
   `DispatcherCeiling` condition warns at four fifths of either budget and reads
