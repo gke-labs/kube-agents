@@ -365,6 +365,22 @@ UNKNOWN_LABEL = "?"
 EXIT_OK = 0
 EXIT_ERROR = 2
 
+# What kubectl prints when a listing is refused for good rather than failing
+# for the moment: the identity may not list the kind, or the cluster does not
+# serve it. A listing that fails any other way (a timeout, a 5xx, a reply the
+# broker cut) may answer the next time it is asked, so a resolver treats the
+# two apart: a refused kind is not asked for again, a kind unreadable this
+# time is asked for in the next namespace.
+LISTING_REFUSAL_MARKERS = ("(Forbidden)", "doesn't have a resource type", "could not find the requested resource")
+
+
+class ListingRefused:
+    """The lister's answer for a kind refused outright; `None` is a kind not
+    readable this time. `NameResolver` reads both as unresolvable."""
+
+
+REFUSED = ListingRefused()
+
 
 # --------------------------------------------------------------------------
 # kubectl
@@ -405,8 +421,16 @@ def kubectl_json(args: list[str]) -> dict:
         raise RuntimeError(f"kubectl {' '.join(args)} returned unparseable output ({rc}): {exc}")
 
 
-def kubectl_names(resource: str, namespace: str) -> set[str] | None:
-    """Names of `resource` in `namespace`, or None when the API cannot be read.
+def listing_refused(stderr: str) -> bool:
+    """Whether kubectl's stderr says the listing is refused for good
+    (LISTING_REFUSAL_MARKERS) rather than failed for the moment."""
+    return any(marker in (stderr or "") for marker in LISTING_REFUSAL_MARKERS)
+
+
+def kubectl_names(resource: str, namespace: str) -> set[str] | ListingRefused | None:
+    """Names of `resource` in `namespace`; REFUSED when the listing is refused
+    for good (Forbidden, a kind the cluster does not serve); None when the
+    API cannot be read this time.
 
     `-o name` carries no object bodies, which is what keeps Secret contents
     out of this script.
@@ -419,7 +443,7 @@ def kubectl_names(resource: str, namespace: str) -> set[str] | None:
             f"{WARNING_PREFIX}cannot list {resource} in {namespace}; references to "
             f"{resource} are not checked: {stderr.strip()}\n"
         )
-        return None
+        return REFUSED if listing_refused(stderr) else None
     return {
         line.split(RESOURCE_NAME_SEPARATOR, 1)[-1] for line in stdout.splitlines() if line.strip()
     }
@@ -453,7 +477,7 @@ class NameResolver:
 
     def __init__(self, lister=kubectl_names):
         self._lister = lister
-        self._cache: dict[tuple[str, str], set[str] | None] = {}
+        self._cache: dict[tuple[str, str], set[str] | ListingRefused | None] = {}
 
     def exists(self, kind: str, namespace: str, name: str) -> bool | None:
         """True/False when the kind is resolvable, None when it is not."""
@@ -464,7 +488,7 @@ class NameResolver:
         if key not in self._cache:
             self._cache[key] = self._lister(resource, namespace)
         names = self._cache[key]
-        if names is None:
+        if names is None or isinstance(names, ListingRefused):
             return None
         return name in names
 
@@ -1111,12 +1135,17 @@ class ClusterNameResolver(NameResolver):
     listing, as the namespace read resolves it: the cluster-wide read saves
     calls and never leaves a reference unchecked that the namespace read
     would have checked, so a dangling-reference row does not clear on a
-    listing that failed. A kind neither listing can read stays unresolved,
-    as before, and is not asked for again: Secrets are refused at both
-    scopes on the read-only permission set (the admission policy lets no
-    agent Role grant them), and a Secret reference is the common one, so
-    without that memory every namespace with one would cost a refused call,
-    the per-namespace cost the cluster read exists to remove."""
+    listing that failed. A kind the per-namespace listing refuses outright
+    (REFUSED: Forbidden, or not served) stays unresolved, as before, and is
+    not asked for again: Secrets are refused at both scopes on the read-only
+    permission set (the admission policy lets no agent Role grant them), and
+    a Secret reference is the common one, so without that memory every
+    namespace with one would cost a refused call, the per-namespace cost the
+    cluster read exists to remove. A per-namespace listing that fails for the
+    moment (a timeout, a 5xx, a cut reply: None) leaves that one namespace's
+    references unchecked, with the warning, and the kind is asked for again
+    in the next namespace: one namespace's bad moment must not clear a
+    dangling-reference row in another."""
 
     def __init__(self, lister=kubectl_names_cluster_wide, namespace_lister=kubectl_names):
         super().__init__(lister=namespace_lister)
@@ -1136,7 +1165,7 @@ class ClusterNameResolver(NameResolver):
         if resource in self._unlistable:
             return None
         answer = super().exists(kind, namespace, name)
-        if self._cache.get((resource, namespace)) is None:
+        if isinstance(self._cache.get((resource, namespace)), ListingRefused):
             self._unlistable.add(resource)
         return answer
 

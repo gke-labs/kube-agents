@@ -225,10 +225,13 @@ per-namespace path throughout. The referents of the dangling-reference heuristic
 from one name-only listing per kind across the cluster (`-o custom-columns` of namespace and
 name, never a body); a kind whose cluster-wide listing failed or was cut is resolved per
 namespace through the namespace read's own `-o name` listing, so a failed listing clears no
-dangling-reference row; a kind neither listing can read (Secrets on the read-only permission set,
-which the admission policy lets no agent Role grant) stays unresolved and is not asked for in the
-next namespace, so the fallback costs a kind at most one refused call rather than one per
-namespace with a reference. The cursor keeps its two grains: a tick that runs out before a
+dangling-reference row; a kind the per-namespace listing refuses outright (Forbidden, or not
+served: Secrets on the read-only permission set, which the admission policy lets no agent Role
+grant) stays unresolved and is not asked for in the next namespace, so the fallback costs such a
+kind at most one refused call rather than one per namespace with a reference, while a listing
+that fails for the moment (a timeout, a 5xx, a cut reply) leaves that one namespace's references
+unchecked, with a warning, and the kind is asked for again in the next namespace, so one
+namespace's bad moment clears no row in another. The cursor keeps its two grains: a tick that runs out before a
 cluster's read resumes at the cluster; one that runs out between per-namespace reads resumes at
 the namespace. Every hop the watch makes through `run_sandbox` (the endpoint helper's own hop
 is not among them) runs its remote command under coreutils `timeout` at the hop's bound plus

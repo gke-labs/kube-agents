@@ -2180,6 +2180,25 @@ class ClusterRead(Base):
         self.assertEqual(r.returncode, 124, "coreutils timeout ended the reader")
         self.assertLess(elapsed, bound + stall_watch.REMOTE_TIMEOUT_GRACE_SECONDS + stall_watch.REMOTE_TIMEOUT_KILL_AFTER_SECONDS, "within the grace, not the reader's 30 s")
 
+    def test_the_local_timeout_fires_before_the_remote_bound(self):
+        # The fake sandbox honours the local bound: the hop raises
+        # TimeoutExpired, as read_cluster_part relies on at the budget, and
+        # the remote bound it carries is past the local one. A grace of zero
+        # or less would let the remote `timeout` win and the hop return 124
+        # instead of raising.
+        seen = {}
+
+        def local_sandbox(argv, *, remote_env=None, timeout=None, check=False, stdin=None):
+            seen["argv"] = list(argv)
+            return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
+
+        bound = 0.2
+        with patch.object(stall_watch.sandbox_exec, "run", local_sandbox):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                stall_watch.run_sandbox(["sleep", "3"], timeout=bound)
+        self.assertGreater(float(seen["argv"][3]), bound, "the remote bound is past the local one")
+        self.assertGreater(stall_watch.REMOTE_TIMEOUT_GRACE_SECONDS, 0)
+
     def test_the_ledger_rows_are_the_same_whichever_path_read_them(self):
         now = "2026-11-10T12:00:00+00:00"
         rows = {"checkout": [DEPLOYMENT_ROW, finding("checkout", "Deployment/cart", "generation-lag", "generation 3, observedGeneration 2")], "storefront": GATEWAY_ROWS, "web": []}
