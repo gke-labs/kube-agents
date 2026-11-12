@@ -1155,10 +1155,19 @@ func TestA2ACancelPublishesAKindCancel(t *testing.T) {
 }
 
 // TestA2ACancelRetriedAfterTheTerminalIsAnsweredWithTheTask: a cancel whose
-// response was lost is retried; by then the executor may have ended the task
-// canceled. The retry gets the task back, canceled, not -32002 "already
-// canceled" for a cancel that took.
+// response was lost is retried; by then the executor may have ended the task.
+// The retry gets the task back as it ended, not -32002 "already canceled" for
+// a cancel that took. A turn that finished before the cancel took ends
+// completed, and the retry says so rather than refusing.
 func TestA2ACancelRetriedAfterTheTerminalIsAnsweredWithTheTask(t *testing.T) {
+	for _, terminal := range []lib.TaskState{lib.StateCanceled, lib.StateCompleted} {
+		t.Run(string(terminal), func(t *testing.T) {
+			cancelRetriedAfterTheTerminal(t, terminal)
+		})
+	}
+}
+
+func cancelRetriedAfterTheTerminal(t *testing.T, terminal lib.TaskState) {
 	r := startA2ARig(t)
 	ctx := context.Background()
 
@@ -1174,18 +1183,18 @@ func TestA2ACancelRetriedAfterTheTerminalIsAnsweredWithTheTask(t *testing.T) {
 	if first := r.rpc(t, a2aTestCaller, a2aMethodCancel, map[string]any{"id": task.ID}); first.Error != nil {
 		t.Fatalf("the first cancel was refused: %d %s", first.Error.Code, first.Error.Message)
 	}
-	if err := exec.PublishStatus(ctx, lib.StateCanceled, true); err != nil {
+	if err := exec.PublishStatus(ctx, terminal, true); err != nil {
 		t.Fatal(err)
 	}
-	r.getUntil(t, a2aTestCaller, task.ID, "the canceled terminal to reach the door", func(task a2aTaskObject) bool {
-		return task.Status.State == lib.StateCanceled
+	r.getUntil(t, a2aTestCaller, task.ID, "the terminal to reach the door", func(task a2aTaskObject) bool {
+		return task.Status.State == terminal
 	})
 	again := r.rpc(t, a2aTestCaller, a2aMethodCancel, map[string]any{"id": task.ID})
 	if again.Error != nil {
 		t.Fatalf("a cancel retried after the terminal was refused: %d %s", again.Error.Code, again.Error.Message)
 	}
-	if got := taskOf(t, again); got.ID != task.ID || got.Status.State != lib.StateCanceled {
-		t.Errorf("the retried cancel answered with task %q in %q, want %q canceled", got.ID, got.Status.State, task.ID)
+	if got := taskOf(t, again); got.ID != task.ID || got.Status.State != terminal {
+		t.Errorf("the retried cancel answered with task %q in %q, want %q %s", got.ID, got.Status.State, task.ID, terminal)
 	}
 }
 
