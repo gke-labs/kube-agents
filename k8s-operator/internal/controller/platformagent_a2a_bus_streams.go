@@ -104,6 +104,7 @@ const (
 	// (busReprovisionRecord, JSON), so the rate limit outlives an operator
 	// restart.
 	busStreamsReprovisionAnnotation = "kubeagents.x-k8s.io/a2a-bus-reprovision"
+	busStreamsTasksLostAnnotation   = "kubeagents.x-k8s.io/a2a-bus-tasks-lost"
 
 	busStreamsMissingEventReason          = "A2ABusStreamsMissing"
 	busStreamsRestoredEventReason         = "A2ABusStreamsRestored"
@@ -342,13 +343,19 @@ func busStreamsVerdictFor(replicas int, readings []busServerReading) busStreamsV
 // inside busStreamsReprovisionWindow only.
 type busReprovisionRecord struct {
 	Attempts []busReprovisionAttempt `json:"attempts"`
-	// TasksLostAt is the poll that first saw the latest loss of TASKS, and
-	// TasksBack whether a poll has seen TASKS present since. A TASKS client
-	// container that started before TasksLostAt lost its durable with the
-	// stream and is restarted once TASKS is back (restartTasksClients); one
-	// that started since waits for the stream and its durable, then binds.
-	TasksLostAt *time.Time `json:"tasksLostAt,omitempty"`
-	TasksBack   bool       `json:"tasksBack,omitempty"`
+}
+
+// busTasksLoss is the latest confirmed loss of TASKS, on its own annotation
+// (busStreamsTasksLostAnnotation) so that clearing the re-run record, as a
+// stop's message suggests, can't drop a restart still owed. At is the first
+// poll of the run that confirmed it, and Back whether a poll has seen TASKS
+// present since. A TASKS client container that started before At lost its
+// durable with the stream and is restarted once TASKS is back
+// (restartTasksClients); one that started since waits for the stream and its
+// durable, then binds.
+type busTasksLoss struct {
+	At   time.Time `json:"at"`
+	Back bool      `json:"back,omitempty"`
 }
 
 type busReprovisionAttempt struct {
@@ -415,7 +422,7 @@ func (rec busReprovisionRecord) pruned(now time.Time) busReprovisionRecord {
 			kept = append(kept, attempt)
 		}
 	}
-	return busReprovisionRecord{Attempts: kept, TasksLostAt: rec.TasksLostAt, TasksBack: rec.TasksBack}
+	return busReprovisionRecord{Attempts: kept}
 }
 
 // busStreamStreak is one CR's run of polls, per process.
@@ -423,7 +430,13 @@ type busStreamStreak struct {
 	// missing is the set every poll in the current run found missing.
 	missing map[string]bool
 	misses  int
-	// restartWarnedFor is the TasksLostAt whose failed restart has already
+	// tasksMisses counts polls in a row that found TASKS missing, from
+	// tasksFirstMissing: a loss of TASKS is confirmed over
+	// busStreamsConfirmPolls, as any loss is, before its clients are owed a
+	// restart, but dated from the first of those polls.
+	tasksMisses       int
+	tasksFirstMissing time.Time
+	// restartWarnedFor is the loss whose failed restart has already
 	// raised its Warning, so a restart that keeps failing warns once per loss.
 	restartWarnedFor time.Time
 	// unknown counts polls in a row that had nothing to judge by.
@@ -552,7 +565,7 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 		// No verdict while the bus rolls, converts or provisions: a stream
 		// the Job is about to create, or a server still joining, is not a
 		// loss. The run starts again afterwards.
-		streak.missing, streak.misses, streak.unknown = nil, 0, 0
+		streak.missing, streak.misses, streak.unknown, streak.tasksMisses = nil, 0, 0, 0
 		return nil
 	}
 
@@ -609,32 +622,40 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 	// from the clients' own start times, not from any attempt, so a re-run
 	// that failed, a delete that didn't land, a loss mid-run or a fix by hand
 	// all end the same way.
+	loss := readBusTasksLoss(agent)
 	if slices.Contains(verdict.missing, a2aTasksStream) {
-		if record.TasksLostAt == nil || record.TasksBack {
-			lostAt := now
-			record.TasksLostAt, record.TasksBack = &lostAt, false
-			if err := p.writeRecord(ctx, agent, record.pruned(now)); err != nil {
-				return err
+		if loss == nil || loss.Back {
+			if streak.tasksMisses == 0 {
+				streak.tasksFirstMissing = now
+			}
+			streak.tasksMisses++
+			if streak.tasksMisses >= busStreamsConfirmPolls {
+				if err := p.writeTasksLoss(ctx, agent, busTasksLoss{At: streak.tasksFirstMissing}); err != nil {
+					return err
+				}
 			}
 		}
-	} else if record.TasksLostAt != nil {
-		if !record.TasksBack {
-			record.TasksBack = true
-			if err := p.writeRecord(ctx, agent, record.pruned(now)); err != nil {
-				return err
+	} else {
+		streak.tasksMisses = 0
+		if loss != nil {
+			if !loss.Back {
+				loss.Back = true
+				if err := p.writeTasksLoss(ctx, agent, *loss); err != nil {
+					return err
+				}
 			}
-		}
-		if err := p.restartTasksClients(ctx, agent, *record.TasksLostAt); err != nil {
-			// Warned once per loss; the condition says so in a fixed
-			// message, so a restart that keeps failing rewrites nothing,
-			// and the next poll retries it.
-			if !streak.restartWarnedFor.Equal(*record.TasksLostAt) {
-				streak.restartWarnedFor = *record.TasksLostAt
-				p.r.recordEvent(agent, corev1.EventTypeWarning, busStreamsRestartFailedEventReason,
-					fmt.Sprintf("TASKS is back on the A2A bus, but restarting the A2A gateway and the agent pod failed, so their TASKS consumers are not recreated yet; the operator retries on every poll: %v", err))
+			if err := p.restartTasksClients(ctx, agent, loss.At); err != nil {
+				// Warned once per loss; the condition says so in a fixed
+				// message, so a restart that keeps failing rewrites nothing,
+				// and the next poll retries it.
+				if !streak.restartWarnedFor.Equal(loss.At) {
+					streak.restartWarnedFor = loss.At
+					p.r.recordEvent(agent, corev1.EventTypeWarning, busStreamsRestartFailedEventReason,
+						fmt.Sprintf("TASKS is back on the A2A bus, but restarting the A2A gateway and the agent pod failed, so their TASKS consumers are not recreated yet; the operator retries on every poll: %v", err))
+				}
+				return p.writeCondition(ctx, agent, metav1.ConditionFalse, busStreamsReasonReprovisioning,
+					fmt.Sprintf("TASKS is back on the A2A bus, but restarting the A2A gateway and the agent pod failed, so their TASKS consumers are not recreated yet. The operator retries on every poll; the %s event carries the error.", busStreamsRestartFailedEventReason))
 			}
-			return p.writeCondition(ctx, agent, metav1.ConditionFalse, busStreamsReasonReprovisioning,
-				fmt.Sprintf("TASKS is back on the A2A bus, but restarting the A2A gateway and the agent pod failed, so their TASKS consumers are not recreated yet. The operator retries on every poll; the %s event carries the error.", busStreamsRestartFailedEventReason))
 		}
 	}
 
@@ -724,11 +745,14 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 // replaced is skipped.
 func (p *BusStreamPoller) restartTasksClients(ctx context.Context, agent *agentv1alpha1.PlatformAgent, lostAt time.Time) error {
 	clients := []struct {
-		name, container string
-		selector        map[string]string
+		name     string
+		isClient func(corev1.Container) bool
+		selector map[string]string
 	}{
-		{a2aGatewayName(agent), a2aGatewayContainerName, a2aGatewayPodSelector(agent)},
-		{agent.Name + gatewayAppSuffix, a2aBridgeContainerName, gatewayPodSelector(agent)},
+		{a2aGatewayName(agent), func(c corev1.Container) bool { return c.Name == a2aGatewayContainerName }, a2aGatewayPodSelector(agent)},
+		// The bridge as a2aIsBridgeSidecar knows it: the operator's, or one
+		// the CR declares under its own name.
+		{agent.Name + gatewayAppSuffix, a2aIsBridgeSidecar, gatewayPodSelector(agent)},
 	}
 	var restarted []string
 	for _, c := range clients {
@@ -738,7 +762,7 @@ func (p *BusStreamPoller) restartTasksClients(ctx context.Context, agent *agentv
 		}
 		for i := range pods {
 			pod := &pods[i]
-			if pod.DeletionTimestamp != nil || !boundBefore(pod, c.container, lostAt) {
+			if pod.DeletionTimestamp != nil || !boundBefore(pod, c.isClient, lostAt) {
 				continue
 			}
 			uid := pod.UID
@@ -758,15 +782,50 @@ func (p *BusStreamPoller) restartTasksClients(ctx context.Context, agent *agentv
 	return nil
 }
 
-// boundBefore reports whether pod's container has been running since before
+// boundBefore reports whether pod's client container, the one isClient picks
+// from its spec (a native sidecar included), has been running since before
 // at, and so may hold a consumer bound to a stream lost since.
-func boundBefore(pod *corev1.Pod, container string, at time.Time) bool {
+func boundBefore(pod *corev1.Pod, isClient func(corev1.Container) bool, at time.Time) bool {
+	names := map[string]bool{}
+	for _, c := range append(append([]corev1.Container{}, pod.Spec.InitContainers...), pod.Spec.Containers...) {
+		if isClient(c) {
+			names[c.Name] = true
+		}
+	}
 	for _, st := range append(append([]corev1.ContainerStatus{}, pod.Status.InitContainerStatuses...), pod.Status.ContainerStatuses...) {
-		if st.Name == container {
-			return st.State.Running != nil && st.State.Running.StartedAt.Time.Before(at)
+		if names[st.Name] && st.State.Running != nil && st.State.Running.StartedAt.Time.Before(at) {
+			return true
 		}
 	}
 	return false
+}
+
+func readBusTasksLoss(agent *agentv1alpha1.PlatformAgent) *busTasksLoss {
+	raw := agent.Annotations[busStreamsTasksLostAnnotation]
+	if raw == "" {
+		return nil
+	}
+	var loss busTasksLoss
+	if err := json.Unmarshal([]byte(raw), &loss); err != nil || loss.At.IsZero() {
+		// Unreadable reads as none: no restart is owed from it, the safe
+		// direction for a delete.
+		return nil
+	}
+	return &loss
+}
+
+// writeTasksLoss stores the latest loss of TASKS on its annotation.
+func (p *BusStreamPoller) writeTasksLoss(ctx context.Context, agent *agentv1alpha1.PlatformAgent, loss busTasksLoss) error {
+	raw, err := json.Marshal(loss)
+	if err != nil {
+		return err
+	}
+	base := agent.DeepCopy()
+	if agent.Annotations == nil {
+		agent.Annotations = map[string]string{}
+	}
+	agent.Annotations[busStreamsTasksLostAnnotation] = string(raw)
+	return p.r.Patch(ctx, agent, client.MergeFrom(base))
 }
 
 // tasksClientPods lists one TASKS client's pods: those with its app label that
@@ -839,7 +898,18 @@ func (p *BusStreamPoller) deleteProvisionJob(ctx context.Context, agent *agentv1
 	if err := p.r.Delete(ctx, job, client.Preconditions{UID: &uid}, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("failed to delete the completed A2A provision Job %s: %w", job.Name, err)
 	}
-	streak.missing, streak.misses = nil, 0
+	if streak.tasksMisses > 0 {
+		// The re-run recreates TASKS too. A loss of it this run saw counts
+		// as confirmed by the re-run itself, however few polls saw it,
+		// since after the delete the polls that would confirm it are
+		// gated until the Job is done.
+		if loss := readBusTasksLoss(agent); loss == nil || loss.Back {
+			if err := p.writeTasksLoss(ctx, agent, busTasksLoss{At: streak.tasksFirstMissing}); err != nil {
+				return err
+			}
+		}
+	}
+	streak.missing, streak.misses, streak.tasksMisses = nil, 0, 0
 	log.Info("re-running the A2A provision Job: provisioned streams are missing from the bus",
 		"platformagent", client.ObjectKeyFromObject(agent), "missing", missing, "job", job.Name)
 	p.r.recordEvent(agent, corev1.EventTypeWarning, busStreamsMissingEventReason,
