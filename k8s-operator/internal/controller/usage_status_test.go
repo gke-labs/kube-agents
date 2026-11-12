@@ -93,7 +93,7 @@ func TestAgentUsageStatusSerialisesOnlyWhatIsSet(t *testing.T) {
 	now := metav1.Now()
 	full := agentv1alpha1.AgentUsageStatus{
 		SessionsTotal: 3, EventsIngestedTotal: 4, ToolExecutionsTotal: 5,
-		RemediationsProposedTotal: 6, RemediationsMergedTotal: ptr.To(int64(10)), ChatMessagesInboundTotal: 11, ToolExecutionsBlockedTotal: 12, BrokerFailuresTotal: 13, ChatTurnsErroredTotal: 14, BackgroundTasksGaveUpTotal: 15, NegativeFeedbackTotal: 16, PositiveFeedbackTotal: 21, RemediationsClosedUnmergedTotal: ptr.To(int64(17)),
+		RemediationsProposedTotal: 6, RemediationsMergedTotal: ptr.To(int64(10)), ChatMessagesInboundTotal: 11, ToolExecutionsBlockedTotal: 12, BrokerFailuresTotal: 13, ChatTurnsErroredTotal: 14, BackgroundTasksGaveUpTotal: 15, NegativeFeedbackTotal: 16, PositiveFeedbackTotal: 21, InputTokensTotal: 22, OutputTokensTotal: 23, SpendMicrosUSDTotal: 24, RemediationsClosedUnmergedTotal: ptr.To(int64(17)),
 		RemediationsOpen: ptr.To(int64(18)), ProposalsAuthored: ptr.To(int64(19)), ProposalHumanTouches: ptr.To(int64(20)), ProposalsMergedUntouched: ptr.To(int64(0)),
 		ClustersRegistered: ptr.To(int64(8)), ClustersMonitored: ptr.To(int64(9)),
 		ActiveInterfaces: []string{"googlechat"}, LastActiveTime: &now, LastHumanActiveTime: &now,
@@ -109,14 +109,14 @@ func TestAgentUsageStatusSerialisesOnlyWhatIsSet(t *testing.T) {
 	for _, key := range []string{
 		"sessionsTotal", "eventsIngestedTotal", "toolExecutionsTotal",
 		"remediationsProposedTotal", "remediationsMergedTotal", "chatMessagesInboundTotal",
-		"toolExecutionsBlockedTotal", "brokerFailuresTotal", "chatTurnsErroredTotal", "backgroundTasksGaveUpTotal", "negativeFeedbackTotal", "positiveFeedbackTotal", "remediationsClosedUnmergedTotal", "remediationsOpen", "proposalsAuthored", "proposalHumanTouches", "proposalsMergedUntouched", "clustersRegistered", "clustersMonitored", "activeInterfaces", "lastActiveTime", "lastHumanActiveTime",
+		"toolExecutionsBlockedTotal", "brokerFailuresTotal", "chatTurnsErroredTotal", "backgroundTasksGaveUpTotal", "negativeFeedbackTotal", "positiveFeedbackTotal", "inputTokensTotal", "outputTokensTotal", "spendMicrosUSDTotal", "remediationsClosedUnmergedTotal", "remediationsOpen", "proposalsAuthored", "proposalHumanTouches", "proposalsMergedUntouched", "clustersRegistered", "clustersMonitored", "activeInterfaces", "lastActiveTime", "lastHumanActiveTime",
 	} {
 		if _, ok := decoded[key]; !ok {
 			t.Errorf("serialised form lacks %q: %s", key, got)
 		}
 	}
-	if len(decoded) != 22 {
-		t.Errorf("serialised form has %d keys, want 22: %s", len(decoded), got)
+	if len(decoded) != 25 {
+		t.Errorf("serialised form has %d keys, want 25: %s", len(decoded), got)
 	}
 }
 

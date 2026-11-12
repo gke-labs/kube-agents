@@ -482,6 +482,8 @@ For a usage summary of this install you can paste into a report, send `/feedback
 
 Sent with text, `/feedback the cost report posted twice this morning`, the message is an ordinary turn and the Planning Agent answers it. It writes the report up as the form would receive it, a one-line summary, the kind and what happened in your words, says that a submission becomes a public issue on `gke-labs/kube-agents`, and asks for a yes. Nothing is filed until you give one. On `yes` it hands the exact text to the platform specialist, which files it through the public feedback form; the reply names the issue the form opened. The form needs no account and the install needs no GitHub credential for it. The same text sent again within a day is not filed twice: the reply names the issue already open.
 
+The draft also offers to add the install's usage summary, with no names in it: the environment and usage sections of the block [`/feedback summary`](#feedback-summary) prints. The lines the agent cannot read from where it runs say `unavailable`. Say `add the usage summary`. The reply is an ack, and the block is posted into the thread when the specialist's card completes. Your next message, a yes included, gets the draft shown again with the block as its environment, and the question asked again. Only a yes to that draft files, so nothing is attached that you did not read. When the block could not be rendered, the draft comes back without it.
+
 When the install cannot reach the form, the reply says that nothing was filed and gives the composed text back with the two links above, so you can file it yourself. An air-gapped install, or one whose credential broker has no route to the form's hosts, answers this way every time.
 
 On Slack, start the message with the bot's mention, `@bot /feedback`, as for `/session`.
@@ -495,6 +497,7 @@ On Slack, start the message with the bot's mention, `@bot /feedback`, as for `/s
 - the `status.usage` counters and readings;
 - one `proposals by origin:` line, the origins whose count is above zero, as the agent reports them (`none` when all are zero, `no reading` when the status has none);
 - the credential broker's top five `tool/subcommand` pairs since its pod started, from `status.usage.topTools` (`unavailable` while the status holds no list);
+- the install's token and spend totals since install, from `status.usage`, which the operator keeps across LiteLLM restarts;
 - a roll-up of the chat turns the gateway's own records still hold (ended, cancelled, active);
 - a short feedback template.
 
@@ -502,7 +505,7 @@ The line is labelled `chat turns`, not `tasks`, because the script's `tasks` lin
 
 It names no cluster, project, namespace, task or person. The gateway audits the block outside two lines: its `model:` line, which carries only the provider and model name from the status, and its `proposals by origin:` line, which carries only fixed words and digits. It refuses to post a block whose audited lines contain the install's own name, namespace, or any naming string from its declaration (the harness, scope, integration, security, telemetry and network-policy settings), and says so instead. The block's own words, such as a bucket or interface name, are not refused.
 
-The figures the gateway cannot see from where it runs, tokens, spend and latency, are in the block `scripts/feedback-summary.sh` prints from a workstation. That block has the same environment, usage and feedback sections, the same check, and more besides (the cluster scale counts, the performance figures and recent task rows). When the gateway cannot read the `PlatformAgent` resource, it says the summary is unavailable and points at the script. In the web console a `usage summary` button in the chat footer sends the same command, and the block it answers with has a `copy` button. Under `today` the Hermes gateway does not read this command, as for the rest of `/feedback`.
+The one figure the gateway cannot see from where it runs, latency, is in the block `scripts/feedback-summary.sh` prints from a workstation. That block has the same environment, usage, performance and feedback sections, the same check, and more besides (the cluster scale counts, LiteLLM's live token, spend and latency figures and recent task rows). When the gateway cannot read the `PlatformAgent` resource, it says the summary is unavailable and points at the script. In the web console a `usage summary` button in the chat footer sends the same command, and the block it answers with has a `copy` button. Under `today` the Hermes gateway does not read this command, as for the rest of `/feedback`.
 
 ### The Slack Home tab
 

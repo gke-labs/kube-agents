@@ -412,6 +412,7 @@ data:
     KUBEAGENTS_AUTOMERGE=off
     KUBEAGENTS_DIAL=off
     KUBEAGENTS_SCOPE_FILE=/etc/kube-agents/scope.json
+    KUBEAGENTS_RESOLVED_SCOPE_FILE=
     RECONCILE_PROJECT=
     GKE_PROJECT_ID=example-project
     STALL_WATCH_EXCLUDE_NAMESPACES=
@@ -1186,6 +1187,10 @@ spec:
               name: data
               readOnly: true
               subPath: profiles/platform/governance
+      dnsConfig:
+        options:
+          - name: ndots
+            value: "3"
       enableServiceLinks: false
       initContainers:
         - args:
@@ -1568,6 +1573,10 @@ spec:
             - mountPath: /etc/kube-agents/scope
               name: platform-agent-scope-vol
               readOnly: true
+      dnsConfig:
+        options:
+          - name: ndots
+            value: "3"
       securityContext:
         fsGroup: 10000
         runAsNonRoot: true
@@ -1995,6 +2004,10 @@ spec:
             - mountPath: /etc/credential-proxy-exec-tier
               name: credential-proxy-exec-tier-replicas
               readOnly: true
+      dnsConfig:
+        options:
+          - name: ndots
+            value: "3"
       securityContext:
         fsGroup: 10000
         runAsNonRoot: true
@@ -2165,6 +2178,7 @@ spec:
               value: /etc/hermes
             - name: KUBEAGENTS_SCOPE_FILE
               value: /etc/kube-agents/scope.json
+            - name: KUBEAGENTS_RESOLVED_SCOPE_FILE
             - name: RECONCILE_PROJECT
             - name: HERMES_HOME_MODE
               value: "2770"
