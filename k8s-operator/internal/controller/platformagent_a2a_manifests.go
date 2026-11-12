@@ -4987,8 +4987,9 @@ const reasonA2ABusMigrationUnavailable = "A2ABusMigrationUnavailable"
 const busMigrationRunDeadline = 2 * time.Hour
 
 // startBusMigration starts a migration from running to want servers, unless
-// one is under way, or the last one ended without converting at this same
-// generation (it would only fail or abandon again until the spec changes).
+// busMigrationWouldStart says no: one is under way, a Failed run waits for a
+// person, or the last one ended without converting and neither a new count
+// nor the bus-migration-start annotation naming it asks for another.
 func startBusMigration(agent *agentv1alpha1.PlatformAgent, running, want int, now metav1.Time) {
 	if !busMigrationWouldStart(agent, want) {
 		return

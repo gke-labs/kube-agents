@@ -336,7 +336,9 @@ func (r *PlatformAgentReconciler) observeBusMigration(ctx context.Context, agent
 	}
 	job := func(step string) (busMigrationOutcome, bool, error) {
 		j := &batchv1.Job{}
-		switch err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: busMigrationWorkName(agent, run, step)}, j); {
+		// Uncached, like every Job read here: a cached read would start a
+		// cluster-wide Job informer (a2aReader).
+		switch err := r.a2aReader().Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: busMigrationWorkName(agent, run, step)}, j); {
 		case errors.IsNotFound(err):
 			return busMigrationPending, false, nil
 		case err != nil:
@@ -1526,7 +1528,12 @@ func busMigrationActOnFailed(agent *agentv1alpha1.PlatformAgent, now metav1.Time
 func busMigrationFailedActions(agent *agentv1alpha1.PlatformAgent) string {
 	run := agent.Status.BusMigration
 	if run.GivenUp {
-		return " It was given up: the freeze is lifted, and streams it did not put back are recreated empty."
+		if busMigrationLeg(run.Leg) == busMigrationGrow {
+			return " It was given up: the freeze is lifted, and streams it did not put back are recreated empty."
+		}
+		// Three to one never freezes or deletes a stream: its streams are
+		// where the run left them, data kept.
+		return " It was given up; its streams keep their data where the run left them, and another migration may start."
 	}
 	var b strings.Builder
 	if busMigrationRetryPhase(busMigrationPhase(run.FailedIn)) != "" {

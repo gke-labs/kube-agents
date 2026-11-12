@@ -495,8 +495,9 @@ what a switch changes inside the install. This section covers what a switch does
 A `today` install has no A2A bus, so its first switch to `next` creates one, and a new bus runs three
 NATS servers on separate nodes ([Cluster requirements](/kube-agents/install/prerequisites/#cluster-requirements)). On a Standard
 cluster that cannot grow to three nodes, set the chart value
-`platformAgent.harness.tuning.busReplicas: 1` (through `extra_helm_values`) before the switch: once the
-bus exists, its server count cannot change.
+`platformAgent.harness.tuning.busReplicas: 1` (through `extra_helm_values`) before the switch. Once the
+bus exists, changing the count migrates it, keeping its data
+([Changing the bus's server count](/kube-agents/operator/platformagent-crd/#changing-the-buss-server-count)).
 
 With Google Chat or Slack on, a full run prints the chat setup checklist for the mode it applied
 after "Upgrade Complete!", so the app steps that mode needs are on the screen after the switch.

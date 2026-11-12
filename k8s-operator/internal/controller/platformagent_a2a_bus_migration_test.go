@@ -1528,6 +1528,25 @@ func TestTheRunSecretIsReadUncached(t *testing.T) {
 	m.pass(busMigrationClearing, 1)
 }
 
+// The pin Job is read uncached: a cached read would start a cluster-wide
+// Job informer the operator otherwise never runs.
+func TestTheMigrationJobsAreReadUncached(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	m := newMigrationRig(t, busMigrationShrink, busMigrationPinning, 3, time.Now().Add(time.Hour))
+	m.r.APIReader = m.cl
+	m.r.Client = interceptor.NewClient(m.cl.(client.WithWatch), interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*batchv1.Job); ok {
+				return fmt.Errorf("a cached Job read")
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
+	if err := m.r.resolveA2ABusReplicas(context.Background(), m.agent); err != nil {
+		t.Fatalf("a Pinning pass: %v", err)
+	}
+}
+
 // Nothing the operator renders for the namespace can make the freeze
 // sentinel's ServiceAccount, mint a token for any ServiceAccount, or run a
 // pod as a migration identity: no rule grants serviceaccounts create,
@@ -2655,5 +2674,19 @@ func TestGivingUpAClearThatFailedReprovisionsTheBus(t *testing.T) {
 	}
 	if a2aBridgeInPod(m.agent) {
 		t.Error("the bridge is in the pod before the bus is provisioned again")
+	}
+}
+
+// A given-up three-to-one run is never told that a freeze lifted or that
+// streams were recreated empty: it had no freeze and deleted nothing.
+func TestAGivenUpShrinkClaimsNoFreezeOrRecreatedStreams(t *testing.T) {
+	agent := a2aTestAgent()
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationShrink), RunID: "3-1", Phase: string(busMigrationFailed), FailedIn: string(busMigrationShrinking), GivenUp: true}
+	if got := busMigrationFailedActions(agent); strings.Contains(got, "freeze") || strings.Contains(got, "recreated") {
+		t.Errorf("given-up shrink says %q", got)
+	}
+	agent.Status.BusMigration.Leg = string(busMigrationGrow)
+	if got := busMigrationFailedActions(agent); !strings.Contains(got, "recreated empty") {
+		t.Errorf("given-up grow says %q, want the recreated streams named", got)
 	}
 }
