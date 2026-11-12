@@ -515,10 +515,8 @@ readonly EVAL_TASK_PARALLELISM_DEFAULT=4
 readonly BRIDGE_QUEUE_CAPACITY=1024
 # The TASKS consumer budget's terms, as the operator sizes it
 # (k8s-operator/internal/controller/platformagent_a2a_manifests.go): a fresh
-# stream is created at max(budget, A2A_TASKS_FLOOR) - plus 64 for the
-# AgentProfile durables when the operator renders the dispatcher, which this
-# lane leaves off (no A2A_DISPATCHER_IMAGE, step 4), as a default install
-# does - where the budget is
+# stream is created at max(budget, A2A_TASKS_FLOOR) - the AgentProfile
+# dispatcher's durables are on PROFILE_SUBMITS, not TASKS - where the budget is
 # maxSessions * A2A_SESSION_CONSUMERS + A2A_RESERVE_FIXED +
 # A2A_RESERVE_PER_WORKER * (the bridge workers the pod runs, rendered or
 # declared); provisioning never edits a stream that exists, and a later
@@ -625,14 +623,14 @@ readonly MODE_NEXT_ENTRYPOINT_MATCH_LINES=40
 # platformagent_a2a_manifests.go, a2aCalloutImage in platformagent_a2a_callout.go,
 # a2aVerifierImage in platformagent_a2a_verifier.go, a2aConsoleImage in
 # platformagent_a2a_console.go) and the repository names step 4 pushes the
-# builds under. The AgentProfile dispatcher's image is built and pushed too
-# (A2A_DISPATCHER_IMAGE_NAME), but its override, A2A_DISPATCHER_IMAGE, is not
-# set: the dispatcher is off by default until profiles dispatch end to end.
+# builds under, and the AgentProfile dispatcher's (a2aDispatcherImage in
+# platformagent_a2a_dispatcher.go), which runs by default.
 readonly A2A_GATEWAY_IMAGE_ENV_VAR="A2A_GATEWAY_IMAGE"
 readonly A2A_CALLOUT_IMAGE_ENV_VAR="A2A_CALLOUT_IMAGE"
 readonly A2A_WORKER_IMAGE_ENV_VAR="A2A_WORKER_IMAGE"
 readonly A2A_VERIFIER_IMAGE_ENV_VAR="A2A_VERIFIER_IMAGE"
 readonly A2A_CONSOLE_IMAGE_ENV_VAR="A2A_CONSOLE_IMAGE"
+readonly A2A_DISPATCHER_IMAGE_ENV_VAR="A2A_DISPATCHER_IMAGE"
 # Two of the rendered bridge's four operator settings (a2aBridgeImageEnvVar
 # and a2aBridgeConcurrencyOperatorEnvVar in platformagent_a2a_bridge.go): its
 # image and its BRIDGE_CONCURRENCY. The operator reads them from its own
@@ -649,6 +647,10 @@ readonly A2A_WORKER_IMAGE_NAME="a2a-worker"
 readonly A2A_VERIFIER_IMAGE_NAME="a2a-verifier"
 readonly A2A_CONSOLE_IMAGE_NAME="a2a-console"
 readonly A2A_DISPATCHER_IMAGE_NAME="a2a-dispatcher"
+# The cluster AgentProfile's persona image (a2a/Dockerfile.persona-cluster,
+# context agents/cluster/persona), built beside the A2A images so the lane runs
+# this tree's persona.
+readonly PERSONA_CLUSTER_IMAGE_NAME="persona-cluster"
 # The bridge image goes to the operator too (A2A_BRIDGE_IMAGE_ENV_VAR), which
 # renders the bridge sidecar from it.
 readonly A2A_BRIDGE_IMAGE_NAME="hermes-bridge"
@@ -792,8 +794,11 @@ A2A_OPERATOR_ENV_ARGS=()
 # first-run chain included) writes one whenever a pool repository declares a
 # workload with a major finding (#3439). spec.deployment.env carries the
 # switch; the operator forwards it to the shell sandbox, where finish runs.
-# It also enables the optional `tse` AgentProfile so `mode: next` eval lanes
-# scaffold `/opt/data/profiles/tse` (#3492). Empty on the today lane, so that
+# It also enables the `cluster` AgentProfile, which the profile dispatcher
+# serves (its images are set with the A2A overrides below). Not the optional
+# `tse` one: its chart persona image is a placeholder a dispatched worker can't
+# stage, so the lane leaves it off, and its case parked, until #3842 gives it a
+# real one (#3492 enabled it here for the Kanban scaffold). Empty on the today lane, so that
 # release stays byte-for-byte the same.
 # env[3], set on every lane in the install below, turns the broker's proposal
 # readings sweep off (CREDENTIAL_PROXY_VCS_READINGS=off). Its hourly forge
@@ -805,7 +810,7 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   MODE_NEXT_ENV_ARGS=(
     --set-string "platformAgent.deployment.env[4].name=KUBEAGENTS_AUDIT_AUTO_PROMOTE"
     --set-string "platformAgent.deployment.env[4].value=false"
-    --set "profiles.tse.enabled=true"
+    --set "profiles.cluster.enabled=true"
   )
 fi
 
@@ -1780,6 +1785,7 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   A2A_CONSOLE_URI="${A2A_IMAGE_PREFIX}/${A2A_CONSOLE_IMAGE_NAME}:${TAG}"
   A2A_BRIDGE_URI="${A2A_IMAGE_PREFIX}/${A2A_BRIDGE_IMAGE_NAME}:${TAG}"
   A2A_DISPATCHER_URI="${A2A_IMAGE_PREFIX}/${A2A_DISPATCHER_IMAGE_NAME}:${TAG}"
+  PERSONA_CLUSTER_URI="${A2A_IMAGE_PREFIX}/${PERSONA_CLUSTER_IMAGE_NAME}:${TAG}"
   A2A_OPERATOR_ENV_ARGS=(
     --set-string "operator.extraEnv[0].name=${A2A_GATEWAY_IMAGE_ENV_VAR}"
     --set-string "operator.extraEnv[0].value=${A2A_GATEWAY_URI}"
@@ -1810,10 +1816,19 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     # on by default, and set here so the lane doesn't depend on the default.
     --set-string "operator.extraEnv[9].name=${A2A_GATEWAY_ELECTION_ENV_VAR}"
     --set-string "operator.extraEnv[9].value=${A2A_GATEWAY_ELECTION_ON}"
-    # No A2A_DISPATCHER_IMAGE: the AgentProfile dispatcher is off by default
-    # until profiles dispatch end to end, and the lane installs what a
-    # default install does. Its image is still built (step 4) so the build
-    # stays green; setting the override here is how the lane would turn it on.
+    # The AgentProfile dispatcher runs by default, so the lane runs it too,
+    # from this build: unoverridden, the operator derives its image from the
+    # operator's registry, as it would the verifier's.
+    --set-string "operator.extraEnv[10].name=${A2A_DISPATCHER_IMAGE_ENV_VAR}"
+    --set-string "operator.extraEnv[10].value=${A2A_DISPATCHER_URI}"
+    # The profiles' images. Unset, the chart takes each from ghcr at the agent
+    # image's tag, which on this lane is a CI tag ghcr never has, and the
+    # profile's worker never pulls. The cluster profile runs this build's
+    # persona and worker.
+    --set-string "profiles.cluster.persona.image.repository=${A2A_IMAGE_PREFIX}/${PERSONA_CLUSTER_IMAGE_NAME}"
+    --set-string "profiles.cluster.persona.image.tag=${TAG}"
+    --set-string "profiles.cluster.harness.image.repository=${A2A_IMAGE_PREFIX}/${A2A_WORKER_IMAGE_NAME}"
+    --set-string "profiles.cluster.harness.image.tag=${TAG}"
   )
 fi
 
@@ -1825,7 +1840,7 @@ fi
 if [ -n "${RC_COMMIT_SHA:-}" ]; then
   echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Skipping image builds: installing published images at ${RC_COMMIT_SHA:0:7} ==="
   if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
-    echo "EVAL_MODE_NEXT=1: the A2A gateway, auth callout, worker, verifier, dispatcher and console images and the Hermes bridge sidecar are the candidate's published ones, from ${A2A_IMAGE_PREFIX}"
+    echo "EVAL_MODE_NEXT=1: the A2A gateway, auth callout, worker, verifier, dispatcher and console images, the cluster persona and the Hermes bridge sidecar are the candidate's published ones, from ${A2A_IMAGE_PREFIX}"
   fi
 else
   STEP_START=$SECONDS
@@ -1858,7 +1873,7 @@ else
     echo "Shadow replay proxy: also building its image"
   fi
   if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
-    A2A_BUILD_SUBSTITUTIONS=",_A2A_GATEWAY_URI=${A2A_GATEWAY_URI},_A2A_CALLOUT_URI=${A2A_CALLOUT_URI},_A2A_WORKER_URI=${A2A_WORKER_URI},_A2A_VERIFIER_URI=${A2A_VERIFIER_URI},_A2A_CONSOLE_URI=${A2A_CONSOLE_URI},_A2A_BRIDGE_URI=${A2A_BRIDGE_URI},_A2A_DISPATCHER_URI=${A2A_DISPATCHER_URI}"
+    A2A_BUILD_SUBSTITUTIONS=",_A2A_GATEWAY_URI=${A2A_GATEWAY_URI},_A2A_CALLOUT_URI=${A2A_CALLOUT_URI},_A2A_WORKER_URI=${A2A_WORKER_URI},_A2A_VERIFIER_URI=${A2A_VERIFIER_URI},_A2A_CONSOLE_URI=${A2A_CONSOLE_URI},_A2A_BRIDGE_URI=${A2A_BRIDGE_URI},_A2A_DISPATCHER_URI=${A2A_DISPATCHER_URI},_PERSONA_CLUSTER_URI=${PERSONA_CLUSTER_URI}"
     echo "EVAL_MODE_NEXT=1: also building the A2A gateway, auth callout, worker, verifier, dispatcher and console images and the Hermes bridge sidecar"
   fi
   # Submitted asynchronously and polled, never streamed (#3129). Without

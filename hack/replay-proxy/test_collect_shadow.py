@@ -21,6 +21,7 @@ import tempfile
 import textwrap
 import time
 import unittest
+from unittest import mock
 
 import collect_shadow as C
 
@@ -966,6 +967,30 @@ class ProcessTest(unittest.TestCase):
                     C.parse_args([*base, "--bucket", bucket, "--build", build])
         args = C.parse_args([*base, "--bucket", BUCKET, "--build", "1790000000000000000"])
         self.assertNotRegex(C.job_prefix(args.bucket, args.kind, "2026-11-05", args.build), r"/\.\.?(/|$)")
+
+    def test_a_commit_is_a_full_sha_or_empty_and_reaches_the_record_and_the_report(self):
+        base = ["--namespace", NAMESPACE, "--selector", SELECTOR, "--container", CONTAINER, "--bucket", BUCKET,
+                "--build", "1790000000000000000"]
+        record = [*base, "--kind", "nightly", "--mode", "record", "--keep-dir", self.root, "--verdicts-dir",
+                  self.root, "--publish-bucket", BUCKET, "--job-name", "ci-kube-agents-eval-nightly"]
+        for bad in ("abc", "AB" * 20, "ab" * 20 + "\n", "ab" * 32, "-x", "HEAD"):
+            for flag in ("--commit", "--lane-commit"):
+                with self.subTest(flag=flag, bad=bad):
+                    with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                        C.parse_args([*record, flag, bad])
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            C.parse_args([*base, "--kind", "replay-lane", "--lane-commit-source", "nightly"])
+        for commit in ("ab" * 20, ""):
+            with self.subTest(commit=commit):
+                publisher = C.make_publisher(C.parse_args([*record, "--commit", commit]), mock.Mock())
+                self.assertEqual(publisher.job["commit"], commit)
+        replay = C.parse_args([*base, "--kind", "replay-lane", "--mode", "replay", "--keep-dir", self.root,
+                               "--seed-dir", self.root, "--verdicts-dir", self.root, "--lane-commit", "cd" * 20,
+                               "--lane-commit-source", "recording"])
+        with mock.patch("lane_report.write_report", return_value="") as write:
+            C.make_lane_report(replay)(self.root)
+        self.assertEqual((write.call_args.kwargs["commit"], write.call_args.kwargs["commit_source"]),
+                         ("cd" * 20, "recording"))
 
     def test_bad_arguments_still_exit_0(self):
         proc = subprocess.run([sys.executable, os.path.join(HERE, "collect_shadow.py"), "--kind", "weekly"],

@@ -534,6 +534,9 @@ func TestAMalformedOperatorPrincipalRendersNoEntryAndFailsNothing(t *testing.T) 
 // With them, its entry is the directory and its inbox, nothing else.
 func TestTheOperatorsBusIdentityIsTheDirectoryAndNothingElse(t *testing.T) {
 	withOperatorBusPrincipal(t)
+	// With the dispatcher off: on, the operator also syncs the profiles'
+	// durables, which the dispatcher's tests hold.
+	t.Setenv(a2aProfileDispatcherEnvVar, "false")
 	agent := a2aTestAgent()
 	e, ok := renderedMapEntries(t, agent, nil)[a2aOperatorBusUser]
 	if !ok {
@@ -1479,6 +1482,46 @@ func TestAProfileServiceAccountChangeWakesItsProfile(t *testing.T) {
 		if got := profileServiceAccountRequest(other); len(got) != 0 {
 			t.Errorf("%s/%v mapped to %v, want nothing", other.Namespace, other.Labels, got)
 		}
+	}
+}
+
+// A ServiceAccount in a profile namespace named like a profile's may be one a
+// profile would land on and doesn't own, whatever its labels say, which
+// refuses that profile and moves the dispatcher ceiling's cut for every newer
+// one: its event re-reconciles every profile in the agent's namespace. One
+// with another name wakes only its labelled profile, or none.
+func TestAProfileNamedServiceAccountWakesEveryProfile(t *testing.T) {
+	agent := a2aTestAgent()
+	a, b := testAgentProfile(agent.Namespace, "auditor"), testAgentProfile(agent.Namespace, "triage")
+	c := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(&a, &b).Build()
+	sa := func(name, ns string, labels map[string]string) *corev1.ServiceAccount {
+		return &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, Labels: labels}}
+	}
+	woke := func(obj *corev1.ServiceAccount) []string {
+		names := []string{}
+		for _, r := range profileServiceAccountRequests(context.Background(), c, obj) {
+			names = append(names, r.Name)
+		}
+		slices.Sort(names)
+		return names
+	}
+	profilesNS := agent.Namespace + "-profiles"
+	// Named like a profile's, it may be foreign whatever its labels say: a
+	// stale copy labelled with the profile's name but an old UID, or one
+	// labelled with another profile's name.
+	for _, labels := range []map[string]string{nil, {agentProfileNameLabel: "auditor"}, {agentProfileNameLabel: "triage"}} {
+		if got := woke(sa("agentprofile-auditor-read", profilesNS, labels)); !slices.Equal(got, []string{"auditor", "triage"}) {
+			t.Errorf("a profile-named ServiceAccount labelled %v woke %v, want every profile", labels, got)
+		}
+	}
+	if got := woke(sa("default", profilesNS, map[string]string{agentProfileNameLabel: "auditor"})); !slices.Equal(got, []string{"auditor"}) {
+		t.Errorf("a labelled ServiceAccount with another name woke %v, want its own profile", got)
+	}
+	if got := woke(sa("default", profilesNS, nil)); len(got) != 0 {
+		t.Errorf("an unlabelled ServiceAccount with another name woke %v, want none", got)
+	}
+	if got := woke(sa("agentprofile-auditor-read", agent.Namespace, nil)); len(got) != 0 {
+		t.Errorf("a ServiceAccount outside a profile namespace woke %v", got)
 	}
 }
 

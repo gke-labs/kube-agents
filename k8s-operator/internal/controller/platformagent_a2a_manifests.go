@@ -4823,9 +4823,14 @@ func a2aStandingPods(agent *agentv1alpha1.PlatformAgent) int64 {
 	// example CR, no operator flags) cannot show; TestA2AStandingPodsCountThe
 	// ConditionalWorkloads names each. The credential proxy's exec tier is a CR
 	// field (spec.deployment.credentialProxy.exec.replicas, unset as 0); the
-	// workloads behind an operator flag (the MCP door, the dispatcher) come from
+	// workloads behind an operator flag (the MCP door) come from
 	// a2aFlaggedPods, which the chart's quota preflight mirrors.
 	n += int64(credentialProxyExecTierReplicas(agent))
+	// The profile dispatcher, on unless A2A_PROFILE_DISPATCHER is "false"
+	// (operator.profileDispatcher.enabled in the chart).
+	if a2aDispatcherEnabled() {
+		n += int64(ptr.Deref(buildA2ADispatcherDeployment(agent).Spec.Replicas, 1))
+	}
 	n += a2aFlaggedStandingPods(agent)
 	// The gateway's standbys and its rollout's surge pod, under the election
 	// (the builder above renders the one replica it runs before then).
@@ -4923,8 +4928,9 @@ func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, age
 		case running == 2:
 			// No record: claims for ordinals 0 and 1 and not 2 are a
 			// three-server bus that lost one, not a two-server bus, which
-			// never existed. A flip to today clears the record, so a bus
-			// coming back from today reads its claims.
+			// never existed. A flip to today keeps the record (#5451), so a
+			// bus back from today resolves through the case above; this one
+			// is for a record lost another way (a served CRD that prunes it).
 			running = 3
 		}
 	default:
@@ -6732,6 +6738,9 @@ type a2aProvisionState struct {
 	// (reconcileA2ADispatcherWithJobMode), nil when it made nothing of it,
 	// for the DispatcherJobMode condition written on the way out.
 	dispatcherJobMode *metav1.Condition
+	// dispatcherCeiling is the DispatcherCeiling verdict, written on
+	// the way out (syncDispatcherCeiling).
+	dispatcherCeiling *metav1.Condition
 
 	// gatewayHeld reports that the gateway Deployment was withheld this
 	// pass because BusCredentialsReady is not yet true. It exists to make
@@ -7264,6 +7273,18 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// The dispatcher (platformagent_a2a_dispatcher.go), when this operator
 	// has an image for it. Its pod-read Role lives in the profile namespace,
 	// and a failure there follows the same rule as the quota's.
+	// Past the size one identity-map shard can carry, the dispatcher's entry
+	// is left out of the map, so it is torn down as though switched off, and
+	// the condition says why (a2aDispatcherCeiling, gke-labs/kube-agents#5381).
+	// The step itself tears the dispatcher down past the ceiling.
+	state.dispatcherCeiling = dispatcherCeilingRemoved
+	if a2aDispatcherEnabled() {
+		ceiling, _, cerr := a2aDispatcherCeiling(agent, profiles, draining)
+		if cerr != nil {
+			return state, cerr
+		}
+		state.dispatcherCeiling = &ceiling
+	}
 	jobMode, dispatcherProfileErr, err := r.reconcileA2ADispatcherWithJobMode(ctx, agent, profiles, profileFenced, draining)
 	state.dispatcherJobMode = jobMode
 	if err != nil {
