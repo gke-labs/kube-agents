@@ -449,9 +449,7 @@ leave open:
   `A2A_DISPATCHER_BUCKETED_GRANTS` (off by default) moves the dispatcher's per-profile grants
   out of the identity map and onto per-bucket connections the callout derives
   (spec-nats-deployment.md); a dispatcher that doesn't open them loses every profile grant, so
-  it stays off until the dispatcher opens its bucket connections (#5381). With it on, the
-  dispatcher's entry no longer grows with the profile count; the ceiling above still measures
-  the unbucketed entry until #5381's second change lifts it.
+  it stays off until the dispatcher opens its bucket connections (#5381). With it on, the dispatcher's entry is a fixed size whatever the profile count, so the ceiling above measures that entry and cuts on the dispatch config's budget alone.
 - **Terminal notice.** A task the dispatcher ends gets a final status on its `.supervisor`
   subject (`lib.TaskSupervisorSubject`, contract addendum 6), never its `.events`, which stays
   the executor's alone: `rejected` when it is refused at admission (nothing ran), `failed`
