@@ -521,7 +521,8 @@ def run_evals(args: argparse.Namespace, host_context: str, out: Path) -> dict:
 
 def capability_usage(host_context: str, namespace: str, windows: dict[str, dict]) -> dict[str, dict]:
     """Each window's tokens by capability (docs/designs/capability-usage-attribution.md), from one read."""
-    stores = attribution.read_stores(host_context, namespace)
+    starts = [datetime.fromisoformat(w["start"]).timestamp() for w in windows.values() if "start" in w]
+    stores = attribution.read_stores(host_context, namespace, since=min(starts, default=0.0))
     usage = {}
     for name, window in windows.items():
         try:
