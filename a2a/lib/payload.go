@@ -780,6 +780,10 @@ type AgentCard struct {
 	ClusterRef *ClusterRef `json:"clusterRef,omitempty"`
 	// Parameters are the task parameters the profile's persona declares.
 	Parameters []ProfileParameter `json:"parameters,omitempty"`
+	// YieldToPinned hands a task addressed to this profile to the profile
+	// pinned to its target cluster, when there is one: the generic cluster
+	// agent sets it, and a specialist addressed by name keeps the task.
+	YieldToPinned bool `json:"yieldToPinned,omitempty"`
 }
 
 // ClusterRef names one GKE cluster.

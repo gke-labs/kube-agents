@@ -326,9 +326,10 @@ func buildA2AVerifierPDB(agent *agentv1alpha1.PlatformAgent) *policyv1.PodDisrup
 			MaxUnavailable: ptr.To(intstr.FromInt32(a2aVerifierPDBMaxUnavailable)),
 			Selector:       &metav1.LabelSelector{MatchLabels: a2aVerifierPodSelector(agent)},
 			// AlwaysAllow rather than the IfHealthyBudget default. /readyz
-			// is "connected to the bus and bound to the bucket", and the
-			// bus is a one-replica StatefulSet, so while it is down — or
-			// its PVC is Pending, or the provision Job has failed — BOTH
+			// is "connected to the bus and bound to the bucket", so while
+			// the bus is down (a single-server bus restarting, or every
+			// server of a cluster gone) — or its PVC is Pending, or the
+			// provision Job has failed — BOTH
 			// verifiers are Running and NotReady. Under the default that
 			// is currentHealthy 0 against desiredHealthy 1, zero
 			// disruptions allowed, and the eviction API answering 429 for
