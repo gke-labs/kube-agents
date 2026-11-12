@@ -306,6 +306,13 @@ def pause():
             if failure and jid not in failed_ids:
                 failed.append(failure)
                 failed_ids.add(jid)
+            elif not failure:
+                # Again after the pause: a resume that ran since the write above found this
+                # job not yet paused and may have removed the record, which must still name it.
+                try:
+                    write_record(set(read_record()) | {jid})
+                except OSError:
+                    pass
         try:
             after = {job["id"]: job for job in jobs_in(ROSTER)}
         except (OSError, ValueError) as exc:
@@ -354,7 +361,10 @@ def resume():
     except (OSError, ValueError) as exc:
         print(f"asked to resume {', '.join(targets)}, but the roster could not be read back: {exc}")
         return RETRY
-    still = [jid for jid in targets if paused(after.get(jid, {}))]
+    # Every recorded job, not only those it resumed: a pause that landed after the first
+    # read (a pass still under way) keeps the record, and the caller's retry resumes it.
+    still = [jid for jid in ids if paused(after.get(jid, {}))]
+    retryable |= any(jid not in targets for jid in still)
     if not still:
         os.remove(RECORD)
     failed += [f"{jid} (still paused in the store)" for jid in still if jid not in failed_ids]

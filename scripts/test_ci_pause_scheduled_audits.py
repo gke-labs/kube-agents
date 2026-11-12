@@ -61,6 +61,21 @@ FAKE_HERMES = textwrap.dedent('''\
         if not os.path.exists(flag):
             open(flag, "w").close()
             sys.exit(0)
+    home = os.path.join(os.path.dirname(os.environ["FAKE_ROSTER"]), "..", "..", "..")
+    if mode.startswith("drop-record-at:") and sys.argv[4] == "pause" and sys.argv[5] == mode.split(":", 1)[1]:
+        # A resume ran between the record's write and this pause, and removed it.
+        try:
+            os.remove(os.path.join(home, ".ci-paused-audits.json"))
+        except FileNotFoundError:
+            pass
+    if mode.startswith("late-pause:") and sys.argv[4] == "resume":
+        # A watch pass still under way pauses this job while the resume runs.
+        late = mode.split(":", 1)[1]
+        store = json.load(open(os.environ["FAKE_ROSTER"]))
+        for job in store["jobs"]:
+            if str(job["id"]) == late:
+                job.update(enabled=False, state="paused", paused_at="2026-10-14T00:00:00+00:00")
+        json.dump(store, open(os.environ["FAKE_ROSTER"], "w"))
     if mode == "arm-on-first":
         # The oobe-first-run-audits stack arms while this pause is in flight: the pause still
         # lands, and the state file is there for every later one.
@@ -461,6 +476,28 @@ class ChainTest(unittest.TestCase):
         for audit in STAGE_FIVE:
             self.assertTrue(store[audit]["enabled"], audit)
 
+    def test_a_pause_after_a_resume_removed_the_record_is_recorded_again(self):
+        self.write_roster(self.five())
+        self.write_stage(fired=STAGE_FIVE, done=True)
+        result, store = self.run_script(mode=f"drop-record-at:{STAGE_FIVE[2]}", chain=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(store[STAGE_FIVE[2]]["state"], "paused")
+        self.assertIn(STAGE_FIVE[2], json.loads((self.home / ".ci-paused-audits.json").read_text()))
+
+    def test_a_pause_landing_during_the_resume_keeps_the_record_for_the_retry(self):
+        first, late = STAGE_FIVE[:2]
+        self.write_roster(self.five(**{first: {"enabled": False, "state": "paused", "paused_at": "x"}}))
+        (self.home / ".ci-paused-audits.json").write_text(json.dumps([first, late]))
+        result, store = self.run_script(mode=f"late-pause:{late}", resume=True)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertTrue(store[first]["enabled"])
+        self.assertIn(late, json.loads((self.home / ".ci-paused-audits.json").read_text()))
+        # scheduled_audits retries; the retry resumes it and the record goes.
+        result, store = self.run_script(resume=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(store[late]["enabled"])
+        self.assertFalse((self.home / ".ci-paused-audits.json").exists())
+
     def test_its_paths_are_the_stage_and_the_stacks(self):
         text = SCRIPT.read_text()
         stage = STAGE.read_text()
@@ -677,7 +714,7 @@ class ChainWatchTest(unittest.TestCase):
         stop = trap.index("declare -F stop_chain_audits_watch >/dev/null && stop_chain_audits_watch")
         self.assertLess(stop, trap.index('scheduled_audits resume "exit"'))
 
-    def run_watch(self, interval, stub, steps):
+    def run_watch(self, interval, stub, steps, stop_wait=20):
         """The two functions as the runner defines them, scheduled_audits stubbed, then <steps>."""
         with tempfile.TemporaryDirectory() as tmp:
             log = pathlib.Path(tmp) / "calls"
@@ -687,7 +724,7 @@ class ChainWatchTest(unittest.TestCase):
                 f"readonly EVAL_CHAIN_AUDITS_INTERVAL_SECONDS={interval}",
                 'readonly EVAL_CHAIN_AUDITS_PID_FILE="watch.pid"',
                 'readonly EVAL_CHAIN_AUDITS_RUNNING_FILE="watch.running"',
-                "readonly EVAL_CHAIN_AUDITS_STOP_WAIT_SECONDS=20",
+                f"readonly EVAL_CHAIN_AUDITS_STOP_WAIT_SECONDS={stop_wait}",
                 f'LOG="{log}"',
                 f"scheduled_audits() {{ {stub}; }}",
                 "start_chain_audits_watch() {" + self.body("start_chain_audits_watch") + "\n}",
@@ -722,6 +759,18 @@ class ChainWatchTest(unittest.TestCase):
         start = time.monotonic()
         self.run_watch(60, 'echo "$1" >> "$LOG"', ["sleep 1", "stop_chain_audits_watch"])
         self.assertLess(time.monotonic() - start, 30)
+
+    def test_a_second_stop_still_waits_for_a_pass_the_first_outwaited(self):
+        # The fan-out's stop times out; the EXIT trap's stop, with no pid file left, waits on.
+        calls = self.run_watch(1, 'echo started >> "$LOG"; sleep 5; echo landed >> "$LOG"', [
+            "sleep 2",
+            "stop_chain_audits_watch 2>/dev/null",
+            'tail -1 "$LOG" | grep -qx started',
+            '[ ! -e "{tmp}/watch.pid" ]',
+            "stop_chain_audits_watch",
+            'tail -1 "$LOG" | grep -qx landed || { echo "the second stop did not wait" >&2; exit 9; }',
+        ], stop_wait=2)
+        self.assertEqual(calls, ["started", "landed"])
 
     def test_a_stop_waits_for_a_pass_under_way(self):
         # The pass's pauses land before the EXIT trap's resume reads the record.

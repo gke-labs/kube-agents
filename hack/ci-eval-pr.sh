@@ -2512,7 +2512,9 @@ scheduled_audits() { # <pause|chain|resume> <label>
 # stop_chain_audits_watch sends TERM. A nap ends at once; a pass under way runs to its
 # end, since bash runs a trap only once the foreground command returns, and killing
 # the subshell alone would leave that pass's exec running to pause after the EXIT
-# trap's resume, which may already have removed the record that names it.
+# trap's resume. A pass that outlasts the wait still leaves its pauses recorded: the
+# script writes the record again after each pause, and the resume keeps the record,
+# and asks for its retry, while any job it names is paused.
 start_chain_audits_watch() {
   local pidfile="${STATE_DIR}/${EVAL_CHAIN_AUDITS_PID_FILE}" running="${STATE_DIR}/${EVAL_CHAIN_AUDITS_RUNNING_FILE}" owner=$$
   : > "${running}"
@@ -2539,15 +2541,19 @@ start_chain_audits_watch() {
 
 stop_chain_audits_watch() {
   local pidfile="${STATE_DIR:-}/${EVAL_CHAIN_AUDITS_PID_FILE}" running="${STATE_DIR:-}/${EVAL_CHAIN_AUDITS_RUNNING_FILE}" pid waited=0
-  [ -n "${STATE_DIR:-}" ] && [ -e "${pidfile}" ] || return 0
-  pid="$(cat "${pidfile}" 2>/dev/null || true)"
-  rm -f "${pidfile}"
-  [ -z "${pid}" ] || kill "${pid}" 2>/dev/null || true
+  [ -n "${STATE_DIR:-}" ] || return 0
+  # A second call (the EXIT trap's, after the fan-out's timed out) finds no pid file
+  # but still waits on the pass.
+  if [ -e "${pidfile}" ]; then
+    pid="$(cat "${pidfile}" 2>/dev/null || true)"
+    rm -f "${pidfile}"
+    [ -z "${pid}" ] || kill "${pid}" 2>/dev/null || true
+  fi
   while [ -e "${running}" ] && [ "${waited}" -lt "${EVAL_CHAIN_AUDITS_STOP_WAIT_SECONDS}" ]; do
     sleep 1
     waited=$((waited + 1))
   done
-  [ ! -e "${running}" ] || echo "WARNING: Scheduled audits: the fan-out watch's pass was still running after ${EVAL_CHAIN_AUDITS_STOP_WAIT_SECONDS}s; a first-run audit it pauses after the resume stays paused until the next eval run's resume or the oobe-first-run-audits arm lifts it, both from the record it wrote first" >&2
+  [ ! -e "${running}" ] || echo "WARNING: Scheduled audits: the fan-out watch's pass was still running after ${EVAL_CHAIN_AUDITS_STOP_WAIT_SECONDS}s; a first-run audit it pauses after the resume stays paused until the next eval run's resume or the oobe-first-run-audits arm lifts it, both from the record it writes after each pause" >&2
   return 0
 }
 
