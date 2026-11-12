@@ -10103,6 +10103,21 @@ def test_verified_claims_backed_reads_the_head_up_to_the_pods_marker_not_a_print
     assert verifiers._clipped_result_marker(clipped).start() == limit
 
 
+def test_verified_claims_backed_a_kept_tail_does_not_make_a_clipped_result_whole():
+    # The tail closes the JSON string and object again, so a whole-object decode
+    # succeeds; an excerpt from the dropped middle is unchecked, not invented.
+    from kube_agents_bench import worker_trajectory
+
+    output = "head " + "x" * 2500 + " middle node-b NotReady " + "y" * 2500 + " tail"
+    out = json.dumps({"output": output, "exit_code": 0, "error": None})
+    limit, tail = worker_trajectory.MAX_RESULT_CHARS, worker_trajectory.RESULT_TAIL_CHARS
+    clipped = out[:limit] + " ...[clipped %d chars]... " % (len(out) - limit - tail) + out[-tail:]
+    text, was_clipped = verifiers._terminal_output(clipped)
+    assert was_clipped and "[clipped" not in text and text.startswith("head ")
+    res = _grade_claims(_block("kubectl get nodes", "middle node-b NotReady"), [_terminal("kubectl get nodes", result=clipped)])
+    assert res.status == "pass" and "not checked" in res.reason and "output clipped" in res.reason, res
+
+
 def test_verified_claims_backed_masks_addresses_as_the_pod_does():
     out = json.dumps({"output": "user:[REDACTED_EMAIL] roles/viewer", "exit_code": 0})
     res = _grade_claims(_block("gcloud projects get-iam-policy p", "user:ana@example.com roles/viewer"),

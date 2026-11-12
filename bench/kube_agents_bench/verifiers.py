@@ -1908,7 +1908,7 @@ class ToolCalledVerifier(BaseVerifier):
     the tool answered rather than only that it was called, such as Hermes'
     ``<persisted-output>`` notice for a result too large to return whole. A
     worker call's result is clipped in the pod, so the pattern must match near
-    the start of it. A call whose result the capture could not read (none
+    its start or near its end. A call whose result the capture could not read (none
     recorded, or withheld because the pod's redactor did not load) makes the
     check ``status="error"``, since a pattern over it would read as no match --
     but only when its arguments are withheld too, cut where the clip left them
@@ -3884,16 +3884,19 @@ def _terminal_output(result: str) -> tuple[str, bool]:
     repeated-call notice), which is advice to the model and not output, so
     the leading JSON object is decoded and whatever follows it is left
     alone; that also reads a result whose clip landed inside the note. A
-    result whose JSON itself was cut no longer parses; its surviving head
-    is decoded as a JSON string, less any escape the cut split.
+    result whose JSON itself was cut is read up to the pod's marker: the
+    kept tail can close the string and the object again, so a decode that
+    succeeds with the marker inside the object is not a whole result. Its
+    surviving head is decoded as a JSON string, less any escape the cut split.
     """
-    try:
-        parsed, _ = json.JSONDecoder().raw_decode(result)
-    except ValueError:
-        parsed = None
-    if isinstance(parsed, dict) and isinstance(parsed.get("output"), str):
-        return parsed["output"], False
     clipped = _clipped_result_marker(result)
+    try:
+        parsed, end = json.JSONDecoder().raw_decode(result)
+    except ValueError:
+        parsed, end = None, 0
+    whole = clipped is None or clipped.start() >= end
+    if whole and isinstance(parsed, dict) and isinstance(parsed.get("output"), str):
+        return parsed["output"], False
     if not clipped:
         return result, False
     head = _OUTPUT_HEAD_RE.sub("", result[: clipped.start()])
