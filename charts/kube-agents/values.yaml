@@ -384,6 +384,8 @@ litellm:
   # 3.x model a value also replaces the thinking key the chart renders there
   # to get Gemini's thoughts back ("Gemini's thoughts" on the same page); both
   # ask for them. Chart-only; the kustomize dev base carries no such key.
+  # A vLLM server passes it to the model's chat template as written;
+  # the template decides what each level means (site: inference-gateway page).
   reasoningEffort: ""
   # Renders litellm_settings.drop_params: true (also enabled automatically when
   # fallback.reasoningEffort is set), so a parameter the
