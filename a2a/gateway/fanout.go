@@ -34,6 +34,9 @@ const (
 	// wakeBatchCutNote follows the "…" truncateRunes leaves on a child's
 	// text cut to its share of the wake.
 	wakeBatchCutNote = " (cut to its share of a wake carrying %d results)"
+	// wakeBatchQuestionCutNote follows a child's question cut the same way:
+	// a question is posted nowhere else, so the session asks it again.
+	wakeBatchQuestionCutNote = " (question cut to its share of a wake carrying %d results; it was not posted anywhere, so ask the task again for the rest)"
 	// wakeBatchQuestionGuide is added when a child ended on a question
 	// (batchChildAsks): the session asks the person once, for all of them.
 	wakeBatchQuestionGuide = "A task that needed input ended with its question instead of asking the person. Ask them once, in your own words, for everything those questions need."
@@ -77,14 +80,18 @@ func batchShare(n int) int {
 
 // cutBatchText is a child's text as its entry in a wake of n carries it:
 // backtick runs broken (so its fence stays bounded), then cut on a rune
-// boundary to its share, the cut named.
-func cutBatchText(text string, n int) string {
+// boundary to its share, the cut named: a result's as posted whole in the
+// conversation, a question's as posted nowhere (wakeBatchQuestionCutNote).
+func cutBatchText(text string, n int, question bool) string {
 	text = breakBacktickRuns(strings.TrimSpace(text), wakeFenceMax-1)
 	share := batchShare(n)
 	if len(text) <= share {
 		return text
 	}
 	note := fmt.Sprintf(wakeBatchCutNote, n)
+	if question {
+		note = fmt.Sprintf(wakeBatchQuestionCutNote, n)
+	}
 	return truncateRunes(text, share-len("…")-len(note)) + note
 }
 
@@ -188,7 +195,7 @@ func (g *Gateway) batchChildEnded(ctx context.Context, rec *SessionRecord, child
 	}
 	parent, known := rec.TaskRefFor(child.ParentTaskID)
 	end.Stopped = child.Canceled
-	end.Text = cutBatchText(end.Text, max(parent.BatchSize, len(parent.Children)))
+	end.Text = cutBatchText(end.Text, max(parent.BatchSize, len(parent.Children)), end.State == lib.StateInputRequired)
 	rec.setBatchEnd(child.ID, &end)
 	left := 0
 	if known {
@@ -278,8 +285,12 @@ const noticeBatchChildAsked = "❓ needs input: the question goes back with the 
 // question as its result (batchChildEnded), rather than pausing the
 // conversation on it: several children each asking the room at once would be
 // unreadable, so the session asks the person once, in its own words. The
-// child is sent a cancel, quiet so its terminal posts nothing, and its line
-// is closed. A single delegation, and a batch of one, keep the pause
+// child is sent a cancel, quiet so its terminal posts nothing, under the
+// delegation's authority as its mint was, and its line is closed. A cancel
+// that can't be built or published leaves the child counted as ended all
+// the same, and its route retired, so it holds neither the batch nor the
+// conversation's one live delegation (liveChild); a late event of its is
+// dropped. A single delegation, and a batch of one, keep the pause
 // (applyStatus).
 func (g *Gateway) batchChildAsks(ctx context.Context, rec *SessionRecord, child TaskRef, question string) {
 	if child.BatchEnd != nil {
@@ -291,12 +302,17 @@ func (g *Gateway) batchChildAsks(ctx context.Context, rec *SessionRecord, child 
 	}
 	g.batchChildEnded(ctx, rec, child, BatchEnd{State: lib.StateInputRequired, Text: question, Source: TerminalFromExecutor}, "")
 	// No answer is coming, so the task is told to stop rather than wait.
-	authority, _ := AuthorityFromAttribution(child.Attribution)
-	if g.publishBatchCancel(ctx, rec, child, authority, batchCancelAsked) {
+	g.publishDispatchStop(ctx, child)
+	parent, _ := rec.TaskRefFor(child.ParentTaskID)
+	authority, ok := delegationAuthority(parent)
+	if !ok {
+		g.log.Error("cancel not sent for "+batchCancelAsked+": the delegation's authority is not on record", "taskId", child.ID)
+	} else if g.publishBatchCancel(ctx, rec, child, authority, batchCancelAsked) {
 		rec.MarkCanceled(child.ID)
 		rec.markQuietCancel(child.ID)
+		return
 	}
-	g.publishDispatchStop(ctx, child)
+	g.retireTaskRoute(ctx, child.ID)
 }
 
 // noticeBatchChildNeverStarted is what the room reads when the heal ends a

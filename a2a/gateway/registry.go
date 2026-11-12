@@ -432,7 +432,7 @@ type TaskRef struct {
 	// record write before any child is published (mintBatch), so a record
 	// with fewer children than this is a batch a gateway stopped partway
 	// through, which the request's redelivery, or the heal's read of it from
-	// the stream, finishes or withdraws (resumeBatch). Zero on every other
+	// the stream, finishes or withdraws (handleDelegateRequest's resuming case). Zero on every other
 	// turn, a batch of one included.
 	BatchSize int `json:"batchSize,omitempty"`
 	// BatchIndex, Target and BatchEnd are a batch child's, for a batch of
@@ -482,9 +482,14 @@ func (rec *SessionRecord) batchChildren(parentID string) []TaskRef {
 }
 
 // batchLeft is how many of a fan-out parent's planned children have not
-// ended: those still to be minted and those on record with no BatchEnd.
+// ended: those still to be minted and those on record with no BatchEnd. A
+// withdrawn batch (DelegationEnd) mints nothing more, so only the children
+// it kept on the record count: the last of them to end ends the chain.
 func (rec *SessionRecord) batchLeft(parent TaskRef) int {
 	left := parent.BatchSize
+	if parent.DelegationEnd != "" {
+		left = len(rec.batchChildren(parent.ID))
+	}
 	for _, k := range rec.batchChildren(parent.ID) {
 		if k.BatchEnd != nil {
 			left--
@@ -735,7 +740,7 @@ func (rec *SessionRecord) observedAs(taskID string) (id string, ends bool) {
 //
 // A batch is handled once every child it planned is on the record
 // (BatchSize): one a gateway stopped partway through is still to finish, so
-// its request is read again (resumeBatch).
+// its request is read again (handleDelegateRequest's resuming case).
 func (rec *SessionRecord) delegationHandled(taskID string) bool {
 	ref, ok := rec.TaskRefFor(taskID)
 	return ok && ((len(ref.Children) > 0 && ref.batchComplete()) || ref.DelegationEnd != "")

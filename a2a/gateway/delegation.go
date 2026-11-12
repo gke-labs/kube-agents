@@ -490,7 +490,7 @@ func (g *Gateway) mintBatch(ctx context.Context, rec *SessionRecord, taskID stri
 			Addressee:            addressee,
 			KeepActive:           true,
 			BatchIndex:           i + 1,
-			Target:               batchTarget(e.Parameters),
+			Target:               batchTarget(batchParams(e, routes[i])),
 		})
 		if !ok {
 			// The parent records that its request ran nothing, whether or
@@ -589,8 +589,10 @@ func (g *Gateway) withdrawCutShortBatch(ctx context.Context, rec *SessionRecord,
 	// The cancels ride the delegation's own authority, as the mint's did;
 	// an attribution that can't be read leaves the block empty, and no
 	// executor checks a cancel's grants.
-	authority, _ := AuthorityFromAttribution(parent.Attribution)
-	authority.Via = &AuthorityVia{TaskID: taskID, Session: parent.Addressee}
+	authority, _ := delegationAuthority(parent)
+	if authority.Via == nil {
+		authority.Via = &AuthorityVia{TaskID: taskID, Session: parent.Addressee}
+	}
 	kept := g.withdrawBatch(ctx, rec, taskID, parent.Children, authority)
 	rec.markDelegationEnd(taskID, notStartedEnd(whyBatchCutShort))
 	if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
@@ -619,6 +621,29 @@ const (
 	batchTargetSep = ", "
 	batchTargetKV  = "="
 )
+
+// batchParams is the parameters a batch child runs with: its route's, as
+// resolved (a pinned profile's include its cluster), or the entry's own for
+// platform, which takes none.
+func batchParams(e lib.DelegateTask, route *profileRoute) map[string]string {
+	if route != nil {
+		return route.Params
+	}
+	return e.Parameters
+}
+
+// delegationAuthority is the authority a gateway-sent message for a child of
+// parent rides, as the child's mint did: the parent's stored attribution
+// with a via naming the parent and the session it ran on. false when the
+// attribution can't be read.
+func delegationAuthority(parent TaskRef) (Authority, bool) {
+	authority, err := AuthorityFromAttribution(parent.Attribution)
+	if err != nil || len(parent.Attribution) == 0 {
+		return Authority{}, false
+	}
+	authority.Via = &AuthorityVia{TaskID: parent.ID, Session: parent.Addressee}
+	return authority, true
+}
 
 // batchTarget is a batch entry's parameters as the wake and a status name
 // the child: each name=value, sorted by name, held to batchTargetCap. Empty
