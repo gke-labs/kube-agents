@@ -106,9 +106,12 @@ UNSTORABLE_REPEATS_AGE = "repeats_swapped_age"
 # it would be served with the recording's value.
 UNSTORABLE_BOUND_VALUE_LEFT_LITERAL = "bound_value_left_literal"
 # Normalized, the answer still holds an identifier shape (a card, a pod, a
-# session) the request never bound, so it would be served as recorded, or
-# names a file only a dropped read_file `similar_files` listed.
+# session) the request never bound, so it would be served as recorded.
 UNSTORABLE_UNBOUND_IDENTIFIER = "unbound_identifier"
+# The answer names a file the request's read_file `similar_files` listed, which
+# the key drops: served to a run whose list lacked it, it would act on a file
+# that run was never shown.
+UNSTORABLE_NAMES_DROPPED_FILE = "names_dropped_similar_file"
 # The answer quotes a timestamp the request does not hold verbatim (one the
 # model made), which no placeholder can bring up to date.
 UNSTORABLE_UNBOUND_TIMESTAMP = "unbound_timestamp"
@@ -176,6 +179,10 @@ GUARD_VALUE_ONLY_IN_ANSWERS = "value_only_in_answers"
 GUARD_UNBOUND_PLACEHOLDER = "unbound_placeholder"
 # The saved answer is missing or not an answer.
 GUARD_UNREADABLE_ENTRY = "unreadable_entry"
+# The saved answer names a file this request's read_file `similar_files`
+# listed, which the key drops: the recording may have acted on that file not
+# being there (written it, reported it missing).
+GUARD_NAMES_DROPPED_FILE = "names_dropped_similar_file"
 # Where the first difference is when it is not a message.
 MISS_ROLE_SETTINGS = "settings"
 MISS_ROLE_NONE = "none"

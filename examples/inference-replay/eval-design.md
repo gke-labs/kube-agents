@@ -240,10 +240,16 @@ The rules that keep this safe:
   agent had written `INVENTORY.md` there yet changed the list between otherwise identical runs. So
   in a tool message answering a `read_file` call, a not-found result keys the same whatever it
   lists, and the same as one with no list, also when Hermes has appended a warning after it. Any
-  other result, and any other tool's output, keeps its list. The model often reads a listed file
-  next (63 of the 1,370 answers that followed such a list in the Nov 12 nightlies named one), so an
-  answer that names a dropped file by its file name isn't saved: served to a run whose list didn't
-  have it, it would read a file that run was never shown.
+  other result, and any other tool's output, keeps its list. About one answer in twenty after such
+  a list names a listed file (63 of 1,370 in the Nov 12 nightlies), so no file named in either
+  run's list crosses runs, matched by its file name in the answer as written: an answer naming one
+  of the recording's isn't saved, since served to a run whose list lacked it, it would read a file
+  that run was never shown; and a saved answer naming one of this run's isn't served, since the
+  recording may have acted on that file not being there (writing `INVENTORY.md` would overwrite
+  what another agent wrote). An answer that acts on a file's absence without naming it ("no
+  inventory file exists yet") is still served across runs. In the Nov 12 nightlies none of the 300
+  answers that came straight after a not-found result talked about a missing file other than by
+  naming it.
 - **The eval pool project is an identifier.** Every Prow build leases its own GCP project,
   `kube-agents-evals` or `kube-agents-evals-<n>`, and its name is in 94% of requests (Nov 7 shadow
   data): the Cluster Agent's profile name (`cluster-kube-agents-evals-31-seeded-a-…`), the front
@@ -267,9 +273,11 @@ The rules that keep this safe:
 - **An earlier run's proposal in `submit_suggestion`'s notice is bound.** When `prepare` finds that
   a closed or merged proposal last used the branch name, it says so ("… was the source of
   `https://github.com/<owner>/<repo>/pull/1399`, which is closed. That proposal's last revision,
-  `3ef98c4e29cf`, is not in 'main' …", and "Deleted the spent branch at `<revision>`" when it
-  deletes the branch). Every run opens proposals of its own, so the number and the revision are an
-  earlier run's and differ between otherwise identical runs. In those sentences only, the revision
+  `3ef98c4e29cf`, is not in 'main' …"; "Deleted the spent branch at `<revision>`" when it deletes
+  the branch; and "The repository held the branch at `<revision>`" or "still holds the branch at
+  `<revision>`" when it can't). A GitLab proposal's URL ends `/-/merge_requests/<n>` instead. Every
+  run opens proposals of its own, so the number and the revision are an earlier run's and differ
+  between otherwise identical runs. In those sentences only, the revision
   is bound like any commit, and the number gets a placeholder that, like a `pid`, is never put back
   in an answer: an answer that holds the number with no digit beside it (`proposal view 1399`,
   `PR #1399`) isn't saved. A proposal number or a run of hex anywhere else stays literal.
@@ -287,7 +295,8 @@ inject message id, GKE node name, pod name with ReplicaSet hash, IP, `pid`/`run_
 `resourceVersion`/`generation`, scratch file `_<epoch>_<pid>` suffixes, and ages; the eval pool
 project, repository commits, the declared-intent clone directory and GKE operation IDs came later,
 from the Nov 7 shadow data, and the kanban `comment_id` (a row id counting every comment on the
-install's board) from the Nov 10 replay-lane trial. Epoch seconds
+install's board) from the Nov 10 replay-lane trial, and the spent proposal's number and revision in
+`submit_suggestion`'s notice from the Nov 12 nightlies. Epoch seconds
 become an unnumbered how-far-from-now time token rather than a numbered placeholder, because two
 events in one second would otherwise shift every later number. The measurements found two gaps,
 `ls -l` dates (`Nov  2 04:13`) and Hermes' terminal-output cache file suffixes (`…-89b0.log`); the

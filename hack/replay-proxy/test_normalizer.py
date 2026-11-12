@@ -1014,14 +1014,22 @@ class SimilarFilesTest(unittest.TestCase):
         mapping = normalizer.normalize_request(read_file_conversation(not_found(similar=self.WITH_INVENTORY)), NOW).mapping
         for answer in ('{"path": "/opt/data/INVENTORY.md"}', "cd /opt/data && cat INVENTORY.md", "SETTINGS.md."):
             with self.subTest(answer=answer):
-                self.assertTrue(mapping.has_identifier(answer))
+                self.assertTrue(mapping.answer_names_dropped_file(answer))
         self.assertEqual(mapping.dropped_files, {"INVENTORY.md", "INVENTORY.raw.md", "SETTINGS.md"})
         for answer in ('{"path": "/opt/data/AGENTS.md"}', "OLD_INVENTORY.md", "INVENTORY.mdx", "an inventory"):
             with self.subTest(answer=answer):
-                self.assertFalse(mapping.has_identifier(answer))
+                self.assertFalse(mapping.answer_names_dropped_file(answer))
         self.assertEqual(normalizer.normalize_request(
             read_file_conversation(not_found(similar=self.WITH_INVENTORY), tool_name="terminal"), NOW).mapping.dropped_files,
             set(), "nothing is dropped from another tool's result, so nothing counts")
+
+    def test_a_dropped_name_holding_a_bound_identifier_counts_as_written(self):
+        # Normalized, the name would read `⟦EVALPROJECT_1⟧-notes.md`; the answer is read as written.
+        body = read_file_conversation(not_found(similar=["/opt/data/kube-agents-evals-22-notes.md"]))
+        body["messages"][0]["content"] = "look at the inventory for kube-agents-evals-22"
+        mapping = normalizer.normalize_request(body, NOW).mapping
+        self.assertTrue(mapping.answer_names_dropped_file('{"path": "/opt/data/kube-agents-evals-22-notes.md"}'))
+        self.assertFalse(mapping.answer_names_dropped_file('{"path": "/opt/data/kube-agents-evals-21-notes.md"}'))
 
 
 def spent_notice(number, revision, outcome="The repository no longer holds the branch, so the name is free."):
@@ -1049,6 +1057,26 @@ class SpentProposalTest(unittest.TestCase):
                          "The repository held the branch at ⟦COMMIT_1⟧, and deleting it did not complete")
         self.assertEqual(norm("The repository still holds the branch at 2d5fee9a5002, so"),
                          "The repository still holds the branch at ⟦COMMIT_1⟧, so")
+
+    def test_a_gitlab_proposal(self):
+        def gitlab(number):
+            return spent_notice(number, "3ef98c4e29cf").replace(
+                f"github.com/gke-agentic/kube-agents-evals-22-infra/pull/{number}",
+                f"gitlab.com/grp/sub/kube-agents-evals-22-infra/-/merge_requests/{number}")
+        self.assertIn("/-/merge_requests/⟦PULL_1⟧, which is closed", json.loads(norm(gitlab(12)))["output"])
+        self.assertEqual(norm(gitlab(12)), norm(gitlab(31)))
+        self.assertEqual(normalizer.normalize_request(request(gitlab(12)), NOW).mapping.proposal_numbers, {"12"})
+        self.assertEqual(norm("https://gitlab.com/grp/x/-/merge_requests/12"), "https://gitlab.com/grp/x/-/merge_requests/12")
+
+    def test_a_proposal_number_only_a_recent_work_digest_holds_counts_against_an_answer(self):
+        # The digest is dropped from the key; its unrestorable values still count (merge_unrestorable).
+        card = ("card t_bbbbbbbb\n\n## Recent work by @platform\n- t_deadbeef — 'platform-agent/b' was the source of "
+                "https://github.com/gke-agentic/x/pull/1399, which is closed.")
+        walker = normalizer.Normalizer(NOW, False)
+        walker.text(card)
+        self.assertTrue(walker.mapping.answer_repeats_bare_number("vcs.py proposal view 1399"))
+        self.assertFalse(walker.mapping.answer_repeats_bare_number("vcs.py proposal view 1400"))
+        self.assertEqual(walker.mapping.counts, {"TASK": 1}, "nothing in the digest is keyed")
 
     def test_the_proposals_state_still_counts(self):
         self.assertNotEqual(norm(spent_notice(1399, "3ef98c4e29cf")),

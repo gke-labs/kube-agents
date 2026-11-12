@@ -364,13 +364,17 @@ HEX_LETTER_RE = re.compile(r"[a-f]")
 # 'main', ..." and, when it deletes the branch, "Deleted the spent branch at
 # <12 hex>". Every eval run opens proposals of its own, so the number and the
 # revision are an earlier run's and differ between otherwise identical runs.
-# Both are read only in those sentences. The revision is bound as a commit. The
+# `clear_spent_branch`'s refusals name the revision as "The repository held
+# the branch at <12 hex>" and "The repository still holds the branch at <12
+# hex>". The number and revision are read only in those sentences, the number
+# in a GitHub (`/pull/<n>`) or GitLab (`/-/merge_requests/<n>`) proposal URL,
+# the forms the broker's proposals carry. The revision is bound as a commit. The
 # number gets a placeholder in the key and is never put back in an answer: it
 # is a bare number, and an unrelated `175` in an answer must not become this
 # run's. An answer that holds it with no digit beside it is not saved instead
 # (Mapping.answer_repeats_bare_number).
 SPENT_PROPOSAL_CLASS = "PULL"
-SPENT_PROPOSAL_RE = re.compile(r"was the source of https?://[^\s,]+/pull/(\d+)(?=, which is )")
+SPENT_PROPOSAL_RE = re.compile(r"was the source of https?://[^\s,]+/(?:pull|-/merge_requests)/(\d+)(?=, which is )")
 SPENT_REVISION_RE = re.compile(
     r"(?:That proposal's last revision, |(?:held|holds) the branch at |Deleted the spent branch at )" + COMMIT_HEX)
 PROPOSAL_NUMBER_BEFORE = r"(?<!\d)"
@@ -442,10 +446,13 @@ RECENT_WORK_ESCAPED_RE = re.compile(
 # there yet changes the list (`/opt/data/INVENTORY.md` listed in one run and
 # not yet in the next), so the key drops it (without_similar_files): only in a
 # not-found result, in a tool message answering a read_file call, found by its
-# tool_call_id. The model reads a listed file next often enough (about one
-# answer in twenty after such a result, Nov 12 nightlies) that an answer naming
-# a dropped file by its file name is not saved (Mapping.has_identifier): served
-# to a run whose list lacked it, it would read a file that run was never shown.
+# tool_call_id. The model sometimes reads a listed file next (about one answer
+# in twenty after such a result, Nov 12 nightlies), so a file named in either
+# run's list never crosses runs (Mapping.answer_names_dropped_file): an answer
+# naming one of the recording's is not saved, and a saved answer naming one of
+# this run's is not served (replay_proxy lookup), since the answer may act on
+# the file being there, or on it not being there (`write_file INVENTORY.md`
+# would overwrite what another agent wrote).
 TOOL_ROLE = "tool"
 READ_FILE_TOOL = "read_file"
 READ_FILE_ERROR_KEY = "error"
@@ -867,18 +874,23 @@ class Mapping:
         no identifier shape once an answer writes it as plain hex, so the
         digest's commits are kept to check (dropped_hex). As in
         identifier_left_literal, a run counts when it starts a kept commit or a
-        kept commit starts it: an answer may shorten or lengthen a SHA. A file
-        only a dropped `similar_files` listed counts by its file name, so a
-        relative path (`cat INVENTORY.md`) counts too.
+        kept commit starts it: an answer may shorten or lengthen a SHA.
         """
         if any(pattern.search(text) for _, pattern, _ in ID_CLASSES):
-            return True
-        if any(re.search(DROPPED_FILE_BEFORE + re.escape(name) + DROPPED_FILE_AFTER, text) for name in self.dropped_files):
             return True
         if not self.dropped_hex:
             return False
         return any(run.startswith(kept) or kept.startswith(run)
                    for run in HEX_RUN_RE.findall(text) for kept in self.dropped_hex)
+
+    def answer_names_dropped_file(self, text: str) -> bool:
+        """Whether an answer names, by its file name, a file a dropped read_file `similar_files` listed.
+
+        Read on the answer as written, not normalized: a name holding a bound
+        identifier (`kube-agents-evals-22-notes.md`) would otherwise be read
+        as its placeholder. By file name, so a relative path (`cat INVENTORY.md`) counts too.
+        """
+        return any(re.search(DROPPED_FILE_BEFORE + re.escape(name) + DROPPED_FILE_AFTER, text) for name in self.dropped_files)
 
     @staticmethod
     def has_timestamp(text: str) -> bool:
@@ -1029,7 +1041,7 @@ class Normalizer:
     def similar_files_dropped(self, message: Any) -> Any:
         """`message`, without its content's `similar_files` when it is a noted read_file call's not-found result.
 
-        The file name of each dropped entry is noted for the answer guard (Mapping.has_identifier).
+        The file name of each dropped entry is noted for the answer guards (Mapping.answer_names_dropped_file).
         """
         if not (isinstance(message, dict) and message.get(ROLE_FIELD) == TOOL_ROLE
                 and isinstance(message.get(TOOL_CALL_ID_KEY), str) and message[TOOL_CALL_ID_KEY] in self.read_file_calls

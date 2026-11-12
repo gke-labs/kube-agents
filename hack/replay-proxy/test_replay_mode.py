@@ -587,7 +587,39 @@ class SimilarFilesTest(AnalyzeCase):
                 tool = "read_file" if "path" in arguments else "terminal"
                 line = self.recorded(self.body(["/opt/data/INVENTORY.md", "/opt/data/SETTINGS.md"]),
                                      self.answer(tool, arguments))
-                self.assertEqual(line["unstorable"], ["unbound_identifier"])
+                self.assertEqual(line["unstorable"], ["names_dropped_similar_file"])
+
+    def test_a_listed_name_holding_a_bound_identifier_is_not_stored(self):
+        body = self.body(["/opt/data/kube-agents-evals-22-notes.md"])
+        body["messages"][0]["content"] = "look at the inventory for kube-agents-evals-22"
+        line = self.recorded(body, self.answer("read_file", {"path": "/opt/data/kube-agents-evals-22-notes.md"}))
+        self.assertEqual(line["unstorable"], ["names_dropped_similar_file"])
+
+    def test_an_answer_naming_a_file_only_this_runs_list_holds_is_not_served(self):
+        # Recorded where INVENTORY.md did not exist yet; this run's list shows another agent wrote it.
+        answer = self.answer("write_file", {"path": "/opt/data/INVENTORY.md", "content": "# fresh"})
+        self.assertEqual(self.recorded(self.body(None), answer)["unstorable"], [])
+        hit, refused = self.proxy().lookup(self.body(["/opt/data/INVENTORY.md"]), time.time())
+        self.assertIsNone(hit)
+        self.assertEqual(refused, {"via": "exact", "guard": "names_dropped_similar_file"})
+        # A run whose list does not name it is served the write.
+        hit, refused = self.proxy().lookup(self.body(["/opt/data/SETTINGS.md"]), time.time())
+        self.assertIsNone(refused)
+        self.assertIsNotNone(hit)
+
+    def test_this_runs_listed_name_is_read_in_the_answer_as_served(self):
+        # Saved, the name is `⟦EVALPROJECT_1⟧-notes.md`; restored with this run's project, it is the listed file.
+        def body(project, similar):
+            asked = self.body(similar)
+            asked["messages"][0]["content"] = f"look at the inventory for {project}"
+            return asked
+
+        answer = self.answer("write_file", {"path": "/opt/data/kube-agents-evals-22-notes.md", "content": "# fresh"})
+        self.assertEqual(self.recorded(body("kube-agents-evals-22", None), answer)["unstorable"], [])
+        hit, refused = self.proxy().lookup(
+            body("kube-agents-evals-23", ["/opt/data/kube-agents-evals-23-notes.md"]), time.time())
+        self.assertIsNone(hit)
+        self.assertEqual(refused, {"via": "exact", "guard": "names_dropped_similar_file"})
 
 
 class SpentProposalTest(AnalyzeCase):
