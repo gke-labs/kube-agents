@@ -294,6 +294,8 @@ class TestWithDeny(unittest.TestCase):
         "deny first, wide dash": "version: 1\nautomerge:\n  deny:\n  -   fix: '*'\n      environments: [prod]\n  allow:\n  - fix: no-pdb\n    environments: [dev]\n",
         "bare dash": "version: 1\nautomerge:\n  allow: [{fix: no-pdb, environments: [dev]}]\n  deny:\n    -\n      fix: '*'\n      environments: [prod]\n",
         "comment after dash": "version: 1\nautomerge:\n  allow: [{fix: no-pdb, environments: [dev]}]\n  deny:\n  - # why\n    fix: '*'\n    environments: [prod]\n",
+        "flow deny, trailing comma": "version: 1\nautomerge:\n  allow: [{fix: no-pdb, environments: [dev]}]\n  deny: [{fix: '*', environments: [prod]},]\n",
+        "flow automerge, trailing comma": "version: 1\nautomerge: {allow: [{fix: no-pdb, environments: [dev]}],}\n",
         "numeric environment": "version: 1\nautomerge:\n  allow: [{fix: no-pdb, environments: ['1']}]\n",
     }
 
@@ -326,6 +328,25 @@ class TestWithDeny(unittest.TestCase):
         }.items():
             with self.subTest(name), self.assertRaises(ar.RulesError):
                 ar.with_deny(text, "no-pdb", "dev")
+
+    def test_an_alias_never_moves_an_allow_rule_into_deny(self):
+        # The alias's node keeps its anchor's marks, which point into `allow`.
+        for name, text in {
+            "no deny": "version: 1\nautomerge:\n  allow:\n    - fix: no-pdb\n      environments: &dev [dev]\n"
+                       "    - fix: other-fix\n      environments: *dev\n",
+            "deny ends in an alias": "version: 1\nautomerge:\n  allow:\n    - fix: no-pdb\n      environments: &dev [dev]\n"
+                                     "    - fix: other-fix\n      environments: [qa]\n  deny:\n    - fix: '*'\n      environments: *dev\n",
+        }.items():
+            with self.subTest(name):
+                before = ar.parse(text)
+                self.assertEqual(before.status, ar.LOADED, before.error)
+                try:
+                    out = ar.with_deny(text, "no-pdb", "dev")
+                except ar.RulesError:
+                    continue
+                after = ar.parse(out)
+                self.assertEqual(after.allow, before.allow)
+                self.assertEqual(after.deny, before.deny + (ar.Rule("no-pdb", ("dev",)),))
 
 
 if __name__ == "__main__":

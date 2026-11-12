@@ -289,6 +289,20 @@ class TestWriters(unittest.TestCase):
                 self.assertNotIsInstance(caught.exception, pms.StepDownError)
         self.assertTrue((self.tree / "pdb-0.yaml").exists())
 
+    def test_a_bare_cr_before_a_hash_is_not_a_forge_note(self):
+        _git(self.tree, "switch", "-q", "-c", "fix")
+        (self.tree / "mac.txt").write_text("old\r# kept\n", newline="")
+        _git(self.tree, "add", "-A")
+        _git(self.tree, "commit", "-q", "-m", "fix")
+        _git(self.tree, "switch", "-q", "main")
+        # Read as bytes: text mode would turn the bare `\r` into a newline.
+        diff = subprocess.run(["git", "-C", str(self.tree), "diff", "main...fix"],
+                              check=True, capture_output=True).stdout.decode()
+        self.assertIn("\r# kept", diff)
+        _git(self.tree, "merge", "-q", "--no-ff", "-m", "merge fix", "fix")
+        pms._revert_writer(self.fix, 7, diff)(self.tree, self.vcs, REPO, "b")
+        self.assertFalse((self.tree / "mac.txt").exists())
+
     def test_step_down_adds_a_deny_rule(self):
         pms._step_down_writer("no-pdb", "dev", "https://x/pull/7")(self.tree, self.vcs, REPO, "b")
         rules = ar.load(self.tree)

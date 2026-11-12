@@ -135,7 +135,9 @@ def _revert_writer(fix: dict, number: int, diff: str) -> Callable[[Path, Any, st
     def write(tree: Path, vcs_client: Any, repo: str, branch: str) -> None:
         if not diff.strip():
             raise StepDownError(f"#{number} has no diff to undo")
-        if any(line.startswith("#") for line in diff.splitlines()):
+        # Split on `\n` alone, as git does: splitlines() also breaks on a bare
+        # `\r` or U+2028 inside a changed line.
+        if any(line.startswith("#") for line in diff.split("\n")):
             # A forge adapter's note in place of changes it withheld or cut
             # short. No line of a real diff starts with `#`, so applying this
             # would undo part of the fix or fail as a false conflict. Not a

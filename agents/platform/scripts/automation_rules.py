@@ -309,7 +309,8 @@ def with_deny(text: str, fix_type: str, environment: str, note: str = "") -> str
     """
     import yaml
 
-    if parse(text).status != LOADED:
+    before = parse(text)
+    if before.status != LOADED:
         raise RulesError(f"{RULES_FILE} does not parse; not edited")
     fix_q, env_q = json.dumps(fix_type), json.dumps(environment)
     root = yaml.compose(text, Loader=yaml.SafeLoader)
@@ -328,7 +329,7 @@ def with_deny(text: str, fix_type: str, environment: str, note: str = "") -> str
 
     if isinstance(deny, yaml.SequenceNode) and deny.flow_style:
         close = deny.end_mark.index - 1
-        insert = flow_item if not deny.value else f", {flow_item}"
+        insert = flow_item if not deny.value or _ends_in_comma(text, close) else f", {flow_item}"
         out = text[:close] + insert + text[close:]
     elif isinstance(deny, yaml.SequenceNode) and deny.value:
         # The sequence's own mark is its first `-`; the first rule's mark is its
@@ -338,7 +339,7 @@ def with_deny(text: str, fix_type: str, environment: str, note: str = "") -> str
         if deny is not None:
             raise RulesError("`automerge.deny` is not a list")
         close = automerge.end_mark.index - 1
-        sep = ", " if automerge.value else ""
+        sep = ", " if automerge.value and not _ends_in_comma(text, close) else ""
         out = text[:close] + f"{sep}deny: [{flow_item}]" + text[close:]
     elif deny_key is not None:
         # `deny:` with nothing after it. `deny: ~` or `deny: null` fall to the
@@ -349,9 +350,21 @@ def with_deny(text: str, fix_type: str, environment: str, note: str = "") -> str
         pad = " " * automerge.value[0][0].start_mark.column
         out = _insert_after_line(text, _exact_end(automerge), f"{pad}deny:{nl}" + block_item(pad + "  "))
     edited = parse(out)
-    if edited.status != LOADED or decide(edited, fix_type, environment).allowed:
+    # Exactly one rule more, nothing moved: an alias's node carries its anchor's
+    # marks, so a position found from it can land inside another list.
+    if (
+        edited.status != LOADED
+        or decide(edited, fix_type, environment).allowed
+        or edited.allow != before.allow
+        or edited.deny != before.deny + (Rule(fix_type, (environment,)),)
+    ):
         raise RulesError(f"could not add a deny rule to this layout of {RULES_FILE}")
     return out
+
+
+def _ends_in_comma(text: str, close: int) -> bool:
+    """Whether a flow collection closing at `close` already ends in `,` (YAML allows it)."""
+    return text[:close].rstrip().endswith(",")
 
 
 def _exact_end(node: Any) -> int:
