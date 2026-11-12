@@ -260,9 +260,8 @@ func frozenOut(agent *agentv1alpha1.PlatformAgent, id a2aIdentity) bool {
 }
 
 // a2aStaticPrincipalNames is every user nats.conf authenticates by password,
-// in render order: the callout's own user, then the static identities. It is
-// the one list both auth_users and the callout's reserved principal names are
-// rendered from, so the two cannot disagree.
+// in render order: the callout's own user, then the static identities. The
+// callout's reserved principal names are rendered from it.
 func a2aStaticPrincipalNames(agent *agentv1alpha1.PlatformAgent) []string {
 	names := []string{a2aCalloutConfUser}
 	for _, id := range staticIdentities(agent) {

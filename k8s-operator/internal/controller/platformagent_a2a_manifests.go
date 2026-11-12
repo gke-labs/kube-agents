@@ -4811,13 +4811,13 @@ func a2aNATSReplicas(agent *agentv1alpha1.PlatformAgent) int {
 }
 
 // resolveA2ABusReplicas sets status.busReplicas to the server count this pass
-// renders, before anything renders. An existing bus keeps what it has,
-// because changing the count empties it (the field's doc and
-// spec-nats-deployment.md): the count last resolved, or with no record the
+// renders, before anything renders. An existing bus keeps what it has until
+// a migration converts it (startBusMigration; the field's doc): the count
+// last resolved, or with no record the
 // shape the StatefulSet's template was rendered for. The live replica count
 // is never read: a StatefulSet scaled by hand, to any count, is a hand scale
 // the next apply reverts, not a new bus shape, so a scale between 1 and 3
-// cannot convert the bus past the gate. Failing a StatefulSet, the record
+// cannot convert the bus outside a migration. Failing a StatefulSet, the record
 // again while the bus left data claims behind (a StatefulSet deleted by hand
 // keeps its claims, and the next one must come back at the bus's count, or it
 // would convert them), and with no record the count the claims imply. The

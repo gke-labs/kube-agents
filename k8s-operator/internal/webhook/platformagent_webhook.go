@@ -353,8 +353,8 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 	allErrs = append(allErrs, storageErrs...)
 	warnings = append(warnings, storageWarnings...)
 
-	// 6. The bus's server count, on an update: an edit asking an existing bus
-	// for another count is refused here as the operator refuses it.
+	// 6. The bus's server count, on an update: a change while a migration
+	// runs is refused; otherwise a change is how a migration starts.
 	allErrs = append(allErrs, validateBusReplicas(oldObj, platformAgent)...)
 	// 7. Leaving next while a bus migration holds the bus: the run's
 	// staging claim can hold the only copy of the bus's data.

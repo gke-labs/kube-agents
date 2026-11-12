@@ -2962,7 +2962,8 @@ type BusMigrationStatus struct {
 
 	// ObservedGeneration is the PlatformAgent generation that started this
 	// migration. A migration that ended without converting is not started
-	// again until the spec changes.
+	// again until busReplicas asks for another count, or the
+	// bus-migration-start annotation names the run.
 	ObservedGeneration int64 `json:"observedGeneration"`
 }
 

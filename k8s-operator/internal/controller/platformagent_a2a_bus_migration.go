@@ -1419,21 +1419,11 @@ func (r *PlatformAgentReconciler) busMigrationCalloutServesTheFreeze(ctx context
 		if pod.Annotations[a2aBusFreezeAnnotation] != run.RunID {
 			return false, nil
 		}
-		if pod.DeletionTimestamp == nil && podReady(pod) {
+		if pod.DeletionTimestamp == nil && podIsReady(pod) {
 			serving++
 		}
 	}
 	return serving >= desired, nil
-}
-
-// podReady reports a pod's Ready condition true.
-func podReady(pod *corev1.Pod) bool {
-	for _, c := range pod.Status.Conditions {
-		if c.Type == corev1.PodReady {
-			return c.Status == corev1.ConditionTrue
-		}
-	}
-	return false
 }
 
 // busMigrationFreezeConfigured reports the bus rendered for the freeze:
@@ -1555,8 +1545,8 @@ func busMigrationRequeue(agent *agentv1alpha1.PlatformAgent) time.Duration {
 	return 0
 }
 
-// busMigrationPodOfRun reports a pod name as one of the run's stage-mounting
-// pods, any attempt.
+// busMigrationPodOfRun reports a pod name as one of the run's work pods
+// (snapshot, hash, the clears, restore and rollback), any attempt.
 func busMigrationPodOfRun(agent *agentv1alpha1.PlatformAgent, run *agentv1alpha1.BusMigrationStatus, name string) bool {
 	for _, kind := range []string{"snapshot", "hash", "restore", "rollback", busMigrationClearWork, busMigrationClearBackWork} {
 		base := busMigrationWorkloadName(agent, kind, run.RunID)
