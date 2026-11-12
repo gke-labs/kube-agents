@@ -2920,6 +2920,14 @@ type BusMigrationStatus struct {
 	// +optional
 	ForwardDeadline *metav1.Time `json:"forwardDeadline,omitempty"`
 
+	// PhaseDeadline is a deadline the current phase has of its own, shorter
+	// than Deadline, which applies as well: the one to three leg's
+	// Converting phase has 15 minutes to get three servers Ready, since the
+	// bus is write-frozen and its only copy is on the staging claim while it
+	// waits. Unset in every other phase.
+	// +optional
+	PhaseDeadline *metav1.Time `json:"phaseDeadline,omitempty"`
+
 	// FailedIn is the phase a Failed run failed in. A run that failed inside
 	// the one to three leg's write freeze keeps the freeze, with its
 	// snapshot, until a person retries it or gives it up, each with an

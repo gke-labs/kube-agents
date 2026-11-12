@@ -474,6 +474,41 @@ func TestAOneToThreeMigrationRunsThroughThePass(t *testing.T) {
 	late.pass(busMigrationClearing, 3) // still three servers: their copies go before the shrink
 }
 
+// Converting has fifteen minutes of its own to get three servers Ready, on
+// top of the run's deadline: a cluster that cannot schedule servers 1 and 2
+// turns the run back in that time, not at the run's two-hour deadline with
+// the bus frozen all along. A run already in Converting under an operator
+// without the phase's deadline gets one on its first pass.
+func TestAConversionThatCannotFinishTurnsBackAtItsOwnDeadline(t *testing.T) {
+	m := newMigrationRig(t, busMigrationGrow, busMigrationClearing, 1, time.Now().Add(time.Hour))
+	m.snapshotKept()
+	m.clearedAll()
+	m.pass(busMigrationConverting, 3)
+	pd := m.agent.Status.BusMigration.PhaseDeadline
+	if pd == nil {
+		t.Fatal("entering Converting set no phase deadline")
+	}
+	if left := time.Until(pd.Time); left > busMigrationConvertDeadline || left < busMigrationConvertDeadline-time.Minute {
+		t.Fatalf("the conversion's deadline is %s away, want %s", left, busMigrationConvertDeadline)
+	}
+	m.pass(busMigrationConverting, 3) // servers 1 and 2 Pending, within the phase's time
+	m.agent.Status.BusMigration.PhaseDeadline = ptr.To(metav1.NewTime(time.Now().Add(-time.Second)))
+	m.pass(busMigrationClearing, 3)
+	run := m.agent.Status.BusMigration
+	if !run.Abandoning || !strings.Contains(run.Cause, "the Converting phase was still running at its own deadline") {
+		t.Errorf("abandoning %v, cause %q", run.Abandoning, run.Cause)
+	}
+	if run.PhaseDeadline != nil {
+		t.Errorf("the conversion's deadline outlived the phase: %v", run.PhaseDeadline)
+	}
+
+	upgraded := newMigrationRig(t, busMigrationGrow, busMigrationConverting, 3, time.Now().Add(time.Hour))
+	upgraded.pass(busMigrationConverting, 3)
+	if upgraded.agent.Status.BusMigration.PhaseDeadline == nil {
+		t.Error("a run found in Converting without a phase deadline got none")
+	}
+}
+
 // A hashing pod whose report is not exactly the provisioned streams' digest
 // pairs writes no run Secret, and the run turns back naming why.
 func TestARefusedDigestReportTurnsTheRunBack(t *testing.T) {

@@ -35,6 +35,15 @@ import (
 // the one function that moves between them; the reconcile that observes each
 // phase's work and renders what a phase needs builds on it.
 
+// busMigrationConvertDeadline is the Converting phase's own deadline, from
+// when it begins (status.busMigration.phaseDeadline). The phase only waits
+// for three servers to be Ready, which takes minutes where they can be
+// scheduled and never happens where they cannot (a node short of the
+// hostname spread). It waits write-frozen with the bus's only copy on the
+// staging claim, so a conversion that cannot finish turns back in this
+// time rather than at the run's two-hour deadline.
+const busMigrationConvertDeadline = 15 * time.Minute
+
 // busMigrationLeg is the direction of a run.
 type busMigrationLeg string
 
@@ -471,7 +480,16 @@ func (r *PlatformAgentReconciler) advanceBusMigration(ctx context.Context, agent
 		if err != nil {
 			return 0, err
 		}
+		if busMigrationPhase(run.Phase) == busMigrationConverting && run.PhaseDeadline == nil {
+			// A run that entered Converting under an operator without the
+			// phase's own deadline gets it from the first pass that finds
+			// none.
+			run.PhaseDeadline = ptr.To(metav1.NewTime(now.Add(busMigrationConvertDeadline)))
+		}
 		outcome := withDeadline(observed, run.Deadline.Time, now)
+		if run.PhaseDeadline != nil {
+			outcome = withDeadline(outcome, run.PhaseDeadline.Time, now)
+		}
 		if busMigrationPhase(run.Phase) == busMigrationFreezing && !run.FreezeConfirmed && outcome == busMigrationPending {
 			// The handshake: the bus restarts into the freeze only once
 			// every callout replica serves the frozen map.
@@ -509,7 +527,7 @@ func (r *PlatformAgentReconciler) advanceBusMigration(ctx context.Context, agent
 			}
 		}
 		if outcome == busMigrationErred && run.Cause == "" {
-			run.Cause = busMigrationCause(run, late || observed == busMigrationPending)
+			run.Cause = busMigrationCause(run, late || observed == busMigrationPending, now)
 		}
 		step := nextBusMigrationPhase(leg, busMigrationPhase(run.Phase), run.Abandoning, outcome)
 		if step.next == busMigrationFailed && busMigrationPhase(run.Phase) != busMigrationFailed {
@@ -524,6 +542,13 @@ func (r *PlatformAgentReconciler) advanceBusMigration(ctx context.Context, agent
 		}
 		if step.next == busMigrationClearing && busMigrationPhase(run.Phase) != busMigrationClearing {
 			run.Cleared = nil
+		}
+		if step.next != busMigrationPhase(run.Phase) {
+			// The phase's own deadline starts when it begins and ends with it.
+			run.PhaseDeadline = nil
+			if step.next == busMigrationConverting {
+				run.PhaseDeadline = ptr.To(metav1.NewTime(now.Add(busMigrationConvertDeadline)))
+			}
 		}
 		run.Phase, run.Abandoning = string(step.next), step.abandoning
 		if step.manual != "" {
@@ -544,7 +569,10 @@ func (r *PlatformAgentReconciler) advanceBusMigration(ctx context.Context, agent
 // busMigrationCause says why a run turned back: the phase that failed, and
 // the deadline when that is what stopped it, so a slow run is not read as a
 // broken one.
-func busMigrationCause(run *agentv1alpha1.BusMigrationStatus, late bool) string {
+func busMigrationCause(run *agentv1alpha1.BusMigrationStatus, late bool, now time.Time) string {
+	if late && run.PhaseDeadline != nil && now.After(run.PhaseDeadline.Time) && run.PhaseDeadline.Before(&run.Deadline) {
+		return fmt.Sprintf("the %s phase was still running at its own deadline, %s, %s after it began", run.Phase, run.PhaseDeadline.UTC().Format(time.RFC3339), busMigrationConvertDeadline)
+	}
 	if late {
 		return fmt.Sprintf("the %s phase was still running at the run's deadline, %s", run.Phase, run.Deadline.UTC().Format(time.RFC3339))
 	}
