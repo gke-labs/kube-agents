@@ -189,6 +189,13 @@ layout and are collected from the moment they start running.
       The same readers count it apart from the storm and the ceiling, and
       `classify.py` classes a case whose ungraded reps are all of this kind
       `fixture-drift`.
+      An `infra` rep whose `reason` leads with `KUBE_AGENTS_FORGE_UNAVAILABLE`
+      is a **forge** rep: every check that errored did so because a forge read
+      failed for a while during grading (a 5xx, a dropped connection, a GitHub
+      rate limit on grading's own token). The same readers count it apart
+      from the storm and outside every pass-rate denominator, and
+      `classify.py` classes a case whose ungraded reps are forge reps, with no
+      storm rep beside them, `forge-unavailable`.
       Similarly, a harness-declared card-wake replay error (`ReplayMismatch`
       or `ReplayBroken`, e.g. `failure wake:`, `question wake:`, `block wake:`, `thread context:`
       in the reason) is recognized by `classify.py` and `health.py` as `fail`,
@@ -585,7 +592,8 @@ what the renderer does with them.
   task results; an `infra` rep whose `reason` leads with
   `KUBE_AGENTS_DELEGATION_CEILING` is also excluded from the storm counts
   (`storm_reps`, `health.json`'s `infra_reps`) and reported under
-  `metrics.ceiling_reps` instead. When `reps` is absent the task's single
+  `metrics.ceiling_reps` instead; one whose `reason` leads with
+  `KUBE_AGENTS_FORGE_UNAVAILABLE` is excluded from the storm counts too. When `reps` is absent the task's single
   `result` stands in for one rep.
 - `runs[].lane_excluded` — the case ids `hack/ci-eval-pr.sh` dropped from
   the matrix before the fan-out on the inject lane
@@ -960,7 +968,7 @@ recorded `null` from a pre-field record), `not_evaluated[]` (the case ids
 the suite could not evaluate; empty on every other verdict), `cases[]`
 (`{case, outcome, cls, also_failing_prs, pass_rate_30d, reason, excerpt, rep_n,
 do, admitted, reps, nightly_failed_recent}`, `reps` being `{pass, fail, infra,
-ceiling, fixture}`) and `health_at` (the verdict in force when it finished, from
+ceiling, fixture, forge}`) and `health_at` (the verdict in force when it finished, from
 history; `null` without history). `rep_n` is the 1-based
 repetition the row is about — the one whose `reason` is shown, else the
 one whose `excerpt` is (`null` when there is neither); the pages link that

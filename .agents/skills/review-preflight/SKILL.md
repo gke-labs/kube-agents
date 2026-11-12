@@ -1,6 +1,6 @@
 ---
 name: review-preflight
-description: Runs the pre-PR review passes — adversarial and docs-drift, required on every change, plus chat UX when chat output changes — each in a context that did not write the change, and merges what they return into one disposition list.
+description: Runs the pre-PR review passes — adversarial and docs-drift on every change, plus chat UX whenever chat output changes — each in a context that did not write the change, and merges what they return into one disposition list.
 ---
 
 # Task
@@ -64,11 +64,11 @@ branch wrote them.
 
 - `review-adversarial` — always.
 - `review-docs-drift` — always.
-- `review-chat-ux` — when the range touches chat output, as that skill's Scope defines it.
+- `review-chat-ux` — required when the range touches chat output, as that skill's Scope defines it.
 
-The first two are required on every change and have no trigger to evaluate. The third is not a
-requirement; it runs when chat output changes: read the range's file list and hunks against its
-Scope, and run it when in doubt. Say which passes ran, and
+The first two are required on every change and have no trigger to evaluate. The third is required
+whenever chat output changes: read the range's file list and hunks against its Scope, and run it
+when in doubt. Say which passes ran, and
 say it when one did not. A pass nobody ran is a gap in the section, not an absence of findings.
 
 ## 3. Run the mechanical gate first, in the main loop

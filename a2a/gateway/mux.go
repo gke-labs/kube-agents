@@ -265,6 +265,20 @@ func (m *MultiAdapter) ShowsTaskStatus(conversation string) bool {
 	return ok && shower.ShowsTaskStatus(conversation)
 }
 
+// PostPrivate goes to the backend that owns the conversation
+// (PrivatePoster); one that has no private post answers errNoPrivatePosts.
+func (m *MultiAdapter) PostPrivate(conversation, viewer, text string) error {
+	a, err := m.pick(conversation)
+	if err != nil {
+		return err
+	}
+	poster, ok := a.(PrivatePoster)
+	if !ok {
+		return errNoPrivatePosts
+	}
+	return poster.PostPrivate(conversation, viewer, text)
+}
+
 // AnswersOnLine answers for the backend that owns the conversation
 // (LineAnswerer); one that does not implement it keeps the post and the
 // terminal edit.

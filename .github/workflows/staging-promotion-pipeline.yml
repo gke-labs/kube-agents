@@ -464,9 +464,9 @@ jobs:
 
       # The auth step exports GOOGLE_GHA_CREDS_PATH; this login makes that
       # credential the active account for the poller's `gcloud storage ls` and
-      # `cat` calls, the same way ci-health.yml does before its reads. (Those
-      # reads were gsutil's until 2026-10, and gsutil ignored the exported
-      # file: without this line every listing failed on anonymous credentials,
+      # `cat` calls, the same way ci-health.yml does before its reads. (Until
+      # 2026-10 those reads used the legacy storage client, which ignored the
+      # exported file: without this line every listing failed on anonymous credentials,
       # the build never appeared, and the job reported `never_ran`, which
       # reads as a broken eval lane rather than a missing login. That cost
       # ci-health.yml forty failed ticks on 2026-09-10.)

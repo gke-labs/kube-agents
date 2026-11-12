@@ -110,6 +110,10 @@
             }
           }
         },
+        "slackTestUsers": {
+          "type": "array",
+          "items": { "type": "string", "pattern": "^[A-Z0-9]+$" }
+        },
         "webhooks": {
           "type": "object",
           "additionalProperties": false,
@@ -1291,6 +1295,10 @@
                   "minimum": 1,
                   "maximum": 10000
                 },
+                "busReplicas": {
+                  "type": "integer",
+                  "enum": [1, 3]
+                },
                 "admission": {
                   "type": "object",
                   "additionalProperties": false,
@@ -1786,6 +1794,9 @@
                     "maximum": 65535
                   },
                   "namespace": {
+                    "type": "string"
+                  },
+                  "identity": {
                     "type": "string"
                   },
                   "credentialsRef": {

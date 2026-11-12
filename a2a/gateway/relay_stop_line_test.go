@@ -693,8 +693,10 @@ func TestAChatTypedStopWhoseCloseFailsPostsTheNotice(t *testing.T) {
 // A Stop press on Google Chat from a member the allowlist does not admit
 // posts nothing: the press asked the bot for nothing, and the unverified
 // sender's notice, which names the presser, would land in a thread the
-// space reads. The task runs on. (A typed message from the same member
-// still gets the notice once.)
+// space reads. Nor are they told privately, as a listed member the
+// requester gate refuses is (gchat_stop_gate_test.go): the allowlist drops
+// the press before the gate reads it, named viewer or not. The task runs
+// on. (A typed message from the same member still gets the notice once.)
 func TestAChatStopPressFromAnUnlistedMemberPostsNoNotice(t *testing.T) {
 	r := startGchatRig(t, []string{"user@example.com"}, false)
 	conv := "gchat:spaces/S1/threads/T-unlisted-press"
@@ -711,7 +713,7 @@ func TestAChatStopPressFromAnUnlistedMemberPostsNoNotice(t *testing.T) {
 	line := r.adapter.stopLinesCopy()[0].MessageID
 	before := len(r.adapter.postTextsFor(conv))
 	press := line + "#t1"
-	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "nobody@example.com", MessageID: press, Intent: IntentCancel, TaskID: origin.TaskID, Click: true}
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "nobody@example.com", MessageID: press, Intent: IntentCancel, TaskID: origin.TaskID, Click: true, Viewer: "users/000000000000000000002"}
 	// The press's verdict reaches the adapter after verifySender has posted
 	// whatever it posts, so once it is observed the press's own posts are on
 	// record: there must be none. (Without the skip, the press would post the
@@ -722,6 +724,9 @@ func TestAChatStopPressFromAnUnlistedMemberPostsNoNotice(t *testing.T) {
 	})
 	if posts := r.adapter.postTextsFor(conv); len(posts) != before {
 		t.Fatalf("an unlisted member's press posted %q", posts[before:])
+	}
+	if got := r.adapter.privatePosts(); len(got) != 0 {
+		t.Fatalf("an unlisted member's press told them privately: %+v", got)
 	}
 	// The same member's typed message still gets the notice, once.
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "nobody@example.com", MessageID: "spaces/S1/messages/M2", Text: "hello"}

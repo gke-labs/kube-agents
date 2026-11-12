@@ -92,6 +92,8 @@ def _clean_env(monkeypatch):
         "PROW_JOB_ID",
         "AGENT_TRANSPORT",
         "EVAL_ROLLBACK_LANE",
+        "MODEL_PROVIDER",
+        "EVAL_REASONING_EFFORT",
     ):
         monkeypatch.delenv(name, raising=False)
 

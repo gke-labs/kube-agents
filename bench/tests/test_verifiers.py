@@ -812,6 +812,51 @@ def test_worker_commands_absolute_local_git_is_not_the_bare_name():
     assert v.verify(5.0).status == "pass"
 
 
+def test_tool_called_on_the_workers_grades_zero_calls_on_the_no_worker_calls_entry():
+    """#5371: with the harness's no-worker-calls entry and no tagged entry,
+    a workers-scope check grades zero calls (a required call fails, a
+    forbidden one passes) instead of erroring as unobservable."""
+    from kube_agents_bench import worker_trajectory
+
+    marker = worker_trajectory.no_worker_calls_entry(["t_1"])
+    transcript.set("ok", [{"name": "kanban_create"}, marker], final_message="ok", started_at=1.0)
+    try:
+        required = ToolCalledVerifier(type="tool_called", tool_names=["kanban_complete"], scope="workers").verify(5.0)
+    finally:
+        transcript.clear()
+    assert required.status == "fail", required.reason
+    transcript.set("ok", [{"name": "kanban_create"}], final_message="ok", started_at=1.0)
+    try:
+        unobserved = ToolCalledVerifier(type="tool_called", tool_names=["kanban_complete"], scope="workers").verify(5.0)
+    finally:
+        transcript.clear()
+    assert unobserved.status == "error"
+    # A capture gap beside the entry still leaves the workers unobservable.
+    gap = worker_trajectory.gap_entry(["session store for cluster-a: locked"])
+    transcript.set("ok", [{"name": "kanban_create"}, marker, gap], final_message="ok", started_at=1.0)
+    try:
+        gapped = ToolCalledVerifier(type="tool_called", tool_names=["kanban_complete"], scope="workers").verify(5.0)
+    finally:
+        transcript.clear()
+    assert gapped.status == "error"
+    # A result pattern is not graded beside the entry, on either transport (the scorer sets it aside).
+    transcript.set("ok", [{"name": "kanban_create"}, marker], final_message="ok", started_at=1.0)
+    try:
+        with_result = ToolCalledVerifier(
+            type="tool_called", tool_names=["kanban_complete"], scope="workers", result="done"
+        ).verify(5.0)
+    finally:
+        transcript.clear()
+    assert with_result.status == "error"
+    # The ``all`` scope reads the router's calls too, which the entry does not speak for.
+    transcript.set("ok", [{"name": "kanban_create"}, marker], final_message="ok", started_at=1.0)
+    try:
+        both = ToolCalledVerifier(type="tool_called", tool_names=["kanban_complete"], scope="all").verify(5.0)
+    finally:
+        transcript.clear()
+    assert both.status == "error"
+
+
 def test_worker_commands_missing_required_fails_and_counts():
     _stash_commands(["cat README.md"])
     v = WorkerCommandsVerifier(type="worker_commands", required_patterns=[r"vcs\.py"])
@@ -7077,6 +7122,69 @@ def test_a_rate_limit_is_noted_only_under_the_ci_grading_token_on_github(monkeyp
     assert seen == [(noted, "answered 429")]
 
 
+def test_a_handled_issues_404_does_not_keep_a_later_outage_on_rung_2(minted_token, github):
+    """_resolve falls back from /issues to /pulls on a 404; the 404 is a route."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (404, {"message": "Not Found"})
+    github.routes[_pr_api("pulls")] = (503, {"message": "Service Unavailable"})
+    res = _pr_check().verify(5.0)
+    assert res.status == "error"
+    assert res.reason.startswith(forges.FORGE_UNAVAILABLE_MARKER)
+
+
+def test_an_absent_commits_page_does_not_keep_a_later_outage_on_rung_2(minted_token, github):
+    """_head_push reads a 404 commits page as "dates nothing"; the closed-head
+    listing's outage after it still marks the error."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, _pr_payload())
+    _pr_head_routes(github)
+    github.routes[_commits_of()] = (404, {"message": "Not Found"})
+    github.routes[_closed_from()] = (503, {"message": "Service Unavailable"})
+    res = _pr_check(reuses_spent_branch=True).verify(5.0)
+    assert _commits_of() in [url for url, _ in github.calls]
+    assert res.status == "error"
+    assert res.reason.startswith(forges.FORGE_UNAVAILABLE_MARKER)
+
+
+def _three_pr_reply():
+    return "Opened " + ", ".join(_PR_URL.replace("/7", f"/{n}") for n in (5, 6, 7))
+
+
+def test_a_rejected_candidate_drops_only_its_own_reads(minted_token, github):
+    """#5 is unevaluable on a malformed answer (a plain entry), #6 is rejected
+    on a 404, #7 hits a 503. #6's rejection must not take #5's entry with it,
+    so the error stays plain."""
+    _stash_pr_report(final_message=_three_pr_reply())
+    github.routes[_pr_api(number=5)] = (200, ["not", "an", "object"])
+    github.routes[_pr_api("pulls", number=5)] = (200, ["not", "an", "object"])
+    github.routes[_pr_api(number=7)] = (503, {"message": "Service Unavailable"})
+    res = _pr_check().verify(5.0)
+    assert res.status == "error"
+    assert forges.FORGE_UNAVAILABLE_MARKER not in res.reason
+
+
+def test_a_rejected_404_candidate_does_not_keep_a_later_outage_on_rung_2(minted_token, github):
+    _stash_pr_report(final_message="Opened " + _PR_URL.replace("/7", "/6") + " and " + _PR_URL)
+    github.routes[_pr_api()] = (503, {"message": "Service Unavailable"})
+    res = _pr_check().verify(5.0)
+    assert res.status == "error"
+    assert res.reason.startswith(forges.FORGE_UNAVAILABLE_MARKER)
+
+
+def test_a_handled_404_is_dropped_only_for_its_own_read():
+    """handled() takes the entry of the read just made, and only a plain one."""
+    seen = [(True, "answered 503")]
+    token = verifiers._forge_unavailable.set(seen)
+    try:
+        verifiers._forge_read_handled(404)
+        assert seen == [(True, "answered 503")]
+        seen.append((False, "answered 404"))
+        verifiers._forge_read_handled(404)
+        assert seen == [(True, "answered 503")]
+    finally:
+        verifiers._forge_unavailable.reset(token)
+
+
 def test_the_commit_page_the_head_date_read_is_not_read_again(token, github):
     """`_head_push` already read the whole listing of a one-page proposal to
     date its head; the revision clause reuses it."""
@@ -12723,6 +12831,44 @@ def test_issue_state_an_earlier_candidates_outage_does_not_excuse_a_malformed_an
     else:
         github.routes[_ticket_api(709)] = (200, _ticket() | {"number": 709})
         github.routes[_ticket_comments_api(709)] = (200, {"message": "not a list"})
+    res = _state_check().verify(5.0)
+    assert res.status == "error"
+    assert forges.FORGE_UNAVAILABLE_MARKER not in res.reason
+
+
+# #5346: a read the check handled, or a candidate it rejected, leaves the
+# forge-unavailable decision, so a later outage on the read that errors is
+# marked. A rejection beside a transient read keeps the error plain.
+
+
+def test_ledger_a_rejected_404_candidate_does_not_keep_a_later_outage_on_rung_2(token, github):
+    _stash_report(final_message=f"Ledger: {_LEDGER_URL.replace('/42', '/41')} and {_LEDGER_URL}")
+    github.routes[_api(41)] = (404, {"message": "Not Found"})
+    github.routes[_api()] = (503, {"message": "Service Unavailable"})
+    res = _ledger_check(required_phrases=["debug-binding"]).verify(5.0)
+    assert res.status == "error"
+    assert res.reason.startswith(forges.FORGE_UNAVAILABLE_MARKER)
+
+
+def test_issue_state_a_rejected_candidate_does_not_keep_a_later_outage_on_rung_2(token, gitops_repo, github):
+    _stash_report(final_message=_two_ticket_reply())
+    github.routes[_ticket_api()] = (404, {"message": "Not Found"})
+    github.routes[_ticket_api(709)] = (503, {"message": "Service Unavailable"})
+    res = _state_check().verify(5.0)
+    assert res.status == "error"
+    assert res.reason.startswith(forges.FORGE_UNAVAILABLE_MARKER)
+
+
+def test_issue_state_a_candidate_rejected_beside_a_transient_read_keeps_the_error_plain(
+    token, gitops_repo, github
+):
+    """#708 is rejected on its state while its comment read answered 503: the
+    code cannot tell that rejection from an outage, so its reads stay, and
+    #709's outage does not mark the error."""
+    _stash_report(final_message=_two_ticket_reply())
+    github.routes[_ticket_api()] = (200, _ticket(state="open", labels=("status:in-progress",)))
+    github.routes[_ticket_comments_api()] = (503, {"message": "Service Unavailable"})
+    github.routes[_ticket_api(709)] = (503, {"message": "Service Unavailable"})
     res = _state_check().verify(5.0)
     assert res.status == "error"
     assert forges.FORGE_UNAVAILABLE_MARKER not in res.reason

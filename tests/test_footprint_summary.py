@@ -193,11 +193,12 @@ class FootprintSummaryTest(unittest.TestCase):
         # the figures carry them, the NATS bus's JetStream claim included, and only
         # the session pods are left out.
         self.assertIn("Not counted: the session pods", notes)
-        self.assertIn("40 GiB JetStream claim among them, are in the figures above", notes)
+        self.assertIn("its JetStream claims among them, are in the figures above", notes)
         today_notes, today = self._render(["platformAgent.mode=today"])
         self.assertNotIn("Not counted", today_notes)
-        self.assertEqual(req["persistentVolumeClaims"], today["persistentVolumeClaims"] + 1)
-        self.assertEqual(req["requestsStorage"], today["requestsStorage"] + 40 * _GIB)
+        # One 40 GiB JetStream claim per NATS server, three by default.
+        self.assertEqual(req["persistentVolumeClaims"], today["persistentVolumeClaims"] + 3)
+        self.assertEqual(req["requestsStorage"], today["requestsStorage"] + 3 * 40 * _GIB)
         self.assertGreater(req["pods"], today["pods"])
 
     def test_summary_follows_the_quota_preflight_switch(self) -> None:

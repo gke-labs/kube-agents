@@ -31,9 +31,12 @@ What goes, and what stays:
   that stays still has it as head. A pool repository is a fixture nothing else
   keeps branches in.
 * a file in PLANTED_STACK_FILES on the default branch that carries the stack
-  label (`managed-by: kube-agents-bench` on a line of its own). The one entry
-  is the Kustomize root that bench/tf/prebuilt/kustomize-overlay-declaration
-  plants for obtainability-pdb-kustomize-overlay and removes at its destroy.
+  label (`managed-by: kube-agents-bench` on a line of its own): the Kustomize
+  root that bench/tf/prebuilt/kustomize-overlay-declaration plants for
+  obtainability-pdb-kustomize-overlay, and the four files of the payments
+  HelmRelease directory that bench/tf/prebuilt/context-repository-owns-the-fix
+  plants for remediation-context-repository-owns-the-fix; each stack removes
+  its own at its destroy.
   Two things leave it: a unit killed before that destroy, and a teardown
   that failed (devops-bench logs a teardown error and goes on, and the state
   is the run's own, so nothing applies the destroy again). Then
@@ -95,9 +98,18 @@ CALL_FAULTS = (urllib.error.HTTPError, OSError, http.client.HTTPException)
 # The files a case stack plants on the default branch and that this reset
 # deletes when a killed unit left them, and the label that makes such a file
 # the stack's. bench/tf/prebuilt/kustomize-overlay-declaration/plant.py writes
-# the same path and label; scripts/test_ci_eval_agent_pulls_reset.py holds
-# them equal.
-PLANTED_STACK_FILES = ("clusters/seeded-a/seeded-reliability/kustomization.yaml",)
+# the first path, bench/tf/prebuilt/context-repository-owns-the-fix/plant.py
+# the four under the pool's host cluster directory, each with the label;
+# scripts/test_ci_eval_agent_pulls_reset.py holds them equal.
+POOL_HOST_CLUSTER = "platform-agent-host"
+CONTEXT_FIX_DIRECTORY = f"clusters/{POOL_HOST_CLUSTER}/demo-shop/payments"
+PLANTED_STACK_FILES = (
+    "clusters/seeded-a/seeded-reliability/kustomization.yaml",
+    f"{CONTEXT_FIX_DIRECTORY}/source.yaml",
+    f"{CONTEXT_FIX_DIRECTORY}/release.yaml",
+    f"{CONTEXT_FIX_DIRECTORY}/values.enc.yaml",
+    f"{CONTEXT_FIX_DIRECTORY}/legacy-env.yaml",
+)
 STACK_LABEL_KEY = "managed-by"
 STACK_LABEL_VALUE = "kube-agents-bench"
 STACK_FILE_DELETE_MESSAGE = "test(bench): remove {path}, which an eval stack left behind (reset {scope})"
