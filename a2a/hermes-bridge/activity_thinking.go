@@ -52,16 +52,16 @@ var (
 	// answer (2026-10-28T03:56:05Z-03:59:15Z) puts where a host would be.
 	timestampHostPattern    = regexp.MustCompile(`^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt ][0-9]{2}$`)
 	cliUserPassPattern      = regexp.MustCompile(`(?i)(\b(?:curl|wget|mysql|mysqldump|mariadb|mysqladmin|(?:docker|helm)\s+login)\b[^\r\n]*?\s(?:-u|--user)(?:=|[ \t]+)?)(["']?)([^"'\s:]+):([^"'\s]+)(["']?)`)
-	cliAttachedPassPattern  = regexp.MustCompile(`(?i)(\b(?:mysql|mysqldump|mariadb|mysqladmin|sshpass|mongosh|mongo)\b[^\r\n]*?\s-p)("[^"\r\n]*"|'[^'\r\n]*'|[^\s"';|&]+)`)
-	cliSpacedPassPattern    = regexp.MustCompile(`(?i)(\b(?:mysql|mysqldump|mariadb|mysqladmin|sshpass|mongosh|mongo|redis-cli|az\s+login|(?:docker|helm)\s+login)\b[^\r\n]*?\s-[pa][ \t]+)("[^"\r\n]*"|'[^'\r\n]*'|[^-\s"';|&][^\s"';|&]*)`)
-	cliLDAPPassPattern      = regexp.MustCompile(`(?i)(\bldap(?:search|modify|add|delete|whoami|passwd|compare|exop|modrdn)\b[^\r\n]*?\s-w[ \t]+)("[^"\r\n]*"|'[^'\r\n]*'|[^-\s"';|&][^\s"';|&]*)`)
+	cliAttachedPassPattern  = regexp.MustCompile(`(?i)(\b(?:mysql|mysqldump|mariadb|mysqladmin|sshpass|mongosh|mongo)\b[^\r\n]*?\s-p)("[^"\r\n]*"|'[^'\r\n]*'|[^\s"';|&]+?)(\x60?(?:[\s"';|&]|$))`)
+	cliSpacedPassPattern    = regexp.MustCompile(`(?i)(\b(?:mysql|mysqldump|mariadb|mysqladmin|sshpass|mongosh|mongo|redis-cli|az\s+login|(?:docker|helm)\s+login)\b[^\r\n]*?\s-[pa][ \t]+)("[^"\r\n]*"|'[^'\r\n]*'|[^-\s"';|&][^\s"';|&]*?)(\x60?(?:[\s"';|&]|$))`)
+	cliLDAPPassPattern      = regexp.MustCompile(`(?i)(\bldap(?:search|modify|add|delete|whoami|passwd|compare|exop|modrdn)\b[^\r\n]*?\s-w[ \t]+)("[^"\r\n]*"|'[^'\r\n]*'|[^-\s"';|&][^\s"';|&]*?)(\x60?(?:[\s"';|&]|$))`)
 	cliPassphraseArgPattern = regexp.MustCompile(`(?i)(\s-pass(?:in|out|word)?[ \t]+pass:)([^\s"';|&]+)`)
 	// A flag's unquoted value never starts with a dash, so a flag with no
 	// value of its own does not take the next flag as its value and hide
 	// that flag's; a value after = or : that does start with one is read
 	// by the Dashed patterns, which take no spaced value.
-	cliLongSecretFlagPattern       = regexp.MustCompile(`(--([A-Za-z0-9_.-]+)(=|[ \t]+))("[^"\r\n]*"|'[^'\r\n]*'|[^-\s"';|&][^\s"';|&]*)`)
-	cliLongSecretFlagDashedPattern = regexp.MustCompile(`(--([A-Za-z0-9_.-]+)(=))(-[^\s"';|&]*)`)
+	cliLongSecretFlagPattern       = regexp.MustCompile(`(--([A-Za-z0-9_.-]+)(=|[ \t]+))("[^"\r\n]*"|'[^'\r\n]*'|[^-\s"';|&][^\s"';|&]*?)(\x60?(?:[\s"';|&]|$))`)
+	cliLongSecretFlagDashedPattern = regexp.MustCompile(`(--([A-Za-z0-9_.-]+)(=))(-[^\s"';|&]*?)(\x60?(?:[\s"';|&]|$))`)
 	// A single-dash long flag (-password x, -Password x, -token=x), the
 	// spelling Go's flag package, Java tools and PowerShell take.
 	cliSingleDashSecretFlagPattern       = regexp.MustCompile(`(?:^|[\s"'(\[,])(-([A-Za-z][A-Za-z0-9_.-]{2,})(=|:|[ \t]+))("[^"\r\n]*"|'[^'\r\n]*'|[^-\s"';|&][^\s"';|&]*)`)

@@ -587,3 +587,25 @@ func TestScrubInlineSecretsValuelessFlagBeforeACredentialFlag(t *testing.T) {
 		}
 	}
 }
+
+// A credential flag inside a markdown code span keeps the span's closing
+// backtick outside the redaction, so the answer still renders; a backtick
+// inside the value is part of the value and is redacted with it.
+func TestScrubInlineSecretsKeepsACodeSpansClosingBacktick(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"Connect with `psql --password=synthetic-pass-0001` once Ready.", "Connect with `psql --password=[redacted]` once Ready."},
+		{"`app --token synthetic-token-0001`", "`app --token [redacted]`"},
+		{"`app --password=-synthetic-pass-0001`", "`app --password=[redacted]`"},
+		{"run `mysql -ufoo -psynthetic-pass-0001` then", "run `mysql -ufoo -p[redacted]` then"},
+		{"`mysql -h db -p synthetic-pass-0001`", "`mysql -h db -p [redacted]`"},
+		{"`ldapsearch -x -w synthetic-pass-0001`", "`ldapsearch -x -w [redacted]`"},
+		// Not a closing backtick: it's inside the value.
+		{"app --password=synthetic`pass-0001 x", "app --password=[redacted] x"},
+		{"run `mysql -ufoo -psynth`etic9x` then", "run `mysql -ufoo -p[redacted]` then"},
+	}
+	for _, tc := range cases {
+		if got := scrubInlineSecrets(tc.in); got != tc.want {
+			t.Errorf("scrubInlineSecrets(%q)\n got %q\nwant %q", tc.in, got, tc.want)
+		}
+	}
+}
