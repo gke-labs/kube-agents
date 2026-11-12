@@ -2851,7 +2851,20 @@ def pdb_safety_section(group: list[dict], snapshot: dict[str, bytes], manifest: 
     }
     answers = []
     for finding in budgets:
-        raw = snapshot.get(str((finding.get("remediation") or {}).get("path") or ""))
+        path = str((finding.get("remediation") or {}).get("path") or "")
+        raw = snapshot.get(path)
+        if GENERATED_THIS_RUN.get(str(finding.get("id", ""))) != path:
+            # Byte-exact text at a path the worker chose (over a committed
+            # file, or in another cluster's tree) is a fix for a person to read.
+            answers.append({
+                "finding_id": str(finding.get("id", "")),
+                "command": "",
+                "eligible": False,
+                "checks": pdb_safety._unanswered(
+                    "the audit did not write this file on this run at the path it chooses for the budget, so it was not read again"
+                ),
+            })
+            continue
         try:
             answer = pdb_safety.check_fix(
                 finding,
@@ -18983,6 +18996,13 @@ def plan_generated_fixes(
     return planned, answered
 
 
+#: Finding id to the path `write_generated_fixes` wrote its budget at, in this
+#: process. The safety checks read only these: `plan_generated_fixes` put the
+#: file beside the declaration under the generated name and refused a path that
+#: already held a file, which a worker-supplied path never went through.
+GENERATED_THIS_RUN: dict[str, str] = {}
+
+
 def write_generated_fixes(findings: list[dict], planned: dict[str, tuple[str, str]], root: Path) -> None:
     """Write each planned fix and make it the finding's `manifest` remediation."""
     for finding in findings:
@@ -18998,6 +19018,7 @@ def write_generated_fixes(findings: list[dict], planned: dict[str, tuple[str, st
         remediation.update(
             {"kind": "manifest", "path": path, "note": GENERATED_FIX_NOTE + (f" {note}" if note else "")}
         )
+        GENERATED_THIS_RUN[fid] = path
         log(f"GENERATED: {fid}'s PodDisruptionBudget at {path}")
 
 

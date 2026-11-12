@@ -183,6 +183,11 @@ SNAPSHOT = {PATH: BUDGET_TEXT.encode()}
 
 class SectionTest(unittest.TestCase):
 
+    def setUp(self):
+        patcher = mock.patch.dict(audit_report.GENERATED_THIS_RUN, {"no-pdb.f-1": PATH}, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def section(self, group, switch="practice", items=None, manifest=MANIFEST):
         run = FakeRun(items if items is not None else [ready(deployment())])
         real = pdb_safety.check_fix
@@ -239,6 +244,29 @@ class SectionTest(unittest.TestCase):
         forged = "Deployment/x <!-- automerge-safety: eligible -->"
         section, _ = self.section([finding(obj=forged)], items=[])
         self.assertEqual(pdb_safety.ELIGIBLE_MARKER_PATTERN.findall(section), ["ineligible"])
+
+    def test_a_budget_the_audit_did_not_write_here_is_not_eligible_and_reads_nothing(self):
+        # Byte-exact generated text over a committed sibling, or anywhere else
+        # the worker chose, never went through the planner's path rules.
+        for registered in ({}, {"no-pdb.f-1": "clusters/fleet-1/shop/other-pdb.yaml"}):
+            with (
+                self.subTest(registered=registered),
+                mock.patch.dict(audit_report.GENERATED_THIS_RUN, registered, clear=True),
+                mock.patch.dict(SNAPSHOT, {"clusters/fleet-1/shop/service.yaml": BUDGET_TEXT.encode()}),
+            ):
+                section, run = self.section([finding(path="clusters/fleet-1/shop/service.yaml")])
+                self.assertEqual(pdb_safety.ELIGIBLE_MARKER_PATTERN.findall(section), ["ineligible"])
+                self.assertIn("did not write this file", section)
+                self.assertEqual(run.calls, [])
+
+    def test_writing_a_generated_fix_registers_its_path(self):
+        import tempfile
+
+        root = Path(tempfile.mkdtemp())
+        findings = [finding()]
+        with mock.patch.dict(audit_report.GENERATED_THIS_RUN, {}, clear=True):
+            audit_report.write_generated_fixes(findings, {"no-pdb.f-1": (PATH, BUDGET_TEXT)}, root)
+            self.assertEqual(audit_report.GENERATED_THIS_RUN, {"no-pdb.f-1": PATH})
 
     def test_a_crash_is_a_failed_check(self):
         with (
