@@ -1,5 +1,5 @@
 {
-  "version": "9671c501d2681112",
+  "version": "ebc80d1ecae36b93",
   "shard": 0,
   "shards": 1,
   "identities": [
@@ -105,6 +105,30 @@
         "subscribe": [
           "a2a.cap.verify.*",
           "_INBOX.verifier.>"
+        ]
+      }
+    },
+    {
+      "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-dispatcher",
+      "user": "dispatcher",
+      "account": "TRUSTED",
+      "grants": {
+        "publish": [
+          "$KV.PROFILE_LEASES.>",
+          "$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
+          "$JS.API.DIRECT.GET.KV_PROFILE_LEASES.>",
+          "$JS.API.CONSUMER.CREATE.KV_PROFILE_LEASES.>",
+          "$JS.API.CONSUMER.DELETE.KV_PROFILE_LEASES.*",
+          "$JS.FC.KV_PROFILE_LEASES.>",
+          "a2a.dispatch.*.*.*",
+          "a2a.cap.verify.dispatcher",
+          "_INBOX.dispatcher.>"
+        ],
+        "subscribe": [
+          "a2a.dispatch.*.*.*.accept",
+          "a2a.dispatch.*.*.*.lease",
+          "a2a.cap.reply.dispatcher.>",
+          "_INBOX.dispatcher.>"
         ]
       }
     }

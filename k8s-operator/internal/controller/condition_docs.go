@@ -60,8 +60,13 @@ var platformAgentConditionDocs = []conditionDoc{
 	},
 	{
 		Type:    dispatcherJobModeCondition,
-		Written: "Under `mode: next`, while the operator runs the profile dispatcher (`A2A_DISPATCHER_IMAGE`) with the chart's `A2A_DISPATCHER_JOB_POLICY` signal set, from the first pass that reaches the dispatcher",
+		Written: "Under `mode: next`, while the operator runs the profile dispatcher (on by default; `operator.profileDispatcher.enabled`) with the chart's `A2A_DISPATCHER_JOB_POLICY` signal set, from the first pass that reaches the dispatcher",
 		Meaning: "Whether the dispatcher runs unattended profile tasks as Jobs. `Reason: InPlace` (`True`), `PolicyMissing`, `NamespaceNotSelected`, `NamespaceNotReady`, `ForeignJobTemplate`, or `GrantFailed`; [What `DispatcherJobMode` reports](#what-dispatcherjobmode-reports) has each.",
+	},
+	{
+		Type:    dispatcherCeilingCondition,
+		Written: "Under `mode: next`, while the profile dispatcher is switched on",
+		Meaning: "How the dispatcher's identity-map entry and its config compare with what one shard and one ConfigMap can hold. `WithinBudget` (`True`); `NearBudget` (`True`), past four fifths of either, with a Warning event; `ProfilesRefused` (`False`), with a Warning event: the newest profiles aren't bound and the dispatcher serves the rest; `OverBudget` (`False`), with a Warning event, only from draining profiles: no dispatcher until their drains run out. About 200 profiles that allow `unattended` under Job mode, about 650 at two tiers otherwise.",
 	},
 	{
 		Type:    a2aIdentityMapAppliedConditionType,
