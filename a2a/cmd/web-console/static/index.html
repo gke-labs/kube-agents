@@ -3091,8 +3091,9 @@
           >
             <input type="checkbox" id="feedback-include-context" checked />
             Attach environment context: versions, install and upgrade dates,
-            node/namespace/workload counts, skills seen. No names (cluster,
-            project, namespace, workload, user) are included.
+            node/namespace/workload counts, skills seen, and the agent's usage
+            counters, top tools and token totals from the PlatformAgent status.
+            No names (cluster, project, namespace, workload, user) are included.
           </label>
           <div
             class="skill-card"
@@ -6324,7 +6325,12 @@
         }
 
         const u = data.usage || {};
-        if (!u.replicas_read) {
+        // The headline is the operator's totals since install when the
+        // PlatformAgent status carries them (source "platformagent"), which
+        // survive a LiteLLM restart; else the replicas' counters since each
+        // last restarted (source "litellm").
+        const sinceInstall = u.source === "platformagent";
+        if (!sinceInstall && !u.replicas_read) {
           setText("ins-tokens", "Not available", u.error);
           setText("ins-tokens-split", u.error || "", u.error);
           setText("ins-cost", "Not available", u.error);
@@ -6338,12 +6344,19 @@
           setText(
             "ins-cost",
             formatUSD(u.spend_usd),
-            "Estimated by LiteLLM from its price table",
+            sinceInstall
+              ? "Estimated by LiteLLM from its price table; kept across its restarts by the operator"
+              : "Estimated by LiteLLM from its price table",
           );
           const partial = u.replicas_read < u.replicas_found;
+          const replicas = u.replicas_found
+            ? `${u.replicas_read} of ${u.replicas_found} replicas`
+            : "no replica read";
           const note = setText(
             "ins-usage-note",
-            `Since LiteLLM last restarted · ${u.replicas_read} of ${u.replicas_found} replicas`,
+            sinceInstall
+              ? `Since install (PlatformAgent status) · live: ${replicas}`
+              : `Since LiteLLM last restarted · ${replicas}`,
             u.error,
           );
           note.classList.toggle("warn", partial);
@@ -8915,7 +8928,7 @@
               : "?";
 
         const lines = [
-          "## Environment (no identifying names; counts, versions and dates only)",
+          "## Environment (no identifying names; counts, versions, dates and usage counters only)",
           "",
         ];
         lines.push("**kube-agents**");
@@ -8992,6 +9005,23 @@
         const missing = Object.keys(unavailable);
         if (missing.length)
           lines.push(`- Not readable by the console: ${missing.join(", ")}`);
+        // The PlatformAgent's status.usage block as GET /api/environment
+        // renders it: the same usage, tools and performance lines as
+        // "/feedback summary" in chat. Counters, the broker's tool vocabulary
+        // and totals; the server copies nothing else off the status.
+        if (
+          env.usage &&
+          Array.isArray(env.usage.lines) &&
+          env.usage.lines.length
+        ) {
+          lines.push("");
+          lines.push(
+            "**Agent usage** (PlatformAgent status: counters, tool vocabulary and totals; no names)",
+          );
+          lines.push("```");
+          lines.push(...env.usage.lines);
+          lines.push("```");
+        }
         return lines.join("\n");
       }
 
@@ -9018,7 +9048,18 @@
       function usageStatsMarkdown() {
         const u = (lastInsights && lastInsights.usage) || {};
         const lines = ["## Usage statistics", ""];
-        if (u.replicas_read) {
+        if (u.source === "platformagent") {
+          lines.push(
+            `- Tokens since install (PlatformAgent status): ${formatCount(u.total_tokens)} (${formatCount(u.input_tokens)} in / ${formatCount(u.output_tokens)} out)`,
+          );
+          lines.push(
+            `- Estimated spend since install (LiteLLM price table): ${formatUSD(u.spend_usd)}`,
+          );
+          if (u.live && u.replicas_read)
+            lines.push(
+              `- Tokens since LiteLLM last restarted: ${formatCount(u.live.total_tokens)} (${formatCount(u.live.input_tokens)} in / ${formatCount(u.live.output_tokens)} out) across ${u.replicas_read} of ${u.replicas_found} replicas`,
+            );
+        } else if (u.replicas_read) {
           lines.push(
             `- Tokens since LiteLLM last restarted: ${formatCount(u.total_tokens)} (${formatCount(u.input_tokens)} in / ${formatCount(u.output_tokens)} out) across ${u.replicas_read} of ${u.replicas_found} replicas`,
           );

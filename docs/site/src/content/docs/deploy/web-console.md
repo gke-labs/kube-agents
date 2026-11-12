@@ -55,7 +55,7 @@ To run a specific runbook, type `$` in the message box for autocomplete or open 
 
 From the header bar, you can also test and switch the active model or reasoning level against the cluster's inference gateway. Saving a model records `kubeagents.x-k8s.io/active-model`, `active-model-target`, and `reasoning-level` on the `PlatformAgent` resource. It also gives you a Helm values snippet so the choice persists across chart upgrades.
 
-Beside the model selector, the banner shows token and cost counters summed across reachable LiteLLM replicas since LiteLLM last restarted. Treat the cost figure as LiteLLM's price-table estimate rather than your cloud bill.
+Beside the model selector, the banner shows token and cost totals since install, read from the counters the operator keeps on the `PlatformAgent` status across LiteLLM restarts; the note under them says so and how many LiteLLM replicas answered. When the status carries no totals yet, the banner falls back to the counters summed across reachable LiteLLM replicas since each last restarted, and the note says that instead. Treat the cost figure as LiteLLM's price-table estimate rather than your cloud bill.
 
 ## Connect repositories and open pull requests
 
@@ -75,7 +75,7 @@ Opening the release badge displays copyable `./upgrade.sh` and `helm upgrade` co
 
 ![Web console feedback modal with inference gateway draft polish](../../../assets/web-console/web-console-feedback.png)
 
-Select **Feedback** or **Bugs** to draft a bug report, feature request, or question for `gke-labs/kube-agents`. You can attach anonymized environment counts (versions, rollout dates, and counts of nodes, namespaces, workloads, and pods, with no cluster, project, or workload names). Select **Polish** to tighten your draft through the cluster's own inference gateway before opening a pre-filled GitHub issue.
+Select **Feedback** or **Bugs** to draft a bug report, feature request, or question for `gke-labs/kube-agents`. You can attach anonymized environment counts (versions, rollout dates, and counts of nodes, namespaces, workloads, and pods) with no cluster, project, or workload names. The attachment also carries the agent's usage block from the `PlatformAgent` status, the same block the chat's `/feedback summary` prints: usage counters, the top tools by tool name, and token and spend totals since install. Select **Polish** to tighten your draft through the cluster's own inference gateway before opening a pre-filled GitHub issue.
 
 ## Access control and privacy
 
