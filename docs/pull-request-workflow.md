@@ -867,7 +867,10 @@ only the pull request's own runs: a head commit that is also a commit on `main` 
 carries that line's push runs too, and a red one of those is named and left alone. It reads the best state per check name, so a run a newer success superseded is not re-run, except
 under a check name the base branch requires: GitHub still counts that red run and keeps the pull request out
 of the queue, so it is re-run once no run of its workflow on the pull request is still going, one run per workflow per `/retest`. A run cancelled while still queued made no check run and is never
-re-run. GitHub's own re-run button needs Write access, which most
+re-run. A run still `queued` an hour after it started, which is what a run GitHub lost during an
+Actions incident looks like, is cancelled (force-cancelled if a cancel does not take) and re-run
+whole; when a newer run of its workflow on the pull request carries its checks, it is cancelled
+and not re-run. That clears the checks without the push that would restart the smoke test. GitHub's own re-run button needs Write access, which most
 collaborators here do not hold. The comment gets 👀 when something was re-run and 😕 when nothing
 was, with the reason on the workflow run (a `Retest Actions Checks` run in the Actions tab; it is
 red, carrying GitHub's message, when GitHub refused every re-run, which is what a token that cannot
