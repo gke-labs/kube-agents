@@ -153,11 +153,13 @@ func (g *Gateway) applyTaskMark(rec *SessionRecord, taskID string, next MarkStat
 // executor's heartbeats mark with too) on the ask a task just accepted, so
 // the reaction is there before any model call, as under today, rather than
 // waiting for the executor's first heartbeat, which a fast turn never sends.
-// Only an ask's own first task draws it: a chain continued from an earlier ask
-// (a click, an answer) keeps the mark it carried, and a task with no ask
-// message draws nothing. The executor's marks and the terminal take over from
-// there. It reports whether anything was drawn; the caller holds the session
-// lock and writes the record.
+// Only an ask's own first task draws it (startTaskWith calls it for a task
+// with no role that is neither a click nor an answer): a task whose ask
+// already carries a mark keeps it, and a task with no ask message draws
+// nothing. Every route's asks get it, the session route's and a profile's
+// included, whose executors mark nothing of their own. The executor's marks
+// and the terminal take over from there. It reports whether anything was
+// drawn; the caller holds the session lock.
 func (g *Gateway) drawArrivalMark(rec *SessionRecord, taskID, text string) bool {
 	i := rec.markingRootIndex(taskID)
 	if i < 0 || rec.Tasks[i].Mark != nil {
