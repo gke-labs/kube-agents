@@ -130,7 +130,7 @@ func TestTheBusRendersAClusterByDefaultAndOneServerOnRequest(t *testing.T) {
 			// its clients, and lame duck there only delays its exit.
 			if tc.wantCluster {
 				if c.Lifecycle == nil || c.Lifecycle.PreStop == nil || c.Lifecycle.PreStop.Exec == nil ||
-					!slices.Equal(c.Lifecycle.PreStop.Exec.Command, []string{"nats-server", "--signal", "ldm=" + a2aNATSPidFile}) {
+					!slices.Equal(c.Lifecycle.PreStop.Exec.Command, []string{"nats-server", "--signal", "ldm=" + a2aNATSPIDFile}) {
 					t.Errorf("preStop is not the lame-duck signal: %+v", c.Lifecycle)
 				}
 				if pod.TerminationGracePeriodSeconds == nil || *pod.TerminationGracePeriodSeconds <= a2aNATSLameDuckSeconds {
@@ -152,10 +152,13 @@ func TestTheBusRendersAClusterByDefaultAndOneServerOnRequest(t *testing.T) {
 			if !strings.Contains(conf, "server_name: $POD_NAME") {
 				t.Error("nats.conf lacks server_name: $POD_NAME")
 			}
-			for _, line := range []string{`pid_file: "` + a2aNATSPidFile + `"`, `lame_duck_duration: "30s"`} {
-				if got := strings.Contains(conf, line); got != tc.wantCluster {
-					t.Errorf("nats.conf has %q = %v, want %v", line, got, tc.wantCluster)
-				}
+			// The pid file is every bus's: the config reloader reads it, and
+			// on a cluster the preStop lame-duck signal does too.
+			if pid := `pid_file: "` + a2aNATSPIDFile + `"`; !strings.Contains(conf, pid) {
+				t.Errorf("nats.conf lacks %q", pid)
+			}
+			if got := strings.Contains(conf, `lame_duck_duration: "30s"`); got != tc.wantCluster {
+				t.Errorf("nats.conf has lame_duck_duration = %v, want %v", got, tc.wantCluster)
 			}
 
 			job := buildA2AProvisionJob(agent)
@@ -411,7 +414,7 @@ func TestTheRenderedClusterFormsOverVerifiedRoutes(t *testing.T) {
 	start := func(i int, tlsDir string) *natsserver.Server {
 		t.Helper()
 		c := strings.Replace(conf, "server_name: $POD_NAME", "server_name: a2a-test-nats-"+strconv.Itoa(i), 1)
-		c = strings.Replace(c, `pid_file: "`+a2aNATSPidFile+`"`, `pid_file: "`+filepath.Join(t.TempDir(), "pid")+`"`, 1)
+		c = strings.Replace(c, `pid_file: "`+a2aNATSPIDFile+`"`, `pid_file: "`+filepath.Join(t.TempDir(), "pid")+`"`, 1)
 		c = strings.Replace(c, routeHost, "localhost:"+strconv.Itoa(ports[0]), 1)
 		c = strings.Replace(c, "port: "+strconv.Itoa(a2aNATSRoutePort), "port: "+strconv.Itoa(ports[i]), 1)
 		if tlsDir != "" {
@@ -1187,6 +1190,64 @@ func TestALoneClaimKeepsTheRecordedServerCount(t *testing.T) {
 	}
 }
 
+// With WhenScaled Retain, a single server scaled by hand to 3 keeps claims 1
+// and 2 after the scale is reverted. If the StatefulSet then goes, the record
+// still holds the bus at one server: read from the claims alone it would come
+// back as a cluster on server 0's standalone store, past the conversion gate.
+// With no claims left there is no bus, and the field (or the default) decides.
+func TestStrayClaimsDoNotOutvoteTheRecordedServerCount(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		recorded int32
+		claims   []int
+		spec     *int
+		want     int32
+	}{
+		{"one server, claims 0-2 from a hand scale", 1, []int{0, 1, 2}, nil, 1},
+		{"one server, claims 0-1 from a hand scale", 1, []int{0, 1}, nil, 1},
+		{"one server, claims 0-2, field asks 3", 1, []int{0, 1, 2}, ptr.To(3), 1},
+		{"three servers, claims 0-2", 3, []int{0, 1, 2}, nil, 3},
+		{"no record, claims 0-2", 0, []int{0, 1, 2}, nil, 3},
+		{"no record, claims 0-1", 0, []int{0, 1}, nil, 3},
+		{"one server recorded, no claims: a new bus", 1, nil, nil, 3},
+		{"one server recorded, no claims, field asks 1", 1, nil, ptr.To(1), 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := a2aTestAgent()
+			agent.Status.BusReplicas = tc.recorded
+			if tc.spec != nil {
+				agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: tc.spec}}
+			}
+			objs := []client.Object{agent}
+			labels := buildA2ANATSStatefulSet(agent, "h").Spec.VolumeClaimTemplates[0].Labels
+			for _, o := range tc.claims {
+				objs = append(objs, &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+					Name: a2aNATSDataClaimName(agent, o), Namespace: agent.Namespace, Labels: labels,
+				}})
+			}
+			rec := record.NewFakeRecorder(8)
+			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).Build(), Scheme: setupScheme(), Recorder: rec}
+			converting, err := r.resolveA2ABusReplicas(context.Background(), agent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if agent.Status.BusReplicas != tc.want || converting {
+				t.Errorf("status.busReplicas = %d converting = %v, want %d and no conversion", agent.Status.BusReplicas, converting, tc.want)
+			}
+			if tc.spec != nil && *tc.spec != int(tc.want) {
+				select {
+				case ev := <-rec.Events:
+					if !strings.Contains(ev, a2aBusConversionRefusedReason) {
+						t.Errorf("event %q, want the refusal", ev)
+					}
+				default:
+					t.Errorf("a field asking %d of a %d-server bus was not refused", *tc.spec, tc.want)
+				}
+			}
+		})
+	}
+}
+
 // Pods are not watched, so the short server's note follows its pod only if a
 // short bus requeues on a provisioned, Ready pass; and the note skips a pod
 // on its way out, which its successor replaces.
@@ -1575,5 +1636,54 @@ func TestABusScaledByHandKeepsItsRecordedCount(t *testing.T) {
 				t.Errorf("status.busReplicas %d, rendered %d; want %d", agent.Status.BusReplicas, a2aNATSReplicas(agent), want)
 			}
 		})
+	}
+}
+
+// a2aSingleServerTestAgent is a2aTestAgent with a one-server bus: the in-place
+// reload is a single server's, and a cluster rolls instead.
+func a2aSingleServerTestAgent() *agentv1alpha1.PlatformAgent {
+	agent := a2aTestAgent()
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(1)}}
+	return agent
+}
+
+// A single server reloads a profile's deny in place, so its pod template's
+// hash leaves the profiles out. A cluster's hash carries them, so a profile
+// change rolls the servers one at a time, and the reload plan stands aside:
+// one config_load_time read through the Service can't confirm that every
+// server reloaded, and the reload's fallback restarts one pod.
+func TestAClusterRollsOntoAProfileChangeInsteadOfReloading(t *testing.T) {
+	creds := a2aFullCreds("a", "1")
+	keys := a2aTestCalloutKeys(t)
+	single, cluster := a2aSingleServerTestAgent(), a2aTestAgent()
+	if a2aNATSReplicas(cluster) != 3 {
+		t.Fatalf("the default test agent runs %d servers, want 3", a2aNATSReplicas(cluster))
+	}
+	profiles := []string{"tse"}
+	if a2aConfigRolloutHash(single, creds, keys, "s", nil) != a2aConfigRolloutHash(single, creds, keys, "s", profiles) {
+		t.Error("a single server's hash moved with a profile; it should reload instead")
+	}
+	if a2aConfigRolloutHash(cluster, creds, keys, "s", nil) == a2aConfigRolloutHash(cluster, creds, keys, "s", profiles) {
+		t.Error("a cluster's hash did not move with a profile; it would not roll onto the new deny")
+	}
+
+	sts := buildA2ANATSStatefulSet(cluster, "h1")
+	live := buildA2ANATSConfigSecret(cluster, creds, keys, nil)
+	r := &PlatformAgentReconciler{
+		Client:   fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(cluster, sts, live).Build(),
+		Scheme:   setupScheme(),
+		Recorder: record.NewFakeRecorder(8),
+		busConfigLoadTime: func(context.Context, *agentv1alpha1.PlatformAgent) (string, error) {
+			t.Error("a cluster's reload plan read config_load_time")
+			return "", nil
+		},
+	}
+	desired := buildA2ANATSConfigSecret(cluster, creds, keys, profiles)
+	plan, err := r.planA2ABusReload(context.Background(), cluster, desired, sts.DeepCopy(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan != (a2aBusReload{}) || desired.Annotations[a2aBusReloadRequestedAnnotation] != "" {
+		t.Errorf("a cluster's reload plan = %+v, annotations %v; want nothing tracked", plan, desired.Annotations)
 	}
 }

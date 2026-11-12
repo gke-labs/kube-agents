@@ -203,14 +203,15 @@ The rules that keep this safe:
   isn't saved. `reasoning_content` isn't saved at all: the client never sends it back, so no later
   key needs it. Thinking blocks are kept, since a client that sends them back keys on them.
 - **An answer that repeats a number we swapped isn't saved.** Some values are swapped in the
-  request but can't safely be put back in an answer: bare numbers like a `pid`, a row `id`,
-  `resourceVersion` or `generation`, and epoch timestamps, which become an unnumbered
+  request but can't safely be put back in an answer: bare numbers like a `pid`, a row `id`, a
+  kanban `comment_id`, `resourceVersion` or `generation`, and epoch timestamps, which become an unnumbered
   how-far-from-now time token. If the model's answer repeats one of those values (say it answers
   `kill 4821` after reading `pid 4821`), a later run would get the old number back. So the proxy checks each answer before
   saving it, and if it repeats any of those values, it doesn't save it. That request just goes to
   the model next time, which is always safe. A short swapped number (under 4 digits, like
-  `generation: 1` or a kanban `run_id: 190`) only counts as repeated next to its key
-  (`generation=1`, "the run_id is 190"): the dev-install dry run showed that counting any bare `1`
+  `generation: 1` or a kanban `run_id: 190`) only counts as repeated next to one of those keys
+  (`generation=1`, "the run_id is 190"), and a swapped `comment_id` next to the word "comment" too:
+  the dev-install dry run showed that counting any bare `1`
   (`2>&1`, "revision 1") marked about one answer in seven unsaveable.
 - **Hermes' recent-work digest is dropped from the key.** Every card view ends with
   `## Recent work by @<assignee>`, the assignee's last five runs on other cards, so the first
@@ -266,7 +267,8 @@ Classes the prototype maps: UUID, Hermes session id, ISO timestamp, kanban task 
 inject message id, GKE node name, pod name with ReplicaSet hash, IP, `pid`/`run_id`/numeric `id`/
 `resourceVersion`/`generation`, scratch file `_<epoch>_<pid>` suffixes, and ages; the eval pool
 project, repository commits, the declared-intent clone directory and GKE operation IDs came later,
-from the Nov 7 shadow data. Epoch seconds
+from the Nov 7 shadow data, and the kanban `comment_id` (a row id counting every comment on the
+install's board) from the Nov 10 replay-lane trial. Epoch seconds
 become an unnumbered how-far-from-now time token rather than a numbered placeholder, because two
 events in one second would otherwise shift every later number. The measurements found two gaps,
 `ls -l` dates (`Nov  2 04:13`) and Hermes' terminal-output cache file suffixes (`…-89b0.log`); the

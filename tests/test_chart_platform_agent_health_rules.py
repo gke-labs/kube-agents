@@ -168,6 +168,41 @@ class HealthRulesRenderTest(unittest.TestCase):
         for job in jobs:
             self.assertIn(job, expr, f"the scrape alert does not watch {job}")
 
+    def test_the_scrape_alert_watches_the_exec_tier_only_while_it_renders(self):
+        exec_set = ["--set", "platformAgent.deployment.credentialProxy.exec.replicas=2"]
+        for extra, watched in (([], False), (exec_set, True)):
+            docs = _render(*_ON, *extra)
+            expr = _alerts(_rules(docs)[0])[_SCRAPE_ALERT]["expr"]
+            agent = next(d for d in docs if d.get("kind") == "PlatformAgent")["metadata"]["name"]
+            job = f"{agent}-credential-proxy-exec-tier-monitoring"
+            rendered = any(d.get("kind") == "PodMonitoring" and d["metadata"]["name"] == job for d in docs)
+            self.assertEqual(rendered, watched, f"exec PodMonitoring rendered={rendered} with {extra}")
+            self.assertEqual(job in expr, watched, f"scrape alert watches the exec tier={job in expr} with {extra}")
+
+    def test_the_scrape_alert_watches_the_nats_exporter_only_where_it_runs(self):
+        # The operator omits the exporter sidecar when A2A_NATS_IMAGE is set
+        # and A2A_NATS_EXPORTER_IMAGE is not (a2aNATSExporterOmitted). There
+        # the scrape would only ever read down, so neither the PodMonitoring
+        # nor the alert's job renders; everywhere else both do, so a hung or
+        # dead exporter fires the alert.
+        image = ["--set", "operator.extraEnv[0].name=A2A_NATS_IMAGE", "--set", "operator.extraEnv[0].value=mirror/nats:2"]
+        exporter = ["--set", "operator.extraEnv[1].name=A2A_NATS_EXPORTER_IMAGE", "--set", "operator.extraEnv[1].value=mirror/exporter:0.20.3"]
+        empty = ["--set", "operator.extraEnv[0].name=A2A_NATS_IMAGE", "--set-string", "operator.extraEnv[0].value="]
+        for name, extra, rendered in (
+            ("default", [], True),
+            ("nats image overridden alone", image, False),
+            ("both overridden", image + exporter, True),
+            ("nats image empty", empty, True),
+        ):
+            with self.subTest(name):
+                docs = _render(*_ON, *extra)
+                agent = next(d for d in docs if d.get("kind") == "PlatformAgent")["metadata"]["name"]
+                job = f"{agent}-a2a-nats-monitoring"
+                monitors = {d["metadata"]["name"] for d in docs if d.get("kind") == "PodMonitoring"}
+                expr = _alerts(_rules(docs)[0])[_SCRAPE_ALERT]["expr"]
+                self.assertEqual(rendered, job in monitors)
+                self.assertEqual(rendered, job in expr)
+
     def test_vector_matching_names_the_agent_labels(self):
         """Under Managed Prometheus scoping a recorded series carries project, cluster
         and namespace labels the inline `max by` sides do not, so a bare `and` or

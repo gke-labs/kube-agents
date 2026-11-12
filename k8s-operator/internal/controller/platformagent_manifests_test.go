@@ -1542,6 +1542,47 @@ func TestSafeSandboxEnvOverridesPassesRosterSummaryThreshold(t *testing.T) {
 	}
 }
 
+// The earned-autonomy switches reach the agent through the managed .env only,
+// every one on every render: a switch left out because it is off is one the
+// agent could turn on with a line in the PVC .env, which Hermes applies over
+// the container env. kubeagents_switches.py reads the managed file.
+func TestManagedEnvPinsTheAutonomySwitches(t *testing.T) {
+	switches := func(agent *agentv1alpha1.PlatformAgent) map[string]string {
+		got := map[string]string{}
+		for _, line := range strings.Split(renderManagedEnv(agent), "\n") {
+			for _, name := range autonomySwitchNames {
+				if value, ok := strings.CutPrefix(line, name+"="); ok {
+					if _, dup := got[name]; dup {
+						t.Errorf("%s is pinned twice in the managed .env", name)
+					}
+					got[name] = value
+				}
+			}
+		}
+		return got
+	}
+	agent := shellSandboxTestAgent()
+	want := map[string]string{envPostMergeCheck: "off", envAutomerge: "off", envDial: "off"}
+	if got := switches(agent); !maps.Equal(got, want) {
+		t.Errorf("managed .env switches with none set = %v, want %v", got, want)
+	}
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Env: []corev1.EnvVar{
+		{Name: envPostMergeCheck, Value: " Report "},
+		{Name: envAutomerge, Value: "on\nKUBEAGENTS_DIAL=on"},
+		{Name: envDial, ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{Key: "k"}}},
+	}}
+	want = map[string]string{envPostMergeCheck: "report", envAutomerge: "off", envDial: "off"}
+	if got := switches(agent); !maps.Equal(got, want) {
+		t.Errorf("managed .env switches = %v, want %v", got, want)
+	}
+	// One delivery path, as for the mode: the container env does not carry them.
+	for _, name := range autonomySwitchNames {
+		if got := safeSandboxEnvOverrides([]corev1.EnvVar{{Name: name, Value: "on"}}); len(got) != 0 {
+			t.Errorf("%s passed the agent container's env allowlist, got %#v; the managed .env is its only path", name, got)
+		}
+	}
+}
+
 // dedupWindowEntries returns every INCIDENT_WORKLOAD_DEDUP_SECONDS entry in
 // the platform container's env, in order.
 func dedupWindowEntries(t *testing.T, agent *agentv1alpha1.PlatformAgent) []string {
@@ -3299,7 +3340,7 @@ func TestBuildMinimalPlatformRole(t *testing.T) {
 		t.Errorf("expected APIGroups [''], got %v", ruleCore.APIGroups)
 	}
 
-	expectedCoreResources := []string{"nodes", "namespaces", "pods", "pods/log", "services", "endpoints", "events", "persistentvolumes", "persistentvolumeclaims", "resourcequotas", "limitranges", "configmaps", "serviceaccounts"}
+	expectedCoreResources := []string{"nodes", "namespaces", "pods", "pods/log", "services", "endpoints", "events", "persistentvolumes", "persistentvolumeclaims", "resourcequotas", "limitranges", "configmaps", "serviceaccounts", "secrets"}
 	if !slices.Equal(ruleCore.Resources, expectedCoreResources) {
 		t.Errorf("expected Resources %v, got %v", expectedCoreResources, ruleCore.Resources)
 	}
@@ -3322,13 +3363,45 @@ func TestBuildMinimalPlatformRole(t *testing.T) {
 	if !slices.Equal(ruleMetrics.Verbs, expectedMetricsVerbs) {
 		t.Errorf("expected Metrics Verbs %v, got %v", expectedMetricsVerbs, ruleMetrics.Verbs)
 	}
+
+	// DisallowSecretsRead=true omits secrets from the core group rule.
+	disallowedAgent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{
+				Security: &agentv1alpha1.SecuritySpec{
+					DisallowSecretsRead: ptr.To(true),
+				},
+			},
+		},
+	}
+	disallowedRole := buildMinimalPlatformRole(disallowedAgent)
+	if slices.Contains(disallowedRole.Rules[0].Resources, "secrets") {
+		t.Errorf("expected DisallowSecretsRead=true to omit secrets, got %v", disallowedRole.Rules[0].Resources)
+	}
+
+	// DisallowSecretsRead=false includes secrets in the core group rule.
+	allowedAgent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{
+				Security: &agentv1alpha1.SecuritySpec{
+					DisallowSecretsRead: ptr.To(false),
+				},
+			},
+		},
+	}
+	allowedRole := buildMinimalPlatformRole(allowedAgent)
+	if !slices.Contains(allowedRole.Rules[0].Resources, "secrets") {
+		t.Errorf("expected DisallowSecretsRead=false to include secrets, got %v", allowedRole.Rules[0].Resources)
+	}
 }
 
 // The agent reads the GitOps reconcilers' sync objects to learn which repository
-// and directory syncs a cluster. Nothing in that grant may write or reach a Secret
-// (Argo CD keeps cluster and repository credentials in Secrets), and the kinds the
-// sync lookup does not need stay out, so the readable inline values are bounded
-// to what Applications and Kustomizations carry.
+// and directory syncs a cluster. Nothing in that grant may write (and only the
+// core API group may read Secrets for `<agent>-kube-proxy`'s redacted metadata
+// path), and the kinds the sync lookup does not need stay out, so the readable
+// inline values are bounded to what Applications and Kustomizations carry.
 func TestMinimalPlatformRoleReadsTheGitOpsReconcilers(t *testing.T) {
 	role := buildMinimalPlatformRole(&agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
@@ -3348,8 +3421,8 @@ func TestMinimalPlatformRoleReadsTheGitOpsReconcilers(t *testing.T) {
 	readOnly := []string{"get", "list", "watch"}
 	seen := map[string]bool{}
 	for _, rule := range role.Rules {
-		if slices.Contains(rule.Resources, "secrets") {
-			t.Errorf("minimal role grants secrets in %v", rule.APIGroups)
+		if slices.Contains(rule.Resources, "secrets") && (!slices.Equal(rule.APIGroups, []string{""}) || !slices.Equal(rule.Verbs, readOnly)) {
+			t.Errorf("minimal role grants secrets outside read-only core group: groups=%v verbs=%v", rule.APIGroups, rule.Verbs)
 		}
 		if slices.Contains(rule.Resources, "*") || slices.Contains(rule.APIGroups, "*") || slices.Contains(rule.Verbs, "*") {
 			t.Errorf("minimal role carries a wildcard: %+v", rule)
@@ -3980,14 +4053,18 @@ func TestManagedEnvPinsPlatformKeysButNotHome(t *testing.T) {
 	// A deployment with no chat integration pins no PLATFORM key — an agent with no chat
 	// integration has no platform credential worth freezing, and a pin invented for one
 	// would only be a key the agent is refused permission to set. What survives is the
-	// ten unconditional pins, none of which is about chat: the loopback bearer (see
-	// the next test), the PVC's directory mode, the mode switch, the scope path, the
+	// thirteen unconditional pins, none of which is about chat: the loopback bearer (see
+	// the next test), the PVC's directory mode, the mode switch, the three
+	// earned-autonomy switches, the scope path, the
 	// empty management-project override, the stall watch's three knobs, empty, the
 	// Pub/Sub platform relay URL, empty, and the project that qualifies its routes.
 	bare := renderManagedEnv(newTestPlatformAgent())
 	want := "API_SERVER_KEY=" + loopbackAgentAPIKey + "\n" +
 		"HERMES_HOME_MODE=" + hermesHomeMode + "\n" +
 		kubeagentsModeEnvKey + "=today\n" +
+		envPostMergeCheck + "=off\n" +
+		envAutomerge + "=off\n" +
+		envDial + "=off\n" +
 		scopeFileEnvKey + "=" + scopeDir + "/" + scopeFileName + "\n" +
 		reconcileProjectEnvKey + "=\n" +
 		stallWatchExcludeNamespacesEnvKey + "=\n" +
@@ -4062,7 +4139,8 @@ func assertManagedEnvAgrees(t *testing.T, agent *agentv1alpha1.PlatformAgent) {
 	// The mode key is pinned-only by design: the managed .env is the one path the
 	// mode takes into the runtime (spec-mode-switch.md), so a container-env copy
 	// would be a second answer to a question that must have exactly one. The stall
-	// watch's knobs take the same single path to stall_watch.py.
+	// watch's knobs take the same single path to stall_watch.py, and the
+	// earned-autonomy switches theirs to kubeagents_switches.py.
 	pinnedOnly := map[string]bool{
 		"GATEWAY_ALLOWED_USERS":           true,
 		"GATEWAY_ALLOW_ALL_USERS":         true,
@@ -4070,6 +4148,9 @@ func assertManagedEnvAgrees(t *testing.T, agent *agentv1alpha1.PlatformAgent) {
 		stallWatchExcludeNamespacesEnvKey: true,
 		stallWatchMinAgeEnvKey:            true,
 		stallWatchKindsEnvKey:             true,
+		envPostMergeCheck:                 true,
+		envAutomerge:                      true,
+		envDial:                           true,
 	}
 
 	for _, line := range strings.Split(strings.TrimSpace(renderManagedEnv(agent)), "\n") {

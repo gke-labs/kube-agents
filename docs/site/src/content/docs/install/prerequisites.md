@@ -101,6 +101,8 @@ The chart's quota check counts the `spec.mode: next` additions in the capacity r
 
 Two next-mode workloads run only behind an operator flag, and the check counts each while its flag is set. With `A2A_MCP_DOOR=true` (the chart's `operator.mcpServer.enabled`, or an `operator.extraEnv` entry), the MCP server adds one pod. With `A2A_DISPATCHER_IMAGE` set through `operator.extraEnv`, the profile dispatcher adds one pod. The footprint's per-pod table gives both. Both run in the release namespace. AgentProfile workers don't: they run in the profile namespace, `<release-namespace>-profiles`, under a pod quota the operator renders there.
 
+With `platformAgent.deployment.credentialProxy.exec.replicas` above 0, each exec-tier replica is one more pod with 2 CPU and 2 GiB in requests and limits, plus the broker's ephemeral storage, and the chart's check counts them. It does not check node room. On a Standard cluster whose nodes lack 2 free CPU, a replica stays `Pending`. Turning the tier on also restarts the shell sandbox, which then needs its own room again.
+
 The scope publisher's Job runs in the release namespace too, one pod at a time every 15 minutes. It runs where the gateway pod admission policy is on and `platformAgent.scope` names a folder, organization, Shared VPC host or Metrics Scope, and the check counts it then.
 
 The `install.sh` pre-flight summary prints the release's requested CPU, memory, pods and persistent storage, with a monthly cost modeled from us-central1 list prices, model tokens excluded, before anything is applied. The apply shows no chart notes; `helm get notes kube-agents -n <NAMESPACE>` prints the same figures afterwards.
@@ -113,7 +115,7 @@ A Standard cluster that cannot grow to three nodes should run one server, set be
 
 The Terraform full install sets it to 1 on a zonal Standard cluster it creates, so that bus runs one server from the start.
 
-A quota is more than CPU and memory, and so is the check: it also counts pods, persistent volume claims, `requests.storage` and ephemeral storage, which [Footprint](#footprint) gives for each profile. Two of the claims, the agent's data claim and the shell sandbox's, follow [`spec.storage.size`](/kube-agents/operator/platformagent-crd/#specstorage), so each GiB added to it adds 2 GiB of `requests.storage`, and the chart's check counts it. A namespace quota that caps pod or claim counts below what the release needs refuses the install the same way; note that constraining ephemeral storage additionally requires every container to declare it (or a `LimitRange` to default it), as the chart README explains. Under `spec.mode: next`, each NATS server adds a JetStream persistent volume claim, and the operator renders a namespace-wide `ResourceQuota` on `pods`, the footprint's session quota, sized for the session pods plus the rest of the release; anything else you run in
+A quota is more than CPU and memory, and so is the check: it also counts pods, persistent volume claims, `requests.storage` and ephemeral storage, which [Footprint](#footprint) gives for each profile. Two of the claims, the agent's data claim and the shell sandbox's, follow [`spec.storage.size`](/kube-agents/operator/platformagent-crd/#specstorage), so each GiB added to it adds 2 GiB of `requests.storage`, and the chart's check counts it. [`spec.storage.expectedClusterProfiles`](/kube-agents/operator/platformagent-crd/#specstorage) raises the agent's claim alone, and the check counts that too. A namespace quota that caps pod or claim counts below what the release needs refuses the install the same way; note that constraining ephemeral storage additionally requires every container to declare it (or a `LimitRange` to default it), as the chart README explains. Under `spec.mode: next`, each NATS server adds a JetStream persistent volume claim, and the operator renders a namespace-wide `ResourceQuota` on `pods`, the footprint's session quota, sized for the session pods plus the rest of the release; anything else you run in
 the namespace counts against it. The claims
 are also disks: on GKE's default `standard-rwo` class they are balanced persistent
 disks, which count against the project's regional SSD quota (`SSD_TOTAL_GB`) with the
@@ -144,10 +146,10 @@ Totals by install profile, as the chart's quota preflight sums them (the operato
 | ------- | ---- | ------------ | --------------- | ---------- | ------------- | ----------------------------------- | ------ | ------------------ | -------------------- |
 | `today`, GKE Standard | 9 | 2756m | 12096Mi | 13200m | 25472Mi | 14912Mi / 14912Mi | 4 | 102Gi | — |
 | `today`, GKE Autopilot | 9 | 4256m | 13120Mi | 13200m | 25472Mi | 14912Mi / 14912Mi | 4 | 102Gi | — |
-| `next`, GKE Standard | 20 | 4356m | 15008Mi | 22400m | 32704Mi | 15040Mi / 15040Mi | 7 | 222Gi | 38 |
-| `next`, GKE Autopilot | 20 | 5856m | 16032Mi | 22400m | 32704Mi | 15040Mi / 15040Mi | 7 | 222Gi | 38 |
-| `next` with one NATS server, GKE Standard | 18 | 3756m | 13792Mi | 19400m | 30272Mi | 15040Mi / 15040Mi | 5 | 142Gi | 36 |
-| `next` with Hindsight and the GitHub minter, GKE Standard | 24 | 5206m | 17440Mi | 28400m | 38336Mi | 16192Mi / 16192Mi | 8 | 230Gi | 44 |
+| `next`, GKE Standard | 20 | 4386m | 15056Mi | 22550m | 32800Mi | 15232Mi / 15232Mi | 7 | 222Gi | 38 |
+| `next`, GKE Autopilot | 20 | 5886m | 16080Mi | 22550m | 32800Mi | 15232Mi / 15232Mi | 7 | 222Gi | 38 |
+| `next` with one NATS server, GKE Standard | 18 | 3766m | 13808Mi | 19450m | 30304Mi | 15104Mi / 15104Mi | 5 | 142Gi | 36 |
+| `next` with Hindsight and the GitHub minter, GKE Standard | 24 | 5236m | 17488Mi | 28550m | 38432Mi | 16Gi / 16Gi | 8 | 230Gi | 44 |
 
 The session quota is `spec.harness.tuning.maxSessions` (10 by default) plus the pods the operator runs for the agent, the chart's pods in the namespace with their rollout surges (5 when the operator cannot read the chart's count), and a margin of 7 for the operator's rollout surges, its Jobs and the gateway's count-then-create overshoot.
 
@@ -155,7 +157,7 @@ Under `spec.mode: next`, per pod:
 
 | Workload | Pods | CPU request | Memory request | CPU limit | Memory limit | Ephemeral storage request / limit | Runs |
 | -------- | ---- | ----------- | -------------- | --------- | ------------ | --------------------------------- | ---- |
-| NATS server | 3 | 300m | 608Mi | 1500m | 1216Mi | — | Standing, each on its own node, with one JetStream claim each (40Gi); one with `spec.harness.tuning.busReplicas: 1` |
+| NATS server | 3 | 310m | 624Mi | 1550m | 1248Mi | 64Mi / 64Mi | Standing, each on its own node, with one JetStream claim each (40Gi); one with `spec.harness.tuning.busReplicas: 1` |
 | Auth callout | 2 | 50m | 64Mi | 500m | 256Mi | — | Standing |
 | Capability verifier | 2 | 50m | 64Mi | 500m | 256Mi | — | Standing |
 | A2A gateway | 2 | 50m | 64Mi | 500m | 512Mi | — | Standing; one fewer with the operator's `A2A_GATEWAY_ELECTION=false` |

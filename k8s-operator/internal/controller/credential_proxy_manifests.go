@@ -304,7 +304,8 @@ const (
 	// figure follows a raised ephemeral-storage override the way the volume
 	// does (credentialProxyEmptyDirSizeLimit), /tmp keeps its cap, and an
 	// override lowered under the two caps together splits the limit between
-	// them (credentialProxyEvictionBytes). In the
+	// them (credentialProxyEvictionBytes). The exec tier rewrites both to its
+	// own fixed caps (credentialProxyExecTierStateSizeLimit). In the
 	// base env list and so reserved in mergeCredentialProxyEnv, because a CR
 	// that could set either would detach the gate from the eviction threshold.
 	credentialProxyStateLimitEnv = "CREDENTIAL_PROXY_STATE_LIMIT_BYTES" // #nosec G101 -- Env var name, not a credential
@@ -785,9 +786,9 @@ func buildCredentialProxyVolumeMounts(agent *agentv1alpha1.PlatformAgent) []core
 			ReadOnly:  true,
 		})
 	}
-	if scopePublisherRendered(agent) {
-		mounts = append(mounts, scopeConfigMount(brokerScopeDir))
-	}
+	// The scope declaration in every mode: spec.scope.exclude.clusters is
+	// refused at the broker for every caller (scope_exclude.py).
+	mounts = append(mounts, scopeConfigMount(brokerScopeDir))
 	return append(mounts, buildVCSForgesVolumeMounts(agent)...)
 }
 
@@ -1004,11 +1005,10 @@ func buildCredentialProxyRuntimeVolumes(agent *agentv1alpha1.PlatformAgent) []co
 		}
 	}
 	volumes = append(volumes, buildGitopsStateVolume(agent))
-	// The scope declaration under mode next, which the broker reads on every
-	// scope call to bound the role's arguments (CREDENTIAL_PROXY_SCOPE_FILE).
-	if scopePublisherRendered(agent) {
-		volumes = append(volumes, scopeConfigVolume(agent))
-	}
+	// The scope declaration, in every mode (CREDENTIAL_PROXY_SCOPE_FILE): the
+	// broker refuses an excluded cluster for every caller from it, and under
+	// mode next the scope role reads it to bound its arguments.
+	volumes = append(volumes, scopeConfigVolume(agent))
 	volumes = append(volumes, buildVCSForgesVolumes(agent)...)
 	return append(volumes, buildCredentialProxyFederationVolume(agent)...)
 }

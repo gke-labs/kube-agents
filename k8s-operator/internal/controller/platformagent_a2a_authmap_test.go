@@ -257,7 +257,7 @@ func TestRenderedNATSConfMatchesTheCalloutFixture(t *testing.T) {
 	// The two values the pod supplies and a test process cannot: the server
 	// name, from the pod's env, and a pid file on the pod's data volume.
 	conf = strings.Replace(conf, "server_name: $POD_NAME", "server_name: a2a-nats-0", 1)
-	conf = strings.Replace(conf, `pid_file: "`+a2aNATSPidFile+`"`, `pid_file: ""`, 1)
+	conf = strings.Replace(conf, `pid_file: "`+a2aNATSPIDFile+`"`, `pid_file: ""`, 1)
 
 	// The generated keys differ on every run, so the committed fixture is
 	// normalised to a stable placeholder. The consuming test replaces these

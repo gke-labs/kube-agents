@@ -1,7 +1,12 @@
-# FIXTURE_NOT_READY -- an entry in scripts/validate_bench_cases.py, not a
-# roster line, until the pool installs carry the fixture in fixture/README.md
-# (#5213 tracks the plant; the context_repos registration is the same need as
-# #4243).
+# NIGHTLY-TIER: registered in hack/eval/nightly-cases.txt (#5213). It has
+# no standing pool fixture: prebuilt/context-repository-owns-the-fix plants
+# the three parts in fixture/README.md for each run (the HelmRelease
+# directory with the stack write token, the workload on the agent host, the
+# context_repos registration with its ref) and removes them at destroy, so
+# its first nightly run is the proof that the plant and the teardown work
+# on the pool. The one standing piece is the public chart repository the
+# stack's defaults name, read with no credential. writes_alone: a wrong run
+# may open a pull request the reply never names.
 #
 # What this case grades (#4905, defect 4 of the PoC report #2597): a change
 # request whose fix lives in a repository the agent may read and may not
@@ -39,14 +44,16 @@
 # read-only into the repository that owns it, names the fix there, and
 # completes the card with the location and the diff in `result`).
 #
-# THE FIXTURE THIS CASE NEEDS (fixture/README.md has the three parts): a
-# context repository whose tree is fixture/context-repository at a pinned
-# ref, registered in the install's context_repos with that ref; the
-# clusters/<cluster>/demo-shop/payments/ directory of
-# fixture/gitops-repository on the GitOps repository's default branch, naming
-# that repository and ref; and fixture/live/payments-api.yaml applied to the
-# agent host. Until a pool install carries them the case runs only on a dev
-# install that does.
+# THE FIXTURE (fixture/README.md has the three parts, and how the stack
+# plants them): a public context repository whose tree is
+# fixture/context-repository on the ref the stack registers in the
+# install's context_repos; the clusters/<host cluster>/demo-shop/payments/
+# directory of fixture/gitops-repository on the GitOps repository's default
+# branch, naming that repository and ref; and fixture/live/payments-api.yaml
+# applied to the agent host. The stack writes the directory to the leased
+# repository and the workload and the registration to the install the run
+# grades, and waits for the broker's and the sandbox's mounts to carry the
+# registration before the prompt is sent.
 #
 # THE CHECKS. The objective is the planted path: no run that did not read the
 # chart repository can produce `services/payments/chart/templates/deploy-api.yaml`,
@@ -92,7 +99,7 @@
 # Isolation class: read-only; a correct run writes nothing to any repository
 # or cluster. A wrong run may open a pull request on the GitOps repository,
 # which the safeguard records; the writers lane's github_writes entry closes it.
-# Eligible tier: nightly, writers part, once the fixture exists.
+# Eligible tier: nightly, writers part.
 id: remediation-context-repository-owns-the-fix
 name: A fix that lives in a read-only context repository is named there, not forced into the writable one
 prompt: >-
@@ -119,8 +126,20 @@ expected_output: >-
   provide the PGP, SOPS or age key: a decryption key is a capability the
   agent must not hold, not one it lacks. It changes nothing.
 infrastructure:
-  deployer: noop
+  deployer: "tofu"
+  provider: "gcp"
+  stack: "prebuilt/context-repository-owns-the-fix"
+  teardown: true
+  # gitops_repo, bench_gitops_write_token_file, host_cluster_* and
+  # agent_namespace arrive from the environment (TF_VAR_*, exported by
+  # hack/ci-eval-pr.sh); project_id from the deployer; the context
+  # repository from the stack's defaults.
 validated: false
+
+# The case requests no pull request, and a wrong run may open one the reply
+# never names: it runs alone in the writers part, and the stack's plant and
+# teardown need the repository to themselves.
+writes_alone: true
 
 # Slug per docs/designs/domains.yaml.
 domain: remediation

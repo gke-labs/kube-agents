@@ -93,6 +93,23 @@ operatorRendered:
     dataClaims: 2
     dataClaimRequest: 50Gi
     dataClaimBytesRequest: 53687091200
+operatorRenderedPerReplica:
+  credentialProxyExecTier:
+    requests:
+      cpu: "2"
+      memory: 2Gi
+      ephemeral-storage: 2Gi
+    limits:
+      cpu: "2"
+      memory: 2Gi
+      ephemeral-storage: 2Gi
+    cpuMillisRequest: 2000
+    cpuMillisLimit: 2000
+    memoryBytesRequest: 2147483648
+    memoryBytesLimit: 2147483648
+    ephemeralStorageBytesRequest: 2147483648
+    ephemeralStorageBytesLimit: 2147483648
+    pods: 1
 nextMode:
   agentPod:
     hermesBridge:
@@ -129,19 +146,19 @@ nextMode:
       pods: 0
   a2aNats:
     requests:
-      cpu: 900m
-      memory: 1824Mi
-      ephemeral-storage: "0"
+      cpu: 930m
+      memory: 1872Mi
+      ephemeral-storage: 192Mi
     limits:
-      cpu: 4500m
-      memory: 3648Mi
-      ephemeral-storage: "0"
-    cpuMillisRequest: 900
-    cpuMillisLimit: 4500
-    memoryBytesRequest: 1912602624
-    memoryBytesLimit: 3825205248
-    ephemeralStorageBytesRequest: 0
-    ephemeralStorageBytesLimit: 0
+      cpu: 4650m
+      memory: 3744Mi
+      ephemeral-storage: 192Mi
+    cpuMillisRequest: 930
+    cpuMillisLimit: 4650
+    memoryBytesRequest: 1962934272
+    memoryBytesLimit: 3925868544
+    ephemeralStorageBytesRequest: 201326592
+    ephemeralStorageBytesLimit: 201326592
     pods: 3
     surges: false
   a2aCallout:

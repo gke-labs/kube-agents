@@ -161,8 +161,9 @@ const (
 	// agree, so they read from one name rather than four string literals.
 	a2aProvisionWritablePath = "/tmp"
 
-	// The two third-party pins. images.json carries both (as `nats` and
-	// `nats-box`), and hack/check-image-inventory.sh holds these constants
+	// Two of the three third-party pins; the bus reloader's is in
+	// platformagent_a2a_nats_reload.go. images.json carries these (as `nats`
+	// and `nats-box`), and hack/check-image-inventory.sh holds these constants
 	// to it on the normalised reference, so a bump starts there. The short
 	// Docker Hub spelling stays: it is the string the operator renders, and
 	// qualifying it to docker.io/library/... would change the pod template
@@ -233,9 +234,10 @@ const (
 	// collects garbage before the kernel kills the container (which the
 	// supervisor loop cannot survive). The loop replaces it with 80% of the
 	// limit it reads from its cgroup (a2aNATSExporterSupervisor); this is
-	// the value where it can't read one, 80% of the rendered limit.
-	// GOMEMLIMIT takes a byte count with an IEC suffix.
-	a2aNATSExporterGoMemLimit = "160MiB"
+	// the value where it can't read one, 80% of the rendered limit (192Mi
+	// gives 153.6MiB, rounded down to a whole MiB). GOMEMLIMIT takes a byte
+	// count with an IEC suffix.
+	a2aNATSExporterGoMemLimit = "153MiB"
 
 	a2aGatewayCPURequest    = "50m"
 	a2aGatewayMemoryRequest = "64Mi"
@@ -318,13 +320,14 @@ const (
 	a2aInjectBackendEnvVar = "A2A_INJECT_BACKEND"
 
 	// a2aSessionClusterViewEnvVar arms the session pods' temporary read-only
-	// cluster view: the pod becomes a caller of the credential broker with
-	// the broker's `session` role (kubectl and gcloud, read-only, nothing
-	// else). A demo aid until declarative profiles (spec-subagent-profiles)
-	// carry a session's identity and tools; the flag and everything it
-	// renders go when they do. Operator-level and off by default for the
-	// reason a2aInjectBackendEnvVar is: the pod executes model output, and
-	// what widens its fence is a property of who deployed the operator.
+	// cluster view: session pods route kubectl through <agent>-kube-proxy
+	// (read-only-dry-run with Secret redaction) and reach the credential
+	// broker's `session` role for read-only gcloud. A demo aid until
+	// declarative profiles (spec-subagent-profiles) carry a session's
+	// identity and tools; the flag and everything it renders go when they
+	// do. Operator-level and off by default for the reason
+	// a2aInjectBackendEnvVar is: the pod executes model output, and what
+	// widens its fence is a property of who deployed the operator.
 	a2aSessionClusterViewEnvVar = "A2A_SESSION_CLUSTER_VIEW"
 	// The platform agent's trusted-human allowlists, handed to the gateway
 	// so a session's request to delegate to the platform agent is checked
@@ -618,6 +621,12 @@ const (
 	// carried the way Chat's is (a2aGchatAllowedUsersEnvVar).
 	a2aSlackAllowedUsersEnvVar  = "A2A_SLACK_ALLOWED_USERS"
 	a2aSlackAllowAllUsersEnvVar = "A2A_SLACK_ALLOW_ALL_USERS"
+	// a2aSlackTestUsersEnvVar names the end-to-end test users whose
+	// app-attributed posts the gateway reads as theirs. The operator reads it
+	// from its own environment (as a2aInjectBackendEnvVar) and renders it onto
+	// the gateway under the same name; a2a/gateway/config.go's
+	// EnvSlackTestUsers.
+	a2aSlackTestUsersEnvVar = "A2A_SLACK_TEST_USERS"
 	// The principal map the gateway resolves Discord and Slack senders
 	// through: one path (A2A_PRINCIPAL_MAP, the gateway's default spelled
 	// out), one volume, and one source in it, the armed backend's table
@@ -1298,13 +1307,15 @@ func a2aNATSExporterOmitted() bool {
 	return os.Getenv(a2aNATSImageEnvVar) != "" && os.Getenv(a2aNATSExporterImageEnvVar) == ""
 }
 
-// a2aNATSContainers is the NATS pod's containers: the server, and the
-// metrics sidecar unless a2aNATSExporterOmitted.
+// a2aNATSContainers is the NATS pod's containers: the server, the config
+// reloader (buildA2ANATSReloaderContainer), and the metrics sidecar unless
+// a2aNATSExporterOmitted.
 func a2aNATSContainers(server corev1.Container) []corev1.Container {
+	containers := []corev1.Container{server, buildA2ANATSReloaderContainer()}
 	if a2aNATSExporterOmitted() {
-		return []corev1.Container{server}
+		return containers
 	}
-	return []corev1.Container{server, a2aNATSExporterContainer()}
+	return append(containers, a2aNATSExporterContainer())
 }
 
 func a2aProvisionImage() string {
@@ -2412,6 +2423,9 @@ func renderA2ANATSConf(agent *agentv1alpha1.PlatformAgent, pw func(key string) s
 server_name: $POD_NAME
 port: ` + strconv.Itoa(a2aNATSClientPort) + `
 http: ` + strconv.Itoa(a2aNATSMonitorPort) + `
+# For the reloader in the same pod, which signals this PID when the mounted
+# config changes.
+pid_file: "` + a2aNATSPIDFile + `"
 ` + renderA2ANATSLameDuck(agent) + renderA2ANATSCluster(agent) + `
 
 # TLS on the client listener, required of every connection: the server
@@ -2442,8 +2456,8 @@ max_control_line: 65536
 # the console server is encrypted and verified against the bus CA. The
 # Service is ClusterIP, so nothing OUTSIDE the cluster reaches this listener.
 # An ingress NetworkPolicy fences the pod network too: 4222 from the
-# enumerated bus clients, 9222 from the console server alone, and no
-# pod-network peer for 8222. The console server is admitted because it is the
+# enumerated bus clients, 9222 from the console server alone, and 8222 from
+# the operator's pod alone. The console server is admitted because it is the
 # page's proxy. A browser reaches it through a kubectl port-forward and it
 # forwards the websocket here over wss, with the browser's headers intact. It
 # is not an in-cluster door for anything else. A port-forward straight to
@@ -2761,7 +2775,7 @@ func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.
 			Namespace: agent.Namespace,
 			Labels:    a2aLabels(agent, "nats-config"),
 		},
-		Data: map[string][]byte{"nats.conf": []byte(conf)},
+		Data: map[string][]byte{a2aNATSConfKey: []byte(conf)},
 	}
 }
 
@@ -2808,9 +2822,21 @@ func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.
 // The serving certificate's fingerprint is the third input, for the same
 // reason as the conf: nats-server reads its certificate at boot, so a renewed
 // one that the kubelet has already written into the mounted directory is not
-// served until the pod restarts. Until a reloader sends the reload signal
-// instead, a renewal rolls the bus once a year.
+// served until the pod restarts. A renewal rolls the bus once a year; the
+// bus pod's reloader would also apply it in place, but the hash still rolls.
+//
+// On a single server the gateway's per-profile deny is left out
+// (renderA2ANATSConf with no profiles): the config Secret carries it, the
+// reloader applies it, and planA2ABusReload confirms it, so a profile change
+// doesn't restart the bus. A cluster digests it too, so a profile change rolls
+// the servers one at a time onto it, each in lame duck while the others serve:
+// the reload's confirmation reads one config_load_time through the Service,
+// which can't tell whether every server reloaded, and its fallback restarts
+// one pod.
 func a2aConfigRolloutHash(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret, keys *a2aCalloutKeys, servingFingerprint string, profiles []string) string {
+	if a2aNATSReplicas(agent) <= 1 {
+		profiles = nil
+	}
 	redacted := renderA2ANATSConf(agent, func(key string) string {
 		return fmt.Sprintf(a2aConfigHashPlaceholder, key)
 	}, keys, profiles)
@@ -2934,6 +2960,8 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 				},
 				Spec: corev1.PodSpec{
 					AutomountServiceAccountToken: ptr.To(false),
+					// The reloader signals nats-server by PID.
+					ShareProcessNamespace: ptr.To(true),
 					SecurityContext: &corev1.PodSecurityContext{
 						RunAsNonRoot:   ptr.To(true),
 						RunAsUser:      ptr.To(int64(1000)),
@@ -2961,9 +2989,10 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 						// (a2aNATSLifecycle).
 						Lifecycle: a2aNATSLifecycle(replicas),
 						VolumeMounts: []corev1.VolumeMount{
-							{Name: "config", MountPath: "/etc/nats", ReadOnly: true},
+							{Name: "config", MountPath: a2aNATSConfMountDir, ReadOnly: true},
 							{Name: a2aNATSTLSVolume, MountPath: a2aNATSTLSMountDir, ReadOnly: true},
 							{Name: a2aNATSDataClaim, MountPath: "/data"},
+							{Name: a2aNATSPIDVolume, MountPath: a2aNATSPIDMountDir},
 						},
 						SecurityContext: hardenedSecurityContext(),
 						Resources:       a2aResources(a2aNATSCPURequest, a2aNATSMemoryRequest, a2aNATSCPULimit, a2aNATSMemoryLimit),
@@ -2974,6 +3003,9 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 						},
 					}),
 					Volumes: []corev1.Volume{{
+						Name:         a2aNATSPIDVolume,
+						VolumeSource: a2aNATSPIDVolumeSource(),
+					}, {
 						Name: "config",
 						VolumeSource: corev1.VolumeSource{
 							Secret: &corev1.SecretVolumeSource{SecretName: a2aNATSConfigSecretName(agent)},
@@ -3136,8 +3168,9 @@ func a2aSessionNetpolName(agent *agentv1alpha1.PlatformAgent) string {
 // this is the pod that executes model output.
 //
 // A worker that needs the internet is a design change, not a policy widening:
-// the broker rule below is the one admitted widening, flag-gated, and it
-// reaches a pod that authenticates the caller rather than the internet.
+// the broker and kube-proxy rules below are the only admitted widenings,
+// flag-gated, and they reach pods that authenticate the caller rather than the
+// internet.
 //
 // PolicyTypes carries Ingress with no rules on purpose: nothing dials a
 // session pod, so a listener in a worker is an accident and an accident should
@@ -3180,22 +3213,23 @@ func buildA2ASessionNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluster
 		},
 	}
 	if a2aSessionClusterViewEnabled(agent) {
-		// The credential broker, under the cluster-view flag: the one
-		// widening of this fence, to the broker's pods on one port (the
-		// stateful broker, and the exec tier while it renders), and the pod on
-		// the other end authenticates the token and confers the session
-		// role. The API server stays unreachable from here; kubectl runs
-		// in the broker. Header comment: this IS the design change.
+		// The credential broker (and its exec tier while it renders) for gcloud,
+		// plus kube-proxy for kubectl, under the cluster-view flag. Both
+		// authenticate the session pod's projected token.
 		to := []networkingv1.NetworkPolicyPeer{namespacedPodPeer(agent.Namespace, credentialProxySelector(agent))}
-		// And the exec tier while it renders, on the same port, for the
-		// commands the session pod's shim sends there.
 		if credentialProxyExecTierEnabled(agent) {
 			to = append(to, namespacedPodPeer(agent.Namespace, credentialProxyExecTierSelector(agent)))
 		}
-		egress = append(egress, networkingv1.NetworkPolicyEgressRule{
-			Ports: []networkingv1.NetworkPolicyPort{tcpPort(credentialProxyPort)},
-			To:    to,
-		})
+		egress = append(egress,
+			networkingv1.NetworkPolicyEgressRule{
+				Ports: []networkingv1.NetworkPolicyPort{tcpPort(credentialProxyPort)},
+				To:    to,
+			},
+			networkingv1.NetworkPolicyEgressRule{
+				Ports: []networkingv1.NetworkPolicyPort{tcpPort(kubeProxyPort)},
+				To:    []networkingv1.NetworkPolicyPeer{namespacedPodPeer(agent.Namespace, kubeProxySelector(agent))},
+			},
+		)
 	}
 
 	return &networkingv1.NetworkPolicy{
@@ -3235,13 +3269,16 @@ func buildA2ASessionNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluster
 // console server, the exporter sidecar's a2aNATSMetricsPort from the
 // managed-Prometheus collector's namespace, nothing else.
 //
-// 8222 (monitor) gets no pod-network peer at all, decided rather than
-// forgotten. The kubelet's readiness probe enters from the node, which
-// NetworkPolicy does not govern (Dataplane V2 exempts host-local traffic), and
-// the exporter sidecar (a2aNATSExporterContainer) reads it over the pod's
-// loopback, so denying every pod costs nothing. A scrape reaches the
-// exporter's port instead, which serves the derived series and nothing of
-// the monitor's own endpoints.
+// 8222 (monitor) gets one peer, the operator's own pod, which reads
+// config_load_time there to confirm a config reload (planA2ABusReload). It's
+// the same peer 4222 admits, and nothing else on the pod network reaches the
+// port. The kubelet's readiness probe enters from the node, which
+// NetworkPolicy does not govern (Dataplane V2 exempts host-local traffic),
+// and the exporter sidecar (a2aNATSExporterContainer) reads it over the
+// pod's loopback. A scrape reaches the exporter's port instead, which serves
+// the derived series and nothing of the monitor's own endpoints. With no
+// operator peer (a2aOperatorNATSPeers) there is no 8222 rule, a reload can't
+// be confirmed, and the operator restarts the bus pod instead.
 //
 // 9222 (ws) gets one peer, the console server. The browser reaches the console
 // server through a port-forward and the server proxies the page's websocket to
@@ -3255,7 +3292,7 @@ func buildA2ASessionNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluster
 func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1.NetworkPolicy {
 	tcp := corev1.ProtocolTCP
 
-	np := &networkingv1.NetworkPolicy{
+	policy := &networkingv1.NetworkPolicy{
 		TypeMeta: metav1.TypeMeta{APIVersion: "networking.k8s.io/v1", Kind: "NetworkPolicy"},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      a2aNATSNetpolName(agent),
@@ -3360,10 +3397,11 @@ func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 				// collector's namespace alone, the shape of the A2A
 				// gateway's metrics rule (buildA2AGatewayNetworkPolicy).
 				// The exporter reads 8222 over loopback, so this rule is
-				// what the scrape needs and 8222 stays without a peer.
-				// The operator's own pod is the other peer: the bus-stream
-				// check reads the stream list here (BusStreamPoller), as
-				// it has no other way to it.
+				// what the scrape needs, and the collector gets nothing on
+				// 8222, whose one peer is the operator's (planA2ABusReload).
+				// The operator's own pod is the other peer here: the
+				// bus-stream check reads the stream list on this port
+				// (BusStreamPoller).
 				Ports: []networkingv1.NetworkPolicyPort{tcpPort(a2aNATSMetricsPort)},
 				From: append([]networkingv1.NetworkPolicyPeer{{
 					NamespaceSelector: &metav1.LabelSelector{
@@ -3373,8 +3411,16 @@ func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 			}},
 		},
 	}
-	np.Spec.Ingress = append(np.Spec.Ingress, a2aNATSRouteIngress(agent)...)
-	return np
+	if operator := a2aOperatorNATSPeers(); len(operator) > 0 {
+		policy.Spec.Ingress = append(policy.Spec.Ingress, networkingv1.NetworkPolicyIngressRule{
+			Ports: []networkingv1.NetworkPolicyPort{
+				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(a2aNATSMonitorPort))},
+			},
+			From: operator,
+		})
+	}
+	policy.Spec.Ingress = append(policy.Spec.Ingress, a2aNATSRouteIngress(agent)...)
+	return policy
 }
 
 // a2aNATSRouteIngress admits the cluster routes: 6222 from the bus's own
@@ -4783,11 +4829,12 @@ func a2aNATSReplicas(agent *agentv1alpha1.PlatformAgent) int {
 // shape the StatefulSet's template was rendered for. The live replica count
 // is never read: a StatefulSet scaled by hand, to any count, is a hand scale
 // the next apply reverts, not a new bus shape, so a scale between 1 and 3
-// cannot convert the bus past the gate. Failing a StatefulSet, the data
-// claims a bus left behind (a
-// StatefulSet deleted by hand keeps its claims, and the next one must come
-// back at their count, or it would convert them). The field decides only for a
-// bus that does not exist yet, and three when it is unset.
+// cannot convert the bus past the gate. Failing a StatefulSet, the record
+// again while the bus left data claims behind (a StatefulSet deleted by hand
+// keeps its claims, and the next one must come back at the bus's count, or it
+// would convert them), and with no record the count the claims imply. The
+// field decides only for a bus that does not exist yet, and three when it is
+// unset.
 //
 // A field that asks an existing bus for another count is refused unless
 // busConversionAllowed (which #4225 sets with the migration): the bus keeps
@@ -4824,17 +4871,22 @@ func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, age
 				return false, err
 			}
 		}
-		if running == 2 {
-			// Claims for ordinals 0 and 1 and not 2 are a three-server
-			// bus that lost one, not a two-server bus, which never existed.
-			running = 3
-		}
-		if running == 1 && agent.Status.BusReplicas == 3 {
-			// A cluster whose StatefulSet went before server 1 had its
-			// claim (OrderedReady creates them in turn) leaves the same
-			// lone claim as a single server; only the recorded count tells
-			// them apart. A flip to today clears it, so a bus coming back
-			// from today reads its claims.
+		switch {
+		case running != 0 && (recorded == 1 || recorded == 3):
+			// Claims left behind, and the count last resolved: the record,
+			// as with a StatefulSet. The claims alone can't tell a bus's
+			// shape: under WhenScaled Retain a single server scaled by hand
+			// to 3 keeps claims 1 and 2 after the scale is reverted, and a
+			// cluster whose StatefulSet went before server 1 had its claim
+			// (OrderedReady creates them in turn) leaves one claim, like a
+			// single server. With no claims there is no bus to keep, and
+			// the field decides below.
+			running = recorded
+		case running == 2:
+			// No record: claims for ordinals 0 and 1 and not 2 are a
+			// three-server bus that lost one, not a two-server bus, which
+			// never existed. A flip to today clears the record, so a bus
+			// coming back from today reads its claims.
 			running = 3
 		}
 	default:
@@ -4954,11 +5006,6 @@ func a2aStreamReplicas(agent *agentv1alpha1.PlatformAgent) int {
 const a2aStreamReplicasEnv = "STREAM_REPLICAS"
 
 const (
-	// a2aNATSPidFile is where nats-server writes its pid, for the preStop
-	// lame-duck signal. On the data volume because the root filesystem is
-	// read-only; a stale file from a crash is overwritten at the next boot.
-	a2aNATSPidFile = "/data/nats-server.pid"
-
 	// a2aNATSLameDuckSeconds is lame_duck_duration: how long a stopping
 	// server spreads its clients' reconnects over. a2aNATSTerminationGrace
 	// leaves room above it for the grace period nats-server waits before
@@ -4967,18 +5014,18 @@ const (
 	a2aNATSTerminationGraceSeconds = 60
 )
 
-// renderA2ANATSLameDuck is the nats.conf lines for lame duck on a cluster: the
-// pid file the preStop hook signals, and how long a stopping server spreads
-// its clients' reconnects over the other servers. A single server renders
-// neither (a2aNATSLifecycle).
+// renderA2ANATSLameDuck is the nats.conf line for lame duck on a cluster: how
+// long a stopping server spreads its clients' reconnects over the other
+// servers. The preStop hook signals the pid the config reloader also reads
+// (a2aNATSPIDFile, rendered for every bus). A single server renders none
+// (a2aNATSLifecycle).
 func renderA2ANATSLameDuck(agent *agentv1alpha1.PlatformAgent) string {
 	if a2aNATSReplicas(agent) <= 1 {
 		return ""
 	}
 	return `
-# For the preStop hook's lame-duck signal (buildA2ANATSStatefulSet).
-pid_file: "` + a2aNATSPidFile + `"
-# How long a stopping server spreads its clients' reconnects over.
+# How long a stopping server spreads its clients' reconnects over. The
+# preStop hook signals the pid in pid_file above.
 lame_duck_duration: "` + strconv.Itoa(a2aNATSLameDuckSeconds) + `s"
 `
 }
@@ -4996,7 +5043,7 @@ func a2aNATSLifecycle(replicas int) *corev1.Lifecycle {
 	}
 	return &corev1.Lifecycle{
 		PreStop: &corev1.LifecycleHandler{
-			Exec: &corev1.ExecAction{Command: []string{"nats-server", "--signal", "ldm=" + a2aNATSPidFile}},
+			Exec: &corev1.ExecAction{Command: []string{"nats-server", "--signal", "ldm=" + a2aNATSPIDFile}},
 		},
 	}
 }
@@ -6248,11 +6295,14 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	var clusterViewEnv []corev1.EnvVar
 	if a2aSessionClusterViewEnabled(agent) {
 		// The spawner's half of the cluster view: told, and told where the
-		// broker is. Both or neither - the gateway refuses the first
-		// without the second (a2a/gateway/config.go).
+		// broker and kube-proxy are. Both or neither - the gateway refuses the
+		// first without the broker URL (a2a/gateway/config.go).
 		clusterViewEnv = []corev1.EnvVar{
 			{Name: "A2A_SESSION_CLUSTER_VIEW", Value: "true"},
 			{Name: "A2A_CREDENTIAL_PROXY_URL", Value: credentialProxyBaseURL(agent)},
+			{Name: "A2A_KUBE_PROXY_URL", Value: kubeProxyURL(agent)},
+			{Name: "A2A_KUBE_PROXY_CA_CONFIGMAP", Value: kubeProxyCABundleName(agent)},
+			{Name: "A2A_KUBE_PROXY_HOST_CONTEXT", Value: hostClusterContextName(agent)},
 		}
 		// The exec tier's address, while it renders, for the session pods'
 		// commands; the spawner passes it on as CREDENTIAL_PROXY_EXEC_URL.
@@ -6310,6 +6360,12 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		// gateway's env, and its pod, as they were.
 		if slack.AnswerFeedback != nil && !*slack.AnswerFeedback {
 			backendEnv = append(backendEnv, corev1.EnvVar{Name: a2aSlackAnswerFeedbackEnvVar, Value: strconv.FormatBool(false)})
+		}
+		// End-to-end test users, from the operator's own environment and
+		// never from the CR, so only an operator deployed for CI or eval
+		// renders it; unset, the gateway's env and pod are as they were.
+		if users := strings.TrimSpace(os.Getenv(a2aSlackTestUsersEnvVar)); users != "" {
+			backendEnv = append(backendEnv, corev1.EnvVar{Name: a2aSlackTestUsersEnvVar, Value: users})
 		}
 		// The learned-home contract (platformagent_home_channel_record.go):
 		// whether the gateway may learn a home channel from the first
@@ -6698,6 +6754,9 @@ type a2aProvisionState struct {
 	// busPodRequeue is how long until a bus pod stuck on an old revision is
 	// due for replacement (replaceStuckA2ANATSPod); zero when none waits.
 	busPodRequeue time.Duration
+	// busReloadRequeue is when to check again on a bus config reload still
+	// pending (planA2ABusReload). Zero when none is.
+	busReloadRequeue time.Duration
 	// gatewayElected is the image the pod holding the gateway's Lease runs,
 	// as this pass read it, or nil when it couldn't tell
 	// (observeA2AGatewayElection). The status writers carry it as the
@@ -6983,9 +7042,11 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// The profiles the dispatcher writes .supervisor for, for the gateway's
 	// deny on those subjects (gatewayProfileSupervisorDeny): the admitted
 	// ones and the ones still draining, the same names as the dispatcher's
-	// grant. A profile the controller refuses gets neither. In the config
-	// and its hash, so a profile admitted, removed or done draining rolls
-	// the bus.
+	// grant. A profile the controller refuses gets neither. The list is in
+	// the config, and on a single server not the pod template's hash, so a
+	// profile admitted, removed or done draining reaches a single-server bus
+	// by a reload (planA2ABusReload) rather than a restart. A cluster rolls
+	// onto it (a2aConfigRolloutHash).
 	profileNames, _ := dispatcherGrantNames(agent, profiles, draining)
 	sts := buildA2ANATSStatefulSet(agent, a2aConfigRolloutHash(agent, creds, calloutKeys, natsTLS.ServingFingerprint, profileNames))
 	busHeld, err := r.a2aBusWaitsForCallout(ctx, agent, sts, calloutGeneration)
@@ -6998,6 +7059,13 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 			"statefulset", sts.Name, "callout", a2aCalloutName(agent))
 	} else {
 		config := buildA2ANATSConfigSecret(agent, creds, calloutKeys, profileNames)
+		reload, err := r.planA2ABusReload(ctx, agent, config, sts, time.Now())
+		if err != nil {
+			return state, err
+		}
+		if err := r.actOnA2ABusReload(ctx, agent, sts.Name, reload); err != nil {
+			return state, err
+		}
 		if err := ctrl.SetControllerReference(agent, config, r.Scheme); err != nil {
 			return state, err
 		}
@@ -7014,6 +7082,7 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		if err := r.applyManaged(ctx, agent, sts); err != nil {
 			return state, fmt.Errorf("failed to apply A2A NATS StatefulSet: %w", err)
 		}
+		state.busReloadRequeue = reload.requeue
 		// A pod that never became Ready on an earlier template blocks the
 		// rolling update this apply starts (replaceStuckA2ANATSPod).
 		if state.busPodRequeue, err = r.replaceStuckA2ANATSPod(ctx, agent, sts, time.Now()); err != nil {
@@ -7629,12 +7698,13 @@ func (r *PlatformAgentReconciler) applyA2AInjectBackend(ctx context.Context, age
 // next install is the standing cost. Three are cached: Service, ConfigMap
 // and NetworkPolicy are Owns() kinds (see SetupWithManager), so their
 // informers exist. The Secret is NOT read through the cache, and this is
-// load-bearing rather than tidy: the operator ships secrets with get only,
-// and a cached Get of an unwatched kind starts a cluster-wide informer
-// whose LIST is then forbidden -- the call does not fail, it blocks in
-// WaitForCacheSync, and with one reconcile worker that is every
-// PlatformAgent in the cluster stopped (the same trap documented on the
-// gateway's own credential reads below). So the Secret goes through
+// load-bearing rather than tidy: the manager does not watch Secrets, and a
+// cached Get of an unwatched kind starts a cluster-wide Secret informer that
+// holds every Secret in the cluster in operator memory and blocks in
+// WaitForCacheSync wherever list/watch on secrets is trimmed -- with one
+// reconcile worker that stops every PlatformAgent in the cluster (the same
+// trap documented on the gateway's own credential reads below). So the Secret
+// goes through
 // a2aReader, the same uncached client the other A2A Secrets use, and the
 // entry list carries the reader beside each object so the choice is made
 // once, next to the object it is made for.

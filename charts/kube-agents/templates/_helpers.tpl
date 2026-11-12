@@ -209,6 +209,32 @@ keeps the container's env free of a duplicate name. `| default dict` because
 - name: A2A_MCP_DOOR
   value: "true"
 {{- end -}}
+{{- with (.Values.operator.slackTestUsers | default list) }}
+{{- if not (hasKey $named "A2A_SLACK_TEST_USERS") }}
+- name: A2A_SLACK_TEST_USERS
+  value: {{ join "," . | quote }}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Whether the A2A bus's pods carry the NATS exporter sidecar, so its PodMonitoring and
+scrape-alert job render: "true" unless the operator omits the sidecar, which it does when
+operator.extraEnv sets A2A_NATS_IMAGE and not A2A_NATS_EXPORTER_IMAGE
+(a2aNATSExporterOmitted). An entry counts as set when it has a non-empty value or a
+valueFrom. Without the sidecar the scrape would only ever read down.
+*/}}
+{{- define "kube-agents.a2aNATSExporterRendered" -}}
+{{- $set := dict -}}
+{{- range $e := (.Values.operator.extraEnv | default list) -}}
+{{- $e = $e | default dict -}}
+{{- if or (ne (toString (index $e "value" | default "")) "") (index $e "valueFrom") -}}
+{{- $_ := set $set (toString (index $e "name")) true -}}
+{{- end -}}
+{{- end -}}
+{{- if or (not (hasKey $set "A2A_NATS_IMAGE")) (hasKey $set "A2A_NATS_EXPORTER_IMAGE") -}}
+true
+{{- end -}}
 {{- end }}
 
 {{/*
@@ -238,6 +264,74 @@ true
 {{- end -}}
 {{- else if $explicit -}}
 true
+{{- end -}}
+{{- end }}
+
+{{/*
+hindsight.api.networkPolicy.additionalEgress as NetworkPolicyEgressRule items,
+one YAML list. The values take the shape of spec.networkPolicy.additionalEgress
+on the PlatformAgent CR -- to[].cidr with an optional to[].except, and
+ports[].protocol / ports[].port -- so an install that already names a peer for
+the agent's gateway policy writes the same thing here. Peers are CIDR blocks
+only, as the CR's are, and values.schema.json bounds them the way the CRD
+does. The schema admits what the CRD admits, so each peer also goes through
+openaiCompatibleCIDRRefusal, the check the gateway's egressCIDRs take (the
+operator's own check on those upstream CIDRs): a malformed address, an
+IPv4-mapped IPv6 block, a peer in a link-local range or inside fd20:ce::/48
+fails the render rather than rendering as the whole internet or a path to
+the metadata server. A bare address, as a peer or an except, is written out
+as a /32 or /128, as the operator canonicalises one on the CR; the
+NetworkPolicy API rejects an ipBlock without a prefix. An except is widened
+but not checked: one outside its peer is rejected by the API server, as the
+values comment says. A rule without ports opens every port to its peers,
+which is the NetworkPolicy API's own reading of it.
+*/}}
+{{- define "kube-agents.hindsightAdditionalEgress" -}}
+{{- $rules := list -}}
+{{- range . -}}
+{{- $peers := list -}}
+{{- range .to -}}
+{{- $cidr := include "kube-agents.cidrWithHostPrefix" .cidr -}}
+{{- with include "kube-agents.openaiCompatibleCIDRRefusal" $cidr -}}
+{{- fail (printf "hindsight.api.networkPolicy.additionalEgress peer %q %s." $cidr .) -}}
+{{- end -}}
+{{- $block := dict "cidr" $cidr -}}
+{{- $excepts := list -}}
+{{- range .except -}}
+{{- $excepts = append $excepts (include "kube-agents.cidrWithHostPrefix" .) -}}
+{{- end -}}
+{{- with $excepts -}}
+{{- $_ := set $block "except" . -}}
+{{- end -}}
+{{- $peers = append $peers (dict "ipBlock" $block) -}}
+{{- end -}}
+{{- $rule := dict "to" $peers -}}
+{{- with .ports -}}
+{{- $ports := list -}}
+{{- range . -}}
+{{- $ports = append $ports (dict "port" .port "protocol" .protocol) -}}
+{{- end -}}
+{{- $_ := set $rule "ports" $ports -}}
+{{- end -}}
+{{- $rules = append $rules $rule -}}
+{{- end -}}
+{{- toYaml $rules -}}
+{{- end }}
+
+{{/*
+A CIDR as written, or a bare address with its host prefix appended: /32 for
+IPv4, /128 for IPv6. The NetworkPolicy API rejects an ipBlock without a
+prefix, and the operator canonicalises a bare address on the CR the same way.
+Takes the value; returns the string, trimmed.
+*/}}
+{{- define "kube-agents.cidrWithHostPrefix" -}}
+{{- $ipv4HostPrefix := 32 -}}
+{{- $ipv6HostPrefix := 128 -}}
+{{- $cidr := toString . | trim -}}
+{{- if contains "/" $cidr -}}
+{{- $cidr -}}
+{{- else -}}
+{{- printf "%s/%d" $cidr (ternary $ipv6HostPrefix $ipv4HostPrefix (contains ":" $cidr)) -}}
 {{- end -}}
 {{- end }}
 
@@ -2545,6 +2639,15 @@ autopilotRequests are the requests on GKE Autopilot (credentialProxyAutopilotCPU
 credentialProxyAutopilotMemoryRequest), where the limits are clamped to the requests and only
 the request buys CPU; the quota preflight counts them where kube-agents.gkeAutopilot holds.
 */}}
+{{- /*
+kube-agents.credentialProxyExecReplicas is
+platformAgent.deployment.credentialProxy.exec.replicas, 0 when unset: the exec
+tier's replica count, which gates the tier's scrape objects and its quota term.
+*/}}
+{{- define "kube-agents.credentialProxyExecReplicas" -}}
+{{- dig "exec" "replicas" 0 (.Values.platformAgent.deployment.credentialProxy | default dict) | int -}}
+{{- end -}}
+
 {{- define "kube-agents.credentialProxyDefaults" -}}
 {{- dict
       "requests" (dict "cpu" "500m" "memory" "1Gi")
@@ -2771,6 +2874,25 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
 {{- if not (hasKey $props .field) -}}
 {{- $crdPath := join "." (append (prepend .path "spec") .field) -}}
 {{- fail (printf "%s is set, but the installed PlatformAgent CRD predates %s and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/, or run upgrade.sh, which does). Otherwise the API server prunes the value silently while the release record keeps it" .value $crdPath) -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{- /* kube-agents.crdFieldGuard's twin for a top-level AgentProfile spec field the
+       chart renders: helm upgrade doesn't apply crds/, and an AgentProfile CRD from
+       before the field prunes it silently, which for a routing field like
+       yieldToPinned changes where tasks go with no error. */ -}}
+{{- define "kube-agents.agentProfileFieldGuard" -}}
+{{- $crd := lookup "apiextensions.k8s.io/v1" "CustomResourceDefinition" "" "agentprofiles.kubeagents.x-k8s.io" -}}
+{{- if $crd -}}
+{{- $props := dict -}}
+{{- range $crd.spec.versions -}}
+{{- if .storage -}}
+{{- $props = dig "schema" "openAPIV3Schema" "properties" "spec" "properties" (dict) . -}}
+{{- end -}}
+{{- end -}}
+{{- if not (hasKey $props .field) -}}
+{{- fail (printf "%s renders spec.%s, but the installed AgentProfile CRD predates it and helm upgrade does not update CRDs; apply charts/kube-agents/crds/ first (kubectl apply --server-side -f charts/kube-agents/crds/, or run upgrade.sh, which does). Otherwise the API server prunes the field silently" .value .field) -}}
 {{- end -}}
 {{- end -}}
 {{- end }}
@@ -3185,6 +3307,31 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
     {{- end -}}
   {{- end -}}
 
+  {{- /* The credential broker's exec tier: one replica's worth from the footprint
+         (operatorRenderedPerReplica, read from the operator's one-replica golden),
+         times platformAgent.deployment.credentialProxy.exec.replicas. Outside the loop
+         above, which sums each operatorRendered entry once. A positive count with no
+         entry fails rather than counting the tier as zero. Its cpu, memory and
+         ephemeral storage are fixed (credential_proxy_exec_tier.go), so an override
+         of the broker's resources does not reach it and the entry is counted as it
+         is. No surge term: the tier rolls with maxSurge 0 and maxUnavailable 1, so
+         a rollout replaces a pod in place and adds none. This
+         counts the quota only; whether the nodes have room for a 2 CPU pod is the
+         scheduler's, which this cannot see. */ -}}
+  {{- $execReplicas := include "kube-agents.credentialProxyExecReplicas" . | int64 -}}
+  {{- if gt $execReplicas 0 -}}
+    {{- $exec := index ((index $footprint "operatorRenderedPerReplica") | default dict) "credentialProxyExecTier" | default dict -}}
+    {{- if not $exec -}}
+      {{- fail "quota preflight: platformAgent.deployment.credentialProxy.exec.replicas is set, but footprint.yaml has no operatorRenderedPerReplica.credentialProxyExecTier entry to size it. Reinstall from an intact chart, or set quotaPreflight.enabled=false to skip the check." -}}
+    {{- end -}}
+    {{- $reqPods = include "kube-agents.satAdd" (dict "a" $reqPods "b" (include "kube-agents.satMul" (dict "a" ($exec.pods | default 1 | int64) "b" $execReplicas))) | int64 -}}
+    {{- $reqCpu = include "kube-agents.satAdd" (dict "a" $reqCpu "b" (include "kube-agents.satMul" (dict "a" ($exec.cpuMillisRequest | default 0 | int64) "b" $execReplicas))) | int64 -}}
+    {{- $limCpu = include "kube-agents.satAdd" (dict "a" $limCpu "b" (include "kube-agents.satMul" (dict "a" ($exec.cpuMillisLimit | default 0 | int64) "b" $execReplicas))) | int64 -}}
+    {{- $reqMem = include "kube-agents.satAdd" (dict "a" $reqMem "b" (include "kube-agents.satMul" (dict "a" ($exec.memoryBytesRequest | default 0 | int64) "b" $execReplicas))) | int64 -}}
+    {{- $limMem = include "kube-agents.satAdd" (dict "a" $limMem "b" (include "kube-agents.satMul" (dict "a" ($exec.memoryBytesLimit | default 0 | int64) "b" $execReplicas))) | int64 -}}
+    {{- $reqEph = include "kube-agents.satAdd" (dict "a" $reqEph "b" (include "kube-agents.satMul" (dict "a" ($exec.ephemeralStorageBytesRequest | default 0 | int64) "b" $execReplicas))) | int64 -}}
+    {{- $limEph = include "kube-agents.satAdd" (dict "a" $limEph "b" (include "kube-agents.satMul" (dict "a" ($exec.ephemeralStorageBytesLimit | default 0 | int64) "b" $execReplicas))) | int64 -}}
+  {{- end -}}
   {{- /* Next mode's own workloads: NATS, the auth callouts, the verifiers, the console,
          the A2A gateway and the provisioning Job, each a total over its replicas, plus the
          JetStream claim. None has a sizing override in the chart. An entry marked `surges`
@@ -3380,12 +3527,30 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
          satMul/satAdd, as above: parseBytes clamps an oversized size to MaxInt64,
          and dataClaims times that would wrap the total negative. Both take a
          negative delta. */ -}}
-  {{- with (.Values.platformAgent.storage | default dict).size -}}
+  {{- $storageValues := .Values.platformAgent.storage | default dict -}}
+  {{- if or $storageValues.size $storageValues.expectedClusterProfiles -}}
     {{- if not (and (hasKey $storage "dataClaims") (hasKey $storage "dataClaimBytesRequest")) -}}
-      {{- fail "quota preflight: footprint.yaml has no dataClaims or dataClaimBytesRequest, so platformAgent.storage.size cannot be counted. Reinstall from an intact chart, or set quotaPreflight.enabled=false to skip the check." -}}
+      {{- fail "quota preflight: footprint.yaml has no dataClaims or dataClaimBytesRequest, so platformAgent.storage.size and platformAgent.storage.expectedClusterProfiles cannot be counted. Reinstall from an intact chart, or set quotaPreflight.enabled=false to skip the check." -}}
     {{- end -}}
-    {{- $dataClaimDelta := sub (include "kube-agents.parseBytes" . | int64) ($storage.dataClaimBytesRequest | int64) -}}
+    {{- $defaultBytes := $storage.dataClaimBytesRequest | int64 -}}
+    {{- $sizedBytes := $defaultBytes -}}
+    {{- with $storageValues.size -}}
+      {{- $sizedBytes = include "kube-agents.parseBytes" . | int64 -}}
+    {{- end -}}
+    {{- $dataClaimDelta := sub $sizedBytes $defaultBytes -}}
     {{- $reqStorage = include "kube-agents.satAdd" (dict "a" $reqStorage "b" (include "kube-agents.satMul" (dict "a" ($storage.dataClaims | int64) "b" $dataClaimDelta))) | int64 -}}
+    {{- /* expectedClusterProfiles raises the agent's claim alone, to at least base +
+           N x per-profile rounded up to whole GiB: the operator's dataVolumeBaseSize and
+           perClusterProfileStorage, which tests/test_chart_expected_cluster_profiles.py
+           pins equal to these. */ -}}
+    {{- with $storageValues.expectedClusterProfiles -}}
+      {{- $gib := 1073741824 -}}
+      {{- $need := add 8589934592 (mul (. | int64) 419430400) -}}
+      {{- $formula := mul (div (add $need (sub $gib 1)) $gib) $gib -}}
+      {{- if gt $formula $sizedBytes -}}
+        {{- $reqStorage = include "kube-agents.satAdd" (dict "a" $reqStorage "b" (sub $formula $sizedBytes)) | int64 -}}
+      {{- end -}}
+    {{- end -}}
   {{- end -}}
 {{- end -}}
 

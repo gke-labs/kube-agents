@@ -275,11 +275,36 @@ func main() {
 	// ticker, off the reconcile worker, and the reconciler puts the last
 	// answer on every PlatformAgent's status; see
 	// internal/controller/rbac_selfcheck.go.
+	//
+	// The namespace this pod runs in is read first: the check probes the
+	// namespaced half of the role (the Secret verbs) there. It also feeds the
+	// NetworkPolicy rule that admits the operator to the gateway's and broker's
+	// metrics ports. Both install paths set it from the Downward API; off the
+	// cluster, under `make run`, it is unset, the namespaced permissions are
+	// probed cluster-wide, the rule is not rendered, and the poller is not
+	// started: no pod IP is reachable from there, and a poller that ran anyway
+	// would record a Warning on every CR blaming a NetworkPolicy for the gap.
+	operatorNamespace := os.Getenv(controller.OperatorNamespaceEnv)
+	if operatorNamespace == "" {
+		setupLog.Info("the operator's namespace is unknown; the agent policies will not admit this operator on the metrics ports and status.usage's counters will not advance",
+			"variable", controller.OperatorNamespaceEnv)
+	} else if errs := validation.IsDNS1123Label(operatorNamespace); len(errs) > 0 {
+		// The value becomes kubernetes.io/metadata.name in the metrics rule's
+		// selector, which the API server only ever sets to a namespace's own
+		// (DNS-1123) name, so a value that is not a DNS-1123 label matches no
+		// namespace on any cluster -- and one the selector cannot even carry
+		// would have the API server reject the policy on every reconcile. Clear
+		// it either way, so the rule is not rendered and the poller, which could
+		// reach no pod without it, is not started.
+		setupLog.Info("the operator's namespace is not a valid namespace name (DNS-1123 label); the agent policies will not admit this operator on the metrics ports and status.usage's counters will not advance",
+			"variable", controller.OperatorNamespaceEnv, "value", operatorNamespace)
+		operatorNamespace = ""
+	}
 	var rbacChecker *controller.RBACChecker
 	if clientset, err := kubernetes.NewForConfig(mgr.GetConfig()); err != nil {
 		setupLog.Error(err, "RBAC self-check disabled: could not build a clientset")
 	} else {
-		rbacChecker = controller.NewRBACChecker(clientset.AuthorizationV1().SelfSubjectAccessReviews())
+		rbacChecker = controller.NewRBACChecker(clientset.AuthorizationV1().SelfSubjectAccessReviews(), operatorNamespace)
 		denied, err := rbacChecker.Probe(context.Background())
 		if err != nil {
 			setupLog.Error(err, "RBAC self-check could not run; the controller retries it during reconciles")
@@ -312,29 +337,6 @@ func main() {
 				apiHost = host
 			}
 		}
-	}
-
-	// The namespace this pod runs in, for the NetworkPolicy rule that admits
-	// the operator to the gateway's and broker's metrics ports. Both install
-	// paths set it from the Downward API; off the cluster, under `make run`,
-	// it is unset, the rule is not rendered, and the poller is not started:
-	// no pod IP is reachable from there, and a poller that ran anyway would
-	// record a Warning on every CR blaming a NetworkPolicy for the gap.
-	operatorNamespace := os.Getenv(controller.OperatorNamespaceEnv)
-	if operatorNamespace == "" {
-		setupLog.Info("the operator's namespace is unknown; the agent policies will not admit this operator on the metrics ports and status.usage's counters will not advance",
-			"variable", controller.OperatorNamespaceEnv)
-	} else if errs := validation.IsDNS1123Label(operatorNamespace); len(errs) > 0 {
-		// The value becomes kubernetes.io/metadata.name in the metrics rule's
-		// selector, which the API server only ever sets to a namespace's own
-		// (DNS-1123) name, so a value that is not a DNS-1123 label matches no
-		// namespace on any cluster -- and one the selector cannot even carry
-		// would have the API server reject the policy on every reconcile. Clear
-		// it either way, so the rule is not rendered and the poller, which could
-		// reach no pod without it, is not started.
-		setupLog.Info("the operator's namespace is not a valid namespace name (DNS-1123 label); the agent policies will not admit this operator on the metrics ports and status.usage's counters will not advance",
-			"variable", controller.OperatorNamespaceEnv, "value", operatorNamespace)
-		operatorNamespace = ""
 	}
 
 	reconciler := &controller.PlatformAgentReconciler{
@@ -397,6 +399,25 @@ func main() {
 		setupLog.Info("AgentProfile CRD is not installed on cluster; skipping the AgentProfile controller. Restart the operator after installing the CRD to enable it.")
 	default:
 		setupLog.Error(mapErr, "Failed to discover the AgentProfile kind")
+		os.Exit(1)
+	}
+
+	// The Tier reconciler, gated as the AgentProfile one is (#3659).
+	tierGVK := agentv1alpha1.GroupVersion.WithKind("Tier")
+	_, tierMapErr := mgr.GetRESTMapper().RESTMapping(tierGVK.GroupKind(), tierGVK.Version)
+	tierDenied := controller.TierAccessDenied(rbacChecker)
+	switch {
+	case tierMapErr == nil && len(tierDenied) > 0:
+		setupLog.Error(nil, "The operator's role cannot read Tiers; skipping the Tier controller. Restart the operator after applying the current ClusterRole.", "denied", tierDenied)
+	case tierMapErr == nil:
+		if err := (&controller.TierReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to create controller", "controller", "tier")
+			os.Exit(1)
+		}
+	case meta.IsNoMatchError(tierMapErr):
+		setupLog.Info("Tier CRD is not installed on cluster; skipping the Tier controller. Restart the operator after installing the CRD to enable it.")
+	default:
+		setupLog.Error(tierMapErr, "Failed to discover the Tier kind")
 		os.Exit(1)
 	}
 

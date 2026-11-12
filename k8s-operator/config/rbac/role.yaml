@@ -30,6 +30,7 @@ rules:
       - nodes
       - persistentvolumes
       - pods/log
+      - secrets
     verbs:
       - get
       - list
@@ -50,16 +51,6 @@ rules:
       - podtemplates
     verbs:
       - create
-  - apiGroups:
-      - ""
-    resources:
-      - secrets
-    verbs:
-      - create
-      - delete
-      - get
-      - patch
-      - update
   - apiGroups:
       - admissionregistration.k8s.io
     resourceNames:
@@ -166,6 +157,7 @@ rules:
       - kubeagents.x-k8s.io
     resources:
       - agentplugins
+      - tiers
     verbs:
       - get
       - list
@@ -175,6 +167,7 @@ rules:
     resources:
       - agentplugins/status
       - agentprofiles/status
+      - tiers/status
     verbs:
       - get
       - patch
@@ -327,3 +320,19 @@ rules:
       - storageclasses
     verbs:
       - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: manager-role
+  namespace: kubeagents-system
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    verbs:
+      - create
+      - delete
+      - patch
+      - update

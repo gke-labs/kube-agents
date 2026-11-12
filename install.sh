@@ -640,6 +640,7 @@ PARAM_ENABLE_DRIFT_DETECTOR="${ENABLE_DRIFT_DETECTOR:-}"
 # answer and the run's answer are distinguishable.
 SHELL_ENABLE_DRIFT_DETECTOR="${ENABLE_DRIFT_DETECTOR:-}"
 PARAM_ENABLE_GKE_BACKUP_PLAN="${ENABLE_GKE_BACKUP_PLAN:-}"
+PARAM_DISALLOW_SECRETS_READ="${DISALLOW_SECRETS_READ:-}"
 # Set-ness, never ${VAR:-...}: `--enable-gvisor=` with no value sets this to the empty
 # string, and that has to survive to the validator in main rather than being
 # silently read back as the default. The default itself comes from
@@ -952,6 +953,11 @@ Flags for AI Agents & Automation:
   --enable-gke-backup-plan[=true|false]
                                 Provision a GKE Backup Plan for the cluster
                                 (default: DEFAULT_ENABLE_GKE_BACKUP_PLAN, currently false)
+  --disallow-secrets-read[=true|false]
+                                Omit core secrets (get, list, watch) from the reader
+                                ClusterRole (kubeagents:minimal:<ns>:<name>); when unset,
+                                new installs grant secrets read access and existing installs
+                                keep their current ClusterRole permissions
   --user-profile-enabled=BOOL   Enable user profile persona extensions
                                 (default: DEFAULT_USER_PROFILE_ENABLED,
                                 currently false)
@@ -1291,6 +1297,9 @@ parse_args() {
       --enable-gke-backup-plan|--enable-gke-backup-plan=*)
         PARAM_ENABLE_GKE_BACKUP_PLAN="$(flag_bool_value "$1")"
         validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_GKE_BACKUP_PLAN"; shift ;;
+      --disallow-secrets-read|--disallow-secrets-read=*)
+        PARAM_DISALLOW_SECRETS_READ="$(flag_bool_value "$1")"
+        validate_bool_flag_value "${1%%=*}" "$PARAM_DISALLOW_SECRETS_READ"; shift ;;
       --enable-pubsub-platform|--enable-pubsub|--enable-pubsub-platform=*|--enable-pubsub=*)
         PARAM_ENABLE_PUBSUB_PLATFORM="$(flag_bool_value "$1")"
         validate_bool_flag_value "${1%%=*}" "$PARAM_ENABLE_PUBSUB_PLATFORM"; shift ;;
@@ -2719,6 +2728,11 @@ bootstrap_install_env_file() {
       "A later run without it re-reads the recorded value and plans the BackupPlan's destruction; once a backup has been taken the API refuses that destroy and the apply fails partway instead." \
       true \
       "every later install.sh run"
+    warn_flag_beats_unrecorded_file_value "$destination" DISALLOW_SECRETS_READ --disallow-secrets-read \
+      "${PARAM_DISALLOW_SECRETS_READ:-}" \
+      "A later run without it renders the PlatformAgent from what the file records; upgrade.sh and --menu take no --disallow-secrets-read, so the next of either puts the reader ClusterRole's secrets rule back to the recorded or existing state." \
+      true \
+      "every later install.sh run"
     warn_flag_beats_unrecorded_file_value "$destination" WEB_CONSOLE_ENABLED --enable-web-console \
       "${PARAM_ENABLE_WEB_CONSOLE:-}" \
       "A later run without it renders the web console from what the file records; upgrade.sh and --menu take no --enable-web-console, so the next of either puts the console back to the recorded or default state." \
@@ -3074,6 +3088,9 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" WEB_CONSOLE_ENABLED "${WEB_CONSOLE_ENABLED:-$DEFAULT_ENABLE_WEB_CONSOLE}"
   write_env_var "$tmp" ENABLE_GVISOR "${ENABLE_GVISOR:-$DEFAULT_ENABLE_GVISOR}"
   write_env_var "$tmp" ENABLE_GKE_BACKUP_PLAN "${ENABLE_GKE_BACKUP_PLAN:-$DEFAULT_ENABLE_GKE_BACKUP_PLAN}"
+  if [ -n "${DISALLOW_SECRETS_READ:-}" ]; then
+    write_env_var "$tmp" DISALLOW_SECRETS_READ "${DISALLOW_SECRETS_READ}"
+  fi
   write_env_var "$tmp" ENABLE_PUBSUB_PLATFORM "${PARAM_ENABLE_PUBSUB_PLATFORM:-$DEFAULT_ENABLE_PUBSUB_PLATFORM}"
   write_env_var "$tmp" ENABLE_STOCKOUT_INVESTIGATOR "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}"
   write_env_var "$tmp" ENABLE_DRIFT_DETECTOR "${PARAM_ENABLE_DRIFT_DETECTOR:-$DEFAULT_ENABLE_DRIFT_DETECTOR}"
@@ -5058,8 +5075,8 @@ adopt_live_platform_agent_mode() {
 }
 
 # A first install that mirrors its third-party images ($1, the prefix)
-# defaults to today. next's NATS bus runs three images (nats,
-# prometheus-nats-exporter, nats-box) that are the operator's compiled defaults, which neither this installer nor the
+# defaults to today. next's NATS bus runs four images (nats, nats-box,
+# nats-server-config-reloader, prometheus-nats-exporter) that are the operator's compiled defaults, which neither this installer nor the
 # chart points at a mirror, so on a cluster that pulls only from the mirror
 # the bus would sit in ImagePullBackOff. Only the fallback moves: --mode, an
 # exported PLATFORM_AGENT_MODE, a recorded key and the cluster's live mode all win.
@@ -5070,7 +5087,7 @@ mirrored_first_install_mode() {
   [ "$PLATFORM_AGENT_MODE_FALLBACK" = "next" ] || return 0
   local remedy="Pass --mode=next"
   [ "${PARAM_MENU_MODE:-false}" = "true" ] && remedy="Set PLATFORM_AGENT_MODE=next in ${INSTALL_ENV_FILE}"
-  print_info "This first install mirrors its third-party images (${1}), so it installs spec.mode today rather than next: next's NATS bus pulls nats, prometheus-nats-exporter and nats-box from Docker Hub, and nothing in this install points them at the mirror. ${remedy} to install next anyway."
+  print_info "This first install mirrors its third-party images (${1}), so it installs spec.mode today rather than next: next's NATS bus pulls nats, nats-box, nats-server-config-reloader and prometheus-nats-exporter from Docker Hub, and nothing in this install points them at the mirror. ${remedy} to install next anyway."
   PLATFORM_AGENT_MODE_FALLBACK="today"
 }
 
@@ -8413,6 +8430,9 @@ main() {
   if [ -n "${PARAM_ENABLE_GKE_BACKUP_PLAN:-}" ]; then
     export ENABLE_GKE_BACKUP_PLAN="$PARAM_ENABLE_GKE_BACKUP_PLAN"
   fi
+  if [ -n "${PARAM_DISALLOW_SECRETS_READ:-}" ]; then
+    export DISALLOW_SECRETS_READ="$PARAM_DISALLOW_SECRETS_READ"
+  fi
   export MODEL_PROVIDER="$model_provider"
   export MODEL_DEFAULT_NAME="$model_default_name"
   export MODEL_MAX_TOKENS="$model_max_tokens"
@@ -8422,13 +8442,13 @@ main() {
   platform_agent_mode="${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}"
   export PLATFORM_AGENT_MODE="$platform_agent_mode"
   # The bus's three third-party images are the operator's compiled defaults
-  # (A2A_NATS_IMAGE, A2A_NATS_EXPORTER_IMAGE and A2A_PROVISION_IMAGE in
+  # (A2A_NATS_IMAGE, A2A_PROVISION_IMAGE, A2A_NATS_RELOADER_IMAGE and A2A_NATS_EXPORTER_IMAGE in
   # images.json), which neither this installer nor the chart points at a
   # mirror, so a next install that mirrors its third-party images still pulls
   # those three from Docker Hub.
   if [ "$platform_agent_mode" = "next" ] && [ -n "$third_party_registry_prefix" ]; then
-    print_warning "spec.mode next with a third-party registry prefix: the operator still pulls the NATS bus's three images (nats, prometheus-nats-exporter, nats-box) from Docker Hub. Nothing in this install points them at ${third_party_registry_prefix}."
-    print_info "On a cluster that can pull only from the mirror, the bus stays in ImagePullBackOff until the operator's A2A_NATS_IMAGE, A2A_NATS_EXPORTER_IMAGE and A2A_PROVISION_IMAGE name the mirrored copies (images.json lists all three)."
+    print_warning "spec.mode next with a third-party registry prefix: the operator still pulls the NATS bus's four images (nats, nats-box, nats-server-config-reloader, prometheus-nats-exporter) from Docker Hub. Nothing in this install points them at ${third_party_registry_prefix}."
+    print_info "On a cluster that can pull only from the mirror, the bus stays in ImagePullBackOff until the operator's A2A_NATS_IMAGE, A2A_PROVISION_IMAGE, A2A_NATS_RELOADER_IMAGE and A2A_NATS_EXPORTER_IMAGE name the mirrored copies (images.json lists all four)."
   fi
   export VERTEX_PROJECT_ID="$vertex_project_id"
   export VERTEX_LOCATION="$vertex_location"

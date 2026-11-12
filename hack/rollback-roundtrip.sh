@@ -28,8 +28,9 @@
 #     -2 the same way; this run checks -0, which every bus has). The NATS StatefulSet's
 #     volumeClaimTemplate (a2aNATSDataClaim, "data") stamps it out, so it has
 #     no owner reference, and the StatefulSet's PVC retention policy keeps
-#     claims when the StatefulSet itself is deleted (WhenDeleted: Retain; a
-#     scale-down deletes the claims it removes, which a flip never does). The flip
+#     claims when the StatefulSet itself is deleted (WhenDeleted: Retain), and
+#     in this release on a scale-down too (WhenScaled: Retain; #4225 changes
+#     that with the migration). The flip
 #     forward renders the same template under the same StatefulSet name, and
 #     the StatefulSet controller binds the claim of that name that is already
 #     there.

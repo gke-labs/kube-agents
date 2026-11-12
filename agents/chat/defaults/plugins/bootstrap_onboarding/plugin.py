@@ -1,5 +1,6 @@
 import importlib.util
 import json
+from datetime import datetime, timezone
 import logging
 import math
 import os
@@ -64,6 +65,37 @@ SESSION_SCOPE_ID_ENV = "HERMES_SESSION_SCOPE_ID"
 # the delivery job at whichever chat spoke last. See the README, "One-time
 # means one time".
 GREETED_MARKER = ".bootstrap_greeted"
+# Written by the delivery stage when it filed the first-run report as a ledger
+# issue because nobody had written in chat within a day of the sweep
+# (bootstrap_delivery.REPORT_FILED_FILE, pinned equal by its tests): the
+# report is in that issue, so the first human turn after it is greeted once
+# with a pointer there rather than with a report that is not coming.
+REPORT_FILED_MARKER = ".bootstrap_report_filed"
+# Written by the delivery stage when it retired the report a week after the sweep
+# with nobody aligned (bootstrap_delivery.REPORT_RETIRED_FILE, pinned equal by
+# its tests): nothing to point at, but the first human turn on a durable
+# platform still makes the chat the home channel.
+REPORT_RETIRED_MARKER = ".bootstrap_report_retired"
+REPORT_FILED_URL_KEY = "url"
+URL_SCHEME_PREFIX = "http"
+REPORT_FILED_AT_KEY = "filed_at"
+_FALLBACK_REPORT_FILED = (
+    "This is the first time this person has talked to you since the install. Nobody wrote within a day of "
+    "the discovery sweep, so the first-run inventory report is filed as an issue at {url}{dated} instead of "
+    "being posted into a chat thread. One message of at most 60 words in plain sentences: open \"Hi there, "
+    "I'm kube-agents 👋\" unless the session gives their Slack profile name (a typed name is not one); say "
+    "the report was ready before anyone wrote and is filed at that address, given exactly once after the "
+    "opener and never as the first words; that you only read their clusters, so nothing changed; that a "
+    "change you think should happen comes as a pull request for their team to review; then ask one question, "
+    "\"Want me to start on one of those findings?\", and end on it. If their message is a real ask, answer "
+    "it first in your normal voice, then add those points in two sentences at the end and skip the question; "
+    "if your reply is only an acknowledgement before you work, send that alone. Do not restate the findings, "
+    "name internal agents, list what you can do, claim to have saved anything, apologise, or use hype."
+)
+REPORT_FILED_DATE_FORMAT = "%Y-%m-%d %H:%M"
+REPORT_FILED_DATED_FORMAT = " (filed {date} UTC)"
+# An operator's override of the filed-report instruction, under onboarding/ like the others.
+REPORT_FILED_INSTRUCTIONS = "report_filed.md"
 
 # The eval seam: requests written only by the first-install-hello bench stack
 # (bench/tf/prebuilt/first-install-hello) as files whose names start with this
@@ -84,7 +116,8 @@ GREETED_MARKER = ".bootstrap_greeted"
 # one a failed destroy leaves behind disarms on its own.
 # JSON: {"phrase": str, "variant": str, "written_at": number,
 # "home_channel_set": bool (optional; true adds HOME_CHANNEL_INSTRUCTION),
-# "report": str (required with from_report)}.
+# "report": str (required with from_report), "url": str (required with filed),
+# "filed_at": number (optional with filed)}.
 # The variant names the greeting, or is EVAL_VARIANT_FROM_REPORT: pick it with
 # the opening turn's report check, run on the file the request's "report" names
 # rather than the real report, so a case never puts a file where onboarding
@@ -97,6 +130,13 @@ EVAL_KEY_WRITTEN_AT = "written_at"
 EVAL_KEY_HOME_CHANNEL_SET = "home_channel_set"
 EVAL_VARIANT_COMPLETED = "completed"
 EVAL_VARIANT_FROM_REPORT = "from_report"
+# The greeting for a first turn after the report was filed as a ledger issue:
+# the request carries the issue's address ("url") and, optionally, when it was
+# filed ("filed_at", epoch seconds); the plugin greets exactly as it would from
+# the delivery stage's record, without reading or writing one.
+EVAL_VARIANT_FILED = "filed"
+EVAL_KEY_URL = "url"
+EVAL_KEY_FILED_AT = "filed_at"
 EVAL_KEY_REPORT = "report"
 # A bare file name beside the real report that nothing in onboarding reads.
 EVAL_REPORT_NAME = re.compile(r"\AINVENTORY\.bench-[a-z0-9-]+\.md\Z")
@@ -143,6 +183,8 @@ PRIMING_STALE_SECONDS = 120
 # Written by bootstrap_scan_gate.py when it files the sweep. A sweep older than
 # SCAN_MAX_AGE_SECONDS belongs to an install that ran before this path existed:
 # its first new thread would otherwise get a weeks-old report as onboarding.
+# Delivery retires an undelivered report at the same age
+# (bootstrap_delivery.UNDELIVERED_RETIRE_SECONDS, pinned equal by its tests).
 SCAN_FILED_MARKER = ".bootstrap_scan_filed"
 SCAN_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 CONVERSATION_JOB_ID = "oobe"
@@ -165,7 +207,7 @@ DEFAULT_DATA_DIR = "/opt/data"
 # touches no disk. A gateway restart empties it and leaves the file to age out.
 _greeting_turns: set = set()
 
-# The greeting's word ceiling; both bench cases' at-most-sixty-words check holds it.
+# The greeting's word ceiling; the three first-install-hello bench cases' at-most-sixty-words check holds it.
 GREETING_MAX_WORDS = 60
 
 # Added to the greeting instructions only when this turn made the chat the home
@@ -304,13 +346,14 @@ def _set_home_channel_if_unset(**kwargs: Any) -> bool:
     return True
 
 
-def _eval_request(data_dir: Path, user_message: str) -> Optional[Tuple[bool, bool]]:
+def _eval_request(data_dir: Path, user_message: str) -> Optional[Tuple[Any, bool]]:
     """The eval seam's request whose phrase is in this turn's message, if any.
 
     Returns None when no request names this turn. Else it returns two values:
-    whether to give the completed greeting, and whether to greet as if this
-    turn set the home channel. The file stays for the stack's destroy step, so
-    a retry of the same turn greets again.
+    which greeting to give (True for the completed one, False for the one in
+    progress, or the filed report's record for the pointer greeting), and
+    whether to greet as if this turn set the home channel. The file stays for
+    the stack's destroy step, so a retry of the same turn greets again.
     """
     for marker in sorted(data_dir.glob(f"{EVAL_GREET_MARKER}*")):
         try:
@@ -320,6 +363,8 @@ def _eval_request(data_dir: Path, user_message: str) -> Optional[Tuple[bool, boo
             written_at = request.get(EVAL_KEY_WRITTEN_AT)
             home_channel_set = request.get(EVAL_KEY_HOME_CHANNEL_SET) is True
             report_name = str(request.get(EVAL_KEY_REPORT) or "")
+            url = str(request.get(EVAL_KEY_URL) or "")
+            filed_at = request.get(EVAL_KEY_FILED_AT)
         except FileNotFoundError:
             continue
         except (OSError, ValueError, AttributeError, RecursionError) as e:
@@ -351,9 +396,14 @@ def _eval_request(data_dir: Path, user_message: str) -> Optional[Tuple[bool, boo
         if variant == EVAL_VARIANT_FROM_REPORT and not EVAL_REPORT_NAME.match(report_name):
             logger.warning("Ignoring %s: %s names no report file matching %s.", marker, EVAL_KEY_REPORT, EVAL_REPORT_NAME.pattern)
             continue
+        if variant == EVAL_VARIANT_FILED and not url.startswith(URL_SCHEME_PREFIX):
+            logger.warning("Ignoring %s: %s names no web address.", marker, EVAL_KEY_URL)
+            continue
         logger.info("Matched %s (variant=%s, home_channel_set=%s).", marker, variant, home_channel_set)
         if variant == EVAL_VARIANT_FROM_REPORT:
             return _report_ready(data_dir, report_name), home_channel_set
+        if variant == EVAL_VARIANT_FILED:
+            return {REPORT_FILED_URL_KEY: url, REPORT_FILED_AT_KEY: filed_at}, home_channel_set
         return variant == EVAL_VARIANT_COMPLETED, home_channel_set
     return None
 
@@ -579,6 +629,60 @@ def _prime_conversation(data_dir: Path, session_id: str, turn_id: str = "") -> O
             pass
 
 
+def _human_chat_turn(platform_name: str, session_id: str) -> bool:
+    """Whether this turn is a human's chat turn: a durable platform, or an API-server turn the
+    hermes-bridge relayed from one. Alert, triage and A2A-door turns are API-server turns with no
+    conversation route, and must not spend the one-time greeting."""
+    if platform_name in DURABLE_CHAT_PLATFORMS:
+        return True
+    if platform_name != API_SERVER_PLATFORM:
+        return False
+    try:
+        route = _load_chat_notify().conversation_route(session_id)
+    except Exception as e:  # noqa: BLE001 - no route is the safe answer
+        logger.warning("Could not read the conversation route for %s: %s", session_id, e)
+        return False
+    return bool(route) and route.get("platform") in DURABLE_CHAT_PLATFORMS
+
+
+def _report_filed(data_dir: Path) -> Optional[Dict[str, Any]]:
+    """The delivery stage's record of the filed report, when it carries the issue's address."""
+    try:
+        record = json.loads((data_dir / REPORT_FILED_MARKER).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(record, dict) or not str(record.get(REPORT_FILED_URL_KEY) or "").startswith(URL_SCHEME_PREFIX):
+        return None
+    return record
+
+
+def _fill(template: str, **values: str) -> str:
+    """Substitute ``{name}`` placeholders one by one: an operator's override may hold other braces."""
+    for name, value in values.items():
+        template = template.replace("{" + name + "}", value)
+    return template
+
+
+def _filed_greeting(data_dir: Path, record: Dict[str, Any], home_channel_set: bool = False) -> Dict[str, str]:
+    dated = ""
+    try:
+        stamp = float(record.get(REPORT_FILED_AT_KEY) or 0)
+        if stamp > 0:
+            dated = REPORT_FILED_DATED_FORMAT.format(
+                date=datetime.fromtimestamp(stamp, timezone.utc).strftime(REPORT_FILED_DATE_FORMAT)
+            )
+    except (TypeError, ValueError, OverflowError, OSError):
+        dated = ""
+    instructions = _fill(
+        _load_instructions(data_dir, REPORT_FILED_INSTRUCTIONS, _FALLBACK_REPORT_FILED),
+        url=str(record[REPORT_FILED_URL_KEY]), dated=dated,
+    )
+    if home_channel_set:
+        instructions = f"{instructions}\n\n{HOME_CHANNEL_INSTRUCTION}"
+    logger.info("Injecting onboarding greeting instructions (REPORT FILED, home_channel_set=%s).", home_channel_set)
+    return {"context": f"\n\n[SYSTEM ONBOARDING INSTRUCTIONS — REPORT FILED]\n{instructions}\n"}
+
+
 def _greeting(data_dir: Path, completed: bool, home_channel_set: bool = False) -> Dict[str, str]:
     if completed:
         instructions = _load_instructions(data_dir, "scan_completed.md", _FALLBACK_COMPLETED)
@@ -632,7 +736,10 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     if platform_name == EVAL_PLATFORM:
         eval_request = _eval_request(data_dir, str(kwargs.get("user_message") or ""))
         if eval_request is not None:
-            return _greeting(data_dir, *eval_request)
+            which, home_set = eval_request
+            if isinstance(which, dict):
+                return _filed_greeting(data_dir, which, home_set)
+            return _greeting(data_dir, which, home_set)
 
     # A bridged conversation keeps one session, so if its route could not be
     # read (or the bridge could not record it) on the first message, a later
@@ -647,6 +754,26 @@ def handle_pre_llm_call(**kwargs: Any) -> Optional[Dict[str, str]]:
     # API-server turn goes on only to _prime_conversation's route check.
     if platform_name not in DURABLE_CHAT_PLATFORMS and platform_name != API_SERVER_PLATFORM:
         return None
+
+    # The report went to a ledger issue because nobody wrote within a day: the
+    # first human turn after that is told where it is, once; nothing is bound
+    # or primed, since the report is not coming to this thread.
+    # The report left without a human (filed as an issue, or retired a week on): the first human
+    # chat turn after that is told where it went, once, when it went anywhere; and on a durable
+    # platform that turn still makes the chat the home channel when none is configured, as the
+    # greeting turn always did, or every scheduled report stays dropped.
+    filed = _report_filed(data_dir)
+    retired = (data_dir / REPORT_RETIRED_MARKER).exists()
+    if (filed is not None or retired) and not (data_dir / GREETED_MARKER).exists() \
+            and _human_chat_turn(platform_name, session_id):
+        home_set = platform_name in DURABLE_CHAT_PLATFORMS and _set_home_channel_if_unset(**kwargs)
+        # Built before the marker is written, so an instruction that cannot be built spends nothing.
+        greeting = _filed_greeting(data_dir, filed, home_set) if filed is not None else None
+        try:
+            (data_dir / GREETED_MARKER).touch(exist_ok=True)
+        except OSError as e:
+            logger.warning("Could not record the greeting: %s", e)
+        return greeting
 
     # Already delivered, or already primed by an earlier session. Either way
     # onboarding has happened and must not happen again.

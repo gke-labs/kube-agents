@@ -40,6 +40,11 @@ Decisions, per logged request:
   been seen going on from its answer while cases are still running;
 - `unattributed`: once every case is graded, no stored text or a card no run worked;
 - `ambiguous`: no card of its own, and no graded run went on from its answer.
+
+A saved answer is decided by its recording line, or, when that line is left
+unattributed or ambiguous on the last call, by the other lines that sent the
+same request and got the same answer, provided no failing run is tied to any of
+them (Attribution.decide_answer).
 """
 
 from __future__ import annotations
@@ -53,7 +58,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple
 import replay_cache
 import schema as F
 
-CARD_RE = re.compile(r"^t_[0-9a-f]{8}$")
+CARD_RE = re.compile(r"^t_[0-9a-f]{8}\Z")
 # Hermes' first message to a worker (bench/kube_agents_bench/worker_trajectory.py reads the same).
 WORKER_OPENING_RE = re.compile(r"\Awork kanban task (t_[0-9a-f]{8})\b")
 CREATE_TOOL = "kanban_create"
@@ -101,7 +106,7 @@ STORE_REQUESTS_DIR = os.path.join("store", "requests")
 STORE_BLOBS_DIR = os.path.join("store", "blobs")
 MESSAGES_KEY = "messages"
 # The names the store writes: a request id (uuid4 hex) and a blob (sha256 hex).
-SAFE_STORE_NAME = re.compile(r"^[0-9a-f]{16,64}$")
+SAFE_STORE_NAME = re.compile(r"^[0-9a-f]{16,64}\Z")
 # An answer's identity in a history: [context, answer] (normalizer.answer_variant).
 ANSWER_PAIR_LENGTH = 2
 TEXT_ENCODING = "utf-8"
@@ -433,6 +438,11 @@ class Attribution:
         # them, never for a run it was not proven for: every one of them sent
         # that request after that answer, since each holds both as a prefix.
         self.went_on: Dict[Tuple[str, Tuple[str, ...]], List[Tuple[List[str], str]]] = {}
+        # Every line by (build, fingerprint): the cache keeps the first answer
+        # to a fingerprint, and later lines sent the same request.
+        self.by_fingerprint: Dict[Tuple[str, str], List[Line]] = {}
+        for line in logs.lines:
+            self.by_fingerprint.setdefault((line.build, line.fingerprint), []).append(line)
         for line in sorted(logs.lines, key=lambda l: -len(l.chain)):
             run = self.run_of(line)
             proven: Set[str] = {run} if run is not None else set()
@@ -498,6 +508,53 @@ class Attribution:
         if evidence:
             return Decision(FAIL, tuple(sorted(evidence)))
         return Decision(AMBIGUOUS)
+
+    def decide_answer(self, saved: Line) -> Decision:
+        """The decision for the answer `saved` recorded: its own, or other lines' that got the same answer.
+
+        The cache keeps the first answer to a fingerprint, so when traffic no
+        graded run owns (an alert's triage, another Cluster Agent's turn) sent a
+        request first, a run that later sent the same request is never the
+        recording line. A line of the same build and fingerprint whose own
+        answer is the saved one (`answer_variant`, the identity a
+        continuation's `prior_answer` is checked against) proves its runs got
+        that answer to that request. Only a recording line left unattributed or
+        ambiguous on the last call takes that evidence, and only when no failing
+        run is tied to the saved line or to any line that got the same answer
+        (`_tied_runs`), whatever those lines' own decisions say.
+        """
+        decision = self.decide(saved)
+        if decision.decision not in (UNATTRIBUTED, AMBIGUOUS) or saved.answer_variant is None:
+            return decision
+        if self._any_failed(self._tied_runs(saved)):
+            return decision
+        passed: Set[str] = set()
+        for other in self.by_fingerprint.get((saved.build, saved.fingerprint), []):
+            if other.request_id == saved.request_id or other.answer_variant != saved.answer_variant:
+                continue
+            if self._any_failed(self._tied_runs(other)):
+                return decision
+            found = self.decide(other)
+            if found.decision == PASS:
+                passed.update(found.runs)
+        if passed:
+            return Decision(PASS, tuple(sorted(passed)))
+        return decision
+
+    def _tied_runs(self, line: Line) -> Set[str]:
+        """Every graded run a line is tied to: its own cards' runs, even beside a card no run worked,
+        and, with no card of its own, the runs seen going on from its answer. A decision keeps only
+        some of them (PASS drops a failing run that also went on), so the publish guard reads these."""
+        own = self._own(line)
+        if own is None:
+            return set()
+        runs, unknown = own
+        if runs or unknown:
+            return set(runs)
+        return self._went_on_from(line)
+
+    def _any_failed(self, runs: Set[str]) -> bool:
+        return any(not self.runs[run].passed for run in runs)
 
     def run_of(self, line: Line) -> Optional[str]:
         """The one run a request names by its own IDs, for the lane's per-run counts; None otherwise."""

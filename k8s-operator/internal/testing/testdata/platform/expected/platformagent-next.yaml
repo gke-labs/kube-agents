@@ -62,6 +62,7 @@ rules:
       - limitranges
       - configmaps
       - serviceaccounts
+      - secrets
     verbs:
       - get
       - list
@@ -410,11 +411,15 @@ data:
       ssh_key: /etc/sandbox-ssh/id_ed25519
       ssh_port: 2222
       ssh_user: agent
+      timeout: 180
       workspace_root: /opt/data
   managed.env: |
     API_SERVER_KEY=cluster-internal-trusted
     HERMES_HOME_MODE=2770
     KUBEAGENTS_MODE=next
+    KUBEAGENTS_POST_MERGE_CHECK=off
+    KUBEAGENTS_AUTOMERGE=off
+    KUBEAGENTS_DIAL=off
     KUBEAGENTS_SCOPE_FILE=/etc/kube-agents/scope.json
     RECONCILE_PROJECT=
     GKE_PROJECT_ID=example-project
@@ -698,6 +703,26 @@ metadata:
 type: Opaque
 ---
 apiVersion: v1
+data:
+  ca.crt: <GENERATED_FOR_TESTS>
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-kube-proxy-ca-bundle
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
+apiVersion: v1
 kind: Service
 metadata:
   labels:
@@ -791,7 +816,7 @@ spec:
             - name: CREDENTIAL_PROXY_AUDIENCE
               value: kubeagents-credential-proxy
             - name: CREDENTIAL_PROXY_ALLOWED_CALLERS
-              value: system:serviceaccount:kubeagents-system:platformagent-gateway-agent,system:serviceaccount:kubeagents-system:platformagent-shell,system:serviceaccount:kubeagents-system:platformagent-a2a-gateway
+              value: system:serviceaccount:kubeagents-system:platformagent-shell
             - name: CREDENTIAL_PROXY_KUBE_CA_FILE
               value: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
             - name: CREDENTIAL_PROXY_KUBE_TOKEN_FILE
@@ -802,6 +827,10 @@ spec:
               value: "true"
             - name: OTEL_RESOURCE_ATTRIBUTES
               value: service.namespace=kubeagents-system,k8s.namespace.name=kubeagents-system,kubeagents.agent_type=platform,kubeagents.agent_name=platformagent
+            - name: KUBE_PROXY_SCOPE_FILE
+              value: /etc/kube-agents/scope/scope.json
+            - name: KUBE_PROXY_EXCLUDE_HOST_CLUSTER_ID
+              value: gke_example-project_us-central1-a_cluster-a
           image: ghcr.io/gke-labs/kube-agents/kube-proxy:latest
           imagePullPolicy: IfNotPresent
           lifecycle:
@@ -845,6 +874,9 @@ spec:
             - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
               name: event-watcher-ksa-token
               readOnly: true
+            - mountPath: /etc/kube-agents/scope
+              name: platform-agent-scope-vol
+              readOnly: true
       securityContext:
         fsGroup: 10000
         runAsNonRoot: true
@@ -863,6 +895,14 @@ spec:
           topologyKey: kubernetes.io/hostname
           whenUnsatisfiable: ScheduleAnyway
       volumes:
+        - configMap:
+            defaultMode: 292
+            items:
+              - key: scope.json
+                path: scope.json
+            name: platformagent-config
+            optional: true
+          name: platform-agent-scope-vol
         - name: kube-proxy-tls
           secret:
             defaultMode: 288
@@ -3375,10 +3415,12 @@ stringData:
     server_name: $POD_NAME
     port: 4222
     http: 8222
+    # For the reloader in the same pod, which signals this PID when the mounted
+    # config changes.
+    pid_file: "/var/run/nats/nats.pid"
 
-    # For the preStop hook's lame-duck signal (buildA2ANATSStatefulSet).
-    pid_file: "/data/nats-server.pid"
-    # How long a stopping server spreads its clients' reconnects over.
+    # How long a stopping server spreads its clients' reconnects over. The
+    # preStop hook signals the pid in pid_file above.
     lame_duck_duration: "30s"
 
     cluster {
@@ -3432,8 +3474,8 @@ stringData:
     # the console server is encrypted and verified against the bus CA. The
     # Service is ClusterIP, so nothing OUTSIDE the cluster reaches this listener.
     # An ingress NetworkPolicy fences the pod network too: 4222 from the
-    # enumerated bus clients, 9222 from the console server alone, and no
-    # pod-network peer for 8222. The console server is admitted because it is the
+    # enumerated bus clients, 9222 from the console server alone, and 8222 from
+    # the operator's pod alone. The console server is admitted because it is the
     # page's proxy. A browser reaches it through a kubectl port-forward and it
     # forwards the websocket here over wss, with the browser's headers intact. It
     # is not an in-cluster door for anything else. A port-forward straight to
@@ -4141,7 +4183,7 @@ spec:
                 command:
                   - nats-server
                   - --signal
-                  - ldm=/data/nats-server.pid
+                  - ldm=/var/run/nats/nats.pid
           name: nats
           ports:
             - containerPort: 4222
@@ -4178,6 +4220,40 @@ spec:
               readOnly: true
             - mountPath: /data
               name: data
+            - mountPath: /var/run/nats
+              name: nats-pid
+        - args:
+            - -pid
+            - /var/run/nats/nats.pid
+            - -config
+            - /etc/nats/nats.conf
+          image: natsio/nats-server-config-reloader:0.25.0@sha256:24bacde6b844f8875f93424ed153d33b3d9e9367fcccc14b683eb71fab3a4d8c
+          name: reloader
+          resources:
+            limits:
+              cpu: 50m
+              ephemeral-storage: 64Mi
+              memory: 32Mi
+            requests:
+              cpu: 10m
+              ephemeral-storage: 64Mi
+              memory: 16Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+          volumeMounts:
+            - mountPath: /etc/nats
+              name: config
+              readOnly: true
+            - mountPath: /etc/nats-tls
+              name: tls
+              readOnly: true
+            - mountPath: /var/run/nats
+              name: nats-pid
+              readOnly: true
         - args:
             - -port=7777
             - -varz
@@ -4212,7 +4288,7 @@ spec:
             - /prometheus-nats-exporter
           env:
             - name: GOMEMLIMIT
-              value: 160MiB
+              value: 153MiB
           image: natsio/prometheus-nats-exporter:0.20.3@sha256:4b8ddc1c86fec360b5cd3d5e1fbc6fb52bdafd5805bba3901cc52926538af255
           name: nats-exporter
           ports:
@@ -4242,6 +4318,7 @@ spec:
         runAsUser: 1000
         seccompProfile:
           type: RuntimeDefault
+      shareProcessNamespace: true
       terminationGracePeriodSeconds: 60
       topologySpreadConstraints:
         - labelSelector:
@@ -4258,6 +4335,9 @@ spec:
           topologyKey: topology.kubernetes.io/zone
           whenUnsatisfiable: ScheduleAnyway
       volumes:
+        - emptyDir:
+            sizeLimit: 1Mi
+          name: nats-pid
         - name: config
           secret:
             secretName: platformagent-a2a-nats-config

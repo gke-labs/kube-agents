@@ -875,7 +875,7 @@ grades the record: the acknowledgement a repetition holds when the delegation wa
 still running, which then reaches the ceiling's own infra class; a reply that relays the delegated worker's
 provider rate limit or billing stop on a line of its own; and the acknowledgement the harness graded after it
 could not read the session store. A write the reply did name spent allowance, so a duplicate opened beside
-it still blocks. The carve-out reads the case's own requesting checks, which the pinned grader has; a case that requests a pull request only through the lane `requesting:` listing is not distinguished (the grader is pinned to `bench/` and cannot read this file), so its infra-ended repetition blocks (#4778). A write is charged to a repetition
+it still blocks. The carve-out reads the case's own requesting checks and its top-level `requested_pull_requests` key, both in the task file the pinned grader has, which is why the count lives there and not in the lane safeguards file (the grader is pinned to `bench/` and cannot read it). A write is charged to a repetition
 whose reply, or whose call that created the write (a `submit-suggestion`, `vcs.py` or raw
 push or create, its own or a delegated worker's; never a read's argument), names it (its URL or
 its branch); a write in the window that the repetition does not name is recorded under
@@ -888,7 +888,7 @@ included, and on GitHub without `EVAL_LEDGER_APP_KEY_FILE` it refuses unless
 learned on the first repetition, whose check errors naming the repository and the missing permission.
 The task files under `bench/tasks/` are untouched. A case that
 requests a pull request (a `pull_request_opened` or `pull_request_diff_contains` check of its
-own) is allowed the ones its reply names, and the script runs those cases, the stopped asks and
+own, or its top-level `requested_pull_requests` key) is allowed the ones its reply names, and the script runs those cases, the stopped asks and
 the cases that declare `writes_alone: true` in a second phase after every other unit has finished, one at a time and each after a settle as long as the
 check's clock-skew tolerance, so a repetition that requests nothing never shares the repository
 with one that writes by design and no window reaches back into the unit before.
@@ -927,9 +927,9 @@ version key does not carry the serving provider
 sides of the switch at the same key. A step in cost or latency from that night has this cause.
 The first night, 2026-11-06, made about 13,300 agent calls across four leased projects (main-a
 6,355, main-b 4,910, writers 1,121, the two GitLab jobs 951) with 0 rate-limit responses and 11
-transient 503s. The two Argon smoke presubmits and `post-kube-agents-eval-rc` moved the same way on
-2026-11-06, so the blocking gate's record has the same step from that day; the Claude and Flash
-smoke jobs and the forge smoke variants stay on Vertex AI.
+transient 503s. The blocking and today smoke presubmits and `post-kube-agents-eval-rc` moved the same way on
+2026-11-06, so the blocking gate's record has the same step from that day. Since then each lane's
+provider comes from its eval-model pair ([`ci-pool-projects.md`](ci-pool-projects.md) 5.10).
 
 ## The GitLab lane
 

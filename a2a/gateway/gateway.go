@@ -219,6 +219,9 @@ type Gateway struct {
 	// profiles is the AgentProfiles this gateway can address, kept from
 	// their cards on DIRECTORY (startProfileDirectory).
 	profiles *profileDirectory
+	// resolvedScope reads the scope publisher's ConfigMap (SetResolvedScope);
+	// nil when none is configured.
+	resolvedScope resolvedScopeSource
 	// relayInFlight counts the relay batches rendering (relayBatch), which a
 	// stop waits for.
 	relayInFlight inFlight
@@ -1177,9 +1180,10 @@ func (g *Gateway) verifySender(msg InboundMessage) (backend, principal string, o
 		// else's message, and the adapter tells the clicker privately
 		// (InboundMessage.Shortcut).
 		//
-		// Nor for a press of Slack's Stop button: it asked the bot for
-		// nothing, and the notice would land in a thread the channel reads.
-		notified := msg.Unaddressed || msg.Shortcut || isSlackStop(msg, backend)
+		// Nor for a press of a Stop button, Slack's or Google Chat's: it
+		// asked the bot for nothing, and the notice, which names the
+		// presser, would land in a thread the channel reads.
+		notified := msg.Unaddressed || msg.Shortcut || isSlackStop(msg, backend) || isChatStopPress(msg, backend)
 		if !notified {
 			key := droppedNoticeKey(backend, msg.AuthorID)
 			g.mu.Lock()
@@ -1305,7 +1309,7 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		// Post-flip, every conversation is a session already, so
 		// "/session <text>" is <text>: the ordinary turn it would have been
 		// without the prefix, not a confirmation that drops the ask.
-		msg.Text, sessionCmd = sessionRest, false
+		msg, sessionCmd = wordsAfter(msg, sessionRest), false
 	}
 	// The bare "/feedback" and "/feedback summary" are answered in place
 	// whatever the conversation's route or task state; any other text after
@@ -1369,19 +1373,22 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		// chattext.IsStatusQuery is a phrase set, so a real question such
 		// as "how is the deploy doing" still starts a task.
 		g.post(rec.Key, topLevelNothingRunningNotice)
-	case stopping && isSlackStop(msg, backend) &&
-		!mayStop(rec, backend, TaskRequester{Backend: backend, Subject: requesterSubject(g.ps, backend, msg.AuthorID)}):
-		// Only the people who asked for work in a Slack thread may press
-		// its Stop button (stopgate.go). Anyone else's press cancels
-		// nothing and posts nothing. A typed `stop` keeps the rule below.
-		g.log.Info("slack stop refused: not a requester in this conversation", "conversation", rec.Key)
-	case stopping && isSlackStop(msg, backend) && g.cardStopWanted(rec, msg):
-		g.slackStop(ctx, rec, authority, backend)
 	case stopping && isChatStopPress(msg, backend) && msg.TaskID != "" && (active == nil || active.TaskID != msg.TaskID):
 		// Google Chat's Stop button names its task (gchat_stop.go): a
 		// press on a task that is not the running one is a stale button,
-		// answered on its own line, and cancels nothing.
+		// answered on its own line, and cancels nothing. Read before the
+		// requester gate below: it cancels nothing, so anyone may heal a
+		// dead line.
 		g.chatStopStale(rec, msg)
+	case stopping && isStopPress(msg, backend) &&
+		!mayStop(rec, backend, TaskRequester{Backend: backend, Subject: requesterSubject(g.ps, backend, msg.AuthorID)}):
+		// Only the people who asked for work in a thread may press its Stop
+		// button, Slack's native one or the one drawn on Google Chat
+		// (stopgate.go). Anyone else's press cancels nothing and posts
+		// nothing. A typed `stop` keeps the rule below.
+		g.log.Info("stop press refused: not a requester in this conversation", "backend", backend, "conversation", rec.Key)
+	case stopping && isSlackStop(msg, backend) && g.cardStopWanted(rec, msg):
+		g.slackStop(ctx, rec, authority, backend)
 	case stopping && isChatStopPress(msg, backend) && msg.TaskID != "":
 		// A press on the running task answers on that task's own line, and
 		// posts nothing (chat_stop_press.go). With the card stop armed the
@@ -1514,7 +1521,7 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 			}
 			rec.BusSession = mintSessionName(rec.Profile)
 			rec.Addressee = rec.BusSession
-			msg.Text = rest
+			msg = wordsAfter(msg, rest)
 		} else if rec.SessionRouted {
 			// A new task on the session route goes to the conversation's
 			// live pod when it can take it, and to a fresh incarnation
@@ -1567,6 +1574,53 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 
 	if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
 		g.log.Error("session record write failed", "conversation", rec.Key, "err", err)
+	}
+}
+
+// agentText is the text a turn puts to an agent: the quoted ask the adapter
+// composed beside the member's words, when the message quoted one
+// (InboundMessage.Quoted), and the words otherwise. It is read at the two
+// sinks a turn's text leaves through, startTask and steerTask, and nowhere
+// before: every matcher routeTurn and sessionCommand run on the way there
+// reads Text, the words as typed, so a quote-reply "stop" on a running task
+// stops it, a quote-reply status ask is answered as one where routeTurn
+// answers a status ask at all (a running task; a DM's top level with none),
+// and a bare "delegate" stays the one word IsDelegate refuses; whatever
+// those matchers hand to an agent carries the quote, the same words
+// elsewhere ("status" in a space with nothing running) included. A bare
+// quote has empty Text and a Quoted ask, and no matcher reads "" as its
+// command, so it reaches an agent whole.
+func agentText(msg InboundMessage) string {
+	if msg.Quoted != "" {
+		return msg.Quoted
+	}
+	return msg.Text
+}
+
+// wordsAfter is the turn with rest, what a matcher left of the member's
+// words after taking its command word off them ("/session <text>" is
+// <text>, "delegate <task>" is <task>), in Text's place. A quoted ask opens
+// with the words as typed (InboundMessage.Quoted, "the member's words
+// followed by the message they quoted"), so the command word comes off its
+// head the same way and an agent reads the task and the quote, not the
+// command. A turn with no quote is the rest alone.
+func wordsAfter(msg InboundMessage, rest string) InboundMessage {
+	if msg.Quoted != "" && strings.HasPrefix(msg.Quoted, msg.Text) {
+		msg.Quoted = rest + strings.TrimPrefix(msg.Quoted, msg.Text)
+	}
+	msg.Text = rest
+	return msg
+}
+
+// noteUnreadQuote posts the one line a member is owed when the message they
+// quoted could not be read (InboundMessage.QuotedUnread), in the
+// conversation, ahead of the turn that now reads their words alone. It runs
+// at the two sinks that hand words to an agent, startTask and steerTask,
+// and nowhere else: a "stop" or a status ask the router answers itself never
+// needed the quote, so no line says it was not read.
+func (g *Gateway) noteUnreadQuote(conversation string, msg InboundMessage) {
+	if msg.QuotedUnread {
+		g.post(conversation, gchatQuotedUnreadWords)
 	}
 }
 
@@ -2411,14 +2465,14 @@ func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg In
 	case running && rec.AddressedToOwnSession():
 		// Already on the route with its own task running: the text is what
 		// a plain message would have been, a steer into that task.
-		msg.Text = rest
+		msg = wordsAfter(msg, rest)
 		g.steerTask(ctx, rec, msg, backend, authority)
 		return true
 	case running:
 		g.post(rec.Key, "🧵 session route on — a task is still running, so that message was not sent; send it again when the task finishes")
 		return true
 	}
-	msg.Text = rest
+	msg = wordsAfter(msg, rest)
 	if !g.nextIncarnation(ctx, rec) {
 		return false
 	}
@@ -2914,9 +2968,10 @@ type taskStart struct {
 // startTask opens a turn for a human message, and returns its task id once
 // the submission is on the bus, "" otherwise (startTaskWith).
 func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg InboundMessage, backend, principal string, authority Authority, route *profileRoute) string {
+	g.noteUnreadQuote(rec.Key, msg)
 	taskID, _ := g.startTaskWith(ctx, rec, taskStart{
 		Route:     route,
-		Text:      msg.Text,
+		Text:      agentText(msg),
 		MessageID: msg.MessageID,
 		Click:     msg.Click,
 		Answer:    msg.Answer,
@@ -3250,7 +3305,8 @@ func (g *Gateway) steerTask(ctx context.Context, rec *SessionRecord, msg Inbound
 		g.post(rec.Key, noticeSteerNotSent)
 		return
 	}
-	payload, err := messagePayload(msg.Text, active.TaskID, rec.ContextID)
+	g.noteUnreadQuote(rec.Key, msg)
+	payload, err := messagePayload(agentText(msg), active.TaskID, rec.ContextID)
 	if err != nil {
 		g.log.Error("steer payload build failed", "err", err)
 		return
