@@ -35,17 +35,20 @@ def _block_2a() -> str:
     return text[start:end]
 
 
-def _run_2a(env: dict, secrets: dict) -> subprocess.CompletedProcess:
-    """Runs the 2a block with a fake gcloud that answers `secrets versions access` from secrets."""
+# The fixture's values are fake ids, never credentials; it is named for what it holds
+# (answers by secret name) and not "secrets", which CodeQL's clear-text heuristic reads as
+# a credential (.agents/rules/core_engineering.md, "Name identifiers for what they hold").
+def _run_2a(env: dict, answers: dict) -> subprocess.CompletedProcess:
+    """Runs the 2a block with a fake gcloud that answers `secrets versions access` from answers."""
     tmp = tempfile.TemporaryDirectory()
     bin_dir = pathlib.Path(tmp.name)
-    cases = "\n".join(f'  {name}) printf %s "{value}" ;;' for name, value in secrets.items())
+    cases = "\n".join(f'  {name}) printf %s "{value}" ;;' for name, value in answers.items())
     gcloud = bin_dir / "gcloud"
     gcloud.write_text(textwrap.dedent("""\
         #!/usr/bin/env bash
-        secret=""
-        for a in "$@"; do case "$a" in --secret=*) secret="${a#--secret=}" ;; esac; done
-        case "$secret" in
+        name=""
+        for a in "$@"; do case "$a" in --secret=*) name="${a#--secret=}" ;; esac; done
+        case "$name" in
         """) + cases + "\n  *) exit 1 ;;\nesac\n")
     gcloud.chmod(0o755)
     script = "set -euo pipefail\n" + _deploy_constants() + "\n" + _block_2a() + '\nprintf "ARG %s\\n" ${SLACK_LANE_HELM_ARGS[@]+"${SLACK_LANE_HELM_ARGS[@]}"}\n'
