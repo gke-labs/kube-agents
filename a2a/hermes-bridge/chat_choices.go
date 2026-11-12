@@ -111,12 +111,13 @@ var (
 )
 
 // boldWrapped is _bold_wrapped: whether sentence is one bold run in marker
-// from end to end, its code spans held, so a "**" inside a code span does not
-// read as a second run.
+// from end to end: its code spans held, so a "**" inside a code span does not
+// read as a second run, and no edge marker inside, so an in-word one (2**20)
+// does not either.
 func boldWrapped(sentence, marker string) bool {
 	held, _ := holdCode(sentence)
 	return len(held) > 2*len(marker) && strings.HasPrefix(held, marker) && strings.HasSuffix(held, marker) &&
-		!strings.Contains(held[len(marker):len(held)-len(marker)], marker)
+		edgeCount(held[len(marker):len(held)-len(marker)], marker) == 0
 }
 
 // opensBold is _opens_bold: whether h opens a bold run it does not close, an
@@ -132,8 +133,9 @@ func opensBold(h string) bool {
 	return false
 }
 
-// edgeCount is the number of marker's openers and closers in s, as openerIn
-// and closerIn read them; an in-word marker is neither.
+// edgeCount is _bold_edges: the number of marker's edges in s, as openerIn
+// and closerIn read them; an in-word marker is none, and one that reads as
+// both an opener and a closer is one.
 func edgeCount(s, marker string) int {
 	rs := []rune(s)
 	width := len([]rune(marker))
@@ -326,7 +328,7 @@ func wordCut(sentence string) (string, string, bool) {
 			// Every later space leaves a longer headline.
 			break
 		}
-		last := strings.TrimLeft(strings.Trim(h[strings.LastIndex(h, " ")+1:], clauseEmphasis), clauseOpeners)
+		last := strings.TrimRight(strings.TrimLeft(h[strings.LastIndex(h, " ")+1:], clauseOpeners+clauseEmphasis), clauseEmphasis)
 		if n < clauseHeadlineMin || wordCutHolds[strings.ToLower(last)] || isDigits(last) {
 			continue
 		}

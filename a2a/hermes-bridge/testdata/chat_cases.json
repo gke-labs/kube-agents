@@ -478,6 +478,34 @@
       "body": [
         "…(and the same again for the pods of the other namespace on seeded-c and seeded-b)."
       ]
+    },
+    {
+      "in": "**The 2**20 byte limit on the queue was reached before sunrise on seeded-c (the producer kept writing while every consumer waited on the retired replica in us-central1).**",
+      "headline": "The 220 byte limit on the queue was reached before sunrise on seeded-c…**",
+      "body": [
+        "**…(the producer kept writing while every consumer waited on the retired replica in us-central1).**"
+      ]
+    },
+    {
+      "in": "The (see **`pod-a`**) container on seeded-c points to the retired replica (the one the migration retired last week after the failover test that moved every writer to the new pool in us-central1).",
+      "headline": "The (see pod-a) container on seeded-c points to the retired replica…",
+      "body": [
+        "…(the one the migration retired last week after the failover test that moved every writer to the new pool in us-central1)."
+      ]
+    },
+    {
+      "in": "(xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx (*and* the same again for the pods of the other namespace on seeded-c and seeded-b).",
+      "headline": "(xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…",
+      "body": [
+        "…(*and* the same again for the pods of the other namespace on seeded-c and seeded-b)."
+      ]
+    },
+    {
+      "in": "(xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx (**209** running GKE clusters across all projects in scope since the rollout at noon today).",
+      "headline": "(xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…",
+      "body": [
+        "…(**209** running GKE clusters across all projects in scope since the rollout at noon today)."
+      ]
     }
   ],
   "plain": [

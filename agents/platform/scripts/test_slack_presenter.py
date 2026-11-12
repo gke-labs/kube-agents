@@ -320,6 +320,27 @@ class SplitAnswerTest(unittest.TestCase):
         cut = sp.word_cut("x" * 130 + " (and the same again for the pods of the other namespace on seeded-c and seeded-b).")
         self.assertEqual(cut[0], "x" * 130 + "…")
 
+    def test_a_marker_between_two_non_word_characters_is_one_edge(self):
+        # The closing ** sits between a held code span and ")", where it reads as an opener and a
+        # closer at once: it is one edge, so the run is closed and the cut goes ahead.
+        prose = ("The (see **`pod-a`**) container on seeded-c points to the retired replica (the one the migration "
+                 "retired last week after the failover test that moved every writer to the new pool in us-central1).")
+        headline, body = sp.split_answer(prose)
+        self.assertEqual(headline, "The (see pod-a) container on seeded-c points to the retired replica…")
+        self.assertTrue(body[0].startswith("…(the one"), body)
+        # An in-word ** inside the bold wrap is no edge either: the sentence is still one bold run.
+        bold = ("**The 2**20 byte limit on the queue was reached before sunrise on seeded-c (the producer kept "
+                "writing while every consumer waited on the retired replica in us-central1).**")
+        cut = sp.word_cut(bold)
+        self.assertEqual(cut[0], "**The 2**20 byte limit on the queue was reached before sunrise on seeded-c…**")
+
+    def test_an_emphasised_connector_or_number_behind_a_bracket_is_held(self):
+        # Inside one long bracket, the last word that fits is "(*and*" and then "(**209**": both held.
+        inner = sp.word_cut("(" + "x" * 140 + " (*and* the same again for the pods of the other namespace on seeded-c and seeded-b).")
+        self.assertEqual(inner[0], "(" + "x" * 140 + "…")
+        inner = sp.word_cut("(" + "x" * 140 + " (**209** running GKE clusters across all projects in scope since the rollout at noon today).")
+        self.assertEqual(inner[0], "(" + "x" * 140 + "…")
+
     def test_word_cut_adds_no_second_ellipsis(self):
         # The sentence's own ellipsis stands at the cut: the headline ends on it once, and the rest
         # opens on one of its own.

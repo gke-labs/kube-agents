@@ -125,3 +125,27 @@ func TestWordCutRoundTwo(t *testing.T) {
 		t.Errorf("a bracketed connector: %q, %v", head, ok)
 	}
 }
+
+// A marker between two non-word characters is one edge, an in-word marker
+// inside a bold wrap is none, and an emphasised connector or number behind a
+// bracket is held: the presenter's tests, case for case.
+func TestWordCutRoundThree(t *testing.T) {
+	prose := "The (see **`pod-a`**) container on seeded-c points to the retired replica (the one the migration " +
+		"retired last week after the failover test that moved every writer to the new pool in us-central1)."
+	if head, _, ok := wordCut(prose); !ok || head != "The (see **`pod-a`**) container on seeded-c points to the retired replica…" {
+		t.Errorf("a marker that is opener and closer at once: %q, %v", head, ok)
+	}
+	bold := "**The 2**20 byte limit on the queue was reached before sunrise on seeded-c (the producer kept " +
+		"writing while every consumer waited on the retired replica in us-central1).**"
+	if head, _, ok := wordCut(bold); !ok || head != "**The 2**20 byte limit on the queue was reached before sunrise on seeded-c…**" {
+		t.Errorf("an in-word marker inside a bold wrap: %q, %v", head, ok)
+	}
+	if head, _, ok := wordCut("(" + strings.Repeat("x", 140) + " (*and* the same again for the pods of the other namespace on seeded-c and seeded-b)."); !ok ||
+		head != "("+strings.Repeat("x", 140)+"…" {
+		t.Errorf("an emphasised connector behind a bracket: %q, %v", head, ok)
+	}
+	if head, _, ok := wordCut("(" + strings.Repeat("x", 140) + " (**209** running GKE clusters across all projects in scope since the rollout at noon today)."); !ok ||
+		head != "("+strings.Repeat("x", 140)+"…" {
+		t.Errorf("an emphasised number behind a bracket: %q, %v", head, ok)
+	}
+}

@@ -761,19 +761,27 @@ def split_answer(markdown: str) -> tuple[str, list[str]]:
 
 
 def _bold_wrapped(sentence: str, marker: str) -> bool:
-    """Whether ``sentence`` is one bold run in ``marker`` from end to end, its code spans held, so a
-    ``**`` inside a code span does not read as a second run."""
+    """Whether ``sentence`` is one bold run in ``marker`` from end to end: its code spans held, so a
+    ``**`` inside a code span does not read as a second run, and no edge marker inside, so an
+    in-word one (``2**20``) does not either."""
     held, _spans = _hold_code(sentence)
     return len(held) > 2 * len(marker) and held.startswith(marker) and held.endswith(marker) \
-        and marker not in held[len(marker) : -len(marker)]
+        and not _bold_edges(held[len(marker) : -len(marker)], marker)
+
+
+def _bold_edges(text: str, marker: str) -> int:
+    """How many of ``marker``'s edges ``text`` holds, as :data:`BOLD_EDGES` reads them: an in-word
+    marker is none, and one that reads as both an opener and a closer (between two non-word
+    characters, a held code span or a bracket, say) is one."""
+    opener, closer = BOLD_EDGES[marker]
+    return len({match.start() for pattern in (opener, closer) for match in pattern.finditer(text)})
 
 
 def _opens_bold(head: str) -> bool:
     """Whether ``head`` opens a bold run it does not close: an odd number of edge markers, an opener
     among them. An in-word marker (``DB__HOST``, ``2**20``) is neither edge, as :data:`BOLD_EDGES`
     reads it, so one after a closed run does not reopen it."""
-    return any((len(opener.findall(head)) + len(closer.findall(head))) % 2 and opener.search(head)
-               for marker, (opener, closer) in BOLD_EDGES.items())
+    return any(_bold_edges(head, marker) % 2 and opener.search(head) for marker, (opener, _closer) in BOLD_EDGES.items())
 
 
 def clause_cut(sentence: str) -> tuple[str, str] | None:
@@ -878,7 +886,7 @@ def word_cut(sentence: str) -> tuple[str, str] | None:
         title = len(_plain(_restore_code(head, spans)))
         if title > limit:
             break
-        last = head.rsplit(" ", 1)[-1].strip(CLAUSE_EMPHASIS).lstrip(CLAUSE_OPENERS)
+        last = head.rsplit(" ", 1)[-1].lstrip(CLAUSE_OPENERS + CLAUSE_EMPHASIS).rstrip(CLAUSE_EMPHASIS)
         if title < CLAUSE_HEADLINE_MIN or last.lower() in WORD_CUT_HOLDS or (last.isascii() and last.isdigit()):
             continue
         if depth:
