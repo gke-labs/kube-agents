@@ -156,11 +156,11 @@ type Target struct {
 
 // Trigger is the unattended trigger that started a task, as the grant the
 // verifier checked binds it (#4685): Name is "schedule/<name>" or a bare
-// source ("stall-watch"), Origin is "builtin", and Stream is the report stream
-// the grant binds (only ever the schedule's own name), empty when it binds none. The broker reads it
-// to decide which audit stream a task may write (the broker's reader comes in
-// a later #4685 change). Only AudienceCredentialProxy
-// carries one.
+// source ("stall-watch"), Origin is "builtin", and Stream is the report
+// stream the grant binds (only ever the schedule's own name), empty when it
+// binds none. The broker reads it to decide which audit stream a task may
+// write (the broker's reader comes in a later #4685 change). Only
+// AudienceCredentialProxy carries one.
 type Trigger struct {
 	Name   string `json:"name"`
 	Origin string `json:"origin"`

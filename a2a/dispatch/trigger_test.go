@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -137,6 +139,38 @@ func TestTheProxyTokenCarriesTheAdmittedTrigger(t *testing.T) {
 	natsC := verifyAs(t, confirms[0].TaskCredential, pub, taskcred.AudienceNATS)
 	if natsC.Trigger != nil {
 		t.Errorf("the bus credential carries a trigger %+v", *natsC.Trigger)
+	}
+}
+
+// A checked trigger on a task that names no cluster has no credential-proxy
+// token to ride on: the task still runs, and the drop is logged rather than
+// silent.
+func TestATriggerWithNoClusterToRideOnIsLoggedAsDropped(t *testing.T) {
+	b := newBus(t, "tse-1")
+	b.ensure("tse", 2, 0, "read")
+	w := b.worker("tse", "read", "tse-1", answerAccept, time.Second)
+	ti := oneProfile("tse", 2, "tse-1")
+	ti.pool.SetUID("tse", "read", "tse-1", "uid-tse-1")
+	kp, _ := signingKey(t)
+	logs := &syncBuffer{}
+	b.runKeyedWith(ti, kp, 0, &fakeVerifier{}, func(d *Dispatcher) {
+		d.log = slog.New(slog.NewTextHandler(logs, nil))
+	})
+
+	if err := b.gateway.Publish(b.ctx, lib.TaskSubmitSubject("tse", "read", lib.SubmitKindTop, "task-1"),
+		triggeredEnv(t, "tse", "task-1", "cap-ok", scheduleTriggerJSON, nil)); err != nil {
+		t.Fatal(err)
+	}
+	if ts := b.waitTerminal("task-1", 10*time.Second); ts.state != lib.StateCompleted {
+		t.Fatalf("terminal %+v", ts)
+	}
+	confirms := confirmsOf(w)
+	if len(confirms) != 1 || confirms[0].ProxyToken != "" {
+		t.Fatalf("%d confirms; want one with no proxy token", len(confirms))
+	}
+	out := logs.String()
+	if !strings.Contains(out, "trigger dropped") || !strings.Contains(out, scheduleTrigger.Name) {
+		t.Errorf("no log line for the dropped trigger in:\n%s", out)
 	}
 }
 

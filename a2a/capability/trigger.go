@@ -43,9 +43,10 @@ var triggerKeys = []string{"name", "origin", "stream"}
 
 // TriggerFromAuthority pulls the trigger a submission claims out of an
 // envelope's authority block. The gateway writes it there on a trigger's
-// submission and nowhere else (that half is Track 2 of #4685, not yet built); it is a claim, not authority, until the
-// verifier finds it equal to the grant's (profile.run). nil when the block
-// names none: the block absent or null, or its trigger absent or null.
+// submission and nowhere else (that half is Track 2 of #4685, not yet built);
+// it is a claim, not authority, until the verifier finds it equal to the
+// grant's (profile.run). nil when the block names none: the block absent or
+// null, or its trigger absent or null.
 //
 // It reads the block strictly, the way taskcred reads a credential: no key
 // twice and no key that equals "trigger" (or one of the trigger's own keys)
