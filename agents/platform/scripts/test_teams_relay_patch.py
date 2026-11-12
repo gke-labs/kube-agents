@@ -396,6 +396,11 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(registered), 1)
         self.assertEqual(registered[0]["name"], "teams")
         self.assertEqual(registered[0]["label"], "Microsoft Teams")
+        # Hermes' core authorizer reads the allowlist through these entry
+        # fields; a real tenant answered every sender with the pairing prompt
+        # while they were missing (live test, 2026-11-12).
+        self.assertEqual(registered[0]["allowed_users_env"], "TEAMS_ALLOWED_USERS")
+        self.assertEqual(registered[0]["allow_all_env"], "TEAMS_ALLOW_ALL_USERS")
 
     async def test_teams_relay_adapter_lifecycle_and_message_processing(self):
         from gateway.platform_registry import PlatformRegistry, platform_registry

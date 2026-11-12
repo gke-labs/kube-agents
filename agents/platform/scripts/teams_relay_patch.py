@@ -916,6 +916,11 @@ def register_plugin(ctx: Any) -> None:
         install_hint="",
         standalone_sender_fn=_standalone_sender,
         max_message_length=TEAMS_MAX_MESSAGE_LENGTH,
+        # Hermes' core authorizer looks these up on the registry entry for a
+        # platform it has no built-in mapping for; without them it never reads
+        # TEAMS_ALLOWED_USERS and every sender gets the pairing prompt.
+        allowed_users_env="TEAMS_ALLOWED_USERS",
+        allow_all_env="TEAMS_ALLOW_ALL_USERS",
     )
 
 
@@ -966,10 +971,17 @@ def install() -> None:
                 }
                 # Match the plugin's register_platform entry so the limit does
                 # not depend on which of the two registrations Hermes keeps.
-                if "max_message_length" in getattr(
+                entry_dataclass_fields = getattr(
                     platform_entry_cls, "__dataclass_fields__", {}
-                ):
+                )
+                if "max_message_length" in entry_dataclass_fields:
                     entry_fields["max_message_length"] = TEAMS_MAX_MESSAGE_LENGTH
+                # Same two names as the plugin registration: Hermes' core
+                # authorizer reads the allowlist env from the entry.
+                if "allowed_users_env" in entry_dataclass_fields:
+                    entry_fields["allowed_users_env"] = "TEAMS_ALLOWED_USERS"
+                if "allow_all_env" in entry_dataclass_fields:
+                    entry_fields["allow_all_env"] = "TEAMS_ALLOW_ALL_USERS"
                 entry = platform_entry_cls(**entry_fields)
                 singleton.register(entry)
         except Exception:
