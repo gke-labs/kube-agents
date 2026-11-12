@@ -1088,7 +1088,7 @@ def proposal_url_parts(url: str) -> tuple[str, int] | None:
     # The pattern's greedy group takes the last marker that leaves a valid tail.
     for at, marker in sorted(found, reverse=True):
         start = end = at + len(marker)
-        while end < len(rest) and rest[end].isdigit():
+        while end < len(rest) and rest[end].isdecimal():
             end += 1
         tail = rest[end:]
         if end == start or (tail and tail[0] not in "/?#"):

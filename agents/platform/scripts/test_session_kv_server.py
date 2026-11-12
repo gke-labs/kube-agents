@@ -14166,6 +14166,8 @@ class TestProposalOrigin(unittest.TestCase):
             "https://github.com/pull/5", "https://github.com//pull/5", "http://h/a/pull/0", "https://h/a b/pull/1",
             "ftp://h/a/pull/1", "https://h/a/pull/", "https://h/a/pulls/4/-/x", "https://h/a/pull/4#/pull/5",
             "https://h/-/merge_requests/3/pull/4", "https://h/a/pull-requests/2/merge_requests/3",
+            # \\d is a Unicode decimal: Arabic-Indic digits match, a superscript does not.
+            "https://h/a/pull/\u0663", "https://h/a/pull/1\u00b9", "https://h/a/pull/\u00b9",
         ]
         for url in urls:
             with self.subTest(url=url):
@@ -14194,6 +14196,7 @@ class TestProposalOrigin(unittest.TestCase):
                 "cluster": "c", "object": "Deployment/x", "origin": "audit"}
         for change in (
             {"url": "https://github.com/example/fleet/issues/13"},
+            {"url": "https://github.com/example/fleet/pull/\u00b9"},
             {"url": ""},
             {"finding_id": "no-hpa.c.ns.Deployment/x"},
             {"finding_id": None, "kind": "no-pdb"},
