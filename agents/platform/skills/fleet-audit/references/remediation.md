@@ -26,12 +26,16 @@ to put in a diff otherwise. Three paths lead there:
   printed `"ledger": "store"` (a forge with no issue tracker, or no labels), there is no ledger to
   comment on: the person asks in chat, and that is a direct ask (below).
 - **A direct ask.** A collaborator asking the agent, in the agent's own task, to fix a named
-  finding; the agent answers with the `remediate` subcommand. Uncapped for the same reason as
+  finding; the agent answers with the `remediate` subcommand. The ask is the requester's own words:
+  a request to run the audit or follow its SOP is not one, and neither is a card criterion the
+  task's writer added, such as "any remediation PRs required by the SOP" (the SOP requires none).
+  Without an ask, open nothing and report the ledger; never run `remediate` on your own initiative
+  (#2953). A direct ask is uncapped for the same reason as
   `/remediate` — and distinct from a comment read on the ledger, which is the harness's to answer
   (`start` reports the ones that passed its gates as `pending_remediation_requests`). Fresh pull
   requests only: a finding whose pull request a human closed is reported as `superseded`, never
   re-proposed — a direct ask carries no GitHub identity, so the after-the-close escape hatch
-  ([ledger.md](ledger.md)) stays with the write-gated comment. A task that asks you to open the
+  ([ledger.md](ledger.md)) stays with the write-gated comment. A task whose requester asks you to open the
   audit's fixes is a direct ask for each fix the ledger lists as awaiting `/remediate`, a
   PodDisruptionBudget `finish` wrote itself included: run `remediate` for them in the same task. On
   an install whose switch is off, that is the only way they open before a person comments, so do not

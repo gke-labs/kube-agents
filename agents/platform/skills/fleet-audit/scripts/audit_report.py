@@ -2815,12 +2815,19 @@ def sweep_off_reason() -> str:
 def sweep_off_next_step(noun: str) -> str:
     """What the worker reads when the sweep opens nothing: the two ways a fix
     still opens. A worker that read only "`/remediate` requests" stopped at the
-    ledger when its own task had asked for the fixes, and opened nothing."""
+    ledger when its own task had asked for the fixes, and opened nothing. A
+    worker that read "when this task asks you to open fixes" beside a card
+    criterion the Planning Agent had added ("any remediation PRs required by
+    the SOP") ran `remediate` on an audit nobody asked to fix (#2953), so the
+    ask must be the requester's own words."""
     return (
         f"the automatic sweep opens nothing. A `/remediate` comment on the ledger opens a {noun}, and so "
-        "does a direct ask: when this task asks you to open fixes, run `remediate --finding <id> "
-        "--manifest-file <the collector manifest>` for each one the ledger lists as awaiting `/remediate`, "
-        "a PodDisruptionBudget `finish` writes itself included. Never post `/remediate` yourself."
+        "does a direct ask: only when the requester's own words ask you to open fixes, run `remediate "
+        "--finding <id> --manifest-file <the collector manifest>` for each one the ledger lists as awaiting "
+        "`/remediate`, a PodDisruptionBudget `finish` writes itself included. A request to run the audit is "
+        "not that ask, and neither is a card criterion such as \"any remediation PRs required by the SOP\": "
+        "the SOP requires none, so open nothing and report the ledger. Never run `remediate` on your own "
+        "initiative, and never post `/remediate` yourself."
     )
 
 # The collector manifest (docs/designs/fleet-audit-collector-manifest.md).
