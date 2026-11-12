@@ -55,7 +55,6 @@ DEFAULT_HOST_CLUSTER = "scale-host"
 DEFAULT_HOST_LOCATION = "us-central1-c"
 DEFAULT_NAMESPACE = "kubeagents-system"
 KUBECONFIG_FORMAT = "sized-fleet-{size}.kubeconfig"
-NETWORK_FORMAT = "sized-fleet-{size}"
 VERDICT_FILE = "scale-verdict.json"
 # The label a host cluster carries when its install exists to be measured: a run resets the
 # install's state volumes, and refuses a host without it, as the scale runner does.
@@ -70,17 +69,15 @@ TOFU_PARALLELISM = 32
 TOFU_APPLY_TIMEOUT_SECONDS = 90 * 60
 TOFU_INIT_TIMEOUT_SECONDS = 10 * 60
 TOFU_PLAN_TIMEOUT_SECONDS = 15 * 60
-FIREWALL_DELETE_TIMEOUT_SECONDS = 10 * 60
 TOFU_ARGS_LOGGED = 3
 STDERR_TAIL_CHARS = 2000
 SIGNAL_EXIT_BASE = 128
-# The error a destroy gives when rules outside the stack still use the network.
-NETWORK_IN_USE = "is already being used by"
-FIREWALL_RESOURCE = "/firewalls/"
 ZONE_SUFFIX_SEPARATOR = "-"
 READY_TIMEOUT_SECONDS = 30 * 60
 READY_POLL_SECONDS = 30
 CHURN_POLL_SECONDS = 20
+# One CronJob period (5 minutes) and a margin: by then every client has fired once.
+CHURN_WARMUP_SECONDS = 10 * 60
 DEFAULT_CHURN_MINUTES = 6
 SECONDS_PER_MINUTE = 60
 CLUSTER_PARALLELISM = 8
@@ -203,10 +200,33 @@ def wait_ready(args: argparse.Namespace, fleet: sf.Fleet) -> None:
         time.sleep(READY_POLL_SECONDS)
 
 
+def wait_clients_scheduled(ctx: dict[str, str], selector: str) -> None:
+    """Wait until every client CronJob has fired once, at most CHURN_WARMUP_SECONDS.
+
+    A new CronJob first fires at its next scheduled minute, so a churn window that starts
+    as the fleet comes up counts too few starts: one run measured 22 Pods a minute of 50.
+    """
+    deadline = time.monotonic() + CHURN_WARMUP_SECONDS
+    while True:
+        total = scheduled = 0
+        for context in ctx.values():
+            jobs = kube.kubectl_json(context, "get", "cronjobs", "-A", "-l", selector)["items"]
+            total += len(jobs)
+            scheduled += sum(1 for j in jobs if j.get("status", {}).get("lastScheduleTime"))
+        if scheduled >= total:
+            return
+        if time.monotonic() > deadline:
+            LOG.warning("%d of %d client CronJobs have fired; measuring the churn anyway", scheduled, total)
+            return
+        LOG.info("waiting for the client CronJobs to fire once: %d of %d", scheduled, total)
+        time.sleep(CHURN_POLL_SECONDS)
+
+
 def measure_churn(args: argparse.Namespace, fleet: sf.Fleet, minutes: int) -> float:
     """Client Pods started a minute: the distinct client Pods seen created inside the window."""
     ctx = contexts(args, fleet)
     selector = f"{sf.PART_OF_LABEL}={sf.PART_OF},{sf.COMPONENT_LABEL}={sf.CLIENT}"
+    wait_clients_scheduled(ctx, selector)
     # Whole seconds, as Kubernetes timestamps are: a fractional start drops the Pods created in its own second.
     start = float(int(time.time()))
     seen: set[str] = set()
@@ -410,37 +430,11 @@ def summary(name: str, body: dict) -> str:
                      for w, v in windows.items())
 
 
-def delete_network_firewalls(args: argparse.Namespace) -> list[str]:
-    """Delete every firewall rule on the fleet's own network.
-
-    An organization policy agent can create firewall rules on any new VPC, outside
-    the stack, and a network with rules on it cannot be deleted. The network is the
-    fleet's alone (`sized-fleet-<size>`), so every rule on it goes with it.
-    """
-    network = NETWORK_FORMAT.format(size=args.size.lower())
-    names = kube.gcloud("compute", "firewall-rules", "list", f"--filter=network~/networks/{network}$",
-                        "--format=value(name)", project=args.project).split()
-    if names:
-        kube.gcloud("compute", "firewall-rules", "delete", *names, "--quiet", project=args.project,
-                    timeout=FIREWALL_DELETE_TIMEOUT_SECONDS)
-    return names
-
-
 def cmd_down(args: argparse.Namespace) -> int:
     started = time.time()
     init(args.project, args.size)
-    destroy = ["destroy", "-input=false", "-no-color", "-auto-approve", f"-parallelism={TOFU_PARALLELISM}",
-               *tofu_vars(args)]
-    try:
-        tofu(destroy, timeout=TOFU_APPLY_TIMEOUT_SECONDS, capture=True)
-    except TofuFailed as exc:
-        # Only the failure firewall rules outside the stack cause: anything else (a held state
-        # lock, an API error) must not touch the rules GKE manages on a fleet that may be live.
-        if NETWORK_IN_USE not in exc.output or FIREWALL_RESOURCE not in exc.output:
-            raise
-        removed = delete_network_firewalls(args)
-        LOG.warning("a firewall rule outside the stack held the network; deleted %d, destroying again", len(removed))
-        tofu(destroy, timeout=TOFU_APPLY_TIMEOUT_SECONDS, capture=True)
+    tofu(["destroy", "-input=false", "-no-color", "-auto-approve", f"-parallelism={TOFU_PARALLELISM}",
+          *tofu_vars(args)], timeout=TOFU_APPLY_TIMEOUT_SECONDS)
     LOG.info("fleet %s down in %.0fs", args.size, time.time() - started)
     return 0
 

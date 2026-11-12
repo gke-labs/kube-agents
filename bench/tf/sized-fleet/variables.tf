@@ -38,6 +38,12 @@ variable "zone" {
   default     = "us-central1-f"
 }
 
+variable "network" {
+  description = "The standing network the fleet's subnets join, created once outside this stack (README.md)."
+  type        = string
+  default     = "sized-fleet"
+}
+
 variable "node_service_account" {
   description = "Email of the nodes' service account, created once outside this stack (README.md) so the identity that applies the stack needs no right to create service accounts."
   type        = string

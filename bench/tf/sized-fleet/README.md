@@ -8,11 +8,11 @@ This stack builds the sized test fleet: GKE clusters with real nodes, sized S, M
 
 For one size:
 
-- a network of its own, `sized-fleet-<size>`, with one subnet a cluster, and a router with Cloud NAT, so the nodes need no external address;
+- one subnet a cluster on the standing `sized-fleet` network, in address ranges of the size's own, and a router with Cloud NAT for those subnets, so the nodes need no external address;
 - the clusters, `sized-<size>-01` and on, zonal, with private nodes and a public control-plane endpoint;
 - one node pool a cluster, of `n1-standard-1` nodes, so the count of node pools is the count of clusters.
 
-The clusters and their nodes carry `managed-by=kube-agents-sized-fleet`, apart from the bench clusters' and the seeded fleet's labels, and `kube-agents-scale-size` and `kube-agents-scale-run`, by which a run's cost record finds its instances and clusters. The network, its subnets and its router are named `sized-fleet-<size>`; they carry no labels, because Compute Engine networks take none. Each cluster holds a 24-hour no-upgrades maintenance exclusion from its creation, so no upgrade replaces nodes during a run. The workloads are not in the stack: `hack/sized_fleet.py` applies them with `kubectl`, because they number in the thousands.
+The clusters and their nodes carry `managed-by=kube-agents-sized-fleet`, apart from the bench clusters' and the seeded fleet's labels, and `kube-agents-scale-size` and `kube-agents-scale-run`, by which a run's cost record finds its instances and clusters. The subnets take their cluster's name and the router `sized-fleet-<size>`; they carry no labels, because Compute Engine networks take none. Each cluster holds a 24-hour no-upgrades maintenance exclusion from its creation, so no upgrade replaces nodes during a run. The workloads are not in the stack: `hack/sized_fleet.py` applies them with `kubectl`, because they number in the thousands.
 
 ## Running it
 
@@ -41,6 +41,12 @@ for role in roles/logging.logWriter roles/monitoring.metricWriter roles/monitori
   gcloud projects add-iam-policy-binding "$P" --condition=None \
     --member="serviceAccount:sized-fleet-nodes@$P.iam.gserviceaccount.com" --role="$role"
 done
+```
+
+The network stands too. An organization policy agent can add firewall rules to every new network, and some of those rules cannot be deleted, so a network a run created could not be deleted again. It is created once, and each run adds and removes only its own subnets, router and NAT:
+
+```bash
+gcloud compute networks create sized-fleet --project "$P" --subnet-mode=custom
 ```
 
 The state bucket, `<project>-tf-state`, is the one the seeded fleet uses in the same project.

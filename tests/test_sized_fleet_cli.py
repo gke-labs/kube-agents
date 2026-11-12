@@ -1,4 +1,4 @@
-"""hack/sized_fleet.py's own logic: the region and the firewall fallback. The cloud calls are stubbed; nothing here creates or deletes a resource."""
+"""hack/sized_fleet.py's own logic: the region, the host check, the teardown record and the churn warm-up. The cloud calls are stubbed; nothing here creates or deletes a resource."""
 
 import argparse
 import importlib.util
@@ -22,40 +22,6 @@ class RegionTest(unittest.TestCase):
         self.assertEqual(cli.region_of("us-central1-f"), "us-central1")
         self.assertEqual(cli.region_of("europe-west4-a"), "europe-west4")
         self.assertIn("-var=region=europe-west4", cli.tofu_vars(args(zone="europe-west4-a")))
-
-
-class DownTest(unittest.TestCase):
-    def run_down(self, first_error):
-        calls = []
-
-        def fake_tofu(argv, timeout, capture=False):
-            calls.append(argv[0])
-            if argv[0] == "destroy" and calls.count("destroy") == 1 and first_error is not None:
-                raise cli.TofuFailed("destroy", 1, first_error)
-            return ""
-
-        with mock.patch.object(cli, "tofu", side_effect=fake_tofu), \
-                mock.patch.object(cli, "delete_network_firewalls", return_value=["fw-1"]) as fw:
-            try:
-                cli.cmd_down(args())
-            except cli.TofuFailed:
-                pass
-        return calls, fw
-
-    def test_a_firewall_holding_the_network_is_deleted_and_the_destroy_retried(self):
-        error = "The network resource '.../networks/sized-fleet-s' is already being used by '.../firewalls/fw-1'"
-        calls, fw = self.run_down(error)
-        fw.assert_called_once()
-        self.assertEqual(calls.count("destroy"), 2)
-
-    def test_any_other_failure_leaves_the_firewall_rules_alone(self):
-        calls, fw = self.run_down("Error acquiring the state lock")
-        fw.assert_not_called()
-        self.assertEqual(calls.count("destroy"), 1)
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class HostTest(unittest.TestCase):
@@ -85,3 +51,15 @@ class TeardownTest(unittest.TestCase):
         self.assertFalse(verdict["green"])
         self.assertIn("sized-s-01 still exists", verdict["checks"]["teardown"]["failures"])
         self.assertTrue(any("down failed" in f for f in verdict["checks"]["teardown"]["failures"]))
+
+
+class WarmupTest(unittest.TestCase):
+    def test_waits_until_every_client_has_fired_once(self):
+        reads = iter([
+            {"items": [{"status": {}}, {"status": {"lastScheduleTime": "t"}}]},
+            {"items": [{"status": {"lastScheduleTime": "t"}}, {"status": {"lastScheduleTime": "t"}}]},
+        ])
+        with mock.patch.object(cli.kube, "kubectl_json", side_effect=lambda *a, **k: next(reads)), \
+                mock.patch.object(cli.time, "sleep") as sleep:
+            cli.wait_clients_scheduled({"c": "ctx"}, "sel")
+        self.assertEqual(sleep.call_count, 1)

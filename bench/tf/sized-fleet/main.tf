@@ -36,6 +36,8 @@ locals {
   remainder   = local.nodes - local.per_cluster * local.clusters
 
   size_label = lower(var.size)
+  # Each size's own address ranges on the shared network.
+  size_index = index(["S", "M", "L"], var.size)
   fleet = {
     for i in range(local.clusters) : format("sized-%s-%02d", local.size_label, i + 1) => {
       index = i
@@ -56,42 +58,45 @@ provider "google" {
   zone    = var.zone
 }
 
-# A network of its own, so the fleet's ranges never meet the project's other
-# clusters and a destroy removes every address it took.
-resource "google_compute_network" "fleet" {
-  name                    = "sized-fleet-${local.size_label}"
-  auto_create_subnetworks = false
+# The network stands: it is created once (README.md, "One-time setup"), because an
+# organization policy agent adds firewall rules to every new network, and some of them
+# cannot be deleted, so a network a run created could not be deleted again. Each run adds
+# and removes only its own subnets, router and NAT.
+data "google_compute_network" "fleet" {
+  name = var.network
 }
 
-# One subnet a cluster. Up to 16 clusters (L):
-#   nodes     10.100.<i>.0/24   (at most 32 nodes a cluster at L)
-#   Pods      10.<128+i>.0.0/16 (32 nodes x /26 a node fits with room)
-#   Services  10.200.<16i>.0/20
-#   control plane 172.16.0.<16i>/28, the private endpoint's peering range
+# One subnet a cluster, in ranges of the size's own, so two sizes never collide on the
+# shared network. With k the size's index (S 0, M 1, L 2) and up to 16 clusters (L):
+#   nodes     10.<100+k>.<i>.0/24      (at most 32 nodes a cluster at L)
+#   Pods      10.<128+16k+i>.0.0/16    (32 nodes x /26 a node fits with room)
+#   Services  10.<200+k>.<16i>.0/20
+#   control plane 172.<16+k>.0.<16i>/28, the private endpoint's peering range
 resource "google_compute_subnetwork" "fleet" {
   for_each = local.fleet
 
   name                     = each.key
-  network                  = google_compute_network.fleet.id
+  network                  = data.google_compute_network.fleet.id
   region                   = var.region
-  ip_cidr_range            = "10.100.${each.value.index}.0/24"
+  ip_cidr_range            = "10.${100 + local.size_index}.${each.value.index}.0/24"
   private_ip_google_access = true
 
   secondary_ip_range {
     range_name    = "pods"
-    ip_cidr_range = "10.${128 + each.value.index}.0.0/16"
+    ip_cidr_range = "10.${128 + 16 * local.size_index + each.value.index}.0.0/16"
   }
   secondary_ip_range {
     range_name    = "services"
-    ip_cidr_range = "10.200.${each.value.index * 16}.0/20"
+    ip_cidr_range = "10.${200 + local.size_index}.${each.value.index * 16}.0/20"
   }
 }
 
-# The nodes have no external address, so L's 500 nodes take none of the
-# project's address quota; NAT gives them the way out to pull the image.
+# The nodes have no external address, so L's 500 nodes take none of the project's
+# address quota; NAT gives them the way out to pull the image. It covers this size's
+# subnets only, since the network is shared.
 resource "google_compute_router" "fleet" {
   name    = "sized-fleet-${local.size_label}"
-  network = google_compute_network.fleet.id
+  network = data.google_compute_network.fleet.id
   region  = var.region
 }
 
@@ -100,7 +105,15 @@ resource "google_compute_router_nat" "fleet" {
   router                             = google_compute_router.fleet.name
   region                             = var.region
   nat_ip_allocate_option             = "AUTO_ONLY"
-  source_subnetwork_ip_ranges_to_nat = "ALL_SUBNETWORKS_ALL_IP_RANGES"
+  source_subnetwork_ip_ranges_to_nat = "LIST_OF_SUBNETWORKS"
+
+  dynamic "subnetwork" {
+    for_each = google_compute_subnetwork.fleet
+    content {
+      name                    = subnetwork.value.id
+      source_ip_ranges_to_nat = ["ALL_IP_RANGES"]
+    }
+  }
 }
 
 resource "google_container_cluster" "fleet" {
@@ -109,7 +122,7 @@ resource "google_container_cluster" "fleet" {
   name     = each.key
   location = var.zone
 
-  network    = google_compute_network.fleet.id
+  network    = data.google_compute_network.fleet.id
   subnetwork = google_compute_subnetwork.fleet[each.key].id
 
   # The one node pool is the resource below, so the count of node pools is the
@@ -127,7 +140,7 @@ resource "google_container_cluster" "fleet" {
   private_cluster_config {
     enable_private_nodes    = true
     enable_private_endpoint = false
-    master_ipv4_cidr_block  = "172.16.0.${each.value.index * 16}/28"
+    master_ipv4_cidr_block  = "172.${16 + local.size_index}.0.${each.value.index * 16}/28"
   }
 
   logging_config {
