@@ -1037,6 +1037,34 @@ class BrowserTest(unittest.TestCase):
         self.assertNotIn("all 0 reps", page)
         self.assertNotIn("0 reps lost", page)
 
+    def test_a_case_lost_to_a_forge_outage_says_so_on_the_run_page(self):
+        """Forge reps sit under their own key in `reps` (#5342); the card is
+        tagged and worded as a forge outage, not as unexplained or lost."""
+        data = copy.deepcopy(self.data)
+        run = next(r for r in data["runs"] if r["build_id"] == "2097282860221206528")
+        task = next(t for t in run["tasks"] if t["name"] == CRASHLOOP_TRIO[0])
+        task["result"] = "infra"
+        reason = "KUBE_AGENTS_FORGE_UNAVAILABLE: a forge read failed in transport or was rate limited, so these checks could not be evaluated, which says nothing about the run: a-check: answered 503"
+        task["reps"] = [{"n": n, "result": "infra", "reason": reason} for n in (1, 2, 3)]
+        out = render_to(pathlib.Path(self.tmp.name) / "forge", data, health=health_doc())
+        page = dom_text(out / "run.html", query="build=2097282860221206528")
+        self.assertIn("all 3 reps not graded: a forge read failed during grading", page)
+        self.assertIn('class="tag storm">forge unavailable<', page)
+        self.assertNotIn('class="tag unclear">unexplained<', page)
+
+    def test_a_forge_and_ceiling_mix_counts_only_the_kinds_it_has(self):
+        """No "0 lost before grading" when no repetition was lost to the storm."""
+        data = copy.deepcopy(self.data)
+        run = next(r for r in data["runs"] if r["build_id"] == "2097282860221206528")
+        task = next(t for t in run["tasks"] if t["name"] == CRASHLOOP_TRIO[0])
+        task["result"] = "infra"
+        forge = "KUBE_AGENTS_FORGE_UNAVAILABLE: a forge read failed in transport or was rate limited, so these checks could not be evaluated, which says nothing about the run: a-check: answered 503"
+        task["reps"] = [{"n": 1, "result": "infra", "reason": forge}] + [{"n": n, "result": "infra", "reason": CEILING_REASON} for n in (2, 3)]
+        out = render_to(pathlib.Path(self.tmp.name) / "forge-ceiling", data, health=health_doc())
+        page = dom_text(out / "run.html", query="build=2097282860221206528")
+        self.assertIn("all 3 reps ungraded: 2 at the delegation ceiling, 1 not graded, forge unavailable", page)
+        self.assertNotIn("0 lost before grading", page)
+
     def test_a_delegation_ceiling_wave_has_its_own_brief_and_banner(self):
         health = health_doc(
             "DEGRADED", condition="delegation_ceiling", failing_cases=[], tracking_issues=[],
@@ -1260,6 +1288,29 @@ class BrowserTest(unittest.TestCase):
         self.assertIn("repetitions are being lost to API quota", app)
         self.assertIn("Why we think it's a quota storm", app)
         self.assertIn("Retest after Tue 10:30 AM ET", app)
+
+    def test_a_storm_brief_does_not_quote_a_forge_outage_as_its_evidence(self):
+        """'What the agent saw' under a storm quotes a storm case only (#5342):
+        a forge-unavailable case is the forge's, not the quota storm's."""
+        data = copy.deepcopy(self.data)
+        # The forge case is the only ungraded case with a reason to quote.
+        for other in data["runs"]:
+            for t in other.get("tasks") or []:
+                for r in t.get("reps") or []:
+                    if r.get("result") == "infra":
+                        r["reason"] = None
+        run = next(r for r in data["runs"] if r["build_id"] == "2095859789312561152")
+        task = run["tasks"][0]
+        task["result"] = "infra"
+        reason = "KUBE_AGENTS_FORGE_UNAVAILABLE: a forge read failed in transport or was rate limited, so these checks could not be evaluated, which says nothing about the run: forge-evidence-check: answered 503"
+        task["reps"] = [{"n": n, "result": "infra", "reason": reason} for n in (1, 2, 3)]
+        health = health_doc("DEGRADED", condition="storm", failing_cases=[], tracking_issues=[],
+                            since="2026-09-04T18:00:00+00:00",
+                            incident={"prs": [1, 2, 3], "runs": 3, "window_start": "2026-09-04T18:30:00+00:00", "window_end": "2026-09-04T19:00:00+00:00"})
+        out = render_to(pathlib.Path(self.tmp.name) / "storm-forge", data, health=health)
+        app = dom_text(out / "index.html")
+        self.assertIn("What the agent saw", app)
+        self.assertNotIn("forge-evidence-check", app)
 
     def test_setup_deaths_brief(self):
         app = self.render_state(health_doc("DEGRADED", condition="setup_deaths", failing_cases=[], tracking_issues=[], since=SETUP_DEATHS_SINCE), "setup")

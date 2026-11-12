@@ -274,7 +274,11 @@ STDIN_WRITE_CHUNK_BYTES = select.PIPE_BUF
 KILLED_COMMAND_DRAIN_SECONDS = 5
 # How often a command that has closed both its pipes but is still running is
 # looked at: nothing can wake that wait, so the deadline and the caller's
-# hang-up are checked in steps this long.
+# hang-up are checked in steps this long. Within a step the child is reaped
+# with `_reap`'s short poll, so an exit is seen within milliseconds: a child
+# closes its pipes a moment before it can be reaped (a multithreaded kubectl
+# or a Python gcloud only after every thread exits), and on a busy pod one
+# look then a sleep cost about a third of the calls a whole step (#5540).
 PIPES_CLOSED_POLL_SECONDS = 0.5
 # How often a command's `stop` check is asked while it runs (`_capture_output`).
 STOP_POLL_SECONDS = 0.5
@@ -805,6 +809,15 @@ WATCHER_K8S_ACCEPT_SHAPE = re.compile(r"^[\x20-\x7e]{1,256}\Z")
 # rather than relayed in part.
 WATCHER_POD_METADATA_MAX_BYTES = 1 << 20
 WATCHER_GCP_CONTENT_TYPE = "application/json"
+# The header the shim's get-credentials check sends on its one relay read
+# (credential_proxy_client.GET_CREDENTIALS_CHECK_HEADER, held equal by a test).
+# It only narrows: with it, a clusters-get for a cluster that
+# spec.scope.exclude.clusters names is refused, so the shim sends the command
+# on to /v1/exec and that route's excluded-cluster refusal answers (#5305).
+# Without it the read is unchanged, so the reconcile's existence check and
+# every other control-plane read stay allowed. A caller that sets it can only
+# be refused more, never reach more.
+GET_CREDENTIALS_CHECK_HEADER = "X-Kube-Agents-Get-Credentials-Check"
 # The caller's host segment is held to `api_policy.HOST_SHAPE` -- a lower-case
 # DNS name, no scheme, port, user info or percent-encoding -- before the
 # policy sees it. Anything else is a 400, not something to normalise: the
@@ -1427,6 +1440,7 @@ SHELL_KUBECTL_REFUSAL_HINT = (
 )
 RULE_CALLER_KUBECTL_FLAG = "caller.kubectl-flag"
 RULE_CALLER_VCS_VERB = "caller.vcs-verb-role"
+RULE_VCS_WRITE_MODE = "vcs.write-mode"
 RULE_GIT_ARGUMENT_REFUSED = "git.argument.refused"
 RULE_GIT_WORKSPACE_LEASE = "git.workspace.lease"
 RULE_SCOPED_SA_UNMAPPED_SCOPE = "gcp.scoped-sa.unmapped-scope"
@@ -8903,7 +8917,9 @@ def _capture_output(
                 elif stop is not None and stop():
                     abandoned = stopped = True
                 else:
-                    time.sleep(min(PIPES_CLOSED_POLL_SECONDS, remaining))
+                    # Reaped within this step if it exits within it; the
+                    # loop's own look then returns at once.
+                    _reap(process, min(PIPES_CLOSED_POLL_SECONDS, remaining))
                     continue
                 _kill_process_group(process)
                 _reap(process, None)
@@ -14460,6 +14476,19 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 },
             )
             return
+        if decision.rule_id == api_policy.GKE_CLUSTER_GET_RULE and self.headers.get(GET_CREDENTIALS_CHECK_HEADER):
+            # The route's pattern has fixed the path's shape:
+            # v1/projects/<project>/locations/<location>/clusters/<cluster>.
+            segments = path.split("/")
+            try:
+                self.exclusions.check(segments[2], segments[4], segments[6])
+            except scope_exclude.ExcludedCluster as exc:
+                LOGGER.warning("api excluded cluster refused request_id=%s rule=%s", request_id, exc.rule)
+                self._json(
+                    HTTPStatus.FORBIDDEN,
+                    {"status": "blocked", "code": "SECURITY_POLICY_BLOCKED", "rule": exc.rule, "message": str(exc)},
+                )
+                return
         if self.api_relay is None:
             LOGGER.warning("api disabled request_id=%s rule=%s", request_id, decision.rule_id)
             self._json(
@@ -15447,6 +15476,32 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 },
             )
             return TOOL_STATUS_BLOCKED
+        # The install's write mode (`vcs_broker.write_mode`), here for the same
+        # reason as the role check: ahead of anything that spends, and in the
+        # one process that can push. At `none` a branch or proposal write is
+        # refused whoever asks. The refusal states the fact and instructs
+        # nothing: what the agent says instead is the dial eval's to decide.
+        if verb in vcs_broker.PROPOSE_VERBS:
+            mode, raw = vcs_broker.write_mode()
+            if mode == vcs_broker.WRITE_MODE_NONE:
+                LOGGER.warning(
+                    "vcs verb refused by the write mode verb=%s rule=%s",
+                    _sanitize_for_logging(verb),
+                    RULE_VCS_WRITE_MODE,
+                )
+                refusal = {
+                    "status": "blocked",
+                    "error": (
+                        "this install is explain-only (writeMode: none): kube-agents does not push "
+                        "branches or open, update or comment on pull requests here."
+                    ),
+                    "code": "WRITE_MODE_NONE",
+                    "rule": RULE_VCS_WRITE_MODE,
+                }
+                if detail := vcs_broker.write_mode_detail(raw):
+                    refusal["detail"] = detail
+                self._json(HTTPStatus.FORBIDDEN, refusal)
+                return TOOL_STATUS_BLOCKED
         if self.vcs is None:
             self._json(
                 HTTPStatus.NOT_FOUND,

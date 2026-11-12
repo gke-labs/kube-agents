@@ -80,6 +80,10 @@ class Profile:
 
 
 _NEXT = ("platformAgent.mode=next",)
+# platformAgent.harness.tuning.busReplicas, the bus's server count; unset runs
+# the golden's (three).
+BUS_REPLICAS_KEY = "platformAgent.harness.tuning.busReplicas"
+_ONE_SERVER = (f"{BUS_REPLICAS_KEY}=1",)
 _HINDSIGHT_MINTER = ("hindsight.enabled=true", "githubMinter.enabled=true")
 # The installer test's tfvars, as the installer maps them onto the chart
 # (tests/test_installer_common.py, _FOOTPRINT_EXPECTED_SETS, which that test holds
@@ -97,6 +101,7 @@ PROFILES = (
     Profile("today-autopilot", "`today`, GKE Autopilot", (), autopilot=True),
     Profile("next-standard", "`next`, GKE Standard", _NEXT),
     Profile("next-autopilot", "`next`, GKE Autopilot", _NEXT, autopilot=True),
+    Profile("next-one-server", "`next` with one NATS server, GKE Standard", _NEXT + _ONE_SERVER),
     Profile("next-hindsight-minter", "`next` with Hindsight and the GitHub minter, GKE Standard", _NEXT + _HINDSIGHT_MINTER),
     Profile("installer-autopilot", "", INSTALLER_SETS, autopilot=True),
     Profile("installer-standard", "", INSTALLER_SETS),
@@ -114,7 +119,7 @@ WORKLOADS_HEADER = (
 # the Runs cell says. A workload the data file adds and this table lacks fails the
 # render, so a new one cannot go unlisted.
 NEXT_WORKLOADS = (
-    ("a2aNats", "NATS server", "Standing, one JetStream claim each ({claim})"),
+    ("a2aNats", "NATS server", "Standing, each on its own node, with one JetStream claim each ({claim}); one with `spec.harness.tuning.busReplicas: 1`"),
     ("a2aCallout", "Auth callout", "Standing"),
     ("a2aVerifier", "Capability verifier", "Standing"),
     ("a2aGateway", "A2A gateway", "Standing; one fewer with the operator's `A2A_GATEWAY_ELECTION=false`"),
@@ -223,11 +228,20 @@ def session_quota(profile: Profile) -> int | None:
 
     The golden counts the operator's default chart pods, which is what a default
     chart stamps; a profile whose chart stamps more moves the quota by as many.
+    The golden's bus runs its default server count, and every server is a
+    standing pod the quota counts, so a profile with fewer servers moves it by
+    the difference.
     """
     if not profile.next_mode:
         return None
-    stamped = run_probe(profile)["chartQuotaPods"]
-    return golden_session_quota() - quota_constants()["defaultChartPods"] + stamped
+    probe = run_probe(profile)
+    golden_servers = probe["footprint"]["nextMode"]["a2aNats"]["pods"]
+    servers = next(
+        (int(item.split("=", 1)[1]) for item in profile.sets if item.startswith(f"{BUS_REPLICAS_KEY}=")),
+        golden_servers,
+    )
+    stamped = probe["chartQuotaPods"]
+    return golden_session_quota() - quota_constants()["defaultChartPods"] + stamped - (golden_servers - servers)
 
 
 def cpu(millis: int) -> str:
