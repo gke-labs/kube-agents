@@ -411,8 +411,9 @@ CLAUSE_CLOSERS = ")]"
 WORD_CUT_HOLDS = frozenset(("a", "an", "and", "as", "at", "but", "by", "for", "from", "in", "into", "of", "on", "or",
                             "the", "to", "with"))
 # A word cut never falls inside a link, whose label and url read as one word: a Markdown link, or
-# an mrkdwn one (``<url|label>``), which this token also covers for a mention.
-WORD_CUT_LINKS = (MD_LINK, re.compile(r"<[^<>]*>"))
+# an mrkdwn link or mention (``<url|label>``, ``<@U…>``, ``<#C…|name>``, ``<!here>``); a bare
+# ``<`` of a comparison is not one.
+WORD_CUT_LINKS = (MD_LINK, re.compile(r"<(?:https?://|mailto:|[@#!])[^<>]*>"))
 
 
 def enabled() -> bool:
@@ -768,9 +769,11 @@ def _bold_wrapped(sentence: str, marker: str) -> bool:
 
 
 def _opens_bold(head: str) -> bool:
-    """Whether ``head`` opens a bold run it does not close; an in-word marker (``DB__HOST``,
-    ``2**20``) is text, as :data:`BOLD_EDGES` reads it."""
-    return any(head.count(marker) % 2 and opener.search(head) for marker, (opener, _closer) in BOLD_EDGES.items())
+    """Whether ``head`` opens a bold run it does not close: an odd number of edge markers, an opener
+    among them. An in-word marker (``DB__HOST``, ``2**20``) is neither edge, as :data:`BOLD_EDGES`
+    reads it, so one after a closed run does not reopen it."""
+    return any((len(opener.findall(head)) + len(closer.findall(head))) % 2 and opener.search(head)
+               for marker, (opener, closer) in BOLD_EDGES.items())
 
 
 def clause_cut(sentence: str) -> tuple[str, str] | None:
@@ -875,8 +878,8 @@ def word_cut(sentence: str) -> tuple[str, str] | None:
         title = len(_plain(_restore_code(head, spans)))
         if title > limit:
             break
-        last = head.rsplit(" ", 1)[-1].strip("*_")
-        if title < CLAUSE_HEADLINE_MIN or last.lower() in WORD_CUT_HOLDS or last.isdigit():
+        last = head.rsplit(" ", 1)[-1].strip(CLAUSE_EMPHASIS).lstrip(CLAUSE_OPENERS)
+        if title < CLAUSE_HEADLINE_MIN or last.lower() in WORD_CUT_HOLDS or (last.isascii() and last.isdigit()):
             continue
         if depth:
             inside = head, rest
@@ -887,7 +890,11 @@ def word_cut(sentence: str) -> tuple[str, str] | None:
         return None
     head, rest = (_restore_code(part, spans) for part in found)
     # A sentence that carries its own ellipsis at the cut is not given a second one.
-    return (head if head.endswith(ELLIPSIS) else head + ELLIPSIS), (rest if rest.startswith(ELLIPSIS) else ELLIPSIS + rest)
+    if not head.rstrip(CLAUSE_EMPHASIS).endswith(ELLIPSIS):
+        head += ELLIPSIS
+    if not rest.lstrip(CLAUSE_EMPHASIS).startswith(ELLIPSIS):
+        rest = ELLIPSIS + rest
+    return head, rest
 
 
 def split_lead(markdown: str, cut: bool = True, word: bool = False) -> tuple[str, list[str]]:

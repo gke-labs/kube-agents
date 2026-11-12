@@ -292,6 +292,34 @@ class SplitAnswerTest(unittest.TestCase):
                   "writer to the new pool in us-central1 and nobody moved the variable after.")
         self.assertEqual(sp.clause_cut(clause)[0], "DB__HOST on seeded-c still points to the retired replica.")
 
+    def test_a_closed_bold_run_before_an_in_word_marker_stays_closed(self):
+        # Three raw markers, two of them the edges of a closed run: the head is not an open run.
+        prose = ("The __bold__ setting and DB__HOST on seeded-c point to the retired replica (the one the migration "
+                 "retired last week after the failover test that moved every writer to the new pool in us-central1).")
+        headline, body = sp.split_answer(prose)
+        self.assertEqual(headline, "The bold setting and DB__HOST on seeded-c point to the retired replica…")
+        self.assertTrue(body[0].startswith("…(the one"), body)
+        stars = ("The **bold** setting and 2**20 byte limit on the queue were reached before sunrise on seeded-c (the "
+                 "producer kept writing while every consumer waited on the retired replica in us-central1).")
+        self.assertTrue(sp.word_cut(stars)[0].endswith("before sunrise on seeded-c…"), sp.word_cut(stars))
+
+    def test_word_cut_reads_the_ellipsis_through_closing_emphasis(self):
+        head, rest = sp.word_cut("x" * 132 + " **found 209…** running GKE clusters across all projects in scope today.")
+        self.assertEqual(head, "x" * 132 + " **found 209…**")
+        self.assertEqual(rest, "…running GKE clusters across all projects in scope today.")
+        head, rest = sp.word_cut("x" * 136 + " found **…209 running** GKE clusters across all projects in scope today.")
+        self.assertEqual((head, rest), ("x" * 136 + " found…", "**…209 running** GKE clusters across all projects in scope today."))
+
+    def test_a_comparison_is_no_mrkdwn_link_and_a_bracketed_connector_is_held(self):
+        # "< 100Mi and memory limit is >" is not a link token: the cut may fall inside it.
+        cut = sp.word_cut("x" * 60 + " request is < 100Mi and memory limit is > 200Mi for all pods running in the production "
+                          "namespace of seeded-c (every one of them since the rollout at noon).")
+        self.assertIsNotNone(cut)
+        self.assertTrue(cut[0].endswith("production…") or cut[0].endswith("namespace…") or cut[0].endswith("seeded-c…"), cut)
+        # "(and" is the connector with its bracket: the cut steps back from it as from a bare "and".
+        cut = sp.word_cut("x" * 130 + " (and the same again for the pods of the other namespace on seeded-c and seeded-b).")
+        self.assertEqual(cut[0], "x" * 130 + "…")
+
     def test_word_cut_adds_no_second_ellipsis(self):
         # The sentence's own ellipsis stands at the cut: the headline ends on it once, and the rest
         # opens on one of its own.

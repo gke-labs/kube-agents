@@ -445,6 +445,39 @@
       "body": [
         "Because the failover test moved every writer to the new pool in us-central1 and nobody moved the variable after."
       ]
+    },
+    {
+      "in": "The __bold__ setting and DB__HOST on seeded-c point to the retired replica (the one the migration retired last week after the failover test that moved every writer to the new pool in us-central1).",
+      "headline": "The bold setting and DB__HOST on seeded-c point to the retired replica…",
+      "body": [
+        "…(the one the migration retired last week after the failover test that moved every writer to the new pool in us-central1)."
+      ]
+    },
+    {
+      "in": "The **bold** setting and 2**20 byte limit on the queue were reached before sunrise on seeded-c (the producer kept writing while every consumer waited on the retired replica in us-central1).",
+      "headline": "The bold setting and 2**20 byte limit on the queue were reached before sunrise on seeded-c…",
+      "body": [
+        "…(the producer kept writing while every consumer waited on the retired replica in us-central1)."
+      ]
+    },
+    {
+      "in": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx **found 209…** running GKE clusters across all projects in scope today.",
+      "headline": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx found 209…",
+      "body": ["…running GKE clusters across all projects in scope today."]
+    },
+    {
+      "in": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx request is < 100Mi and memory limit is > 200Mi for all pods running in the production namespace of seeded-c (every one of them since the rollout at noon).",
+      "headline": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx request is < 100Mi and memory limit is > 200Mi for all pods running in the production…",
+      "body": [
+        "…namespace of seeded-c (every one of them since the rollout at noon)."
+      ]
+    },
+    {
+      "in": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx (and the same again for the pods of the other namespace on seeded-c and seeded-b).",
+      "headline": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…",
+      "body": [
+        "…(and the same again for the pods of the other namespace on seeded-c and seeded-b)."
+      ]
     }
   ],
   "plain": [

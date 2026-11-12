@@ -68,11 +68,12 @@ var wordCutHolds = map[string]bool{
 	"in": true, "into": true, "of": true, "on": true, "or": true, "the": true, "to": true, "with": true,
 }
 
-// wordCutLinks is WORD_CUT_LINKS: a word cut never falls inside a Markdown or
-// mrkdwn link, whose label and url read as one word. boldMarkers and
+// wordCutLinks is WORD_CUT_LINKS: a word cut never falls inside a Markdown
+// link or an mrkdwn link or mention, whose label and url read as one word; a
+// bare "<" of a comparison is not one. boldMarkers and
 // italicMarkers are BOLD_MARKERS and the keys of ITALIC_EDGES.
 var (
-	wordCutLinks  = []*regexp.Regexp{mdLink, regexp.MustCompile(`<[^<>]*>`)}
+	wordCutLinks  = []*regexp.Regexp{mdLink, regexp.MustCompile(`<(?:https?://|mailto:|[@#!])[^<>]*>`)}
 	boldMarkers   = []string{"**", "__"}
 	italicMarkers = []string{"*", "_"}
 )
@@ -118,15 +119,38 @@ func boldWrapped(sentence, marker string) bool {
 		!strings.Contains(held[len(marker):len(held)-len(marker)], marker)
 }
 
-// opensBold is _opens_bold: whether h opens a bold run it does not close; an
-// in-word marker (DB__HOST, 2**20) is text, as openerIn reads it.
+// opensBold is _opens_bold: whether h opens a bold run it does not close, an
+// odd number of edge markers with an opener among them; an in-word marker
+// (DB__HOST, 2**20) is neither edge, so one after a closed run does not
+// reopen it.
 func opensBold(h string) bool {
 	for _, marker := range boldMarkers {
-		if strings.Count(h, marker)%2 == 1 && openerIn(h, marker) {
+		if edgeCount(h, marker)%2 == 1 && openerIn(h, marker) {
 			return true
 		}
 	}
 	return false
+}
+
+// edgeCount is the number of marker's openers and closers in s, as openerIn
+// and closerIn read them; an in-word marker is neither.
+func edgeCount(s, marker string) int {
+	rs := []rune(s)
+	width := len([]rune(marker))
+	n := 0
+	for i := range rs {
+		if !hasAt(rs, i, marker) {
+			continue
+		}
+		prev, hasPrev := at(rs, i-1)
+		next, hasNext := at(rs, i+width)
+		opener := (!hasPrev || !isWord(prev)) && hasNext && !isPySpace(next)
+		closer := hasPrev && !isPySpace(prev) && (!hasNext || !isWord(next))
+		if opener || closer {
+			n++
+		}
+	}
+	return n
 }
 
 // clauseCut is slack_presenter.clause_cut: the headline and the rest for a
@@ -302,7 +326,7 @@ func wordCut(sentence string) (string, string, bool) {
 			// Every later space leaves a longer headline.
 			break
 		}
-		last := strings.Trim(h[strings.LastIndex(h, " ")+1:], "*_")
+		last := strings.TrimLeft(strings.Trim(h[strings.LastIndex(h, " ")+1:], clauseEmphasis), clauseOpeners)
 		if n < clauseHeadlineMin || wordCutHolds[strings.ToLower(last)] || isDigits(last) {
 			continue
 		}
@@ -321,10 +345,10 @@ func wordCut(sentence string) (string, string, bool) {
 	}
 	head, rest := restoreCode(found[0], spans, false), restoreCode(found[1], spans, false)
 	// A sentence that carries its own ellipsis at the cut is not given a second one.
-	if !strings.HasSuffix(head, chatEllipsis) {
+	if !strings.HasSuffix(strings.TrimRight(head, clauseEmphasis), chatEllipsis) {
 		head += chatEllipsis
 	}
-	if !strings.HasPrefix(rest, chatEllipsis) {
+	if !strings.HasPrefix(strings.TrimLeft(rest, clauseEmphasis), chatEllipsis) {
 		rest = chatEllipsis + rest
 	}
 	return head, rest, true

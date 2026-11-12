@@ -93,3 +93,35 @@ func TestAnInWordMarkerIsTextToBothCuts(t *testing.T) {
 		t.Errorf("clauseCut with an in-word __: %q, %v", head, ok)
 	}
 }
+
+// A closed bold run before an in-word marker stays closed, the ellipsis test
+// reads through closing emphasis, a comparison's "<" is no mrkdwn link, and a
+// bracketed connector is held: the presenter's tests, case for case.
+func TestWordCutRoundTwo(t *testing.T) {
+	prose := "The __bold__ setting and DB__HOST on seeded-c point to the retired replica (the one the migration " +
+		"retired last week after the failover test that moved every writer to the new pool in us-central1)."
+	if head, _, ok := wordCut(prose); !ok || head != "The __bold__ setting and DB__HOST on seeded-c point to the retired replica…" {
+		t.Errorf("closed run then in-word __: %q, %v", head, ok)
+	}
+	stars := "The **bold** setting and 2**20 byte limit on the queue were reached before sunrise on seeded-c (the " +
+		"producer kept writing while every consumer waited on the retired replica in us-central1)."
+	if head, _, ok := wordCut(stars); !ok || !strings.HasSuffix(head, "before sunrise on seeded-c…") {
+		t.Errorf("closed run then in-word **: %q, %v", head, ok)
+	}
+	if head, rest, ok := wordCut(strings.Repeat("x", 132) + " **found 209…** running GKE clusters across all projects in scope today."); !ok ||
+		head != strings.Repeat("x", 132)+" **found 209…**" || rest != "…running GKE clusters across all projects in scope today." {
+		t.Errorf("ellipsis inside closing emphasis: %q, %q, %v", head, rest, ok)
+	}
+	if head, rest, ok := wordCut(strings.Repeat("x", 136) + " found **…209 running** GKE clusters across all projects in scope today."); !ok ||
+		head != strings.Repeat("x", 136)+" found…" || rest != "**…209 running** GKE clusters across all projects in scope today." {
+		t.Errorf("ellipsis inside opening emphasis: %q, %q, %v", head, rest, ok)
+	}
+	if _, _, ok := wordCut(strings.Repeat("x", 60) + " request is < 100Mi and memory limit is > 200Mi for all pods running in the production " +
+		"namespace of seeded-c (every one of them since the rollout at noon)."); !ok {
+		t.Error("a comparison read as a link")
+	}
+	if head, _, ok := wordCut(strings.Repeat("x", 130) + " (and the same again for the pods of the other namespace on seeded-c and seeded-b)."); !ok ||
+		head != strings.Repeat("x", 130)+"…" {
+		t.Errorf("a bracketed connector: %q, %v", head, ok)
+	}
+}
