@@ -353,7 +353,8 @@ which used to replace the Secret and restart every pod holding it.
 
 ### The GitOps forge
 
-`GITOPS_FORGE` is `github` (the default) or `gitlab`. A github.com install records none of the
+`GITOPS_FORGE` is `github` (the default), `gitlab`, `bitbucket` (Bitbucket Cloud) or
+`bitbucket-datacenter`. A github.com install records none of the
 forge keys. A GitHub Enterprise Server install (`--gitops-host` with the github forge) records
 these keys, beside `GITOPS_ORG`, `GITOPS_REPO` and `GITHUB_APP_ID`, which name the repository and
 the App on the instance:
@@ -400,6 +401,36 @@ read token: the installer writes each key with its own server-side-apply field
 manager, so the write-token apply never removes `read-token`. Use a GitLab project or group access
 token with the Reporter role and only the `read_repository` scope, on the GitOps forge's host
 (gitlab.com or self-managed). On GitHub, `install.sh` refuses the key.
+
+A Bitbucket install, Cloud or Data Center, records the same keys as a GitLab install, plus one:
+
+| Key                   | Value                                                                                                                             |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `GITOPS_FORGE`        | `bitbucket` or `bitbucket-datacenter`                                                                                             |
+| `GITOPS_HOST`         | The Data Center instance's hostname; empty for Cloud                                                                              |
+| `GITOPS_REPO`         | `workspace/repo-slug` (Cloud) or `PROJECTKEY/repo-slug` (Data Center)                                                             |
+| `GITLAB_TOKEN_SECRET` | The name of the Secret that holds the token (default `bitbucket-forge-token`). The key keeps its GitLab name for every forge      |
+| `GITOPS_CA_SECRET`    | Data Center only: the name of the Secret that holds a private CA (default `bitbucket-forge-ca`); set only with `--gitops-ca-file` |
+| `GITOPS_IDENTITY`     | The account the token acts as (`--gitops-identity`): the account UUID for a Bitbucket Cloud access token. Recorded only when set  |
+
+The neutral flags `--gitops-token-file` and `--gitops-token-secret` are the GitLab flags under new
+names, and `GITOPS_TOKEN_FILE`, `GITOPS_TOKEN_SECRET` and `GITOPS_READ_TOKEN_FILE` in the
+environment are aliases of the `GITLAB_*` variables. The generator writes `gitops_forge`,
+`gitops_host`, `gitops_repo_path`, `gitops_token_secret_name`, and, when set,
+`gitops_ca_secret_name` and `gitops_identity` into `terraform.tfvars`. A switch to another forge
+drops a recorded identity, and a default token Secret name becomes the new forge's default. A
+switch between two forges with a token (GitLab, Bitbucket Cloud, Bitbucket Data Center) does not
+keep the recorded token Secret, which holds the old forge's token: the run must give
+`--gitops-token-file` or `--gitops-token-secret`. Without one, a non-interactive run or a run with
+no terminal stops, and an interactive run asks for the new token after the apply and stops if none
+is entered. When the run keeps the recorded Secret without naming it with `--gitops-token-secret`, and gives no read token, the installer removes
+the Secret's `read-token` key, which holds the old forge's read token. A switch to a forge with a
+token drops the recorded `GITOPS_REPO` unless `--gitops-repo` gives it: a non-interactive run then
+stops, and an interactive run asks. The installer records the old forge and its Secret as
+`GITOPS_SWITCH_FROM_FORGE` and `GITOPS_SWITCH_FROM_SECRET` with the new forge, and removes them
+only after the new token steps succeed, so a run that stops in between leaves the switch pending
+for the next run. A Data Center host is asked for in an interactive run; a non-interactive run, or
+a run with no terminal, needs `--gitops-host`.
 
 - `install.sh` records these keys on a first install, and on a later run that goes on to the apply
   with a different forge, host, project or Secret name.

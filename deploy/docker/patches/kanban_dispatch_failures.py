@@ -1,10 +1,11 @@
 """Count the kanban dispatcher's failed ticks per board, on the chat_metrics registry.
 
-Installed as ``gateway/kanban_dispatch_failures.py`` and called from the two
+Installed as ``gateway/kanban_dispatch_failures.py`` and called from the four
 places ``apply_kanban_dispatch_failures.py`` patches into
 ``gateway/kanban_watchers_dispatcher.py``'s ``tick_once_for_board``: after
-``dispatch_once`` returns (a good tick, which ends the board's streak) and
-after the ``tick failed on board`` log line (a failed tick, which adds one).
+``dispatch_once`` returns (a good tick, which ends the board's streak), after
+the ``tick failed on board`` log line (a failed tick, which adds one), and at
+the tick's start and end (so the registry knows a board is being tried).
 The registry renders the streak as ``kubeagents_kanban_dispatcher_failed_ticks``
 on the listener the operator's usage poller reads, and the poller sets the
 PlatformAgent's ``KanbanDispatcherFailing`` condition from it.
@@ -36,3 +37,23 @@ def record_tick(board: str, exc: Optional[BaseException] = None) -> None:
             registry.record_dispatch_tick(str(board), type(exc).__name__ if exc is not None else "")
     except Exception:  # noqa: BLE001 - a metric must never fail the dispatcher's tick
         LOGGER.debug("dispatcher tick not recorded", exc_info=True)
+
+
+def record_tick_start(board: str) -> None:
+    """Record that a tick on ``board`` began. Never raises."""
+    try:
+        registry = chat_turn_metrics._load_registry()
+        if registry is not None:
+            registry.record_dispatch_tick_start(str(board))
+    except Exception:  # noqa: BLE001 - a metric must never fail the dispatcher's tick
+        LOGGER.debug("dispatcher tick start not recorded", exc_info=True)
+
+
+def record_tick_end(board: str) -> None:
+    """Record that the tick on ``board`` ended, whichever way. Never raises."""
+    try:
+        registry = chat_turn_metrics._load_registry()
+        if registry is not None:
+            registry.record_dispatch_tick_end(str(board))
+    except Exception:  # noqa: BLE001 - a metric must never fail the dispatcher's tick
+        LOGGER.debug("dispatcher tick end not recorded", exc_info=True)
