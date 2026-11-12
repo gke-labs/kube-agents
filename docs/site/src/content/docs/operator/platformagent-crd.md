@@ -2071,6 +2071,12 @@ old one's profiles, so a line the agent wrote into the PVC `.env` could otherwis
 have two clean runs delete every profile of the real management project. Nothing in the operator
 or the chart sets the variable; the script treats the empty value as unset.
 
+`KUBEAGENTS_RESOLVED_SCOPE_FILE` is pinned too. Under `spec.mode: next` it is
+`/etc/kube-agents-resolved/resolved-scope.json`: the scope publisher's `<name>-resolved-scope`
+ConfigMap, mounted read-only into the agent container, which is where the helper scripts' cluster
+lists come from. The container env carries it too. Elsewhere it is pinned empty, because the
+publisher runs only under `next`, and a key left out is one the agent could write.
+
 On GKE, `GKE_PROJECT_ID` is also pinned, to `spec.harness.projectID`. The reconcile reads it as the
 management project when `RECONCILE_PROJECT` is empty, so it is pinned for the same reason. A kind
 install does not pin it, because the container env there carries no project.
