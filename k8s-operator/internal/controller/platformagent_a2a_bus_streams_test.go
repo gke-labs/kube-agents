@@ -1513,3 +1513,26 @@ func TestTasksLostBeforeARetriedDeleteStillRestartsItsClients(t *testing.T) {
 		}
 	}
 }
+
+// A re-run that recreates TASKS and then ends Failed (a later step) still
+// settles its attempt, so TASKS' readers are restarted.
+func TestARerunThatFailsAfterRecreatingTasksStillRestartsItsClients(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	rig.serve(1, allStreamsBut("TASKS", "KV_cap")...)
+	rig.poll()
+	rig.poll()
+	rig.poll()
+	rig.recreateJob(batchv1.JobFailed)
+	rig.serve(1, allStreamsBut("KV_cap")...)
+	rig.poll()
+	last := readBusReprovisionRecord(rig.agent()).last()
+	if last == nil || !last.Settled || last.Restored || !last.RestartOwed || !last.Restarted {
+		t.Fatalf("attempt = %+v, want settled, not restored, restart owed and done", last)
+	}
+	for _, pod := range []string{"test-agent-a2a-gateway-abc", "test-agent-gateway-xyz"} {
+		if !slices.Contains(rig.deleted, pod) {
+			t.Errorf("deleted %v, want %s restarted after the failed re-run recreated TASKS", rig.deleted, pod)
+		}
+	}
+}

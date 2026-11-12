@@ -581,7 +581,10 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 	// alone, and a restart that fails stays owed and is retried below on the
 	// next poll, before anything can read AllPresent.
 	last := record.last()
-	reRan := last != nil && !last.Settled && jobState == busJobComplete && job.UID != last.JobUID
+	// A re-run that ended Failed settles too: the script creates TASKS and
+	// its durables first, so a later step's failure can leave TASKS
+	// recreated, and its readers owed the restart, all the same.
+	reRan := last != nil && !last.Settled && (jobState == busJobComplete || jobState == busJobFailed) && job.UID != last.JobUID
 	if reRan {
 		// TASKS is back whatever else still isn't: its two durable readers
 		// need restarting now, not once every stream returns.
