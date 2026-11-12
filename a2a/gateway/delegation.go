@@ -22,10 +22,13 @@ const (
 	ruleDelegationBusy          = "delegation.busy"
 	ruleDelegationDepth         = "delegation.depth"
 	ruleDelegationWidth         = "delegation.width"
-	ruleDelegationNoRequester   = "delegation.no-requester"
-	ruleDelegationStale         = "delegation.stale"
-	ruleDelegationMalformed     = "delegation.malformed"
-	ruleDelegationDoorUnlisted  = "delegation.door-unlisted"
+	// ruleDelegationProfileBatch ignores a batch from a profile task, which
+	// waits open for one child result and has no way yet to take several.
+	ruleDelegationProfileBatch = "delegation.profile-batch"
+	ruleDelegationNoRequester  = "delegation.no-requester"
+	ruleDelegationStale        = "delegation.stale"
+	ruleDelegationMalformed    = "delegation.malformed"
+	ruleDelegationDoorUnlisted = "delegation.door-unlisted"
 	// ruleDelegationChildSteer refuses a steer into a delegated child from
 	// an author the target's list refuses (gke-labs#2531 item 5).
 	ruleDelegationChildSteer = "delegation.child-steer"
@@ -53,6 +56,7 @@ const (
 	whyRequestMalformed = "the request was malformed"
 	whyNoChild          = "the request minted no child"
 	whyRequestUnread    = "the delegate request could not be read from the stream"
+	whyProfileBatch     = "a profile task can't hand out a batch yet"
 )
 
 // notStartedEnd is the DelegationEnd for a request that minted no child for
@@ -188,6 +192,13 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	if rec.ActiveTask.Detached || parent.Canceled {
 		ignore(ruleDelegationStale, "stopped", true)
 		noChild(notStartedEnd(whyTurnStopped))
+		return
+	}
+	// A profile task waits open for its child's result, and nothing yet
+	// lets it take several, so a batch from one is not served.
+	if parsed && req.IsBatch() && profileParent {
+		ignore(ruleDelegationProfileBatch, "tasks", len(req.Tasks))
+		noChild(notStartedEnd(whyProfileBatch))
 		return
 	}
 	// A batch wider than this gateway's setting is refused whole, naming
@@ -379,6 +390,10 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 
 // noticeBatchChildWithdrawn closes the line of a batch child that reached
 // the bus when a later one in its batch did not: the batch is withdrawn whole.
+// reasonBatchWithdrawn is the reason token on the terminal audit line of a
+// batch child withdrawn because a later child in its batch could not start.
+const reasonBatchWithdrawn = "batch-withdrawn"
+
 const noticeBatchChildWithdrawn = "🛑 not run: another task in the same delegation could not be started"
 
 // mintBatch mints a checked batch of two or more children of taskID. Unlike a
@@ -386,10 +401,10 @@ const noticeBatchChildWithdrawn = "🛑 not run: another task in the same delega
 // parent keeps both, and each child carries its own addressee on its entry
 // (AddresseeFor) and its rolling line there too. Each is linked from the
 // parent in the record write that adds it. A mint that fails partway
-// withdraws the batch whole: each child already on the bus is sent a cancel
-// (and, for a profile task, its stop record), every child of the batch is
-// dropped from the record and the index, and the parent records that its
-// request minted no child, so the record is as it was before the request.
+// withdraws the batch (withdrawBatch): each child already on the bus is sent
+// a cancel and dropped, and the parent records that its request minted no
+// child, so the record is as it was before the request. A child whose cancel
+// couldn't be published stays on the record, canceled, linked and indexed.
 func (g *Gateway) mintBatch(ctx context.Context, rec *SessionRecord, taskID string, parent TaskRef, tasks []lib.DelegateTask,
 	routes []*profileRoute, authority Authority, noChild func(string), log *slog.Logger) {
 	correlationID := rec.ActiveTask.CorrelationID
@@ -417,8 +432,11 @@ func (g *Gateway) mintBatch(ctx context.Context, rec *SessionRecord, taskID stri
 			KeepActive:           true,
 		})
 		if !ok {
-			g.withdrawBatch(ctx, rec, taskID, minted, authority)
-			noChild(notStartedEnd(whyChildOffBus))
+			if kept := g.withdrawBatch(ctx, rec, taskID, minted, authority); kept == 0 {
+				noChild(notStartedEnd(whyChildOffBus))
+			} else if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
+				g.log.Error("session record write failed after a batch was withdrawn", "conversation", rec.Key, "err", err)
+			}
 			log.Warn("delegation batch withdrawn: a child could not be started", "parent", taskID, "minted", len(minted), "tasks", len(tasks))
 			return
 		}
@@ -427,31 +445,72 @@ func (g *Gateway) mintBatch(ctx context.Context, rec *SessionRecord, taskID stri
 	}
 }
 
-// withdrawBatch undoes the children of a batch that minted partway: each in
+// withdrawBatch undoes the children of a batch that minted partway. Each in
 // minted is on the bus, so it is sent a cancel (and its stop record, for a
-// profile task) and its line closed, and then every child of taskID is
-// dropped from the record (dropFailedChildren), which leaves the parent's
-// links empty and the record written.
-func (g *Gateway) withdrawBatch(ctx context.Context, rec *SessionRecord, taskID string, minted []string, authority Authority) {
+// profile task). One whose cancel went out has its line closed, its terminal
+// logged (it wrote an ingress line) and its entry, link and index dropped,
+// with the child that failed. One whose cancel could not be published may
+// still run, so it stays on the record, marked canceled and indexed, where a
+// later stop and the reaper can still find it; it reports how many stayed.
+// A canceled child that ends wakes nothing.
+func (g *Gateway) withdrawBatch(ctx context.Context, rec *SessionRecord, taskID string, minted []string, authority Authority) int {
+	kept := map[string]bool{}
 	for _, id := range minted {
 		ref, ok := rec.TaskRefFor(id)
 		if !ok {
 			continue
 		}
-		env, err := lib.NewCancelEnvelope(gatewayParty, id, rec.ContextID, ref.CorrelationID,
-			lib.WithTo(lib.Party{Session: ref.Addressee}),
-			lib.WithAuthority(authority.Render(ref.Capability)))
-		if err != nil {
-			g.log.Error("cancel envelope build failed for a withdrawn batch child", "taskId", id, "err", err)
-		} else if err := g.client.Publish(ctx, lib.TaskInSubject(ref.Addressee, id), env); err != nil {
-			g.log.Error("cancel publish failed for a withdrawn batch child", "taskId", id, "err", err)
-		}
 		g.publishDispatchStop(ctx, ref)
+		if !g.publishBatchCancel(ctx, rec, ref, authority) {
+			rec.MarkCanceled(id)
+			kept[id] = true
+			continue
+		}
 		if ref.StatusMsgID != "" {
 			g.editLine(rec.Key, ref.StatusMsgID, noticeBatchChildWithdrawn, "")
 		}
+		g.logTaskTerminal(rec, ref.Addressee, id, lib.StateCanceled, TerminalFromGateway,
+			"reason: "+reasonBatchWithdrawn+" - "+noticeBatchChildWithdrawn)
 	}
-	g.dropFailedChildren(ctx, rec, taskID)
+	keep := rec.Tasks[:0]
+	for _, ref := range rec.Tasks {
+		if ref.Role == taskRoleChild && ref.ParentTaskID == taskID && !kept[ref.ID] {
+			g.retireTaskRoute(ctx, ref.ID)
+			continue
+		}
+		keep = append(keep, ref)
+	}
+	rec.Tasks = keep
+	for i := range rec.Tasks {
+		if rec.Tasks[i].ID != taskID {
+			continue
+		}
+		var links []string
+		for _, id := range rec.Tasks[i].Children {
+			if kept[id] {
+				links = append(links, id)
+			}
+		}
+		rec.Tasks[i].Children = links
+	}
+	return len(kept)
+}
+
+// publishBatchCancel sends a withdrawn batch child its cancel, on its own
+// .in under the delegation's authority, and reports whether it went out.
+func (g *Gateway) publishBatchCancel(ctx context.Context, rec *SessionRecord, ref TaskRef, authority Authority) bool {
+	env, err := lib.NewCancelEnvelope(gatewayParty, ref.ID, rec.ContextID, ref.CorrelationID,
+		lib.WithTo(lib.Party{Session: ref.Addressee}),
+		lib.WithAuthority(authority.Render(ref.Capability)))
+	if err != nil {
+		g.log.Error("cancel envelope build failed for a withdrawn batch child", "taskId", ref.ID, "err", err)
+		return false
+	}
+	if err := g.client.Publish(ctx, lib.TaskInSubject(ref.Addressee, ref.ID), env); err != nil {
+		g.log.Error("cancel publish failed for a withdrawn batch child", "taskId", ref.ID, "err", err)
+		return false
+	}
+	return true
 }
 
 // delegateEvidence is what a reader of a task knows about a delegate request
@@ -833,12 +892,11 @@ func setParentLine(rec *SessionRecord, taskID, statusMsgID string) {
 	}
 }
 
-// dropFailedChildren removes the entry, the index and the parent's link of
-// each child of taskID from a request that did not mint whole: a single child
-// whose submission never reached the bus, or every child of a batch that
-// failed partway (withdrawBatch). The parent had no child on record before
-// (the busy check), so every child entry naming it is from that request, and
-// so is every link it holds.
+// dropFailedChildren removes the entry, the index and the parent's link of a
+// child of taskID whose submission never reached the bus. The parent had no
+// child on record before (the busy check), so any child entry naming it is
+// the failed one, and so is every link it holds. A batch that fails partway
+// is withdrawBatch's.
 func (g *Gateway) dropFailedChildren(ctx context.Context, rec *SessionRecord, taskID string) {
 	kept := rec.Tasks[:0]
 	for _, ref := range rec.Tasks {

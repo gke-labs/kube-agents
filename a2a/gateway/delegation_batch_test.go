@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -315,6 +316,8 @@ func TestABatchThatFailsPartwayLeavesNoChain(t *testing.T) {
 	if key, err := r.g.reg.SessionForTask(ctx, first.TaskID); err != nil || key != "" {
 		t.Fatalf("the withdrawn child is still indexed: %q %v", key, err)
 	}
+	// It wrote an ingress line, so it gets a terminal line too.
+	waitFor(t, "the withdrawn child's terminal line", loggedContaining(r, "task terminal", "taskId="+first.TaskID, "state=canceled", "reason="+reasonBatchWithdrawn))
 	// The child that did reach the bus is told to stop, so nothing runs
 	// for a request the record no longer holds.
 	waitFor(t, "a cancel for the first child", func() bool {
@@ -351,5 +354,182 @@ func closeProfileSubmissions(t *testing.T, url string) {
 	cfg.Subjects = []string{lib.SubmitSubjectPrefix + "closed.>"}
 	if _, err := js.UpdateStream(ctx, cfg); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// startBatchProfileRig is a session rig taking batches up to width whose
+// gateway also knows the generic cluster profile and a profile that takes no
+// target, under a scope that lists project p1. tweak, when set, edits the
+// Config further.
+func startBatchProfileRig(t *testing.T, width int, tweak func(*Config)) (*rig, *fakeSpawner) {
+	t.Helper()
+	scope := filepath.Join(t.TempDir(), "scope.json")
+	if err := os.WriteFile(scope, []byte(`{"present":true,"projects":["p1"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r, spawn := startRigWithSpawnerCap(t, targetPlatform, 0, func(c *Config) {
+		c.DelegationWidthMax = width
+		c.ScopeFile = scope
+		c.Namespace = "kubeagents-system"
+		if tweak != nil {
+			tweak(c)
+		}
+	})
+	r.g.profiles.put("cluster", &lib.AgentCard{Name: "cluster", Parameters: clusterParams})
+	r.g.profiles.put("triage", &lib.AgentCard{Name: "triage"})
+	return r, spawn
+}
+
+// TestOnlyTheSecondEntryFailingRefusesTheBatch: every entry meets the
+// target's checks, not only the first. The first entry here (platform, no
+// list) passes all of them, and the second (triage) fails one: the batch is
+// refused under that rule, naming triage, with nothing minted. The steer
+// over-cap refusal isn't here: it doesn't depend on the target, so the first
+// entry meets it the same way.
+func TestOnlyTheSecondEntryFailingRefusesTheBatch(t *testing.T) {
+	off := func(r *rig) TaskRequester {
+		return TaskRequester{Backend: "discord", Subject: requesterSubject(r.g.ps, "discord", "1002")}
+	}
+	for _, tc := range []struct {
+		name    string
+		backend string
+		tweak   func(c *Config)
+		edit    func(r *rig, rec *SessionRecord, parent string)
+		rule    string
+		field   string
+	}{
+		{name: "the target's list", rule: ruleDelegationAllowedUsers,
+			tweak: func(c *Config) {
+				c.TargetAllowedUsers = map[string]map[string][]string{"triage": {"discord": {"1002"}}}
+			}},
+		{name: "the door's own list", backend: a2aBackend, rule: ruleDelegationDoorUnlisted,
+			tweak: func(c *Config) {
+				armDoorMap(t, c)
+				c.TargetAllowedUsers = map[string]map[string][]string{targetPlatform: {a2aBackend: {"1001"}}}
+			}},
+		{name: "a steer author", rule: ruleDelegationSteerAuthor, field: "steerBackend=discord",
+			tweak: func(c *Config) {
+				c.TargetAllowedUsers = map[string]map[string][]string{"triage": {"discord": {"1001"}}}
+			},
+			edit: func(r *rig, rec *SessionRecord, parent string) {
+				for i := range rec.Tasks {
+					if rec.Tasks[i].ID == parent {
+						rec.Tasks[i].SteerAuthors = append(rec.Tasks[i].SteerAuthors, off(r))
+					}
+				}
+			}},
+		{name: "an incarnation-set member", rule: ruleDelegationSessionAuthor, field: "sessionBackend=discord",
+			tweak: func(c *Config) {
+				c.TargetAllowedUsers = map[string]map[string][]string{"triage": {"discord": {"1001"}}}
+			},
+			edit: func(r *rig, rec *SessionRecord, _ string) { rec.addSessionAuthor(off(r)) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, spawn := startBatchProfileRig(t, 2, tc.tweak)
+			ctx := context.Background()
+			conv := "discord:g1/t-batch-second"
+			if tc.backend == a2aBackend {
+				conv = "a2a:agent-1001/ctx-batch-second"
+			}
+			exec, origin, _ := sessionTurnVia(t, r, spawn, conv, tc.backend, "x")
+			if tc.edit != nil {
+				putRecord(t, r, conv, func(rec *SessionRecord) { tc.edit(r, rec, origin.TaskID) })
+			}
+			art := delegateBatchArtifact(t, platformTask("first"), lib.DelegateTask{Addressee: "triage", Text: "second"})
+			if err := exec.PublishArtifact(ctx, art); err != nil {
+				t.Fatal(err)
+			}
+			waitFor(t, "refusal line", loggedContaining(r, "delegation refused", "rule="+tc.rule, origin.TaskID, tc.field))
+			completeTask(t, exec, "delegated 2 tasks to platform, triage")
+			waitFor(t, "the notice names the second target", postedContaining(r, fmt.Sprintf(noticeDelegationNotAllowed, "triage")))
+			if n := platformSubmissions(t, r); n != 0 {
+				t.Fatalf("a refused batch minted %d platform children", n)
+			}
+			if envs := streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+"triage.>"); len(envs) != 0 {
+				t.Fatalf("a refused batch submitted %d triage children", len(envs))
+			}
+		})
+	}
+}
+
+// TestAProfileParentsBatchIsIgnored: a profile task waits open for its child,
+// and nothing yet lets it take several child results, so a batch from one is
+// ignored under its own rule (delegation.profile-batch), with nothing
+// minted. This rig captures no log, so the record's end is the observation.
+func TestAProfileParentsBatchIsIgnored(t *testing.T) {
+	r := startProfileRig(t)
+	r.g.cfg.DelegationWidthMax = 3
+	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
+	ctx := context.Background()
+	conv := "console:tab-profile-batch"
+	turn := profileTurn(conv, "chat", nil)
+	turn.Backend, turn.AuthorID = consoleBackend, consoleAuthor
+	r.adapter.inbox <- turn
+	origin := submissionOn(t, r, "chat")
+	parent := r.execFor(t, origin, "chat")
+	if err := parent.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	art := delegateBatchArtifact(t,
+		lib.DelegateTask{Addressee: "cluster", Text: "a", Parameters: targetParams("p1", "us-east1", "a")},
+		lib.DelegateTask{Addressee: "cluster", Text: "b", Parameters: targetParams("p1", "us-east1", "b")})
+	if err := parent.PublishArtifact(ctx, art); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the request recorded as minting nothing", func() bool {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		ref, ok := rec.TaskRefFor(origin.TaskID)
+		return ok && strings.Contains(ref.DelegationEnd, whyProfileBatch)
+	})
+	if envs := streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+"cluster.>"); len(envs) != 0 {
+		t.Fatalf("a profile parent's batch submitted %d children", len(envs))
+	}
+	rec, _ := r.g.reg.Get(ctx, conv)
+	if pref, _ := rec.TaskRefFor(origin.TaskID); len(pref.Children) != 0 {
+		t.Fatalf("parent children = %v", pref.Children)
+	}
+}
+
+// TestAWithdrawnChildWhoseCancelFailedStaysOnRecord: when the second child
+// can't be submitted and the first one's cancel can't be published either,
+// the first may still run, so its entry stays, marked canceled, linked from
+// the parent and indexed, where a later stop and the reaper can find it. Its
+// stop record is still written for the dispatcher.
+func TestAWithdrawnChildWhoseCancelFailedStaysOnRecord(t *testing.T) {
+	r, spawn := startBatchProfileRig(t, 2, nil)
+	ctx := context.Background()
+	conv := "discord:g1/t-batch-cancel-fails"
+	exec, origin, session := sessionTurn(t, r, spawn, conv, "x")
+	// TASKS keeps only the session's own .in: platform's submission and
+	// the cluster child's cancel both fail, its submission doesn't.
+	narrowTasksStream(t, r.url, session)
+	art := delegateBatchArtifact(t,
+		lib.DelegateTask{Addressee: "cluster", Text: "first", Parameters: targetParams("p1", "us-east1", "dev")},
+		platformTask("second"))
+	if err := exec.PublishArtifact(ctx, art); err != nil {
+		t.Fatal(err)
+	}
+	first := submissionOn(t, r, "cluster")
+	waitFor(t, "the failed cancel", loggedContaining(r, "cancel publish failed for a withdrawn batch child", first.TaskID))
+	waitFor(t, "the second child's entry dropped", func() bool {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		return len(childrenOf(rec, origin.TaskID)) == 1
+	})
+	rec, _ := r.g.reg.Get(ctx, conv)
+	kept := childrenOf(rec, origin.TaskID)
+	if kept[0].ID != first.TaskID || !kept[0].Canceled {
+		t.Fatalf("kept child = %+v, want %s marked canceled", kept[0], first.TaskID)
+	}
+	if pref, _ := rec.TaskRefFor(origin.TaskID); len(pref.Children) != 1 || pref.Children[0] != first.TaskID {
+		t.Fatalf("parent children = %v, want the kept child", pref.Children)
+	}
+	if key, _ := r.g.reg.SessionForTask(ctx, first.TaskID); key != conv {
+		t.Fatalf("the kept child's index = %q, want %q", key, conv)
+	}
+	if rec.ActiveTask == nil || rec.ActiveTask.TaskID != origin.TaskID || rec.Addressee != session {
+		t.Fatalf("active=%+v addressee=%s, want the parent on its session", rec.ActiveTask, rec.Addressee)
+	}
+	if _, ok := dispatchStopFor(t, r.url, "cluster", first.TaskID); !ok {
+		t.Fatal("no stop record for the kept child")
 	}
 }
