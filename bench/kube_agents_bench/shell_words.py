@@ -395,7 +395,9 @@ def _extract_shell_command_string(
             for c in word[1:]:
                 if c == "c" and not is_plus:
                     saw_c = True
-                elif c in ("n", "D") and not is_plus:
+                elif c == "n":
+                    has_noexec = not is_plus
+                elif c == "D" and not is_plus:
                     has_noexec = True
                 elif c == "o":
                     vals_needed.append(("set_o", is_plus))
@@ -498,6 +500,10 @@ def _scan_command_prefix(
                 continue
 
             # Options parsing before options end
+            if not options_ended and wrapper_name == "env" and w == "-":
+                idx += 1
+                continue
+
             if not options_ended and w.startswith("-") and w != "-" and not _is_redirect(w):
                 if w == "--":
                     options_ended = True
@@ -514,27 +520,32 @@ def _scan_command_prefix(
                     elif w.startswith("--split-string="):
                         split_val = w.partition("=")[2]
                         del argv[idx]
-                    elif w.startswith("-") and not w.startswith("--") and "S" in w[1:]:
-                        s_idx = w.index("S")
-                        rest = w[s_idx + 1:]
-                        prefix = w[:s_idx]
-                        if rest:
-                            split_val = rest
-                            if prefix == "-":
-                                del argv[idx]
-                            else:
-                                argv[idx] = prefix
-                                idx += 1
-                        else:
-                            val_word, next_idx = _next_shell_arg(argv, idx + 1)
-                            if val_word is not None:
-                                split_val = val_word
-                                if prefix == "-":
-                                    del argv[idx:next_idx + 1]
+                    elif w.startswith("-") and not w.startswith("--") and len(w) > 1:
+                        env_val_opts = _GENERIC_WRAPPER_VAL_OPTS.get("env", frozenset())
+                        for ci, c in enumerate(w[1:]):
+                            if f"-{c}" in env_val_opts:
+                                break
+                            if c == "S":
+                                rest = w[1 + ci + 1:]
+                                prefix = w[:1 + ci]
+                                if rest:
+                                    split_val = rest
+                                    if prefix == "-":
+                                        del argv[idx]
+                                    else:
+                                        argv[idx] = prefix
+                                        idx += 1
                                 else:
-                                    argv[idx] = prefix
-                                    del argv[idx + 1:next_idx + 1]
-                                    idx += 1
+                                    val_word, next_idx = _next_shell_arg(argv, idx + 1)
+                                    if val_word is not None:
+                                        split_val = val_word
+                                        if prefix == "-":
+                                            del argv[idx:next_idx + 1]
+                                        else:
+                                            argv[idx] = prefix
+                                            del argv[idx + 1:next_idx + 1]
+                                            idx += 1
+                                break
 
                     if split_val is not None:
                         try:

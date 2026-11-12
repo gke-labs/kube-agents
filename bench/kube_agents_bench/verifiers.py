@@ -3609,23 +3609,26 @@ class WorkerCommandsVerifier(BaseVerifier):
         gaps = list(snap.worker_capture_gaps or ())
         if withheld and uncredited_succeeded:
             gaps.append("the pod withheld a worker terminal call's arguments")
-        clipped_unmatched = False
+        has_window_forbidding = bool(self.after_result_pattern is not None and forbidding)
+        clipped_gap = False
         for _, _, cmd, _, call_succeeded, is_clipped in traj_calls:
             if not is_clipped:
                 continue
-            if cmd is None:
-                clipped_unmatched = True
+            if has_window_forbidding and cmd is None:
+                clipped_gap = True
                 break
-            if not call_succeeded:
-                continue
-            argv_entries = _shell_argvs_with_exit_propagation(cmd)
-            if any(
-                not any(_argv_runs(argv, run) for argv, _ in argv_entries)
-                for run in uncredited_succeeded
-            ):
-                clipped_unmatched = True
-                break
-        if clipped_unmatched and (uncredited_succeeded or (self.after_result_pattern is not None and forbidding)):
+            if uncredited_succeeded and call_succeeded:
+                if cmd is None:
+                    clipped_gap = True
+                    break
+                argv_entries = _shell_argvs_with_exit_propagation(cmd)
+                if any(
+                    not any(_argv_runs(argv, run) for argv, _ in argv_entries)
+                    for run in uncredited_succeeded
+                ):
+                    clipped_gap = True
+                    break
+        if clipped_gap:
             gaps.append("the pod clipped a worker terminal call's arguments")
         gaps_str = "; ".join(gaps)
 

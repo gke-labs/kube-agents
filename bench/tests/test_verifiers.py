@@ -9402,6 +9402,18 @@ def test_worker_commands_required_run_succeeded_flag():
     assert "fleet_upgrade_report.py --readiness ran but exited non-zero" in res_unclosed_failed.reason
     assert "the pod clipped a worker terminal call's arguments" not in res_unclosed_failed.reason
 
+    # A failed terminal call whose raw arguments were clipped before "command" (cmd is None)
+    # does not fold into gaps or turn a conclusive fail into error (#3335).
+    traj_clipped_no_cmd_failed = [
+        {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": f"python3 {_SCRIPT_PATH} --readiness"}, "result": '{"exit_code": 1}', "exit_code": 1, "status": "completed", "at": 1.0},
+        {"agent": "worker", "name": "terminal", "task": "t_2", "args": {"raw": '{"description": "long description ...[clipped 40 chars]'}, "result": '{"exit_code": 1}', "exit_code": 1, "status": "completed", "at": 2.0},
+    ]
+    transcript.set("ok", traj_clipped_no_cmd_failed, worker_commands=[{"task": "t_1", "command": f"python3 {_SCRIPT_PATH} --readiness"}])
+    res_clipped_no_cmd_failed = v.verify(5.0)
+    assert res_clipped_no_cmd_failed.status == "fail"
+    assert "fleet_upgrade_report.py --readiness ran but exited non-zero" in res_clipped_no_cmd_failed.reason
+    assert "the pod clipped a worker terminal call's arguments" not in res_clipped_no_cmd_failed.reason
+
     # A clipped exit-0 match beside an earlier failed unclipped match remains inconclusive (error status, not conclusive fail).
     traj_failed_then_clipped = [
         {"agent": "worker", "name": "terminal", "task": "t_1", "args": {"command": f"python3 {_SCRIPT_PATH} --readiness"}, "result": '{"exit_code": 1}', "exit_code": 1, "status": "completed", "at": 1.0},
@@ -10317,6 +10329,31 @@ def test_scan_command_prefix_env_and_xargs_flags():
     assert _argv_runs(argv5, run_audit)
     assert _command_word_index(argv5) == 3
 
+    # 6. env -u with attached value containing 'S' (e.g. -uHTTPS_PROXY, -uKUBECONFIGS, -uS):
+    # 'S' is part of the unset variable name, not -S / --split-string
+    from kube_agents_bench.verifiers import _has_detaching_wrapper
+
+    argv6 = ["env", "-uHTTPS_PROXY", "python3", "collect.py", "compliance-audit"]
+    assert _argv_runs(argv6, run_collect)
+    assert _command_word_index(argv6) == 2
+
+    argv7 = ["env", "-uKUBECONFIGS", "python3", "collect.py", "compliance-audit"]
+    assert _argv_runs(argv7, run_collect)
+    assert _command_word_index(argv7) == 2
+
+    argv8 = ["env", "-uS", "setsid", "python3", "collect.py", "compliance-audit"]
+    assert _command_word_index(argv8) == 3
+    assert _has_detaching_wrapper(argv8)
+
+    # 7. Bare '-' in env (equivalent to -i):
+    argv9 = ["env", "-", "python3", "collect.py", "compliance-audit"]
+    assert _argv_runs(argv9, run_collect)
+    assert _command_word_index(argv9) == 2
+
+    argv10 = ["env", "-", "setsid", "python3", "collect.py", "compliance-audit"]
+    assert _command_word_index(argv10) == 3
+    assert _has_detaching_wrapper(argv10)
+
 
 def test_extract_shell_command_string_clustered_options():
     from kube_agents_bench.shell_words import _extract_shell_command_string
@@ -10341,6 +10378,19 @@ def test_extract_shell_command_string_clustered_options():
     )
     assert cmd3 == "python3 collect.py"
     assert noexec3 is True
+
+    # 4. bash -n +n -c "<cmd>" and bash -o noexec +n -c "<cmd>" clear has_noexec on +n
+    cmd4, noexec4, _ = _extract_shell_command_string(
+        ["bash", "-n", "+n", "-c", "python3 collect.py"], 1
+    )
+    assert cmd4 == "python3 collect.py"
+    assert noexec4 is False
+
+    cmd5, noexec5, _ = _extract_shell_command_string(
+        ["bash", "-o", "noexec", "+n", "-c", "python3 collect.py"], 1
+    )
+    assert cmd5 == "python3 collect.py"
+    assert noexec5 is False
 
 
 def test_window_clipped_command_none_guards():
