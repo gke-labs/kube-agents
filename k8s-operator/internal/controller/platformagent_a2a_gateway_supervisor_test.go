@@ -151,7 +151,7 @@ func TestADrainingProfileKeepsTheGatewaysDeny(t *testing.T) {
 // config_load_time that moves clears it, and one that doesn't move within the
 // bound gets the bus pod restarted.
 func TestBindingAProfileReloadsTheBusInsteadOfRollingIt(t *testing.T) {
-	agent := a2aTestAgent()
+	agent := a2aSingleServerTestAgent()
 	cl := fake.NewClientBuilder().
 		WithScheme(setupScheme()).
 		WithObjects(agent, chartProfileNamespace(agent)).
@@ -287,7 +287,7 @@ func TestAReloadedDenyRefusesTheGatewayWithoutARestart(t *testing.T) {
 	load := func(profiles []string) *natsserver.Options {
 		t.Helper()
 		conf := string(buildA2ANATSConfigSecret(agent, creds, keys, profiles).Data["nats.conf"])
-		if err := os.WriteFile(path, []byte(a2aWithTestTLS(t, conf)), 0o600); err != nil {
+		if err := os.WriteFile(path, []byte(a2aWithTestTLS(t, a2aSingleServerTestConf(t, conf))), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		opts, err := natsserver.ProcessConfigFile(path)
@@ -358,7 +358,7 @@ func TestAReloadedDenyRefusesTheGatewayWithoutARestart(t *testing.T) {
 // a delete that fails leaves the pending record on the Secret for the next
 // pass rather than dropping it with the restart never done.
 func TestAFailedRestartKeepsThePendingReload(t *testing.T) {
-	agent := a2aTestAgent()
+	agent := a2aSingleServerTestAgent()
 	refuseDeletes := false
 	funcs := fakeServerSideApplyInterceptors()
 	funcs.Delete = func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {

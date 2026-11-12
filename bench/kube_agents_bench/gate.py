@@ -67,7 +67,7 @@ import json
 import os
 import re
 import sys
-from collections.abc import Collection, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -98,6 +98,7 @@ from kube_agents_bench.scoring import (
     MISSING,
     NOT_APPLICABLE_PHRASE,
     REP_OUTCOME_NOT_APPLICABLE,
+    RunRecord,
     SUITE_OUTCOME_GREEN,
     SUITE_OUTCOME_NOT_EVALUATED,
     SUITE_OUTCOME_RED,
@@ -126,6 +127,19 @@ TRANSPORT_INJECT = "inject"
 #: set it while main's grader predates the flag. ``--grader-sha`` overrides.
 GRADER_SHA_ENV = "EVAL_GRADER_SHA"
 GRADER_SHA_KEY = "grader_sha"
+#: The record's stamp of the gateway's model setup, written by `bench-gate case`
+#: under this key: the provider the gateway routes to, the model the records
+#: name and the reasoning effort the gateway asks for. Read from the job
+#: environment by the names the deploy used (hack/ci-deploy.sh), never from a
+#: flag: a pull request is graded with main's bench, which must not have to
+#: know the flag. Absent when the provider or the model is unknown, so an old
+#: record and an unknown setup stay distinct.
+AGENT_STAMP_KEY = "agent"
+AGENT_PROVIDER_ENV = "MODEL_PROVIDER"
+REASONING_EFFORT_ENV = "EVAL_REASONING_EFFORT"
+#: The chart's litellm.reasoningEffort values; empty is the model's default and
+#: leaves the field out of the stamp.
+REASONING_EFFORT_VALUES = ("low", "medium", "high")
 
 #: Rung 6 compares a run only with history from its own mode, because the
 #: mode is a component of the version key (``VersionKey.mode``). Before it
@@ -412,6 +426,34 @@ def _report_excerpt(text: str | None, limit: int = REPORT_EXCERPT_MAX_CHARS) -> 
     return flat
 
 
+def agent_stamp(
+    records: Sequence[RunRecord | None], environ: Mapping[str, str] | None = None
+) -> dict[str, str] | None:
+    """The ``agent`` stamp for a case document, or None when it cannot be named.
+
+    The provider and the effort come from the environment; the model from the
+    first record that carries one (devops-bench's ``manifest.json``, the same
+    place the version key's setup_id comes from). An effort outside
+    :data:`REASONING_EFFORT_VALUES` raises ValueError: a misspelt effort must
+    not be recorded as if it were one the gateway honours.
+    """
+    env = os.environ if environ is None else environ
+    provider = (env.get(AGENT_PROVIDER_ENV) or "").strip()
+    effort = (env.get(REASONING_EFFORT_ENV) or "").strip()
+    if effort and effort not in REASONING_EFFORT_VALUES:
+        raise ValueError(
+            f"{REASONING_EFFORT_ENV}={effort!r} is not one of "
+            f"{', '.join(REASONING_EFFORT_VALUES)} or empty (the model default)"
+        )
+    model = next((r.agent_model for r in records if r is not None and r.agent_model), None)
+    if not provider or not model:
+        return None
+    stamp = {"provider": provider, "model": model}
+    if effort:
+        stamp["reasoning_effort"] = effort
+    return stamp
+
+
 def _cmd_case(args: argparse.Namespace) -> int:
     try:
         spec = load_case(args.task)
@@ -429,6 +471,15 @@ def _cmd_case(args: argparse.Namespace) -> int:
     run_dirs: list[str | None] = [
         None if d == MISSING else d for d in (args.result or [])
     ]
+
+    # The effort is checked before any grading, with the shell's own check
+    # (hack/ci-eval-pr.sh) as the first guard; a bad value here is exit 2
+    # like a bad VERSIONS.json, never a stamp that names an effort nobody set.
+    try:
+        agent_stamp([], None)
+    except ValueError as exc:
+        print(f"Task {spec.case_id} Result: [FAILED] {exc}", file=sys.stderr)
+        return 2
 
     # The version key comes off the first repetition whose record has one.
     # All repetitions of one case run on the same software, so any of them
@@ -526,6 +577,13 @@ def _cmd_case(args: argparse.Namespace) -> int:
     # is reported here instead so there is one parser, not two that can
     # disagree about which task provisions infrastructure.
     payload["deployer"] = spec.deployer
+    # The gateway's model setup the run was graded under, for the certification
+    # record: its reader groups repetitions per release and splits a window at
+    # a model or effort change, which setup_id alone cannot show (it carries
+    # the model, not the provider or the effort).
+    stamp = agent_stamp(loaded)
+    if stamp is not None:
+        payload[AGENT_STAMP_KEY] = stamp
     payload["label"] = _label(payload)
 
     # The one-line log the presubmit has always printed, in the same shape so
@@ -1057,6 +1115,19 @@ def _cmd_record(args: argparse.Namespace) -> int:
             f"::error::refusing to record a baseline with {ROLLBACK_LANE_ENV}=1: "
             "the today lane grades a rolled-back install, which is not what "
             "today's window measures",
+            file=sys.stderr,
+        )
+        return 2
+    if (os.environ.get(REASONING_EFFORT_ENV) or "").strip() and not args.force:
+        # Fourth way in, mirrored from the same decision: a run at a named
+        # reasoning effort would file its lines under the default-effort key,
+        # because the version key carries no effort. The effort in the key is
+        # a later change; until then such a run reads the store and never
+        # writes it.
+        print(
+            f"::error::refusing to record a baseline with {REASONING_EFFORT_ENV}="
+            f"{os.environ[REASONING_EFFORT_ENV]}: the version key carries no "
+            "reasoning effort, so the lines would pool with the default-effort window",
             file=sys.stderr,
         )
         return 2

@@ -54,7 +54,9 @@ Cluster Agent profile's `cluster_identity` names, which is how a project
 `spec.scope` brings in reaches the watch, and, for every namespace of every
 running or reconciling cluster that has a Cluster Agent profile and is not a
 system namespace, runs the Cluster Agent's `stall_report.py` over a bounded list
-of controller kinds, keeping a ledger of the rows it has seen. On a new stall
+of controller kinds, once per cluster (each kind read once across the cluster
+and split per namespace, clusters four at a time), keeping a ledger of the rows
+it has seen. On a new stall
 episode it sends the Session KV server a `controller-stall` inject, the route
 `k8s-event-watcher` and the drift detector use
 ([design](../../../docs/designs/stall-watch-inject.md)). The server posts the
@@ -984,7 +986,7 @@ SOP and a roster entry, not a restore.
 ## Adding a watchdog: the repository steps
 
 The site's [Autonomous watchdogs](../../../docs/site/src/content/docs/concepts/autonomous-watchdogs.md#adding-a-watchdog)
-page lists what an entry needs. Two steps belong to this repository rather than
+page lists what an entry needs. Three steps belong to this repository rather than
 to an install:
 
 - Run `make docs-generate` after editing either roster. The site's cron
@@ -993,6 +995,10 @@ to an install:
   `compliance-audit` entry is also rendered in full as the job-schema example
   on the watchdogs, skills and cron-jobs pages, so an edit to it changes those
   three pages too.
+- Add, change or remove the job's row in
+  [`scheduling-on-profiles-inventory.md`](../../../docs/designs/scheduling-on-profiles-inventory.md)
+  in the same PR, saying where the job lives once Hermes cron retires (profile,
+  trigger kind, report sink). TBD with a linked open question is an answer.
 - For a dev workspace, `scripts/dev/dev_rebuild_agent.sh` rebuilds and restarts
   the agent image without a release; `./upgrade.sh --upgrade-mode=harness
 --image-tag=<ref>` is the path for an installed cluster.
