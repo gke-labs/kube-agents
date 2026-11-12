@@ -2476,11 +2476,28 @@ exit 0
         proc, _ = self._run_delete(wedged=True)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         calls = self.kubectl_args.splitlines()
-        # get, delete, patch, three RBAC deletes, and one JetStream claim
-        # delete per bus server ordinal (0, 1, 2).
-        self.assertEqual(len(calls), 9, self.kubectl_args)
+        # get, delete, patch, three RBAC deletes, the bus StatefulSet's
+        # delete, and one JetStream claim delete per bus server ordinal
+        # (0, 1, 2).
+        self.assertEqual(len(calls), 10, self.kubectl_args)
         for call in calls:
             self.assertTrue(call.startswith("--context gke_test-project_us-central1_test-cluster "), call)
+
+    def test_the_bus_statefulset_goes_before_its_claims(self):
+        # A claim deleted while the StatefulSet still creates pods is
+        # recreated with one and outlives it, pinned to that pod's zone; so
+        # the StatefulSet is marked for deletion first, in the foreground. The
+        # mark alone stops it creating pods, so nothing waits for them.
+        proc, _ = self._run_delete(wedged=True)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        calls = self.kubectl_args.splitlines()
+        sts = [i for i, c in enumerate(calls) if " delete statefulset " in c]
+        pvcs = [i for i, c in enumerate(calls) if " delete pvc " in c]
+        self.assertEqual(len(sts), 1, self.kubectl_args)
+        self.assertTrue(pvcs and sts[0] < min(pvcs), self.kubectl_args)
+        self.assertIn("--field-selector metadata.name=agent-a2a-nats", calls[sts[0]])
+        self.assertIn("--cascade=foreground", calls[sts[0]])
+        self.assertIn("--wait=false", calls[sts[0]])
 
     def test_wedged_finalizer_cleans_tokenreview_callout_rbac_and_jetstream_pvc(self):
         # When the operator's finalizer fails to clear in time, the script strips

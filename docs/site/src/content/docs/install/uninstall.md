@@ -131,8 +131,11 @@ The finalizer is what deletes the agent's cluster-scoped RBAC and, under `spec.m
 for o in $(kubectl get clusterrole,clusterrolebinding -o name | grep ':kubeagents-system:platform-agent$'); do
   kubectl delete "$o"
 done
+kubectl delete statefulset platform-agent-a2a-nats -n kubeagents-system --cascade=foreground --wait=false --ignore-not-found=true
 kubectl delete pvc data-platform-agent-a2a-nats-0 data-platform-agent-a2a-nats-1 data-platform-agent-a2a-nats-2 -n kubeagents-system --ignore-not-found=true
 ```
+
+The bus StatefulSet is marked for deletion before the volumes. A volume deleted while the StatefulSet still runs is recreated with its server and left behind, and a later install can then fail to place that server.
 
 ## Where to go next
 

@@ -384,6 +384,7 @@ data:
     KUBEAGENTS_AUTOMERGE=off
     KUBEAGENTS_DIAL=off
     KUBEAGENTS_SCOPE_FILE=/etc/kube-agents/scope.json
+    KUBEAGENTS_RESOLVED_SCOPE_FILE=
     RECONCILE_PROJECT=
     GKE_PROJECT_ID=example-project
     STALL_WATCH_EXCLUDE_NAMESPACES=
@@ -1783,6 +1784,7 @@ spec:
               value: /etc/hermes
             - name: KUBEAGENTS_SCOPE_FILE
               value: /etc/kube-agents/scope.json
+            - name: KUBEAGENTS_RESOLVED_SCOPE_FILE
             - name: RECONCILE_PROJECT
             - name: HERMES_HOME_MODE
               value: "2770"
