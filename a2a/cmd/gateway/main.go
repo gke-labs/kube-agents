@@ -45,6 +45,10 @@ const (
 // terminationLogPath is the kubelet's default terminationMessagePath.
 var terminationLogPath = "/dev/termination-log"
 
+// terminationLogMode is the termination message's file mode: the kubelet
+// reads it from outside the container.
+const terminationLogMode = 0o644
+
 func main() {
 	os.Exit(run())
 }
@@ -488,7 +492,7 @@ func serve(ctx context.Context, cfg *gateway.Config, metrics *gateway.Metrics, r
 			// the termination message as the last state's message.
 			msg := "ErrTermBusLost: " + err.Error() + "; the lease is released and the restarted container stands by"
 			log.Error("gateway exited: the bus was down mid-term (ErrTermBusLost)", "err", err)
-			_ = os.WriteFile(terminationLogPath, []byte(msg), 0o644)
+			_ = os.WriteFile(terminationLogPath, []byte(msg), terminationLogMode)
 			return err
 		}
 		log.Error("gateway exited", "err", err)

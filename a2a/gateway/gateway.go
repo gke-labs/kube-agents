@@ -106,6 +106,10 @@ const (
 // tests can shorten it.
 var termWaitBusMax = 60 * time.Second
 
+// busWatchEvery is how often a run with a BusDownLimit looks at the
+// connection. A var so tests can shorten it.
+var busWatchEvery = time.Second
+
 // errTermBusGaveUp is a term start that waited termWaitBusMax on the bus.
 var errTermBusGaveUp = errors.New("the bus didn't answer")
 
@@ -790,10 +794,6 @@ type RunOptions struct {
 	// to termWaitBusMax; zero, the default, never gives up.
 	BusDownLimit time.Duration
 }
-
-// busWatchEvery is how often a run with a BusDownLimit looks at the
-// connection. A var so tests can shorten it.
-var busWatchEvery = time.Second
 
 // watchBus ends the run with ErrTermBusLost, through cancel, once the
 // connection has been down for limit without a break. It returns when ctx
