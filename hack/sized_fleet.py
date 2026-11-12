@@ -29,14 +29,11 @@ A run by hand goes through this script, from a `main` checkout, never through
 from __future__ import annotations
 
 import argparse
-import base64
-import contextlib
 import json
 import logging
 import os
 import re
 import signal
-import socket
 import subprocess
 import sys
 import tempfile
@@ -53,7 +50,7 @@ sys.path.insert(0, str(REPO / "bench"))
 
 from kube_agents_bench.scale import collect, kube  # noqa: E402
 from kube_agents_bench.scale import sized_fleet as sf  # noqa: E402
-from kube_agents_bench.scale import runner, sized_records, sized_run  # noqa: E402
+from kube_agents_bench.scale import operations, runner, sized_records, sized_run  # noqa: E402
 
 LOG = logging.getLogger("sized-fleet")
 STACK_DIR = REPO / "bench" / "tf" / "sized-fleet"
@@ -93,17 +90,7 @@ EVAL_CASES_FILE = REPO / "hack" / "eval" / "sized-fleet-cases.txt"
 BENCH_DIR = REPO / "bench"
 EVALS_DIR = "evals"
 EVAL_SUMMARY_FILE = "summary.json"
-# The agent runs under GKE Sandbox, which a port-forward cannot reach, so the harness rides
-# the exec relay (bench/README.md, "Sandboxed installs").
-RELAY_SCRIPT = REPO / "scripts" / "hermes-dashboard-tunnel.py"
-RELAY_CONTAINER = "agent-api-auth"
-RELAY_REMOTE_PORT = 8643
-EVAL_LOCAL_PORT = 18642
-RELAY_START_SECONDS = 60
-RELAY_POLL_SECONDS = 2
 EVAL_TIMEOUT_SECONDS = 30 * 60
-AGENT_SECRET = "platform-agent-secrets"
-AGENT_TOKEN_KEY = "API_SERVER_KEY"
 AGENT_SERVICE = "platform-agent"
 JUDGE_PROVIDER = "google"
 JUDGE_MODEL = "gemini-3.1-pro-preview"
@@ -461,43 +448,21 @@ def case_passed(result: dict) -> bool:
     return bool(objectives) and all(c.get("success") for c in objectives)
 
 
-@contextlib.contextmanager
-def agent_relay(args: argparse.Namespace, host_context: str, workdir: Path):
-    """Hold the exec relay to the agent API open on EVAL_LOCAL_PORT, on its own kubeconfig."""
-    kubeconfig = workdir / "host.kubeconfig"
-    kubeconfig.write_text(kube.run(["kubectl", "config", "view", "--minify", "--flatten", "--context", host_context]))
-    relay = subprocess.Popen(
-        [sys.executable, str(RELAY_SCRIPT), "--namespace", args.namespace, "--container", RELAY_CONTAINER,
-         "--remote-port", str(RELAY_REMOTE_PORT), "--local-port", str(EVAL_LOCAL_PORT)],
-        env={**os.environ, "KUBECONFIG": str(kubeconfig)}, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    try:
-        deadline = time.time() + RELAY_START_SECONDS
-        while True:
-            with contextlib.suppress(OSError), socket.create_connection(("127.0.0.1", EVAL_LOCAL_PORT), timeout=1):
-                break
-            if relay.poll() is not None or time.time() > deadline:
-                raise RuntimeError("the relay to the agent API did not open")
-            time.sleep(RELAY_POLL_SECONDS)
-        yield
-    finally:
-        relay.terminate()
-        relay.wait()
-
-
 def run_evals(args: argparse.Namespace, host_context: str, out: Path) -> dict:
     """Run each listed case once against the host install; write each result and a summary under out/evals."""
     evals = out / EVALS_DIR
     evals.mkdir(parents=True, exist_ok=True)
-    token = base64.b64decode(kube.run(["kubectl", "--context", host_context, "-n", args.namespace, "get", "secret",
-                                       AGENT_SECRET, "-o", f"jsonpath={{.data.{AGENT_TOKEN_KEY}}}"])).decode()
-    env = {**os.environ, "PROJECT_ID": args.project, "GCP_PROJECT_ID": args.project, "CLUSTER_NAME": args.host_cluster,
-           "AGENT_CLUSTER_CONTEXT": host_context, "AGENT_NAMESPACE": args.namespace,
-           "AGENT_SERVICE_NAME": AGENT_SERVICE, "AGENT_LOCAL_PORT": str(EVAL_LOCAL_PORT),
-           "PLATFORM_AGENT_TOKEN": token, "BENCH_TF_ROOT": "./tf",
-           "JUDGE_PROVIDER": os.environ.get("JUDGE_PROVIDER", JUDGE_PROVIDER),
-           "JUDGE_MODEL": os.environ.get("JUDGE_MODEL", JUDGE_MODEL)}
+    # The agent runs under GKE Sandbox, which a port-forward cannot reach, so the harness rides
+    # the exec relay (bench/README.md, "Sandboxed installs").
+    relay = operations.Relay(host_context, args.namespace)
     summary: dict[str, dict] = {}
-    with agent_relay(args, host_context, evals):
+    relay.start()
+    try:
+        env = {**os.environ, **operations.agent_env(host_context, args.namespace, relay.port),
+               "PROJECT_ID": args.project, "GCP_PROJECT_ID": args.project, "CLUSTER_NAME": args.host_cluster,
+               "AGENT_SERVICE_NAME": AGENT_SERVICE, "BENCH_TF_ROOT": "./tf",
+               "JUDGE_PROVIDER": os.environ.get("JUDGE_PROVIDER", JUDGE_PROVIDER),
+               "JUDGE_MODEL": os.environ.get("JUDGE_MODEL", JUDGE_MODEL)}
         for case in eval_cases(Path(args.eval_cases)):
             name = Path(case).parent.name
             LOG.info("eval case %s", name)
@@ -510,12 +475,15 @@ def run_evals(args: argparse.Namespace, host_context: str, out: Path) -> dict:
             if found:
                 result = json.loads(Path(found.group(1)).read_text())[0]
                 (evals / f"{name}.results.json").write_text(json.dumps(result, indent=2) + "\n")
-                entry.update(passed=case_passed(result), checks={c["name"]: c.get("status") for c in
-                                                                 result.get("verification_report") or []})
+                # The answer's time and tokens are the capability usage design's C9 inputs.
+                entry.update(passed=case_passed(result), latency=result.get("latency"), tokens=result.get("tokens"),
+                             checks={c["name"]: c.get("status") for c in result.get("verification_report") or []})
             else:
                 entry["passed"] = False
             LOG.info("eval case %s: %s", name, "passed" if entry["passed"] else "failed")
             summary[name] = entry
+    finally:
+        relay.stop()
     (evals / EVAL_SUMMARY_FILE).write_text(json.dumps(summary, indent=2) + "\n")
     return summary
 
