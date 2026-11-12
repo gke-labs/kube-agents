@@ -215,14 +215,17 @@ readonly A2A_DIAG_MAX_PODS=40
 # otherwise undiagnosable from logs: #5644's today smoke run); /routez the
 # routes the server holds; /varz its version and build. The image each
 # server's containers ran goes to a2a-nats-images.txt, so servers on
-# different builds of a floating tag show. Bounded per read, and a read that
-# hangs gives up at the request timeout.
+# different builds of a floating tag show. Each read is bounded by
+# `timeout`, not by --request-timeout: that governs plain API calls and not an
+# exec's stream, so a wedged node tunnel would otherwise hold the exit trap
+# (the credential-proxy scrape above has the same bound for the same reason).
+# 3 servers x 3 reads x the bound caps the whole at 90s.
 readonly A2A_DIAG_NATS_COMPONENT="nats"
 readonly A2A_DIAG_NATS_CONTAINER="nats"
 readonly A2A_DIAG_NATS_MONITOR_URL="http://127.0.0.1:8222"
 readonly A2A_DIAG_NATS_MONITOR_PATHS="jsz routez varz"
 readonly A2A_DIAG_NATS_READ_MAX_BYTES=$((1024 * 1024))
-readonly A2A_DIAG_NATS_REQUEST_TIMEOUT="20s"
+readonly A2A_DIAG_NATS_EXEC_BOUND_SECONDS=10
 readonly A2A_DIAG_NATS_IMAGES_JSONPATH='{range .items[*]}{.metadata.name}{"\t"}{range .status.containerStatuses[*]}{.name}={.imageID}{" "}{end}{"\n"}{end}'
 
 # ─── Inference-replay shadow mode ────────────────────────────────────────────
@@ -1340,10 +1343,11 @@ collect_a2a_nats_monitor() {
   shift 5
   local kctl=("$@")
   local path
+  local bound=(timeout --foreground "${A2A_DIAG_NATS_EXEC_BOUND_SECONDS}")
+  command -v timeout >/dev/null 2>&1 || bound=()
   for path in ${A2A_DIAG_NATS_MONITOR_PATHS}; do
-    "${kctl[@]}" exec "pod/${pod}" -n "${ns}" -c "${A2A_DIAG_NATS_CONTAINER}" \
-      --request-timeout="${A2A_DIAG_NATS_REQUEST_TIMEOUT}" -- \
-      wget -qO- -T 10 "${A2A_DIAG_NATS_MONITOR_URL}/${path}" 2>&1 \
+    ${bound[@]+"${bound[@]}"} "${kctl[@]}" exec "pod/${pod}" -n "${ns}" -c "${A2A_DIAG_NATS_CONTAINER}" -- \
+      wget -qO- -T 5 "${A2A_DIAG_NATS_MONITOR_URL}/${path}" 2>&1 \
       | last_bytes "${A2A_DIAG_NATS_READ_MAX_BYTES}" "${artifact_dir}/${prefix}${base}-${path}.json" || true
   done
   return 0

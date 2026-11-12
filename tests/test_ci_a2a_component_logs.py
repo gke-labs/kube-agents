@@ -8,7 +8,9 @@ collect_agent_pod_diagnostics, which both the eval's exit trap and the failure
 dumper call, now reads every pod carrying the operator's A2A component label,
 and every session pod the gateway spawned, and writes
 a2a-<component>-<pod>.log plus a2a-<component>-<pod>-previous.log for one
-with a restarted container.
+with a restarted container. For each bus server it also reads the server's
+/jsz, /routez and /varz from inside the pod, each under a `timeout` bound, and
+records the bus pods' images (a2a-nats-images.txt).
 
 ci-env.sh is sourced whole and the real collector runs, with `kubectl` on PATH
 replaced by a stub that answers the pod listings from fixtures and the log
@@ -90,6 +92,19 @@ _KUBECTL_STUB = textwrap.dedent(
 )
 
 
+# A `timeout` that logs its bound and runs the command, so a test can pin that
+# every exec runs under it.
+_TIMEOUT_STUB = textwrap.dedent(
+    """\
+    #!/usr/bin/env bash
+    echo "timeout $*" >> "${KUBECTL_CALL_LOG}"
+    [ "$1" = "--foreground" ] && shift
+    shift
+    exec "$@"
+    """
+)
+
+
 class A2AComponentLogsTest(unittest.TestCase):
     def collect(self, *, component_listing=_COMPONENT_LISTING, session_listing=_SESSION_LISTING, list_fails=False, prefix="", exec_fails=False):
         """Runs collect_agent_pod_diagnostics under `set -euo pipefail`, as the
@@ -102,6 +117,9 @@ class A2AComponentLogsTest(unittest.TestCase):
         kubectl = bin_dir / "kubectl"
         kubectl.write_text(_KUBECTL_STUB)
         kubectl.chmod(kubectl.stat().st_mode | stat.S_IEXEC)
+        timeout = bin_dir / "timeout"
+        timeout.write_text(_TIMEOUT_STUB)
+        timeout.chmod(timeout.stat().st_mode | stat.S_IEXEC)
         artifacts = root / "artifacts"
         calls = root / "calls.log"
         calls.touch()
@@ -216,16 +234,26 @@ class A2AComponentLogsTest(unittest.TestCase):
                 dump = (artifacts / f"a2a-nats-{_NATS}-{path}.json").read_text()
                 self.assertIn(f'"pod":"{_NATS}"', dump)
                 self.assertIn(f"http://127.0.0.1:8222/{path}", dump)
-        execs = [c for c in calls if " exec pod/" in f" {c}"]
+        execs = [c for c in calls if " exec pod/" in f" {c}" and not c.startswith("timeout ")]
         self.assertEqual(len(execs), 3, execs)
+        bound = lift_constant("A2A_DIAG_NATS_EXEC_BOUND_SECONDS", _CI_ENV.read_text(), _CI_ENV).split("=", 1)[1].strip()
+        bounded = [c for c in calls if c.startswith(f"timeout --foreground {bound} kubectl ") and f" exec pod/{_NATS} " in c]
+        self.assertEqual(len(bounded), 3, calls)
         for read in execs:
             self.assertIn(f"exec pod/{_NATS} ", read)
             self.assertIn(f"--context {_CONTEXT}", read)
             self.assertIn(f"-n {_NS}", read)
             self.assertIn("-c nats", read)
-            self.assertIn("--request-timeout=", read)
+            self.assertIn("wget -qO- -T ", read)
         images = (artifacts / "a2a-nats-images.txt").read_text()
         self.assertIn("nats=docker.io/library/nats@sha256:aaa", images)
+
+    def test_the_rollback_prefix_reaches_the_bus_server_files(self) -> None:
+        result, artifacts, _ = self.collect(prefix="rollback-")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((artifacts / f"rollback-a2a-nats-{_NATS}-jsz.json").exists())
+        self.assertTrue((artifacts / "rollback-a2a-nats-images.txt").exists())
+        self.assertFalse((artifacts / f"a2a-nats-{_NATS}-jsz.json").exists())
 
     def test_only_bus_servers_are_read_from_inside(self) -> None:
         _, _, calls = self.collect()
