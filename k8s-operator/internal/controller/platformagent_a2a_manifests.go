@@ -76,6 +76,11 @@ import (
 )
 
 const (
+	// a2aNATSDeletionRecheck is how long a CR's deletion waits after
+	// marking its bus StatefulSet for deletion before it reaps the claims
+	// (deleteA2ANATSStatefulSetFirst).
+	a2aNATSDeletionRecheck = 5 * time.Second
+
 	// a2aPartOf marks every object of the next stack, so
 	// `kubectl get -l app.kubernetes.io/part-of=a2a-next` is the whole venue.
 	a2aPartOf = "a2a-next"
@@ -2790,6 +2795,31 @@ const (
 // a2aNATSMaxReplicas is the most servers the bus can run (the busReplicas
 // enum's top value), and so the ordinals handleDeletion reaps claims for.
 const a2aNATSMaxReplicas = 3
+
+// deleteA2ANATSStatefulSetFirst marks the bus StatefulSet this agent
+// controls for deletion, in the foreground so its pods go with it, and
+// reports whether the claim reap has to wait a pass: claims reaped while the
+// StatefulSet still creates pods would be recreated with them
+// (handleDeletion). Once the StatefulSet carries a deletion timestamp its
+// controller creates no pod, and so no claim, and each claim's protection
+// finalizer holds it until its pod exits; so the reap waits for the mark,
+// not for the pods, and a pod stuck terminating on a lost node holds
+// nothing. Read uncached, so a StatefulSet created moments before the CR's
+// deletion isn't missed. A StatefulSet of that name the agent doesn't
+// control isn't its to delete, and doesn't hold the reap.
+func (r *PlatformAgentReconciler) deleteA2ANATSStatefulSetFirst(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (bool, error) {
+	sts := &appsv1.StatefulSet{}
+	if err := r.a2aReader().Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aNATSName(agent)}, sts); err != nil {
+		return false, client.IgnoreNotFound(err)
+	}
+	if !metav1.IsControlledBy(sts, agent) || !sts.DeletionTimestamp.IsZero() {
+		return false, nil
+	}
+	if err := r.Delete(ctx, sts, client.PropagationPolicy(metav1.DeletePropagationForeground)); client.IgnoreNotFound(err) != nil {
+		return false, fmt.Errorf("deleting the A2A bus StatefulSet before its claims: %w", err)
+	}
+	return true, nil
+}
 
 // a2aNATSDataClaimName is the claim the StatefulSet controller creates for
 // the server at ordinal.

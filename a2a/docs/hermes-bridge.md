@@ -502,7 +502,14 @@ bridge logs a warning with the task, session and answer size, never the text. Th
 cancel raced the end of the turn too: a withheld answer ends `failed`, not `completed`. The rule is
 `opensWithUnstructuredReasoning` in `reasoning_leak.go`. The image patch
 `apply_unstructured_reasoning_replay.py` keeps such a reply out of the history Hermes sends the
-model on later calls. Output that never passes the bridge is not guarded: a kanban card's result
+model on later calls. On the API executor one more guard follows the answer: a reply that names a card
+or task id (`t_` and eight hex characters) when the turn's prompt, the user's words, names no task,
+card, board or kanban is asked for again, once, with a fixed user message in the same session under
+the turn's Idempotency-Key plus `/restate-card-id`, and the restated reply is the turn's answer; a
+restated reply that still names an id is delivered as it is, with a `card-id-restated` warning in
+the log. The chat UX rule keeps ids out of user text outside a board read, the Planning Agent's SOUL
+says so, and in a thread whose earlier replies carry an id the model copied them all the same
+(`card_id_leak.go`). The CLI executor has no such step. Output that never passes the bridge is not guarded: a kanban card's result
 posted by the notifier, a `today`-mode reply from Hermes's own gateway platforms, and cron
 deliveries on every leg, `report_to_chat` included. The scheduled `deliver: "chat"` report of a
 fleet-audit job the image ships is already immune, because the relay posts the record the run's
