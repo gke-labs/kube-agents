@@ -35,14 +35,15 @@ import (
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
 const (
-	metaN0 = "platform-agent-a2a-nats-0"
-	metaN1 = "platform-agent-a2a-nats-1"
-	metaN2 = "platform-agent-a2a-nats-2"
+	metaN0 = "test-agent-a2a-nats-0"
+	metaN1 = "test-agent-a2a-nats-1"
+	metaN2 = "test-agent-a2a-nats-2"
 )
 
 // leaderView is the leader's /jsz: it alone lists the other members.
@@ -170,7 +171,7 @@ func (m *metaRig) heal(views []a2aBusServerView, since, now time.Time) bool {
 	if err := m.cl.Get(context.Background(), client.ObjectKeyFromObject(m.sts), live); err != nil {
 		m.t.Fatal(err)
 	}
-	did, err := m.r.healA2ABusMeta(context.Background(), m.agent, live, views, judgeA2ABusMeta(views, 3), 3, since, now)
+	did, err := m.r.healA2ABusMeta(context.Background(), m.agent, live, views, judgeA2ABusMeta(views, 3), since, now)
 	if err != nil {
 		m.t.Fatal(err)
 	}
@@ -232,6 +233,10 @@ func TestTheRestartGuards(t *testing.T) {
 	holding[2].Streams = 1
 	consuming := lateJoinerViews()
 	consuming[2].Consumers = 1
+	memberHolding := lateJoinerViews()
+	memberHolding[0].Streams = 1
+	loading := lateJoinerViews()
+	loading[2].ClusterSize = 0
 	noLeader := []a2aBusServerView{{Pod: metaN0}, {Pod: metaN1}, {Pod: metaN2}}
 	for _, tc := range []struct {
 		name  string
@@ -243,6 +248,8 @@ func TestTheRestartGuards(t *testing.T) {
 		{"two servers outside (no quorum without them)", twoOutside, past},
 		{"the stray holds a stream", holding, past},
 		{"the stray holds a consumer", consuming, past},
+		{"a member holds a stream (not a fresh bus)", memberHolding, past},
+		{"the stray's meta node hasn't started (still loading its store)", loading, past},
 		{"no agreed leader", noLeader, past},
 		{"formed", formedViews(), past},
 		{"unknown", append(lateJoinerViews()[:2], a2aBusServerView{Pod: metaN2, Err: errors.New("x")}), past},
@@ -412,5 +419,160 @@ func TestTheProvisionJobWaitsForTheMetaGroup(t *testing.T) {
 	}
 	if err := cl.Get(ctx, jobKey, &batchv1.Job{}); err != nil {
 		t.Errorf("the provision Job was not created once the meta group formed: %v", err)
+	}
+}
+
+// Never on a bus that has been provisioned: a running bus's server is
+// never restarted by this, whatever its view says.
+func TestNoRestartOnAProvisionedBus(t *testing.T) {
+	m := newMetaRig(t, nil)
+	setBusProvisionedCondition(m.agent, true, "provision-job", metav1.Now())
+	now := time.Now()
+	if m.heal(lateJoinerViews(), now.Add(-time.Hour), now) {
+		t.Fatal("restarted a server of a provisioned bus")
+	}
+	if !m.podExists(metaN2) {
+		t.Error("deleted a provisioned bus's server")
+	}
+}
+
+// A pod under another StatefulSet's UID, or one already being deleted, is
+// never restarted.
+func TestOnlyALivePodOfThisStatefulSetIsRestarted(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		edit func(o client.Object)
+	}{
+		{"another owner's UID", func(o client.Object) {
+			o.SetOwnerReferences([]metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "StatefulSet", Name: "x", UID: "other-uid", Controller: ptrTrue()}})
+		}},
+		{"already being deleted", func(o client.Object) {
+			o.SetFinalizers([]string{"test/hold"})
+			o.SetDeletionTimestamp(&metav1.Time{Time: time.Now()})
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newMetaRig(t, func(m *metaRig, objs []client.Object) []client.Object {
+				for _, o := range objs {
+					if o.GetName() == metaN2 {
+						tc.edit(o)
+					}
+				}
+				return objs
+			})
+			now := time.Now()
+			if m.heal(lateJoinerViews(), now.Add(-a2aBusMetaHealAfter), now) {
+				t.Fatal("restarted")
+			}
+			if rec := m.restartedRecord(); len(rec) != 0 {
+				t.Errorf("recorded %v", rec)
+			}
+		})
+	}
+}
+
+func ptrTrue() *bool { b := true; return &b }
+
+// The record is written before the delete: a patch that fails deletes
+// nothing, and a delete that fails takes the record back.
+func TestTheRestartIsRecordedBeforeTheDelete(t *testing.T) {
+	now := time.Now()
+	t.Run("patch fails", func(t *testing.T) {
+		m := newMetaRig(t, nil)
+		m.r.Client = interceptor.NewClient(m.cl.(client.WithWatch), interceptor.Funcs{
+			Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+				return errors.New("patch refused")
+			},
+		})
+		live := &appsv1.StatefulSet{}
+		if err := m.cl.Get(context.Background(), client.ObjectKeyFromObject(m.sts), live); err != nil {
+			t.Fatal(err)
+		}
+		views := lateJoinerViews()
+		if _, err := m.r.healA2ABusMeta(context.Background(), m.agent, live, views, judgeA2ABusMeta(views, 3), now.Add(-a2aBusMetaHealAfter), now); err == nil {
+			t.Error("a failed record reported no error")
+		}
+		if !m.podExists(metaN2) {
+			t.Error("the pod was deleted although its restart couldn't be recorded")
+		}
+	})
+	t.Run("delete fails", func(t *testing.T) {
+		m := newMetaRig(t, nil)
+		m.r.Client = interceptor.NewClient(m.cl.(client.WithWatch), interceptor.Funcs{
+			Delete: func(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+				return errors.New("delete refused")
+			},
+		})
+		live := &appsv1.StatefulSet{}
+		if err := m.cl.Get(context.Background(), client.ObjectKeyFromObject(m.sts), live); err != nil {
+			t.Fatal(err)
+		}
+		views := lateJoinerViews()
+		if _, err := m.r.healA2ABusMeta(context.Background(), m.agent, live, views, judgeA2ABusMeta(views, 3), now.Add(-a2aBusMetaHealAfter), now); err == nil {
+			t.Error("a failed delete reported no error")
+		}
+		if rec := m.restartedRecord(); len(rec) != 0 {
+			t.Errorf("the record %v stands for a restart that didn't happen", rec)
+		}
+	})
+}
+
+// Wired: the check restarts the stray once the condition has said it is
+// outside long enough.
+func TestTheCheckRestartsTheStrayWhenItsTimeIsUp(t *testing.T) {
+	m := newMetaRig(t, nil)
+	views := lateJoinerViews()
+	m.r.busServerViews = func(context.Context, *agentv1alpha1.PlatformAgent, *appsv1.StatefulSet) ([]a2aBusServerView, error) {
+		return views, nil
+	}
+	msg := a2aBusMetaMessage(judgeA2ABusMeta(views, 3), nil)
+	setA2ABusMetaCondition(m.agent, a2aBusMetaState{checked: true, reason: a2aBusMetaOutsideReason, message: msg}, metav1.NewTime(time.Now().Add(-a2aBusMetaHealAfter-time.Second)))
+	live := &appsv1.StatefulSet{}
+	if err := m.cl.Get(context.Background(), client.ObjectKeyFromObject(m.sts), live); err != nil {
+		t.Fatal(err)
+	}
+	hold, state, err := m.r.checkA2ABusMeta(context.Background(), m.agent, live, 3, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.podExists(metaN2) || !hold {
+		t.Errorf("the stray wasn't restarted (hold %v)", hold)
+	}
+	if !strings.Contains(state.message, "Restarted once already") {
+		t.Errorf("the condition doesn't say it was restarted: %q", state.message)
+	}
+}
+
+// A changed message starts a new period: another server outside, or the
+// same one after its restart, waits its own 3 minutes.
+func TestANewMessageRestartsTheClock(t *testing.T) {
+	agent := a2aTestAgent()
+	t0 := metav1.NewTime(time.Now().Add(-time.Hour))
+	setA2ABusMetaCondition(agent, a2aBusMetaState{checked: true, reason: a2aBusMetaOutsideReason, message: "nats-1 is outside"}, t0)
+	t1 := metav1.NewTime(time.Now())
+	setA2ABusMetaCondition(agent, a2aBusMetaState{checked: true, reason: a2aBusMetaOutsideReason, message: "nats-2 is outside"}, t1)
+	if since := a2aBusMetaSince(agent); since.Before(t1.Time.Add(-time.Second)) {
+		t.Errorf("since %v, want the new message's %v, not the old %v", since, t1, t0)
+	}
+}
+
+// Only the StatefulSet's ordinal pods are read: a pod that copies its labels
+// and owner reference under another name adds no view.
+func TestOnlyTheStatefulSetsOrdinalPodsAreRead(t *testing.T) {
+	m := newMetaRig(t, func(m *metaRig, objs []client.Object) []client.Object {
+		decoy := objs[len(objs)-1].DeepCopyObject().(*corev1.Pod)
+		decoy.Name, decoy.UID = "test-agent-a2a-nats-decoy", "decoy-uid"
+		return append(objs, decoy)
+	})
+	views, err := m.r.readA2ABusServerViews(context.Background(), m.agent, m.sts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, v := range views {
+		names = append(names, v.Pod)
+	}
+	if !slices.Equal(names, []string{metaN0, metaN1, metaN2}) {
+		t.Errorf("read %v", names)
 	}
 }

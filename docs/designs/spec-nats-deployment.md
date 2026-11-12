@@ -63,7 +63,10 @@ A server still outside after 3 minutes is restarted once, under every one of the
 
 - it is the only server outside;
 - the rest are a quorum without it;
-- it holds no stream or consumer, so it holds no only copy of anything;
+- the bus hasn't been provisioned yet, and no server holds a stream or consumer, so no only copy of
+  anything can be on the stray;
+- the stray's own meta node has started (it reports the group's size), which nats-server does only
+  after recovering its store from disk;
 - the bus StatefulSet doesn't already record it as restarted.
 
 The record is an annotation the operator writes before the delete, with its own patch, so the
@@ -72,9 +75,8 @@ its one restart stays named in the condition, for a person.
 
 If a server's view can't be read, the verdict is unknown: nothing is held or restarted, and the
 condition names the unreadable server. The check also runs when the provision Job is re-created on a running bus (its 24 h TTL, or a
-digest change). There it can hold that re-run and set the condition, but its restart can't reach a
-running bus's server, which holds a replica of every R3 stream. It doesn't repair a server that
-drops out of a running bus.
+digest change). There it can hold that re-run and set the condition, but it never restarts anything on a bus that
+has been provisioned. It doesn't repair a server that drops out of a running bus.
 
 **The customer operates this.** Server restarts - rollouts, node drains, PV failover - are
 routine operations, not incidents. That fact drives the resilience contract below more than

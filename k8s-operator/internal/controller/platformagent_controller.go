@@ -1373,6 +1373,8 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// No callout, so no claim about its map: the condition goes.
 		removed := a2aIdentityMapRemoved
 		a2aState.calloutMap = &removed
+		// No bus, so no meta group: its condition goes too.
+		a2aState.busMeta = a2aBusMetaState{checked: true}
 	}
 	// The record travelled into the render (the projection) and travels on
 	// the state to every status writer below, the failed and parked paths

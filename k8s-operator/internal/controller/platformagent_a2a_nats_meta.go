@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"slices"
@@ -80,7 +81,17 @@ const (
 	// usual budget.
 	a2aBusMetaHealAfter = 3 * time.Minute
 	a2aBusJszPath       = "/jsz"
+	// a2aBusJszMaxBytes caps one /jsz read: the summary carries no stream
+	// detail, a few kilobytes.
+	a2aBusJszMaxBytes = 1 << 20
 )
+
+// a2aBusJszClient reads the bus servers' /jsz. It follows no redirect: a
+// pod's answer must not steer the operator's GET elsewhere.
+var a2aBusJszClient = &http.Client{
+	Transport:     &http.Transport{Proxy: nil},
+	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+}
 
 // a2aBusServerView is one bus server's own report of the meta group, read
 // from its /jsz. Err is set when it could not be read.
@@ -135,10 +146,18 @@ func (r *PlatformAgentReconciler) readA2ABusServerViews(ctx context.Context, age
 	if err := r.podReader().List(ctx, pods, client.InNamespace(sts.Namespace), client.MatchingLabels{"app": a2aNATSName(agent)}); err != nil {
 		return nil, err
 	}
+	ordinals := map[string]bool{}
+	if sts.Spec.Replicas != nil {
+		for i := int32(0); i < *sts.Spec.Replicas; i++ {
+			ordinals[sts.Name+"-"+strconv.Itoa(int(i))] = true
+		}
+	}
 	var views []a2aBusServerView
 	for i := range pods.Items {
 		pod := &pods.Items[i]
-		if owner := metav1.GetControllerOf(pod); owner == nil || owner.UID != sts.UID || pod.DeletionTimestamp != nil {
+		// Only the StatefulSet's own ordinal pods: a pod that copies its
+		// labels and owner reference adds no view.
+		if owner := metav1.GetControllerOf(pod); owner == nil || owner.UID != sts.UID || pod.DeletionTimestamp != nil || !ordinals[pod.Name] {
 			continue
 		}
 		views = append(views, readA2ABusServerView(ctx, pod))
@@ -161,7 +180,7 @@ func readA2ABusServerView(ctx context.Context, pod *corev1.Pod) a2aBusServerView
 		view.Err = err
 		return view
 	}
-	resp, err := a2aBusVarzClient.Do(req)
+	resp, err := a2aBusJszClient.Do(req)
 	if err != nil {
 		view.Err = err
 		return view
@@ -171,6 +190,7 @@ func readA2ABusServerView(ctx context.Context, pod *corev1.Pod) a2aBusServerView
 		view.Err = fmt.Errorf("%s answered %s", url, resp.Status)
 		return view
 	}
+	resp.Body = io.NopCloser(io.LimitReader(resp.Body, a2aBusJszMaxBytes))
 	return decodeA2ABusServerView(pod.Name, resp)
 }
 
@@ -314,14 +334,24 @@ func a2aBusMetaRestarted(sts *appsv1.StatefulSet) []string {
 // healA2ABusMeta restarts the one server outside the meta group, once, when
 // every guard holds. since is when the condition first said a server was
 // outside (zero when it does not yet). It returns whether it restarted one.
-func (r *PlatformAgentReconciler) healA2ABusMeta(ctx context.Context, agent *agentv1alpha1.PlatformAgent, sts *appsv1.StatefulSet, views []a2aBusServerView, v a2aBusMetaVerdict, replicas int, since, now time.Time) (bool, error) {
+func (r *PlatformAgentReconciler) healA2ABusMeta(ctx context.Context, agent *agentv1alpha1.PlatformAgent, sts *appsv1.StatefulSet, views []a2aBusServerView, v a2aBusMetaVerdict, since, now time.Time) (bool, error) {
+	// Exactly one outside, with an agreed leader: the verdict then has every
+	// other server naming that leader and listed by it as current, so the
+	// rest are a quorum without the stray.
 	if !v.Known || v.Formed || v.Leader == "" || len(v.Outside) != 1 || since.IsZero() || now.Sub(since) < a2aBusMetaHealAfter {
 		return false, nil
 	}
-	// The rest must be a quorum without the stray: the leader and every other
-	// member current, so taking the stray down costs nothing that serves.
-	if replicas-len(v.Outside) < replicas/2+1 {
+	// Bring-up only: never on a bus that has been provisioned, nor while any
+	// server holds a stream or consumer. A server recovering its store from
+	// disk reports none until it has (and no meta group either), so a running
+	// bus's server can't be taken for an empty one.
+	if busProvisioned(agent) {
 		return false, nil
+	}
+	for _, view := range views {
+		if view.Streams != 0 || view.Consumers != 0 {
+			return false, nil
+		}
 	}
 	stray := v.Outside[0]
 	if slices.Contains(a2aBusMetaRestarted(sts), stray) {
@@ -333,9 +363,10 @@ func (r *PlatformAgentReconciler) healA2ABusMeta(ctx context.Context, agent *age
 			strayView = &views[i]
 		}
 	}
-	// A stray that holds a stream or consumer may hold its only copy; it is
-	// never restarted for this.
-	if strayView == nil || strayView.Streams != 0 || strayView.Consumers != 0 {
+	// The stray's own meta node must have started (it reports the group's
+	// size), which nats-server does only after recovering its store: a
+	// server still loading reports neither.
+	if strayView == nil || strayView.ClusterSize == 0 {
 		return false, nil
 	}
 	pod := &corev1.Pod{}
@@ -359,8 +390,17 @@ func (r *PlatformAgentReconciler) healA2ABusMeta(ctx context.Context, agent *age
 	uid := pod.UID
 	if err := r.Delete(ctx, pod, client.Preconditions{UID: &uid}); err != nil {
 		if errors.IsNotFound(err) || errors.IsConflict(err) {
+			// The pod went, or was replaced, without us: that is a restart.
 			return false, nil
 		}
+		// Not restarted: take the record back (best effort), so the
+		// condition doesn't tell a person it was.
+		undo := client.MergeFrom(sts.DeepCopy())
+		sts.Annotations[a2aBusMetaRestartedAnnotation] = strings.Join(restarted[:len(restarted)-1], ",")
+		if sts.Annotations[a2aBusMetaRestartedAnnotation] == "" {
+			delete(sts.Annotations, a2aBusMetaRestartedAnnotation)
+		}
+		_ = r.Patch(ctx, sts, undo)
 		return false, err
 	}
 	r.recordEvent(agent, corev1.EventTypeWarning, a2aBusMetaRestartedReason,
@@ -401,7 +441,7 @@ func (r *PlatformAgentReconciler) checkA2ABusMeta(ctx context.Context, agent *ag
 	if v.Formed {
 		return false, a2aBusMetaState{checked: true}, nil
 	}
-	_, err = r.healA2ABusMeta(ctx, agent, sts, views, v, replicas, a2aBusMetaSince(agent), now)
+	_, err = r.healA2ABusMeta(ctx, agent, sts, views, v, a2aBusMetaSince(agent), now)
 	return true, a2aBusMetaState{checked: true, reason: a2aBusMetaOutsideReason, message: a2aBusMetaMessage(v, a2aBusMetaRestarted(sts))}, err
 }
 
@@ -425,11 +465,12 @@ func setA2ABusMetaCondition(agent *agentv1alpha1.PlatformAgent, s a2aBusMetaStat
 		meta.RemoveStatusCondition(&agent.Status.Conditions, a2aBusMetaConditionType)
 		return
 	}
-	// A new reason starts a new period: SetStatusCondition keeps the
-	// transition time while the status stays False, and the restart's clock
-	// (a2aBusMetaSince) must count from the first pass that saw a server
-	// outside, not from an earlier unknown verdict.
-	if existing := meta.FindStatusCondition(agent.Status.Conditions, a2aBusMetaConditionType); existing != nil && existing.Reason != s.reason {
+	// A new reason or message starts a new period: SetStatusCondition keeps
+	// the transition time while the status stays False, and the restart's
+	// clock (a2aBusMetaSince) must count from the first pass that saw this
+	// server outside, not from an earlier unknown verdict, a leaderless
+	// phase, another server, or its own restart.
+	if existing := meta.FindStatusCondition(agent.Status.Conditions, a2aBusMetaConditionType); existing != nil && (existing.Reason != s.reason || existing.Message != s.message) {
 		meta.RemoveStatusCondition(&agent.Status.Conditions, a2aBusMetaConditionType)
 	}
 	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{

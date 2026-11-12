@@ -7319,6 +7319,11 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		// one meta leader that lists the rest as current, and a server left
 		// outside is restarted once (platformagent_a2a_nats_meta.go).
 		metaHold := false
+		// A pass that doesn't look clears the condition: on one server it
+		// doesn't apply, and while another hold applies (a roll, the
+		// restart itself) a server's absence isn't the meta group's, so the
+		// restart's clock starts again once the bus is back.
+		state.busMeta = a2aBusMetaState{checked: true}
 		if !calloutHold && !busHold && !state.busHeld && a2aNATSReplicas(agent) > 1 {
 			live := &appsv1.StatefulSet{}
 			if err := r.a2aReader().Get(ctx, types.NamespacedName{Name: a2aNATSName(agent), Namespace: agent.Namespace}, live); err != nil {
@@ -7340,6 +7345,11 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 			return state, fmt.Errorf("failed to create A2A provision Job: %w", err)
 		}
 	} else {
+		// With the Job created, an unknown verdict ("not held on it") no
+		// longer says anything about provisioning.
+		if c := meta.FindStatusCondition(agent.Status.Conditions, a2aBusMetaConditionType); c != nil && c.Reason == a2aBusMetaUnknownReason {
+			state.busMeta = a2aBusMetaState{checked: true}
+		}
 		for _, cond := range existing.Status.Conditions {
 			if cond.Status != corev1.ConditionTrue {
 				continue
