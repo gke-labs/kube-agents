@@ -101,6 +101,15 @@
 # three-replica Deployment that no PodDisruptionBudget selects (the planted
 # stateless-ingest-service in seeded-upgrades). A baseline: no gap declared.
 ./tasks/upgrade-missing-pdb-drain-outage-baseline/task.yaml
+# Capability row: cluster and node upgrades; the upgrade and patch readiness
+# audit on a fail-closed admission webhook whose one rule names CapacityBuffer
+# writes in autoscaling.x-k8s.io and whose backend Service does not exist (the
+# fleet's seeded-crd-gate on slot b, kept off every real write by an
+# objectSelector on the fleet label). A declared gap, expected_fail: no check
+# of the audit reads an admission webhook configuration; the gap is #2567
+# (item 1). The flip bets that the check grades rules and not selectors, as
+# the readiness grader does.
+./tasks/upgrade-webhook-blocks-capacitybuffers-crd/task.yaml
 # Capability row: workloads, OOM, probes and HPA; the obtainability audit on a
 # Deployment whose HorizontalPodAutoscaler scales down with no stabilization
 # window and whose containers have no preStop hook (the planted web-api-server

@@ -748,7 +748,7 @@ gets the same treatment, for two reasons that are not stylistic:
 | `GET /v1/findings`                               | `platform` worker, weekly brief   | the on-demand pull, filterable by project, cluster, state, severity, check prefix      |
 | `POST /v1/findings/{id}/surfaced`                | any publisher                     | after the send: `surface_count`, `surfaced_at`, `chat_id`, `thread_id`                 |
 | `POST /v1/findings/{id}/surfaced` + `publisher`  | a paced publisher (§7.2)          | also `added_class`, `run`: `first_shown_at` on a first paced showing, and the addition |
-| `GET /v1/findings/additions?day=`                | the nudge                         | items added on a UTC day, by class, from `findings_additions` (§7.2)                   |
+| `GET /v1/findings/additions?day=`                | the nudge                         | items added on a UTC day, by class, and their lines, from `findings_additions` (§7.2)  |
 | `POST /v1/findings/expire-snoozes`               | the nudge, every run              | return every row whose `snoozed_until` has lapsed to `surfaced` (§3.2)                 |
 | `PATCH /v1/findings/{id}`                        | the `platform` worker             | the three human transitions (§3.2) for the row's item, plus `pr_url`/`pr_state`        |
 | `POST /v1/findings/{id}/verified`                | the daily job                     | the three-outcome result of §7.4, with what was observed                               |
@@ -985,13 +985,18 @@ holding on would add nothing ever again. Each run that is held, or would be but 
 which on stderr. And a run that fails before it posts, a failed queue read included, exits non-zero,
 which the scheduler posts, at most once a UTC day; later failures that day go to stderr. The day's
 state (the daily part sent, the items added today and the ids of the findings they named, the
-failure reported) is a file in the platform profile home, written before the rows are marked. An addition whose mark fails is not announced
+failure reported) is a file in the platform profile home, written before the rows are marked. An addition whose marks all fail is not announced
 again that day and still counts against that day's limit, though `findings_additions` has no row
 for it. It also holds additions back as a pending item of its class would: a critical one holds
 non-criticals back, and a non-critical one stops every addition, though the stop-add notice does not
 name it. Unlike a recorded addition, it counts only while it stays undecided and under the class
 it has now: a decision on it the same day refunds its slot, and a re-score can move it between
-the two counts. It comes back as new the next day. A finding that joins an added line later, which
+the two counts. It comes back as new the next day. When only some of an addition's marks fail, `findings_additions` has
+its row, so a member left new does not count a second time and is not added again that day; a
+non-critical one does not stop additions, and a critical one holds non-criticals back as a
+critical waiting for the budget does. It is new again the next day. `GET /v1/findings/additions`
+names the line of each addition that day, and the nudge treats an item as on record only when its
+line has an entry for every time the line was announced that day. A finding that joins an added line later, which
 a decision can leave open, was not named: once no finding the addition named is still new, it is a
 new item of its own and holds nothing back. If the state file cannot be written either, the
 additions and the daily part repeat every hour.

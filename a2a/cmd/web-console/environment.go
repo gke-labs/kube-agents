@@ -89,8 +89,8 @@ const (
 	defaultHelmReleaseName          = "kube-agents"
 	controllerManagerSuffix         = "-controller-manager"
 	gatewayDeploymentSuffix         = "-gateway"
-	credentialProxyDeploymentSuffix = "-credential-proxy"
-	credentialProxyExecTierSuffix   = "-credential-proxy-exec-tier"
+	credentialProxyDeploymentSuffix = "-credential-proxy"           // #nosec G101 -- a Deployment name suffix, not a credential
+	credentialProxyExecTierSuffix   = "-credential-proxy-exec-tier" // #nosec G101 -- a Deployment name suffix, not a credential
 	litellmDeploymentName           = "litellm"
 )
 

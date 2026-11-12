@@ -37,6 +37,7 @@ from agent_common_server import _run_env, CONFIG_PATH, DOTENV_PATH
 import board_health_card
 import board_snapshot
 import chat_notify
+import clean_merges
 import cron_schedule
 import findings_queue
 import gitops_workspace
@@ -10829,6 +10830,21 @@ def get_board() -> Dict[str, Any]:
         raise HTTPException(status_code=503, detail=f"the board could not be read: {exc}") from None
 
 
+@app.get("/v1/post-merge/clean-merges", dependencies=[Depends(verify_api_key)])
+def get_clean_merges(repo: str = "") -> Dict[str, Any]:
+    """Clean merges per repository, kind of fix and environment (`clean_merges.py`), for the offer and the dial.
+
+    `repo` narrows the answer to one repository. A database that cannot be read,
+    or a records table without a column the count needs, is a 503, never zero
+    clean merges.
+    """
+    try:
+        with closing(_read_only(SESSION_KV_DB_PATH)) as conn:
+            return clean_merges.track_record(conn, datetime.now(timezone.utc), repo=repo.strip() or None)
+    except (sqlite3.Error, clean_merges.SchemaIncomplete) as exc:
+        raise HTTPException(status_code=503, detail=f"the post-merge records could not be read: {exc}") from None
+
+
 @app.get("/v1/findings/ranked", dependencies=[Depends(verify_api_key)])
 def get_ranked_findings() -> Dict[str, Any]:
     with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:
@@ -10868,7 +10884,7 @@ def mark_finding_surfaced(finding_id: str, body: Dict[str, Any] | None = None) -
 
 @app.get("/v1/findings/additions", dependencies=[Depends(verify_api_key)])
 def get_finding_additions(day: str = "") -> Dict[str, Any]:
-    """Items added on a UTC day (default today) by class, across every state (§7.2)."""
+    """Items added on a UTC day (default today) by class, and the line of each, across every state (§7.2)."""
     day = day or datetime.now(timezone.utc).date().isoformat()
     try:
         with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:

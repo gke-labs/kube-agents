@@ -464,7 +464,9 @@ def store_text(store: dict | None) -> str:
 def why_text(gap: dict) -> str:
     parts = ["on the `allowlist` in `docs/designs/domains.yaml`"]
     if gap["issue"]:
-        parts.append(f"for #{gap['issue']}")
+        # The allowlist record's issue is a source-repository issue, whatever
+        # repository this issue is filed in.
+        parts.append(f"for {ghcli.issue_url(ghcli.SOURCE_REPO, gap['issue'])}")
     if gap["since"]:
         parts.append(f"since {gap['since'].isoformat()}")
     text = " ".join(parts) + "; the comment above the entry carries the full reason and its exit condition."

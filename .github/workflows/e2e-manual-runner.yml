@@ -51,6 +51,18 @@ on:
         options:
           - "rc"
           - "nightly"
+      # The PlatformAgent's spec.mode the cluster runs. wait_for_gke_readiness.sh
+      # refuses a cluster whose CR names another mode, and under `next` adds the
+      # sibling-gateway gate (platform_agent_mode.sh), which the job timeout
+      # budgets; the `slack` suite needs `next`, the only mode with the gateway.
+      mode:
+        description: "The PlatformAgent's spec.mode the cluster runs: today or next"
+        required: false
+        default: "today"
+        type: choice
+        options:
+          - "today"
+          - "next"
       # `test_suite`, not `test_environment`: this names a list of test files in
       # e2e_config.yaml, while `github_environment` above names the GitHub
       # environment supplying the cluster.
@@ -66,6 +78,7 @@ on:
           - "audit"
           - "agent-plugin"
           - "gchat"
+          - "slack"
           - "stockout-full"
           - "all"
       stockout_scenarios:
@@ -117,8 +130,9 @@ jobs:
     # gateway (1500s) gates paid up to twice each (64m), and up to 60m for
     # `--suite all` across all five E2E test files (matching the five-file suite
     # allowance in staging-promotion-pipeline.yml). Held by
-    # SiblingGatewayRolloutGatesTest in tests/test_gateway_rollout_budgets.py.
-    timeout-minutes: 130
+    # SiblingGatewayRolloutGatesTest in tests/test_gateway_rollout_budgets.py,
+    # plus the `next` mode gate (the `mode` input).
+    timeout-minutes: 160
 
     env:
       CLOUDSDK_PYTHON: "/usr/bin/python3"
@@ -168,6 +182,7 @@ jobs:
           GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
           GCP_REGION: ${{ vars.GCP_REGION }}
           GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
+          PLATFORM_AGENT_MODE: ${{ inputs.mode }}
         run: |
           ./scripts/release/wait_for_gke_readiness.sh
           gcloud auth configure-docker "${GCP_REGION}-docker.pkg.dev" --quiet || true
@@ -203,7 +218,19 @@ jobs:
           E2E_CHAT_CLIENT_SECRET: ${{ secrets.E2E_CHAT_CLIENT_SECRET }}
           E2E_CHAT_REFRESH_TOKEN: ${{ secrets.E2E_CHAT_REFRESH_TOKEN }}
           CHAT_SPACE_ID: ${{ secrets.E2E_CHAT_SPACE_ID }}
+          # The `slack` suite's test user, CI channel and the install's bot
+          # (tests/e2e/README.md, "Slack E2E test"); unset, it skips. It reads
+          # the PlatformAgent's spec.mode itself.
+          E2E_SLACK_USER_TOKEN: ${{ secrets.E2E_SLACK_USER_TOKEN }}
+          E2E_SLACK_CHANNEL_ID: ${{ secrets.E2E_SLACK_CHANNEL_ID }}
+          E2E_SLACK_BOT_USER_ID: ${{ vars.E2E_SLACK_BOT_USER_ID }}
+          E2E_SLACK_MODE: ${{ inputs.mode }}
         # The wrapper rather than the .py, so this goes through the same entry
         # point as e2e-run.yml and `make test-e2e`. `--suite all` needs no special
         # case: execute_e2e_tests.py expands it into one child process per suite.
-        run: ./scripts/release/execute_e2e_tests.sh --suite "${TEST_SUITE}"
+        # 300s reply wait under `next`, as e2e-run.yml gives it.
+        run: |
+          if [ "${{ inputs.mode }}" = next ]; then
+            export TEST_TIMEOUT_SEC=300
+          fi
+          ./scripts/release/execute_e2e_tests.sh --suite "${TEST_SUITE}"

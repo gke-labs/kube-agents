@@ -39,6 +39,10 @@ sys.modules["poll_rc_eval_verdict"] = poller
 _spec.loader.exec_module(poller)
 
 _BUILD_BASE = "gs://kube-agents-prow/logs/post-kube-agents-eval-rc/1/"
+# The same build after the lane moves to the presubmit lanes' private bucket:
+# the artifact and the read are identical, only the link the poller emits
+# changes form, since Deck cannot render a build there.
+_PRIVATE_BUILD_BASE = "gs://kube-agents-evals-presubmit-logs/logs/post-kube-agents-eval-rc/1/"
 
 
 class RcEvalVerdictSeamTest(unittest.TestCase):
@@ -55,7 +59,7 @@ class RcEvalVerdictSeamTest(unittest.TestCase):
     def run_driver(self, root):
         return self.driver.run_driver(root)
 
-    def _reader(self, *, passed):
+    def _reader(self, *, passed, base=_BUILD_BASE):
         """Serves the build directory the poller would fetch from GCS.
 
         `finished.json` is synthesised rather than taken from disk because the
@@ -72,11 +76,11 @@ class RcEvalVerdictSeamTest(unittest.TestCase):
                 files[key] = path.read_text(encoding="utf-8")
 
         def read_file(url):
-            return files.get(url.removeprefix(_BUILD_BASE))
+            return files.get(url.removeprefix(base))
 
         return read_file
 
-    def _verdict(self, *, passed):
+    def _verdict(self, *, passed, base=_BUILD_BASE):
         """The poller's read of this build, with `finished.json` handed in.
 
         `read_verdict` takes that text as an argument rather than fetching it,
@@ -86,14 +90,24 @@ class RcEvalVerdictSeamTest(unittest.TestCase):
         formed from, and a second fetch the production path does not make is not
         one this test should make on its behalf.
         """
-        read_file = self._reader(passed=passed)
-        finished = read_file(_BUILD_BASE + poller.FINISHED_FILE)
-        return poller.read_verdict(_BUILD_BASE, read_file, finished)
+        read_file = self._reader(passed=passed, base=base)
+        finished = read_file(base + poller.FINISHED_FILE)
+        return poller.read_verdict(base, read_file, finished)
 
     def test_a_green_eval_reads_back_as_a_promotion(self):
         root, _ = self.build_repo()
         self.assertEqual(self.run_driver(root).returncode, 0)
         self.assertEqual(self._verdict(passed=True), poller.VERDICT_GREEN)
+
+    def test_the_same_artifact_reads_the_same_from_the_private_bucket(self):
+        """The lane's move changes where the artifact lives, not what it says:
+        the verdict is read the same way under either prefix, and only the
+        link differs -- the Console for the bucket Deck cannot read."""
+        root, _ = self.build_repo()
+        self.assertEqual(self.run_driver(root).returncode, 0)
+        self.assertEqual(self._verdict(passed=True, base=_PRIVATE_BUILD_BASE), poller.VERDICT_GREEN)
+        self.assertTrue(poller.build_url(_PRIVATE_BUILD_BASE).startswith("https://console.cloud.google.com/storage/browser/"))
+        self.assertTrue(poller.build_url(_BUILD_BASE).startswith("https://oss.gprow.dev/view/gs/"))
 
     def test_a_red_eval_reads_back_as_a_rejected_candidate(self):
         """Settled, so the nomination tag stays and the candidate is not retried."""

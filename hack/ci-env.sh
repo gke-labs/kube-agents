@@ -297,6 +297,16 @@ readonly REPLAY_MODE_STOP_WAIT_SECONDS=255
 # beside its logs (charts/kube-agents/templates/litellm.yaml).
 readonly REPLAY_LANE_CACHE_MAX_AGE_HOURS=30
 readonly REPLAY_LANE_CACHE_MAX_BYTES=$((512 * 1024 * 1024))
+# A recording names the commit its checkout was at, and the lane's report the
+# commit it replayed: a full SHA-1, publish_cache.COMMIT_PATTERN. Anything else
+# goes to the collector as empty, which it takes, rather than as a value it
+# would refuse and so collect nothing.
+readonly REPLAY_COMMIT_RE='^[0-9a-f]{40}$'
+# What the lane's Prow job exports as REPLAY_LANE_COMMIT_SOURCE: it checked out
+# the commit the newest recording night ran (fetch_cache.py --print-commit), or
+# stayed on main because no record named one or the fetch failed.
+readonly REPLAY_LANE_COMMIT_SOURCE_RECORDING="recording"
+readonly REPLAY_LANE_COMMIT_SOURCE_MAIN="main"
 # The variable the chart stamps the mode into, read back the same way: the
 # deploy decides the mode once, and the eval's collector runs in that mode.
 readonly REPLAY_SHADOW_PROXY_MODE_VAR="REPLAY_MODE"
@@ -323,6 +333,8 @@ readonly REPLAY_SHADOW_COLLECTOR_POLL_SECONDS=1
 readonly REPLAY_SHADOW_COLLECTOR_LOG="replay-shadow-collector.log"
 REPLAY_SHADOW_COLLECTOR_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/replay-proxy/collect_shadow.py"
 REPLAY_CACHE_FETCH_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/replay-proxy/fetch_cache.py"
+# A directory in this checkout, for the commit it is at (_replay_checkout_commit).
+REPLAY_CHECKOUT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 ensure_helm() {
   if command -v helm >/dev/null 2>&1; then
@@ -899,11 +911,44 @@ replay_shadow_helm_args() {
 # resolution decide; the proxy then bounds its own cache (REPLAY_DATA_MAX_BYTES).
 # Record and replay keep what they copy in a private directory on this machine
 # (REPLAY_KEEP_DIR), never the artifacts.
+#
+# A recording collector passes the checkout's commit (--commit), which every
+# publish record names; the lane's passes the commit it replays on and
+# REPLAY_LANE_COMMIT_SOURCE (--lane-commit, --lane-commit-source), which its
+# report names.
 REPLAY_SHADOW_COLLECTOR_PID=""
 REPLAY_SHADOW_COLLECTOR_WAIT_SECONDS=""
 REPLAY_KEEP_DIR=""
 REPLAY_LANE_SEED_DIR=""
 REPLAY_LANE_NIGHTLY_RUNS=""
+# The commit this checkout is at, or nothing when git can't say or prints
+# something other than a full SHA-1 (REPLAY_COMMIT_RE).
+_replay_checkout_commit() {
+  local commit=""
+  if [ -n "${REPLAY_CHECKOUT_DIR:-}" ] && command -v git >/dev/null 2>&1; then
+    commit="$(git -C "${REPLAY_CHECKOUT_DIR}" rev-parse --verify --quiet HEAD 2>/dev/null)" || commit=""
+  fi
+  if [ -n "${commit}" ] && ! [[ "${commit}" =~ ${REPLAY_COMMIT_RE} ]]; then
+    echo "WARNING: git names this checkout's commit '${commit}', not a full SHA-1; the collector is told none." >&2
+    commit=""
+  fi
+  echo "${commit}"
+}
+
+# The lane's REPLAY_LANE_COMMIT_SOURCE, or nothing when it is unset or neither
+# REPLAY_LANE_COMMIT_SOURCE_RECORDING nor REPLAY_LANE_COMMIT_SOURCE_MAIN.
+_replay_lane_commit_source() {
+  case "${REPLAY_LANE_COMMIT_SOURCE:-}" in
+  "${REPLAY_LANE_COMMIT_SOURCE_RECORDING}" | "${REPLAY_LANE_COMMIT_SOURCE_MAIN}")
+    echo "${REPLAY_LANE_COMMIT_SOURCE}"
+    ;;
+  "") ;;
+  *)
+    echo "WARNING: REPLAY_LANE_COMMIT_SOURCE='${REPLAY_LANE_COMMIT_SOURCE}' is neither ${REPLAY_LANE_COMMIT_SOURCE_RECORDING} nor ${REPLAY_LANE_COMMIT_SOURCE_MAIN}; the lane's report leaves it unstated." >&2
+    ;;
+  esac
+}
+
 start_replay_shadow_collector() {
   [ -z "${REPLAY_SHADOW_COLLECTOR_PID}" ] || return 0
   if ! resolve_replay_shadow; then
@@ -1000,12 +1045,14 @@ start_replay_shadow_collector() {
     args+=(--mode "${mode}" --keep-dir "${REPLAY_KEEP_DIR}" --cache-subdir "${REPLAY_CACHE_SUBDIR}"
       --publish-bucket "${REPLAY_CACHE_BUCKET}" --verdicts-dir "${artifact_dir}"
       --publish-interval "${REPLAY_RECORD_PUBLISH_INTERVAL_SECONDS}"
-      --job-name "${JOB_NAME:-}" --eval-mode-next "${EVAL_MODE_NEXT:-}" --forge "${EVAL_FORGE:-}")
+      --job-name "${JOB_NAME:-}" --eval-mode-next "${EVAL_MODE_NEXT:-}" --forge "${EVAL_FORGE:-}"
+      --commit "$(_replay_checkout_commit)")
     ;;
   "${REPLAY_MODE_REPLAY}")
     args+=(--mode "${mode}" --keep-dir "${REPLAY_KEEP_DIR}" --cache-subdir "${REPLAY_CACHE_SUBDIR}"
       --seed-dir "${REPLAY_LANE_SEED_DIR:-}" --verdicts-dir "${artifact_dir}"
-      --nightly-runs "${REPLAY_LANE_NIGHTLY_RUNS:-}")
+      --nightly-runs "${REPLAY_LANE_NIGHTLY_RUNS:-}"
+      --lane-commit "$(_replay_checkout_commit)" --lane-commit-source "$(_replay_lane_commit_source)")
     ;;
   esac
   if [ "${mode}" != "${REPLAY_MODE_SHADOW}" ]; then

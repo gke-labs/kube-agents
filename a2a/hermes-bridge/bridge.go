@@ -790,7 +790,7 @@ func (b *Bridge) accept(ctx context.Context, env *lib.Envelope) {
 			b.finalize(run, lib.StateFailed, shutdownReason, nil)
 			return
 		}
-		go b.runCardStop(ctx, run)
+		go b.runCardStop(ctx, run) // #nosec G118 -- runCardStop detaches its stop context on purpose; cancel and shutdown end it through cancelReq, the way they end a turn
 		return
 	}
 	select {
@@ -1496,7 +1496,7 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 	}
 
 	argv := promptArgv(b.cfg.Command, prompt)
-	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd := exec.Command(argv[0], argv[1:]...) // #nosec G204 -- Command is the bridge's configured executor; argv goes to exec without a shell
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	// stdout is the answer, kept to the cap; stdoutTail is the last
 	// stdoutTailBytes of the same stream for a failed run's terminal, which

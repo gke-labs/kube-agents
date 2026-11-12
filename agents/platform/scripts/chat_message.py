@@ -369,11 +369,18 @@ def plan_mark(ask: str, rows: Sequence[Any]) -> dict | None:
 
 
 def plan_text(title: str | None, rows: Sequence[Any]) -> str:
-    """:func:`slack_status.plan_text` unescaped: the gateway escapes a fallback itself."""
+    """:func:`slack_status.plan_text` unescaped: the gateway escapes a fallback itself.
+
+    A plan of one card whose row has nothing to say yet is titled by that
+    card, and its one row line would repeat the title under it; the row
+    line, which carries the status marker, is drawn alone then.
+    """
     rows = _plan_rows(rows)
     several = len(rows) > 1
-    lines = [_status.plan_title(title, rows)]
-    lines += [f"{_status.ROW_MARKERS.get(r.status, _status.STEP_OPEN)} {_status.row_title(r, several)}" for r in rows]
+    head = _status.plan_title(title, rows)
+    lines = [f"{_status.ROW_MARKERS.get(r.status, _status.STEP_OPEN)} {_status.row_title(r, several)}" for r in rows]
+    if not (len(rows) == 1 and _status.row_title(rows[0], several) == head):
+        lines.insert(0, head)
     return "\n".join(lines)
 
 

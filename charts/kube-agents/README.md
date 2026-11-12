@@ -171,8 +171,8 @@ operator as `PLATFORM_AGENT_IMAGE`, `AGENT_SANDBOX_IMAGE`, and
 `ghcr.io` and Docker Hub minutes after `helm install` reported success.
 `CREDENTIAL_PROXY_IMAGE` is deliberately not passed: the operator derives the
 broker image from the agent image by swapping the trailing name, so it follows
-the mirror on its own. The sandbox image cannot be derived that way — it is a
-separate repository — which is why it has to be named.
+the mirror on its own. The sandbox image is not derived from the agent image, so
+the chart names it.
 
 The prefix is not a per-image default — it replaces every image's registry and
 path, keeping the trailing name, because that is the flat layout
@@ -498,7 +498,7 @@ Old agent pods continue routing through `Service/litellm` until the operator upd
 kubectl delete svc litellm -n <namespace>
 ```
 
-**Custom-gateway installs (`litellm.enabled=false`):** If you exposed your own gateway as a Service named `litellm` in the release namespace (the documented path before this release), expose a parallel `inference-gateway` Service (for example, an `ExternalName` pointing at your existing Service) before upgrading. Once the upgrade completes and the operator has reconciled — agent pods are resolving `inference-gateway` — remove the old `litellm` Service. Renaming `litellm` before the upgrade cuts off the active name that running agent pods depend on. When Hindsight is enabled alongside `litellm.enabled=false`, `hindsight-api`'s `NetworkPolicy` renders as `Ingress`-only (omitting the `Egress` rules that pin `app: litellm` / `app: standalone-replay` pods in the release namespace) while still confining `hindsight-api` ingress on port 8888 and rendering `hindsight-postgresql`; apply an egress `NetworkPolicy` of your own for `hindsight-api` if you want to restrict its outbound traffic to your custom gateway.
+**Custom-gateway installs (`litellm.enabled=false`):** If you exposed your own gateway as a Service named `litellm` in the release namespace (the documented path before this release), expose a parallel `inference-gateway` Service (for example, an `ExternalName` pointing at your existing Service) before upgrading. Once the upgrade completes and the operator has reconciled — agent pods are resolving `inference-gateway` — remove the old `litellm` Service. Renaming `litellm` before the upgrade cuts off the active name that running agent pods depend on. When Hindsight is enabled alongside `litellm.enabled=false`, `hindsight-api`'s `NetworkPolicy` renders as `Ingress`-only (omitting the `Egress` rules that pin `app: litellm` / `app: standalone-replay` pods in the release namespace) while still confining `hindsight-api` ingress on port 8888 and rendering `hindsight-postgresql`. To confine its egress to your gateway instead, name the gateway in `hindsight.api.networkPolicy.additionalEgress` ([Hindsight memory store](#hindsight-memory-store)); to replace the policy with one of your own, set `hindsight.api.networkPolicy.enabled=false`, which leaves `hindsight-postgresql` in place.
 
 #### Upgrade notes: static to dynamic NetworkPolicy
 
@@ -533,6 +533,37 @@ with it and everything else renders nothing; `true`/`false` override. The
 image pins mirror `images.json`; `hindsight.postgresql.storage` sizes the
 volumeClaimTemplate (immutable once the StatefulSet exists), and the PVC —
 which **is** the memory — survives uninstall.
+
+`hindsight.networkPolicy` is the umbrella over both policies: `false` renders
+neither. Each policy also has its own switch, `hindsight.api.networkPolicy.enabled`
+and `hindsight.postgresql.networkPolicy.enabled`, so an install can drop
+`hindsight-api`'s policy and keep `hindsight-postgresql`'s, the only guard on a
+database that takes no password. Leave the Postgres switch on; the install
+notes warn when the store renders without it.
+
+`hindsight.api.networkPolicy.additionalEgress` appends egress rules to
+`hindsight-api`'s policy in the shape of the `PlatformAgent` CR's
+`spec.networkPolicy.additionalEgress` (`to[].cidr` with an optional `except`,
+`ports[].protocol` and `port`), bounded as the CRD bounds them: 32 rules, 16
+peers and 16 ports each, a `/12` (IPv4) or `/48` (IPv6) prefix floor, and an
+`except` that must lie inside its peer or the API server rejects the policy.
+The render also refuses what `litellm.openaiCompatible.egressCIDRs` refuses: a
+malformed address, an IPv4-mapped IPv6 block, and a peer in a
+link-local range (`169.254.0.0/16`, `fe80::/10`) or inside `fd20:ce::/48`; the
+first and last of those ranges hold the metadata server's addresses. A bare
+address renders as a `/32` or `/128`. Peers are CIDR blocks, so a gateway in
+another namespace is named by its Pod range. A non-empty list also turns the egress
+half on under `litellm.enabled=false`, after the DNS, Postgres and in-cluster
+gateway rules:
+
+```yaml
+hindsight:
+  api:
+    networkPolicy:
+      additionalEgress:
+        - to: [{ cidr: "10.200.0.0/16" }]
+          ports: [{ protocol: TCP, port: 443 }]
+```
 
 `hindsight.api.rollingUpdate.maxUnavailable` defaults to `0` to keep the
 existing Pod serving while the replacement pulls its image and loads models (up
@@ -674,7 +705,8 @@ a release that predates `operator.metrics` renders with the listener off until t
 
 `platformAgent.healthRules.enabled: true` renders `<name>-health-rules`, a Managed Prometheus
 `Rules` object in the release namespace with the install's At-Risk and Friction alerts over the
-operator's gauges, and the recording rules for their ratios; the alerts are listed on
+operator's gauges (plus one over the A2A gateway's Slack connection gauge and one over the scrape
+jobs' `up`), and the recording rules for their ratios; the alerts are listed on
 [Observability](https://gke-labs.github.io/kube-agents/concepts/observability/#health-cohorts-and-alerts).
 Off by default, and a plain boolean rather than the tri-state above: on means alerts fire,
 into Managed Prometheus's managed Alertmanager, which routes them by the `alertmanager` Secret
@@ -685,7 +717,9 @@ sample floor is a value under `platformAgent.healthRules.thresholds`, with its d
 string, which the schema refuses). A `helm upgrade --reuse-values` from a release that predates
 the key keeps the rules off; turning them on from such a release needs `--reset-then-reuse-values`, which applies the new
 defaults and keeps the release's values, or every threshold set; the schema requires the whole
-block and the template says so when it is missing. The rules read the operator's scrape, so
+block and the template says so when it is missing. `slackDisconnectedFor` is the exception: it is
+optional and defaults to `5m`, so a `--reuse-values` upgrade from a release without it keeps
+rendering. The rules read the operator's scrape, so
 enabling them with `operator.metrics` off, or where the `PodMonitoring` CRD is absent, fails at
 render with a message. The two proposal alerts read the forge's proposal readings, and a fall in
 `proposalsAuthored` (a repository leaving the managed list, or a deleted proposal) silences them for two weeks; see
@@ -765,12 +799,13 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   preserved across `upgrade.sh` upgrades via `TF_VAR_extra_helm_values`.
 - **Git forges and repositories** — `platformAgent.integration.forges` lists
   the forges the agent talks to (`name`, `provider`, optional `host`,
-  `scheme`, `port`, `namespace` and `credentialsRef`), and
+  `scheme`, `port`, `namespace`, `credentialsRef`, `caBundleRef` and
+  `identity`), and
   `platformAgent.integration.repositories` the repositories on them (`forge`,
   `repository`, optional `namespace`, and `role`: `gitops` for the one the
   agent publishes to, `managed` for others it may change, `context` for
-  read-only reference). `provider` is `github`, `gitlab` or `gitea`. If you omit it, it is `github`. A forge at a host other than github.com must name it. `credentialsRef` is
-  ignored for `github` and required for `gitlab` and `gitea`: a Secret holding the access
+  read-only reference). `provider` is `github`, `gitlab`, `gitea`, `bitbucket` (Bitbucket Cloud) or `bitbucket-datacenter`. If you omit it, it is `github`. A forge at a host other than github.com must name it. `credentialsRef` is
+  ignored for `github` and required for `gitlab`, `gitea`, `bitbucket` and `bitbucket-datacenter`: a Secret holding the access
   token under the key `token`, mounted into the credential broker only. A
   `gitlab` forge's `host` is gitlab.com by default or a self-managed instance,
   never a GitHub name, and one `gitlab` forge per host. A `github` forge's
@@ -788,9 +823,9 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   the CA for all of its outbound calls (see the token minter guide). A Secret, so
   changing the CA needs the same rights as changing the token. It is for a
   forge at a self-managed host, GitLab, GitHub Enterprise Server, or `https`
-  Gitea, never gitlab.com or github.com. With a `gitlab` or `gitea` forge
+  Gitea, never gitlab.com or github.com. With a `gitlab`, `gitea` or Bitbucket forge
   declared beside GitHub, a bare `owner/name` still works for a GitHub
-  repository that the install registered by URL. Name a GitLab or Gitea repository, or
+  repository that the install registered by URL. Name a GitLab, Gitea or Bitbucket repository, or
   a GitHub repository that the install did not register, by its URL. Apply `crds/` before upgrading
   to a release that adds a provider, since `helm upgrade` does not update CRDs. A GitHub forge's
   `host` is a spelling of github.com (`github.com`, `www.github.com`,
@@ -799,12 +834,21 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   `host` is required, `scheme` may be `http` only for an in-cluster Service
   (`*.svc` or `*.svc.cluster.local`), `port` is set when the forge is not on
   the scheme's default port, and `credentialsRef` names the Secret holding its
-  API token under the key `token`. A repository must name a declared forge.
+  API token under the key `token`. A `bitbucket` forge is at bitbucket.org
+  only: it takes no `host` other than that, no `port`, no `scheme` and no
+  `caBundleRef`, its `namespace` is a lowercase workspace ID, and one
+  `bitbucket` forge per install. A `bitbucket-datacenter` forge needs `host`
+  (the instance, served at the root path on port 443, so no `port` and no
+  `scheme: http`), may set `caBundleRef`, and its `namespace` is a project key.
+  `identity` is for these two providers only: the account the token acts as,
+  1 to 255 letters, digits and `. _ @ + { } -`; on `bitbucket` it is the
+  account UUID, which a workspace, project or repository access token needs.
+  A repository must name a declared forge.
   `platformAgent.integration.github.org` / `.gitRepo` remain as a deprecated
   alias for one GitHub forge and its gitops repository — set the lists or the
   alias, not both. For a github.com GitOps repository, the alias is still what
   `install.sh` and the `full-install` Terraform composition write. For a
-  GitLab or GitHub Enterprise Server GitOps repository, they write the
+  GitLab, Bitbucket or GitHub Enterprise Server GitOps repository, they write the
   `forges` and `repositories` lists. One GitHub forge with no
   `credentialsRef`, no `caBundleRef`, no host other than a spelling of
   github.com, and at most one repository, the gitops one, with no
@@ -859,6 +903,16 @@ still works and wins over the value. The
 [MCP server page](https://gke-labs.github.io/kube-agents/reference/a2a-mcp/) is canonical for
 what it renders and how a client connects.
 
+### Slack end-to-end test users (`operator.slackTestUsers`)
+
+Meant for CI and eval installs. `operator.slackTestUsers` lists Slack member ids (`U…`) whose
+posts the A2A gateway reads as theirs even though they carry an app's `bot_id`, which a post
+made with a user token through an app does; the gateway otherwise drops those as bot traffic.
+It renders as `A2A_SLACK_TEST_USERS` on the controller manager, which hands it to the gateway
+when the gateway runs the Slack adapter under `next`. Empty by default, and an `operator.extraEnv` entry of that name wins. A listed
+user still has to be on `integration.slack.allowedUsers`. Nothing but the value itself keeps it
+off a real install, and a listed member's posts through any app in the workspace read as theirs.
+
 ### Data volume size (`platformAgent.storage.size`)
 
 `platformAgent.storage.size` is the CR's `spec.storage.size`: the request of the agent's
@@ -875,6 +929,11 @@ default. The render fails on a size of zero or above `64Ti`, and on a live insta
 predates `spec.storage`. The
 [PlatformAgent CRD page](https://gke-labs.github.io/kube-agents/operator/platformagent-crd/#specstorage)
 is canonical for the behaviour.
+
+`platformAgent.storage.expectedClusterProfiles` (CR: `spec.storage.expectedClusterProfiles`, 1 to 20000) raises the agent's claim alone to at least `8Gi` plus `400Mi` per expected Cluster Agent
+profile, rounded up to whole GiB, the size the session stores settle at under 90-day retention.
+The claim takes the larger of that and `size` (or the default), and the formula passes the 50Gi
+default above 107 profiles. The quota preflight counts the raised claim.
 
 ### Sizing for a fleet (`examples/values-fleet.yaml`)
 
@@ -1303,9 +1362,8 @@ though note that if a namespace ResourceQuota restricts that compute resource (s
 declare it (or a `LimitRange` to default it), and will reject the pod if omitted.
 The credential broker's exec tier is counted as `platformAgent.deployment.credentialProxy.exec.replicas`
 times one replica's footprint (`operatorRenderedPerReplica.credentialProxyExecTier`), and not at
-all at `0`. An ephemeral-storage key in `platformAgent.deployment.credentialProxy.resources`
-moves each replica too, because the operator gives the tier the broker's other resource keys; its
-cpu and memory are fixed. It needs no surge headroom: it rolls with `maxSurge: 0` and `maxUnavailable: 1`, so a
+all at `0`. Its cpu, memory and ephemeral storage are fixed: a key in
+`platformAgent.deployment.credentialProxy.resources` moves the stateful broker, not the tier. It needs no surge headroom: it rolls with `maxSurge: 0` and `maxUnavailable: 1`, so a
 rollout replaces a pod in place and adds none. The check counts the
 quota only; whether a node has room for each 2 CPU replica is the scheduler's.
 The two data claims are counted at `platformAgent.storage.size` when it is set: footprint.yaml
@@ -1323,8 +1381,15 @@ in `A2A_BRIDGE_RESOURCES`. The chart bounds the operator's reading of those valu
 rather than re-implementing it, so it can over-count; it never fails the render on them.
 It also counts the standing pods the operator renders only behind an operator flag,
 listed with their sizes in `files/flagged-pods.yaml`: the MCP server's pod when `A2A_MCP_DOOR`
-is `true` (set by `operator.mcpServer.enabled` or `operator.extraEnv`, the latter winning),
-and the profile dispatcher's when `A2A_DISPATCHER_IMAGE` is set to anything but blank. A flag set in a form the chart cannot read (a `valueFrom`, a non-string value) counts
+is `true` (set by `operator.mcpServer.enabled` or `operator.extraEnv`, the latter winning).
+The profile dispatcher runs by default under next, so it is in `footprint.yaml`, and switched off
+(`operator.profileDispatcher.enabled: false`) it is still counted. It has a ceiling: about 200
+AgentProfiles that allow `unattended` under Job mode (the default on Kubernetes 1.30+, where each
+carries its Job template in the dispatch config), about 650 at two tiers otherwise. The operator binds
+profiles oldest first while the dispatcher's identity and its config both fit, leaves newer ones
+unbound (`IdentityReady` reads `DispatcherCeiling`), and the PlatformAgent's `DispatcherCeiling`
+condition says so. Adding a tier to an older profile can
+leave the newest one out. A flag set in a form the chart cannot read (a `valueFrom`, a non-string value) counts
 as on. An operator test holds that file to the operator's own list and sizes. It counts the A2A gateway at two pods, the operator's default under its
 election, with one gateway pod of surge room for a rollout, unless `operator.extraEnv` sets
 `A2A_GATEWAY_ELECTION` to `false`. It also counts the
@@ -1487,6 +1552,11 @@ limit. A cluster with bursting admits the manifest as rendered.
 controlling its `AgentProfile` spec. When bound, the operator passes
 `KUBE_AGENTS_ENABLED_PROFILES=tse` to the gateway Deployment so the entrypoint
 scaffolds `/opt/data/profiles/tse` from `/opt/tse-template` on startup.
+Its default persona image is still a placeholder with no persona payload, and the
+profile dispatcher, on by default, gives every bound profile a warm worker. So until
+tse ships a real persona image, enabling `profiles.tse` leaves a tse warm pod
+crash-looping at its persona step. Handing work to tse through Kanban still works,
+since that runs in the scaffolded profile, not in the worker.
 
 `profiles.cluster.enabled` (default `false`) renders `AgentProfile/cluster`, the
 generic cluster agent: one profile for every cluster in scope, with the
@@ -1495,10 +1565,12 @@ Its persona is the `persona-cluster` image, built from `agents/cluster/persona`,
 and its harness is `a2a-worker`. `profiles.cluster.{description,persona.image,harness,allowedTiers,lifecycle,concurrency,resources}`
 control its spec. The parameters are fixed, in the persona's order, because
 the design has the worker refuse a task when they differ from the persona's.
-No pod runs it until the profile dispatcher, worker and pool land and the
-operator runs them, though enabling it already gets the profile its
-ServiceAccounts, bus identity and agent card. A cluster that needs its own
+Enabled, it gets its ServiceAccounts, bus identity and agent card, and the
+profile dispatcher, on by default, runs its warm worker pool and its
+unattended Jobs. A cluster that needs its own
 persona or tier gets a second `AgentProfile` with `clusterRef` set (`k8s-operator/examples/agentprofile-cluster.yaml`).
+The chart sets `yieldToPinned: true` on `cluster`, so that second profile receives
+the cluster's tasks; a specialist such as `tse` keeps the tasks addressed to it.
 
 ## Uninstalling
 

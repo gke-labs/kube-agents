@@ -1351,6 +1351,7 @@ class TestSessionKvServerAuth(unittest.TestCase):
         ("GET", "/v1/cron/jobs/j-1/origin", None),
         ("POST", "/v1/proposals/opened", {"url": "https://example.invalid/pull/1", "origin": "other"}),
         ("GET", "/v1/proposals/opened/counts", None),
+        ("GET", "/v1/post-merge/clean-merges", None),
         ("POST", "/v1/board/stamp-tickets", {"origin": "issue"}),
         ("POST", "/v1/board/stamp-tickets/tk-1/redeem", None),
     )
@@ -7421,7 +7422,7 @@ class TestFindingsQueueApi(unittest.TestCase):
         day = added["first_shown_at"][:10]
         self.assertEqual(
             self.client.get(f"/v1/findings/additions?day={day}").json(),
-            {"day": day, "critical": 0, "noncritical": 1},
+            {"day": day, "critical": 0, "noncritical": 1, "lines": [["probes-readiness", "acme-prod", "prod-eu"]]},
         )
 
     def test_the_first_report_marks_a_critical_addition(self):
@@ -7435,7 +7436,7 @@ class TestFindingsQueueApi(unittest.TestCase):
         day = added["first_shown_at"][:10]
         self.assertEqual(
             self.client.get(f"/v1/findings/additions?day={day}").json(),
-            {"day": day, "critical": 1, "noncritical": 0},
+            {"day": day, "critical": 1, "noncritical": 0, "lines": [["probes-readiness", "acme-prod", "prod-eu"]]},
         )
 
     def test_the_first_report_may_not_mark_a_dismissed_finding(self):
@@ -14165,6 +14166,58 @@ class TestKeptRefusals(unittest.TestCase):
                 patch.object(session_kv_server, "_chat_platforms_disabled", return_value=False), \
                 patch.object(session_kv_server, "_post_initial_alert", return_value=session_kv_server.ALERT_KEPT_FOR_DIGEST):
             self.assertTrue(session_kv_server._post_data_volume_warning("data volume at 90%"))
+
+
+class TestCleanMergesRoute(unittest.TestCase):
+    """GET /v1/post-merge/clean-merges serves clean_merges.track_record over the Session KV database."""
+
+    def setUp(self):
+        from fastapi.testclient import TestClient
+
+        os.environ["SESSION_KV_API_KEY"] = API_KEY
+        self.addCleanup(lambda: os.environ.pop("SESSION_KV_API_KEY", None))
+        self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+        self.addCleanup(self._drop_table)
+
+    def _drop_table(self):
+        with closing_db() as conn, conn:
+            conn.execute("DROP TABLE IF EXISTS post_merge_records")
+
+    def test_no_records_table_yet_is_an_empty_list(self):
+        resp = self.client.get("/v1/post-merge/clean-merges")
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json()["counts"], [])
+        self.assertEqual(resp.json()["clean_merges_needed"], 5)
+
+    def test_counts_the_clean_merges_per_repository_and_narrows_to_one(self):
+        with closing_db() as conn, conn:
+            conn.execute(
+                "CREATE TABLE post_merge_records (url TEXT PRIMARY KEY, repo TEXT, kind TEXT, environment TEXT, "
+                "outcome TEXT, outcome_at TEXT, merged_at TEXT, human_edited INTEGER, reverted_at TEXT)"
+            )
+            for url, repo in (("https://github.com/a/b/pull/1", "https://github.com/a/b"),
+                              ("https://github.com/a/c/pull/2", "https://github.com/a/c"),
+                              ("https://github.com/a/c/pull/3", "https://github.com/a/c")):
+                conn.execute(
+                    "INSERT INTO post_merge_records VALUES (?, ?, 'no-pdb', 'dev', 'verified_fixed', "
+                    "'2026-11-01T10:30:00+00:00', '2026-11-01T10:00:00+00:00', 0, NULL)",
+                    (url, repo),
+                )
+        resp = self.client.get("/v1/post-merge/clean-merges")
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(
+            [(c["repo"], c["kind"], c["environment"], c["clean"]) for c in resp.json()["counts"]],
+            [("https://github.com/a/b", "no-pdb", "dev", 1), ("https://github.com/a/c", "no-pdb", "dev", 2)],
+        )
+        resp = self.client.get("/v1/post-merge/clean-merges", params={"repo": "https://github.com/a/c.git"})
+        self.assertEqual([c["clean"] for c in resp.json()["counts"]], [2])
+
+    def test_a_table_missing_a_counted_column_is_a_503(self):
+        with closing_db() as conn, conn:
+            conn.execute("CREATE TABLE post_merge_records (url TEXT PRIMARY KEY, outcome TEXT, outcome_at TEXT)")
+        resp = self.client.get("/v1/post-merge/clean-merges")
+        self.assertEqual(resp.status_code, 503, resp.text)
+        self.assertIn("human_edited", resp.json()["detail"])
 
 
 if __name__ == "__main__":

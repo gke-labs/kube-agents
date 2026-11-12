@@ -286,6 +286,18 @@ class TestEveryTaskIsValid(unittest.TestCase):
             "false; bench-gate would refuse it after the cluster lease:",
         )
 
+    def test_no_run_record_is_committed(self):
+        # Tree-level like the sanitizer, so validate_all() does not carry it
+        # and this is the assertion that gates it.
+        findings = validator.committed_run_records()
+        self.assertEqual(
+            findings,
+            [],
+            "\n\nThese files sit under a case's evidence/ directory. A run's record "
+            "is not committed; cite the run by its directory name or build id:\n  "
+            + "\n  ".join(findings),
+        )
+
     def test_no_fixture_carries_a_real_address_or_credential(self):
         # The sanitization scan is tree-level rather than per case, like the
         # fixture-catalogue drift check, so validate_all() does not carry it
@@ -984,6 +996,41 @@ class TestTheRulesReject(unittest.TestCase):
         with unittest.mock.patch.dict(validator.FIXTURE_NOT_READY, {"made-up-case": "#1 plants slot e"}):
             self.assertEqual([p for p in self._validate(verification_spec=self._entry(check={"type": "report_contains", "any_of_patterns": ["(?m)^{cluster:e}: ok$"]})) if "does not declare" in p], [])
 
+    def test_a_fleet_prompt_placeholder_is_well_formed_listed_and_catalogued(self):
+        # The valid case lists rbac-overgrant in fixtures:.
+        good = "on {{FLEET_CLUSTER_NAME:rbac-overgrant}} in {{FLEET_CLUSTER_PROJECT:rbac-overgrant}}"
+        self.assertEqual(self._validate(prompt=good), [])
+        self._only("malformed fleet placeholder", prompt="on {{FLEET_CLUSTER_ZONE:rbac-overgrant}}")
+        self._only("doesn't list", prompt="on {{FLEET_CLUSTER_NAME:crashloop-workload}}", fixtures=["rbac-overgrant"])
+        problems = self._validate(prompt="on {{FLEET_CLUSTER_NAME:not-a-role}}", fixtures=["rbac-overgrant", "not-a-role"])
+        self.assertTrue(any("has no cluster slot" in p for p in problems), problems)
+
+    def test_a_fleet_placeholder_naming_a_project_scoped_role_is_rejected(self):
+        # world-open-ingress is in the catalogue with cluster_slot: null: the
+        # runner records no cluster for it, so every run would fail.
+        problems = self._validate(prompt="on {{FLEET_CLUSTER_NAME:world-open-ingress}}", fixtures=["rbac-overgrant", "world-open-ingress"])
+        self.assertTrue(any("has no cluster slot" in p for p in problems), problems)
+
+    def test_a_misspelled_fleet_opener_is_rejected(self):
+        for prompt in (
+            "on {FLEET_CLUSTER_NAME:rbac-overgrant}}",
+            "on {{ FLEET_CLUSTER_NAME:rbac-overgrant }}",
+            "on {{fleet_cluster_name:rbac-overgrant}}",
+        ):
+            with self.subTest(prompt=prompt):
+                self._only("malformed fleet placeholder", prompt=prompt)
+
+    def test_a_fleet_placeholder_outside_the_prompt_is_rejected(self):
+        problem = self._only(
+            "which only the prompt expands",
+            verification_spec=self._entry(check={"type": "report_contains", "any_of_patterns": ["{{FLEET_CLUSTER_NAME:rbac-overgrant}}"]}),
+        )
+        self.assertIn("verification_spec", problem)
+
+    def test_a_scalar_fixtures_beside_a_fleet_placeholder_is_reported_not_raised(self):
+        problems = self._validate(prompt="on {{FLEET_CLUSTER_NAME:rbac-overgrant}}", fixtures=True)
+        self.assertTrue(problems, "a scalar fixtures: passed")
+
     def test_a_cluster_placeholder_outside_report_contains_is_rejected(self):
         # worker_commands searches its patterns as written, so the placeholder
         # there is literal text: a forbid that never fires, a requirement that
@@ -1253,6 +1300,33 @@ class TestTheRulesReject(unittest.TestCase):
                 }
             ),
         )
+
+
+class TestTheRunRecordGuard(unittest.TestCase):
+    """committed_run_records() on a temporary tree: any file under a case's
+    evidence/ directory is a finding; a file elsewhere in the case is not."""
+
+    def _findings(self, relatives):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            for relative in relatives:
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("{}\n")
+            return validator.committed_run_records(root)
+
+    def test_a_record_at_depth_under_evidence_is_rejected(self):
+        found = self._findings(["a-case/evidence/run_1/results.json"])
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("a-case/evidence/run_1/results.json", found[0])
+        self.assertIn("not committed", found[0])
+
+    def test_any_file_under_evidence_is_rejected(self):
+        found = self._findings(["a-case/evidence/run_1/campaign.json", "a-case/evidence/notes.md"])
+        self.assertEqual(len(found), 2, found)
+
+    def test_a_file_outside_evidence_passes(self):
+        self.assertEqual(self._findings(["a-case/fixture/results.json", "a-case/task.yaml"]), [])
 
 
 class TestTheSanitizer(unittest.TestCase):
