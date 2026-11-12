@@ -3242,6 +3242,11 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	// otherwise answer a later turn with an id it will never see end.
 	if ts.Role == "" {
 		g.observeTaskAccepted(rec.Key, taskID)
+		if g.drawArrivalMark(rec, taskID, ts.Text) {
+			if err := g.reg.Put(ctx, rec); err != nil {
+				g.log.Error("session record write failed", "conversation", rec.Key, "err", err)
+			}
+		}
 	}
 
 	// Session-addressed routes get an incarnation; fixed addressees (the

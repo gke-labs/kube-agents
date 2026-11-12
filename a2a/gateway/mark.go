@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/askkind"
 )
 
 // The mark: reaction state for the human message that started a chain
@@ -146,6 +147,23 @@ func (rec *SessionRecord) markingRootIndex(taskID string) int {
 // writes the record after.
 func (g *Gateway) applyTaskMark(rec *SessionRecord, taskID string, next MarkState) {
 	g.drawMark(rec, rec.markingRootIndex(taskID), next)
+}
+
+// drawArrivalMark draws the ask's kind (askkind.Kind, the keyword match the
+// executor's heartbeats mark with too) on the ask a task just accepted, so
+// the reaction is there before any model call, as under today, rather than
+// waiting for the executor's first heartbeat, which a fast turn never sends.
+// Only an ask's own first task draws it: a chain continued from an earlier ask
+// (a click, an answer) keeps the mark it carried, and a task with no ask
+// message draws nothing. The executor's marks and the terminal take over from
+// there. It reports whether anything was drawn; the caller holds the session
+// lock and writes the record.
+func (g *Gateway) drawArrivalMark(rec *SessionRecord, taskID, text string) bool {
+	i := rec.markingRootIndex(taskID)
+	if i < 0 || rec.Tasks[i].Mark != nil {
+		return false
+	}
+	return g.drawMark(rec, i, MarkState{Ask: askkind.Kind(text)})
 }
 
 // applyTerminalMark is the default for the newest task ending with no mark

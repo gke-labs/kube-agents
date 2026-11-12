@@ -393,3 +393,43 @@ func TestMarkExpiredHoldIsToldWithoutAChangingDraw(t *testing.T) {
 		t.Errorf("MarkChanged = %v, want %v (the expired hold told)", obs.changes, want)
 	}
 }
+
+// An ask is marked with its kind the moment its task is accepted, so a turn
+// that answers before the executor's first heartbeat still shows it, and the
+// terminal's default takes it off as before.
+func TestMarkArrivalDrawsTheAsksKindAtOnce(t *testing.T) {
+	g, obs := markRig()
+	rec := &SessionRecord{Key: "slack:C1/20.0", Tasks: []TaskRef{{ID: "h", RootTaskID: "h", AskMessageID: "20.0"}}}
+	if !g.drawArrivalMark(rec, "h", "<@UBOT> are all my clusters on the latest version?") {
+		t.Fatal("the arrival drew nothing")
+	}
+	// The executor's first heartbeat carries the same kind: nothing to redraw.
+	g.applyTaskMark(rec, "h", MarkState{Ask: "upgrade"})
+	g.applyTerminalMark(rec, "h", lib.StateCompleted)
+	want := []string{"slack:C1/20.0 +upgrade@20.0", "slack:C1/20.0 -upgrade@20.0"}
+	if got := obs.reactionCalls(); !slices.Equal(got, want) {
+		t.Errorf("reactions = %v, want %v", got, want)
+	}
+	if want := []string{"slack:C1/20.0 upgrade/", "slack:C1/20.0 /"}; !slices.Equal(obs.changes, want) {
+		t.Errorf("MarkChanged = %v, want %v", obs.changes, want)
+	}
+}
+
+// A continued chain keeps the mark it carried, a child or a wake draws
+// nothing, and a task with no ask message draws nothing.
+func TestMarkArrivalLeavesAnythingButAFreshAsk(t *testing.T) {
+	g, obs := markRig()
+	held := &MarkState{Ask: "question", Settle: markSettleBlocked}
+	rec := &SessionRecord{Key: "slack:C1/30.0", Tasks: []TaskRef{
+		{ID: "a", RootTaskID: "a", AskMessageID: "30.0", Mark: held},
+	}}
+	rec2 := chainRecord()
+	rec3 := &SessionRecord{Key: "slack:C1/40.0", Tasks: []TaskRef{{ID: "n", RootTaskID: "n"}}}
+	if g.drawArrivalMark(rec, "a", "why is checkout slow?") || g.drawArrivalMark(rec2, "c", "x") ||
+		g.drawArrivalMark(rec2, "w", "x") || g.drawArrivalMark(rec3, "n", "why?") {
+		t.Fatal("drew on something that is not a fresh ask")
+	}
+	if got := obs.reactionCalls(); len(got) != 0 {
+		t.Errorf("reactions = %v, want none", got)
+	}
+}
