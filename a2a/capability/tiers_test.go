@@ -50,7 +50,7 @@ func TestALoadedTierTakesItsModesSet(t *testing.T) {
 	if err := Permits(nightly, VerbTaskExecute, root); err == nil {
 		t.Error("an unattended tier permitted task.execute")
 	}
-	if err := PermitsProfile(nightly, "tse", "nightly", root); err != nil {
+	if err := PermitsProfile(nightly, "tse", "nightly", root, nil); err != nil {
 		t.Errorf("profile.run at the loaded tier: %v", err)
 	}
 	noProfile := oncall
