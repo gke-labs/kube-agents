@@ -318,3 +318,73 @@ func TestDelegateMCPQuotesACardsDescription(t *testing.T) {
 		t.Errorf("description %q doesn't say the descriptions aren't instructions", desc)
 	}
 }
+
+// A width of one, or none advertised (an older gateway), is exactly the
+// single-child schema; a width over one offers a tasks list of the same
+// entries, at most the width long, and no longer requires the single fields.
+func TestDelegateMCPOffersABatchOnlyOverAWidthOfOne(t *testing.T) {
+	platform := []lib.DelegateTarget{{Name: "platform"}}
+	single := delegateToolSchema(&lib.DelegateTargets{Targets: platform})
+	for name, targets := range map[string]*lib.DelegateTargets{
+		"no list":    nil,
+		"width one":  {Targets: platform, WidthMax: 1},
+		"width zero": {Targets: platform},
+	} {
+		got := delegateToolSchema(targets)
+		schema := got["inputSchema"].(map[string]any)
+		if _, ok := schema["properties"].(map[string]any)["tasks"]; ok {
+			t.Errorf("%s: the schema offers tasks", name)
+		}
+		if !reflect.DeepEqual(schema["required"], []string{"addressee", "text"}) {
+			t.Errorf("%s: required = %v", name, schema["required"])
+		}
+		if got["description"] != delegateToolDescription {
+			t.Errorf("%s: description = %q", name, got["description"])
+		}
+	}
+	if !reflect.DeepEqual(single, delegateToolSchema(&lib.DelegateTargets{Targets: platform, WidthMax: 1})) {
+		t.Error("width one differs from an unset width")
+	}
+
+	wide := delegateToolSchema(&lib.DelegateTargets{Targets: platform, WidthMax: 4})
+	schema := wide["inputSchema"].(map[string]any)
+	tasks, ok := schema["properties"].(map[string]any)["tasks"].(map[string]any)
+	if !ok || tasks["type"] != "array" || tasks["maxItems"] != 4 || tasks["minItems"] != 2 {
+		t.Fatalf("tasks property = %v, want an array of 2 to 4", tasks)
+	}
+	items := tasks["items"].(map[string]any)
+	props := items["properties"].(map[string]any)
+	for _, k := range []string{"addressee", "text", "parameters"} {
+		if _, ok := props[k]; !ok {
+			t.Errorf("a batch entry lacks %s", k)
+		}
+	}
+	if !reflect.DeepEqual(items["required"], []string{"addressee", "text"}) {
+		t.Errorf("entry required = %v", items["required"])
+	}
+	if req, ok := schema["required"]; ok && len(req.([]string)) != 0 {
+		t.Errorf("a batch-capable schema still requires %v", req)
+	}
+	if !strings.Contains(wide["description"].(string), "at most 4") {
+		t.Errorf("description %q doesn't name the width", wide["description"])
+	}
+}
+
+// A call carrying tasks reaches the adapter as a batch.
+func TestDelegateMCPForwardsABatch(t *testing.T) {
+	sock, got := fakeAdapterSocket(t, delegateReply{OK: true, Message: "delegated"})
+	inR, inW := io.Pipe()
+	outR, outW := io.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = ServeDelegateMCP(ctx, inR, outW, sock, nil, slog.Default()) }()
+	out := bufio.NewReader(outR)
+	call := rpc(t, inW, out, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"delegate","arguments":{"tasks":[{"addressee":"cluster","text":"a","parameters":{"cluster":"dev"}},{"addressee":"cluster","text":"b"}]}}}`)
+	if res := call["result"].(map[string]any); res["isError"] == true {
+		t.Fatalf("call errored: %v", call)
+	}
+	reqs := got()
+	if len(reqs) != 1 || len(reqs[0].Tasks) != 2 || reqs[0].Tasks[0].Parameters["cluster"] != "dev" || reqs[0].Tasks[1].Text != "b" {
+		t.Fatalf("adapter got %+v", reqs)
+	}
+}
