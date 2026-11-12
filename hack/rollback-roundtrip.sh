@@ -138,6 +138,45 @@ readonly AGENT_API_PROMPT="ping"
 readonly AGENT_API_ACCEPT_MARKERS="output assistant pong"
 readonly AGENT_LOCAL_PORT_DEFAULT=28541
 
+# ─── The web console ─────────────────────────────────────────────────────────
+# The deploy's console gate (hack/ci-deploy.sh, 6a), run again after pre and
+# after every leg: the console's Deployment is rolled out, its page and read
+# routes answer, one turn through its chat route gets a reply, and the
+# session's messages show the user's row and the assistant's. The console is
+# the chart's, named off the Helm release rather than the CR
+# (<release>-web-console, charts/kube-agents/templates/web-console.yaml);
+# ROLLBACK_WEB_CONSOLE_NAME overrides the lane's release name. An install with
+# no such Service gets a SKIP: the lane installs the console, a dev install
+# may not. The routes, keys, header and session shape are the console's
+# (a2a/cmd/web-console/main.go, insights.go, environment.go);
+# tests/test_rollback_roundtrip.py holds them to the deploy's.
+readonly WEB_CONSOLE_NAME_DEFAULT="kube-agents-web-console"
+readonly WEB_CONSOLE_PORT=8080
+readonly WEB_CONSOLE_LOCAL_PORT_DEFAULT=28080
+readonly WEB_CONSOLE_HEADER="X-Kube-Agents-Console: 1"
+readonly WEB_CONSOLE_HEALTH_PATH="/healthz"
+readonly WEB_CONSOLE_PAGE_PATH="/"
+readonly WEB_CONSOLE_PAGE_MARKER="<html"
+readonly WEB_CONSOLE_READ_ROUTES="/api/insights /api/environment /api/channels/alerts/posts /api/channels/scheduled/posts /api/models /api/repositories /api/patches"
+readonly WEB_CONSOLE_INSIGHTS_PATH="/api/insights"
+readonly WEB_CONSOLE_INSIGHTS_KEYS="cluster"
+readonly WEB_CONSOLE_ENVIRONMENT_PATH="/api/environment"
+readonly WEB_CONSOLE_ENVIRONMENT_KEYS="versions counts"
+readonly WEB_CONSOLE_CHAT_PATH="/api/chat"
+readonly WEB_CONSOLE_CHAT_KEYS="session_id reply"
+readonly WEB_CONSOLE_MESSAGES_PATH_FORMAT="/api/sessions/%s/messages"
+readonly WEB_CONSOLE_MESSAGES_KEYS="messages"
+readonly WEB_CONSOLE_SESSION_ID_PREFIX="web-console-"
+readonly WEB_CONSOLE_SESSION_ID_HEX_BYTES=16
+readonly WEB_CONSOLE_CHAT_PROMPT="Reply with the single word pong. Do not run any tools."
+readonly WEB_CONSOLE_ROLE_USER="user"
+readonly WEB_CONSOLE_ROLE_ASSISTANT="assistant"
+# What console_judge returns for an answer a fresh tunnel may change (no
+# answer, or a 5xx: the console's own 502, 503 and 504); 1 is the one it
+# would not (a 4xx, or a 200 whose body is not the route's).
+readonly WEB_CONSOLE_RETRY_STATUS=2
+readonly WEB_CONSOLE_DETAIL_BYTES=300
+
 # ─── The bus task ────────────────────────────────────────────────────────────
 # One task through the inject door (a2aInjectPort; token under a2aInjectTokenKey
 # in the Secret beside it), awaited to its terminal by the lane's client.
@@ -197,6 +236,12 @@ readonly DEFAULT_UNSCHEDULABLE_TIMEOUT=300
 # One today turn's request, and how many fresh tunnels it gets.
 readonly DEFAULT_TURN_TIMEOUT=120
 readonly DEFAULT_TURN_ATTEMPTS=5
+# One console read route's request, and one console turn's: the latter
+# outlasts the console's own turn timeout (turnTimeout, 300 s), after which
+# the console answers 504 and the next attempt sends another turn. The
+# console's checks get TURN_ATTEMPTS fresh tunnels, as the today turn does.
+readonly DEFAULT_CONSOLE_ROUTE_TIMEOUT=60
+readonly DEFAULT_CONSOLE_TURN_TIMEOUT=330
 # One bus task, submission to terminal; and how many fresh tunnels a door
 # that could not be reached gets.
 readonly DEFAULT_BUS_TASK_TIMEOUT=900
@@ -233,6 +278,10 @@ SETTLE_TIMEOUT="${ROLLBACK_SETTLE_TIMEOUT:-${DEFAULT_SETTLE_TIMEOUT}}"
 UNSCHEDULABLE_TIMEOUT="${ROLLBACK_UNSCHEDULABLE_TIMEOUT:-${DEFAULT_UNSCHEDULABLE_TIMEOUT}}"
 TURN_TIMEOUT="${ROLLBACK_TURN_TIMEOUT:-${DEFAULT_TURN_TIMEOUT}}"
 TURN_ATTEMPTS="${ROLLBACK_TURN_ATTEMPTS:-${DEFAULT_TURN_ATTEMPTS}}"
+CONSOLE_ROUTE_TIMEOUT="${ROLLBACK_CONSOLE_ROUTE_TIMEOUT:-${DEFAULT_CONSOLE_ROUTE_TIMEOUT}}"
+CONSOLE_TURN_TIMEOUT="${ROLLBACK_CONSOLE_TURN_TIMEOUT:-${DEFAULT_CONSOLE_TURN_TIMEOUT}}"
+WEB_CONSOLE_NAME="${ROLLBACK_WEB_CONSOLE_NAME:-${WEB_CONSOLE_NAME_DEFAULT}}"
+WEB_CONSOLE_LOCAL_PORT="${ROLLBACK_WEB_CONSOLE_LOCAL_PORT:-${WEB_CONSOLE_LOCAL_PORT_DEFAULT}}"
 BUS_TASK_TIMEOUT="${ROLLBACK_BUS_TASK_TIMEOUT:-${DEFAULT_BUS_TASK_TIMEOUT}}"
 BUS_TASK_ATTEMPTS="${ROLLBACK_BUS_TASK_ATTEMPTS:-${DEFAULT_BUS_TASK_ATTEMPTS}}"
 PORT_FORWARD_WAIT="${ROLLBACK_PORT_FORWARD_WAIT:-${DEFAULT_PORT_FORWARD_WAIT}}"
@@ -243,6 +292,7 @@ INJECT_LOCAL_PORT="${ROLLBACK_INJECT_LOCAL_PORT:-${INJECT_LOCAL_PORT_DEFAULT}}"
 # AGENT_INJECT_URL works: for an install already reachable from here.
 AGENT_URL="${ROLLBACK_AGENT_URL:-}"
 INJECT_URL="${ROLLBACK_INJECT_URL:-}"
+WEB_CONSOLE_URL="${ROLLBACK_WEB_CONSOLE_URL:-}"
 # Optional: every PASS, FAIL and SKIP line is appended here too.
 RESULTS_FILE="${ROLLBACK_RESULTS_FILE:-}"
 # Where the run leaves the install: next (the round trip) or today (a third
@@ -922,6 +972,180 @@ assert_today_turn() {
   fail "${name}" "no answer from ${AGENT_API_PATH} in ${TURN_ATTEMPTS} attempts; last: ${detail:0:300}"
 }
 
+# ─── The web console ─────────────────────────────────────────────────────────
+# A JSON object carrying every key named, or why not.
+readonly PY_CONSOLE_JSON='
+import json, sys
+path, keys = sys.argv[1], sys.argv[2:]
+try:
+    with open(path, encoding="utf-8") as handle:
+        doc = json.load(handle)
+except (OSError, ValueError) as exc:
+    print("the body is not JSON (%s)" % exc)
+    sys.exit(1)
+if not isinstance(doc, dict):
+    print("the body is JSON but not an object")
+    sys.exit(1)
+missing = [key for key in keys if key not in doc]
+if missing:
+    print("the object lacks %s" % ", ".join(missing))
+    sys.exit(1)
+'
+# The session's messages hold a row of each role named, or why not.
+readonly PY_CONSOLE_ROLES='
+import json, sys
+path, wanted = sys.argv[1], sys.argv[2:]
+with open(path, encoding="utf-8") as handle:
+    doc = json.load(handle)
+roles = [m.get("role") for m in doc.get("messages") or []]
+missing = [role for role in wanted if role not in roles]
+if missing:
+    print("no %s row among %d message(s) (roles: %s)" % (" or ".join(missing), len(roles), ", ".join(str(r) for r in roles) or "none"))
+    sys.exit(1)
+'
+readonly PY_CONSOLE_SESSION_ID='
+import secrets, sys
+print(sys.argv[1] + secrets.token_hex(int(sys.argv[2])))
+'
+CONSOLE_STATUS=""
+CONSOLE_DETAIL=""
+CONSOLE_BODY=""
+
+# One request to the console. CONSOLE_STATUS is the HTTP status (000 when
+# nothing answered inside the timeout); the body is in CONSOLE_BODY. A body
+# makes it a console POST: the header and the JSON content type the console
+# requires (requireConsoleRequest); the loopback Host it requires is the
+# tunnel's.
+console_request() { # <base url> <method> <path> <timeout> [JSON body]
+  local url="$1" method="$2" path="$3" timeout="$4" body="${5:-}"
+  local -a args=(-s -o "${CONSOLE_BODY}" -w '%{http_code}' --max-time "${timeout}" -X "${method}")
+  if [ -n "${body}" ]; then
+    args+=(-H "${WEB_CONSOLE_HEADER}" -H "Content-Type: application/json" -d "${body}")
+  fi
+  : >"${CONSOLE_BODY}"
+  CONSOLE_STATUS="$(curl "${args[@]}" "${url}${path}" 2>/dev/null || true)"
+  CONSOLE_STATUS="${CONSOLE_STATUS:-000}"
+}
+
+console_body_excerpt() {
+  head -c "${WEB_CONSOLE_DETAIL_BYTES}" "${CONSOLE_BODY}" 2>/dev/null | tr '\n' ' '
+}
+
+# Judges the last answer: 0 for a 200 whose body is a JSON object carrying
+# every key named; WEB_CONSOLE_RETRY_STATUS for no answer or a 5xx; 1 for
+# anything else. CONSOLE_DETAIL says which, naming the route.
+console_judge() { # <path> [key...]
+  local path="$1" why
+  shift
+  case "${CONSOLE_STATUS}" in
+    200) ;;
+    000)
+      CONSOLE_DETAIL="${path}: no answer (the tunnel dropped, or nothing came within the timeout)"
+      return "${WEB_CONSOLE_RETRY_STATUS}"
+      ;;
+    5??)
+      CONSOLE_DETAIL="${path}: HTTP ${CONSOLE_STATUS}: $(console_body_excerpt)"
+      return "${WEB_CONSOLE_RETRY_STATUS}"
+      ;;
+    *)
+      CONSOLE_DETAIL="${path}: HTTP ${CONSOLE_STATUS}: $(console_body_excerpt)"
+      return 1
+      ;;
+  esac
+  if ! why="$(python3 -c "${PY_CONSOLE_JSON}" "${CONSOLE_BODY}" "$@")"; then
+    CONSOLE_DETAIL="${path}: HTTP 200 but ${why}: $(console_body_excerpt)"
+    return 1
+  fi
+}
+
+# One pass over the console at a base URL: the health route, the page, the
+# read routes, a turn, the messages. Returns as console_judge does.
+console_probe() { # <base url>
+  local url="$1" path sid messages_path why
+  local -a keys
+  console_request "${url}" GET "${WEB_CONSOLE_HEALTH_PATH}" "${CONSOLE_ROUTE_TIMEOUT}"
+  console_judge "${WEB_CONSOLE_HEALTH_PATH}" || return $?
+  console_request "${url}" GET "${WEB_CONSOLE_PAGE_PATH}" "${CONSOLE_ROUTE_TIMEOUT}"
+  case "${CONSOLE_STATUS}" in
+    200)
+      if ! grep -qiF "${WEB_CONSOLE_PAGE_MARKER}" "${CONSOLE_BODY}"; then
+        CONSOLE_DETAIL="${WEB_CONSOLE_PAGE_PATH}: HTTP 200 but the body is not the console page (no ${WEB_CONSOLE_PAGE_MARKER}): $(console_body_excerpt)"
+        return 1
+      fi
+      ;;
+    000 | 5??)
+      CONSOLE_DETAIL="${WEB_CONSOLE_PAGE_PATH}: HTTP ${CONSOLE_STATUS}: $(console_body_excerpt)"
+      return "${WEB_CONSOLE_RETRY_STATUS}"
+      ;;
+    *)
+      CONSOLE_DETAIL="${WEB_CONSOLE_PAGE_PATH}: HTTP ${CONSOLE_STATUS}: $(console_body_excerpt)"
+      return 1
+      ;;
+  esac
+  for path in ${WEB_CONSOLE_READ_ROUTES}; do
+    keys=()
+    case "${path}" in
+      "${WEB_CONSOLE_INSIGHTS_PATH}") read -r -a keys <<<"${WEB_CONSOLE_INSIGHTS_KEYS}" ;;
+      "${WEB_CONSOLE_ENVIRONMENT_PATH}") read -r -a keys <<<"${WEB_CONSOLE_ENVIRONMENT_KEYS}" ;;
+    esac
+    console_request "${url}" GET "${path}" "${CONSOLE_ROUTE_TIMEOUT}"
+    console_judge "${path}" ${keys[@]+"${keys[@]}"} || return $?
+  done
+  sid="$(python3 -c "${PY_CONSOLE_SESSION_ID}" "${WEB_CONSOLE_SESSION_ID_PREFIX}" "${WEB_CONSOLE_SESSION_ID_HEX_BYTES}")"
+  console_request "${url}" POST "${WEB_CONSOLE_CHAT_PATH}" "${CONSOLE_TURN_TIMEOUT}" \
+    "{\"session_id\": \"${sid}\", \"message\": \"${WEB_CONSOLE_CHAT_PROMPT}\"}"
+  read -r -a keys <<<"${WEB_CONSOLE_CHAT_KEYS}"
+  console_judge "${WEB_CONSOLE_CHAT_PATH}" "${keys[@]}" || return $?
+  # The format is a named constant, which is the point of it (SC2059 wants a literal).
+  # shellcheck disable=SC2059
+  printf -v messages_path "${WEB_CONSOLE_MESSAGES_PATH_FORMAT}" "${sid}"
+  console_request "${url}" GET "${messages_path}" "${CONSOLE_ROUTE_TIMEOUT}"
+  read -r -a keys <<<"${WEB_CONSOLE_MESSAGES_KEYS}"
+  console_judge "${messages_path}" "${keys[@]}" || return $?
+  if ! why="$(python3 -c "${PY_CONSOLE_ROLES}" "${CONSOLE_BODY}" "${WEB_CONSOLE_ROLE_USER}" "${WEB_CONSOLE_ROLE_ASSISTANT}")"; then
+    CONSOLE_DETAIL="${messages_path}: HTTP 200 but ${why}"
+    return 1
+  fi
+  CONSOLE_DETAIL="every route answered 200, the turn on session ${sid} got a reply, and the session shows the ${WEB_CONSOLE_ROLE_USER} and ${WEB_CONSOLE_ROLE_ASSISTANT} rows"
+}
+
+assert_web_console() {
+  local name="$1" present state attempt url rc
+  present="$(k_read get svc "${WEB_CONSOLE_NAME}" --ignore-not-found -o name)" || fail "${name}" "svc/${WEB_CONSOLE_NAME} could not be read"
+  if [ -z "${present}" ]; then
+    skip "${name}" "no svc/${WEB_CONSOLE_NAME}: the install has no web console (webConsole.enabled), so nothing is checked"
+    return 0
+  fi
+  state="$(rollout_state deployment "${WEB_CONSOLE_NAME}")"
+  [ "${state}" = "ok" ] || fail "${name}" "deployment/${WEB_CONSOLE_NAME} is not rolled out: ${state}"
+  CONSOLE_BODY="$(mktemp)"
+  CONSOLE_DETAIL="no attempt ran"
+  rc=1
+  for ((attempt = 1; attempt <= TURN_ATTEMPTS; attempt++)); do
+    url="${WEB_CONSOLE_URL}"
+    if [ -z "${url}" ]; then
+      if ! start_port_forward "svc/${WEB_CONSOLE_NAME}" "${WEB_CONSOLE_LOCAL_PORT}" "${WEB_CONSOLE_PORT}"; then
+        CONSOLE_DETAIL="the port-forward to svc/${WEB_CONSOLE_NAME} did not listen within ${PORT_FORWARD_WAIT}s"
+        rc="${WEB_CONSOLE_RETRY_STATUS}"
+        continue
+      fi
+      url="http://127.0.0.1:${WEB_CONSOLE_LOCAL_PORT}"
+    fi
+    rc=0
+    console_probe "${url}" || rc=$?
+    stop_port_forward
+    if [ "${rc}" -eq 0 ]; then
+      rm -f "${CONSOLE_BODY}"
+      pass "${name}" "deployment/${WEB_CONSOLE_NAME} rolled out; ${CONSOLE_DETAIL} (attempt ${attempt}/${TURN_ATTEMPTS})"
+      return 0
+    fi
+    [ "${rc}" -eq "${WEB_CONSOLE_RETRY_STATUS}" ] || break
+    note "${name}: attempt ${attempt}/${TURN_ATTEMPTS}: ${CONSOLE_DETAIL}"
+  done
+  rm -f "${CONSOLE_BODY}"
+  fail "${name}" "${CONSOLE_DETAIL}"
+}
+
 # ─── The bus task ────────────────────────────────────────────────────────────
 # Through the lane's own client. Exits 0 on a completed terminal, the
 # unreachable status when nothing could be submitted, 1 otherwise; prints one
@@ -1074,6 +1298,7 @@ flip_to_today() {
   wait_settled "${leg}.nothing-stuck" "${MODE_TODAY}" "${SETTLE_TIMEOUT}"
   assert_not_degraded "${leg}.not-degraded"
   assert_today_turn "${leg}.today-turn"
+  assert_web_console "${leg}.web-console"
 }
 
 # ─── The run ─────────────────────────────────────────────────────────────────
@@ -1114,6 +1339,7 @@ PVC_UID="${ASSERTED_UID}"
 assert_present "pre.creds-present" secret "${CREDS_SECRET}"
 CREDS_UID="${ASSERTED_UID}"
 assert_bus_task "pre.bus-task"
+assert_web_console "pre.web-console"
 
 # Leg 1: next -> today.
 CURRENT_LEG="leg1"
@@ -1202,6 +1428,7 @@ wait_rolled "leg2.gateway-serving" deployment "${A2A_GATEWAY_NAME}" "${ROLLOUT_T
 assert_bus_task "leg2.bus-task"
 wait_settled "leg2.nothing-stuck" "${MODE_NEXT}" "${SETTLE_TIMEOUT}"
 assert_not_degraded "leg2.not-degraded"
+assert_web_console "leg2.web-console"
 
 ROUTE="next -> today -> next"
 if [ "${END_MODE}" = "${MODE_TODAY}" ]; then

@@ -17,6 +17,11 @@
 # step 5 hands the operator their references, the bridge's settings and the
 # inject door, step 6b flips and gates; the constants block below says what
 # each does). Unset, nothing behaves differently either.
+#
+# The web console is installed on every lane (webConsole.enabled=true in step
+# 5, from the image step 4 builds or the candidate publishes) and gated under
+# today (6a) and, under the flag, under next (the end of 6b): its routes answer
+# and a chat turn through it gets a reply (#2462).
 # ==============================================================================
 
 set -euo pipefail
@@ -427,6 +432,76 @@ readonly CREDENTIAL_PROXY_DEPLOYMENT_NAME="${PLATFORM_AGENT_CR_NAME}-credential-
 # scripts/release/common.sh publish them by.
 readonly PLUGIN_IMAGE_PUBSUB_PLATFORM="pubsub-platform"
 readonly PLUGIN_IMAGE_STOCKOUT_INVESTIGATOR="gke-stockout-investigator"
+# The web console (a2a/cmd/web-console), installed on every lane so the
+# presubmit and the nightlies run it where a person would (#2462): step 4
+# builds its image beside the others (cloudbuild-ci.yaml's web-console step;
+# the release-candidate path installs the candidate's published one, which
+# docker-publish-ghcr.yml publishes under this name and
+# scripts/release/common.sh requires), step 5 turns it on with that image, and
+# gate_web_console (6a, and the end of 6b under next) reads its routes and
+# sends a chat turn through it.
+readonly WEB_CONSOLE_IMAGE_NAME="web-console"
+# The chart names the console's Deployment and Service <release>-web-console
+# (charts/kube-agents/templates/web-console.yaml) and serves it on 8080.
+readonly WEB_CONSOLE_NAME="${HELM_RELEASE_NAME}-web-console"
+readonly WEB_CONSOLE_PORT=8080
+# The local end of the gate's port-forward.
+readonly WEB_CONSOLE_LOCAL_PORT=18080
+readonly WEB_CONSOLE_PF_LOG="/tmp/pf-web-console.log"
+# The console refuses a Host that is not loopback and a POST without this
+# header (requireLocalHost and requireConsoleRequest in
+# a2a/cmd/web-console/main.go); the port-forward gives it the first.
+readonly WEB_CONSOLE_HEADER="X-Kube-Agents-Console: 1"
+readonly WEB_CONSOLE_HEALTH_PATH="/healthz"
+# The page itself, which the gate reads for this marker.
+readonly WEB_CONSOLE_PAGE_PATH="/"
+readonly WEB_CONSOLE_PAGE_MARKER="<html"
+# The read routes the gate GETs, each answering 200 with a JSON object, and
+# the keys the two metadata routes carry (insightsResponse in insights.go,
+# environmentResponse in environment.go).
+readonly WEB_CONSOLE_READ_ROUTES="/api/insights /api/environment /api/channels/alerts/posts /api/channels/scheduled/posts /api/models /api/repositories /api/patches"
+readonly WEB_CONSOLE_INSIGHTS_PATH="/api/insights"
+readonly WEB_CONSOLE_INSIGHTS_KEYS="cluster"
+readonly WEB_CONSOLE_ENVIRONMENT_PATH="/api/environment"
+readonly WEB_CONSOLE_ENVIRONMENT_KEYS="versions counts"
+# One turn through the console (chatRequest, chatResponse), into a session id
+# of the console's own shape (sessionIDPattern: the prefix and 32 hex digits),
+# then the session's messages (sessionMessagesResponse), which must show the
+# user's row and the assistant's.
+readonly WEB_CONSOLE_CHAT_PATH="/api/chat"
+readonly WEB_CONSOLE_CHAT_KEYS="session_id reply"
+readonly WEB_CONSOLE_MESSAGES_PATH_FORMAT="/api/sessions/%s/messages"
+readonly WEB_CONSOLE_MESSAGES_KEYS="messages"
+readonly WEB_CONSOLE_SESSION_ID_PREFIX="web-console-"
+readonly WEB_CONSOLE_SESSION_ID_HEX_BYTES=16
+readonly WEB_CONSOLE_CHAT_PROMPT="Reply with the single word pong. Do not run any tools."
+readonly WEB_CONSOLE_ROLE_USER="user"
+readonly WEB_CONSOLE_ROLE_ASSISTANT="assistant"
+readonly WEB_CONSOLE_ROLLOUT_TIMEOUT="600s"
+readonly WEB_CONSOLE_EXISTS_ATTEMPTS=60
+readonly WEB_CONSOLE_POLL_SECONDS=5
+# Every attempt gets a fresh tunnel (step 7 says why) after this pause; a
+# read route gets a bounded wait; the chat turn's deadline outlasts the
+# console's own turn timeout (turnTimeout, 300 s), after which the console
+# answers 504 and the next attempt sends another turn. A 4xx, or a 200 whose
+# body is not what the route returns, is not retried: a fresh tunnel would not
+# change it.
+readonly WEB_CONSOLE_GATE_ATTEMPTS=5
+readonly WEB_CONSOLE_RETRY_SECONDS=10
+readonly WEB_CONSOLE_PORT_FORWARD_WAIT_SECONDS=30
+readonly WEB_CONSOLE_ROUTE_MAX_TIME_SECONDS=60
+readonly WEB_CONSOLE_CHAT_MAX_TIME_SECONDS=330
+# web_console_expect_json's return for an answer a fresh tunnel may change
+# (no answer, or a 5xx); 1 is the one it would not.
+readonly WEB_CONSOLE_PROBE_RETRY=2
+# How much of a body the failure line quotes, and of the console's log the
+# failure dump shows.
+readonly WEB_CONSOLE_DETAIL_BYTES=300
+readonly WEB_CONSOLE_DIAG_LOG_LINES=100
+# How many reads, WEB_CONSOLE_POLL_SECONDS apart, a Degraded CR phase gets to
+# clear after the turn before the gate fails on it: the operator rewrites the
+# status on its next pass, which the agent Deployment's status moving starts.
+readonly WEB_CONSOLE_CR_ATTEMPTS=12
 # Section 7b: the Pub/Sub platform adapter must pull through the credential
 # broker. The adapter logs the first line when it connects; the broker logs
 # the second for every relayed pull. The route is the stockout investigator's
@@ -714,6 +789,14 @@ if ! command -v ssh-keygen >/dev/null 2>&1; then
   exit 1
 fi
 
+# The web console gate (6a) reads the console's JSON with python3, which the
+# round trip (hack/rollback-roundtrip.sh) and the eval already need; checked
+# here so a runner without it fails before the build rather than after it.
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "ERROR: python3 is required to verify the web console's routes"
+  exit 1
+fi
+
 # ─── 2. Configuration Environment Variables ───────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/ci-env.sh"
@@ -729,6 +812,8 @@ stop_deploy_heartbeat() { kill "${DEPLOY_HEARTBEAT_PID:-}" 2>/dev/null || true; 
 deploy_exit() {
   dump_prow_artifacts_on_failure
   stop_deploy_heartbeat
+  # The web console gate's tunnel (6a), if a failure left one open.
+  kill "${WEB_CONSOLE_PF_PID:-}" 2>/dev/null || true
 }
 trap deploy_exit EXIT
 
@@ -908,6 +993,9 @@ if [ -n "${RC_COMMIT_SHA:-}" ]; then
     --set-string "agentSandbox.image.tag=${TAG}"
     --set-string "plugins.pubsubPlatform.image.tag=${TAG}"
     --set-string "plugins.stockoutInvestigator.image.tag=${TAG}"
+    # The web console too: the chart defaults its repository to the published
+    # one, so the tag is the whole of it.
+    --set-string "webConsole.image.tag=${TAG}"
   )
   DEPLOY_SOURCE="release candidate ${RC_COMMIT_SHA:0:7} from ${RC_REGISTRY_PREFIX}"
 else
@@ -922,6 +1010,10 @@ else
     --set-string "plugins.pubsubPlatform.image.tag=${TAG}"
     --set-string "plugins.stockoutInvestigator.image.repository=${AR_REPO}/${PLUGIN_IMAGE_STOCKOUT_INVESTIGATOR}"
     --set-string "plugins.stockoutInvestigator.image.tag=${TAG}"
+    # The web console, from the image step 4 builds beside the others
+    # (cloudbuild-ci.yaml's web-console step).
+    --set-string "webConsole.image.repository=${AR_REPO}/${WEB_CONSOLE_IMAGE_NAME}"
+    --set-string "webConsole.image.tag=${TAG}"
   )
   DEPLOY_SOURCE="PR #${PULL_NUMBER:-local} build (${TAG})"
 fi
@@ -1851,6 +1943,9 @@ else
   # release-candidate path installs the candidate's published ones, section
   # 2a, and skipped this section above), so they are always built here.
   PLUGIN_IMAGE_SUBSTITUTIONS=",_PUBSUB_PLATFORM_URI=${AR_REPO}/${PLUGIN_IMAGE_PUBSUB_PLATFORM}:${TAG},_STOCKOUT_INVESTIGATOR_URI=${AR_REPO}/${PLUGIN_IMAGE_STOCKOUT_INVESTIGATOR}:${TAG}"
+  # The web console, built on every lane for the same reason: the deploy
+  # installs it on every lane, at the reference section 2a gave the chart.
+  WEB_CONSOLE_BUILD_SUBSTITUTIONS=",_WEB_CONSOLE_URI=${AR_REPO}/${WEB_CONSOLE_IMAGE_NAME}:${TAG}"
   A2A_BUILD_SUBSTITUTIONS=""
   REPLAY_SHADOW_BUILD_SUBSTITUTIONS=""
   if [ -n "${REPLAY_SHADOW_PROXY_URI:-}" ]; then
@@ -1880,7 +1975,7 @@ else
   CLOUD_BUILD_ID=""
   CLOUD_BUILD_LOG_URL=""
   CLOUD_BUILD_SUBMIT_OUT="$(with_deadline "${BUILD_SUBMIT_TIMEOUT_SECONDS}" gcloud builds submit --async --config="deploy/docker/cloudbuild-ci.yaml" \
-    --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_SANDBOX_URI=${AR_REPO}/agent-sandbox:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG},_KUBE_PROXY_URI=${AR_REPO}/kube-proxy:${TAG}${PLUGIN_IMAGE_SUBSTITUTIONS},_CACHE_IMAGE=${CACHE_IMAGE},_BUILDCACHE_IMAGE=${BUILDCACHE_IMAGE},_PROXY_BUILDCACHE_IMAGE=${PROXY_BUILDCACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_KUBE_AGENTS_VERSION=${TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false}${A2A_BUILD_SUBSTITUTIONS}${REPLAY_SHADOW_BUILD_SUBSTITUTIONS}" \
+    --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_SANDBOX_URI=${AR_REPO}/agent-sandbox:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG},_KUBE_PROXY_URI=${AR_REPO}/kube-proxy:${TAG}${PLUGIN_IMAGE_SUBSTITUTIONS}${WEB_CONSOLE_BUILD_SUBSTITUTIONS},_CACHE_IMAGE=${CACHE_IMAGE},_BUILDCACHE_IMAGE=${BUILDCACHE_IMAGE},_PROXY_BUILDCACHE_IMAGE=${PROXY_BUILDCACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_KUBE_AGENTS_VERSION=${TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false}${A2A_BUILD_SUBSTITUTIONS}${REPLAY_SHADOW_BUILD_SUBSTITUTIONS}" \
     --project="${PROJECT_ID}" "${BUILD_WORKER_ARGS[@]}" --quiet --format="value(id,logUrl)" .)" || {
     echo "ERROR: gcloud builds submit exited $? before returning a build id (deadline ${BUILD_SUBMIT_TIMEOUT_SECONDS}s)" >&2
     exit 1
@@ -2148,6 +2243,7 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set "plugins.pubsubPlatform.enabled=true" \
     --set "plugins.stockoutInvestigator.enabled=true" \
     --set "plugins.stockoutInvestigator.applyTuning=false" \
+    --set "webConsole.enabled=true" \
     ${A2A_OPERATOR_ENV_ARGS[@]+"${A2A_OPERATOR_ENV_ARGS[@]}"} \
     ${MODE_NEXT_ENV_ARGS[@]+"${MODE_NEXT_ENV_ARGS[@]}"} \
     ${REPLAY_SHADOW_HELM_ARGS[@]+"${REPLAY_SHADOW_HELM_ARGS[@]}"} \
@@ -2285,6 +2381,260 @@ if [[ "${drift_detector_started}" != "true" ]]; then
   exit 1
 fi
 echo "✓ Rollout verification finished in $((SECONDS - STEP_START))s"
+
+# ─── 6a. The web console ──────────────────────────────────────────────────────
+# Step 5 installed the console (webConsole.enabled=true) from the image step
+# 4 built, so the lanes run it where a person would: through a port-forward to
+# its Service, which is the only way in (the chart's Service is ClusterIP
+# behind a deny-all ingress NetworkPolicy). The gate is what #2462 asks for,
+# made automatic: the console's Deployment rolls out, its page and every read
+# route answer (200 and a JSON object, the two metadata routes with the keys
+# the page reads), one chat turn through it reaches the agent and gets a
+# reply, the session's messages show the user's row and the assistant's, and
+# the CR is not Degraded afterwards. It runs here under today, and again at the
+# end of 6b under next, where the console still reaches the agent on the
+# Hermes API the today path keeps beside the bus
+# (docs/designs/spec-mode-switch.md); hack/rollback-roundtrip.sh runs the same
+# checks after each flip. The console holds the agent's key itself, so the
+# gate carries none: it sends what a browser sends, the loopback Host the
+# tunnel gives it and the console's own header on the POST.
+#
+# Fresh tunnel per attempt, as step 7, and the same split of answers: no
+# answer or a 5xx (the console's own 502 for an agent it could not reach, 503
+# for a busy one, 504 for a turn past its timeout) is worth another attempt;
+# a 4xx, or a 200 whose body is not what the route returns, is not, since the
+# same request through a fresh tunnel gets the same answer. The failure line
+# names the route and quotes the start of its body; the console's log and the
+# CR's status follow it.
+WEB_CONSOLE_PF_PID=""
+WEB_CONSOLE_STATUS=""
+WEB_CONSOLE_DETAIL=""
+WEB_CONSOLE_BODY_FILE=""
+stop_web_console_port_forward() {
+  if [ -n "${WEB_CONSOLE_PF_PID}" ]; then
+    kill "${WEB_CONSOLE_PF_PID}" 2>/dev/null || true
+    wait "${WEB_CONSOLE_PF_PID}" 2>/dev/null || true
+    WEB_CONSOLE_PF_PID=""
+  fi
+}
+
+# One request through the tunnel. WEB_CONSOLE_STATUS is the HTTP status (000
+# when nothing answered inside the deadline); the body is in
+# WEB_CONSOLE_BODY_FILE. A body makes it a console POST: the header and the
+# JSON content type requireConsoleRequest asks for.
+web_console_request() { # <method> <path> <max-time seconds> [JSON body]
+  local method="$1" path="$2" max_time="$3" body="${4:-}"
+  local -a args=(-s -o "${WEB_CONSOLE_BODY_FILE}" -w '%{http_code}' --max-time "${max_time}" -X "${method}")
+  if [ -n "${body}" ]; then
+    args+=(-H "${WEB_CONSOLE_HEADER}" -H "Content-Type: application/json" -d "${body}")
+  fi
+  : >"${WEB_CONSOLE_BODY_FILE}"
+  WEB_CONSOLE_STATUS="$(curl "${args[@]}" "http://127.0.0.1:${WEB_CONSOLE_LOCAL_PORT}${path}" 2>/dev/null || true)"
+  WEB_CONSOLE_STATUS="${WEB_CONSOLE_STATUS:-000}"
+}
+
+# The start of the last body, on one line, for a failure line.
+web_console_body_excerpt() {
+  head -c "${WEB_CONSOLE_DETAIL_BYTES}" "${WEB_CONSOLE_BODY_FILE}" 2>/dev/null | tr '\n' ' '
+}
+
+# Judges the last answer: 0 for a 200 whose body is a JSON object carrying
+# every key named; WEB_CONSOLE_PROBE_RETRY for no answer or a 5xx; 1 for
+# anything else. WEB_CONSOLE_DETAIL says which, naming the route.
+web_console_expect_json() { # <path> [key...]
+  local path="$1" why
+  shift
+  case "${WEB_CONSOLE_STATUS}" in
+    200) ;;
+    000)
+      WEB_CONSOLE_DETAIL="${path}: no answer (the tunnel dropped, or nothing came within the deadline)"
+      return "${WEB_CONSOLE_PROBE_RETRY}"
+      ;;
+    5??)
+      WEB_CONSOLE_DETAIL="${path}: HTTP ${WEB_CONSOLE_STATUS}: $(web_console_body_excerpt)"
+      return "${WEB_CONSOLE_PROBE_RETRY}"
+      ;;
+    *)
+      WEB_CONSOLE_DETAIL="${path}: HTTP ${WEB_CONSOLE_STATUS}: $(web_console_body_excerpt)"
+      return 1
+      ;;
+  esac
+  if ! why="$(python3 - "${WEB_CONSOLE_BODY_FILE}" "$@" <<'PY'
+import json, sys
+path, keys = sys.argv[1], sys.argv[2:]
+try:
+    with open(path, encoding="utf-8") as handle:
+        doc = json.load(handle)
+except (OSError, ValueError) as exc:
+    print("the body is not JSON (%s)" % exc)
+    sys.exit(1)
+if not isinstance(doc, dict):
+    print("the body is JSON but not an object")
+    sys.exit(1)
+missing = [key for key in keys if key not in doc]
+if missing:
+    print("the object lacks %s" % ", ".join(missing))
+    sys.exit(1)
+PY
+  )"; then
+    WEB_CONSOLE_DETAIL="${path}: HTTP 200 but ${why}: $(web_console_body_excerpt)"
+    return 1
+  fi
+}
+
+# The session's messages after the turn must hold a row of each role.
+web_console_expect_roles() { # <path>
+  local path="$1" why
+  if ! why="$(python3 - "${WEB_CONSOLE_BODY_FILE}" "${WEB_CONSOLE_ROLE_USER}" "${WEB_CONSOLE_ROLE_ASSISTANT}" <<'PY'
+import json, sys
+path, wanted = sys.argv[1], sys.argv[2:]
+with open(path, encoding="utf-8") as handle:
+    doc = json.load(handle)
+roles = [m.get("role") for m in doc.get("messages") or []]
+missing = [role for role in wanted if role not in roles]
+if missing:
+    print("no %s row among %d message(s) (roles: %s)" % (" or ".join(missing), len(roles), ", ".join(str(r) for r in roles) or "none"))
+    sys.exit(1)
+PY
+  )"; then
+    WEB_CONSOLE_DETAIL="${path}: HTTP 200 but ${why}"
+    return 1
+  fi
+}
+
+# One pass over the console through a tunnel that is up: the health route,
+# the page, the read routes, a turn, the messages. Returns as
+# web_console_expect_json does.
+web_console_probe() {
+  local path sid messages_path
+  local -a keys
+  web_console_request GET "${WEB_CONSOLE_HEALTH_PATH}" "${WEB_CONSOLE_ROUTE_MAX_TIME_SECONDS}"
+  web_console_expect_json "${WEB_CONSOLE_HEALTH_PATH}" || return $?
+  web_console_request GET "${WEB_CONSOLE_PAGE_PATH}" "${WEB_CONSOLE_ROUTE_MAX_TIME_SECONDS}"
+  case "${WEB_CONSOLE_STATUS}" in
+    200)
+      if ! grep -qiF "${WEB_CONSOLE_PAGE_MARKER}" "${WEB_CONSOLE_BODY_FILE}"; then
+        WEB_CONSOLE_DETAIL="${WEB_CONSOLE_PAGE_PATH}: HTTP 200 but the body is not the console page (no ${WEB_CONSOLE_PAGE_MARKER}): $(web_console_body_excerpt)"
+        return 1
+      fi
+      ;;
+    000 | 5??)
+      WEB_CONSOLE_DETAIL="${WEB_CONSOLE_PAGE_PATH}: HTTP ${WEB_CONSOLE_STATUS}: $(web_console_body_excerpt)"
+      return "${WEB_CONSOLE_PROBE_RETRY}"
+      ;;
+    *)
+      WEB_CONSOLE_DETAIL="${WEB_CONSOLE_PAGE_PATH}: HTTP ${WEB_CONSOLE_STATUS}: $(web_console_body_excerpt)"
+      return 1
+      ;;
+  esac
+  for path in ${WEB_CONSOLE_READ_ROUTES}; do
+    keys=()
+    case "${path}" in
+      "${WEB_CONSOLE_INSIGHTS_PATH}") read -r -a keys <<<"${WEB_CONSOLE_INSIGHTS_KEYS}" ;;
+      "${WEB_CONSOLE_ENVIRONMENT_PATH}") read -r -a keys <<<"${WEB_CONSOLE_ENVIRONMENT_KEYS}" ;;
+    esac
+    web_console_request GET "${path}" "${WEB_CONSOLE_ROUTE_MAX_TIME_SECONDS}"
+    web_console_expect_json "${path}" ${keys[@]+"${keys[@]}"} || return $?
+  done
+  echo "  every read route answered 200 with a JSON object"
+  sid="${WEB_CONSOLE_SESSION_ID_PREFIX}$(openssl rand -hex "${WEB_CONSOLE_SESSION_ID_HEX_BYTES}")"
+  web_console_request POST "${WEB_CONSOLE_CHAT_PATH}" "${WEB_CONSOLE_CHAT_MAX_TIME_SECONDS}" \
+    "{\"session_id\": \"${sid}\", \"message\": \"${WEB_CONSOLE_CHAT_PROMPT}\"}"
+  read -r -a keys <<<"${WEB_CONSOLE_CHAT_KEYS}"
+  web_console_expect_json "${WEB_CONSOLE_CHAT_PATH}" "${keys[@]}" || return $?
+  echo "  ${WEB_CONSOLE_CHAT_PATH} answered the turn on session ${sid}"
+  # The format is a named constant, which is the point of it (SC2059 wants a literal).
+  # shellcheck disable=SC2059
+  printf -v messages_path "${WEB_CONSOLE_MESSAGES_PATH_FORMAT}" "${sid}"
+  web_console_request GET "${messages_path}" "${WEB_CONSOLE_ROUTE_MAX_TIME_SECONDS}"
+  read -r -a keys <<<"${WEB_CONSOLE_MESSAGES_KEYS}"
+  web_console_expect_json "${messages_path}" "${keys[@]}" || return $?
+  web_console_expect_roles "${messages_path}" || return $?
+  echo "  ${messages_path} shows the ${WEB_CONSOLE_ROLE_USER} and ${WEB_CONSOLE_ROLE_ASSISTANT} rows"
+}
+
+dump_web_console_state() {
+  local label="$1"
+  echo "=== Debug: web console port-forward log (tail) ==="
+  tail -n "${WEB_CONSOLE_DIAG_LOG_LINES}" "${WEB_CONSOLE_PF_LOG}" 2>/dev/null || true
+  echo "=== Debug: web console ==="
+  kubectl get "deployment/${WEB_CONSOLE_NAME}" "svc/${WEB_CONSOLE_NAME}" -n "${NAMESPACE}" || true
+  kubectl logs -n "${NAMESPACE}" "deployment/${WEB_CONSOLE_NAME}" --tail="${WEB_CONSOLE_DIAG_LOG_LINES}" || true
+  kubectl get pods -n "${NAMESPACE}" || true
+  report_cr_status "web-console-${label}"
+}
+
+# <label> names the mode in the log and the status artifact (today, next).
+gate_web_console() {
+  local label="$1" attempt rc pair phase="" gate_start=$SECONDS
+  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Verifying the web console under ${label} ==="
+  for _ in $(seq 1 "${WEB_CONSOLE_EXISTS_ATTEMPTS}"); do
+    kubectl get "deployment/${WEB_CONSOLE_NAME}" -n "${NAMESPACE}" >/dev/null 2>&1 && break
+    sleep "${WEB_CONSOLE_POLL_SECONDS}"
+  done
+  if ! kubectl rollout status "deployment/${WEB_CONSOLE_NAME}" -n "${NAMESPACE}" --timeout="${WEB_CONSOLE_ROLLOUT_TIMEOUT}"; then
+    echo "ERROR: deployment/${WEB_CONSOLE_NAME} rollout failed under ${label}"
+    kubectl describe "deployment/${WEB_CONSOLE_NAME}" -n "${NAMESPACE}" || true
+    dump_web_console_state "${label}"
+    exit 1
+  fi
+  echo "✓ deployment/${WEB_CONSOLE_NAME} rolled out under ${label}"
+
+  WEB_CONSOLE_BODY_FILE="$(mktemp)"
+  WEB_CONSOLE_DETAIL="no attempt ran"
+  rc=1
+  : >"${WEB_CONSOLE_PF_LOG}"
+  for ((attempt = 1; attempt <= WEB_CONSOLE_GATE_ATTEMPTS; attempt++)); do
+    # Kill any previous tunnel and start a fresh one; the log is appended so
+    # a failure dump shows every attempt, not just the last.
+    stop_web_console_port_forward
+    echo "--- web console port-forward attempt ${attempt}/${WEB_CONSOLE_GATE_ATTEMPTS} (${label}) ---" >>"${WEB_CONSOLE_PF_LOG}"
+    kubectl port-forward "svc/${WEB_CONSOLE_NAME}" -n "${NAMESPACE}" "${WEB_CONSOLE_LOCAL_PORT}:${WEB_CONSOLE_PORT}" >>"${WEB_CONSOLE_PF_LOG}" 2>&1 &
+    WEB_CONSOLE_PF_PID=$!
+    for _ in $(seq 1 "${WEB_CONSOLE_PORT_FORWARD_WAIT_SECONDS}"); do
+      (exec 3<>"/dev/tcp/127.0.0.1/${WEB_CONSOLE_LOCAL_PORT}") 2>/dev/null && break
+      sleep 1
+    done
+    rc=0
+    web_console_probe || rc=$?
+    [ "${rc}" -eq 0 ] && break
+    if [ "${rc}" -ne "${WEB_CONSOLE_PROBE_RETRY}" ]; then
+      echo "web console attempt ${attempt}/${WEB_CONSOLE_GATE_ATTEMPTS} (${label}) failed: ${WEB_CONSOLE_DETAIL}; a fresh tunnel would not change that"
+      break
+    fi
+    if [ "${attempt}" -lt "${WEB_CONSOLE_GATE_ATTEMPTS}" ]; then
+      echo "web console attempt ${attempt}/${WEB_CONSOLE_GATE_ATTEMPTS} (${label}) failed: ${WEB_CONSOLE_DETAIL}; respawning the tunnel in ${WEB_CONSOLE_RETRY_SECONDS}s"
+      sleep "${WEB_CONSOLE_RETRY_SECONDS}"
+    else
+      echo "web console attempt ${attempt}/${WEB_CONSOLE_GATE_ATTEMPTS} (${label}) failed: ${WEB_CONSOLE_DETAIL}"
+    fi
+  done
+  stop_web_console_port_forward
+  rm -f "${WEB_CONSOLE_BODY_FILE}"
+  if [ "${rc}" -ne 0 ]; then
+    echo "ERROR: the web console failed under ${label}: ${WEB_CONSOLE_DETAIL}"
+    dump_web_console_state "${label}"
+    exit 1
+  fi
+
+  # The CR after the turn: a console that drove something on the bus side
+  # Degraded shows up here. The operator's status can lag a pod by one pass,
+  # so a Degraded is re-read a bounded number of times before it fails.
+  for _ in $(seq 1 "${WEB_CONSOLE_CR_ATTEMPTS}"); do
+    pair="$(kubectl get platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" -o jsonpath="${CR_PHASE_READY_JSONPATH}" 2>/dev/null || true)"
+    phase="${pair%%$'\t'*}"
+    [ "${phase}" = "${CR_PHASE_DEGRADED}" ] || break
+    sleep "${WEB_CONSOLE_POLL_SECONDS}"
+  done
+  if [ "${phase}" = "${CR_PHASE_DEGRADED}" ]; then
+    echo "ERROR: ${PLATFORM_AGENT_CR_NAME} is ${phase} with the web console on under ${label}; Ready condition: ${pair#*$'\t'}"
+    dump_web_console_state "${label}"
+    exit 1
+  fi
+  echo "✓ web console verified under ${label} in $((SECONDS - gate_start))s (attempt ${attempt}/${WEB_CONSOLE_GATE_ATTEMPTS}; ${PLATFORM_AGENT_CR_NAME} is ${phase:-unread}: ${pair#*$'\t'})"
+}
+
+gate_web_console today
 
 # ─── 6b. EVAL_MODE_NEXT: switch to spec.mode: next and gate the bus ──────────
 # Everything above proved the today-mode install. From here the mode is set
@@ -2823,6 +3173,11 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   # now, and the backoff it may still be in has been running against the two
   # rollouts above rather than in front of them.
   gate_mode_next_rollout "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-verifier"
+
+  # The console again, now under next (6a says what it checks): the today
+  # path it talks to is still there beside the bus, and the CR stays out of
+  # Degraded with the console on.
+  gate_web_console next
 
   # What the run has to show for itself, for the artifact log: the CR status,
   # the stack the mode rendered, the ungated gateway, and the entrypoint's

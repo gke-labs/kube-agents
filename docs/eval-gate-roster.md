@@ -790,6 +790,8 @@ optional `pull-kube-agents-smoke-test-today` (on demand with `/test`, and on its
 request touches `hack/rollback-roundtrip.sh` or the operator's A2A reconciliation). It runs with `EVAL_ROLLBACK_LANE=1`:
 the deploy brings the install up under `next`, `hack/rollback-roundtrip.sh` takes it to `today`,
 back to `next` and to `today` again before the matrix, and a rollback that fails reds the run.
+Every deploy installs the web console and gates it under `today` and `next` (a chat turn through
+it and its read routes), and the round trip repeats those checks after each flip.
 The matrix is the presubmit's, roster included, so a case graded only over the api transport is
 graded there, but the job does not block a merge.
 
