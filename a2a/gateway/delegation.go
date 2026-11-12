@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
@@ -20,6 +21,7 @@ const (
 	ruleDelegationSessionAuthor = "delegation.session-author"
 	ruleDelegationBusy          = "delegation.busy"
 	ruleDelegationDepth         = "delegation.depth"
+	ruleDelegationWidth         = "delegation.width"
 	ruleDelegationNoRequester   = "delegation.no-requester"
 	ruleDelegationStale         = "delegation.stale"
 	ruleDelegationMalformed     = "delegation.malformed"
@@ -83,11 +85,16 @@ const (
 	noticeDelegationSessionIncomplete = "⚠️ delegation refused: this session's authors can no longer all be checked; ask again in a new turn"
 	noticeDelegationSteerOverflow     = "⚠️ delegation refused: more people steered this turn than can be checked; ask again"
 	noticeWakeNoRequester             = "ℹ️ the delegated task finished, but the delegating turn's " + requesterGone + "; the session was not woken"
+	noticeDelegationTooWide           = "⚠️ delegation refused: %d tasks in one delegation, and this conversation may hand out at most %d; split them or pick the ones that matter"
 )
+
+// delegateAddresseeSep joins a batch's addressees in the audit lines.
+const delegateAddresseeSep = ","
 
 // handleDelegateRequest is the gateway's side of the delegation primitive: a
 // session turn's lib.ArtifactDelegate, accepted, checked, and minted as a
-// child task to the platform agent. Called from the relay under the session
+// child task to the platform agent or an AgentProfile, or as a batch of them
+// (mintBatch). Called from the relay under the session
 // lock with the record the relay writes back.
 //
 // The cases that cannot be a live request from the conversation's own session
@@ -100,13 +107,21 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 	parent, known := rec.TaskRefFor(taskID)
 	var req lib.DelegateRequest
 	parsed := len(parts) == 1 && parts[0].Kind == "data" && json.Unmarshal(parts[0].Data, &req) == nil
-	addressee := strings.TrimSpace(req.Addressee)
 
 	log := g.log.With("task", taskID, "session", session, "conversation", rec.Key)
 	// The addressee is the session's to write and nothing upstream bounds
 	// its length (only the text has a cap), so the audit lines carry it cut
-	// to delegateAddresseeLogCap: a valid one is a single short name.
-	logAddressee := truncateRunes(addressee, delegateAddresseeLogCap)
+	// to delegateAddresseeLogCap: a valid one is a single short name. A
+	// batch's are each cut, and joined, for at most lib.DelegateBatchMax
+	// entries: a longer batch is refused or ignored below.
+	var logNames []string
+	for i, e := range req.Entries() {
+		if i == lib.DelegateBatchMax {
+			break
+		}
+		logNames = append(logNames, truncateRunes(strings.TrimSpace(e.Addressee), delegateAddresseeLogCap))
+	}
+	logAddressee := strings.Join(logNames, delegateAddresseeSep)
 	log.Info("delegation requested", "addressee", logAddressee, "depth", parent.Depth)
 	// Every refusal and ignore line carries the rule, the backend and the
 	// requester as the record stores it: already hashed.
@@ -152,9 +167,10 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		ignore(ruleDelegationStale, "busSession", rec.BusSession)
 		return
 	}
-	// One child at a time, and a request is accepted once per
-	// task. A slice, so fan-out is one condition here later. Checked before
-	// the active task, so a repeat from the parent logs as what it is.
+	// A request is accepted once per task, whether it asked for one child
+	// or a batch: a parent with any child has had its request. Checked
+	// before the active task, so a repeat from the parent logs as what it
+	// is.
 	if len(parent.Children) > 0 {
 		ignore(ruleDelegationBusy, "child", parent.Children[len(parent.Children)-1])
 		return
@@ -174,12 +190,26 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		noChild(notStartedEnd(whyTurnStopped))
 		return
 	}
-	// The adapter holds the same cap and refuses blank text; a request that
-	// breaks either reached the bus some other way.
-	if !parsed || strings.TrimSpace(req.Text) == "" || len(req.Text) > lib.DelegateTextCap {
-		ignore(ruleDelegationMalformed, "textBytes", len(req.Text))
+	// A batch wider than this gateway's setting is refused whole, naming
+	// the cap, so the session can split it or choose. The adapter holds the
+	// width it was told, so this is a setting changed under a running turn,
+	// or a request from elsewhere.
+	if parsed && req.IsBatch() && len(req.Tasks) > g.cfg.DelegationWidthMax {
+		refuse(ruleDelegationWidth, fmt.Sprintf(noticeDelegationTooWide, len(req.Tasks), g.cfg.DelegationWidthMax), "tasks", len(req.Tasks))
+		return
+	}
+	// The adapter holds the same shape and cap and refuses blank text; a
+	// request that breaks any of them reached the bus some other way.
+	if !parsed || lib.ValidateDelegateRequest(req) != nil {
+		ignore(ruleDelegationMalformed, "textBytes", len(req.Text), "tasks", len(req.Tasks))
 		noChild(notStartedEnd(whyRequestMalformed))
 		return
+	}
+	// A batch of one is the single shape: the child takes the active slot,
+	// as it always has.
+	if len(req.Tasks) == 1 {
+		e := req.Tasks[0]
+		req = lib.DelegateRequest{Addressee: e.Addressee, Text: e.Text, Parameters: e.Parameters}
 	}
 
 	// One live child per conversation, whichever turn asked
@@ -197,84 +227,108 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		refuse(ruleDelegationNoRequester, noticeDelegationNoRequester)
 		return
 	}
-	// Anything but platform is an AgentProfile: resolved, its target checked
-	// against the scope, and minted at the parent's tier, which for a
-	// session parent is its requester's (profileRouteFor).
-	var route *profileRoute
-	// A profile task delegates only to another profile: a platform child is
-	// minted at the install's tier and scope, wider than the parent's.
-	if profileParent && addressee == targetPlatform {
-		refuse(ruleDelegationTarget, noticeDelegationRefusedFor+noticeProfileParentToPlatform)
-		return
-	}
-	if addressee == targetPlatform && len(req.Parameters) > 0 {
-		// Only a profile route carries parameters; platform's would be dropped.
-		refuse(ruleDelegationTarget, noticeDelegationRefusedFor+noticePlatformTakesNoParameters)
-		return
-	}
-	if addressee != targetPlatform {
-		tier := capability.Tier(parent.Tier)
-		if !profileParent {
-			if tier, err = requesterTier(*parent.Requester); err != nil {
+	// Each child the request asks for meets the same checks, all of them
+	// before any is minted, so one entry that fails refuses the request with
+	// nothing minted. check refuses (with the notice a single child would
+	// get) and reports false, or reports the entry's route: nil for
+	// platform.
+	check := func(e lib.DelegateTask) (*profileRoute, bool) {
+		// Anything but platform is an AgentProfile: resolved, its target checked
+		// against the scope, and minted at the parent's tier, which for a
+		// session parent is its requester's (profileRouteFor).
+		var route *profileRoute
+		var err error
+		addressee := strings.TrimSpace(e.Addressee)
+		// A profile task delegates only to another profile: a platform child is
+		// minted at the install's tier and scope, wider than the parent's.
+		if profileParent && addressee == targetPlatform {
+			refuse(ruleDelegationTarget, noticeDelegationRefusedFor+noticeProfileParentToPlatform)
+			return nil, false
+		}
+		if addressee == targetPlatform && len(e.Parameters) > 0 {
+			// Only a profile route carries parameters; platform's would be dropped.
+			refuse(ruleDelegationTarget, noticeDelegationRefusedFor+noticePlatformTakesNoParameters)
+			return nil, false
+		}
+		if addressee != targetPlatform {
+			tier := capability.Tier(parent.Tier)
+			if !profileParent {
+				if tier, err = requesterTier(*parent.Requester); err != nil {
+					refuse(ruleDelegationTarget, refusalNotice(noticeDelegationRefusedFor, err))
+					return nil, false
+				}
+			}
+			if route, err = g.profileRouteFor(addressee, e.Parameters, tier, lib.SubmitKindChild); err != nil {
 				refuse(ruleDelegationTarget, refusalNotice(noticeDelegationRefusedFor, err))
-				return
+				return nil, false
 			}
 		}
-		if route, err = g.profileRouteFor(addressee, req.Parameters, tier, lib.SubmitKindChild); err != nil {
-			refuse(ruleDelegationTarget, refusalNotice(noticeDelegationRefusedFor, err))
+		// The lists are the target's: the profile the address resolved to, so a
+		// list on a pinned profile can't be stepped round by addressing another.
+		target := addressee
+		if route != nil {
+			target = route.Profile
+		}
+		// The A2A door's callers delegate only under a list of their own,
+		// which nothing renders yet (gke-labs#2478): an absent list there is
+		// nobody, where on a chat backend it is everyone the ingress admits.
+		if g.doorUnlisted(target, parent.Requester.Backend) {
+			refuse(ruleDelegationDoorUnlisted, fmt.Sprintf(noticeDelegationNotAllowed, target))
+			return nil, false
+		}
+		if !g.targetAllows(target, parent.Requester.Backend, parent.Requester.Subject) {
+			refuse(ruleDelegationAllowedUsers, fmt.Sprintf(noticeDelegationNotAllowed, target))
+			return nil, false
+		}
+		// Anyone in the room can steer the turn, so everyone who did is checked
+		// as the requester is: otherwise an off-list human steers the session
+		// into delegating under the requester's name.
+		if parent.SteerAuthorsOverflow {
+			refuse(ruleDelegationSteerAuthor, noticeDelegationSteerOverflow, "steerAuthors", "over-cap")
+			return nil, false
+		}
+		for _, a := range parent.SteerAuthors {
+			if rule := g.authorRefusal(target, a, ruleDelegationSteerAuthor); rule != "" {
+				refuse(rule, fmt.Sprintf(noticeDelegationNotAllowed, target), "steerBackend", a.Backend, "steerAuthor", a.Subject)
+				return nil, false
+			}
+		}
+		// And everyone whose text reached this incarnation, on any turn: the
+		// pod keeps what it was told, so an off-list human's earlier turn can
+		// leave the instruction a later on-list turn delegates on. The check
+		// above pinned the parent to rec.BusSession, so the set is the parent's
+		// incarnation's.
+		sessionAuthors, sessionUnknown, _ := rec.sessionAuthorsOf()
+		if profileParent {
+			sessionAuthors, sessionUnknown = nil, false
+		}
+		if sessionUnknown {
+			refuse(ruleDelegationSessionAuthor, noticeDelegationSessionIncomplete, "sessionAuthors", "incomplete")
+			return nil, false
+		}
+		for _, a := range sessionAuthors {
+			if rule := g.authorRefusal(target, a, ruleDelegationSessionAuthor); rule != "" {
+				refuse(rule, fmt.Sprintf(noticeDelegationNotAllowed, target), "sessionBackend", a.Backend, "sessionAuthor", a.Subject)
+				return nil, false
+			}
+		}
+		return route, true
+	}
+	routes := make([]*profileRoute, 0, len(req.Entries()))
+	for _, e := range req.Entries() {
+		route, ok := check(e)
+		if !ok {
 			return
 		}
-	}
-	// The lists are the target's: the profile the address resolved to, so a
-	// list on a pinned profile can't be stepped round by addressing another.
-	target := addressee
-	if route != nil {
-		target = route.Profile
-	}
-	// The A2A door's callers delegate only under a list of their own,
-	// which nothing renders yet (gke-labs#2478): an absent list there is
-	// nobody, where on a chat backend it is everyone the ingress admits.
-	if g.doorUnlisted(target, parent.Requester.Backend) {
-		refuse(ruleDelegationDoorUnlisted, fmt.Sprintf(noticeDelegationNotAllowed, target))
-		return
-	}
-	if !g.targetAllows(target, parent.Requester.Backend, parent.Requester.Subject) {
-		refuse(ruleDelegationAllowedUsers, fmt.Sprintf(noticeDelegationNotAllowed, target))
-		return
-	}
-	// Anyone in the room can steer the turn, so everyone who did is checked
-	// as the requester is: otherwise an off-list human steers the session
-	// into delegating under the requester's name.
-	if parent.SteerAuthorsOverflow {
-		refuse(ruleDelegationSteerAuthor, noticeDelegationSteerOverflow, "steerAuthors", "over-cap")
-		return
-	}
-	for _, a := range parent.SteerAuthors {
-		if rule := g.authorRefusal(target, a, ruleDelegationSteerAuthor); rule != "" {
-			refuse(rule, fmt.Sprintf(noticeDelegationNotAllowed, target), "steerBackend", a.Backend, "steerAuthor", a.Subject)
-			return
-		}
-	}
-	// And everyone whose text reached this incarnation, on any turn: the
-	// pod keeps what it was told, so an off-list human's earlier turn can
-	// leave the instruction a later on-list turn delegates on. The check
-	// above pinned the parent to rec.BusSession, so the set is the parent's
-	// incarnation's.
-	sessionAuthors, sessionUnknown, _ := rec.sessionAuthorsOf()
-	if profileParent {
-		sessionAuthors, sessionUnknown = nil, false
-	}
-	if sessionUnknown {
-		refuse(ruleDelegationSessionAuthor, noticeDelegationSessionIncomplete, "sessionAuthors", "incomplete")
-		return
-	}
-	for _, a := range sessionAuthors {
-		if rule := g.authorRefusal(target, a, ruleDelegationSessionAuthor); rule != "" {
-			refuse(rule, fmt.Sprintf(noticeDelegationNotAllowed, target), "sessionBackend", a.Backend, "sessionAuthor", a.Subject)
-			return
-		}
+		routes = append(routes, route)
 	}
 	authority.Via = &AuthorityVia{TaskID: taskID, Session: session}
+	if len(routes) > 1 {
+		g.mintBatch(ctx, rec, taskID, parent, req.Tasks, routes, authority, noChild, log)
+		return
+	}
+	route := routes[0]
+	addressee := strings.TrimSpace(req.Addressee)
 
 	// The child is a fixed-route task: addressed to platform so steers and a
 	// stop reach it, with BusSession left in place for the wake turn.
@@ -321,6 +375,83 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		return
 	}
 	log.Info("delegation minted", "parent", taskID, "child", childID, "addressee", addressee)
+}
+
+// noticeBatchChildWithdrawn closes the line of a batch child that reached
+// the bus when a later one in its batch did not: the batch is withdrawn whole.
+const noticeBatchChildWithdrawn = "🛑 not run: another task in the same delegation could not be started"
+
+// mintBatch mints a checked batch of two or more children of taskID. Unlike a
+// single child, none takes the active slot or the record's addressee: the
+// parent keeps both, and each child carries its own addressee on its entry
+// (AddresseeFor) and its rolling line there too. Each is linked from the
+// parent in the record write that adds it. A mint that fails partway
+// withdraws the batch whole: each child already on the bus is sent a cancel
+// (and, for a profile task, its stop record), every child of the batch is
+// dropped from the record and the index, and the parent records that its
+// request minted no child, so the record is as it was before the request.
+func (g *Gateway) mintBatch(ctx context.Context, rec *SessionRecord, taskID string, parent TaskRef, tasks []lib.DelegateTask,
+	routes []*profileRoute, authority Authority, noChild func(string), log *slog.Logger) {
+	correlationID := rec.ActiveTask.CorrelationID
+	var minted []string
+	for i, e := range tasks {
+		addressee, lineNote := strings.TrimSpace(e.Addressee), delegatedLineNote
+		if routes[i] != nil {
+			addressee, lineNote = routes[i].Profile, fmt.Sprintf(delegatedProfileLineNote, routes[i].Profile)
+		}
+		childID, ok := g.startTaskWith(ctx, rec, taskStart{
+			Text:                 e.Text,
+			Requester:            *parent.Requester,
+			Authority:            authority,
+			CorrelationID:        correlationID,
+			Role:                 taskRoleChild,
+			ParentTaskID:         taskID,
+			Depth:                parent.Depth + 1,
+			LineNote:             lineNote,
+			Route:                routes[i],
+			SteerAuthors:         parent.SteerAuthors,
+			SteerAuthorsOverflow: parent.SteerAuthorsOverflow,
+			RootTaskID:           parent.rootID(),
+			LinkParent:           true,
+			Addressee:            addressee,
+			KeepActive:           true,
+		})
+		if !ok {
+			g.withdrawBatch(ctx, rec, taskID, minted, authority)
+			noChild(notStartedEnd(whyChildOffBus))
+			log.Warn("delegation batch withdrawn: a child could not be started", "parent", taskID, "minted", len(minted), "tasks", len(tasks))
+			return
+		}
+		minted = append(minted, childID)
+		log.Info("delegation minted", "parent", taskID, "child", childID, "addressee", addressee, "batch", len(tasks))
+	}
+}
+
+// withdrawBatch undoes the children of a batch that minted partway: each in
+// minted is on the bus, so it is sent a cancel (and its stop record, for a
+// profile task) and its line closed, and then every child of taskID is
+// dropped from the record (dropFailedChildren), which leaves the parent's
+// links empty and the record written.
+func (g *Gateway) withdrawBatch(ctx context.Context, rec *SessionRecord, taskID string, minted []string, authority Authority) {
+	for _, id := range minted {
+		ref, ok := rec.TaskRefFor(id)
+		if !ok {
+			continue
+		}
+		env, err := lib.NewCancelEnvelope(gatewayParty, id, rec.ContextID, ref.CorrelationID,
+			lib.WithTo(lib.Party{Session: ref.Addressee}),
+			lib.WithAuthority(authority.Render(ref.Capability)))
+		if err != nil {
+			g.log.Error("cancel envelope build failed for a withdrawn batch child", "taskId", id, "err", err)
+		} else if err := g.client.Publish(ctx, lib.TaskInSubject(ref.Addressee, id), env); err != nil {
+			g.log.Error("cancel publish failed for a withdrawn batch child", "taskId", id, "err", err)
+		}
+		g.publishDispatchStop(ctx, ref)
+		if ref.StatusMsgID != "" {
+			g.editLine(rec.Key, ref.StatusMsgID, noticeBatchChildWithdrawn, "")
+		}
+	}
+	g.dropFailedChildren(ctx, rec, taskID)
 }
 
 // delegateEvidence is what a reader of a task knows about a delegate request
@@ -702,10 +833,12 @@ func setParentLine(rec *SessionRecord, taskID, statusMsgID string) {
 	}
 }
 
-// dropFailedChildren removes the entry, the index and the parent's link of a
-// child of taskID whose submission never reached the bus. The parent had no
-// child on record before (the busy check), so any child entry naming it is
-// the failed one, and so is every link it holds.
+// dropFailedChildren removes the entry, the index and the parent's link of
+// each child of taskID from a request that did not mint whole: a single child
+// whose submission never reached the bus, or every child of a batch that
+// failed partway (withdrawBatch). The parent had no child on record before
+// (the busy check), so every child entry naming it is from that request, and
+// so is every link it holds.
 func (g *Gateway) dropFailedChildren(ctx context.Context, rec *SessionRecord, taskID string) {
 	kept := rec.Tasks[:0]
 	for _, ref := range rec.Tasks {

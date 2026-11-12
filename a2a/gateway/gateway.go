@@ -2987,6 +2987,16 @@ type taskStart struct {
 	// stored record holds the child without its parent's link (observedAs
 	// and chainLast read the link). Set for a child only.
 	LinkParent bool
+	// Addressee, when set, is where the task goes instead of rec.Addressee,
+	// which is left as it is: a batch child's (mintBatch). Empty for every
+	// other task, which goes to rec.Addressee.
+	Addressee string
+	// KeepActive mints the task beside the conversation's active task
+	// rather than in its place: rec.ActiveTask is left alone, and the
+	// task's rolling line is kept on its own entry (TaskRef.StatusMsgID),
+	// where the relay closes it on the task's terminal. Set for a batch
+	// child only.
+	KeepActive bool
 	// Route, when set, addresses the task to an AgentProfile: the grant is
 	// minted against the resolved profile at the requester's tier with the
 	// target in scope, and the submission goes on the profile's submission
@@ -3019,6 +3029,13 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 // or failed before that.
 func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts taskStart) (string, bool) {
 	taskID := "task-" + randHex(taskIDHexWidth)
+	// The task's addressee: the record's, unless the caller names its own
+	// and leaves the record's in place (a batch child).
+	addressee := rec.Addressee
+	if ts.Addressee != "" {
+		addressee = ts.Addressee
+	}
+	ownSession := rec.BusSession != "" && addressee == rec.BusSession
 	// correlationId is minted here and nowhere else — the originating user
 	// interaction (payload spec field rule). A turn opened on another
 	// turn's behalf carries that turn's instead.
@@ -3036,7 +3053,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		"backendMessageId", ts.MessageID,
 		"principal", ts.Principal,
 		"conversation", rec.Key,
-		"addressee", rec.Addressee)
+		"addressee", addressee)
 
 	// The root capability, minted before anything is published. The
 	// gateway allocates the taskId and the addressee in the same breath, so
@@ -3047,9 +3064,9 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	// A mint that fails refuses the turn. The alternative is a submission
 	// with no capability, which the executor refuses anyway, one round trip
 	// and a pod later, with the reason in a different component's log.
-	capRef, err := g.mintTaskCapability(ctx, taskID, rec.Addressee, ts.Route)
+	capRef, err := g.mintTaskCapability(ctx, taskID, addressee, ts.Route)
 	if err != nil {
-		g.log.Error("capability mint failed", "taskId", taskID, "addressee", rec.Addressee, "err", err)
+		g.log.Error("capability mint failed", "taskId", taskID, "addressee", addressee, "err", err)
 		// A profile task never goes without its grant, whatever the switch
 		// says: the grant carries the tier and the target the dispatcher
 		// admits it on.
@@ -3065,7 +3082,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		// executor with grants null. Loud: an install left here has the
 		// control switched off on both sides at once.
 		g.log.Warn("A2A_CAPABILITY_REQUIRED=false; sending this task with no capability",
-			"taskId", taskID, "addressee", rec.Addressee)
+			"taskId", taskID, "addressee", addressee)
 		capRef = nil
 	}
 
@@ -3074,7 +3091,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	// turn, so a reused pod sees profiles as they come and go.
 	// A wake runs without the tool, so it carries none.
 	var extra []lib.Part
-	if ts.Route == nil && ts.Role != taskRoleWake && rec.AddressedToOwnSession() {
+	if ts.Route == nil && ts.Role != taskRoleWake && ownSession {
 		authors, unknown, approximate := delegateAuthors(rec, ts.Requester)
 		if unknown && approximate {
 			// The record's people overflow the cap, but the pod's seeded set
@@ -3093,7 +3110,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		return "", false
 	}
 	env, err := lib.NewMessageEnvelope(gatewayParty, taskID, rec.ContextID, correlationID, payload,
-		lib.WithTo(lib.Party{Session: rec.Addressee}),
+		lib.WithTo(lib.Party{Session: addressee}),
 		lib.WithAuthority(ts.Authority.Render(capRef)))
 	if err != nil {
 		g.log.Error("envelope build failed", "err", err)
@@ -3131,17 +3148,19 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	// terminal edit finds the active task or a delegating parent, and after
 	// this write the task is neither. Its line closes here, as the record
 	// already counts the task (MarkCanceled), with no Stop control on it.
-	if old := rec.ActiveTask; old != nil && old.Detached && old.StatusMsgID != "" {
+	if old := rec.ActiveTask; !ts.KeepActive && old != nil && old.Detached && old.StatusMsgID != "" {
 		g.editLine(rec.Key, old.StatusMsgID, withLineNote(terminalLine(lib.StateCanceled, ""), old.LineNote), "")
 	}
 	// Register the task everywhere the relay looks BEFORE publishing: a fast
 	// executor's submitted event must never race the mapping, because the
 	// relay acks what it cannot route and the durable won't redeliver it.
-	rec.ActiveTask = &ActiveTask{TaskID: taskID, CorrelationID: correlationID, StatusMsgID: statusMsgID,
-		Ask: truncateRunes(ts.Text, askCap), SubmittedAt: time.Now(), Capability: capRef, LineNote: ts.LineNote}
+	if !ts.KeepActive {
+		rec.ActiveTask = &ActiveTask{TaskID: taskID, CorrelationID: correlationID, StatusMsgID: statusMsgID,
+			Ask: truncateRunes(ts.Text, askCap), SubmittedAt: time.Now(), Capability: capRef, LineNote: ts.LineNote}
+	}
 	requester := ts.Requester
 	ref := TaskRef{
-		ID: taskID, Addressee: rec.Addressee, CorrelationID: correlationID, Capability: capRef,
+		ID: taskID, Addressee: addressee, CorrelationID: correlationID, Capability: capRef,
 		Requester:    &requester,
 		Attribution:  ts.Authority.Attribution(),
 		StartedAt:    time.Now().UTC(),
@@ -3153,6 +3172,9 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	}
 	if ref.RootTaskID == "" {
 		ref.RootTaskID = taskID
+	}
+	if ts.KeepActive {
+		ref.StatusMsgID = statusMsgID
 	}
 	if ts.Role == "" {
 		ref.Request = capAsk(strings.TrimSpace(ts.Text))
@@ -3180,7 +3202,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	}
 	// Text published to the conversation's own incarnation joins its author
 	// set; a child to platform does not reach the incarnation.
-	if rec.AddressedToOwnSession() {
+	if ownSession {
 		rec.addTurnToSession(requester, ref.SteerAuthors, ref.SteerAuthorsOverflow)
 	}
 	rec.LastTaskActivity = time.Now().UTC()
@@ -3204,7 +3226,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	// per-subject cap, and past that cap a worker scanning the subject
 	// cannot tell the evicted submission's replacement from the real thing
 	// (lib.EnvOriginSeq).
-	originSeq, err := g.client.PublishSeq(ctx, submissionSubject(rec.Addressee, taskID, ts.Route), env)
+	originSeq, err := g.client.PublishSeq(ctx, submissionSubject(addressee, taskID, ts.Route), env)
 	if err != nil {
 		g.log.Error("task publish failed", "taskId", taskID, "err", err)
 		if statusMsgID != "" {
@@ -3214,7 +3236,9 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 			// went nowhere.
 			g.post(rec.Key, noticeBusUnreachable)
 		}
-		rec.ActiveTask = nil
+		if !ts.KeepActive {
+			rec.ActiveTask = nil
+		}
 		g.mu.Lock()
 		delete(g.taskSessions, taskID)
 		delete(g.relays, taskID)
@@ -3230,7 +3254,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 		// what the chain's root is owed (handleDelegateRequest leaves the
 		// parent to end as itself, wakeSession ends the root). Every task
 		// is logged, though: each wrote its ingress line above.
-		g.logTaskTerminal(rec, rec.Addressee, taskID, lib.StateFailed, TerminalFromGateway, "")
+		g.logTaskTerminal(rec, addressee, taskID, lib.StateFailed, TerminalFromGateway, "")
 		if ts.Role == "" {
 			g.observeTaskTerminal(rec, taskID, lib.StateFailed, TerminalFromGateway, "")
 		}
@@ -3257,7 +3281,7 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	// have one before the pod is created. The spec's ordering rule ("the pod
 	// exists because the message is already durable") is now load-bearing
 	// rather than an optimisation.
-	if g.spawner != nil && rec.BusSession != "" && rec.Addressee == rec.BusSession {
+	if g.spawner != nil && ownSession {
 		g.ensureSessionPod(ctx, rec, taskID, originSeq)
 	}
 	return taskID, true
