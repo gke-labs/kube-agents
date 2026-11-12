@@ -873,7 +873,7 @@ def test_in_an_exclusive_window_a_bare_branch_nothing_names_is_charged_once_list
     Without ``contents: read`` the refs listing is refused (the default
     route), the branch is never seen, and the check finds no write at all:
     the repetition passes its safeguard with a stray push in place."""
-    stash()
+    stash(calls=[])
     route_listing(github, "pulls-empty.json")
     if listable:
         route_branches(github)
