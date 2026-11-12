@@ -84,7 +84,7 @@ exit code, or roster id used as a name (`cluster-foo` where "the foo cluster age
 identifier the user can act on — a cluster, a workload, a pull request as a link — is content, not
 plumbing, and so is a specialist's name where `SOUL.md` asks for attribution. A board read is the
 exception for ids: [`agents/chat/SOUL.md`](../../agents/chat/SOUL.md) §1.5 gives each card a short
-task id, because the user asked about the board and may name a card back. In the evidence section
+task id, because the user asked about their tasks and may name a card back. In the evidence section
 `kanban_complete` adds to a card's `result` from `verified_claims`, each claim's command and output
 excerpt, in their fences, are content: evidence the reader can check and run again, which
 [`agents/platform/SOUL.md`](../../agents/platform/SOUL.md) §0 and
@@ -98,6 +98,8 @@ Today: [`agents/chat/SOUL.md`](../../agents/chat/SOUL.md) §1 ("Don't re-say wha
 says", "Handle pure conversation yourself") and §2 steps 4 and 5. In code,
 `deploy/docker/patches/slack_boilerplate.py` strips Hermes' cron wrapper and its job id from Slack,
 and `busyNotice*` in `a2a/gateway/busy.go` is worded without a task id.
+[`agents/chat/SOUL.md`](../../agents/chat/SOUL.md) §2 ("The thread carries attribution") keeps the card id
+out of an answer the Planning Agent draws from a card that already finished: it says what was found and when. The hermes bridge's API executor asks a reply that names an id where the user asked about no task to restate itself once (`leaksCardID` in `a2a/hermes-bridge/card_id_leak.go`), since the SOUL's rule did not hold in a thread whose earlier replies carried one.
 [`agents/cluster/SOUL.md`](../../agents/cluster/SOUL.md) §6 ("Absent is an answer when presence was the
 question") keeps the command out of a one-line presence finding and sends it to `verified_claims`.
 The evidence section is rendered by `deploy/docker/patches/kanban_verified_claims.py`, which checks

@@ -1440,6 +1440,7 @@ SHELL_KUBECTL_REFUSAL_HINT = (
 )
 RULE_CALLER_KUBECTL_FLAG = "caller.kubectl-flag"
 RULE_CALLER_VCS_VERB = "caller.vcs-verb-role"
+RULE_VCS_WRITE_MODE = "vcs.write-mode"
 RULE_GIT_ARGUMENT_REFUSED = "git.argument.refused"
 RULE_GIT_WORKSPACE_LEASE = "git.workspace.lease"
 RULE_SCOPED_SA_UNMAPPED_SCOPE = "gcp.scoped-sa.unmapped-scope"
@@ -15475,6 +15476,32 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                 },
             )
             return TOOL_STATUS_BLOCKED
+        # The install's write mode (`vcs_broker.write_mode`), here for the same
+        # reason as the role check: ahead of anything that spends, and in the
+        # one process that can push. At `none` a branch or proposal write is
+        # refused whoever asks. The refusal states the fact and instructs
+        # nothing: what the agent says instead is the dial eval's to decide.
+        if verb in vcs_broker.PROPOSE_VERBS:
+            mode, raw = vcs_broker.write_mode()
+            if mode == vcs_broker.WRITE_MODE_NONE:
+                LOGGER.warning(
+                    "vcs verb refused by the write mode verb=%s rule=%s",
+                    _sanitize_for_logging(verb),
+                    RULE_VCS_WRITE_MODE,
+                )
+                refusal = {
+                    "status": "blocked",
+                    "error": (
+                        "this install is explain-only (writeMode: none): kube-agents does not push "
+                        "branches or open, update or comment on pull requests here."
+                    ),
+                    "code": "WRITE_MODE_NONE",
+                    "rule": RULE_VCS_WRITE_MODE,
+                }
+                if detail := vcs_broker.write_mode_detail(raw):
+                    refusal["detail"] = detail
+                self._json(HTTPStatus.FORBIDDEN, refusal)
+                return TOOL_STATUS_BLOCKED
         if self.vcs is None:
             self._json(
                 HTTPStatus.NOT_FOUND,
