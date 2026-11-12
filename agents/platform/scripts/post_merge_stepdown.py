@@ -23,7 +23,9 @@ Safe to run again: the branches are named after the fix's number, an existing
 pull request on either is reused, and the comment is written once, found again
 by `MARKER`.
 
-The reference page is `docs/site/src/content/docs/reference/automation-rules.md`.
+Nothing calls this yet. The reference page
+(`docs/site/src/content/docs/reference/automation-rules.md`) gains a section
+when the post-merge driver wires the call.
 """
 
 from __future__ import annotations
