@@ -563,6 +563,9 @@ ISSUE_BODY_MAX_CHARS = 65536
 # path keeps CONVERSATION_ATTEMPTS_FILE): the two must not share a count, or
 # five refused creates would stop the thread delivery a human binds later.
 REPORT_ATTEMPTS_FILE = ".bootstrap_report_attempts.json"
+# Set in that record once the lookup at the attempt cap found no issue, so the
+# listing is not repeated every tick until the retire; ``_cleanup`` drops it.
+REPORT_CAP_LOOKUP_DONE = "cap_lookup_done"
 # The one line that goes to the home channel once the issue is up: a link, so a
 # reader opens the report from the message (chat_ux.md, no plumbing in user
 # text), and the user's own fact rather than the stage's. ``a2a notify`` exits
@@ -701,6 +704,10 @@ def _record_attempt(data_dir: Path, reason: str, counted: bool, name: str = CONV
         record[ATTEMPTS_AT] = time.time()
     if counted and count >= CONVERSATION_MAX_ATTEMPTS:
         _stage_note(data_dir, f"the report was not posted after {count} attempts and now waits: {reason}")
+    _write_attempts(data_dir, record, name)
+
+
+def _write_attempts(data_dir: Path, record: dict, name: str) -> None:
     target = data_dir / name
     tmp = target.with_name(target.name + ".tmp")
     try:
@@ -1238,11 +1245,15 @@ def _cleanup(data_dir: Path, in_sandbox: bool, shown: bool = False) -> None:
     run where the report is, treat a present ``INVENTORY.md`` as "already done",
     so leaving it in place would make a later, deliberate re-run of onboarding a
     no-op. ``shown`` sets the shown file aside beside it, so a later report
-    whose worker never ran ``select`` is not marked with this one's items.
+    whose worker never ran ``select`` is not marked with this one's items. The
+    no-human path's lookup flag goes with the report it held.
     """
     _archive(data_dir, in_sandbox)
     if shown:
         _archive(data_dir, in_sandbox, SHOWN_NAME, DELIVERED_SHOWN_NAME)
+    record = _read_attempts(data_dir, REPORT_ATTEMPTS_FILE)
+    if record.pop(REPORT_CAP_LOOKUP_DONE, None) is not None:
+        _write_attempts(data_dir, record, REPORT_ATTEMPTS_FILE)
 
 
 def _retire_jobs() -> None:
@@ -2243,10 +2254,13 @@ def _retire_undelivered(data_dir: Path, in_sandbox: bool) -> int:
 def _record_issue_left_open(data_dir: Path, in_sandbox: bool, sweep: str, record: dict, now: float) -> int:
     """At the attempt cap: find the issue a create-then-fail may have opened, and settle on it.
 
-    One lookup per retry wait (the last wait in the table), so a repository that keeps refusing
-    is not listed every tick. A hit is recorded as filed, the report set aside and the home
-    line sent, as a clean filing would have done; a miss changes nothing.
+    One lookup, after the last retry wait in the table. A hit is recorded as filed, the report
+    set aside and the home line sent, as a clean filing would have done; a miss is flagged in the
+    record and ends the lookups; a refused listing is recorded with its time, so the next one
+    waits out the last retry wait again rather than running every tick.
     """
+    if record.get(REPORT_CAP_LOOKUP_DONE):
+        return 0
     try:
         last = float(record.get(ATTEMPTS_AT))
     except (TypeError, ValueError):
@@ -2262,10 +2276,14 @@ def _record_issue_left_open(data_dir: Path, in_sandbox: bool, sweep: str, record
     try:
         found = _existing_report_issue(repo, sweep)
     except forge.ForgeError as e:
-        _record_attempt(data_dir, f"issue-list on {repo} refused: {e.reason}: {e.value}", counted=False, name=REPORT_ATTEMPTS_FILE)
+        reason = f"issue-list on {repo} refused: {e.reason}: {e.value}"
+        sys.stderr.write(f"bootstrap_delivery: {reason}\n")
+        _write_attempts(data_dir, {**record, ATTEMPTS_REASON: reason, ATTEMPTS_AT: now}, REPORT_ATTEMPTS_FILE)
         return 0
     if found is None:
-        _record_attempt(data_dir, REPORT_NO_ISSUE_AT_CAP_REASON.format(repo=repo), counted=False, name=REPORT_ATTEMPTS_FILE)
+        reason = REPORT_NO_ISSUE_AT_CAP_REASON.format(repo=repo)
+        sys.stderr.write(f"bootstrap_delivery: {reason}\n")
+        _write_attempts(data_dir, {**record, ATTEMPTS_REASON: reason, REPORT_CAP_LOOKUP_DONE: True}, REPORT_ATTEMPTS_FILE)
         return 0
     if not _claim_for_this_path(data_dir):
         return 0
@@ -2296,7 +2314,7 @@ def _file_without_thread(data_dir: Path, in_sandbox: bool, sweep: str, filed_at:
     count = _attempt_count(record)
     if count >= CONVERSATION_MAX_ATTEMPTS:
         # Past the last try. A create that opened the issue and then failed (a timeout after the
-        # write) left it open and unrecorded, so each retry wait still gets one lookup for it.
+        # write) left it open and unrecorded, so one lookup follows the last retry wait.
         return _record_issue_left_open(data_dir, in_sandbox, sweep, record, now)
     if count:
         try:
