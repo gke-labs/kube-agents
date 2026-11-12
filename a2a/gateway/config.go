@@ -27,6 +27,16 @@ const attributionSaltInfo = "a2a-attribution-salt"
 // keying in principal.go sees the same shape it always did.
 const attributionSaltLen = 32
 
+// The mux keys and conversation prefixes, exported for cmd/gateway, which
+// builds one adapter per backend: Backends returns the first three, and the
+// console is the essential backend beside them.
+const (
+	BackendGchat   = gchatBackend
+	BackendSlack   = slackBackend
+	BackendDiscord = discordBackend
+	BackendConsole = consoleBackend
+)
+
 // defaultMaxSessions is what MaxSessions means when unset; the field's
 // comment carries the sizing rationale.
 const defaultMaxSessions = 10
@@ -190,10 +200,12 @@ type Config struct {
 	// SlackBotToken and SlackAppToken arm the Slack backend: Socket Mode
 	// needs both (xoxb- drives the Web API, xapp- the outbound websocket —
 	// no inbound endpoint, nothing to expose). Slack may run beside the
-	// other backends in one gateway process: each backend is its own
-	// transport, and only Chat reads the relay durable
-	// (Options.RelayDurable), which the election gives one leader per
-	// Deployment.
+	// other backends in one gateway process. Each backend is its own
+	// transport (Chat a Pub/Sub pull through the broker, Slack a Socket
+	// Mode connection, Discord its gateway websocket) and none shares a
+	// durable with another. The task-event relay durable
+	// (Options.RelayDurable) is the process's own, bound once per process,
+	// and the election keeps one leader per Deployment.
 	SlackBotToken string
 	SlackAppToken string
 
@@ -676,8 +688,9 @@ type Config struct {
 }
 
 // Backends lists every REAL chat backend this config arms, in the fixed
-// order gchat, slack, discord, or nil when none is armed. The doors are not
-// among the answers, for the reason Backend gives.
+// order gchat, slack, discord (BackendGchat, BackendSlack, BackendDiscord),
+// or nil when none is armed. The doors are not among the answers, for the
+// reason Backend gives.
 func (c *Config) Backends() []string {
 	var backends []string
 	if c.GchatRelayURL != "" {
@@ -694,32 +707,26 @@ func (c *Config) Backends() []string {
 
 // Backend names the first REAL chat backend of Backends: "gchat", "slack",
 // "discord", or "" when a side door (inject, A2A, or both) or the console
-// door alone is the only way in. It stays for the authority default and the
-// boot line.
+// door alone is the only way in. It is the authority default; the door
+// default (inject, a2a or console) is chosen in New, not here.
 //
 // The doors are deliberately not among the answers. Either can be armed
 // beside any backend, so "which backend is this gateway" and "is a door
 // open" are two questions, and collapsing them is what would make a door
 // exclusive again.
 func (c *Config) Backend() string {
-	switch {
-	case c.GchatRelayURL != "":
-		return gchatBackend
-	case c.SlackBotToken != "":
-		return slackBackend
-	case c.DiscordToken != "":
-		return discordBackend
-	case c.InjectListen != "" || c.A2ADoorListen != "" || c.ConsoleDoor:
+	if backends := c.Backends(); len(backends) > 0 {
+		return backends[0]
+	}
+	if c.InjectListen != "" || c.A2ADoorListen != "" || c.ConsoleDoor {
 		// No real backend: a door is the whole of the ingress, and the
 		// attribution on a message that comes through it is the door's own.
 		return ""
-	default:
-		// A hand-built Config with nothing armed at all. FromEnv refuses
-		// this; a test that builds a Config directly gets the historical
-		// default rather than an empty backend string in its authority
-		// blocks.
-		return discordBackend
 	}
+	// A hand-built Config with nothing armed at all. FromEnv refuses this;
+	// a test that builds a Config directly gets the historical default
+	// rather than an empty backend string in its authority blocks.
+	return discordBackend
 }
 
 // InjectArmed reports whether the side door is open.
@@ -857,10 +864,11 @@ func FromEnv() (*Config, error) {
 		return nil, fmt.Errorf("SLACK_BOT_TOKEN and SLACK_APP_TOKEN arm Slack together; only one is set")
 	}
 	// The gateway runs every REAL backend whose credential is set. Several
-	// in one process share no transport: each backend is its own
-	// connection, and the Chat relay durable is the gateway's alone, with
-	// the election keeping one leader per Deployment, so no delivery is
-	// split. What the guard still refuses is half a Slack pair (above) and
+	// in one process split nothing: each backend is its own transport (Chat
+	// a Pub/Sub pull through the broker, Slack a Socket Mode connection,
+	// Discord its gateway websocket) and none shares a durable with another.
+	// The task-event relay durable is the gateway process's own, bound once
+	// per process, and the election keeps one leader per Deployment. What the guard still refuses is half a Slack pair (above) and
 	// no ingress at all (below).
 	//
 	// The doors (inject, A2A) are NOT among Backends, decided 2026-09-17 on

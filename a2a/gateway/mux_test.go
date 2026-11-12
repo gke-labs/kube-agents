@@ -316,24 +316,50 @@ func TestMultiAdapterStampsTheBackendOnInbound(t *testing.T) {
 	}
 }
 
+// namedDMAdapter answers OpenDirect with its own name and the id it was
+// handed, so a test sees which backend a direct message reached and with
+// which id.
+type namedDMAdapter struct {
+	*fakeAdapter
+	name string
+}
+
+func (a namedDMAdapter) OpenDirect(userID string) (string, error) {
+	return a.name + ":dm:" + userID, nil
+}
+
 func TestMultiAdapterOpenDirectResolvesPerBackend(t *testing.T) {
-	s, g, c := newFakeAdapter(), newFakeAdapter(), newFakeAdapter()
+	s := namedDMAdapter{newFakeAdapter(), "slack"}
+	g, c := newFakeAdapter(), newFakeAdapter()
 	m, err := NewMultiAdapter("", "console", map[string]Adapter{"slack": s, "gchat": g, "console": c}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.OpenDirect("slack:U1"); err != nil {
-		t.Errorf("prefixed id refused: %v", err)
+	if got, err := m.OpenDirect("slack:U1"); err != nil || got != "slack:dm:U1" {
+		t.Errorf("prefixed id: got %q, %v; want slack:dm:U1", got, err)
+	}
+	// A Slack guest id from another workspace carries the separator itself;
+	// the prefix in front of it still picks the backend.
+	if got, err := m.OpenDirect("slack:T1:U1"); err != nil || got != "slack:dm:T1:U1" {
+		t.Errorf("prefixed guest id: got %q, %v; want slack:dm:T1:U1", got, err)
 	}
 	if _, err := m.OpenDirect("U1"); err == nil {
 		t.Error("a bare id with two real backends was accepted")
 	}
+	if _, err := m.OpenDirect("T1:U1"); err == nil || !strings.Contains(err.Error(), "T1") {
+		t.Errorf("bare guest id with two real backends: err = %v, want one naming T1", err)
+	}
 	if _, err := m.OpenDirect("nosuch:U1"); err == nil || !strings.Contains(err.Error(), "nosuch") {
 		t.Errorf("unknown prefix: err = %v, want one naming nosuch", err)
 	}
-	one := newTestMux(t, map[string]Adapter{"discord": newFakeAdapter(), "console": c})
-	if _, err := one.OpenDirect("1001"); err != nil {
-		t.Errorf("bare id with one real backend: %v", err)
+	d := namedDMAdapter{newFakeAdapter(), "discord"}
+	one := newTestMux(t, map[string]Adapter{"discord": d, "console": c})
+	if got, err := one.OpenDirect("1001"); err != nil || got != "discord:dm:1001" {
+		t.Errorf("bare id with one real backend: got %q, %v; want discord:dm:1001", got, err)
+	}
+	// One real backend takes any id it understands, a colon in it or not.
+	if got, err := one.OpenDirect("T1:U1"); err != nil || got != "discord:dm:T1:U1" {
+		t.Errorf("bare guest id with one real backend: got %q, %v; want discord:dm:T1:U1", got, err)
 	}
 }
 

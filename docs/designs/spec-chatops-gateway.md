@@ -2371,9 +2371,11 @@ three suggested prompts. `agent_session_stopped` is the Stop button, above.
 
 **Every armed backend in one gateway process.** Config lists the armed backends
 (`Backends()`: gchat, slack and discord, in that order) and refuses only half a Slack
-pair or no ingress at all. The backends share no transport: each is its own connection,
-the Chat relay durable belongs to the process, and the election keeps one leader per
-Deployment, so two backends split no deliveries. The mux stamps each inbound message
+pair or no ingress at all. Several backends in one process split nothing. Each backend is
+its own transport: Chat a Pub/Sub pull through the broker, Slack a Socket Mode connection,
+Discord its gateway websocket. None shares a durable with another. The task-event relay
+durable is the gateway process's own, bound once per process, and the election keeps one
+leader per Deployment. The mux stamps each inbound message
 with the backend that delivered it, and a direct message names its backend as
 `<backend>:<id>`. The console stays the essential backend: when it stops, the process
 restarts, while a chat backend that stops is run again after a backoff and the rest
@@ -2792,13 +2794,15 @@ arriving on a Discord conversation is an unmapped id and drops. One shared princ
 posture until the account split gives each person a credential, at which point the entry
 becomes one inbound subject per principal and nothing else here changes.
 
-**Backend per message.** One gateway process runs its configured chat backend and the console
+**Backend per message.** One gateway process runs every armed chat backend and the console
 together, through a mux that dispatches `post`/`edit`/`roster` on the conversation prefix.
-The console adapter stamps its own backend on every message it delivers, the way the inject
-door does, so `authority.requester.backend`, the drop notice and verification name the console
-rather than the configured backend. Where there is no message to ask (the relay holding a
-session record), the `console:` prefix answers the same question. `openDirect` takes a bare
-user id and goes to the configured backend. With no real backend, as on an inject-only eval
+The mux stamps every inbound message that names no backend with the key of the adapter that
+delivered it, console and chat backends alike, and the inject door stamps its own beside the
+mux. So `authority.requester.backend`, the drop notice and verification name the backend the
+message came in on. Where there is no message to ask (the relay holding a session record), the
+conversation prefix answers the same question. `openDirect` takes a user id as
+`<backend>:<id>` and goes to that backend with the bare id. A bare id goes to the only real
+backend when exactly one is armed, and is refused otherwise. With no real backend, as on an inject-only eval
 install, the console is the only chat backend and runs without a mux. With no backend and no
 door, `A2A_CONSOLE_DOOR=true` lets the gateway start on the console alone; the operator renders
 it on every next gateway (2026-10-22), so every `mode: next` install runs one.
@@ -2811,12 +2815,12 @@ the backend that owns the conversation, since the Slack adapter learns its sessi
 from them. The console runs whenever the gateway runs, so an inject-only gateway also exits when the console
 adapter does.
 
-**The console outlives the chat backend.** The console is the way in when chat is broken, so
-the two do not share a fate. When the console adapter stops, the gateway exits and restarts.
-When the chat backend stops (a bad or revoked Discord or Slack token, a Socket Mode give-up),
-the mux logs `chat backend stopped` at error with the backend in a `backend` field, and runs
-that backend again after a delay that doubles from one second to a one-minute cap, while the
-console keeps serving. A run that lasted at least the cap starts the doubling over. A backend
+**The console outlives each chat backend.** The console is the way in when chat is broken, so
+the console and the chat backends do not share a fate. When the console adapter stops, the
+gateway exits and restarts. When a chat backend stops (a bad or revoked Discord or Slack token,
+a Socket Mode give-up), the mux logs `chat backend stopped` at error with the backend in a
+`backend` field, and runs that backend again after a delay that doubles from one second to a
+one-minute cap, while the console and the other chat backends keep serving. A run that lasted at least the cap starts the doubling over. A backend
 that returns without an error while the gateway is still running has stopped all the same and is
 handled the same way. Google Chat never takes this path, since its adapter retries pulls itself.
 A dead chat backend therefore shows as that log line on a Running pod, not as a restart.

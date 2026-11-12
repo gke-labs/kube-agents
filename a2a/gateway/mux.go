@@ -34,9 +34,9 @@ var errNoPrimaryBackend = errors.New("multi adapter: a direct message needs a ba
 // Conversation ids are backend-qualified by convention (discord:…, gchat:…,
 // console:…), so every per-conversation operation dispatches on the prefix.
 // OpenDirect takes a backend-qualified user id (slack:U1) and goes to that
-// backend with the bare id. A bare id goes to the primary backend, the one
-// real backend when the process runs only one, and is refused when there is
-// no primary. Run stamps every inbound message that names no backend with
+// backend with the bare id. Any other id goes whole to the primary backend,
+// the one real backend when the process runs only one, and is refused when
+// there is no primary. Run stamps every inbound message that names no backend with
 // the key of the backend that delivered it.
 //
 // One backend is essential: when it stops, Run returns and the process
@@ -227,20 +227,23 @@ func (m *MultiAdapter) Roster(conversation string) ([]string, bool, error) {
 }
 
 // OpenDirect opens a direct message with a backend-qualified user id
-// (<backend>:<id>) on that backend. A caller must always qualify the id: a
-// Slack guest id from another workspace is itself T…:U… and contains the
-// separator, so only the backend prefix in front of it is unambiguous. A
-// bare id works only on a mux with a single real backend, and only for an
-// id with no colon in it. An unknown prefix is refused.
+// (<backend>:<id>) on that backend, with the bare id. On a mux with several
+// real backends a caller must qualify the id: a bare id, or one whose prefix
+// names no backend the mux runs, is refused. A mux with a single real backend
+// takes any id that backend understands: an id whose prefix names no backend
+// (a Slack guest id from another workspace is itself T…:U…) goes whole to
+// the primary, as a bare id does.
 func (m *MultiAdapter) OpenDirect(userID string) (string, error) {
-	if backend, id, ok := strings.Cut(userID, ":"); ok {
-		a, known := m.byPrefix[backend]
-		if !known {
-			return "", fmt.Errorf(muxUnknownBackendFormat, backend)
+	backend, id, qualified := strings.Cut(userID, ":")
+	if qualified {
+		if a, known := m.byPrefix[backend]; known {
+			return a.OpenDirect(id)
 		}
-		return a.OpenDirect(id)
 	}
 	if m.primary == "" {
+		if qualified {
+			return "", fmt.Errorf(muxUnknownBackendFormat, backend)
+		}
 		return "", errNoPrimaryBackend
 	}
 	return m.byPrefix[m.primary].OpenDirect(userID)

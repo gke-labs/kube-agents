@@ -39,13 +39,6 @@ const (
 	// metricsUnavailableAlert is the one line a metrics listener that could
 	// not start leaves, whichever step refused it.
 	metricsUnavailableAlert = "ALERT metrics listener unavailable; the gateway serves no /metrics and no /readyz until it restarts, so the pod never reads Ready and the PlatformAgent stays Provisioning; conversations are unaffected"
-
-	// The mux keys, as Config.Backends() and the conversation prefixes spell
-	// them.
-	gchatBackendName   = "gchat"
-	slackBackendName   = "slack"
-	discordBackendName = "discord"
-	consoleBackendName = "console"
 )
 
 func main() {
@@ -97,7 +90,7 @@ func buildAdaptersWith(backends map[string]gateway.Adapter, console *gateway.Con
 	if len(backends) == 0 {
 		return console, nil
 	}
-	all := map[string]gateway.Adapter{consoleBackendName: console}
+	all := map[string]gateway.Adapter{gateway.BackendConsole: console}
 	primary := ""
 	for name, a := range backends {
 		all[name] = a
@@ -105,7 +98,7 @@ func buildAdaptersWith(backends map[string]gateway.Adapter, console *gateway.Con
 			primary = name
 		}
 	}
-	return gateway.NewMultiAdapter(primary, consoleBackendName, all, log)
+	return gateway.NewMultiAdapter(primary, gateway.BackendConsole, all, log)
 }
 
 // buildBackendAdapters builds one adapter per backend in cfg.Backends(),
@@ -114,14 +107,14 @@ func buildBackendAdapters(cfg *gateway.Config, metrics *gateway.Metrics, log *sl
 	adapters := map[string]gateway.Adapter{}
 	for _, backend := range cfg.Backends() {
 		switch backend {
-		case gchatBackendName:
+		case gateway.BackendGchat:
 			chat, err := gateway.NewGoogleChatAdapter(cfg.GchatRelayURL, cfg.GchatTokenPath, log)
 			if err != nil {
 				return nil, fmt.Errorf("%s: %w", backend, err)
 			}
 			chat.SetMetrics(metrics)
 			adapters[backend] = chat
-		case slackBackendName:
+		case gateway.BackendSlack:
 			sl, err := gateway.NewSlackAdapter(cfg.SlackBotToken, cfg.SlackAppToken, log)
 			if err != nil {
 				return nil, fmt.Errorf("%s: %w", backend, err)
@@ -133,7 +126,7 @@ func buildBackendAdapters(cfg *gateway.Config, metrics *gateway.Metrics, log *sl
 			// allowlist still decides who is served.
 			sl.SetTestUsers(cfg.SlackTestUsers)
 			adapters[backend] = sl
-		case discordBackendName:
+		case gateway.BackendDiscord:
 			dc, err := gateway.NewDiscordAdapter(cfg.DiscordToken, log)
 			if err != nil {
 				return nil, fmt.Errorf("%s: %w", backend, err)
@@ -203,7 +196,8 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 
 	// FromEnv already enforced that the door carries a token if it is armed
 	// at all. Every armed real backend runs; cfg.Backend() is the first of
-	// them, or the door default, and stays the gateway's authority default.
+	// them, or "" when only a door is armed (gateway.New then picks the door
+	// default), and stays the gateway's authority default.
 	backend := cfg.Backend()
 	// One set of counters for the whole process: the gateway counts what it
 	// relays, the Chat adapter counts its pulls, the Slack adapter reports its
@@ -288,7 +282,7 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 			// line reads it, and nothing writes it after. Only the Slack
 			// route learns its home; armHomeLearn returns early for the rest.
 			if notifier.Backend() == lib.NotifyPlatformSlack {
-				armHomeLearn(cfg, backendAdapters[slackBackendName], notifier, log)
+				armHomeLearn(cfg, backendAdapters[gateway.BackendSlack], notifier, log)
 			}
 			defer runNotifier(ctx, notifier, client)()
 		}
