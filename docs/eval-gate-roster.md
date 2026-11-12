@@ -793,6 +793,11 @@ back to `next` and to `today` again before the matrix, and a rollback that fails
 The matrix is the presubmit's, roster included, so a case graded only over the api transport is
 graded there, but the job does not block a merge.
 
+Every lane's deploy installs the web console and gates it (its read routes and a chat turn through
+it): under `today` on every deploy, and under `next` as well on a deploy that runs with
+`EVAL_MODE_NEXT=1`; the round trip repeats the same checks before its first flip and after each
+leg, and skips them on an install that has no console.
+
 A check the transport blinds is the scorer's business. The harness reads no card ids, no worker's
 entries and no results off the door's trace. The delegation wait now reads the cards and the workers from the pod
 when the turn ran under the bridge's `api` executor and puts the workers' calls on the record, so the
@@ -810,7 +815,8 @@ evaluated, outside the pass rate, never weather
 transport cannot show"). No roster edit is involved. The half of the rule for a router-scope
 `tool_called` without a `result` pattern retires on a record whose door showed the whole trace (the transport's `a2a.activity` marker,
 reporting no loss), whether or not the run made a call. The worker half retires on a record that
-carries the workers' tagged entries and no `harness_worker_capture_gaps` entry (#5236).
+carries the workers' tagged entries and no `harness_worker_capture_gaps` entry (#5236), and a
+`workers`-scope `tool_called` with no `result` pattern also on one carrying `harness_no_worker_calls` and no worker entry.
 
 A premise the transport removes is the lane's exclusion list,
 `hack/eval/inject-lane-exclusions.txt`. The front door's delegation cases are not on it: the
@@ -927,9 +933,9 @@ version key does not carry the serving provider
 sides of the switch at the same key. A step in cost or latency from that night has this cause.
 The first night, 2026-11-06, made about 13,300 agent calls across four leased projects (main-a
 6,355, main-b 4,910, writers 1,121, the two GitLab jobs 951) with 0 rate-limit responses and 11
-transient 503s. The two Argon smoke presubmits and `post-kube-agents-eval-rc` moved the same way on
-2026-11-06, so the blocking gate's record has the same step from that day; the Claude and Flash
-smoke jobs and the forge smoke variants stay on Vertex AI.
+transient 503s. The blocking and today smoke presubmits and `post-kube-agents-eval-rc` moved the same way on
+2026-11-06, so the blocking gate's record has the same step from that day. Since then each lane's
+provider comes from its eval-model pair ([`ci-pool-projects.md`](ci-pool-projects.md) 5.10).
 
 ## The GitLab lane
 

@@ -1,0 +1,85 @@
+{
+  "comment": "memberHash vectors shared by the gateway (Go) and the scope publisher (Python): the #4119 contract, section 3. Each scope is a rendered scope.json; hash is the expected memberHash.",
+  "vectors": [
+    {
+      "scope": {
+        "present": true,
+        "projects": [
+          "p2",
+          "p1",
+          "p1"
+        ],
+        "folders": [
+          "123"
+        ],
+        "organizations": [],
+        "sharedVpcHosts": [
+          "host-a"
+        ],
+        "metricsScopes": [
+          "scope-p"
+        ],
+        "maxProjects": 100,
+        "exclude": {
+          "projects": [
+            "team-*",
+            "legacy"
+          ],
+          "clusters": [
+            {
+              "projectId": "p1",
+              "location": "us-east1",
+              "clusterName": "x"
+            }
+          ]
+        }
+      },
+      "canonical": "{\"exclude\":{\"projects\":[\"legacy\",\"team-*\"]},\"folders\":[\"123\"],\"maxProjects\":100,\"metricsScopes\":[\"scope-p\"],\"organizations\":[],\"projects\":[\"p1\",\"p2\"],\"sharedVpcHosts\":[\"host-a\"]}",
+      "hash": "sha256:973c98df4c5a1430d79cb96f1bb482cb7326fc50bdbeb22a0b1a60d6f811062f"
+    },
+    {
+      "scope": {
+        "present": true,
+        "folders": [
+          "123"
+        ]
+      },
+      "canonical": "{\"exclude\":{\"projects\":[]},\"folders\":[\"123\"],\"maxProjects\":100,\"metricsScopes\":[],\"organizations\":[],\"projects\":[],\"sharedVpcHosts\":[]}",
+      "hash": "sha256:1fbf7a3528db2af0695f56e453d28d49c4244a7bad037954b85c7f7d69f60cfe"
+    },
+    {
+      "scope": {
+        "present": true,
+        "projects": [
+          "team-b",
+          "team-a",
+          "team-a"
+        ],
+        "folders": [
+          "222222222222",
+          "111111111111"
+        ],
+        "organizations": [],
+        "sharedVpcHosts": [
+          "host-project-1"
+        ],
+        "exclude": {
+          "projects": [
+            "legacy-*",
+            "123456789012"
+          ],
+          "clusters": [
+            {
+              "projectId": "team-a",
+              "location": "us-central1",
+              "clusterName": "c1"
+            }
+          ]
+        }
+      },
+      "canonical": "{\"exclude\":{\"projects\":[\"123456789012\",\"legacy-*\"]},\"folders\":[\"111111111111\",\"222222222222\"],\"maxProjects\":100,\"metricsScopes\":[],\"organizations\":[],\"projects\":[\"team-a\",\"team-b\"],\"sharedVpcHosts\":[\"host-project-1\"]}",
+      "hash": "sha256:078c09284502aeccfafc4e819358684d7b3938b6f0e6b8204967114a3eaf8118",
+      "source": "the scope publisher's MemberHashTest (agents/platform/scripts/test_scope_publisher.py)"
+    }
+  ]
+}

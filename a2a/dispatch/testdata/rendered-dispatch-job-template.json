@@ -13,7 +13,7 @@
       "kubeagents.x-k8s.io/a2a-component": "dispatcher"
     },
     "annotations": {
-      "kubeagents.x-k8s.io/dispatch-template-hash": "06ecfba171668118"
+      "kubeagents.x-k8s.io/dispatch-template-hash": "fbbe8ed88100fccd"
     }
   },
   "spec": {
@@ -343,7 +343,15 @@
             "value": "amd64",
             "effect": "NoSchedule"
           }
-        ]
+        ],
+        "dnsConfig": {
+          "options": [
+            {
+              "name": "ndots",
+              "value": "3"
+            }
+          ]
+        }
       }
     }
   }

@@ -125,7 +125,11 @@ idle-install hold on model-run cron jobs, the `CRON_CATCH_UP_STAGGER_MINUTES` st
 catch-up policy on the same jobs, and the `KAGE_SLACK_UX` flag — but only as literal values; all `valueFrom` sources
 are rejected. One name goes to the shell Pod
 instead: `KUBEAGENTS_AUDIT_AUTO_PROMOTE`, the fleet audits' auto-promotion switch, which the
-operator normalises to `true` or `false` before it reaches that Pod. A name earns a
+operator normalises to `true` or `false` before it reaches that Pod. The three
+earned-autonomy switches (`KUBEAGENTS_POST_MERGE_CHECK`, `KUBEAGENTS_AUTOMERGE`,
+`KUBEAGENTS_DIAL`) reach both: the shell Pod as variables normalised to a value
+the switch knows or `off`, and the agent pinned in its managed `.env` rather than
+through this list; the site's credential-isolation reference describes them. A name earns a
 place on that list only if an arbitrary value for it cannot redirect state,
 grant access, or run code the image does not already ship. The list is
 `safeSandboxEnvOverrides` in
@@ -800,11 +804,27 @@ on the sandbox side. The visible pin
 that profile scaffolding records and the Cluster Agent preflight inspects
 therefore still exists, without being what a later command opens.
 
+With the kube-api proxy in use (`KUBE_PROXY_URL` set in the shell sandbox),
+the shim answers a `get-credentials` that names its cluster, one location and
+`--project` itself (#5447). One `/v1/gcp/` read of the cluster (the relay's
+`gcp.api.container.clusters-get` route, on the broker's identity) checks that
+the cluster exists and is running. Then the shim writes the same kube-proxy
+kubeconfig it builds from a broker answer. No broker command runs, so there is
+no command audit line (the relay's line names the principal and the path) and
+no managed kubeconfig is filed for that cluster. Any other answer, any other
+argv, and a profile task's call go to the broker as above. The read carries the
+`X-Kube-Agents-Get-Credentials-Check` header, and the broker refuses it for a
+cluster `spec.scope.exclude.clusters` names, so the call goes to the broker's
+`get-credentials`, which refuses that cluster itself. The header only narrows:
+without it the read is unchanged, so other control-plane reads of an excluded
+cluster stay allowed.
+
 Consequences:
 
 - Naming a cluster is not additional authority. `get-credentials` is bound by
   the same Workload Identity the broker already holds, so the sandbox can only
-  name clusters that identity could already reach.
+  name clusters that identity could already reach. The relay read that answers
+  a `get-credentials` in the shim runs on that identity too.
 - Only GKE contexts are supported, because the context name is what makes
   regeneration possible. A pin the proxy cannot regenerate from — no
   `current-context`, a non-GKE context name, or a merged `path1:path2` list — is
@@ -1233,7 +1253,8 @@ needs the same treatment.
 CI and deployment tests should assert that:
 
 1. the sandbox has no `spec.deployment.env` (bar `KUBEAGENTS_AUDIT_AUTO_PROMOTE`,
-   normalised to `true` or `false`), secret volume, credential-state
+   normalised to `true` or `false`, and the three earned-autonomy switches,
+   normalised to a known value), secret volume, credential-state
    volume, and no Secret-backed env other than the two pod-scoped Session KV
    values named above — the assertion enumerates them, so a third one cannot
    be added without amending this list. The `platform-agent` container and the

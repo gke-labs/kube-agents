@@ -927,6 +927,38 @@ class ResourceWatermarkGateTest(unittest.TestCase):
         self.assertEqual("soft", gate.tick())
         self.assertEqual(2, self.relieved)
 
+    def test_an_exec_pods_soft_watermark_reclaims_kubectls_cache(self):
+        # The exec role's reclaimer: at the soft mark the cache is renamed
+        # and removed, a kubectl reading it keeps its open file, and the next
+        # command builds a new cache beside the kubeconfig, which stays.
+        with tempfile.TemporaryDirectory() as state:
+            executor = credential_proxy.CommandExecutor(
+                timeout_seconds=5, max_output_bytes=1024, state_dir=state, scoped_pool=None)
+            kube = executor.home_dir / ".kube"
+            entry = kube / "cache" / "discovery" / "cluster" / "servergroups.json"
+            entry.parent.mkdir(parents=True)
+            entry.write_text("cached")
+            (kube / "config").write_text("kubeconfig")
+            leftover = kube / (credential_proxy.KUBECTL_CACHE_RECLAIMED_PREFIX + "old")
+            leftover.mkdir()
+            gate = self.gate(memory_percent=50)
+            gate.set_reclaimers([executor.reclaim_kubectl_cache])
+            self.sizes["state"] = _percent(_STATE_LIMIT, 75)
+            self.sizes["tmp"] = _percent(_TMP_LIMIT, 10)
+            with entry.open() as reader:
+                with self.assertLogs(credential_proxy.LOGGER, level="INFO") as logs:
+                    self.assertEqual("soft", gate.tick())
+                self.assertEqual("cached", reader.read())
+            self.assertIn("relief: reclaimed=2 trimmed=True", "\n".join(logs.output))
+            self.assertFalse((kube / "cache").exists())
+            self.assertEqual([], list(kube.glob(credential_proxy.KUBECTL_CACHE_RECLAIMED_PREFIX + "*")))
+            self.assertEqual("kubeconfig", (kube / "config").read_text())
+            rebuilt = kube / "cache" / "discovery" / "cluster" / "servergroups.json"
+            rebuilt.parent.mkdir(parents=True)
+            rebuilt.write_text("fresh")
+            self.assertEqual("fresh", rebuilt.read_text())
+            self.assertEqual(1, executor.reclaim_kubectl_cache())
+
     def test_a_reclaimer_that_fails_does_not_stop_the_relief(self):
         gate = self.gate(memory_percent=76)
 

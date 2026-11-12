@@ -46,8 +46,11 @@ Per failed admitted case, in priority order:
 An ungraded case (outcome ``infra``) is ``storm`` under the same storm
 tests, or ``delegation-ceiling`` when every one of its ungraded repetitions
 carries the scorer's DELEGATION_CEILING_MARKER: the harness's delegation
-wait ran out with the worker still running (#1874). Ceiling repetitions
-are outside the storm count and every pass-rate denominator.
+wait ran out with the worker still running (#1874), ``fixture-drift`` when
+they were never run because a fixture had drifted, or ``forge-unavailable``
+when their checks errored on a forge read that failed during grading
+(FORGE_UNAVAILABLE_MARKER). Ceiling, fixture and forge repetitions are
+outside the storm count and every pass-rate denominator.
 
 ``setup`` is a run-level class: no tasks, a FAILURE verdict, under
 SETUP_DEATH_MAX_DURATION (#1172). A lost pod -- the same zero-task FAILURE
@@ -168,6 +171,22 @@ DELEGATION_CEILING_MARKER = "KUBE_AGENTS_DELEGATION_CEILING"
 FIXTURE_DRIFT_LABEL = "fixture-drift"
 FIXTURE_DRIFT_MARKER = f"({FIXTURE_DRIFT_LABEL}:"
 
+# --- Forge unavailable --------------------------------------------------------
+# The marker bench/kube_agents_bench/forges.py has the scorer lead an `infra`
+# repetition's reason with when every check that errored did so because a
+# forge read failed for a while during grading: a 5xx, a dropped connection, a
+# GitHub rate limit on grading's own token. Counted apart from the storm,
+# like the ceiling: nothing was lost to the model provider's 429s, and the
+# forge's outage says nothing about the pull request.
+# test_eval_dashboard_classify.py reads the literal out of the bench module.
+FORGE_UNAVAILABLE_MARKER = "KUBE_AGENTS_FORGE_UNAVAILABLE"
+
+# A rung-2 block's reason: the scorer gives each errored check's reason after
+# this phrase, and a check's reason can quote a rate limit or a 429 from the
+# forge it read. The repetition was graded, and blocked, so it is a fail,
+# never a storm rep; STORM_REASON_RE is not asked about it.
+RUNG_2_ERRORED_PHRASE = "checks errored rather than ran"
+
 # --- Replay errors (#2328) ---------------------------------------------------
 # A card-wake replay whose plant or turn failed in the image (ReplayBroken) or
 # whose directive/prompt was invalid returns an errored result; at bench-gate
@@ -213,6 +232,7 @@ REP_FAIL = "fail"
 REP_STORM = "storm"
 REP_CEILING = "ceiling"
 REP_FIXTURE = "fixture"
+REP_FORGE = "forge"
 # Memo bounds for the per-run derivations and the 30-day pass rates.
 RUN_CACHE_MAX = 4096
 RATE_CACHE_MAX = 8
@@ -251,6 +271,7 @@ CLS_ONLY_THIS_PR = "only-this-pr"
 CLS_STORM = "storm"
 CLS_CEILING = "delegation-ceiling"
 CLS_FIXTURE_DRIFT = "fixture-drift"
+CLS_FORGE = "forge-unavailable"
 CLS_SETUP = "setup"
 CLS_DEADLINE = "deadline-kill"
 VERDICT_RED = "red"
@@ -279,6 +300,7 @@ DO_SETUP = "Retest. If it dies the same way again, the leased project is the sus
 DO_LOST_POD = "Retest once new jobs are progressing; the build node died under this run, not your change."
 DO_CEILING = "Retest. The worker was still running when the harness's delegation wait ran out; nothing about your change was graded."
 DO_FIXTURE_DRIFT = "Nothing for the PR. A seeded-fleet fixture this case needs was out of its designed state on the leased project, so the case was not run and does not block; the reason names the role and what the scan saw."
+DO_FORGE = "Retest. A forge read failed during grading (a 5xx, a dropped connection or a rate limit), so the checks that read it were not evaluated; nothing about your change was graded."
 DO_DEADLINE_KILL = "Retest once the brief says runs are finishing again. Prow killed the run at its deadline before a verdict; if other PRs' runs are finishing, a change on this branch that hangs the eval looks like this too."
 # The outage's recovering hold: other PRs' runs are finishing, so a kill
 # arriving now may be the branch, and it holds the gate out of GREEN.
@@ -326,13 +348,15 @@ def task_reps(task: dict) -> list[dict]:
 
 
 def rep_kind(rep: dict) -> str:
-    """'pass' | 'fail' | 'storm' | 'ceiling' | 'fixture' -- the adjudicator's
+    """'pass' | 'fail' | 'storm' | 'ceiling' | 'fixture' | 'forge' -- the adjudicator's
     kinds. A storm rep is one the harness could not grade: an infra verdict,
     or a fail whose reason is a never-ran phrasing. A ceiling rep is one the
     harness stopped watching with the worker still running (its reason leads
     with DELEGATION_CEILING_MARKER); it reads `infra` too, but is not a storm.
     A fixture rep is an `infra` one never run because a fixture it needs had
-    drifted (FIXTURE_DRIFT_MARKER); not a storm either.
+    drifted (FIXTURE_DRIFT_MARKER); not a storm either. A forge rep is an
+    `infra` one whose checks errored on a forge read that failed for a while
+    (its reason leads with FORGE_UNAVAILABLE_MARKER); not a storm either.
     A harness-declared replay error (#2328) is a graded fail, not a storm."""
     result = str(rep.get("result") or "").lower()
     if result == "pass":
@@ -342,17 +366,21 @@ def rep_kind(rep: dict) -> str:
         return REP_CEILING
     if result == "infra" and FIXTURE_DRIFT_MARKER in reason:
         return REP_FIXTURE
+    if result == "infra" and reason.startswith(FORGE_UNAVAILABLE_MARKER):
+        return REP_FORGE
     if result != "infra" and "KUBE_AGENTS_INFRA_FAILURE" not in reason and REPLAY_ERROR_RE.search(reason):
         return REP_FAIL
     if result == "infra":
         return REP_STORM
+    if RUNG_2_ERRORED_PHRASE in reason:
+        return REP_FAIL
     if STORM_REASON_RE.search(reason):
         return REP_STORM
     return REP_FAIL
 
 
 def rep_counts(task: dict) -> dict:
-    counts = {"pass": 0, "fail": 0, "infra": 0, "ceiling": 0, "fixture": 0}
+    counts = {"pass": 0, "fail": 0, "infra": 0, "ceiling": 0, "fixture": 0, "forge": 0}
     for rep in task_reps(task):
         kind = rep_kind(rep)
         counts["infra" if kind == REP_STORM else kind] += 1
@@ -361,7 +389,7 @@ def rep_counts(task: dict) -> dict:
 
 def outcome_of(counts: dict) -> str | None:
     """passed (every graded rep passed), partial, failed (every graded rep
-    failed), infra (nothing graded: storm, ceiling or fixture reps only),
+    failed), infra (nothing graded: storm, ceiling, fixture or forge reps only),
     None (no reps at all)."""
     if counts["pass"] and counts["fail"]:
         return OUTCOME_PARTIAL
@@ -369,7 +397,7 @@ def outcome_of(counts: dict) -> str | None:
         return OUTCOME_FAILED
     if counts["pass"]:
         return OUTCOME_PASSED
-    if counts["infra"] or counts.get("ceiling") or counts.get("fixture"):
+    if counts["infra"] or counts.get("ceiling") or counts.get("fixture") or counts.get("forge"):
         return OUTCOME_INFRA
     return None
 
@@ -810,16 +838,22 @@ def classify_case(task: dict, run: dict, others: list[dict], admitted: frozenset
         if not is_admitted:
             do = DO_HELD_OUT
     elif outcome == OUTCOME_INFRA:
-        if counts["fixture"] and not counts["infra"] and not counts["ceiling"]:
+        if counts["fixture"] and not counts["infra"] and not counts["ceiling"] and not counts["forge"]:
             # Every ungraded rep was never run: a fixture the case needs had
             # drifted on the leased project. The fleet's, never the PR's.
             cls = CLS_FIXTURE_DRIFT
             do = DO_FIXTURE_DRIFT
-        elif counts["ceiling"] and not counts["infra"]:
+        elif counts["ceiling"] and not counts["infra"] and not counts["forge"]:
             # Every ungraded rep hit the delegation ceiling: the eval's wait,
             # not the storm's 429s, and never the pull request's.
             cls = CLS_CEILING
             do = DO_CEILING
+        elif counts["forge"] and not counts["infra"]:
+            # No storm rep: the ungraded reps lost their checks to a forge
+            # outage during grading (a ceiling rep beside them is the eval's
+            # wait). Neither is the PR's.
+            cls = CLS_FORGE
+            do = DO_FORGE
         elif run_storm or condition == CONDITION_STORM:
             cls = CLS_STORM
             do = DO_STORM
@@ -864,10 +898,22 @@ def headline_for(cases: list[dict], run: dict, incident: bool, has_incident: boo
                 "The cases were not run; the fixture's drift is the infra owner's, not a verdict on your change." + held_note,
                 VERDICT_INFRA,
             )
+        if ungraded and all(c["cls"] == CLS_FORGE for c in ungraded):
+            return (
+                "Nothing was graded: every case's checks errored on a forge read that failed during grading.",
+                "A 5xx, a dropped connection or a rate limit on the forge is not a verdict on your change." + held_note,
+                VERDICT_INFRA,
+            )
         if ungraded and all(c["cls"] == CLS_CEILING for c in ungraded):
             return (
                 "Nothing was graded: every repetition hit the delegation ceiling with its worker still running.",
                 "The harness stopped waiting before any worker delivered; that is the eval's wait, not a verdict on your change." + held_note,
+                VERDICT_INFRA,
+            )
+        if ungraded and all(c["cls"] in (CLS_CEILING, CLS_FIXTURE_DRIFT, CLS_FORGE) for c in ungraded):
+            return (
+                "Nothing was graded: the repetitions hit the delegation ceiling, a drifted fixture or a forge outage.",
+                "None of them was lost to the quota storm, and none is a verdict on your change." + held_note,
                 VERDICT_INFRA,
             )
         if ungraded:

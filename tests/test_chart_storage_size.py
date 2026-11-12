@@ -44,9 +44,9 @@ _TOO_LARGE_MESSAGE = "the data volume size must be at most 64Ti"
 
 
 def _storage_block(template: str) -> str:
-    """The template text from the size's `with` to the block it renders."""
+    """The template text from the storage values to the block it renders."""
     block = re.search(
-        r"\{\{- with \(\.Values\.platformAgent\.storage \| default dict\)\.size \}\}\n(.*?)\n  storage:\n    size: \{\{ \. \| quote \}\}\n  \{\{- end \}\}",
+        r"\{\{- \$storageValues := \.Values\.platformAgent\.storage \| default dict \}\}\n(.*?)\n  storage:\n",
         template,
         re.DOTALL,
     )
@@ -63,13 +63,13 @@ class StorageSizeShapeTest(unittest.TestCase):
 
     def test_the_chart_default_is_null(self):
         values = yaml.safe_load((_CHART / "values.yaml").read_text())
-        self.assertEqual(values["platformAgent"]["storage"], {"size": None})
+        self.assertEqual(values["platformAgent"]["storage"], {"size": None, "expectedClusterProfiles": None})
 
     def test_the_schema_closes_the_block_and_checks_the_quantity(self):
         schema = json.loads((_CHART / "values.schema.json").read_text())
         storage = schema["properties"]["platformAgent"]["properties"]["storage"]
         self.assertIs(storage["additionalProperties"], False)
-        self.assertEqual(set(storage["properties"]), {"size"})
+        self.assertEqual(set(storage["properties"]), {"size", "expectedClusterProfiles"})
         pattern = re.compile(storage["properties"]["size"]["pattern"])
         for good in ("", "80Gi", "1Ti", "51200Mi", "1.5Ti", "100G", "5e10"):
             with self.subTest(good=good):
