@@ -93,6 +93,12 @@ Two optional stacks add to the total:
   once. The prerequisites page's [Footprint](/kube-agents/install/prerequisites/#footprint)
   gives the totals and each pod's requests and limits, generated from the chart.
 
+  Each NATS server's metrics exporter is sized for up to about 2,000 JetStream consumers, which
+  is about 1,000 clusters at two consumers per AgentProfile. Its memory and CPU grow with the
+  consumer count, and past that it nears its 192 MiB limit. The same ceiling holds on an
+  Autopilot cluster without Pod bursting, where the limits become the 50m and 96 MiB requests:
+  there, CPU runs out first, and past about 2,500 consumers a scrape outlasts the interval.
+
 ## The host cluster
 
 ### Option A: GKE Autopilot

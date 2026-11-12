@@ -146,10 +146,10 @@ Totals by install profile, as the chart's quota preflight sums them (the operato
 | ------- | ---- | ------------ | --------------- | ---------- | ------------- | ----------------------------------- | ------ | ------------------ | -------------------- |
 | `today`, GKE Standard | 9 | 2756m | 12096Mi | 13200m | 25472Mi | 14912Mi / 14912Mi | 4 | 102Gi | — |
 | `today`, GKE Autopilot | 9 | 4256m | 13120Mi | 13200m | 25472Mi | 14912Mi / 14912Mi | 4 | 102Gi | — |
-| `next`, GKE Standard | 20 | 4236m | 14768Mi | 21050m | 32224Mi | 15232Mi / 15232Mi | 7 | 222Gi | 38 |
-| `next`, GKE Autopilot | 20 | 5736m | 15792Mi | 21050m | 32224Mi | 15232Mi / 15232Mi | 7 | 222Gi | 38 |
-| `next` with one NATS server, GKE Standard | 18 | 3716m | 13712Mi | 18950m | 30112Mi | 15104Mi / 15104Mi | 5 | 142Gi | 36 |
-| `next` with Hindsight and the GitHub minter, GKE Standard | 24 | 5086m | 17200Mi | 27050m | 37856Mi | 16Gi / 16Gi | 8 | 230Gi | 44 |
+| `next`, GKE Standard | 20 | 4386m | 15056Mi | 22550m | 32800Mi | 15424Mi / 15424Mi | 7 | 222Gi | 38 |
+| `next`, GKE Autopilot | 20 | 5886m | 16080Mi | 22550m | 32800Mi | 15424Mi / 15424Mi | 7 | 222Gi | 38 |
+| `next` with one NATS server, GKE Standard | 18 | 3766m | 13808Mi | 19450m | 30304Mi | 15168Mi / 15168Mi | 5 | 142Gi | 36 |
+| `next` with Hindsight and the GitHub minter, GKE Standard | 24 | 5236m | 17488Mi | 28550m | 38432Mi | 16576Mi / 16576Mi | 8 | 230Gi | 44 |
 
 The session quota is `spec.harness.tuning.maxSessions` (10 by default) plus the pods the operator runs for the agent, the chart's pods in the namespace with their rollout surges (5 when the operator cannot read the chart's count), and a margin of 7 for the operator's rollout surges, its Jobs and the gateway's count-then-create overshoot.
 
@@ -157,7 +157,7 @@ Under `spec.mode: next`, per pod:
 
 | Workload | Pods | CPU request | Memory request | CPU limit | Memory limit | Ephemeral storage request / limit | Runs |
 | -------- | ---- | ----------- | -------------- | --------- | ------------ | --------------------------------- | ---- |
-| NATS server | 3 | 260m | 528Mi | 1050m | 1056Mi | 64Mi / 64Mi | Standing, each on its own node, with one JetStream claim each (40Gi); one with `spec.harness.tuning.busReplicas: 1` |
+| NATS server | 3 | 310m | 624Mi | 1550m | 1248Mi | 128Mi / 128Mi | Standing, each on its own node, with one JetStream claim each (40Gi); one with `spec.harness.tuning.busReplicas: 1` |
 | Auth callout | 2 | 50m | 64Mi | 500m | 256Mi | — | Standing |
 | Capability verifier | 2 | 50m | 64Mi | 500m | 256Mi | — | Standing |
 | A2A gateway | 2 | 50m | 64Mi | 500m | 512Mi | — | Standing; one fewer with the operator's `A2A_GATEWAY_ELECTION=false` |
