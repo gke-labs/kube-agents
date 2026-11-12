@@ -2,6 +2,7 @@
 
 import argparse
 import importlib.util
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -63,3 +64,16 @@ class WarmupTest(unittest.TestCase):
                 mock.patch.object(cli.time, "sleep") as sleep:
             cli.wait_clients_scheduled({"c": "ctx"}, "sel")
         self.assertEqual(sleep.call_count, 1)
+
+
+class CredentialsTest(unittest.TestCase):
+    def test_the_host_is_in_the_same_kubeconfig_as_the_fleet(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(cli.os.environ, {}, clear=False), \
+                mock.patch.object(cli.kube, "gcloud", side_effect=lambda *a, **k: calls.append(a[3])):
+            cli.credentials(args(kubeconfig=str(Path(tmp) / "k"), host_cluster="scale-host",
+                                 host_location="us-central1-c"), cli.sf.fleet("S"))
+            self.assertEqual(cli.os.environ[cli.kube.KUBECONFIG_ENV], str(Path(tmp) / "k"))
+        self.assertEqual(calls[-1], "scale-host")
+        self.assertEqual(len(calls), len(cli.sf.fleet("S").clusters) + 1)

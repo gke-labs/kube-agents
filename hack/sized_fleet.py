@@ -143,6 +143,11 @@ def credentials(args: argparse.Namespace, fleet: sf.Fleet) -> None:
     use_kubeconfig(args)
     for c in fleet.clusters:
         kube.gcloud("container", "clusters", "get-credentials", c.name, f"--zone={args.zone}", project=args.project)
+    # The run resets and reads the host install through the same kubeconfig: without its
+    # entry here, the host's context exists only in the caller's default kubeconfig.
+    if getattr(args, "host_cluster", None):
+        kube.gcloud("container", "clusters", "get-credentials", args.host_cluster,
+                    f"--location={args.host_location}", project=args.project)
 
 
 def apply_workloads(args: argparse.Namespace, fleet: sf.Fleet) -> None:
