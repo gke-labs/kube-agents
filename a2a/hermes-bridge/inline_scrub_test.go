@@ -150,6 +150,27 @@ func TestScrubInlineSecretsShapeClasses(t *testing.T) {
 			forbidden: []string{"quietpasture", "meadowlark"},
 			wantSub:   []string{"The password is [redacted].", "The secret was [redacted],", "the token is expired."},
 		},
+		// A colon straight after the verb or a qualifier, and a two-word
+		// subject: the reviewers' inputs on #5311 (Fuxiao-Gao 11-11,
+		// bradhoekstra 11-12), each published unredacted before.
+		{
+			name:      "prose: a colon after the verb",
+			in:        "The password is: hunter2Xq9z71. The token is: abcdEFGH1234ijkl5678. Password is: Tr0ub4dor3xyz",
+			forbidden: []string{"hunter2Xq9z71", "abcdEFGH1234ijkl5678", "Tr0ub4dor3xyz"},
+			wantSub:   []string{"The password is: [redacted].", "The token is: [redacted].", "Password is: [redacted]"},
+		},
+		{
+			name:      "prose: a colon after a qualifier, a colon before a new line, a decoded password",
+			in:        "Password is now: hunter2Xq9z71\nThe password is:\n`Tr0ub4dor3xyz`\nThe decoded password is: s3cretDecoded99",
+			forbidden: []string{"hunter2Xq9z71", "Tr0ub4dor3xyz", "s3cretDecoded99"},
+			wantSub:   []string{"Password is now: [redacted]", "The decoded password is: [redacted]"},
+		},
+		{
+			name:      "prose: a two-word subject after for",
+			in:        "The password for user admin is `hunter2Xq9z71`.",
+			forbidden: []string{"hunter2Xq9z71"},
+			wantSub:   []string{"The password for user admin is `[redacted]`."},
+		},
 		{
 			name:      "fail closed: a lower-case word under a strong key, mid-sentence",
 			in:        "Log in with password: quietpasture and then token: meadowlark today",
@@ -229,6 +250,11 @@ func TestScrubInlineSecretsShapeClasses(t *testing.T) {
 		"`UPGRADE_MASTER` (`2026-10-28T03:10:37Z`–`03:17:08Z`, `6 min`) and (2026-10-28T03:59:19Z–04:02:33Z) on default-pool",
 		`{"state":{"running":{"startedAt":"2026-11-09T06:53:15Z"}},"name":"api","ready":false,"restartCount":4}`,
 		"The upgrade ran 2026-10-28T03:56:05Z-03:59:15Z on default-pool.",
+		// Near the colon fix: a state after a colon, and a two-word subject
+		// with a state, state no secret.
+		"The token is: expired. The password is: unchanged.",
+		"The secret for the app is mounted and the token for user admin is valid.",
+		"Rotation: the password is currently being reset by the operator.",
 	}
 	for _, in := range negatives {
 		if got := scrubInlineSecrets(in); got != in {

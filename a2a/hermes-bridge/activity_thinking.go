@@ -77,11 +77,13 @@ var (
 	// Prose that states a secret: "the password is hunter2", "password for
 	// admin is hunter2", "the password in secret app-db is hunter2", "the
 	// password key decodes to hunter2", "the token was abc", "the password
-	// is now hunter2", "the secret is set to abc". The verb may be followed
-	// by a qualifier (now, currently, still, just, simply, set to, equal
-	// to) or a colon, none of which is the value. proseValueRedacted keeps
+	// is now hunter2", "the secret is set to abc", "the password is:
+	// hunter2", "the password for user admin is hunter2". The verb, and each
+	// qualifier after it (now, currently, still, just, simply, set to, equal
+	// to), may be followed by a colon or by whitespace, none of which is the
+	// value. proseValueRedacted keeps
 	// a state word: "the token is expired" states no secret.
-	proseSecretPattern          = regexp.MustCompile(`(?i)\b((?:the\s+)?(?:[A-Za-z0-9_.-]+\s+)?(?:password|passwd|passphrase|secret|token|api[ _-]?key|credential)\s+(?:(?:key|value|field|entry)\s+)?(?:(?:for|in|of|from)\s+(?:(?:the|secret|kubernetes)\s+){0,2}[^\s,.;:!?)'"\]]+\s+)?(?:is|was|=|will\s+be|should\s+be|has\s+been\s+set\s+to|decodes\s+(?:to|as)|decoded\s+(?:to|as)|is\s+decoded\s+as)\s+(?:(?:now|currently|still|just|simply|also|again)\s+)*(?:(?:set|equal|changed|updated|reset)\s+to\s+)?(?::\s*)?)("[^"\r\n]*"|'[^'\r\n]*'|[^\s,.;:!?)'"\]]+)`)
+	proseSecretPattern          = regexp.MustCompile(`(?i)\b((?:the\s+)?(?:[A-Za-z0-9_.-]+\s+)?(?:password|passwd|passphrase|secret|token|api[ _-]?key|credential)\s+(?:(?:key|value|field|entry)\s+)?(?:(?:for|in|of|from)\s+(?:(?:the|secret|kubernetes)\s+){0,2}[^\s,.;:!?)'"\]]+(?:\s+[^\s,.;:!?)'"\]]+)?\s+)?(?:is|was|=|will\s+be|should\s+be|has\s+been\s+set\s+to|decodes\s+(?:to|as)|decoded\s+(?:to|as)|is\s+decoded\s+as)(?:\s*:\s*|\s+)(?:(?:now|currently|still|just|simply|also|again)(?:\s*:\s*|\s+))*(?:(?:set|equal|changed|updated|reset)\s+to(?:\s*:\s*|\s+))?)("[^"\r\n]*"|'[^'\r\n]*'|[^\s,.;:!?)'"\]]+)`)
 	inlineKVSecretPattern       = regexp.MustCompile(`((?:\\?["'])?)([A-Za-z0-9_.-]+)((?:\\?["'])?)([ \t]*([=:])[ \t]*)`)
 	inlineExtraSecretKeyPattern = regexp.MustCompile(`(?i)(?:^|[_.-])(?:pass|pwd|auth|apikey|access[_-]?key|secret[_-]?key|privatekey|id_rsa|id_ed25519|id_ecdsa|dockercfg|dockerconfigjson|client[_-]?certificate[_-]?data)(?:$|[_.-])|\.(?:key|pem|crt|p12|pfx|dockercfg|dockerconfigjson)$`)
 	// An all-caps env-style key whose last component says it holds a key,
@@ -1081,6 +1083,9 @@ var credentialStateWords = map[string]bool{
 	"true": true, "false": true, "null": true, "nil": true, "none": true, "yes": true, "no": true,
 	"on": true, "off": true, "enabled": true, "disabled": true, "set": true, "unset": true,
 	"empty": true, "blank": true, "required": true, "optional": true, "n/a": true,
+	// A progressive auxiliary, never a value: "the password is currently
+	// being reset".
+	"being":   true,
 	"mounted": true, "rotated": true, "expired": true, "revoked": true, "valid": true, "invalid": true,
 	"stored": true, "missing": true, "present": true, "absent": true, "configured": true,
 	"unconfigured": true, "unchanged": true, "changed": true, "correct": true, "incorrect": true,
