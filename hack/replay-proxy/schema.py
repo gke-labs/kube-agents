@@ -106,7 +106,8 @@ UNSTORABLE_REPEATS_AGE = "repeats_swapped_age"
 # it would be served with the recording's value.
 UNSTORABLE_BOUND_VALUE_LEFT_LITERAL = "bound_value_left_literal"
 # Normalized, the answer still holds an identifier shape (a card, a pod, a
-# session) the request never bound, so it would be served as recorded.
+# session) the request never bound, so it would be served as recorded, or
+# names a file only a dropped read_file `similar_files` listed.
 UNSTORABLE_UNBOUND_IDENTIFIER = "unbound_identifier"
 # The answer quotes a timestamp the request does not hold verbatim (one the
 # model made), which no placeholder can bring up to date.
