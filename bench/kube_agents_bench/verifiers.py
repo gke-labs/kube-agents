@@ -941,7 +941,27 @@ _KANBAN_TOOL_PREFIX = "kanban_"
 # one result of a call that read a credential, is a recorded call whose
 # output is redacted: it starts with `[REDACTED_` and is never a read gap.
 _WITHHELD_RESULT = "[WITHHELD: redactor unavailable in the pod]"
-_CLIPPED_RESULT = re.compile(r" \.\.\.\[clipped \d+ chars\]$")
+# ``worker_trajectory.clip``'s marker. On an argument it ends the string. On a
+# result the kept tail follows it after ``... ``, and an older record ends on
+# it; ``_clipped_result_marker`` finds it by that shape, so the same words
+# printed inside a worker's own output are not read as the cut.
+_CLIPPED_RESULT = re.compile(r" \.\.\.\[clipped \d+ chars\]")
+_CLIPPED_ARGS = re.compile(r" \.\.\.\[clipped \d+ chars\]$")
+_CLIPPED_TAIL_LEAD = "... "
+
+
+def _clipped_result_marker(result: str) -> re.Match[str] | None:
+    """The marker the pod put on ``result``, or None when the result is whole.
+
+    The last occurrence that ends the string or opens the kept tail: the
+    marker sits after the whole head, so an occurrence the worker's own
+    output carries earlier is never the last one of that shape.
+    """
+    found = None
+    for match in _CLIPPED_RESULT.finditer(result):
+        if match.end() == len(result) or result.startswith(_CLIPPED_TAIL_LEAD, match.end()):
+            found = match
+    return found
 
 
 def _minute(instant: datetime) -> datetime:
@@ -1034,7 +1054,7 @@ def _read_minutes(trajectory: list[dict[str, Any]], dates: list[str]) -> tuple[s
             # A credential read, recorded without its output: no time in it,
             # and no gap in the capture.
             continue
-        if _CLIPPED_RESULT.search(result):
+        if _clipped_result_marker(result):
             clipped += 1
         minutes |= _output_minutes(result, dates)
     return minutes, withheld, clipped
@@ -1966,7 +1986,7 @@ class ToolCalledVerifier(BaseVerifier):
         if set(args) == {"raw"} and isinstance(args["raw"], str):
             # worker_trajectory's clip() ends a cut argument string with the
             # same marker it ends a cut result with.
-            clip = _CLIPPED_RESULT.search(args["raw"])
+            clip = _CLIPPED_ARGS.search(args["raw"])
             if clip is None:
                 args = _clipped_string_args(args["raw"], self.arguments)
             else:
@@ -3767,8 +3787,9 @@ _EVIDENCE_BLOCK_RE = re.compile(
 # before the reply is searched for the label.
 _EVIDENCE_HEADING = "**Evidence for verified claims**"
 _VERIFIED_LABEL_RE = re.compile(r"\bverified\b", re.I)
-# ``worker_trajectory.clip``'s marker on a result cut in the pod.
-_CLIPPED_RESULT_RE = re.compile(r" \.\.\.\[clipped \d+ chars\]$")
+# The head of a result cut in the pod is what sits before the marker
+# ``_clipped_result_marker`` finds; the kept tail after it is for a reader of
+# the record, not decoded here.
 # The head of a terminal result as the pod stores it: ``{"output": "``.
 _OUTPUT_HEAD_RE = re.compile(r'^\{\s*"output":\s*"')
 # The longest escape a cut can split (``\uXXXX``), trimmed one character at a
@@ -3872,7 +3893,7 @@ def _terminal_output(result: str) -> tuple[str, bool]:
         parsed = None
     if isinstance(parsed, dict) and isinstance(parsed.get("output"), str):
         return parsed["output"], False
-    clipped = _CLIPPED_RESULT_RE.search(result)
+    clipped = _clipped_result_marker(result)
     if not clipped:
         return result, False
     head = _OUTPUT_HEAD_RE.sub("", result[: clipped.start()])

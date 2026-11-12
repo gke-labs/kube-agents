@@ -3176,6 +3176,13 @@ def test_tool_called_still_reads_a_key_a_cut_name_cannot_complete():
     assert _verdicts() == ("pass", "fail")
 
 
+def test_tool_called_reads_a_clip_marker_inside_a_value_as_text():
+    # The command itself printed a clipped record; the pod's own marker ends the string.
+    head = '{"command": "echo ...[clipped 5 chars] done", "x": "' + "y" * 60
+    transcript.set("done", _terminal_call({"raw": head + " ...[clipped 3000 chars]"}))
+    assert _verdicts() == ("pass", "fail")
+
+
 def test_tool_called_leaves_a_scalar_json_refuses_unread():
     head = '{"timeout": 030, "command": "' + "y" * 60
     transcript.set("done", _terminal_call({"raw": head + " ...[clipped 3000 chars]"}))
@@ -10081,6 +10088,19 @@ def test_verified_claims_backed_finds_an_excerpt_in_a_clipped_head():
     clipped = out[:200] + " ...[clipped 3000 chars]"
     res = _grade_claims(_block("kubectl get nodes", "phase \u2026 node-b NotReady"), [_terminal("kubectl get nodes", result=clipped)])
     assert res.status == "pass" and "not checked" not in res.reason, res
+
+
+def test_verified_claims_backed_reads_the_head_up_to_the_pods_marker_not_a_printed_one():
+    # The worker's own output quotes a clipped record; the pod's marker opens the kept tail.
+    from kube_agents_bench import worker_trajectory
+
+    output = "earlier: a ...[clipped 12 chars] record\nnode-b NotReady " + "x" * 4000 + "\nverdict: done"
+    out = json.dumps({"output": output, "exit_code": 0})
+    limit, tail = worker_trajectory.MAX_RESULT_CHARS, worker_trajectory.RESULT_TAIL_CHARS
+    clipped = out[:limit] + " ...[clipped %d chars]... " % (len(out) - limit - tail) + out[-tail:]
+    res = _grade_claims(_block("kubectl get nodes", "node-b NotReady"), [_terminal("kubectl get nodes", result=clipped)])
+    assert res.status == "pass" and "not checked" not in res.reason, res
+    assert verifiers._clipped_result_marker(clipped).start() == limit
 
 
 def test_verified_claims_backed_masks_addresses_as_the_pod_does():
