@@ -562,6 +562,9 @@ func New(o Options) (*Gateway, error) {
 	if o.Config.DelegationDepthMax <= 0 {
 		o.Config.DelegationDepthMax = defaultDelegationDepthMax
 	}
+	if o.Config.DelegationWidthMax <= 0 {
+		o.Config.DelegationWidthMax = defaultDelegationWidthMax
+	}
 	if o.Config.TaskDeadline <= 0 {
 		o.Config.TaskDeadline = defaultTaskDeadline
 	}
