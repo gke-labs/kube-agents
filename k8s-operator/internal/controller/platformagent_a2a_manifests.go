@@ -76,6 +76,11 @@ import (
 )
 
 const (
+	// a2aNATSDeletionRecheck is how long a CR's deletion waits after
+	// marking its bus StatefulSet for deletion before it reaps the claims
+	// (deleteA2ANATSStatefulSetFirst).
+	a2aNATSDeletionRecheck = 5 * time.Second
+
 	// a2aPartOf marks every object of the next stack, so
 	// `kubectl get -l app.kubernetes.io/part-of=a2a-next` is the whole venue.
 	a2aPartOf = "a2a-next"
@@ -2786,11 +2791,6 @@ const (
 // a2aNATSMaxReplicas is the most servers the bus can run (the busReplicas
 // enum's top value), and so the ordinals handleDeletion reaps claims for.
 const a2aNATSMaxReplicas = 3
-
-// a2aNATSDeletionRecheck is how long a CR's deletion waits after marking its
-// bus StatefulSet for deletion before it reaps the claims
-// (deleteA2ANATSStatefulSetFirst).
-const a2aNATSDeletionRecheck = 5 * time.Second
 
 // deleteA2ANATSStatefulSetFirst marks the bus StatefulSet this agent
 // controls for deletion, in the foreground so its pods go with it, and
