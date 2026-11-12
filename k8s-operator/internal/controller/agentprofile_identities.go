@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"regexp"
@@ -218,11 +219,81 @@ func resolveAgentProfileIdentities(agent *agentv1alpha1.PlatformAgent, profiles 
 	out := make(map[string]agentProfileResolution, len(sorted))
 	claimedBy := map[string]string{}
 	profilesNS := profileNamespaceName(agent)
+	budget := newDispatchBudget(agent)
 	for i := range sorted {
 		p := &sorted[i]
-		out[p.Name] = resolveOneAgentProfile(p, agent, reserved, mapKeys, claimedBy, profilesNS)
+		r := resolveOneAgentProfile(p, agent, reserved, mapKeys, claimedBy, profilesNS)
+		if r.refused == nil && budget != nil && !budget.admit(agent, p) {
+			// Past the dispatch config's budget: refused whole, like any other
+			// refusal, and its ServiceAccounts released so a later profile
+			// isn't refused for a claim nothing renders.
+			for sa, owner := range claimedBy {
+				if owner == p.Name {
+					delete(claimedBy, sa)
+				}
+			}
+			r = agentProfileResolution{refused: fmt.Errorf("the dispatch config is at its %d-byte budget: the profiles created before this one fill it, so this one isn't dispatched", dispatchConfigBudgetBytes), reason: reasonAgentProfileDispatchFull}
+		}
+		out[p.Name] = r
 	}
 	return out
+}
+
+// dispatchConfigBudgetBytes is how large the dispatch config (dispatch.json)
+// may grow before the newest profiles are refused (#5479): under the 1 MiB a
+// ConfigMap holds, with the rest left for the envelope's growth and the
+// profiles still draining, which are listed after the live ones and aren't
+// counted here. 2,500 two-tier profiles come to about 445 KB, so this binds
+// only on unusually long names or parameter lists. A var so tests can shrink it.
+var dispatchConfigBudgetBytes = 900 << 10
+
+// dispatchBudget counts the dispatch config's bytes as profiles are admitted,
+// oldest first.
+type dispatchBudget struct{ used int }
+
+// newDispatchBudget is the budget with the envelope already counted, or nil
+// when the operator renders no dispatcher (there is no config to fill).
+func newDispatchBudget(agent *agentv1alpha1.PlatformAgent) *dispatchBudget {
+	if !a2aDispatcherEnabled() {
+		return nil
+	}
+	envelope := dispatchConfigEnvelope(agent)
+	// The version and the Job labels are set once the profiles are known.
+	// Count the version at its length, and the labels whenever the chart
+	// rendered the Job policy (they're written once any profile has a Job
+	// template), so the envelope never runs short.
+	envelope.Version = strings.Repeat("0", 16)
+	if dispatcherJobPolicyRendered() {
+		envelope.JobLabels = dispatchJobLabels(agent)
+	}
+	body, err := json.Marshal(envelope)
+	if err != nil {
+		return nil
+	}
+	return &dispatchBudget{used: len(body)}
+}
+
+// admit counts p's entry and reports whether it still fits. The entry is the
+// one desiredDispatchConfigWith writes (dispatchProfileEntry), with a Job
+// template reference counted for any profile with an unattended-mode tier
+// once the chart renders the Job policy, whether or not that profile's other
+// gates (its namespace, its tools) let it have one, so the estimate never
+// runs short.
+func (b *dispatchBudget) admit(agent *agentv1alpha1.PlatformAgent, p *agentv1alpha1.AgentProfile) bool {
+	var ref *a2aDispatchJobTemplateRef
+	if dispatcherJobPolicyRendered() && unattendedTierOf(p) != "" {
+		ref = &a2aDispatchJobTemplateRef{Hash: strings.Repeat("0", dispatchJobTemplateHashLength)}
+	}
+	entry, err := json.Marshal(dispatchProfileEntry(agent, p, ref))
+	if err != nil {
+		return false
+	}
+	cost := len(entry) + 1 // the comma between entries
+	if b.used+cost > dispatchConfigBudgetBytes {
+		return false
+	}
+	b.used += cost
+	return true
 }
 
 // resolveOneAgentProfile decides one profile's identities, recording each

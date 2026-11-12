@@ -109,6 +109,10 @@ const (
 	reasonAgentProfileBusError        = "BusUnavailable"
 	reasonAgentProfileIdentityMissing = "IdentityNotRendered"
 	reasonAgentProfileNamespaceAbsent = "ProfileNamespaceAbsent"
+	// reasonAgentProfileDispatchFull refuses a profile the dispatch config
+	// has no room for: the profiles created before it fill its byte budget
+	// (dispatchConfigBudgetBytes, #5479).
+	reasonAgentProfileDispatchFull = "DispatchConfigFull"
 )
 
 // AgentProfileReconciler reconciles AgentProfile objects.

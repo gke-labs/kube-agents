@@ -610,6 +610,66 @@ func dispatchSubmitRetentionSeconds(agent *agentv1alpha1.PlatformAgent) int {
 	return int(retention)
 }
 
+// dispatchConfigEnvelope is the dispatch config with every install-wide value
+// resolved and no profiles. The dispatch budget counts it before any profile
+// (newDispatchBudget), which is why it resolves no profiles itself.
+func dispatchConfigEnvelope(agent *agentv1alpha1.PlatformAgent) a2aDispatchConfig {
+	ceiling := resolveProfileCeiling(agent)
+	child, interactive := dispatchReserves(agent, ceiling)
+	return a2aDispatchConfig{
+		Namespace:              agent.Namespace,
+		ProfileNamespace:       profileNamespaceName(agent),
+		Ceiling:                ceiling,
+		InteractiveReserve:     interactive,
+		ChildReserve:           child,
+		LeaseSeconds:           resolveProfileLeaseSeconds(agent),
+		RenewSeconds:           resolveProfileRenewSeconds(agent),
+		RestartGraceSeconds:    resolveProfileRestartGraceSeconds(agent),
+		AcceptTimeoutSeconds:   resolveProfileAcceptTimeoutSeconds(agent),
+		SubmitRetentionSeconds: dispatchSubmitRetentionSeconds(agent),
+		Profiles:               []a2aDispatchProfile{},
+	}
+}
+
+// dispatchProfileEntry is one live profile's entry in the dispatch config,
+// with ref as its Job template reference (nil for none). It is also what the
+// dispatch budget measures (dispatchEntryEstimate), so the two agree on what
+// an entry costs.
+func dispatchProfileEntry(agent *agentv1alpha1.PlatformAgent, p *agentv1alpha1.AgentProfile, ref *a2aDispatchJobTemplateRef) a2aDispatchProfile {
+	unattendedTier := unattendedTierOf(p)
+	if unattendedTier == agentv1alpha1.AgentProfileTierUnattended {
+		unattendedTier = "" // the built-in, which the dispatcher knows
+	}
+	dp := a2aDispatchProfile{
+		Name:                  p.Name,
+		Tiers:                 liveTiersOf(p),
+		UnattendedTier:        unattendedTier,
+		Concurrency:           int(p.Spec.Concurrency),
+		QueueTimeoutSeconds:   int(p.QueueTimeout()),
+		ActiveDeadlineSeconds: func() int { d, _ := cappedTaskDeadline(agent, p); return d }(),
+		Durables:              []a2aDispatchDurable{},
+		JobTemplateRef:        ref,
+	}
+	for _, param := range p.Spec.Parameters {
+		dp.Parameters = append(dp.Parameters, a2aCardParameter{Name: param.Name, Required: param.Required})
+	}
+	drains := drainingTiersOf(p)
+	for _, tier := range p.AllowedTierList() {
+		if until, ok := drains[tier]; ok {
+			dp.DrainingTiers = append(dp.DrainingTiers, a2aDrainingTier{Tier: tier, Mode: tierModeOf(p, tier), Until: until})
+		}
+	}
+	// The draining tiers' durables too, so what is queued at them is read
+	// and refused tier-withdrawn rather than left with no terminal. Kept in
+	// memory only (#5479): the dispatcher derives the same set.
+	for _, tier := range p.AllowedTierList() {
+		for _, kind := range a2aSubmitKinds {
+			dp.Durables = append(dp.Durables, a2aDispatchDurable{Tier: tier, Kind: kind, Name: profileDurableName(p.Name, tier, kind)})
+		}
+	}
+	return dp
+}
+
 // desiredDispatchConfig is what the dispatcher reads for this agent: every
 // value resolved, and the profiles that have a rendered identity, each with
 // the durables the operator creates for it, one per (tier, kind).
@@ -632,58 +692,14 @@ func desiredDispatchConfigDraining(agent *agentv1alpha1.PlatformAgent, profiles 
 // drainingDispatchProfiles built it, with no durables and no template, since
 // nothing new is dispatched for it.
 func desiredDispatchConfigWith(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, jobTemplates map[string]*corev1.PodTemplateSpec, draining []a2aDispatchProfile) (a2aDispatchConfig, error) {
-	ceiling := resolveProfileCeiling(agent)
-	child, interactive := dispatchReserves(agent, ceiling)
-	cfg := a2aDispatchConfig{
-		Namespace:              agent.Namespace,
-		ProfileNamespace:       profileNamespaceName(agent),
-		Ceiling:                ceiling,
-		InteractiveReserve:     interactive,
-		ChildReserve:           child,
-		LeaseSeconds:           resolveProfileLeaseSeconds(agent),
-		RenewSeconds:           resolveProfileRenewSeconds(agent),
-		RestartGraceSeconds:    resolveProfileRestartGraceSeconds(agent),
-		AcceptTimeoutSeconds:   resolveProfileAcceptTimeoutSeconds(agent),
-		SubmitRetentionSeconds: dispatchSubmitRetentionSeconds(agent),
-		Profiles:               []a2aDispatchProfile{},
-	}
+	cfg := dispatchConfigEnvelope(agent)
 	resolved := resolveAgentProfileIdentities(agent, profiles)
 	for i := range profiles {
 		p := &profiles[i]
 		if resolved[p.Name].refused != nil {
 			continue
 		}
-		unattendedTier := unattendedTierOf(p)
-		if unattendedTier == agentv1alpha1.AgentProfileTierUnattended {
-			unattendedTier = "" // the built-in, which the dispatcher knows
-		}
-		dp := a2aDispatchProfile{
-			Name:                  p.Name,
-			Tiers:                 liveTiersOf(p),
-			UnattendedTier:        unattendedTier,
-			Concurrency:           int(p.Spec.Concurrency),
-			QueueTimeoutSeconds:   int(p.QueueTimeout()),
-			ActiveDeadlineSeconds: func() int { d, _ := cappedTaskDeadline(agent, p); return d }(),
-			Durables:              []a2aDispatchDurable{},
-			JobTemplateRef:        dispatchJobTemplateRef(p.Name, jobTemplates[p.Name]),
-		}
-		for _, param := range p.Spec.Parameters {
-			dp.Parameters = append(dp.Parameters, a2aCardParameter{Name: param.Name, Required: param.Required})
-		}
-		drains := drainingTiersOf(p)
-		for _, tier := range p.AllowedTierList() {
-			if until, ok := drains[tier]; ok {
-				dp.DrainingTiers = append(dp.DrainingTiers, a2aDrainingTier{Tier: tier, Mode: tierModeOf(p, tier), Until: until})
-			}
-		}
-		// The draining tiers' durables too, so what is queued at them is
-		// read and refused tier-withdrawn rather than left with no terminal.
-		for _, tier := range p.AllowedTierList() {
-			for _, kind := range a2aSubmitKinds {
-				dp.Durables = append(dp.Durables, a2aDispatchDurable{Tier: tier, Kind: kind, Name: profileDurableName(p.Name, tier, kind)})
-			}
-		}
-		cfg.Profiles = append(cfg.Profiles, dp)
+		cfg.Profiles = append(cfg.Profiles, dispatchProfileEntry(agent, p, dispatchJobTemplateRef(p.Name, jobTemplates[p.Name])))
 	}
 	live := map[string]bool{}
 	for _, p := range cfg.Profiles {
