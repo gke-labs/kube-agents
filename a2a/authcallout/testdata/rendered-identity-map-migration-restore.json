@@ -1,5 +1,5 @@
 {
-  "version": "c333598b83692e55",
+  "version": "c41e6cc7fd685ab0",
   "shard": 0,
   "shards": 1,
   "identities": [
@@ -63,7 +63,12 @@
           "$JS.API.STREAM.RESTORE.PROFILE_SUBMITS",
           "$JS.API.STREAM.UPDATE.PROFILE_SUBMITS",
           "$JS.API.STREAM.DELETE.PROFILE_SUBMITS",
-          "$JS.SNAPSHOT.RESTORE.PROFILE_SUBMITS.>"
+          "$JS.SNAPSHOT.RESTORE.PROFILE_SUBMITS.>",
+          "$JS.API.STREAM.INFO.DISPATCH_STOPS",
+          "$JS.API.STREAM.RESTORE.DISPATCH_STOPS",
+          "$JS.API.STREAM.UPDATE.DISPATCH_STOPS",
+          "$JS.API.STREAM.DELETE.DISPATCH_STOPS",
+          "$JS.SNAPSHOT.RESTORE.DISPATCH_STOPS.>"
         ],
         "subscribe": [
           "_INBOX.migrate-stream-3-1.>"

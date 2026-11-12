@@ -1229,6 +1229,7 @@ func TestALoneClaimKeepsTheRecordedServerCount(t *testing.T) {
 // back as a cluster on server 0's standalone store, past the conversion gate.
 // With no claims left there is no bus, and the field (or the default) decides.
 func TestStrayClaimsDoNotOutvoteTheRecordedServerCount(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
 	for _, tc := range []struct {
 		name     string
 		recorded int32
@@ -1643,9 +1644,9 @@ func TestTheRetiredConversionRefusalIsCleared(t *testing.T) {
 func TestNoOperatorImageStartsNoMigration(t *testing.T) {
 	t.Setenv(operatorImageEnvVar, "")
 	agent := a2aTestAgent()
+	// A bus rendered for one server, so the field below asks it to grow.
+	sts := buildA2ANATSStatefulSet(a2aSingleServerTestAgent(), "h")
 	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(3)}}
-	sts := buildA2ANATSStatefulSet(agent, "h")
-	sts.Spec.Replicas = ptr.To(int32(1))
 	rec := record.NewFakeRecorder(8)
 	r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent, sts).Build(), Scheme: setupScheme(), Recorder: rec}
 	if err := r.resolveA2ABusReplicas(context.Background(), agent); err != nil {

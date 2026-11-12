@@ -1539,6 +1539,8 @@ func TestNoRenderedPrincipalCanMakeOrBorrowAMigrationIdentity(t *testing.T) {
 		"buildPlatformLocalRole":               buildPlatformLocalRole(agent).Rules,
 		"buildPlatformLeaderRole":              buildPlatformLeaderRole(agent).Rules,
 		"buildScopePublisherRole":              buildScopePublisherRole(agent).Rules,
+		"buildA2ADispatcherJobsRole":           buildA2ADispatcherJobsRole(agent).Rules,
+		"buildMinimalPlatformRoleWithSecrets":  buildMinimalPlatformRoleWithSecrets(agent, true).Rules,
 	}
 	if got := buildersReturning(t, map[string]bool{"Role": true, "ClusterRole": true}); len(got) != len(roles) {
 		var names []string

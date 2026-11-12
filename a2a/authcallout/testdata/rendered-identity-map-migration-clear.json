@@ -1,5 +1,5 @@
 {
-  "version": "0a12f099f27f3d08",
+  "version": "cd650e8e1d6c8cf0",
   "shard": 0,
   "shards": 1,
   "identities": [
@@ -30,7 +30,9 @@
           "$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
           "$JS.API.STREAM.DELETE.KV_PROFILE_LEASES",
           "$JS.API.STREAM.INFO.PROFILE_SUBMITS",
-          "$JS.API.STREAM.DELETE.PROFILE_SUBMITS"
+          "$JS.API.STREAM.DELETE.PROFILE_SUBMITS",
+          "$JS.API.STREAM.INFO.DISPATCH_STOPS",
+          "$JS.API.STREAM.DELETE.DISPATCH_STOPS"
         ],
         "subscribe": [
           "_INBOX.migrate-stream-3-1.>"

@@ -1,5 +1,5 @@
 {
-  "provenance": "Captured 2026-10-31 by running the create lines of the operator's rendered provision script (operator commit 710c74b94, test agent, STREAM_REPLICAS=1) with natscli v0.1.5 (the CLI natsio/nats-box:0.14.5 ships, read from its binary's build info) against nats-server v2.10.29 (the bus image's line), then reading each stream back with STREAM.INFO. Regenerate with the capture tool whenever the provision script, the provision image or the bus image changes. Cross-checked against four /jsz dumps from the ka-next-4 lane (streams created there by the real provision Job, nats-box 0.14.5 against the nats:2.10-alpine bus): every field of the eight streams those dumps hold matched, absent and false read alike, except TOPICS-STATE's subjects, which come from the agent's topics and are policy fields; the two PROFILE streams postdate the dumps. KV_people (the people bucket, added to the provision script after the capture) is KV_feedback's captured entry with its name, subject and max_bytes changed: its provision line differs from feedback's only in those, so natscli renders the same fields; regenerate with the capture tool to replace it with a capture.",
+  "provenance": "Captured 2026-10-31 by running the create lines of the operator's rendered provision script (operator commit 710c74b94, test agent, STREAM_REPLICAS=1) with natscli v0.1.5 (the CLI natsio/nats-box:0.14.5 ships, read from its binary's build info) against nats-server v2.10.29 (the bus image's line), then reading each stream back with STREAM.INFO. Regenerate with the capture tool whenever the provision script, the provision image or the bus image changes. Cross-checked against four /jsz dumps from the ka-next-4 lane (streams created there by the real provision Job, nats-box 0.14.5 against the nats:2.10-alpine bus): every field of the eight streams those dumps hold matched, absent and false read alike, except TOPICS-STATE's subjects, which come from the agent's topics and are policy fields; the two PROFILE streams postdate the dumps. KV_people (the people bucket, added to the provision script after the capture) is KV_feedback's captured entry with its name, subject and max_bytes changed: its provision line differs from feedback's only in those, so natscli renders the same fields; regenerate with the capture tool to replace it with a capture. DISPATCH_STOPS was added 2026-11-11 from its create line in the same script, captured with natscli v0.4.0 against nats-server v2.14.5 (the tools at hand). PROFILE_SUBMITS, captured beside it as a control, matched this file on every field it records, and the entry keeps only those fields.",
   "streams": {
     "DIRECTORY": {
       "name": "DIRECTORY",
@@ -266,6 +266,28 @@
       "discard": "old",
       "max_age": 0,
       "max_msgs_per_subject": 8,
+      "max_msg_size": -1,
+      "storage": "file",
+      "num_replicas": 1,
+      "duplicate_window": 120000000000,
+      "compression": "none",
+      "allow_direct": true,
+      "mirror_direct": false,
+      "consumer_limits": {},
+      "allow_msg_ttl": false
+    },
+    "DISPATCH_STOPS": {
+      "name": "DISPATCH_STOPS",
+      "subjects": [
+        "a2a.stop.>"
+      ],
+      "retention": "limits",
+      "max_consumers": 1,
+      "max_msgs": -1,
+      "max_bytes": 67108864,
+      "discard": "old",
+      "max_age": 86400000000000,
+      "max_msgs_per_subject": 1,
       "max_msg_size": -1,
       "storage": "file",
       "num_replicas": 1,

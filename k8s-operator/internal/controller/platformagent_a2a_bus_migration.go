@@ -1031,6 +1031,7 @@ func a2aStreamPolicies(replicas int) []busmigrate.StreamPolicy {
 		kv("people", 33554432, 30*day),
 		kv("PROFILE_LEASES", 67108864, 0),
 		stream("PROFILE_SUBMITS", []string{"a2a.submit.>"}, 3*day, 1073741824, 1),
+		stream(a2aDispatchStopStream, []string{"a2a.stop.>"}, day, 67108864, 1),
 	}
 }
 
