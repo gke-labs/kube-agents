@@ -234,6 +234,15 @@ type fakeAdapter struct {
 	// nil, and a text edit of a text line is not.
 	stopLines []fakePost
 	laidOut   map[string]bool
+	// privates records every PostPrivate (privatePosts), the posts one
+	// viewer alone sees; they are not in posts.
+	privates []fakePrivatePost
+}
+
+type fakePrivatePost struct {
+	Conversation string
+	Viewer       string
+	Text         string
 }
 
 type fakeTerminal struct {
@@ -396,6 +405,19 @@ func (a *fakeAdapter) InboundVerified(_, messageID string, verified bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.verified = append(a.verified, fmt.Sprintf("%s:%t", messageID, verified))
+}
+
+func (a *fakeAdapter) PostPrivate(conversation, viewer, text string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.privates = append(a.privates, fakePrivatePost{conversation, viewer, text})
+	return nil
+}
+
+func (a *fakeAdapter) privatePosts() []fakePrivatePost {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]fakePrivatePost(nil), a.privates...)
 }
 
 func (a *fakeAdapter) verifiedCalls() []string {
@@ -1211,7 +1233,10 @@ func TestARejectedTaskPostsTheReasonTheExecutorGave(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	const reason = "reason: capability-refused - the verifier could not be reached"
+	// The notice carries the detail and never the token or the prefix
+	// (.agents/rules/chat_ux.md, "No plumbing in user text").
+	const detail = "the verifier could not be reached"
+	const reason = "reason: capability-refused - " + detail
 	payload, err := json.Marshal(lib.StatusUpdate{
 		TaskID: origin.TaskID, ContextID: origin.ContextID,
 		Status: lib.TaskStatus{State: lib.StateRejected, Message: &lib.Message{
@@ -1233,12 +1258,17 @@ func TestARejectedTaskPostsTheReasonTheExecutorGave(t *testing.T) {
 
 	waitFor(t, "the refusal posts with its reason", func() bool {
 		for _, p := range r.adapter.postTexts() {
-			if strings.Contains(p, reason) {
+			if strings.Contains(p, detail) {
 				return true
 			}
 		}
 		return false
 	})
+	for _, p := range r.adapter.postTexts() {
+		if strings.Contains(p, reasonPrefix) || strings.Contains(p, "capability-refused") {
+			t.Fatalf("the notice carries the executor's plumbing: %q", p)
+		}
+	}
 }
 
 func TestLongFailureReasonIsChunkedUnderTheCap(t *testing.T) {

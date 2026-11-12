@@ -220,8 +220,9 @@ fixtures:
       - instance/startup-fail-<prefix>
     defect: >-
       A standalone e2-micro, startup-fail-<prefix>, whose startup script
-      exits 1 on every boot, so the guest agent's failure line is on its
-      serial console from the first boot onward.
+      exits 1 on every boot. The guest agent prints the failure line once
+      per boot, and the serial buffer rotates it out within about three
+      weeks, so each reconcile resets the VM to print it again.
 
   - role: world-open-ingress
     slot: null # Project-scoped, in var.zone; not attached to any cluster.
@@ -458,6 +459,21 @@ fixtures:
       Service that does not exist. The missing backend is the defect; Fail
       alone is set by healthy webhooks. Selectors confine it so it rejects no
       other scenario's writes.
+
+  - role: readiness-crd-webhook
+    slot: b
+    available_from_day: 0
+    objects:
+      - validatingwebhookconfiguration/seeded-crd-gate
+    defect: >-
+      failurePolicy Fail with a 2-second timeout and one rule on
+      CapacityBuffer creates and updates in the autoscaling.x-k8s.io group,
+      pointing at a Service that does not exist: the fail-closed webhook that
+      refuses the writes GKE's control plane makes in that group after a
+      1.35+ upgrade, where it installs capacitybuffers. An objectSelector on
+      the fleet label keeps it off every real object; the rule stays off
+      apiextensions.k8s.io so a dropped selector could never refuse a CRD
+      write.
 
   - role: node-local-state
     slot: a

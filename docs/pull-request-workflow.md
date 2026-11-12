@@ -135,7 +135,9 @@ fails; see `.agents/skills/edit-mirrored-skill/SKILL.md`.
 every namespace as full objects (`-A -o json|yaml`), because the credential proxy cuts such a reply
 at its output cap on a large cluster. Read one kind per call, project the fields with
 `-o jsonpath=` or `custom-columns=`, or read per namespace; the reads already in the tree are pinned
-with a reason in `scripts/cluster_reads_allowlist.txt`, which only shrinks. A Markdown span that
+with a reason in `scripts/cluster_reads_allowlist.txt`, which only shrinks, except for an
+`unresolved-kinds` read of one runtime kind per call that falls back when the broker cuts it, which
+is pinned with a reason that says so. A Markdown span that
 quotes the shape only to warn against it carries `<!-- cluster-reads-check: warning -->` on its
 line, and the check skips the spans on that line. CI runs the same check through
 `scripts/test_check_cluster_reads.py`.
@@ -327,7 +329,8 @@ exception (`make gosec`, below). The per-area targets, for a faster loop while y
   live under `agents/*/defaults/skills/` instead of `agents/*/skills/`.
 - `make -C k8s-operator test` — manifests, generate, fmt, vet, the Python suite under
   `k8s-operator/internal/controller` (the gateway's leader-election wrapper; `make test-python`
-  runs it too), then the envtest download and `go test`; what the `Operator Tests` job runs.
+  runs it too), then the envtest download and `go test`; what the `Operator Tests` job runs
+  after its gosec step, which the target does not include (`make gosec`, below, does).
 - `make test-integration` — the seam tier only, for a component another one talks to across a
   process or protocol boundary. Install a Go toolchain first: the injector seam compiles the real
   Go event-watcher client, and without `go` on `PATH` its tests skip and the run still prints

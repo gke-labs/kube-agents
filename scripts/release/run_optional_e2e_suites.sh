@@ -17,6 +17,11 @@ OPTIONAL_SUITES="${OPTIONAL_SUITES:-}"
 # at the same path, so nothing has to reach a cluster to pin the loop's control
 # flow.
 E2E_RUNNER="${E2E_RUNNER:-./scripts/release/execute_e2e_tests.sh}"
+# pytest's summary line for a run that skipped and passed nothing: a suite that
+# skips while its credentials are unprovisioned exits 0, and reading that as
+# "passed" would report coverage that never ran.
+readonly PYTEST_SKIPPED_PATTERN='[0-9]+ skipped'
+readonly PYTEST_PASSED_PATTERN='[0-9]+ passed'
 
 # Strip separators as well as whitespace, so "", " " and ",," all read as empty.
 if [ -z "${OPTIONAL_SUITES//[[:space:],]/}" ]; then
@@ -25,6 +30,7 @@ if [ -z "${OPTIONAL_SUITES//[[:space:],]/}" ]; then
 fi
 
 passed=()
+skipped=()
 failed=()
 
 IFS=',' read -r -a requested_suites <<<"${OPTIONAL_SUITES}"
@@ -33,14 +39,20 @@ for raw_suite in "${requested_suites[@]}"; do
   [ -n "${suite}" ] || continue
 
   echo "::group::Optional E2E suite: ${suite}"
-  if "${E2E_RUNNER}" --suite "${suite}"; then
+  suite_log="$(mktemp)"
+  "${E2E_RUNNER}" --suite "${suite}" 2>&1 | tee "${suite_log}"
+  suite_status=${PIPESTATUS[0]}
+  if [ "${suite_status}" -eq 0 ] && grep -Eq "${PYTEST_SKIPPED_PATTERN}" "${suite_log}" && ! grep -Eq "${PYTEST_PASSED_PATTERN}" "${suite_log}"; then
+    skipped+=("${suite}")
+    echo "==> Optional suite '${suite}' skipped: it ran no test."
+  elif [ "${suite_status}" -eq 0 ]; then
     passed+=("${suite}")
     echo "==> Optional suite '${suite}' passed."
   else
-    suite_status=$?
     failed+=("${suite}")
     echo "::warning title=Optional E2E suite failed::'${suite}' exited ${suite_status}. It is optional, so the pipeline continues and nothing it gates is blocked — but the coverage it was meant to provide is missing from this run." >&2
   fi
+  rm -f "${suite_log}"
   echo "::endgroup::"
 done
 
@@ -53,6 +65,9 @@ if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
     for suite in "${passed[@]:-}"; do
       [ -n "${suite}" ] && echo "| \`${suite}\` | ✅ passed |"
     done
+    for suite in "${skipped[@]:-}"; do
+      [ -n "${suite}" ] && echo "| \`${suite}\` | ⏭️ skipped |"
+    done
     for suite in "${failed[@]:-}"; do
       [ -n "${suite}" ] && echo "| \`${suite}\` | ❌ failed (tolerated) |"
     done
@@ -64,4 +79,4 @@ if [ "${#failed[@]}" -gt 0 ]; then
   exit 1
 fi
 
-echo "==> All ${#passed[@]} optional suite(s) passed."
+echo "==> ${#passed[@]} optional suite(s) passed, ${#skipped[@]} skipped."
