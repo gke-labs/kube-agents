@@ -236,8 +236,9 @@ ensure compilation succeeds.
 
 **A2A module code.** If you modify `a2a/`, run `make gosec` from the repository root (it scans every
 module; the CI step scans `a2a/` alone, with the same binary built from `k8s-operator/go.mod`'s
-pin), then `go vet ./...` and `go test -race ./...` inside that directory — what the
-`A2A Module Tests` CI job runs for this module. The conformance suite starts an embedded
+pin), then `go vet ./...` and `go test -race -timeout 20m ./...` inside that directory — what the
+`A2A Module Tests` CI job runs for this module (the gateway package alone takes close to go test's
+default 10 minutes under `-race`). The conformance suite starts an embedded
 JetStream server, so no cluster or credentials are needed. The CI job additionally installs the
 envtest binaries and the `nats` CLI; without them the auth callout's API-server and CLI cases skip
 and the run still reports green. To match it, run with
