@@ -26,7 +26,10 @@ type conditionDoc struct {
 }
 
 // degradedConditionReasons are the reasons the Degraded condition carries,
-// for its row. Listed by constant, so a renamed reason fails to compile; a
+// for its row, in the order updateStatusReady ranks them. A parked pass reads
+// the ones ahead of A2ABusStreamsMissing as ranked above it
+// (degradedRanksAboveBusStreams), so a new reason goes where the chain puts
+// it. Listed by constant, so a renamed reason fails to compile; a
 // new reason has to be added here by hand (the writer passes it as a value,
 // which the completeness test cannot follow).
 var degradedConditionReasons = []string{
