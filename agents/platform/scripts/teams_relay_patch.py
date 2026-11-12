@@ -45,6 +45,8 @@ TEAMS_RELAY_REQUEST_TIMEOUT_SECONDS = 60
 # on a stalled broker would hold an executor slot the reply itself needs.
 TEAMS_TYPING_REQUEST_TIMEOUT_SECONDS = 5
 TEAMS_TRUSTED_SERVICE_HOSTS = ("smba.trafficmanager.net", "api.botframework.com")
+# Conversations whose regional serviceUrl the adapter remembers (oldest out).
+TEAMS_SERVICE_URL_CACHE_MAX = 1024
 # Bot Framework `conversation.conversationType` -> gateway `chat_type`. The
 # memory providers treat only "dm" as single-person, so a Teams 1:1 chat
 # (`personal`) must arrive as "dm" for personal memory to stay on.
@@ -586,6 +588,11 @@ def _build_teams_adapter_and_sender(
             # Conversation -> the monotonic deadline of its typing post in
             # flight (see send_typing).
             self._typing_in_flight: dict[str, float] = {}
+            # Conversation -> the regional serviceUrl its last inbound activity
+            # carried. Hermes' typing and reply calls pass thread metadata
+            # without a serviceUrl, and the global default URL does not render
+            # a typing indicator for a regionally hosted chat (live, 2026-11-12).
+            self._service_urls: dict[str, str] = {}
 
         def set_handler(
             self, handler: Callable[[str, str, dict[str, Any]], Any]
@@ -625,11 +632,15 @@ def _build_teams_adapter_and_sender(
             text = content if content is not None else message
             meta = metadata if isinstance(metadata, dict) else {}
             fallback_url = default_service_url()
-            candidate_url = meta.get("serviceUrl") or fallback_url
+            conversation_id = str(chat_id or "").strip()
+            candidate_url = (
+                meta.get("serviceUrl")
+                or self._service_urls.get(conversation_id)
+                or fallback_url
+            )
             service_url = (
                 candidate_url if is_trusted_service_url(candidate_url) else fallback_url
             )
-            conversation_id = str(chat_id or "").strip()
 
             effective_thread = (
                 thread_id
@@ -695,7 +706,11 @@ def _build_teams_adapter_and_sender(
         ) -> None:
             """Send a typing indicator activity to Teams (the base's signature)."""
             meta = metadata if isinstance(metadata, dict) else {}
-            service_url = meta.get("serviceUrl") or default_service_url()
+            service_url = (
+                meta.get("serviceUrl")
+                or self._service_urls.get(str(chat_id or "").strip())
+                or default_service_url()
+            )
             if not is_trusted_service_url(service_url):
                 return
             # The base refreshes the indicator every 2 s and cancels each call
@@ -802,6 +817,10 @@ def _build_teams_adapter_and_sender(
 
             conv = activity.get("conversation") or {}
             conv_id = str(conv.get("id") or "").strip()
+            if conv_id and raw_service_url:
+                if len(self._service_urls) >= TEAMS_SERVICE_URL_CACHE_MAX:
+                    self._service_urls.pop(next(iter(self._service_urls)))
+                self._service_urls[conv_id] = service_url
 
             if not is_user_allowed(
                 sender_id=sender_id,

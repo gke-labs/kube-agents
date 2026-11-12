@@ -348,6 +348,43 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(shebang_blocks), 1)
         self.assertIsNone(shebang_blocks[0].get("weight"))
 
+    async def test_typing_and_replies_reuse_the_conversations_regional_url(self):
+        from gateway.platform_registry import PlatformRegistry
+
+        teams_relay_patch.install()
+        adapter = PlatformRegistry().create_adapter("teams", config={"extra": {}})
+        adapter.allow_all_users = True
+        adapter.set_handler(mock.AsyncMock())
+        regional = "https://smba.trafficmanager.net/ca/759d68f0-0000-0000-0000-000000000000/"
+        posted: list[dict] = []
+
+        def fake_urlopen(req, timeout=None):
+            posted.append(json.loads(req.data))
+            resp = mock.MagicMock()
+            resp.__enter__.return_value = resp
+            resp.read.return_value = b'{"response": {"id": "1"}}'
+            return resp
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            await adapter._process_activity(
+                {
+                    "type": "message",
+                    "id": "act-regional",
+                    "text": "hi",
+                    "serviceUrl": regional,
+                    "conversation": {"id": "a:conv-ca", "conversationType": "personal"},
+                    "from": {"id": "29:u", "aadObjectId": "aad-u"},
+                }
+            )
+            posted.clear()
+            # Hermes' typing and reply calls carry thread metadata only.
+            await adapter.send_typing("a:conv-ca", metadata={"thread_id": None})
+            await adapter.send("a:conv-ca", "reply", metadata={"thread_id": None})
+            await adapter.send("a:other", "reply", metadata=None)
+        urls = [body["serviceUrl"] for body in posted if "serviceUrl" in body]
+        self.assertEqual(urls[:2], [regional, regional])
+        self.assertEqual(urls[2], teams_relay_patch.default_service_url())
+
     def test_markdown_table_becomes_an_adaptive_card_table(self):
         text = (
             "Clusters:\n\n"
