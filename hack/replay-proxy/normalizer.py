@@ -126,6 +126,16 @@ LINE_BREAK = "\n"
 # A line that opens a JSON document, and an indented line continuing a warning.
 JSON_LINE_RE = re.compile(r"^[{\[]", re.M)
 CONTINUATION_PREFIXES = (" ", "\t")
+# Hermes' skill_view result lists a skill's files per support directory as
+# glob/rglob returns them, in directory order, which differs from pod to pod:
+# `linked_files` (tools/skills_tool.py `_skill_linked_files`) and, when the
+# asked-for file is missing, `available_files` (tools/skills_tool_plugin.py
+# `_available_skill_files`). Each group's list is sorted for the key
+# (sorted_skill_listings); nothing else in the result is reordered. Read only
+# in a tool message answering a skill_view call, found by its tool_call_id.
+TOOL_ROLE = "tool"
+SKILL_VIEW_TOOL = "skill_view"
+SKILL_LISTING_KEYS = ("linked_files", "available_files")
 NUMBER_CLASS = "NUM"
 # A swapped number with at least this many digits counts as repeated wherever an
 # answer has it as a whole token (`kill 4821`). A shorter one counts only next
@@ -457,7 +467,6 @@ RECENT_WORK_ESCAPED_RE = re.compile(
 # this run's is not served (replay_proxy lookup), since the answer may act on
 # the file being there, or on it not being there (`write_file INVENTORY.md`
 # would overwrite what another agent wrote).
-TOOL_ROLE = "tool"
 READ_FILE_TOOL = "read_file"
 READ_FILE_ERROR_KEY = "error"
 READ_FILE_NOT_FOUND_PREFIX = "File not found:"
@@ -552,6 +561,38 @@ def warnings_last(text: str) -> str:
             return LINE_BREAK.join([text[opener.start(): end]] + before + after)
         return text
     return text
+
+
+def sorted_skill_listings(text: str) -> str:
+    """A skill_view result with each SKILL_LISTING_KEYS group's file list sorted; any other text as it is.
+
+    Returns `text` itself when nothing moved, so a result already in order keeps its exact text.
+    A result Hermes appended a notice to (the iteration-budget warning, toolguard guidance)
+    is JSON followed by text: its JSON is sorted and written in canonical form, so two pods'
+    copies key alike whichever needed the sort, and the appended text is kept as it is.
+    """
+    parsed = Normalizer.parse_json_document(text)
+    tail = None
+    if parsed is None:
+        try:
+            parsed, end = json.JSONDecoder().raw_decode(text.lstrip())
+        except ValueError:
+            return text
+        tail = text.lstrip()[end:]
+    if not isinstance(parsed, dict):
+        return text
+    moved = False
+    for key in SKILL_LISTING_KEYS:
+        groups = parsed.get(key)
+        if not isinstance(groups, dict):
+            continue
+        for group, files in groups.items():
+            if isinstance(files, list) and all(isinstance(f, str) for f in files) and files != sorted(files):
+                groups[group] = sorted(files)
+                moved = True
+    if tail is not None:
+        return json.dumps(parsed, sort_keys=True, ensure_ascii=False) + tail
+    return json.dumps(parsed, ensure_ascii=False) if moved else text
 
 
 def time_bucket(when: float, now: float) -> str:
@@ -999,6 +1040,8 @@ class Normalizer:
         self.timed_strings: Dict[str, bool] = {}
         self.timed_containers: Dict[Tuple[int, Optional[str], bool], bool] = {}
         self.time_indexes: Dict[str, TimeIndex] = {}
+        # The tool_call ids of the skill_view calls walked so far (walk_message).
+        self.skill_view_calls: Set[str] = set()
 
     # -- structure ---------------------------------------------------------
     #
@@ -1027,15 +1070,18 @@ class Normalizer:
     def walk_message(self, message: Any) -> Any:
         """Walk one request message; an assistant message's text also gets the answer-only swaps (text).
 
-        An assistant message's read_file calls are noted, so the tool message
-        answering one is walked without a not-found's `similar_files` (without_similar_files).
+        An assistant message's read_file and skill_view calls are noted, so the
+        tool message answering one is walked without a not-found's
+        `similar_files` (without_similar_files), or with its file listings
+        sorted (sorted_skill_listings).
         """
         outer = self.in_answer
         self.in_answer = isinstance(message, dict) and message.get(ROLE_FIELD) == ASSISTANT_ROLE
         if self.in_answer:
             self.note_read_file_calls(message)
+            self.note_skill_view_calls(message)
         try:
-            return self.walk(self.similar_files_dropped(message))
+            return self.walk(self.similar_files_dropped(self.skill_listings_sorted(message)))
         finally:
             self.in_answer = outer
 
@@ -1058,6 +1104,23 @@ class Normalizer:
             return message
         content, files = without_similar_files(message[CONTENT_FIELD])
         self.mapping.dropped_files.update(name for name in (PurePosixPath(f).name for f in files) if name)
+        return message if content is message[CONTENT_FIELD] else dict(message, **{CONTENT_FIELD: content})
+
+    def note_skill_view_calls(self, message: Dict[str, Any]) -> None:
+        calls = message.get(TOOL_CALLS_KEY)
+        for call in calls if isinstance(calls, list) else []:
+            function = call.get(FUNCTION_FIELD) if isinstance(call, dict) else None
+            if isinstance(function, dict) and function.get(NAME_FIELD) == SKILL_VIEW_TOOL:
+                if isinstance(call.get(ID_KEY), str):
+                    self.skill_view_calls.add(call[ID_KEY])
+
+    def skill_listings_sorted(self, message: Any) -> Any:
+        """`message`, with its content's file listings sorted when it is the result of a noted skill_view call."""
+        if not (isinstance(message, dict) and message.get(ROLE_FIELD) == TOOL_ROLE
+                and isinstance(message.get(TOOL_CALL_ID_KEY), str) and message[TOOL_CALL_ID_KEY] in self.skill_view_calls
+                and isinstance(message.get(CONTENT_FIELD), str)):
+            return message
+        content = sorted_skill_listings(message[CONTENT_FIELD])
         return message if content is message[CONTENT_FIELD] else dict(message, **{CONTENT_FIELD: content})
 
     def replacement(self, obj: Any, key: Optional[str], in_tool_call: bool) -> Optional[Callable[[], Any]]:

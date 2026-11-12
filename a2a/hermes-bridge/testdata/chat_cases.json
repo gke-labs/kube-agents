@@ -1,5 +1,5 @@
 {
-  "_comment": "Shared cases for the bridge's ports of slack_presenter.split_answer, _plain and arrival_reaction (a2a/hermes-bridge/chat.go). Expected values are the Python presenter's; agents/platform/scripts/test_chat_message.py fails when they drift from it.",
+  "_comment": "Shared cases for the bridge's ports of slack_presenter.split_answer, _plain and arrival_reaction (a2a/hermes-bridge/chat.go; ask_kind's is a2a/lib/askkind, through chat.go's askKind). Expected values are the Python presenter's; agents/platform/scripts/test_chat_message.py fails when they drift from it.",
   "split_answer": [
     {
       "in": "checkout-gateway is crashlooping on an OOM. It hit its 256Mi limit.\n\nRaise it to 512Mi.",
