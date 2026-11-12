@@ -863,7 +863,10 @@ step as its only choice, `next` and not `primary`, and leaves the line out of `h
 and `fold`, by `slack_moments.next_step`'s rule; the line is plumbing, so the text fallback
 leaves it out too (`slack_moments.visible_text`, the bridge's `visibleText`), and a renderer
 without buttons shows the answer alone),
-the prompt's `mark.ask` on each `progress` heartbeat, and, when the turn filed a card (a
+the prompt's `mark.ask` on each `progress` heartbeat (the gateway draws the same kind on the ask
+when it accepts a human turn on any route, from the same keyword match, `a2a/lib/askkind`, so
+the reaction stands before the first heartbeat and a turn that ends sooner still shows it; a
+click or an answer continues an earlier ask and draws nothing new), and, when the turn filed a card (a
 `kanban_create` call that did not fail) in a Slack conversation with `KAGE_SLACK_UX` on and its conversation route recorded,
 the terminal's mark-only message; anywhere else nothing settles the ask later, so the
 terminal keeps its default. The kanban notifier, in the Hermes gateway process where the

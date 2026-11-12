@@ -109,12 +109,12 @@ class SlackAgentTestLogic(unittest.TestCase):
         _run(fake)
         self.assertTrue(fake.posted[0]["text"].startswith(f"<@{_BOT}> "))
 
-    def test_no_reaction_is_the_expected_failure_on_next_and_a_failure_on_today(self):
+    def test_no_reaction_fails_in_either_mode(self):
         step = [{"replies": [_ANSWER]}]
-        _run(FakeSlack(step), mode="next")
-        with self.assertRaises(AssertionError) as caught:
-            _run(FakeSlack(step), mode="today")
-        self.assertIn("reacted", str(caught.exception))
+        for mode in ("next", "today"):
+            with self.subTest(mode=mode), self.assertRaises(AssertionError) as caught:
+                _run(FakeSlack(step), mode=mode)
+            self.assertIn("reacted", str(caught.exception))
 
     def test_a_plain_text_answer_fails_only_on_next(self):
         answer = {"ts": _ANSWER_TS, "user": _BOT, "text": "It is 5."}
