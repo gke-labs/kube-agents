@@ -908,7 +908,17 @@ def cause_sentence(health: dict) -> str:
         rest = items[STORM_CHAT_PHRASINGS:]
         if rest:
             said += f", and {sum(n for _, n in rest)} reps in {len(rest)} other phrasings"
-        return f"quota storm {window} hit {prs} PRs" + (f"; reps: {said}." if said else ".")
+        sentence = f"quota storm {window} hit {prs} PRs" + (f"; reps: {said}" if said else "")
+        # Runs set aside because their install died: named, so the reader
+        # does not count them against the storm.
+        aside = [a for a in (incident.get("set_aside") or []) if isinstance(a, dict) and isinstance(a.get("reps"), int)]
+        if aside:
+            sentence += "; not counted: " + "; ".join(
+                f"{a['reps']} case attempts on " + (f"PR #{a['pr']}" if isinstance(a.get("pr"), int) else "one run") + (f" ({a['project']})" if isinstance(a.get("project"), str) else "")
+                + (f", whose install died at {clock(parse_iso(a['at']))}" if isinstance(a.get("at"), str) and parse_iso(a["at"]) else ", whose install died")
+                for a in aside
+            )
+        return sentence + "."
     if condition == "setup_deaths":
         return f"{incident.get('runs', 0)} runs on {prs} PRs died during setup since {since}."
     if condition == CONDITION_FIXTURE_DRIFT:

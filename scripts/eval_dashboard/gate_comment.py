@@ -63,7 +63,8 @@ Which words: classify.py's `classify_run` -- the same rules the dashboard's
 run.html and the incident brief use -- decides per case whether it is
 `shared` (the gate's), `only-this-pr` (yours), `storm`, `delegation-ceiling`
 (the harness's wait, nothing graded), `forge-unavailable` (a forge read failed
-during grading) or unexplained; this module only phrases it.
+during grading), `install-died` (the run's install died under the case) or
+unexplained; this module only phrases it.
 
 One comment per pull request, found by a hidden marker and edited in place
 on later runs; a build already commented on is never commented on twice.
@@ -123,6 +124,7 @@ OUTCOME_PARTIAL = classify.OUTCOME_PARTIAL
 OUTCOME_FAILED = classify.OUTCOME_FAILED
 CLS_CEILING = classify.CLS_CEILING
 CLS_FORGE = classify.CLS_FORGE
+CLS_INSTALL_DIED = classify.CLS_INSTALL_DIED
 
 # Links. The run page and the brief are the dashboard's, written by
 # post_health.run_link and, for the brief, brief_link below (post_health's
@@ -159,9 +161,10 @@ SHARED_BREAK_CAUSE = "the same cases fail on every PR since {since} ({prs} PRs s
 # same sentence without the count, built from the same incident fields.
 CEILING_PUBLIC_CAUSE = "runs on {prs} PRs ended with the worker still running {window}; nothing was graded and nothing counts against a case."
 CEILING_WINDOW_SINCE = "since {since}"
-# health.json incident field the storm sentence quotes (the reps' words and
-# counts); dropped before the sentence is rendered here.
-STORM_CAUSES_KEY = "causes"
+# health.json incident fields the storm sentence quotes (the reps' words and
+# counts; the runs set aside, with their pool projects); dropped before the
+# sentence is rendered here.
+STORM_PRIVATE_KEYS = ("causes", "set_aside")
 BOX_HEALTHY = "🟢 **Gate healthy.**"
 ALL_THEIRS = "**Your failures are exactly the gate's, so this red is not your code.** Don't retest yet; run `/retest` once #kube-agents-ci-health says the gate is healthy again."
 SOME_THEIRS = "**Some of your failures are the gate's; {yours_text}.** Fix those; don't retest for the rest until the gate is healthy."
@@ -243,6 +246,7 @@ NOT_EVALUATED_CAUSE = "infrastructure failed before the agent ran"
 NOT_EVALUATED_CAUSE_BY_CLASS = {
     CLS_FORGE: "a forge read failed during grading, so the checks that read it could not be evaluated",
     CLS_CEILING: "delegated work was still running when the harness stopped waiting",
+    CLS_INSTALL_DIED: "the run's install died under them, every pod deleted at once",
 }
 # Lost cases that all ran the agent, but not of one class: a forge outage on
 # some and the delegation ceiling on others.
@@ -356,8 +360,9 @@ def newest_red_per_pr(data: dict, since: datetime, now: datetime) -> list[dict]:
 def cause_text(health_doc: dict) -> str:
     """post_health.cause_sentence, except that a shared break names no case,
     a delegation ceiling counts no repetitions, and a storm prints no
-    repetition count or reason: the incident's `causes` are the reps' own
-    words, which this comment keeps off the public record."""
+    repetition count, reason or pool project: the incident's `causes` are the
+    reps' own words and `set_aside` names runs, which this comment keeps off
+    the public record."""
     incident = health_doc.get("incident") or {}
     since = post_health.clock(post_health.parse_iso(health_doc.get("since")))
     if health_doc.get("condition") == health.SHARED_BREAK:
@@ -367,7 +372,7 @@ def cause_text(health_doc: dict) -> str:
         window = post_health.clock_range(start, end) if start and end else CEILING_WINDOW_SINCE.format(since=since)
         return CEILING_PUBLIC_CAUSE.format(prs=len(incident.get("prs") or []), window=window)
     if health_doc.get("condition") == health.STORM:
-        return post_health.cause_sentence(dict(health_doc, incident={k: v for k, v in incident.items() if k != STORM_CAUSES_KEY}))
+        return post_health.cause_sentence(dict(health_doc, incident={k: v for k, v in incident.items() if k not in STORM_PRIVATE_KEYS}))
     return post_health.cause_sentence(health_doc)
 
 

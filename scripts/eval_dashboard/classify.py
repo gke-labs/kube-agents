@@ -47,10 +47,12 @@ An ungraded case (outcome ``infra``) is ``storm`` under the same storm
 tests, or ``delegation-ceiling`` when every one of its ungraded repetitions
 carries the scorer's DELEGATION_CEILING_MARKER: the harness's delegation
 wait ran out with the worker still running (#1874), ``fixture-drift`` when
-they were never run because a fixture had drifted, or ``forge-unavailable``
+they were never run because a fixture had drifted, ``forge-unavailable``
 when their checks errored on a forge read that failed during grading
-(FORGE_UNAVAILABLE_MARKER). Ceiling, fixture and forge repetitions are
-outside the storm count and every pass-rate denominator.
+(FORGE_UNAVAILABLE_MARKER), or ``install-died`` when the run's install died
+under them (``install_deaths`` on the run record: every pod deleted at once).
+Ceiling, fixture and forge repetitions are outside the storm count and every
+pass-rate denominator; a dead install's are outside the storm count.
 
 ``setup`` is a run-level class: no tasks, a FAILURE verdict, under
 SETUP_DEATH_MAX_DURATION (#1172). A lost pod -- the same zero-task FAILURE
@@ -272,6 +274,7 @@ CLS_STORM = "storm"
 CLS_CEILING = "delegation-ceiling"
 CLS_FIXTURE_DRIFT = "fixture-drift"
 CLS_FORGE = "forge-unavailable"
+CLS_INSTALL_DIED = "install-died"
 CLS_SETUP = "setup"
 CLS_DEADLINE = "deadline-kill"
 VERDICT_RED = "red"
@@ -300,6 +303,7 @@ DO_SETUP = "Retest. If it dies the same way again, the leased project is the sus
 DO_LOST_POD = "Retest once new jobs are progressing; the build node died under this run, not your change."
 DO_CEILING = "Retest. The worker was still running when the harness's delegation wait ran out; nothing about your change was graded."
 DO_FIXTURE_DRIFT = "Nothing for the PR. A seeded-fleet fixture this case needs was out of its designed state on the leased project, so the case was not run and does not block; the reason names the role and what the scan saw."
+DO_INSTALL_DIED = "Retest. The run's install died under these cases (every pod was deleted at once), so nothing about your change was graded."
 DO_FORGE = "Retest. A forge read failed during grading (a 5xx, a dropped connection or a rate limit), so the checks that read it were not evaluated; nothing about your change was graded."
 DO_DEADLINE_KILL = "Retest once the brief says runs are finishing again. Prow killed the run at its deadline before a verdict; if other PRs' runs are finishing, a change on this branch that hangs the eval looks like this too."
 # The outage's recovering hold: other PRs' runs are finishing, so a kill
@@ -443,6 +447,14 @@ def _run_facts(run: dict) -> dict:
 def collapsed_cases(run: dict) -> set[str]:
     """Cases that failed every graded repetition (the adjudicator's collapse)."""
     return _run_facts(run)["collapsed"]
+
+
+def run_is_storm(run: dict) -> bool:
+    """Whether the run's dead repetitions read as the storm's: enough of
+    them, and not a run whose install died under them (`install_deaths`,
+    SCHEMA.md), whose losses are that install's and not the pool's, as the
+    health rule counts them."""
+    return storm_reps(run) >= STORM_RUN_SIGNATURE_REPS and not run.get("install_deaths")
 
 
 def storm_reps(run: dict) -> int:
@@ -854,6 +866,12 @@ def classify_case(task: dict, run: dict, others: list[dict], admitted: frozenset
             # wait). Neither is the PR's.
             cls = CLS_FORGE
             do = DO_FORGE
+        elif run.get("install_deaths"):
+            # The run's install died under its cases (SCHEMA.md
+            # `install_deaths`): the health rule keeps these out of the
+            # storm, and so does the advice.
+            cls = CLS_INSTALL_DIED
+            do = DO_INSTALL_DIED
         elif run_storm or condition == CONDITION_STORM:
             cls = CLS_STORM
             do = DO_STORM
@@ -910,9 +928,15 @@ def headline_for(cases: list[dict], run: dict, incident: bool, has_incident: boo
                 "The harness stopped waiting before any worker delivered; that is the eval's wait, not a verdict on your change." + held_note,
                 VERDICT_INFRA,
             )
-        if ungraded and all(c["cls"] in (CLS_CEILING, CLS_FIXTURE_DRIFT, CLS_FORGE) for c in ungraded):
+        if ungraded and all(c["cls"] == CLS_INSTALL_DIED for c in ungraded):
             return (
-                "Nothing was graded: the repetitions hit the delegation ceiling, a drifted fixture or a forge outage.",
+                "Nothing was graded: the run's install died, every pod deleted at once.",
+                "That is the leased install's loss, not the quota storm's shape and not a verdict on your change." + held_note,
+                VERDICT_INFRA,
+            )
+        if ungraded and all(c["cls"] in (CLS_CEILING, CLS_FIXTURE_DRIFT, CLS_FORGE, CLS_INSTALL_DIED) for c in ungraded):
+            return (
+                "Nothing was graded: the repetitions hit the delegation ceiling, a drifted fixture, a forge outage or a dead install.",
                 "None of them was lost to the quota storm, and none is a verdict on your change." + held_note,
                 VERDICT_INFRA,
             )
@@ -1035,7 +1059,7 @@ def classify_run(run: dict, runs: list[dict], health_at: dict | None = None, now
         gate, nightly = split_tiers(runs)
         others = _other_pr_runs(run, gate)
         rates = case_pass_rates(gate, anchor)
-        run_storm = storm_reps(run) >= STORM_RUN_SIGNATURE_REPS
+        run_storm = run_is_storm(run)
         run_ceiling = ceiling_reps(run) >= STORM_RUN_SIGNATURE_REPS
         cases = [classify_case(t, run, others, admitted, health_at, rates, run_storm, nightly) for t in tasks]
         cases = [c for c in cases if c["outcome"] is not None]
@@ -1123,7 +1147,7 @@ def classify_run(run: dict, runs: list[dict], health_at: dict | None = None, now
     gate, nightly = split_tiers(runs)
     others = _other_pr_runs(run, gate)
     rates = case_pass_rates(gate, anchor)
-    run_storm = storm_reps(run) >= STORM_RUN_SIGNATURE_REPS
+    run_storm = run_is_storm(run)
     # The delegation-ceiling wave's run signature is the storm's (health.py
     # aliases the thresholds): five ceiling reps tie a run to a declared wave.
     run_ceiling = ceiling_reps(run) >= STORM_RUN_SIGNATURE_REPS

@@ -716,6 +716,47 @@ class Storm(unittest.TestCase):
         result = adjudicate(self.stormy([1, 2, 3], 6), T0)
         self.assertEqual(result["advice"], "Retest after 00:30 UTC; runs started inside the storm lose repetitions to 429s.")
 
+    def test_a_run_whose_install_died_is_set_aside_from_the_storm(self):
+        # 2026-10-29 03:58Z: 15 dead attempts on 5 PRs, 8 of them one run on
+        # evals-18 whose install a node upgrade killed at 02:02Z (every pod
+        # deleted at once; the attempts read as transport failures). Those 8
+        # are the install's; the other 7 on 4 PRs are no storm.
+        board = {"result": "infra", "reason": "the harness recorded an infrastructure condition or exhausted its retries without reaching the agent (KUBE_AGENTS_INFRA_FAILURE): the record is scored, but there is no answer in it to grade (the kanban board could not be read 3 times running; still waiting on: t_8ddd5cf3)"}
+        hermes = {"result": "infra", "reason": "the harness recorded an infrastructure condition or exhausted its retries without reaching the agent (KUBE_AGENTS_INFRA_FAILURE): the record is scored, but there is no answer in it to grade (task task-93cb2a3275225fb7 ended failed: the executor's own failure (hermes-rate-limited) (reason: reason: he"}
+        death = {"at": "2026-10-29T02:02:08Z", "pods": 12, "reasons": {"Killing": 12}, "messages": ["Stopping container platform-agent"]}
+        def run_with(build, pr, i, rep, cases, project="kube-agents-evals-1", **extra):
+            tasks = [{"name": f"case-{k}", "result": "infra", "duration_s": None, "outcome_validity": None, "reps": [dict(rep, n=2)]} for k in range(cases)]
+            tasks += [task(name, "ppp") for name in sorted(ADMITTED)]
+            return dict(run(build, pr, T0 - timedelta(minutes=10 * i), result="SUCCESS", tasks=tasks), project=project, **extra)
+        evicted = run_with(100, 4158, 0, board, 8, project="kube-agents-evals-18", install_deaths=[death])
+        others = [run_with(101, 4156, 1, hermes, 3), run_with(102, 4171, 2, hermes, 2), run_with(103, 4172, 3, hermes, 1), run_with(104, 4180, 4, hermes, 1)]
+        result = assess(data(evicted, *others), T0)
+        self.assertEqual(result["state"], "GREEN", result["evidence"])
+        self.assertEqual(
+            [line for line in result["evidence"] if line.startswith("install died")],
+            ["install died: PR #4158 on kube-agents-evals-18 at 02:02 UTC, every pod Killing; 8 case attempts not counted as a storm"],
+        )
+        self.assertFalse(any(line.startswith("quota storm") for line in result["evidence"]))
+        # The same record with no death recorded, or an empty list, counts as
+        # it always did: 15 on 5 PRs is a storm.
+        for plain in (run_with(100, 4158, 0, board, 8, project="kube-agents-evals-18"), run_with(100, 4158, 0, board, 8, install_deaths=[])):
+            self.assertEqual(assess(data(plain, *others), T0)["condition"], "storm")
+        # Beside a real storm the storm still fires, counted from the healthy
+        # runs, and the line, the incident and the words leave the dead run out.
+        many = [run_with(110 + i, 5000 + i, i + 1, hermes, 6) for i in range(3)]
+        result = assess(data(evicted, *many), T0)
+        self.assertEqual((result["state"], result["condition"]), ("DEGRADED", "storm"))
+        line = next(l for l in result["evidence"] if l.startswith("quota storm"))
+        self.assertTrue(line.startswith("quota storm: 18 infra/empty-record reps across 3 PRs"), line)
+        self.assertTrue(line.endswith("; unconfirmed: no Vertex 429 reading; not counted: 8 case attempts on PR #4158 on kube-agents-evals-18, whose install died"), line)
+        self.assertEqual(result["incident"]["set_aside"], [{"pr": 4158, "project": "kube-agents-evals-18", "build_id": "100", "reps": 8, "at": "2026-10-29T02:02:08Z", "words": "every pod Killing"}])
+        self.assertEqual(result["incident"]["causes"], [["the executor's own failure (hermes-rate-limited)", 18]])
+        self.assertEqual(result["incident"]["prs"], [5000, 5001, 5002])
+        self.assertIn("install died: PR #4158 on kube-agents-evals-18 at 02:02 UTC, every pod Killing; 8 case attempts not counted as a storm", result["evidence"])
+        # A death with no reasons recorded still reads as a death.
+        bare = run_with(100, 4158, 0, board, 8, project="kube-agents-evals-18", install_deaths=[{"at": "2026-10-29T02:02:08Z", "pods": 12, "reasons": {}, "messages": []}])
+        self.assertIn("install died: PR #4158 on kube-agents-evals-18 at 02:02 UTC, every pod deleted; 8 case attempts not counted as a storm", assess(data(bare, *others), T0)["evidence"])
+
     def test_the_storm_runs_themselves_do_not_count_as_its_recovery(self):
         # Three green runs with six storm reps each ARE the storm. Two hours
         # later the window has rolled past them and rule 2 no longer fires;
@@ -730,6 +771,24 @@ class Storm(unittest.TestCase):
         # Three clean greens on new PRs after the storm: GREEN.
         doc["runs"] += [run(200 + i, 20 + i, later - timedelta(minutes=30 - 5 * i), result="SUCCESS", tasks=broken_tasks(set())) for i in range(3)]
         self.assertEqual(adjudicate(doc, later, held)["state"], "GREEN")
+
+
+    def test_a_dead_install_among_the_newest_runs_does_not_hold_the_storm_open(self):
+        # Rule 6's exit reads the storm's signature off the newest runs; a run
+        # set aside for a dead install carries none, whatever it lost.
+        doc = self.stormy([1, 2, 3], 6)
+        prev = adjudicate(doc, T0)
+        later = T0 + timedelta(hours=2, minutes=1)
+        held = adjudicate(doc, later, prev)
+        self.assertEqual((held["state"], held["recovering"]), ("DEGRADED", True))
+        greens = [run(200 + i, 20 + i, later - timedelta(minutes=30 - 5 * i), result="SUCCESS", tasks=broken_tasks(set())) for i in range(2)]
+        dead_tasks = [task(f"case-{k}", "pip") for k in range(6)] + [task(name, "ppp") for name in sorted(ADMITTED)]
+        dead = dict(run(300, 30, later - timedelta(minutes=5), result="SUCCESS", tasks=dead_tasks), install_deaths=[{"at": health.iso(later - timedelta(minutes=40)), "pods": 12, "reasons": {"Killing": 12}, "messages": []}])
+        doc["runs"] += greens + [dead]
+        self.assertEqual(adjudicate(doc, later, held)["state"], "GREEN")
+        # The same run with a healthy install carries the signature and holds it.
+        doc["runs"][-1] = dict(dead, install_deaths=[])
+        self.assertEqual(adjudicate(doc, later, held)["state"], "DEGRADED")
 
 
 # --------------------------------------------------------------------------- #

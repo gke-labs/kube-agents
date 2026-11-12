@@ -208,7 +208,9 @@ layout and are collected from the moment they start running.
       rate limit on grading's own token). The same readers count it apart
       from the storm and outside every pass-rate denominator, and
       `classify.py` classes a case whose ungraded reps are forge reps, with no
-      storm rep beside them, `forge-unavailable`.
+      storm rep beside them, `forge-unavailable`. A case whose ungraded reps
+      sit in a run with `install_deaths` (below) is `install-died`: the
+      install died under it, and `health.py` keeps the run out of the storm.
       Similarly, a harness-declared card-wake replay error (`ReplayMismatch`
       or `ReplayBroken`, e.g. `failure wake:`, `question wake:`, `block wake:`, `thread context:`
       in the reason) is recognized by `classify.py` and `health.py` as `fail`,
@@ -1364,7 +1366,11 @@ and shows no gate banner. Only a `GREEN` verdict reads as healthy. For
 `storm` the `incident` also carries `causes`, the repetitions' own words for
 how they died with counts (`[[words, n], …]`, every phrasing, commonest first,
 scrubbed and cut as the periodics' quoted log line is), which the Chat
-sentence names short. For
+sentence names short, and `set_aside`: the runs in the window whose install
+died (`runs[].install_deaths`), kept out of the count, each
+`{pr, project, build_id, reps, at, words}` (`reps` the run's dead attempts,
+`at` the first death's time, `words` its reasons as "every pod Killing";
+`pr`, `project` and `at` `null` as on the record), `[]` when none. For
 `lost_pods` the `incident` also carries `nodes` (`{node name: runs lost on
 it}`) and `event` (`true` when the loss counts as a build-cluster event);
 the pages give it the same 2-hour lead on the Brief's window as a storm and

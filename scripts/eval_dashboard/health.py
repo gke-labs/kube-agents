@@ -960,11 +960,19 @@ class Task:
 
 
 class Run:
-    __slots__ = ("base_sha", "build_id", "duration", "eval_verdict", "eval_verdict_recorded", "finished", "gcs_base", "has_build_log", "merge_conflict", "not_evaluated", "not_evaluated_cases", "pod_last_event", "pod_node", "pr", "result", "started", "tasks")
+    __slots__ = ("base_sha", "build_id", "duration", "eval_verdict", "eval_verdict_recorded", "finished", "gcs_base", "has_build_log", "install_deaths", "merge_conflict", "not_evaluated", "not_evaluated_cases", "pod_last_event", "pod_node", "pr", "project", "result", "started", "tasks")
 
     def __init__(self, run: dict):
         self.build_id = str(run.get("build_id") or "")
         self.pr = run.get("pr")
+        # The pool project the run leased (SCHEMA.md): names a run whose
+        # install died. Absent on a record without one.
+        self.project = run.get("project") if isinstance(run.get("project"), str) else None
+        # The moments the run's install died (SCHEMA.md `install_deaths`):
+        # every pod deleted at once, with Kubernetes' own words. None when
+        # the record has no watch to say, which counts as no death.
+        deaths = run.get("install_deaths")
+        self.install_deaths = [d for d in deaths if isinstance(d, dict)] if isinstance(deaths, list) else None
         # The build directory the run was read from (SCHEMA.md, optional):
         # the comment's build link follows it. Absent on older documents.
         self.gcs_base = run.get("gcs_base") if isinstance(run.get("gcs_base"), str) else None
@@ -1017,6 +1025,17 @@ class Run:
     @property
     def storm_reps(self) -> int:
         return sum(task.storms for task in self.tasks)
+
+    @property
+    def install_died(self) -> bool:
+        return bool(self.install_deaths)
+
+    @property
+    def counted_storm_reps(self) -> int:
+        """The storm repetitions the weather is judged on: none from a run
+        whose install died, whose losses are that install's and not the
+        pool's."""
+        return 0 if self.install_died else self.storm_reps
 
     def storm_causes(self) -> Counter:
         """The run's storm repetitions' own words, counted across its cases."""
@@ -1338,7 +1357,10 @@ def storm(full_runs, now: datetime, vertex: dict | None = None) -> dict:
     the rule does not fire. Without one the reps decide, as before, and the
     evidence says the storm is unconfirmed."""
     window = _in_window(full_runs, now, STORM_WINDOW)
-    hit = [run for run in window if run.storm_reps > 0]
+    # A run whose install died is set aside: its dead repetitions are the
+    # install's, whatever the pool was doing, and the evidence says so.
+    aside = [run for run in window if run.storm_reps > 0 and run.install_died]
+    hit = [run for run in window if run.counted_storm_reps > 0]
     reps = sum(run.storm_reps for run in hit)
     prs = _prs(hit)
     start = min((run.finished for run in hit), default=None)
@@ -1366,7 +1388,12 @@ def storm(full_runs, now: datetime, vertex: dict | None = None) -> dict:
             line += f"; the pool's peak 429 share was {share}" + ("" if confirmed else f", under the {STORM_429_MIN_RATE * 100:.0f} % a storm needs: infra deaths, not a quota storm")
         elif reps_fire:
             line += f"; unconfirmed: {rate['reason']}"
+        if aside:
+            line += "; not counted: " + "; ".join(f"{run.storm_reps} case attempts on {_run_name(run)}, whose install died" for run in aside)
         evidence.append(line)
+    # The dead installs themselves, storm or no storm: the Brief's record of
+    # why those attempts are nobody's weather.
+    deaths = [_install_death_line(run) for run in aside]
     return {
         "fires": fires,
         "reps_fire": reps_fire,
@@ -1374,14 +1401,46 @@ def storm(full_runs, now: datetime, vertex: dict | None = None) -> dict:
         "prs": prs,
         "start": start,
         "end": end,
-        "evidence": evidence if (fires or (reps_fire and rate["read"])) else [],
+        "evidence": (evidence if (fires or (reps_fire and rate["read"])) else []) + deaths,
         "signature_runs": {run.build_id for run in hit if run.storm_reps >= STORM_RUN_SIGNATURE_REPS},
         "runs": len(hit),
         "rate": rate,
         # Every phrasing with its count, commonest first, for the incident
         # the Chat sentence reads (it names each one, short).
         "causes": [[cause, n] for cause, n in causes.most_common()],
+        # The runs set aside, for the Chat sentence's "not counted" clause.
+        "set_aside": [_set_aside_record(run) for run in aside],
     }
+
+
+def _run_name(run) -> str:
+    """The run as "PR #4158 on kube-agents-evals-18", with whichever halves the record has."""
+    parts = [f"PR #{run.pr}" if run.pr is not None else f"build {run.build_id}"]
+    if run.project:
+        parts.append(f"on {run.project}")
+    return " ".join(parts)
+
+
+def _death_words(death: dict) -> str:
+    """"every pod Killing" from a death's reasons, commonest first, scrubbed
+    like any quoted line; "every pod deleted" when the record names none."""
+    reasons = death.get("reasons") if isinstance(death.get("reasons"), dict) else {}
+    names = [periodics.quotable(str(reason)) for reason, _ in sorted(reasons.items(), key=lambda kv: (-kv[1], str(kv[0])))[:STORM_CAUSES_SHOWN]]
+    return "every pod " + (", ".join(names) if names else "deleted")
+
+
+def _install_death_line(run) -> str:
+    first = run.install_deaths[0]
+    at = parse_iso(first.get("at"))
+    return (
+        f"install died: {_run_name(run)} at {hhmm(at) + ' UTC' if at else 'an unknown time'}, {_death_words(first)};"
+        f" {run.storm_reps} case attempts not counted as a storm"
+    )
+
+
+def _set_aside_record(run) -> dict:
+    first = run.install_deaths[0]
+    return {"pr": run.pr, "project": run.project, "build_id": run.build_id, "reps": run.storm_reps, "at": first.get("at") if isinstance(first.get("at"), str) else None, "words": _death_words(first)}
 
 
 def delegation_ceiling(full_runs, now: datetime) -> dict:
@@ -2560,7 +2619,7 @@ def assess(
     if condition == SHARED_BREAK:
         signature = r1["signature_runs"]
     elif condition == STORM:
-        signature = {run.build_id for run in full_runs if run.storm_reps > 0}
+        signature = {run.build_id for run in full_runs if run.counted_storm_reps > 0}
     elif condition == DELEGATION_CEILING:
         signature = {run.build_id for run in full_runs if run.ceiling_reps > 0}
     else:
@@ -2573,7 +2632,7 @@ def assess(
     if condition == SHARED_BREAK:
         incident = {"prs": r1["prs"], "runs": r1["runs"], "window_start": None, "window_end": None}
     elif condition == STORM:
-        incident = {"prs": r2["prs"], "runs": r2["runs"], "window_start": iso(r2["start"]), "window_end": iso(r2["end"]), "causes": r2["causes"]}
+        incident = {"prs": r2["prs"], "runs": r2["runs"], "window_start": iso(r2["start"]), "window_end": iso(r2["end"]), "causes": r2["causes"], "set_aside": r2["set_aside"]}
     elif condition == DELEGATION_CEILING:
         # `reps` beside the storm's keys: the message says how many
         # repetitions ended at the wait, not only how many runs held one.
@@ -2732,7 +2791,7 @@ def recovered(full_runs, prev: dict, since: datetime, last_setup_death: datetime
     cases = set(prev.get("failing_cases") or [])
     carries = {
         SHARED_BREAK: lambda run: bool(run.collapsed_cases() & cases & roster.at(run.started or run.finished)),
-        STORM: lambda run: run.storm_reps >= STORM_RUN_SIGNATURE_REPS,
+        STORM: lambda run: run.counted_storm_reps >= STORM_RUN_SIGNATURE_REPS,
         DELEGATION_CEILING: lambda run: run.ceiling_reps >= CEILING_RUN_SIGNATURE_REPS,
         SETUP_DEATHS: lambda run: last_setup_death is not None and run.finished <= last_setup_death,
         LOST_PODS: lambda run: last_lost_pod is not None and run.finished <= last_lost_pod,

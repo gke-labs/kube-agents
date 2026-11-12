@@ -1222,6 +1222,7 @@ function tagFor(c) {
   if (c.cls === "delegation-ceiling") return '<span class="tag storm">delegation ceiling</span>';
   if (c.cls === "fixture-drift") return '<span class="tag storm">fixture drifted</span>';
   if (c.cls === "forge-unavailable") return '<span class="tag storm">forge unavailable</span>';
+  if (c.cls === "install-died") return '<span class="tag storm">install died</span>';
   return '<span class="tag unclear">unexplained</span>';
 }
 
@@ -1415,6 +1416,7 @@ function lastFailureHtml(c) {
   else if (f.cls === "storm") head = "a quota storm: repetitions lost before grading";
   else if (f.cls === "delegation-ceiling") head = "the delegation ceiling: the harness stopped waiting with the worker still running";
   else if (f.cls === "fixture-drift") head = "a drifted fixture: the case was not run on that lease";
+  else if (f.cls === "install-died") head = "a dead install: every pod of the run's install was deleted at once";
   else if (f.cls === "only-this-pr") head = "PR-caused: passed on other PRs around it";
   else if (f.event) head = "failed all reps in a run where almost everything failed";
   else head = "failed all reps";
