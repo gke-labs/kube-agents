@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
@@ -148,4 +150,123 @@ func TestTheDispatchDurablesFixture(t *testing.T) {
 		t.Fatal(err)
 	}
 	checkFixture(t, dispatchDurablesFixturePath, string(body)+"\n")
+}
+
+// The ceiling's config measure (a2aDispatchConfigShares) charges each entry
+// as the operator writes it: no durables, and a Job template referenced by
+// its hash alone (#5479). Base plus the shares is at least what is written,
+// and over only by the first entry's comma, which the measure's own comment
+// promises, for every shape a profile's entry takes. A measure that still
+// counted listed durables, a template name, or a template for a tier that
+// isn't live, would be hundreds of bytes over here.
+func TestTheDispatchConfigMeasureIsTheWrittenShape(t *testing.T) {
+	withOperatorBusPrincipal(t)
+	t.Setenv(a2aProfileDispatcherEnvVar, "false") // no cut: measure all of them
+	t.Setenv(a2aDispatcherImageEnvVar, testDispatcherImage)
+	agent := a2aTestAgent()
+	read := []string{agentv1alpha1.AgentProfileTierRead}
+	both := []string{agentv1alpha1.AgentProfileTierRead, agentv1alpha1.AgentProfileTierUnattended}
+	until := time.Now().Add(time.Hour).Unix()
+	drainUnattended := func(p *agentv1alpha1.AgentProfile) {
+		if p.Annotations == nil {
+			p.Annotations = map[string]string{}
+		}
+		p.Annotations[drainingTiersAnnotation] = fmt.Sprintf("%s=%d", agentv1alpha1.AgentProfileTierUnattended, until)
+	}
+	// A Tier resource whose mode is unattended, as renderableAgentProfiles
+	// leaves it on the copy the renderers read (#3659).
+	batchTier := func(p *agentv1alpha1.AgentProfile) {
+		p.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead, "batch"}
+		if p.Annotations == nil {
+			p.Annotations = map[string]string{}
+		}
+		p.Annotations[renderedTierModesAnnotation] = "batch=" + tierModeUnattended
+	}
+	sized := func(tiers []string, mutate ...func(*agentv1alpha1.AgentProfile)) func(*agentv1alpha1.PlatformAgent) []agentv1alpha1.AgentProfile {
+		return func(agent *agentv1alpha1.PlatformAgent) []agentv1alpha1.AgentProfile {
+			profiles := twoTierProfiles(agent, 30)
+			for i := range profiles {
+				profiles[i].Spec.AllowedTiers = tiers
+				for _, m := range mutate {
+					m(&profiles[i])
+				}
+			}
+			return profiles
+		}
+	}
+	for _, tc := range []struct {
+		name     string
+		jobMode  bool
+		profiles func(*agentv1alpha1.PlatformAgent) []agentv1alpha1.AgentProfile
+	}{
+		{"one tier", false, sized(read)},
+		{"one tier, Job mode", true, sized(read)},
+		{"two tiers", false, sized(both)},
+		{"two tiers, Job mode", true, sized(both)},
+		{"draining unattended", false, sized(both, drainUnattended)},
+		{"draining unattended, Job mode", true, sized(both, drainUnattended)},
+		{"an unattended Tier resource, Job mode", true, sized(nil, batchTier)},
+		{"parameter-heavy, Job mode", true, func(agent *agentv1alpha1.PlatformAgent) []agentv1alpha1.AgentProfile {
+			return parameterHeavyProfiles(agent, 30)
+		}},
+		{"mixed, Job mode", true, func(agent *agentv1alpha1.PlatformAgent) []agentv1alpha1.AgentProfile {
+			profiles := parameterHeavyProfiles(agent, 30)
+			for i := range profiles {
+				switch i % 4 {
+				case 1:
+					profiles[i].Spec.AllowedTiers = read
+				case 2:
+					drainUnattended(&profiles[i])
+				case 3:
+					batchTier(&profiles[i])
+				}
+			}
+			return profiles
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(a2aDispatcherJobPolicyEnvVar, "")
+			if tc.jobMode {
+				t.Setenv(a2aDispatcherJobPolicyEnvVar, "true")
+			}
+			profiles := tc.profiles(agent)
+			var ptrs []*agentv1alpha1.AgentProfile
+			for i := range profiles {
+				ptrs = append(ptrs, &profiles[i])
+			}
+			base, shares, err := a2aDispatchConfigShares(agent, ptrs)
+			if err != nil {
+				t.Fatal(err)
+			}
+			estimate := base
+			for _, n := range shares {
+				estimate += n
+			}
+			for _, imageVolumes := range []bool{true, false} {
+				var templates map[string]*corev1.PodTemplateSpec
+				if tc.jobMode {
+					templates = dispatchJobTemplates(agent, profiles, imageVolumes)
+				}
+				cm, err := buildA2ADispatchConfigMapWith(agent, profiles, templates, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				written := len(cm.Data[a2aDispatchConfigKey])
+				// The base carries Job mode's labels whether or not any
+				// profile takes a template (the operator writes them only
+				// when one does): a fixed charge, not a per-entry one.
+				slack := 1
+				if tc.jobMode && len(templates) == 0 {
+					slack += len(`,"jobLabels":`) + jsonLen(dispatchJobLabels(agent))
+				}
+				if estimate < written {
+					t.Errorf("imageVolumes=%v: base plus shares is %d bytes, under the %d written", imageVolumes, estimate, written)
+				}
+				if estimate-written > slack {
+					t.Errorf("imageVolumes=%v: base plus shares is %d bytes, %d over the %d written; want at most %d",
+						imageVolumes, estimate, estimate-written, written, slack)
+				}
+			}
+		})
+	}
 }

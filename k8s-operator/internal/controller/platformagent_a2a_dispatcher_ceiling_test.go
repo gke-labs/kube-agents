@@ -381,9 +381,9 @@ func parameterHeavyProfiles(agent *agentv1alpha1.PlatformAgent, n int) []agentv1
 }
 
 // The dispatch config's shares, summed, are at least the ConfigMap the
-// operator writes for the same profiles, and only a little over: a Job
-// template is charged at the larger of its two renderings, and the first
-// entry one comma it doesn't take (gke-labs/kube-agents#5479).
+// operator writes for the same profiles, and only a little over: the first
+// entry is charged one comma it doesn't take (gke-labs/kube-agents#5479).
+// TestTheDispatchConfigMeasureIsTheWrittenShape covers the other shapes.
 func TestTheDispatchConfigSharesCoverTheConfigMap(t *testing.T) {
 	withOperatorBusPrincipal(t)
 	t.Setenv(a2aProfileDispatcherEnvVar, "false") // no cut: measure all of them
@@ -415,7 +415,7 @@ func TestTheDispatchConfigSharesCoverTheConfigMap(t *testing.T) {
 		}
 		largest = max(largest, actual)
 	}
-	// Against the larger rendering, which is what each share is charged at,
+	// A template is referenced by a fixed-width hash, so at either rendering
 	// the sum is over by the first entry's comma alone.
 	if estimate-largest > 1 {
 		t.Errorf("the shares sum to %d bytes, %d over the larger ConfigMap's %d", estimate, estimate-largest, largest)
