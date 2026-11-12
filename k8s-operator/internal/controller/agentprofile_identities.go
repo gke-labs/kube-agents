@@ -150,7 +150,8 @@ type agentProfileTierIdentity struct {
 //
 // Each is reserved whether or not this agent renders it now (the session
 // account only on next, the MCP account only under A2A_MCP_DOOR, the scope
-// publisher's only while a publisher may run): a flip or a flag turned on
+// publisher's only while a publisher may run, the dispatcher's only while it
+// is switched on): a flip or a flag turned on
 // later must not find a profile or an override already holding the name.
 //
 // `default` is reserved because every pod in the namespace that names no
@@ -170,6 +171,7 @@ func reservedProfileServiceAccounts(agent *agentv1alpha1.PlatformAgent) map[stri
 		a2aMCPServiceAccountName(agent):       "the A2A MCP server's ServiceAccount, the broker's mcp caller",
 		a2aCuratorName(agent):                 "the OKF memory curator's ServiceAccount",
 		scopePublisherName(agent):             "the scope publisher's ServiceAccount, the broker's scope caller",
+		a2aDispatcherName(agent):              "the profile dispatcher's ServiceAccount, which carries its bus principal and Jobs RBAC",
 	}
 }
 
@@ -207,14 +209,7 @@ func resolveAgentProfileIdentities(agent *agentv1alpha1.PlatformAgent, profiles 
 	// Oldest first, so an incumbent keeps a contested ServiceAccount and a
 	// newcomer naming it is the one refused; name breaks ties, so the answer
 	// never depends on list order.
-	sorted := append([]agentv1alpha1.AgentProfile(nil), profiles...)
-	sort.Slice(sorted, func(i, j int) bool {
-		ti, tj := sorted[i].CreationTimestamp, sorted[j].CreationTimestamp
-		if !ti.Equal(&tj) {
-			return ti.Before(&tj)
-		}
-		return sorted[i].Name < sorted[j].Name
-	})
+	sorted := sortedOldestFirst(profiles)
 
 	out := make(map[string]agentProfileResolution, len(sorted))
 	claimedBy := map[string]string{}
@@ -223,7 +218,26 @@ func resolveAgentProfileIdentities(agent *agentv1alpha1.PlatformAgent, profiles 
 		p := &sorted[i]
 		out[p.Name] = resolveOneAgentProfile(p, agent, reserved, mapKeys, claimedBy, profilesNS)
 	}
+	// While the dispatcher runs, only as many profiles as its identity can
+	// carry are bound, oldest first (gke-labs/kube-agents#5381).
+	if a2aDispatcherEnabled() {
+		refuseOverDispatcherCeiling(agent, sorted, out)
+	}
 	return out
+}
+
+// sortedOldestFirst is profiles by creation time, name breaking ties, so an
+// answer that depends on order never depends on list order.
+func sortedOldestFirst(profiles []agentv1alpha1.AgentProfile) []agentv1alpha1.AgentProfile {
+	sorted := append([]agentv1alpha1.AgentProfile(nil), profiles...)
+	sort.Slice(sorted, func(i, j int) bool {
+		ti, tj := sorted[i].CreationTimestamp, sorted[j].CreationTimestamp
+		if !ti.Equal(&tj) {
+			return ti.Before(&tj)
+		}
+		return sorted[i].Name < sorted[j].Name
+	})
+	return sorted
 }
 
 // resolveOneAgentProfile decides one profile's identities, recording each

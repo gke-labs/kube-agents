@@ -287,6 +287,16 @@ const (
 	// (a2a/cmd/curator), rendered under A2A_CURATOR=true.
 	a2aCuratorUser = "curator"
 
+	// The memory query and outcome subjects served by the curator pod under
+	// A2A_CURATOR=true. Replies ride their own namespace (a2a.memory.reply.>)
+	// for the same reason verifierIdentity answers on a2a.cap.reply.> and
+	// bridgeIdentity answers on chat.board.reply.gateway.>: the curator never
+	// holds a publish grant on _INBOX.agent.>.
+	a2aMemoryQuerySubject       = "a2a.memory.query"
+	a2aMemoryReplySubjects      = "a2a.memory.reply.>"
+	a2aMemoryReplyAgentSubjects = "a2a.memory.reply.agent.>"
+	a2aCuratorOutcomesSubject   = "a2a.topics.agent.platform.curator-outcomes"
+
 	// a2aConsoleConfirmSubject is the console confirmation subject: console
 	// alone may publish it and gateway alone may subscribe to it. Its
 	// publisher and subscriber land with #4457.
@@ -949,6 +959,36 @@ func agentIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity {
 			// The gateway's answers to its notifies.
 			a2aNotifyReplySubjects,
 			"_INBOX." + a2aAgentBusUser + ".>",
+		},
+	}
+}
+
+// curatorIdentity returns the NATS auth-callout entry for the curator pod,
+// rendered when A2A_CURATOR=true. It holds no task-plane grants, no JetStream
+// consumer-create verbs, and no publish grant on _INBOX.agent.>; replies to
+// a2a.memory.query ride a2a.memory.reply.>.
+func curatorIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity {
+	publish := []string{
+		"a2a.topics.shared.annotations",
+		"a2a.topics.shared.blueprint",
+	}
+	publish = append(publish, a2aAgentJetStreamGrants()...)
+	publish = append(publish, a2aMemoryReplySubjects)
+	publish = append(publish, "_INBOX."+a2aCuratorUser+".>")
+
+	return a2aIdentity{
+		user:           a2aCuratorUser,
+		account:        a2aAccountApp,
+		comment:        "the OKF memory curator: indexes learning outcomes into Hindsight, publishes blueprint digests, and answers memory queries on a2a.memory.reply.> with no cluster or forge credentials",
+		auth:           a2aAuthCallout,
+		serviceAccount: a2aServiceAccountName(ns, a2aCuratorName(agent)),
+		publish:        publish,
+		subscribe: []string{
+			"a2a.topics.shared.annotations",
+			"a2a.topics.shared.blueprint",
+			a2aCuratorOutcomesSubject,
+			a2aMemoryQuerySubject,
+			"_INBOX." + a2aCuratorUser + ".>",
 		},
 	}
 }

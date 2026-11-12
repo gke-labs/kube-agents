@@ -63,7 +63,7 @@ func startCLIJetStream(t *testing.T) string {
 	})
 	_, _ = js.CreateStream(ctx, jetstream.StreamConfig{
 		Name:        lib.StreamTopicsJournal,
-		Subjects:    []string{memory.SubjectAnnotations},
+		Subjects:    []string{memory.SubjectAnnotations, memory.SubjectCuratorOutcomes},
 		AllowDirect: true,
 	})
 	return ns.ClientURL()
@@ -325,3 +325,95 @@ func TestDaemonStatusEndpoints(t *testing.T) {
 		t.Fatal("runDaemonContext did not shut down within 10s of context cancel")
 	}
 }
+
+func TestRunCheckOverseerCapsLLMFindingsAtWarnAndDreamSubcommand(t *testing.T) {
+	repoDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(repoDir, "clusters", "prod"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "clusters", "prod", "app.yaml"), []byte("apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: app\nspec:\n  replicas: 1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Seed a prose-only active record with severity: block (like mergeGuard sets on crash evidence).
+	proseBlockRec := memory.Record{
+		Meta: memory.RecordMeta{
+			ID:     "DEC-2026-040",
+			Type:   memory.RecordTypeDecision,
+			Status: memory.StatusActive,
+			Title:  "Prose-only rule with block severity",
+			Date:   "2026-11-12",
+			Scope:  memory.RecordScope{Paths: []string{"clusters/**"}},
+			Guard: &memory.RecordGuard{
+				Rule:     "Do not change replica counts on Fridays.",
+				Severity: "block",
+			},
+		},
+		Body: "## Context\n\nProse-only rule.\n",
+	}
+	if err := memory.SaveRecord(repoDir, &proseBlockRec); err != nil {
+		t.Fatal(err)
+	}
+	diffPath := filepath.Join(repoDir, "change.diff")
+	if err := os.WriteFile(diffPath, []byte("+  replicas: 1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	llmSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"violations\":[{\"id\":\"DEC-2026-040\",\"severity\":\"block\",\"rule\":\"Do not change replica counts on Fridays.\",\"reason\":\"Changed replicas on Friday\"}]}"}}]}`))
+	}))
+	defer llmSrv.Close()
+
+	t.Setenv("DECISION_MEMORY_LLM_URL", llmSrv.URL)
+	t.Setenv("DECISION_MEMORY_LLM_MODEL", "test-model")
+
+	// High 1: LLM Overseer finding must be capped at "warn" (exit 0, Verdict: "warn"), never "block" (exit 2).
+	stdout, err := captureStdout(t, func() error {
+		return runCheck([]string{"--repo", repoDir, "--overseer", "--diff-file", diffPath, "--", "clusters/prod/app.yaml"})
+	})
+	if err != nil {
+		t.Fatalf("expected LLM Overseer finding to be advisory (exit 0), got err=%v", err)
+	}
+	var checkOut memory.CheckReport
+	if err := json.Unmarshal([]byte(stdout), &checkOut); err != nil {
+		t.Fatalf("decode runCheck output: %v", err)
+	}
+	if checkOut.Verdict != "warn" || len(checkOut.Findings) != 1 || checkOut.Findings[0].Severity != "warn" {
+		t.Fatalf("expected LLM finding capped at warn, got verdict=%q findings=%+v", checkOut.Verdict, checkOut.Findings)
+	}
+
+	// Low 1: Verify `curator dream` subcommand audits active guards against HEAD and outputs a DreamReport.
+	driftedRec := memory.Record{
+		Meta: memory.RecordMeta{
+			ID:     "DEC-2026-041",
+			Type:   memory.RecordTypeDecision,
+			Status: memory.StatusActive,
+			Title:  "Drifted replica guard",
+			Date:   "2026-11-12",
+			Scope:  memory.RecordScope{Paths: []string{"clusters/**"}},
+			Guard: &memory.RecordGuard{
+				Rule:     "Keep replicas >= 3",
+				Severity: "block",
+				Expect:   &memory.GuardExpect{File: "clusters/**/*.yaml", Path: "spec.replicas", Op: ">=", Value: 3},
+			},
+		},
+		Body: "## Context\n\nDrifted guard.\n",
+	}
+	if err := memory.SaveRecord(repoDir, &driftedRec); err != nil {
+		t.Fatal(err)
+	}
+	dreamOut, err := captureStdout(t, func() error {
+		return run([]string{"dream", "--repo", repoDir, "--repo-id", "acme/gitops"})
+	})
+	if err != nil {
+		t.Fatalf("curator dream failed: %v", err)
+	}
+	var dreamRep memory.DreamReport
+	if err := json.Unmarshal([]byte(dreamOut), &dreamRep); err != nil {
+		t.Fatalf("decode curator dream output: %v", err)
+	}
+	if len(dreamRep.DemotedDrifted) != 1 || dreamRep.DemotedDrifted[0] != "DEC-2026-041" {
+		t.Fatalf("expected DEC-2026-041 in demoted_drifted, got %+v", dreamRep)
+	}
+}
+

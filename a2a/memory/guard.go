@@ -287,33 +287,36 @@ func CompareValue(actual any, op string, expected any) bool {
 }
 
 func matchSegments(patSegs, targetSegs []string) bool {
-	for len(patSegs) > 0 {
-		seg := patSegs[0]
+	pLen := len(patSegs)
+	tLen := len(targetSegs)
+	dp := make([]bool, tLen+1)
+	dp[tLen] = true
+
+	for i := pLen - 1; i >= 0; i-- {
+		seg := patSegs[i]
+		next := make([]bool, tLen+1)
 		if seg == "**" {
-			for len(patSegs) > 1 && patSegs[1] == "**" {
-				patSegs = patSegs[1:]
+			suffixTrue := false
+			for j := tLen; j >= 0; j-- {
+				if dp[j] {
+					suffixTrue = true
+				}
+				next[j] = suffixTrue
 			}
-			if len(patSegs) == 1 {
-				return true
-			}
-			for i := 0; i <= len(targetSegs); i++ {
-				if matchSegments(patSegs[1:], targetSegs[i:]) {
-					return true
+		} else {
+			for j := 0; j < tLen; j++ {
+				if !dp[j+1] {
+					continue
+				}
+				matched, err := path.Match(seg, targetSegs[j])
+				if err == nil && matched {
+					next[j] = true
 				}
 			}
-			return false
 		}
-		if len(targetSegs) == 0 {
-			return false
-		}
-		matched, err := path.Match(seg, targetSegs[0])
-		if err != nil || !matched {
-			return false
-		}
-		patSegs = patSegs[1:]
-		targetSegs = targetSegs[1:]
+		dp = next
 	}
-	return len(targetSegs) == 0
+	return dp[0]
 }
 
 // MatchGlob matches a slash-separated path against a glob pattern, supporting "**".
@@ -524,7 +527,7 @@ func GuardPassesOnHead(repoDir string, g *RecordGuard, scopeResources []string) 
 		}
 		slashRel := filepath.ToSlash(rel)
 		if MatchGlob(exp.File, slashRel) {
-			if raw, readErr := root.ReadFile(rel); readErr == nil {
+			if raw, readErr := readBoundedFromRoot(root, rel); readErr == nil {
 				matched[slashRel] = string(raw)
 			}
 		}

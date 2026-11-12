@@ -209,11 +209,41 @@ keeps the container's env free of a duplicate name. `| default dict` because
 - name: A2A_MCP_DOOR
   value: "true"
 {{- end -}}
+{{- $dispatcher := (.Values.operator.profileDispatcher | default dict) -}}
+{{- if and (hasKey $dispatcher "enabled") (eq (toString $dispatcher.enabled) "false") (not (hasKey $named "A2A_PROFILE_DISPATCHER")) }}
+- name: A2A_PROFILE_DISPATCHER
+  value: "false"
+{{- end -}}
 {{- with (.Values.operator.slackTestUsers | default list) }}
 {{- if not (hasKey $named "A2A_SLACK_TEST_USERS") }}
 - name: A2A_SLACK_TEST_USERS
   value: {{ join "," . | quote }}
 {{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Whether the A2A bus's pods carry the NATS exporter sidecar, so its PodMonitoring and
+scrape-alert job render: "true" unless the operator omits the sidecar, which it does when
+operator.extraEnv sets A2A_NATS_IMAGE and not A2A_NATS_EXPORTER_IMAGE
+(a2aNATSExporterOmitted). An entry counts as set when it has a non-empty value or a
+valueFrom, and the last entry for a name wins, as it does in the operator container's env
+(operator-deployment.yaml appends extraEnv in order): a later empty entry clears an earlier
+one. Without the sidecar the scrape would only ever read down.
+*/}}
+{{- define "kube-agents.a2aNATSExporterRendered" -}}
+{{- $set := dict -}}
+{{- range $e := (.Values.operator.extraEnv | default list) -}}
+{{- $e = $e | default dict -}}
+{{- $name := toString (index $e "name") -}}
+{{- if or (ne (toString (index $e "value" | default "")) "") (index $e "valueFrom") -}}
+{{- $_ := set $set $name true -}}
+{{- else -}}
+{{- $_ := unset $set $name -}}
+{{- end -}}
+{{- end -}}
+{{- if or (not (hasKey $set "A2A_NATS_IMAGE")) (hasKey $set "A2A_NATS_EXPORTER_IMAGE") -}}
+true
 {{- end -}}
 {{- end }}
 
@@ -3427,7 +3457,9 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
     {{- end -}}
   {{- end -}}
   {{- /* Standing pods behind an operator flag (files/flagged-pods.yaml: the MCP server,
-         #3869; the profile dispatcher, #4808). The operator renders each only while
+         #3869). The profile dispatcher, on by default, is in footprint.yaml; switched off
+         (operator.profileDispatcher.enabled false) it is still counted, which over-counts
+         by its one pod in the safe direction. The operator renders each only while
          its flag is set (operator.mcpServer.enabled or operator.extraEnv), so no golden
          renders it and footprint.yaml has no entry for it. An entry's flag is read as the operator reads it, the last setting
          winning: enabledWhen "true" takes only that value, nonBlank any value that isn't blank.

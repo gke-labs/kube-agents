@@ -124,13 +124,13 @@ NEXT_WORKLOADS = (
     ("a2aVerifier", "Capability verifier", "Standing"),
     ("a2aGateway", "A2A gateway", "Standing; one fewer with the operator's `A2A_GATEWAY_ELECTION=false`"),
     ("a2aConsole", "Console", "Standing"),
+    ("a2aDispatcher", "Profile dispatcher", "Standing, unless `operator.profileDispatcher.enabled` is `false`, when the quota check still counts it"),
     ("a2aProvision", "Bus provisioning Job", "At install, again whenever its spec changes, and about daily"),
 )
 # footprint.yaml nextMode keys that are not a workload row of their own.
 NEXT_NON_WORKLOADS = ("agentPod", "storage")
 FLAGGED_LABELS = {
     "mcp": "MCP server",
-    "dispatcher": "Profile dispatcher",
     "curator": "OKF memory curator",
 }
 FLAGGED_WHEN = {

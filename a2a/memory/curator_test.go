@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -205,12 +206,60 @@ func startEmbeddedJetStream(t *testing.T) string {
 	}
 	if _, err := js.CreateStream(ctx, jetstream.StreamConfig{
 		Name:        lib.StreamTopicsJournal,
-		Subjects:    []string{SubjectAnnotations},
+		Subjects:    []string{SubjectAnnotations, SubjectCuratorOutcomes},
 		AllowDirect: true,
 	}); err != nil {
 		t.Fatalf("create TOPICS-JOURNAL: %v", err)
 	}
 	return ns.ClientURL()
+}
+
+func runGitTestCmd(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v failed: %v\n%s", args, err, string(out))
+	}
+}
+
+func commitRecordInGit(t *testing.T, repoDir string, rec Record) {
+	t.Helper()
+	if _, err := os.Stat(filepath.Join(repoDir, ".git")); os.IsNotExist(err) {
+		runGitTestCmd(t, repoDir, "init")
+	}
+	rec.Meta.Status = StatusActive
+	if len( rec.Meta.Scope.Paths) == 0 && len(rec.Meta.Scope.Resources) == 0 && len(rec.Meta.Scope.Checks) == 0 {
+		rec.Meta.Scope.Paths = []string{"**"}
+	}
+	if rec.Meta.Type == RecordTypeLesson && rec.Meta.Evidence.PullRequest == "" {
+		rec.Meta.Evidence.PullRequest = "#1"
+	}
+	if strings.TrimSpace(rec.Body) == "" {
+		rec.Body = "## Context\n\nMerged in Git.\n"
+	}
+	if err := SaveRecord(repoDir, &rec); err != nil {
+		t.Fatalf("SaveRecord for git commit: %v", err)
+	}
+	runGitTestCmd(t, repoDir, "add", "-A")
+	runGitTestCmd(t, repoDir, "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "--allow-empty", "-m", "merge "+rec.Meta.ID)
+}
+
+func promoteExistingRecordInGit(t *testing.T, repoDir, id, prRef string) {
+	t.Helper()
+	recs, err := LoadRecords(repoDir)
+	if err != nil {
+		t.Fatalf("LoadRecords(%s): %v", repoDir, err)
+	}
+	for _, r := range recs {
+		if r.Meta.ID == id {
+			if prRef != "" {
+				r.Meta.Evidence.PullRequest = prRef
+			}
+			commitRecordInGit(t, repoDir, r)
+			return
+		}
+	}
+	t.Fatalf("record %s not found in %s", id, repoDir)
 }
 
 func TestCuratorEndToEndNATSFlow(t *testing.T) {
@@ -489,8 +538,9 @@ spec:
 		t.Fatalf("expected graduated decision DEC-2026-005, got %s", gradID)
 	}
 
-	// Merging the fleet-wide knowledge/ PR for DEC-2026-005 promotes DEC-2026-005 to status:active
+	// Merging the fleet-wide knowledge/ PR for DEC-2026-005 in Git promotes DEC-2026-005 to status:active
 	// and supersedes LES-2026-001 and LES-2026-002 while keeping unrelated rejected DEC-2026-004 intact!
+	promoteExistingRecordInGit(t, repoDir, "DEC-2026-005", "https://github.com/acme/infra/pull/289 (#289)")
 	publishOutcome(OutcomeEvent{
 		Schema:      OutcomeSchema,
 		Kind:        OutcomeApproved,
@@ -543,7 +593,20 @@ spec:
 		t.Fatalf("expected second identical NATS query to hit cache (Cached=true)")
 	}
 
-	// Publish a new active decision and verify that the NATS query cache is invalidated automatically.
+	// Publish a new active decision merged in Git and verify that the NATS query cache is invalidated automatically.
+	commitRecordInGit(t, repoDir, Record{
+		Meta: RecordMeta{
+			Type:        RecordTypeDecision,
+			ID:          "DEC-2026-006",
+			Title:       "Checkout PDB minimum available replicas",
+			Status:      StatusActive,
+			Date:        "2026-11-12",
+			Scope:       RecordScope{Paths: []string{"clusters/**/checkout/pdb.yaml"}},
+			Guard:       &RecordGuard{Rule: "Keep checkout PDB minAvailable >= 2.", Severity: "warn"},
+			Evidence:    RecordEvidence{PullRequest: "https://github.com/acme/infra/pull/290 (#290)"},
+		},
+		Body: "## Context\n\nRequire minAvailable >= 2 on checkout PodDisruptionBudget.\n",
+	})
 	publishOutcome(OutcomeEvent{
 		Schema:      OutcomeSchema,
 		Kind:        OutcomeApproved,
@@ -633,8 +696,20 @@ spec:
 	}
 
 	// Scenario 3: Reviewer modifies a proposed PR before merging (OutcomeModifiedMerged) ->
-	// transitions in-place to status:active with the human-corrected guard and records the
-	// superseded initial proposal in evidence.rejected_proposals.
+	// transitions in-place to status:active once merged in Git with the human-corrected guard
+	// and records the superseded initial proposal in evidence.rejected_proposals.
+	recsBeforeMod, _ := LoadRecords(repoDir)
+	for _, r := range recsBeforeMod {
+		if r.Meta.ID == prop1.RecordID {
+			r.Meta.Guard = &RecordGuard{
+				Rule:     "All staging and preprod Ingress resources must include networking.gke.io/managed-certificates.",
+				Severity: "warn",
+			}
+			r.Meta.Evidence.PullRequest = "https://github.com/acme/infra/pull/273 (#273)"
+			commitRecordInGit(t, repoDir, r)
+			break
+		}
+	}
 	modRes, err := cur.ProcessOutcome(ctx, OutcomeEvent{
 		Schema:          OutcomeSchema,
 		Kind:            OutcomeModifiedMerged,
@@ -1102,6 +1177,16 @@ spec:
 	}, ""); err != nil {
 		t.Fatal(err)
 	}
+	commitRecordInGit(t, curDir, Record{
+		Meta: RecordMeta{
+			ID:     "DEC-2026-092",
+			Type:   RecordTypeDecision,
+			Status: StatusActive,
+			Title:  "Approved PDB floor",
+			Scope:  RecordScope{Paths: []string{"clusters/**/pdb.yaml"}, Checks: []string{"pdb-min"}},
+		},
+		Body: "## Context\n\nApproved PDB floor.\n",
+	})
 	if _, err := cur.ProcessOutcome(ctx, OutcomeEvent{
 		Kind:       OutcomeApproved,
 		RecordID:   "DEC-2026-092",
@@ -1176,7 +1261,28 @@ func TestOutcomeProposedNeverOverwritesActiveOrConflictingProposed(t *testing.T)
 		t.Fatal(err)
 	}
 
-	// 1. Seed an active decision DEC-2026-001.
+	// 1. Seed an active decision DEC-2026-001 verified in Git HEAD.
+	if err := os.MkdirAll(filepath.Join(repoDir, "apps", "checkout"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "apps", "checkout", "deploy.yaml"), []byte("apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: checkout\nspec:\n  replicas: 2\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	commitRecordInGit(t, repoDir, Record{
+		Meta: RecordMeta{
+			ID:     "DEC-2026-001",
+			Type:   RecordTypeDecision,
+			Status: StatusActive,
+			Title:  "Keep checkout replicas at two or higher",
+			Scope:  RecordScope{Paths: []string{"apps/checkout/*.yaml"}},
+			Guard: &RecordGuard{
+				Rule:     "Keep checkout replicas >= 2",
+				Severity: "block",
+				Expect:   &GuardExpect{File: "apps/checkout/*.yaml", Path: "spec.replicas", Op: ">=", Value: 2},
+			},
+			Evidence: RecordEvidence{PullRequest: "https://github.com/acme/gitops/pull/10 (#10)"},
+		},
+	})
 	_, err = cur.ProcessOutcome(ctx, OutcomeEvent{
 		Kind:       OutcomeApproved,
 		RecordID:   "DEC-2026-001",
@@ -1406,15 +1512,30 @@ func TestHandleQueryEnforcesClusterPathMaxResultsAndBank(t *testing.T) {
 		}
 	}
 
-	// 3. Explicit Bank routes to kube-agents-memory instead of DefaultBankID.
+	// 3. Disallowed Bank (kube-agents-memory) and user:* tags are rejected by HandleQuery's allowlist.
 	rBank := cur.HandleQuery(ctx, MemoryQueryRequest{
 		Query: "canary rollouts",
 		Bank:  "kube-agents-memory",
 		Tags:  []string{"scope:shared"},
 	})
-	if rBank.Bank != "kube-agents-memory" || len(rBank.Results) == 0 || rBank.Results[0].ID != "conv-1" {
-		t.Fatalf("expected kube-agents-memory recall hit conv-1, got %+v", rBank)
+	if rBank.Error == "" || len(rBank.Results) != 0 {
+		t.Fatalf("expected kube-agents-memory bank query to be rejected, got %+v", rBank)
 	}
+	rUserTag := cur.HandleQuery(ctx, MemoryQueryRequest{
+		Query: "canary rollouts",
+		Tags:  []string{"user:alice"},
+	})
+	if rUserTag.Error == "" || len(rUserTag.Results) != 0 {
+		t.Fatalf("expected user:alice tag query to be rejected, got %+v", rUserTag)
+	}
+	mu.Lock()
+	for _, b := range banksQueried {
+		if b == "kube-agents-memory" {
+			mu.Unlock()
+			t.Fatalf("Curator queried disallowed bank kube-agents-memory")
+		}
+	}
+	mu.Unlock()
 
 	// 4. Redirect responses from Hindsight are refused (ErrUseLastResponse).
 	redirSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1495,7 +1616,12 @@ func TestPublishOutcomeWithMetaSurfacesAppErrorWithoutSecondSubjectRetry(t *test
 
 	// When SubjectMemoryQuery has no responders, PublishOutcomeWithMeta falls back to SubjectCuratorOutcomes with CorrelationID.
 	qSub.Stop()
-	res, fallbackSubj, err := PublishOutcomeWithMeta(ctx, callerClient, OutcomeEvent{
+	if err := serverClient.Conn().FlushTimeout(2 * time.Second); err != nil {
+		t.Fatalf("flush serverClient after qSub.Stop: %v", err)
+	}
+	fallbackCtx, fallbackCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer fallbackCancel()
+	res, fallbackSubj, err := PublishOutcomeWithMeta(fallbackCtx, callerClient, OutcomeEvent{
 		Kind:     OutcomeApproved,
 		RecordID: "DEC-2026-077",
 	}, "corr-fallback-1")
@@ -1619,6 +1745,7 @@ func TestLifecycleBuildersMatchFormattedPRRefAndCheckScopedGraduation(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
+	promoteExistingRecordInGit(t, repoDir, prop.RecordID, "https://github.com/acme/gitops/pull/77 (#77)")
 	modMerged, err := cur.ProcessOutcome(ctx, OutcomeEvent{
 		Kind:        OutcomeModifiedMerged,
 		Repo:        "acme/gitops",
@@ -1636,7 +1763,7 @@ func TestLifecycleBuildersMatchFormattedPRRefAndCheckScopedGraduation(t *testing
 	// Thread 10: Check-scoped lessons (no Expect.Path) across 2 clusters preserve Rule, block Severity, and synth.Guard.
 	for i, cluster := range []string{"prod-eu", "prod-us"} {
 		res, err := cur.ProcessOutcome(ctx, OutcomeEvent{
-			Kind:       OutcomeApproved,
+			Kind:       OutcomeResolvedMerged,
 			RecordType: RecordTypeLesson,
 			Repo:       "acme/gitops",
 			PRNumber:   200 + i,
@@ -1813,4 +1940,175 @@ func TestCuratorStartConcurrentWithProcessOutcomeNoRace(t *testing.T) {
 	}()
 	wg.Wait()
 }
+
+func TestReviewInvariantsGitVerificationEmptyDirRecoveryAndMutantGuards(t *testing.T) {
+	natsURL := startEmbeddedJetStream(t)
+	mockHS, hsSrv := newMockHindsightServer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+
+	client, err := lib.Connect(ctx, natsURL, lib.WithName("curator-invariants-test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	// 1. Low 5: SaveRecord rejects invalid record IDs.
+	tmpRepo := t.TempDir()
+	for _, badID := range []string{"", "../evil", "DEC-2026-1", "FOO-2026-001"} {
+		badRec := Record{Meta: RecordMeta{ID: badID, Type: RecordTypeDecision, Title: "Bad ID", Status: StatusProposed}}
+		if err := SaveRecord(tmpRepo, &badRec); err == nil {
+			t.Fatalf("expected SaveRecord to reject invalid ID %q", badID)
+		}
+	}
+
+	// 2. Low 2: GuardPassesOnHead enforces the 4 MiB file cap.
+	oversizedRepo := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(oversizedRepo, "apps"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	hugeYAML := "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: big\ndata:\n  blob: " + strings.Repeat("a", maxRecordFileBytes+1024) + "\n"
+	if err := os.WriteFile(filepath.Join(oversizedRepo, "apps", "big.yaml"), []byte(hugeYAML), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if GuardPassesOnHead(oversizedRepo, &RecordGuard{
+		Rule:     "Check text",
+		Severity: "warn",
+		Expect:   &GuardExpect{File: "apps/*.yaml", Path: "$text", Op: "contains", Value: "ConfigMap"},
+	}, nil) {
+		t.Fatal("expected GuardPassesOnHead to skip/reject target file exceeding 4 MiB cap")
+	}
+
+	// 3. Low 3: MatchGlob with many ** segments runs in linear DP time (<50ms).
+	startGlob := time.Now()
+	deepPattern := "a/**/**/**/**/**/**/**/**/**/**/**/z.yaml"
+	deepTarget := "a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q/r/s/t/u/v/w/x/y/not-z.yaml"
+	if MatchGlob(deepPattern, deepTarget) {
+		t.Fatal("expected non-matching deep target to return false")
+	}
+	if elapsed := time.Since(startGlob); elapsed > 100*time.Millisecond {
+		t.Fatalf("MatchGlob with 11 ** segments took %v, expected <100ms DP", elapsed)
+	}
+
+	// 4. Low 5: mergeGuard rejects an LLM-synthesized Guard.Expect that fails GuardPassesOnHead.
+	headCheckRepo := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(headCheckRepo, "apps"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(headCheckRepo, "apps", "web.yaml"), []byte("apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: web\nspec:\n  replicas: 2\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	badSynth := &SynthesizedRecord{
+		Title: "Hallucinated guard",
+		Guard: &RecordGuard{
+			Rule:     "Keep replicas >= 10",
+			Severity: "block",
+			Expect:   &GuardExpect{File: "apps/*.yaml", Path: "spec.replicas", Op: ">=", Value: 10},
+		},
+	}
+	mergedG := mergeGuard(headCheckRepo, nil, OutcomeEvent{Rule: "Keep replicas >= 2"}, badSynth, nil)
+	if mergedG == nil || mergedG.Expect != nil {
+		t.Fatalf("expected mergeGuard to reject synthesized Guard.Expect failing HEAD check, got %+v", mergedG)
+	}
+
+	// 5. High 2: Unverified OutcomeApproved / OutcomeModifiedMerged (not committed in Git HEAD)
+	// stays StatusProposed and cannot supersede, reject, or retire an existing Git-verified active record.
+	gitRepo := t.TempDir()
+	commitRecordInGit(t, gitRepo, Record{
+		Meta: RecordMeta{
+			ID:     "DEC-2026-001",
+			Type:   RecordTypeDecision,
+			Status: StatusActive,
+			Title:  "Human-merged active rule",
+			Date:   "2026-11-12",
+			Scope:  RecordScope{Paths: []string{"clusters/**"}},
+			Guard:  &RecordGuard{Rule: "Require 2 replicas.", Severity: "block"},
+		},
+		Body: "## Context\n\nMerged by human.\n",
+	})
+
+	cur, err := NewCurator(CuratorConfig{
+		RepoDir:   gitRepo,
+		RepoID:    "acme/gitops",
+		Client:    client,
+		Hindsight: NewHindsightClient(hsSrv.URL, DefaultBankID),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cur.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer cur.Stop()
+
+	// Unverified OutcomeApproved attempting to mint an active rule DEC-2026-002 and supersede DEC-2026-001.
+	unverifiedRes, err := PublishOutcome(ctx, client, OutcomeEvent{
+		Kind:       OutcomeApproved,
+		RecordID:   "DEC-2026-002",
+		RecordType: RecordTypeDecision,
+		Title:      "Unverified outcome attempting to supersede DEC-2026-001",
+		Rule:       "Allow 1 replica",
+		Supersedes: []string{"DEC-2026-001"},
+		Scope:      &RecordScope{Paths: []string{"clusters/**"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unverifiedRes.Status != StatusProposed {
+		t.Fatalf("unverified OutcomeApproved must produce status=proposed, got %s", unverifiedRes.Status)
+	}
+	// Verify DEC-2026-001 is still StatusActive (not superseded, rejected, or retired).
+	for _, attemptKind := range []OutcomeKind{OutcomeRefused, OutcomeRetired} {
+		resAttempt, err := cur.ProcessOutcome(ctx, OutcomeEvent{
+			Kind:     attemptKind,
+			RecordID: "DEC-2026-001",
+		}, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resAttempt.Status != StatusActive {
+			t.Fatalf("%s demoted Git-verified active record DEC-2026-001 to %s", attemptKind, resAttempt.Status)
+		}
+	}
+
+	// 6. Medium 3: Simulate emptyDir restart by creating a new Curator on a fresh empty directory
+	// connected to the same Hindsight and NATS TOPICS-STATE. NextRecordID must not reset to DEC-2026-001.
+	freshEmptyDir := t.TempDir()
+	restartedCur, err := NewCurator(CuratorConfig{
+		RepoDir:   freshEmptyDir,
+		RepoID:    "acme/gitops",
+		Client:    client,
+		Hindsight: NewHindsightClient(hsSrv.URL, DefaultBankID),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterRestartRes, err := restartedCur.ProcessOutcome(ctx, OutcomeEvent{
+		Kind:       OutcomeProposed,
+		RecordType: RecordTypeDecision,
+		Title:      "Proposal after emptyDir restart",
+		Rule:       "Keep PDB minAvailable >= 1",
+		Scope:      &RecordScope{Paths: []string{"clusters/**"}},
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterRestartRes.RecordID != "DEC-2026-003" {
+		t.Fatalf("expected post-restart allocation to skip DEC-2026-001..002 and allocate DEC-2026-003, got %s", afterRestartRes.RecordID)
+	}
+	mockHS.mu.Lock()
+	_, has002 := mockHS.docs["okf:acme/gitops:DEC-2026-002"]
+	_, has003 := mockHS.docs["okf:acme/gitops:DEC-2026-003"]
+	mockHS.mu.Unlock()
+	if !has002 || !has003 {
+		t.Fatalf("expected Hindsight to retain both DEC-2026-002 and DEC-2026-003 without collision")
+	}
+
+	// Verify outcome was journaled to TOPICS-JOURNAL on SubjectCuratorOutcomes.
+	journalEnv, jErr := client.ReadTopicLatest(ctx, lib.StreamTopicsJournal, SubjectCuratorOutcomes)
+	if jErr != nil || journalEnv == nil {
+		t.Fatalf("expected outcome to be journaled on TOPICS-JOURNAL (%s), err=%v", SubjectCuratorOutcomes, jErr)
+	}
+}
+
 

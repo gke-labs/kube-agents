@@ -119,35 +119,6 @@ func a2aCuratorNATSPeers(agent *agentv1alpha1.PlatformAgent) []networkingv1.Netw
 	}}}
 }
 
-// curatorIdentity returns the NATS auth-callout entry for the curator pod.
-// It holds no task-plane grants and no JetStream consumer-create verbs.
-func curatorIdentity(agent *agentv1alpha1.PlatformAgent, ns string) a2aIdentity {
-	publish := []string{
-		"a2a.topics.shared.annotations",
-		"a2a.topics.shared.blueprint",
-	}
-	publish = append(publish, a2aAgentJetStreamGrants()...)
-	publish = append(publish,
-		"_INBOX."+a2aAgentBusUser+".>",
-		"_INBOX."+a2aCuratorUser+".>",
-	)
-	return a2aIdentity{
-		user:           a2aCuratorUser,
-		account:        a2aAccountApp,
-		comment:        "the OKF memory curator: indexes learning outcomes into Hindsight, publishes blueprint digests, and answers memory queries with no cluster or forge credentials",
-		auth:           a2aAuthCallout,
-		serviceAccount: a2aServiceAccountName(ns, a2aCuratorName(agent)),
-		publish:        publish,
-		subscribe: []string{
-			"a2a.topics.shared.annotations",
-			"a2a.topics.shared.blueprint",
-			"_INBOX." + a2aAgentBusUser + ".memory.query",
-			"_INBOX." + a2aAgentBusUser + ".curator.outcomes",
-			"_INBOX." + a2aCuratorUser + ".>",
-		},
-	}
-}
-
 // buildA2ACuratorServiceAccount builds the dedicated ServiceAccount for the
 // curator pod. No Role or ClusterRole binds to this ServiceAccount.
 func buildA2ACuratorServiceAccount(agent *agentv1alpha1.PlatformAgent) *corev1.ServiceAccount {

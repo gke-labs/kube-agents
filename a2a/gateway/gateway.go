@@ -3131,6 +3131,11 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	if old := rec.ActiveTask; old != nil && old.Detached && old.StatusMsgID != "" {
 		g.editLine(rec.Key, old.StatusMsgID, withLineNote(terminalLine(lib.StateCanceled, ""), old.LineNote), "")
 	}
+	// A detached task superseded here may never send its terminal: its ask
+	// takes the canceled end's mark, so no reaction is left on it.
+	if old := rec.ActiveTask; old != nil && old.Detached {
+		g.applyTerminalMark(rec, old.TaskID, lib.StateCanceled)
+	}
 	// Register the task everywhere the relay looks BEFORE publishing: a fast
 	// executor's submitted event must never race the mapping, because the
 	// relay acks what it cannot route and the durable won't redeliver it.
@@ -3256,6 +3261,15 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	// rather than an optimisation.
 	if g.spawner != nil && rec.BusSession != "" && rec.Addressee == rec.BusSession {
 		g.ensureSessionPod(ctx, rec, taskID, originSeq)
+	}
+	// The ask's reaction, drawn now rather than at the executor's first
+	// heartbeat (mark.go, drawArrivalMark), after the pod is asked for so a
+	// slow reactions call never delays it. A click or an answer continues an
+	// earlier ask, whose mark is the executor's to redraw.
+	if ts.Role == "" && !ts.Click && !ts.Answer && g.drawArrivalMark(rec, taskID, ts.Text) {
+		if err := g.reg.Put(ctx, rec); err != nil {
+			g.log.Error("session record write failed", "conversation", rec.Key, "err", err)
+		}
 	}
 	return taskID, true
 }

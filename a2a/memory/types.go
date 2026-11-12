@@ -57,14 +57,17 @@ const (
 	// MemoryQueryReplySchema is the reply payload schema for NATS memory queries.
 	MemoryQueryReplySchema = "kube-agents.memory.query.reply/v1"
 
-	// SubjectMemoryQuery is the NATS request-reply subject within the agent
-	// principal's granted _INBOX.agent.> namespace used to query semantic memory
-	// over NATS without coupling callers to a specific storage backend.
-	SubjectMemoryQuery = "_INBOX.agent.memory.query"
+	// SubjectMemoryQuery is the dedicated NATS request-reply subject used to query
+	// semantic memory over NATS without coupling callers to a specific storage backend.
+	SubjectMemoryQuery = "a2a.memory.query"
 
-	// SubjectCuratorOutcomes is the dedicated NATS outcome subject within the
-	// agent principal's reserved _INBOX.agent.> namespace.
-	SubjectCuratorOutcomes = "_INBOX.agent.curator.outcomes"
+	// SubjectMemoryReplyPrefix is the NATS reply subject prefix used by callers
+	// when sending request-reply queries to the Curator (a2a.memory.reply.<caller>.>).
+	SubjectMemoryReplyPrefix = "a2a.memory.reply."
+
+	// SubjectCuratorOutcomes is the durable journal-class NATS outcome subject
+	// within the agent principal's reserved a2a.topics.agent.> namespace on TOPICS-JOURNAL.
+	SubjectCuratorOutcomes = "a2a.topics.agent.platform.curator-outcomes"
 
 	maxSlugLen              = 60
 	proposalBranchPrefix    = "platform-agent/memory/"
@@ -1272,6 +1275,13 @@ func SaveRecord(repoDir string, rec *Record) error {
 
 // NextRecordID allocates the next sequential DEC-YYYY-NNN or LES-YYYY-NNN ID in repoDir.
 func NextRecordID(repoDir string, rtype RecordType, year int) string {
+	return NextRecordIDWithKnown(repoDir, rtype, year, nil)
+}
+
+// NextRecordIDWithKnown allocates the next sequential DEC-YYYY-NNN or LES-YYYY-NNN ID
+// considering both local records in repoDir and any additional known IDs recovered from
+// Hindsight or the TOPICS-STATE blueprint digest across pod restarts.
+func NextRecordIDWithKnown(repoDir string, rtype RecordType, year int, extraIDs map[string]bool) string {
 	prefix := "DEC"
 	if rtype == RecordTypeLesson {
 		prefix = "LES"
@@ -1284,6 +1294,13 @@ func NextRecordID(repoDir string, rtype RecordType, year int) string {
 	records, _ := LoadRecords(repoDir)
 	for _, r := range records {
 		if rest, ok := strings.CutPrefix(r.Meta.ID, pat); ok {
+			if n, err := strconv.Atoi(rest); err == nil && n > maxN {
+				maxN = n
+			}
+		}
+	}
+	for id := range extraIDs {
+		if rest, ok := strings.CutPrefix(id, pat); ok {
 			if n, err := strconv.Atoi(rest); err == nil && n > maxN {
 				maxN = n
 			}

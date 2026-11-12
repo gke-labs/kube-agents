@@ -373,15 +373,22 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 // bus runs, with the operator's own message (controller.BusConversionRefusedMessage):
 // converting a bus empties it until #4225 brings the migration. Best effort:
 // the running count is the stored object's status.busReplicas, which an older
-// CRD prunes and a flip to today clears, so the operator's refusal on every
-// pass is the enforcement and this only refuses the edit early. An update that
-// leaves the field as it was is let through, so a CR the operator already
-// holds to its count can still be edited otherwise.
+// CRD prunes, so the operator's refusal on every pass is the enforcement and
+// this only refuses the edit early. An update that leaves the field as it was
+// is let through, so a CR the operator already holds to its count can still
+// be edited otherwise.
 func validateBusReplicas(oldObj, platformAgent *agentv1alpha1.PlatformAgent) field.ErrorList {
 	// Under today the field is inert and the bus is torn down, so an edit
-	// that flips to today, or edits a today CR whose count is not yet
-	// cleared, converts nothing.
+	// that flips to today, or edits a today CR, converts nothing. An edit
+	// from today to next is left to the operator too: a flip to today keeps
+	// status.busReplicas (#5451), but whether a bus is still there to keep
+	// is a question of its data claims, which can be deleted while the CR
+	// is under today and which only the operator reads. Refusing here on the
+	// record alone would refuse a new bus the operator would create.
 	if oldObj == nil || platformAgent.Spec.Mode == nil || *platformAgent.Spec.Mode != "next" {
+		return nil
+	}
+	if oldObj.Spec.Mode == nil || *oldObj.Spec.Mode != "next" {
 		return nil
 	}
 	running := oldObj.Status.BusReplicas

@@ -1,12 +1,14 @@
 package memory
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -19,15 +21,16 @@ import (
 )
 
 const (
-	defaultCuratorRepoDir  = "/opt/data/memory/knowledge-store"
-	defaultCuratorSession  = "agent"
-	minRecurrenceThreshold = 2
-	maxSeenEnvelopes       = 4096
-	maxQueryCacheEntries   = 256
-	defaultMaxQueryResults = 8
-	queryHandlerTimeout    = 30 * time.Second
-	hindsightRecallTimeout = 4 * time.Second
-	stateSnapshotFile      = "decisions_state.json"
+	defaultCuratorRepoDir      = "/opt/data/memory/knowledge-store"
+	defaultCuratorSession      = "agent"
+	minRecurrenceThreshold     = 2
+	maxSeenEnvelopes           = 4096
+	maxQueryCacheEntries       = 256
+	defaultMaxQueryResults     = 8
+	queryHandlerTimeout        = 30 * time.Second
+	defaultRequestReplyTimeout = 10 * time.Second
+	hindsightRecallTimeout     = 4 * time.Second
+	stateSnapshotFile          = "decisions_state.json"
 )
 
 var queryStopwords = map[string]bool{
@@ -84,6 +87,8 @@ type Curator struct {
 	log               *slog.Logger
 	mu                sync.Mutex
 	bankEnsured       bool
+	knownIDsLoaded    bool
+	knownIDs          map[string]bool
 	outcomesProcessed uint64
 	seenEnvelopes     map[string]bool
 	graduatedIDs      []string
@@ -142,9 +147,108 @@ func NewCurator(cfg CuratorConfig) (*Curator, error) {
 	return &Curator{
 		cfg:           cfg,
 		log:           log,
+		knownIDs:      map[string]bool{},
 		seenEnvelopes: map[string]bool{},
 		queryCache:    map[string]MemoryQueryResponse{},
 	}, nil
+}
+
+func recordIDFromDoc(doc HindsightDocument) string {
+	if doc.DocumentMetadata != nil {
+		if id := strings.TrimSpace(doc.DocumentMetadata["id"]); reRecordID.MatchString(id) {
+			return id
+		}
+	}
+	if idx := strings.LastIndex(doc.ID, ":"); idx >= 0 && idx+1 < len(doc.ID) {
+		if id := strings.TrimSpace(doc.ID[idx+1:]); reRecordID.MatchString(id) {
+			return id
+		}
+	}
+	for _, t := range doc.Tags {
+		if strings.HasPrefix(t, "id:") {
+			if id := strings.TrimSpace(strings.TrimPrefix(t, "id:")); reRecordID.MatchString(id) {
+				return id
+			}
+		}
+	}
+	return ""
+}
+
+func (c *Curator) ensureKnownIDsLocked(ctx context.Context) {
+	if c.knownIDs == nil {
+		c.knownIDs = map[string]bool{}
+	}
+	if records, err := LoadRecords(c.cfg.RepoDir); err == nil {
+		for _, r := range records {
+			if reRecordID.MatchString(r.Meta.ID) {
+				c.knownIDs[r.Meta.ID] = true
+			}
+		}
+	}
+	if c.knownIDsLoaded {
+		return
+	}
+	loadedAny := false
+	if c.cfg.Hindsight != nil {
+		hsCtx, cancel := context.WithTimeout(ctx, hindsightRecallTimeout)
+		docs, err := c.cfg.Hindsight.ListDocuments(hsCtx)
+		cancel()
+		if err == nil {
+			loadedAny = true
+			for _, doc := range docs {
+				if id := recordIDFromDoc(doc); id != "" {
+					c.knownIDs[id] = true
+				}
+			}
+		}
+	}
+	if c.cfg.Client != nil {
+		if env, err := c.cfg.Client.ReadTopicLatest(ctx, lib.StreamTopicsState, SubjectBlueprint); err == nil && env != nil {
+			loadedAny = true
+			var art lib.Artifact
+			if json.Unmarshal(env.Payload, &art) == nil {
+				for _, p := range art.Parts {
+					if p.Kind == "data" && len(p.Data) > 0 {
+						var digest BlueprintDigest
+						if json.Unmarshal(p.Data, &digest) == nil {
+							for _, id := range digest.ActiveIDs {
+								c.knownIDs[id] = true
+							}
+							for _, id := range digest.ProposedIDs {
+								c.knownIDs[id] = true
+							}
+							for _, id := range digest.RejectedIDs {
+								c.knownIDs[id] = true
+							}
+							for _, id := range digest.SupersededIDs {
+								c.knownIDs[id] = true
+							}
+							for _, id := range digest.GraduatedDecisions {
+								c.knownIDs[id] = true
+							}
+							for _, rec := range digest.Records {
+								if reRecordID.MatchString(rec.ID) {
+									c.knownIDs[rec.ID] = true
+								}
+							}
+						}
+					}
+				}
+			}
+		} else if errors.Is(err, lib.ErrTopicEmpty) {
+			loadedAny = true
+		}
+	}
+	if loadedAny || (c.cfg.Hindsight == nil && c.cfg.Client == nil) {
+		c.knownIDsLoaded = true
+	}
+}
+
+func (c *Curator) nextRecordIDLocked(ctx context.Context, rtype RecordType, year int) string {
+	c.ensureKnownIDsLocked(ctx)
+	id := NextRecordIDWithKnown(c.cfg.RepoDir, rtype, year, c.knownIDs)
+	c.knownIDs[id] = true
+	return id
 }
 
 func (c *Curator) ensureBankOnceLocked(ctx context.Context) {
@@ -193,6 +297,7 @@ func isRedirectedJetStreamDelivery(msg *nats.Msg) bool {
 func (c *Curator) Start(ctx context.Context) error {
 	c.mu.Lock()
 	c.ensureBankOnceLocked(ctx)
+	c.ensureKnownIDsLocked(ctx)
 	c.mu.Unlock()
 
 	if c.cfg.Client == nil {
@@ -263,6 +368,13 @@ func (c *Curator) Start(ctx context.Context) error {
 		}
 	} else if latestErr != nil && !errors.Is(latestErr, lib.ErrTopicEmpty) {
 		c.log.Debug("curator: initial journal read skipped", "err", latestErr)
+	}
+
+	latestOutcomeEnv, latestOutErr := c.cfg.Client.ReadTopicLatest(ctx, lib.StreamTopicsJournal, SubjectCuratorOutcomes)
+	if latestOutErr == nil && latestOutcomeEnv != nil {
+		c.handleJournaledOutcomeEnvelope(ctx, latestOutcomeEnv)
+	} else if latestOutErr != nil && !errors.Is(latestOutErr, lib.ErrTopicEmpty) {
+		c.log.Debug("curator: initial curator-outcomes journal read skipped", "err", latestOutErr)
 	}
 
 	// Publish initial blueprint state under c.mu only if no live outcome callback
@@ -397,6 +509,58 @@ func (c *Curator) handleAnnotationEnvelope(ctx context.Context, env *lib.Envelop
 	)
 }
 
+func (c *Curator) handleJournaledOutcomeEnvelope(ctx context.Context, env *lib.Envelope) {
+	if env == nil || env.Kind != lib.KindTopicUpdate {
+		return
+	}
+	var art lib.Artifact
+	if json.Unmarshal(env.Payload, &art) != nil || art.Name != "curator-outcomes" {
+		return
+	}
+	c.mu.Lock()
+	alreadySeen := c.markSeenLocked(env.EnvelopeID)
+	c.mu.Unlock()
+	if alreadySeen {
+		return
+	}
+	ev, ok := ExtractOutcomeEvent(env)
+	if !ok {
+		return
+	}
+	if _, err := c.ProcessOutcome(ctx, ev, env.CorrelationID); err != nil {
+		c.log.Error("curator: failed to replay journaled outcome event", "kind", ev.Kind, "record_id", ev.RecordID, "err", err)
+	}
+}
+
+func (c *Curator) journalOutcomeEvent(ctx context.Context, ev OutcomeEvent, corrID string) {
+	if c.cfg.Client == nil {
+		return
+	}
+	if ev.Schema == "" {
+		ev.Schema = OutcomeSchema
+	}
+	art, err := lib.NewTopicArtifact("curator-outcomes", fmt.Sprintf("curator outcome %s %s", ev.Kind, ev.RecordID), ev)
+	if err != nil {
+		return
+	}
+	if corrID == "" {
+		corrID = lib.NewCorrelationID()
+	}
+	profile := c.cfg.Profile
+	if profile == "" {
+		profile = "platform"
+	}
+	_ = c.cfg.Client.PublishTopic(
+		ctx,
+		SubjectCuratorOutcomes,
+		lib.Party{Session: c.cfg.Session, Profile: profile},
+		"",
+		"",
+		corrID,
+		art,
+	)
+}
+
 func (c *Curator) handleCuratorOutcomeMsg(ctx context.Context, msg *nats.Msg, expectedSubj string) {
 	if msg == nil || len(msg.Data) == 0 {
 		return
@@ -412,6 +576,14 @@ func (c *Curator) handleCuratorOutcomeMsg(ctx context.Context, msg *nats.Msg, ex
 	var ev OutcomeEvent
 	var corrID string
 	if env, err := lib.ParseEnvelope(msg.Data); err == nil && env != nil && env.Kind != "" {
+		var art lib.Artifact
+		_ = json.Unmarshal(env.Payload, &art)
+		if env.Kind == lib.KindTopicUpdate && art.Name == "curator-outcomes" {
+			c.mu.Lock()
+			_ = c.markSeenLocked(env.EnvelopeID)
+			c.mu.Unlock()
+			return
+		}
 		c.mu.Lock()
 		alreadySeen := c.markSeenLocked(env.EnvelopeID)
 		c.mu.Unlock()
@@ -572,6 +744,50 @@ func scopesOverlapPaths(a, b []string) bool {
 	return false
 }
 
+func verifiedGitRecordByStatus(repoDir, id string, wantStatus RecordStatus) (Record, bool) {
+	if strings.TrimSpace(repoDir) == "" || !reRecordID.MatchString(id) {
+		return Record{}, false
+	}
+	if _, err := exec.Command("git", "-C", repoDir, "rev-parse", "--verify", "HEAD").Output(); err != nil {
+		return Record{}, false
+	}
+	out, err := exec.Command("git", "-C", repoDir, "ls-tree", "-r", "--name-only", "HEAD").Output()
+	if err != nil {
+		return Record{}, false
+	}
+	var primary, secondary []string
+	for _, line := range strings.Split(string(out), "\n") {
+		relPath := strings.TrimSpace(line)
+		if relPath == "" || !strings.HasSuffix(relPath, ".md") {
+			continue
+		}
+		base := filepath.Base(relPath)
+		if base == id+".md" || strings.HasPrefix(base, id+"-") {
+			primary = append(primary, relPath)
+		} else {
+			secondary = append(secondary, relPath)
+		}
+	}
+	for _, relPath := range append(primary, secondary...) {
+		blob, bErr := exec.Command("git", "-C", repoDir, "show", "HEAD:"+relPath).Output()
+		if bErr != nil {
+			continue
+		}
+		rec, pErr := ParseRecord(string(blob), relPath)
+		if pErr != nil {
+			continue
+		}
+		if rec.Meta.ID == id && rec.Meta.Status == wantStatus && len(ValidateRecord(rec)) == 0 {
+			return rec, true
+		}
+	}
+	return Record{}, false
+}
+
+func verifiedGitActiveRecord(repoDir, id string) (Record, bool) {
+	return verifiedGitRecordByStatus(repoDir, id, StatusActive)
+}
+
 func rejectedGovernedSameSubject(oldRec, activeRec Record) bool {
 	if !scopesOverlapPaths(oldRec.Meta.Scope.Paths, activeRec.Meta.Scope.Paths) {
 		return false
@@ -716,6 +932,10 @@ func (c *Curator) ProcessOutcome(ctx context.Context, ev OutcomeEvent, correlati
 	if err := SaveRecord(c.cfg.RepoDir, &targetRec); err != nil {
 		return OutcomeProcessResult{}, fmt.Errorf("save record %s: %w", targetRec.Meta.ID, err)
 	}
+	if c.knownIDs == nil {
+		c.knownIDs = map[string]bool{}
+	}
+	c.knownIDs[targetRec.Meta.ID] = true
 	if c.cfg.Hindsight != nil {
 		c.ensureBankOnceLocked(ctx)
 		if err := c.cfg.Hindsight.RetainRecord(ctx, repoID, targetRec); err != nil {
@@ -723,22 +943,26 @@ func (c *Curator) ProcessOutcome(ctx context.Context, ev OutcomeEvent, correlati
 		}
 	}
 
-	// When a record transitions to status:active via a merged knowledge/ PR,
-	// reconcile superseded records: (1) explicit Supersedes IDs (including
-	// cluster lessons graduated into a fleet-wide DEC-*), and (2) Precedence
-	// Rule 3 ("Merged outranks rejected") when governing the same check or field.
+	// When a record transitions to status:active via a merged knowledge/ PR
+	// verified against Git HEAD, reconcile superseded records: (1) explicit
+	// Supersedes IDs committed in the Git-merged record (including cluster
+	// lessons graduated into a fleet-wide DEC-*), and (2) Precedence Rule 3
+	// ("Merged outranks rejected") when governing the same check or field.
 	if targetRec.Meta.Status == StatusActive {
+		gitRec, gitOK := verifiedGitActiveRecord(c.cfg.RepoDir, targetRec.Meta.ID)
 		supTargets := map[string]bool{}
-		for _, sid := range targetRec.Meta.Supersedes {
-			if sid != "" && sid != targetRec.Meta.ID {
-				supTargets[sid] = true
+		if gitOK {
+			for _, sid := range gitRec.Meta.Supersedes {
+				if sid != "" && sid != targetRec.Meta.ID {
+					supTargets[sid] = true
+				}
 			}
 		}
 		for oid, oldRec := range byID {
 			if oid == targetRec.Meta.ID || oldRec.Meta.Status != StatusRejected {
 				continue
 			}
-			if rejectedGovernedSameSubject(oldRec, targetRec) {
+			if gitOK && rejectedGovernedSameSubject(oldRec, targetRec) {
 				supTargets[oid] = true
 			}
 		}
@@ -820,7 +1044,7 @@ func (c *Curator) buildProposedRecord(ctx context.Context, ev OutcomeEvent, byID
 	}
 	rid := ev.RecordID
 	if rid == "" {
-		rid = NextRecordID(c.cfg.RepoDir, rtype, year)
+		rid = c.nextRecordIDLocked(ctx, rtype, year)
 	}
 	existing, hasExisting := byID[rid]
 
@@ -906,12 +1130,18 @@ func (c *Curator) buildApprovedRecord(ctx context.Context, ev OutcomeEvent, byID
 		if rtype == "" {
 			rtype = RecordTypeDecision
 		}
-		rid = NextRecordID(c.cfg.RepoDir, rtype, year)
+		rid = c.nextRecordIDLocked(ctx, rtype, year)
 	}
 	existing, hasExisting := byID[rid]
+	gitRec, gitVerified := verifiedGitActiveRecord(c.cfg.RepoDir, rid)
+	if hasExisting && existing.Meta.Status == StatusActive && !gitVerified {
+		return existing
+	}
 	rtype := existing.Meta.Type
 	if rtype == "" {
-		if ev.RecordType != "" {
+		if gitVerified && gitRec.Meta.Type != "" {
+			rtype = gitRec.Meta.Type
+		} else if ev.RecordType != "" {
 			rtype = ev.RecordType
 		} else {
 			rtype = RecordTypeDecision
@@ -921,47 +1151,60 @@ func (c *Curator) buildApprovedRecord(ctx context.Context, ev OutcomeEvent, byID
 	if !hasExisting || strings.TrimSpace(existing.Body) == "" {
 		synth = c.cfg.LLM.Synthesize(ctx, rtype, ev)
 	}
-	title := firstNonEmpty(ev.Title, existing.Meta.Title, synthTitle(synth), "Approved decision "+rid)
+	title := firstNonEmpty(gitRec.Meta.Title, ev.Title, existing.Meta.Title, synthTitle(synth), "Approved decision "+rid)
 	scope := mergeScope(existing.Meta.Scope, ev)
+	if gitVerified && (len(gitRec.Meta.Scope.Paths) > 0 || len(gitRec.Meta.Scope.Resources) > 0 || len(gitRec.Meta.Scope.Checks) > 0) {
+		scope = gitRec.Meta.Scope
+	}
 	guard := mergeGuard(c.cfg.RepoDir, existing.Meta.Guard, ev, synth, scope.Resources)
+	if gitVerified && gitRec.Meta.Guard != nil {
+		guard = gitRec.Meta.Guard
+	}
 	if guard != nil && guard.Severity == "" {
 		g := *guard
 		g.Severity = inferDefaultGuardSeverity(ev)
 		guard = &g
 	}
-	status := StatusActive
-	if gitopsPRsDisabled() {
-		status = StatusProposed
+	// Outcomes alone produce status:proposed; only a knowledge/ record verified
+	// as status:active in Git HEAD transitions to status:active or supersedes
+	// existing records.
+	status := StatusProposed
+	if gitVerified && !gitopsPRsDisabled() {
+		status = StatusActive
 	}
-	prRef := firstNonEmpty(formatPRRef(ev), existing.Meta.Evidence.PullRequest)
+	supersedes := firstSlice(ev.Supersedes, existing.Meta.Supersedes)
+	if status == StatusActive {
+		supersedes = gitRec.Meta.Supersedes
+	}
+	prRef := firstNonEmpty(gitRec.Meta.Evidence.PullRequest, formatPRRef(ev), existing.Meta.Evidence.PullRequest)
 	meta := RecordMeta{
 		Type:   rtype,
 		ID:     rid,
 		Title:  title,
 		Status: status,
-		Date:   firstNonEmpty(existing.Meta.Date, dateStr),
+		Date:   firstNonEmpty(gitRec.Meta.Date, existing.Meta.Date, dateStr),
 		Scope:  scope,
 		Guard:  guard,
 		Evidence: RecordEvidence{
 			PullRequest:   prRef,
-			RemediationPR: firstNonEmpty(ev.RemediationPR, existing.Meta.Evidence.RemediationPR),
-			BreakingPR:    firstNonEmpty(ev.BreakingPR, existing.Meta.Evidence.BreakingPR),
-			Incident:      firstNonEmpty(ev.Incident, existing.Meta.Evidence.Incident),
-			Commit:        firstNonEmpty(ev.Commit, existing.Meta.Evidence.Commit),
-			FindingID:     firstNonEmpty(ev.FindingID, existing.Meta.Evidence.FindingID),
+			RemediationPR: firstNonEmpty(gitRec.Meta.Evidence.RemediationPR, ev.RemediationPR, existing.Meta.Evidence.RemediationPR),
+			BreakingPR:    firstNonEmpty(gitRec.Meta.Evidence.BreakingPR, ev.BreakingPR, existing.Meta.Evidence.BreakingPR),
+			Incident:      firstNonEmpty(gitRec.Meta.Evidence.Incident, ev.Incident, existing.Meta.Evidence.Incident),
+			Commit:        firstNonEmpty(gitRec.Meta.Evidence.Commit, ev.Commit, existing.Meta.Evidence.Commit),
+			FindingID:     firstNonEmpty(gitRec.Meta.Evidence.FindingID, ev.FindingID, existing.Meta.Evidence.FindingID),
 			Outcome:       existing.Meta.Evidence.Outcome,
-			SoakWindow:    firstNonEmpty(ev.SoakWindow, existing.Meta.Evidence.SoakWindow),
+			SoakWindow:    firstNonEmpty(gitRec.Meta.Evidence.SoakWindow, ev.SoakWindow, existing.Meta.Evidence.SoakWindow),
 		},
-		Supersedes: firstSlice(ev.Supersedes, existing.Meta.Supersedes),
+		Supersedes: supersedes,
 	}
-	body := existing.Body
-	if !hasExisting || strings.TrimSpace(body) == "" {
+	body := firstNonEmpty(gitRec.Body, existing.Body)
+	if strings.TrimSpace(body) == "" {
 		body = buildRecordBody(rtype, ev, synth, "", status, "")
-	} else if ev.Summary != "" {
+	} else if ev.Summary != "" && !strings.Contains(body, "## Approval") {
 		body = strings.TrimSpace(body) + "\n\n## Approval\n\n" + strings.TrimSpace(ev.Summary)
 	}
 	return Record{
-		Path: existing.Path,
+		Path: firstNonEmpty(gitRec.Path, existing.Path),
 		Meta: meta,
 		Body: body,
 	}
@@ -977,12 +1220,18 @@ func (c *Curator) buildModifiedMergedRecord(ctx context.Context, ev OutcomeEvent
 		if rtype == "" {
 			rtype = RecordTypeDecision
 		}
-		rid = NextRecordID(c.cfg.RepoDir, rtype, year)
+		rid = c.nextRecordIDLocked(ctx, rtype, year)
 	}
 	existing, hasExisting := byID[rid]
+	gitRec, gitVerified := verifiedGitActiveRecord(c.cfg.RepoDir, rid)
+	if hasExisting && existing.Meta.Status == StatusActive && !gitVerified {
+		return existing
+	}
 	rtype := existing.Meta.Type
 	if rtype == "" {
-		if ev.RecordType != "" {
+		if gitVerified && gitRec.Meta.Type != "" {
+			rtype = gitRec.Meta.Type
+		} else if ev.RecordType != "" {
 			rtype = ev.RecordType
 		} else if strings.HasPrefix(rid, "LES-") {
 			rtype = RecordTypeLesson
@@ -999,14 +1248,19 @@ func (c *Curator) buildModifiedMergedRecord(ctx context.Context, ev OutcomeEvent
 	}
 
 	synth := c.cfg.LLM.Synthesize(ctx, rtype, ev)
-	title := firstNonEmpty(ev.Title, synthTitle(synth), existing.Meta.Title, "Modified and merged "+rid)
+	title := firstNonEmpty(gitRec.Meta.Title, ev.Title, synthTitle(synth), existing.Meta.Title, "Modified and merged "+rid)
 	scope := mergeScope(existing.Meta.Scope, ev)
+	if gitVerified && (len(gitRec.Meta.Scope.Paths) > 0 || len(gitRec.Meta.Scope.Resources) > 0 || len(gitRec.Meta.Scope.Checks) > 0) {
+		scope = gitRec.Meta.Scope
+	}
 
-	// When a human edits a proposal before merging, prefer the new guard from ev/synth
+	// When a human edits a proposal before merging, prefer the new guard from Git/ev/synth
 	// over the superseded existing.Meta.Guard. Default severity to "warn" unless
 	// explicitly classified as "block".
 	var guard *RecordGuard
-	if ev.Guard != nil {
+	if gitVerified && gitRec.Meta.Guard != nil {
+		guard = gitRec.Meta.Guard
+	} else if ev.Guard != nil {
 		guard = ev.Guard
 	} else if synth != nil && synth.Guard != nil && GuardPassesOnHead(c.cfg.RepoDir, synth.Guard, scope.Resources) {
 		guard = synth.Guard
@@ -1036,18 +1290,22 @@ func (c *Curator) buildModifiedMergedRecord(ctx context.Context, ev OutcomeEvent
 		guard = &g
 	}
 
-	// Only a human edit on the knowledge/ PR itself transitions directly to
-	// status:active. An edit-before-merge on an operational remediation PR
-	// synthesizes a status:proposed record so a separate knowledge/ PR is opened.
-	isKnowledgePR := ev.KnowledgePR || (hasExisting && existing.Meta.Status == StatusProposed && existing.Meta.Evidence.FindingID == "" && ev.RemediationPR == "")
+	// Only a human edit on the knowledge/ PR itself that is verified as status:active
+	// in Git HEAD transitions to status:active. An edit-before-merge on an operational
+	// remediation PR (or an unverified outcome) synthesizes a status:proposed record.
+	isKnowledgePR := ev.KnowledgePR || ((gitVerified || (hasExisting && existing.Meta.Status == StatusProposed)) && existing.Meta.Evidence.FindingID == "" && ev.RemediationPR == "")
 	status := StatusProposed
-	if isKnowledgePR && !gitopsPRsDisabled() {
+	if isKnowledgePR && gitVerified && !gitopsPRsDisabled() {
 		status = StatusActive
 	}
+	supersedes := firstSlice(ev.Supersedes, existing.Meta.Supersedes)
+	if status == StatusActive {
+		supersedes = gitRec.Meta.Supersedes
+	}
 
-	rawPR := firstNonEmpty(formatPRRef(ev), existing.Meta.Evidence.PullRequest)
+	rawPR := firstNonEmpty(gitRec.Meta.Evidence.PullRequest, formatPRRef(ev), existing.Meta.Evidence.PullRequest)
 	pullReq := rawPR
-	remediationPR := firstNonEmpty(ev.RemediationPR, existing.Meta.Evidence.RemediationPR)
+	remediationPR := firstNonEmpty(gitRec.Meta.Evidence.RemediationPR, ev.RemediationPR, existing.Meta.Evidence.RemediationPR)
 	if status == StatusProposed && !isKnowledgePR && !gitopsPRsDisabled() {
 		remediationPR = firstNonEmpty(remediationPR, rawPR)
 		pullReq = ""
@@ -1060,24 +1318,24 @@ func (c *Curator) buildModifiedMergedRecord(ctx context.Context, ev OutcomeEvent
 		ID:     rid,
 		Title:  title,
 		Status: status,
-		Date:   firstNonEmpty(existing.Meta.Date, dateStr),
+		Date:   firstNonEmpty(gitRec.Meta.Date, existing.Meta.Date, dateStr),
 		Scope:  scope,
 		Guard:  guard,
 		Evidence: RecordEvidence{
 			PullRequest:       pullReq,
 			RemediationPR:     remediationPR,
-			BreakingPR:        firstNonEmpty(ev.BreakingPR, existing.Meta.Evidence.BreakingPR),
-			Incident:          firstNonEmpty(ev.Incident, existing.Meta.Evidence.Incident),
-			Commit:            firstNonEmpty(ev.Commit, existing.Meta.Evidence.Commit),
-			FindingID:         firstNonEmpty(ev.FindingID, existing.Meta.Evidence.FindingID),
+			BreakingPR:        firstNonEmpty(gitRec.Meta.Evidence.BreakingPR, ev.BreakingPR, existing.Meta.Evidence.BreakingPR),
+			Incident:          firstNonEmpty(gitRec.Meta.Evidence.Incident, ev.Incident, existing.Meta.Evidence.Incident),
+			Commit:            firstNonEmpty(gitRec.Meta.Evidence.Commit, ev.Commit, existing.Meta.Evidence.Commit),
+			FindingID:         firstNonEmpty(gitRec.Meta.Evidence.FindingID, ev.FindingID, existing.Meta.Evidence.FindingID),
 			Outcome:           string(OutcomeModifiedMerged),
-			SoakWindow:        firstNonEmpty(ev.SoakWindow, existing.Meta.Evidence.SoakWindow),
+			SoakWindow:        firstNonEmpty(gitRec.Meta.Evidence.SoakWindow, ev.SoakWindow, existing.Meta.Evidence.SoakWindow),
 			ReviewerReason:    reason,
 			RejectedProposals: rejected,
 		},
-		Supersedes: firstSlice(ev.Supersedes, existing.Meta.Supersedes),
+		Supersedes: supersedes,
 	}
-	body := buildRecordBody(rtype, ev, synth, existing.Body, status, reason)
+	body := buildRecordBody(rtype, ev, synth, firstNonEmpty(gitRec.Body, existing.Body), status, reason)
 	modSection := "## Reviewer Modification Before Merge\n\n" + reason
 	if initialProposal != "" {
 		modSection += "\n\nSuperseded initial proposal: `" + initialProposal + "`"
@@ -1086,7 +1344,7 @@ func (c *Curator) buildModifiedMergedRecord(ctx context.Context, ev OutcomeEvent
 		body = strings.TrimSpace(body) + "\n\n" + modSection
 	}
 	return Record{
-		Path: existing.Path,
+		Path: firstNonEmpty(gitRec.Path, existing.Path),
 		Meta: meta,
 		Body: body,
 	}
@@ -1102,8 +1360,13 @@ func (c *Curator) buildResolvedMergedRecord(ctx context.Context, ev OutcomeEvent
 		}
 	}
 	rid := ev.RecordID
+	if rid != "" {
+		if ex, ok := byID[rid]; ok && ex.Meta.Status == StatusActive {
+			return ex
+		}
+	}
 	if rid == "" {
-		rid = NextRecordID(c.cfg.RepoDir, rtype, year)
+		rid = c.nextRecordIDLocked(ctx, rtype, year)
 	}
 	existing := byID[rid]
 	synth := c.cfg.LLM.Synthesize(ctx, rtype, ev)
@@ -1157,8 +1420,13 @@ func (c *Curator) buildResolvedMergedRecord(ctx context.Context, ev OutcomeEvent
 
 func (c *Curator) buildPersistsRecord(ctx context.Context, ev OutcomeEvent, byID map[string]Record, year int, dateStr string) Record {
 	rid := ev.RecordID
+	if rid != "" {
+		if ex, ok := byID[rid]; ok && ex.Meta.Status == StatusActive {
+			return ex
+		}
+	}
 	if rid == "" {
-		rid = NextRecordID(c.cfg.RepoDir, RecordTypeLesson, year)
+		rid = c.nextRecordIDLocked(ctx, RecordTypeLesson, year)
 	}
 	existing := byID[rid]
 	synth := c.cfg.LLM.Synthesize(ctx, RecordTypeLesson, ev)
@@ -1206,13 +1474,16 @@ func (c *Curator) buildRefusedRecord(ctx context.Context, ev OutcomeEvent, byID 
 		rid = matchRecordIDByPR(ev, byID)
 	}
 	existing, hasExisting := byID[rid]
+	if hasExisting && existing.Meta.Status == StatusActive {
+		return existing
+	}
 	prRef := firstNonEmpty(formatPRRef(ev), existing.Meta.Evidence.PullRequest)
 	reason := firstNonEmpty(ev.ReviewerReason, ev.Summary, "Proposal closed unmerged by reviewer.")
 
 	// If an existing proposed record (such as a proposed chat rule DEC-*) is refused,
 	// transition that exact record in-place to status:rejected so update_mode:replace
 	// overwrites the proposed entry in Hindsight and leaves no stale rule behind.
-	if hasExisting && (existing.Meta.Status == StatusProposed || existing.Meta.Status == StatusRejected || existing.Meta.Type == RecordTypeDecision) {
+	if hasExisting && (existing.Meta.Status == StatusProposed || existing.Meta.Status == StatusRejected) {
 		existing.Meta.Status = StatusRejected
 		if existing.Meta.Guard != nil && existing.Meta.Guard.Severity == "block" {
 			g := *existing.Meta.Guard
@@ -1243,7 +1514,7 @@ func (c *Curator) buildRefusedRecord(ctx context.Context, ev OutcomeEvent, byID 
 		}
 	}
 	if rid == "" {
-		rid = NextRecordID(c.cfg.RepoDir, rtype, year)
+		rid = c.nextRecordIDLocked(ctx, rtype, year)
 	}
 	status := StatusRejected
 	synth := c.cfg.LLM.Synthesize(ctx, rtype, ev)
@@ -1280,6 +1551,11 @@ func (c *Curator) buildRetiredRecord(ev OutcomeEvent, byID map[string]Record, ye
 	}
 	existing, hasExisting := byID[rid]
 	if hasExisting {
+		if existing.Meta.Status == StatusActive {
+			if _, gitRetired := verifiedGitRecordByStatus(c.cfg.RepoDir, rid, StatusRetired); !gitRetired {
+				return existing
+			}
+		}
 		existing.Meta.Status = StatusRetired
 		existing.Meta.Evidence.Outcome = string(OutcomeRetired)
 		if ev.ReviewerReason != "" {
@@ -1292,7 +1568,7 @@ func (c *Curator) buildRetiredRecord(ev OutcomeEvent, byID map[string]Record, ye
 		rtype = RecordTypeLesson
 	}
 	if rid == "" {
-		rid = NextRecordID(c.cfg.RepoDir, rtype, year)
+		rid = c.nextRecordIDLocked(context.Background(), rtype, year)
 	}
 	return Record{
 		Meta: RecordMeta{
@@ -1324,7 +1600,7 @@ func (c *Curator) graduateRecurrencesLocked(ctx context.Context, repoID string, 
 
 	var graduated []string
 	for _, cand := range candidates {
-		decID := NextRecordID(c.cfg.RepoDir, RecordTypeDecision, year)
+		decID := c.nextRecordIDLocked(ctx, RecordTypeDecision, year)
 		synth := c.cfg.LLM.Synthesize(ctx, RecordTypeDecision, cand)
 		title := synthTitle(synth)
 		if title == "" {
@@ -1679,6 +1955,7 @@ func (c *Curator) HandleQuery(ctx context.Context, req MemoryQueryRequest) Memor
 				Error:  err.Error(),
 			}
 		}
+		c.journalOutcomeEvent(ctx, *req.Outcome, req.CorrelationID)
 		return MemoryQueryResponse{
 			Schema:  MemoryQueryReplySchema,
 			Backend: "curator",
@@ -1712,6 +1989,34 @@ func (c *Curator) HandleQuery(ctx context.Context, req MemoryQueryRequest) Memor
 		}
 	}
 
+	allowedBank := DefaultBankID
+	if c.cfg.Hindsight != nil && c.cfg.Hindsight.bankID != "" {
+		allowedBank = c.cfg.Hindsight.bankID
+	}
+	bank := strings.TrimSpace(req.Bank)
+	if bank == "" {
+		bank = allowedBank
+	}
+	if bank != DefaultBankID && bank != allowedBank {
+		return MemoryQueryResponse{
+			Schema: MemoryQueryReplySchema,
+			Bank:   bank,
+			Query:  req.Query,
+			Error:  fmt.Sprintf("bank %q is not allowed; curator only serves %q", bank, allowedBank),
+		}
+	}
+	for _, rawTag := range req.Tags {
+		trimmed := strings.TrimSpace(rawTag)
+		if strings.HasPrefix(strings.ToLower(trimmed), "user:") {
+			return MemoryQueryResponse{
+				Schema: MemoryQueryReplySchema,
+				Bank:   bank,
+				Query:  req.Query,
+				Error:  fmt.Sprintf("tag %q is not allowed on shared decision memory queries", trimmed),
+			}
+		}
+	}
+
 	tags := append([]string(nil), req.Tags...)
 	if len(tags) == 0 {
 		tags = []string{SharedTag}
@@ -1720,13 +2025,6 @@ func (c *Curator) HandleQuery(ctx context.Context, req MemoryQueryRequest) Memor
 	tagsMatch := req.TagsMatch
 	if tagsMatch == "" {
 		tagsMatch = "all_strict"
-	}
-	bank := req.Bank
-	if bank == "" {
-		bank = DefaultBankID
-		if c.cfg.Hindsight != nil && c.cfg.Hindsight.bankID != "" {
-			bank = c.cfg.Hindsight.bankID
-		}
 	}
 	maxRecs := req.MaxResults
 	if maxRecs <= 0 {
@@ -2003,6 +2301,56 @@ func curatorQuerySubject() string {
 	return SubjectMemoryQuery
 }
 
+func memoryReplyCaller() string {
+	for _, k := range []string{lib.EnvBusUser, "NATS_USER"} {
+		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
+			return v
+		}
+	}
+	return defaultCuratorSession
+}
+
+func newMemoryReplySubject() string {
+	nonce := strings.TrimPrefix(nats.NewInbox(), "_INBOX.")
+	return fmt.Sprintf("%s%s.%s", SubjectMemoryReplyPrefix, memoryReplyCaller(), nonce)
+}
+
+func requestOnMemoryReplyInbox(ctx context.Context, nc *nats.Conn, outMsg *nats.Msg) (*nats.Msg, error) {
+	reqCtx := ctx
+	var cancel context.CancelFunc
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		reqCtx, cancel = context.WithTimeout(ctx, defaultRequestReplyTimeout)
+		defer cancel()
+	}
+	replySubj := newMemoryReplySubject()
+	sub, err := nc.SubscribeSync(replySubj)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = sub.Unsubscribe() }()
+
+	outMsg.Reply = replySubj
+	if err := nc.PublishMsg(outMsg); err != nil {
+		return nil, err
+	}
+	for {
+		replyMsg, err := sub.NextMsgWithContext(reqCtx)
+		if err != nil {
+			return nil, err
+		}
+		if replyMsg.Header != nil && replyMsg.Header.Get("Status") == "503" {
+			return nil, nats.ErrNoResponders
+		}
+		// When outMsg.Subject is captured by a JetStream stream (such as TOPICS-JOURNAL
+		// on SubjectCuratorOutcomes), JetStream emits a PubAck JSON ({"stream":...})
+		// on outMsg.Reply before the Curator daemon sends its MemoryQueryResponse.
+		if bytes.Contains(replyMsg.Data, []byte(`"stream"`)) && !bytes.Contains(replyMsg.Data, []byte(MemoryQueryReplySchema)) {
+			continue
+		}
+		return replyMsg, nil
+	}
+}
+
 // PublishOutcome sends an OutcomeEvent to the Curator on its dedicated NATS
 // subjects (curatorQuerySubject request-reply, falling back to
 // SubjectCuratorOutcomes only when no responder is listening on the query subject).
@@ -2066,7 +2414,7 @@ func PublishOutcomeWithMeta(ctx context.Context, client *lib.Client, ev OutcomeE
 	outMsg := nats.NewMsg(outSubj)
 	outMsg.Data = raw
 	outMsg.Header.Set("Nats-Correlation-Id", correlationID)
-	msg, reqErr := nc.RequestMsgWithContext(ctx, outMsg)
+	msg, reqErr := requestOnMemoryReplyInbox(ctx, nc, outMsg)
 	if reqErr != nil {
 		return OutcomeProcessResult{}, outSubj, fmt.Errorf("curator outcome request on %s: %w", outSubj, reqErr)
 	}
@@ -2103,7 +2451,9 @@ func requestMemoryQuerySubject(ctx context.Context, client *lib.Client, subj str
 		return MemoryQueryResponse{}, false, fmt.Errorf("marshal memory query: %w", err)
 	}
 	nc := client.Conn()
-	msg, err := nc.RequestWithContext(ctx, subj, rawReq)
+	outMsg := nats.NewMsg(subj)
+	outMsg.Data = rawReq
+	msg, err := requestOnMemoryReplyInbox(ctx, nc, outMsg)
 	if err != nil {
 		return MemoryQueryResponse{}, false, fmt.Errorf("nats memory query on %s: %w", subj, err)
 	}
@@ -2329,4 +2679,93 @@ func SyncRecordsToHindsight(ctx context.Context, hs *HindsightClient, repoID, re
 		deleted = append(deleted, doc.ID)
 	}
 	return upserted, deleted, nil
+}
+
+// DreamReport summarizes a Dreamer consolidation and guard verification pass.
+type DreamReport struct {
+	Repo               string   `json:"repo"`
+	VerifiedActive     []string `json:"verified_active"`
+	DemotedDrifted     []string `json:"demoted_drifted,omitempty"`
+	GraduatedDecisions []string `json:"graduated_decisions,omitempty"`
+	Upserted           []string `json:"upserted,omitempty"`
+	Deleted            []string `json:"deleted,omitempty"`
+}
+
+// RunDream executes a Dreamer consolidation pass: it audits active guards against
+// the current HEAD worktree (downgrading drifted "block" guards to "warn"),
+// graduates cross-cluster recurring lessons into fleet-wide proposed decisions,
+// and syncs all valid OKF records to Hindsight.
+func (c *Curator) RunDream(ctx context.Context) (DreamReport, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.ensureKnownIDsLocked(ctx)
+	records, err := LoadRecords(c.cfg.RepoDir)
+	if err != nil {
+		return DreamReport{}, err
+	}
+	report := DreamReport{
+		Repo:           c.cfg.RepoID,
+		VerifiedActive: []string{},
+	}
+	now := time.Now().UTC()
+	dateStr := now.Format("2006-01-02")
+	year := now.Year()
+
+	for _, r := range records {
+		if r.Meta.Status != StatusActive || r.Meta.Guard == nil || r.Meta.Guard.Expect == nil {
+			continue
+		}
+		if GuardPassesOnHead(c.cfg.RepoDir, r.Meta.Guard, r.Meta.Scope.Resources) {
+			report.VerifiedActive = append(report.VerifiedActive, r.Meta.ID)
+			continue
+		}
+		if r.Meta.Guard.Severity == "block" {
+			g := *r.Meta.Guard
+			g.Severity = "warn"
+			r.Meta.Guard = &g
+			if sErr := SaveRecord(c.cfg.RepoDir, &r); sErr != nil {
+				return report, sErr
+			}
+		}
+		report.DemotedDrifted = append(report.DemotedDrifted, r.Meta.ID)
+	}
+
+	records, err = LoadRecords(c.cfg.RepoDir)
+	if err != nil {
+		return report, err
+	}
+	graduated, err := c.graduateRecurrencesLocked(ctx, c.cfg.RepoID, records, year, dateStr)
+	if err != nil {
+		return report, err
+	}
+	if len(graduated) > 0 {
+		report.GraduatedDecisions = graduated
+		c.graduatedIDs = append(c.graduatedIDs, graduated...)
+		records, _ = LoadRecords(c.cfg.RepoDir)
+	}
+
+	if c.cfg.Hindsight != nil {
+		upserted, deleted, syncErr := SyncRecordsToHindsight(ctx, c.cfg.Hindsight, c.cfg.RepoID, c.cfg.RepoDir)
+		if syncErr != nil {
+			return report, syncErr
+		}
+		report.Upserted = upserted
+		report.Deleted = deleted
+	} else {
+		for _, r := range records {
+			if len(ValidateRecord(r)) == 0 {
+				report.Upserted = append(report.Upserted, r.Meta.ID)
+			}
+		}
+	}
+
+	c.queryCache = map[string]MemoryQueryResponse{}
+	gradCopy := append([]string(nil), c.graduatedIDs...)
+	digest := BuildBlueprintDigest(c.cfg.RepoID, records, "dream-pass", gradCopy)
+	_ = persistLocalStateSnapshot(c.cfg.RepoDir, digest)
+	if c.cfg.Client != nil {
+		_ = c.publishBlueprintDigest(ctx, digest, "")
+	}
+	return report, nil
 }

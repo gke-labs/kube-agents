@@ -90,6 +90,9 @@ true.
 {{- if gt (include "kube-agents.credentialProxyExecReplicas" . | int) 0 }}
 {{- $jobs = append $jobs (printf "%s-credential-proxy-exec-tier-monitoring" $agent) }}
 {{- end }}
+{{- if include "kube-agents.a2aNATSExporterRendered" . }}
+{{- $jobs = append $jobs (printf "%s-a2a-nats-monitoring" $agent) }}
+{{- end }}
 {{- $who := "{{ $labels.agent_namespace }}/{{ $labels.agent }}" }}
 apiVersion: monitoring.googleapis.com/v1
 kind: Rules

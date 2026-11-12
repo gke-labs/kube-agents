@@ -41,10 +41,11 @@ const (
 	exitCodeBlocked         = 2
 )
 
-const curatorUsage = `curator - Go OKF Decision & Lesson Memory Curator for kube-agents
+const curatorUsage = `curator - Go OKF Decision & Lesson Memory Curator and Dreamer for kube-agents
 
 usage:
   curator daemon [flags]         subscribe to SubjectCuratorOutcomes, index into Hindsight, serve NATS memory queries, and publish blueprint digests
+  curator dream [flags]          audit active guards against HEAD, graduate cross-cluster recurring lessons, and sync into Hindsight
   curator emit [flags]           publish a kube-agents.memory.outcome/v1 event and return the synthesized record metadata
   curator pending [flags]        list status:proposed OKF records awaiting pull request creation or review
   curator check [flags] [-- ...] evaluate active and proposed OKF guards against changed files (exits 2 on block)
@@ -85,6 +86,8 @@ func run(args []string) error {
 	switch args[0] {
 	case "daemon", "serve":
 		return runDaemon(args[1:])
+	case "dream", "bootstrap":
+		return runDream(args[1:])
 	case "emit", "publish":
 		return runEmit(args[1:])
 	case "pending":
@@ -612,11 +615,13 @@ func runCheck(args []string) error {
 				if !ok {
 					continue
 				}
-				sev := v.Severity
-				if sev == "" {
-					sev = "warn"
+				// Advisory LLM findings are capped at "warn" (memory.md Stage A/B); only
+				// deterministic scope / guard.expect checks may block.
+				sev := "warn"
+				if strings.EqualFold(strings.TrimSpace(v.Severity), "info") {
+					sev = "info"
 				}
-				report.Findings = append(report.Findings, memory.CheckFinding{
+				finding := memory.CheckFinding{
 					ID:          v.ID,
 					Type:        rec.Meta.Type,
 					Status:      memory.StatusActive,
@@ -634,7 +639,18 @@ func runCheck(args []string) error {
 						Severity: sev,
 					},
 					Body: v.Reason,
-				})
+				}
+				replaced := false
+				for i := range report.Findings {
+					if report.Findings[i].ID == v.ID && report.Findings[i].Verdict == "related" {
+						report.Findings[i] = finding
+						replaced = true
+						break
+					}
+				}
+				if !replaced {
+					report.Findings = append(report.Findings, finding)
+				}
 				appended = true
 			}
 			if appended {
@@ -708,6 +724,54 @@ func runIndex(args []string) error {
 		"upserted": upserted,
 		"deleted":  deleted,
 	})
+}
+
+func runDream(args []string) error {
+	fs := flag.NewFlagSet("curator dream", flag.ContinueOnError)
+	repoDir := fs.String("repo", defaultRepoDir(), "knowledge repository directory")
+	repoID := fs.String("repo-id", defaultRepoID(), "canonical repository identifier")
+	hsURL := fs.String("hindsight-url", defaultHindsightURL(), "Hindsight API URL")
+	bank := fs.String("bank", memory.DefaultBankID, "Hindsight bank ID")
+	threshold := fs.Int("recurrence-threshold", defaultRecurrenceFloor, "clusters required to graduate a lesson to a fleet-wide decision")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), indexOpTimeout)
+	defer cancel()
+
+	var hs *memory.HindsightClient
+	if *hsURL != "" {
+		hs = memory.NewHindsightClient(*hsURL, *bank)
+	}
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	var client *lib.Client
+	if os.Getenv("NATS_URL") != "" {
+		if c, err := connectNATS(ctx, "dream", log); err == nil {
+			client = c
+			defer client.Close()
+		}
+	}
+	cur, err := memory.NewCurator(memory.CuratorConfig{
+		RepoDir:             *repoDir,
+		RepoID:              *repoID,
+		Session:             busUser(),
+		Profile:             os.Getenv("A2A_PROFILE"),
+		RecurrenceThreshold: *threshold,
+		Client:              client,
+		Hindsight:           hs,
+		LLM:                 memory.ResolveLLMConfig(),
+		Logger:              log,
+	})
+	if err != nil {
+		return err
+	}
+	report, err := cur.RunDream(ctx)
+	if err != nil {
+		return err
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	return enc.Encode(report)
 }
 
 func runRecall(args []string) error {

@@ -50,7 +50,7 @@ This list and `REQUIRED_APIS` in `scripts/verify_ci_pool_project.py` must agree 
 
 `hack/ci-deploy.sh` turns on the gateway's session-affinity hook (`litellm.vertex.sessionAffinity`), which sends a `session_id` on every Gemini request so that conversations sharing a prompt land on the same few Vertex replicas and read its prefix from cache. Vertex honours `session_id` only on a project carrying the `LLM_SESSION_ID` visibility label on `aiplatform.googleapis.com`. The Vertex team sets it on request; no `gcloud` command or Terraform resource reaches it, so neither the provisioning script nor the verifier touches it. `kube-agents-evals` and `kube-agents-evals-2` through `-40` carried it on 2026-11-02.
 
-A project without it still passes every eval: Vertex accepts the field and ignores it, so the run routes as if the hook were off and only its cache reads are lower. To check a project, send four `generateContent` requests to `gemini-3.1-pro-preview` on `global`, a few seconds apart, with one `session_id`, the same system instruction of several thousand tokens, and a different first user message each time. With the label, `usageMetadata.cachedContentTokenCount` on the second to fourth covers most of the system instruction; without it, they mostly read zero. About one check in five misses on a labelled project, so repeat a check that reads zero before asking for the label.
+A project without it still passes every eval: Vertex accepts the field and ignores it, so the run routes as if the hook were off and only its cache reads are lower. To check a project, send four `generateContent` requests to the gate's model on `global`, a few seconds apart, with one `session_id`, the same system instruction of several thousand tokens, and a different first user message each time. With the label, `usageMetadata.cachedContentTokenCount` on the second to fourth covers most of the system instruction; without it, they mostly read zero. About one check in five misses on a labelled project, so repeat a check that reads zero before asking for the label.
 
 ## 2. Host GKE Cluster (`platform-agent-host`)
 
@@ -601,8 +601,8 @@ Developer API with the leased project's own key, and so are redded by the
 `ci-kube-agents-eval-replay-lane` in `oss-test-infra` (`kube-agents-periodics.yaml`) runs daily at
 06:00 UTC with the nightlies' identity, decoration and log bucket
 (`gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-replay-lane/`). It replays the
-model answers the next-mode nightlies recorded to the replay cache bucket (section 3) on `main`,
-gates nothing and publishes no dashboard data: its report (served share and each replayed
+model answers the next-mode nightlies recorded to the replay cache bucket (section 3) on the
+commit the newest recording night ran, or on `main` when no record names one, gates nothing and publishes no dashboard data: its report (served share and each replayed
 conversation's verdict against its recording's) is in the shadow bucket under
 `replay-shadow/replay-lane/<YYYY-MM-DD>/<build>/report/`, and its summary lines are in the job's
 `replay-shadow-collector.log`. ci-health watches the job
@@ -612,10 +612,12 @@ refused or the records could not be listed (the download's summary line in the j
 which, by its error class), or when a proxy pod did not take the cache (the seed line above the
 error counts them).
 [`hack/replay-proxy/README.md`](../hack/replay-proxy/README.md#record-and-replay-the-replay-lane)
-explains each. Any edit to `hack/replay-proxy/normalizer.py` changes the cache's normalizer
-version, so a change that merges after the nightlies check out `main` (00:00 UTC) and before the
-lane does (06:00 UTC) leaves the lane nothing recorded under its version that morning: expect one
-red, cleared by the next night's recordings.
+explains each, and how the commit is chosen. Because the lane replays on that commit, a prompt or
+normalizer change that merges after the nightlies check out `main` (00:00 UTC) doesn't change that
+morning's lane. On the fallback to `main` it still can: any edit to
+`hack/replay-proxy/normalizer.py` changes the cache's normalizer version and leaves the lane nothing
+recorded under its version, so expect one red, cleared by the next night's recordings. The job log
+says which commit the lane checked out and why, and the report names it.
 
 ## 6. The seeded dirty fleet
 

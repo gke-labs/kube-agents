@@ -58,7 +58,8 @@ Why: the ack is status, and a specific target is what tells the user they were u
 
 Today: [`agents/chat/SOUL.md`](../../agents/chat/SOUL.md) §2 step 4 is the rule. The arrival
 reaction is the receipt before any model call: `arrival_reaction` in `slack_presenter.py`, ported
-as `askKind` in `a2a/hermes-bridge/chat.go`.
+as `askkind.Kind` in `a2a/lib/askkind`, which the A2A gateway draws when it accepts the ask and
+the hermes-bridge's heartbeats mark with.
 
 ## One live status line, updated in place
 

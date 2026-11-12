@@ -107,7 +107,10 @@ func TestBuildA2ACuratorNetworkPolicyRestrictsIngressAndEgress(t *testing.T) {
 	if len(np.Spec.Egress) != 4 {
 		t.Fatalf("Egress rules = %d, want 4 (DNS, NATS, LiteLLM, Hindsight)", len(np.Spec.Egress))
 	}
-	for _, rule := range np.Spec.Egress {
+	for i, rule := range np.Spec.Egress {
+		if len(rule.To) == 0 {
+			t.Errorf("egress rule %d has empty To (wildcard destination); every curator egress rule must bound To", i)
+		}
 		for _, p := range rule.Ports {
 			if p.Port != nil && p.Port.IntVal == 443 {
 				t.Errorf("curator NetworkPolicy grants port 443 egress; curator must not dial K8s API or external HTTPS")
@@ -121,6 +124,11 @@ func TestBuildA2ACuratorNetworkPolicyRestrictsIngressAndEgress(t *testing.T) {
 				}
 			}
 		}
+	}
+	// Verify LiteLLM egress rule specifically targets the litellm pod.
+	litellmRule := np.Spec.Egress[2]
+	if len(litellmRule.To) != 1 || litellmRule.To[0].PodSelector == nil || litellmRule.To[0].PodSelector.MatchLabels["app"] != "litellm" {
+		t.Fatalf("LiteLLM egress To = %+v, want PodSelector app=litellm", litellmRule.To)
 	}
 }
 
@@ -178,9 +186,15 @@ func TestCuratorFlagControlsAuthMapAndNATSPeers(t *testing.T) {
 		t.Errorf("curator serviceAccount = %q, want %q", cur.ServiceAccount, wantSA)
 	}
 	for _, g := range cur.Grants.Publish {
-		if strings.Contains(g, "CONSUMER.CREATE") || strings.HasPrefix(g, "a2a.tasks.") {
+		if g == "$JS.API.>" || strings.Contains(g, "CONSUMER.CREATE") || strings.HasPrefix(g, "a2a.tasks.") || strings.HasPrefix(g, "_INBOX."+a2aAgentBusUser+".") {
 			t.Errorf("curator holds forbidden publish grant %q", g)
 		}
+	}
+	if !slices.Contains(cur.Grants.Publish, a2aMemoryReplySubjects) {
+		t.Errorf("curator publish grants %v missing %q", cur.Grants.Publish, a2aMemoryReplySubjects)
+	}
+	if !slices.Contains(cur.Grants.Subscribe, a2aMemoryQuerySubject) || !slices.Contains(cur.Grants.Subscribe, a2aCuratorOutcomesSubject) {
+		t.Errorf("curator subscribe grants %v missing %q or %q", cur.Grants.Subscribe, a2aMemoryQuerySubject, a2aCuratorOutcomesSubject)
 	}
 
 	// Verify ServiceAccount has zero RBAC bindings and is reserved from AgentProfiles.

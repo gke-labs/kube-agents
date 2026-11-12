@@ -308,9 +308,12 @@ func (cfg LLMConfig) JudgeDiff(ctx context.Context, records []Record, diffText s
 		if !exists {
 			continue
 		}
+		// Advisory LLM findings are capped at "warn" (memory.md Stage A/B); only
+		// deterministic guard.expect assertions may block.
 		sev := "warn"
-		if rec.Meta.Guard != nil && rec.Meta.Guard.Severity != "" {
-			sev = rec.Meta.Guard.Severity
+		if strings.EqualFold(strings.TrimSpace(v.Severity), "info") ||
+			(rec.Meta.Guard != nil && strings.EqualFold(strings.TrimSpace(rec.Meta.Guard.Severity), "info")) {
+			sev = "info"
 		}
 		ruleText := strings.TrimSpace(v.Rule)
 		if ruleText == "" && rec.Meta.Guard != nil && rec.Meta.Guard.Rule != "" {
