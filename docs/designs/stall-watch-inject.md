@@ -222,9 +222,16 @@ to its own read, which reads its own events; a cluster report that cannot be had
 script failed, printed no report, or timed out short of the budget) sends the cluster to the
 per-namespace path throughout. The referents of the dangling-reference heuristic are resolved
 from one name-only listing per kind across the cluster (`-o custom-columns` of namespace and
-name, never a body), a cut or failed listing leaving the kind unresolved as a failed `-o name`
-did. The cursor keeps its two grains: a tick that runs out before a cluster's read resumes at
-the cluster; one that runs out between per-namespace reads resumes at the namespace.
+name, never a body); a kind whose cluster-wide listing failed or was cut is resolved per
+namespace through the namespace read's own `-o name` listing, so a failed listing clears no
+dangling-reference row, and only a kind neither listing can read (Secrets on the read-only
+permission set) stays unresolved. The cursor keeps its two grains: a tick that runs out before a
+cluster's read resumes at the cluster; one that runs out between per-namespace reads resumes at
+the namespace. Every hop's remote command runs under coreutils `timeout` at the hop's bound plus
+a two-second grace: a local timeout frees the broker slot but not the `stall_report.py` it
+started in the sandbox, and without the wrapper a few timeouts would leave more readers running
+than `SCAN_WORKERS` admits; the grace keeps the local timeout first, so a timed-out hop still
+reads as one.
 
 Clusters are read `SCAN_WORKERS` (four) at a time once the listing is in. The bound is the
 broker's: it admits eight commands at once, the shell role is interactive there and admitted

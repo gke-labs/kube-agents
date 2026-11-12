@@ -1092,7 +1092,7 @@ def kubectl_names_cluster_wide(resource: str) -> set[tuple[str, str]] | None:
     if rc != 0 or reply_cut(rc, stderr):
         sys.stderr.write(
             f"{WARNING_PREFIX}cannot list {resource} across every namespace; references to "
-            f"{resource} are not checked: {stderr.strip()}\n"
+            f"{resource} are resolved per namespace instead: {stderr.strip()}\n"
         )
         return None
     names: set[tuple[str, str]] = set()
@@ -1106,10 +1106,16 @@ def kubectl_names_cluster_wide(resource: str) -> set[tuple[str, str]] | None:
 class ClusterNameResolver(NameResolver):
     """`NameResolver` over one listing per referent kind across every
     namespace, so a cluster of hundreds of namespaces resolves its references
-    from at most one read per kind."""
+    from at most one read per kind. A kind whose cluster-wide listing failed
+    or was cut is resolved per namespace, through `NameResolver`'s own
+    listing, as the namespace read resolves it: the cluster-wide read saves
+    calls and never leaves a reference unchecked that the namespace read
+    would have checked, so a dangling-reference row does not clear on a
+    listing that failed. A kind neither listing can read (Secrets on the
+    read-only permission set) stays unresolved, as before."""
 
-    def __init__(self, lister=kubectl_names_cluster_wide):
-        super().__init__()
+    def __init__(self, lister=kubectl_names_cluster_wide, namespace_lister=kubectl_names):
+        super().__init__(lister=namespace_lister)
         self._cluster_lister = lister
         self._names: dict[str, set[tuple[str, str]] | None] = {}
 
@@ -1121,7 +1127,7 @@ class ClusterNameResolver(NameResolver):
             self._names[resource] = self._cluster_lister(resource)
         names = self._names[resource]
         if names is None:
-            return None
+            return super().exists(kind, namespace, name)
         return (namespace, name) in names
 
 

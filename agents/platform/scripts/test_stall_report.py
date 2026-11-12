@@ -862,12 +862,14 @@ class RecordedCluster:
     `raw_rc` fails every raw deployments page; `events_cut` cuts the raw
     and the chunked events reads."""
 
-    def __init__(self, cut=(), raw_cut_until=0, raw_rc=0, events_cut=False, secrets_rc=1):
+    def __init__(self, cut=(), raw_cut_until=0, raw_rc=0, events_cut=False, secrets_rc=1, configmaps_rc=0):
         self.cut = set(cut)
         self.raw_cut_until = raw_cut_until
         self.raw_rc = raw_rc
         self.events_cut = events_cut
         self.secrets_rc = secrets_rc
+        # The cluster-wide configmaps listing's exit code; the per-namespace one always answers.
+        self.configmaps_rc = configmaps_rc
         self.calls = []
         self.deployments = [lagging_deployment(), healthy_deployment("api"), deadline_deployment(), deadline_deployment("hidden", OTHER)]
         self.gateways = [stale_gateway()]
@@ -911,6 +913,8 @@ class RecordedCluster:
                 if resource == "secrets":
                     return self.secrets_rc, "", "Error from server (Forbidden): secrets is forbidden"
                 assert resource == "configmaps", args
+                if self.configmaps_rc:
+                    return self.configmaps_rc, "", "Error from server (ServiceUnavailable): the server is currently unable to handle the request"
                 return 0, "".join(f"{ns}   {name}\n" for ns, name in sorted(self.configmaps)), ""
             if resource in self.cut:
                 return 74, '{"kind":"List","items":[{"metadata":{"name":"a', CUT_STDERR
@@ -965,10 +969,11 @@ class ClusterMode(unittest.TestCase):
         self.assertFalse(report["events_fallback"])
         # Two raw pages of deployments, one chunked read of gateways, one raw
         # page of events, and one listing each of configmaps (the envFrom)
-        # and secrets (the listener's certificateRefs; forbidden, so
-        # unresolved) for the dangling references: six calls for the
-        # cluster, against five per namespace.
-        self.assertEqual(cluster_reads, 6, cluster.calls)
+        # and secrets (the listener's certificateRefs) for the dangling
+        # references, the secrets listing forbidden across every namespace
+        # and so tried once per namespace with a reference, forbidden there
+        # too: seven calls for the cluster, against five per namespace.
+        self.assertEqual(cluster_reads, 7, cluster.calls)
         self.assertEqual(cluster.calls[0], ["get", "--raw", "/apis/apps/v1/deployments?limit=500"])
         self.assertEqual(cluster.calls[1], ["get", "--raw", "/apis/apps/v1/deployments?limit=500&continue=tok1"])
         self.assertEqual(cluster.calls[2], ["get", GATEWAYS, "--all-namespaces", "--chunk-size=500", "--show-managed-fields", "-o", "json"])
@@ -976,6 +981,7 @@ class ClusterMode(unittest.TestCase):
         self.assertEqual(cluster.calls[4], ["get", "configmaps", "--all-namespaces", "--chunk-size=500", "--no-headers", "-o", stall_report.NAME_COLUMNS])
         self.assertEqual(cluster.calls[5][:2], ["get", "secrets"])
         self.assertEqual(cluster.calls[5][-1], stall_report.NAME_COLUMNS, "names only: no Secret body crosses")
+        self.assertEqual(cluster.calls[6], ["get", "secrets", "-n", NAMESPACE, "-o", "name"], "the per-namespace listing a failed cluster-wide one falls back to")
 
     def test_a_chunked_reply_the_broker_cut_leaves_the_kind_to_the_per_namespace_read(self):
         report, err = self.report(RecordedCluster(cut=[GATEWAYS]))
@@ -1024,21 +1030,42 @@ class ClusterMode(unittest.TestCase):
         self.assertEqual([f["object"] for f in report["namespaces"][BILLING]["findings"]], ["Deployment/batch"])
         self.assertEqual([c[1] for c in cluster.calls if c[1] == GATEWAYS], [])
 
-    def test_the_cluster_resolver_lists_a_referent_kind_once_and_an_unlistable_one_is_unresolved(self):
+    def test_a_failed_cluster_wide_referent_listing_falls_back_to_the_per_namespace_listing(self):
+        # The configmaps listing across every namespace fails (an aggregated
+        # API hiccup, a cut): the references are resolved per namespace, as
+        # the namespace read resolves them, and the dangling-reference row
+        # stands rather than clearing on a listing that failed.
+        cluster = RecordedCluster(configmaps_rc=1)
+        report, err = self.report(cluster)
+        expected = RecordedCluster().namespace_path(NAMESPACE)
+        self.assertEqual(json.dumps(report["namespaces"][NAMESPACE]["findings"]), json.dumps(expected))
+        self.assertIn("dangling-reference", [f["heuristic"] for f in report["namespaces"][NAMESPACE]["findings"]])
+        self.assertIn("references to configmaps are resolved per namespace instead", err)
+        self.assertEqual([c for c in cluster.calls if c[1] == "configmaps" and "-n" in c], [["get", "configmaps", "-n", NAMESPACE, "-o", "name"]], "one per-namespace listing, for the namespace with the reference")
+
+    def test_the_cluster_resolver_lists_a_referent_kind_once_and_falls_back_per_namespace_when_it_cannot(self):
         calls = []
+        namespaced = []
 
         def lister(resource):
             calls.append(resource)
-            return None if resource == "secrets" else {(NAMESPACE, "present")}
+            return None if resource in ("secrets", "services") else {(NAMESPACE, "present")}
 
-        resolver = stall_report.ClusterNameResolver(lister=lister)
+        def namespace_lister(resource, namespace):
+            namespaced.append((resource, namespace))
+            return None if resource == "secrets" else {"svc"}
+
+        resolver = stall_report.ClusterNameResolver(lister=lister, namespace_lister=namespace_lister)
         self.assertTrue(resolver.exists("ConfigMap", NAMESPACE, "present"))
         self.assertFalse(resolver.exists("ConfigMap", BILLING, "present"), "the namespace is part of the name")
         self.assertFalse(resolver.exists("ConfigMap", NAMESPACE, "absent"))
-        self.assertIsNone(resolver.exists("Secret", NAMESPACE, "tls"))
+        self.assertTrue(resolver.exists("Service", NAMESPACE, "svc"), "a kind the cluster-wide listing could not read resolves per namespace")
+        self.assertFalse(resolver.exists("Service", NAMESPACE, "gone"))
+        self.assertIsNone(resolver.exists("Secret", NAMESPACE, "tls"), "a kind neither listing can read stays unresolved")
         self.assertIsNone(resolver.exists("Secret", BILLING, "tls"))
         self.assertIsNone(resolver.exists("Thing", NAMESPACE, "x"), "a kind with no resource is left alone")
-        self.assertEqual(calls, ["configmaps", "secrets"])
+        self.assertEqual(calls, ["configmaps", "services", "secrets"], "one cluster-wide listing per kind")
+        self.assertEqual(namespaced, [("services", NAMESPACE), ("secrets", NAMESPACE), ("secrets", BILLING)], "the per-namespace listing once per kind and namespace it fell back for")
 
     def test_a_cut_referent_listing_leaves_references_unresolved(self):
         with patch.object(stall_report, "run_kubectl", return_value=(0, "payments   present\n", "credential proxy output truncated\n")):

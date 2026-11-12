@@ -594,6 +594,17 @@ NAMESPACE_SCAN_TIMEOUT_SECONDS = 300
 #: budget.
 CLUSTER_SCAN_TIMEOUT_SECONDS = 600
 SCAN_TIMEOUT_FLOOR_SECONDS = 1
+#: Every hop's remote command runs under coreutils `timeout` (in the sandbox
+#: image's base) at the hop's own bound plus this grace, TERM then KILL after
+#: REMOTE_TIMEOUT_KILL_AFTER_SECONDS. A local timeout ends the ssh and frees
+#: the broker slot, but not the `stall_report.py` or `kubectl` it started on
+#: the other side; without the wrapper a few timeouts leave more readers in
+#: the sandbox than SCAN_WORKERS admits. The grace keeps the local timeout
+#: first, so a timed-out hop still reads as one here.
+REMOTE_TIMEOUT_COMMAND = "timeout"
+REMOTE_TIMEOUT_KILL_FLAG = "-k"
+REMOTE_TIMEOUT_KILL_AFTER_SECONDS = 5
+REMOTE_TIMEOUT_GRACE_SECONDS = 2
 #: stall_report.py exits 2 when it could read no kind at all; anything else
 #: non-zero is a crash, and both leave the namespace unread this tick.
 REPORT_UNREADABLE_EXIT = 2
@@ -793,7 +804,13 @@ def run_sandbox(
     with BROKER_SLOTS:
         if deadline is not None:
             timeout = min(timeout, max(SCAN_TIMEOUT_FLOOR_SECONDS, deadline - time.monotonic()))
-        return sandbox_exec.run(argv, remote_env=remote_env, timeout=timeout, check=False, stdin=stdin)
+        # The remote command runs under `timeout` for the same bound plus a
+        # grace: the local side gives up first, so a timeout here still
+        # reads as one (the budget cut, the cluster's slice skipped), and
+        # the reader in the sandbox ends within the grace rather than
+        # running on past the slot it was counted against.
+        remote = [REMOTE_TIMEOUT_COMMAND, REMOTE_TIMEOUT_KILL_FLAG, str(REMOTE_TIMEOUT_KILL_AFTER_SECONDS), f"{timeout + REMOTE_TIMEOUT_GRACE_SECONDS:g}", *argv]
+        return sandbox_exec.run(remote, remote_env=remote_env, timeout=timeout, check=False, stdin=stdin)
 
 
 def stderr_excerpt(text: str | None) -> str:

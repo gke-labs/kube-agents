@@ -2158,6 +2158,28 @@ class ClusterRead(Base):
             stall_watch.run_sandbox(["kubectl", "version"], timeout=300, deadline=1000.0 - 5)
         self.assertEqual(seen, [300, 40, stall_watch.SCAN_TIMEOUT_FLOOR_SECONDS], "no deadline: as asked; a deadline: the time left to it; past it: the floor")
 
+    def test_a_timed_out_hop_ends_the_remote_reader_too(self):
+        # The sandbox is this machine: the fake runs the remote argv as a
+        # process, with a local timeout far past the hop's, so only the
+        # `timeout` wrapper the hop carries can end the reader. It does, at
+        # the hop's bound plus the grace, with coreutils' exit code.
+        seen = {}
+
+        def local_sandbox(argv, *, remote_env=None, timeout=None, check=False, stdin=None):
+            seen["argv"], seen["timeout"] = list(argv), timeout
+            return subprocess.run(argv, capture_output=True, text=True, timeout=timeout + 30, check=False)
+
+        bound = 0.2
+        started = stall_watch.time.perf_counter()
+        with patch.object(stall_watch.sandbox_exec, "run", local_sandbox):
+            r = stall_watch.run_sandbox(["sleep", "30"], timeout=bound)
+        elapsed = stall_watch.time.perf_counter() - started
+        self.assertEqual(seen["argv"][:4], [stall_watch.REMOTE_TIMEOUT_COMMAND, stall_watch.REMOTE_TIMEOUT_KILL_FLAG, str(stall_watch.REMOTE_TIMEOUT_KILL_AFTER_SECONDS), f"{bound + stall_watch.REMOTE_TIMEOUT_GRACE_SECONDS:g}"])
+        self.assertEqual(seen["argv"][4:], ["sleep", "30"])
+        self.assertEqual(seen["timeout"], bound, "the local bound is the hop's own")
+        self.assertEqual(r.returncode, 124, "coreutils timeout ended the reader")
+        self.assertLess(elapsed, bound + stall_watch.REMOTE_TIMEOUT_GRACE_SECONDS + stall_watch.REMOTE_TIMEOUT_KILL_AFTER_SECONDS, "within the grace, not the reader's 30 s")
+
     def test_the_ledger_rows_are_the_same_whichever_path_read_them(self):
         now = "2026-11-10T12:00:00+00:00"
         rows = {"checkout": [DEPLOYMENT_ROW, finding("checkout", "Deployment/cart", "generation-lag", "generation 3, observedGeneration 2")], "storefront": GATEWAY_ROWS, "web": []}
