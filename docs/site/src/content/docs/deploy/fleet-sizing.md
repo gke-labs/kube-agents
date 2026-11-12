@@ -39,8 +39,8 @@ agent reads.
 
 ## What each pod needs
 
-The table is the `today` component stack with the GitHub minter on, the web console off and
-Hindsight off. The default column is declared. The fleet column is what
+The table is the component stack without the A2A stack, with the GitHub minter on, the web
+console off and Hindsight off. The default column is declared. The fleet column is what
 [`values-fleet.yaml`](#the-fleet-values-file) sets, plus the one field it cannot, and is modeled.
 CPU is in vCPU, memory in GiB, and each cell reads requests then limits. A test derives the
 declared column from the two files and fails when the page falls behind them.
@@ -83,12 +83,12 @@ runtime unless
 names `gvisor`; the gateway pod's class is the separate `availability.runtimeClassName`, which
 the installer sets.
 
-Two optional stacks add to the total:
+Two more stacks add to the total:
 
 - **Hindsight memory** (`platformAgent.harness.memory.provider: kube_agents_memory`): the API
   at 0.5 vCPU and 2 GiB requests, 4 vCPU and 4 GiB limits; Postgres at 0.25 vCPU and 256 MiB
   requests, 1 vCPU and 1 GiB limits, 1.1 GiB ephemeral and an 8 GiB claim. Declared.
-- **`spec.mode: next`**: the A2A stack's standing pods, a container in the agent pod and a
+- **The A2A stack**, on every install: its standing pods, a container in the agent pod and a
   JetStream claim per NATS server. Each delegation adds a session pod, up to `maxSessions` at
   once. The prerequisites page's [Footprint](/kube-agents/install/prerequisites/#footprint)
   gives the totals and each pod's requests and limits, generated from the chart.
@@ -157,8 +157,8 @@ the tier at the row it admits, and the CR's `SizingCappedByQuota` condition name
 
 | Pool             | Shape (modeled)                                                                            | Carries                                                               |
 | ---------------- | ------------------------------------------------------------------------------------------ | --------------------------------------------------------------------- |
-| Default          | 3 × `n2-standard-8` (or `c3-standard-8`), 200 GB `pd-balanced` boot disk, autoscale 2 to 4 | proxy, operator, LiteLLM, minter, the `next` stack                    |
-| gVisor (sandbox) | 1 × `n2-standard-4`, 150 GB boot disk, autoscale 1 to 2; `n2-standard-8` for `mode: next`  | gateway pod; the shell sandbox once its own `runtimeClassName` is set |
+| Default          | 3 × `n2-standard-8` (or `c3-standard-8`), 200 GB `pd-balanced` boot disk, autoscale 2 to 4 | proxy, operator, LiteLLM, minter, the A2A stack                       |
+| gVisor (sandbox) | 1 × `n2-standard-8`, 150 GB boot disk, autoscale 1 to 2                                    | gateway pod; the shell sandbox once its own `runtimeClassName` is set |
 
 Create the gVisor pool with `--sandbox type=gvisor`, so it carries the taint only the sandboxed
 pods tolerate. The boot disk sizes are modeled: the measured fleet's evictions were disk

@@ -15,7 +15,7 @@ them, since the merge-blocking presubmit runs on that lane (below).
 `hack/replay-proxy/` carries it as well, because its normalizer decides which requests match a
 recorded answer ([`eval-design.md`](../examples/inference-replay/eval-design.md#the-proxy-cant-come-from-the-pull-request)).
 Nothing else carries the rule: `hack/ci-eval-pr.sh` and the scripts it runs,
-`hack/eval/nightly-cases.txt`, `hack/eval/certification-cases.txt`, `hack/eval/api-lane-exclusions.txt`, `hack/eval/replay-lane-cases.txt` and a new case directory under `bench/tasks/` need only the normal approvers
+`hack/eval/nightly-cases.txt`, `hack/eval/certification-cases.txt`, `hack/eval/replay-lane-cases.txt` and a new case directory under `bench/tasks/` need only the normal approvers
 ([#1546](https://github.com/gke-labs/kube-agents/issues/1546), decided 2026-09-15). This
 page lives under `docs/` on purpose: the presubmit's step 0 (`hack/ci-revalidate.sh`) treats
 `docs/` as inert (and the Prow path filter in `oss-test-infra` does today too), so a review finding
@@ -171,14 +171,10 @@ roster line on 2026-11-02 (its bullet stays for the record):
   2026-10-28), because that lane sets the route check aside and the
   current models read the block correctly on their own, so a presubmit seat could not fail when
   the fix it guards is undone. It stays a nightly case; the domain's seat is
-  consistency-drift-outlier's. No CI lane grades its route check today: the nightly's main shards run
-  through the inject door since #3783, and since #3969 retired the today-mode nightly the
-  api-lane jobs that remain carry the presubmit list (the GitLab nightly its own list), not the
-  nightly file, so the route is graded only on an api-lane run that carries the case, as #3975's
-  today-lane measuring run did. Enters again only once a CI lane grades that route check (an
-  api-lane job that runs the nightly file, or the case on a list such a job reads) and the record
-  under it holds; #3598 stays open as that tracker, its bar on the retired today-mode nightly
-  retired with the lane.
+  consistency-drift-outlier's. No CI lane grades its route check: every lane runs through the
+  inject door, which sets a `worker_commands` check aside, so the route is graded only on a
+  developer's run over the agent API, as #3975's measuring run was. Enters again only once a CI
+  lane grades that route check and the record under it holds; #3598 stays open as that tracker.
 
 **autoops-warning-event-triage** is no longer in the presubmit at all (tofu wall clock,
 [#1218](https://github.com/gke-labs/kube-agents/pull/1218)); it runs and accrues its
@@ -325,13 +321,9 @@ Admitted on the record since the split:
   the inject lane until #5236, so the merge-blocking presubmit and the main nightly graded neither, and the
   seat blocked there on the two report objectives alone. Since #5236 both grade on an inject record
   that carries the workers' entries, so the seat blocks on all four: on the 381 inject presubmit
-  repetitions of 2026-11-07 to 11-09 both passed on every record. The today lane ([below](#the-inject-lane))
-  runs the presubmit matrix over the api transport, where both are graded: this seat puts the
-  case on that matrix with the route objective live and its one api-transport record a collapse,
-  so a collapse there reds `ci-kube-agents-eval-today` (a periodic on `main`, not a merge
-  block) until the api transport's `worker_commands` read of a platform card is fixed or the
-  objective is reworded; the eval crew's approval of this line takes that exposure with the
-  seat. Rule (c): it declares no `fixtures:` role and names no seeded cluster, so the
+  repetitions of 2026-11-07 to 11-09 both passed on every record. No CI lane grades over the api
+  transport now, so its one api-transport collapse is a record, not an exposure the seat takes.
+  Rule (c): it declares no `fixtures:` role and names no seeded cluster, so the
   seeded-fleet scan has nothing of its own to watch; what it depends on instead is the pool
   project's `roles/monitoring.alertPolicyEditor` grant to both runners, which
   `scripts/verify_ci_pool_project.py` checks on every scan (#3632). A stack apply that fails
@@ -700,21 +692,16 @@ What the canary alone grades, the compliance stream and its planted binding, blo
 ## The whole-suite rate
 
 Beside the per-case rungs the verdict carries one number for the whole pull request: the pooled
-pass rate of every roster case's scored repetitions — on the presubmit, the roster less any
-case the inject lane excludes ([below](#the-inject-lane)), and on the today
-lane the whole roster, each case at three repetitions (`python3 scripts/eval_rosters.py --summary`
+pass rate of every roster case's scored repetitions — the roster less any
+case the inject lane excludes ([below](#the-inject-lane)), each case at three repetitions (`python3 scripts/eval_rosters.py --summary`
 has the roster's count), `infra` repetitions left out — against `main`'s rate over the same cases from the evidence store (the
 newest seven nightly lines per case). It is the rule that can see a pull request
 which made several cases a little worse without making any one of them fail three times. The
 version key carries the mode ([`bench/baselines/README.md`](../bench/baselines/README.md)), so the
-presubmit's `next` is compared only with lines a next-mode run on `main` recorded at its key, and
-the today lane's `today` only with today's; a case with no line at its key contributes nothing to
-`main`'s side, with one exception below. The main nightly (`ci-kube-agents-eval-nightly`, its
-`-main-b` to `-main-e` shards and its three writers thirds) is the next-mode run on `main` that records, on the presubmit's agent model. A case
-with no line at its next key (one the inject lane excludes, or whose window has not filled) falls
-back, for this number only, to its today-mode lines at the same key otherwise, which the store
-already holds (no job appends them now), and the verdict names those cases in a note; rung 6
-never falls back. The verdict prints it on every
+presubmit's `next` is compared only with lines a run on `main` recorded at its key, never with the
+legacy `today` lines; a case with no line at its key contributes nothing to
+`main`'s side. The main nightly (`ci-kube-agents-eval-nightly`, its
+`-main-b` to `-main-e` shards and its three writers thirds) is the run on `main` that records, on the presubmit's agent model. The verdict prints it on every
 run:
 
 ```
@@ -746,7 +733,7 @@ holds its own night, so its aggregate is a report, never a gate. Revisit the mar
 window rate passes 0.96 (at that point 0.10 starts redding five failed repetitions, which the
 sample contains); the eval dashboard's Trend page draws the `next` window from the same store, per
 case and per domain, which is the window the presubmit is compared with since the nightly grades
-`next`. Today's window stays selectable on the page until its lines age out: no job appends it now.
+`next`. The legacy `today` series stays selectable on the page until its lines age out: no job appends it now.
 
 **What an author sees when it fires.** No case is marked blocking; the failures are spread. The
 job's final log line is the ordinary `PR Smoke Test Evaluation Failed -- see .../eval-verdict.md`,
@@ -777,21 +764,12 @@ tightens this rule at the same time.
 
 ## The inject lane
 
-`pull-kube-agents-smoke-test` grades a `spec.mode: next` install, the mode a new install gets, so
-its matrix goes through the A2A gateway's inject door — the harness's `AGENT_TRANSPORT=inject`,
-which `hack/ci-eval-pr.sh` exports under `EVAL_MODE_NEXT=1`
+Every install runs the A2A stack, so every CI lane's matrix goes through the A2A gateway's inject
+door — the harness's `AGENT_TRANSPORT=inject`, which `hack/ci-eval-pr.sh` exports on every run
 ([`docs/designs/eval-next-transport.md`](designs/eval-next-transport.md), "The CI flag"). The
 roster above is still the roster there: nothing in the two roster files changes, and every case
 not named in the lane's exclusion list (below) runs and can red the job. Three things differ from
-the api transport, and they are kept apart on purpose.
-
-`today`, the mode a rollback lands on, is graded over the api transport by the today lane: the
-optional `pull-kube-agents-smoke-test-today` (on demand with `/test`, and on its own when a pull
-request touches `hack/rollback-roundtrip.sh` or the operator's A2A reconciliation). It runs with `EVAL_ROLLBACK_LANE=1`:
-the deploy brings the install up under `next`, `hack/rollback-roundtrip.sh` takes it to `today`,
-back to `next` and to `today` again before the matrix, and a rollback that fails reds the run.
-The matrix is the presubmit's, roster included, so a case graded only over the api transport is
-graded there, but the job does not block a merge.
+a run over the agent API (a developer's, outside CI), and they are kept apart on purpose.
 
 A check the transport blinds is the scorer's business. The harness reads no card ids, no worker's
 entries and no results off the door's trace. The delegation wait now reads the cards and the workers from the pod
@@ -824,16 +802,14 @@ user's answer and the card, and a block replay grades the reply to the wake, whi
 nowhere but the same front door writes. What stays listed is the
 fresh-session question case, whose answer turn carries today's Slack thread context, a turn
 next's door never sends.
-`hack/ci-eval-pr.sh` drops the listed cases from the matrix on that lane only, and says so in
-the log; on the api lane the file changes nothing. Each entry carries its reason as the comment
+`hack/ci-eval-pr.sh` drops the listed cases from the matrix and says so in
+the log. Each entry carries its reason as the comment
 block above it, naming the issue that decides when it goes, and `scripts/test_eval_rosters.py`
 holds every entry to that, the way the validator's `FIXTURE_NOT_READY` holds a case with no
 fixture to an issue. The case keeps its seat in `presubmit-cases.txt` or `nightly-cases.txt` and
-on the blocking roster, but it stops running wherever the inject lane runs, the nightlies
-included. No job on `main` runs the presubmit matrix over the api transport now: a listed
-presubmit case runs only when the today presubmit (`pull-kube-agents-smoke-test-today`) runs on a
-pull request, and a listed nightly case runs nowhere in CI.
-An entry also leaves what can red a pull request, because the merge-blocking presubmit is on the inject lane: `hack/ci-eval-pr.sh` drops it
+on the blocking roster, but it runs nowhere in CI until its entry goes: every lane grades through
+the door.
+An entry also leaves what can red a pull request: `hack/ci-eval-pr.sh` drops it
 from the matrix and from `BOOTSTRAP_ADMITTED` there. No roster case is listed, so the
 merge-blocking run grades delegation through the chat front door with `agent-kanban-smoke`.
 `scripts/test_eval_rosters.py` pins that set, so listing a roster case is a decision made in that
@@ -841,12 +817,12 @@ test and on this page, not a side effect of an exclusion entry.
 The file needs an `eval-crew` approval, as `presubmit-cases.txt` does: it changes what every
 pull request runs.
 
-Its mirror, `hack/eval/api-lane-exclusions.txt`, names the cases only the inject lane can carry:
-the stopped asks (a `stop` sent on the conversation during or after the opening turn,
-[`bench/kube_agents_bench/stop_hook.py`](../bench/kube_agents_bench/stop_hook.py)), and a case
-graded on the question a delegated card paused on, which only the inject lane's board read folds
-into the reply, and the reply-under-pushed-report replays (a report stored for the conversation
-after the opening turn, then the reply sent as a second message on it,
+The cases only the inject door can carry need no list of their own, since every lane goes
+through the door: the stopped asks (a `stop` sent on the conversation during or after the opening
+turn, [`bench/kube_agents_bench/stop_hook.py`](../bench/kube_agents_bench/stop_hook.py)), a case
+graded on the question a delegated card paused on, which the board read folds into the reply,
+and the reply-under-pushed-report replays (a report stored for the conversation after the
+opening turn, then the reply sent as a second message on it,
 [`bench/kube_agents_bench/pushed_report.py`](../bench/kube_agents_bench/pushed_report.py)).
 `hack/ci-eval-pr.sh` drops them on every other transport. None is on the roster, so the file
 needs only the normal approvers. On the inject lane a stopped ask runs in the second phase with
@@ -897,16 +873,14 @@ with one that writes by design and no window reaches back into the unit before.
 the set of requesting cases. It needs an `eval-crew` approval, as the exclusion list does:
 `hack/OWNERS` scopes it to that alias, and an entry in it is a rung 1 check on every pull request.
 
-Rung 6 compares an inject run only with next-mode history. The version key carries the mode
-([`bench/baselines/README.md`](../bench/baselines/README.md)), and `bench-gate` reads
-`AGENT_TRANSPORT=inject` as `next`, so an inject run's judged mean is set against the means a
-next-mode run on `main` recorded at the same key, never against today-mode history: that
-comparison measured the lane rather than the pull request, and redded four admitted cases at once
-on 2026-10-17 with nothing changed on their side. Where no next-mode line exists at the key, rung 6
-is quiet; a partial window is compared, as it is for `today`. The today lane reads today's history
-only, which no job appends to now, so rung 6 there is quiet once the key moves past the stored
-lines. The key includes the agent model, and the main nightly runs the presubmit's, so its
-next-mode lines are the presubmit's rung 6 history.
+Rung 6 compares a run only with history at its own key. The version key carries the mode
+([`bench/baselines/README.md`](../bench/baselines/README.md)), `next` on every key a run writes
+now, so a run's judged mean is set against the means a run on `main` recorded at the same key,
+never against the legacy today-mode lines: that comparison measured the stack rather than the
+pull request, and redded four admitted cases at once on 2026-10-17 with nothing changed on their
+side. Where no line exists at the key, rung 6 is quiet; a partial window is compared. The key
+includes the agent model, and the main nightly runs the presubmit's, so its lines are the
+presubmit's rung 6 history.
 
 One thing about the inject lane's install differs too. The fleet audits' automatic remediation
 sweep opens a pull request on its own wherever a pool repository declares a workload with a
@@ -954,7 +928,7 @@ roster seat since 2026-10-26, but has no GitLab record), so the ledger path is t
 lease-time probe in [`docs/ci-pool-projects.md`](ci-pool-projects.md) 5.6, which says the forge
 takes a ledger, not that the agent publishes one; that stays a case's job once one earns a line. The GitLab
 nightly (`ci-kube-agents-eval-nightly-gitlab-next`, #2832) runs the same list once a night on its own
-leased project, under `spec.mode: next` (`EVAL_MODE_NEXT=1`, through the inject door) as the
+leased project, through the inject door as the
 presubmit does, and never appends to the evidence store, since a case's record is per case, not per
 forge; nothing runs the cases this file leaves out against GitLab. Its nights are listed under the
 Brief's GitLab lane section, in no gate number or case record, and the GitLab lane never records.
@@ -1061,8 +1035,8 @@ grant fails the apply, which is INFRA per repetition; three in one run make the 
 EVALUATED, red until a `/retest`, blaming nobody, and the pool verifier reports the grant. A
 graded collapse is the agent no longer reading the policy: check that the broker still allows
 `gcloud monitoring policies list` and `describe` (`GCLOUD_READ_COMMANDS` in
-`agents/platform/scripts/command_policy.py`) before reading it as the case's flake. A red on
-the today lane alone, on the route objective `read-from-monitoring-not-the-audit-log` with
+`agents/platform/scripts/command_policy.py`) before reading it as the case's flake. A red over
+the agent API alone (no CI lane runs it now), on the route objective `read-from-monitoring-not-the-audit-log` with
 the two report objectives passing, is the api transport's `worker_commands` read of a platform
 card (a collapse that way on 2026-10-26), not the case and not the agent.
 

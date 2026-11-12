@@ -583,8 +583,8 @@ envelope's to make decision-grade.
 ## Chat messages (added 10/8)
 
 A task's answer is not always prose. A report has a headline and rows, a question has
-choices, and a running task has a plan. Under `today` the Slack presenter lays these out
-from the agent's text at post time. Under `next` the chat gateway posts what comes off the
+choices, and a running task has a plan. On the Hermes Slack platform the Slack presenter lays these out
+from the agent's text at post time. The A2A chat gateway posts what comes off the
 bus, and it holds no model and does not parse prose (#2149). So the executor states the
 structure, and every adapter renders it: Block Kit, a card, an embed, or plain text.
 
@@ -611,7 +611,7 @@ consumer that missed an event renders the next one correctly.
 A click on a choice arrives like any message in the conversation: a new turn once the task
 has ended, a steer while it runs, under the steering rules above (so on the fixed route,
 which refuses steers, a click on a mid-task `notice` gets the refusal). (The Hermes bridge emits
-no `input-required` today, so under `next` choices live on `result` and `notice` for now.)
+no `input-required` today, so choices live on `result` and `notice` for now.)
 
 ### The object
 
@@ -692,14 +692,14 @@ A choice may also carry `next: true`, which marks a finished answer's optional n
 Block order is fixed so every renderer agrees: headline and note, detail, rows, after, fold,
 then the buttons, choices before links. In `progress` the `plan` follows the headline and
 takes the place of the rows. The caps on headline, row text and row detail, button
-labels, the url rule and the plan are the `today` presenter's (`slack_presenter.py`,
+labels, the url rule and the plan are the Hermes Slack presenter's (`slack_presenter.py`,
 `slack_status.py`), and fold text is #2360's. The rest are chosen here and sit inside Slack's own
-limits. The `today` path clips where this spec refuses, so the emitter applies windows:
+limits. The presenter clips where this spec refuses, so the emitter applies windows:
 the presenter's newest 20 plan items (settled ones first to go) and last 6 steps of each,
 and the first 5 `after` lines, which the presenter leaves uncapped.
 
 **The emitter composes, the renderer lays out.** A plan item's `title` arrives finished
-(`today`'s `row_title`: "waiting on you", the result, or the note and "step N ▸"), and a
+(the presenter's `row_title`: "waiting on you", the result, or the note and "step N ▸"), and a
 choice's `reply` names whatever the answer needs to reach (a card, an option). The
 renderer adds only what is its backend's own: a "✓ name: choice" rewrite of an answered
 question (#2346), a "waiting on you" context line under an open one, which emoji a mark
@@ -795,7 +795,7 @@ through the delegation primitive and the profile dispatcher), at which point car
 ride the carriers above. The plan is on #2149
 ([the 10/8 comment](https://github.com/gke-labs/kube-agents/issues/2149#issuecomment-6065582878)).
 
-Under `next` on chat platforms (`slack` and `gchat`), the Planning Agent often answers "on it", hands the work to kanban cards, and
+On the chat platforms the gateway holds (`slack` and `gchat`), the Planning Agent often answers "on it", hands the work to kanban cards, and
 its task ends (whereas on console, MCP and A2A door origins only, `waitsForCardsInTurn`, the `api` executor holds the turn open while polling `kanban.db`, emits `subtask` steps as cards settle, and synthesizes multi-card results into the task's `result` artifact; see `a2a/docs/hermes-bridge.md`). Where the task ends at the acknowledgement, the cards keep going outside that A2A task, so none of the carriers above
 reach them. Their updates reach the conversation on the chat.notify route instead,
 addressed to the asking conversation and checked against the gateway's session record
@@ -835,13 +835,13 @@ then carry the plan (under one `update` key per plan), ⏸️ (`settle: blocked`
 and the folded answer, and the final settle. The task is not held open for its cards:
 that would turn every follow-up into a steer queued behind hours of idle.
 
-**The emitter.** Two halves, each a port of the `today` presenter run on the shared
+**The emitter.** Two halves, each a port of the Hermes Slack presenter run on the shared
 cases. The hermes-bridge emits what its own turn owns: the answer on the `result` (the
 first sentence as `headline`, cut at a clause when it runs past the headline's cap, the rest
 as `detail`, or under `fold` past `detail`'s cap; an answer that ends by asking which of two
 to five listed options to take carries them as `choices`, its opening paragraph, each
 option's label and first sentence (when every option has one) and the question as `detail`, and the rest under `fold`,
-by the rule `slack_moments.answer_choices` applies under `today`; an answer that instead
+by the rule `slack_moments.answer_choices` applies on the Hermes Slack platform; an answer that instead
 declares its one next step on a last line of its own, `[next: <label>]`, carries that
 step as its only choice, `next` and not `primary`, and leaves the line out of `headline`, `detail`
 and `fold`, by `slack_moments.next_step`'s rule; the line is plumbing, so the text fallback
@@ -946,8 +946,8 @@ and only when the operator renders `A2A_CARD_STOP=true` (spec-chatops-gateway, S
   a group or a channel. A markdown link renders only when its url passes the `links` rule,
   label check included. The fallback keeps the gateway's existing escaping.
 - **The gateway renders, it doesn't compose.** It neither invents fields nor reads the text
-  to fill one. Under `next` the Hermes bridge emits the chat message, as a port of the
-  `today` presenter's rules with the same fixtures (#2149).
+  to fill one. The Hermes bridge emits the chat message, as a port of the
+  Hermes Slack presenter's rules with the same fixtures (#2149).
 - **Size.** The part counts against the envelope's max message size like any other. A
   carrier too large with it is published without it: the text is the deliverable.
 - **A backend that can't hold it.** The caps fit Slack. A valid chat message may still be
@@ -968,7 +968,7 @@ and only when the operator renders `A2A_CARD_STOP=true` (spec-chatops-gateway, S
 the wording one, which `Lint` checks, the
 fallback each carrier pairs with a chat message, and the DataPart encoding. The command
 matchers and the label check it shares with the gateway are in `a2a/lib/chattext`. The shared
-cases in `tests/conformance/chat/` pair inputs from the `today` presenters' tests with the chat
+cases in `tests/conformance/chat/` pair inputs from the Hermes Slack presenters' tests with the chat
 messages the emitter owes for them; `chatmsg` validates and lints every one, and
 `agents/platform/scripts/chat_cases.py` reads them for the Python presenters.
 `tests/conformance/chat-ux/lint.json` holds the lint's own cases, which both lints read.

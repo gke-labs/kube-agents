@@ -166,7 +166,7 @@ Each operation runs against the factors that load it, not against every factor. 
 ## Open questions
 
 1. **Fleet size has more than one dimension.** Memory depends on total watched objects (clusters × objects per cluster), but single-factor experiments vary each factor alone. Plot memory against total watched objects so the two experiments fall on one axis, and confirm with one combined point (for example 8 clusters × 4,000 objects). Phase 2 measured that point: for memory the single-factor lines add up within about 15%, the agent's peak the furthest above the sum at 1.15 times; the shell's CPU was 2.1 times the sum (Phase 2 and Phase 3 results).
-2. **Which mode.** `spec.mode: today` and `spec.mode: next` load the harness differently (session pods, the A2A bus, kanban dispatch). The results hold only for the mode measured; each record carries it.
+2. **Which stack.** Each record carries a `mode` key, `next` on every record taken since the A2A stack became the only one; a record keyed `today`, from when `spec.mode: today` loaded the harness without session pods, the bus or kanban dispatch, holds only for that stack.
 
 # Phases
 

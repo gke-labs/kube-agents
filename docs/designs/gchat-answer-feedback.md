@@ -1,15 +1,15 @@
 # Google Chat: rate the final answer, as on Slack
 
 Design for [#2732](https://github.com/gke-labs/kube-agents/issues/2732), the next step of the
-Google Chat next-mode parity work after the keyed home threads of #4390 and the DM thread per ask
+Google Chat gateway parity work after the keyed home threads of #4390 and the DM thread per ask
 of #4687 ([`gchat-dm-thread-per-ask.md`](gchat-dm-thread-per-ask.md)). It changes the A2A
-gateway under `spec.mode: next`: the Google Chat adapter draws the answer-feedback mark that the
+gateway: the Google Chat adapter draws the answer-feedback mark that the
 gateway already sets, takes the tap, and asks for the note a 👎 may carry, and the `PlatformAgent`
 gains the switch that turns it off on a Google Chat install.
 
 ## Intent
 
-Under `next` on Slack, the final answer of every ask ends with 👍 and 👎
+On Slack through the A2A gateway, the final answer of every ask ends with 👍 and 👎
 ([`spec-chatops-gateway.md`](spec-chatops-gateway.md), "Answer feedback"). A tap is counted,
 keeps the question and the answer in the `feedback` bucket for thirty days so an operator can
 turn the exchange into an eval case, and a 👎 opens a box for a one-line note. On Google Chat
@@ -52,8 +52,8 @@ false`, with the same effect as the Slack field. The chart carries the value.
   them. Unchanged.
 - The Slack follow-ups #3374 (file a 👎 as an issue), #3447 and #3481. They stay Slack issues and
   would reach Google Chat through the shared recorder when they land.
-- Running Slack and Google Chat in one gateway (#3094). The gateway holds one chat backend under
-  `next`, so the off switch stays one global flag with two names.
+- Running Slack and Google Chat in one gateway (#3094). The gateway holds one chat backend, so the off
+  switch stays one global flag with two names.
 - Ratings on home-channel posts (alerts, scheduled reports). The notifier marks only the card
   report that answers an ask in its conversation; home posts are not marked on Slack either.
 
@@ -180,7 +180,7 @@ button").
 
 **Call 6: the switch.** `spec.integration.googleChat.answerFeedback *bool`, default `true`, the
 Slack field's twin. The operator renders `A2A_GOOGLE_CHAT_ANSWER_FEEDBACK=false` on the gateway
-only when Google Chat is the gateway's backend under `next` and the field is `false`, as it
+only when Google Chat is the gateway's backend and the field is `false`, as it
 renders the Slack variable only when Slack is armed. The gateway sets `AnswerFeedbackOff` when
 either variable is `false`; the desk then never starts, no backend draws, and a tap on an older
 message is logged and dropped. Chart: `platformAgent.integration.googleChat.answerFeedback`,
@@ -195,7 +195,7 @@ only. The CRD field pages and the upgrade page's row for the next release name t
 
 ## Acceptance, as a live run on gkedemos
 
-gkedemos runs `next` with Google Chat on the gateway and a `feedback` bucket with a TTL. With the
+gkedemos runs with Google Chat on the gateway and a `feedback` bucket with a TTL. With the
 branch's gateway image swapped in (the operator's `A2A_GATEWAY_IMAGE` override):
 
 1. Ask a question in the app's DM. The answer, in its thread, ends with 👍 and 👎 after any

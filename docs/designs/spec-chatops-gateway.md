@@ -3,6 +3,7 @@
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
 - **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters, the console adapter, and the A2A door with its eval and Google sign-in identity classes); the operator renders the gateway Deployment, its env, the `A2A_SPAWN_SESSIONS` arming and the console door (`A2A_CONSOLE_DOOR=true`, so a gateway with no chat backend starts on the console alone) under `mode: next` (`platformagent_a2a_manifests.go`), with the metrics listener (`A2A_METRICS_PORT`, container port `a2a-metrics`) and the gateway's own metrics-only NetworkPolicy (the collector and the operator, on 9096) on every next gateway (see "Metrics"), plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, and under its own flag the A2A door and the same four objects (but not yet the door's Google sign-in env); and, when `spec.integration.googleChat` is enabled under `next`, the Google Chat adapter's env (the home channel the chat.notify route posts to included), its projected relay token, and the broker's side of it (the A2A relay instance on the install's one subscription, `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod); the legacy Hermes consumer is not rendered under `next`, so the composition's one Chat subscription is the whole of the Pub/Sub the install needs; and, when `spec.integration.slack` is enabled under `next` and Chat is not, the Slack adapter's env (`SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` through the CR's `botTokenSecretRef` and `appTokenSecretRef`, and the CR's `allowedUsers` as `A2A_SLACK_ALLOWED_USERS` and `A2A_SLACK_ALLOW_ALL_USERS`, and the home channel the chat.notify route posts to as `A2A_SLACK_HOME_CHANNEL`), with the legacy consumer - the broker's Socket Mode relay and the Hermes slack platform - not rendered, so one Slack app has one Socket Mode connection; and the `a2a-slack-principal-map` mount either; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); the session pod's temporary read-only cluster view (a third broker caller under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, off by default) is built, and now that gateway-side `AllowedUsers` enforcement has shipped it retires on the default flip (#2371), not at that enforcement's landing; the gateway-minted child task is built (a session asks with the `delegate` artifact; the gateway checks the platform agent's allowlist - the turn's requester, every steer author, and every author the conversation's current incarnation has seen - mints with the turn's authority and `via`, and wakes the session on the child's terminal; one child at a time, `A2A_DELEGATION_DEPTH_MAX` 3); the session pod's persona and the cluster agent's read-only GKE diagnosis skills ship in the worker image (`a2a/cmd/session-persona`); not yet the `chat` profile's own skills (discovery and standing state, below) or the default flip
+- **Status (2026-11-12):** `spec.mode: today` is retired and every install runs the A2A stack, so the gateway holds Google Chat on every install that enables it, and Slack whenever Google Chat is not enabled beside it; `spec.mode` is a deprecated, ignored field ([spec-mode-switch.md](spec-mode-switch.md), its status note). The "by mode" and version-skew passages below describe the switch as it was and stay as history; the one pairing that survives is Slack on the Hermes platform behind the broker's relay while Chat holds the gateway (`legacySlackConsumer`). The user-facing account is [the ChatOps page](../site/src/content/docs/concepts/chatops.md).
 
 ## Purpose
 
@@ -1543,12 +1544,12 @@ backends' ingress semantics closely enough: the Discord websocket redelivers not
 and Slack's Socket Mode, which does redeliver unacked envelopes, carries its own
 in-adapter dedupe ring for exactly that (the Slack section below).
 
-**Coexistence is by mode.** A topic fans out to every subscription and two consumers on one
-subscription split its deliveries, so exactly one brain consumes an install's Chat, and
-`spec.mode` chooses it: under `today` the Hermes `google_chat` platform pulls the
-subscription through the broker's legacy relay instance; under `next` the operator arms the
-A2A relay instance on the same subscription, gives the gateway the adapter's env and token,
-and renders neither the Hermes platform nor its relay env. One subscription rather than a
+**One consumer.** A topic fans out to every subscription and two consumers on one
+subscription split its deliveries, so exactly one brain consumes an install's Chat: the operator
+arms the A2A relay instance on the subscription, gives the gateway the adapter's env and token,
+and renders neither the Hermes platform nor its relay env (until 2026-11-12 `spec.mode` chose
+between that and the Hermes `google_chat` platform pulling the subscription through the broker's
+legacy relay instance, which is what the flips below refer to). One subscription rather than a
 second one for the A2A path, because the unacked backlog then follows the live consumer
 across a flip in either direction, where a second subscription would hold up to seven days
 of stale asks for the legacy consumer to drain on a rollback. The per-install choice of a
@@ -2006,31 +2007,31 @@ for the Web API, app token for the socket), and under `next` they arm the gatewa
 backend, the way `spec.integration.googleChat` arms its Chat one (`a2aSlackArmed`). The same
 refs feed the credential broker's own Socket Mode connection on the legacy path
 (`credential_proxy.py`, `SlackRelay`), and Slack spreads an app's events across every
-connection it has open, so two consumers would split one workspace's messages. The mode
-chooses, as it does for Chat: under `next` the broker is not handed the pair and the Hermes
-slack platform and its relay env are off (`legacySlackConsumer`); under `today`, or under
-`next` while Chat holds the gateway, the legacy path keeps Slack. `allowedUsers` carries
+connection it has open, so two consumers would split one workspace's messages. Whether Chat
+holds the gateway chooses: with Slack the only platform the broker is not handed the pair and
+the Hermes slack platform and its relay env are off (`legacySlackConsumer`); while Chat holds
+the gateway, the legacy path keeps Slack. `allowedUsers` carries
 over the way Chat's does (2026-10-06): the operator renders it as `A2A_SLACK_ALLOWED_USERS`,
 normalized the way the gateway reads it, with `A2A_SLACK_ALLOW_ALL_USERS` from the legacy
 consumer's rule on the raw list (absent, or a single empty string, is everyone), so one CR
-means one thing in both modes. The gateway then admits a Slack sender only if they belong
+means one thing on both paths. The gateway then admits a Slack sender only if they belong
 to the bot's own workspace, or the list names them by workspace as `T…:U…` (a Slack Connect
 guest from another organisation is otherwise not a turn; see the mapping-table paragraph
 below), and the list admits them (exact match, no case fold: the `user_id` for our own
 member, the `T…:U…` entry for a guest). The principal map below is an optional override for attribution, not a second
-gate. One thing does not carry over on the flip:
+gate. One thing does not carry over:
 the broker reads `SLACK_BOT_TOKEN` as a comma-separated list, one token per workspace,
-where the gateway's adapter takes one token, so a multi-workspace install stays on
-`today`. `homeChannel` does carry over, as the home channel the gateway's chat.notify route
+where the gateway's adapter takes one token, so a multi-workspace install keeps Slack on the
+legacy path only with Chat enabled beside it. `homeChannel` does carry over, as the home channel the gateway's chat.notify route
 posts proactive alerts into (below); `/sethome` no longer reaches it.
 
 The operator does not enforce the multi-workspace rule. The arm reads the CR alone and never opens the
-token Secret, so an install already on `next` whose bot-token Secret holds a list is flipped
+token Secret, so an install whose bot-token Secret holds a list is flipped
 by the operator upgrade that brings the arm: the broker is no longer handed the pair, the
 gateway takes the whole list as one token, and Slack refuses it at `auth.test`. The pod does
 not exit: the console is the mux's essential backend, so the Slack backend is contained and
 retried on a backoff, the pod stays Running and Ready, and Slack has no consumer until the
-Secret holds one workspace's token or the install goes back to `today`. Nothing in the CR's
+Secret holds one workspace's token or Chat is enabled beside Slack. Nothing in the CR's
 `.status` says why, since no `A2AGateway` condition is written for a gateway the arm called
 configured; the gateway pod's log carries the cause, and its events do for a missing Secret
 or key. Reading the Secret in the arm would catch it, at the cost of a
@@ -2043,7 +2044,7 @@ also refuse the token when they recover it from the Secret
 reach the state above unchecked: `upgrade.sh`'s operator and harness arms, which re-tag the
 release; an operator upgrade made any other way; and a CR edited by hand.
 
-Version skew double-consumes Slack, and this is where Slack differs from Chat. The arm uses
+_Retired 2026-11-12 with `spec.mode`: the enum leaves no unrecognised value, so no skew path remains._ Version skew double-consumes Slack, and this is where Slack differs from Chat. The arm uses
 Chat's rule, so an unrecognised `spec.mode` reads as `today` and the legacy consumer renders
 again: the broker's Socket Mode relay and the Hermes slack platform. The reconciler freezes
 the A2A objects on skew rather than touching them, and a Slack gateway holds the token pair
@@ -2996,7 +2997,7 @@ namespace, the rule the broker's and the Hermes gateway's policies carry for the
 which reads the gateway's inbound-message counter. Each armed door renders a copy under its own
 name, and the doors' ports admit no pod. The gateway's fence used to render only with a door, which
 left the metrics port, bound on every interface, reachable from the whole pod network on an install
-with neither door armed; it renders on every `next` install now so that it is not (decided
+with neither door armed; it renders on every install now so that it is not (decided
 10/6 on #2473). It is Ingress-only, so the gateway's own dials to the bus are untouched.
 
 `/readyz` is the kubelet's: the operator's readinessProbe reads it every 5 seconds. It answers 200

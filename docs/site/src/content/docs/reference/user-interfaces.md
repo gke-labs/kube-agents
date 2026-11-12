@@ -11,7 +11,7 @@ Chat is the primary way to talk to kube-agents ([ChatOps](/kube-agents/concepts/
 
 | Surface                               | Where it runs                                                        | Port   | Default                                                        | How you reach it                                                                                              |
 | ------------------------------------- | -------------------------------------------------------------------- | ------ | -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| [A2A console](#a2a-console)           | The `<name>-a2a-console` pod, part of the `spec.mode: next` stack    | `8080` | On, on every `next` install; absent under `today`              | `kubectl -n kubeagents-system port-forward svc/<name>-a2a-console 8080:8080`, then `http://localhost:8080`    |
+| [A2A console](#a2a-console)           | The `<name>-a2a-console` pod, part of the A2A stack                  | `8080` | On, on every install                                           | `kubectl -n kubeagents-system port-forward svc/<name>-a2a-console 8080:8080`, then `http://localhost:8080`    |
 | [Web console](#web-console)           | The chart's `<release>-web-console` pod                              | `8080` | Off; `install.sh --enable-web-console` or `webConsole.enabled` | `kubectl -n kubeagents-system port-forward svc/<release>-web-console 8080:8080`, then `http://localhost:8080` |
 | [Hermes dashboard](#hermes-dashboard) | The `platform-agent-dashboard` container of the `<name>-gateway` pod | `9119` | Off in `install.sh`; `--enable-hermes-dashboard` turns it on   | `./scripts/hermes-dashboard-tunnel.py`, then `http://127.0.0.1:9119`                                          |
 | [Admin console](#admin-console)       | Your workstation, from a repository checkout                         | `8501` | Not deployed; started by hand                                  | `./scripts/admin_portal.sh`, then `http://127.0.0.1:8501`                                                     |
@@ -20,9 +20,9 @@ Chat is the primary way to talk to kube-agents ([ChatOps](/kube-agents/concepts/
 
 ## A2A console
 
-The A2A console is a status page over the install's message bus with a chat pane under it. It is served by the `<name>-a2a-console` pod, which the operator renders on every `spec.mode: next` install beside the bus, the auth callout, the verifier and the A2A gateway ([Architecture](/kube-agents/overview/architecture/#deployment-topology)). Under `today` there is no bus, so there is no console.
+The A2A console is a status page over the install's message bus with a chat pane under it. It is served by the `<name>-a2a-console` pod, which the operator renders on every install beside the bus, the auth callout, the verifier and the A2A gateway ([Architecture](/kube-agents/overview/architecture/#deployment-topology)).
 
-The page shows what the bus knows: sessions and their liveness, recent tasks and why they failed, conversations by chat backend, the standing topics, stream capacity and protocol anomalies. The chat pane talks to the A2A gateway through its console door, the same way a Google Chat or Slack message does, `/session` and `/feedback` included ([Conversations under `spec.mode: next`](/kube-agents/concepts/chatops/#conversations-under-specmode-next)). A message typed there reaches the Planning Agent, which answers or files kanban cards as it does for any chat message.
+The page shows what the bus knows: sessions and their liveness, recent tasks and why they failed, conversations by chat backend, the standing topics, stream capacity and protocol anomalies. The chat pane talks to the A2A gateway through its console door, the same way a Google Chat or Slack message does, `/session` and `/feedback` included ([Conversations through the A2A gateway](/kube-agents/concepts/chatops/#conversations-through-the-a2a-gateway)). A message typed there reaches the Planning Agent, which answers or files kanban cards as it does for any chat message.
 
 Forward the Service and open the page:
 
@@ -37,7 +37,7 @@ The Service is `ClusterIP` and the pod's NetworkPolicy denies all ingress, so th
 
 ## Web console
 
-The web console is a browser chat page for installs with no chat platform: an evaluation cluster, a workshop seat or a demo. It shows event triage and scheduled checks as channels you can reply in, holds your own chat threads, and shows the model and LiteLLM usage. The chart renders it when `webConsole.enabled` is true, which `install.sh --enable-web-console` sets; it is off by default. It works in either mode, since it talks to the agent's own API rather than the bus. [Web console](/kube-agents/deploy/web-console/) is canonical: the port-forward, the layout, the threads, and what the page holds and does not.
+The web console is a browser chat page for installs with no chat platform: an evaluation cluster, a workshop seat or a demo. It shows event triage and scheduled checks as channels you can reply in, holds your own chat threads, and shows the model and LiteLLM usage. The chart renders it when `webConsole.enabled` is true, which `install.sh --enable-web-console` sets; it is off by default. It talks to the agent's own API rather than the bus. [Web console](/kube-agents/deploy/web-console/) is canonical: the port-forward, the layout, the threads, and what the page holds and does not.
 
 ## Hermes dashboard
 
@@ -51,4 +51,4 @@ The admin console is a Streamlit prototype for one operator's machine. `./script
 
 ## Other ways in
 
-Two doors are not browser pages. The Hermes CLI runs inside the gateway pod over `kubectl exec` ([When no chat platform is enabled](/kube-agents/concepts/chatops/#when-no-chat-platform-is-enabled)). The opt-in [MCP server](/kube-agents/reference/a2a-mcp/) lets an external coding agent or IDE talk to a `next` install over the same bus the A2A console uses.
+Two doors are not browser pages. The Hermes CLI runs inside the gateway pod over `kubectl exec` ([When no chat platform is enabled](/kube-agents/concepts/chatops/#when-no-chat-platform-is-enabled)). The opt-in [MCP server](/kube-agents/reference/a2a-mcp/) lets an external coding agent or IDE talk to the install over the same bus the A2A console uses.

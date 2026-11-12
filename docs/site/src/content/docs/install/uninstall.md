@@ -107,9 +107,9 @@ ENV_FILE="$HOME/kube-agents/install.env"
 
 The subshell keeps the file's variables out of your shell. The `gitlab-forge-token` fallback applies only to a GitLab install whose `install.env` records no Secret name; `install.sh` records the name for every GitLab and Bitbucket install, so a Bitbucket install deletes its own Secret (default `bitbucket-forge-token`). After the teardown, revoke the token in GitLab or Bitbucket, and the read-only token too, if you made one.
 
-### What `spec.mode: next` leaves behind
+### What the A2A stack leaves behind
 
-The objects the operator creates for `spec.mode: next` go with the `PlatformAgent`. Its finalizer deletes the JetStream volumes, one per bus server (`data-platform-agent-a2a-nats-0` through `-2` on a three-server bus). The rest, the bus credentials Secret `platform-agent-a2a-nats-creds` among them, are owned by the resource and garbage-collected. Flipping an install back to `today` without removing it keeps those volumes and that Secret, so a later flip to `next` finds the bus where it left it. The `a2a-slack-principal-map` Secret, if you created it, is yours and stays either way. To drop them on an install that stays on `today`:
+The objects the operator creates for the A2A stack go with the `PlatformAgent`. Its finalizer deletes the JetStream volumes, one per bus server (`data-platform-agent-a2a-nats-0` through `-2` on a three-server bus). The rest, the bus credentials Secret `platform-agent-a2a-nats-creds` among them, are owned by the resource and garbage-collected. A rollback to a release that ran without the stack, and a switch to `spec.mode: today` there, keeps those volumes and that Secret, so a later upgrade finds the bus where it left it. The `a2a-slack-principal-map` Secret, if you created it, is yours and stays either way. To drop them on an install that stays without the stack:
 
 ```bash
 kubectl delete pvc data-platform-agent-a2a-nats-0 data-platform-agent-a2a-nats-1 data-platform-agent-a2a-nats-2 -n kubeagents-system --ignore-not-found=true
@@ -125,7 +125,7 @@ kubectl patch platformagent platform-agent -n kubeagents-system \
   --type=merge -p '{"metadata":{"finalizers":null}}'
 ```
 
-The finalizer is what deletes the agent's cluster-scoped RBAC and, under `spec.mode: next`, the JetStream volume, so a cleared finalizer leaves them behind. A teardown that has to clear it deletes them itself: the `kubeagents:minimal:…` and `kubeagents:tokenreview:…` ClusterRoles and bindings, the callout's binding, and the JetStream volume. The loop below is for a finalizer you cleared by hand. Every ClusterRole and ClusterRoleBinding the operator made for the agent ends in the resource's namespace and name: `kubeagents:minimal:kubeagents-system:platform-agent` and `kubeagents:tokenreview:kubeagents-system:platform-agent`, and under `next` the callout's binding `kubeagents:a2a-callout-tokenreview:kubeagents-system:platform-agent`. This removes them all:
+The finalizer is what deletes the agent's cluster-scoped RBAC and the JetStream volumes, so a cleared finalizer leaves them behind. A teardown that has to clear it deletes them itself: the `kubeagents:minimal:…` and `kubeagents:tokenreview:…` ClusterRoles and bindings, the callout's binding, and the JetStream volume. The loop below is for a finalizer you cleared by hand. Every ClusterRole and ClusterRoleBinding the operator made for the agent ends in the resource's namespace and name: `kubeagents:minimal:kubeagents-system:platform-agent` and `kubeagents:tokenreview:kubeagents-system:platform-agent`, and the callout's binding `kubeagents:a2a-callout-tokenreview:kubeagents-system:platform-agent`. This removes them all:
 
 ```bash
 for o in $(kubectl get clusterrole,clusterrolebinding -o name | grep ':kubeagents-system:platform-agent$'); do

@@ -1,13 +1,13 @@
 ---
 title: AgentProfile CRD
-description: Custom resource describing one kind of A2A agent pod, and what the operator renders from it under mode next.
+description: Custom resource describing one kind of A2A agent pod, and what the operator renders from it.
 sidebar:
   order: 3
 ---
 
-The `AgentProfile` custom resource describes one kind of agent pod on the A2A bus: its persona, worker and tools images, its topic grants, the ServiceAccount it runs as, and how long one task may run. It is part of the `spec.mode: next` stack. On a PlatformAgent running `today` an `AgentProfile` renders nothing.
+The `AgentProfile` custom resource describes one kind of agent pod on the A2A bus: its persona, worker and tools images, its topic grants, the ServiceAccount it runs as, and how long one task may run. It is part of the A2A stack.
 
-An `AgentProfile` is not a Hermes profile on its own: the platform and cluster templates the gateway scaffolds under `$HERMES_HOME/profiles` are unaffected by ordinary profiles. The one exception is a built-in optional specialist template shipped in the `platform-agent` image (`tse`, under `/opt/tse-template`): when a bound `AgentProfile` of that name resolves under `mode: next`, the operator also passes its name in `KUBE_AGENTS_ENABLED_PROFILES` on the gateway Deployment so the entrypoint scaffolds and syncs `$HERMES_HOME/profiles/tse` on startup (and archives it to `$HERMES_HOME/profiles/.deleted/tse` when the `AgentProfile` is removed).
+An `AgentProfile` is not a Hermes profile on its own: the platform and cluster templates the gateway scaffolds under `$HERMES_HOME/profiles` are unaffected by ordinary profiles. The one exception is a built-in optional specialist template shipped in the `platform-agent` image (`tse`, under `/opt/tse-template`): when a bound `AgentProfile` of that name resolves, the operator also passes its name in `KUBE_AGENTS_ENABLED_PROFILES` on the gateway Deployment so the entrypoint scaffolds and syncs `$HERMES_HOME/profiles/tse` on startup (and archives it to `$HERMES_HOME/profiles/.deleted/tse` when the `AgentProfile` is removed).
 
 - **API group / version**: `kubeagents.x-k8s.io/v1alpha1`
 - **Kind**: `AgentProfile`
@@ -65,15 +65,15 @@ Topic grants are written without the `a2a.topics.` prefix, as `shared.{topic}` o
 
 ## What the operator renders
 
-A profile binds to the PlatformAgent in its own namespace. With that agent on `mode: next`, the operator renders three things per profile:
+A profile binds to the PlatformAgent in its own namespace. The operator renders three things per profile:
 
 - A ServiceAccount per allowed tier, `agentprofile-<name>-<tier>`, in the profile namespace (see below). Each has token automount off and no RoleBinding, and carries the profile's name and UID, since an owner reference can't cross namespaces. If `spec.identity.serviceAccountName` names an existing ServiceAccount in the profile namespace, that one is used and none is created. A named ServiceAccount can serve only one tier, so the CRD refuses it alongside more than one entry in `allowedTiers`. Naming a ServiceAccount does hand the profile's pods whatever RBAC it holds.
 - A bus identity per tier in the auth callout's identity map, user `profile-<name>-<tier>`. Its pods may publish task events and read task input for this profile's tasks, take work the dispatcher sends to that pod on `a2a.dispatch.<name>.<tier>.<pod>`, accept it and renew its lease there, and use the topics the profile names. Nothing else. The task-subject scope is the profile, not one task: two pods of the same profile can reach each other's task subjects.
-- An agent card on `a2a.agents.<name>`, rendered from `spec.description`, `allowedTiers`, `clusterRef`, `parameters` and `yieldToPinned`. Deleting the profile on a `mode: next` install publishes a tombstone in its place before the profile is removed. A profile deleted while its PlatformAgent is on `today`, while its namespace holds no PlatformAgent or more than one, or while the operator has no bus identity, is removed without one.
+- An agent card on `a2a.agents.<name>`, rendered from `spec.description`, `allowedTiers`, `clusterRef`, `parameters` and `yieldToPinned`. Deleting the profile publishes a tombstone in its place before the profile is removed. A profile deleted while its namespace holds no PlatformAgent or more than one, or while the operator has no bus identity, is removed without one.
 
 When a bound `AgentProfile`'s name matches a built-in optional specialist template baked into the `platform-agent` image (`tse`), the operator also sets `KUBE_AGENTS_ENABLED_PROFILES` on the gateway Deployment (which triggers a gateway pod rollout when `tse` is added or removed so the entrypoint scaffolds or archives `$HERMES_HOME/profiles/tse`). Ordinary `AgentProfile` resources (such as `chat` or `auditor`) do not touch `KUBE_AGENTS_ENABLED_PROFILES` and do not roll the gateway pod.
 
-Deletion waits on the `kubeagents.x-k8s.io/agentprofile-finalizer` finalizer, which every profile reconciled on a `mode: next` install carries and which only the operator removes. Before rolling the operator back to a release without AgentProfiles, or uninstalling it, delete the profiles while the operator is still running. Otherwise `kubectl delete agentprofile` hangs, and so does deleting the CRD behind it. To clear one by hand (it publishes no tombstone, so the card stays on the directory), and then delete its ServiceAccounts in the profile namespace, which carry no owner reference and so outlive it. Left there, they'd make a profile re-created under the same name find them foreign and be refused:
+Deletion waits on the `kubeagents.x-k8s.io/agentprofile-finalizer` finalizer, which every reconciled profile carries and which only the operator removes. Before rolling the operator back to a release without AgentProfiles, or uninstalling it, delete the profiles while the operator is still running. Otherwise `kubectl delete agentprofile` hangs, and so does deleting the CRD behind it. To clear one by hand (it publishes no tombstone, so the card stays on the directory), and then delete its ServiceAccounts in the profile namespace, which carry no owner reference and so outlive it. Left there, they'd make a profile re-created under the same name find them foreign and be refused:
 
 ```bash
 kubectl patch agentprofile <name> -n <namespace> --type=merge -p '{"metadata":{"finalizers":null}}'
@@ -96,7 +96,7 @@ Before `yieldToPinned`, every profile that takes a target handed off to a pinned
 
 `parameters` lists the task parameters the profile's persona declares, at most 16, each a lower-case identifier the worker exports as `PROFILE_TASK_<NAME>`. The gateway and the dispatcher read it here because neither can read the persona image: the gateway sends cluster work to a profile that declares `project`, `location` and `cluster`, and the dispatcher refuses a submission missing a `required` one. The list must match the persona's, and a worker refuses to run a task when they differ.
 
-Profile workers run in their own namespace, `<agent-namespace>-profiles`, which the chart creates on a `mode: next` install. The operator never creates it, and treats a namespace of that name as the profile namespace only when it carries the chart's `app.kubernetes.io/component: profiles` label and its `meta.helm.sh/release-namespace` annotation naming the agent's namespace. Into it the operator renders a pod quota and a NetworkPolicy. That policy lets its pods reach DNS, the bus, LiteLLM and the credential broker's port, and nothing else.
+Profile workers run in their own namespace, `<agent-namespace>-profiles`, which the chart creates. The operator never creates it, and treats a namespace of that name as the profile namespace only when it carries the chart's `app.kubernetes.io/component: profiles` label and its `meta.helm.sh/release-namespace` annotation naming the agent's namespace. Into it the operator renders a pod quota and a NetworkPolicy. That policy lets its pods reach DNS, the bus, LiteLLM and the credential broker's port, and nothing else.
 
 Deleting the PlatformAgent removes its quota from that namespace. If the delete is refused, the operator retries for two minutes and then lets the PlatformAgent go, leaving the quota and a `ProfileQuotaLeft` Warning event that names it. A later PlatformAgent in the same namespace removes the leftover quota when it renders its own (a `ProfileQuotaAdopted` event); one of the same name takes it over as its own. The NetworkPolicy stays until the chart's uninstall deletes the namespace, since removing it first would leave the namespace admitted to the bus without its own policy.
 
@@ -104,7 +104,7 @@ Only once that policy is in place does the operator admit the namespace on the b
 
 The profile's ServiceAccounts live there too. While the namespace is missing, or doesn't carry the chart's markers, a profile renders no identity and withdraws its card, and `IdentityReady` says `ProfileNamespaceAbsent`.
 
-The dispatcher, `<agent>-a2a-dispatcher`, reads the profiles' submissions and hands each to a ready worker. It is the only component that publishes directly to a profile task's supervisor subject, because the bus's config denies the A2A gateway each profile's by name. It's off by default until profiles dispatch end to end: a `mode: next` install runs it only when the operator's `A2A_DISPATCHER_IMAGE` names its image.
+The dispatcher, `<agent>-a2a-dispatcher`, reads the profiles' submissions and hands each to a ready worker. It is the only component that publishes directly to a profile task's supervisor subject, because the bus's config denies the A2A gateway each profile's by name. It's off by default until profiles dispatch end to end: an install runs it only when the operator's `A2A_DISPATCHER_IMAGE` names its image.
 
 Binding or removing a profile, or one finishing its drain, changes the bus's config, whether or not the dispatcher runs. The bus reloads it in place, without a restart, usually within a minute. Session pods' bus connections drop and reconnect at the reload, within a second, and their tasks carry on. If the reload can't be confirmed within three minutes, the operator restarts the bus pod instead and records a `BusConfigReloadFailed` Warning on the PlatformAgent. A session task running at that moment fails, as on any bus restart.
 
@@ -114,7 +114,7 @@ With the dispatcher on, each admitted profile also gets a warm pool for each of 
 
 [AgentProfile fields → Status](/kube-agents/operator/agentprofile-fields/#status) lists the status fields. The two conditions carry the detail:
 
-| Condition                 | Meaning                                                                                                                                                                                                                                        |
-| ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `IdentityReady` condition | The ServiceAccount and bus identity are rendered, or why not (`ModeNotNext`, `ModeNotRecognized`, `NoPlatformAgent`, `MultiplePlatformAgents`, `InvalidProfile`, `ServiceAccountRefused`, `ServiceAccountNotFound`, `ProfileNamespaceAbsent`). |
-| `CardPublished` condition | The agent card is on the directory, or why not (`BusUnavailable`, `OperatorBusIdentityUnconfigured`, `IdentityNotRendered`, or the same mode and binding reasons as `IdentityReady`).                                                          |
+| Condition                 | Meaning                                                                                                                                                                                                    |
+| ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `IdentityReady` condition | The ServiceAccount and bus identity are rendered, or why not (`NoPlatformAgent`, `MultiplePlatformAgents`, `InvalidProfile`, `ServiceAccountRefused`, `ServiceAccountNotFound`, `ProfileNamespaceAbsent`). |
+| `CardPublished` condition | The agent card is on the directory, or why not (`BusUnavailable`, `OperatorBusIdentityUnconfigured`, `IdentityNotRendered`, or the same binding reasons as `IdentityReady`).                               |

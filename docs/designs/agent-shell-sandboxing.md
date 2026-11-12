@@ -2675,8 +2675,8 @@ API server. Every path on the credentialed listener except `/healthz` requires i
 unidentified caller gets an undifferentiated `401` rather than a reason. `CREDENTIAL_PROXY_ALLOWED_CALLERS` names the
 TokenReview usernames the broker will serve — the sandbox's ServiceAccount, which is where
 every credentialed command originates, the gateway's, because the chat relays go through
-the same listener, when the next stack takes Google Chat, the A2A gateway's, under the
-operator's `A2A_SESSION_CLUSTER_VIEW` flag the session pods', and, under `mode: next` with
+the same listener, when Google Chat is enabled, the A2A gateway's, under the
+operator's `A2A_SESSION_CLUSTER_VIEW` flag the session pods', and, with
 an `AgentProfile` bound, each profile tier's ServiceAccount. The operator grants
 the broker exactly one verb, `create` on `tokenreviews`, to do it.
 
@@ -2715,8 +2715,8 @@ admits `proposal-view` only, checked on the normalised verb before the body is r
 verb's managed-repository check still applying. It is bound the same way:
 `CREDENTIAL_PROXY_MCP_CALLERS` names the MCP pod's own ServiceAccount, which may present only
 the mcp audience, and no other caller may present it; with the list empty, nobody holds the
-role. It names the account only while the operator controls it; an account somebody else holds under the name is never named. Under
-`mode: next` with an `AgentProfile` bound, a sixth, `profile`, is the profile workers':
+role. It names the account only while the operator controls it; an account somebody else holds under the name is never named. With
+an `AgentProfile` bound, a sixth, `profile`, is the profile workers':
 their token is minted for `kubeagents-credential-proxy-profile`, `/v1/exec` admits it, and
 `ROLE_EXECUTABLES` holds it to `kubectl` and `gcloud` with the session's `kubectl` flag
 allowlist. It is bound the same way: `CREDENTIAL_PROXY_PROFILE_IDENTITIES` maps each
@@ -2729,7 +2729,7 @@ credential's cluster and project. Profile calls together hold at most
 chosen, because it does nothing at all on a CNI that does not implement `NetworkPolicy` and
 `TokenReview` is answered by the API server on every cluster.
 
-The scope publisher Job under `mode: next` has a role of its own, `scope`:
+The scope publisher Job has a role of its own, `scope`:
 its token is minted for `kubeagents-credential-proxy-scope`, it is bound to its callers through
 `CREDENTIAL_PROXY_SCOPE_CALLERS` as the mcp role is, it reaches `/v1/exec` alone, and
 `ROLE_EXECUTABLES` holds it to `gcloud`. Within that, `scope_policy.py` admits five lookups token

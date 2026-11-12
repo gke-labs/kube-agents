@@ -120,8 +120,8 @@ each kind stays without `namespace=`.
 Objects. In the install namespace: the Role (`kubeagents-manager-role` under kustomize,
 `<release>-operator-namespaced-role` under Helm) and its RoleBinding, both existing. In the profile
 namespace: a second Role with the same rules and a RoleBinding, new. The chart renders the Role and
-its RoleBinding once per namespace from one `range` over the namespaces (the profile namespace only
-under `mode: next`, where `profiles-namespace.yaml` creates it), with the spliced rules block
+its RoleBinding once per namespace from one `range` over the namespaces (the profile namespace, which
+`profiles-namespace.yaml` creates), with the spliced rules block
 inline rather than in a named template: `hack/sync-chart-manifests.sh` keeps splicing one block
 between the `GENERATED NAMESPACED RULES` markers, and the conformance harness's text reader would
 drop an `include` line (§3 Guard). Kustomize's `config/default` rewrites every namespaced object to
@@ -135,7 +135,7 @@ namespace at all, so this is the first time that path carries one.
 
 Guard. `test_C5_the_operators_secret_grant_is_namespaced` becomes
 `test_C5_the_operators_write_verbs_are_namespaced`. Its sources are `role.yaml`
-(`operator_clusterrole`) and a rendered chart: `helm template` with `platformAgent.mode=next`,
+(`operator_clusterrole`) and a rendered chart: `helm template`,
 through a new harness helper. The existing `chart_operator_rbac` source goes through
 `helm_documents`, which reads the template as text and drops every template line, so a `range`
 collapses to one Role and a Role whose rules arrive through an `include` reads as a Role with no
@@ -213,7 +213,7 @@ one.
 
 The self-check. `requiredPermissions` marks every write tuple `Namespaced: true`; `probeRBAC`
 reviews them in the operator's namespace, in each agent namespace it observes, and, new, in the
-profile namespace of each `mode: next` agent whose profile namespace is ready
+profile namespace of each agent whose profile namespace is ready
 (`profileNamespaceReady`). A denial reads `create deployments.apps (in namespace
 kubeagents-system-profiles)` and the cause sentence names the object to add. The probe count grows
 from one namespace to two on a stock install; the reviews are concurrent and bounded by
@@ -252,7 +252,7 @@ during the apply can be refused once; the reconcile requeues and the next pass s
 operator pod of the old image, if it outlives the RBAC apply, keeps writing in the install namespace
 under the new Role and reports `RBACIncomplete` for the cluster-wide probes until its replacement
 starts. A kustomize `make deploy` behaves the same, and applies `config/profiles` after
-`config/default`. An install whose profile namespace was created by hand (kustomize, `mode: next`)
+`config/default`. An install whose profile namespace was created by hand (kustomize)
 needs the Role and RoleBinding added there, or under shape (b) the RoleBinding; the self-check names
 the namespace until then. Revert: revert the commits, `make manifests && make chart-sync`, upgrade
 again.

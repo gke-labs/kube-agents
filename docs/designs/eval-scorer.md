@@ -946,9 +946,9 @@ The judge model is its own component, pinned independently of the agent model, b
 tracks whatever the agent is running cannot be told apart from an agent that got better — and a
 drifting judge moves every baseline at once.
 
-A sixth component, `mode`, is the `spec.mode` the run graded (`today` or `next`), read off the
-transport (`AGENT_TRANSPORT=inject` is `next`). It is written only when it is not `today`, so the
-lines recorded before it existed match today's key unchanged. `bench/baselines/README.md` is
+A sixth component, `mode`, is the stack the run graded: `next` on every key a run writes, since
+every install runs the A2A stack; `today` is the legacy reading of a key with no `mode`, so the
+lines recorded before the component existed match their own key unchanged. `bench/baselines/README.md` is
 canonical for it.
 
 `fleet` and `verifiers` are hand-bumped integers rather than content hashes: a hash changes on a
@@ -997,10 +997,8 @@ is on `main` and carries no `PULL_NUMBER`, so both conditions above pass it thro
 is the third condition, enforced in the same two places, and it exists because `VersionKey` carries
 no field naming the build a sample came from: once written, a candidate's record and `main`'s are
 indistinguishable, and the candidate is then measured for non-inferiority against a window it just
-moved. The today lane (`EVAL_ROLLBACK_LANE=1`) is the fourth condition and the second member of the
-class, enforced in the same two places: its key reads `today`, but it grades an install rolled back
-from `next`, which is not what today's window measures. A next-mode run on `main` is not in the
-class: the key's `mode` files it under a window of its own. `bench/baselines/README.md` is
+moved. A run on `main` is not in the
+class: the key's `mode` files it under the `next` window, apart from the legacy lines. `bench/baselines/README.md` is
 canonical for the rule; this paragraph records why the read-only class exists.
 
 Two independent reasons, and the weaker one is the one usually cited. The narrow reason is
@@ -1076,8 +1074,8 @@ It is `ci-kube-agents-eval-nightly` in
 export. Its schedule, budget and fan-out are the decisions recorded on
 [gke-labs/kube-agents#1491](https://github.com/gke-labs/kube-agents/issues/1491). The YAML is not
 reproduced here — a copy in a second repository is a copy that goes stale, and the shape below is
-the part that matters. It, its `-main-b` to `-main-e` shards and its three writers thirds grade `spec.mode: next` (`EVAL_MODE_NEXT=1`) and
-so record under the version key's `next` mode. No job in the file records under `today` now.
+the part that matters. It, its `-main-b` to `-main-e` shards and its three writers thirds grade through the inject door and
+so record under the version key's `next` mode. No job records under `today` now.
 
 **Its script body is the presubmit's, byte-for-byte, plus its exports** — `EVAL_TIER` to select
 the nightly matrix, `EVAL_BASELINE_STORE` to close the loop, and `EVAL_REPETITIONS` only if the
