@@ -128,6 +128,19 @@ class PlatformPersonaProposesInTheReply(unittest.TestCase):
             with self.subTest(path=path.relative_to(REPO_ROOT)):
                 self.assertIn(PROPOSE_ONLY_LINE, _read(path))
 
+    def test_a_card_adds_no_pull_request_the_user_did_not_ask_for(self):
+        # The Planning Agent added "(and any ledger issue / remediation PRs
+        # required by the SOP)" to a request to run an audit, and the worker
+        # opened one (#2953).
+        soul = _read(REPO_ROOT / "agents/chat/SOUL.md")
+        for phrase in (
+            "Nor does a card add a deliverable the user did not ask for.",
+            "only when the user's words asked for it, and then word for word",
+            "never \"and any remediation PRs required by the SOP\"",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, soul)
+
     def test_the_audit_worker_publishes_the_ledger_on_a_propose_only_card(self):
         # A chat delegation that carries the propose-only line made the
         # fleet-audit worker return the findings as text and skip the ledger

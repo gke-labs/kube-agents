@@ -23356,11 +23356,12 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
                 self.assertIn("## Awaiting `/remediate`", body)
                 # The worker is told the direct ask still opens these: a task that asked
                 # for the fixes runs `remediate` rather than stopping at the ledger.
-                self.assertIn("only when the requester's own words ask you to open fixes, run `remediate", self.err)
-                # ...and that an audit request, or a criterion the card's writer added, is
-                # not that ask (#2953): the worker opens nothing on its own initiative.
+                self.assertIn("when this task tells you to open the audit's fixes, run `remediate --finding", self.err)
+                # ...and that an audit request, or a criterion deferring to the SOP, is not
+                # that ask (#2953): the worker opens nothing on its own initiative.
                 self.assertIn("A request to run the audit is not that ask", self.err)
-                self.assertIn("any remediation PRs required by the SOP", self.err)
+                self.assertIn("a criterion that defers to the SOP", self.err)
+                self.assertIn("the SOP's pull requests are the ones this sweep opens", self.err)
                 self.assertIn("Never run `remediate` on your own initiative", self.err)
                 self.assertIn(f"`{audit_report.AUTO_PROMOTE_ENV}={audit_report.AUTO_PROMOTE_OFF}`", body)
                 self.assertIn(derived_id(), body[body.index("## Awaiting `/remediate`"):])
