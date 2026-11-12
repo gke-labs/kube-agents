@@ -1062,6 +1062,40 @@ WORKLOAD_INCIDENT_INDEX_TERM = (
 PR_OPENED_EVENT_KIND = "pr_opened"
 PROPOSAL_URL_RE = re.compile(r"^(https?://[^/\s]+/\S+)(?:/pull/|/-/merge_requests/|/pulls/|/pull-requests/)(\d+)(?:[/?#](?:(?!/-/|/issues/|/pull/|/pulls/|/pull-requests/|/merge_requests/)\S)*)?$")
 PROPOSAL_OPEN_STATE = "open"
+_PROPOSAL_URL_PREFIX_RE = re.compile(r"https?://[^/\s]+/")
+_PROPOSAL_URL_MARKERS = ("/pull/", "/-/merge_requests/", "/pulls/", "/pull-requests/")
+_PROPOSAL_URL_TAIL_REFUSED = ("/-/", "/issues/", "/pull/", "/pulls/", "/pull-requests/", "/merge_requests/")
+
+
+def proposal_url_parts(url: str) -> tuple[str, int] | None:
+    """``(repository url, number)``, PROPOSAL_URL_RE's two groups, when it matches ``url``; else None.
+
+    The same answer as that pattern, found by string search rather than a
+    backtracking match, for text a caller sends: its ``\\S+`` before the
+    marker alternation is polynomial on a crafted url.
+    """
+    prefix = _PROPOSAL_URL_PREFIX_RE.match(url)
+    if prefix is None or any(c.isspace() for c in url):
+        return None
+    rest = url[prefix.end():]
+    found = []
+    for marker in _PROPOSAL_URL_MARKERS:
+        at = rest.find(marker, 1)
+        while at != -1:
+            found.append((at, marker))
+            at = rest.find(marker, at + 1)
+    # The pattern's greedy group takes the last marker that leaves a valid tail.
+    for at, marker in sorted(found, reverse=True):
+        start = end = at + len(marker)
+        while end < len(rest) and rest[end].isdigit():
+            end += 1
+        tail = rest[end:]
+        if end == start or (tail and tail[0] not in "/?#"):
+            continue
+        if any(refused in tail[1:] for refused in _PROPOSAL_URL_TAIL_REFUSED):
+            continue
+        return url[: prefix.end() + at], int(rest[start:end])
+    return None
 # How many of the workload's most recent incidents are searched for a fix.
 FIX_PR_INCIDENTS_SCANNED = 5
 # The forge lookup's budget for the whole search; past it the event is
@@ -8462,10 +8496,10 @@ def post_post_merge_record(request_data: Dict[str, Any]) -> Dict[str, bool]:
     way, so a retry after a lost answer is not told it failed.
     """
     url = request_data.get("url")
-    match = PROPOSAL_URL_RE.match(url.strip()) if isinstance(url, str) and len(url) <= PROPOSAL_URL_MAX_CHARS else None
-    if match is None:
+    parts = proposal_url_parts(url.strip()) if isinstance(url, str) and len(url) <= PROPOSAL_URL_MAX_CHARS else None
+    if parts is None:
         raise HTTPException(status_code=400, detail="url must be a pull request url")
-    number = int(match.group(2))
+    repository, number = parts
     sent_number = request_data.get("number")
     if sent_number is not None and sent_number != number:
         raise HTTPException(status_code=400, detail="number must match the pull request url")
@@ -8488,7 +8522,7 @@ def post_post_merge_record(request_data: Dict[str, Any]) -> Dict[str, bool]:
     project, location = _cluster_coordinates(cluster)
     row = (
         url.strip(),
-        match.group(1),
+        repository,
         number,
         kind,
         finding_id,

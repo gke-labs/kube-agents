@@ -14156,6 +14156,29 @@ class TestProposalOrigin(unittest.TestCase):
                 "SELECT number, project, location FROM post_merge_records WHERE number IN (16, 17, 18)"))
         self.assertEqual(got, {n: want for n, _, want in cases})
 
+    def test_proposal_url_parts_agrees_with_the_pattern(self):
+        urls = [
+            "https://github.com/o/r/pull/12", "https://github.com/o/r/pull/12/files", "https://github.com/o/r/pull/12?x=1#y",
+            "https://gitlab.example/g/sub/p/-/merge_requests/7", "https://gitea.example/o/r/pulls/3",
+            "https://bitbucket.org/o/r/pull-requests/9/overview", "https://github.com/o/r/pull/1/pull/2",
+            "https://github.com/o/r/pull/1/issues/2", "https://github.com/o/r/pull/x", "https://github.com/o/r/pull/12x",
+            "https://github.com/pull/5", "https://github.com//pull/5", "http://h/a/pull/0", "https://h/a b/pull/1",
+            "ftp://h/a/pull/1", "https://h/a/pull/", "https://h/a/pulls/4/-/x", "https://h/a/pull/4#/pull/5",
+            "https://h/-/merge_requests/3/pull/4", "https://h/a/pull-requests/2/merge_requests/3",
+        ]
+        for url in urls:
+            with self.subTest(url=url):
+                match = session_kv_server.PROPOSAL_URL_RE.match(url)
+                self.assertEqual(session_kv_server.proposal_url_parts(url), (match.group(1), int(match.group(2))) if match else None)
+
+    def test_proposal_url_parts_is_linear_on_a_crafted_url(self):
+        import time
+
+        crafted = "https://h/" + "/pull/1" * 300 + "/pull/" * 2000 + "!"
+        started = time.monotonic()
+        self.assertIsNone(session_kv_server.proposal_url_parts(crafted))
+        self.assertLess(time.monotonic() - started, 1.0)
+
     def test_post_merge_kinds_match_the_pr_opened_plugin(self):
         spec = importlib.util.spec_from_file_location(
             "pr_opened_for_kinds", Path(__file__).resolve().parents[1] / "plugins" / "pr_opened" / "__init__.py"
