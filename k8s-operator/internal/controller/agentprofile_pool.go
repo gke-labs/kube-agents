@@ -213,7 +213,10 @@ func buildProfileWorkerPodSpec(agent *agentv1alpha1.PlatformAgent, profile *agen
 		ServiceAccountName:           serviceAccount,
 		AutomountServiceAccountToken: ptr.To(false),
 		RestartPolicy:                restart,
-		RuntimeClassName:             shellSandboxRuntimeClassName(agent),
+		// ndots:3, see brokerCallerPodDNSConfig: the Job template and the
+		// warm pool both use this pod spec.
+		DNSConfig:        brokerCallerPodDNSConfig(),
+		RuntimeClassName: shellSandboxRuntimeClassName(agent),
 		SecurityContext: &corev1.PodSecurityContext{
 			RunAsNonRoot:   ptr.To(true),
 			RunAsUser:      ptr.To(int64(profileWorkerUID)),
