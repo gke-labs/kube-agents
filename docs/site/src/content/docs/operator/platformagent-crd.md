@@ -1396,16 +1396,16 @@ Enables external integrations. Only the enabled ones need to be present.
 - **`repositories[].baseBranch`** — on a `gitops` or `managed` entry, the branch every pull request (a merge request on GitLab) onto that repository must target; absent means the repository's own default branch. [`spec.integration.repositories[].baseBranch`](#specintegrationrepositoriesbasebranch) says what the credential broker does with it and the spellings the schema accepts.
 - **`github`** — deprecated alias for one forge with `provider: github`: `org` is its `namespace` and `gitRepo`, when set, is one `gitops` repository on it; the two resolve identically. Set `forges`/`repositories` or `github`, not both; a resource setting both is refused by a CEL rule on the CRD and by the webhook.
 
-  This is still the spelling `install.sh` and the `full-install` Terraform composition write for a github.com install (a GitLab or GitHub Enterprise Server install writes `forges`/`repositories`; see [GitLab as the GitOps forge](/kube-agents/install/gitlab/)). The Helm chart renders one GitHub forge with no `credentialsRef`, no `caBundleRef`, no host other than a spelling of github.com, and at most one repository, the `gitops` one, with no namespace of its own, this way whichever values key set it, because `helm upgrade` does not update CRDs and an older CRD would prune `forges`.
+  This is still the spelling `install.sh` and the `full-install` Terraform composition write for a github.com install (a GitLab, Bitbucket or GitHub Enterprise Server install writes `forges`/`repositories`; see [GitLab as the GitOps forge](/kube-agents/install/gitlab/) and [Bitbucket as the GitOps forge](/kube-agents/install/bitbucket/)). The Helm chart renders one GitHub forge with no `credentialsRef`, no `caBundleRef`, no host other than a spelling of github.com, and at most one repository, the `gitops` one, with no namespace of its own, this way whichever values key set it, because `helm upgrade` does not update CRDs and an older CRD would prune `forges`.
 
   It does so only where the forge declares a namespace or the repository, and the repository is one the operator would accept for GitHub: `name`, `owner/name`, or an `http(s)://`, `ssh://` or `git://` URL, a schemeless host or an scp remote on `github.com`, `www.github.com` or `ssh.github.com`, with no port, naming `owner/name`. A repository the operator would refuse renders as the lists, so the refusal names the entry that was written. A repository that sets `baseBranch` renders as the lists too, since the alias has no place for it.
 
 :::caution[Upgrade note: non-GitHub repository rejection]
-Upgrading to an operator that accepts `provider: gitlab` or `provider: gitea` needs the CRD from the same release applied first: `helm upgrade` does not update CRDs, an older CRD's enum refuses the newer providers, and the chart fails the render with that message when it can read the installed CRD.
+Upgrading to an operator that accepts `provider: gitlab`, `provider: gitea`, `provider: bitbucket` or `provider: bitbucket-datacenter` needs the CRD from the same release applied first: `helm upgrade` does not update CRDs, an older CRD's enum refuses the newer providers, and the chart fails the render with that message when it can read the installed CRD.
 
 Earlier operator versions passed arbitrary `https://` and `http://` URLs through to `CleanRepoURLWithOrg` without host validation. A repository now has to sit on a host its forge's provider serves — for `provider: github`, `github.com`, `www.github.com` or `ssh.github.com`, or the forge's declared GitHub Enterprise Server host. A forge at a host other than github.com must name its `provider`: the CRD refuses one without it, and the field has no default any more. A CRD of an earlier release stored `provider: github` on a forge written without one, so before you upgrade, check that every forge at a host other than github.com names the provider you mean. A forge written for a GitLab instance that way now reads as a GitHub Enterprise Server forge.
 
-Existing `PlatformAgent` resources pointing at another forge reconcile into `phase: Degraded` with condition `Reason: InvalidGitRepoURL`, and subsequent updates to those resources are rejected at admission by the validating webhook, where it is enabled, until the `spec.integration.repositories` entry — or the deprecated `spec.integration.github.gitRepo` — is corrected or removed. A repository on GitLab, Gitea or Bitbucket needs a forge of that provider with a `credentialsRef`, named in the entry's `forge`. See the `forges` field above, [GitLab as the GitOps forge](/kube-agents/install/gitlab/) for `install.sh`'s way of doing it, and [Gitea as the GitOps forge](/kube-agents/install/gitea/) for self-managed Gitea.
+Existing `PlatformAgent` resources pointing at another forge reconcile into `phase: Degraded` with condition `Reason: InvalidGitRepoURL`, and subsequent updates to those resources are rejected at admission by the validating webhook, where it is enabled, until the `spec.integration.repositories` entry — or the deprecated `spec.integration.github.gitRepo` — is corrected or removed. A repository on GitLab, Gitea or Bitbucket needs a forge of that provider with a `credentialsRef`, named in the entry's `forge`. See the `forges` field above, [GitLab as the GitOps forge](/kube-agents/install/gitlab/) and [Bitbucket as the GitOps forge](/kube-agents/install/bitbucket/) for `install.sh`'s way of doing it, and [Gitea as the GitOps forge](/kube-agents/install/gitea/) for self-managed Gitea.
 :::
 
 :::caution[Upgrade note: repository spellings no longer rescued]
@@ -1552,8 +1552,8 @@ The operator writes observed state to the `status` subresource; [PlatformAgent f
 
 `usage.toolExecutionsTotal`, `usage.toolExecutionsBlockedTotal`, `usage.eventsIngestedTotal`, `usage.sessionsTotal`, `usage.chatSessionsTotal`, `usage.remediationsProposedTotal`,
 `usage.chatMessagesInboundTotal`, `usage.brokerFailuresTotal`, `usage.chatTurnsErroredTotal`, `usage.backgroundTasksGaveUpTotal`, `usage.negativeFeedbackTotal`, `usage.positiveFeedbackTotal`,
-`usage.lastActiveTime`, `usage.lastHumanActiveTime`, the two cluster gauges and the proposal, people and origin readings are produced by the operator, on the leader and off the reconcile path. Every five
-minutes it reads the credential broker's, the event watcher's, the chat plugin's and, on a `next`
+`usage.lastActiveTime`, `usage.lastHumanActiveTime`, the two cluster gauges and the proposal, people and origin readings are produced by the operator, on the leader and off the reconcile path. So are the three inference totals, `usage.inputTokensTotal`, `usage.outputTokensTotal` and `usage.spendMicrosUSDTotal`. Every five
+minutes it reads the credential broker's, the event watcher's, the chat plugin's, LiteLLM's and, on a `next`
 install, the A2A gateway's metrics listeners over the pod network, folds the counter series into totals it keeps with their per-pod baseline in the
 `<name>-usage-counters` ConfigMap, so the counters stay monotonic across pod, process and operator
 restarts, and patches the status only when it is behind.
@@ -1673,7 +1673,7 @@ record. Under a served CRD that predates `status.usage` they accumulate in the
 applied. Under a served CRD at a previous schema, which has `status.usage` without the fields added
 later (the two cluster gauges, the proposal readings, the people readings, the origin readings, `chatMessagesInboundTotal`,
 `toolExecutionsBlockedTotal`, `brokerFailuresTotal`, `chatTurnsErroredTotal`,
-`backgroundTasksGaveUpTotal`, `negativeFeedbackTotal`, `positiveFeedbackTotal`, `chatSessionsTotal` and `lastHumanActiveTime`), the first-schema
+`backgroundTasksGaveUpTotal`, `negativeFeedbackTotal`, `positiveFeedbackTotal`, `chatSessionsTotal`, the three inference totals and `lastHumanActiveTime`), the first-schema
 counters keep landing and the newer fields are probed again every five minutes until this
 release's CRD is applied. `storageStatus.capacityBytes` and `freeBytes` follow the same rule under
 a served CRD that predates them.
@@ -2077,6 +2077,12 @@ project ahead of the metadata server, and a management project that changes iden
 old one's profiles, so a line the agent wrote into the PVC `.env` could otherwise re-point it and
 have two clean runs delete every profile of the real management project. Nothing in the operator
 or the chart sets the variable; the script treats the empty value as unset.
+
+`KUBEAGENTS_RESOLVED_SCOPE_FILE` is pinned too. Under `spec.mode: next` it is
+`/etc/kube-agents-resolved/resolved-scope.json`: the scope publisher's `<name>-resolved-scope`
+ConfigMap, mounted read-only into the agent container, which is where the helper scripts' cluster
+lists come from. The container env carries it too. Elsewhere it is pinned empty, because the
+publisher runs only under `next`, and a key left out is one the agent could write.
 
 On GKE, `GKE_PROJECT_ID` is also pinned, to `spec.harness.projectID`. The reconcile reads it as the
 management project when `RECONCILE_PROJECT` is empty, so it is pinned for the same reason. A kind

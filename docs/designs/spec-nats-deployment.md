@@ -640,8 +640,11 @@ Layout:
   one peer every new connection depends on - and nothing looks broken when that
   happens, because established connections are already authorized and keep working
   while the fabric silently accepts no new client. Still owed as they arm: the audit
-  exporter, the janitor, and the metrics scrape (the alert set above is scraped
-  series). The NATS pods' own route peer, which this list used to carry as owed, landed
+  exporter and the janitor. The metrics scrape landed (amended 11/9, #4477) without a
+  new peer on 8222, whose one peer stays the operator's pod (for reload
+  confirmation): a `prometheus-nats-exporter` sidecar in each NATS pod reads 8222 over
+  loopback and serves on 7777, and a separate rule admits the managed collector's
+  namespace (`gke-gmp-system`) to 7777 and nothing else. The NATS pods' own route peer, which this list used to carry as owed, landed
   with the three-server default (amended 10/29, #3274): a separate rule admits 6222 from
   the bus's servers and nothing else, since a fence without it keeps the cluster from
   ever forming. The topic-grant corollary that two edits

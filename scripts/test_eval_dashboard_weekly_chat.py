@@ -65,7 +65,7 @@ class Result:
 
 class FakeGcloudStorage:
     """``gcloud storage cat`` / ``cp`` against one in-memory object; any other
-    command fails the test (the job has no working gsutil)."""
+    command fails the test (the code under test only ever calls gcloud storage)."""
 
     def __init__(self, content=None, cat_error="ERROR: (gcloud.storage.cat) The following URLs matched no objects or files:\n-" + GS_STATE):
         self.content = content

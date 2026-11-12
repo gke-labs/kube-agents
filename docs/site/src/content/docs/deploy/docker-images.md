@@ -11,8 +11,8 @@ Every image an install pulls or a rebuild needs, and how their tags are managed.
 
 [`images.json`](https://github.com/gke-labs/kube-agents/blob/main/images.json) at the repository root is the source of truth for this list. It is what `make mirror-images` copies from, what the chart and the dev tooling resolve their third-party pins from, and what the table below is generated from — so there is one pin per image, not one per install path.
 
-The A2A `next` stack pulls NATS, nats-box, the NATS config reloader, the gateway, the session worker, the auth callout,
-the capability verifier, the AgentProfile dispatcher, the console server and the Hermes bridge sidecar, and each is in the
+The A2A `next` stack pulls NATS, nats-box, the NATS config reloader, its metrics exporter, the gateway, the session worker, the auth callout,
+the capability verifier, the AgentProfile dispatcher, the console server and the Hermes bridge sidecar. Each is in the
 tables below. The first-party ones (`a2a-gateway`, `a2a-worker`, `a2a-authcallout`,
 `a2a-verifier`, `a2a-dispatcher`, `a2a-console`, `hermes-bridge`) are built and tagged with the rest of the
 release.
@@ -33,12 +33,20 @@ the agent image instead, and `A2A_BRIDGE_IMAGE` on the operator overrides it. A 
 that declares its own `hermes-bridge` sidecar keeps it, and that sidecar's image is whatever the
 resource names.
 
-NATS, nats-box and the NATS config reloader are ordinary third-party pins, in the table as `nats`,
-`nats-box` and `nats-server-config-reloader`, so `make mirror-images` copies them. The chart does
-not set their env vars, so a mirrored `next` install still points `A2A_NATS_IMAGE`,
-`A2A_PROVISION_IMAGE` and `A2A_NATS_RELOADER_IMAGE` at the copies itself, through the operator's
-environment
+NATS, nats-box, the NATS config reloader and its metrics exporter are ordinary third-party pins,
+in the table as `nats`, `nats-box`, `nats-server-config-reloader` and `prometheus-nats-exporter`,
+so `make mirror-images` copies them. The chart does not set their env vars, so a mirrored `next`
+install still points `A2A_NATS_IMAGE`, `A2A_PROVISION_IMAGE`, `A2A_NATS_RELOADER_IMAGE` and
+`A2A_NATS_EXPORTER_IMAGE` at the copies itself, through the operator's environment
 ([Operator settings](/kube-agents/install/quickstart-gke/#operator-settings) shows how).
+
+If `A2A_NATS_IMAGE` is set and `A2A_NATS_EXPORTER_IMAGE` is not, as on a mirrored install set up
+before the exporter existed, the operator renders the NATS pods without the exporter. It records
+an `A2ABusMetricsExporterOmitted` Warning event on the `PlatformAgent`. The bus keeps running, and
+its metrics are absent until the variable names the mirrored copy.
+`A2A_NATS_EXPORTER_IMAGE` has to name a copy of the upstream image, not a rebuild: the operator
+runs `/prometheus-nats-exporter` under the image's `/bin/sh`, in a loop that restarts the exporter
+if it exits.
 
 The bases those images are built from are inventory entries too. `golang`, `node` and
 `distroless-static` in the build-time table below carry `a2a/Dockerfile.authcallout`,
@@ -90,6 +98,7 @@ Pinned here so `make mirror-images` and the install ask for the same version.
 | `nats` | `docker.io/library/nats` | `2.10-alpine` | `A2A_NATS_IMAGE` | The NATS StatefulSet the operator renders under spec.mode: next, and nothing under spec.mode: today. |
 | `nats-box` | `docker.io/natsio/nats-box` | `0.14.5` | `A2A_PROVISION_IMAGE` | The provision Job the operator runs against that NATS under spec.mode: next, and nothing under spec.mode: today. |
 | `nats-server-config-reloader` | `docker.io/natsio/nats-server-config-reloader` | `0.25.0@sha256:24bacde6b844f8875f93424ed153d33b3d9e9367fcccc14b683eb71fab3a4d8c` | `A2A_NATS_RELOADER_IMAGE` | A sidecar in the NATS pod the operator renders under spec.mode: next, and nothing under spec.mode: today. |
+| `prometheus-nats-exporter` | `docker.io/natsio/prometheus-nats-exporter` | `0.20.3@sha256:4b8ddc1c86fec360b5cd3d5e1fbc6fb52bdafd5805bba3901cc52926538af255` | `A2A_NATS_EXPORTER_IMAGE` | The metrics sidecar in each pod of that NATS StatefulSet under spec.mode: next, and nothing under spec.mode: today. |
 | `k8s` | `docker.io/alpine/k8s` | `1.36.5` | — | The chart's pre-delete cleanup hook Job. |
 | `github-token-minter-server` | `us-docker.pkg.dev/abcxyz-artifacts/docker-images/github-token-minter-server` | `v2.7.1-amd64` | `GITHUB_MINTER_IMAGE` | The optional GitHub integration. |
 | `hindsight-api` | `ghcr.io/vectorize-io/hindsight-api` | `0.10.2@sha256:1ba631f950a04460feff6b1e212bad3cdf127b0cfb3d765bdcba12f512481d7b` | `HINDSIGHT_API_IMAGE` | The chart, when the memory provider uses Hindsight (make deploy-hindsight for the kustomize dev path). |
@@ -305,14 +314,16 @@ when a prefix is in effect:
 - `AGENT_SANDBOX_IMAGE` — the shell sandbox StatefulSet rendered beside every agent pod.
 - `FLUENT_BIT_IMAGE` — the logging sidecar injected into every agent pod.
 
-`CREDENTIAL_PROXY_IMAGE` and `KUBE_PROXY_IMAGE` need nothing: the operator derives them from the agent image
-by swapping the trailing name (`platform-agent` to `credential-proxy` and `kube-proxy`), which lands on the mirror
-on its own. The A2A `next` images the operator renders (`a2a-gateway`, `a2a-worker`,
-`a2a-authcallout`, `a2a-verifier`, `a2a-console`) follow `OPERATOR_IMAGE`, else `PLATFORM_AGENT_IMAGE`, the same way, so they need
-no env of their own on a mirror. The sandbox is a separate repository, so it gets no such
-derivation. Setting it explicitly still wins, which is why `install.sh` leaves it unset. One
-explicit value pins the sidecar for every agent in the cluster, and the per-CR derivation is what
-otherwise keeps each sidecar in step with its own agent's image.
+`CREDENTIAL_PROXY_IMAGE` and `KUBE_PROXY_IMAGE` need nothing on a mirror. The operator derives
+the credential proxy from each agent's own image by swapping the trailing name (`platform-agent` to
+`credential-proxy`). It derives `kube-proxy`, and the A2A `next` images it renders (`a2a-gateway`,
+`a2a-worker`, `a2a-authcallout`, `a2a-verifier`, `a2a-console`), from `OPERATOR_IMAGE`, else
+`PLATFORM_AGENT_IMAGE`, the same way. The sandbox follows `AGENT_SANDBOX_IMAGE`, else
+`OPERATOR_IMAGE` with the repository swapped to `agent-sandbox`, else the ghcr.io default; the
+chart always sets `AGENT_SANDBOX_IMAGE`. Setting `CREDENTIAL_PROXY_IMAGE` or `KUBE_PROXY_IMAGE`
+explicitly still wins, which is why `install.sh` leaves them unset: one explicit
+`CREDENTIAL_PROXY_IMAGE` pins the broker for every agent in the cluster, where the per-CR
+derivation keeps each broker in step with its own agent's image.
 
 Per-agent, `spec.deployment.image` / `spec.deployment.tag` on a `PlatformAgent` override all of
 the above for that agent's containers — see the

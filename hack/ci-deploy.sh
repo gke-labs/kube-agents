@@ -992,6 +992,26 @@ resolve_agent_gemini_api_key() {
 # --- agent key: end
 resolve_agent_gemini_api_key
 export MODEL_DEFAULT_NAME="${MODEL_DEFAULT_NAME:-gemini-3.1-pro-preview}"
+# --- reasoning effort: begin
+# The reasoning effort the gateway asks the model for on every request, the
+# chart's litellm.reasoningEffort: low, medium or high, or empty for the
+# model's own default. A certification run names it beside the model, and
+# hack/ci-eval-pr.sh stamps the same variable on every case record, so a
+# record says which effort the agent ran at and a window never pools two
+# efforts. Checked here, before the lease is spent on a deploy the chart's
+# schema would refuse at step 5c. The deploy never sets litellm.dropParams,
+# so an effort a provider does not take fails its requests loudly rather
+# than being dropped in silence. The FATAL line names the effort only.
+export EVAL_REASONING_EFFORT="${EVAL_REASONING_EFFORT:-}"
+case "${EVAL_REASONING_EFFORT}" in
+  "" | low | medium | high) ;;
+  *)
+    echo "FATAL: EVAL_REASONING_EFFORT='${EVAL_REASONING_EFFORT}' is not low, medium, high or empty (the model default)." >&2
+    exit 1
+    ;;
+esac
+echo "Agent model for this install: ${MODEL_PROVIDER}/${MODEL_DEFAULT_NAME}, reasoning effort: ${EVAL_REASONING_EFFORT:-model default}"
+# --- reasoning effort: end
 # Default to enforcing CMEK database encryption on CI evaluation clusters.
 # Set ALLOW_UNENCRYPTED_SECRETS=true to bypass CMEK checks on unencrypted test clusters.
 export ALLOW_UNENCRYPTED_SECRETS="${ALLOW_UNENCRYPTED_SECRETS:-false}"
@@ -2106,6 +2126,7 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set-file "platformAgent.credentials.data.SANDBOX_SSH_PUBLIC_KEY=${SANDBOX_KEY_DIR}/id_sandbox.pub" \
     --set-string "litellm.modelProvider=${MODEL_PROVIDER}" \
     --set-string "litellm.modelDefaultName=${MODEL_DEFAULT_NAME}" \
+    --set-string "litellm.reasoningEffort=${EVAL_REASONING_EFFORT:-}" \
     --set "litellm.fallback.numRetries=${EVAL_LITELLM_NUM_RETRIES}" \
     --set "litellm.fallback.retryAfterSeconds=${EVAL_LITELLM_RETRY_AFTER_SECONDS}" \
     --set-string "litellm.vertex.serviceAccountAnnotations.iam\.gke\.io/gcp-service-account=${LITELLM_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \

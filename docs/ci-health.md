@@ -717,7 +717,14 @@ link has the list), and that nothing about the change is implied:
 Ran 27 min · build log
 ```
 
-When every recorded case was lost the box says so. While `health.json`'s
+When every lost case lost its checks to a forge read that failed during
+grading, the box names that stage instead ("a forge read failed during
+grading, so the checks that read it could not be evaluated"), and when every
+lost case hit the delegation ceiling it says delegated work was still running
+when the harness stopped waiting: the agent ran in both. A mix of the two says
+the agent ran but the harness could not grade the result; any other mix keeps
+the wording above. Beside any of these three stages the storm line below, and its link to the
+brief, are left out, so they cannot read as their cause. When every recorded case was lost the box says so. While `health.json`'s
 condition is `storm` it adds "a quota storm is declared on the gate right
 now" and links the brief, with no case names in the link. A gate case that
 went red on the same run (the dashboard's roster can be newer than the
@@ -1027,6 +1034,80 @@ coverage-gap filer with it ([Coverage gaps](#coverage-gaps));
 `CI_HEALTH_MUTE=true` disarms it again with every other write. Locally,
 `python3 scripts/eval_dashboard/nightly_bugs.py --data data.json` is a dry run
 against any `data.json`; `--live` writes.
+
+## Nightly triage
+
+`scripts/eval_dashboard/nightly_triage.py` puts a model between the filer and
+a person, so the assignee gets a bug that is really theirs. The filer routes by
+who owns the case, which is the wrong person whenever the case is not at fault:
+on 2026-11-09, ten issues for one grader change went to five case owners, and
+each diagnosed it separately.
+
+Armed, the filer files a domain or group bug (not an infra issue) unassigned,
+labelled `triage:pending`, with every @-mention in its body written as code so
+the filing notifies no one, and a `kube-agents-bot:triage-pending` marker
+naming who its own rule would assign and mention. The `nightly-triage` job runs
+after each tick and handles at most 5 such issues, oldest first, in two steps
+with two identities:
+
+- **Gather**, as the archive reader (`github-actions@kube-agents-prow`): from
+  `data.json`, each case's last green and first red nightly commits and every
+  failing repetition's grading line on its red nights; the tail of up to three
+  transcripts from the nightly's private bucket; `git log` between those
+  commits on a full-history checkout, with each pull request's title and author
+  from GitHub; and the candidate fixes, open pull requests touching the same
+  files and commits on those files merged since the first red night. It writes
+  only to the runner's disk.
+- **Route**, as the publisher (`CI_HEALTH_SA`): one call to Gemini on Vertex AI
+  through the job's Workload Identity, model `NIGHTLY_TRIAGE_MODEL`
+  (`gemini-4-argon` unless the repository variable names another), billed to
+  `NIGHTLY_TRIAGE_PROJECT` (`kube-agents-prow` unless set). The prompt is
+  capped at 60,000 tokens (transcripts are cut first, then the oldest commits,
+  then grading lines) and the answer at 16,384, thinking included. The model returns a
+  classification, a suspected pull request, an open or merged fix, a priority
+  and a confidence. A pull request outside the commit window, or a fix outside
+  the candidates, is set aside rather than trusted.
+
+| Verdict                                                                    | Assigned to                                 |
+| -------------------------------------------------------------------------- | ------------------------------------------- |
+| Product bug or grader/harness, with a suspected pull request in the window | that pull request's author                  |
+| Grader/harness, no suspected pull request                                  | `infra_owner` in `domains.yaml`             |
+| Infra                                                                      | `infra_owner`                               |
+| Case needs rework, low confidence, or no verdict                           | the filer's rule (case owner, domain owner) |
+
+The first login GitHub accepts is assigned, the rule's logins behind it; a
+person without access to the issues repository is not assignable there, and
+the issue falls to the rule. The job then posts one comment on the issue with
+the verdict, the evidence, the suspected pull request and the fix (linked in
+full, since pull requests live in this repository), @-mentions the people the
+filer would have, swaps `triage:pending` for `triage:agent`, and marks the body
+`triage-done`. The comment goes only to the issues repository
+(`KUBE_AGENTS_ISSUES_REPO`, private), so it names cases and quotes grading
+lines; the job log carries issue numbers, pull request numbers and logins only.
+
+A model call that fails, times out, stops at its token cap or answers off the
+schema routes by the filer's rule, and the comment says so in one line. An
+issue whose evidence was not gathered waits for the next tick; one still
+waiting two hours after it was filed is routed by the rule without a model
+call, by the job or, when the job fails before routing, by a step of the tick
+itself. A failed GitHub write leaves the issue pending, and the next tick
+resumes it without another model call: an assignee already set is kept, and a
+comment already posted is not posted again. The body is marked done on a fresh
+read and the labels are added and removed one by one, so an edit a person made
+meanwhile stays. The filer files for triage only into a separate issues
+repository, the route step writes to no other, and the job's own token holds
+no issue write.
+
+Unarmed, the job dry-runs on the issues the filer filed that tick (which the
+filer assigned as before) and prints what it would assign; a manual run of the
+workflow with `triage_issues` set to issue numbers of the issues repository
+does the same for those issues. Setting the repository variable
+`NIGHTLY_TRIAGE_LIVE=true` arms it, together with `NIGHTLY_BUGS_LIVE=true`;
+`CI_HEALTH_MUTE=true` disarms both. Switched off while issues still wait,
+the tick routes each by the rule without a model call. The call needs
+`roles/aiplatform.user` for `CI_HEALTH_SA` on `NIGHTLY_TRIAGE_PROJECT`, with
+the Vertex AI API enabled there; until then every call fails and every issue
+goes by the rule.
 
 ## The nightly section
 
@@ -1425,10 +1506,12 @@ the adjudicator can ask "drifted last scan too?" from one file.
 read-only account, `seeded-fleet-reader@<project>.iam.gserviceaccount.com`
 (`bench/tf/fleet`): `CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT` makes gcloud
 impersonate it for the cluster listing, the credentials, the control-plane
-describes and the `gcloud compute instances list` and `gcloud compute
-firewall-rules list` reads of the project-scoped roles (`startup-fail-vm` and
+describes and the `gcloud compute instances list`, `gcloud compute
+firewall-rules list` and `gcloud compute instances get-serial-port-output`
+reads of the project-scoped roles (`startup-fail-vm` and
 `world-open-ingress`, which have no cluster slot; the account holds
-`roles/compute.viewer` for them), and `FLEET_READONLY_SA` makes the runner
+`roles/compute.viewer` for them, which includes
+`compute.instances.getSerialPortOutput`), and `FLEET_READONLY_SA` makes the runner
 rewrite each kubeconfig so `kubectl`'s token is minted as it too. The bot,
 `eval-dashboard-publisher@kube-agents-prow`, therefore needs exactly one grant
 per pool project — `roles/iam.serviceAccountTokenCreator` on that account, the
@@ -1507,7 +1590,9 @@ message and the health box's advice say that the pool is below that margin and i
 `bench/tf/fleet/main.tf` is the fix, rolling project by project if a size change has just
 merged, beside the re-apply line when a planted role drifts too, and the issue carries the
 same exception beside the re-apply paragraph, since a re-apply of a stack that is already
-applied changes nothing; and when every drift line on the incident is one no re-apply clears,
+applied changes nothing; a `startup-fail-vm` line reading `serial_contains`, the VM's
+failure line gone from its serial buffer, is cleared by the re-apply too, because the
+reconcile resets the VM after each project; and when every drift line on the incident is one no re-apply clears,
 keyed on its assertion rather than its role, the Chat message and the health box's advice say
 so and name the remedy instead: an `age_hours_ge` line, seeded-c's `createTime` under the
 24-hour age gate, clears itself at `createTime` plus 24 hours and the advice gives that time
