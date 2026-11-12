@@ -303,6 +303,9 @@ func TestBuildA2ANATSStatefulSet(t *testing.T) {
 	if got := sts.Spec.Template.Spec.Containers[0].Image; got != defaultA2ANATSImage {
 		t.Errorf("image = %q, want %q", got, defaultA2ANATSImage)
 	}
+	if !strings.Contains(defaultA2ANATSImage, "@sha256:") {
+		t.Errorf("default bus image %q carries no digest; it must be pinned as tag@sha256", defaultA2ANATSImage)
+	}
 	if got := sts.Labels["app.kubernetes.io/part-of"]; got != a2aPartOf {
 		t.Errorf("part-of label = %q, want %q", got, a2aPartOf)
 	}
