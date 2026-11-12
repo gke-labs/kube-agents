@@ -1073,34 +1073,35 @@ func TestDelegationDepthMaxFromEnv(t *testing.T) {
 	}
 }
 
-// TestDelegationWidthMaxFromEnv: unset or 1 means a delegation of one child.
-// Anything over 1 is refused at boot for now, naming the variable and why:
-// a batch's children can't yet be stopped together or report back in one
-// wake. A value below 1 or a non-integer refuses the boot, as the depth bound
-// does.
+// TestDelegationWidthMaxFromEnv: unset means a batch of up to 10 children,
+// the widest FromEnv accepts. Anything from 1 to 10 is taken as set; over 10
+// is refused at boot, naming the variable and the bound. A value below 1 or
+// a non-integer refuses the boot, as the depth bound does.
 func TestDelegationWidthMaxFromEnv(t *testing.T) {
 	setBaseEnv(t)
 	cfg, err := FromEnv()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.DelegationWidthMax != 1 {
-		t.Fatalf("default DelegationWidthMax = %d, want 1", cfg.DelegationWidthMax)
+	if cfg.DelegationWidthMax != 10 {
+		t.Fatalf("default DelegationWidthMax = %d, want 10", cfg.DelegationWidthMax)
 	}
 
-	t.Setenv("A2A_DELEGATION_WIDTH_MAX", "1")
-	if cfg, err = FromEnv(); err != nil || cfg.DelegationWidthMax != 1 {
-		t.Fatalf("A2A_DELEGATION_WIDTH_MAX=1: %v, %v", cfg, err)
+	for _, n := range []int{1, 2, 10} {
+		t.Setenv("A2A_DELEGATION_WIDTH_MAX", strconv.Itoa(n))
+		if cfg, err = FromEnv(); err != nil || cfg.DelegationWidthMax != n {
+			t.Fatalf("A2A_DELEGATION_WIDTH_MAX=%d: %v, %v", n, cfg, err)
+		}
 	}
 
-	for _, wide := range []string{"2", "10", strconv.Itoa(lib.DelegateBatchMax)} {
+	for _, wide := range []string{"11", strconv.Itoa(lib.DelegateBatchMax)} {
 		t.Setenv("A2A_DELEGATION_WIDTH_MAX", wide)
 		_, err := FromEnv()
 		if err == nil {
-			t.Fatalf("A2A_DELEGATION_WIDTH_MAX=%q accepted before fan-out's results and stop exist", wide)
+			t.Fatalf("A2A_DELEGATION_WIDTH_MAX=%q accepted over 10", wide)
 		}
-		if !strings.Contains(err.Error(), "A2A_DELEGATION_WIDTH_MAX") || !strings.Contains(err.Error(), "not built yet") {
-			t.Fatalf("A2A_DELEGATION_WIDTH_MAX=%q: error %q does not name the variable and why", wide, err)
+		if !strings.Contains(err.Error(), "A2A_DELEGATION_WIDTH_MAX") || !strings.Contains(err.Error(), "at most 10") {
+			t.Fatalf("A2A_DELEGATION_WIDTH_MAX=%q: error %q does not name the variable and the bound", wide, err)
 		}
 	}
 
