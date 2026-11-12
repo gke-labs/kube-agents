@@ -131,3 +131,42 @@ class EvalTest(unittest.TestCase):
         self.assertTrue(cli.case_passed({"verification_report": [passed, safeguard]}))
         self.assertFalse(cli.case_passed({"verification_report": [passed, failed]}))
         self.assertFalse(cli.case_passed({"verification_report": []}))
+
+
+class ImagesTest(unittest.TestCase):
+    def test_every_tagged_image_is_checked_from_the_chart_values(self):
+        repos = cli.image_repositories()
+        self.assertEqual(len(repos), len(cli.IMAGE_TAG_KEYS))
+        self.assertIn("gke-labs/kube-agents/platform-agent", repos)
+
+    def test_a_commit_counts_as_published_only_when_every_image_is(self):
+        with mock.patch.object(cli, "manifest_exists", side_effect=lambda repo, sha: "operator" in repo):
+            self.assertFalse(cli.image_published("abc"))
+        with mock.patch.object(cli, "manifest_exists", return_value=True):
+            self.assertTrue(cli.image_published("abc"))
+
+
+class EvalCaseIsolationTest(unittest.TestCase):
+    def test_a_case_that_fails_to_run_does_not_cost_the_others_their_records(self):
+        calls = []
+
+        def run_case(case, name, env, evals):
+            calls.append(name)
+            if name == "a":
+                raise cli.subprocess.TimeoutExpired("devops-bench", 1)
+            return {"passed": True}
+
+        relay = mock.Mock(port=1)
+        with tempfile.TemporaryDirectory() as tmp:
+            cases = Path(tmp) / "cases.txt"
+            cases.write_text("./tasks/a/task.yaml\n./tasks/b/task.yaml\n")
+            with mock.patch.object(cli.operations, "Relay", return_value=relay), \
+                    mock.patch.object(cli.operations, "agent_env", return_value={}), \
+                    mock.patch.object(cli, "run_case", side_effect=run_case):
+                summary = cli.run_evals(args(eval_cases=str(cases), namespace="ns", host_cluster="h"), "ctx",
+                                        Path(tmp))
+            self.assertTrue((Path(tmp) / "evals" / "summary.json").is_file())
+        self.assertEqual(calls, ["a", "b"])
+        self.assertFalse(summary["a"]["passed"])
+        self.assertTrue(summary["b"]["passed"])
+        relay.stop.assert_called_once()

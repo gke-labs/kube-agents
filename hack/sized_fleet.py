@@ -48,6 +48,8 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "bench"))
 
+import yaml  # noqa: E402
+
 from kube_agents_bench.scale import collect, kube  # noqa: E402
 from kube_agents_bench.scale import sized_fleet as sf  # noqa: E402
 from kube_agents_bench.scale import operations, runner, sized_records, sized_run  # noqa: E402
@@ -67,7 +69,9 @@ RELEASE = "kube-agents"
 CHART_DIR = REPO / "charts" / "kube-agents"
 CRD_DIR = CHART_DIR / "crds"
 REGISTRY = "ghcr.io"
-IMAGE_REPO = "gke-labs/kube-agents/k8s-operator"
+CHART_VALUES = CHART_DIR / "values.yaml"
+TAG_SUFFIX = ".tag"
+REPOSITORY_FIELD = "repository"
 MANIFEST_ACCEPT = ("application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, "
                    "application/vnd.docker.distribution.manifest.list.v2+json, "
                    "application/vnd.docker.distribution.manifest.v2+json")
@@ -448,6 +452,32 @@ def case_passed(result: dict) -> bool:
     return bool(objectives) and all(c.get("success") for c in objectives)
 
 
+def run_case(case: str, name: str, env: dict[str, str], evals: Path) -> dict:
+    """Run one case once; its log and results go under ``evals``."""
+    started = time.time()
+    # Its own session, so a timeout stops devops-bench along with uv.
+    proc = subprocess.Popen(["uv", "run", "devops-bench", case, "--agent-type", "kubeagents"], cwd=BENCH_DIR,
+                            env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                            start_new_session=True)
+    try:
+        output, _ = proc.communicate(timeout=EVAL_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGTERM)
+        output, _ = proc.communicate()
+        (evals / f"{name}.log").write_text(output or "")
+        raise
+    (evals / f"{name}.log").write_text(output)
+    entry: dict = {"seconds": round(time.time() - started), "exit": proc.returncode, "passed": False}
+    found = RESULTS_LINE.search(output)
+    if found:
+        result = json.loads(Path(found.group(1)).read_text())[0]
+        (evals / f"{name}.results.json").write_text(json.dumps(result, indent=2) + "\n")
+        # The answer's time and tokens are the capability usage design's C9 inputs.
+        entry.update(passed=case_passed(result), latency=result.get("latency"), tokens=result.get("tokens"),
+                     checks={c["name"]: c.get("status") for c in result.get("verification_report") or []})
+    return entry
+
+
 def run_evals(args: argparse.Namespace, host_context: str, out: Path) -> dict:
     """Run each listed case once against the host install; write each result and a summary under out/evals."""
     evals = out / EVALS_DIR
@@ -466,20 +496,11 @@ def run_evals(args: argparse.Namespace, host_context: str, out: Path) -> dict:
         for case in eval_cases(Path(args.eval_cases)):
             name = Path(case).parent.name
             LOG.info("eval case %s", name)
-            started = time.time()
-            proc = subprocess.run(["uv", "run", "devops-bench", case, "--agent-type", "kubeagents"], cwd=BENCH_DIR,
-                                  env=env, capture_output=True, text=True, timeout=EVAL_TIMEOUT_SECONDS, check=False)
-            (evals / f"{name}.log").write_text(proc.stdout + proc.stderr)
-            found = RESULTS_LINE.search(proc.stdout + proc.stderr)
-            entry: dict = {"seconds": round(time.time() - started), "exit": proc.returncode}
-            if found:
-                result = json.loads(Path(found.group(1)).read_text())[0]
-                (evals / f"{name}.results.json").write_text(json.dumps(result, indent=2) + "\n")
-                # The answer's time and tokens are the capability usage design's C9 inputs.
-                entry.update(passed=case_passed(result), latency=result.get("latency"), tokens=result.get("tokens"),
-                             checks={c["name"]: c.get("status") for c in result.get("verification_report") or []})
-            else:
-                entry["passed"] = False
+            try:
+                entry = run_case(case, name, env, evals)
+            except (OSError, ValueError, LookupError, subprocess.SubprocessError) as exc:
+                # One case's failure does not cost the others their records.
+                entry = {"passed": False, "error": str(exc)}
             LOG.info("eval case %s: %s", name, "passed" if entry["passed"] else "failed")
             summary[name] = entry
     finally:
@@ -545,12 +566,33 @@ def summary(name: str, body: dict) -> str:
                      for w, v in windows.items())
 
 
+def image_repositories() -> list[str]:
+    """The registry path of each image the release sets a tag on, read from the chart's values."""
+    values = yaml.safe_load(CHART_VALUES.read_text())
+    repos = []
+    for key in IMAGE_TAG_KEYS:
+        node = values
+        for part in key.removesuffix(TAG_SUFFIX).split("."):
+            node = node[part]
+        repos.append(node[REPOSITORY_FIELD].removeprefix(f"{REGISTRY}/"))
+    return repos
+
+
 def image_published(sha: str) -> bool:
-    """Whether the operator image for ``sha`` is in the registry; the release workflow publishes them together."""
-    token_url = f"https://{REGISTRY}/token?scope=repository:{IMAGE_REPO}:pull&service={REGISTRY}"
+    """Whether every image the release sets is in the registry at ``sha``.
+
+    The release workflow publishes the operator and the agent images in separate jobs,
+    the agent images one after another, so one image's tag does not mean the others'.
+    """
+    return all(manifest_exists(repo, sha) for repo in image_repositories())
+
+
+def manifest_exists(repo: str, sha: str) -> bool:
+    """Whether ``repo`` has a manifest tagged ``sha``, read anonymously."""
+    token_url = f"https://{REGISTRY}/token?scope=repository:{repo}:pull&service={REGISTRY}"
     with urllib.request.urlopen(token_url, timeout=REGISTRY_TIMEOUT_SECONDS) as response:  # noqa: S310 -- fixed URL
         token = json.loads(response.read())["token"]
-    request = urllib.request.Request(f"https://{REGISTRY}/v2/{IMAGE_REPO}/manifests/{sha}",
+    request = urllib.request.Request(f"https://{REGISTRY}/v2/{repo}/manifests/{sha}",
                                      headers={"Authorization": f"Bearer {token}", "Accept": MANIFEST_ACCEPT})
     try:
         with urllib.request.urlopen(request, timeout=REGISTRY_TIMEOUT_SECONDS):  # noqa: S310
@@ -579,13 +621,22 @@ def cmd_install(args: argparse.Namespace) -> int:
     kube.gcloud("container", "clusters", "get-credentials", args.host_cluster, f"--location={args.host_location}",
                 project=args.project)
     check_host(args)
-    with host_lease(args):
+    with host_lease(args), tempfile.TemporaryDirectory(prefix="sized-chart-") as tree:
+        # The chart and CRDs of the commit whose images run, not of this checkout: HEAD's images
+        # may not be published yet, and a newer chart may read values older images lack.
+        archive = subprocess.run(["git", "-C", str(REPO), "archive", sha, str(CHART_DIR.relative_to(REPO))],
+                                 capture_output=True, check=True).stdout
+        subprocess.run(["tar", "-x", "-C", tree], input=archive, check=True)
+        chart = Path(tree) / CHART_DIR.relative_to(REPO)
         LOG.info("installing %s at the %s tier on %s", sha[:12], tier, args.host_cluster)
         kube.run(["kubectl", "--context", host_context, "apply", "--server-side", "--force-conflicts", "-f",
-                  str(CRD_DIR)], timeout=HELM_TIMEOUT_SECONDS)
+                  str(chart / CRD_DIR.name)], timeout=HELM_TIMEOUT_SECONDS)
         sets = [f"--set={key}={sha}" for key in IMAGE_TAG_KEYS] + [f"--set={SIZING_KEY}={tier}"]
-        kube.run(["helm", "--kube-context", host_context, "-n", args.namespace, "upgrade", RELEASE, str(CHART_DIR),
-                  "--reuse-values", *sets, "--wait", f"--timeout={HELM_TIMEOUT}"], timeout=HELM_TIMEOUT_SECONDS)
+        # --reset-then-reuse-values: the chart's own defaults, then the release's values on top,
+        # so a key the newer chart adds gets its default rather than nothing.
+        kube.run(["helm", "--kube-context", host_context, "-n", args.namespace, "upgrade", RELEASE, str(chart),
+                  "--reset-then-reuse-values", *sets, "--wait", f"--timeout={HELM_TIMEOUT}"],
+                 timeout=HELM_TIMEOUT_SECONDS)
     LOG.info("installed %s", sha)
     return 0
 
@@ -651,7 +702,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host-location", default=DEFAULT_HOST_LOCATION)
     parser.add_argument("--namespace", default=DEFAULT_NAMESPACE, help="run: the install's namespace")
     parser.add_argument("--soak-minutes", type=int, default=sized_run.SOAK_SECONDS // SECONDS_PER_MINUTE)
-    parser.add_argument("--out", help="run: the folder for the three records; default a new temp folder")
+    parser.add_argument("--out", help="run: the folder for the records; default a new temp folder")
     parser.add_argument("--results-bucket", help="run: also copy the records to <bucket>/<size>/<run id>/")
     parser.add_argument("--eval-cases", nargs="?", const=str(EVAL_CASES_FILE), default=None,
                         help="run: run the cases this file lists in the soak window "
