@@ -2036,12 +2036,15 @@ webConsole:
   enabled: false
   # GET /api/environment and PlatformAgent state: versions, install and
   # last-rollout dates, and counts of nodes, namespaces, pods and controllers
-  # for feedback reports, plus reading and patching the PlatformAgent resource
-  # for repository topology, preferred model annotations, and applied PR
-  # annotations. Needs a service account with list on those kinds and get/patch
-  # on the PlatformAgent, which the chart creates. The console discards the
-  # listed items; the only names GET /api/environment returns are the
-  # kube-agents Helm release, its namespace and the owning Argo CD Application.
+  # for feedback reports, the PlatformAgent's status.usage block (counters,
+  # top tools and token totals, for the feedback attachment and the banner's
+  # since-install figures), plus reading and patching the PlatformAgent
+  # resource for repository topology, preferred model annotations, and applied
+  # PR annotations. Needs a service account with list on those kinds and
+  # get/patch on the PlatformAgent, which the chart creates. The console
+  # discards the listed items; the only names GET /api/environment returns are
+  # the kube-agents Helm release, its namespace and the owning Argo CD
+  # Application.
   environment:
     enabled: true
   # "Polish with Gemini" in the feedback form: POST /api/assist sends the
