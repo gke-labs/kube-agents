@@ -18284,9 +18284,10 @@ def unwritten_refusal_message(
     notes = notes or {}
     parts = [
         f"{len(unwritten)} finding(s) need their fix written before a `/remediate` "
-        "can open a pull request for them. Writing a fix opens nothing: it waits in the "
-        "ledger as awaiting `/remediate`, and you run `remediate` only when this task "
-        "tells you to open the audit's fixes (#2953)."
+        # The second sentence is #2953: a worker wrote the fixes and then opened them.
+        "can open a pull request for them. Writing a fix opens nothing unless a person's "
+        "`/remediate` already asks for it: it waits in the ledger as awaiting `/remediate`, "
+        "and you run `remediate` only when this task tells you to open the audit's fixes."
         if sweep_off
         else f"{len(unwritten)} finding(s) qualify for an automatic pull request, but "
         "their fix is not written."
@@ -26682,14 +26683,16 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
         log(
             f"{fid}: the collector ran this check on this cluster and emitted no "
             "candidate for this object, so the sweep will not open a pull request "
-            f"on it. A person who has read it and wants one comments `/remediate {fid}`; never you."
+            f"on it. A person who has read it and wants one comments `/remediate {fid}`; never you. "
+            "A task that tells you to open the audit's fixes runs `remediate` instead."
         )
     for fid in plan.needs_triage:
         log(
             f"{fid}: the collector flagged this and stands behind it, and marked "
             f"the fix `{triage_reasons.get(fid, '?')}` as needing a judgement it could not make, so the sweep will "
             f"not open a pull request on it. A person comments `/remediate {fid}` once they "
-            "have decided; never you."
+            "have decided; never you. A task that tells you to open the audit's fixes runs "
+            "`remediate` instead."
         )
     for fid in plan.already_open:
         log(f"{fid} already has an open remediation pull request; not replacing it.")
