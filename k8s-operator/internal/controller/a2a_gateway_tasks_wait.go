@@ -103,6 +103,12 @@ type a2aGatewayLeaderRead struct {
 	Pod        *corev1.Pod
 	Ready      bool
 	AcquiredAt time.Time
+	// RenewedAt and LeaseDuration are the Lease's renewTime and
+	// leaseDurationSeconds, zero when the Lease does not carry them; Ready
+	// following the leader (a2aGatewayReadyByLeader) reads them to tell a
+	// holder that stopped renewing from a current one.
+	RenewedAt     time.Time
+	LeaseDuration time.Duration
 }
 
 // a2aGatewayLeader reads the A2A gateway's elected leader. It returns nil
@@ -135,6 +141,12 @@ func (r *PlatformAgentReconciler) a2aGatewayLeader(ctx context.Context, agent *a
 	read := &a2aGatewayLeaderRead{Pod: pod}
 	if lease.Spec.AcquireTime != nil {
 		read.AcquiredAt = lease.Spec.AcquireTime.Time
+	}
+	if lease.Spec.RenewTime != nil {
+		read.RenewedAt = lease.Spec.RenewTime.Time
+	}
+	if lease.Spec.LeaseDurationSeconds != nil {
+		read.LeaseDuration = time.Duration(*lease.Spec.LeaseDurationSeconds) * time.Second
 	}
 	if gateway := a2aGatewayContainerStatus(pod); gateway != nil {
 		read.Ready = gateway.Ready

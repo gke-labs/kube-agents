@@ -4266,6 +4266,13 @@ type splitWorkloadStatus struct {
 	kind string
 	// ready is the workload's ReadyReplicas; zero when the object is absent.
 	ready int32
+	// detail, when set, follows the name in the Provisioning message: the
+	// A2A gateway's not-ready elected leader (a2aGatewayReadyByLeader).
+	detail string
+	// recheck is how soon the status pass should look again, 0 for no need:
+	// the A2A gateway's leader handover grace, or the follow-up on a
+	// not-ready leader, neither of which an event announces.
+	recheck time.Duration
 }
 
 // readSplitWorkloads reads the shell sandbox StatefulSet and the credential broker
@@ -4405,9 +4412,15 @@ func (r *PlatformAgentReconciler) readSplitWorkloads(ctx context.Context, agent 
 			if a2a.gatewayWaking && gateway.Status.ReadyReplicas == 0 {
 				gatewayCond = a2aGatewayWakingMessage
 			}
-			workloads = append(workloads, splitWorkloadStatus{
-				name: gatewayName, kind: "Deployment", ready: gateway.Status.ReadyReplicas,
-			})
+			// Elected replicas: Ready follows the leader, which alone binds
+			// the relay, rather than a standby that reads Ready
+			// (a2aGatewayReadyByLeader).
+			ready, leader, recheck := r.a2aGatewayReadyByLeader(ctx, agent, gateway, time.Now())
+			w := splitWorkloadStatus{name: gatewayName, kind: "Deployment", ready: ready, recheck: recheck}
+			if leader != "" {
+				w.detail = "(elected leader " + leader + " not ready)"
+			}
+			workloads = append(workloads, w)
 		}
 	}
 
@@ -4794,9 +4807,17 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	}
 	notReady := make([]string, 0, len(splitWorkloads))
 	brokerNotReady := false
+	var splitRecheck time.Duration
 	for _, w := range splitWorkloads {
+		if w.recheck > 0 && (splitRecheck == 0 || w.recheck < splitRecheck) {
+			splitRecheck = w.recheck
+		}
 		if w.ready == 0 {
-			notReady = append(notReady, fmt.Sprintf("%s %s", w.kind, w.name))
+			entry := fmt.Sprintf("%s %s", w.kind, w.name)
+			if w.detail != "" {
+				entry += " " + w.detail
+			}
+			notReady = append(notReady, entry)
 			if w.name == credentialBrokerName(agent) {
 				brokerNotReady = true
 			}
@@ -4893,6 +4914,11 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	// it needs goes back to Reconcile with the phase, so the pass that
 	// writes the reason is scheduled without a second read.
 	a2aTasksWaitMsg, a2aTasksWaitRequeue := r.a2aGatewayTasksWaitMessage(ctx, agent)
+	// The A2A gateway leader's recheck rides the same returned requeue: both
+	// are reads of pods and a Lease that send the operator no event.
+	if splitRecheck > 0 && (a2aTasksWaitRequeue <= 0 || splitRecheck < a2aTasksWaitRequeue) {
+		a2aTasksWaitRequeue = splitRecheck
+	}
 
 	degradedStatus := metav1.ConditionFalse
 	degradedReason := ""
