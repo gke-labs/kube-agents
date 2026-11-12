@@ -696,7 +696,9 @@ command gets Slack's timeout error.
    the gateway with it. For the seconds the gateway pod takes to stop, both can hold a
    connection, and a message the stopping gateway takes gets no answer. The bus volume and its
    credentials Secret stay; [Uninstall](/kube-agents/install/uninstall/#what-specmode-next-leaves-behind)
-   says how to remove them. Wait for the broker, for up to 5 minutes:
+   says how to remove them. The CR keeps `status.busReplicas`, the server count the bus ran, so a
+   switch back to `next` brings the bus back at that count while its volume is still there. Wait for
+   the broker, for up to 5 minutes:
 
    ```bash
    for i in $(seq 30); do

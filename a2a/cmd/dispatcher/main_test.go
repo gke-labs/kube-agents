@@ -100,7 +100,7 @@ func TestTheVerifierAsksProfileRunOnTheCurrentConnection(t *testing.T) {
 	// Nobody answers: no verdict, so the dispatcher holds the submission
 	// rather than rejecting it. It ends within the caller's ctx.
 	nctx, ncancel := context.WithTimeout(ctx, 2*time.Second)
-	err = v.CheckProfileRun(nctx, ref, "tse", "read", "namespace/ka")
+	err = v.CheckProfileRun(nctx, ref, "tse", "read", "namespace/ka", nil)
 	ncancel()
 	if !errors.Is(err, dispatch.ErrVerifierUnreachable) {
 		t.Fatalf("with no verifier, got %v, want ErrVerifierUnreachable", err)
@@ -132,19 +132,19 @@ func TestTheVerifierAsksProfileRunOnTheCurrentConnection(t *testing.T) {
 	// The client replaced its connection: the old one is closed.
 	current.Load().Close()
 	current.Store(dial())
-	if err := v.CheckProfileRun(ctx, ref, "tse", "read", "namespace/ka"); err != nil {
+	if err := v.CheckProfileRun(ctx, ref, "tse", "read", "namespace/ka", nil); err != nil {
 		t.Fatalf("permitted ref: %v", err)
 	}
 	if req := asked.Load(); req == nil || req.Verb != capability.VerbProfileRun || req.Profile != "tse" ||
 		req.Tier != "read" || req.Resource != "namespace/ka" || req.Ref != ref {
 		t.Errorf("the verifier was asked %+v, want profile.run for tse at read on namespace/ka", req)
 	}
-	err = v.CheckProfileRun(ctx, capability.Ref{Key: "cap-bad", Revision: 1}, "tse", "read", "namespace/ka")
+	err = v.CheckProfileRun(ctx, capability.Ref{Key: "cap-bad", Revision: 1}, "tse", "read", "namespace/ka", nil)
 	if !errors.As(err, &r) || capability.Reason(err) != "not this one" || errors.Is(err, dispatch.ErrVerifierUnreachable) {
 		t.Errorf("refused ref: got %v, want the verifier's refusal", err)
 	}
 	current.Store(nil)
-	if err := v.CheckProfileRun(ctx, ref, "tse", "read", "namespace/ka"); !errors.Is(err, dispatch.ErrVerifierUnreachable) {
+	if err := v.CheckProfileRun(ctx, ref, "tse", "read", "namespace/ka", nil); !errors.Is(err, dispatch.ErrVerifierUnreachable) {
 		t.Errorf("with no connection, got %v, want ErrVerifierUnreachable", err)
 	}
 }
