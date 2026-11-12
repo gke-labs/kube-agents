@@ -177,12 +177,13 @@ func UsageTotal(turns []Usage) Usage {
 	return total
 }
 
-// DelegateRequest is the ArtifactDelegate data part's shape: one child task
-// to mint, addressee and the task text. It is also the wire shape the
-// session pod's MCP server sends over the adapter's unix socket (the socket
-// hop is how the call gets from the harness's delegate tool to the adapter
-// that actually publishes the artifact), so it is named here, beside
-// ArtifactDelegate, rather than duplicated per caller.
+// DelegateRequest is the ArtifactDelegate data part's shape: the child tasks
+// to mint, either one (addressee, text and parameters) or a batch (Tasks). It
+// is also the wire shape the session pod's MCP server sends over the
+// adapter's unix socket (the socket hop is how the call gets from the
+// harness's delegate tool to the adapter that actually publishes the
+// artifact), so it is named here, beside ArtifactDelegate, rather than
+// duplicated per caller.
 //
 // Parameters are the child task's parameters (TaskParameters), the target
 // cluster among them. The contract (spec-a2a-payloads.md, "Task parameters
