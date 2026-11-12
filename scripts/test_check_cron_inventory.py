@@ -78,6 +78,29 @@ class StaticCheckTest(unittest.TestCase):
         self.assertGreaterEqual(len(rosters), 30)
 
 
+class RobustnessTest(unittest.TestCase):
+    def test_a_duplicate_id_fails_within_or_across_rosters(self):
+        repo = Repo(self)
+        repo.write(roster(job("a"), job("a", "1 1 * * *")), roster(), inventory(("a", "x")))
+        repo.commit()
+        self.assertTrue(any("`a`" in p and "twice" in p for p in cci.check(repo.root, None)))
+        repo.write(roster(job("a")), roster(job("a", "1 1 * * *")), inventory(("a", "x")))
+        self.assertTrue(any("`a`" in p and "twice" in p for p in cci.check(repo.root, None)))
+
+    def test_no_roster_jobs_at_all_fails(self):
+        repo = Repo(self)
+        (repo.root / "x").write_text("x")
+        repo.commit()
+        self.assertTrue(any("no roster" in p.lower() for p in cci.check(repo.root, None)))
+
+    def test_a_bad_base_ref_is_a_readable_failure(self):
+        repo = Repo(self)
+        repo.write(roster(job("a")), roster(), inventory(("a", "x")))
+        repo.commit()
+        problems = cci.check(repo.root, "origin/nonexistent")
+        self.assertTrue(any("origin/nonexistent" in p for p in problems), problems)
+
+
 class DiffCheckTest(unittest.TestCase):
     def setUp(self):
         self.repo = Repo(self)
@@ -116,6 +139,19 @@ class DiffCheckTest(unittest.TestCase):
                 self.repo.write(roster(job("tick", "* * * * *")), roster(changed),
                                 inventory(("tick", "every minute"), ("audit", "daily")))
                 self.assertEqual(len(self.problems()), 1, name)
+
+    def test_a_non_cron_schedule_change_counts(self):
+        base = job("audit", "20 6 * * *", no_agent=False)
+        base["schedule"] = {"kind": "interval", "minutes": 30, "display": "every 30m"}
+        self.repo.write(roster(job("tick", "* * * * *")), roster(base), inventory(("tick", "every minute"), ("audit", "daily")))
+        self.base = self.repo.commit("interval base")
+        changed = dict(base, schedule={"kind": "interval", "minutes": 60, "display": "every 60m"})
+        self.repo.write(roster(job("tick", "* * * * *")), roster(changed), inventory(("tick", "every minute"), ("audit", "daily")))
+        self.assertEqual(len(self.problems()), 1)
+        # The display string alone isn't a schedule change.
+        relabelled = dict(base, schedule={"kind": "interval", "minutes": 30, "display": "half-hourly"})
+        self.repo.write(roster(job("tick", "* * * * *")), roster(relabelled), inventory(("tick", "every minute"), ("audit", "daily")))
+        self.assertEqual(self.problems(), [])
 
     def test_another_field_changing_needs_no_row_change(self):
         # A prompt edit isn't one the inventory tracks.

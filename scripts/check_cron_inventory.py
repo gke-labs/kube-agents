@@ -39,26 +39,46 @@ ROW = re.compile(r"^\|\s*`([^`]+)`\s*\|")
 
 
 def tracked(entry: dict) -> tuple:
-    """The fields of a roster entry the inventory records the plan for."""
+    """The fields of a roster entry the inventory records the plan for: the whole
+    schedule (any kind) less its display label, the script, no_agent and deliver."""
     schedule = entry.get("schedule")
-    expr = schedule.get("expr") if isinstance(schedule, dict) else schedule
-    return (expr, entry.get("script"), bool(entry.get("no_agent")), entry.get("deliver"))
+    if isinstance(schedule, dict):
+        schedule = json.dumps({k: v for k, v in schedule.items() if k != "display"}, sort_keys=True)
+    return (schedule, entry.get("script"), bool(entry.get("no_agent")), entry.get("deliver"))
 
 
-def parse_roster(text: str) -> dict[str, dict]:
+def parse_roster(text: str) -> list[dict]:
     data = json.loads(text)
     jobs = data.get("jobs", []) if isinstance(data, dict) else data
-    return {j["id"]: j for j in jobs if isinstance(j, dict) and isinstance(j.get("id"), str)}
+    return [j for j in jobs if isinstance(j, dict) and isinstance(j.get("id"), str)]
+
+
+def read_roster_entries(root: Path, ref: str | None = None) -> list[tuple[str, dict]]:
+    """Every (roster file, job) on both rosters, duplicates included."""
+    entries: list[tuple[str, dict]] = []
+    for rel in ROSTERS:
+        text = _show(root, ref, rel) if ref else _read(root / rel)
+        if text is not None:
+            entries += [(rel, j) for j in parse_roster(text)]
+    return entries
 
 
 def read_rosters(root: Path, ref: str | None = None) -> dict[str, dict]:
     """Both rosters' jobs by ID, from the working tree or, with ref, from git."""
-    jobs: dict[str, dict] = {}
-    for rel in ROSTERS:
-        text = _show(root, ref, rel) if ref else _read(root / rel)
-        if text is not None:
-            jobs.update(parse_roster(text))
-    return jobs
+    return {j["id"]: j for _, j in read_roster_entries(root, ref)}
+
+
+def duplicate_problems(entries: list[tuple[str, dict]]) -> list[str]:
+    """A job ID listed twice, in one roster or across both: the second copy would
+    otherwise hide behind the first and escape both checks."""
+    seen: dict[str, str] = {}
+    problems = []
+    for rel, j in entries:
+        if j["id"] in seen:
+            problems.append(f"roster job `{j['id']}` is listed twice ({seen[j['id']]} and {rel}): give the new job its own ID")
+        else:
+            seen[j["id"]] = rel
+    return problems
 
 
 def inventory_rows(text: str) -> dict[str, str]:
@@ -93,12 +113,18 @@ def diff_problems(base_jobs: dict, head_jobs: dict, base_rows: dict, head_rows: 
 
 
 def check(root: Path, base: str | None) -> list[str]:
+    entries = read_roster_entries(root)
+    if not entries:
+        return [f"no roster job found in {' or '.join(ROSTERS)}: the rosters are missing or empty"]
     head_jobs = read_rosters(root)
     head_text = _read(root / INVENTORY) or ""
     head_rows = inventory_rows(head_text)
-    problems = static_problems(head_jobs, head_rows)
+    problems = duplicate_problems(entries) + static_problems(head_jobs, head_rows)
     if base:
-        merge_base = _git(root, "merge-base", base, "HEAD").strip()
+        try:
+            merge_base = _git(root, "merge-base", base, "HEAD").strip()
+        except subprocess.CalledProcessError:
+            return problems + [f"can't find where this branch left {base}: fetch it (git fetch origin <base>) and run again"]
         base_jobs = read_rosters(root, merge_base)
         base_rows = inventory_rows(_show(root, merge_base, INVENTORY) or "")
         problems += diff_problems(base_jobs, head_jobs, base_rows, head_rows)
