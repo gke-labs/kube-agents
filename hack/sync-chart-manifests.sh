@@ -6,6 +6,9 @@
 #     config/rbac/role.yaml: the ClusterRole document between the GENERATED RULES
 #     markers, the namespaced Role document between the GENERATED NAMESPACED RULES
 #     markers.
+#   - k8s-operator/config/profiles/role.yaml is the Role document of config/rbac/role.yaml,
+#     copied whole for the profile namespace's kustomization (kustomize refuses a resource
+#     above its own directory). The one destination under k8s-operator/config/.
 #   - templates/agent-rbac-admission-policy.yaml is config/admission/agent-rbac-policy.yaml
 #     wrapped in the chart's values gate. The chart is the only thing that installs those
 #     policies, so a drifted copy is a backstop nobody applies.

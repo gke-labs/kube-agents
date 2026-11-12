@@ -31,7 +31,8 @@ runs.
 Bucket 1 runs in CI on every pull request, unconditionally — no paths filter.
 A security conformance suite that only runs when someone remembers to add a
 file to a filter is a suite that stops running. It is stdlib `unittest` plus
-PyYAML and takes under a second.
+PyYAML, and `helm` for the one test that reads the chart rendered (C5's
+operator grant); it takes a few seconds.
 
 ## The three buckets
 

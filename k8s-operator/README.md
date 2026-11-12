@@ -233,9 +233,11 @@ Deploy the operator deployment, RBAC permissions, and CRDs into the cluster:
 make deploy IMG=$IMG
 ```
 
-The refused tags and the `ALLOW_MUTABLE_IMG=1` override are on the
+`make deploy` applies `config/default` and then `config/profiles`: the profile namespace
+(`kubeagents-system-profiles`) with the operator's namespaced Role and its RoleBinding in it. The
+refused tags and the `ALLOW_MUTABLE_IMG=1` override are on the
 [operator page](../docs/site/src/content/docs/operator/index.md#an-image-ahead-of-its-clusterrole).
-`make undeploy` removes the deployment.
+`make undeploy` removes the deployment and the profile namespace.
 
 ### Step 3: Verify the Deployment
 

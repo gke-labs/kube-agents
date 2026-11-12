@@ -94,8 +94,8 @@ const (
 	// a Role and RoleBinding nobody installs by default. A RoleBinding can name
 	// a Role in its own namespace only, so the Role is copied, not referenced.
 	rbacAgentNamespaceCause = "a denial marked (in namespace ...) means that namespace has no copy of the " +
-		"operator's namespaced Role and no RoleBinding to it; create both there (the chart renders them " +
-		"in the install namespace and, under mode next, in its profile namespace)"
+		"operator's namespaced Role and no RoleBinding to it; create both there (the chart and make deploy " +
+		"render them in the install namespace and in its profile namespace)"
 	// rbacAgentNamespaceLabelMark is the substring of a denied label that names
 	// an agent namespace (rbacAgentNamespaceLabelFormat's opening), which
 	// rbacIncompleteMessage looks for to add rbacAgentNamespaceCause.
@@ -116,9 +116,10 @@ const (
 	// namespace, when that is not the operator's, and for its profile namespace:
 	// "create secrets (in namespace team-a)", "create deployments.apps (in
 	// namespace kubeagents-system-profiles)". The namespaced Role is bound in
-	// the install namespace by both install paths and, under mode next, in the
-	// profile namespace by the chart; those two namespaces, and an agent
-	// elsewhere, are what the operator-namespace probe cannot see.
+	// the install namespace and the profile namespace by both install paths
+	// (the chart under mode next, make deploy in every mode); those two
+	// namespaces, and an agent elsewhere, are what the operator-namespace
+	// probe cannot see.
 	rbacAgentNamespaceLabelFormat = " (in namespace %s)"
 )
 

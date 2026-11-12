@@ -791,8 +791,9 @@ type PlatformAgentReconciler struct {
 // nothing. Both are namespaced, reads included: no informer watches a
 // DispatchJobTemplate (every read goes through a2aReader(), uncached, in the
 // profile namespace) and no Role the operator renders grants the kind, so
-// nothing needs the grant cluster-wide. The chart creates the profile
-// namespace and binds the namespaced Role there in the same release, which
+// nothing needs the grant cluster-wide. The install creates the profile
+// namespace and binds the namespaced Role there in the same apply (the
+// chart under mode next, config/profiles under make deploy), which
 // is what lets a namespaced grant reach it (the ClusterRole form approved by
 // @bnaylor on 2026-10-30 and 2026-10-31, #3655 PR 6, predates that binding).
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=dispatchjobtemplates,verbs=get;list;create;update;patch;delete,namespace=kubeagents-system

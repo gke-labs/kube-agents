@@ -1,11 +1,15 @@
 # The Operator's Namespaced Write Verbs
 
-> **STATUS — proposed; awaiting a ruling.** Pull request #5145 (merged 2026-11-11 as `e5285b4a4`;
-> it closes #4906) moved the Secret write verbs off the operator ClusterRole into a namespaced Role
-> in the install namespace. This document is the follow-up that change named: the write verbs on
-> every other namespaced kind the operator renders. It lays out the two shapes the review thread
-> raised, the guard each needs, and a recommendation. Nothing here ships until an owner rules; the
-> implementation is prepared on a branch and opens after the ruling.
+> **STATUS — design of record; shape (a) implemented.** Pull request #5145 (merged 2026-11-11 as
+> `e5285b4a4`; it closes #4906) moved the Secret write verbs off the operator ClusterRole into a
+> namespaced Role in the install namespace. This document is the follow-up that change named: the
+> write verbs on every other namespaced kind the operator renders. Shape (a), §3, is what ships:
+> the write verbs are the namespaced Role, bound in the install namespace and the profile namespace
+> on both install paths, with one Role document for both namespaces (decision 3). The ruling
+> between the two shapes on the tracking issue is still open, as is decision 2; the switch to
+> shape (b) is a kind change in the chart template, the kustomize `allowKindChange` patch, the
+> guard flip in §4, and dropping the profile Role copy. §1 and §2 describe the ClusterRole as it
+> was before the move.
 
 **Scope:** which verbs on the operator's ClusterRole (`k8s-operator/config/rbac/role.yaml`,
 rendered from the `+kubebuilder:rbac` markers in
@@ -294,11 +298,12 @@ way.
 
 ## 8. Decisions for the owner
 
-1. Shape (a) or (b).
+1. Shape (a) or (b). Shape (a) is implemented; the ruling may still switch it (the banner names
+   the switch).
 2. Whether the webhook should also refuse a `PlatformAgent` outside the operator's namespace. Yes
    removes the only hand-managed case from shape (a); no keeps today's behaviour and the
-   `RBACIncomplete` disclosure.
-3. One Role document for both namespaces, or a narrower profile-namespace document (the profile
+   `RBACIncomplete` disclosure. Open.
+3. One Role document for both namespaces (implemented), or a narrower profile-namespace document (the profile
    namespace needs ConfigMaps, ServiceAccounts, Deployments, ResourceQuotas, NetworkPolicies, Roles,
    RoleBindings, Jobs, PodTemplates and DispatchJobTemplates; not Secrets, Services, PVCs,
    StatefulSets, Leases, PodDisruptionBudgets or FQDNNetworkPolicies). One document is one marker

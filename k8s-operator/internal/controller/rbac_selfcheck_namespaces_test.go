@@ -104,6 +104,52 @@ func TestTheProbeCoversEveryAgentNamespaceItHasHeardOf(t *testing.T) {
 	}
 }
 
+// The fence pass is where the reconcile learns the profile namespace exists,
+// so it is where the self-check starts probing it, and the pass that finds
+// it gone (a flip to today removes it with its RoleBinding) is where the
+// probing stops, or the agent would carry a denial for a namespace it no
+// longer writes in.
+func TestTheProfileFenceObservesAndForgetsTheProfileNamespace(t *testing.T) {
+	const operatorNamespace = "kubeagents-system"
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+	agent.Namespace = operatorNamespace
+	profileNamespace := profileNamespaceObject(agent)
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, profileNamespace).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	checker := NewRBACChecker(secretsOnlyIn(operatorNamespace).reviews(), operatorNamespace)
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, RBAC: checker, OperatorNamespace: operatorNamespace}
+	ctx := context.Background()
+
+	fenced, err := r.reconcileProfileFence(ctx, agent, nil)
+	if err != nil || !fenced {
+		t.Fatalf("reconcileProfileFence over a ready namespace = (%v, %v), want (true, nil)", fenced, err)
+	}
+	if !slices.Contains(checker.sortedAgentNamespaces(), profileNamespaceName(agent)) {
+		t.Fatalf("the fence pass did not observe the profile namespace; probed: %v", checker.sortedAgentNamespaces())
+	}
+	if got := checker.DeniedFor(agent.Namespace, profileNamespaceName(agent)); len(got) == 0 {
+		t.Fatal("an unbound profile namespace must be a denial once the fence pass has seen it")
+	}
+
+	if err := cl.Delete(ctx, profileNamespace); err != nil {
+		t.Fatalf("delete the profile namespace: %v", err)
+	}
+	fenced, err = r.reconcileProfileFence(ctx, agent, nil)
+	if err != nil || fenced {
+		t.Fatalf("reconcileProfileFence over an absent namespace = (%v, %v), want (false, nil)", fenced, err)
+	}
+	if slices.Contains(checker.sortedAgentNamespaces(), profileNamespaceName(agent)) {
+		t.Errorf("the fence pass over an absent namespace must forget it; probed: %v", checker.sortedAgentNamespaces())
+	}
+	if got := checker.DeniedFor(agent.Namespace, profileNamespaceName(agent)); len(got) != 0 {
+		t.Errorf("a forgotten profile namespace must carry no standing denial; got %v", got)
+	}
+}
+
 // The profile namespace is the second namespace the chart binds the Role in.
 // reconcileProfileFence observes it once it exists; from then on its denials
 // are the agent's own (DeniedFor takes both namespaces), labelled with the
@@ -227,13 +273,18 @@ func TestReconcileReportsAMissingRoleBindingInTheAgentsNamespace(t *testing.T) {
 		t.Errorf("condition message %q blames image skew for a denial that is only the agent's namespace", degraded.Message)
 	}
 
-	// Deleting the agent forgets its namespace: the denial must not stand
-	// against whatever reconciles next, and the namespace is not probed again.
+	// Deleting the agent forgets its namespace and its profile namespace:
+	// the denials must not stand against whatever reconciles next, and
+	// neither namespace is probed again.
+	checker.Observe(profileNamespaceName(stored))
+	if got := checker.DeniedFor(stored.Namespace, profileNamespaceName(stored)); len(got) == 0 {
+		t.Fatal("the observed profile namespace must be a denial before deletion")
+	}
 	if _, err := r.handleDeletion(ctx, stored); err != nil {
 		t.Fatalf("handleDeletion: %v", err)
 	}
-	if got := checker.DeniedFor("team-a"); len(got) != 0 {
-		t.Errorf("after deletion the checker still holds team-a's denials: %v", got)
+	if got := checker.DeniedFor("team-a", profileNamespaceName(stored)); len(got) != 0 {
+		t.Errorf("after deletion the checker still holds team-a's or its profile namespace's denials: %v", got)
 	}
 	if _, err := checker.Probe(ctx); err != nil {
 		t.Fatalf("probe after deletion: %v", err)

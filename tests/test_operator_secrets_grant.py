@@ -259,8 +259,8 @@ def _render_kustomize(*dirs: Path) -> list[dict]:
 
 class OperatorSecretsGrantTest(unittest.TestCase):
     def test_no_shipped_manifest_places_a_platformagent_outside_the_install_namespace(self):
-        # The operator's Secret write verbs are bound in the install namespace
-        # only, so a PlatformAgent a user copies from the docs or samples has
+        # The operator's write verbs are bound in the install namespace and its
+        # profile namespace only, so a PlatformAgent a user copies from the docs or samples has
         # to be there: anywhere else its first kube-proxy TLS Secret write is
         # forbidden and the agent sits Degraded/RBACIncomplete. This reads
         # every tracked YAML file and every fenced YAML block under the
@@ -278,7 +278,6 @@ class OperatorSecretsGrantTest(unittest.TestCase):
                     f"in {INSTALL_NAMESPACE} only",
                 )
 
-    @unittest.skipUnless(shutil.which("helm") and shutil.which("kubectl"), "helm and kubectl needed")
     def _assert_role_bound_in(self, path: str, documents: list[dict], namespaces: set[str]) -> None:
         # On a render: one Role naming secrets per expected namespace and no
         # other, and in each namespace exactly one RoleBinding names that Role
@@ -326,6 +325,7 @@ class OperatorSecretsGrantTest(unittest.TestCase):
                 f"ServiceAccount {operator_sa} in {INSTALL_NAMESPACE}; subjects={subjects}",
             )
 
+    @unittest.skipUnless(shutil.which("helm") and shutil.which("kubectl"), "helm and kubectl needed")
     def test_the_namespaced_role_is_bound_to_the_operator_on_both_delivery_paths(self):
         # The Role's verbs are pinned above; this pins that something binds it,
         # in the install namespace alone on a stock render.
@@ -333,6 +333,7 @@ class OperatorSecretsGrantTest(unittest.TestCase):
             with self.subTest(path=path):
                 self._assert_role_bound_in(path, documents, {INSTALL_NAMESPACE})
 
+    @unittest.skipUnless(shutil.which("helm") and shutil.which("kubectl"), "helm and kubectl needed")
     def test_the_namespaced_role_is_bound_in_the_profile_namespace_too(self):
         # Under mode next the chart creates the profile namespace and renders
         # the Role and its binding there as well; the kustomize path's

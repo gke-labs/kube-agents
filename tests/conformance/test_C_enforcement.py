@@ -2820,11 +2820,10 @@ class C5PrivilegedControllersAreBounded(unittest.TestCase):
     #   system:auth-delegator, which carries subjectaccessreviews too.
     WRITE_CAPABLE_ROLE_PREFIXES = ("kubeagents:leader:", "kubeagents:tokenreview:")
 
-    # The two halves of the operator's Secret grant. The reads are the
-    # ClusterRole's: escalation prevention needs the operator to hold what the
-    # agent's `minimal` role grants. The writes are the namespaced Role's:
-    # by-name writes in one namespace are the whole grant.
-    OPERATOR_SECRET_READ_VERBS = frozenset({"get", "list", "watch"})
+    # The write half of the operator's Secret grant, the namespaced Role's:
+    # by-name writes in the two namespaces are the whole grant. The reads are
+    # the ClusterRole's (READ_VERBS above): escalation prevention needs the
+    # operator to hold what the agent's `minimal` role grants.
     OPERATOR_SECRET_WRITE_VERBS = frozenset({"create", "update", "patch", "delete"})
 
     # Every namespaced kind the operator renders, as (apiGroup, resource): the
@@ -2944,7 +2943,11 @@ class C5PrivilegedControllersAreBounded(unittest.TestCase):
                     for role in h.objects_of_kind(documents, "Role")
                     if secret_rules(role)
                 ]
-                expected = namespaces or {granting[0][0]["metadata"].get("namespace")} if granting else set()
+                self.assertTrue(
+                    granting,
+                    f"{source}: no Role names secrets; the Role document is missing or lost its Secret rule",
+                )
+                expected = namespaces or {granting[0][0]["metadata"].get("namespace")}
                 self.assertEqual(
                     expected,
                     {role["metadata"].get("namespace") for role, _ in granting},
