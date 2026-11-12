@@ -244,6 +244,12 @@ func TestReconcileReportsAMissingRoleBindingInTheAgentsNamespace(t *testing.T) {
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
 	ctx := context.Background()
 
+	// A today agent writes nothing in its profile namespace, so a reconcile
+	// under today forgets one the checker was told about (a flip from next,
+	// whose chart upgrade removes the namespace and its RoleBinding), or the
+	// agent would carry a denial for a namespace it no longer writes in.
+	checker.Observe(profileNamespaceName(agent))
+
 	// The first reconcile tells the checker about team-a, and the status
 	// has to follow in that same pass: an agent whose reconcile makes no
 	// Secret write (the upgrade case, where the kube-proxy TLS Secret already
@@ -251,6 +257,9 @@ func TestReconcileReportsAMissingRoleBindingInTheAgentsNamespace(t *testing.T) {
 	// minutes away. No probe between the two lines, by design of the test.
 	if _, err := r.Reconcile(ctx, req); err != nil {
 		t.Fatalf("first reconcile: %v", err)
+	}
+	if slices.Contains(checker.sortedAgentNamespaces(), profileNamespaceName(agent)) {
+		t.Errorf("a reconcile under today must forget the profile namespace; probed: %v", checker.sortedAgentNamespaces())
 	}
 
 	stored := &agentv1alpha1.PlatformAgent{}

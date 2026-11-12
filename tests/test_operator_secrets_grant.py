@@ -104,15 +104,16 @@ CLUSTER_ROLE_KIND = "ClusterRole"
 ROLE_KIND = "Role"
 # The ClusterRole half: what escalation prevention needs the operator to hold.
 CLUSTER_SECRET_VERBS = {"get", "list", "watch"}
-# The Role half: what the operator writes, in the install namespace only.
+# The Role half: what the operator writes, in the install namespace and the
+# profile namespace only.
 NAMESPACED_SECRET_VERBS = {"create", "update", "patch", "delete"}
 # One marker per document; both name `secrets` alone.
 SECRET_MARKER_COUNT = 2
 CONTROLLER_DIR = REPO_ROOT / "k8s-operator" / "internal" / "controller"
 IGNORE_PATH = REPO_ROOT / ".trivyignore.yaml"
 SECRETS_MISCONFIG_ID = "KSV-0041"
-# The namespace both install paths place the PlatformAgent in, and the only
-# one where the operator's namespaced Role is bound.
+# The namespace both install paths place the PlatformAgent in; the operator's
+# namespaced Role is bound here and in its profile namespace.
 INSTALL_NAMESPACE = "kubeagents-system"
 KUSTOMIZE_DEFAULT_DIR = REPO_ROOT / "k8s-operator" / "config" / "default"
 # The profile namespace and the kustomization that renders the Role copy there;

@@ -666,8 +666,8 @@ type PlatformAgentReconciler struct {
 	// (reportA2AProvisionFindings). VolumesDropped went to a condition when
 	// there was no recorder, and it stays one, because it is also a state the
 	// render re-derives on every pass. An Event costs create;patch on events
-	// in the ClusterRole, which the RBAC self-check names when an image runs
-	// ahead of its role.
+	// in the namespaced Role (the Event lands in the agent's namespace),
+	// which the RBAC self-check names when an image runs ahead of its role.
 	Recorder record.EventRecorder
 
 	// busConfigLoadTime stands in for reading the A2A bus's config_load_time
@@ -1389,6 +1389,12 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if err != nil {
 			return ctrl.Result{}, err
 		}
+		// Under today the operator writes nothing in the profile namespace,
+		// and a chart upgrade after a flip from next removes it with its
+		// RoleBinding. The fence pass that would forget it never runs here,
+		// so forget it on this branch, or the self-check keeps probing a
+		// namespace this agent no longer writes in and reports it denied.
+		r.RBAC.Forget(profileNamespaceName(instance))
 		// The bus is torn down but its data claims are kept, so that a flip
 		// back reuses them, and so is the count it last ran at (#5451): with
 		// no record, the flip back reads the claims, and a single server once
