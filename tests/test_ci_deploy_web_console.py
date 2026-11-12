@@ -16,9 +16,10 @@ port-forward, with `kubectl` stubbed: every route answering passes; a 403 on
 the chat route fails at once naming it; a 504 followed by a 200 is retried
 through a fresh tunnel; a read route whose body lacks a key the page reads,
 or is not JSON, fails naming the route; a Degraded CR after the turn fails;
-a rollout that never finishes fails before any request. The routes, keys,
-header and session shape the gate uses are pinned against the console's Go
-source, and hack/rollback-roundtrip.sh's copies against the deploy's.
+a rollout that never finishes fails before any request. The requests
+themselves are hack/web-console-probe.sh's, which hack/rollback-roundtrip.sh
+sources too; its routes, keys, header and session shape are pinned against
+the console's Go source.
 """
 
 import http.server
@@ -38,6 +39,7 @@ from tests.test_ci_deploy_rc_images import fake_candidate_tree
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _CI_DEPLOY = _REPO_ROOT / "hack" / "ci-deploy.sh"
 _ROLLBACK = _REPO_ROOT / "hack" / "rollback-roundtrip.sh"
+_PROBE = _REPO_ROOT / "hack" / "web-console-probe.sh"
 _CLOUDBUILD = _REPO_ROOT / "deploy" / "docker" / "cloudbuild-ci.yaml"
 _CONSOLE_DIR = _REPO_ROOT / "a2a" / "cmd" / "web-console"
 _CONSOLE_MAIN = _CONSOLE_DIR / "main.go"
@@ -296,7 +298,7 @@ class SourcePinsTest(unittest.TestCase):
     failure here rather than a red lane."""
 
     def test_the_routes_header_and_session_shape_are_the_consoles(self) -> None:
-        consts = constants(_CI_DEPLOY)
+        consts = constants(_PROBE)
         main_go = text(_CONSOLE_MAIN)
         self.assertEqual(consts["WEB_CONSOLE_READ_ROUTES"].split(), list(_READ_ROUTES))
         for route in ("/api/insights", "/api/environment", "/api/models", "/api/repositories", "/api/patches"):
@@ -318,7 +320,7 @@ class SourcePinsTest(unittest.TestCase):
         self.assertIn('"scheduled"', text(_CONSOLE_DIR / "channels.go"))
 
     def test_the_keys_are_the_responses(self) -> None:
-        consts = constants(_CI_DEPLOY)
+        consts = constants(_PROBE)
         self.assertEqual(consts["WEB_CONSOLE_INSIGHTS_KEYS"].split(), ["cluster"])
         self.assertIn('`json:"cluster"`', text(_CONSOLE_INSIGHTS))
         self.assertEqual(consts["WEB_CONSOLE_ENVIRONMENT_KEYS"].split(), ["versions", "counts"])
@@ -326,10 +328,12 @@ class SourcePinsTest(unittest.TestCase):
             self.assertIn(f'`json:"{key}"`', text(_CONSOLE_ENVIRONMENT))
         main_go = text(_CONSOLE_MAIN)
         self.assertEqual(consts["WEB_CONSOLE_CHAT_KEYS"].split(), ["session_id", "reply"])
-        self.assertIn('Reply     string `json:"reply"`', main_go)
+        # \s+ rather than the literal run of spaces: that is gofmt's alignment
+        # to the struct's longest field, not the key.
+        self.assertRegex(main_go, r'Reply\s+string\s+`json:"reply"`')
         self.assertEqual(consts["WEB_CONSOLE_MESSAGES_KEYS"].split(), ["messages"])
-        self.assertIn('Messages  []sessionMessage `json:"messages"`', main_go)
-        self.assertIn('Role      string        `json:"role"`', main_go)
+        self.assertRegex(main_go, r'Messages\s+\[\]sessionMessage\s+`json:"messages"`')
+        self.assertRegex(main_go, r'Role\s+string\s+`json:"role"`')
         self.assertEqual(consts["WEB_CONSOLE_ROLE_ASSISTANT"], go_constant(_CONSOLE_MAIN, "roleAssistant"))
 
     def test_the_console_is_named_and_ported_as_the_chart_renders_it(self) -> None:
@@ -348,33 +352,19 @@ class SourcePinsTest(unittest.TestCase):
         self.assertIsNotNone(turn_timeout)
         self.assertGreater(int(consts["WEB_CONSOLE_CHAT_MAX_TIME_SECONDS"]), int(turn_timeout.group(1)))
 
-    def test_the_round_trip_checks_what_the_deploy_checks(self) -> None:
-        deploy, rollback = constants(_CI_DEPLOY), constants(_ROLLBACK)
-        for name in (
-            "WEB_CONSOLE_PORT",
-            "WEB_CONSOLE_HEADER",
-            "WEB_CONSOLE_HEALTH_PATH",
-            "WEB_CONSOLE_PAGE_PATH",
-            "WEB_CONSOLE_PAGE_MARKER",
-            "WEB_CONSOLE_READ_ROUTES",
-            "WEB_CONSOLE_INSIGHTS_PATH",
-            "WEB_CONSOLE_INSIGHTS_KEYS",
-            "WEB_CONSOLE_ENVIRONMENT_PATH",
-            "WEB_CONSOLE_ENVIRONMENT_KEYS",
-            "WEB_CONSOLE_CHAT_PATH",
-            "WEB_CONSOLE_CHAT_KEYS",
-            "WEB_CONSOLE_MESSAGES_PATH_FORMAT",
-            "WEB_CONSOLE_MESSAGES_KEYS",
-            "WEB_CONSOLE_SESSION_ID_PREFIX",
-            "WEB_CONSOLE_SESSION_ID_HEX_BYTES",
-            "WEB_CONSOLE_CHAT_PROMPT",
-            "WEB_CONSOLE_ROLE_USER",
-            "WEB_CONSOLE_ROLE_ASSISTANT",
-        ):
-            with self.subTest(constant=name):
-                self.assertEqual(rollback[name], deploy[name])
-        self.assertEqual(rollback["WEB_CONSOLE_NAME_DEFAULT"], f"{deploy['HELM_RELEASE_NAME']}-web-console")
-        self.assertGreater(int(rollback["DEFAULT_CONSOLE_TURN_TIMEOUT"]), 300)
+    def test_the_round_trip_runs_the_same_probe_as_the_deploy(self) -> None:
+        """One copy of the requests and the judgement, sourced by both; a
+        second copy in either script would be the drift this test exists for."""
+        deploy, rollback, probe = text(_CI_DEPLOY), text(_ROLLBACK), text(_PROBE)
+        for script in (deploy, rollback):
+            self.assertIn('source "${SCRIPT_DIR}/web-console-probe.sh"', script)
+            for function in ("web_console_request", "web_console_expect_json", "web_console_expect_roles", "web_console_probe"):
+                self.assertNotIn(f"{function}() {{", script)
+                self.assertIn(f"{function}() {{", probe)
+            self.assertIn("web_console_probe ", script)
+        self.assertEqual(constants(_ROLLBACK)["WEB_CONSOLE_PORT"], constants(_CI_DEPLOY)["WEB_CONSOLE_PORT"])
+        self.assertEqual(constants(_ROLLBACK)["WEB_CONSOLE_NAME_DEFAULT"], f"{constants(_CI_DEPLOY)['HELM_RELEASE_NAME']}-web-console")
+        self.assertGreater(int(constants(_ROLLBACK)["DEFAULT_CONSOLE_TURN_TIMEOUT"]), 300)
 
 
 class _Console(http.server.BaseHTTPRequestHandler):
@@ -491,6 +481,7 @@ class GateTest(unittest.TestCase):
                 '  esac',
                 '  return 0',
                 '}',
+                f'source "{_PROBE}"',
                 constants_block(
                     WEB_CONSOLE_LOCAL_PORT=str(self.server.server_address[1]),
                     WEB_CONSOLE_POLL_SECONDS="0",
@@ -584,10 +575,15 @@ class GateTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("ERROR: the web console failed under today: /: HTTP 200 but the body is not the console page (no <html): service unavailable", result.stdout)
 
-    def test_a_session_without_the_assistants_row_fails(self) -> None:
+    def test_a_session_without_the_assistants_row_gets_another_turn_then_fails(self) -> None:
+        """A turn that ended with no text is the model's doing, not the
+        tunnel's, so it gets the attempts a 504 gets before the gate fails."""
         result = self.run_gate(messages_no_assistant=True)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertRegex(result.stdout, r"web console attempt 1/5 \(today\) failed: /api/sessions/web-console-[0-9a-f]{32}/messages: HTTP 200 but no assistant row among 1 message\(s\) \(roles: user\); respawning the tunnel")
         self.assertRegex(result.stdout, r"ERROR: the web console failed under today: /api/sessions/web-console-[0-9a-f]{32}/messages: HTTP 200 but no assistant row among 1 message\(s\) \(roles: user\)")
+        self.assertEqual(len(self.kubectl_calls("port-forward")), 5)
+        self.assertEqual(len(self.chat_calls), 5)
 
     def test_a_degraded_cr_after_the_turn_fails(self) -> None:
         result = self.run_gate(cr=_CR_DEGRADED)

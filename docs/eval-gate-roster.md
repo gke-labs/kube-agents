@@ -790,10 +790,13 @@ optional `pull-kube-agents-smoke-test-today` (on demand with `/test`, and on its
 request touches `hack/rollback-roundtrip.sh` or the operator's A2A reconciliation). It runs with `EVAL_ROLLBACK_LANE=1`:
 the deploy brings the install up under `next`, `hack/rollback-roundtrip.sh` takes it to `today`,
 back to `next` and to `today` again before the matrix, and a rollback that fails reds the run.
-Every deploy installs the web console and gates it under `today` and `next` (a chat turn through
-it and its read routes), and the round trip repeats those checks after each flip.
 The matrix is the presubmit's, roster included, so a case graded only over the api transport is
 graded there, but the job does not block a merge.
+
+Every lane's deploy installs the web console and gates it (its read routes and a chat turn through
+it): under `today` on every deploy, and under `next` as well on a deploy that runs with
+`EVAL_MODE_NEXT=1`; the round trip repeats the same checks before its first flip and after each
+leg, and skips them on an install that has no console.
 
 A check the transport blinds is the scorer's business. The harness reads no card ids, no worker's
 entries and no results off the door's trace. The delegation wait now reads the cards and the workers from the pod

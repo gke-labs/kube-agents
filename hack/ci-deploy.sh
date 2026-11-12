@@ -448,55 +448,26 @@ readonly WEB_CONSOLE_PORT=8080
 # The local end of the gate's port-forward.
 readonly WEB_CONSOLE_LOCAL_PORT=18080
 readonly WEB_CONSOLE_PF_LOG="/tmp/pf-web-console.log"
-# The console refuses a Host that is not loopback and a POST without this
-# header (requireLocalHost and requireConsoleRequest in
-# a2a/cmd/web-console/main.go); the port-forward gives it the first.
-readonly WEB_CONSOLE_HEADER="X-Kube-Agents-Console: 1"
-readonly WEB_CONSOLE_HEALTH_PATH="/healthz"
-# The page itself, which the gate reads for this marker.
-readonly WEB_CONSOLE_PAGE_PATH="/"
-readonly WEB_CONSOLE_PAGE_MARKER="<html"
-# The read routes the gate GETs, each answering 200 with a JSON object, and
-# the keys the two metadata routes carry (insightsResponse in insights.go,
-# environmentResponse in environment.go).
-readonly WEB_CONSOLE_READ_ROUTES="/api/insights /api/environment /api/channels/alerts/posts /api/channels/scheduled/posts /api/models /api/repositories /api/patches"
-readonly WEB_CONSOLE_INSIGHTS_PATH="/api/insights"
-readonly WEB_CONSOLE_INSIGHTS_KEYS="cluster"
-readonly WEB_CONSOLE_ENVIRONMENT_PATH="/api/environment"
-readonly WEB_CONSOLE_ENVIRONMENT_KEYS="versions counts"
-# One turn through the console (chatRequest, chatResponse), into a session id
-# of the console's own shape (sessionIDPattern: the prefix and 32 hex digits),
-# then the session's messages (sessionMessagesResponse), which must show the
-# user's row and the assistant's.
-readonly WEB_CONSOLE_CHAT_PATH="/api/chat"
-readonly WEB_CONSOLE_CHAT_KEYS="session_id reply"
-readonly WEB_CONSOLE_MESSAGES_PATH_FORMAT="/api/sessions/%s/messages"
-readonly WEB_CONSOLE_MESSAGES_KEYS="messages"
-readonly WEB_CONSOLE_SESSION_ID_PREFIX="web-console-"
-readonly WEB_CONSOLE_SESSION_ID_HEX_BYTES=16
-readonly WEB_CONSOLE_CHAT_PROMPT="Reply with the single word pong. Do not run any tools."
-readonly WEB_CONSOLE_ROLE_USER="user"
-readonly WEB_CONSOLE_ROLE_ASSISTANT="assistant"
+# What the gate reads and sends through the tunnel (the routes, the keys, the
+# header, the turn and the session shape) is hack/web-console-probe.sh's,
+# sourced in section 2 and shared with the round trip.
 readonly WEB_CONSOLE_ROLLOUT_TIMEOUT="600s"
 readonly WEB_CONSOLE_EXISTS_ATTEMPTS=60
 readonly WEB_CONSOLE_POLL_SECONDS=5
 # Every attempt gets a fresh tunnel (step 7 says why) after this pause; a
 # read route gets a bounded wait; the chat turn's deadline outlasts the
 # console's own turn timeout (turnTimeout, 300 s), after which the console
-# answers 504 and the next attempt sends another turn. A 4xx, or a 200 whose
+# answers 504 and the next attempt sends another turn, so a quota backoff
+# that outlasts one turn is spent across attempts (five of them give the
+# turn more than three times step 7's own deadline). A 4xx, or a 200 whose
 # body is not what the route returns, is not retried: a fresh tunnel would not
-# change it.
+# change it (web_console_probe says which is which).
 readonly WEB_CONSOLE_GATE_ATTEMPTS=5
 readonly WEB_CONSOLE_RETRY_SECONDS=10
 readonly WEB_CONSOLE_PORT_FORWARD_WAIT_SECONDS=30
 readonly WEB_CONSOLE_ROUTE_MAX_TIME_SECONDS=60
 readonly WEB_CONSOLE_CHAT_MAX_TIME_SECONDS=330
-# web_console_expect_json's return for an answer a fresh tunnel may change
-# (no answer, or a 5xx); 1 is the one it would not.
-readonly WEB_CONSOLE_PROBE_RETRY=2
-# How much of a body the failure line quotes, and of the console's log the
-# failure dump shows.
-readonly WEB_CONSOLE_DETAIL_BYTES=300
+# How much of the console's log the failure dump shows.
 readonly WEB_CONSOLE_DIAG_LOG_LINES=100
 # How many reads, WEB_CONSOLE_POLL_SECONDS apart, a Degraded CR phase gets to
 # clear after the turn before the gate fails on it: the operator rewrites the
@@ -801,6 +772,9 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/ci-env.sh"
 source "${SCRIPT_DIR}/../tags.env"
+# The web console probe the gate in 6a runs, shared with the round trip.
+# shellcheck source=hack/web-console-probe.sh
+source "${SCRIPT_DIR}/web-console-probe.sh"
 # EVAL_REPLAY_SHADOW and its bucket and job tags (resolve_replay_shadow in
 # ci-env.sh), checked before anything is built, the way the session-affinity
 # settings are above.
@@ -2399,158 +2373,22 @@ echo "✓ Rollout verification finished in $((SECONDS - STEP_START))s"
 # gate carries none: it sends what a browser sends, the loopback Host the
 # tunnel gives it and the console's own header on the POST.
 #
-# Fresh tunnel per attempt, as step 7, and the same split of answers: no
-# answer or a 5xx (the console's own 502 for an agent it could not reach, 503
-# for a busy one, 504 for a turn past its timeout) is worth another attempt;
-# a 4xx, or a 200 whose body is not what the route returns, is not, since the
-# same request through a fresh tunnel gets the same answer. The failure line
-# names the route and quotes the start of its body; the console's log and the
-# CR's status follow it.
+# The requests themselves are hack/web-console-probe.sh's (web_console_probe,
+# shared with the round trip so the two cannot drift). Fresh tunnel per
+# attempt, as step 7, and the probe's split of answers: no answer, a 5xx (the
+# console's own 502 for an agent it could not reach, 503 for a busy one, 504
+# for a turn past its timeout) or a turn that ended with no assistant text is
+# worth another attempt; a 4xx, or a 200 whose body is not what the route
+# returns, is not, since the same request through a fresh tunnel gets the
+# same answer. The failure line names the route and quotes the start of its
+# body; the console's log and the CR's status follow it.
 WEB_CONSOLE_PF_PID=""
-WEB_CONSOLE_STATUS=""
-WEB_CONSOLE_DETAIL=""
-WEB_CONSOLE_BODY_FILE=""
 stop_web_console_port_forward() {
   if [ -n "${WEB_CONSOLE_PF_PID}" ]; then
     kill "${WEB_CONSOLE_PF_PID}" 2>/dev/null || true
     wait "${WEB_CONSOLE_PF_PID}" 2>/dev/null || true
     WEB_CONSOLE_PF_PID=""
   fi
-}
-
-# One request through the tunnel. WEB_CONSOLE_STATUS is the HTTP status (000
-# when nothing answered inside the deadline); the body is in
-# WEB_CONSOLE_BODY_FILE. A body makes it a console POST: the header and the
-# JSON content type requireConsoleRequest asks for.
-web_console_request() { # <method> <path> <max-time seconds> [JSON body]
-  local method="$1" path="$2" max_time="$3" body="${4:-}"
-  local -a args=(-s -o "${WEB_CONSOLE_BODY_FILE}" -w '%{http_code}' --max-time "${max_time}" -X "${method}")
-  if [ -n "${body}" ]; then
-    args+=(-H "${WEB_CONSOLE_HEADER}" -H "Content-Type: application/json" -d "${body}")
-  fi
-  : >"${WEB_CONSOLE_BODY_FILE}"
-  WEB_CONSOLE_STATUS="$(curl "${args[@]}" "http://127.0.0.1:${WEB_CONSOLE_LOCAL_PORT}${path}" 2>/dev/null || true)"
-  WEB_CONSOLE_STATUS="${WEB_CONSOLE_STATUS:-000}"
-}
-
-# The start of the last body, on one line, for a failure line.
-web_console_body_excerpt() {
-  head -c "${WEB_CONSOLE_DETAIL_BYTES}" "${WEB_CONSOLE_BODY_FILE}" 2>/dev/null | tr '\n' ' '
-}
-
-# Judges the last answer: 0 for a 200 whose body is a JSON object carrying
-# every key named; WEB_CONSOLE_PROBE_RETRY for no answer or a 5xx; 1 for
-# anything else. WEB_CONSOLE_DETAIL says which, naming the route.
-web_console_expect_json() { # <path> [key...]
-  local path="$1" why
-  shift
-  case "${WEB_CONSOLE_STATUS}" in
-    200) ;;
-    000)
-      WEB_CONSOLE_DETAIL="${path}: no answer (the tunnel dropped, or nothing came within the deadline)"
-      return "${WEB_CONSOLE_PROBE_RETRY}"
-      ;;
-    5??)
-      WEB_CONSOLE_DETAIL="${path}: HTTP ${WEB_CONSOLE_STATUS}: $(web_console_body_excerpt)"
-      return "${WEB_CONSOLE_PROBE_RETRY}"
-      ;;
-    *)
-      WEB_CONSOLE_DETAIL="${path}: HTTP ${WEB_CONSOLE_STATUS}: $(web_console_body_excerpt)"
-      return 1
-      ;;
-  esac
-  if ! why="$(python3 - "${WEB_CONSOLE_BODY_FILE}" "$@" <<'PY'
-import json, sys
-path, keys = sys.argv[1], sys.argv[2:]
-try:
-    with open(path, encoding="utf-8") as handle:
-        doc = json.load(handle)
-except (OSError, ValueError) as exc:
-    print("the body is not JSON (%s)" % exc)
-    sys.exit(1)
-if not isinstance(doc, dict):
-    print("the body is JSON but not an object")
-    sys.exit(1)
-missing = [key for key in keys if key not in doc]
-if missing:
-    print("the object lacks %s" % ", ".join(missing))
-    sys.exit(1)
-PY
-  )"; then
-    WEB_CONSOLE_DETAIL="${path}: HTTP 200 but ${why}: $(web_console_body_excerpt)"
-    return 1
-  fi
-}
-
-# The session's messages after the turn must hold a row of each role.
-web_console_expect_roles() { # <path>
-  local path="$1" why
-  if ! why="$(python3 - "${WEB_CONSOLE_BODY_FILE}" "${WEB_CONSOLE_ROLE_USER}" "${WEB_CONSOLE_ROLE_ASSISTANT}" <<'PY'
-import json, sys
-path, wanted = sys.argv[1], sys.argv[2:]
-with open(path, encoding="utf-8") as handle:
-    doc = json.load(handle)
-roles = [m.get("role") for m in doc.get("messages") or []]
-missing = [role for role in wanted if role not in roles]
-if missing:
-    print("no %s row among %d message(s) (roles: %s)" % (" or ".join(missing), len(roles), ", ".join(str(r) for r in roles) or "none"))
-    sys.exit(1)
-PY
-  )"; then
-    WEB_CONSOLE_DETAIL="${path}: HTTP 200 but ${why}"
-    return 1
-  fi
-}
-
-# One pass over the console through a tunnel that is up: the health route,
-# the page, the read routes, a turn, the messages. Returns as
-# web_console_expect_json does.
-web_console_probe() {
-  local path sid messages_path
-  local -a keys
-  web_console_request GET "${WEB_CONSOLE_HEALTH_PATH}" "${WEB_CONSOLE_ROUTE_MAX_TIME_SECONDS}"
-  web_console_expect_json "${WEB_CONSOLE_HEALTH_PATH}" || return $?
-  web_console_request GET "${WEB_CONSOLE_PAGE_PATH}" "${WEB_CONSOLE_ROUTE_MAX_TIME_SECONDS}"
-  case "${WEB_CONSOLE_STATUS}" in
-    200)
-      if ! grep -qiF "${WEB_CONSOLE_PAGE_MARKER}" "${WEB_CONSOLE_BODY_FILE}"; then
-        WEB_CONSOLE_DETAIL="${WEB_CONSOLE_PAGE_PATH}: HTTP 200 but the body is not the console page (no ${WEB_CONSOLE_PAGE_MARKER}): $(web_console_body_excerpt)"
-        return 1
-      fi
-      ;;
-    000 | 5??)
-      WEB_CONSOLE_DETAIL="${WEB_CONSOLE_PAGE_PATH}: HTTP ${WEB_CONSOLE_STATUS}: $(web_console_body_excerpt)"
-      return "${WEB_CONSOLE_PROBE_RETRY}"
-      ;;
-    *)
-      WEB_CONSOLE_DETAIL="${WEB_CONSOLE_PAGE_PATH}: HTTP ${WEB_CONSOLE_STATUS}: $(web_console_body_excerpt)"
-      return 1
-      ;;
-  esac
-  for path in ${WEB_CONSOLE_READ_ROUTES}; do
-    keys=()
-    case "${path}" in
-      "${WEB_CONSOLE_INSIGHTS_PATH}") read -r -a keys <<<"${WEB_CONSOLE_INSIGHTS_KEYS}" ;;
-      "${WEB_CONSOLE_ENVIRONMENT_PATH}") read -r -a keys <<<"${WEB_CONSOLE_ENVIRONMENT_KEYS}" ;;
-    esac
-    web_console_request GET "${path}" "${WEB_CONSOLE_ROUTE_MAX_TIME_SECONDS}"
-    web_console_expect_json "${path}" ${keys[@]+"${keys[@]}"} || return $?
-  done
-  echo "  every read route answered 200 with a JSON object"
-  sid="${WEB_CONSOLE_SESSION_ID_PREFIX}$(openssl rand -hex "${WEB_CONSOLE_SESSION_ID_HEX_BYTES}")"
-  web_console_request POST "${WEB_CONSOLE_CHAT_PATH}" "${WEB_CONSOLE_CHAT_MAX_TIME_SECONDS}" \
-    "{\"session_id\": \"${sid}\", \"message\": \"${WEB_CONSOLE_CHAT_PROMPT}\"}"
-  read -r -a keys <<<"${WEB_CONSOLE_CHAT_KEYS}"
-  web_console_expect_json "${WEB_CONSOLE_CHAT_PATH}" "${keys[@]}" || return $?
-  echo "  ${WEB_CONSOLE_CHAT_PATH} answered the turn on session ${sid}"
-  # The format is a named constant, which is the point of it (SC2059 wants a literal).
-  # shellcheck disable=SC2059
-  printf -v messages_path "${WEB_CONSOLE_MESSAGES_PATH_FORMAT}" "${sid}"
-  web_console_request GET "${messages_path}" "${WEB_CONSOLE_ROUTE_MAX_TIME_SECONDS}"
-  read -r -a keys <<<"${WEB_CONSOLE_MESSAGES_KEYS}"
-  web_console_expect_json "${messages_path}" "${keys[@]}" || return $?
-  web_console_expect_roles "${messages_path}" || return $?
-  echo "  ${messages_path} shows the ${WEB_CONSOLE_ROLE_USER} and ${WEB_CONSOLE_ROLE_ASSISTANT} rows"
 }
 
 dump_web_console_state() {
@@ -2596,7 +2434,7 @@ gate_web_console() {
       sleep 1
     done
     rc=0
-    web_console_probe || rc=$?
+    web_console_probe "http://127.0.0.1:${WEB_CONSOLE_LOCAL_PORT}" "${WEB_CONSOLE_ROUTE_MAX_TIME_SECONDS}" "${WEB_CONSOLE_CHAT_MAX_TIME_SECONDS}" || rc=$?
     [ "${rc}" -eq 0 ] && break
     if [ "${rc}" -ne "${WEB_CONSOLE_PROBE_RETRY}" ]; then
       echo "web console attempt ${attempt}/${WEB_CONSOLE_GATE_ATTEMPTS} (${label}) failed: ${WEB_CONSOLE_DETAIL}; a fresh tunnel would not change that"
