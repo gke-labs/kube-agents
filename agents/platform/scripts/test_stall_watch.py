@@ -508,7 +508,7 @@ class Base(unittest.TestCase):
         conn.executescript(BOARD_SCHEMA)
         conn.close()
         env = {stall_watch.PROJECT_ENVS[0]: PROJECT, "PLATFORM_AGENT_HOME": self.tmp.name}
-        for var in (stall_watch.KINDS_ENV, stall_watch.EXCLUDE_NAMESPACES_ENV, stall_watch.MIN_AGE_ENV, stall_watch.REPORT_SCRIPT_ENV, stall_watch.STATE_PATH_ENV, *stall_watch.PROJECT_ENVS[1:]):
+        for var in (stall_watch.KINDS_ENV, stall_watch.EXCLUDE_NAMESPACES_ENV, stall_watch.MIN_AGE_ENV, stall_watch.REPORT_SCRIPT_ENV, stall_watch.STATE_PATH_ENV, stall_watch.fleet_scope_targets.RESOLVED_SCOPE_FILE_ENV, *stall_watch.PROJECT_ENVS[1:]):
             env[var] = ""
         patcher = patch.dict(os.environ, env)
         patcher.start()
@@ -2861,6 +2861,66 @@ class Projects(Base):
     def test_a_domain_scoped_project_splits_back_out_of_its_key(self):
         project = "example.com:proj"
         self.assertEqual(stall_watch.split_cluster_id(stall_watch.cluster_id(project, "c", LOCATION)), (project, "c", LOCATION))
+
+
+class ResolvedScope(Base):
+    """Under spec.mode: next (#5621) the resolved scope names the fleet: the
+    management and explicit projects are listed live, a member project's
+    clusters come from the scope publisher's list, and a cluster in scope and
+    not excluded is swept whether or not it has a Cluster Agent profile."""
+
+    MEMBER = "member-proj"
+    UNREAD = "member-unread"
+    GHOST = "ghost-proj"
+
+    def next_mode(self, exclude_clusters=()):
+        render = {"present": True, "projects": [], "folders": ["1"],
+                  "exclude": {"clusters": [{"projectId": p, "location": l, "clusterName": c} for p, l, c in exclude_clusters]}}
+        (self.home / "scope.json").write_text(json.dumps(render))
+        document = {"v": 1, "resolvedAt": "2026-11-10T12:00:00Z", "state": "ok", "memberHash": "sha256:x", "excludedProjects": [],
+                    "projects": [{"id": self.MEMBER, "via": ["folders/1"], "outcome": "ok"}, {"id": self.UNREAD, "via": ["folders/1"], "outcome": "denied"}],
+                    "clusters": {self.MEMBER: {"at": "2026-11-10T12:00:00Z", "clusters": [[LOCATION, "m"]]}}}
+        (self.home / "resolved-scope.json").write_text(json.dumps(document))
+        patcher = patch.dict(os.environ, {stall_watch.fleet_scope_targets.SCOPE_FILE_ENV: str(self.home / "scope.json"),
+                                          stall_watch.fleet_scope_targets.RESOLVED_SCOPE_FILE_ENV: str(self.home / "resolved-scope.json")})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def listed(self, fake):
+        return [argv[4] for argv, _, _ in fake.calls if argv[:4] == ["gcloud", "container", "clusters", "list"]]
+
+    def test_members_come_from_the_resolved_scope_and_no_profile_is_needed(self):
+        self.next_mode()
+        # A profile naming another project: the walk would list it; next mode does not walk.
+        self.scaffold("g", project=self.GHOST)
+        fleet = {"c": {"storefront": []}, f"{self.MEMBER}:m": {"checkout": []}, f"{self.GHOST}:g": {"web": []}}
+        with patch.object(stall_watch.fleet_scope_targets, "profile_identities", side_effect=AssertionError("walked the profiles")):
+            lines, fake = self.run_tick(fleet, unmanaged=("c", "m"))
+        self.assertEqual(self.listed(fake), [f"--project={PROJECT}"], "only the management project is listed live")
+        self.assertEqual(sorted(fake.scanned()), ["checkout", "storefront"])
+        unreadable = self.ledger()["unreadable"]
+        self.assertNotIn(cid("c"), unreadable, "no profile is not a gap in next mode")
+        self.assertNotIn(cid("m", project=self.MEMBER), unreadable)
+        self.assertIn("denied", unreadable[f"{stall_watch.LISTING_SCOPE} {self.UNREAD}"])
+        self.assertIsNone(self.ledger()["sweep_error"])
+
+    def test_an_excluded_cluster_is_not_read_and_not_a_gap(self):
+        self.next_mode(exclude_clusters=[(self.MEMBER, LOCATION, "m"), (PROJECT, LOCATION, "c")])
+        lines, fake = self.run_tick({"c": {"storefront": []}, f"{self.MEMBER}:m": {"checkout": []}}, unmanaged=("c", "m"))
+        self.assertEqual(fake.scanned(), [])
+        unreadable = self.ledger()["unreadable"]
+        self.assertNotIn(cid("c"), unreadable)
+        self.assertNotIn(cid("m", project=self.MEMBER), unreadable)
+
+    def test_an_unreadable_document_holds_member_rows_instead_of_clearing_them(self):
+        self.next_mode()
+        self.run_tick({"c": {"catalog": []}, f"{self.MEMBER}:m": {"checkout": [DEPLOYMENT_ROW]}}, unmanaged=("c", "m"))
+        self.assertEqual({e["cluster"] for e in self.ledger()["stalls"].values()}, {cid("m", project=self.MEMBER)})
+        (self.home / "resolved-scope.json").write_text("{not json")
+        lines, fake = self.run_tick({"c": {"catalog": []}, f"{self.MEMBER}:m": {"checkout": []}}, unmanaged=("c", "m"))
+        self.assertEqual(self.cleared(lines), [])
+        self.assertEqual({e["cluster"] for e in self.ledger()["stalls"].values()}, {cid("m", project=self.MEMBER)})
+        self.assertIn(f"{stall_watch.LISTING_SCOPE} {stall_watch.fleet_scope_targets.UNRESOLVED_SCOPE_ROW}", self.ledger()["unreadable"])
 
 
 class Knobs(Base):

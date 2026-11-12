@@ -40,7 +40,9 @@ themselves cannot read the file: they run in the shell sandbox, whose
 /opt/data is a separate volume at the same path (deploy/sandbox/entrypoint.sh
 says nothing is copied across), so the agent carries the scope from the tool
 to the collector's `--scope-projects`, `--scope-unread` and
-`--scope-exclude-clusters`. The reader is
+`--scope-exclude-clusters`. The watch scripts' cluster lists come from
+`list_scope_clusters` below (#5621): the resolved scope under spec.mode: next,
+the Cluster Agent profiles otherwise. The reader is
 deliberately independent of cluster_agent_reconcile.py, which writes the
 snapshot and owns its shape: that module's import has side effects.
 """
@@ -463,3 +465,238 @@ def declared_scope_targets(agent_home: str | os.PathLike | None = None) -> Scope
         declared_containers=_declared_containers(declared),
         retiring=tuple(retiring),
     )
+
+
+# --- cluster lists (#5621) ---------------------------------------------------
+#
+# The helper scripts' fleet cluster list. Under spec.mode: next the operator
+# mounts the scope publisher's resolved scope read-only and names it in
+# KUBEAGENTS_RESOLVED_SCOPE_FILE (pinned empty outside next); the document's
+# `clusters` map holds each member project's clusters as the publisher's probe
+# listed them. Without it the list is what it was before: the Cluster Agent
+# profiles' `cluster_identity` blocks, and this module is the one place that
+# walks the profiles directory for them (the scripts used to walk it each on
+# their own). `list_scope_clusters` is the narrow interface a later fleet read
+# cache can stand behind.
+RESOLVED_SCOPE_FILE_ENV = "KUBEAGENTS_RESOLVED_SCOPE_FILE"
+PROFILES_DIR = "profiles"
+# The resolved scope's wire keys (scope_publisher.py owns them; it is not
+# imported here, because it imports the reconcile, whose import has side effects).
+RESOLVED_VERSION = 1
+RESOLVED_STATE_OK = "ok"
+RESOLVED_CLUSTERS_KEY = "clusters"
+RESOLVED_AT_KEY = "at"
+# Which source answered `list_scope_clusters`.
+SOURCE_RESOLVED_SCOPE = "resolved-scope"
+SOURCE_PROFILES_WALK = "profiles-walk"
+# One project's status in that answer. LISTED: `clusters` holds the clusters
+# the source knows (possibly none). LIST_LIVE: the source does not list this
+# project and the caller lists it itself, as it did before (the management
+# project and the explicit projects, which the publisher never probes).
+# UNREAD: nothing listed it and nothing should be invented; `reason` says why.
+# `clusters` is None for both of the last two, so a caller that iterates it
+# without checking the status fails rather than reading "no clusters".
+STATUS_LISTED = "listed"
+STATUS_LIST_LIVE = "list-live"
+STATUS_UNREAD = "unread"
+LIVE_MANAGEMENT_REASON = "the management project: the scope publisher never lists it; list it live"
+LIVE_EXPLICIT_REASON = "an explicit spec.scope project: the scope publisher never lists it; list it live"
+NO_ENTRY_REASON = "the resolved scope has no cluster list for this member project yet (row outcome {outcome})"
+DOCUMENT_UNREAD_REASON = "the resolved scope at {path} {problem}, so no member project's clusters are known"
+
+
+@dataclass(frozen=True)
+class ProjectClusters:
+    """One project's clusters, or why there is no list of them."""
+
+    project: str
+    status: str
+    # (project, location, cluster) triples, sorted; None unless LISTED.
+    clusters: tuple[tuple[str, str, str], ...] | None = None
+    # When the source listed them (the publisher's `at`; a carried entry keeps
+    # its old time), None for the profiles walk.
+    at: str | None = None
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class ScopeClusters:
+    """The fleet's clusters by project, and which source answered."""
+
+    source: str
+    projects: tuple[ProjectClusters, ...]
+    # spec.scope.exclude.clusters, already left out of every LISTED entry; a
+    # caller that lists a LIST_LIVE project leaves these out itself.
+    excluded_clusters: tuple[tuple[str, str, str], ...] = ()
+    path: str | None = None
+    # Set when the resolved scope could not be used as a whole.
+    note: str | None = None
+    # Profiles directories whose cluster_identity could not be read (profiles
+    # walk only), in the order the walk met them.
+    unidentified_profiles: tuple[str, ...] = ()
+
+    @property
+    def next_mode(self) -> bool:
+        return self.source == SOURCE_RESOLVED_SCOPE
+
+    def by_project(self) -> dict[str, ProjectClusters]:
+        return {entry.project: entry for entry in self.projects}
+
+    def admits(self, project: str, location: str, cluster: str) -> bool:
+        """Whether the cluster is in scope: its project is in this answer
+        (not as the unread placeholder) and no exclude entry names it."""
+        if project == UNRESOLVED_SCOPE_ROW or (project, location, cluster) in self.excluded_clusters:
+            return False
+        return any(entry.project == project for entry in self.projects)
+
+
+def resolved_scope_file() -> str | None:
+    """The resolved scope's path when this pod is in spec.mode: next, else None.
+    The operator pins the variable empty outside next; empty and unset alike
+    mean "no resolved scope"."""
+    return os.environ.get(RESOLVED_SCOPE_FILE_ENV, "").strip() or None
+
+
+def profile_identities(agent_home: str | os.PathLike | None = None) -> list[tuple[str, dict[str, str] | None]]:
+    """Every Cluster Agent profile's directory name and cluster_identity (None
+    when it cannot be read), in directory order: reserved profiles, hidden
+    entries and files are skipped. The one walk of the profiles directory the
+    helper scripts make. The file is in the model-writable agent home, so a
+    malformed one reads as absent rather than failing the caller."""
+    from cluster_agent_profile import RESERVED_PROFILES, read_cluster_identity  # lazy: pulls the scaffold's imports
+
+    root = agent_home if agent_home is not None else (os.environ.get(AGENT_HOME_ENV) or DEFAULT_AGENT_HOME)
+    base = Path(root) / PROFILES_DIR
+    if not base.is_dir():
+        return []
+    found: list[tuple[str, dict[str, str] | None]] = []
+    for home in base.iterdir():
+        if home.name in RESERVED_PROFILES or home.name.startswith(".") or not home.is_dir():
+            continue
+        try:
+            identity = read_cluster_identity(home)
+        except Exception:  # noqa: BLE001 - any unreadable file is an absent identity
+            identity = None
+        found.append((home.name, identity))
+    return found
+
+
+def _from_profiles(agent_home: str | os.PathLike | None) -> ScopeClusters:
+    """Today's answer: the projects and clusters the profiles' identities name.
+    A project only incomplete identities name is LIST_LIVE, as the scripts
+    listed such a project live before."""
+    triples: dict[str, set[tuple[str, str, str]]] = {}
+    unidentified: list[str] = []
+    for name, identity in profile_identities(agent_home):
+        project = str((identity or {}).get("project") or "").strip()
+        if not project:
+            unidentified.append(name)
+            continue
+        location = str(identity.get("location") or "").strip()
+        cluster = str(identity.get("cluster") or "").strip()
+        triples.setdefault(project, set())
+        if location and cluster:
+            triples[project].add((project, location, cluster))
+    entries = tuple(
+        ProjectClusters(project, STATUS_LISTED, tuple(sorted(found))) if found else ProjectClusters(project, STATUS_LIST_LIVE)
+        for project, found in sorted(triples.items())
+    )
+    return ScopeClusters(source=SOURCE_PROFILES_WALK, projects=entries, unidentified_profiles=tuple(unidentified))
+
+
+def _read_resolved(path: str) -> tuple[dict | None, list, str | None]:
+    """The usable resolved document, its rows whatever its state, and what is
+    wrong with it when it cannot be used."""
+    try:
+        parsed = json.loads(Path(path).read_text(encoding="utf-8"))
+    except OSError as e:
+        return None, [], f"cannot be read ({e.strerror or e})"
+    except ValueError:
+        return None, [], "is not JSON"
+    if not isinstance(parsed, dict):
+        return None, [], "is not a JSON object"
+    rows = [row for row in (parsed.get("projects") if isinstance(parsed.get("projects"), list) else [])
+            if isinstance(row, dict) and isinstance(row.get("id"), str) and row.get("id")]
+    if parsed.get("v") != RESOLVED_VERSION:
+        return None, [], f"has schema version {parsed.get('v')!r}, not {RESOLVED_VERSION}"
+    if parsed.get("state") != RESOLVED_STATE_OK:
+        return None, rows, f"is in state {parsed.get('state')!r}"
+    if not isinstance(parsed.get("projects"), list):
+        return None, [], "has no projects list"
+    return parsed, rows, None
+
+
+def _listed_entry(project: str, entry: object, excluded: set) -> ProjectClusters | None:
+    """A member's LISTED entry from the `clusters` map, or None when the entry
+    is missing or malformed (the member is then unread)."""
+    if not isinstance(entry, dict) or not isinstance(entry.get(RESOLVED_AT_KEY), str):
+        return None
+    pairs = entry.get(RESOLVED_CLUSTERS_KEY)
+    if not isinstance(pairs, list) or not all(
+        isinstance(p, list) and len(p) == 2 and all(isinstance(v, str) and v for v in p) for p in pairs
+    ):
+        return None
+    triples = {(project, location, name) for location, name in pairs} - excluded
+    return ProjectClusters(project, STATUS_LISTED, tuple(sorted(triples)), at=entry[RESOLVED_AT_KEY])
+
+
+def _from_resolved(path: str, management_project: str | None) -> ScopeClusters:
+    """Next mode's answer: the management project and the explicit projects to
+    list live, and each member project's clusters from the resolved scope's
+    `clusters` map, or unread."""
+    render = _read_render() or {}
+    exclude_patterns = [p for p in ((render.get("exclude") or {}).get("projects") or []) if isinstance(p, str)]
+    excluded_clusters = _excluded_clusters(render)
+    excluded = set(excluded_clusters)
+    document, rows, problem = _read_resolved(path)
+    dropped = {p for p in ((document or {}).get(EXCLUDED_KEY) or []) if isinstance(p, str)}
+
+    def left_out(project: str) -> bool:
+        return project in dropped or any(fnmatch.fnmatchcase(project, pattern) for pattern in exclude_patterns)
+
+    host = management_project or next((os.environ.get(name) for name in MANAGEMENT_PROJECT_ENVS if os.environ.get(name)), None)
+    entries: list[ProjectClusters] = []
+    seen: set[str] = set()
+    if host:
+        entries.append(ProjectClusters(host, STATUS_LIST_LIVE, reason=LIVE_MANAGEMENT_REASON))
+        seen.add(host)
+    if render.get(RENDER_PRESENT_KEY) is True:
+        for project in render.get("projects") or []:
+            if isinstance(project, str) and project and project not in seen and not left_out(project):
+                entries.append(ProjectClusters(project, STATUS_LIST_LIVE, reason=LIVE_EXPLICIT_REASON))
+                seen.add(project)
+    note = DOCUMENT_UNREAD_REASON.format(path=path, problem=problem) if problem else None
+    clusters_map = (document or {}).get(RESOLVED_CLUSTERS_KEY)
+    clusters_map = clusters_map if isinstance(clusters_map, dict) else {}
+    for row in sorted(rows, key=lambda r: r["id"]):
+        project = row["id"]
+        if project in seen or left_out(project):
+            continue
+        seen.add(project)
+        listed = None if note else _listed_entry(project, clusters_map.get(project), excluded)
+        if listed is not None:
+            entries.append(listed)
+        else:
+            reason = note or NO_ENTRY_REASON.format(outcome=row.get("outcome") or OUTCOME_UNKNOWN)
+            entries.append(ProjectClusters(project, STATUS_UNREAD, reason=reason))
+    if note and (not render or any(isinstance(render.get(key), list) and render.get(key) for key in CONTAINER_AND_SELECTOR_KEYS)):
+        # Members no row names: a missing, too-large or unparseable document
+        # carries none, so the gap is named once rather than read as no members.
+        entries.append(ProjectClusters(UNRESOLVED_SCOPE_ROW, STATUS_UNREAD, reason=note))
+    return ScopeClusters(source=SOURCE_RESOLVED_SCOPE, projects=tuple(entries), excluded_clusters=excluded_clusters,
+                         path=path, note=note)
+
+
+def list_scope_clusters(agent_home: str | os.PathLike | None = None, management_project: str | None = None) -> ScopeClusters:
+    """The fleet's clusters by project. Under spec.mode: next
+    (KUBEAGENTS_RESOLVED_SCOPE_FILE set) the resolved scope answers: member
+    projects LISTED from its `clusters` map or UNREAD with the reason, the
+    management project (`management_project`, else GCP_PROJECT_ID) and the
+    explicit projects LIST_LIVE, spec.scope.exclude.clusters left out. A
+    named scope render that cannot be read raises ScopeRenderUnreadable.
+    Otherwise the Cluster Agent profiles answer, as the scripts read them
+    before (`profile_identities`)."""
+    path = resolved_scope_file()
+    if path is None:
+        return _from_profiles(agent_home)
+    return _from_resolved(path, management_project)

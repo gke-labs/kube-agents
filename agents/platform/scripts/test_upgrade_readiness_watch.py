@@ -2658,6 +2658,31 @@ class Projects(unittest.TestCase):
                 self.assertEqual(watch.roster_projects(), {"tenant-a", "tenant-b", "tenant-c"})
 
 
+    def test_next_mode_reads_the_resolved_scope_and_never_walks_the_profiles(self) -> None:
+        # #5621: under spec.mode: next the roster is every project the resolved
+        # scope names (the report lists each one's clusters itself); a profile
+        # that would name another project is not read.
+        with tempfile.TemporaryDirectory() as home:
+            root = Path(home)
+            (root / "profiles" / "cluster-ghost").mkdir(parents=True)
+            (root / "profiles" / "cluster-ghost" / "config.yaml").write_text(
+                "cluster_identity:\n  project: ghost-proj\n  cluster: g\n  location: l\n", encoding="utf-8")
+            (root / "scope.json").write_text(json.dumps({"present": True, "projects": ["explicit-a"], "folders": ["1"]}), encoding="utf-8")
+            (root / "resolved-scope.json").write_text(json.dumps({
+                "v": 1, "resolvedAt": "2026-11-10T12:00:00Z", "state": "ok", "memberHash": "sha256:x", "excludedProjects": [],
+                "projects": [{"id": "member-a", "via": ["folders/1"], "outcome": "ok"}, {"id": "member-b", "via": ["folders/1"], "outcome": "denied"}],
+                "clusters": {"member-a": {"at": "2026-11-10T12:00:00Z", "clusters": [["l", "c"]]}},
+            }), encoding="utf-8")
+            env = {watch.PROJECTS_ENV: "", watch.MANAGEMENT_PROJECT_ENV: "mgmt",
+                   watch.fleet_scope_targets.SCOPE_FILE_ENV: str(root / "scope.json"),
+                   watch.fleet_scope_targets.RESOLVED_SCOPE_FILE_ENV: str(root / "resolved-scope.json")}
+            with mock.patch.dict(os.environ, env), mock.patch.object(watch.gitops_workspace, "agent_home", return_value=home), mock.patch.object(
+                watch.fleet_scope_targets, "profile_identities", side_effect=AssertionError("walked the profiles")
+            ):
+                self.assertEqual(watch.roster_projects(), {"mgmt", "explicit-a", "member-a", "member-b"})
+                self.assertEqual(watch.projects(), ["explicit-a", "member-a", "member-b", "mgmt"])
+
+
 class Loader(unittest.TestCase):
     def setUp(self) -> None:
         self.env = mock.patch.dict(os.environ, {watch.SKILL_SCRIPTS_DIR_ENV: ""}, clear=False)

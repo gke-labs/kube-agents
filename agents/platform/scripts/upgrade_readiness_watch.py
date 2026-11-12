@@ -37,8 +37,10 @@ and is listed apart; and a ``blocked`` verdict stands whatever the kubectl read 
 Which clusters. The projects come from this pod, not from the sandbox:
 ``UPGRADE_READINESS_PROJECTS`` when set, otherwise the management project
 (``GCP_PROJECT_ID``) together with every project a Cluster Agent profile's
-``cluster_identity`` names, the roster the cluster reconciler keeps; with
-neither, the sandbox's ``gcloud config get-value project``; and with nothing
+``cluster_identity`` names, the roster the cluster reconciler keeps (under
+``spec.mode: next``, every project the scope publisher's resolved scope
+names instead, read through ``fleet_scope_targets.list_scope_clusters``,
+#5621); with neither, the sandbox's ``gcloud config get-value project``; and with nothing
 at all the tick fails closed rather than let the report script fall back to
 its own scope, which on an install that declares none is every project the
 credential can list. Every cluster in those projects is listed and its versions graded,
@@ -191,8 +193,6 @@ ROSTER_SPELLING_DETAIL = (
 )
 PROJECTS_SEPARATOR = ","
 MANAGEMENT_PROJECT_ENV = "GCP_PROJECT_ID"
-PROFILES_DIR = "profiles"
-IDENTITY_PROJECT_KEY = "project"
 CONFIG_PROJECT_ARGV = ("gcloud", "config", "get-value", "project")
 PROJECT_LOOKUP_TIMEOUT_SECONDS = 30
 PROJECT_FLAG = "--project"
@@ -804,26 +804,16 @@ def watch_home() -> Path:
 
 
 def roster_projects() -> set[str]:
-    """The projects the Cluster Agent profiles' identities name, as
-    stall_watch.py reads them; a profile whose identity cannot be read names none."""
-    from cluster_agent_profile import RESERVED_PROFILES, read_cluster_identity  # lazy, as in stall_watch
-
-    base = Path(gitops_workspace.agent_home()) / PROFILES_DIR
-    if not base.is_dir():
-        return set()
-    projects: set[str] = set()
-    for home in base.iterdir():
-        if home.name in RESERVED_PROFILES or home.name.startswith(".") or not home.is_dir():
-            continue
-        try:
-            identity = read_cluster_identity(home)
-        except Exception:  # noqa: BLE001 - any unreadable file is an absent identity
-            identity = None
-        # Stripped as every other roster source is, so the spelling check sees one shape.
-        project = str((identity or {}).get(IDENTITY_PROJECT_KEY) or "").strip()
-        if project:
-            projects.add(project)
-    return projects
+    """The projects `fleet_scope_targets.list_scope_clusters` names: outside
+    spec.mode: next the Cluster Agent profiles' identities, as stall_watch.py
+    reads them (a profile whose identity cannot be read names none); under it
+    every project the resolved scope names, a member nothing listed included,
+    since the report lists each project's clusters itself and records the one
+    it cannot read. Stripped, as every other roster source is, so the
+    spelling check sees one shape."""
+    scope = fleet_scope_targets.list_scope_clusters(gitops_workspace.agent_home())
+    return {entry.project.strip() for entry in scope.projects
+            if entry.project.strip() and entry.project != fleet_scope_targets.UNRESOLVED_SCOPE_ROW}
 
 
 def projects() -> list[str]:

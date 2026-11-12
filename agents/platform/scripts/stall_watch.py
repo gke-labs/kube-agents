@@ -23,7 +23,13 @@ no model. Each tick:
    profile, one the reconciler pruned for ``spec.scope.exclude.clusters`` or
    ``RECONCILE_EXCLUDE`` or has not yet scaffolded, is left unread: the
    exclusion is the operator keeping a model turn off that cluster, and this
-   watch follows the same roster;
+   watch follows the same roster. Under ``spec.mode: next`` the scope
+   publisher's resolved scope names the fleet instead
+   (``fleet_scope_targets.list_scope_clusters``, #5621): the management and
+   explicit projects are listed as above, a member project's clusters come
+   from the publisher's list, a member it holds no list for is held as a
+   failed listing is, and a cluster in scope and not excluded is swept
+   whether or not it has a profile;
 2. per cluster, points a per-cluster kubeconfig at the cluster and lists the
    namespaces that are not system namespaces and not excluded (see "What an
    install can tune" below). The credentials behind that
@@ -190,6 +196,7 @@ from pathlib import Path
 # already on `sys.path` when the scheduler runs it as a plain subprocess.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import credential_proxy_client  # noqa: E402
+import fleet_scope_targets  # noqa: E402
 import gitops_workspace  # noqa: E402
 import sandbox_exec  # noqa: E402
 from gke_endpoint import dns_endpoint_args  # noqa: E402
@@ -1558,6 +1565,10 @@ class Sweep:
         project, name, location = split_cluster_id(cid)
         if project in self.unlisted_projects:
             return True
+        if fleet_scope_targets.UNRESOLVED_SCOPE_ROW in self.unlisted_projects and project not in self.projects:
+            # The resolved scope could not be read, so which projects are its
+            # members is unknown this tick: a project it does not name is held.
+            return True
         return project not in self.projects and cluster_agent_for(project, name, location) is not None
 
     def verdict(self, entry: dict) -> str:
@@ -1692,23 +1703,14 @@ def profile_identity(home: Path) -> dict[str, str] | None:
         return None
 
 
-def roster_projects() -> tuple[set[str], dict[str, str]]:
+def roster_projects(scope: fleet_scope_targets.ScopeClusters | None = None) -> tuple[set[str], dict[str, str]]:
     """The projects the Cluster Agent profiles' identities name, and a ledger
-    entry for each profile whose identity names none."""
-    from cluster_agent_profile import RESERVED_PROFILES  # lazy, as in cluster_agent_for
-
-    base = Path(gitops_workspace.agent_home()) / PROFILES_DIR
-    if not base.is_dir():
-        return set(), {}
-    projects, unread = set(), {}
-    for home in base.iterdir():
-        if home.name in RESERVED_PROFILES or home.name.startswith(".") or not home.is_dir():
-            continue
-        identity = profile_identity(home)
-        if identity:
-            projects.add(identity["project"])
-        else:
-            unread[f"{PROFILE_SCOPE} {home.name}"] = NO_IDENTITY_REASON
+    entry for each profile whose identity names none: the profiles walk
+    `fleet_scope_targets.list_scope_clusters` makes outside spec.mode: next."""
+    if scope is None:
+        scope = fleet_scope_targets.list_scope_clusters(gitops_workspace.agent_home())
+    projects = {entry.project for entry in scope.projects}
+    unread = {f"{PROFILE_SCOPE} {name}": NO_IDENTITY_REASON for name in scope.unidentified_profiles}
     return projects, unread
 
 
@@ -2055,10 +2057,21 @@ def sweep_fleet(
     `cluster_timings` its record of what each cluster cost to read
     (CLUSTER_TIMINGS_KEY), and `now` the tick's time, which a fetch, a
     discovery or a read this tick is recorded as."""
-    projects, unread_profiles = roster_projects()
-    sweep = Sweep({management_project} | projects)
-    sweep.unread_profiles = set(unread_profiles)
-    sweep.unreadable.update(unread_profiles)
+    scope = fleet_scope_targets.list_scope_clusters(gitops_workspace.agent_home(), management_project=management_project)
+    # Under spec.mode: next the resolved scope answers (#5621): the management
+    # and explicit projects are listed live, a member project's clusters come
+    # from the scope publisher's list, and a member nothing listed is held as
+    # a failed listing is. Outside it, the profiles' projects are listed live.
+    entries = scope.by_project() if scope.next_mode else {}
+    if scope.next_mode:
+        sweep = Sweep({management_project} | set(entries))
+        live = {management_project} | {p for p, e in entries.items() if e.status == fleet_scope_targets.STATUS_LIST_LIVE}
+    else:
+        projects, unread_profiles = roster_projects(scope)
+        sweep = Sweep({management_project} | projects)
+        sweep.unread_profiles = set(unread_profiles)
+        sweep.unreadable.update(unread_profiles)
+        live = sweep.projects
     records = dict(credentials or {})
     discoveries = dict(discovered or {})
     timings = dict(cluster_timings or {})
@@ -2067,13 +2080,25 @@ def sweep_fleet(
     clock = time.perf_counter()
     source = report_source()
     failures: dict[str, Exception] = {}
-    listings = list_projects(sorted(sweep.projects), management_project, started)
+    listings = list_projects(sorted(live), management_project, started)
     listing_seconds = seconds_since(clock)
     # Every listed cluster is registered before any is read: a cluster the
     # budget never reaches is unread, not gone.
     sweepable = []
+    resolved_listed = False
     for project in sorted(sweep.projects):
-        listing = listings[project]
+        resolved = False
+        if project in listings:
+            listing = listings[project]
+        elif entries[project].status == fleet_scope_targets.STATUS_UNREAD:
+            sweep.unlisted_projects.add(project)
+            sweep.unreadable[f"{LISTING_SCOPE} {project}"] = entries[project].reason or ""
+            continue
+        else:
+            # The publisher's probe listed names and locations, not statuses:
+            # each is swept, and one that is not serving fails its read.
+            listing = ([{"name": name, "location": location, "status": ""} for _, location, name in entries[project].clusters or ()], None)
+            resolved = resolved_listed = True
         if isinstance(listing, Exception):
             failures[project] = listing
             sweep.unlisted_projects.add(project)
@@ -2085,17 +2110,24 @@ def sweep_fleet(
             sweep.unreadable[f"{LISTING_SCOPE} {project}"] = f"incomplete: {incomplete}"
         for cluster in clusters:
             cid = cluster_id(project, cluster["name"], cluster["location"])
-            if cluster_agent_for(project, cluster["name"], cluster["location"]) is None:
+            if scope.next_mode:
+                # The cluster agent is one `cluster` AgentProfile with a target
+                # now (#3658): a cluster in the resolved scope and not excluded
+                # is swept, profile or none. An excluded one is not a gap.
+                if not scope.admits(project, cluster["location"], cluster["name"]):
+                    sweep.unmanaged.add(cid)
+                    continue
+            elif cluster_agent_for(project, cluster["name"], cluster["location"]) is None:
                 sweep.unmanaged.add(cid)
                 sweep.unreadable[scope_key(cid)] = NO_PROFILE_REASON
                 continue
             sweep.listed_clusters.add(cid)
-            if cluster["status"] in SWEEPABLE_CLUSTER_STATUSES:
+            if resolved or cluster["status"] in SWEEPABLE_CLUSTER_STATUSES:
                 sweepable.append((cid, cluster))
                 sweep.sweepable_clusters.add(cid)
             else:
                 sweep.unreadable[scope_key(cid)] = f"status={cluster['status'] or 'unknown'}"
-    if len(failures) == len(sweep.projects):
+    if len(failures) == len(live) and not resolved_listed:
         raise failures[management_project]
     # Clusters are read SCAN_WORKERS at a time, in cursor order. Each worker
     # fills a ClusterPart and shares nothing but the budget flag; the parts

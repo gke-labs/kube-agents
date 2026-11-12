@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
@@ -1713,6 +1714,57 @@ class RosterTest(unittest.TestCase):
         self.assertEqual(entry["schedule"]["expr"].split()[2:], ["*", "*", "*"], "a daily job")
         self.assertTrue(entry["enabled"])
         self.assertEqual(entry["risk"], "high")
+
+
+class ResolvedScopeTests(unittest.TestCase):
+    """#5621: under spec.mode: next the resolved scope names the projects and
+    each member project's clusters; the management and explicit projects are
+    listed live, a member nothing listed is a scan error, and the profiles
+    directory is not walked."""
+
+    def test_next_mode_sweeps_from_the_resolved_scope(self) -> None:
+        argvs: list[list[str]] = []
+
+        def sandbox(argv, **kw):
+            argvs.append(list(argv))
+            if argv[0] == "gcloud":
+                return subprocess.CompletedProcess(args=argv, returncode=0, stdout="m1\tus-central1\nm-old\tus-east1\n", stderr="")
+            target = argv[argv.index(watch.CLUSTERS_FLAG) + 1]
+            return completed_json(make_report([{"cluster": c, "status": "ok"} for c in target.split(",")]))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "profiles" / "cluster-ghost").mkdir(parents=True)
+            (root / "profiles" / "cluster-ghost" / "config.yaml").write_text(
+                "cluster_identity:\n  project: member-a\n  cluster: ghost\n  location: l\n", encoding="utf-8")
+            (root / "scope.json").write_text(json.dumps({
+                "present": True, "projects": [], "folders": ["1"],
+                "exclude": {"clusters": [{"projectId": "mgmt", "location": "us-east1", "clusterName": "m-old"}]},
+            }), encoding="utf-8")
+            (root / "resolved-scope.json").write_text(json.dumps({
+                "v": 1, "resolvedAt": "2026-11-10T12:00:00Z", "state": "ok", "memberHash": "sha256:x", "excludedProjects": [],
+                "projects": [{"id": p, "via": ["folders/1"], "outcome": o} for p, o in (("member-a", "ok"), ("member-b", "denied"), ("member-empty", "ok"))],
+                "clusters": {"member-a": {"at": "2026-11-10T12:00:00Z", "clusters": [["us-central1", "a1"]]},
+                             "member-empty": {"at": "2026-11-10T12:00:00Z", "clusters": []}},
+            }), encoding="utf-8")
+            env = {
+                watch.WATCH_HOME_ENV: str(root / "leeway"), watch.CLUSTERS_ENV: "", watch.PROJECTS_ENV: "",
+                watch.MANAGEMENT_PROJECT_ENV: "mgmt", "PLATFORM_AGENT_HOME": tmp,
+                watch.fleet_scope_targets.SCOPE_FILE_ENV: str(root / "scope.json"),
+                watch.fleet_scope_targets.RESOLVED_SCOPE_FILE_ENV: str(root / "resolved-scope.json"),
+            }
+            with mock.patch.dict(os.environ, env), mock.patch.object(
+                watch, "roster_clusters_by_project", side_effect=AssertionError("walked the profiles")
+            ), mock.patch.object(
+                watch.fleet_scope_targets, "profile_identities", side_effect=AssertionError("walked the profiles")
+            ), mock.patch.object(watch.sandbox_exec, "run", side_effect=sandbox):
+                _, _, scan_errors, error_kinds, scanned, requested = watch.sweep_fleet({}, T0, time.monotonic() + 3600)
+        self.assertEqual([a for a in argvs if a[0] == "gcloud"], [[*watch.LIST_CLUSTERS_ARGV, "mgmt"]], "only the management project is listed live")
+        self.assertEqual(requested, {"mgmt/us-central1/m1", "member-a/us-central1/a1"})
+        self.assertEqual(scanned, {"mgmt", "member-a", "member-empty"})
+        self.assertEqual(set(scan_errors), {"member-b"})
+        self.assertIn("denied", scan_errors["member-b"])
+        self.assertEqual(error_kinds["member-b"], watch.ERROR_KIND_SCAN_FAILED)
 
 
 if __name__ == "__main__":

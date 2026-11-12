@@ -32,6 +32,13 @@ Which clusters. Target clusters are resolved on the agent pod:
    `kubectl --context=gke_<project>_<location>_<cluster>` read through the
    credential-proxy shim, which is the one route the sandbox has to a
    cluster.
+4. Under `spec.mode: next` (`KUBEAGENTS_RESOLVED_SCOPE_FILE` set), steps 2
+   and 3 read the scope publisher's resolved scope instead
+   (`fleet_scope_targets.list_scope_clusters`, #5621): the management and
+   explicit projects are enumerated with `gcloud` as above, a member
+   project is swept by the triples the publisher listed for it, and a
+   member it holds no list for is a scan error, not an empty project. No
+   Cluster Agent profile is read.
 
 Where it runs. `leeway` is baked into `agent-sandbox` at `/usr/local/bin/leeway`
 and routes Kubernetes object reads through the sandbox's `kubectl`
@@ -148,10 +155,6 @@ CLUSTERS_ENV = "LEEWAY_WATCH_CLUSTERS"
 PROJECTS_ENV = "LEEWAY_WATCH_PROJECTS"
 CSV_SEPARATOR = ","
 MANAGEMENT_PROJECT_ENV = "GCP_PROJECT_ID"
-PROFILES_DIR = "profiles"
-IDENTITY_PROJECT_KEY = "project"
-IDENTITY_LOCATION_KEY = "location"
-IDENTITY_CLUSTER_KEY = "cluster"
 CONFIG_PROJECT_ARGV = ("gcloud", "config", "get-value", "project")
 PROJECT_LOOKUP_TIMEOUT_SECONDS = 30
 NO_PROJECT_DETAIL = (
@@ -184,6 +187,8 @@ TIMED_OUT_DETAIL = "the sandbox run timed out after {seconds}s"
 BUDGET_EXHAUSTED_DETAIL = "tick budget exhausted before {target} could run"
 SCAN_CUT_SHORT_DETAIL = "leeway scan for {target} cut short by the tick budget"
 SCAN_FAILED_DETAIL = "leeway scan for {target} failed: {error}"
+# A project the resolved scope names but holds no cluster list for (spec.mode: next).
+UNREAD_PROJECT_DETAIL = "{target} was not swept: {reason}"
 
 # Partial-scan error kinds (used as deduplication signature keys so rotating
 # project names do not re-page every day for the same underlying condition).
@@ -441,30 +446,12 @@ def explicit_clusters() -> list[str]:
 
 
 def roster_clusters_by_project() -> dict[str, list[str]]:
-    """Map each project to its sorted `<project>/<location>/<cluster>` triples from Cluster Agent profiles."""
-    from cluster_agent_profile import RESERVED_PROFILES, read_cluster_identity
-
-    base = Path(gitops_workspace.agent_home()) / PROFILES_DIR
-    if not base.is_dir():
-        return {}
-    by_proj: dict[str, set[str]] = {}
-    for home in base.iterdir():
-        if home.name in RESERVED_PROFILES or not home.is_dir():
-            continue
-        try:
-            identity = read_cluster_identity(home)
-        except Exception:  # noqa: BLE001
-            identity = None
-        if not identity:
-            continue
-        proj = str(identity.get(IDENTITY_PROJECT_KEY) or "").strip()
-        loc = str(identity.get(IDENTITY_LOCATION_KEY) or "").strip()
-        cluster = str(identity.get(IDENTITY_CLUSTER_KEY) or "").strip()
-        if proj:
-            by_proj.setdefault(proj, set())
-            if loc and cluster:
-                by_proj[proj].add(CLUSTER_KEY_SEPARATOR.join([proj, loc, cluster]))
-    return {proj: sorted(triples) for proj, triples in by_proj.items()}
+    """Map each project to its sorted `<project>/<location>/<cluster>` triples
+    from Cluster Agent profiles: the profiles walk
+    `fleet_scope_targets.list_scope_clusters` makes outside spec.mode: next.
+    A project only incomplete identities name maps to no triple."""
+    scope = fleet_scope_targets.list_scope_clusters(gitops_workspace.agent_home())
+    return {entry.project: [CLUSTER_KEY_SEPARATOR.join(t) for t in entry.clusters or ()] for entry in scope.projects}
 
 
 def roster_projects() -> set[str]:
@@ -1333,9 +1320,30 @@ def sweep_fleet(
             requested_clusters,
         )
 
-    known_triples_by_proj = roster_clusters_by_project()
-    target_projects = order_by_least_recent(projects(scope), project_runs)
+    # Under spec.mode: next the resolved scope names the projects and each
+    # member project's clusters (#5621); the management and explicit projects
+    # are listed live, and a member nothing listed is recorded unread.
+    # Outside it the profiles' triples sweep their projects, as before.
+    entries: dict[str, fleet_scope_targets.ProjectClusters] = {}
+    if fleet_scope_targets.resolved_scope_file():
+        cluster_scope = fleet_scope_targets.list_scope_clusters(gitops_workspace.agent_home())
+        entries = cluster_scope.by_project()
+        excluded |= {CLUSTER_KEY_SEPARATOR.join(ref) for ref in cluster_scope.excluded_clusters}
+        known_triples_by_proj = {
+            proj: [CLUSTER_KEY_SEPARATOR.join(t) for t in entry.clusters or ()] for proj, entry in entries.items()
+        }
+        explicit = {p.strip() for p in os.environ.get(PROJECTS_ENV, "").split(CSV_SEPARATOR) if p.strip()}
+        names = [proj for proj in entries if not explicit or proj in explicit]
+        target_projects = order_by_least_recent(names, project_runs)
+    else:
+        known_triples_by_proj = roster_clusters_by_project()
+        target_projects = order_by_least_recent(projects(scope), project_runs)
     for proj in target_projects:
+        entry = entries.get(proj)
+        if entry is not None and entry.status == fleet_scope_targets.STATUS_UNREAD:
+            scan_errors[proj] = UNREAD_PROJECT_DETAIL.format(target=proj, reason=entry.reason)
+            error_kinds[proj] = ERROR_KIND_SCAN_FAILED
+            continue
         remaining = int(deadline - time.monotonic())
         if remaining < MIN_PROJECT_RUN_SECONDS:
             scan_errors[proj] = BUDGET_EXHAUSTED_DETAIL.format(target=proj)
@@ -1344,7 +1352,7 @@ def sweep_fleet(
         timeout = min(PROJECT_TIMEOUT_SECONDS, remaining)
         triples = [t for t in (known_triples_by_proj.get(proj) or []) if t not in excluded]
         try:
-            if not triples:
+            if not triples and (entry is None or entry.status == fleet_scope_targets.STATUS_LIST_LIVE):
                 triples = [t for t in project_cluster_triples(proj) if t not in excluded]
             if not triples:
                 # A project with no clusters is a clean, empty read.
