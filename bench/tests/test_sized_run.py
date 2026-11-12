@@ -111,6 +111,33 @@ class RunTest(unittest.TestCase):
         self.assertEqual(record.burst_seconds, 3600)
         self.assertTrue(result["green"], result)
 
+    def run_with_soak_hook(self, hook):
+        now = [0.0]
+        statuses = {j: "completed" for j in sr.audits()}
+        with mock.patch.object(sr.operations, "reset"), \
+                mock.patch.object(sr.operations, "trigger_jobs", return_value=[]), \
+                mock.patch.object(sr.operations, "job_statuses", return_value=statuses), \
+                mock.patch.object(sr.operations, "job_seconds", return_value={}), \
+                mock.patch.object(sr, "pod_states", return_value={}), \
+                mock.patch.object(sr, "log_lines", return_value=[]):
+            return sr.run(project="p", host_cluster="h", host_context="ctx", namespace="ns",
+                          check_fleet=lambda: {"findings": []}, soak_seconds=3600, during_soak=hook,
+                          clock=lambda: now[0], sleep=lambda s: now.__setitem__(0, now[0] + s)), now
+
+    def test_the_soak_hook_runs_once_at_the_soak_start(self):
+        calls = []
+        (record, result), _ = self.run_with_soak_hook(lambda: calls.append(1))
+        self.assertEqual(calls, [1])
+        self.assertTrue(result["green"], result)
+
+    def test_a_failed_soak_hook_is_a_note_and_the_soak_still_lasts_its_hour(self):
+        def hook():
+            raise RuntimeError("relay closed")
+        (record, result), now = self.run_with_soak_hook(hook)
+        self.assertTrue(result["green"], result)
+        self.assertTrue(any("relay closed" in e for e in record.errors))
+        self.assertGreaterEqual(now[0] - record.burst_seconds, 3600)
+
 
 class RemarkTest(unittest.TestCase):
     def test_an_unclaimed_mark_is_made_again_after_ten_minutes(self):
