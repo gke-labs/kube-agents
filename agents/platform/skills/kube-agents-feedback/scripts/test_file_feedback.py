@@ -241,5 +241,120 @@ class FileFeedbackTest(unittest.TestCase):
         self.assertEqual(([], []), (calls, self._markers()))
 
 
+# A PlatformAgent as the sandbox's kubectl returns it. The chat subtree names
+# a channel, which is an identifier the block must never carry.
+RESOURCE = {
+    "apiVersion": "kubeagents.x-k8s.io/v1alpha1",
+    "kind": "PlatformAgent",
+    "metadata": {
+        "name": "platform-agent",
+        "namespace": "kubeagents-system",
+        "creationTimestamp": "2026-10-01T00:00:00Z",
+    },
+    "spec": {
+        "mode": "next",
+        "deployment": {"tag": "v0.9.1"},
+        "chat": {"slack": {"channel": "ops-alerts-prod"}},
+    },
+    "status": {
+        "conditions": [{"type": "Ready", "status": "True"}],
+        "inference": {"provider": "vertex_ai", "model": "claude-opus-5"},
+        "usage": {"clustersRegistered": 3, "activeInterfaces": ["slack"]},
+    },
+}
+
+
+class SummaryTest(unittest.TestCase):
+    """`summary` renders the resource-only block over the brokered kubectl and audits it."""
+
+    def _run(self, resource, readable: bool = True, **kwargs) -> tuple[int, str, str, list[list[str]]]:
+        argvs: list[list[str]] = []
+
+        def run(command, **_kw):
+            argvs.append(list(command))
+            if command[1:3] == ["get", "platformagent"] and readable:
+                return mock.Mock(returncode=0, stdout=json.dumps(resource), stderr="")
+            return mock.Mock(returncode=1, stdout="", stderr="forbidden")
+
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(file_feedback.feedback_summary.subprocess, "run", side_effect=run):
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = file_feedback.summary(kwargs.get("namespace", "kubeagents-system"), kwargs.get("name", "platform-agent"))
+        return code, out.getvalue(), err.getvalue(), argvs
+
+    def test_a_clean_resource_prints_the_fenced_block(self) -> None:
+        code, out, _, _ = self._run(RESOURCE)
+        self.assertEqual(0, code)
+        lines = out.strip().splitlines()
+        self.assertEqual(("```", "```"), (lines[0], lines[-1]))
+        self.assertIn(file_feedback.feedback_summary.SUMMARY_TITLE, lines[1])
+        self.assertIn("  version: v0.9.1", lines)
+        self.assertIn("  mode: next", lines)
+        self.assertIn("  clustersRegistered: 3", lines)
+        # The in-pod sources are off, so the figures the sandbox cannot read say so.
+        self.assertIn("  tokens: unavailable", lines)
+        self.assertIn("tasks (14 days): unavailable", lines)
+        self.assertNotIn("ops-alerts-prod", out)
+        # The rating form is for a person pasting the block by hand; an
+        # attached block ends on its last data line, then the fence.
+        self.assertNotIn("feedback:", lines)
+        self.assertFalse(any("Rating" in line for line in lines))
+        self.assertEqual("tasks (14 days): unavailable", lines[-2])
+
+    def test_the_rating_form_is_cut_only_where_render_puts_it(self) -> None:
+        rendered = file_feedback.feedback_summary.render(file_feedback.feedback_summary.Snapshot(
+            generated_at=file_feedback.feedback_summary.TEMPLATE_EPOCH, cr=RESOURCE, server_version=None,
+            litellm_config=None, tasks=None, litellm_metrics=None, sources={}))
+        form = list(file_feedback.feedback_summary.FEEDBACK_TEMPLATE)
+        self.assertEqual(form, rendered.split("\n")[-1 - len(form):-1], "render moved the form; the cut must follow")
+        cut = file_feedback._without_rating_form(rendered)
+        self.assertEqual(rendered.split("\n")[: -1 - len(form)] + ["```"], cut.split("\n"))
+        # A block without the form at its end is passed through untouched.
+        self.assertEqual(cut, file_feedback._without_rating_form(cut))
+
+    def test_an_identifier_in_the_block_is_blocked_with_a_count_only(self) -> None:
+        leaking = json.loads(json.dumps(RESOURCE))
+        leaking["status"]["usage"]["activeInterfaces"] = ["ops-alerts-prod"]
+        code, out, err, _ = self._run(leaking)
+        self.assertEqual(1, code)
+        printed = json.loads(out.strip())
+        self.assertEqual("BLOCKED", printed["status"])
+        self.assertIn("1 identifier", printed["reason"])
+        self.assertEqual(FALLBACK, printed["fallback"])
+        for text in (out, err):
+            self.assertNotIn("ops-alerts-prod", text, "the refusal must not name what the audit kept out")
+            self.assertNotIn("```", text, "no block is printed on a hit")
+
+    def test_an_unreadable_resource_is_blocked(self) -> None:
+        code, out, err, _ = self._run(RESOURCE, readable=False)
+        self.assertEqual(1, code)
+        printed = json.loads(out.strip())
+        self.assertEqual("BLOCKED", printed["status"])
+        self.assertIn("could not be read", printed["reason"])
+        self.assertIn("platform-agent in kubeagents-system", printed["reason"])
+        self.assertNotIn("```", out)
+        self.assertIn("feedback-summary:", err)
+
+    def test_the_kubectl_calls_carry_no_context_and_no_exec(self) -> None:
+        _, _, _, argvs = self._run(RESOURCE, namespace="agents", name="pa")
+        self.assertTrue(argvs, "the resource was never read")
+        self.assertIn(["kubectl", "get", "platformagent", "pa", "-n", "agents", "-o", "json"], argvs)
+        for argv in argvs:
+            with self.subTest(argv=argv):
+                self.assertNotIn("--context", argv)
+                self.assertNotIn("--kubeconfig", argv)
+                self.assertNotIn("exec", argv)
+
+    def test_the_summary_subcommand_is_wired_and_submit_is_unchanged(self) -> None:
+        with mock.patch.object(file_feedback, "summary", return_value=0) as run_summary:
+            with mock.patch.object(sys, "argv", ["file_feedback.py", "summary", "-n", "agents", "--name", "pa"]):
+                self.assertEqual(0, file_feedback.main())
+        run_summary.assert_called_once_with("agents", "pa")
+        with mock.patch.object(sys, "argv", ["file_feedback.py", "submit", "--payload-file", "p.json", "--attach-usage-summary"]):
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    file_feedback.main()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1367,7 +1367,10 @@ Enterprise Server hostname and its namespace a GitHub organisation or user name,
 one GitHub host and one host is one forge's, a GitLab forge needs a
 credentialsRef, a host that is a hostname and not GitHub's, and a namespace that
 is a GitLab group path, a self-managed forge (gitea) must
-name its host and credentialsRef, only a self-managed forge may declare a port or plain http, and a repository must name a
+name its host and credentialsRef, a bitbucket forge is at bitbucket.org with a credentialsRef and a
+workspace ID as its namespace, a bitbucket-datacenter forge names its host and credentialsRef and a
+project key as its namespace, only the Bitbucket providers accept an identity (an account UUID on
+bitbucket), only a self-managed forge may declare a port or plain http, and a repository must name a
 declared forge, be neither empty nor the alias's `None`, and be qualified by a
 namespace if it is a bare name; and at most one repository has role gitops. The namespace checks matter beyond the error
 text: a single-forge declaration renders as the alias, so without them the
@@ -1385,19 +1388,22 @@ declares nothing -- reading it as a declaration would make it collide with the
 `forges` list that replaces it, which is the migration every install has to
 make.
 
-The provider list mirrors the CRD's enum on ForgeSpec.Provider less
-bitbucket and bitbucket-datacenter, which the chart does not render yet: a
-Bitbucket forge is declared on the PlatformAgent resource itself until the
-chart learns their rules. The self-managed list mirrors the providers with SelfManaged set, the host list
-mirrors githubHosts, and the GitLab and Gitea namespace patterns mirror
-gitlabNamespaceRegex and giteaNamespaceRegex, all in k8s-operator/api/v1alpha1.
+The provider list mirrors the CRD's enum on ForgeSpec.Provider. The self-managed list mirrors the
+providers with AcceptsPort set (gitea), the host list mirrors githubHosts, the Bitbucket reserved
+domains mirror the bitbucket provider's ReservedDomains, and the GitLab, Gitea and Bitbucket
+namespace and identity patterns mirror gitlabNamespaceRegex, giteaNamespaceRegex,
+bitbucketWorkspaceRegex, bitbucketProjectKeyRegex and bitbucketAccountUUIDRegex, all in
+k8s-operator/api/v1alpha1.
 */}}
 {{- define "kube-agents.forgeProviders" -}}
-{{- $registered := list "github" "gitlab" "gitea" -}}
+{{- $registered := list "github" "gitlab" "gitea" "bitbucket" "bitbucket-datacenter" -}}
 {{- $selfManaged := list "gitea" -}}
 {{- $defaultScheme := "https" -}}
 {{- $githubHosts := list "github.com" "www.github.com" "ssh.github.com" -}}
-{{- $reservedHosted := list "github.com" "www.github.com" "ssh.github.com" "gitlab.com" "www.gitlab.com" -}}
+{{- $reservedHosted := list "github.com" "www.github.com" "ssh.github.com" "gitlab.com" "www.gitlab.com" "bitbucket.org" "www.bitbucket.org" -}}
+{{- $bitbucketHosts := list "bitbucket.org" "www.bitbucket.org" -}}
+{{- /* Mirrors the bitbucket provider's ReservedDomains: no other provider may be declared at one. */ -}}
+{{- $bitbucketReserved := "(^|\\.)(bitbucket\\.org|bitbucket\\.io|atlassian\\.com|atlassian\\.net)$" -}}
 {{- $integ := .Values.platformAgent.integration -}}
 {{- $forges := $integ.forges | default list -}}
 {{- $repos := $integ.repositories | default list -}}
@@ -1432,10 +1438,10 @@ gitlabNamespaceRegex and giteaNamespaceRegex, all in k8s-operator/api/v1alpha1.
 {{- /* ASCII only before `lower`, which is Unicode: `gİthub.com` lowers to github.com, and the operator folds ASCII only, so it is another host. */ -}}
 {{- /* A forge at a host other than github.com names its provider, as the CRD's rule, and before the host is judged as a GitHub host, so the remedy named is the provider: left to the default, a forge written for a GitLab instance would become a GitHub Enterprise Server. */ -}}
 {{- if and (not $f.provider) $host (regexMatch "^[A-Za-z0-9.-]+$" $host) (not (has (lower $host) $githubHosts)) -}}
-{{- fail (printf "platformAgent.integration.forges[%d].provider is required: the forge is at %q, not github.com; name it github for a GitHub Enterprise Server or gitlab for a GitLab instance" $i $f.host) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].provider is required: the forge is at %q, not github.com; name it github for a GitHub Enterprise Server, gitlab for a GitLab instance, or bitbucket-datacenter for a Bitbucket Data Center instance" $i $f.host) -}}
 {{- end -}}
 {{- /* A github forge is at github.com in one of its spellings, or at a GitHub Enterprise Server host: a hostname, label by label, that is not under a domain where GitHub runs its own services and not GitLab's. */ -}}
-{{- if and (eq $provider "github") $host (not (and (regexMatch "^[A-Za-z0-9.-]+$" $host) (has (lower $host) $githubHosts))) (or (not (regexMatch "^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$" $host)) (gt (len $host) 253) (regexMatch $githubReserved (lower $host)) (regexMatch "(^|\\.)gitlab\\.com$" (lower $host))) -}}
+{{- if and (eq $provider "github") $host (not (and (regexMatch "^[A-Za-z0-9.-]+$" $host) (has (lower $host) $githubHosts))) (or (not (regexMatch "^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$" $host)) (gt (len $host) 253) (regexMatch $githubReserved (lower $host)) (regexMatch "(^|\\.)gitlab\\.com$" (lower $host)) (regexMatch $bitbucketReserved (lower $host))) -}}
 {{- fail (printf "platformAgent.integration.forges[%d].host is %q, which provider github does not serve: name github.com or a GitHub Enterprise Server host" $i $f.host) -}}
 {{- end -}}
 {{- /* One host per forge, and one GitHub host per install, as the operator's hostConflicts. */ -}}
@@ -1448,6 +1454,12 @@ gitlabNamespaceRegex and giteaNamespaceRegex, all in k8s-operator/api/v1alpha1.
 {{- $ghHost = $canon -}}
 {{- else if eq $provider "gitlab" -}}
 {{- if or (not $canon) (eq $canon "www.gitlab.com") }}{{ $canon = "gitlab.com" }}{{ end -}}
+{{- else if eq $provider "bitbucket" -}}
+{{- /* Bitbucket Cloud has one host. A Data Center instance is the other provider. */ -}}
+{{- if and $canon (not (has $canon $bitbucketHosts)) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].host is %q, but provider bitbucket is Bitbucket Cloud at bitbucket.org only; for a Bitbucket Data Center instance, use provider bitbucket-datacenter" $i $f.host) -}}
+{{- end -}}
+{{- $canon = "bitbucket.org" -}}
 {{- end -}}
 {{- if and $canon (hasKey $hostProviders $canon) (ne (get $hostProviders $canon) $provider) -}}
 {{- fail (printf "platformAgent.integration.forges[%d].host: %s is already the host of a %s forge; one host is one forge's" $i $canon (get $hostProviders $canon)) -}}
@@ -1467,6 +1479,9 @@ gitlabNamespaceRegex and giteaNamespaceRegex, all in k8s-operator/api/v1alpha1.
 {{- end -}}
 {{- if $caMap -}}
 {{- /* gitlab.com and github.com present certificates the public CAs sign: a private CA must never vouch for them. */ -}}
+{{- if eq $provider "bitbucket" -}}
+{{- fail (printf "platformAgent.integration.forges[%d].caBundleRef cannot be set on provider bitbucket: bitbucket.org uses the public CAs" $i) -}}
+{{- end -}}
 {{- if and (has $provider (list "github" "gitlab")) (or (not $host) (has (lower $host) (concat (list "gitlab.com" "www.gitlab.com") $githubHosts))) -}}
 {{- fail (printf "platformAgent.integration.forges[%d].caBundleRef is for a self-managed host; gitlab.com and github.com use the public CAs, so set host to the instance's hostname or drop caBundleRef" $i) -}}
 {{- end -}}
@@ -1499,7 +1514,7 @@ gitlabNamespaceRegex and giteaNamespaceRegex, all in k8s-operator/api/v1alpha1.
 {{- if eq $provider "gitlab" -}}
 {{- /* Any GitHub name, not only its three spellings: api.github.com or raw.githubusercontent.com would hand GitHub's traffic a GitLab token. */ -}}
 {{- /* Label by label, as the operator's DNS-subdomain check: no empty or dash-edged label. */ -}}
-{{- if and $host (or (not (regexMatch "^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$" $host)) (gt (len $host) 253) (regexMatch $githubReserved (lower $host))) -}}
+{{- if and $host (or (not (regexMatch "^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$" $host)) (gt (len $host) 253) (regexMatch $githubReserved (lower $host)) (regexMatch $bitbucketReserved (lower $host))) -}}
 {{- fail (printf "platformAgent.integration.forges[%d].host is %q, which is not a hostname a gitlab forge can be at" $i $f.host) -}}
 {{- end -}}
 {{- if not $secret -}}
@@ -1513,11 +1528,39 @@ gitlabNamespaceRegex and giteaNamespaceRegex, all in k8s-operator/api/v1alpha1.
 {{- end -}}
 {{- $_ := set $credentialHosts $glHost (toString $i) -}}
 {{- $_ := set $forgeHosts $f.name (ternary (list "gitlab.com" "www.gitlab.com") (list $glHost) (eq $glHost "gitlab.com")) -}}
+{{- else if eq $provider "bitbucket" -}}
+{{- if not $secret -}}
+{{- fail (printf "platformAgent.integration.forges[%d] is a bitbucket forge with no credentialsRef.name; name the Secret that holds its API or access token under the key token" $i) -}}
+{{- end -}}
+{{- if hasKey $credentialHosts "bitbucket.org" -}}
+{{- fail (printf "platformAgent.integration.forges[%d].host: bitbucket.org is already served by forges[%s]; the broker holds one credential per host, so declare one bitbucket forge" $i (get $credentialHosts "bitbucket.org")) -}}
+{{- end -}}
+{{- $_ := set $credentialHosts "bitbucket.org" (toString $i) -}}
+{{- $_ := set $forgeHosts $f.name $bitbucketHosts -}}
+{{- else if eq $provider "bitbucket-datacenter" -}}
+{{- if not $host -}}
+{{- fail (printf "platformAgent.integration.forges[%d].host is required: provider bitbucket-datacenter is self-managed and has no default host" $i) -}}
+{{- end -}}
+{{- if or (has (lower $host) $reservedHosted) (regexMatch $githubReserved (lower $host)) (regexMatch "(^|\\.)gitlab\\.com$" (lower $host)) (regexMatch $bitbucketReserved (lower $host)) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].host is %q, which is a hosted SaaS domain and cannot be targeted by self-managed provider bitbucket-datacenter; Bitbucket Cloud is provider bitbucket" $i $f.host) -}}
+{{- end -}}
+{{- if or (not (regexMatch "^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$" $host)) (gt (len $host) 253) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].host is %q, which is not a multi-label DNS hostname; a Bitbucket Data Center instance is served at the root path on port 443, so give the hostname alone" $i $f.host) -}}
+{{- end -}}
+{{- if not $secret -}}
+{{- fail (printf "platformAgent.integration.forges[%d].credentialsRef.name is required: provider bitbucket-datacenter needs the Secret that holds its HTTP access token" $i) -}}
+{{- end -}}
+{{- $canonHost := lower $host -}}
+{{- if hasKey $credentialHosts $canonHost -}}
+{{- fail (printf "platformAgent.integration.forges[%d].host: %s is already served by forges[%s]; the broker holds one credential per host, so declare one %s forge there" $i $canonHost (get $credentialHosts $canonHost) $provider) -}}
+{{- end -}}
+{{- $_ := set $credentialHosts $canonHost (toString $i) -}}
+{{- $_ := set $forgeHosts $f.name (list $canonHost) -}}
 {{- else if $isSelfManaged -}}
 {{- if not $host -}}
 {{- fail (printf "platformAgent.integration.forges[%d].host is required: provider %s is self-managed and has no default host" $i $provider) -}}
 {{- end -}}
-{{- if or (has (lower $host) $reservedHosted) (regexMatch $githubReserved (lower $host)) (regexMatch "(^|\\.)gitlab\\.com$" (lower $host)) -}}
+{{- if or (has (lower $host) $reservedHosted) (regexMatch $githubReserved (lower $host)) (regexMatch "(^|\\.)gitlab\\.com$" (lower $host)) (regexMatch $bitbucketReserved (lower $host)) -}}
 {{- fail (printf "platformAgent.integration.forges[%d].host is %q, which is a hosted SaaS domain and cannot be targeted by self-managed provider %s" $i $f.host $provider) -}}
 {{- end -}}
 {{- if or (not (regexMatch "^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$" $host)) (gt (len $host) 253) -}}
@@ -1567,6 +1610,35 @@ gitlabNamespaceRegex and giteaNamespaceRegex, all in k8s-operator/api/v1alpha1.
 {{- end -}}
 {{- if and (eq $provider "gitea") $namespace (or (has (lower $namespace) $reservedHosted) (eq (lower $namespace) (lower $host))) -}}
 {{- fail (printf "platformAgent.integration.forges[%d].namespace is %q, which is the forge host; name the owner or organisation alone" $i $namespace) -}}
+{{- end -}}
+{{- if eq $provider "bitbucket" -}}
+{{- if gt (len $namespace) 255 -}}
+{{- fail (printf "platformAgent.integration.forges[%d].namespace is longer than 255 characters" $i) -}}
+{{- end -}}
+{{- if and $namespace (not (regexMatch "^[a-z0-9][a-z0-9_-]*$" $namespace)) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].namespace is %q, which is not a Bitbucket Cloud workspace ID (lowercase letters, digits, - and _)" $i $namespace) -}}
+{{- end -}}
+{{- end -}}
+{{- if eq $provider "bitbucket-datacenter" -}}
+{{- if gt (len $namespace) 255 -}}
+{{- fail (printf "platformAgent.integration.forges[%d].namespace is longer than 255 characters" $i) -}}
+{{- end -}}
+{{- if and $namespace (not (regexMatch "^[A-Za-z][A-Za-z0-9_]*$" $namespace)) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].namespace is %q, which is not a Bitbucket Data Center project key (a letter, then letters, digits and _)" $i $namespace) -}}
+{{- end -}}
+{{- end -}}
+{{- /* identity is the login the forge's credential acts as, for a token that cannot name its own account; only the Bitbucket brokers read it. */ -}}
+{{- with $f.identity -}}
+{{- if not (has $provider (list "bitbucket" "bitbucket-datacenter")) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].identity is set, but provider %s does not read it; only bitbucket and bitbucket-datacenter do" $i $provider) -}}
+{{- end -}}
+{{- /* The CRD's grammar for identity, on both providers. */ -}}
+{{- if not (regexMatch "^[A-Za-z0-9._@+{}-]{1,255}$" (toString .)) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].identity is %q; it is 1 to 255 letters, digits and . _ @ + { } -" $i (toString .)) -}}
+{{- end -}}
+{{- if and (eq $provider "bitbucket") (not (regexMatch "^(\\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\\}|[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12})$" (toString .))) -}}
+{{- fail (printf "platformAgent.integration.forges[%d].identity is %q; on provider bitbucket it is the account UUID the token acts as, with or without its braces" $i (toString .)) -}}
+{{- end -}}
 {{- end -}}
 {{- $names = append $names $f.name -}}
 {{- $providers = append $providers $provider -}}
