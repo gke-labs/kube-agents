@@ -280,7 +280,7 @@ func TestAProfileNamedForABucketUserIsRefusedAlone(t *testing.T) {
 	agent := authMapTestAgent()
 	profiles := []agentv1alpha1.AgentProfile{testAgentProfile(agent.Namespace, "dispatcher-b5"), testAgentProfile(agent.Namespace, "tse")}
 	withDispatcher(t)
-	t.Setenv(a2aDispatcherBucketedGrantsEnvVar, "")
+	t.Setenv(a2aDispatcherBucketedGrantsEnvVar, "false") // on unless "false" since this PR
 	if res := resolveAgentProfileIdentities(agent, profiles)["dispatcher-b5"]; res.refused != nil {
 		t.Errorf("with bucketed grants off, dispatcher-b5 was refused: %v", res.refused)
 	}
