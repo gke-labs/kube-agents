@@ -934,8 +934,8 @@ _HALF_MINUTE = timedelta(seconds=30)
 # Kanban tools return cards, and a card's result is a worker's own words.
 _KANBAN_TOOL_PREFIX = "kanban_"
 # What worker_trajectory's in-pod script puts in place of a result when the
-# pod's redactor will not load (its WITHHELD), and the marker its clip ends a
-# cut result with. Both live inside that script's source, so they are
+# pod's redactor will not load (its WITHHELD), and the marker its clip puts
+# on a cut value. Both live inside that script's source, so they are
 # spelled again here; test_report_times_in_window.py pins them to it. The
 # script's other placeholder, worker_trajectory.WITHHELD_READ_RESULT for the
 # one result of a call that read a credential, is a recorded call whose
