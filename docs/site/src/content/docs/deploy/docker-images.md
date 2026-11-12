@@ -102,7 +102,7 @@ Pinned here so `make mirror-images` and the install ask for the same version.
 | `k8s` | `docker.io/alpine/k8s` | `1.36.5` | — | The chart's pre-delete cleanup hook Job. |
 | `github-token-minter-server` | `us-docker.pkg.dev/abcxyz-artifacts/docker-images/github-token-minter-server` | `v2.7.1-amd64` | `GITHUB_MINTER_IMAGE` | The optional GitHub integration. |
 | `hindsight-api` | `ghcr.io/vectorize-io/hindsight-api` | `0.10.2@sha256:1ba631f950a04460feff6b1e212bad3cdf127b0cfb3d765bdcba12f512481d7b` | `HINDSIGHT_API_IMAGE` | The chart, when the memory provider uses Hindsight (make deploy-hindsight for the kustomize dev path). |
-| `hindsight-postgresql` | `docker.io/pgvector/pgvector` | `0.8.6-pg15@sha256:a947c45cdc5906a1bc951f20a8709e321256343ee0f251e4ae00b5e7def4e6da` | `HINDSIGHT_POSTGRES_IMAGE` | The chart, alongside the Hindsight API. |
+| `hindsight-postgresql` | `docker.io/pgvector/pgvector` | `0.8.7-pg15@sha256:88164492558c9773a1e17a8305abaca7863e05b3d8bbcdb792774890a2047e06` | `HINDSIGHT_POSTGRES_IMAGE` | The chart, alongside the Hindsight API. |
 | `cert-manager-controller` | `quay.io/jetstack/cert-manager-controller` | `v1.21.3` | — | cert-manager, installed by the full-install composition unless enable_cert_manager is false. |
 | `cert-manager-cainjector` | `quay.io/jetstack/cert-manager-cainjector` | `v1.21.3` | — | cert-manager, installed by the full-install composition unless enable_cert_manager is false. |
 | `cert-manager-webhook` | `quay.io/jetstack/cert-manager-webhook` | `v1.21.3` | — | cert-manager, installed by the full-install composition unless enable_cert_manager is false. |
