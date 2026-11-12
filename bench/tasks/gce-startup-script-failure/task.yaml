@@ -1,7 +1,7 @@
 # NIGHTLY-TIER: a full audit, the same cost band as the other fleet-audit
 # cases, registered in hack/eval/nightly-cases.txt. The VM below is on every
-# pool project: the fixture-state scan of 2026-11-06 reads the startup-fail-vm
-# role healthy on all 40.
+# pool project. The fixture-state scan checks its failure line on the serial
+# console, and each reconcile's reset of the VM keeps it there.
 #
 # The check this case grades is `gce-startup-script-status`, GCE compute SOP
 # §2.1: a RUNNING instance whose startup script failed. The collector
@@ -15,6 +15,18 @@
 # project-scoped startup-fail-vm role in bench/tf/fleet/fixtures.json
 # (cluster_slot null), which the runner probes with gcloud. No check reads it
 # by `fixture_role:`, because the role has no kubeconfig.
+#
+# The failure line is on the serial console only after a boot. The guest
+# prints it once per boot, and the VM's serial buffer (about 1 MiB) rotates
+# it out about three weeks later. Without the line the case has no finding to
+# grade. hack/fleet_reconcile.py resets the VM after each project whose
+# state it reads, and the fixture-state scan asserts the line on the
+# console (`serial_contains`), so a rotated buffer is fixture drift. The case
+# is recorded as infrastructure, not run, once the hourly scan has held the
+# role drifted on its last two scans and the lease-time scan sees it drifted
+# too (bench/kube_agents_bench/fixture_drift.py); otherwise it is graded. On
+# a console without the line the collector finds no failure line and files
+# nothing.
 #
 # Eval-driven development (.agents/rules/eval_driven_development.md): the
 # case was red before the collector fix. The collector knew only the markers

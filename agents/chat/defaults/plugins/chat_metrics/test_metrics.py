@@ -269,6 +269,34 @@ class DispatcherFailedTicksTest(unittest.TestCase):
         now[0] += metrics.DISPATCH_FAILURE_STALE_SECONDS + 1
         self.assertEqual([], _DISPATCH_LINE.findall(registry.render()))
 
+    def test_a_stale_streak_restarts_when_a_non_tick_try_comes_first(self):
+        # Two failures, then no try and no render past the stale window (the
+        # operator was down). An auto-decompose try comes before the next tick;
+        # the old streak must not carry on through it.
+        now = [100.0]
+        registry = metrics.ChatMetrics(clock=lambda: now[0])
+        for _ in range(2):
+            registry.record_dispatch_tick("default", "OperationalError")
+        now[0] += metrics.DISPATCH_FAILURE_STALE_SECONDS + 100
+        registry.record_dispatch_tick_start("default")
+        now[0] += 5
+        registry.record_dispatch_tick_end("default")
+        now[0] += 5
+        registry.record_dispatch_tick("default", "OperationalError")
+        self.assertEqual([("default", "OperationalError", "1")], _DISPATCH_LINE.findall(registry.render()))
+        self.assertEqual([("default", "OperationalError", "0")], _AGE_LINE.findall(registry.render()))
+
+    def test_a_render_during_the_first_try_after_a_stale_gap_drops_the_streak(self):
+        now = [100.0]
+        registry = metrics.ChatMetrics(clock=lambda: now[0])
+        for _ in range(2):
+            registry.record_dispatch_tick("default", "OperationalError")
+        now[0] += metrics.DISPATCH_FAILURE_STALE_SECONDS + 100
+        registry.record_dispatch_tick_start("default")
+        now[0] += 5
+        self.assertEqual([], _DISPATCH_LINE.findall(registry.render()))
+        self.assertEqual([], _AGE_LINE.findall(registry.render()))
+
     def test_a_good_tick_or_a_stale_restart_starts_the_age_again(self):
         now = [100.0]
         registry = metrics.ChatMetrics(clock=lambda: now[0])
