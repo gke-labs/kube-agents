@@ -87,13 +87,13 @@ func buildAdapters(cfg *gateway.Config, backends map[string]gateway.Adapter, nat
 	if err != nil {
 		return nil, err
 	}
-	return buildAdaptersWith(cfg, backends, console, log)
+	return buildAdaptersWith(backends, console, log)
 }
 
 // buildAdaptersWith is buildAdapters around a console adapter already
 // dialed, which realMain keeps for the console's chat.notify route. A lone
 // real backend is the mux's primary; with two or more no one backend is.
-func buildAdaptersWith(cfg *gateway.Config, backends map[string]gateway.Adapter, console *gateway.ConsoleAdapter, log *slog.Logger) (gateway.Adapter, error) {
+func buildAdaptersWith(backends map[string]gateway.Adapter, console *gateway.ConsoleAdapter, log *slog.Logger) (gateway.Adapter, error) {
 	if len(backends) == 0 {
 		return console, nil
 	}
@@ -160,13 +160,13 @@ func composeAdapters(cfg *gateway.Config, backends map[string]gateway.Adapter, d
 	if err != nil {
 		return nil, err
 	}
-	return composeAdaptersWith(cfg, backends, console, doors, log)
+	return composeAdaptersWith(backends, console, doors, log)
 }
 
 // composeAdaptersWith is composeAdapters around a console adapter already
 // dialed.
-func composeAdaptersWith(cfg *gateway.Config, backends map[string]gateway.Adapter, console *gateway.ConsoleAdapter, doors []gateway.DoorSpec, log *slog.Logger) (gateway.Adapter, error) {
-	chat, err := buildAdaptersWith(cfg, backends, console, log)
+func composeAdaptersWith(backends map[string]gateway.Adapter, console *gateway.ConsoleAdapter, doors []gateway.DoorSpec, log *slog.Logger) (gateway.Adapter, error) {
+	chat, err := buildAdaptersWith(backends, console, log)
 	if err != nil {
 		return nil, err
 	}
@@ -257,7 +257,7 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		log.Error("console adapter", "err", err)
 		return err
 	}
-	adapter, err := composeAdaptersWith(cfg, backendAdapters, console, doors, log)
+	adapter, err := composeAdaptersWith(backendAdapters, console, doors, log)
 	if err != nil {
 		log.Error("console adapter", "err", err)
 		return err

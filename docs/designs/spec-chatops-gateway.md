@@ -1157,11 +1157,10 @@ credential that may publish on `.in`. Going through the gateway instead means th
 that credential, mints the ids and the `authority` block itself, and the harness needs neither a
 NATS client nor a principal of its own.
 
-**A side door, not a fourth backend.** The one-backend guard refuses two real backends because
-two processes on one relay durable split its event deliveries, and the symptom is a gateway that
-looks healthy and answers half the messages. A local HTTP door has no such failure mode, so it
-may sit beside exactly one real backend and the guard keeps refusing two of those - which is what
-lets one install run the eval door and the Chat relay and compare them. The door alone also
+**A side door, not a fourth backend.** A local HTTP door consumes nothing and competes for
+nothing, so it sits beside the backends - which is what lets one install run the eval door and
+the Chat relay and compare them. What the config refuses is half a Slack pair or no ingress at
+all. The door alone also
 counts as an ingress, so an eval install with neither a Discord token nor a Chat relay starts its
 gateway instead of crash-looping. That last sentence is a decision, not an assumption of this
 section: the A2A owner decided it on the eval transport's design doc (`eval-next-transport.md`,
@@ -1414,8 +1413,8 @@ not watched, is seen within one requeue; a door flag comes back with the operato
 changing it causes, and Chat or Slack with the CR edit. An eval install with this door armed has an ingress
 the guard accepts, by the decision recorded above, and the render counts the door as a backend
 for the same reason. An install that enables Google Chat or Slack under `next` has a backend
-by that fact alone: the render asks the CR before it reads any Secret, and, because the gateway
-refuses two real backends, renders one of them in this order - Chat, then Slack, then the
+by that fact alone: the render asks the CR before it reads any Secret, and, because the operator
+renders one backend today, renders one of them in this order - Chat, then Slack, then the
 `discord-bot` reference - so a `discord-bot` Secret left in the namespace does not stop a Chat
 or Slack gateway starting. With both integrations enabled, Chat holds the gateway and Slack
 stays on the legacy consumer rather than reaching nobody. The Slack refs are rendered on the

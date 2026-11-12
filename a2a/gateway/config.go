@@ -861,22 +861,13 @@ func FromEnv() (*Config, error) {
 	// connection, and the Chat relay durable is the gateway's alone, with
 	// the election keeping one leader per Deployment, so no delivery is
 	// split. What the guard still refuses is half a Slack pair (above) and
-	// no ingress at all (below). Adding a backend is one entry in this list.
-	var armed []string
-	if cfg.GchatRelayURL != "" {
-		armed = append(armed, "A2A_GCHAT_RELAY_URL")
-	}
-	if cfg.SlackBotToken != "" {
-		armed = append(armed, "the SLACK_BOT_TOKEN+SLACK_APP_TOKEN pair")
-	}
-	if cfg.DiscordToken != "" {
-		armed = append(armed, "DISCORD_TOKEN")
-	}
-	// The doors (inject, A2A) are NOT in that list, decided 2026-09-17 on
+	// no ingress at all (below).
+	//
+	// The doors (inject, A2A) are NOT among Backends, decided 2026-09-17 on
 	// the design doc's review for the inject door and holding for its
 	// sibling. A local HTTP door consumes nothing and competes for nothing,
 	// so it is a way in beside the backends rather than one of them.
-	if len(armed) == 0 {
+	if len(cfg.Backends()) == 0 {
 		// The door alone is enough to start. Decided, not assumed: the A2A
 		// owner's decision of 2026-09-17 on the eval transport's design doc
 		// (eval-next-transport.md) is that an eval install with neither a

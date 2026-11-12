@@ -226,6 +226,12 @@ func (m *MultiAdapter) Roster(conversation string) ([]string, bool, error) {
 	return a.Roster(conversation)
 }
 
+// OpenDirect opens a direct message with a backend-qualified user id
+// (<backend>:<id>) on that backend. A caller must always qualify the id: a
+// Slack guest id from another workspace is itself T…:U… and contains the
+// separator, so only the backend prefix in front of it is unambiguous. A
+// bare id works only on a mux with a single real backend, and only for an
+// id with no colon in it. An unknown prefix is refused.
 func (m *MultiAdapter) OpenDirect(userID string) (string, error) {
 	if backend, id, ok := strings.Cut(userID, ":"); ok {
 		a, known := m.byPrefix[backend]

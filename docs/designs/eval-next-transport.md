@@ -226,7 +226,9 @@ Chat; a localhost door has no silent-stop failure mode, so it is a side door tha
 exactly one real backend, and the guard keeps refusing two real ones. The door beside a real
 backend is therefore not a refusal, which is what lets stage 2 run the inject and Chat transports
 against one install and compare them, and meets the A2A owner's condition that the guard change
-be coordinated with the Slack adapter in flight.
+be coordinated with the Slack adapter in flight. The guard was narrowed on 2026-11-12, so the
+gateway now runs every armed backend (the gateway spec's "Every armed backend in one gateway
+process").
 The door alone is also enough for the gateway to start (decided 2026-09-17 by the A2A owner,
 whose reason is that this is what makes the adapter the answer for an eval install with no real
 backend), and the eval install has none until stage 2 gives it one; the adapter's change makes
@@ -576,7 +578,8 @@ gateway renders and starts without a Discord Secret; and the one-backend guard i
 precedence rather than by a guard change: the render omits the Discord reference when Chat is
 armed, the relay URL beside a Slack credential stays the gateway's refusal, and the inject door
 beside the relay URL is not one (stage 1), so the install this stage wires runs both
-transports. A render that drops the relay URL still leaves a gateway on the door alone, which
+transports. The gateway's guard was narrowed on 2026-11-12 to run every armed backend (the
+gateway spec's "Every armed backend in one gateway process"). A render that drops the relay URL still leaves a gateway on the door alone, which
 the read route reports as inject-only and the stage's preflight fails as infrastructure before
 any case runs.
 

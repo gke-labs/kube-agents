@@ -348,7 +348,9 @@ func TestMultiAdapterRestartsOneBackendWhileTheOtherServes(t *testing.T) {
 	m.restartBase, m.restartMax = time.Millisecond, 4*time.Millisecond
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go m.Run(ctx, func(InboundMessage) {})
+	got := make(chan InboundMessage, 1)
+	done := make(chan error, 1)
+	go func() { done <- m.Run(ctx, func(msg InboundMessage) { got <- msg }) }()
 	deadline := time.Now().Add(time.Second)
 	for bad.runs.Load() < 3 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
@@ -356,7 +358,21 @@ func TestMultiAdapterRestartsOneBackendWhileTheOtherServes(t *testing.T) {
 	if bad.runs.Load() < 3 {
 		t.Fatalf("slack restarted %d times, want at least 3", bad.runs.Load())
 	}
+	select {
+	case err := <-done:
+		t.Fatalf("Run returned while slack restarts: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	g.inbox <- InboundMessage{Conversation: "gchat:spaces/A", AuthorID: "a@x"}
+	select {
+	case msg := <-got:
+		if msg.Backend != "gchat" {
+			t.Errorf("gchat inbound stamped %q, want gchat", msg.Backend)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("gchat stopped serving while slack restarts: inbound not delivered")
+	}
 	if _, err := m.Post("gchat:spaces/A", "still here"); err != nil {
-		t.Errorf("gchat stopped serving while slack restarts: %v", err)
+		t.Errorf("gchat stopped dispatching while slack restarts: %v", err)
 	}
 }
