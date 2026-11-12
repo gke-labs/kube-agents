@@ -226,6 +226,9 @@ readonly A2A_DIAG_NATS_MONITOR_URL="http://127.0.0.1:8222"
 readonly A2A_DIAG_NATS_MONITOR_PATHS="jsz routez varz"
 readonly A2A_DIAG_NATS_READ_MAX_BYTES=$((1024 * 1024))
 readonly A2A_DIAG_NATS_EXEC_BOUND_SECONDS=10
+# wget's own read timeout, inside the exec's bound, so a monitor that accepts
+# and then stalls ends the read before the bound kills the exec.
+readonly A2A_DIAG_NATS_WGET_TIMEOUT_SECONDS=5
 readonly A2A_DIAG_NATS_IMAGES_JSONPATH='{range .items[*]}{.metadata.name}{"\t"}{range .status.containerStatuses[*]}{.name}={.imageID}{" "}{end}{"\n"}{end}'
 
 # ─── Inference-replay shadow mode ────────────────────────────────────────────
@@ -1347,7 +1350,7 @@ collect_a2a_nats_monitor() {
   command -v timeout >/dev/null 2>&1 || bound=()
   for path in ${A2A_DIAG_NATS_MONITOR_PATHS}; do
     ${bound[@]+"${bound[@]}"} "${kctl[@]}" exec "pod/${pod}" -n "${ns}" -c "${A2A_DIAG_NATS_CONTAINER}" -- \
-      wget -qO- -T 5 "${A2A_DIAG_NATS_MONITOR_URL}/${path}" 2>&1 \
+      wget -qO- -T "${A2A_DIAG_NATS_WGET_TIMEOUT_SECONDS}" "${A2A_DIAG_NATS_MONITOR_URL}/${path}" 2>&1 \
       | last_bytes "${A2A_DIAG_NATS_READ_MAX_BYTES}" "${artifact_dir}/${prefix}${base}-${path}.json" || true
   done
   return 0
