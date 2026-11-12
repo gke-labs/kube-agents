@@ -213,6 +213,34 @@ func TestSeenSecrets_ACredentialKeysPlainWordIsTrackedAndSettingsAreNot(t *testi
 	}
 }
 
+// Prefixed connection settings (DB_HOST, POSTGRES_USER, db.name, hostname)
+// are settings too, matched on the key's last component, and the answer
+// that names them stays readable; a prefixed password stays tracked
+// (#5311 review: Fuxiao-Gao, bradhoekstra).
+func TestSeenSecrets_PrefixedConnectionSettingsAreNotTracked(t *testing.T) {
+	const (
+		host = "postgres.prod.svc.cluster.local"
+		user = "orders_app"
+		db   = "orders_db"
+		pass = "Synth3tic-DbPass-0042"
+	)
+	data := map[string]string{"DB_HOST": host, "POSTGRES_USER": user, "db.name": db, "hostname": "db-replica-1", "DB_PASSWORD": pass}
+	var s seenSecrets
+	s.collectToolResult(terminalResult(t, secretJSON(t, "Opaque", data)))
+	for _, v := range []string{host, user, db, "db-replica-1"} {
+		if s.has(v) {
+			t.Errorf("the setting %q is tracked", v)
+		}
+	}
+	if !s.has(pass) {
+		t.Error("the prefixed password is not tracked")
+	}
+	answer := "DB_HOST is " + host + "; user " + user + " on " + db + "."
+	if got := scrubAnswerText(answer, &s); got != answer {
+		t.Errorf("the answer naming the settings was changed: %q", got)
+	}
+}
+
 // YAML lists: kubectl's -o yaml of several Secrets is a List whose items
 // are indented, a kind line may carry a comment, and each item is read for
 // its own lines only, so a ConfigMap item beside a Secret is not read.
