@@ -37,6 +37,21 @@ const (
 	BackendConsole = consoleBackend
 )
 
+// backendArm is one REAL chat backend and the config field that arms it.
+type backendArm struct {
+	name  string
+	armed func(*Config) bool
+}
+
+// backendArms lists the real chat backends in Backends' order. Adding a real
+// backend is one row here: Backends and the mux's direct-message refusal
+// (knownBackendName) both read it.
+var backendArms = []backendArm{
+	{name: gchatBackend, armed: func(c *Config) bool { return c.GchatRelayURL != "" }},
+	{name: slackBackend, armed: func(c *Config) bool { return c.SlackBotToken != "" }},
+	{name: discordBackend, armed: func(c *Config) bool { return c.DiscordToken != "" }},
+}
+
 // defaultMaxSessions is what MaxSessions means when unset; the field's
 // comment carries the sizing rationale.
 const defaultMaxSessions = 10
@@ -693,14 +708,10 @@ type Config struct {
 // reason Backend gives.
 func (c *Config) Backends() []string {
 	var backends []string
-	if c.GchatRelayURL != "" {
-		backends = append(backends, gchatBackend)
-	}
-	if c.SlackBotToken != "" {
-		backends = append(backends, slackBackend)
-	}
-	if c.DiscordToken != "" {
-		backends = append(backends, discordBackend)
+	for _, arm := range backendArms {
+		if arm.armed(c) {
+			backends = append(backends, arm.name)
+		}
 	}
 	return backends
 }
