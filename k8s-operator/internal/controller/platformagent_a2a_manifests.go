@@ -179,6 +179,15 @@ const (
 	a2aProvisionImageEnvVar = "A2A_PROVISION_IMAGE"
 	// nats-box carries the nats CLI the provisioning script drives.
 	defaultA2AProvisionImage = "natsio/nats-box:0.14.5"
+	// prometheus-nats-exporter, the metrics sidecar in the NATS pod
+	// (a2aNATSExporterContainer); images.json carries it as
+	// prometheus-nats-exporter. Pinned by digest as well as tag, the OCI
+	// index, so the same reference serves amd64 and arm64 nodes.
+	a2aNATSExporterImageEnvVar = "A2A_NATS_EXPORTER_IMAGE"
+	// a2aNATSExporterOmittedReason is the Warning event's reason when the
+	// NATS pod renders without the metrics sidecar (a2aNATSExporterOmitted).
+	a2aNATSExporterOmittedReason = "A2ABusMetricsExporterOmitted"
+	defaultA2ANATSExporterImage  = "natsio/prometheus-nats-exporter:0.20.3@sha256:4b8ddc1c86fec360b5cd3d5e1fbc6fb52bdafd5805bba3901cc52926538af255"
 
 	// Requests and limits on the next-stack pods. A namespace whose
 	// ResourceQuota requires limits refuses a pod that omits them at
@@ -203,6 +212,37 @@ const (
 	a2aNATSMemoryRequest = "512Mi"
 	a2aNATSCPULimit      = "1"
 	a2aNATSMemoryLimit   = "1Gi"
+
+	// The exporter sidecar holds one scrape's worth of /varz and /jsz JSON
+	// at a time, and -jsz=all brings every consumer with it, so its memory
+	// and CPU grow with the bus's consumers (about two per AgentProfile).
+	// Measured with a synthetic /jsz: 20Mi on a dev bus with five consumers,
+	// 31Mi at 500, 90Mi and 0.7 CPU-seconds a scrape at 2,000, 121Mi and 4
+	// CPU-seconds at 5,000. The limits are sized for 2,000, the stated
+	// ceiling (about 1,000 clusters' profiles); past it the exporter nears
+	// its memory limit, and an OOM kill takes the container and so the pod's
+	// readiness. On an Autopilot cluster without Pod bursting the limits are
+	// rewritten to the requests, 50m and 96Mi; the loop derives GOMEMLIMIT
+	// from the real limit, and measured there the exporter peaked at 70Mi
+	// with 2,000 consumers (a scrape about 12s) and 78Mi with 3,000, where a
+	// scrape at 50m outlasts the 30s interval. So the ceiling holds there
+	// too, bound by CPU rather than memory.
+	// The CPU request is the stack's floor, 50m, rather than what the
+	// exporter uses idle, so a namespace LimitRange that admits the bus's
+	// other containers admits this one: a refused sidecar would keep its
+	// server out of the bus.
+	a2aNATSExporterCPURequest    = "50m"
+	a2aNATSExporterMemoryRequest = "96Mi"
+	a2aNATSExporterCPULimit      = "500m"
+	a2aNATSExporterMemoryLimit   = "192Mi"
+	// The Go runtime's soft limit, below the container's so the exporter
+	// collects garbage before the kernel kills the container (which the
+	// supervisor loop cannot survive). The loop replaces it with 80% of the
+	// limit it reads from its cgroup (a2aNATSExporterSupervisor); this is
+	// the value where it can't read one, 80% of the rendered limit (192Mi
+	// gives 153.6MiB, rounded down to a whole MiB). GOMEMLIMIT takes a byte
+	// count with an IEC suffix.
+	a2aNATSExporterGoMemLimit = "153MiB"
 
 	a2aGatewayCPURequest    = "50m"
 	a2aGatewayMemoryRequest = "64Mi"
@@ -1210,6 +1250,30 @@ const (
 	a2aGatewayReadyzPath = "/readyz"
 )
 
+// a2aNATSMetricsPort is the NATS exporter sidecar's listener
+// (a2aNATSExporterContainer), where it serves the bus's JetStream stream and
+// storage series in Prometheus format. Its own port, so the managed-Prometheus
+// collector is admitted to the exporter and not to the server: the exporter
+// reads the monitor port over the pod's loopback, and the monitor port keeps
+// no pod-network peer. One constant for the container port, the exporter's
+// -port flag, and the collector's ingress rule in buildA2ANATSNetworkPolicy;
+// the chart's PodMonitoring scrapes it by number, held to this one by
+// tests/test_chart_platform_agent_monitoring.py. 7777 is the exporter's own
+// default.
+const (
+	a2aNATSMetricsPort           int32 = 7777
+	a2aNATSMetricsPortName             = "nats-metrics"
+	a2aNATSExporterContainerName       = "nats-exporter"
+	// a2aNATSExporterMonitorHost is where the exporter reaches the server's
+	// monitor listener: the pod's own loopback, which NetworkPolicy does
+	// not govern, so the fence needs no rule for it.
+	a2aNATSExporterMonitorHost = "127.0.0.1"
+	// a2aNATSExporterUID is nobody. The exporter image sets no USER, so
+	// without one the container would run as root; it reads nothing from
+	// disk and writes nothing, so any non-root UID serves.
+	a2aNATSExporterUID int64 = 65534
+)
+
 // a2aGatewayProgressDeadlineSeconds is the gateway Deployment's progress
 // deadline. With the readiness probe, a gateway waiting for TASKS holds its
 // rollout at zero available replicas, and past the deadline the Deployment
@@ -1227,6 +1291,47 @@ func a2aNATSImage() string {
 		return override
 	}
 	return defaultA2ANATSImage
+}
+
+func a2aNATSExporterImage() string {
+	if override := os.Getenv(a2aNATSExporterImageEnvVar); override != "" {
+		return override
+	}
+	return defaultA2ANATSExporterImage
+}
+
+// a2aNATSExporterOmitted reports whether the NATS pod renders without the
+// metrics sidecar: when A2A_NATS_IMAGE is overridden and
+// A2A_NATS_EXPORTER_IMAGE is not. An install that mirrors the bus's images
+// set the first before the sidecar existed, and the default exporter
+// reference would not pull there. The sidecar is a plain container, so a pod
+// whose sidecar cannot start never goes Ready and its server leaves the bus;
+// metrics never cost a bus server. The reconcile says so in a Warning event
+// (a2aNATSExporterOmittedReason).
+func a2aNATSExporterOmitted() bool {
+	return os.Getenv(a2aNATSImageEnvVar) != "" && os.Getenv(a2aNATSExporterImageEnvVar) == ""
+}
+
+// a2aNATSExporterResources adds an ephemeral-storage request and equal limit,
+// for the container's own log (the supervisor loop's lines and the
+// exporter's), to its CPU and memory, as a2aNATSReloaderResources does. It
+// writes nothing else: its root filesystem is read-only and it mounts nothing.
+func a2aNATSExporterResources() corev1.ResourceRequirements {
+	resources := a2aResources(a2aNATSExporterCPURequest, a2aNATSExporterMemoryRequest, a2aNATSExporterCPULimit, a2aNATSExporterMemoryLimit)
+	resources.Requests[corev1.ResourceEphemeralStorage] = resource.MustParse(emptyDirLogsAllowance)
+	resources.Limits[corev1.ResourceEphemeralStorage] = resource.MustParse(emptyDirLogsAllowance)
+	return resources
+}
+
+// a2aNATSContainers is the NATS pod's containers: the server, the config
+// reloader (buildA2ANATSReloaderContainer), and the metrics sidecar unless
+// a2aNATSExporterOmitted.
+func a2aNATSContainers(server corev1.Container) []corev1.Container {
+	containers := []corev1.Container{server, buildA2ANATSReloaderContainer()}
+	if a2aNATSExporterOmitted() {
+		return containers
+	}
+	return append(containers, a2aNATSExporterContainer())
 }
 
 func a2aProvisionImage() string {
@@ -2909,7 +3014,7 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 					// default (a2aNATSTerminationGrace).
 					TerminationGracePeriodSeconds: a2aNATSTerminationGrace(replicas),
 					TopologySpreadConstraints:     a2aNATSTopologySpread(selector, replicas),
-					Containers: []corev1.Container{{
+					Containers: a2aNATSContainers(corev1.Container{
 						Name:    "nats",
 						Image:   a2aNATSImage(),
 						Command: []string{"/bin/sh", "-c", a2aNATSStartupScript},
@@ -2937,7 +3042,7 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 								HTTPGet: &corev1.HTTPGetAction{Path: a2aNATSReadinessPath(replicas), Port: intstr.FromString("monitor")},
 							},
 						},
-					}, buildA2ANATSReloaderContainer()},
+					}),
 					Volumes: []corev1.Volume{{
 						Name:         a2aNATSPIDVolume,
 						VolumeSource: a2aNATSPIDVolumeSource(),
@@ -3202,15 +3307,19 @@ func buildA2ASessionNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluster
 // grants do the real refusing; with it the network layer agrees with the
 // grants: 4222 from exactly the enumerated bus clients (and every pod in the
 // AgentProfile namespace, once that namespace's own fence is in place), 9222 from exactly the
-// console server, nothing else.
+// console server, the exporter sidecar's a2aNATSMetricsPort from the
+// managed-Prometheus collector's namespace, nothing else.
 //
 // 8222 (monitor) gets one peer, the operator's own pod, which reads
 // config_load_time there to confirm a config reload (planA2ABusReload). It's
 // the same peer 4222 admits, and nothing else on the pod network reaches the
 // port. The kubelet's readiness probe enters from the node, which
-// NetworkPolicy does not govern (Dataplane V2 exempts host-local traffic).
-// With no operator peer (a2aOperatorNATSPeers) there is no 8222 rule, a
-// reload can't be confirmed, and the operator restarts the bus pod instead.
+// NetworkPolicy does not govern (Dataplane V2 exempts host-local traffic),
+// and the exporter sidecar (a2aNATSExporterContainer) reads it over the
+// pod's loopback. A scrape reaches the exporter's port instead, which serves
+// the derived series and nothing of the monitor's own endpoints. With no
+// operator peer (a2aOperatorNATSPeers) there is no 8222 rule, a reload can't
+// be confirmed, and the operator restarts the bus pod instead.
 //
 // 9222 (ws) gets one peer, the console server. The browser reaches the console
 // server through a port-forward and the server proxies the page's websocket to
@@ -3261,8 +3370,9 @@ func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 					// new work.
 					//
 					// The same rule is owed to the peers that arm later.
-					// The audit exporter, the janitor and the metrics
-					// scrape each add one when they exist. The NATS
+					// The audit exporter and the janitor each add one
+					// when they exist; the metrics scrape needs none, as
+					// it reads the monitor port over loopback. The NATS
 					// servers' own route peer, on 6222, is a separate rule
 					// (a2aNATSRouteIngress): a multi-server bus's servers
 					// dial each other, and a fence without it means the
@@ -3323,6 +3433,19 @@ func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 						"app": a2aConsoleName(agent),
 					}}},
 				},
+			}, {
+				// The exporter sidecar's port from the managed-Prometheus
+				// collector's namespace alone, the shape of the A2A
+				// gateway's metrics rule (buildA2AGatewayNetworkPolicy).
+				// The exporter reads 8222 over loopback, so this rule is
+				// what the scrape needs, and the collector gets nothing on
+				// 8222, whose one peer is the operator's (planA2ABusReload).
+				Ports: []networkingv1.NetworkPolicyPort{tcpPort(a2aNATSMetricsPort)},
+				From: []networkingv1.NetworkPolicyPeer{{
+					NamespaceSelector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{labelMetadataName: gmpNamespace},
+					},
+				}},
 			}},
 		},
 	}
@@ -4962,6 +5085,108 @@ func a2aNATSLifecycle(replicas int) *corev1.Lifecycle {
 		},
 	}
 }
+
+// a2aNATSExporterContainer is the metrics sidecar in every NATS pod, on a
+// one-server bus and on each server of a cluster: prometheus-nats-exporter
+// reading its own server's monitor listener over the pod's loopback and
+// serving what it reads on a2aNATSMetricsPort for the managed-Prometheus
+// collector.
+//
+// -varz carries the server's JetStream storage (used, reserved, and the
+// configured maximum). -jsz=all asks the server for /jsz with consumers and
+// stream config, which is the one jsz filter that exports each stream's
+// max_bytes beside its bytes; the narrower "streams" filter leaves config
+// out. The exporter labels its series with the URL it reads, the same on
+// every server; the collector's own pod label tells the servers apart.
+//
+// The exporter runs under a2aNATSExporterSupervisor rather than as the
+// container's own process. The pod is Ready only while every container is,
+// so an exporter that exited would take its server out of the client Service
+// and count against the bus's disruption budget; the loop keeps the
+// container running and restarts the exporter instead. A native sidecar does
+// not help: measured on GKE 1.35, one that crashes or fails its probe makes
+// the pod NotReady the same way, and one whose image will not pull keeps the
+// server from starting at all. What the loop cannot cover is an OOM kill,
+// which takes the whole container: GOMEMLIMIT sits below the memory limit so
+// the exporter collects garbage before it gets there.
+//
+// No preStop, unlike the server: the loop kills the exporter and exits on
+// SIGTERM, which the kubelet sends it at the start of the pod's grace period
+// while the server's lame duck runs (a2aNATSLifecycle). The bus is unscraped
+// for that window, which costs one or two missing samples per roll.
+func a2aNATSExporterContainer() corev1.Container {
+	monitorURL := "http://" + net.JoinHostPort(a2aNATSExporterMonitorHost, strconv.Itoa(a2aNATSMonitorPort))
+	return corev1.Container{
+		Name:    a2aNATSExporterContainerName,
+		Image:   a2aNATSExporterImage(),
+		Command: []string{"/bin/sh", "-c", a2aNATSExporterSupervisor, a2aNATSExporterBinary},
+		Env:     []corev1.EnvVar{{Name: "GOMEMLIMIT", Value: a2aNATSExporterGoMemLimit}},
+		Args: []string{
+			"-port=" + strconv.Itoa(int(a2aNATSMetricsPort)),
+			"-varz",
+			"-jsz=all",
+			monitorURL,
+		},
+		Ports: []corev1.ContainerPort{{
+			Name: a2aNATSMetricsPortName, ContainerPort: a2aNATSMetricsPort,
+		}},
+		SecurityContext: &corev1.SecurityContext{
+			RunAsNonRoot:             ptr.To(true),
+			RunAsUser:                ptr.To(a2aNATSExporterUID),
+			RunAsGroup:               ptr.To(a2aNATSExporterUID),
+			AllowPrivilegeEscalation: ptr.To(false),
+			ReadOnlyRootFilesystem:   ptr.To(true),
+			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+			SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+		},
+		Resources: a2aNATSExporterResources(),
+	}
+}
+
+// a2aNATSExporterBinary is the exporter's path in its image, which runs it
+// from /entrypoint.sh as exec "/${GO_APP}".
+const a2aNATSExporterBinary = "/prometheus-nats-exporter"
+
+// a2aNATSExporterSupervisor runs the exporter with the container's args and
+// restarts it whenever it exits, logging the exit code, after a pause that
+// doubles from 1s to 30s and starts again at 1s once a run has lasted a
+// minute, so a crashing exporter cannot spin. The shell is the container's
+// main process, the one the kubelet's TERM reaches. The pod shares one
+// process namespace for the config reloader, so the shell isn't PID 1 (the
+// pause process is), and the trap is what ends the run cleanly: it kills the
+// exporter (or the pause) and exits at once on TERM or INT, so a pod delete
+// or a NATS drain is not held for the grace period, and no exporter is left
+// running past its shell. The image is alpine, so sh,
+// sleep, date and cat are busybox's.
+//
+// Before the first run it sets GOMEMLIMIT to 80% of the container's actual
+// memory limit, read from its cgroup. The rendered value assumes the
+// rendered limit, but an Autopilot cluster without Pod bursting rewrites the
+// limit to the request, and a GOMEMLIMIT above the real limit never makes
+// the runtime collect early. A limit that reads "max" (none) or can't be read
+// (a cgroup v1 node) keeps the rendered value.
+const a2aNATSExporterSupervisor = `trap 'kill -TERM "$pid" 2>/dev/null; exit 0' TERM INT
+max=$(cat /sys/fs/cgroup/memory.max 2>/dev/null)
+case "$max" in
+  '' | *[!0-9]*) ;;
+  *) GOMEMLIMIT=$((max / 5 * 4)) && export GOMEMLIMIT ;;
+esac
+echo "prometheus-nats-exporter GOMEMLIMIT=$GOMEMLIMIT" >&2
+delay=1
+while :; do
+  started=$(date +%s)
+  "$0" "$@" &
+  pid=$!
+  wait "$pid"
+  rc=$?
+  if [ $(($(date +%s) - started)) -ge 60 ]; then delay=1; fi
+  echo "prometheus-nats-exporter exited with code $rc; restarting in ${delay}s" >&2
+  sleep "$delay" &
+  pid=$!
+  wait "$pid"
+  delay=$((delay * 2))
+  if [ "$delay" -gt 30 ]; then delay=30; fi
+done`
 
 // a2aNATSTerminationGrace is the pod's grace period: room for lame duck on a
 // cluster, the Kubernetes default on a single server, which runs none.
@@ -6887,6 +7112,10 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		}
 		if err := r.applyManaged(ctx, agent, config); err != nil {
 			return state, fmt.Errorf("failed to apply A2A NATS config: %w", err)
+		}
+		if a2aNATSExporterOmitted() {
+			r.recordEvent(agent, corev1.EventTypeWarning, a2aNATSExporterOmittedReason,
+				"the A2A bus runs without its metrics exporter: "+a2aNATSImageEnvVar+" is set and "+a2aNATSExporterImageEnvVar+" is not; set it to the mirrored prometheus-nats-exporter image")
 		}
 		if err := ctrl.SetControllerReference(agent, sts, r.Scheme); err != nil {
 			return state, err
