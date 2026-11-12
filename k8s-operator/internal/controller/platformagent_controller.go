@@ -788,15 +788,20 @@ type PlatformAgentReconciler struct {
 // writes; no Role it renders grants the kind, and the built-in admin and edit
 // roles don't aggregate it. `podtemplates` create only: the server-side dry
 // run that defaults a Job template (defaultedJobTemplate), which stores
-// nothing. Both are namespaced, reads included: no informer watches a
-// DispatchJobTemplate (every read goes through a2aReader(), uncached, in the
-// profile namespace) and no Role the operator renders grants the kind, so
-// nothing needs the grant cluster-wide. The install creates the profile
-// namespace and binds the namespaced Role there in the same apply (the
-// chart under mode next, config/profiles under make deploy), which
-// is what lets a namespaced grant reach it (the ClusterRole form approved by
-// @bnaylor on 2026-10-30 and 2026-10-31, #3655 PR 6, predates that binding).
-// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=dispatchjobtemplates,verbs=get;list;create;update;patch;delete,namespace=kubeagents-system
+// nothing. The writes are namespaced like every other rendered kind's. The
+// reads stay cluster-wide, like every other kind's, for the teardown walk:
+// deleteDispatcherJobsAndTemplates lists the kind in <ns>-profiles on every
+// deletion and every flip to today, before any check that the namespace or
+// a RoleBinding in it exists, and a Helm install in mode today binds the
+// Role in the install namespace only, so a namespaced read would be a 403
+// there (the API server authorises a namespaced list before it looks for
+// the namespace). The install creates the profile namespace and binds the
+// namespaced Role there in the same apply (the chart under mode next,
+// config/profiles under make deploy), which is what lets the namespaced
+// writes reach it (the ClusterRole form approved by @bnaylor on 2026-10-30
+// and 2026-10-31, #3655 PR 6, predates that binding).
+// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=dispatchjobtemplates,verbs=get;list
+// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=dispatchjobtemplates,verbs=create;update;patch;delete,namespace=kubeagents-system
 // +kubebuilder:rbac:groups="",resources=podtemplates,verbs=create,namespace=kubeagents-system
 // `get` on the dispatcher Job admission policy and its binding: before the
 // dispatcher gets its Jobs Role, the operator checks both are in the cluster

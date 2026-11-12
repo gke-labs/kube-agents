@@ -125,9 +125,9 @@ PROFILE_ROLE_COPY = KUSTOMIZE_PROFILES_DIR / "role.yaml"
 HELM_MODE_NEXT_SETS = ["--set", "platformAgent.mode=next"]
 # Every namespaced kind the operator renders, as (apiGroup, resource). The Role
 # document names exactly this set and the ClusterRole grants no write verb on
-# any of it. dispatchjobtemplates is read uncached in the profile namespace by
-# the operator alone (no informer, not in the agent's minimal role), so its
-# reads are in the Role document too.
+# any of it; every kind's reads stay in the ClusterRole (the informers,
+# escalation prevention, and the teardown's list of dispatchjobtemplates in a
+# profile namespace a mode-today install never binds the Role in).
 NAMESPACED_WRITE_KINDS = frozenset({
     (CORE_API_GROUP, "configmaps"),
     (CORE_API_GROUP, "events"),
@@ -149,7 +149,10 @@ NAMESPACED_WRITE_KINDS = frozenset({
     ("rbac.authorization.k8s.io", "rolebindings"),
     ("rbac.authorization.k8s.io", "roles"),
 })
-NAMESPACED_READ_KINDS = frozenset({("kubeagents.x-k8s.io", "dispatchjobtemplates")})
+# Kinds whose reads are allowed in the Role document as well. None today: a
+# read in the Role is a 403 wherever the Role is not bound, and the operator
+# reads in namespaces it does not write in.
+NAMESPACED_READ_KINDS = frozenset()
 READ_VERBS = frozenset({"get", "list", "watch"})
 WRITE_VERBS = frozenset({"create", "update", "patch", "delete"})
 PLATFORM_AGENT_KIND = "PlatformAgent"
@@ -381,8 +384,8 @@ class OperatorSecretsGrantTest(unittest.TestCase):
     def test_the_role_document_names_exactly_the_namespaced_kinds_with_write_verbs(self):
         # Equality, not a subset: a kind dropped from the Role is a write the
         # operator can no longer do anywhere, which the self-check would name
-        # at runtime and this names at review. The verbs are the four writes;
-        # dispatchjobtemplates carries its reads too.
+        # at runtime and this names at review. The verbs are the four writes
+        # and nothing else.
         role = _namespaced_role(self)
         self.assertEqual(
             NAMESPACED_WRITE_KINDS,

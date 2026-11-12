@@ -85,8 +85,9 @@ for dst in "$CRD_DST"/*.yaml; do
 done
 
 # RBAC rules: role.yaml carries two documents, the ClusterRole from the
-# markers without `namespace=` and the Role from the one with it (the Secret
-# write verbs, in the install namespace). Each document's rules block is spliced
+# markers without `namespace=` and the Role from the ones with it (the write
+# verbs on every kind the operator renders, bound in the install namespace and
+# the profile namespace). Each document's rules block is spliced
 # between its own pair of markers: GENERATED RULES for the ClusterRole,
 # GENERATED NAMESPACED RULES for the Role. Without the BEGIN markers the awk
 # pass would copy the template unchanged and both modes would silently pass

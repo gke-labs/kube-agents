@@ -230,10 +230,13 @@ var requiredPermissions = []requiredPermission{
 	{Group: "batch", Resources: []string{"jobs"}, Verbs: rbacReadVerbs},
 	{Group: "batch", Resources: []string{"jobs"}, Verbs: rbacNamespacedWriteVerbs, Namespaced: true},
 	// dispatchjobtemplates: the dispatcher Job admission policy's params in
-	// the profile namespace, which the operator alone writes and reads
-	// uncached there, so reads and writes are namespaced alike (no informer
-	// needs them). podtemplates: create only, the dry run that defaults them.
-	{Group: "kubeagents.x-k8s.io", Resources: []string{"dispatchjobtemplates"}, Verbs: []string{"get", "list", "create", "update", "patch", "delete"}, Namespaced: true},
+	// the profile namespace, which the operator alone writes. The reads stay
+	// cluster-wide (no watch; the teardown lists the kind in a profile
+	// namespace that a mode-today install never binds the Role in), the
+	// writes are namespaced. podtemplates: create only, the dry run that
+	// defaults them.
+	{Group: "kubeagents.x-k8s.io", Resources: []string{"dispatchjobtemplates"}, Verbs: []string{"get", "list"}},
+	{Group: "kubeagents.x-k8s.io", Resources: []string{"dispatchjobtemplates"}, Verbs: rbacNamespacedWriteVerbs, Namespaced: true},
 	{Group: "", Resources: []string{"podtemplates"}, Verbs: []string{"create"}, Namespaced: true},
 	// The dispatcher Job admission policy and its binding, read by name
 	// before the dispatcher gets its Jobs Role (dispatcherJobPolicyInPlace).

@@ -156,6 +156,13 @@ rules:
   - apiGroups:
       - kubeagents.x-k8s.io
     resources:
+      - dispatchjobtemplates
+    verbs:
+      - get
+      - list
+  - apiGroups:
+      - kubeagents.x-k8s.io
+    resources:
       - platformagents
     verbs:
       - create
@@ -365,8 +372,6 @@ rules:
     verbs:
       - create
       - delete
-      - get
-      - list
       - patch
       - update
   - apiGroups:

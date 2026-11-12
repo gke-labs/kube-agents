@@ -2829,9 +2829,10 @@ class C5PrivilegedControllersAreBounded(unittest.TestCase):
     # Every namespaced kind the operator renders, as (apiGroup, resource): the
     # Secret split applied to all of them. The ClusterRole holds the reads of
     # each (the informers, escalation prevention) and no write verb; the Role
-    # document names exactly this set. dispatchjobtemplates is read uncached
-    # in the profile namespace by the operator alone, so its reads are in the
-    # Role document too. docs/designs/operator-namespaced-write-verbs.md.
+    # document names exactly this set, with write verbs only: a read in the
+    # Role is a 403 wherever the Role is not bound, and the teardown reads
+    # the dispatcher's params in a profile namespace a mode-today install
+    # never binds it in. docs/designs/operator-namespaced-write-verbs.md.
     OPERATOR_NAMESPACED_WRITE_KINDS = frozenset({
         ("", "configmaps"),
         ("", "events"),
@@ -2853,7 +2854,7 @@ class C5PrivilegedControllersAreBounded(unittest.TestCase):
         ("rbac.authorization.k8s.io", "rolebindings"),
         ("rbac.authorization.k8s.io", "roles"),
     })
-    OPERATOR_NAMESPACED_READ_KINDS = frozenset({("kubeagents.x-k8s.io", "dispatchjobtemplates")})
+    OPERATOR_NAMESPACED_READ_KINDS = frozenset()
     # The two namespaces the chart binds the Role in under mode next: the
     # release namespace and its profile namespace.
     OPERATOR_ROLE_NAMESPACES = frozenset({h.HELM_RENDER_NAMESPACE, h.HELM_RENDER_NAMESPACE + "-profiles"})
@@ -2879,7 +2880,7 @@ class C5PrivilegedControllersAreBounded(unittest.TestCase):
         rendered chart grants a verb beyond the three reads on any kind in
         OPERATOR_NAMESPACED_WRITE_KINDS, or a wildcard that reaches one; and
         the Role that names `secrets` names exactly that set of kinds, with
-        write verbs only (dispatchjobtemplates keeps its reads). Equality
+        write verbs only. Equality
         rather than a subset, so a kind dropped from the Role is red here and
         not first at runtime; the Secret rule's verbs are pinned as before.
 
