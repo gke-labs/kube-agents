@@ -417,7 +417,19 @@ readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
 # a run graded through the inject door records under the version key's next
 # mode (bench-gate), and hack/ci-eval-pr.sh keeps the today lane, the GitLab
 # lane and a release candidate out of the recorder altogether.
-readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test ci-kube-agents-eval-nightly ci-kube-agents-eval-nightly-main-b ci-kube-agents-eval-nightly-main-c ci-kube-agents-eval-nightly-main-d ci-kube-agents-eval-nightly-main-e ci-kube-agents-eval-nightly-writers ci-kube-agents-eval-nightly-writers-b ci-kube-agents-eval-nightly-writers-c ci-kube-agents-eval-nightly-gitlab-next ci-kube-agents-eval-weekly-ghes-next ci-kube-agents-eval-weekly-gitlab-ce-next ci-kube-agents-certification-1 post-kube-agents-eval-rc ci-kube-agents-eval-replay-lane"
+readonly EVAL_MODE_NEXT_JOB_NAMES="pull-kube-agents-smoke-test ci-kube-agents-eval-nightly ci-kube-agents-eval-nightly-main-b ci-kube-agents-eval-nightly-main-c ci-kube-agents-eval-nightly-main-d ci-kube-agents-eval-nightly-main-e ci-kube-agents-eval-nightly-writers ci-kube-agents-eval-nightly-writers-b ci-kube-agents-eval-nightly-writers-c ci-kube-agents-eval-nightly-gitlab-next ci-kube-agents-eval-weekly-ghes-next ci-kube-agents-eval-weekly-gitlab-ce-next ci-kube-agents-certification-1 post-kube-agents-eval-rc ci-kube-agents-eval-replay-lane ci-kube-agents-eval-nightly-slack"
+
+# The Slack lane's nightly (EVAL_SLACK_LANE=1 on ci-kube-agents-eval-nightly-slack,
+# beside EVAL_MODE_NEXT=1): the install gets Slack through the eval Slack app, and
+# hack/ci-eval-pr.sh runs hack/slack-lane/run.sh in place of the matrix. The app's
+# tokens, the CI channel and the test user's member id live in Secret Manager in
+# SLACK_LANE_SECRETS_PROJECT, where the runner reads the GitLab pair too; with any
+# of them unreadable the install keeps Slack off and the lane logs its skip.
+readonly SLACK_LANE_SECRETS_PROJECT="${SLACK_LANE_SECRETS_PROJECT:-kube-agents-prow}"
+readonly SLACK_LANE_BOT_TOKEN_SECRET="slack-eval-bot-token"
+readonly SLACK_LANE_APP_TOKEN_SECRET="slack-eval-app-token"
+readonly SLACK_LANE_CHANNEL_SECRET="slack-eval-channel-id"
+readonly SLACK_LANE_TEST_USER_SECRET="slack-eval-test-user-id"
 readonly AGENT_DEPLOYMENT_NAME="${PLATFORM_AGENT_CR_NAME}-gateway"
 readonly OPERATOR_DEPLOYMENT_NAME="${HELM_RELEASE_NAME}-controller-manager"
 # The broker Deployment, named after the CR the way the operator names it
@@ -1030,6 +1042,48 @@ export MEMORY_ENABLED="false"
 export USER_PROFILE_ENABLED="false"
 export GOOGLE_CHAT_ENABLED="false"
 export SLACK_ENABLED="false"
+
+# ─── 2a. The Slack lane's Slack (EVAL_SLACK_LANE=1) ──────────────────────────
+# Slack on, through the eval app, with Google Chat off so Slack holds the A2A
+# gateway; the CI channel as the home channel; the test user on the allowlist
+# and on operator.slackTestUsers, so the gateway reads its user-token posts as
+# its own. The tokens reach Helm as --set-file from a 0700 directory, never on
+# argv. Any secret unreadable: Slack stays off, and the lane (which reads its own
+# three values from the same project) skips. Empty on every other run.
+SLACK_LANE_HELM_ARGS=()
+if [ "${EVAL_SLACK_LANE:-}" = "1" ]; then
+  if [ "${EVAL_MODE_NEXT:-}" != "1" ]; then
+    echo "ERROR: EVAL_SLACK_LANE=1 needs EVAL_MODE_NEXT=1: the lane's test user reaches a turn only through the A2A gateway's Slack adapter, which only next renders." >&2
+    exit 1
+  fi
+  SLACK_LANE_DIR="$(mktemp -d)"
+  chmod 700 "${SLACK_LANE_DIR}"
+  slack_lane_missing=()
+  for slack_lane_secret in "${SLACK_LANE_BOT_TOKEN_SECRET}" "${SLACK_LANE_APP_TOKEN_SECRET}" "${SLACK_LANE_CHANNEL_SECRET}" "${SLACK_LANE_TEST_USER_SECRET}"; do
+    slack_lane_value="$(gcloud secrets versions access latest --secret="${slack_lane_secret}" --project="${SLACK_LANE_SECRETS_PROJECT}" 2>/dev/null | tr -d '[:space:]')" || slack_lane_value=""
+    if [ -z "${slack_lane_value}" ]; then
+      slack_lane_missing+=("${slack_lane_secret}")
+      continue
+    fi
+    printf '%s' "${slack_lane_value}" >"${SLACK_LANE_DIR}/${slack_lane_secret}"
+  done
+  unset slack_lane_value
+  if [ "${#slack_lane_missing[@]}" -gt 0 ]; then
+    echo "Slack lane: ${slack_lane_missing[*]} not readable in ${SLACK_LANE_SECRETS_PROJECT}; installing without Slack, and the lane will skip"
+  else
+    SLACK_LANE_CHANNEL="$(cat "${SLACK_LANE_DIR}/${SLACK_LANE_CHANNEL_SECRET}")"
+    SLACK_LANE_TEST_USER="$(cat "${SLACK_LANE_DIR}/${SLACK_LANE_TEST_USER_SECRET}")"
+    SLACK_LANE_HELM_ARGS=(
+      --set "platformAgent.integration.slack.enabled=true"
+      --set-file "platformAgent.credentials.data.SLACK_BOT_TOKEN=${SLACK_LANE_DIR}/${SLACK_LANE_BOT_TOKEN_SECRET}"
+      --set-file "platformAgent.credentials.data.SLACK_APP_TOKEN=${SLACK_LANE_DIR}/${SLACK_LANE_APP_TOKEN_SECRET}"
+      --set-string "platformAgent.integration.slack.homeChannel=${SLACK_LANE_CHANNEL}"
+      --set-string "platformAgent.integration.slack.allowedUsers[0]=${SLACK_LANE_TEST_USER}"
+      --set-string "operator.slackTestUsers[0]=${SLACK_LANE_TEST_USER}"
+    )
+    echo "Slack lane: Slack on through the eval app, home channel ${SLACK_LANE_CHANNEL}, test user ${SLACK_LANE_TEST_USER} allowed and listed in operator.slackTestUsers"
+  fi
+fi
 
 # ─── 2b. GitOps Repository for This Run ───────────────────────────────────────
 # Every GitHub-writing eval scenario begins by reading the registered repositories
@@ -2119,6 +2173,7 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set-string "platformAgent.security.serviceAccountAnnotations.iam\.gke\.io/gcp-service-account=${GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
     "${FORGE_ARGS[@]}" \
     "${GITHUB_MINTER_ARGS[@]}" \
+    ${SLACK_LANE_HELM_ARGS[@]+"${SLACK_LANE_HELM_ARGS[@]}"} \
     --set "platformAgent.credentials.create=true" \
     --set-string "platformAgent.credentials.data.API_SERVER_KEY=${API_SERVER_KEY}" \
     --set-string "platformAgent.credentials.data.GEMINI_API_KEY=${AGENT_GEMINI_API_KEY}" \

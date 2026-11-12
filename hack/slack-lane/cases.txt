@@ -1,8 +1,9 @@
 # The Slack lane's cases (hack/slack-lane/run.sh): nightly cases the lane runs
 # again through real Slack (AGENT_TRANSPORT=slack) to time Slack's legs and see
 # the answer as a person sees it. Advisory: the lane gates nothing, and each case
-# keeps its own nightly record on inject. Kept small so one serial run fits a
-# nightly part; the whole chat and routing set is a weekly option for later.
+# keeps its own nightly record on inject. ci-kube-agents-eval-nightly-slack runs
+# them one at a time, so the list stays small; the whole chat and routing set is
+# a weekly option for later.
 #
 # The transport folds the thread into the report the other transports build
 # (the ack, then a "Result/Question from delegated task" section per card

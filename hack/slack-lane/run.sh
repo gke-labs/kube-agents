@@ -11,8 +11,9 @@
 # Secret Manager in ${SLACK_LANE_SECRETS_PROJECT}, the project the nightly
 # already reads its shared GitLab tokens from (hack/ci-eval-pr.sh,
 # read_gitlab_token). Absent any of them, the lane prints one skip line and
-# exits 0. Nothing runs it on a schedule yet: it runs by hand against an
-# install, and a nightly part is to call it once the Slack test account exists.
+# exits 0. The nightly runs it as ci-kube-agents-eval-nightly-slack
+# (EVAL_SLACK_LANE=1 in hack/ci-eval-pr.sh, which also arms Slack on the install
+# in hack/ci-deploy.sh); by hand it runs against any install set up as below.
 #
 # Beside the three Slack values it needs what any devops-bench run against the
 # install needs: PROJECT_ID, CLUSTER_NAME, AGENT_CLUSTER_CONTEXT (the harness

@@ -738,6 +738,10 @@ publish_eval_dashboard() {
     echo "eval-dashboard publish skipped: EVAL_ROLLBACK_LANE=1 is set: the today lane grades a rolled-back install, which is not main's history"
     return 0
   fi
+  if [ "${EVAL_SLACK_LANE:-}" = "1" ]; then
+    echo "eval-dashboard publish skipped: EVAL_SLACK_LANE=1 is set: the Slack lane is advisory and grades no matrix"
+    return 0
+  fi
   if [ "${EVAL_TIER:-}" = "certification" ]; then
     echo "eval-dashboard publish skipped: EVAL_TIER=certification: the certification lane's record is its logs bucket, read by the certified-capabilities page, not the nightly dashboard"
     return 0
@@ -4436,6 +4440,22 @@ EVAL_RECORD_COMMIT="${PULL_BASE_SHA:-$(git -C "${SCRIPT_DIR}/.." rev-parse HEAD 
 # artifact, so a night's record is reviewable beside its verdict, and what the
 # cut-off line counts as "recorded".
 EVAL_RECORDED_MANIFEST="${ARTIFACT_DIR}/baseline-recorded.jsonl"
+
+# ─── The Slack lane (EVAL_SLACK_LANE=1) ──────────────────────────────────────
+# ci-kube-agents-eval-nightly-slack runs hack/slack-lane/run.sh in place of the
+# matrix: each case in hack/slack-lane/cases.txt once, through real Slack
+# (AGENT_TRANSPORT=slack), with the environment exported above. The lane reads
+# its token, channel and bot id from Secret Manager itself and skips without
+# them; the deploy armed Slack (hack/ci-deploy.sh, 2a) on the same condition.
+# Advisory: whatever its cases did, the job reports green, and nothing here
+# records a baseline or a verdict. Its results and Slack timings land under
+# ${ARTIFACTS}/slack-lane.
+if [ "${EVAL_SLACK_LANE:-}" = "1" ]; then
+  profile_begin "slack lane: hack/slack-lane/run.sh"
+  SLACK_LANE_ARTIFACTS="${ARTIFACTS:-/tmp/artifacts}/slack-lane" "${SCRIPT_DIR}/slack-lane/run.sh" || true
+  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Slack lane finished; it is advisory, so this job reports green whatever its cases did ==="
+  exit 0
+fi
 
 # ─── Parallel fan-out ─────────────────────────────────────────────────────────
 # The schedulable unit is one (task, repetition): every invocation is an
