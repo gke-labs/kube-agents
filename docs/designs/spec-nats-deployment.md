@@ -1131,9 +1131,13 @@ reloaded, not rolled. Every other config change still rolls it. The operator rec
 reload it asked for on the Secret, with the `config_load_time` it read just before writing,
 and confirms the reload when that value moves. A config written while a reload is still
 pending can't be confirmed by that move, which may be the earlier write landing, so the move
-restarts the wait from the new value. If it hasn't moved within three minutes, or
-can't be read, the operator deletes the bus pod so it restarts onto the new config, and
-writes a `BusConfigReloadFailed` Warning. The kubelet takes up to about a minute to write
+restarts the wait from the new value. Writes a few seconds apart usually reach the pod in one
+kubelet write, so a restarted wait usually sees no further move. It is confirmed at three
+minutes: the move showed the kubelet delivering, and the kubelet writes the Secret as it is
+when it syncs, so a write still undelivered would move the value again within one sync. If
+a wait that never saw a move hasn't moved within three minutes, or the value can't be read,
+the operator deletes the bus pod so it restarts onto the new config, and writes a
+`BusConfigReloadFailed` Warning. The kubelet takes up to about a minute to write
 an updated Secret into a running pod, so a newly added profile's deny lands that long after
 the profile does. On the roll path it landed when the new pod came up, tens of seconds
 later, with the bus down for the roll. The websocket listener on 9222, the console's

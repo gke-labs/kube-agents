@@ -59,6 +59,14 @@ const (
 	// wait for the newest write rather than confirm it
 	// (platformagent_a2a_profile_hold.go relies on that).
 	a2aBusReloadFoldedAnnotation = "kubeagents.x-k8s.io/a2a-reload-folded"
+	// a2aBusReloadRearmedAnnotation marks a wait re-armed off a folded
+	// reload's move. That move shows the kubelet and the reloader delivering
+	// a write, and the kubelet writes the Secret as it is when it syncs, so
+	// a newer write still undelivered moves the load time again within a
+	// sync. A re-armed wait that reaches a2aBusReloadBound with no further
+	// move is the newest write having been in that move: confirmed, not
+	// restarted. Only a write the pod could still lack is restarted onto.
+	a2aBusReloadRearmedAnnotation = "kubeagents.x-k8s.io/a2a-reload-rearmed"
 
 	// How long a reload may take before the operator restarts the bus pod
 	// instead. The kubelet writes an updated Secret into a running pod
@@ -213,17 +221,27 @@ func (r *PlatformAgentReconciler) planA2ABusReload(ctx context.Context, agent *a
 			// The move may be the earlier write landing: wait for one off
 			// this load time, or restart past the bound, for the newest.
 			stampA2ABusReload(config, now.UTC().Format(time.RFC3339Nano), loaded)
+			config.Annotations[a2aBusReloadRearmedAnnotation] = "true"
 			return a2aBusReload{requeue: a2aBusReloadRecheck, busUID: busUID}, nil
 		}
 		return a2aBusReload{reloaded: true, busUID: busUID}, nil
 	}
+	_, rearmed := live.Annotations[a2aBusReloadRearmedAnnotation]
 	since, perr := time.Parse(time.RFC3339Nano, requestedAt)
 	if perr != nil || now.Sub(since) >= a2aBusReloadBound {
+		if rearmed && perr == nil && err == nil && loaded == baseline {
+			// A full bound since a delivered move, and nothing newer moved
+			// the load time: the newest write was in that move.
+			return a2aBusReload{reloaded: true, busUID: busUID}, nil
+		}
 		return a2aBusReload{restartPod: true, busUID: busUID}, nil
 	}
 	stampA2ABusReload(config, requestedAt, baseline)
 	if _, folded := live.Annotations[a2aBusReloadFoldedAnnotation]; folded {
 		config.Annotations[a2aBusReloadFoldedAnnotation] = "true"
+	}
+	if rearmed {
+		config.Annotations[a2aBusReloadRearmedAnnotation] = "true"
 	}
 	return a2aBusReload{requeue: min(a2aBusReloadRecheck, a2aBusReloadBound-now.Sub(since)), busUID: busUID}, nil
 }

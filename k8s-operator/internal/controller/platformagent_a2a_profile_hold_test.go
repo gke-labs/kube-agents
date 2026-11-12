@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"slices"
 	"strconv"
 	"strings"
@@ -722,6 +723,57 @@ func TestAFoldedReloadIsNotConfirmedByTheFirstMove(t *testing.T) {
 	}
 	if config.Annotations[a2aBusReloadBaselineAnnotation] != "t1" || config.Annotations[a2aBusReloadFoldedAnnotation] != "" {
 		t.Errorf("the wait didn't re-arm off the new load time: %v", config.Annotations)
+	}
+	if config.Annotations[a2aBusReloadRearmedAnnotation] == "" {
+		t.Errorf("the re-armed wait isn't marked re-armed: %v", config.Annotations)
+	}
+}
+
+// A wait re-armed off a folded reload's move ends at the bound by
+// confirming, not by restarting the only server: the move showed the kubelet
+// delivering, and a newer write it hadn't delivered would have moved the load
+// time again within a sync. A load time that can't be read, or a wait never
+// re-armed, still restarts; a further move confirms before the bound.
+func TestAReArmedFoldedReloadIsConfirmedAtTheBound(t *testing.T) {
+	armed := time.Date(2026, 11, 9, 22, 1, 0, 0, time.UTC)
+	cases := []struct {
+		name        string
+		rearmed     bool
+		loadTime    string
+		loadErr     error
+		at          time.Duration
+		wantReload  bool
+		wantRestart bool
+	}{
+		{name: "re-armed, quiet to the bound", rearmed: true, loadTime: "t1", at: a2aBusReloadBound, wantReload: true},
+		{name: "re-armed, before the bound", rearmed: true, loadTime: "t1", at: a2aBusReloadBound - time.Second},
+		{name: "re-armed, a further move", rearmed: true, loadTime: "t2", at: time.Minute, wantReload: true},
+		{name: "re-armed, unreadable at the bound", rearmed: true, loadErr: errors.New("refused"), at: a2aBusReloadBound, wantRestart: true},
+		{name: "never re-armed, quiet to the bound", loadTime: "t1", at: a2aBusReloadBound, wantRestart: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ann := map[string]string{
+				a2aBusReloadRequestedAnnotation: armed.Format(time.RFC3339Nano),
+				a2aBusReloadBaselineAnnotation:  "t1",
+			}
+			if tc.rearmed {
+				ann[a2aBusReloadRearmedAnnotation] = "true"
+			}
+			r, agent, sts, _ := a2aReloadFixture(t, "v2", ann)
+			r.busConfigLoadTime = func(context.Context, *agentv1alpha1.PlatformAgent) (string, error) { return tc.loadTime, tc.loadErr }
+			config := a2aDesiredConfig(agent, "v2")
+			plan, err := r.planA2ABusReload(context.Background(), agent, config, sts.DeepCopy(), armed.Add(tc.at))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if plan.reloaded != tc.wantReload || plan.restartPod != tc.wantRestart {
+				t.Fatalf("plan = %+v, want reloaded=%v restartPod=%v", plan, tc.wantReload, tc.wantRestart)
+			}
+			if !tc.wantReload && !tc.wantRestart && config.Annotations[a2aBusReloadRearmedAnnotation] == "" {
+				t.Errorf("a still-pending re-armed wait dropped its mark: %v", config.Annotations)
+			}
+		})
 	}
 }
 

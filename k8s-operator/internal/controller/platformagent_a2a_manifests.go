@@ -6824,8 +6824,12 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	}
 	if len(held) > 0 {
 		state.profileHoldRequeue = a2aBusReloadRecheck
-		logf.FromContext(ctx).Info("holding newly bound AgentProfiles out of the dispatcher until every A2A bus server has loaded their config",
-			"profiles", held)
+		// With the dispatcher off, only the card waits.
+		what := "holding newly bound AgentProfiles out of the dispatcher until every A2A bus server has loaded their config"
+		if !a2aDispatcherEnabled() {
+			what = "holding newly bound AgentProfiles' cards until every A2A bus server has loaded their config"
+		}
+		logf.FromContext(ctx).Info(what, "profiles", held)
 	}
 	authMaps, authMapVersion, err := buildA2AAuthMapConfigMapsHeld(agent, profiles, dispatchable, draining)
 	if err != nil {
