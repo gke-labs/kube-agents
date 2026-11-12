@@ -99,7 +99,7 @@ class FakeAPI(rfc.GitHubAPI):
         super().__init__("gke-labs/kube-agents", "x")
         # Which cancel endpoints finish a run: a lost run may ignore `cancel` and need `force-cancel`.
         self.finishes_on = set(finishes_on)
-        self.finished = set()
+        self.finished = {}  # run id -> the conclusion it finished with
         self.refusal_body = refusal_body
         self.failing = set(failing)  # paths that answer 502, as the API failing rather than refusing
         self.pull = pull or {"number": 3245, "state": "open", "head": PR_HEAD, "base": PR_BASE, "title": "ci: bump"}
@@ -122,8 +122,7 @@ class FakeAPI(rfc.GitHubAPI):
         if matched:
             query = dict(part.split("=") for part in matched.group(1).split("&"))
             assert query["head_sha"] == HEAD, path
-            cancelled = {"status": "completed", "conclusion": "cancelled"}
-            listed = [entry | (cancelled if entry["id"] in self.finished else {}) for entry in self.runs]
+            listed = [entry | ({"status": "completed", "conclusion": self.finished[entry["id"]]} if entry["id"] in self.finished else {}) for entry in self.runs]
             return self._page(listed, "workflow_runs", query)
         matched = re.search(rf"/commits/{HEAD}/check-runs\?(.*)$", path)
         if matched:
@@ -149,7 +148,7 @@ class FakeAPI(rfc.GitHubAPI):
         self.posts.append((path, payload))
         matched = re.search(r"/actions/runs/(\d+)/([a-z-]+)$", path)
         if matched and matched.group(2) in self.finishes_on:
-            self.finished.add(int(matched.group(1)))
+            self.finished[int(matched.group(1))] = rfc.CANCELLED_CONCLUSION
         return {}
 
 
@@ -673,7 +672,7 @@ class MainTest(unittest.TestCase):
         )
         summary = pathlib.Path(self.summary.name).read_text()
         self.assertIn("Cancelled and re-ran stuck Python Unit Tests (run 1", summary)
-        self.assertIn("Cancelled superseded stuck Merge Gate (run 2", summary)
+        self.assertIn("Cleared superseded stuck Merge Gate (run 2", summary)
 
     def test_a_superseded_stuck_run_is_cancelled_so_it_stops_holding_a_red_newer_run(self):
         """Left queued, the older run reads as still going and every /retest declines the red one."""
@@ -709,21 +708,22 @@ class MainTest(unittest.TestCase):
         self.assertEqual(rfc.REACTION_DECLINED, api.posts[-1][1]["content"])
         self.assertIn("Could not cancel stuck Python Unit Tests", out)
 
-    def test_a_refused_cancel_on_a_run_that_finished_meanwhile_still_reruns_it(self):
+    def test_a_run_that_finished_green_before_the_cancel_landed_is_not_rerun(self):
         cancel_path = "/repos/gke-labs/kube-agents/actions/runs/1/cancel"
         api = self.stuck_api(refusing={cancel_path}, refusal_body=b'{"message": "Cannot cancel a workflow run that is completed."}')
         refuse = api.post
 
         def finish_then_refuse(path, payload=None, tolerate=()):
             if path == cancel_path:
-                api.finished.add(1)  # it finished on its own between the plan's read and the cancel
+                api.finished[1] = "success"  # it got a runner and passed between the plan's read and the cancel
             return refuse(path, payload, tolerate)
 
         api.post = finish_then_refuse
         code, out, err = self.run_stuck(api)
         self.assertEqual(0, code, err)
-        self.assertIn(("/repos/gke-labs/kube-agents/actions/runs/1/rerun", None), api.posts)
+        self.assertNotIn(("/repos/gke-labs/kube-agents/actions/runs/1/rerun", None), api.posts)
         self.assertIn("Cannot cancel a workflow run that is completed.", err)
+        self.assertIn("it finished on its own (success) before the cancel landed", pathlib.Path(self.summary.name).read_text())
 
     def test_a_refused_rerun_after_the_cancel_is_reported(self):
         api = self.stuck_api(refusing={"/repos/gke-labs/kube-agents/actions/runs/1/rerun"}, refusal_body=b'{"message": "This workflow run cannot be rerun."}')

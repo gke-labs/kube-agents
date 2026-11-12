@@ -153,6 +153,9 @@ STUCK_QUEUED_AFTER = datetime.timedelta(minutes=60)
 # polled at this interval with one runs listing per poll (`cancel_stuck`).
 CANCEL_ACTIONS = ("cancel", "force-cancel")
 CANCEL_SETTLE_SECONDS = 90
+# Only a stuck run that finished this way was finished by the cancel and is
+# re-run; any other conclusion is a result the run reached on its own.
+CANCELLED_CONCLUSION = "cancelled"
 CANCEL_POLL_SECONDS = 10
 # GitHub's timestamps end in `Z`, which `fromisoformat` reads only from 3.11.
 UTC_SUFFIX, UTC_OFFSET = "Z", "+00:00"
@@ -408,17 +411,22 @@ def describe_stuck(run: dict) -> str:
     return f"{run.get('name')} (run {run.get('id')}, attempt {run.get('run_attempt')}, queued since {run.get('run_started_at') or run.get('created_at')})"
 
 
-def cancel_stuck(api, repo: str, head_sha: str, runs) -> list:
-    """Cancel each stuck run, force-cancelling the ones a cancel does not finish; the runs left unfinished.
+def cancel_stuck(api, repo: str, head_sha: str, runs) -> dict:
+    """Cancel each stuck run, force-cancelling the ones a cancel does not finish.
 
-    A refused cancel is logged and the run polled anyway: GitHub answers 409
-    for a run that finished on its own between the read and the cancel. The
-    poll lists the head commit's runs once per interval rather than reading
-    each run, so a few dozen stuck runs cost a few requests a round.
+    Returns each run's id mapped to the conclusion it finished with, or to
+    None when it was still not finished after `force-cancel`. A refused cancel
+    is logged and the run polled anyway: GitHub answers 409 for a run that
+    finished on its own between the read and the cancel, and that run's
+    conclusion is its own (`success`, say), not `cancelled`, which is how the
+    caller knows not to re-run it. The poll lists the head commit's runs once
+    per interval rather than reading each run, so a few dozen stuck runs cost
+    a few requests a round.
     """
-    pending = {run["id"]: run for run in runs}
+    outcome = {run["id"]: None for run in runs}
+    pending = set(outcome)
     for action in CANCEL_ACTIONS:
-        for run_id in pending:
+        for run_id in sorted(pending):
             try:
                 api.post(f"/repos/{repo}/actions/runs/{run_id}/{action}")
             except urllib.error.HTTPError as error:
@@ -427,14 +435,16 @@ def cancel_stuck(api, repo: str, head_sha: str, runs) -> list:
                 log(f"Run {run_id}: GitHub refused {action} ({error.code}: {refusal_message(error)})")
         deadline = time.monotonic() + CANCEL_SETTLE_SECONDS
         while pending:
-            finished = {run["id"] for run in list_runs(api, repo, head_sha) if run.get("status") == COMPLETED_STATUS}
-            pending = {run_id: run for run_id, run in pending.items() if run_id not in finished}
+            for run in list_runs(api, repo, head_sha):
+                if run["id"] in pending and run.get("status") == COMPLETED_STATUS:
+                    outcome[run["id"]] = run.get("conclusion")
+                    pending.discard(run["id"])
             if not pending or time.monotonic() >= deadline:
                 break
             time.sleep(CANCEL_POLL_SECONDS)
         if not pending:
             break
-    return list(pending.values())
+    return outcome
 
 
 def describe(entry: Rerun) -> str:
@@ -591,20 +601,31 @@ def main(argv=None):
             log(f"--dry-run: would cancel superseded stuck {describe_stuck(run)}")
             cleared.append(run)
     elif stuck or superseded:
-        unfinished = cancel_stuck(api, args.repo, head_sha, stuck + superseded)
+        outcome = cancel_stuck(api, args.repo, head_sha, stuck + superseded)
+        unfinished = f"still not finished {CANCEL_SETTLE_SECONDS}s after force-cancel"
         for run in superseded:
-            if run in unfinished:
-                noted.append(f"Could not cancel superseded stuck {describe_stuck(run)}: still not finished {CANCEL_SETTLE_SECONDS}s after force-cancel")
+            if outcome[run["id"]] is None:
+                noted.append(f"Could not cancel superseded stuck {describe_stuck(run)}: {unfinished}")
                 continue
-            log(f"Cancelled superseded stuck {describe_stuck(run)}")
-            lines.append(f"Cancelled superseded stuck {describe_stuck(run)} (a newer run of its workflow carries its checks)")
+            log(f"Cleared superseded stuck {describe_stuck(run)}: {outcome[run['id']]}")
+            lines.append(f"Cleared superseded stuck {describe_stuck(run)} (a newer run of its workflow carries its checks)")
             cleared.append(run)
-        for run in (run for run in stuck if run in unfinished):
-            message = f"still not finished {CANCEL_SETTLE_SECONDS}s after force-cancel"
-            log(f"Stuck {describe_stuck(run)}: {message}")
-            refused.append((run, message))
-            noted.append(f"Could not cancel stuck {describe_stuck(run)}: {message}")
-        for run in (run for run in stuck if run not in unfinished):
+        for run in stuck:
+            conclusion = outcome[run["id"]]
+            if conclusion is None:
+                log(f"Stuck {describe_stuck(run)}: {unfinished}")
+                refused.append((run, unfinished))
+                noted.append(f"Could not cancel stuck {describe_stuck(run)}: {unfinished}")
+                continue
+            if conclusion != CANCELLED_CONCLUSION:
+                # It got a runner and finished before the cancel landed: its
+                # result is real, so it stands. A red one is the red path's
+                # on the next /retest.
+                message = f"Not re-running {describe_stuck(run)}: it finished on its own ({conclusion}) before the cancel landed"
+                log(message)
+                lines.append(message)
+                cleared.append(run)
+                continue
             try:
                 api.post(f"/repos/{args.repo}/actions/runs/{run['id']}/{RERUN_WHOLE}")
             except urllib.error.HTTPError as error:
