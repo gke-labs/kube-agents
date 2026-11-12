@@ -259,8 +259,10 @@ successful command behind it, changes nothing). The command is the candidate's o
 it carries one, otherwise the `commands[]` record for that check. A finding with no matching
 candidate keeps the model's evidence: that is the manual fallback, and it stays legal.
 
-`remediate` renders the document as filed. It accepts `--manifest-file` only to refuse a held id as
-held rather than as unknown (§3.3) and adopts no evidence from it, so a pull request it opens
+`remediate` renders the document as filed. It accepts `--manifest-file` to refuse a held id as held
+rather than as unknown (§3.3), and to write the budget of a declared `no-pdb` finding left `manual`
+([the ledger design's `remediate` section](fleet-audit-issue-ledger.md)). It adopts no evidence
+from it, so a pull request it opens
 carries the model's evidence where one `finish` promoted carries the collector's; a `/remediate`
 answered on a later `finish` run is promoted from the adopted document.
 

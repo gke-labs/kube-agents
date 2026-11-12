@@ -69,6 +69,18 @@ const (
 	scopeResolvedConfigMapSuffix = "-resolved-scope"
 	// scopeResolvedDataKey is the one key the publisher writes.
 	scopeResolvedDataKey = "resolved-scope.json"
+	// resolvedScopeVolumeName mounts that ConfigMap, read-only, into the agent
+	// container under mode next (#5621), at resolvedScopeDir, for the helper
+	// scripts' cluster lists (fleet_scope_targets.py). Not into the shell
+	// sandbox: the scripts read the list in the agent container. A volume,
+	// not an API read, so the agent needs no RBAC for it, and a directory
+	// mount, so the kubelet keeps it current as the publisher rewrites it.
+	resolvedScopeVolumeName = "platform-agent-resolved-scope-vol"
+	resolvedScopeDir        = "/etc/kube-agents-resolved"
+	// resolvedScopeFileEnvKey names the mounted document. Pinned in the
+	// managed .env (renderManagedEnv), as KUBEAGENTS_SCOPE_FILE is, so a line
+	// the agent writes can't point the scripts at a list it authored.
+	resolvedScopeFileEnvKey = "KUBEAGENTS_RESOLVED_SCOPE_FILE"
 
 	scopePublisherSuffix    = "-scope-publisher"
 	scopePublisherComponent = "scope-publisher"
@@ -754,15 +766,13 @@ func (r *PlatformAgentReconciler) scopePublisherIdentityOwned(ctx context.Contex
 	return metav1.IsControlledBy(existing, agent), nil
 }
 
-// scopeBrokerEnv is the broker's side of the publisher. Under mode next the
-// declaration's path, which the scope role reads to bound every argument;
+// scopeBrokerEnv is the broker's side of the publisher. In every mode the
+// declaration's path, from which the broker refuses an excluded cluster to
+// every caller and which the scope role reads to bound every argument;
 // while a publisher may run (scopePublisherMayRun), the audience and the
 // publisher's username bound to it both ways, as a2aMCPBrokerEnv binds the mcp role. Without the
 // pair the broker confers the scope role to nobody.
 func scopeBrokerEnv(agent *agentv1alpha1.PlatformAgent, owned bool) []corev1.EnvVar {
-	if !scopePublisherRendered(agent) {
-		return nil
-	}
 	env := []corev1.EnvVar{{Name: credentialProxyScopeFileEnvVar, Value: path.Join(brokerScopeDir, scopeFileName)}}
 	if scopePublisherMayRun(agent, owned) {
 		env = append(env,

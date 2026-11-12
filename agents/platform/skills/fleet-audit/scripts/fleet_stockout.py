@@ -397,6 +397,14 @@ _COMMITMENT_QUOTA_PREFIX = "COMMITTED_"
 # ceiling "a hard stop, not a soft one, so 'close to it' means measurably
 # close, not a judgment call".
 NODEPOOL_CEILING_FRACTION = 0.9
+# How each arm of §3.9 opens its excerpt clause. The arms share a slug, an
+# object kind and a severity, so the excerpt is the one field that says which
+# fired: audit_report.py's declared-intent join reads these two prefixes
+# (`ZONE_LOCKED_ARM_MARK`, `CEILING_ARM_MARK`) to move a declared zone-locked
+# pool and leave a pool at its ceiling a finding, and a test pins its copies
+# to these. Reword them here and there together, never one side alone.
+ZONE_LOCKED_ARM_PREFIX = "single-zone ("
+CEILING_ARM_PREFIX = "at its autoscaling ceiling:"
 
 # §3.9's Impact, one per arm. The arms share a slug and nothing else, so no
 # single sentence is true of both: the zone-locked arm is about a stockout in
@@ -1504,7 +1512,7 @@ def check_single_zone_nodepool(pool: dict, has_nap: bool, current_node_count: in
             why = f"tainted ({keys}), so no other pool is counted as its fallback"
         else:
             why = f"no multi-zone node pool of machine type {machine_type or 'unknown'} on the cluster"
-        excerpts.append(f"single-zone ({locations}), autoscaling enabled, no NAP, {why}")
+        excerpts.append(f"{ZONE_LOCKED_ARM_PREFIX}{locations}), autoscaling enabled, no NAP, {why}")
         impacts.append(_IMPACT_ZONE_LOCKED)
     if at_ceiling:
         # Name the arm and the zone span. This condition has nothing to do with
@@ -1514,7 +1522,7 @@ def check_single_zone_nodepool(pool: dict, has_nap: bool, current_node_count: in
         # 3.9 keys its impact and its remediation off this prefix, so a run
         # stops proposing multi-zone node pools to an operator who has them.
         excerpts.append(
-            f"at its autoscaling ceiling: {current_node_count}/{ceiling} live nodes "
+            f"{CEILING_ARM_PREFIX} {current_node_count}/{ceiling} live nodes "
             f"({current_node_count / ceiling * 100:.0f}% of {basis}), zones {locations}"
         )
         impacts.append(_ceiling_impact(ceiling, current_node_count, has_nap))

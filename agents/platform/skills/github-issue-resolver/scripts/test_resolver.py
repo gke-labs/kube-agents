@@ -635,10 +635,12 @@ class HandlePollTest(ResolverTest):
     def test_the_forge_is_asked_to_skip_the_ledgers_other_jobs_own(self):
         """The exclusion is a filter the forge applies, not a page this filters.
 
-        `agent:audit` is the fleet-audit ledger and `agent:delivery-watch` is
+        `agent:audit` is the fleet-audit ledger, `agent:delivery-watch` is
         `chat_delivery_watch.py`'s ledger of scheduled reports that stopped
-        reaching chat; both are edited and closed by their owner alone, and a
-        resolver turn on either corrupts a report that is not its own.
+        reaching chat, and `agent:onboarding` is the first-run inventory report
+        `bootstrap_delivery.py` filed when no chat thread took it; each is a
+        record its owner keeps, and a resolver turn on any of them corrupts a
+        report that is not its own.
 
         Asserted twice on purpose: once on the payload, because a page-side
         filter would read a repository with a full page of claimed issues as a
@@ -655,12 +657,14 @@ class HandlePollTest(ResolverTest):
                     issue(5, labels=["status:resolved"]),
                     issue(6, labels=["status:escalation-needed"]),
                     issue(7, labels=["bug"]),
+                    issue(8, labels=["agent:onboarding"]),
                 ]
             }
         )
         payload, _ = self.poll(forge=forge)
         asked = forge.payloads("issue-list")[-1]
         self.assertEqual(asked["excludeLabels"], resolver.SKIP_LABELS)
+        self.assertIn("agent:onboarding", asked["excludeLabels"])
         self.assertEqual(payload["issue_number"], 7)
 
     def test_the_poll_ranks_over_a_window_wider_than_one_page(self):

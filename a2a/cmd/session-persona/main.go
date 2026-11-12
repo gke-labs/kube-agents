@@ -73,7 +73,7 @@ func main() {
 
 // build writes the persona and every session skill under out.
 func build(skillsSrc, personaSrc, out string) error {
-	persona, err := os.ReadFile(personaSrc)
+	persona, err := os.ReadFile(personaSrc) // #nosec G304 -- the -persona flag of a build-time tool
 	if err != nil {
 		return err
 	}
@@ -84,7 +84,7 @@ func build(skillsSrc, personaSrc, out string) error {
 		return err
 	}
 	for _, name := range sessionSkills {
-		src, err := os.ReadFile(filepath.Join(skillsSrc, name, skillFile))
+		src, err := os.ReadFile(filepath.Join(skillsSrc, name, skillFile)) // #nosec G304 -- the -skills flag of a build-time tool
 		if err != nil {
 			return err
 		}
@@ -125,15 +125,15 @@ func mkdirOut(out string) error {
 // mkdir and writeFile set the mode explicitly after creating, so the shipped
 // modes don't depend on the build's umask.
 func mkdir(dir string) error {
-	if err := os.MkdirAll(dir, dirMode); err != nil {
+	if err := os.MkdirAll(dir, dirMode); err != nil { // #nosec G301 -- the shipped tree is read by the agent user, so 0755 is the point
 		return err
 	}
-	return os.Chmod(dir, dirMode)
+	return os.Chmod(dir, dirMode) // #nosec G302 -- same mode as above
 }
 
 func writeFile(path string, data []byte) error {
-	if err := os.WriteFile(path, data, fileMode); err != nil {
+	if err := os.WriteFile(path, data, fileMode); err != nil { // #nosec G306 G703 -- the -out tree of a build-time tool; the shipped tree is read by the agent user, so 0644 is the point
 		return err
 	}
-	return os.Chmod(path, fileMode)
+	return os.Chmod(path, fileMode) // #nosec G302 -- same mode as writeFile's
 }

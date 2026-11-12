@@ -221,6 +221,8 @@ class EstimateTest(unittest.TestCase):
         self.assertEqual((rep["presubmit_requests"], rep["replay_lane_requests"]), (1, 1))
         self.assertEqual(rep["health"]["lines_by_kind"]["replay-lane"], 1)
         self.assertEqual(skipped["untagged"], 0)
+        self.assertIn("requests: 2 (1 presubmit, 0 nightly, 0 nightly-untrusted, 1 replay-lane,",
+                      analyze_shadow.render(rep, skipped), "the header's counts add up to its total")
 
     def test_cross_project_share(self):
         rep, _ = report([

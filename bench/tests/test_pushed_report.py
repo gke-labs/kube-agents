@@ -185,6 +185,25 @@ def test_merge_grades_the_reply_turn_and_keeps_both_trajectories():
     assert merged.tokens == {"total": 1}
 
 
+@pytest.mark.parametrize("opening_marked, reply_marked", [(True, False), (False, True), (True, True)])
+def test_merge_keeps_a_no_worker_calls_entry_only_when_both_turns_carry_one(opening_marked, reply_marked):
+    """#5371: the entry speaks for the cards of the turn that wrote it, so a
+    merge beside a turn without one drops it rather than grading that turn's
+    cards as zero worker calls."""
+    from kube_agents_bench import worker_trajectory
+
+    def turn(marked: bool, card: str) -> AgentResult:
+        trajectory = [{"name": "kanban_create"}]
+        if marked:
+            trajectory.append(worker_trajectory.no_worker_calls_entry([card]))
+        return AgentResult(output="x", trajectory=trajectory, tokens={}, errors=[], metadata={"final_message": "x"})
+
+    entry = pushed_report.plant_entry("a2a-ctx-1", "inject:c", {"stored": True, "status": 200})
+    merged = pushed_report.merge(turn(opening_marked, "t_1"), turn(reply_marked, "t_2"), entry)
+    kept = [e for e in merged.trajectory if e["name"] == worker_trajectory.NO_WORKER_CALLS_ENTRY]
+    assert len(kept) == (2 if opening_marked and reply_marked else 0)
+
+
 def test_merge_sums_both_turns_tokens_bucket_by_bucket():
     """An inject record's tokens are the chain's usage; the run's are both turns'."""
     opening = AgentResult(

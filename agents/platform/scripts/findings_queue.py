@@ -15,6 +15,7 @@ import json
 import re
 import sqlite3
 import sys
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Any, Iterable, Mapping
@@ -113,6 +114,8 @@ PACED_PUBLISHERS = ("nudge", "first_report")
 # The two classes an item is counted under when it is added. Stored with the
 # addition so a later re-score cannot move it from one day's count to the other.
 ITEM_CLASSES = ("critical", "noncritical")
+# The key of `additions_on` that names the line of each addition that day.
+ADDITIONS_LINES_KEY = "lines"
 # The first UTC hour new criticals may be added and pending ones reminded:
 # after the last daily audit, and not the middle of the night in the US.
 REMIND_HOUR = 12
@@ -1190,6 +1193,9 @@ def additions_on(conn: sqlite3.Connection, day: str) -> dict:
     Read from `findings_additions`, which only `mark_surfaced` writes and
     nothing clears: a dismissed, snoozed, resolved or recurred addition still
     spent that day's budget, and a line added twice in a day counts twice.
+    `lines` is the `item_key` of each addition that day, one entry per
+    addition, so `pace` can tell an announced line whose additions are all on
+    record from one with an addition whose marks all failed.
     """
     if not isinstance(day, str) or not DAY_RE.match(day):
         raise FindingError(f"day is {_brief(day)}; must be a UTC date, YYYY-MM-DD")
@@ -1202,7 +1208,13 @@ def additions_on(conn: sqlite3.Connection, day: str) -> dict:
         "SELECT added_class, COUNT(*) FROM findings_additions WHERE day = ? GROUP BY added_class", (day,)
     ):
         counts[added_class] = count
-    return {"day": day, **counts}
+    lines = [
+        json.loads(key)
+        for (key,) in conn.execute(
+            "SELECT item_key FROM findings_additions WHERE day = ? ORDER BY added_at, item_key", (day,)
+        )
+    ]
+    return {"day": day, **counts, ADDITIONS_LINES_KEY: lines}
 
 
 @dataclass(frozen=True)
@@ -1334,14 +1346,15 @@ def pace(
     rows: Iterable[Mapping],
     now: datetime,
     limits: PacingLimits,
-    added_today: Mapping[str, int],
+    added_today: Mapping[str, Any],
     may_add: bool = True,
     announced: Iterable[Iterable[str]] = (),
     announced_ids: Iterable[str] | None = None,
 ) -> PacingPlan:
     """What a paced publisher names now, from the open rows in ranked order.
 
-    `added_today` is `additions_on` for now's UTC date. The rules, in order:
+    `added_today` is `additions_on` for now's UTC date: the counts by class,
+    and `lines`, the line of each addition on record. The rules, in order:
 
     - Stop-add: while any pending item is non-critical, nothing is added.
     - Criticals are added from `REMIND_HOUR`, up to `daily_criticals` a day.
@@ -1362,7 +1375,13 @@ def pace(
     these only while one of those ids is still among its new members, so a
     row that joined the line later (a decision left it open) is an ordinary
     new item. None (a record from before the ids were kept) matches on the
-    key alone.
+    key alone. An announced item whose line has as many entries in
+    `added_today["lines"]` as it was announced today had a mark succeed in each
+    of those additions, so `added_today` already counts it: it is not counted
+    again and does not stop additions, and it waits for tomorrow rather than
+    being added twice in a day. A recorded critical still holds non-criticals
+    back, as a critical waiting for the budget does. Without `lines`, every
+    announced item still new counts as unrecorded.
     """
     now = (now if now.tzinfo else now.replace(tzinfo=timezone.utc)).astimezone(timezone.utc)
     items, managed = _gather(rows)
@@ -1370,7 +1389,8 @@ def pace(
 
     pending = [item for item in items if item.pending]
     new = [item for item in items if not item.pending]
-    announced_keys = {tuple(key) for key in announced}
+    announced = [tuple(key) for key in announced]
+    announced_keys = set(announced)
     named = None if announced_ids is None else {str(finding_id) for finding_id in announced_ids}
 
     def was_announced(item: Item) -> bool:
@@ -1378,7 +1398,17 @@ def pace(
             return False
         return named is None or any(str(member.get("id")) in named for member in item.members)
 
-    unrecorded = [item for item in new if was_announced(item)]
+    # A line announced twice today with one addition on record has a second
+    # addition whose marks all failed: it is still unrecorded.
+    recorded_lines = Counter(tuple(key) for key in added_today.get(ADDITIONS_LINES_KEY) or ())
+    times_announced = Counter(announced)
+
+    def on_record(item: Item) -> bool:
+        return recorded_lines[item.key] >= times_announced[item.key]
+
+    announced_today = [item for item in new if was_announced(item)]
+    unrecorded = [item for item in announced_today if not on_record(item)]
+    recorded = [item for item in announced_today if on_record(item)]
     new = [item for item in new if not was_announced(item)]
 
     def spent(item_class: str) -> int:
@@ -1400,9 +1430,12 @@ def pace(
         # A critical left out of `add` waits for tomorrow's budget or today's
         # hour, and a non-critical added now would hold it back behind
         # stop-add. With a daily limit of 0 no critical is ever added, so none
-        # is waiting. A critical announced today but never recorded holds them
-        # back as a pending one would.
-        critical_waiting = limits.daily_criticals > 0 and len(new_critical) > len(add)
+        # is waiting. A recorded critical left new by a failed mark waits for
+        # tomorrow too. A critical announced today but never recorded holds
+        # them back as a pending one would.
+        critical_waiting = limits.daily_criticals > 0 and (
+            len(new_critical) > len(add) or any(item.item_class == critical for item in recorded)
+        )
         critical_unrecorded = any(item.item_class == critical for item in unrecorded)
         if (
             not pending_critical
@@ -1418,6 +1451,6 @@ def pace(
         add=add,
         remind=remind,
         blocking=blocking,
-        waiting=[item for item in new if item not in add],
+        waiting=[item for item in new if item not in add] + recorded,
         rolled_up=managed,
     )

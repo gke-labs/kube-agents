@@ -70,16 +70,16 @@ JSON_SUFFIX = replay_cache.JSON_SUFFIX
 VARIANT_SEPARATOR = "-"
 SEGMENT_SUFFIX = ".jsonl"
 HEX = replay_cache.CACHE_HEX
-SAFE_HEX = re.compile(rf"^{HEX}$")
+SAFE_HEX = re.compile(rf"^{HEX}\Z")
 # A cache object's name under the version prefix: replay_cache.CACHE_REL_RE's
 # layout with each variant flattened to one name, `variants/<context>-<answer>.json`.
 OBJECT_NAME_RE = re.compile(replay_cache.CACHE_LAYOUT_PATTERN.replace(replay_cache.VARIANT_JOINER, re.escape(VARIANT_SEPARATOR)))
-NORMALIZER_VERSION_RE = re.compile(r"^[0-9a-f]{16}$")
-POD_NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$")
+NORMALIZER_VERSION_RE = re.compile(r"^[0-9a-f]{16}\Z")
+POD_NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?\Z")
 # A build id as a path segment: hack/ci-env.sh's REPLAY_SHADOW_BUILD_RE, which
 # tests/test_ci_replay_shadow.py holds equal to this.
 BUILD_PATTERN = r"[A-Za-z0-9][A-Za-z0-9._-]*"
-BUILD_RE = re.compile(rf"^{BUILD_PATTERN}$")
+BUILD_RE = re.compile(rf"^{BUILD_PATTERN}\Z")
 # A publish record's fields, read by fetch_cache.py and lane_report.py.
 RECORD_BUILD = "build"
 RECORD_FINAL = "final"
@@ -88,13 +88,21 @@ RECORD_DECISIONS = "decisions"
 RECORD_LOST_LINES = "lost_lines"
 RECORD_OBJECTS = "objects"
 # The recording job: its Prow job name, the install mode it graded (next or
-# today) and its forge (github when EVAL_FORGE is unset). The lane fetches
-# objects only from records whose mode and forge match its own run's, so a
-# GitLab or today-mode night's answers, which it can't hit, never take its room.
+# today), its forge (github when EVAL_FORGE is unset) and the commit its
+# checkout was at (empty when git could not say; records written before it
+# have none). The lane fetches objects only from records whose mode and forge
+# match its own run's, so a GitLab or today-mode night's answers, which it
+# can't hit, never take its room, and replays on the newest night's commit
+# (fetch_cache.py --print-commit).
 RECORD_JOB = "job"
 JOB_NAME = "name"
 JOB_MODE = "mode"
 JOB_FORGE = "forge"
+JOB_COMMIT = "commit"
+# A full SHA-1 commit id, as `git rev-parse HEAD` prints it (hack/ci-env.sh's
+# REPLAY_COMMIT_RE, which tests/test_ci_replay_shadow.py holds equal to this).
+COMMIT_PATTERN = r"[0-9a-f]{40}"
+COMMIT_RE = re.compile(rf"^{COMMIT_PATTERN}\Z")
 MODE_NEXT = "next"
 MODE_TODAY = "today"
 DEFAULT_FORGE = "github"
@@ -111,7 +119,7 @@ GCLOUD_TIMEOUT_SECONDS = 300.0
 TEXT_ENCODING = "utf-8"
 UPLOAD_STAGING_PREFIX = "replay-cache-publish-"
 RECORD_STAGING_PREFIX = "replay-cache-record-"
-BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{1,61}[a-z0-9]$")
+BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{1,61}[a-z0-9]\Z")
 
 # Why an answer was not uploaded, beside run_attribution's decisions.
 NO_RECORDING_LINE = "no_recording_line"
@@ -238,6 +246,10 @@ def select(keep_dir: str, verdicts_dir: str, final: bool, state: Optional[State]
     logs = state.reader.load(p for _, _, segments in pods for p in segments)
     selection.lost_lines = logs.lost
     attribution = RA.Attribution(logs, state.store, selection.runs, final)
+    # (version, slot object, local path, answer fingerprint), in pod order:
+    # decided once every pod's answers are, since two pods can each hold a
+    # pointer for one slot key, each to its own answer.
+    slots: List[Tuple[str, str, str, str]] = []
     for _, pod_dir, segments in pods:
         version = pod_version(segments, state.versions)
         if not version:
@@ -274,8 +286,20 @@ def select(keep_dir: str, verdicts_dir: str, final: bool, state: Optional[State]
                 continue
             target = read_json(path)
             if isinstance(target, str) and SAFE_HEX.match(target):
-                selection.add(version, SLOTS, name, path)
-                selection.slot_targets.setdefault(version, {}).setdefault(name, target)
+                slots.append((version, name, path, target))
+    # A pointer is a candidate only once its answer is selected or already up,
+    # so one to an answer that will not go up never takes the name from one
+    # whose answer will. One whose answer is already up goes first: a failed
+    # answer upload in this call then cannot cost the slot.
+    def already_up(slot: Tuple[str, str, str, str]) -> bool:
+        version, _, _, target = slot
+        return (version, f"{ANSWERS}/{target}{JSON_SUFFIX}") in state.done
+
+    for version, name, path, target in sorted(slots, key=lambda slot: not already_up(slot)):
+        answer = f"{ANSWERS}/{target}{JSON_SUFFIX}"
+        if answer in selection.objects.get(version, {}).get(ANSWERS, {}) or (version, answer) in state.done:
+            selection.add(version, SLOTS, name, path)
+            selection.slot_targets.setdefault(version, {}).setdefault(name, target)
     return selection
 
 
@@ -384,10 +408,10 @@ class Publisher:
         return report
 
 
-def job_identity(name: str, mode_next: str, forge: str) -> Dict[str, str]:
-    """The record's job block from the eval's own settings (EVAL_MODE_NEXT, EVAL_FORGE)."""
+def job_identity(name: str, mode_next: str, forge: str, commit: str = "") -> Dict[str, str]:
+    """The record's job block from the eval's own settings (EVAL_MODE_NEXT, EVAL_FORGE) and its checkout's commit."""
     return {JOB_NAME: name, JOB_MODE: MODE_NEXT if mode_next == "1" else MODE_TODAY,
-            JOB_FORGE: forge or DEFAULT_FORGE}
+            JOB_FORGE: forge or DEFAULT_FORGE, JOB_COMMIT: commit}
 
 
 def _size(path: str) -> int:

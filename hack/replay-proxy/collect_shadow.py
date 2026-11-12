@@ -46,13 +46,14 @@ Rollout step 2):
   keeps a copy of every line and stored request it fetched. Every
   `--publish-interval` seconds, and once in the last pass, publish_cache.py
   uploads the answers from runs that passed, as graded so far under
-  `--verdicts-dir`, to the shared cache bucket. The cache never goes to the
-  shadow bucket.
+  `--verdicts-dir`, to the shared cache bucket, each record naming the
+  checkout's commit (`--commit`). The cache never goes to the shadow bucket.
 - `replay`, in the replay lane: each pass seeds any proxy pod that has not got
   the cache (a pod that replaced one starts empty) from `--seed-dir`, which
   fetch_cache.py filled, and keeps the lines and stored requests. The last
-  pass writes lane_report.py's report and uploads it under the job's prefix,
-  in `report/`. `--seed-once` seeds every pod and exits, 0 only when every
+  pass writes lane_report.py's report, which names the commit replayed and
+  where it came from (`--lane-commit`, `--lane-commit-source`), and uploads it
+  under the job's prefix, in `report/`. `--seed-once` seeds every pod and exits, 0 only when every
   pod took the cache, so the lane can stop before its cases. A pod being
   deleted is never seeded, though its lines are still collected.
 
@@ -112,7 +113,7 @@ SOURCES = ((LOGS_DIR, SEGMENT_SUFFIX), (STORE_REQUESTS_DIR, JSON_SUFFIX), (STORE
 # machine or an object name: one directory from SOURCES, one plain file name.
 SAFE_NAME = re.compile(
     r"^(?:logs/[A-Za-z0-9][A-Za-z0-9._-]*\.jsonl(?:\.open)?"
-    r"|store/(?:requests|blobs)/[A-Za-z0-9][A-Za-z0-9._-]*\.json)$"
+    r"|store/(?:requests|blobs)/[A-Za-z0-9][A-Za-z0-9._-]*\.json)\Z"
 )
 
 # The proxy's saved answers, under the cache directory in the data volume
@@ -120,7 +121,7 @@ SAFE_NAME = re.compile(
 # file is one plain name under one of four directories, variants one level
 # deeper, so a name is checked like the others before it becomes a path.
 DEFAULT_CACHE_SUBDIR = "replay-cache"
-CACHE_SUBDIR_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+CACHE_SUBDIR_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 CACHE_REL_RE = replay_cache.CACHE_REL_RE
 CACHE_SEED_MARKER = ".seeded"
 # The kept copy on this machine: one directory per pod (its lines and its
@@ -128,7 +129,7 @@ CACHE_SEED_MARKER = ".seeded"
 KEEP_PODS_DIR = "pods"
 KEEP_LOGS_DIR = "logs"
 KEEP_CACHE_DIR = "cache"
-POD_NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$")
+POD_NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?\Z")
 DEFAULT_PUBLISH_INTERVAL_SECONDS = 300.0
 PUBLISH_THREAD_NAME = "replay-cache-publish"
 # A file being written: the store's, and the collector's own kept copies.
@@ -180,8 +181,17 @@ ERROR_CLASS_OTHER = "other"
 # and REPLAY_SHADOW_BUILD_RE), so no object key this writes holds a `.` or `..`
 # segment: the bucket's IAM conditions match a key's prefix as text, and a
 # downloader that resolved `presubmit/x/../../nightly/` would file it elsewhere.
-BUCKET_SHAPE = re.compile(r"^[a-z0-9][a-z0-9_.-]{1,61}[a-z0-9]$")
-BUILD_SHAPE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+BUCKET_SHAPE = re.compile(r"^[a-z0-9][a-z0-9_.-]{1,61}[a-z0-9]\Z")
+BUILD_SHAPE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+# A checkout's commit, or empty when git could not say (hack/ci-env.sh passes
+# empty rather than anything else): publish_cache.COMMIT_PATTERN or nothing.
+COMMIT_SHAPE = re.compile(r"^(?:[0-9a-f]{40})?\Z")
+# Where the replay lane's commit came from (hack/ci-env.sh's
+# REPLAY_LANE_COMMIT_SOURCE, which the Prow job exports): the newest recording
+# night's commit, a fallback to main, or empty when the job did not say.
+COMMIT_SOURCE_RECORDING = "recording"
+COMMIT_SOURCE_MAIN = "main"
+COMMIT_SOURCES = ("", COMMIT_SOURCE_RECORDING, COMMIT_SOURCE_MAIN)
 GCLOUD_ENV = {
     # A composite upload writes and deletes temporary objects, which needs a
     # delete grant the presubmit's identity should not hold.
@@ -990,6 +1000,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--job-name", default="", help="record: the Prow job name, written into each record")
     parser.add_argument("--eval-mode-next", default="", help="record and replay: EVAL_MODE_NEXT (1 is next mode)")
     parser.add_argument("--forge", default="", help="record and replay: EVAL_FORGE (empty is github)")
+    parser.add_argument("--commit", default="", type=_shaped(COMMIT_SHAPE, "commit id"),
+                        help="record: the checkout's commit, written into each record")
+    parser.add_argument("--lane-commit", default="", type=_shaped(COMMIT_SHAPE, "commit id"),
+                        help="replay: the commit the lane replayed on, named in the report")
+    parser.add_argument("--lane-commit-source", default="", choices=COMMIT_SOURCES,
+                        help="replay: whether that commit is the recording night's or main")
     parser.add_argument("--seed-dir", default="", help="replay: the cache fetch_cache.py filled, seeded into each pod")
     parser.add_argument("--seed-once", action="store_true", help="replay: seed every live proxy pod, then exit")
     parser.add_argument("--nightly-runs", default="", help="replay: fetch_cache.py's runs per recording build")
@@ -1019,7 +1035,8 @@ def make_publisher(args: argparse.Namespace, collector: "Collector"):
     return publish_cache.Publisher(keep_dir=args.keep_dir, verdicts_dir=args.verdicts_dir,
                                    bucket=args.publish_bucket, build=args.build, run=collector.run,
                                    env=GCLOUD_ENV, emit=collector.emit,
-                                   job=publish_cache.job_identity(args.job_name, args.eval_mode_next, args.forge))
+                                   job=publish_cache.job_identity(args.job_name, args.eval_mode_next, args.forge,
+                                                                     args.commit))
 
 
 def make_lane_report(args: argparse.Namespace) -> Optional[Callable[[str], Optional[str]]]:
@@ -1030,7 +1047,8 @@ def make_lane_report(args: argparse.Namespace) -> Optional[Callable[[str], Optio
     def report(out_dir: str) -> Optional[str]:
         import lane_report
 
-        return lane_report.write_report(args.keep_dir, args.verdicts_dir, args.nightly_runs, out_dir)
+        return lane_report.write_report(args.keep_dir, args.verdicts_dir, args.nightly_runs, out_dir,
+                                        commit=args.lane_commit, commit_source=args.lane_commit_source)
 
     return report
 

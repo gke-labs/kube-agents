@@ -95,6 +95,15 @@ def created(card, call_id="call_1"):
     ]
 
 
+class NameShapeTest(unittest.TestCase):
+    def test_a_card_or_store_name_with_a_trailing_newline_is_refused(self):
+        for pattern, good in ((RA.CARD_RE, "t_11111111"), (RA.SAFE_STORE_NAME, blob_name(1))):
+            with self.subTest(pattern=pattern.pattern):
+                self.assertTrue(pattern.match(good))
+                self.assertIsNone(pattern.match(good + "\n"))
+        self.assertEqual(RA.owned_cards(front(*created("t_22222222\n"))), set())
+
+
 class CardsTest(unittest.TestCase):
     def test_a_worker_owns_the_card_it_was_started_on(self):
         self.assertEqual(RA.owned_cards(worker("t_11111111")), {"t_11111111"})

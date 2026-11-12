@@ -79,7 +79,10 @@ Environment:
         or a run that delivered nothing, and nothing is written.
     PLATFORM_AGENT_TOKEN: Bearer token for the endpoint.
 
-    AGENT_TRANSPORT: ``api`` (default; everything above) or ``inject``, which
+    AGENT_TRANSPORT: ``api`` (default; everything above), ``slack`` (advisory, for
+        the Slack lane: a test user's post in a CI channel, read back from the
+        thread, :mod:`kube_agents_bench.slack_transport`; its whole-turn budget is
+        ``AGENT_SLACK_TIMEOUT``, 600 s unset) or ``inject``, which
         hands the prompt to the agent through the A2A gateway's inject backend
         instead -- ``POST /inject`` with the prompt, then the conversation's
         transcript folded until the task's terminal, the way the gateway
@@ -175,6 +178,7 @@ from devops_bench.agents import AgentConfig, AgentHarness, AgentResult
 from devops_bench.agents.result import empty_tokens
 
 from kube_agents_bench import inject_transport as inject
+from kube_agents_bench import slack_transport as slack
 from kube_agents_bench import board, card_wake, chat_shape, gitops, pushed_report, stop_hook, transcript, worker_trajectory
 from kube_agents_bench.gateway_silence import is_intentional_silence_response
 from kube_agents_bench.parsing import (
@@ -221,13 +225,19 @@ INFRA_FAILURE_MARKER = "KUBE_AGENTS_INFRA_FAILURE"
 # trend lives.
 SKIP_REPORT_ONLY_JUDGES_ENV = "KUBE_AGENTS_SKIP_REPORT_ONLY_JUDGES"
 
-# The two doors ``AGENT_TRANSPORT`` selects between. ``api`` is the agent's own
+# The doors ``AGENT_TRANSPORT`` selects between. ``api`` is the agent's own
 # HTTP endpoint, which is identical under both modes and therefore says nothing
 # about the next stack; ``inject`` goes through the A2A gateway, which is the
 # stack the mode renders.
 TRANSPORT_API = "api"
 TRANSPORT_INJECT = "inject"
-_TRANSPORTS = frozenset({TRANSPORT_API, TRANSPORT_INJECT})
+# ``slack`` goes the way a person does: a test user's post in a CI channel, the
+# reply read back from the thread (slack_transport.py). Advisory, for the Slack
+# lane only (hack/slack-lane/run.sh).
+TRANSPORT_SLACK = "slack"
+_TRANSPORTS = frozenset({TRANSPORT_API, TRANSPORT_INJECT, TRANSPORT_SLACK})
+# The Slack transport's whole-turn budget when AGENT_SLACK_TIMEOUT is unset.
+_SLACK_DEFAULT_TIMEOUT = "600"
 
 # Board management tools that do not count as substantive worker action or final answer generation.
 _BOARD_NON_ACTION_TOOLS = frozenset({
@@ -302,6 +312,7 @@ _FRONT_DOOR_NON_ACTION_TOOLS = frozenset({
     inject.EVENT_ENTRY_STATUS,
     inject.EVENT_ENTRY_ACTIVITY,
     worker_trajectory.GAP_ENTRY,
+    worker_trajectory.NO_WORKER_CALLS_ENTRY,
 })
 
 # Character ceiling for card detail quoted in infrastructure failure errors.
@@ -1010,6 +1021,18 @@ _SESSION_ID_HEADER = "X-Hermes-Session-Id"
 _FAILURE_REASON_HEADER = "X-Hermes-Failure-Reason"
 
 
+def _closed_explicitly(card: board.BoardCard | None) -> bool:
+    """Whether the board holds ``card`` closed by an agent (:data:`_CLOSED_STATUS`,
+    or blocked with one of :data:`_CLOSING_BLOCK_KINDS`)."""
+    if card is None:
+        return False
+    # A breaker trip keeps an earlier block's kind and records the spawn's
+    # failure: a block with a failure error is the platform's, not a close.
+    return card.status == _CLOSED_STATUS or (
+        card.status == _BLOCKED_STATUS and card.block_kind in _CLOSING_BLOCK_KINDS and not card.error
+    )
+
+
 def _guardrail_blocked_cards(
     awaited: Sequence[str],
     on_board: dict[str, board.BoardCard] | None,
@@ -1133,6 +1156,14 @@ def _canonical_session_tokens(
 # set would run the wait to its ceiling and grade as the harness's, not the
 # worker's.
 _TERMINAL_STATUSES = frozenset({"done", "archived", "blocked", "failed", "cancelled"})
+# A card ended by an explicit close, which only an agent makes: completed, or
+# blocked with one of ``kanban_block``'s own kinds. The breaker's gave_up, the
+# rate-limit guardrail's ``transient`` block and the admission patch's
+# capacity block are the platform's, not a close, and neither is a card left
+# archived, failed or cancelled.
+_CLOSED_STATUS = "done"
+_BLOCKED_STATUS = "blocked"
+_CLOSING_BLOCK_KINDS = frozenset({"needs_input", "dependency", "capability"})
 _BOARD_INFRA_STATUSES = frozenset({"blocked", "triage"})
 
 
@@ -2627,6 +2658,48 @@ def _post_turn(
     return parse_response(payload), session_id
 
 
+# Placeholders a case prompt may use for the cluster the agent itself runs on,
+# expanded from AGENT_CLUSTER_CONTEXT before the prompt is sent
+# (:func:`expand_agent_cluster_placeholders`). The runner substitutes only
+# {{CLUSTER_NAME}} and {{PROJECT_ID}}; a delegation to the generic cluster
+# profile needs the location too.
+AGENT_CLUSTER_PROJECT_PLACEHOLDER = "{{AGENT_CLUSTER_PROJECT}}"
+AGENT_CLUSTER_LOCATION_PLACEHOLDER = "{{AGENT_CLUSTER_LOCATION}}"
+AGENT_CLUSTER_NAME_PLACEHOLDER = "{{AGENT_CLUSTER_NAME}}"
+_AGENT_CLUSTER_PLACEHOLDERS = (
+    AGENT_CLUSTER_PROJECT_PLACEHOLDER,
+    AGENT_CLUSTER_LOCATION_PLACEHOLDER,
+    AGENT_CLUSTER_NAME_PLACEHOLDER,
+)
+_GKE_CONTEXT_PARTS = re.compile(r"gke_(?P<project>[^_]+)_(?P<location>[^_]+)_(?P<cluster>[^_]+)")
+
+
+def expand_agent_cluster_placeholders(prompt: str, context: str | None) -> tuple[str, str | None]:
+    """``prompt`` with the agent's own cluster written in, and the setup problem, if any.
+
+    A prompt that names none of the placeholders is returned as it is,
+    whatever the context. One that names any needs ``context`` to be a GKE
+    kubectl context (``gke_<project>_<location>_<cluster>``); otherwise the
+    second value says why, and the caller records the run as a setup failure,
+    never as the model's.
+    """
+    if not any(p in prompt for p in _AGENT_CLUSTER_PLACEHOLDERS):
+        return prompt, None
+    match = _GKE_CONTEXT_PARTS.fullmatch((context or "").strip())
+    if match is None:
+        return prompt, (
+            "the case prompt names the agent's cluster ({{AGENT_CLUSTER_*}}), but "
+            f"AGENT_CLUSTER_CONTEXT is {'unset' if not context else repr(context)}, "
+            "not a gke_<project>_<location>_<cluster> context"
+        )
+    return (
+        prompt.replace(AGENT_CLUSTER_PROJECT_PLACEHOLDER, match["project"])
+        .replace(AGENT_CLUSTER_LOCATION_PLACEHOLDER, match["location"])
+        .replace(AGENT_CLUSTER_NAME_PLACEHOLDER, match["cluster"]),
+        None,
+    )
+
+
 def _infra_failure(detail: str) -> AgentResult:
     """A run where no answer can be graded, recorded as infrastructure.
 
@@ -2788,6 +2861,75 @@ def _inject_result(exchange: inject.Exchange, identity: dict[str, Any]) -> Agent
     )
 
 
+def _execute_slack(prompt: str) -> AgentResult:
+    """The Slack transport: one ask as the test user, graded on the report the thread delivered.
+
+    The report is built the way the other transports build theirs
+    (:func:`_append_delivered`): the router's first content post, then each
+    later card post as a "Result of delegated task" section, or a "Question
+    from delegated task" section when it carries buttons, folded with
+    :func:`_fold_sections`. Slack shows no task id, so a section names its post
+    by timestamp (``slack-<ts>``). No trajectory is recorded, so a case that
+    checks a worker's tool calls cannot pass here.
+
+    Missing configuration is infrastructure, never graded, so the lane script's
+    skip and a half-configured run cannot read as the agent's failure. The
+    opening turn's seconds are post to answer, as Slack's timestamps show them.
+    """
+    missing = [name for name in slack.REQUIRED_ENV if not os.environ.get(name)]
+    if missing:
+        return _infra_failure(f"slack transport not configured: {', '.join(missing)} unset")
+    token = os.environ[slack.USER_TOKEN_ENV]
+    if not token.startswith(slack.USER_TOKEN_PREFIXES):
+        return _infra_failure(f"{slack.USER_TOKEN_ENV} is not a user token")
+    try:
+        timeout = _numeric_env("AGENT_SLACK_TIMEOUT", _SLACK_DEFAULT_TIMEOUT, float)
+    except ValueError as exc:
+        return AgentResult.errored(str(exc))
+    turn = slack.SlackTurn(slack.SlackClient(token), os.environ[slack.CHANNEL_ENV], os.environ[slack.BOT_USER_ENV])
+    try:
+        exchange = turn.run(prompt, timeout)
+    except (slack.SlackAPIError, OSError) as exc:
+        return _infra_failure(f"slack: {exc}")
+    timing = exchange.timing()
+    slack.write_timing(timing)
+    if timing["slack_post_to_answer_s"] is not None:
+        _write_turn_timing(timing["slack_post_to_answer_s"])
+    if exchange.outcome == "no_reply":
+        return _infra_failure(f"slack: no bot reply in the thread within {timeout:g}s")
+    errors = [] if exchange.outcome == "settled" else [f"slack: the turn had not settled by {timeout:g}s"]
+    report = _slack_report(exchange.posts)
+    return AgentResult(
+        output=report,
+        trajectory=[],
+        tokens={},
+        errors=errors,
+        metadata={
+            "transport": TRANSPORT_SLACK,
+            "final_message": report,
+            "outcome": exchange.outcome,
+            "window_posts": len(exchange.posts),
+            "slack_ask_ts": exchange.ask_ts,
+            "slack_reaction": exchange.reaction or None,
+            "slack_buttons": exchange.buttons,
+            "slack_transient_errors": len(exchange.errors),
+            **timing,
+        },
+    )
+
+
+def _slack_report(posts: list[dict[str, Any]]) -> str:
+    """The thread's delivered report: the ack, then a section per card post."""
+    ack, cards = slack.split_thread(posts)
+    sections = [
+        (_QUESTION_SECTION if slack.has_buttons(p) else _RESULT_SECTION).format(
+            tid=slack.post_id(p), text=p.get("text", "")
+        )
+        for p in cards
+    ]
+    return _fold_sections(str((ack or {}).get("text", "")), sections)
+
+
 class _DelegationTransportExhausted(Exception):
     """The delegation wait lost its transport on every status-turn retry.
 
@@ -2866,6 +3008,10 @@ class KubeAgentsHarness(AgentHarness):
         """
         transcript.clear()
         started_at = time.time()
+        prompt, setup_problem = expand_agent_cluster_placeholders(prompt, os.environ.get("AGENT_CLUSTER_CONTEXT"))
+        if setup_problem is not None:
+            transcript.set("", [], prompt=prompt, started_at=started_at)
+            return _infra_failure(setup_problem)
         # The GitOps wait uses it as a lower bound on PR creation time: a rerun
         # that reuses a cluster name reuses the run branch, and the previous
         # run's merged PR is still listed against it.
@@ -2923,6 +3069,8 @@ class KubeAgentsHarness(AgentHarness):
             return AgentResult.errored(
                 f"{pushed_report.DIRECTIVE} needs AGENT_TRANSPORT={TRANSPORT_INJECT}, got {transport!r}"
             )
+        if transport == TRANSPORT_SLACK:
+            return _execute_slack(prompt)
         return self._execute_api(prompt, workspace_path, opening_turn=opening_turn)
 
     def _execute_api(
@@ -4443,7 +4591,12 @@ class KubeAgentsHarness(AgentHarness):
             # _settle's own gap entry stays, with its reasons; only what it
             # added besides is withheld.
             added = result.trajectory[before:]
-            kept = [e for e in added if isinstance(e, dict) and e.get("name") == worker_trajectory.GAP_ENTRY]
+            kept = [
+                e
+                for e in added
+                if isinstance(e, dict)
+                and e.get("name") in (worker_trajectory.GAP_ENTRY, worker_trajectory.NO_WORKER_CALLS_ENTRY)
+            ]
             withheld = [e for e in added if e not in kept]
             result.trajectory[before:] = kept
             if withheld:
@@ -4848,6 +5001,19 @@ class KubeAgentsHarness(AgentHarness):
 
         trajectory_clean = captured is not None and not bool(worker_trajectory.gaps(captured.summary))
         logs_clean = logs is None or all(l is not None for l in logs.values())
+        # Every awaited card closed, a clean read, and not one worker entry or
+        # logged command: the workers made no call, which the workers-scope
+        # checks grade rather than set aside (worker_trajectory.NO_WORKER_CALLS_ENTRY).
+        if (
+            awaited
+            and trajectory_clean
+            and logs_clean
+            and on_board is not None
+            and not result.metadata.get("worker_commands")
+            and not any(isinstance(e, dict) and e.get("agent") for e in captured.entries)
+            and all(_closed_explicitly(on_board.get(t)) for t in awaited)
+        ):
+            result.trajectory.append(worker_trajectory.no_worker_calls_entry(awaited))
         worker_acted = (
             any(
                 isinstance(e, dict)

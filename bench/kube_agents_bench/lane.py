@@ -27,10 +27,11 @@ touched, and the scorer still reads it (the appended entries reach the
 record through the report, which is what rung 1 grades).
 
 The file is ``hack/eval/inject-lane-safeguards.yaml``, read by
-``hack/ci-eval-pr.sh`` beside the lane's exclusions; its shape is two keys:
-``safeguards``, holding entries in the case format's own vocabulary, and
-``requesting``, mapping a case the lane treats as requesting a pull request
-before its own checks say so to the count it is allowed.
+``hack/ci-eval-pr.sh`` beside the lane's exclusions; its shape is one key,
+``safeguards``, holding entries in the case format's own vocabulary. A case
+that requests more pull requests than its checks grade, or one the persona
+answers with a pull request before its own check lands, declares its count in
+its own task file under :data:`REQUESTED_KEY`.
 ``scripts/test_eval_rosters.py`` holds the file to that shape and to the
 lane's rules.
 
@@ -38,8 +39,10 @@ Two things a copy does that a plain append would not. An entry whose name a
 case already declares would be refused by devops-bench as a duplicate -- a
 parse error that reds every repetition of that case at rung 2, after the
 cluster lease -- so the collision is refused here, before it. And a case that requests a pull
-request (a leaf of a type in :data:`REQUESTING_CHECK_TYPES` in its own spec)
-has that many requested writes: every ``github_writes`` leaf appended to it
+request (a leaf of a type in :data:`REQUESTING_CHECK_TYPES` in its own spec,
+or a total it declares under :data:`REQUESTED_KEY`) has that many requested
+writes, the larger of the two:
+every ``github_writes`` leaf appended to it
 gets ``requested_pull_requests`` set to that count, so the lane's safeguard
 leaves the case's own pull request out and fails the repetition on anything
 beyond it, and ``exclusive_window``, since such a case runs alone and a
@@ -75,17 +78,18 @@ __all__ = [
     "append_lane_safeguards",
     "check_repository",
     "copy_task",
-    "load_lane_requesting",
+    "declared_pull_requests",
     "load_lane_safeguards",
     "main",
     "requested_pull_requests",
 ]
 
-#: The top-level keys of a lane safeguards file: the entries every case
-#: carries, and the cases the lane treats as requesting a pull request
-#: beyond what their own checks say, each with the count it is allowed.
+#: The top-level key of a lane safeguards file: the entries every case
+#: carries. The file once also held a ``requesting:`` map of allowances; that
+#: count lives in each task under REQUESTED_KEY now, and a file that still
+#: carries the map is refused so a stale entry cannot go unread.
 SAFEGUARDS_KEY = "safeguards"
-REQUESTING_KEY = "requesting"
+RETIRED_REQUESTING_KEY = "requesting"
 #: The keys a check subtree nests children under, as ``cases.py`` walks them.
 CHECK_CHILD_KEYS = ("checks", "check")
 #: The check types that request a pull request -- ``pull_request_opened``
@@ -95,6 +99,13 @@ CHECK_CHILD_KEYS = ("checks", "check")
 REQUESTING_CHECK_TYPES = frozenset({"pull_request_opened", "pull_request_diff_contains"})
 WRITES_CHECK_TYPE = "github_writes"
 REQUESTED_FIELD = "requested_pull_requests"
+#: The same name at the top of a task.yaml is the case's own declaration of
+#: how many pull requests it opens: a case that opens more than its checks
+#: grade, or a placeholder for a case the persona answers with a pull
+#: request before its own check lands. The count lives in the one file both
+#: the lane and the pinned grader read (``cases.load_case`` reads it too).
+#: The larger of this and the case's requesting leaves is the allowance.
+REQUESTED_KEY = REQUESTED_FIELD
 EXCLUSIVE_WINDOW_FIELD = "exclusive_window"
 #: A case's own declaration that it runs alone in the lane's second phase
 #: (`writes_alone: true` at the top of its task.yaml): a case that requests
@@ -148,6 +159,11 @@ def load_lane_safeguards(path: str | Path) -> list[dict[str, Any]]:
         doc = yaml.safe_load(file.read_text(encoding="utf-8"))
     except yaml.YAMLError as exc:
         raise LaneSafeguardsError(f"{file}: not parseable as YAML: {exc}") from exc
+    if isinstance(doc, dict) and RETIRED_REQUESTING_KEY in doc:
+        raise LaneSafeguardsError(
+            f"{file}: `{RETIRED_REQUESTING_KEY}:` is retired; a case declares its count in its "
+            f"own task.yaml under `{REQUESTED_KEY}:`"
+        )
     if not isinstance(doc, dict) or not isinstance(doc.get(SAFEGUARDS_KEY), list):
         raise LaneSafeguardsError(
             f"{file}: expected a mapping with a `{SAFEGUARDS_KEY}:` list at the top level"
@@ -204,39 +220,6 @@ def check_repository(safeguards: list[dict[str, Any]], repo: str) -> None:
                 )
 
 
-def load_lane_requesting(path: str | Path) -> dict[str, int]:
-    """The file's ``requesting:`` mapping, case id to the count of pull
-    requests the lane allows it, or an empty mapping when the key is absent.
-
-    For a case whose prompt the persona answers with a pull request before
-    its checks say so: it runs in the second phase and is allowed that many,
-    where its own spec would count zero. An entry is a placeholder for the
-    case's own check and goes when that check lands. Or for a case that opens
-    more pull requests by design than its checks grade: the count is the
-    total, and the entry stays.
-    """
-    file = Path(path)
-    if not file.is_file():
-        raise LaneSafeguardsError(f"{file}: no such lane safeguards file")
-    try:
-        doc = yaml.safe_load(file.read_text(encoding="utf-8"))
-    except yaml.YAMLError as exc:
-        raise LaneSafeguardsError(f"{file}: not parseable as YAML: {exc}") from exc
-    if not isinstance(doc, dict):
-        raise LaneSafeguardsError(f"{file}: expected a mapping at the top level")
-    listed = doc.get(REQUESTING_KEY) or {}
-    if not isinstance(listed, dict):
-        raise LaneSafeguardsError(f"{file}: `{REQUESTING_KEY}:` must map case ids to counts")
-    out: dict[str, int] = {}
-    for case, count in listed.items():
-        if not isinstance(count, int) or isinstance(count, bool) or count < 1:
-            raise LaneSafeguardsError(
-                f"{file}: `{REQUESTING_KEY}:` {case!r} must map to a count of at least 1, got {count!r}"
-            )
-        out[str(case)] = count
-    return out
-
-
 def requested_pull_requests(spec: Any) -> int:
     """How many pull requests a task's own checks request: its leaves of a
     type in :data:`REQUESTING_CHECK_TYPES`, wherever they nest."""
@@ -263,10 +246,26 @@ def runs_alone(doc: dict[str, Any]) -> bool:
     return stop_hook.is_stopped_ask(str(doc.get("prompt") or "")) or declares_writes_alone(doc)
 
 
-def requested_for(spec: Any, listed_allowance: int = 0) -> int:
+def declared_pull_requests(doc: dict[str, Any], *, where: str = TASK_FILE) -> int:
+    """The count a task declares at its top level under ``REQUESTED_KEY``; 0
+    when absent. A bool, a string or a negative number is refused: PyYAML
+    reads an unquoted number as int, so anything else was typed wrong, and a
+    permissive read would hand the case an allowance it did not ask for."""
+    value = doc.get(REQUESTED_KEY)
+    if value is None:
+        return 0
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise LaneSafeguardsError(
+            f"{where}: `{REQUESTED_KEY}:` must be a non-negative integer, got {value!r}"
+        )
+    return value
+
+
+def requested_for(spec: Any, declared: int = 0) -> int:
     """How many pull requests a case requests: the larger of what its own
-    checks say and the count the lane file's ``requesting:`` gives it."""
-    return max(requested_pull_requests(spec), listed_allowance)
+    checks say and ``declared``, the count the task declares under
+    ``REQUESTED_KEY``."""
+    return max(requested_pull_requests(spec), declared)
 
 
 def _load_task(task_yaml: Path) -> dict[str, Any]:
@@ -285,7 +284,7 @@ def append_lane_safeguards(
     task_yaml: str | Path, safeguards: list[dict[str, Any]], out_dir: str | Path
 ) -> Path:
     """Write ``<out_dir>/<case>/task.yaml`` with the lane's entries appended
-    and return its path; :func:`copy_task` with no listed allowance."""
+    and return its path; :func:`copy_task`, keeping the path alone."""
     return copy_task(task_yaml, safeguards, out_dir)[0]
 
 
@@ -293,12 +292,11 @@ def copy_task(
     task_yaml: str | Path,
     safeguards: list[dict[str, Any]],
     out_dir: str | Path,
-    listed_allowance: int = 0,
 ) -> tuple[Path, int]:
     """Write ``<out_dir>/<case>/task.yaml``: the task with the lane's entries
     appended. Returns the copy's path and how many pull requests the case
-    requests: the larger of what its own checks say and ``listed_allowance``,
-    the count the lane file's ``requesting:`` gives it.
+    requests: the larger of what its own checks say and the count the task
+    declares under ``REQUESTED_KEY``.
 
     The case is the task file's directory name, which is what devops-bench
     records as ``folder`` and the scorer joins on, so the copy keeps it.
@@ -310,7 +308,7 @@ def copy_task(
     spec = doc.get(SPEC_KEY)
     existing = list(spec) if isinstance(spec, list) else []
     taken = {str(e.get("name")) for e in existing if isinstance(e, dict) and e.get("name")}
-    requested = requested_for(existing, listed_allowance)
+    requested = requested_for(existing, declared_pull_requests(doc, where=str(source)))
     # A stopped ask, or a case that declares `writes_alone`, runs alone in the
     # second phase as well (hack/ci-eval-pr.sh reads both through
     # kube_agents_bench.stop_hook), so its window is exclusive with no allowance.
@@ -347,7 +345,8 @@ def main(argv: list[str] | None = None) -> int:
     """Materialise every task given with the lane's safeguards appended.
 
     Prints ``<requested> <case> <path>`` per task -- how many pull requests
-    the case's own checks request, which the script uses to run those cases
+    the case requests (the larger of its own checks and its ``requested_pull_requests``
+    key), which the script uses to run those cases
     in the fan-out's second phase, then the copy's path, last because it may
     hold spaces; exits
     non-zero, naming the file and the fault, when the lane file or a task
@@ -368,10 +367,8 @@ def main(argv: list[str] | None = None) -> int:
         safeguards = load_lane_safeguards(args.safeguards)
         if args.gitops_repo:
             check_repository(safeguards, args.gitops_repo)
-        listed = load_lane_requesting(args.safeguards)
         for task in args.tasks:
-            case = Path(task).parent.name
-            written, requested = copy_task(task, safeguards, args.out_dir, listed.get(case, 0))
+            written, requested = copy_task(task, safeguards, args.out_dir)
             # The count first and the path last: the path may hold spaces
             # (a TMPDIR with one), and the consumer splits on whitespace.
             print(f"{requested} {written.parent.name} {written}")

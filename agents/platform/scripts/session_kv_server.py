@@ -10868,7 +10868,7 @@ def mark_finding_surfaced(finding_id: str, body: Dict[str, Any] | None = None) -
 
 @app.get("/v1/findings/additions", dependencies=[Depends(verify_api_key)])
 def get_finding_additions(day: str = "") -> Dict[str, Any]:
-    """Items added on a UTC day (default today) by class, across every state (§7.2)."""
+    """Items added on a UTC day (default today) by class, and the line of each, across every state (§7.2)."""
     day = day or datetime.now(timezone.utc).date().isoformat()
     try:
         with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=5.0)) as conn:

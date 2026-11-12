@@ -1,7 +1,7 @@
 # Eval run artifacts and judge caches -- regenerated on every run.
 .deepeval/
 results/
-.venv/
+.venv
 uv.lock
 
 # OpenTofu droppings -- single (non-parallel) runs execute tofu in the source

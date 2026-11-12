@@ -13,6 +13,7 @@ import unittest
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 DOCKERFILE = REPO_ROOT / "deploy/sandbox/Dockerfile"
+WORKER_DOCKERFILE = REPO_ROOT / "a2a/Dockerfile.worker"
 SMOKE_TEST = REPO_ROOT / "deploy/sandbox/smoke-test.sh"
 VERSION_ARG_RE = re.compile(r"^ARG KUBECTL_VERSION=(?P<version>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)$", re.MULTILINE)
 SHA256_ARG_RE = re.compile(r"^ARG KUBECTL_SHA256_(?:AMD64|ARM64)=[0-9a-f]{64}$", re.MULTILINE)
@@ -25,17 +26,21 @@ SMOKE_EXPECTATION = "request path /clusters/seeded-a/api/v1/pods?limit=1"
 
 class KubectlPin(unittest.TestCase):
     def test_pin_is_at_or_above_the_raw_path_floor(self):
-        match = VERSION_ARG_RE.search(DOCKERFILE.read_text(encoding="utf-8"))
-        self.assertIsNotNone(match, "deploy/sandbox/Dockerfile declares no ARG KUBECTL_VERSION=<major>.<minor>.<patch>")
-        self.assertEqual(int(match.group("version")), 1)
-        self.assertGreaterEqual(
-            int(match.group("minor")),
-            FLOOR_MINOR,
-            f"kubectl 1.{match.group('minor')} drops the kubeconfig server's /clusters/<ctx> path on --raw; the floor is 1.{FLOOR_MINOR}",
-        )
+        for df in (DOCKERFILE, WORKER_DOCKERFILE):
+            with self.subTest(dockerfile=df.relative_to(REPO_ROOT)):
+                match = VERSION_ARG_RE.search(df.read_text(encoding="utf-8"))
+                self.assertIsNotNone(match, f"{df} declares no ARG KUBECTL_VERSION=<major>.<minor>.<patch>")
+                self.assertEqual(int(match.group("version")), 1)
+                self.assertGreaterEqual(
+                    int(match.group("minor")),
+                    FLOOR_MINOR,
+                    f"kubectl 1.{match.group('minor')} drops the kubeconfig server's /clusters/<ctx> path on --raw; the floor is 1.{FLOOR_MINOR}",
+                )
 
     def test_both_checksums_are_pinned(self):
-        self.assertEqual(len(SHA256_ARG_RE.findall(DOCKERFILE.read_text(encoding="utf-8"))), 2)
+        for df in (DOCKERFILE, WORKER_DOCKERFILE):
+            with self.subTest(dockerfile=df.relative_to(REPO_ROOT)):
+                self.assertEqual(len(SHA256_ARG_RE.findall(df.read_text(encoding="utf-8"))), 2)
 
     def test_smoke_test_proves_the_path_against_the_binary(self):
         self.assertIn(SMOKE_EXPECTATION, SMOKE_TEST.read_text(encoding="utf-8"))
