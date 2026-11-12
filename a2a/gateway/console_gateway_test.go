@@ -393,7 +393,8 @@ func TestAConsoleHandOffWithNoChildIsAFailedFrame(t *testing.T) {
 	waitFor(t, "the frame", func() bool { return len(r.adapter.terminalPosts()) > 0 })
 	got := r.adapter.terminalPosts()
 	if len(got) != 1 || got[0].TaskID != origin.TaskID || got[0].State != lib.StateFailed ||
-		!strings.HasPrefix(got[0].Text, "❌ failed: ") || !strings.Contains(got[0].Text, "delegation refused") ||
+		got[0].Text != "❌ failed — "+reasonSentences["delegation-refused"] ||
+		strings.Contains(got[0].Text, reasonPrefix) ||
 		strings.Contains(got[0].Text, "delegated to nobody-here") {
 		t.Fatalf("terminal frames = %+v, want one failed frame for %s with the reason", got, origin.TaskID)
 	}

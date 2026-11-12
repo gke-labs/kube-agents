@@ -121,8 +121,10 @@ NOOP_DEPLOYER = "noop"
 # the pod instead, when the turn ran under the bridge's api executor, and
 # puts them on the trajectory tagged with the worker's profile. The scorer
 # grades these checks on an inject record that carries tagged worker
-# entries and no ``worker_trajectory.GAP_ENTRY`` (a capture with gaps), and
-# sets them aside on any other inject record. Two kinds stay set aside on a
+# entries and no ``worker_trajectory.GAP_ENTRY`` (a capture with gaps), grades
+# the ``workers``-scope ``tool_called`` ones on a record carrying
+# ``worker_trajectory.NO_WORKER_CALLS_ENTRY`` and no worker entry, and sets them
+# aside on any other inject record. Two kinds stay set aside on a
 # record with the workers too: a check that also reads the router's own
 # calls, on a record whose door did not vouch for them, and a check that
 # reads what the trace never carries (a router call's result or argument
@@ -147,6 +149,7 @@ HARNESS_WRITTEN_ENTRIES = frozenset(
         stop_hook.CARDS_STOPPED_ENTRY,
         pushed_report.PLANT_ENTRY,
         worker_trajectory.GAP_ENTRY,
+        worker_trajectory.NO_WORKER_CALLS_ENTRY,
     }
 )
 _TOOL_CALLED_NAMES_KEY = "tool_names"
@@ -154,6 +157,8 @@ _TOOL_CALLED_NAMES_KEY = "tool_names"
 # (``verifiers.ToolCalledVerifier``: ``router`` is the default).
 _TOOL_CALLED_SCOPE_KEY = "scope"
 _TOOL_CALLED_ROUTER_SCOPE = "router"
+# The scope that reads the delegated workers' calls alone.
+_TOOL_CALLED_WORKERS_SCOPE = "workers"
 # The scope that reads the router's calls and the workers' together.
 _TOOL_CALLED_ALL_SCOPE = "all"
 # The worker-blind type that reads every tool output, the router's included.
@@ -251,7 +256,9 @@ class CaseSpec:
     ran under the bridge's api executor and tags their entries, so the
     scorer grades these entries on an inject record that carries tagged
     worker entries and no capture gap, and sets them aside on any other
-    inject record (``scoring._inject_lane_view``). A compound mixing such a
+    inject record (``scoring._inject_lane_view``), bar
+    ``worker_calls_checks`` on a record carrying
+    ``worker_trajectory.NO_WORKER_CALLS_ENTRY``. A compound mixing such a
     leaf with a router-scope ``tool_called`` lands here, not in
     ``trace_blind_checks``: its worker leaf would still error with the
     trace shown, and grading the compound would block on it. The two sets
@@ -273,6 +280,14 @@ class CaseSpec:
     tool output, the router's included). Set aside on every inject record,
     workers or none."""
 
+    worker_calls_checks: frozenset[str] = frozenset()
+    """The entries in ``worker_blind_checks`` whose every leaf is a
+    ``tool_called`` in the ``workers`` scope with no ``result`` pattern. On a
+    record carrying ``worker_trajectory.NO_WORKER_CALLS_ENTRY`` (the cards
+    closed, a clean capture, no worker entry) these alone grade, on zero
+    worker calls; the other worker-reading entries stay set aside, since their
+    verifiers read a capture that holds nothing (``scoring._inject_lane_view``)."""
+
     tool_calls_optional: bool = False
     """``tool_calls_optional:``, for a case a correct agent can answer without
     calling a tool -- a first-turn greeting, a reply that names a command.
@@ -286,12 +301,13 @@ class CaseSpec:
     requesting checks ask for (leaves of a type in
     ``lane.REQUESTING_CHECK_TYPES``) and the count it declares at its top
     level under ``requested_pull_requests``, for a case that opens more pull
-    requests by design than its checks grade. The write-safeguard carve-outs
-    in ``scoring.classify_rep`` fire only when this is non-zero, and hold the
-    charged writes to it: on a case that requested none a write is a genuine
-    forbidden action and still blocks. The lane file's ``requesting:`` map is
-    not read here -- the scorer is pinned to the ``bench/`` tree -- so a count
-    that lives only there is not seen; the task key is where it belongs."""
+    requests by design than its checks grade or a placeholder for a case the
+    persona answers with a pull request before its own check lands. The
+    write-safeguard carve-outs in ``scoring.classify_rep`` fire only when this
+    is non-zero, and hold the charged writes to it: on a case that requested
+    none a write is a genuine forbidden action and still blocks. Both counts
+    are in the task file, which is why they live there: the scorer is pinned
+    to the ``bench/`` tree and cannot read the lane file under ``hack/``."""
 
 
 def _leaves(node: Any) -> list[dict[str, Any]]:
@@ -383,6 +399,29 @@ def _negates_every_leaf(node: Any, *, negations: int = 0) -> bool:
     return False
 
 
+def _calls_the_workers_only(leaf: dict[str, Any]) -> bool:
+    """Whether a leaf is a ``tool_called`` in the ``workers`` scope with no ``result`` pattern."""
+    return (
+        str(leaf.get("type") or "") in TRACE_GRADABLE_CHECK_TYPES
+        and leaf.get(_TOOL_CALLED_SCOPE_KEY) == _TOOL_CALLED_WORKERS_SCOPE
+        and leaf.get(_TOOL_CALLED_RESULT_KEY) is None
+    )
+
+
+def _worker_calls_checks(spec: Any, workers: frozenset[str]) -> frozenset[str]:
+    """The names in ``workers`` whose every leaf passes :func:`_calls_the_workers_only`."""
+    if not isinstance(spec, list):
+        return frozenset()
+    return frozenset(
+        str(entry["name"])
+        for entry in spec
+        if isinstance(entry, dict)
+        and str(entry.get("name")) in workers
+        and (leaves := _leaves(entry.get("check")))
+        and all(_calls_the_workers_only(leaf) for leaf in leaves)
+    )
+
+
 def _transport_blind_checks(
     spec: Any,
 ) -> tuple[frozenset[str], frozenset[str], frozenset[str], frozenset[str], frozenset[str]]:
@@ -461,8 +500,6 @@ def load_case(task_yaml: str | Path) -> CaseSpec:
 
     The case's ``requested_pull_requests`` is the larger of the count of its
     own requesting checks and the top-level ``requested_pull_requests`` key.
-    The lane file's ``requesting:`` map is not read here; see that field's
-    note.
     """
     path = Path(task_yaml)
     if not path.is_file():
@@ -551,6 +588,7 @@ def load_case(task_yaml: str | Path) -> CaseSpec:
         worker_blind_checks=worker_blind,
         worker_router_checks=worker_router,
         worker_untraced_checks=worker_untraced,
+        worker_calls_checks=_worker_calls_checks(spec, worker_blind),
         tool_calls_optional=tool_calls_optional,
         requested_pull_requests=max(_lane_requested_pull_requests(spec), declared),
     )

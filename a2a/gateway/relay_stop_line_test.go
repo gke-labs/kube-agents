@@ -689,3 +689,55 @@ func TestAChatTypedStopWhoseCloseFailsPostsTheNotice(t *testing.T) {
 		}
 	}
 }
+
+// A Stop press on Google Chat from a member the allowlist does not admit
+// posts nothing: the press asked the bot for nothing, and the unverified
+// sender's notice, which names the presser, would land in a thread the
+// space reads. Nor are they told privately, as a listed member the
+// requester gate refuses is (gchat_stop_gate_test.go): the allowlist drops
+// the press before the gate reads it, named viewer or not. The task runs
+// on. (A typed message from the same member still gets the notice once.)
+func TestAChatStopPressFromAnUnlistedMemberPostsNoNotice(t *testing.T) {
+	r := startGchatRig(t, []string{"user@example.com"}, false)
+	conv := "gchat:spaces/S1/threads/T-unlisted-press"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "user@example.com", MessageID: "spaces/S1/messages/M1", Text: "explain node upgrades"}
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	if err := exec.PublishStatus(context.Background(), lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the working line", func() bool {
+		lines := r.adapter.stopLinesCopy()
+		return len(lines) > 0 && strings.Contains(lines[len(lines)-1].Text, "working")
+	})
+	line := r.adapter.stopLinesCopy()[0].MessageID
+	before := len(r.adapter.postTextsFor(conv))
+	press := line + "#t1"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "nobody@example.com", MessageID: press, Intent: IntentCancel, TaskID: origin.TaskID, Click: true, Viewer: "users/000000000000000000002"}
+	// The press's verdict reaches the adapter after verifySender has posted
+	// whatever it posts, so once it is observed the press's own posts are on
+	// record: there must be none. (Without the skip, the press would post the
+	// notice here and the typed message below would be silent, which is why
+	// the typed message alone is no proof.)
+	waitFor(t, "the press to be dropped", func() bool {
+		return slices.Contains(r.adapter.verifiedCalls(), press+":false")
+	})
+	if posts := r.adapter.postTextsFor(conv); len(posts) != before {
+		t.Fatalf("an unlisted member's press posted %q", posts[before:])
+	}
+	if got := r.adapter.privatePosts(); len(got) != 0 {
+		t.Fatalf("an unlisted member's press told them privately: %+v", got)
+	}
+	// The same member's typed message still gets the notice, once.
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "nobody@example.com", MessageID: "spaces/S1/messages/M2", Text: "hello"}
+	awaitPostIn(t, r, "the typed message's unverified notice", conv, "I can't verify who you are")
+	posts := r.adapter.postTextsFor(conv)
+	if n := len(posts) - before; n != 1 {
+		t.Fatalf("the press and the message posted %d line(s): %q; want the message's notice alone", n, posts[before:])
+	}
+	if slices.ContainsFunc(inSubjectEnvelopes(t, r.url, "platform"), func(e *lib.Envelope) bool {
+		return e.TaskID == origin.TaskID && e.Kind == lib.KindCancel
+	}) {
+		t.Fatal("an unlisted member's press cancelled the task")
+	}
+}

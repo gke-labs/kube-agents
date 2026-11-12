@@ -58,9 +58,13 @@ misconfigurations:
     paths:
       - "k8s-operator/config/rbac/**"
 
-  # Ignore KSV-0041: callers need Secret verbs on manager-role, and trivy
+  # Ignore KSV-0041: callers need Secret verbs on the manager role, and trivy
   # cannot scope an exemption to one rule -- `paths` globs are its whole
-  # vocabulary -- so exempting either exempts the whole rbac directory.
+  # vocabulary -- so exempting either exempts the whole rbac directory. The
+  # read verbs stay on the ClusterRole, and KSV-0041 flags a ClusterRole that
+  # names secrets with any of them. The write verbs are the namespaced Role
+  # document in role.yaml (the marker carries `namespace=`), bound in the
+  # install namespace; a Role is KSV-0113 (MEDIUM), under the scan's threshold.
   #
   #   - `get`: checkShellSandboxKeys asks whether the sandbox's authorized-keys
   #     Secret exists, so the CR can report a missing one instead of leaving the
@@ -72,19 +76,22 @@ misconfigurations:
   #     read values; only their HMAC-SHA256 digest, keyed by the UIDs of the
   #     Secrets read, leaves the controller, and the digest goes on an object
   #     the operator already writes.
-  #   - create/update/patch/delete: under `mode: next` the operator generates
-  #     and repairs the A2A NATS credential and config Secrets, and
-  #     ensureKubeProxyTLSSecret manages the `<agent>-kube-proxy-tls` Secret,
-  #     owner-referenced to the PlatformAgent.
-  #   - list/watch: held on manager-role only so the operator can grant
-  #     read-only `get`/`list`/`watch` on `secrets` in `buildMinimalPlatformRole`
+  #   - create/update/patch/delete, in the install namespace only: under
+  #     `mode: next` the operator generates and repairs the A2A NATS credential
+  #     and config Secrets, and ensureKubeProxyTLSSecret manages the
+  #     `<agent>-kube-proxy-tls` Secret, owner-referenced to the PlatformAgent.
+  #     Every write names a Secret in the namespace of the PlatformAgent being
+  #     reconciled, which both install paths make the install namespace.
+  #   - list/watch: held cluster-wide only so the operator can grant read-only
+  #     `get`/`list`/`watch` on `secrets` in `buildMinimalPlatformRole`
   #     (`kubeagents:minimal:<ns>:<name>`) without Kubernetes RBAC escalation
   #     errors; the operator itself reads Secrets by name through a2aReader and
   #     never lists or watches Secrets.
   #
   # tests/test_operator_secrets_grant.py is what replaces the check: it pins the
-  # verb set and marker, forbids controller SecretList/watch calls, and fails if
-  # this exemption widens past the rbac and golden expected directories.
+  # verb set of each document and the two markers, forbids controller
+  # SecretList/watch calls, and fails if this exemption widens past the rbac
+  # and golden expected directories.
   - id: KSV-0041
     paths:
       - "k8s-operator/config/rbac/**"

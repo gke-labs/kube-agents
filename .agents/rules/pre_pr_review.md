@@ -4,13 +4,14 @@ paths:
   - ".github/PULL_REQUEST_TEMPLATE.md"
   - "docs/pull-request-workflow.md"
 trigger: model_decision
-description: "Pre-PR review and validation mechanics: running adversarial and docs-drift reviews in a clean context, live validation, bug-fix recurrence, and keeping PR sections current."
+description: "Pre-PR review and validation mechanics: running adversarial, docs-drift and chat UX reviews in a clean context, live validation, UX-change screenshots, bug-fix recurrence, and keeping PR sections current."
 ---
 
 # Pre-PR review mechanics
 
 [`AGENTS.md`](../../AGENTS.md) owns the rules below — that adversarial self-review, docs-drift
-review, and live validation are required before opening a pull request, that each is recorded in the
+review, live validation, the chat UX pass when chat output changes, and a screenshot of a changed
+user-facing surface are required before opening a pull request, that each is recorded in the
 pull request body and kept current across rounds, and that a bug fix must name what stops it
 recurring. This file holds the mechanics of carrying them out, and what the automated review shares
 with the self-review. The comments in
@@ -41,6 +42,15 @@ The rule, and the requirement to fill in the template's **Self-Review** section,
   agent is otherwise told to wait for — coding agents are instructed not to spawn subagents on
   their own initiative, which is why `AGENTS.md` names the command in the rule itself rather than
   leaving the only route to it on this page, which an agent reaches only after deciding to look.
+- **A change to chat output also runs `review-chat-ux`**, in its own clean context, against
+  [`chat_ux.md`](chat_ux.md). Chat output is what that skill's Scope says: a non-test file under
+  the rule file's `paths:`, a string a user reads in chat anywhere else, or who may confirm, stop
+  or press a button. `/pr-preflight` decides from the range and runs it; its violations join the
+  one disposition list. The `Chat output follows the chat UX rules` check in
+  [`ux-evidence.yml`](../../.github/workflows/ux-evidence.yml) runs `a2a/lib/chatmsg`'s lint and
+  the chat conformance and golden tests on the same paths. The lint reads the shared cases in
+  `tests/conformance/chat-ux/`, so a new kind of message is checked by code only once a case
+  carries it; the pass reads the rest.
 - **If your harness will not spawn one without a human's approval, go and get the approval.** A
   setting that requires sign-off before starting a subagent blocks this step; it does not waive
   it. Ask when you hit it, not after the review, and say what you are blocked on. Quietly running
@@ -99,10 +109,9 @@ in `AGENTS.md` under Pull Request Hygiene.
   confirm it goes back.
 - **Say what you could not cover, and why**, rather than implying full coverage. Clean up test
   artifacts, restore prior state, and note anything left behind.
-- **Screenshots of graphical surfaces go through `scripts/pr_evidence_screenshot.sh`**, which
-  publishes the image where a PR body can render it and prints Markdown stamped with the
-  commit and capture time. Command output stays as fenced text transcripts — a screenshot of a
-  terminal is evidence degraded, not evidence.
+- **Command output stays as fenced text transcripts** — a screenshot of a terminal is evidence
+  degraded, not evidence. The one exception is an installer prompt, whose terminal is the UX
+  (next section).
 - **If the install is shared with other agents, take the lease.**
   `scripts/live_test_lease.py` holds it as a ConfigMap in the install's own namespace. Copy
   `.claude/settings.json.example` to `.claude/settings.json` once per checkout and its
@@ -116,6 +125,31 @@ in `AGENTS.md` under Pull Request Hygiene.
   section is not an answer.
 - **The section names the outcome and where the record is**, nothing from inside it:
   [`public_surfaces.md`](public_surfaces.md).
+
+## UX change
+
+A pull request that changes what a user sees shows it. That covers chat replies and cards in Slack
+and Google Chat, the docs site's rendering, the two browser UIs an install ships (the web
+console and the A2A console), and the installer's prompts. The admin console is not in scope:
+it is a developer tool that runs on your own machine.
+
+- **At least one screenshot of the new UX goes under Testing → UX change**, and a before shot
+  beside it when the change alters output that exists today. Show the moment the change touches —
+  the reply, the card, the page, the prompt — not a surface it happens to sit near.
+- **Publish it with `scripts/pr_evidence_screenshot.sh`**, which hosts the image where a pull
+  request body renders it and prints Markdown stamped with the commit and capture time, or drag
+  it into the GitHub editor. A chat screenshot is of the real client, Slack or Google Chat, talking
+  to your dev install.
+- **When nothing a user sees moved** — a refactor of a renderer, a console handler's backend
+  logic — tick **No user-visible change** instead. The reviewer holds the tick to the diff.
+- **[`ux-evidence.yml`](../../.github/workflows/ux-evidence.yml) checks the body.** It fails when
+  the diff changes a user-facing path and the body, outside comments and code fences, has neither
+  an image nor the ticked box; editing the body re-runs it. The paths are the `paths:` of
+  [`chat_ux.md`](chat_ux.md) plus `SURFACES` in
+  [`scripts/ux_evidence.py`](../../scripts/ux_evidence.py); test files never count, and the docs
+  site counts for its rendering (config, components, styles, assets, `public/`), not its prose,
+  which the diff already shows.
+  The check cannot tell a before shot from an after shot; the reviewer can.
 
 ## Keeping the sections current
 

@@ -1023,7 +1023,7 @@ def test_a_failed_task_is_graded_rather_than_classified(
     stub_gateway.entries = [
         entry(1, inject.ENTRY_TASK, taskId=stub_gateway.task_id),
         entry(2, inject.ENTRY_POST, text=PLACEHOLDER, messageId=PLACEHOLDER_ID),
-        entry(3, inject.ENTRY_POST, text="❌ failed: the cluster is unreachable", messageId=RESULT_ID),
+        entry(3, inject.ENTRY_POST, text="❌ failed — the cluster is unreachable", messageId=RESULT_ID),
         entry(4, inject.ENTRY_TERMINAL, taskId=stub_gateway.task_id, state="failed",
               source=inject.TERMINAL_SOURCE_EXECUTOR,
               reason="reason: hermes-exited-nonzero - exit status 1"),
@@ -1048,7 +1048,7 @@ def test_an_executors_own_failure_is_infrastructure(
     stub_gateway.entries = [
         entry(1, inject.ENTRY_TASK, taskId=stub_gateway.task_id),
         entry(2, inject.ENTRY_POST, text=PLACEHOLDER, messageId=PLACEHOLDER_ID),
-        entry(3, inject.ENTRY_POST, text=f"❌ failed: reason: {token}", messageId=RESULT_ID),
+        entry(3, inject.ENTRY_POST, text="❌ failed — detail here", messageId=RESULT_ID),
         entry(4, inject.ENTRY_TERMINAL, taskId=stub_gateway.task_id, state="failed",
               source=inject.TERMINAL_SOURCE_EXECUTOR, reason=f"reason: {token} - detail here"),
     ]
@@ -3702,6 +3702,35 @@ def test_a_withheld_turn_keeps_the_captures_own_gap_entry(
     assert worker_trajectory.gap_entry([unread]) in gaps
     assert (withheld_gap in gaps) == bool(entries)
     assert result.metadata["worker_entries_withheld"] == entries
+    assert scoring._inject_blind(result.trajectory)
+
+
+def test_a_withheld_turn_keeps_the_no_worker_calls_entry(
+    api_executor: _StubGatewayServer,
+    tmp_path: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On a door that showed no trace, a card closed with no worker call keeps
+    ``worker_trajectory.NO_WORKER_CALLS_ENTRY`` on the trajectory: nothing is
+    withheld, no withheld gap entry is added, and the record still reads as
+    blind."""
+    build_session_store(tmp_path, created=[CARD_A])
+    set_card(tmp_path, CARD_A, "done", result="all 3 clusters healthy")
+    monkeypatch.setattr(harness, "_agent_shell", local_shell(tmp_path, monkeypatch))
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {CARD_A: ""})
+    monkeypatch.setattr(harness, "_worker_commands", lambda logs: [])
+    monkeypatch.setattr(board, "read_board_cards", lambda shell, ids, to: {CARD_A: board.BoardCard("done")})
+
+    def capture(shell: Any, task_ids: list[str], timeout: float) -> Any:
+        return worker_trajectory.WorkerCapture(entries=[], summary={"cards": {CARD_A: {"sessions": ["s1"]}}})
+
+    monkeypatch.setattr(worker_trajectory, "capture", capture)
+
+    result = KubeAgentsHarness().run("check the fleet")
+
+    assert worker_trajectory.no_worker_calls_entry([CARD_A]) in result.trajectory
+    assert worker_trajectory.GAP_ENTRY not in [e.get("name") for e in result.trajectory]
+    assert result.metadata["worker_entries_withheld"] == 0
     assert scoring._inject_blind(result.trajectory)
 
 

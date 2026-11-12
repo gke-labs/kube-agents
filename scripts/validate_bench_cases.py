@@ -70,6 +70,15 @@ REQUESTED_PULL_REQUESTS_KEY = "requested_pull_requests"
 REQUESTING_CHECK_TYPES = frozenset({"pull_request_opened", "pull_request_diff_contains"})
 CHECK_CHILD_KEYS = ("checks", "check")
 TASKS_DIR = REPO_ROOT / "bench" / "tasks"
+# A run's record is never committed beside a case: a public file names the run
+# and its outcome, nothing from inside the record. The harness writes runs
+# under bench/results/, which is gitignored, so nothing legitimate lands here.
+EVIDENCE_DIR_NAME = "evidence"
+RUN_RECORD_RULE = (
+    "a run's record is not committed, and nothing goes under a case's evidence/ "
+    "directory; cite the run by its directory name or build id and leave the record "
+    "in the bucket or on the dev install"
+)
 # The tag PyYAML gives a `<<:` merge key; its pairs are merged in, not repeated.
 YAML_MERGE_TAG = "tag:yaml.org,2002:merge"
 # The rosters hack/ci-eval-pr.sh reads at startup (#1546): what the presubmit
@@ -454,15 +463,6 @@ FIXTURE_NOT_READY = {
         "install's context_repos, as the case's header gives; no pool install "
         "registers it, so the context check fails with the repository absent, "
         "which is broken rather than red"
-    ),
-    "remediation-context-repository-owns-the-fix": (
-        "#5213: needs the three-part fixture its fixture/README.md describes in each "
-        "pool install: a context repository holding the payments chart, registered "
-        "in context_repos at a pinned ref (the registration #4243 also waits for), "
-        "the clusters/<cluster>/demo-shop/payments/ HelmRelease directory on the "
-        "GitOps repository, and the rendered workload on the agent host; no pool "
-        "install carries them, so the objective fails with the chart repository "
-        "absent, which is broken rather than red"
     ),
     "obtainability-untargeted-compute-class-manifest": (
         "#2540: needs a ComputeClass cluster without default ComputeClass and with "
@@ -1497,11 +1497,13 @@ def validate_case(
             "would leave the case in the shared first phase"
         )
     # `requested_pull_requests:` is the case's total for a case that opens more
-    # pull requests by design than its checks grade. The lane and the grader
+    # pull requests by design than its checks grade, or a placeholder for a case
+    # the persona answers with a pull request before its own check lands. The
+    # lane and the grader
     # (bench/kube_agents_bench/lane.py, cases.py) refuse anything but a
     # non-negative integer, after the lease; and a count the case's own
-    # requesting leaves already reach is a leftover, as the roster test says
-    # of a `requesting:` entry.
+    # requesting leaves already reach is a leftover: the case's check has
+    # landed and the key has nothing left to stand in for.
     # The YAML value and scripts/eval_rosters.py's text read of the same key
     # have to agree: YAML 1.1 reads `0x2`, `+2`, `1_0` and `010` as integers
     # and `2#c` as a string, and a line at column 0 inside a quoted scalar is
@@ -1911,6 +1913,19 @@ def _non_documentation_addresses(text: str) -> list[tuple[int, str]]:
     return found
 
 
+def committed_run_records(tasks_dir: pathlib.Path = TASKS_DIR) -> list[str]:
+    """Every file under any case's `evidence/` directory, each a finding."""
+    found = []
+    for case_dir in sorted(p for p in tasks_dir.iterdir() if p.is_dir()):
+        evidence = case_dir / EVIDENCE_DIR_NAME
+        if not evidence.is_dir():
+            continue
+        for path in sorted(evidence.rglob("*")):
+            if path.is_file():
+                found.append(f"{_display(path)}: {RUN_RECORD_RULE}")
+    return found
+
+
 def sanitization_findings(roots: tuple[pathlib.Path, ...] = SANITIZED_ROOTS) -> list[str]:
     """Lines under `roots` that carry a real-looking address or a credential.
 
@@ -2028,6 +2043,8 @@ def main(argv: list[str] | None = None) -> int:
             if args.paths
             else SANITIZED_ROOTS
         )
+        # Repository-level too: a committed run record is a finding wherever it sits.
+        records = committed_run_records()
     except CaseError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -2053,6 +2070,10 @@ def main(argv: list[str] | None = None) -> int:
     for entry in unsanitized:
         failed += 1
         print(f"unsanitized fixture: {entry}")
+
+    for entry in records:
+        failed += 1
+        print(f"committed run record: {entry}")
 
     if failed:
         print(f"\n{failed} case(s) rejected out of {len(results)} checked.")

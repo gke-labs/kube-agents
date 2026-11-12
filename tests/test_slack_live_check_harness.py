@@ -1324,8 +1324,10 @@ class UnitTest(unittest.TestCase):
         # The queued acknowledgement (#2634) is a steer too, not the bot's answer.
         self.assertEqual(harness.classify("✏️ got it, I'll take that next"), harness.KIND_STEER)
         for failure in ("🚫 *rejected*", "❌ *failed* — the pod died", "🛑 *canceled*", "❌ could not reach the bus; try again",
-                        "❌ failed: the executor is down", "❌ the task failed", "🛑 canceled",
-                        "🚫 the executor rejected the task", "🚫 the executor rejected the task: no capability"):
+                        "❌ failed: the executor is down", "❌ failed — the agent could not be started; ask again",
+                        "❌ the task failed", "🛑 canceled", "🚫 the executor rejected the task",
+                        "🚫 the executor rejected the task: no capability",
+                        "🚫 the executor rejected the task — the request carried no text"):
             self.assertEqual(harness.classify(failure), harness.KIND_FAILURE, failure)
         # Not the gateway's grammar: the agent's own text, whatever it opens with.
         for answer in ("PONG", "✅ PONG", "✅ *done*", "⚙️ PONG", "❌ PONG", "🚫 rejected", "✏️ PONG", "🔎 task `t` is *completed*",
@@ -1357,10 +1359,16 @@ class UnitTest(unittest.TestCase):
             self.assertRegex(relay, rf'{const}:\s+"{icon}",', state)
         # The terminal notices are worded in one place, terminalNotice, which
         # the relay posts through (and a console conversation's terminal
-        # frame carries); pin the wording there and the posts that use it.
-        for notice in ('"❌ failed: " + reason', '"❌ the task failed"', '"🛑 canceled"',
-                       '"🚫 the executor rejected the task: " + reason', '"🚫 the executor rejected the task"'):
-            self.assertIn(f"return {notice}", relay)
+        # frame carries): pin the constants it joins, the two separators
+        # (a dash after an executor's `reason:` detail, a colon after plain
+        # text), and the posts that use it.
+        for const, text in (("noticeFailed", "❌ failed"), ("noticeFailedBare", "❌ the task failed"),
+                            ("noticeCanceled", "🛑 canceled"), ("noticeRejected", "🚫 the executor rejected the task"),
+                            ("noticeDetailSeparator", " — "), ("noticePlainSeparator", ": ")):
+            self.assertRegex(relay, rf'{const}\s*=\s*"{re.escape(text)}"', const)
+        self.assertIn("return noticeWithReason(noticeFailed, noticeFailedBare, text, shaped)", relay)
+        self.assertIn("return noticeWithReason(noticeRejected, noticeRejected, text, shaped)", relay)
+        self.assertIn("return noticeCanceled", relay)
         self.assertEqual(relay.count("g.post(rec.Key, terminalNotice(s.Status.State, reason))"), 2)
 
     def test_not_started_grammar_matches_the_gateway_source(self):
@@ -1526,7 +1534,7 @@ class NoStatusLineTest(unittest.TestCase):
         answer = {"text": "*payments-api is CrashLooping.*", "ts": "2"}
         self.assertIsNone(harness.read_turn([answer], harness.WAIT_ANSWER))
         self.assertEqual(harness.read_turn([answer], harness.WAIT_ANSWER, lineless=True), (answer, harness.KIND_ANSWER))
-        failed = {"text": "❌ failed: reason: spawn-failed", "ts": "3"}
+        failed = {"text": "❌ failed — exec: no such file", "ts": "3"}
         self.assertEqual(harness.read_turn([answer, failed], harness.WAIT_ANSWER, lineless=True), (failed, harness.KIND_FAILURE))
 
     def test_a_standalone_queue_notice_is_no_status_line(self):

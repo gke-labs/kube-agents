@@ -622,7 +622,7 @@ func TestTheStopStreamIsProvisionedToItsContract(t *testing.T) {
 	if m == nil {
 		t.Fatal("the provision script doesn't add DISPATCH_STOPS")
 	}
-	for _, flag := range []string{"--allow-direct", "--subjects='a2a.stop.>'", "--max-age=24h", "--max-bytes=67108864", "--max-msgs-per-subject=1", "--max-consumers=1", "--storage=file", "--discard=old", "--replicas=1"} {
+	for _, flag := range []string{"--allow-direct", "--subjects='a2a.stop.>'", "--max-age=24h", "--max-bytes=67108864", "--max-msgs-per-subject=1", "--max-consumers=1", "--storage=file", "--discard=old", `--replicas="${STREAM_REPLICAS}"`} {
 		if !strings.Contains(m[1], flag) {
 			t.Errorf("DISPATCH_STOPS is added without %s: %s", flag, m[0])
 		}

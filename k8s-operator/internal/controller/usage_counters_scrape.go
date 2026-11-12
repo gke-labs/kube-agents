@@ -228,8 +228,12 @@ const (
 	// chat_metrics listener does, and projected to the KanbanDispatcherFailing
 	// condition (usage_kanban_dispatcher.go).
 	kanbanDispatcherFailedTicksSeries = "kubeagents_kanban_dispatcher_failed_ticks"
-	kanbanDispatcherBoardLabel        = "board"
-	kanbanDispatcherErrorLabel        = "error"
+	// kanbanDispatcherFailingSecondsSeries is the plugin's age of each failing
+	// board's streak, in seconds, beside the ticks; matched to them by board.
+	// A plugin from before it serves only the ticks.
+	kanbanDispatcherFailingSecondsSeries = "kubeagents_kanban_dispatcher_failing_seconds"
+	kanbanDispatcherBoardLabel           = "board"
+	kanbanDispatcherErrorLabel           = "error"
 	// usageDispatcherBoardCeiling bounds the failing boards one body may list,
 	// refused rather than clamped as usageClusterGaugeCeiling is. Hermes keeps
 	// a handful of boards; a body past this is a broken one.
@@ -588,11 +592,14 @@ type usageDispatcherReading struct {
 	Failing []usageDispatcherFailure
 }
 
-// usageDispatcherFailure is one board's failed-tick streak.
+// usageDispatcherFailure is one board's failed-tick streak, and its age when
+// the body served one (HasAge).
 type usageDispatcherFailure struct {
-	Board string
-	Error string
-	Ticks int64
+	Board   string
+	Error   string
+	Ticks   int64
+	Seconds int64
+	HasAge  bool
 }
 
 // usageDataVolume is one reading of the agent's data volume, in bytes.
@@ -762,6 +769,8 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 	// dispatcher collects the kanban dispatcher's failing boards, for the
 	// chat_metrics listener's body alone.
 	var dispatcher *usageDispatcherReading
+	// dispatcherAges is each board's streak age, joined to its ticks after the body.
+	var dispatcherAges map[string]int64
 	// readsOf is every (counter, filter) pair a family feeds, so a sibling
 	// family takes its own filter, not the one its counter's own family takes.
 	readsOf := make(map[string][]usageRead, len(counters))
@@ -786,7 +795,8 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 		}
 		if family == kanbanGaveUpSeries {
 			dispatcher = &usageDispatcherReading{}
-			wanted = append(wanted, kanbanDispatcherFailedTicksSeries)
+			dispatcherAges = map[string]int64{}
+			wanted = append(wanted, kanbanDispatcherFailedTicksSeries, kanbanDispatcherFailingSecondsSeries)
 		}
 	}
 	// The reading slot, for a body asked for readings: a running sum per spec
@@ -884,6 +894,14 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 						})
 						continue
 					}
+					if name == kanbanDispatcherFailingSecondsSeries {
+						// Bounded to what a time.Duration holds, for the condition's message.
+						if len(dispatcherAges) >= usageDispatcherBoardCeiling || value >= float64(math.MaxInt64/int64(time.Second)) {
+							return usageReading{}, &usageScrapeError{Kind: usageScrapeKindSample}
+						}
+						dispatcherAges[usageLabelValue(metric, kanbanDispatcherBoardLabel)] = int64(value)
+						continue
+					}
 					if name == clusterUpSeries {
 						clusters.Registered++
 						if clusters.Registered > usageClusterGaugeCeiling {
@@ -925,6 +943,13 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 			return usageReading{}, &usageScrapeError{Kind: usageScrapeKindSample}
 		}
 		samples[counter] = int64(sum)
+	}
+	if dispatcher != nil {
+		for i := range dispatcher.Failing {
+			if age, ok := dispatcherAges[dispatcher.Failing[i].Board]; ok {
+				dispatcher.Failing[i].Seconds, dispatcher.Failing[i].HasAge = age, true
+			}
+		}
 	}
 	out := usageReading{Samples: samples, StartTime: start, Clusters: clusters, DataVolume: usageDataVolumeReading(volume), Dispatcher: dispatcher}
 	if readings != nil {

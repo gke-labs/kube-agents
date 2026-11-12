@@ -212,8 +212,14 @@ SOURCES: dict[str, Source] = {
         # (system:auth-delegator), and A4 is once again a statement about how
         # that bind is bounded rather than about its absence. Deleting the
         # scoping is the mutation this anchor exists to make loud.
+        #
+        # "kind: Role" is the second document: the operator's Secret write
+        # verbs, rendered as a namespaced Role by the one marker that carries
+        # `namespace=`. C5 asserts the ClusterRole grants no Secret write verb,
+        # and that assertion is vacuous the day the Role document disappears
+        # with the grant moved back.
         "k8s-operator/config/rbac/role.yaml",
-        ("clusterrolebindings", "resourceNames"),
+        ("clusterrolebindings", "resourceNames", "kind: Role"),
     ),
     # The other Role a kustomize install ships. role.yaml is the operator's
     # ClusterRole and was for a long time the only RBAC A4 read; this one is
@@ -230,7 +236,9 @@ SOURCES: dict[str, Source] = {
         # is anchored too because it is the chart's RBAC object OUTSIDE that
         # block -- the one `make chart-sync` does not manage and a
         # block-scoped parse never reached.
-        ("END GENERATED RULES", "operator-leader-election-role"),
+        # The namespaced block is the chart's copy of role.yaml's Role
+        # document (the Secret write verbs); C5 reads it.
+        ("END GENERATED RULES", "operator-leader-election-role", "END GENERATED NAMESPACED RULES"),
     ),
     "admission_policy": Source(
         "k8s-operator/config/admission/agent-rbac-policy.yaml",
@@ -247,6 +255,19 @@ SOURCES: dict[str, Source] = {
     "chart_gateway_pod_policy": Source(
         "charts/kube-agents/templates/a2a-gateway-pod-admission-policy.yaml",
         ("kube-agents.a2aGatewayPodPolicyEnabled", "policyName"),
+    ),
+    # C1 reads the guard on the hindsight-postgresql NetworkPolicy, the only
+    # thing between a passwordless Postgres and the namespace. The template
+    # carries multi-line Helm comments, which helm_documents() cannot read, so
+    # the test slices the policy's block by these anchors instead.
+    "chart_hindsight": Source(
+        "charts/kube-agents/templates/hindsight.yaml",
+        (
+            "$postgresqlNetworkPolicy :=",
+            "{{- if $postgresqlNetworkPolicy }}",
+            "name: hindsight-postgresql",
+            "POSTGRES_HOST_AUTH_METHOD",
+        ),
     ),
     # --- rendered output the operator is asserted against -----------------
     "shell_sandbox_manifests_go": Source(

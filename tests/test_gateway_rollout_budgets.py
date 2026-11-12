@@ -285,6 +285,9 @@ _E2E_RUNNER_SETUP_SECONDS = 300
 # 60-minute suite budget in staging-promotion-pipeline.yml).
 _E2E_RC_SUITE_ALLOWANCE_SECONDS = 1200
 _E2E_ALL_SUITES_ALLOWANCE_SECONDS = 3600
+# What the optional `slack` suite adds where a caller lists it: the Slack test's
+# reply wait, 300s on `next`.
+_E2E_SLACK_SUITE_SECONDS = 300
 # What the upgrade.sh workflows do outside the waits the floor sums. The
 # reconcile job: checkout, auth and gcloud setup, the lease and KMS checks,
 # and terraform init/plan/apply outside the Helm release wait. The rollback
@@ -550,7 +553,7 @@ class SiblingGatewayRolloutGatesTest(unittest.TestCase):
                         _E2E_ALL_SUITES_ALLOWANCE_SECONDS
                         if files == all_e2e_files or "stockout-full" in suites
                         else _E2E_RC_SUITE_ALLOWANCE_SECONDS
-                    )
+                    ) + (_E2E_SLACK_SUITE_SECONDS if "slack" in suites else 0)
                     # `next` adds its gate once, after the two above; `today`
                     # (the input's default) adds nothing. Anything else -- an
                     # expression forwarding a caller's own input -- may be
@@ -580,7 +583,9 @@ class SiblingGatewayRolloutGatesTest(unittest.TestCase):
             (
                 "e2e-manual-runner.yml:run-e2e",
                 int(manual_minutes),
-                gates_paid_twice + _E2E_RUNNER_SETUP_SECONDS + _E2E_ALL_SUITES_ALLOWANCE_SECONDS,
+                # Its `mode` input can be `next`, so its gate is budgeted too.
+                gates_paid_twice + _E2E_RUNNER_SETUP_SECONDS + _E2E_ALL_SUITES_ALLOWANCE_SECONDS
+                + _mode_next_gate_seconds(),
             )
         )
 

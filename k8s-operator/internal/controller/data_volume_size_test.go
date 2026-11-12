@@ -104,9 +104,68 @@ func TestBothDataClaimsFollowTheResolvedSize(t *testing.T) {
 				t.Errorf("sandbox data claim template requests %s, want %s", sandboxClaim.String(), want.String())
 			}
 			if agentClaim.Cmp(sandboxClaim) != 0 {
-				t.Errorf("the two data claims differ (%s and %s); the sandbox mirror needs them equal", agentClaim.String(), sandboxClaim.String())
+				t.Errorf("the two data claims differ (%s and %s) with no expected profile count", agentClaim.String(), sandboxClaim.String())
 			}
 		})
+	}
+}
+
+// profileCountAgent is sizedAgent with spec.storage.expectedClusterProfiles = n.
+func profileCountAgent(size string, n int32) *agentv1alpha1.PlatformAgent {
+	agent := sizedAgent(size)
+	if agent.Spec.Storage == nil {
+		agent.Spec.Storage = &agentv1alpha1.PlatformAgentStorageSpec{}
+	}
+	agent.Spec.Storage.ExpectedClusterProfiles = ptr.To(n)
+	return agent
+}
+
+// TestTheAgentClaimIsSizedByTheExpectedProfileCount pins the formula on the
+// agent's claim, base + N x per-profile rounded up to whole GiB, never below
+// spec.storage.size or the default, and the sandbox claim staying on
+// ResolveDataStorageSize: it holds no session stores, which the mirror does not
+// copy (sandbox_mirror.py's denylist).
+func TestTheAgentClaimIsSizedByTheExpectedProfileCount(t *testing.T) {
+	base := resource.MustParse(dataVolumeBaseSize)
+	perProfile := resource.MustParse(perClusterProfileStorage)
+	formula := func(n int64) resource.Quantity {
+		const gib = int64(1) << 30
+		need := base.Value() + n*perProfile.Value()
+		return *resource.NewQuantity((need+gib-1)/gib*gib, resource.BinarySI)
+	}
+	cases := []struct {
+		name        string
+		agent       *agentv1alpha1.PlatformAgent
+		wantAgent   resource.Quantity
+		wantSandbox string
+	}{
+		{"a small count stays on the default", profileCountAgent("", 10), resource.MustParse(agentDataStorageSize), agentDataStorageSize},
+		{"a large count raises the agent's claim only", profileCountAgent("", 200), formula(200), agentDataStorageSize},
+		{"an explicit size larger than the formula wins", profileCountAgent("500Gi", 200), resource.MustParse("500Gi"), "500Gi"},
+		{"an explicit size smaller than the formula is raised on the agent's claim", profileCountAgent("20Gi", 200), formula(200), "20Gi"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			agentClaim := buildPVC(tc.agent).Spec.Resources.Requests[corev1.ResourceStorage]
+			if agentClaim.Cmp(tc.wantAgent) != 0 {
+				t.Errorf("agent data claim requests %s, want %s", agentClaim.String(), tc.wantAgent.String())
+			}
+			sandboxClaim := sandboxDataClaimRequest(t, tc.agent)
+			if want := resource.MustParse(tc.wantSandbox); sandboxClaim.Cmp(want) != 0 {
+				t.Errorf("sandbox data claim template requests %s, want %s", sandboxClaim.String(), want.String())
+			}
+		})
+	}
+	// The worked figures the docs quote: 200 profiles is 87Gi, and the 50Gi
+	// default is reached at 108 (8Gi + 107 x 400Mi is 49.8Gi, rounded up to 50).
+	if got := formula(200); got.Cmp(resource.MustParse("87Gi")) != 0 {
+		t.Errorf("200 profiles size to %s, want 87Gi", got.String())
+	}
+	if got := ResolveAgentDataStorageSize(profileCountAgent("", 108)); got.Cmp(resource.MustParse("51Gi")) != 0 {
+		t.Errorf("108 profiles resolve to %s, want 51Gi", got.String())
+	}
+	if got := ResolveAgentDataStorageSize(profileCountAgent("", 107)); got.Cmp(resource.MustParse(agentDataStorageSize)) != 0 {
+		t.Errorf("107 profiles resolve to %s, want the default", got.String())
 	}
 }
 
@@ -172,6 +231,94 @@ func TestReconcileGrowsBothBoundDataClaimsToTheField(t *testing.T) {
 	}
 	if cond := meta.FindStatusCondition(got.Status.Conditions, dataVolumeExpansionConditionType); cond != nil {
 		t.Errorf("%s is set on claims that grew: %+v", dataVolumeExpansionConditionType, cond)
+	}
+}
+
+// TestARaisedProfileCountGrowsTheAgentClaimOnly raises
+// spec.storage.expectedClusterProfiles above two bound claims at the default in
+// a class that can expand: the agent's claim is patched to the formula's size,
+// the sandbox's stays at the default, and the condition stays absent.
+func TestARaisedProfileCountGrowsTheAgentClaimOnly(t *testing.T) {
+	agent := profileCountAgent("", 200)
+	agentClaim := buildPVC(agent).Name
+	sandboxClaim := shellSandboxDataClaimName(agent)
+	r, cl := sizeFixture(t, agent,
+		storageClass(testStorageClassName, true),
+		boundClaim(agent, agentClaim, agentDataStorageSize, testStorageClassName, true),
+		boundClaim(agent, sandboxClaim, agentDataStorageSize, testStorageClassName, false))
+
+	got := reconcileOnce(t, r, cl, agent)
+	if size := claimSize(t, cl, agentClaim, agent.Namespace); size != "87Gi" {
+		t.Errorf("agent claim is %s, want 87Gi for 200 expected profiles", size)
+	}
+	if size := claimSize(t, cl, sandboxClaim, agent.Namespace); size != agentDataStorageSize {
+		t.Errorf("sandbox claim is %s, want it left at %s", size, agentDataStorageSize)
+	}
+	if cond := meta.FindStatusCondition(got.Status.Conditions, dataVolumeExpansionConditionType); cond != nil {
+		t.Errorf("%s is set on a claim that grew: %+v", dataVolumeExpansionConditionType, cond)
+	}
+}
+
+// undersizedEvents drains the fake recorder and returns the DataVolumeUndersized
+// Events it holds.
+func undersizedEvents(r *PlatformAgentReconciler) []string {
+	var out []string
+	recorder := r.Recorder.(*record.FakeRecorder)
+	for {
+		select {
+		case event := <-recorder.Events:
+			if strings.Contains(event, dataVolumeUndersizedReason) {
+				out = append(out, event)
+			}
+		default:
+			return out
+		}
+	}
+}
+
+// TestAnUndersizedClaimThatWillNotGrowIsWarnedAboutOnce pins the
+// DataVolumeUndersized Event: an agent claim below the formula's size that the
+// operator does not control, or whose class cannot expand it, gets one Warning
+// that says which, and a second pass in the same state writes none. A claim the
+// operator can grow gets none.
+func TestAnUndersizedClaimThatWillNotGrowIsWarnedAboutOnce(t *testing.T) {
+	cases := []struct {
+		name       string
+		owned      bool
+		expandable bool
+		want       string
+	}{
+		{"a claim made by hand", false, true, dataVolumeUnownedSentence},
+		{"a class that cannot expand", true, false, dataVolumeCannotGrowSentence},
+		{"a claim the operator grows", true, true, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := profileCountAgent("", 200)
+			agentClaim := buildPVC(agent).Name
+			sandboxClaim := shellSandboxDataClaimName(agent)
+			r, cl := sizeFixture(t, agent,
+				storageClass(testStorageClassName, tc.expandable),
+				boundClaim(agent, agentClaim, agentDataStorageSize, testStorageClassName, tc.owned),
+				boundClaim(agent, sandboxClaim, agentDataStorageSize, testStorageClassName, false))
+
+			reconcileOnce(t, r, cl, agent)
+			events := undersizedEvents(r)
+			if tc.want == "" {
+				if len(events) != 0 {
+					t.Fatalf("a claim that grows was warned about: %v", events)
+				}
+				return
+			}
+			if len(events) != 1 || !strings.Contains(events[0], "Warning") || !strings.Contains(events[0], tc.want) ||
+				!strings.Contains(events[0], "87Gi") {
+				t.Fatalf("want one Warning naming 87Gi and %q, got %v", tc.want, events)
+			}
+			reconcileOnce(t, r, cl, agent)
+			if again := undersizedEvents(r); len(again) != 0 {
+				t.Errorf("a second pass in the same state warned again: %v", again)
+			}
+		})
 	}
 }
 

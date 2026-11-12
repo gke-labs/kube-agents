@@ -17,6 +17,7 @@ paths:
   - "deploy/docker/patches/kanban_notifier.py"
   - "deploy/docker/patches/kanban_progress_lines.py"
   - "deploy/docker/patches/kanban_chat_notify.py"
+  - "deploy/docker/patches/kanban_verified_claims.py"
   - "deploy/docker/patches/slack_*.py"
 trigger: model_decision
 description: "Chat UX rules for anything a user reads in Slack or Google Chat: answer first, named acks, one live status line, no plumbing, buttons for choices, one-line failures, speaking up only when it matters, confirmed destructive actions, and renderers that never compose."
@@ -69,7 +70,9 @@ Why: a trail of progress posts buries the answer and notifies the user for every
 Today: under `next`, the `progress` artifact is "the task's one live message, edited in place"
 ([`spec-a2a-payloads.md`](../../docs/designs/spec-a2a-payloads.md), "Chat messages"), drawn by
 `updateRollingLine` in `a2a/gateway/relay.go`; the queue notice in `a2a/gateway/busy.go` replaces
-the placeholder rather than following it. Under `today`, a card's heartbeats share one message
+the placeholder rather than following it, and on Google Chat the line ends as a bare ✅ once the
+answer posts, or as the hand-off acknowledgement (`doneTerminalLine` in `a2a/gateway/relay.go`,
+`answerOnLine` in `a2a/gateway/relay_chat.go`), rather than reading `completed` under the ask. Under `today`, a card's heartbeats share one message
 ([`agents/platform/SOUL.md`](../../agents/platform/SOUL.md) §0, "Show your progress"), the plan is
 one message per thread (`agents/platform/scripts/slack_status.py`), and `kanban_notifier.py`'s
 `drop_superseded` drops a held failure line, before it posts, once the card recovers.
@@ -81,7 +84,12 @@ exit code, or roster id used as a name (`cluster-foo` where "the foo cluster age
 identifier the user can act on — a cluster, a workload, a pull request as a link — is content, not
 plumbing, and so is a specialist's name where `SOUL.md` asks for attribution. A board read is the
 exception for ids: [`agents/chat/SOUL.md`](../../agents/chat/SOUL.md) §1.5 gives each card a short
-task id, because the user asked about the board and may name a card back.
+task id, because the user asked about the board and may name a card back. In the evidence section
+`kanban_complete` adds to a card's `result` from `verified_claims`, each claim's command and output
+excerpt, in their fences, are content: evidence the reader can check and run again, which
+[`agents/platform/SOUL.md`](../../agents/platform/SOUL.md) §0 and
+[`agents/cluster/SOUL.md`](../../agents/cluster/SOUL.md) §6 require. Every other line of the
+section, the tag above each claim included, is bound by this rule like any renderer's text.
 
 Why: plumbing is noise to the person who asked, and an internal name tells them nothing they can
 use.
@@ -92,6 +100,9 @@ says", "Handle pure conversation yourself") and §2 steps 4 and 5. In code,
 and `busyNotice*` in `a2a/gateway/busy.go` is worded without a task id.
 [`agents/cluster/SOUL.md`](../../agents/cluster/SOUL.md) §6 ("Absent is an answer when presence was the
 question") keeps the command out of a one-line presence finding and sends it to `verified_claims`.
+The evidence section is rendered by `deploy/docker/patches/kanban_verified_claims.py`, which checks
+each claim's command and excerpt against the calls the card ran, or a claim the gate already
+accepted on a card it created, before it adds them.
 
 ## Choices are buttons
 
@@ -119,7 +130,11 @@ re-route, when there is one, is a button.
 Why: a failure is where trust is won or lost, and a promise nothing keeps loses it twice.
 
 Today: [`agents/chat/SOUL.md`](../../agents/chat/SOUL.md) §2 step 5 owns the agent's wording. The
-gateway's own failure lines follow the same shape: `slackStopCouldntReply` in
+gateway's own failure lines follow the same shape: `terminalNotice` in `a2a/gateway/relay.go` posts
+a failed task's end as `❌ failed — <why>` and a rejected one as `🚫 the executor rejected the
+task — <why>`, where `<why>` is one plain sentence per executor token (`reasonSentences`), or the
+detail the dispatcher or the verifier wrote for the person (`reasonDetailShown`), never the
+`reason:` token or an operator's detail (`reasonInPlainWords`); `slackStopCouldntReply` in
 `a2a/gateway/slack_stop.go` offers "Press Stop again" only where a second press can work, and
 `slackStopCouldntFinalReply` drops it where it cannot.
 
@@ -136,7 +151,10 @@ to a blocked or failed card, and `[SILENT]` when the specialist's question is al
 `deploy/docker/patches/slack_ux_moments.py`, which posts a pull request opened and a question the
 work waits on as messages of their own while every other milestone stays a plan row; and
 `completion_text` and `explained_by_wake` in `deploy/docker/patches/kanban_notifier.py`, which drop
-the head line above a report and hold a failure line the wake will explain.
+the head line above a report and hold a failure line the wake will explain. A post one reader
+alone sees, telling them a control they pressed was refused and what still works
+(`refusedPressNotice` in `a2a/gateway/stopgate.go`), is that reader's failure line and notifies
+nobody else.
 
 ## A destructive action needs the asker's confirm
 
@@ -149,7 +167,13 @@ cluster.
 Today: [`agents/chat/SOUL.md`](../../agents/chat/SOUL.md) §1.6 ("state the resolved target back to
 them and wait for a yes") and §3's `/feedback` confirmation, which shows the exact submission and waits for a yes. In the
 gateway, `mayStop` in `a2a/gateway/stopgate.go` lets only a requester of the thread press its Stop
-button, Slack's native one or the one drawn on Google Chat; a typed `stop` is not gated.
+button, Slack's native one or the one drawn on Google Chat; a typed `stop` is not gated. A refused
+press on Google Chat tells the presser alone, in the thread, by a post only they see
+(`refusedPressNotice`, `tellsRefusedPresser`): the drawn button stays until the gateway edits the
+line, so silence there is a frozen control, and a line nobody else is notified of keeps "Speak up
+only when it matters"; it names the typed word rather than offering a button, since a button is
+what the gate refuses, so "Choices are buttons" does not apply. Slack's refused press stays silent:
+its button is Slack's own and settles on its own.
 
 ## Renderers never compose
 
