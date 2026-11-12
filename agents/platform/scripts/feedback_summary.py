@@ -210,7 +210,7 @@ BROKER_SUBCOMMANDS: Mapping[str, frozenset] = {
     "gcloud": frozenset({
         "artifacts", "asset", "auth", "billing", "components", "compute", "config",
         "container", "iam", "info", "init", "logging", "monitoring", "projects",
-        "resource-manager", "services", "version",
+        "resource-manager", "services", "storage", "version",
     }),
     "git": frozenset({
         "add", "am", "apply", "archive", "blame", "branch", "bundle", "cat-file",
