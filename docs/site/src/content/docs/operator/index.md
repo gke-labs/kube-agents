@@ -13,7 +13,7 @@ Source: [`k8s-operator/`](https://github.com/gke-labs/kube-agents/tree/main/k8s-
 
 ```text
 k8s-operator/
-├── api/v1alpha1/           # PlatformAgent type definitions (Kubebuilder)
+├── api/v1alpha1/           # CRD type definitions (Kubebuilder)
 ├── cmd/                    # manager entrypoint
 ├── config/                 # Kustomize base for the operator + integrations
 ├── internal/               # controller reconciler + admission webhook logic
@@ -29,6 +29,7 @@ Custom resources in the `kubeagents.x-k8s.io/v1alpha1` API group:
 - **`PlatformAgent`** — declares a Platform Agent instance, container image, service account, chat integrations, and harness toggles.
 - **`AgentPlugin`** — declares OCI plugin extensions, secret environment variables, and allowed configuration overrides targeted to a `PlatformAgent`. The repository ships the Pub/Sub alert adapter and the GKE stockout investigator: [Shipped plugins](/kube-agents/operator/agentplugin-crd/#shipped-plugins).
 - **`AgentProfile`** — under `spec.mode: next` only, declares one kind of A2A agent pod; the operator renders its ServiceAccount, bus identity and agent card. See [AgentProfile CRD](/kube-agents/operator/agentprofile-crd/).
+- **`Tier`** — names what a task may do at a tier. The operator only reports it `Accepted`; nothing enforces it yet. See [Tier CRD](/kube-agents/operator/tier-crd/).
 
 The controller reconciles a `PlatformAgent` into:
 
@@ -179,9 +180,9 @@ refusals among them. Re-apply with `make deploy IMG=$IMG` once the cause is fixe
 
 ## An image ahead of its ClusterRole
 
-The webhook port above is one instance of a general skew: `make deploy` ships the ClusterRole with
-the image, and only when it is re-run. A controller deployed from a floating tag such as `:latest`
-is upgraded on its next pod reschedule while the applied ClusterRole stays put, and the first verb
+The webhook port above is one instance of a general skew: `make deploy` ships the operator's RBAC objects
+with the image, and only when it is re-run. A controller deployed from a floating tag such as `:latest`
+is upgraded on its next pod reschedule while the applied roles stay put, and the first verb
 the newer controller needs that the older role lacks fails every reconcile with `forbidden`.
 Two things say so.
 
@@ -194,7 +195,10 @@ five minutes after, on its own ticker rather than on the reconcile worker. A den
 `RBAC self-check failed` line in the startup log naming the denied permissions
 (`patch poddisruptionbudgets.policy`) and the fix, and a `Degraded` condition with reason
 `RBACIncomplete` carrying the same text on each `PlatformAgent` it reconciles that is not already
-`Degraded` for another reason. Reconciles continue; the steps that need the missing verb still fail
+`Degraded` for another reason. The Secret write verbs are also probed in the namespace of each
+`PlatformAgent` once the controller has reconciled it. A denial there is learned after startup,
+logged as `RBAC self-check result changed`, and written on that agent alone, with the namespace in
+the label. Reconciles continue; the steps that need the missing verb still fail
 until the manifests are re-applied. Re-applying them with the same image tag restarts nothing and
 triggers no reconcile, so the condition follows the next reconcile after the probe notices: every
 five minutes while the condition stands and the reconcile completes, or, while the reconcile itself

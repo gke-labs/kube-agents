@@ -129,7 +129,7 @@
       "repository": "ghcr.io/gke-labs/kube-agents/a2a-dispatcher",
       "tagPolicy": "release",
       "override": "A2A_DISPATCHER_IMAGE",
-      "pulledBy": "The AgentProfile dispatcher Deployment the operator renders under spec.mode: next when A2A_DISPATCHER_IMAGE is set, and nothing otherwise: it is off by default until profiles dispatch end to end, so the operator derives nothing for it. Nothing under spec.mode: today.",
+      "pulledBy": "The AgentProfile dispatcher Deployment the operator renders under spec.mode: next, unless `operator.profileDispatcher.enabled` is `false`. Nothing under spec.mode: today.",
       "description": "The AgentProfile dispatcher: the only reader of the profiles' shared durables, it holds each submission for the life of its task and hands it to a ready worker under a lease (a2a/Dockerfile.dispatcher)."
     },
     {
@@ -193,6 +193,15 @@
       "override": "A2A_NATS_RELOADER_IMAGE",
       "pulledBy": "A sidecar in the NATS pod the operator renders under spec.mode: next, and nothing under spec.mode: today.",
       "description": "Signals nats-server to reload its config when the operator changes only the bus's permissions, so an AgentProfile added or removed doesn't restart the bus. From nats-io, the same publisher as nats. Pinned by digest as well as tag; same override arrangement as nats."
+    },
+    {
+      "name": "prometheus-nats-exporter",
+      "origin": "third-party",
+      "repository": "docker.io/natsio/prometheus-nats-exporter",
+      "tag": "0.20.3@sha256:4b8ddc1c86fec360b5cd3d5e1fbc6fb52bdafd5805bba3901cc52926538af255",
+      "override": "A2A_NATS_EXPORTER_IMAGE",
+      "pulledBy": "The metrics sidecar in each pod of that NATS StatefulSet under spec.mode: next, and nothing under spec.mode: today.",
+      "description": "Reads the NATS server's monitor port over the pod's loopback and serves its JetStream stream and storage figures for Managed Prometheus to scrape. Same override arrangement as nats; pinned by digest as well as tag."
     },
     {
       "name": "k8s",

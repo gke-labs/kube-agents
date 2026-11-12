@@ -64,6 +64,6 @@ Check it from `a2a/`:
 ```sh
 go run ./cmd/persona validate --in ../agents/cluster/persona
 go run ./cmd/persona render --harness claude-code --in ../agents/cluster/persona --out "$(mktemp -d)" \
-  --relay-url http://credential-proxy:8765/mcp \
+  --relay-url http://credential-proxy:8765/v1/mcp \
   --relay-command 'node /opt/mcp-remote/dist/proxy.js {url} --transport http-only'
 ```

@@ -1384,9 +1384,16 @@ func (g *Gateway) routeTurn(ctx context.Context, msg InboundMessage, backend, pr
 		!mayStop(rec, backend, TaskRequester{Backend: backend, Subject: requesterSubject(g.ps, backend, msg.AuthorID)}):
 		// Only the people who asked for work in a thread may press its Stop
 		// button, Slack's native one or the one drawn on Google Chat
-		// (stopgate.go). Anyone else's press cancels nothing and posts
-		// nothing. A typed `stop` keeps the rule below.
+		// (stopgate.go). Anyone else's press cancels nothing; on Google
+		// Chat, in a space, the presser alone is told so. A typed `stop`
+		// keeps the rule below.
 		g.log.Info("stop press refused: not a requester in this conversation", "backend", backend, "conversation", rec.Key)
+		// A task a requester has already asked to stop (Detached) is
+		// settling: its line reads "cancel sent", and a line telling the
+		// presser to type stop would be stale advice, so nothing is said.
+		if active := rec.ActiveTask; active == nil || !active.Detached {
+			g.tellRefusedPresser(rec.Key, msg, backend)
+		}
 	case stopping && isSlackStop(msg, backend) && g.cardStopWanted(rec, msg):
 		g.slackStop(ctx, rec, authority, backend)
 	case stopping && isChatStopPress(msg, backend) && msg.TaskID != "":
@@ -2609,6 +2616,27 @@ func (g *Gateway) showsTaskStatus(conversation string) bool {
 	return ok && shower.ShowsTaskStatus(conversation)
 }
 
+// tellRefusedPresser posts refusedPressNotice to the presser of msg alone,
+// in conversation, where tellsRefusedPresser says so (stopgate.go), through
+// the backend's private post (PrivatePoster). A post that fails is logged
+// and nothing more: the press cancelled nothing either way, and the typed
+// stop the notice names still works.
+func (g *Gateway) tellRefusedPresser(conversation string, msg InboundMessage, backend string) {
+	if !tellsRefusedPresser(msg, backend) {
+		return
+	}
+	poster, ok := g.adapter.(PrivatePoster)
+	if !ok {
+		g.log.Warn("refused stop press: the adapter posts no private message", "backend", backend, "conversation", conversation)
+		return
+	}
+	if err := poster.PostPrivate(conversation, msg.Viewer, refusedPressNotice); err != nil {
+		g.log.Warn("refused stop press: the presser's notice was not posted", "backend", backend, "conversation", conversation, "err", err)
+		return
+	}
+	g.log.Info("refused stop press: the presser was told privately", "backend", backend, "conversation", conversation)
+}
+
 // observeTaskStarted and observeTaskTerminal tell an adapter that implements
 // TaskObserver about a task's two ends. Both are no-ops for an adapter that
 // does not implement the interface -- Discord and gchat, for which a human
@@ -3103,6 +3131,11 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	if old := rec.ActiveTask; old != nil && old.Detached && old.StatusMsgID != "" {
 		g.editLine(rec.Key, old.StatusMsgID, withLineNote(terminalLine(lib.StateCanceled, ""), old.LineNote), "")
 	}
+	// A detached task superseded here may never send its terminal: its ask
+	// takes the canceled end's mark, so no reaction is left on it.
+	if old := rec.ActiveTask; old != nil && old.Detached {
+		g.applyTerminalMark(rec, old.TaskID, lib.StateCanceled)
+	}
 	// Register the task everywhere the relay looks BEFORE publishing: a fast
 	// executor's submitted event must never race the mapping, because the
 	// relay acks what it cannot route and the durable won't redeliver it.
@@ -3228,6 +3261,15 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	// rather than an optimisation.
 	if g.spawner != nil && rec.BusSession != "" && rec.Addressee == rec.BusSession {
 		g.ensureSessionPod(ctx, rec, taskID, originSeq)
+	}
+	// The ask's reaction, drawn now rather than at the executor's first
+	// heartbeat (mark.go, drawArrivalMark), after the pod is asked for so a
+	// slow reactions call never delays it. A click or an answer continues an
+	// earlier ask, whose mark is the executor's to redraw.
+	if ts.Role == "" && !ts.Click && !ts.Answer && g.drawArrivalMark(rec, taskID, ts.Text) {
+		if err := g.reg.Put(ctx, rec); err != nil {
+			g.log.Error("session record write failed", "conversation", rec.Key, "err", err)
+		}
 	}
 	return taskID, true
 }

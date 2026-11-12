@@ -152,12 +152,14 @@ CRD_KINDS: dict[str, Path] = {
     "PlatformAgent": OPERATOR_DOCS_DIR / "platformagent-fields.md",
     "AgentProfile": OPERATOR_DOCS_DIR / "agentprofile-fields.md",
     "AgentPlugin": OPERATOR_DOCS_DIR / "agentplugin-fields.md",
+    "Tier": OPERATOR_DOCS_DIR / "tier-fields.md",
 }
 # The narrative guide each field page points its reader at, as a site route.
 CRD_GUIDES = {
     "PlatformAgent": "/kube-agents/operator/platformagent-crd/",
     "AgentProfile": "/kube-agents/operator/agentprofile-crd/",
     "AgentPlugin": "/kube-agents/operator/agentplugin-crd/",
+    "Tier": "/kube-agents/operator/tier-crd/",
 }
 CRD_BLOCK_PREFIX = "crd-fields-"
 # Every block read from the operator's Go source, the field pages above and the

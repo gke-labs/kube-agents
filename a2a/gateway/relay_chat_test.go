@@ -383,7 +383,8 @@ func TestAChildsEndLeavesTheMarkToTheWake(t *testing.T) {
 	r, spawn := startRigWithSpawner(t)
 	ctx := context.Background()
 	conv := "discord:g1/t-wake-mark"
-	exec, origin, _ := sessionTurnVia(t, r, spawn, conv, "", "how is the fleet?")
+	// Worded as a fleet ask, so the arrival draw and the executor's mark agree.
+	exec, origin, _ := sessionTurnVia(t, r, spawn, conv, "", "how are all my clusters?")
 	ask := conv + "-0"
 	mark := chatPart(t, chatmsg.Message{Schema: chatmsg.Schema, Headline: "looking", Mark: &chatmsg.Mark{Ask: "fleet"}})
 	if err := exec.PublishArtifact(ctx, lib.Artifact{ArtifactID: "artifact-p", Name: lib.ArtifactProgress,
@@ -435,7 +436,7 @@ func TestAClickChainMarksThePreviousAsk(t *testing.T) {
 func testAnswerChainMarksThePreviousAsk(t *testing.T, answer InboundMessage) {
 	r := startRig(t)
 	conv := "discord:g1/click-chain"
-	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "d-5", Text: "which cluster first?"}
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "d-5", Text: "where do I start?"}
 	origin := r.awaitTask(t, "platform")
 	question, err := chatmsg.MarkPart(chatmsg.Mark{Ask: "question", Settle: "blocked"})
 	if err != nil {
@@ -465,12 +466,12 @@ func testAnswerChainMarksThePreviousAsk(t *testing.T, answer InboundMessage) {
 func TestConversationNotifyMarkWaitsForTheChainToEnd(t *testing.T) {
 	r := startRig(t)
 	conv := "discord:g1/notify-mark"
-	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "d-3", Text: "restart the fleet"}
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "d-3", Text: "how are all my clusters doing?"}
 	origin := r.awaitTask(t, "platform")
 	marker := r.g.Conversations(r.adapter).(notifyMarker)
 	marker.MarkConversation(conv, "plan-1", MarkState{Ask: "fleet", Settle: "blocked"})
-	if got := r.adapter.reactionCalls(); len(got) != 0 {
-		t.Fatalf("a notify mark drew while the chain ran: %v", got)
+	if got := r.adapter.reactionCalls(); fmt.Sprint(got) != fmt.Sprint([]string{conv + " +fleet@d-3"}) {
+		t.Fatalf("reactions while the chain ran = %v, want the arrival's alone: a notify mark must not draw", got)
 	}
 	mark, err := chatmsg.MarkPart(chatmsg.Mark{Ask: "fleet"})
 	if err != nil {
@@ -504,21 +505,24 @@ func TestConversationNotifyMarkWaitsForTheChainToEnd(t *testing.T) {
 // with none takes the ask off once the answer is posted, and a failed one
 // leaves ❌ and lifts ⏸️.
 func TestTerminalWithoutAMarkSettlesTheAsk(t *testing.T) {
+	// Each ask is worded to the kind its progress marks, so the arrival draw
+	// (askkind.Kind) is the mark's first token and the progress adds the rest.
 	cases := []struct {
 		name  string
+		ask   string
 		mark  chatmsg.Mark
 		state lib.TaskState
 		want  []string
 	}{
-		{"answered", chatmsg.Mark{Ask: "question"}, lib.StateCompleted, []string{"+question", "-question"}},
-		{"failed while blocked", chatmsg.Mark{Ask: "fleet", Settle: "blocked"}, lib.StateFailed,
+		{"answered", "how is checkout?", chatmsg.Mark{Ask: "question"}, lib.StateCompleted, []string{"+question", "-question"}},
+		{"failed while blocked", "how are all my clusters?", chatmsg.Mark{Ask: "fleet", Settle: "blocked"}, lib.StateFailed,
 			[]string{"+fleet", "+blocked", "-fleet", "-blocked", "+failed"}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			r := startRig(t)
 			conv := "discord:g1/settle-" + strings.ReplaceAll(c.name, " ", "-")
-			r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "d-2", Text: "how is the fleet?"}
+			r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "d-2", Text: c.ask}
 			origin := r.awaitTask(t, "platform")
 			mark := c.mark
 			progress := chatPart(t, chatmsg.Message{Schema: chatmsg.Schema, Headline: "looking", Mark: &mark})

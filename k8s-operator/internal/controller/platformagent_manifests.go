@@ -878,6 +878,14 @@ func renderManagedEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agentPlugins
 	// would hand it a declaration it authored; with it, save_env_value refuses the key
 	// and the ConfigMap stays the only answer to "what is declared".
 	add(scopeFileEnvKey, scopeDir+"/"+scopeFileName)
+	// The resolved scope's path, pinned for the same reason (#5621): under mode next to
+	// the mounted ConfigMap, and empty elsewhere, since an absent key is one the agent
+	// may write and the publisher's ConfigMap exists only under next.
+	if scopePublisherRendered(agent) {
+		add(resolvedScopeFileEnvKey, resolvedScopeDir+"/"+scopeResolvedDataKey)
+	} else {
+		add(resolvedScopeFileEnvKey, "")
+	}
 
 	// RECONCILE_PROJECT, pinned empty. The reconcile reads it as the management project
 	// first, and since the scope prune exists a management identity that changes
@@ -2182,7 +2190,7 @@ func seededGitOpsEntry(agent *agentv1alpha1.PlatformAgent) *agentv1alpha1.Manage
 // maps each one onto the TERMINAL_* environment variable tools/terminal_tool.py
 // reads, and tools/environments/ssh.py turns them into an ssh command line.
 //
-// Six of these keys are Hermes'. `cwd` is absent on purpose — it is per-profile,
+// Seven of these keys are Hermes'. `cwd` is absent on purpose — it is per-profile,
 // and a value here would replace each profile's own (see the note on
 // renderConfigYAML). `ssh_persistent` is absent because Hermes has no env var for
 // it, so rendering it would look like a setting and be one only for in-process
@@ -2205,7 +2213,17 @@ func seededGitOpsEntry(agent *agentv1alpha1.PlatformAgent) *agentv1alpha1.Manage
 // cleanup() no longer reaches the master either. The value stays because
 // reaping reclaims nothing here.
 //
-// `workspace_root` is the sixth and is NOT Hermes'. Hermes ignores it; the reader
+// `timeout` is the terminal tool's per-call limit for a command run without a
+// `timeout=` argument. Hermes' code default is 180s, but the image's first boot
+// seeds $HERMES_HOME/.env from Hermes' .env.example, which sets
+// TERMINAL_TIMEOUT=60, and .env beats the code default. So without this key every
+// install ran at 60s: a polling `sleep 60` with no `timeout=` raced it, and the
+// scripts that budget against 180s (cluster_preflight.sh) were cut short. A
+// seeded .env is never reseeded, so only a key that outranks it reaches an
+// existing install;
+// deploy/shared/terminal_env_pin.py copies it into each profile's .env.
+//
+// `workspace_root` is the eighth and is NOT Hermes'. Hermes ignores it; the reader
 // is agents/platform/scripts/sandbox_exec.py, which already parses this block for
 // ssh_host and needs one more fact about the far side — the directory a proxied
 // command must run in, which is shellSandboxDataPath, the sandbox's data volume.
@@ -2221,8 +2239,15 @@ type managedTerminalConfig struct {
 	SSHPort         int    `json:"ssh_port"`
 	SSHKey          string `json:"ssh_key"`
 	LifetimeSeconds int    `json:"lifetime_seconds"`
+	TimeoutSeconds  int    `json:"timeout"`
 	WorkspaceRoot   string `json:"workspace_root"`
 }
+
+// shellSandboxTerminalTimeoutSeconds is what the operator publishes as
+// terminal.timeout — see the note above. Hermes' own code default
+// (`_parse_env_var("TERMINAL_TIMEOUT", "180")` in tools/terminal_tool.py), which
+// cluster_preflight.sh mirrors as TERMINAL_TOOL_TIMEOUT_SECONDS.
+const shellSandboxTerminalTimeoutSeconds = 180
 
 // shellSandboxEnvLifetimeSeconds is what the operator publishes as
 // terminal.lifetime_seconds — see the note above. 30 days, not "off": Hermes
@@ -2362,6 +2387,7 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 		SSHPort:         shellSandboxPort,
 		SSHKey:          shellSandboxClientKeyFilePath(),
 		LifetimeSeconds: shellSandboxEnvLifetimeSeconds,
+		TimeoutSeconds:  shellSandboxTerminalTimeoutSeconds,
 		WorkspaceRoot:   shellSandboxDataPath,
 	}
 
@@ -3511,6 +3537,12 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		Name:  scopeFileEnvKey,
 		Value: scopeDir + "/" + scopeFileName,
 	})
+	// The resolved scope's path, as the managed .env pins it (empty outside next).
+	resolvedScopeFile := ""
+	if scopePublisherRendered(agent) {
+		resolvedScopeFile = resolvedScopeDir + "/" + scopeResolvedDataKey
+	}
+	envVars = append(envVars, corev1.EnvVar{Name: resolvedScopeFileEnvKey, Value: resolvedScopeFile})
 	// The managed .env pins RECONCILE_PROJECT empty (renderManagedEnv says why), and the
 	// two renders must agree, so the container env carries the same empty value.
 	envVars = append(envVars, corev1.EnvVar{Name: reconcileProjectEnvKey, Value: ""})
@@ -5786,6 +5818,9 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 		userVolumeMounts = append(userVolumeMounts, extraVolumeMounts...)
 	}
 	volumeMounts := append(dropTmpScratchIfClaimed(buildDefaultVolumeMounts(homeDir), userVolumeMounts), userVolumeMounts...)
+	if scopePublisherRendered(agent) {
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{Name: resolvedScopeVolumeName, MountPath: resolvedScopeDir, ReadOnly: true})
+	}
 	// The staged SSH key, read-only. Only the emptyDir the init container wrote —
 	// the container that opens the connection has no reason to see the Secret mount
 	// the init container read from.
@@ -6193,7 +6228,7 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 
 // buildDefaultVolumes generates the default volumes for PlatformAgent
 func buildDefaultVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
-	return []corev1.Volume{
+	vols := []corev1.Volume{
 		{
 			Name: "platform-agent-data-vol",
 			VolumeSource: corev1.VolumeSource{
@@ -6313,6 +6348,22 @@ func buildDefaultVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
 			},
 		},
 	}
+	// The scope publisher's resolved scope, under mode next only (#5621): optional,
+	// since the publisher writes the ConfigMap after the agent starts.
+	if scopePublisherRendered(agent) {
+		vols = append(vols, corev1.Volume{
+			Name: resolvedScopeVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{Name: scopeResolvedConfigMapName(agent)},
+					Items:                []corev1.KeyToPath{{Key: scopeResolvedDataKey, Path: scopeResolvedDataKey}},
+					Optional:             ptr.To(true),
+					DefaultMode:          ptr.To(int32(0444)),
+				},
+			},
+		})
+	}
+	return vols
 }
 
 // agentAllowsSecretsRead returns false when spec.security.disallowSecretsRead is true.

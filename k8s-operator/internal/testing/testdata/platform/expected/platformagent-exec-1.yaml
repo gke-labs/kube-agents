@@ -402,6 +402,7 @@ data:
       ssh_key: /etc/sandbox-ssh/id_ed25519
       ssh_port: 2222
       ssh_user: agent
+      timeout: 180
       workspace_root: /opt/data
   managed.env: |
     API_SERVER_KEY=cluster-internal-trusted
@@ -411,6 +412,7 @@ data:
     KUBEAGENTS_AUTOMERGE=off
     KUBEAGENTS_DIAL=off
     KUBEAGENTS_SCOPE_FILE=/etc/kube-agents/scope.json
+    KUBEAGENTS_RESOLVED_SCOPE_FILE=
     RECONCILE_PROJECT=
     KUBEAGENTS_DIAL_ADMINS=
     GKE_PROJECT_ID=example-project
@@ -1186,6 +1188,10 @@ spec:
               name: data
               readOnly: true
               subPath: profiles/platform/governance
+      dnsConfig:
+        options:
+          - name: ndots
+            value: "3"
       enableServiceLinks: false
       initContainers:
         - args:
@@ -1568,6 +1574,10 @@ spec:
             - mountPath: /etc/kube-agents/scope
               name: platform-agent-scope-vol
               readOnly: true
+      dnsConfig:
+        options:
+          - name: ndots
+            value: "3"
       securityContext:
         fsGroup: 10000
         runAsNonRoot: true
@@ -1894,9 +1904,9 @@ spec:
             - name: API_SERVER_KEY
               value: cluster-internal-trusted
             - name: CREDENTIAL_PROXY_STATE_LIMIT_BYTES
-              value: "5368709120"
+              value: "1073741824"
             - name: CREDENTIAL_PROXY_TMP_LIMIT_BYTES
-              value: "2147483648"
+              value: "268435456"
             - name: CREDENTIAL_PROXY_SCOPED_SA_POOL
               value: "0"
             - name: CREDENTIAL_PROXY_ENVOY_ADDRESS
@@ -1959,7 +1969,7 @@ spec:
           resources:
             limits:
               cpu: "2"
-              ephemeral-storage: 8Gi
+              ephemeral-storage: 2Gi
               memory: 2Gi
             requests:
               cpu: "2"
@@ -1995,6 +2005,10 @@ spec:
             - mountPath: /etc/credential-proxy-exec-tier
               name: credential-proxy-exec-tier-replicas
               readOnly: true
+      dnsConfig:
+        options:
+          - name: ndots
+            value: "3"
       securityContext:
         fsGroup: 10000
         runAsNonRoot: true
@@ -2008,10 +2022,10 @@ spec:
             name: platformagent-credential-proxy-policy
           name: credential-proxy-policy
         - emptyDir:
-            sizeLimit: 2Gi
+            sizeLimit: 256Mi
           name: credential-proxy-tmp
         - emptyDir:
-            sizeLimit: 5Gi
+            sizeLimit: 1Gi
           name: credential-proxy-state
         - emptyDir:
             medium: Memory
@@ -2165,6 +2179,7 @@ spec:
               value: /etc/hermes
             - name: KUBEAGENTS_SCOPE_FILE
               value: /etc/kube-agents/scope.json
+            - name: KUBEAGENTS_RESOLVED_SCOPE_FILE
             - name: RECONCILE_PROJECT
             - name: HERMES_HOME_MODE
               value: "2770"
