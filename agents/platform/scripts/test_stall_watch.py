@@ -2912,6 +2912,32 @@ class ResolvedScope(Base):
         self.assertNotIn(cid("c"), unreadable)
         self.assertNotIn(cid("m", project=self.MEMBER), unreadable)
 
+    def test_a_stall_with_no_cluster_agent_to_alert_is_said_once_not_dropped(self):
+        # Next mode sweeps a cluster with no Hermes profile; with no profile to
+        # assign the alert to, it is said in chat once (and again only when the
+        # set changes), not written to stderr the scheduler discards (#5622
+        # moves the alert to the cluster profile).
+        self.next_mode()
+        fleet = {"c": {"catalog": []}, f"{self.MEMBER}:m": {"storefront": GATEWAY_ROWS}}
+        lines, _ = self.run_tick(fleet, unmanaged=("c", "m"), now="2026-10-02T12:30:00+00:00")
+        self.assertEqual(self.last_alerts, [])
+        said = [l for l in lines if stall_watch.UNROUTED_MARK in l]
+        self.assertEqual(len(said), 1, lines)
+        self.assertIn("storefront", said[0])
+        again, _ = self.run_tick(fleet, unmanaged=("c", "m"), now="2026-10-02T13:00:00+00:00")
+        self.assertEqual([l for l in again if stall_watch.UNROUTED_MARK in l], [], "an unchanged set is said once")
+
+    def test_an_excluded_member_cluster_leaves_the_roster(self):
+        self.next_mode()
+        fleet = {"c": {"catalog": []}, f"{self.MEMBER}:m": {"storefront": GATEWAY_ROWS}}
+        self.run_tick(fleet, unmanaged=("c", "m"))
+        self.next_mode(exclude_clusters=[(self.MEMBER, LOCATION, "m")])
+        self.run_tick(fleet, unmanaged=("c", "m"))
+        sweep_cid = cid("m", project=self.MEMBER)
+        self.assertEqual([e for e in self.ledger()["stalls"].values() if e["cluster"] == sweep_cid], [],
+                         "an excluded cluster's rows go")
+        self.assertNotIn(sweep_cid, self.ledger()["unreadable"])
+
     def test_an_unreadable_document_holds_member_rows_instead_of_clearing_them(self):
         self.next_mode()
         self.run_tick({"c": {"catalog": []}, f"{self.MEMBER}:m": {"checkout": [DEPLOYMENT_ROW]}}, unmanaged=("c", "m"))

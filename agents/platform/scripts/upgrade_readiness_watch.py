@@ -675,6 +675,10 @@ ERROR_KIND_KEY = "kind"
 ERROR_KIND_LISTING = "listing failed"
 ERROR_KIND_SERVER_CONFIG = "server config failed"
 ERROR_KIND_READ = "read failed"
+# Under spec.mode: next, a resolved scope that names no member (missing,
+# unparseable, too-large or error) leaves the member projects out of the roster
+# (#5621). The table is then partial, not complete, so nothing is retired.
+ERROR_KIND_RESOLVED_SCOPE_UNREAD = "resolved scope unreadable"
 # Each entry of an ungraded announcement's signature: a project and the kind
 # of its failure.
 SIGNATURE_PAIR_FIELDS = (MEMBER_ID_KEYS[0], ERROR_KIND_KEY)
@@ -814,6 +818,19 @@ def roster_projects() -> set[str]:
     scope = fleet_scope_targets.list_scope_clusters(gitops_workspace.agent_home())
     return {entry.project.strip() for entry in scope.projects
             if entry.project.strip() and entry.project != fleet_scope_targets.UNRESOLVED_SCOPE_ROW}
+
+
+def resolved_scope_gap() -> dict | None:
+    """A read error for the member projects an unusable resolved scope leaves
+    out of the roster under spec.mode: next, or None. Without it the table of
+    the live projects alone reads as complete, and every version only member
+    clusters pend would be retired, then come back as new once the document
+    returns."""
+    scope = fleet_scope_targets.list_scope_clusters(gitops_workspace.agent_home())
+    if not scope.next_mode or not any(e.project == fleet_scope_targets.UNRESOLVED_SCOPE_ROW for e in scope.projects):
+        return None
+    return {MEMBER_ID_KEYS[0]: fleet_scope_targets.UNRESOLVED_SCOPE_ROW, MEMBER_ID_KEYS[1]: None,
+            ERROR_KIND_KEY: ERROR_KIND_RESOLVED_SCOPE_UNREAD, MESSAGE_KEY: scope.note or "the resolved scope names no member project"}
 
 
 def projects() -> list[str]:
@@ -2152,6 +2169,9 @@ def sweep(started: float, home: Path, ledger: dict, dry_run: bool) -> list[str]:
     names = projects()
     deadline = started + TICK_BUDGET_SECONDS
     versions = versions_by_project(names, started + TABLE_BUDGET_SECONDS, ledger, now, scope, standing)
+    gap = resolved_scope_gap()
+    if gap is not None:
+        versions[ENVELOPE_REPORT_KEY][ERRORS_KEY].append(gap)
     canonicalise_projects(versions[ENVELOPE_REPORT_KEY], ledger[PROJECT_IDS_KEY])
     read_errors = versions[ENVELOPE_REPORT_KEY].get(ERRORS_KEY) or []
     # A table is partial when a read failed; the script's exit code alone (it

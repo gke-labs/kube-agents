@@ -705,6 +705,12 @@ TERMINAL_CARD_STATUSES = frozenset({"done", "archived", "cancelled", "failed"})
 BOARD_DB_NAME = "kanban.db"
 BOARD_BUSY_TIMEOUT_SECONDS = 10
 NOTICED_PREFIX = "🧭 stall noticed"
+# A stall swept under spec.mode: next on a cluster with no Cluster Agent
+# profile to assign its alert to (#5621): said once per change of the set,
+# keyed in the state under UNROUTED_KEY, until #5622 moves the alert to the
+# cluster profile.
+UNROUTED_MARK = "with no Cluster Agent profile to alert"
+UNROUTED_KEY = "unrouted"
 CLEARED_PREFIX = "✅ stall cleared"
 DRY_RUN_PREFIX = "dry run:"
 #: A card the board no longer has, or cannot describe for this many ticks
@@ -1374,6 +1380,7 @@ def empty_state() -> dict:
         EPISODES_KEY: {},
         "sweep_error": None,
         INJECT_ERROR_KEY: None,
+        UNROUTED_KEY: None,
         "updated_at": None,
         CURSOR_KEY: None,
         CREDENTIALS_KEY: {},
@@ -2105,6 +2112,13 @@ def sweep_fleet(
             sweep.unreadable[f"{LISTING_SCOPE} {project}"] = failure_text(listing)
             continue
         clusters, incomplete = listing
+        if scope.next_mode:
+            # The reader leaves an excluded cluster out of a member's listing; it
+            # has left the roster all the same, so an alert open on it closes as
+            # the roster's, not as a stall that cleared.
+            for excluded_project, location, name in scope.excluded_clusters:
+                if excluded_project == project:
+                    sweep.unmanaged.add(cluster_id(project, name, location))
         if incomplete:
             sweep.unlisted_projects.add(project)
             sweep.unreadable[f"{LISTING_SCOPE} {project}"] = f"incomplete: {incomplete}"
@@ -2677,6 +2691,7 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
         if not dry_run and episode.get("pending") and scope not in candidates and scope_rows(state, scope):
             candidates[scope] = []
     raised = held = 0
+    unrouted: list[str] = []
     refusal: str | None = None
     for scope in sorted(candidates, key=lambda sc: (scope_first_seen(state, sc), sc)):
         new_rows = candidates[scope]
@@ -2741,9 +2756,12 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
             continue
         assignee = cluster_agent_for(project, name, location)
         if assignee is None:
-            # The profile went between the sweep and the alert; the next sweep
-            # leaves the cluster out and its rows clear.
+            # Outside next mode the profile went between the sweep and the
+            # alert, and the next sweep leaves the cluster out. Under next mode
+            # the cluster is swept whether or not it has a profile, so the
+            # stall is said in chat rather than lost (below).
             sys.stderr.write(f"stall_watch: {cid} has no Cluster Agent profile; no alert for {scope}\n")
+            unrouted.append(scope)
             continue
         payload = stall_payload(project, name, location, namespace, assignee, rows, scope_first_seen(state, scope) or now)
         try:
@@ -2768,6 +2786,12 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
             sys.stderr.write(f"stall_watch: no alert for {scope}: {refusal}\n")
             continue
         raised += 1
+    unrouted_now = sorted(set(unrouted))
+    if unrouted_now and state.get(UNROUTED_KEY) != unrouted_now:
+        shown = ", ".join(unrouted_now[:5]) + (f" and {len(unrouted_now) - 5} more" if len(unrouted_now) > 5 else "")
+        text = f"{NOTICED_PREFIX} in {len(unrouted_now)} namespace{'s' if len(unrouted_now) > 1 else ''} {UNROUTED_MARK} ({shown}); tracked here and cleared when they clear"
+        lines.append(f"{DRY_RUN_PREFIX} {text}" if dry_run else text)
+    state[UNROUTED_KEY] = unrouted_now or None
     if held:
         text = f"{NOTICED_PREFIX} in {held} more namespace{'s' if held > 1 else ''}; alerts follow on later ticks, {MAX_ALERTS_PER_TICK} a tick"
         lines.append(f"{DRY_RUN_PREFIX} {text}" if dry_run else text)

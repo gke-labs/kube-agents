@@ -2683,6 +2683,30 @@ class Projects(unittest.TestCase):
                 self.assertEqual(watch.projects(), ["explicit-a", "member-a", "member-b", "mgmt"])
 
 
+    def test_an_unusable_resolved_scope_makes_the_table_partial(self) -> None:
+        # A too-large or missing document names no member, so the roster holds
+        # only the live projects. That must not read as a complete table, or
+        # every version only member clusters pend would be retired and come
+        # back as new once the document returns.
+        with tempfile.TemporaryDirectory() as home:
+            root = Path(home)
+            (root / "scope.json").write_text(json.dumps({"present": True, "projects": ["explicit-a"], "folders": ["1"]}), encoding="utf-8")
+            (root / "resolved-scope.json").write_text(json.dumps({"v": 1, "state": "too-large", "projects": []}), encoding="utf-8")
+            env = {watch.MANAGEMENT_PROJECT_ENV: "mgmt",
+                   watch.fleet_scope_targets.SCOPE_FILE_ENV: str(root / "scope.json"),
+                   watch.fleet_scope_targets.RESOLVED_SCOPE_FILE_ENV: str(root / "resolved-scope.json")}
+            with mock.patch.dict(os.environ, env), mock.patch.object(watch.gitops_workspace, "agent_home", return_value=home):
+                gap = watch.resolved_scope_gap()
+                self.assertIsNotNone(gap)
+                self.assertEqual(gap[watch.ERROR_KIND_KEY], watch.ERROR_KIND_RESOLVED_SCOPE_UNREAD)
+                self.assertIsNone(gap[watch.MEMBER_ID_KEYS[1]])
+                self.assertIn("too-large", gap[watch.MESSAGE_KEY])
+            # Today mode, or a usable document, has no gap.
+            with mock.patch.dict(os.environ, {watch.fleet_scope_targets.RESOLVED_SCOPE_FILE_ENV: ""}), mock.patch.object(
+                watch.gitops_workspace, "agent_home", return_value=home
+            ):
+                self.assertIsNone(watch.resolved_scope_gap())
+
 class Loader(unittest.TestCase):
     def setUp(self) -> None:
         self.env = mock.patch.dict(os.environ, {watch.SKILL_SCRIPTS_DIR_ENV: ""}, clear=False)
