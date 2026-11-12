@@ -17,6 +17,7 @@ and the person is told so.
 """
 
 import contextlib
+import datetime
 import io
 import os
 import pathlib
@@ -53,11 +54,17 @@ def required_rule(*names):
     return {"type": rfc.RULE_REQUIRED_STATUS_CHECKS, "parameters": {"required_status_checks": checks, "strict_required_status_checks_policy": False}}
 
 
-def run(run_id, conclusion, suite, status="completed", attempt=1, name="Python Unit Tests", event="pull_request", head_branch=PR_HEAD["ref"], head_repo=PR_HEAD["repo"]["full_name"], workflow_id=None):
+NOW = datetime.datetime(2026, 11, 12, 20, 0, tzinfo=datetime.timezone.utc)
+LONG_AGO = "2026-11-11T20:21:04Z"  # a day before NOW: stuck
+JUST_NOW = (NOW - datetime.timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")  # within STUCK_QUEUED_AFTER
+
+
+def run(run_id, conclusion, suite, status="completed", attempt=1, name="Python Unit Tests", event="pull_request", head_branch=PR_HEAD["ref"], head_repo=PR_HEAD["repo"]["full_name"], workflow_id=None, created=None, started=None):
     """A workflow run as the runs list returns it; `suite` ties it to its check runs.
     By default it is the pull request's own: a pull-request event at its head branch and repository.
     Its workflow is its name unless `workflow_id` says otherwise."""
-    return {
+    stamps = {key: value for key, value in (("created_at", created), ("run_started_at", started)) if value}
+    return stamps | {
         "id": run_id,
         "name": name,
         "workflow_id": workflow_id or name,
@@ -88,8 +95,11 @@ class FakeAPI(rfc.GitHubAPI):
     """`GitHubAPI` with `get` and `post` faked, so the real pager runs over one pull request,
     paged lists and recorded posts."""
 
-    def __init__(self, pull=None, runs=(), checks=(), per_page=github_api.PER_PAGE, refusing=(), refusal_body=b"", failing=(), rules=()):
+    def __init__(self, pull=None, runs=(), checks=(), per_page=github_api.PER_PAGE, refusing=(), refusal_body=b"", failing=(), rules=(), finishes_on=("cancel",)):
         super().__init__("gke-labs/kube-agents", "x")
+        # Which cancel endpoints finish a run: a lost run may ignore `cancel` and need `force-cancel`.
+        self.finishes_on = set(finishes_on)
+        self.finished = set()
         self.refusal_body = refusal_body
         self.failing = set(failing)  # paths that answer 502, as the API failing rather than refusing
         self.pull = pull or {"number": 3245, "state": "open", "head": PR_HEAD, "base": PR_BASE, "title": "ci: bump"}
@@ -112,7 +122,9 @@ class FakeAPI(rfc.GitHubAPI):
         if matched:
             query = dict(part.split("=") for part in matched.group(1).split("&"))
             assert query["head_sha"] == HEAD, path
-            return self._page(self.runs, "workflow_runs", query)
+            cancelled = {"status": "completed", "conclusion": "cancelled"}
+            listed = [entry | (cancelled if entry["id"] in self.finished else {}) for entry in self.runs]
+            return self._page(listed, "workflow_runs", query)
         matched = re.search(rf"/commits/{HEAD}/check-runs\?(.*)$", path)
         if matched:
             query = dict(part.split("=") for part in matched.group(1).split("&"))
@@ -135,6 +147,9 @@ class FakeAPI(rfc.GitHubAPI):
         if path in self.refusing:
             raise urllib.error.HTTPError(path, 403, "Forbidden", {}, io.BytesIO(self.refusal_body))
         self.posts.append((path, payload))
+        matched = re.search(r"/actions/runs/(\d+)/([a-z-]+)$", path)
+        if matched and matched.group(2) in self.finishes_on:
+            self.finished.add(int(matched.group(1)))
         return {}
 
 
@@ -365,6 +380,68 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(0, plan.pending)
 
 
+class StuckPlanTest(unittest.TestCase):
+    def plan(self, *runs):
+        return rfc.plan_stuck(list(runs), PR_HEAD, NOW)
+
+    def ids(self, runs):
+        return [entry["id"] for entry in runs]
+
+    def test_a_run_queued_past_the_threshold_is_stuck_and_a_recent_one_is_not(self):
+        stuck, superseded, skipped = self.plan(
+            run(1, None, 10, status="queued", created=LONG_AGO),
+            run(2, None, 20, status="queued", created=JUST_NOW, name="Docs Build"),
+        )
+        self.assertEqual(([1], [], []), (self.ids(stuck), superseded, skipped))
+
+    def test_a_run_without_timestamps_or_not_queued_is_never_stuck(self):
+        planned = self.plan(
+            run(1, None, 10, status="queued"),
+            run(2, None, 20, status="in_progress", created=LONG_AGO, name="Docs Build"),
+            run(3, "cancelled", 30, created=LONG_AGO, name="Merge Gate"),
+        )
+        self.assertEqual(([], [], []), planned)
+
+    def test_the_latest_attempt_start_counts_not_the_runs_creation(self):
+        """A run re-run five minutes ago is a fresh attempt waiting for a runner, not a lost one."""
+        planned = self.plan(run(1, None, 10, status="queued", attempt=2, created=LONG_AGO, started=JUST_NOW))
+        self.assertEqual(([], [], []), planned)
+
+    def test_only_the_newest_stuck_run_of_a_workflow_is_rerun_and_older_ones_are_cancelled(self):
+        stuck, superseded, skipped = self.plan(
+            run(1, None, 10, status="queued", created=LONG_AGO, name="Merge Gate"),
+            run(2, None, 20, status="queued", created=LONG_AGO, name="Merge Gate"),
+            run(3, "success", 30, created=JUST_NOW, name="Auto Enqueue"),
+            run(4, None, 40, status="queued", created=LONG_AGO, name="Auto Enqueue"),
+        )
+        # Run ids rise with creation: run 2 supersedes run 1, and run 4 is the newest Auto Enqueue.
+        self.assertEqual(([2, 4], [1], []), (self.ids(stuck), self.ids(superseded), skipped))
+
+    def test_a_stuck_run_older_than_a_finished_run_of_its_workflow_is_cancelled_not_rerun(self):
+        stuck, superseded, skipped = self.plan(
+            run(1, None, 10, status="queued", created=LONG_AGO, name="Merge Gate"),
+            run(2, "success", 20, created=JUST_NOW, name="Merge Gate"),
+        )
+        self.assertEqual(([], [1], []), (stuck, self.ids(superseded), skipped))
+
+    def test_a_stuck_run_waits_while_an_older_run_of_its_workflow_is_going(self):
+        stuck, superseded, skipped = self.plan(
+            run(1, None, 10, status="in_progress", created=LONG_AGO),
+            run(2, None, 20, status="queued", created=LONG_AGO),
+        )
+        self.assertEqual(([], []), (stuck, superseded))
+        self.assertIn("another run of the same workflow is going", skipped[0].reason)
+
+    def test_a_stuck_run_at_the_attempt_ceiling_is_left_alone(self):
+        stuck, superseded, skipped = self.plan(run(1, None, 10, status="queued", attempt=rfc.RERUN_ATTEMPT_CEILING, created=LONG_AGO))
+        self.assertEqual(([], []), (stuck, superseded))
+        self.assertIn(f"attempt {rfc.RERUN_ATTEMPT_CEILING}", skipped[0].reason)
+
+    def test_a_stuck_run_that_is_not_the_pull_requests_is_ignored(self):
+        planned = self.plan(run(1, None, 10, status="queued", event="push", head_branch="main", created=LONG_AGO))
+        self.assertEqual(([], [], []), planned)
+
+
 class ListTest(unittest.TestCase):
     def test_every_page_of_both_object_endpoints_is_read(self):
         api = FakeAPI(runs=[run(index, "success", index) for index in range(5)], checks=[check(index, "T", "success", index) for index in range(3)], per_page=2)
@@ -432,7 +509,7 @@ class MainTest(unittest.TestCase):
             api.posts,
         )
         self.assertIn(rfc.WORKFLOW_WARNING_PREFIX, out)
-        self.assertIn("no red GitHub Actions check", out)
+        self.assertIn("no red or stuck GitHub Actions run", out)
         self.assertIn("1 still running", out)
 
     def test_a_cancelled_run_that_never_made_a_check_run_is_not_rerun(self):
@@ -564,6 +641,115 @@ class MainTest(unittest.TestCase):
         api = FakeAPI(runs=[run(1, "success", 10)], checks=[check(1, "Tests", "success", 10)], failing={"/repos/gke-labs/kube-agents/issues/comments/77/reactions"})
         with self.assertRaises(urllib.error.HTTPError):
             self.run_main(api)
+
+    def stuck_api(self, **kwargs):
+        """#5606's shape: a lost run of a required check, and a superseded lost run beside a green one."""
+        return FakeAPI(
+            runs=[
+                run(1, None, 10, status="queued", created=LONG_AGO),
+                run(2, None, 20, status="queued", created=LONG_AGO, name="Merge Gate"),
+                run(3, "success", 30, created=LONG_AGO, name="Merge Gate"),
+            ],
+            checks=[check(3, "matrix.gate", "success", 30)],
+            **kwargs,
+        )
+
+    def run_stuck(self, api, *argv):
+        with mock.patch.object(rfc.time, "sleep"):
+            return self.run_main(api, *argv)
+
+    def test_a_stuck_run_is_cancelled_then_rerun_and_the_comment_gets_eyes(self):
+        api = self.stuck_api()
+        code, out, err = self.run_stuck(api)
+        self.assertEqual(0, code, err)
+        self.assertEqual(
+            [
+                ("/repos/gke-labs/kube-agents/actions/runs/1/cancel", None),
+                ("/repos/gke-labs/kube-agents/actions/runs/2/cancel", None),
+                ("/repos/gke-labs/kube-agents/actions/runs/1/rerun", None),
+                ("/repos/gke-labs/kube-agents/issues/comments/77/reactions", {"content": rfc.REACTION_ACKNOWLEDGED}),
+            ],
+            api.posts,
+        )
+        summary = pathlib.Path(self.summary.name).read_text()
+        self.assertIn("Cancelled and re-ran stuck Python Unit Tests (run 1", summary)
+        self.assertIn("Cancelled superseded stuck Merge Gate (run 2", summary)
+
+    def test_a_superseded_stuck_run_is_cancelled_so_it_stops_holding_a_red_newer_run(self):
+        """Left queued, the older run reads as still going and every /retest declines the red one."""
+        api = FakeAPI(
+            runs=[run(1, None, 10, status="queued", created=LONG_AGO), run(2, "failure", 20)],
+            checks=[check(2, "Python Unit Tests", "failure", 20)],
+        )
+        code, out, err = self.run_stuck(api)
+        self.assertEqual(0, code, err)
+        self.assertEqual(["runs/1/cancel"], [path.split("actions/")[1] for path, _ in api.posts if "/actions/" in path])
+        self.assertIn("run 1 of the same workflow is still going", out)
+        api.posts.clear()
+        code, out, err = self.run_stuck(api)
+        self.assertEqual(0, code, err)
+        self.assertEqual(["runs/2/rerun-failed-jobs"], [path.split("actions/")[1] for path, _ in api.posts if "/actions/" in path])
+
+    def test_a_stuck_run_that_ignores_cancel_is_force_cancelled(self):
+        api = self.stuck_api(finishes_on=("force-cancel",))
+        with mock.patch.object(rfc, "CANCEL_SETTLE_SECONDS", 0):
+            code, out, err = self.run_stuck(api)
+        self.assertEqual(0, code, err)
+        self.assertEqual(
+            ["runs/1/cancel", "runs/2/cancel", "runs/1/force-cancel", "runs/2/force-cancel", "runs/1/rerun"],
+            [path.split("actions/")[1] for path, _ in api.posts if "/actions/" in path],
+        )
+
+    def test_a_stuck_run_nothing_cancels_is_not_rerun_and_the_run_goes_red(self):
+        api = self.stuck_api(finishes_on=())
+        with mock.patch.object(rfc, "CANCEL_SETTLE_SECONDS", 0):
+            code, out, err = self.run_stuck(api)
+        self.assertEqual(1, code)
+        self.assertNotIn(("/repos/gke-labs/kube-agents/actions/runs/1/rerun", None), api.posts)
+        self.assertEqual(rfc.REACTION_DECLINED, api.posts[-1][1]["content"])
+        self.assertIn("Could not cancel stuck Python Unit Tests", out)
+
+    def test_a_refused_cancel_on_a_run_that_finished_meanwhile_still_reruns_it(self):
+        cancel_path = "/repos/gke-labs/kube-agents/actions/runs/1/cancel"
+        api = self.stuck_api(refusing={cancel_path}, refusal_body=b'{"message": "Cannot cancel a workflow run that is completed."}')
+        refuse = api.post
+
+        def finish_then_refuse(path, payload=None, tolerate=()):
+            if path == cancel_path:
+                api.finished.add(1)  # it finished on its own between the plan's read and the cancel
+            return refuse(path, payload, tolerate)
+
+        api.post = finish_then_refuse
+        code, out, err = self.run_stuck(api)
+        self.assertEqual(0, code, err)
+        self.assertIn(("/repos/gke-labs/kube-agents/actions/runs/1/rerun", None), api.posts)
+        self.assertIn("Cannot cancel a workflow run that is completed.", err)
+
+    def test_a_refused_rerun_after_the_cancel_is_reported(self):
+        api = self.stuck_api(refusing={"/repos/gke-labs/kube-agents/actions/runs/1/rerun"}, refusal_body=b'{"message": "This workflow run cannot be rerun."}')
+        code, out, err = self.run_stuck(api)
+        self.assertEqual(1, code)
+        self.assertIn("Cancelled stuck Python Unit Tests (run 1", out)
+        self.assertIn("This workflow run cannot be rerun.", out)
+
+    def test_a_red_run_and_a_stuck_run_are_both_handled_in_one_command(self):
+        api = FakeAPI(
+            runs=[run(1, "failure", 10, name="Docs Build"), run(2, None, 20, status="queued", created=LONG_AGO)],
+            checks=[check(1, "Docs Build", "failure", 10)],
+        )
+        code, out, err = self.run_stuck(api)
+        self.assertEqual(0, code, err)
+        self.assertEqual(
+            ["runs/1/rerun-failed-jobs", "runs/2/cancel", "runs/2/rerun"],
+            [path.split("actions/")[1] for path, _ in api.posts if "/actions/" in path],
+        )
+
+    def test_dry_run_neither_cancels_nor_reruns_a_stuck_run(self):
+        api = self.stuck_api()
+        code, out, err = self.run_stuck(api, "--dry-run")
+        self.assertEqual(0, code, err)
+        self.assertEqual([], api.posts)
+        self.assertIn("would cancel and re-run stuck Python Unit Tests", err)
 
     def test_dry_run_posts_nothing(self):
         api = FakeAPI(runs=[run(1, "failure", 10)], checks=[check(1, "Tests", "failure", 10)])

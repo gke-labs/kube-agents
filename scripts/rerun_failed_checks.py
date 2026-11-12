@@ -46,6 +46,17 @@ spending runners on nothing. A workflow run cancelled while still queued -- its
 concurrency group displaced it -- never created a check run, so it blocks
 nothing and is never re-run, required or not.
 
+A run that never leaves `queued` is the other case. GitHub can lose a run
+during an Actions incident, and it then sits `queued` with no job for days,
+so its checks never report, a required one never goes green, and GitHub
+refuses to re-run a run that has not finished. A pull request's own run
+queued for longer than `STUCK_QUEUED_AFTER` is cancelled (force-cancelled when
+a cancel does not take) and then re-run whole. When a newer run of its
+workflow on the pull request exists, that one carries the checks, so the
+stuck run is cancelled and not re-run; left queued, it would read as still
+going and hold back a re-run of the newer one. It is left alone when another
+run of its workflow is going, and at the attempt ceiling.
+
 A re-run executes the original run again, with the privileges of the actor
 who first triggered it, so the person typing the command gains no ability to
 run pull-request code with a write token; the workflow itself checks out the
@@ -66,9 +77,11 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import datetime
 import json
 import os
 import sys
+import time
 import urllib.error
 
 from github_api import GitHubAPI, is_refusal, log
@@ -127,6 +140,22 @@ RERUN_WHOLE = "rerun"
 # attempt (a runner lost, a superseding event) put in the way of that one.
 # Past it, a person with Write reads the log and decides.
 RERUN_ATTEMPT_CEILING = 3
+
+# A run still `queued` this long after its attempt started is taken as lost,
+# not waiting: a hosted runner picks a job up in seconds to minutes, and a
+# run held by its concurrency group waits on a run of its workflow that is
+# going, which `plan_stuck` leaves alone.
+QUEUED_STATUS = "queued"
+STUCK_QUEUED_AFTER = datetime.timedelta(minutes=60)
+# GitHub refuses to re-run an unfinished run, so a stuck one is cancelled
+# first. `cancel` is the polite request; `force-cancel` is GitHub's endpoint
+# for a run that ignores it. Each is given this long to read `completed`,
+# polled at this interval with one runs listing per poll (`cancel_stuck`).
+CANCEL_ACTIONS = ("cancel", "force-cancel")
+CANCEL_SETTLE_SECONDS = 90
+CANCEL_POLL_SECONDS = 10
+# GitHub's timestamps end in `Z`, which `fromisoformat` reads only from 3.11.
+UTC_SUFFIX, UTC_OFFSET = "Z", "+00:00"
 
 # Reactions on the `/retest` comment: 👀 when something was re-run, 😕 when the
 # command found nothing to do. Without the second, a declined command looks
@@ -331,6 +360,83 @@ def plan_reruns(check_runs, runs, head: dict, required=frozenset()) -> Plan:
     return plan
 
 
+def attempt_started(run: dict):
+    """When the run's latest attempt started, or None when the run says neither."""
+    stamp = run.get("run_started_at") or run.get("created_at")
+    if not stamp:
+        return None
+    return datetime.datetime.fromisoformat(stamp.replace(UTC_SUFFIX, UTC_OFFSET))
+
+
+def plan_stuck(runs, head: dict, now) -> tuple:
+    """The pull request's stuck `queued` runs: to cancel and re-run, to cancel only, and left alone and why.
+
+    One run per workflow is re-run at most: the newest run of a workflow on
+    the pull request. An older stuck run beside it, which a newer run
+    superseded and which made no check run, is cancelled and not re-run:
+    left queued, it would read as still going to `plan_reruns` and hold a red
+    newer run of its workflow back from every later `/retest`.
+    """
+    mine = [run for run in runs if belongs_to(run, head)]
+    newest = {}
+    going = set()
+    for run in mine:
+        workflow = run.get("workflow_id", run["id"])
+        newest[workflow] = max(newest.get(workflow, run["id"]), run["id"])
+        if run.get("status") not in (COMPLETED_STATUS, QUEUED_STATUS):
+            going.add(workflow)
+    stuck, superseded, skipped = [], [], []
+    for run in sorted(mine, key=lambda entry: entry["id"]):
+        started = attempt_started(run)
+        if run.get("status") != QUEUED_STATUS or started is None or now - started < STUCK_QUEUED_AFTER:
+            continue
+        workflow = run.get("workflow_id", run["id"])
+        label = f"{run.get('name')} (run {run['id']}, queued since {started.isoformat()})"
+        attempt = run.get("run_attempt") or 1
+        if newest[workflow] != run["id"]:
+            superseded.append(run)
+        elif workflow in going:
+            skipped.append(Skipped(label, "stuck, but another run of the same workflow is going; /retest again once it finishes"))
+        elif attempt >= RERUN_ATTEMPT_CEILING:
+            skipped.append(Skipped(label, f"stuck on attempt {attempt}; a person with Write access decides"))
+        else:
+            stuck.append(run)
+    return stuck, superseded, skipped
+
+
+def describe_stuck(run: dict) -> str:
+    return f"{run.get('name')} (run {run.get('id')}, attempt {run.get('run_attempt')}, queued since {run.get('run_started_at') or run.get('created_at')})"
+
+
+def cancel_stuck(api, repo: str, head_sha: str, runs) -> list:
+    """Cancel each stuck run, force-cancelling the ones a cancel does not finish; the runs left unfinished.
+
+    A refused cancel is logged and the run polled anyway: GitHub answers 409
+    for a run that finished on its own between the read and the cancel. The
+    poll lists the head commit's runs once per interval rather than reading
+    each run, so a few dozen stuck runs cost a few requests a round.
+    """
+    pending = {run["id"]: run for run in runs}
+    for action in CANCEL_ACTIONS:
+        for run_id in pending:
+            try:
+                api.post(f"/repos/{repo}/actions/runs/{run_id}/{action}")
+            except urllib.error.HTTPError as error:
+                if not is_refusal(error):
+                    raise
+                log(f"Run {run_id}: GitHub refused {action} ({error.code}: {refusal_message(error)})")
+        deadline = time.monotonic() + CANCEL_SETTLE_SECONDS
+        while pending:
+            finished = {run["id"] for run in list_runs(api, repo, head_sha) if run.get("status") == COMPLETED_STATUS}
+            pending = {run_id: run for run_id, run in pending.items() if run_id not in finished}
+            if not pending or time.monotonic() >= deadline:
+                break
+            time.sleep(CANCEL_POLL_SECONDS)
+        if not pending:
+            break
+    return list(pending.values())
+
+
 def describe(entry: Rerun) -> str:
     run = entry.run
     return f"{run.get('name')} (run {run.get('id')}, attempt {run.get('run_attempt')}, {run.get('conclusion')}): {', '.join(entry.check_names)}"
@@ -432,12 +538,14 @@ def main(argv=None):
         return 0
 
     required = required_check_names(api, args.repo, pull_request["base"]["ref"])
-    plan = plan_reruns(list_check_runs(api, args.repo, head_sha), list_runs(api, args.repo, head_sha), pull_request["head"], required)
-    skipped_lines = [f"Left alone: {entry.name}: {entry.reason}" for entry in plan.skipped]
-    if not plan.rerun:
-        reason = "no red GitHub Actions check at the head commit"
-        if plan.skipped:
-            reason = "no red GitHub Actions check at the head commit that this command can re-run"
+    runs = list_runs(api, args.repo, head_sha)
+    plan = plan_reruns(list_check_runs(api, args.repo, head_sha), runs, pull_request["head"], required)
+    stuck, superseded, stuck_skipped = plan_stuck(runs, pull_request["head"], datetime.datetime.now(datetime.timezone.utc))
+    skipped_lines = [f"Left alone: {entry.name}: {entry.reason}" for entry in plan.skipped + stuck_skipped]
+    if not plan.rerun and not stuck and not superseded:
+        reason = "no red or stuck GitHub Actions run at the head commit"
+        if plan.skipped or stuck_skipped:
+            reason = "no red or stuck GitHub Actions run at the head commit that this command can re-run"
         if plan.pending:
             reason += f"; {plan.pending} still running"
         decline(api, args, reason, skipped_lines)
@@ -469,12 +577,52 @@ def main(argv=None):
             continue
         log(f"Re-ran {describe(entry)} via {entry.action}")
         done.append(entry)
-
     lines = [f"Re-ran {describe(entry)} ({entry.action})" for entry in done]
-    noted = [f"GitHub refused to re-run {describe(entry)}: {message}" for entry, message in refused] + skipped_lines
+    noted = [f"GitHub refused to re-run {describe(entry)}: {message}" for entry, message in refused]
+
+    # A superseded stuck run is cancelled and not re-run (`plan_stuck` says why);
+    # cancelling it is work done, so it earns the acknowledgement too.
+    cleared = []
+    if args.dry_run:
+        for run in stuck:
+            log(f"--dry-run: would cancel and re-run stuck {describe_stuck(run)}")
+            done.append(run)
+        for run in superseded:
+            log(f"--dry-run: would cancel superseded stuck {describe_stuck(run)}")
+            cleared.append(run)
+    elif stuck or superseded:
+        unfinished = cancel_stuck(api, args.repo, head_sha, stuck + superseded)
+        for run in superseded:
+            if run in unfinished:
+                noted.append(f"Could not cancel superseded stuck {describe_stuck(run)}: still not finished {CANCEL_SETTLE_SECONDS}s after force-cancel")
+                continue
+            log(f"Cancelled superseded stuck {describe_stuck(run)}")
+            lines.append(f"Cancelled superseded stuck {describe_stuck(run)} (a newer run of its workflow carries its checks)")
+            cleared.append(run)
+        for run in (run for run in stuck if run in unfinished):
+            message = f"still not finished {CANCEL_SETTLE_SECONDS}s after force-cancel"
+            log(f"Stuck {describe_stuck(run)}: {message}")
+            refused.append((run, message))
+            noted.append(f"Could not cancel stuck {describe_stuck(run)}: {message}")
+        for run in (run for run in stuck if run not in unfinished):
+            try:
+                api.post(f"/repos/{args.repo}/actions/runs/{run['id']}/{RERUN_WHOLE}")
+            except urllib.error.HTTPError as error:
+                if not is_refusal(error):
+                    raise
+                message = refusal_message(error)
+                log(f"Stuck {describe_stuck(run)}: cancelled, but GitHub refused the re-run ({error.code}: {message})")
+                refused.append((run, message))
+                noted.append(f"Cancelled stuck {describe_stuck(run)}, but GitHub refused to re-run it: {message}")
+                continue
+            log(f"Cancelled and re-ran stuck {describe_stuck(run)}")
+            lines.append(f"Cancelled and re-ran stuck {describe_stuck(run)}")
+            done.append(run)
+
+    noted += skipped_lines
     warn(noted)
     summarize(lines + noted)
-    react(api, args, REACTION_ACKNOWLEDGED if done else REACTION_DECLINED)
+    react(api, args, REACTION_ACKNOWLEDGED if done or cleared else REACTION_DECLINED)
     if refused and not done:
         log("Every re-run was refused; failing the run so the refusal is seen")
         return 1
