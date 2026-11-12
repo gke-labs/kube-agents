@@ -102,3 +102,25 @@ class RetryTest(unittest.TestCase):
                 mock.patch.object(sr.time, "sleep"):
             self.assertEqual(sr._get("https://example.invalid", "p"), {"skus": []})
         self.assertEqual(len(calls), 2)
+
+
+class CatalogTest(unittest.TestCase):
+    def test_the_catalog_is_read_page_by_page_for_each_service(self):
+        pages = {}
+        for service, skus in CATALOG.items():
+            pages[sr.CATALOG.format(service=service)] = {"skus": skus[:1], "nextPageToken": "t"}
+            pages[f"{sr.CATALOG.format(service=service)}&pageToken=t"] = {"skus": skus[1:]}
+        prices = sr.catalog_prices("p", get=lambda url, project: pages[url])
+        self.assertEqual(prices["region"], sr.DEFAULT_REGION)
+        self.assertEqual(prices["prices"]["n1_core_hour"]["sku"], "c1")
+
+
+class SafeTest(unittest.TestCase):
+    def test_any_failure_of_a_record_step_is_a_note(self):
+        errors = []
+
+        def broken():
+            raise NameError("a defect")
+
+        self.assertEqual(sr.safe(broken, errors, "cost record"), {})
+        self.assertEqual(errors, ["cost record: NameError: a defect"])

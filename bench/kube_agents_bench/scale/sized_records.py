@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import http.client
 import json
-import subprocess
 import time
 import urllib.error
 import urllib.request
@@ -107,13 +106,13 @@ def catalog_prices(project: str, region: str = DEFAULT_REGION,
                    get: Callable[[str, str], dict[str, Any]] = _get) -> dict[str, Any]:
     by_service: dict[str, list[dict[str, Any]]] = {}
     for service in {s[1] for s in skus(region)}:
-        url, skus = CATALOG.format(service=service), []
+        url, found = CATALOG.format(service=service), []
         while url:
             page = get(url, project)
-            skus += page.get("skus", [])
+            found += page.get("skus", [])
             token = page.get("nextPageToken")
             url = f"{CATALOG.format(service=service)}&pageToken={token}" if token else ""
-        by_service[service] = skus
+        by_service[service] = found
     return {"source": "Cloud Billing Catalog API", "read": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
             "region": region, "prices": pick_prices(by_service, region)}
 
@@ -223,10 +222,13 @@ def cost_record(project: str, run_id: str, windows: dict[str, dict[str, Any]],
 
 
 def safe(fn: Callable[[], dict[str, Any]], errors: list[str], what: str) -> dict[str, Any]:
-    """Run one record step; a failure is noted in the run's errors instead of losing the run."""
+    """Run one record step; a failure is noted in the run's errors instead of losing the run.
+
+    Any exception: a step that fails for a reason nobody listed, a defect included, still
+    costs only its own record, not the verdict and measurements of a run of hours.
+    """
     try:
         return fn()
-    except (kube.CommandError, LookupError, ValueError, OSError, subprocess.SubprocessError,
-            http.client.HTTPException) as exc:
-        errors.append(f"{what}: {exc}")
+    except Exception as exc:  # noqa: BLE001 -- see the docstring
+        errors.append(f"{what}: {type(exc).__name__}: {exc}")
         return {}
