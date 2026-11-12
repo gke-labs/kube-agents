@@ -197,8 +197,14 @@ func a2aBridgeRendered(agent *agentv1alpha1.PlatformAgent) bool {
 // not wait: it counts the bridge from the first render (a2aBridgeSidecars), so
 // the first provisioning Job is already sized for it and the bridge's arrival
 // does not re-render the Job.
+//
+// A bus migration drops BusProvisioned when it changes the server count, so
+// Ready waits for the provision Job after it (reconcileA2AStack). The bridge
+// does not wait with it: a run only starts on a provisioned bus, the streams
+// come through it, and withholding the bridge for the run's length would roll
+// the agent pod out and back in for nothing.
 func a2aBridgeInPod(agent *agentv1alpha1.PlatformAgent) bool {
-	return a2aBridgeRendered(agent) && busProvisioned(agent)
+	return a2aBridgeRendered(agent) && (busProvisioned(agent) || agent.Status.BusMigration != nil)
 }
 
 // a2aRenderedBridgeSettings is the part of the rendered bridge's environment

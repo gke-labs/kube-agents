@@ -24,6 +24,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
@@ -256,6 +257,29 @@ func TestTheRenderedBridgeWaitsForTheBusButIsBudgetedFromTheStart(t *testing.T) 
 	}
 	if a2aProvisionScript(agent) != before {
 		t.Error("the provision script changed when the bridge arrived; the Job would re-render")
+	}
+}
+
+// A migration that changes the server count drops BusProvisioned so Ready
+// waits for the provision Job after it. The bridge stays in the pod through
+// the run, both legs and after Done until that Job completes: dropping it
+// rolled the agent pod out and back in on ka-next-4 (#4488 live run).
+func TestTheBridgeStaysInThePodThroughABusMigration(t *testing.T) {
+	for _, phase := range []busMigrationPhase{busMigrationShrinking, busMigrationConverting, busMigrationRestoring, busMigrationDone} {
+		agent := provisionedAgent()
+		want := containersNamed(bridgeTestPod(agent), a2aBridgeContainerName)
+		if len(want) != 1 {
+			t.Fatalf("a provisioned agent has %d bridge containers, want 1", len(want))
+		}
+		agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), RunID: "1-1", Phase: string(phase)}
+		meta.RemoveStatusCondition(&agent.Status.Conditions, busProvisionedConditionType)
+		pod := bridgeTestPod(agent)
+		if got := containersNamed(pod, a2aBridgeContainerName); len(got) != 1 {
+			t.Errorf("%s: the pod has %d bridge containers with BusProvisioned dropped by the run, want 1", phase, len(got))
+		}
+		if _, ok := envIndex(containersNamed(pod, a2aAgentContainerName)[0])[a2aActivitySecretEnvVar]; !ok {
+			t.Errorf("%s: the agent container lost %s with the bridge kept", phase, a2aActivitySecretEnvVar)
+		}
 	}
 }
 
