@@ -161,16 +161,11 @@ func TestTheIdentityMapAtFleetScaleWithBucketedGrants(t *testing.T) {
 	agent := a2aTestAgent()
 	profiles := fleetScaleProfileFixtures(t, agent)
 
-	small, err := renderA2AAuthMap(agent, profiles[:1])
-	if err != nil {
-		t.Fatal(err)
-	}
-	full, err := renderA2AAuthMap(agent, profiles)
-	if err != nil {
-		t.Fatal(err)
-	}
-	a, _ := json.Marshal(dispatcherEntryOf(t, small))
-	b, _ := json.Marshal(dispatcherEntryOf(t, full))
+	// The entry itself: renderA2AAuthMap also applies #5394's ceiling, and
+	// at this N the dispatch config, not the entry, is past its budget
+	// (#5479), so the map would carry no dispatcher entry to compare.
+	a, _ := json.Marshal(dispatcherMapEntry(agent, profiles[:1], nil))
+	b, _ := json.Marshal(dispatcherMapEntry(agent, profiles, nil))
 	if len(a) != len(b) {
 		t.Fatalf("the dispatcher's entry is %d bytes at 1 profile and %d at %d; with bucketed grants it must not grow", len(a), len(b), fleetScaleProfiles)
 	}
@@ -318,4 +313,34 @@ func TestNoNameCarriedIntoDrainingFailsTheMap(t *testing.T) {
 	if _, err := renderA2AAuthMapDraining(agent, []agentv1alpha1.AgentProfile{testAgentProfile(agent.Namespace, "tse")}, draining); err != nil {
 		t.Errorf("the map failed with the carried draining set: %v", err)
 	}
+}
+
+// With bucketed grants, #5394's ceiling no longer cuts on the dispatcher's
+// identity entry, which doesn't grow: only the dispatch config's budget can
+// leave a profile out (#5381).
+func TestBucketedGrantsLiftTheIdentityCeiling(t *testing.T) {
+	withDispatcher(t)
+	agent := a2aTestAgent()
+	profiles := fleetScaleProfileFixtures(t, agent)
+	var bound []*agentv1alpha1.AgentProfile
+	for i := range profiles {
+		bound = append(bound, &profiles[i])
+	}
+	t.Setenv(a2aDispatcherBucketedGrantsEnvVar, "")
+	off, err := dispatcherCeilingCut(agent, bound)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withBucketedGrants(t)
+	on, err := dispatcherCeilingCut(agent, bound)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if on.limit == dispatcherCeilingLimitIdentity {
+		t.Errorf("with bucketed grants the cut stopped on the identity entry at %d", on.fit)
+	}
+	if on.fit < off.fit {
+		t.Errorf("bucketed grants fit %d profiles, fewer than the %d without", on.fit, off.fit)
+	}
+	t.Logf("fit %d (%s) without bucketed grants, %d (%s) with", off.fit, off.limit, on.fit, on.limit)
 }
