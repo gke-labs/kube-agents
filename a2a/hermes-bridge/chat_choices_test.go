@@ -71,3 +71,25 @@ func TestWordCutPrefersOutsideABracketAndStepsBackFromAConnector(t *testing.T) {
 		t.Errorf("a second ellipsis: %q, %q, %v", head, rest, ok)
 	}
 }
+
+// An in-word marker (DB__HOST, 2**20) is text to both cuts, and a bold wrap
+// whose code span holds "**" is still one bold run: the presenter's
+// test_an_in_word_marker_is_text_to_both_cuts.
+func TestAnInWordMarkerIsTextToBothCuts(t *testing.T) {
+	prose := "DB__HOST on seeded-c points to the retired replica (the one the migration retired last week after " +
+		"the failover test that moved every writer to the new pool in us-central1)."
+	if head, rest, ok := wordCut(prose); !ok || head != "DB__HOST on seeded-c points to the retired replica…" || !strings.HasPrefix(rest, "…(the one") {
+		t.Errorf("in-word __: %q, %q, %v", head, rest, ok)
+	}
+	bold := "**The `2**20` byte limit on the queue was reached before sunrise on seeded-c (the producer kept " +
+		"writing while every consumer waited on the retired replica in us-central1).**"
+	if head, rest, ok := wordCut(bold); !ok || head != "**The `2**20` byte limit on the queue was reached before sunrise on seeded-c…**" ||
+		!strings.HasPrefix(rest, "**…(the producer") || !strings.HasSuffix(rest, "**") {
+		t.Errorf("bold wrap over a code span with **: %q, %q, %v", head, rest, ok)
+	}
+	clause := "DB__HOST on seeded-c still points to the retired replica because the failover test moved every " +
+		"writer to the new pool in us-central1 and nobody moved the variable after."
+	if head, _, ok := clauseCut(clause); !ok || head != "DB__HOST on seeded-c still points to the retired replica." {
+		t.Errorf("clauseCut with an in-word __: %q, %v", head, ok)
+	}
+}

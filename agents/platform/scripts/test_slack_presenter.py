@@ -275,6 +275,23 @@ class SplitAnswerTest(unittest.TestCase):
         cut = sp.word_cut(mrkdwn)
         self.assertEqual(cut[0], "word " * 20 + "then…")
 
+    def test_an_in_word_marker_is_text_to_both_cuts(self):
+        # DB__HOST and 2**20 are text, as the rest of the presenter reads them: neither cut declines
+        # on a head that holds one, and a bold wrap whose code span holds ** is still one bold run.
+        prose = ("DB__HOST on seeded-c points to the retired replica (the one the migration retired last week after "
+                 "the failover test that moved every writer to the new pool in us-central1).")
+        headline, body = sp.split_answer(prose)
+        self.assertEqual(headline, "DB__HOST on seeded-c points to the retired replica…")
+        self.assertTrue(body[0].startswith("…(the one"), body)
+        bold = ("**The `2**20` byte limit on the queue was reached before sunrise on seeded-c (the producer kept "
+                "writing while every consumer waited on the retired replica in us-central1).**")
+        cut = sp.word_cut(bold)
+        self.assertEqual(cut[0], "**The `2**20` byte limit on the queue was reached before sunrise on seeded-c…**")
+        self.assertTrue(cut[1].startswith("**…(the producer") and cut[1].endswith("**"), cut)
+        clause = ("DB__HOST on seeded-c still points to the retired replica because the failover test moved every "
+                  "writer to the new pool in us-central1 and nobody moved the variable after.")
+        self.assertEqual(sp.clause_cut(clause)[0], "DB__HOST on seeded-c still points to the retired replica.")
+
     def test_word_cut_adds_no_second_ellipsis(self):
         # The sentence's own ellipsis stands at the cut: the headline ends on it once, and the rest
         # opens on one of its own.

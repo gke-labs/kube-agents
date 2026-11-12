@@ -759,6 +759,20 @@ def split_answer(markdown: str) -> tuple[str, list[str]]:
     return (_clip(_plain(lead), HEADLINE_MAX) if lead else ""), body
 
 
+def _bold_wrapped(sentence: str, marker: str) -> bool:
+    """Whether ``sentence`` is one bold run in ``marker`` from end to end, its code spans held, so a
+    ``**`` inside a code span does not read as a second run."""
+    held, _spans = _hold_code(sentence)
+    return len(held) > 2 * len(marker) and held.startswith(marker) and held.endswith(marker) \
+        and marker not in held[len(marker) : -len(marker)]
+
+
+def _opens_bold(head: str) -> bool:
+    """Whether ``head`` opens a bold run it does not close; an in-word marker (``DB__HOST``,
+    ``2**20``) is text, as :data:`BOLD_EDGES` reads it."""
+    return any(head.count(marker) % 2 and opener.search(head) for marker, (opener, _closer) in BOLD_EDGES.items())
+
+
 def clause_cut(sentence: str) -> tuple[str, str] | None:
     """``(headline, rest)`` for a first sentence longer than ``HEADLINE_MAX``, as markdown, or None.
 
@@ -771,10 +785,8 @@ def clause_cut(sentence: str) -> tuple[str, str] | None:
     one, is cut inside the bold, and each half stays bold.
     """
     for marker in BOLD_MARKERS:
-        inner = sentence[len(marker) : -len(marker)]
-        if len(sentence) > 2 * len(marker) and sentence.startswith(marker) and sentence.endswith(marker) \
-                and marker not in inner:
-            cut = clause_cut(inner)
+        if _bold_wrapped(sentence, marker):
+            cut = clause_cut(sentence[len(marker) : -len(marker)])
             return (f"{marker}{cut[0]}{marker}", f"{marker}{cut[1]}{marker}") if cut else None
     if len(sentence) > CLAUSE_SCAN_MAX:
         # No headline comes from past the scan, so only its prefix is read, up to its last space,
@@ -796,7 +808,7 @@ def clause_cut(sentence: str) -> tuple[str, str] | None:
         head = held[: match.start()].rstrip()
         connector = match.group("connector") is not None
         rest = held[match.end("connector") if connector else match.end() :].strip()
-        if not rest or any(head.count(marker) % 2 for marker in BOLD_MARKERS):
+        if not rest or _opens_bold(head):
             continue
         # A lone italic marker this head opens and does not close, as _first_sentence counts them.
         if any(head.replace(marker * 2, "").count(marker) % 2 and opener.search(head)
@@ -834,10 +846,8 @@ def word_cut(sentence: str) -> tuple[str, str] | None:
     to end is cut inside the bold, each half bold.
     """
     for marker in BOLD_MARKERS:
-        inner = sentence[len(marker) : -len(marker)]
-        if len(sentence) > 2 * len(marker) and sentence.startswith(marker) and sentence.endswith(marker) \
-                and marker not in inner:
-            cut = word_cut(inner)
+        if _bold_wrapped(sentence, marker):
+            cut = word_cut(sentence[len(marker) : -len(marker)])
             return (f"{marker}{cut[0]}{marker}", f"{marker}{cut[1]}{marker}") if cut else None
     if len(sentence) > CLAUSE_SCAN_MAX:
         end = sentence.rfind(" ", 0, CLAUSE_SCAN_MAX)
@@ -857,7 +867,7 @@ def word_cut(sentence: str) -> tuple[str, str] | None:
         if char != " " or any(start < offset < end for start, end in links):
             continue
         head, rest = held[:offset].rstrip(), held[offset:].strip()
-        if not rest or any(head.count(marker) % 2 for marker in BOLD_MARKERS):
+        if not rest or _opens_bold(head):
             continue
         if any(head.replace(marker * 2, "").count(marker) % 2 and opener.search(head)
                for marker, (opener, _closer) in ITALIC_EDGES.items()):

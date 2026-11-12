@@ -424,6 +424,27 @@
       "in": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx found 209 running GKE clusters across all projects in scope today.",
       "headline": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx found…",
       "body": ["…209 running GKE clusters across all projects in scope today."]
+    },
+    {
+      "in": "DB__HOST on seeded-c points to the retired replica (the one the migration retired last week after the failover test that moved every writer to the new pool in us-central1).",
+      "headline": "DB__HOST on seeded-c points to the retired replica…",
+      "body": [
+        "…(the one the migration retired last week after the failover test that moved every writer to the new pool in us-central1)."
+      ]
+    },
+    {
+      "in": "**The `2**20` byte limit on the queue was reached before sunrise on seeded-c (the producer kept writing while every consumer waited on the retired replica in us-central1).**",
+      "headline": "The 2**20 byte limit on the queue was reached before sunrise on seeded-c…",
+      "body": [
+        "**…(the producer kept writing while every consumer waited on the retired replica in us-central1).**"
+      ]
+    },
+    {
+      "in": "DB__HOST on seeded-c still points to the retired replica because the failover test moved every writer to the new pool in us-central1 and nobody moved the variable after.",
+      "headline": "DB__HOST on seeded-c still points to the retired replica.",
+      "body": [
+        "Because the failover test moved every writer to the new pool in us-central1 and nobody moved the variable after."
+      ]
     }
   ],
   "plain": [

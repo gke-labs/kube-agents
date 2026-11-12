@@ -109,6 +109,26 @@ var (
 	nextStepRefused = regexp.MustCompile(`[<>|\[\]]`)
 )
 
+// boldWrapped is _bold_wrapped: whether sentence is one bold run in marker
+// from end to end, its code spans held, so a "**" inside a code span does not
+// read as a second run.
+func boldWrapped(sentence, marker string) bool {
+	held, _ := holdCode(sentence)
+	return len(held) > 2*len(marker) && strings.HasPrefix(held, marker) && strings.HasSuffix(held, marker) &&
+		!strings.Contains(held[len(marker):len(held)-len(marker)], marker)
+}
+
+// opensBold is _opens_bold: whether h opens a bold run it does not close; an
+// in-word marker (DB__HOST, 2**20) is text, as openerIn reads it.
+func opensBold(h string) bool {
+	for _, marker := range boldMarkers {
+		if strings.Count(h, marker)%2 == 1 && openerIn(h, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 // clauseCut is slack_presenter.clause_cut: the headline and the rest for a
 // first sentence longer than the headline cap, cut at its last clause break
 // outside a code span, a bracket and a bold run that leaves a headline of
@@ -117,9 +137,8 @@ var (
 // as_line capitalizes one.
 func clauseCut(sentence string) (string, string, bool) {
 	// A sentence bold end to end is cut inside the bold, each half kept bold.
-	for _, marker := range []string{"**", "__"} {
-		if len(sentence) > 2*len(marker) && strings.HasPrefix(sentence, marker) && strings.HasSuffix(sentence, marker) &&
-			!strings.Contains(sentence[len(marker):len(sentence)-len(marker)], marker) {
+	for _, marker := range boldMarkers {
+		if boldWrapped(sentence, marker) {
 			head, rest, ok := clauseCut(sentence[len(marker) : len(sentence)-len(marker)])
 			if !ok {
 				return "", "", false
@@ -173,7 +192,7 @@ func clauseCut(sentence string) (string, string, bool) {
 			from = m[3]
 		}
 		r := pyStrip(held[from:])
-		if r == "" || strings.Count(h, "**")%2 == 1 || strings.Count(h, "__")%2 == 1 {
+		if r == "" || opensBold(h) {
 			continue
 		}
 		if !connector && clauseRelative.MatchString(r) {
@@ -225,8 +244,7 @@ func clauseCut(sentence string) (string, string, bool) {
 // sentence bold end to end is cut inside the bold.
 func wordCut(sentence string) (string, string, bool) {
 	for _, marker := range boldMarkers {
-		if len(sentence) > 2*len(marker) && strings.HasPrefix(sentence, marker) && strings.HasSuffix(sentence, marker) &&
-			!strings.Contains(sentence[len(marker):len(sentence)-len(marker)], marker) {
+		if boldWrapped(sentence, marker) {
 			head, rest, ok := wordCut(sentence[len(marker) : len(sentence)-len(marker)])
 			if !ok {
 				return "", "", false
@@ -268,7 +286,7 @@ func wordCut(sentence string) (string, string, bool) {
 		}
 		h := strings.TrimRightFunc(held[:i], isPySpace)
 		r := pyStrip(held[i:])
-		if r == "" || strings.Count(h, "**")%2 == 1 || strings.Count(h, "__")%2 == 1 {
+		if r == "" || opensBold(h) {
 			continue
 		}
 		italic := false
