@@ -283,3 +283,39 @@ func TestAProfileNamedForABucketUserIsRefusedAlone(t *testing.T) {
 		t.Errorf("the map failed for every principal: %v", err)
 	}
 }
+
+// Every name the map's mirror refuses as a draining name is also one
+// drainingDispatchProfiles doesn't carry: a callout-authenticated map user
+// (agent, session, the dispatcher itself), a static principal, the callout's
+// user, and a bucket user whatever the switch says. So a profile that held
+// one while live leaves without failing the map for its drain window
+// (#5553, round 2).
+func TestNoNameCarriedIntoDrainingFailsTheMap(t *testing.T) {
+	withDispatcher(t)
+	withBucketedGrants(t)
+	withOperatorBusPrincipal(t)
+	agent := authMapTestAgent()
+	excluded := a2aDrainingNameExclusions(agent)
+	var applied a2aDispatchConfig
+	for _, name := range append(append([]string{}, excluded...), "dispatcher-b3", "gone") {
+		if isDNS1123LabelToken(name) {
+			applied.Profiles = append(applied.Profiles, a2aDispatchProfile{Name: name, Tiers: []string{"read"}})
+		}
+	}
+	draining := drainingDispatchProfiles(&applied, map[string]bool{}, time.Now(), excluded...)
+	if len(draining) != 1 || draining[0].Name != "gone" {
+		var got []string
+		for _, d := range draining {
+			got = append(got, d.Name)
+		}
+		t.Fatalf("draining = %v, want gone alone", got)
+	}
+	for _, want := range []string{a2aDispatcherUser, "dispatcher-b3"} {
+		if a2aCanDrainAs(want, excluded) {
+			t.Errorf("%q can drain", want)
+		}
+	}
+	if _, err := renderA2AAuthMapDraining(agent, []agentv1alpha1.AgentProfile{testAgentProfile(agent.Namespace, "tse")}, draining); err != nil {
+		t.Errorf("the map failed with the carried draining set: %v", err)
+	}
+}
