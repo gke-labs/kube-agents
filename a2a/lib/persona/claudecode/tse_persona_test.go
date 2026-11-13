@@ -25,7 +25,7 @@ const (
 )
 
 // The tse persona loads, and renders for Claude Code without a warning: its
-// skill, both broker servers with their read tools, and the built-ins it does
+// skill, its one broker server with its read tools, and the built-ins it does
 // not grant denied.
 func TestTheTsePersonaRendersWhole(t *testing.T) {
 	p := load(t, tsePersonaDir)

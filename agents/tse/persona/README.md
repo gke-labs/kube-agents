@@ -39,7 +39,8 @@ tracks project-scoped tasks.
 What it holds:
 
 - [`persona.yaml`](persona.yaml): the manifest, with the three parameters and
-  the tools it grants (`read_file`, `shell`, `web_search` and the two servers);
+  the tools it grants (`read_file`, `shell`, `web_search` and the one server,
+  `developer_knowledge`);
 - [`instructions.md`](instructions.md): the instructions, from `SOUL.md`,
   `AGENTS.md` and `CAPABILITIES.md`;
 - [`mcp.yaml`](mcp.yaml): the `developer_knowledge` server on the broker's
@@ -47,9 +48,10 @@ What it holds:
   server is left out: the broker refuses it to profile workers, whose `kubectl`
   and `gcloud` reach the task's target instead;
 - the [`support-escalation-bundle`](skills/support-escalation-bundle/SKILL.md)
-  skill: its `agents/tse/skills` source with only the edit
+  skill: its `agents/tse/skills` source with only the two edits
   `a2a/lib/persona/claudecode/tse_persona_test.go` lists (the bundle's
-  variables set from the task's target). The same test fails if they drift.
+  variables set from the task's target, and the serial-port read's
+  regional-target note). The same test fails if they drift.
   The platform-agent image's skill manifest does not hash its copy under
   `/opt/tse-template/persona`, because nothing in that image loads it.
 
