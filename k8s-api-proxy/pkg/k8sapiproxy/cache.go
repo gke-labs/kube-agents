@@ -60,6 +60,10 @@ const (
 	maxCacheBodyBytes      = 64 << 20
 	maxEntryHitCount       = 15
 	cacheKeyHashBytes      = 16
+	// cacheKeyFieldSeparator separates the fields hashed into a key; the partition, which an
+	// embedder chooses, is prefixed by its length and cacheKeyLengthSeparator instead.
+	cacheKeyFieldSeparator  = "\x00"
+	cacheKeyLengthSeparator = ":"
 
 	defaultMaxStaleDuration     = 24 * time.Hour
 	maxDeltaSeconds             = 1 << 31
@@ -1259,7 +1263,8 @@ func buildCacheKey(clusterID, partition string, req *http.Request, callerAccept 
 		accept = normalizeAcceptHeader(req.Header)
 	}
 	encoding := normalizeAcceptEncoding(req.Header)
-	raw := strconv.Itoa(len(partition)) + ":" + partition + "\x00" + clusterID + "\x00" + req.Method + "\x00" + req.URL.Path + "\x00" + query + "\x00" + accept + "\x00" + encoding
+	raw := strconv.Itoa(len(partition)) + cacheKeyLengthSeparator + partition + cacheKeyFieldSeparator +
+		strings.Join([]string{clusterID, req.Method, req.URL.Path, query, accept, encoding}, cacheKeyFieldSeparator)
 	sum := sha256.Sum256([]byte(raw))
 	return "k8s:" + clusterID + ":" + hex.EncodeToString(sum[:cacheKeyHashBytes])
 }

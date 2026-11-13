@@ -33,10 +33,6 @@ func (tenantAuthenticator) AuthenticateRequest(r *http.Request) (*CallerIdentity
 	return &CallerIdentity{Username: "actor/" + tenant + "/session", Groups: []string{"tenant:" + tenant}}, nil
 }
 
-type recordingAuditSink struct{ events *[]AuditEvent }
-
-func (s recordingAuditSink) Record(_ context.Context, e AuditEvent) { *s.events = append(*s.events, e) }
-
 // partitionByTenant puts every session of a tenant in one partition.
 func partitionByTenant(c *CallerIdentity) string {
 	return strings.TrimPrefix(c.Groups[0], "tenant:")
@@ -213,11 +209,11 @@ func TestPartitionFromContextReportsWhetherOneWasSet(t *testing.T) {
 
 // A panic in the embedder's func is audited as a panic, not as a forwarded request.
 func TestHandlerCallerPartitionPanicIsNotRecordedAsForwarded(t *testing.T) {
-	var events []AuditEvent
+	sink := &recordingSink{}
 	h, upstream := newTestHandler(t, Config{
 		Authenticator:   tenantAuthenticator{},
 		CallerPartition: func(*CallerIdentity) string { panic("partition func") },
-		Audit:           recordingAuditSink{events: &events},
+		Audit:           sink,
 	})
 
 	func() {
@@ -228,8 +224,8 @@ func TestHandlerCallerPartitionPanicIsNotRecordedAsForwarded(t *testing.T) {
 	if upstream.calls != 0 {
 		t.Errorf("upstream calls = %d, want 0", upstream.calls)
 	}
-	if len(events) != 1 || events[0].Outcome == OutcomeForwarded {
-		t.Errorf("audit events = %+v, want one not recorded as forwarded", events)
+	if len(sink.events) != 1 || sink.events[0].Outcome == OutcomeForwarded {
+		t.Errorf("audit events = %+v, want one not recorded as forwarded", sink.events)
 	}
 }
 

@@ -63,7 +63,8 @@ type Config struct {
 	// an upstream fetch only within one partition, and the Upstream reads it with
 	// PartitionFromContext. Nil puts every caller in one partition: the handler then shares
 	// responses across callers, which is safe only when the Upstream uses one credential.
-	// It runs once per forwarded request, with a non-nil caller, and must not panic.
+	// It runs once per authenticated request, refused ones included, with a non-nil caller,
+	// and must not panic.
 	CallerPartition func(*CallerIdentity) string
 	// MaxInFlight caps the forwarded requests in flight; one over it is answered 429 with
 	// Retry-After. Each in-flight response holds upstream buffers in the proxy, so the cap
