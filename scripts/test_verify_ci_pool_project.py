@@ -4495,13 +4495,50 @@ FLEET_RESOURCE_ROLES = {
     # runs bench/tf/fleet/seeded_b_pin.py, whose reads are `gcloud container
     # get-server-config` and `clusters describe` as the reconciler.
     "external": {"roles/container.admin"},
-    "google_client_config": set(),
 }
 # Every kubernetes_* resource is an in-cluster write, which container.admin
 # grants through the GKE IAM webhook.
 FLEET_KUBERNETES_ROLES = {"roles/container.admin"}
 # Needed by every google_* call regardless of type.
 FLEET_PROVIDER_ROLES = {"roles/serviceusage.serviceUsageConsumer"}
+
+
+class FleetKubernetesProvidersUseExecAuthTest(unittest.TestCase):
+    """Every `provider "kubernetes"` block in the fleet stack authenticates
+    through gke-gcloud-auth-plugin on each call and carries no `token`.
+
+    hack/fleet_reconcile.py saves the plan and applies it, so a token read at
+    plan time travels inside the plan and is dead an hour later; a project
+    whose node pools roll before its in-cluster fixtures then fails every
+    Kubernetes write with Unauthorized.
+    """
+
+    _FLEET = checker._ROOT / "bench" / "tf" / "fleet"
+    _PLUGIN = "gke-gcloud-auth-plugin"
+    _HEADER = re.compile(r'^provider\s+"kubernetes"\s*\{', re.M)
+
+    @classmethod
+    def _provider_blocks(cls, fleet):
+        """(file name, block text) for each kubernetes provider block."""
+        blocks = []
+        for path in sorted(fleet.glob("*.tf")):
+            text = path.read_text()
+            for match in cls._HEADER.finditer(text):
+                depth, start = 0, match.end() - 1
+                for index in range(start, len(text)):
+                    depth += {"{": 1, "}": -1}.get(text[index], 0)
+                    if depth == 0:
+                        blocks.append((path.name, text[match.start():index + 1]))
+                        break
+        return blocks
+
+    def test_every_kubernetes_provider_runs_the_plugin_and_bakes_no_token(self):
+        blocks = self._provider_blocks(self._FLEET)
+        self.assertTrue(blocks, 'no provider "kubernetes" block under %s' % self._FLEET)
+        for name, block in blocks:
+            with self.subTest(file=name):
+                self.assertIsNone(re.search(r"^\s*token\s*=", block, re.M), "%s: a kubernetes provider reads a token at plan time" % name)
+                self.assertRegex(block, r'exec\s*\{[^}]*command\s*=\s*"%s"' % re.escape(self._PLUGIN), "%s: a kubernetes provider without the exec plugin" % name)
 
 
 class FleetResourceTypesAreCoveredByReconcilerRolesTest(unittest.TestCase):
