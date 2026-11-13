@@ -45,9 +45,10 @@ const (
 // terminationLogPath is the kubelet's default terminationMessagePath.
 var terminationLogPath = "/dev/termination-log"
 
-// terminationLogMode is the termination message's file mode: the kubelet
-// reads it from outside the container.
-const terminationLogMode = 0o644
+// terminationLogMode is the termination message's file mode: owner-only,
+// as gosec's G306 asks. The kubelet reads the file through its host-side
+// mount, not as the container's user, so it still reads it.
+const terminationLogMode = 0o600
 
 func main() {
 	os.Exit(run())
