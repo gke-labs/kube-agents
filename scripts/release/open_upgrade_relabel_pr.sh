@@ -7,8 +7,8 @@
 # fetched. scripts/relabel_upgrade_table_pending.py rewrites each `pending` row a release contains to
 # that release, by the rule `make docs-check-upgrade-releases` checks, so the check on main is not left
 # failing until someone relabels the rows by hand. With nothing to relabel it changes nothing. Otherwise
-# it pushes the relabel to a branch named for the release and opens a pull request against main, or
-# updates the branch of one already open (a re-run). The pull request still needs a reviewer: this
+# it pushes the relabel to one fixed branch and opens a pull request against main, or updates the branch
+# of the one already open (a re-run, or a later release while the first is unmerged). The pull request still needs a reviewer: this
 # writes no commit to main itself.
 set -euo pipefail
 
@@ -24,16 +24,17 @@ fi
 validate_pure_numeric_semver "${RELEASE_VERSION}" "Release version" || exit 1
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
-UPGRADE_PAGE="docs/site/src/content/docs/install/upgrade.md"
-BASE_BRANCH="main"
-# Not under release/: the kube-agents-release-lines ruleset guards refs/heads/release/** for the lines.
-RELABEL_BRANCH="relabel-upgrade-table/${RELEASE_VERSION}"
+readonly REPO_ROOT
+readonly UPGRADE_PAGE="docs/site/src/content/docs/install/upgrade.md"
+readonly BASE_BRANCH="main"
+# One branch for every release, not one per release: a release cut while an earlier relabel pull request
+# is still open finds it and updates it, rather than opening a second for the same rows. Not under
+# release/: the kube-agents-release-lines ruleset guards refs/heads/release/** for the lines.
+readonly RELABEL_BRANCH="relabel-upgrade-table/pending"
 # The version CI's prettier check pins (.github/workflows/prettier.yml).
-PRETTIER_VERSION="3.9.6"
-COMMIT_MESSAGE="docs(upgrade): relabel the rows ${RELEASE_VERSION} shipped from pending"
-PR_TITLE="docs(upgrade): relabel the rows ${RELEASE_VERSION} shipped, fixing main's Documentation Checks"
-GIT_USER_NAME="kube-agents release bot"
-GIT_USER_EMAIL="${GIT_USER_EMAIL:-kube-agents-release-bot@users.noreply.github.com}"
+readonly PRETTIER_VERSION="3.9.6"
+readonly GIT_USER_NAME="kube-agents release bot"
+readonly GIT_USER_EMAIL="${GIT_USER_EMAIL:-kube-agents-release-bot@users.noreply.github.com}"
 
 cd "${REPO_ROOT}"
 
@@ -52,10 +53,16 @@ if git diff --quiet -- "${UPGRADE_PAGE}"; then
   exit 0
 fi
 
-rows="$(printf '%s\n' "${relabelled}" | awk -F '\t' '{printf "- `%s` → %s\n", $2, $1}')"
+# A change cell can hold its own code span, so a cell with a backtick is fenced with two.
+rows="$(printf '%s\n' "${relabelled}" | awk -F '\t' '{f = index($2, "`") ? "``" : "`"; s = index($2, "`") ? " " : ""; printf "- %s%s%s%s%s → %s\n", f, s, $2, s, f, $1}')"
+# The releases the rows are labelled with, which are not always RELEASE_VERSION: a row an earlier release
+# shipped, still pending because its relabel has not merged, takes that release.
+releases="$(printf '%s\n' "${relabelled}" | cut -f1 | sort -u -t. -k1,1n -k2,2n -k3,3n | paste -sd, - | sed 's/,/, /g')"
+commit_message="docs(upgrade): relabel the pending rows ${releases} shipped"
+pr_title="docs(upgrade): relabel the pending rows ${releases} shipped, fixing main's Documentation Checks"
 
 git switch -C "${RELABEL_BRANCH}"
-git -c user.name="${GIT_USER_NAME}" -c user.email="${GIT_USER_EMAIL}" commit --quiet -m "${COMMIT_MESSAGE}" -- "${UPGRADE_PAGE}"
+git -c user.name="${GIT_USER_NAME}" -c user.email="${GIT_USER_EMAIL}" commit --quiet -m "${commit_message}" -- "${UPGRADE_PAGE}"
 # The branch is this script's own, named for the release, so a re-run replaces it. The checkout keeps no
 # credentials (persist-credentials: false); the token is handed to this one push as a header.
 push_auth=()
@@ -72,7 +79,7 @@ ${rows}
 
 Until they're relabelled, \`make docs-check-upgrade-releases\` (Documentation Checks) fails on every push to main. This change only rewrites their Release cells, by the rule that check uses (\`scripts/relabel_upgrade_table_pending.py\`). Approving it turns main's docs check green again.
 
-Opened by the release workflow after it tagged ${RELEASE_VERSION} (#5673).
+Opened by the release workflow after it tagged ${RELEASE_VERSION} (#5673). A later release updates this pull request, rather than opening another, while it is open.
 EOF
 
 existing="$(gh pr list --base "${BASE_BRANCH}" --head "${RELABEL_BRANCH}" --state open --json number --jq '.[0].number // empty')"
@@ -80,4 +87,4 @@ if [ -n "${existing}" ]; then
   echo "✅ Updated the branch of the open relabel pull request #${existing}."
   exit 0
 fi
-gh pr create --base "${BASE_BRANCH}" --head "${RELABEL_BRANCH}" --title "${PR_TITLE}" --body "${body}"
+gh pr create --base "${BASE_BRANCH}" --head "${RELABEL_BRANCH}" --title "${pr_title}" --body "${body}"

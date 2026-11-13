@@ -28,7 +28,7 @@ COPIED = (
     "scripts/check_upgrade_table_releases.py",
 )
 SCRIPT = "scripts/release/open_upgrade_relabel_pr.sh"
-BRANCH = "relabel-upgrade-table/1.0.0"
+BRANCH = "relabel-upgrade-table/pending"
 STUB = """#!/bin/sh
 echo "$(basename "$0") $*" >> "{log}"
 if [ "$(basename "$0")" = npx ]; then echo "npx GH_TOKEN=${{GH_TOKEN:-unset}}" >> "{log}"; fi
@@ -89,7 +89,7 @@ class OpenUpgradeRelabelPrTest(unittest.TestCase):
         self.assertEqual(len(create), 1, self.calls())
         self.assertIn("--base main", create[0])
         self.assertIn(f"--head {BRANCH}", create[0])
-        self.assertIn("relabel the rows 1.0.0 shipped, fixing main's Documentation Checks", create[0])
+        self.assertIn("relabel the pending rows 1.0.0 shipped, fixing main's Documentation Checks", create[0])
         self.assertIn("`a shipped change` → 1.0.0", self.log.read_text(encoding="utf-8"))
         self.assertTrue(any(c.startswith("npx --yes prettier@3.9.6 --write") for c in self.calls()))
 
@@ -118,6 +118,28 @@ class OpenUpgradeRelabelPrTest(unittest.TestCase):
         self.assertIn("#4242", result.stdout)
         self.assertTrue(self.origin_has(f"refs/heads/{BRANCH}"))
         self.assertFalse(any(c.startswith("gh pr create") for c in self.calls()))
+
+    def test_a_later_release_names_each_rows_own_release_and_reuses_the_branch(self):
+        """A row 1.0.0 shipped, still pending because its relabel has not merged, keeps 1.0.0 when 1.1.0's
+        run relabels it with a row 1.1.0 shipped, and the run reuses the one branch."""
+        self.repo.commit("feat: first", row=row("pending", "a first change"))
+        self.repo.tag("1.0.0")
+        self.repo.commit("feat: second", row=row("pending", "a second change"))
+        self.repo.tag("1.1.0")
+        result = self.run_script(version="1.1.0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.origin_has(f"refs/heads/{BRANCH}"))
+        create = [c for c in self.calls() if c.startswith("gh pr create")]
+        self.assertIn("relabel the pending rows 1.0.0, 1.1.0 shipped", create[0])
+        log = self.log.read_text(encoding="utf-8")
+        self.assertIn("`a first change` → 1.0.0", log)
+        self.assertIn("`a second change` → 1.1.0", log)
+
+    def test_a_change_cell_with_a_code_span_is_fenced_with_two_backticks(self):
+        self.repo.commit("feat: code", row=row("pending", "the `spec.mode` field moves"))
+        self.repo.tag("1.0.0")
+        self.run_script()
+        self.assertIn("- `` the `spec.mode` field moves `` → 1.0.0", self.log.read_text(encoding="utf-8"))
 
     def test_a_version_that_is_not_a_release_number_is_refused(self):
         result = self.run_script(version="v1.0")
