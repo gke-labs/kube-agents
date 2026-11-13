@@ -22,11 +22,20 @@ scale (a handful of fixes, :data:`READS_PER_TICK` reads a tick) that costs
 little. No model is involved, and nothing here posts: the reporter (a later
 step) decides what to say, under ``KUBEAGENTS_POST_MERGE_CHECK``. Nothing
 schedules it yet; ``post_merge_check.py notice`` is one tick.
+
+Step 3, wait until applied, will read the GitOps reconcilers that deliver the
+repository into the record's namespace (:func:`reconcilers_for`) against the
+merge commit (:func:`combined_sync`, over ``reconciler_sync``), asking the
+broker (:func:`forge_contains`) whether a later applied commit contains it,
+and :class:`SandboxKubectl` reads a cluster through the shell sandbox.
+Nothing calls these helpers yet; the step that uses them comes next.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 import sqlite3
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
@@ -144,6 +153,193 @@ def notice_merges(
             bucket = "failed"
         seen[bucket].append(url)
     return seen
+
+
+# --------------------------------------------------------------------------
+# Step 3, wait until applied: reading reconcilers and selectors
+# --------------------------------------------------------------------------
+
+#: The reconciler objects that can deliver a merge, as kubectl names them.
+ARGO_APPLICATIONS = "applications.argoproj.io"
+FLUX_KUSTOMIZATIONS = "kustomizations.kustomize.toolkit.fluxcd.io"
+FLUX_GIT_REPOSITORIES = "gitrepositories.source.toolkit.fluxcd.io"
+#: Named so a test can show it never counts; not read, since a RootSync names no namespace.
+CONFIGSYNC_ROOTSYNCS = "rootsyncs.configsync.gke.io"
+CONFIGSYNC_REPOSYNCS = "reposyncs.configsync.gke.io"
+#: The lists one tick reads per cluster.
+RECONCILER_RESOURCES = (ARGO_APPLICATIONS, FLUX_KUSTOMIZATIONS, FLUX_GIT_REPOSITORIES, CONFIGSYNC_REPOSYNCS)
+#: An Argo CD Application deploys to the cluster it runs on when its
+#: destination names this server or this name (or none).
+ARGO_IN_CLUSTER = ({"", "https://kubernetes.default.svc"}, {"", "in-cluster"})
+#: kubectl's answers for a resource type the cluster does not serve, and for an object that is gone.
+NOT_SERVED = "doesn't have a resource type"
+NOT_FOUND = "NotFound"
+KUBECTL_REQUEST_TIMEOUT_SECONDS = 20
+KUBECTL_HOP_TIMEOUT_SECONDS = 45
+
+
+class ClusterReadError(RuntimeError):
+    """A cluster read that did not answer."""
+
+
+class WorkloadGone(ClusterReadError):
+    """The workload the fix is for no longer exists, or cannot be judged."""
+
+
+#: Reads one cluster: ``kubectl_json(record, argv)`` -> the parsed ``-o json`` answer,
+#: ``{"items": []}`` for a resource type the cluster does not serve. Raises
+#: :class:`WorkloadGone` for an object kubectl reports NotFound.
+KubectlJson = Callable[[dict, list], dict]
+
+
+def forge_contains(repo: str, ancestor: str, revision: str) -> bool | None:
+    """The broker's ``revision-contains`` answer; None when it cannot say."""
+    try:
+        import forge
+
+        answer = forge.call(
+            "revision-contains", {"ancestor": ancestor, "revision": revision}, repo,
+            retry_transient=True, timeout_s=VIEW_TIMEOUT_SECONDS * 3,
+        )
+    except Exception as exc:  # noqa: BLE001 — unknown ancestry reads as unconfirmed
+        logger.warning("post-merge check: could not ask whether %s contains %s: %r", revision, ancestor, exc)
+        return None
+    contains = answer.get("contains") if isinstance(answer, dict) else None
+    return contains if isinstance(contains, bool) else None
+
+
+def _repo_key(url: object) -> str:
+    """A git url as one comparable key: host and path, lower-case, no scheme, user, ``.git`` or trailing slash."""
+    text = str(url or "").strip().lower()
+    text = re.sub(r"^[a-z+]+://", "", text)
+    if "@" in text.split("/", 1)[0]:
+        text = text.split("@", 1)[1].replace(":", "/", 1)
+    return re.sub(r"(\.git)?/*$", "", text)
+
+
+def reconcilers_for(repo: str, namespace: str, lists: dict[str, dict]) -> list[dict]:
+    """The reconciler objects on this cluster that deliver ``repo`` into ``namespace``.
+
+    An Argo CD Application counts when one of its Git sources is ``repo``, it
+    deploys to this cluster and its destination namespace is ``namespace``; a
+    Flux Kustomization when its GitRepository is ``repo`` and its
+    ``targetNamespace`` is ``namespace``; a Config Sync RepoSync in ``namespace``
+    with ``repo`` as its source. A RootSync names no namespace, so it never
+    counts: with nothing targeting the namespace, the fix is observed directly.
+    ``lists`` maps the resource names above to their ``kubectl get -A -o json`` answers.
+    """
+    key = _repo_key(repo)
+    found = []
+    for app in lists.get(ARGO_APPLICATIONS, {}).get("items", []):
+        spec = app.get("spec") or {}
+        destination = spec.get("destination") or {}
+        if str(destination.get("server") or "") not in ARGO_IN_CLUSTER[0] or str(destination.get("name") or "") not in ARGO_IN_CLUSTER[1]:
+            continue
+        sources = ([spec["source"]] if isinstance(spec.get("source"), dict) else []) + list(spec.get("sources") or [])
+        if destination.get("namespace") == namespace and any(
+            _repo_key(source.get("repoURL")) == key for source in sources if isinstance(source, dict)
+        ):
+            found.append(app)
+    repositories = {
+        ((r.get("metadata") or {}).get("namespace"), (r.get("metadata") or {}).get("name")): r
+        for r in lists.get(FLUX_GIT_REPOSITORIES, {}).get("items", [])
+    }
+    for kustomization in lists.get(FLUX_KUSTOMIZATIONS, {}).get("items", []):
+        meta, spec = kustomization.get("metadata") or {}, kustomization.get("spec") or {}
+        ref = spec.get("sourceRef") or {}
+        source = repositories.get((ref.get("namespace") or meta.get("namespace"), ref.get("name")))
+        if (ref.get("kind") == "GitRepository" and source and spec.get("targetNamespace") == namespace
+                and _repo_key((source.get("spec") or {}).get("url")) == key):
+            found.append(kustomization)
+    for sync in lists.get(CONFIGSYNC_REPOSYNCS, {}).get("items", []):
+        git = (sync.get("spec") or {}).get("git") or {}
+        if (sync.get("metadata") or {}).get("namespace") == namespace and _repo_key(git.get("repo")) == key:
+            found.append(sync)
+    return found
+
+
+def combined_sync(objects: list[dict], merge_commit: str, contains: Callable[[str, str], "bool | None"] | None = None) -> tuple[str, str]:
+    """``(state, detail)`` over the reconcilers that deliver the fix: applied only when every one is."""
+    import reconciler_sync
+
+    if not objects:
+        return reconciler_sync.UNKNOWN, "no reconciler delivers the fix"
+    readings = []
+    for obj in objects:
+        try:
+            readings.append(reconciler_sync.read_sync(obj, merge_commit, contains))
+        except (TypeError, ValueError) as exc:
+            readings.append(reconciler_sync.SyncReading(reconciler_sync.UNKNOWN, "", "", str(exc)))
+    for state in (reconciler_sync.ERROR, reconciler_sync.UNKNOWN, reconciler_sync.UNCONFIRMED, reconciler_sync.PENDING):
+        for reading in readings:
+            if reading.state == state:
+                return state, reading.detail
+    return reconciler_sync.APPLIED, readings[0].detail
+
+
+SELECTOR_OPERATORS = {"In": "in", "NotIn": "notin"}
+
+
+def label_selector(selector: dict) -> str:
+    """A Kubernetes LabelSelector as kubectl's ``-l`` text, ``matchExpressions`` included."""
+    parts = [f"{key}={value}" for key, value in sorted((selector.get("matchLabels") or {}).items())]
+    for expression in selector.get("matchExpressions") or []:
+        key, operator, values = expression.get("key"), expression.get("operator"), expression.get("values") or []
+        if operator in SELECTOR_OPERATORS:
+            parts.append(f"{key} {SELECTOR_OPERATORS[operator]} ({','.join(values)})")
+        elif operator == "Exists":
+            parts.append(str(key))
+        elif operator == "DoesNotExist":
+            parts.append(f"!{key}")
+        else:
+            raise WorkloadGone(f"the selector operator {operator!r} is not one the health window reads")
+    return ",".join(parts)
+
+
+def selects(selector: dict, labels: dict) -> bool:
+    """Whether a LabelSelector matches ``labels`` (a pod template's)."""
+    if any(labels.get(key) != value for key, value in (selector.get("matchLabels") or {}).items()):
+        return False
+    for expression in selector.get("matchExpressions") or []:
+        key, operator, values = expression.get("key"), expression.get("operator"), expression.get("values") or []
+        if (operator == "In" and labels.get(key) not in values) or (operator == "NotIn" and labels.get(key) in values) \
+                or (operator == "Exists" and key not in labels) or (operator == "DoesNotExist" and key in labels):
+            return False
+    return bool(selector.get("matchLabels") or selector.get("matchExpressions"))
+
+
+class SandboxKubectl:
+    """``kubectl ... -o json`` in the shell sandbox, against the record's cluster.
+
+    The agent pod carries no kubectl (``sandbox_exec``). Credentials are the
+    stall watch's per-cluster kubeconfig in the hermes-owned directory, fetched
+    once per cluster per run.
+    """
+
+    def __init__(self) -> None:
+        self.kubeconfigs: dict[tuple[str, str, str], str] = {}
+
+    def __call__(self, record: dict, argv: list) -> dict:
+        import stall_watch
+
+        key = (record["project"], record["cluster"], record["location"])
+        if key not in self.kubeconfigs:
+            self.kubeconfigs[key] = stall_watch.fetch_credentials(*key)
+        done = stall_watch.run_sandbox(
+            ["kubectl", *argv, f"--request-timeout={KUBECTL_REQUEST_TIMEOUT_SECONDS}s"],
+            timeout=KUBECTL_HOP_TIMEOUT_SECONDS,
+            kubeconfig=self.kubeconfigs[key],
+        )
+        if done.returncode != 0:
+            stderr = done.stderr or ""
+            if NOT_SERVED in stderr:
+                return {"items": []}
+            if NOT_FOUND in stderr and "-A" in argv:
+                return {"items": []}  # a list that 404s is a kind this cluster no longer serves, not a gone workload
+            if NOT_FOUND in stderr:
+                raise WorkloadGone(stall_watch.stderr_excerpt(stderr))
+            raise ClusterReadError(stall_watch.stderr_excerpt(stderr))
+        return json.loads(done.stdout or "{}")
 
 
 #: Session KV's database, as ``session_kv_server.py`` reads the same variable.
