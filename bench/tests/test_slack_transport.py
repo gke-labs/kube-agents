@@ -336,3 +336,21 @@ def test_a_typed_answer_waits_while_the_first_ask_is_marked_in_flight():
     assert then.outcome == "settled"
     assert then.deliverable == "Left as it is.", "settled on the interim post while the first ask was still marked"
     assert then.reaction == "" and then.reaction_seen is None, "the first ask's mark was read as the reply's own"
+
+
+def test_a_follow_up_after_a_failed_first_turn_settles():
+    """A failed first ask keeps its ❌ for good; it must not hold the follow-up to the deadline."""
+    later = {"ts": "1800000012.000100", "user": BOT, "text": "Here is what I can do."}
+
+    class FailedFirst(ThreadSlack):
+        def call(self, method, **params):
+            if method == "reactions.get":
+                on_root = params.get("timestamp") == ASK_TS
+                return {"ok": True, "message": {"reactions": [{"name": "x", "users": [BOT]}] if on_root else []}}
+            return super().call(method, **params)
+
+    fake = FailedFirst([{"replies": [ANSWER]}, {"replies": [ANSWER]}, {"replies": [ANSWER, later]}])
+    turn = _turn(fake, FakeClock())
+    first = turn.run("q", 60)
+    then = turn.follow_up(first, "and?", 300)
+    assert then.outcome == "settled" and then.deliverable == later["text"]

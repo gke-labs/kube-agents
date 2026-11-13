@@ -86,6 +86,9 @@ POLL_SECONDS = 2.0
 # The bot's reactions that end a turn rather than mark it in flight: blocked and
 # failed (slackMarkEmoji in a2a/gateway/slack_reactions.go).
 SETTLE_REACTIONS = frozenset({"double_vertical_bar", "x"})
+# The blocked mark alone: a typed answer continues a paused ask, which keeps ⏸️
+# until the continuing task draws its first mark. A failed ask's ❌ never lifts.
+BLOCKED_REACTION = "double_vertical_bar"
 # How long the thread must stay unchanged, after the reaction is gone, for the
 # turn to count as settled: long enough to cover the gap between a status line's
 # last edit and the answer's post.
@@ -288,9 +291,10 @@ class SlackTurn:
 
         also_marked is a continued ask's message (a typed answer's first ask). Its
         reactions never count as ex's own; they hold the turn open while it is in
-        flight, and while it still carries the settle mark Turn 1 left on it (the
-        gateway keeps ⏸️ until the continuing task draws its first mark), since
-        until then the answer has not visibly taken.
+        flight, and while it still carries the ⏸️ Turn 1 left on it (the gateway
+        keeps it until the continuing task draws its first mark), since until
+        then the answer has not visibly taken. A ❌ Turn 1 left never lifts, so
+        it holds nothing.
         """
         after = ts_value(ex.ask_ts)
         left_by_first = set(self._bot_reactions(also_marked)) if also_marked else set()
@@ -316,7 +320,7 @@ class SlackTurn:
             # it after the ask's), so any settle mark ends the turn.
             reacting = bool(names) and not SETTLE_REACTIONS.intersection(names)
             if also_marked and ((continued and not SETTLE_REACTIONS & continued)
-                                or (SETTLE_REACTIONS & left_by_first and continued == left_by_first)):
+                                or (BLOCKED_REACTION in left_by_first and continued == left_by_first)):
                 reacting = True
             shape = tuple((p.get("ts"), (p.get("edited") or {}).get("ts"), p.get("text")) for p in ex.posts)
             if shape != last_shape:
