@@ -18,7 +18,8 @@ A public post about a run may carry:
 - the stage or check that failed, by name (provisioning, verification, a check id), without
   its reason text;
 - the install, the commit, the run's wall clock, and infrastructure facts (the lease, the pool
-  project, the Prow state).
+  project, the Prow state, and a lane's standing provider as `docs/ci-pool-projects.md` records
+  it: that is the lane's configuration, not a run's record).
 
 It carries nothing from inside the record: what the run produced (per-repetition results, counts or
 ratios, check reasons, scores, report and transcript text) and how the run was configured, the model
