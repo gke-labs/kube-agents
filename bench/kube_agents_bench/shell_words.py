@@ -351,6 +351,7 @@ def _extract_shell_command_string(
     idx = start_index
     saw_c = False
     has_noexec = False
+    has_dump_strings = False
     has_help_or_version = False
     cmd_string = None
 
@@ -372,7 +373,7 @@ def _extract_shell_command_string(
             if opt_name in ("--help", "--version"):
                 has_help_or_version = True
             elif opt_name in ("--dump-strings", "--dump-po-strings"):
-                has_noexec = True
+                has_dump_strings = True
             elif opt_name in ("--rcfile", "--init-file"):
                 if "=" not in word:
                     idx += 1
@@ -398,7 +399,7 @@ def _extract_shell_command_string(
                 elif c == "n":
                     has_noexec = not is_plus
                 elif c == "D" and not is_plus:
-                    has_noexec = True
+                    has_dump_strings = True
                 elif c == "o":
                     vals_needed.append(("set_o", is_plus))
                 elif c == "O":
@@ -419,7 +420,7 @@ def _extract_shell_command_string(
             cmd_string = word
         break
 
-    return cmd_string, has_noexec, has_help_or_version
+    return cmd_string, (has_noexec or has_dump_strings), has_help_or_version
 
 
 def _scan_command_prefix(

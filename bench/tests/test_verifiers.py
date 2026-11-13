@@ -10485,6 +10485,19 @@ def test_extract_shell_command_string_clustered_options():
     assert cmd5 == "python3 collect.py"
     assert noexec5 is False
 
+    # 5. bash -D +n -c "<cmd>" and bash --dump-strings +o noexec -c "<cmd>" keep has_noexec/dump mode
+    cmd6, noexec6, _ = _extract_shell_command_string(
+        ["bash", "-D", "+n", "-c", "python3 collect.py"], 1
+    )
+    assert cmd6 == "python3 collect.py"
+    assert noexec6 is True
+
+    cmd7, noexec7, _ = _extract_shell_command_string(
+        ["bash", "--dump-strings", "+o", "noexec", "-c", "python3 collect.py"], 1
+    )
+    assert cmd7 == "python3 collect.py"
+    assert noexec7 is True
+
 
 def test_window_clipped_command_none_guards():
     from kube_agents_bench.verifiers import WorkerCommandsVerifier
@@ -10573,6 +10586,44 @@ def test_window_clipped_command_none_guards():
     assert res_later_clipped.status == "error"
     assert "the worker-trajectory capture was partial" in res_later_clipped.reason
     assert "the pod clipped a worker terminal call's arguments" in res_later_clipped.reason
+
+    # 4. Window check without forbidden set where all calls clipped before command opened returns error
+    v_no_forbidding = WorkerCommandsVerifier(
+        type="worker_commands",
+        after_result_pattern=r"(?!)",
+        required_patterns=[r"collect\.py"],
+    )
+    transcript.set("ok", traj_all_clipped, worker_commands=[])
+    res_no_forbidding = v_no_forbidding.verify(5.0)
+    assert not res_no_forbidding.success
+    assert res_no_forbidding.status == "error"
+    assert "are readable in the trajectory" in res_no_forbidding.reason
+
+    # 5. Window check without forbidden set reports correct count in sources when card log joined
+    traj_with_readable = [
+        {
+            "agent": "worker",
+            "name": "terminal",
+            "task": "t_1",
+            "args": {"raw": '{"other": "val ...[clipped 10 chars]'},
+            "result": "ok",
+            "status": "completed",
+            "at": 1.0,
+        },
+        {
+            "agent": "worker",
+            "name": "terminal",
+            "task": "t_1",
+            "args": {"command": "python3 collect.py"},
+            "result": "ok",
+            "status": "completed",
+            "at": 2.0,
+        },
+    ]
+    transcript.set("ok", traj_with_readable, worker_commands=[{"task": "t_1", "command": "kubectl get pods"}])
+    res_sources = v_no_forbidding.verify(5.0)
+    assert res_sources.success
+    assert "1 tagged calls as typed and 1 from the card log" in res_sources.reason
 
 
 # ------------------------------- the retrospective's drained-budget case's line

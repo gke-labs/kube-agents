@@ -3486,7 +3486,7 @@ class WorkerCommandsVerifier(BaseVerifier):
         else:
             no_traj_for_succeeded = False
             calls = _worker_terminal_calls(snap.trajectory)
-            if not calls or (forbidding and not any(call[2] is not None for call in calls)):
+            if not calls or not any(call[2] is not None for call in calls):
                 # Tagged MCP calls beside an empty card log mean the worker typed nothing.
                 # No tagged entry at all, a card log that was not read or that shows commands
                 # the capture did not carry, or a withheld code-tool argument, is an error.
@@ -3500,6 +3500,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                         reason=_NO_WORKER_TERMINAL_CALLS_REASON,
                     )
             typed = [command for _, _, command, _, _, _ in calls if command is not None]
+            calls_typed_count = len(typed)
             # The ordered check reads the calls alone: a log row has no time.
             # A check with no forbidden set keeps the card log as a source for
             # its required checks: the trajectory can be the narrower read (two
@@ -3510,7 +3511,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                 joined = [row for row in (str(r.get("command") or "") for r in snap.worker_commands or []) if row and row not in seen]
                 typed += joined
                 if joined:
-                    sources = f" ({len(calls)} tagged calls as typed and {len(joined)} from the card log)"
+                    sources = f" ({calls_typed_count} tagged calls as typed and {len(joined)} from the card log)"
             untimed = [command or "<clipped>" for _, at, command, _, _, _ in calls if at is None]
             # Only the window orders calls; a check with no forbidden set
             # grades nothing by time, so an untimed call cannot mislead it.
