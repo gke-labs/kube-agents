@@ -6796,7 +6796,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	// campaigns for and its identity there, with the election on.
 	env = append(env, leaseEnv...)
 
-	return &appsv1.Deployment{
+	dep := &appsv1.Deployment{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: agent.Namespace, Labels: labels},
 		Spec: appsv1.DeploymentSpec{
@@ -6871,6 +6871,8 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 			},
 		},
 	}
+	withA2ATiersFile(agent, &dep.Spec.Template.Spec, a2aGatewayContainerName)
+	return dep
 }
 
 // a2aProvisionState reports where the provision Job stands, because nothing
@@ -7696,6 +7698,11 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		return state, err
 	}
 	if err := r.applyA2AAgentDoor(ctx, agent); err != nil {
+		return state, err
+	}
+	// The install's tiers, which the verifier, the gateway and the callout
+	// mount (optional, so ordering against their Deployments doesn't matter).
+	if err := r.applyA2ATiers(ctx, agent); err != nil {
 		return state, err
 	}
 
@@ -8618,6 +8625,9 @@ func (r *PlatformAgentReconciler) a2aPreBusTeardown(agent *agentv1alpha1.Platfor
 		{&coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayLeaseName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aHomeChannelRecordName(agent), Namespace: agent.Namespace}}, r.Client},
 		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aHomeChannelProjectionName(agent), Namespace: agent.Namespace}}, r.Client},
+		// The tiers file the gateway, the verifier and the callout mount
+		// (platformagent_a2a_tiers.go); its volume is optional.
+		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aTiersName(agent), Namespace: agent.Namespace}}, r.Client},
 		// The inject door's four, listed whatever the flag says: a flip to
 		// today has to clean up after an operator that WAS deployed with the
 		// flag, and the reads are cheap (three are Owns() kinds) and find
