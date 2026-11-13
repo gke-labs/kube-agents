@@ -1,14 +1,13 @@
-"""Seam: cron relay adapter → session KV relay → chat_delivery_watch, with no chat route.
+"""Seam: cron relay adapter → session KV relay → chat_delivery_watch, with no home channel.
 
-A `next` install whose gateway holds Slack while nothing routes the agent's
-posts to it (`A2A_NOTIFY_PLATFORM` empty, both Hermes platforms off; #3385).
-The operator now routes a single-platform install with no home channel, so the
-gateway keeps what it refuses, but a pod the operator has not re-rendered yet
-still has this shape. The relay must post nowhere, and the refusal must survive the trip it takes to the
+A `next` install whose gateway holds one platform with no home channel set
+anywhere: `A2A_NOTIFY_PLATFORM` empty (no CR home), `A2A_NOTIFY_CONVERSATIONS`
+naming the platform, no projected Slack channel, both Hermes platforms off.
+Every armed route then takes the home posts, so the relay sends the report to
+the gateway, which refuses it for want of a home channel and keeps it for its
+digest. Nothing goes through `hermes send`, and the refusal still reaches the
 reader: the route's 502 `detail`, the adapter's `last_delivery_error`, and the
 ledger issue's platform column, which `chat_delivery_watch` parses out of it.
-The cronjob tool repeats the first 200 characters of the same string in chat,
-so the setting it names has to land inside them.
 """
 
 from __future__ import annotations
@@ -26,8 +25,9 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 import chat_delivery_watch  # noqa: E402
 
 ADAPTER_PATH = REPO_ROOT / "deploy" / "docker" / "plugins" / "chat" / "adapter.py"
-# What the Hermes cronjob tool shows the model of `last_delivery_error`.
-CRONJOB_TOOL_ERROR_CHARS = 200
+# `a2a notify`'s exit status for a post the gateway refused for want of a home
+# channel and kept for its digest (chat_notify.NOTIFY_KEPT).
+NOTIFY_KEPT = 5
 BOTH_PLATFORMS_OFF = (
     "platforms:\n  google_chat:\n    enabled: false\n  slack:\n    enabled: false\n"
 )
@@ -48,7 +48,8 @@ class TestCronRelayWithNoHomeChannel(unittest.TestCase):
 
     def _relay(self, gateway_platform: str):
         """Relay one report through the real adapter and server; return the
-        adapter's error and the argv of every `hermes` the server ran."""
+        adapter's error, the argv of every `hermes` the server ran, and the
+        argv of every `a2a` it ran."""
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             managed = tmp_path / "managed"
@@ -65,12 +66,25 @@ class TestCronRelayWithNoHomeChannel(unittest.TestCase):
                 sys.exit(1)
                 """,
             )
+            notify_record = tmp_path / "a2a-calls.jsonl"
+            fake_executable(
+                tmp_path / "bin",
+                "a2a",
+                f"""
+                import json, sys
+                with open({str(notify_record)!r}, "a") as handle:
+                    handle.write(json.dumps(sys.argv[1:]) + "\\n")
+                sys.exit({NOTIFY_KEPT})
+                """,
+            )
             server = KVServer(
                 tmp_path,
                 env={
                     "HERMES_MANAGED_DIR": str(managed),
                     "A2A_NOTIFY_CONVERSATIONS": gateway_platform,
                     "A2A_NOTIFY_PLATFORM": "",
+                    "NATS_URL": "nats://nats.invalid:4222",
+                    "A2A_BUS_USER": "agent",
                 },
                 path_prepend=str(tmp_path / "bin"),
             )
@@ -79,26 +93,20 @@ class TestCronRelayWithNoHomeChannel(unittest.TestCase):
             finally:
                 server.stop()
             calls = [json.loads(line) for line in record.read_text().splitlines()] if record.exists() else []
-        return error, calls
+            notifies = [json.loads(line) for line in notify_record.read_text().splitlines()] if notify_record.exists() else []
+        return error, calls, notifies
 
-    def test_slack_refusal_reaches_the_ledger_and_the_cronjob_tool(self):
-        error, calls = self._relay("slack")
-        self.assertEqual(calls, [], "nothing may be posted")
+    def test_slack_report_goes_to_the_gateway_and_the_refusal_reaches_the_ledger(self):
+        error, calls, notifies = self._relay("slack")
+        self.assertEqual(calls, [], "nothing may go through hermes send")
+        self.assertEqual([argv[:3] for argv in notifies], [["notify", "--platform", "slack"]])
         self.assertEqual(chat_delivery_watch.platforms_from(error), ["slack"])
-        self.assertEqual(chat_delivery_watch.grade_error(error), chat_delivery_watch.GRADE_HARD)
-        self.assertIn(
-            "set spec.integration.slack.homeChannel / SLACK_HOME_CHANNEL",
-            error[:CRONJOB_TOOL_ERROR_CHARS],
-        )
 
-    def test_google_chat_refusal_fits_the_cronjob_tool(self):
-        error, calls = self._relay("google_chat")
+    def test_google_chat_report_goes_to_the_gateway(self):
+        error, calls, notifies = self._relay("google_chat")
         self.assertEqual(calls, [])
+        self.assertEqual([argv[:3] for argv in notifies], [["notify", "--platform", "google_chat"]])
         self.assertEqual(chat_delivery_watch.platforms_from(error), ["google_chat"])
-        self.assertIn(
-            "set spec.integration.googleChat.homeChannel / GOOGLE_CHAT_HOME_CHANNEL",
-            error[:CRONJOB_TOOL_ERROR_CHARS],
-        )
 
 
 if __name__ == "__main__":

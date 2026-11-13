@@ -60,13 +60,11 @@ logger = logging.getLogger("session_kv_server")
 # `.env` is agent-writable (`save_env_value`), and `load_dotenv` adds any key the
 # container env lacks, which on an install that did not opt in is exactly these.
 _OPERATOR_ONLY_ENV_KEYS = ("INCIDENT_TRIAGE_OPEN_PULL_REQUEST", "INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS")
-# The home channels a today-era `/sethome` or first chat mirrored into that
+# The home channel a today-era `/sethome` or first chat mirrored into that
 # `.env` (Hermes' persist_home_channel). Under `next` with the operator's
-# projection mounted, the container env (the CR) and the projected file are
-# the channels the gateway posts into, and chat_notify.routed_platforms() reads
-# them to pick where home posts go, so the mirror must not fill a key the
-# container env lacks.
-_PROJECTED_HOME_ENV_KEYS = (chat_notify.GCHAT_HOME_ENV, chat_notify.SLACK_HOME_ENV)
+# projection mounted, the projected file is the channel the gateway posts
+# into, so the mirror must not fill the key the container env lacks.
+_PROJECTED_HOME_ENV_KEYS = ("SLACK_HOME_CHANNEL",)
 # Joins the per-platform no-route refusals when the gateway holds more than one
 # backend with no home channel; chat_delivery_watch reads refusals joined by it.
 NO_CHAT_ROUTE_JOIN = "; "
@@ -2975,17 +2973,16 @@ def enabled_chat_platforms() -> list[str]:
     3. The environment signals above, for an install neither file describes.
 
     One thing outranks all three: the platforms ``chat_notify.routed_platforms()``
-    names, from ``A2A_NOTIFY_PLATFORM`` or the projected home-channel file. Under
-    ``spec.mode: next`` the
+    names, from ``A2A_NOTIFY_PLATFORM``, ``A2A_NOTIFY_CONVERSATIONS`` and the
+    projected home-channel file. Under ``spec.mode: next`` the
     managed scope says each such platform's Hermes consumer is off because the
     A2A gateway holds its backend, and posts to it go through the gateway
     instead, so each is still a platform this install posts to. The operator
-    names every armed route there; ``routed_platforms()`` keeps the ones with
-    a home channel the pod can see (``GOOGLE_CHAT_HOME_CHANNEL``,
-    ``SLACK_HOME_CHANNEL``, or the projected file), and all of them when none
-    has one, the gateway keeping the refused posts for a digest. The alert
-    takes the first of them. The operator renders the variable only under
-    next, and it is reserved against every other source.
+    lists the armed routes with a CR home channel; ``routed_platforms()`` adds
+    Slack when the file names a channel, and takes every armed route when no
+    platform has a home, the gateway keeping the refused posts for a digest.
+    The alert takes the first of them. The operator renders the variables only
+    under next, and they are reserved against every other source.
 
     Never returns an empty list — an install that resolves to nothing gets
     DEFAULT_CHAT_PLATFORM.
@@ -3088,8 +3085,9 @@ def _no_chat_route_error() -> str:
     backends whether or not a home channel is set, so with any named the cause
     is the missing home channel, one sentence per platform; without one this
     cannot tell no chat from a misconfigured one, so it guesses at neither. A
-    pod the operator has routed never reaches this: its send goes to the
-    gateway, whose refusal says the post is kept.
+    pod whose gateway arms any route rarely reaches this: with no home channel
+    anywhere, ``chat_notify.routed_platforms()`` names every armed route, and
+    the gateway's refusal says the post is kept.
     """
     refusals = [
         f"composed but not delivered to {platform} (no home channel: set {HOME_CHANNEL_SETTINGS[platform]})"

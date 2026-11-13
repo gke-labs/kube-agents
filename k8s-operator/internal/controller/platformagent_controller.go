@@ -309,9 +309,10 @@ const (
 	// refuses and keeps (a2a/gateway/notify_refused.go).
 	homeChannelUnsetKept = "are refused by the gateway, which keeps them and posts one digest into the channel once it is set"
 	// homeChannelUnsetToGchat and homeChannelUnsetToSlackRoute are the
-	// meanwhile when the other armed backend has a home: the agent routes
-	// home posts only to the routed platforms with one it can see
-	// (agents/platform/scripts/chat_notify.py, routed_platforms).
+	// meanwhile when the other armed backend has a home: the agent sends
+	// home posts only to the platforms with one, the CR's list plus a
+	// learned Slack channel (agents/platform/scripts/chat_notify.py,
+	// routed_platforms).
 	homeChannelUnsetToGchat      = "go to Google Chat's home channel meanwhile"
 	homeChannelUnsetToSlackRoute = "go to Slack's home channel meanwhile"
 	// homeChannelUnsetJoin joins the sentences when both backends lack a home.

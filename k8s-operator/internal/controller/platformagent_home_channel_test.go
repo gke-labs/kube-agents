@@ -354,12 +354,11 @@ func TestHomeChannelRecordDrivesTheProjection(t *testing.T) {
 			if got := env[agentSlackHomeChannelEnvVar].Value; got != tc.wantEnv {
 				t.Errorf("%s = %q, want %q (the learned channel travels as a file, not env)", agentSlackHomeChannelEnvVar, got, tc.wantEnv)
 			}
-			// Routed whenever Slack's route is armed: with the CR's channel,
-			// and with the field empty (the gateway keeps what it refuses for
-			// the digest); a malformed CR value arms no route.
-			wantRouted := tc.wantEnv != "" || strings.TrimSpace(tc.crHome) == ""
-			if _, routed := env[a2aNotifyPlatformEnvVar]; routed != wantRouted {
-				t.Errorf("%s present = %v, want %v", a2aNotifyPlatformEnvVar, routed, wantRouted)
+			// Listed only with the CR's channel: a learned one reaches the
+			// agent through the file, and a malformed CR value arms no route.
+			wantListed := tc.wantEnv != ""
+			if _, listed := env[a2aNotifyPlatformEnvVar]; listed != wantListed {
+				t.Errorf("%s present = %v, want %v", a2aNotifyPlatformEnvVar, listed, wantListed)
 			}
 			msg := homeChannelUnsetMessage(a, rec)
 			if (msg != "") != tc.wantCond {
@@ -384,10 +383,10 @@ func TestHomeChannelRecordDrivesTheProjection(t *testing.T) {
 
 // TestHomeChannelRecordLeavesTheNotifyListsAlone: with Chat and Slack on
 // the gateway, Chat without a home and Slack's home only in the admitted
-// record, both notify variables still list every armed route, and the
-// learned channel is not env: the pod template reads CR fields only, so a
-// learn rolls no pod. The agent finds the learned channel in the projected
-// file and narrows home posts itself.
+// record, the platform list stays absent (no CR home), the conversations
+// list names every armed route, and the learned channel is not env: the pod
+// template reads CR fields only, so a learn rolls no pod. The agent finds
+// the learned channel in the projected file and sends home posts to Slack.
 func TestHomeChannelRecordLeavesTheNotifyListsAlone(t *testing.T) {
 	a := chatAndSlackTestAgent("next")
 	rec := readHomeChannelRecord(a, &corev1.ConfigMap{Data: map[string]string{homeChannelRecordSlackKey: "C0LEARNED"}})
@@ -396,10 +395,11 @@ func TestHomeChannelRecordLeavesTheNotifyListsAlone(t *testing.T) {
 	}
 	pod := buildPodTemplateSpec(a, "h", "h", "h", "h", nil, renderOptions{})
 	env := envMapOf(brokerContainerNamed(pod.Spec.Containers, "platform-agent").Env)
-	for name, want := range map[string]string{a2aNotifyPlatformEnvVar: "google_chat,slack", a2aNotifyConversationsEnvVar: "google_chat,slack"} {
-		if got := env[name].Value; got != want {
-			t.Errorf("%s = %q, want %q", name, got, want)
-		}
+	if got, ok := env[a2aNotifyPlatformEnvVar]; ok {
+		t.Errorf("%s = %q, want absent: no home channel is set on the CR", a2aNotifyPlatformEnvVar, got.Value)
+	}
+	if got := env[a2aNotifyConversationsEnvVar].Value; got != "google_chat,slack" {
+		t.Errorf("%s = %q, want %q", a2aNotifyConversationsEnvVar, got, "google_chat,slack")
 	}
 	if got, ok := env[agentSlackHomeChannelEnvVar]; ok {
 		t.Errorf("%s = %q; the learned channel travels as a file, not env", agentSlackHomeChannelEnvVar, got.Value)

@@ -1541,16 +1541,31 @@ func a2aSlackNotifyArmed(agent *agentv1alpha1.PlatformAgent) bool {
 }
 
 // a2aNotifyPlatforms is every platform whose chat.notify route the gateway
-// arms, Chat first: the platforms the agent routes its proactive posts and
-// conversation reports to (A2A_NOTIFY_PLATFORM, A2A_NOTIFY_CONVERSATIONS).
-// It reads CR fields only, so a learned home channel changes no pod. The
-// agent narrows home posts to the platforms with a home channel it can see.
+// arms, Chat first: the platforms a kanban card's report and onboarding's
+// first report can go back to (A2A_NOTIFY_CONVERSATIONS).
 func a2aNotifyPlatforms(agent *agentv1alpha1.PlatformAgent) []string {
 	var platforms []string
 	if a2aGchatNotifyArmed(agent) {
 		platforms = append(platforms, a2aNotifyPlatformGchat)
 	}
 	if a2aSlackNotifyArmed(agent) {
+		platforms = append(platforms, a2aNotifyPlatformSlack)
+	}
+	return platforms
+}
+
+// a2aNotifyHomePlatforms is every armed platform whose home channel the CR
+// sets, Chat first (A2A_NOTIFY_PLATFORM), and empty when none is. It reads
+// CR fields only, so a learned channel rolls no pod: the agent adds Slack
+// from the projected file, and sends home posts to every armed route when no
+// platform has a home (agents/platform/scripts/chat_notify.py,
+// routed_platforms).
+func a2aNotifyHomePlatforms(agent *agentv1alpha1.PlatformAgent) []string {
+	var platforms []string
+	if a2aGchatHasHome(agent) {
+		platforms = append(platforms, a2aNotifyPlatformGchat)
+	}
+	if a2aSlackNotifyArmed(agent) && a2aSlackHomeChannel(agent) != "" {
 		platforms = append(platforms, a2aNotifyPlatformSlack)
 	}
 	return platforms
@@ -1564,7 +1579,7 @@ func a2aGchatHasHome(agent *agentv1alpha1.PlatformAgent) bool {
 
 // a2aSlackHasHome is whether Slack's chat.notify route is armed with a home
 // channel to post to, from the CR or the admitted record. Only the status
-// reads it; the pod template never reads the record.
+// reads it; the pod template never reads the record (a2aNotifyHomePlatforms).
 func a2aSlackHasHome(agent *agentv1alpha1.PlatformAgent, rec homeChannelRecord) bool {
 	return a2aSlackNotifyArmed(agent) && a2aSlackHomeEffective(agent, rec) != ""
 }

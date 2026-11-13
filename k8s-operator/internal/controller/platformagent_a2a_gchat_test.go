@@ -496,12 +496,13 @@ func TestTheHomeChannelReachesTheArmedGateway(t *testing.T) {
 }
 
 // TestTheAgentRoutesProactivePostsToTheGatewayExactlyWhenArmed: the agent
-// container is told to send proactive posts, and the kanban notifier a card's
-// report back to its conversation, through chat.notify for every platform
-// whose route the gateway arms, home channel or not, Chat first. The agent
-// picks which of them get home posts from the home channels it can see; the
-// operator renders CR fields only, so a learned channel rolls no pod. Telling
-// either with no route behind it sends posts to a subject nobody answers.
+// container is told, in A2A_NOTIFY_CONVERSATIONS, every platform whose route
+// the gateway arms, home channel or not, Chat first, and in
+// A2A_NOTIFY_PLATFORM the armed platforms whose home channel the CR sets.
+// The second may be absent; the agent then sends home posts to Slack's
+// projected channel or to every armed route. Both read CR fields only, so a
+// learned channel rolls no pod. Telling either with no route behind it sends
+// posts to a subject nobody answers.
 func TestTheAgentRoutesProactivePostsToTheGatewayExactlyWhenArmed(t *testing.T) {
 	for _, tc := range []struct {
 		name                            string
@@ -511,12 +512,13 @@ func TestTheAgentRoutesProactivePostsToTheGatewayExactlyWhenArmed(t *testing.T) 
 		{"today with chat", gchatTestAgent("", true), "", ""},
 		{"skew with chat", gchatTestAgent("later", true), "", ""},
 		{"next with chat", withHome(gchatTestAgent("next", true), "spaces/AAAA"), "google_chat", "google_chat"},
-		{"next with chat, no home channel", gchatTestAgent("next", true), "google_chat", "google_chat"},
-		// Both backends share the gateway, so both are routed, home channel
-		// or not; the agent narrows home posts to the ones with a home.
-		{"next with chat and slack, no homes", chatAndSlackTestAgent("next"), "google_chat,slack", "google_chat,slack"},
-		{"next with chat and slack, slack home only", withSlackHomeChannel(chatAndSlackTestAgent("next"), "C0HOME"), "google_chat,slack", "google_chat,slack"},
-		{"next with chat and slack, chat home only", withHome(chatAndSlackTestAgent("next"), "spaces/AAAA"), "google_chat,slack", "google_chat,slack"},
+		{"next with chat, no home channel", gchatTestAgent("next", true), "", "google_chat"},
+		{"next with slack, no home channel", slackTestAgent("next", true), "", "slack"},
+		// Both backends share the gateway, so both carry conversation
+		// reports; the platform list names the ones with a CR home.
+		{"next with chat and slack, no homes", chatAndSlackTestAgent("next"), "", "google_chat,slack"},
+		{"next with chat and slack, slack home only", withSlackHomeChannel(chatAndSlackTestAgent("next"), "C0HOME"), "slack", "google_chat,slack"},
+		{"next with chat and slack, chat home only", withHome(chatAndSlackTestAgent("next"), "spaces/AAAA"), "google_chat", "google_chat,slack"},
 		{"next with chat and slack, both homes", withSlackHomeChannel(withHome(chatAndSlackTestAgent("next"), "spaces/AAAA"), "C0HOME"), "google_chat,slack", "google_chat,slack"},
 		// A malformed home drops only that platform's route; the other stays.
 		{"next with chat and slack, slack home a name", withSlackHomeChannel(withHome(chatAndSlackTestAgent("next"), "spaces/AAAA"), "#ops"), "google_chat", "google_chat"},
@@ -540,17 +542,16 @@ func TestTheAgentRoutesProactivePostsToTheGatewayExactlyWhenArmed(t *testing.T) 
 					t.Errorf("%s = %q, want %q (the platform names the agent-side callers use)", name, got.Value, want)
 				}
 			}
-			if tc.wantPlatform != "" && legacyChatConsumer(tc.agent) {
-				t.Error("the notify route and the legacy Hermes platform both render")
+			if tc.wantConversations != "" && (legacyChatConsumer(tc.agent) || legacySlackConsumer(tc.agent)) {
+				t.Error("the notify route and a legacy Hermes platform both render")
 			}
 		})
 	}
 }
 
-// TestNotifyPlatformsOrderIsChatThenSlack: the list the agent reads names
-// every armed route, Chat before Slack, whatever home channels are set, and
-// Slack alone on a Slack-only install. The agent, not the operator, narrows
-// home posts to the platforms with a home.
+// TestNotifyPlatformsOrderIsChatThenSlack: the conversations list names every
+// armed route, Chat before Slack, whatever home channels are set, and Slack
+// alone on a Slack-only install.
 func TestNotifyPlatformsOrderIsChatThenSlack(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -570,23 +571,46 @@ func TestNotifyPlatformsOrderIsChatThenSlack(t *testing.T) {
 	}
 }
 
-// TestTheAgentSeesTheChatHomeChannelUnderNext: under next the agent
-// container carries GOOGLE_CHAT_HOME_CHANNEL exactly when Chat's route is
-// armed with a space name, so the agent can tell which routed platform has a
-// home. A Slack-only install, a home-less Chat and a malformed space carry
-// none. Today's legacy relay env still carries the CR value as it always has.
-func TestTheAgentSeesTheChatHomeChannelUnderNext(t *testing.T) {
+// TestNotifyHomePlatformsAreTheArmedRoutesWithACRHome: the platform list
+// names the armed routes whose CR home channel is set and well-formed, Chat
+// before Slack, and is empty when none is: no fallback to every armed route,
+// and no admitted record, which only the projected file carries.
+func TestNotifyHomePlatformsAreTheArmedRoutesWithACRHome(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		agent *agentv1alpha1.PlatformAgent
+		want  []string
+	}{
+		{"chat and slack, no homes", chatAndSlackTestAgent("next"), nil},
+		{"chat and slack, slack home", withSlackHomeChannel(chatAndSlackTestAgent("next"), "C0HOME"), []string{"slack"}},
+		{"chat and slack, chat home", withHome(chatAndSlackTestAgent("next"), "spaces/AAAA"), []string{"google_chat"}},
+		{"chat and slack, both homes", withSlackHomeChannel(withHome(chatAndSlackTestAgent("next"), "spaces/AAAA"), "C0HOME"), []string{"google_chat", "slack"}},
+		{"chat and slack, chat home not a space", withSlackHomeChannel(withHome(chatAndSlackTestAgent("next"), "AAAA"), "C0HOME"), []string{"slack"}},
+		{"chat only, no home", gchatTestAgent("next", true), nil},
+		{"chat only, home", withHome(gchatTestAgent("next", true), "spaces/AAAA"), []string{"google_chat"}},
+		{"slack only, no home", slackTestAgent("next", true), nil},
+		{"slack only, home", withSlackHomeChannel(slackTestAgent("next", true), "C0HOME"), []string{"slack"}},
+		{"today, both homes", withSlackHomeChannel(withHome(chatAndSlackTestAgent(""), "spaces/AAAA"), "C0HOME"), nil},
+	} {
+		if got := a2aNotifyHomePlatforms(tc.agent); !slices.Equal(got, tc.want) {
+			t.Errorf("%s: a2aNotifyHomePlatforms = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestTheAgentCarriesNoChatHomeChannelUnderNext: under next the agent
+// container carries no GOOGLE_CHAT_HOME_CHANNEL, whatever the CR sets: the
+// platform list carries Chat's home, and an added variable would roll the
+// pod on upgrade. Today's legacy relay env still carries the CR value.
+func TestTheAgentCarriesNoChatHomeChannelUnderNext(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		agent *agentv1alpha1.PlatformAgent
 		want  string // "" for absent
 	}{
-		{"next with chat and slack, chat home set", withHome(chatAndSlackTestAgent("next"), "spaces/AAAA"), "spaces/AAAA"},
-		{"next with chat, home set", withHome(gchatTestAgent("next", true), "spaces/AAAA"), "spaces/AAAA"},
-		{"next with chat and slack, no chat home", withSlackHomeChannel(chatAndSlackTestAgent("next"), "C0HOME"), ""},
-		{"next with chat, not a space", withHome(gchatTestAgent("next", true), "AAAA"), ""},
+		{"next with chat and slack, chat home set", withHome(chatAndSlackTestAgent("next"), "spaces/AAAA"), ""},
+		{"next with chat, home set", withHome(gchatTestAgent("next", true), "spaces/AAAA"), ""},
 		{"next slack only", withSlackHomeChannel(slackTestAgent("next", true), "C0HOME"), ""},
-		{"next without chat", withHome(gchatTestAgent("next", false), "spaces/AAAA"), ""},
 		{"today with chat and home", withHome(gchatTestAgent("", true), "spaces/AAAA"), "spaces/AAAA"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

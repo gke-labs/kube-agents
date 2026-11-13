@@ -4,8 +4,8 @@ Under ``spec.mode: next`` the operator stops rendering the Hermes chat platform
 that ``hermes send`` posts through, because the A2A gateway consumes the chat
 backend instead. Every caller that posts unprompted (the alert path, the cron
 relay, the Cluster Agent reconcile notice, ``send_notification``) would then post
-nowhere. The operator names the platforms the gateway now holds in
-``A2A_NOTIFY_PLATFORM``, and for those platforms these callers run
+nowhere. The operator names the platforms the gateway now holds, and for the
+ones :func:`routed_platforms` picks these callers run
 ``a2a notify`` instead, which asks the gateway to post to the home channel over
 its ``chat.notify`` route.
 
@@ -35,12 +35,12 @@ import os
 import sqlite3
 from contextlib import closing
 
-# The variable the operator renders into the agent container exactly when the
-# next stack holds the chat backend (platformagent_manifests.go,
-# a2aNotifyPlatformEnvVar): every platform whose route the gateway arms, home
-# channel or not. Its value is a list of platform names as Hermes spells them,
-# separated by PLATFORM_LIST_SEPARATOR; one name is a list of one.
-# routed_platforms() narrows it to the platforms with a home channel.
+# The variable the operator renders into the agent container when the next
+# stack holds the chat backend (platformagent_manifests.go,
+# a2aNotifyPlatformEnvVar): every armed platform whose home channel the CR
+# sets, and absent when none is. Its value is a list of platform names as
+# Hermes spells them, separated by PLATFORM_LIST_SEPARATOR; one name is a list
+# of one. routed_platforms() adds the learned Slack channel and the fallback.
 NOTIFY_PLATFORM_ENV = "A2A_NOTIFY_PLATFORM"
 # The variable the operator renders whenever the gateway arms its chat.notify
 # route, home channel or not (platformagent_a2a_manifests.go,
@@ -58,12 +58,6 @@ PLATFORM_LIST_SEPARATOR = ","
 # the writable volume point the readers at a file of its own.
 HOME_FILE_DIR = "/etc/kube-agents/chat-home"
 HOME_FILE_KEY = "slack_home"
-# The home channels the operator renders into the agent container from the CR
-# (platformagent_manifests.go, agentGchatHomeChannelEnvVar and
-# agentSlackHomeChannelEnvVar). A learned Slack channel is not env: it reaches
-# the pod through the file above, so a learn restarts no pod.
-GCHAT_HOME_ENV = "GOOGLE_CHAT_HOME_CHANNEL"
-SLACK_HOME_ENV = "SLACK_HOME_CHANNEL"
 #: The Slack platform name, whose threads go out channel-qualified (command).
 SLACK_PLATFORM = "slack"
 # What `a2a notify` needs to reach the bus (a2a/cmd/a2a/main.go, connect): the
@@ -123,8 +117,6 @@ ALERT_UPDATE_FORMAT = "alert-{session}"
 GCHAT_PLATFORM = "google_chat"
 GCHAT_MESSAGES_TOKEN = "/messages/"
 GCHAT_THREADS_TOKEN = "/threads/"
-# Each platform's home-channel variable (GCHAT_HOME_ENV, SLACK_HOME_ENV).
-HOME_ENV_BY_PLATFORM = {GCHAT_PLATFORM: GCHAT_HOME_ENV, SLACK_PLATFORM: SLACK_HOME_ENV}
 
 
 def alert_update_key(session_id: str) -> str:
@@ -168,47 +160,36 @@ def platform_list(raw: str) -> list[str]:
     return names
 
 
-def sees_home(platform: str) -> bool:
-    """Whether this pod can see a home channel for ``platform``.
-
-    Google Chat's comes from the CR only (GCHAT_HOME_ENV). Slack's comes from
-    the CR (SLACK_HOME_ENV) or from the projected file, which also carries a
-    channel the gateway learned.
-    """
-    env = HOME_ENV_BY_PLATFORM.get(platform)
-    if env and os.environ.get(env, "").strip():
-        return True
-    return platform == SLACK_PLATFORM and bool(home_file_value())
-
-
 def routed_platforms() -> list[str]:
     """The platforms that get home posts through the gateway, or [] when none does.
 
-    The rendered env names every platform whose route the gateway arms, with
-    a home channel or without one. Of those, home posts go to the platforms
-    with a home channel this pod can see (:func:`sees_home`), Chat first. When
-    none has one, they go to every routed platform: the gateway refuses each
-    post and keeps it for the digest it posts once a channel is set. The
-    operator renders CR fields only, so a learned Slack channel changes the
-    answer through the projected file, with no pod restart.
-
-    With the env empty the answer is derived: the gateway holds Slack
-    (``A2A_NOTIFY_CONVERSATIONS``) and the projected file names a home channel.
+    The operator lists every armed route whose home channel the CR sets, Chat
+    first (``A2A_NOTIFY_PLATFORM``), and this adds Slack when the gateway holds
+    it and the projected file names a channel, the CR's or one it learned.
+    With no such list, home posts go to Slack alone when the file names a
+    channel, and otherwise to every armed route (``A2A_NOTIFY_CONVERSATIONS``),
+    whose posts the gateway keeps for the digest it posts once a channel is set.
+    The rule reads only those two variables and the file, so every process
+    computes the same list and a learned channel restarts no pod.
     """
-    routed = platform_list(os.environ.get(NOTIFY_PLATFORM_ENV, ""))
-    if routed:
-        return [name for name in routed if sees_home(name)] or routed
-    if SLACK_PLATFORM in gateway_platforms() and home_file_value():
+    listed = platform_list(os.environ.get(NOTIFY_PLATFORM_ENV, ""))
+    armed = gateway_platforms()
+    slack_home = SLACK_PLATFORM in armed and bool(home_file_value())
+    if listed:
+        if slack_home and SLACK_PLATFORM not in listed:
+            return [*listed, SLACK_PLATFORM]
+        return listed
+    if slack_home:
         return [SLACK_PLATFORM]
-    return []
+    return armed
 
 
 def gateway_platforms() -> list[str]:
     """The platforms whose backends the gateway holds, or [] when it holds none.
 
-    Unlike :func:`routed_platforms` this is set with no home channel, so it names
-    the platforms an install has when nothing routes a proactive post there, and
-    whose conversations :func:`conversation_command` can post into.
+    It names every armed route, home channel or not: the platforms whose
+    conversations :func:`conversation_command` can post into, and the home-post
+    fallback of :func:`routed_platforms`.
     """
     return platform_list(os.environ.get(NOTIFY_CONVERSATIONS_ENV, ""))
 

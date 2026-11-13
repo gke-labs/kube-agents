@@ -457,8 +457,10 @@ class DeliveryToConversationTest(unittest.TestCase):
         self.assertNotIn("--update", argv)
         text = argv[argv.index("--") + 1]
         self.assertTrue(text.startswith(self.REPORT.rstrip("\n")))
-        self.assertIn(bootstrap_delivery.AUDITS_NO_HOME_SENTENCE, text)
-        self.assertNotIn(bootstrap_delivery.AUDITS_HOME_SENTENCE, text)
+        # No platform has a home, so every armed route takes the home posts and
+        # the gateway keeps them for its digest: the summaries are not lost.
+        self.assertIn(bootstrap_delivery.AUDITS_HOME_SENTENCE, text)
+        self.assertNotIn(bootstrap_delivery.AUDITS_NO_HOME_SENTENCE, text)
         self.assertTrue((self.d / COMPLETED).exists())
         self.assertEqual((self.d / DELIVERED).read_text(encoding="utf-8"), self.REPORT)
         # Kept as onboarding's destination after delivery.
@@ -504,7 +506,7 @@ class DeliveryToConversationTest(unittest.TestCase):
         self.assertEqual(report[report.index("--") + 1], text)
         self.assertNotIn("--chat-file", note)
         self.assertNotIn("--update", note)
-        self.assertIn(bootstrap_delivery.AUDITS_NO_HOME_SENTENCE, note[note.index("--") + 1])
+        self.assertIn(bootstrap_delivery.AUDITS_HOME_SENTENCE, note[note.index("--") + 1])
         self.assertNotIn("went as text", stage_log(self.d))
 
     def test_the_card_is_built_from_the_stored_files_not_the_report(self):
@@ -1690,11 +1692,11 @@ class DeliveryCardTest(unittest.TestCase):
         self.assertEqual(chat, inventory_card.chat(self.card)[0])
 
     def test_a_google_chat_origin_with_no_routed_home_gets_the_text_and_the_log_says_why(self):
-        # A conversations-only gateway serves Google Chat, so the card is built, but the
-        # home door has nowhere to send it: the report prints as text and the log says so.
+        # The gateway serves Google Chat, so the card is built, but only Slack has a home,
+        # so the home door has nowhere to send it: the report prints as text and the log says so.
         origin = dict(self.ORIGIN, platform="google_chat", chat_id="spaces/A", thread_id="spaces/A/threads/B")
         environ = {k: v for k, v in os.environ.items() if k not in ("KAGE_SLACK_UX", "SLACK_RELAY_URL", "A2A_NOTIFY_PLATFORM", "A2A_NOTIFY_CONVERSATIONS")}
-        environ.update({"KAGE_SLACK_UX": "1", "A2A_NOTIFY_CONVERSATIONS": "google_chat"})
+        environ.update({"KAGE_SLACK_UX": "1", "A2A_NOTIFY_PLATFORM": "slack", "A2A_NOTIFY_CONVERSATIONS": "google_chat,slack"})
         out = io.StringIO()
         with (
             mock.patch.dict(os.environ, environ, clear=True),
