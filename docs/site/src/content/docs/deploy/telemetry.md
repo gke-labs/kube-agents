@@ -28,7 +28,7 @@ Enabled at the cluster level (default on new GKE Standard clusters, opt-in on ol
 LiteLLM is the only component that knows what a request cost, and its `prometheus` callback publishes that as `litellm_spend_metric_total` — a counter labelled with the real model and provider it routed to alongside the `requested_model` alias the agent asked for:
 
 ```text
-litellm_spend_metric_total{api_provider="gemini",model="gemini-3.5-flash",requested_model="model-default",…} 2.907
+litellm_spend_metric_total{api_provider="gemini",model="gemini-3.8-flash",requested_model="model-default",…} 2.907
 ```
 
 That metric is the source of truth for spend, and it is already scraped by the `PodMonitoring` above.
