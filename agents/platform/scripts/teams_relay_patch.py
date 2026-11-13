@@ -183,6 +183,24 @@ def _split_table_row(stripped: str) -> list[str]:
     return [cell.strip() for cell in stripped.strip("|").split("|")]
 
 
+def strip_bot_mentions(text: str, activity: dict[str, Any]) -> str:
+    """Drop the bot's own ``<at>Name</at>`` mention from channel text.
+
+    A channel message reaches the bot only when it is @mentioned, and Teams
+    leaves the mention markup in ``text``; the agent should see the words
+    after it. Mentions of other people stay (entities name whom).
+    """
+    recipient_id = str((activity.get("recipient") or {}).get("id") or "")
+    for entity in activity.get("entities") or []:
+        if not isinstance(entity, dict) or entity.get("type") != "mention":
+            continue
+        mentioned_id = str((entity.get("mentioned") or {}).get("id") or "")
+        marker = entity.get("text")
+        if recipient_id and mentioned_id == recipient_id and isinstance(marker, str) and marker:
+            text = text.replace(marker, " ")
+    return " ".join(text.split()).strip()
+
+
 def markdown_to_adaptive_card(text: str, title: str | None = None) -> dict[str, Any]:
     """Convert Markdown text into a Microsoft Teams Adaptive Card v1.5 schema."""
     body_elements: list[dict[str, Any]] = []
@@ -854,7 +872,7 @@ def _build_teams_adapter_and_sender(
                 return
 
             # 3. Handle message text & dispatch
-            text = (raw_text or "").strip()
+            text = strip_bot_mentions(raw_text or "", activity)
             activity_id = str(activity.get("id") or "").strip()
 
             await self.send_typing(conv_id, metadata={"serviceUrl": service_url})

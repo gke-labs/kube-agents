@@ -385,6 +385,23 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(urls[:2], [regional, regional])
         self.assertEqual(urls[2], teams_relay_patch.default_service_url())
 
+    def test_strip_bot_mentions_drops_only_the_bots_own_mention(self):
+        bot = "28:6736b7e8-31ec-41b1-816f-8abb333b26cb"
+        activity = {
+            "recipient": {"id": bot, "name": "kube-agents-dev-bot"},
+            "entities": [
+                {"type": "mention", "mentioned": {"id": bot, "name": "Kage"}, "text": "<at>Kage</at>"},
+                {"type": "mention", "mentioned": {"id": "29:user", "name": "Ann"}, "text": "<at>Ann</at>"},
+                {"type": "clientInfo", "locale": "en-US"},
+            ],
+        }
+        self.assertEqual(
+            teams_relay_patch.strip_bot_mentions("<at>Kage</at> hello <at>Ann</at>!", activity),
+            "hello <at>Ann</at>!",
+        )
+        # No entities (a personal chat): the text is only trimmed.
+        self.assertEqual(teams_relay_patch.strip_bot_mentions("  hi  ", {"recipient": {"id": bot}}), "hi")
+
     def test_markdown_table_becomes_an_adaptive_card_table(self):
         text = (
             "Clusters:\n\n"
