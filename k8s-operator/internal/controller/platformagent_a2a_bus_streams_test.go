@@ -224,6 +224,8 @@ type busStreamsRig struct {
 	// patch, while set.
 	jobDeleteErr   error
 	statusPatchErr error
+	// patchFailOn fails a patch whose body contains it, while set.
+	patchFailOn string
 }
 
 func busStreamsAgent(replicas int) *agentv1alpha1.PlatformAgent {
@@ -382,6 +384,11 @@ func newBusStreamsRig(t *testing.T, replicas int, objs ...client.Object) *busStr
 			Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
 				if rig.patchErr != nil {
 					return rig.patchErr
+				}
+				if rig.patchFailOn != "" {
+					if data, err := patch.Data(obj); err == nil && strings.Contains(string(data), rig.patchFailOn) {
+						return errors.New("admission webhook refused the update")
+					}
 				}
 				return c.Patch(ctx, obj, patch, opts...)
 			},
@@ -1802,5 +1809,54 @@ func TestOnlyTheClientContainersStartTimeCounts(t *testing.T) {
 	rig.poll()
 	if slices.Contains(rig.deleted, "test-agent-gateway-mixed") {
 		t.Errorf("restarted an agent pod whose bridge started after the loss, for its other container's age")
+	}
+}
+
+// The loss a re-run confirms is written before the Job is deleted: a write
+// that fails leaves the Job, and the next poll's retry records the loss and
+// re-runs, so TASKS' clients are restarted all the same.
+func TestATasksLossThatFailsToWriteHoldsTheDelete(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobComplete))
+	rig.serve(1, allStreamsBut("KV_cap")...)
+	rig.poll()
+	rig.serve(1, allStreamsBut("KV_cap", "TASKS")...)
+	rig.poll()
+	rig.patchFailOn = busStreamsTasksLostAnnotation
+	if err := rig.poller.pollAgent(context.Background(), rig.agent()); err == nil {
+		t.Fatalf("poll succeeded with the loss unwritable")
+	}
+	rig.now = rig.now.Add(busStreamsPollInterval)
+	if !rig.jobExists() {
+		t.Fatalf("the Job was deleted though the TASKS loss wasn't recorded")
+	}
+	rig.patchFailOn = ""
+	rig.poll()
+	if rig.jobExists() || readBusTasksLoss(rig.agent()) == nil {
+		t.Fatalf("the retry didn't record the loss and re-run: job %v, loss %+v", rig.jobExists(), readBusTasksLoss(rig.agent()))
+	}
+	rig.recreateJob(batchv1.JobComplete)
+	rig.serve(1, a2aProvisionedStreams...)
+	rig.poll()
+	for _, pod := range []string{"test-agent-a2a-gateway-abc", "test-agent-gateway-xyz"} {
+		if !slices.Contains(rig.deleted, pod) {
+			t.Errorf("deleted %v, want %s restarted", rig.deleted, pod)
+		}
+	}
+}
+
+// A poll with nothing to judge breaks a run of TASKS misses, as it breaks any
+// run: misses separated by unreadable polls aren't three in a row.
+func TestUnreadablePollsBreakARunOfTasksMisses(t *testing.T) {
+	agent := busStreamsAgent(1)
+	rig := newBusStreamsRig(t, 1, busStreamsJob(agent, busStreamsTestNow.Add(-time.Hour), batchv1.JobFailed))
+	for i := 0; i < busStreamsConfirmPolls; i++ {
+		rig.serve(1, allStreamsBut("TASKS")...)
+		rig.poll()
+		rig.source.bodies = map[string]string{}
+		rig.poll()
+	}
+	if loss := readBusTasksLoss(rig.agent()); loss != nil {
+		t.Errorf("loss = %+v recorded from misses that unreadable polls separated", loss)
 	}
 }

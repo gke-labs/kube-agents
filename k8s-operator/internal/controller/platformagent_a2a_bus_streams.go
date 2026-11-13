@@ -525,7 +525,7 @@ func (p *BusStreamPoller) streak(agent *agentv1alpha1.PlatformAgent) *busStreamS
 }
 
 // pollAgent is one CR's poll. It writes BusStreamsPresent and nothing else of
-// the status, re-runs the provision Job when a loss is confirmed, and says
+// the status, re-runs the provision Job when a loss is confirmed, and
 // restarts TASKS' clients once TASKS is back after a loss (restartTasksClients).
 func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	if agent.DeletionTimestamp != nil || !a2aStackRendering(agent) || !busProvisioned(agent) {
@@ -572,7 +572,7 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 	readings := p.scrapeServers(ctx, agent, sts)
 	verdict := busStreamsVerdictFor(int(busServers(sts)), readings)
 	if !verdict.known {
-		streak.missing, streak.misses = nil, 0
+		streak.missing, streak.misses, streak.tasksMisses = nil, 0, 0
 		streak.unknown++
 		if streak.unknown < busStreamsConfirmPolls {
 			return nil
@@ -894,20 +894,22 @@ func (p *BusStreamPoller) deleteProvisionJob(ctx context.Context, agent *agentv1
 		fmt.Sprintf("Missing from the A2A bus: %s. The provision Job is running again to recreate them.%s", names, restart)); err != nil {
 		log.Error(err, "writing the Reprovisioning condition; deleting the provision Job anyway", "platformagent", client.ObjectKeyFromObject(agent))
 	}
-	uid := job.UID
-	if err := p.r.Delete(ctx, job, client.Preconditions{UID: &uid}, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !apierrors.IsNotFound(err) {
-		return fmt.Errorf("failed to delete the completed A2A provision Job %s: %w", job.Name, err)
-	}
 	if streak.tasksMisses > 0 {
 		// The re-run recreates TASKS too. A loss of it this run saw counts
 		// as confirmed by the re-run itself, however few polls saw it,
 		// since after the delete the polls that would confirm it are
-		// gated until the Job is done.
+		// gated until the Job is done. It's written before the delete, as
+		// the re-run record is: a write that fails leaves the Job for the
+		// next poll to retry, and the loss can't be lost behind it.
 		if loss := readBusTasksLoss(agent); loss == nil || loss.Back {
 			if err := p.writeTasksLoss(ctx, agent, busTasksLoss{At: streak.tasksFirstMissing}); err != nil {
 				return err
 			}
 		}
+	}
+	uid := job.UID
+	if err := p.r.Delete(ctx, job, client.Preconditions{UID: &uid}, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("failed to delete the completed A2A provision Job %s: %w", job.Name, err)
 	}
 	streak.missing, streak.misses, streak.tasksMisses = nil, 0, 0
 	log.Info("re-running the A2A provision Job: provisioned streams are missing from the bus",

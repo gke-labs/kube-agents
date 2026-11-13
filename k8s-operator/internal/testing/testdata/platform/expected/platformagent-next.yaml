@@ -5511,7 +5511,7 @@ metadata:
     app.kubernetes.io/name: platform-agent
     app.kubernetes.io/part-of: a2a-next
     kubeagents.x-k8s.io/a2a-component: provision
-  name: platformagent-a2a-provision-95b55cf7
+  name: platformagent-a2a-provision-8a231a1f
   namespace: kubeagents-system
   ownerReferences:
     - apiVersion: kubeagents.x-k8s.io/v1alpha1
@@ -5934,10 +5934,10 @@ spec:
               \"     the bus until this Job runs. Delete the Job to re-run it now, or
               leave it and the\" >&2\n  echo \"     24h TTL will.\" >&2\n  echo \"  3.
               once TASKS is back, the operator restarts the clients holding a durable
-              consumer\" >&2\n  echo \"     on it, if one of its five-minute polls saw
-              the stream missing. If yours didn't\" >&2\n  echo \"     (deleted and recreated
-              between two polls), restart them yourself:\" >&2\n  echo \"       kubectl
-              rollout restart deployment/platformagent-a2a-gateway -n kubeagents-system\"
+              consumer\" >&2\n  echo \"     on it, if it saw the stream missing on three
+              five-minute polls in a row. After a\" >&2\n  echo \"     quicker fix (deleted
+              and recreated inside 15 minutes), restart them yourself:\" >&2\n  echo \"
+              \      kubectl rollout restart deployment/platformagent-a2a-gateway -n kubeagents-system\"
               >&2\n  echo \"     and, where a Hermes bridge sidecar runs, the agent workload
               platformagent-gateway\" >&2\n  echo \"     (a Deployment or a StatefulSet,
               depending on the spec) with it.\" >&2\n  echo \"     Deleting a stream deletes
