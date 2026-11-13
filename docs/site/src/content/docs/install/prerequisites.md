@@ -289,8 +289,7 @@ use. Terraform and Helm both default it off — `enable_google_chat` and the cha
 `googleChat.enabled` are `false`, so neither takes a slot unless you ask. The interactive installer
 goes the other way: its chat menu pre-selects **Google Chat**, so pressing enter at that prompt
 provisions the Chat backend. Pick "None" or Slack there if you want the project's Chat slot left
-alone. Pick Slack alone, too, if you install `next` (a first install's default) and want Slack on the A2A gateway: with both platforms enabled, Google Chat holds the gateway and Slack stays on the
-Hermes Slack platform. **Slack is unaffected** — it provisions no GCP resource at all, so a project whose Chat slot
+alone. **Slack is unaffected** — it provisions no GCP resource at all, so a project whose Chat slot
 is already spoken for can still run kube-agents with Slack in it.
 
 If you do want Chat and the slot is taken, moving just the Chat backend elsewhere is not available

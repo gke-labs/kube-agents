@@ -6,7 +6,7 @@ description: Create the Slack app, its tokens and its allowlist for a kube-agent
 kube-agents talks to Slack through one Slack app that you create in your workspace. The app connects over Socket Mode (an outbound websocket), so nothing on the cluster needs an inbound endpoint. Which process holds the connection depends on the install's `spec.mode`:
 
 - **`today`**: the credential broker (the `platform-agent-credential-proxy` Deployment) holds the connection and relays each event to the Planning Agent's Hermes Slack listener in the `platform-agent-gateway` Deployment.
-- **`next`** (a first install's default): the A2A gateway, in the `platform-agent-a2a-gateway` Deployment. If Google Chat is also enabled, Google Chat holds the A2A gateway and Slack stays on the `today` path.
+- **`next`** (a first install's default): the A2A gateway, in the `platform-agent-a2a-gateway` Deployment. With Google Chat enabled too, the same gateway serves both.
 
 The two need different app settings, so follow the section for your mode. The tokens and the allowlist work the same way in both.
 

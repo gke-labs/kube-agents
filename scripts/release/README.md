@@ -301,10 +301,10 @@ repository code, and none of it happens automatically.
 
 Slack runs the other way. `SLACK_ENABLED`, `SLACK_HOME_CHANNEL`, `SLACK_BOT_TOKEN`,
 `SLACK_APP_TOKEN` and the three `E2E_SLACK_*` values would belong on `rc` only, for the optional
-`slack` suite on the RC pipeline's `next` leg, and are left unset there for now: with Google Chat on,
-Chat holds the A2A gateway and Slack stays on the path that drops the suite's posts
-([`tests/e2e/README.md`](../../tests/e2e/README.md#-slack-e2e-test-testse2eslack_agent_testpy)), which
-the `nightly` suite does not include.
+`slack` suite on the RC pipeline's `next` leg, and are left unset there for now: the installer has no variable yet for the chart's
+`operator.slackTestUsers`, without which the A2A gateway drops the suite's posts
+([`tests/e2e/README.md`](../../tests/e2e/README.md#-slack-e2e-test-testse2eslack_agent_testpy)). The
+`nightly` suite does not include it.
 
 Two things this list deliberately does not cover, because they are not part of the nightly
 pipeline: the `staging` environment, which is a deploy target that nothing tests, and the GA

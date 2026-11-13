@@ -120,7 +120,7 @@ flowchart LR
     GW -.->|proactive alert / relayed progress| SL
 ```
 
-The diagram shows a `spec.mode: next` install, the first-install default ([the quick start](/kube-agents/install/quickstart-gke/#verify-a-specmode-next-install)). With both chat platforms enabled, Slack stays on the agent pod's own listener, as under `today`; a `today` install has no A2A stack, and chat reaches the Planning Agent directly. Full walkthrough on the [Architecture](/kube-agents/overview/architecture/) page.
+The diagram shows a `spec.mode: next` install, the first-install default ([the quick start](/kube-agents/install/quickstart-gke/#verify-a-specmode-next-install)). The gateway serves Google Chat and Slack together; a `today` install has no A2A stack, and chat reaches the Planning Agent directly. Full walkthrough on the [Architecture](/kube-agents/overview/architecture/) page.
 
 ## Install
 

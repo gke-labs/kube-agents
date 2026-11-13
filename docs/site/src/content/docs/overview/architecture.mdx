@@ -86,7 +86,7 @@ flowchart TB
     GW -.->|reply / relayed progress| SL
 ```
 
-The map is a `spec.mode: next` install. The gateway holds Google Chat when it is enabled and Slack otherwise; with both enabled, Slack stays on the Planning Agent's own listener, as every chat platform does under `today`, where the A2A stack is not rendered. [Deployment topology](#deployment-topology) lists the pods each mode runs.
+The map is a `spec.mode: next` install. The gateway holds Google Chat and Slack, either or both. Under `today` the A2A stack is not rendered, and every chat platform reaches the Planning Agent's own listener. [Deployment topology](#deployment-topology) lists the pods each mode runs.
 
 ## The request flows
 

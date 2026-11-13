@@ -506,7 +506,7 @@ after "Upgrade Complete!", so the app steps that mode needs are on the screen af
 
 ### Google Chat
 
-With Google Chat enabled, Google Chat takes the A2A gateway under `next`. Each top-level
+With Google Chat enabled, the A2A gateway takes Google Chat under `next`. Each top-level
 message you send the app in a DM is then its own conversation, answered in its own thread, as on
 Slack ([ChatOps → Google Chat](/kube-agents/concepts/chatops/#google-chat)). The thing to set for
 it is the home channel, where alerts and scheduled reports land. Under `next` the gateway posts them
@@ -521,10 +521,8 @@ Before switching to `next`, set `GOOGLE_CHAT_HOME_CHANNEL` in the same `install.
 ([ChatOps → Home channel](/kube-agents/concepts/chatops/#home-channel)). After the switch, check
 that a scheduled report or an alert reaches that space.
 
-With Slack enabled too, Slack stays on the credential broker under `next`, as under `today`. Then
-none of the Slack steps below apply: switch, check Slack as in [Checking the result](#slack), and
-leave the Slack app as it is. The rest of this section is for an install whose Slack takes the
-gateway.
+With Slack enabled too, the same gateway takes Slack. The Slack steps below apply as they do
+with Google Chat off.
 
 ### Before the switch
 
@@ -805,7 +803,7 @@ change of the new release.
   release that predates the value, re-run with `--drop-undeclared-values`. A full upgrade refuses
   that flag, since it has no recorded values to drop.
 - **A Slack setting the A2A gateway cannot use.** A full upgrade applies `PLATFORM_AGENT_MODE` from
-  `install.env`. With `next`, Slack on and Google Chat off, the A2A gateway takes Slack, and the run
+  `install.env`. With `next` and Slack on, the A2A gateway takes Slack, with or without Google Chat. The run
   refuses three settings it cannot use, naming each one:
   - a `SLACK_ALLOWED_USERS` entry with an `@`: the list matches Slack member IDs exactly, so an
     email matches nobody. Replace it with the person's member ID (in Slack, their profile, then

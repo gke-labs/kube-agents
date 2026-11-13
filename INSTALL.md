@@ -634,8 +634,8 @@ KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply
   `install.env` and re-run `install.sh` or a full `upgrade.sh` (the upgrade guide's
   [Switching `spec.mode`](docs/site/src/content/docs/install/upgrade.md#switching-specmode));
   [`scripts/installer/README.md`](scripts/installer/README.md) has the rules for the key. Before
-  switching an install whose Slack is on and Google Chat off to `next` (the A2A gateway then
-  takes Slack), check three Slack keys: `SLACK_ALLOWED_USERS` holds member IDs such as
+  switching an install whose Slack is on to `next` (the A2A gateway then takes Slack, with or
+  without Google Chat), check three Slack keys: `SLACK_ALLOWED_USERS` holds member IDs such as
   `U0123ABCD`, not emails, which match nobody; `SLACK_HOME_CHANNEL`, if set, is a channel ID
   (`C...` or `G...`), not a DM or a user; `SLACK_BOT_TOKEN` is one workspace's token, not a
   comma-separated list, with no comma or space left in it. Both front doors refuse a `next` apply that fails any of them. On
@@ -728,7 +728,7 @@ If you enabled Google Chat or Slack during the install, perform the following re
 2. **Send a Test Direct Message**:
    - Send a DM to the bot in Google Chat with the message `"Hi Platform Agent"`.
    - If you left `GOOGLE_CHAT_HOME_CHANNEL` empty and this is the install's first chat message on either platform, it makes its space the home channel, where scheduled reports post. To send them to a team space instead, send the first message there, or run `/sethome` there afterwards.
-   - Under `spec.mode: next` neither the first message nor `/sethome` sets it: the A2A gateway posts alerts and reports only to `GOOGLE_CHAT_HOME_CHANNEL`, a space name (`spaces/<id>`), and while it is empty refuses and keeps them (up to fifty, for thirty days) for one digest into the space once it is set; with Slack enabled too, they go to the Slack Hermes platform, which delivers them only if Slack has a home channel. The installer warns before it applies with it empty (and `install.sh`'s setup interview asks you to confirm), and the PlatformAgent carries the `HomeChannelUnset` condition until it is set. A value that is not a space name turns the gateway's notify route off, so card reports back to their conversation stop too.
+   - Under `spec.mode: next` neither the first message nor `/sethome` sets it: the A2A gateway posts alerts and reports only to `GOOGLE_CHAT_HOME_CHANNEL`, a space name (`spaces/<id>`), and while it is empty refuses and keeps them (up to fifty, for thirty days) for one digest into the space once it is set. It keeps Slack's refused posts apart, for Slack's own home channel. The installer warns before it applies with it empty (and `install.sh`'s setup interview asks you to confirm), and the PlatformAgent carries the `HomeChannelUnset` condition until it is set. A value that is not a space name turns the gateway's notify route off, so card reports back to their conversation stop too.
 3. **Approve Pairing Code (Optional / First-time setup)**:
    - If pairing mode is enabled, approve the pairing code displayed in the gateway logs:
      ```bash
@@ -742,7 +742,7 @@ If you enabled Google Chat or Slack during the install, perform the following re
 
 ##### 2. Slack Configuration (`SLACK_ENABLED=true`)
 
-[Slack app setup](docs/site/src/content/docs/install/slack-app.md) covers creating the app, its tokens, the allowlist and how to verify, for both `spec.mode` values. Under `spec.mode: next`, unless Google Chat is also enabled (Google Chat then holds the A2A gateway and Slack stays on the Hermes listener, so the steps below apply), the A2A gateway holds Slack and needs a different app manifest from the one below; follow that page instead of steps 1, 3, 4 and 5 here, and skip step 2's home-channel bullet: under `next` the home channel is `SLACK_HOME_CHANNEL`, a channel ID, or, under `homeChannelPolicy` auto (the default), the channel of the first top-level mention of the agent; that page's home-channel section says how to set it.
+[Slack app setup](docs/site/src/content/docs/install/slack-app.md) covers creating the app, its tokens, the allowlist and how to verify, for both `spec.mode` values. Under `spec.mode: next`, with or without Google Chat, the A2A gateway holds Slack and needs a different app manifest from the one below; follow that page instead of steps 1, 3, 4 and 5 here, and skip step 2's home-channel bullet: under `next` the home channel is `SLACK_HOME_CHANNEL`, a channel ID, or, under `homeChannelPolicy` auto (the default), the channel of the first top-level mention of the agent; that page's home-channel section says how to set it.
 
 1. **Verify Slack App Settings**:
    - Ensure **Socket Mode** is enabled in your Slack App console.
@@ -1608,7 +1608,7 @@ When a Slack bot connects or is online in your workspace but never replies to me
     ```bash
     kubectl get platformagent platform-agent -n kubeagents-system -o yaml
     ```
-    (The gateway runs on every `next` install, on the console door alone when no chat backend is configured. The `A2AGateway` condition is present only on an install upgraded from an operator that ran no gateway without a chat backend: `status: False` with reason `NoChatBackend` (written by the older operator). A gateway that operator scaled to zero comes back with the condition as `WaitingForReplica` until its replica is ready; on an install where it never created one, the condition clears on the first pass and `Ready` waits on the new gateway. Otherwise it is absent, and that is the healthy reading. If `googleChat` is also enabled, Chat holds the gateway and Slack stays on the legacy path, so read the `mode: today` logs above instead.)
+    (The gateway runs on every `next` install, on the console door alone when no chat backend is configured. The `A2AGateway` condition is present only on an install upgraded from an operator that ran no gateway without a chat backend: `status: False` with reason `NoChatBackend` (written by the older operator). A gateway that operator scaled to zero comes back with the condition as `WaitingForReplica` until its replica is ready; on an install where it never created one, the condition clears on the first pass and `Ready` waits on the new gateway. Otherwise it is absent, and that is the healthy reading. With `googleChat` enabled too, the same gateway holds Slack, and these checks apply unchanged.)
 
 ### 6. Tracing Where a Chat Message Stops
 
