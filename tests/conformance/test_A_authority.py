@@ -14,8 +14,9 @@ mechanism is different, because these assertions run without a cluster.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import email.message
-import json
+import types
 import re
 import textwrap
 import unittest
@@ -476,46 +477,27 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
         reached = sorted(prefix for prefix, roles in h.credential_proxy.ROUTE_ROLES if profile in roles)
         self.assertEqual(sorted(["/v1/exec", h.mcp_policy.MCP_RELAY_PREFIX]), reached)
 
-    # A report credential (#5619): the one task credential with no target.
-    FIXTURES = h.REPO_ROOT / "a2a" / "taskcred" / "testdata" / "credential_proxy_fixtures.json"
-
-    def _fixtures(self) -> tuple[dict, dict]:
-        doc = json.loads(self.FIXTURES.read_text(encoding="utf-8"))
-        return doc, {case["name"]: case for case in doc["cases"]}
-
-    def test_A3_only_an_unattended_task_a_trigger_started_omits_the_target(self) -> None:
-        doc, cases = self._fixtures()
-        verify = h.task_credential.verify
-        for name in ("no target", "no target, a trigger, at the read tier", "no target, unattended, no trigger"):
-            with self.subTest(name=name):
-                case = cases[name]
-                with self.assertRaises(h.task_credential.TaskCredentialError):
-                    verify(case["token"], tuple(doc["trusted"]), case["now"], doc["max_lifetime_seconds"])
-        report = cases["a report credential: unattended, a builtin schedule trigger, no target"]
-        claims = verify(report["token"], tuple(doc["trusted"]), report["now"], doc["max_lifetime_seconds"])
-        self.assertTrue(claims.report_only)
-
     def test_A3_a_report_credential_reaches_the_audit_report_routes_alone(self) -> None:
+        # A report credential (#5619) is the one task credential with no
+        # target. Its verdict is task_credential's, pinned by the golden
+        # fixtures in the Python suite (that module needs `cryptography`, which
+        # this suite doesn't import); this is the handler's gate on what an
+        # admitted one may reach, driven through _admit_task with a gate that
+        # admits a stand-in for it.
         cp = h.credential_proxy
-        doc, cases = self._fixtures()
-        report = cases["a report credential: unattended, a builtin schedule trigger, no target"]
-        workload = "system:serviceaccount:kubeagents-profiles:agentprofile-auditor-unattended"
-        principal = cp.Principal(
-            workload=workload, uid="sa-uid", role=cp.CALLER_ROLE_PROFILE,
-            pod=report["claims"]["pod"], pod_uid=report["claims"]["pod_uid"],
-        )
-        gate = cp.ProfileTaskGate(
-            trusted=tuple(doc["trusted"]),
-            identities={workload: h.task_credential.ProfileIdentity("auditor", "unattended")},
-            max_lifetime_raw=f"{doc['max_lifetime_seconds']}s",
-            clock=lambda: report["now"],
-        )
+        report_task = types.SimpleNamespace(report_only=True)
+        principal = cp.Principal(workload="w", uid="u", role=cp.CALLER_ROLE_PROFILE, pod="p", pod_uid="u")
+
+        class AdmitsAReportCredential:
+            def admit(self, principal, token):
+                return dataclasses.replace(principal, task=report_task, task_target=None)
 
         def admit(method: str, path: str) -> tuple[bool, list]:
             handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
             handler.headers = email.message.Message()
-            handler.headers[cp.TASK_CREDENTIAL_HEADER] = report["token"]
-            handler.command, handler.path, handler.profile_gate = method, path, gate
+            handler.headers[cp.TASK_CREDENTIAL_HEADER] = "a-report-credential"
+            handler.command, handler.path = method, path
+            handler.profile_gate = AdmitsAReportCredential()
             replies: list = []
             handler._json = lambda status, body: replies.append((status, body))
             return handler._admit_task(principal), replies
@@ -526,6 +508,7 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
             ("GET", cp.API_RELAY_PREFIX + "projects/proj-a"),
             ("POST", "/v1/vcs/issue-view"),
             ("GET", "/v1/a-route-added-later"),
+            ("PUT", "/v1/audit-reports/a/%2e%2e/latest"),
         ):
             with self.subTest(method=method, path=path):
                 admitted, replies = admit(method, path)
@@ -537,6 +520,12 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
             with self.subTest(pattern=pattern.pattern):
                 self.assertIn(method, ("GET", "PUT", "DELETE"))
                 self.assertTrue(pattern.pattern.startswith(cp.AUDIT_REPORTS_PREFIX), pattern.pattern)
+        # The MCP relay, which the gate already closes, reads it as no task too.
+        decision, _ = cp.mcp_relay_decision(
+            dataclasses.replace(principal, task=report_task), "developer_knowledge",
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "search_documents"}},
+        )
+        self.assertFalse(decision.allowed)
 
     def test_A3_a_profile_worker_reaches_no_cluster_through_mcp(self) -> None:
         # The relay has no per-task target check, so a profile worker reaches

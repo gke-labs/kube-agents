@@ -104,15 +104,6 @@ MUTATIONS: list[Mutation] = [
         "no target to confine it",
     ),
     Mutation(
-        "A3-report-credential-any-tier",
-        "agents/platform/scripts/task_credential.py",
-        ('    if target_claim is None and (_string(nats, "tier", "nats") != REPORT_TIER or trigger is None):\n',
-         "    if False:\n"),
-        "test_A3_only_an_unattended_task_a_trigger_started_omits_the_target",
-        "accept any proxy credential with no target, as Go does, so a chat "
-        "task that names no cluster also reaches the store",
-    ),
-    Mutation(
         "A3-profile-reaches-gke-mcp",
         "agents/platform/scripts/mcp_policy.py",
         ('    "developer_knowledge": frozenset({"get_documents", "search_documents"}),\n}',
