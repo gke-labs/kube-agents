@@ -3019,7 +3019,7 @@ export TF_VAR_prow_build_id="${BUILD_ID:-}"
 export TF_VAR_prow_pull_number="${PULL_NUMBER:-}"
 
 # 4. Token & Model Configuration
-# Dynamically fetches API_SERVER_KEY from GKE secret and locks down Gemini 3.1
+# Dynamically fetches API_SERVER_KEY from GKE secret and locks down the agent model
 PLATFORM_AGENT_TOKEN="$(kubectl get secret platform-agent-secrets -n "${TARGET_NAMESPACE}" -o jsonpath='{.data.API_SERVER_KEY}' | base64 --decode)"
 export PLATFORM_AGENT_TOKEN
 # Under EVAL_MODE_NEXT=1 the deploy flipped the install to next, armed the

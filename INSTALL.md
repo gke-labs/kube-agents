@@ -1631,7 +1631,7 @@ When the checks in the entry above pass and a message still gets no reply, follo
   kubectl logs deploy/platform-agent-a2a-gateway -n kubeagents-system | grep console-only
   ```
   A match means no chat backend reached the gateway: check the backend's configuration (the `discord-bot` Secret's `token` key, or the CR's Google Chat or Slack settings).
-- **`next`: read the gateway's log.** Once it is up it logs `a2a gateway starting` naming the `backend` (a startup failure is logged before that line), a Slack gateway then logs `slack connected`, and every message that becomes a task logs `ingress` and, when it ends, `task terminal`.
+- **`next`: read the gateway's log.** Once it is up it logs `a2a gateway starting` naming the `backends` (a startup failure is logged before that line), a Slack gateway then logs `slack connected`, and every message that becomes a task logs `ingress` and, when it ends, `task terminal`.
 
   ```bash
   kubectl logs -n kubeagents-system deploy/platform-agent-a2a-gateway | tail -n 100
