@@ -64,4 +64,9 @@ const (
 	// shellSandboxClientKeyEphemeralRequest is shellSandboxClientKeySizeLimit
 	// plus emptyDirLogsAllowance, for the init container that writes the copy.
 	shellSandboxClientKeyEphemeralRequest = "65Mi"
+
+	// The OKF memory curator's local record store (/var/lib/curator): small-state floor.
+	a2aCuratorStateSizeLimit = "64Mi"
+	// a2aCuratorEphemeralRequest is a2aCuratorStateSizeLimit plus emptyDirLogsAllowance.
+	a2aCuratorEphemeralRequest = "128Mi"
 )

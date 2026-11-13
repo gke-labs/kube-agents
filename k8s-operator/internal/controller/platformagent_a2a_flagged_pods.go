@@ -51,7 +51,8 @@ type a2aFlaggedPod struct {
 // namespace, under the pod quota the operator derives for it from the warm
 // pools and the profile ceiling, not in this namespace or its quota.
 var a2aFlaggedPods = []a2aFlaggedPod{
-	{name: "mcp", env: a2aMCPDoorEnvVar, enabled: a2aMCPDoorEnabled, build: buildA2AMCPDeployment}, // #3869
+	{name: "mcp", env: a2aMCPDoorEnvVar, enabled: a2aMCPDoorEnabled, build: buildA2AMCPDeployment},         // #3869
+	{name: "curator", env: a2aCuratorEnvVar, enabled: a2aCuratorEnabled, build: buildA2ACuratorDeployment}, // #5566
 }
 
 // a2aFlaggedStandingPods is the pods the flagged workloads add to the namespace
