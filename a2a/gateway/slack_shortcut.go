@@ -302,7 +302,8 @@ func (s *SlackAdapter) shortcut(ctx context.Context, raw json.RawMessage, handle
 		MessageID:    p.Message.TS,
 		Text: fmt.Sprintf(slackShortcutAsk, slackShortcutWhere(p.Channel.Name),
 			shortcutAskQuoted(s.shortcutAuthor(ctx, p.Message), quoted)),
-		Shortcut: true,
+		Shortcut:  true,
+		ArrivedAt: time.Now(),
 	}
 	clicker := s.slackUserNameContext(ctx, p.User.ID)
 	if runCtx.Err() != nil {

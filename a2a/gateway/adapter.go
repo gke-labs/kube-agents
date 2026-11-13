@@ -104,6 +104,10 @@ type InboundMessage struct {
 	// settles on the answer, and the ask keeps ⏸️. False on every backend
 	// but Slack.
 	Answer bool
+	// ArrivedAt is when the adapter received the message, set by the Slack
+	// adapter only: the start of slack_first_ack_seconds, which ends when the
+	// gateway has drawn the ask's arrival reaction (drawArrivalMark).
+	ArrivedAt time.Time
 	// Unaddressed marks a message the sender did not address to the bot,
 	// delivered only because of where it was typed: today an unmentioned
 	// Slack reply under one of the bot's own posts (an alert, or another

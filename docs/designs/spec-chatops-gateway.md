@@ -3081,7 +3081,7 @@ feed `/readyz`: a Slack outage would otherwise take the pod, which also serves t
 Ready, the `PlatformAgent` with it, and the gateway's PodDisruptionBudget away, for no failover,
 since the lease rather than readiness picks the leader.
 
-Three more Slack series time the legs the agent's own latency leaves out, each appearing with its
+Four more Slack series time the legs the agent's own latency leaves out, each appearing with its
 first observation. `kubeagents_a2a_gateway_slack_ingress_lag_seconds`, unlabelled, is the arrival
 time less the event's own Slack timestamp, for a message that becomes a turn (the pump reads its
 `event_ts`, or its `ts` when absent) and for every block action (`interactive` reads its
@@ -3094,7 +3094,12 @@ are all timed without a call site changing; the websocket dial and a shortcut's 
 are not. `method` is the URL's last segment when `metricsSlackAPIMethods` names it and `other`
 otherwise; `outcome` is `ok` for a 2xx, which includes Slack's `ok: false` answers, `rate_limited`
 for a 429, and `error` for any other status or no response. The duration ends at the response
-headers.
+headers. `kubeagents_a2a_gateway_slack_first_ack_seconds`, unlabelled, is an ask's wait for its first
+receipt: from the adapter receiving the message (`InboundMessage.ArrivedAt`) to the arrival
+reaction landing (`drawArrivalMark`'s reactions call succeeded), so it includes the gateway's own
+work before the draw (the queue, the capability mint, the publish, a session pod's request). A
+reaction whose call failed, a click or an answer (which draw none), a steer, and an ask refused
+before its task starts are not observed.
 
 The terminal counter counts every terminal the gateway hands its adapter, not only the relay's.
 It counts in `observeTaskTerminal`, the funnel each route ends in once: the relay; the stale-task
