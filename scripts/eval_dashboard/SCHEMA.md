@@ -1510,11 +1510,13 @@ daily passed having reached every project the failed build named, at the same
 `fleet_tree` (a failed build's pre-input-hash git id against the daily's hash
 is not compared; a project a whole pass no longer lists has left the pool and
 counts; a failed build naming no project needs a whole pass), false when it
-failed itself, so its own note is the current story and nothing clears; `by`
+failed itself on a build that owes a hand step, so its own note is the current
+story and nothing clears (a later failure the next run retries writes none of
+its own unless a project persists, and silences nothing); `by`
 is the daily run a recovery was decided on (`build`, `finished_at`,
 `summary`), what the clear cites. A failed build whose report is absent or
 cut short is never recovered by a pass, and a silence ends when a later daily
-passes without reaching the projects. The
+passes without reaching the projects or fails on a build that owes no hand step. The
 entry is carried from the previous tick while `build` is still the job's
 latest, unchanged on a tick blind to either job, so neither re-opens the
 failure, and a silence becomes a recovery once a later pass reaches the

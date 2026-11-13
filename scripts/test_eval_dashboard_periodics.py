@@ -664,12 +664,25 @@ class AssessTest(unittest.TestCase):
         unread = self.reading(POST, NOW - timedelta(days=2), passed=False, artifact={"error": periodics.REPORT_UNREADABLE})
         self.assertEqual(periodics.superseded_jobs({POST.job: unread, DAILY.job: reached}), {})
         self.assertEqual(periodics.superseded_jobs({POST.job: self.reading(POST, NOW - timedelta(days=2), passed=False, artifact=None), DAILY.job: reached}), {})
-        # A failed daily silences the older note but is no recovery.
-        daily_failed = self.reading(DAILY, NOW - timedelta(hours=1), passed=False, artifact={"summary": {"failed": 1}, "outcomes": {"kube-agents-evals-9": {"outcome": "failed", "detail": "lock"}}})
+        # A failed daily that is itself news silences the older note but is no recovery.
+        daily_failed = self.reading(DAILY, NOW - timedelta(hours=1), passed=False, artifact={"summary": {"failed": 1}, "outcomes": {"kube-agents-evals-9": {"outcome": "failed", "detail": "Error acquiring the state lock: ID 1"}}})
         decided = periodics.superseded_jobs({POST.job: failed, DAILY.job: daily_failed})
         self.assertEqual(decided, {POST.job: {"build": "100", "recovery": False}})
         notes = periodics.assess({POST.job: failed, DAILY.job: daily_failed}, NOW, {}, superseded=decided)
         self.assertEqual(sorted(notes), [DAILY.job], "the daily's own note is the current story")
+        # A failed daily the next run retries writes no note of its own, so it
+        # silences nothing: the postsubmit's hand step stays in the notes.
+        daily_retry = self.reading(DAILY, NOW - timedelta(hours=1), passed=False, artifact={"summary": {"failed": 1, "not_reached": 1}, "outcomes": {"kube-agents-evals-2": {"outcome": "failed", "detail": "ZONE_RESOURCE_POOL_EXHAUSTED"}, "kube-agents-evals-9": {"outcome": "not_reached", "detail": "busy"}}})
+        self.assertEqual(periodics.superseded_jobs({POST.job: failed, DAILY.job: daily_retry}), {})
+        refused = self.reading(POST, NOW - timedelta(days=2), passed=False, artifact={"fleet_tree": "t1", "summary": {"refused": 1}, "outcomes": {"kube-agents-evals-9": {"outcome": "refused", "detail": "delete x"}}})
+        readings = {POST.job: refused, DAILY.job: daily_retry}
+        self.assertEqual(sorted(periodics.assess(readings, NOW, {}, streaks=periodics.streaks(readings, None), superseded=periodics.superseded_jobs(readings))), [POST.job])
+        # A silence carried from a daily that was news ends on the next daily
+        # that is not: the carried map is not kept over a retry-shaped failure.
+        silenced = periodics.superseded_jobs({POST.job: refused, DAILY.job: daily_failed})
+        self.assertEqual(silenced, {POST.job: {"build": "100", "recovery": False}})
+        self.assertEqual(periodics.superseded_jobs(readings, silenced), {})
+        self.assertEqual(sorted(periodics.assess(readings, NOW, {}, streaks=periodics.streaks(readings, None), superseded=periodics.superseded_jobs(readings, silenced))), [POST.job])
         earlier_daily = self.reading(DAILY, NOW - timedelta(days=3), artifact={"fleet_tree": "t1", "outcomes": {"kube-agents-evals-9": {"outcome": "converged", "detail": ""}}})
         self.assertEqual(periodics.superseded_jobs({POST.job: failed, DAILY.job: earlier_daily}), {})
         self.assertEqual(periodics.superseded_jobs({POST.job: failed}), {})
@@ -1002,6 +1015,15 @@ class AssessTest(unittest.TestCase):
         readings = {DAILY.job: reading("5", {"kube-agents-evals-2": stockout})}
         streaks = periodics.streaks(readings, streaks)
         self.assertEqual(periodics.assess(readings, NOW, None, streaks=streaks), {})
+        # A project a failed run listed as busy or not reached keeps its count:
+        # the reconcile's report names every mapped project, unlike the sweep's.
+        held = {"outcome": "not_reached", "detail": "not free in Boskos before the run's budget ran out"}
+        streaks = periodics.streaks({DAILY.job: reading("5b", {"kube-agents-evals-2": held, "kube-agents-evals-40": token})}, streaks)
+        self.assertEqual(streaks[DAILY.job]["projects"], {"kube-agents-evals-2": 1, "kube-agents-evals-40": 1})
+        readings = {DAILY.job: reading("5c", {"kube-agents-evals-2": stockout, "kube-agents-evals-40": {"outcome": "busy", "detail": "leased"}})}
+        streaks = periodics.streaks(readings, streaks)
+        self.assertEqual(streaks[DAILY.job]["projects"], {"kube-agents-evals-2": 2, "kube-agents-evals-40": 1})
+        self.assertIn(DAILY.job, periodics.assess(readings, NOW, None, streaks=streaks))
         # Shapes that owe a hand step are news on their first build, with the report's own lines.
         first = periodics.streaks({DAILY.job: reading("6", {})}, None)
         for name, outcomes, report in (

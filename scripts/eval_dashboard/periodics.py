@@ -211,6 +211,10 @@ RECONCILE_RETRY_STEPS = (RECONCILE_NEXT_STEP["failed"], RECONCILE_NEXT_STEP["int
 REPORT_KEY_MAIN_CHECK_ERROR = "main_check_error"
 RECONCILE_OUTCOME_NOT_REACHED = "not_reached"
 RECONCILE_OUTCOME_BUSY = "busy"
+# A project the run listed but never held: it neither failed nor succeeded,
+# so a streak count it carries stands, and a pass that lists it so did not
+# reach it.
+RECONCILE_UNREACHED_OUTCOMES = (RECONCILE_OUTCOME_NOT_REACHED, RECONCILE_OUTCOME_BUSY)
 # The report's outcome names as the message says them.
 RECONCILE_OUTCOME_WORDS = {RECONCILE_OUTCOME_NOT_REACHED: "not reached"}
 REPORT_KEY_VISITED = "visited"
@@ -950,6 +954,12 @@ def runs(readings: dict[str, dict], watched=WATCHED) -> dict[str, dict]:
     return out
 
 
+def _project_unreached(periodic: Periodic, entry) -> bool:
+    """A reconcile report lists every mapped project, the ones it never held
+    as busy or not reached; the sweep's leaves them out."""
+    return periodic.artifact == RECONCILE_ARTIFACT and isinstance(entry, dict) and entry.get(REPORT_KEY_OUTCOME) in RECONCILE_UNREACHED_OUTCOMES
+
+
 def _project_failed(periodic: Periodic, entry) -> bool:
     if not isinstance(entry, dict):
         return False
@@ -983,6 +993,8 @@ def streaks(readings: dict[str, dict], prev_streaks: dict | None, watched=WATCHE
             else:
                 if isinstance(outcomes, dict):
                     for project, entry in outcomes.items():
+                        if _project_unreached(periodic, entry):
+                            continue
                         if _project_failed(periodic, entry):
                             projects[project] = projects.get(project, 0) + 1
                         else:
@@ -1149,7 +1161,7 @@ def _reached(artifact, projects: list[str]) -> bool:
             if not whole:
                 return False
             continue
-        if not isinstance(entry, dict) or entry.get(REPORT_KEY_OUTCOME) in (RECONCILE_OUTCOME_NOT_REACHED, RECONCILE_OUTCOME_BUSY):
+        if not isinstance(entry, dict) or entry.get(REPORT_KEY_OUTCOME) in RECONCILE_UNREACHED_OUTCOMES:
             return False
     return True
 
@@ -1159,10 +1171,12 @@ def _supersession(job: str, readings: dict[str, dict]) -> str | None:
     one: SUPERSEDED_RECOVERY when it passed later having reached every
     project the failed build named (a build naming none needs a whole pass),
     at the same fleet tree (a failed build's pre-input-hash git id is not compared), SUPERSEDED_SILENCE
-    when it failed later (its own note is the current story; nothing
-    recovered), None otherwise. A later pass that never reached them (busy,
-    not reached), applied another tree of the same kind, or carries the
-    git id against a hashed failure, is None."""
+    when it failed later on a build that owes a hand step (its own note is
+    the current story; nothing recovered), None otherwise. A later pass that
+    never reached them (busy, not reached), applied another tree of the same
+    kind, or carries the git id against a hashed failure, is None; so is a
+    later failure the next run retries, which writes no note of its own
+    (unless a project persists, and then both stories stand)."""
     other = SUPERSEDED_BY.get(job)
     if not other:
         return None
@@ -1173,7 +1187,7 @@ def _supersession(job: str, readings: dict[str, dict]) -> str | None:
     if when is None or later is None or later <= when:
         return None
     if not theirs.get(KEY_PASSED):
-        return SUPERSEDED_SILENCE
+        return SUPERSEDED_SILENCE if actionable_failure(theirs.get(KEY_ARTIFACT)) else None
     if _outcomes(mine.get(KEY_ARTIFACT)) is None:
         # A failed build whose report is absent or cut short names no project
         # because nothing can be read, not because nothing failed: a later
@@ -1218,8 +1232,9 @@ def superseded_jobs(readings: dict[str, dict], carried: dict | None = None) -> d
     job's latest: a tick blind to either job, or a later failing daily, does
     not re-open a retired failure as news. A silence becomes a recovery once
     a later pass reaches the projects, and ends when a later pass does not
-    reach them (the failure is back in the notes, not as news); a new failed
-    build is decided afresh."""
+    reach them, or a later failing daily owes no hand step and so writes no
+    note to stand in (the failure is back in the notes, not as news); a new
+    failed build is decided afresh."""
     carried = carried if isinstance(carried, dict) else {}
     latest = runs(readings)
     out = {}
@@ -1242,10 +1257,11 @@ def superseded_jobs(readings: dict[str, dict], carried: dict | None = None) -> d
             continue
         other = SUPERSEDED_BY[job]
         theirs = readings.get(other)
-        if ground is None and before is not None and not before.get(SUPERSEDED_KEY_RECOVERY) and isinstance(theirs, dict) and theirs.get(KEY_PASSED):
+        if ground is None and before is not None and not before.get(SUPERSEDED_KEY_RECOVERY) and isinstance(theirs, dict) and (theirs.get(KEY_PASSED) or not actionable_failure(theirs.get(KEY_ARTIFACT))):
             # The daily that silenced this failure has passed without
-            # reaching its projects: its own note clears, and the failure
-            # it hid is still open.
+            # reaching its projects, or failed again on a build the next run
+            # retries: its own note clears or is not written, and the
+            # failure it hid is still open.
             continue
         entry = {SUPERSEDED_KEY_BUILD: build, SUPERSEDED_KEY_RECOVERY: bool((before or {}).get(SUPERSEDED_KEY_RECOVERY)) or ground == SUPERSEDED_RECOVERY}
         if ground == SUPERSEDED_RECOVERY:
