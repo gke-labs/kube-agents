@@ -47,16 +47,18 @@ readonly SLACK_TIMING_FILE_NAME="slack-timing.json"
 readonly SUMMARY_FILE_NAME="summary.jsonl"
 # The run's Slack overhead (hack/slack-lane/overhead.py), from the A2A
 # gateway's metrics listener scraped before the cases and after them: its pods
-# by name, its metrics port (a2aGatewayMetricsPort in the operator), and the
-# namespace and context the eval exports.
+# by name (<AGENT_SERVICE_NAME>-a2a-gateway-, as the operator names them), its
+# metrics port (a2aGatewayMetricsPort in the operator), and the namespace
+# (AGENT_NAMESPACE, as the cases use) and context the eval exports.
 readonly OVERHEAD_FILE_NAME="slack-overhead.json"
-readonly GATEWAY_POD_PREFIX="${SLACK_LANE_GATEWAY_POD_PREFIX:-platform-agent-a2a-gateway-}"
+readonly GATEWAY_POD_PREFIX="${SLACK_LANE_GATEWAY_POD_PREFIX:-${AGENT_SERVICE_NAME:-platform-agent}-a2a-gateway-}"
 readonly GATEWAY_METRICS_PORT="${SLACK_LANE_GATEWAY_METRICS_PORT:-9096}"
 readonly AGENT_NAMESPACE_DEFAULT="kubeagents-system"
 readonly GATEWAY_LOCAL_PORT_BASE=19096
 readonly PORT_FORWARD_TRIES=10
 readonly METRICS_TIMEOUT_SECONDS=5
 readonly POD_MARKER="# pod: "
+readonly PROCESS_START_METRIC="process_start_time_seconds"
 
 # Writes every gateway pod's metrics, each under a "# pod: <name>" line, to
 # <out file>. Through kubectl port-forward, as the eval runner reaches the
@@ -64,7 +66,7 @@ readonly POD_MARKER="# pod: "
 # monitoring namespace and the operator, and an API-server pod proxy is pod
 # network ingress the policy denies, while a port-forward is not.
 scrape_gateway() { # <out file>
-  local out="$1" ns="${TARGET_NAMESPACE:-${NAMESPACE:-${AGENT_NAMESPACE_DEFAULT}}}" pod pf i=0 local_port
+  local out="$1" ns="${AGENT_NAMESPACE:-${TARGET_NAMESPACE:-${NAMESPACE:-${AGENT_NAMESPACE_DEFAULT}}}}" pod pf i=0 local_port
   local -a kubectl_cmd=(kubectl)
   [ -n "${AGENT_CLUSTER_CONTEXT:-}" ] && kubectl_cmd+=(--context "${AGENT_CLUSTER_CONTEXT}")
   : >"${out}"
@@ -79,12 +81,16 @@ scrape_gateway() { # <out file>
       sleep 1
     done
     kill "${pf}" 2>/dev/null || true
+    # Reaped here, or bash reports each killed port-forward as "Terminated" in the lane log.
+    wait "${pf}" 2>/dev/null || true
   done
 }
 
 # Writes the run's overhead (overhead.py: after less before, per pod), or why it could not.
+# Every good scrape carries process_start_time_seconds; the Slack histograms serve nothing
+# before their first sample, so their absence is overhead.py's nulls, not a failed scrape.
 record_overhead() { # <before file> <after file> <out file>
-  if grep -q "_count" "$2" 2>/dev/null; then
+  if grep -q "^${PROCESS_START_METRIC} " "$2" 2>/dev/null; then
     python3 "${SCRIPT_DIR}/overhead.py" "$2" "$1" >"$3" || echo '{"error": "overhead.py failed"}' >"$3"
   else
     echo '{"error": "no gateway metrics could be read (see kubectl port-forward to the gateway)"}' >"$3"

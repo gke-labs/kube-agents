@@ -102,6 +102,8 @@ class RunScrapesTheGatewayTest(unittest.TestCase):
             got = json.loads((root / "artifacts" / "slack-overhead.json").read_text())
             self.assertEqual(0.5, got["delivery_lag_s"])
             self.assertEqual(3, got["samples"]["delivery_lag"])
+            self.assertEqual([], got["no_baseline"])
+            self.assertNotIn("Terminated", proc.stderr)
 
 
 class SinceTest(unittest.TestCase):
@@ -109,11 +111,33 @@ class SinceTest(unittest.TestCase):
         before = "# pod: a\nprocess_start_time_seconds 1\n" + METRICS
         doubled = METRICS.replace("_count 3", "_count 5").replace("_sum 1.5", "_sum 2.5")
         after = "# pod: a\nprocess_start_time_seconds 1\n" + doubled
-        got = overhead.overhead(overhead.since(after, before))
+        text, no_baseline = overhead.since(after, before)
+        got = overhead.overhead(text)
         self.assertEqual({"delivery_lag": 2, "post": 0, "first_ack": 0}, got["samples"])
         self.assertEqual(0.5, got["delivery_lag_s"], "1 s over 2 new deliveries")
+        self.assertEqual([], no_baseline)
         restarted = "# pod: a\nprocess_start_time_seconds 2\n" + METRICS
-        self.assertEqual(3, overhead.overhead(overhead.since(restarted, before))["samples"]["delivery_lag"])
+        self.assertEqual(3, overhead.overhead(overhead.since(restarted, before)[0])["samples"]["delivery_lag"])
+
+    def test_a_failed_baseline_drops_the_pod_and_names_it(self):
+        after = "# pod: a\nprocess_start_time_seconds 1\n" + METRICS + "# pod: b\nprocess_start_time_seconds 1\n" + METRICS
+        before = "# pod: a\n# pod: b\nprocess_start_time_seconds 1\n"
+        text, no_baseline = overhead.since(after, before)
+        self.assertEqual(["a"], no_baseline, "a's before scrape failed, so its after values are lifetime totals")
+        self.assertEqual(3, overhead.overhead(text)["samples"]["delivery_lag"], "only b's run")
+        self.assertEqual(("", ["a", "b"]), overhead.since(after, ""),
+                         "an empty before file is a failed scrape of every pod, not a missing argument")
+
+    def test_main_writes_no_baseline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            after, before = pathlib.Path(tmp, "after"), pathlib.Path(tmp, "before")
+            after.write_text("# pod: a\nprocess_start_time_seconds 1\n" + METRICS)
+            before.write_text("# pod: a\n")
+            proc = subprocess.run(["python3", str(_LANE / "overhead.py"), str(after), str(before)],
+                                  capture_output=True, text=True, check=True)
+            got = json.loads(proc.stdout)
+            self.assertEqual(["a"], got["no_baseline"])
+            self.assertEqual(0, got["samples"]["delivery_lag"])
 
 
 if __name__ == "__main__":

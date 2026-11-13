@@ -6,7 +6,10 @@ listener before its canaries and again after them, each pod's text under a
 "# pod: <name>" line, and hands both scrapes here. The histograms count from
 the pod's start, so what the canaries added is the difference, taken per pod;
 a pod that restarted in between (its process_start_time_seconds moved, or a
-count went down) counts from zero. Out comes that run's Slack overhead:
+count went down) counts from zero. A pod with no baseline (its before scrape
+failed, or it came up during the run) is dropped and named under no_baseline,
+since its after values alone are its lifetime totals. Out comes that run's
+Slack overhead:
 
 - delivery_lag_s: the mean of slack_ingress_lag_seconds, Slack's event time to
   the gateway receiving it over Socket Mode;
@@ -78,20 +81,26 @@ def _start(text: str) -> float | None:
     return next((value for name, _, value in _samples(text) if name == PROCESS_START), None)
 
 
-def since(after: str, before: str = "") -> str:
-    """after's three histograms less before's, pod by pod, as exposition text. A pod missing
-    from before, or one that restarted in between, keeps after's values."""
-    earlier = _pods(before)
-    lines = []
+def since(after: str, before: str | None = None) -> tuple[str, list[str]]:
+    """after's three histograms less before's, pod by pod, as exposition text, and the pods
+    left out for having no baseline. With no before at all, after is kept whole. A pod that
+    restarted in between keeps after's values; one whose before scrape carries no
+    process_start_time_seconds (the scrape failed, or the pod did not exist yet) is dropped."""
+    earlier = _pods(before) if before is not None else {}
+    lines, no_baseline = [], []
     for pod, text in _pods(after).items():
+        if before is not None and _start(earlier.get(pod, "")) is None:
+            if _counters(text):
+                no_baseline.append(pod)
+            continue
         now, then = _counters(text), _counters(earlier.get(pod, ""))
-        restarted = pod not in earlier or _start(text) != _start(earlier[pod]) or any(
+        restarted = before is None or _start(text) != _start(earlier[pod]) or any(
             then.get(key, 0.0) > value for key, value in now.items())
         for (name, labels), value in now.items():
             delta = value if restarted else value - then.get((name, labels), 0.0)
             label_text = ",".join(f'{k}="{v}"' for k, v in labels)
             lines.append(f"{name}{{{label_text}}} {delta}" if label_text else f"{name} {delta}")
-    return "\n".join(lines)
+    return "\n".join(lines), sorted(no_baseline)
 
 
 def _histogram(text: str, name: str, **want: str) -> tuple[float, float, list[tuple[float, float]]]:
@@ -163,7 +172,8 @@ def main(argv: list[str]) -> int:
     for path in argv[1:]:
         with open(path, encoding="utf-8") as fh:
             texts.append(fh.read())
-    print(json.dumps(overhead(since(*texts)), sort_keys=True))
+    text, no_baseline = since(*texts)
+    print(json.dumps({**overhead(text), "no_baseline": no_baseline}, sort_keys=True))
     return 0
 
 
