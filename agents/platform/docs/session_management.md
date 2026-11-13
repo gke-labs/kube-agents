@@ -10,7 +10,7 @@ AI agent execution is typically stateless and triggered on-demand. To support pr
 
 This server acts as a bridge between the **GKE Event Watcher** (monitoring target clusters) and the **Hermes Gateway** (running the LLM reasoning turns). The **drift detector** is a second producer on the watcher's side of that bridge, posting out-of-band cluster changes to the same routes; see [the second producer](#the-second-producer-gitops-drift). The `stall-watch` cron script is a third, posting namespaces whose controllers stopped making progress; see [the third producer](#the-third-producer-controller-stall). The turn it starts runs on the gateway's default profile — the **Planning Agent** — which delegates the diagnosis on the kanban board to the **Cluster Agent** of the cluster that raised the event, so the agent that investigates the failure is the one scoped to the cluster it happened on.
 
-It binds loopback rather than `0.0.0.0` because every one of its callers shares this Pod's network namespace: the event watcher and the drift detector, both in the `agent-api-auth` sidecar, the Platform MCP server, the `incident_context` plugin, the gateway's kanban notifier, and the chat adapter's scheduled-report relay, the two findings scripts, the `stall-watch` cron script, and the hermes-bridge sidecar, which records a gateway conversation's route (`PUT /v1/sessions/{id}/route`), stops that conversation's kanban cards (`POST /v1/sessions/{id}/cards/stop`, below), reads the report stored for a conversation a reply arrives on (`GET /v1/incidents/by-thread`, the `incident_context` read on the `api` executor's path), and relays the Slack Home tab's board (`GET /v1/board`). The Slack adapter's autonomy dial (`deploy/docker/patches/slack_dial_home.py`) reads the clean merges (`GET /v1/post-merge/clean-merges`). The hermes-bridge also records a session's origin (`PUT /v1/sessions/{id}/origin`). The work-origin callers are the rest ([below](#work-origin-tables)): the board's insert-time stamp (`deploy/docker/patches/kanban_origin.py`) reads a turn's origin (`GET /v1/sessions/{id}/origin`) and redeems stamp tickets; the bootstrap hand-off and the GitHub scan gate mint those tickets through it; the cron scheduler's origin patch (`deploy/docker/patches/cron_job_template.py`) reads and records a job's origin; the `pr_opened` plugin writes the proposals ledger; and the `chat_metrics` plugin reads its counts. The `session_store` plugin writes the `origin` keys of `session_metadata` straight into the database, not through a route. No count here on purpose: the list keeps growing and a stated total is what goes stale first. Every route except `/healthz` also requires a bearer token from the `SESSION_KV_API_KEY` key of the agent's Secret — the rows it serves carry chat identifiers, and loopback inside a shared namespace is not on its own an authorization boundary. Deliberately not `API_SERVER_KEY`, which is the non-secret sentinel `cluster-internal-trusted` and would authenticate nothing. When the key is absent the server answers `503` to every authenticated route and logs why; see [the credential-isolation design](../../../docs/credential-isolation-design.md#the-loopback-only-exception).
+It binds loopback rather than `0.0.0.0` because every one of its callers shares this Pod's network namespace: the event watcher and the drift detector, both in the `agent-api-auth` sidecar, the Platform MCP server, the `incident_context` plugin, the gateway's kanban notifier, and the chat adapter's scheduled-report relay, the two findings scripts, the `stall-watch` cron script, and the hermes-bridge sidecar, which records a gateway conversation's route (`PUT /v1/sessions/{id}/route`), stops that conversation's kanban cards (`POST /v1/sessions/{id}/cards/stop`, below), reads the report stored for a conversation a reply arrives on (`GET /v1/incidents/by-thread`, the `incident_context` read on the `api` executor's path), and relays the Slack Home tab's board (`GET /v1/board`). The Slack adapter's autonomy dial (`deploy/docker/patches/slack_dial_home.py`) reads the clean merges (`GET /v1/post-merge/clean-merges`). The hermes-bridge also records a session's origin (`PUT /v1/sessions/{id}/origin`). The work-origin callers are the rest ([below](#work-origin-tables)): the board's insert-time stamp (`deploy/docker/patches/kanban_origin.py`) reads a turn's origin (`GET /v1/sessions/{id}/origin`) and redeems stamp tickets; the bootstrap hand-off and the GitHub scan gate mint those tickets through it; the cron scheduler's origin patch (`deploy/docker/patches/cron_job_template.py`) reads and records a job's origin; the `pr_opened` plugin writes the proposals ledger and, with `KUBEAGENTS_POST_MERGE_CHECK` not `off`, the post-merge records; and the `chat_metrics` plugin reads its counts. The `session_store` plugin writes the `origin` keys of `session_metadata` straight into the database, not through a route. No count here on purpose: the list keeps growing and a stated total is what goes stale first. Every route except `/healthz` also requires a bearer token from the `SESSION_KV_API_KEY` key of the agent's Secret — the rows it serves carry chat identifiers, and loopback inside a shared namespace is not on its own an authorization boundary. Deliberately not `API_SERVER_KEY`, which is the non-secret sentinel `cluster-internal-trusted` and would authenticate nothing. When the key is absent the server answers `503` to every authenticated route and logs why; see [the credential-isolation design](../../../docs/credential-isolation-design.md#the-loopback-only-exception).
 
 ### Key Responsibilities:
 
@@ -394,13 +394,43 @@ that stamp one new card's origin at insert; a ticket is spent once, and `cleanup
 removes it once it is older than `STAMP_TICKET_TTL_SECONDS` (300). The card's stamp itself is in
 `kanban.db`, in the side table `kanban_task_origins`.
 
-#### `post_merge_records` (read here, not created)
+#### `post_merge_records`
 
-`GET /v1/post-merge/clean-merges` reads the post-merge check's `post_merge_records` table, which this
-server does not create, and answers the clean merges per repository, kind of fix and environment, as
-a `counts` list; `?repo=<url>` narrows it to one repository. The rule and its thresholds
-(`REVERT_WINDOW`, `CLEAN_MERGES_NEEDED`, `DAYS_NEEDED`) live in `clean_merges.py`. A table that
-does not exist yet answers an empty list; a table missing a column the count needs, or a database
+```sql
+CREATE TABLE post_merge_records(    -- POST /v1/post-merge/records
+  url TEXT PRIMARY KEY,
+  repo TEXT, number INTEGER, kind TEXT,
+  finding_id TEXT, project TEXT, location TEXT, cluster TEXT, namespace TEXT, object TEXT,
+  environment TEXT,
+  origin TEXT, origin_platform TEXT, opened_at TEXT,
+  task_id TEXT, thread_platform TEXT, thread_chat_id TEXT, thread_id TEXT,
+  merged_at TEXT, merge_commit TEXT, closed_at TEXT, merge_checked_at TEXT,
+  applied_at TEXT, sync_state TEXT, health_baseline TEXT, health_result TEXT, health_detail TEXT,
+  health_at TEXT, health_checked_at TEXT,
+  human_edited INTEGER, reverted_at TEXT, outcome TEXT, outcome_at TEXT,
+  outcome_detail TEXT, reported_at TEXT, followup_state TEXT, followup_attempts INTEGER,
+  followup_detail TEXT
+);
+```
+
+One row per fix pull request the post-merge check follows, the first record of a url standing. The
+`pr_opened` plugin writes it when it claims a proposal whose record names the finding it fixes (the
+fleet audit sets it for a one-workload `no-pdb` fix) and the install's `KUBEAGENTS_POST_MERGE_CHECK`
+switch is not `off`; with the switch off nothing is written. The server derives `kind` from the
+finding id's first segment (`POST_MERGE_KINDS` in `session_kv_server.py`, mirrored in the plugin)
+and ignores any kind the caller sends; `project` and `location` come from the Cluster Agent profile
+whose `cluster_identity` names that cluster (all three parts must match for the audit's qualified
+`<project>/<location>/<name>`), empty when none names it or the profiles that do disagree. The finding itself is
+still the opener's word, so the check verifies the fix rather than trusting the row. `repo` is read
+off the pull request url, and the thread is the one the opening card reports to: empty outside a
+kanban worker, which includes the scheduled audits. `environment` is stored if a caller sends it (the plugin does not); the merge, edit, revert and
+outcome columns are left for the check to fill. `cleanup_old_records` leaves the table: each row is
+a durable record of a fix pull request, not idle-session state.
+
+`GET /v1/post-merge/clean-merges` reads this table and answers the clean merges per repository, kind of
+fix and environment, as a `counts` list; `?repo=<url>` narrows it to one repository. The rule and its
+thresholds (`REVERT_WINDOW`, `CLEAN_MERGES_NEEDED`, `DAYS_NEEDED`) live in `clean_merges.py`. A table
+that does not exist yet answers an empty list; a table missing a column the count needs, or a database
 that cannot be read, answers `503`.
 
 #### `incidents`
