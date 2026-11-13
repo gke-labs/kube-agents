@@ -97,8 +97,11 @@ func TestAChildNeverReachesOutsideItsProfileParentsScope(t *testing.T) {
 		if rule != tc.rule {
 			t.Errorf("%s: rule %q, want %q", tc.name, rule, tc.rule)
 		}
-		if strings.Contains(notice, "project/") || strings.Contains(notice, "namespace/kube") {
+		if strings.Contains(notice, "project/") || strings.Contains(notice, "namespace/") {
 			t.Errorf("%s: notice %q shows a scope path, not a cluster", tc.name, notice)
+		}
+		if tc.parent == "namespace/other" && notice != noticeParentScopeStale {
+			t.Errorf("%s: notice %q, want the stale-scope notice", tc.name, notice)
 		}
 	}
 }

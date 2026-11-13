@@ -731,7 +731,8 @@ head may start one child of its own profile; when its target lies outside the pa
 (`delegation.parent-scope`: a cluster-scoped parent's children stay inside its cluster, and a
 targetless child under one is refused, while a parent with the install's scope may target any
 cluster the install admits); when the parent's scope and chain aren't on its record
-(`delegation.parent-scope-unknown`, failing closed); and when the parent runs at `unattended`
+(`delegation.parent-scope-unknown`, failing closed); when an ancestor the record still holds
+contradicts the parent's carried chain (`delegation.parent-chain-mismatch`); and when the parent runs at `unattended`
 (`delegation.unattended-parent`), whose trigger binding a child's grant doesn't carry yet. A child's
 end reaches a profile parent as a `childResult` message on the parent's `.in`, which the parent
 reads while it waits open, and the parent holds the conversation again, so a stop or a steer
