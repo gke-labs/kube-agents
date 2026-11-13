@@ -3588,6 +3588,16 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		Name:  "CREDENTIAL_PROXY_TOKEN_FILE",
 		Value: credentialProxyTokenMountPath + "/token",
 	})
+	// The kube-api proxy's URL, under a name nothing in this container acts on,
+	// so no shim or kubectl behaviour here changes. The scripts here that hop
+	// into the shell sandbox for a get-credentials (stall_watch,
+	// platform_mcp_server) read it to know the sandbox's shim writes a kube-proxy
+	// kubeconfig, which the sandbox always does (buildShellSandboxStatefulSet sets
+	// KUBE_PROXY_URL there), and so skip choosing endpoint flags that would not
+	// reach it (gke_endpoint.KUBE_PROXY_ENVS). When the shim cannot answer and the
+	// broker runs the fetch, the broker decides the endpoint for a fetch that
+	// names none (credential_proxy's _decision_for_callers_fetch).
+	envVars = append(envVars, corev1.EnvVar{Name: kubeProxyInUseURLEnv, Value: kubeProxyURL(agent)})
 	// Unconditional and in both modes, unlike the chat relay URLs: the remote
 	// MCP servers are in every profile that runs here, and mcp-remote presents
 	// the token above to reach them. A plugin cannot redirect it; the operator

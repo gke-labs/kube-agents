@@ -17,6 +17,7 @@ import (
 // transcript. spawn.go's truncateRunes guards the primer's tail only; this cut
 // lands mid-transcript and survives it.
 func TestTheRehydrationPrimerCutsOnRuneBoundaries(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	conv := "discord:g1/primer-runes"
 	r.adapter.inbox <- InboundMessage{
@@ -86,6 +87,7 @@ func TestTheRehydrationPrimerCutsOnRuneBoundaries(t *testing.T) {
 // started for is left out, or the new message would be replayed as history,
 // and a turn whose result has aged out still leaves what was asked.
 func TestTheRehydrationPrimerCarriesBothSidesOfEachTurn(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	conv := "discord:g1/primer-sides"
 	r.adapter.inbox <- InboundMessage{
@@ -296,6 +298,7 @@ func TestThePrimerCountsOnlyThePeopleOfTheTurnsItKeeps(t *testing.T) {
 // and refused, the turn says it ended with the gateway's reason. A turn that
 // failed on the stream says so too.
 func TestThePrimerReplaysHandOffsAndFailuresAsTheyEnded(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	ctx := context.Background()
 	someone := TaskRequester{Backend: "discord", Subject: "someone-hash"}
