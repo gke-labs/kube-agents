@@ -82,6 +82,7 @@ _KUBECTL_STUB = textwrap.dedent(
         pod="${pod%% *}"
         case "${args}" in
           *" --previous "*) echo "PREVIOUS ${pod}: auth callout exiting" ;;
+          *" --limit-bytes="*) echo "HEAD ${pod}: Starting nats-server" ;;
           *) echo "CURRENT ${pod}" ;;
         esac
         ;;
@@ -248,10 +249,27 @@ class A2AComponentLogsTest(unittest.TestCase):
         images = (artifacts / "a2a-nats-images.txt").read_text()
         self.assertIn("nats=docker.io/library/nats@sha256:aaa", images)
 
+    def test_a_bus_server_gets_the_head_of_its_log(self) -> None:
+        # The bring-up, where the meta group forms, is at the start of a log a
+        # long debug-level run pushes out of the tail (#5708).
+        result, artifacts, calls = self.collect()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"HEAD {_NATS}: Starting nats-server", (artifacts / f"a2a-nats-{_NATS}-head.log").read_text())
+        limit = lift_constant("A2A_DIAG_NATS_HEAD_MAX_BYTES", _CI_ENV.read_text(), _CI_ENV).split("=", 1)[1].strip()
+        heads = [c for c in self.logs_calls(calls, _NATS) if "--limit-bytes=" in c]
+        self.assertEqual(len(heads), 1, calls)
+        self.assertIn("-c nats", heads[0])
+        self.assertIn(f"--context {_CONTEXT}", heads[0])
+        self.assertIn("--limit-bytes=2097152", heads[0], limit)
+        # Only bus servers get a head read.
+        for pod in (_CRASHING, _READY, _SESSION):
+            self.assertFalse([c for c in self.logs_calls(calls, pod) if "--limit-bytes=" in c])
+
     def test_the_rollback_prefix_reaches_the_bus_server_files(self) -> None:
         result, artifacts, _ = self.collect(prefix="rollback-")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue((artifacts / f"rollback-a2a-nats-{_NATS}-jsz.json").exists())
+        self.assertTrue((artifacts / f"rollback-a2a-nats-{_NATS}-head.log").exists())
         self.assertTrue((artifacts / "rollback-a2a-nats-images.txt").exists())
         self.assertFalse((artifacts / f"a2a-nats-{_NATS}-jsz.json").exists())
 

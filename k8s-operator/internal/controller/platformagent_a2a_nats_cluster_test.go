@@ -1937,3 +1937,44 @@ func TestAClusterRollsOntoAProfileChangeInsteadOfReloading(t *testing.T) {
 		t.Errorf("a cluster's reload plan = %+v, annotations %v; want nothing tracked", plan, desired.Annotations)
 	}
 }
+
+// The bus logs at debug only while the operator's environment carries
+// A2A_NATS_DEBUG=true, as CI's does; never trace, which logs payloads. The
+// default render, and any other value, has neither.
+func TestTheBusLogsAtDebugOnlyWhenTheOperatorAsks(t *testing.T) {
+	render := func() string {
+		return renderA2ANATSConf(a2aTestAgent(), func(k string) string { return "pw-" + k }, &a2aCalloutKeys{IssuerPublic: "A", XKeyPublic: "X"}, nil)
+	}
+	debugLine := regexp.MustCompile(`(?m)^\s*debug:`)
+	traceLine := regexp.MustCompile(`(?m)^\s*(trace|trace_verbose):`)
+	if conf := render(); debugLine.MatchString(conf) || traceLine.MatchString(conf) {
+		t.Errorf("the default render logs at debug or trace:\n%s", conf)
+	}
+	for _, v := range []string{"1", "yes", "TRUE", ""} {
+		t.Setenv(a2aNATSDebugEnvVar, v)
+		if debugLine.MatchString(render()) {
+			t.Errorf("%s=%q turned debug on; only \"true\" does", a2aNATSDebugEnvVar, v)
+		}
+	}
+	t.Setenv(a2aNATSDebugEnvVar, "true")
+	conf := render()
+	if !regexp.MustCompile(`(?m)^debug: true$`).MatchString(conf) {
+		t.Errorf("%s=true left debug off:\n%s", a2aNATSDebugEnvVar, conf)
+	}
+	if traceLine.MatchString(conf) {
+		t.Error("debug brought trace with it")
+	}
+	// The rendered config still parses with the line in it.
+	full := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aFullCreds("c", "1"), a2aTestCalloutKeys(t), nil).Data["nats.conf"])
+	path := filepath.Join(t.TempDir(), "nats.conf")
+	if err := os.WriteFile(path, []byte(a2aWithTestTLS(t, strings.NewReplacer(`pid_file: "`+a2aNATSPIDFile+`"`, `pid_file: "`+filepath.Join(t.TempDir(), "pid")+`"`, "server_name: $POD_NAME", "server_name: n0").Replace(full))), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	opts, err := natsserver.ProcessConfigFile(path)
+	if err != nil {
+		t.Fatalf("the debug render does not parse: %v", err)
+	}
+	if !opts.Debug || opts.Trace {
+		t.Errorf("parsed debug=%v trace=%v, want debug only", opts.Debug, opts.Trace)
+	}
+}

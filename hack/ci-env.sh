@@ -229,6 +229,11 @@ readonly A2A_DIAG_NATS_EXEC_BOUND_SECONDS=10
 # wget's own read timeout, inside the exec's bound, so a monitor that accepts
 # and then stalls ends the read before the bound kills the exec.
 readonly A2A_DIAG_NATS_WGET_TIMEOUT_SECONDS=5
+# The first bytes of each bus server's log, beside the tail the component logs
+# keep (A2A_DIAG_LOG_MAX_BYTES). The lane runs the bus at debug (#5708), and a
+# server's bring-up, where its meta group forms, is at the start of a log a
+# long run can push out of the tail.
+readonly A2A_DIAG_NATS_HEAD_MAX_BYTES=$((2 * 1024 * 1024))
 readonly A2A_DIAG_NATS_IMAGES_JSONPATH='{range .items[*]}{.metadata.name}{"\t"}{range .status.containerStatuses[*]}{.name}={.imageID}{" "}{end}{"\n"}{end}'
 
 # ─── Inference-replay shadow mode ────────────────────────────────────────────
@@ -1386,8 +1391,10 @@ collect_a2a_component_logs() {
 
 # collect_a2a_nats_monitor reads one bus server's monitoring endpoints
 # (A2A_DIAG_NATS_MONITOR_PATHS) from inside its pod, one file each:
-# <base>-<path>.json. Same contract as its caller: every command ends in
-# `|| true`, so a server that doesn't answer leaves the error in its file.
+# <base>-<path>.json, and the head of its server log, <base>-head.log
+# (A2A_DIAG_NATS_HEAD_MAX_BYTES). Same contract as its caller: every command
+# ends in `|| true`, so a server that doesn't answer leaves the error in its
+# file.
 collect_a2a_nats_monitor() {
   local artifact_dir="$1" prefix="$2" ns="$3" pod="$4" base="$5"
   shift 5
@@ -1400,6 +1407,9 @@ collect_a2a_nats_monitor() {
       wget -qO- -T "${A2A_DIAG_NATS_WGET_TIMEOUT_SECONDS}" "${A2A_DIAG_NATS_MONITOR_URL}/${path}" 2>&1 \
       | last_bytes "${A2A_DIAG_NATS_READ_MAX_BYTES}" "${artifact_dir}/${prefix}${base}-${path}.json" || true
   done
+  "${kctl[@]}" logs "pod/${pod}" -n "${ns}" -c "${A2A_DIAG_NATS_CONTAINER}" \
+    --limit-bytes="${A2A_DIAG_NATS_HEAD_MAX_BYTES}" \
+    >"${artifact_dir}/${prefix}${base}-head.log" 2>&1 || true
   return 0
 }
 
