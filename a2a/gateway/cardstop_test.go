@@ -105,6 +105,7 @@ func shownContaining(r *rig, needle string) bool {
 }
 
 func TestCardStopPublishesTheDataPartAloneAndWordsTheAnswer(t *testing.T) {
+	t.Parallel()
 	r := cardStopRig(t, 0)
 	conv := "discord:g1/thread-cardstop-shape"
 	ranATurn(t, r, conv)
@@ -170,6 +171,7 @@ func TestCardStopPublishesTheDataPartAloneAndWordsTheAnswer(t *testing.T) {
 }
 
 func TestCardStopGateOffKeepsTheCardNotice(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	conv := "discord:g1/thread-cardstop-off"
 	ranATurn(t, r, conv)
@@ -181,6 +183,7 @@ func TestCardStopGateOffKeepsTheCardNotice(t *testing.T) {
 }
 
 func TestCardStopNeverOnTheSessionRoute(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawnerCap(t, RouteSession, 0, func(c *Config) { c.CardStop = true })
 	conv := "discord:g1/thread-cardstop-session"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "ss-1", Text: "check the pods"}
@@ -201,6 +204,7 @@ func TestCardStopNeverOnTheSessionRoute(t *testing.T) {
 }
 
 func TestCardStopCancelsTheRunningTurnFirst(t *testing.T) {
+	t.Parallel()
 	r := cardStopRig(t, 0)
 	conv := "discord:g1/thread-cardstop-active"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "ca-1", Text: "check the pods"}
@@ -261,6 +265,7 @@ func TestCardStopCancelsTheRunningTurnFirst(t *testing.T) {
 }
 
 func TestCardStopNotForAProgramsNamedCancel(t *testing.T) {
+	t.Parallel()
 	r := cardStopRig(t, 0)
 	conv := "discord:g1/thread-cardstop-named"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "nc-1", Text: "check the pods"}
@@ -274,6 +279,7 @@ func TestCardStopNotForAProgramsNamedCancel(t *testing.T) {
 }
 
 func TestCardStopNotForATopLevelStop(t *testing.T) {
+	t.Parallel()
 	r := cardStopRig(t, 0)
 	conv := "discord:g1/thread-cardstop-top"
 	ranATurn(t, r, conv)
@@ -287,6 +293,7 @@ func TestCardStopNotForATopLevelStop(t *testing.T) {
 // Every way a control can end without a usable answer answers the reply the
 // stop had before the card stop, never a success.
 func TestCardStopFallsBackWithoutAnAnswer(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name   string
 		finish func(t *testing.T, r *rig, control *lib.Envelope)
@@ -324,6 +331,7 @@ func TestCardStopFallsBackWithoutAnAnswer(t *testing.T) {
 }
 
 func TestCardStopTimesOut(t *testing.T) {
+	t.Parallel()
 	r := cardStopRig(t, 300*time.Millisecond)
 	conv := "discord:g1/thread-cardstop-timeout"
 	ranATurn(t, r, conv)
@@ -357,6 +365,7 @@ func TestCardStopTimesOut(t *testing.T) {
 // started before a restart) is given up on the next turn, so the stop it
 // meets is not answered "already stopping" for ever.
 func TestCardStopExpiresAControlFromBeforeARestart(t *testing.T) {
+	t.Parallel()
 	r := cardStopRig(t, 0)
 	conv := "discord:g1/thread-cardstop-expire"
 	ranATurn(t, r, conv)
@@ -384,6 +393,7 @@ func TestCardStopExpiresAControlFromBeforeARestart(t *testing.T) {
 // While a control runs, the next message is an ordinary turn: not a steer
 // into the control, and the control is not in the history the turn joins.
 func TestCardStopIsNotATurn(t *testing.T) {
+	t.Parallel()
 	r := cardStopRig(t, 0)
 	conv := "discord:g1/thread-cardstop-notturn"
 	ranATurn(t, r, conv)
@@ -517,6 +527,7 @@ func TestCardStopTitleIsSanitized(t *testing.T) {
 // The control's answer arrives on the result artifact; a gateway that lost
 // the render state to a restart reads it off the stream.
 func TestCardStopReadsTheAnswerOffTheStreamAfterARestart(t *testing.T) {
+	t.Parallel()
 	r := cardStopRig(t, 0)
 	var replayedID atomic.Value
 	r.g.terminalReplayHook = func(taskID string) error {
@@ -567,6 +578,7 @@ func TestCardStopReadsTheAnswerOffTheStreamAfterARestart(t *testing.T) {
 // stop, a new question started while the control ran, and the second stop
 // cancelled that question.
 func TestCardStopFollowUpCatchesCardsFiledSinceTheLastStop(t *testing.T) {
+	t.Parallel()
 	r := cardStopRig(t, 0)
 	conv := "discord:g1/thread-cardstop-again"
 	ranATurn(t, r, conv)
@@ -608,6 +620,7 @@ func TestCardStopFollowUpCatchesCardsFiledSinceTheLastStop(t *testing.T) {
 // A stop told "the answer comes" while a quiet follow-up runs gets that
 // answer, even when the follow-up finds nothing.
 func TestCardStopPromisedAnswerFromAQuietFollowUp(t *testing.T) {
+	t.Parallel()
 	r := cardStopRig(t, 0)
 	conv := "discord:g1/thread-cardstop-again-promised"
 	ranATurn(t, r, conv)
@@ -636,6 +649,7 @@ func TestCardStopPromisedAnswerFromAQuietFollowUp(t *testing.T) {
 
 // A follow-up that fails says so, as the first control would.
 func TestCardStopFollowUpFailurePostsTheFallback(t *testing.T) {
+	t.Parallel()
 	r := cardStopRig(t, 0)
 	conv := "discord:g1/thread-cardstop-again-fail"
 	ranATurn(t, r, conv)
@@ -656,6 +670,7 @@ func TestCardStopFollowUpFailurePostsTheFallback(t *testing.T) {
 // running sends no follow-up: it would wait for that question and archive its
 // cards too. The room is told instead.
 func TestCardStopFollowUpSkippedForANewerTurn(t *testing.T) {
+	t.Parallel()
 	r := cardStopRig(t, 0)
 	conv := "discord:g1/thread-cardstop-again-newer"
 	ranATurn(t, r, conv)
@@ -682,6 +697,7 @@ func TestCardStopFollowUpSkippedForANewerTurn(t *testing.T) {
 // A marked control that ends after the conversation moved to a session
 // worker sends no follow-up, and says that, not that a question is running.
 func TestCardStopFollowUpSkippedWhenTheRouteMoved(t *testing.T) {
+	t.Parallel()
 	r, _ := startRigWithSpawnerCap(t, "platform", 0, func(c *Config) { c.CardStop = true })
 	conv := "discord:g1/thread-cardstop-again-moved"
 	ranATurn(t, r, conv)
@@ -717,6 +733,7 @@ func TestCardStopFollowUpSkippedWhenTheStopIsOff(t *testing.T) {
 // The timer path with a control sent after a cancel answers the armed
 // fallback, not the card notice.
 func TestCardStopTimesOutAfterACancel(t *testing.T) {
+	t.Parallel()
 	r := cardStopRig(t, 300*time.Millisecond)
 	conv := "discord:g1/thread-cardstop-timeout-active"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "ta-1", Text: "check the pods"}
@@ -732,6 +749,7 @@ func TestCardStopTimesOutAfterACancel(t *testing.T) {
 
 // A stop whose cancel cannot be published sends no control.
 func TestCardStopNotSentWhenTheCancelFails(t *testing.T) {
+	t.Parallel()
 	r := cardStopRig(t, 0)
 	conv := "discord:g1/thread-cardstop-cancel-fails"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "cf-1", Text: "check the pods"}
@@ -751,6 +769,7 @@ func TestCardStopNotSentWhenTheCancelFails(t *testing.T) {
 // A control that cannot be started answers the armed fallback at once: a
 // failed capability mint posts no placeholder, a failed publish edits it.
 func TestCardStopThatCannotStartAnswersTheFallback(t *testing.T) {
+	t.Parallel()
 	t.Run("capability mint fails", func(t *testing.T) {
 		r := cardStopRig(t, 0)
 		conv := "discord:g1/thread-cardstop-mint-fails"
@@ -787,6 +806,7 @@ func TestCardStopThatCannotStartAnswersTheFallback(t *testing.T) {
 
 // An answer whose edit fails is posted.
 func TestCardStopAnswerPostsWhenTheEditFails(t *testing.T) {
+	t.Parallel()
 	r := cardStopRig(t, 0)
 	conv := "discord:g1/thread-cardstop-edit-fails"
 	ranATurn(t, r, conv)
@@ -806,6 +826,7 @@ func TestCardStopAnswerPostsWhenTheEditFails(t *testing.T) {
 // and the outcome, so an operator can tell an old bridge (rejected
 // no-text-parts) from a failed stop and a timeout.
 func TestCardStopEndedIsLogged(t *testing.T) {
+	t.Parallel()
 	r, _ := startRigWithSpawnerCap(t, "platform", 0, func(c *Config) { c.CardStop = true })
 	conv := "discord:g1/thread-cardstop-log"
 	ranATurn(t, r, conv)
@@ -820,6 +841,7 @@ func TestCardStopEndedIsLogged(t *testing.T) {
 // task index outlived the route's retirement, is dropped, never rendered as a
 // task's terminal.
 func TestCardStopLateEventAfterAFailedIndexDropIsDropped(t *testing.T) {
+	t.Parallel()
 	r := cardStopRig(t, 0)
 	conv := "discord:g1/thread-cardstop-late"
 	ranATurn(t, r, conv)
@@ -844,6 +866,7 @@ func TestCardStopLateEventAfterAFailedIndexDropIsDropped(t *testing.T) {
 // The same late event, for a control a follow-up has since followed and
 // ended: one remembered id would name the follow-up, not the control.
 func TestCardStopLateEventAfterAFollowUpIsDropped(t *testing.T) {
+	t.Parallel()
 	r := cardStopRig(t, 0)
 	conv := "discord:g1/thread-cardstop-late-fu"
 	ranATurn(t, r, conv)
@@ -872,6 +895,7 @@ func TestCardStopLateEventAfterAFollowUpIsDropped(t *testing.T) {
 // with nothing running, reports the card stop as a stop that reached the bus,
 // not as a refusal that leaves the work running.
 func TestCardStopInjectCancelReportsTheStop(t *testing.T) {
+	t.Parallel()
 	r := startInjectRigWith(t, func(c *Config) { c.CardStop = true })
 	reply := r.inject(t, "case-cardstop", injectTestAuthor, "check the pods")
 	origin := r.awaitTask(t, "platform")
@@ -916,6 +940,7 @@ func TestCardStopInjectCancelReportsTheStop(t *testing.T) {
 // inject door's cancel count: a program's cancel waiting on the conversation
 // would read the follow-up as its own cancel on the bus.
 func TestCardStopFollowUpTellsNoDoorACancelWent(t *testing.T) {
+	t.Parallel()
 	r := startInjectRigWith(t, func(c *Config) { c.CardStop = true })
 	reply := r.inject(t, "case-cardstop-fu", injectTestAuthor, "check the pods")
 	origin := r.awaitTask(t, "platform")
@@ -966,6 +991,7 @@ func TestCardStopFollowUpTellsNoDoorACancelWent(t *testing.T) {
 // answer: the door's Edit cannot reach a placeholder, and the answer comes
 // after the turn with no task to carry it.
 func TestCardStopOnTheA2ADoorPromisesNoAnswer(t *testing.T) {
+	t.Parallel()
 	r := startA2ARigOpts(t, func(door *A2ADoor) Adapter { return door }, nil, func(c *Config) { c.CardStop = true })
 	taskOf(t, r.rpc(t, a2aTestCaller, a2aMethodSend, sendParams("check the pods", "m-1", "ctx-cs", false)))
 	origin := r.awaitTask(t, "platform")

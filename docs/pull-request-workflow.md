@@ -254,11 +254,13 @@ bases against their Dockerfile `ARG` defaults; the Go builder pin against the `g
 `k8s-operator/go.mod`; the pins and repositories compiled into the operator binary (the fluent-bit
 fallback, the NATS, NATS exporter and nats-box pins, the A2A `next`-stack image names) and the gateway binary's
 worker repository; the example manifests; and the kustomize integrations, which it requires to name a variable the file owns
-rather than a literal. Two copies it does not reach, where a stale pin passes every check:
+rather than a literal. Copies it does not reach, where a stale pin passes every check:
 Hindsight's images sit behind `hindsight.enabled` — unset by default, and then following
 `platformAgent.harness.memory.provider`, which no render turns on — so their pins in
-`charts/kube-agents/values.yaml` are unguarded; and cert-manager's version is set again in
-`terraform/examples/full-install/variables.tf`, which no check reads. So: bump the pin in
+`charts/kube-agents/values.yaml` are unguarded; cert-manager's version is set again in
+`terraform/examples/full-install/variables.tf`, which no check reads; and the example
+fluent-bit tags in `INSTALL.md` and the commented example in
+`k8s-operator/config/manager/manager.yaml` are prose. So: bump the pin in
 `images.json`, run `make images-check` and `make docs-generate`, then grep the tree for the old
 version before opening the pull request.
 

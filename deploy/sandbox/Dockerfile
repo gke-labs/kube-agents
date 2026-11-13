@@ -100,6 +100,8 @@ ARG KUBECTL_VERSION=1.35.10
 ARG KUBECTL_SHA256_AMD64=c49a28f1f4efc4d475ed05f47f2ce8e563bf7bef69ed77fe1b924ea6d83b6327
 ARG KUBECTL_SHA256_ARM64=283f1be6a46b3695b625e25030106b8ffe18bd0d3a900f5b65c259ca407f04f5
 COPY deploy/sandbox/check_kubectl_base_path.py /tmp/check_kubectl_base_path.py
+# The wrapper below asks this first, and starts Python only when the context is not registered yet.
+COPY --chmod=0755 deploy/sandbox/kubectl_context_registered.sh /usr/local/libexec/kubectl-context-registered
 RUN ARCH=$(dpkg --print-architecture) && \
     case "${ARCH}" in \
       amd64) KUBECTL_SHA256="${KUBECTL_SHA256_AMD64}" ;; \
@@ -119,7 +121,7 @@ RUN ARCH=$(dpkg --print-architecture) && \
       'if [ -n "${KUBE_PROXY_URL:-}" ]; then' \
       '  case " $* " in' \
       '  *" --context"*)' \
-      '    PYTHONDONTWRITEBYTECODE=1 python3 -I /opt/defaults/scripts/credential_proxy_client.py --ensure-kubectl-context "$@" 2>/dev/null || true' \
+      '    /usr/local/libexec/kubectl-context-registered "$@" 2>/dev/null || PYTHONDONTWRITEBYTECODE=1 python3 -I /opt/defaults/scripts/credential_proxy_client.py --ensure-kubectl-context "$@" 2>/dev/null || true' \
       '    ;;' \
       '  esac' \
       'fi' \
@@ -607,6 +609,8 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          and passes the flags on; this module parses them
 #   kubeagents_switches.py the earned-autonomy switches' one reader: the root-owned
 #                          files entrypoint.sh writes, then the session's variables
+#   automation_rules.py    checks a GitOps checkout's .kube-agents/automation.yaml,
+#                          the checkouts being here; imports kubeagents_switches
 #   broker_admission.py    how wide the fleet-audit collectors sweep: it reads what
 #                          the broker admits at once (GET /v1/exec/admission)
 #                          through credential_proxy_client and sizes their pools
@@ -694,6 +698,7 @@ COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/feedback_summary.py \
      agents/platform/scripts/fleet_scope_args.py \
      agents/platform/scripts/kubeagents_switches.py \
+     agents/platform/scripts/automation_rules.py \
      agents/platform/scripts/collector_run.py \
      agents/platform/scripts/broker_admission.py \
      agents/platform/scripts/vcs_client.py \
