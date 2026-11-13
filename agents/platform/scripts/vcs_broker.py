@@ -2479,9 +2479,9 @@ WRITE_VERBS = frozenset(
 # default, is today's behaviour. `none` is explain-only: the broker refuses
 # PROPOSE_VERBS, every verb that moves a branch or writes to a proposal. Issues
 # and labels stay open to it, because an issue is how an audit reports.
-# Read on every request through write_mode(), the one place a second source
-# (a runtime setting) can be added. Today its only source is the broker's env,
-# so on a pod a change applies once the operator has rolled the broker.
+# Read on every request through write_mode(), which takes the most restrictive
+# of the broker's env (applies once the operator has rolled the broker) and the
+# Slack autonomy dial (applies at once; see dial_level below).
 WRITE_MODE_ENV = "KUBEAGENTS_WRITE_MODE"
 WRITE_MODE_PROPOSE = "propose"
 WRITE_MODE_NONE = "none"
@@ -2502,15 +2502,90 @@ PROPOSE_VERBS = frozenset(
 def write_mode(environ: Mapping[str, str] | None = None) -> tuple[str, str]:
     """The install's write mode and the raw value it was read from.
 
-    Unset or empty is `propose`. A value that is neither mode is `none`: a
-    setting someone wrote to restrict the agent must not lift the restriction
-    because it was misspelt.
+    The most restrictive of two sources: the broker's env, and the Slack
+    autonomy dial (`dial_level`), whose Explain is `none`. Unset or empty env
+    is `propose`. A value that is neither mode is `none`: a setting someone
+    wrote to restrict the agent must not lift the restriction because it was
+    misspelt. When the dial is what restricts, the raw value is `none`, so
+    `write_mode_detail` says nothing about the env.
     """
     raw = (os.environ if environ is None else environ).get(WRITE_MODE_ENV, "")
     value = raw.strip().lower()
     if not value:
-        return WRITE_MODE_PROPOSE, raw
-    return (value if value in WRITE_MODES else WRITE_MODE_NONE), raw
+        mode = WRITE_MODE_PROPOSE
+    else:
+        mode = value if value in WRITE_MODES else WRITE_MODE_NONE
+    if mode == WRITE_MODE_PROPOSE and dial_level(environ) == DIAL_EXPLAIN:
+        return WRITE_MODE_NONE, WRITE_MODE_NONE
+    return mode, raw
+
+
+# The Slack autonomy dial's level, the runtime source write_mode() reads beside
+# the env, set through set_dial_level(), so a new level applies with no pod
+# restart. Nothing in the broker calls set_dial_level() yet; the Slack adapter's
+# report is its intended caller. Only while `KUBEAGENTS_DIAL` is `on` (the broker
+# gets spec.deployment.env); off, the dial is not a source at all. On, a broker
+# with no level set since it started reads the level it last stored on its own
+# volume, and with none stored, Explain: it fails closed. The dial only ever
+# restricts.
+DIAL_ENV = "KUBEAGENTS_DIAL"
+DIAL_STATE_FILE_ENV = "KUBEAGENTS_DIAL_STATE_FILE"
+DIAL_STATE_FILE = "/var/lib/credential-proxy/dial-level"
+DIAL_EXPLAIN = "explain"
+DIAL_PROPOSE = "propose"
+DIAL_AUTOMERGE = "automerge"
+DIAL_LEVELS = (DIAL_EXPLAIN, DIAL_PROPOSE, DIAL_AUTOMERGE)
+_dial_lock = threading.Lock()
+_dial_level: str | None = None
+_dial_reported = False
+
+
+def dial_enabled(environ: Mapping[str, str] | None = None) -> bool:
+    return (os.environ if environ is None else environ).get(DIAL_ENV, "").strip().lower() == "on"
+
+
+def _dial_state_path(environ: Mapping[str, str] | None = None) -> Path:
+    return Path((os.environ if environ is None else environ).get(DIAL_STATE_FILE_ENV, "") or DIAL_STATE_FILE)
+
+
+def dial_level(environ: Mapping[str, str] | None = None) -> str | None:
+    """The dial's level, or None while `KUBEAGENTS_DIAL` is not `on`."""
+    if not dial_enabled(environ):
+        return None
+    with _dial_lock:
+        if _dial_level is not None:
+            return _dial_level
+    try:
+        stored = _dial_state_path(environ).read_text(encoding="utf-8").strip()
+    except OSError:
+        stored = ""
+    return stored if stored in DIAL_LEVELS else DIAL_EXPLAIN
+
+
+def set_dial_level(level: str, environ: Mapping[str, str] | None = None) -> None:
+    """Record the level the gateway reported; ValueError for anything but a level."""
+    global _dial_level, _dial_reported
+    if level not in DIAL_LEVELS:
+        raise ValueError(f"level must be one of {', '.join(DIAL_LEVELS)}")
+    path = _dial_state_path(environ)
+    with _dial_lock:
+        _dial_level = level
+        _dial_reported = True
+        # Kept on the broker's own volume, so a restarted broker process keeps
+        # it; best effort, because the gateway reports it again within a minute.
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(level + "\n", encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError as exc:
+            LOGGER.warning("could not store the dial level at %s: %s", path, exc)
+
+
+def dial_reported() -> bool:
+    """Whether the gateway has reported the dial's level to this broker process."""
+    with _dial_lock:
+        return _dial_reported
 
 
 def write_mode_detail(raw: str) -> str:
@@ -2627,6 +2702,15 @@ __all__ = [
     "WRITE_MODE_PROPOSE",
     "WRITE_MODES",
     "WRITE_VERBS",
+    "DIAL_AUTOMERGE",
+    "DIAL_ENV",
+    "DIAL_EXPLAIN",
+    "DIAL_LEVELS",
+    "DIAL_PROPOSE",
+    "dial_enabled",
+    "dial_level",
+    "dial_reported",
+    "set_dial_level",
     "write_mode",
     "write_mode_detail",
     "max_bundle_bytes",
