@@ -234,7 +234,7 @@ generate_sboms() {
 build_binaries() {
   local commit_sha
   commit_sha="$(resolve_bundle_commit "${TAG_NAME}")"
-  DIST_DIR="${TMP_DIST_DIR}" RELEASE_COMMIT="${commit_sha}" REPO_ROOT="${REPO_ROOT}" \
+  DIST_DIR="${TMP_DIST_DIR}" RELEASE_COMMIT="${commit_sha}" RELEASE_REPO_ROOT="${REPO_ROOT}" \
     bash "${SCRIPT_DIR}/build_release_binaries.sh" "${TAG_NAME}"
 }
 
