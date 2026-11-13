@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"time"
 
@@ -246,10 +247,10 @@ func (d *Dispatcher) stopRequested(ctx context.Context, log *slog.Logger, profil
 		}
 	default:
 		got, ok := stopFor(profile, msg.Header.Get("Nats-Subject"), msg.Data)
-		d.stopStreamRead()
+		d.stopStreamRead(slot)
 		return ok && got == taskID
 	}
-	d.stopStreamRead()
+	d.stopStreamRead(slot)
 	return false
 }
 
@@ -264,22 +265,46 @@ const stopReadBackoff = 30 * time.Second
 // is missed by any dispatcher that didn't hear it live.
 func (d *Dispatcher) stopStreamFailed(log *slog.Logger, slot int, why string) {
 	d.mu.Lock()
-	first := d.stopStreamErr == ""
+	_, failing := d.stopStreamErr[slot]
 	if d.stopReadRetry == nil {
 		d.stopReadRetry = map[int]time.Time{}
 	}
-	d.stopStreamErr, d.stopReadRetry[slot] = why, d.now().Add(stopReadBackoff)
+	if d.stopStreamErr == nil {
+		d.stopStreamErr = map[int]string{}
+	}
+	d.stopStreamErr[slot], d.stopReadRetry[slot] = why, d.now().Add(stopReadBackoff)
 	d.mu.Unlock()
-	if first {
+	if !failing { // logged once per slot until it reads again
 		log.Error("cannot read the stop stream; queued tasks are taken as not stopped, and a stop is honoured only if heard live",
 			"stream", lib.DispatchStopStream, "err", why, "retryAfter", stopReadBackoff)
 	}
 }
 
-func (d *Dispatcher) stopStreamRead() {
+// stopStreamRead records a good read on slot's connection; it clears that
+// slot's failure only.
+func (d *Dispatcher) stopStreamRead(slot int) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.stopStreamErr = ""
+	delete(d.stopStreamErr, slot)
+}
+
+// stopStreamReport is Health's StopStream: the one failure as it is
+// without bucketed grants, else each failing bucket's, in bucket order.
+// Caller holds d.mu.
+func (d *Dispatcher) stopStreamReport() string {
+	if d.buckets == nil {
+		return d.stopStreamErr[0]
+	}
+	slots := make([]int, 0, len(d.stopStreamErr))
+	for s := range d.stopStreamErr {
+		slots = append(slots, s)
+	}
+	sort.Ints(slots)
+	parts := make([]string, 0, len(slots))
+	for _, s := range slots {
+		parts = append(parts, fmt.Sprintf("bucket %d: %s", s, d.stopStreamErr[s]))
+	}
+	return strings.Join(parts, "; ")
 }
 
 // stopQueued ends a submission that was stopped before any worker had it:

@@ -321,8 +321,8 @@ func serve(ctx context.Context, log *slog.Logger, s settings, kube kubernetes.In
 // in bucket order, each named for its bucket; nil, nil when they aren't. On
 // an error it returns the ones it opened, for the caller to close.
 //
-// Each connection retries in the background (RetryOnFailedConnect) instead
-// of being waited for here: a bucket the callout refuses (its mint over the
+// Each connection's first dial retries in the background
+// (RetryOnFailedConnect, first dial only) instead of being waited for here: a bucket the callout refuses (its mint over the
 // reply cap, a bad entry) must stop only that bucket's profiles, as it does at
 // runtime, not hold the whole process before Run. Ready still needs every
 // connection up, so a bucket that never connects is visible, not silent.
@@ -333,10 +333,13 @@ func connectBuckets(ctx context.Context, log *slog.Logger, s settings) ([]*lib.C
 	var out []*lib.Client
 	for b, auth := range s.bucketAuth {
 		opts := append(append([]nats.Option{}, auth...),
-			nats.RetryOnFailedConnect(true), nats.ReconnectWait(reconnectWait), nats.ReconnectJitter(reconnectJitter, reconnectJitter))
+			nats.ReconnectWait(reconnectWait), nats.ReconnectJitter(reconnectJitter, reconnectJitter))
 		c, err := lib.Connect(ctx, s.natsURL, lib.WithName(fmt.Sprintf("%s-b%d", clientName, b)), lib.WithLogger(log),
 			lib.WithAgreementPolicy(lib.AgreementPolicy{Submitter: dispatch.DefaultSubmitter}),
-			lib.WithNATSOptions(opts...))
+			lib.WithNATSOptions(opts...),
+			// The first dial only: a later rebuild keeps lib's own backoff
+			// and sees a failed dial as the failure it is.
+			lib.WithFirstDialNATSOptions(nats.RetryOnFailedConnect(true)))
 		if err != nil {
 			return out, fmt.Errorf("bucket %d: %w", b, err)
 		}

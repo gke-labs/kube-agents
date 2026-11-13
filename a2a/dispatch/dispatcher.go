@@ -251,11 +251,12 @@ type Dispatcher struct {
 	// stopped the stops heard live, by profile/task (stop.go).
 	stopSubs map[string]lib.Subscription
 	stopped  map[string]time.Time
-	// stopStreamErr is why the last read of the stop stream failed ("" once
-	// one succeeds), and stopReadRetry when each connection slot may read it
-	// again (stop.go): per slot, so one bucket's failed read holds back no
-	// other bucket's catch-up.
-	stopStreamErr string
+	// stopStreamErr is why each connection slot's last read of the stop
+	// stream failed (no entry once one succeeds), and stopReadRetry when
+	// each slot may read it again (stop.go): per slot, so one bucket's
+	// failed read holds back no other bucket's catch-up, and one bucket's
+	// good read clears no other bucket's failure.
+	stopStreamErr map[int]string
 	stopReadRetry map[int]time.Time
 	// jobAdmissionErr is the last refusal of a Job by the admission
 	// policy, "" once one is admitted (job.go).

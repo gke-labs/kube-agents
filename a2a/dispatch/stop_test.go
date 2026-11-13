@@ -3,6 +3,7 @@ package dispatch
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -535,7 +536,31 @@ func TestAClosedConnectionDoesNotBackTheStopStreamOff(t *testing.T) {
 	if d.stopRequested(context.Background(), quietLog(), "tse", "task-1") {
 		t.Fatal("a stop read on a closed connection reported a stop")
 	}
-	if d.stopStreamErr != "" || len(d.stopReadRetry) != 0 {
-		t.Errorf("stop stream error %q, retry at %v; want neither for a closed connection", d.stopStreamErr, d.stopReadRetry)
+	if len(d.stopStreamErr) != 0 || len(d.stopReadRetry) != 0 {
+		t.Errorf("stop stream errors %v, retry at %v; want neither for a closed connection", d.stopStreamErr, d.stopReadRetry)
+	}
+}
+
+// One bucket's good read must not clear another bucket's failure, and each
+// failing bucket shows in Health.
+func TestAStopStreamFailureIsKeptPerBucket(t *testing.T) {
+	d := &Dispatcher{cfg: testConfig(), now: time.Now, buckets: make([]*lib.Client, lib.DispatcherBuckets)}
+	log := slog.New(slog.DiscardHandler)
+	d.stopStreamFailed(log, 3, "no responders")
+	d.stopStreamFailed(log, 9, "permissions violation")
+	d.stopStreamRead(5)
+	d.stopStreamRead(9)
+	if got, want := d.Health().StopStream, "bucket 3: no responders"; got != want {
+		t.Fatalf("StopStream = %q, want %q", got, want)
+	}
+	d.stopStreamRead(3)
+	if got := d.Health().StopStream; got != "" {
+		t.Fatalf("StopStream = %q after every bucket read, want empty", got)
+	}
+
+	single := &Dispatcher{cfg: testConfig(), now: time.Now}
+	single.stopStreamFailed(log, 0, "status 503 no stream")
+	if got, want := single.Health().StopStream, "status 503 no stream"; got != want {
+		t.Fatalf("unbucketed StopStream = %q, want %q", got, want)
 	}
 }
