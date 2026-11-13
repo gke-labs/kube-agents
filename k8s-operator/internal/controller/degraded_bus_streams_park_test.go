@@ -271,3 +271,24 @@ func TestAParkFollowsTheStreamsMessage(t *testing.T) {
 		t.Errorf("edit %d %+v, want the new message %q", edit, cond, now.Message)
 	}
 }
+
+// A spec edit during a park (a new generation) with the streams still
+// missing brings Degraded's observedGeneration level with Ready's, once:
+// the next pass at the same generation keeps it.
+func TestAParkMovesDegradedToANewGeneration(t *testing.T) {
+	agent := a2aTestAgent()
+	agent.Generation = 4
+	meta.SetStatusCondition(&agent.Status.Conditions, busStreamsPresent(metav1.ConditionFalse))
+	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+		Type: degradedConditionType, Status: metav1.ConditionTrue, Reason: conditionReasonA2ABusStreamsMissing,
+		Message: parkStreamsMissingMsg, ObservedGeneration: 3,
+	})
+	edit, cond := parkBusStreamsDegraded(agent)
+	if edit != busStreamsDegradedSet || cond.ObservedGeneration != 4 {
+		t.Fatalf("Degraded a generation behind: edit %d %+v, want a write at generation 4", edit, cond)
+	}
+	applyParkBusStreamsDegraded(agent, edit, cond, metav1.Now())
+	if edit, _ := parkBusStreamsDegraded(agent); edit != busStreamsDegradedKeep {
+		t.Errorf("the pass after the write: edit %d, want keep", edit)
+	}
+}

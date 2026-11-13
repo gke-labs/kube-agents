@@ -85,10 +85,14 @@ func parkBusStreamsDegraded(agent *agentv1alpha1.PlatformAgent) (busStreamsDegra
 		if degradedRanksAboveBusStreams(degraded.Reason) {
 			return busStreamsDegradedKeep, nil
 		}
-		// Compared as updateStatusReady compares it (degradedUnchanged), so
-		// the two writers agree on what is current and neither rewrites the
-		// other's condition.
-		if degraded.Reason == conditionReasonA2ABusStreamsMissing && degraded.Message == streams.Message {
+		// Current when the reason and message match, as updateStatusReady
+		// compares them (degradedUnchanged), and when it carries this
+		// generation: updateStatusReady stamps the generation on every write,
+		// and a park that wrote Ready for a spec edit must not leave Degraded
+		// a generation behind. One write brings both level, so this does not
+		// write on every tick.
+		if degraded.Reason == conditionReasonA2ABusStreamsMissing && degraded.Message == streams.Message &&
+			degraded.ObservedGeneration == agent.Generation {
 			return busStreamsDegradedKeep, nil
 		}
 	}
