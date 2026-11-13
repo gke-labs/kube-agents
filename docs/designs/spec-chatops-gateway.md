@@ -1685,12 +1685,12 @@ with `kept` beside the error, and `a2a notify` exits with a fourth status for it
 senders that re-send on failure (the drift-backlog digest, the data-volume warning) take
 it as handled, so the keep holds one copy, and the alert path records the alert as kept
 rather than lost. The agent-side callers
-(`agents/platform/scripts/chat_notify.py`) switch on `routed_platforms()`, `A2A_NOTIFY_PLATFORM` when set, else the projected file. The variable
-holds a comma-separated list of platform names, and a single name is a list of one; the operator
-renders one name today, exactly when `a2aChatArmed` holds and `homeChannel` is a space name, or is unset with
-Slack not enabled (`a2aGchatHomeRouted`), and send to every
+(`agents/platform/scripts/chat_notify.py`) switch on `routed_platforms()` (`A2A_NOTIFY_PLATFORM` when set, else the projected file) and send to every
 other platform through `hermes send` as before (a day on with no conversation to take onboarding's
-first report, that report is a ledger issue on GitHub and one home line linking it goes the same way). The kanban notifier's report back to a gateway
+first report, that report is a ledger issue on GitHub and one home line linking it goes the same way).
+The variable holds a comma-separated list of platform names, and a single name is a list of one;
+the operator renders one name today, exactly when `a2aChatArmed` holds and `homeChannel` is a space
+name, or is unset with Slack not enabled (`a2aGchatHomeRouted`). The kanban notifier's report back to a gateway
 conversation (below), and onboarding's first report into the conversation the user first wrote in,
 are armed by their own variable, `A2A_NOTIFY_CONVERSATIONS`, a comma-separated list of the
 platforms the gateway serves (read by `gateway_platforms()`), which the operator renders, one name
