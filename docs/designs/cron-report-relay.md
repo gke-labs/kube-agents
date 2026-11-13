@@ -650,19 +650,21 @@ An install with no chat route gets no send at all: when the managed scope turns
 every platform off and nothing routes one through the gateway — an install with
 neither Google Chat nor Slack, or one whose home channel is malformed, which routes
 nothing — the relay answers 502 without posting, and the detail says that no route
-exists. The operator names every armed platform in `A2A_NOTIFY_PLATFORM` (a
-comma-separated list of platform names), and the agent sends home posts to the ones with a
-home channel it can see (`chat_notify.routed_platforms()`). So a `next` install whose
-gateway holds no platform with a home channel is routed anyway: the relay sends to every
-armed platform, and the gateway refuses the post and keeps it for the digest it posts once a
-home channel is set (the gateway design, "Proactive posts"). With a home channel on one
-platform, the agent sends only to that platform and the report posts there. The 502's detail is then
-the relay's `composed but not delivered to <platform>`. The gateway's refusal, which
-says the post is kept, is in the gateway's and the session server's logs. A pod
-rendered before the operator routed it still answers the platform-naming detail
+exists. The operator names every armed platform in `A2A_NOTIFY_CONVERSATIONS` and every
+armed platform with a home channel set on the CR in `A2A_NOTIFY_PLATFORM` (each a
+comma-separated list of platform names). The agent adds Slack when the gateway learned a
+channel, and sends home posts to every armed platform when no platform has a home
+(`chat_notify.routed_platforms()`). So a `next` install whose gateway holds no platform
+with a home channel is routed anyway: the relay sends to every armed platform, and the
+gateway refuses the post and keeps it for the digest it posts once a home channel is set
+(the gateway design, "Proactive posts"). With a home channel on one platform, the agent
+sends only to that platform and the report posts there. The 502's detail is then the
+relay's `composed but not delivered to <platform>`. The gateway's refusal, which says the
+post is kept, is in the gateway's and the session server's logs. The platform-naming detail
 (`composed but not delivered to slack (no home channel: set
-spec.integration.slack.homeChannel / SLACK_HOME_CHANNEL)`), one such sentence per
-gateway platform without a home channel, joined by `; `.
+spec.integration.slack.homeChannel / SLACK_HOME_CHANNEL)`, one such sentence per gateway
+platform without a home channel, joined by `; `) is reached only by an agent that names a
+gateway platform it does not route, which this rule never does.
 
 The one narrowing is `also_delivered_to`: a platform the cron child already
 posted the raw report to is skipped, and where that would empty the set the

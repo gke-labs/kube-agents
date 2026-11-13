@@ -1422,7 +1422,7 @@ See [`k8s-operator/api/v1alpha1/platformagent_types.go`](https://github.com/gke-
 
 ### `spec.integration.slack` under `mode: next`
 
-Under `mode: next` the `slack` field arms the A2A gateway's Slack backend instead of the legacy consumer (the credential broker's Socket Mode relay and the Hermes slack platform are not rendered). With `googleChat` enabled too, one gateway serves both platforms. The operator names both in the agent's `A2A_NOTIFY_PLATFORM` and renders each `homeChannel` it can route as `GOOGLE_CHAT_HOME_CHANNEL` and `SLACK_HOME_CHANNEL`. The agent sends home posts to the platforms with a home channel it can see, a learned Slack channel included. With none, the gateway keeps each platform's posts for its digest.
+Under `mode: next` the `slack` field arms the A2A gateway's Slack backend instead of the legacy consumer (the credential broker's Socket Mode relay and the Hermes slack platform are not rendered). With `googleChat` enabled too, one gateway serves both platforms. The operator names both in the agent's `A2A_NOTIFY_CONVERSATIONS`, and in `A2A_NOTIFY_PLATFORM` each one whose `homeChannel` is set. The agent adds Slack when the gateway learned a channel. With no home channel anywhere, it sends home posts to both, and the gateway keeps each platform's posts for its digest.
 
 Whichever backend the stack holds, under `mode: next` the operator renders an empty ConfigMap `<agent>-home-channel` beside the gateway and a Role rule that lets the gateway read and patch that one object. With Slack on the gateway, it also renders the gateway env `A2A_SLACK_HOME_POLICY`, `A2A_HOME_CHANNEL_RECORD`, `A2A_SELF_IMAGE` and `A2A_HOME_CHANNEL_LEARN`, for `homeChannelPolicy`.
 
