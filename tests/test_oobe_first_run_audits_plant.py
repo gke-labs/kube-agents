@@ -464,6 +464,45 @@ class PlantScriptsTest(unittest.TestCase):
                 self.store.write_text(json.dumps([OTHER_JOB, job]))
                 self.assertEqual(self._run("own_stage.py", str(self.home)).stdout.strip(), "clear")
 
+    def _fresh(self) -> str:
+        return self._run("own_stage.py", str(self.home), "fresh").stdout.strip()
+
+    def test_a_first_run_recorded_within_a_day_is_fresh(self):
+        import time
+        (self.home / ".oobe_audits_fired").write_text(json.dumps({"done": True, "at": time.time() - 3600}))
+        self.assertEqual(self._fresh(), "fresh")
+        # A stage that skipped the audits on this install is this install's first run too.
+        (self.home / ".oobe_audits_fired").write_text(json.dumps({"done": True, "skipped": True, "at": time.time()}))
+        self.assertEqual(self._fresh(), "fresh")
+
+    def test_a_first_run_from_long_ago_or_none_is_stale(self):
+        import time
+        (self.home / ".oobe_audits_fired").write_text(json.dumps({"done": True, "at": time.time() - 25 * 3600}))
+        self.assertEqual(self._fresh(), "stale")
+        (self.home / ".oobe_audits_fired").write_text(json.dumps({"done": True}))
+        self.assertEqual(self._fresh(), "stale")
+        (self.home / ".oobe_audits_fired").unlink()
+        self.assertEqual(self._fresh(), "stale")
+
+    def test_a_disarm_puts_back_the_record_and_its_age(self):
+        # The arm removes the record and the disarm restores it whole, `at` included, so a
+        # long-lived install reads as stale again after a stand-in run.
+        import time
+        old = time.time() - 30 * 86400
+        (self.home / ".oobe_audits_fired").write_text(json.dumps({"done": True, "at": old}))
+        self.store.write_text(json.dumps([OTHER_JOB, OOBE_JOB]))
+        self.assertEqual(self._arm().returncode, 0)
+        self.assertEqual(self._run("disarm.py", str(self.home), str(self.hermes)).returncode, 0)
+        self.assertEqual(self._fresh(), "stale")
+
+    def test_a_fresh_first_run_ends_the_apply_before_any_arm(self):
+        apply = HEREDOC.findall((STACK / "main.tf").read_text())[0]
+        fresh = apply.index('agent_py "${local.home}" fresh)"')
+        self.assertLess(apply.index("# ---- 2. Wait for the install's own first-run stage"), fresh)
+        exit_at = apply.index("exit 0", fresh)
+        self.assertLess(exit_at, apply.index("arming=1"))
+        self.assertLess(exit_at, apply.index("'${local.arm_b64}'"))
+
     # --- the chain wait ----------------------------------------------------------
 
     def test_the_wait_is_skipped_on_an_image_without_the_job(self):

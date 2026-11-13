@@ -14,7 +14,7 @@
 
 """Print whether the install's own first-run stage is still pending. Runs in the agent container.
 
-Usage: python3 - <home> < own_stage.py
+Usage: python3 - <home> [fresh] < own_stage.py
 
 A fresh install has the `oobe` job until onboarding is over: its first-run audits stage is done
 and its report was claimed a few minutes ago, after which a tick removes the job. On an install
@@ -26,11 +26,17 @@ Pending, too, while the stage is done and the report claimed (`.bootstrap_comple
 is still there: a tick is about to remove it, and an arm in that minute would record the job as
 present while that tick takes it away, leaving nothing to run the stand-in chain. Otherwise clear.
 Prints `pending` or `clear`.
+
+With `fresh`, prints whether the install's own first run is this install's: `fresh` when the
+stage's record was last written (its `at`, which the disarm restores with the rest) within
+FRESH_SECONDS, `stale` otherwise or with no record. A fresh first run is the one the case grades;
+on a stale one (a long-lived install that onboarded long ago) the stack arms a stand-in.
 """
 
 import json
 import os
 import sys
+import time
 
 from cron.jobs import is_job_runnable, load_jobs
 
@@ -39,6 +45,20 @@ JOB_ID = "oobe"
 AUDITS_MARKER = os.path.join(home, ".oobe_audits_fired")
 COMPLETED_MARKER = os.path.join(home, ".bootstrap_completed")
 DONE_KEY = "done"
+AT_KEY = "at"
+# agents/chat/scripts/oobe.py: NEW_INSTALL_SECONDS, the stage's own idea of a new install. A
+# nightly shard grades this case up to its fourteen-hour budget after the install's first run.
+FRESH_SECONDS = 24 * 60 * 60
+
+if sys.argv[2:] == ["fresh"]:
+    try:
+        with open(AUDITS_MARKER, encoding="utf-8") as fh:
+            at = json.load(fh).get(AT_KEY)
+    except (OSError, ValueError, AttributeError):
+        at = None
+    fresh = isinstance(at, (int, float)) and time.time() - at < FRESH_SECONDS
+    print("fresh" if fresh else "stale")
+    sys.exit(0)
 
 # A disabled or paused job never runs, so it never finishes: nothing to wait for.
 present = any(job.get("id") == JOB_ID and is_job_runnable(job) for job in load_jobs())

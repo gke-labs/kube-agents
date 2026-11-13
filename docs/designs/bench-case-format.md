@@ -184,8 +184,7 @@ lock for the whole unit, beside the stream a `ledger_issue_contains` check names
 (`hack/ci-eval-pr.sh`, `task_streams`, reading the key with the YAML parser the lint uses), and
 releases them when devops-bench returns. A run that outlasts the unit is covered by the next
 unit on the stream, which waits for it first (`wait_platform_runs`), so an audit case does not
-run beside the case's runs and grade their ledger. `oobe-first-run-audits` carries the five it
-starts. devops-bench ignores the key.
+run beside the case's runs and grade their ledger. devops-bench ignores the key.
 
 `scope_exclude` is for a case whose precondition is an install that leaves some seeded
 clusters out of its scope: `scope_exclude: {slots: [b]}` names catalogue slots, never
@@ -435,7 +434,8 @@ newest, per repository store) or during it. An audit whose stores need no URL (a
 open ledger, or no record before the turn) passes on the mention alone; which audit a URL is given
 to is the judge's to grade. `oobe_audits_started`, in its own module
 (`bench/kube_agents_bench/oobe.py`), reads the stack's state file and the Platform Agent's
-`cron/executions.db` in the agent pod, and passes when the stage's `.oobe_audits_fired` lists each
+`cron/executions.db` in the agent pod (with no state file, the install's own first run, provided the
+stage's record is less than a day old; otherwise an error), and passes when the stage's `.oobe_audits_fired` lists each
 of the five first-run audits as marked due and each has a run claimed since the stage marked it
 that got going (running, completed, or ended after its start), each starting only after the one before it in the chain ended.
 `workload_incident_folded`, in its own module (`bench/kube_agents_bench/incidents.py`), reads a

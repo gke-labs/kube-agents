@@ -316,10 +316,64 @@ def test_another_jobs_run_does_not_count(store: Store) -> None:
     assert _verify().status == "fail"
 
 
-def test_no_state_file_is_an_error(store: Store) -> None:
+def test_no_state_file_and_no_first_run_record_is_an_error(store: Store) -> None:
     result = _verify()
     assert result.status == "error"
-    assert "did not arm" in result.reason
+    assert "neither armed the stage nor found a recent first run" in result.reason
+
+
+# --- the install's own first run (no state file) ------------------------------
+
+NOW = datetime.now(timezone.utc).replace(microsecond=0)
+
+
+def _own_record(store: Store, at: datetime, **extra) -> None:
+    """The stage's record as a fresh install's own first run leaves it; no state file."""
+    store.marker.write_text(json.dumps({"fired": list(oobe.FIRST_RUN_AUDITS), "at": at.timestamp(), **extra}))
+
+
+def test_a_fresh_installs_own_chain_is_graded_without_a_state_file(store: Store) -> None:
+    _own_record(store, NOW)
+    store.chain(NOW - timedelta(minutes=30))
+    result = _verify()
+    assert result.status == "pass", result.reason
+    assert result.reason.startswith("on the install's own first run, ")
+
+
+def test_a_first_run_from_long_ago_is_not_graded_as_this_installs(store: Store) -> None:
+    # A long-lived install whose stack did not arm: its old chain must not pass.
+    old = NOW - timedelta(seconds=oobe.FRESH_SECONDS + 3600)
+    _own_record(store, old)
+    store.chain(old - timedelta(minutes=30))
+    result = _verify()
+    assert result.status == "error"
+    assert "was last recorded" in result.reason
+
+
+def test_a_fresh_install_whose_stage_skipped_is_a_red_that_says_so(store: Store) -> None:
+    store.marker.write_text(json.dumps({"done": True, "skipped": True, "reason": "no sweep", "at": NOW.timestamp()}))
+    result = _verify()
+    assert result.status == "fail"
+    assert "the stage skipped the first-run audits: no sweep" in result.reason
+
+
+def test_on_the_own_chain_a_run_before_its_mark_does_not_count(store: Store) -> None:
+    _own_record(store, NOW)
+    store.chain(NOW - timedelta(minutes=30))
+    # The last audit's only run was claimed before the stage marked it.
+    last = oobe.FIRST_RUN_AUDITS[-1]
+    store.mark(last, NOW)
+    result = _verify()
+    assert result.status == "fail"
+    assert last in result.reason
+
+
+def test_the_fresh_window_is_the_stacks_and_the_stages() -> None:
+    own_stage = (ARM.parent / "own_stage.py").read_text()
+    window = "FRESH_SECONDS = 24 * 60 * 60"
+    assert window in own_stage
+    assert oobe.FRESH_SECONDS == 24 * 60 * 60
+    assert "NEW_INSTALL_SECONDS = 24 * 60 * 60" in STAGE.read_text()
 
 
 def test_an_unreadable_store_is_an_error(store: Store) -> None:

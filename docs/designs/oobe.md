@@ -312,9 +312,11 @@ times. It rides with the audits stage, whose eval case covers both.
 3. **Later:** drop the disabled ids; T+0 delivery to the home channel.
 
 Eval case `oobe-first-run-audits` (domain `fleet-audits`; nightly, in `hack/eval/nightly-cases.txt`,
-off the infra lock; each repetition waits for the previous one's five audits to finish). The stack
-(`bench/tf/prebuilt/oobe-first-run-audits`) first waits for the install's own first-run stage to
-finish, so it never cuts across a fresh install's real scan, then re-arms the stage: it first
+off the infra lock). The stack (`bench/tf/prebuilt/oobe-first-run-audits`) first waits for the
+install's own first-run stage to finish, so it never cuts across a fresh install's real scan. On an
+eval lease that first run is the install's own and recent (the stage's record less than a day old),
+and the case grades it: the stack arms nothing, and every repetition reads the one chain the install
+ran. On a long-lived install whose first run was long ago it re-arms the stage instead: it first
 resumes any of the five audits an eval run paused once the install's own stage was past them (the
 stage skips a paused audit), then files an archived stand-in sweep card and an archived ranking card after it, points `.bootstrap_scan_filed`
 at the sweep and the hand-off's `.bootstrap_handoff_filed` at the ranking card, clears
@@ -323,8 +325,7 @@ the teardown restores the markers and the job as it found them.
 The stack then waits, up to an hour, for the stage to finish its chain, so the verifier's two-minute window opens after the last audit has started. The verifier reads the Platform Agent's cron run records and
 passes when the stage's `.oobe_audits_fired` lists all five audits as marked due and each has a run claimed since the stage marked it that got going (running, completed, or ended after its start) (a skipped row is passed over), so a scheduled run that falls in the window does not count, and each started only after the one before it in the chain ended. An audit the stage recorded as adopted (a run completed since the sweep) counts as had, and stays out of that order; at least one audit must be the stage's own. That is stricter than the stage: a mark that lands on a scheduled run it did not see start, a race the runner's wait for running audits makes rare, reads as no run. Red: on
 an image without the job, no audit runs. Green, from the verifier on a dev install: four, in three repetitions, before the retrospective joined the stage; the five-audit stage's green is the case's nightly record, not this document's. The case's runs are
-real audit runs on five streams, so it declares them (`audit_streams`) and the runner holds their
-locks for the unit. Every unit on an audit stream first waits, up to two hours, while the install
+real audit runs only when it re-arms the stage, and it declares no streams. Every unit on an audit stream first waits, up to two hours, while the install
 has a run of that audit claimed, running or marked due, a stage under way is to mark it next, or a
 stage this case armed and could not disarm has still to run it (`wait_platform_runs` in
 `hack/ci-eval-pr.sh`). That keeps the nightly's audit cases from running beside this case's last
