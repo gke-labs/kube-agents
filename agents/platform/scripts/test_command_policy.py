@@ -604,6 +604,58 @@ class KubectlRawPathTest(unittest.TestCase):
                 self.assertEqual(urllib.parse.parse_qsl(text, keep_blank_values=True), command_policy._query_pairs(text))
 
 
+class KubectlSecretReadRefusalTest(unittest.TestCase):
+    """The credential broker does not strip Secret data, so command_policy refuses Secret reads."""
+
+    RULE = command_policy.KUBERNETES_SECRET_READ_RULE
+
+    def test_secret_reads_are_refused_across_read_verbs_and_spellings(self):
+        for argv in (
+            ["kubectl", "get", "secret"],
+            ["kubectl", "get", "secrets"],
+            ["kubectl", "get", "Secret", "my-secret", "-o", "yaml"],
+            ["kubectl", "get", "secrets/my-secret", "-o", "json"],
+            ["kubectl", "get", "secret.v1.", "-n", "default"],
+            ["kubectl", "get", "secrets.v1./my-secret"],
+            ["kubectl", "get", "pods,secrets"],
+            ["kubectl", "get", "po,secret/my-secret"],
+            ["kubectl", "describe", "secret", "my-secret"],
+            ["kubectl", "describe", "secrets/my-secret"],
+            ["kubectl", "events", "--for=secret/my-secret"],
+            ["kubectl", "events", "--for", "secrets/my-secret"],
+            ["kubectl", "wait", "--for=jsonpath={.data.token}", "secret/my-secret"],
+        ):
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertFalse(decision.allowed, argv)
+                self.assertEqual(self.RULE, decision.rule_id, argv)
+
+    def test_manifest_input_flags_are_refused_on_resource_read_verbs(self):
+        for argv, expected_flag in (
+            (["kubectl", "get", "-f", "secret.yaml"], "-f"),
+            (["kubectl", "get", "--filename=secret.yaml"], "--filename"),
+            (["kubectl", "get", "-Rf", "."], "-f"),
+            (["kubectl", "describe", "-k", "."], "-k"),
+            (["kubectl", "wait", "--kustomize=.", "--for=condition=Ready"], "--kustomize"),
+        ):
+            with self.subTest(argv=argv):
+                decision = evaluate(argv)
+                self.assertFalse(decision.allowed, argv)
+                self.assertEqual(self.RULE, decision.rule_id, argv)
+                self.assertEqual(expected_flag, decision.offending_flag)
+
+    def test_non_secret_reads_and_logs_follow_remain_allowed(self):
+        for argv in (
+            ["kubectl", "get", "pods"],
+            ["kubectl", "get", "configmaps/my-cm"],
+            ["kubectl", "describe", "pod", "my-pod"],
+            ["kubectl", "events", "--for=pod/my-pod"],
+            ["kubectl", "logs", "-f", "my-pod"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertTrue(evaluate(argv).allowed, argv)
+
+
 class KubectlKubercTest(unittest.TestCase):
     """--kuberc is a flags file, and it launders the impersonation refusal."""
 

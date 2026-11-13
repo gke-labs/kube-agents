@@ -70,7 +70,7 @@ Minty was originally designed for integration with GitHub Actions, which inheren
 
 The GitHub Token Minter requires an asymmetric signing key (`rsa-sign-pkcs1-2048-sha256` or `rsa-sign-pkcs1-4096-sha512`) in Google Cloud KMS with your GitHub App private key imported (Version 1 `ENABLED`).
 
-- **Key Coordinates:** By default, `kube-agents` expects the key ring `github-token-minter-keyring` and crypto key `github-token-minter-key` in your cluster's Cloud KMS region (`KMS_LOCATION`).
+- **Key Coordinates:** On this Kustomize path, `kube-agents` expects the key ring `github-token-minter-keyring` and crypto key `github-token-minter-key` in your cluster's Cloud KMS region (`KMS_LOCATION`). The installer gives a new install per-install names instead (`<cluster>-minter-keyring`, `<cluster>-minter-key`).
 - **Permanence:** Cloud KMS key rings and crypto keys cannot be destroyed or deleted in GCP. Once Version 1 is imported and `ENABLED`, it persists permanently across cluster teardowns (`uninstall.sh`) and re-installations.
 - **Import Methods:**
   - **Option 1 (Automated via `install.sh`):** Pass `--github-pem-path="/path/to/app-private-key.pem"` during install. `install.sh` provisions the key and uses the Minty CLI to import it into Cloud KMS. Once imported, delete the local `.pem` file. Subsequent runs skip the import.

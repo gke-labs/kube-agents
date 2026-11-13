@@ -83,6 +83,23 @@ verification_spec:
       type: tool_called
       tool_names: ["kanban_create"]
       require_success: true
+  # The card's end, read from the worker's own calls: the delegated card
+  # ends in kanban_complete or kanban_block (agents/platform/SOUL.md: a
+  # blocked card "is the successful end of it"). A worker that ran and never
+  # closed its card, or whose close failed, fails it. A run with no worker
+  # entry at all is an error, not a fail: rung 2 blocks it on the api
+  # transport, and the scorer sets it aside on an inject record (#5236).
+  # When the harness recorded that every card was closed with no worker call
+  # (harness_no_worker_calls), it is a graded fail on both transports (#5371).
+  # scope: workers reads the workers' tagged calls.
+  - name: the-worker-ended-its-card
+    role: objective
+    mode: assert
+    check:
+      type: tool_called
+      scope: workers
+      tool_names: ["kanban_complete", "kanban_block"]
+      require_success: true
   - name: the-shipped-skill-tree-is-the-image-tree
     role: objective
     mode: assert

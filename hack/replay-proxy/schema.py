@@ -143,6 +143,13 @@ RECORDED = "recorded"
 # RECORD_ERROR_BUDGET when the data budget is spent and nothing was saved.
 RECORD_ERROR = "record_error"
 RECORD_ERROR_BUDGET = "budget_spent"
+# In record mode: [context, answer] identifying this request's answer as a
+# later request's history holds it (normalizer.answer_variant), and the same
+# pair for the last assistant message this request holds. A later request's
+# PRIOR_ANSWER equal to an earlier line's ANSWER_VARIANT says its conversation
+# went on from that very answer (hack/replay-proxy/run_attribution.py).
+ANSWER_VARIANT = "answer_variant"
+PRIOR_ANSWER = "prior_answer"
 # On a replay miss: the closest saved request and where this one differed.
 MISS = "miss"
 MISS_CLOSEST_FINGERPRINT = "closest_fingerprint"

@@ -54,6 +54,44 @@ func TestSpawnSetsPodDeadlineMirroringTheAdapters(t *testing.T) {
 	}
 }
 
+// TestSpawnedSessionPodsSetNdots3: a session pod dials the broker and the
+// kube-api proxy by their 4-dot service names, so it lowers ndots to 3 and
+// the names are asked as written first (#5590). Only ndots changes: the DNS
+// policy stays ClusterFirst, with the cluster's nameservers and search list.
+func TestSpawnedSessionPodsSetNdots3(t *testing.T) {
+	cs := k8sfake.NewSimpleClientset()
+	cfg := &Config{Namespace: "test-ns", WorkerImage: "img", SessionServiceAccount: "agent-a2a-session",
+		TaskDeadline: 15 * time.Minute}
+	s := &podSpawner{cfg: cfg, client: cs, log: slog.Default()}
+	rec := &SessionRecord{Key: "discord:g1/t", ContextID: "ctx-1", BusSession: "chat-otter-abcd", Addressee: "chat-otter-abcd"}
+	if _, err := s.Spawn(context.Background(), rec, "task-1", "", 1); err != nil {
+		t.Fatal(err)
+	}
+	pod, err := cs.CoreV1().Pods("test-ns").Get(context.Background(), "chat-otter-abcd", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pod.Spec.DNSPolicy != "" && pod.Spec.DNSPolicy != corev1.DNSClusterFirst {
+		t.Errorf("dnsPolicy %q, want the default ClusterFirst", pod.Spec.DNSPolicy)
+	}
+	dns := pod.Spec.DNSConfig
+	if dns == nil {
+		t.Fatal("session pod has no dnsConfig, so the resolver keeps ndots:5")
+	}
+	if len(dns.Nameservers) != 0 || len(dns.Searches) != 0 {
+		t.Errorf("dnsConfig adds nameservers %v or searches %v; it should change only ndots", dns.Nameservers, dns.Searches)
+	}
+	var ndots []string
+	for _, o := range dns.Options {
+		if o.Name == "ndots" && o.Value != nil {
+			ndots = append(ndots, *o.Value)
+		}
+	}
+	if len(ndots) != 1 || ndots[0] != "3" {
+		t.Errorf("ndots options %v, want exactly one, 3", ndots)
+	}
+}
+
 // TestSpawnCarriesTheOriginSequence: the pod is told which message on its
 // ...in subject is the submission it exists to run. Without it the worker
 // scans the subject and, past TASKS's per-subject cap, cannot tell the
@@ -312,7 +350,11 @@ func TestClusterViewProjectsOnlyTheSessionAudience(t *testing.T) {
 	cs := k8sfake.NewSimpleClientset()
 	cfg := &Config{Namespace: "test-ns", WorkerImage: "img", SessionServiceAccount: "agent-a2a-session",
 		TaskDeadline: 15 * time.Minute, NATSURL: "nats://bus:4222",
-		SessionClusterView: true, CredentialProxyURL: "http://agent-credential-proxy.test-ns.svc.cluster.local:8765"}
+		SessionClusterView:   true,
+		CredentialProxyURL:   "http://agent-credential-proxy.test-ns.svc.cluster.local:8765",
+		KubeProxyURL:         "https://agent-kube-proxy.test-ns.svc.cluster.local:8443",
+		KubeProxyCAConfigMap: "agent-kube-proxy-ca-bundle",
+		KubeProxyHostContext: "in-cluster"}
 	s := &podSpawner{cfg: cfg, client: cs, log: slog.Default()}
 	rec := &SessionRecord{Key: "discord:g1/t", ContextID: "ctx-9", BusSession: "chat-otter-1a2b", Addressee: "chat-otter-1a2b"}
 	if _, err := s.Spawn(context.Background(), rec, "task-9", "", 1); err != nil {
@@ -349,17 +391,26 @@ func TestClusterViewProjectsOnlyTheSessionAudience(t *testing.T) {
 	}
 	if env["CREDENTIAL_PROXY_URL"] != cfg.CredentialProxyURL ||
 		env["CREDENTIAL_PROXY_TOKEN_FILE"] != credentialProxyTokenMountPath+"/"+credentialProxyTokenFile ||
+		env["KUBE_PROXY_URL"] != cfg.KubeProxyURL ||
+		env["KUBE_PROXY_CA_FILE"] != kubeProxyCAMountPath+"/"+kubeProxyCAFile ||
+		env["KUBE_PROXY_HOST_CONTEXT"] != cfg.KubeProxyHostContext ||
 		env["HERMES_HOME"] != sessionHermesHome || env[lib.EnvClusterView] != "true" {
 		t.Fatalf("cluster-view env = %v", env)
 	}
-	var mounted bool
+	var mounted, caMounted bool
 	for _, m := range c.VolumeMounts {
 		if m.MountPath == credentialProxyTokenMountPath && m.ReadOnly {
 			mounted = true
 		}
+		if m.Name == kubeProxyCAVolume && m.MountPath == kubeProxyCAMountPath && m.ReadOnly {
+			caMounted = true
+		}
 	}
 	if !mounted {
 		t.Fatal("the session token is not mounted read-only at the path the shim reads")
+	}
+	if !caMounted {
+		t.Fatal("the kube-proxy CA bundle is not mounted read-only")
 	}
 }
 

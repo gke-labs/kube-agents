@@ -87,7 +87,7 @@ Pass `rightsizing` to `kanban_complete`, one entry per workload or pool:
 - `dependency`: one sentence on what the dependency means for a cut, for example "a lower request adds replicas" or "a lower request is also a lower limit".
 - `checks`: one finding each for `hpa`, `qos`, `sharing`, `source` and `packing`, with the command or reading behind it. "No HPA targets it" is a finding. Not needed for `not_on_cluster`.
 
-Each field is one line of at most 200 characters, with no code fence. The tool renders these entries in your `result`, and the Platform Agent's summary gets the same lines, so the person sees each dependency whatever the summary says. `kanban_complete` refuses, once, a completion without them on a card that names this skill.
+Pass at most 8 entries. Each field is one line of at most 200 characters, with no code fence. The tool renders these entries in your `result`, and the Platform Agent's summary gets the same lines, so the person sees each dependency whatever the summary says. `kanban_complete` refuses, once, a completion without them on a card that names this skill.
 
 In `result` itself, after at most one bold sentence, for each workload or pool:
 

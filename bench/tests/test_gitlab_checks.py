@@ -265,6 +265,17 @@ def test_path_clauses_are_unevaluable_on_gitlab_not_a_pass(env, gitlab, clause, 
     assert clause in result.reason and "not implemented for GitLab" in result.reason
 
 
+def test_body_contains_reads_the_merge_request_description(env, gitlab):
+    route_mr3(gitlab, description="Applies a PDB for the checkout deployment.")
+    stash(f"Opened {MR3_URL}")
+    result = pr_check(body_contains=["## Evidence"]).verify(30)
+    assert result.success is False
+    assert result.status == "fail", result.reason
+    assert "body_contains" in result.reason
+    route_mr3(gitlab, description="Adds a PDB.\n\n## Evidence\n\n**Finding:** no PDB\n")
+    assert pr_check(body_contains=["## Evidence"]).verify(30).success is True
+
+
 def test_a_merge_request_opened_in_the_run_passes(env, gitlab):
     route_mr3(gitlab)
     stash(f"Opened {MR3_URL}")
@@ -463,6 +474,21 @@ def test_a_project_read_that_is_throttled_is_not_blamed_on_the_token(env, gitlab
     assert result.status == "error"
     assert "cannot see it" not in result.reason
     assert "503" in result.reason
+
+
+def test_a_project_read_outage_after_a_merge_request_404_is_marked(env, gitlab, monkeypatch):
+    """#5346: the merge request's 404 is what the project read decides, not the
+    error; the project read's 503 is, so the error is marked."""
+    configured(monkeypatch)
+    gitlab.routes[PROJECT] = (503, {"message": "unavailable"})
+    stash(f"Opened {MR3_URL}")
+    result = pr_check().verify(30)
+    assert result.status == "error"
+    assert result.reason.startswith(forges.FORGE_UNAVAILABLE_MARKER)
+    stash(f"Audit filed: {ISSUE_URL}")
+    result = ledger_check(required_phrases=["rbac-overgrant"]).verify(30)
+    assert result.status == "error"
+    assert result.reason.startswith(forges.FORGE_UNAVAILABLE_MARKER)
 
 
 def stream_env(monkeypatch, repo=REPO):

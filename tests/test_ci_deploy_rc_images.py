@@ -45,7 +45,7 @@ _AR_REPO = "us-central1-docker.pkg.dev/kube-agents-evals/kube-agents"
 _GHCR_PREFIX = "ghcr.io/gke-labs/kube-agents"
 
 # The two sections under test, delimited by the banner that follows each.
-_IMAGE_SOURCE_SECTION = (r"^# ─── 2a\. Image Source.*?", r"^export MODEL_PROVIDER=")
+_IMAGE_SOURCE_SECTION = (r"^# ─── 2a\. Image Source.*?", r"^# --- agent model required in a Prow job: begin")
 _BUILD_SECTION = (r"^# ─── 4\. Build Container Images.*?", r"^# ─── 5\. Chart Deployment")
 
 
@@ -199,6 +199,10 @@ class PresubmitPathUnchangedTest(unittest.TestCase):
                 f"plugins.stockoutInvestigator.image.repository={_AR_REPO}/gke-stockout-investigator",
                 "--set-string",
                 f"plugins.stockoutInvestigator.image.tag={_PRESUBMIT_TAG}",
+                "--set-string",
+                f"webConsole.image.repository={_AR_REPO}/web-console",
+                "--set-string",
+                f"webConsole.image.tag={_PRESUBMIT_TAG}",
             ],
             "the presubmit's Helm image flags must name every image the run "
             "built: every pull request runs this path, and an image left off "
@@ -228,8 +232,9 @@ class ReleaseCandidatePathTest(unittest.TestCase):
         Registry one is `kube-agents-operator`, so an override copied from the
         presubmit path would 404. The chart already defaults every image to the
         published path; only the tag has to be said. The two AgentPlugin images
-        are published under the same tag (scripts/release/common.sh,
-        REQUIRED_RELEASE_IMAGES), so they get a tag and no repository too."""
+        and the web console are published under the same tag
+        (scripts/release/common.sh, REQUIRED_RELEASE_IMAGES), so they get a
+        tag and no repository too."""
         with tempfile.TemporaryDirectory() as tmp:
             fake_hack, rc_sha = fake_candidate_tree(tmp, images_exist=True)
             result = run_image_source(fake_hack, rc_commit_sha=rc_sha)
@@ -247,6 +252,8 @@ class ReleaseCandidatePathTest(unittest.TestCase):
                 f"plugins.pubsubPlatform.image.tag={rc_sha}",
                 "--set-string",
                 f"plugins.stockoutInvestigator.image.tag={rc_sha}",
+                "--set-string",
+                f"webConsole.image.tag={rc_sha}",
             ],
         )
 

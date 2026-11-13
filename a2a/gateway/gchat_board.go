@@ -37,10 +37,10 @@ import (
 // UTC: Chat has no date token each reader sees in their own zone.
 //
 // One tap per row at a time, held in this process, and the edits of one
-// message in turn under its rewrite lock (lockRewrite), each from the layout
-// the last edit sent, which the adapter remembers per message; a message it
-// does not remember (posted before a restart) is rebuilt from the event's
-// copy of it, text and buttons.
+// message in turn under its rewrite lock (lockRewrite), each from the
+// message's one layout record (gchat_layout.go), the layout the last
+// rewrite of any kind sent; a message with no record (posted before a
+// restart) is rebuilt from the event's copy of it, text and buttons.
 const (
 	// gchatBoardFunction is the onClick action a Retry or Drop sends, and
 	// gchatBoardParamAction, gchatBoardParamRow, gchatBoardParamTasks and
@@ -277,7 +277,7 @@ func (a *GoogleChatAdapter) boardClick(ev *gchatEvent) string {
 	// message with no record (posted before a restart) is edited from the
 	// click's own copy, so that copy must still draw the row, or the tap
 	// would act on cards it cannot report on.
-	layout, remembered := ux.board[message]
+	layout, remembered := ux.layouts[message]
 	if !remembered {
 		layout = gchatEventLayout(ev.Message)
 	}
@@ -345,21 +345,21 @@ func (a *GoogleChatAdapter) runBoardTap(ev *gchatEvent, claim gchatBoardClaim, v
 	settled := outcome != slackBoardFailed
 	line := gchatBoardLine(verb, outcome, name, a.clock())
 	// Under the message's rewrite lock, so the edits of one message land in
-	// turn, each from the layout the last one sent.
+	// turn, each from the layout the last one sent (gchat_layout.go).
 	defer a.lockRewrite(message)()
-	base, remembered, moved := a.boardLayoutOf(message)
+	base, remembered, moved := a.layoutOf(message)
 	// The round trip took time, and the message may have been laid out
-	// again in it (trackBoard frees the claims and replaces or drops the
-	// record): the outcome belongs to the row the tap named, not to
-	// whatever is row n now, so it is drawn only where that row, with those
-	// cards, still is: on the line the remembered card's own button gives
-	// it, which a re-layout that kept the row but shifted it has moved, or
-	// the line the tap's button named when there is no record
-	// (gchatBoardRowOf). A message marked as laid out without rows is such a
-	// message, and the tap's own copy of it (the click's) is stale. A
-	// message with no record, never remembered (posted before a restart) or
-	// forgotten since the tap was taken (an edit that failed, below), is
-	// read from that copy.
+	// again in it (trackLayout frees the claims and replaces the record):
+	// the outcome belongs to the row the tap named, not to whatever is row
+	// n now, so it is drawn only where that row, with those cards, still
+	// is: on the line the remembered card's own button gives it, which a
+	// re-layout that kept the row but shifted it has moved, or the line the
+	// tap's button named when there is no record (gchatBoardRowOf). A
+	// message marked as laid out without rows is such a message, and the
+	// tap's own copy of it (the click's) is stale. A message with no
+	// record, never remembered (posted before a restart) or forgotten since
+	// the tap was taken (an edit that failed, below), is read from that
+	// copy.
 	if moved {
 		a.releaseBoardTap(claim)
 		a.log.Info(gchatBoardRowMoved, "message", message, "row", n, "outcome", outcome)
@@ -381,12 +381,12 @@ func (a *GoogleChatAdapter) runBoardTap(ev *gchatEvent, claim gchatBoardClaim, v
 	}
 	if err != nil {
 		// The edit may have landed though Chat's answer did not, so the
-		// next edit builds from its own tap's copy of the message.
-		a.forgetBoard(message)
+		// next rewrite builds from the event's copy of the message.
+		a.forgetLayout(message)
 		a.log.Warn("gchat: editing a board row failed", "message", message, "err", err)
 		return
 	}
-	a.rememberBoard(message, layout)
+	a.rememberLayout(message, layout)
 }
 
 // releaseBoardTap frees a tap's claim on its row, so it can be tapped
@@ -639,61 +639,6 @@ func (a *GoogleChatAdapter) patchLayout(message string, layout gchatChatLayout) 
 		gchatBodyArg:       gchatLayoutBody(layout),
 	}
 	return a.apiCall([]string{gchatSpacesResource, gchatMessagesResource}, gchatPatchMethod, arguments, nil)
-}
-
-// trackBoard remembers the layout a message with rows that carry buttons
-// was last sent with, so a tap edits from it, and forgets one laid out
-// again without such rows.
-// Either way the rows are new, so every claim a tap holds on the message
-// goes (releaseBoardTapsLocked); a message that had such rows and now has
-// none is marked, so a tap still in flight on it draws nothing on it.
-func (a *GoogleChatAdapter) trackBoard(message string, m *chatmsg.Message, layout gchatChatLayout) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	ux := a.uxLocked()
-	ux.releaseBoardTapsLocked(message)
-	if m == nil || !slackChatRowsAct(m.Rows) {
-		if _, had := ux.board[message]; had {
-			ux.boardMoved[message] = true
-			remember(&ux.boardMovedOrder, message, func(k string) { delete(ux.boardMoved, k) })
-		}
-		ux.forgetBoardLocked(message)
-		return
-	}
-	delete(ux.boardMoved, message)
-	forget(&ux.boardMovedOrder, message)
-	ux.board[message] = layout
-	remember(&ux.boardOrder, message, func(k string) { delete(ux.board, k) })
-}
-
-func (a *GoogleChatAdapter) rememberBoard(message string, layout gchatChatLayout) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	ux := a.uxLocked()
-	ux.board[message] = layout
-	remember(&ux.boardOrder, message, func(k string) { delete(ux.board, k) })
-}
-
-func (a *GoogleChatAdapter) forgetBoard(message string) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.uxLocked().forgetBoardLocked(message)
-}
-
-// forgetBoardLocked is forgetBoard under the adapter's lock.
-func (ux *gchatUX) forgetBoardLocked(message string) {
-	delete(ux.board, message)
-	forget(&ux.boardOrder, message)
-}
-
-// boardLayoutOf is the layout message was last sent with, when remembered,
-// and whether the message was laid out again without rows that act.
-func (a *GoogleChatAdapter) boardLayoutOf(message string) (layout gchatChatLayout, remembered, moved bool) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	ux := a.uxLocked()
-	layout, remembered = ux.board[message]
-	return layout, remembered, ux.boardMoved[message]
 }
 
 // clock is the adapter's time, time.Now outside a test.

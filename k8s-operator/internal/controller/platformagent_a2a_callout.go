@@ -458,6 +458,12 @@ func a2aExecutorSidecarEnv(containers []corev1.Container) []corev1.Container {
 			{Name: a2aCapabilityRequiredEnvVar, Value: a2aCapabilityRequired()},
 			a2aNATSCAFileEnvVar(),
 		}
+		// A declared bridge binds its intake durable as the rendered one does:
+		// the provision Job creates it, and the bridge principal is refused
+		// creating it (#4173).
+		if a2aIsBridgeSidecar(c) {
+			switchOverride = append(switchOverride, corev1.EnvVar{Name: a2aBridgeDurablePrecreatedEnvVar, Value: "true"})
+		}
 		// mergeEnvVars' second argument wins, so the nesting IS the
 		// precedence: the container's own env beats the namespace default,
 		// and the switch beats both.
@@ -912,9 +918,10 @@ func buildA2ACalloutPDB(agent *agentv1alpha1.PlatformAgent) *policyv1.PodDisrupt
 			MaxUnavailable: ptr.To(intstr.FromInt32(a2aCalloutPDBMaxUnavailable)),
 			Selector:       &metav1.LabelSelector{MatchLabels: a2aCalloutPodSelector(agent)},
 			// AlwaysAllow rather than the IfHealthyBudget default, for the
-			// verifier's reason. /readyz needs the bus connection, and the
-			// bus is a one-replica StatefulSet, so while it is down, or its
-			// PVC is Pending, BOTH callouts are Running and NotReady. Under
+			// verifier's reason. /readyz needs the bus connection, so while
+			// the bus is down (a single-server bus restarting, or every
+			// server of a cluster gone), or its PVC is Pending, BOTH
+			// callouts are Running and NotReady. Under
 			// the default that is currentHealthy 0 against desiredHealthy
 			// 1, zero disruptions allowed, and every eviction of either pod
 			// refused until the bus returns: a budget holding a node's drain

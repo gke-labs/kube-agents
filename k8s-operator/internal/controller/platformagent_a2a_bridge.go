@@ -166,18 +166,19 @@ func a2aBridgeDeclared(agent *agentv1alpha1.PlatformAgent) bool {
 	if agent == nil || agent.Spec.Deployment == nil {
 		return false
 	}
-	for _, c := range agent.Spec.Deployment.Sidecars {
-		if c.Name == a2aBridgeContainerName {
-			return true
-		}
-		if _, set := a2aBridgeConcurrencyValue(c); set {
-			return true
-		}
-		if imageRepositoryName(c.Image) == a2aBridgeImageName {
-			return true
-		}
+	return slices.ContainsFunc(agent.Spec.Deployment.Sidecars, a2aIsBridgeSidecar)
+}
+
+// a2aIsBridgeSidecar reports whether a declared sidecar is the bridge: by its
+// container name, its BRIDGE_CONCURRENCY, or its image.
+func a2aIsBridgeSidecar(c corev1.Container) bool {
+	if c.Name == a2aBridgeContainerName {
+		return true
 	}
-	return false
+	if _, set := a2aBridgeConcurrencyValue(c); set {
+		return true
+	}
+	return imageRepositoryName(c.Image) == a2aBridgeImageName
 }
 
 // a2aBridgeRendered reports whether the operator renders the bridge for this
@@ -344,6 +345,8 @@ func a2aBridgeOwnEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 			Key:                  a2aBridgePasswordKey,
 		}}},
 		{Name: a2aBridgeConcurrencyEnvVar, Value: a2aRenderedBridgeConcurrency()},
+		// The intake binds the durable the provision Job created (#4173).
+		{Name: a2aBridgeDurablePrecreatedEnvVar, Value: "true"},
 		a2aActivitySecretEnv(agent),
 		// The bearer the agent's API server accepts (the managed .env pins the
 		// same). Set here rather than inherited: the agent container's entry
@@ -384,18 +387,19 @@ const a2aBridgeDebugErrorTextEnvVar = "BRIDGE_DEBUG_ERROR_TEXT"
 // override the soft limit the bridge derives from its own admitted memory
 // limit. A bridge-specific GOMEMLIMIT belongs in a2aBridgeOwnEnv.
 var a2aBridgeDroppedAgentEnv = map[string]bool{
-	a2aBridgeDebugErrorTextEnvVar: true,
-	sharedStateSetupEnvVar:        true,
-	a2aBridgeNATSURLEnvVar:        true,
-	a2aBridgeNATSUserEnvVar:       true,
-	a2aBridgeNATSPasswordEnvVar:   true,
-	a2aBridgeConcurrencyEnvVar:    true,
-	a2aBridgeExecutorEnvVar:       true,
-	a2aActivitySecretEnvVar:       true,
-	a2aBusUserEnv:                 true,
-	a2aBridgeAPIServerKeyEnvVar:   true,
-	a2aBridgeMemoryLimitEnvVar:    true,
-	memlimit.GoMemLimitEnv:        true,
+	a2aBridgeDebugErrorTextEnvVar:    true,
+	sharedStateSetupEnvVar:           true,
+	a2aBridgeNATSURLEnvVar:           true,
+	a2aBridgeNATSUserEnvVar:          true,
+	a2aBridgeNATSPasswordEnvVar:      true,
+	a2aBridgeConcurrencyEnvVar:       true,
+	a2aBridgeDurablePrecreatedEnvVar: true,
+	a2aBridgeExecutorEnvVar:          true,
+	a2aActivitySecretEnvVar:          true,
+	a2aBusUserEnv:                    true,
+	a2aBridgeAPIServerKeyEnvVar:      true,
+	a2aBridgeMemoryLimitEnvVar:       true,
+	memlimit.GoMemLimitEnv:           true,
 }
 
 // buildA2ABridgeContainer renders the bridge from the finished agent

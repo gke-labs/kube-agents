@@ -69,7 +69,7 @@ const (
 	// doesn't set it. Optional; unset means the callout's 6h default, which
 	// matches #4121's. See
 	// authcallout.Config.TaskCredentialMaxLifetime.
-	envTaskCredentialMaxLifetime = "A2A_TASK_CREDENTIAL_MAX_LIFETIME"
+	envTaskCredentialMaxLifetime = "A2A_TASK_CREDENTIAL_MAX_LIFETIME" // #nosec G101 -- an env var name, not a credential
 
 	defaultAuthMapKey  = "identities.json"
 	defaultStatusAddr  = ":8080"

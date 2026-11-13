@@ -187,8 +187,8 @@ func UsageTotal(turns []Usage) Usage {
 // Parameters are the child task's parameters (TaskParameters), the target
 // cluster among them. The contract (spec-a2a-payloads.md, "Task parameters
 // and child results"): the gateway carries them into the child's submission
-// and refuses a child whose target is not inside its parent's. No gateway
-// reads them yet.
+// and refuses a child whose target is not inside its parent's. The gateway
+// holds the names to the target profile's declared ones.
 type DelegateRequest struct {
 	Addressee  string            `json:"addressee"`
 	Text       string            `json:"text"`
@@ -780,6 +780,10 @@ type AgentCard struct {
 	ClusterRef *ClusterRef `json:"clusterRef,omitempty"`
 	// Parameters are the task parameters the profile's persona declares.
 	Parameters []ProfileParameter `json:"parameters,omitempty"`
+	// YieldToPinned hands a task addressed to this profile to the profile
+	// pinned to its target cluster, when there is one: the generic cluster
+	// agent sets it, and a specialist addressed by name keeps the task.
+	YieldToPinned bool `json:"yieldToPinned,omitempty"`
 }
 
 // ClusterRef names one GKE cluster.

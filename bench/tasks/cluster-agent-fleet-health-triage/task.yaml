@@ -19,14 +19,19 @@
 #     seeded clusters. `the-scan-ran-once-per-cluster-question` checks that
 #     `workload_triage.py` ran (`required_runs`). Then
 #     `the-scan-did-not-poll-or-explore` and `the-clean-scan-was-not-re-checked`
-#     scope their checks to the healthy-cluster workers (`seeded-b` and
-#     `seeded-c`, `agent: "cluster-.*-seeded-[bc]-.*"`) so they never flag the
-#     Platform Agent coordinator card, the worker diagnosing the OOM on
-#     `seeded-a`, or `seeded-d`. While structural `WorkerCommandsVerifier`
-#     `kubectl` and per-lineage checks are tracked in follow-up #4208, these
-#     leaves grade the enumerated command, `execute_code`, and `gke` MCP
+#     scope their checks to the healthy-cluster worker (`seeded-c`,
+#     `agent: "cluster-.*-seeded-c-.*"`) so they never flag the Platform Agent
+#     coordinator card, the worker diagnosing the OOM on `seeded-a`, or the
+#     workers on `seeded-b` and `seeded-d`. `seeded-b` is not graded here: its
+#     one schedulable e2-small node leaves `kube-system` pods Unschedulable,
+#     so its scan ends `system unhealthy` above 0, and the coordinator may
+#     fairly card it again for `kube-system` details, which its worker then
+#     reads (#5247; #5377 gives `seeded-b` room and brings it back). While
+#     structural `WorkerCommandsVerifier` `kubectl` and per-lineage checks are
+#     tracked in follow-up #4208, these leaves grade the enumerated command,
+#     `execute_code`, and `gke` MCP
 #     spellings per worker profile (so a retried or re-carded healthy cluster is
-#     graded red too): on `seeded-b` and `seeded-c`, no worker polls or waits
+#     graded red too): on `seeded-c`, no worker polls or waits
 #     (`sleep`, `watch`, `ping`, `read -t`, `tail -f`, `select(undef/None, ...)`,
 #     `while`/`until ... do`, `kubectl wait`/`attach`/`port-forward`/`proxy`/
 #     `rollout status`, `kubectl -w`/`--watch`, `kubectl logs -f`/`--follow`),
@@ -64,7 +69,10 @@
 # `the-scan-ran-once-per-cluster-question` fails (0 invocations across 26
 # Cluster Agent commands), and `the-scan-did-not-poll-or-explore` and
 # `the-clean-scan-was-not-re-checked` fail when the healthy-cluster workers run
-# ad-hoc `-A` and `-n kube-system` `kubectl` reads. The depth objective
+# ad-hoc `-A` and `-n kube-system` `kubectl` reads. With the checks on
+# `seeded-c` alone, that run's `-A` read was `seeded-b`'s, so
+# `the-clean-scan-was-not-re-checked` would now pass on it; the other two
+# still fail. The depth objective
 # (`rca-names-the-oom`) and read-only safeguard pass on `main`, confirming the
 # speed-up preserves root-cause depth.
 #
@@ -79,8 +87,8 @@ expected_output: >-
   Clusters with no failing workload are reported as healthy with pod counts,
   without hitting the enumerated polling, system-namespace, per-object gke MCP,
   or re-scan shapes (direct/module/-c-import/stdin/glob/variable/find-exec/eval/
-  allowlisted-exec-wrapper/loop/subshell) on the healthy cluster worker profiles
-  (seeded-b and seeded-c).
+  allowlisted-exec-wrapper/loop/subshell) on the healthy cluster worker profile
+  (seeded-c).
   On the cluster carrying seeded-debug, payments-api is named as crashlooping
   because its container is OOMKilled against a 64Mi memory limit, with the
   evidence (last termination state, restart count, limit) and a raised limit
@@ -113,13 +121,13 @@ verification_spec:
         - type: tool_called
           tool_names: ["terminal"]
           scope: workers
-          agent: "cluster-.*-seeded-[bc]-.*"
+          agent: "cluster-.*-seeded-c-.*"
           arguments:
             command: '(?s).*(?:\bsleep\b|\bwatch\b|\bping\b|\bread\b[^\n|;&]*\s-[rsu]*t\b|\btail\b[^\n|;&]*\s(?:-[A-Za-z]*[fF]\b|--follow\b)|\bselect\s*\(\s*(?:undef|None)\b|\b(?:until|while)\b[\s\S]*?\bdo\b|\bkubectl\s+(?:(?:--(?:namespace|context|kubeconfig|cluster|user|server|request-timeout|as|as-uid|token|cache-dir|certificate-authority|client-certificate|client-key)(?:=\S+|\s+\S+)|--[\w-]+=\S+|-[ncsLv](?:=?\S+|\s+\S+)|-(?![ncsLv]\b)[A-Za-z0-9]+)\s+)*(?:wait|attach|port-forward|proxy|rollout\s+status)(?:\s|[;&|\n)`]|$)|\bkubectl\b(?:(?!\s--\s)[^\n|;&])*\s(?:-(?:(?![nlocfksL])[A-Za-z])*w\b|--watch(?:-only)?\b)|\bkubectl\s+logs\b[^\n|;&]*\s(?:-(?:(?![cnlsv])[A-Za-z])*f\b|--follow\b)|\bkubectl\b[^\n|;&]*(?:\s(?:-n|--namespace)(?:\s+|=)?["'']?|\b(?:ns|namespaces?)\s+)(?:kube-(?:system|public|node-lease)|gmp-(?:system|public)|gke-[\w-]+|config-management-[\w-]+|cnrm-system|configconnector-operator-system|krmapihosting-system|istio-system|asm-system|anthos-identity-service|gatekeeper-system|composer-system)\b|\b(?:kube-(?:system|public|node-lease)|gmp-(?:system|public)|gke-managed-[\w-]+|gke-gmp-system|config-management-[\w-]+|cnrm-system|configconnector-operator-system|krmapihosting-system|istio-system|asm-system|anthos-identity-service|gatekeeper-system|composer-system)\b|\bgcloud\b[^\n|;&]*\bget-credentials\b|--include-system\b).*'
         - type: tool_called
           tool_names: ["execute_code"]
           scope: workers
-          agent: "cluster-.*-seeded-[bc]-.*"
+          agent: "cluster-.*-seeded-c-.*"
           arguments:
             code: '(?s).*\b(?:sleep|kubectl|gcloud|watch|ping|select|poll|wait|workload_triage|kube-system|gke-managed-|gmp-system)\b.*'
         - type: tool_called
@@ -135,24 +143,7 @@ verification_spec:
             - mcp__gke__get_k8s_rollout_status
             - mcp_gke_get_k8s_rollout_status
           scope: workers
-          agent: "cluster-.*-seeded-[bc]-.*"
-        - type: tool_called
-          tool_names:
-            - terminal
-            - execute_code
-            - mcp__gke__get_k8s_resource
-            - mcp_gke_get_k8s_resource
-            - mcp__gke__describe_k8s_resource
-            - mcp_gke_describe_k8s_resource
-            - mcp__gke__list_k8s_events
-            - mcp_gke_list_k8s_events
-            - mcp__gke__get_k8s_logs
-            - mcp_gke_get_k8s_logs
-            - mcp__gke__get_k8s_rollout_status
-            - mcp_gke_get_k8s_rollout_status
-          scope: workers
-          agent: "cluster-.*-seeded-b-.*"
-          minimum_calls: 7
+          agent: "cluster-.*-seeded-c-.*"
         - type: tool_called
           tool_names:
             - terminal
@@ -179,7 +170,7 @@ verification_spec:
         - type: tool_called
           tool_names: ["terminal"]
           scope: workers
-          agent: "cluster-.*-seeded-b-.*"
+          agent: "cluster-.*-seeded-c-.*"
           arguments:
             command: '(?s).*(?:(?:^|[;&|\n]|\$\(|`|(?<=\bdo\s))\s*\(?\s*(?:(?:for\s+\S+(?:\s+in\b[^;\n]*)?[;\n]\s*do\s+|(?:do|then|else)\s+|cd\s+\S+\s*&&\s*|eval\s+["'']?\s*|command\s+(?:-(?:p|-)\s+)+|[A-Za-z_]\w*=\S+\s+|(?:(?:\S+/)?(?:ba|z|da|k)?sh)\s+-\S*c\s+["'']?\s*|(?:(?:\S+/)?(?:exec|time))\s+(?:-[A-Za-z0-9]+\s+)*|(?:(?:\S+/)?(?:nohup|setsid))\s+(?:--[\w-]+(?:=\S+)?\s+|-[A-Za-z0-9]+\s+)*|(?:(?:\S+/)?env)\s+(?:(?:-i|-u\s+\S+|--[\w-]+(?:=\S+)?|[A-Za-z_]\w*=\S+)\s+)*|(?:(?:\S+/)?sudo)\s+(?:(?:-[ugCp]\s+\S+|-[A-Za-z0-9]+|--[\w-]+(?:=\S+)?)\s+)*|(?:(?:\S+/)?timeout)\s+(?:(?:-[ks](?:\s+\S+|\S+)|--(?:kill-after|signal)(?:=\S+|\s+\S+)|-[A-Za-z0-9]+|--[\w-]+(?:=\S+)?)\s+)*\d+(?:\.\d+)?[smhd]?\s+|(?:(?:\S+/)?nice)\s+(?:(?:-n\s*-?\d+|--adjustment(?:=\S+|\s+\S+)|-\d+)\s+)*|(?:(?:\S+/)?ionice)\s+(?:(?:-c\s*\d+|-n\s*\d+|-[A-Za-z0-9]+|--[\w-]+(?:=\S+)?)\s+)*|(?:(?:\S+/)?stdbuf)\s+(?:(?:-[ioe](?:\s+\S+|\S+)|--(?:input|output|error)(?:=\S+|\s+\S+))\s+)+|(?:(?:\S+/)?flock)\s+(?:(?:-[wEF]\s+\S+|-[A-Za-z0-9]+|--[\w-]+(?:=\S+)?)\s+)*\S+\s+|(?:(?:\S+/)?xargs)\s+(?:(?:-[nLIPSs]\s+\S+|-[A-Za-z0-9]+|--[\w-]+(?:=\S+)?)\s+)*))*(?:(?:\S+/)?python3?(?:\.\d+)?\s+(?:(?:-(?![mc]\b)[A-Za-z0-9]+|--[\w-]+(?:=\S+)?)\s+)*(?:-m\s+["'']?workload_triage\b|-c\s+(?:"(?:\\.|[^"])*?(?:\bimport\s+workload_triage\b|\bfrom\s+workload_triage\s+import\b|workload_triage\.py\b)(?:\\.|[^"])*"|''[^'']*?(?:\bimport\s+workload_triage\b|\bfrom\s+workload_triage\s+import\b|workload_triage\.py\b)[^'']*'')|(?:(?:-\s+)?<\s*)?["'']?(?![A-Za-z_]\w*=)(?:(?:[\w./*-]+/)?(?:workload_triage|workload_[\w*?[\]-]*[*?\[][\w*?[\]-]*|[\w*?[\]-]*[*?\[][\w*?[\]-]*triage[\w*?[\]-]*)\.py|(?:/[\w.*?-]+)*/opt/data/scripts/(?=[w*?\[])[\w*?[\].-]*[*?\[][\w*?[\].-]*\.py))(?![.\w])(?![^\n|;&]*(?:\s|^)(?:-h|--help)(?:\s|["'')`]|$))|["'']?(?![A-Za-z_]\w*=)(?:(?:[\w./*-]+/)?(?:workload_triage|workload_[\w*?[\]-]*[*?\[][\w*?[\]-]*|[\w*?[\]-]*[*?\[][\w*?[\]-]*triage[\w*?[\]-]*)\.py|(?:/[\w.*?-]+)*/opt/data/scripts/(?=[w*?\[])[\w*?[\].-]*[*?\[][\w*?[\].-]*\.py)(?![.\w])(?![^\n|;&]*(?:\s|^)(?:-h|--help)(?:\s|["'')`]|$))|\bfind\b[^\n|;&]*(?:workload_triage|/opt/data/scripts)\b[^\n|;&]*-(?:exec|execdir)\b)|\b([A-Za-z_]\w*)=["'']?(?:(?:[\w./*-]+/)?(?:workload_triage|workload_[\w*?[\]-]*[*?\[][\w*?[\]-]*|[\w*?[\]-]*[*?\[][\w*?[\]-]*triage[\w*?[\]-]*)\.py|(?:/[\w.*?-]+)*/opt/data/scripts/(?=[w*?\[])[\w*?[\].-]*[*?\[][\w*?[\].-]*\.py)["'']?[\s\S]*?(?:\bpython3?(?:\.\d+)?\s+(?:-\S+\s+)*(?:(?:-\s+)?<\s*)?|[;&|\n]\s*|\bdo\s+|\beval\s+["'']?)["'']?\$\{?\1\}?["'']?(?![^\n|;&]*(?:\s|^)(?:-h|--help)(?:\s|["'')`]|$))).*'
           minimum_calls: 2
@@ -188,24 +179,17 @@ verification_spec:
           scope: workers
           agent: "cluster-.*-seeded-c-.*"
           arguments:
-            command: '(?s).*(?:(?:^|[;&|\n]|\$\(|`|(?<=\bdo\s))\s*\(?\s*(?:(?:for\s+\S+(?:\s+in\b[^;\n]*)?[;\n]\s*do\s+|(?:do|then|else)\s+|cd\s+\S+\s*&&\s*|eval\s+["'']?\s*|command\s+(?:-(?:p|-)\s+)+|[A-Za-z_]\w*=\S+\s+|(?:(?:\S+/)?(?:ba|z|da|k)?sh)\s+-\S*c\s+["'']?\s*|(?:(?:\S+/)?(?:exec|time))\s+(?:-[A-Za-z0-9]+\s+)*|(?:(?:\S+/)?(?:nohup|setsid))\s+(?:--[\w-]+(?:=\S+)?\s+|-[A-Za-z0-9]+\s+)*|(?:(?:\S+/)?env)\s+(?:(?:-i|-u\s+\S+|--[\w-]+(?:=\S+)?|[A-Za-z_]\w*=\S+)\s+)*|(?:(?:\S+/)?sudo)\s+(?:(?:-[ugCp]\s+\S+|-[A-Za-z0-9]+|--[\w-]+(?:=\S+)?)\s+)*|(?:(?:\S+/)?timeout)\s+(?:(?:-[ks](?:\s+\S+|\S+)|--(?:kill-after|signal)(?:=\S+|\s+\S+)|-[A-Za-z0-9]+|--[\w-]+(?:=\S+)?)\s+)*\d+(?:\.\d+)?[smhd]?\s+|(?:(?:\S+/)?nice)\s+(?:(?:-n\s*-?\d+|--adjustment(?:=\S+|\s+\S+)|-\d+)\s+)*|(?:(?:\S+/)?ionice)\s+(?:(?:-c\s*\d+|-n\s*\d+|-[A-Za-z0-9]+|--[\w-]+(?:=\S+)?)\s+)*|(?:(?:\S+/)?stdbuf)\s+(?:(?:-[ioe](?:\s+\S+|\S+)|--(?:input|output|error)(?:=\S+|\s+\S+))\s+)+|(?:(?:\S+/)?flock)\s+(?:(?:-[wEF]\s+\S+|-[A-Za-z0-9]+|--[\w-]+(?:=\S+)?)\s+)*\S+\s+|(?:(?:\S+/)?xargs)\s+(?:(?:-[nLIPSs]\s+\S+|-[A-Za-z0-9]+|--[\w-]+(?:=\S+)?)\s+)*))*(?:(?:\S+/)?python3?(?:\.\d+)?\s+(?:(?:-(?![mc]\b)[A-Za-z0-9]+|--[\w-]+(?:=\S+)?)\s+)*(?:-m\s+["'']?workload_triage\b|-c\s+(?:"(?:\\.|[^"])*?(?:\bimport\s+workload_triage\b|\bfrom\s+workload_triage\s+import\b|workload_triage\.py\b)(?:\\.|[^"])*"|''[^'']*?(?:\bimport\s+workload_triage\b|\bfrom\s+workload_triage\s+import\b|workload_triage\.py\b)[^'']*'')|(?:(?:-\s+)?<\s*)?["'']?(?![A-Za-z_]\w*=)(?:(?:[\w./*-]+/)?(?:workload_triage|workload_[\w*?[\]-]*[*?\[][\w*?[\]-]*|[\w*?[\]-]*[*?\[][\w*?[\]-]*triage[\w*?[\]-]*)\.py|(?:/[\w.*?-]+)*/opt/data/scripts/(?=[w*?\[])[\w*?[\].-]*[*?\[][\w*?[\].-]*\.py))(?![.\w])(?![^\n|;&]*(?:\s|^)(?:-h|--help)(?:\s|["'')`]|$))|["'']?(?![A-Za-z_]\w*=)(?:(?:[\w./*-]+/)?(?:workload_triage|workload_[\w*?[\]-]*[*?\[][\w*?[\]-]*|[\w*?[\]-]*[*?\[][\w*?[\]-]*triage[\w*?[\]-]*)\.py|(?:/[\w.*?-]+)*/opt/data/scripts/(?=[w*?\[])[\w*?[\].-]*[*?\[][\w*?[\].-]*\.py)(?![.\w])(?![^\n|;&]*(?:\s|^)(?:-h|--help)(?:\s|["'')`]|$))|\bfind\b[^\n|;&]*(?:workload_triage|/opt/data/scripts)\b[^\n|;&]*-(?:exec|execdir)\b)|\b([A-Za-z_]\w*)=["'']?(?:(?:[\w./*-]+/)?(?:workload_triage|workload_[\w*?[\]-]*[*?\[][\w*?[\]-]*|[\w*?[\]-]*[*?\[][\w*?[\]-]*triage[\w*?[\]-]*)\.py|(?:/[\w.*?-]+)*/opt/data/scripts/(?=[w*?\[])[\w*?[\].-]*[*?\[][\w*?[\].-]*\.py)["'']?[\s\S]*?(?:\bpython3?(?:\.\d+)?\s+(?:-\S+\s+)*(?:(?:-\s+)?<\s*)?|[;&|\n]\s*|\bdo\s+|\beval\s+["'']?)["'']?\$\{?\1\}?["'']?(?![^\n|;&]*(?:\s|^)(?:-h|--help)(?:\s|["'')`]|$))).*'
-          minimum_calls: 2
-        - type: tool_called
-          tool_names: ["terminal"]
-          scope: workers
-          agent: "cluster-.*-seeded-[bc]-.*"
-          arguments:
             command: '(?s).*(?:(?:^|[;&|\n]|\$\(|`|(?<=\bdo\s))\s*\(?\s*(?:(?:for\s+\S+(?:\s+in\b[^;\n]*)?[;\n]\s*do\s+|(?:do|then|else)\s+|cd\s+\S+\s*&&\s*|eval\s+["'']?\s*|command\s+(?:-(?:p|-)\s+)+|[A-Za-z_]\w*=\S+\s+|(?:(?:\S+/)?(?:ba|z|da|k)?sh)\s+-\S*c\s+["'']?\s*|(?:(?:\S+/)?(?:exec|time))\s+(?:-[A-Za-z0-9]+\s+)*|(?:(?:\S+/)?(?:nohup|setsid))\s+(?:--[\w-]+(?:=\S+)?\s+|-[A-Za-z0-9]+\s+)*|(?:(?:\S+/)?env)\s+(?:(?:-i|-u\s+\S+|--[\w-]+(?:=\S+)?|[A-Za-z_]\w*=\S+)\s+)*|(?:(?:\S+/)?sudo)\s+(?:(?:-[ugCp]\s+\S+|-[A-Za-z0-9]+|--[\w-]+(?:=\S+)?)\s+)*|(?:(?:\S+/)?timeout)\s+(?:(?:-[ks](?:\s+\S+|\S+)|--(?:kill-after|signal)(?:=\S+|\s+\S+)|-[A-Za-z0-9]+|--[\w-]+(?:=\S+)?)\s+)*\d+(?:\.\d+)?[smhd]?\s+|(?:(?:\S+/)?nice)\s+(?:(?:-n\s*-?\d+|--adjustment(?:=\S+|\s+\S+)|-\d+)\s+)*|(?:(?:\S+/)?ionice)\s+(?:(?:-c\s*\d+|-n\s*\d+|-[A-Za-z0-9]+|--[\w-]+(?:=\S+)?)\s+)*|(?:(?:\S+/)?stdbuf)\s+(?:(?:-[ioe](?:\s+\S+|\S+)|--(?:input|output|error)(?:=\S+|\s+\S+))\s+)+|(?:(?:\S+/)?flock)\s+(?:(?:-[wEF]\s+\S+|-[A-Za-z0-9]+|--[\w-]+(?:=\S+)?)\s+)*\S+\s+|(?:(?:\S+/)?xargs)\s+(?:(?:-[nLIPSs]\s+\S+|-[A-Za-z0-9]+|--[\w-]+(?:=\S+)?)\s+)*))*(?:(?:\S+/)?python3?(?:\.\d+)?\s+(?:(?:-(?![mc]\b)[A-Za-z0-9]+|--[\w-]+(?:=\S+)?)\s+)*(?:-m\s+["'']?workload_triage\b|-c\s+(?:"(?:\\.|[^"])*?(?:\bimport\s+workload_triage\b|\bfrom\s+workload_triage\s+import\b|workload_triage\.py\b)(?:\\.|[^"])*"|''[^'']*?(?:\bimport\s+workload_triage\b|\bfrom\s+workload_triage\s+import\b|workload_triage\.py\b)[^'']*'')|(?:(?:-\s+)?<\s*)?["'']?(?![A-Za-z_]\w*=)(?:(?:[\w./*-]+/)?(?:workload_triage|workload_[\w*?[\]-]*[*?\[][\w*?[\]-]*|[\w*?[\]-]*[*?\[][\w*?[\]-]*triage[\w*?[\]-]*)\.py|(?:/[\w.*?-]+)*/opt/data/scripts/(?=[w*?\[])[\w*?[\].-]*[*?\[][\w*?[\].-]*\.py))(?![.\w])(?![^\n|;&]*(?:\s|^)(?:-h|--help)(?:\s|["'')`]|$))|["'']?(?![A-Za-z_]\w*=)(?:(?:[\w./*-]+/)?(?:workload_triage|workload_[\w*?[\]-]*[*?\[][\w*?[\]-]*|[\w*?[\]-]*[*?\[][\w*?[\]-]*triage[\w*?[\]-]*)\.py|(?:/[\w.*?-]+)*/opt/data/scripts/(?=[w*?\[])[\w*?[\].-]*[*?\[][\w*?[\].-]*\.py)(?![.\w])(?![^\n|;&]*(?:\s|^)(?:-h|--help)(?:\s|["'')`]|$))|\bfind\b[^\n|;&]*(?:workload_triage|/opt/data/scripts)\b[^\n|;&]*-(?:exec|execdir)\b)[^\n|;&]*(?=[;&|\n]|\$\(|`).*(?:^|[;&|\n]|\$\(|`|(?<=\bdo\s))\s*\(?\s*(?:(?:for\s+\S+(?:\s+in\b[^;\n]*)?[;\n]\s*do\s+|(?:do|then|else)\s+|cd\s+\S+\s*&&\s*|eval\s+["'']?\s*|command\s+(?:-(?:p|-)\s+)+|[A-Za-z_]\w*=\S+\s+|(?:(?:\S+/)?(?:ba|z|da|k)?sh)\s+-\S*c\s+["'']?\s*|(?:(?:\S+/)?(?:exec|time))\s+(?:-[A-Za-z0-9]+\s+)*|(?:(?:\S+/)?(?:nohup|setsid))\s+(?:--[\w-]+(?:=\S+)?\s+|-[A-Za-z0-9]+\s+)*|(?:(?:\S+/)?env)\s+(?:(?:-i|-u\s+\S+|--[\w-]+(?:=\S+)?|[A-Za-z_]\w*=\S+)\s+)*|(?:(?:\S+/)?sudo)\s+(?:(?:-[ugCp]\s+\S+|-[A-Za-z0-9]+|--[\w-]+(?:=\S+)?)\s+)*|(?:(?:\S+/)?timeout)\s+(?:(?:-[ks](?:\s+\S+|\S+)|--(?:kill-after|signal)(?:=\S+|\s+\S+)|-[A-Za-z0-9]+|--[\w-]+(?:=\S+)?)\s+)*\d+(?:\.\d+)?[smhd]?\s+|(?:(?:\S+/)?nice)\s+(?:(?:-n\s*-?\d+|--adjustment(?:=\S+|\s+\S+)|-\d+)\s+)*|(?:(?:\S+/)?ionice)\s+(?:(?:-c\s*\d+|-n\s*\d+|-[A-Za-z0-9]+|--[\w-]+(?:=\S+)?)\s+)*|(?:(?:\S+/)?stdbuf)\s+(?:(?:-[ioe](?:\s+\S+|\S+)|--(?:input|output|error)(?:=\S+|\s+\S+))\s+)+|(?:(?:\S+/)?flock)\s+(?:(?:-[wEF]\s+\S+|-[A-Za-z0-9]+|--[\w-]+(?:=\S+)?)\s+)*\S+\s+|(?:(?:\S+/)?xargs)\s+(?:(?:-[nLIPSs]\s+\S+|-[A-Za-z0-9]+|--[\w-]+(?:=\S+)?)\s+)*))*(?:(?:\S+/)?python3?(?:\.\d+)?\s+(?:(?:-(?![mc]\b)[A-Za-z0-9]+|--[\w-]+(?:=\S+)?)\s+)*(?:-m\s+["'']?workload_triage\b|-c\s+(?:"(?:\\.|[^"])*?(?:\bimport\s+workload_triage\b|\bfrom\s+workload_triage\s+import\b|workload_triage\.py\b)(?:\\.|[^"])*"|''[^'']*?(?:\bimport\s+workload_triage\b|\bfrom\s+workload_triage\s+import\b|workload_triage\.py\b)[^'']*'')|(?:(?:-\s+)?<\s*)?["'']?(?![A-Za-z_]\w*=)(?:(?:[\w./*-]+/)?(?:workload_triage|workload_[\w*?[\]-]*[*?\[][\w*?[\]-]*|[\w*?[\]-]*[*?\[][\w*?[\]-]*triage[\w*?[\]-]*)\.py|(?:/[\w.*?-]+)*/opt/data/scripts/(?=[w*?\[])[\w*?[\].-]*[*?\[][\w*?[\].-]*\.py))(?![.\w])(?![^\n|;&]*(?:\s|^)(?:-h|--help)(?:\s|["'')`]|$))|["'']?(?![A-Za-z_]\w*=)(?:(?:[\w./*-]+/)?(?:workload_triage|workload_[\w*?[\]-]*[*?\[][\w*?[\]-]*|[\w*?[\]-]*[*?\[][\w*?[\]-]*triage[\w*?[\]-]*)\.py|(?:/[\w.*?-]+)*/opt/data/scripts/(?=[w*?\[])[\w*?[\].-]*[*?\[][\w*?[\].-]*\.py)(?![.\w])(?![^\n|;&]*(?:\s|^)(?:-h|--help)(?:\s|["'')`]|$))|\bfind\b[^\n|;&]*(?:workload_triage|/opt/data/scripts)\b[^\n|;&]*-(?:exec|execdir)\b)|\b([A-Za-z_]\w*)=["'']?(?:(?:[\w./*-]+/)?(?:workload_triage|workload_[\w*?[\]-]*[*?\[][\w*?[\]-]*|[\w*?[\]-]*[*?\[][\w*?[\]-]*triage[\w*?[\]-]*)\.py|(?:/[\w.*?-]+)*/opt/data/scripts/(?=[w*?\[])[\w*?[\].-]*[*?\[][\w*?[\].-]*\.py)["'']?[\s\S]*?(?:\bpython3?(?:\.\d+)?\s+(?:-\S+\s+)*(?:(?:-\s+)?<\s*)?|[;&|\n]\s*|\bdo\s+|\beval\s+["'']?)["'']?\$\{?\1\}?["'']?[^\n|;&]*(?=[;&|\n]|\$\(|`)[\s\S]*?(?:(?:^|[;&|\n]|\$\(|`|(?<=\bdo\s))\s*\(?\s*(?:(?:for\s+\S+(?:\s+in\b[^;\n]*)?[;\n]\s*do\s+|(?:do|then|else)\s+|cd\s+\S+\s*&&\s*|eval\s+["'']?\s*|command\s+(?:-(?:p|-)\s+)+|[A-Za-z_]\w*=\S+\s+|(?:(?:\S+/)?(?:ba|z|da|k)?sh)\s+-\S*c\s+["'']?\s*|(?:(?:\S+/)?(?:exec|time))\s+(?:-[A-Za-z0-9]+\s+)*|(?:(?:\S+/)?(?:nohup|setsid))\s+(?:--[\w-]+(?:=\S+)?\s+|-[A-Za-z0-9]+\s+)*|(?:(?:\S+/)?env)\s+(?:(?:-i|-u\s+\S+|--[\w-]+(?:=\S+)?|[A-Za-z_]\w*=\S+)\s+)*|(?:(?:\S+/)?sudo)\s+(?:(?:-[ugCp]\s+\S+|-[A-Za-z0-9]+|--[\w-]+(?:=\S+)?)\s+)*|(?:(?:\S+/)?timeout)\s+(?:(?:-[ks](?:\s+\S+|\S+)|--(?:kill-after|signal)(?:=\S+|\s+\S+)|-[A-Za-z0-9]+|--[\w-]+(?:=\S+)?)\s+)*\d+(?:\.\d+)?[smhd]?\s+|(?:(?:\S+/)?nice)\s+(?:(?:-n\s*-?\d+|--adjustment(?:=\S+|\s+\S+)|-\d+)\s+)*|(?:(?:\S+/)?ionice)\s+(?:(?:-c\s*\d+|-n\s*\d+|-[A-Za-z0-9]+|--[\w-]+(?:=\S+)?)\s+)*|(?:(?:\S+/)?stdbuf)\s+(?:(?:-[ioe](?:\s+\S+|\S+)|--(?:input|output|error)(?:=\S+|\s+\S+))\s+)+|(?:(?:\S+/)?flock)\s+(?:(?:-[wEF]\s+\S+|-[A-Za-z0-9]+|--[\w-]+(?:=\S+)?)\s+)*\S+\s+|(?:(?:\S+/)?xargs)\s+(?:(?:-[nLIPSs]\s+\S+|-[A-Za-z0-9]+|--[\w-]+(?:=\S+)?)\s+)*))*(?:(?:\S+/)?python3?(?:\.\d+)?\s+(?:(?:-(?![mc]\b)[A-Za-z0-9]+|--[\w-]+(?:=\S+)?)\s+)*(?:-m\s+["'']?workload_triage\b|-c\s+(?:"(?:\\.|[^"])*?(?:\bimport\s+workload_triage\b|\bfrom\s+workload_triage\s+import\b|workload_triage\.py\b)(?:\\.|[^"])*"|''[^'']*?(?:\bimport\s+workload_triage\b|\bfrom\s+workload_triage\s+import\b|workload_triage\.py\b)[^'']*'')|(?:(?:-\s+)?<\s*)?["'']?(?![A-Za-z_]\w*=)(?:(?:[\w./*-]+/)?(?:workload_triage|workload_[\w*?[\]-]*[*?\[][\w*?[\]-]*|[\w*?[\]-]*[*?\[][\w*?[\]-]*triage[\w*?[\]-]*)\.py|(?:/[\w.*?-]+)*/opt/data/scripts/(?=[w*?\[])[\w*?[\].-]*[*?\[][\w*?[\].-]*\.py))(?![.\w])(?![^\n|;&]*(?:\s|^)(?:-h|--help)(?:\s|["'')`]|$))|["'']?(?![A-Za-z_]\w*=)(?:(?:[\w./*-]+/)?(?:workload_triage|workload_[\w*?[\]-]*[*?\[][\w*?[\]-]*|[\w*?[\]-]*[*?\[][\w*?[\]-]*triage[\w*?[\]-]*)\.py|(?:/[\w.*?-]+)*/opt/data/scripts/(?=[w*?\[])[\w*?[\].-]*[*?\[][\w*?[\].-]*\.py)(?![.\w])(?![^\n|;&]*(?:\s|^)(?:-h|--help)(?:\s|["'')`]|$))|\bfind\b[^\n|;&]*(?:workload_triage|/opt/data/scripts)\b[^\n|;&]*-(?:exec|execdir)\b)|(?:[;&|\n]|\$\(|`)\s*(?:\bpython3?(?:\.\d+)?\s+(?:-\S+\s+)*(?:(?:-\s+)?<\s*)?|\beval\s+["'']?)?["'']?\$\{?\1\}?["'']?)).*'
         - type: tool_called
           tool_names: ["terminal"]
           scope: workers
-          agent: "cluster-.*-seeded-[bc]-.*"
+          agent: "cluster-.*-seeded-c-.*"
           arguments:
             command: '(?s).*(?:\bfor\s+\S+(?:\s+in\b[^;\n]*)?[;\n]+\s*do\b[\s\S]*?(?:^|[;&|\n]|\$\(|`|(?<=\bdo\s))\s*\(?\s*(?:(?:for\s+\S+(?:\s+in\b[^;\n]*)?[;\n]\s*do\s+|(?:do|then|else)\s+|cd\s+\S+\s*&&\s*|eval\s+["'']?\s*|command\s+(?:-(?:p|-)\s+)+|[A-Za-z_]\w*=\S+\s+|(?:(?:\S+/)?(?:ba|z|da|k)?sh)\s+-\S*c\s+["'']?\s*|(?:(?:\S+/)?(?:exec|time))\s+(?:-[A-Za-z0-9]+\s+)*|(?:(?:\S+/)?(?:nohup|setsid))\s+(?:--[\w-]+(?:=\S+)?\s+|-[A-Za-z0-9]+\s+)*|(?:(?:\S+/)?env)\s+(?:(?:-i|-u\s+\S+|--[\w-]+(?:=\S+)?|[A-Za-z_]\w*=\S+)\s+)*|(?:(?:\S+/)?sudo)\s+(?:(?:-[ugCp]\s+\S+|-[A-Za-z0-9]+|--[\w-]+(?:=\S+)?)\s+)*|(?:(?:\S+/)?timeout)\s+(?:(?:-[ks](?:\s+\S+|\S+)|--(?:kill-after|signal)(?:=\S+|\s+\S+)|-[A-Za-z0-9]+|--[\w-]+(?:=\S+)?)\s+)*\d+(?:\.\d+)?[smhd]?\s+|(?:(?:\S+/)?nice)\s+(?:(?:-n\s*-?\d+|--adjustment(?:=\S+|\s+\S+)|-\d+)\s+)*|(?:(?:\S+/)?ionice)\s+(?:(?:-c\s*\d+|-n\s*\d+|-[A-Za-z0-9]+|--[\w-]+(?:=\S+)?)\s+)*|(?:(?:\S+/)?stdbuf)\s+(?:(?:-[ioe](?:\s+\S+|\S+)|--(?:input|output|error)(?:=\S+|\s+\S+))\s+)+|(?:(?:\S+/)?flock)\s+(?:(?:-[wEF]\s+\S+|-[A-Za-z0-9]+|--[\w-]+(?:=\S+)?)\s+)*\S+\s+|(?:(?:\S+/)?xargs)\s+(?:(?:-[nLIPSs]\s+\S+|-[A-Za-z0-9]+|--[\w-]+(?:=\S+)?)\s+)*))*(?:(?:\S+/)?python3?(?:\.\d+)?\s+(?:(?:-(?![mc]\b)[A-Za-z0-9]+|--[\w-]+(?:=\S+)?)\s+)*(?:-m\s+["'']?workload_triage\b|-c\s+(?:"(?:\\.|[^"])*?(?:\bimport\s+workload_triage\b|\bfrom\s+workload_triage\s+import\b|workload_triage\.py\b)(?:\\.|[^"])*"|''[^'']*?(?:\bimport\s+workload_triage\b|\bfrom\s+workload_triage\s+import\b|workload_triage\.py\b)[^'']*'')|(?:(?:-\s+)?<\s*)?["'']?(?![A-Za-z_]\w*=)(?:(?:[\w./*-]+/)?(?:workload_triage|workload_[\w*?[\]-]*[*?\[][\w*?[\]-]*|[\w*?[\]-]*[*?\[][\w*?[\]-]*triage[\w*?[\]-]*)\.py|(?:/[\w.*?-]+)*/opt/data/scripts/(?=[w*?\[])[\w*?[\].-]*[*?\[][\w*?[\].-]*\.py))(?![.\w])(?![^\n|;&]*(?:\s|^)(?:-h|--help)(?:\s|["'')`]|$))|["'']?(?![A-Za-z_]\w*=)(?:(?:[\w./*-]+/)?(?:workload_triage|workload_[\w*?[\]-]*[*?\[][\w*?[\]-]*|[\w*?[\]-]*[*?\[][\w*?[\]-]*triage[\w*?[\]-]*)\.py|(?:/[\w.*?-]+)*/opt/data/scripts/(?=[w*?\[])[\w*?[\].-]*[*?\[][\w*?[\].-]*\.py)(?![.\w])(?![^\n|;&]*(?:\s|^)(?:-h|--help)(?:\s|["'')`]|$))|\bfind\b[^\n|;&]*(?:workload_triage|/opt/data/scripts)\b[^\n|;&]*-(?:exec|execdir)\b)|\b([A-Za-z_]\w*)=["'']?(?:(?:[\w./*-]+/)?(?:workload_triage|workload_[\w*?[\]-]*[*?\[][\w*?[\]-]*|[\w*?[\]-]*[*?\[][\w*?[\]-]*triage[\w*?[\]-]*)\.py|(?:/[\w.*?-]+)*/opt/data/scripts/(?=[w*?\[])[\w*?[\].-]*[*?\[][\w*?[\].-]*\.py)["'']?[\s\S]*?\bfor\s+\S+(?:\s+in\b[^;\n]*)?[;\n]+\s*do\b[\s\S]*?["'']?\$\{?\1\}?["'']?).*'
         - type: tool_called
           tool_names: ["terminal"]
           scope: workers
-          agent: "cluster-.*-seeded-[bc]-.*"
+          agent: "cluster-.*-seeded-c-.*"
           arguments:
             command: '(?s).*\bkubectl\b(?:(?!\s--\s)[^\n|;&])*\s(?:-(?:(?![nlocfksL])[A-Za-z])*A[A-Za-z]*\b|--all-namespaces\b|--raw(?:\s+|=)["'']?/(?:api/v1/(?!namespaces/)\w+|apis/[\w.-]+/[\w.-]+/(?!namespaces/)\w+)(?:[?"''\s|;&/]|$)).*'
   - name: rca-names-the-oom

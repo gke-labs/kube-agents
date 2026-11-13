@@ -41,9 +41,11 @@ Which clusters. The projects come from this pod, not from the sandbox:
 neither, the sandbox's ``gcloud config get-value project``; and with nothing
 at all the tick fails closed rather than let the report script fall back to
 its own scope, which on an install that declares none is every project the
-credential can list. Every cluster in those projects is read,
+credential can list. Every cluster in those projects is listed and its versions graded,
 including ones ``spec.scope.exclude.clusters`` keeps a Cluster Agent from,
-because the report script enumerates by project. On an install that declares
+because the report script enumerates by project; an excluded cluster's
+in-cluster readiness reads are skipped (``--scope-readiness-excluded-clusters``),
+since the credential broker refuses its Kubernetes API to every caller. On an install that declares
 a scope (a ``spec.scope`` block), the report script, a fleet-audit collector,
 refuses a bare ``--project`` in the sandbox (``fleet_scope_args``, under the
 operator's ``KUBEAGENTS_SCOPE_DECLARED``), so the tick reads the declared
@@ -249,6 +251,10 @@ OUTPUT_FLAG = "--output"
 STATE_DIR_FLAG = "--state-dir"
 READINESS_FLAG = "--readiness"
 KUBECONFIG_DIR_FLAG = "--kubeconfig-dir"
+# The excluded clusters, whose versions the report still grades but whose
+# in-cluster reads it skips: the credential broker refuses their Kubernetes API
+# to every caller, this watch included (fleet_upgrade_report's flag of the name).
+READINESS_EXCLUDED_FLAG = "--scope-readiness-excluded-clusters"
 ENVELOPE_SENTINEL = "__UPGRADE_READINESS_WATCH_ENVELOPE__"
 ENVELOPE_EXIT_KEY = "exit"
 ENVELOPE_TABLES_KEY = "tables"
@@ -1044,10 +1050,11 @@ def scope_flags(scope: fleet_scope_targets.ScopeTargets | None) -> list[str]:
     stdin, beside both scripts' sources."""
     if scope is None:
         return []
-    # No --scope-exclude-clusters, on purpose: the watch's report covers the
-    # clusters spec.scope.exclude.clusters excludes, one of the reads the CRD
-    # field names as still covering them (#3081); the report enumerates by
-    # project, so the scope goes without its cluster exclusion.
+    # No --scope-exclude-clusters, on purpose: the watch's report still lists
+    # and grades the versions of the clusters spec.scope.exclude.clusters
+    # excludes, through control-plane reads (#3081, narrowed by #3461); the
+    # report enumerates by project, so the scope goes without its cluster
+    # exclusion, and report_argv names them for the in-cluster reads it skips.
     return list(dataclasses.replace(scope, excluded_clusters=()).collector_argv())
 
 
@@ -1055,6 +1062,9 @@ def report_argv(names: list[str], readiness: bool, scope: fleet_scope_targets.Sc
     argv = project_flags(names) + scope_flags(scope)
     if readiness:
         argv += [READINESS_FLAG, KUBECONFIG_DIR_FLAG, SANDBOX_KUBECONFIG_DIR]
+        if scope is not None and scope.excluded_clusters:
+            argv += [READINESS_EXCLUDED_FLAG, ",".join(
+                fleet_scope_args.format_cluster_ref(*triple) for triple in scope.excluded_clusters)]
     return argv
 
 

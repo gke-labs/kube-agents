@@ -172,6 +172,8 @@ func TestTheWebConsoleCRPolicyHoldsWhereAForgeCredentialGoes(t *testing.T) {
 		{"a credentialed forge's provider", gitLabWith(`"provider":"gitlab"`, `"provider":"gitea"`), destinationRule},
 		{"a credentialsRef added to a forge with none", integration(
 			`{"name":"github","namespace":"gke-labs","credentialsRef":{"name":"gl-token"}},`+forgeGitLab+","+forgeGitea, reposBothForge), destinationRule},
+		{"a caBundleRef added to a forge with none", giteaWith(`"namespace":"acme"`, `"namespace":"acme","caBundleRef":{"name":"gt-ca"}`), destinationRule},
+		{"a credentialed forge's caBundleRef removed", gitLabWith(`,"caBundleRef":{"name":"gl-ca"}`, ``), destinationRule},
 		{"a forge added with only a CA bundle", integration(forgeGitHub+","+forgeGitLab+","+forgeGitea+
 			`,{"name":"gh-ca","provider":"github","host":"ghe.attacker.example","caBundleRef":{"name":"evil-ca"}}`, reposBothForge), newForgeRule},
 		{"a credentialed forge's namespace", gitLabWith(`"namespace":"acme"`, `"namespace":"other-group"`), destinationRule},
@@ -214,6 +216,12 @@ func TestTheWebConsoleCRPolicyHoldsWhereAForgeCredentialGoes(t *testing.T) {
 		forgeGHE      = `{"name":"ghe","provider":"github","host":"ghe.corp.example","namespace":"acme"}`
 		forgeShared   = `{"name":"gl","provider":"gitlab","host":"shared.corp.example","namespace":"acme","credentialsRef":{"name":"gl-token"}}`
 		forgeAtShared = `{"name":"gh","provider":"github","host":"shared.corp.example","namespace":"acme"}`
+		// Two GitHub forges at one GitHub Enterprise host that name different
+		// CA bundles (the CRD refuses a CA bundle at github.com): the operator
+		// keeps the first one's for the host and refuses the second.
+		forgeCAa    = `{"name":"gh-a","provider":"github","host":"ghe.corp.example","namespace":"org-a","caBundleRef":{"name":"ca-a"}}`
+		forgeCAb    = `{"name":"gh-b","provider":"github","host":"ghe.corp.example","namespace":"org-b","caBundleRef":{"name":"ca-b"}}`
+		forgeCAaKey = `{"name":"gh-b","provider":"github","host":"ghe.corp.example","namespace":"org-b","caBundleRef":{"name":"ca-a","key":"other.crt"}}`
 	)
 	for _, tc := range []struct{ name, setup, body, rule string }{
 		{
@@ -242,6 +250,30 @@ func TestTheWebConsoleCRPolicyHoldsWhereAForgeCredentialGoes(t *testing.T) {
 			name:  "a GitHub forge moved before a GitLab forge at its host",
 			setup: integration(forgeShared+","+forgeAtShared, `[]`),
 			body:  integration(forgeAtShared+","+forgeShared, `[]`),
+			rule:  refusedRule,
+		},
+		{
+			name:  "the forge whose CA bundle the broker trusts removed, leaving another bundle",
+			setup: integration(forgeCAa+","+forgeCAb, `[]`),
+			body:  integration(forgeCAb, `[]`),
+			rule:  refusedRule,
+		},
+		{
+			name:  "two GitHub forges with different CA bundles reordered",
+			setup: integration(forgeCAa+","+forgeCAb, `[]`),
+			body:  integration(forgeCAb+","+forgeCAa, `[]`),
+			rule:  refusedRule,
+		},
+		{
+			name:  "two GitHub forges with CA bundles that differ only by key reordered",
+			setup: integration(forgeCAa+","+forgeCAaKey, `[]`),
+			body:  integration(forgeCAaKey+","+forgeCAa, `[]`),
+			rule:  refusedRule,
+		},
+		{
+			name:  "the forge whose CA bundle the broker trusts given another namespace",
+			setup: integration(forgeCAa+","+forgeCAb, `[]`),
+			body:  integration(strings.Replace(forgeCAa, `"namespace":"org-a"`, `"namespace":"other"`, 1)+","+forgeCAb, `[]`),
 			rule:  refusedRule,
 		},
 		{
@@ -298,6 +330,31 @@ func TestTheWebConsoleCRPolicyHoldsWhereAForgeCredentialGoes(t *testing.T) {
 	if err := patch(console, integration(`{"name":"github","provider":"github","namespace":"gke-labs"},`+forgeGHE,
 		`[{"forge":"ghe","repository":"acme/infra","role":"gitops"}]`)); err != nil {
 		t.Errorf("a repository added on a refused declaration: refused, want admitted: %v", err)
+	}
+
+	// GitHub forges with different CA bundles still take repositories.
+	if err := patch(admin, integration(forgeCAa+","+forgeCAb, `[]`)); err != nil {
+		t.Fatalf("setting the two CA bundles: %v", err)
+	}
+	if err := patch(console, integration(forgeCAa+","+forgeCAb,
+		`[{"forge":"gh-a","repository":"org-a/infra","role":"gitops"}]`)); err != nil {
+		t.Errorf("a repository added beside two CA bundles: refused, want admitted: %v", err)
+	}
+	// One CA bundle for the host, named once or on both forges: removing or
+	// reordering forges does not change it, so the console may.
+	forgeCAbSame := strings.Replace(forgeCAb, `"ca-b"`, `"ca-a"`, 1)
+	forgeNoCA := `{"name":"gh-b","provider":"github","host":"ghe.corp.example","namespace":"org-b"}`
+	for _, tc := range []struct{ name, setup, body string }{
+		{"the first of two forges with the same CA bundle removed", forgeCAa + "," + forgeCAbSame, forgeCAbSame},
+		{"two forges with the same CA bundle reordered", forgeCAa + "," + forgeCAbSame, forgeCAbSame + "," + forgeCAa},
+		{"a forge with no CA bundle moved after the one with it", forgeNoCA + "," + forgeCAa, forgeCAa + "," + forgeNoCA},
+	} {
+		if err := patch(admin, integration(tc.setup, `[]`)); err != nil {
+			t.Fatalf("%s: setting the declaration: %v", tc.name, err)
+		}
+		if err := patch(console, integration(tc.body, `[]`)); err != nil {
+			t.Errorf("%s: refused, want admitted: %v", tc.name, err)
+		}
 	}
 
 	// A provider's own host spelled out on a forge declared without one is

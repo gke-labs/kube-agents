@@ -121,7 +121,7 @@ func (g *Gateway) delegateTargets(r TaskRequester, authors []TaskRequester, auth
 		if len(c.Tiers) > 0 && !slices.Contains(c.Tiers, string(tier)) {
 			continue
 		}
-		next := lib.DelegateTarget{Name: c.Name, Description: lib.DelegateTargetDescription(c.Description), Parameters: c.Parameters}
+		next := lib.DelegateTarget{Name: c.Name, Description: lib.DelegateTargetDescription(c.Description), Parameters: offeredParameters(c)}
 		if !fits(lib.DelegateTargets{}, next) {
 			// A card whose parameters break the part's rules isn't offered;
 			// the delegation would refuse its parameters anyway.
@@ -145,4 +145,23 @@ func fits(t lib.DelegateTargets, next lib.DelegateTarget) bool {
 	t.Truncated = true
 	_, err := lib.DelegateTargetsPart(t)
 	return err == nil
+}
+
+// offeredParameters is what a card asks a delegation for. A profile pinned to a
+// cluster takes its target from the pin (resolveProfile), so its project,
+// location and cluster aren't offered: listing them as required would invite
+// a partial or guessed target the gateway refuses.
+func offeredParameters(c lib.AgentCard) []lib.ProfileParameter {
+	if c.ClusterRef == nil {
+		return c.Parameters
+	}
+	out := make([]lib.ProfileParameter, 0, len(c.Parameters))
+	for _, p := range c.Parameters {
+		switch p.Name {
+		case paramProject, paramLocation, paramCluster:
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
 }

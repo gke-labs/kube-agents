@@ -100,6 +100,7 @@ from dataclasses import dataclass, field
 
 from devops_bench.agents import AgentResult
 
+from kube_agents_bench import worker_trajectory
 from kube_agents_bench.worker_trajectory import FALLBACK_PYTHON, HERMES_PYTHON
 
 __all__ = [
@@ -141,7 +142,7 @@ _BLOCK_FIELDS = ("title", "kind", "reason")
 # The block kind a question replay files, and the kinds a block replay may
 # name: Hermes' VALID_BLOCK_KINDS less the question's, which needs an answer.
 NEEDS_INPUT = "needs_input"
-BLOCK_KINDS = ("transient", "capability", "dependency")
+BLOCK_KINDS = ("transient", "capability", "dependency", "capacity")
 
 # The name of the harness trajectory entry carrying the card as the run left
 # it: ``args.card`` is the card, ``result`` is ``Settled.as_metadata()`` or
@@ -907,11 +908,20 @@ def merge(
         "answer_final_message": answer_reply,
     }
     errors = [*answer.errors, *wake.errors] if no_reply(answer) else [*wake.errors, *answer.errors]
+    trajectory = [*wake.trajectory, *answer.trajectory]
+    # A no-worker-calls entry speaks for the cards of the turn that wrote it
+    # (pushed_report.merge keeps it the same way).
+    if not all(
+        any(isinstance(e, dict) and e.get("name") == worker_trajectory.NO_WORKER_CALLS_ENTRY for e in turn)
+        for turn in (wake.trajectory, answer.trajectory)
+    ):
+        trajectory = [
+            e for e in trajectory if not (isinstance(e, dict) and e.get("name") == worker_trajectory.NO_WORKER_CALLS_ENTRY)
+        ]
     return AgentResult(
         output=wake.output,
         trajectory=[
-            *wake.trajectory,
-            *answer.trajectory,
+            *trajectory,
             _settled_entry(planted, settled, None if no_reply(answer) else answer_reply),
         ],
         tokens=tokens,

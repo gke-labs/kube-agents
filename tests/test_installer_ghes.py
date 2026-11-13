@@ -162,7 +162,7 @@ class GhesFlagsTest(_Tmp):
         tok = self._ca("tok", "x")
         proc = self._validate(self._ghes(PARAM_GITLAB_TOKEN_FILE=str(tok)))
         self.assertRegex(proc.stdout, r"rc=[1-9]", proc.stderr + proc.stdout)
-        self.assertIn("--gitlab-token-file applies only with --gitops-forge=gitlab", proc.stdout + proc.stderr)
+        self.assertIn("--gitlab-token-file (--gitops-token-file) applies only with --gitops-forge=gitlab", proc.stdout + proc.stderr)
 
     def test_a_ca_file_names_the_github_secret(self):
         ca = self._ca()

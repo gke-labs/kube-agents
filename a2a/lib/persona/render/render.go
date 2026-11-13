@@ -53,12 +53,12 @@ func WriteFiles(dir string, files []persona.File) error {
 	if entries, err := os.ReadDir(dir); err == nil && len(entries) > 0 {
 		return fmt.Errorf("%s is not empty", dir)
 	}
-	if err := os.MkdirAll(dir, writeDirMode); err != nil {
+	if err := os.MkdirAll(dir, writeDirMode); err != nil { // #nosec G301 -- the rendered persona is read by the harness user, so 0755 is the point
 		return err
 	}
 	for _, f := range files {
 		full := filepath.Join(dir, filepath.FromSlash(f.Path))
-		if err := os.MkdirAll(filepath.Dir(full), writeDirMode); err != nil {
+		if err := os.MkdirAll(filepath.Dir(full), writeDirMode); err != nil { // #nosec G301 -- same mode as above
 			return err
 		}
 		mode := os.FileMode(writeFileMode)

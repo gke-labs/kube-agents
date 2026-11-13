@@ -34,7 +34,11 @@ the pair. The canonical identifiers also live with the installer, and the module
 defaults mirror them: the GSA `kubeagents-github-minter-gsa` and the namespace
 `kubeagents-system` as defaults in `install.defaults.env` (an install overrides them
 through `install.env`), the KSA `kubeagents-github-minter` as a constant in
-`scripts/installer/common.sh` for the dev tooling.
+`scripts/installer/common.sh` for the dev tooling. `install.sh` gives a new install its
+own GSA, key ring and key names, derived from the cluster, and keeps the names an
+existing install's state holds; these defaults are what an existing install was
+created with. `owner_labels` and `owner_description` record the owning install on the
+crypto key and the GSA, for the full-install composition's adoption check.
 
 ## Usage
 

@@ -59,6 +59,12 @@
 id: vcs-spent-branch-reuse
 name: A second proposal under a branch name whose first proposal was closed
 domain: source-control
+# The case opens a pull request and closes it to spend the branch name, then
+# opens the second one its check grades, and the reply names both. Its one
+# pull_request_opened leaf would allow one; this is the case's total, read by
+# the lane for the write safeguard's allowance and by the grader for the
+# carve-out that excuses a requested pull request.
+requested_pull_requests: 2
 prompt: >-
   Do all of the following as ONE delegated task, in order — do not split it
   across several tasks.

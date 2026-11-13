@@ -75,7 +75,8 @@ PLACEHOLDER_RE = re.compile(re.escape(OPEN) + r"[^" + re.escape(CLOSE) + r"]+" +
 # `tool_call_id` still names the same call as the assistant's `id`. The
 # forwarded request is never modified; this is the key only.
 OPAQUE_KEY_RE = re.compile(r"signature|provider_specific_fields", re.I)
-OPAQUE_ALWAYS_KEYS = ("tool_call_id",)
+TOOL_CALL_ID_KEY = "tool_call_id"
+OPAQUE_ALWAYS_KEYS = (TOOL_CALL_ID_KEY,)
 # `id` is opaque only as the `id` of an item in a `tool_calls` list, whatever
 # the provider's prefix (`call_…` from Gemini through LiteLLM, `toolu_…` from
 # Claude). Any other string `id` -- a kanban card, a cluster, a resource --
@@ -85,8 +86,13 @@ ID_KEY = "id"
 TOOL_CALLS_KEY = "tool_calls"
 OPAQUE_CLASS = "OPAQUE"
 
-# Keys whose numeric value is a per-run counter or row id.
-KEYED_NUMBER_KEYS = ("pid", "PID", "run_id", "id", "resourceVersion", "generation", "observedGeneration")
+# Keys whose numeric value is a per-run counter or row id. `comment_id` is the
+# row id `kanban_comment` returns: upstream's `add_comment` returns the
+# comment's `lastrowid` (deploy/docker/patches/kanban_comment_status.py), one
+# counter for the whole install's board, so it counts every comment earlier
+# runs left (the Nov 10 lane trial recorded 41 and replayed 43, 44, 45).
+KEYED_NUMBER_KEYS = ("pid", "PID", "run_id", "id", "comment_id", "resourceVersion", "generation",
+                     "observedGeneration")
 # Any key ending in this is a run id too (`current_run_id`, `parent_run_id`).
 RUN_ID_SUFFIX = "_run_id"
 # Kanban card history: heartbeat entries are liveness pings on a timer, so how
@@ -120,6 +126,16 @@ LINE_BREAK = "\n"
 # A line that opens a JSON document, and an indented line continuing a warning.
 JSON_LINE_RE = re.compile(r"^[{\[]", re.M)
 CONTINUATION_PREFIXES = (" ", "\t")
+# Hermes' skill_view result lists a skill's files per support directory as
+# glob/rglob returns them, in directory order, which differs from pod to pod:
+# `linked_files` (tools/skills_tool.py `_skill_linked_files`) and, when the
+# asked-for file is missing, `available_files` (tools/skills_tool_plugin.py
+# `_available_skill_files`). Each group's list is sorted for the key
+# (sorted_skill_listings); nothing else in the result is reordered. Read only
+# in a tool message answering a skill_view call, found by its tool_call_id.
+TOOL_ROLE = "tool"
+SKILL_VIEW_TOOL = "skill_view"
+SKILL_LISTING_KEYS = ("linked_files", "available_files")
 NUMBER_CLASS = "NUM"
 # A swapped number with at least this many digits counts as repeated wherever an
 # answer has it as a whole token (`kill 4821`). A shorter one counts only next
@@ -127,11 +143,20 @@ NUMBER_CLASS = "NUM"
 # (`2>&1`, "revision 1") is almost never the swapped value, and treating it as
 # one marked about one answer in seven unstorable in the dev-install dry run.
 MIN_STANDALONE_REPEAT_DIGITS = 4
-SHORT_NUMBER_KEYS = r"(?:resourceVersion|observedGeneration|generation|run_id|run|pid|PID|id)"
+SHORT_NUMBER_KEYS = r"(?:resourceVersion|observedGeneration|generation|run_id|run|comment_id|pid|PID|id)"
+# A comment id also counts next to the bare word, as "posted comment 41" names
+# it; only a value swapped from `comment_id` does, so "comment: 2 pods" next
+# to a swapped `generation: 2` stays storable.
+COMMENT_ID_KEY = "comment_id"
+COMMENT_WORD = "comment"
 SHORT_NUMBER_KEY_GAP = r"(?:\s+(?:is|was|now|of)\s+|\W{0,4})"
 DIGITS_RE = re.compile(r"^\d+$")
 KEYED_NUMBER_TEXT_RE = re.compile(
     r"(?<![A-Za-z0-9_])(resourceVersion|observedGeneration|generation|[A-Za-z0-9]*_?run_id|pid|PID|id)"
+    r"(\\?[\"']?\s*[:=]\s*\\?[\"']?)(\d+)\b"
+)
+COMMENT_ID_TEXT_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(" + COMMENT_ID_KEY + r")"
     r"(\\?[\"']?\s*[:=]\s*\\?[\"']?)(\d+)\b"
 )
 # `pid 4821`, as a process listing or a sentence names one.
@@ -480,6 +505,38 @@ def warnings_last(text: str) -> str:
     return text
 
 
+def sorted_skill_listings(text: str) -> str:
+    """A skill_view result with each SKILL_LISTING_KEYS group's file list sorted; any other text as it is.
+
+    Returns `text` itself when nothing moved, so a result already in order keeps its exact text.
+    A result Hermes appended a notice to (the iteration-budget warning, toolguard guidance)
+    is JSON followed by text: its JSON is sorted and written in canonical form, so two pods'
+    copies key alike whichever needed the sort, and the appended text is kept as it is.
+    """
+    parsed = Normalizer.parse_json_document(text)
+    tail = None
+    if parsed is None:
+        try:
+            parsed, end = json.JSONDecoder().raw_decode(text.lstrip())
+        except ValueError:
+            return text
+        tail = text.lstrip()[end:]
+    if not isinstance(parsed, dict):
+        return text
+    moved = False
+    for key in SKILL_LISTING_KEYS:
+        groups = parsed.get(key)
+        if not isinstance(groups, dict):
+            continue
+        for group, files in groups.items():
+            if isinstance(files, list) and all(isinstance(f, str) for f in files) and files != sorted(files):
+                groups[group] = sorted(files)
+                moved = True
+    if tail is not None:
+        return json.dumps(parsed, sort_keys=True, ensure_ascii=False) + tail
+    return json.dumps(parsed, ensure_ascii=False) if moved else text
+
+
 def time_bucket(when: float, now: float) -> str:
     """The placeholder for a timestamp: how far from `now` it is, and which way."""
     delta = now - when
@@ -586,6 +643,9 @@ class Mapping:
     # (keyed numbers) and epoch timestamps, which become an unnumbered
     # how-far-from-now time token.
     bare_numbers: set = field(default_factory=set)
+    # The bare numbers swapped from a `comment_id`, which an answer also
+    # repeats next to the word "comment".
+    comment_numbers: set = field(default_factory=set)
     # Dates swapped for a day-count token. The token can't be put back, so an
     # answer naming one is not saved: replayed on another day it would carry
     # the recording's. `today_dates` are the ones on the request's own day,
@@ -628,7 +688,7 @@ class Mapping:
 
     def copy(self) -> "Mapping":
         return Mapping(dict(self.to_placeholder), dict(self.to_value), dict(self.counts), set(self.bare_numbers),
-                       set(self.dates), set(self.today_dates), list(self.time_occurrences), set(self.ages),
+                       set(self.comment_numbers), set(self.dates), set(self.today_dates), list(self.time_occurrences), set(self.ages),
                        set(self.dropped_counts), set(self.dropped_count_keys), set(self.dropped_hex))
 
     def swappable_values(self) -> Dict[str, str]:
@@ -688,9 +748,17 @@ class Mapping:
         for cls, pattern, group in ID_CLASSES:
             text = Normalizer.sub_group(pattern, group, lambda v: self.bound(v) or v, text)
         text = IPV4_RE.sub(lambda m: self.bound(m.group(0)) or m.group(0), text)
-        text = HEX_RUN_RE.sub(lambda m: self.bound_commit(m.group(0)) or m.group(0), text)
+        text = self.swap_bare_commits(text)
         for pattern in TIMESTAMP_PATTERNS:
             text = pattern.sub(lambda m: self.bound_time(m.group(0)) or m.group(0), text)
+        return self.swap_whole_tokens(text)
+
+    def swap_bare_commits(self, text: str) -> str:
+        """Swap each whole run of hex that is a bound commit for its placeholder."""
+        return HEX_RUN_RE.sub(lambda m: self.bound_commit(m.group(0)) or m.group(0), text)
+
+    def swap_whole_tokens(self, text: str) -> str:
+        """Swap each bound value where it is a whole token, longest first; a suffix class's may follow `-` or `_`."""
         for value, token in sorted(self.swappable_values().items(), key=lambda kv: len(kv[0]), reverse=True):
             if value not in text:
                 continue
@@ -811,6 +879,11 @@ class Mapping:
                 pattern = r"(?<![A-Za-z0-9_])" + SHORT_NUMBER_KEYS + SHORT_NUMBER_KEY_GAP + re.escape(value) + NUMBER_AFTER
             if re.search(pattern, text):
                 return True
+        for value in self.comment_numbers:
+            # Any case: an answer often starts a sentence or bullet with it ("Comment 41 posted").
+            if re.search(r"(?<![A-Za-z0-9_])" + COMMENT_WORD + SHORT_NUMBER_KEY_GAP + re.escape(value) + NUMBER_AFTER, text,
+                         re.IGNORECASE):
+                return True
         return self.answer_repeats_dropped_count(text)
 
     def answer_repeats_dropped_count(self, text: str) -> bool:
@@ -848,6 +921,9 @@ class Normalizer:
         # Whether a value in any object or list enclosing the one being walked
         # holds a time of day (timed): then no date in it is day-counted.
         self.time_beside = False
+        # Whether the message being walked is an assistant message (walk_message):
+        # then text() also swaps bound values as Mapping.apply_to_answer does.
+        self.in_answer = False
         # Per-request caches: a string's parsed JSON document (nested_json),
         # whether a string or container holds a time of day (timed), and a
         # string's TimeIndex, so each is computed once however often it is asked.
@@ -855,6 +931,8 @@ class Normalizer:
         self.timed_strings: Dict[str, bool] = {}
         self.timed_containers: Dict[Tuple[int, Optional[str], bool], bool] = {}
         self.time_indexes: Dict[str, TimeIndex] = {}
+        # The tool_call ids of the skill_view calls walked so far (walk_message).
+        self.skill_view_calls: Set[str] = set()
 
     # -- structure ---------------------------------------------------------
     #
@@ -880,12 +958,46 @@ class Normalizer:
             return walked
         return obj
 
+    def walk_message(self, message: Any) -> Any:
+        """Walk one request message; an assistant message's text also gets the answer-only swaps (text).
+
+        An assistant message's skill_view calls are noted, so the tool message
+        answering one is walked with its file listings sorted (sorted_skill_listings).
+        """
+        outer = self.in_answer
+        self.in_answer = isinstance(message, dict) and message.get(ROLE_FIELD) == ASSISTANT_ROLE
+        if self.in_answer:
+            self.note_skill_view_calls(message)
+        try:
+            return self.walk(self.skill_listings_sorted(message))
+        finally:
+            self.in_answer = outer
+
+    def note_skill_view_calls(self, message: Dict[str, Any]) -> None:
+        calls = message.get(TOOL_CALLS_KEY)
+        for call in calls if isinstance(calls, list) else []:
+            function = call.get(FUNCTION_FIELD) if isinstance(call, dict) else None
+            if isinstance(function, dict) and function.get(NAME_FIELD) == SKILL_VIEW_TOOL:
+                if isinstance(call.get(ID_KEY), str):
+                    self.skill_view_calls.add(call[ID_KEY])
+
+    def skill_listings_sorted(self, message: Any) -> Any:
+        """`message`, with its content's file listings sorted when it is the result of a noted skill_view call."""
+        if not (isinstance(message, dict) and message.get(ROLE_FIELD) == TOOL_ROLE
+                and isinstance(message.get(TOOL_CALL_ID_KEY), str) and message[TOOL_CALL_ID_KEY] in self.skill_view_calls
+                and isinstance(message.get(CONTENT_FIELD), str)):
+            return message
+        content = sorted_skill_listings(message[CONTENT_FIELD])
+        return message if content is message[CONTENT_FIELD] else dict(message, **{CONTENT_FIELD: content})
+
     def replacement(self, obj: Any, key: Optional[str], in_tool_call: bool) -> Optional[Callable[[], Any]]:
         """What `walk` swaps `obj` for whole (a placeholder or token), as a call, or None when it walks into it."""
         if key is not None and self.is_opaque(key, in_tool_call):
             return lambda: self.opaque(obj)
         if key is not None and TIME_KEY_RE.match(key) and self.epoch_value(obj) is not None:
             return lambda: self.epoch_token(str(obj), self.epoch_value(obj))
+        if key == COMMENT_ID_KEY and self.is_number(obj):
+            return lambda: self.comment_id_number(str(obj))
         if (key in KEYED_NUMBER_KEYS or (key or "").endswith(RUN_ID_SUFFIX)) and self.is_number(obj):
             return lambda: self.keyed_number(str(obj))
         if key in AGE_KEYS and isinstance(obj, str) and AGE_FULL_RE.match(obj):
@@ -929,6 +1041,7 @@ class Normalizer:
     def merge_unrestorable(self, other: "Mapping") -> None:
         """Add what another (throwaway) mapping noted as unrestorable to this request's."""
         self.mapping.bare_numbers |= other.bare_numbers
+        self.mapping.comment_numbers |= other.comment_numbers
         self.mapping.ages |= other.ages
         self.mapping.dates |= other.dates
         self.mapping.today_dates |= other.today_dates
@@ -1007,6 +1120,11 @@ class Normalizer:
         """Swap a keyed number (any length) for a placeholder."""
         return self.mapping.placeholder(NUMBER_CLASS, value)
 
+    def comment_id_number(self, value: str) -> str:
+        """Swap a kanban comment's row id, noting it for the answer guard's bare-word check."""
+        self.mapping.comment_numbers.add(value)
+        return self.keyed_number(value)
+
     def opaque(self, value: Any) -> str:
         whole = value if isinstance(value, str) else json.dumps(value, sort_keys=True)
         return self.mapping.placeholder(OPAQUE_CLASS, whole)
@@ -1057,7 +1175,19 @@ class Normalizer:
         return False
 
     def text(self, text: str, strip: bool = True) -> str:
-        """Normalize a string; `strip` False leaves a recent-work digest in (digest_guards reads one so)."""
+        """Normalize a string; `strip` False leaves a recent-work digest in (digest_guards reads one so).
+
+        In an assistant message (in_answer), the values bound so far are first
+        swapped as Mapping.apply_to_answer swaps them, in its order: identifiers
+        already bound, then a bound commit as a bare run of hex, then a bound
+        value as a whole token outside its pattern (`clone-<tmpname>`). A served
+        answer comes back in the next request's history with this run's values
+        where the recording had its own, so both must key the same. Before the
+        binding identifier pass, which would bind part of such a token afresh
+        (the uuid of `old_<operation>`); after the age columns, which read
+        positions. It binds nothing; a value it swaps is the placeholder the
+        binding pass would have given it.
+        """
         text = warnings_last(text)
         nested = self.nested_json(text)
         if nested is not None:
@@ -1066,10 +1196,18 @@ class Normalizer:
             self.digest_guards(text)
             text = strip_recent_work(text)
         text = self.age_columns(text)
+        if self.in_answer:
+            # Mapping.apply_to_answer's order: identifiers already bound first
+            # (looked up, never bound here), then the bare-commit and whole-token
+            # swaps, so a commit equal to one segment of a bound uuid never splits it.
+            for cls, pattern, group in ID_CLASSES:
+                text = self.sub_group(pattern, group, lambda v: self.mapping.bound(v) or v, text)
+            text = self.mapping.swap_whole_tokens(self.mapping.swap_bare_commits(text))
         for cls, pattern, group in ID_CLASSES:
             text = self.sub_group(pattern, group, lambda v, c=cls: self.mapping.placeholder(c, v), text)
         text = self.timestamps(text)
         text = self.sub_group(KEYED_NUMBER_TEXT_RE, 3, self.keyed_number, text)
+        text = self.sub_group(COMMENT_ID_TEXT_RE, 3, self.comment_id_number, text)
         text = self.sub_group(PID_PROSE_RE, 3, self.keyed_number, text)
         text = KEYED_EPOCH_TEXT_RE.sub(self.keyed_epoch, text)
         if not self.keep_ips:
@@ -1349,7 +1487,7 @@ def normalize_request(body: Dict[str, Any], now: float) -> NormalizedRequest:
     # a slot blanks an answer's words, so a position counted there could shift.
     for message in raw_messages if isinstance(raw_messages, list) else []:
         normalizer.time_literals = []
-        messages.append(normalizer.walk(message))
+        messages.append(normalizer.walk_message(message))
         if not (isinstance(message, dict) and message.get(ROLE_FIELD) == ASSISTANT_ROLE):
             normalizer.mapping.time_occurrences += normalizer.time_literals
     history_mapping = normalizer.mapping.copy()
@@ -1454,7 +1592,7 @@ def answer_after(normalized: NormalizedRequest, answer: Any) -> str:
     walker = Normalizer(normalized.now, normalized.keep_ips)
     walker.mapping = normalized.history_mapping.copy()
     message = dict(answer, role=ASSISTANT_ROLE) if isinstance(answer, dict) else answer
-    return answer_identity(walker.walk(message))
+    return answer_identity(walker.walk_message(message))
 
 
 def answer_variant(normalized: NormalizedRequest, answer: Any, context: KeyContext) -> Tuple[str, str]:

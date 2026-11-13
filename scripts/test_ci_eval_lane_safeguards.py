@@ -183,9 +183,9 @@ class InjectLaneTest(unittest.TestCase):
         self.assertIn("every task in the matrix carries the lane safeguards", result.stdout)
         self.assertIn("BENCH_GITOPS_REPO=gke-agentic/kube-agents-evals-21-infra", result.stdout)
         # The presubmit cases that request a pull request, by their own
-        # checks or the file's `requesting:` list: the second phase holds
+        # checks or their own `requested_pull_requests:` key: the second phase holds
         # them and the log says so. obtainability-remediation-proposal left
-        # the list when the persona's rule put its manifest in the reply
+        # the lane file's former `requesting:` list when the persona's rule put its manifest in the reply
         # (#2037), so it is graded at zero writes with the rest of the first
         # phase. pdb-remediation-pr, which asks for its pull request by its
         # own check, was the presubmit's one requesting case from 2026-10-14

@@ -453,6 +453,34 @@ variable "model_max_tokens" {
   }
 }
 
+variable "litellm_budget" {
+  description = "The LiteLLM gateway's spend ceiling, the chart's litellm.budget: usd is the most the gateway spends, in US dollars as LiteLLM prices each response, in every window of period (a LiteLLM duration: a whole number and s, m, h, d, w or mo). Rendered only while usd is above 0, so an install without a ceiling keeps the gateway config it had; the chart splits the ceiling evenly across the gateway's replicas, and a replica whose share is spent refuses model calls until its window ends. What the agent sees and how to read the remaining budget: the site's inference-gateway page, \"Setting a spend ceiling\"."
+  type = object({
+    usd    = optional(number, 0)
+    period = optional(string, "1d")
+  })
+  nullable = false
+  default  = {}
+
+  # The same checks as the chart's values.schema.json, so a bad value fails the
+  # plan rather than the helm_release apply. The period is checked only beside
+  # an amount above zero: the chart reads it then and not otherwise.
+  # 0.01 is the least a ceiling can be when it is on: the chart splits the
+  # amount across the gateway replicas and renders each share with four
+  # decimals, refusing a share that rounds to 0 at the helm_release apply. A
+  # cent keeps the share above that floor at up to 100 replicas, and the
+  # refusal happens at the plan. The installer's LITELLM_BUDGET_MIN_USD and the
+  # chart's values.schema.json carry the same floor.
+  validation {
+    condition     = var.litellm_budget.usd == 0 || var.litellm_budget.usd >= 0.01
+    error_message = "litellm_budget.usd must be 0 (no ceiling) or an amount in US dollars of at least 0.01."
+  }
+  validation {
+    condition     = var.litellm_budget.usd == 0 || can(regex("^[1-9][0-9]*(s|m|h|d|w|mo)$", var.litellm_budget.period))
+    error_message = "litellm_budget.period must be a LiteLLM duration: a whole number and s, m, h, d, w or mo, such as 1d."
+  }
+}
+
 variable "alert_daily_limits" {
   description = "Daily alert ceilings for the Platform Agent, one per bucket: critical, warning, info and drift. The chart renders each key that is set as ALERT_DAILY_LIMIT_<KEY> in the PlatformAgent's spec.deployment.env. A key that is not set keeps the default in the agent image, and 0 removes the cap for that bucket. Each apply that changes the env list that the chart renders replaces the full env list on the CR, and entries added to the CR by hand are lost; set those through platformAgent.deployment.env in extra_helm_values. Buckets, defaults and a sizing method: the site's chatops page, \"Daily alert ceiling\"."
   # A map, not an object type: Terraform drops an unknown attribute of an
@@ -740,17 +768,17 @@ variable "github_repo" {
 }
 
 variable "gitops_forge" {
-  description = "Which forge holds the GitOps repository: github (the default; github_repo and the GitHub App minter, on github.com or, with gitops_host, on a GitHub Enterprise Server) or gitlab (gitlab_repo, with the access token in the Kubernetes Secret gitlab_token_secret_name names). A gitlab install, and a github install with gitops_host, declare one forge and its gitops repository through spec.integration.forges/repositories. A gitlab install must leave github_repo and enable_github_minter unset."
+  description = "Which forge holds the GitOps repository: github (the default; github_repo and the GitHub App minter, on github.com or, with gitops_host, on a GitHub Enterprise Server), gitlab (gitlab_repo, with the access token in the Kubernetes Secret gitlab_token_secret_name names), bitbucket (Bitbucket Cloud, at bitbucket.org) or bitbucket-datacenter (gitops_repo_path, with the token in the Secret gitops_token_secret_name names). A gitlab or Bitbucket install, and a github install with gitops_host, declare one forge and its gitops repository through spec.integration.forges/repositories. A gitlab or Bitbucket install must leave github_repo and enable_github_minter unset."
   type        = string
   default     = "github"
   validation {
-    condition     = contains(["github", "gitlab"], var.gitops_forge)
-    error_message = "gitops_forge must be github or gitlab."
+    condition     = contains(["github", "gitlab", "bitbucket", "bitbucket-datacenter"], var.gitops_forge)
+    error_message = "gitops_forge must be github, gitlab, bitbucket or bitbucket-datacenter."
   }
 }
 
 variable "gitops_host" {
-  description = "Hostname of the forge holding the GitOps repository: with gitops_forge = github, a GitHub Enterprise Server (e.g. github.example.com); with gitops_forge = gitlab, a self-managed GitLab instance (e.g. gitlab.example.com). Empty is the forge's own host (github.com or gitlab.com). A bare hostname: no scheme, path or port. For github, a host that GitHub operates (github.com, githubusercontent.com, ghe.com and the like) is refused. On a GitHub Enterprise Server the composition declares the github forge at this host in spec.integration.forges, with github_repo's owner as its namespace, and the chart points the token minter at https://<host>/api/v3."
+  description = "Hostname of the forge holding the GitOps repository: with gitops_forge = github, a GitHub Enterprise Server (e.g. github.example.com); with gitops_forge = gitlab, a self-managed GitLab instance (e.g. gitlab.example.com); with gitops_forge = bitbucket-datacenter, the instance's hostname (required; the instance must serve at the root path on port 443). Bitbucket Cloud (bitbucket) takes no host. Empty is the forge's own host (github.com or gitlab.com). A bare hostname: no scheme, path or port. For github, a host that GitHub operates (github.com, githubusercontent.com, ghe.com and the like) is refused. On a GitHub Enterprise Server the composition declares the github forge at this host in spec.integration.forges, with github_repo's owner as its namespace, and the chart points the token minter at https://<host>/api/v3."
   type        = string
   default     = ""
   validation {
@@ -785,6 +813,38 @@ variable "gitlab_ca_secret_name" {
   }
 }
 
+variable "gitops_repo_path" {
+  description = "The GitOps repository on a Bitbucket forge: workspace/repo-slug on Bitbucket Cloud (bitbucket), PROJECTKEY/repo-slug on Bitbucket Data Center (bitbucket-datacenter). Read only when gitops_forge is bitbucket or bitbucket-datacenter; a GitLab install names its project in gitlab_repo."
+  type        = string
+  default     = ""
+}
+
+variable "gitops_token_secret_name" {
+  description = "Name of the Kubernetes Secret, in the agent's namespace, holding a Bitbucket forge's token under the key `token`, and an optional read-only token for context repositories under `read-token`. Empty is bitbucket-forge-token. The installer creates it from a prompt or a token file after the apply; Terraform only names it, so the token never reaches the plan or the state. Read only when gitops_forge is bitbucket or bitbucket-datacenter."
+  type        = string
+  default     = ""
+  validation {
+    condition     = var.gitops_token_secret_name == "" || (can(regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$", var.gitops_token_secret_name)) && length(var.gitops_token_secret_name) <= 253)
+    error_message = "gitops_token_secret_name must be a valid Kubernetes Secret name (lowercase DNS subdomain)."
+  }
+}
+
+variable "gitops_ca_secret_name" {
+  description = "Name of the Secret, in the agent's namespace, holding the PEM CA that signed a Bitbucket Data Center instance's TLS certificate, under the key `ca.crt`. The broker trusts it for that host only. Empty: the system CAs only. Read only when gitops_forge is bitbucket-datacenter."
+  type        = string
+  default     = ""
+  validation {
+    condition     = var.gitops_ca_secret_name == "" || (can(regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$", var.gitops_ca_secret_name)) && length(var.gitops_ca_secret_name) <= 253)
+    error_message = "gitops_ca_secret_name must be a valid Kubernetes Secret name (lowercase DNS subdomain)."
+  }
+}
+
+variable "gitops_identity" {
+  description = "Bitbucket only: the account the forge's token acts as, written to the forge's identity field. On Bitbucket Cloud, the account UUID, needed for a workspace, project or repository access token, which cannot name its own account; an API token needs none. On Bitbucket Data Center, rarely needed: the broker reads the login from the X-AUSERNAME response header. Empty: none."
+  type        = string
+  default     = ""
+}
+
 variable "github_ca_secret_name" {
   description = "Name of the Secret, in the agent's namespace, holding the PEM CA that signed a GitHub Enterprise Server's TLS certificate, under the key `ca.crt`. The credential broker trusts it for the instance's host only. The chart's token minter trusts it for all of its outbound calls, and reads it when it starts, so restart the minter after the Secret changes. Empty: the system CAs only. The installer creates it from --gitops-ca-file and restarts the minter; Terraform only names it. Read only when gitops_forge is github and gitops_host is set."
   type        = string
@@ -811,6 +871,28 @@ variable "github_minter_kms_key" {
   description = "Cloud KMS asymmetric signing key the minter signs GitHub App JWTs with. The App private key is imported into it outside Terraform."
   type        = string
   default     = "github-token-minter-key"
+}
+
+variable "github_minter_shared_kms_key" {
+  description = "A minter signing key this install shares on purpose, as <keyring>/<key>: one provisioned for the project outside any install, as the CI pool projects' is. lifecycle.sh's adoption step imports a minter key ring or key that another install's labels claim, or that carries no owner labels, only when it is the one named here. Empty adopts only this install's own. When it names the key this install uses, the composition sets no owner labels on that key, so they stay its owner's."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = can(regex("^$|^[a-zA-Z0-9_-]{1,63}/[a-zA-Z0-9_-]{1,63}$", var.github_minter_shared_kms_key))
+    error_message = "github_minter_shared_kms_key must be empty or <keyring>/<key>."
+  }
+}
+
+variable "github_minter_adopt_unlabelled_kms_key" {
+  description = "A minter signing key with no owner labels that this install adopts as its own, as <keyring>/<key>. The installer sets it when the key ring and key were named explicitly (KMS_KEYRING and KMS_KEY), and the apply then labels the key as this install's. A key another install's labels claim is refused whatever this says. Terraform itself reads nothing from it."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = can(regex("^$|^[a-zA-Z0-9_-]{1,63}/[a-zA-Z0-9_-]{1,63}$", var.github_minter_adopt_unlabelled_kms_key))
+    error_message = "github_minter_adopt_unlabelled_kms_key must be empty or <keyring>/<key>."
+  }
 }
 
 variable "github_app_id" {
@@ -858,7 +940,7 @@ variable "enable_cert_manager" {
 variable "cert_manager_version" {
   description = "cert-manager chart version. Values below 1.15.x need the crds.enabled key in main.tf renamed back to installCRDs."
   type        = string
-  default     = "v1.21.2"
+  default     = "v1.21.3"
 }
 
 variable "enable_webhooks" {
@@ -1011,4 +1093,10 @@ variable "extra_helm_values" {
   description = "Extra values for the kube-agents Helm release, covering chart settings this composition does not expose as its own variable (telemetry.otlpEndpoint, litellm.otel, the resource blocks, the PlatformAgent harness knobs). Passed as a second values document, so Helm deep-merges it key by key over the ones computed here and anything set wins. Setting a key the composition also computes — platformAgent.harness.clusterName, say — overrides it, which is rarely what you want."
   type        = any
   default     = {}
+}
+
+variable "disallow_secrets_read" {
+  description = "Omit core secrets (get, list, watch) from the reader ClusterRole (spec.security.disallowSecretsRead on the PlatformAgent CR). Null leaves the field unset on the CR so new installs grant secrets read access and existing installs keep their current ClusterRole permissions."
+  type        = bool
+  default     = null
 }

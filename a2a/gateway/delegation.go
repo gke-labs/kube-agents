@@ -207,6 +207,11 @@ func (g *Gateway) handleDelegateRequest(ctx context.Context, rec *SessionRecord,
 		refuse(ruleDelegationTarget, noticeDelegationRefusedFor+noticeProfileParentToPlatform)
 		return
 	}
+	if addressee == targetPlatform && len(req.Parameters) > 0 {
+		// Only a profile route carries parameters; platform's would be dropped.
+		refuse(ruleDelegationTarget, noticeDelegationRefusedFor+noticePlatformTakesNoParameters)
+		return
+	}
 	if addressee != targetPlatform {
 		tier := capability.Tier(parent.Tier)
 		if !profileParent {

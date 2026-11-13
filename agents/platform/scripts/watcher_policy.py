@@ -34,13 +34,10 @@ half of the first:
   `WATCHER_NAMED_READS`; pods are not, so the first-sorted pod's metadata is
   reach this rule adds. One more GET reads one named Pod's metadata, under a
   JSON `PartialObjectMetadata` Accept on every range, for the event watcher's
-  owner lookup; the broker relays only its projection (`project_pod_metadata`:
-  the controller ownerReference's kind and name when it is one of
-  `POD_METADATA_OWNER_KINDS`, a ReplicaSet only with its `pod-template-hash`
-  label, which is relayed with it), never the Pod's name or UID, an
-  annotation, another label, another owner or managedFields. No other list, no
-  watch of anything else (the deprecated `watch/<resource>` paths included), no
-  subresource, never a Secret.
+  owner lookup; the broker relays only its projection (`project_pod_metadata`;
+  the `POD_METADATA_KIND` comment names each field it keeps, and why). No
+  other list, no watch of anything else (the deprecated `watch/<resource>`
+  paths included), no subresource, never a Secret.
 
 Standard library only, like `api_policy`. `Decision` is reused from
 `command_policy`. No refusal message repeats caller text.

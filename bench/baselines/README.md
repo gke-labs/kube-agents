@@ -38,9 +38,9 @@ page's sake; in the file a record is one line.
   "recorded_at": "2026-08-25T00:00:00Z",
   "commit": "<the main sha this batch ran on>",
   "key": {
-    "setup_id": "gemini-3-1-pro-preview-kubeagents-mcp",
+    "setup_id": "agent-a-kubeagents-mcp",
     "scoring_version": "v1",
-    "judge_model": "gemini-3.1-pro-preview",
+    "judge_model": "judge-a",
     "fleet": 1,
     "verifiers": 1
   },
@@ -107,7 +107,10 @@ it is a periodic with no `PULL_NUMBER`, so it satisfies both conditions exactly.
 places. `EVAL_ROLLBACK_LANE=1` is the fourth, also enforced in both: the today
 lane deploys `next` and rolls it back to `today` before its
 matrix, so its key reads `today`, but a rolled-back install is not the fresh
-`today` install that window measures. The third has to be enforced twice,
+`today` install that window measures. A run at a named reasoning effort
+(`EVAL_REASONING_EFFORT` set) is the fifth, enforced in both as well: the key
+carries no effort, so its lines would pool with the default-effort window.
+The third has to be enforced twice,
 because the mistake is not correctable afterwards:
 `VersionKey` names the setup, the scoring version, the judge, the two content
 versions and the mode, and nothing about which build produced a sample, so a
@@ -149,7 +152,8 @@ directory.
 
 The local backend is the default and stays the default: the store travels with
 the checkout, so running the gate needs no credential and no network, and every
-unit test is hermetic.
+unit test is hermetic. The committed copy of this directory stays empty but for
+`VERSIONS.json`; the bucket is the record.
 
 GCS is the intended production home for one reason — on the local backend
 something has to _commit_ the file, and the CI job that measures the
@@ -172,7 +176,7 @@ key — so an object files itself under the software it was measured on:
 
 ```
 gs://kube-agents-evals-bench/evidence/agent-kanban-smoke/
-  gemini-3-1-pro-preview-kubeagents-mcp/gemini-3.1-pro-preview/v1-f1-v1/
+  agent-a-kubeagents-mcp/judge-a/v1-f1-v1/
     2026-08-01T02-03-04Z-12345.jsonl
 ```
 

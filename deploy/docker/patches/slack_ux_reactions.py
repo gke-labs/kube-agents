@@ -98,16 +98,19 @@ PLATFORM = "slack"
 #: the notifier names none.
 DEFAULT_BOARD = "default"
 
-#: ``kanban_progress_lines.HARD_WALL_BLOCK_KIND`` and ``GAVE_UP_KIND``: a card
-#: whose latest stop is either is parked, as :data:`OPEN_CARDS_SQL` reads it.
+#: ``kanban_progress_lines.HARD_WALL_BLOCK_KINDS`` and ``GAVE_UP_KIND``: a card
+#: whose latest stop is any of them is parked, as :data:`OPEN_CARDS_SQL` reads it.
 HARD_WALL_BLOCK_KIND = "capability"
+CAPACITY_BLOCK_KIND = "capacity"
+HARD_WALL_BLOCK_KINDS = (HARD_WALL_BLOCK_KIND, CAPACITY_BLOCK_KIND)
 GAVE_UP_KIND = "gave_up"
 
 #: Cards subscribed to one Slack thread that have not reached a final status,
 #: with that status and the card whose worker created it, if one did: Hermes
 #: copies the creator's subscriptions onto the new card, and whether it sits
 #: parked by a give-up: still ``blocked``, with a ``gave_up`` as its latest
-#: stop, or a block of Hermes's hard-wall kind ``capability``, which settles as
+#: stop, or a block of a hard-wall kind (``capability``, or the dispatcher's
+#: ``capacity``), which settles as
 #: one (``kanban_progress_lines.settles_as``). An unblock, or any move off
 #: ``blocked``, revives it, so either clears that.
 OPEN_CARDS_SQL = (
@@ -117,7 +120,7 @@ OPEN_CARDS_SQL = (
     "t.status = 'blocked' AND COALESCE((SELECT CASE e.kind WHEN 'blocked' "
     "THEN json_extract(e.payload, '$.kind') ELSE e.kind END FROM task_events e WHERE e.task_id = s.task_id "
     "AND e.kind IN ('blocked', 'unblocked', 'gave_up') ORDER BY e.id DESC LIMIT 1), '') "
-    "IN ('" + GAVE_UP_KIND + "', '" + HARD_WALL_BLOCK_KIND + "') "
+    "IN ('" + "', '".join((GAVE_UP_KIND, *HARD_WALL_BLOCK_KINDS)) + "') "
     "FROM kanban_notify_subs s JOIN tasks t ON t.id = s.task_id "
     "WHERE lower(s.platform) = ? AND s.chat_id = ? AND COALESCE(s.thread_id, '') = ? "
     "AND t.status NOT IN ('done', 'archived')"

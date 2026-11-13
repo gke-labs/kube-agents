@@ -498,6 +498,16 @@ type probeReport struct {
 	// (ConversationState). Present, like Usage, only on a read that asked.
 	ChildUsage   *lib.Usage `json:"childUsage,omitempty"`
 	UsagePartial bool       `json:"usagePartial,omitempty"`
+	// ChildAddressees names whom the chain delegated to, each child's
+	// addressee once in the order delegated: the profile its address
+	// resolved to (a pinned profile's own name, when a cluster target picked
+	// it) or platform, never a task id (ConversationState). On every read,
+	// since it comes from the record: [] when the chain delegated nothing,
+	// null when the read had no task to look at (no record, no task, or a
+	// read that failed), and absent only on a door older than
+	// the field, so a harness can tell "none" from "can't say". The inject
+	// door's alone: no chat surface or the console reports it.
+	ChildAddressees []string `json:"childAddressees"`
 	// LastPost is the newest post entry on this conversation, if any: the
 	// last thing the relay said, for a caller deciding what a stalled task
 	// was doing.
@@ -1919,13 +1929,14 @@ func (a *InjectAdapter) runProbe(ctx context.Context, key, taskID string, chainU
 		ReachedWorking: state.ReachedWorking,
 		// Bounded like an entry: a result is an agent's report and rides
 		// the same in-memory transcript budget.
-		TerminalSource: string(state.TerminalSource),
-		Result:         truncateRunes(state.Result, injectMaxEntryBytes),
-		Reason:         truncateRunes(state.Reason, injectMaxEntryBytes),
-		Progress:       truncateRunes(state.Progress, injectMaxEntryBytes),
-		Usage:          state.Usage,
-		ChildUsage:     state.ChildUsage,
-		UsagePartial:   state.UsagePartial,
+		TerminalSource:  string(state.TerminalSource),
+		Result:          truncateRunes(state.Result, injectMaxEntryBytes),
+		Reason:          truncateRunes(state.Reason, injectMaxEntryBytes),
+		Progress:        truncateRunes(state.Progress, injectMaxEntryBytes),
+		Usage:           state.Usage,
+		ChildUsage:      state.ChildUsage,
+		UsagePartial:    state.UsagePartial,
+		ChildAddressees: state.ChildAddressees,
 	}
 	// Non-nil is the fact that the stream was read (ConversationState.
 	// Activity), and the pointer carries that fact onto the wire.

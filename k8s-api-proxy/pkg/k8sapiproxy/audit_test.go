@@ -281,6 +281,12 @@ func TestSlogAuditSink(t *testing.T) {
 			absent:    []string{auditKeyUsername, auditKeyCluster, auditKeyCache},
 		},
 		{
+			name:      "throttled",
+			event:     AuditEvent{Outcome: OutcomeThrottled, StatusCode: http.StatusTooManyRequests},
+			wantLevel: "WARN",
+			want:      map[string]any{auditKeyOutcome: "throttled", auditKeyStatus: 429.0},
+		},
+		{
 			name:      "unauthenticated",
 			event:     AuditEvent{Outcome: OutcomeUnauthenticated, Err: errors.New("token expired"), StatusCode: http.StatusUnauthorized},
 			wantLevel: "WARN",

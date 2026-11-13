@@ -58,7 +58,10 @@ install without the interview.
   the gateway asks for on a request that names none; `litellm_redaction`
   (off by default) redacts every request body the gateway forwards to the
   provider, and `install.sh` sets it from the `LITELLM_REDACTION_*` keys in
-  `install.env`; `platform_agent_mode` (default `"today"`, which passes the
+  `install.env`; `litellm_budget` (default `{}`, meaning no ceiling) caps what
+  the gateway spends per period, and `install.sh` sets it from
+  `LITELLM_BUDGET_USD` and `LITELLM_BUDGET_PERIOD` in `install.env`;
+  `platform_agent_mode` (default `"today"`, which passes the
   chart nothing, so the CR carries no `mode` field) sets the `PlatformAgent`'s
   `spec.mode`, and `"next"` puts the NATS bus and the A2A gateway in front of
   the agent. `install.sh` sets it from `PLATFORM_AGENT_MODE` in `install.env`,
@@ -199,7 +202,12 @@ run it again after a few minutes and it untaints the key ring or key the first
 run created, where a bare `terraform apply` would plan their replacement and 409.
 Once the project has been destroyed and re-applied even once, `make tf-apply`
 is required — it adopts the Cloud KMS resources GCP refuses to delete, which a
-bare `terraform apply` fails on. The table under
+bare `terraform apply` fails on. For the minter's key ring and key it adopts only
+this install's own, by the owner labels on the key, or the one
+`github_minter_shared_kms_key` names. A key with no owner labels is adopted as
+this install's own, and labelled, when `github_minter_adopt_unlabelled_kms_key`
+names it (the installer sets it when `KMS_KEYRING` and `KMS_KEY` were given). Any
+other, and any key another install's labels claim, refuses the apply. The table under
 [Teardown and re-apply](#teardown-and-re-apply) has both.
 
 ### Remote state
@@ -339,6 +347,13 @@ with the two overrides the BackupPlan recipe below writes — and then re-run
 front (`guard_cluster_ownership`, [below](#recovering-from-an-interrupted-apply))
 rather than 409ing on the cluster halfway through. Through `install.sh` the
 probe derives `create_cluster = false` instead and adopts the cluster.
+
+Every input the guards read goes through the remote state: each `tfvar` read
+is a `terraform console` that opens it, and the pre-apply guards make about
+fifty of them. When Cloud Storage answers a transient 429 or 5xx, or the
+connection drops, the script asks again, up to `STATE_BACKEND_ATTEMPTS` times
+(4) with `STATE_BACKEND_WAIT_SECONDS` (15) between. Any other error fails the
+read at once, as before, with the Terraform error printed.
 
 ### Asking what an apply would change
 
@@ -812,6 +827,8 @@ With `enable_github_minter = true`, set `github_repo` to your primary GitOps rep
 For a GitOps repository on a GitHub Enterprise Server, set `gitops_host` to the instance's hostname and `github_repo` to `owner/name` on the instance (not a URL: the composition reads a github.com URL only). The composition then declares the `github` forge at that host in `spec.integration.forges`, with the owner as its namespace, and the repository as its `gitops` repository, with no `github` alias; the chart points the token minter at `https://<host>/api/v3`. A host where GitHub runs its own services (`github.com`, `githubusercontent.com`, `ghe.com` and the like) or `gitlab.com` is refused. When a private CA signed the instance's certificate, set `github_ca_secret_name` to the Secret that holds the CA under the key `ca.crt`: the broker trusts it for that host only, and the minter trusts it for all of its calls and reads it when it starts, so restart the minter after the Secret changes (`install.sh --gitops-ca-file` creates the Secret and restarts the minter). The minter's Cloud KMS key ring and key are created and the App key imported before the apply, so apply with `KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply`, which adopts them, not a bare `terraform apply`. A new cluster goes into the project's `default` VPC network, because the composition has no network or subnetwork variable: an instance reachable only from another VPC or a Shared VPC needs a cluster created in that VPC and `create_cluster = false`. See [GitHub Enterprise Server in INSTALL.md](../../../INSTALL.md#github-enterprise-server).
 
 With `gitops_forge = "gitlab"`, set `gitlab_repo` to the GitLab project's full path (`group/project`, nested groups allowed) and, for a self-managed instance, `gitops_host` to its hostname. The CR then declares one `gitlab` forge and the project as its `gitops` repository, with `credentialsRef` naming `gitlab_token_secret_name` (default `gitlab-forge-token`). Terraform never sees the token: create that Secret, with the token under the key `token`, in the agent's namespace yourself (`install.sh` does it for you). A self-managed instance whose certificate a private CA signed also sets `gitlab_ca_secret_name` to the Secret that holds the CA under the key `ca.crt`; the broker trusts it for that host only (`install.sh --gitops-ca-file` creates it). A Secret, not a ConfigMap, so changing the CA needs the same rights as changing the token. A GitLab install has no GitHub App, so `github_repo` and `enable_github_minter` must stay unset; the plan refuses otherwise. See [GitLab as the GitOps forge](../../../docs/site/src/content/docs/install/gitlab.md).
+
+With `gitops_forge = "bitbucket"` (Bitbucket Cloud, at `bitbucket.org` only) or `gitops_forge = "bitbucket-datacenter"`, set `gitops_repo_path` to `workspace/repo-slug` (Cloud) or `PROJECTKEY/repo-slug` (Data Center), and, for Data Center, `gitops_host` to the instance's hostname. The instance must serve at the root path on port 443. The CR then declares one forge named after its provider, with the workspace or project key as its namespace and the repository slug as its `gitops` repository, and `credentialsRef` naming `gitops_token_secret_name` (default `bitbucket-forge-token`). Terraform never sees the token: create that Secret, with the token under the key `token`, in the agent's namespace yourself (`install.sh` does it for you). A Data Center instance behind a private CA sets `gitops_ca_secret_name`. A Bitbucket Cloud workspace, project or repository access token cannot name its own account, so set `gitops_identity` to the account UUID it acts as; an API token needs none. A Bitbucket install has no GitHub App, so `github_repo` and `enable_github_minter` stay unset. See [Bitbucket as the GitOps forge](../../../docs/site/src/content/docs/install/bitbucket.md).
 
 `enable_slack = true` writes `slack_bot_token` / `slack_app_token` into the
 credentials Secret and turns on the CR's `slack` section, the same pair

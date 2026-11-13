@@ -587,11 +587,17 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          module name, so it is staged here as well
 #   credential_shapes.py   the token shapes the feedback gate refuses and the broker
 #                          redacts before logging: one list, imported by
-#                          feedback_broker here and by credential_proxy off-pod
+#                          feedback_broker and submit_suggestion here and by
+#                          credential_proxy off-pod
 #   feedback_broker.py     the constants the kube-agents-feedback client reads (the
 #                          route, the statuses, the fallback links, the payload's
 #                          normalisation); the same module's broker half files the
 #                          form from the broker pod, which is the side with egress
+#   feedback_summary.py    the usage summary's collect, render and audit, imported
+#                          by the same client for its `summary` subcommand: the
+#                          resource read goes through the kubectl shim, and the
+#                          in-pod sources are left off (exec is a write verb to
+#                          the broker's command policy)
 #   fleet_scope_args.py    the flags (`--scope-projects`, `--scope-unread`,
 #                          `--scope-exclude-clusters`) the
 #                          fleet-audit collectors take the install's declared scope
@@ -599,6 +605,8 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          volume, which this container does not share, so the agent
 #                          reads it through the platform MCP server's fleet_scope tool
 #                          and passes the flags on; this module parses them
+#   kubeagents_switches.py the earned-autonomy switches' one reader: the root-owned
+#                          files entrypoint.sh writes, then the session's variables
 #   broker_admission.py    how wide the fleet-audit collectors sweep: it reads what
 #                          the broker admits at once (GET /v1/exec/admission)
 #                          through credential_proxy_client and sizes their pools
@@ -683,7 +691,9 @@ COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/credential_proxy_client.py \
      agents/platform/scripts/credential_shapes.py \
      agents/platform/scripts/feedback_broker.py \
+     agents/platform/scripts/feedback_summary.py \
      agents/platform/scripts/fleet_scope_args.py \
+     agents/platform/scripts/kubeagents_switches.py \
      agents/platform/scripts/collector_run.py \
      agents/platform/scripts/broker_admission.py \
      agents/platform/scripts/vcs_client.py \
@@ -761,8 +771,8 @@ RUN find /opt/defaults -name '__pycache__' -type d -prune -exec rm -rf {} + && \
 #
 # The pull-request and issue crons run in the agent pod, hold the forge
 # credential, and do their forge work by sshing in as `hermes` and running a
-# script here. The Cluster Agent reconcile does the same for its GKE reads
-# (gke_cluster_reads.py, #3703). Two of the crons cross: forge.py for every forge verb
+# script here. The Cluster Agent reconcile and stall_watch do the same for their GKE
+# reads (gke_cluster_reads.py, #3703). Two of the crons cross: forge.py for every forge verb
 # (agents/platform/scripts/forge.py, `_forward`) and resolver.py for the issues
 # sweep's `poll` (github-issue-resolver, `_forward_to_sandbox`). The copy under
 # /opt/data is root-owned and, under the operator, a read-only mount, but it

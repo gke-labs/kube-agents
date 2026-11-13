@@ -402,8 +402,9 @@ func TestTheScopeResolvedCondition(t *testing.T) {
 	}
 }
 
-// The broker's side follows two gates. Under mode next it reads the
-// declaration (the mount and CREDENTIAL_PROXY_SCOPE_FILE). While the
+// The broker's side follows two gates. In every mode it reads the
+// declaration (the mount and CREDENTIAL_PROXY_SCOPE_FILE), which is where
+// it reads spec.scope.exclude.clusters from. While the
 // operator says the gateway pod admission policy is rendered and the scope
 // declares something to resolve, its fence admits the publisher pods; when
 // the account is also this PlatformAgent's, it confers the scope role: the
@@ -424,7 +425,7 @@ func TestTheBrokerConfersTheScopeRoleOnlyBehindTheGatewayPodPolicy(t *testing.T)
 		{"next, policy true", ptr.To("next"), "true", allBrokerCallersOwned, want{file: true, role: true, peer: true}},
 		{"next, policy true, account not ours", ptr.To("next"), "true", brokerCallerOwnership{mcp: true}, want{file: true, peer: true}},
 		{"next, policy true, nothing to resolve", ptr.To("next"), "true", allBrokerCallersOwned, want{file: true}},
-		{"today, policy true", nil, "true", allBrokerCallersOwned, want{}},
+		{"today, policy true", nil, "true", allBrokerCallersOwned, want{file: true}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -842,5 +843,39 @@ func TestTheScopeResolvedConditionIsCarriedAndRemoved(t *testing.T) {
 	setScopeResolvedCondition(agent, nil, now)
 	if !scopeResolvedConditionCurrent(agent, nil) {
 		t.Error("the condition was not removed")
+	}
+}
+
+// kube-proxy reads spec.scope.exclude.clusters from the same scope.json as the broker,
+// in every mode, and checks in-cluster as the cluster the harness names.
+func TestKubeProxyReadsTheScopeDeclarationInEveryMode(t *testing.T) {
+	for _, mode := range []*string{nil, ptr.To("next")} {
+		agent := scopePublisherAgent()
+		agent.Spec.Mode = mode
+		agent.Spec.Harness = &agentv1alpha1.HarnessSpec{ProjectID: "kagents-dev", Location: "us-east4", ClusterName: "mgmt"}
+		deployment := buildKubeProxyDeployment(agent, "", true, "tls-hash")
+		c := deployment.Spec.Template.Spec.Containers[0]
+		if file, _ := brokerEnvValue(c.Env, "KUBE_PROXY_SCOPE_FILE"); file != "/etc/kube-agents/scope/scope.json" {
+			t.Errorf("mode %v: KUBE_PROXY_SCOPE_FILE = %q", mode, file)
+		}
+		if host, _ := brokerEnvValue(c.Env, "KUBE_PROXY_EXCLUDE_HOST_CLUSTER_ID"); host != "gke_kagents-dev_us-east4_mgmt" {
+			t.Errorf("mode %v: KUBE_PROXY_EXCLUDE_HOST_CLUSTER_ID = %q", mode, host)
+		}
+		mounted, volume := false, false
+		for _, m := range c.VolumeMounts {
+			mounted = mounted || (m.Name == scopeVolumeName && m.MountPath == "/etc/kube-agents/scope" && m.ReadOnly && m.SubPath == "")
+		}
+		for _, v := range deployment.Spec.Template.Spec.Volumes {
+			volume = volume || (v.Name == scopeVolumeName && v.ConfigMap != nil && v.ConfigMap.Name == agent.Name+"-config")
+		}
+		if !mounted || !volume {
+			t.Errorf("mode %v: declaration mounted %v, volume %v", mode, mounted, volume)
+		}
+	}
+	agent := scopePublisherAgent()
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{ProjectID: "kagents-dev"}
+	c := buildKubeProxyDeployment(agent, "", true, "tls-hash").Spec.Template.Spec.Containers[0]
+	if host, found := brokerEnvValue(c.Env, "KUBE_PROXY_EXCLUDE_HOST_CLUSTER_ID"); found {
+		t.Errorf("a harness naming no cluster rendered KUBE_PROXY_EXCLUDE_HOST_CLUSTER_ID = %q", host)
 	}
 }

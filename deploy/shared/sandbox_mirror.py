@@ -350,9 +350,11 @@ RECURSIVE_EXCLUDES = (
 # The one cost is a dotfile the model *did* write at a home root, which this
 # leaves behind. That is logged as skipped rather than dropped silently.
 
-# No byte cap by default. The sandbox's volume is sized from the agent's
+# No byte cap by default. The sandbox's volume gets the agent's base size
 # (agentDataStorageSize in the operator), and what crosses is a subset of the
-# agent's volume, so the copy fits by construction. A fixed cap here could only
+# agent's volume, so the copy fits by construction. The agent's volume can be
+# larger by spec.storage.expectedClusterProfiles' budget, but that budget is for
+# the session stores, which HERMES_RUNTIME keeps from crossing. A fixed cap here could only
 # do one thing the free-space floor below does not: silently truncate a migration
 # on an install whose working directories are larger than the guess, which is the
 # "upgraded and lost my files" outcome this whole path exists to prevent.
