@@ -654,6 +654,10 @@ class SandboxEntrypointForwardedEnvTest(unittest.TestCase):
             "KUBEAGENTS_SCOPE_DECLARED",
             # The audits' auto-promotion switch, read by audit_report.py in the session.
             "KUBEAGENTS_AUDIT_AUTO_PROMOTE",
+            # The earned-autonomy switches, read by kubeagents_switches.py in the session.
+            "KUBEAGENTS_POST_MERGE_CHECK",
+            "KUBEAGENTS_AUTOMERGE",
+            "KUBEAGENTS_DIAL",
         }
         self.assertTrue(
             required.issubset(names),
@@ -674,6 +678,20 @@ class SandboxEntrypointForwardedEnvTest(unittest.TestCase):
         self.assertIn('SANDBOX_AUDIT_AUTO_PROMOTE_FILE="/run/kube-agents-sandbox/audit-auto-promote"', content)
         self.assertRegex(content, r'printf \'%s\\n\' "\$\{KUBEAGENTS_AUDIT_AUTO_PROMOTE:-true\}" >"\$SANDBOX_AUDIT_AUTO_PROMOTE_FILE"')
         self.assertIn('chmod 0644 "$SANDBOX_AUDIT_AUTO_PROMOTE_FILE"', content)
+
+    def test_the_autonomy_switches_are_written_as_root_owned_files_defaulting_off(self) -> None:
+        """kubeagents_switches.py reads these files before the forwarded variables, so a
+        session cannot turn a switch on (test_kubeagents_switches.py holds its paths to these)."""
+        content = _ENTRYPOINT.read_text()
+        chmod = 'chmod 0644 "$SANDBOX_POST_MERGE_CHECK_FILE" "$SANDBOX_AUTOMERGE_FILE" "$SANDBOX_DIAL_FILE"'
+        self.assertIn(chmod, content)
+        for name, path in (
+            ("POST_MERGE_CHECK", "/run/kube-agents-sandbox/post-merge-check"),
+            ("AUTOMERGE", "/run/kube-agents-sandbox/automerge"),
+            ("DIAL", "/run/kube-agents-sandbox/dial"),
+        ):
+            self.assertIn(f'SANDBOX_{name}_FILE="{path}"', content)
+            self.assertIn(f"printf '%s\\n' \"${{KUBEAGENTS_{name}:-off}}\" >\"$SANDBOX_{name}_FILE\"", content)
 
 
 class SandboxEntrypointKubeconfigMigrationTest(_SandboxEntrypointHarness):

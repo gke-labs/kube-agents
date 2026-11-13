@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	rbacv1 "k8s.io/api/rbac/v1"
-	"sigs.k8s.io/yaml"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -40,6 +39,7 @@ func everyRenderedRole(agent *agentv1alpha1.PlatformAgent) []renderedRole {
 		{"buildA2ADispatcherJobsRole", buildA2ADispatcherJobsRole(agent).Rules},
 		{"buildCredentialBrokerTokenReviewRole", buildCredentialBrokerTokenReviewRole(agent).Rules},
 		{"buildMinimalPlatformRole", buildMinimalPlatformRole(agent).Rules},
+		{"buildMinimalPlatformRoleWithSecrets", buildMinimalPlatformRoleWithSecrets(agent, true).Rules},
 		{"buildPlatformLocalRole", buildPlatformLocalRole(agent).Rules},
 		{"buildPlatformLeaderRole", buildPlatformLeaderRole(agent).Rules},
 		{"buildScopePublisherRole", buildScopePublisherRole(agent).Rules},
@@ -69,23 +69,18 @@ func ruleReaches(rule rbacv1.PolicyRule, group, resource, verb string) bool {
 	return false
 }
 
-// operatorClusterRole is the operator's own ClusterRole as it ships, parsed
-// rather than grepped so a wildcard rule is seen for what it is.
+// operatorClusterRole is the operator's own RBAC as it ships -- the ClusterRole
+// and the namespaced Role role.yaml carries beside it -- parsed rather than
+// grepped so a wildcard rule is seen for what it is. Both documents are
+// swept: a grant that arrives through the Role installs as readily.
 func operatorClusterRole(t *testing.T) renderedRole {
 	t.Helper()
-	const path = "../../config/rbac/role.yaml"
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("reading %s: %v", path, err)
+	roles := loadGeneratedRoles(t)
+	rules := append([]rbacv1.PolicyRule(nil), roles.clusterRole.Rules...)
+	for _, role := range roles.roles {
+		rules = append(rules, role.Rules...)
 	}
-	var cr rbacv1.ClusterRole
-	if err := yaml.UnmarshalStrict(raw, &cr); err != nil {
-		t.Fatalf("parsing %s: %v", path, err)
-	}
-	if len(cr.Rules) == 0 {
-		t.Fatalf("%s parsed to no rules; the sweep would pass vacuously", path)
-	}
-	return renderedRole{path, cr.Rules}
+	return renderedRole{generatedRolePath, rules}
 }
 
 // Nothing this deployment renders may mint a ServiceAccount token.

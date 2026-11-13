@@ -1,0 +1,24 @@
+# The replay lane's matrix: what hack/ci-eval-pr.sh runs under
+# EVAL_REPLAY_LANE=true, a periodic on main that replays the nightlies'
+# recorded answers and gates nothing (examples/inference-replay/eval-design.md,
+# Rollout step 2; hack/replay-proxy/README.md, "In CI").
+#
+# One `./tasks/<id>/task.yaml` path per line, relative to bench/. `#` starts a
+# comment, blank lines are skipped. Every entry must be a registered case, a
+# line in presubmit-cases.txt or nightly-cases.txt, since the lane replays
+# what the nightly recorded; the script refuses anything else.
+# tests/test_replay_lane_roster.py also holds each entry off the inject lane's
+# exclusions (the lane grades through the inject door, as the nightly does)
+# and off the cases that request a pull request.
+#
+# The first three are the dev-install trials' cases ("Replay lane trials" in
+# the design). The rest add a fan-out over the fleet, which is where a miss
+# spreads between agents, and three short single-agent cases.
+./tasks/chat-routing-own-cluster-namespaces/task.yaml
+./tasks/obtainability-design-quota-vs-capacity/task.yaml
+./tasks/provisioning-cluster-request-never-creates/task.yaml
+./tasks/chat-fanout-fleet-restarts-rows/task.yaml
+./tasks/chat-routing-fleet-question/task.yaml
+./tasks/upgrades-fleet-version-table/task.yaml
+./tasks/agent-kanban-smoke/task.yaml
+./tasks/cluster-agent-crashloop-debug/task.yaml

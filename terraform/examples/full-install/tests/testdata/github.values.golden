@@ -63,6 +63,7 @@
     "projects": []
     "sharedVpcHosts": []
   "security":
+    "disallowSecretsRead": null
     "scopedServiceAccountPool":
       "enabled": false
       "serviceAccounts": []

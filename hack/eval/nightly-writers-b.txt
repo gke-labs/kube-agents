@@ -22,7 +22,7 @@
 # lists. A new writer lands in writers-a; when the counts drift apart, list
 # a case here or in nightly-writers-c.txt until they balance.
 #
-# Balanced on the gemini-4-argon night of 2026-11-06 (build
+# Balanced on the night of 2026-11-06 (build
 # 2117406650204688384; the 14-case roster at 292 unit-minutes): writers-b
 # 96, writers-c 98, writers-a 98 (chat-stop-halts-delegated-remediation,
 # obtainability-major-pdb-auto-pr, obtainability-refusal-direct-mutation,

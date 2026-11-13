@@ -1,4 +1,4 @@
-"""The series the usage counters poller reads are the ones the four listeners export.
+"""The series the usage counters poller reads are the ones the five listeners export.
 
 The operator sums the credential broker's tool-invocation counter over its
 success and error outcomes (the commands it ran and the requests it rejected or
@@ -11,7 +11,8 @@ proposal readings (the gauges the readings sweep sets, vcs_readings.py) into the
 proposal fields of status.usage, and the chat plugin's inbound-message
 counter over its platform label into chatMessagesInboundTotal, and into sessionsTotal the watcher's
 triage-sessions counter, the chat plugin's sessions counter and the A2A gateway's, and the chat
-plugin's proposals ledger gauge, by origin, into the nine proposalsFrom fields. Each series name, the status label
+plugin's proposals ledger gauge, by origin, into the nine proposalsFrom fields, and LiteLLM's
+token and spend families into the three inference totals. Each series name, the status label
 key the broker writes and the operator filters on, and each counted outcome
 value is a constant on the producer's side and a second copy on the operator's,
 and a rename on either side would freeze a status counter silently: the scrape
@@ -87,7 +88,33 @@ def _watcher_gauge_family(field):
     return match.group(1)
 
 
+def _py_tuple(name, path, key=None):
+    """The quoted strings of a module-level tuple, or of one key's tuple inside a mapping."""
+    source = path.read_text()
+    if key is None:
+        match = re.search(rf'^{name}\b[^=\n]*=\s*\((.*?)\)', source, re.M | re.S)
+    else:
+        match = re.search(rf'^{name}\b.*?"{key}":\s*\((.*?)\)', source, re.M | re.S)
+    assert match, f"{name} not found in {path}"
+    return re.findall(r'"([^"]+)"', match.group(1))
+
+
 class UsageCountersSeriesNamesTest(unittest.TestCase):
+    def test_the_litellm_families_the_poller_sums_are_the_scripts(self):
+        """LiteLLM is not this repository's code, so neither side can be checked against
+        its producer; the workstation summary reads the same families live, and the two
+        readers must agree on the suffixed name and its bare sibling, in that order."""
+        for go_total, go_bare, key, mapping in (
+            ("litellmInputSeries", "litellmInputBareSeries", "in", "TOKEN_FAMILIES"),
+            ("litellmOutputSeries", "litellmOutputBareSeries", "out", "TOKEN_FAMILIES"),
+            ("litellmSpendSeries", "litellmSpendBareSeries", None, "SPEND_FAMILIES"),
+        ):
+            with self.subTest(family=go_total):
+                families = _py_tuple(mapping, _FEEDBACK_SUMMARY_PY, key)
+                self.assertEqual(families[:2], [_go_const(_SCRAPE_GO, go_total), _go_const(_SCRAPE_GO, go_bare)])
+                self.assertTrue(families[0].endswith("_total"))
+                self.assertEqual(families[0], families[1] + "_total")
+
     def test_the_brokers_vcs_counter_is_the_one_the_poller_sums_for_proposals(self):
         self.assertEqual(_py_const("VCS_REQUESTS_METRIC"), _go_const(_SCRAPE_GO, "vcsRequestsSeries"))
         self.assertEqual(_py_const("VCS_VERB_LABEL"), _go_const(_SCRAPE_GO, "vcsVerbLabel"))
@@ -303,6 +330,12 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
 
     def test_the_chat_plugins_gave_up_family_is_the_one_the_poller_sums_into_kanban_tasks_gave_up(self):
         self.assertEqual(_py_const("KANBAN_GAVE_UP_METRIC", _CHAT_METRICS_PY), _go_const(_SCRAPE_GO, "kanbanGaveUpSeries"))
+
+    def test_the_chat_plugins_dispatcher_gauge_is_the_one_the_poller_reads_into_kanban_dispatcher_failing(self):
+        self.assertEqual(_py_const("KANBAN_DISPATCHER_FAILED_TICKS_METRIC", _CHAT_METRICS_PY), _go_const(_SCRAPE_GO, "kanbanDispatcherFailedTicksSeries"))
+        self.assertEqual(_py_const("BOARD_LABEL", _CHAT_METRICS_PY), _go_const(_SCRAPE_GO, "kanbanDispatcherBoardLabel"))
+        self.assertEqual(_py_const("ERROR_LABEL", _CHAT_METRICS_PY), _go_const(_SCRAPE_GO, "kanbanDispatcherErrorLabel"))
+        self.assertEqual(_py_const("KANBAN_DISPATCHER_FAILING_SECONDS_METRIC", _CHAT_METRICS_PY), _go_const(_SCRAPE_GO, "kanbanDispatcherFailingSecondsSeries"))
 
     def test_the_status_label_key_the_broker_writes_is_the_one_the_poller_filters_on(self):
         self.assertEqual(_py_const("TOOL_STATUS_LABEL"), _go_const(_SCRAPE_GO, "toolInvocationsStatusLabel"))

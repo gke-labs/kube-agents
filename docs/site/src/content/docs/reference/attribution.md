@@ -56,7 +56,7 @@ These are per-requester attribution on objects the agent creates, and are distin
 - Object annotations are supporting correlation data, not durable proof. They can be changed, are gone after deletion, and don't identify the requester for unannotated updates.
 - Server-generated logs are tamper-resistant only when retention and IAM prevent the agent from modifying the sink. Default provisioning grants the agent read-only log access; stronger environments should route an immutable copy to a separate security project.
 - Prompts, model outputs, chat messages, and tool arguments can contain secrets or personal data. Restrict access and retention; redact sensitive values before export.
-- The requester identity in spans, session rows, and audit records is a pseudonym, not an address. Google Chat reports the sender's e-mail as their user id, so it is HMAC-SHA256 hashed with `SESSION_KV_SALT` before anything is written; a Slack member id is already opaque and stays readable. The hash is stable while the salt is, so a person's sessions still correlate — but resolving one back to a person means joining against the chat platform, which is the point. Rotating the salt breaks that correlation for every past session.
+- The requester identity in spans, session rows, and audit records is a pseudonym. Google Chat reports the sender's e-mail as their user id, so it is HMAC-SHA256 hashed with `SESSION_KV_SALT` before anything is written; a Slack member id is already opaque and stays readable. The hash is stable while the salt is, so a person's sessions still correlate — but resolving one back to a person means joining against the chat platform, which is the point. Rotating the salt breaks that correlation for every past session.
 
 ## Query recipes
 

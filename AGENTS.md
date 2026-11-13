@@ -12,7 +12,7 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`): agent c
   - `cluster/`: The Cluster Agent profile _template_ (persona, scoped config, runtime-debugging skills), which the Platform Agent scaffolds into per-cluster Hermes profiles at runtime; not deployed directly.
   - `contributor/`: The contributor-agent protocol: the claim/PR/review/escalation loop for external bots (e.g. Kyber, Codebot Robot) coordinating over GitHub alone. Not a runtime blueprint; not shipped.
 - `.agents/skills/`: Repository-level skills, not shipped in the agent images: review skills (adversarial, security, docs-drift, chat UX, skill quality) run against pull requests and clusters, `review-preflight` runs the pre-PR set in a context that did not write the change, the `install-`/`uninstall-`/`upgrade-kube-agents` lifecycle skills drive the installer scripts, and `edit-mirrored-skill` edits mirrored `gke-*` skills.
-- `.agents/rules/`: Repository-level rules, one file per family: code (`core_engineering.md`), workflows (`github_actions.md`), pre-PR passes (`pre_pr_review.md`), eval-driven development (`eval_driven_development.md`), docs (`documentation.md`), chat UX (`chat_ux.md`).
+- `.agents/rules/`: Repository-level rules, one file per family: code (`core_engineering.md`), workflows (`github_actions.md`), pre-PR passes (`pre_pr_review.md`), eval-driven development (`eval_driven_development.md`), docs (`documentation.md`), chat UX (`chat_ux.md`), public posts (`public_surfaces.md`).
 - `a2a/`: bus Go module: wire library, `a2a` topics CLI (`docs/designs/spec-a2a-payloads.md`), gateway, auth-callout, `persona/` (bus content), `lib/persona/` (persona format).
 - `charts/`: Canonical Helm chart (`kube-agents`) deploying the operator and profiles.
 - `terraform/`: Reusable Terraform modules (`gke-cluster`, `kube-agents-iam`, `kube-agents-scope-resolver`, `chat-pubsub`, `github-minter`, `gke-backup-plan`, `drift-pubsub`), plus `examples/full-install/`, the single-apply composition that installs the Helm chart on top.
@@ -48,7 +48,7 @@ Tests live in many places. **Decide by whether a model call is in the loop:**
 - **Yes, and it is the release gate** — `tests/e2e/`, run on a schedule by the release pipeline.
 
 A new Python test directory only runs if a `PYTHON_TEST_DIRS` glob in the `Makefile` reaches it
-(`tests/conformance/` excepted by design); add the glob in the same change. Full map:
+(`tests/conformance/` excepted); add the glob in the same change. Full map:
 [`docs/testing-map.md`](docs/testing-map.md).
 
 ## Agent Setup & Integration
@@ -61,7 +61,7 @@ operational guides.
 
 ### Branch from a `main` you have just fetched
 
-`main` takes roughly ten commits a day. Always fetch first and branch from the fetched ref:
+`main` moves fast. Fetch first and branch from the fetched ref:
 
 ```bash
 # `upstream` is the remote for gke-labs/kube-agents (`origin` on a direct clone).
@@ -153,7 +153,7 @@ Rules (see also [`.agents/rules/documentation.md`](.agents/rules/documentation.m
   lists (`SKILL.md` excepted per `.agents/skills/skill-review/SKILL.md`).
 
 Run `make docs-check` before pushing: generated regions, links/anchors/reachability, terminology,
-site audience, site prose, the context budget, and the PR template's sections.
+site audience, site prose, the context budget, the PR template's sections, and upgrade-table labels.
 
 ## Contributing as an agent
 
@@ -182,20 +182,20 @@ user" clauses here. Agents with a user in the loop follow this file.
   assistance in the PR description instead.
 - **Write PR titles, bodies, commits, and review replies straight:** plain declaratives leading with
   the outcome, without self-grading (`comprehensive`, `production-ready`).
-- **Adversarial and docs-drift self-review before opening a PR:** run `review-adversarial`
-  (`.agents/skills/review-adversarial/SKILL.md`) and `review-docs-drift`
-  (`.agents/skills/review-docs-drift/SKILL.md`) against your branch diff **in a clean context that
-  did not write the change** (`/pr-preflight` spawns one). Fix confirmed findings and record one
-  merged disposition list under **Self-Review**: what you looked for, what was found, the context
-  used. Mechanics: [`pre_pr_review.md`](.agents/rules/pre_pr_review.md).
-- **Live-test the change before opening a PR:** fill in **Testing → Live validation** with how the
-  change ran against a running installation ([INSTALL.md](INSTALL.md)), the eval loop or
-  exemption record for agent behaviour changes, or "Not live-tested" with the reason when no install
-  can reach it. Mechanics and shared-install lease rules:
-  [`pre_pr_review.md`](.agents/rules/pre_pr_review.md).
+- **Self-review before opening a PR:** run `review-adversarial`, `review-docs-drift` and, when chat
+  output changes, `review-chat-ux` on your diff **in a clean context that did not write it**
+  (`/pr-preflight` spawns them). Fix confirmed findings; under **Self-Review** list every
+  disposition, what you looked for and the context ([mechanics](.agents/rules/pre_pr_review.md)).
+- **Show a user-facing change:** a PR changing what a user sees carries a screenshot under **UX
+  change**; CI checks it ([mechanics](.agents/rules/pre_pr_review.md#ux-change)).
+- **Live-test the change before opening a PR:** fill in **Testing → Live validation** with how it
+  ran against a running installation, the eval loop or exemption record for agent
+  behaviour changes, or "Not live-tested" and why. Mechanics:
+  [`pre_pr_review.md`](.agents/rules/pre_pr_review.md); what the section may carry:
+  [`public_surfaces.md`](.agents/rules/public_surfaces.md).
 - **Keep `Self-Review` and `Live validation` current, not chronological:** fold later passes and
-  fixes into the sections rather than appending rounds; round-by-round history belongs in the
-  review threads ([`pre_pr_review.md`](.agents/rules/pre_pr_review.md)).
+  fixes into the sections, not appended rounds; per-round history goes in review threads
+  ([`pre_pr_review.md`](.agents/rules/pre_pr_review.md)).
 - **The install has one engine: Terraform + Helm.** `terraform/examples/full-install` (via
   `lifecycle.sh`) owns every GCP resource and the chart every Kubernetes resource;
   `install.sh` / `uninstall.sh` / `upgrade.sh` only generate `terraform.tfvars` and drive it. Do not

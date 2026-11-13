@@ -82,6 +82,38 @@ _SHELL_FLAG_PREFIX = "-"
 _SHELL_OPTIONS_END = "--"
 _SHELL_EXPANSION_PREFIX = "$"
 _SHELL_COUNT_RE = re.compile(r"^(?:\d+(?:\.\d+)?[smhd]?|infinity)$")
+# The structural grep exemption (`_without_grep_patterns`): the programs it reads, the short
+# options that take a value (in the next word or glued, `-A 2` or `-A2`; `-e` gives a pattern and
+# `-f` a file of patterns, so with either no positional word is the pattern), the long forms of
+# those two when the value is glued with `=` (any other long option is read as a flag, so a
+# separate value of one is graded as the pattern and the real pattern stays on the row), the one
+# place its output may go, and the row hermes renders for a collapsed chain.
+_GREP_PROGRAMS = frozenset(("grep", "egrep", "fgrep"))
+_GREP_SHORT_VALUE_OPTIONS = frozenset("efABCmdD")
+_GREP_PATTERN_OPTION = "e"
+_GREP_PATTERN_FILE_OPTION = "f"
+_GREP_LONG_PATTERN_PREFIX = "--regexp="
+_GREP_LONG_PATTERN_FILE_PREFIX = "--file="
+_GREP_LONG_OPTION_PREFIX = "--"
+_GREP_STDOUT_REDIRECT = ">"
+_GREP_OUTPUT_SINK = "/dev/null"
+# A `#` where a word opens starts a comment, which the words drop; a card log row joins the next
+# typed line onto it with a space, so a comment there would hide that line from the grading.
+_COMMENT_CHAR = "#"
+_COLLAPSED_CHAIN_RE = re.compile(r"\s\+\s\d+\scommand(?:s|\(s\))?\s*$")
+# A backslash before a blank in a stored typed call: an escaped space or tab, or what the pod's
+# scrub leaves of an escaped backslash at a line end (`worker_transcript.fold_shell_command`).
+_ESCAPED_BLANK_RE = re.compile(r"\\[ \t]")
+# The checks below read the line as the shell reader keeps it, quotes in place and line
+# continuations gone, so a quote or a backslash that ends a name in bash ends it here too.
+# A word that reads the last argument back (`$_`, `${_}`), or a variable through another
+# (`${!NAME}`, which can name `_` or a variable an assignment set).
+_READ_BACK_RE = re.compile(r"\$(?:_(?![A-Za-z0-9_])|\{_(?![A-Za-z0-9_])|\{!)")
+# The one braced expansion a grep row may hold: a plain name, or a default that assigns
+# nothing (`${HOME}`, `${DIR:-.}`). Any other `${…}` can assign (`${X:=…}`, `${A[i]=…}`,
+# `${!X:=…}`), so it is refused rather than parsed.
+_BRACED_EXPANSION_OPEN = "${"
+_PLAIN_BRACED_EXPANSION_RE = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*(?:\}|:?-)")
 
 
 def _read_shell_line(command: str) -> tuple[str, list[str], list[str]]:
@@ -358,3 +390,137 @@ def _command_word_index(
             continue
         return None
     return None
+
+
+def _typed_call_may_join(command: str) -> bool:
+    """Whether a typed command, as the pod stores it, may hold more than one line, which a card
+    log row joins with a space: a newline outside quotes once the ends are trimmed, a backslash
+    before a blank (an escaped blank, or what the pod's scrub leaves of an escaped backslash at
+    a line end once it folds the continuation), or a line the shell reader cannot split."""
+    if _ESCAPED_BLANK_RE.search(command):
+        return True
+    words, _ = _shell_words_and_spans(command.strip())
+    if not words:
+        return bool(command.strip())
+    return any(isinstance(word, _ShellOperator) and word == _SHELL_LINE_END for word in words)
+
+
+def _can_read_a_word_back(line: str) -> bool:
+    """Whether ``line``, as :func:`_read_shell_line` keeps it, can read a removed word back: an
+    ANSI-C quote, a read of the last argument or of a variable through another, or a braced
+    expansion other than a plain name or a default that assigns nothing."""
+    if _has_ansi_c_quote(line) or _READ_BACK_RE.search(line):
+        return True
+    start = line.find(_BRACED_EXPANSION_OPEN)
+    while start != -1:
+        if not _PLAIN_BRACED_EXPANSION_RE.match(line, start):
+            return True
+        start = line.find(_BRACED_EXPANSION_OPEN, start + 1)
+    return False
+
+
+def _has_ansi_c_quote(command: str) -> bool:
+    """Whether the line opens an ANSI-C quote (``$'…'``) outside other quotes: the shell reader
+    keeps its escapes undecoded, so ``$'\\x24_'`` would not read as ``$_``."""
+    quote: str | None = None
+    i = 0
+    while i < len(command):
+        char = command[i]
+        if char == _SHELL_ESCAPE_CHAR and quote != _SHELL_SINGLE_QUOTE:
+            i += 2
+            continue
+        if quote is not None:
+            if char == quote:
+                quote = None
+        elif char == _SHELL_EXPANSION_PREFIX and command.startswith(_SHELL_SINGLE_QUOTE, i + 1):
+            return True
+        elif char in _SHELL_QUOTE_CHARS:
+            quote = char
+        i += 1
+    return False
+
+
+def _without_grep_patterns(command: str) -> str | None:
+    """The command line as its shell words joined by spaces, with the grep's pattern argument
+    removed (the first positional word, or each ``-e``/``--regexp=`` value when one is given);
+    None when the line is not one such grep. The line is a ``grep``, ``egrep`` or ``fgrep`` named
+    bare (no path, wrapper, assignment or reserved word ahead) and nothing else: no control
+    operator (``;``, ``&``, ``&&``, ``||``, ``|``, a newline, a parenthesis), so no later command
+    typed on the line can read the removed word back from the shell; no redirect but ``>`` to ``/dev/null``; no
+    comment, since a card log row joins the next typed line onto it; and not a collapsed chain
+    (`` + N command(s)``); and no substitution anywhere on it. Options end at the first operand.
+    Every other word stays: the options, the file operands and any text the rendering joined
+    onto the row. Quotes come off, as the shell reads the line; a line bash refuses yields None.
+    A card log row that joined a second typed line onto the grep is one row here, so the line
+    is also refused when a later word could read the removed word back
+    (:func:`_can_read_a_word_back`)."""
+    if _COLLAPSED_CHAIN_RE.search(command):
+        return None
+    # The reader keeps every quoted, escaped or in-word `#` and a span's text whole, so a `#` it
+    # did not hand back opened a comment.
+    kept, kept_spans, _ = _read_shell_line(command)
+    if kept.count(_COMMENT_CHAR) + sum(span.count(_COMMENT_CHAR) for span in kept_spans) < command.count(_COMMENT_CHAR):
+        return None
+    words, spans = _shell_words_and_spans(command)
+    if not words or isinstance(words[0], _ShellOperator) or words[0] not in _GREP_PROGRAMS:
+        return None
+    # A substitution anywhere runs a command, and can run one the removed word set up
+    # (`grep "${X:=<cmd>}" $(eval $X)`).
+    if spans:
+        return None
+    # The grep alone: a later command could read the removed word back from the shell (`$_`,
+    # `declare -p _`, `jobs` behind a `&`), and a pipe hands it the grep's output.
+    if any(_is_control_operator(word) for word in words):
+        return None
+    end = len(words)
+    patterns: list[int] = []
+    positionals: list[int] = []
+    given = False
+    options_done = False
+    i = 1
+    while i < end:
+        word = words[i]
+        if isinstance(word, _ShellOperator):
+            # `>` to /dev/null is the one operator the grep's segment may hold; `>|` and every
+            # other redirect are refused.
+            if word != _GREP_STDOUT_REDIRECT or i + 1 >= end or words[i + 1] != _GREP_OUTPUT_SINK:
+                return None
+            i += 2
+            continue
+        if options_done or word == "-" or not word.startswith(_SHELL_FLAG_PREFIX):
+            # Options end at the first operand, as POSIX grep reads them, so an `-e` after a file
+            # operand is graded rather than removed.
+            positionals.append(i)
+            options_done = True
+        elif word == _SHELL_OPTIONS_END:
+            options_done = True
+        elif word.startswith(_GREP_LONG_OPTION_PREFIX):
+            if word.startswith(_GREP_LONG_PATTERN_PREFIX):
+                patterns.append(i)
+            given = given or word.startswith((_GREP_LONG_PATTERN_PREFIX, _GREP_LONG_PATTERN_FILE_PREFIX))
+        else:
+            for j, flag in enumerate(word[1:], start=1):
+                if flag not in _GREP_SHORT_VALUE_OPTIONS:
+                    continue
+                given = given or flag in (_GREP_PATTERN_OPTION, _GREP_PATTERN_FILE_OPTION)
+                if word[j + 1:]:
+                    value = i
+                elif i + 1 < end and not isinstance(words[i + 1], _ShellOperator):
+                    value = i + 1
+                    i += 1
+                else:
+                    break
+                if flag == _GREP_PATTERN_OPTION:
+                    patterns.append(value)
+                break
+        i += 1
+    removed = set(patterns) if given else set(positionals[:1])
+    if not removed:
+        return None
+    # A card log row joins the next typed line onto the grep, so a word after it can be a
+    # command that reads the removed word back: from a variable the line assigned, as the last
+    # argument (`$_`), or through an ANSI-C quote whose escapes spell either. Such a row is
+    # graded whole (#5331).
+    if _can_read_a_word_back(kept):
+        return None
+    return " ".join(word for k, word in enumerate(words) if k not in removed)

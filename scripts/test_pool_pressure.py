@@ -693,7 +693,8 @@ class Cause(unittest.TestCase):
             self._pool(10, 5), pp.LiveQueue([], {str(n) for n in range(10)}), 10
         )
         self.assertEqual(pp.CAUSE_CONCURRENCY_CAP, label)
-        self.assertIn("Raise the cap", " ".join(text))
+        self.assertIn("the share the nightly, today, GitLab and reconcile jobs lease from", " ".join(text))
+        self.assertNotIn("Raise the cap", " ".join(text), "the pool is shared; moving the cap is a human tradeoff")
         self.assertIn("Deck confirms it: 10 run(s) running", " ".join(text))
 
     def test_the_deck_confirmation_is_left_out_when_deck_does_not_confirm(self):

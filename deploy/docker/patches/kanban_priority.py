@@ -62,11 +62,16 @@ What
    what filled the slots on ``DispatchResult.saturation`` and the watcher logs
    ``kanban dispatcher saturated: ...`` instead of "stuck" when every board is
    capped or holding its reserved slot. "stuck" stays for budget available and
-   nothing spawned.
+   nothing spawned. That warning waits for a window of saturated ticks, so
+   each ``queued`` event also logs one ``kanban priority: <id> queued ...``
+   line on the tick it is written, naming the holders and the held-back
+   reason, so a short saturation is readable back.
 4. **A queued notice** (:func:`note_waiting`, :func:`format_queued`). A user
    card left waiting for a slot gets one ``queued`` task event per wait. The
    notifier delivers it into the card's thread as the first line of the card's
-   rolling progress message, with no LLM turn. ``kanban_create`` also says the
+   rolling progress message, with no LLM turn. The event's payload carries
+   the slot counts, the ids of this board's cards that held the slots
+   (``holders``) and the reserved-slot counts. ``kanban_create`` also says the
    card is queued when no slot is free (:func:`queue_fields`).
 
 Nothing here may break a dispatch tick or a ``kanban_create``: every entry
@@ -268,8 +273,31 @@ QUEUED_KIND = "queued"
 QUEUED_TEXT = "Queued: the system is busy. Your request will start when a worker frees up."
 QUEUED_MARKER = "⏳"
 
+#: The gateway log line written once per ``queued`` event: which card waited,
+#: how many user cards were ahead of it, and what held the slots at that
+#: moment. The saturation warning below only fires after ``_HEALTH_WINDOW``
+#: saturated ticks back to back and at most every WARN_INTERVAL_SECONDS, so a
+#: card queued during a short saturation left no line at all, and a report
+#: like gke-labs/kube-agents#3311 could not be read back from the logs.
+QUEUED_LOG = (
+    "kanban priority: %s queued (%d user card(s) ahead): %d/%d worker slots "
+    "busy (%d background, %d user: %s)%s"
+)
+#: The ``queued`` event payload key holding the ids of the running cards that
+#: held the slots (the first CARDS_SHOWN, oldest first), so the board keeps the
+#: record where the log may have rotated. The ids are this board's cards only:
+#: ``record_saturation`` lists the ticking board's rows, while the counts
+#: beside them are host-wide, so on a host with several boards the list can be
+#: shorter than the count.
+HOLDERS_KEY = "holders"
+
 #: How many running cards the saturation warning names.
 CARDS_SHOWN = 5
+
+#: What a holder is listed under when its card names no assignee, and what the
+#: holder list reads when no running card could be listed.
+UNKNOWN_ASSIGNEE = "?"
+NO_HOLDERS_TEXT = "none listed"
 
 #: How often the saturation warning may repeat, matching upstream's stuck
 #: warning, which it replaces for this case.
@@ -658,18 +686,31 @@ def note_waiting(
         ]
         if not owed:
             return
+        sat = result.saturation
+        holders = [card.get("id") for card in sat.get("cards", ())]
         payload_base = {
             "note": QUEUED_TEXT,
-            "running": result.saturation["running"],
-            "limit": result.saturation["limit"],
-            "background_running": result.saturation["background_running"],
+            "running": sat["running"],
+            "limit": sat["limit"],
+            "background_running": sat["background_running"],
+            HOLDERS_KEY: holders,
+            "reserved_user": sat["reserved_user"],
+            "reserved_background": sat["reserved_background"],
         }
+        owed_ahead = [(tid, user_waiting.index(tid)) for tid in owed]
         kb = _kb()
         with kb.write_txn(conn):
-            for tid in owed:
-                ahead = user_waiting.index(tid)
+            for tid, ahead in owed_ahead:
                 kb._append_event(conn, tid, QUEUED_KIND, {**payload_base, "ahead": ahead})
         result.queued_noticed.extend(owed)
+        holders_text = _holders_text(sat.get("cards", ()), time.time())
+        held_back = _held_back_text(sat)
+        for tid, ahead in owed_ahead:
+            logger.info(
+                QUEUED_LOG, tid, ahead, sat["running"], sat["limit"],
+                sat.get("background_running", 0), sat.get("user_running", 0),
+                holders_text, held_back,
+            )
     except Exception as exc:  # noqa: BLE001 — never break the dispatch tick
         logger.warning("kanban priority: noting waiting cards failed: %r", exc)
 
@@ -823,36 +864,33 @@ def _origin(card: dict) -> str:
     return "background"
 
 
-def saturation_message(sat: dict, now: Optional[float] = None) -> str:
-    """The warning text. Counts belong here, not in the user's thread."""
-    now = time.time() if now is None else now
-    cards = ", ".join(
-        f"{card.get('id')} @{card.get('assignee') or '?'} "
+def _holders_text(cards: Iterable[dict], now: float) -> str:
+    """The running cards that hold the slots, one ``id @assignee age [origin]`` each."""
+    return ", ".join(
+        f"{card.get('id')} @{card.get('assignee') or UNKNOWN_ASSIGNEE} "
         f"{_age(card.get('started_at'), now)} [{_origin(card)}]"
-        for card in sat.get("cards", ())
-    )
-    # A free slot held for the other class is not saturation; say which class
-    # is being held back.
-    running, limit = sat.get("running"), sat.get("limit")
-    full = isinstance(running, int) and isinstance(limit, int) and running >= limit
+        for card in cards
+    ) or NO_HOLDERS_TEXT
+
+
+def _held_back(sat: dict) -> tuple:
+    """``(held_user, held_background)``: how many ready cards of each class a
+    tick held back for the other class's reserved slot."""
     held_user = int(sat.get("reserved_user", 0) or 0)
     held_background = sat.get("reserved_background")
     if held_background is None:
         held_background = int(sat.get("reserved", 0) or 0) - held_user
-    held_background = int(held_background or 0)
-    if full:
-        state = "saturated"
-    elif held_user and not held_background:
-        state = "holding user cards"
-    else:
-        state = "holding background cards"
-    text = (
-        f"kanban dispatcher {state}: {running}/{limit} "
-        f"worker slots busy ({sat.get('background_running', 0)} background, "
-        f"{sat.get('user_running', 0)} user: {cards or 'none listed'}); "
-        f"{sat.get('user_waiting', 0)} user card(s) and "
-        f"{sat.get('background_waiting', 0)} background card(s) waiting"
-    )
+    return held_user, int(held_background or 0)
+
+
+def _held_back_text(sat: dict) -> str:
+    """The clauses saying which class a free slot is held for, or ``""``.
+
+    A free slot held for the other class is not saturation, so a line that
+    shows a free slot says why it was not given out.
+    """
+    held_user, held_background = _held_back(sat)
+    text = ""
     if held_background:
         text += (
             f"; {held_background} background card(s) held back because one slot "
@@ -864,6 +902,28 @@ def saturation_message(sat: dict, now: Optional[float] = None) -> str:
             "for background triage"
         )
     return text
+
+
+def saturation_message(sat: dict, now: Optional[float] = None) -> str:
+    """The warning text. Counts belong here, not in the user's thread."""
+    now = time.time() if now is None else now
+    cards = _holders_text(sat.get("cards", ()), now)
+    running, limit = sat.get("running"), sat.get("limit")
+    full = isinstance(running, int) and isinstance(limit, int) and running >= limit
+    held_user, held_background = _held_back(sat)
+    if full:
+        state = "saturated"
+    elif held_user and not held_background:
+        state = "holding user cards"
+    else:
+        state = "holding background cards"
+    return (
+        f"kanban dispatcher {state}: {running}/{limit} "
+        f"worker slots busy ({sat.get('background_running', 0)} background, "
+        f"{sat.get('user_running', 0)} user: {cards}); "
+        f"{sat.get('user_waiting', 0)} user card(s) and "
+        f"{sat.get('background_waiting', 0)} background card(s) waiting"
+    ) + _held_back_text(sat)
 
 
 def saturation_tick(

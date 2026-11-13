@@ -19,8 +19,11 @@ limitations under the License.
 // A feedback report needs to say what kind of environment the console ran
 // in without naming the customer's resources. So this route returns
 // versions (Kubernetes, kube-agents chart and images, Hermes), dates (when
-// kube-agents was installed, when it last rolled out), and counts (nodes,
-// namespaces, workloads, pods). It never returns the name of the customer's
+// kube-agents was installed, when it last rolled out), counts (nodes,
+// namespaces, workloads, pods), and the PlatformAgent's status.usage block
+// (usage.go: counters, proposal origins, the broker's tool vocabulary,
+// totals, the interface words and the two last-active timestamps, nothing
+// else). It never returns the name of the customer's
 // cluster, project, namespaces or workloads. The one exception is the
 // install block's ownership fields: the kube-agents Helm release, the
 // namespace it was installed into, and the Argo CD Application that owns it,
@@ -83,13 +86,14 @@ const (
 	// The kube-agents Deployments whose newest ReplicaSet dates the last
 	// upgrade, by how the chart and operator name them: the operator is
 	// "<release>-controller-manager" (operator-deployment.yaml), the
-	// gateway and credential proxy are "<agent>-gateway" and
-	// "<agent>-credential-proxy" (the operator's manifests), and LiteLLM's
-	// name is fixed (litellm.yaml).
+	// gateway, credential proxy and its exec tier are "<agent>-gateway",
+	// "<agent>-credential-proxy" and "<agent>-credential-proxy-exec-tier" (the
+	// operator's manifests), and LiteLLM's name is fixed (litellm.yaml).
 	defaultHelmReleaseName          = "kube-agents"
 	controllerManagerSuffix         = "-controller-manager"
 	gatewayDeploymentSuffix         = "-gateway"
-	credentialProxyDeploymentSuffix = "-credential-proxy"
+	credentialProxyDeploymentSuffix = "-credential-proxy"           // #nosec G101 -- a Deployment name suffix, not a credential
+	credentialProxyExecTierSuffix   = "-credential-proxy-exec-tier" // #nosec G101 -- a Deployment name suffix, not a credential
 	litellmDeploymentName           = "litellm"
 )
 
@@ -123,6 +127,7 @@ func rolloutDeployments(agentName, helmRelease string) map[string]bool {
 		helmRelease + controllerManagerSuffix:       true,
 		agentName + gatewayDeploymentSuffix:         true,
 		agentName + credentialProxyDeploymentSuffix: true,
+		agentName + credentialProxyExecTierSuffix:   true,
 		litellmDeploymentName:                       true,
 	}
 }
@@ -164,7 +169,12 @@ type environmentResponse struct {
 	Floor []string `json:"floor,omitempty"`
 	// Unavailable names what could not be read and why, without secrets.
 	Unavailable map[string]string `json:"unavailable,omitempty"`
-	ReadAt      string            `json:"read_at"`
+	// Usage is the PlatformAgent's status.usage block (usage.go): the
+	// allowlisted fields and the lines the feedback modal pastes. Absent
+	// when the PlatformAgent could not be read or carries no block;
+	// Unavailable names "usage" then.
+	Usage  *usageStatus `json:"usage,omitempty"`
+	ReadAt string       `json:"read_at"`
 }
 
 // installManagedBy reads who owns the install off the PlatformAgent's
@@ -430,6 +440,7 @@ func (s *server) readEnvironment(ctx context.Context) environmentResponse {
 	k := s.kube
 	if k == nil {
 		out.Unavailable["kubernetes"] = "no service account token is mounted; the chart grants one when webConsole.environment.enabled is true"
+		out.Unavailable["usage"] = out.Unavailable["kubernetes"]
 		return out
 	}
 	var ver struct {
@@ -461,6 +472,7 @@ func (s *server) readEnvironment(ctx context.Context) environmentResponse {
 	ns := s.cfg.PodNamespace
 	if ns == "" {
 		out.Unavailable["install"] = envPodNamespace + " is not set"
+		out.Unavailable["usage"] = envPodNamespace + " is not set"
 		return out
 	}
 	var pa struct {
@@ -476,13 +488,18 @@ func (s *server) readEnvironment(ctx context.Context) environmentResponse {
 			} `json:"deployment"`
 		} `json:"spec"`
 		Status struct {
-			Phase             string `json:"phase"`
-			LastReconcileTime string `json:"lastReconcileTime"`
+			Phase             string         `json:"phase"`
+			LastReconcileTime string         `json:"lastReconcileTime"`
+			Usage             map[string]any `json:"usage"`
 		} `json:"status"`
 	}
 	if err := k.get(ctx, fmt.Sprintf(platformAgentsAPIPath, ns, s.cfg.PlatformAgentName), &pa); err != nil {
 		out.Unavailable["install"] = "platformagent: " + err.Error()
+		out.Unavailable["usage"] = "platformagent: " + err.Error()
 	} else {
+		if out.Usage = newUsageStatus(pa.Status.Usage); out.Usage == nil {
+			out.Unavailable["usage"] = usageAbsentReason
+		}
 		out.Install.InstalledAt = pa.Metadata.CreationTimestamp
 		out.Install.Generation = pa.Metadata.Generation
 		out.Install.Phase = pa.Status.Phase

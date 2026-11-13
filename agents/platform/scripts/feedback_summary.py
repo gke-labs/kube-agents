@@ -54,7 +54,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, TextI
 
 # Independent of the gateway's usageSummaryMaxLines: this block has lines the
 # gateway's lacks.
-SUMMARY_MAX_LINES = 57
+SUMMARY_MAX_LINES = 59
 SUMMARY_TITLE = "kube-agents usage & feedback summary"
 TASK_WINDOW_DAYS = 14
 RECENT_TASKS_SHOWN = 5
@@ -93,6 +93,8 @@ REASON_SKIPPED = "skipped by --no-exec"
 EXIT_OK = 0
 EXIT_COLLECT = 1
 EXIT_LEAK = 3
+#: The one stderr prefix, here and in the feedback client's ``summary`` subcommand.
+LOG_PREFIX = "feedback-summary: "
 UNAVAILABLE = "unavailable"
 NEVER = "never"
 UNKNOWN = "unknown"
@@ -101,6 +103,15 @@ DEFAULT_MODE = "today"
 READY_CONDITION = "Ready"
 OTHER_BUCKET = "other"
 SPEND_CURRENCY = "USD"
+#: ``status.usage``'s three inference totals, the operator's running sums of
+#: LiteLLM's token and spend counters since the install (they survive a LiteLLM
+#: restart, where the live ``tokens:`` and ``spend:`` lines below start again at
+#: zero); the three fields the gateway's render reads, in the order it reads
+#: them. The spend is kept in micro-dollars so the field stays an integer.
+PERFORMANCE_TOTAL_FIELDS: Tuple[str, str, str] = ("inputTokensTotal", "outputTokensTotal", "spendMicrosUSDTotal")
+MICROS_PER_USD = 1_000_000
+TOKENS_SINCE_INSTALL_LABEL = "tokens (since install)"
+SPEND_SINCE_INSTALL_LABEL = "spend (since install)"
 TRUNCATED_SUFFIX = "+"
 KCC_CRD_SUFFIX = ".cnrm.cloud.google.com"
 SCALE_RESOURCES: Tuple[Tuple[str, str], ...] = (
@@ -784,6 +795,18 @@ def _origin_line(usage: Mapping[str, Any]) -> str:
     return f"{ORIGIN_LINE_PREFIX}{shown}{USAGE_AGENT_READING_SUFFIX}"
 
 
+def audited_block(snapshot: Snapshot) -> Tuple[str, List[str]]:
+    """The rendered block and the identifiers that leak into it.
+
+    The audit runs over the block less its model line and its origin line, the
+    lines printed by design. ``main`` and the feedback client's ``summary``
+    subcommand both go through here, so the check that guards a pasted block
+    and the check that guards an attached one are one check.
+    """
+    text = render(snapshot)
+    return text, audit(_without_fixed_lines(text), snapshot.identifiers)
+
+
 # --- rendering ------------------------------------------------------------------
 
 def _duration(seconds: float) -> str:
@@ -875,6 +898,9 @@ def render(snapshot: Snapshot) -> str:
     else:
         lines.append(f"{TOP_TOOLS_LABEL}: {UNAVAILABLE}")
     lines.append("performance:")
+    tokens_in_total, tokens_out_total, spend_micros_total = (int(usage.get(field) or 0) for field in PERFORMANCE_TOTAL_FIELDS)
+    lines.append(f"  {TOKENS_SINCE_INSTALL_LABEL}: in {tokens_in_total} / out {tokens_out_total}")
+    lines.append(f"  {SPEND_SINCE_INSTALL_LABEL}: {spend_micros_total / MICROS_PER_USD:.2f} {SPEND_CURRENCY}")
     if snapshot.litellm_metrics is not None:
         samples = parse_prometheus(snapshot.litellm_metrics)
         tokens_in = family_total(samples, TOKEN_FAMILIES["in"])
@@ -1130,16 +1156,15 @@ def main(argv: Optional[Sequence[str]] = None, stdout: TextIO = sys.stdout, stde
     try:
         snapshot = collect(options)
     except CollectError as error:
-        print(f"feedback-summary: {error}", file=stderr)
+        print(f"{LOG_PREFIX}{error}", file=stderr)
         return EXIT_COLLECT
-    text = render(snapshot)
+    text, leaked = audited_block(snapshot)
     missing = [name for name, present in snapshot.sources.items() if not present]
     if missing and options.in_pod:
         detail = "; ".join(f"{name}: {snapshot.source_reasons.get(name, REASON_EXEC)}" for name in missing)
-        print(f"feedback-summary: could not be read: {detail}", file=stderr)
-    leaked = audit(_without_fixed_lines(text), snapshot.identifiers)
+        print(f"{LOG_PREFIX}could not be read: {detail}", file=stderr)
     if leaked:
-        print(f"feedback-summary: refused to print: the block names {', '.join(leaked)}", file=stderr)
+        print(f"{LOG_PREFIX}refused to print: the block names {', '.join(leaked)}", file=stderr)
         return EXIT_LEAK
     print(text, file=stdout)
     return EXIT_OK

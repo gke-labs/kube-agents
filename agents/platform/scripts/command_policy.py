@@ -810,6 +810,18 @@ _GCLOUD_FOURTH_WORD_VERBS = frozenset(
 )
 # The one rule whose refusal carries a render flag (``local_render``).
 KUBERNETES_READ_ONLY_RULE = "kubernetes.read-only"
+KUBERNETES_SECRET_READ_RULE = "kubernetes.secret-read-forbidden"
+_KUBECTL_SECRET_READ_VERBS: frozenset[tuple[str, ...]] = frozenset(
+    {("get",), ("describe",), ("events",), ("wait",)}
+)
+_KUBECTL_MANIFEST_INPUT_FLAGS: frozenset[str] = frozenset(
+    {"-f", "--filename", "-k", "--kustomize"}
+)
+_KUBECTL_SECRET_READ_MESSAGE = (
+    "Reading Kubernetes Secrets through the credential broker is refused; "
+    "route kubectl through kube-proxy to read redacted Secret metadata. "
+    + _ACTION_BOUNDARY_NOTICE
+)
 
 # `kubectl get --raw <path>` sends the path to the API server as it stands,
 # which is how the fleet collectors page a large kind 500 objects at a time
@@ -1505,6 +1517,58 @@ def _kubectl_raw_refusal(argv: list[str], verb: tuple[str, ...]) -> Decision | N
     )
 
 
+def _names_secret_resource(target: str) -> bool:
+    """Return True when any comma-separated segment of target names a Secret resource."""
+    for part in target.split(","):
+        kind = part.partition("/")[0].lower()
+        if kind in ("secret", "secrets") or kind.startswith(("secret.", "secrets.")):
+            return True
+    return False
+
+
+def _kubectl_secret_read_refusal(argv: list[str], verb: tuple[str, ...]) -> Decision | None:
+    """Refuse Secret reads and file-sourced resource targets on brokered kubectl reads.
+
+    The credential broker does not redact Secret payloads when it runs kubectl on
+    behalf of `/v1/exec` callers. Only `kube-proxy` strips `.data` and
+    `.stringData`, so the broker command policy refuses `Secret` reads and
+    `-f`/`-k` manifest inputs on `get`, `describe`, `events`, and `wait`.
+    """
+    if verb[:1] not in _KUBECTL_SECRET_READ_VERBS:
+        return None
+    for token in argv[1:]:
+        name, separator, value = token.partition("=")
+        if name in _KUBECTL_MANIFEST_INPUT_FLAGS:
+            return Decision(
+                allowed=False,
+                rule_id=KUBERNETES_SECRET_READ_RULE,
+                message=_KUBECTL_SECRET_READ_MESSAGE,
+                verb_tuple=verb,
+                offending_flag=name,
+            )
+        if len(token) > 2 and token.startswith("-") and not token.startswith("--"):
+            for character in token[1:]:
+                if character in ("f", "k"):
+                    return Decision(
+                        allowed=False,
+                        rule_id=KUBERNETES_SECRET_READ_RULE,
+                        message=_KUBECTL_SECRET_READ_MESSAGE,
+                        verb_tuple=verb,
+                        offending_flag=f"-{character}",
+                    )
+                if character not in _KUBECTL_BOOLEAN_SHORTHANDS:
+                    break
+        target = value if (separator and name == "--for") else (token if not token.startswith("-") else "")
+        if target and _names_secret_resource(target):
+            return Decision(
+                allowed=False,
+                rule_id=KUBERNETES_SECRET_READ_RULE,
+                message=_KUBECTL_SECRET_READ_MESSAGE,
+                verb_tuple=verb,
+            )
+    return None
+
+
 def _kubectl_refuses_file_write(argv: list[str]) -> str | None:
     """Return the offending sidecar-filesystem-writing flag, or None."""
     for token in argv[1:]:
@@ -1826,7 +1890,10 @@ def _evaluate(argv: list[str], readings: bool = True) -> Decision:
             # A read verb's `--raw` is the one target the verb table cannot
             # see; a write's is refused with the write, below.
             raw_refusal = _kubectl_raw_refusal(argv, verb)
-            return _ALLOWED if raw_refusal is None else raw_refusal
+            if raw_refusal is not None:
+                return raw_refusal
+            secret_refusal = _kubectl_secret_read_refusal(argv, verb)
+            return _ALLOWED if secret_refusal is None else secret_refusal
         return Decision(
             allowed=False,
             rule_id=KUBERNETES_READ_ONLY_RULE,

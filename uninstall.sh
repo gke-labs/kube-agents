@@ -929,6 +929,9 @@ main() {
   # Gateway redaction, for the same reason: the generator refuses a misspelt
   # toggle or a malformed rule, and the gateway goes with the release.
   export LITELLM_REDACTION_ENABLED="false" LITELLM_REDACTION_IP_ACTION="" LITELLM_REDACTION_IP_ALLOW_CIDRS="" LITELLM_REDACTION_RULES=""
+  # The gateway's spend ceiling, likewise: the generator refuses an amount or
+  # a period it cannot read, and the gateway goes with the release.
+  export LITELLM_BUDGET_USD="" LITELLM_BUDGET_PERIOD=""
   # The scoped service account pool, likewise: the generator refuses a
   # misspelt switch or a malformed cap, and the destroy removes the members
   # in state whatever these say.
@@ -971,6 +974,10 @@ main() {
     export MODEL_PROVIDER="$DEFAULT_MODEL_PROVIDER" MODEL_DEFAULT_NAME=""
   fi
   export WEB_CONSOLE_ENABLED="false"
+  # The minter keys a lifecycle.sh refusal asks an operator to type into
+  # install.env by hand: the composition refuses either one in the wrong shape,
+  # and a destroy has no use for them, since both only steer adoption.
+  export MINTER_SHARED_KEY="" MINTER_ADOPT_KEY=""
   write_tfvars_from_state "${compose_dir}/terraform.tfvars"
   (
     cd "$compose_dir"

@@ -23,7 +23,13 @@ import (
 // delegate tool call: the reserved name, one data part.
 func delegateArtifact(t *testing.T, addressee, text string) lib.Artifact {
 	t.Helper()
-	data, err := json.Marshal(lib.DelegateRequest{Addressee: addressee, Text: text})
+	return delegateArtifactWithParameters(t, addressee, text, nil)
+}
+
+// delegateArtifactWithParameters is delegateArtifact carrying a parameter set.
+func delegateArtifactWithParameters(t *testing.T, addressee, text string, params map[string]string) lib.Artifact {
+	t.Helper()
+	data, err := json.Marshal(lib.DelegateRequest{Addressee: addressee, Text: text, Parameters: params})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -340,9 +346,12 @@ func TestDelegateRefusalsWithANotice(t *testing.T) {
 		name      string
 		addressee string
 		edit      func(rec *SessionRecord, parent string)
+		params    map[string]string
 		notice    string
 		rule      string
 	}{
+		{name: "parameters addressed to platform", addressee: "platform", params: map[string]string{"cluster": "web-1"},
+			notice: "⚠️ delegation refused: " + noticePlatformTakesNoParameters, rule: ruleDelegationTarget},
 		{name: "addressee that is no agent profile", addressee: "chat-other-1",
 			notice: `⚠️ delegation refused: there is no agent profile named "chat-other-1"`, rule: ruleDelegationTarget},
 		{name: "depth at the bound", addressee: "platform",
@@ -371,7 +380,7 @@ func TestDelegateRefusalsWithANotice(t *testing.T) {
 			if tc.edit != nil {
 				putRecord(t, r, conv, func(rec *SessionRecord) { tc.edit(rec, origin.TaskID) })
 			}
-			if err := exec.PublishArtifact(context.Background(), delegateArtifact(t, tc.addressee, "x")); err != nil {
+			if err := exec.PublishArtifact(context.Background(), delegateArtifactWithParameters(t, tc.addressee, "x", tc.params)); err != nil {
 				t.Fatal(err)
 			}
 			waitFor(t, "refusal line", loggedContaining(r, "delegation refused", "rule="+tc.rule, origin.TaskID))
@@ -2962,7 +2971,7 @@ func TestADelegationToAProfileIsSubmittedForTheResolvedProfile(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.g.cfg.ScopeFile = scope
-	r.g.profiles.put("cluster", &lib.AgentCard{Name: "cluster", Parameters: clusterParams})
+	r.g.profiles.put("cluster", &lib.AgentCard{Name: "cluster", Parameters: clusterParams, YieldToPinned: true})
 	r.g.profiles.put("prod-east", &lib.AgentCard{Name: "prod-east", Parameters: clusterParams,
 		ClusterRef: &lib.ClusterRef{ProjectID: "p1", Location: "us-east1", Cluster: "prod"}})
 	ctx := context.Background()

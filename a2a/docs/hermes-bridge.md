@@ -162,6 +162,14 @@ sets it deliberately wins. Both are inputs to the capability check below rather 
 deployment preferences - see "What scope the check runs at" for why the render has to
 supply `POD_NAMESPACE` at all, and for what a default install did before it did.
 
+**One more on a declared bridge.** `BRIDGE_DURABLE_PRECREATED=true` goes onto a sidecar
+recognised as the bridge, as the override. The provision Job creates the bridge's intake
+durable on `TASKS`, and the `bridge` principal is refused creating, updating or deleting
+it, so a bridge has to bind it rather than create it. A bridge on an image older than the
+operator ignores the flag, tries to create the durable, and is refused. That holds for the
+rendered bridge too, whose image follows the agent's tag, and for a gateway image pinned
+older than the operator: roll the agent, bridge and gateway images with the operator.
+
 Concurrent hermes processes under one `$HERMES_HOME` is the kanban dispatcher's existing
 posture (`deploy/docker/patches/kanban_result_required.py` documents `_default_spawn`
 spawning the same kind of one-shot `hermes chat -q` process), so the bridge inherits a
@@ -350,9 +358,10 @@ lands in an unhelpful place. The retired `worker` user's subscribe grant was
 another addressee just worked. `bridge`'s grants name `platform` literally
 (`a2aBridgeAddressee`, which is also `defaultProfile` in the bridge's own `main.go`: one
 value living in two modules that cannot import each other). Override the env now and the
-intake half still works — the consumer is created and pulled over `$JS.API`, where the
-filter subject rides in the request body and no subject grant sees it — so the other
-addressee's task is delivered. It stops there. `accept` publishes `submitted` on
+bridge never starts consuming: the provision Job makes only `bridge-platform`, and a bridge
+binding its intake (`BRIDGE_DURABLE_PRECREATED`, which the operator sets) waits for
+`bridge-<other>`, which nothing creates. A bridge without that flag would create its own and
+have the other addressee's task delivered, and it stops there. `accept` publishes `submitted` on
 `a2a.tasks.<other>.*.events` before it puts anything on the worker queue, and that subject
 is not in the publish list, so the publish is refused, the submission is dropped, and
 Hermes is never spawned. The refusal does not read as one: a rejected JetStream publish is
@@ -493,7 +502,14 @@ bridge logs a warning with the task, session and answer size, never the text. Th
 cancel raced the end of the turn too: a withheld answer ends `failed`, not `completed`. The rule is
 `opensWithUnstructuredReasoning` in `reasoning_leak.go`. The image patch
 `apply_unstructured_reasoning_replay.py` keeps such a reply out of the history Hermes sends the
-model on later calls. Output that never passes the bridge is not guarded: a kanban card's result
+model on later calls. On the API executor one more guard follows the answer: a reply that names a card
+or task id (`t_` and eight hex characters) when the turn's prompt, the user's words, names no task,
+card, board or kanban is asked for again, once, with a fixed user message in the same session under
+the turn's Idempotency-Key plus `/restate-card-id`, and the restated reply is the turn's answer; a
+restated reply that still names an id is delivered as it is, with a `card-id-restated` warning in
+the log. The chat UX rule keeps ids out of user text outside a board read, the Planning Agent's SOUL
+says so, and in a thread whose earlier replies carry an id the model copied them all the same
+(`card_id_leak.go`). The CLI executor has no such step. Output that never passes the bridge is not guarded: a kanban card's result
 posted by the notifier, a `today`-mode reply from Hermes's own gateway platforms, and cron
 deliveries on every leg, `report_to_chat` included. The scheduled `deliver: "chat"` report of a
 fleet-audit job the image ships is already immune, because the relay posts the record the run's

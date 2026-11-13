@@ -357,8 +357,8 @@ func TestGchatBoardEditRefreshesTheRecordAndASettleDropsOldTaps(t *testing.T) {
 	if err := a.EditNotifyMessage("spaces/_c2fixtureAA", "", gchatBoardMessage, OutMessage{Text: "settled"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, remembered, _ := a.boardLayoutOf(gchatBoardMessage); remembered {
-		t.Error("a message laid out without rows that act is still remembered")
+	if layout, remembered, _ := a.layoutOf(gchatBoardMessage); !remembered || layout.Text != "settled" || len(layout.Widgets) != 0 {
+		t.Errorf("record after the settle = %+v, remembered %v; want the settled text with no buttons", layout, remembered)
 	}
 	// A client still showing the old card: the tap carries the old text and
 	// buttons, and is dropped before it acts.
@@ -714,8 +714,8 @@ func TestGchatBoardSettleDuringTheRoundTripStands(t *testing.T) {
 	if body := callBody(t, f.call(1)); body["text"] != "settled: all done" {
 		t.Errorf("the settled message = %q", body["text"])
 	}
-	if _, remembered, moved := a.boardLayoutOf(gchatBoardMessage); remembered || !moved {
-		t.Errorf("record after the settle: remembered %v, moved %v", remembered, moved)
+	if layout, remembered, moved := a.layoutOf(gchatBoardMessage); !remembered || layout.Text != "settled: all done" || !moved {
+		t.Errorf("record after the settle: %+v, remembered %v, moved %v; want the settled text, marked as moved", layout, remembered, moved)
 	}
 	old, err := renderGchatChat(gchatBoardCard())
 	if err != nil {
@@ -934,7 +934,7 @@ func TestGchatBoardFailedEditLetsAConcurrentTapDrawFromItsCopy(t *testing.T) {
 	// The first tap's edit fails while the second is still acting.
 	close(firstGo)
 	waitFor(t, "the first tap's failed edit to forget the record", func() bool {
-		_, remembered, _ := a.boardLayoutOf(gchatBoardMessage)
+		_, remembered, _ := a.layoutOf(gchatBoardMessage)
 		return !remembered
 	})
 	close(secondGo)
@@ -1137,7 +1137,7 @@ func TestGchatBoardLegacyButtonWithoutALineEditsThroughTheFinder(t *testing.T) {
 	if texts := buttonTexts(t, body); strings.Join(texts, ",") != "Retry 1,Drop 1" {
 		t.Errorf("buttons = %v", texts)
 	}
-	if _, remembered, _ := a.boardLayoutOf(gchatBoardMessage); !remembered {
+	if _, remembered, _ := a.layoutOf(gchatBoardMessage); !remembered {
 		t.Fatal("the legacy tap's edit was not remembered")
 	}
 	if _, reason := a.classify(gchatBoardTapAt(t, "drop", 1, "t_1,t_2", "")); !strings.HasPrefix(reason, gchatBoardTaken) {

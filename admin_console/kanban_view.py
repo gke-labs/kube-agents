@@ -13,6 +13,7 @@ BLOCK_KIND_LABELS = {
     "needs_input": "blocked · needs input",
     "capability": "blocked · missing capability",
     "transient": "blocked · temporary failure",
+    "capacity": "blocked · no capacity",
 }
 DONE_LABEL = "done"
 DONE_WITH_PR_LABEL = "done · with a pull request"

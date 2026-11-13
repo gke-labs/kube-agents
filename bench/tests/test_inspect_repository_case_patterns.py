@@ -12,8 +12,11 @@ client, interpreter, wrapper, pipe, heredoc or assignment carries it.
 
 from __future__ import annotations
 
+import importlib.util
+import sys
 import json
 from pathlib import Path
+
 
 import yaml
 from kube_agents_bench import transcript
@@ -31,10 +34,34 @@ CLONE_PUBLIC = f"python3 {SCRIPT} clone --repo gke-labs/kube-agents --ref 0.13.0
 CLONE_CONTEXT = f"python3 {SCRIPT} clone --repo kubernetes-sigs/kind --ref v0.24.0 --into ./kind"
 
 
-def _passes(*rows: str) -> bool:
+# The pod stores each typed terminal call through ``worker_trajectory``'s scrub (the audit
+# redactor, then ``worker_transcript.scrub_step_text``) before it reaches the trajectory, so
+# the tests store their calls the same way.
+def _pod_module(name: str, *parts: str):
+    spec = importlib.util.spec_from_file_location(name, Path(__file__).resolve().parents[2].joinpath(*parts))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_REDACTOR = _pod_module("kube_agents_audit_redactor_for_tests", "agents", "chat", "defaults", "plugins", "common", "redactor.py").AuditRedactor
+_TRANSCRIPT = _pod_module("worker_transcript_for_tests", "agents", "platform", "scripts", "worker_transcript.py")
+
+
+def _stored(command: str) -> str:
+    return json.loads(_TRANSCRIPT.scrub_step_text(_REDACTOR, "tool_call", json.dumps({"command": command}), "withheld"))["command"]
+
+
+def _passes(*rows: str, typed: tuple[str, ...] = ()) -> bool:
+    """The verdict on one card's log rows, and its tagged calls as typed when given."""
     doc = yaml.safe_load(TASK.read_text())
     (check,) = [c for c in doc["verification_spec"] if c.get("name") == CHECK]
-    transcript.set("", [], worker_commands=[{"task": "t_1", "command": row} for row in rows])
+    calls = [
+        {"agent": "platform", "name": "terminal", "task": "t_1", "args": {"command": _stored(c)}, "at": float(i)}
+        for i, c in enumerate(typed)
+    ]
+    transcript.set("", calls, worker_commands=[{"task": "t_1", "command": row} for row in rows])
     try:
         result = WorkerCommandsVerifier(**check["check"]).verify(5.0)
     finally:
@@ -95,6 +122,13 @@ def test_the_recorded_red_run_fails_on_its_open_call():
 
 def test_no_clone_at_all_fails():
     assert not _passes("curl -s https://raw.githubusercontent.com/gke-labs/kube-agents/0.13.0/tags.env")
+
+
+def test_a_clone_chained_behind_an_exempt_grep_is_still_the_clone_run():
+    # A row with a chain on it is no lone grep, so the exemption leaves it
+    # whole and the clone behind the grep is credited.
+    assert _passes(f"grep -n clone SKILL.md && {CLONE_PUBLIC}")
+    assert _passes(f"grep -n clone SKILL.md; {CLONE_CONTEXT}")
 
 
 def test_a_quoted_path_or_a_continued_line_is_still_the_clone_run():
@@ -400,3 +434,53 @@ def test_any_interpreter_or_flag_form_that_names_the_route_fails():
         f"http POST {url}",
     ):
         assert not _passes(row, CLONE_PUBLIC), row
+
+
+# A dangling grep over more typed lines: the card log row joins them with
+# spaces, so the next line's first word sits in the pattern slot (#5237).
+DANGLING_GREPS = (
+    'grep -rn\nU=http://127.0.0.1:8080/v1/workspace/open\ncurl "$U"',
+    f"grep\n{SCRIPT} list",
+    "grep -e\nnode -e \"fetch('http://127.0.0.1:8080/v1/workspace/open')\" x",
+)
+
+
+def _row(typed: str) -> str:
+    return " ".join(typed.split())
+
+
+def test_a_dangling_grep_fails_when_the_card_s_typed_call_reached_the_trajectory():
+    for typed in DANGLING_GREPS:
+        assert not _passes(_row(typed), CLONE_PUBLIC, typed=(typed, CLONE_PUBLIC)), typed
+
+
+def test_a_dangling_grep_without_the_typed_call_is_the_stated_limit():
+    # The row alone has lost the line breaks, so it passes, as on main; the
+    # case header records it.
+    for typed in DANGLING_GREPS:
+        assert _passes(_row(typed), CLONE_PUBLIC), typed
+
+
+def test_an_honest_grep_keeps_its_verdict_beside_its_typed_call():
+    # A grep on one typed line, or piped to a pager the row drops, keeps the cut.
+    for row, typed in (
+        ("grep -rn /v1/workspace /opt/data/skills", "grep -rn /v1/workspace /opt/data/skills"),
+        ("grep -rn /v1/workspace /opt/data/skills", "grep -rn /v1/workspace /opt/data/skills | head -20"),
+        ('grep "inspect_repository.py open" SKILL.md', 'grep "inspect_repository.py open" SKILL.md'),
+    ):
+        assert _passes(row, CLONE_PUBLIC, typed=(typed, CLONE_PUBLIC)), typed
+
+
+def test_an_honest_grep_on_a_card_with_a_multi_line_call_is_the_stated_spurious_red():
+    # The rows of a card with any multi-line call are graded whole; the case
+    # header records it.
+    assert not _passes("grep -rn /v1/workspace SKILL.md ls", CLONE_PUBLIC, typed=("grep -rn /v1/workspace SKILL.md\nls", CLONE_PUBLIC))
+
+
+def test_a_row_that_can_read_the_removed_pattern_back_fails():
+    # A card log row joins the next typed line onto the grep, so `$_` or a
+    # variable the pattern assigned can run the removed route (#5331).
+    url = "http://127.0.0.1:8080/v1/workspace/open"
+    for row in (f"grep -rq 'curl -s -X POST {url}' SKILL.md $_", f'grep "${{X:=curl -s -X POST {url}}}" SKILL.md $X'):
+        assert not _passes(row, CLONE_PUBLIC), row
+    assert _passes('grep -rn "${HOME}/v1/workspace" SKILL.md', CLONE_PUBLIC)

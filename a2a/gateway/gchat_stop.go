@@ -15,15 +15,16 @@ import (
 // terminal edit arrives without Stop and takes the button off, as Edit does.
 // A click on it sends the cancel a typed `stop` sends: it lands on the
 // gateway as IntentCancel with no text, naming the task the button carries
-// and bound to the conversation it carries, for anyone the allowlist admits,
-// and the gateway answers it on the line itself rather than with the typed
-// stop's posts, or, for a task that is not the running one, on the stale
-// line with nothing cancelled (chat_stop_press.go). Slack's Stop is native to
-// its Agent Sessions (slack_stop.go); this one is drawn, since Chat has no
-// such control, and a text line Chat refuses with it is posted or patched
-// once more without it, so the line itself never fails for the button (a
-// laid-out line's refusal is the layout's, and the relay falls back to the
-// text, which then takes the same path).
+// and bound to the conversation it carries, for anyone the allowlist admits.
+// The gateway then takes it from a requester of the thread alone (mayStop in
+// stopgate.go, the rule Slack's button has) and answers it on the line itself
+// rather than with the typed stop's posts, or, for a task that is not the
+// running one, on the stale line with nothing cancelled (chat_stop_press.go).
+// Slack's Stop is native to its Agent Sessions (slack_stop.go); this one is
+// drawn, since Chat has no such control, and a text line Chat refuses with it
+// is posted or patched once more without it, so the line itself never fails
+// for the button (a laid-out line's refusal is the layout's, and the relay
+// falls back to the text, which then takes the same path).
 const (
 	// gchatStopFunction is the onClick action the Stop button sends, with
 	// two parameters: the conversation its line belongs to, since the
@@ -47,6 +48,10 @@ const (
 	gchatStopOtherSpace     = "a stop click naming a conversation outside its space"
 	gchatStopDuplicate      = "duplicate delivery of stop click "
 )
+
+// errGchatNoViewer is PostPrivate's refusal of a viewer that is not a user's
+// resource name, under which the post would be public.
+var errGchatNoViewer = errors.New("gchat: a private post needs a users/ viewer")
 
 // gchatStopButtons appends the Stop button, bound to conversation and
 // naming task, after every button layout carries: in its one button list,
@@ -127,6 +132,13 @@ func (a *GoogleChatAdapter) classifyStop(ev *gchatEvent) (InboundMessage, string
 	if strings.HasPrefix(conversation, gchatDMKeyPrefix) {
 		kind = sessionKindDM
 	}
+	// The clicker's user name travels beside the email, for the one line a
+	// refused press tells them privately (InboundMessage.Viewer); a name
+	// that is not a user's is no viewer, as noteViewer reads it.
+	viewer := click.User.Name
+	if !strings.HasPrefix(viewer, gchatUsersToken) {
+		viewer = ""
+	}
 	return InboundMessage{
 		Conversation: conversation,
 		Kind:         kind,
@@ -135,5 +147,34 @@ func (a *GoogleChatAdapter) classifyStop(ev *gchatEvent) (InboundMessage, string
 		Intent:       IntentCancel,
 		TaskID:       task,
 		Click:        true,
+		Viewer:       viewer,
 	}, ""
 }
+
+// PostPrivate posts text in conversation so that viewer alone sees it
+// (PrivatePoster): spaces.messages.create with privateMessageViewer, as the
+// note card is posted (createCard). viewer must be a user's resource name
+// (users/<id>), since a message with none would be public; any other name
+// is refused with no call made. A private thread reply Chat refuses is
+// posted once more at the space's top level, still private, as the note
+// card is (askForNote).
+func (a *GoogleChatAdapter) PostPrivate(conversation, viewer, text string) error {
+	if !strings.HasPrefix(viewer, gchatUsersToken) {
+		return fmt.Errorf("%w: %q", errGchatNoViewer, viewer)
+	}
+	space, thread, ok := gchatSpaceThread(conversation)
+	if !ok {
+		return fmt.Errorf("gchat: not a gchat conversation: %q", conversation)
+	}
+	body := func() map[string]any {
+		return map[string]any{"text": toGchatText(text), gchatPrivateViewerKey: map[string]any{gchatNameArg: viewer}}
+	}
+	_, _, err := a.create(space, thread, body())
+	if errors.Is(gchatLayoutError(err, false), ErrLayoutRefused) && thread != "" {
+		a.log.Info("gchat: a private line in the thread was refused; posting it at the top level", "space", space, "err", err)
+		_, _, err = a.create(space, "", body())
+	}
+	return err
+}
+
+var _ PrivatePoster = (*GoogleChatAdapter)(nil)

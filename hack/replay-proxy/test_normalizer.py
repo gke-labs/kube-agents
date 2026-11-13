@@ -85,6 +85,30 @@ class IdentifierTest(unittest.TestCase):
         out = normalizer.Normalizer(NOW, False).walk({"current_run_id": 190, "parent_run_id": 7})
         self.assertNotIn("190", json.dumps(out))
 
+    def test_kanban_comment_id_is_swapped(self):
+        # kanban_comment's result: the comment's row id counts every comment on
+        # the install's board, so each run gets a later one (41, then 43).
+        def comment(cid, task="t_57626387"):
+            return {"role": "tool", "tool_call_id": "call_1", "content": json.dumps({
+                "ok": True, "task_id": task, "comment_id": cid, "task_status": "running",
+                "comment_reaches": "the worker running this card right now", "completion_posts_to_chat": True})}
+        self.assertEqual(fp({"model": "m", "messages": [comment(41)]}),
+                         fp({"model": "m", "messages": [comment(43, task="t_f3c26f19")]}))
+        out = normalizer.Normalizer(NOW, False).walk({"comment_id": 41})
+        self.assertEqual(out, {"comment_id": "⟦NUM_1⟧"})
+        self.assertEqual(norm('comment_id: 41'), norm('comment_id: 43'))
+        self.assertEqual(norm('"comment_id": "41"'), '"comment_id": "⟦NUM_1⟧"')
+        # What the card is doing stays in the key.
+        self.assertNotEqual(norm(json.dumps({"comment_id": 41, "task_status": "running"})),
+                            norm(json.dumps({"comment_id": 41, "task_status": "done"})))
+
+    def test_comment_id_lookalikes_stay_literal(self):
+        for text in ('"comment_count": 41', '"comments": 41', 'last_comment_id: 41', 'xcomment_id=41',
+                     'comment 41'):
+            self.assertNotIn("⟦NUM", norm(text), text)
+        out = normalizer.Normalizer(NOW, False).walk({"last_comment_id": 41, "comment_count": 41, "comment_id": "c-41"})
+        self.assertEqual(out, {"comment_count": 41, "comment_id": "c-41", "last_comment_id": 41})
+
     def test_heartbeat_events_are_left_out_of_the_key(self):
         def card(events):
             return norm(json.dumps({"task": {"id": "t_11111111", "status": "running"}, "events": events}))
@@ -248,6 +272,94 @@ class StderrOrderTest(unittest.TestCase):
         warning = "WARNING: something"
         self.assertNotEqual(norm(warning + "\nlimit: 16"), norm(warning + "\nlimit: 64"))
         self.assertEqual(norm(warning), warning)
+
+
+def skill_result(references, scripts, **extra):
+    """A skill_view result as Hermes writes one (tools/skills_tool.py), with its linked files in the order given."""
+    result = {"success": True, "name": "fleet-audit", "tags": ["audit", "fleet"], "related_skills": ["submit-suggestion"],
+              "content": "---\nname: fleet-audit\n---\n# fleet-audit", "path": "fleet-audit/SKILL.md",
+              "linked_files": {"references": references, "scripts": scripts}}
+    result.update(extra)
+    return json.dumps(result)
+
+
+def tool_conversation(tool_name, content, call_id="call_1__thought__QUJD"):
+    """A request whose last message is `content`, returned by a call to `tool_name`."""
+    call = {"id": call_id, "type": "function",
+            "function": {"name": tool_name, "arguments": json.dumps({"name": "fleet-audit"})}}
+    return {"model": "m", "messages": [
+        {"role": "user", "content": "audit the fleet"},
+        {"role": "assistant", "content": "", "tool_calls": [call]},
+        {"role": "tool", "tool_call_id": call_id, "content": content},
+    ]}
+
+
+class SkillViewListingTest(unittest.TestCase):
+    def test_a_notice_hermes_appended_keeps_the_listing_sorted(self):
+        # Hermes appends its iteration-budget warning to the last tool message:
+        # the content is then JSON followed by text, and the listing still keys alike.
+        notice = "\n\n[Iteration budget: 3 of 90 iterations left.]"
+        recorded = skill_result(["references/ledger.md", "references/finish.md"], ["scripts/a.py"]) + notice
+        replayed = skill_result(["references/finish.md", "references/ledger.md"], ["scripts/a.py"]) + notice
+        self.assertEqual(fp(tool_conversation("skill_view", recorded)), fp(tool_conversation("skill_view", replayed)))
+        other = skill_result(["references/finish.md", "references/ledger.md"], ["scripts/a.py"]) + "\n\nanother notice"
+        self.assertNotEqual(fp(tool_conversation("skill_view", recorded)), fp(tool_conversation("skill_view", other)))
+
+    def test_linked_files_in_another_order_key_the_same(self):
+        recorded = skill_result(["references/ledger.md", "references/finish.md"], ["scripts/b.py", "scripts/a.py"])
+        replayed = skill_result(["references/finish.md", "references/ledger.md"], ["scripts/a.py", "scripts/b.py"])
+        self.assertEqual(fp(tool_conversation("skill_view", recorded)), fp(tool_conversation("skill_view", replayed)))
+
+    def test_available_files_in_another_order_key_the_same(self):
+        def missing(files):
+            return json.dumps({"success": False, "error": "File 'x.md' not found in skill 'fleet-audit'.",
+                               "available_files": {"references": files}})
+        self.assertEqual(fp(tool_conversation("skill_view", missing(["references/b.md", "references/a.md"]))),
+                         fp(tool_conversation("skill_view", missing(["references/a.md", "references/b.md"]))))
+
+    def test_a_different_set_of_files_keys_differently(self):
+        one = skill_result(["references/ledger.md", "references/finish.md"], ["scripts/a.py"])
+        other = skill_result(["references/ledger.md", "references/clean-run.md"], ["scripts/a.py"])
+        self.assertNotEqual(fp(tool_conversation("skill_view", one)), fp(tool_conversation("skill_view", other)))
+        moved = skill_result(["references/ledger.md"], ["scripts/a.py", "references/finish.md"])
+        self.assertNotEqual(fp(tool_conversation("skill_view", one)), fp(tool_conversation("skill_view", moved)),
+                            "a file in another group is another listing")
+
+    def test_another_tools_listing_keeps_its_order(self):
+        recorded = skill_result(["references/ledger.md", "references/finish.md"], ["scripts/b.py", "scripts/a.py"])
+        replayed = skill_result(["references/finish.md", "references/ledger.md"], ["scripts/a.py", "scripts/b.py"])
+        self.assertNotEqual(fp(tool_conversation("read_file", recorded)), fp(tool_conversation("read_file", replayed)))
+
+    def test_a_result_answering_no_skill_view_call_keeps_its_order(self):
+        # The call is matched by id: a tool message naming another call is not read as skill_view's.
+        recorded = skill_result(["references/ledger.md", "references/finish.md"], ["scripts/a.py"])
+        replayed = skill_result(["references/finish.md", "references/ledger.md"], ["scripts/a.py"])
+
+        def answering_other(content):
+            body = tool_conversation("skill_view", content)
+            body["messages"][-1] = dict(body["messages"][-1], tool_call_id="call_2")
+            return body
+        self.assertNotEqual(fp(answering_other(recorded)), fp(answering_other(replayed)))
+
+    def test_the_results_other_fields_are_unchanged(self):
+        content = skill_result(["references/ledger.md", "references/finish.md"], ["scripts/b.py", "scripts/a.py"])
+        walked = normalizer.normalize_request(tool_conversation("skill_view", content), NOW).messages[-1]
+        expected = json.loads(content)
+        expected["linked_files"] = {"references": ["references/finish.md", "references/ledger.md"],
+                                    "scripts": ["scripts/a.py", "scripts/b.py"]}
+        self.assertEqual(json.loads(walked["content"]), expected)
+        self.assertEqual(json.loads(walked["content"])["tags"], ["audit", "fleet"], "tags keep their order")
+        flipped = skill_result(["references/ledger.md", "references/finish.md"], ["scripts/b.py", "scripts/a.py"],
+                               tags=["fleet", "audit"])
+        self.assertNotEqual(fp(tool_conversation("skill_view", content)), fp(tool_conversation("skill_view", flipped)))
+
+    def test_a_result_already_in_order_keeps_its_text(self):
+        content = skill_result(["references/a.md"], ["scripts/a.py"])
+        message = {"role": "tool", "tool_call_id": "call_1", "content": content}
+        walker = normalizer.Normalizer(NOW, keep_ips=False)
+        walker.skill_view_calls.add("call_1")
+        self.assertIs(walker.skill_listings_sorted(message), message)
+        self.assertEqual(normalizer.sorted_skill_listings("<persisted-output>"), "<persisted-output>")
 
 
 class AnswerSlotTest(unittest.TestCase):
@@ -1019,6 +1131,118 @@ class AnswerMappingTest(unittest.TestCase):
             self.assertFalse(mapping.answer_repeats_bare_number(answer), answer)
         for answer in ("generation=1", "observedGeneration: 1", "the generation is 1"):
             self.assertTrue(mapping.answer_repeats_bare_number(answer), answer)
+
+
+    def test_an_answer_repeating_a_comment_id_is_refused(self):
+        # A row id is never swapped into an answer, so one repeating it is not
+        # stored: replayed, it would name the recording's comment.
+        tool = {"role": "tool", "tool_call_id": "call_1",
+                "content": json.dumps({"ok": True, "task_id": "t_11111111", "comment_id": 41})}
+        mapping = normalizer.normalize_request({"model": "m", "messages": [tool]}, NOW).mapping
+        self.assertEqual(mapping.apply_to_answer("posted comment 41"), "posted comment 41")
+        for answer in ("posted comment 41 on the card", "comment #41", '{"comment_id": 41}', "comment_id is 41",
+                       "Comment 41 has been posted", "Comment #41:", "COMMENT 41"):
+            self.assertTrue(mapping.answer_repeats_bare_number(answer), answer)
+        for answer in ("41 pods are pending", "comments 41", "port 41", "comment_id 410", "commented 41 times"):
+            self.assertFalse(mapping.answer_repeats_bare_number(answer), answer)
+
+    def test_the_word_comment_counts_only_against_a_comment_id(self):
+        # "comment" is an ordinary word: an answer putting another key's swapped
+        # number after it (a generation, a row id) is still stored.
+        tool = {"role": "tool", "tool_call_id": "call_1",
+                "content": json.dumps({"metadata": {"generation": 2, "id": 7}, "status": {"observedGeneration": 2}})}
+        mapping = normalizer.normalize_request({"model": "m", "messages": [tool]}, NOW).mapping
+        for answer in ("I left a comment: 2 pods are pending", "Here is the comment:\n\n2. Root cause",
+                       "comment (7)", "kubectl annotate deploy/web comment=2"):
+            self.assertFalse(mapping.answer_repeats_bare_number(answer), answer)
+        self.assertTrue(mapping.answer_repeats_bare_number("generation: 2"))
+        # The same word does count once a comment id was swapped, in text as in JSON.
+        text = {"role": "tool", "tool_call_id": "call_2", "content": "posted, comment_id: 2"}
+        mapping = normalizer.normalize_request({"model": "m", "messages": [text]}, NOW).mapping
+        self.assertTrue(mapping.answer_repeats_bare_number("I left a comment: 2 pods are pending"))
+
+class HistorySwapTest(unittest.TestCase):
+    """An answer comes back in the next request's history keyed as apply_to_answer stored it."""
+
+    OP_RECORDED = "1793806478493-11b21f18-4eef-47ea-8ce1-fbd3c40047b3"
+    OP_REPLAYED = "1792900340178-5482a62f-d7e3-4c54-bb09-236983a9dfb7"
+
+    @staticmethod
+    def turn(shown, said):
+        return {"model": "m", "messages": [{"role": "user", "content": "go"},
+                                           {"role": "tool", "tool_call_id": "call_1", "content": shown},
+                                           {"role": "assistant", "content": said}]}
+
+    def assert_keys_alike(self, shown, said, recorded, replayed, expected):
+        a = normalizer.normalize_request(self.turn(shown.format(*recorded), said.format(*recorded)), NOW)
+        b = normalizer.normalize_request(self.turn(shown.format(*replayed), said.format(*replayed)), NOW)
+        self.assertEqual(a.messages[2]["content"], expected)
+        self.assertEqual(a.messages, b.messages)
+        self.assertEqual(fp(self.turn(shown.format(*recorded), said.format(*recorded))),
+                         fp(self.turn(shown.format(*replayed), said.format(*replayed))))
+        # The history keys the answer as record mode stored it.
+        asked = dict(self.turn(shown.format(*recorded), ""), messages=self.turn(shown.format(*recorded), "")["messages"][:2])
+        self.assertEqual(normalizer.normalize_request(asked, NOW).mapping.apply_to_answer(said.format(*recorded)), expected)
+
+    def test_a_bare_commit_in_history_keys_the_same_across_runs(self):
+        self.assert_keys_alike("cloned acme/app@{}", "git -C app checkout {}", ("c99b1ab",), ("4f1e414",),
+                               "git -C app checkout ⟦COMMIT_1⟧")
+
+    def test_a_commit_equal_to_a_bound_uuids_segment_never_splits_it(self):
+        # apply_to_answer's order: the bound uuid is looked up before the
+        # bare-commit swap, so the commit equal to its first segment stays inside it.
+        self.assert_keys_alike("cloned acme/app@{0} uid {1}", "uid {1}",
+                               ("11b21f18", "11b21f18-4eef-47ea-8ce1-fbd3c40047b3"),
+                               ("5482a62f", "5482a62f-d7e3-4c54-bb09-236983a9dfb7"),
+                               "uid ⟦UID_1⟧")
+
+    def test_a_bound_suffix_token_outside_its_pattern_keys_the_same(self):
+        self.assert_keys_alike("cloned into /opt/data/scratch/declared-intent-{}; newest operation-{}",
+                               "mv clone-{} old_{}", ("j77z8q6q", self.OP_RECORDED), ("a2_elobt", self.OP_REPLAYED),
+                               "mv clone-⟦TMPNAME_1⟧ old_⟦GKEOP_1⟧")
+
+    def test_the_answer_slot_check_agrees(self):
+        asked = {"model": "m", "messages": self.turn("cloned acme/app@{}", "")["messages"][:2]}
+        identities = set()
+        for sha in ("c99b1ab", "4f1e414"):
+            body = json.loads(json.dumps(asked).replace("{}", sha))
+            identities.add(normalizer.answer_in_context(body, {"role": "assistant", "content": f"checkout {sha}"}, NOW))
+        self.assertEqual(len(identities), 1)
+
+    def test_lookalikes_stay_literal(self):
+        full = "c99b1ab1fee80c1d2e3f40516273849a5b6c7d8e"
+        for shown, said in (
+            # Another commit, a longer and a shorter run, a run inside a word, and too short to be a commit.
+            ("cloned acme/app@c99b1ab", "checkout c99b1ac c99b1ab0 xc99b1ab c99b1a deadbeef1"),
+            # An abbreviation of a bound commit: no exact run, as apply_to_answer reads it.
+            (f"cloned acme/app@{full}", "checkout c99b1ab"),
+            # A bound tail inside a longer word.
+            ("cloned into declared-intent-j77z8q6q", "rm xj77z8q6q j77z8q6qx"),
+        ):
+            with self.subTest(said=said):
+                n = normalizer.normalize_request(self.turn(shown, said), NOW)
+                self.assertEqual(n.messages[2]["content"], said)
+        # Only an assistant message, and only with values bound before it.
+        n = normalizer.normalize_request({"model": "m", "messages": [
+            {"role": "assistant", "content": "checkout c99b1ab"},
+            {"role": "tool", "tool_call_id": "call_1", "content": "cloned acme/app@c99b1ab; at c99b1ab"},
+        ]}, NOW)
+        self.assertEqual(n.messages[0]["content"], "checkout c99b1ab")
+        self.assertEqual(n.messages[1]["content"], "cloned acme/app@⟦COMMIT_1⟧; at c99b1ab")
+
+    def test_a_request_without_such_a_repeat_keys_as_before(self):
+        n = normalizer.normalize_request({"model": "m", "messages": [
+            {"role": "user", "content": "work t_11111111 on web-7d4b9c8f6d-x2k9p"},
+            {"role": "tool", "tool_call_id": "call_1", "content": "cloned acme/app@c99b1ab pid 4821 at 10.1.2.3"},
+            {"role": "assistant", "content": "web-7d4b9c8f6d-x2k9p restarted 5m ago, pid 4822, see acme/app@c99b1ab",
+             "tool_calls": [{"id": "call_2", "type": "function", "function": {
+                 "name": "terminal", "arguments": json.dumps({"command": "kubectl get pod web-5f6c7d8b9c-m8n7q"})}}]},
+        ]}, NOW)
+        self.assertEqual(n.messages[2], {
+            "content": "web-⟦POD_1⟧ restarted ⟦AGEm_1⟧ ago, pid ⟦NUM_2⟧, see acme/app@⟦COMMIT_1⟧", "role": "assistant",
+            "tool_calls": [{"function": {"arguments": json.dumps({"command": "kubectl get pod web-⟦POD_2⟧"}, ensure_ascii=False),
+                                         "name": "terminal"}, "id": "⟦OPAQUE_2⟧", "type": "function"}]})
+        self.assertEqual(n.mapping.counts, {"TASK": 1, "POD": 2, "COMMIT": 1, "NUM": 2, "OPAQUE": 2, "IP": 1, "AGEm": 1})
 
 
 if __name__ == "__main__":

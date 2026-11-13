@@ -32,6 +32,11 @@ _TARGET_VAR_MODIFIERS = frozenset({"export", "unexport", "override", "private", 
 _RECIPE_PREFIX_RE = re.compile(r"^\t([@+ \t-]*)")
 _EXACT_MAKE_STEP_RE = re.compile(r"^make (?P<target>docs-check-[a-z0-9-]+)$")
 _PINNED_CHECKOUT_RE = re.compile(r"^actions/checkout@[0-9a-f]{40}$")
+# The one tool-setup step allowed, as step #1: helm for the install footprint
+# tables `make docs-check-generated` renders from the chart, pinned by commit and
+# told only which helm release to install.
+_PINNED_SETUP_HELM_RE = re.compile(r"^azure/setup-helm@[0-9a-f]{40}$")
+_ALLOWED_SETUP_HELM_WITH_KEYS = frozenset({"version"})
 
 _MAKE_ENV_VARIABLES = ("MAKEFLAGS", "GNUMAKEFLAGS", "MAKEFILES", "MFLAGS")
 _FAIL_FAST_SHELLS = (None, "bash", "sh")
@@ -240,6 +245,14 @@ def validate_docs_check_workflow(
         if not isinstance(step, dict):
             raise ValueError(f"step #{index} in `{_JOB_ID}` must be a mapping")
         step_label = step.get("name", f"step #{index}")
+        if "run" not in step and index == 1 and _PINNED_SETUP_HELM_RE.match(str(step.get("uses", ""))):
+            extra_helm_keys = sorted(set(step) - _ALLOWED_CHECKOUT_STEP_KEYS)
+            helm_with = step.get("with")
+            if extra_helm_keys or not isinstance(helm_with, dict) or set(helm_with) != _ALLOWED_SETUP_HELM_WITH_KEYS:
+                raise ValueError(
+                    f"setup-helm step {step_label!r} may carry only name, uses and `with: {{version: ...}}`"
+                )
+            continue
         if "run" not in step:
             if index != 0:
                 raise ValueError(
@@ -357,6 +370,38 @@ class DocsCheckWorkflowTest(unittest.TestCase):
             targets,
             [target for target in prereqs if target not in PENDING_WORKFLOW_TARGETS],
         )
+
+    def test_setup_helm_is_pinned_and_matches_chart_check(self) -> None:
+        # The footprint tables and chart-check render the same chart; the same action
+        # commit and helm release keep the two from rendering it differently.
+        def helm_step(path: pathlib.Path, job: str) -> dict:
+            steps = yaml.safe_load(path.read_text(encoding="utf-8"))["jobs"][job]["steps"]
+            return next(s for s in steps if str(s.get("uses", "")).startswith("azure/setup-helm@"))
+
+        docs = helm_step(_WORKFLOW_PATH, _JOB_ID)
+        validate = yaml.safe_load((_REPO_ROOT / ".github/workflows/validate.yml").read_text(encoding="utf-8"))
+        chart_check_job = next(
+            name for name, job in validate["jobs"].items()
+            if any(str(s.get("run", "")).strip() == "make chart-check" for s in job.get("steps", []))
+        )
+        chart_check = helm_step(_REPO_ROOT / ".github/workflows/validate.yml", chart_check_job)
+        self.assertEqual(docs["uses"], chart_check["uses"])
+        self.assertEqual(docs["with"], chart_check["with"])
+
+    def test_setup_helm_by_tag_or_with_extra_inputs_is_refused(self) -> None:
+        text = _WORKFLOW_PATH.read_text(encoding="utf-8")
+        doc = yaml.safe_load(text)
+        steps = doc["jobs"][_JOB_ID]["steps"]
+        prereqs = [str(step["run"]).split()[-1] for step in steps if "run" in step]
+        # The committed workflow passes, so each refusal below is the mutation's.
+        self.assertEqual(validate_docs_check_workflow(text, prereqs), prereqs)
+        uses = steps[1]["uses"]
+        for mutated in (
+            text.replace(uses, "azure/setup-helm@v5"),
+            text.replace("version: v4.2.3", "version: v4.2.3\n          token: x"),
+        ):
+            with self.assertRaises(ValueError):
+                validate_docs_check_workflow(mutated, prereqs)
 
     def test_dropping_prose_step_from_committed_workflow_fails(self) -> None:
         prereqs = makefile_docs_check_prereqs()

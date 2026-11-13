@@ -1785,8 +1785,8 @@ def summarise(
 
     # The cap and the pool size are set in two different repositories, so
     # nothing keeps them in step. A cap below the pool leaves the extra projects
-    # unreachable: they sit free while runs queue, which from outside reads
-    # exactly like a control-plane stall.
+    # to the other jobs: they sit free while presubmit runs queue, which from
+    # outside reads exactly like a control-plane stall.
     stranded = (
         max(0, pool_state.total - concurrency)
         if pool_state is not None and concurrency is not None
@@ -2095,7 +2095,7 @@ def render(summary: dict) -> str:
     if pool["stranded"] > 0:
         out.append(
             f"\n[!] The cap ({concurrency}) is below the pool ({pool['total']}): "
-            f"{pool['stranded']} project(s) can never be leased."
+            f"{pool['stranded']} project(s) are out of the presubmit's reach, the other jobs' room."
         )
 
     releasing = summary["releasing_leases"]
@@ -2249,7 +2249,7 @@ def cause(
     while the report prints the prose underneath.
 
     Three causes look identical from the outside -- runs queue, nothing fails --
-    and they have three different remedies, one of which costs a project.
+    and they call for three different things, one of which costs a project.
 
     Ordered by what can be ruled out cheapest. A full pool is unambiguous. A
     pool with free projects that nothing can reach is the concurrency cap, and
@@ -2316,9 +2316,9 @@ def _wait_cause(
             )
         lines += [
             "",
-            "Raise the cap in oss-test-infra's kube-agents presubmit to the number of",
-            "leasable projects before onboarding anything: the projects to absorb this",
-            "queue already exist and are being paid for.",
+            "The pool is shared: the gap between the cap and the pool is the share the",
+            "nightly, today, GitLab and reconcile jobs lease from. Moving the cap trades",
+            "presubmit throughput against their room, and is a human decision.",
         ]
         return CAUSE_CONCURRENCY_CAP, lines
 

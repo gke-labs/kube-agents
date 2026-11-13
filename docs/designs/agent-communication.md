@@ -13,7 +13,7 @@
 The platform is a **decoupled, persona-based** system:
 
 - **Platform Agent** — one Hermes profile (the `platform` profile). Fleet-wide synthesis. It is not the chat front door: the `default` profile is the Chat Agent, which owns chat ingress and delegates to this one (§6.1).
-- **Cluster subagent** — one Hermes profile **per managed cluster**, co-located in the same pod for the MVP. Runs its own cron for periodic local scans, and processes delegated tasks.
+- **Cluster subagent** — one Hermes profile **per managed cluster**, co-located in the same pod for the MVP. It processes delegated tasks and ships no `cron/jobs.json` (`profile_cron_tick.py` skips any profile directory without a `cron/jobs.json`; see [`scheduling-on-profiles.md`](scheduling-on-profiles.md)).
 
 Two communication channels, with different shapes and different reliability requirements:
 
@@ -258,9 +258,9 @@ The MVP starts with `health` and `utilization`; the others are added as their CU
 ### 2.7 Concurrency, atomicity, retention
 
 - **Atomic writes** (same-directory temp + `fsync` + `os.replace`) — no torn reads, crash-safe (matches the `save_job_output` recipe).
-- **Latest-wins** — each `(cluster, location, type)` is a single file, overwritten each cycle. No history in the handover layer (history lives in cron output / logs if needed).
-- **Staleness** — readers honor `expires_at`; producers set a `ttl_seconds` sized to their scan cadence (e.g. a 5-minute health scan → `ttl ≈ 15m`).
-- **Concurrent writers within a profile** — the persistent cron context and any transient worker share the profile; if both could write the same handover file, wrap the helper's write in an `flock` (the `_jobs_lock` pattern). Low risk (distinct types, low cadence) but cheap to harden.
+- **Latest-wins** — each `(cluster, location, type)` is a single file, overwritten each cycle. No history in the handover layer.
+- **Staleness** — readers honor `expires_at`; producers set a `ttl_seconds` sized to the expected refresh cadence (e.g. a 5-minute refresh → `ttl ≈ 15m`).
+- **Concurrent writers within a profile** — if two workers for the same profile (or a future scheduled writer) could write the same handover file concurrently, wrap the helper's write in an `flock` (the `_jobs_lock` pattern). Low risk (distinct types, low cadence) but cheap to harden.
 
 ### 2.8 No generic interface now; the write helper is the migration seam
 

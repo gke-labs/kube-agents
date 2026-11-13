@@ -77,7 +77,7 @@ store reads, or the collecting turn, which is a model call the customer never ma
 
 The consequence, measured: the presubmit matrix ran under `mode: next` with the A2A gateway in
 `ErrImagePull`, the auth callout in `ImagePullBackOff` and the provisioning Job in `Error`, and
-the job went GREEN (build `2100310325382352896`, admitted-case pass rate 90.0%, no case
+the job went GREEN (build `2100310325382352896`: the admitted-case pass rate inside the margin, no case
 collapsed, every failing repetition a phrase miss the same cases carry under `today`). The gate
 cannot red on a broken next stack until a case sends through it. The same measurement found
 nothing that passed under `today` and failed reproducibly under `next`, which is the other half
@@ -472,12 +472,12 @@ with the `platform_toolsets.cli` bundle: `terminal`, `read_file`, `patch`, `proc
 from the one today's evals reach. The api transport posts to the API server, which runs the
 default profile, the Planning Agent: its model-facing tools are the kanban set, it delegates fleet
 work to the platform persona over a card, and it relays the worker's report. Same prompt, two
-agents reading it: `obtainability-remediation-proposal` is 12 of 12 on the first, where the
-Planning Agent inlines a manifest, and was 0 of 3 on the second, where the persona followed its own
+agents reading it: `obtainability-remediation-proposal` is clean on the first, where the
+Planning Agent inlines a manifest, and collapsed on the second, where the persona followed its own
 rule and opened a pull request (the rule has since been scoped, in `agents/platform/SOUL.md` §3: a
 request to investigate or report is answered in the reply, and a pull request is opened only when
 the request asks for one or for a change to be submitted or fixed; the unattended case is
-`fleet-audit`'s own path); the first run's 94.4% against 77.8% is withdrawn as a like-for-like
+`fleet-audit`'s own path); the first run's rate comparison of the two is withdrawn as a like-for-like
 comparison. The lane now runs the bridge's `api` executor, the default a customer install runs,
 so the turn is the API server's and the agent that answers is the Planning Agent, the one the api
 transport reaches. The delegation wait reads the cards the turn filed from the Planning Agent's
@@ -496,8 +496,11 @@ reaches the delegation ceiling or when the wait falls back, nor a card whose exc
 transport cut before the wait began. A write from one of those that lands in a later first-phase
 unit's window is unattributed there. A second-phase unit (a requesting case, a stopped ask, a
 `writes_alone` case) runs alone and its window is marked exclusive, so the CI script archives
-every card still live before each such unit, then settles. A fence that could not run is a
-`Card fence` warning in the run log; read a block on that unit after one as transport. Parity in
+every card still live before each such unit, then settles. A fence that ran and left a card live is a
+`Card fence` warning in the run log; read a block on that unit after one as transport. A fence skipped for a missing
+prerequisite warns and the unit runs. A fence that could not run to its verdict after its attempts, no
+Ready gateway pod or an exec that did not reach the container, leaves the unit unlaunched and recorded
+as infrastructure, so no block follows it. Parity in
 [#2007](https://github.com/gke-labs/kube-agents/issues/2007) (phase 2) is this lane's record on
 `api` being acceptable per case and stable across the on-demand runs, not the api lane's numbers.
 Two things follow for the lane. A case that grades the delegation
@@ -674,9 +677,11 @@ the TASKS budget counts its workers from the first `next` render, so the mode ch
 change and the one provisioning Job is already sized for the bridge. The bridge enters the agent
 pod only once the bus is provisioned (the CR's `BusProvisioned` condition), so the agent
 Deployment rolls twice, once for the mode change and once after the Job for the bridge, and the
-step gates both rolls. The step ends on the
+step gates both rolls. The step waits for the
 bridge's own log line that it is consuming `platform` tasks, because a flip without a consuming
-bridge leaves a bus on which nobody answers. It reports the A2A gateway's state and last log
+bridge leaves a bus on which nobody answers, then gates the verifier's rollout and the web
+console under `next` (the same read routes and chat turn the deploy gated under `today`, through
+the console's port-forward). It reports the A2A gateway's state and last log
 lines and does not gate on it: the door gives the gateway the backend it lacked, so it now
 starts, but a gateway that is down is what the harness classifies as infrastructure on every
 case, and gating it is the change that follows the first measured run through the door. The
@@ -714,8 +719,10 @@ since nobody reads the report there and the today lane below proves the same pat
 and back to `next`, with any CR-declared `spec.deployment.sidecars` unset before the first flip
 and declared again after the second (the lane declares none: the bridge the operator renders
 leaves and returns with the mode), and asserts that the JetStream PVC and the bus creds Secret keep their
-UIDs, that the agent answers a turn under `today`, and that a task completes over the bus
-afterwards. It is reported, not gated: its own section of the log and two artifacts
+UIDs, that the agent answers a turn under `today`, that a task completes over the bus
+afterwards, and, before the first flip and after each leg, that the web console's read routes
+answer and a chat turn through it gets a reply (a `SKIP` on an install with no console, which the
+lane always has). It is reported, not gated: its own section of the log and two artifacts
 (`rollback-roundtrip.log`, `rollback-roundtrip.txt`), no case in the matrix, and no effect
 on the job's exit status. It is skipped when the job is too old for its one-hour bound to end
 inside the job's deadline, counted from its Prow `BUILD_ID` or, when that gives no start, from
@@ -743,7 +750,7 @@ the batch runs Tide started, the main nightly's eight parts
 `ci-kube-agents-eval-nightly`, `ci-kube-agents-eval-nightly-main-b` to `-main-e`,
 `ci-kube-agents-eval-nightly-writers`, `-writers-b` and `-writers-c`, the GitLab lane's nightly
 under next, the GHES and GitLab CE lanes' weekly jobs under next (`ci-kube-agents-eval-weekly-ghes-next`, `ci-kube-agents-eval-weekly-gitlab-ce-next`), the certification lane's first slice (`ci-kube-agents-certification-1`), and the release-candidate eval's postsubmit, which grades a candidate in the mode a new
-install gets), and refuses it on any other Prow run, so the flag mis-set on the today-mode GitLab nightly or another
+install gets), and refuses it on any other Prow run, so the flag mis-set on another periodic or
 postsubmit still stops the deploy before anything is built. A next-mode run has a record of its own: the baseline version key carries the mode, which
 `bench-gate` reads off the inject transport ([`bench/baselines/README.md`](../../bench/baselines/README.md)),
 so the main nightly appends under a `next` key that today's window never reads, and rung 6 on the

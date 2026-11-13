@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -113,6 +114,7 @@ func TestNewHandlerValidatesConfig(t *testing.T) {
 		"no upstream":      func(c *Config) { c.Upstream = nil },
 		"no mode":          func(c *Config) { c.Policy.Mode = "" },
 		"unknown mode":     func(c *Config) { c.Policy.Mode = "READ-ONLY" },
+		"negative cap":     func(c *Config) { c.MaxInFlight = -1 },
 	} {
 		cfg := ok
 		mutate(&cfg)
@@ -322,6 +324,68 @@ func TestHandlerUpgrade(t *testing.T) {
 	}
 	if upstream.calls != 0 {
 		t.Error("a refused upgrade reached the upstream")
+	}
+}
+
+func TestHandlerMaxInFlight(t *testing.T) {
+	const blockedPath = "/api/v1/pods"
+	entered, gate := make(chan struct{}), make(chan struct{})
+	// release frees the held request on a failed assertion too, so its goroutine does not leak.
+	release := sync.OnceFunc(func() { close(gate) })
+	t.Cleanup(release)
+	upstream := &fakeUpstream{handler: func(_ string, req *http.Request) (*http.Response, error) {
+		if req.URL.Path == blockedPath {
+			close(entered)
+			<-gate
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{contentTypeJSON}},
+			Body:       io.NopCloser(strings.NewReader(`{"kind":"PodList","apiVersion":"v1","items":[]}`)),
+		}, nil
+	}}
+	metrics := NewMetrics()
+	h, _ := newTestHandler(t, Config{Upstream: upstream, Metrics: metrics, MaxInFlight: 1})
+	get := func(path string) *httptest.ResponseRecorder {
+		return serve(h, httptest.NewRequest(http.MethodGet, "/clusters/"+gkeHost+path, nil))
+	}
+
+	held := make(chan *httptest.ResponseRecorder, 1)
+	go func() { held <- get(blockedPath) }()
+	<-entered
+
+	rec := get("/api/v1/namespaces")
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("over the cap: code = %d, want 429", rec.Code)
+	}
+	if got := rec.Header().Get(headerRetryAfter); got != retryAfterSeconds {
+		t.Errorf("Retry-After = %q, want %q", got, retryAfterSeconds)
+	}
+	if s := decodeStatus(t, rec); s.Reason != metav1.StatusReasonTooManyRequests {
+		t.Errorf("reason = %q, want TooManyRequests", s.Reason)
+	}
+	if want := `outcome="throttled",resource="namespaces",status_code="429"`; !strings.Contains(scrapeMetricsText(t, metrics), want) {
+		t.Errorf("metrics lack %q", want)
+	}
+	for name, path := range map[string]string{
+		"watch": "/api/v1/namespaces?watch=true",
+		"log":   "/api/v1/namespaces/default/pods/web/log",
+	} {
+		if rec := get(path); rec.Code != http.StatusOK {
+			t.Errorf("%s over the cap: code = %d, want 200: long-running requests take no slot", name, rec.Code)
+		}
+	}
+	write := httptest.NewRequest(http.MethodPost, "/clusters/"+gkeHost+"/api/v1/namespaces/default/configmaps", strings.NewReader(`{}`))
+	if rec := serve(h, write); rec.Code != http.StatusForbidden {
+		t.Errorf("refused write over the cap: code = %d, want 403: the policy answers before the cap", rec.Code)
+	}
+
+	release()
+	if rec := <-held; rec.Code != http.StatusOK {
+		t.Fatalf("held request: code = %d, want 200", rec.Code)
+	}
+	if rec := get("/api/v1/namespaces"); rec.Code != http.StatusOK {
+		t.Errorf("after the held request finished: code = %d, want 200", rec.Code)
 	}
 }
 

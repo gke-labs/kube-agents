@@ -42,7 +42,7 @@ const defaultScopeFile = "/etc/kube-agents/scope.json"
 
 // defaultGchatTokenPath is where the operator projects the gateway's
 // relay-audience ServiceAccount token when the gchat backend is armed.
-const defaultGchatTokenPath = "/var/run/secrets/a2a-chat-relay/token"
+const defaultGchatTokenPath = "/var/run/secrets/a2a-chat-relay/token" // #nosec G101 -- a path, not a credential
 
 // envGchatHomeChannel carries the Chat home space the chat.notify route posts
 // to (notify.go); the operator renders it from googleChat.homeChannel.
@@ -51,6 +51,12 @@ const envGchatHomeChannel = "A2A_GCHAT_HOME_CHANNEL"
 // envSlackHomeChannel carries the Slack home channel's id the chat.notify
 // route posts to; the operator renders it from slack.homeChannel.
 const envSlackHomeChannel = "A2A_SLACK_HOME_CHANNEL"
+
+// EnvSlackTestUsers carries Config.SlackTestUsers, comma-separated; the
+// operator renders it from its own environment of the same name, never from
+// the CR, so only an install whose operator was deployed with it (CI, eval)
+// has it.
+const EnvSlackTestUsers = "A2A_SLACK_TEST_USERS"
 
 // The learned-home contract (slack_home_channel.go): the operator renders the
 // policy from slack.homeChannelPolicy, the record ConfigMap's name, the
@@ -250,6 +256,20 @@ type Config struct {
 	// mirroring the legacy SLACK_ALLOW_ALL_USERS posture. Another
 	// workspace's member is still refused.
 	SlackAllowAllUsers bool
+	// SlackTestUsers are the Slack member ids of end-to-end test users
+	// (EnvSlackTestUsers), meant for CI and eval installs; the allowlist
+	// (A2A_SLACK_ALLOWED_USERS) is still the gate on who is served. A message such a
+	// user posts with a user token through an app carries the app's bot_id,
+	// which the Slack adapter otherwise drops as bot traffic; from a listed
+	// member it is read as theirs (SlackAdapter.SetTestUsers). Every other
+	// gate still applies, and the allowlist must still admit them.
+	SlackTestUsers []string
+	// RelayPrecreated binds the event relay to the durable the provision Job
+	// created rather than creating it (#4173): the operator sets
+	// A2A_GATEWAY_RELAY_PRECREATED=true beside a grant that denies this
+	// principal the create on that name. Off, as in tests and a hand-run
+	// gateway, the relay creates its own durable as before.
+	RelayPrecreated bool
 
 	// TargetAllowedUsers is the per-target, per-backend trusted-human
 	// allowlist a session's delegation is checked against: target ->
@@ -545,6 +565,9 @@ type Config struct {
 	SessionClusterView     bool
 	CredentialProxyURL     string
 	CredentialProxyExecURL string
+	KubeProxyURL           string
+	KubeProxyCAConfigMap   string
+	KubeProxyHostContext   string
 
 	// StrictEventsWriter makes the `…events` writer-class agreement check a
 	// refusal instead of a counted advisory (A2A_STRICT_EVENTS_WRITER=true).
@@ -629,6 +652,12 @@ type Config struct {
 	// entry that matches it, as the reconcile does. Empty admits nothing
 	// extra.
 	ManagementProject string
+
+	// ResolvedScopeConfigMap names the ConfigMap the scope publisher writes
+	// the resolved scope into (A2A_RESOLVED_SCOPE_CONFIGMAP), which
+	// Gateway.checkScope reads for a target a folder, organization or selector
+	// reaches. Empty leaves such a target unconfirmed.
+	ResolvedScopeConfigMap string
 
 	// BusyNoticeAt is how many tasks have to be ahead of a new fixed-route
 	// turn before the gateway marks the turn's status line queued
@@ -719,11 +748,15 @@ func FromEnv() (*Config, error) {
 		SessionClusterView:     os.Getenv("A2A_SESSION_CLUSTER_VIEW") == "true",
 		CredentialProxyURL:     os.Getenv("A2A_CREDENTIAL_PROXY_URL"),
 		CredentialProxyExecURL: os.Getenv("A2A_CREDENTIAL_PROXY_EXEC_URL"),
+		KubeProxyURL:           os.Getenv("A2A_KUBE_PROXY_URL"),
+		KubeProxyCAConfigMap:   os.Getenv("A2A_KUBE_PROXY_CA_CONFIGMAP"),
+		KubeProxyHostContext:   os.Getenv("A2A_KUBE_PROXY_HOST_CONTEXT"),
 		AuthorityTier:          capability.Tier(envOr("A2A_AUTHORITY_TIER", string(capability.TierDeveloperTeam))),
 		AuthorityScope:         capability.Scope(os.Getenv("A2A_AUTHORITY_SCOPE")),
 		CapabilityOptional:     capability.OptionalFromEnv(),
 		ScopeFile:              envOr("A2A_SCOPE_FILE", defaultScopeFile),
 		ManagementProject:      os.Getenv("A2A_MANAGEMENT_PROJECT"),
+		ResolvedScopeConfigMap: os.Getenv("A2A_RESOLVED_SCOPE_CONFIGMAP"),
 	}
 	cfg.GchatRelayURL = os.Getenv("A2A_GCHAT_RELAY_URL")
 	cfg.GchatTokenPath = envOr("A2A_GCHAT_TOKEN_PATH", defaultGchatTokenPath)
@@ -768,6 +801,8 @@ func FromEnv() (*Config, error) {
 		}
 	}
 	cfg.SlackAllowAllUsers = os.Getenv("A2A_SLACK_ALLOW_ALL_USERS") == "true"
+	cfg.SlackTestUsers = splitList(os.Getenv(EnvSlackTestUsers))
+	cfg.RelayPrecreated = os.Getenv("A2A_GATEWAY_RELAY_PRECREATED") == "true"
 	cfg.InjectListen = strings.TrimSpace(os.Getenv("A2A_INJECT_LISTEN"))
 	cfg.InjectToken = strings.TrimSpace(os.Getenv("A2A_INJECT_TOKEN"))
 	cfg.InjectPrincipalMapPath = envOr("A2A_INJECT_PRINCIPAL_MAP", defaultInjectPrincipalMapPath)

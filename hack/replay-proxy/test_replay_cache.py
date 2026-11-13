@@ -30,6 +30,14 @@ ANSWER = {
 }
 
 
+class LayoutTest(unittest.TestCase):
+    def test_a_name_with_a_trailing_newline_is_outside_the_layout(self):
+        for rel in (f"answers/{'a' * 64}.json", f"variants/{'a' * 16}/{'b' * 16}.json"):
+            with self.subTest(rel=rel):
+                self.assertTrue(replay_cache.CACHE_REL_RE.match(rel))
+                self.assertIsNone(replay_cache.CACHE_REL_RE.match(rel + "\n"))
+
+
 class NormalizeRestoreTest(unittest.TestCase):
     def test_round_trip_puts_the_current_values_in(self):
         saved = replay_cache.normalize_answer(ANSWER, mapping_for("task t_11111111 pod web-7d4b9c8f6d-x2k9p"))

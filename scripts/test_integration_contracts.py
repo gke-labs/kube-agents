@@ -104,6 +104,8 @@ FLAKY_CHECK_NOTIFIER = "flaky-check-notify.yml"
 FLAKY_CHECK_EXCLUDED_WORKFLOWS = (
     # A title edit legitimately turns it green without a commit.
     "Validate PR Title",
+    # Likewise a body edit: adding the screenshot is the fix, not a re-run.
+    "UX Evidence",
     # The advisory database moves between attempts.
     "Security Scanning",
     # pull_request_target automations, not checks on the tree.
@@ -1246,6 +1248,9 @@ class PoolPressureArtifactContractTest(unittest.TestCase):
                 "lease_failures_hours": doc["recent"]["hours"],
                 "no_build_id": sum(doc["no_build_id"].values()),
                 "max_concurrency": doc["max_concurrency"],
+                "breached_days": doc["trend"]["breached_days"],
+                "worst_s": int(day["worst_minutes"] * 60),
+                "waiting": doc["queue"]["waiting"],
             },
             {key: note[key] for key in note if key not in ("since", "measured_at")},
         )

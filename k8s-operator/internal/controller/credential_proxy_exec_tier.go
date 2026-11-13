@@ -39,6 +39,44 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
+// The exec pods' ephemeral storage, their own and not the broker's (5Gi state,
+// 2Gi /tmp, 8Gi limit). An exec command's output is held in memory, its
+// TMPDIR is on the state volume, and its gcloud writes no log files
+// (GCLOUD_FILE_LOGGING_OFF_ENV in credential_proxy.py), so the state volume
+// holds the command HOME (gcloud's config, kubectl's discovery cache: about
+// 0.3MiB a cluster, 1.9MiB with the OpenAPI schemas), the kubeconfigs and
+// the commands' TMPDIR.
+// Measured at the 8-slot cap with file logging on, gcloud's logs alone grew
+// about 386KiB a command, some 3.3GiB a day (#4536); with it off the volume
+// stays at the HOME's size. /tmp holds only Envoy's rendered config. The
+// limit holds both caps and leaves the rest for the writable layer and the
+// logs. Fixed, as cpu and
+// memory are: an override of the broker's ephemeral-storage does not reach
+// the tier.
+const (
+	credentialProxyExecTierStateSizeLimit        = "1Gi"
+	credentialProxyExecTierTmpSizeLimit          = "256Mi"
+	credentialProxyExecTierEphemeralStorageLimit = "2Gi"
+)
+
+// The exec pods' readiness probe, tighter than the stateful broker's (10s
+// period, 5s timeout, 3 failures). A draining exec pod answers /healthz with
+// 503 (HEALTHZ_DRAINING_PAYLOAD in credential_proxy.py), at once, so three
+// failures 3s apart take it out of its Service in about 9s: at one replica a
+// caller's connect then fails over to the stateful broker instead of reading
+// `draining` until the replacement is Ready. Three failures, not one, so a
+// single slow probe on a healthy pod does not eject it: at one replica an
+// ApiSession whose connect fails stays on the stateful broker for the rest of
+// the session (credential_proxy_client.py), and CredentialProxyExecReady would
+// flip on each miss. The 2s timeout is ample for a handler that returns a
+// constant. The stateful broker keeps its own probe: it rolls with Recreate,
+// so no other pod could take its traffic.
+const (
+	credentialProxyExecTierReadinessPeriodSeconds    int32 = 3
+	credentialProxyExecTierReadinessTimeoutSeconds   int32 = 2
+	credentialProxyExecTierReadinessFailureThreshold int32 = 3
+)
+
 // How long an exec pod may take to stop (credential-broker-exec-tier.md §9
 // step 0). RollingUpdate keeps another replica serving while one rolls, so the
 // exec role drains for as long as the longest command it admits
@@ -190,10 +228,9 @@ func credentialProxyExecTierPodPeer(agent *agentv1alpha1.PlatformAgent) networki
 }
 
 // credentialProxyExecTierResources is the broker container's resources with
-// cpu and memory fixed at the tier's figures on both sides. The broker's other
-// keys stay, ephemeral-storage among them: the tier's emptyDirs are the
-// broker's, and a namespace quota on ephemeral-storage refuses a pod that
-// declares none.
+// cpu and memory fixed at the tier's figures on both sides, and
+// ephemeral-storage at the tier's own limit: a namespace quota on
+// ephemeral-storage refuses a pod that declares none.
 func credentialProxyExecTierResources(broker corev1.ResourceRequirements) corev1.ResourceRequirements {
 	out := corev1.ResourceRequirements{Requests: corev1.ResourceList{}, Limits: corev1.ResourceList{}}
 	for name, q := range broker.Requests {
@@ -206,7 +243,20 @@ func credentialProxyExecTierResources(broker corev1.ResourceRequirements) corev1
 		list[corev1.ResourceCPU] = resource.MustParse(credentialProxyExecTierCPU)
 		list[corev1.ResourceMemory] = resource.MustParse(credentialProxyExecTierMemory)
 	}
+	// Declared on the limit, as the broker's is, so the API server defaults
+	// the request to it; a request the broker's override set follows it.
+	out.Limits[corev1.ResourceEphemeralStorage] = resource.MustParse(credentialProxyExecTierEphemeralStorageLimit)
+	if _, ok := out.Requests[corev1.ResourceEphemeralStorage]; ok {
+		out.Requests[corev1.ResourceEphemeralStorage] = resource.MustParse(credentialProxyExecTierEphemeralStorageLimit)
+	}
 	return out
+}
+
+// credentialProxyExecTierLimitBytes is a size, in bytes, for the broker's
+// watermark gate (credentialProxyStateLimitEnv, credentialProxyTmpLimitEnv).
+func credentialProxyExecTierLimitBytes(size string) string {
+	q := resource.MustParse(size)
+	return strconv.FormatInt(q.Value(), 10)
 }
 
 // buildCredentialProxyExecTierDeployment derives the tier's Deployment from the
@@ -219,16 +269,18 @@ func credentialProxyExecTierResources(broker corev1.ResourceRequirements) corev1
 //     0: no exec call keeps state across calls, a second replica serves while
 //     one rolls, and a rollout needs no surge Pod. A stopping pod keeps its cpu
 //     and quota until it exits, so a step whose replacement has no room waits
-//     for it. At one replica a stopping pod refuses new requests as draining
-//     until its replacement is Ready (for the whole drain when the replacement
-//     has no room); the callers fall back to the stateful broker only once it
-//     stops accepting connections;
+//     for it. A stopping pod fails its readiness probe and leaves the Service
+//     in about 9s (credentialProxyExecTierReadinessPeriodSeconds and the
+//     threshold), so at one replica callers fall back to the stateful broker
+//     until the replacement is Ready;
 //   - the grace period (credentialProxyExecTierTerminationGraceSeconds): the
 //     exec role drains on SIGTERM for as long as the longest command it
 //     admits, not for the broker's bounded drain;
 //   - CREDENTIAL_PROXY_ROLE=exec, and the replica count mounted from the
 //     ConfigMap;
-//   - cpu and memory fixed at the tier's figures (other keys as the broker's);
+//   - cpu, memory and ephemeral-storage fixed at the tier's figures, its own
+//     state and /tmp emptyDir caps (credentialProxyExecTierStateSizeLimit),
+//     and the watermark gate's two limits set to those caps;
 //   - no Secret: no Secret-backed volume (forge credentials and CA bundles
 //     included) and no env read from one (chat, Teams and plugin credentials),
 //     dropped by source rather than by name so a Secret the broker gains later
@@ -281,9 +333,21 @@ func buildCredentialProxyExecTierDeployment(agent *agentv1alpha1.PlatformAgent, 
 	spec := &dep.Spec.Template.Spec
 	volumes := spec.Volumes[:0]
 	for _, v := range spec.Volumes {
-		if !dropped[v.Name] {
-			volumes = append(volumes, v)
+		if dropped[v.Name] {
+			continue
 		}
+		// The tier's own caps (credentialProxyExecTierStateSizeLimit): the
+		// broker's are sized for its vcs scratch, which an exec pod never
+		// holds.
+		if v.EmptyDir != nil {
+			switch v.Name {
+			case credentialProxyStateVolumeName:
+				v.EmptyDir.SizeLimit = ptr.To(resource.MustParse(credentialProxyExecTierStateSizeLimit))
+			case credentialProxyTmpVolumeName:
+				v.EmptyDir.SizeLimit = ptr.To(resource.MustParse(credentialProxyExecTierTmpSizeLimit))
+			}
+		}
+		volumes = append(volumes, v)
 	}
 	spec.Volumes = append(volumes, corev1.Volume{
 		Name: credentialProxyExecTierReplicasVolume,
@@ -297,6 +361,11 @@ func buildCredentialProxyExecTierDeployment(agent *agentv1alpha1.PlatformAgent, 
 		if c.Name != credentialProxyContainerName {
 			continue
 		}
+		if c.ReadinessProbe != nil {
+			c.ReadinessProbe.PeriodSeconds = credentialProxyExecTierReadinessPeriodSeconds
+			c.ReadinessProbe.TimeoutSeconds = credentialProxyExecTierReadinessTimeoutSeconds
+			c.ReadinessProbe.FailureThreshold = credentialProxyExecTierReadinessFailureThreshold
+		}
 		env := c.Env[:0]
 		for _, e := range c.Env {
 			if forgeEnv[e.Name] || credentialProxyExecTierEnvDropped[e.Name] || e.Name == credentialProxyRoleEnv {
@@ -304,6 +373,14 @@ func buildCredentialProxyExecTierDeployment(agent *agentv1alpha1.PlatformAgent, 
 			}
 			if e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil {
 				continue
+			}
+			// The watermark gate measures each scratch volume against the
+			// figure the kubelet evicts it on: the tier's own caps.
+			switch e.Name {
+			case credentialProxyStateLimitEnv:
+				e.Value = credentialProxyExecTierLimitBytes(credentialProxyExecTierStateSizeLimit)
+			case credentialProxyTmpLimitEnv:
+				e.Value = credentialProxyExecTierLimitBytes(credentialProxyExecTierTmpSizeLimit)
 			}
 			env = append(env, e)
 		}
