@@ -150,7 +150,7 @@ limits in check:
 
 Very wide work fans out in layers: a coordinator profile (per project or region) above the
 cluster agents, each layer a different profile. Precisely (decided 2026-10-22, worded here
-to close the gaps review found): only the **head of a chain** may start children of its own profile,
+to close the gaps review found): only the **head of a chain** may start a child of its own profile, once,
 and **no profile appears twice on a task's ancestor chain** otherwise. The head is a `top` task, or
 the first profile task under a session turn or a wake: neither a session nor a wake's ended child
 is a profile task waiting open, so the chain starts afresh there. So a task below the head never
@@ -182,8 +182,8 @@ its budget function; until it exists, a fixed conservative default behind a knob
    narrowing when it mints: the child's tier equals the parent's (and the child's profile must
    allow it), and the child's scope must lie inside the parent's. The gateway stays the only
    publisher of submissions. Depth is capped (as `A2A_DELEGATION_DEPTH_MAX` caps delegation today), and the
-   ancestor-chain rule in [Scale rules](#scale-rules) applies (only a `top` task nests its own
-   profile; no profile repeats otherwise). Entries a broker adds to a grant chain never change
+   ancestor-chain rule in [Scale rules](#scale-rules) applies (only a chain's head nests its own
+   profile, once; no profile repeats otherwise). Entries a broker adds to a grant chain never change
    the profile. Width is bounded by the dispatcher's caps.
 4. **Stop.** One stop cancels the conversation's whole task tree, enforced by the dispatcher,
    keeping the user-facing behaviour of #3263 and #3379.

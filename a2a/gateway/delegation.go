@@ -43,6 +43,9 @@ const (
 	// ruleDelegationParentScopeUnknown refuses when the profile parent's
 	// scope and chain aren't on its record: failing closed, not open.
 	ruleDelegationParentScopeUnknown = "delegation.parent-scope-unknown"
+	// ruleDelegationParentChainMismatch refuses when an ancestor the record
+	// still holds contradicts the parent's carried chain.
+	ruleDelegationParentChainMismatch = "delegation.parent-chain-mismatch"
 	// ruleDelegationUnattendedParent refuses a child of an unattended task:
 	// the child's grant would not carry the parent's trigger binding.
 	ruleDelegationUnattendedParent = "delegation.unattended-parent"

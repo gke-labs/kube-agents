@@ -8,6 +8,10 @@ import (
 	"github.com/gke-labs/kube-agents/a2a/capability"
 )
 
+// clusterScopeSegments is how many segments a cluster scope has:
+// project/P/location/L/cluster/C (clusterTarget.scope).
+const clusterScopeSegments = 6
+
 // A profile parent's delegation rules (#5686; spec-profiles-dispatch.md,
 // "Scale rules" and "Replacing kanban's plumbing" item 3; 09, "Profile
 // tasks"). A profile task's child is minted a fresh root, not a hop, so the
@@ -55,10 +59,14 @@ func (g *Gateway) profileChildRefusal(rec *SessionRecord, parent TaskRef, route 
 		return ruleDelegationProfileCycle, fmt.Sprintf(noticeProfileCycle, route.Profile, strings.Join(chain, noticeChainSeparator))
 	}
 	if !g.parentScopeHolds(capability.Scope(parent.Scope), route.Scope) {
-		return ruleDelegationParentScope, fmt.Sprintf(noticeOutsideParentScope, route.Scope, parent.Scope)
+		parentCluster := scopeForRoom(capability.Scope(parent.Scope))
+		if route.Scope == capability.NamespaceScope(g.cfg.Namespace) {
+			return ruleDelegationParentScope, fmt.Sprintf(noticeChildWiderThanParent, parentCluster)
+		}
+		return ruleDelegationParentScope, fmt.Sprintf(noticeOutsideParentScope, scopeForRoom(route.Scope), parentCluster)
 	}
 	if !chainAgreesWithRecord(rec, parent) {
-		return ruleDelegationParentScopeUnknown, noticeParentScopeUnknown
+		return ruleDelegationParentChainMismatch, noticeParentChainMismatch
 	}
 	return "", ""
 }
@@ -103,4 +111,15 @@ func chainAgreesWithRecord(rec *SessionRecord, parent TaskRef) bool {
 	// cur is a top submission, present on the record: it heads the chain,
 	// so nothing may be left of the carried chain above it.
 	return i < 0
+}
+
+// scopeForRoom is a cluster scope as the room reads it, "cluster
+// project/location/cluster", the way the other target notices write one. Any
+// other scope is shown as it is.
+func scopeForRoom(s capability.Scope) string {
+	segs := strings.Split(string(s), "/")
+	if len(segs) == clusterScopeSegments && segs[0] == scopeKindProject && segs[2] == scopeKindLocation && segs[4] == scopeKindCluster {
+		return scopeKindCluster + " " + strings.Join([]string{segs[1], segs[3], segs[5]}, "/")
+	}
+	return string(s)
 }

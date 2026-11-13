@@ -69,7 +69,7 @@ func TestNoProfileTwiceOnAChainButTheHeadMayNestItselfOnce(t *testing.T) {
 		if rule != tc.rule {
 			t.Errorf("%s: rule %q (%s), want %q", tc.name, rule, notice, tc.rule)
 		}
-		if rule == ruleDelegationProfileCycle && !strings.Contains(notice, tc.child+" is already on this task's chain") {
+		if rule == ruleDelegationProfileCycle && !strings.Contains(notice, tc.child+" is already working on this request above this task") {
 			t.Errorf("%s: notice %q doesn't name the child and the chain", tc.name, notice)
 		}
 	}
@@ -93,9 +93,12 @@ func TestAChildNeverReachesOutsideItsProfileParentsScope(t *testing.T) {
 	for _, tc := range cases {
 		parent := TaskRef{ID: "p", Addressee: "a", Tier: "read", Scope: tc.parent}
 		rec := &SessionRecord{Tasks: []TaskRef{parent}}
-		rule, _ := g.profileChildRefusal(rec, parent, &profileRoute{Profile: "b", Scope: capability.Scope(tc.cld)})
+		rule, notice := g.profileChildRefusal(rec, parent, &profileRoute{Profile: "b", Scope: capability.Scope(tc.cld)})
 		if rule != tc.rule {
 			t.Errorf("%s: rule %q, want %q", tc.name, rule, tc.rule)
+		}
+		if strings.Contains(notice, "project/") || strings.Contains(notice, "namespace/kube") {
+			t.Errorf("%s: notice %q shows a scope path, not a cluster", tc.name, notice)
 		}
 	}
 }
@@ -114,11 +117,11 @@ func TestTheCarriedChainIsHeldToTheAncestorsTheRecordStillHas(t *testing.T) {
 	}{
 		{"every ancestor present and agreeing", []TaskRef{top, b}, b, ""},
 		{"the top evicted: the carried chain stands", []TaskRef{b}, b, ""},
-		{"an ancestor contradicting the chain", []TaskRef{{ID: "t-a", Addressee: "x", Tier: "read", Scope: installScope}, b}, b, ruleDelegationParentScopeUnknown},
+		{"an ancestor contradicting the chain", []TaskRef{{ID: "t-a", Addressee: "x", Tier: "read", Scope: installScope}, b}, b, ruleDelegationParentChainMismatch},
 		{"a chain longer than the present top allows", []TaskRef{top, {ID: "t-b", Addressee: "b", Tier: "read", Scope: installScope, Role: taskRoleChild,
 			ParentTaskID: "t-a", ProfileChain: []string{"z", "a"}, Depth: 1}},
 			TaskRef{ID: "t-b", Addressee: "b", Tier: "read", Scope: installScope, Role: taskRoleChild, ParentTaskID: "t-a", ProfileChain: []string{"z", "a"}, Depth: 1},
-			ruleDelegationParentScopeUnknown},
+			ruleDelegationParentChainMismatch},
 	}
 	for _, tc := range cases {
 		rec := &SessionRecord{Tasks: tc.tasks}
@@ -243,5 +246,69 @@ func TestAProfileParentWhoseScopeIsNotOnRecordMintsNothing(t *testing.T) {
 	})
 	if envs := streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+"prod-east.>"); len(envs) != 0 {
 		t.Fatalf("%d submission(s) for a parent whose scope isn't on record", len(envs))
+	}
+}
+
+// The handler applies the chain and scope rules before anything is minted,
+// on the resolved route: a profile parent's child that breaks either is
+// refused on the parent's entry with no submission on the stream.
+func TestAProfileParentsCycleOrOutOfScopeChildIsRefusedWithNothingSubmitted(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		edit   func(*TaskRef)
+		notice string
+	}{
+		{
+			// A prod-east task whose carried chain names prod-east above it,
+			// addressing generic cluster at prod: resolved, that is prod-east.
+			// The parent stays a top task, because a child-role task is the
+			// conversation's live child and the one-live-child rule refuses it
+			// first; the cycle check runs before the chain's consistency check,
+			// so this exercises the handler on the resolved route.
+			name:   "cycle through a generic address",
+			edit:   func(ref *TaskRef) { ref.ProfileChain = []string{"prod-east"} },
+			notice: "prod-east is already working on this request above this task",
+		},
+		{
+			name:   "child outside a cluster-scoped parent",
+			edit:   func(ref *TaskRef) { ref.Scope = devScope },
+			notice: "cluster p1/us-east1/prod is outside this task's cluster p1/us-east1/dev",
+		},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := startProfileRig(t)
+			ctx := context.Background()
+			conv := "console:tab-refuse-" + string(rune('a'+i))
+			turn := profileTurn(conv, "prod-east", nil)
+			turn.Backend, turn.AuthorID = consoleBackend, consoleAuthor
+			r.adapter.inbox <- turn
+			origin := submissionOn(t, r, "prod-east")
+			parent := r.execFor(t, origin, "prod-east")
+			if err := parent.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+				t.Fatal(err)
+			}
+			putRecord(t, r, conv, func(rec *SessionRecord) {
+				for j := range rec.Tasks {
+					if rec.Tasks[j].ID == origin.TaskID {
+						tc.edit(&rec.Tasks[j])
+					}
+				}
+			})
+			before := len(streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+"prod-east.>"))
+			if err := parent.PublishArtifact(ctx, delegateArtifactWithParameters(t, "cluster", "look again",
+				targetParams("p1", "us-east1", "prod"))); err != nil {
+				t.Fatal(err)
+			}
+			waitFor(t, "the refusal on the parent's entry", func() bool {
+				rec, _ := r.g.reg.Get(ctx, conv)
+				ref, ok := rec.TaskRefFor(origin.TaskID)
+				return ok && strings.Contains(ref.DelegationEnd, tc.notice)
+			})
+			if after := len(streamEnvelopes(t, r.url, lib.SubmitSubjectPrefix+"prod-east.>")); after != before {
+				t.Fatalf("%d submission(s) for a refused child", after-before)
+			}
+		})
 	}
 }
