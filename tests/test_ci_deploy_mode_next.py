@@ -453,6 +453,14 @@ class FlagSetIsNextTest(unittest.TestCase):
                 "--set-string",
                 f"{key}.image.tag={_TAG}",
             ]
+        # The A2A door, for the card-wait stopped ask (#5407), under the name
+        # the operator reads it by.
+        expected += [
+            "--set-string",
+            f"operator.extraEnv[11].name={go_constant(_A2A_MANIFESTS, 'a2aAgentDoorEnvVar')}",
+            "--set-string",
+            "operator.extraEnv[11].value=true",
+        ]
         self.assertEqual(args, expected)
         # Nothing names the executor setting, under any index: set to anything,
         # the operator renders BRIDGE_EXECUTOR and the lane stops measuring the
@@ -609,7 +617,8 @@ class FlagSetIsNextTest(unittest.TestCase):
         self.assertEqual(values[9], "operator.extraEnv[9].value=true")
         # The dispatcher, at the candidate's published image.
         self.assertEqual(values[10], f"operator.extraEnv[10].value={_RC_REGISTRY_PREFIX}/a2a-dispatcher:{_RC_COMMIT_SHA}")
-        self.assertEqual(len(values), 11, values)
+        self.assertEqual(values[11], "operator.extraEnv[11].value=true")
+        self.assertEqual(len(values), 12, values)
         self.assertNotIn(_AR_REPO, result.stdout)
         # The names are the ones the release publishes.
         common = text(_REPO_ROOT / "scripts" / "release" / "common.sh")
@@ -999,6 +1008,27 @@ class TasksBudgetSizingTest(unittest.TestCase):
         broker = (_CI_DEPLOY.parent.parent / "agents/platform/scripts/credential_proxy.py").read_text()
         self.assertIn('VCS_READINGS_ENV = "CREDENTIAL_PROXY_VCS_READINGS"', broker)
         self.assertIn('VCS_READINGS_OFF = "off"', broker)
+
+    def test_every_lane_excludes_the_stalled_config_connector_namespace_from_the_event_watcher(self) -> None:
+        """The kcc-stalled-declaration stack holds a ContainerNodePool at
+        DependencyNotFound for the whole run, and that reason is on the
+        watcher's list. Every lane's install excludes the stack's namespace,
+        by the name the stack and the case use."""
+        script = _CI_DEPLOY.read_text()
+        self.assertIn('readonly EVAL_EVENT_WATCHER_EXCLUDED_NAMESPACE="eval-kcc-stalled"', script)
+        release = re.search(r"helm upgrade --install.*?--wait --timeout", script, re.DOTALL)
+        assert release is not None
+        self.assertIn(
+            '--set-string "platformAgent.harness.eventWatcher.alertExclude[0].namespace=${EVAL_EVENT_WATCHER_EXCLUDED_NAMESPACE}"',
+            release.group(0),
+        )
+        block = re.search(r'MODE_NEXT_ENV_ARGS=\(\)\nif \[ "\$\{EVAL_MODE_NEXT:-\}" = "1" \]; then\n  MODE_NEXT_ENV_ARGS=\((.*?)\)\nfi', script, re.DOTALL)
+        assert block is not None
+        self.assertNotIn("alertExclude", block.group(1), "set on every lane, not the next lane alone")
+        root = _CI_DEPLOY.parent.parent
+        self.assertIn('kcc_namespace: "eval-kcc-stalled"', (root / "bench/tasks/fleet-audit-manifest-fix-names-stalled-config-connector/task.yaml").read_text())
+        self.assertIn('"DependencyNotFound"', (root / "k8s-operator/cmd/k8s-event-watcher/filter.go").read_text())
+        self.assertIn("DependencyNotFound", (root / "deploy/shared/start-services.sh").read_text())
 
     def test_the_first_change_carries_the_mode_and_the_sized_max_sessions_before_the_first_job_wait(self) -> None:
         consts = constants()

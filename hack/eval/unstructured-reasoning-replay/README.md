@@ -47,7 +47,7 @@ python3 hack/eval/unstructured-reasoning-replay/replay.py /tmp/urr-fixture.json 
 ## Record
 
 2026-10-23 00:32Z, against the inference gateway of a next-mode install at `main` 6382e22e
-(Gemini 3.5 Flash on Vertex, `main`'s gateway config), with the fixture built by this directory's `build_fixture.py` (442e11fc; its repository
+(the agent model on Vertex, `main`'s gateway config), with the fixture built by this directory's `build_fixture.py` (442e11fc; its repository
 inputs are unchanged since 0be2f0fd) and Hermes v2026.9.14:
 
 | arm     | replies opening with `thought` | exit |

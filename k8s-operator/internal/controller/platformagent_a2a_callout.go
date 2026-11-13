@@ -107,7 +107,10 @@ const a2aIdentityMapSchemaAnnotation = "a2a.kubeagents.x-k8s.io/identity-map-sch
 //	4 -> adds tier (one AgentProfile entry per tier, #3655)
 //	5 -> adds shard and shards (the map is cut into numbered ConfigMaps;
 //	     a callout from before it watches a name no longer rendered)
-const a2aIdentityMapSchema = "5"
+//	6 -> adds draining, and the narrowing value "dispatcher" (#5381,
+//	     behind A2A_DISPATCHER_BUCKETED_GRANTS); a callout from before it
+//	     refuses both
+const a2aIdentityMapSchema = "6"
 
 const (
 	// Release surface, resolved by a2aReleaseImage like the gateway and the
@@ -684,7 +687,7 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent, taskSigningPu
 		podLabels[k] = v
 	}
 
-	return &appsv1.Deployment{
+	dep := &appsv1.Deployment{
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: agent.Namespace, Labels: labels},
 		Spec: appsv1.DeploymentSpec{
@@ -862,6 +865,8 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent, taskSigningPu
 			},
 		},
 	}
+	withA2ATiersFile(agent, &dep.Spec.Template.Spec, "callout")
+	return dep
 }
 
 // buildA2ACalloutService fronts the status endpoints. The bus reaches the

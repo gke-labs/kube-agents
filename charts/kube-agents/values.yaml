@@ -561,7 +561,7 @@ litellm:
     # copies: a chart pinned to a version the mirror was never populated with
     # is an ImagePullBackOff. This pin sat a release behind the kustomize base
     # for exactly that reason.
-    tag: v1.106.0
+    tag: v1.108.6
     pullPolicy: IfNotPresent
   replicaCount: 2
   # Rollout strategy — the canonical home for this argument. The chart template
@@ -804,7 +804,7 @@ hindsight:
     # tag, because that is what mirror-images pushes.
     image:
       repository: ghcr.io/vectorize-io/hindsight-api
-      tag: "0.10.2@sha256:1ba631f950a04460feff6b1e212bad3cdf127b0cfb3d765bdcba12f512481d7b"
+      tag: "0.10.3@sha256:f80f304db313cbc8775acd601fda7d094f5854ebf9bc252d8134eb9276d56b40"
       pullPolicy: IfNotPresent
     # Rollout strategy for the hindsight-api Deployment.
     #
@@ -874,7 +874,7 @@ hindsight:
     # this tag — the pg15 line among them. Read them there before changing it.
     image:
       repository: docker.io/pgvector/pgvector
-      tag: "0.8.6-pg15@sha256:a947c45cdc5906a1bc951f20a8709e321256343ee0f251e4ae00b5e7def4e6da"
+      tag: "0.8.7-pg15@sha256:88164492558c9773a1e17a8305abaca7863e05b3d8bbcdb792774890a2047e06"
       pullPolicy: IfNotPresent
     # Ephemeral storage is the run and tmp emptyDirs' sizeLimits (64Mi and 1Gi,
     # templates/hindsight.yaml) plus 64Mi for the container's logs; the limit
@@ -927,8 +927,10 @@ githubMinter:
   # empty, that Secret must already exist in the release namespace.
   appId: ""
   # KSA/GSA pair for Workload Identity; defaults mirror
-  # terraform/modules/kube-agents-iam, so the binding it creates targets the
-  # KSA the chart renders.
+  # terraform/modules/github-minter, so the binding it creates targets the KSA
+  # the chart renders. The full-install composition sets both from the same
+  # inputs as that module (ksaName from github_minter_ksa_name, which install.sh
+  # makes <cluster>-github-minter on a new install).
   ksaName: kubeagents-github-minter
   gsaName: kubeagents-github-minter-gsa
   # The GSA email allowed to request tokens from any of the three scopes in
@@ -988,7 +990,7 @@ githubMinter:
 fluentBit:
   image:
     repository: docker.io/fluent/fluent-bit
-    tag: "5.1.2"
+    tag: "5.1.5"
 
 # The shell sandbox StatefulSet the operator renders beside every agent pod.
 # Same shape as fluentBit above and for the same reason: the chart never renders
@@ -1617,7 +1619,7 @@ platformAgent:
     # images.json like every other third-party image.
     image:
       repository: docker.io/alpine/k8s
-      tag: "1.36.5"
+      tag: "1.36.6"
     # How long to wait for AgentProfile finalizers to clear before deleting
     # the PlatformAgent CR.
     agentProfileTimeout: 30s
@@ -2036,12 +2038,15 @@ webConsole:
   enabled: false
   # GET /api/environment and PlatformAgent state: versions, install and
   # last-rollout dates, and counts of nodes, namespaces, pods and controllers
-  # for feedback reports, plus reading and patching the PlatformAgent resource
-  # for repository topology, preferred model annotations, and applied PR
-  # annotations. Needs a service account with list on those kinds and get/patch
-  # on the PlatformAgent, which the chart creates. The console discards the
-  # listed items; the only names GET /api/environment returns are the
-  # kube-agents Helm release, its namespace and the owning Argo CD Application.
+  # for feedback reports, the PlatformAgent's status.usage block (counters,
+  # top tools and token totals, for the feedback attachment and the banner's
+  # since-install figures), plus reading and patching the PlatformAgent
+  # resource for repository topology, preferred model annotations, and applied
+  # PR annotations. Needs a service account with list on those kinds and
+  # get/patch on the PlatformAgent, which the chart creates. The console
+  # discards the listed items; the only names GET /api/environment returns are
+  # the kube-agents Helm release, its namespace and the owning Argo CD
+  # Application.
   environment:
     enabled: true
   # "Polish with Gemini" in the feedback form: POST /api/assist sends the

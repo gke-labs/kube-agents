@@ -29,7 +29,7 @@ Custom resources in the `kubeagents.x-k8s.io/v1alpha1` API group:
 - **`PlatformAgent`** — declares a Platform Agent instance, container image, service account, chat integrations, and harness toggles.
 - **`AgentPlugin`** — declares OCI plugin extensions, secret environment variables, and allowed configuration overrides targeted to a `PlatformAgent`. The repository ships the Pub/Sub alert adapter and the GKE stockout investigator: [Shipped plugins](/kube-agents/operator/agentplugin-crd/#shipped-plugins).
 - **`AgentProfile`** — under `spec.mode: next` only, declares one kind of A2A agent pod; the operator renders its ServiceAccount, bus identity and agent card. See [AgentProfile CRD](/kube-agents/operator/agentprofile-crd/).
-- **`Tier`** — names what a task may do at a tier. The operator only reports it `Accepted`; nothing enforces it yet. See [Tier CRD](/kube-agents/operator/tier-crd/).
+- **`Tier`** — names what a task may do at a tier. The operator renders every `Tier` into the tiers file the capability verifier, the gateway and the auth callout load; no AgentProfile can list one yet. See [Tier CRD](/kube-agents/operator/tier-crd/).
 
 The controller reconciles a `PlatformAgent` into:
 
@@ -195,8 +195,9 @@ five minutes after, on its own ticker rather than on the reconcile worker. A den
 `RBAC self-check failed` line in the startup log naming the denied permissions
 (`patch poddisruptionbudgets.policy`) and the fix, and a `Degraded` condition with reason
 `RBACIncomplete` carrying the same text on each `PlatformAgent` it reconciles that is not already
-`Degraded` for another reason. The Secret write verbs are also probed in the namespace of each
-`PlatformAgent` once the controller has reconciled it. A denial there is learned after startup,
+`Degraded` for another reason. The namespaced write verbs are also probed in the namespace of each
+`PlatformAgent` once the controller has reconciled it, and in its profile namespace once that
+namespace exists. A denial there is learned after startup,
 logged as `RBAC self-check result changed`, and written on that agent alone, with the namespace in
 the label. Reconciles continue; the steps that need the missing verb still fail
 until the manifests are re-applied. Re-applying them with the same image tag restarts nothing and

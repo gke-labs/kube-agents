@@ -652,6 +652,12 @@ type PlatformAgentReconciler struct {
 	// informer would never sync.
 	agentProfilesUnreadable bool
 
+	// tiersUnreadable is the same for Tiers (TierAccessDenied): the Tier
+	// watch is skipped and the tiers file renders an empty list, which serves
+	// the compiled-in tiers, rather than listing a kind whose informer would
+	// never sync and stall every next-mode reconcile.
+	tiersUnreadable bool
+
 	// Recorder writes Events on the PlatformAgent. Nil records nothing, which
 	// is what tests and the golden harness supply (recordEvent).
 	//
@@ -666,13 +672,16 @@ type PlatformAgentReconciler struct {
 	// (reportA2AProvisionFindings). VolumesDropped went to a condition when
 	// there was no recorder, and it stays one, because it is also a state the
 	// render re-derives on every pass. An Event costs create;patch on events
-	// in the ClusterRole, which the RBAC self-check names when an image runs
-	// ahead of its role.
+	// in the namespaced Role (the Event lands in the agent's namespace),
+	// which the RBAC self-check names when an image runs ahead of its role.
 	Recorder record.EventRecorder
 
 	// busConfigLoadTime stands in for reading the A2A bus's config_load_time
 	// from its monitoring endpoint (a2aBusConfigLoadTime). Nil reads it.
 	busConfigLoadTime func(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, error)
+	// busServerViews stands in for reading each bus server's /jsz
+	// (readA2ABusServerViews) in tests.
+	busServerViews func(ctx context.Context, agent *agentv1alpha1.PlatformAgent, sts *appsv1.StatefulSet) ([]a2aBusServerView, error)
 
 	// clusterImageVolumes caches the cluster-wide ImageVolume capability. Server
 	// version cannot change without an API server restart, so resolving it once
@@ -736,25 +745,28 @@ type PlatformAgentReconciler struct {
 }
 
 // The markers below are the operator's whole Kubernetes authority: controller-gen renders them
-// into config/rbac/role.yaml, and hack/sync-chart-manifests.sh copies that into the chart. Every
-// rule is cluster-scoped unless it carries `namespace=`, and each cluster-scoped rule is here for
-// one of four reasons, named on the rule or the group it sits in:
+// into config/rbac/role.yaml, and hack/sync-chart-manifests.sh copies that into the chart. A
+// marker without `namespace=` lands in the ClusterRole; one with it lands in the Role document
+// beside it, which both install paths bind in the install namespace and, under mode next, in the
+// profile namespace. Each cluster-scoped rule is here for one of four reasons, named on the rule
+// or the group it sits in:
 //
 //   - CR: the PlatformAgent, AgentPlugin and AgentProfile resources, which the manager watches
 //     in every namespace because nothing fixes the namespace a CR is created in.
 //   - render: an object kind the operator creates for an agent, in that agent's namespace or
 //     the profile namespace beside it, and watches through a cluster-wide informer for drift.
+//     The reads stay cluster-scoped for that informer; the writes are namespaced.
 //   - escalation prevention: a read the operator never does itself but must hold, because
 //     buildMinimalPlatformRole grants it to the agent's audit ClusterRole and the API server
 //     refuses to let a subject grant a permission it does not hold.
 //   - operator read: something the operator reads by name or lists for itself.
 //
-// Secrets are split: the read verbs stay cluster-scoped, because the agent's audit ClusterRole
-// grants them and escalation prevention needs the operator to hold what it grants; the write
-// verbs are a namespaced Role (the last marker below), because the operator only ever writes a
-// Secret in the namespace of the PlatformAgent it is reconciling. The ClusterRole carries no
-// Secret write verb. tests/test_operator_secrets_grant.py and the C5 conformance test pin that
-// shape.
+// Every rendered kind is split the same way Secrets are: `get`, `list` and `watch` cluster-wide,
+// `create`, `update`, `patch` and `delete` in the Role document, because the operator writes each
+// of them only in the namespace of the PlatformAgent it reconciles or that namespace's profile
+// namespace. The ClusterRole carries no write verb on a namespaced kind other than the custom
+// resources. tests/test_operator_secrets_grant.py and the C5 conformance test pin that shape;
+// docs/designs/operator-namespaced-write-verbs.md is the inventory and the reasoning.
 //
 // CR.
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents,verbs=get;list;watch;create;update;patch;delete
@@ -762,29 +774,44 @@ type PlatformAgentReconciler struct {
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents/finalizers,verbs=update
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentplugins,verbs=get;list;watch
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentplugins/status,verbs=get;update;patch
-// Render: the agent, broker, gateway and bus workloads; escalation prevention for the reads.
-// +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets,verbs=get;list;watch;create;update;patch;delete
+// Render: the agent, broker, gateway and bus workloads, and the profile pools. Reads cluster-wide
+// (the informers; escalation prevention); writes namespaced.
+// +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets,verbs=create;update;patch;delete,namespace=kubeagents-system
 // Escalation prevention, with two operator reads on the same grant: resolveNetpolProfile
 // reads the gke-metadata-server DaemonSet to discover its port (issue #747 B4), and
 // a2aCalloutHasOlderPods lists ReplicaSets to tell an old callout pod from a new one.
 // +kubebuilder:rbac:groups=apps,resources=daemonsets;replicasets,verbs=get;list;watch
 // Render: the agent's ServiceAccounts, data claims, config, Services and (mode next) session
-// pods; escalation prevention for the reads.
-// +kubebuilder:rbac:groups="",resources=serviceaccounts;persistentvolumeclaims;configmaps;services;pods,verbs=get;list;watch;create;update;patch;delete
-// Render: full `jobs` verbs for the mode-next provisioning Job.
-// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch;create;update;patch;delete
+// pods; escalation prevention for the reads. The pod writes are a dry-run create (the sizing
+// probe), the stuck-NATS-pod delete, and what the gateway Role grants. Reads cluster-wide; writes
+// namespaced.
+// +kubebuilder:rbac:groups="",resources=serviceaccounts;persistentvolumeclaims;configmaps;services;pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=serviceaccounts;persistentvolumeclaims;configmaps;services;pods,verbs=create;update;patch;delete,namespace=kubeagents-system
+// Render: `jobs` for the mode-next provisioning Job and the scope publisher, and what the
+// dispatcher's Jobs Role grants in the profile namespace. Reads cluster-wide; writes namespaced.
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get;list;watch
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=create;update;patch;delete,namespace=kubeagents-system
 // `dispatchjobtemplates` are the dispatcher Job admission policy's params in
 // <ns>-profiles (agentprofile_job_template.go), which the operator alone
 // writes; no Role it renders grants the kind, and the built-in admin and edit
 // roles don't aggregate it. `podtemplates` create only: the server-side dry
 // run that defaults a Job template (defaultedJobTemplate), which stores
-// nothing. ClusterRole rules, not Roles: the profile namespace is created at
-// runtime, and RBAC escalation prevention stops the operator granting itself
-// a Role there with verbs it does not already hold. No watch: every read goes
-// through a2aReader(), uncached. Approved by @bnaylor, 2026-10-30 and
-// 2026-10-31 (#3655 PR 6).
-// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=dispatchjobtemplates,verbs=get;list;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=podtemplates,verbs=create
+// nothing. The writes are namespaced like every other rendered kind's. The
+// reads stay cluster-wide, like every other kind's, for the teardown walk:
+// deleteDispatcherJobsAndTemplates lists the kind in <ns>-profiles on every
+// deletion and every flip to today, before any check that the namespace or
+// a RoleBinding in it exists, and a Helm install in mode today binds the
+// Role in the install namespace only, so a namespaced read would be a 403
+// there (the API server authorises a namespaced list before it looks for
+// the namespace). The install creates the profile namespace and binds the
+// namespaced Role there in the same apply (the chart under mode next,
+// config/profiles under make deploy), which is what lets the namespaced
+// writes reach it (the ClusterRole form approved by @bnaylor on 2026-10-30
+// and 2026-10-31, #3655 PR 6, predates that binding).
+// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=dispatchjobtemplates,verbs=get;list
+// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=dispatchjobtemplates,verbs=create;update;patch;delete,namespace=kubeagents-system
+// +kubebuilder:rbac:groups="",resources=podtemplates,verbs=create,namespace=kubeagents-system
 // `get` on the dispatcher Job admission policy and its binding: before the
 // dispatcher gets its Jobs Role, the operator checks both are in the cluster
 // as rendered (dispatcherJobPolicyInPlace). Read by name, uncached; no list,
@@ -797,11 +824,15 @@ type PlatformAgentReconciler struct {
 // the egress policy).
 // +kubebuilder:rbac:groups="",resources=namespaces;nodes;events;persistentvolumes;limitranges;endpoints;pods/log,verbs=get;list;watch
 // events create;patch: the Recorder's writes (see the field); patch is what
-// the recorder uses to bump the count on a repeat of the same Event.
-// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
-// Render: full `resourcequotas` verbs exist for the mode-next session-pod quota (the
-// enforcement half of the session cap); everything else only reads quotas.
-// +kubebuilder:rbac:groups="",resources=resourcequotas,verbs=get;list;watch;create;update;patch;delete
+// the recorder uses to bump the count on a repeat of the same Event. An Event
+// lands in the namespace of the PlatformAgent it is about, or the operator's
+// own for the leader-election recorder, so the grant is namespaced.
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch,namespace=kubeagents-system
+// Render: the `resourcequotas` writes exist for the mode-next session-pod quota (the
+// enforcement half of the session cap) and the profile quota; everything else only
+// reads quotas. Reads cluster-wide; writes namespaced.
+// +kubebuilder:rbac:groups="",resources=resourcequotas,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=resourcequotas,verbs=create;update;patch;delete,namespace=kubeagents-system
 // Operator read. storageclasses get: growDataClaim reads a data claim's class by name, around
 // the cache, to learn whether the claim can expand. Read-only, and no list or
 // watch, so a cached read cannot be added by accident.
@@ -814,22 +845,32 @@ type PlatformAgentReconciler struct {
 // +kubebuilder:rbac:groups=node.k8s.io,resources=runtimeclasses,verbs=get;list;watch
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch
 // Render: the agent's leader Role grants `leases` in its namespace, so the operator must hold
-// the verbs it grants; the operator's own election lease is in its namespace too.
-// +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
-// Render: the agent's egress and ingress policies and its disruption budget.
-// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=networking.gke.io,resources=fqdnnetworkpolicies,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
+// the verbs it grants there; the gateway lease and the operator's own election lease are in the
+// same namespaces. Reads cluster-wide (the Lease informer); writes namespaced.
+// +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch
+// +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=create;update;patch;delete,namespace=kubeagents-system
+// Render: the agent's egress and ingress policies, the profile fence and the disruption
+// budgets. Reads cluster-wide; writes namespaced.
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=create;update;patch;delete,namespace=kubeagents-system
+// +kubebuilder:rbac:groups=networking.gke.io,resources=fqdnnetworkpolicies,verbs=get;list;watch
+// +kubebuilder:rbac:groups=networking.gke.io,resources=fqdnnetworkpolicies,verbs=create;update;patch;delete,namespace=kubeagents-system
+// +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=create;update;patch;delete,namespace=kubeagents-system
 // Render: the agent's RBAC. The cluster-scoped objects are the audit ClusterRole and its
 // binding (kubeagents:minimal:<ns>:<name>), the broker's TokenReview ClusterRole and binding
 // (kubeagents:tokenreview:<ns>:<name>) and, under mode next, the callout's binding
 // (kubeagents:a2a-callout-tokenreview:<ns>:<name>); the namespaced ones are the local, leader,
 // gateway, callout, dispatcher and scope-publisher Roles. Every name carries the agent's
 // namespace and name, so `resourceNames` cannot pin them, and the informers that watch them for
-// drift need unscoped `list` and `watch`. What bounds this grant is the API server's escalation
-// check: the operator holds no `escalate`, so no role it authors or binds can carry a
-// permission the operator does not itself hold, and the one `bind` below is scoped by name.
-// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings;roles;rolebindings,verbs=get;list;watch;create;update;patch;delete
+// drift need unscoped `list` and `watch`. The Role and RoleBinding writes are namespaced: the
+// operator renders them in the agent's namespace and the profile namespace and nowhere else.
+// What bounds the cluster-scoped grant is the API server's escalation check: the operator holds
+// no `escalate`, so no role it authors or binds can carry a permission the operator does not
+// itself hold, and the one `bind` below is scoped by name.
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,verbs=get;list;watch
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,verbs=create;update;patch;delete,namespace=kubeagents-system
 // The split credential broker verifies its callers with a TokenReview. The operator has to
 // hold that permission in order to grant it; it confers no read access and cannot mint a token.
 // +kubebuilder:rbac:groups=authentication.k8s.io,resources=tokenreviews,verbs=create
@@ -877,8 +918,9 @@ type PlatformAgentReconciler struct {
 // PlatformAgent it reconciles (every call site builds its key from agent.Namespace), so the
 // write verbs are a Role in the install namespace: `namespace=` makes controller-gen render a
 // Role beside the ClusterRole in role.yaml, the kustomize overlay rewrites the literal to the
-// deployed namespace, and the chart renders the same rules as a Role in the release namespace.
-// A PlatformAgent in any other namespace needs that Role and a RoleBinding there. The writers:
+// deployed namespace, and the chart renders the same rules as a Role in the release namespace
+// and in the profile namespace. A PlatformAgent in any other namespace needs that Role and a
+// RoleBinding there. The writers:
 // ensureKubeProxyTLSSecret creates and renews the kube-proxy TLS Secret on every install; the
 // mode-next A2A stack creates, repairs, patches and deletes the NATS credentials, config, TLS,
 // callout-key, inject-token, door-token and MCP-access Secrets it generates. Because the Role
@@ -1361,6 +1403,12 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if err != nil {
 			return ctrl.Result{}, err
 		}
+		// Under today the operator writes nothing in the profile namespace,
+		// and a chart upgrade after a flip from next removes it with its
+		// RoleBinding. The fence pass that would forget it never runs here,
+		// so forget it on this branch, or the self-check keeps probing a
+		// namespace this agent no longer writes in and reports it denied.
+		r.RBAC.Forget(profileNamespaceName(instance))
 		// The bus is torn down but its data claims are kept, so that a flip
 		// back reuses them, and so is the count it last ran at (#5451): with
 		// no record, the flip back reads the claims, and a single server once
@@ -1383,6 +1431,8 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// No callout, so no claim about its map: the condition goes.
 		removed := a2aIdentityMapRemoved
 		a2aState.calloutMap = &removed
+		// No bus, so no meta group: its condition goes too.
+		a2aState.busMeta = a2aBusMetaState{checked: true}
 	}
 	// The record travelled into the render (the projection) and travels on
 	// the state to every status writer below, the failed and parked paths
@@ -1450,7 +1500,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
-	phase, err := r.updateStatusReady(ctx, instance, otlpEndpoint, otlpSource, netpolProf, a2aState)
+	phase, tasksWaitRequeue, err := r.updateStatusReady(ctx, instance, otlpEndpoint, otlpSource, netpolProf, a2aState)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -1459,7 +1509,8 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// workload is written, and Pods are not watched here. Requeue while the picture is
 	// still incomplete so both the failure and the later recovery reach plugin status.
 	if pluginStatusNeedsRecheck(agentPlugins, phase == "Ready") {
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		// The TASKS wait's threshold pass may be due sooner (below).
+		return ctrl.Result{RequeueAfter: minPositive(tasksWaitRequeue, 30*time.Second)}, nil
 	}
 
 	// A2A provisioning still running — Jobs are not watched (see a2aReader),
@@ -1498,7 +1549,8 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if a2aState.busReloadRequeue > 0 {
 			requeue = min(requeue, a2aState.busReloadRequeue)
 		}
-		return ctrl.Result{RequeueAfter: requeue}, nil
+		// So can the TASKS wait's threshold pass (a2aGatewayTasksWaitMessage).
+		return ctrl.Result{RequeueAfter: minPositive(tasksWaitRequeue, requeue)}, nil
 	}
 
 	// An out-of-date ClusterRole is fixed by someone re-applying the manifests,
@@ -1521,7 +1573,8 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if credentialProxyExecShort(instance) {
 			requeue = min(requeue, credentialProxyExecShortRequeue)
 		}
-		return ctrl.Result{RequeueAfter: requeue}, nil
+		// And the TASKS wait's threshold pass (a2aGatewayTasksWaitMessage).
+		return ctrl.Result{RequeueAfter: minPositive(tasksWaitRequeue, requeue)}, nil
 	}
 
 	// Secret material reaches the gateway as environment, and a container's
@@ -1556,6 +1609,12 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// and the settled lower row sends no event for it, so the pass that
 	// measures the step again is scheduled for the hold's end.
 	requeueAfter = min(requeueAfter, r.sizingStepBackRequeue(instance))
+	// An A2A gateway waiting for TASKS on a provisioned bus turns Degraded at
+	// a threshold, and pods are not watched, so the pass that writes it is
+	// scheduled, from the status pass's own read (a2aGatewayTasksWaitMessage).
+	if tasksWaitRequeue > 0 {
+		requeueAfter = min(requeueAfter, tasksWaitRequeue)
+	}
 	// The scope publisher's next run, or the moment its document goes stale:
 	// Jobs are not watched, so the pass that starts the run and the pass
 	// that turns ScopeResolved False have to be asked for.
@@ -1621,10 +1680,11 @@ func pluginStatusNeedsRecheck(plugins []*agentv1alpha1.AgentPlugin, agentReady b
 
 func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (ctrl.Result, error) {
 	if controllerutil.ContainsFinalizer(agent, platformAgentFinalizer) {
-		// The self-check stops probing this agent's namespace: once the agent
-		// is gone its RoleBinding may go too, and that must not stand as a
-		// denial on the agents that remain.
+		// The self-check stops probing this agent's namespace and its profile
+		// namespace: once the agent is gone their RoleBindings may go too, and
+		// that must not stand as a denial on the agents that remain.
 		r.RBAC.Forget(agent.Namespace)
+		r.RBAC.Forget(profileNamespaceName(agent))
 		// Delete the credential broker's TokenReview grant, if the split ever
 		// created one. cleanupAgentRBAC's label-driven pass also reaps it under
 		// deleteAll, but only when the grant carries the instance labels — one
@@ -4325,6 +4385,13 @@ type splitWorkloadStatus struct {
 	kind string
 	// ready is the workload's ReadyReplicas; zero when the object is absent.
 	ready int32
+	// detail, when set, follows the name in the Provisioning message: the
+	// A2A gateway's not-ready elected leader (a2aGatewayReadyByLeader).
+	detail string
+	// recheck is how soon the status pass should look again, 0 for no need:
+	// the A2A gateway's leader handover grace, or the follow-up on a
+	// not-ready leader, neither of which an event announces.
+	recheck time.Duration
 }
 
 // readSplitWorkloads reads the shell sandbox StatefulSet and the credential broker
@@ -4464,9 +4531,15 @@ func (r *PlatformAgentReconciler) readSplitWorkloads(ctx context.Context, agent 
 			if a2a.gatewayWaking && gateway.Status.ReadyReplicas == 0 {
 				gatewayCond = a2aGatewayWakingMessage
 			}
-			workloads = append(workloads, splitWorkloadStatus{
-				name: gatewayName, kind: "Deployment", ready: gateway.Status.ReadyReplicas,
-			})
+			// Elected replicas: Ready follows the leader, which alone binds
+			// the relay, rather than a standby that reads Ready
+			// (a2aGatewayReadyByLeader).
+			ready, leader, recheck := r.a2aGatewayReadyByLeader(ctx, agent, gateway, time.Now())
+			w := splitWorkloadStatus{name: gatewayName, kind: "Deployment", ready: ready, recheck: recheck}
+			if leader != "" {
+				w.detail = "(elected leader " + leader + " not ready)"
+			}
+			workloads = append(workloads, w)
 		}
 	}
 
@@ -4707,6 +4780,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 		shellSandboxImagePinnedConditionCurrent(agent, sandboxPinnedMsg) &&
 		a2aMCPIdentityConditionCurrent(agent, a2a.mcpNotRendered) &&
 		a2aCalloutStalledConditionCurrent(agent, a2a.calloutStalled) &&
+		a2aBusMetaConditionCurrent(agent, a2a.busMeta) &&
 		a2aIdentityMapAppliedConditionCurrent(agent, a2a.calloutMap) &&
 		scopeResolvedConditionCurrent(agent, a2a.scopeCondition) &&
 		a2aBusConversionRefusedConditionCurrent(agent, conversionMsg) &&
@@ -4722,6 +4796,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 			shellSandboxImagePinnedConditionCurrent(live, shellSandboxImagePinnedMsg(live)) &&
 			a2aMCPIdentityConditionCurrent(live, a2a.mcpNotRendered) &&
 			a2aCalloutStalledConditionCurrent(live, a2a.calloutStalled) &&
+			a2aBusMetaConditionCurrent(live, a2a.busMeta) &&
 			a2aIdentityMapAppliedConditionCurrent(live, a2a.calloutMap) &&
 			scopeResolvedConditionCurrent(live, a2a.scopeCondition) &&
 			a2aBusConversionRefusedConditionCurrent(live, conversionMsg) &&
@@ -4739,6 +4814,7 @@ func (r *PlatformAgentReconciler) syncA2AConditions(ctx context.Context, agent *
 	setShellSandboxImagePinnedCondition(agent, sandboxPinnedMsg, now)
 	setA2AMCPIdentityCondition(agent, a2a.mcpNotRendered, now)
 	setA2ACalloutStalledCondition(agent, a2a.calloutStalled, now)
+	setA2ABusMetaCondition(agent, a2a.busMeta, now)
 	setA2AIdentityMapAppliedCondition(agent, a2a.calloutMap, now)
 	setScopeResolvedCondition(agent, a2a.scopeCondition, now)
 	setA2ABusConversionRefusedCondition(agent, conversionMsg, now)
@@ -4805,13 +4881,17 @@ func (r *PlatformAgentReconciler) liveAgentSatisfies(ctx context.Context, agent 
 }
 
 // updateStatusReady writes the agent's status and returns the phase it settled on, so
-// the caller can decide whether the agent is still converging. otlpEndpoint, otlpSource,
+// the caller can decide whether the agent is still converging, and the requeue the
+// A2A gateway's TASKS wait needs (0 for none; a2aGatewayTasksWaitMessage). otlpEndpoint, otlpSource,
 // and netpolProfile are the resolved telemetry and network policy wiring; they are reported
 // rather than derived because discovery is otherwise invisible to anyone reading the CR.
 // a2a is what reconcileA2A found this pass (zero on a today install): whether the
 // provisioning Job is complete and what it is called, so the status write neither
 // re-reads the Job nor re-renders it to learn its name.
-func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *agentv1alpha1.PlatformAgent, otlpEndpoint, otlpSource string, netpolProfile netpolProfile, a2a a2aProvisionState) (string, error) {
+func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *agentv1alpha1.PlatformAgent, otlpEndpoint, otlpSource string, netpolProfile netpolProfile, a2a a2aProvisionState) (string, time.Duration, error) {
+	// One leader read for the whole pass: Ready (readSplitWorkloads) and the
+	// TASKS-wait reason both ask, and should see the same holder.
+	ctx = withA2AGatewayLeaderMemo(ctx)
 	newDeploymentStatusName := ""
 	newDeploymentStatusReadyReplicas := int32(0)
 	var errWorkload error
@@ -4840,7 +4920,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		sts := &appsv1.StatefulSet{}
 		errWorkload = r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-gateway"}, sts)
 		if errWorkload != nil && !errors.IsNotFound(errWorkload) {
-			return "", fmt.Errorf("failed to get StatefulSet for status update: %w", errWorkload)
+			return "", 0, fmt.Errorf("failed to get StatefulSet for status update: %w", errWorkload)
 		}
 		if errWorkload == nil {
 			newDeploymentStatusName = sts.Name
@@ -4854,7 +4934,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		dep := &appsv1.Deployment{}
 		errWorkload = r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-gateway"}, dep)
 		if errWorkload != nil && !errors.IsNotFound(errWorkload) {
-			return "", fmt.Errorf("failed to get Deployment for status update: %w", errWorkload)
+			return "", 0, fmt.Errorf("failed to get Deployment for status update: %w", errWorkload)
 		}
 		if errWorkload == nil {
 			newDeploymentStatusName = dep.Name
@@ -4867,7 +4947,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	pvc := &corev1.PersistentVolumeClaim{}
 	errPVC := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-data"}, pvc)
 	if errPVC != nil && !errors.IsNotFound(errPVC) {
-		return "", fmt.Errorf("failed to get PVC for status update: %w", errPVC)
+		return "", 0, fmt.Errorf("failed to get PVC for status update: %w", errPVC)
 	}
 	newStorageStatusBound := false
 	if errPVC == nil {
@@ -4878,7 +4958,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	svc := &corev1.Service{}
 	errSvc := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name}, svc)
 	if errSvc != nil && !errors.IsNotFound(errSvc) {
-		return "", fmt.Errorf("failed to get Service for status update: %w", errSvc)
+		return "", 0, fmt.Errorf("failed to get Service for status update: %w", errSvc)
 	}
 	newServiceStatusEndpoint := ""
 	newAddress := ""
@@ -4892,13 +4972,21 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	// gateway alone.
 	splitWorkloads, a2aGatewayMsg, errSplit := r.readSplitWorkloads(ctx, agent, a2a)
 	if errSplit != nil {
-		return "", errSplit
+		return "", 0, errSplit
 	}
 	notReady := make([]string, 0, len(splitWorkloads))
 	brokerNotReady := false
+	var splitRecheck time.Duration
 	for _, w := range splitWorkloads {
+		if w.recheck > 0 && (splitRecheck == 0 || w.recheck < splitRecheck) {
+			splitRecheck = w.recheck
+		}
 		if w.ready == 0 {
-			notReady = append(notReady, fmt.Sprintf("%s %s", w.kind, w.name))
+			entry := fmt.Sprintf("%s %s", w.kind, w.name)
+			if w.detail != "" {
+				entry += " " + w.detail
+			}
+			notReady = append(notReady, entry)
 			if w.name == credentialBrokerName(agent) {
 				brokerNotReady = true
 			}
@@ -4996,6 +5084,17 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	agentAPIAuthRefusal, _ := agentAPIAuthResourcesRefusal(agent)
 	sandboxResourcesRefusal, _ := shellSandboxResourcesRefusal(agent)
 	execRefusal := ValidateCredentialProxyExec(agent, nil)
+	// The A2A gateway still waiting for TASKS on a provisioned bus
+	// (a2aGatewayTasksWaitMessage): read once per pass, only while that
+	// Deployment is short of ready replicas and the bus is up. The requeue
+	// it needs goes back to Reconcile with the phase, so the pass that
+	// writes the reason is scheduled without a second read.
+	a2aTasksWaitMsg, a2aTasksWaitRequeue := r.a2aGatewayTasksWaitMessage(ctx, agent)
+	// The A2A gateway leader's recheck rides the same returned requeue: both
+	// are reads of pods and a Lease that send the operator no event.
+	if splitRecheck > 0 && (a2aTasksWaitRequeue <= 0 || splitRecheck < a2aTasksWaitRequeue) {
+		a2aTasksWaitRequeue = splitRecheck
+	}
 
 	degradedStatus := metav1.ConditionFalse
 	degradedReason := ""
@@ -5050,6 +5149,16 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		degradedStatus = metav1.ConditionTrue
 		degradedReason = conditionReasonA2ABusStreamsMissing
 		degradedMsg = busStreams.Message
+	} else if a2aTasksWaitMsg != "" {
+		// Degraded only, as the held minter entry above: Ready and the phase
+		// keep what the workload says (Provisioning, naming the gateway), and
+		// this says why the wait is not provisioning's. It reports lost
+		// function, so it ranks above the resource refusals below; a
+		// confirmed loss of the streams (A2ABusStreamsMissing, #5474) ranks
+		// above it.
+		degradedStatus = metav1.ConditionTrue
+		degradedReason = conditionReasonA2AGatewayWaitingForTasks
+		degradedMsg = a2aTasksWaitMsg
 	} else if proxyResourcesRefusal != "" {
 		// Same shape as the git refusal above: the spec is read here, on
 		// every pass, rather than carried from reconcileCredentialProxy, so
@@ -5167,6 +5276,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	a2aVerifierUnchanged := a2aVerifierConditionCurrent(agent, verifierNotReady, verifierKnown)
 	a2aMCPServerUnchanged := a2aMCPIdentityConditionCurrent(agent, a2a.mcpNotRendered)
 	a2aCalloutStalledUnchanged := a2aCalloutStalledConditionCurrent(agent, a2a.calloutStalled)
+	a2aBusMetaUnchanged := a2aBusMetaConditionCurrent(agent, a2a.busMeta)
 	identityMapAppliedUnchanged := a2aIdentityMapAppliedConditionCurrent(agent, a2a.calloutMap)
 	scopeResolvedUnchanged := scopeResolvedConditionCurrent(agent, a2a.scopeCondition)
 	gatewayElected := gatewayElectedImage(agent, a2a.gatewayElected)
@@ -5238,12 +5348,12 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		a2aGatewayUnchanged &&
 		busProvisionedUnchanged &&
 		r.busReplicasStatusCurrent(agent, a2a.busReplicasPersisted) &&
-		a2aVerifierUnchanged && a2aMCPServerUnchanged && a2aCalloutStalledUnchanged && identityMapAppliedUnchanged && scopeResolvedUnchanged &&
+		a2aVerifierUnchanged && a2aMCPServerUnchanged && a2aCalloutStalledUnchanged && a2aBusMetaUnchanged && identityMapAppliedUnchanged && scopeResolvedUnchanged &&
 		gatewayElectedUnchanged &&
 		dataVolumeExpansionUnchanged &&
 		existingCond != nil && existingCond.Status == condStatus && existingCond.Reason == condReason && existingCond.Message == condMsg &&
 		existingCond.ObservedGeneration == agent.Generation {
-		return newPhase, nil
+		return newPhase, a2aTasksWaitRequeue, nil
 	}
 
 	// Apply updates
@@ -5324,6 +5434,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	setA2AVerifierCondition(agent, verifierNotReady, verifierKnown, now)
 	setA2AMCPIdentityCondition(agent, a2a.mcpNotRendered, now)
 	setA2ACalloutStalledCondition(agent, a2a.calloutStalled, now)
+	setA2ABusMetaCondition(agent, a2a.busMeta, now)
 	setA2AIdentityMapAppliedCondition(agent, a2a.calloutMap, now)
 	setScopeResolvedCondition(agent, a2a.scopeCondition, now)
 	setGatewayElectedCondition(agent, gatewayElected, now)
@@ -5336,12 +5447,12 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		wroteInference = &inferenceModel{Provider: newInference.Provider, Model: newInference.Model}
 	}
 	if err := r.Status().Update(ctx, agent); err != nil {
-		return newPhase, err
+		return newPhase, a2aTasksWaitRequeue, err
 	}
 	r.noteUsageStatusEcho(ctx, agent, newActiveInterfaces)
 	r.noteBusReplicasEcho(agent, writtenBusReplicas)
 	r.noteInferenceEcho(ctx, agent, wroteInference)
-	return newPhase, nil
+	return newPhase, a2aTasksWaitRequeue, nil
 }
 
 // heldUsageFields is the usage gauges' view of the served-CRD skew for one
@@ -6533,6 +6644,29 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			logf.Log.WithName("platformagent-controller").Info(
 				"AgentPlugin CRD is not installed on cluster; skipping AgentPlugin watch. " +
 					"Restart the operator after installing the CRD to enable plugin reconciliation.")
+		}
+	}
+
+	// Tiers feed the tiers ConfigMap (platformagent_a2a_tiers.go), so a Tier
+	// created, edited or deleted re-renders it. Registered only when the CRD
+	// is installed.
+	tierGVK := agentv1alpha1.GroupVersion.WithKind("Tier")
+	if denied := TierAccessDenied(r.RBAC); len(denied) > 0 {
+		r.tiersUnreadable = true
+		logf.Log.WithName("platformagent-controller").Info(
+			"The operator's role cannot read Tiers; skipping the Tier watch and rendering no install-defined tiers. Restart the operator after applying the current ClusterRole.",
+			"denied", denied)
+	} else if mgr != nil && mgr.GetRESTMapper() != nil {
+		if _, err := mgr.GetRESTMapper().RESTMapping(tierGVK.GroupKind(), tierGVK.Version); err == nil {
+			bld = bld.Watches(
+				&agentv1alpha1.Tier{},
+				handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+					return enqueueAgentsInNamespace(ctx, obj.GetNamespace())
+				}),
+				// The Tier reconciler writes status; only spec changes,
+				// creates and deletes change the file.
+				builder.WithPredicates(predicate.GenerationChangedPredicate{}),
+			)
 		}
 	}
 

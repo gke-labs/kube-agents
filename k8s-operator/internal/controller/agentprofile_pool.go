@@ -40,7 +40,7 @@ const (
 	// profileWorkerResetPathsEnv is lib.EnvProfileResetPaths: the
 	// directories the worker empties after every task.
 	profileWorkerResetPathsEnv = "A2A_PROFILE_RESET_PATHS"
-	// profileWorkerUID is the worker image's user (a2a-worker, node:22's
+	// profileWorkerUID is the worker image's user (a2a-worker, the node base image's
 	// node user), and its FSGroup.
 	profileWorkerUID = 1000
 	// profileWorkerStatusPort is lib.ProfileWorkerStatusPort: /readyz and

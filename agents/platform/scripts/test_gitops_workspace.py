@@ -25,6 +25,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import gitops_workspace  # noqa: E402
+import no_live_kubectl  # noqa: E402
 import vcs_client  # noqa: E402
 
 LEASE = "compliance-audit"
@@ -34,13 +35,23 @@ def setUpModule():
     # in_operator_pod() keys on the real /etc/gitops, and in the pod a test's
     # own GITOPS_STATE_PATH is then ignored. Keep every test off the host's
     # mount; TestReadersIgnoreWorkerSources points it at a temp dir of its own.
-    global _NO_MOUNT
+    global _NO_MOUNT, _NO_KUBECTL
     _NO_MOUNT = patch("gitops_workspace.GITOPS_STATE_DIR", "/nonexistent/kube-agents-test/etc-gitops")
     _NO_MOUNT.start()
+    # No test here reaches a cluster: a read of the state ConfigMap that a test
+    # leaves unstubbed is unreadable, and any other kubectl found on PATH fails
+    # the module.
+    _NO_KUBECTL = no_live_kubectl.install()
 
 
 def tearDownModule():
     _NO_MOUNT.stop()
+    _NO_KUBECTL.uninstall()
+
+
+class TestNoLiveKubectl(unittest.TestCase):
+    def test_no_test_in_this_module_can_reach_a_cluster(self):
+        no_live_kubectl.assert_in_force(self, _NO_KUBECTL)
 
 
 class WorkspaceTestCase(unittest.TestCase):

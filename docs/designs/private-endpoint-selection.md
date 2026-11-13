@@ -132,7 +132,11 @@ gcloud is installed and is asked again next time:
 | `provisional`         | `True` when the own-cluster describe gave no answer and the decision fell back    |
 
 `dns_endpoint_args()` stays as the wrapper returning only `flags` as a list. Its callers,
-`platform_mcp_server.py` and `stall_watch.py`, inherit rule 3 without a signature change;
+`platform_mcp_server.py` and `stall_watch.py`, inherit rule 3 without a signature change.
+Where the shell's `kubectl` goes through the kube-api proxy (`KUBE_PROXY_URL` in the sandbox,
+`KUBE_PROXY_IN_USE_URL` in the gateway's agent container), the wrapper returns no flags and
+decides nothing: the shim answers the `get-credentials` itself, or the credential proxy's
+splice decides for a fetch that names no endpoint, and the kubeconfig names kube-proxy either way.
 `cluster_agent_profile.py` and `credential_proxy.py` call `endpoint_decision()` themselves,
 the first because it writes the decision out and the second because it reads the
 `provisional` mark. The describe widens to

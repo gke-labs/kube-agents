@@ -567,8 +567,14 @@ Like the pool note it rides beside the state and never becomes one. A job whose
 latest finished build failed is a `FAILED` note, once it is news: the sweep runs
 hourly and this tick reads its latest finished build every fifteen minutes, so
 every build is read and counted once, and one failed build followed by a clean
-one is a flap. The sweep's note waits until two consecutive checks have failed;
-the reconciles' first failed build is the news. Any project's failure fails a
+one is a flap. The sweep's note waits until two consecutive checks have failed.
+A reconcile's first failed build is the news only when it owes a hand step (a
+refused plan, a locked state, an unmapped project or a runner fault, a run that
+failed before reaching a project or whose check of `main` failed, or a report it
+wrote none of or could not read); a failure the next run retries (a stockout, a
+409, an expired plan token)
+is noted once the same project has failed in two consecutive runs, and a silent
+one still advances the counts. Any project's failure fails a
 sweep run, so a per-project threshold could never fire before the run's; the
 per-project counts name, in the message, the projects that failed in this check
 and the ones before it.
@@ -577,8 +583,9 @@ read build and carried across ticks; a failed build that did not reach a
 project (busy) keeps its count, and a clean build clears every count. A tick
 that could not fetch the previous `health.json` has no counts to carry, so it
 notes any failed build rather than hide one already told. A
-recovery needs a build that passed: a failed check under the threshold writes
-no note and is not one. One whose latest finished
+recovery needs a build that passed, or for the postsubmit reconcile a later
+daily run that reached its projects (below): a failed check under the
+threshold writes no note and is not one. One whose latest finished
 build is older than its stale window (two hours for the sweep, 36 hours for the
 daily reconcile and the daily replay lane, eight days for the weekly certification slice; the postsubmit runs on merges, so no age makes it stale) is `STALE`, whatever that build's
 verdict, measured on the wall clock rather than data.json's horizon, as the
@@ -589,7 +596,8 @@ message is built from (where the job acts, what stops happening when it fails
 and resumes when it recovers, what it does and how often, what a failure costs),
 a one-line summary of what the run did from its report, and the report's detail
 lines, up to five: for the reconcile the projects it refused, failed or was
-interrupted in, each with its reason and its one next step, then how many it
+interrupted in, each with its reason and its one next step (a project that
+failed in consecutive runs leads, with its count), then how many it
 did not reach and why, and the allowlist entries no plan needed; for the sweep the projects whose sweep
 failed with GitHub's answer, what the run left for the next one under its write
 budget, the projects it did not reach after stopping, and why it stopped if it
@@ -616,7 +624,7 @@ digest carries it daily), a job that has stopped (in grey, whether or not its
 last build failed; the same grey when its latest build carries no readable
 finish time, since the window cannot be measured), and one when a job the space
 was told about passes again, on a reading only, or, for the postsubmit
-reconcile, when a later daily pass at the same fleet tree reached the projects it failed on (a failed build's git id, the tree reports carried before the input hash, is not compared with the daily's hash). The failed and stopped
+reconcile, when a later daily run at the same fleet tree reached the projects it failed on (a pass that held and planned them, or a run that failed elsewhere and applied them; a failed build's git id, the tree reports carried before the input hash, is not compared with the daily's hash). The failed and stopped
 messages are four lines, the failed one with the report's detail lines and a
 "how it died" line (the log line that says so, the node, a Warning pod event)
 under its second: a headline naming where and what stopped happening ("Eval GitOps repos:
@@ -1378,8 +1386,8 @@ the compared scenarios' graded repetitions with its 90th percentile, "the
 slowest 10%"), and a fourth when the week has token counts (the median tokens
 per graded repetition and, when the week has a trend, its change from last
 week on the same scenarios, which the text says because it is not measured
-against that median; and its cache hit rate when repetitions carry the prompt
-split), a "Needs attention" box, one row per area with
+against that median; and its cache hit rate when at least 30 repetitions carry the prompt
+split); the tile says the figure is one repetition of one scenario, all agents, a "Needs attention" box, one row per area with
 its `meaning:` from [`docs/designs/domains.yaml`](designs/domains.yaml) (no
 owners), how failures become bugs, and a footer naming the dates and the model
 the evidence store records for the counted nights' builds (`store.json`).
@@ -1392,8 +1400,8 @@ are left out of the median and their number is shown. The change compares
 the two weeks' figures over the scenarios with a full count in both weeks.
 Each such scenario's median is taken over its full counts in each week, and a
 week's figure is the median of those per-scenario medians, so every scenario
-weighs the same and its partial counts do not move it. When full counts carry the prompt
-split, the tile and the Chat line add the cache hit rate: their cache reads over their
+weighs the same and its partial counts do not move it. When at least 30 full counts carry the prompt
+split (`TOKENS_CACHE_MIN_RUNS`; fewer say little about caching), the tile and the Chat line add the cache hit rate: their cache reads over their
 whole prompt (`cached / (input + cached + cache_write)`), summed over those repetitions so
 a long run weighs by its tokens; the tile also gives how many repetitions it covers. The
 tokens tile and the Chat line are left out when no repetition the week compared carries a
