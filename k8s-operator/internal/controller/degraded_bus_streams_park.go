@@ -72,7 +72,9 @@ func parkBusStreamsDegraded(agent *agentv1alpha1.PlatformAgent) (busStreamsDegra
 		}
 		// The streams' reason goes. A spec refusal it outranked comes back,
 		// as updateStatusReady would show it; it is the one lower reason a
-		// park can read, the rest being the unparked pass's.
+		// park can read from the CR alone. A2AGatewayWaitingForTasks reads
+		// the gateway's pods and Lease, so it is the unparked pass's to put
+		// back, like the reasons ranked above the streams.
 		if reason, msg := specResourceDegraded(agent); reason != "" {
 			return busStreamsDegradedSet, &metav1.Condition{
 				Type: degradedConditionType, Status: metav1.ConditionTrue,
