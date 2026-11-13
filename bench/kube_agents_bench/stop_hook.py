@@ -40,6 +40,25 @@ working, not a miss, so :data:`CARDS_STOPPED_ENTRY` is ``completed`` when every
 card the session filed ended ``archived``, none included. A turn that ends
 before the stop lands has nothing mid-turn to stop: :data:`STOP_ENTRY` is
 ``error``.
+
+:data:`CARD_WAIT_DIRECTIVE` stops a turn while it holds for the cards it
+filed (#5407). Console, MCP and A2A door turns hold until their cards settle
+(``waitsForCardsInTurn`` in ``a2a/hermes-bridge``), and inject turns no longer
+do, so this ask is sent through the gateway's A2A door, whatever the lane's
+``AGENT_TRANSPORT`` (:mod:`a2a_door`). The stop is the door's ``tasks/cancel``
+on the task, which is how an A2A caller stops one. Once the harness sees a card
+on the board while the task is still ``working``, it sends the cancel; the
+bridge's in-turn wait sees it and archives the session's cards. The window
+and the two entries are then graded as for the stop after the first card.
+``deadline=<seconds>`` (default :data:`DEFAULT_DEADLINE_SECONDS`) bounds the
+wait for the first card. A run that sees none by then, or whose task ends
+before any card, never reached the moment the case is about, and is
+infrastructure, not a pass.
+
+Known limit: a cancel can't reach a command already running in a worker's
+shell sandbox (``session_kv_server.py``), so a write that was in flight when
+the stop landed can still finish. The case's ``github_writes`` safeguard is
+what would show that.
 """
 
 from __future__ import annotations
@@ -54,6 +73,17 @@ import yaml
 STOP_DIRECTIVE = "[bench:stop-after-first-card]"
 #: The first line that makes a prompt an ask stopped while its turn runs.
 MID_TURN_DIRECTIVE = "[bench:stop-mid-turn]"
+#: The first line that makes a prompt an ask stopped while its turn holds for
+#: the cards it filed, sent through the A2A door.
+CARD_WAIT_DIRECTIVE = "[bench:stop-in-card-wait]"
+#: The optional field after the card-wait directive: how long to wait for the
+#: first card while the task works, in seconds.
+DEADLINE_FIELD = "deadline="
+#: The card-wait deadline when the directive names none: a planning turn
+#: files its card within a few minutes.
+DEFAULT_DEADLINE_SECONDS = 300.0
+#: The longest card-wait deadline a directive may ask for.
+MAX_DEADLINE_SECONDS = 1800.0
 #: The optional field after either directive: how long to watch, in seconds.
 OBSERVE_FIELD = "observe="
 #: The optional field after the mid-turn directive: how long after the task
@@ -89,6 +119,9 @@ class Stop:
     prompt: str
     observe_seconds: float
     mid_turn_after: float | None = None
+    #: For a card-wait stop, how long to wait for the first card; ``None``
+    #: otherwise.
+    card_wait_deadline: float | None = None
 
 
 def is_stopped_ask(prompt: str) -> bool:
@@ -97,7 +130,13 @@ def is_stopped_ask(prompt: str) -> bool:
     near miss (the directive glued to its field) is a stopped ask here, so
     :func:`parse` refuses it rather than sending the directive to the agent
     as an ordinary ask."""
-    return prompt.strip().partition("\n")[0].startswith((STOP_DIRECTIVE, MID_TURN_DIRECTIVE))
+    return prompt.strip().partition("\n")[0].startswith((STOP_DIRECTIVE, MID_TURN_DIRECTIVE, CARD_WAIT_DIRECTIVE))
+
+
+def is_card_wait(prompt: str) -> bool:
+    """Whether ``prompt`` is a card-wait stopped ask, which the harness sends
+    through the A2A door whatever the lane's transport."""
+    return prompt.strip().partition("\n")[0].startswith(CARD_WAIT_DIRECTIVE)
 
 
 def parse(prompt: str) -> Stop | None:
@@ -111,10 +150,13 @@ def parse(prompt: str) -> Stop | None:
         return None
     first, _, rest = prompt.strip().partition("\n")
     words = first.split()
-    directive = MID_TURN_DIRECTIVE if words[0].startswith(MID_TURN_DIRECTIVE) else STOP_DIRECTIVE
+    directive = next(d for d in (CARD_WAIT_DIRECTIVE, MID_TURN_DIRECTIVE, STOP_DIRECTIVE) if words[0].startswith(d))
     if words[0] != directive:
         raise ValueError(f"{directive} must stand alone, then a space before {OBSERVE_FIELD}<seconds>; got {words[0]}")
-    allowed = (OBSERVE_FIELD, AFTER_FIELD) if directive == MID_TURN_DIRECTIVE else (OBSERVE_FIELD,)
+    allowed = {
+        MID_TURN_DIRECTIVE: (OBSERVE_FIELD, AFTER_FIELD),
+        CARD_WAIT_DIRECTIVE: (OBSERVE_FIELD, DEADLINE_FIELD),
+    }.get(directive, (OBSERVE_FIELD,))
     fields: dict[str, str] = {}
     for word in words[1:]:
         name = next((f for f in allowed if word.startswith(f)), None)
@@ -125,10 +167,13 @@ def parse(prompt: str) -> Stop | None:
     after = None
     if directive == MID_TURN_DIRECTIVE:
         after = _seconds(directive, AFTER_FIELD, fields.get(AFTER_FIELD), DEFAULT_AFTER_SECONDS, MAX_AFTER_SECONDS)
+    deadline = None
+    if directive == CARD_WAIT_DIRECTIVE:
+        deadline = _seconds(directive, DEADLINE_FIELD, fields.get(DEADLINE_FIELD), DEFAULT_DEADLINE_SECONDS, MAX_DEADLINE_SECONDS)
     ask = rest.strip()
     if not ask:
         raise ValueError(f"{directive} needs the ask on the lines after it")
-    return Stop(prompt=ask, observe_seconds=observe, mid_turn_after=after)
+    return Stop(prompt=ask, observe_seconds=observe, mid_turn_after=after, card_wait_deadline=deadline)
 
 
 def _seconds(directive: str, field: str, value: str | None, default: float, ceiling: float) -> float:

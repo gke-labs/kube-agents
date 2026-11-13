@@ -100,6 +100,8 @@ ARG KUBECTL_VERSION=1.35.10
 ARG KUBECTL_SHA256_AMD64=c49a28f1f4efc4d475ed05f47f2ce8e563bf7bef69ed77fe1b924ea6d83b6327
 ARG KUBECTL_SHA256_ARM64=283f1be6a46b3695b625e25030106b8ffe18bd0d3a900f5b65c259ca407f04f5
 COPY deploy/sandbox/check_kubectl_base_path.py /tmp/check_kubectl_base_path.py
+# The wrapper below asks this first, and starts Python only when the context is not registered yet.
+COPY --chmod=0755 deploy/sandbox/kubectl_context_registered.sh /usr/local/libexec/kubectl-context-registered
 RUN ARCH=$(dpkg --print-architecture) && \
     case "${ARCH}" in \
       amd64) KUBECTL_SHA256="${KUBECTL_SHA256_AMD64}" ;; \
@@ -119,7 +121,7 @@ RUN ARCH=$(dpkg --print-architecture) && \
       'if [ -n "${KUBE_PROXY_URL:-}" ]; then' \
       '  case " $* " in' \
       '  *" --context"*)' \
-      '    PYTHONDONTWRITEBYTECODE=1 python3 -I /opt/defaults/scripts/credential_proxy_client.py --ensure-kubectl-context "$@" 2>/dev/null || true' \
+      '    /usr/local/libexec/kubectl-context-registered "$@" 2>/dev/null || PYTHONDONTWRITEBYTECODE=1 python3 -I /opt/defaults/scripts/credential_proxy_client.py --ensure-kubectl-context "$@" 2>/dev/null || true' \
       '    ;;' \
       '  esac' \
       'fi' \
@@ -587,7 +589,8 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          module name, so it is staged here as well
 #   credential_shapes.py   the token shapes the feedback gate refuses and the broker
 #                          redacts before logging: one list, imported by
-#                          feedback_broker here and by credential_proxy off-pod
+#                          feedback_broker and submit_suggestion here and by
+#                          credential_proxy off-pod
 #   feedback_broker.py     the constants the kube-agents-feedback client reads (the
 #                          route, the statuses, the fallback links, the payload's
 #                          normalisation); the same module's broker half files the
@@ -770,8 +773,8 @@ RUN find /opt/defaults -name '__pycache__' -type d -prune -exec rm -rf {} + && \
 #
 # The pull-request and issue crons run in the agent pod, hold the forge
 # credential, and do their forge work by sshing in as `hermes` and running a
-# script here. The Cluster Agent reconcile does the same for its GKE reads
-# (gke_cluster_reads.py, #3703). Two of the crons cross: forge.py for every forge verb
+# script here. The Cluster Agent reconcile and stall_watch do the same for their GKE
+# reads (gke_cluster_reads.py, #3703). Two of the crons cross: forge.py for every forge verb
 # (agents/platform/scripts/forge.py, `_forward`) and resolver.py for the issues
 # sweep's `poll` (github-issue-resolver, `_forward_to_sandbox`). The copy under
 # /opt/data is root-owned and, under the operator, a read-only mount, but it

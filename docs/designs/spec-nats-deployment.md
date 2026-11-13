@@ -353,7 +353,9 @@ Status (amended 9/4, the callout armed; amended 9/8, sessions moved; amended 9/1
 callout**, by presenting a projected ServiceAccount token: the bus provisioning Job,
 every spawned session pod, the platform agent container, the capability verifier, and
 (amended 10/28, #3655) the AgentProfile dispatcher, when the operator has its image
-(`A2A_DISPATCHER_IMAGE`; off by default until profiles dispatch end to end).
+(`A2A_DISPATCHER_IMAGE`; off by default until profiles dispatch end to end). Amended
+11/10: on by default, at the release set's image, and off at `A2A_PROFILE_DISPATCHER=false`
+(the chart's `operator.profileDispatcher.enabled`).
 The dispatcher's grants name each profile durable it reads on `PROFILE_SUBMITS` and each
 profile it dispatches for; it reconnects when its config adds one, and tasks it holds keep
 running across the reconnect. With a dispatcher the
@@ -675,7 +677,9 @@ Layout:
   new peer on 8222, whose one peer stays the operator's pod (for reload
   confirmation): a `prometheus-nats-exporter` sidecar in each NATS pod reads 8222 over
   loopback and serves on 7777, and a separate rule admits the managed collector's
-  namespace (`gke-gmp-system`) to 7777 and nothing else. The NATS pods' own route peer, which this list used to carry as owed, landed
+  namespace (`gke-gmp-system`) and the operator's own pod to 7777 and nothing else; the
+  operator reads the stream list there to notice a provisioned stream gone missing
+  (amended 11/10, #4290). The NATS pods' own route peer, which this list used to carry as owed, landed
   with the three-server default (amended 10/29, #3274): a separate rule admits 6222 from
   the bus's servers and nothing else, since a fence without it keeps the cluster from
   ever forming. The topic-grant corollary that two edits

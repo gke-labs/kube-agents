@@ -321,5 +321,148 @@ class FetchTest(unittest.TestCase):
         self.assertEqual(self.fetcher().fetch(self.dest).builds, ["101.2"])
 
 
+COMMIT_A, COMMIT_B, COMMIT_C = "a" * 40, "b" * 40, "c" * 40
+
+
+class PrintCommitTest(FetchTest):
+    """--print-commit: the commit the newest night of the lane's mode and forge ran, or nothing."""
+
+    def job(self, commit, **overrides):
+        job = dict(self.NEXT_GITHUB, commit=commit)
+        job.update(overrides)
+        return job
+
+    def main(self, *extra, mode_next="1"):
+        import contextlib
+        import io
+        out, err = io.StringIO(), io.StringIO()
+        original = FC.default_run
+        FC.default_run = self.bucket
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                status = FC.main(["--bucket", BUCKET, "--print-commit", "--eval-mode-next", mode_next, *extra])
+        finally:
+            FC.default_run = original
+        return status, out.getvalue(), err.getvalue()
+
+    def test_it_prints_the_newest_nights_commit_at_any_version(self):
+        # Last night (builds 100, 101, one still publishing hours later), tonight
+        # (200, 201, answers at another normalizer version than this checkout's),
+        # and a night past the window.
+        self.record("150", 1, {}, created=NOW - 40 * HOUR, job=self.job("f" * 40))
+        self.record("100", 1, {VERSION: [f"answers/{fp(1)}.json"]}, created=NOW - 26 * HOUR, job=self.job(COMMIT_A))
+        self.record("100", 2, {VERSION: [f"answers/{fp(2)}.json"]}, created=NOW - 20 * HOUR, job=self.job(COMMIT_A))
+        self.record("101", 1, {}, created=NOW - 25 * HOUR, job=self.job(COMMIT_A))
+        self.record("200", 1, {OTHER_VERSION: [f"answers/{fp(3)}.json"]}, created=NOW - 3 * HOUR, job=self.job(COMMIT_B))
+        self.record("201", 1, {}, created=NOW - 1 * HOUR, job=self.job(COMMIT_B))
+        night = self.fetcher(max_age_hours=30).night_commit()
+        self.assertEqual((night.commit, night.builds, night.commit_builds), (COMMIT_B, ["200", "201"],
+                                                                             {COMMIT_B: ["200", "201"]}))
+        self.assertEqual(night.answers, {}, "one commit: no answers need counting")
+        self.assertEqual(sorted(self.bucket.copied),
+                         [f"replay-cache/builds/{b}/publish-{ms}.json" for b, ms in
+                          (("100", 2), ("101", 1), ("200", 1), ("201", 1))],
+                         "each young build's newest record, and nothing else")
+        status, out, err = self.main()
+        self.assertEqual((status, out), (0, COMMIT_B + "\n"))
+        self.assertNotIn("commits;", err)
+
+    def test_two_commits_in_one_night_print_the_one_with_the_most_answers_and_say_so(self):
+        self.targets[f"slots/{fp(9)}.json"] = fp(1)
+        self.record("200", 1, {VERSION: [f"answers/{fp(1)}.json", f"slots/{fp(9)}.json"]},
+                    created=NOW - 3 * HOUR, job=self.job(COMMIT_B))
+        self.record("200", 2, {VERSION: [f"answers/{fp(2)}.json"]}, created=NOW - 2 * HOUR, job=self.job(COMMIT_B))
+        # The newer build, but fewer answers: one, confirmed twice.
+        self.record("201", 1, {VERSION: [f"answers/{fp(5)}.json"]}, created=NOW - 1 * HOUR, job=self.job(COMMIT_C))
+        self.record("201", 2, {VERSION: [f"answers/{fp(5)}.json"]}, created=NOW, job=self.job(COMMIT_C))
+        night = self.fetcher().night_commit()
+        self.assertEqual((night.commit, night.answers), (COMMIT_B, {COMMIT_B: 2, COMMIT_C: 1}))
+        self.assertIn("replay-cache/builds/200/publish-1.json", self.bucket.copied, "contested: every record read")
+        status, out, err = self.main()
+        self.assertEqual((status, out), (0, COMMIT_B + "\n"))
+        self.assertIn(f"name 2 commits; printing {COMMIT_B}", err)
+
+    def test_a_rerun_from_earlier_in_the_day_is_not_tonights_night(self):
+        # A Deck rerun of a nightly 11 hours before tonight's shards records under
+        # its own (older) commit, with more answers; it is not part of tonight.
+        self.record("190", 1, {VERSION: [f"answers/{fp(1)}.json", f"answers/{fp(2)}.json"]},
+                    created=NOW - 12 * HOUR, job=self.job(COMMIT_C))
+        self.record("200", 1, {VERSION: [f"answers/{fp(3)}.json"]}, created=NOW - 1 * HOUR, job=self.job(COMMIT_B))
+        night = self.fetcher().night_commit()
+        self.assertEqual((night.commit, night.builds), (COMMIT_B, ["200"]))
+
+    def test_an_answer_two_builds_of_one_commit_confirmed_counts_once(self):
+        # Two shards of commit B both confirm fp(1); commit C confirms two answers.
+        self.record("202", 1, {VERSION: [f"answers/{fp(5)}.json", f"answers/{fp(6)}.json"]},
+                    created=NOW - 3 * HOUR, job=self.job(COMMIT_C))
+        self.record("200", 1, {VERSION: [f"answers/{fp(1)}.json"]}, created=NOW - 2 * HOUR, job=self.job(COMMIT_B))
+        self.record("201", 1, {VERSION: [f"answers/{fp(1)}.json"]}, created=NOW - 1 * HOUR, job=self.job(COMMIT_B))
+        night = self.fetcher().night_commit()
+        self.assertEqual((night.commit, night.answers), (COMMIT_C, {COMMIT_B: 1, COMMIT_C: 2}))
+
+    def test_no_commit_prints_nothing_and_exits_1(self):
+        for name, records in (("empty bucket", ()),
+                              ("records before the commit", (("200", None), ("201", ""))),
+                              ("only last night named one", (("100", COMMIT_A), ("200", None)))):
+            with self.subTest(name):
+                self.bucket.created.clear()
+                for build, commit in records:
+                    job = dict(self.NEXT_GITHUB) if commit is None else self.job(commit)
+                    created = NOW - 26 * HOUR if build == "100" else NOW
+                    self.record(build, 1, {VERSION: [f"answers/{fp(1)}.json"]}, created=created, job=job)
+                if not records:
+                    self.bucket.ls_result = (1, b"ERROR: One or more URLs matched no objects.")
+                status, out, err = self.main()
+                self.bucket.ls_result = ("ok",)
+                self.assertEqual((status, out), (1, ""))
+                self.assertIn("stays on main", err)
+
+    def test_other_modes_and_forges_are_ignored(self):
+        self.record("200", 1, {VERSION: [f"answers/{fp(1)}.json"]}, created=NOW - 3 * HOUR, job=self.job(COMMIT_B))
+        self.record("300", 1, {VERSION: [f"answers/{fp(2)}.json", f"answers/{fp(3)}.json"]}, created=NOW,
+                    job=self.job(COMMIT_C, name="ci-kube-agents-eval-nightly-gitlab", mode="today", forge="gitlab"))
+        self.record("301", 1, {VERSION: [f"answers/{fp(4)}.json"]}, created=NOW,
+                    job=self.job(COMMIT_A, mode="today"))
+        self.record("302", 1, {VERSION: [f"answers/{fp(5)}.json"]}, created=NOW, job=None)
+        night = self.fetcher().night_commit()
+        self.assertEqual((night.commit, night.builds, night.other_job_records), (COMMIT_B, ["200"], 3))
+        status, out, _ = self.main()
+        self.assertEqual((status, out), (0, COMMIT_B + "\n"))
+        status, out, _ = self.main("--forge", "gitlab", mode_next="")
+        self.assertEqual((status, out), (0, COMMIT_C + "\n"), "the lane's own mode and forge pick the night")
+
+    def test_records_without_a_commit_are_tolerated(self):
+        # A night of records some of which predate the commit: they count for
+        # nothing, the others decide. fetch() reads them as it always has.
+        self.objects(VERSION, f"answers/{fp(1)}.json", f"answers/{fp(2)}.json")
+        self.record("200", 1, {VERSION: [f"answers/{fp(1)}.json"]}, created=NOW - 2 * HOUR)
+        self.record("201", 1, {VERSION: [f"answers/{fp(2)}.json"]}, created=NOW - 1 * HOUR, job=self.job(COMMIT_B))
+        night = self.fetcher().night_commit()
+        self.assertEqual((night.commit, night.uncommitted_builds), (COMMIT_B, 1))
+        self.assertEqual(self.fetcher().fetch(self.dest).downloaded, 2)
+
+    def test_a_record_out_of_shape_refuses_and_prints_nothing(self):
+        for name, objects, commit in (("a commit that is not one", {}, "HEAD"),
+                                      ("an uppercase commit", {}, "A" * 40),
+                                      ("a name outside the layout at another version",
+                                       {OTHER_VERSION: [("answers/../x.json", 1, "")]}, COMMIT_B)):
+            with self.subTest(name):
+                self.bucket.created.clear()
+                self.record("200", 1, objects, job=self.job(commit))
+                with self.assertRaises(FC.Refused):
+                    self.fetcher().night_commit()
+                status, out, err = self.main()
+                self.assertEqual((status, out), (1, ""))
+                self.assertIn('"refused"', err)
+
+    def test_print_commit_needs_no_dest_and_fetch_still_does(self):
+        import contextlib
+        import io
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            FC.main(["--bucket", BUCKET])
+        status, out, _ = self.main("--version", "bad")
+        self.assertEqual((status, out), (1, ""), "a bad argument keeps stdout empty too")
+
+
 if __name__ == "__main__":
     unittest.main()
