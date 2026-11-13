@@ -229,10 +229,11 @@ readonly A2A_DIAG_NATS_EXEC_BOUND_SECONDS=10
 # wget's own read timeout, inside the exec's bound, so a monitor that accepts
 # and then stalls ends the read before the bound kills the exec.
 readonly A2A_DIAG_NATS_WGET_TIMEOUT_SECONDS=5
-# The first bytes of each bus server's log, beside the tail the component logs
-# keep (A2A_DIAG_LOG_MAX_BYTES). The lane runs the bus at debug (#5708), and a
-# server's bring-up, where its meta group forms, is at the start of a log a
-# long run can push out of the tail.
+# The first bytes of each bus server's current log file, beside the tail the
+# component logs keep (A2A_DIAG_LOG_MAX_BYTES). The lane runs the bus at debug
+# (#5708), and a server's bring-up, where its meta group forms, is at the start
+# of a log a long run can push out of the tail. A log the kubelet rotated has
+# lost it; the file then says so (collect_a2a_nats_monitor).
 readonly A2A_DIAG_NATS_HEAD_MAX_BYTES=$((2 * 1024 * 1024))
 readonly A2A_DIAG_NATS_IMAGES_JSONPATH='{range .items[*]}{.metadata.name}{"\t"}{range .status.containerStatuses[*]}{.name}={.imageID}{" "}{end}{"\n"}{end}'
 
@@ -1410,6 +1411,12 @@ collect_a2a_nats_monitor() {
   "${kctl[@]}" logs "pod/${pod}" -n "${ns}" -c "${A2A_DIAG_NATS_CONTAINER}" \
     --limit-bytes="${A2A_DIAG_NATS_HEAD_MAX_BYTES}" \
     >"${artifact_dir}/${prefix}${base}-head.log" 2>&1 || true
+  # kubectl serves the container's current log file only, which the kubelet
+  # rotates at 10Mi: past a rotation the head is the newest file's start, not
+  # the bring-up. Say so in the file rather than let it pass for one.
+  grep -q "Starting nats-server" "${artifact_dir}/${prefix}${base}-head.log" 2>/dev/null \
+    || echo "# no 'Starting nats-server' line: the log rotated, or the read failed; this is not the server's bring-up" \
+      >>"${artifact_dir}/${prefix}${base}-head.log" || true
   return 0
 }
 

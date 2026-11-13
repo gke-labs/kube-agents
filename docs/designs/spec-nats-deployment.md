@@ -37,10 +37,11 @@ clients off a stopping server rather than dropping them.
 **Amended 11/13 (#5708):** with `A2A_NATS_DEBUG=true` in the operator's own environment, the
 bus config carries `debug: true`. CI sets it through `operator.extraEnv`, so a failing run's
 server logs show the meta group's raft votes, terms and peer updates. It is never a CR field
-or a chart value. It is debug and never trace, because trace logs protocol frames and
+or a chart value of its own; only the chart's general `operator.extraEnv` reaches it. It is debug and never trace, because trace logs protocol frames and
 payloads and CI logs are public; debug names connections and the public keys they
-authenticated with. CI's failure collector keeps the first 2 MiB of each server's log beside
-the tail, since a long debug run can push the bring-up out of the tail.
+authenticated with. CI's failure collector keeps the first 2 MiB of each server's current log file beside the
+tail, since a long debug run can push the bring-up out of the tail. A file the kubelet rotated
+at 10Mi has lost the bring-up, and the head file then says so.
 
 **Changing the server count empties the bus.** A server that restarts in cluster mode
 finds its standalone streams unassigned in the new metadata layer and deletes them as

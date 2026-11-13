@@ -1945,6 +1945,7 @@ func TestTheBusLogsAtDebugOnlyWhenTheOperatorAsks(t *testing.T) {
 	render := func() string {
 		return renderA2ANATSConf(a2aTestAgent(), func(k string) string { return "pw-" + k }, &a2aCalloutKeys{IssuerPublic: "A", XKeyPublic: "X"}, nil)
 	}
+	t.Setenv(a2aNATSDebugEnvVar, "") // a developer shell may carry it
 	debugLine := regexp.MustCompile(`(?m)^\s*debug:`)
 	traceLine := regexp.MustCompile(`(?m)^\s*(trace|trace_verbose):`)
 	if conf := render(); debugLine.MatchString(conf) || traceLine.MatchString(conf) {

@@ -328,10 +328,12 @@ const (
 	// CI only (#5708): hack/ci-deploy.sh sets it through operator.extraEnv, so
 	// a failing run's server logs carry the meta group's raft votes, terms and
 	// peer updates. It is never a CR field or a chart value, so an install
-	// can't turn it on by accident. Debug, never trace: trace logs protocol
+	// can't turn it on by accident (only operator.extraEnv reaches it). Debug, never trace: trace logs protocol
 	// frames, payloads and CONNECT included, and CI logs are public. Debug
 	// names connections and the public keys they authenticated with, nothing
-	// secret. Anything but an explicit "true" is off.
+	// secret. Anything but an explicit "true" is off. It reaches the operator
+	// only through the chart's operator.extraEnv, which takes any variable, so
+	// turning it on is a deliberate act.
 	a2aNATSDebugEnvVar = "A2A_NATS_DEBUG"
 
 	// a2aSessionClusterViewEnvVar arms the session pods' temporary read-only
@@ -1424,10 +1426,6 @@ func a2aCardStop() string {
 	return "false"
 }
 
-// a2aInjectBackendEnabled reports whether the operator was deployed with the
-// eval flag. Anything but an explicit "true" is off, for the reason
-// a2aStrictEventsWriter gives: a typo must relax rather than tighten, and
-// here "relaxed" is the shut door.
 // renderA2ANATSDebug is the bus's debug line, present only while the
 // operator's environment asks for it (a2aNATSDebugEnvVar).
 func renderA2ANATSDebug() string {
@@ -1440,6 +1438,10 @@ debug: true
 `
 }
 
+// a2aInjectBackendEnabled reports whether the operator was deployed with the
+// eval flag. Anything but an explicit "true" is off, for the reason
+// a2aStrictEventsWriter gives: a typo must relax rather than tighten, and
+// here "relaxed" is the shut door.
 func a2aInjectBackendEnabled() bool {
 	return os.Getenv(a2aInjectBackendEnvVar) == "true"
 }

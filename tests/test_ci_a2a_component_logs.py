@@ -82,7 +82,7 @@ _KUBECTL_STUB = textwrap.dedent(
         pod="${pod%% *}"
         case "${args}" in
           *" --previous "*) echo "PREVIOUS ${pod}: auth callout exiting" ;;
-          *" --limit-bytes="*) echo "HEAD ${pod}: Starting nats-server" ;;
+          *" --limit-bytes="*) echo "${KUBECTL_HEAD_TEXT:-HEAD ${pod}: Starting nats-server}" ;;
           *) echo "CURRENT ${pod}" ;;
         esac
         ;;
@@ -107,7 +107,7 @@ _TIMEOUT_STUB = textwrap.dedent(
 
 
 class A2AComponentLogsTest(unittest.TestCase):
-    def collect(self, *, component_listing=_COMPONENT_LISTING, session_listing=_SESSION_LISTING, list_fails=False, prefix="", exec_fails=False):
+    def collect(self, *, component_listing=_COMPONENT_LISTING, session_listing=_SESSION_LISTING, list_fails=False, prefix="", exec_fails=False, head_text=""):
         """Runs collect_agent_pod_diagnostics under `set -euo pipefail`, as the
         eval's trap does. Returns the result, the artifacts dir and the calls."""
         tmp = tempfile.TemporaryDirectory()
@@ -135,6 +135,7 @@ class A2AComponentLogsTest(unittest.TestCase):
                 "AGENT_CLUSTER_CONTEXT": _CONTEXT,
                 "KUBECTL_LIST_FAILS": "1" if list_fails else "",
                 "KUBECTL_EXEC_FAILS": "1" if exec_fails else "",
+                "KUBECTL_HEAD_TEXT": head_text,
             },
             bin_dir=str(bin_dir),
             absent=("TARGET_NAMESPACE", "NAMESPACE"),
@@ -261,9 +262,17 @@ class A2AComponentLogsTest(unittest.TestCase):
         self.assertIn("-c nats", heads[0])
         self.assertIn(f"--context {_CONTEXT}", heads[0])
         self.assertIn("--limit-bytes=2097152", heads[0], limit)
+        self.assertNotIn("not the server's bring-up", (artifacts / f"a2a-nats-{_NATS}-head.log").read_text())
         # Only bus servers get a head read.
         for pod in (_CRASHING, _READY, _SESSION):
             self.assertFalse([c for c in self.logs_calls(calls, pod) if "--limit-bytes=" in c])
+
+    def test_a_head_without_the_bring_up_says_so(self) -> None:
+        # A rotated log (or a failed read) has no "Starting nats-server" at its
+        # start; the file says it isn't the bring-up rather than pass for one.
+        result, artifacts, _ = self.collect(head_text="[DBG] Client Ping Timer")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("not the server's bring-up", (artifacts / f"a2a-nats-{_NATS}-head.log").read_text())
 
     def test_the_rollback_prefix_reaches_the_bus_server_files(self) -> None:
         result, artifacts, _ = self.collect(prefix="rollback-")
