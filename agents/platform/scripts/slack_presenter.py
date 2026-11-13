@@ -384,7 +384,9 @@ CLAUSE_STOP = "."
 #: Emphasis markers a clause head's end is read through: "**Lead!**" already ends in a stop.
 CLAUSE_EMPHASIS = "*_"
 #: A first word :func:`as_line` capitalizes; "seeded-c" or "kube-system" is a name and keeps its case.
-LOWER_WORD = re.compile(r"[a-z]+(?![\w-])")
+#: Anchored, so the run is read from the start only: unanchored, a search over a long run of
+#: letters that ends on a word character or ``-`` would retry it from every offset.
+LOWER_WORD = re.compile(r"\A[a-z]+(?![\w-])")
 #: Where :func:`clause_cut` may cut a first sentence too long for the headline: after a comma, a
 #: semicolon or a spaced dash, or before "due to" or "because", which then open the rest.
 CLAUSE_BREAK = re.compile(r"(?:,|;|\s+[—–])\s+|(?P<connector>\s+)(?:due\s+to|because)\b", re.IGNORECASE)

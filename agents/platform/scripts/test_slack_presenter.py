@@ -348,6 +348,28 @@ class SplitAnswerTest(unittest.TestCase):
         self.assertEqual(head, "x" * 136 + " found 209…")
         self.assertEqual(rest, "…running GKE clusters across all projects in scope today.")
 
+    def test_the_rest_of_a_cut_is_read_for_its_first_word_once(self):
+        # The rest's first word is read from its start only: a run of letters that ends on a character
+        # the lookahead refuses is one failed read, never one from every offset (CodeQL py/polynomial-redos).
+        run = "a" * 20000
+        self.assertIsNone(sp.LOWER_WORD.search(" " + run), "the pattern is anchored")
+        for tail in ("_", "-x", "1"):
+            with self.subTest(tail=tail):
+                start = time.monotonic()
+                self.assertIsNone(sp.LOWER_WORD.search(run + tail))
+                self.assertLess(time.monotonic() - start, ARRIVAL_BUDGET_SECONDS)
+        # The same shapes through the cuts and as_line, as they were capitalized before.
+        run = "a" * 3000
+        self.assertEqual(sp.clause_cut("x" * 40 + ", " + run + "_x is the rest of it."),
+                         ("x" * 40 + ".", run + "_x is the rest of it."))
+        self.assertEqual(sp.clause_cut("x" * 40 + ", " + run + " is the rest of it."),
+                         ("x" * 40 + ".", "A" + run[1:] + " is the rest of it."))
+        self.assertEqual(sp.word_cut("x" * 40 + " " + run + "-b " + "word " * 30 + "end."),
+                         ("x" * 40 + "…", "…" + run + "-b " + "word " * 30 + "end."))
+        for name in ("seeded-c", "kube-system", "iOS", "x1", "2 clusters"):
+            self.assertEqual(sp.as_line(name + " is up"), name + " is up.")
+        self.assertEqual(sp.as_line("pods are up"), "Pods are up.")
+
     def test_a_soft_wrapped_first_sentence_is_the_whole_headline(self):
         md = "payments-api keeps crashing: secret\npayments-db-creds is missing. Since 14:02.\n- one"
         headline, body = sp.split_answer(md)

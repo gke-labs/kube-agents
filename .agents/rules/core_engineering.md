@@ -116,5 +116,5 @@ request that touches Python, Go, JavaScript or workflow files, fork pull request
 [`docs/pull-request-workflow.md`](../../docs/pull-request-workflow.md#local-validation-before-committing)
 is canonical for what that run reports, why it cannot show an alert closing, and the CLI commands
 that reproduce one before the pull request opens, from a database over the flagged file alone
-(Python) or its module (Go), before and after the change. A pull request that closes an alert
-cites both runs.
+(Python; the whole tree when the alert's source is in another file) or its module (Go), before and
+after the change. A pull request that closes an alert cites both runs.
