@@ -598,6 +598,16 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 			p.r.recordEvent(agent, corev1.EventTypeNormal, busStreamsRestoredEventReason,
 				fmt.Sprintf("Re-running the A2A provision Job restored %s.", strings.Join(last.Missing, ", ")))
 		}
+		// The re-run recreated TASKS, so an open loss of it ends here, even
+		// if no poll saw TASKS present: a client that bound to the new
+		// stream and then lost it to a second loss is covered by that
+		// loss's own date, not the first one's.
+		if loss := readBusTasksLoss(agent); loss != nil && !loss.Back {
+			loss.Back = true
+			if err := p.writeTasksLoss(ctx, agent, *loss); err != nil {
+				return err
+			}
+		}
 	} else if last != nil && !last.Settled && jobState == busJobComplete && job.UID == last.JobUID && len(verdict.missing) == 0 {
 		// An attempt whose Job delete didn't land, and the streams are back
 		// before its retry: the Job never re-ran, so it recreated nothing.
@@ -648,6 +658,9 @@ func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.Pl
 				// Warned once per loss; the condition says so in a fixed
 				// message, so a restart that keeps failing rewrites nothing,
 				// and the next poll retries it.
+				// TASKS is present on this poll, so no run in flight
+				// stands: drop it, as the polls past this branch would.
+				streak.missing, streak.misses = nil, 0
 				if !streak.restartWarnedFor.Equal(loss.At) {
 					streak.restartWarnedFor = loss.At
 					p.r.recordEvent(agent, corev1.EventTypeWarning, busStreamsRestartFailedEventReason,
