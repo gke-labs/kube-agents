@@ -385,7 +385,7 @@ class ChainTest(unittest.TestCase):
         self.assertEqual(store[first]["state"], "paused")
 
     def test_a_due_mark_is_left_for_the_tick_to_claim(self):
-        # A case that ran `hermes cron run` on it after the chain waits on that run.
+        # A case that marked it due (`cron.jobs.trigger_job`) after the chain waits on that run.
         first = STAGE_FIVE[0]
         self.write_roster(self.five(**{first: {"next_run_at": PAST}}))
         self.write_stage(fired=[first], done=False)

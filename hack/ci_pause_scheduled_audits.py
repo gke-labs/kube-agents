@@ -39,7 +39,7 @@ repeated, so an audit is paused once the stage has fired or adopted it, or the s
 done (a done stage reads no hold again, so the audits it skipped or gave up on count
 too), and no run of it is due or under way: from then on a clock run would be a second full run that
 nothing grades (#5570). A due mark is left too because a case that triggered the
-job (`hermes cron run`) waits on that run, and a pause before the tick claims it would
+job (`cron.jobs.trigger_job`) waits on that run, and a pause before the tick claims it would
 drop it. While the oobe-first-run-audits stack has the stage armed (its state file is
 there), none of the five is paused: the stack's own chain is starting them, and its
 arm.py resumes those this script paused. The state file is read again before each
