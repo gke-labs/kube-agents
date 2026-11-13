@@ -99,7 +99,13 @@ var reasonSentences = map[string]string{
 	"delegate-socket-failed":             "the agent's worker could not open its delegation channel",
 	"no-worker":                          "no worker on this install can run this request",
 	"tier-not-allowed":                   "this agent is not allowed to run requests of this kind",
-	"lease-expired":                      "the worker that took this request stopped responding; ask again",
+	// The dispatcher's re-check of a profile task's child (#5686). The
+	// gateway refuses the same at mint, so these reach the room only from a
+	// child an older gateway sent, or one that broke a rule anyway.
+	"parent-unchecked":     "this delegated request wasn't checked against the task that asked for it, so it didn't run; ask again",
+	"parent-cycle":         "this agent is already working on the request that asked for this, so it didn't run",
+	"outside-parent-scope": "this request reaches outside the cluster the task that asked for it covers, so it didn't run",
+	"lease-expired":        "the worker that took this request stopped responding; ask again",
 	// The agent ran and produced no answer.
 	"hermes-exited-nonzero":         "the agent stopped with an error before it answered",
 	"stream-ended-without-result":   "the agent stopped before it produced an answer",

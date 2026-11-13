@@ -225,7 +225,13 @@ working code - and that is the one thing 09 forbids.
 asked and that turn's session. On the wake-up turn after it, `taskId` is the minted task whose
 end woke the session (not the turn that asked), and `session` is still the session that asked.
 Like `requester` and `audience` it is populated by the gateway only and advisory; absent on a
-task a human turn started.
+task a human turn started. On a child whose parent is an AgentProfile task (#5686), `via` also
+carries the parent's `profileChain` (the waiting profile tasks above the parent, nearest last) and
+its `scope`. The dispatcher reads those for one purpose, to refuse: a child whose `session` names a
+profile it dispatches is refused when it lacks `scope` (an older gateway's, which never checked),
+when its profile is already on the chain (the chain's head may start one child of its own
+profile), or when its target lies outside the parent's scope. Nothing reads `via` as a reason to
+admit.
 
 `authority.trigger` (added 11/11, #4685) is the unattended trigger that submitted the task:
 `{"name": "schedule/compliance-audit", "origin": "builtin", "stream": "compliance-audit"}`.
