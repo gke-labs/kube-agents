@@ -26,6 +26,7 @@ import unittest
 from unittest import mock
 
 import tests.test_installer_common as _installer_common_tests
+from tests.testing import no_live_gcloud
 from tests.testing.common import (
     INSTALLER_HELP_BANNER,
     INVALID_IMMUTABLE_REFS,
@@ -92,6 +93,22 @@ def _run_installer_bash(body, env, cwd=_REPO_ROOT):
         env=env,
         cwd=str(cwd),
     )
+
+
+def setUpModule():
+    # No test here runs the real gcloud: a gcloud call that a test leaves
+    # unstubbed goes to a stand-in, and the stand-in fails the module.
+    global _NO_GCLOUD
+    _NO_GCLOUD = no_live_gcloud.install()
+
+
+def tearDownModule():
+    _NO_GCLOUD.uninstall()
+
+
+class TestNoLiveGcloud(unittest.TestCase):
+    def test_no_test_in_this_module_can_run_the_real_gcloud(self):
+        no_live_gcloud.assert_in_force(self, _NO_GCLOUD)
 
 
 class InstallScriptValidationTest(unittest.TestCase):
@@ -1768,6 +1785,7 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
         cmd4 = (
             f'{_SOURCE_INSTALLER_COMMON}'
             'kms_key_enabled_version() { echo ""; }; '
+            "gcloud() { return 1; }; "
             'validate_non_interactive_minter_config "12345" "" "ring" "key" "us-central1" "p1" "my-org"'
         )
         proc4 = self._run_install_func(cmd4)
@@ -1778,6 +1796,7 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
         self.assertIn("pass both again", proc4.stdout + proc4.stderr)
         proc4g = self._run_install_func(
             f'{_SOURCE_INSTALLER_COMMON}kms_key_enabled_version() {{ echo ""; }}; '
+            "gcloud() { return 1; }; "
             'PARAM_KMS_KEYRING_GIVEN=true PARAM_KMS_KEY_GIVEN=true; '
             'validate_non_interactive_minter_config "12345" "" "ring" "key" "us-central1" "p1" "my-org"')
         self.assertNotIn("pass both again", proc4g.stdout + proc4g.stderr)
@@ -2792,6 +2811,7 @@ print_success() {
   fi
 }
 tf_state_chat_subscription_name() { return 0; }
+gcloud() { return 1; }
 
 PROJECT_ID="test-project"
 GOOGLE_CHAT_ENABLED="true"
@@ -2841,7 +2861,7 @@ gcloud() {
 EOF
     return 0
   fi
-  command gcloud "$@"
+  return 1
 }
 
 PROJECT_ID="test-project"
@@ -2871,6 +2891,7 @@ print_success() {
   fi
 }
 tf_state_chat_subscription_name() { return 0; }
+gcloud() { return 1; }
 
 PROJECT_ID="test-project"
 GOOGLE_CHAT_ENABLED="true"
@@ -5397,7 +5418,7 @@ class MissingPemAgainstKmsTest(unittest.TestCase):
         readiness without a key, and the composition's helm release waits on it
         -- so proceeding here buys a wedged install rather than a partial one.
         """
-        proc = self._resolve("/tmp/never-existed-12345.pem", "")
+        proc = self._resolve("/tmp/never-existed-12345.pem", "", overrides="gcloud() { return 1; }; ")
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
         combined = proc.stdout + proc.stderr
         self.assertIn("GitHub App private key PEM file does not exist", combined)
@@ -11143,6 +11164,7 @@ prompt_read() {{
     eval "$var=\\"$default_val\\""
   fi
 }}
+gcloud() {{ return 1; }}
 allowed_users="" allowed_users_hint="" chat_topic_name="platform-agent-chat-events" chat_sub_name="pinned-sub" PARAM_CHAT_SUB_NAME="pinned-sub" google_chat_home_channel="" project_id="p" cluster_name="c"
 _prompt_google_chat_settings() {{
 {body}
@@ -11163,6 +11185,7 @@ prompt_read() {{
     eval "$var=\\"$default_val\\""
   fi
 }}
+gcloud() {{ return 1; }}
 allowed_users="" allowed_users_hint="" chat_topic_name="platform-agent-chat-events" chat_sub_name="platform-agent-chat-events-sub" PARAM_CHAT_SUB_NAME="platform-agent-chat-events-sub" google_chat_home_channel="" project_id="p" cluster_name="c"
 _prompt_google_chat_settings() {{
 {body}
