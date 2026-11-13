@@ -916,6 +916,7 @@ func TestOneLiveChildPerConversation(t *testing.T) {
 // later turn's request is refused, naming it; once its terminal arrives the
 // next request mints.
 func TestAStoppedChildBlocksUntilItEnds(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	ctx := context.Background()
 	conv := "discord:g1/t-stopped-child-blocks"

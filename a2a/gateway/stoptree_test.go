@@ -46,6 +46,7 @@ func refOf(t *testing.T, r *rig, conv, taskID string) TaskRef {
 // anyway hands the door's observer no deliverable and ends canceled, and a
 // console's terminal frame says canceled with no answer text.
 func TestAStoppedTaskHandsAProgramNoAnswer(t *testing.T) {
+	t.Parallel()
 	t.Run("observer", func(t *testing.T) {
 		r, _, obs := startObservedRig(t, nil)
 		conv := "discord:g1/t-stopped-no-delivery"
@@ -86,6 +87,7 @@ func TestAStoppedTaskHandsAProgramNoAnswer(t *testing.T) {
 // TestAStoppedTasksDeferredNoticeIsDropped: a refusal held for a turn's end
 // is not posted when the turn was stopped first.
 func TestAStoppedTasksDeferredNoticeIsDropped(t *testing.T) {
+	t.Parallel()
 	r, spawn, _ := startStopRig(t, nil)
 	ctx := context.Background()
 	conv := "discord:g1/t-stop-deferred"
@@ -104,6 +106,7 @@ func TestAStoppedTasksDeferredNoticeIsDropped(t *testing.T) {
 // TestAStoppedTasksSteerShortfallIsDropped: a follow-up queued and never run
 // gets no "did not run" line when the task was stopped.
 func TestAStoppedTasksSteerShortfallIsDropped(t *testing.T) {
+	t.Parallel()
 	r, _, _ := startObservedRig(t, nil)
 	conv := "discord:g1/t-stop-shortfall"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "s-1", Text: "check the fleet"}
@@ -130,6 +133,7 @@ func TestAStoppedTasksSteerShortfallIsDropped(t *testing.T) {
 // open; the stopped task's first dropped write closes it on "cancel sent"
 // with its Stop control gone.
 func TestAStoppedTasksFirstDropClosesItsLine(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	conv := "discord:g1/t-stop-first-drop"
 	origin := startChatTask(t, r, conv, false)
@@ -155,6 +159,7 @@ func TestAStoppedTasksFirstDropClosesItsLine(t *testing.T) {
 // TestAWithdrawnChildsTerminalClearsCancelUnsent: a kept child whose cancel
 // never went out has ended once its terminal relays: nothing re-sends it.
 func TestAWithdrawnChildsTerminalClearsCancelUnsent(t *testing.T) {
+	t.Parallel()
 	r, spawn, _ := startFanOutRig(t, 2)
 	conv := "discord:g1/t-withdrawn-terminal"
 	_, first, _ := withdrawnKept(t, r, spawn, conv)
@@ -169,6 +174,7 @@ func TestAWithdrawnChildsTerminalClearsCancelUnsent(t *testing.T) {
 // out, a kept child that never starts is ended by the heal past
 // FirstEventGrace, and its end ends the chain once, canceled.
 func TestTheHealEndsAWithdrawnBatchsKeptChild(t *testing.T) {
+	t.Parallel()
 	r, spawn, obs := startFanOutRig(t, 2)
 	ctx := context.Background()
 	conv := "discord:g1/t-withdrawn-heal"
@@ -204,6 +210,7 @@ func TestTheHealEndsAWithdrawnBatchsKeptChild(t *testing.T) {
 // TestAStopResendsACancelThatNeverWentOut: stopping a tree with a task whose
 // earlier cancel failed sends that cancel again.
 func TestAStopResendsACancelThatNeverWentOut(t *testing.T) {
+	t.Parallel()
 	r, spawn, _ := startFanOutRig(t, 2)
 	ctx := context.Background()
 	conv := "discord:g1/t-stop-resend"
@@ -226,6 +233,7 @@ func TestAStopResendsACancelThatNeverWentOut(t *testing.T) {
 // (fewer children on record than planned) mints no more, so the batch ends
 // once its children on record have.
 func TestAStopCaughtMidMintEndsWithItsChildren(t *testing.T) {
+	t.Parallel()
 	r, spawn, obs := startStopRig(t, nil)
 	ctx := context.Background()
 	conv := "discord:g1/t-stop-midmint"
@@ -248,6 +256,7 @@ func TestAStopCaughtMidMintEndsWithItsChildren(t *testing.T) {
 // canceled outside a tree stop (a named cancel) is healed silently: no
 // status card for a terminal the relay missed, no never-started notice.
 func TestTheFanOutHealPostsNothingForACanceledChild(t *testing.T) {
+	t.Parallel()
 	r, spawn := startBatchRig(t, 2)
 	conv := "discord:g1/t-fanout-heal-canceled"
 	f := fanOut(t, r, spawn, conv, platformTask("one"), platformTask("two"))
@@ -283,6 +292,7 @@ func TestTheFanOutHealPostsNothingForACanceledChild(t *testing.T) {
 // while it is routed to this conversation and has no observed end; a
 // re-send goes only to a task routed here.
 func TestLiveNodeNeedsThisConversationsLiveRoute(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	ctx := context.Background()
 	rec := &SessionRecord{Key: "discord:g1/t-livenode", ContextID: "ctx-livenode"}

@@ -86,6 +86,7 @@ func startStopRig(t *testing.T, tweak func(*Config)) (*rig, *fakeSpawner, *recor
 // doesn't end until the stopped children have; then it ends once, canceled,
 // and nothing wakes though a child completed.
 func TestAStopCancelsTheWholeFanOut(t *testing.T) {
+	t.Parallel()
 	r, spawn, obs := startStopRig(t, nil)
 	ctx := context.Background()
 	conv := "discord:g1/t-stop-tree"
@@ -191,6 +192,7 @@ func setTasksSubjects(t *testing.T, url string, subjects []string) {
 // A second stop re-sends the cancels; once they go out, the batch ends, the
 // chain ends once, canceled, and the next delegation mints.
 func TestAStopWhoseChildCancelFailsHoldsUntilResent(t *testing.T) {
+	t.Parallel()
 	r, spawn, obs := startStopRig(t, nil)
 	ctx := context.Background()
 	conv := "discord:g1/t-stop-tree-nocancel"
@@ -256,6 +258,7 @@ func TestAStopWhoseChildCancelFailsHoldsUntilResent(t *testing.T) {
 // holds the batch until the heal ends it past FirstEventGrace; then the
 // chain ends once, canceled, nothing wakes, and the next delegation mints.
 func TestAStoppedFanOutReleasesTheConversation(t *testing.T) {
+	t.Parallel()
 	r, spawn, obs := startStopRig(t, nil)
 	ctx := context.Background()
 	conv := "discord:g1/t-stop-release"
@@ -316,6 +319,7 @@ func TestAStoppedFanOutReleasesTheConversation(t *testing.T) {
 // on its stream past FirstEventGrace is ended by the next turn's heal: its
 // route retired and its end logged, with nothing posted.
 func TestTheHealEndsAStoppedChildThatNeverStarted(t *testing.T) {
+	t.Parallel()
 	r, spawn, _ := startStopRig(t, nil)
 	ctx := context.Background()
 	conv := "discord:g1/t-stop-heal"
@@ -389,6 +393,7 @@ func assertNothingLate(t *testing.T, r *rig, posts, edits int) {
 // a result: the room gets nothing after the stop's own "cancel sent", and
 // the drops are logged.
 func TestAStoppedChildWritesNothingLate(t *testing.T) {
+	t.Parallel()
 	r, spawn, _ := startObservedRig(t, nil)
 	conv := "discord:g1/t-stop-late-single"
 	_, _, child := delegated(t, r, spawn, conv, "")
@@ -410,6 +415,7 @@ func TestAStoppedChildWritesNothingLate(t *testing.T) {
 // TestAStoppedFanOutChildWritesNothingLate: the same for a fan-out child
 // after the stop, and its result wakes nothing.
 func TestAStoppedFanOutChildWritesNothingLate(t *testing.T) {
+	t.Parallel()
 	r, spawn, _ := startStopRig(t, nil)
 	conv := "discord:g1/t-stop-late-fanout"
 	f := fanOut(t, r, spawn, conv, platformTask("one"), platformTask("two"))
