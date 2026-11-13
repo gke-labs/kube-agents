@@ -102,13 +102,14 @@ _AGENT_DATA_CLAIM = "platformagent-data"
 _SHELL_DATA_CLAIM_TEMPLATE = "data"
 
 # What spec.mode: next adds, by footprint key: the A2A stack's workloads (kind, name, the
-# one container each runs), the hermes-bridge container in the agent pod, the
+# containers each runs), the hermes-bridge container in the agent pod, the
 # provisioning Job, and the NATS StatefulSet's JetStream claim.
 _A2A_NATS = "a2aNats"
 _A2A_CALLOUT = "a2aCallout"
 _A2A_VERIFIER = "a2aVerifier"
 _A2A_CONSOLE = "a2aConsole"
 _A2A_GATEWAY = "a2aGateway"
+_A2A_DISPATCHER = "a2aDispatcher"
 _A2A_PROVISION = "a2aProvision"
 _HERMES_BRIDGE = "hermesBridge"
 # The agent container's resources, which the operator copies onto the bridge under
@@ -158,13 +159,17 @@ _KIND_CRON_JOB = "CronJob"
 _KIND_POD = "Pod"
 
 # The A2A workloads next mode adds: footprint key -> (kind, name, the containers its pod
-# runs, summed into one entry). The bus pod runs nats-server and its config reloader.
+# runs, summed into one entry). The bus pod runs nats-server, its config reloader and its
+# metrics exporter.
 _A2A_WORKLOADS = {
-    _A2A_NATS: (_KIND_STATEFULSET, _A2A_NATS_WORKLOAD, ("nats", "reloader")),
+    _A2A_NATS: (_KIND_STATEFULSET, _A2A_NATS_WORKLOAD, ("nats", "reloader", "nats-exporter")),
     _A2A_CALLOUT: (_KIND_DEPLOYMENT, "platformagent-a2a-callout", ("callout",)),
     _A2A_VERIFIER: (_KIND_DEPLOYMENT, "platformagent-a2a-verifier", ("verifier",)),
     _A2A_CONSOLE: (_KIND_DEPLOYMENT, "platformagent-a2a-console", ("console",)),
     _A2A_GATEWAY: (_KIND_DEPLOYMENT, "platformagent-a2a-gateway", ("gateway",)),
+    # On by default; operator.profileDispatcher.enabled=false switches it off, and the
+    # preflight then over-counts its one pod.
+    _A2A_DISPATCHER: (_KIND_DEPLOYMENT, "platformagent-a2a-dispatcher", ("dispatcher",)),
 }
 
 # Kinds that put pods on a cluster. Every golden document of one of these has to reach the

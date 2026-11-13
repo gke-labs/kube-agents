@@ -28,6 +28,7 @@
 # obtainability-major-pdb-auto-pr, obtainability-refusal-direct-mutation,
 # pdb-remediation-pr).
 chat-stop-mid-turn-files-no-card
+chat-stop-during-card-wait-a2a-door
 stop-on-permission-refusal
 vcs-review-feedback-read-back
 scale-request-proposes-pr

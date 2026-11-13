@@ -54,12 +54,13 @@ On a GitHub Enterprise Server run (``BENCH_FORGE=github`` with
 ``BENCH_GITHUB_API_ROOT`` when set, and a pull request the reply names is one
 whose URL is on ``BENCH_GITHUB_HOST``.
 
-What it cannot see, and says so: the branch listing wants ``contents: read``,
-which the grading credential does not carry today (docs/ci-pool-projects.md
-5.5), so a listing GitHub refuses leaves ``branches_observed`` false and a
-note in the report rather than an error. A pull request is the write a
+What it may not see, and says so: the branch listing wants ``contents: read``.
+The eval's grading mint asks for it (``LEDGER_GRADING_MINT_BODY`` in
+hack/ci-eval-pr.sh, since #5519; docs/ci-pool-projects.md 5.5). A credential
+without it, or a listing GitHub refuses, leaves ``branches_observed`` false
+and a note in the report rather than an error. A pull request is the write a
 branch exists for, and the pull-request listing needs only
-``pull_requests: read``; the branch half is best effort until the grant.
+``pull_requests: read``, so the branch half stays best effort.
 """
 
 from __future__ import annotations

@@ -17,6 +17,11 @@
 # step 5 hands the operator their references, the bridge's settings and the
 # inject door, step 6b flips and gates; the constants block below says what
 # each does). Unset, nothing behaves differently either.
+#
+# The web console is installed on every lane (webConsole.enabled=true in step
+# 5, from the image step 4 builds or the candidate publishes) and gated under
+# today (6a) and, under the flag, under next (the end of 6b): its routes answer
+# and a chat turn through it gets a reply (#2462).
 # ==============================================================================
 
 set -euo pipefail
@@ -439,6 +444,48 @@ readonly CREDENTIAL_PROXY_DEPLOYMENT_NAME="${PLATFORM_AGENT_CR_NAME}-credential-
 # scripts/release/common.sh publish them by.
 readonly PLUGIN_IMAGE_PUBSUB_PLATFORM="pubsub-platform"
 readonly PLUGIN_IMAGE_STOCKOUT_INVESTIGATOR="gke-stockout-investigator"
+# The web console (a2a/cmd/web-console), installed on every lane so the
+# presubmit and the nightlies run it where a person would (#2462): step 4
+# builds its image beside the others (cloudbuild-ci.yaml's web-console step;
+# the release-candidate path installs the candidate's published one, which
+# docker-publish-ghcr.yml publishes under this name and
+# scripts/release/common.sh requires), step 5 turns it on with that image, and
+# gate_web_console (6a, and the end of 6b under next) reads its routes and
+# sends a chat turn through it.
+readonly WEB_CONSOLE_IMAGE_NAME="web-console"
+# The chart names the console's Deployment and Service <release>-web-console
+# (charts/kube-agents/templates/web-console.yaml) and serves it on 8080.
+readonly WEB_CONSOLE_NAME="${HELM_RELEASE_NAME}-web-console"
+readonly WEB_CONSOLE_PORT=8080
+# The local end of the gate's port-forward.
+readonly WEB_CONSOLE_LOCAL_PORT=18080
+readonly WEB_CONSOLE_PF_LOG="/tmp/pf-web-console.log"
+# What the gate reads and sends through the tunnel (the routes, the keys, the
+# header, the turn and the session shape) is hack/web-console-probe.sh's,
+# sourced in section 2 and shared with the round trip.
+readonly WEB_CONSOLE_ROLLOUT_TIMEOUT="600s"
+readonly WEB_CONSOLE_EXISTS_ATTEMPTS=60
+readonly WEB_CONSOLE_POLL_SECONDS=5
+# Every attempt gets a fresh tunnel (step 7 says why) after this pause; a
+# read route gets a bounded wait; the chat turn's deadline outlasts the
+# console's own turn timeout (turnTimeout, 300 s), after which the console
+# answers 504 and the next attempt sends another turn, so a quota backoff
+# that outlasts one turn is spent across attempts (five of them give the
+# turn more than three times step 7's own deadline). A 4xx, or a 200 whose
+# body is not what the route returns, is not retried: a fresh tunnel would not
+# change it (web_console_probe says which is which).
+readonly WEB_CONSOLE_GATE_ATTEMPTS=5
+readonly WEB_CONSOLE_RETRY_SECONDS=10
+readonly WEB_CONSOLE_PORT_FORWARD_WAIT_SECONDS=30
+readonly WEB_CONSOLE_ROUTE_MAX_TIME_SECONDS=60
+readonly WEB_CONSOLE_CHAT_MAX_TIME_SECONDS=330
+# How much of the console's log the failure dump shows.
+readonly WEB_CONSOLE_DIAG_LOG_LINES=100
+# How many reads, WEB_CONSOLE_POLL_SECONDS apart, a Degraded CR phase gets to
+# clear after the turn before the gate fails on it: the operator rewrites the
+# status on its next pass, which the agent Deployment's status moving starts.
+# A read that returns no phase spends one of them too and never passes.
+readonly WEB_CONSOLE_CR_ATTEMPTS=12
 # Section 7b: the Pub/Sub platform adapter must pull through the credential
 # broker. The adapter logs the first line when it connects; the broker logs
 # the second for every relayed pull. The route is the stockout investigator's
@@ -494,6 +541,15 @@ readonly A2A_GATEWAY_ELECTION_ON="true"
 # it onto the gateway from its own environment; only an exact "true" arms it.
 readonly A2A_CARD_STOP_ENV_VAR="A2A_CARD_STOP"
 readonly A2A_CARD_STOP_ON="true"
+# The gateway's A2A door (k8s-operator platformagent_a2a_manifests.go,
+# a2aAgentDoorEnvVar): on for the next lane, so the card-wait stopped ask
+# (bench stop_hook.CARD_WAIT_DIRECTIVE, #5407) can stop a turn while it holds
+# for its cards, which only console, MCP and A2A door turns do. A default
+# install leaves the door off; the lane diverges here on purpose. The door
+# authenticates every call with its own per-install token, which
+# hack/ci-eval-pr.sh reads from the Secret the operator renders.
+readonly A2A_AGENT_DOOR_ENV_VAR="A2A_AGENT_DOOR"
+readonly A2A_AGENT_DOOR_ON="true"
 # The bridge sidecar. The operator renders it into the agent pod under next
 # (platformagent_a2a_bridge.go): its bus identity, its env and the bus token
 # it must not mount are the operator's, not this script's. The script names
@@ -527,10 +583,8 @@ readonly EVAL_TASK_PARALLELISM_DEFAULT=4
 readonly BRIDGE_QUEUE_CAPACITY=1024
 # The TASKS consumer budget's terms, as the operator sizes it
 # (k8s-operator/internal/controller/platformagent_a2a_manifests.go): a fresh
-# stream is created at max(budget, A2A_TASKS_FLOOR) - plus 64 for the
-# AgentProfile durables when the operator renders the dispatcher, which this
-# lane leaves off (no A2A_DISPATCHER_IMAGE, step 4), as a default install
-# does - where the budget is
+# stream is created at max(budget, A2A_TASKS_FLOOR) - the AgentProfile
+# dispatcher's durables are on PROFILE_SUBMITS, not TASKS - where the budget is
 # maxSessions * A2A_SESSION_CONSUMERS + A2A_RESERVE_FIXED +
 # A2A_RESERVE_PER_WORKER * (the bridge workers the pod runs, rendered or
 # declared); provisioning never edits a stream that exists, and a later
@@ -637,14 +691,14 @@ readonly MODE_NEXT_ENTRYPOINT_MATCH_LINES=40
 # platformagent_a2a_manifests.go, a2aCalloutImage in platformagent_a2a_callout.go,
 # a2aVerifierImage in platformagent_a2a_verifier.go, a2aConsoleImage in
 # platformagent_a2a_console.go) and the repository names step 4 pushes the
-# builds under. The AgentProfile dispatcher's image is built and pushed too
-# (A2A_DISPATCHER_IMAGE_NAME), but its override, A2A_DISPATCHER_IMAGE, is not
-# set: the dispatcher is off by default until profiles dispatch end to end.
+# builds under, and the AgentProfile dispatcher's (a2aDispatcherImage in
+# platformagent_a2a_dispatcher.go), which runs by default.
 readonly A2A_GATEWAY_IMAGE_ENV_VAR="A2A_GATEWAY_IMAGE"
 readonly A2A_CALLOUT_IMAGE_ENV_VAR="A2A_CALLOUT_IMAGE"
 readonly A2A_WORKER_IMAGE_ENV_VAR="A2A_WORKER_IMAGE"
 readonly A2A_VERIFIER_IMAGE_ENV_VAR="A2A_VERIFIER_IMAGE"
 readonly A2A_CONSOLE_IMAGE_ENV_VAR="A2A_CONSOLE_IMAGE"
+readonly A2A_DISPATCHER_IMAGE_ENV_VAR="A2A_DISPATCHER_IMAGE"
 # Two of the rendered bridge's four operator settings (a2aBridgeImageEnvVar
 # and a2aBridgeConcurrencyOperatorEnvVar in platformagent_a2a_bridge.go): its
 # image and its BRIDGE_CONCURRENCY. The operator reads them from its own
@@ -661,6 +715,10 @@ readonly A2A_WORKER_IMAGE_NAME="a2a-worker"
 readonly A2A_VERIFIER_IMAGE_NAME="a2a-verifier"
 readonly A2A_CONSOLE_IMAGE_NAME="a2a-console"
 readonly A2A_DISPATCHER_IMAGE_NAME="a2a-dispatcher"
+# The cluster AgentProfile's persona image (a2a/Dockerfile.persona-cluster,
+# context agents/cluster/persona), built beside the A2A images so the lane runs
+# this tree's persona.
+readonly PERSONA_CLUSTER_IMAGE_NAME="persona-cluster"
 # The bridge image goes to the operator too (A2A_BRIDGE_IMAGE_ENV_VAR), which
 # renders the bridge sidecar from it.
 readonly A2A_BRIDGE_IMAGE_NAME="hermes-bridge"
@@ -726,10 +784,21 @@ if ! command -v ssh-keygen >/dev/null 2>&1; then
   exit 1
 fi
 
+# The web console gate (6a) reads the console's JSON with python3, which the
+# round trip (hack/rollback-roundtrip.sh) and the eval already need; checked
+# here so a runner without it fails before the build rather than after it.
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "ERROR: python3 is required to verify the web console's routes"
+  exit 1
+fi
+
 # ─── 2. Configuration Environment Variables ───────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/ci-env.sh"
 source "${SCRIPT_DIR}/../tags.env"
+# The web console probe the gate in 6a runs, shared with the round trip.
+# shellcheck source=hack/web-console-probe.sh
+source "${SCRIPT_DIR}/web-console-probe.sh"
 # EVAL_REPLAY_SHADOW and its bucket and job tags (resolve_replay_shadow in
 # ci-env.sh), checked before anything is built, the way the session-affinity
 # settings are above.
@@ -741,6 +810,8 @@ stop_deploy_heartbeat() { kill "${DEPLOY_HEARTBEAT_PID:-}" 2>/dev/null || true; 
 deploy_exit() {
   dump_prow_artifacts_on_failure
   stop_deploy_heartbeat
+  # The web console gate's tunnel (6a), if a failure left one open.
+  kill "${WEB_CONSOLE_PF_PID:-}" 2>/dev/null || true
 }
 trap deploy_exit EXIT
 
@@ -804,8 +875,11 @@ A2A_OPERATOR_ENV_ARGS=()
 # first-run chain included) writes one whenever a pool repository declares a
 # workload with a major finding (#3439). spec.deployment.env carries the
 # switch; the operator forwards it to the shell sandbox, where finish runs.
-# It also enables the optional `tse` AgentProfile so `mode: next` eval lanes
-# scaffold `/opt/data/profiles/tse` (#3492). Empty on the today lane, so that
+# It also enables the `cluster` AgentProfile, which the profile dispatcher
+# serves (its images are set with the A2A overrides below). Not the optional
+# `tse` one: its chart persona image is a placeholder a dispatched worker can't
+# stage, so the lane leaves it off, and its case parked, until #3842 gives it a
+# real one (#3492 enabled it here for the Kanban scaffold). Empty on the today lane, so that
 # release stays byte-for-byte the same.
 # env[3], set on every lane in the install below, turns the broker's proposal
 # readings sweep off (CREDENTIAL_PROXY_VCS_READINGS=off). Its hourly forge
@@ -817,7 +891,7 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   MODE_NEXT_ENV_ARGS=(
     --set-string "platformAgent.deployment.env[4].name=KUBEAGENTS_AUDIT_AUTO_PROMOTE"
     --set-string "platformAgent.deployment.env[4].value=false"
-    --set "profiles.tse.enabled=true"
+    --set "profiles.cluster.enabled=true"
   )
 fi
 
@@ -920,6 +994,9 @@ if [ -n "${RC_COMMIT_SHA:-}" ]; then
     --set-string "agentSandbox.image.tag=${TAG}"
     --set-string "plugins.pubsubPlatform.image.tag=${TAG}"
     --set-string "plugins.stockoutInvestigator.image.tag=${TAG}"
+    # The web console too: the chart defaults its repository to the published
+    # one, so the tag is the whole of it.
+    --set-string "webConsole.image.tag=${TAG}"
   )
   DEPLOY_SOURCE="release candidate ${RC_COMMIT_SHA:0:7} from ${RC_REGISTRY_PREFIX}"
 else
@@ -934,13 +1011,17 @@ else
     --set-string "plugins.pubsubPlatform.image.tag=${TAG}"
     --set-string "plugins.stockoutInvestigator.image.repository=${AR_REPO}/${PLUGIN_IMAGE_STOCKOUT_INVESTIGATOR}"
     --set-string "plugins.stockoutInvestigator.image.tag=${TAG}"
+    # The web console, from the image step 4 builds beside the others
+    # (cloudbuild-ci.yaml's web-console step).
+    --set-string "webConsole.image.repository=${AR_REPO}/${WEB_CONSOLE_IMAGE_NAME}"
+    --set-string "webConsole.image.tag=${TAG}"
   )
   DEPLOY_SOURCE="PR #${PULL_NUMBER:-local} build (${TAG})"
 fi
 
 # vertex_ai stays the default, for the presubmits' concurrency. On 2026-09-02
 # every smoke run redded on 429s from one shared Gemini Developer API key's
-# fixed paid-tier-3 quota -- 8,000,000 input tokens/minute for gemini-3.1-pro,
+# fixed paid-tier-3 quota -- 8,000,000 input tokens/minute for the model then in use,
 # named in the error body -- with five concurrent builds drawing ~94k-token
 # turns from one shared minute window (#1097; the full diagnosis with build
 # artifacts is on #1184). Vertex AI serves the same Gemini models under dynamic
@@ -1792,6 +1873,7 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   A2A_CONSOLE_URI="${A2A_IMAGE_PREFIX}/${A2A_CONSOLE_IMAGE_NAME}:${TAG}"
   A2A_BRIDGE_URI="${A2A_IMAGE_PREFIX}/${A2A_BRIDGE_IMAGE_NAME}:${TAG}"
   A2A_DISPATCHER_URI="${A2A_IMAGE_PREFIX}/${A2A_DISPATCHER_IMAGE_NAME}:${TAG}"
+  PERSONA_CLUSTER_URI="${A2A_IMAGE_PREFIX}/${PERSONA_CLUSTER_IMAGE_NAME}:${TAG}"
   A2A_OPERATOR_ENV_ARGS=(
     --set-string "operator.extraEnv[0].name=${A2A_GATEWAY_IMAGE_ENV_VAR}"
     --set-string "operator.extraEnv[0].value=${A2A_GATEWAY_URI}"
@@ -1822,10 +1904,22 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     # on by default, and set here so the lane doesn't depend on the default.
     --set-string "operator.extraEnv[9].name=${A2A_GATEWAY_ELECTION_ENV_VAR}"
     --set-string "operator.extraEnv[9].value=${A2A_GATEWAY_ELECTION_ON}"
-    # No A2A_DISPATCHER_IMAGE: the AgentProfile dispatcher is off by default
-    # until profiles dispatch end to end, and the lane installs what a
-    # default install does. Its image is still built (step 4) so the build
-    # stays green; setting the override here is how the lane would turn it on.
+    # The AgentProfile dispatcher runs by default, so the lane runs it too,
+    # from this build: unoverridden, the operator derives its image from the
+    # operator's registry, as it would the verifier's.
+    --set-string "operator.extraEnv[10].name=${A2A_DISPATCHER_IMAGE_ENV_VAR}"
+    --set-string "operator.extraEnv[10].value=${A2A_DISPATCHER_URI}"
+    # The profiles' images. Unset, the chart takes each from ghcr at the agent
+    # image's tag, which on this lane is a CI tag ghcr never has, and the
+    # profile's worker never pulls. The cluster profile runs this build's
+    # persona and worker.
+    --set-string "profiles.cluster.persona.image.repository=${A2A_IMAGE_PREFIX}/${PERSONA_CLUSTER_IMAGE_NAME}"
+    --set-string "profiles.cluster.persona.image.tag=${TAG}"
+    --set-string "profiles.cluster.harness.image.repository=${A2A_IMAGE_PREFIX}/${A2A_WORKER_IMAGE_NAME}"
+    --set-string "profiles.cluster.harness.image.tag=${TAG}"
+    # The A2A door, for the card-wait stopped ask (above).
+    --set-string "operator.extraEnv[11].name=${A2A_AGENT_DOOR_ENV_VAR}"
+    --set-string "operator.extraEnv[11].value=${A2A_AGENT_DOOR_ON}"
   )
 fi
 
@@ -1837,7 +1931,7 @@ fi
 if [ -n "${RC_COMMIT_SHA:-}" ]; then
   echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Skipping image builds: installing published images at ${RC_COMMIT_SHA:0:7} ==="
   if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
-    echo "EVAL_MODE_NEXT=1: the A2A gateway, auth callout, worker, verifier, dispatcher and console images and the Hermes bridge sidecar are the candidate's published ones, from ${A2A_IMAGE_PREFIX}"
+    echo "EVAL_MODE_NEXT=1: the A2A gateway, auth callout, worker, verifier, dispatcher and console images, the cluster persona and the Hermes bridge sidecar are the candidate's published ones, from ${A2A_IMAGE_PREFIX}"
   fi
 else
   STEP_START=$SECONDS
@@ -1863,6 +1957,9 @@ else
   # release-candidate path installs the candidate's published ones, section
   # 2a, and skipped this section above), so they are always built here.
   PLUGIN_IMAGE_SUBSTITUTIONS=",_PUBSUB_PLATFORM_URI=${AR_REPO}/${PLUGIN_IMAGE_PUBSUB_PLATFORM}:${TAG},_STOCKOUT_INVESTIGATOR_URI=${AR_REPO}/${PLUGIN_IMAGE_STOCKOUT_INVESTIGATOR}:${TAG}"
+  # The web console, built on every lane for the same reason: the deploy
+  # installs it on every lane, at the reference section 2a gave the chart.
+  WEB_CONSOLE_BUILD_SUBSTITUTIONS=",_WEB_CONSOLE_URI=${AR_REPO}/${WEB_CONSOLE_IMAGE_NAME}:${TAG}"
   A2A_BUILD_SUBSTITUTIONS=""
   REPLAY_SHADOW_BUILD_SUBSTITUTIONS=""
   if [ -n "${REPLAY_SHADOW_PROXY_URI:-}" ]; then
@@ -1870,7 +1967,7 @@ else
     echo "Shadow replay proxy: also building its image"
   fi
   if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
-    A2A_BUILD_SUBSTITUTIONS=",_A2A_GATEWAY_URI=${A2A_GATEWAY_URI},_A2A_CALLOUT_URI=${A2A_CALLOUT_URI},_A2A_WORKER_URI=${A2A_WORKER_URI},_A2A_VERIFIER_URI=${A2A_VERIFIER_URI},_A2A_CONSOLE_URI=${A2A_CONSOLE_URI},_A2A_BRIDGE_URI=${A2A_BRIDGE_URI},_A2A_DISPATCHER_URI=${A2A_DISPATCHER_URI}"
+    A2A_BUILD_SUBSTITUTIONS=",_A2A_GATEWAY_URI=${A2A_GATEWAY_URI},_A2A_CALLOUT_URI=${A2A_CALLOUT_URI},_A2A_WORKER_URI=${A2A_WORKER_URI},_A2A_VERIFIER_URI=${A2A_VERIFIER_URI},_A2A_CONSOLE_URI=${A2A_CONSOLE_URI},_A2A_BRIDGE_URI=${A2A_BRIDGE_URI},_A2A_DISPATCHER_URI=${A2A_DISPATCHER_URI},_PERSONA_CLUSTER_URI=${PERSONA_CLUSTER_URI}"
     echo "EVAL_MODE_NEXT=1: also building the A2A gateway, auth callout, worker, verifier, dispatcher and console images and the Hermes bridge sidecar"
   fi
   # Submitted asynchronously and polled, never streamed (#3129). Without
@@ -1892,7 +1989,7 @@ else
   CLOUD_BUILD_ID=""
   CLOUD_BUILD_LOG_URL=""
   CLOUD_BUILD_SUBMIT_OUT="$(with_deadline "${BUILD_SUBMIT_TIMEOUT_SECONDS}" gcloud builds submit --async --config="deploy/docker/cloudbuild-ci.yaml" \
-    --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_SANDBOX_URI=${AR_REPO}/agent-sandbox:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG},_KUBE_PROXY_URI=${AR_REPO}/kube-proxy:${TAG}${PLUGIN_IMAGE_SUBSTITUTIONS},_CACHE_IMAGE=${CACHE_IMAGE},_BUILDCACHE_IMAGE=${BUILDCACHE_IMAGE},_PROXY_BUILDCACHE_IMAGE=${PROXY_BUILDCACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_KUBE_AGENTS_VERSION=${TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false}${A2A_BUILD_SUBSTITUTIONS}${REPLAY_SHADOW_BUILD_SUBSTITUTIONS}" \
+    --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_SANDBOX_URI=${AR_REPO}/agent-sandbox:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG},_KUBE_PROXY_URI=${AR_REPO}/kube-proxy:${TAG}${PLUGIN_IMAGE_SUBSTITUTIONS}${WEB_CONSOLE_BUILD_SUBSTITUTIONS},_CACHE_IMAGE=${CACHE_IMAGE},_BUILDCACHE_IMAGE=${BUILDCACHE_IMAGE},_PROXY_BUILDCACHE_IMAGE=${PROXY_BUILDCACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_KUBE_AGENTS_VERSION=${TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false}${A2A_BUILD_SUBSTITUTIONS}${REPLAY_SHADOW_BUILD_SUBSTITUTIONS}" \
     --project="${PROJECT_ID}" "${BUILD_WORKER_ARGS[@]}" --quiet --format="value(id,logUrl)" .)" || {
     echo "ERROR: gcloud builds submit exited $? before returning a build id (deadline ${BUILD_SUBMIT_TIMEOUT_SECONDS}s)" >&2
     exit 1
@@ -2161,6 +2258,7 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set "plugins.pubsubPlatform.enabled=true" \
     --set "plugins.stockoutInvestigator.enabled=true" \
     --set "plugins.stockoutInvestigator.applyTuning=false" \
+    --set "webConsole.enabled=true" \
     ${A2A_OPERATOR_ENV_ARGS[@]+"${A2A_OPERATOR_ENV_ARGS[@]}"} \
     ${MODE_NEXT_ENV_ARGS[@]+"${MODE_NEXT_ENV_ARGS[@]}"} \
     ${REPLAY_SHADOW_HELM_ARGS[@]+"${REPLAY_SHADOW_HELM_ARGS[@]}"} \
@@ -2298,6 +2396,138 @@ if [[ "${drift_detector_started}" != "true" ]]; then
   exit 1
 fi
 echo "✓ Rollout verification finished in $((SECONDS - STEP_START))s"
+
+# ─── 6a. The web console ──────────────────────────────────────────────────────
+# Step 5 installed the console (webConsole.enabled=true) from the image step
+# 4 built, so the lanes run it where a person would: through a port-forward to
+# its Service, which is the only way in (the chart's Service is ClusterIP
+# behind a deny-all ingress NetworkPolicy). The gate is what #2462 asks for,
+# made automatic: the console's Deployment rolls out, its page and every read
+# route answer (200 and a JSON object, the two metadata routes with the keys
+# the page reads), one chat turn through it reaches the agent and gets a
+# reply, the session's messages show the user's row and the assistant's, and
+# the CR is not Degraded afterwards. It runs here under today, and again at the
+# end of 6b under next, where the console still reaches the agent on the
+# Hermes API the today path keeps beside the bus
+# (docs/designs/spec-mode-switch.md); hack/rollback-roundtrip.sh runs the same
+# checks after each flip. The console holds the agent's key itself, so the
+# gate carries none: it sends what a browser sends, the loopback Host the
+# tunnel gives it and the console's own header on the POST.
+#
+# The requests themselves are hack/web-console-probe.sh's (web_console_probe,
+# shared with the round trip so the two cannot drift). Fresh tunnel per
+# attempt, as step 7, and the probe's split of answers: no answer, a 5xx (the
+# console's own 502 for an agent it could not reach, 503 for a busy one, 504
+# for a turn past its timeout) or a turn that ended with no assistant text is
+# worth another attempt; a 4xx, or a 200 whose body is not what the route
+# returns, is not, since the same request through a fresh tunnel gets the
+# same answer. The failure line names the route and quotes the start of its
+# body; the console's log and the CR's status follow it.
+WEB_CONSOLE_PF_PID=""
+stop_web_console_port_forward() {
+  if [ -n "${WEB_CONSOLE_PF_PID}" ]; then
+    kill "${WEB_CONSOLE_PF_PID}" 2>/dev/null || true
+    wait "${WEB_CONSOLE_PF_PID}" 2>/dev/null || true
+    WEB_CONSOLE_PF_PID=""
+  fi
+}
+
+dump_web_console_state() {
+  local label="$1"
+  echo "=== Debug: web console port-forward log (tail) ==="
+  tail -n "${WEB_CONSOLE_DIAG_LOG_LINES}" "${WEB_CONSOLE_PF_LOG}" 2>/dev/null || true
+  echo "=== Debug: web console ==="
+  kubectl get "deployment/${WEB_CONSOLE_NAME}" "svc/${WEB_CONSOLE_NAME}" -n "${NAMESPACE}" || true
+  kubectl logs -n "${NAMESPACE}" "deployment/${WEB_CONSOLE_NAME}" --tail="${WEB_CONSOLE_DIAG_LOG_LINES}" || true
+  kubectl get pods -n "${NAMESPACE}" || true
+  report_cr_status "web-console-${label}"
+}
+
+# <label> names the mode in the log and the status artifact (today, next).
+gate_web_console() {
+  local label="$1" attempt rc read_pair pair="" phase="" gate_start=$SECONDS
+  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Verifying the web console under ${label} ==="
+  for _ in $(seq 1 "${WEB_CONSOLE_EXISTS_ATTEMPTS}"); do
+    kubectl get "deployment/${WEB_CONSOLE_NAME}" -n "${NAMESPACE}" >/dev/null 2>&1 && break
+    sleep "${WEB_CONSOLE_POLL_SECONDS}"
+  done
+  if ! kubectl rollout status "deployment/${WEB_CONSOLE_NAME}" -n "${NAMESPACE}" --timeout="${WEB_CONSOLE_ROLLOUT_TIMEOUT}"; then
+    echo "ERROR: deployment/${WEB_CONSOLE_NAME} rollout failed under ${label}"
+    kubectl describe "deployment/${WEB_CONSOLE_NAME}" -n "${NAMESPACE}" || true
+    dump_web_console_state "${label}"
+    exit 1
+  fi
+  echo "✓ deployment/${WEB_CONSOLE_NAME} rolled out under ${label}"
+
+  WEB_CONSOLE_BODY_FILE="$(mktemp)"
+  WEB_CONSOLE_DETAIL="no attempt ran"
+  rc=1
+  : >"${WEB_CONSOLE_PF_LOG}"
+  for ((attempt = 1; attempt <= WEB_CONSOLE_GATE_ATTEMPTS; attempt++)); do
+    # Kill any previous tunnel and start a fresh one; the log is appended so
+    # a failure dump shows every attempt, not just the last.
+    stop_web_console_port_forward
+    echo "--- web console port-forward attempt ${attempt}/${WEB_CONSOLE_GATE_ATTEMPTS} (${label}) ---" >>"${WEB_CONSOLE_PF_LOG}"
+    kubectl port-forward "svc/${WEB_CONSOLE_NAME}" -n "${NAMESPACE}" "${WEB_CONSOLE_LOCAL_PORT}:${WEB_CONSOLE_PORT}" >>"${WEB_CONSOLE_PF_LOG}" 2>&1 &
+    WEB_CONSOLE_PF_PID=$!
+    for _ in $(seq 1 "${WEB_CONSOLE_PORT_FORWARD_WAIT_SECONDS}"); do
+      (exec 3<>"/dev/tcp/127.0.0.1/${WEB_CONSOLE_LOCAL_PORT}") 2>/dev/null && break
+      sleep 1
+    done
+    rc=0
+    web_console_probe "http://127.0.0.1:${WEB_CONSOLE_LOCAL_PORT}" "${WEB_CONSOLE_ROUTE_MAX_TIME_SECONDS}" "${WEB_CONSOLE_CHAT_MAX_TIME_SECONDS}" || rc=$?
+    [ "${rc}" -eq 0 ] && break
+    if [ "${rc}" -ne "${WEB_CONSOLE_PROBE_RETRY}" ]; then
+      echo "web console attempt ${attempt}/${WEB_CONSOLE_GATE_ATTEMPTS} (${label}) failed: ${WEB_CONSOLE_DETAIL}; a fresh tunnel would not change that"
+      break
+    fi
+    if [ "${attempt}" -lt "${WEB_CONSOLE_GATE_ATTEMPTS}" ]; then
+      echo "web console attempt ${attempt}/${WEB_CONSOLE_GATE_ATTEMPTS} (${label}) failed: ${WEB_CONSOLE_DETAIL}; respawning the tunnel in ${WEB_CONSOLE_RETRY_SECONDS}s"
+      sleep "${WEB_CONSOLE_RETRY_SECONDS}"
+    else
+      echo "web console attempt ${attempt}/${WEB_CONSOLE_GATE_ATTEMPTS} (${label}) failed: ${WEB_CONSOLE_DETAIL}"
+    fi
+  done
+  stop_web_console_port_forward
+  rm -f "${WEB_CONSOLE_BODY_FILE}"
+  if [ "${rc}" -ne 0 ]; then
+    echo "ERROR: the web console failed under ${label}: ${WEB_CONSOLE_DETAIL}"
+    dump_web_console_state "${label}"
+    exit 1
+  fi
+
+  # The CR after the turn: a console that drove something on the bus side
+  # Degraded shows up here. The operator's status can lag a pod by one pass,
+  # so a Degraded is re-read a bounded number of times before it fails. A
+  # read that returns no phase (the read swallows a failed GET, and the CR
+  # carries a status once its provisioning Job has run, so nothing read is
+  # no answer) is one more read against the same bound, never a pass, as in
+  # gate_cr_not_degraded; phase and pair keep the last read that answered,
+  # so a window that ends unread fails on that answer, or, with none, as
+  # unread.
+  for _ in $(seq 1 "${WEB_CONSOLE_CR_ATTEMPTS}"); do
+    read_pair="$(kubectl get platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" -o jsonpath="${CR_PHASE_READY_JSONPATH}" 2>/dev/null || true)"
+    if [ -n "${read_pair%%$'\t'*}" ]; then
+      pair="${read_pair}"
+      phase="${pair%%$'\t'*}"
+      [ "${phase}" = "${CR_PHASE_DEGRADED}" ] || break
+    fi
+    sleep "${WEB_CONSOLE_POLL_SECONDS}"
+  done
+  if [ -z "${phase}" ]; then
+    echo "ERROR: ${PLATFORM_AGENT_CR_NAME} is unread with the web console on under ${label}: all ${WEB_CONSOLE_CR_ATTEMPTS} reads after the turn returned no phase, so there is no phase or Ready condition to judge"
+    dump_web_console_state "${label}"
+    exit 1
+  fi
+  if [ "${phase}" = "${CR_PHASE_DEGRADED}" ]; then
+    echo "ERROR: ${PLATFORM_AGENT_CR_NAME} is ${phase} with the web console on under ${label}; Ready condition: ${pair#*$'\t'}"
+    dump_web_console_state "${label}"
+    exit 1
+  fi
+  echo "✓ web console verified under ${label} in $((SECONDS - gate_start))s (attempt ${attempt}/${WEB_CONSOLE_GATE_ATTEMPTS}; ${PLATFORM_AGENT_CR_NAME} is ${phase}: ${pair#*$'\t'})"
+}
+
+gate_web_console today
 
 # ─── 6b. EVAL_MODE_NEXT: switch to spec.mode: next and gate the bus ──────────
 # Everything above proved the today-mode install. From here the mode is set
@@ -2836,6 +3066,11 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   # now, and the backoff it may still be in has been running against the two
   # rollouts above rather than in front of them.
   gate_mode_next_rollout "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-verifier"
+
+  # The console again, now under next (6a says what it checks): the today
+  # path it talks to is still there beside the bus, and the CR stays out of
+  # Degraded with the console on.
+  gate_web_console next
 
   # What the run has to show for itself, for the artifact log: the CR status,
   # the stack the mode rendered, the ungated gateway, and the entrypoint's

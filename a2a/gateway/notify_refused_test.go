@@ -240,6 +240,7 @@ func TestNotify_APruneThatFailsStillKeeps(t *testing.T) {
 // without bound: past the queue's depth a post is answered as a plain
 // refusal, never as kept, and every requester gets exactly one answer.
 func TestNotify_AFullKeepQueueRefusesPlainly(t *testing.T) {
+	t.Parallel()
 	poster := &fakeNotifyPoster{}
 	n, err := NewSlackNotifier(poster, "", nil)
 	if err != nil {
@@ -463,6 +464,7 @@ func TestNotify_StartWithAHomeChannelPostsTheDigestBeforeAnyRequest(t *testing.T
 // Stop waits for a keep in flight, so a refused post is not lost to the
 // exit.
 func TestNotify_StopWaitsForAKeepInFlight(t *testing.T) {
+	t.Parallel()
 	s := startServer(t)
 	provision(t, s.ClientURL())
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -497,6 +499,7 @@ func TestNotify_StopWaitsForAKeepInFlight(t *testing.T) {
 // finishes, the rest get the stopping refusal without a store call, and no
 // requester is left in silence to record its post as possibly posted.
 func TestNotify_StopAnswersQueuedKeeps(t *testing.T) {
+	t.Parallel()
 	s := startServer(t)
 	provision(t, s.ClientURL())
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -614,6 +617,7 @@ func TestNotify_ARefusalDuringTheDigestStaysCounted(t *testing.T) {
 // Home requests arriving while the count is being read for the first time
 // start no second read: one prime is in flight at a time.
 func TestNotify_HomeRequestsDuringThePrimeStartOneRead(t *testing.T) {
+	t.Parallel()
 	poster := &fakeNotifyPoster{}
 	n, err := NewGchatNotifier(poster, "", nil)
 	if err != nil {
