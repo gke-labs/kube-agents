@@ -74,9 +74,10 @@ import math
 import re
 
 try:
-    from eval_dashboard import links, tiers
+    from eval_dashboard import links, slack_estimate, tiers
 except ImportError:  # run as a script from scripts/eval_dashboard/
     import links  # type: ignore[no-redef]
+    import slack_estimate  # type: ignore[no-redef]
     import tiers  # type: ignore[no-redef]
 
 # The report page render.py writes and the digest links to.
@@ -786,7 +787,7 @@ def joined_night_document(night: dict[str, dict], data: dict, previous: dict[str
     durations = [p["duration_s"] for p in own if p["duration_s"] is not None]
     primary = runs[0]
     previous_primary = (previous.get(PART_MAIN) or next(iter(previous.values()))) if previous else None
-    return {
+    doc = {
         "build": primary.get("build_id") if isinstance(primary.get("build_id"), str) else None,
         "job": primary.get("job") if isinstance(primary.get("job"), str) else None,
         "head_sha": primary.get("head_sha") if isinstance(primary.get("head_sha"), str) else None,
@@ -826,6 +827,9 @@ def joined_night_document(night: dict[str, dict], data: dict, previous: dict[str
         "shape": shape_rollup(shaped),
         "cases": cases,
     }
+    # Estimated end-to-end Slack times, from the Slack lane's overhead that night (slack_estimate).
+    slack_estimate.annotate(doc, day.isoformat() if day else None, data.get("slack_overhead"))
+    return doc
 
 
 def sorted_nightly_runs(data: dict) -> list[dict]:
@@ -873,6 +877,7 @@ def night_reports(data: dict, limit: int = NIGHTS_ON_RECORD, running: list[dict]
         sources.sort(key=lambda source: -source[0])
         previous = {part: nights[at][part] for at, part in sources}
         out.append(joined_night_document(night, data, previous or None, running, borrowed))
+    slack_estimate.average_p95(out)
     return out
 
 

@@ -433,6 +433,7 @@ jobs:
             --nightly-main-e-prefix "$NIGHTLY_MAIN_E_PREFIX" \
             --nightly-writers-b-prefix "$NIGHTLY_WRITERS_B_PREFIX" \
             --nightly-writers-c-prefix "$NIGHTLY_WRITERS_C_PREFIX" \
+            --slack-lane-prefix \
             --lane-nightly-prefix "gitlab=$GITLAB_NIGHTLY_NEXT_PREFIX" \
             --lane-pr-glob "ghes=$GHES_PR_GLOB" \
             --lane-nightly-prefix "ghes=$GHES_WEEKLY_PREFIX" \

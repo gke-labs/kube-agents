@@ -280,6 +280,17 @@ DEFAULT_NIGHTLY_WRITERS_C_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{DEFAULT_NIGHTLY_WRITER
 # archived as a periodic beside the GitHub nightly, tier gitlab, pr null.
 DEFAULT_GITLAB_NIGHTLY_JOB = "ci-kube-agents-eval-nightly-gitlab"
 DEFAULT_GITLAB_NIGHTLY_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{DEFAULT_GITLAB_NIGHTLY_JOB}/"
+# The Slack lane's nightly (oss-test-infra: ci-kube-agents-eval-nightly-slack)
+# writes the night's Slack overhead (hack/slack-lane/overhead.py) into its
+# artifacts; slack_overheads_from_gcs reads the newest SLACK_OVERHEAD_NIGHTS of
+# them into data.json's slack_overhead (SCHEMA.md), which nightly.py turns into
+# each case's estimated end-to-end Slack time (slack_estimate.py). Read only
+# with --slack-lane-prefix, and carried forward from --merge-with's file.
+SLACK_LANE_JOB = "ci-kube-agents-eval-nightly-slack"
+SLACK_LANE_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{SLACK_LANE_JOB}/"
+SLACK_OVERHEAD_FILE = "artifacts/slack-lane/slack-overhead.json"
+SLACK_OVERHEAD_NIGHTS = 14
+SLACK_OVERHEAD_KEYS = ("delivery_lag_s", "post_s", "first_ack_p50_s", "first_ack_p95_s")
 # Where Prow's Spyglass shows a build directory (links.py).
 SPYGLASS_VIEW = links.SPYGLASS_VIEW
 # What `gcloud storage ls` says about a prefix that exists but holds nothing
@@ -1689,6 +1700,27 @@ def _gcs_reader(base: str, gcloud: str):
     return reader
 
 
+def slack_overheads_from_gcs(gcloud: str = DEFAULT_GCLOUD, prefix: str = SLACK_LANE_PREFIX,
+                             limit: int = SLACK_OVERHEAD_NIGHTS) -> list[dict]:
+    """The Slack lane's recorded overhead per build, newest first: ``{build_id, date, ...}``
+    with SLACK_OVERHEAD_KEYS. A build with no overhead file, one that records an error, or
+    no lane at all yields nothing, so the pages stay quiet until the lane runs."""
+    listing = _gcloud_storage(["ls", prefix], gcloud)
+    out = []
+    for build_id, base in sorted(_build_dirs(listing or ""), key=lambda b: int(b[0]), reverse=True)[:limit]:
+        read = _gcs_reader(base, gcloud)
+        started, text = _started_at(read("started.json")), read(SLACK_OVERHEAD_FILE)
+        try:
+            doc = json.loads(text) if started and text else None
+        except ValueError:
+            doc = None
+        if isinstance(doc, dict) and "error" not in doc:
+            # Dated as the nightlies are (nightly.night_day), so it meets its own night.
+            day = nightly.night_day(started)
+            out.append({"build_id": build_id, "date": day.isoformat(), **{k: doc.get(k) for k in SLACK_OVERHEAD_KEYS}})
+    return out
+
+
 def records_location(base: str) -> bool:
     """Whether a run read from `base` carries `gcs_base`: only for a bucket
     Deck cannot read (PRIVATE_LOG_BUCKETS); elsewhere Spyglass still renders
@@ -2478,6 +2510,7 @@ def collect(
     gitlab_nightly_prefix: str | None = None,
     lane_globs: dict[str, list[str]] | None = None,
     lane_nightly_prefixes: dict[str, list[str]] | None = None,
+    slack_lane_prefix: str | None = None,
 ) -> dict:
     # gh=None skips pr_merged resolution entirely (runs carry no key), which
     # keeps library callers and unit tests hermetic; the CLI passes its --gh
@@ -2582,6 +2615,7 @@ def collect(
     # their own schedules, so one watermark per tier would skip the slower
     # job's builds once the faster one is past them.
     lane_after: dict[tuple[str, str | None, bool], int | None] = {}
+    prior_data: dict | None = None
     if merge_with is not None:
         prior_data = load_prior(merge_with, gcloud)
         if prior_data is not None:
@@ -2870,6 +2904,13 @@ def collect(
         # Trimmed as well as read-bounded: without this the carried-forward
         # list grows without limit as the RC archive does.
         data["releases"] = sorted(by_id.values(), key=_release_sort_key, reverse=True)[:rc_limit]
+    # The Slack lane's overhead, newest first: this scan's read merged over the
+    # prior file's by build, so a failed read keeps what was there.
+    known = [o for o in (prior_data or {}).get("slack_overhead") or [] if isinstance(o, dict) and isinstance(o.get("build_id"), str)]
+    fresh = slack_overheads_from_gcs(gcloud, slack_lane_prefix) if slack_lane_prefix else []
+    by_build = {o["build_id"]: o for o in known} | {o["build_id"]: o for o in fresh}
+    if by_build:
+        data["slack_overhead"] = sorted(by_build.values(), key=lambda o: int(o["build_id"]), reverse=True)[:SLACK_OVERHEAD_NIGHTS]
     return data
 
 
@@ -3026,6 +3067,16 @@ def main(argv: list[str] | None = None) -> int:
         " job, on a watermark of their own",
     )
     parser.add_argument(
+        "--slack-lane-prefix",
+        nargs="?",
+        const=SLACK_LANE_PREFIX,
+        default=None,
+        metavar="GS_PREFIX",
+        help="also read the Slack lane's per-night overhead (slack-overhead.json) from this"
+        f" Prow log prefix into slack_overhead. Given without a value: {SLACK_LANE_PREFIX}."
+        " Omitted: none read, and --merge-with's list is carried forward",
+    )
+    parser.add_argument(
         "--nightly-writers-c-prefix",
         nargs="?",
         const=DEFAULT_NIGHTLY_WRITERS_C_PREFIX,
@@ -3162,6 +3213,7 @@ def main(argv: list[str] | None = None) -> int:
         gcloud=args.gcloud,
         gh=args.gh or None,
         merge_with=args.merge_with,
+        slack_lane_prefix=args.slack_lane_prefix,
         since_days=args.since_days,
         stale_after_s=args.stale_after_s,
         index_prefix=args.index_prefix,
