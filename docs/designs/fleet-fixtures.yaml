@@ -460,6 +460,21 @@ fixtures:
       alone is set by healthy webhooks. Selectors confine it so it rejects no
       other scenario's writes.
 
+  - role: readiness-crd-webhook
+    slot: b
+    available_from_day: 0
+    objects:
+      - validatingwebhookconfiguration/seeded-crd-gate
+    defect: >-
+      failurePolicy Fail with a 2-second timeout and one rule on
+      CapacityBuffer creates and updates in the autoscaling.x-k8s.io group,
+      pointing at a Service that does not exist: the fail-closed webhook that
+      refuses the writes GKE's control plane makes in that group after a
+      1.35+ upgrade, where it installs capacitybuffers. An objectSelector on
+      the fleet label keeps it off every real object; the rule stays off
+      apiextensions.k8s.io so a dropped selector could never refuse a CRD
+      write.
+
   - role: node-local-state
     slot: a
     available_from_day: 0

@@ -543,7 +543,8 @@ type PlatformAgentReconciler struct {
 	// status.usage field -- the cluster gauges as one (usageNewerFieldGauges),
 	// the proposal readings as one (usageNewerFieldReadings), the two people
 	// readings as one (usageNewerFieldPeople), the nine origin readings as one
-	// (usageNewerFieldOrigins), lastHumanActiveTime, and each
+	// (usageNewerFieldOrigins), the three inference totals as one
+	// (usageNewerFieldInference), lastHumanActiveTime, and each other
 	// counter after the first schema by its name -- the last poll in which the usage counters poller wrote the field
 	// and it came back absent: a served CRD at a previous schema, which has
 	// the first-schema counters and not every later field. A record per field
@@ -1038,7 +1039,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// the dispatcher step's verdict (syncDispatcherJobMode), or cleanupA2A's
 	// below. A pass that reached neither leaves it as it was.
 	busCredsMapVersion := ""
-	var dispatcherJobMode *metav1.Condition
+	var dispatcherJobMode, dispatcherCeiling *metav1.Condition
 	if modeErr == nil {
 		wantNext := renderMode(instance, "nats") == ModeNext
 		exitWrite := func(condition string, err error) {
@@ -1061,6 +1062,9 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 		defer func() {
 			exitWrite(busCredentialsReadyCondition, r.syncBusCredentialsReady(ctx, instance, wantNext, busCredsMapVersion))
+			exitWrite(dispatcherCeilingCondition, r.syncDispatcherCeiling(ctx, instance, dispatcherCeiling))
+			// Last, so it outlives every status writer of its pass
+			// (TestDispatcherJobModeOutlivesTheStatusWritersOfItsPass).
 			exitWrite(dispatcherJobModeCondition, r.syncDispatcherJobMode(ctx, instance, dispatcherJobMode))
 		}()
 	}
@@ -1348,6 +1352,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// For the deferred write at 2d, failed pass or not: a step after
 		// the dispatcher's failing doesn't undo what it did to Job mode.
 		dispatcherJobMode = a2aState.dispatcherJobMode
+		dispatcherCeiling = a2aState.dispatcherCeiling
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -1356,16 +1361,25 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		// No bus, no server count. Telling the writers what the CR carried
-		// lets them write the cleared field once, and then find it current.
+		// The bus is torn down but its data claims are kept, so that a flip
+		// back reuses them, and so is the count it last ran at (#5451): with
+		// no record, the flip back reads the claims, and a single server once
+		// scaled by hand keeps claims -1 and -2 under WhenScaled Retain,
+		// which read as three servers over a one-server store and recreate
+		// every stream empty. resolveA2ABusReplicas reads the record only
+		// while a bus exists to keep (a StatefulSet or labelled claims), so a
+		// record kept here cannot bring back a bus whose claims are gone.
+		// The writers are told the value the CR carries, so the kept field
+		// reads current and no pass writes status on its account.
 		a2aState.busReplicasPersisted = instance.Status.BusReplicas
-		instance.Status.BusReplicas = 0
 		// The dispatcher and its Job mode went with the stack, unless their
 		// profile-namespace teardown failed: then the Jobs Role and templates
 		// are still live and the condition stays as it was.
 		if tornDown {
 			dispatcherJobMode = jobModeTornDown
 		}
+		// No dispatcher without the stack, so no ceiling to report.
+		dispatcherCeiling = dispatcherCeilingRemoved
 		// No callout, so no claim about its map: the condition goes.
 		removed := a2aIdentityMapRemoved
 		a2aState.calloutMap = &removed
@@ -1436,7 +1450,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
-	phase, err := r.updateStatusReady(ctx, instance, otlpEndpoint, otlpSource, netpolProf, a2aState)
+	phase, tasksWaitRequeue, err := r.updateStatusReady(ctx, instance, otlpEndpoint, otlpSource, netpolProf, a2aState)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -1445,7 +1459,8 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// workload is written, and Pods are not watched here. Requeue while the picture is
 	// still incomplete so both the failure and the later recovery reach plugin status.
 	if pluginStatusNeedsRecheck(agentPlugins, phase == "Ready") {
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		// The TASKS wait's threshold pass may be due sooner (below).
+		return ctrl.Result{RequeueAfter: minPositive(tasksWaitRequeue, 30*time.Second)}, nil
 	}
 
 	// A2A provisioning still running — Jobs are not watched (see a2aReader),
@@ -1484,7 +1499,8 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if a2aState.busReloadRequeue > 0 {
 			requeue = min(requeue, a2aState.busReloadRequeue)
 		}
-		return ctrl.Result{RequeueAfter: requeue}, nil
+		// So can the TASKS wait's threshold pass (a2aGatewayTasksWaitMessage).
+		return ctrl.Result{RequeueAfter: minPositive(tasksWaitRequeue, requeue)}, nil
 	}
 
 	// An out-of-date ClusterRole is fixed by someone re-applying the manifests,
@@ -1507,7 +1523,8 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if credentialProxyExecShort(instance) {
 			requeue = min(requeue, credentialProxyExecShortRequeue)
 		}
-		return ctrl.Result{RequeueAfter: requeue}, nil
+		// And the TASKS wait's threshold pass (a2aGatewayTasksWaitMessage).
+		return ctrl.Result{RequeueAfter: minPositive(tasksWaitRequeue, requeue)}, nil
 	}
 
 	// Secret material reaches the gateway as environment, and a container's
@@ -1542,6 +1559,12 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// and the settled lower row sends no event for it, so the pass that
 	// measures the step again is scheduled for the hold's end.
 	requeueAfter = min(requeueAfter, r.sizingStepBackRequeue(instance))
+	// An A2A gateway waiting for TASKS on a provisioned bus turns Degraded at
+	// a threshold, and pods are not watched, so the pass that writes it is
+	// scheduled, from the status pass's own read (a2aGatewayTasksWaitMessage).
+	if tasksWaitRequeue > 0 {
+		requeueAfter = min(requeueAfter, tasksWaitRequeue)
+	}
 	// The scope publisher's next run, or the moment its document goes stale:
 	// Jobs are not watched, so the pass that starts the run and the pass
 	// that turns ScopeResolved False have to be asked for.
@@ -1675,6 +1698,20 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 			if err := r.deleteManagedLiteLLMPolicy(ctx, agent); err != nil {
 				return ctrl.Result{}, err
 			}
+		}
+
+		// The bus StatefulSet is marked for deletion first, and its claims
+		// reaped only once it is. The CR's finalizer keeps the StatefulSet
+		// alive (its owner isn't deleted yet), and a claim deleted under a
+		// live StatefulSet is recreated with its pod: a fresh claim, provisioned in whatever zone
+		// that pod lands, which then outlives the StatefulSet (WhenDeleted is
+		// Retain). A reinstall reuses it pinned to that zone, and on a
+		// three-server bus that zone's node can already hold another server,
+		// so the third never schedules (the hostname spread refuses it).
+		if wait, err := r.deleteA2ANATSStatefulSetFirst(ctx, agent); err != nil {
+			return ctrl.Result{}, err
+		} else if wait {
+			return ctrl.Result{RequeueAfter: a2aNATSDeletionRecheck}, nil
 		}
 
 		// The NATS StatefulSet's volumeClaimTemplate PVCs have no owner
@@ -4777,13 +4814,14 @@ func (r *PlatformAgentReconciler) liveAgentSatisfies(ctx context.Context, agent 
 }
 
 // updateStatusReady writes the agent's status and returns the phase it settled on, so
-// the caller can decide whether the agent is still converging. otlpEndpoint, otlpSource,
+// the caller can decide whether the agent is still converging, and the requeue the
+// A2A gateway's TASKS wait needs (0 for none; a2aGatewayTasksWaitMessage). otlpEndpoint, otlpSource,
 // and netpolProfile are the resolved telemetry and network policy wiring; they are reported
 // rather than derived because discovery is otherwise invisible to anyone reading the CR.
 // a2a is what reconcileA2A found this pass (zero on a today install): whether the
 // provisioning Job is complete and what it is called, so the status write neither
 // re-reads the Job nor re-renders it to learn its name.
-func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *agentv1alpha1.PlatformAgent, otlpEndpoint, otlpSource string, netpolProfile netpolProfile, a2a a2aProvisionState) (string, error) {
+func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *agentv1alpha1.PlatformAgent, otlpEndpoint, otlpSource string, netpolProfile netpolProfile, a2a a2aProvisionState) (string, time.Duration, error) {
 	newDeploymentStatusName := ""
 	newDeploymentStatusReadyReplicas := int32(0)
 	var errWorkload error
@@ -4812,7 +4850,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		sts := &appsv1.StatefulSet{}
 		errWorkload = r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-gateway"}, sts)
 		if errWorkload != nil && !errors.IsNotFound(errWorkload) {
-			return "", fmt.Errorf("failed to get StatefulSet for status update: %w", errWorkload)
+			return "", 0, fmt.Errorf("failed to get StatefulSet for status update: %w", errWorkload)
 		}
 		if errWorkload == nil {
 			newDeploymentStatusName = sts.Name
@@ -4826,7 +4864,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		dep := &appsv1.Deployment{}
 		errWorkload = r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-gateway"}, dep)
 		if errWorkload != nil && !errors.IsNotFound(errWorkload) {
-			return "", fmt.Errorf("failed to get Deployment for status update: %w", errWorkload)
+			return "", 0, fmt.Errorf("failed to get Deployment for status update: %w", errWorkload)
 		}
 		if errWorkload == nil {
 			newDeploymentStatusName = dep.Name
@@ -4839,7 +4877,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	pvc := &corev1.PersistentVolumeClaim{}
 	errPVC := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-data"}, pvc)
 	if errPVC != nil && !errors.IsNotFound(errPVC) {
-		return "", fmt.Errorf("failed to get PVC for status update: %w", errPVC)
+		return "", 0, fmt.Errorf("failed to get PVC for status update: %w", errPVC)
 	}
 	newStorageStatusBound := false
 	if errPVC == nil {
@@ -4850,7 +4888,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	svc := &corev1.Service{}
 	errSvc := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name}, svc)
 	if errSvc != nil && !errors.IsNotFound(errSvc) {
-		return "", fmt.Errorf("failed to get Service for status update: %w", errSvc)
+		return "", 0, fmt.Errorf("failed to get Service for status update: %w", errSvc)
 	}
 	newServiceStatusEndpoint := ""
 	newAddress := ""
@@ -4864,7 +4902,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	// gateway alone.
 	splitWorkloads, a2aGatewayMsg, errSplit := r.readSplitWorkloads(ctx, agent, a2a)
 	if errSplit != nil {
-		return "", errSplit
+		return "", 0, errSplit
 	}
 	notReady := make([]string, 0, len(splitWorkloads))
 	brokerNotReady := false
@@ -4968,6 +5006,12 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	agentAPIAuthRefusal, _ := agentAPIAuthResourcesRefusal(agent)
 	sandboxResourcesRefusal, _ := shellSandboxResourcesRefusal(agent)
 	execRefusal := ValidateCredentialProxyExec(agent, nil)
+	// The A2A gateway still waiting for TASKS on a provisioned bus
+	// (a2aGatewayTasksWaitMessage): read once per pass, only while that
+	// Deployment is short of ready replicas and the bus is up. The requeue
+	// it needs goes back to Reconcile with the phase, so the pass that
+	// writes the reason is scheduled without a second read.
+	a2aTasksWaitMsg, a2aTasksWaitRequeue := r.a2aGatewayTasksWaitMessage(ctx, agent)
 
 	degradedStatus := metav1.ConditionFalse
 	degradedReason := ""
@@ -5013,6 +5057,25 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		degradedStatus = metav1.ConditionTrue
 		degradedReason = conditionReasonMinterPruningHeld
 		degradedMsg = minterHeldMessage(agent.Name+gitopsStateConfigMapSuffix, minterHeld)
+	} else if busStreams := busStreamsMissingCondition(agent); busStreams != nil {
+		// Degraded only, as the held minter entry above: the bus-stream
+		// poller owns BusStreamsPresent and the recovery
+		// (platformagent_a2a_bus_streams.go); this names the loss on the
+		// condition a reader looks at first. Ahead of the resource
+		// refusals, because it reports lost function.
+		degradedStatus = metav1.ConditionTrue
+		degradedReason = conditionReasonA2ABusStreamsMissing
+		degradedMsg = busStreams.Message
+	} else if a2aTasksWaitMsg != "" {
+		// Degraded only, as the held minter entry above: Ready and the phase
+		// keep what the workload says (Provisioning, naming the gateway), and
+		// this says why the wait is not provisioning's. It reports lost
+		// function, so it ranks above the resource refusals below; a
+		// confirmed loss of the streams (A2ABusStreamsMissing, #5474) ranks
+		// above it.
+		degradedStatus = metav1.ConditionTrue
+		degradedReason = conditionReasonA2AGatewayWaitingForTasks
+		degradedMsg = a2aTasksWaitMsg
 	} else if proxyResourcesRefusal != "" {
 		// Same shape as the git refusal above: the spec is read here, on
 		// every pass, rather than carried from reconcileCredentialProxy, so
@@ -5206,7 +5269,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		dataVolumeExpansionUnchanged &&
 		existingCond != nil && existingCond.Status == condStatus && existingCond.Reason == condReason && existingCond.Message == condMsg &&
 		existingCond.ObservedGeneration == agent.Generation {
-		return newPhase, nil
+		return newPhase, a2aTasksWaitRequeue, nil
 	}
 
 	// Apply updates
@@ -5299,12 +5362,12 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		wroteInference = &inferenceModel{Provider: newInference.Provider, Model: newInference.Model}
 	}
 	if err := r.Status().Update(ctx, agent); err != nil {
-		return newPhase, err
+		return newPhase, a2aTasksWaitRequeue, err
 	}
 	r.noteUsageStatusEcho(ctx, agent, newActiveInterfaces)
 	r.noteBusReplicasEcho(agent, writtenBusReplicas)
 	r.noteInferenceEcho(ctx, agent, wroteInference)
-	return newPhase, nil
+	return newPhase, a2aTasksWaitRequeue, nil
 }
 
 // heldUsageFields is the usage gauges' view of the served-CRD skew for one

@@ -4976,28 +4976,32 @@ class CommandExecutorTest(unittest.TestCase):
         # shared kubeconfig for that cluster. A by-hand or skill-driven fetch
         # that names no endpoint would otherwise move an internal-ip cluster
         # back to its public IP for every brokered kubectl after it.
-        executor = self.fake_gcloud(self.executor())
-        seen = []
-        original = executor._execute
+        # Both endpoint flags: a caller under the kube-api proxy sends no flag
+        # (gke_endpoint.KUBE_PROXY_ENVS), so a DNS-only cluster relies on this too.
+        for flag in ("--internal-ip", "--dns-endpoint"):
+            with self.subTest(flag):
+                executor = self.fake_gcloud(self.executor())
+                seen = []
+                original = executor._execute
 
-        def record(argv, **kwargs):
-            seen.append(argv)
-            return original(argv, **kwargs)
+                def record(argv, _seen=seen, _original=original, **kwargs):
+                    _seen.append(argv)
+                    return _original(argv, **kwargs)
 
-        with (
-            mock.patch("gke_endpoint.endpoint_decision", return_value=self.a_decision(["--internal-ip"])) as decide,
-            mock.patch.object(executor, "_execute", record),
-        ):
-            executor.execute(
-                ["gcloud", "container", "clusters", "get-credentials", "cluster-b",
-                 "--location=us-central1", "--project=demo-project"],
-            )
+                with (
+                    mock.patch("gke_endpoint.endpoint_decision", return_value=self.a_decision([flag])) as decide,
+                    mock.patch.object(executor, "_execute", record),
+                ):
+                    executor.execute(
+                        ["gcloud", "container", "clusters", "get-credentials", "cluster-b",
+                         "--location=us-central1", "--project=demo-project"],
+                    )
 
-        fetches = [argv for argv in seen if "get-credentials" in argv]
-        self.assertEqual(1, len(fetches))
-        self.assertEqual("--internal-ip", fetches[0][-1])
-        decide.assert_called_once()
-        self.assertEqual(("demo-project", "cluster-b", "us-central1"), decide.call_args.args)
+                fetches = [argv for argv in seen if "get-credentials" in argv]
+                self.assertEqual(1, len(fetches))
+                self.assertEqual(flag, fetches[0][-1])
+                decide.assert_called_once()
+                self.assertEqual(("demo-project", "cluster-b", "us-central1"), decide.call_args.args)
 
     def test_a_callers_fetch_target_is_read_through_gclouds_flag_shapes(self):
         # Every spelling a hand-typed command might carry: a global flag with a
@@ -12258,6 +12262,75 @@ class VcsRouteTest(unittest.TestCase):
             "a new verb must be classified as a read or a write",
         )
 
+    def test_write_mode_none_refuses_every_branch_and_proposal_write_before_it_spends(self):
+        refreshed = []
+        broker = self.broker(refresh=lambda provider, repository: refreshed.append(repository))
+        with mock.patch.dict(os.environ, {vcs_broker.WRITE_MODE_ENV: "none"}), mock.patch.object(
+            credential_proxy, "managed_repositories", side_effect=AssertionError("the managed list was read")
+        ):
+            for verb in sorted(vcs_broker.PROPOSE_VERBS):
+                with self.subTest(verb=verb), self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                    status, payload = self._handler(
+                        f"/v1/vcs/{verb}", {"repository": "https://github.com/acme/infra"}, broker
+                    )
+                    self.assertEqual(HTTPStatus.FORBIDDEN, status)
+                    self.assertEqual("WRITE_MODE_NONE", payload["code"])
+                    self.assertEqual(credential_proxy.RULE_VCS_WRITE_MODE, payload["rule"])
+                    self.assertIn("explain-only (writeMode: none)", payload["error"])
+                    self.assertNotIn("detail", payload)
+                    self.assertTrue(any(credential_proxy.RULE_VCS_WRITE_MODE in line for line in logs.output))
+        self.assertEqual([], refreshed)
+
+    def test_write_mode_none_keeps_reads_and_issues(self):
+        # Past the write-mode check, these reach the managed-list gate, which
+        # refuses an unregistered repository with its own code.
+        with mock.patch.dict(os.environ, {vcs_broker.WRITE_MODE_ENV: "none"}), mock.patch.object(
+            credential_proxy, "managed_repositories", return_value=frozenset()
+        ):
+            for verb in ("clone", "proposal-view", "issue-create", "issue-comment", "label-ensure"):
+                with self.subTest(verb=verb):
+                    status, payload = self._handler(
+                        f"/v1/vcs/{verb}", {"repository": "https://github.com/acme/infra"}, self.broker()
+                    )
+                    self.assertEqual(HTTPStatus.FORBIDDEN, status)
+                    self.assertEqual("REPOSITORY_NOT_MANAGED", payload.get("code"))
+
+    def test_write_mode_propose_or_unset_lets_a_write_through_to_the_next_gate(self):
+        for value in ("propose", " Propose ", ""):
+            with self.subTest(value=value), mock.patch.dict(
+                os.environ, {vcs_broker.WRITE_MODE_ENV: value}
+            ), mock.patch.object(credential_proxy, "managed_repositories", return_value=frozenset()):
+                status, payload = self._handler(
+                    "/v1/vcs/proposal-create", {"repository": "https://github.com/acme/infra"}, self.broker()
+                )
+                self.assertEqual(HTTPStatus.FORBIDDEN, status)
+                self.assertEqual("REPOSITORY_NOT_MANAGED", payload.get("code"))
+
+    def test_write_mode_is_read_on_every_request(self):
+        # Proves the broker holds no cached copy. On a pod the env changes only
+        # when the operator rolls the broker, so this is not "at once" there.
+        broker = self.broker()
+        body = {"repository": "https://github.com/acme/infra"}
+        with mock.patch.object(credential_proxy, "managed_repositories", return_value=frozenset()):
+            with mock.patch.dict(os.environ, {vcs_broker.WRITE_MODE_ENV: "none"}):
+                _, payload = self._handler("/v1/vcs/publish", body, broker)
+                self.assertEqual("WRITE_MODE_NONE", payload["code"])
+            with mock.patch.dict(os.environ, {vcs_broker.WRITE_MODE_ENV: "propose"}):
+                _, payload = self._handler("/v1/vcs/publish", body, broker)
+                self.assertEqual("REPOSITORY_NOT_MANAGED", payload.get("code"))
+
+    def test_a_misspelt_write_mode_refuses_and_says_why(self):
+        with mock.patch.dict(os.environ, {vcs_broker.WRITE_MODE_ENV: "nope"}), self.assertLogs(
+            credential_proxy.LOGGER, level="WARNING"
+        ):
+            status, payload = self._handler(
+                "/v1/vcs/publish", {"repository": "https://github.com/acme/infra"}, self.broker()
+            )
+        self.assertEqual(HTTPStatus.FORBIDDEN, status)
+        self.assertEqual("WRITE_MODE_NONE", payload["code"])
+        self.assertIn("neither none nor propose", payload["detail"])
+        self.assertNotIn("nope", json.dumps(payload))
+
     def test_a_forge_refusal_is_redacted_before_it_crosses_back(self):
         # The forge's own words are what the caller needs, and they are also a
         # string this process did not write. The sandbox is the side that must
@@ -16356,7 +16429,7 @@ def yaml_value(text):
 # outside the enum fails Envoy's validation, and any other shape fails the
 # load. A UInt32Value takes a JSON number with no fraction or a string
 # spelling one, from 0 to 2**32 - 1; anything else fails the load (Envoy
-# 1.39.1, --mode validate, on each shape the tests below name). pyyaml's
+# 1.39.1 and re-checked on 1.39.6, --mode validate, on each shape the tests below name). pyyaml's
 # integers are Envoy's: yaml-cpp converts a scalar with the base left to its
 # prefix, so both read 010 as 8 and 0x10 as 16, which Envoy's /clusters page
 # shows.
@@ -16729,7 +16802,7 @@ class ThreadCapDefaultTest(unittest.TestCase):
     def test_a_quoted_digit_priority_is_the_number_envoy_reads(self):
         # pyyaml keeps a quoted scalar a string, and so does Envoy's YAML
         # loader; proto-JSON, given a string that is not an enum value's
-        # name, reads the number it spells. Envoy 1.39.1 loads
+        # name, reads the number it spells. Envoy 1.39.1 and 1.39.6 load
         # `priority: "0"` and its /clusters page shows the DEFAULT breaker at
         # that threshold's count, so the cap has to read it the same way
         # rather than fall to 1024 under a breaker of 4096; `"2"` fails
@@ -16751,7 +16824,7 @@ class ThreadCapDefaultTest(unittest.TestCase):
             self.assertIsNone(credential_proxy._routing_priority(value), value)
 
     def test_a_count_is_bounded_by_uint32_and_an_integer_is_read_as_envoy_reads_it(self):
-        # max_connections is a UInt32Value: Envoy 1.39.1 refuses to load
+        # max_connections is a UInt32Value: Envoy 1.39.1 and 1.39.6 refuse to load
         # 4294967296 (`integer out of range`) and loads 4294967295, so the
         # first is not a count and the second is. An integer pyyaml read
         # from the file needs no re-reading: yaml-cpp converts a scalar with

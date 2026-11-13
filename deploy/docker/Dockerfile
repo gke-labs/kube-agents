@@ -49,7 +49,7 @@
 # The defaults are the upstream references, so an ordinary build is unchanged.
 ARG HERMES_AGENT_TAG
 ARG HERMES_AGENT_IMAGE=nousresearch/hermes-agent
-ARG ENVOY_VERSION=v1.39.1
+ARG ENVOY_VERSION=v1.39.6
 ARG ENVOY_IMAGE=envoyproxy/envoy
 ARG GOLANG_IMAGE=golang
 ARG GOLANG_VERSION=1.27-alpine
@@ -1459,7 +1459,7 @@ RUN install -m 0644 /tmp/kanban-scheduling/kanban_priority.py /opt/hermes/hermes
 # google.rpc.RetryInfo.retryDelay, so the three retries fell 2-6s apart. The
 # retryDelay fallback shares the header path's 600s cap and leaves the retry
 # count alone. rate_limit_backoff_floor, applied after it, covers the 429 that
-# names no window at all: gemini-4-argon's dynamic-shared-quota 429 carries no
+# names no window at all: Vertex's dynamic-shared-quota 429 carries no
 # header, no field and no RetryInfo, so the three retries still fell 2-6s apart
 # inside a quota minute that was still closed and the rep was lost as
 # hermes-rate-limited (gke-labs/kube-agents#4238). It waits a jittered 30-60s

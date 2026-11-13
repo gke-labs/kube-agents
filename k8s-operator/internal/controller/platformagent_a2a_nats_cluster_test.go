@@ -44,6 +44,33 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
+const (
+	// a2aClusterFormDeadline bounds how long the three embedded servers may
+	// take to peer and elect a JetStream meta leader. A fresh meta group
+	// campaigns within about a second, often before the TLS routes are up,
+	// and nats-server retries a failed election on a randomized four-to-nine
+	// second timer, so a loaded CI runner can legitimately need several
+	// rounds. A healthy run leaves the loop in three to ten seconds; the
+	// deadline only bounds the slow path.
+	a2aClusterFormDeadline = 90 * time.Second
+	// a2aClusterFormPoll is how often the formation loop re-reads the servers.
+	a2aClusterFormPoll = 100 * time.Millisecond
+	// a2aClusterRouteSettle is how long, once the cluster has formed, each
+	// server gets to settle on exactly one route connection per peer. A pair
+	// that dialled each other at once drops the duplicate within a round
+	// trip; a count still wrong after this is a pooling regression.
+	a2aClusterRouteSettle = 5 * time.Second
+	// a2aClusterDeliveryDeadline is how long one publisher gets to reach one
+	// subscriber across the routes; each publisher-to-subscriber pair gets
+	// its own.
+	a2aClusterDeliveryDeadline = 10 * time.Second
+	// a2aClusterDeliveryPoll is how long one publish waits before the next.
+	a2aClusterDeliveryPoll = 200 * time.Millisecond
+	// a2aClusterIntruderWait is how long a server with a foreign certificate
+	// is given to try the routes before the test reads who it peers with.
+	a2aClusterIntruderWait = 3 * time.Second
+)
+
 // a2aTestAgentWithBusReplicas is a2aTestAgent with spec.harness.tuning.busReplicas set.
 func a2aTestAgentWithBusReplicas(n int) *agentv1alpha1.PlatformAgent {
 	agent := a2aTestAgent()
@@ -350,6 +377,105 @@ func TestHandleDeletionReapsEveryServersJetStreamPVC(t *testing.T) {
 	}
 }
 
+// The claims wait for the bus StatefulSet's deletion mark: a claim reaped
+// while it still creates pods is recreated with one and outlives it, pinned
+// to a zone (handleDeletion). The first pass marks the StatefulSet and
+// leaves every claim; a pass that finds it marked (still terminating, its
+// pods going) or gone reaps them, so a stuck pod holds nothing. A
+// StatefulSet of that name the agent doesn't control holds nothing back.
+func TestHandleDeletionReapsTheBusClaimsOnlyOnceItsStatefulSetIsMarked(t *testing.T) {
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+	agent.UID = "agent-uid"
+	agent.Finalizers = []string{platformAgentFinalizer}
+	now := metav1.Now()
+	agent.DeletionTimestamp = &now
+	sts := buildA2ANATSStatefulSet(a2aTestAgent(), "h")
+	sts.OwnerReferences = []metav1.OwnerReference{{APIVersion: agentv1alpha1.GroupVersion.String(), Kind: "PlatformAgent",
+		Name: agent.Name, UID: agent.UID, Controller: ptr.To(true)}}
+	labels := sts.Spec.VolumeClaimTemplates[0].Labels
+	objs := []client.Object{agent, sts}
+	for ordinal := range a2aNATSMaxReplicas {
+		objs = append(objs, &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+			Name: a2aNATSDataClaimName(agent, ordinal), Namespace: agent.Namespace, Labels: labels,
+		}})
+	}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+	claimsLeft := func() int {
+		n := 0
+		for ordinal := range a2aNATSMaxReplicas {
+			if cl.Get(ctx, types.NamespacedName{Name: a2aNATSDataClaimName(agent, ordinal), Namespace: agent.Namespace}, &corev1.PersistentVolumeClaim{}) == nil {
+				n++
+			}
+		}
+		return n
+	}
+
+	res, err := r.handleDeletion(ctx, agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.RequeueAfter != a2aNATSDeletionRecheck {
+		t.Errorf("RequeueAfter = %v with the StatefulSet just deleted, want %v", res.RequeueAfter, a2aNATSDeletionRecheck)
+	}
+	if n := claimsLeft(); n != a2aNATSMaxReplicas {
+		t.Fatalf("%d of %d claims left after the first pass, want all: they wait for the StatefulSet", n, a2aNATSMaxReplicas)
+	}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(sts), &appsv1.StatefulSet{}); !errors.IsNotFound(err) {
+		t.Fatalf("the bus StatefulSet survived the first pass (err=%v)", err)
+	}
+	if _, err := r.handleDeletion(ctx, agent); err != nil {
+		t.Fatal(err)
+	}
+	if n := claimsLeft(); n != 0 {
+		t.Errorf("%d claims left once the StatefulSet was gone, want none", n)
+	}
+
+	// Already marked and still terminating (its pods held by a lost node,
+	// say): the claims go on the first pass, and nothing is deleted again.
+	agent3 := a2aTestAgent()
+	agent3.UID = "agent-uid"
+	agent3.Finalizers = []string{platformAgentFinalizer}
+	agent3.DeletionTimestamp = &now
+	terminating := sts.DeepCopy()
+	terminating.ResourceVersion = ""
+	terminating.Finalizers = []string{metav1.FinalizerDeleteDependents}
+	terminating.DeletionTimestamp = &now
+	cl3 := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{agent3, terminating}, objs[2:]...)...).Build()
+	r3 := &PlatformAgentReconciler{Client: cl3, Scheme: scheme}
+	res3, err := r3.handleDeletion(ctx, agent3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res3.RequeueAfter == a2aNATSDeletionRecheck {
+		t.Error("a pass held the reap for a StatefulSet already marked for deletion")
+	}
+	if err := cl3.Get(ctx, types.NamespacedName{Name: a2aNATSDataClaimName(agent, 0), Namespace: agent.Namespace}, &corev1.PersistentVolumeClaim{}); !errors.IsNotFound(err) {
+		t.Errorf("a StatefulSet already marked held back the claim reap (err=%v)", err)
+	}
+
+	// A StatefulSet of that name the agent doesn't control: the claims go
+	// on the first pass, and the StatefulSet stays.
+	agent2 := a2aTestAgent()
+	agent2.UID = "agent-uid"
+	agent2.Finalizers = []string{platformAgentFinalizer}
+	agent2.DeletionTimestamp = &now
+	foreign := buildA2ANATSStatefulSet(a2aTestAgent(), "h")
+	cl2 := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append([]client.Object{agent2, foreign}, objs[2:]...)...).Build()
+	r2 := &PlatformAgentReconciler{Client: cl2, Scheme: scheme}
+	if _, err := r2.handleDeletion(ctx, agent2); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl2.Get(ctx, client.ObjectKeyFromObject(foreign), &appsv1.StatefulSet{}); err != nil {
+		t.Errorf("a StatefulSet the agent doesn't control was deleted (err=%v)", err)
+	}
+	if err := cl2.Get(ctx, types.NamespacedName{Name: a2aNATSDataClaimName(agent, 0), Namespace: agent.Namespace}, &corev1.PersistentVolumeClaim{}); !errors.IsNotFound(err) {
+		t.Errorf("a foreign StatefulSet held back the claim reap (err=%v)", err)
+	}
+}
+
 // Every stream and bucket the provision script creates takes the configured
 // replica count, never a literal. A stream added with --replicas=1 (or any
 // number) fails here, so a new stream cannot quietly ship R1 on a cluster.
@@ -396,6 +522,11 @@ func TestEveryProvisionedStreamTakesTheConfiguredReplicaCount(t *testing.T) {
 // them with the TLS name saved from the explicit route (saveRouteTLSName), the
 // behaviour the render's SANs rely on. A fourth server whose certificate comes
 // from another CA does not join: routes authenticate by certificate.
+//
+// Formation is polled under a wide deadline (a2aClusterFormDeadline): the
+// first meta election often runs before the routes are up, and each retry
+// waits a randomized election timeout, so wall time varies by the round the
+// cluster lands on.
 func TestTheRenderedClusterFormsOverVerifiedRoutes(t *testing.T) {
 	agent := a2aTestAgent()
 	creds := a2aFullCreds("c", "1")
@@ -444,11 +575,15 @@ func TestTheRenderedClusterFormsOverVerifiedRoutes(t *testing.T) {
 	}
 
 	servers := []*natsserver.Server{start(0, ""), start(1, ""), start(2, "")}
-	deadline := time.Now().Add(20 * time.Second)
+	// Formed means every server holds a route to each of its two peers and
+	// runs clustered JetStream, and one of them is meta leader. All of it is
+	// polled under one deadline: a server reporting clustered a tick after
+	// its peers is a moment in formation, not a verdict.
+	deadline := time.Now().Add(a2aClusterFormDeadline)
 	for {
 		formed := true
 		for _, s := range servers {
-			if len(a2aRoutePeers(t, s)) != 2 {
+			if len(a2aRoutePeers(t, s)) != 2 || !s.JetStreamIsClustered() {
 				formed = false
 			}
 		}
@@ -458,20 +593,28 @@ func TestTheRenderedClusterFormsOverVerifiedRoutes(t *testing.T) {
 		}
 		if time.Now().After(deadline) {
 			for i, s := range servers {
-				t.Logf("server %d: peers %v, clustered=%v, leader=%v", i, a2aRoutePeers(t, s), s.JetStreamIsClustered(), s.JetStreamIsLeader())
+				t.Logf("server %d: peers %v, routes=%d, clustered=%v, leader=%v", i, a2aRoutePeers(t, s), s.NumRoutes(), s.JetStreamIsClustered(), s.JetStreamIsLeader())
 			}
-			t.Fatal("the rendered cluster did not form with a JetStream meta leader within 20s")
+			t.Fatalf("the rendered cluster did not form with a JetStream meta leader within %s", a2aClusterFormDeadline)
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(a2aClusterFormPoll)
 	}
-	for i, s := range servers {
-		if !s.JetStreamIsClustered() {
-			t.Errorf("server %d is not running clustered JetStream", i)
+	// One route per peer (pool_size -1): two, not a pool of four. A pair
+	// that dialled each other at once holds a duplicate for a moment while
+	// it settles on one, so the count gets a short window of its own rather
+	// than a place in the formation deadline: a count that never reaches two
+	// is a pooling regression and is named as one, not as a slow election.
+	settled := time.Now().Add(a2aClusterRouteSettle)
+	for slices.ContainsFunc(servers, func(s *natsserver.Server) bool { return s.NumRoutes() != 2 }) {
+		if time.Now().After(settled) {
+			for i, s := range servers {
+				if n := s.NumRoutes(); n != 2 {
+					t.Errorf("server %d holds %d route connections after %s, want exactly one per peer (2)", i, n, a2aClusterRouteSettle)
+				}
+			}
+			break
 		}
-		// One route per peer (pool_size -1): two, not a pool of four.
-		if n := s.NumRoutes(); n != 2 {
-			t.Errorf("server %d holds %d route connections, want exactly one per peer (2)", i, n)
-		}
+		time.Sleep(a2aClusterFormPoll)
 	}
 
 	// Interest crosses every route in the APP account: a subscriber on each
@@ -492,32 +635,44 @@ func TestTheRenderedClusterFormsOverVerifiedRoutes(t *testing.T) {
 	for i, sub := range servers {
 		nc := connect(sub)
 		ch := make(chan *nats.Msg, 4)
-		if _, err := nc.ChanSubscribe(subject, ch); err != nil {
+		subscription, err := nc.ChanSubscribe(subject, ch)
+		if err != nil {
 			t.Fatal(err)
 		}
 		if err := nc.Flush(); err != nil {
 			t.Fatal(err)
 		}
-		deadline := time.Now().Add(5 * time.Second)
 		for j, pub := range servers {
 			if j == i {
 				continue
 			}
 			pc := connect(pub)
 			got := false
+			// Only this pair's payload counts: a retry from the previous
+			// publisher that arrived after its wait is still on the
+			// channel, and reading it as this publisher's would pass a
+			// route that carried nothing.
+			want := fmt.Sprintf("%d->%d", j, i)
+			deadline := time.Now().Add(a2aClusterDeliveryDeadline)
 			for !got && time.Now().Before(deadline) {
-				if err := pc.Publish(subject, []byte(fmt.Sprintf("%d->%d", j, i))); err != nil {
+				if err := pc.Publish(subject, []byte(want)); err != nil {
 					t.Fatal(err)
 				}
 				select {
-				case <-ch:
-					got = true
-				case <-time.After(200 * time.Millisecond):
+				case m := <-ch:
+					got = string(m.Data) == want
+				case <-time.After(a2aClusterDeliveryPoll):
 				}
 			}
 			if !got {
 				t.Errorf("a publish on server %d never reached a subscriber on server %d", j, i)
 			}
+		}
+		// Drop the subscription before the next server's round, or the
+		// retries published later land on this small channel too and the
+		// client reports a slow consumer.
+		if err := subscription.Unsubscribe(); err != nil {
+			t.Fatal(err)
 		}
 	}
 
@@ -546,7 +701,7 @@ func TestTheRenderedClusterFormsOverVerifiedRoutes(t *testing.T) {
 		}
 	}
 	intruder := start(3, foreignCA)
-	time.Sleep(3 * time.Second)
+	time.Sleep(a2aClusterIntruderWait)
 	if peers := a2aRoutePeers(t, intruder); len(peers) != 0 {
 		t.Errorf("a server with a certificate from another CA joined, peering with %v", peers)
 	}
@@ -1024,41 +1179,135 @@ func TestAConversionDropsBusProvisioned(t *testing.T) {
 	}
 }
 
-// A flip to today clears status.busReplicas: a today CR has no bus.
-func TestAFlipToTodayClearsTheBusServerCount(t *testing.T) {
+// flipRig is a next install reconciled through Reconcile, with the fake
+// client's status subresource and server-side apply.
+func flipRig(t *testing.T, agent *agentv1alpha1.PlatformAgent) (*PlatformAgentReconciler, client.Client, ctrl.Request) {
+	t.Helper()
 	scheme := setupScheme()
-	agent := a2aTestAgent()
-	keys := sandboxKeysSecret(agent)
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, keys).
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, sandboxKeysSecret(agent)).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
-	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
-	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
-	ctx := context.Background()
-	for i := 0; i < 2; i++ {
-		if _, err := r.Reconcile(ctx, req); err != nil {
-			t.Fatalf("Reconcile %d under next: %v", i+1, err)
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(64)}
+	return r, cl, ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+}
+
+func reconcileN(t *testing.T, r *PlatformAgentReconciler, req ctrl.Request, n int, when string) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		if _, err := r.Reconcile(context.Background(), req); err != nil {
+			t.Fatalf("Reconcile %d %s: %v", i+1, when, err)
 		}
 	}
+}
+
+func setMode(t *testing.T, cl client.Client, req ctrl.Request, mode string) {
+	t.Helper()
+	fresh := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(context.Background(), req.NamespacedName, fresh); err != nil {
+		t.Fatal(err)
+	}
+	fresh.Spec.Mode = ptr.To(mode)
+	if err := cl.Update(context.Background(), fresh); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A flip to today keeps status.busReplicas (#5451): the bus's claims are
+// kept for the flip back, and so is the count it ran at. The status writers
+// read the kept field as current, so no today pass writes status for it.
+func TestAFlipToTodayKeepsTheBusServerCount(t *testing.T) {
+	r, cl, req := flipRig(t, a2aTestAgent())
+	ctx := context.Background()
+	reconcileN(t, r, req, 2, "under next")
 	fresh := &agentv1alpha1.PlatformAgent{}
 	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
 		t.Fatal(err)
 	}
-	if fresh.Status.BusReplicas == 0 {
+	before := fresh.Status.BusReplicas
+	if before == 0 {
 		t.Fatal("precondition: status.busReplicas not written under next")
 	}
-	fresh.Spec.Mode = ptr.To("today")
-	if err := cl.Update(ctx, fresh); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := r.Reconcile(ctx, req); err != nil {
-		t.Fatalf("Reconcile after flip: %v", err)
-	}
+	setMode(t, cl, req, "today")
+	reconcileN(t, r, req, 2, "after the flip to today")
 	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
 		t.Fatal(err)
 	}
-	if fresh.Status.BusReplicas != 0 {
-		t.Errorf("status.busReplicas = %d after the flip to today, want 0", fresh.Status.BusReplicas)
+	if fresh.Status.BusReplicas != before {
+		t.Errorf("status.busReplicas = %d after the flip to today, want the %d it ran at", fresh.Status.BusReplicas, before)
+	}
+	rv := fresh.ResourceVersion
+	reconcileN(t, r, req, 2, "settled under today")
+	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
+		t.Fatal(err)
+	}
+	if fresh.ResourceVersion != rv {
+		t.Errorf("settled today passes wrote the CR (resourceVersion %s -> %s); the kept field must read current", rv, fresh.ResourceVersion)
+	}
+}
+
+// TestABusComesBackFromTodayAtItsCount is #5451's round trip through
+// Reconcile: a bus at a count, with data claims, flipped to today and back,
+// comes back at the count it ran, not the count its claims imply. A single
+// server once scaled by hand keeps claims 1 and 2 under WhenScaled Retain;
+// read alone they say three, over a one-server store. A bus whose claims are
+// gone has nothing to keep and comes back at the default.
+func TestABusComesBackFromTodayAtItsCount(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		single bool
+		claims []int
+		want   int32
+	}{
+		{"one server with stray claims 1 and 2", true, []int{0, 1, 2}, 1},
+		{"three servers with claims 0-2", false, []int{0, 1, 2}, 3},
+		{"one server, claims gone under today: a new bus", true, nil, agentv1alpha1.DefaultBusReplicas},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := a2aTestAgent()
+			if tc.single {
+				agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(1)}}
+			}
+			r, cl, req := flipRig(t, agent)
+			ctx := context.Background()
+			reconcileN(t, r, req, 2, "under next")
+			fresh := &agentv1alpha1.PlatformAgent{}
+			if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
+				t.Fatal(err)
+			}
+			if tc.single {
+				// The field goes; the record keeps the bus at one server.
+				fresh.Spec.Harness.Tuning.BusReplicas = nil
+				if err := cl.Update(ctx, fresh); err != nil {
+					t.Fatal(err)
+				}
+				reconcileN(t, r, req, 1, "with the field removed")
+			}
+			labels := buildA2ANATSStatefulSet(agent, "h").Spec.VolumeClaimTemplates[0].Labels
+			for _, o := range tc.claims {
+				if err := cl.Create(ctx, &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
+					Name: a2aNATSDataClaimName(agent, o), Namespace: agent.Namespace, Labels: labels,
+				}}); err != nil && !errors.IsAlreadyExists(err) {
+					t.Fatal(err)
+				}
+			}
+			setMode(t, cl, req, "today")
+			reconcileN(t, r, req, 2, "under today")
+			if err := cl.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aNATSName(agent)}, &appsv1.StatefulSet{}); !errors.IsNotFound(err) {
+				t.Fatalf("precondition: the bus StatefulSet survived the flip to today (err %v)", err)
+			}
+			setMode(t, cl, req, "next")
+			reconcileN(t, r, req, 2, "back under next")
+			if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
+				t.Fatal(err)
+			}
+			sts := &appsv1.StatefulSet{}
+			if err := cl.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aNATSName(agent)}, sts); err != nil {
+				t.Fatal(err)
+			}
+			if fresh.Status.BusReplicas != tc.want || sts.Spec.Replicas == nil || *sts.Spec.Replicas != tc.want {
+				t.Errorf("back from today: status.busReplicas = %d, StatefulSet replicas = %v; want %d", fresh.Status.BusReplicas, sts.Spec.Replicas, tc.want)
+			}
+		})
 	}
 }
 
@@ -1168,7 +1417,8 @@ func TestTheBusBudgetRecoversFromAForeignBudgetField(t *testing.T) {
 // OrderedReady creates server 1 and its claim only once server 0 is Ready, so
 // a new cluster's StatefulSet deleted before then leaves only claim 0, as a
 // single server does. The recorded count tells them apart; with nothing
-// recorded (a bus back from today) the lone claim reads as one server.
+// recorded (a record lost to a served CRD that prunes it; a flip to today
+// keeps it since #5451) the lone claim reads as one server.
 func TestALoneClaimKeepsTheRecordedServerCount(t *testing.T) {
 	for _, tc := range []struct {
 		recorded, want int32

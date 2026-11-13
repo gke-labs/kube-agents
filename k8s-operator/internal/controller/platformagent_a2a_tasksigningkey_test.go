@@ -169,8 +169,8 @@ func TestAnUnownedTaskSigningSecretIsRefused(t *testing.T) {
 
 // After a full reconcile under next: the callout carries the public half as a
 // plain value, and nothing else the operator rendered references the
-// task-signing Secret or carries the seed. Until the dispatcher exists,
-// nothing mounts it at all.
+// task-signing Secret or carries the seed, except the dispatcher, which runs
+// by default and is the one workload that mounts it.
 func TestTheTaskSigningKeyReachesTheCalloutAsItsPublicHalfOnly(t *testing.T) {
 	// The MCP door renders only with its env var set.
 	t.Setenv(a2aMCPDoorEnvVar, "true")
@@ -235,6 +235,25 @@ func TestTheTaskSigningKeyReachesTheCalloutAsItsPublicHalfOnly(t *testing.T) {
 	for _, list := range lists {
 		if err := cl.List(ctx, list, client.InNamespace("test-ns")); err != nil {
 			t.Fatalf("list %T: %v", list, err)
+		}
+		// The dispatcher is the one workload that mounts it, on by default:
+		// held to mounting it, and left out of the scan.
+		if deps, isDeps := list.(*appsv1.DeploymentList); isDeps {
+			kept := deps.Items[:0]
+			for _, d := range deps.Items {
+				if d.Name != "test-agent-a2a-dispatcher" {
+					kept = append(kept, d)
+					continue
+				}
+				own, err := json.Marshal(d)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !strings.Contains(string(own), secretName) {
+					t.Errorf("the dispatcher doesn't mount %s", secretName)
+				}
+			}
+			deps.Items = kept
 		}
 		raw, err := json.Marshal(list)
 		if err != nil {

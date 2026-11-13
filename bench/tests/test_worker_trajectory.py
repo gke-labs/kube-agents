@@ -242,6 +242,7 @@ def _run_script(
     max_cards: int = 32,
     max_calls: int = 2000,
     max_result: int = 2000,
+    result_tail: int = worker_trajectory.RESULT_TAIL_CHARS,
     redactor: Path = REDACTOR,
     supplement: Path = SUPPLEMENT,
 ) -> str:
@@ -261,6 +262,7 @@ def _run_script(
             str(max_calls),
             str(max_result),
             "2000",
+            str(result_tail),
             *task_ids,
         ],
         capture_output=True,
@@ -503,10 +505,38 @@ def test_a_missing_board_still_answers_with_the_sentinel(tmp_path: Path) -> None
 
 
 def test_long_results_are_clipped_in_the_pod(data_root: Path) -> None:
-    calls = _payload(_run_script(data_root, [FRONT], max_result=10))["calls"]
+    calls = _payload(_run_script(data_root, [FRONT], max_result=10, result_tail=0))["calls"]
     assert calls[0]["result"].startswith("NAME READY")
     assert calls[0]["result"].endswith("chars]")
     assert "[clipped" in calls[0]["result"]
+
+
+def test_a_clipped_result_keeps_its_last_lines(data_root: Path) -> None:
+    """The verdict of a long command is its last line, so the clip keeps the tail."""
+    body = "\n".join("line %04d" % i for i in range(400))
+    verdict = "WARNING: report store write for compliance-audit failed: boom"
+    output = body + "\n" + verdict
+    entry = _read_result(data_root, {"output": output, "exit_code": 0, "error": None})
+    stored = json.dumps({"output": output, "exit_code": 0, "error": None})
+    marker = re.search(r" \.\.\.\[clipped (\d+) chars\]\.\.\. ", entry["result"])
+    assert marker, entry["result"][-200:]
+    head, tail = entry["result"][: marker.start()], entry["result"][marker.end() :]
+    assert head == stored[:2000] and tail == stored[-1000:]
+    assert int(marker.group(1)) == len(stored) - 3000
+    assert verdict in tail
+
+
+def test_the_tail_follows_the_whole_head(data_root: Path) -> None:
+    calls = _payload(_run_script(data_root, [FRONT], max_result=10, result_tail=4))["calls"]
+    result = calls[0]["result"]
+    assert result.startswith("NAME READY")
+    marker = re.search(r" \.\.\.\[clipped \d+ chars\]\.\.\. ", result)
+    assert marker and len(result[: marker.start()]) == 10 and len(result[marker.end() :]) == 4
+
+
+def test_a_result_no_longer_than_head_plus_tail_is_kept_whole(data_root: Path) -> None:
+    calls = _payload(_run_script(data_root, [FRONT], max_result=10))["calls"]
+    assert calls[0]["result"].startswith("NAME READY") and "[clipped" not in calls[0]["result"]
 
 
 def test_the_call_cap_stops_the_read_and_says_so(data_root: Path) -> None:
@@ -777,7 +807,7 @@ def test_a_configmaps_data_is_blanked_as_the_audit_log_blanks_it(data_root: Path
 def test_a_clipped_structured_failure_still_reads_as_an_error(data_root: Path) -> None:
     """The verdict is taken on the unclipped result, so the clip cannot hide it."""
     entry = _read_result(data_root, {"exit_code": 1, "output": "x" * 3000})
-    assert entry["failed"] is True and entry["result"].endswith("chars]")
+    assert entry["failed"] is True and "[clipped" in entry["result"]
     status = [
         e["status"]
         for e in worker_trajectory.capture(
@@ -1474,7 +1504,7 @@ def _run_recorded_script(root: Path, script: str) -> tuple[str, int, bool]:
     if not REDACTOR.exists():
         pytest.skip(f"{REDACTOR} is not beside this checkout")
     proc = subprocess.run(
-        [sys.executable, "-c", _WRITE_RECORDER + script, str(root), worker_trajectory.CAPTURE_PRESENT, str(REDACTOR), str(SUPPLEMENT), "32", "2000", "2000", "2000", FRONT],
+        [sys.executable, "-c", _WRITE_RECORDER + script, str(root), worker_trajectory.CAPTURE_PRESENT, str(REDACTOR), str(SUPPLEMENT), "32", "2000", "2000", "2000", str(worker_trajectory.RESULT_TAIL_CHARS), FRONT],
         capture_output=True,
         text=True,
         check=False,

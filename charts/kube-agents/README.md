@@ -603,7 +603,8 @@ itself. With `webConsole.environment.enabled` (the default) the chart also
 renders the console's ServiceAccount, a ClusterRole that lists nodes,
 namespaces, pods and workloads, and a namespaced Role that lists ReplicaSets and
 gets/patches the `PlatformAgent` resource (for repository topology, preferred
-model annotations, and applied PR annotations). `webConsole.resources` is
+model annotations, applied PR annotations, and the `status.usage` block behind
+the banner's totals and the feedback attachment). `webConsole.resources` is
 sized to run under its requests, which is what GKE Autopilot without Pod
 bursting clamps the limits to; the console reads the memory limit the cluster
 admitted through the Downward API and sets its Go soft memory limit to nine
@@ -695,7 +696,8 @@ a release that predates `operator.metrics` renders with the listener off until t
 
 `platformAgent.healthRules.enabled: true` renders `<name>-health-rules`, a Managed Prometheus
 `Rules` object in the release namespace with the install's At-Risk and Friction alerts over the
-operator's gauges, and the recording rules for their ratios; the alerts are listed on
+operator's gauges (plus one over the A2A gateway's Slack connection gauge and one over the scrape
+jobs' `up`), and the recording rules for their ratios; the alerts are listed on
 [Observability](https://gke-labs.github.io/kube-agents/concepts/observability/#health-cohorts-and-alerts).
 Off by default, and a plain boolean rather than the tri-state above: on means alerts fire,
 into Managed Prometheus's managed Alertmanager, which routes them by the `alertmanager` Secret
@@ -706,7 +708,9 @@ sample floor is a value under `platformAgent.healthRules.thresholds`, with its d
 string, which the schema refuses). A `helm upgrade --reuse-values` from a release that predates
 the key keeps the rules off; turning them on from such a release needs `--reset-then-reuse-values`, which applies the new
 defaults and keeps the release's values, or every threshold set; the schema requires the whole
-block and the template says so when it is missing. The rules read the operator's scrape, so
+block and the template says so when it is missing. `slackDisconnectedFor` is the exception: it is
+optional and defaults to `5m`, so a `--reuse-values` upgrade from a release without it keeps
+rendering. The rules read the operator's scrape, so
 enabling them with `operator.metrics` off, or where the `PodMonitoring` CRD is absent, fails at
 render with a message. The two proposal alerts read the forge's proposal readings, and a fall in
 `proposalsAuthored` (a repository leaving the managed list, or a deleted proposal) silences them for two weeks; see
@@ -1368,8 +1372,15 @@ in `A2A_BRIDGE_RESOURCES`. The chart bounds the operator's reading of those valu
 rather than re-implementing it, so it can over-count; it never fails the render on them.
 It also counts the standing pods the operator renders only behind an operator flag,
 listed with their sizes in `files/flagged-pods.yaml`: the MCP server's pod when `A2A_MCP_DOOR`
-is `true` (set by `operator.mcpServer.enabled` or `operator.extraEnv`, the latter winning),
-and the profile dispatcher's when `A2A_DISPATCHER_IMAGE` is set to anything but blank. A flag set in a form the chart cannot read (a `valueFrom`, a non-string value) counts
+is `true` (set by `operator.mcpServer.enabled` or `operator.extraEnv`, the latter winning).
+The profile dispatcher runs by default under next, so it is in `footprint.yaml`, and switched off
+(`operator.profileDispatcher.enabled: false`) it is still counted. It has a ceiling: about 200
+AgentProfiles that allow `unattended` under Job mode (the default on Kubernetes 1.30+, where each
+carries its Job template in the dispatch config), about 650 at two tiers otherwise. The operator binds
+profiles oldest first while the dispatcher's identity and its config both fit, leaves newer ones
+unbound (`IdentityReady` reads `DispatcherCeiling`), and the PlatformAgent's `DispatcherCeiling`
+condition says so. Adding a tier to an older profile can
+leave the newest one out. A flag set in a form the chart cannot read (a `valueFrom`, a non-string value) counts
 as on. An operator test holds that file to the operator's own list and sizes. It counts the A2A gateway at two pods, the operator's default under its
 election, with one gateway pod of surge room for a rollout, unless `operator.extraEnv` sets
 `A2A_GATEWAY_ELECTION` to `false`. It also counts the
@@ -1532,6 +1543,11 @@ limit. A cluster with bursting admits the manifest as rendered.
 controlling its `AgentProfile` spec. When bound, the operator passes
 `KUBE_AGENTS_ENABLED_PROFILES=tse` to the gateway Deployment so the entrypoint
 scaffolds `/opt/data/profiles/tse` from `/opt/tse-template` on startup.
+Its default persona image is still a placeholder with no persona payload, and the
+profile dispatcher, on by default, gives every bound profile a warm worker. So until
+tse ships a real persona image, enabling `profiles.tse` leaves a tse warm pod
+crash-looping at its persona step. Handing work to tse through Kanban still works,
+since that runs in the scaffolded profile, not in the worker.
 
 `profiles.cluster.enabled` (default `false`) renders `AgentProfile/cluster`, the
 generic cluster agent: one profile for every cluster in scope, with the
@@ -1540,9 +1556,9 @@ Its persona is the `persona-cluster` image, built from `agents/cluster/persona`,
 and its harness is `a2a-worker`. `profiles.cluster.{description,persona.image,harness,allowedTiers,lifecycle,concurrency,resources}`
 control its spec. The parameters are fixed, in the persona's order, because
 the design has the worker refuse a task when they differ from the persona's.
-No pod runs it until the profile dispatcher, worker and pool land and the
-operator runs them, though enabling it already gets the profile its
-ServiceAccounts, bus identity and agent card. A cluster that needs its own
+Enabled, it gets its ServiceAccounts, bus identity and agent card, and the
+profile dispatcher, on by default, runs its warm worker pool and its
+unattended Jobs. A cluster that needs its own
 persona or tier gets a second `AgentProfile` with `clusterRef` set (`k8s-operator/examples/agentprofile-cluster.yaml`).
 The chart sets `yieldToPinned: true` on `cluster`, so that second profile receives
 the cluster's tasks; a specialist such as `tse` keeps the tasks addressed to it.
