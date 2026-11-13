@@ -2259,6 +2259,108 @@ class TestShimEntryRouting(unittest.TestCase):
         self.assertIn("invalid choice", refused.stderr)
 
 
+class TestTheLauncherStartsTheSameClient(TestShimEntryRouting):
+    """The images install a launcher that imports the client as a module, so
+    the client starts from bytecode the build compiled. Every case of
+    `TestShimEntryRouting` runs again here through the launcher, laid out as
+    the images lay it out; the cases below compare it with the single file."""
+
+    LAUNCHER = Path(__file__).resolve().parents[3] / "deploy" / "shared" / "credential-proxy-exec.py"
+
+    def setUp(self):
+        super().setUp()
+        self.single = self.root / "single" / "credential-proxy-exec"
+        self.single.parent.mkdir()
+        self.shim.rename(self.single)
+        (self.root / "kubectl").unlink()
+        (self.single.parent / "gcloud").symlink_to(self.single)
+        libexec = self.root.resolve() / "libexec"
+        libexec.mkdir()
+        self.launcher = libexec / "credential-proxy-exec"
+        shutil.copy(self.LAUNCHER, self.launcher)
+        self.module = libexec / "credential_proxy_client.py"
+        shutil.copy(credential_proxy_client.__file__, self.module)
+        # The same bare environment as `run_shim`: a PYTHONPYCACHEPREFIX or
+        # PYTHONOPTIMIZE of the caller's would put the bytecode where the shim
+        # does not look.
+        subprocess.run(
+            [sys.executable, "-m", "compileall", "-q", "--invalidation-mode", "unchecked-hash", str(self.module)],
+            env={"PATH": os.environ["PATH"]}, check=True, capture_output=True, timeout=60,
+        )
+        self.bytecode = libexec / "__pycache__" / f"credential_proxy_client.{sys.implementation.cache_tag}.pyc"
+        self.assertTrue(self.bytecode.is_file())
+        # As the sandbox image links it: a name on PATH, to the launcher's name
+        # in another folder, to the launcher.
+        self.shim.symlink_to(self.launcher)
+        for name in ("kubectl", "gcloud"):
+            (self.root / name).symlink_to(self.shim)
+
+    def both(self, flags, name, args, environ):
+        """The same command through the single file and through the launcher."""
+        return [
+            self.run_shim([*flags, str(folder / name), *args], {"PYTHONDONTWRITEBYTECODE": "1", **environ})
+            for folder in (self.single.parent, self.root)
+        ]
+
+    def test_the_client_is_loaded_from_the_bytecode_the_build_compiled(self):
+        completed = self.run_shim(
+            ["-v", str(self.root / "kubectl"), "get", "pods"],
+            {"CREDENTIAL_PROXY_URL": self.live, "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr[-2000:])
+        self.assertIn(f"code object from {str(self.bytecode)!r}", completed.stderr)
+
+    def test_the_bytecode_is_loaded_without_a_look_at_the_source(self):
+        """`unchecked-hash`: no stat and no hash of the source at a start. The
+        price is that an edit of the module does nothing until it is compiled
+        again."""
+        with open(self.module, "a") as source:
+            source.write("\nraise SystemExit(99)\n")
+        completed = self.run_shim([str(self.root / "kubectl"), "get", "pods"], {"CREDENTIAL_PROXY_URL": self.live})
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertEqual("ok\n", completed.stdout)
+
+    def test_without_the_bytecode_the_launcher_still_runs_the_client(self):
+        shutil.rmtree(self.bytecode.parent)
+        completed = self.run_shim(
+            [str(self.root / "kubectl"), "get", "pods"],
+            {"CREDENTIAL_PROXY_URL": self.live, "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        self.assertFalse(self.bytecode.parent.exists(), "and it writes none")
+
+    def test_it_answers_as_the_single_file_does(self):
+        cases = {
+            "a tool name with no broker": ([], "gcloud", ["config", "get-value", "project"], {}),
+            "a tool name": ([], "gcloud", ["config", "get-value", "project"], {"CREDENTIAL_PROXY_URL": self.live}),
+            "the help": ([], "credential-proxy-exec", ["--help"], {}),
+            "the explicit form": ([], "credential-proxy-exec", ["--endpoint", self.live, "kubectl", "get", "pods"], {}),
+            "a tool that is not supported": ([], "credential-proxy-exec", ["--endpoint", self.live, "rm", "-rf", "/"], {}),
+            "an unreachable endpoint": ([], "credential-proxy-exec", ["--endpoint", self.closed, "kubectl", "get", "pods"], {}),
+            "the kubectl wrapper's isolated call": (["-I"], "credential-proxy-exec", ["--ensure-kubectl-context", "get", "pods"], {}),
+        }
+        for label, (flags, name, args, environ) in cases.items():
+            with self.subTest(label):
+                single, launched = self.both(flags, name, args, environ)
+                self.assertEqual(
+                    (single.returncode, single.stdout, single.stderr),
+                    (launched.returncode, launched.stdout, launched.stderr),
+                )
+
+    def test_stdin_reaches_the_broker_as_it_does_from_the_single_file(self):
+        for folder in (self.single.parent, self.root):
+            completed = subprocess.run(
+                [sys.executable, str(folder / "credential-proxy-exec"), "--endpoint", self.live, "kubectl", "apply", "-f", "-"],
+                env={"PATH": os.environ["PATH"], "HERMES_HOME": str(self.root / "home")},
+                input="kind: ConfigMap\n", capture_output=True, text=True, timeout=60,
+            )
+            self.assertEqual(0, completed.returncode, completed.stderr)
+        single, launched = self.requests[-2:]
+        self.assertEqual("kind: ConfigMap\n", launched["stdin"])
+        self.assertEqual(single["stdin"], launched["stdin"])
+        self.assertEqual(single["argv"], launched["argv"])
+
+
 @unittest.skipUnless(Path("/proc/self/stat").exists() and shutil.which("bash"), "needs /proc and bash")
 class TestRealShellCommandLines(unittest.TestCase):
     """The shell pin through real processes, not a patched ancestry.

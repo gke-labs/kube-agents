@@ -2387,32 +2387,59 @@ Mutation(
         "site instead of referencing lib.ArtifactDelegate",
     ),
     Mutation(
-        "C1-delegate-text-cap-hand-spelled-in-delegation",
+        "C1-delegate-gateway-skips-the-shared-validator",
         "a2a/gateway/delegation.go",
-        ('len(req.Text) > lib.DelegateTextCap {', 'len(req.Text) > 16*1024 {'),
+        ("if !parsed || lib.ValidateDelegateRequest(req) != nil {", "if !parsed {"),
         "test_C1_the_delegate_text_cap_is_spelled_once",
-        "hand-type the cap in the gateway's own length check instead of "
-        "referencing lib.DelegateTextCap -- agrees with the constant today "
-        "and silently stops the day someone edits only the constant",
+        "drop the gateway's call to lib.ValidateDelegateRequest: an "
+        "over-length text, or a malformed batch, that reached the bus without "
+        "the adapter would then be minted, and the gateway's line of defence "
+        "is gone (#5682 moved the cap check into the shared validator)",
     ),
     Mutation(
-        "C1-delegate-text-cap-shifted-in-delegation",
-        "a2a/gateway/delegation.go",
-        ('len(req.Text) > lib.DelegateTextCap {', 'len(req.Text) > 1<<14 {'),
+        "C1-delegate-validator-cap-hand-spelled",
+        "a2a/lib/payload.go",
+        ("case len(text) > DelegateTextCap:", "case len(text) > 16*1024:"),
         "test_C1_the_delegate_text_cap_is_spelled_once",
-        "spell the gateway's cap as a shift the magic-number regex does not "
-        "name; only the positive check, scoped to handleDelegateRequest, "
-        "sees that the shared constant is gone from the check (the rest of "
-        "delegation.go still references it)",
+        "hand-type the cap in lib's shared validator instead of referencing "
+        "DelegateTextCap -- agrees with the constant today and silently "
+        "stops the day someone edits only the constant",
     ),
     Mutation(
-        "C1-delegate-text-cap-shifted-under-a-comment-naming-it",
-        "a2a/gateway/delegation.go",
-        ('len(req.Text) > lib.DelegateTextCap {', 'len(req.Text) > 1<<14 { // lib.DelegateTextCap, as a shift'),
+        "C1-delegate-validator-cap-shifted",
+        "a2a/lib/payload.go",
+        ("case len(text) > DelegateTextCap:", "case len(text) > 1<<14:"),
         "test_C1_the_delegate_text_cap_is_spelled_once",
-        "spell the gateway's cap as a shift and leave the constant's name in "
-        "a comment on the same line; only a pin that reads the function's "
-        "code without its comments sees the constant gone",
+        "spell the validator's cap as a shift the magic-number regex does not "
+        "name; only the positive check, scoped to validateDelegateText, sees "
+        "that the shared constant is gone from the comparison",
+    ),
+    Mutation(
+        "C1-delegate-validator-skips-batch-entries",
+        "a2a/lib/payload.go",
+        ("validateDelegateText(e.Text)", "validateDelegateText(r.Text)"),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "cap the request's top-level text inside the batch loop instead of "
+        "each entry's: every batch entry then goes uncapped, through the "
+        "adapter and the gateway alike",
+    ),
+    Mutation(
+        "C1-delegate-validator-skips-the-single-text",
+        "a2a/lib/payload.go",
+        ("if err := validateDelegateText(r.Text); err != nil {", "if err := error(nil); err != nil {"),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "stop capping a single (non-batch) request's text in the shared "
+        "validator: the gateway then mints an over-length single task that "
+        "reached the bus without the adapter",
+    ),
+    Mutation(
+        "C1-delegate-wire-tasks-renamed",
+        "a2a/lib/payload.go",
+        ('json:"tasks,omitempty"', 'json:"batch,omitempty"'),
+        "test_C1_the_delegate_tool_schema_names_agree_with_the_wire_shape",
+        "rename the batch's wire field without touching the tool schema: the "
+        "model sends `tasks` by the schema and the adapter reads a `batch` "
+        "that was never sent",
     ),
     Mutation(
         "C1-delegate-text-cap-hand-spelled-in-worker-adapter",

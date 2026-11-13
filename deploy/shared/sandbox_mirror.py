@@ -317,7 +317,6 @@ RECURSIVE_EXCLUDES = (
     "gke_gcloud_auth_plugin_cache",
     "application_default_credentials.json",
     ".config/gcloud",
-    ".gsutil",
     ".mcp-auth",
     ".env",
     ".envrc",

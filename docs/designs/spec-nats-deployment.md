@@ -48,6 +48,39 @@ with an `A2ABusConversionRefused` condition and Warning, and the admission webho
 refuses the edit with the same message. #4225 lifts that refusal in the same change that
 adds the migration, so no release can convert without it.
 
+**Amended 11/12 (#5708): a multi-server bus provisions only once its meta group is formed.**
+The servers start in turn (`OrderedReady`), and a member reports ready before a JetStream meta
+leader exists, so the first two elect a leader and the third joins later. Twice in CI, on GKE
+Standard, the third never joined although every server held its routes. The leader then refused
+every R3 stream with a bare "no suitable peers for placement", and the provision Job retried until
+the run timed out. So before the provision Job is created, the operator reads each server's `/jsz`
+at its pod IP: the bus pods have no per-pod DNS names, and the client Service would answer from one
+server at random. The group counts as formed when a quorum of servers report one leader and that
+leader lists every other server as a current peer. Until then the Job waits, and the
+`A2ABusMetaGroup` condition names the server outside.
+
+A server still outside after 3 minutes is restarted once, under every one of these guards:
+
+- it is the only server outside;
+- the rest are a quorum without it;
+- the bus hasn't been provisioned yet, and no server holds a stream or consumer, so no only copy of
+  anything can be on the stray;
+- the stray's own meta node has started (it reports the group's size), which nats-server does only
+  after recovering its store from disk;
+- the bus StatefulSet doesn't already record it as restarted.
+
+The record is an annotation the operator writes before the delete, with its own patch, so the
+StatefulSet's server-side apply leaves it. A new bus starts without one. A server still outside after
+its one restart stays named in the condition, for a person.
+
+If a server isn't running while the others are (its pod absent, being deleted, or not Running,
+as the restarted one is for a while), the Job waits for it under `ServerNotRunning`, and nothing
+is restarted on that account. If a running server's view can't be read, or no server is
+running at all, the verdict is unknown: nothing is held or restarted, and the condition names
+the unreadable server. The check also runs when the provision Job is re-created on a running bus (its 24 h TTL, or a
+digest change). There it can hold that re-run and set the condition, but it never restarts anything on a bus that
+has been provisioned. It doesn't repair a server that drops out of a running bus.
+
 **The customer operates this.** Server restarts - rollouts, node drains, PV failover - are
 routine operations, not incidents. That fact drives the resilience contract below more than
 any other input.
@@ -89,8 +122,9 @@ the tempting place for a cheaper R1 class, but they are also the replay and audi
 and R1 loses them to a single node failure. Audit wins. The cost knob is W, not replicas.
 
 Every stream also carries a hard `max_bytes` cap with `discard: old` alongside its age
-limit (dev defaults: 20GiB `TASKS`, 5GiB `TOPICS-JOURNAL`, 1GiB each for `TOPICS-STATE`
-and `DIRECTORY`). A runaway telemetry flood drops oldest chunks early; it never fills
+limit (dev defaults: 8GiB `TASKS`, 1GiB each for `TOPICS-JOURNAL`, `TOPICS-STATE`
+and `DIRECTORY`; an existing stream keeps its cap, and the provision Job reports the edit that lowers
+it and whether that is safe yet). A runaway telemetry flood drops oldest chunks early; it never fills
 the PV and stalls the whole JetStream deployment, which would take `runtime-state`,
 `session-state`, and discovery down with it. The honest cost: under byte pressure,
 replay completeness degrades oldest-first - a running task's early events can age out of
@@ -99,7 +133,7 @@ before it is reached.
 
 `TASKS` carries one further limit, `max_msgs_per_subject` (4096; amended 9/16). The cap
 above is stream-wide, so one runaway task - a looping harness, a gigabyte of streamed
-artifact text - could consume the whole 20GiB budget and, under `discard: old`, evict
+artifact text - could consume the whole 8GiB budget and, under `discard: old`, evict
 every other session's history on the way out. The per-subject cap makes a runaway pay
 for its own runaway and nobody else's. Be precise about what it is not: a session's
 publish grant is `a2a.tasks.<pod>.*.events` - the task id is not part of the attested
@@ -118,8 +152,9 @@ the sibling of `PostFinalDropped` for assertion 10, so a truncated replay is a
 degradation a reader can see rather than a short history it cannot distinguish from a
 real one. On the number, sized against the publisher that means it rather than the
 well-behaved one: the render sets no `max_payload`, so NATS' 1MiB default is the
-per-message ceiling and 4096 messages is a ~4GiB worst case on one subject - a fifth of
-the stream. The worker adapter's own result chunks are 256KiB, so a task built out of
+per-message ceiling and 4096 messages is a ~4GiB worst case on one subject - half of
+the 8GiB stream since #4476, so a subject that means it can still evict half the other
+sessions' history; the per-subject cap bounds a runaway, not a determined publisher. The worker adapter's own result chunks are 256KiB, so a task built out of
 those reaches nearer 1GiB at the same count, but that is a property of one publisher and
 not a bound the bus enforces. A chat-driven task emits single digits to low hundreds of
 events; reaching 4096 is already a loop or a gigabyte of streamed artifact text. The

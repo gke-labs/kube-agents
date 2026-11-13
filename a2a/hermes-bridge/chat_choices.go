@@ -61,6 +61,23 @@ const (
 	labelTrim = ":"
 )
 
+// wordCutHolds is WORD_CUT_HOLDS: a word cut never leaves the headline on one
+// of these, nor on a bare number, and prefers a cut outside a bracket.
+var wordCutHolds = map[string]bool{
+	"a": true, "an": true, "and": true, "as": true, "at": true, "but": true, "by": true, "for": true, "from": true,
+	"in": true, "into": true, "of": true, "on": true, "or": true, "the": true, "to": true, "with": true,
+}
+
+// wordCutLinks is WORD_CUT_LINKS: a word cut never falls inside a Markdown
+// link or an mrkdwn link or mention, whose label and url read as one word; a
+// bare "<" of a comparison is not one. boldMarkers and
+// italicMarkers are BOLD_MARKERS and the keys of ITALIC_EDGES.
+var (
+	wordCutLinks  = []*regexp.Regexp{mdLink, regexp.MustCompile(`<(?:https?://|mailto:|[@#!])[^<>]*>`)}
+	boldMarkers   = []string{"**", "__"}
+	italicMarkers = []string{"*", "_"}
+)
+
 var (
 	clauseBreak = regexp.MustCompile(`(?i)(?:,|;|` + pySpace + `+[—–])` + pySpace + `+|(` + pySpace + `+)(?:due` + pySpace + `+to|because)\b`)
 	itemLine    = regexp.MustCompile(`^( {0,3})([-*+•]|\p{Nd}+[.)]|[A-Za-z][.)])` + pySpace + `+([^` + pySpaceChars + `].*?)` + pySpace + `*$`)
@@ -93,6 +110,51 @@ var (
 	nextStepRefused = regexp.MustCompile(`[<>|\[\]]`)
 )
 
+// boldWrapped is _bold_wrapped: whether sentence is one bold run in marker
+// from end to end: its code spans held, so a "**" inside a code span does not
+// read as a second run, and no edge marker inside, so an in-word one (2**20)
+// does not either.
+func boldWrapped(sentence, marker string) bool {
+	held, _ := holdCode(sentence)
+	return len(held) > 2*len(marker) && strings.HasPrefix(held, marker) && strings.HasSuffix(held, marker) &&
+		edgeCount(held[len(marker):len(held)-len(marker)], marker) == 0
+}
+
+// opensBold is _opens_bold: whether h opens a bold run it does not close, an
+// odd number of edge markers with an opener among them; an in-word marker
+// (DB__HOST, 2**20) is neither edge, so one after a closed run does not
+// reopen it.
+func opensBold(h string) bool {
+	for _, marker := range boldMarkers {
+		if edgeCount(h, marker)%2 == 1 && openerIn(h, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// edgeCount is _bold_edges: the number of marker's edges in s, as openerIn
+// and closerIn read them; an in-word marker is none, and one that reads as
+// both an opener and a closer is one.
+func edgeCount(s, marker string) int {
+	rs := []rune(s)
+	width := len([]rune(marker))
+	n := 0
+	for i := range rs {
+		if !hasAt(rs, i, marker) {
+			continue
+		}
+		prev, hasPrev := at(rs, i-1)
+		next, hasNext := at(rs, i+width)
+		opener := (!hasPrev || !isWord(prev)) && hasNext && !isPySpace(next)
+		closer := hasPrev && !isPySpace(prev) && (!hasNext || !isWord(next))
+		if opener || closer {
+			n++
+		}
+	}
+	return n
+}
+
 // clauseCut is slack_presenter.clause_cut: the headline and the rest for a
 // first sentence longer than the headline cap, cut at its last clause break
 // outside a code span, a bracket and a bold run that leaves a headline of
@@ -101,9 +163,8 @@ var (
 // as_line capitalizes one.
 func clauseCut(sentence string) (string, string, bool) {
 	// A sentence bold end to end is cut inside the bold, each half kept bold.
-	for _, marker := range []string{"**", "__"} {
-		if len(sentence) > 2*len(marker) && strings.HasPrefix(sentence, marker) && strings.HasSuffix(sentence, marker) &&
-			!strings.Contains(sentence[len(marker):len(sentence)-len(marker)], marker) {
+	for _, marker := range boldMarkers {
+		if boldWrapped(sentence, marker) {
 			head, rest, ok := clauseCut(sentence[len(marker) : len(sentence)-len(marker)])
 			if !ok {
 				return "", "", false
@@ -157,7 +218,7 @@ func clauseCut(sentence string) (string, string, bool) {
 			from = m[3]
 		}
 		r := pyStrip(held[from:])
-		if r == "" || strings.Count(h, "**")%2 == 1 || strings.Count(h, "__")%2 == 1 {
+		if r == "" || opensBold(h) {
 			continue
 		}
 		if !connector && clauseRelative.MatchString(r) {
@@ -194,6 +255,128 @@ func clauseCut(sentence string) (string, string, bool) {
 		rest = strings.ToUpper(rest[:1]) + rest[1:]
 	}
 	return head, rest, true
+}
+
+// wordCut is slack_presenter.word_cut: the headline and the rest for a first
+// sentence longer than the headline cap that clauseCut cannot cut (one long
+// parenthetical, say), which the clip used to end at the cap with the clipped
+// words dropped. The cut is the last space outside a code span and a bold or
+// italic run that leaves a headline of clauseHeadlineMin to chatHeadlineMax
+// code points once plain, the ellipsis counted, outside a bracket when one
+// such space exists and inside one otherwise, never inside a link
+// (wordCutLinks) and never after a word in wordCutHolds or a bare number; the
+// headline ends on the ellipsis and the
+// rest opens with one, so the sentence reads on in the detail as written. A
+// sentence bold end to end is cut inside the bold.
+func wordCut(sentence string) (string, string, bool) {
+	for _, marker := range boldMarkers {
+		if boldWrapped(sentence, marker) {
+			head, rest, ok := wordCut(sentence[len(marker) : len(sentence)-len(marker)])
+			if !ok {
+				return "", "", false
+			}
+			return marker + head + marker, marker + rest + marker, true
+		}
+	}
+	if rs := []rune(sentence); len(rs) > clauseScanMax {
+		end := clauseScanMax
+		for i := clauseScanMax - 1; i > 0; i-- {
+			if rs[i] == ' ' {
+				end = i
+				break
+			}
+		}
+		head, rest, ok := wordCut(string(rs[:end]))
+		if !ok {
+			return "", "", false
+		}
+		return head, rest + string(rs[end:]), true
+	}
+	held, spans := holdCode(sentence)
+	limit := chatHeadlineMax - runeLen(chatEllipsis)
+	var links [][]int
+	for _, pattern := range wordCutLinks {
+		links = append(links, pattern.FindAllStringIndex(held, -1)...)
+	}
+	var outside, inside [2]string
+	foundOutside, foundInside := false, false
+	depth := 0
+	for i := 0; i < len(held); i++ {
+		if strings.IndexByte(clauseOpeners, held[i]) >= 0 {
+			depth++
+		} else if strings.IndexByte(clauseClosers, held[i]) >= 0 && depth > 0 {
+			depth--
+		}
+		if held[i] != ' ' || insideAny(links, i) {
+			continue
+		}
+		h := strings.TrimRightFunc(held[:i], isPySpace)
+		r := pyStrip(held[i:])
+		if r == "" || opensBold(h) {
+			continue
+		}
+		italic := false
+		for _, marker := range italicMarkers {
+			lone := strings.Count(strings.ReplaceAll(h, marker+marker, ""), marker)
+			italic = italic || (lone%2 == 1 && openerIn(h, marker))
+		}
+		if italic {
+			continue
+		}
+		n := runeLen(plainLine(restoreCode(h, spans, false)))
+		if n > limit {
+			// Every later space leaves a longer headline.
+			break
+		}
+		last := strings.TrimRight(strings.TrimLeft(h[strings.LastIndex(h, " ")+1:], clauseOpeners+clauseEmphasis), clauseEmphasis)
+		if n < clauseHeadlineMin || wordCutHolds[strings.ToLower(last)] || isDigits(last) {
+			continue
+		}
+		if depth > 0 {
+			inside, foundInside = [2]string{h, r}, true
+		} else {
+			outside, foundOutside = [2]string{h, r}, true
+		}
+	}
+	found := outside
+	if !foundOutside {
+		if !foundInside {
+			return "", "", false
+		}
+		found = inside
+	}
+	head, rest := restoreCode(found[0], spans, false), restoreCode(found[1], spans, false)
+	// A sentence that carries its own ellipsis at the cut is not given a second one.
+	if !strings.HasSuffix(strings.TrimRight(head, clauseEmphasis), chatEllipsis) {
+		head += chatEllipsis
+	}
+	if !strings.HasPrefix(strings.TrimLeft(rest, clauseEmphasis), chatEllipsis) {
+		rest = chatEllipsis + rest
+	}
+	return head, rest, true
+}
+
+// insideAny reports whether offset falls strictly inside one of the [start, end) ranges.
+func insideAny(ranges [][]int, offset int) bool {
+	for _, r := range ranges {
+		if r[0] < offset && offset < r[1] {
+			return true
+		}
+	}
+	return false
+}
+
+// isDigits is Python's str.isdigit on the ASCII digits a cut can leave a headline on.
+func isDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // lowerWordAt is LOWER_WORD's match at the start of s: a run of ASCII
