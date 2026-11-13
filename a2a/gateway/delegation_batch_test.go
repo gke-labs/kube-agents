@@ -517,8 +517,12 @@ func TestAWithdrawnChildWhoseCancelFailedStaysOnRecord(t *testing.T) {
 	})
 	rec, _ := r.g.reg.Get(ctx, conv)
 	kept := childrenOf(rec, origin.TaskID)
-	if kept[0].ID != first.TaskID || !kept[0].Canceled {
-		t.Fatalf("kept child = %+v, want %s marked canceled", kept[0], first.TaskID)
+	if kept[0].ID != first.TaskID || !kept[0].Canceled || !kept[0].CancelUnsent {
+		t.Fatalf("kept child = %+v, want %s marked canceled, its cancel unsent", kept[0], first.TaskID)
+	}
+	// It may still run, so it is the conversation's live delegation.
+	if live := r.g.liveChild(ctx, rec); live != first.TaskID {
+		t.Fatalf("liveChild = %q, want the kept child %s", live, first.TaskID)
 	}
 	if pref, _ := rec.TaskRefFor(origin.TaskID); len(pref.Children) != 1 || pref.Children[0] != first.TaskID {
 		t.Fatalf("parent children = %v, want the kept child", pref.Children)

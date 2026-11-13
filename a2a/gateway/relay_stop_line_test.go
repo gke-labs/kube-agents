@@ -588,10 +588,10 @@ func TestAChatTypedStopWithTheCardStopArmedKeepsItsPosts(t *testing.T) {
 	}
 }
 
-// A stop typed on Discord keeps today's replies, line or no line: the
-// "cancel sent" post, the line moving on with no Stop, and the relay's
-// "canceled" notice beside the terminal edit. Discord draws no button, and
-// the posts are its contract.
+// A stop typed on Discord keeps its reply, line or no line: the "cancel
+// sent" post and the terminal edit. Discord draws no button, and the post is
+// its contract. The relay's "canceled" notice is gone: nothing a stopped
+// task writes reaches the room.
 func TestADiscordTypedStopKeepsItsPosts(t *testing.T) {
 	t.Parallel()
 	r := startRig(t)
@@ -614,13 +614,13 @@ func TestADiscordTypedStopKeepsItsPosts(t *testing.T) {
 	if err := r.execFor(t, origin, "platform").PublishStatus(context.Background(), lib.StateCanceled, true); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, "the canceled notice", func() bool {
-		return slices.ContainsFunc(r.adapter.postTexts(), func(s string) bool { return strings.Contains(s, "canceled") })
-	})
 	waitFor(t, "the terminal edit", func() bool {
 		texts := r.adapter.editTexts()
 		return len(texts) > 0 && strings.Contains(texts[len(texts)-1], "canceled")
 	})
+	if slices.ContainsFunc(r.adapter.postTexts(), func(s string) bool { return strings.Contains(s, "canceled") }) {
+		t.Fatalf("a stopped task's terminal posted a notice: %q", r.adapter.postTexts())
+	}
 	for _, e := range r.adapter.editTexts() {
 		if strings.Contains(e, "cancel sent") {
 			t.Errorf("a Discord typed stop edited the line to %q", e)

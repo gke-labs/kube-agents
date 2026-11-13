@@ -176,7 +176,8 @@ func TestAnAnswerOnLineBackendKeepsTheFailedLine(t *testing.T) {
 // A task its requester asked to stop, which completed anyway, keeps the
 // terminal edit it had: its line said "cancel sent", and a stale press
 // rewrites such a line as canceled, so neither an acknowledgement nor the
-// bare mark is written there.
+// bare mark is written there, and its line ends stopped. Nothing a stopped
+// task writes reaches the room, so its acknowledgement isn't posted either.
 func TestAnAnswerOnLineBackendKeepsTheTerminalEditOfAStoppedTask(t *testing.T) {
 	t.Parallel()
 	r := startLineAnsweringRig(t)
@@ -197,11 +198,20 @@ func TestAnAnswerOnLineBackendKeepsTheTerminalEditOfAStoppedTask(t *testing.T) {
 		return ok && ref.Canceled
 	})
 	completeTask(t, exec, "checking the fleet.")
-	waitFor(t, "the acknowledgement posted", postedContaining(r, "checking the fleet."))
+	// Its line keeps reading stopped: a completed with no answer would read
+	// as an answer that never came.
 	waitFor(t, "the terminal edit", func() bool {
 		edits := editsOf(r, line)
-		return len(edits) > 0 && strings.Contains(edits[len(edits)-1], "completed")
+		return len(edits) > 0 && strings.Contains(edits[len(edits)-1], terminalLine(lib.StateCanceled, ""))
 	})
+	for _, e := range editsOf(r, line) {
+		if strings.Contains(e, "completed") {
+			t.Fatalf("a stopped task's line read completed: %q", e)
+		}
+	}
+	if postedContaining(r, "checking the fleet.")() {
+		t.Fatal("a stopped task's acknowledgement was posted")
+	}
 }
 
 // Behind the mux the answer is the owning backend's: a conversation of a
