@@ -7,9 +7,9 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
-	"unicode/utf8"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
+	"github.com/gke-labs/kube-agents/a2a/lib/askkind"
 	"github.com/gke-labs/kube-agents/a2a/lib/chatmsg"
 	"github.com/gke-labs/kube-agents/a2a/lib/chattext"
 )
@@ -31,7 +31,8 @@ import (
 //     on a last line of its own offers that step as its one choice
 //     (next_step);
 //   - mark.ask, the kind of ask the prompt is, chosen by keyword
-//     (arrival_reaction), on each heartbeat while the turn runs;
+//     (arrival_reaction, a2a/lib/askkind, which the gateway also draws on
+//     arrival), on each heartbeat while the turn runs;
 //   - when the turn filed kanban cards, the terminal's mark-only message
 //     holding that ask, so it stays marked until the cards' notifies settle
 //     it. The same kind rides the conversation route (route.go) for those
@@ -66,54 +67,11 @@ const (
 	codeHold = "\x00"
 )
 
-// The ask kinds, mark.ask tokens for arrival_reaction's emoji, tried in
-// arrival_reaction's order: the first match wins. A question outranks the
-// incident words, so "is checkout crashlooping?" is investigate while
-// "checkout is down" is incident.
+// The ask kinds, mark.ask tokens (askkind, which the gateway shares to draw
+// the kind on arrival).
 const (
-	askQuestion    = "question"
-	askInvestigate = "investigate"
-	askFleet       = "fleet"
-	askUpgrade     = "upgrade"
-	askCost        = "cost"
-	askSecurity    = "security"
-	askChange      = "change"
-	askBoard       = "board"
-	askIncident    = "incident"
-)
-
-var (
-	changeWords = regexp.MustCompile(`(?i)\bfix(es|ing)?\b|\bbump\b|\broll(ing)?[\s-]*back\b|\brollback\b` +
-		`|\bopen\s+(a\s+|the\s+|an\s+)?(pr|pull\s+request)\b|\bscale\b`)
-	upgradeWords  = regexp.MustCompile(`(?i)\bupgrad(e|es|ed|ing)\b|\bversions?\b|\brelease\s+channels?\b|\boutdated\b|\bout\s+of\s+date\b`)
-	costWords     = regexp.MustCompile(`(?i)\bcosts?\b|\bcosting\b|\bspend(s|ing)?\b|\bbill(s|ing)?\b|\bbudgets?\b|\bpric(e|es|ing)\b`)
-	securityWords = regexp.MustCompile(`(?i)\bsecurity\b|\baudit(s|ing)?\b|\bcves?\b|\bvulnerab|\brbac\b|\biam\b|\bpermissions?\b|\bexposed\b`)
-	fleetWords    = regexp.MustCompile(`(?i)\b(all|every|which|each)\s+(of\s+(the|my|our)\s+)?(my\s+|our\s+|the\s+)?clusters?\b` +
-		`|\bacross\s+(the\s+|my\s+|our\s+)?(fleet|clusters)\b|\bfleet[\s-]*wide\b`)
-	investigateWords = regexp.MustCompile(`(?i)\bwhy\b|\brestart|\berrors?\b|\bfail|\bcrash|\boom(killed|kill|ed)?\b|\bpending\b|\bslow\b` +
-		`|\bdebug|\bdiagnos|\binvestigat|\bbroken\b`)
-	boardWords    = regexp.MustCompile(`(?i)\bboard\b|\bstatus\b|\bwhat'?s\s+running\b|\bwhat\s+is\s+running\b`)
-	incidentWords = regexp.MustCompile(`(?i)\bdown\b|\bpag(e|ed|es|ing)\b|\boutage\b|\bsev\s?\d\b|\bsev\b|\bcrash\s?loop`)
-	askMention    = regexp.MustCompile(`<[@#!][^<>]*>`)
-	askFirstWord  = regexp.MustCompile(`[A-Za-z']+`)
-	askClasses    = []struct {
-		words *regexp.Regexp
-		kind  string
-	}{
-		{changeWords, askChange},
-		{upgradeWords, askUpgrade},
-		{boardWords, askBoard},
-		{costWords, askCost},
-		{securityWords, askSecurity},
-		{fleetWords, askFleet},
-	}
-	questionOpeners = map[string]bool{
-		"is": true, "are": true, "was": true, "were": true, "why": true, "what": true, "whats": true,
-		"what's": true, "how": true, "which": true, "who": true, "when": true, "where": true, "does": true,
-		"do": true, "did": true, "can": true, "could": true, "should": true, "will": true, "would": true,
-		"has": true, "have": true, "check": true, "show": true, "list": true, "tell": true, "explain": true,
-		"describe": true,
-	}
+	askQuestion = askkind.Question
+	askFleet    = askkind.Fleet
 )
 
 // slackUXOnValues are the KAGE_SLACK_UX values that keep it on.
@@ -142,60 +100,8 @@ func isPySpace(r rune) bool { return unicode.IsSpace(r) || (r >= '\x1c' && r <= 
 // pyStrip is Python's str.strip(): isPySpace trimmed from both ends.
 func pyStrip(s string) string { return strings.TrimFunc(s, isPySpace) }
 
-// pyFolds are the non-ASCII letters Python's re.IGNORECASE matches to an
-// ASCII keyword letter: dotted and dotless i, long s, the Kelvin sign (an
-// escape, since a normalising editor turns the raw rune into an ASCII K).
-var pyFolds = map[rune]rune{'İ': 'i', 'ı': 'i', 'ſ': 's', '\u212a': 'k'}
-
-// asciiWords stands in for Python's Unicode \s, \b and case folding, which
-// RE2 spells in ASCII: a space Python's \s takes becomes a space, a letter
-// Python folds to an ASCII one becomes it, and any other non-ASCII letter or
-// number becomes "_", a word character in both engines that no keyword
-// holds, so every boundary and space run reads as the presenter reads it.
-func asciiWords(text string) string {
-	return strings.Map(func(r rune) rune {
-		if folded, ok := pyFolds[r]; ok {
-			return folded
-		}
-		switch {
-		case r == '\v' || (r >= '\x1c' && r <= '\x1f') || (r >= utf8.RuneSelf && isPySpace(r)):
-			return ' '
-		case r < utf8.RuneSelf:
-			return r
-		case unicode.IsLetter(r) || unicode.IsNumber(r):
-			return '_'
-		}
-		return r
-	}, text)
-}
-
 // askKind is the mark.ask token for an ask, from its words alone.
-func askKind(text string) string {
-	stripped := pyStrip(askMention.ReplaceAllString(text, " "))
-	clean := asciiWords(stripped)
-	for _, c := range askClasses {
-		if c.words.MatchString(clean) {
-			return c.kind
-		}
-	}
-	// The opener check reads the ask as written: the presenter's FIRST_WORD
-	// is case-sensitive ASCII and never folds, so "İs" opens on "s".
-	if !askIsQuestion(stripped) && incidentWords.MatchString(clean) {
-		return askIncident
-	}
-	if investigateWords.MatchString(clean) || incidentWords.MatchString(clean) {
-		return askInvestigate
-	}
-	return askQuestion
-}
-
-func askIsQuestion(text string) bool {
-	if strings.HasSuffix(strings.TrimRightFunc(text, isPySpace), "?") {
-		return true
-	}
-	first := askFirstWord.FindString(text)
-	return first != "" && questionOpeners[strings.ToLower(first)]
-}
+func askKind(text string) string { return askkind.Kind(text) }
 
 // answerChat is the result's chat message, or false when the answer posts as
 // text: no headline (one opening on a code fence) or a rest past the fold's

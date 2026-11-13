@@ -1,11 +1,13 @@
 """Count the kanban dispatcher's failed ticks per board, on the chat_metrics registry.
 
-Installed as ``gateway/kanban_dispatch_failures.py`` and called from the four
+Installed as ``gateway/kanban_dispatch_failures.py`` and called from the eight
 places ``apply_kanban_dispatch_failures.py`` patches into
-``gateway/kanban_watchers_dispatcher.py``'s ``tick_once_for_board``: after
+``gateway/kanban_watchers_dispatcher.py``. In ``tick_once_for_board``: after
 ``dispatch_once`` returns (a good tick, which ends the board's streak), after
 the ``tick failed on board`` log line (a failed tick, which adds one), and at
-the tick's start and end (so the registry knows a board is being tried).
+the tick's start and end. In ``ready_nonempty`` and ``auto_decompose_tick``:
+at the start and end of each per-board connect. The starts and ends tell the
+registry when a board is being tried.
 The registry renders the streak as ``kubeagents_kanban_dispatcher_failed_ticks``
 on the listener the operator's usage poller reads, and the poller sets the
 PlatformAgent's ``KanbanDispatcherFailing`` condition from it.
@@ -40,7 +42,7 @@ def record_tick(board: str, exc: Optional[BaseException] = None) -> None:
 
 
 def record_tick_start(board: str) -> None:
-    """Record that a tick on ``board`` began. Never raises."""
+    """Record that a try on ``board`` began: a tick, a ready probe or an auto-decompose connect. Never raises."""
     try:
         registry = chat_turn_metrics._load_registry()
         if registry is not None:
@@ -50,7 +52,7 @@ def record_tick_start(board: str) -> None:
 
 
 def record_tick_end(board: str) -> None:
-    """Record that the tick on ``board`` ended, whichever way. Never raises."""
+    """Record that the try on ``board`` ended, whichever way. Never raises."""
     try:
         registry = chat_turn_metrics._load_registry()
         if registry is not None:

@@ -63,6 +63,7 @@ func awaitPostIn(t *testing.T, r *rig, what, conv, want string) {
 // question's task; it says where the stop goes and cancels nothing. A stop
 // typed inside the question's thread reaches the question's task.
 func TestGchatDMTopLevelStopPointsAtTheThread(t *testing.T) {
+	t.Parallel()
 	r := startGchatRig(t, []string{gchatDMUser}, false)
 	ctx := context.Background()
 	gchatDM(r, gchatDMQuestion, "spaces/D1/messages/M1", "how is the fleet", true)
@@ -100,6 +101,7 @@ func TestGchatDMTopLevelStopPointsAtTheThread(t *testing.T) {
 // the redirect a top-level stop gets and starts no task. A top-level real
 // question shaped like the wide status match still starts a task.
 func TestGchatDMTopLevelStatusPointsAtTheThread(t *testing.T) {
+	t.Parallel()
 	r := startGchatRig(t, []string{gchatDMUser}, false)
 	ctx := context.Background()
 	gchatDM(r, gchatDMQuestion, "spaces/D1/messages/M1", "how is the fleet", true)

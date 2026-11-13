@@ -33,6 +33,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -47,21 +48,38 @@ import (
 // only reader of the profiles' shared durables and the only writer of
 // PROFILE_LEASES. This file renders what it runs on. The binary is PR 3's.
 const (
-	// a2aDispatcherImageEnvVar names the dispatcher's image, and setting it
-	// is the only way to turn the dispatcher on. Unset, the operator renders
-	// no dispatcher at all, not its identity, its grants nor its
-	// Deployment: until profiles dispatch end to end (the worker's side is
-	// #3655's PR 5) it would be an idle component that costs every next
-	// install a principal and a pod.
+	// a2aDispatcherImageEnvVar overrides the dispatcher's image. Unset, the
+	// operator runs the release set's, derived as its other A2A images are
+	// (a2aDispatcherReleaseImage); a2aProfileDispatcherEnvVar is the switch.
 	// a2aDispatcherImageName is its name in the release set, which it is
 	// built and published under already; a2aDispatcherReleaseImage resolves
-	// it, so turning the default on is one line in a2aDispatcherImage.
+	// it.
 	a2aDispatcherImageName   = "a2a-dispatcher"
 	a2aDispatcherImageEnvVar = "A2A_DISPATCHER_IMAGE"
+	// a2aProfileDispatcherEnvVar turns the dispatcher off at "false", the
+	// one value that does; the chart sets it from
+	// operator.profileDispatcher.enabled.
+	a2aProfileDispatcherEnvVar = "A2A_PROFILE_DISPATCHER"
 
 	// a2aDispatcherUser is the dispatcher's NATS user, and so its inbox
 	// prefix and its verifier caller name. The binary spells the same string.
 	a2aDispatcherUser = "dispatcher"
+
+	// a2aDispatcherBucketedGrantsEnvVar turns on the dispatcher's bucketed
+	// grants (#5381). With it on, the dispatcher's map entry carries only its
+	// control connection's fixed grants and the draining profiles' names, and
+	// the callout derives each bucket connection's per-profile grants from
+	// the profile entries. Off by default. Turning it on needs a dispatcher
+	// that opens its bucket connections (#5381's second PR): an older one
+	// loses every profile grant.
+	a2aDispatcherBucketedGrantsEnvVar = "A2A_DISPATCHER_BUCKETED_GRANTS"
+
+	// a2aNarrowingDispatcher is the callout's NarrowingDispatcher, and
+	// a2aDispatcherBuckets is lib.DispatcherBuckets. This module can't import
+	// either; the callout suite parses the rendered map, and the bucket count
+	// is spelled again only to reserve the bucket users here.
+	a2aNarrowingDispatcher = "dispatcher"
+	a2aDispatcherBuckets   = 32
 
 	a2aDispatcherContainerName = "dispatcher"
 	a2aDispatcherStatusPort    = 8080
@@ -82,22 +100,62 @@ const (
 	agentProfileWorkerComponent = "agentprofile-worker"
 )
 
-// a2aDispatcherImage is the dispatcher's image: A2A_DISPATCHER_IMAGE, or
-// nothing. It is off by default until profiles dispatch end to end.
-func a2aDispatcherImage() string { return strings.TrimSpace(os.Getenv(a2aDispatcherImageEnvVar)) }
+// a2aDispatcherImage is the dispatcher's image, or nothing when
+// A2A_PROFILE_DISPATCHER turns it off. On by default: the release set's
+// image (a2aDispatcherReleaseImage), with A2A_DISPATCHER_IMAGE the override.
+func a2aDispatcherImage() string {
+	if strings.TrimSpace(os.Getenv(a2aProfileDispatcherEnvVar)) == "false" {
+		return ""
+	}
+	return a2aDispatcherReleaseImage()
+}
 
 // a2aDispatcherReleaseImage is the dispatcher's image as the release set
 // resolves it, the way the verifier's is (a2aReleaseImage), with
-// A2A_DISPATCHER_IMAGE still the override. Nothing calls it yet: rendering
-// the dispatcher by default is a2aDispatcherImage returning this.
+// A2A_DISPATCHER_IMAGE still the override.
 func a2aDispatcherReleaseImage() string {
 	return strings.TrimSpace(a2aReleaseImage(a2aDispatcherImageEnvVar, a2aDispatcherImageName))
 }
 
 // a2aDispatcherEnabled reports whether this operator renders the dispatcher:
-// only when A2A_DISPATCHER_IMAGE is set, so an empty image never renders a
-// Deployment with nothing to pull.
+// unless A2A_PROFILE_DISPATCHER is "false".
 func a2aDispatcherEnabled() bool { return a2aDispatcherImage() != "" }
+
+// a2aDispatcherBucketedGrants reports whether the dispatcher's entry narrows
+// on "dispatcher" (A2A_DISPATCHER_BUCKETED_GRANTS=true). Only the exact
+// string turns it on.
+func a2aDispatcherBucketedGrants() bool {
+	return strings.TrimSpace(os.Getenv(a2aDispatcherBucketedGrantsEnvVar)) == "true"
+}
+
+// dispatcherMapEntry is the dispatcher's identity-map entry. With bucketed
+// grants off, it lists every grant: the fixed set, plus every admitted and
+// draining profile's subjects (dispatcherIdentity). With them on (#5381), it
+// narrows on "dispatcher". Its grants are then the fixed set alone, for the
+// control connection, plus the draining profiles' names. The callout derives
+// every per-profile subject from the profile entries (lib.DispatcherGrants),
+// so the entry's size no longer grows with the profile count.
+func dispatcherMapEntry(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, draining []a2aDispatchProfile) a2aAuthMapIdentity {
+	if !a2aDispatcherBucketedGrants() {
+		entry, _ := a2aDispatcherMapEntry(agent, profiles, draining)
+		return entry
+	}
+	id := dispatcherIdentity(agent, agent.Namespace, nil, nil)
+	var drainingNames []string
+	for _, d := range draining {
+		if !slices.Contains(drainingNames, d.Name) {
+			drainingNames = append(drainingNames, d.Name)
+		}
+	}
+	return a2aAuthMapIdentity{
+		ServiceAccount: id.serviceAccount,
+		User:           id.user,
+		Account:        id.account,
+		Grants:         a2aAuthMapGrants{Publish: id.publish, Subscribe: id.subscribe},
+		Narrowing:      a2aNarrowingDispatcher,
+		Draining:       drainingNames,
+	}
+}
 
 func a2aDispatcherName(agent *agentv1alpha1.PlatformAgent) string {
 	return agent.Name + "-a2a-dispatcher"
@@ -257,6 +315,16 @@ func a2aTaskSigningKeyHash(public string) string {
 // two at once would each hold their own share of every durable's in-flight
 // count and enforce the ceiling against half the picture. The gap Recreate
 // leaves is what restartGraceSeconds covers.
+// a2aDispatcherResources adds an ephemeral-storage request and equal limit,
+// for the container's own log, to its CPU and memory, as the bus's config
+// reloader does: the dispatcher writes nothing else to disk.
+func a2aDispatcherResources() corev1.ResourceRequirements {
+	resources := a2aResources(a2aDispatcherCPURequest, a2aDispatcherMemoryRequest, a2aDispatcherCPULimit, a2aDispatcherMemoryLimit)
+	resources.Requests[corev1.ResourceEphemeralStorage] = resource.MustParse(emptyDirLogsAllowance)
+	resources.Limits[corev1.ResourceEphemeralStorage] = resource.MustParse(emptyDirLogsAllowance)
+	return resources
+}
+
 func buildA2ADispatcherDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deployment {
 	name := a2aDispatcherName(agent)
 	selector := a2aDispatcherPodSelector(agent)
@@ -323,8 +391,7 @@ func buildA2ADispatcherDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.De
 							PeriodSeconds:    10,
 							FailureThreshold: 6,
 						},
-						Resources: a2aResources(a2aDispatcherCPURequest, a2aDispatcherMemoryRequest,
-							a2aDispatcherCPULimit, a2aDispatcherMemoryLimit),
+						Resources:       a2aDispatcherResources(),
 						SecurityContext: hardenedSecurityContext(),
 					}},
 					Volumes: []corev1.Volume{a2aBusTokenVolumeSource(), a2aNATSCABundleVolume(agent), a2aTaskSigningSeedVolumeSource(agent)},
@@ -602,45 +669,14 @@ func desiredDispatchConfigDraining(agent *agentv1alpha1.PlatformAgent, profiles 
 // drainingDispatchProfiles built it, with no durables and no template, since
 // nothing new is dispatched for it.
 func desiredDispatchConfigWith(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, jobTemplates map[string]*corev1.PodTemplateSpec, draining []a2aDispatchProfile) (a2aDispatchConfig, error) {
-	ceiling := resolveProfileCeiling(agent)
-	child, interactive := dispatchReserves(agent, ceiling)
-	cfg := a2aDispatchConfig{
-		Namespace:              agent.Namespace,
-		ProfileNamespace:       profileNamespaceName(agent),
-		Ceiling:                ceiling,
-		InteractiveReserve:     interactive,
-		ChildReserve:           child,
-		LeaseSeconds:           resolveProfileLeaseSeconds(agent),
-		RenewSeconds:           resolveProfileRenewSeconds(agent),
-		RestartGraceSeconds:    resolveProfileRestartGraceSeconds(agent),
-		AcceptTimeoutSeconds:   resolveProfileAcceptTimeoutSeconds(agent),
-		SubmitRetentionSeconds: dispatchSubmitRetentionSeconds(agent),
-		Profiles:               []a2aDispatchProfile{},
-	}
+	cfg := dispatchConfigHeader(agent)
 	resolved := resolveAgentProfileIdentities(agent, profiles)
 	for i := range profiles {
 		p := &profiles[i]
 		if resolved[p.Name].refused != nil {
 			continue
 		}
-		dp := a2aDispatchProfile{
-			Name:                  p.Name,
-			Tiers:                 p.AllowedTierList(),
-			Concurrency:           int(p.Spec.Concurrency),
-			QueueTimeoutSeconds:   int(p.QueueTimeout()),
-			ActiveDeadlineSeconds: func() int { d, _ := cappedTaskDeadline(agent, p); return d }(),
-			Durables:              []a2aDispatchDurable{},
-			JobTemplate:           jobTemplates[p.Name],
-		}
-		for _, param := range p.Spec.Parameters {
-			dp.Parameters = append(dp.Parameters, a2aCardParameter{Name: param.Name, Required: param.Required})
-		}
-		for _, tier := range dp.Tiers {
-			for _, kind := range a2aSubmitKinds {
-				dp.Durables = append(dp.Durables, a2aDispatchDurable{Tier: tier, Kind: kind, Name: profileDurableName(p.Name, tier, kind)})
-			}
-		}
-		cfg.Profiles = append(cfg.Profiles, dp)
+		cfg.Profiles = append(cfg.Profiles, dispatchProfileEntry(agent, p, jobTemplates[p.Name]))
 	}
 	live := map[string]bool{}
 	for _, p := range cfg.Profiles {
@@ -660,9 +696,56 @@ func desiredDispatchConfigWith(agent *agentv1alpha1.PlatformAgent, profiles []ag
 		return cfg, err
 	}
 	sum := sha256.Sum256(body)
-	cfg.Version = hex.EncodeToString(sum[:8])
+	cfg.Version = hex.EncodeToString(sum[:dispatchConfigVersionBytes])
 	return cfg, nil
 }
+
+// dispatchConfigHeader is the dispatch config with no profiles: the
+// install-wide settings every config carries.
+func dispatchConfigHeader(agent *agentv1alpha1.PlatformAgent) a2aDispatchConfig {
+	ceiling := resolveProfileCeiling(agent)
+	child, interactive := dispatchReserves(agent, ceiling)
+	return a2aDispatchConfig{
+		Namespace:              agent.Namespace,
+		ProfileNamespace:       profileNamespaceName(agent),
+		Ceiling:                ceiling,
+		InteractiveReserve:     interactive,
+		ChildReserve:           child,
+		LeaseSeconds:           resolveProfileLeaseSeconds(agent),
+		RenewSeconds:           resolveProfileRenewSeconds(agent),
+		RestartGraceSeconds:    resolveProfileRestartGraceSeconds(agent),
+		AcceptTimeoutSeconds:   resolveProfileAcceptTimeoutSeconds(agent),
+		SubmitRetentionSeconds: dispatchSubmitRetentionSeconds(agent),
+		Profiles:               []a2aDispatchProfile{},
+	}
+}
+
+// dispatchProfileEntry is one live profile's entry in the dispatch config,
+// with its Job template when it has one.
+func dispatchProfileEntry(agent *agentv1alpha1.PlatformAgent, p *agentv1alpha1.AgentProfile, jobTemplate *corev1.PodTemplateSpec) a2aDispatchProfile {
+	dp := a2aDispatchProfile{
+		Name:                  p.Name,
+		Tiers:                 p.AllowedTierList(),
+		Concurrency:           int(p.Spec.Concurrency),
+		QueueTimeoutSeconds:   int(p.QueueTimeout()),
+		ActiveDeadlineSeconds: func() int { d, _ := cappedTaskDeadline(agent, p); return d }(),
+		Durables:              []a2aDispatchDurable{},
+		JobTemplate:           jobTemplate,
+	}
+	for _, param := range p.Spec.Parameters {
+		dp.Parameters = append(dp.Parameters, a2aCardParameter{Name: param.Name, Required: param.Required})
+	}
+	for _, tier := range dp.Tiers {
+		for _, kind := range a2aSubmitKinds {
+			dp.Durables = append(dp.Durables, a2aDispatchDurable{Tier: tier, Kind: kind, Name: profileDurableName(p.Name, tier, kind)})
+		}
+	}
+	return dp
+}
+
+// dispatchConfigVersionBytes is how much of the config's digest its Version
+// keeps.
+const dispatchConfigVersionBytes = 8
 
 // a2aDrainingMargin is how long past the longest task deadline a profile that
 // has left the install stays draining: the dispatcher fails a task still held
@@ -692,14 +775,22 @@ const a2aDrainingWindow = time.Duration(agentv1alpha1.DefaultProfileMaxTaskDeadl
 // deadline under its 6h ceiling), and a time no later than the window from
 // now; nothing else of the entry. An entry that isn't is
 // dropped, and grants nothing.
-func drainingDispatchProfiles(applied *a2aDispatchConfig, live map[string]bool, now time.Time) []a2aDispatchProfile {
+func drainingDispatchProfiles(applied *a2aDispatchConfig, live map[string]bool, now time.Time, reserved ...string) []a2aDispatchProfile {
 	if applied == nil {
 		return nil
 	}
 	var out []a2aDispatchProfile
 	seen := map[string]bool{}
 	for _, a := range applied.Profiles {
+		// A reserved addressee is no profile's name (the operator refuses a
+		// live profile named for one), so an applied entry naming one is
+		// not one this operator wrote, and would grant the dispatcher that
+		// addressee's .supervisor subject. Nor is any other name a2aCanDrainAs
+		// refuses (a principal's, a map user's, a bucket user's): a live
+		// profile may hold one, but the map's mirror refuses it as a draining
+		// name, so carrying it would fail the whole map (#5553, rounds 1-2).
 		if live[a.Name] || seen[a.Name] || !isDNS1123LabelToken(a.Name) || len(a.Tiers) == 0 ||
+			!a2aCanDrainAs(a.Name, reserved) ||
 			slices.ContainsFunc(a.Tiers, func(t string) bool { return !isDNS1123LabelToken(t) }) {
 			continue
 		}
@@ -757,7 +848,7 @@ func (r *PlatformAgentReconciler) dispatchDraining(ctx context.Context, agent *a
 	for _, p := range cfg.Profiles {
 		live[p.Name] = true
 	}
-	return drainingDispatchProfiles(&applied, live, time.Now()), nil
+	return drainingDispatchProfiles(&applied, live, time.Now(), a2aDrainingNameExclusions(agent)...), nil
 }
 
 // reasonDispatchConfigUnreadable is the Warning when the applied dispatch
@@ -775,7 +866,9 @@ func buildA2ADispatchConfigMapWith(agent *agentv1alpha1.PlatformAgent, profiles 
 	if err != nil {
 		return nil, err
 	}
-	body, err := json.MarshalIndent(cfg, "", "  ")
+	// Compact, not indented: indentation roughly doubles a Job template, and
+	// the whole config has to fit one ConfigMap (gke-labs/kube-agents#5479).
+	body, err := json.Marshal(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -818,8 +911,33 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcherDraining(ctx context.Con
 // since a step after the Jobs Role failing doesn't undo what the pass did to
 // it.
 func (r *PlatformAgentReconciler) reconcileA2ADispatcherWithJobMode(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, profileNamespaceReady bool, draining []a2aDispatchProfile) (jobModeVerdict *metav1.Condition, profileErr error, err error) {
-	if !a2aDispatcherEnabled() {
-		profileErr, err = r.removeA2ADispatcher(ctx, agent)
+	// Past the size one identity-map shard can carry, the map leaves the
+	// dispatcher's entry out, so it is torn down as though switched off; the
+	// DispatcherCeiling condition says why (gke-labs/kube-agents#5381). The
+	// dispatch config is still written, with the draining profiles alone: they
+	// are read from it, with their deadlines, so the teardown lasts until those
+	// drains run out rather than one pass. The live profiles stay out, so the
+	// write fits whichever limit was passed; nothing dispatches for them.
+	overCeiling := false
+	if a2aDispatcherEnabled() {
+		_, over, cerr := a2aDispatcherCeiling(agent, profiles, draining)
+		if cerr != nil {
+			return nil, nil, cerr
+		}
+		overCeiling = over
+	}
+	if !a2aDispatcherEnabled() || overCeiling {
+		profileErr, err = r.removeA2ADispatcher(ctx, agent, overCeiling)
+		if overCeiling && err == nil {
+			cm, berr := buildA2ADispatchConfigMap(agent, nil, draining)
+			if berr == nil {
+				berr = ctrl.SetControllerReference(agent, cm, r.Scheme)
+			}
+			if berr == nil {
+				berr = r.applyManaged(ctx, agent, cm)
+			}
+			err = berr
+		}
 		if profileErr == nil && err == nil {
 			jobModeVerdict = jobModeTornDown
 		}
@@ -1024,7 +1142,7 @@ func (r *PlatformAgentReconciler) reconcileA2ADispatcherWithJobMode(ctx context.
 // removeA2ADispatcher deletes what reconcileA2ADispatcher rendered: the
 // owned objects only if this agent controls them, and the profile namespace's
 // Role and binding only if they carry this agent's labels.
-func (r *PlatformAgentReconciler) removeA2ADispatcher(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (profileErr error, err error) {
+func (r *PlatformAgentReconciler) removeA2ADispatcher(ctx context.Context, agent *agentv1alpha1.PlatformAgent, keepDispatchConfig bool) (profileErr error, err error) {
 	// The pools and their bundle go first, whatever the deletes after them
 	// do: their pods hold bus and broker tokens, and nothing dispatches to
 	// them once the dispatcher is off.
@@ -1037,6 +1155,9 @@ func (r *PlatformAgentReconciler) removeA2ADispatcher(ctx context.Context, agent
 		if err := r.deleteIfControlled(ctx, agent, obj, types.NamespacedName{Namespace: agent.Namespace, Name: name}); err != nil {
 			errs = append(errs, err)
 		}
+	}
+	if keepDispatchConfig {
+		return profileErr, goerrors.Join(errs...)
 	}
 	if err := r.deleteIfControlled(ctx, agent, &corev1.ConfigMap{}, types.NamespacedName{Namespace: agent.Namespace, Name: a2aDispatchConfigName(agent)}); err != nil {
 		errs = append(errs, err)
@@ -1112,4 +1233,28 @@ func agentLabelsMarkComponent(obj client.Object, agent *agentv1alpha1.PlatformAg
 		}
 	}
 	return true
+}
+
+// a2aDrainingNameExclusions are the names, beyond the bucket users, that
+// can't be a draining profile's: the static principals, every user the map
+// renders (the callout-authenticated principals included), and the callout's
+// own user. One list, read by drainingDispatchProfiles and by the map's
+// mirror alike (a2aCanDrainAs), so nothing carried into draining is refused
+// later (#5553, round 2).
+func a2aDrainingNameExclusions(agent *agentv1alpha1.PlatformAgent) []string {
+	// The dispatcher's and the operator's users are rendered by their own
+	// paths, not a2aIdentities, so they are named here.
+	names := append([]string{a2aCalloutConfUser, a2aDispatcherUser, a2aOperatorBusUser}, a2aStaticPrincipalNames(agent)...)
+	for _, id := range a2aIdentities(agent) {
+		names = append(names, id.user)
+	}
+	return names
+}
+
+// a2aCanDrainAs reports whether name can be a draining profile's: not a
+// reserved addressee, not one of excluded (a2aDrainingNameExclusions, plus a
+// map's own entry users where the caller has them), and not a dispatcher
+// bucket user, whatever the switch says.
+func a2aCanDrainAs(name string, excluded []string) bool {
+	return !slices.Contains(a2aReservedAddressees(), name) && !slices.Contains(excluded, name) && !isDispatcherBucketUser(name)
 }

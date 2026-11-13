@@ -392,9 +392,17 @@ class ChatMetrics:
             self._dispatch_failures[board] = (streak + 1, error_class, now, began)
 
     def record_dispatch_tick_start(self, board: str) -> None:
-        """A dispatcher tick on ``board`` began."""
+        """A try on ``board`` began: a tick, a ready probe or an auto-decompose connect."""
         with self._lock:
-            self._dispatch_ticking[board] = self._clock()
+            now = self._clock()
+            if board in self._dispatch_failures and board not in self._dispatch_ticking:
+                # Drop a streak past the window first, as render() would have:
+                # this try must not carry it on.
+                _, _, at, _ = self._dispatch_failures[board]
+                if now - max(at, self._dispatch_tried.get(board, at)) > DISPATCH_FAILURE_STALE_SECONDS:
+                    del self._dispatch_failures[board]
+                    self._dispatch_tried.pop(board, None)
+            self._dispatch_ticking[board] = now
 
     def record_dispatch_tick_end(self, board: str) -> None:
         """The try on ``board`` ended, whichever way."""
