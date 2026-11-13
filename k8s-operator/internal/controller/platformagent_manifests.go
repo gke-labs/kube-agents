@@ -3687,43 +3687,38 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			})
 		}
 	}
-	// The Hermes Google Chat platform is off under next (legacyChatConsumer),
-	// so the agent-side callers that used to `hermes send` a proactive post
-	// route it to the gateway's chat.notify home channel instead. This names
-	// the platform they reroute; the bus identity above is what sends it.
-	// With a home channel the route posts; without one it refuses and keeps
-	// the post for the digest, so the route is named whenever the backend
-	// is the only platform the posts could reach (a2aGchatHomeRouted). On a
-	// Chat-and-Slack install with no Chat home the agent is not routed, so
-	// it does not count Chat as a platform to post to ahead of Slack.
-	if a2aAgentSurface(agent) && a2aGchatHomeRouted(agent) {
-		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyPlatformEnvVar, Value: a2aNotifyPlatformGchat})
-	} else if a2aAgentSurface(agent) && a2aSlackHomeRouted(agent) {
-		// Slack's half of the same rule: the Hermes slack platform is off
-		// when the gateway holds Slack (legacySlackConsumer), and Chat wins
-		// the single-backend gateway, so at most one platform is routed. Only
-		// the CR's channel travels as env; a channel the gateway learned
-		// reaches the agent through the projection file mounted below
-		// (platformagent_home_channel_record.go), which the agent's readers
-		// take after a non-empty env, so a learn replaces no pod.
-		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyPlatformEnvVar, Value: a2aNotifyPlatformSlack})
-		// The agent's own idea of the Slack home channel, as under today: the
-		// audit relay gates its report card on knowing a channel and records
-		// it on the incident's routing row. The Hermes slack platform is off
-		// here, so this arms nothing on the agent but those readers.
+	// The Hermes Google Chat and Slack platforms are off while the gateway
+	// holds them (legacyChatConsumer, legacySlackConsumer), so the agent-side
+	// callers that used to `hermes send` a proactive post route it to the
+	// gateway's chat.notify instead; the bus identity above is what sends it.
+	// Every platform whose route is armed is routed, home channel or not: a
+	// platform without a home has its posts kept by the gateway for the
+	// digest it posts once a channel is set (a2a/gateway/notify_refused.go).
+	// The alert picks one platform from the list on its own, Chat first. A
+	// kanban card's report back to the conversation it was filed in, and
+	// onboarding's first report, ride the same routes, so both variables
+	// carry the same list. The agent's Slack home-file fallback, which
+	// applies only when A2A_NOTIFY_PLATFORM is empty, is never needed:
+	// `slack` is in the list whenever Slack's route is armed.
+	notify := strings.Join(a2aNotifyPlatforms(agent), a2aNotifyPlatformSeparator)
+	if a2aAgentSurface(agent) && notify != "" {
+		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyPlatformEnvVar, Value: notify})
+	}
+	// The agent's own idea of the Slack home channel, as under today: the
+	// audit relay gates its report card on knowing a channel and records it
+	// on the incident's routing row. Only the CR's channel travels as env; a
+	// channel the gateway learned reaches the agent through the projection
+	// file mounted below (platformagent_home_channel_record.go), which the
+	// agent's readers take after a non-empty env, so a learn replaces no pod.
+	// It renders between the two lists, where it always has, so an upgrade
+	// that leaves the values alone rolls no pod.
+	if a2aAgentSurface(agent) && a2aSlackNotifyArmed(agent) {
 		if home := a2aSlackHomeChannel(agent); home != "" {
 			envVars = append(envVars, corev1.EnvVar{Name: agentSlackHomeChannelEnvVar, Value: home})
 		}
 	}
-	// A kanban card's report back to the gateway conversation it was filed
-	// in, and onboarding's first report into the conversation the user first
-	// wrote in, ride the same route whenever the gateway arms it, home channel
-	// or not. The kanban notifier and onboarding route by this; the cron relay
-	// only names it when it refuses a report for want of a home channel.
-	if a2aAgentSurface(agent) && a2aGchatNotifyArmed(agent) {
-		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyConversationsEnvVar, Value: a2aNotifyPlatformGchat})
-	} else if a2aAgentSurface(agent) && a2aSlackNotifyArmed(agent) {
-		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyConversationsEnvVar, Value: a2aNotifyPlatformSlack})
+	if a2aAgentSurface(agent) && notify != "" {
+		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyConversationsEnvVar, Value: notify})
 	}
 	if a2aActivityHookWanted(agent) {
 		envVars = append(envVars, a2aActivitySecretEnv(agent))

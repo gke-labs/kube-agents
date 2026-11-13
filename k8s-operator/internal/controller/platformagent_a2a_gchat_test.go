@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -495,54 +496,57 @@ func TestTheHomeChannelReachesTheArmedGateway(t *testing.T) {
 }
 
 // TestTheAgentRoutesProactivePostsToTheGatewayExactlyWhenArmed: the agent
-// container is told to send proactive posts through chat.notify exactly when
-// the next stack holds Google Chat and the home channel is a space name, or
-// is unset with no Slack to fall back to (the gateway then keeps the refused
-// posts for the digest); and the kanban notifier to send a card's report
-// back to its conversation whenever the gateway arms the route (home channel
-// unset or a space name). Telling either with no route behind it sends posts
-// to a subject nobody answers.
+// container is told to send proactive posts, and the kanban notifier a card's
+// report back to its conversation, through chat.notify for every platform
+// whose route the gateway arms, home channel or not (a platform without one
+// has its posts kept for the digest), Chat first. Telling either with no
+// route behind it sends posts to a subject nobody answers.
 func TestTheAgentRoutesProactivePostsToTheGatewayExactlyWhenArmed(t *testing.T) {
 	for _, tc := range []struct {
-		name               string
-		agent              *agentv1alpha1.PlatformAgent
-		home, conversation bool
-		// homePlatform is A2A_NOTIFY_PLATFORM's value when present; empty
-		// means google_chat.
-		homePlatform string
+		name                            string
+		agent                           *agentv1alpha1.PlatformAgent
+		wantPlatform, wantConversations string // "" for absent
 	}{
-		{"today with chat", gchatTestAgent("", true), false, false, ""},
-		{"skew with chat", gchatTestAgent("later", true), false, false, ""},
-		{"next with chat", withHome(gchatTestAgent("next", true), "spaces/AAAA"), true, true, ""},
-		{"next with chat, no home channel", gchatTestAgent("next", true), true, true, ""},
-		// Slack shares the gateway, so with no Chat home the proactive
-		// posts route to Slack.
-		{"next with chat and slack, no chat home", chatAndSlackTestAgent("next"), true, true, a2aNotifyPlatformSlack},
-		{"next with chat, not a space", withHome(gchatTestAgent("next", true), "spaces/AAAA/threads/B"), false, false, ""},
-		{"next with chat, bare id", withHome(gchatTestAgent("next", true), "AAAA"), false, false, ""},
-		{"next without chat", withHome(gchatTestAgent("next", false), "spaces/AAAA"), false, false, ""},
-		{"today with chat and home", withHome(gchatTestAgent("", true), "spaces/AAAA"), false, false, ""},
+		{"today with chat", gchatTestAgent("", true), "", ""},
+		{"skew with chat", gchatTestAgent("later", true), "", ""},
+		{"next with chat", withHome(gchatTestAgent("next", true), "spaces/AAAA"), "google_chat", "google_chat"},
+		{"next with chat, no home channel", gchatTestAgent("next", true), "google_chat", "google_chat"},
+		// Both backends share the gateway, so both are routed; Chat's posts
+		// are kept for the digest until its home is set.
+		{"next with chat and slack, no chat home", chatAndSlackTestAgent("next"), "google_chat,slack", "google_chat,slack"},
+		{"next with chat, not a space", withHome(gchatTestAgent("next", true), "spaces/AAAA/threads/B"), "", ""},
+		{"next with chat, bare id", withHome(gchatTestAgent("next", true), "AAAA"), "", ""},
+		{"next without chat", withHome(gchatTestAgent("next", false), "spaces/AAAA"), "", ""},
+		{"today with chat and home", withHome(gchatTestAgent("", true), "spaces/AAAA"), "", ""},
+		{"today with chat and slack", chatAndSlackTestAgent(""), "", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			pod := buildPodTemplateSpec(tc.agent, "h", "h", "h", "h", nil, renderOptions{})
 			env := envMapOf(brokerContainerNamed(pod.Spec.Containers, "platform-agent").Env)
-			for name, want := range map[string]bool{a2aNotifyPlatformEnvVar: tc.home, a2aNotifyConversationsEnvVar: tc.conversation} {
+			for name, want := range map[string]string{a2aNotifyPlatformEnvVar: tc.wantPlatform, a2aNotifyConversationsEnvVar: tc.wantConversations} {
 				got, ok := env[name]
-				if ok != want {
-					t.Fatalf("%s present = %v, want %v", name, ok, want)
+				if ok != (want != "") {
+					t.Fatalf("%s present = %v, want %v", name, ok, want != "")
 				}
-				wantValue := "google_chat"
-				if name == a2aNotifyPlatformEnvVar && tc.homePlatform != "" {
-					wantValue = tc.homePlatform
-				}
-				if ok && got.Value != wantValue {
-					t.Errorf("%s = %q, want %s (the platform name the agent-side callers use)", name, got.Value, wantValue)
+				if ok && got.Value != want {
+					t.Errorf("%s = %q, want %q (the platform names the agent-side callers use)", name, got.Value, want)
 				}
 			}
-			if (tc.home || tc.conversation) && legacyChatConsumer(tc.agent) {
+			if tc.wantPlatform != "" && legacyChatConsumer(tc.agent) {
 				t.Error("the notify route and the legacy Hermes platform both render")
 			}
 		})
+	}
+}
+
+// TestNotifyPlatformsOrderIsChatThenSlack: the list the agent reads names
+// Chat before Slack, and Slack alone on a Slack-only install.
+func TestNotifyPlatformsOrderIsChatThenSlack(t *testing.T) {
+	if got, want := a2aNotifyPlatforms(chatAndSlackTestAgent("next")), []string{"google_chat", "slack"}; !slices.Equal(got, want) {
+		t.Errorf("Chat and Slack: a2aNotifyPlatforms = %q, want %q", got, want)
+	}
+	if got, want := a2aNotifyPlatforms(slackTestAgent("next", true)), []string{"slack"}; !slices.Equal(got, want) {
+		t.Errorf("Slack only: a2aNotifyPlatforms = %q, want %q", got, want)
 	}
 }
 

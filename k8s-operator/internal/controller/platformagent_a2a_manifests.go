@@ -664,6 +664,9 @@ const (
 	a2aNotifyPlatformEnvVar = "A2A_NOTIFY_PLATFORM"
 	a2aNotifyPlatformGchat  = "google_chat"
 	a2aNotifyPlatformSlack  = "slack"
+	// The agent reads A2A_NOTIFY_PLATFORM and A2A_NOTIFY_CONVERSATIONS as
+	// comma-separated lists of the platform names above.
+	a2aNotifyPlatformSeparator = ","
 	// The Slack home channel the same route posts to on a Slack-armed
 	// gateway, from slack.homeChannel.
 	a2aSlackHomeChannelEnvVar = "A2A_SLACK_HOME_CHANNEL"
@@ -1536,32 +1539,18 @@ func a2aSlackNotifyArmed(agent *agentv1alpha1.PlatformAgent) bool {
 	return strings.TrimSpace(agent.Spec.Integration.Slack.HomeChannel) == "" || a2aSlackHomeChannel(agent) != ""
 }
 
-// a2aGchatHomeRouted says the agent routes its home posts (alerts, drift
-// and scheduled reports) to the gateway's Chat backend: the home channel is
-// a space name, or it is empty and Slack is not enabled, so the posts have
-// nowhere else to go and the gateway keeps the refused ones for the digest
-// it posts once a channel is set (a2a/gateway/notify_refused.go). With Slack
-// enabled beside an unset Chat home the posts keep going to Slack through
-// its Hermes platform (legacySlackConsumer) rather than into the keep. A
-// malformed home channel routes nothing: the gateway refuses it at start.
-func a2aGchatHomeRouted(agent *agentv1alpha1.PlatformAgent) bool {
-	if !a2aChatArmed(agent) {
-		return false
+// a2aNotifyPlatforms is every platform whose chat.notify route the gateway
+// arms, Chat first: the platforms the agent routes its proactive posts and
+// conversation reports to (A2A_NOTIFY_PLATFORM, A2A_NOTIFY_CONVERSATIONS).
+func a2aNotifyPlatforms(agent *agentv1alpha1.PlatformAgent) []string {
+	var platforms []string
+	if a2aGchatNotifyArmed(agent) {
+		platforms = append(platforms, a2aNotifyPlatformGchat)
 	}
-	if a2aGchatHomeSpace(agent) != "" {
-		return true
+	if a2aSlackNotifyArmed(agent) {
+		platforms = append(platforms, a2aNotifyPlatformSlack)
 	}
-	return strings.TrimSpace(agent.Spec.Integration.GoogleChat.HomeChannel) == "" && !slackEnabled(agent)
-}
-
-// a2aSlackHomeRouted is Slack's half of a2aGchatHomeRouted. Slack holds the
-// gateway only when Chat is not enabled (a2aSlackArmed), so an unset home
-// channel always routes: Slack is the install's one chat platform.
-func a2aSlackHomeRouted(agent *agentv1alpha1.PlatformAgent) bool {
-	if !a2aSlackArmed(agent) {
-		return false
-	}
-	return a2aSlackHomeChannel(agent) != "" || strings.TrimSpace(agent.Spec.Integration.Slack.HomeChannel) == ""
+	return platforms
 }
 
 // a2aSlackHomeChannel is slack.homeChannel trimmed, when it is a public

@@ -327,9 +327,9 @@ func TestHomeChannelRecordDrivesTheProjection(t *testing.T) {
 			if got := env[agentSlackHomeChannelEnvVar].Value; got != tc.wantEnv {
 				t.Errorf("%s = %q, want %q (the learned channel travels as a file, not env)", agentSlackHomeChannelEnvVar, got, tc.wantEnv)
 			}
-			// Routed with the CR's channel, and with the field empty (Slack is
-			// the only chat platform here, so the gateway keeps what it
-			// refuses); a malformed CR value routes nothing.
+			// Routed whenever Slack's route is armed: with the CR's channel,
+			// and with the field empty (the gateway keeps what it refuses for
+			// the digest); a malformed CR value arms no route.
 			wantRouted := tc.wantEnv != "" || strings.TrimSpace(tc.crHome) == ""
 			if _, routed := env[a2aNotifyPlatformEnvVar]; routed != wantRouted {
 				t.Errorf("%s present = %v, want %v", a2aNotifyPlatformEnvVar, routed, wantRouted)

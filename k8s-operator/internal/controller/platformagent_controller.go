@@ -309,7 +309,7 @@ const (
 	// refuses and keeps (a2a/gateway/notify_refused.go).
 	homeChannelUnsetKept = "are refused by the gateway, which keeps them and posts one digest into the channel once it is set"
 	// homeChannelUnsetToSlack is the meanwhile on a Chat-and-Slack install:
-	// the agent is not routed to Chat (a2aGchatHomeRouted), so the posts go
+	// the agent is not routed to Chat, so the posts go
 	// to the Slack Hermes platform, which delivers them only where Slack's
 	// own home channel is set; the operator cannot see one set from chat.
 	homeChannelUnsetToSlack = "go to the Slack Hermes platform meanwhile, which delivers them only if Slack has a home channel"
