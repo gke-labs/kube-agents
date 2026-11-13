@@ -231,6 +231,9 @@ SLACK_PLATFORM = "slack"
 GOOGLE_CHAT_PLATFORM = "google_chat"
 CHAT_UX_PLATFORMS = (SLACK_PLATFORM, GOOGLE_CHAT_PLATFORM)
 GATEWAY_PLATFORM_ENVS = ("A2A_NOTIFY_PLATFORM", "A2A_NOTIFY_CONVERSATIONS")
+# What separates the platform names in either variable
+# (kanban_chat_notify.PLATFORM_LIST_SEPARATOR).
+GATEWAY_PLATFORM_SEPARATOR = ","
 
 
 def _normalise(text: str) -> str:
@@ -1625,11 +1628,15 @@ def chat_ux_on(platform: object) -> bool:
 
 
 def gateway_serves(platform: object) -> bool:
-    """Whether the A2A gateway serves ``platform``'s posts (``spec.mode: next``): the
-    platform the operator names in ``A2A_NOTIFY_PLATFORM`` (home posts) or
-    ``A2A_NOTIFY_CONVERSATIONS`` (conversations), as kanban_chat_notify reads them."""
+    """Whether the A2A gateway serves ``platform``'s posts (``spec.mode: next``): a
+    platform the operator names in the ``A2A_NOTIFY_PLATFORM`` (home posts) or
+    ``A2A_NOTIFY_CONVERSATIONS`` (conversations) list, as kanban_chat_notify reads them."""
     name = str(platform or "").strip().lower()
-    served = {os.environ.get(key, "").strip().lower() for key in GATEWAY_PLATFORM_ENVS}
+    served = {
+        part.strip().lower()
+        for key in GATEWAY_PLATFORM_ENVS
+        for part in os.environ.get(key, "").split(GATEWAY_PLATFORM_SEPARATOR)
+    }
     return bool(name) and name in served
 
 

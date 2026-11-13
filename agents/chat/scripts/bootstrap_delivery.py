@@ -155,6 +155,8 @@ SCAN_JOB_ID = "bootstrap-inventory-scan"
 DELIVERY_JOB_ID = "bootstrap-inventory-delivery"
 # The job that runs this stage, and so the one the plugin links to the chat.
 OOBE_JOB_ID = "oobe"
+# What a reason prints for an empty served-platform list.
+UNSET_LABEL = "<unset>"
 
 # The delivered report is renamed here rather than deleted. It is the only copy
 # of a sweep that can take many minutes over a whole fleet, and a chat message
@@ -616,6 +618,8 @@ HOME_LINE_POSTED = "was posted"
 HOME_LINE_KEPT = "was kept by the gateway for its digest (no home channel yet)"
 HOME_LINE_FAILED = "was not posted (a2a notify exited {code}: {detail})"
 HOME_LINE_NO_EXIT = "none"
+# Leads each home-line note when more than one platform is routed, so each names its platform.
+HOME_LINE_PLATFORM_PREFIX = "{platform}: "
 REPORT_TOO_LONG_REASON = (
     "the first-run report is longer than an issue body may be ({chars} characters, limit {limit}); not filing it"
 )
@@ -818,10 +822,10 @@ def _conversation_ready(data_dir: Path, conversation: dict) -> bool:
     platform = conversation["platform"]
     if not all(conversation.values()):
         reason = f"{CONVERSATION_FILE} is missing or incomplete; the report waits"
-    elif chat_notify.gateway_platform() != platform:
+    elif platform not in (served := chat_notify.gateway_platforms()):
         reason = (
             f"the gateway does not serve {platform} conversations to this run "
-            f"({chat_notify.NOTIFY_CONVERSATIONS_ENV}={chat_notify.gateway_platform()!r}); the report waits"
+            f"({chat_notify.NOTIFY_CONVERSATIONS_ENV}={chat_notify.PLATFORM_LIST_SEPARATOR.join(served) or UNSET_LABEL}); the report waits"
         )
     else:
         reason = chat_notify.bus_unreachable_reason()
@@ -1278,7 +1282,7 @@ def _card_platform(platform: str | None) -> bool:
     gateway serves it (``spec.mode: next``), home posts or conversations, and lays the card out."""
     if platform == PRESENTED_PLATFORM:
         return True
-    return platform == GCHAT_PLATFORM and (chat_notify.routes(platform) or chat_notify.gateway_platform() == platform)
+    return platform == GCHAT_PLATFORM and (chat_notify.routes(platform) or platform in chat_notify.gateway_platforms())
 
 
 def _origin_platform() -> str | None:
@@ -2164,16 +2168,22 @@ def _file_report_issue(repo: str, body: str, sweep: str, filed_at: float, now: f
 
 
 def _post_home_line(data_dir: Path, url: str, now: float) -> None:
-    """One line naming the filed report, to the platform whose home posts route through the gateway.
+    """One line naming the filed report, to each platform whose home posts route through the gateway.
 
     After the claim and the issue, so best effort: the issue is the record. ``NOTIFY_KEPT`` is
     the gateway holding the line for its digest, which is where a channel set later reads it.
+    Each platform is posted and noted on its own; a failure on one does not skip the next.
     """
-    platform = chat_notify.routed_platform()
-    if not platform:
-        return
+    platforms = chat_notify.routed_platforms()
     text = REPORT_ISSUE_HOME_POST.format(url=url, date=_utc(now))
-    argv = chat_notify.command(platform, text, wait_seconds=chat_notify.NOTIFY_WAIT_SECONDS)
+    for platform in platforms:
+        prefix = HOME_LINE_PLATFORM_PREFIX.format(platform=platform) if len(platforms) > 1 else ""
+        outcome = _home_line_outcome(chat_notify.command(platform, text, wait_seconds=chat_notify.NOTIFY_WAIT_SECONDS))
+        _stage_note(data_dir, prefix + REPORT_HOME_LINE_NOTE.format(outcome=outcome))
+
+
+def _home_line_outcome(argv: list[str]) -> str:
+    """How one home-line post ended, as a ``HOME_LINE_*`` outcome."""
     # A route that is not there right now (a gateway roll) is waited out as
     # the conversation path waits it out; one that stays away is a log line.
     for delay in (*chat_notify.NOTIFY_ROUTE_RETRY_DELAYS_SECONDS, None):
@@ -2183,19 +2193,16 @@ def _post_home_line(data_dir: Path, url: str, now: float) -> None:
                 timeout=chat_notify.NOTIFY_SUBPROCESS_TIMEOUT_SECONDS, check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as e:
-            _stage_note(data_dir, REPORT_HOME_LINE_NOTE.format(outcome=HOME_LINE_FAILED.format(code=HOME_LINE_NO_EXIT, detail=e)))
-            return
+            return HOME_LINE_FAILED.format(code=HOME_LINE_NO_EXIT, detail=e)
         if not chat_notify.route_unavailable(res.returncode) or delay is None:
             break
         time.sleep(delay)
     if res.returncode == 0:
-        outcome = HOME_LINE_POSTED
-    elif chat_notify.kept(res.returncode):
-        outcome = HOME_LINE_KEPT
-    else:
-        detail = _gateway_error(res.stdout) or (res.stderr or "").strip()
-        outcome = HOME_LINE_FAILED.format(code=res.returncode, detail=detail)
-    _stage_note(data_dir, REPORT_HOME_LINE_NOTE.format(outcome=outcome))
+        return HOME_LINE_POSTED
+    if chat_notify.kept(res.returncode):
+        return HOME_LINE_KEPT
+    detail = _gateway_error(res.stdout) or (res.stderr or "").strip()
+    return HOME_LINE_FAILED.format(code=res.returncode, detail=detail)
 
 
 def _retire_undelivered(data_dir: Path, in_sandbox: bool) -> int:
@@ -2327,7 +2334,7 @@ def _file_without_thread(data_dir: Path, in_sandbox: bool, sweep: str, filed_at:
     # Sized as filed (markers, intro, report, note), before the second sandbox read and the
     # findings registration; counted, so a report that will never fit stops after the waits.
     no_ranking = _no_ranking(data_dir)
-    note = _safe_audits_note(data_dir, no_ranking is True, bool(chat_notify.routed_platform()))
+    note = _safe_audits_note(data_dir, no_ranking is True, bool(chat_notify.routed_platforms()))
     body = _with_note(content, note)
     composed = len(_issue_text(body, sweep, filed_at, now))
     if composed > ISSUE_BODY_MAX_CHARS:
@@ -2492,7 +2499,7 @@ def main(data_dir: Path | None = None) -> int:
     platform = conversation["platform"] if conversation is not None else _origin_platform()
     card, text_reason = _first_report_card(platform, no_ranking, files, suppressed)
     # Also before the claim, so its reads cannot cost the report once the claim is taken.
-    home = bool(chat_notify.routed_platform()) if conversation is not None else True
+    home = bool(chat_notify.routed_platforms()) if conversation is not None else True
     note = _safe_audits_note(data_dir, no_ranking is True, home)
 
     # The cheap check above is advisory; this is the decision. Nothing may be
