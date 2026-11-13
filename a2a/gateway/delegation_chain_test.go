@@ -212,6 +212,13 @@ func TestAProfileParentsChildCarriesTheChainAndBothRecordTheirScopes(t *testing.
 	if !ok || ref.Scope != prodScope || len(ref.ProfileChain) != 1 || ref.ProfileChain[0] != "chat" {
 		t.Fatalf("child scope %q chain %v, want %q and [chat]", ref.Scope, ref.ProfileChain, prodScope)
 	}
+	// The child's authority carries the parent's chain and scope for the
+	// dispatcher's re-check: the parent heads its chain, so its carried chain
+	// is empty, and its scope is the install's.
+	via, err := capability.ViaFromAuthority(child.Authority)
+	if err != nil || via == nil || via.Session != "chat" || len(via.ProfileChain) != 0 || string(via.Scope) != installScope {
+		t.Fatalf("child via %+v (err %v), want session chat, no chain, scope %q", via, err, installScope)
+	}
 }
 
 func TestAProfileParentWhoseScopeIsNotOnRecordMintsNothing(t *testing.T) {

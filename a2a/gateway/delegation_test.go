@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -1037,7 +1038,7 @@ func TestTheChildsTerminalWakesTheSessionWithTheResult(t *testing.T) {
 	if auth.Requester != parent.Requester || auth.Audience.Conversation != parent.Audience.Conversation {
 		t.Fatalf("wake attribution %+v != parent %+v", auth, parent)
 	}
-	if auth.Via == nil || *auth.Via != (AuthorityVia{TaskID: child.TaskID, Session: session}) {
+	if auth.Via == nil || !reflect.DeepEqual(*auth.Via, AuthorityVia{TaskID: child.TaskID, Session: session}) {
 		t.Fatalf("wake via = %+v, want task %s session %s", auth.Via, child.TaskID, session)
 	}
 	assertRootCapability(t, r, auth, wake.TaskID, wakeSession)

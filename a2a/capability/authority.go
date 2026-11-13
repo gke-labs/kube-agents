@@ -19,6 +19,31 @@ type authorityGrants struct {
 
 type authorityBlock struct {
 	Grants *authorityGrants `json:"grants"`
+	Via    *Via             `json:"via"`
+}
+
+// Via is the authority block's `via`: the task and session on whose request
+// the gateway minted a child, and, for a child of an AgentProfile task, the
+// parent's carried profile chain and its scope (#5686). The gateway alone
+// writes it; the dispatcher reads it to re-check a profile parent's child.
+type Via struct {
+	TaskID       string   `json:"taskId"`
+	Session      string   `json:"session"`
+	ProfileChain []string `json:"profileChain,omitempty"`
+	Scope        Scope    `json:"scope,omitempty"`
+}
+
+// ViaFromAuthority reads the authority block's `via`, or nil when the block or
+// its `via` is absent. err is non-nil when the block doesn't parse.
+func ViaFromAuthority(raw json.RawMessage) (*Via, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var block authorityBlock
+	if err := json.Unmarshal(raw, &block); err != nil {
+		return nil, err
+	}
+	return block.Via, nil
 }
 
 // RefFromAuthority pulls the capability reference out of an envelope's
