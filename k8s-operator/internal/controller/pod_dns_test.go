@@ -17,11 +17,6 @@ limitations under the License.
 package controller
 
 import (
-	"go/ast"
-	"go/parser"
-	"go/token"
-	"path/filepath"
-	"strconv"
 	"testing"
 	"time"
 
@@ -80,43 +75,7 @@ func TestBrokerCallerPodsSetNdots3(t *testing.T) {
 // TestSessionPodNdotsIsTheOperators is the same check from the other side,
 // because each module's tests run only when that module changes.
 func TestBrokerCallerPodNdotsIsTheGateways(t *testing.T) {
-	path := filepath.Join("..", "..", "..", "a2a", "gateway", "spawn.go")
-	if got := stringConstantIn(t, path, "sessionPodNdots"); got != brokerCallerPodNdots {
+	if got := stringConstInSource(t, a2aGatewaySpawnSource, "sessionPodNdots"); got != brokerCallerPodNdots {
 		t.Errorf("the gateway's sessionPodNdots is %q and brokerCallerPodNdots is %q; change both together", got, brokerCallerPodNdots)
 	}
-}
-
-// stringConstantIn is the value of the string constant name that the Go file
-// at path declares.
-func stringConstantIn(t *testing.T, path, name string) string {
-	t.Helper()
-	file, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, decl := range file.Decls {
-		gen, ok := decl.(*ast.GenDecl)
-		if !ok || gen.Tok != token.CONST {
-			continue
-		}
-		for _, spec := range gen.Specs {
-			values := spec.(*ast.ValueSpec)
-			for i, ident := range values.Names {
-				if ident.Name != name || i >= len(values.Values) {
-					continue
-				}
-				lit, ok := values.Values[i].(*ast.BasicLit)
-				if !ok || lit.Kind != token.STRING {
-					t.Fatalf("%s: %s is not a string literal", path, name)
-				}
-				value, err := strconv.Unquote(lit.Value)
-				if err != nil {
-					t.Fatal(err)
-				}
-				return value
-			}
-		}
-	}
-	t.Fatalf("%s declares no constant %s", path, name)
-	return ""
 }
