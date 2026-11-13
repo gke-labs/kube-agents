@@ -19,6 +19,19 @@ type CallerAuthenticator interface {
 	AuthenticateRequest(r *http.Request) (*CallerIdentity, error)
 }
 
+// partitionKey carries Config.CallerPartition's value for the request to the cache and the
+// Upstream.
+type partitionKey struct{}
+
+// PartitionFromContext returns the partition Config.CallerPartition gave the request whose
+// context ctx is, or "" when the handler has no CallerPartition. An Upstream that chooses a
+// credential per caller chooses it by this value: a coalesced fetch serves every request of
+// its partition, so it carries no single caller.
+func PartitionFromContext(ctx context.Context) string {
+	partition, _ := ctx.Value(partitionKey{}).(string)
+	return partition
+}
+
 // UpstreamTransport forwards an admitted request to the cluster clusterID names. req carries
 // the API server path and query, with the caller's credentials already removed; the
 // transport sets the scheme, host and its own credentials. For a 101 Switching Protocols

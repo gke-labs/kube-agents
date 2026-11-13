@@ -79,6 +79,14 @@ evictions, byte size, and entry count are exported on the metrics listener as
 `kubeagents_kube_proxy_cache_requests_total`, `kubeagents_kube_proxy_cache_evictions_total`,
 `kubeagents_kube_proxy_cache_bytes`, and `kubeagents_kube_proxy_cache_entries`.
 
+Cached responses and coalesced fetches are shared across callers, which is safe while the
+`UpstreamTransport` uses one credential for everyone, as `pkg/upstream` does. An embedder whose
+transport picks a credential per caller or tenant sets `Config.CallerPartition`: its value for the
+authenticated caller is part of the cache and coalescing keys, so requests share a response or a
+fetch only within a partition, and the transport reads it with `PartitionFromContext` to choose
+the credential. Coalescing runs even with a `0s` resource TTL, so a per-tenant transport without a
+partition needs the cache off (`Config.Cache` nil).
+
 It is a self-contained Go module. Run its checks from this directory:
 
 ```bash

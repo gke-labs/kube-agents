@@ -526,7 +526,7 @@ func (c *responseCache) roundTrip(req *http.Request, next func(*http.Request) (*
 		return resp, err
 	}
 
-	key := buildCacheKey(clusterID, req, meta.callerAccept)
+	key := buildCacheKey(clusterID, PartitionFromContext(req.Context()), req, meta.callerAccept)
 	now := c.now()
 
 	if !reqCC.noCache && !reqCC.zeroMaxAge {
@@ -1249,14 +1249,16 @@ func buildResponseFromCache(req *http.Request, entry *cachedResponse, now time.T
 	}
 }
 
-func buildCacheKey(clusterID string, req *http.Request, callerAccept string) string {
+// buildCacheKey names one stored response and one in-flight fetch. partition is
+// Config.CallerPartition's value, length-prefixed so no partition can spell another's key.
+func buildCacheKey(clusterID, partition string, req *http.Request, callerAccept string) string {
 	query := canonicalQuery(req.URL.RawQuery)
 	accept := callerAccept
 	if accept == "" {
 		accept = normalizeAcceptHeader(req.Header)
 	}
 	encoding := normalizeAcceptEncoding(req.Header)
-	raw := clusterID + "\x00" + req.Method + "\x00" + req.URL.Path + "\x00" + query + "\x00" + accept + "\x00" + encoding
+	raw := strconv.Itoa(len(partition)) + ":" + partition + "\x00" + clusterID + "\x00" + req.Method + "\x00" + req.URL.Path + "\x00" + query + "\x00" + accept + "\x00" + encoding
 	sum := sha256.Sum256([]byte(raw))
 	return "k8s:" + clusterID + ":" + hex.EncodeToString(sum[:cacheKeyHashBytes])
 }
