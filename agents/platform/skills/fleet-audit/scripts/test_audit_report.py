@@ -46,6 +46,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))
 import audit_report  # noqa: E402
 import credential_proxy_client  # noqa: E402
 import gitops_workspace  # noqa: E402
+import no_live_kubectl  # noqa: E402
 import providers  # noqa: E402
 import vcs_broker  # noqa: E402
 import vcs_client  # noqa: E402
@@ -55,6 +56,23 @@ import workspace_paths  # noqa: E402
 # need not each carry a manifest; the guard's own tests put this back.
 REAL_COLLECTOR_AUDITS = audit_report.COLLECTOR_AUDITS
 SKILL_ROOT = Path(__file__).resolve().parents[1]
+
+
+def setUpModule():
+    # No test here reaches a cluster: a read of the state ConfigMap that a test
+    # leaves unstubbed is unreadable, and any other kubectl found on PATH fails
+    # the module.
+    global _NO_KUBECTL
+    _NO_KUBECTL = no_live_kubectl.install()
+
+
+def tearDownModule():
+    _NO_KUBECTL.uninstall()
+
+
+class TestNoLiveKubectl(unittest.TestCase):
+    def test_no_test_in_this_module_can_reach_a_cluster(self):
+        no_live_kubectl.assert_in_force(self, _NO_KUBECTL)
 
 
 def skill_text() -> str:
@@ -716,6 +734,8 @@ class Recorder:
         self.cwds: list[str | None] = []
         # The payload each forge call carried, None for a command.
         self.payloads: list[dict | None] = []
+        # The (verb, target) of each forge call: the finding it named for the post-merge check.
+        self.targets: list[tuple[str, dict | None]] = []
         self.replies = replies or {}
         self.failures = failures or {}
         # What `identity` answers for each comment author, filled from the
@@ -757,8 +777,9 @@ class Recorder:
                 return CompletedProcess(cmd, 0, payload, "")
         return CompletedProcess(cmd, 0, "", "")
 
-    def forge(self, verb, payload, repository=None):
-        """`vcs_client.forge`, answered from `replies` and `failures`."""
+    def forge(self, verb, payload, repository=None, target=None):
+        """`vcs_client.forge`, answered from `replies` and `failures`; a `target` lands in `targets`."""
+        self.targets.append((verb, target))
         payload = {k: v for k, v in dict(payload).items() if v is not None}
         if repository is not None:
             payload["repository"] = repository
@@ -1099,10 +1120,12 @@ class BaseTestCase(unittest.TestCase):
         self.patch_attr("SCRATCH_DIR", str(self.tmp_path / "scratch"))
 
     @staticmethod
-    def forge_through_recorder(verb, payload, repository=None):
+    def forge_through_recorder(verb, payload, repository=None, target=None):
         recorder = audit_report.run_cmd
         if not isinstance(recorder, Recorder):
             raise AssertionError(f"forge {verb} called with no Recorder installed")
+        if target:
+            return recorder.forge(verb, payload, repository=repository, target=target)
         return recorder.forge(verb, payload, repository=repository)
 
     def issue_list(self, number=42, url="https://github.com/acme/fleet/issues/42"):
@@ -12707,6 +12730,27 @@ class TestOpenRemediationPr(HarnessTestCase):
         # whatever survived the forced checkout.
         self.assertEqual((self.workspace / self.path).read_bytes(), b"# fix\n")
 
+    def test_create_names_the_finding_of_a_one_finding_no_pdb_group(self):
+        self.harness.replies = {"proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8")}
+        self.group = [dict(f, check=audit_report.GENERATED_FIX_CHECK, object="Deployment/web") for f in self.group]
+        self.open_it()
+        [target] = [t for verb, t in self.harness.targets if verb == "proposal-create"]
+        self.assertEqual(target, {"finding_id": self.group[0]["id"], "cluster": "prod-us-east",
+                                  "namespace": "payments", "object": "Deployment/web"})
+
+    def test_create_names_no_target_for_another_check(self):
+        self.harness.replies = {"proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8")}
+        self.group = [dict(f, check="no-hpa") for f in self.group]
+        self.open_it()
+        self.assertIn(("proposal-create", None), self.harness.targets)
+
+    def test_remediation_target_only_for_one_no_pdb_finding(self):
+        one = {"id": "no-pdb.c.ns.Deployment/x", "check": "no-pdb", "cluster": "c", "namespace": "ns", "object": "Deployment/x"}
+        self.assertEqual(audit_report.remediation_target([one])["finding_id"], "no-pdb.c.ns.Deployment/x")
+        self.assertIsNone(audit_report.remediation_target([one, dict(one, id="no-pdb.c.ns.Deployment/y")]))
+        self.assertIsNone(audit_report.remediation_target([dict(one, check="no-hpa")]))
+        self.assertIsNone(audit_report.remediation_target([]))
+
     def test_create_carries_all_four_labels(self):
         self.harness.replies = {"proposal-create": created("proposal", "https://github.com/acme/fleet/pull/8")}
         self.open_it()
@@ -23354,9 +23398,18 @@ class TestUnwrittenSweepFixes(HarnessTestCase):
                 self.assertFalse(self.harness.forge_calls("proposal-create"))
                 body = "".join(self.harness.bodies_for("issue-*"))
                 self.assertIn("## Awaiting `/remediate`", body)
-                # The worker is told the direct ask still opens these: a task that asked
-                # for the fixes runs `remediate` rather than stopping at the ledger.
-                self.assertIn("when this task asks you to open fixes, run `remediate --finding", self.err)
+                # The worker is told a direct ask still opens these: a request that itself
+                # asks for the fixes, by id or as a set, runs `remediate`.
+                self.assertIn("only when the request itself asks for fixes to be opened", self.err)
+                self.assertIn("for each fix it asks for, by id or as a set", self.err)
+                self.assertIn("run `remediate --finding", self.err)
+                # ...and that an audit-only ask is not one. Worded loosely, a worker read
+                # its card's "remediation PRs required by the SOP" as the ask and opened an
+                # unrequested pull request (nightly 2026-11-11, obtainability-planted-pdb;
+                # #5093's smoke, compliance-rbac-overgrant).
+                self.assertIn("A request only to run an audit or follow its SOP is not that ask", self.err)
+                self.assertIn("a line that attributes remediation pull requests to the SOP", self.err)
+                self.assertIn("stop at the ledger and name the findings it lists as awaiting a fix", self.err)
                 self.assertIn(f"`{audit_report.AUTO_PROMOTE_ENV}={audit_report.AUTO_PROMOTE_OFF}`", body)
                 self.assertIn(derived_id(), body[body.index("## Awaiting `/remediate`"):])
 

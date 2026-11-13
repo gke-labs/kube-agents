@@ -96,7 +96,7 @@ type unreachableVerifier struct {
 	calls int
 }
 
-func (v *unreachableVerifier) CheckProfileRun(context.Context, capability.Ref, string, capability.Tier, capability.Scope) error {
+func (v *unreachableVerifier) CheckProfileRun(context.Context, capability.Ref, string, capability.Tier, capability.Scope, *capability.Trigger) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	v.calls++

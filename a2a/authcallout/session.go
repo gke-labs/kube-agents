@@ -38,6 +38,13 @@ const (
 	// profile_narrowing.go.
 	NarrowingProfile = "profile"
 
+	// NarrowingDispatcher marks the A2A profile dispatcher's entry (#5381).
+	// The entry's own grants are its control connection's, the fixed set
+	// that names no profile. Each per-profile grant is derived at mint time,
+	// on a bucket connection, from the map's profile entries. See
+	// dispatcher_narrowing.go.
+	NarrowingDispatcher = "dispatcher"
+
 	// The Extra keys the API server writes onto a TokenReview of a
 	// pod-bound token. Written by the authenticator from the token's own
 	// bound-object claim, never by the client.

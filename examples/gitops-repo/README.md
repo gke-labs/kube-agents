@@ -15,6 +15,7 @@ gitops-repo/
 ├── knowledge/                     # OKF base (§5) — never applied to a cluster
 ├── policy/                        # admission policies (ValidatingAdmissionPolicy; Gatekeeper/Kyverno)
 ├── .kube-agents/intent.yaml       # where the declaring audits look for declared-intent notes
+├── .kube-agents/automation.yaml   # which fixes may merge without a human (reference/automation-rules)
 └── .github/workflows/             # the actuation pipeline config (customer's CI/CD)
 ```
 

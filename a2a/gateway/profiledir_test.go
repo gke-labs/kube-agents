@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -53,7 +52,7 @@ func TestProfileDirectory_ReadsWhatDirectoryHoldsThenFollowsChanges(t *testing.T
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
-	nc, err := nats.Connect(url)
+	nc, err := connectTest(url)
 	if err != nil {
 		t.Fatal(err)
 	}
