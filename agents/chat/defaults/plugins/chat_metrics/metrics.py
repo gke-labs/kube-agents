@@ -409,7 +409,7 @@ class ChatMetrics:
         self._dispatch_stuck: dict[str, list[float]] = {}
         # boards in the corrupt-board quarantine that still have a streak or a
         # stuck state: their ready-probe and auto-decompose tries do not count
-        self._dispatch_quarantined: set[str] = set()
+        self._dispatch_in_quarantine: set[str] = set()
 
     def prime(self) -> None:
         """Take the board's baseline now rather than at the first scrape."""
@@ -438,7 +438,7 @@ class ChatMetrics:
         ``locked`` says the failure was a database lock or busy error."""
         with self._lock:
             # A tick with a result, good or failed, ends a quarantine.
-            self._dispatch_quarantined.discard(board)
+            self._dispatch_in_quarantine.discard(board)
             if not error_class:
                 self._dispatch_failures.pop(board, None)
                 self._dispatch_tried.pop(board, None)
@@ -485,8 +485,8 @@ class ChatMetrics:
                     del self._dispatch_failures[board]
                     self._dispatch_tried.pop(board, None)
             if board not in self._dispatch_failures and board not in self._dispatch_stuck:
-                self._dispatch_quarantined.discard(board)
-            if board in self._dispatch_quarantined and not tick:
+                self._dispatch_in_quarantine.discard(board)
+            if board in self._dispatch_in_quarantine and not tick:
                 # A quarantined board's ready probe or auto-decompose: not a
                 # try, so it does not keep the streak or the stuck state.
                 return
@@ -514,9 +514,9 @@ class ChatMetrics:
                 if stuck is not None and stuck[0] == tick_started:
                     del self._dispatch_stuck[board]
                 if board in self._dispatch_failures or board in self._dispatch_stuck:
-                    self._dispatch_quarantined.add(board)
+                    self._dispatch_in_quarantine.add(board)
                 return
-            if board in self._dispatch_quarantined:
+            if board in self._dispatch_in_quarantine:
                 return
             if board in self._dispatch_failures:
                 self._dispatch_tried[board] = self._clock()
@@ -549,7 +549,7 @@ class ChatMetrics:
                           if b not in self._dispatch_ticking and now - tried > DISPATCH_FAILURE_STALE_SECONDS]:
                 del self._dispatch_stuck[board]
             dispatch_stuck = sorted((b, since) for b, (since, _) in self._dispatch_stuck.items())
-            self._dispatch_quarantined.intersection_update(set(self._dispatch_failures) | set(self._dispatch_stuck))
+            self._dispatch_in_quarantine.intersection_update(set(self._dispatch_failures) | set(self._dispatch_stuck))
         lines = [
             f"# HELP {CHAT_INBOUND_METRIC} Chat messages that reached the gateway's dispatch hook, by platform.",
             f"# TYPE {CHAT_INBOUND_METRIC} counter",
