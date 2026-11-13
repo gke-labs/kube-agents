@@ -189,6 +189,14 @@ class CompressedSessionTest(unittest.TestCase):
         self.assertEqual(got, ("api_server", "a2a-ctx-1", None))
         self.assertTrue(any("no notifier serves" in line for line in logs.output), logs.output)
 
+    def test_an_empty_served_list_logs_as_the_unset_label(self):
+        with mock.patch.dict("os.environ", {"A2A_NOTIFY_CONVERSATIONS": ""}), \
+                self.assertLogs(ker.log, level="WARNING") as logs:
+            got = resolve_chat_route("api_server", "a2a-ctx-1", None, db_path=self.db)
+        self.assertEqual(got, ("api_server", "a2a-ctx-1", None))
+        expected = f"A2A_NOTIFY_CONVERSATIONS={ker.UNSET_LABEL}"
+        self.assertTrue(any(expected in line for line in logs.output), logs.output)
+
     def test_a_route_on_any_platform_the_list_names_is_delivered(self):
         with mock.patch.dict("os.environ", {"A2A_NOTIFY_CONVERSATIONS": "google_chat,slack"}):
             self.assertEqual(

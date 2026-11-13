@@ -1694,8 +1694,8 @@ name, or is unset with Slack not enabled (`a2aGchatHomeRouted`); the Slack rende
 conversation (below), and onboarding's first report into the conversation the user first wrote in,
 are armed by their own variable, `A2A_NOTIFY_CONVERSATIONS`, a comma-separated list of the
 platforms the gateway serves (read by `chat_notify.gateway_platforms()` on the agent side and by the kanban patches' own copies), which the operator renders, one name
-today, whenever the gateway arms the route: `homeChannel` unset (the route then
-serves conversation requests only) or a space name. The Hermes kanban notifier, which posts a card's events into the thread the card
+today, on Chat, whenever the gateway arms the route: `homeChannel` unset (the route then
+serves conversation requests only) or a space name; the Slack render is below. The Hermes kanban notifier, which posts a card's events into the thread the card
 subscribes to and wakes its creator when a card blocks or fails, reaches the same route
 through a send-only stand-in adapter that exists only inside the notifier
 (`deploy/docker/patches/kanban_chat_notify.py`); nothing else in the Hermes gateway treats
