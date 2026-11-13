@@ -12,40 +12,44 @@
 # stores, and the safeguard holds the turn to that, so the grade comes from what
 # the stack set up and the verifier read.
 #
-# bench/tf/prebuilt/oobe-first-run-audits waits for the install's own first-run
-# stage to finish, then files an archived stand-in sweep
+# On an eval lease the install is fresh, and its own first-run chain is what this
+# case grades: bench/tf/prebuilt/oobe-first-run-audits waits, up to its own_wait,
+# for the install's own first-run stage to finish and arms nothing (own_stage.py
+# `fresh`: the stage's record written within the last day). The install runs its
+# chain once, so every repetition reads that one chain and the three verdicts
+# agree; the evidence store counts each chain three times. On a long-lived install
+# whose first run was long ago, the stack instead files an archived stand-in sweep
 # card and an archived ranking card after it, points `.bootstrap_scan_filed` at
 # the sweep and `.bootstrap_handoff_filed` at the ranking card, removes
 # `.oobe_audits_fired`, resumes the five audits if an eval run paused them once the
-# install's own chain had run them (hack/ci_pause_scheduled_audits.py; the stage skips
+# install's own stage was past them (hack/ci_pause_scheduled_audits.py; the stage skips
 # a paused audit), and puts back the `oobe` job if the
 # deployed image ships one (an install that onboarded before the job existed never
 # got it), then waits up to an hour for the stage to finish its chain. The verifier
 # reads the stage's .oobe_audits_fired and the Platform Agent's cron/executions.db,
 # and passes once the stage marked all five audits due, each has a run since its mark
 # that got going (running, completed, or ended after its start), and each started only after the one before it
-# ended. On an image without the job nothing starts them, which is this case's red.
+# ended. On an image without the job nothing starts them, which is this case's red;
+# so is a fresh install whose stage skipped them, which the red names.
 #
-# Isolation class: writes to the install under test. It replaces
+# Isolation class: reads the install under test on an eval lease. On a long-lived
+# install it writes to it: it replaces
 # `.bootstrap_scan_filed`, `.bootstrap_handoff_filed` and `.oobe_audits_fired` for
 # the run and restores them,
-# files two archived cards, and adds and removes the `oobe` job. The five audits
+# files two archived cards, and adds and removes the `oobe` job, and the five audits
 # it starts are real runs: each writes its ledger issue in the install's GitOps
 # repository (with none, its report in the report store) and, when it changed
-# something, posts its summary wherever the install sends audit reports. The
-# runner holds their streams' locks for the unit (`audit_streams` below; the stage
-# also starts the upgrade retrospective after the four, so its stream is listed), and
-# every unit on one of those streams first waits up to two hours for a run the
-# install started there, so no audit case runs beside them and the next repetition
-# arms only once they have ended. The runner does not hold the infra lock for it
+# something, posts its summary wherever the install sends audit reports. It declares
+# no audit streams: on a lease it starts no audit, and the runner's wait for runs the
+# install started (wait_platform_runs) keeps an audit case off a stream while the
+# install's chain is on it; run the stand-in on a long-lived install alone. The
+# runner does not hold the infra lock for it
 # (hack/ci-eval-pr.sh, infra_lock_exempt): the stack touches no task cluster and
 # reaches the install through a kubeconfig of its own. The onboarding state lock
 # (unit_state_lock) keeps it apart from bootstrap-discovery-fanout and
-# bootstrap-inventory-ranking-delivery, whose stacks rewrite the same markers and
-# the `oobe` job.
-# Eligible tier: nightly -- each repetition runs the five audits one after another,
-# after the previous repetition's have finished (the runner waits for them; run by
-# hand, the stage itself holds its first mark until they end).
+# bootstrap-inventory-ranking-delivery, whose stacks rewrite the onboarding markers.
+# Eligible tier: nightly -- the first repetition waits out the install's own first
+# run, up to about two hours after the fan-out.
 ---
 id: oobe-first-run-audits
 name: The first-run audits start as soon as the onboarding scan settles
@@ -70,20 +74,6 @@ domain: fleet-audits
 # The turn below makes no tool call on purpose, so bench-gate's liveness rung
 # takes its reply as the sign of a real run instead of a tool call.
 tool_calls_optional: true
-
-# The streams whose audits the stack starts. The runner holds their locks for the
-# whole unit (hack/ci-eval-pr.sh: task_streams), so no audit case on one of them
-# runs beside these real runs and grades the other's ledger.
-# The retrospective is the fifth audit the stage marks, after the four, and the
-# verifier grades its start like the others'.
-audit_streams:
-  [
-    fleet-wide-cost-analysis,
-    compliance-audit,
-    obtainability-audit,
-    stockout-prevention,
-    upgrade-retrospective,
-  ]
 
 # A turn that needs no tools. The session this reaches is the Planning Agent's,
 # which could ask the Platform Agent to start an audit; a run that started would be
