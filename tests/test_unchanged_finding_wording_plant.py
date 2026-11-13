@@ -81,10 +81,11 @@ class PlantTest(unittest.TestCase):
         resolve.start()
         self.addCleanup(resolve.stop)
 
-    def run_plant(self, manifest):
+    def run_plant(self, manifest, remediation=None):
         collected = subprocess.CompletedProcess([], 0, stdout=json.dumps(manifest), stderr="")
+        extra = () if remediation is None else (remediation,)
         with mock.patch.object(self.plant.subprocess, "run", return_value=collected):
-            return self.plant.plant(self.audit_report, _MARK, str(_SCRIPTS))
+            return self.plant.plant(self.audit_report, _MARK, str(_SCRIPTS), *extra)
 
     def store(self):
         return self.audit_report.reports_dir_for(self.plant.AUDIT, _REPO)
@@ -114,6 +115,44 @@ class PlantTest(unittest.TestCase):
         self.assertEqual(carried, [finding["id"]])
         self.assertEqual(finding["title"], f"{_MARK} authorized-networks Cluster/seeded-c")
         self.assertTrue(finding["remediation"]["note"].startswith(_MARK))
+
+    def worker_gcloud_finding(self):
+        finding = self.worker_finding()
+        finding["remediation"] = {"kind": "gcloud", "note": "gcloud container clusters update seeded-c --enable-master-authorized-networks --master-authorized-networks=<ranges>"}
+        return finding
+
+    def test_a_stale_gcloud_plant_is_never_carried(self):
+        """The evidence differs, so this run's own words stand, whatever its kind."""
+        self.assertEqual(self.run_plant(_MANIFEST, self.plant.REMEDIATION_STALE), 0)
+        document = self.audit_report.previous_run_document(self.plant.AUDIT, _REPO)
+        [planted] = document["findings"]
+        self.assertEqual(planted["remediation"]["kind"], "gcloud")
+        self.assertIn("--master-authorized-networks=203.0.113.0/24", planted["remediation"]["note"])
+        self.assertIn(_MARK, planted["remediation"]["note"])
+        for finding in (self.worker_finding(), self.worker_gcloud_finding()):
+            before = json.dumps(finding, sort_keys=True)
+            self.assertEqual(self.audit_report.carry_unchanged_findings([finding], document), [])
+            self.assertEqual(json.dumps(finding, sort_keys=True), before)
+
+    def test_a_same_evidence_gcloud_plant_is_carried_over_this_runs_command(self):
+        """The negative control: `finish` keeps the planted command, range and all."""
+        self.assertEqual(self.run_plant(_MANIFEST, self.plant.REMEDIATION_SAME), 0)
+        document = self.audit_report.previous_run_document(self.plant.AUDIT, _REPO)
+        for finding in (self.worker_finding(), self.worker_gcloud_finding()):
+            self.assertEqual(self.audit_report.carry_unchanged_findings([finding], document), [finding["id"]])
+            self.assertEqual(finding["remediation"]["kind"], "gcloud")
+            self.assertIn("203.0.113.0/24", finding["remediation"]["note"])
+            self.assertIn(_MARK, finding["remediation"]["note"])
+
+    def test_the_collector_gets_the_stacks_arguments(self):
+        collected = subprocess.CompletedProcess([], 0, stdout=json.dumps(_MANIFEST), stderr="")
+        with mock.patch.dict(os.environ, {self.plant.COLLECTOR_ARGS_ENV: "--scope-projects acme"}), \
+                mock.patch.object(self.plant.subprocess, "run", return_value=collected) as run:
+            self.assertEqual(self.plant.plant(self.audit_report, _MARK, str(_SCRIPTS)), 0)
+        self.assertEqual(run.call_args.args[0][-2:], ["--scope-projects", "acme"])
+
+    def test_an_unknown_remediation_is_refused(self):
+        self.assertEqual(self.plant.main(["-", "plant", str(_SCRIPTS), _MARK, "gcloud-other"]), 2)
 
     def test_the_planted_envelope_names_no_issue(self):
         self.run_plant(_MANIFEST)

@@ -52,6 +52,7 @@ resource "null_resource" "previous_run" {
     host_project     = var.project_id
     namespace        = var.agent_namespace
     mark             = var.mark
+    remediation      = var.planted_remediation
     pod_selector     = local.pod_selector
     store_containers = local.store_containers
     scripts_dir      = local.scripts_dir
@@ -69,7 +70,7 @@ resource "null_resource" "previous_run" {
       plant_store() {
         printf '%s' '${local.script_b64}' | base64 -d | \
           kubectl exec -i -n "${var.agent_namespace}" "$pod" -c "$container" -- \
-            env PYTHONDONTWRITEBYTECODE=1 python3 - "$1" "${local.scripts_dir}" "${var.mark}"
+            env PYTHONDONTWRITEBYTECODE=1 PLANT_COLLECTOR_ARGS="${var.collector_args}" python3 - "$1" "${local.scripts_dir}" "${var.mark}" "${var.planted_remediation}"
       }
       on_exit() {
         status=$?

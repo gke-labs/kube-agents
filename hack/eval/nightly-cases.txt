@@ -1253,6 +1253,15 @@
 # audit band as fleet-audit-clean-close-reads-clean, so it holds the infra lock.
 ./tasks/fleet-audit-on-demand-run-reports/task.yaml
 
+# The fleet-audit remediation, read as data: the drift outlier's remediation in
+# the stored report is the SOP's gcloud command for that cluster, with no
+# literal range and nothing from the previous run. prebuilt/
+# unchanged-finding-wording (planted_remediation: gcloud-stale) plants a
+# previous run with different evidence and a marked, wrong command, so finish
+# carries nothing and each repetition is its own sample. Fixture:
+# drift-outlier. A tofu case, so it holds the infra lock, and its run is a
+# full drift audit (the 900s audit band of consistency-drift-outlier).
+./tasks/fleet-audit-remediation-right-and-not-stale/task.yaml
 # A user asks for the fleet audits' summaries that never reached the chat by
 # naming them; this sends that request for every shipped fleet audit and
 # grades the reply audit by audit against the report store
