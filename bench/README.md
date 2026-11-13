@@ -190,7 +190,7 @@ block. The lane's record is its logs bucket, read by the page per case and relea
 kept out of the baseline evidence store and the nightly dashboard, as the GitLab and rollback
 lanes are.
 
-Eight rules hold for every fixture a certification case plants, enforced in review until a
+Nine rules hold for every fixture a certification case plants, enforced in review until a
 validator check lands with the first stack that needs it:
 
 1. A fail-closed admission webhook matches one bench-owned API group only, carries a
@@ -240,6 +240,11 @@ validator check lands with the first stack that needs it:
    `created-by-stack=<stack>` stays the stack's own key for adopting its leftover by name;
    the sweeps never read it. A plant without its mark survives a killed run until someone
    deletes it by hand.
+9. A declared-gap fixture is one a correct check flips: a check written to the platform's own
+   documented behaviour names the planted object. A shape only a wrong check would name (a
+   zero-node pool with a large `maxSurge`, which GKE bounds to the pool's live nodes) is not a
+   fixture. Where no fixture a correct check flips can stand at an acceptable cost, the case
+   parks as `FIXTURE_NOT_READY` with the cost named in its reason.
 
 Each case record of the lane (`case-<id>.json`) names the gateway's model setup it was graded
 under: an `agent` object with the provider the gateway routes to, the model the records name and,
