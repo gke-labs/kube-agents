@@ -203,7 +203,6 @@ jobs:
         if: steps.verify-eligibility.outputs.skip_release != 'true'
         env:
           RELEASE_VERSION: ${{ steps.calculate-version.outputs.release_version }}
-          GH_TOKEN: ${{ steps.release-token.outputs.token }}
         run: ./scripts/release/tag_go_modules.sh
 
       # The builder image and config from mirror.gcr.io, as in docker-build.yml:
