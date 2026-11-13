@@ -86,16 +86,23 @@ const (
 // connection's settings, not credentials: a user or database name, a host,
 // a port. An exact match on one would redact an ordinary word everywhere
 // in the answer, so they are not tracked, like a service account token
-// Secret's namespace. Matched on the whole key, in any case.
+// Secret's namespace. Matched on the key's last component (split on _, -
+// and ., in any case), so DB_HOST, POSTGRES_USER and db.name are settings
+// too, while DB_PASSWORD stays tracked.
 var seenSecretSkippedKeys = map[string]bool{
-	"username": true, "user": true, "host": true, "port": true, "database": true,
+	"username": true, "user": true, "host": true, "hostname": true, "port": true,
+	"database": true, "db": true, "dbname": true, "name": true,
 }
 
 // seenSecretKeySkipped says whether a Secret's value under key is not
 // tracked.
 func seenSecretKeySkipped(key string, saToken bool) bool {
 	k := strings.ToLower(strings.TrimSpace(key))
-	return seenSecretSkippedKeys[k] || (saToken && k == "namespace")
+	last := k
+	if i := strings.LastIndexAny(k, "_-."); i >= 0 {
+		last = k[i+1:]
+	}
+	return seenSecretSkippedKeys[k] || seenSecretSkippedKeys[last] || (saToken && k == "namespace")
 }
 
 // seenSecrets is one task's set of secret values seen in its tool results,

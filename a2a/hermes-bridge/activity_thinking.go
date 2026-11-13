@@ -77,11 +77,13 @@ var (
 	// Prose that states a secret: "the password is hunter2", "password for
 	// admin is hunter2", "the password in secret app-db is hunter2", "the
 	// password key decodes to hunter2", "the token was abc", "the password
-	// is now hunter2", "the secret is set to abc". The verb may be followed
-	// by a qualifier (now, currently, still, just, simply, set to, equal
-	// to) or a colon, none of which is the value. proseValueRedacted keeps
+	// is now hunter2", "the secret is set to abc", "the password is:
+	// hunter2", "the password for user admin is hunter2". The verb, and each
+	// qualifier after it (now, currently, still, just, simply, set to, equal
+	// to), may be followed by a colon or by whitespace, none of which is the
+	// value. proseValueRedacted keeps
 	// a state word: "the token is expired" states no secret.
-	proseSecretPattern          = regexp.MustCompile(`(?i)\b((?:the\s+)?(?:[A-Za-z0-9_.-]+\s+)?(?:password|passwd|passphrase|secret|token|api[ _-]?key|credential)\s+(?:(?:key|value|field|entry)\s+)?(?:(?:for|in|of|from)\s+(?:(?:the|secret|kubernetes)\s+){0,2}[^\s,.;:!?)'"\]]+\s+)?(?:is|was|=|will\s+be|should\s+be|has\s+been\s+set\s+to|decodes\s+(?:to|as)|decoded\s+(?:to|as)|is\s+decoded\s+as)\s+(?:(?:now|currently|still|just|simply|also|again)\s+)*(?:(?:set|equal|changed|updated|reset)\s+to\s+)?(?::\s*)?)("[^"\r\n]*"|'[^'\r\n]*'|[^\s,.;:!?)'"\]]+)`)
+	proseSecretPattern          = regexp.MustCompile(`(?i)\b((?:the\s+)?(?:[A-Za-z0-9_.-]+\s+)?(?:password|passwd|passphrase|secret|token|api[ _-]?key|credential)\s+(?:(?:key|value|field|entry)\s+)?(?:(?:for|in|of|from)\s+(?:(?:the|secret|kubernetes)\s+){0,2}[^\s,.;:!?)'"\]]+(?:\s+[^\s,.;:!?)'"\]]+)?\s+)?(?:is|was|=|will\s+be|should\s+be|has\s+been\s+set\s+to|decodes\s+(?:to|as)|decoded\s+(?:to|as)|is\s+decoded\s+as)(?:\s*:\s*|\s+)(?:(?:now|currently|still|just|simply|also|again)(?:\s*:\s*|\s+))*(?:(?:set|equal|changed|updated|reset)\s+to(?:\s*:\s*|\s+))?)("[^"\r\n]*"|'[^'\r\n]*'|[^\s,.;:!?)'"\]]+)`)
 	inlineKVSecretPattern       = regexp.MustCompile(`((?:\\?["'])?)([A-Za-z0-9_.-]+)((?:\\?["'])?)([ \t]*([=:])[ \t]*)`)
 	inlineExtraSecretKeyPattern = regexp.MustCompile(`(?i)(?:^|[_.-])(?:pass|pwd|auth|apikey|access[_-]?key|secret[_-]?key|privatekey|id_rsa|id_ed25519|id_ecdsa|dockercfg|dockerconfigjson|client[_-]?certificate[_-]?data)(?:$|[_.-])|\.(?:key|pem|crt|p12|pfx|dockercfg|dockerconfigjson)$`)
 	// An all-caps env-style key whose last component says it holds a key,
@@ -1084,6 +1086,9 @@ var credentialStateWords = map[string]bool{
 	"true": true, "false": true, "null": true, "nil": true, "none": true, "yes": true, "no": true,
 	"on": true, "off": true, "enabled": true, "disabled": true, "set": true, "unset": true,
 	"empty": true, "blank": true, "required": true, "optional": true, "n/a": true,
+	// A progressive auxiliary, never a value: "the password is currently
+	// being reset".
+	"being":   true,
 	"mounted": true, "rotated": true, "expired": true, "revoked": true, "valid": true, "invalid": true,
 	"stored": true, "missing": true, "present": true, "absent": true, "configured": true,
 	"unconfigured": true, "unchanged": true, "changed": true, "correct": true, "incorrect": true,
@@ -1407,6 +1412,14 @@ func redactSubmatchTo(re *regexp.Regexp, s string, group int, keep func(s string
 // where the key in keyGroup names a credential outright
 // (keyClearlyNamesSecret); keyGroup -1 hands every value.
 func redactNamedSubmatch(re *regexp.Regexp, s string, group, keyGroup int, keep func(s string, m []int) bool, sink secretSink) string {
+	return redactNamedSubmatchSpan(re, s, group, keyGroup, keep, sink, false)
+}
+
+// redactNamedSubmatchSpan is redactNamedSubmatch that, with codeSpan, gives
+// a code span's closing backtick back to the text (closingBacktickOutside).
+// Only the command-line flag rules pass it: their value runs to whitespace,
+// so it alone takes a span's closing backtick.
+func redactNamedSubmatchSpan(re *regexp.Regexp, s string, group, keyGroup int, keep func(s string, m []int) bool, sink secretSink, codeSpan bool) string {
 	ms := re.FindAllStringSubmatchIndex(s, -1)
 	if ms == nil {
 		return s
@@ -1417,6 +1430,9 @@ func redactNamedSubmatch(re *regexp.Regexp, s string, group, keyGroup int, keep 
 		lo, hi := m[2*group], m[2*group+1]
 		if lo < last || hi <= lo || s[lo:hi] == redactedValue || (keep != nil && !keep(s, m)) {
 			continue
+		}
+		if codeSpan {
+			hi = closingBacktickOutside(s, lo, hi)
 		}
 		sb.WriteString(s[last:lo])
 		sb.WriteString(redactedValue)
@@ -1432,6 +1448,55 @@ func redactNamedSubmatch(re *regexp.Regexp, s string, group, keyGroup int, keep 
 	return sb.String()
 }
 
+// closingPunctuation is what may follow a code span's closing backtick and
+// still be handed back to the text with it (closingBacktickOutside).
+const closingPunctuation = ").,;:!?]}"
+
+// closingBacktickOutside gives the text back from the backtick that closes
+// a markdown code span the value sits in: an unquoted value inside an open
+// span (an odd count of backticks earlier on its line) ends at its last
+// backtick, and that backtick and whatever the value rule took after it
+// (closingPunctuation only) stay in the text. Everything before it is still
+// redacted, a backtick inside the value included. Outside a code span, or
+// for a quoted value, the span is unchanged.
+func closingBacktickOutside(s string, lo, hi int) int {
+	if hi-lo < 2 || s[lo] == '"' || s[lo] == '\'' {
+		return hi
+	}
+	k := strings.LastIndexByte(s[lo:hi], '`')
+	if k < 1 || strings.Trim(s[lo+k+1:hi], closingPunctuation) != "" {
+		// No backtick, or one with more of the value after it than
+		// closing punctuation: the value's own, redacted whole.
+		return hi
+	}
+	// The closing delimiter is the whole run of backticks the value ends
+	// in (a span may open with two, "``--password=x``"), and a span is open
+	// before the value when an odd number of backtick runs precede it on
+	// the line.
+	for k > 0 && s[lo+k-1] == '`' {
+		k--
+	}
+	if k < 1 {
+		return hi
+	}
+	line := strings.LastIndexByte(s[:lo], '\n') + 1
+	if backtickRuns(s[line:lo])%2 == 1 {
+		return lo + k
+	}
+	return hi
+}
+
+// backtickRuns counts the maximal runs of backticks in s.
+func backtickRuns(s string) int {
+	runs := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == '`' && (i == 0 || s[i-1] != '`') {
+			runs++
+		}
+	}
+	return runs
+}
+
 // authSchemeCredentialRedacted says whether a credential after a scheme
 // word is redacted here: not where an Authorization key leads it on its
 // line (the key=value rule takes the whole value there, a Digest's
@@ -1443,8 +1508,15 @@ func redactNamedSubmatch(re *regexp.Regexp, s string, group, keyGroup int, keep 
 // other scheme words, which are ordinary English too (a token, a digest),
 // only a token-shaped one.
 func authSchemeCredentialRedacted(s string, m []int) bool {
-	lineStart := strings.LastIndexByte(s[:m[0]], '\n') + 1
-	if authHeaderKVLeadPattern.MatchString(s[lineStart:m[0]]) {
+	// The lead pattern ends at the match and is short ("authorization", an
+	// optional quote, a separator, spaces), so only a bounded tail of the
+	// line is read: reading back to the line's start for every match made a
+	// long single line (minified JSON) cost the square of its length.
+	tail := s[max(0, m[0]-authHeaderLeadWindow):m[0]]
+	if i := strings.LastIndexByte(tail, '\n'); i >= 0 {
+		tail = tail[i+1:]
+	}
+	if authHeaderKVLeadPattern.MatchString(tail) {
 		return false
 	}
 	cred := trimValueEdges(s[m[4]:m[5]])
@@ -1454,6 +1526,11 @@ func authSchemeCredentialRedacted(s string, m []int) bool {
 	}
 	return valueTokenShaped(cred)
 }
+
+// authHeaderLeadWindow bounds how far before a scheme word the
+// authorization key is looked for: far more than the key, its quotes and
+// separator take.
+const authHeaderLeadWindow = 256
 
 // authSchemeProseWords are the dictionary words of eight letters or more
 // that prose puts after Bearer or Basic as an adjective. A shorter word is
@@ -1518,26 +1595,26 @@ func scrubCLISecretFlags(s string, sink secretSink) string {
 	notAFlag := func(group int) func(s string, m []int) bool {
 		return func(s string, m []int) bool { return !strings.HasPrefix(s[m[2*group]:m[2*group+1]], "-") }
 	}
-	s = redactSubmatchTo(cliUserPassPattern, s, 4, nil, sink)
-	s = redactSubmatchTo(cliSpacedPassPattern, s, 2, notAFlag(2), sink)
-	s = redactSubmatchTo(cliAttachedPassPattern, s, 2, nil, sink)
-	s = redactSubmatchTo(cliLDAPPassPattern, s, 2, notAFlag(2), sink)
-	s = redactSubmatchTo(cliPassphraseArgPattern, s, 2, nil, sink)
+	s = redactNamedSubmatchSpan(cliUserPassPattern, s, 4, -1, nil, sink, true)
+	s = redactNamedSubmatchSpan(cliSpacedPassPattern, s, 2, -1, notAFlag(2), sink, true)
+	s = redactNamedSubmatchSpan(cliAttachedPassPattern, s, 2, -1, nil, sink, true)
+	s = redactNamedSubmatchSpan(cliLDAPPassPattern, s, 2, -1, notAFlag(2), sink, true)
+	s = redactNamedSubmatchSpan(cliPassphraseArgPattern, s, 2, -1, nil, sink, true)
 	// A flag whose name is a credential key (flagValueRedacted).
 	flagValue := func(s string, m []int) bool {
 		return flagValueRedacted(s[m[4]:m[5]], s[m[6]:m[7]], s[m[8]:m[9]])
 	}
 	// A flag's value is handed to sink only under a name that names a
 	// credential outright.
-	s = redactNamedSubmatch(cliLongSecretFlagPattern, s, 4, 2, flagValue, sink)
-	s = redactNamedSubmatch(cliLongSecretFlagDashedPattern, s, 4, 2, flagValue, sink)
-	s = redactNamedSubmatch(cliSingleDashSecretFlagPattern, s, 4, 2, flagValue, sink)
-	s = redactNamedSubmatch(cliSingleDashSecretFlagDashedPattern, s, 4, 2, flagValue, sink)
+	s = redactNamedSubmatchSpan(cliLongSecretFlagPattern, s, 4, 2, flagValue, sink, true)
+	s = redactNamedSubmatchSpan(cliLongSecretFlagDashedPattern, s, 4, 2, flagValue, sink, true)
+	s = redactNamedSubmatchSpan(cliSingleDashSecretFlagPattern, s, 4, 2, flagValue, sink, true)
+	s = redactNamedSubmatchSpan(cliSingleDashSecretFlagDashedPattern, s, 4, 2, flagValue, sink, true)
 	argListValue := func(s string, m []int) bool {
 		return flagValueRedacted(s[m[2]:m[3]], " ", s[m[4]:m[5]])
 	}
-	s = redactNamedSubmatch(cliArgListJSONPattern, s, 2, 1, argListValue, sink)
-	return redactNamedSubmatch(cliArgListYAMLPattern, s, 2, 1, argListValue, sink)
+	s = redactNamedSubmatchSpan(cliArgListJSONPattern, s, 2, 1, argListValue, sink, true)
+	return redactNamedSubmatchSpan(cliArgListYAMLPattern, s, 2, 1, argListValue, sink, true)
 }
 
 // flagValueRedacted says whether a flag's value is redacted: the flag's
@@ -1859,6 +1936,19 @@ func scrubMarkdownTables(s string, sink secretSink) string {
 					cols[c] = class
 				}
 			}
+			if h := block[0].cells; kubectlSecretListingHeader(s, h) && kubectlSecretListingRows(s, func() (cells [][][2]int) {
+				for _, r := range block[2:] {
+					cells = append(cells, r.cells)
+				}
+				return cells
+			}()) {
+				// `kubectl get secrets` as a table lists Secrets, never their
+				// values: its DATA is a key count. Only when every row reads
+				// as kubectl's own, so the header alone can't carry a value
+				// past the scrub.
+				block = block[:0]
+				return
+			}
 			if h := block[0].cells; len(h) >= 2 {
 				hasValue := false
 				for c := 1; c < len(h); c++ {
@@ -2026,6 +2116,42 @@ func tableHeaderWords(s string, cell [2]int) []string {
 	}
 	return words
 }
+
+// kubectlSecretListingHeader says whether a table's header is kubectl's
+// listing of Secrets, NAME | TYPE | DATA | AGE, in any case and markdown.
+func kubectlSecretListingHeader(s string, h [][2]int) bool {
+	want := []string{"name", "type", "data", "age"}
+	if len(h) != len(want) {
+		return false
+	}
+	for i, cell := range h {
+		if words := tableHeaderWords(s, cell); len(words) != 1 || words[0] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// kubectlSecretListingRows says whether every row reads as kubectl's
+// listing of Secrets: a name, a Secret type (one token, no spaces), a whole
+// number of keys, and an age (5d, 3h12m, <unknown>).
+func kubectlSecretListingRows(s string, rows [][][2]int) bool {
+	for _, r := range rows {
+		if len(r) != 4 {
+			return false
+		}
+		cell := func(i int) string { n, _ := normalizeMarkdown(s[r[i][0]:r[i][1]]); return strings.TrimSpace(n) }
+		if !kubectlSecretTypePattern.MatchString(cell(1)) || !isAllDigits(cell(2)) || cell(2) == "" || !kubectlAgePattern.MatchString(cell(3)) {
+			return false
+		}
+	}
+	return true
+}
+
+var (
+	kubectlSecretTypePattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9._/-]*$`)
+	kubectlAgePattern        = regexp.MustCompile(`^(?:(?:\d+[smhdy])+|<unknown>|<invalid>)$`)
+)
 
 // tableHeaderIsValue says whether a header names a column of values
 // (tableValueHeaderWords).

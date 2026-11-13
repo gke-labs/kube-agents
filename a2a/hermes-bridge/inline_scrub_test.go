@@ -3,6 +3,7 @@ package hermesbridge
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // The shape classes scrubInlineSecrets must catch, and the ordinary ops text
@@ -150,6 +151,27 @@ func TestScrubInlineSecretsShapeClasses(t *testing.T) {
 			forbidden: []string{"quietpasture", "meadowlark"},
 			wantSub:   []string{"The password is [redacted].", "The secret was [redacted],", "the token is expired."},
 		},
+		// A colon straight after the verb or a qualifier, and a two-word
+		// subject: the reviewers' inputs on #5311 (Fuxiao-Gao 11-11,
+		// bradhoekstra 11-12), each published unredacted before.
+		{
+			name:      "prose: a colon after the verb",
+			in:        "The password is: hunter2Xq9z71. The token is: abcdEFGH1234ijkl5678. Password is: Tr0ub4dor3xyz",
+			forbidden: []string{"hunter2Xq9z71", "abcdEFGH1234ijkl5678", "Tr0ub4dor3xyz"},
+			wantSub:   []string{"The password is: [redacted].", "The token is: [redacted].", "Password is: [redacted]"},
+		},
+		{
+			name:      "prose: a colon after a qualifier, a colon before a new line, a decoded password",
+			in:        "Password is now: hunter2Xq9z71\nThe password is:\n`Tr0ub4dor3xyz`\nThe decoded password is: s3cretDecoded99",
+			forbidden: []string{"hunter2Xq9z71", "Tr0ub4dor3xyz", "s3cretDecoded99"},
+			wantSub:   []string{"Password is now: [redacted]", "The decoded password is: [redacted]"},
+		},
+		{
+			name:      "prose: a two-word subject after for",
+			in:        "The password for user admin is `hunter2Xq9z71`.",
+			forbidden: []string{"hunter2Xq9z71"},
+			wantSub:   []string{"The password for user admin is `[redacted]`."},
+		},
 		{
 			name:      "fail closed: a lower-case word under a strong key, mid-sentence",
 			in:        "Log in with password: quietpasture and then token: meadowlark today",
@@ -229,6 +251,11 @@ func TestScrubInlineSecretsShapeClasses(t *testing.T) {
 		"`UPGRADE_MASTER` (`2026-10-28T03:10:37Z`–`03:17:08Z`, `6 min`) and (2026-10-28T03:59:19Z–04:02:33Z) on default-pool",
 		`{"state":{"running":{"startedAt":"2026-11-09T06:53:15Z"}},"name":"api","ready":false,"restartCount":4}`,
 		"The upgrade ran 2026-10-28T03:56:05Z-03:59:15Z on default-pool.",
+		// Near the colon fix: a state after a colon, and a two-word subject
+		// with a state, state no secret.
+		"The token is: expired. The password is: unchanged.",
+		"The secret for the app is mounted and the token for user admin is valid.",
+		"Rotation: the password is currently being reset by the operator.",
 	}
 	for _, in := range negatives {
 		if got := scrubInlineSecrets(in); got != in {
@@ -585,6 +612,92 @@ func TestScrubInlineSecretsValuelessFlagBeforeACredentialFlag(t *testing.T) {
 		if got := scrubInlineSecrets(tc.in); got != tc.want {
 			t.Errorf("scrubInlineSecrets(%q)\n got %q\nwant %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+// A credential flag inside a markdown code span keeps the span's closing
+// backtick outside the redaction, so the answer still renders; a backtick
+// inside the value is part of the value and is redacted with it.
+func TestScrubInlineSecretsKeepsACodeSpansClosingBacktick(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"Connect with `psql --password=synthetic-pass-0001` once Ready.", "Connect with `psql --password=[redacted]` once Ready."},
+		{"`app --token synthetic-token-0001`", "`app --token [redacted]`"},
+		{"`app --password=-synthetic-pass-0001`", "`app --password=[redacted]`"},
+		{"run `mysql -ufoo -psynthetic-pass-0001` then", "run `mysql -ufoo -p[redacted]` then"},
+		{"`mysql -h db -p synthetic-pass-0001`", "`mysql -h db -p [redacted]`"},
+		{"`ldapsearch -x -w synthetic-pass-0001`", "`ldapsearch -x -w [redacted]`"},
+		// Not a closing backtick: it's inside the value.
+		{"app --password=synthetic`pass-0001 x", "app --password=[redacted] x"},
+		{"run `mysql -ufoo -psynth`etic9x` then", "run `mysql -ufoo -p[redacted]` then"},
+		// Outside a code span a trailing backtick is the value's own.
+		{"app --password=synthetic-pass-0001` x", "app --password=[redacted] x"},
+		// A quoted value followed by punctuation is still redacted.
+		{`app --password="synthetic-pass-0001".`, `app --password=[redacted].`},
+		{`app --password='synthetic-pass-0001'),`, `app --password=[redacted]),`},
+		{"`app --password=\"synthetic-pass-0001\"`.", "`app --password=[redacted]`."},
+		{"(`app --token synthetic-token-0001`), then", "(`app --token [redacted]`), then"},
+		// Inside a span, a backtick with more value after it is the
+		// value's own: redacted whole, nothing of it handed back.
+		{"`app --password=synthetic`pass-0001 more`", "`app --password=[redacted] more`"},
+		// A key=value rule stops at the backtick itself; only the flag
+		// rules, whose value runs to whitespace, hand one back.
+		{"see `password=synthetic-pass-0001`), then", "see `password=[redacted]`), then"},
+		// A double-backtick span keeps both closing backticks (#5311
+		// review, bradhoekstra).
+		{"run ``app --password=hunter2-Xq9z71`` then", "run ``app --password=[redacted]`` then"},
+		{"``--token synthetic-token-0001``.", "``--token [redacted]``."},
+	}
+	for _, tc := range cases {
+		if got := scrubInlineSecrets(tc.in); got != tc.want {
+			t.Errorf("scrubInlineSecrets(%q)\n got %q\nwant %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// One long line (minified JSON, a fetched page) full of scheme words is
+// scrubbed in linear time: the authorization lead is read from a bounded
+// tail before each match, not from the line's start (#5311 review). 256 KiB
+// took about two minutes before; it must stay far inside the hook's 10s.
+func TestALongLineOfSchemeWordsScrubsInLinearTime(t *testing.T) {
+	var b strings.Builder
+	for b.Len() < 256*1024 {
+		b.WriteString(`{"reason":"token basic digest refresh","message":"bearer token rotated"},`)
+	}
+	// CI runs go test -race, which slows this loop about 20x (0.2s becomes
+	// 4s); the quadratic version took minutes, so 10x still separates them.
+	budget := 3 * time.Second
+	if raceEnabled {
+		budget *= 10
+	}
+	start := time.Now()
+	scrubInlineSecrets(b.String())
+	if took := time.Since(start); took > budget {
+		t.Errorf("a 256 KiB line took %s to scrub", took)
+	}
+	// The lead is still honoured inside the window.
+	if got := scrubInlineSecrets(`"authorization": "Bearer abcdEFGH1234ijkl5678"`); strings.Contains(got, "abcdEFGH1234ijkl5678") {
+		t.Errorf("the authorization value leaked: %q", got)
+	}
+}
+
+// `kubectl get secrets` as a markdown table lists Secrets, never their
+// values: a name ending in a credential word keeps its TYPE (#5311 review,
+// Fuxiao-Gao). A key/value table with a value column is still redacted.
+func TestAKubectlSecretListingKeepsItsTypeColumn(t *testing.T) {
+	listing := "| NAME | TYPE | DATA | AGE |\n|---|---|---|---|\n| db-password | Opaque | 1 | 5d |\n| api-token | kubernetes.io/service-account-token | 3 | 9d |\n"
+	if got := scrubInlineSecrets(listing); got != listing {
+		t.Errorf("the listing changed:\n%s", got)
+	}
+	// The header alone doesn't carry a value past the scrub: a row that
+	// isn't kubectl's (a value where the key count goes) is scrubbed as
+	// before.
+	disguised := "| NAME | TYPE | DATA | AGE |\n|---|---|---|---|\n| db-password | Synth3tic-Pass-0042 | Synth3tic-Pass-0043 | 5d |\n"
+	if got := scrubInlineSecrets(disguised); strings.Contains(got, "Synth3tic-Pass-0043") {
+		t.Errorf("a value under a kubectl-shaped header leaked: %q", got)
+	}
+	kv := "| Key | Value |\n|---|---|\n| db-password | Synth3tic-Pass-0042 |\n"
+	if got := scrubInlineSecrets(kv); strings.Contains(got, "Synth3tic-Pass-0042") {
+		t.Errorf("a key/value table leaked: %q", got)
 	}
 }
 
