@@ -24,15 +24,17 @@ type CallerAuthenticator interface {
 type partitionKey struct{}
 
 // PartitionFromContext returns the partition Config.CallerPartition gave the request whose
-// context ctx is, or "" when the handler has no CallerPartition. An Upstream that chooses a
-// credential per caller chooses it by this value: a coalesced fetch serves every request of
-// its partition, so it carries no single caller.
-func PartitionFromContext(ctx context.Context) string {
-	partition, _ := ctx.Value(partitionKey{}).(string)
-	return partition
+// context ctx is; ok is false when the handler has no CallerPartition, so a transport that
+// chooses a credential per caller can refuse rather than fall back to a shared one. ""
+// is a partition like any other. The transport chooses by this value alone: a coalesced
+// fetch serves every request of its partition, and its context is the first request's.
+func PartitionFromContext(ctx context.Context) (partition string, ok bool) {
+	partition, ok = ctx.Value(partitionKey{}).(string)
+	return partition, ok
 }
 
-// UpstreamTransport forwards an admitted request to the cluster clusterID names. req carries
+// UpstreamTransport forwards an admitted request to the cluster clusterID names. A transport
+// that holds more than one credential picks it by PartitionFromContext(ctx) and nothing else. req carries
 // the API server path and query, with the caller's credentials already removed; the
 // transport sets the scheme, host and its own credentials. For a 101 Switching Protocols
 // response the body must be an io.ReadWriteCloser, as net/http/httputil.ReverseProxy requires

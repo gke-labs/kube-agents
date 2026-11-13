@@ -85,7 +85,9 @@ transport picks a credential per caller or tenant sets `Config.CallerPartition`:
 authenticated caller is part of the cache and coalescing keys, so requests share a response or a
 fetch only within a partition, and the transport reads it with `PartitionFromContext` to choose
 the credential. Coalescing runs even with a `0s` resource TTL, so a per-tenant transport without a
-partition needs the cache off (`Config.Cache` nil).
+partition needs the cache off (`Config.Cache` nil). Invalidation is not partitioned: a `401` or
+`403` in one partition evicts that resource's entries in every partition, which costs the others
+refetches but never serves one partition another's response.
 
 It is a self-contained Go module. Run its checks from this directory:
 

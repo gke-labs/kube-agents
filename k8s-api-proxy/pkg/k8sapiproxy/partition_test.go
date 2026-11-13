@@ -17,6 +17,8 @@ const (
 	testPartitionTTL   = time.Minute
 	testArrivalTimeout = 2 * time.Second
 	testPodsPath       = "/api/v1/namespaces/default/pods"
+	// noPartition is what partitionEchoUpstream answers when the handler set none.
+	noPartition = "none"
 )
 
 // tenantAuthenticator names the caller after the tenant header, standing in for an
@@ -31,6 +33,10 @@ func (tenantAuthenticator) AuthenticateRequest(r *http.Request) (*CallerIdentity
 	return &CallerIdentity{Username: "actor/" + tenant + "/session", Groups: []string{"tenant:" + tenant}}, nil
 }
 
+type recordingAuditSink struct{ events *[]AuditEvent }
+
+func (s recordingAuditSink) Record(_ context.Context, e AuditEvent) { *s.events = append(*s.events, e) }
+
 // partitionByTenant puts every session of a tenant in one partition.
 func partitionByTenant(c *CallerIdentity) string {
 	return strings.TrimPrefix(c.Groups[0], "tenant:")
@@ -44,7 +50,11 @@ func partitionEchoUpstream(calls *atomic.Int32, gate func()) *fakeUpstream {
 		if gate != nil {
 			gate()
 		}
-		body := `{"kind":"PodList","apiVersion":"v1","metadata":{"resourceVersion":"` + PartitionFromContext(req.Context()) + `"},"items":[]}`
+		partition, ok := PartitionFromContext(req.Context())
+		if !ok {
+			partition = noPartition
+		}
+		body := `{"kind":"PodList","apiVersion":"v1","metadata":{"resourceVersion":"` + partition + `"},"items":[]}`
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Header:     http.Header{headerContentType: []string{contentTypeJSON}},
@@ -170,7 +180,7 @@ func TestHandlerWithoutCallerPartitionSharesAcrossCallers(t *testing.T) {
 	a := serve(h, tenantRequest("a"))
 	b := serve(h, tenantRequest("b"))
 
-	fetchedWith(t, a.Body.String(), "")
+	fetchedWith(t, a.Body.String(), noPartition)
 	if got := b.Header().Get(headerCacheStatus); got != cacheStatusHit {
 		t.Errorf("Cache-Status = %q, want %q", got, cacheStatusHit)
 	}
@@ -191,9 +201,35 @@ func TestPartitionFromContextReachesTheUpstreamWithoutACache(t *testing.T) {
 	fetchedWith(t, serve(h, tenantRequest("b")).Body.String(), "b")
 }
 
-func TestPartitionFromContextIsEmptyWithoutOne(t *testing.T) {
-	if got := PartitionFromContext(context.Background()); got != "" {
-		t.Errorf("PartitionFromContext(Background) = %q, want empty", got)
+func TestPartitionFromContextReportsWhetherOneWasSet(t *testing.T) {
+	if got, ok := PartitionFromContext(context.Background()); ok || got != "" {
+		t.Errorf("PartitionFromContext(Background) = %q, %v; want \"\", false", got, ok)
+	}
+	ctx := context.WithValue(context.Background(), partitionKey{}, "")
+	if got, ok := PartitionFromContext(ctx); !ok || got != "" {
+		t.Errorf("PartitionFromContext(empty partition) = %q, %v; want \"\", true", got, ok)
+	}
+}
+
+// A panic in the embedder's func is audited as a panic, not as a forwarded request.
+func TestHandlerCallerPartitionPanicIsNotRecordedAsForwarded(t *testing.T) {
+	var events []AuditEvent
+	h, upstream := newTestHandler(t, Config{
+		Authenticator:   tenantAuthenticator{},
+		CallerPartition: func(*CallerIdentity) string { panic("partition func") },
+		Audit:           recordingAuditSink{events: &events},
+	})
+
+	func() {
+		defer func() { _ = recover() }()
+		serve(h, tenantRequest("a"))
+	}()
+
+	if upstream.calls != 0 {
+		t.Errorf("upstream calls = %d, want 0", upstream.calls)
+	}
+	if len(events) != 1 || events[0].Outcome == OutcomeForwarded {
+		t.Errorf("audit events = %+v, want one not recorded as forwarded", events)
 	}
 }
 

@@ -63,6 +63,7 @@ type Config struct {
 	// an upstream fetch only within one partition, and the Upstream reads it with
 	// PartitionFromContext. Nil puts every caller in one partition: the handler then shares
 	// responses across callers, which is safe only when the Upstream uses one credential.
+	// It runs once per forwarded request, with a non-nil caller, and must not panic.
 	CallerPartition func(*CallerIdentity) string
 	// MaxInFlight caps the forwarded requests in flight; one over it is answered 429 with
 	// Retry-After. Each in-flight response holds upstream buffers in the proxy, so the cap
@@ -274,6 +275,12 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request, ev *AuditEvent, 
 		return
 	}
 	ev.Caller = caller
+	// Before anything is recorded as forwarded: a panic in the embedder's func is then
+	// audited as the panic it is.
+	var partition string
+	if h.partition != nil {
+		partition = h.partition(caller)
+	}
 
 	clusterID, apiPath, perr := SplitClusterPath(r.URL)
 	if perr != nil {
@@ -327,7 +334,7 @@ func (h *handler) serve(w http.ResponseWriter, r *http.Request, ev *AuditEvent, 
 	ctx := context.WithValue(out.Context(), auditEventKey{}, ev)
 	if h.partition != nil {
 		// Read by the cache key and by the Upstream; a coalesced fetch inherits it.
-		ctx = context.WithValue(ctx, partitionKey{}, h.partition(ev.Caller))
+		ctx = context.WithValue(ctx, partitionKey{}, partition)
 	}
 	callerAccept := normalizeAcceptHeader(out.Header)
 	if h.cache != nil {

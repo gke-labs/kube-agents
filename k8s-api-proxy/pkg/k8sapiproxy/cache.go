@@ -526,7 +526,8 @@ func (c *responseCache) roundTrip(req *http.Request, next func(*http.Request) (*
 		return resp, err
 	}
 
-	key := buildCacheKey(clusterID, PartitionFromContext(req.Context()), req, meta.callerAccept)
+	partition, _ := PartitionFromContext(req.Context())
+	key := buildCacheKey(clusterID, partition, req, meta.callerAccept)
 	now := c.now()
 
 	if !reqCC.noCache && !reqCC.zeroMaxAge {
