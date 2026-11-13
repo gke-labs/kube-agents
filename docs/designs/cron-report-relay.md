@@ -655,12 +655,12 @@ channel is routed anyway: the operator renders `A2A_NOTIFY_PLATFORM` for it (a
 comma-separated list of platform names, one today), the relay
 sends, and the gateway refuses the post and keeps it for the digest it posts once a
 home channel is set (the gateway design, "Proactive posts"). The 502's detail is then
-the relay's `composed but not delivered to <platform>`, one such sentence per gateway platform
-without a home channel, joined by `; `. The gateway's refusal, which
+the relay's `composed but not delivered to <platform>`. The gateway's refusal, which
 says the post is kept, is in the gateway's and the session server's logs. A pod
 rendered before the operator routed it still answers the platform-naming detail
 (`composed but not delivered to slack (no home channel: set
-spec.integration.slack.homeChannel / SLACK_HOME_CHANNEL)`).
+spec.integration.slack.homeChannel / SLACK_HOME_CHANNEL)`), one such sentence per
+gateway platform without a home channel, joined by `; `.
 
 The one narrowing is `also_delivered_to`: a platform the cron child already
 posted the raw report to is skipped, and where that would empty the set the
