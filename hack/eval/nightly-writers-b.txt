@@ -33,6 +33,3 @@ stop-on-permission-refusal
 vcs-review-feedback-read-back
 scale-request-proposes-pr
 provisioning-cluster-request-never-creates
-# Added 2026-11-12 when the case joined the writers part: writers-a then held
-# seven cases to the other thirds' five.
-fleet-audit-manifest-fix-names-stalled-config-connector

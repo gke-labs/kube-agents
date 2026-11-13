@@ -1164,7 +1164,7 @@
 # both at destroy. Fixture: hpa-saturated. The fixture-state scan of
 # 2026-11-10 reads config-connector-namespaced healthy on all 40 pool
 # projects. writes_alone, because the stack writes to the GitOps repository's
-# default branch: it runs alone in the writers part (writers-b), after a
+# default branch: it runs alone in the writers part (writers-c), after a
 # repository reset that deletes a declaration a failed teardown left. It has
 # a stack and is not in infra_lock_exempt, so it also holds the infra lock.
 # Priced at the stockout audit's band plus the stack's waits. It has no
