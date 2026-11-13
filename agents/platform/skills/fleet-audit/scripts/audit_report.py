@@ -2815,12 +2815,25 @@ def sweep_off_reason() -> str:
 def sweep_off_next_step(noun: str) -> str:
     """What the worker reads when the sweep opens nothing: the two ways a fix
     still opens. A worker that read only "`/remediate` requests" stopped at the
-    ledger when its own task had asked for the fixes, and opened nothing."""
+    ledger when its own task had asked for the fixes, and opened nothing.
+
+    The direct ask is narrow on purpose. Worded as "when this task asks you to
+    open fixes", a worker on an audit-only ask read its card's "remediation
+    pull requests required by the SOP" as the ask and opened an unrequested
+    pull request: a PodDisruptionBudget (nightly 2026-11-11,
+    obtainability-planted-pdb) and a Pod Security fix (#5093's smoke,
+    compliance-rbac-overgrant). Keyed on what the request asks, not on whose
+    words carry it: the worker sees only the planner's card, so a paraphrased
+    "open every PodDisruptionBudget" still counts."""
     return (
-        f"the automatic sweep opens nothing. A `/remediate` comment on the ledger opens a {noun}, and so "
-        "does a direct ask: when this task asks you to open fixes, run `remediate --finding <id> "
-        "--manifest-file <the collector manifest>` for each one the ledger lists as awaiting `/remediate`, "
-        "a PodDisruptionBudget `finish` writes itself included. Never post `/remediate` yourself."
+        f"the automatic sweep opens nothing, and that is the answer for a run that was asked only to audit. "
+        f"A `/remediate` comment on the ledger opens a {noun}, and so does a direct ask: only when the request "
+        "itself asks for fixes to be opened (\"open the fixes\", \"open every PodDisruptionBudget the audit "
+        "wrote\", \"remediate <finding>\"), run `remediate --finding <id> --manifest-file <the collector "
+        "manifest>` for each fix it asks for, by id or as a set, that the ledger lists as awaiting a fix, a "
+        "PodDisruptionBudget `finish` writes itself included. A request only to run an audit or follow its "
+        "SOP is not that ask, and neither is a line that attributes remediation pull requests to the SOP: "
+        "stop at the ledger and name the findings it lists as awaiting a fix. Never post `/remediate` yourself."
     )
 
 # The collector manifest (docs/designs/fleet-audit-collector-manifest.md).

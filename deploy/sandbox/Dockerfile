@@ -587,7 +587,8 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          module name, so it is staged here as well
 #   credential_shapes.py   the token shapes the feedback gate refuses and the broker
 #                          redacts before logging: one list, imported by
-#                          feedback_broker here and by credential_proxy off-pod
+#                          feedback_broker and submit_suggestion here and by
+#                          credential_proxy off-pod
 #   feedback_broker.py     the constants the kube-agents-feedback client reads (the
 #                          route, the statuses, the fallback links, the payload's
 #                          normalisation); the same module's broker half files the
@@ -770,8 +771,8 @@ RUN find /opt/defaults -name '__pycache__' -type d -prune -exec rm -rf {} + && \
 #
 # The pull-request and issue crons run in the agent pod, hold the forge
 # credential, and do their forge work by sshing in as `hermes` and running a
-# script here. The Cluster Agent reconcile does the same for its GKE reads
-# (gke_cluster_reads.py, #3703). Two of the crons cross: forge.py for every forge verb
+# script here. The Cluster Agent reconcile and stall_watch do the same for their GKE
+# reads (gke_cluster_reads.py, #3703). Two of the crons cross: forge.py for every forge verb
 # (agents/platform/scripts/forge.py, `_forward`) and resolver.py for the issues
 # sweep's `poll` (github-issue-resolver, `_forward_to_sandbox`). The copy under
 # /opt/data is root-owned and, under the operator, a read-only mount, but it
