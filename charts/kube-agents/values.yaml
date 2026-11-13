@@ -1960,10 +1960,10 @@ platformAgent:
       # false hides the buttons and keeps nothing.
       answerFeedback: true
       # "auto" (also empty) or "manual". Under spec.mode next with Slack on the
-      # gateway (Google Chat not enabled) and homeChannel empty, "auto" lets the
-      # A2A gateway make the channel of the first top-level mention of the
-      # agent the home channel; "manual" leaves homeChannel alone to decide. A
-      # set homeChannel wins under either.
+      # gateway and homeChannel empty, "auto" lets the A2A gateway make the
+      # channel of the first top-level mention of the agent the home channel;
+      # "manual" leaves homeChannel alone to decide. A set homeChannel wins
+      # under either.
       homeChannelPolicy: ""
     teams:
       # Microsoft Teams ChatOps integration via Microsoft Bot Framework / Entra ID.

@@ -514,6 +514,10 @@ func TestTheAgentRoutesProactivePostsToTheGatewayExactlyWhenArmed(t *testing.T) 
 		// Both backends share the gateway, so both are routed; Chat's posts
 		// are kept for the digest until its home is set.
 		{"next with chat and slack, no chat home", chatAndSlackTestAgent("next"), "google_chat,slack", "google_chat,slack"},
+		// A malformed home drops only that platform's route; the other stays.
+		{"next with chat and slack, slack home a name", withSlackHomeChannel(withHome(chatAndSlackTestAgent("next"), "spaces/AAAA"), "#ops"), "google_chat", "google_chat"},
+		{"next with chat and slack, chat home not a space", withSlackHomeChannel(withHome(chatAndSlackTestAgent("next"), "AAAA"), "C0HOME"), "slack", "slack"},
+		{"next with chat and slack, both homes malformed", withSlackHomeChannel(withHome(chatAndSlackTestAgent("next"), "AAAA"), "#ops"), "", ""},
 		{"next with chat, not a space", withHome(gchatTestAgent("next", true), "spaces/AAAA/threads/B"), "", ""},
 		{"next with chat, bare id", withHome(gchatTestAgent("next", true), "AAAA"), "", ""},
 		{"next without chat", withHome(gchatTestAgent("next", false), "spaces/AAAA"), "", ""},
@@ -552,6 +556,11 @@ func TestNotifyPlatformsOrderIsChatThenSlack(t *testing.T) {
 
 func withHome(agent *agentv1alpha1.PlatformAgent, home string) *agentv1alpha1.PlatformAgent {
 	agent.Spec.Integration.GoogleChat.HomeChannel = home
+	return agent
+}
+
+func withSlackHomeChannel(agent *agentv1alpha1.PlatformAgent, home string) *agentv1alpha1.PlatformAgent {
+	agent.Spec.Integration.Slack.HomeChannel = home
 	return agent
 }
 

@@ -43,8 +43,8 @@ import (
 // TestHomeChannelUnsetMessageFollowsTheGatewaysBackend: the advisory exists
 // exactly when the next stack's gateway holds a chat backend whose home
 // channel is empty (#3320). Today's mode posts through the agent, so it never
-// applies there; with both chats enabled the gateway holds both, and an
-// empty Chat home is reported first. With no record, Slack's message says a
+// applies there; with both chats enabled the gateway holds both, and each
+// empty home is reported, Chat first. With no record, Slack's message says a
 // mention sets the channel.
 func TestHomeChannelUnsetMessageFollowsTheGatewaysBackend(t *testing.T) {
 	slackHome := func(mode, home string) func() string {
@@ -67,25 +67,26 @@ func TestHomeChannelUnsetMessageFollowsTheGatewaysBackend(t *testing.T) {
 		return homeChannelUnsetMessage(a, homeChannelRecord{})
 	}
 	for _, tc := range []struct {
-		name  string
-		msg   func() string
-		names []string // empty: no condition
+		name   string
+		msg    func() string
+		names  []string // empty: no condition
+		absent []string
 	}{
-		{"next slack, no home", slackHome("next", ""), []string{"Slack", "spec.integration.slack.homeChannel", "SLACK_HOME_CHANNEL", "mention the agent"}},
-		{"next slack, blank home", slackHome("next", "  "), []string{"spec.integration.slack.homeChannel"}},
-		{"next slack, home set", slackHome("next", "C0123ABCD"), nil},
-		{"today slack, no home", slackHome("today", ""), nil},
-		{"next chat, no home", chatHome("next", ""), []string{"Google Chat", "spec.integration.googleChat.homeChannel", "GOOGLE_CHAT_HOME_CHANNEL", "keeps them"}},
+		{"next slack, no home", slackHome("next", ""), []string{"Slack", "spec.integration.slack.homeChannel", "SLACK_HOME_CHANNEL", "mention the agent"}, nil},
+		{"next slack, blank home", slackHome("next", "  "), []string{"spec.integration.slack.homeChannel"}, nil},
+		{"next slack, home set", slackHome("next", "C0123ABCD"), nil, nil},
+		{"today slack, no home", slackHome("today", ""), nil, nil},
+		{"next chat, no home", chatHome("next", ""), []string{"Google Chat", "spec.integration.googleChat.homeChannel", "GOOGLE_CHAT_HOME_CHANNEL", "keeps them"}, nil},
 		{"next chat and slack, no chat home", func() string {
 			a := chatAndSlackTestAgent("next")
 			a.Spec.Integration.GoogleChat.HomeChannel = ""
 			return homeChannelUnsetMessage(a, homeChannelRecord{})
-		}, []string{"Google Chat", "Slack Hermes platform meanwhile"}},
-		{"next chat, home set", chatHome("next", "spaces/AAA"), nil},
-		{"today chat, no home", chatHome("", ""), nil},
+		}, []string{"holds Google Chat", "holds Slack", "keeps them", "mention the agent"}, []string{"Slack Hermes platform"}},
+		{"next chat, home set", chatHome("next", "spaces/AAA"), nil, nil},
+		{"today chat, no home", chatHome("", ""), nil, nil},
 		// Slack shares the gateway, so its empty home is reported.
-		{"next chat and slack, chat home set", bothChatHomeOnly, []string{"Slack", "spec.integration.slack.homeChannel"}},
-		{"next, no chat", func() string { return homeChannelUnsetMessage(a2aTestAgent(), homeChannelRecord{}) }, nil},
+		{"next chat and slack, chat home set", bothChatHomeOnly, []string{"holds Slack", "spec.integration.slack.homeChannel", "mention the agent"}, []string{"holds Google Chat"}},
+		{"next, no chat", func() string { return homeChannelUnsetMessage(a2aTestAgent(), homeChannelRecord{}) }, nil, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := tc.msg()
@@ -100,7 +101,15 @@ func TestHomeChannelUnsetMessageFollowsTheGatewaysBackend(t *testing.T) {
 					t.Errorf("message does not name %q: %q", want, got)
 				}
 			}
-			if !strings.Contains(got, "keeps them") && !strings.Contains(got, "Slack Hermes platform") {
+			for _, unwanted := range tc.absent {
+				if strings.Contains(got, unwanted) {
+					t.Errorf("message names %q: %q", unwanted, got)
+				}
+			}
+			if c, sl := strings.Index(got, "holds Google Chat"), strings.Index(got, "holds Slack"); c >= 0 && sl >= 0 && c > sl {
+				t.Errorf("Chat's sentence must come first: %q", got)
+			}
+			if !strings.Contains(got, "keeps them") {
 				t.Errorf("message must say where the posts go meanwhile, not just that a field is empty: %q", got)
 			}
 		})

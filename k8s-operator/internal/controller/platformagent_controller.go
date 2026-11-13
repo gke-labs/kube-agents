@@ -300,19 +300,16 @@ const (
 		"Clear the field to run the operator's image, or set it to the matching build."
 	// homeChannelUnsetMessageFormat takes the backend, the CR field, the
 	// install.env key, what the field holds, and where the posts go
-	// meanwhile (one of the two sentences below).
+	// meanwhile (the sentence below).
 	homeChannelUnsetMessageFormat = "The A2A gateway holds %[1]s (spec.mode next) and %[2]s is empty, so the agent's " +
 		"proactive posts -- alerts, drift reports, scheduled reports -- %[5]s; " +
 		"replies in a conversation still arrive. Set %[2]s (%[3]s in install.env) to %[4]s to deliver them."
-	// homeChannelUnsetKept is the meanwhile when the gateway's backend is the
-	// install's only chat platform: the agent still sends, the gateway
-	// refuses and keeps (a2a/gateway/notify_refused.go).
+	// homeChannelUnsetKept is the meanwhile for each backend without a home:
+	// the agent still sends, the gateway refuses and keeps
+	// (a2a/gateway/notify_refused.go).
 	homeChannelUnsetKept = "are refused by the gateway, which keeps them and posts one digest into the channel once it is set"
-	// homeChannelUnsetToSlack is the meanwhile on a Chat-and-Slack install:
-	// the agent is not routed to Chat, so the posts go
-	// to the Slack Hermes platform, which delivers them only where Slack's
-	// own home channel is set; the operator cannot see one set from chat.
-	homeChannelUnsetToSlack = "go to the Slack Hermes platform meanwhile, which delivers them only if Slack has a home channel"
+	// homeChannelUnsetJoin joins the sentences when both backends lack a home.
+	homeChannelUnsetJoin = " "
 
 	// The condition reporting that the render left a hostPath volume out of
 	// the agent Pod. Written only while the spec carries one, on the
@@ -5545,40 +5542,44 @@ func (r *PlatformAgentReconciler) forgetUsageStatus(agent *agentv1alpha1.Platfor
 
 // homeChannelUnsetMessage is the HomeChannelUnset condition's message for this
 // spec and the home-channel record, or "" when the condition is to be absent:
-// the next stack holds no chat backend, or the one it holds has a home
-// channel, from the CR or admitted from the record. A malformed home channel
-// is not this condition's: the gateway refuses it at start and says so. On
-// Slack with the CR field empty the base sentence carries at most one more:
-// why the record did not stand in (manual, not an id, refused), or
-// that a mention sets it.
+// the next stack holds no chat backend, or each one it holds has a home
+// channel, from the CR or (Slack) admitted from the record. With both
+// backends lacking one, the message carries both sentences, Chat first. A
+// malformed home channel is not this condition's: the gateway refuses it at
+// start and says so. On Slack with the CR field empty the base sentence
+// carries at most one more: why the record did not stand in (manual, not an
+// id, refused), or that a mention sets it.
 func homeChannelUnsetMessage(agent *agentv1alpha1.PlatformAgent, rec homeChannelRecord) string {
-	switch {
-	case a2aChatArmed(agent) && strings.TrimSpace(agent.Spec.Integration.GoogleChat.HomeChannel) == "":
-		meanwhile := homeChannelUnsetKept
-		if slackEnabled(agent) {
-			meanwhile = homeChannelUnsetToSlack
-		}
-		return fmt.Sprintf(homeChannelUnsetMessageFormat, "Google Chat",
-			"spec.integration.googleChat.homeChannel", "GOOGLE_CHAT_HOME_CHANNEL", "a Chat space name (spaces/<id>)", meanwhile)
-	case a2aSlackArmed(agent) && strings.TrimSpace(agent.Spec.Integration.Slack.HomeChannel) == "":
-		if rec.channel != "" {
-			return ""
-		}
-		msg := fmt.Sprintf(homeChannelUnsetMessageFormat, "Slack",
-			"spec.integration.slack.homeChannel", "SLACK_HOME_CHANNEL", "a channel id (C... or G...)", homeChannelUnsetKept)
-		switch {
-		case slackHomeChannelPolicy(agent) == slackHomeChannelPolicyManual:
-			return msg + homeChannelUnsetManualSuffix
-		case rec.recorded == homeChannelRecordMalformed:
-			return msg + homeChannelUnsetMalformedSuffix
-		case rec.recorded != "" && rec.refused != "":
-			return msg + fmt.Sprintf(homeChannelUnsetRefusedRecordedFormat, rec.recorded, rec.refused)
-		case rec.refused != "":
-			return msg + fmt.Sprintf(homeChannelUnsetRefusedCandidateFormat, rec.refused)
-		}
-		return msg + homeChannelUnsetLearnSuffix
+	var parts []string
+	if a2aChatArmed(agent) && strings.TrimSpace(agent.Spec.Integration.GoogleChat.HomeChannel) == "" {
+		parts = append(parts, fmt.Sprintf(homeChannelUnsetMessageFormat, "Google Chat",
+			"spec.integration.googleChat.homeChannel", "GOOGLE_CHAT_HOME_CHANNEL", "a Chat space name (spaces/<id>)", homeChannelUnsetKept))
 	}
-	return ""
+	if msg := slackHomeChannelUnsetMessage(agent, rec); msg != "" {
+		parts = append(parts, msg)
+	}
+	return strings.Join(parts, homeChannelUnsetJoin)
+}
+
+// slackHomeChannelUnsetMessage is homeChannelUnsetMessage's Slack sentence,
+// or "" when Slack is not armed or has a home channel.
+func slackHomeChannelUnsetMessage(agent *agentv1alpha1.PlatformAgent, rec homeChannelRecord) string {
+	if !a2aSlackArmed(agent) || strings.TrimSpace(agent.Spec.Integration.Slack.HomeChannel) != "" || rec.channel != "" {
+		return ""
+	}
+	msg := fmt.Sprintf(homeChannelUnsetMessageFormat, "Slack",
+		"spec.integration.slack.homeChannel", "SLACK_HOME_CHANNEL", "a channel id (C... or G...)", homeChannelUnsetKept)
+	switch {
+	case slackHomeChannelPolicy(agent) == slackHomeChannelPolicyManual:
+		return msg + homeChannelUnsetManualSuffix
+	case rec.recorded == homeChannelRecordMalformed:
+		return msg + homeChannelUnsetMalformedSuffix
+	case rec.recorded != "" && rec.refused != "":
+		return msg + fmt.Sprintf(homeChannelUnsetRefusedRecordedFormat, rec.recorded, rec.refused)
+	case rec.refused != "":
+		return msg + fmt.Sprintf(homeChannelUnsetRefusedCandidateFormat, rec.refused)
+	}
+	return msg + homeChannelUnsetLearnSuffix
 }
 
 // noChatPlatformMsg is the NoChatPlatform condition's message for this spec,

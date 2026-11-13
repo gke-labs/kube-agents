@@ -658,8 +658,8 @@ const (
 	// The home space the gateway's chat.notify route posts to
 	// (a2a/gateway/config.go, notify.go), from googleChat.homeChannel.
 	a2aGchatHomeChannelEnvVar = "A2A_GCHAT_HOME_CHANNEL"
-	// The agent container's half of the same route: which platform name
-	// the agent-side callers route through `a2a notify` instead of
+	// The agent container's half of the same route: which platform names,
+	// comma-separated, the agent-side callers route through `a2a notify` instead of
 	// `hermes send` (agents/platform/scripts/chat_notify.py).
 	a2aNotifyPlatformEnvVar = "A2A_NOTIFY_PLATFORM"
 	a2aNotifyPlatformGchat  = "google_chat"

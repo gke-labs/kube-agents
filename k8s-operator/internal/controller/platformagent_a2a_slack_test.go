@@ -889,9 +889,8 @@ func TestTheSlackHomeChannelReachesTheArmedGateway(t *testing.T) {
 
 // TestTheAgentRoutesSlackProactivePostsExactlyWhenArmed: the agent is told
 // to route Slack's proactive posts through chat.notify exactly when the
-// gateway holds Slack AND the home channel is a channel id or unset (Slack is
-// then the only chat platform, and the gateway keeps the refused posts for
-// the digest), and the kanban
+// gateway holds Slack AND the home channel is a channel id or unset (when
+// unset, the gateway keeps the refused posts for the digest), and the kanban
 // notifier to send a card's report back to its conversation whenever the
 // gateway arms Slack's route (home channel unset or a channel id). Otherwise
 // posts would go to a subject nobody answers. With Chat beside it both are
