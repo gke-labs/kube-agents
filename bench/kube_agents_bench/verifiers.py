@@ -2955,7 +2955,7 @@ def _code_call_text_and_clip(entry: dict[str, Any]) -> tuple[str | None, bool]:
     command: str | None = None
     if set(args) == {"raw"} and isinstance(args["raw"], str):
         raw = args["raw"]
-        clip = _CLIPPED_RESULT.search(raw)
+        clip = _CLIPPED_ARGS.search(raw)
         if clip is not None:
             text = raw[: clip.start()]
             parsed = _read_clipped_args(text)

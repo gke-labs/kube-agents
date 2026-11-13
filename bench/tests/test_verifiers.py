@@ -10332,6 +10332,54 @@ def test_code_call_text_and_clip_cut_later_key_preserves_command():
     assert "forbidden pattern(s) matched worker commands" in res_forbid.reason
 
 
+def test_code_call_text_and_clip_worker_typed_clip_marker_not_mistaken_for_pod_clip():
+    from kube_agents_bench.verifiers import _code_call_text_and_clip
+
+    # 1. Command itself was cut by the pod, but contained worker-typed clip marker earlier
+    entry_cut = {
+        "name": "terminal",
+        "args": {
+            "raw": '{"command": "grep \\" ...[clipped 50 chars]\\" log.txt && curl ...[clipped 120 chars]',
+        },
+    }
+    cmd, is_clipped = _code_call_text_and_clip(entry_cut)
+    assert is_clipped is True
+    assert cmd == 'grep " ...[clipped 50 chars]" log.txt && curl'
+
+    # 2. Command closed, contained clip marker, and clip cut an ambiguous later key
+    entry_cut_later = {
+        "name": "terminal",
+        "args": {
+            "raw": '{"command": "grep \\" ...[clipped 50 chars]\\" log.txt", "c ...[clipped 120 chars]',
+        },
+    }
+    cmd_later, is_clipped_later = _code_call_text_and_clip(entry_cut_later)
+    assert is_clipped_later is True
+    assert cmd_later == 'grep " ...[clipped 50 chars]" log.txt'
+
+    # 3. Command closed, contained clip marker, and clip cut a non-conflicting later value
+    entry_notes_cut = {
+        "name": "terminal",
+        "args": {
+            "raw": '{"command": "grep \\" ...[clipped 50 chars]\\" log.txt", "notes": "some notes ...[clipped 120 chars]',
+        },
+    }
+    cmd_notes, is_clipped_notes = _code_call_text_and_clip(entry_notes_cut)
+    assert is_clipped_notes is False
+    assert cmd_notes == 'grep " ...[clipped 50 chars]" log.txt'
+
+    # 4. Command contains clip marker text and is whole (no pod clip at all)
+    entry_whole = {
+        "name": "terminal",
+        "args": {
+            "raw": '{"command": "echo \\" ...[clipped 50 chars]\\""}',
+        },
+    }
+    cmd_whole, is_clipped_whole = _code_call_text_and_clip(entry_whole)
+    assert is_clipped_whole is False
+    assert cmd_whole == 'echo " ...[clipped 50 chars]"'
+
+
 def test_scan_command_prefix_env_and_xargs_flags():
     from kube_agents_bench.shell_words import _command_word_index, _scan_command_prefix
     from kube_agents_bench.verifiers import WorkerRun, _argv_runs
