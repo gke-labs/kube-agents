@@ -65,6 +65,9 @@ _OPERATOR_ONLY_ENV_KEYS = ("INCIDENT_TRIAGE_OPEN_PULL_REQUEST", "INCIDENT_TRIAGE
 # projection mounted, the projected file is the channel the gateway posts
 # into, so the mirror must not fill the key the container env lacks.
 _PROJECTED_HOME_ENV_KEYS = ("SLACK_HOME_CHANNEL",)
+# Joins the per-platform no-route refusals when the gateway holds more than one
+# backend with no home channel; chat_delivery_watch reads refusals joined by it.
+NO_CHAT_ROUTE_JOIN = "; "
 
 # The origin of a unit of work (docs/designs/proposal-origin.md §2.1): one value
 # per session, written once under ORIGIN_KEY in its metadata, with the chat
@@ -2846,9 +2849,6 @@ HOME_CHANNEL_SETTINGS: Dict[str, str] = {
 # The refusal when no platform can be named: no chat at all, a malformed home
 # channel the gateway refuses, or a backend this file has no route for.
 NO_CHAT_ROUTE_ERROR = "no Google Chat or Slack route to post to; check the chat integration and homeChannel"
-# Joins the per-platform refusals when the gateway holds more than one backend
-# with no home channel.
-NO_CHAT_ROUTE_JOIN = "; "
 
 
 def _mapping(value: object) -> dict:

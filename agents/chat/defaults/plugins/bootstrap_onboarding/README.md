@@ -79,7 +79,7 @@ graph TD
     DG -->|inject greeting instructions| H["LLM greets as kube-agents + asks one question (no inventory content)"]
 
     C -->|Periodic / triggered tick| I{".user_aligned present and not completed (agent pod), then INVENTORY.md present (sandbox pod)?"}
-    I -->|No, and nobody has written a day after the sweep| F["File the report as a GitHub issue (claim), one home line links it; a week on, claim and retire"]
+    I -->|No, and nobody has written a day after the sweep| F["File the report as a GitHub issue (claim), a home line on each routed platform links it; a week on, claim and retire"]
     I -->|No| J["Emit nothing -> silent run"]
     I -->|Yes| CL{"Atomically claim .bootstrap_completed (exclusive link)"}
     CL -->|Lost the race| J

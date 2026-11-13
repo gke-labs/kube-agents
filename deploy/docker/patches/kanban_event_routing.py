@@ -122,6 +122,8 @@ CONVERSATION_ROUTE_KEY = "conversation_route"
 NOTIFY_CONVERSATIONS_ENV = "A2A_NOTIFY_CONVERSATIONS"
 #: What separates the platform names (kanban_chat_notify.PLATFORM_LIST_SEPARATOR).
 PLATFORM_LIST_SEPARATOR = ","
+#: What the log lines print for an empty or absent value.
+UNSET_LABEL = "<unset>"
 
 
 def _served_conversation_platforms() -> list[str]:
@@ -289,7 +291,7 @@ def resolve_chat_route(
         _log_undeliverable(
             chat_id,
             f"its conversation route is on {conversation[0]}, which no notifier serves here "
-            f"({NOTIFY_CONVERSATIONS_ENV}={PLATFORM_LIST_SEPARATOR.join(served) or '<unset>'})",
+            f"({NOTIFY_CONVERSATIONS_ENV}={PLATFORM_LIST_SEPARATOR.join(served) or UNSET_LABEL})",
         )
         return platform, chat_id, thread_id
     if not metadata:
@@ -309,7 +311,7 @@ def resolve_chat_route(
         _log_undeliverable(
             chat_id,
             "the recorded route is not a chat surface either: "
-            f"{route_platform or '<unset>'}/{route_chat_id or '<unset>'}",
+            f"{route_platform or UNSET_LABEL}/{route_chat_id or UNSET_LABEL}",
         )
         return platform, chat_id, thread_id
 
