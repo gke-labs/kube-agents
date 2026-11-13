@@ -312,6 +312,15 @@ const (
 	// usageScrapeKindOther is the kind for an error that is not a
 	// usageScrapeError, which the pod source never returns and a stub might.
 	usageScrapeKindOther = "error"
+
+	// usageClosedIdleErrorText is the text of net/http's unexported
+	// errServerClosedIdle: the transport's read loop starts as soon as the
+	// connection is dialled, and when the peer's close reaches it before the
+	// request is registered there, that plain sentinel -- neither a
+	// net.OpError nor io.EOF, and wrapping neither -- is what client.Do
+	// returns. usageConnectKind compares the innermost cause against it by
+	// equality, so no byte a peer sent can steer the match.
+	usageClosedIdleErrorText = "http: server closed idle connection"
 )
 
 var (
@@ -701,10 +710,11 @@ func (e *usageScrapeError) Error() string {
 
 // usageConnectKind classifies a client.Do error by what happened rather than
 // where it surfaced: a timeout, a dial that was refused, unreachable, a
-// connection the peer accepted but never answered on, or -- only when the peer
-// did send a status line the client could not parse -- a malformed response, so
-// the event points the reader at the layer that failed rather than at a policy.
-// Never the text net/http builds from the bytes it read.
+// connection the peer accepted but never answered on (however the transport
+// reports the close), or -- only when the peer did send a status line the
+// client could not parse -- a malformed response, so the event points the
+// reader at the layer that failed rather than at a policy. Never the text
+// net/http builds from the bytes it read.
 func usageConnectKind(err error) string {
 	if usageTimedOut(err) {
 		return usageScrapeKindTimeout
@@ -728,7 +738,26 @@ func usageConnectKind(err error) string {
 		errors.Is(err, io.EOF) {
 		return usageScrapeKindConnect
 	}
+	// The same close, seen by the transport's read loop before the request
+	// was registered with it, surfaces as the closed-idle sentinel instead of
+	// the EOF underneath: still nothing answered, still connect.
+	if usageRootCause(err).Error() == usageClosedIdleErrorText {
+		return usageScrapeKindConnect
+	}
 	return usageScrapeKindMalformed
+}
+
+// usageRootCause is the innermost error of err's Unwrap chain, the one whose
+// text is its own rather than a wrapper's, so a wrapper that quotes the peer's
+// bytes around a cause is never what a sentinel is compared against.
+func usageRootCause(err error) error {
+	for {
+		inner := errors.Unwrap(err)
+		if inner == nil {
+			return err
+		}
+		err = inner
+	}
 }
 
 // usageTimedOut reports whether err is a deadline or a network timeout, which

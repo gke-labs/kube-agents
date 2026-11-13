@@ -433,9 +433,8 @@ var a2aIdentityMapSchemaKeys = map[string][]string{
 	"3": {"account", "grants", "identities", "narrowing", "profile", "publish", "serviceAccount", "subscribe", "topics", "user", "version"},
 	"4": {"account", "grants", "identities", "narrowing", "profile", "publish", "serviceAccount", "subscribe", "tier", "topics", "user", "version"},
 	"5": {"account", "grants", "identities", "narrowing", "profile", "publish", "serviceAccount", "shard", "shards", "subscribe", "tier", "topics", "user", "version"},
-	// 6 is #5553's (the dispatcher's bucketed entry); once it merges, 7 is
-	// its key set plus notAfter.
-	"7": {"account", "grants", "identities", "narrowing", "notAfter", "profile", "publish", "serviceAccount", "shard", "shards", "subscribe", "tier", "topics", "user", "version"},
+	"6": {"account", "draining", "grants", "identities", "narrowing", "profile", "publish", "serviceAccount", "shard", "shards", "subscribe", "tier", "topics", "user", "version"},
+	"7": {"account", "draining", "grants", "identities", "narrowing", "notAfter", "profile", "publish", "serviceAccount", "shard", "shards", "subscribe", "tier", "topics", "user", "version"},
 }
 
 // The schema constant is the newest version the table records, and each
@@ -501,13 +500,23 @@ func TestTheIdentityMapShapeMatchesTheSchemaTheCalloutPodTemplatePins(t *testing
 	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationShrink), RunID: "3-1", Phase: string(busMigrationPinning),
 		StartedAt: metav1.Now(), Deadline: metav1.NewTime(time.Now().Add(time.Hour))}
 
-	// With a profile that has topics, so every key the renderer can emit is
+	// With a profile that has topics, and the dispatcher's bucketed entry
+	// with a draining profile, so every key the renderer can emit is
 	// emitted: a map rendered with no profiles would pass on the old schema
 	// and roll nothing.
-	cm, _ := singleA2AAuthMapShard(t, agent, []agentv1alpha1.AgentProfile{testAgentProfile(agent.Namespace, "auditor", func(p *agentv1alpha1.AgentProfile) {
+	withDispatcher(t)
+	withBucketedGrants(t)
+	auditor := testAgentProfile(agent.Namespace, "auditor", func(p *agentv1alpha1.AgentProfile) {
 		p.Spec.Bus.PublishTopics = []string{"agent.auditor.findings"}
 		p.Spec.Bus.SubscribeTopics = []string{"shared.blueprint"}
-	})})
+	})
+	draining := []a2aDispatchProfile{{Name: "gone", Concurrency: 1, Tiers: []string{"read"}, ActiveDeadlineSeconds: 1800,
+		Durables: []a2aDispatchDurable{}, DrainingUntil: time.Date(2026, 11, 6, 12, 45, 0, 0, time.UTC)}}
+	cms, _, err := buildA2AAuthMapConfigMaps(agent, []agentv1alpha1.AgentProfile{auditor}, draining)
+	if err != nil || len(cms) != 1 {
+		t.Fatalf("rendering the auth map: %d shards, %v", len(cms), err)
+	}
+	cm := cms[0]
 	var doc any
 	if err := json.Unmarshal([]byte(cm.Data[a2aAuthMapKey]), &doc); err != nil {
 		t.Fatalf("decoding the rendered auth map: %v", err)

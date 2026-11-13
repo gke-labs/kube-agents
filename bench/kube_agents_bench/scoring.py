@@ -981,8 +981,23 @@ def _inject_record(trajectory: list[Any]) -> bool:
     )
 
 
-#: The public name ``gate`` reads the version key's mode with.
+#: The public name for the inject transport's marker.
 is_inject_record = _inject_record
+
+#: The entry a card-wait stopped ask writes when the A2A door takes its send
+#: (``harness._A2A_DOOR_SEND_ENTRY``, #5407). Duplicated rather than imported,
+#: like the inject names above; ``test_card_wait.py`` asserts they agree.
+A2A_DOOR_SEND_EVENT = "a2a_door.send"
+
+
+def is_next_lane_record(trajectory: list[Any]) -> bool:
+    """Whether the record came off a next install, which ``gate`` files the
+    version key's mode by: the inject transport's task marker, or the A2A
+    door's send entry (only a next install has the door). Not an inject
+    record for grading: the door record keeps the api grading."""
+    return _inject_record(trajectory) or any(
+        isinstance(entry, dict) and entry.get("name") == A2A_DOOR_SEND_EVENT for entry in trajectory
+    )
 
 
 def _entry_failed(entry: dict[str, Any]) -> bool:

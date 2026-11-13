@@ -107,7 +107,9 @@ const a2aIdentityMapSchemaAnnotation = "a2a.kubeagents.x-k8s.io/identity-map-sch
 //	4 -> adds tier (one AgentProfile entry per tier, #3655)
 //	5 -> adds shard and shards (the map is cut into numbered ConfigMaps;
 //	     a callout from before it watches a name no longer rendered)
-//	6 -> taken by the dispatcher's bucketed entry (#5553)
+//	6 -> adds draining, and the narrowing value "dispatcher" (#5381,
+//	     behind A2A_DISPATCHER_BUCKETED_GRANTS); a callout from before it
+//	     refuses both
 //	7 -> adds notAfter (the bus migration's per-run principals)
 const a2aIdentityMapSchema = "7"
 
