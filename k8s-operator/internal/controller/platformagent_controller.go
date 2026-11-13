@@ -762,12 +762,20 @@ type PlatformAgentReconciler struct {
 // resources. tests/test_operator_secrets_grant.py and the C5 conformance test pin that shape;
 // docs/designs/operator-namespaced-write-verbs.md is the inventory and the reasoning.
 //
-// CR.
-// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents/status,verbs=get;list;watch;update;patch
+// CR. Every verb here has a caller, and tests/test_operator_secrets_grant.py names it per
+// verb: the reads are the informers, the webhook's List and r.Get; `update` on platformagents
+// is the finalizer (Add/RemoveFinalizer with r.Update) and `patch` the bus-stream annotation
+// merge patch; the status writes are Status().Update and Status().Patch; `update` on
+// */finalizers is what the API server's owner-references admission requires of an owner
+// whose rendered objects carry blockOwnerDeletion (SetControllerReference). The operator
+// never creates or deletes a PlatformAgent, and never updates an AgentPlugin's status whole,
+// so those verbs are not here. `get` on a status subresource has no caller and stays as the
+// read half of a subresource the controller writes.
+// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents/finalizers,verbs=update
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentplugins,verbs=get;list;watch
-// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentplugins/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentplugins/status,verbs=get;patch
 // Render: the agent, broker, gateway and bus workloads, and the profile pools. Reads cluster-wide
 // (the informers; escalation prevention); writes namespaced.
 // +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets,verbs=get;list;watch

@@ -162,6 +162,47 @@ NAMESPACED_VERBS_BY_KIND = {
     (CORE_API_GROUP, "events"): frozenset({"create", "patch"}),
     (CORE_API_GROUP, "podtemplates"): frozenset({"create"}),
 }
+# The custom resources' verbs on the ClusterRole, each with the code that
+# calls it. A verb with no caller is a grant the operator never uses, and on a
+# cluster-scoped grant that is authority over every namespace for nothing:
+# `create` and `delete` on `platformagents` were that until this table. The
+# `get` on each status subresource has no caller either; it is the read half
+# of a subresource the controller writes and is kept as such, named here so a
+# reader does not go looking for one. `tiers` is left to its own owner.
+#
+#   platformagents            get: r.Get in Reconcile; list/watch: the For()
+#                             informer and the webhook's List; update: the
+#                             finalizer (AddFinalizer/RemoveFinalizer with
+#                             r.Update); patch: the bus-stream annotation
+#                             merge patch (platformagent_a2a_bus_streams.go).
+#   platformagents/status     update/patch: Status().Update and Status().Patch
+#                             across the reconcilers; get: the read half.
+#   platformagents/finalizers update: SetControllerReference sets
+#                             blockOwnerDeletion on every rendered object, and
+#                             the API server's owner-references admission
+#                             requires it on the owner's finalizers.
+#   agentplugins              get/list/watch: the Watches() informer and r.Get.
+#   agentplugins/status       patch: Status().Patch (the plugin conditions);
+#                             get: the read half.
+#   agentprofiles             get/list/watch: the For() informer and the
+#                             identity map's List; patch: patchFinalizers'
+#                             merge patch (an Update would drop spec fields a
+#                             newer CRD added).
+#   agentprofiles/status      update: Status().Update (writeStatus); get: the
+#                             read half.
+#   agentprofiles/finalizers  update: the profile's ServiceAccounts carry a
+#                             controller reference, as above.
+CR_API_GROUP = "kubeagents.x-k8s.io"
+CR_VERBS_BY_RESOURCE = {
+    "platformagents": frozenset({"get", "list", "watch", "update", "patch"}),
+    "platformagents/status": frozenset({"get", "update", "patch"}),
+    "platformagents/finalizers": frozenset({"update"}),
+    "agentplugins": frozenset({"get", "list", "watch"}),
+    "agentplugins/status": frozenset({"get", "patch"}),
+    "agentprofiles": frozenset({"get", "list", "watch", "patch"}),
+    "agentprofiles/status": frozenset({"get", "update"}),
+    "agentprofiles/finalizers": frozenset({"update"}),
+}
 # The kustomize deploy recipe: config/profiles is applied after config/default
 # and a failed first apply fails the target. The profile namespace's
 # release-namespace annotation is the install namespace, which the operator
@@ -412,6 +453,29 @@ class OperatorSecretsGrantTest(unittest.TestCase):
         self.assertEqual("Namespace", namespace.get("kind"))
         self.assertEqual(INSTALL_NAMESPACE, (namespace.get("metadata", {}).get("annotations") or {}).get(RELEASE_NAMESPACE_ANNOTATION))
         self.assertEqual(PROFILE_COMPONENT, (namespace.get("metadata", {}).get("labels") or {}).get(PROFILE_COMPONENT_LABEL))
+
+    def test_each_custom_resource_verb_on_the_cluster_role_has_a_caller(self):
+        # Per resource, the union over every ClusterRole rule that names it,
+        # on role.yaml and on the chart's render: equal to the table, so a verb
+        # added without a caller (or a caller's verb dropped) is red here. The
+        # Go parity test holds role.yaml to the self-check list; this holds
+        # both to the code that uses them.
+        for source, cluster_roles in (
+            ("role.yaml", [_cluster_role(self)]),
+            ("helm", [d for d in _render_helm() if d.get("kind") == CLUSTER_ROLE_KIND and d["metadata"]["name"].endswith("operator-role")]),
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(1, len(cluster_roles), f"{source}: expected one operator ClusterRole")
+                rules = cluster_roles[0].get("rules") or []
+                for resource, want in sorted(CR_VERBS_BY_RESOURCE.items()):
+                    with self.subTest(source=source, resource=resource):
+                        verbs = {
+                            verb
+                            for rule in rules
+                            if CR_API_GROUP in (rule.get("apiGroups") or []) and resource in (rule.get("resources") or [])
+                            for verb in (rule.get("verbs") or [])
+                        }
+                        self.assertEqual(want, verbs)
 
     def test_the_cluster_role_grants_no_write_verb_on_a_namespaced_kind(self):
         # The general form of the Secret invariant: every kind the operator

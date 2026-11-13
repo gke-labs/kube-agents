@@ -172,16 +172,22 @@ var (
 // fails on any difference in either direction, so a marker change that forgets
 // this list does not build green.
 var requiredPermissions = []requiredPermission{
-	{Group: "kubeagents.x-k8s.io", Resources: []string{"platformagents"}, Verbs: rbacWriteVerbs},
-	{Group: "kubeagents.x-k8s.io", Resources: []string{"platformagents/status"}, Verbs: []string{"get", "list", "watch", "update", "patch"}},
+	// The custom resources, each verb with a caller (the markers above
+	// Reconcile and tests/test_operator_secrets_grant.py name them): no
+	// create or delete on platformagents, no whole-status update on
+	// agentplugins, no list or watch on a status subresource.
+	{Group: "kubeagents.x-k8s.io", Resources: []string{"platformagents"}, Verbs: []string{"get", "list", "watch", "update", "patch"}},
+	{Group: "kubeagents.x-k8s.io", Resources: []string{"platformagents/status"}, Verbs: []string{"get", "update", "patch"}},
 	{Group: "kubeagents.x-k8s.io", Resources: []string{"platformagents/finalizers"}, Verbs: []string{"update"}},
 	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentplugins"}, Verbs: rbacReadVerbs},
-	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentplugins/status"}, Verbs: []string{"get", "update", "patch"}},
+	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentplugins/status"}, Verbs: []string{"get", "patch"}},
 	// agentprofiles: the AgentProfile reconciler adds and removes its
-	// finalizer (update, patch) and writes status; the PlatformAgent
-	// reconciler lists them into the identity map.
-	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentprofiles"}, Verbs: []string{"get", "list", "watch", "update", "patch"}},
-	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentprofiles/status"}, Verbs: []string{"get", "update", "patch"}},
+	// finalizer with a merge patch (patchFinalizers; no update, which would
+	// drop spec fields a newer CRD added) and writes status with
+	// Status().Update; the PlatformAgent reconciler lists them into the
+	// identity map.
+	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentprofiles"}, Verbs: []string{"get", "list", "watch", "patch"}},
+	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentprofiles/status"}, Verbs: []string{"get", "update"}},
 	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentprofiles/finalizers"}, Verbs: []string{"update"}},
 	// tiers: the Tier reconciler reads each tier and writes its Accepted
 	// condition (#3659). Nothing else: tiers are cluster administrators' to
