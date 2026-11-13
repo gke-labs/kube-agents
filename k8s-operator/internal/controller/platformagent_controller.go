@@ -5080,10 +5080,6 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		}
 	}
 
-	proxyResourcesRefusal, _ := credentialProxyResourcesRefusal(agent)
-	agentAPIAuthRefusal, _ := agentAPIAuthResourcesRefusal(agent)
-	sandboxResourcesRefusal, _ := shellSandboxResourcesRefusal(agent)
-	execRefusal := ValidateCredentialProxyExec(agent, nil)
 	// The A2A gateway still waiting for TASKS on a provisioned bus
 	// (a2aGatewayTasksWaitMessage): read once per pass, only while that
 	// Deployment is short of ready replicas and the bus is up. The requeue
@@ -5159,40 +5155,13 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		degradedStatus = metav1.ConditionTrue
 		degradedReason = conditionReasonA2AGatewayWaitingForTasks
 		degradedMsg = a2aTasksWaitMsg
-	} else if proxyResourcesRefusal != "" {
-		// Same shape as the git refusal above: the spec is read here, on
-		// every pass, rather than carried from reconcileCredentialProxy, so
-		// the condition clears on the pass the override is corrected.
-		// Degraded only, as the held minter entry above: the proxy runs at
-		// the operator's defaults, so Ready and the phase keep what the
-		// workload says. Last, because the reasons above report lost
-		// function and must not be masked by it.
+	} else if reason, msg := specResourceDegraded(agent); reason != "" {
+		// The spec's resource and exec-tier refusals, last: each leaves its
+		// workload at the operator's defaults, and the reasons above report
+		// lost function and must not be masked by them (specResourceDegraded).
 		degradedStatus = metav1.ConditionTrue
-		degradedReason = conditionReasonInvalidCredentialProxyResources
-		degradedMsg = fmt.Sprintf(invalidCredentialProxyResourcesMsgFmt, proxyResourcesRefusal)
-	} else if agentAPIAuthRefusal != "" {
-		// Same shape as the credential-proxy refusal above and last for the same
-		// reason: the sidecar runs at the operator's defaults, so Ready and the
-		// phase keep what the workload says, and a reason reporting lost function
-		// must not be masked by it.
-		degradedStatus = metav1.ConditionTrue
-		degradedReason = conditionReasonInvalidAgentAPIAuthResources
-		degradedMsg = fmt.Sprintf(invalidAgentAPIAuthResourcesMsgFmt, agentAPIAuthRefusal)
-	} else if sandboxResourcesRefusal != "" {
-		// The third resource refusal, ranked after the two above for the same
-		// reason: the shell runs at the operator's defaults, so Ready and the
-		// phase keep what the workload says, and a reason reporting lost
-		// function must not be masked by it.
-		degradedStatus = metav1.ConditionTrue
-		degradedReason = conditionReasonInvalidShellSandboxResources
-		degradedMsg = fmt.Sprintf(invalidShellSandboxResourcesMsgFmt, sandboxResourcesRefusal)
-	} else if len(execRefusal) > 0 {
-		// The exec tier's refusal, after the three above for the same reason:
-		// the tier is not rendered and every command goes to the stateful
-		// broker, so Ready and the phase keep what the workload says.
-		degradedStatus = metav1.ConditionTrue
-		degradedReason = conditionReasonInvalidCredentialProxyExec
-		degradedMsg = fmt.Sprintf(invalidExecTierReplicasMsgFmt, execRefusal[0].Detail)
+		degradedReason = reason
+		degradedMsg = msg
 	}
 	if degradedMsg == "" {
 		degradedMsg = condMsg
@@ -6399,6 +6368,11 @@ func degradedStatusCurrent(agent *agentv1alpha1.PlatformAgent, reason, message s
 		!credentialProxyExecReadyCurrent(agent, execReady) {
 		return false
 	}
+	// Degraded following BusStreamsPresent on a park (#5707): read from the
+	// agent itself, so the live re-check below judges the live object.
+	if edit, _ := parkBusStreamsDegraded(agent); edit != busStreamsDegradedKeep {
+		return false
+	}
 	if rendered != workloadRendered {
 		return true
 	}
@@ -6528,6 +6502,11 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 	}
 	setCredentialProxyExecReadyCondition(agent, execReady, now)
 	setDataVolumeExpansionCondition(agent, dataVolumeMsg, dataVolumeKnown, now)
+	// Degraded is updateStatusReady's to rank, and a park returns before it
+	// runs; the bus streams' reason alone follows the poller here, which keeps
+	// writing BusStreamsPresent through a park (parkBusStreamsDegraded).
+	edit, busStreams := parkBusStreamsDegraded(agent)
+	applyParkBusStreamsDegraded(agent, edit, busStreams, now)
 	return r.Status().Update(ctx, agent)
 }
 
