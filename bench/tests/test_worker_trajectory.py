@@ -821,7 +821,7 @@ def test_a_clipped_structured_failure_still_reads_as_an_error(data_root: Path) -
 def test_a_clipped_exit_code_zero_still_records_exit_code(data_root: Path) -> None:
     """The exit code is taken on the unclipped result, so the clip cannot erase it."""
     entry = _read_result(data_root, {"exit_code": 0, "output": "x" * 3000})
-    assert entry["exit_code"] == 0 and entry["result"].endswith("chars]")
+    assert entry["exit_code"] == 0 and "[clipped" in entry["result"]
     cap = worker_trajectory.capture(
         lambda s, t: _run_script(data_root, [FRONT]), [FRONT], 5.0
     )
@@ -835,7 +835,7 @@ def test_a_clipped_exit_code_zero_still_records_exit_code(data_root: Path) -> No
 def test_a_clipped_exit_code_nonzero_still_records_exit_code(data_root: Path) -> None:
     """The non-zero exit code is taken on the unclipped result and preserved."""
     entry = _read_result(data_root, {"exit_code": 1, "output": "x" * 3000})
-    assert entry["exit_code"] == 1 and entry["result"].endswith("chars]")
+    assert entry["exit_code"] == 1 and "[clipped" in entry["result"]
     cap = worker_trajectory.capture(
         lambda s, t: _run_script(data_root, [FRONT]), [FRONT], 5.0
     )
