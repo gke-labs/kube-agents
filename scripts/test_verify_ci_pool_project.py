@@ -3436,7 +3436,7 @@ class LedgerTokenMintTest(unittest.TestCase):
 
     def test_a_refused_permission_fails_because_the_eval_preflight_would(self):
         # The pinned body makes 422 possible: the installation no longer holds
-        # one of the three reads. hack/ci-eval-pr.sh sends the same body at
+        # one of the four reads. hack/ci-eval-pr.sh sends the same body at
         # preflight and exits on this answer, so it is a pool-wide failure,
         # not an "unknown" to re-run later.
         token, status, message = self._mint(urlopen=self._http_error(422, "Unprocessable Entity"))
