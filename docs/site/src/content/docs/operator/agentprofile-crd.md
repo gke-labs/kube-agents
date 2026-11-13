@@ -102,7 +102,7 @@ The operator decides what each listed name renders, and reports it in the `Tiers
 
   Listing the tier again ends the drain once it renders again: not while its `Tier` is missing, and not while it conflicts with the profile's live unattended-mode tier. A running task that delegates to its own profile at the draining tier is refused like any new task; delegating to another profile still works. A profile left with no tier that renders drains as a removed profile does. A profile on a named ServiceAccount (`spec.identity`) serves one tier, so its tier is replaced at once rather than drained.
 
-  **This is not an emergency revoke.** Deleting a `Tier`, or dropping it from a profile, doesn't cut off work already running at it: that work carries on until the drain ends. To stop it now, use the stop (or the dispatcher's breaker).
+  **This is not an emergency revoke.** Deleting a `Tier`, or dropping it from a profile, doesn't cut off work already running at it: that work carries on until the drain ends. There's no lever yet to end a whole tier's running work at once. Stop is the requester's, and an unattended Job has no chat. For now, delete a running task's worker pod, or its Job for an unattended task, in the profile namespace: that ends the one task, which the dispatcher fails `lease-expired`.
 
 `status.renderedTiers` records what the last pass rendered. The operator uses it to tell the tier a profile already serves from a newcomer. If status is lost (a restore, a GitOps apply), it reads the profile's own ServiceAccounts once instead.
 
