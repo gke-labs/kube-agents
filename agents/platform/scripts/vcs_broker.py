@@ -1782,6 +1782,45 @@ class VcsBroker:
             {"branch": {"name": branch, "exists": bool(revision), "revision": revision or None}}
         )
 
+    def revision_contains(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Whether `revision` contains `ancestor` on the remote: `{"contains": bool}`.
+
+        The post-merge check's question when a GitOps tool applied a commit
+        other than the merge commit: reconcilers track a branch, so a later
+        merge carries this one. git against the remote, like `branch-view`:
+        `revision`'s history is fetched into a scratch repository, never checked
+        out, under the clone's size ceiling. A fetch that fails, whether the
+        remote lacks the revision or the credential, network or ceiling stopped
+        it, is refused as `REVISION_NOT_FOUND`. A revision equal to `ancestor`
+        contains it without a fetch.
+        """
+        bound = self._bind(payload)
+        ancestor = validate_revision(payload.get("ancestor"), "ancestor")
+        revision = validate_revision(payload.get("revision"), "revision")
+        if ancestor == revision:
+            return bound.stamp({"contains": True})
+        bound.ensure()
+        git = bound.git
+        root = self._scratch("contains")
+        try:
+            git(root, "init", "--quiet", "--bare")
+            fetched = git(
+                root, "fetch", "--quiet", "--no-tags", "--filter=tree:0", bound.forge.clone_url(bound.repo), revision,
+                check=False,
+            )
+            if fetched.returncode != 0:
+                raise WorkspaceError(
+                    f"{bound.repo} has no revision {revision} this credential can fetch",
+                    status=404,
+                    code="REVISION_NOT_FOUND",
+                )
+            self._enforce_ceiling(root, bound.repo)
+            present = git(root, "rev-parse", "--verify", "--quiet", f"{ancestor}^{{commit}}", check=False)
+            contains = present.returncode == 0 and self._is_ancestor(git, root, ancestor, revision)
+        finally:
+            self._discard_scratch(root)
+        return bound.stamp({"contains": contains})
+
     def branch_delete(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Delete a spent branch: one whose proposal is done with and whose tip it carried.
 
@@ -2573,6 +2612,7 @@ VCS_VERBS = frozenset(
         "identity",
         "branch-view",
         "branch-delete",
+        "revision-contains",
     }
 )
 
@@ -2608,6 +2648,7 @@ def route_table(broker: VcsBroker) -> dict[str, Callable[[dict], dict]]:
         "identity": broker.identity,
         "branch-view": broker.branch_view,
         "branch-delete": broker.branch_delete,
+        "revision-contains": broker.revision_contains,
     }
 
 

@@ -1915,6 +1915,30 @@ class BranchVerbTest(unittest.TestCase):
             check=False,
         ).returncode == 0
 
+    # -- revision-contains -----------------------------------------------
+
+    def contains(self, ancestor: str, revision: str) -> dict:
+        return self.broker.revision_contains(
+            {"repository": "local.test/acme/infra", "ancestor": ancestor, "revision": revision}
+        )
+
+    def test_contains_reads_ancestry_on_the_remote(self):
+        merge = self.push_branch("main", "first\n")
+        later = self.push_branch("main", "second\n")
+        self.assertTrue(self.contains(merge, later)["contains"])
+        self.assertFalse(self.contains(later, merge)["contains"])
+        self.assertTrue(self.contains(merge, merge)["contains"])
+        side = self.push_branch(self.SPENT, "side\n")
+        self.assertFalse(self.contains(side, later)["contains"])
+
+    def test_contains_refuses_a_revision_the_remote_does_not_have(self):
+        merge = self.push_branch("main", "first\n")
+        with self.assertRaises(WorkspaceError) as caught:
+            self.contains(merge, "f" * 40)
+        self.assertEqual(caught.exception.fields.get("code"), "REVISION_NOT_FOUND")
+        with self.assertRaises(WorkspaceError):
+            self.contains("main", merge)
+
     # -- branch-view -----------------------------------------------------
 
     def test_view_says_a_branch_the_remote_does_not_hold_is_absent(self):

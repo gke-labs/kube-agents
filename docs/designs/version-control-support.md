@@ -933,6 +933,7 @@ it; `ROLE_VCS_VERBS` refuses it to the `mcp` role.
 | `identity`                           | `{repository, login?, bot?}`                                         | `{identity: {login, subject, canWrite}}`                                                 |
 | `branch-view`                        | `{repository, branch}`                                               | `{branch: {name, exists, revision}}`                                                     |
 | `branch-delete`                      | `{repository, branch, revision}`                                     | `{branch: {name, deleted, revision}}`                                                    |
+| `revision-contains`                  | `{repository, ancestor, revision}`                                   | `{contains}` (library callers only, like `snapshot`)                                     |
 
 `baseBranch` is the repository's configured base, or null when it has none.
 Where it is set, `proposal-create`'s `target`, and a first-round `publish`'s,
@@ -962,10 +963,11 @@ thing, and the contract test holds them together. The issue verbs come as one
 group in the same way, all or none.
 
 The rows down to `issue-create` except `snapshot` and `proposal-claim`, and the two branch rows, are the
-version-control skill's. `snapshot` and `proposal-claim` are the library verbs (`LIBRARY_VERBS` in
+version-control skill's. `snapshot`, `proposal-claim` and `revision-contains` are the library verbs (`LIBRARY_VERBS` in
 `providers/base.py`), which `capabilities` leaves out of `verbs`. `snapshot` is served to library callers
 (`vcs_client.snapshot`), which `inspect-repository` is. `proposal-claim` is served to the `pr_opened` plugin,
-which presents the token from a proposal record line. The rest are the union of
+which presents the token from a proposal record line. `revision-contains` is for the
+post-merge check, which asks whether a reconciler's applied commit contains a fix's merge commit. The rest are the union of
 what the shipped consumers do to a forge — edit and close what they opened, read
 a proposal's commits, acknowledge a comment, keep a label in existence, ask who
 the credential is and whether a login may write — decided by the callers rather
