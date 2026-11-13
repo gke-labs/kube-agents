@@ -346,20 +346,20 @@ class TestWithDeny(unittest.TestCase):
         # The alias's node keeps its anchor's marks, which point into `allow`.
         for name, text in {
             "no deny": "version: 1\nautomerge:\n  allow:\n    - fix: no-pdb\n      environments: &dev [dev]\n"
-                       "    - fix: other-fix\n      environments: *dev\n",
+                       "    - fix: no-pdb\n      environments: *dev\n",
             "deny ends in an alias": "version: 1\nautomerge:\n  allow:\n    - fix: no-pdb\n      environments: &dev [dev]\n"
-                                     "    - fix: other-fix\n      environments: [qa]\n  deny:\n    - fix: '*'\n      environments: *dev\n",
+                                     "    - fix: no-pdb\n      environments: [qa]\n  deny:\n    - fix: '*'\n      environments: *dev\n",
         }.items():
             with self.subTest(name):
                 before = ar.parse(text)
                 self.assertEqual(before.status, ar.LOADED, before.error)
                 try:
-                    out = ar.with_deny(text, "no-pdb", "dev")
+                    out = ar.with_deny(text, "no-pdb", "prod")
                 except ar.RulesError:
                     continue
                 after = ar.parse(out)
                 self.assertEqual(after.allow, before.allow)
-                self.assertEqual(after.deny, before.deny + (ar.Rule("no-pdb", ("dev",)),))
+                self.assertEqual(after.deny, before.deny + (ar.Rule("no-pdb", ("prod",)),))
 
 
 if __name__ == "__main__":
