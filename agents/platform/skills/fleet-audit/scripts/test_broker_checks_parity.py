@@ -26,7 +26,8 @@ class BrokerChecksParityTest(unittest.TestCase):
         self.assertEqual(self.ac.BUILTIN_OWNER_GROUPS, collect.BUILTIN_OWNER_GROUPS)
         self.assertEqual(self.ac.BUILTIN_OWNER_KINDS, collect.BUILTIN_OWNER_KINDS)
         self.assertEqual(self.ac.DEFAULT_HPA_MIN_REPLICAS, collect.DEFAULT_HPA_MIN_REPLICAS)
-        for ns in ("gke-x", "config-management-y", "shop"):
+        self.assertEqual(set(self.ac.READ_KINDS.split(",")), set(pdb_safety.READ.kinds.split(",")))
+        for ns in ("gke-x", "config-management-y", "shop", "asm-x", "istio-x", "anthos-x", "gmp-x", "cnrm-x"):
             self.assertEqual(ns.startswith(self.ac.SYSTEM_NAMESPACE_PREFIXES), collect._is_system_namespace(ns) and ns not in collect.SYSTEM_NAMESPACES)
 
     def test_the_broker_reaches_the_sandboxs_verdicts(self):
@@ -87,6 +88,15 @@ class BrokerChecksParityTest(unittest.TestCase):
                     {c["name"]: c["passed"] for c in sandbox["checks"]},
                     (broker, sandbox["checks"]),
                 )
+
+    def test_an_unreadable_live_selector_is_stricter_here_on_purpose(self):
+        odd = pdb("odd", labels={"app": "other"})
+        odd["spec"]["selector"]["matchExpressions"] = [{"key": "a", "operator": "Bogus"}]
+        items = [ready(deployment()), odd]
+        sandbox = pdb_safety.check_fix(finding(), BUDGET_TEXT, in_manifest=True, run=FakeRun(items), kube_context=CTX)
+        broker = self.ac.judge({"items": items}, "Deployment/checkout", NS, "checkout-pdb", {"matchLabels": LABELS})
+        self.assertTrue({c["name"]: c["passed"] for c in sandbox["checks"]}[self.ac.NO_OVERLAPPING_BUDGET])
+        self.assertFalse({c["name"]: c["passed"] for c in broker}[self.ac.NO_OVERLAPPING_BUDGET])
 
 
 if __name__ == "__main__":

@@ -6,7 +6,14 @@ the pull request's body itself, on one namespace read with its own credential,
 because nothing the sandbox reports can be trusted for that: `replicas-ready`
 (with an autoscaler's floor), `no-overlapping-budget` and `selector-matches`
 (Jobs and CronJobs included), behind the audit's scope rules S1-S5
-(`in_scope`): a workload the audit would not read is never eligible.
+(`in_scope`): a workload the audit would not read is never eligible. Whether
+the cluster itself is inside the install's declared scope is the caller's to
+establish before it reads anything; nothing here sees the scope.
+
+One deliberate difference from the sandbox: a live budget whose selector this
+cannot read (an operator it does not know) counts as overlapping, where
+`collect.selector_matches` skips the unknown term. The broker's answer is the
+stricter one.
 
 `fleet-audit/scripts/test_broker_checks_parity.py` holds the verdicts and the
 copied rules to the sandbox's own. Stdlib only: the credential-proxy image ships
