@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -40,6 +41,14 @@ const (
 	// not start leaves, whichever step refused it.
 	metricsUnavailableAlert = "ALERT metrics listener unavailable; the gateway serves no /metrics and no /readyz until it restarts, so the pod never reads Ready and the PlatformAgent stays Provisioning; conversations are unaffected"
 )
+
+// terminationLogPath is the kubelet's default terminationMessagePath.
+var terminationLogPath = "/dev/termination-log"
+
+// terminationLogMode is the termination message's file mode: owner-only,
+// as gosec's G306 asks. The kubelet reads the file through its host-side
+// mount, not as the container's user, so it still reads it.
+const terminationLogMode = 0o600
 
 func main() {
 	os.Exit(run())
@@ -479,6 +488,14 @@ func runNotifier(ctx context.Context, n *gateway.Notifier, client *lib.Client) f
 func serve(ctx context.Context, cfg *gateway.Config, metrics *gateway.Metrics, readiness func() (bool, string), log *slog.Logger, run func(context.Context) error) error {
 	startMetricsListener(ctx, cfg, metrics, readiness, log)
 	if err := run(ctx); err != nil && ctx.Err() == nil {
+		if errors.Is(err, gateway.ErrTermBusLost) {
+			// A restart that kubectl describe can explain: the kubelet shows
+			// the termination message as the last state's message.
+			msg := "ErrTermBusLost: " + err.Error() + "; the lease is released and the restarted container stands by"
+			log.Error("gateway exited: the bus was down mid-term (ErrTermBusLost)", "err", err)
+			_ = os.WriteFile(terminationLogPath, []byte(msg), terminationLogMode)
+			return err
+		}
 		log.Error("gateway exited", "err", err)
 		return err
 	}
