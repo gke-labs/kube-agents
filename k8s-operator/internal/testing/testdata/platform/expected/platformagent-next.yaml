@@ -2240,6 +2240,10 @@ spec:
             - mountPath: /etc/a2a-nats-ca
               name: a2a-nats-ca
               readOnly: true
+      dnsConfig:
+        options:
+          - name: ndots
+            value: "3"
       initContainers:
         - args:
             - |-
@@ -6261,6 +6265,10 @@ spec:
               name: a2a-chat-relay-token
               readOnly: true
           workingDir: /
+      dnsConfig:
+        options:
+          - name: ndots
+            value: "3"
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
