@@ -253,6 +253,18 @@ jobs:
         with:
           syft-version: "v1.51.1"
 
+      # The bundle step builds the k8s-api-proxy release binaries
+      # (build_release_binaries.sh) with the toolchain main's go.mod pins; the
+      # build runs with GOTOOLCHAIN=local, so a release commit needing a newer
+      # one fails rather than downloads it. No cache: a release build restores
+      # nothing an earlier run left behind.
+      - name: Set up Go
+        if: steps.verify-eligibility.outputs.skip_release != 'true'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: "k8s-api-proxy/go.mod"
+          cache: false
+
       - name: Package Release Bundle & Generate SBOMs
         if: steps.verify-eligibility.outputs.skip_release != 'true'
         env:
