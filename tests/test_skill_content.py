@@ -14,6 +14,8 @@ import importlib.util
 import unittest
 from pathlib import Path
 
+import yaml
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKLOAD_TRIAGE_SCRIPT = REPO_ROOT / "agents/platform/scripts/workload_triage.py"
 CLUSTER_WORKLOAD_SECURITY = REPO_ROOT / "agents/cluster/skills/gke-workload-security/SKILL.md"
@@ -368,13 +370,16 @@ class RoutedSkillsExistTest(unittest.TestCase):
 
 
 def _description(skill):
-    """The frontmatter `description:` of a platform skill, which the router reads."""
+    """The frontmatter `description` of a platform skill, which the router reads.
+
+    Read with a YAML parser, as the router's loader reads it, so a description
+    in a folded block (`description: >-`) is read whole.
+    """
     text = (REPO_ROOT / "agents/platform/skills" / skill / "SKILL.md").read_text(encoding="utf-8")
-    front = text.split("---", 2)[1]
-    for line in front.splitlines():
-        if line.startswith("description:"):
-            return line
-    raise AssertionError(f"{skill} has no description line")
+    description = yaml.safe_load(text.split("---", 2)[1]).get("description")
+    if not description:
+        raise AssertionError(f"{skill} has no description")
+    return description
 
 
 class DeleteRequestsRouteToTheDeletionSectionTest(unittest.TestCase):
