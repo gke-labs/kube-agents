@@ -255,13 +255,15 @@ class StanzaTest(unittest.TestCase):
         # The Platform ends every no-change card with this line; on a status card it drew a Sources list.
         flat = " ".join(REPORT_FORMAT_STANZA.split())
         self.assertIn(
-            'Neither does a closing "Propose only: put the fix in result; do not open a pull request." line: it '
+            'Neither does a closing line that starts "Propose only", however it is worded: it '
             "only rules out opening a pull request or making the change, and never turns a question into a "
             "request for a fix, a report, "
             "claims or a Sources list, so a yes-or-no or status card that carries it still gets the short answer.",
             flat,
         )
-        self.assertIn('summarize is not that ask, and neither is a "Propose only" line.', flat)
+        self.assertIn('summarize is not that ask, and neither is a line that starts "Propose only".', flat)
+        # The Platform rewords the line ("put the findings in the result"); quoting one wording would miss it.
+        self.assertNotIn("put the fix in result", flat)
 
     def test_the_question_budget_is_the_cases(self):
         """The stanza's question rule and ``chat-voice-answer-first`` name one budget.
