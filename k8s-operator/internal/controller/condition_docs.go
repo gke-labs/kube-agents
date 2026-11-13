@@ -34,6 +34,7 @@ var degradedConditionReasons = []string{
 	conditionReasonCorruptManagedRepos,
 	conditionReasonMinterPruningHeld,
 	conditionReasonA2ABusStreamsMissing,
+	conditionReasonA2AGatewayWaitingForTasks,
 	conditionReasonInvalidCredentialProxyResources,
 	conditionReasonInvalidAgentAPIAuthResources,
 	conditionReasonInvalidShellSandboxResources,
