@@ -79,6 +79,10 @@ evictions, byte size, and entry count are exported on the metrics listener as
 `kubeagents_kube_proxy_cache_requests_total`, `kubeagents_kube_proxy_cache_evictions_total`,
 `kubeagents_kube_proxy_cache_bytes`, and `kubeagents_kube_proxy_cache_entries`.
 
+Each kube-agents GitHub Release attaches the binary for Linux and macOS on amd64 and arm64
+(`k8s-api-proxy_<X.Y.Z>_<os>_<arch>.tar.gz`), for running the proxy outside a cluster; verify an
+archive against the release's signed `checksums.txt`.
+
 It is a self-contained Go module. Run its checks from this directory:
 
 ```bash

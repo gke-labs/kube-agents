@@ -18,6 +18,7 @@ from tests.testing.common import (
 from tests.testing.release import (
     MOCK_RELEASE_BUNDLE_VERSION,
     MOCK_TARGET_RELEASE_VERSION,
+    create_mock_go_binary,
     create_mock_helm_binary,
     create_mock_syft_binary,
 )
@@ -111,6 +112,7 @@ class PackageReleaseBundleTest(unittest.TestCase):
 
             create_mock_helm_binary(bin_dir)
             create_mock_syft_binary(bin_dir)
+            create_mock_go_binary(bin_dir)
 
             head_commit = subprocess.check_output(
                 ["git", "-C", str(_REPO_ROOT), "rev-parse", "HEAD"], text=True
@@ -242,6 +244,7 @@ class PackageReleaseBundleTest(unittest.TestCase):
 
             create_mock_helm_binary(bin_dir)
             create_mock_syft_binary(bin_dir)
+            create_mock_go_binary(bin_dir)
 
             head_commit = subprocess.check_output(
                 ["git", "-C", str(_REPO_ROOT), "rev-parse", "HEAD"], text=True
@@ -291,6 +294,7 @@ class PackageReleaseBundleTest(unittest.TestCase):
                 dist_dir = temp_path / "dist"
                 create_mock_helm_binary(bin_dir)
                 create_mock_syft_binary(bin_dir)
+                create_mock_go_binary(bin_dir)
 
                 head_commit = subprocess.check_output(
                     ["git", "-C", str(_REPO_ROOT), "rev-parse", "HEAD"], text=True

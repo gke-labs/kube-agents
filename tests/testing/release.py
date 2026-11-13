@@ -481,6 +481,35 @@ exit 0
     return git_path, log_path
 
 
+def create_mock_go_binary(bin_dir, log_file=None, fail_build=False):
+    """Creates a mock go CLI whose `build -o <path>` writes a placeholder binary.
+
+    Each call logs its GOOS/GOARCH/CGO_ENABLED and arguments, so a test can read
+    which platforms were built and with which flags.
+    """
+    bin_path = pathlib.Path(bin_dir)
+    bin_path.mkdir(parents=True, exist_ok=True)
+    go_path = bin_path / "go"
+    log_path = log_file if log_file else (bin_path / "go.log")
+    build_exit = "exit 1" if fail_build else ""
+    content = f"""#!/bin/sh
+echo "GOOS=$GOOS GOARCH=$GOARCH CGO_ENABLED=$CGO_ENABLED GOFLAGS=$GOFLAGS go $@" >> "{log_path}"
+if [ "$1" = "build" ]; then
+  {build_exit}
+  out=""
+  while [ $# -gt 0 ]; do
+    if [ "$1" = "-o" ]; then out="$2"; fi
+    shift
+  done
+  [ -n "$out" ] && printf 'binary %s/%s\\n' "$GOOS" "$GOARCH" > "$out"
+fi
+exit 0
+"""
+    go_path.write_text(content)
+    go_path.chmod(0o755)
+    return go_path
+
+
 def create_mock_syft_binary(bin_dir, log_file=None, fail_on_images=None):
     """Creates a mock syft CLI that writes mock SPDX or CycloneDX JSON."""
     bin_path = pathlib.Path(bin_dir)

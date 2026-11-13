@@ -3,6 +3,7 @@
 # 📦 Kubernetes Agentic Harness (kube-agents) Release Bundle Packaging Engine
 # ==============================================================================
 # Packages Helm charts, web-distribution bundles (.tar.gz, .zip), generates SBOMs,
+# builds the standalone binaries (build_release_binaries.sh),
 # and computes sha256 checksums atomically into DIST_DIR (default: build/dist).
 #
 # Usage:
@@ -228,6 +229,15 @@ generate_sboms() {
   fi
 }
 
+# The standalone binaries go into the same staging directory, so the checksums,
+# their signature and the GitHub Release cover them like the bundle.
+build_binaries() {
+  local commit_sha
+  commit_sha="$(resolve_bundle_commit "${TAG_NAME}")"
+  DIST_DIR="${TMP_DIST_DIR}" RELEASE_COMMIT="${commit_sha}" REPO_ROOT="${REPO_ROOT}" \
+    bash "${SCRIPT_DIR}/build_release_binaries.sh" "${TAG_NAME}"
+}
+
 compute_checksums() {
   echo "🔒 Computing SHA256 checksums across all release artifacts..."
   local chk_cmd=""
@@ -278,6 +288,7 @@ main() {
   package_helm_charts
   create_archives
   generate_sboms
+  build_binaries
   compute_checksums
   promote_artifacts
 
