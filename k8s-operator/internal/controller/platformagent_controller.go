@@ -769,12 +769,16 @@ type PlatformAgentReconciler struct {
 // owner-references admission requires of an owner whose rendered objects carry
 // blockOwnerDeletion (SetControllerReference). The reads are the informers (list, watch),
 // the Lists outside them (the webhook's, the usage poller's, the bus-stream check's) and the
-// uncached Gets of a PlatformAgent (r.APIReader, podReader, a2aReader); `get` on a status
-// subresource and on agentplugins has no sender and stays as the read half of a kind the
-// controller writes or watches. The operator never creates or deletes a PlatformAgent, and
-// never updates an AgentPlugin's status whole, so those verbs are not here.
+// uncached Gets of a PlatformAgent (r.APIReader, podReader, a2aReader). The reads on
+// platformagents/status are escalation prevention: buildPlatformLocalRole grants the agent's
+// local Role get;list;watch on platformagents and platformagents/status, and the API server
+// refuses a Role whose grantor does not hold every verb in it (a grant on the resource does
+// not cover the subresource), so without them reconcileRBAC fails on every new agent. `get`
+// on the other status subresources and on agentplugins has no sender and stays as the read
+// half of a kind the controller writes or watches. The operator never creates or deletes a
+// PlatformAgent, and never updates an AgentPlugin's status whole, so those verbs are not here.
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents,verbs=get;list;watch;update;patch
-// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents/status,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents/finalizers,verbs=update
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentplugins,verbs=get;list;watch
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentplugins/status,verbs=get;patch

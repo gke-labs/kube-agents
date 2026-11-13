@@ -175,9 +175,10 @@ var requiredPermissions = []requiredPermission{
 	// The custom resources, each verb with a caller (the markers above
 	// Reconcile and tests/test_operator_secrets_grant.py name them): no
 	// create or delete on platformagents, no whole-status update on
-	// agentplugins, no list or watch on a status subresource.
+	// agentplugins. list and watch on platformagents/status are escalation
+	// prevention for the agent's local Role, which grants them.
 	{Group: "kubeagents.x-k8s.io", Resources: []string{"platformagents"}, Verbs: []string{"get", "list", "watch", "update", "patch"}},
-	{Group: "kubeagents.x-k8s.io", Resources: []string{"platformagents/status"}, Verbs: []string{"get", "update", "patch"}},
+	{Group: "kubeagents.x-k8s.io", Resources: []string{"platformagents/status"}, Verbs: []string{"get", "list", "watch", "update", "patch"}},
 	{Group: "kubeagents.x-k8s.io", Resources: []string{"platformagents/finalizers"}, Verbs: []string{"update"}},
 	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentplugins"}, Verbs: rbacReadVerbs},
 	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentplugins/status"}, Verbs: []string{"get", "patch"}},

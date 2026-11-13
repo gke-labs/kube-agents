@@ -159,6 +159,7 @@ rules:
       - kubeagents.x-k8s.io
     resources:
       - platformagents
+      - platformagents/status
     verbs:
       - get
       - list
@@ -174,7 +175,6 @@ rules:
   - apiGroups:
       - kubeagents.x-k8s.io
     resources:
-      - platformagents/status
       - tiers/status
     verbs:
       - get
