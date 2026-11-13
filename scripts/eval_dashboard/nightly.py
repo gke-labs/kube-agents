@@ -105,7 +105,7 @@ EVAL_VERDICT_KEY = "eval_verdict"
 # A nightly build on the collector's pending_builds (listed, no finished.json
 # yet) is a night still running only while it started this recently: the
 # longest part's budget is 14 hours (oss-test-infra: timeout 840m on the main
-# shards for the gemini-4-argon window, 720m before), plus Prow's
+# shards for the newer agent model's window, 720m before), plus Prow's
 # 5-minute grace and the minutes a pod cut at its deadline takes to end (seen
 # at 12h04m-12h06m on the 720m budget). Past that the build is a pod that
 # died without uploading, which the collector keeps on pending_builds for

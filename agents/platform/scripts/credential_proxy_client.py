@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-import argparse
+import hashlib
 import http.client
 import json
 import math
@@ -19,8 +19,13 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from dataclasses import dataclass
 from pathlib import Path
+
+# Every brokered call starts this script as a new process, so its imports are
+# on the caller's clock (#5578). `argparse` is imported in `parse_args`, and
+# `ClusterTarget` is a plain class, not a dataclass: `dataclasses` pulls in
+# `inspect`. A call through the `gcloud` or `kubectl` name uses neither.
+# (`hashlib` and `tempfile` stay: `urllib.request` imports them anyway.)
 
 
 # What this client may be invoked *as*, which is a different list from what the
@@ -234,8 +239,42 @@ RELAY_FALLBACK_MIN_SECONDS = 1.0
 DEFAULT_HERMES_HOME = "/opt/data"
 KUBECONFIG_DIR_NAME = ".kubeconfigs"
 DEFAULT_KUBE_PROXY_CA_FILE = "/var/run/secrets/kubeagents/kube-proxy-ca/ca.crt"
+# A `get-credentials` the shim answers itself when the kube-api proxy is in
+# use (`answer_get_credentials_locally`): the broker would run gcloud only for
+# the shim to replace its kubeconfig with a kube-proxy one built from the
+# context name, about half of the gcloud slot time the fleet audits put on the
+# broker (#5444). The flags it understands; any other sends the call to the
+# broker as before. Valued flags take the next token or `=value`. The endpoint
+# flags (`--internal-ip`, `--dns-endpoint`) are accepted and have no effect:
+# the kubeconfig names kube-proxy, which picks the cluster's endpoint itself.
+GET_CREDENTIALS_LOCAL_VALUED_FLAGS = frozenset({"--location", "--zone", "-z", "--region", "--project"})
+GET_CREDENTIALS_LOCAL_LOCATION_FLAGS = frozenset({"--location", "--zone", "-z", "--region"})
+GET_CREDENTIALS_LOCAL_BARE_FLAGS = frozenset({"--internal-ip", "--dns-endpoint", "--quiet", "-q"})
+# The one relay read that tells a typo from a cluster: the route the Cluster
+# Agent reconcile already uses to ask whether a cluster still exists. Its
+# answer is projected to name, location, status and id. A relay read takes
+# well under a second; past this bound the broker answers instead.
+GET_CREDENTIALS_CHECK_URL = "https://container.googleapis.com/v1/projects/{project}/locations/{location}/clusters/{cluster}"
+GET_CREDENTIALS_CHECK_TIMEOUT_SECONDS = 5
+# Sent on that read so the broker refuses it for a cluster the install's
+# spec.scope.exclude.clusters names (credential_proxy.GET_CREDENTIALS_CHECK_HEADER,
+# held equal by a test). It only narrows: the refusal sends the call to the
+# broker's get-credentials, which refuses an excluded cluster itself (#5305);
+# the sandbox has no scope file to check against.
+GET_CREDENTIALS_CHECK_HEADER = "X-Kube-Agents-Get-Credentials-Check"
+GET_CREDENTIALS_RUNNING_STATUS = "RUNNING"
+# What gcloud prints on stderr for a get-credentials of a running cluster; the
+# shim prints the same, so a caller reads the same lines.
+GET_CREDENTIALS_FETCHING_LINE = "Fetching cluster endpoint and auth data."
+GET_CREDENTIALS_GENERATED_LINE = "kubeconfig entry generated for {cluster}."
 DEFAULT_KUBE_PROXY_TOKEN_FILE = "/var/run/secrets/kubeagents/credential-proxy/token"
 KUBE_PROXY_USER_NAME = "kube-proxy-caller"
+# Beside each kubeconfig the merge below checks, one line per context it found current or wrote:
+# `<context> <sha256 of the file> <sha256 of proxy URL, CA file and token file>`. The sandbox's
+# kubectl wrapper (deploy/sandbox/kubectl_context_registered.sh) skips Python only on an exact line,
+# so any later edit to the file, or a new proxy URL, CA file or token file, runs the merge once more.
+REGISTERED_MARKER_NAME = ".{name}.contexts-registered"
+REGISTERED_MARKER_ENV_SEPARATOR = "\n"
 SANDBOX_HERMES_UID = 1001
 SANDBOX_HERMES_KUBECONFIG_PATH = Path("/home/hermes/.kube/config")
 SANDBOX_WORKER_UID = 1000
@@ -595,13 +634,42 @@ def reads_stdin(argv: list[str]) -> bool:
     return False
 
 
-@dataclass(frozen=True)
 class ClusterTarget:
-    """A GKE cluster identified well enough to re-fetch credentials for it."""
+    """A GKE cluster identified well enough to re-fetch credentials for it.
 
-    project: str
-    location: str
-    cluster: str
+    Immutable, compared and hashed by its three fields, as the frozen dataclass
+    it replaces (see the note at the imports).
+    """
+
+    __slots__ = ("project", "location", "cluster")
+
+    def __init__(self, project: str, location: str, cluster: str) -> None:
+        object.__setattr__(self, "project", project)
+        object.__setattr__(self, "location", location)
+        object.__setattr__(self, "cluster", cluster)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError(f"cannot assign to field {name!r}")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError(f"cannot delete field {name!r}")
+
+    def _fields(self) -> tuple[str, str, str]:
+        return (self.project, self.location, self.cluster)
+
+    def __eq__(self, other: object) -> bool:
+        if other.__class__ is self.__class__:
+            return self._fields() == other._fields()
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash(self._fields())
+
+    def __repr__(self) -> str:
+        return f"ClusterTarget(project={self.project!r}, location={self.location!r}, cluster={self.cluster!r})"
+
+    def __reduce__(self):
+        return (self.__class__, self._fields())
 
     @property
     def context_name(self) -> str:
@@ -1090,6 +1158,29 @@ def _ensure_host_kubeconfig_initialized(
         pass
 
 
+def _record_registered_context(
+    path: Path,
+    content: bytes,
+    context: str,
+    proxy_url: str,
+    ca_file: str,
+    token_file: str,
+) -> None:
+    """Record that `content`, the bytes of `path` the merge checked or wrote, holds `context`'s current
+    entries. Called under the merge's lock; the digest is of those bytes, never of a later read, so a
+    writer that does not take the lock can only make the line stale, never vouch for unchecked bytes."""
+    marker = path.with_name(REGISTERED_MARKER_NAME.format(name=path.name))
+    file_digest = hashlib.sha256(content).hexdigest()
+    env_digest = hashlib.sha256(
+        REGISTERED_MARKER_ENV_SEPARATOR.join((proxy_url, ca_file, token_file)).encode("utf-8")
+    ).hexdigest()
+    kept = []
+    if marker.is_file() and not marker.is_symlink():
+        kept = [line for line in marker.read_text(encoding="utf-8", errors="replace").splitlines()
+                if line.split(" ", 1)[0] != context]
+    _replace_file(marker, "\n".join([*kept, f"{context} {file_digest} {env_digest}"]) + "\n")
+
+
 def _merge_context_into_kubeconfig_file(
     path: Path,
     context: str,
@@ -1130,7 +1221,8 @@ def _merge_context_into_kubeconfig_file(
             st = path.stat()
             if st.st_uid != os.geteuid() or st.st_nlink != 1:
                 return
-            doc = yaml.safe_load(path.read_text(encoding="utf-8", errors="replace"))
+            content = path.read_bytes()
+            doc = yaml.safe_load(content.decode("utf-8", errors="replace"))
         except (OSError, yaml.YAMLError, RecursionError):
             return
         if not isinstance(doc, dict):
@@ -1162,6 +1254,10 @@ def _merge_context_into_kubeconfig_file(
             for u in existing_users
         )
         if has_cluster and has_context and has_user:
+            try:
+                _record_registered_context(path, content, context, proxy_url, ca_file, token_file)
+            except OSError:
+                pass
             return
         clusters = [
             c for c in existing_clusters if isinstance(c, dict) and c.get("name") != context
@@ -1202,7 +1298,9 @@ def _merge_context_into_kubeconfig_file(
         )
         doc["contexts"] = contexts
         try:
-            _replace_file(path, yaml.safe_dump(doc, sort_keys=False))
+            written = yaml.safe_dump(doc, sort_keys=False)
+            _replace_file(path, written)
+            _record_registered_context(path, written.encode("utf-8"), context, proxy_url, ca_file, token_file)
         except OSError:
             pass
     finally:
@@ -1403,6 +1501,115 @@ def is_get_credentials(argv: list[str]) -> bool:
     if words[:1] and words[0] in _GCLOUD_RELEASE_TRACKS:
         words = words[1:]
     return words[:3] == list(_GET_CREDENTIALS_WORDS)
+
+
+def get_credentials_local_target(argv: list[str]) -> ClusterTarget | None:
+    """The cluster a get-credentials names in full, or None when the shim should not answer it.
+
+    Read from `argv` with `--kubeconfig` already taken off: the command words,
+    one positional cluster name, exactly one location (as `--location`,
+    `--zone`, `-z` or `--region`; `--zone` and `--location` for the same zone
+    name the same context) and exactly one `--project`. Any other flag, a second
+    positional, a missing part, or a second location or project flag is None,
+    and the broker answers the call as before (gcloud refuses two location
+    flags as a usage error).
+    """
+    if not is_get_credentials(argv):
+        return None
+    values: dict[str, list[str]] = {}
+    positionals: list[str] = []
+    index = 1
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":
+            return None
+        if token.startswith("-"):
+            name, eq, value = token.partition("=")
+            if name in GET_CREDENTIALS_LOCAL_BARE_FLAGS and not eq:
+                index += 1
+                continue
+            if name not in GET_CREDENTIALS_LOCAL_VALUED_FLAGS:
+                return None
+            if not eq:
+                if index + 1 >= len(argv):
+                    return None
+                value = argv[index + 1]
+                index += 1
+            key = "location" if name in GET_CREDENTIALS_LOCAL_LOCATION_FLAGS else name
+            values.setdefault(key, []).append(value)
+            index += 1
+            continue
+        positionals.append(token)
+        index += 1
+    if positionals[:1] and positionals[0] in _GCLOUD_RELEASE_TRACKS:
+        positionals = positionals[1:]
+    if positionals[:3] != list(_GET_CREDENTIALS_WORDS) or len(positionals) != len(_GET_CREDENTIALS_WORDS) + 1:
+        return None
+    locations = values.get("location", [])
+    projects = values.get("--project", [])
+    if len(locations) != 1 or len(projects) != 1:
+        return None
+    target = ClusterTarget(project=projects[0], location=locations[0], cluster=positionals[-1])
+    if not all(_GKE_CONTEXT_COMPONENT.fullmatch(part) for part in (target.project, target.location, target.cluster)):
+        return None
+    return target
+
+
+def answer_get_credentials_locally(
+    argv: list[str], destination: Path | None, implicit_destination: bool, endpoint: str
+) -> int | None:
+    """Answer a get-credentials without the broker when the kube-api proxy is in use.
+
+    The kubeconfig the shim writes after a broker call is built from the
+    context name alone (`rewrite_kubeconfig_for_kube_proxy`), so with
+    `KUBE_PROXY_URL` set the broker's gcloud run adds nothing but a check that
+    the cluster exists and is running. That check is one relay read here
+    instead. Returns 0 with the kubeconfig written as after a broker call.
+    Returns None, and the caller sends the command to the broker as before,
+    when the kube-api proxy is not in use, the argv does not name the cluster
+    in full (`get_credentials_local_target`), or the relay answers anything but
+    a running cluster or cannot be reached. A 404 is one of those: gcloud's own
+    error names the cluster and, for a wrong location, the right one. So is
+    the broker's refusal of an excluded cluster (GET_CREDENTIALS_CHECK_HEADER):
+    the broker's get-credentials then refuses it with its own message.
+
+    The check is one attempt at `endpoint`, the broker `execute` sends the
+    command to: no retry of a busy or draining refusal and no fallback of its
+    own, so it costs at most GET_CREDENTIALS_CHECK_TIMEOUT_SECONDS before
+    `execute`'s own retries and fallback take the call.
+    """
+    if not os.environ.get("KUBE_PROXY_URL", "").strip():
+        return None
+    target = get_credentials_local_target(argv)
+    if target is None:
+        return None
+    url = GET_CREDENTIALS_CHECK_URL.format(project=target.project, location=target.location, cluster=target.cluster)
+    try:
+        response = ApiSession(endpoint)._get_once(
+            url, timeout=GET_CREDENTIALS_CHECK_TIMEOUT_SECONDS, headers={GET_CREDENTIALS_CHECK_HEADER: "1"}
+        )
+        if response.status_code != http.HTTPStatus.OK:
+            return None
+        cluster = response.json()
+    except Exception:  # noqa: BLE001 - any failure here is the broker's call to make
+        return None
+    # gcloud warns about a cluster that is not running, and fails on one with
+    # no endpoint yet; the broker's gcloud prints those.
+    if not isinstance(cluster, dict) or cluster.get("status") != GET_CREDENTIALS_RUNNING_STATUS:
+        return None
+    merge_context_into_default_kubeconfig(target.context_name)
+    generated = build_kube_proxy_kubeconfig(target.context_name)
+    print(GET_CREDENTIALS_FETCHING_LINE, file=sys.stderr)
+    print(GET_CREDENTIALS_GENERATED_LINE.format(cluster=target.cluster), file=sys.stderr)
+    if implicit_destination:
+        land_implicit_kubeconfig(generated)
+    if destination is not None:
+        try:
+            _replace_file(destination, generated)
+        except OSError as exc:
+            print(f"credential proxy: could not write {destination}: {exc}", file=sys.stderr)
+            return 1
+    return 0
 
 
 def get_credentials_destination(argv: list[str]) -> tuple[list[str], Path | None]:
@@ -1686,9 +1893,11 @@ def execute(
                 "the task's cluster and project are used",
                 file=sys.stderr,
             )
+    get_credentials = False
     try:
         context = ""
         if is_get_credentials(argv):
+            get_credentials = True
             argv, destination = get_credentials_destination(argv)
             implicit_destination = destination is None
         elif argv and argv[0] in KUBECONFIG_AWARE:
@@ -1705,6 +1914,13 @@ def execute(
     except KubeconfigUnreadable as exc:
         print(f"credential proxy: {exc}", file=sys.stderr)
         return 1
+    # With the kube-api proxy in use, a get-credentials that names its cluster
+    # in full needs no broker call; a profile task's stays with the broker,
+    # which holds the task's cluster.
+    if get_credentials and not in_task:
+        answered = answer_get_credentials_locally(argv, destination, implicit_destination, endpoint)
+        if answered is not None:
+            return answered
 
     request_payload = {
         "requestId": str(uuid.uuid4()),
@@ -2087,8 +2303,11 @@ class ApiSession:
             return False
         return busy_reply_retryable(self._json_body(response))
 
-    def _get_once(self, url: str, *, params=None, timeout=None):
-        """One relayed GET, moved to the stateful broker when the exec tier cannot be reached."""
+    def _get_once(self, url: str, *, params=None, timeout=None, headers=None):
+        """One relayed GET, moved to the stateful broker when the exec tier cannot be reached.
+
+        `headers` are sent beside the caller's credential (the get-credentials
+        check's GET_CREDENTIALS_CHECK_HEADER)."""
         caller_timeout = timeout
         started = time.monotonic()
         with self._lock:
@@ -2103,7 +2322,7 @@ class ApiSession:
             return self._http.get(
                 self.relay_url(url, endpoint),
                 params=params,
-                headers=authorization_headers(),
+                headers={**authorization_headers(), **(headers or {})},
                 timeout=timeout,
             )
         except _connection_errors() as exc:
@@ -2124,7 +2343,7 @@ class ApiSession:
             left = _time_left(caller_timeout, time.monotonic() - started)
             if left is False:
                 raise
-            return self._get_once(url, params=params, timeout=left)
+            return self._get_once(url, params=params, timeout=left, headers=headers)
 
 
 def _exec_connect_bound(timeout):
@@ -2185,7 +2404,9 @@ def read_stdin_if_requested(argv: list[str]) -> str | None:
         return None
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args():
+    import argparse
+
     parser = argparse.ArgumentParser()
     # No default: a named endpoint is used as given, with no exec routing and
     # no fallback, and an unnamed one is resolved by `exec_endpoints`. Read from

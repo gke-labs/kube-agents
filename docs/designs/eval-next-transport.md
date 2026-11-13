@@ -496,8 +496,11 @@ reaches the delegation ceiling or when the wait falls back, nor a card whose exc
 transport cut before the wait began. A write from one of those that lands in a later first-phase
 unit's window is unattributed there. A second-phase unit (a requesting case, a stopped ask, a
 `writes_alone` case) runs alone and its window is marked exclusive, so the CI script archives
-every card still live before each such unit, then settles. A fence that could not run is a
-`Card fence` warning in the run log; read a block on that unit after one as transport. Parity in
+every card still live before each such unit, then settles. A fence that ran and left a card live is a
+`Card fence` warning in the run log; read a block on that unit after one as transport. A fence skipped for a missing
+prerequisite warns and the unit runs. A fence that could not run to its verdict after its attempts, no
+Ready gateway pod or an exec that did not reach the container, leaves the unit unlaunched and recorded
+as infrastructure, so no block follows it. Parity in
 [#2007](https://github.com/gke-labs/kube-agents/issues/2007) (phase 2) is this lane's record on
 `api` being acceptable per case and stable across the on-demand runs, not the api lane's numbers.
 Two things follow for the lane. A case that grades the delegation
@@ -674,9 +677,11 @@ the TASKS budget counts its workers from the first `next` render, so the mode ch
 change and the one provisioning Job is already sized for the bridge. The bridge enters the agent
 pod only once the bus is provisioned (the CR's `BusProvisioned` condition), so the agent
 Deployment rolls twice, once for the mode change and once after the Job for the bridge, and the
-step gates both rolls. The step ends on the
+step gates both rolls. The step waits for the
 bridge's own log line that it is consuming `platform` tasks, because a flip without a consuming
-bridge leaves a bus on which nobody answers. It reports the A2A gateway's state and last log
+bridge leaves a bus on which nobody answers, then gates the verifier's rollout and the web
+console under `next` (the same read routes and chat turn the deploy gated under `today`, through
+the console's port-forward). It reports the A2A gateway's state and last log
 lines and does not gate on it: the door gives the gateway the backend it lacked, so it now
 starts, but a gateway that is down is what the harness classifies as infrastructure on every
 case, and gating it is the change that follows the first measured run through the door. The
@@ -696,7 +701,10 @@ lane's exclusion list (`hack/eval/inject-lane-exclusions.txt`, keyed on `AGENT_T
 than on this flag) leaves out the cases whose premise needs the chat front door, and its mirror
 (`hack/eval/api-lane-exclusions.txt`) keeps the cases only the door can carry off every other
 lane; the deploy also arms the card stop (`A2A_CARD_STOP`) on the install, which those cases
-grade. The lane safeguards (`hack/eval/inject-lane-safeguards.yaml`) hang off neither the flag
+grade, and turns on the gateway's A2A door (`A2A_AGENT_DOOR`) for the card-wait stopped ask, which
+cancels a door task while its turn holds for its cards. The script exports that door's own token
+(`AGENT_A2A_DOOR_TOKEN`) beside the inject one. An eval install therefore runs with a door a
+default install doesn't have. The lane safeguards (`hack/eval/inject-lane-safeguards.yaml`) hang off neither the flag
 nor the transport: on both lanes they are appended to a scratch copy of every remaining task
 file, which the unit hands devops-bench, over the leased project's GitOps repository exported as
 `BENCH_GITOPS_REPO` (the run refuses to start without one), with the cases that request a pull
@@ -714,8 +722,10 @@ since nobody reads the report there and the today lane below proves the same pat
 and back to `next`, with any CR-declared `spec.deployment.sidecars` unset before the first flip
 and declared again after the second (the lane declares none: the bridge the operator renders
 leaves and returns with the mode), and asserts that the JetStream PVC and the bus creds Secret keep their
-UIDs, that the agent answers a turn under `today`, and that a task completes over the bus
-afterwards. It is reported, not gated: its own section of the log and two artifacts
+UIDs, that the agent answers a turn under `today`, that a task completes over the bus
+afterwards, and, before the first flip and after each leg, that the web console's read routes
+answer and a chat turn through it gets a reply (a `SKIP` on an install with no console, which the
+lane always has). It is reported, not gated: its own section of the log and two artifacts
 (`rollback-roundtrip.log`, `rollback-roundtrip.txt`), no case in the matrix, and no effect
 on the job's exit status. It is skipped when the job is too old for its one-hour bound to end
 inside the job's deadline, counted from its Prow `BUILD_ID` or, when that gives no start, from

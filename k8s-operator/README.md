@@ -79,11 +79,12 @@ images and downloading dependencies.
 The two scripts handle the unset case differently. `dev_rebuild_agent.sh` takes the default pool's
 default machine (2 vCPUs), while `hack/ci-deploy.sh` requests `e2-highcpu-8` because it compiles the
 first-party images (platform, credential-proxy, sandbox, operator, on a pull request's path the
-two AgentPlugin images, and under `EVAL_MODE_NEXT=1` the A2A images and the Hermes bridge) in a
-single Cloud Build
+two AgentPlugin images and the web console, and under `EVAL_MODE_NEXT=1` the A2A images and the
+Hermes bridge) in a single Cloud Build
 submission ([`deploy/docker/cloudbuild-ci.yaml`](../deploy/docker/cloudbuild-ci.yaml)), with the
-sandbox, operator and AgentPlugin builds running in parallel alongside the platform-agent and
-credential-proxy builds. Because private worker pools define their own fixed machine types and
+sandbox, operator, AgentPlugin and web console builds running in parallel alongside the
+platform-agent and credential-proxy builds (the web console waits for the A2A step, which exits at
+once on a today lane). Because private worker pools define their own fixed machine types and
 reject
 `--machine-type`, `hack/ci-deploy.sh` only passes `--machine-type` when `CLOUD_BUILD_WORKER_POOL`
 is unset.
@@ -93,7 +94,7 @@ is unset.
 ## Local Development (Fast Iteration)
 
 The operator is a standard Kubebuilder project; `make help` lists every target. `make manifests`
-writes to `config/crd/bases/`, `config/rbac/` and `config/webhook/`, then regenerates the three CRD
+writes to `config/crd/bases/`, `config/rbac/` and `config/webhook/`, then regenerates the CRD
 field reference pages under `docs/site/src/content/docs/operator/` from the API types (it needs
 `python3` and exits with an error without it), and `make test` downloads the envtest binaries to
 `bin/` on first run. `make test` also runs the event watcher's fleet soak, ten fake clusters watched
@@ -354,14 +355,21 @@ When modifying or deprecating RBAC roles or rolebindings in the operator:
    ServiceAccount and deletes any non-canonical `kubeagents*` binding.
 3. **Sync controller RBAC annotations:** make sure the `// +kubebuilder:rbac` markers on the
    reconciler include every permission the operator itself needs to grant or clean up, then run
-   `make manifests` to regenerate `config/rbac/role.yaml`.
+   `make manifests` to regenerate `config/rbac/role.yaml`. A marker that carries `namespace=`
+   renders as the Role document in that file (bound by `namespaced_role_binding.yaml`) rather
+   than into the ClusterRole; the Secret write verbs are the one such marker, and
+   `tests/test_operator_secrets_grant.py` refuses them anywhere else. Add the verbs to
+   `requiredPermissions` in `rbac_selfcheck.go` too, with `Namespaced: true` for a namespaced
+   marker, then `make chart-sync` to copy both documents into the chart. Which other write verbs
+   can leave the ClusterRole for a namespaced grant, and in what object, is
+   [`docs/designs/operator-namespaced-write-verbs.md`](../docs/designs/operator-namespaced-write-verbs.md).
 
 ---
 
 ## Formatting and CI
 
 `prettier.yml` enforces Markdown and YAML formatting (`**/*.{md,yaml,yml}`) in CI; the local
-targets are under `make help`. The workflows that exercise this directory: `k8s-operator-test.yml` runs `make test`, `docker-publish-ghcr.yml` publishes the manager
+targets are under `make help`. The workflows that exercise this directory: `k8s-operator-test.yml` runs gosec and then `make test`, `docker-publish-ghcr.yml` publishes the manager
 image alongside the agent images, and `e2e-gchat-test.yml` is the end-to-end Google Chat test.
 
 ---

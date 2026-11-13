@@ -687,6 +687,15 @@ delegation-ceiling condition above: DEGRADED under its own name, its own
 message and advice, so a fleet-wide worker stall (#1879) is named here rather
 than read only as "not evaluated" on every pull request.
 
+A repetition graded `infra` under a reason that leads with
+`KUBE_AGENTS_FORGE_UNAVAILABLE` is a forge repetition: every check that errored
+did so because a forge read failed for a while during grading (a 5xx, a dropped
+connection, a GitHub rate limit on grading's own token). It is not a storm
+repetition either, so the storm rule and the pass-rate denominators leave it
+out, and a case whose ungraded repetitions are of this kind, with no storm
+repetition, is classed `forge-unavailable` on the run page (its Do is a
+retest).
+
 Three other shapes get a comment, each one line with the same marker and
 dedupe. A run the suite marked **not evaluated** — an admitted case, or every
 case, lost every repetition to infrastructure, so `hack/ci-eval-pr.sh` exited
@@ -708,7 +717,14 @@ link has the list), and that nothing about the change is implied:
 Ran 27 min · build log
 ```
 
-When every recorded case was lost the box says so. While `health.json`'s
+When every lost case lost its checks to a forge read that failed during
+grading, the box names that stage instead ("a forge read failed during
+grading, so the checks that read it could not be evaluated"), and when every
+lost case hit the delegation ceiling it says delegated work was still running
+when the harness stopped waiting: the agent ran in both. A mix of the two says
+the agent ran but the harness could not grade the result; any other mix keeps
+the wording above. Beside any of these three stages the storm line below, and its link to the
+brief, are left out, so they cannot read as their cause. When every recorded case was lost the box says so. While `health.json`'s
 condition is `storm` it adds "a quota storm is declared on the gate right
 now" and links the brief, with no case names in the link. A gate case that
 went red on the same run (the dashboard's roster can be newer than the
@@ -758,7 +774,9 @@ commented on is never commented on twice. The watermark and the comment ids
 live in `gate-comment-state.json` beside `health.json`; a first tick with no
 state looks back one hour. Posting uses the workflow's own `GITHUB_TOKEN`
 through `gh api` (the job holds `pull-requests: write` and `issues: write` for
-this, the tracking issue, the nightly bug and the coverage-gap issue). A failure to post is a warning; the run is
+this; the tracking issue, the nightly bug and the coverage-gap issue post with
+the issues repository's token when `KUBE_AGENTS_ISSUES_REPO` is set, the
+pull-request comment always with the workflow's own). A failure to post is a warning; the run is
 retried next tick and the job never reds for it. `--dry-run` prints the
 comments instead.
 
@@ -769,9 +787,16 @@ none for the failing cases, and no open issue, whatever its labels, names
 every failing case in its title or body — the poster files one, labelled
 `presubmit-gate`: `Smoke gate outage since Sun 7:30 AM ET`, with the window,
 the class and the incident brief link, and the line "Filed automatically by
-the smoke health bot; edit freely. Fix PRs: reference this issue." The issue
-names no failing case and quotes no evidence line: the repository is public,
-and both are on the brief it links; its first line is a hidden marker
+the smoke health bot; edit freely. Fix PRs: reference this issue." It is filed
+in the repository the variable `KUBE_AGENTS_ISSUES_REPO` names (this one while
+the variable is unset; set, the workflow mints the token from the secrets
+`ISSUES_APP_ID` and `ISSUES_APP_PRIVATE_KEY`, a GitHub App installed on that
+one repository with Issues: write), as are the nightly and coverage issues;
+human-filed issues are adopted from the issues repository only. A reference
+to this repository's issue is written `#NNN`, one to the issues repository's
+as its full URL, so it resolves wherever it is read. The issue
+names no failing case and quotes no evidence line: the rule holds whichever
+repository is set, and both are on the brief it links; its first line is a hidden marker
 carrying the case ids, by which the bot re-finds its own issue. A human's issue that already names the cases is
 adopted instead and labelled `presubmit-gate`. One rule for a title: any open
 issue. One rule for a body: a `presubmit-gate` issue, or an unlabelled one
@@ -780,7 +805,7 @@ whose body also carries a word the condition's own evidence uses ("drift" or
 issue that mentions a role or node in passing is not the tracker; case names
 never match an unlabelled body, since a roster tracker lists them all. The
 bot's own `nightly-red` issues, and its coverage-gap issues (the
-`kube-agents-bot:coverage-gap` marker, [Coverage gaps](#coverage-gaps)), are never adopted. The Chat message then reads `Tracking #NNN`, the issue rides
+`kube-agents-bot:coverage-gap` marker, [Coverage gaps](#coverage-gaps)), are never adopted. The Chat message then reads `Tracking #NNN` (`#NNN` for this repository's issues, the full URL for the issues repository's; so below), the issue rides
 in `health-state.json` and in `health.json`'s `issue` field (`{number, url, condition}`,
 `null` outside an incident; `health.py` reads it back through
 `--posted-state`), and the recovery comments on it: "Healthy again after Xh;
@@ -792,6 +817,12 @@ to a storm or to lost pods before it clears still gets its recovery comment,
 and the recovery message names the ones still carried. A recovery comment or
 close that did not land, or an issue the bot could not read that tick, rides
 on past GREEN and is retried each tick until it does.
+Set `KUBE_AGENTS_ISSUES_REPO` mid-episode and the issue the bot already filed
+here is still commented on and closed: the issue steps carry the workflow's
+own token as `SOURCE_GH_TOKEN` beside the minted one, and a call that
+addresses this repository uses it. Unsetting it mid-episode has no such
+fallback (the issues repository's token is minted only while it is set); an
+issue carried there is then closed by hand.
 
 Each tick re-reads every carried issue. One a human closed is dropped rather
 than cited; if its condition still fires (`health.json`'s `open_conditions`,
@@ -817,7 +848,7 @@ count), with the nodes and how many runs each lost, the window, the affected
 pull requests, the evidence, the advice for authors, and the line "Filed
 automatically by the smoke health bot; the cluster owner should check the node
 events and autorepair; the bot closes it when the condition clears." An open issue that already
-names every lost node is adopted instead. The Chat message
+names every lost node is adopted instead, from the issues repository. The Chat message
 reads `Tracking #NNN`; the issue rides in the state the same way and is filed
 once per event. Each issue records the condition it was filed for (`{number,
 url, condition}`): an outage's issue is never cited as the lost pods' tracking,
@@ -837,7 +868,7 @@ names the job and quotes the evidence, which mentions deadline kills whenever
 one sits in the window; "kill" rather than "smoke" so a feature request about
 the gate's deadline is not; and the label, because the pair has no identifier
 and a bug report about the `deadline-kill` classifier would otherwise be the
-tracker. The Chat message reads `Tracking #NNN`, the issue
+tracker. The Chat message reads `Tracking #NNN` (the issue's URL when it is in the issues repository), the issue
 rides in the state the same way, and the recovery comments on it.
 
 The four infrastructure shapes (`lost_pods`, `fixture_drift`, `pool_drift`,
@@ -854,7 +885,10 @@ write (a timeout, a 5xx, a 403) files nothing that tick.
 
 `scripts/eval_dashboard/nightly_bugs.py` files an issue for a case that failed
 every graded repetition on its last 3 graded nightly nights, and comments on it
-once when the case is clear again. It runs every tick before the
+once when the case is clear again. It files in the repository
+`KUBE_AGENTS_ISSUES_REPO` names (this one while unset; [The tracking
+issue](#the-tracking-issue)), and a human's issue is adopted from that
+repository only. It runs every tick before the
 post, on the same `data.json`, so the digest's nightly section sees the issues
 it filed that tick; the step is capped at 3 minutes so a slow GitHub cannot
 hold the post past the job's timeout.
@@ -922,6 +956,32 @@ repetition on a graded night after its last failing one, and that night
 finished after the issue was opened, the bot comments with that night's run link, keyed on the night so it comments once per recovery. It
 never closes an issue; the triager does.
 
+When one change breaks many cases, they get one issue. Before filing, the
+cases that would each file are grouped by the night their current run of red
+nights began and a check that every graded failing repetition of that run
+names (read from the grading line's tripped safeguards, or the failed checks
+after a low score). Three or more cases on one such key file one issue in
+place of one each, labelled `nightly-red`, each case's `domain:<slug>` and
+`needs-triage`, and listing each case's nights as a per-case issue does. It goes to the
+domain's `owner:` when the cases share a domain, and to `infra_owner` in
+`domains.yaml` when they span domains, with each case's effective owner
+@-mentioned. The issue carries every case's marker, so the dedupe treats it as each
+case's issue (matched on those markers alone, never on a case named in its
+text); a triager who
+deletes a case's marker line splits that case off, and it files on its own if
+it stays red. Once every case it names has a recovery night after the issue
+opened (or, once a case's red nights have left the 14-night window, a pass
+after the issue opened), the bot comments once, listing each case's clear
+night; a group issue gets no per-case recovery comment. A part
+that graded nothing that night (no project, a setup death) is skipped, as for
+one case, so it does not count as clear. A case that reaches 3 red nights a
+tick after its group was filed files on its own. The issue names no check: the
+check is used to group and stays on the dashboard. Three, not two: two cases
+sharing a check from one night are often a probe and its audit in one domain,
+one owner either way, and three unrelated cases breaking the same check the
+same night are rarely a coincidence. On 2026-11-09 one grader change (#4973)
+filed ten per-case issues to five owners.
+
 Two infrastructure shapes file an issue labelled `nightly-red`, `Infra` and
 `needs-triage` instead of a domain label, assigned to `infra_owner` in
 `domains.yaml` with `infra_backup` mentioned (`nightly_infra.py` holds the
@@ -974,6 +1034,80 @@ coverage-gap filer with it ([Coverage gaps](#coverage-gaps));
 `CI_HEALTH_MUTE=true` disarms it again with every other write. Locally,
 `python3 scripts/eval_dashboard/nightly_bugs.py --data data.json` is a dry run
 against any `data.json`; `--live` writes.
+
+## Nightly triage
+
+`scripts/eval_dashboard/nightly_triage.py` puts a model between the filer and
+a person, so the assignee gets a bug that is really theirs. The filer routes by
+who owns the case, which is the wrong person whenever the case is not at fault:
+on 2026-11-09, ten issues for one grader change went to five case owners, and
+each diagnosed it separately.
+
+Armed, the filer files a domain or group bug (not an infra issue) unassigned,
+labelled `triage:pending`, with every @-mention in its body written as code so
+the filing notifies no one, and a `kube-agents-bot:triage-pending` marker
+naming who its own rule would assign and mention. The `nightly-triage` job runs
+after each tick and handles at most 5 such issues, oldest first, in two steps
+with two identities:
+
+- **Gather**, as the archive reader (`github-actions@kube-agents-prow`): from
+  `data.json`, each case's last green and first red nightly commits and every
+  failing repetition's grading line on its red nights; the tail of up to three
+  transcripts from the nightly's private bucket; `git log` between those
+  commits on a full-history checkout, with each pull request's title and author
+  from GitHub; and the candidate fixes, open pull requests touching the same
+  files and commits on those files merged since the first red night. It writes
+  only to the runner's disk.
+- **Route**, as the publisher (`CI_HEALTH_SA`): one call to Gemini on Vertex AI
+  through the job's Workload Identity, model `NIGHTLY_TRIAGE_MODEL`
+  (`gemini-4-argon` unless the repository variable names another), billed to
+  `NIGHTLY_TRIAGE_PROJECT` (`kube-agents-prow` unless set). The prompt is
+  capped at 60,000 tokens (transcripts are cut first, then the oldest commits,
+  then grading lines) and the answer at 16,384, thinking included. The model returns a
+  classification, a suspected pull request, an open or merged fix, a priority
+  and a confidence. A pull request outside the commit window, or a fix outside
+  the candidates, is set aside rather than trusted.
+
+| Verdict                                                                    | Assigned to                                 |
+| -------------------------------------------------------------------------- | ------------------------------------------- |
+| Product bug or grader/harness, with a suspected pull request in the window | that pull request's author                  |
+| Grader/harness, no suspected pull request                                  | `infra_owner` in `domains.yaml`             |
+| Infra                                                                      | `infra_owner`                               |
+| Case needs rework, low confidence, or no verdict                           | the filer's rule (case owner, domain owner) |
+
+The first login GitHub accepts is assigned, the rule's logins behind it; a
+person without access to the issues repository is not assignable there, and
+the issue falls to the rule. The job then posts one comment on the issue with
+the verdict, the evidence, the suspected pull request and the fix (linked in
+full, since pull requests live in this repository), @-mentions the people the
+filer would have, swaps `triage:pending` for `triage:agent`, and marks the body
+`triage-done`. The comment goes only to the issues repository
+(`KUBE_AGENTS_ISSUES_REPO`, private), so it names cases and quotes grading
+lines; the job log carries issue numbers, pull request numbers and logins only.
+
+A model call that fails, times out, stops at its token cap or answers off the
+schema routes by the filer's rule, and the comment says so in one line. An
+issue whose evidence was not gathered waits for the next tick; one still
+waiting two hours after it was filed is routed by the rule without a model
+call, by the job or, when the job fails before routing, by a step of the tick
+itself. A failed GitHub write leaves the issue pending, and the next tick
+resumes it without another model call: an assignee already set is kept, and a
+comment already posted is not posted again. The body is marked done on a fresh
+read and the labels are added and removed one by one, so an edit a person made
+meanwhile stays. The filer files for triage only into a separate issues
+repository, the route step writes to no other, and the job's own token holds
+no issue write.
+
+Unarmed, the job dry-runs on the issues the filer filed that tick (which the
+filer assigned as before) and prints what it would assign; a manual run of the
+workflow with `triage_issues` set to issue numbers of the issues repository
+does the same for those issues. Setting the repository variable
+`NIGHTLY_TRIAGE_LIVE=true` arms it, together with `NIGHTLY_BUGS_LIVE=true`;
+`CI_HEALTH_MUTE=true` disarms both. Switched off while issues still wait,
+the tick routes each by the rule without a model call. The call needs
+`roles/aiplatform.user` for `CI_HEALTH_SA` on `NIGHTLY_TRIAGE_PROJECT`, with
+the Vertex AI API enabled there; until then every call fails and every issue
+goes by the rule.
 
 ## The nightly section
 
@@ -1071,7 +1205,7 @@ night started in the last 36 hours, last night's run or any main shard
 (main, or main-b to main-e) still running or missing, no GitHub token, the issues unreadable or their
 listing not trusted (GraphQL disagreed on every read, as for the filer), pyyaml missing, a count that does not
 add up, or a link that is not a well-formed `https` URL (an issue link must
-point into this repository). Links are checked for form, not fetched: the
+point into the issues repository). Links are checked for form, not fetched: the
 dashboard's links sit behind a Google login a fetch from the job cannot pass.
 It never posts partial numbers.
 
@@ -1079,7 +1213,9 @@ It never posts partial numbers.
 
 `scripts/eval_dashboard/coverage_gaps.py` keeps one issue open for each domain
 in [`docs/designs/domains.yaml`](designs/domains.yaml) that has no blocking
-presubmit seat, and closes it when the domain has one again. A domain is
+presubmit seat, and closes it when the domain has one again; the issue lives
+in the repository `KUBE_AGENTS_ISSUES_REPO` names (this one while unset;
+[The tracking issue](#the-tracking-issue)). A domain is
 covered when a case on `hack/eval/blocking-roster.txt` claims it with
 `domain:` and carries a non-empty `verification_spec`; the step and
 `scripts/test_domain_coverage.py` both read coverage through
@@ -1115,7 +1251,7 @@ store says at the current next-mode version key (the mode the main nightly grade
 `collecting` with the runs still needed for a full window, `cut` (the read left
 older records at that key behind), or that it holds no record there. Candidates are ranked store `would-admit` first, then meeting the
 bar, then by pass rate. The issue's table names the candidates in that order
-and nothing more, since the repository is public; the records behind it are
+and nothing more, whichever repository is set; the records behind it are
 on the domain scorecard (`cases.html#view=domains`), and the Chat digest line
 carries the best candidate's. The body is edited in place when any of this changes,
 about once a day; its assignees are never touched, and the assignment line of an
@@ -1156,7 +1292,8 @@ reads no GitHub.
 
 It runs dry until armed, on the nightly bug filer's switch: `NIGHTLY_BUGS_LIVE=true`
 arms it, `CI_HEALTH_MUTE=true` disarms it, and it has no variable of its own. It
-writes with the job's token under the `issues: write` the job already holds.
+writes with the job's token under the `issues: write` the job already holds,
+or with the issues repository's token when `KUBE_AGENTS_ISSUES_REPO` is set.
 It opens no roster pull request: the job holds no branch write path, and the
 eval crew approves every roster line. Locally,
 `python3 scripts/eval_dashboard/coverage_gaps.py --data data.json [--store store.json]`
@@ -1369,10 +1506,12 @@ the adjudicator can ask "drifted last scan too?" from one file.
 read-only account, `seeded-fleet-reader@<project>.iam.gserviceaccount.com`
 (`bench/tf/fleet`): `CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT` makes gcloud
 impersonate it for the cluster listing, the credentials, the control-plane
-describes and the `gcloud compute instances list` and `gcloud compute
-firewall-rules list` reads of the project-scoped roles (`startup-fail-vm` and
+describes and the `gcloud compute instances list`, `gcloud compute
+firewall-rules list` and `gcloud compute instances get-serial-port-output`
+reads of the project-scoped roles (`startup-fail-vm` and
 `world-open-ingress`, which have no cluster slot; the account holds
-`roles/compute.viewer` for them), and `FLEET_READONLY_SA` makes the runner
+`roles/compute.viewer` for them, which includes
+`compute.instances.getSerialPortOutput`), and `FLEET_READONLY_SA` makes the runner
 rewrite each kubeconfig so `kubectl`'s token is minted as it too. The bot,
 `eval-dashboard-publisher@kube-agents-prow`, therefore needs exactly one grant
 per pool project — `roles/iam.serviceAccountTokenCreator` on that account, the
@@ -1431,7 +1570,7 @@ how many projects it could read, every project's drifted roles, and the
 other: one Chat message naming the roles and how many projects, that a red on
 a case depending on them from a run in those projects is the fixture and not
 the code, that a retest waits for the re-apply, and `Tracking
-#NNN`; the gate comment's health box carries the same sentence on a red run
+#NNN` (the issue's URL when it is in the issues repository); the gate comment's health box carries the same sentence on a red run
 while the condition lasts; the 11 AM digest always carries one line on the
 latest scan (`🧭 Seeded fleet: 30 of 30 pool projects checked at 8:00 AM ET,
 every fixture in its designed state`, or how many fixtures are absent on how
@@ -1451,7 +1590,9 @@ message and the health box's advice say that the pool is below that margin and i
 `bench/tf/fleet/main.tf` is the fix, rolling project by project if a size change has just
 merged, beside the re-apply line when a planted role drifts too, and the issue carries the
 same exception beside the re-apply paragraph, since a re-apply of a stack that is already
-applied changes nothing; and when every drift line on the incident is one no re-apply clears,
+applied changes nothing; a `startup-fail-vm` line reading `serial_contains`, the VM's
+failure line gone from its serial buffer, is cleared by the re-apply too, because the
+reconcile resets the VM after each project; and when every drift line on the incident is one no re-apply clears,
 keyed on its assertion rather than its role, the Chat message and the health box's advice say
 so and name the remedy instead: an `age_hours_ge` line, seeded-c's `createTime` under the
 24-hour age gate, clears itself at `createTime` plus 24 hours and the advice gives that time
@@ -1463,7 +1604,7 @@ project whose only drift is these) — and the
 line "Filed automatically by the smoke health bot; the daily reconcile re-applies
 the stack in the projects named, and the bot comments here when a scan reads
 them healthy; the bot closes it when the condition clears." An open issue that already names
-every drifted role is adopted instead. The recovery comments on it as on any
+every drifted role is adopted instead, from the issues repository. The recovery comments on it as on any
 other.
 The daily `ci-kube-agents-fleet-reconcile-daily` run re-applies the stack in
 the projects the scan names (`docs/ci-pool-projects.md` §6.2) at 08:30 UTC, and the
@@ -1491,7 +1632,7 @@ scan, every hour, `scripts/eval_dashboard/pool_state.py` runs
 against every pool project, eight at a time, and publishes
 `gs://kube-agents-dashboards/evals/pool-state.json` beside `fixture-state.json`.
 The verifier is the one implementation; the scan runs it and reads its report.
-`forge_pieces` reads the once-per-project pieces a self-managed forge VM needs (the private zone, the two reserved addresses and their records, the 443 allow rule and the deny rule on the tag, each held to its shape, the VM identity; `docs/ci-pool-projects.md` 5.8); its findings pass every leased run on the public lanes, so the bot's pool-drift advice does not blame them. `gemini_api_key` reads the eval nightlies' Gemini Developer API key, its secret and the runners' grants on it (`docs/ci-pool-projects.md` section 3); its findings red the runs that lease the project and export `MODEL_PROVIDER=gemini` (the five eval nightlies, `post-kube-agents-eval-rc` and the two Argon smoke presubmits; `pull-kube-agents-smoke-test-claude`, `pull-kube-agents-smoke-test-flash` and the forge smoke variants stay on Vertex AI and do not read the key). `gitops_default_branch` is the one GitHub read: the project's private `*-infra` repository must default to `main` (a default left on an agent branch makes every rca write a no-op; the finding is `gitops/default-branch`, the repair the `gh api -X PATCH` that moves it back, run by an owner of gke-agentic because the field needs repository admin), read with the credential the job's `GITOPS_METADATA_READ_TOKEN` secret puts in `GH_TOKEN` and "not checked" with that reason while the secret is unset.
+`forge_pieces` reads the once-per-project pieces a self-managed forge VM needs (the private zone, the two reserved addresses and their records, the 443 allow rule and the deny rule on the tag, each held to its shape, the VM identity; `docs/ci-pool-projects.md` 5.8); its findings pass every leased run on the public lanes, so the bot's pool-drift advice does not blame them. `gemini_api_key` reads the eval nightlies' Gemini Developer API key, its secret and the runners' grants on it (`docs/ci-pool-projects.md` section 3); its findings red the runs that lease the project with provider `gemini` in their eval-model pair (`docs/ci-pool-projects.md` 5.10); a lane whose pair names `vertex_ai` does not read the key. `gitops_default_branch` is the one GitHub read: the project's private `*-infra` repository must default to `main` (a default left on an agent branch makes every rca write a no-op; the finding is `gitops/default-branch`, the repair the `gh api -X PATCH` that moves it back, run by an owner of gke-agentic because the field needs repository admin), read with the credential the job's `GITOPS_METADATA_READ_TOKEN` secret puts in `GH_TOKEN` and "not checked" with that reason while the secret is unset.
 
 The secret is a fine-grained personal access token: resource owner `gke-agentic`, repository access the pool's `*-infra` repositories picked one by one (a fine-grained token has no wildcard, so a new pool project's repository is added to the token's list before the project is registered, as `docs/ci-pool-projects.md` 5.4 does for the ledger App's installation), permission Repository -> Metadata: read-only and nothing else, expiry one year at most. Whoever creates it records their name and the expiry date here: held by _(unset)_, expires _(unset)_. Its expiry is silent by design: the check goes "not checked" on every project and the hourly digest reads "35 checks not read in full", with no alert and no issue, so the owner puts the renewal on a calendar. The durable form is the one 5.4 chose for the ledger read, a third App holding Metadata: read-only on the selected repositories, its PEM as the repository secret and `actions/create-github-app-token` in the step exporting `GH_TOKEN`; the verifier reads only `GH_TOKEN`, so that swap is a workflow-step and docs change.
 Left out: the fleet fixtures (the fleet scan reads those), the warm-cache reader grants in the Prow project (`warm_cache`), the other GitHub-reading checks
@@ -1580,7 +1721,7 @@ extra role is drift like a missing one.
 
 **What it posts.** One Chat message naming the findings and how many projects,
 that a 403 from a run that leased one of them is the pool's and not the change's,
-and `Tracking #NNN`; one digest line on the latest scan; a `presubmit-gate` issue
+and `Tracking #NNN` (the issue's URL when it is in the issues repository); one digest line on the latest scan; a `presubmit-gate` issue
 for whoever holds the pool with, per project, what was observed and the exact
 command that repairs it. An open issue whose title names every finding is adopted
 instead (title only: every bot-filed body quotes the evidence, which carries the
@@ -1681,6 +1822,11 @@ sent stays sent. The dashboard is unaffected — the pool episode's start rides
 in `health.json`, which is written every tick, not in the state file.
 An incoming-webhook URL in Secret Manager
 (`ci-health-chat-webhook`, `kube-agents-prow`) is the optional alternative.
+The repository variable `KUBE_AGENTS_ISSUES_REPO` (optional) names the
+repository the issue filers write to, and the repository secrets
+`ISSUES_APP_ID` and `ISSUES_APP_PRIVATE_KEY` the GitHub App that writes there
+([The tracking issue](#the-tracking-issue)).
+
 The repository secret `CI_HEALTH_CHAT_MENTIONS` (optional) maps GitHub logins
 to Chat user ids for the digest's mentions ([The nightly
 section](#the-nightly-section)).

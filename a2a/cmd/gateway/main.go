@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -40,6 +41,14 @@ const (
 	// not start leaves, whichever step refused it.
 	metricsUnavailableAlert = "ALERT metrics listener unavailable; the gateway serves no /metrics and no /readyz until it restarts, so the pod never reads Ready and the PlatformAgent stays Provisioning; conversations are unaffected"
 )
+
+// terminationLogPath is the kubelet's default terminationMessagePath.
+var terminationLogPath = "/dev/termination-log"
+
+// terminationLogMode is the termination message's file mode: owner-only,
+// as gosec's G306 asks. The kubelet reads the file through its host-side
+// mount, not as the container's user, so it still reads it.
+const terminationLogMode = 0o600
 
 func main() {
 	os.Exit(run())
@@ -153,8 +162,8 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 	// carries a token if it is armed at all.
 	backend := cfg.Backend()
 	// One set of counters for the whole process: the gateway counts what it
-	// relays, the Chat adapter counts its pulls, and the metrics listener
-	// serves both (gateway/metrics.go).
+	// relays, the Chat adapter counts its pulls, the Slack adapter reports its
+	// connection, and the metrics listener serves them all (gateway/metrics.go).
 	metrics := gateway.NewMetrics()
 	var adapter gateway.Adapter
 	switch backend {
@@ -171,6 +180,10 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		if err == nil {
 			// The allowlist's T…:U… entries: other workspaces' members it serves.
 			sl.SetAllowedGuests(cfg.SlackAllowedUsers)
+			sl.SetMetrics(metrics)
+			// End-to-end test users, meant for CI and eval installs; the
+			// allowlist still decides who is served.
+			sl.SetTestUsers(cfg.SlackTestUsers)
 			adapter = sl
 		}
 	case "":
@@ -245,6 +258,7 @@ func realMain(ctx context.Context, log *slog.Logger) error {
 		log.Error("gateway", "err", err)
 		return err
 	}
+	armResolvedScope(cfg, gw, log)
 	// lead is all of the gateway's work: the chat.notify routes and Run.
 	// Under the election it runs only while this replica holds the lease.
 	lead := func(ctx context.Context, opts gateway.RunOptions) error {
@@ -395,6 +409,29 @@ func chatNotifier(cfg *gateway.Config, backend gateway.Adapter, conversations fu
 	return n
 }
 
+// armResolvedScope points the profile-route scope check at the scope
+// publisher's ConfigMap (Config.ResolvedScopeConfigMap), read with the pod's
+// own ServiceAccount, whose Role allows get on that one name. Without it, or
+// when the client cannot be built, a target only a resolution can confirm is
+// refused as unconfirmed.
+func armResolvedScope(cfg *gateway.Config, gw *gateway.Gateway, log *slog.Logger) {
+	if cfg.ResolvedScopeConfigMap == "" {
+		return
+	}
+	rc, err := rest.InClusterConfig()
+	if err != nil {
+		log.Error("resolved scope not armed: no in-cluster config", "err", err)
+		return
+	}
+	cs, err := kubernetes.NewForConfig(rc)
+	if err != nil {
+		log.Error("resolved scope not armed: no Kubernetes client", "err", err)
+		return
+	}
+	gw.SetResolvedScope(cs, cfg.Namespace, cfg.ResolvedScopeConfigMap)
+	log.Info("resolved scope armed", "configmap", cfg.ResolvedScopeConfigMap)
+}
+
 // armHomeLearn lets a Slack gateway learn its home channel from the first
 // admitted channel mention and record it (gateway/slack_home_channel.go), when
 // the operator armed it (Config.HomeLearnArmed), and points the notify route
@@ -451,6 +488,14 @@ func runNotifier(ctx context.Context, n *gateway.Notifier, client *lib.Client) f
 func serve(ctx context.Context, cfg *gateway.Config, metrics *gateway.Metrics, readiness func() (bool, string), log *slog.Logger, run func(context.Context) error) error {
 	startMetricsListener(ctx, cfg, metrics, readiness, log)
 	if err := run(ctx); err != nil && ctx.Err() == nil {
+		if errors.Is(err, gateway.ErrTermBusLost) {
+			// A restart that kubectl describe can explain: the kubelet shows
+			// the termination message as the last state's message.
+			msg := "ErrTermBusLost: " + err.Error() + "; the lease is released and the restarted container stands by"
+			log.Error("gateway exited: the bus was down mid-term (ErrTermBusLost)", "err", err)
+			_ = os.WriteFile(terminationLogPath, []byte(msg), terminationLogMode)
+			return err
+		}
 		log.Error("gateway exited", "err", err)
 		return err
 	}

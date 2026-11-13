@@ -926,8 +926,8 @@ func TestBuildDeployment(t *testing.T) {
 	if fbContainer.Name != "fluent-bit" {
 		t.Errorf("expected container name fluent-bit, got %s", fbContainer.Name)
 	}
-	if fbContainer.Image != "fluent/fluent-bit:5.1.2" {
-		t.Errorf("expected fluent-bit image fluent/fluent-bit:5.1.2, got %s", fbContainer.Image)
+	if fbContainer.Image != "fluent/fluent-bit:5.1.5" {
+		t.Errorf("expected fluent-bit image fluent/fluent-bit:5.1.5, got %s", fbContainer.Image)
 	}
 	if fbContainer.SecurityContext == nil || fbContainer.SecurityContext.ReadOnlyRootFilesystem == nil || !*fbContainer.SecurityContext.ReadOnlyRootFilesystem {
 		t.Errorf("expected SecurityContext.ReadOnlyRootFilesystem true on fluent-bit container")
@@ -1542,6 +1542,47 @@ func TestSafeSandboxEnvOverridesPassesRosterSummaryThreshold(t *testing.T) {
 	}
 }
 
+// The earned-autonomy switches reach the agent through the managed .env only,
+// every one on every render: a switch left out because it is off is one the
+// agent could turn on with a line in the PVC .env, which Hermes applies over
+// the container env. kubeagents_switches.py reads the managed file.
+func TestManagedEnvPinsTheAutonomySwitches(t *testing.T) {
+	switches := func(agent *agentv1alpha1.PlatformAgent) map[string]string {
+		got := map[string]string{}
+		for _, line := range strings.Split(renderManagedEnv(agent), "\n") {
+			for _, name := range autonomySwitchNames {
+				if value, ok := strings.CutPrefix(line, name+"="); ok {
+					if _, dup := got[name]; dup {
+						t.Errorf("%s is pinned twice in the managed .env", name)
+					}
+					got[name] = value
+				}
+			}
+		}
+		return got
+	}
+	agent := shellSandboxTestAgent()
+	want := map[string]string{envPostMergeCheck: "off", envAutomerge: "off", envDial: "off"}
+	if got := switches(agent); !maps.Equal(got, want) {
+		t.Errorf("managed .env switches with none set = %v, want %v", got, want)
+	}
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Env: []corev1.EnvVar{
+		{Name: envPostMergeCheck, Value: " Report "},
+		{Name: envAutomerge, Value: "on\nKUBEAGENTS_DIAL=on"},
+		{Name: envDial, ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{Key: "k"}}},
+	}}
+	want = map[string]string{envPostMergeCheck: "report", envAutomerge: "off", envDial: "off"}
+	if got := switches(agent); !maps.Equal(got, want) {
+		t.Errorf("managed .env switches = %v, want %v", got, want)
+	}
+	// One delivery path, as for the mode: the container env does not carry them.
+	for _, name := range autonomySwitchNames {
+		if got := safeSandboxEnvOverrides([]corev1.EnvVar{{Name: name, Value: "on"}}); len(got) != 0 {
+			t.Errorf("%s passed the agent container's env allowlist, got %#v; the managed .env is its only path", name, got)
+		}
+	}
+}
+
 // dedupWindowEntries returns every INCIDENT_WORKLOAD_DEDUP_SECONDS entry in
 // the platform container's env, in order.
 func dedupWindowEntries(t *testing.T, agent *agentv1alpha1.PlatformAgent) []string {
@@ -2027,10 +2068,10 @@ func TestImageEnvOverrides(t *testing.T) {
 }
 
 func TestFluentBitImageEnvOverride(t *testing.T) {
-	if got := fluentBitImage(); got != "fluent/fluent-bit:5.1.2" {
+	if got := fluentBitImage(); got != "fluent/fluent-bit:5.1.5" {
 		t.Fatalf("unexpected default fluent-bit image: %s", got)
 	}
-	t.Setenv("FLUENT_BIT_IMAGE", "registry.corp/mirror/fluent-bit:5.1.2")
+	t.Setenv("FLUENT_BIT_IMAGE", "registry.corp/mirror/fluent-bit:5.1.5")
 
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "my-ns"},
@@ -2040,7 +2081,7 @@ func TestFluentBitImageEnvOverride(t *testing.T) {
 	for _, c := range dep.Spec.Template.Spec.Containers {
 		if c.Name == "fluent-bit" {
 			found = true
-			if c.Image != "registry.corp/mirror/fluent-bit:5.1.2" {
+			if c.Image != "registry.corp/mirror/fluent-bit:5.1.5" {
 				t.Fatalf("expected FLUENT_BIT_IMAGE override on sidecar, got %s", c.Image)
 			}
 		}
@@ -2059,7 +2100,7 @@ func TestFluentBitImageEnvOverride(t *testing.T) {
 func TestNoPublicRegistryWhenMirrored(t *testing.T) {
 	const mirror = "registry.corp/mirror"
 	t.Setenv("PLATFORM_AGENT_IMAGE", mirror+"/platform-agent:v1.2.3")
-	t.Setenv("FLUENT_BIT_IMAGE", mirror+"/fluent-bit:5.1.2")
+	t.Setenv("FLUENT_BIT_IMAGE", mirror+"/fluent-bit:5.1.5")
 	// CREDENTIAL_PROXY_IMAGE deliberately left unset: the sidecar must derive
 	// its registry from PLATFORM_AGENT_IMAGE, not fall back to ghcr.io.
 
@@ -4012,15 +4053,20 @@ func TestManagedEnvPinsPlatformKeysButNotHome(t *testing.T) {
 	// A deployment with no chat integration pins no PLATFORM key — an agent with no chat
 	// integration has no platform credential worth freezing, and a pin invented for one
 	// would only be a key the agent is refused permission to set. What survives is the
-	// ten unconditional pins, none of which is about chat: the loopback bearer (see
-	// the next test), the PVC's directory mode, the mode switch, the scope path, the
-	// empty management-project override, the stall watch's three knobs, empty, the
+	// fourteen unconditional pins, none of which is about chat: the loopback bearer (see
+	// the next test), the PVC's directory mode, the mode switch, the three
+	// earned-autonomy switches, the scope path, the resolved scope's path (empty outside
+	// next), the empty management-project override, the stall watch's three knobs, empty, the
 	// Pub/Sub platform relay URL, empty, and the project that qualifies its routes.
 	bare := renderManagedEnv(newTestPlatformAgent())
 	want := "API_SERVER_KEY=" + loopbackAgentAPIKey + "\n" +
 		"HERMES_HOME_MODE=" + hermesHomeMode + "\n" +
 		kubeagentsModeEnvKey + "=today\n" +
+		envPostMergeCheck + "=off\n" +
+		envAutomerge + "=off\n" +
+		envDial + "=off\n" +
 		scopeFileEnvKey + "=" + scopeDir + "/" + scopeFileName + "\n" +
+		resolvedScopeFileEnvKey + "=\n" +
 		reconcileProjectEnvKey + "=\n" +
 		stallWatchExcludeNamespacesEnvKey + "=\n" +
 		stallWatchMinAgeEnvKey + "=\n" +
@@ -4094,7 +4140,8 @@ func assertManagedEnvAgrees(t *testing.T, agent *agentv1alpha1.PlatformAgent) {
 	// The mode key is pinned-only by design: the managed .env is the one path the
 	// mode takes into the runtime (spec-mode-switch.md), so a container-env copy
 	// would be a second answer to a question that must have exactly one. The stall
-	// watch's knobs take the same single path to stall_watch.py.
+	// watch's knobs take the same single path to stall_watch.py, and the
+	// earned-autonomy switches theirs to kubeagents_switches.py.
 	pinnedOnly := map[string]bool{
 		"GATEWAY_ALLOWED_USERS":           true,
 		"GATEWAY_ALLOW_ALL_USERS":         true,
@@ -4102,6 +4149,9 @@ func assertManagedEnvAgrees(t *testing.T, agent *agentv1alpha1.PlatformAgent) {
 		stallWatchExcludeNamespacesEnvKey: true,
 		stallWatchMinAgeEnvKey:            true,
 		stallWatchKindsEnvKey:             true,
+		envPostMergeCheck:                 true,
+		envAutomerge:                      true,
+		envDial:                           true,
 	}
 
 	for _, line := range strings.Split(strings.TrimSpace(renderManagedEnv(agent)), "\n") {

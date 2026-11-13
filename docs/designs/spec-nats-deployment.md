@@ -25,6 +25,29 @@ Production guidance is a 3-node cluster with stream replicas R3. Dev and CI run 
 node with R1 under the same config surface - the conformance suite runs against `kind`, so
 nothing here may depend on a managed control plane.
 
+**Amended 10/29 (#3274):** the production posture is the default for a new bus. The
+operator renders `spec.harness.tuning.busReplicas` servers. When the field is unset, an
+install keeps the server count its bus already runs (an install from before this change
+stays on one server), and a new bus gets three. Every stream and bucket the provision Job
+creates takes `min(3, servers)` replicas. The servers find each other through a headless
+routes Service on 6222, authenticated to each other by mutual TLS under the bus CA (the callout does not govern routes, and no route password is rendered). A `maxUnavailable: 1` budget and
+a hostname topology spread keep one drain to one server, and a lame-duck `preStop` moves
+clients off a stopping server rather than dropping them.
+
+**Changing the server count empties the bus.** A server that restarts in cluster mode
+finds its standalone streams unassigned in the new metadata layer and deletes them as
+orphans; going back, a standalone server refuses to load an R3 stream. Either way the
+provision Job then recreates every stream and bucket empty. So setting `busReplicas` on
+an install whose bus already runs another count is a conversion, and its cost is the
+bus's contents: task history, the topics journal, and the KV buckets. Converting without
+that loss is #4225 (a copy into a new cluster before the switch).
+
+**Amended 10/30 (#3274):** so the operator does not convert. An existing bus keeps the
+count it runs: a `busReplicas` that asks for another count is held to the running one,
+with an `A2ABusConversionRefused` condition and Warning, and the admission webhook
+refuses the edit with the same message. #4225 lifts that refusal in the same change that
+adds the migration, so no release can convert without it.
+
 **The customer operates this.** Server restarts - rollouts, node drains, PV failover - are
 routine operations, not incidents. That fact drives the resilience contract below more than
 any other input.
@@ -297,10 +320,24 @@ Status (amended 9/4, the callout armed; amended 9/8, sessions moved; amended 9/1
 callout**, by presenting a projected ServiceAccount token: the bus provisioning Job,
 every spawned session pod, the platform agent container, the capability verifier, and
 (amended 10/28, #3655) the AgentProfile dispatcher, when the operator has its image
-(`A2A_DISPATCHER_IMAGE`; off by default until profiles dispatch end to end).
+(`A2A_DISPATCHER_IMAGE`; off by default until profiles dispatch end to end). Amended
+11/10: on by default, at the release set's image, and off at `A2A_PROFILE_DISPATCHER=false`
+(the chart's `operator.profileDispatcher.enabled`).
 The dispatcher's grants name each profile durable it reads on `PROFILE_SUBMITS` and each
 profile it dispatches for; it reconnects when its config adds one, and tasks it holds keep
-running across the reconnect. With a dispatcher the
+running across the reconnect. Listing them all in its map entry grows the entry about
+1.1 KB per profile tier, and past about 1,000 profiles no single user JWT can carry them (#5381).
+With `A2A_DISPATCHER_BUCKETED_GRANTS=true` on the operator, the entry narrows on
+`dispatcher` instead. It carries only the fixed grants, which are its control connection's,
+and the draining profiles' names. A connection that sends the bucket `<b>/32` as its
+CONNECT password beside the token gets the per-profile grants, draining profiles' included,
+of the profiles that hash to bucket b (fnv32a of the name, mod 32): the callout derives them
+from the map's profile entries with `lib.DispatcherGrants`, plus the bucket's own inbox. The
+password picks a slice of what the token already allows; it is not a credential. A bucket the
+callout doesn't accept is refused, never served the control grants. The hash is unkeyed, so
+names chosen to collide fill one bucket, whose mint fails closed at roughly 450 two-tier
+profiles. The switch is off by default, and stays off until the dispatcher opens its bucket
+connections. With a dispatcher the
 operator principal also creates and deletes those durables, and it is the only principal
 with a consumer verb on that stream. **Statically**, from `nats.conf` and listed in `auth_users`:
 the callout itself, which cannot authenticate through the thing it is; the chatops
@@ -615,10 +652,16 @@ Layout:
   one peer every new connection depends on - and nothing looks broken when that
   happens, because established connections are already authorized and keep working
   while the fabric silently accepts no new client. Still owed as they arm: the audit
-  exporter, the janitor, and the metrics scrape (the alert set above is scraped
-  series), and the NATS pods themselves on their route port the moment the deployment
-  leaves the single-node dev shape - a 3-node cluster's servers dial each other, and a
-  fence without the route peer prevents the cluster from ever forming. The topic-grant corollary that two edits
+  exporter and the janitor. The metrics scrape landed (amended 11/9, #4477) without a
+  new peer on 8222, whose one peer stays the operator's pod (for reload
+  confirmation): a `prometheus-nats-exporter` sidecar in each NATS pod reads 8222 over
+  loopback and serves on 7777, and a separate rule admits the managed collector's
+  namespace (`gke-gmp-system`) and the operator's own pod to 7777 and nothing else; the
+  operator reads the stream list there to notice a provisioned stream gone missing
+  (amended 11/10, #4290). The NATS pods' own route peer, which this list used to carry as owed, landed
+  with the three-server default (amended 10/29, #3274): a separate rule admits 6222 from
+  the bus's servers and nothing else, since a fence without it keeps the cluster from
+  ever forming. The topic-grant corollary that two edits
   travel together, applied to the fence. A second policy in the same amendment
   fences the session pods' egress (DNS, 4222 by label, LiteLLM - a spawned worker has no
   other legitimate destination, save the credential broker on its one port when the
@@ -789,7 +832,8 @@ changed value changes the pod template, which rolls the callout. The same check 
 refuses a narrowed pod named after a user in the callout's own identity map (`provision`,
 `agent`, `verifier`, `session`, and any user the map gains), because the callout mints
 each entry that is not narrowed under its `user` and that entry's grants carry
-`_INBOX.<user>.>`; the narrowed entry's own user, `session`, is never minted and is
+`_INBOX.<user>.>` (the dispatcher's entry, though narrowed, is minted under its `user` too,
+and its bucket users `<user>-b0` to `<user>-b31` are reserved with the rest); the narrowed entry's own user, `session`, is never minted and is
 reserved with the rest because one check covers every map user. Those names
 come from the map being served, not from the variable: they are built when the map is
 parsed and installed with it, so a reload that adds or removes a user moves the reserved

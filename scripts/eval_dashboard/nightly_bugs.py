@@ -20,6 +20,32 @@ is the nightly's counterpart of ``gate_issue.py``::
     on a graded night after its last failing one
     -> comment once on the issue with that night's run link; never close it
 
+**One cause, one issue.** Before filing, the cases that would each file
+are grouped by ``(first red night, failing check)``: the date their run of
+failing nights began, and a check every graded failing repetition of that
+run names (``rep_checks``). GROUP_MIN_CASES or more cases on one key file
+one issue instead of one each (``Filer.file_group``)::
+
+    GROUP_MIN_CASES cases would file, turned red on the same night and share
+    a failing check on every failing repetition since
+    -> one issue, labelled `nightly-red`, each case's `domain:<slug>` and
+       `needs-triage`, listing each case's nights; assigned to the domain
+       owner, or to ``infra_owner`` when the cases span domains, with every
+       case's effective owner @-mentioned
+
+    every case an open group issue names has recovered (``recovery_night``)
+    -> one comment listing each case's clear night; no per-case recovery
+       comment on a group issue, so ten cases do not make eleven comments
+
+The group issue carries each case's marker, so the dedupe reads it as it
+reads a per-case issue, and its own marker (GROUP_MARKER) for the all-clear.
+A case that reaches the streak a tick after its group was filed, with the
+same first night and check, files on its own: GROUP_MARKER carries the night
+only, by design, so no key matches it to the group (a known follow-up). It names no check: the repository is
+public, and the check is on the dashboard behind the run links. On
+2026-11-09 the filer opened 12 issues, 10 of them for one grader change
+(#4973, fixed by #5179), sent to five owners.
+
 **A graded night** for a case is one where the part of the night that ran
 it (``nightly.night_part``) was not cut short and at least one of its
 repetitions was graded. Three kinds of night say nothing about one case and
@@ -79,6 +105,15 @@ tick clears it. A dry run records nothing held: it files nothing anyway.
 Comments are read the same way: an issue whose listing counts
 more comments than the read returned is not commented on that tick.
 
+**Triage first, when armed** (``--triage-pending``, which the workflow passes
+while ``NIGHTLY_TRIAGE_LIVE`` is ``true``). A domain bug or a group issue is
+then filed unassigned, labelled ``triage:pending``, with every @-mention in
+its body written as code, so nobody is notified yet, and a marker
+(TRIAGE_PENDING_MARKER) naming who the rule above would assign and mention.
+``nightly_triage.py`` reads the issue, decides what the bug is, assigns it
+and mentions those people in its comment; when it cannot decide, it assigns
+the marker's first login. Infra issues are filed as before.
+
 All GitHub traffic goes through ``ghcli.Gh``. **Dry run is the default**:
 reads happen, every write is printed instead of sent. ``--live`` sends them;
 the workflow passes it only when the repository variable
@@ -108,12 +143,12 @@ except ImportError:  # scripts/ is not on sys.path yet
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
     import case_owner
 try:
-    from eval_dashboard import classify, gate_issue, ghcli, nightly, nightly_infra
+    from eval_dashboard import classify, collect, gate_issue, ghcli, nightly, nightly_infra
     from eval_dashboard import post_health
     from eval_dashboard.post_health import NIGHTLY_URL
 except ImportError:  # run as a script: scripts/eval_dashboard/nightly_bugs.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-    from eval_dashboard import classify, gate_issue, ghcli, nightly, nightly_infra
+    from eval_dashboard import classify, collect, gate_issue, ghcli, nightly, nightly_infra
     from eval_dashboard import post_health
     from eval_dashboard.post_health import NIGHTLY_URL
 
@@ -335,6 +370,80 @@ WHY_INFRA_OWNER = "infra owner"
 FAILED_NOTE = "a GitHub call failed: a timeout, a 5xx, a 403, or comments that could not be read; nothing more written for it this tick, retried next tick"
 WHY_NO_INFRA_OWNER = "`docs/designs/domains.yaml` names no `infra_owner`"
 
+# --- One cause, one issue (module docstring). Three cases, not two: Nov 9's
+# 10-of-12 needs no lower bar, and two cases sharing a check from the same
+# night are often one probe and its audit in one domain, one owner either
+# way; grouping a pair saves one triage and risks hiding a second cause
+# behind the first, while three unrelated cases breaking the same named
+# check on the same night is no coincidence.
+GROUP_MIN_CASES = 3
+# Not BOT_MARKER_RE's shape (`nightly-red-group`, not `nightly-red case=`),
+# so no reader takes it for a case's marker.
+GROUP_MARKER = "<!-- kube-agents-bot:nightly-red-group night={date} -->"
+GROUP_MARKER_RE = re.compile(r"<!-- kube-agents-bot:nightly-red-group night=([0-9]{4}-[0-9]{2}-[0-9]{2}) -->")
+# One all-clear per recovery: keyed by the newest case's clear night.
+GROUP_RECOVERY_MARKER = "<!-- kube-agents-bot:nightly-red-group-recovered night={first} clear={date} -->"
+# The checks a failing repetition names, from bench-gate's grading line
+# (bench/kube_agents_bench/scoring.py): a tripped safeguard's
+# `VerificationCatastrophic=<x> (<name>, <name>): ...`, or a low score's
+# `VerificationCorrectness=<x> (floor <y>) -- <name>: <why>; <name>: <why>`.
+# A name after the score is read only in a check's shape, two words or more
+# joined by `-`, `_` or `.`: a `; want: 3` inside a check's own reason is not
+# a check, and a bare word shared by three cases would group them wrongly.
+CATASTROPHIC_CHECKS_RE = re.compile(r"^VerificationCatastrophic=\S+ \(([^)]*)\):")
+CHECK_NAME_RE = re.compile(r"(?:^|; )([A-Za-z0-9]+(?:[._-][A-Za-z0-9]+)+)(?=: |;|$| \[)")
+GROUP_TITLE = "Nightly: cases red together since {date} need triage"
+GROUP_BODY = """\
+{markers}
+These cases turned red on the same nightly, {date}, and have failed the same way on every graded night since, so one change likely broke them all: triage them together, here. Each night's grading is on the dashboard behind its run link. {domains}
+
+{addressee}{owners}
+
+**Cases** (each case's nights, newest first; a night cut off at the job deadline, a night where nothing was graded, and a night where nearly every case failed are skipped, not counted)
+
+{cases_block}
+
+Nightly report: {nightly_url}
+
+**What triage decides (within a week)**
+
+- **Find the cause:** compare the commits of the last green nightly and the first red one ({date}) and name the pull request that likely broke them; its author is the natural fixer.
+- **Product bug:** name a fixer, a priority and a target date.
+- **Grader or harness:** fix the grading; the cases are not at fault.
+- **Infra:** close this issue and point to the infra issue.
+- **A case that does not belong here:** delete its `kube-agents-bot:nightly-red case=` line from this body; it is filed on its own if it stays red.
+
+Filed automatically by `scripts/eval_dashboard/nightly_bugs.py` (docs/ci-health.md, "Nightly bugs") in place of one issue per case. It comments here once every case is clear again; it never closes the issue. Closing this one issue closes it for every case listed.
+"""
+GROUP_CASE_LINE = "- `{case}` (`{domain}`)"
+GROUP_DOMAIN = "**{name}** (`{slug}`)"
+GROUP_DOMAINS_ONE = "Domain: {domains}."
+GROUP_DOMAINS_MANY = "Domains: {domains}."
+GROUP_OWNERS = "\nCase owners: {owners}."
+WHY_GROUP_DOMAIN_OWNER = "the domain owner in `docs/designs/domains.yaml`"
+WHY_GROUP_INFRA_OWNER = "the cases span domains: the infra owner in `docs/designs/domains.yaml`, who takes the nightly failures no one domain owns"
+GROUP_RECOVERY_COMMENT = """\
+{marker}
+Every case here is clear again: {cases}. The bot will not close this issue; the triager decides whether it is fixed, and closing it covers every case.
+"""
+GROUP_RECOVERY_CASE = "`{case}` on the {date} nightly ([run]({run_url}))"
+
+# --- Triage first (module docstring). The marker is what nightly_triage.py
+# keys on: `assign` is the rule's assignment chain (the next login takes it
+# when GitHub refuses one), `cc` the people the body would have @-mentioned.
+# Both are comma-separated logins, `-` for none. The triage step rewrites
+# `triage-pending` to `triage-done` once it has routed the issue.
+TRIAGE_PENDING_LABEL = "triage:pending"
+TRIAGE_PENDING_MARKER = "<!-- kube-agents-bot:triage-pending assign={assign} cc={cc} -->"
+TRIAGE_PENDING_ADDRESSEE = ("**Triage pending:** an agent (`scripts/eval_dashboard/nightly_triage.py`) reads the failing runs and the commits "
+                            "since the last green night, then assigns this issue and says why in a comment. If it cannot, the issue goes to {fallback}.")
+TRIAGE_FALLBACK_LOGIN = "`{login}` ({why})"
+TRIAGE_FALLBACK_NOBODY = "no one ({why})"
+WHY_TRIAGE_PENDING = "triage pending; the rule's assignee is {fallback}"
+# An @-mention in a body filed for triage: written as code instead, so the
+# filing notifies no one (GitHub does not link a mention inside backticks).
+MENTION_RE = re.compile(r"(?<![\w`@/])@([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)(?![\w-])")
+
 
 def log(message: str) -> None:
     print(message, file=sys.stderr)
@@ -398,8 +507,10 @@ def resolve_assignee(owner: str | None, domain: str, domain_owners: dict[str, st
 def graded_nights(data: dict) -> dict[str, list[dict]]:
     """``{case: [night verdict, ...]}``, oldest first, over the newest
     LOOKBACK_NIGHTS dates on record. A verdict is ``{date, build, outcome,
-    passed, graded, infra, run_url, transcript_url}`` for a night
-    that graded the case (module docstring: what is skipped)."""
+    passed, graded, infra, run_url, transcript_url, checks, head_sha,
+    gcs_base, fails}`` for a night that graded the case (module docstring:
+    what is skipped); ``checks`` (``night_checks``) and the last three are
+    internal and never printed in public text."""
     nights = nightly.group_nights(nightly.sorted_nightly_runs(data))
     dates = sorted({nightly.night_date(nightly.night_parts(n)[0]) for n in nights} - {None})
     window = set(dates[-LOOKBACK_NIGHTS:])
@@ -435,9 +546,16 @@ def graded_nights(data: dict) -> dict[str, list[dict]]:
                     "outcome": outcome,
                     "passed": counts["pass"],
                     "graded": counts["pass"] + counts["fail"],
-                    "infra": counts["infra"] + counts["ceiling"] + counts["fixture"],
+                    "infra": counts["infra"] + counts["ceiling"] + counts["fixture"] + counts["forge"],
                     "run_url": nightly.build_url(run),
                     "transcript_url": nightly.transcript_url(run, name),
+                    "checks": night_checks(task),
+                    # For nightly_triage.py, never printed here: the commit
+                    # the night ran, its gs:// directory, and each failing
+                    # repetition's number and grading reason.
+                    "head_sha": run.get("head_sha") if isinstance(run.get("head_sha"), str) else None,
+                    "gcs_base": nightly.console_base(run),
+                    "fails": [{"n": r.get("n"), "reason": r.get("reason")} for r in classify.task_reps(task) if classify.rep_kind(r) == classify.REP_FAIL],
                 }
     out: dict[str, list[dict]] = {}
     for day in sorted(by_date):
@@ -467,6 +585,91 @@ def recovery_night(verdicts: list[dict], news=lambda v: True) -> dict | None:
     return next((v for v in verdicts[last_fail + 1:] if v["outcome"] == classify.OUTCOME_PASSED and news(v)), None)
 
 
+def rep_checks(reason: str | None) -> frozenset:
+    """The checks a failing repetition's reason names (CATASTROPHIC_CHECKS_RE,
+    CHECK_NAME_RE); empty when it names none (a replay error, an empty
+    report, a shape this does not read)."""
+    reason = reason or ""
+    tripped = CATASTROPHIC_CHECKS_RE.match(reason)
+    if tripped:
+        return frozenset(n.strip() for n in tripped.group(1).split(",") if CASE_NAME_RE.fullmatch(n.strip()))
+    head = classify.REASON_SCORE_PREFIX_RE.match(reason)
+    if not head:
+        return frozenset()
+    tail = reason[head.end():]
+    # A name at the very end of a reason the collector cut may be cut short.
+    cut = len(reason) >= collect.REP_REASON_MAX_CHARS
+    return frozenset(m.group(1) for m in CHECK_NAME_RE.finditer(tail) if not (cut and m.end(1) == len(tail)))
+
+
+def night_checks(task: dict) -> tuple[str, ...]:
+    """The checks every graded failing repetition of ``task`` names, sorted;
+    empty when one names none."""
+    sets = [rep_checks(r.get("reason")) for r in classify.task_reps(task) if classify.rep_kind(r) == classify.REP_FAIL]
+    return tuple(sorted(frozenset.intersection(*sets))) if sets else ()
+
+
+def red_run(verdicts: list[dict]) -> list[dict]:
+    """The newest verdicts that are all failures: the case's current run of
+    red nights, oldest first."""
+    run = []
+    for v in reversed(verdicts):
+        if v["outcome"] != classify.OUTCOME_FAILED:
+            break
+        run.append(v)
+    return run[::-1]
+
+
+def group_keys(verdicts: list[dict]) -> set[tuple[str, str]]:
+    """``{(first red night, check)}``: one key per check that every failing
+    repetition of the case's red run names."""
+    run = red_run(verdicts)
+    if not run:
+        return set()
+    shared = frozenset.intersection(*(frozenset(v.get("checks") or ()) for v in run))
+    return {(run[0]["date"], check) for check in shared}
+
+
+def group_cases(pending: list[dict], min_cases: int = GROUP_MIN_CASES) -> tuple[list[tuple[tuple[str, str], list[dict]]], list[dict]]:
+    """``(groups, singles)`` over the cases that would each file
+    (``{case, verdicts, ...}``): the key most of them share first, while at
+    least ``min_cases`` share one; a case joins one group at most. The
+    rest file one issue each."""
+    left = list(pending)
+    groups = []
+    while True:
+        keyed: dict[tuple[str, str], list[dict]] = {}
+        for entry in left:
+            for key in group_keys(entry["verdicts"]):
+                keyed.setdefault(key, []).append(entry)
+        best = min(keyed.items(), key=lambda kv: (-len(kv[1]), kv[0]), default=None)
+        if not best or len(best[1]) < min_cases:
+            return groups, left
+        groups.append(best)
+        taken = {e["case"] for e in best[1]}
+        left = [e for e in left if e["case"] not in taken]
+
+
+def group_clear_night(verdicts: list[dict], issue: dict) -> dict | None:
+    """The night a case of a group issue is clear on: its ``recovery_night``
+    after the issue opened; or, once its failing nights have left the
+    window (it cleared long before the slowest case), its first pass after
+    the issue opened, when no night in the window failed and the newest
+    passed. None while it is not clear, or has no graded night on record."""
+    if not verdicts:
+        return None
+    night = recovery_night(verdicts, lambda v: opened_before(issue, v))
+    if night or any(v["outcome"] == classify.OUTCOME_FAILED for v in verdicts) or verdicts[-1]["outcome"] != classify.OUTCOME_PASSED:
+        return night
+    return next((v for v in verdicts if v["outcome"] == classify.OUTCOME_PASSED and opened_before(issue, v)), None)
+
+
+def group_issue_cases(issue: dict) -> list[str]:
+    """The cases an open group issue still names, by their markers: a case
+    a triager split off (its marker line deleted) is no longer in it."""
+    return [key for kind, key in BOT_MARKER_RE.findall(issue.get("body") or "") if kind == KIND_RED]
+
+
 # --------------------------------------------------------------------------
 # what the issue says
 
@@ -477,6 +680,34 @@ def night_block(streak: list[dict]) -> str:
         template = NIGHT_LINE if v["run_url"] else NIGHT_LINE_NO_LINK
         lines.append(template.format(date=v["date"], run_url=v["run_url"], transcript_url=v["transcript_url"]))
     return "\n".join(lines)
+
+
+def quiet_mentions(text: str) -> str:
+    """``text`` with every @-mention written as code (MENTION_RE)."""
+    return MENTION_RE.sub(lambda m: f"`{m.group(1)}`", text)
+
+
+def login_list(logins) -> str:
+    """TRIAGE_PENDING_MARKER's form of ``logins``: comma-separated, deduped
+    in order, ``-`` for none."""
+    out: list[str] = []
+    for login in logins:
+        if login and case_owner.is_person_login(login) and login.lower() not in {o.lower() for o in out}:
+            out.append(login)
+    return ",".join(out) or "-"
+
+
+def pending_body(body: str, addressee: str, chain: list[tuple[str | None, str]], cc: list[str]) -> str:
+    """The body of an issue filed for triage: the marker first, the
+    assignment line ``addressee`` replaced by TRIAGE_PENDING_ADDRESSEE
+    naming the rule's first choice in ``chain`` (``(login, why)``, the
+    filer's candidates), no mention left live."""
+    login, why = chain[0] if chain else (None, "")
+    fallback = TRIAGE_FALLBACK_LOGIN.format(login=login, why=why) if login else TRIAGE_FALLBACK_NOBODY.format(why=why)
+    marker = TRIAGE_PENDING_MARKER.format(assign=login_list(c for c, _ in chain), cc=login_list(cc))
+    # On a line of its own, so the triage step's rewrite of it, to the end of
+    # its line, leaves what followed (the domain owner) in place.
+    return marker + "\n" + quiet_mentions(body.replace(addressee, TRIAGE_PENDING_ADDRESSEE.format(fallback=fallback) + "\n", 1))
 
 
 def render_issue(case: str, domain: str, domain_row: dict, assignee: str | None, why: str, streak: list[dict]) -> tuple[str, str]:
@@ -495,6 +726,27 @@ def render_issue(case: str, domain: str, domain_row: dict, assignee: str | None,
     return title, body[:ISSUE_BODY_MAX_CHARS]
 
 
+def render_group_issue(first_red: str, members: list[dict], domains: dict, addressee: str, owners: list[str]) -> tuple[str, str]:
+    """The group issue: each case's marker, then its nights as a per-case
+    issue lists them. ``members`` are ``{case, domain, streak}``."""
+    slugs = sorted({m["domain"] for m in members})
+    named = ", ".join(GROUP_DOMAIN.format(name=(domains.get(s) or {}).get("name") or s, slug=s) for s in slugs)
+    blocks = []
+    for m in members:
+        nights = "\n".join(f"  {line}" for line in night_block(m["streak"]).splitlines())
+        blocks.append(GROUP_CASE_LINE.format(case=m["case"], domain=m["domain"]) + "\n" + nights)
+    body = GROUP_BODY.format(
+        markers="\n".join([GROUP_MARKER.format(date=first_red)] + [MARKER.format(case=m["case"]) for m in members]),
+        date=first_red,
+        domains=(GROUP_DOMAINS_ONE if len(slugs) == 1 else GROUP_DOMAINS_MANY).format(domains=named),
+        addressee=addressee,
+        owners=GROUP_OWNERS.format(owners=", ".join(f"@{o}" for o in owners)) if owners else "",
+        cases_block="\n".join(blocks),
+        nightly_url=NIGHTLY_URL,
+    )
+    return GROUP_TITLE.format(date=first_red)[:TITLE_MAX_CHARS], body[:ISSUE_BODY_MAX_CHARS]
+
+
 # --------------------------------------------------------------------------
 # GitHub
 
@@ -508,7 +760,9 @@ def names_case(issue: dict, case: str, kind: str = KIND_RED) -> bool:
     runs whose URLs name the job."""
     body = issue.get("body") or ""
     markers = BOT_MARKER_RE.findall(body)
-    if markers or kind != KIND_RED:
+    # A group issue is matched on its case markers alone, even with none
+    # left: a case still listed in its body after its marker went is split off.
+    if markers or kind != KIND_RED or GROUP_MARKER_RE.search(body):
         return (kind, case) in markers
     text = f"{issue.get('title') or ''}\n{body}"
     return any(re.search(pattern.format(name=re.escape(case)), text, re.IGNORECASE) for pattern in (NAME_IN_TEXT_RE, NAME_IN_TRANSCRIPT_RE))
@@ -701,9 +955,11 @@ def held_digest_lines(state: dict | None, now: datetime.datetime) -> list[str]:
 
 
 class Filer:
-    def __init__(self, gh: ghcli.Gh, repo_root: pathlib.Path = REPO_ROOT):
+    def __init__(self, gh: ghcli.Gh, repo_root: pathlib.Path = REPO_ROOT, triage_pending: bool = False):
         self.gh = gh
         self.repo_root = repo_root
+        # File domain and group bugs for the triage agent (module docstring).
+        self.triage_pending = triage_pending
         self.domains = load_domains(repo_root)
         self.horizon = None
         try:
@@ -750,6 +1006,7 @@ class Filer:
             log("warning: no trusted nightly-red issue listing this pass; nothing filed or commented, retried next tick")
             return result
         active = set(nightly.expected_cases(data))
+        pending = []
         for case, verdicts in sorted(nights.items()):
             fields = task_fields(case, self.repo_root)
             issue = tracking_issue(open_issues, case)
@@ -768,14 +1025,23 @@ class Filer:
                 elif closed:
                     result["tracked"].append({"case": case, "issue": closed["number"], "closed": True})
                 else:
-                    filed = self.file(case, fields, streak)
-                    result["filed" if filed["issue"] or self.gh.dry_run else "failed"].append(filed)
+                    pending.append({"case": case, "fields": fields, "streak": streak, "verdicts": verdicts})
                 continue
-            recovered = recovery_night(verdicts, lambda v: opened_before(issue, v)) if issue else None
+            # A group issue gets one all-clear (recover_groups) instead.
+            grouped = bool(issue and GROUP_MARKER_RE.search(issue.get("body") or ""))
+            recovered = recovery_night(verdicts, lambda v: opened_before(issue, v)) if issue and not grouped else None
             if recovered and issue:
                 done = self.recover(case, issue, recovered)
                 if done:
                     result["recovered" if done["ok"] else "failed"].append(done)
+        groups, singles = group_cases(pending)
+        for (first_red, _check), members in groups:
+            filed = self.file_group(first_red, members)
+            result["filed" if filed["issue"] or self.gh.dry_run else "failed"].append(filed)
+        for entry in singles:
+            filed = self.file(entry["case"], entry["fields"], entry["streak"])
+            result["filed" if filed["issue"] or self.gh.dry_run else "failed"].append(filed)
+        self.recover_groups(nights, open_issues, result)
         self.run_infra(data, parts, active, open_issues, closed_issues, result)
         return result
 
@@ -895,7 +1161,7 @@ class Filer:
         created, assignee = self.create(attempts, key)
         number = created.get("number") if isinstance(created, dict) else None
         why = WHY_INFRA_OWNER if assignee else WHY_UNASSIGNED_REFUSED.format(refused=f"`{self.infra_owner}`") if self.infra_owner else WHY_NO_INFRA_OWNER
-        entry = {"case": key, "assignee": assignee, "why": why, "mention": self.infra_backup, "labels": labels,
+        entry = {"case": key, "infra": True, "assignee": assignee, "why": why, "mention": self.infra_backup, "labels": labels,
                  "nights": [n["date"] for n in nights], "runs": [n["run_url"] for n in nights], "issue": number}
         result["filed" if number or self.gh.dry_run else "failed"].append(entry)
 
@@ -958,12 +1224,100 @@ class Filer:
             title, body = render_issue(case, domain, row, login, reason, streak)
             attempts.append((login, {"title": title, "body": body, "labels": labels, **({"assignees": [login]} if login else {})}))
             reasons[login] = reason
+        if self.triage_pending:
+            login, reason = candidates[0]
+            addressee = (ASSIGNED if login else UNASSIGNED).format(assignee=login, why=reason)
+            attempts, labels = self.pending_attempt(attempts[0][1], addressee, candidates, [domain_owner, row.get("backup")])
+            reasons[None] = WHY_TRIAGE_PENDING.format(fallback=f"@{login}" if login else "no one")
         created, assignee = self.create(attempts, case)
         number = created.get("number") if isinstance(created, dict) else None
         if number:
             log(f"nightly bug: filed #{number} for {case}")
         return {"case": case, "domain": domain, "assignee": assignee, "why": reasons[assignee], "mention": domain_owner,
                 "labels": labels, "nights": [v["date"] for v in streak], "runs": [v["run_url"] for v in streak], "issue": number}
+
+    def file_group(self, first_red: str, entries: list[dict]) -> dict:
+        """One issue for ``entries``, the cases that turned red on
+        ``first_red`` with a failing check in common (``group_cases``):
+        to the domain owner, or to the infra owner when they span domains;
+        unassigned, saying who was refused, when GitHub refuses that login."""
+        members = [{"case": e["case"], "domain": e["fields"].get("domain") or UNKNOWN, "streak": e["streak"]} for e in entries]
+        slugs = sorted({m["domain"] for m in members})
+        if len(slugs) == 1:
+            owner, why = case_owner.domain_owner(slugs[0], self.domain_owners), WHY_GROUP_DOMAIN_OWNER
+            nobody = WHY_UNASSIGNED_NO_OWNER.format(domain=slugs[0])
+        else:
+            owner, why, nobody = self.infra_owner, WHY_GROUP_INFRA_OWNER, WHY_NO_INFRA_OWNER
+        owners = []
+        for e, m in zip(entries, members):
+            login, _ = resolve_assignee(e["fields"].get("owner"), m["domain"], self.domain_owners)
+            if login and login.lower() not in {o.lower() for o in owners} and login.lower() != (owner or "").lower():
+                owners.append(login)
+        candidates = ([(owner, why)] if owner else []) + [(None, WHY_UNASSIGNED_REFUSED.format(refused=f"`{owner}`") if owner else nobody)]
+        labels = [LABEL] + [DOMAIN_LABEL.format(slug=s) for s in slugs] + [TRIAGE_LABEL]
+        attempts, reasons = [], {}
+        for login, reason in candidates:
+            addressee = (ASSIGNED if login else UNASSIGNED).format(assignee=login, why=reason)
+            title, body = render_group_issue(first_red, members, self.domains, addressee, owners)
+            attempts.append((login, {"title": title, "body": body, "labels": labels, **({"assignees": [login]} if login else {})}))
+            reasons[login] = reason
+        if self.triage_pending:
+            login, reason = candidates[0]
+            addressee = (ASSIGNED if login else UNASSIGNED).format(assignee=login, why=reason)
+            attempts, labels = self.pending_attempt(attempts[0][1], addressee, candidates, owners)
+            reasons[None] = WHY_TRIAGE_PENDING.format(fallback=f"@{login}" if login else "no one")
+        cases = [m["case"] for m in members]
+        created, assignee = self.create(attempts, f"the group since {first_red}")
+        number = created.get("number") if isinstance(created, dict) else None
+        if number:
+            log(f"nightly bug: filed #{number} for {', '.join(cases)} (red together since {first_red})")
+        return {"case": f"{', '.join(cases)} (one issue: red together since {first_red})", "cases": cases, "assignee": assignee, "why": reasons[assignee],
+                "mention": owners, "labels": labels, "nights": [first_red], "runs": [v["run_url"] for m in members for v in m["streak"]], "issue": number}
+
+    def pending_attempt(self, payload: dict, addressee: str, candidates: list[tuple[str | None, str]], cc: list) -> tuple[list, list[str]]:
+        """``(attempts, labels)`` for an issue filed for triage: one attempt,
+        no assignee, the body from ``pending_body`` (``candidates`` the
+        rule's ``(login, why)`` chain, ``cc`` who it mentions), and
+        TRIAGE_PENDING_LABEL added."""
+        chain = [(login, why) for login, why in candidates if login] or candidates[-1:]
+        mentioned = [login for login in cc if login and login.lower() != (chain[0][0] or "").lower()]
+        labels = payload["labels"] + [TRIAGE_PENDING_LABEL]
+        body = pending_body(payload["body"], addressee, chain, mentioned)[:ISSUE_BODY_MAX_CHARS]
+        return [(None, {"title": payload["title"], "body": body, "labels": labels})], labels
+
+    def recover_groups(self, nights: dict, open_issues: list, result: dict) -> None:
+        """One comment on an open group issue once every case it names has
+        recovered on a night after it opened (``recovery_night``). A case
+        with no graded night on record holds the comment back: nothing says
+        it is clear."""
+        for issue in open_issues:
+            if not isinstance(issue, dict) or issue.get("pull_request") or not issue.get("number"):
+                continue
+            marked = GROUP_MARKER_RE.search(issue.get("body") or "")
+            cases = group_issue_cases(issue) if marked else []
+            if not cases:
+                continue
+            clear = []
+            for case in cases:
+                night = group_clear_night(nights.get(case), issue)
+                if not night:
+                    break
+                clear.append((case, night))
+            else:
+                # At least one case's red nights must still be on record, as
+                # for one case (LOOKBACK_NIGHTS): once they have all left the
+                # window, the fallback's clear night is the window's oldest
+                # date, which moves every night and would post again each time.
+                if not any(recovery_night(nights.get(case), lambda v, issue=issue: opened_before(issue, v)) for case in cases):
+                    continue
+                newest = max((night for _, night in clear), key=lambda v: v["date"])
+                marker = GROUP_RECOVERY_MARKER.format(first=marked.group(1), date=newest["date"])
+                comment = GROUP_RECOVERY_COMMENT.format(marker=marker, cases=", ".join(
+                    GROUP_RECOVERY_CASE.format(case=case, date=night["date"], run_url=night["run_url"]) for case, night in clear))
+                done = self.comment_once(issue, marker, comment)
+                if done is not None:
+                    result["recovered" if done else "failed"].append({"case": f"every case of the group ({', '.join(cases)})", "issue": issue["number"],
+                                                                       "night": newest["date"], "run": newest["run_url"]})
 
     def recover(self, case: str, issue: dict, night: dict) -> dict | None:
         """Comment once on ``night``'s pass, when the night started after the
@@ -994,7 +1348,8 @@ def summary(result: dict, dry_run: bool) -> str:
     for f in result["filed"]:
         issue = f" #{f['issue']}" if f["issue"] else ""
         who = f"assign @{f['assignee']}" if f["assignee"] else "unassigned"
-        mention = f"; mention @{f['mention']}" if f["mention"] else ""
+        mentions = f["mention"] if isinstance(f["mention"], list) else [f["mention"]] if f["mention"] else []
+        mention = f"; mention {', '.join(f'@{m}' for m in mentions)}" if mentions else ""
         lines.append(f"  file{issue}: {f['case']} [{', '.join(f['labels'])}] {who} ({f['why']}){mention}; nights {', '.join(f['nights'])}")
         lines.extend(f"    {url}" for url in f["runs"] if url)
     lines += [f"  recovered: {r['case']} on #{r['issue']} ({r['night']}, {r['run']})" for r in result["recovered"]]
@@ -1010,6 +1365,9 @@ def parse_args(argv=None):
     parser.add_argument("--data", required=True, type=pathlib.Path, help="data.json the collector wrote")
     parser.add_argument("--repo", default=ghcli.DEFAULT_REPO)
     parser.add_argument("--repo-root", type=pathlib.Path, default=REPO_ROOT, help="checkout holding bench/tasks and domains.yaml")
+    parser.add_argument("--triage-pending", action="store_true",
+                        help="file domain and group bugs unassigned and labelled triage:pending, for nightly_triage.py (module docstring)")
+    parser.add_argument("--filed-out", type=pathlib.Path, help="write the numbers of the issues filed this pass here, as a JSON list")
     parser.add_argument("--state", help="held-filing state (held_state): local path or gs:// object; read and rewritten each pass whose listings were read")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", dest="dry_run", action="store_true", default=True, help="print every write instead of sending it (the default)")
@@ -1028,9 +1386,21 @@ def main(argv=None, gh_runner=None) -> int:
         log(f"ERROR: {args.data}: {exc}")
         return 1
     gh = ghcli.Gh(args.repo, gh_runner, dry_run=args.dry_run) if gh_runner else ghcli.Gh(args.repo, dry_run=args.dry_run)
-    filer = Filer(gh, args.repo_root)
+    # Triage comments only into a separate (private) issues repository
+    # (nightly_triage.py refuses this one), so filing for triage here would
+    # leave every issue waiting for a step that never writes.
+    triage_pending = args.triage_pending and args.repo != ghcli.SOURCE_REPO
+    if args.triage_pending and not triage_pending:
+        log(f"warning: --triage-pending ignored: the issues repository is {ghcli.SOURCE_REPO}; filing and assigning as before")
+    filer = Filer(gh, args.repo_root, triage_pending=triage_pending)
     result = filer.run(data if isinstance(data, dict) else {})
     print(summary(result, args.dry_run))
+    if args.filed_out:
+        try:
+            # Domain and group issues only: the triage takes no infra issue.
+            args.filed_out.write_text(json.dumps([f["issue"] for f in result["filed"] if f.get("issue") and not f.get("infra")]))
+        except OSError as exc:
+            log(f"warning: could not write {args.filed_out}: {exc}")
     # A live pass that could not read the listings at all neither trusted
     # nor doubted them: it carries an open hold forward with the count
     # unchanged, so an hour of failed reads does not age it out

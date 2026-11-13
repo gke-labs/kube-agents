@@ -25,9 +25,10 @@ package controller
 // streams, retention, and the account layout; subjects come from the payload
 // spec (docs/designs/spec-a2a-payloads.md).
 //
-// PLAYGROUND POSTURE (stage 1): single-node R1 JetStream (production: 3-node
-// R3), no audit exporter, no breaker, gateway sweep as the only janitor. Each
-// has a decided design in the specs; none gates letting people play.
+// PLAYGROUND POSTURE (stage 1): no audit exporter, no breaker, gateway sweep as
+// the only janitor. Each has a decided design in the specs; none gates letting
+// people play. The bus came off that list: it runs as a three-server
+// JetStream cluster with R3 streams by default (a2aNATSReplicas).
 //
 // Authentication came off that list. The auth callout is armed, and the
 // identities that have a ServiceAccount and a client that presents it — the
@@ -75,6 +76,11 @@ import (
 )
 
 const (
+	// a2aNATSDeletionRecheck is how long a CR's deletion waits after
+	// marking its bus StatefulSet for deletion before it reaps the claims
+	// (deleteA2ANATSStatefulSetFirst).
+	a2aNATSDeletionRecheck = 5 * time.Second
+
 	// a2aPartOf marks every object of the next stack, so
 	// `kubectl get -l app.kubernetes.io/part-of=a2a-next` is the whole venue.
 	a2aPartOf = "a2a-next"
@@ -173,6 +179,15 @@ const (
 	a2aProvisionImageEnvVar = "A2A_PROVISION_IMAGE"
 	// nats-box carries the nats CLI the provisioning script drives.
 	defaultA2AProvisionImage = "natsio/nats-box:0.14.5"
+	// prometheus-nats-exporter, the metrics sidecar in the NATS pod
+	// (a2aNATSExporterContainer); images.json carries it as
+	// prometheus-nats-exporter. Pinned by digest as well as tag, the OCI
+	// index, so the same reference serves amd64 and arm64 nodes.
+	a2aNATSExporterImageEnvVar = "A2A_NATS_EXPORTER_IMAGE"
+	// a2aNATSExporterOmittedReason is the Warning event's reason when the
+	// NATS pod renders without the metrics sidecar (a2aNATSExporterOmitted).
+	a2aNATSExporterOmittedReason = "A2ABusMetricsExporterOmitted"
+	defaultA2ANATSExporterImage  = "natsio/prometheus-nats-exporter:0.20.3@sha256:4b8ddc1c86fec360b5cd3d5e1fbc6fb52bdafd5805bba3901cc52926538af255"
 
 	// Requests and limits on the next-stack pods. A namespace whose
 	// ResourceQuota requires limits refuses a pod that omits them at
@@ -197,6 +212,37 @@ const (
 	a2aNATSMemoryRequest = "512Mi"
 	a2aNATSCPULimit      = "1"
 	a2aNATSMemoryLimit   = "1Gi"
+
+	// The exporter sidecar holds one scrape's worth of /varz and /jsz JSON
+	// at a time, and -jsz=all brings every consumer with it, so its memory
+	// and CPU grow with the bus's consumers (about two per AgentProfile).
+	// Measured with a synthetic /jsz: 20Mi on a dev bus with five consumers,
+	// 31Mi at 500, 90Mi and 0.7 CPU-seconds a scrape at 2,000, 121Mi and 4
+	// CPU-seconds at 5,000. The limits are sized for 2,000, the stated
+	// ceiling (about 1,000 clusters' profiles); past it the exporter nears
+	// its memory limit, and an OOM kill takes the container and so the pod's
+	// readiness. On an Autopilot cluster without Pod bursting the limits are
+	// rewritten to the requests, 50m and 96Mi; the loop derives GOMEMLIMIT
+	// from the real limit, and measured there the exporter peaked at 70Mi
+	// with 2,000 consumers (a scrape about 12s) and 78Mi with 3,000, where a
+	// scrape at 50m outlasts the 30s interval. So the ceiling holds there
+	// too, bound by CPU rather than memory.
+	// The CPU request is the stack's floor, 50m, rather than what the
+	// exporter uses idle, so a namespace LimitRange that admits the bus's
+	// other containers admits this one: a refused sidecar would keep its
+	// server out of the bus.
+	a2aNATSExporterCPURequest    = "50m"
+	a2aNATSExporterMemoryRequest = "96Mi"
+	a2aNATSExporterCPULimit      = "500m"
+	a2aNATSExporterMemoryLimit   = "192Mi"
+	// The Go runtime's soft limit, below the container's so the exporter
+	// collects garbage before the kernel kills the container (which the
+	// supervisor loop cannot survive). The loop replaces it with 80% of the
+	// limit it reads from its cgroup (a2aNATSExporterSupervisor); this is
+	// the value where it can't read one, 80% of the rendered limit (192Mi
+	// gives 153.6MiB, rounded down to a whole MiB). GOMEMLIMIT takes a byte
+	// count with an IEC suffix.
+	a2aNATSExporterGoMemLimit = "153MiB"
 
 	a2aGatewayCPURequest    = "50m"
 	a2aGatewayMemoryRequest = "64Mi"
@@ -513,6 +559,11 @@ const (
 	a2aNATSMonitorPort   = 8222
 	a2aNATSWebSocketPort = 9222
 
+	// The cluster route listener: server to server only, on a multi-server
+	// bus (a2aNATSReplicas above 1). Written in the config's cluster block,
+	// the container port, the routes Service and the bus fence's peer rule.
+	a2aNATSRoutePort = 6222
+
 	// The creds Secret's keys. Each is written in at least three places — this
 	// list, the nats.conf template, and whatever workload consumes it through
 	// a secretKeyRef — and a key that disagrees between them renders
@@ -582,6 +633,12 @@ const (
 	// carried the way Chat's is (a2aGchatAllowedUsersEnvVar).
 	a2aSlackAllowedUsersEnvVar  = "A2A_SLACK_ALLOWED_USERS"
 	a2aSlackAllowAllUsersEnvVar = "A2A_SLACK_ALLOW_ALL_USERS"
+	// a2aSlackTestUsersEnvVar names the end-to-end test users whose
+	// app-attributed posts the gateway reads as theirs. The operator reads it
+	// from its own environment (as a2aInjectBackendEnvVar) and renders it onto
+	// the gateway under the same name; a2a/gateway/config.go's
+	// EnvSlackTestUsers.
+	a2aSlackTestUsersEnvVar = "A2A_SLACK_TEST_USERS"
 	// The principal map the gateway resolves Discord and Slack senders
 	// through: one path (A2A_PRINCIPAL_MAP, the gateway's default spelled
 	// out), one volume, and one source in it, the armed backend's table
@@ -803,10 +860,11 @@ const (
 
 	// a2aPostureComment travels on every rendered config and script so the
 	// posture cannot be mistaken for the product when read on the cluster.
-	a2aPostureComment = `# PLAYGROUND POSTURE (stage 1): single-node R1 JetStream (production: 3-node
-# R3), no audit exporter, no breaker, gateway sweep as the only janitor. Each
-# has a decided design in the specs (spec-nats-deployment.md); none gates
-# letting people play.
+	a2aPostureComment = `# PLAYGROUND POSTURE (stage 1): no audit exporter, no breaker, gateway sweep as
+# the only janitor. Each has a decided design in the specs
+# (spec-nats-deployment.md); none gates letting people play. The bus itself is
+# past that stage: a three-server JetStream cluster with R3 streams by default
+# (spec.harness.tuning.busReplicas: 1 runs one server with R1 streams).
 #
 # Authentication is NOT on that list any more. The auth callout is armed: a
 # client presents a projected Kubernetes ServiceAccount token, the callout
@@ -1199,6 +1257,30 @@ const (
 	a2aGatewayReadyzPath = "/readyz"
 )
 
+// a2aNATSMetricsPort is the NATS exporter sidecar's listener
+// (a2aNATSExporterContainer), where it serves the bus's JetStream stream and
+// storage series in Prometheus format. Its own port, so the managed-Prometheus
+// collector is admitted to the exporter and not to the server: the exporter
+// reads the monitor port over the pod's loopback, and the monitor port keeps
+// no pod-network peer. One constant for the container port, the exporter's
+// -port flag, and the collector's ingress rule in buildA2ANATSNetworkPolicy;
+// the chart's PodMonitoring scrapes it by number, held to this one by
+// tests/test_chart_platform_agent_monitoring.py. 7777 is the exporter's own
+// default.
+const (
+	a2aNATSMetricsPort           int32 = 7777
+	a2aNATSMetricsPortName             = "nats-metrics"
+	a2aNATSExporterContainerName       = "nats-exporter"
+	// a2aNATSExporterMonitorHost is where the exporter reaches the server's
+	// monitor listener: the pod's own loopback, which NetworkPolicy does
+	// not govern, so the fence needs no rule for it.
+	a2aNATSExporterMonitorHost = "127.0.0.1"
+	// a2aNATSExporterUID is nobody. The exporter image sets no USER, so
+	// without one the container would run as root; it reads nothing from
+	// disk and writes nothing, so any non-root UID serves.
+	a2aNATSExporterUID int64 = 65534
+)
+
 // a2aGatewayProgressDeadlineSeconds is the gateway Deployment's progress
 // deadline. With the readiness probe, a gateway waiting for TASKS holds its
 // rollout at zero available replicas, and past the deadline the Deployment
@@ -1216,6 +1298,47 @@ func a2aNATSImage() string {
 		return override
 	}
 	return defaultA2ANATSImage
+}
+
+func a2aNATSExporterImage() string {
+	if override := os.Getenv(a2aNATSExporterImageEnvVar); override != "" {
+		return override
+	}
+	return defaultA2ANATSExporterImage
+}
+
+// a2aNATSExporterOmitted reports whether the NATS pod renders without the
+// metrics sidecar: when A2A_NATS_IMAGE is overridden and
+// A2A_NATS_EXPORTER_IMAGE is not. An install that mirrors the bus's images
+// set the first before the sidecar existed, and the default exporter
+// reference would not pull there. The sidecar is a plain container, so a pod
+// whose sidecar cannot start never goes Ready and its server leaves the bus;
+// metrics never cost a bus server. The reconcile says so in a Warning event
+// (a2aNATSExporterOmittedReason).
+func a2aNATSExporterOmitted() bool {
+	return os.Getenv(a2aNATSImageEnvVar) != "" && os.Getenv(a2aNATSExporterImageEnvVar) == ""
+}
+
+// a2aNATSExporterResources adds an ephemeral-storage request and equal limit,
+// for the container's own log (the supervisor loop's lines and the
+// exporter's), to its CPU and memory, as a2aNATSReloaderResources does. It
+// writes nothing else: its root filesystem is read-only and it mounts nothing.
+func a2aNATSExporterResources() corev1.ResourceRequirements {
+	resources := a2aResources(a2aNATSExporterCPURequest, a2aNATSExporterMemoryRequest, a2aNATSExporterCPULimit, a2aNATSExporterMemoryLimit)
+	resources.Requests[corev1.ResourceEphemeralStorage] = resource.MustParse(emptyDirLogsAllowance)
+	resources.Limits[corev1.ResourceEphemeralStorage] = resource.MustParse(emptyDirLogsAllowance)
+	return resources
+}
+
+// a2aNATSContainers is the NATS pod's containers: the server, the config
+// reloader (buildA2ANATSReloaderContainer), and the metrics sidecar unless
+// a2aNATSExporterOmitted.
+func a2aNATSContainers(server corev1.Container) []corev1.Container {
+	containers := []corev1.Container{server, buildA2ANATSReloaderContainer()}
+	if a2aNATSExporterOmitted() {
+		return containers
+	}
+	return append(containers, a2aNATSExporterContainer())
 }
 
 func a2aProvisionImage() string {
@@ -2318,12 +2441,15 @@ func a2aConsumerCreateImportLines(agent *agentv1alpha1.PlatformAgent) string {
 func renderA2ANATSConf(agent *agentv1alpha1.PlatformAgent, pw func(key string) string, keys *a2aCalloutKeys, profiles []string) string {
 	return a2aPostureComment + `
 
-server_name: ` + a2aNATSName(agent) + `
+# One name per server, from the pod (a JetStream cluster refuses two servers
+# with the same name, and the pod name is the one stable across restarts).
+server_name: $POD_NAME
 port: ` + strconv.Itoa(a2aNATSClientPort) + `
 http: ` + strconv.Itoa(a2aNATSMonitorPort) + `
 # For the reloader in the same pod, which signals this PID when the mounted
 # config changes.
 pid_file: "` + a2aNATSPIDFile + `"
+` + renderA2ANATSLameDuck(agent) + renderA2ANATSCluster(agent) + `
 
 # TLS on the client listener, required of every connection: the server
 # advertises tls_required, so a client that dials nats:// is told to upgrade
@@ -2598,6 +2724,67 @@ authorization {
 `
 }
 
+// renderA2ANATSCluster is the cluster block of a multi-server bus, empty for a
+// single server.
+//
+// Routes: one URL, the headless routes Service, which resolves to every
+// server's pod IP. A server dials it, reaches a peer, and learns the rest of
+// the cluster from that peer's gossip, so the list does not change with the
+// replica count.
+//
+// Authentication is mutual TLS, verified both ways. Each server presents the
+// serving certificate as a client (it carries ClientAuth for this) and
+// requires its peer's, checked against the bus CA. nats-server enforces that
+// on every route as soon as the cluster has a tls block, whatever verify says
+// (it sets RequireAndVerifyClientCert for clusters, opts.go); verify: true
+// states it. So the tls block is the lock, and a test pins it. The serving
+// certificate is the only one the bus CA signs with ClientAuth, and only the
+// NATS pods mount it, so holding the serving key is what joining the cluster
+// takes; the bus fence also admits 6222 from the bus's own pods and nothing
+// else. The auth callout governs clients, not routes, and no route password
+// is rendered: it would add a credential that a holder of the serving key
+// does not need. The peers each server learns by gossip arrive as IPs, which
+// no certificate here names; nats-server dials those with the TLS name saved
+// from the explicit route's hostname (saveRouteTLSName in its route.go), which
+// is why the routes Service's name is one of the certificate's SANs.
+func renderA2ANATSCluster(agent *agentv1alpha1.PlatformAgent) string {
+	if a2aNATSReplicas(agent) <= 1 {
+		return ""
+	}
+	// <service>.<namespace>.svc, not the fully qualified name: a cluster with
+	// a DNS domain other than cluster.local resolves this through the pod's
+	// search path, and the serving certificate names it either way.
+	routeHost := a2aNATSRoutesName(agent) + "." + agent.Namespace + ".svc"
+	return `
+cluster {
+  name: ` + a2aNATSName(agent) + `
+  port: ` + strconv.Itoa(a2aNATSRoutePort) + `
+  # One route per peer, not nats-server's default pool of three. Each pooled
+  # connection carries a share of the accounts' interest, and a restarted
+  # server can come back with some of its pool to a peer missing (measured on
+  # 2.10.29: two of four connections, and the APP account's interest on a
+  # missing one), so a client on that server gets "no responders" for every
+  # stream led by the peer until the next restart. A single route per peer
+  # carries every account; this bus's traffic needs no more.
+  pool_size: -1
+  routes: [
+    "nats-route://` + routeHost + `:` + strconv.Itoa(a2aNATSRoutePort) + `"
+  ]
+  tls {
+    cert_file: "` + a2aNATSTLSMountDir + `/` + a2aNATSTLSCertKey + `"
+    key_file: "` + a2aNATSTLSMountDir + `/` + a2aNATSTLSKeyKey + `"
+    ca_file: "` + a2aNATSTLSMountDir + `/` + a2aNATSTLSCAKey + `"
+    verify: true
+  }
+}
+`
+}
+
+// a2aNATSRoutesName is the headless Service the cluster routes dial.
+func a2aNATSRoutesName(agent *agentv1alpha1.PlatformAgent) string {
+	return a2aNATSName(agent) + "-routes"
+}
+
 // buildA2ANATSConfigSecret renders nats.conf with the real credentials from
 // the creds Secret. This Secret's Data is the one place the passwords are
 // meant to appear; a2aConfigRolloutHash covers the rest of the render.
@@ -2661,13 +2848,21 @@ func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.
 // served until the pod restarts. A renewal rolls the bus once a year; the
 // bus pod's reloader would also apply it in place, but the hash still rolls.
 //
-// The gateway's per-profile deny is left out (renderA2ANATSConf with no
-// profiles): the config Secret carries it, the reloader applies it, and
-// planA2ABusReload confirms it, so a profile change doesn't roll the bus.
-func a2aConfigRolloutHash(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret, keys *a2aCalloutKeys, servingFingerprint string) string {
+// On a single server the gateway's per-profile deny is left out
+// (renderA2ANATSConf with no profiles): the config Secret carries it, the
+// reloader applies it, and planA2ABusReload confirms it, so a profile change
+// doesn't restart the bus. A cluster digests it too, so a profile change rolls
+// the servers one at a time onto it, each in lame duck while the others serve:
+// the reload's confirmation reads one config_load_time through the Service,
+// which can't tell whether every server reloaded, and its fallback restarts
+// one pod.
+func a2aConfigRolloutHash(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret, keys *a2aCalloutKeys, servingFingerprint string, profiles []string) string {
+	if a2aNATSReplicas(agent) <= 1 {
+		profiles = nil
+	}
 	redacted := renderA2ANATSConf(agent, func(key string) string {
 		return fmt.Sprintf(a2aConfigHashPlaceholder, key)
-	}, keys, nil)
+	}, keys, profiles)
 	sum := sha256.Sum256([]byte(redacted + a2aConfigHashRotationSeparator + creds.ResourceVersion +
 		a2aConfigHashRotationSeparator + servingFingerprint))
 	return hex.EncodeToString(sum[:])[:a2aConfigHashLength]
@@ -2680,10 +2875,12 @@ func a2aConfigRolloutHash(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secr
 // a2aConfigHashAnnotation carries the bus's config hash on its pod template.
 const a2aConfigHashAnnotation = "kubeagents.x-k8s.io/a2a-config-hash"
 
-// a2aNATSDataClaim is the StatefulSet's volumeClaimTemplate name. The claim the
-// controller stamps out is "<this>-<sts>-0", which handleDeletion reaps by name --
-// so a rename here that is not matched there turns the reap into a silent no-op
-// and leaks the PV on every CR deletion. One spelling, both sites.
+// a2aNATSDataClaim is the StatefulSet's volumeClaimTemplate name. The claims the
+// controller stamps out are "<this>-<sts>-<ordinal>" (a2aNATSDataClaimName),
+// which handleDeletion reaps by name -- so a rename here that is not matched
+// there turns the reap into a silent no-op and leaks the PVs on every CR
+// deletion. One spelling, both sites.
+
 const a2aNATSDataClaim = "data"
 
 const (
@@ -2694,11 +2891,49 @@ const (
 	// under <store>/jetstream/<account>/streams/ with no SYS/_js_/ Raft metadata
 	// group, so moving the account directory relocates the store cleanly.
 	// When both directories exist (a rollback that skipped moving the store
-	// back), it starts on TRUSTED, leaves APP in place and says so.
+	// back), it starts on TRUSTED, leaves APP in place and says so. A
+	// three-server bus never has an APP directory: the account split ships
+	// before the bus can run three servers, so every cluster's store starts
+	// on TRUSTED and the move is a no-op there.
 	a2aNATSStartupScript = "if [ -d /data/jetstream/APP ] && [ ! -e /data/jetstream/TRUSTED ]; then mv /data/jetstream/APP /data/jetstream/TRUSTED; " +
 		"elif [ -d /data/jetstream/APP ]; then echo 'both /data/jetstream/APP and /data/jetstream/TRUSTED exist: starting on TRUSTED, APP left in place' >&2; fi && " +
 		"exec nats-server -c /etc/nats/nats.conf"
 )
+
+// a2aNATSMaxReplicas is the most servers the bus can run (the busReplicas
+// enum's top value), and so the ordinals handleDeletion reaps claims for.
+const a2aNATSMaxReplicas = 3
+
+// deleteA2ANATSStatefulSetFirst marks the bus StatefulSet this agent
+// controls for deletion, in the foreground so its pods go with it, and
+// reports whether the claim reap has to wait a pass: claims reaped while the
+// StatefulSet still creates pods would be recreated with them
+// (handleDeletion). Once the StatefulSet carries a deletion timestamp its
+// controller creates no pod, and so no claim, and each claim's protection
+// finalizer holds it until its pod exits; so the reap waits for the mark,
+// not for the pods, and a pod stuck terminating on a lost node holds
+// nothing. Read uncached, so a StatefulSet created moments before the CR's
+// deletion isn't missed. A StatefulSet of that name the agent doesn't
+// control isn't its to delete, and doesn't hold the reap.
+func (r *PlatformAgentReconciler) deleteA2ANATSStatefulSetFirst(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (bool, error) {
+	sts := &appsv1.StatefulSet{}
+	if err := r.a2aReader().Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aNATSName(agent)}, sts); err != nil {
+		return false, client.IgnoreNotFound(err)
+	}
+	if !metav1.IsControlledBy(sts, agent) || !sts.DeletionTimestamp.IsZero() {
+		return false, nil
+	}
+	if err := r.Delete(ctx, sts, client.PropagationPolicy(metav1.DeletePropagationForeground)); client.IgnoreNotFound(err) != nil {
+		return false, fmt.Errorf("deleting the A2A bus StatefulSet before its claims: %w", err)
+	}
+	return true, nil
+}
+
+// a2aNATSDataClaimName is the claim the StatefulSet controller creates for
+// the server at ordinal.
+func a2aNATSDataClaimName(agent *agentv1alpha1.PlatformAgent, ordinal int) string {
+	return a2aNATSDataClaim + "-" + a2aNATSName(agent) + "-" + strconv.Itoa(ordinal)
+}
 
 // a2aProvisionResources adds the provision container's ephemeral-storage
 // request and equal limit, for the tmp emptyDir it writes
@@ -2726,6 +2961,7 @@ func a2aResources(cpuRequest, memoryRequest, cpuLimit, memoryLimit string) corev
 
 func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string) *appsv1.StatefulSet {
 	name := a2aNATSName(agent)
+	replicas := a2aNATSReplicas(agent)
 	labels := a2aLabels(agent, "nats")
 	selector := map[string]string{"app": name}
 	podLabels := map[string]string{"app": name}
@@ -2737,11 +2973,34 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 		TypeMeta:   metav1.TypeMeta{APIVersion: "apps/v1", Kind: "StatefulSet"},
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: agent.Namespace, Labels: labels},
 		Spec: appsv1.StatefulSetSpec{
+			// ServiceName stays the client Service, which is ClusterIP and so
+			// gives the pods no per-pod DNS names. The cluster routes do not
+			// need them: they dial the headless routes Service
+			// (buildA2ANATSRoutesService) and learn their peers from it. The
+			// field is immutable, so moving it to a headless Service would
+			// mean deleting and recreating every existing install's
+			// StatefulSet; routing through a second Service avoids that.
 			ServiceName: name,
-			// Single node, R1, per the dev posture in the deployment spec;
-			// production guidance is a 3-node cluster with stream replicas R3.
-			Replicas: ptr.To(int32(1)),
-			Selector: &metav1.LabelSelector{MatchLabels: selector},
+			Replicas:    ptr.To(int32(replicas)), // #nosec G115 -- a2aNATSReplicas returns 1 or 3
+			// A rolled server is Ready once JetStream is enabled on it (the
+			// readiness probe below), before its stream replicas have caught
+			// up. Holding the next roll for this long is an allowance for
+			// that, not a guarantee: a stream that takes longer to catch up
+			// has its writes stall while a second of its replicas restarts,
+			// until it does. Raft quorum keeps it from losing data either way.
+			MinReadySeconds: a2aNATSMinReadySeconds(replicas),
+			Selector:        &metav1.LabelSelector{MatchLabels: selector},
+			// Claims are kept on a scale-down and on StatefulSet deletion: a
+			// maintenance scale to 0 and back, or a flip to today and back,
+			// finds the bus where it left it, and handleDeletion reaps them
+			// with the CR. Only a conversion, which the gate keeps closed in
+			// this release, would want a scale-down to delete them (a later
+			// return to three servers would otherwise find the old cluster's
+			// state); #4225 changes WhenScaled when it opens that path.
+			PersistentVolumeClaimRetentionPolicy: &appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy{
+				WhenScaled:  appsv1.RetainPersistentVolumeClaimRetentionPolicyType,
+				WhenDeleted: appsv1.RetainPersistentVolumeClaimRetentionPolicyType,
+			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels:      podLabels,
@@ -2757,15 +3016,26 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 						FSGroup:        ptr.To(int64(1000)),
 						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 					},
-					Containers: []corev1.Container{{
+					// Lame duck has to finish inside this, with room for the
+					// preStop signal to land first; a single server keeps the
+					// default (a2aNATSTerminationGrace).
+					TerminationGracePeriodSeconds: a2aNATSTerminationGrace(replicas),
+					TopologySpreadConstraints:     a2aNATSTopologySpread(selector, replicas),
+					Containers: a2aNATSContainers(corev1.Container{
 						Name:    "nats",
 						Image:   a2aNATSImage(),
 						Command: []string{"/bin/sh", "-c", a2aNATSStartupScript},
-						Ports: []corev1.ContainerPort{
-							{Name: "client", ContainerPort: a2aNATSClientPort},
-							{Name: "monitor", ContainerPort: a2aNATSMonitorPort},
-							{Name: "websocket", ContainerPort: a2aNATSWebSocketPort},
-						},
+						// server_name in nats.conf is $POD_NAME: every server
+						// in a JetStream cluster needs its own, and the pod
+						// name is the one that is stable across restarts.
+						Env: []corev1.EnvVar{{
+							Name:      "POD_NAME",
+							ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}},
+						}},
+						Ports: a2aNATSContainerPorts(replicas),
+						// Lame duck on the way out, on a cluster only
+						// (a2aNATSLifecycle).
+						Lifecycle: a2aNATSLifecycle(replicas),
 						VolumeMounts: []corev1.VolumeMount{
 							{Name: "config", MountPath: a2aNATSConfMountDir, ReadOnly: true},
 							{Name: a2aNATSTLSVolume, MountPath: a2aNATSTLSMountDir, ReadOnly: true},
@@ -2776,10 +3046,10 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 						Resources:       a2aResources(a2aNATSCPURequest, a2aNATSMemoryRequest, a2aNATSCPULimit, a2aNATSMemoryLimit),
 						ReadinessProbe: &corev1.Probe{
 							ProbeHandler: corev1.ProbeHandler{
-								HTTPGet: &corev1.HTTPGetAction{Path: "/healthz", Port: intstr.FromString("monitor")},
+								HTTPGet: &corev1.HTTPGetAction{Path: a2aNATSReadinessPath(replicas), Port: intstr.FromString("monitor")},
 							},
 						},
-					}, buildA2ANATSReloaderContainer()},
+					}),
 					Volumes: []corev1.Volume{{
 						Name:         a2aNATSPIDVolume,
 						VolumeSource: a2aNATSPIDVolumeSource(),
@@ -2830,6 +3100,53 @@ func buildA2ANATSService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {
 				// server, not this port.
 				{Name: "websocket", Port: a2aNATSWebSocketPort},
 			},
+		},
+	}
+}
+
+// buildA2ANATSRoutesService is the headless Service the cluster routes dial
+// (renderA2ANATSCluster): no ClusterIP, so its name resolves to every
+// server's pod IP rather than to one virtual IP that would balance a route
+// onto whichever server it liked, including the one dialling.
+//
+// PublishNotReadyAddresses, because a server reports ready only once it
+// serves, and on a new cluster it cannot serve JetStream until it has met
+// its peers: publishing only ready addresses would keep the first server
+// from finding the second. Port 6222 only; clients use the client Service.
+func buildA2ANATSRoutesService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {
+	return &corev1.Service{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Service"},
+		ObjectMeta: metav1.ObjectMeta{Name: a2aNATSRoutesName(agent), Namespace: agent.Namespace, Labels: a2aLabels(agent, "nats")},
+		Spec: corev1.ServiceSpec{
+			ClusterIP:                corev1.ClusterIPNone,
+			PublishNotReadyAddresses: true,
+			Selector:                 map[string]string{"app": a2aNATSName(agent)},
+			Ports:                    []corev1.ServicePort{{Name: "cluster", Port: a2aNATSRoutePort}},
+		},
+	}
+}
+
+// buildA2ANATSPDB keeps an eviction from taking more than one server of a
+// multi-server bus at a time: with two of three left, the cluster keeps its
+// JetStream quorum and every R3 stream keeps a leader.
+//
+// maxUnavailable 1, not 0. A budget that allows no eviction holds every node
+// drain and upgrade, and every install would trip the obtainability audit's
+// own blocking-pdb finding (obtainability_audit_sop.md §3.4); #3274 has the
+// argument. UnhealthyPodEvictionPolicy AlwaysAllow for the callout's reason
+// (buildA2ACalloutPDB): a server that is Running and not Ready is not
+// serving, and holding a drain to protect it protects nothing.
+//
+// Not rendered for a single server, where it could only allow the one
+// eviction or block every drain.
+func buildA2ANATSPDB(agent *agentv1alpha1.PlatformAgent) *policyv1.PodDisruptionBudget {
+	return &policyv1.PodDisruptionBudget{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "policy/v1", Kind: "PodDisruptionBudget"},
+		ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace, Labels: a2aLabels(agent, "nats")},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			MaxUnavailable:             ptr.To(intstr.FromInt32(1)),
+			Selector:                   &metav1.LabelSelector{MatchLabels: map[string]string{"app": a2aNATSName(agent)}},
+			UnhealthyPodEvictionPolicy: ptr.To(policyv1.AlwaysAllow),
 		},
 	}
 }
@@ -2997,15 +3314,20 @@ func buildA2ASessionNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluster
 // grants do the real refusing; with it the network layer agrees with the
 // grants: 4222 from exactly the enumerated bus clients (and every pod in the
 // AgentProfile namespace, once that namespace's own fence is in place), 9222 from exactly the
-// console server, nothing else.
+// console server, the exporter sidecar's a2aNATSMetricsPort from the
+// managed-Prometheus collector's namespace and the operator's own pod (the
+// bus-stream check), nothing else.
 //
 // 8222 (monitor) gets one peer, the operator's own pod, which reads
 // config_load_time there to confirm a config reload (planA2ABusReload). It's
 // the same peer 4222 admits, and nothing else on the pod network reaches the
 // port. The kubelet's readiness probe enters from the node, which
-// NetworkPolicy does not govern (Dataplane V2 exempts host-local traffic).
-// With no operator peer (a2aOperatorNATSPeers) there is no 8222 rule, a
-// reload can't be confirmed, and the operator restarts the bus pod instead.
+// NetworkPolicy does not govern (Dataplane V2 exempts host-local traffic),
+// and the exporter sidecar (a2aNATSExporterContainer) reads it over the
+// pod's loopback. A scrape reaches the exporter's port instead, which serves
+// the derived series and nothing of the monitor's own endpoints. With no
+// operator peer (a2aOperatorNATSPeers) there is no 8222 rule, a reload can't
+// be confirmed, and the operator restarts the bus pod instead.
 //
 // 9222 (ws) gets one peer, the console server. The browser reaches the console
 // server through a port-forward and the server proxies the page's websocket to
@@ -3056,12 +3378,13 @@ func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 					// new work.
 					//
 					// The same rule is owed to the peers that arm later.
-					// The audit exporter, the janitor and the metrics
-					// scrape each add one when they exist. And the NATS
-					// pods join on their route port the moment this
-					// leaves the single-node dev shape: a 3-node cluster's
-					// servers dial each other, and a fence without the
-					// route peer means the cluster never forms.
+					// The audit exporter and the janitor each add one
+					// when they exist; the metrics scrape needs none, as
+					// it reads the monitor port over loopback. The NATS
+					// servers' own route peer, on 6222, is a separate rule
+					// (a2aNATSRouteIngress): a multi-server bus's servers
+					// dial each other, and a fence without it means the
+					// cluster never forms.
 					{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
 						"app": a2aCalloutName(agent),
 					}}},
@@ -3118,6 +3441,23 @@ func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 						"app": a2aConsoleName(agent),
 					}}},
 				},
+			}, {
+				// The exporter sidecar's port from the managed-Prometheus
+				// collector's namespace, the shape of the A2A gateway's
+				// metrics rule (buildA2AGatewayNetworkPolicy), and from the
+				// operator's own pod (below).
+				// The exporter reads 8222 over loopback, so this rule is
+				// what the scrape needs, and the collector gets nothing on
+				// 8222, whose one peer is the operator's (planA2ABusReload).
+				// The operator's own pod is the other peer here: the
+				// bus-stream check reads the stream list on this port
+				// (BusStreamPoller).
+				Ports: []networkingv1.NetworkPolicyPort{tcpPort(a2aNATSMetricsPort)},
+				From: append([]networkingv1.NetworkPolicyPeer{{
+					NamespaceSelector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{labelMetadataName: gmpNamespace},
+					},
+				}}, a2aOperatorNATSPeers()...),
 			}},
 		},
 	}
@@ -3129,7 +3469,28 @@ func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 			From: operator,
 		})
 	}
+	policy.Spec.Ingress = append(policy.Spec.Ingress, a2aNATSRouteIngress(agent)...)
 	return policy
+}
+
+// a2aNATSRouteIngress admits the cluster routes: 6222 from the bus's own
+// servers and nothing else. Without it the servers cannot dial each other and
+// the cluster never forms; with a wider peer, anything that reached 6222 would
+// only need a certificate the bus CA signed (renderA2ANATSCluster).
+//
+// Rendered whatever the server count. A fence that followed the count would
+// drop this rule on any pass that read a count other than the one running (a
+// refused spec edit that also sets busReplicas renders the fence without
+// converting the bus), cutting a running cluster's routes and its quorum. On a
+// single server nothing listens on 6222, so the rule admits nothing there.
+func a2aNATSRouteIngress(agent *agentv1alpha1.PlatformAgent) []networkingv1.NetworkPolicyIngressRule {
+	tcp := corev1.ProtocolTCP
+	return []networkingv1.NetworkPolicyIngressRule{{
+		Ports: []networkingv1.NetworkPolicyPort{{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(a2aNATSRoutePort))}},
+		From: []networkingv1.NetworkPolicyPeer{{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
+			"app": a2aNATSName(agent),
+		}}}},
+	}}
 }
 
 // a2aOperatorNATSPeers admits the operator's own pod, which publishes
@@ -3399,7 +3760,7 @@ NATS="nats --server ` + a2aNATSTLSScheme + server + ` --tlsca ` + a2aNATSCAFile(
 # fetchOriginAtSeq and docs/designs/spec-nats-deployment.md.
 $NATS stream info TASKS >/dev/null 2>&1 || $NATS stream add TASKS --allow-direct \
   --subjects='a2a.tasks.>' --storage=file --retention=limits \
-  --max-age=72h --max-bytes=21474836480 --discard=old --replicas=1 \
+  --max-age=72h --max-bytes=21474836480 --discard=old --replicas="${STREAM_REPLICAS}" \
   --max-msgs-per-subject=` + strconv.Itoa(a2aTasksMaxMsgsPerSubject) + ` \
   --max-consumers=` + strconv.Itoa(a2aTasksMaxConsumers(agent)) + ` --defaults
 
@@ -3439,7 +3800,7 @@ fixed_durable ` + a2aBridgeDurable() + ` bridge --pull \
 # DIRECTORY: last-value — the tombstone replaces the card. 1GiB cap.
 $NATS stream info DIRECTORY >/dev/null 2>&1 || $NATS stream add DIRECTORY --allow-direct \
   --subjects='a2a.agents.>' --storage=file --retention=limits \
-  --max-msgs-per-subject=1 --max-bytes=1073741824 --discard=old --replicas=1 --max-consumers=64 --defaults
+  --max-msgs-per-subject=1 --max-bytes=1073741824 --discard=old --replicas="${STREAM_REPLICAS}" --max-consumers=64 --defaults
 
 # TOPICS-STATE: current answer plus short history, no age limit. 1GiB cap.
 # State-class topics (provisioned registry): upgrade-readiness, topology-skew, blueprint, probe.
@@ -3460,13 +3821,13 @@ $NATS stream info DIRECTORY >/dev/null 2>&1 || $NATS stream add DIRECTORY --allo
 $NATS stream info TOPICS-STATE >/dev/null 2>&1 || $NATS stream add TOPICS-STATE --allow-direct \
   --subjects='a2a.topics.agent.platform.upgrade-readiness,a2a.topics.agent.platform.topology-skew,a2a.topics.shared.blueprint,a2a.topics.shared.probe' \
   --storage=file --retention=limits \
-  --max-msgs-per-subject=8 --max-bytes=1073741824 --discard=old --replicas=1 --max-consumers=64 --defaults
+  --max-msgs-per-subject=8 --max-bytes=1073741824 --discard=old --replicas="${STREAM_REPLICAS}" --max-consumers=64 --defaults
 
 # TOPICS-JOURNAL: append-only, ages out at 30d. 5GiB cap.
 # Journal-class topics: annotations.
 $NATS stream info TOPICS-JOURNAL >/dev/null 2>&1 || $NATS stream add TOPICS-JOURNAL --allow-direct \
   --subjects='a2a.topics.shared.annotations' --storage=file --retention=limits \
-  --max-age=720h --max-bytes=5368709120 --discard=old --replicas=1 --max-consumers=64 --defaults
+  --max-age=720h --max-bytes=5368709120 --discard=old --replicas="${STREAM_REPLICAS}" --max-consumers=64 --defaults
 
 # Heartbeats (agents.hb.>) are core NATS, outside JetStream — no stream.
 
@@ -3486,9 +3847,9 @@ $NATS stream info TOPICS-JOURNAL >/dev/null 2>&1 || $NATS stream add TOPICS-JOUR
 # running task would refuse that task mid-flight instead. Reclaiming is a
 # "nats kv del cap" against a finished task's key; no tooling ships for it
 # and the runbook says so.
-$NATS kv info runtime-state >/dev/null 2>&1 || $NATS kv add runtime-state --history=1 --replicas=1 --storage=file --max-bucket-size=268435456
-$NATS kv info session-state >/dev/null 2>&1 || $NATS kv add session-state --history=1 --replicas=1 --storage=file --max-bucket-size=268435456
-$NATS kv info cap           >/dev/null 2>&1 || $NATS kv add cap --history=1 --replicas=1 --storage=file --max-bucket-size=268435456
+$NATS kv info runtime-state >/dev/null 2>&1 || $NATS kv add runtime-state --history=1 --replicas="${STREAM_REPLICAS}" --storage=file --max-bucket-size=268435456
+$NATS kv info session-state >/dev/null 2>&1 || $NATS kv add session-state --history=1 --replicas="${STREAM_REPLICAS}" --storage=file --max-bucket-size=268435456
+$NATS kv info cap           >/dev/null 2>&1 || $NATS kv add cap --history=1 --replicas="${STREAM_REPLICAS}" --storage=file --max-bucket-size=268435456
 
 # feedback: the 👍 and 👎 ratings chat users gave the gateway's answers, each with
 # the exchange it rated (a2a/gateway/feedback.go). User content, so the max
@@ -3497,7 +3858,7 @@ $NATS kv info cap           >/dev/null 2>&1 || $NATS kv add cap --history=1 --re
 # gateway's user reads or writes its records (provision and seed can list its keys). 64MiB holds about three thousand ratings
 # at their caps (ask, answer and note, about 22KB) and more at a typical
 # size; past it the write is refused, and the rating is counted but not kept.
-$NATS kv info feedback      >/dev/null 2>&1 || $NATS kv add feedback --history=1 --replicas=1 --storage=file --max-bucket-size=67108864 --ttl=720h
+$NATS kv info feedback      >/dev/null 2>&1 || $NATS kv add feedback --history=1 --replicas="${STREAM_REPLICAS}" --storage=file --max-bucket-size=67108864 --ttl=720h
 
 # people: one hashed key and a last-put time per chat person the gateway has
 # seen (a2a/gateway/people.go). The max age is the retention: NATS deletes a
@@ -3505,12 +3866,12 @@ $NATS kv info feedback      >/dev/null 2>&1 || $NATS kv add feedback --history=1
 # bucket without one. Only the gateway's user reads or writes its records
 # (provision and seed can list its keys). 32MiB holds about a hundred thousand
 # entries; past it the put is refused, and the count under-counts.
-$NATS kv info people        >/dev/null 2>&1 || $NATS kv add people --history=1 --replicas=1 --storage=file --max-bucket-size=33554432 --ttl=720h
+$NATS kv info people        >/dev/null 2>&1 || $NATS kv add people --history=1 --replicas="${STREAM_REPLICAS}" --storage=file --max-bucket-size=33554432 --ttl=720h
 # PROFILE_LEASES: each profile task's liveness lease, written only by the
 # dispatcher (lib.ProfileLeaseBucket; contract on #3655). No TTL: the
 # dispatcher reads expiry from each record, so a restarted one can still read
 # every lease it has to re-adopt or fail.
-$NATS kv info PROFILE_LEASES >/dev/null 2>&1 || $NATS kv add PROFILE_LEASES --history=1 --replicas=1 --storage=file --max-bucket-size=67108864
+$NATS kv info PROFILE_LEASES >/dev/null 2>&1 || $NATS kv add PROFILE_LEASES --history=1 --replicas="${STREAM_REPLICAS}" --storage=file --max-bucket-size=67108864
 
 # PROFILE_SUBMITS: new tasks for AgentProfiles, one subject per task
 # (a2a.submit.<profile>.<tier>.<kind>.<task>), published by the gateway and
@@ -3522,7 +3883,7 @@ $NATS kv info PROFILE_LEASES >/dev/null 2>&1 || $NATS kv add PROFILE_LEASES --hi
 # profiles; nothing else makes a consumer here.
 $NATS stream info PROFILE_SUBMITS >/dev/null 2>&1 || $NATS stream add PROFILE_SUBMITS --allow-direct \
   --subjects='a2a.submit.>' --storage=file --retention=limits \
-  --max-age=` + strconv.Itoa(int(a2aProfileSubmitMaxAge.Hours())) + `h --max-bytes=1073741824 --discard=old --replicas=1 \
+  --max-age=` + strconv.Itoa(int(a2aProfileSubmitMaxAge.Hours())) + `h --max-bytes=1073741824 --discard=old --replicas="${STREAM_REPLICAS}" \
   --max-msgs-per-subject=1 --dupe-window=2m \
   --max-consumers=` + strconv.Itoa(a2aProfileDurablesAllowed) + ` --defaults
 
@@ -3535,7 +3896,7 @@ $NATS stream info PROFILE_SUBMITS >/dev/null 2>&1 || $NATS stream add PROFILE_SU
 # means unlimited.
 $NATS stream info DISPATCH_STOPS >/dev/null 2>&1 || $NATS stream add DISPATCH_STOPS --allow-direct \
   --subjects='a2a.stop.>' --storage=file --retention=limits \
-  --max-age=24h --max-bytes=67108864 --discard=old --replicas=1 \
+  --max-age=24h --max-bytes=67108864 --discard=old --replicas="${STREAM_REPLICAS}" \
   --max-msgs-per-subject=1 --max-consumers=1 --defaults
 
 # TASKS older than this render: the limits the create above could not apply.
@@ -3882,6 +4243,12 @@ func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
 							// not as any part of the decision.
 							Name:  "BUS_USER",
 							Value: a2aServiceAccountName(agent.Namespace, a2aProvisionServiceAccountName(agent)),
+						}, {
+							// Every stream and bucket the script creates takes
+							// this, never a literal: one copy per server, up to
+							// three (a2aStreamReplicas).
+							Name:  a2aStreamReplicasEnv,
+							Value: strconv.Itoa(a2aStreamReplicas(agent)),
 						}},
 						VolumeMounts: []corev1.VolumeMount{
 							{Name: "tmp", MountPath: a2aProvisionWritablePath},
@@ -4468,9 +4835,14 @@ func a2aStandingPods(agent *agentv1alpha1.PlatformAgent) int64 {
 	// example CR, no operator flags) cannot show; TestA2AStandingPodsCountThe
 	// ConditionalWorkloads names each. The credential proxy's exec tier is a CR
 	// field (spec.deployment.credentialProxy.exec.replicas, unset as 0); the
-	// workloads behind an operator flag (the MCP door, the dispatcher) come from
+	// workloads behind an operator flag (the MCP door) come from
 	// a2aFlaggedPods, which the chart's quota preflight mirrors.
 	n += int64(credentialProxyExecTierReplicas(agent))
+	// The profile dispatcher, on unless A2A_PROFILE_DISPATCHER is "false"
+	// (operator.profileDispatcher.enabled in the chart).
+	if a2aDispatcherEnabled() {
+		n += int64(ptr.Deref(buildA2ADispatcherDeployment(agent).Spec.Replicas, 1))
+	}
 	n += a2aFlaggedStandingPods(agent)
 	// The gateway's standbys and its rollout's surge pod, under the election
 	// (the builder above renders the one replica it runs before then).
@@ -4483,6 +4855,440 @@ func resolveA2AMaxSessions(agent *agentv1alpha1.PlatformAgent) int {
 		return *limits.MaxSessions
 	}
 	return defaultA2AMaxSessions
+}
+
+// a2aNATSReplicas is the bus's server count: status.busReplicas, which
+// resolveA2ABusReplicas sets at the start of every pass to the count the pass
+// renders (the running bus's, which a set field cannot change: the
+// conversion is refused), otherwise spec.harness.tuning.busReplicas (a bus not
+// yet resolved), otherwise DefaultBusReplicas. Only 1 and 3 are counts: the
+// CRD admits nothing else, and anything else that reaches here (a CR written
+// past the schema) falls through rather than rendering a two-server cluster,
+// which has no JetStream quorum to lose a server from.
+func a2aNATSReplicas(agent *agentv1alpha1.PlatformAgent) int {
+	if r := int(agent.Status.BusReplicas); r == 1 || r == 3 {
+		return r
+	}
+	if limits := agentTuning(agent); limits != nil && limits.BusReplicas != nil {
+		if r := *limits.BusReplicas; r == 1 || r == 3 {
+			return r
+		}
+	}
+	return agentv1alpha1.DefaultBusReplicas
+}
+
+// resolveA2ABusReplicas sets status.busReplicas to the server count this pass
+// renders, before anything renders. An existing bus keeps what it has,
+// because changing the count empties it (the field's doc and
+// spec-nats-deployment.md): the count last resolved, or with no record the
+// shape the StatefulSet's template was rendered for. The live replica count
+// is never read: a StatefulSet scaled by hand, to any count, is a hand scale
+// the next apply reverts, not a new bus shape, so a scale between 1 and 3
+// cannot convert the bus past the gate. Failing a StatefulSet, the record
+// again while the bus left data claims behind (a StatefulSet deleted by hand
+// keeps its claims, and the next one must come back at the bus's count, or it
+// would convert them), and with no record the count the claims imply. The
+// field decides only for a bus that does not exist yet, and three when it is
+// unset.
+//
+// A field that asks an existing bus for another count is refused unless
+// busConversionAllowed (which #4225 sets with the migration): the bus keeps
+// its count, and the refusal is a Warning once and the
+// A2ABusConversionRefused condition. With the gate open, the pass about to
+// convert the bus says so on the PlatformAgent, since the conversion is what
+// empties it.
+func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (converting bool, err error) {
+	running := 0
+	recorded := int(agent.Status.BusReplicas)
+	sts := &appsv1.StatefulSet{}
+	switch err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aNATSName(agent)}, sts); {
+	case err == nil && (recorded == 1 || recorded == 3):
+		// A StatefulSet scaled by hand still holds the bus last resolved:
+		// its count is the record, not its live replicas (a scale from 1 to
+		// 3 or back would otherwise read as the bus's shape) and not the
+		// claims, which a single server scaled to 2 leaves looking like a
+		// cluster short one.
+		running = recorded
+	case err == nil:
+		// The same, with no record (an older CRD pruned it, or a first status
+		// write failed): the shape the StatefulSet was rendered with, never
+		// the claims. Only a cluster's template carries the route port.
+		running = a2aNATSRenderedReplicas(sts)
+	case errors.IsNotFound(err):
+		for ordinal := a2aNATSMaxReplicas - 1; ordinal >= 0 && running == 0; ordinal-- {
+			pvc := &corev1.PersistentVolumeClaim{}
+			switch err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aNATSDataClaimName(agent, ordinal)}, pvc); {
+			case err == nil:
+				if pvc.Labels[labelInstance] == instanceLabel(agent.Namespace, agent.Name) {
+					running = ordinal + 1
+				}
+			case !errors.IsNotFound(err):
+				return false, err
+			}
+		}
+		switch {
+		case running != 0 && (recorded == 1 || recorded == 3):
+			// Claims left behind, and the count last resolved: the record,
+			// as with a StatefulSet. The claims alone can't tell a bus's
+			// shape: under WhenScaled Retain a single server scaled by hand
+			// to 3 keeps claims 1 and 2 after the scale is reverted, and a
+			// cluster whose StatefulSet went before server 1 had its claim
+			// (OrderedReady creates them in turn) leaves one claim, like a
+			// single server. With no claims there is no bus to keep, and
+			// the field decides below.
+			running = recorded
+		case running == 2:
+			// No record: claims for ordinals 0 and 1 and not 2 are a
+			// three-server bus that lost one, not a two-server bus, which
+			// never existed. A flip to today keeps the record (#5451), so a
+			// bus back from today resolves through the case above; this one
+			// is for a record lost another way (a served CRD that prunes it).
+			running = 3
+		}
+	default:
+		return false, err
+	}
+	if running != 1 && running != 3 {
+		running = 0
+	}
+
+	want := running
+	if limits := agentTuning(agent); limits != nil && limits.BusReplicas != nil && (*limits.BusReplicas == 1 || *limits.BusReplicas == 3) {
+		want = *limits.BusReplicas
+	}
+	if want == 0 {
+		want = agentv1alpha1.DefaultBusReplicas
+	}
+	converting = running != 0 && want != running
+	if converting && !r.busConversionAllowed {
+		// The bus keeps the count it runs: converting it would empty it, and
+		// the migration that keeps the data is #4225. Said once, on the pass
+		// that first sees the ask; the condition carries it after.
+		if msg := BusConversionRefusedMessage(int32(want), int32(running)); !a2aBusConversionRefusedConditionCurrent(agent, msg) { // #nosec G115 -- 1 or 3
+			r.recordEvent(agent, corev1.EventTypeWarning, a2aBusConversionRefusedReason, msg)
+		}
+		want, converting = running, false
+	}
+	if converting && int(agent.Status.BusReplicas) != want {
+		r.recordEvent(agent, corev1.EventTypeWarning, reasonA2ABusConverting,
+			fmt.Sprintf("spec.harness.tuning.busReplicas asks for %d NATS servers and the bus runs %d: converting it, which recreates every stream and bucket empty (task history, the topics journal and the KV buckets are lost once)", want, running))
+	}
+	agent.Status.BusReplicas = int32(want) // #nosec G115 -- want is 1 or 3
+	return converting, nil
+}
+
+// a2aNATSRenderedReplicas is the server count a NATS StatefulSet's template
+// was rendered for: three when its server container has the route port
+// (a2aNATSContainerPorts), one otherwise.
+func a2aNATSRenderedReplicas(sts *appsv1.StatefulSet) int {
+	for _, c := range sts.Spec.Template.Spec.Containers {
+		for _, port := range c.Ports {
+			if port.Name == "cluster" {
+				return a2aNATSMaxReplicas
+			}
+		}
+	}
+	return 1
+}
+
+// reasonA2ABusConverting is the Warning resolveA2ABusReplicas records when a
+// set busReplicas converts a running bus.
+const reasonA2ABusConverting = "A2ABusConverting"
+
+// BusConversionRefusedMessage says why the bus keeps its count. The operator's
+// condition and Warning and the admission webhook's refusal share it, so the
+// edit refused at apply time reads the same as the one the operator holds.
+func BusConversionRefusedMessage(asked, running int32) string {
+	return fmt.Sprintf("spec.harness.tuning.busReplicas asks for %d NATS servers and the A2A bus runs %d. "+
+		"An existing bus's server count cannot change yet: converting it would empty the bus, and the migration "+
+		"that keeps its data is #4225. The bus keeps %d; set busReplicas to %d, or remove it, to clear this.",
+		asked, running, running, running)
+}
+
+// a2aBusConversionRefusedMessage is the A2ABusConversionRefused condition's
+// message for this pass, "" when the field asks for nothing the bus does not
+// run. Read after resolveA2ABusReplicas, whose count is the bus's.
+func a2aBusConversionRefusedMessage(agent *agentv1alpha1.PlatformAgent) string {
+	running := agent.Status.BusReplicas
+	limits := agentTuning(agent)
+	if !a2aStackRendering(agent) || limits == nil || limits.BusReplicas == nil || (running != 1 && running != 3) {
+		return ""
+	}
+	asked := *limits.BusReplicas
+	if (asked != 1 && asked != 3) || int32(asked) == running { // #nosec G115 -- 1 or 3
+		return ""
+	}
+	return BusConversionRefusedMessage(int32(asked), running) // #nosec G115 -- 1 or 3
+}
+
+// a2aBusConversionRefusedConditionCurrent reports whether the condition already
+// says msg, where "" means it is to be absent.
+func a2aBusConversionRefusedConditionCurrent(agent *agentv1alpha1.PlatformAgent, msg string) bool {
+	existing := meta.FindStatusCondition(agent.Status.Conditions, a2aBusConversionRefusedConditionType)
+	if msg == "" {
+		return existing == nil
+	}
+	return existing != nil && existing.Status == metav1.ConditionTrue &&
+		existing.Reason == a2aBusConversionRefusedReason && existing.Message == msg
+}
+
+// setA2ABusConversionRefusedCondition writes the condition, or removes it when
+// msg is "". The caller does the API write.
+func setA2ABusConversionRefusedCondition(agent *agentv1alpha1.PlatformAgent, msg string, now metav1.Time) {
+	if msg == "" {
+		meta.RemoveStatusCondition(&agent.Status.Conditions, a2aBusConversionRefusedConditionType)
+		return
+	}
+	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{
+		Type:               a2aBusConversionRefusedConditionType,
+		Status:             metav1.ConditionTrue,
+		Reason:             a2aBusConversionRefusedReason,
+		Message:            msg,
+		ObservedGeneration: agent.Generation,
+		LastTransitionTime: now,
+	})
+}
+
+// a2aStreamReplicas is the replica count every JetStream stream and bucket
+// is created with: one per server, up to JetStream's useful maximum of 3.
+// The provision script reads it as STREAM_REPLICAS, so a stream added there
+// writes --replicas="${STREAM_REPLICAS}" and never a literal (a test walks
+// a2aProvisionedStreams to hold that).
+func a2aStreamReplicas(agent *agentv1alpha1.PlatformAgent) int {
+	return min(a2aNATSMaxReplicas, a2aNATSReplicas(agent))
+}
+
+// a2aStreamReplicasEnv carries a2aStreamReplicas into the provision script.
+const a2aStreamReplicasEnv = "STREAM_REPLICAS"
+
+const (
+	// a2aNATSLameDuckSeconds is lame_duck_duration: how long a stopping
+	// server spreads its clients' reconnects over. a2aNATSTerminationGrace
+	// leaves room above it for the grace period nats-server waits before
+	// it starts, and for the final flush.
+	a2aNATSLameDuckSeconds         = 30
+	a2aNATSTerminationGraceSeconds = 60
+)
+
+// renderA2ANATSLameDuck is the nats.conf line for lame duck on a cluster: how
+// long a stopping server spreads its clients' reconnects over the other
+// servers. The preStop hook signals the pid the config reloader also reads
+// (a2aNATSPIDFile, rendered for every bus). A single server renders none
+// (a2aNATSLifecycle).
+func renderA2ANATSLameDuck(agent *agentv1alpha1.PlatformAgent) string {
+	if a2aNATSReplicas(agent) <= 1 {
+		return ""
+	}
+	return `
+# How long a stopping server spreads its clients' reconnects over. The
+# preStop hook signals the pid in pid_file above.
+lame_duck_duration: "` + strconv.Itoa(a2aNATSLameDuckSeconds) + `s"
+`
+}
+
+// a2aNATSLifecycle is the server's preStop lame-duck signal on a cluster: the
+// server stops accepting connections and moves its clients to the other
+// servers over lame_duck_duration, rather than dropping them all when the
+// kubelet's TERM arrives. A single server has nowhere to move them, and lame
+// duck there only delays its exit (nats-server ignores TERM while in lame
+// duck, and the StatefulSet cannot start the same-named replacement until the
+// pod is gone), so it gets none.
+func a2aNATSLifecycle(replicas int) *corev1.Lifecycle {
+	if replicas <= 1 {
+		return nil
+	}
+	return &corev1.Lifecycle{
+		PreStop: &corev1.LifecycleHandler{
+			Exec: &corev1.ExecAction{Command: []string{"nats-server", "--signal", "ldm=" + a2aNATSPIDFile}},
+		},
+	}
+}
+
+// a2aNATSExporterContainer is the metrics sidecar in every NATS pod, on a
+// one-server bus and on each server of a cluster: prometheus-nats-exporter
+// reading its own server's monitor listener over the pod's loopback and
+// serving what it reads on a2aNATSMetricsPort for the managed-Prometheus
+// collector.
+//
+// -varz carries the server's JetStream storage (used, reserved, and the
+// configured maximum). -jsz=all asks the server for /jsz with consumers and
+// stream config, which is the one jsz filter that exports each stream's
+// max_bytes beside its bytes; the narrower "streams" filter leaves config
+// out. The exporter labels its series with the URL it reads, the same on
+// every server; the collector's own pod label tells the servers apart.
+//
+// The exporter runs under a2aNATSExporterSupervisor rather than as the
+// container's own process. The pod is Ready only while every container is,
+// so an exporter that exited would take its server out of the client Service
+// and count against the bus's disruption budget; the loop keeps the
+// container running and restarts the exporter instead. A native sidecar does
+// not help: measured on GKE 1.35, one that crashes or fails its probe makes
+// the pod NotReady the same way, and one whose image will not pull keeps the
+// server from starting at all. What the loop cannot cover is an OOM kill,
+// which takes the whole container: GOMEMLIMIT sits below the memory limit so
+// the exporter collects garbage before it gets there.
+//
+// No preStop, unlike the server: the loop kills the exporter and exits on
+// SIGTERM, which the kubelet sends it at the start of the pod's grace period
+// while the server's lame duck runs (a2aNATSLifecycle). The bus is unscraped
+// for that window, which costs one or two missing samples per roll.
+func a2aNATSExporterContainer() corev1.Container {
+	monitorURL := "http://" + net.JoinHostPort(a2aNATSExporterMonitorHost, strconv.Itoa(a2aNATSMonitorPort))
+	return corev1.Container{
+		Name:    a2aNATSExporterContainerName,
+		Image:   a2aNATSExporterImage(),
+		Command: []string{"/bin/sh", "-c", a2aNATSExporterSupervisor, a2aNATSExporterBinary},
+		Env:     []corev1.EnvVar{{Name: "GOMEMLIMIT", Value: a2aNATSExporterGoMemLimit}},
+		Args: []string{
+			"-port=" + strconv.Itoa(int(a2aNATSMetricsPort)),
+			"-varz",
+			"-jsz=all",
+			monitorURL,
+		},
+		Ports: []corev1.ContainerPort{{
+			Name: a2aNATSMetricsPortName, ContainerPort: a2aNATSMetricsPort,
+		}},
+		SecurityContext: &corev1.SecurityContext{
+			RunAsNonRoot:             ptr.To(true),
+			RunAsUser:                ptr.To(a2aNATSExporterUID),
+			RunAsGroup:               ptr.To(a2aNATSExporterUID),
+			AllowPrivilegeEscalation: ptr.To(false),
+			ReadOnlyRootFilesystem:   ptr.To(true),
+			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+			SeccompProfile:           &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+		},
+		Resources: a2aNATSExporterResources(),
+	}
+}
+
+// a2aNATSExporterBinary is the exporter's path in its image, which runs it
+// from /entrypoint.sh as exec "/${GO_APP}".
+const a2aNATSExporterBinary = "/prometheus-nats-exporter"
+
+// a2aNATSExporterSupervisor runs the exporter with the container's args and
+// restarts it whenever it exits, logging the exit code, after a pause that
+// doubles from 1s to 30s and starts again at 1s once a run has lasted a
+// minute, so a crashing exporter cannot spin. The shell is the container's
+// main process, the one the kubelet's TERM reaches. The pod shares one
+// process namespace for the config reloader, so the shell isn't PID 1 (the
+// pause process is), and the trap is what ends the run cleanly: it kills the
+// exporter (or the pause) and exits at once on TERM or INT, so a pod delete
+// or a NATS drain is not held for the grace period, and no exporter is left
+// running past its shell. The image is alpine, so sh,
+// sleep, date and cat are busybox's.
+//
+// Before the first run it sets GOMEMLIMIT to 80% of the container's actual
+// memory limit, read from its cgroup. The rendered value assumes the
+// rendered limit, but an Autopilot cluster without Pod bursting rewrites the
+// limit to the request, and a GOMEMLIMIT above the real limit never makes
+// the runtime collect early. A limit that reads "max" (none) or can't be read
+// (a cgroup v1 node) keeps the rendered value.
+const a2aNATSExporterSupervisor = `trap 'kill -TERM "$pid" 2>/dev/null; exit 0' TERM INT
+max=$(cat /sys/fs/cgroup/memory.max 2>/dev/null)
+case "$max" in
+  '' | *[!0-9]*) ;;
+  *) GOMEMLIMIT=$((max / 5 * 4)) && export GOMEMLIMIT ;;
+esac
+echo "prometheus-nats-exporter GOMEMLIMIT=$GOMEMLIMIT" >&2
+delay=1
+while :; do
+  started=$(date +%s)
+  "$0" "$@" &
+  pid=$!
+  wait "$pid"
+  rc=$?
+  if [ $(($(date +%s) - started)) -ge 60 ]; then delay=1; fi
+  echo "prometheus-nats-exporter exited with code $rc; restarting in ${delay}s" >&2
+  sleep "$delay" &
+  pid=$!
+  wait "$pid"
+  delay=$((delay * 2))
+  if [ "$delay" -gt 30 ]; then delay=30; fi
+done`
+
+// a2aNATSTerminationGrace is the pod's grace period: room for lame duck on a
+// cluster, the Kubernetes default on a single server, which runs none.
+func a2aNATSTerminationGrace(replicas int) *int64 {
+	if replicas <= 1 {
+		return nil
+	}
+	return ptr.To(int64(a2aNATSTerminationGraceSeconds))
+}
+
+// a2aNATSMinReadySeconds holds a multi-server bus's rollout between servers
+// (the comment on MinReadySeconds in buildA2ANATSStatefulSet). A single
+// server has no peer to wait for.
+func a2aNATSMinReadySeconds(replicas int) int32 {
+	if replicas > 1 {
+		return a2aNATSClusterMinReadySeconds
+	}
+	return 0
+}
+
+// a2aNATSClusterMinReadySeconds is the pause between a multi-server bus's
+// rolled servers (a2aNATSMinReadySeconds).
+const a2aNATSClusterMinReadySeconds = 20
+
+// a2aNATSReadinessPath is the server's health endpoint as the readiness probe
+// reads it. A single server keeps the full /healthz, which includes JetStream.
+// A cluster member reports ready once JetStream is enabled on it
+// (js-enabled-only), which is the one level of the check that does not wait
+// for a JetStream meta leader. A fresh cluster cannot elect one until a second
+// server is up, and the StatefulSet's OrderedReady policy does not start the
+// second until the first is Ready, so any check that waits for the leader
+// deadlocks the bus before it forms. js-server-only is not enough: in
+// nats-server 2.10 it skips the stream and consumer checks but still requires
+// the meta leader (monitor.go, healthz), measured live as a 503 on a lone
+// second server.
+func a2aNATSReadinessPath(replicas int) string {
+	if replicas > 1 {
+		return "/healthz?js-enabled-only=true"
+	}
+	return "/healthz"
+}
+
+// a2aNATSContainerPorts lists the server's listeners; the route port only on
+// a multi-server bus, which is the only one with a cluster block to serve it.
+func a2aNATSContainerPorts(replicas int) []corev1.ContainerPort {
+	ports := []corev1.ContainerPort{
+		{Name: "client", ContainerPort: a2aNATSClientPort},
+		{Name: "monitor", ContainerPort: a2aNATSMonitorPort},
+		{Name: "websocket", ContainerPort: a2aNATSWebSocketPort},
+	}
+	if replicas > 1 {
+		ports = append(ports, corev1.ContainerPort{Name: "cluster", ContainerPort: a2aNATSRoutePort})
+	}
+	return ports
+}
+
+// a2aNATSTopologySpread keeps a multi-server bus's servers on separate nodes,
+// so one node drain, upgrade or repair takes one server and the cluster keeps
+// its JetStream quorum (two of three).
+//
+// Hostname, DoNotSchedule, minDomains 3: with fewer than three nodes the
+// third server waits Pending rather than doubling up, and on Autopilot or an
+// autoscaled pool that wait is what brings up the third node. Two servers on
+// one node would look healthy and lose quorum to that node's first drain. A
+// Standard cluster that cannot grow to three nodes should run busReplicas 1
+// instead (the field's doc says so). Zone is ScheduleAnyway: spreading
+// across zones is better, but a single-zone cluster is common and a zone
+// spread must not block it.
+func a2aNATSTopologySpread(selector map[string]string, replicas int) []corev1.TopologySpreadConstraint {
+	if replicas <= 1 {
+		return nil
+	}
+	return []corev1.TopologySpreadConstraint{{
+		MaxSkew:           1,
+		MinDomains:        ptr.To(int32(replicas)), // #nosec G115 -- a2aNATSReplicas returns 1 or 3
+		TopologyKey:       corev1.LabelHostname,
+		WhenUnsatisfiable: corev1.DoNotSchedule,
+		LabelSelector:     &metav1.LabelSelector{MatchLabels: selector},
+	}, {
+		MaxSkew:           1,
+		TopologyKey:       corev1.LabelTopologyZone,
+		WhenUnsatisfiable: corev1.ScheduleAnyway,
+		LabelSelector:     &metav1.LabelSelector{MatchLabels: selector},
+	}}
 }
 
 // a2aBridgeConcurrency is the number of bridge workers this CR declares: the
@@ -5615,6 +6421,12 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		if slack.AnswerFeedback != nil && !*slack.AnswerFeedback {
 			backendEnv = append(backendEnv, corev1.EnvVar{Name: a2aSlackAnswerFeedbackEnvVar, Value: strconv.FormatBool(false)})
 		}
+		// End-to-end test users, from the operator's own environment and
+		// never from the CR, so only an operator deployed for CI or eval
+		// renders it; unset, the gateway's env and pod are as they were.
+		if users := strings.TrimSpace(os.Getenv(a2aSlackTestUsersEnvVar)); users != "" {
+			backendEnv = append(backendEnv, corev1.EnvVar{Name: a2aSlackTestUsersEnvVar, Value: users})
+		}
 		// The learned-home contract (platformagent_home_channel_record.go):
 		// whether the gateway may learn a home channel from the first
 		// admitted mention, the record it writes, its own image for the
@@ -5937,6 +6749,9 @@ type a2aProvisionState struct {
 	// (reconcileA2ADispatcherWithJobMode), nil when it made nothing of it,
 	// for the DispatcherJobMode condition written on the way out.
 	dispatcherJobMode *metav1.Condition
+	// dispatcherCeiling is the DispatcherCeiling verdict, written on
+	// the way out (syncDispatcherCeiling).
+	dispatcherCeiling *metav1.Condition
 
 	// gatewayHeld reports that the gateway Deployment was withheld this
 	// pass because BusCredentialsReady is not yet true. It exists to make
@@ -5983,6 +6798,12 @@ type a2aProvisionState struct {
 	// a2aMCPTokenUnownedReason for its token Secret (ensureA2AMCPToken), ""
 	// otherwise. The status writers carry it as a2aMCPIdentityConditionType.
 	mcpNotRendered string
+	// busReplicasPersisted is status.busReplicas as the CR carried it before
+	// this pass resolved it (resolveA2ABusReplicas sets the in-memory copy).
+	// The status writers skip a pass whose status is unchanged, and they
+	// compare against the in-memory copy, so this is what tells them the
+	// resolved count still has to be written.
+	busReplicasPersisted int32
 	// scopeCondition is the ScopeResolved condition reconcileScopePublisher
 	// read off the resolved-scope ConfigMap, nil for a scope with nothing to
 	// resolve; the status writers carry it. scopeRequeue is when the
@@ -6146,6 +6967,24 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profileErr *error, homeRec homeChannelRecord) (a2aProvisionState, error) {
 	state := a2aProvisionState{homeRecord: homeRec}
 
+	// First: everything below renders from the server count, and a count
+	// read before this would be last pass's, or the default.
+	state.busReplicasPersisted = agent.Status.BusReplicas
+	converting, err := r.resolveA2ABusReplicas(ctx, agent)
+	if err != nil {
+		return state, fmt.Errorf("resolving the A2A bus's server count: %w", err)
+	}
+	// A conversion empties the bus once the last server restarts into the new
+	// shape, so the provisioned-once record no longer describes it. Dropping
+	// it makes the provision Job count toward Ready again until the new one,
+	// held until the bus has rolled out, completes. A persisted count other
+	// than the resolved one is a conversion whose pass failed after the
+	// StatefulSet apply and before any status write: the StatefulSet already
+	// runs the new count, so only the record still says the drop is owed.
+	if converting || (state.busReplicasPersisted != 0 && state.busReplicasPersisted != agent.Status.BusReplicas) {
+		meta.RemoveStatusCondition(&agent.Status.Conditions, busProvisionedConditionType)
+	}
+
 	creds, err := r.ensureA2ACredsSecret(ctx, agent)
 	if err != nil {
 		return state, fmt.Errorf("failed to ensure A2A NATS creds: %w", err)
@@ -6267,11 +7106,12 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// deny on those subjects (gatewayProfileSupervisorDeny): the admitted
 	// ones and the ones still draining, the same names as the dispatcher's
 	// grant. A profile the controller refuses gets neither. The list is in
-	// the config but not the pod template's hash, so a profile admitted,
-	// removed or done draining reaches the running bus by a reload
-	// (planA2ABusReload) rather than a roll.
+	// the config, and on a single server not the pod template's hash, so a
+	// profile admitted, removed or done draining reaches a single-server bus
+	// by a reload (planA2ABusReload) rather than a restart. A cluster rolls
+	// onto it (a2aConfigRolloutHash).
 	profileNames, _ := dispatcherGrantNames(agent, profiles, draining)
-	sts := buildA2ANATSStatefulSet(agent, a2aConfigRolloutHash(agent, creds, calloutKeys, natsTLS.ServingFingerprint))
+	sts := buildA2ANATSStatefulSet(agent, a2aConfigRolloutHash(agent, creds, calloutKeys, natsTLS.ServingFingerprint, profileNames))
 	busHeld, err := r.a2aBusWaitsForCallout(ctx, agent, sts, calloutGeneration)
 	if err != nil {
 		return state, err
@@ -6295,6 +7135,10 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		if err := r.applyManaged(ctx, agent, config); err != nil {
 			return state, fmt.Errorf("failed to apply A2A NATS config: %w", err)
 		}
+		if a2aNATSExporterOmitted() {
+			r.recordEvent(agent, corev1.EventTypeWarning, a2aNATSExporterOmittedReason,
+				"the A2A bus runs without its metrics exporter: "+a2aNATSImageEnvVar+" is set and "+a2aNATSExporterImageEnvVar+" is not; set it to the mirrored prometheus-nats-exporter image")
+		}
 		if err := ctrl.SetControllerReference(agent, sts, r.Scheme); err != nil {
 			return state, err
 		}
@@ -6308,6 +7152,9 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 			return state, err
 		}
 	}
+	// The apply's response: the generation the provision Job's bus gate
+	// requires the StatefulSet's status to have observed.
+	natsGeneration := sts.Generation
 
 	svc := buildA2ANATSService(agent)
 	if err := ctrl.SetControllerReference(agent, svc, r.Scheme); err != nil {
@@ -6315,6 +7162,10 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	}
 	if err := r.applyManaged(ctx, agent, svc); err != nil {
 		return state, fmt.Errorf("failed to apply A2A NATS Service: %w", err)
+	}
+
+	if err := r.reconcileA2ANATSClusterObjects(ctx, agent); err != nil {
+		return state, err
 	}
 
 	// The capability verifier. It binds the `cap` bucket at boot, and when it
@@ -6425,6 +7276,18 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// The dispatcher (platformagent_a2a_dispatcher.go), when this operator
 	// has an image for it. Its pod-read Role lives in the profile namespace,
 	// and a failure there follows the same rule as the quota's.
+	// Past the size one identity-map shard can carry, the dispatcher's entry
+	// is left out of the map, so it is torn down as though switched off, and
+	// the condition says why (a2aDispatcherCeiling, gke-labs/kube-agents#5381).
+	// The step itself tears the dispatcher down past the ceiling.
+	state.dispatcherCeiling = dispatcherCeilingRemoved
+	if a2aDispatcherEnabled() {
+		ceiling, _, cerr := a2aDispatcherCeiling(agent, profiles, draining)
+		if cerr != nil {
+			return state, cerr
+		}
+		state.dispatcherCeiling = &ceiling
+	}
 	jobMode, dispatcherProfileErr, err := r.reconcileA2ADispatcherWithJobMode(ctx, agent, profiles, profileFenced, draining)
 	state.dispatcherJobMode = jobMode
 	if err != nil {
@@ -6471,13 +7334,20 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		// re-create a Job that exists. A held Job is a pass with
 		// done=false, which is already the requeue.
 		// A held bus is still on its previous config, which a Job of
-		// this one's would provision against; it waits with the bus.
-		if hold, err := r.a2aProvisionJobWaitsForCallout(ctx, agent); err != nil {
+		// this one's would provision against; it waits with the bus, as it
+		// waits for a bus still rolling out.
+		calloutHold, err := r.a2aProvisionJobWaitsForCallout(ctx, agent)
+		if err != nil {
 			return state, err
-		} else if hold || state.busHeld {
+		}
+		busHold, err := r.a2aProvisionJobWaitsForBus(ctx, agent, natsGeneration)
+		if err != nil {
+			return state, err
+		}
+		if hold := calloutHold || busHold || state.busHeld; hold {
 			state.jobHeld = true
-			logf.FromContext(ctx).Info("holding the A2A provision Job until one auth callout replica is ready and the bus is on its current config",
-				"job", job.Name, "callout", a2aCalloutName(agent))
+			logf.FromContext(ctx).Info("holding the A2A provision Job until one auth callout replica is ready and the bus is on its current config and rolled out",
+				"job", job.Name, "callout", a2aCalloutName(agent), "waitingOnCallout", calloutHold, "waitingOnBus", busHold, "busHeld", state.busHeld)
 		} else if err := r.Create(ctx, job); err != nil {
 			return state, fmt.Errorf("failed to create A2A provision Job: %w", err)
 		}
@@ -7086,6 +7956,116 @@ func (r *PlatformAgentReconciler) a2aProvisionJobWaitsForCallout(ctx context.Con
 	return !a2aCalloutServesAnyReplica(callout), nil
 }
 
+// a2aProvisionJobWaitsForBus reports whether the provision Job's creation must
+// wait for the NATS StatefulSet to finish rolling out: every replica on the
+// current revision and Ready, on a status that has observed the generation
+// this pass applied (natsGeneration).
+//
+// Provisioning creates the streams and buckets on the bus as it is when the
+// Job runs, and converting the bus between one server and a cluster deletes
+// every stream when the last server restarts into the new shape
+// (spec-nats-deployment.md). A conversion changes STREAM_REPLICAS and so the
+// Job's digested name, which would start the new Job at once, against a bus
+// still half in the old shape: it would find the old streams, create nothing,
+// complete, and leave the bus with no streams once the roll finished, until
+// the Job's TTL. Waiting for the roll is what makes the Job run on the bus it
+// provisions. Creation only, like the callout gate: a Job that exists is the
+// Job controller's to retry.
+func (r *PlatformAgentReconciler) a2aProvisionJobWaitsForBus(ctx context.Context, agent *agentv1alpha1.PlatformAgent, natsGeneration int64) (bool, error) {
+	sts := &appsv1.StatefulSet{}
+	if err := r.Get(ctx, types.NamespacedName{Name: a2aNATSName(agent), Namespace: agent.Namespace}, sts); err != nil {
+		if errors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, err
+	}
+	return !a2aNATSRolledOut(sts, natsGeneration), nil
+}
+
+// a2aNATSServingReplicas is the NATS StatefulSet's ready count as the status
+// writer counts it toward Ready: its Ready replicas once a quorum of them is
+// Ready, and 0 below that. A JetStream cluster serves with a majority of its
+// servers and not with fewer, so one of three Ready (the others Pending or
+// crash-looping) is a bus that cannot elect a leader, and must not read as
+// ready because one pod is. Two of three, as during a rolling update, serves.
+func a2aNATSServingReplicas(sts *appsv1.StatefulSet) int32 {
+	want := int32(1)
+	if sts.Spec.Replicas != nil {
+		want = *sts.Spec.Replicas
+	}
+	if sts.Status.ReadyReplicas < want/2+1 {
+		return 0
+	}
+	return sts.Status.ReadyReplicas
+}
+
+// a2aNATSShortNote is a sentence for the Ready message when the bus serves on
+// fewer servers than it is configured for, naming each server that is not
+// Ready and why; "" when every server is Ready or the StatefulSet cannot be
+// read. The StatefulSet comes from the informer; the pods are listed only when
+// a server is short.
+func (r *PlatformAgentReconciler) a2aNATSShortNote(ctx context.Context, agent *agentv1alpha1.PlatformAgent) string {
+	want, ready, isShort := r.a2aNATSShort(ctx, agent)
+	if !isShort {
+		return ""
+	}
+	note := fmt.Sprintf("The A2A bus is serving on %d of %d NATS servers", ready, want)
+	pods := &corev1.PodList{}
+	if err := r.podReader().List(ctx, pods, client.InNamespace(agent.Namespace), client.MatchingLabels{"app": a2aNATSName(agent)}); err != nil {
+		return note
+	}
+	var short []string
+	for i := range pods.Items {
+		// A pod on its way out is the one being replaced; its successor
+		// carries the reason.
+		if pods.Items[i].DeletionTimestamp != nil {
+			continue
+		}
+		if why := a2aNATSPodNotReadyReason(&pods.Items[i]); why != "" {
+			short = append(short, pods.Items[i].Name+": "+why)
+		}
+	}
+	slices.Sort(short)
+	if len(short) > 0 {
+		note += " (" + strings.Join(short, "; ") + ")"
+	}
+	return note
+}
+
+// a2aNATSPodNotReadyReason is why a NATS pod is not Ready, "" when it is: the
+// scheduler's message for a pod it cannot place, else a container's waiting
+// reason, else "not Ready".
+func a2aNATSPodNotReadyReason(pod *corev1.Pod) string {
+	for _, c := range pod.Status.Conditions {
+		if c.Type == corev1.PodReady && c.Status == corev1.ConditionTrue {
+			return ""
+		}
+	}
+	for _, c := range pod.Status.Conditions {
+		if c.Type == corev1.PodScheduled && c.Status == corev1.ConditionFalse && c.Message != "" {
+			return strings.TrimSuffix(strings.TrimSpace(c.Message), ".")
+		}
+	}
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.State.Waiting != nil && cs.State.Waiting.Reason != "" {
+			return cs.State.Waiting.Reason
+		}
+	}
+	return "not Ready"
+}
+
+// a2aNATSRolledOut reads a StatefulSet's status as rolled out at generation.
+func a2aNATSRolledOut(sts *appsv1.StatefulSet, generation int64) bool {
+	want := int32(1)
+	if sts.Spec.Replicas != nil {
+		want = *sts.Spec.Replicas
+	}
+	st := sts.Status
+	return st.ObservedGeneration >= generation &&
+		st.Replicas == want && st.ReadyReplicas == want && st.UpdatedReplicas == want &&
+		(st.UpdateRevision == "" || st.CurrentRevision == st.UpdateRevision)
+}
+
 // a2aCalloutSpecObserved reports whether the copy is at least the Generation
 // this pass applied and the Deployment controller has observed it, so its
 // newest ReplicaSet is the current spec's. Readiness never starts a hold on
@@ -7604,6 +8584,10 @@ func (r *PlatformAgentReconciler) deleteA2AAuthMapObjects(ctx context.Context, a
 func (r *PlatformAgentReconciler) a2aBusTeardown(agent *agentv1alpha1.PlatformAgent) []a2aTeardownEntry {
 	return []a2aTeardownEntry{
 		{&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace}}, r.Client},
+		// A multi-server bus's routes Service and budget. Absent on a single
+		// server, which the teardown reads as already gone.
+		{&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSRoutesName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace}}, r.Client},
 		// NetworkPolicy is an Owns() kind (the agent's own policy), so the
 		// cached reads are free.
 		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
@@ -8040,6 +9024,68 @@ func (r *PlatformAgentReconciler) deleteA2ACalloutClusterRoleBinding(ctx context
 		return nil
 	}
 	return client.IgnoreNotFound(r.Delete(ctx, crb))
+}
+
+// reconcileA2ANATSClusterObjects applies the routes Service and the disruption
+// budget, which belong to a multi-server bus. On a single server they are
+// deleted rather than left, so lowering busReplicas does not leave a budget
+// that blocks the last server's drain or a Service that points routes at
+// nothing.
+func (r *PlatformAgentReconciler) reconcileA2ANATSClusterObjects(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	for _, obj := range []client.Object{buildA2ANATSRoutesService(agent), buildA2ANATSPDB(agent)} {
+		if a2aNATSReplicas(agent) > 1 {
+			if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
+				return err
+			}
+			// A minAvailable another manager set on the live budget would
+			// merge with the rendered maxUnavailable and the apply would be
+			// refused, failing everything after this step in reconcileA2A
+			// on every pass; the clear is the callout's and verifier's, for
+			// the same reason.
+			if pdb, isPDB := obj.(*policyv1.PodDisruptionBudget); isPDB {
+				if err := r.clearForeignPDBBudgetField(ctx, pdb); err != nil {
+					return err
+				}
+			}
+			if err := r.applyManaged(ctx, agent, obj); err != nil {
+				return fmt.Errorf("failed to apply A2A NATS %T: %w", obj, err)
+			}
+			// Owned objects only (#3871), as the teardown list removes these
+			// same two: a budget or Service an admin made under one of these
+			// names is skipped and logged, not deleted, and does not fail the
+			// pass.
+		} else if err := r.deleteA2AObjectIfOwned(ctx, agent, obj, r.Client, nil); err != nil {
+			return fmt.Errorf("failed to delete A2A NATS %T for a single-server bus: %w", obj, err)
+		}
+	}
+	return nil
+}
+
+// a2aNATSShort reports a bus StatefulSet with fewer Ready servers than its
+// count.
+func (r *PlatformAgentReconciler) a2aNATSShort(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (want, ready int32, short bool) {
+	sts := &appsv1.StatefulSet{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aNATSName(agent)}, sts); err != nil || sts.Spec.Replicas == nil {
+		return 0, 0, false
+	}
+	want, ready = *sts.Spec.Replicas, sts.Status.ReadyReplicas
+	return want, ready, ready < want
+}
+
+// a2aBusNeedsRecheck is whether a pass that reached the end of Reconcile
+// on a next install must come round again in 30 seconds: anything
+// a2aProvisionState.wantsRequeue asks for (provisioning still running, the
+// gateway held or waking, the bus held, the callouts' map unsettled), or a bus
+// server short of the count. Pods are not watched, so a short server's reason
+// changing (Unschedulable to ImagePullBackOff, or back to Ready) wakes
+// nothing, and the Ready message's note (a2aNATSShortNote) would stand stale
+// until the 15-minute re-probe.
+func (r *PlatformAgentReconciler) a2aBusNeedsRecheck(ctx context.Context, agent *agentv1alpha1.PlatformAgent, state a2aProvisionState) bool {
+	if state.wantsRequeue() {
+		return true
+	}
+	_, _, short := r.a2aNATSShort(ctx, agent)
+	return short
 }
 
 // a2aGatewayScopeFileEnv names the gateway's scope file (A2A_SCOPE_FILE in

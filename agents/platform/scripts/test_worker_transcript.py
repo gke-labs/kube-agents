@@ -151,6 +151,105 @@ class TestScrubStepText(unittest.TestCase):
         other_arg = json.dumps({"path": "a \\\n  b", "command": "ls"})
         self.assertEqual(_scrub("tool_call", other_arg), other_arg)
 
+    def test_only_an_odd_backslash_run_folds_as_a_continuation(self):
+        # Bash removes a backslash-newline and adds nothing; it reads an odd run
+        # before a newline as a continuation and an even run as literal
+        # backslashes, so the newline still ends the command. A backslash
+        # before a CR escapes the CR, so CRLF is no continuation.
+        fold = worker_transcript.fold_shell_continuations
+        self.assertEqual(fold("a\\\n  b"), "a  b")
+        self.assertEqual(fold("kube\\\nctl"), "kubectl")
+        self.assertEqual(fold("a\\\\\n  b"), "a\\\\\n  b")
+        self.assertEqual(fold("a\\\\\\\n  b"), "a\\\\  b")
+        self.assertEqual(fold("a\\\\\\\\\n  b"), "a\\\\\\\\\n  b")
+        self.assertEqual(fold("a\\\r\nb"), "a\\\r\nb")
+        # The masking fold joins an even run's lines with a space, as the file
+        # did before it counted backslashes, so the stored call shows `\ `.
+        stored = json.loads(_scrub("tool_call", json.dumps({"command": "grep -rn\\\\\nU=x\ncurl \"$U\""})))["command"]
+        self.assertEqual(stored, "grep -rn\\ U=x\ncurl \"$U\"")
+
+    def test_masking_joins_an_even_run_or_a_crlf_as_before(self):
+        # A nested `bash -c "…"` halves an even run inside double quotes and
+        # continues the line, so the credential rules read every run joined;
+        # an extra mask is harmless, and a missed one is not.
+        for cmd in (
+            'bash -c "mysql -h db --password \\\\\nhunter2"',
+            "curl -u \\\\\nadmin:hunter2 https://x",
+            "mysql --password \\\r\nhunter2",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertNotIn("hunter2", _scrub("tool_call", json.dumps({"command": cmd})))
+        # Detection still reads only an odd run before an LF as a continuation.
+        self.assertTrue(worker_transcript.command_reads_a_secret("echo done\\\\\nkubectl get secret db -o yaml"))
+        # Runs of 5 and 6 backslashes, past the pairs the other tests cover.
+        fold = worker_transcript.fold_shell_continuations
+        self.assertEqual(fold("a" + "\\" * 5 + "\nb"), "a" + "\\" * 4 + "b")
+        self.assertEqual(fold("a" + "\\" * 6 + "\nb"), "a" + "\\" * 6 + "\nb")
+
+    def test_the_scan_folds_exactly_as_the_regexes_it_replaced(self):
+        # The two folds were regexes until CodeQL flagged them as polynomial;
+        # the one-pass scan must give the same result on every input. The old
+        # regexes live here only, as the reference.
+        import itertools
+        import random
+        import re
+
+        old_continuation = re.compile(r"(?<!\\)((?:\\\\)*)\\\n")
+        old_break_run = re.compile(r"(?<!\\)(\\+)(\r?\n)([ \t]*)")
+
+        def old_detect(command):
+            return old_continuation.sub(lambda m: m.group(1), command)
+
+        def old_mask(command):
+            def one(m):
+                run, line_break, indent = m.groups()
+                if len(run) % 2 and line_break == "\n":
+                    return run[:-1] + indent
+                return run[:-1] + " "
+            return old_break_run.sub(one, command).replace("\\ ", "\ue000")
+
+        inputs = []
+        for head, run, line_break, tail in itertools.product(
+            ("a", 'bash -c "mysql --password', "echo 'q", "x\t", ""),
+            range(9),
+            ("\n", "\r\n", ""),
+            (" b", "\tb", "  \t b", '"', "'", "", "\\"),
+        ):
+            inputs.append(head + "\\" * run + line_break + tail)
+        rng = random.Random(5450)
+        alphabet = ["\\", "\\", "\n", "\r", " ", "\t", '"', "'", "a", "-c "]
+        inputs += ["".join(rng.choice(alphabet) for _ in range(rng.randint(0, 16))) for _ in range(3000)]
+        for command in inputs:
+            with self.subTest(command=command):
+                self.assertEqual(worker_transcript.fold_shell_continuations(command), old_detect(command))
+                self.assertEqual(worker_transcript.fold_shell_command(command), old_mask(command))
+
+    def test_a_continuation_inside_a_word_joins_the_word(self):
+        # The fold used to put a space where bash puts nothing, so a word split
+        # by a continuation hid a secret read or a credential flag.
+        for cmd in (
+            "kube\\\nctl get secret db -o yaml",
+            "kubectl get sec\\\nret db -o yaml",
+            "gcl\\\noud secrets versions access latest --secret=db",
+            "cat /var/run/sec\\\nrets/kubernetes.io/serviceaccount/token",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertTrue(worker_transcript.command_reads_a_secret(cmd))
+        for cmd in ("mysql --pass\\\nword=hunter2", "curl -u admin:hun\\\nter2 https://x"):
+            with self.subTest(cmd=cmd):
+                out = _scrub("tool_call", json.dumps({"command": cmd}))
+                self.assertNotIn("hunter2", out)
+                self.assertNotIn("ter2", out)
+
+    def test_a_secret_read_after_an_even_backslash_run_is_detected(self):
+        # The even run used to fold the newline, so the read joined the line
+        # above and was not seen.
+        for cmd in ("echo done\\\\\nkubectl get secret db -o yaml", "echo done\\\\\\\\\ncat /var/run/secrets/token"):
+            with self.subTest(cmd=cmd):
+                self.assertTrue(worker_transcript.command_reads_a_secret(cmd))
+                self.assertTrue(worker_transcript.is_secret_read_tool_call(json.dumps({"command": cmd})))
+        self.assertFalse(worker_transcript.command_reads_a_secret("echo done\\\\\nkubectl get pods"))
+
     def test_unquoted_value_after_a_credential_key_is_masked_to_the_line_end(self):
         for line in ("password: one two three", "DB_PASSWORD=one two three", "DB_PASSWORD:  my secret phrase here"):
             with self.subTest(line=line):
