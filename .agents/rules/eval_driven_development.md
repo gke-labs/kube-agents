@@ -92,7 +92,10 @@ two exports `hack/ci-eval-pr.sh` makes there: `AGENT_TRANSPORT=inject`, and `AGE
 from the `token` key of the `platform-agent-a2a-inject` Secret in the same namespace. A case on
 `hack/eval/inject-lane-exclusions.txt` is graded over the agent API instead (the today lane and
 the nightlies); run it without them. A case on `hack/eval/api-lane-exclusions.txt` is the
-reverse: it runs only with them, and without them its run errors rather than going red. The lane also appends the GitHub-write safeguard in
+reverse: it runs only with them, and without them its run errors rather than going red. The
+card-wait stopped ask (`[bench:stop-in-card-wait]`) also needs `AGENT_A2A_DOOR_TOKEN`, from the
+`token` key of the `platform-agent-a2a-door` Secret, on an install with the A2A door on; without
+it the run is infrastructure. The lane also appends the GitHub-write safeguard in
 `hack/eval/inject-lane-safeguards.yaml` to every task, so a case that passes here can still trip
 it in CI.
 

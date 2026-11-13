@@ -632,6 +632,8 @@ FOLDER_A = "folders/111111111111"
 FOLDER_B = "folders/222222222222"
 ORG = "organizations/333333333333"
 PREVIOUS_TIME = "2026-11-02T14:00:00Z"
+# The time a test gives two builds it compares, later than PREVIOUS_TIME.
+BUILD_TIME = "2026-11-03T09:00:00Z"
 
 
 def _scope(**fields):
@@ -1445,9 +1447,12 @@ class ClustersMapTest(unittest.TestCase):
         # are what the gateway and the operator admit.
         declared = _scope(projects=["explicit-1"], folders=[FOLDER_A.split("/")[1]])
         assets = {FOLDER_A: ["team-a", "team-b", "explicit-1", MANAGEMENT]}
-        with_map = self._build(FakeBroker(assets=assets, probes={"team-b": DENIED_STDERR}), declared)
-        with mock.patch.object(pub, "_clusters_map", return_value={}):
-            without = self._build(FakeBroker(assets=assets, probes={"team-b": DENIED_STDERR}), declared)
+        # One clock for both builds: an `ok` row stamps confirmedAt with its build's
+        # time, so two builds a second apart would differ by the timestamp alone.
+        with mock.patch.object(pub, "_now", return_value=BUILD_TIME):
+            with_map = self._build(FakeBroker(assets=assets, probes={"team-b": DENIED_STDERR}), declared)
+            with mock.patch.object(pub, "_clusters_map", return_value={}):
+                without = self._build(FakeBroker(assets=assets, probes={"team-b": DENIED_STDERR}), declared)
         self.assertNotIn("clusters", without)
         for key in ("projects", "excludedProjects", "state", "memberHash"):
             self.assertEqual(json.dumps(with_map[key]), json.dumps(without[key]), key)
