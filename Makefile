@@ -945,38 +945,47 @@ tfvar-check: ## Run lifecycle.sh's tfvar() against a real terraform console for 
 # mock_provider put this at 1.7. drift-pubsub's suite raised it to 1.11, for
 # `override_during = plan`: a postcondition on a computed attribute is
 # unreachable without it, since the attribute is unknown at plan time and an
-# apply run leaves state behind that the runs after it silently reuse.
-TERRAFORM_TEST_MIN_VERSION := 1.11.0
+# apply run leaves state behind that the runs after it silently reuse. The
+# scope resolver's suites raised it to 1.15, the first release that accepts a
+# function call (jsonencode) in an override_data value.
+TERRAFORM_TEST_MIN_VERSION := 1.15.0
 
-# Every module and composition that carries a tests/ directory -- the set
-# the validate job initialises -- against mocked providers, so a plan-time
-# rule -- a precondition, a postcondition on a read, the set of bindings a
-# declaration plans -- runs rather than being grepped for
-# (tests/test_scope_iam.py pins the text; these pin the behaviour). A
-# directory without tests/ is skipped, and a new one's tests/ is reached with
-# no edit here; tests/test_terraform_module_tests.py pins the loop, the step
-# and that no test file sits outside it. Every directory runs even after one
-# fails and the failures are named again at the end, for the reason
-# test-python gives: a red run that hides the next suite's result costs a CI
-# round trip to discover.
-terraform-test: ## Run each terraform/{modules,examples}/*/tests suite under `terraform test` with mocked providers; no cloud call (CI runs this; needs terraform >= 1.11, see TERRAFORM_TEST_MIN_VERSION).
-	@command -v terraform >/dev/null 2>&1 || { echo "terraform-test: terraform is required (>= $(TERRAFORM_TEST_MIN_VERSION), for mock_provider and override_during); none on PATH" >&2; exit 1; }; \
+# Where each root keeps its suites. Not Terraform's default `tests`: from 1.6
+# `terraform init` parses a root's tests/ directory, so suites there would
+# break init on every release from 1.6 up to the one their newest test syntax
+# needs, inside the `~> 1.5` the roots declare (1.5 itself never reads tests/;
+# see scripts/installer/min_versions.sh). Both commands below name it.
+TERRAFORM_TEST_DIR := tftests
+
+# Every module and composition that carries a $(TERRAFORM_TEST_DIR)/
+# directory -- the set the validate job initialises -- against mocked
+# providers, so a plan-time rule -- a precondition, a postcondition on a read,
+# the set of bindings a declaration plans -- runs rather than being grepped
+# for (tests/test_scope_iam.py pins the text; these pin the behaviour). A
+# directory without one is skipped, and a new one's is reached with no edit
+# here; tests/test_terraform_module_tests.py pins the loop, the step and that
+# no test file sits outside it. Every directory runs even after one fails and
+# the failures are named again at the end, for the reason test-python gives:
+# a red run that hides the next suite's result costs a CI round trip to
+# discover.
+terraform-test: ## Run each terraform/{modules,examples}/*/tftests suite under `terraform test` with mocked providers; no cloud call (CI runs this; needs terraform >= 1.15, see TERRAFORM_TEST_MIN_VERSION).
+	@command -v terraform >/dev/null 2>&1 || { echo "terraform-test: terraform is required (>= $(TERRAFORM_TEST_MIN_VERSION), for mock_provider, override_during and functions in override values); none on PATH" >&2; exit 1; }; \
 	version="$$(terraform version 2>/dev/null | sed -n '1s/^Terraform v//p')"; \
 	if [ -z "$$version" ]; then \
 	  echo "terraform-test: could not read a Terraform version from \`terraform version\` (first line is not 'Terraform vX.Y.Z'); is PATH's terraform a shim or another binary?" >&2; exit 1; \
 	fi; \
 	if [ "$$(printf '%s\n' "$(TERRAFORM_TEST_MIN_VERSION)" "$$version" | sort -V | head -n1)" != "$(TERRAFORM_TEST_MIN_VERSION)" ]; then \
-	  echo "terraform-test: terraform $$version is too old; the suites need >= $(TERRAFORM_TEST_MIN_VERSION) for mock_provider and override_during (the install floor is lower, the suites are not)" >&2; exit 1; \
+	  echo "terraform-test: terraform $$version is too old; the suites need >= $(TERRAFORM_TEST_MIN_VERSION) for mock_provider, override_during and functions in override values (the install floor is lower, the suites are not)" >&2; exit 1; \
 	fi; \
 	failed=""; for dir in terraform/modules/*/ terraform/examples/*/; do \
-	  if [ -d "$$dir/tests" ]; then \
+	  if [ -d "$$dir/$(TERRAFORM_TEST_DIR)" ]; then \
 	    stale="$$(ls "$$dir"*_override.tf 2>/dev/null)"; \
 	    if [ -n "$$stale" ]; then \
 	      echo "terraform-test: $$dir holds an override file that terraform test would merge silently, so its assertions would run against the override rather than the module; remove it first (lifecycle.sh writes one around each import and removes it, unless killed outright):" >&2; \
 	      printf '  %s\n' $$stale >&2; failed="$$failed $$dir"; continue; \
 	    fi; \
 	    echo "Testing $$dir..."; \
-	    (cd "$$dir" && terraform init -backend=false -input=false >/dev/null && terraform test) || failed="$$failed $$dir"; \
+	    (cd "$$dir" && terraform init -backend=false -input=false -test-directory=$(TERRAFORM_TEST_DIR) >/dev/null && terraform test -test-directory=$(TERRAFORM_TEST_DIR)) || failed="$$failed $$dir"; \
 	  fi; \
 	done; \
 	if [ -n "$$failed" ]; then echo "Failing Terraform test directories:$$failed"; exit 1; fi

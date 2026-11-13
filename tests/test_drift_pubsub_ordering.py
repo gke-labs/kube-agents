@@ -22,7 +22,7 @@ through its own `triggers`, and a reference orders as well as a `depends_on`
 would, so an edge declared beside it would be redundant -- and a test asserting
 that redundant edge would report an ordering failure for removing a line that
 costs no ordering. That link is pinned instead by the `triggers` assertion in
-`terraform/modules/drift-pubsub/tests/sink_writer_grant.tftest.hcl`, which is
+`terraform/modules/drift-pubsub/tftests/sink_writer_grant.tftest.hcl`, which is
 where its real cost shows: lose the reference and the wait stops being re-paid
 when the identity is re-minted or the duration is raised.
 
@@ -66,7 +66,7 @@ publish while the Log Router is still exporting trades `topic_not_found` for
 
 None of this is observable from `terraform test`. A mocked plan cannot show
 which resource was created first and has no notion of a destroy-time wait at
-all, so `terraform/modules/drift-pubsub/tests/sink_writer_grant.tftest.hcl`
+all, so `terraform/modules/drift-pubsub/tftests/sink_writer_grant.tftest.hcl`
 pins the values and this file pins the `depends_on` edges between them. Delete
 any one of the three and that suite still passes green -- which is the
 regression this file exists to catch. The fourth link is the exception that

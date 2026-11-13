@@ -1,6 +1,6 @@
 ---
 title: Release versioning & artifacts
-description: What a kube-agents version number means, what each release publishes, how to verify a release bundle, how the Helm chart is versioned, and how to pin a release in Terraform.
+description: What a kube-agents version number means, what each release publishes, how to verify a release bundle, how to install from a provider mirror on a restricted network, how the Helm chart is versioned, and how to pin a release in Terraform.
 sidebar:
   order: 4
 ---
@@ -129,6 +129,33 @@ jq '.components[] | {name: .name, version: .version, type: .type}' kube-agents-<
 # Inspect container image packages (e.g. operator runtime dependencies):
 jq '.packages[] | {name: .name, version: .versionInfo}' k8s-operator-<VERSION>.spdx.json
 ```
+
+### Terraform providers on a restricted network
+
+The bundle carries the Terraform modules and the kube-agents chart, which `terraform/examples/full-install` reads from local paths. Three things still come from the internet during `terraform init` and `terraform apply`: the providers, from `registry.terraform.io`; the cert-manager chart, from `https://charts.jetstack.io`; and the container images. Point the images at your registry as [Private / custom registry](/kube-agents/deploy/docker-images/#private--custom-registry) describes. For cert-manager, either allow that one host or set `enable_cert_manager = false` and install cert-manager from your mirror before the apply, since the operator's webhooks need it serving; the [full-install README](https://github.com/gke-labs/kube-agents/tree/main/terraform/examples/full-install#installing-from-a-mirrored-registry) has the details.
+
+For the providers, build a mirror on a connected machine, from the same release's `terraform/examples/full-install`, with the same Terraform you will run the install with:
+
+```bash
+cd terraform/examples/full-install
+terraform providers mirror -platform=linux_amd64 /path/to/provider-mirror
+```
+
+Add a `-platform` for each OS and architecture the install will run on (`darwin_arm64` for an Apple-silicon laptop). No lock file is committed, so the mirror's contents decide which provider versions the install uses. Copy the directory to the restricted machine, or serve it over HTTPS, and point the Terraform CLI at it in `~/.terraformrc` (or the file `TF_CLI_CONFIG_FILE` names):
+
+```hcl
+provider_installation {
+  filesystem_mirror {
+    path    = "/path/to/provider-mirror"
+    include = ["registry.terraform.io/*/*"]
+  }
+  direct {
+    exclude = ["registry.terraform.io/*/*"]
+  }
+}
+```
+
+To serve the mirror over HTTPS, use `network_mirror { url = "https://mirror.example.com/providers/" }` in place of `filesystem_mirror`. HashiCorp's [provider installation](https://developer.hashicorp.com/terraform/cli/config/config-file#provider-installation) reference has both forms. The Terraform version the configurations need is on [Prerequisites](/kube-agents/install/prerequisites/).
 
 ## Helm chart versioning
 
