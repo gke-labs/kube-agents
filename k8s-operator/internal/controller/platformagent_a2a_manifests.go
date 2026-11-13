@@ -1631,20 +1631,20 @@ func legacyChatConsumer(agent *agentv1alpha1.PlatformAgent) bool {
 // armed by the same refs). Exactly one consumer holds the app and the mode
 // chooses.
 //
-// One exception, because the gateway runs one real backend per process
-// (a2a/gateway/config.go, FromEnv): when Chat is armed it holds the gateway,
-// as it holds it over the discord-bot Secret, and Slack stays on the legacy
-// consumer rather than reaching nobody. renderMode fails closed, so skew
-// reads as today here too. Unlike Chat, that double-consumes: the frozen
-// gateway holds the pair itself and stays connected beside the re-rendered
-// legacy relay. Accepted and documented in the spec (2026-10-06).
+// Chat does not change this: the gateway runs every armed chat backend in
+// one process (a2a/gateway/config.go, FromEnv), so with both enabled under
+// next the one gateway pod carries Slack beside Chat and the legacy Slack
+// consumer is off. renderMode fails closed, so skew reads as today here too.
+// Unlike Chat, that double-consumes: the frozen gateway holds the pair itself
+// and stays connected beside the re-rendered legacy relay. Accepted and
+// documented in the spec (2026-10-06).
 //
 // The CR alone decides, by decision (2026-10-06): the token Secret is not
 // read, so a multi-workspace bot token (the broker's comma-separated list,
 // which the gateway cannot use) is armed anyway. Such installs must stay on
 // today; the spec's Slack section and the CRD page say so.
 func a2aSlackArmed(agent *agentv1alpha1.PlatformAgent) bool {
-	return renderMode(agent, "gateway") == ModeNext && slackEnabled(agent) && !a2aChatArmed(agent)
+	return renderMode(agent, "gateway") == ModeNext && slackEnabled(agent)
 }
 
 // legacySlackConsumer is the complement: the broker's Slack relay pair, the
@@ -6384,6 +6384,9 @@ func buildA2AGatewayNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkin
 // ServiceAccount holds a verb on it. No DefaultMode: the pod runs as uid 1000
 // with no fsGroup, and a 0400 Secret file would be root's and unreadable.
 //
+// A gateway that also carries Chat reads the same Secret: the Chat backend
+// reads no principal map.
+//
 // Every other gateway keeps the volume it had before Slack could arm one: the
 // principal-map ConfigMap, Discord's test table, which never maps a real
 // principal. The eval door's map is its own ConfigMap at its own path and is
@@ -6425,13 +6428,14 @@ func a2aRequiredSecretRef(ref *corev1.SecretKeySelector, defaultKey string) *cor
 }
 
 // buildA2AGatewayDeployment renders the A2A gateway (the chatops gateway of
-// docs/designs/spec-chatops-gateway.md). Which chat backend it starts on is
+// docs/designs/spec-chatops-gateway.md). Which chat backends it starts are
 // the install's: the Google Chat env and relay token when a2aChatArmed, the
-// Slack token pair from the CR's refs when a2aSlackArmed, the optional
-// discord-bot Secret reference otherwise, and the inject door under its own
-// flag beside any of them. The console door is always armed
-// (a2aConsoleDoorEnvVar), so a gateway with none of those configured starts
-// on the console door alone: every next install renders it at one replica.
+// Slack token pair from the CR's refs when a2aSlackArmed, both together when
+// both are armed, the optional discord-bot Secret reference when neither is,
+// and the inject door under its own flag beside any of them. The console door
+// is always armed (a2aConsoleDoorEnvVar), so a gateway with none of those
+// configured starts on the console door alone: every next install renders it
+// at one replica.
 func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deployment {
 	name := a2aGatewayName(agent)
 	leaseEnv := a2aGatewayLeaseEnv(agent)
@@ -6519,29 +6523,30 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		}
 	}
 
-	// The Google Chat backend, applied the same way: three slices, empty
-	// when the install does not arm it, so every other render is
-	// byte-identical to what it was. What arms it is a2aChatArmed; what it
-	// renders is the env the gateway's FromEnv reads for the gchat adapter,
-	// the projected token the adapter presents to the broker's relay, and
-	// NOT the Discord reference: the gateway refuses two real backends, so
-	// an install with both a discord-bot Secret and Chat enabled under next
-	// gets the one its CR names.
-	backendEnv := []corev1.EnvVar{
-		// Created by hand at install time (the bot token is operator input,
-		// never repo content); the reference is optional so the pod
-		// schedules before it.
-		{Name: "DISCORD_TOKEN", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
-			LocalObjectReference: corev1.LocalObjectReference{Name: a2aDiscordBotSecretName},
-			Key:                  a2aDiscordBotTokenKey,
-			Optional:             ptr.To(true),
-		}}},
+	// The chat backends. The Discord reference is the default for a gateway
+	// the CR arms no chat backend on: when the CR names Chat or Slack, a
+	// discord-bot Secret left in the namespace does not start a third
+	// backend the CR never asked for. Chat (a2aChatArmed) renders the env the
+	// gateway's FromEnv reads for the gchat adapter and the projected token
+	// the adapter presents to the broker's relay, in slices that stay empty
+	// when it is not armed, so every other render is byte-identical to what
+	// it was.
+	var backendEnv []corev1.EnvVar
+	if !a2aSlackArmed(agent) && !a2aChatArmed(agent) {
+		backendEnv = []corev1.EnvVar{
+			// Created by hand at install time (the bot token is operator
+			// input, never repo content); the reference is optional so the
+			// pod schedules before it.
+			{Name: "DISCORD_TOKEN", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: a2aDiscordBotSecretName},
+				Key:                  a2aDiscordBotTokenKey,
+				Optional:             ptr.To(true),
+			}}},
+		}
 	}
-	// The Slack backend takes the Discord reference's place on the same
-	// terms: the CR names it (a2aSlackArmed), so a discord-bot Secret left in
-	// the namespace cannot make the gateway refuse two backends. The pair is
-	// read through the CR's own refs, the ones the legacy broker reads, which
-	// is why the legacy consumer is off whenever this is on.
+	// The Slack backend, beside Chat's when both are armed. The pair is read
+	// through the CR's own refs, the ones the legacy broker reads, which is
+	// why the legacy consumer is off whenever this is on.
 	if a2aSlackArmed(agent) {
 		slack := agent.Spec.Integration.Slack
 		backendEnv = []corev1.EnvVar{
@@ -6593,8 +6598,9 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	var chatEnv []corev1.EnvVar
 	var chatMounts []corev1.VolumeMount
 	// The home-channel projection, read by the notify route and the learner
-	// (a2a/gateway/slack_home_channel.go), on a Slack gateway only: a Chat
-	// gateway's home is the CR's, and its template stays as it was.
+	// (a2a/gateway/slack_home_channel.go), whenever Slack is armed, Chat
+	// beside it or not: Chat's home is the CR's and reads no file, so a
+	// Chat-only gateway's template stays as it was.
 	var homeVolumes []corev1.Volume
 	var homeMounts []corev1.VolumeMount
 	if a2aSlackArmed(agent) {
@@ -6605,7 +6611,6 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	if a2aChatArmed(agent) {
 		gchat := agent.Spec.Integration.GoogleChat
 		allowed := a2aAllowlist(gchat.AllowedUsers)
-		backendEnv = nil
 		chatEnv = []corev1.EnvVar{
 			// The relay is the broker; the gateway pod holds no cloud credential.
 			{Name: a2aGchatRelayURLEnvVar, Value: credentialProxyBaseURL(agent)},
@@ -6654,8 +6659,8 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 	}
 
 	// The container env, in the order it has always had: the bus, the
-	// Discord reference (when not displaced by Chat), the gateway's own
-	// settings, then the Chat backend's and the inject door's additions.
+	// Discord reference or the Slack backend, the gateway's own settings,
+	// then the Chat backend's and the inject door's additions.
 	env := []corev1.EnvVar{
 		{Name: "NATS_URL", Value: a2aNATSClientURL(agent)},
 		a2aNATSCAFileEnvVar(),

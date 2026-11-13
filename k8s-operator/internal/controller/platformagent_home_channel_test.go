@@ -43,9 +43,9 @@ import (
 // TestHomeChannelUnsetMessageFollowsTheGatewaysBackend: the advisory exists
 // exactly when the next stack's gateway holds a chat backend whose home
 // channel is empty (#3320). Today's mode posts through the agent, so it never
-// applies there; with both chats enabled the gateway holds Chat, so only
-// Chat's home channel counts. With no record, Slack's message says a mention
-// sets the channel.
+// applies there; with both chats enabled the gateway holds both, and an
+// empty Chat home is reported first. With no record, Slack's message says a
+// mention sets the channel.
 func TestHomeChannelUnsetMessageFollowsTheGatewaysBackend(t *testing.T) {
 	slackHome := func(mode, home string) func() string {
 		return func() string {
@@ -83,7 +83,8 @@ func TestHomeChannelUnsetMessageFollowsTheGatewaysBackend(t *testing.T) {
 		}, []string{"Google Chat", "Slack Hermes platform meanwhile"}},
 		{"next chat, home set", chatHome("next", "spaces/AAA"), nil},
 		{"today chat, no home", chatHome("", ""), nil},
-		{"next chat and slack, chat home set", bothChatHomeOnly, nil},
+		// Slack shares the gateway, so its empty home is reported.
+		{"next chat and slack, chat home set", bothChatHomeOnly, []string{"Slack", "spec.integration.slack.homeChannel"}},
 		{"next, no chat", func() string { return homeChannelUnsetMessage(a2aTestAgent(), homeChannelRecord{}) }, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -465,6 +466,16 @@ func TestHomeChannelRecordObjectsRoleAndMounts(t *testing.T) {
 			}
 		}
 	}
+
+	// Chat beside Slack under next: Slack is still on the gateway, so both
+	// pods carry the projection.
+	both := chatAndSlackTestAgent("next")
+	bothPod := buildPodTemplateSpec(both, "h", "h", "h", "h", nil, renderOptions{})
+	checkVolume("chat and slack agent pod", volumeOf(bothPod.Spec.Volumes))
+	checkMount("chat and slack agent container", mountOf(brokerContainerNamed(bothPod.Spec.Containers, "platform-agent")), agentChatHomeDir)
+	bothGw := buildA2AGatewayDeployment(both)
+	checkVolume("chat and slack gateway pod", volumeOf(bothGw.Spec.Template.Spec.Volumes))
+	checkMount("chat and slack gateway container", mountOf(&bothGw.Spec.Template.Spec.Containers[0]), a2aGatewayChatHomeDir)
 }
 
 // TestPlatformAgentReconciler_Reconcile_HomeChannelRecordDrivesTheProjection

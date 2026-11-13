@@ -8643,7 +8643,7 @@ func TestPeopleReadingEnabled_TruthTable(t *testing.T) {
 	}{
 		{"next, Chat only", agent(next, true, false, false), true},
 		{"next, Slack only", agent(next, false, true, false), true},
-		{"next, Chat and Slack: Slack on Hermes", agent(next, true, true, false), false},
+		{"next, Chat and Slack: both on the gateway", agent(next, true, true, false), true},
 		{"next, Teams", agent(next, false, false, true), false},
 		{"next, no platform", agent(next, false, false, false), true},
 		{"today, Chat", agent(today, true, false, false), false},

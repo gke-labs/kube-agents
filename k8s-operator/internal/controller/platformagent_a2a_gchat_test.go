@@ -133,12 +133,12 @@ func TestAnArmedGatewayCarriesTheChatBackend(t *testing.T) {
 			t.Errorf("%s = %q (present=%v), want %q", name, got.Value, ok, value)
 		}
 	}
-	// One backend per gateway process: the gateway's guard refuses two, so
-	// the render hands it one. The explicit CR field beats a hand-made
-	// Secret, and the Discord reference is omitted rather than left
-	// optional, because the Secret being present would otherwise arm both.
+	// The Discord reference is the default for a gateway no chat backend
+	// arms. The explicit CR field beats a hand-made Secret: the reference is
+	// omitted rather than left optional, because the Secret being present
+	// would otherwise start a Discord bot the CR never asked for.
 	if _, ok := env["DISCORD_TOKEN"]; ok {
-		t.Error("DISCORD_TOKEN is rendered beside the Chat backend; with the discord-bot Secret present the gateway would refuse to start on two backends")
+		t.Error("DISCORD_TOKEN is rendered beside the Chat backend; a discord-bot Secret left in the namespace would start a backend the CR does not name")
 	}
 
 	var mount *corev1.VolumeMount
@@ -507,16 +507,21 @@ func TestTheAgentRoutesProactivePostsToTheGatewayExactlyWhenArmed(t *testing.T) 
 		name               string
 		agent              *agentv1alpha1.PlatformAgent
 		home, conversation bool
+		// homePlatform is A2A_NOTIFY_PLATFORM's value when present; empty
+		// means google_chat.
+		homePlatform string
 	}{
-		{"today with chat", gchatTestAgent("", true), false, false},
-		{"skew with chat", gchatTestAgent("later", true), false, false},
-		{"next with chat", withHome(gchatTestAgent("next", true), "spaces/AAAA"), true, true},
-		{"next with chat, no home channel", gchatTestAgent("next", true), true, true},
-		{"next with chat and slack, no chat home", chatAndSlackTestAgent("next"), false, true},
-		{"next with chat, not a space", withHome(gchatTestAgent("next", true), "spaces/AAAA/threads/B"), false, false},
-		{"next with chat, bare id", withHome(gchatTestAgent("next", true), "AAAA"), false, false},
-		{"next without chat", withHome(gchatTestAgent("next", false), "spaces/AAAA"), false, false},
-		{"today with chat and home", withHome(gchatTestAgent("", true), "spaces/AAAA"), false, false},
+		{"today with chat", gchatTestAgent("", true), false, false, ""},
+		{"skew with chat", gchatTestAgent("later", true), false, false, ""},
+		{"next with chat", withHome(gchatTestAgent("next", true), "spaces/AAAA"), true, true, ""},
+		{"next with chat, no home channel", gchatTestAgent("next", true), true, true, ""},
+		// Slack shares the gateway, so with no Chat home the proactive
+		// posts route to Slack.
+		{"next with chat and slack, no chat home", chatAndSlackTestAgent("next"), true, true, a2aNotifyPlatformSlack},
+		{"next with chat, not a space", withHome(gchatTestAgent("next", true), "spaces/AAAA/threads/B"), false, false, ""},
+		{"next with chat, bare id", withHome(gchatTestAgent("next", true), "AAAA"), false, false, ""},
+		{"next without chat", withHome(gchatTestAgent("next", false), "spaces/AAAA"), false, false, ""},
+		{"today with chat and home", withHome(gchatTestAgent("", true), "spaces/AAAA"), false, false, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			pod := buildPodTemplateSpec(tc.agent, "h", "h", "h", "h", nil, renderOptions{})
@@ -526,8 +531,12 @@ func TestTheAgentRoutesProactivePostsToTheGatewayExactlyWhenArmed(t *testing.T) 
 				if ok != want {
 					t.Fatalf("%s present = %v, want %v", name, ok, want)
 				}
-				if ok && got.Value != "google_chat" {
-					t.Errorf("%s = %q, want google_chat (the platform name the agent-side callers use)", name, got.Value)
+				wantValue := "google_chat"
+				if name == a2aNotifyPlatformEnvVar && tc.homePlatform != "" {
+					wantValue = tc.homePlatform
+				}
+				if ok && got.Value != wantValue {
+					t.Errorf("%s = %q, want %s (the platform name the agent-side callers use)", name, got.Value, wantValue)
 				}
 			}
 			if (tc.home || tc.conversation) && legacyChatConsumer(tc.agent) {
