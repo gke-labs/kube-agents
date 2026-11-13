@@ -120,7 +120,7 @@ Refuse: a fixture name or a test id in product code; a phrase list edited to mat
 
 ## Step 6: green
 
-On the final head: run the case three times; run every sibling case of the same root cause once. All three must pass on the deterministic checks. The one exception is a Record defect whose writer is in `bench/kube_agents_bench/` or `hack/ci-eval-pr.sh`: its green is the replay of the fixed head's record through the check on `main`, with the exemption line under Live validation; a writer in `a2a/` adds one live run on the fixed head so replayed. A judged score moving is not a pass.
+On the final head: run the case three times; run every sibling case of the same root cause once. All three must pass on the deterministic checks. The greens run on images built from the final head and set on the install's CR. A next-mode gateway pod pulls platform-agent and two images derived from its registry and tag, credential-proxy and hermes-bridge. The sandbox image is the CR's own field or the operator's default. Copy the release's unchanged siblings under the tag before the swap, and set the sandbox image on the CR when it changed. Read the new gateway pod's container images once after it. The one exception is a Record defect whose writer is in `bench/kube_agents_bench/` or `hack/ci-eval-pr.sh`: its green is the replay of the fixed head's record through the check on `main`, with the exemption line under Live validation; a writer in `a2a/` adds one live run on the fixed head so replayed. A judged score moving is not a pass.
 
 ## Step 7: ship
 

@@ -776,3 +776,36 @@ func TestTheStandbyAnswersOnEveryArmedDoor(t *testing.T) {
 		t.Fatalf("standby listens %v", got)
 	}
 }
+
+// A gateway that gave its term up because the bus was down mid-term exits
+// with a termination message naming ErrTermBusLost and how long the bus was
+// down, so the restart reads as that in kubectl describe; another failure
+// writes none.
+func TestServeExplainsABusLostExit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "termination-log")
+	old := terminationLogPath
+	terminationLogPath = path
+	t.Cleanup(func() { terminationLogPath = old })
+	cfg := &gateway.Config{}
+	log := slog.New(slog.DiscardHandler)
+
+	lost := fmt.Errorf("%w for 1m0s, so the lease goes to a replica whose bus may", gateway.ErrTermBusLost)
+	if err := serve(context.Background(), cfg, gateway.NewMetrics(), nil, log, func(context.Context) error { return lost }); !errors.Is(err, gateway.ErrTermBusLost) {
+		t.Fatalf("serve = %v, want the bus-lost error back", err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("termination message: %v", err)
+	}
+	if msg := string(b); !strings.HasPrefix(msg, "ErrTermBusLost: ") || !strings.Contains(msg, "1m0s") {
+		t.Fatalf("termination message = %q, want ErrTermBusLost and the duration", msg)
+	}
+
+	_ = os.Remove(path)
+	if err := serve(context.Background(), cfg, gateway.NewMetrics(), nil, log, func(context.Context) error { return errors.New("something else") }); err == nil {
+		t.Fatal("serve swallowed the error")
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("another failure wrote a termination message: %v", err)
+	}
+}

@@ -572,6 +572,138 @@ class RunNameTest(AnalyzeCase):
         self.assertEqual(line["unstorable"], ["repeats_swapped_number"])
 
 
+class SimilarFilesTest(AnalyzeCase):
+    """A read_file not-found result listing other similar files still matches its recording."""
+
+    @staticmethod
+    def body(similar):
+        call = {"id": "call_1__thought__cmVh", "type": "function",
+                "function": {"name": "read_file", "arguments": json.dumps({"path": "/opt/data/AGENTS.md"})}}
+        result = {"content": "", "total_lines": 0, "file_size": 0, "truncated": False, "is_binary": False,
+                  "is_image": False, "error": "File not found: /opt/data/AGENTS.md"}
+        if similar:
+            result["similar_files"] = similar
+        return {"model": "m", "messages": [
+            {"role": "user", "content": "look at the inventory"},
+            {"role": "assistant", "content": "", "tool_calls": [call]},
+            {"role": "tool", "tool_call_id": "call_1__thought__cmVh", "content": json.dumps(result)},
+        ]}
+
+    @staticmethod
+    def answer(tool, arguments):
+        return {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "call_2__thought__eHl6", "type": "function", "function": {"name": tool, "arguments": json.dumps(arguments)}}]}
+
+    def test_the_next_turn_is_served_whatever_the_list_held(self):
+        answer = self.answer("skill_view", {"name": "support-escalation-bundle"})
+        recorded = self.body(["/opt/data/INVENTORY.md", "/opt/data/SETTINGS.md"])
+        self.assertEqual(self.recorded(recorded, answer)["unstorable"], [])
+        for similar in (["/opt/data/SETTINGS.md"], None):
+            with self.subTest(similar=similar):
+                hit, refused = self.proxy().lookup(self.body(similar), time.time())
+                self.assertIsNone(refused)
+                self.assertIsNotNone(hit)
+                self.assertEqual(hit[3], "exact")
+                self.assertEqual(json.loads(hit[0]["tool_calls"][0]["function"]["arguments"]),
+                                 {"name": "support-escalation-bundle"})
+
+    def test_an_answer_reading_a_listed_file_is_not_stored(self):
+        # Served to a run whose list lacked INVENTORY.md, it would read a file that run was never shown.
+        for arguments in ({"path": "/opt/data/INVENTORY.md"}, {"command": "cd /opt/data && cat INVENTORY.md"}):
+            with self.subTest(arguments=arguments):
+                self.setUp()
+                tool = "read_file" if "path" in arguments else "terminal"
+                line = self.recorded(self.body(["/opt/data/INVENTORY.md", "/opt/data/SETTINGS.md"]),
+                                     self.answer(tool, arguments))
+                self.assertEqual(line["unstorable"], ["names_dropped_similar_file"])
+
+    def test_a_listed_name_holding_a_bound_identifier_is_not_stored(self):
+        body = self.body(["/opt/data/kube-agents-evals-22-notes.md"])
+        body["messages"][0]["content"] = "look at the inventory for kube-agents-evals-22"
+        line = self.recorded(body, self.answer("read_file", {"path": "/opt/data/kube-agents-evals-22-notes.md"}))
+        self.assertEqual(line["unstorable"], ["names_dropped_similar_file"])
+
+    def test_an_answer_naming_a_file_only_this_runs_list_holds_is_not_served(self):
+        # Recorded where INVENTORY.md did not exist yet; this run's list shows another agent wrote it.
+        answer = self.answer("write_file", {"path": "/opt/data/INVENTORY.md", "content": "# fresh"})
+        self.assertEqual(self.recorded(self.body(None), answer)["unstorable"], [])
+        hit, refused = self.proxy().lookup(self.body(["/opt/data/INVENTORY.md"]), time.time())
+        self.assertIsNone(hit)
+        self.assertEqual(refused, {"via": "exact", "guard": "names_dropped_similar_file"})
+        # A run whose list does not name it is served the write.
+        hit, refused = self.proxy().lookup(self.body(["/opt/data/SETTINGS.md"]), time.time())
+        self.assertIsNone(refused)
+        self.assertIsNotNone(hit)
+
+    def test_this_runs_listed_name_is_read_in_the_answer_as_served(self):
+        # Saved, the name is `⟦EVALPROJECT_1⟧-notes.md`; restored with this run's project, it is the listed file.
+        def body(project, similar):
+            asked = self.body(similar)
+            asked["messages"][0]["content"] = f"look at the inventory for {project}"
+            return asked
+
+        answer = self.answer("write_file", {"path": "/opt/data/kube-agents-evals-22-notes.md", "content": "# fresh"})
+        self.assertEqual(self.recorded(body("kube-agents-evals-22", None), answer)["unstorable"], [])
+        hit, refused = self.proxy().lookup(
+            body("kube-agents-evals-23", ["/opt/data/kube-agents-evals-23-notes.md"]), time.time())
+        self.assertIsNone(hit)
+        self.assertEqual(refused, {"via": "exact", "guard": "names_dropped_similar_file"})
+
+
+class SpentProposalTest(AnalyzeCase):
+    """An earlier run's proposal number and revision in submit_suggestion's notice don't fork the key."""
+
+    @staticmethod
+    def body(number, revision):
+        call = {"id": "call_1__thought__cHJl", "type": "function", "function": {
+            "name": "terminal", "arguments": json.dumps({"command": "python3 submit_suggestion.py prepare --branch b"})}}
+        notice = (f"[2026-11-12 02:08:09] [SRE-AUTH] 'platform-agent/b' was the source of "
+                  f"https://github.com/gke-agentic/kube-agents-evals-22-infra/pull/{number}, which is closed. That "
+                  f"proposal's last revision, {revision}, is not in 'main', so it was squash-merged or closed rather "
+                  "than merged whole. The repository no longer holds the branch, so the name is free.")
+        return {"model": "m", "messages": [
+            {"role": "user", "content": "propose the fix"},
+            {"role": "assistant", "content": "", "tool_calls": [call]},
+            {"role": "tool", "tool_call_id": "call_1__thought__cHJl",
+             "content": json.dumps({"output": notice, "exit_code": 0, "error": None})},
+        ]}
+
+    def test_the_next_turn_is_served_with_this_runs_revision(self):
+        said = "The spent branch was last at {}; writing the change on a fresh copy."
+        self.assertEqual(self.recorded(self.body(1399, "3ef98c4e29cf"),
+                                       {"role": "assistant", "content": said.format("3ef98c4e29cf")})["unstorable"], [])
+        replay = self.proxy()
+        echoed = self.body(1398, "141a5bb53467")
+        hit, refused = replay.lookup(echoed, time.time())
+        self.assertIsNone(refused)
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit[0]["content"], said.format("141a5bb53467"))
+
+    def test_the_turn_after_a_served_revision_still_matches(self):
+        said = "Last at {}."
+        first = self.body(1399, "3ef98c4e29cf")
+        answer = {"role": "assistant", "content": said.format("3ef98c4e29cf")}
+        self.assertEqual(self.recorded(first, answer)["unstorable"], [])
+        first["messages"] += [answer, {"role": "user", "content": "thanks"}]
+        self.assertEqual(self.recorded(first, {"role": "assistant", "content": "Done."})["unstorable"], [])
+        replay = self.proxy()
+        echoed = self.body(1398, "141a5bb53467")
+        hit, _ = replay.lookup(echoed, time.time())
+        self.assertIsNotNone(hit)
+        echoed["messages"] += [hit[0], {"role": "user", "content": "thanks"}]
+        hit, refused = replay.lookup(echoed, time.time())
+        self.assertIsNone(refused)
+        self.assertEqual((hit[0]["content"], hit[3]), ("Done.", "exact"))
+
+    def test_an_answer_naming_the_proposal_number_is_not_stored(self):
+        for said in ("vcs.py proposal view 1399 --repo gke-agentic/kube-agents-evals-22-infra",
+                     "First PR (closed): https://github.com/gke-agentic/kube-agents-evals-22-infra/pull/1399"):
+            with self.subTest(said=said):
+                self.setUp()
+                line = self.recorded(self.body(1399, "3ef98c4e29cf"), {"role": "assistant", "content": said})
+                self.assertEqual(line["unstorable"], ["repeats_swapped_number"])
+
+
 class ReasoningTest(AnalyzeCase):
     """An answer's reasoning is checked for credentials, and never stored."""
 

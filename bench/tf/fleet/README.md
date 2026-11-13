@@ -47,6 +47,7 @@ Gateway API CRDs GKE installs with `seeded-a`, and the ComputeClass fixture (`de
 ComputeClass CRD GKE installs with `seeded-c`; on a project that already has both, it changes nothing.
 
 Local validation without credentials: `tofu init -backend=false && tofu validate`.
+A plan or apply needs `gke-gcloud-auth-plugin` on `PATH`: the stack's Kubernetes providers authenticate through it, as gcloud's active credential, on every call rather than with a token read at plan time, which expired mid-apply when a project's apply crossed the hour (the Prow jobs check for it before they start).
 
 Drift is corrected by re-applying this stack with `hack/fleet_reconcile.py`, the fleet's only
 writer: from `main`, under a Boskos lease per project, creates and in-place updates only, plus

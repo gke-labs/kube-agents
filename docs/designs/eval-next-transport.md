@@ -441,7 +441,7 @@ before the bus exists crash-loops the agent's pod). The worker count is sized ag
 bridge's fixed queue as well: the queue behind the workers holds 1024 accepted tasks before the bridge finalizes one
 as `bridge-queue-overflow`, over a hundred times any fan-out the job runs. The operator
 sizes the `TASKS` consumer reserve from that `A2A_BRIDGE_CONCURRENCY` too, from the first `next`
-render, and provisioning never edits a stream that exists, so the first provision has to fit
+render, and provisioning never changes an existing stream's max_consumers, so the first provision has to fit
 the bridge's workers. The deploy therefore sizes the first provision for the bridge (decided
 2026-09-30 on gke-labs/kube-agents#2077): its mode change also sets `spec.harness.tuning.maxSessions` to the
 largest value whose budget at the lane's worker count fits the 64-consumer floor the first

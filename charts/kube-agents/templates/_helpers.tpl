@@ -969,7 +969,7 @@ callbacks is the formatted list of LiteLLM callbacks, built by the caller.
   `thought`, where nothing downstream can tell it from the answer; asking for
   the thoughts gives them a channel of their own. Of the
   settings LiteLLM maps to includeThoughts, this is the one that changes
-  nothing else: with no budget_tokens, LiteLLM v1.106.0
+  nothing else: with no budget_tokens, LiteLLM v1.108.6
   (VertexGeminiConfig._map_thinking_param) sends includeThoughts alone on
   Gemini 3.x, no thinkingLevel, so the model keeps its own depth; on 2.5 it
   sends no thinkingBudget either.
@@ -1064,7 +1064,7 @@ callbacks is the formatted list of LiteLLM callbacks, built by the caller.
 {{- /*
   The spend ceiling, as router_settings.provider_budget_config for the one
   provider every alias routes to. LiteLLM's router budget limiter
-  (litellm/router_strategy/budget_limiter.py, v1.106.0) adds each response's
+  (litellm/router_strategy/budget_limiter.py, v1.108.6) adds each response's
   cost to a per-provider counter in the router's cache, filters the provider's
   deployments out once the counter reaches budget_limit, and lets the counter
   expire time_period after the window opened (at router start for the first
