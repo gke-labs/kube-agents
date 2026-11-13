@@ -5951,7 +5951,7 @@ class NextSlackGatewaySettingsRefusalTest(unittest.TestCase):
                 )
                 self.assertIn(
                     "INFO: Set SLACK_BOT_TOKEN to one workspace's bot token (xoxb-...) in install.env "
-                    "and run again, or keep this install on PLATFORM_AGENT_MODE=today.",
+                    "and run again, or switch this install to PLATFORM_AGENT_MODE=today.",
                     out,
                 )
                 self.assertNotIn("secretpart", out)
@@ -5963,7 +5963,7 @@ class NextSlackGatewaySettingsRefusalTest(unittest.TestCase):
         self.assertIn("rc=1", proc.stdout, out)
         self.assertIn(
             "INFO: Set SLACK_BOT_TOKEN to one workspace's bot token (xoxb-...) in install.env or "
-            "--slack-bot-token and run again, or keep this install on PLATFORM_AGENT_MODE=today "
+            "--slack-bot-token and run again, or switch this install to PLATFORM_AGENT_MODE=today "
             "(--mode=today on a first install with no install.env).",
             out,
         )

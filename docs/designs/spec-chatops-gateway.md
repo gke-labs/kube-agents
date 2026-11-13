@@ -1708,7 +1708,7 @@ rather than lost. The agent-side callers
 other platform through `hermes send` as before (a day on with no conversation to take onboarding's
 first report, that report is a ledger issue on GitHub, and a home line on each routed platform links it the same way).
 `A2A_NOTIFY_PLATFORM` holds a comma-separated list of platform names, and a single name is a list of one;
-the operator renders `gchat` exactly when `a2aChatArmed` holds and `homeChannel` is a space
+these are the agent's platform names (`google_chat`, `slack`), not the gateway's backend names its boot log prints (`gchat`, `slack`). The operator renders `google_chat` exactly when `a2aChatArmed` holds and `homeChannel` is a space
 name or unset (`a2aGchatNotifyArmed`), and `slack` by the Slack rule below, Chat first (`a2aNotifyPlatforms`). The kanban notifier's report back to a gateway
 conversation (below), and onboarding's first report into the conversation the user first wrote in,
 are armed by their own variable, `A2A_NOTIFY_CONVERSATIONS`, a comma-separated list of the
@@ -1769,7 +1769,7 @@ is routed to the subject (`A2A_NOTIFY_PLATFORM` names `slack`) with that id, and
 unset (the gateway keeps what it refuses until a channel is set or learned). Conversation posts are armed whenever the gateway holds
 Slack, `homeChannel` set or not, and `A2A_NOTIFY_CONVERSATIONS` then names `slack`
 (`a2aSlackNotifyArmed`); a `homeChannel` that is set but is not a channel id turns the whole
-route off, as on Chat. With both backends armed both variables read `gchat,slack`.
+route off, as on Chat. With both backends armed both variables read `google_chat,slack`.
 
 **The home-channel record.** Under `next`, Slack on the gateway or not, the operator owns a ConfigMap
 `<agent>-home-channel` with no data, applied beside the gateway Role and torn down with the stack.

@@ -7919,9 +7919,10 @@ main() {
     # deliberate choice rather than as a missing default.
     [ -z "$slack_allowed_users" ] && slack_allowed_hint="empty list"
     # Under next the A2A gateway takes Slack, with Google Chat on or off (the
-    # mode was settled at step 2), and it takes one bot token, member IDs and a channel id. Those prompts say
-    # so and ask again on an answer the gateway cannot use, rather than let
-    # the refusal after this step throw the interview away. A run with nobody
+    # mode was settled at step 2), and it takes one bot token, member IDs and
+    # a channel id. Those prompts say so and ask again on an answer the
+    # gateway cannot use, rather than let the refusal after this step throw
+    # the interview away. A run with nobody
     # to ask keeps its values, and that refusal is its check.
     if slack_moves_to_a2a_gateway "${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}" true "$google_chat_enabled"; then
       _prompt_slack_settings_for_gateway

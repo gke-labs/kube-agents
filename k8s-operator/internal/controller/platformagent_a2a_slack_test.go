@@ -239,8 +239,9 @@ func TestTheLegacySlackConsumerIsNotRenderedUnderNext(t *testing.T) {
 // gateway's Slack adapter). Slack spreads one app's events across every open
 // connection, so two would split the workspace's messages; none would drop
 // them. Exactly one in every mode rendered by a single operator, and beside
-// Chat, where the gateway holds the pair and the broker does not. (Under version skew across operator versions, a frozen gateway and
-// the re-rendered legacy relay both consume; see spec-chatops-gateway.md).
+// Chat, where the gateway holds the pair and the broker does not. (Under
+// version skew across operator versions, a frozen gateway and the
+// re-rendered legacy relay both consume; see spec-chatops-gateway.md).
 func TestNoRenderCarriesTwoSlackSocketModeConsumers(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "")
 	for name, agent := range map[string]*agentv1alpha1.PlatformAgent{

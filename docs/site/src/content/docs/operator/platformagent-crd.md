@@ -1424,7 +1424,7 @@ See [`k8s-operator/api/v1alpha1/platformagent_types.go`](https://github.com/gke-
 
 Under `mode: next` the `slack` field arms the A2A gateway's Slack backend instead of the legacy consumer (the credential broker's Socket Mode relay and the Hermes slack platform are not rendered). With `googleChat` enabled too, one gateway serves both platforms.
 
-With either backend armed, under `mode: next` the operator renders an empty ConfigMap `<agent>-home-channel` beside the gateway, a Role rule that lets the gateway read and patch that one object, and the gateway env `A2A_SLACK_HOME_POLICY`, `A2A_HOME_CHANNEL_RECORD`, `A2A_SELF_IMAGE` and, with Slack on the gateway, `A2A_HOME_CHANNEL_LEARN`, for `homeChannelPolicy`.
+With either backend armed, under `mode: next` the operator renders an empty ConfigMap `<agent>-home-channel` beside the gateway and a Role rule that lets the gateway read and patch that one object. With Slack on the gateway, it also renders the gateway env `A2A_SLACK_HOME_POLICY`, `A2A_HOME_CHANNEL_RECORD`, `A2A_SELF_IMAGE` and `A2A_HOME_CHANNEL_LEARN`, for `homeChannelPolicy`.
 
 **The learned home channel.** Under `mode: next` with `homeChannel` empty and `homeChannelPolicy` `auto`, the gateway makes the channel of the first top-level mention of the agent in a channel the home channel. It checks the channel first: a channel id, not a direct message, not archived, not shared through Slack Connect, and the app a member. It writes the channel to the `<agent>-home-channel` ConfigMap, which the operator renders empty beside the gateway with a Role rule that lets the gateway read and patch that one object. The gateway env `A2A_SLACK_HOME_POLICY`, `A2A_HOME_CHANNEL_RECORD`, `A2A_SELF_IMAGE` and `A2A_HOME_CHANNEL_LEARN` carry the contract.
 

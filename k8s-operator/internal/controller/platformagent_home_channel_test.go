@@ -86,6 +86,12 @@ func TestHomeChannelUnsetMessageFollowsTheGatewaysBackend(t *testing.T) {
 		{"today chat, no home", chatHome("", ""), nil, nil},
 		// Slack shares the gateway, so its empty home is reported.
 		{"next chat and slack, chat home set", bothChatHomeOnly, []string{"holds Slack", "spec.integration.slack.homeChannel", "mention the agent"}, []string{"holds Google Chat"}},
+		// An admitted learned Slack channel is Slack's home: no condition.
+		{"next chat and slack, chat home set, slack record admitted", func() string {
+			a := chatAndSlackTestAgent("next")
+			a.Spec.Integration.GoogleChat.HomeChannel = "spaces/AAA"
+			return homeChannelUnsetMessage(a, homeChannelRecord{channel: "C0123ABCD", recorded: "C0123ABCD"})
+		}, nil, nil},
 		{"next, no chat", func() string { return homeChannelUnsetMessage(a2aTestAgent(), homeChannelRecord{}) }, nil, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

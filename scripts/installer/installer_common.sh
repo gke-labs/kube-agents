@@ -1490,7 +1490,7 @@ refuse_next_slack_gateway_settings() {
       keep_today="PLATFORM_AGENT_MODE=today (--mode=today on a first install with no install.env)"
     fi
     "$say" "${lead}SLACK_BOT_TOKEN holds ${count} tokens, a list for several workspaces. Under spec.mode next the A2A gateway's Slack backend takes one workspace's bot token, and Slack refuses a list, so that backend retries without end and nothing answers on Slack."
-    print_info "Set SLACK_BOT_TOKEN to one workspace's bot token (xoxb-...) in ${via} and run again, or keep this install on ${keep_today}."
+    print_info "Set SLACK_BOT_TOKEN to one workspace's bot token (xoxb-...) in ${via} and run again, or switch this install to ${keep_today}."
     refused=true
   elif slack_bot_token_has_separator "$token"; then
     via="install.env"; [ "$flags" = "flags" ] && via="install.env or --slack-bot-token"

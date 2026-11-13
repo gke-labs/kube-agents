@@ -769,7 +769,7 @@ If you enabled Google Chat or Slack during the install, perform the following re
 5. **Set or Move the Home Channel (if you left `SLACK_HOME_CHANNEL` empty)**:
    - If step 2's message was the install's first chat message, it set the home channel to the channel or DM it came from. If Google Chat received the first message instead, Slack has none, and scheduled audits have nowhere to post on Slack. Either way, run `/sethome` (or `/hermes sethome`) from the Slack channel you want. It takes effect immediately and persists across restarts. Under `spec.mode: next` with Slack on the gateway, neither command sets it: pick the channel on the app's Home tab instead.
 
-- Re-display these instructions at any time from the repository root. When `install.env` records `PLATFORM_AGENT_MODE=next` and Google Chat is off, it prints the A2A gateway's checklist from the [Slack app setup](docs/site/src/content/docs/install/slack-app.md) page instead. As for Google Chat, this script takes the mode from `install.env` alone, while the checklist `install.sh` prints after an apply follows the mode it expects after it:
+- Re-display these instructions at any time from the repository root. When `install.env` records `PLATFORM_AGENT_MODE=next`, it prints the A2A gateway's checklist from the [Slack app setup](docs/site/src/content/docs/install/slack-app.md) page instead. As for Google Chat, this script takes the mode from `install.env` alone, while the checklist `install.sh` prints after an apply follows the mode it expects after it:
   ```bash
   ./scripts/installer/print_instructions_slack.sh
   ```
