@@ -1617,7 +1617,7 @@ platformAgent:
     # images.json like every other third-party image.
     image:
       repository: docker.io/alpine/k8s
-      tag: "1.36.5"
+      tag: "1.36.6"
     # How long to wait for AgentProfile finalizers to clear before deleting
     # the PlatformAgent CR.
     agentProfileTimeout: 30s
