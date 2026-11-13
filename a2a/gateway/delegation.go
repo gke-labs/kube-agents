@@ -534,7 +534,7 @@ func (g *Gateway) withdrawBatch(ctx context.Context, rec *SessionRecord, taskID 
 			continue
 		}
 		if ref.StatusMsgID != "" {
-			g.editLine(rec.Key, ref.StatusMsgID, noticeBatchChildWithdrawn, "")
+			g.editLine(rec.Key, ref.StatusMsgID, withLineNote(noticeBatchChildWithdrawn, ref.LineNote), "")
 		}
 		g.logTaskTerminal(rec, ref.Addressee, id, lib.StateCanceled, TerminalFromGateway,
 			"reason: "+reasonBatchWithdrawn+" - "+noticeBatchChildWithdrawn)

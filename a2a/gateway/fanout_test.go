@@ -1172,3 +1172,61 @@ func TestABareSessionCommandDuringAFanOutIsTruthful(t *testing.T) {
 		}
 	}
 }
+
+// batchChildNote is the note a platform batch child's line carries.
+func batchChildNote() string {
+	if targetPlatform == "platform" {
+		return delegatedLineNote
+	}
+	return fmt.Sprintf(delegatedProfileLineNote, targetPlatform)
+}
+
+// editedTo waits for an edit reading exactly want.
+func editedTo(t *testing.T, r *rig, what, want string) {
+	t.Helper()
+	waitFor(t, what, func() bool {
+		for _, e := range r.adapter.editTexts() {
+			if e == want {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+// TestAnAskingFanOutChildsLineKeepsItsNote: the line of a batch child that
+// asked for input closes with its "(delegated to ...)" note, as a child
+// that ended does, so sibling lines can still be told apart.
+func TestAnAskingFanOutChildsLineKeepsItsNote(t *testing.T) {
+	t.Parallel()
+	r, spawn := startBatchRig(t, 2)
+	f := fanOut(t, r, spawn, "discord:g1/t-fanout-ask-note", platformTask("one"), platformTask("two"))
+	publishQuestion(t, r, f.envs[0], targetPlatform, "which namespace?")
+	childEndedLogged(t, r, f.kids[0].ID)
+	editedTo(t, r, "the asking child's line closed with its note", withLineNote(noticeBatchChildAsked, batchChildNote()))
+}
+
+// TestAWithdrawnBatchChildsLineKeepsItsNote: a batch that fails partway
+// closes the line of the child it withdraws with its "(delegated to ...)"
+// note.
+func TestAWithdrawnBatchChildsLineKeepsItsNote(t *testing.T) {
+	t.Parallel()
+	scope := filepath.Join(t.TempDir(), "scope.json")
+	if err := os.WriteFile(scope, []byte(`{"present":true,"projects":["p1"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r, spawn := startRigWithSpawnerCap(t, targetPlatform, 0, func(c *Config) {
+		c.DelegationWidthMax = 2
+		c.ScopeFile = scope
+		c.Namespace = "kubeagents-system"
+	})
+	r.g.profiles.put("cluster", &lib.AgentCard{Name: "cluster", Parameters: clusterParams})
+	exec, _, _ := sessionTurn(t, r, spawn, "discord:g1/t-batch-withdraw-note", "x")
+	closeProfileSubmissions(t, r.url)
+	art := delegateBatchArtifact(t, platformTask("first"),
+		lib.DelegateTask{Addressee: "cluster", Text: "second", Parameters: targetParams("p1", "us-east1", "dev")})
+	if err := exec.PublishArtifact(context.Background(), art); err != nil {
+		t.Fatal(err)
+	}
+	editedTo(t, r, "the withdrawn child's line closed with its note", withLineNote(noticeBatchChildWithdrawn, batchChildNote()))
+}

@@ -297,7 +297,7 @@ func (g *Gateway) batchChildAsks(ctx context.Context, rec *SessionRecord, child 
 		return
 	}
 	if child.StatusMsgID != "" {
-		g.editLine(rec.Key, child.StatusMsgID, noticeBatchChildAsked, "")
+		g.editLine(rec.Key, child.StatusMsgID, withLineNote(noticeBatchChildAsked, child.LineNote), "")
 		setParentLine(rec, child.ID, "")
 	}
 	g.batchChildEnded(ctx, rec, child, BatchEnd{State: lib.StateInputRequired, Text: question, Source: TerminalFromExecutor}, "")
@@ -379,7 +379,7 @@ func (g *Gateway) healBatchChild(ctx context.Context, rec *SessionRecord, kid Ta
 		g.terminalMark(rec, kid.ID, task.State, terminal)
 		g.retireTaskRoute(ctx, kid.ID)
 		if kid.StatusMsgID != "" {
-			g.editLine(rec.Key, kid.StatusMsgID, terminalLine(task.State, ""), "")
+			g.editLine(rec.Key, kid.StatusMsgID, withLineNote(terminalLine(task.State, ""), kid.LineNote), "")
 			setParentLine(rec, kid.ID, "")
 		}
 		toCards := cardsPending(task.State, terminal) || handedOff(task.State, foldHandedOff(task))
@@ -406,7 +406,7 @@ func (g *Gateway) healBatchChild(ctx context.Context, rec *SessionRecord, kid Ta
 		g.publishDispatchStop(ctx, kid)
 		g.retireTaskRoute(ctx, kid.ID)
 		if kid.StatusMsgID != "" {
-			g.editLine(rec.Key, kid.StatusMsgID, terminalLine(lib.StateFailed, ""), "")
+			g.editLine(rec.Key, kid.StatusMsgID, withLineNote(terminalLine(lib.StateFailed, ""), kid.LineNote), "")
 			setParentLine(rec, kid.ID, "")
 		}
 		g.batchChildEnded(ctx, rec, kid, BatchEnd{State: lib.StateFailed, Text: childNeverStarted, Source: TerminalNeverStarted, Unposted: true}, childNeverStarted)
