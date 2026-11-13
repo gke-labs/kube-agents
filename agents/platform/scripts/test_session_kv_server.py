@@ -5349,6 +5349,9 @@ class TestRelayWithNoChatRoute(unittest.TestCase):
 
         self.assertEqual(chat_delivery_watch.platforms_from(self.SLACK_REFUSAL), ["slack"])
         self.assertEqual(chat_delivery_watch.platforms_from(session_kv_server.NO_CHAT_ROUTE_ERROR), [])
+        os.environ[chat_notify.NOTIFY_CONVERSATIONS_ENV] = "google_chat,slack"
+        self.assertEqual(
+            chat_delivery_watch.platforms_from(session_kv_server._no_chat_route_error()), ["google_chat", "slack"])
 
     def test_a_routed_platform_is_not_refused(self):
         """The control: with a home channel the operator renders
