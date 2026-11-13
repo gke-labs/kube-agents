@@ -1269,6 +1269,70 @@ class TestSlackIncidentAlertDelivery(unittest.TestCase):
         self.assertTrue(any("slack will not receive it" in line for line in logs.output), logs.output)
 
 
+class TestAlertGoesToARoutedPlatformWithAHome(unittest.TestCase):
+    """The operator routes every armed platform; the alert picks one of the
+    routed platforms with a home channel the pod can see, Chat first, and
+    falls back to Chat (kept for its digest) when none has one."""
+
+    def setUp(self):
+        for attribute in ("MANAGED_CONFIG_PATH", "CONFIG_PATH"):
+            p = patch.object(session_kv_server, attribute, "/nonexistent/kube-agents-test-absent.yaml")
+            p.start()
+            self.addCleanup(p.stop)
+        for name in ("_register_session_routing", "_record_alert_title", "mark_delivery_failed"):
+            p = patch.object(session_kv_server, name)
+            p.start()
+            self.addCleanup(p.stop)
+        for name in ("_create_gateway_session", "_start_agent_turn"):
+            p = patch.object(session_kv_server, name, return_value=STARTED)
+            p.start()
+            self.addCleanup(p.stop)
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        p = patch.object(chat_notify, "HOME_FILE_DIR", self.dir)
+        p.start()
+        self.addCleanup(p.stop)
+        env = patch.dict(os.environ, {
+            chat_notify.NOTIFY_PLATFORM_ENV: "google_chat,slack",
+            chat_notify.NOTIFY_CONVERSATIONS_ENV: "google_chat,slack",
+            "GOOGLE_CHAT_HOME_CHANNEL": "",
+            "SLACK_HOME_CHANNEL": "",
+        })
+        env.start()
+        self.addCleanup(env.stop)
+        for name in ("GOOGLE_CHAT_RELAY_URL", "GOOGLE_CHAT_PROJECT_ID", "SLACK_RELAY_URL", "SLACK_BOT_TOKEN"):
+            os.environ.pop(name, None)
+
+    def _run(self, notify):
+        argvs = []
+
+        def run(argv, **_kwargs):
+            argvs.append(argv)
+            return notify(argv)
+
+        pool = park_triage_starts()
+        with patch.object(session_kv_server.subprocess, "run", side_effect=run):
+            session_kv_server.trigger_agent_troubleshooter("s1", "alert", {}, 7, slack_alert_msg="slack alert")
+            pool.run()
+        return [argv[:4] for argv in argvs]
+
+    def test_a_slack_home_takes_the_alert_when_chat_has_none(self):
+        os.environ["SLACK_HOME_CHANNEL"] = "C1"
+        legs = self._run(lambda argv: session_kv_server.subprocess.CompletedProcess(
+            argv, 0, stdout=json.dumps({"message_id": "1712345678.000100", "thread_id": "1712345678.000100"}), stderr=""))
+        self.assertEqual(legs, [[chat_notify.A2A_CLI, "notify", "--platform", "slack"]])
+        session_kv_server._register_session_routing.assert_called_once()
+        self.assertEqual(session_kv_server._register_session_routing.call_args.args[1], "slack")
+
+    def test_with_no_home_the_alert_goes_to_chat_and_is_kept(self):
+        def kept(argv):
+            raise session_kv_server.subprocess.CalledProcessError(chat_notify.NOTIFY_KEPT, argv, stderr="kept")
+
+        legs = self._run(kept)
+        self.assertEqual(legs, [[chat_notify.A2A_CLI, "notify", "--platform", "google_chat"]])
+        session_kv_server._register_session_routing.assert_not_called()
+
+
 class TestAlertTitleRecord(unittest.TestCase):
     def setUp(self):
         import sqlite3
@@ -4199,6 +4263,18 @@ class TestIncidentTriagePullRequestOptIn(unittest.TestCase):
         self.assertEqual(loaded["SAFE_KEY"], "loaded_ok")
         self.assertEqual(loaded["COMMENTED"], "value")
         self.assertEqual(loaded["PREEXISTING_VAR"], "from_env")
+
+    def test_a_mirrored_chat_home_channel_yields_to_a_mounted_projection(self):
+        # A today-era /sethome left GOOGLE_CHAT_HOME_CHANNEL in the PVC .env.
+        # Under next the operator renders the CR's space as env, and the agent
+        # reads it to pick where home posts go, so the mirror must not fill it.
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(chat_notify, "HOME_FILE_DIR", directory):
+                loaded = self._load_dotenv(b"GOOGLE_CHAT_HOME_CHANNEL=spaces/OLD\n", ("GOOGLE_CHAT_HOME_CHANNEL",))
+            self.assertIsNone(loaded["GOOGLE_CHAT_HOME_CHANNEL"])
+            with patch.object(chat_notify, "HOME_FILE_DIR", os.path.join(directory, "unmounted")):
+                loaded = self._load_dotenv(b"GOOGLE_CHAT_HOME_CHANNEL=spaces/OLD\n", ("GOOGLE_CHAT_HOME_CHANNEL",))
+            self.assertEqual(loaded["GOOGLE_CHAT_HOME_CHANNEL"], "spaces/OLD")
 
     def test_a_mirrored_home_channel_yields_to_a_mounted_projection(self):
         # A today-era /sethome left SLACK_HOME_CHANNEL in the PVC .env. With

@@ -112,14 +112,15 @@ from gateway.platforms.base import BasePlatformAdapter, SendResult
 logger = logging.getLogger(__name__)
 
 # The operator's switch (written by platformagent_manifests.go, defined as
-# a2aNotifyPlatformEnvVar in platformagent_a2a_manifests.go): the platforms
-# whose home posts go through the gateway, separated by PLATFORM_LIST_SEPARATOR.
+# a2aNotifyPlatformEnvVar in platformagent_a2a_manifests.go): every platform
+# whose route the gateway arms, home channel or not, separated by
+# PLATFORM_LIST_SEPARATOR. routed_platforms() narrows it to the platforms with
+# a home channel, or keeps all of them when none has one (the gateway then
+# keeps a refused post for its digest).
 NOTIFY_PLATFORM_ENV = "A2A_NOTIFY_PLATFORM"
 # The platforms whose gateway conversations a card can report back to
-# (a2aNotifyConversationsEnvVar), in the same list form. Rendered whenever the
-# gateway arms the route, home channel or not; A2A_NOTIFY_PLATFORM above is home
-# posts: the platforms with a home channel, or every armed platform when none
-# has one (the gateway then keeps a refused post for its digest).
+# (a2aNotifyConversationsEnvVar), in the same list form. The operator renders
+# the same list as A2A_NOTIFY_PLATFORM; this one is never narrowed.
 NOTIFY_CONVERSATIONS_ENV = "A2A_NOTIFY_CONVERSATIONS"
 # What separates the platform names in either variable
 # (chat_notify.PLATFORM_LIST_SEPARATOR).
@@ -129,6 +130,13 @@ PLATFORM_LIST_SEPARATOR = ","
 HOME_FILE_DIR = "/etc/kube-agents/chat-home"
 HOME_FILE_KEY = "slack_home"
 HOME_FILE_PLATFORM = "slack"
+# The home channels the operator renders into the agent container from the CR
+# (chat_notify.GCHAT_HOME_ENV and SLACK_HOME_ENV keep the same two names), and
+# the platform each one belongs to.
+GCHAT_HOME_ENV = "GOOGLE_CHAT_HOME_CHANNEL"
+SLACK_HOME_ENV = "SLACK_HOME_CHANNEL"
+GCHAT_HOME_PLATFORM = "google_chat"
+HOME_ENV_BY_PLATFORM = {GCHAT_HOME_PLATFORM: GCHAT_HOME_ENV, HOME_FILE_PLATFORM: SLACK_HOME_ENV}
 # The bus CLI in the agent image, on PATH.
 A2A_CLI = "a2a"
 # `a2a notify` exit statuses (a2a/cmd/a2a/notify.go): the gateway took the
@@ -276,24 +284,41 @@ def platform_list(raw: str) -> list:
     return names
 
 
+def _home_file_value() -> str:
+    """The projected Slack home channel, trimmed, or "" when there is none."""
+    try:
+        with open(os.path.join(HOME_FILE_DIR, HOME_FILE_KEY), encoding="utf-8") as handle:
+            return handle.read().strip()
+    except (OSError, ValueError):
+        return ""
+
+
+def sees_home(platform: str) -> bool:
+    """Whether this pod can see a home channel for ``platform``: its CR env,
+    or for Slack the projected file. A copy of chat_notify.sees_home."""
+    env = HOME_ENV_BY_PLATFORM.get(platform)
+    if env and os.environ.get(env, "").strip():
+        return True
+    return platform == HOME_FILE_PLATFORM and bool(_home_file_value())
+
+
 def routed_platforms() -> list:
     """The platforms whose home posts the gateway holds, or [] when none.
 
-    The rendered env names them when the CR sets the home channel; a channel the
-    gateway learned is projected into a file instead (the operator's
-    ``slack_home`` mount), so with the env empty the answer is derived from the
-    platforms the gateway holds and a non-empty file. A non-empty env wins.
+    The rendered env names every platform whose route the gateway arms. Of
+    those, home posts go to the platforms with a home channel this pod can see
+    (:func:`sees_home`), and to every routed platform when none has one. A
+    channel the gateway learned is projected into a file (the operator's
+    ``slack_home`` mount), not the env. With the env empty the answer is
+    derived from the platforms the gateway holds and a non-empty file. A copy
+    of chat_notify.routed_platforms, which this patch cannot import.
     """
     routed = platform_list(os.environ.get(NOTIFY_PLATFORM_ENV, ""))
     if routed:
-        return routed
+        return [name for name in routed if sees_home(name)] or routed
     if HOME_FILE_PLATFORM not in conversation_platforms():
         return []
-    try:
-        with open(os.path.join(HOME_FILE_DIR, HOME_FILE_KEY), encoding="utf-8") as handle:
-            return [HOME_FILE_PLATFORM] if handle.read().strip() else []
-    except (OSError, ValueError):
-        return []
+    return [HOME_FILE_PLATFORM] if _home_file_value() else []
 
 
 def routes(platform: Any) -> bool:

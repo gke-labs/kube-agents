@@ -894,9 +894,8 @@ func TestTheSlackHomeChannelReachesTheArmedGateway(t *testing.T) {
 // unset, the gateway keeps the refused posts for the digest), and the kanban
 // notifier to send a card's report back to its conversation whenever the
 // gateway arms Slack's route (home channel unset or a channel id). Otherwise
-// posts would go to a subject nobody answers. With Chat beside it both carry
-// conversation reports, Chat first, and home posts go to the platforms that
-// have a home channel.
+// posts would go to a subject nobody answers. With Chat beside it both are
+// routed, Chat first.
 func TestTheAgentRoutesSlackProactivePostsExactlyWhenArmed(t *testing.T) {
 	withSlackHome := func(agent *agentv1alpha1.PlatformAgent, home string) *agentv1alpha1.PlatformAgent {
 		agent.Spec.Integration.Slack.HomeChannel = home
@@ -942,12 +941,12 @@ func TestTheAgentRoutesSlackProactivePostsExactlyWhenArmed(t *testing.T) {
 			}
 		})
 	}
-	// Both backends share the gateway: both carry conversation reports, Chat
-	// first; home posts go to both only when Slack has a home beside Chat's.
-	// The agent carries Slack's home only when the CR sets one.
+	// Both backends share the gateway: the agent is routed to both, Chat
+	// first, on both variables, and carries Slack's home only when the CR
+	// sets one.
 	for _, tc := range []struct{ slackHome, wantPlatform string }{
 		{"C0HOME", "google_chat,slack"},
-		{"", "google_chat"},
+		{"", "google_chat,slack"},
 	} {
 		both := chatAndSlackTestAgent("next")
 		both.Spec.Integration.Slack.HomeChannel = tc.slackHome

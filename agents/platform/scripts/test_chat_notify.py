@@ -96,6 +96,63 @@ class HomeFileTest(unittest.TestCase):
             self.assertEqual(chat_notify.routed_platforms(), [])
 
 
+class HomePostPlatformsTest(unittest.TestCase):
+    """The operator routes every armed platform; the agent sends home posts to
+    the routed platforms with a home channel it can see, and to all of them
+    when none has one, so the gateway keeps each one's posts for its digest."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        env = mock.patch.dict(os.environ, {
+            chat_notify.NOTIFY_PLATFORM_ENV: "google_chat,slack",
+            chat_notify.NOTIFY_CONVERSATIONS_ENV: "google_chat,slack",
+            "GOOGLE_CHAT_HOME_CHANNEL": "",
+            "SLACK_HOME_CHANNEL": "",
+        })
+        env.start()
+        self.addCleanup(env.stop)
+        directory = mock.patch.object(chat_notify, "HOME_FILE_DIR", self.dir)
+        directory.start()
+        self.addCleanup(directory.stop)
+
+    def _write(self, text):
+        with open(os.path.join(self.dir, chat_notify.HOME_FILE_KEY), "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def test_a_chat_home_alone_takes_the_home_posts(self):
+        os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/A"
+        self.assertEqual(chat_notify.routed_platforms(), ["google_chat"])
+        self.assertFalse(chat_notify.routes("slack"))
+
+    def test_a_slack_home_in_env_alone_takes_the_home_posts(self):
+        os.environ["SLACK_HOME_CHANNEL"] = "C1"
+        self.assertEqual(chat_notify.routed_platforms(), ["slack"])
+
+    def test_a_projected_slack_home_alone_takes_the_home_posts(self):
+        self._write("C0FILE\n")
+        self.assertEqual(chat_notify.routed_platforms(), ["slack"])
+
+    def test_both_homes_keep_both_chat_first(self):
+        os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/A"
+        os.environ["SLACK_HOME_CHANNEL"] = "C1"
+        self.assertEqual(chat_notify.routed_platforms(), ["google_chat", "slack"])
+
+    def test_no_home_keeps_every_routed_platform(self):
+        self._write("   \n")
+        os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "  "
+        self.assertEqual(chat_notify.routed_platforms(), ["google_chat", "slack"])
+
+    def test_a_single_home_less_platform_stays_routed(self):
+        os.environ[chat_notify.NOTIFY_PLATFORM_ENV] = "slack"
+        self.assertEqual(chat_notify.routed_platforms(), ["slack"])
+
+    def test_a_home_on_a_platform_not_routed_counts_for_nothing(self):
+        os.environ[chat_notify.NOTIFY_PLATFORM_ENV] = "google_chat"
+        os.environ["SLACK_HOME_CHANNEL"] = "C1"
+        self.assertEqual(chat_notify.routed_platforms(), ["google_chat"])
+
+
 class PlatformListTest(unittest.TestCase):
     """Both env vars carry a comma-separated list of platforms; one value is a list of one."""
 

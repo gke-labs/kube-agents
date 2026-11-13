@@ -6167,6 +6167,16 @@ class NextHomeChannelUnsetWarningTest(unittest.TestCase):
         self.assertEqual(both_unset.count("keeps them for one digest"), 2, both_unset)
         self.assertNotIn("meanwhile", both_unset)
 
+    def test_a_chat_home_that_is_not_a_space_name_is_no_home(self):
+        # The gateway arms no Chat route for it, so Slack's posts are kept,
+        # as the operator's HomeChannelUnset condition says.
+        for chat_home in ("AAAA", "spaces/AAA/threads/T"):
+            with self.subTest(chat_home=chat_home):
+                out = self._run(chat="true", chat_home=chat_home).stdout
+                self.assertIn("WARN: SLACK_HOME_CHANNEL is empty", out)
+                self.assertIn("keeps them for one digest", out)
+                self.assertNotIn("meanwhile", out)
+
     def test_the_message_names_no_hermes_fallback(self):
         for kw in ({}, {"slack": "false", "chat": "true"}, {"chat": "true"}):
             with self.subTest(**kw):

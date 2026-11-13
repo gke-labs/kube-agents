@@ -84,6 +84,8 @@ class SharedHomeFileContractTest(unittest.TestCase):
             sys.path.pop(0)
         self.assertEqual(kanban_chat_notify.HOME_FILE_DIR, chat_notify.HOME_FILE_DIR)
         self.assertEqual(kanban_chat_notify.HOME_FILE_KEY, chat_notify.HOME_FILE_KEY)
+        self.assertEqual(kanban_chat_notify.GCHAT_HOME_ENV, chat_notify.GCHAT_HOME_ENV)
+        self.assertEqual(kanban_chat_notify.SLACK_HOME_ENV, chat_notify.SLACK_HOME_ENV)
 
 
 class RoutedPlatformFromTheFileTest(unittest.TestCase):
@@ -132,6 +134,57 @@ class RoutedPlatformFromTheFileTest(unittest.TestCase):
     def test_an_absent_directory_routes_nothing(self):
         with mock.patch.object(kanban_chat_notify, "HOME_FILE_DIR", os.path.join(self.dir, "absent")):
             self.assertEqual(kanban_chat_notify.routed_platforms(), [])
+
+
+class HomePostPlatformsTest(unittest.TestCase):
+    """The stand-in narrows home posts as chat_notify does: the routed
+    platforms with a home channel it can see, else every routed platform."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", self.dir], check=False))
+        env = mock.patch.dict(os.environ, {
+            kanban_chat_notify.NOTIFY_PLATFORM_ENV: "google_chat,slack",
+            kanban_chat_notify.NOTIFY_CONVERSATIONS_ENV: "google_chat,slack",
+            "GOOGLE_CHAT_HOME_CHANNEL": "",
+            "SLACK_HOME_CHANNEL": "",
+        })
+        env.start()
+        self.addCleanup(env.stop)
+        directory = mock.patch.object(kanban_chat_notify, "HOME_FILE_DIR", self.dir)
+        directory.start()
+        self.addCleanup(directory.stop)
+
+    def _write(self, text):
+        with open(os.path.join(self.dir, kanban_chat_notify.HOME_FILE_KEY), "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def test_a_chat_home_alone_takes_the_home_posts(self):
+        os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/A"
+        self.assertEqual(kanban_chat_notify.routed_platforms(), ["google_chat"])
+        # Conversation reports still reach Slack.
+        self.assertIn("slack", kanban_chat_notify.served_platforms())
+
+    def test_a_slack_home_in_env_alone_takes_the_home_posts(self):
+        os.environ["SLACK_HOME_CHANNEL"] = "C1"
+        self.assertEqual(kanban_chat_notify.routed_platforms(), ["slack"])
+
+    def test_a_projected_slack_home_alone_takes_the_home_posts(self):
+        self._write("C0FILE\n")
+        self.assertEqual(kanban_chat_notify.routed_platforms(), ["slack"])
+
+    def test_both_homes_keep_both_chat_first(self):
+        os.environ["GOOGLE_CHAT_HOME_CHANNEL"] = "spaces/A"
+        os.environ["SLACK_HOME_CHANNEL"] = "C1"
+        self.assertEqual(kanban_chat_notify.routed_platforms(), ["google_chat", "slack"])
+
+    def test_no_home_keeps_every_routed_platform(self):
+        self._write("")
+        self.assertEqual(kanban_chat_notify.routed_platforms(), ["google_chat", "slack"])
+
+    def test_a_single_home_less_platform_stays_routed(self):
+        os.environ[kanban_chat_notify.NOTIFY_PLATFORM_ENV] = "slack"
+        self.assertEqual(kanban_chat_notify.routed_platforms(), ["slack"])
 
 
 class _Runner:

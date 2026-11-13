@@ -2807,10 +2807,6 @@ type renderOptions struct {
 	// PlatformAgent in `mode: next`. Empty when no optional profiles are bound,
 	// so the zero value renders byte-identical manifests.
 	enabledProfiles []string
-	// homeRecord is the home-channel record the reconcile read once
-	// (homeChannelRecordFor): an admitted learned Slack channel is a home
-	// channel for A2A_NOTIFY_PLATFORM. The zero value is no record.
-	homeRecord homeChannelRecord
 }
 
 const enabledProfilesEnvVar = "KUBE_AGENTS_ENABLED_PROFILES"
@@ -2818,6 +2814,10 @@ const enabledProfilesEnvVar = "KUBE_AGENTS_ENABLED_PROFILES"
 // agentSlackHomeChannelEnvVar is the agent's own idea of the Slack home
 // channel, the name today's Hermes platform reads.
 const agentSlackHomeChannelEnvVar = "SLACK_HOME_CHANNEL"
+
+// agentGchatHomeChannelEnvVar is the agent's own idea of the Google Chat home
+// space, the name today's Hermes platform reads.
+const agentGchatHomeChannelEnvVar = "GOOGLE_CHAT_HOME_CHANNEL"
 
 // lastWinsEnv drops every entry a later entry of the same name supersedes, keeping the
 // surviving one where it already sits. Order is otherwise untouched, so on the ordinary
@@ -3283,7 +3283,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 					Value: strings.Join(gchat.AllowedUsers, ","),
 				},
 				{
-					Name:  "GOOGLE_CHAT_HOME_CHANNEL",
+					Name:  agentGchatHomeChannelEnvVar,
 					Value: gchat.HomeChannel,
 				},
 			}...)
@@ -3695,19 +3695,19 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// holds them (legacyChatConsumer, legacySlackConsumer), so the agent-side
 	// callers that used to `hermes send` a proactive post route it to the
 	// gateway's chat.notify instead; the bus identity above is what sends it.
-	// Home posts go to every armed platform that has a home channel; the
-	// alert picks one platform from that list on its own, Chat first. A
-	// platform without a home has its posts kept by the gateway for the
-	// digest it posts once a channel is set
-	// (a2a/gateway/notify_refused.go), but only when no armed platform has
-	// a home: then every armed platform is routed. A kanban card's report
-	// back to the conversation it was filed in, and onboarding's first
-	// report, need no home, so A2A_NOTIFY_CONVERSATIONS lists every armed
-	// route. The agent's Slack home-file fallback, which applies only when
-	// A2A_NOTIFY_PLATFORM is empty, is never needed: the list is empty only
-	// when no route is armed.
-	notify := strings.Join(a2aNotifyHomePlatforms(agent, opts.homeRecord), a2aNotifyPlatformSeparator)
-	conversations := strings.Join(a2aNotifyConversationPlatforms(agent), a2aNotifyPlatformSeparator)
+	// Every platform whose route is armed is routed, home channel or not.
+	// The agent sends home posts to the routed platforms with a home channel
+	// it can see (the two home variables below, or the learned Slack channel
+	// in the projected file), and to every routed platform when none has
+	// one; the gateway keeps a home-less platform's posts for the digest it
+	// posts once a channel is set (a2a/gateway/notify_refused.go). The alert
+	// picks one of those on its own, Chat first. A kanban card's report back
+	// to the conversation it was filed in, and onboarding's first report,
+	// ride the same routes, so both variables carry the same list. Both read
+	// CR fields only, so a learn rolls no pod. The agent's Slack home-file
+	// fallback, which applies only when A2A_NOTIFY_PLATFORM is empty, is
+	// never needed: `slack` is in the list whenever Slack's route is armed.
+	notify := strings.Join(a2aNotifyPlatforms(agent), a2aNotifyPlatformSeparator)
 	if a2aAgentSurface(agent) && notify != "" {
 		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyPlatformEnvVar, Value: notify})
 	}
@@ -3718,14 +3718,20 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// file mounted below (platformagent_home_channel_record.go), which the
 	// agent's readers take after a non-empty env, so a learn replaces no pod.
 	// It renders between the two lists, where it always has, so an upgrade
-	// that leaves the values alone rolls no pod.
+	// that leaves the values alone rolls no pod. Chat's CR space renders
+	// beside it, so the agent can tell which routed platform has a home.
+	if a2aAgentSurface(agent) && a2aGchatNotifyArmed(agent) {
+		if home := a2aGchatHomeSpace(agent); home != "" {
+			envVars = append(envVars, corev1.EnvVar{Name: agentGchatHomeChannelEnvVar, Value: home})
+		}
+	}
 	if a2aAgentSurface(agent) && a2aSlackNotifyArmed(agent) {
 		if home := a2aSlackHomeChannel(agent); home != "" {
 			envVars = append(envVars, corev1.EnvVar{Name: agentSlackHomeChannelEnvVar, Value: home})
 		}
 	}
-	if a2aAgentSurface(agent) && conversations != "" {
-		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyConversationsEnvVar, Value: conversations})
+	if a2aAgentSurface(agent) && notify != "" {
+		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyConversationsEnvVar, Value: notify})
 	}
 	if a2aActivityHookWanted(agent) {
 		envVars = append(envVars, a2aActivitySecretEnv(agent))

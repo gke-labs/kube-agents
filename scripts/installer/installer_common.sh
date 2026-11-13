@@ -1519,8 +1519,9 @@ refuse_next_slack_gateway_settings_from_env() {
 # only on a home channel. A reply in a conversation still arrives without one,
 # so an install with none looks healthy while every unprompted post is refused
 # by the gateway and kept for one digest (#3320). With two platforms on the
-# gateway and one home set, home posts go to that home instead. The front doors warn rather than refuse: some installs want chat
-# with no posts, and a CI install never posts. The operator reports the same
+# gateway and one home set, the agent sends home posts to that home instead.
+# The front doors warn rather than refuse: some installs want chat with no
+# posts, and a CI install never posts. The operator reports the same
 # state as the HomeChannelUnset condition.
 #
 # The install.env keys of the home channels the gateway's chat backends lack,
@@ -1546,14 +1547,21 @@ next_home_channel_unset_key() {
 
 # The gateway platform that has a home channel, as the operator names it in
 # the HomeChannelUnset condition, or nothing: next_home_channel_unset_key's
-# five arguments. Google Chat first, as the operator routes home posts
-# (a2aNotifyHomePlatforms). Called when a key is unset, so the platform it
-# prints is the other one.
+# five arguments. Google Chat first, as the agent picks where home posts go
+# (chat_notify.routed_platforms). A Chat home counts only as a space name: the
+# gateway arms no Chat route for anything else. It cannot see a Slack channel
+# the gateway learned from a mention, which only the cluster records: with
+# that channel learned, the warning for Google Chat still says the gateway
+# keeps its posts, while the agent sends them to Slack. Called when a key is
+# unset, so the platform it prints is the other one.
 next_home_channel_set_platform() {
   local home
   if google_chat_moves_to_a2a_gateway "${1:-}" "${3:-}"; then
     home="$(trim_go_space "${5:-}")"
-    [ -z "$home" ] || { printf '%s' "$NEXT_HOME_CHANNEL_GCHAT_PLATFORM"; return 0; }
+    if [ -n "$home" ] && [ -z "$(gchat_home_channel_not_a_space_name "$home")" ]; then
+      printf '%s' "$NEXT_HOME_CHANNEL_GCHAT_PLATFORM"
+      return 0
+    fi
   fi
   if slack_moves_to_a2a_gateway "${1:-}" "${2:-}"; then
     home="$(trim_go_space "${4:-}")"
@@ -1563,8 +1571,8 @@ next_home_channel_set_platform() {
 }
 
 # The warning for one of those keys ($1), one line. $2 is
-# next_home_channel_set_platform's answer: the operator routes home posts to
-# every platform with a home channel, so with one set the posts go there, and
+# next_home_channel_set_platform's answer: the agent sends home posts to every
+# routed platform with a home channel, so with one set the posts go there, and
 # the gateway keeps them only when no platform has one.
 next_home_channel_unset_message() {
   if [ -n "${2:-}" ]; then

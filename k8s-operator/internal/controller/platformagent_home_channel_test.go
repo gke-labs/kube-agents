@@ -349,7 +349,7 @@ func TestHomeChannelRecordDrivesTheProjection(t *testing.T) {
 			if !present || got != tc.wantHome {
 				t.Errorf("projection %s = (%q, %v), want (%q, true)", homeChannelProjectionKey, got, present, tc.wantHome)
 			}
-			pod := buildPodTemplateSpec(a, "h", "h", "h", "h", nil, renderOptions{homeRecord: rec})
+			pod := buildPodTemplateSpec(a, "h", "h", "h", "h", nil, renderOptions{})
 			env := envMapOf(brokerContainerNamed(pod.Spec.Containers, "platform-agent").Env)
 			if got := env[agentSlackHomeChannelEnvVar].Value; got != tc.wantEnv {
 				t.Errorf("%s = %q, want %q (the learned channel travels as a file, not env)", agentSlackHomeChannelEnvVar, got, tc.wantEnv)
@@ -382,15 +382,21 @@ func TestHomeChannelRecordDrivesTheProjection(t *testing.T) {
 	}
 }
 
-// TestHomeChannelRecordRoutesHomePostsWhenChatHasNone: with Chat and Slack
-// on the gateway, Chat without a home and Slack's home only in the admitted
-// record, home posts route to Slack alone, and conversation reports to both.
-func TestHomeChannelRecordRoutesHomePostsWhenChatHasNone(t *testing.T) {
+// TestHomeChannelRecordLeavesTheNotifyListsAlone: with Chat and Slack on
+// the gateway, Chat without a home and Slack's home only in the admitted
+// record, both notify variables still list every armed route, and the
+// learned channel is not env: the pod template reads CR fields only, so a
+// learn rolls no pod. The agent finds the learned channel in the projected
+// file and narrows home posts itself.
+func TestHomeChannelRecordLeavesTheNotifyListsAlone(t *testing.T) {
 	a := chatAndSlackTestAgent("next")
 	rec := readHomeChannelRecord(a, &corev1.ConfigMap{Data: map[string]string{homeChannelRecordSlackKey: "C0LEARNED"}})
-	pod := buildPodTemplateSpec(a, "h", "h", "h", "h", nil, renderOptions{homeRecord: rec})
+	if rec.channel == "" {
+		t.Fatal("the record was not admitted; the case tests nothing")
+	}
+	pod := buildPodTemplateSpec(a, "h", "h", "h", "h", nil, renderOptions{})
 	env := envMapOf(brokerContainerNamed(pod.Spec.Containers, "platform-agent").Env)
-	for name, want := range map[string]string{a2aNotifyPlatformEnvVar: "slack", a2aNotifyConversationsEnvVar: "google_chat,slack"} {
+	for name, want := range map[string]string{a2aNotifyPlatformEnvVar: "google_chat,slack", a2aNotifyConversationsEnvVar: "google_chat,slack"} {
 		if got := env[name].Value; got != want {
 			t.Errorf("%s = %q, want %q", name, got, want)
 		}

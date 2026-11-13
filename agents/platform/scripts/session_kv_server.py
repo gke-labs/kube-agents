@@ -60,11 +60,13 @@ logger = logging.getLogger("session_kv_server")
 # `.env` is agent-writable (`save_env_value`), and `load_dotenv` adds any key the
 # container env lacks, which on an install that did not opt in is exactly these.
 _OPERATOR_ONLY_ENV_KEYS = ("INCIDENT_TRIAGE_OPEN_PULL_REQUEST", "INCIDENT_TRIAGE_MAX_OPEN_PULL_REQUESTS")
-# The home channel a today-era `/sethome` or first chat mirrored into that
+# The home channels a today-era `/sethome` or first chat mirrored into that
 # `.env` (Hermes' persist_home_channel). Under `next` with the operator's
-# projection mounted, the projected file is the channel the gateway posts
-# into, so the mirror must not fill the key the container env lacks.
-_PROJECTED_HOME_ENV_KEYS = ("SLACK_HOME_CHANNEL",)
+# projection mounted, the container env (the CR) and the projected file are
+# the channels the gateway posts into, and chat_notify.routed_platforms() reads
+# them to pick where home posts go, so the mirror must not fill a key the
+# container env lacks.
+_PROJECTED_HOME_ENV_KEYS = (chat_notify.GCHAT_HOME_ENV, chat_notify.SLACK_HOME_ENV)
 # Joins the per-platform no-route refusals when the gateway holds more than one
 # backend with no home channel; chat_delivery_watch reads refusals joined by it.
 NO_CHAT_ROUTE_JOIN = "; "
@@ -2977,10 +2979,13 @@ def enabled_chat_platforms() -> list[str]:
     ``spec.mode: next`` the
     managed scope says each such platform's Hermes consumer is off because the
     A2A gateway holds its backend, and posts to it go through the gateway
-    instead, so each is still a platform this install posts to, with a home
-    channel or without one, the gateway keeping the refused posts for a
-    digest. The operator renders the variable only then, and it is reserved
-    against every other source.
+    instead, so each is still a platform this install posts to. The operator
+    names every armed route there; ``routed_platforms()`` keeps the ones with
+    a home channel the pod can see (``GOOGLE_CHAT_HOME_CHANNEL``,
+    ``SLACK_HOME_CHANNEL``, or the projected file), and all of them when none
+    has one, the gateway keeping the refused posts for a digest. The alert
+    takes the first of them. The operator renders the variable only under
+    next, and it is reserved against every other source.
 
     Never returns an empty list — an install that resolves to nothing gets
     DEFAULT_CHAT_PLATFORM.

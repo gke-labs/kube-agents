@@ -37,8 +37,10 @@ from contextlib import closing
 
 # The variable the operator renders into the agent container exactly when the
 # next stack holds the chat backend (platformagent_manifests.go,
-# a2aNotifyPlatformEnvVar). Its value is a list of platform names as Hermes
-# spells them, separated by PLATFORM_LIST_SEPARATOR; one name is a list of one.
+# a2aNotifyPlatformEnvVar): every platform whose route the gateway arms, home
+# channel or not. Its value is a list of platform names as Hermes spells them,
+# separated by PLATFORM_LIST_SEPARATOR; one name is a list of one.
+# routed_platforms() narrows it to the platforms with a home channel.
 NOTIFY_PLATFORM_ENV = "A2A_NOTIFY_PLATFORM"
 # The variable the operator renders whenever the gateway arms its chat.notify
 # route, home channel or not (platformagent_a2a_manifests.go,
@@ -56,6 +58,12 @@ PLATFORM_LIST_SEPARATOR = ","
 # the writable volume point the readers at a file of its own.
 HOME_FILE_DIR = "/etc/kube-agents/chat-home"
 HOME_FILE_KEY = "slack_home"
+# The home channels the operator renders into the agent container from the CR
+# (platformagent_manifests.go, agentGchatHomeChannelEnvVar and
+# agentSlackHomeChannelEnvVar). A learned Slack channel is not env: it reaches
+# the pod through the file above, so a learn restarts no pod.
+GCHAT_HOME_ENV = "GOOGLE_CHAT_HOME_CHANNEL"
+SLACK_HOME_ENV = "SLACK_HOME_CHANNEL"
 #: The Slack platform name, whose threads go out channel-qualified (command).
 SLACK_PLATFORM = "slack"
 # What `a2a notify` needs to reach the bus (a2a/cmd/a2a/main.go, connect): the
@@ -115,6 +123,8 @@ ALERT_UPDATE_FORMAT = "alert-{session}"
 GCHAT_PLATFORM = "google_chat"
 GCHAT_MESSAGES_TOKEN = "/messages/"
 GCHAT_THREADS_TOKEN = "/threads/"
+# Each platform's home-channel variable (GCHAT_HOME_ENV, SLACK_HOME_ENV).
+HOME_ENV_BY_PLATFORM = {GCHAT_PLATFORM: GCHAT_HOME_ENV, SLACK_PLATFORM: SLACK_HOME_ENV}
 
 
 def alert_update_key(session_id: str) -> str:
@@ -158,20 +168,36 @@ def platform_list(raw: str) -> list[str]:
     return names
 
 
+def sees_home(platform: str) -> bool:
+    """Whether this pod can see a home channel for ``platform``.
+
+    Google Chat's comes from the CR only (GCHAT_HOME_ENV). Slack's comes from
+    the CR (SLACK_HOME_ENV) or from the projected file, which also carries a
+    channel the gateway learned.
+    """
+    env = HOME_ENV_BY_PLATFORM.get(platform)
+    if env and os.environ.get(env, "").strip():
+        return True
+    return platform == SLACK_PLATFORM and bool(home_file_value())
+
+
 def routed_platforms() -> list[str]:
-    """The platforms whose posts go through the gateway, or [] when none does.
+    """The platforms that get home posts through the gateway, or [] when none does.
 
     The rendered env names every platform whose route the gateway arms, with
-    the CR's home channel or without one. Without one the gateway refuses
-    each post and keeps it for the digest it posts once one is set. A learned
-    channel is never rendered into the pod, so with the env empty the answer
-    is derived: the gateway holds Slack
+    a home channel or without one. Of those, home posts go to the platforms
+    with a home channel this pod can see (:func:`sees_home`), Chat first. When
+    none has one, they go to every routed platform: the gateway refuses each
+    post and keeps it for the digest it posts once a channel is set. The
+    operator renders CR fields only, so a learned Slack channel changes the
+    answer through the projected file, with no pod restart.
+
+    With the env empty the answer is derived: the gateway holds Slack
     (``A2A_NOTIFY_CONVERSATIONS``) and the projected file names a home channel.
-    A non-empty env wins over the file.
     """
     routed = platform_list(os.environ.get(NOTIFY_PLATFORM_ENV, ""))
     if routed:
-        return routed
+        return [name for name in routed if sees_home(name)] or routed
     if SLACK_PLATFORM in gateway_platforms() and home_file_value():
         return [SLACK_PLATFORM]
     return []
