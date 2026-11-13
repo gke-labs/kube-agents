@@ -45,6 +45,13 @@ gcloud_core_version() {
 # exists so the failure lands in the prerequisite step with the other tool
 # checks rather than at the init inside step 12. Keep the two in step:
 # terraform/examples/full-install/providers.tf owns the authoritative pin.
+#
+# 1.5.0 is the newest language feature the configurations use: check blocks
+# and strcontains(). The `terraform test` suites need more (see
+# TERRAFORM_TEST_MIN_VERSION in the Makefile), which is why they live in
+# tftests/: from 1.6 `terraform init` parses a root's tests/ directory, and
+# suites there would break init on the 1.6+ releases this floor admits.
+# validate.yml's floor job holds it.
 MIN_TERRAFORM_VERSION="1.5.0"
 
 # Echo the Terraform core version, e.g. "1.15.8", from the first line of

@@ -365,7 +365,7 @@ run "github_values_are_unchanged" {
     github_repo = "acme/infra"
   }
   assert {
-    condition     = nonsensitive(helm_release.kube_agents.values[0]) == file("tests/testdata/github.values.golden")
+    condition     = nonsensitive(helm_release.kube_agents.values[0]) == file("tftests/testdata/github.values.golden")
     error_message = "a GitHub install's release values changed"
   }
 }
@@ -378,7 +378,7 @@ run "github_minter_values_are_unchanged" {
     github_app_id        = "123"
   }
   assert {
-    condition     = nonsensitive(helm_release.kube_agents.values[0]) == file("tests/testdata/github_minter.values.golden")
+    condition     = nonsensitive(helm_release.kube_agents.values[0]) == file("tftests/testdata/github_minter.values.golden")
     error_message = "a GitHub minter install's release values changed"
   }
 }

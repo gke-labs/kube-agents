@@ -315,12 +315,12 @@ code-scanning tab on the merged head is still the final check.
 
 **Terraform module tests.** If you change a module or composition under `terraform/`, run
 `make terraform-test`. It runs the `terraform test` suite of each directory under
-`terraform/modules/` and `terraform/examples/` that has a `tests/`, against mocked providers, so it
+`terraform/modules/` and `terraform/examples/` that has a `tftests/`, against mocked providers, so it
 needs no credentials and makes no cloud call (`terraform init` still fetches the providers on a cold
-plugin cache); it needs Terraform 1.11 or newer — `mock_provider` from 1.7 and `override_during`
-from 1.11 — above the 1.5 floor the modules
-and the installer declare, and the `validate` job runs it on the version it pins. `make verify`
-below includes it.
+plugin cache); it needs Terraform 1.15 or newer (the Makefile's `TERRAFORM_TEST_MIN_VERSION` says
+why), above the 1.5 floor the modules and the installer declare, and the `validate` job runs it on
+the version it pins. Suites go in `tftests/`, for the reason
+[`testing-map.md`](testing-map.md#the-trap-that-spans-every-tier) gives. `make verify` below includes it.
 
 **Everything at once.** `make verify` runs what a pull request must pass offline — Go build, vet
 and test, the Python suites, the conformance suite, the Terraform module tests; gosec is the

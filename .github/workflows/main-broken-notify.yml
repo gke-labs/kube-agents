@@ -53,9 +53,11 @@ name: Notify on Broken Main
 # passes on CI's Python and not on the one the agent executes is a break in
 # the tree, the job is unrequired only until it has earned the status, and this
 # watch is the one thing that reports its red on main. `Validate Repo
-# Structure` is the same shape with both jobs required -- `validate`, and
-# `prompt-assets`, which reports the `Agent instructions cite assets that
-# exist` context.
+# Structure` has two required jobs -- `validate`, and `prompt-assets`, which
+# reports the `Agent instructions cite assets that exist` context -- and one
+# that is not, `terraform-floor`. Its red on main is wanted for the same
+# reason as the agent-image sweep's: a root that no longer initialises on the
+# Terraform floor the installer promises is a break in the tree.
 #
 # `Prettier Check` is required and deliberately absent. It scopes itself to the
 # files the push changed, so its green says those files are formatted and

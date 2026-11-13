@@ -1,12 +1,19 @@
 """Every Terraform test suite runs, against mocks, on every pull request.
 
 A `*.tftest.hcl` file runs only if the `terraform-test` Makefile target's loop
-reaches its directory (`terraform/modules/*/tests`, `terraform/examples/*/tests`)
-and the `validate` job in validate.yml runs the target; a suite that neither
+reaches its directory (`terraform/modules/*/tftests`,
+`terraform/examples/*/tftests`) and the `validate` job in validate.yml runs the
+target; a suite that neither
 reaches is a set of cases that passes by never running, the trap AGENTS.md
 "Where Tests Go" names for `PYTHON_TEST_DIRS`. And a suite that mocks one
 provider but not another would reach a real API from CI on the first read
 nobody overrode.
+
+The suites live in `tftests/`, not Terraform's default `tests/` and not beside
+the root: from 1.6, `terraform init` parses both of those, so a suite there
+would break init on every release from 1.6 up to the one its test syntax
+needs, inside the `~> 1.5` the roots declare. The fake `terraform` refuses an `init` or `test` that does not name the
+directory, so the target cannot drop the flag either.
 
 The Makefile side is read the way make reads it, not as text: the target is
 run against a fake `terraform` on PATH, once green and once with one suite
@@ -137,12 +144,19 @@ _IGNORE_LINE_PREFIX = "-"
 _FAKE_TERRAFORM = """#!/bin/sh
 printf '%s %s\\n' "$(pwd -P)" "$1" >> "$TERRAFORM_FAKE_LOG"
 if [ "$1" = version ]; then echo "${TERRAFORM_FAKE_VERSION_LINE:-Terraform v${TERRAFORM_FAKE_VERSION:-1.15.8}}"; exit 0; fi
+if [ "$1" = init ] || [ "$1" = test ]; then
+  case " $* " in
+    *" -test-directory=$TERRAFORM_FAKE_TEST_DIR "*) ;;
+    *) echo "fake terraform: $1 without -test-directory=$TERRAFORM_FAKE_TEST_DIR: $*" >&2; exit 1 ;;
+  esac
+fi
 if [ "$1" = test ] && [ "$(pwd -P)" = "${TERRAFORM_FAKE_FAIL_IN:-}" ]; then
   echo "Failure! 1 failed."; exit 1
 fi
 exit 0
 """
 _FAKE_LOG_VARIABLE, _FAKE_FAIL_VARIABLE, _FAKE_VERSION_VARIABLE = "TERRAFORM_FAKE_LOG", "TERRAFORM_FAKE_FAIL_IN", "TERRAFORM_FAKE_VERSION"
+_FAKE_TEST_DIR_VARIABLE = "TERRAFORM_FAKE_TEST_DIR"
 #: The floor the target names, the Makefile's own constant.
 _MIN_VERSION_VARIABLE = "TERRAFORM_TEST_MIN_VERSION"
 _TOO_OLD_MESSAGE = "is too old"
@@ -203,7 +217,13 @@ _ALIAS_ATTRIBUTE = "alias"
 #: mocks under this key, one object or a list of them per provider.
 _TEST_FILE_SUFFIXES = (".tftest.hcl", ".tftest.json")
 _TEST_FILE_JSON_SUFFIX = ".tftest.json"
-_TESTS_DIR = "tests"
+#: The job that initialises every root on the floor, and where the floor is.
+_FLOOR_WORKFLOW, _FLOOR_JOB, _FLOOR_MATRIX_KEY = "validate.yml", "terraform-floor", "terraform"
+_MIN_VERSIONS_SCRIPT = _REPO_ROOT / "scripts" / "installer" / "min_versions.sh"
+_MIN_TERRAFORM_ASSIGNMENT = r'^MIN_TERRAFORM_VERSION="([0-9.]+)"$'
+#: Where the suites live, the Makefile's TERRAFORM_TEST_DIR; not Terraform's
+#: default, which `terraform init` parses from 1.6 on.
+_TESTS_DIR = "tftests"
 
 
 # ─── Where test files are, and which the loop runs ───────────────────────────
@@ -214,19 +234,19 @@ def _is_test_file(path: pathlib.Path) -> bool:
 
 
 def _suite_files(root: pathlib.Path) -> list:
-    """The test files `terraform test` loads when the loop runs it in `root`:
-    those in tests/ and those beside it. The loop runs only where tests/
-    exists, so a root-level file with no tests/ beside it runs nowhere."""
+    """The test files the loop runs in `root`: those in tftests/. One beside
+    the root would run too, but `terraform init` parses it from 1.6, so it
+    counts as unreached and is reported with the rest."""
     tests_dir = root / _TESTS_DIR
     if not tests_dir.is_dir():
         return []
-    return sorted(p for directory in (root, tests_dir) for p in directory.iterdir() if _is_test_file(p))
+    return sorted(p for p in tests_dir.iterdir() if _is_test_file(p))
 
 
 def _loop_directories(parents=_SUITE_PARENTS) -> list:
     """The directories the Makefile loop runs `terraform test` in: every
-    non-hidden root under the parents with a tests/ directory, whatever it
-    holds (a tests/ left with only a setup module still runs, and reports
+    non-hidden root under the parents with a tftests/ directory, whatever it
+    holds (a tftests/ left with only a setup module still runs, and reports
     0 passed)."""
     return sorted(
         root for parent in parents for root in parent.iterdir()
@@ -317,6 +337,7 @@ def _run_target_against_fake_terraform(fail_in: str = "", version: str = "", ver
                 _FAKE_FAIL_VARIABLE: fail_in,
                 _FAKE_VERSION_VARIABLE: version,
                 _FAKE_VERSION_LINE_VARIABLE: version_line,
+                _FAKE_TEST_DIR_VARIABLE: _TESTS_DIR,
             },
         )
         # The subcommand never holds a space; the directory may, so split
@@ -734,6 +755,23 @@ def _unmocked(text: str, providers, name: str = _TEST_FILE_SUFFIXES[0]) -> list:
     return missing
 
 
+class TerraformFloorJobTest(unittest.TestCase):
+    """validate.yml's terraform-floor job starts at the installer's floor.
+
+    Three places carry the floor: the roots' `~> 1.5`, MIN_TERRAFORM_VERSION
+    in the installer, and the job's first matrix entry. The job is what tests
+    the other two, so a floor raised in the installer and not in the job
+    would leave the new floor untested."""
+
+    def test_the_first_matrix_entry_is_the_installer_floor(self):
+        text = _MIN_VERSIONS_SCRIPT.read_text()
+        match = re.search(_MIN_TERRAFORM_ASSIGNMENT, text, re.M)
+        self.assertIsNotNone(match, f"no MIN_TERRAFORM_VERSION assignment in {_MIN_VERSIONS_SCRIPT}")
+        workflow = yaml.safe_load((_REPO_ROOT / ".github" / "workflows" / _FLOOR_WORKFLOW).read_text())
+        matrix = workflow["jobs"][_FLOOR_JOB]["strategy"]["matrix"][_FLOOR_MATRIX_KEY]
+        self.assertEqual(matrix[0], match.group(1), f"{_FLOOR_JOB}'s first leg must be the floor the installer checks")
+
+
 class TerraformModuleTestsWiringTest(unittest.TestCase):
     def test_at_least_one_module_carries_a_suite(self):
         self.assertTrue(_suites(), f"no {_TESTS_DIR}/*{_TEST_FILE_SUFFIXES[0]} under {_SUITE_PARENTS}; this test pins their wiring")
@@ -742,7 +780,7 @@ class TerraformModuleTestsWiringTest(unittest.TestCase):
         self.assertEqual(
             _unreached_test_files(_REPO_ROOT, _SUITE_PARENTS),
             [],
-            f"these test files are not in, or beside, a {_TESTS_DIR}/ directory under {[p.name for p in _SUITE_PARENTS]}, the only places `{_GATE_COMMAND}` runs `{_TEST_COMMAND}`, so they never run",
+            f"these test files are not in a {_TESTS_DIR}/ directory under {[p.name for p in _SUITE_PARENTS]}: elsewhere `{_GATE_COMMAND}` never runs them, and beside a root or in its tests/ `terraform init` parses them from 1.6, breaking it on every release the roots admit below the one their test syntax needs",
         )
 
     def test_the_target_runs_every_suite_and_fails_when_one_fails(self):
@@ -786,7 +824,7 @@ class TerraformModuleTestsWiringTest(unittest.TestCase):
         recipe = _resolved_recipe(database, _TARGET)
         self.assertTrue(
             any(_LOOP_GLOB in line for line in recipe),
-            f"`{_TARGET}` must loop over every terraform/modules/*/ and terraform/examples/*/ rather than name directories: a new one's tests/ is otherwise a suite nothing runs; make resolved:\n" + "\n".join(recipe),
+            f"`{_TARGET}` must loop over every terraform/modules/*/ and terraform/examples/*/ rather than name directories: a new one's tftests/ is otherwise a suite nothing runs; make resolved:\n" + "\n".join(recipe),
         )
         self.assertEqual(_ignored_recipe_lines(recipe), [], f"a `-` prefix on a `{_TARGET}` recipe line tells make to ignore its status, so the target would exit 0 on a failing suite")
         verify = _resolved_recipe(database, _VERIFY_TARGET)
@@ -942,15 +980,15 @@ class TerraformModuleTestsHelpersTest(unittest.TestCase):
         )
         (setup / "main.tf").write_text('data "http" "seed" {\n  url = "https://x"\n}\n')
         hcl = root / _TESTS_DIR / "a.tftest.hcl"
-        hcl.write_text('mock_provider "google" {}\n\nrun "seed" {\n  module {\n    source = "./tests/setup"\n  }\n}\n')
+        hcl.write_text('mock_provider "google" {}\n\nrun "seed" {\n  module {\n    source = "./tftests/setup"\n  }\n}\n')
         plain = root / _TESTS_DIR / "b.tftest.hcl"
         plain.write_text('mock_provider "google" {}\n\nrun "x" {\n  command = plan\n}\n')
         as_json = root / _TESTS_DIR / "c.tftest.json"
-        as_json.write_text('{"mock_provider": {"google": {}}, "run": {"seed": {"module": {"source": "./tests/setup"}}}}')
+        as_json.write_text('{"mock_provider": {"google": {}}, "run": {"seed": {"module": {"source": "./tftests/setup"}}}}')
         # The array forms HCL-JSON admits: a list of {label: body} runs, and
         # a list of module objects.
         as_array = root / _TESTS_DIR / "d.tftest.json"
-        as_array.write_text('{"mock_provider": {"google": {}}, "run": [{"seed": {"module": [{"source": "./tests/setup"}]}}]}')
+        as_array.write_text('{"mock_provider": {"google": {}}, "run": [{"seed": {"module": [{"source": "./tftests/setup"}]}}]}')
         self.assertEqual(_needed_providers(root), ["google"])
         self.assertEqual(_needed_by_test_file(root, hcl), ["google", "http"])
         self.assertEqual(_needed_by_test_file(root, plain), ["google"])
@@ -1016,7 +1054,7 @@ class TerraformModuleTestsHelpersTest(unittest.TestCase):
         self.assertEqual([r.name for r in _loop_directories(parents)], ["a", "b"])
         self.assertEqual([r.name for r in _suites(parents)], ["a"])
 
-    def test_a_test_file_beside_tests_runs_and_one_without_tests_does_not(self):
+    def test_only_a_test_file_in_the_suite_directory_is_reached(self):
         parents = (self.root / "terraform" / "modules",)
         with_tests = self.root / "terraform" / "modules" / "m"
         (with_tests / _TESTS_DIR).mkdir(parents=True)
@@ -1027,17 +1065,23 @@ class TerraformModuleTestsHelpersTest(unittest.TestCase):
         without_tests = self.root / "terraform" / "modules" / "n"
         without_tests.mkdir()
         (without_tests / "d.tftest.hcl").write_text("")
+        # Terraform's default directory, which init parses from 1.6.
+        (with_tests / "tests").mkdir()
+        (with_tests / "tests" / "e.tftest.hcl").write_text("")
         self.assertEqual(
             [p.name for p in _suites(parents)[with_tests]],
-            ["c.tftest.hcl", "a.tftest.hcl", "b.tftest.json"],
+            ["a.tftest.hcl", "b.tftest.json"],
         )
-        self.assertEqual(_unreached_test_files(self.root, parents), [without_tests / "d.tftest.hcl"])
+        self.assertEqual(
+            _unreached_test_files(self.root, parents),
+            sorted([with_tests / "c.tftest.hcl", with_tests / "tests" / "e.tftest.hcl", without_tests / "d.tftest.hcl"]),
+        )
 
     def test_a_test_file_outside_the_reached_set_is_reported(self):
         # A dot-named module directory is one the shell glob skips, so its
         # suite is unreached however it is laid out.
         parents = (self.root / "terraform" / "modules",)
-        reached = self.root / "terraform" / "modules" / "m" / "tests"
+        reached = self.root / "terraform" / "modules" / "m" / _TESTS_DIR
         stray = self.root / "bench" / "tf" / "fleet" / "tests"
         hidden = self.root / "terraform" / "modules" / ".archived" / "tests"
         ignored = self.root / "terraform" / "modules" / "m" / ".terraform" / "tests"

@@ -57,6 +57,57 @@ jobs:
       - name: Check prompt assets
         run: make prompt-check
 
+  # Every root pins `required_version = "~> 1.5"`, and the validate job below
+  # runs one Terraform, 1.15.8, so nothing else would notice a construct that
+  # needs more than the floor. The first matrix entry is MIN_TERRAFORM_VERSION
+  # in scripts/installer/min_versions.sh; tests/test_terraform_module_tests.py
+  # holds the two equal. 1.6 is here as well as 1.5.0 because from 1.6
+  # `terraform init` parses a root's tests/ directory; a suite moved back
+  # there from tftests/ fails this job rather than an install on 1.6.
+  terraform-floor:
+    name: Terraform ${{ matrix.terraform }} initialises and validates every root
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        terraform: ["1.5.0", "1.6.6"]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ matrix.terraform }}
+          terraform_wrapper: false
+
+      # init retries on the validate job's schedule, for the reason given
+      # there: no lock file, so every provider comes from the registry.
+      # tests/test_third_party_download_retry.py runs this loop against stubs
+      # as it runs that one.
+      - name: Initialise and validate on the floor
+        env:
+          FLOOR_VERSION: ${{ matrix.terraform }}
+        run: |
+          attempts=4; first_delay=5
+          for dir in terraform/modules/* terraform/examples/*; do
+            if [ -d "$dir" ]; then
+              echo "Validating $dir on Terraform $FLOOR_VERSION..."
+              attempt=1; delay=$first_delay
+              until (cd "$dir" && terraform init -backend=false -input=false); do
+                if [ "$attempt" -ge "$attempts" ]; then
+                  echo "::error::terraform init in $dir failed after $attempts attempts."
+                  exit 1
+                fi
+                echo "::warning::terraform init in $dir: attempt $attempt of $attempts failed; retrying in ${delay}s."
+                sleep "$delay"; attempt=$((attempt + 1)); delay=$((delay * 2))
+              done
+              (cd "$dir" && terraform validate)
+            fi
+          done
+
   validate:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -558,7 +609,7 @@ jobs:
             fi
           done
 
-      # The scope modules carry `terraform test` suites under tests/, run
+      # The scope modules carry `terraform test` suites under tftests/, run
       # against mocked providers, so a plan-time rule (a precondition, a
       # postcondition on a read, the bindings a declaration plans) is
       # exercised rather than grepped for. Reuses the provider cache the loop
