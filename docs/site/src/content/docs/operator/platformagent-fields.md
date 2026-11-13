@@ -230,6 +230,7 @@ Every field of the `PlatformAgent` resource's `spec` and `status`, generated fro
 | ----- | ---- | -------- | ------- | ----------- | ----------- |
 | `phase` | `string` | no |  |  | Phase is the overall state (Pending, Provisioning, Ready, Paused, Degraded, Failed). Paused is a gateway held at zero replicas by spec.deployment.scaleToZero; the Ready condition then reads False with reason ScaledToZero. |
 | `observedGeneration` | `integer` | no |  |  | ObservedGeneration is the .metadata.generation the status was last computed from. |
+| `observedVersion` | `string` | no |  |  | ObservedVersion is the image tag or digest from the reconciled gateway workload's platform-agent container (for example, "v0.12.3", "sha-abc1234", or "sha256:..."), stripped of any registry host and repository path. |
 | `address` | `string` | no |  |  | Address is the fully qualified domain name (FQDN) of the agent service. |
 | `lastReconcileTime` | `metav1.Time` | no |  |  | LastReconcileTime is the timestamp when the operator last updated this status. |
 | `conditions` | `[]metav1.Condition` | no |  |  | Conditions represent the latest available observations of the instance's state. |
