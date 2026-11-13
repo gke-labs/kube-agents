@@ -299,6 +299,16 @@ class KubectlContextRegisteredTest(unittest.TestCase):
         self.assertIn(f"{HOST_CTX} {hashlib.sha256(self.kubeconfig.read_bytes()).hexdigest()} {env}", lines)
         self.assertEqual(len(lines), 2)
 
+    def test_a_run_by_a_caller_that_does_not_own_the_kubeconfig_does_not_stop_the_record(self):
+        # A root `kubectl --context` in the shell pod: before the owner check came first, it left a
+        # lock the agent user could not open, so the agent's merge never recorded.
+        with mock.patch.object(self.client.os, "geteuid", return_value=os.geteuid() + 1):
+            self.register()
+        self.assertEqual([self.kubeconfig.name], sorted(p.name for p in self.home.iterdir()), "no lock, no record")
+        self.assert_not_registered("--context", CTX, "get", "pods")
+        self.register()
+        self.assert_registered("--context", CTX, "get", "pods")
+
     def test_the_record_is_of_the_bytes_python_checked_not_of_a_later_read(self):
         # Another writer replaces the kubeconfig between the merge's read and its record, as
         # `kubectl config delete-context` can: it takes no lock. The record must not vouch for the new file.
