@@ -111,10 +111,32 @@ TEXT_ARG_KEYS = ("content",)
 SHELL_ESCAPED_SPACE = "\\ "
 SHELL_ESCAPED_SPACE_FOLD = "\ue000"
 # A served value ends a word: the next character is whitespace, a quote, a
-# shell operator or the end (`mask_served_values`).
-SERVED_VALUE_END = r"(?=[\s\"';|&)]|\Z)"
+# shell operator, a closing parenthesis or the end. A value that ends with
+# its own closing quote has ended there (`mask_served_values`).
+SERVED_VALUE_END_RE = re.compile(r"[\s\"';|&)]|\Z")
+# A spelling can be found again inside its own last place (`-ua:S-ua:S` in a
+# run of `-ua:S`), and each such place costs a new search of about the
+# spelling's length. `mask_served_values` follows such places for this many
+# spelling characters per character of the text, and for the fixed count
+# below in a short text; past that it looks for the spelling only after the
+# end of its last place.
+SERVED_OVERLAP_SEARCH_CHARS_PER_TEXT_CHAR = 4
+SERVED_OVERLAP_SEARCH_MIN_CHARS = 65536
 # The length of a short credential flag word (`-p`, `-a`).
 SHORT_P_FLAG_WORD_LEN = 2
+# Where the redactor's bare key-value value ends (the `bare` branch of
+# `SECRET_KV_PATTERN` in `agents/chat/defaults/plugins/common/redactor.py`):
+# whitespace, a quote, one of `,{}]`, or a backslash escape. A value that
+# took a flag word runs on through `=` and `user:` up to the first of these,
+# and its marker stands in front of what follows (`at_fold_flag_secrets`).
+REDACTOR_BARE_VALUE_END_RE = re.compile(r"[\s\"',{}\]]|\\[nrt\"/]")
+# The longest text one end of that rule spans, a backslash escape.
+REDACTOR_BARE_VALUE_END_MAX_LEN = 2
+# A word character (a letter, a digit or `_`). The spelling after the
+# redactor's marker is kept only for a value with one outside the ends above:
+# a value made of closing punctuation alone (`",`, `}`, `\n'`) would match
+# what follows other markers in the command.
+VALUE_WORD_CHAR_RE = re.compile(r"\w")
 # Words a flag rule may read as a value that are shell operators, not
 # values; the after-pipeline mask leaves them alone.
 SHELL_OPERATOR_WORDS = frozenset({"&&", "||", "&", "|", ";"})
@@ -904,33 +926,53 @@ def blank_named_values(redactor: Any, text: str, value_span: str = VALUE_SPAN_TO
     return text.replace(SHELL_ESCAPED_SPACE_FOLD, SHELL_ESCAPED_SPACE)
 
 
-def at_fold_flag_secrets(redactor: Any, folded: str) -> list[tuple[str, tuple[str, ...]]]:
+def at_fold_flag_secrets(redactor: Any, folded: str) -> list[tuple[tuple[str, int], ...]]:
     """The values the CLI flag rules would mask after the escaped-space mark
-    in `folded`, each with the leads it may follow in the served text: its
-    own flag and separator (`--password `, `-p`, `-u admin:`), and the secret
-    marker in front of what follows the flag word, for when the redactor
-    masked the flag word with the value before it. Spelled as the served
-    text spells them (the mark given back as `\\ `).
+    in `folded`, one entry per value: the spellings it may have in the served
+    text, each with the offset where the value starts in it. A spelling is a
+    lead and the value: the value's own flag and separator (`--password `,
+    `-p`, `-u admin:`), or the secret marker in front of what the redactor
+    left of them, for when the redactor masked the flag word with the value
+    before it. Spelled as the served text spells them (the mark given back
+    as `\\ `).
 
     The redactor runs before the flag rules and its key-value rule reads a
     bare value up to whitespace, which the mark is not: in
     `DB_PASSWORD=x\\ --password S` it masks `x\\<mark>--password` and leaves
-    `S`. Read before the redactor, these values are masked after the whole
-    pipeline where they still follow one of their leads, in each command
-    argument they were read from (`mask_served_values`). Nothing here changes
-    the text the redactor and the other rules read, so no mask is lost.
+    `S`; in `--password="S"` and `--user=admin:"S"` it runs on to the quote
+    (`REDACTOR_BARE_VALUE_END_RE`) and leaves `"S"`. Read before the
+    redactor, these values are masked after the whole pipeline where they
+    still follow one of their leads, in each command argument they were read
+    from (`mask_served_values`). Nothing here changes the text the redactor
+    and the other rules read, so no mask is lost.
     """
-    found: list[tuple[str, tuple[str, ...]]] = []
+    found: list[tuple[tuple[str, int], ...]] = []
+    if SHELL_ESCAPED_SPACE_FOLD not in folded:
+        # Each rule below needs the mark: a command without an escaped space
+        # costs nothing here.
+        return found
 
     def unfold(text: str) -> str:
         return text.replace(SHELL_ESCAPED_SPACE_FOLD, SHELL_ESCAPED_SPACE)
 
-    def keep(raw: str, lead: str, after_flag: str) -> None:
+    def keep(value: str, lead: str, after_flag: str, raw: str = "") -> None:
+        # `value` is the value as its rule reads it; `raw` is the value as the
+        # command spells it, given where the rule read it without its quotes.
         if len(found) >= MAX_AT_FOLD_FLAG_VALUES:
             return
-        value = unfold(raw)
-        if value and not value.startswith(REDACTED_MARKER_PREFIX) and value not in SHELL_OPERATOR_WORDS:
-            found.append((value, (unfold(lead), REDACTED_SECRET_MARKER + unfold(after_flag))))
+        read = unfold(value)
+        if not read or read.startswith(REDACTED_MARKER_PREFIX) or read in SHELL_OPERATOR_WORDS:
+            return
+        raw = raw or value
+        leads = (unfold(lead), REDACTED_SECRET_MARKER + unfold(after_flag))
+        spellings = [(one + spelled, len(one)) for spelled in dict.fromkeys((read, unfold(raw))) for one in leads]
+        # The redactor's value ends at the first such place in the lead, or
+        # where the value starts with one; its marker stands in front of the rest.
+        end = REDACTOR_BARE_VALUE_END_RE.search(lead + raw[:REDACTOR_BARE_VALUE_END_MAX_LEN])
+        if end and end.start() <= len(lead) and VALUE_WORD_CHAR_RE.search(REDACTOR_BARE_VALUE_END_RE.sub("", raw)):
+            rest = REDACTED_SECRET_MARKER + unfold(lead[end.start() :])
+            spellings.append((rest + unfold(raw), len(rest)))
+        found.append(tuple(spellings))
 
     for match in CLI_LONG_FLAG_AT_FOLD_RE.finditer(folded):
         unquoted = unquote_token(match.group("val"))
@@ -945,12 +987,13 @@ def at_fold_flag_secrets(redactor: Any, folded: str) -> list[tuple[str, tuple[st
     def read_userpass(segment: "re.Match[str]", source: str) -> str:
         for match in CLI_USERPASS_ARG_AT_FOLD_RE.finditer(source[segment.start() : segment.end()]):
             quote = match.group("quote") or ""
-            val = match.group("qval") if quote else unquote_token(match.group("val"))
+            raw = match.group("qval") if quote else match.group("val")
+            val = raw if quote else unquote_token(raw)
             if not val.startswith(CLI_FLAG_LEAD_CHAR) and redactor._is_credential_value(val):
                 prefix = match.group("prefix")[len(SHELL_ESCAPED_SPACE_FOLD) :]
                 flag_word = prefix.rstrip(INLINE_WHITESPACE + EQUALS_SEPARATOR)
                 user = quote + (match.group("quser") if quote else match.group("user"))
-                keep(val, prefix + user, prefix[len(flag_word) :] + user)
+                keep(val, prefix + user, prefix[len(flag_word) :] + user, raw)
         return source[segment.start() : segment.end()]
 
     def read_short_p(match: "re.Match[str]", source: str) -> str:
@@ -967,22 +1010,52 @@ def at_fold_flag_secrets(redactor: Any, folded: str) -> list[tuple[str, tuple[st
     return found
 
 
-def mask_served_values(text: str, values: Sequence[tuple[str, tuple[str, ...]]]) -> str:
-    """`text` with each of `values` replaced by the secret marker where it
-    still follows one of its leads (see `at_fold_flag_secrets`) and ends a
-    word: the value after its flag, not the same string elsewhere in the
-    command; more masks only. One pass over `text`, longest lead and value
-    first, so a shorter value cannot split a longer one."""
-    replacements: dict[str, str] = {}
-    for value, leads in values[:MAX_AT_FOLD_FLAG_VALUES]:
-        for lead in leads:
-            replacements.setdefault(lead + value, lead + REDACTED_SECRET_MARKER)
-    if not replacements:
+def mask_served_values(text: str, values: Sequence[tuple[tuple[str, int], ...]]) -> str:
+    """`text` with the value of each spelling in `values` (see
+    `at_fold_flag_secrets`) replaced by the secret marker where the spelling
+    ends a word: the value after its flag, not the same string elsewhere in
+    the command; more masks only. Where places overlap (a value that holds
+    the flag word of the next value), one marker stands for all of them,
+    from the first value's start to the last place's end. Each spelling is
+    searched for as plain text, in one pass, so the cost is linear in
+    `text` (see `SERVED_OVERLAP_SEARCH_CHARS_PER_TEXT_CHAR`)."""
+    value_at_by_spelling: dict[str, int] = {}
+    for spellings in values[:MAX_AT_FOLD_FLAG_VALUES]:
+        for served, value_at in spellings:
+            # Two values with one served spelling: the one that masks more.
+            value_at_by_spelling[served] = min(value_at, value_at_by_spelling.get(served, value_at))
+    places: list[tuple[int, int, int]] = []
+    overlap_chars = SERVED_OVERLAP_SEARCH_MIN_CHARS + SERVED_OVERLAP_SEARCH_CHARS_PER_TEXT_CHAR * len(text)
+    for served, value_at in value_at_by_spelling.items():
+        quoted = served.endswith(SHELL_QUOTE_CHARS)
+        start = text.find(served)
+        while start >= 0:
+            end = start + len(served)
+            if quoted or SERVED_VALUE_END_RE.match(text, end):
+                places.append((start, end, start + value_at))
+            following = text.find(served, start + 1)
+            if 0 <= following < end:
+                if overlap_chars >= len(served):
+                    overlap_chars -= len(served)
+                else:
+                    following = text.find(served, end)
+            start = following
+    if not places:
         return text
-    pattern = re.compile(
-        "(?:" + "|".join(re.escape(key) for key in sorted(replacements, key=len, reverse=True)) + ")" + SERVED_VALUE_END
-    )
-    return pattern.sub(lambda match: replacements[match.group(0)], text)
+    places.sort()
+    pieces: list[str] = []
+    done = 0
+    _, end, value_at = places[0]
+    for next_start, next_end, next_value_at in places[1:]:
+        if next_start < end:
+            end = max(end, next_end)
+            value_at = min(value_at, next_value_at)
+            continue
+        pieces += (text[done:value_at], REDACTED_SECRET_MARKER)
+        done = end
+        end, value_at = next_end, next_value_at
+    pieces += (text[done:value_at], REDACTED_SECRET_MARKER, text[end:])
+    return "".join(pieces)
 
 
 def as_json_structure(text: str) -> Any:
@@ -1210,7 +1283,7 @@ def scrub_step_text(redactor: Any, kind: str, text: str, withheld: str) -> str:
     value_span = VALUE_SPAN_LINE if is_result else VALUE_SPAN_TOKEN
     shell_keys = COMMAND_ARG_KEYS if is_call else ()
     line_keys = TEXT_ARG_KEYS if is_call else ()
-    flag_secrets: list[tuple[str, tuple[str, ...]]] = []
+    flag_secrets: list[tuple[tuple[str, int], ...]] = []
     try:
         parsed = as_json_structure(text)
         if is_call:
