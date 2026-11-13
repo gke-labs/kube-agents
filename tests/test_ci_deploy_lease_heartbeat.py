@@ -149,7 +149,12 @@ class CiDeployLeaseHeartbeatTest(unittest.TestCase):
         text = _text()
         traps = [ln.strip() for ln in text.splitlines() if ln.strip().startswith("trap ") and ln.strip().endswith(" EXIT")]
         self.assertEqual(traps, ["trap deploy_exit EXIT", "trap cleanup_pf_and_dump EXIT", "trap deploy_exit EXIT"], traps)
-        self.assertIn("deploy_exit() {\n  dump_prow_artifacts_on_failure\n  stop_deploy_heartbeat\n}", text)
+        # The web console gate's tunnel (6a) is killed after the daemon stops;
+        # the dump still runs first, on the exit status it was armed with.
+        self.assertIn(
+            "deploy_exit() {\n  dump_prow_artifacts_on_failure\n  stop_deploy_heartbeat\n  # The web console gate's tunnel (6a), if a failure left one open.\n  kill \"${WEB_CONSOLE_PF_PID:-}\" 2>/dev/null || true\n}",
+            text,
+        )
         self.assertIn(
             "cleanup_pf_and_dump() {\n  kill \"${PF_PID:-}\" 2>/dev/null || true\n  dump_prow_artifacts_on_failure\n  stop_deploy_heartbeat\n}",
             text,

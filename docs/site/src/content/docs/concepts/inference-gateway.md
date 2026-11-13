@@ -172,6 +172,8 @@ model_list:
 
 LiteLLM translates the value for each provider. On Gemini 3.x, through `gemini` or `vertex_ai`, it becomes `thinkingConfig.thinkingLevel` on the request to Google. On Claude it becomes adaptive thinking with that effort, and OpenAI and `openai_compatible` servers receive `reasoning_effort` as written. A model that LiteLLM does not treat as a reasoning model, such as `gemini-2.0-flash`, fails every request with `UnsupportedParamsError`, so leave the value empty for one.
 
+A vLLM server passes the value to the model's chat template, which decides what each level means. GLM-5.3's template, for example, recognizes only `low` and `high`. Anything else, `medium` included, runs at `max`, its default and slowest level, with no error. vLLM's Gemma 4 template has no effort field: every value is ignored, and thinking is a server-side template setting. Check the served model's template before relying on a level.
+
 At the default, empty, no `reasoning_effort` is rendered and the model thinks at its own default level; a Gemini 2.5 or 3.x model keeps the `thinking` key described in [Gemini's thoughts](#geminis-thoughts). The value is a default the gateway supplies, the same as `max_tokens` above: LiteLLM lets a request's own `reasoning_effort` win over the one in `litellm_params`.
 
 The chart is the only path that renders it. The kustomize dev copy carries no `reasoning_effort`, and neither `install.env` nor the Terraform example has a variable for it. Set it through the Terraform example's `extra_helm_values` (`{ litellm = { reasoningEffort = "high" } }`) or with `--set litellm.reasoningEffort=high` on a direct Helm install.
