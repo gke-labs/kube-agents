@@ -77,6 +77,10 @@ USER_TOKEN_PREFIXES = ("xoxp-", "xoxe.xoxp-")
 # script sets it beside the run's KUBE_AGENTS_TIMING_FILE, which carries only
 # the post-to-answer leg the scorer reads.
 TIMING_FILE_ENV = "BENCH_SLACK_TIMING_FILE"
+# A second turn the lane sends once the first settles, replying in its thread:
+# a follow-up, or a typed choice for a question's buttons. Recorded beside the
+# first turn's timing under slack_then_*; the case grades the first turn.
+THEN_ENV = "BENCH_SLACK_THEN"
 
 POLL_SECONDS = 2.0
 # The bot's reactions that end a turn rather than mark it in flight: blocked and
@@ -261,6 +265,27 @@ class SlackTurn:
     def run(self, prompt: str, deadline_seconds: float) -> SlackExchange:
         sent = self.client.call("chat.postMessage", channel=self.channel, text=f"<@{self.bot_user}> {prompt}")
         ex = SlackExchange(ask_ts=str(sent["ts"]))
+        return self._await(ex, ex.ask_ts, deadline_seconds)
+
+    def follow_up(self, first: SlackExchange, text: str, deadline_seconds: float) -> SlackExchange:
+        """Reply in the first ask's thread as the test user and read that turn until it settles.
+
+        The exchange's ask is the reply, and its posts are the bot's replies
+        after it. A typed answer to a question goes this way, since Slack's
+        Web API cannot press a button; the gateway reads it as continuing the
+        first ask and marks that ask, not the reply, while the work runs, so
+        the first ask's reactions are read as well.
+        """
+        sent = self.client.call("chat.postMessage", channel=self.channel, thread_ts=first.ask_ts,
+                                text=f"<@{self.bot_user}> {text}")
+        ex = SlackExchange(ask_ts=str(sent["ts"]))
+        return self._await(ex, first.ask_ts, deadline_seconds, also_marked=first.ask_ts)
+
+    def _await(self, ex: SlackExchange, root_ts: str, deadline_seconds: float,
+               also_marked: str = "") -> SlackExchange:
+        """Poll ex's reaction (and also_marked's, for a continued ask) and the bot's posts after
+        ex's ask in root_ts's thread until the turn settles."""
+        after = ts_value(ex.ask_ts)
         deadline = self._clock() + deadline_seconds
         last_shape: tuple = ()
         quiet_since: float | None = None
@@ -269,7 +294,10 @@ class SlackTurn:
             self._sleep(self._poll)
             try:
                 names = self._bot_reactions(ex.ask_ts)
-                ex.posts = self._bot_replies(ex.ask_ts)
+                if also_marked:
+                    names += self._bot_reactions(also_marked)
+                ex.posts = [p for p in self._bot_replies(root_ts)
+                            if after is None or (ts_value(p.get("ts")) or after) > after]
             except SlackAPIError as err:
                 if err.transient:
                     ex.errors.append(str(err))

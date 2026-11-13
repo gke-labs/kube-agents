@@ -254,3 +254,78 @@ def test_the_slack_report_is_the_report_the_other_transports_build(monkeypatch):
 
 def test_a_direct_answer_is_the_whole_report():
     assert harness._slack_report([STATUS, ANSWER]) == ANSWER["text"]
+
+
+class ThreadSlack(FakeSlack):
+    """FakeSlack whose second post (the lane's reply) gets its own ts, so the follow-up reads after it."""
+
+    REPLY_TS = "1800000010.000100"
+
+    def call(self, method, **params):
+        if method == "chat.postMessage" and self.posted:
+            self.posted.append(params)
+            return {"ok": True, "ts": self.REPLY_TS}
+        return super().call(method, **params)
+
+
+def test_a_follow_up_replies_in_the_thread_and_reads_only_what_came_after_it():
+    later = {"ts": "1800000012.000100", "user": BOT, "text": "Only the platform agent can change a deployment."}
+    fake = ThreadSlack([{"replies": [ANSWER]}, {"replies": [ANSWER]}, {"replies": [ANSWER, later]}])
+    clock = FakeClock()
+    turn = _turn(fake, clock)
+    first = turn.run("what can you do?", 60)
+    assert first.outcome == "settled"
+    then = turn.follow_up(first, "which can change a deployment?", 60)
+    assert fake.posted[1]["thread_ts"] == ASK_TS
+    assert fake.posted[1]["text"] == f"<@{BOT}> which can change a deployment?"
+    assert then.outcome == "settled" and then.deliverable == later["text"]
+    assert [p["ts"] for p in then.posts] == [later["ts"]]
+    assert then.timing()["slack_post_to_answer_s"] == 2.0
+
+
+def test_the_then_turn_is_recorded_not_graded():
+    later = {"ts": "1800000012.000100", "user": BOT, "text": "Only the platform agent can."}
+    fake = ThreadSlack([{"replies": [ANSWER]}, {"replies": [ANSWER]}, {"replies": [ANSWER, later]}])
+    turn = _turn(fake, FakeClock())
+    first = turn.run("q", 60)
+    out = harness._slack_then(turn, first, "and?", 60)
+    assert out["slack_then_outcome"] == "settled"
+    assert out["slack_then_posts"] == 1
+    assert out["slack_then_post_to_answer_s"] == 2.0
+    assert set(out) >= {"slack_then_post_to_first_reaction_s", "slack_then_post_to_ack_s", "slack_then_reaction"}
+
+
+def test_a_then_turn_that_fails_is_recorded_as_an_error():
+    class Refusing(ThreadSlack):
+        def call(self, method, **params):
+            if method == "chat.postMessage" and self.posted:
+                raise slack.SlackAPIError(method, "not_in_channel")
+            return super().call(method, **params)
+
+    fake = Refusing([{"replies": [ANSWER]}])
+    turn = _turn(fake, FakeClock())
+    first = turn.run("q", 60)
+    assert harness._slack_then(turn, first, "and?", 60) == {"slack_then_outcome": "error: chat.postMessage: not_in_channel"}
+
+
+def test_a_typed_answer_waits_while_the_first_ask_is_marked_in_flight():
+    """The gateway marks the continued first ask, not the reply, while the resumed work runs."""
+    interim = {"ts": "1800000011.000100", "user": BOT, "text": "picking it back up"}
+    done = {"ts": "1800000030.000100", "user": BOT, "text": "Left as it is."}
+
+    class ContinuedSlack(ThreadSlack):
+        def call(self, method, **params):
+            if method == "reactions.get":
+                step = self.steps[min(self.polls, len(self.steps) - 1)]
+                on_root = params.get("timestamp") == ASK_TS and step.get("root_marked")
+                return {"ok": True, "message": {"reactions": [{"name": "eyes", "users": [BOT]}] if on_root else []}}
+            return super().call(method, **params)
+
+    steps = [{"replies": [ANSWER]}] * 5 + [{"replies": [ANSWER, interim], "root_marked": True}] * 25 + \
+        [{"replies": [ANSWER, interim, done]}]
+    fake = ContinuedSlack(steps)
+    turn = _turn(fake, FakeClock())
+    first = turn.run("q", 60)
+    then = turn.follow_up(first, "none of those", 120)
+    assert then.outcome == "settled"
+    assert then.deliverable == "Left as it is.", "settled on the interim post while the first ask was still marked"
