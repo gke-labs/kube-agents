@@ -2908,7 +2908,11 @@ every message through either stamps its own backend.
 - `tasks/cancel` is a cancel turn on the task's conversation - the same `kind: cancel` envelope
   the inject door's cancel route and the chat path's `stop` publish - answered once the cancel is
   on the bus (`TaskObserver.CancelPublished`) with the `Task` as it stands. The executor decides
-  when the task is canceled; the client polls `tasks/get` for that terminal as for any other.
+  when the task is canceled; the client polls `tasks/get` for that terminal as for any other. Once
+  a cancel for the task is on the bus, any later `tasks/cancel` (a retry after a lost response)
+  is answered with the `Task` and publishes nothing, whatever terminal it has reached since:
+  `canceled`, or `completed` or `failed` if the turn finished before the cancel took. A task that
+  ended with no cancel published refuses one with `TaskNotCancelableError` (-32002).
 - `message/stream` is refused as unsupported and the card says `streaming: false`. It lands
   next, as SSE frames from the same observer hooks.
 
