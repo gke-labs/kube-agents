@@ -64,10 +64,12 @@ main() {
   local line case_id reply dir log timing rc
   while IFS= read -r line; do
     # "<case id>", or "<case id> then: <reply>" for a second turn in the thread;
-    # split before the comment strip, so a reply may hold a "#".
+    # split before the comment strip, so a reply may hold a "#", but only when no
+    # "#" comes before " then: " (a commented-out reply is a comment).
     reply=""
-    case "${line}" in
-      *" then: "*) reply="${line#* then: }"; line="${line%% then: *}" ;;
+    case "${line%% then: *}" in
+      "${line}" | *#*) ;;
+      *) reply="${line#* then: }"; line="${line%% then: *}" ;;
     esac
     line="${line%%#*}"
     case_id="$(echo "${line}" | tr -d '[:space:]')"

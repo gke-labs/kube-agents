@@ -283,9 +283,17 @@ class SlackTurn:
 
     def _await(self, ex: SlackExchange, root_ts: str, deadline_seconds: float,
                also_marked: str = "") -> SlackExchange:
-        """Poll ex's reaction (and also_marked's, for a continued ask) and the bot's posts after
-        ex's ask in root_ts's thread until the turn settles."""
+        """Poll ex's reaction and the bot's posts after ex's ask in root_ts's thread until the
+        turn settles.
+
+        also_marked is a continued ask's message (a typed answer's first ask). Its
+        reactions never count as ex's own; they hold the turn open while it is in
+        flight, and while it still carries the settle mark Turn 1 left on it (the
+        gateway keeps ⏸️ until the continuing task draws its first mark), since
+        until then the answer has not visibly taken.
+        """
         after = ts_value(ex.ask_ts)
+        left_by_first = set(self._bot_reactions(also_marked)) if also_marked else set()
         deadline = self._clock() + deadline_seconds
         last_shape: tuple = ()
         quiet_since: float | None = None
@@ -294,8 +302,7 @@ class SlackTurn:
             self._sleep(self._poll)
             try:
                 names = self._bot_reactions(ex.ask_ts)
-                if also_marked:
-                    names += self._bot_reactions(also_marked)
+                continued = set(self._bot_reactions(also_marked)) if also_marked else set()
                 ex.posts = [p for p in self._bot_replies(root_ts)
                             if after is None or (ts_value(p.get("ts")) or after) > after]
             except SlackAPIError as err:
@@ -308,6 +315,9 @@ class SlackTurn:
             # The ask's own mark stays on beside a blocked mark (the gateway adds
             # it after the ask's), so any settle mark ends the turn.
             reacting = bool(names) and not SETTLE_REACTIONS.intersection(names)
+            if also_marked and ((continued and not SETTLE_REACTIONS & continued)
+                                or (SETTLE_REACTIONS & left_by_first and continued == left_by_first)):
+                reacting = True
             shape = tuple((p.get("ts"), (p.get("edited") or {}).get("ts"), p.get("text")) for p in ex.posts)
             if shape != last_shape:
                 last_shape, quiet_since = shape, self._clock()

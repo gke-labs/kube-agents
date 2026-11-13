@@ -317,11 +317,17 @@ def test_a_typed_answer_waits_while_the_first_ask_is_marked_in_flight():
         def call(self, method, **params):
             if method == "reactions.get":
                 step = self.steps[min(self.polls, len(self.steps) - 1)]
-                on_root = params.get("timestamp") == ASK_TS and step.get("root_marked")
-                return {"ok": True, "message": {"reactions": [{"name": "eyes", "users": [BOT]}] if on_root else []}}
+                names = step.get("root", []) if params.get("timestamp") == ASK_TS else []
+                return {"ok": True, "message": {"reactions": [{"name": n, "users": [BOT]} for n in names]}}
             return super().call(method, **params)
 
-    steps = [{"replies": [ANSWER]}] * 5 + [{"replies": [ANSWER, interim], "root_marked": True}] * 25 + \
+    # Turn 1 settles blocked ([eyes, ⏸️]); the answer's interim post lands while the
+    # first ask still carries that mark, then the continuing task marks it in flight,
+    # then its terminal clears it.
+    paused = ["eyes", "double_vertical_bar"]
+    steps = [{"replies": [ANSWER], "root": paused}] * 5 + \
+        [{"replies": [ANSWER, interim], "root": paused}] * 20 + \
+        [{"replies": [ANSWER, interim], "root": ["eyes"]}] * 10 + \
         [{"replies": [ANSWER, interim, done]}]
     fake = ContinuedSlack(steps)
     turn = _turn(fake, FakeClock())
@@ -329,3 +335,4 @@ def test_a_typed_answer_waits_while_the_first_ask_is_marked_in_flight():
     then = turn.follow_up(first, "none of those", 120)
     assert then.outcome == "settled"
     assert then.deliverable == "Left as it is.", "settled on the interim post while the first ask was still marked"
+    assert then.reaction == "" and then.reaction_seen is None, "the first ask's mark was read as the reply's own"
