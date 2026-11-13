@@ -429,7 +429,7 @@ one run of which reads at most `READS_PER_TICK` (20) waiting records' pull reque
 read first, and reads nothing while the switch is `off`; no job schedules it yet. A merge fills
 `merged_at`, and `merge_commit` when the forge reports one. A close without a merge fills
 `closed_at`; the record is still read for `CLOSED_GRACE` (a day) so a reopen clears it, and past
-that it ends with no outcome. Every read stamps `merge_checked_at`. The apply step is
+that it ends with no outcome. Every read stamps `merge_checked_at`. The apply and health steps are
 `post_merge_check.py health`, under the same switch and per-run cap and likewise unscheduled, least
 recently read first by `health_checked_at`. For a merged record with a `merge_commit` and a cluster it
 can name, it reads the Argo CD Applications, Flux Kustomizations and Config Sync RepoSyncs on that
@@ -437,9 +437,14 @@ cluster that deliver the repository into the record's namespace, asking the brok
 (`revision-contains`) whether a later applied commit contains the merge; with none, or when the broker cannot say, it looks for the
 object the fix adds (for `no-pdb`, a PodDisruptionBudget selecting the workload). The reading goes in
 `sync_state`. Once applied it records `applied_at` and the pods' restart counts
-(`health_baseline`) for the health window, a later step. A workload that is gone or cannot be judged
-fails with the reason in `health_result` and `health_detail`; any other read failure is kept and
-retried. The edit, revert and outcome
+(`health_baseline`). Every later run reads the workload again: the first reading that is not healthy
+fails it at once, and it passes only after `HEALTH_SAMPLES` (2) healthy readings with the last one
+past the window, which is `HEALTH_WINDOW` (5 minutes for `no-pdb`) and never under
+`HEALTHY_AFTER_SYNC` (60 seconds) after the apply. Healthy means the rollout is complete, every pod
+of the workload is Ready, no container restarted past its baseline and none was OOMKilled since the
+apply. The count is kept in `health_detail` while sampling; the result goes in `health_result`, the
+reason in `health_detail` and the time in `health_at`. A workload that is gone or cannot be judged fails with the reason; any other read
+failure is kept and retried. The edit, revert and outcome
 columns are left for the later steps. `cleanup_old_records` leaves the table: each row
 is a durable record of a fix pull request, not idle-session state.
 

@@ -196,10 +196,12 @@ def deployment(replicas=3, updated=3, available=3, ready=3, generation=2, observ
                        "readyReplicas": ready}}
 
 
-def pods(restarts=(0, 0, 0), ready=True):
+def pods(restarts=(0, 0, 0), ready=True, oom_at=None):
     items = []
     for n, count in enumerate(restarts):
         container = {"name": "web", "restartCount": count, "lastState": {}, "state": {"running": {}}}
+        if oom_at and n == 0:
+            container["lastState"] = {"terminated": {"reason": "OOMKilled", "finishedAt": oom_at}}
         items.append({"metadata": {"name": f"checkout-{n}", "uid": f"u{n}", "labels": {"pod-template-hash": "6d4f"},
                                    "ownerReferences": [{"kind": "ReplicaSet", "name": "checkout-6d4f"}]},
                       "status": {"conditions": [{"type": "Ready", "status": "True" if ready else "False"}],
@@ -268,7 +270,7 @@ class WatchHealthTest(unittest.TestCase):
         self.assertIsNone(row["applied_at"])
         self.assertTrue(row["sync_state"].startswith("pending"), row["sync_state"])
 
-    def test_applied_records_the_baseline_and_is_not_read_again(self):
+    def test_applied_records_the_baseline_then_passes_after_the_window(self):
         self.cluster.apps = [argo_app()]
         self.cluster.pod_list = pods(restarts=(2, 0, 0))
         self.assertEqual(self.tick(1)["applied"], [f"{REPO}/pull/1"])
@@ -276,10 +278,76 @@ class WatchHealthTest(unittest.TestCase):
         self.assertEqual(row["applied_at"], (NOW + timedelta(minutes=1)).isoformat())
         self.assertEqual(json.loads(row["health_baseline"]), {"u0/web": 2, "u1/web": 0, "u2/web": 0})
         self.assertEqual(self.cluster.selector, "app=checkout")
-        # Applied: the apply step does not read it again.
+        # Inside the window nothing is judged; after it, a restart count at the baseline passes.
+        self.assertEqual(self.tick(4)["waiting"], [f"{REPO}/pull/1"])
+        self.assertEqual(self.tick(6)["passed"], [f"{REPO}/pull/1"])
+        self.assertEqual(self.row()["health_result"], "passed")
+        # Judged: not read again.
         self.cluster.calls.clear()
         self.tick(10)
         self.assertEqual(self.cluster.calls, [])
+
+    def test_the_window_survives_a_restart_of_the_process(self):
+        self.cluster.apps = [argo_app()]
+        self.tick(1)
+        restarted = FakeCluster()
+        restarted.apps = [argo_app()]
+        post_merge_check.watch_health(self.conn, restarted, NOW + timedelta(minutes=3))
+        restarted = FakeCluster()
+        restarted.apps = [argo_app()]
+        seen = post_merge_check.watch_health(self.conn, restarted, NOW + timedelta(minutes=7))
+        self.assertEqual(seen["passed"], [f"{REPO}/pull/1"])
+        self.assertNotIn(post_merge_check.ARGO_APPLICATIONS, [argv[1] for argv in restarted.calls])
+
+    def test_each_failure_fails_the_window(self):
+        for name, change in (
+            ("restart", lambda c: setattr(c, "pod_list", pods(restarts=(1, 0, 0)))),
+            ("not ready", lambda c: setattr(c, "pod_list", pods(ready=False))),
+            ("rollout", lambda c: setattr(c, "workload", deployment(updated=2))),
+            ("generation", lambda c: setattr(c, "workload", deployment(observed=1))),
+            ("oom", lambda c: setattr(c, "pod_list", pods(oom_at=(NOW + timedelta(minutes=3)).isoformat()))),
+            ("no pods", lambda c: setattr(c, "pod_list", {"items": []})),
+        ):
+            with self.subTest(name):
+                self.setUp()
+                self.cluster.apps = [argo_app()]
+                self.tick(1)
+                change(self.cluster)
+                self.assertEqual(self.tick(6)["failed"], [f"{REPO}/pull/1"])
+                self.assertEqual(self.row()["health_result"], "failed")
+
+    def test_healthy_then_red_after_the_sync_fails_the_window(self):
+        self.cluster.apps = [argo_app()]
+        self.tick(1)
+        self.assertEqual(self.tick(2)["waiting"], [f"{REPO}/pull/1"])
+        self.assertTrue(self.row()["health_detail"].startswith("healthy samples: 1"), self.row()["health_detail"])
+        # Argo still reads synced; a pod fails a minute after the apply.
+        self.cluster.pod_list = pods(ready=False)
+        self.assertEqual(self.tick(3)["failed"], [f"{REPO}/pull/1"])
+        self.assertIn("not Ready", self.row()["health_detail"])
+        # Recovering later does not undo it.
+        self.cluster.pod_list = pods()
+        self.cluster.calls.clear()
+        self.tick(7)
+        self.assertEqual(self.cluster.calls, [])
+
+    def test_a_short_window_still_holds_sixty_seconds_after_the_sync_and_two_readings(self):
+        from unittest import mock
+
+        self.cluster.apps = [argo_app()]
+        with mock.patch.dict(post_merge_check.HEALTH_WINDOW, {"no-pdb": timedelta(seconds=10)}):
+            self.tick(1)
+            at = NOW + timedelta(minutes=1)
+            for seconds, bucket in ((20, "waiting"), (40, "waiting"), (61, "passed")):
+                seen = post_merge_check.watch_health(self.conn, self.cluster, at + timedelta(seconds=seconds))
+                self.assertEqual(seen[bucket], [f"{REPO}/pull/1"], seconds)
+
+    def test_an_oom_before_the_apply_does_not_fail_it(self):
+        self.cluster.apps = [argo_app()]
+        self.cluster.pod_list = pods(oom_at=(NOW - timedelta(hours=1)).isoformat())
+        self.tick(1)
+        self.tick(3)
+        self.assertEqual(self.tick(6)["passed"], [f"{REPO}/pull/1"])
 
     def test_an_unreadable_cluster_is_logged_and_retried(self):
         self.cluster.fail = post_merge_check.ClusterReadError("connection refused")
@@ -331,6 +399,40 @@ class WatchHealthTest(unittest.TestCase):
         self.assertEqual(self.tick(2)["applied"], [f"{REPO}/pull/1"])
         self.assertTrue(self.row()["sync_state"].startswith("observed"), self.row()["sync_state"])
 
+    def test_a_deleted_workload_fails_with_the_reason_and_is_not_read_again(self):
+        self.cluster.apps = [argo_app()]
+        self.tick(1)
+        self.cluster.gone = True
+        with self.assertLogs("post_merge_check", level="WARNING"):
+            self.assertEqual(self.tick(6)["failed"], [f"{REPO}/pull/1"])
+        row = self.row()
+        self.assertEqual(row["health_result"], "failed")
+        self.assertIn("not found", row["health_detail"])
+        self.cluster.calls.clear()
+        self.tick(10)
+        self.assertEqual(self.cluster.calls, [])
+
+    def test_an_unreadable_apply_time_fails_rather_than_waiting_forever(self):
+        self.cluster.apps = [argo_app()]
+        self.tick(1)
+        self.conn.execute("UPDATE post_merge_records SET applied_at = 'garbage'")
+        with self.assertLogs("post_merge_check", level="WARNING"):
+            self.assertEqual(self.tick(2)["failed"], [f"{REPO}/pull/1"])
+        self.assertIn("apply time", self.row()["health_detail"])
+
+    def test_a_read_failure_after_the_apply_is_kept_and_retried(self):
+        self.cluster.apps = [argo_app()]
+        self.tick(1)
+        self.cluster.fail = post_merge_check.ClusterReadError("i/o timeout")
+        with self.assertLogs("post_merge_check", level="WARNING"):
+            self.assertEqual(self.tick(6)["unreadable"], [f"{REPO}/pull/1"])
+        self.assertIn("i/o timeout", self.row()["health_detail"])
+        self.assertIsNone(self.row()["health_result"])
+        self.cluster.fail = None
+        # The failed read reset the count: one healthy reading is not enough.
+        self.assertEqual(self.tick(7)["waiting"], [f"{REPO}/pull/1"])
+        self.assertEqual(self.tick(8)["passed"], [f"{REPO}/pull/1"])
+
     def test_records_are_read_least_recently_checked_first_whatever_their_state(self):
         for n in range(2, 23):
             self.conn.execute(
@@ -350,7 +452,16 @@ class WatchHealthTest(unittest.TestCase):
         self.assertEqual(self.cluster.calls, [])
 
 
-class SelectorTest(unittest.TestCase):
+class SelectorAndRolloutTest(unittest.TestCase):
+    def test_a_pod_belongs_to_the_deployment_only_through_its_own_replica_set(self):
+        def pod(rs, template_hash):
+            return {"metadata": {"labels": {"pod-template-hash": template_hash},
+                                 "ownerReferences": [{"kind": "ReplicaSet", "name": rs}]}}
+
+        web = {"kind": "Deployment", "metadata": {"name": "web"}}
+        self.assertTrue(post_merge_check._owned_by(pod("web-6d4f", "6d4f"), web))
+        self.assertFalse(post_merge_check._owned_by(pod("web-canary-7c9b", "7c9b"), web))
+
     def test_label_selector_renders_match_expressions(self):
         selector = {"matchLabels": {"app": "web"}, "matchExpressions": [
             {"key": "tier", "operator": "In", "values": ["a", "b"]}, {"key": "canary", "operator": "DoesNotExist"},
@@ -364,6 +475,23 @@ class SelectorTest(unittest.TestCase):
         self.assertTrue(post_merge_check.selects(selector, {"app": "web", "tier": "a"}))
         self.assertFalse(post_merge_check.selects(selector, {"app": "web", "tier": "b"}))
         self.assertFalse(post_merge_check.selects({}, {"app": "web"}))
+
+    def test_a_statefulset_is_rolled_out_only_at_its_update_revision(self):
+        sts = {"kind": "StatefulSet", "metadata": {"generation": 1},
+               "spec": {"replicas": 2}, "status": {"observedGeneration": 1, "readyReplicas": 2,
+                                                   "currentRevision": "r1", "updateRevision": "r2"}}
+        self.assertFalse(post_merge_check._rolled_out(sts))
+        sts["status"]["currentRevision"] = "r2"
+        self.assertTrue(post_merge_check._rolled_out(sts))
+
+    def test_pods_of_another_workload_are_not_judged(self):
+        foreign = pods(restarts=(5,))
+        foreign["items"][0]["metadata"]["ownerReferences"] = [{"kind": "ReplicaSet", "name": "canary-77"}]
+        mine = pods()
+        mine["items"] += foreign["items"]
+        passed, _ = post_merge_check.judge_health(deployment(), mine, {}, NOW)
+        self.assertTrue(passed)
+
 
 class SandboxKubectlTest(unittest.TestCase):
     def run_with(self, returncode, stdout="", stderr=""):
