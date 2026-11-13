@@ -27,7 +27,8 @@ import (
 //
 // The two verdicts differ only where the proxy is deliberately stricter:
 // a credential with no target (Verify accepts it for this audience; a proxy
-// credential with no target confines nothing), and the encodings the Python
+// credential with no target confines nothing, so the proxy takes one only as
+// a report credential: tier unattended and a trigger, #5619), and the encodings the Python
 // verifier refuses (non-canonical base64url, a JSON null, header keys beyond
 // typ and alg).
 //
@@ -194,9 +195,37 @@ func buildProxyFixtures(t *testing.T) proxyFixtureFile {
 	add(proxyFixture{Name: "a lowercase typ (jwt/v2 upper-cases it)", Token: signWithHeader(t, kp, `{"typ":"jwt","alg":"ed25519-nkey"}`, base),
 		Now: fixtureNow, GoOK: true, ProxyOK: true, Claims: wantClaims})
 
+	// A report credential (#5619): no target, which the proxy takes only from
+	// an unattended task a trigger started, and holds to the audit-report routes.
+	report := func(tier, trigger string) string {
+		edits := []string{`"tier":"read"`, `"tier":"` + tier + `"`}
+		if trigger == "" {
+			edits = append(edits, trig, ``)
+		} else {
+			edits = append(edits, trig, `,"trigger":`+trigger)
+		}
+		return edited(edits...)
+	}
+	reportClaims := func(trigger Trigger) *proxyFixtureClaims {
+		c := *wantClaims
+		c.Tier, c.Target, c.Trigger = "unattended", nil, &trigger
+		return &c
+	}
+	add(proxyFixture{Name: "a report credential: unattended, a builtin schedule trigger, no target",
+		Token: report("unattended", `{"name":"schedule/compliance-audit","origin":"builtin","stream":"compliance-audit"}`),
+		Now:   fixtureNow, GoOK: true, ProxyOK: true, Claims: reportClaims(builtin)})
+	add(proxyFixture{Name: "a report credential: unattended, a collector trigger, no target",
+		Token: report("unattended", `{"name":"stall-watch","origin":"builtin"}`),
+		Now:   fixtureNow, GoOK: true, ProxyOK: true, Claims: reportClaims(collector)})
+
 	// Go accepts, the proxy refuses: stricter by design.
 	noTarget := edited(`,"target":{"project":"proj-a","location":"us-central1","cluster":"cluster-a"}`, ``)
 	add(proxyFixture{Name: "no target", Token: noTarget, Now: fixtureNow, GoOK: true})
+	add(proxyFixture{Name: "no target, a trigger, at the read tier",
+		Token: report("read", `{"name":"schedule/compliance-audit","origin":"builtin","stream":"compliance-audit"}`), Now: fixtureNow, GoOK: true})
+	add(proxyFixture{Name: "no target, unattended, no trigger", Token: report("unattended", ""), Now: fixtureNow, GoOK: true})
+	add(proxyFixture{Name: "a null target, unattended, a trigger",
+		Token: edited(`"tier":"read"`, `"tier":"unattended"`, trig, `,"target":null,"trigger":{"name":"stall-watch","origin":"builtin"}`), Now: fixtureNow, GoOK: true})
 	add(proxyFixture{Name: "a null name", Token: edited(`"sub":"fixturenonce"`, `"sub":"fixturenonce","name":null`), Now: fixtureNow, GoOK: true})
 	add(proxyFixture{Name: "a header key beyond typ and alg", Token: signWithHeader(t, kp, `{"typ":"JWT","alg":"ed25519-nkey","kid":"x"}`, base),
 		Now: fixtureNow, GoOK: true})
@@ -364,7 +393,8 @@ func TestCredentialProxyFixtures(t *testing.T) {
 		if err == nil && c.Claims != nil {
 			w := c.Claims
 			if got.Task != w.Task || got.Profile != w.Profile || got.Tier != w.Tier || got.Pod != w.Pod ||
-				got.PodUID != w.PodUID || got.Expires.Unix() != w.Expires || got.Target == nil || *got.Target != *w.Target ||
+				got.PodUID != w.PodUID || got.Expires.Unix() != w.Expires ||
+				(got.Target == nil) != (w.Target == nil) || (got.Target != nil && *got.Target != *w.Target) ||
 				(got.Trigger == nil) != (w.Trigger == nil) || (got.Trigger != nil && *got.Trigger != *w.Trigger) {
 				t.Errorf("%s: claims = %+v (target %+v), fixture says %+v", c.Name, got, got.Target, w)
 			}

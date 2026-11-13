@@ -14,6 +14,9 @@ mechanism is different, because these assertions run without a cluster.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import email.message
+import types
 import re
 import textwrap
 import unittest
@@ -473,6 +476,56 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
         profile = h.credential_proxy.CALLER_ROLE_PROFILE
         reached = sorted(prefix for prefix, roles in h.credential_proxy.ROUTE_ROLES if profile in roles)
         self.assertEqual(sorted(["/v1/exec", h.mcp_policy.MCP_RELAY_PREFIX]), reached)
+
+    def test_A3_a_report_credential_reaches_the_audit_report_routes_alone(self) -> None:
+        # A report credential (#5619) is the one task credential with no
+        # target. Its verdict is task_credential's, pinned by the golden
+        # fixtures in the Python suite (that module needs `cryptography`, which
+        # this suite doesn't import); this is the handler's gate on what an
+        # admitted one may reach, driven through _admit_task with a gate that
+        # admits a stand-in for it.
+        cp = h.credential_proxy
+        report_task = types.SimpleNamespace(report_only=True)
+        principal = cp.Principal(workload="w", uid="u", role=cp.CALLER_ROLE_PROFILE, pod="p", pod_uid="u")
+
+        class AdmitsAReportCredential:
+            def admit(self, principal, token):
+                return dataclasses.replace(principal, task=report_task, task_target=None)
+
+        def admit(method: str, path: str) -> tuple[bool, list]:
+            handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
+            handler.headers = email.message.Message()
+            handler.headers[cp.TASK_CREDENTIAL_HEADER] = "a-report-credential"
+            handler.command, handler.path = method, path
+            handler.profile_gate = AdmitsAReportCredential()
+            replies: list = []
+            handler._json = lambda status, body: replies.append((status, body))
+            return handler._admit_task(principal), replies
+
+        for method, path in (
+            ("POST", "/v1/exec"),
+            ("POST", h.mcp_policy.MCP_RELAY_PREFIX + "gke"),
+            ("GET", cp.API_RELAY_PREFIX + "projects/proj-a"),
+            ("POST", "/v1/vcs/issue-view"),
+            ("GET", "/v1/a-route-added-later"),
+            ("PUT", "/v1/audit-reports/a/%2e%2e/latest"),
+        ):
+            with self.subTest(method=method, path=path):
+                admitted, replies = admit(method, path)
+                self.assertFalse(admitted)
+                self.assertEqual(cp.RULE_REPORT_CREDENTIAL_ROUTE, replies[0][1]["rule"])
+        admitted, replies = admit("GET", "/v1/audit-reports/compliance-audit/acme%2Fgitops/latest")
+        self.assertTrue(admitted, replies)
+        for method, pattern in cp.REPORT_CREDENTIAL_ROUTES:
+            with self.subTest(pattern=pattern.pattern):
+                self.assertIn(method, ("GET", "PUT", "DELETE"))
+                self.assertTrue(pattern.pattern.startswith(cp.AUDIT_REPORTS_PREFIX), pattern.pattern)
+        # The MCP relay, which the gate already closes, reads it as no task too.
+        decision, _ = cp.mcp_relay_decision(
+            dataclasses.replace(principal, task=report_task), "developer_knowledge",
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "search_documents"}},
+        )
+        self.assertFalse(decision.allowed)
 
     def test_A3_a_profile_worker_reaches_no_cluster_through_mcp(self) -> None:
         # The relay has no per-task target check, so a profile worker reaches
