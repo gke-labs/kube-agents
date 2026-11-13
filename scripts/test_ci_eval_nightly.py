@@ -672,6 +672,7 @@ class ArrayHygieneTest(unittest.TestCase):
             "networking-world-open-ingress",
             "obtainability-pdb-kustomize-overlay",
             "gce-chat-request-runs-collector",
+            "fleet-audit-manifest-fix-names-stalled-config-connector",
         ):
             with self.subTest(audit=audit):
                 result = run_bash(f"{hint_fn}\nunit_cost_hint {audit}")

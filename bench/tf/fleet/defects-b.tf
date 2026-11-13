@@ -33,8 +33,12 @@
 provider "kubernetes" {
   alias                  = "seeded_b"
   host                   = "https://${google_container_cluster.seeded_b.endpoint}"
-  token                  = data.google_client_config.default.access_token
   cluster_ca_certificate = base64decode(google_container_cluster.seeded_b.master_auth[0].cluster_ca_certificate)
+
+  exec {
+    api_version = "client.authentication.k8s.io/v1beta1"
+    command     = "gke-gcloud-auth-plugin"
+  }
 }
 
 # Defect (upgrade readiness): a pool that upgrades in place. `max_surge = 0`
