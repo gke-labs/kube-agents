@@ -133,7 +133,8 @@ class SlackAgentTestLogic(unittest.TestCase):
         with self.assertRaises(_Failed) as caught:
             _run(fake, listed=[])
         self.assertIn("operator.slackTestUsers", str(caught.exception))
-        self.assertIn("Google Chat holds the gateway", str(caught.exception))
+        self.assertIn("not on spec.mode next", str(caught.exception))
+        self.assertNotIn("Google Chat holds the gateway", str(caught.exception))
         _run(FakeSlack([{"reaction": "eyes", "replies": [_ANSWER]}], ask_bot_id="BDRIVER"), listed=[_TEST_USER])
         # kubectl unavailable: the run goes on and says what it relies on.
         _run(FakeSlack([{"reaction": "eyes", "replies": [_ANSWER]}], ask_bot_id="BDRIVER"), listed=None)

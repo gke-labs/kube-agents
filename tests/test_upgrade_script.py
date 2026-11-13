@@ -3767,6 +3767,9 @@ class FullArmRefusesNextSlackGatewaySettingsTest(unittest.TestCase):
     def test_next_with_slack_on_the_gateway_refuses_each_setting_and_applies_nothing(self):
         base = {"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "true"}
         for extra, says in (
+            # Google Chat beside Slack shares the gateway, so it lifts nothing.
+            ({"GOOGLE_CHAT_ENABLED": "true", "SLACK_BOT_TOKEN": "xoxb-1-secretpart,xoxb-2-secretpart"},
+             "SLACK_BOT_TOKEN holds 2 tokens"),
             ({"SLACK_ALLOWED_USERS": "U0123ABCD, alice@example.com"},
              "SLACK_ALLOWED_USERS holds entries that look like emails: alice@example.com."),
             ({"SLACK_HOME_CHANNEL": "D0123ABCD"},
@@ -3804,10 +3807,6 @@ class FullArmRefusesNextSlackGatewaySettingsTest(unittest.TestCase):
             {"PLATFORM_AGENT_MODE": "next", "SLACK_ALLOWED_USERS": "alice@example.com"},
             {"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "true", "SLACK_ALLOWED_USERS": "U0123ABCD",
              "SLACK_HOME_CHANNEL": "C0123ABCD", "SLACK_BOT_TOKEN": "xoxb-1-secretpart"},
-            # Chat holds the gateway; Slack stays on the today path.
-            {"PLATFORM_AGENT_MODE": "next", "GOOGLE_CHAT_ENABLED": "true", "SLACK_ENABLED": "true",
-             "SLACK_ALLOWED_USERS": "alice@example.com", "SLACK_HOME_CHANNEL": "D0DM",
-             "SLACK_BOT_TOKEN": "xoxb-a,xoxb-b"},
         ):
             with self.subTest(keys=sorted(keys.items())):
                 proc = self._run(keys)
@@ -3861,10 +3860,18 @@ class FullArmRefusesNextSlackGatewaySettingsTest(unittest.TestCase):
         self.assertLess(out.index("An applying run would be refused"), out.index("PLANNED"))
 
     def test_a_plan_is_quiet_where_slack_stays_on_the_today_path(self):
-        proc = self._plan({"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "true", "GOOGLE_CHAT_ENABLED": "true",
+        proc = self._plan({"PLATFORM_AGENT_MODE": "today", "SLACK_ENABLED": "true",
                            "SLACK_ALLOWED_USERS": "alice@example.com"})
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertNotIn("would be refused", proc.stdout + proc.stderr)
+
+    def test_a_plan_warns_with_google_chat_beside_slack(self):
+        # The gateway takes Slack beside Google Chat, so the plan still warns.
+        proc = self._plan({"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "true", "GOOGLE_CHAT_ENABLED": "true",
+                           "SLACK_ALLOWED_USERS": "alice@example.com"})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("An applying run would be refused: SLACK_ALLOWED_USERS holds entries that look like emails",
+                      proc.stdout + proc.stderr)
 
     # ── #3320: no home channel for the gateway's chat backend ──
 

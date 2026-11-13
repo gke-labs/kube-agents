@@ -8240,6 +8240,11 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
              "SLACK_BOT_TOKEN holds 2 tokens"),
             ("", f"PLATFORM_AGENT_MODE=next\nSLACK_ENABLED=true\nSLACK_BOT_TOKEN={token},{token}\n",
              "SLACK_BOT_TOKEN holds 2 tokens"),
+            # Google Chat beside Slack shares the gateway, so it lifts nothing.
+            ("--mode=next --enable-google-chat --enable-slack --slack-home-channel=D0DM", "",
+             "SLACK_HOME_CHANNEL is 'D0DM', which is not a Slack channel id (C... or G...)."),
+            ("", f"PLATFORM_AGENT_MODE=next\nGOOGLE_CHAT_ENABLED=true\nSLACK_ENABLED=true\nSLACK_BOT_TOKEN={token},{token}\n",
+             "SLACK_BOT_TOKEN holds 2 tokens"),
         ):
             with self.subTest(flags=flags.replace("secretpart", "*"), content=content.replace("secretpart", "*")):
                 proc = self._step(flags, content)
@@ -8260,10 +8265,8 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
             ("", "PLATFORM_AGENT_MODE=today\nSLACK_ENABLED=true\nSLACK_ALLOWED_USERS=alice@example.com\nSLACK_BOT_TOKEN=xoxb-a,xoxb-b\n"),
             # next without Slack: the Slack keys are inert.
             ("", "PLATFORM_AGENT_MODE=next\nSLACK_ENABLED=false\nSLACK_ALLOWED_USERS=alice@example.com\n"),
-            # next with Chat and Slack: Chat holds the gateway, so Slack stays
-            # on the today path.
-            ("--mode=next --enable-google-chat --enable-slack --slack-allowed-users=alice@example.com --slack-home-channel=D0DM", ""),
-            ("", "PLATFORM_AGENT_MODE=next\nGOOGLE_CHAT_ENABLED=true\nSLACK_ENABLED=true\nSLACK_ALLOWED_USERS=alice@example.com\nSLACK_BOT_TOKEN=xoxb-a,xoxb-b\n"),
+            # next with Chat and Slack, each setting one the gateway takes.
+            ("--mode=next --enable-google-chat --enable-slack --slack-allowed-users=U0123ABCD --slack-home-channel=C0123ABCD", ""),
         ):
             with self.subTest(flags=flags, content=content):
                 proc = self._step(flags, content)
@@ -8434,7 +8437,7 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
                 self.assertIn("went on ASKED=5", proc.stdout, out)
 
     def test_the_google_chat_home_channel_under_next_is_confirmed_too(self):
-        # #3320 on Chat, which holds the gateway whenever it is enabled under
+        # #3320 on Chat, which the gateway takes whenever it is enabled under
         # next. Allowlist, topic, subscription, then the home channel.
         lead = ["", "", ""]
         proc = self._interview("--mode=next", "", lead + ["", "n", "spaces/AAA"], choice="1")
@@ -8452,18 +8455,25 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
         self.assertIn("Google Chat Home Channel / Space ID (optional", out)
         self.assertNotIn("Continue without a home channel", out)
 
-    def test_the_interview_keeps_the_today_prompts_where_slack_stays_on_the_today_path(self):
+    def test_the_interview_keeps_the_today_prompts_under_today(self):
         answers = ["xoxb-a,xoxb-b", "xapp-1", "alice@example.com", "D0DM", "#ops"]
-        for flags, choice in (("", "2"), ("--mode=next", "3")):
-            with self.subTest(flags=flags, choice=choice):
-                chat = ["", "", "", "spaces/AAA"] if choice == "3" else []
-                proc = self._interview(flags, "", chat + answers, choice=choice)
-                out = proc.stdout + proc.stderr
-                self.assertIn(f"went on ASKED={len(chat) + 5}", proc.stdout, out)
-                # The today prompt (#2787's wording), not the gateway's.
-                self.assertIn("PROMPT: Allowed Slack member IDs (comma-separated, e.g. U0123ABCD; not emails)", out)
-                self.assertIn("PROMPT: Slack Bot Tokens (xoxb-..., comma-separated for several workspaces)", out)
-                self.assertNotIn("look like emails", out)
+        proc = self._interview("", "", answers)
+        out = proc.stdout + proc.stderr
+        self.assertIn("went on ASKED=5", proc.stdout, out)
+        # The today prompt (#2787's wording), not the gateway's.
+        self.assertIn("PROMPT: Allowed Slack member IDs (comma-separated, e.g. U0123ABCD; not emails)", out)
+        self.assertIn("PROMPT: Slack Bot Tokens (xoxb-..., comma-separated for several workspaces)", out)
+        self.assertNotIn("look like emails", out)
+
+    def test_choosing_both_under_next_asks_the_gateway_prompts(self):
+        # Allowlist, topic, subscription and home for Chat, then Slack's five.
+        chat = ["", "", "", "spaces/AAA"]
+        answers = ["xoxb-1-secretpart", "xapp-1", "U0123ABCD", "C0123ABCD", "#ops"]
+        proc = self._interview("--mode=next", "", chat + answers, choice="3")
+        out = proc.stdout + proc.stderr
+        self.assertIn("went on ASKED=9", proc.stdout, out)
+        self.assertIn("PROMPT: Slack Bot Token (xoxb-..., one workspace: spec.mode next takes a single token)", out)
+        self.assertNotIn("comma-separated for several workspaces", out)
 
     # ── after the generator's Secret recovery ──
 
@@ -8508,16 +8518,22 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
         self.assertFalse(exists)
         self.assertIn("which carried the refused settings", out)
 
-    def test_a_recovered_single_token_or_chat_holding_the_gateway_goes_on(self):
-        for keys in (
-            {"PLATFORM_AGENT_MODE": "today", "SLACK_ENABLED": "true"},
-            {"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "true", "GOOGLE_CHAT_ENABLED": "true"},
-        ):
-            with self.subTest(keys=keys):
-                proc, exists = self._after_generator({**keys, "SLACK_APP_TOKEN": "xapp-1", "SLACK_BOT_TOKEN": ""})
-                out = proc.stdout + proc.stderr
-                self.assertIn("APPLIED", proc.stdout, out)
-                self.assertTrue(exists)
+    def test_a_recovered_token_list_under_today_goes_on(self):
+        proc, exists = self._after_generator({"PLATFORM_AGENT_MODE": "today", "SLACK_ENABLED": "true",
+                                              "SLACK_APP_TOKEN": "xapp-1", "SLACK_BOT_TOKEN": ""})
+        out = proc.stdout + proc.stderr
+        self.assertIn("APPLIED", proc.stdout, out)
+        self.assertTrue(exists)
+
+    def test_a_recovered_token_list_is_refused_with_google_chat_beside_slack(self):
+        # The gateway takes Slack beside Google Chat, so Chat lifts nothing.
+        proc, exists = self._after_generator({"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "true",
+                                              "GOOGLE_CHAT_ENABLED": "true",
+                                              "SLACK_APP_TOKEN": "xapp-1", "SLACK_BOT_TOKEN": ""})
+        out = proc.stdout + proc.stderr
+        self.assertNotIn("APPLIED", proc.stdout, out)
+        self.assertIn("SLACK_BOT_TOKEN holds 2 tokens", out)
+        self.assertFalse(exists)
 
     def test_a_dry_run_warns_instead_of_refusing(self):
         proc, exists = self._after_generator({
@@ -8669,11 +8685,11 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
 
     def test_the_menu_names_the_deployment_that_answers_each_platform(self):
         for setup, waits, skips in (
-            # Under next Google Chat holds the A2A gateway, and Slack beside it stays on the agent.
+            # Under next the A2A gateway answers Google Chat and Slack, alone or together.
             ("google_chat_enabled=true slack_enabled=false PLATFORM_AGENT_MODE_AFTER_APPLY=next",
              ("deployment/platform-agent-a2a-gateway ",), ("deployment/platform-agent-gateway ",)),
             ("google_chat_enabled=true slack_enabled=true PLATFORM_AGENT_MODE_AFTER_APPLY=next",
-             ("deployment/platform-agent-a2a-gateway ", "deployment/platform-agent-gateway "), ()),
+             ("deployment/platform-agent-a2a-gateway ",), ("deployment/platform-agent-gateway ",)),
             ("google_chat_enabled=false slack_enabled=true PLATFORM_AGENT_MODE_AFTER_APPLY=next",
              ("deployment/platform-agent-a2a-gateway ",), ("deployment/platform-agent-gateway ",)),
             ("google_chat_enabled=false slack_enabled=true PLATFORM_AGENT_MODE_AFTER_APPLY=today",
@@ -8869,18 +8885,17 @@ class ChatInterviewInheritsAndStillAsksTest(unittest.TestCase):
         # configured gets, rather than option 1.
         self.assertIn('chat_choice="${chat_choice:-4}"', chat_block)
 
-    def test_choosing_both_says_google_chat_holds_the_next_gateway(self):
-        """Under spec.mode next, Google Chat holds the A2A gateway when both
-        are enabled, so Slack is not on the gateway at all. The menu's "Both"
-        arm is where an installer who added Slack to the pre-selected Google
-        Chat makes that choice."""
+    def test_choosing_both_prints_no_precedence_note(self):
+        """Under spec.mode next the A2A gateway takes Google Chat and Slack
+        together, so the menu's "Both" arm has no precedence to explain."""
         arms = self._SOURCE.split('case "$chat_choice" in', 1)
         self.assertEqual(2, len(arms), "the chat_choice case statement moved")
         both_arm = arms[1].split("    3)\n", 1)[1].split(";;", 1)[0]
         self.assertIn('slack_enabled="true"', both_arm)
         self.assertIn('google_chat_enabled="true"', both_arm)
-        self.assertIn("Google Chat holds the A2A gateway", both_arm)
-        self.assertIn("choose Slack alone", both_arm)
+        self.assertNotIn("holds the A2A gateway", both_arm)
+        self.assertNotIn("Slack alone", both_arm)
+        self.assertNotIn("print_info", both_arm)
 
 
 class SlackPromptsKeepTheirCurrentValuesTest(unittest.TestCase):

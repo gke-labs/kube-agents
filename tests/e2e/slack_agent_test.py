@@ -248,8 +248,7 @@ def preflight_ask(client, channel: str, ask_ts: str) -> None:
             f"the ask carries bot_id={ask['bot_id']} (a user-token post through an app), and the gateway's "
             f"{TEST_USERS_ENV_ON_GATEWAY} does not list its author {ask.get('user')}, so the gateway drops it as "
             "bot traffic. Either the install does not list the test user in operator.slackTestUsers, or the "
-            "A2A gateway is not running Slack: under next, Google Chat holds the gateway when both are enabled, "
-            "and Slack then stays on the Hermes path, which has no such list"
+            "install is not on spec.mode next, so Slack is on the Hermes path, which has no such list"
         )
 
 

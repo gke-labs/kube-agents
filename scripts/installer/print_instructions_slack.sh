@@ -21,8 +21,8 @@ Usage: print_instructions_slack.sh [--dry-run] [-y|--no-confirm]
 
 Prints the Slack setup checklist for this install: the app settings to
 verify, the first message to send, and the steps after it. The steps follow
-the Slack path the install uses: the A2A gateway under PLATFORM_AGENT_MODE=next
-without Google Chat, the Hermes listener otherwise. It reads
+the Slack path the install uses: the A2A gateway under PLATFORM_AGENT_MODE=next,
+the Hermes listener otherwise. It reads
 the install.env at the root of the checkout it sits in ($KUBE_AGENTS_INSTALL_ENV
 instead, when set) and scripts/installer/vars.sh, and prints the checklist
 only when SLACK_ENABLED is on there (true, yes, 1 or on). install.sh runs it

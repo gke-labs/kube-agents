@@ -7362,7 +7362,7 @@ run_menu_system() {
         if [ "$CHAT_SETUP_CHECKLIST_PRINTED" = "true" ]; then
           # Unlike main(), this apply does not wait for a rollout, and the menu
           # redrawn below would push the checklist off screen. Under next the
-          # A2A gateway answers the platform it holds; the agent, the rest.
+          # A2A gateway answers every enabled platform; under today, the agent.
           local menu_listeners="" menu_deployment
           if google_chat_moves_to_a2a_gateway "$menu_mode" "$google_chat_enabled" ||
             slack_moves_to_a2a_gateway "$menu_mode" "$slack_enabled" "$google_chat_enabled"; then
@@ -7918,9 +7918,8 @@ main() {
     # Same shape as allowed_users_hint above: an empty list has to read as a
     # deliberate choice rather than as a missing default.
     [ -z "$slack_allowed_users" ] && slack_allowed_hint="empty list"
-    # Under next with Chat off the A2A gateway takes Slack (the mode was
-    # settled at step 2; arm 3 set google_chat_enabled before this runs), and
-    # it takes one bot token, member IDs and a channel id. Those prompts say
+    # Under next the A2A gateway takes Slack, with Google Chat on or off (the
+    # mode was settled at step 2), and it takes one bot token, member IDs and a channel id. Those prompts say
     # so and ask again on an answer the gateway cannot use, rather than let
     # the refusal after this step throw the interview away. A run with nobody
     # to ask keeps its values, and that refusal is its check.
@@ -8135,7 +8134,6 @@ main() {
     3)
       google_chat_enabled="true"
       slack_enabled="true"
-      print_info "Under spec.mode next, Google Chat holds the A2A gateway when both are enabled, and Slack stays on the Hermes Slack platform; choose Slack alone to run Slack on the A2A gateway."
       _prompt_google_chat_settings
       _prompt_slack_settings
       ;;

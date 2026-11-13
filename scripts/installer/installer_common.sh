@@ -1330,11 +1330,12 @@ note_platform_agent_mode_not_applied() {
 
 # Whether Slack is consumed by the A2A gateway after this apply: the
 # operator's a2aSlackArmed (k8s-operator platformagent_a2a_manifests.go),
-# which is spec.mode next, Slack enabled and Google Chat not armed. Chat holds
-# the gateway when both are on, and Slack stays on the today path. $1 the
-# mode the apply renders, $2 SLACK_ENABLED, $3 GOOGLE_CHAT_ENABLED.
+# which is spec.mode next with Slack enabled. The gateway runs Google Chat
+# beside it, so Chat does not change the answer. $1 the mode the apply
+# renders, $2 SLACK_ENABLED. $3, GOOGLE_CHAT_ENABLED, is accepted and ignored
+# so the callers that pass it need no change.
 slack_moves_to_a2a_gateway() {
-  [ "${1:-}" = "next" ] && is_truthy "${2:-}" && ! is_truthy "${3:-}"
+  [ "${1:-}" = "next" ] && is_truthy "${2:-}"
 }
 
 # Whether Google Chat is consumed by the A2A gateway after this apply: the
@@ -1518,37 +1519,30 @@ refuse_next_slack_gateway_settings_from_env() {
 # with no posts, and a CI install never posts. The operator reports the same
 # state as the HomeChannelUnset condition.
 #
-# The install.env key of the home channel the gateway's chat backend lacks,
-# or nothing: $1 the mode the apply renders, $2 SLACK_ENABLED, $3
-# GOOGLE_CHAT_ENABLED, $4 SLACK_HOME_CHANNEL, $5 GOOGLE_CHAT_HOME_CHANNEL.
-# The backend follows the operator: Chat holds the gateway when enabled, and
-# Slack only when Chat is not (slack_moves_to_a2a_gateway).
+# The install.env keys of the home channels the gateway's chat backends lack,
+# one per line, Google Chat first as in the operator's condition, or nothing:
+# $1 the mode the apply renders, $2 SLACK_ENABLED, $3 GOOGLE_CHAT_ENABLED, $4
+# SLACK_HOME_CHANNEL, $5 GOOGLE_CHAT_HOME_CHANNEL. The backends follow the
+# operator: under next the gateway holds each platform that is enabled
+# (google_chat_moves_to_a2a_gateway, slack_moves_to_a2a_gateway).
 next_home_channel_unset_key() {
   local home
-  [ "${1:-}" = "next" ] || return 0
-  if is_truthy "${3:-}"; then
+  if google_chat_moves_to_a2a_gateway "${1:-}" "${3:-}"; then
     home="${5:-}"
     home="$(trim_go_space "$home")"
-    [ -n "$home" ] || printf '%s' GOOGLE_CHAT_HOME_CHANNEL
-    return 0
+    [ -n "$home" ] || printf '%s\n' GOOGLE_CHAT_HOME_CHANNEL
   fi
-  if is_truthy "${2:-}"; then
+  if slack_moves_to_a2a_gateway "${1:-}" "${2:-}"; then
     home="${4:-}"
     home="$(trim_go_space "$home")"
-    [ -n "$home" ] || printf '%s' SLACK_HOME_CHANNEL
+    [ -n "$home" ] || printf '%s\n' SLACK_HOME_CHANNEL
   fi
   return 0
 }
 
-# The warning for that key ($1), one line.
+# The warning for one of those keys ($1), one line.
 next_home_channel_unset_message() {
-  local meanwhile="it refuses them and keeps them for one digest"
-  # Only the Chat key can have Slack beside it: Slack holds the gateway only
-  # with Chat off, so with the Slack key the posts are kept, never sent on.
-  if [ "${1:-}" = GOOGLE_CHAT_HOME_CHANNEL ]; then
-    meanwhile="${meanwhile} (or, with Slack enabled too, they go to the Slack Hermes platform, which delivers them only if Slack has a home channel)"
-  fi
-  printf '%s' "${1} is empty, and under spec.mode next the A2A gateway posts the agent's alerts, drift reports and scheduled reports only to a home channel, so until one is set ${meanwhile}; replies in a conversation still arrive. The PlatformAgent carries the HomeChannelUnset condition until it is set."
+  printf '%s' "${1} is empty, and under spec.mode next the A2A gateway posts the agent's alerts, drift reports and scheduled reports only to a home channel, so until one is set it refuses them and keeps them for one digest; replies in a conversation still arrive. The PlatformAgent carries the HomeChannelUnset condition until it is set."
 }
 
 # What to set for that key ($1); $2 is "flags" when install.sh's flags can
@@ -1569,18 +1563,20 @@ next_home_channel_unset_remedy() {
 
 # Set by warn_next_home_channel_unset, and again by install.sh from the mode
 # after the apply, so the front door's closing summary can say it again where
-# the reader of a non-interactive run's log will see it.
+# the reader of a non-interactive run's log will see it. One key per line.
 NEXT_HOME_CHANNEL_UNSET_KEY=""
 
-# Warns when the apply leaves the gateway's chat backend without a home
-# channel, and records the key for the closing summary. Takes
+# Warns for each of the gateway's chat backends the apply leaves without a
+# home channel, and records the keys for the closing summary. Takes
 # next_home_channel_unset_key's five arguments, then "flags" as $6. Never
 # refuses.
 warn_next_home_channel_unset() {
+  local key
   NEXT_HOME_CHANNEL_UNSET_KEY="$(next_home_channel_unset_key "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}")"
-  [ -n "$NEXT_HOME_CHANNEL_UNSET_KEY" ] || return 0
-  print_warning "$(next_home_channel_unset_message "$NEXT_HOME_CHANNEL_UNSET_KEY")"
-  print_info "$(next_home_channel_unset_remedy "$NEXT_HOME_CHANNEL_UNSET_KEY" "${6:-}")"
+  for key in $NEXT_HOME_CHANNEL_UNSET_KEY; do
+    print_warning "$(next_home_channel_unset_message "$key")"
+    print_info "$(next_home_channel_unset_remedy "$key" "${6:-}")"
+  done
   return 0
 }
 
@@ -1591,13 +1587,16 @@ warn_next_home_channel_unset_from_env() {
     "${SLACK_HOME_CHANNEL:-}" "${GOOGLE_CHAT_HOME_CHANNEL:-}" "${1:-}"
 }
 
-# The closing summary's block, when warn_next_home_channel_unset found the
-# key empty: printed last, so a non-interactive log ends on it. $1 "flags".
+# The closing summary's block, when warn_next_home_channel_unset found a key
+# empty: printed last, so a non-interactive log ends on it. $1 "flags".
 print_next_home_channel_unset_summary() {
+  local key
   [ -n "$NEXT_HOME_CHANNEL_UNSET_KEY" ] || return 0
   echo ""
-  print_warning "No home channel: proactive posts are not delivered there yet. $(next_home_channel_unset_message "$NEXT_HOME_CHANNEL_UNSET_KEY")"
-  print_info "$(next_home_channel_unset_remedy "$NEXT_HOME_CHANNEL_UNSET_KEY" "${1:-}")"
+  for key in $NEXT_HOME_CHANNEL_UNSET_KEY; do
+    print_warning "No home channel: proactive posts are not delivered there yet. $(next_home_channel_unset_message "$key")"
+    print_info "$(next_home_channel_unset_remedy "$key" "${1:-}")"
+  done
 }
 
 # Set by print_chat_setup_checklists: "true" when it printed a checklist.
