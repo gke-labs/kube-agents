@@ -163,8 +163,9 @@ def routed_platforms() -> list[str]:
 
     The rendered env names every platform whose route the gateway arms, with
     the CR's home channel or without one. Without one the gateway refuses
-    each post and keeps it for the digest it posts once one is set. A learned channel is never rendered into the pod, so
-    with the env empty the answer is derived: the gateway holds Slack
+    each post and keeps it for the digest it posts once one is set. A learned
+    channel is never rendered into the pod, so with the env empty the answer
+    is derived: the gateway holds Slack
     (``A2A_NOTIFY_CONVERSATIONS``) and the projected file names a home channel.
     A non-empty env wins over the file.
     """

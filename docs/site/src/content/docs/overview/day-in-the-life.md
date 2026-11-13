@@ -3,7 +3,7 @@ title: A day with kube-agents
 description: Three scenarios from trigger to pull request — a scheduled security audit, a crash loop that ends in a GitOps pull request, and a chat question.
 ---
 
-Each scenario follows one trigger to the chat messages, issues and pull requests it produces. The install runs `spec.mode: next`, the first-install default, has a GitOps repository in `managed_repos`, and has at least one chat platform turned on. Under `next` the A2A gateway holds every chat platform enabled, Google Chat and Slack alike, and posts to the home channel set at install. Where the two modes show a scenario differently the text says so; [What carries over from `today`](/kube-agents/concepts/chatops/#what-carries-over-from-today) has the full list. Names such as `shop`, `checkout`, `redis` and `prod-east` are placeholders.
+Each scenario follows one trigger to the chat messages, issues and pull requests it produces. The install runs `spec.mode: next`, the first-install default, has a GitOps repository in `managed_repos`, and has at least one chat platform turned on. Under `next` the A2A gateway holds Google Chat and Slack, either or both, and posts to the home channel set at install. Where the two modes show a scenario differently the text says so; [What carries over from `today`](/kube-agents/concepts/chatops/#what-carries-over-from-today) has the full list. Names such as `shop`, `checkout`, `redis` and `prod-east` are placeholders.
 
 ## A scheduled audit finds an exposed database
 

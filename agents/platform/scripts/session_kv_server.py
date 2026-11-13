@@ -2977,9 +2977,10 @@ def enabled_chat_platforms() -> list[str]:
     ``spec.mode: next`` the
     managed scope says each such platform's Hermes consumer is off because the
     A2A gateway holds its backend, and posts to it go through the gateway
-    instead, so each is still a platform this install posts to, with a home channel or
-    without one, the gateway keeping the refused posts for a digest. The operator renders the variable only then,
-    and it is reserved against every other source.
+    instead, so each is still a platform this install posts to, with a home
+    channel or without one, the gateway keeping the refused posts for a
+    digest. The operator renders the variable only then, and it is reserved
+    against every other source.
 
     Never returns an empty list — an install that resolves to nothing gets
     DEFAULT_CHAT_PLATFORM.

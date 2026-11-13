@@ -611,7 +611,8 @@ const (
 	a2aProvisionJobNameHashLength = 8
 
 	// a2aDiscordBotSecretName is the hand-made Secret carrying the Discord bot
-	// token, the one chat backend the gateway can be given today without a door.
+	// token, the backend the gateway falls back to when the CR arms neither
+	// Chat nor Slack (buildA2AGatewayDeployment).
 	a2aDiscordBotSecretName = "discord-bot"
 	a2aDiscordBotTokenKey   = "token" // #nosec G101 -- Secret key name, not a credential
 

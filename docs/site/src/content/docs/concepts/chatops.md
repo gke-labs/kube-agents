@@ -51,7 +51,7 @@ When no home channel is set and the install's first chat message, on either plat
 
 Under `spec.mode: next` only the resource field counts. The operator hands it to the A2A gateway, which posts the agent's proactive messages to that space and nowhere else, and `/sethome` does not reach it. The field must name a space (`spaces/<id>`); with it unset or malformed the agent posts nothing to Google Chat unprompted. Unset, the PlatformAgent carries the [`HomeChannelUnset`](/kube-agents/operator/platformagent-crd/#status) condition and the installer warns before it applies,.
 
-The gateway keeps the posts it refused, up to fifty for thirty days, then posts one digest once a home channel is set. It keeps each platform's posts apart: with Slack enabled too, Slack's wait for Slack's own home channel.
+The gateway keeps the posts it refused, up to fifty for thirty days, then posts one digest once a home channel is set. It keeps each platform's posts apart: with Slack enabled too, Slack's posts wait for Slack's own home channel.
 
 ### What it looks like end to end
 
@@ -297,7 +297,7 @@ A message sent while the Planning Agent is still answering an earlier one in the
 
 ## Conversations under `spec.mode: next`
 
-Under `spec.mode: next`, the A2A gateway takes chat in place of the Planning Agent's chat platforms. It holds every chat platform enabled, Google Chat and Slack alike, in one process. On a backend the gateway holds, nothing above about the Planning Agent's Slack or Google Chat platform applies. The gateway holds no model. It decides which messages are turns, keeps one status line per task, and answers a few fixed commands itself.
+Under `spec.mode: next`, the A2A gateway takes chat in place of the Planning Agent's chat platforms. It holds Google Chat and Slack, either or both, in one process. On a backend the gateway holds, nothing above about the Planning Agent's Slack or Google Chat platform applies. The gateway holds no model. It decides which messages are turns, keeps one status line per task, and answers a few fixed commands itself.
 
 Every other message goes as a task, by default to the `platform` route. The Hermes bridge in the agent's pod runs it as a Planning Agent turn in that conversation's own Hermes session, and the Planning Agent answers it or files board cards as it does under `today`. How the agent then answers the question is in [How a chat question is answered under `next`](#how-a-chat-question-is-answered-under-next); this section covers what you see in the conversation.
 
