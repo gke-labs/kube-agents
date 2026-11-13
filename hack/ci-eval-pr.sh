@@ -226,6 +226,11 @@ readonly EVAL_VERDICT_MARKDOWN_FILE="eval-verdict.md"
 readonly EVAL_INJECT_TRANSPORT="inject"
 readonly EVAL_INJECT_TOKEN_SECRET_SUFFIX="-a2a-inject"
 readonly EVAL_INJECT_TOKEN_SECRET_KEY="token"
+# The A2A door's token Secret (k8s-operator platformagent_a2a_manifests.go),
+# rendered when hack/ci-deploy.sh turns the door on for the next lane. Only
+# the card-wait stopped ask (#5407) goes through the door.
+readonly EVAL_A2A_DOOR_TOKEN_SECRET_SUFFIX="-a2a-door"
+readonly EVAL_A2A_DOOR_TOKEN_SECRET_KEY="token"
 # The inject door's port-forward is per unit for the same reason the agent
 # API's is (run_one_unit): the harness reads AGENT_INJECT_LOCAL_PORT for it,
 # not AGENT_LOCAL_PORT, and its default (28099) would put every unit of the
@@ -367,6 +372,21 @@ readonly EVAL_PAUSE_AUDITS_POD_WAIT_SECONDS=300
 # five-minute grace, so it waits only briefly; a gateway that is down then keeps
 # the pause, which the next lease's pause repeats anyway.
 readonly EVAL_RESUME_AUDITS_POD_WAIT_SECONDS=20
+# chain_audits_watch: how often, through the fan-out, the first-run stage's audits
+# are paused once the stage is past them (#5570). The clock fires them
+# hours apart, so a few minutes' lag costs at most a run that lands in it.
+readonly EVAL_CHAIN_AUDITS_INTERVAL_SECONDS=300
+# Where the watch's pid goes: it runs outside the job table, where the fan-out's
+# `jobs -rp` count and its bare `wait` would take it for a unit.
+readonly EVAL_CHAIN_AUDITS_PID_FILE="chain-audits-watch.pid"
+# There while the watch runs; it removes it as it ends. stop_chain_audits_watch waits on
+# it rather than on the pid, which a container whose PID 1 reaps nothing leaves answering.
+readonly EVAL_CHAIN_AUDITS_RUNNING_FILE="chain-audits-watch.running"
+# How long stop_chain_audits_watch waits for a pass under way to finish, so its pauses
+# are recorded before the EXIT trap's resume reads the record. One pass is typically a
+# gateway check and an exec of a few seconds, though its retries can take longer; this
+# keeps most of Prow's five-minute grace for the artifacts.
+readonly EVAL_CHAIN_AUDITS_STOP_WAIT_SECONDS=60
 readonly EVAL_PAUSE_AUDITS_POD_POLL_SECONDS=5
 # The bound on one exec that reads a gateway pod's PID 1 (ready_gateway_pod).
 readonly EVAL_PAUSE_AUDITS_PROBE_TIMEOUT=20s
@@ -948,7 +968,10 @@ profile_and_dump_on_exit() {
   collect_litellm_log
   collect_credential_proxy_evidence
   wait_replay_shadow_collector
-  # Defined further down; a run that died before then paused nothing.
+  # Defined further down; a run that died before then paused nothing. The watch
+  # stops first, and a pass of it under way finishes, so none pauses after the
+  # resume what the resume would lift.
+  declare -F stop_chain_audits_watch >/dev/null && stop_chain_audits_watch
   declare -F scheduled_audits >/dev/null && scheduled_audits resume "exit"
   # Without the wait: the next lease's preflight waits for it instead.
   declare -F scope_exclude_restore >/dev/null && scope_exclude_restore "exit"
@@ -1393,7 +1416,7 @@ export BENCH_TF_ROOT="./tf"
 #
 # EVAL_LEDGER_APP_KEY_FILE set: mint an installation token from App 4739812
 # instead, once per fan-out unit, because a token lasts an hour and units
-# launch across the whole run; grading's mint asks for its three reads
+# launch across the whole run; grading's mint asks for its four reads
 # explicitly (LEDGER_GRADING_MINT_BODY), and the ledger reset below mints its
 # own, narrowed to one repository and issues: write. Unset: the mounted PAT stands. A mint that
 # fails after its retries stops the run at preflight and costs a unit its
@@ -1430,12 +1453,14 @@ LEDGER_TOKEN_RENEW_TICK_SECONDS=10
 # After a renewal that failed, the next attempt comes this soon rather than a
 # whole period later, when the token in the file would already be dead.
 LEDGER_TOKEN_RENEW_RETRY_SECONDS=60
-# What the grading mint asks for: the three reads docs/ci-pool-projects.md 5.4
-# documents, requested explicitly so BENCH_GITHUB_TOKEN's reach is pinned at
-# mint rather than inherited from the installation's whole grant -- which,
-# since 2026-09-22, includes issues: write on every pool repository for the
-# ledger reset. An omitted body on this endpoint means "everything granted".
-LEDGER_GRADING_MINT_BODY='{"permissions":{"issues":"read","pull_requests":"read","metadata":"read"}}'
+# What the grading mint asks for: the four reads docs/ci-pool-projects.md 5.4
+# documents (contents: read since #5519, so the github_writes safeguard can
+# list a branch pushed with no pull request behind it), requested explicitly
+# so BENCH_GITHUB_TOKEN's reach is pinned at mint rather than inherited
+# from the installation's whole grant -- which, since 2026-09-22, includes
+# issues: write on every pool repository for the ledger reset. An omitted
+# body on this endpoint means "everything granted".
+LEDGER_GRADING_MINT_BODY='{"permissions":{"issues":"read","pull_requests":"read","contents":"read","metadata":"read"}}'
 # What the agent-pulls reset asks for (reset_agent_pulls, below): pull_requests
 # to close, contents to delete a branch, issues to label an audit pull request
 # before its close. Narrowed to the leased repository at mint, as the ledger
@@ -2409,21 +2434,24 @@ fence_live_cards() { # <label> [<task-name> <rep>]
 }
 
 # The Platform Agent's clock-started audits, paused at lease time and again right
-# before the fan-out (#3020), and resumed from the EXIT trap.
-# hack/ci_pause_scheduled_audits.py does both in the gateway with Hermes' own `cron
+# before the fan-out (#3020), the first-run stage's audits paused through the
+# fan-out once the stage has had its run of each (`chain`, from chain_audits_watch;
+# #5570), and resumed from the EXIT trap.
+# hack/ci_pause_scheduled_audits.py does all three in the gateway with Hermes' own `cron
 # pause`/`cron resume`, and its header owns which jobs, why the pause outlives a
 # gateway restart, and its exit codes. A Prow lease's teardown sweeps the volume
 # anyway; the resume is for a run against an install that outlives it. A pause that
 # still fails after its attempts stops the run as an infrastructure failure, since a
-# scheduled audit on its clock would charge its writes to the cases; a resume that
-# fails only warns. Pinned to AGENT_CLUSTER_CONTEXT and refused for a context that
+# scheduled audit on its clock would charge its writes to the cases; a `chain` pass or
+# a resume that fails only warns: the next pass tries again. Pinned to AGENT_CLUSTER_CONTEXT and refused for a context that
 # does not name PROJECT_ID, as wait_platform_runs is; without kubectl, a context or a
 # project it returns 0 and does nothing.
-scheduled_audits() { # <pause|resume> <label>
+scheduled_audits() { # <pause|chain|resume> <label>
   local mode="$1" label="$2" ns ctx out rc=0 args=()
   ns="${TARGET_NAMESPACE:-}"
   ctx="${AGENT_CLUSTER_CONTEXT:-}"
   [ "${mode}" = "resume" ] && args=(--resume)
+  [ "${mode}" = "chain" ] && args=(--chain)
   if [ -z "${PROJECT_ID:-}" ] || [ -z "${ctx}" ] || [ -z "${ns}" ] || ! command -v kubectl >/dev/null 2>&1; then
     echo "WARNING: Scheduled audits (${label}): no ${mode}, PROJECT_ID, AGENT_CLUSTER_CONTEXT, TARGET_NAMESPACE or kubectl is missing" >&2
     return 0
@@ -2445,7 +2473,7 @@ scheduled_audits() { # <pause|resume> <label>
   local bound=(timeout --foreground "${EVAL_PAUSE_AUDITS_TIMEOUT_SECONDS}")
   command -v timeout >/dev/null 2>&1 || bound=()
   local attempt pod wait="${EVAL_PAUSE_AUDITS_POD_WAIT_SECONDS}"
-  [ "${mode}" = "pause" ] || wait="${EVAL_RESUME_AUDITS_POD_WAIT_SECONDS}"
+  [ "${mode}" != "resume" ] || wait="${EVAL_RESUME_AUDITS_POD_WAIT_SECONDS}"
   for attempt in $(seq 1 "${EVAL_PAUSE_AUDITS_ATTEMPTS}"); do
     rc=0
     pod="$(ready_gateway_pod "${ctx}" "${ns}" "${wait}")" || {
@@ -2474,6 +2502,67 @@ scheduled_audits() { # <pause|resume> <label>
     exit 1
   fi
   echo "WARNING: Scheduled audits (${label}): ${mode} exited ${rc} on attempt ${attempt}: ${out}; any audit not named as ${mode}d keeps its state" >&2
+  return 0
+}
+
+# The first-run stage's audits are three of the clock-started ones plus two more, and
+# the stage skips one that is paused, so the lease and fan-out pauses leave them on
+# (#5570). This pauses each once the stage is past it (hack/ci_pause_scheduled_audits.py
+# says when), every
+# EVAL_CHAIN_AUDITS_INTERVAL_SECONDS from the fan-out to its end: after that a clock
+# run would be a second full run nothing grades. Started outside the job table
+# (a subshell that exits at once leaves it to init), since launch_units counts
+# `jobs -rp` as running units and the phases end on a bare `wait`. It ends when
+# this script does, if nothing has stopped it first: the pid file goes, or the
+# script's pid is gone.
+#
+# stop_chain_audits_watch sends TERM. A nap ends at once; a pass under way runs to its
+# end, since bash runs a trap only once the foreground command returns, and killing
+# the subshell alone would leave that pass's exec running to pause after the EXIT
+# trap's resume. A pass that outlasts the wait almost always leaves its pauses
+# recorded, for the next run's resume or the oobe-first-run-audits arm to lift: the
+# script writes the record again after each pause, and a resume that sees a job it
+# names paused at its read-back keeps the record and asks for its retry. Only a pause
+# landing between that read-back and the record's removal goes unrecorded.
+start_chain_audits_watch() {
+  local pidfile="${STATE_DIR}/${EVAL_CHAIN_AUDITS_PID_FILE}" running="${STATE_DIR}/${EVAL_CHAIN_AUDITS_RUNNING_FILE}" owner=$$
+  : > "${running}"
+  (
+    (
+      stopping="" nap=""
+      trap 'stopping=1; [ -z "${nap}" ] || kill "${nap}" 2>/dev/null' TERM
+      # Naps first: the pid file is written while it does.
+      while [ -z "${stopping}" ]; do
+        sleep "${EVAL_CHAIN_AUDITS_INTERVAL_SECONDS}" &
+        nap=$!
+        # A TERM between the fork and the line above found no nap to end.
+        [ -z "${stopping}" ] || kill "${nap}" 2>/dev/null || true
+        wait "${nap}" 2>/dev/null || true
+        nap=""
+        [ -z "${stopping}" ] && [ -e "${pidfile}" ] && kill -0 "${owner}" 2>/dev/null || break
+        scheduled_audits chain "fan-out watch"
+      done
+      rm -f "${running}"
+    ) </dev/null &
+    echo "$!" > "${pidfile}"
+  )
+}
+
+stop_chain_audits_watch() {
+  local pidfile="${STATE_DIR:-}/${EVAL_CHAIN_AUDITS_PID_FILE}" running="${STATE_DIR:-}/${EVAL_CHAIN_AUDITS_RUNNING_FILE}" pid waited=0
+  [ -n "${STATE_DIR:-}" ] || return 0
+  # A second call (the EXIT trap's, after the fan-out's timed out) finds no pid file
+  # but still waits on the pass.
+  if [ -e "${pidfile}" ]; then
+    pid="$(cat "${pidfile}" 2>/dev/null || true)"
+    rm -f "${pidfile}"
+    [ -z "${pid}" ] || kill "${pid}" 2>/dev/null || true
+  fi
+  while [ -e "${running}" ] && [ "${waited}" -lt "${EVAL_CHAIN_AUDITS_STOP_WAIT_SECONDS}" ]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+  [ ! -e "${running}" ] || echo "WARNING: Scheduled audits: the fan-out watch's pass was still running after ${EVAL_CHAIN_AUDITS_STOP_WAIT_SECONDS}s; a first-run audit it pauses after the resume stays paused until the next eval run's resume or the oobe-first-run-audits arm lifts it, both from the record it writes after each pause" >&2
   return 0
 }
 
@@ -2942,6 +3031,17 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ] && [ "${EVAL_ROLLBACK_LANE:-}" != "1" ]; then
   fi
   export AGENT_INJECT_TOKEN
   export AGENT_TRANSPORT="${EVAL_INJECT_TRANSPORT}"
+  # The A2A door's token, for the card-wait stopped ask alone. Missing is not
+  # fatal: the matrix goes through the inject door, and the harness records
+  # that one case as infrastructure when it has no token. The value is never
+  # echoed; only the Secret's name is.
+  EVAL_A2A_DOOR_TOKEN_SECRET="${AGENT_SERVICE_NAME}${EVAL_A2A_DOOR_TOKEN_SECRET_SUFFIX}"
+  if AGENT_A2A_DOOR_TOKEN="$(kubectl get secret "${EVAL_A2A_DOOR_TOKEN_SECRET}" -n "${TARGET_NAMESPACE}" -o jsonpath="{.data.${EVAL_A2A_DOOR_TOKEN_SECRET_KEY}}" | base64 --decode)" && [ -n "${AGENT_A2A_DOOR_TOKEN}" ]; then
+    export AGENT_A2A_DOOR_TOKEN
+  else
+    unset AGENT_A2A_DOOR_TOKEN
+    echo "WARNING: the A2A door's token Secret ${EVAL_A2A_DOOR_TOKEN_SECRET} (key ${EVAL_A2A_DOOR_TOKEN_SECRET_KEY}) is missing or empty in ${TARGET_NAMESPACE}; a card-wait stopped ask will be recorded as infrastructure." >&2
+  fi
   echo "EVAL_MODE_NEXT=1: running the matrix through the inject door (AGENT_TRANSPORT=${AGENT_TRANSPORT}, token from ${EVAL_INJECT_TOKEN_SECRET})"
 fi
 export JUDGE_API_KEY="${GEMINI_API_KEY}"
@@ -5650,6 +5750,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
 # Again, right before the fan-out: idempotent, and it catches a gateway that an
 # outside event (an autoscaler scale-down) restarted between lease setup and here.
 scheduled_audits pause "fan-out"
+start_chain_audits_watch
 
 # Case by case, cost-descending: every repetition of a case is queued before
 # the next case's first, so a night cut off by its deadline holds whole cases,
@@ -5913,6 +6014,7 @@ for SCOPE_LINE in ${SCOPE_EXCLUDE_LINES[@]+"${SCOPE_EXCLUDE_LINES[@]}"}; do
   scope_exclude_restore "${SCOPE_CASE}" settle \
     || echo "WARNING: Scope exclusion (${SCOPE_CASE}): the restore did not settle; the next lease's preflight repeats it" >&2
 done
+stop_chain_audits_watch
 
 # ─── What the run left on GitHub (#2079) ─────────────────────────────────────
 # On both lanes, once every unit is done: every pull request and branch

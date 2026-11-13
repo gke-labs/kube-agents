@@ -515,6 +515,8 @@ def unstorable_reasons(
         reasons.append(F.UNSTORABLE_BOUND_VALUE_LEFT_LITERAL)
     if any(mapping.has_identifier(t) for t in normalized):
         reasons.append(F.UNSTORABLE_UNBOUND_IDENTIFIER)
+    if any(mapping.answer_names_dropped_file(t) for t in texts):
+        reasons.append(F.UNSTORABLE_NAMES_DROPPED_FILE)
     if any(mapping.has_timestamp(t) for t in normalized):
         reasons.append(F.UNSTORABLE_UNBOUND_TIMESTAMP)
     # Read after the swap: a timestamp the answer copied from the request is a
@@ -670,6 +672,10 @@ class ShadowProxy:
         answer, missing = replay_cache.restore_answer(entry[replay_cache.ENTRY_ANSWER], normalized.mapping)
         if missing:
             return None, refusal(via, F.GUARD_UNBOUND_PLACEHOLDER)
+        # The other direction of the record-time check: a file this run's
+        # dropped list names, which the recording's run may not have had.
+        if any(normalized.mapping.answer_names_dropped_file(t) for t in replay_cache.answer_texts(answer)):
+            return None, refusal(via, F.GUARD_NAMES_DROPPED_FILE)
         return (answer, entry, fingerprint, via), None
 
     def answers_recorded(

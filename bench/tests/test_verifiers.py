@@ -3176,6 +3176,13 @@ def test_tool_called_still_reads_a_key_a_cut_name_cannot_complete():
     assert _verdicts() == ("pass", "fail")
 
 
+def test_tool_called_reads_a_clip_marker_inside_a_value_as_text():
+    # The command itself printed a clipped record; the pod's own marker ends the string.
+    head = '{"command": "echo ...[clipped 5 chars] done", "x": "' + "y" * 60
+    transcript.set("done", _terminal_call({"raw": head + " ...[clipped 3000 chars]"}))
+    assert _verdicts() == ("pass", "fail")
+
+
 def test_tool_called_leaves_a_scalar_json_refuses_unread():
     head = '{"timeout": 030, "command": "' + "y" * 60
     transcript.set("done", _terminal_call({"raw": head + " ...[clipped 3000 chars]"}))
@@ -5508,6 +5515,44 @@ def test_files_the_credential_cannot_read_are_unevaluable_not_a_pass(token, gith
     assert "pull_requests: read" in res.reason
 
 
+# ---- body_contains: the description carries the evidence (#4966)
+
+_EVIDENCE_PHRASES = ["## Evidence", "**Verify after merge:**"]
+
+
+def test_a_pull_request_whose_description_lacks_the_evidence_is_a_fail(token, github):
+    """The one-line body of #4966 passes every other clause."""
+    _stash_pr_report()
+    github.routes[_pr_api()] = (
+        200,
+        {**_pr_payload(), "body": "Applies a PDB (minAvailable: 1) for the checkout deployment."},
+    )
+    _pr_head_routes(github)
+    res = _pr_check(body_contains=_EVIDENCE_PHRASES).verify(5.0)
+    assert res.status == "fail"
+    assert "'## Evidence'" in res.reason and "body_contains" in res.reason
+    assert _pr_check().verify(5.0).status == "pass"
+
+
+def test_a_pull_request_with_no_description_is_a_fail_under_body_contains(token, github):
+    _stash_pr_report()
+    github.routes[_pr_api()] = (200, {**_pr_payload(), "body": None})
+    _pr_head_routes(github)
+    assert _pr_check(body_contains=_EVIDENCE_PHRASES).verify(5.0).status == "fail"
+
+
+def test_a_pull_request_carrying_the_evidence_passes(token, github):
+    _stash_pr_report()
+    body = (
+        "Adds a PDB.\n\n## Evidence\n\n**Finding:** no PDB\n\n"
+        "**Verify after merge:**\n\n```bash\nkubectl get pdb -A\n```\n"
+    )
+    github.routes[_pr_api()] = (200, {**_pr_payload(), "body": body})
+    _pr_head_routes(github)
+    res = _pr_check(body_contains=_EVIDENCE_PHRASES).verify(5.0)
+    assert res.status == "pass", res.reason
+
+
 # ---- changed_paths_only: an allowlist gates every sibling manifest and IaC path
 
 _SYNCED_MANIFEST = "manifests/apps/eval-autoops-open-pr/deployment.yaml"
@@ -5942,7 +5987,7 @@ def test_a_field_path_is_checked_when_the_case_loads():
 
 
 def test_an_added_file_is_read_from_the_listing_alone(token, github):
-    """The grading credential has no `contents: read`; a file the pull request
+    """The check makes no `/contents` read; a file the pull request
     adds is whole in its patch, so nothing else is fetched."""
     _content_pr(github, {f"{_CLUSTER_DIR}/cluster.yaml": _CLUSTER_YAML})
     res = _pr_check(content=[_beta_api_check()]).verify(5.0)
@@ -10081,6 +10126,34 @@ def test_verified_claims_backed_finds_an_excerpt_in_a_clipped_head():
     clipped = out[:200] + " ...[clipped 3000 chars]"
     res = _grade_claims(_block("kubectl get nodes", "phase \u2026 node-b NotReady"), [_terminal("kubectl get nodes", result=clipped)])
     assert res.status == "pass" and "not checked" not in res.reason, res
+
+
+def test_verified_claims_backed_reads_the_head_up_to_the_pods_marker_not_a_printed_one():
+    # The worker's own output quotes a clipped record; the pod's marker opens the kept tail.
+    from kube_agents_bench import worker_trajectory
+
+    output = "earlier: a ...[clipped 12 chars] record\nnode-b NotReady " + "x" * 4000 + "\nverdict: done"
+    out = json.dumps({"output": output, "exit_code": 0})
+    limit, tail = worker_trajectory.MAX_RESULT_CHARS, worker_trajectory.RESULT_TAIL_CHARS
+    clipped = out[:limit] + " ...[clipped %d chars]... " % (len(out) - limit - tail) + out[-tail:]
+    res = _grade_claims(_block("kubectl get nodes", "node-b NotReady"), [_terminal("kubectl get nodes", result=clipped)])
+    assert res.status == "pass" and "not checked" not in res.reason, res
+    assert verifiers._clipped_result_marker(clipped).start() == limit
+
+
+def test_verified_claims_backed_a_kept_tail_does_not_make_a_clipped_result_whole():
+    # The tail closes the JSON string and object again, so a whole-object decode
+    # succeeds; an excerpt from the dropped middle is unchecked, not invented.
+    from kube_agents_bench import worker_trajectory
+
+    output = "head " + "x" * 2500 + " middle node-b NotReady " + "y" * 2500 + " tail"
+    out = json.dumps({"output": output, "exit_code": 0, "error": None})
+    limit, tail = worker_trajectory.MAX_RESULT_CHARS, worker_trajectory.RESULT_TAIL_CHARS
+    clipped = out[:limit] + " ...[clipped %d chars]... " % (len(out) - limit - tail) + out[-tail:]
+    text, was_clipped = verifiers._terminal_output(clipped)
+    assert was_clipped and "[clipped" not in text and text.startswith("head ")
+    res = _grade_claims(_block("kubectl get nodes", "middle node-b NotReady"), [_terminal("kubectl get nodes", result=clipped)])
+    assert res.status == "pass" and "not checked" in res.reason and "output clipped" in res.reason, res
 
 
 def test_verified_claims_backed_masks_addresses_as_the_pod_does():
