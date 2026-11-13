@@ -5562,7 +5562,7 @@ metadata:
     app.kubernetes.io/name: platform-agent
     app.kubernetes.io/part-of: a2a-next
     kubeagents.x-k8s.io/a2a-component: provision
-  name: platformagent-a2a-provision-26fb2759
+  name: platformagent-a2a-provision-647cdd83
   namespace: kubeagents-system
   ownerReferences:
     - apiVersion: kubeagents.x-k8s.io/v1alpha1
@@ -6024,35 +6024,37 @@ spec:
               to run again - that is what recreates it, and nothing re-reads\" >&2\n  echo
               \"     the bus until this Job runs. Delete the Job to re-run it now, or
               leave it and the\" >&2\n  echo \"     24h TTL will.\" >&2\n  echo \"  3.
-              once TASKS is back, restart the clients holding a durable consumer on it:\"
-              >&2\n  echo \"       kubectl rollout restart deployment/platformagent-a2a-gateway
-              -n kubeagents-system\" >&2\n  echo \"     and, where a Hermes bridge sidecar
-              runs, the agent workload platformagent-gateway\" >&2\n  echo \"     (a Deployment
-              or a StatefulSet, depending on the spec) with it.\" >&2\n  echo \"     Deleting
-              a stream deletes every consumer on it, and neither client re-creates\" >&2\n
-              \ echo \"     one: the consume underneath them carries no error handler,
-              so a deleted consumer\" >&2\n  echo \"     ends the subscription with nothing
-              logged. Skip this and the gateway goes on\" >&2\n  echo \"     accepting
-              delegations and spawning session pods while relaying no events, the\" >&2\n
-              \ echo \"     bridge dispatches nothing, and the CR reads Ready over both.
-              Session pods\" >&2\n  echo \"     recover by themselves, which hides it
-              rather than helping.\" >&2\n  echo \"     The gateway, restarted early,
-              waits for TASKS and its durable and binds once this\" >&2\n  echo \"     Job
-              has made them. The bridge can restart in a loop until TASKS is back, so
-              restart\" >&2\n  echo \"     its workload after the stream is back.\" >&2\n
-              \ # Exit 2, and the convention it establishes: 2 means \"this will fail
-              the\n  # same way next time\", anything else is worth retrying. The Job's\n
-              \ # podFailurePolicy matches on 2 and fails the Job from the first pod\n
-              \ # (buildA2AProvisionJob), so a refusal nothing about a re-run can change\n
-              \ # does not spend the backoffLimit before it is heard. This refusal is
-              in\n  # that class: the budget's two inputs, maxSessions and the bridge's
-              worker\n  # count, and the stream's max_consumers are all fixed until an
-              operator\n  # lowers maxSessions, declares the bridge sidecar with fewer
-              workers where\n  # it declared more than the default, or recreates the stream,
-              and\n  # provisioning does none of those. Note that\n  # set -euo pipefail
-              exits with the failing command's own status, which is\n  # not 2, so an
-              unexpected failure stays on the retry budget.\n  exit 2\nfi\n\necho \"a2a
-              provisioning complete\"\n"
+              once TASKS is back, the operator restarts the clients holding a durable
+              consumer\" >&2\n  echo \"     on it, if it saw the stream missing on three
+              five-minute polls in a row. After a\" >&2\n  echo \"     quicker fix (deleted
+              and recreated inside 15 minutes), restart them yourself:\" >&2\n  echo \"
+              \      kubectl rollout restart deployment/platformagent-a2a-gateway -n kubeagents-system\"
+              >&2\n  echo \"     and, where a Hermes bridge sidecar runs, the agent workload
+              platformagent-gateway\" >&2\n  echo \"     (a Deployment or a StatefulSet,
+              depending on the spec) with it.\" >&2\n  echo \"     Deleting a stream deletes
+              every consumer on it, and neither client re-creates\" >&2\n  echo \"     one:
+              the consume underneath them carries no error handler, so a deleted consumer\"
+              >&2\n  echo \"     ends the subscription with nothing logged. Without a
+              restart the gateway goes on\" >&2\n  echo \"     accepting delegations and
+              spawning session pods while relaying no events, the\" >&2\n  echo \"     bridge
+              dispatches nothing, and the CR reads Ready over both. Session pods\" >&2\n
+              \ echo \"     recover by themselves, which hides it rather than helping.\"
+              >&2\n  echo \"     The gateway, restarted early, waits for TASKS and its
+              durable and binds once this\" >&2\n  echo \"     Job has made them. The
+              bridge can restart in a loop until TASKS is back, so restart\" >&2\n  echo
+              \"     its workload after the stream is back.\" >&2\n  # Exit 2, and the
+              convention it establishes: 2 means \"this will fail the\n  # same way next
+              time\", anything else is worth retrying. The Job's\n  # podFailurePolicy
+              matches on 2 and fails the Job from the first pod\n  # (buildA2AProvisionJob),
+              so a refusal nothing about a re-run can change\n  # does not spend the backoffLimit
+              before it is heard. This refusal is in\n  # that class: the budget's two
+              inputs, maxSessions and the bridge's worker\n  # count, and the stream's
+              max_consumers are all fixed until an operator\n  # lowers maxSessions, declares
+              the bridge sidecar with fewer workers where\n  # it declared more than the
+              default, or recreates the stream, and\n  # provisioning does none of those.
+              Note that\n  # set -euo pipefail exits with the failing command's own status,
+              which is\n  # not 2, so an unexpected failure stays on the retry budget.\n
+              \ exit 2\nfi\n\necho \"a2a provisioning complete\"\n"
           env:
             - name: HOME
               value: /tmp
