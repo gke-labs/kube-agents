@@ -325,7 +325,7 @@ replace it.
 ### Replay lane trials
 
 The table above replays a recording minutes later. To test what the replay lane would do, we ran
-the lane's record and replay modes on the same dev install (2026-11-04 and 05, `gemini-4-argon`, the
+the lane's record and replay modes on the same dev install (2026-11-04 and 05, the
 inject door, as the presubmit runs). Four cases were recorded once, the way the nightly would, and
 then each was replayed three times. "Reused" is the share of prompt tokens served from saved
 answers instead of the model.
@@ -787,7 +787,7 @@ before stage 3 of the rollout (turning replay on):
      tool), and the result of that action differs too. Under replay the saved action would run
      and return the same result.
 
-   The dev-install dry run (2026-11-04, `gemini-4-argon`, four phases standing in for a nightly,
+   The dev-install dry run (2026-11-04, four phases standing in for a nightly,
    two builds of one pull request and a second pull request) showed how big the gap is: the
    replayed estimate (then called simulated) was 12%, ignoring other agents' kanban text as well
    raised it to 22%, and most of the remaining misses were tool results after a differently chosen
