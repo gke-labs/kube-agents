@@ -23,12 +23,14 @@ little. No model is involved, and nothing here posts: the reporter (a later
 step) decides what to say, under ``KUBEAGENTS_POST_MERGE_CHECK``. Nothing
 schedules it yet; ``post_merge_check.py notice`` is one tick.
 
-Step 3, wait until applied, will read the GitOps reconcilers that deliver the
-repository into the record's namespace (:func:`reconcilers_for`) against the
-merge commit (:func:`combined_sync`, over ``reconciler_sync``), asking the
-broker (:func:`forge_contains`) whether a later applied commit contains it,
-and :class:`SandboxKubectl` reads a cluster through the shell sandbox.
-Nothing calls these helpers yet; the step that uses them comes next.
+Step 3, wait until applied (``post_merge_check.py health``, one tick, also
+unscheduled): :func:`watch_health` reads each merged record's cluster through
+the shell sandbox. The GitOps reconcilers that deliver the repository into the
+record's namespace are read against the merge commit (``reconciler_sync``),
+asking the broker (``revision-contains``) whether a later applied commit
+contains it; with none, or when the broker cannot say, the object the fix adds
+is observed directly. Once applied, the pods' restart counts are the baseline
+for the health window, the next step.
 """
 
 from __future__ import annotations
@@ -159,6 +161,7 @@ def notice_merges(
 # Step 3, wait until applied: reading reconcilers and selectors
 # --------------------------------------------------------------------------
 
+HEALTH_FAILED = "failed"
 #: The reconciler objects that can deliver a merge, as kubectl names them.
 ARGO_APPLICATIONS = "applications.argoproj.io"
 FLUX_KUSTOMIZATIONS = "kustomizations.kustomize.toolkit.fluxcd.io"
@@ -176,6 +179,23 @@ NOT_SERVED = "doesn't have a resource type"
 NOT_FOUND = "NotFound"
 KUBECTL_REQUEST_TIMEOUT_SECONDS = 20
 KUBECTL_HOP_TIMEOUT_SECONDS = 45
+#: The workload kinds a disruption-budget fix covers.
+WORKLOAD_RESOURCES = {"Deployment": "deployments.apps", "StatefulSet": "statefulsets.apps"}
+#: How the fix is seen when no reconciler on the cluster targets the record's
+#: namespace: the object the fix adds, read directly (design: "the driver
+#: observes the object directly").
+DIRECT_OBJECTS = {"no-pdb": "poddisruptionbudgets.policy"}
+#: ``sync_state``'s reading for a fix observed directly.
+OBSERVED = "observed"
+
+#: Merged records not yet applied, least recently read first.
+HEALTH_SQL = (
+    f"SELECT url, repo, kind, project, location, cluster, namespace, object, merge_commit "
+    f"FROM {RECORDS_TABLE} WHERE outcome IS NULL AND merged_at IS NOT NULL "
+    "AND merge_commit IS NOT NULL AND health_result IS NULL AND applied_at IS NULL "
+    "ORDER BY health_checked_at IS NOT NULL, health_checked_at, merged_at LIMIT ?"
+)
+HEALTH_COLUMNS = ("url", "repo", "kind", "project", "location", "cluster", "namespace", "object", "merge_commit")
 
 
 class ClusterReadError(RuntimeError):
@@ -190,6 +210,8 @@ class WorkloadGone(ClusterReadError):
 #: ``{"items": []}`` for a resource type the cluster does not serve. Raises
 #: :class:`WorkloadGone` for an object kubectl reports NotFound.
 KubectlJson = Callable[[dict, list], dict]
+#: ``contains(repo, ancestor, revision)`` -> whether ``revision`` contains ``ancestor``; None when unknown.
+Contains = Callable[[str, str, str], "bool | None"]
 
 
 def forge_contains(repo: str, ancestor: str, revision: str) -> bool | None:
@@ -308,6 +330,44 @@ def selects(selector: dict, labels: dict) -> bool:
     return bool(selector.get("matchLabels") or selector.get("matchExpressions"))
 
 
+def restart_baseline(pods: dict) -> dict[str, int]:
+    """``{"<pod uid>/<container>": restartCount}`` for every container of every pod."""
+    out = {}
+    for pod in pods.get("items", []):
+        uid = (pod.get("metadata") or {}).get("uid") or (pod.get("metadata") or {}).get("name") or ""
+        for status in (pod.get("status") or {}).get("containerStatuses") or []:
+            out[f"{uid}/{status.get('name')}"] = int(status.get("restartCount") or 0)
+    return out
+
+
+def _read_workload(kubectl_json: KubectlJson, record: dict) -> tuple[dict, dict]:
+    kind, _, name = str(record["object"]).partition("/")
+    resource = WORKLOAD_RESOURCES.get(kind)
+    if resource is None or not name:
+        raise WorkloadGone(f"{record['object']} is not a workload the health window reads")
+    namespace = record["namespace"] or "default"
+    workload = kubectl_json(record, ["get", resource, name, "-n", namespace, "-o", "json"])
+    selector = label_selector((workload.get("spec") or {}).get("selector") or {})
+    if not selector:
+        raise WorkloadGone(f"{record['object']} has an empty selector")
+    pods = kubectl_json(record, ["get", "pods", "-n", namespace, "-l", selector, "-o", "json"])
+    return workload, pods
+
+
+def observed_directly(kubectl_json: KubectlJson, record: dict, workload: dict) -> tuple[bool, str]:
+    """Whether the object the fix adds is on the cluster: for ``no-pdb``, a PodDisruptionBudget selecting the workload."""
+    namespace = record["namespace"] or "default"
+    resource = DIRECT_OBJECTS.get(record["kind"] or "")
+    if resource is None:
+        return False, f"no reconciler targets {namespace} and a {record['kind']} fix cannot be observed directly"
+    labels = (((workload.get("spec") or {}).get("template") or {}).get("metadata") or {}).get("labels") or {}
+    budgets = kubectl_json(record, ["get", resource, "-n", namespace, "-o", "json"])
+    for budget in budgets.get("items", []):
+        if selects((budget.get("spec") or {}).get("selector") or {}, labels):
+            return True, f"no reconciler targets {namespace}; budget {budget['metadata']['name']} selects the workload"
+    return False, f"no reconciler targets {namespace}; no budget selects the workload yet"
+
+
 class SandboxKubectl:
     """``kubectl ... -o json`` in the shell sandbox, against the record's cluster.
 
@@ -342,25 +402,114 @@ class SandboxKubectl:
         return json.loads(done.stdout or "{}")
 
 
+def watch_health(
+    conn: sqlite3.Connection,
+    kubectl_json: KubectlJson | None = None,
+    now: datetime | None = None,
+    limit: int = READS_PER_TICK,
+    contains: Contains = forge_contains,
+) -> dict[str, list[str]]:
+    """Step 3 for each merged record: wait until the fix is applied.
+
+    Not yet applied: read the reconcilers on the record's cluster that deliver
+    its repository into its namespace (:func:`reconcilers_for`) against the
+    merge commit, asking the broker whether a later applied commit contains it
+    (``contains``); with none, observe the fix's object directly
+    (:func:`observed_directly`). The reading goes in ``sync_state``. Applied:
+    ``applied_at`` and the pods' restart counts (``health_baseline``). A
+    workload that is gone or cannot be judged fails with the reason
+    (``health_result``, ``health_detail``); any other read failure is kept in
+    ``sync_state`` and retried. Every read stamps
+    ``health_checked_at``, which orders the next tick, so no record starves the
+    rest. Everything lives on the row, so a restart loses nothing. Returns urls
+    under ``applied``, ``waiting``, ``failed`` and ``unreadable``.
+    """
+    import reconciler_sync
+
+    kubectl_json = kubectl_json or SandboxKubectl()
+    now = now or datetime.now(timezone.utc)
+    stamp = _now_text(now)
+    seen: dict[str, list[str]] = {"applied": [], "waiting": [], "failed": [], "unreadable": []}
+    lists_by_cluster: dict[tuple, dict] = {}
+    answers: dict[tuple, bool | None] = {}
+    for values in conn.execute(HEALTH_SQL, (limit,)).fetchall():
+        record = dict(zip(HEALTH_COLUMNS, values))
+        url = record["url"]
+        updates: dict[str, object] = {"health_checked_at": stamp}
+        try:
+            if not (record["project"] and record["location"] and record["cluster"] and record["object"]):
+                raise ClusterReadError("the record names no cluster or workload to read")
+            cluster = (record["project"], record["location"], record["cluster"])
+            if cluster not in lists_by_cluster:
+                lists_by_cluster[cluster] = {
+                    resource: kubectl_json(record, ["get", resource, "-A", "-o", "json"])
+                    for resource in RECONCILER_RESOURCES
+                }
+
+            def asked(ancestor: str, revision: str, repo: str = record["repo"]) -> bool | None:
+                if (repo, ancestor, revision) not in answers:
+                    answers[(repo, ancestor, revision)] = contains(repo, ancestor, revision)
+                return answers[(repo, ancestor, revision)]
+
+            objects = reconcilers_for(record["repo"], record["namespace"] or "default", lists_by_cluster[cluster])
+            workload, pods = _read_workload(kubectl_json, record)
+            if objects:
+                state, detail = combined_sync(objects, record["merge_commit"], asked)
+                applied = state == reconciler_sync.APPLIED
+                if state == reconciler_sync.UNCONFIRMED:
+                    # The broker could not say whether the applied commit contains the merge (an
+                    # abbreviated or SHA-256 merge commit, a fetch it refused): look for the fix itself.
+                    applied, direct = observed_directly(kubectl_json, record, workload)
+                    if applied:
+                        state, detail = OBSERVED, direct
+            else:
+                applied, detail = observed_directly(kubectl_json, record, workload)
+                state = OBSERVED if applied else reconciler_sync.PENDING
+            updates["sync_state"] = f"{state}: {detail}"[:500]
+            if applied:
+                updates["applied_at"] = stamp
+                updates["health_baseline"] = json.dumps(restart_baseline(pods), sort_keys=True)
+                seen["applied"].append(url)
+            else:
+                seen["waiting"].append(url)
+        except WorkloadGone as exc:
+            logger.warning("post-merge check: %s cannot be judged: %s", url, exc)
+            updates.update(health_result=HEALTH_FAILED, health_detail=f"cannot judge: {exc}"[:500], health_at=stamp)
+            seen["failed"].append(url)
+        except Exception as exc:  # noqa: BLE001 — one unreadable cluster must not stop the tick
+            logger.warning("post-merge check: could not read the cluster for %s: %r", url, exc)
+            updates["sync_state"] = f"unreadable: {exc}"[:500]
+            seen["unreadable"].append(url)
+        try:
+            with conn:
+                conn.execute(
+                    f"UPDATE {RECORDS_TABLE} SET {', '.join(f'{key} = ?' for key in updates)} WHERE url = ?",
+                    (*updates.values(), url),
+                )
+        except sqlite3.Error as exc:
+            logger.warning("post-merge check: could not record the health step for %s: %r", url, exc)
+    return seen
+
+
 #: Session KV's database, as ``session_kv_server.py`` reads the same variable.
 SESSION_KV_DB_ENV = "SESSION_KV_DB_PATH"
 SESSION_KV_DB_DEFAULT = "/var/lib/kube-agents/session/session_kv.db"
 SWITCH = "POST_MERGE_CHECK"
 
 
-def main(argv: list[str] | None = None, view: View = forge_view) -> int:
-    """``post_merge_check.py notice``: one tick of the merge step; prints what it saw as JSON.
+def main(argv: list[str] | None = None, view: View = forge_view, kubectl_json: KubectlJson | None = None) -> int:
+    """``post_merge_check.py notice|health``: one tick of the merge step, or of the apply step;
+    prints what it saw as JSON.
 
     Reads nothing while the install's ``KUBEAGENTS_POST_MERGE_CHECK`` is ``off``.
     """
-    import json
     import os
     import sys
     from contextlib import closing
 
     argv = sys.argv[1:] if argv is None else argv
-    if argv != ["notice"]:
-        print("usage: post_merge_check.py notice", file=sys.stderr)
+    if argv not in (["notice"], ["health"]):
+        print("usage: post_merge_check.py notice|health", file=sys.stderr)
         return 2
     import kubeagents_switches
 
@@ -369,7 +518,10 @@ def main(argv: list[str] | None = None, view: View = forge_view) -> int:
         return 0
     path = os.environ.get(SESSION_KV_DB_ENV) or SESSION_KV_DB_DEFAULT
     with closing(sqlite3.connect(path, timeout=5.0)) as conn:
-        print(json.dumps(notice_merges(conn, view)))
+        if argv == ["notice"]:
+            print(json.dumps(notice_merges(conn, view)))
+        else:
+            print(json.dumps(watch_health(conn, kubectl_json)))
     return 0
 
 

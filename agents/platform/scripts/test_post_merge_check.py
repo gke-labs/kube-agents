@@ -1,5 +1,6 @@
 """Tests for post_merge_check.notice_merges: one forge read per waiting record, with a fake forge and clock."""
 
+import json
 import re
 import sqlite3
 import sys
@@ -187,6 +188,168 @@ def argo_app(revision=MERGE, status="Synced", repo=REPO + ".git", namespace="sho
             "status": {"sync": {"status": status, "revision": revision}, "operationState": {"phase": "Succeeded"}}}
 
 
+def deployment(replicas=3, updated=3, available=3, ready=3, generation=2, observed=2):
+    return {"kind": "Deployment", "metadata": {"name": "checkout", "generation": generation},
+            "spec": {"replicas": replicas, "selector": {"matchLabels": {"app": "checkout"}},
+                     "template": {"metadata": {"labels": {"app": "checkout", "tier": "web"}}}},
+            "status": {"observedGeneration": observed, "updatedReplicas": updated, "availableReplicas": available,
+                       "readyReplicas": ready}}
+
+
+def pods(restarts=(0, 0, 0), ready=True):
+    items = []
+    for n, count in enumerate(restarts):
+        container = {"name": "web", "restartCount": count, "lastState": {}, "state": {"running": {}}}
+        items.append({"metadata": {"name": f"checkout-{n}", "uid": f"u{n}", "labels": {"pod-template-hash": "6d4f"},
+                                   "ownerReferences": [{"kind": "ReplicaSet", "name": "checkout-6d4f"}]},
+                      "status": {"conditions": [{"type": "Ready", "status": "True" if ready else "False"}],
+                                 "containerStatuses": [container]}})
+    return {"items": items}
+
+
+class FakeCluster:
+    """``kubectl_json`` answered from a mutable table keyed by the resource asked for."""
+
+    def __init__(self):
+        self.apps = [argo_app(revision=OLDER, status="OutOfSync")]
+        self.workload = deployment()
+        self.pod_list = pods()
+        self.calls = []
+        self.fail = None
+        self.budgets = []
+        self.gone = False
+
+    def __call__(self, record, argv):
+        self.calls.append(argv)
+        if self.fail:
+            raise self.fail
+        resource = argv[1]
+        if self.gone and resource in ("deployments.apps", "statefulsets.apps"):
+            raise post_merge_check.WorkloadGone("deployments.apps \"checkout\" not found")
+        if resource == "poddisruptionbudgets.policy":
+            return {"items": self.budgets}
+        if resource == post_merge_check.ARGO_APPLICATIONS:
+            return {"items": self.apps}
+        if resource in post_merge_check.RECONCILER_RESOURCES:
+            return {"items": []}
+        if resource in ("deployments.apps", "statefulsets.apps"):
+            return self.workload
+        if resource == "pods":
+            self.selector = argv[argv.index("-l") + 1]
+            return self.pod_list
+        raise AssertionError(argv)
+
+
+class WatchHealthTest(unittest.TestCase):
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:")
+        self.addCleanup(self.conn.close)
+        self.conn.execute(schema())
+        self.conn.execute(
+            "INSERT INTO post_merge_records (url, repo, number, kind, project, location, cluster, namespace, object, "
+            "opened_at, merged_at, merge_commit) VALUES (?, ?, 1, 'no-pdb', 'p', 'l', 'prod', 'shop', "
+            "'Deployment/checkout', ?, ?, ?)",
+            (f"{REPO}/pull/1", REPO, NOW.isoformat(), NOW.isoformat(), MERGE),
+        )
+        self.cluster = FakeCluster()
+
+    def row(self):
+        self.conn.row_factory = sqlite3.Row
+        found = dict(self.conn.execute("SELECT * FROM post_merge_records").fetchone())
+        self.conn.row_factory = None
+        return found
+
+    def tick(self, minutes):
+        return post_merge_check.watch_health(self.conn, self.cluster, NOW + timedelta(minutes=minutes))
+
+    def test_waits_until_the_reconciler_applies_the_merge_commit(self):
+        self.assertEqual(self.tick(1)["waiting"], [f"{REPO}/pull/1"])
+        row = self.row()
+        self.assertIsNone(row["applied_at"])
+        self.assertTrue(row["sync_state"].startswith("pending"), row["sync_state"])
+
+    def test_applied_records_the_baseline_and_is_not_read_again(self):
+        self.cluster.apps = [argo_app()]
+        self.cluster.pod_list = pods(restarts=(2, 0, 0))
+        self.assertEqual(self.tick(1)["applied"], [f"{REPO}/pull/1"])
+        row = self.row()
+        self.assertEqual(row["applied_at"], (NOW + timedelta(minutes=1)).isoformat())
+        self.assertEqual(json.loads(row["health_baseline"]), {"u0/web": 2, "u1/web": 0, "u2/web": 0})
+        self.assertEqual(self.cluster.selector, "app=checkout")
+        # Applied: the apply step does not read it again.
+        self.cluster.calls.clear()
+        self.tick(10)
+        self.assertEqual(self.cluster.calls, [])
+
+    def test_an_unreadable_cluster_is_logged_and_retried(self):
+        self.cluster.fail = post_merge_check.ClusterReadError("connection refused")
+        with self.assertLogs("post_merge_check", level="WARNING"):
+            self.assertEqual(self.tick(1)["unreadable"], [f"{REPO}/pull/1"])
+        self.assertTrue(self.row()["sync_state"].startswith("unreadable"))
+        self.cluster.fail = None
+        self.cluster.apps = [argo_app()]
+        self.assertEqual(self.tick(2)["applied"], [f"{REPO}/pull/1"])
+
+    def test_a_record_with_no_cluster_coordinates_is_not_read(self):
+        self.conn.execute("UPDATE post_merge_records SET project = ''")
+        with self.assertLogs("post_merge_check", level="WARNING"):
+            self.assertEqual(self.tick(1)["unreadable"], [f"{REPO}/pull/1"])
+        self.assertEqual(self.cluster.calls, [])
+
+    def test_a_later_applied_commit_that_contains_the_merge_is_applied(self):
+        self.cluster.apps = [argo_app(revision=OLDER)]
+        asked = []
+
+        def contains(repo, ancestor, revision):
+            asked.append((repo, ancestor, revision))
+            return True
+
+        seen = post_merge_check.watch_health(self.conn, self.cluster, NOW + timedelta(minutes=1), contains=contains)
+        self.assertEqual(seen["applied"], [f"{REPO}/pull/1"])
+        self.assertEqual(asked, [(REPO, MERGE, OLDER)])
+
+    def test_a_later_commit_without_the_merge_or_unknown_ancestry_waits(self):
+        self.cluster.apps = [argo_app(revision=OLDER)]
+        for answer, state in ((False, "pending"), (None, "unconfirmed")):
+            with self.subTest(answer=answer):
+                post_merge_check.watch_health(self.conn, self.cluster, NOW, contains=lambda *a, answer=answer: answer)
+                self.assertTrue(self.row()["sync_state"].startswith(state), self.row()["sync_state"])
+                self.assertIsNone(self.row()["applied_at"])
+
+    def test_unknown_ancestry_falls_back_to_observing_the_budget(self):
+        self.cluster.apps = [argo_app(revision=OLDER)]
+        self.cluster.budgets = [{"metadata": {"name": "checkout-pdb"}, "spec": {"selector": {"matchLabels": {"app": "checkout"}}}}]
+        seen = post_merge_check.watch_health(self.conn, self.cluster, NOW, contains=lambda *a: None)
+        self.assertEqual(seen["applied"], [f"{REPO}/pull/1"])
+        self.assertTrue(self.row()["sync_state"].startswith("observed"), self.row()["sync_state"])
+
+    def test_with_no_reconciler_for_the_namespace_the_budget_is_observed_directly(self):
+        self.cluster.apps = [argo_app(namespace="elsewhere")]
+        self.assertEqual(self.tick(1)["waiting"], [f"{REPO}/pull/1"])
+        self.assertIn("no budget selects the workload yet", self.row()["sync_state"])
+        self.cluster.budgets = [{"metadata": {"name": "checkout-pdb"}, "spec": {"selector": {"matchLabels": {"app": "checkout"}}}}]
+        self.assertEqual(self.tick(2)["applied"], [f"{REPO}/pull/1"])
+        self.assertTrue(self.row()["sync_state"].startswith("observed"), self.row()["sync_state"])
+
+    def test_records_are_read_least_recently_checked_first_whatever_their_state(self):
+        for n in range(2, 23):
+            self.conn.execute(
+                "INSERT INTO post_merge_records (url, repo, number, kind, project, location, cluster, namespace, "
+                "object, opened_at, merged_at, merge_commit) SELECT ?, repo, ?, kind, project, location, cluster, "
+                "namespace, object, opened_at, merged_at, merge_commit FROM post_merge_records WHERE number = 1",
+                (f"{REPO}/pull/{n}", n),
+            )
+        first = set(self.tick(1)["waiting"])
+        second = set(self.tick(2)["waiting"])
+        self.assertEqual(len(first), 20)
+        self.assertEqual(len(first | second), 22, "every record is read within two ticks")
+
+    def test_unmerged_closed_or_finished_records_are_not_read(self):
+        self.conn.execute("UPDATE post_merge_records SET outcome = 'verified_fixed'")
+        self.tick(1)
+        self.assertEqual(self.cluster.calls, [])
+
+
 class SelectorTest(unittest.TestCase):
     def test_label_selector_renders_match_expressions(self):
         selector = {"matchLabels": {"app": "web"}, "matchExpressions": [
@@ -316,6 +479,25 @@ class MainTest(unittest.TestCase):
                 else:
                     self.assertEqual(answer["merged"], [f"{REPO}/pull/1"])
         self.assertEqual(post_merge_check.main(["other"]), 2)
+
+    def test_health_runs_one_tick_under_the_switch(self):
+        import io
+        import kubeagents_switches
+        import tempfile
+        from contextlib import redirect_stdout
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "kv.db")
+            with sqlite3.connect(db) as conn:
+                conn.execute(schema())
+            out = io.StringIO()
+            with mock.patch.dict("os.environ", {"KUBEAGENTS_POST_MERGE_CHECK": "report", "SESSION_KV_DB_PATH": db}), \
+                    mock.patch.object(kubeagents_switches, "MANAGED_DOTENV_PATH", Path(tmp) / "no-env"), \
+                    mock.patch.object(kubeagents_switches, "SWITCH_DIR", Path(tmp) / "no-dir"), \
+                    redirect_stdout(out):
+                self.assertEqual(post_merge_check.main(["health"], kubectl_json=FakeCluster()), 0)
+            self.assertEqual(json.loads(out.getvalue())["applied"], [])
 
 if __name__ == "__main__":
     unittest.main()
