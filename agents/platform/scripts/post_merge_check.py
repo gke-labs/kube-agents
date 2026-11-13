@@ -442,7 +442,7 @@ def watch_health(
             cluster = (record["project"], record["location"], record["cluster"])
             if cluster not in lists_by_cluster:
                 lists_by_cluster[cluster] = {
-                    resource: kubectl_json(record, ["get", resource, "-A", "-o", "json"])
+                    resource: kubectl_json(record, ["get", resource, "-A", "-o", "json", "--chunk-size=500"])
                     for resource in RECONCILER_RESOURCES
                 }
 
