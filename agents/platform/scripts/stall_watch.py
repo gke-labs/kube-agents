@@ -748,9 +748,9 @@ BOARD_DB_NAME = "kanban.db"
 BOARD_BUSY_TIMEOUT_SECONDS = 10
 NOTICED_PREFIX = "🧭 stall noticed"
 # A stall swept under spec.mode: next on a cluster with no Cluster Agent
-# profile to assign its alert to (#5621): said once per change of the set,
-# keyed in the state under UNROUTED_KEY, until #5622 moves the alert to the
-# cluster profile.
+# profile to assign its alert to (#5621): no alert is raised, and each such
+# namespace is said in chat once while its rows stay ledgered (UNROUTED_KEY
+# holds the ones said), until #5622 moves the alert to the cluster profile.
 UNROUTED_MARK = "with no Cluster Agent profile to alert"
 UNROUTED_KEY = "unrouted"
 CLEARED_PREFIX = "✅ stall cleared"
@@ -2823,12 +2823,16 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
                 what, shown = f"would comment on card `{episode.get('card') or 'not yet filed'}` for", new_rows
             elif not would_raise(state, sweep, scope, now, min_age):
                 continue
-            elif raised < MAX_ALERTS_PER_TICK:
-                what, shown = "would raise an alert for", rows
-                raised += 1
-            else:
+            elif raised >= MAX_ALERTS_PER_TICK:
                 held += 1
                 continue
+            elif cluster_agent_for(project, name, location) is None:
+                # The same check a real alert makes: no profile, no alert.
+                unrouted.append(scope)
+                continue
+            else:
+                what, shown = "would raise an alert for", rows
+                raised += 1
             lines.append(f"{DRY_RUN_PREFIX} {what} {scope_label_text(scope)}: {names_text(object_names(shown))}")
             continue
         if episode:
@@ -2899,12 +2903,18 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
             sys.stderr.write(f"stall_watch: no alert for {scope}: {refusal}\n")
             continue
         raised += 1
-    unrouted_now = sorted(set(unrouted))
-    if unrouted_now and state.get(UNROUTED_KEY) != unrouted_now:
-        shown = ", ".join(unrouted_now[:5]) + (f" and {len(unrouted_now) - 5} more" if len(unrouted_now) > 5 else "")
-        text = f"{NOTICED_PREFIX} in {len(unrouted_now)} namespace{'s' if len(unrouted_now) > 1 else ''} {UNROUTED_MARK} ({shown}); tracked here and cleared when they clear"
+    # A namespace already said stays said while its rows stay ledgered: a tick
+    # that did not read it, held it at the cap, or saw only some of the set
+    # clear is not news. It is forgotten once its rows go or an alert opens
+    # an episode for it, so a stall that comes back is said again.
+    ledgered = {scope_key(e["cluster"], e["namespace"]) for e in state["stalls"].values()}
+    said = {scope for scope in state.get(UNROUTED_KEY) or [] if scope in ledgered and scope not in episodes}
+    fresh = sorted(set(unrouted) - said)
+    if fresh:
+        shown = names_text([scope_label_text(scope) for scope in fresh])
+        text = f"{NOTICED_PREFIX} in {len(fresh)} namespace{'s' if len(fresh) > 1 else ''} {UNROUTED_MARK} ({shown}); no alert was raised, and each is said once while it stays stalled"
         lines.append(f"{DRY_RUN_PREFIX} {text}" if dry_run else text)
-    state[UNROUTED_KEY] = unrouted_now or None
+    state[UNROUTED_KEY] = sorted(said | set(unrouted)) or None
     if held:
         text = f"{NOTICED_PREFIX} in {held} more namespace{'s' if held > 1 else ''}; alerts follow on later ticks, {MAX_ALERTS_PER_TICK} a tick"
         lines.append(f"{DRY_RUN_PREFIX} {text}" if dry_run else text)
