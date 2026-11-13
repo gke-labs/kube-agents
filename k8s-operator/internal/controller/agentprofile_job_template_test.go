@@ -676,7 +676,7 @@ func TestJobModeNeedsThePolicyInPlace(t *testing.T) {
 			if err := c.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aDispatchConfigName(agent)}, &cm); err != nil {
 				t.Fatal(err)
 			}
-			if strings.Contains(cm.Data[a2aDispatchConfigKey], `"jobTemplate"`) {
+			if strings.Contains(cm.Data[a2aDispatchConfigKey], `"jobTemplateRef"`) {
 				t.Errorf("the dispatch config still carries a Job template with %s", name)
 			}
 		})
@@ -986,7 +986,7 @@ func TestAProfileNamespaceThePolicyDoesNotSelectGetsNoJobMode(t *testing.T) {
 	if err := c.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aDispatchConfigName(agent)}, &cm); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(cm.Data[a2aDispatchConfigKey], `"jobTemplate"`) {
+	if strings.Contains(cm.Data[a2aDispatchConfigKey], `"jobTemplateRef"`) {
 		t.Error("the dispatch config names a Job template in a namespace the policy doesn't select")
 	}
 }
@@ -1030,7 +1030,7 @@ func TestAFailedParamsPassRevokesJobMode(t *testing.T) {
 	if err := c.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aDispatchConfigName(agent)}, &cm); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(cm.Data[a2aDispatchConfigKey], `"jobTemplate"`) {
+	if strings.Contains(cm.Data[a2aDispatchConfigKey], `"jobTemplateRef"`) {
 		t.Error("the dispatch config still names a Job template after a failed params pass")
 	}
 }

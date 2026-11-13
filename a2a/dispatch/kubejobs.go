@@ -117,7 +117,7 @@ func (k *KubeJobs) jobTemplate(ctx context.Context, namespace string, prof *lib.
 	// config's Validate: a bad param holds its own profile's tasks, not
 	// every profile's config.
 	if !lib.PodTemplateWithContainers(obj.Spec.Template) {
-		return nil, fmt.Errorf("profile %s's %s holds no pod template with containers", prof.Name, ref.Name)
+		return nil, fmt.Errorf("%w: profile %s's %s holds no pod template with containers", ErrJobTemplateNotCurrent, prof.Name, ref.Name)
 	}
 	return obj.Spec.Template, nil
 }
