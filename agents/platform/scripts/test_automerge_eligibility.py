@@ -76,7 +76,7 @@ class DiffTest(unittest.TestCase):
     def test_one_added_file_comes_back_byte_for_byte(self):
         self.assertEqual(ae.added_file_from_diff(diff_adding(PATH, TEXT)), (PATH, TEXT))
 
-    def test_a_diff_with_no_mode_line_is_read_as_gitlab_writes_it(self):
+    def test_a_diff_with_no_mode_or_index_line_is_still_read(self):
         diff = diff_adding(PATH, TEXT).replace("new file mode 100644\nindex 0000000..653b552\n", "")
         self.assertEqual(ae.added_file_from_diff(diff), (PATH, TEXT))
 

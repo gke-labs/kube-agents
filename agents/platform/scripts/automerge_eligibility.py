@@ -104,7 +104,9 @@ def parse_budget(text: str) -> Budget | None:
         selector = json.loads(body["selector"])
     except json.JSONDecodeError:
         return None
-    if not _selector_shaped(selector):
+    # An empty selector selects every pod in the namespace; the generator
+    # refuses one (`audit_report._pdb_unbuildable_reason`), so it is never its output.
+    if not _selector_shaped(selector) or not any(selector.get(key) for key in SELECTOR_KEYS):
         return None
     budget = Budget(
         header["cluster"], header["object"], header["finding_id"], body["name"], body["namespace"], selector
@@ -144,7 +146,7 @@ def added_file_from_diff(diff: Any) -> tuple[str, str] | None:
         return None
     path = header["b"]
     at = 1
-    # A diff may carry no mode line; `--- /dev/null` below is what says
+    # A diff with no mode line is still read; `--- /dev/null` below is what says
     # the file is new. One that does must be a plain file's.
     if at < len(lines) and lines[at].startswith("new file mode "):
         if lines[at] != "new file mode 100644":
