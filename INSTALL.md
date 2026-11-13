@@ -728,7 +728,7 @@ If you enabled Google Chat or Slack during the install, perform the following re
 2. **Send a Test Direct Message**:
    - Send a DM to the bot in Google Chat with the message `"Hi Platform Agent"`.
    - If you left `GOOGLE_CHAT_HOME_CHANNEL` empty and this is the install's first chat message on either platform, it makes its space the home channel, where scheduled reports post. To send them to a team space instead, send the first message there, or run `/sethome` there afterwards.
-   - Under `spec.mode: next` neither the first message nor `/sethome` sets it: the A2A gateway posts alerts and reports only to `GOOGLE_CHAT_HOME_CHANNEL`, a space name (`spaces/<id>`), and while it is empty refuses and keeps them (up to fifty, for thirty days) for one digest into the space once it is set. Slack's refused posts wait for Slack's own home channel. The installer warns before it applies with it empty (and `install.sh`'s setup interview asks you to confirm), and the PlatformAgent carries the `HomeChannelUnset` condition until it is set. A value that is not a space name turns the gateway's notify route off, so card reports back to their conversation stop too.
+   - Under `spec.mode: next` neither the first message nor `/sethome` sets it: the A2A gateway posts Google Chat's alerts and reports only to `GOOGLE_CHAT_HOME_CHANNEL`, a space name (`spaces/<id>`). Home posts go to every platform with a home channel. With none, every enabled platform's gateway route refuses them and keeps them (up to fifty, for thirty days) for one digest once its channel is set. The installer warns before it applies with it empty (and `install.sh`'s setup interview asks you to confirm), and the PlatformAgent carries the `HomeChannelUnset` condition until it is set. A value that is not a space name turns the gateway's notify route off, so card reports back to their conversation stop too.
 3. **Approve Pairing Code (Optional / First-time setup)**:
    - If pairing mode is enabled, approve the pairing code displayed in the gateway logs:
      ```bash
@@ -1614,7 +1614,7 @@ When a Slack bot connects or is online in your workspace but never replies to me
 
 When the checks in the entry above pass and a message still gets no reply, follow it to the component that should answer.
 
-- Find out which component answers chat. An empty result means `today`, the same as `today` itself; `next` puts Google Chat on the A2A gateway when it is enabled, and Slack otherwise:
+- Find out which component answers chat. An empty result means `today`, the same as `today` itself; `next` puts Google Chat and Slack, either or both, on the A2A gateway:
   ```bash
   kubectl get platformagent platform-agent -n kubeagents-system -o jsonpath='{.spec.mode}{"\n"}'
   ```

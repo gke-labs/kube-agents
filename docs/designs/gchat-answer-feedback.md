@@ -180,7 +180,7 @@ button").
 
 **Call 6: the switch.** `spec.integration.googleChat.answerFeedback *bool`, default `true`, the
 Slack field's twin. The operator renders `A2A_GOOGLE_CHAT_ANSWER_FEEDBACK=false` on the gateway
-only when Google Chat is the gateway's backend under `next` and the field is `false`, as it
+only when Google Chat is among the platforms the gateway serves under `next` and the field is `false`, as it
 renders the Slack variable only when Slack is armed. The gateway sets `AnswerFeedbackOff` when
 either variable is `false`; the desk then never starts, no backend draws, and a tap on an older
 message is logged and dropped. Chart: `platformAgent.integration.googleChat.answerFeedback`,

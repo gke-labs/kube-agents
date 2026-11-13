@@ -118,8 +118,8 @@ NOTIFY_PLATFORM_ENV = "A2A_NOTIFY_PLATFORM"
 # The platforms whose gateway conversations a card can report back to
 # (a2aNotifyConversationsEnvVar), in the same list form. Rendered whenever the
 # gateway arms the route, home channel or not; A2A_NOTIFY_PLATFORM above is home
-# posts, rendered with a home channel or when the backend is the install's only
-# chat platform (the gateway then keeps a refused post for its digest).
+# posts: the platforms with a home channel, or every armed platform when none
+# has one (the gateway then keeps a refused post for its digest).
 NOTIFY_CONVERSATIONS_ENV = "A2A_NOTIFY_CONVERSATIONS"
 # What separates the platform names in either variable
 # (chat_notify.PLATFORM_LIST_SEPARATOR).

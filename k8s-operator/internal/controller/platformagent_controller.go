@@ -304,10 +304,15 @@ const (
 	homeChannelUnsetMessageFormat = "The A2A gateway holds %[1]s (spec.mode next) and %[2]s is empty, so the agent's " +
 		"proactive posts -- alerts, drift reports, scheduled reports -- %[5]s; " +
 		"replies in a conversation still arrive. Set %[2]s (%[3]s in install.env) to %[4]s to deliver them."
-	// homeChannelUnsetKept is the meanwhile for each backend without a home:
-	// the agent still sends, the gateway refuses and keeps
-	// (a2a/gateway/notify_refused.go).
+	// homeChannelUnsetKept is the meanwhile for each backend without a home
+	// when no armed backend has one: the agent still sends, the gateway
+	// refuses and keeps (a2a/gateway/notify_refused.go).
 	homeChannelUnsetKept = "are refused by the gateway, which keeps them and posts one digest into the channel once it is set"
+	// homeChannelUnsetToGchat and homeChannelUnsetToSlackRoute are the
+	// meanwhile when the other armed backend has a home: the agent routes
+	// home posts only to platforms with one (a2aNotifyHomePlatforms).
+	homeChannelUnsetToGchat      = "go to Google Chat's home channel meanwhile"
+	homeChannelUnsetToSlackRoute = "go to Slack's home channel meanwhile"
 	// homeChannelUnsetJoin joins the sentences when both backends lack a home.
 	homeChannelUnsetJoin = " "
 
@@ -1339,14 +1344,14 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	// 12. Reconcile the Agent Sandbox Pod with its Envoy credential sidecar.
 	netpolProf := r.resolveNetpolProfile(ctx, instance)
-	// The home-channel record, read once per pass: the projection in the
-	// A2A render and both condition writers take this value, so the file
-	// and the condition never disagree within one pass.
+	// The home-channel record, read once per pass: the agent's home route,
+	// the projection in the A2A render and both condition writers take this
+	// value, so the file and the condition never disagree within one pass.
 	homeRec, err := r.homeChannelRecordFor(ctx, instance)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := r.reconcileWorkload(ctx, instance, configMapHash, fluentBitHash, settingsHash, gatewayPolicyHash, agentPlugins, otlpEndpoint, otlpDisabled); err != nil {
+	if err := r.reconcileWorkload(ctx, instance, configMapHash, fluentBitHash, settingsHash, gatewayPolicyHash, agentPlugins, otlpEndpoint, otlpDisabled, homeRec); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -2892,11 +2897,11 @@ func (r *PlatformAgentReconciler) reconcileEventWatcherAlertExcludeConfigMap(ctx
 	return r.applyManaged(ctx, agent, cm)
 }
 
-func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, otlpEndpoint string, otlpDisabled bool) error {
+func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *agentv1alpha1.PlatformAgent, configHash, fluentBitHash, settingsHash, policyHash string, agentPlugins []*agentv1alpha1.AgentPlugin, otlpEndpoint string, otlpDisabled bool, homeRec homeChannelRecord) error {
 	imageVolumeSupported := r.imageVolumeSupported(agent)
 	r.updatePluginStatuses(ctx, agent, agentPlugins, imageVolumeSupported)
 
-	opts := renderOptions{imageVolumeSupported: imageVolumeSupported, otlpEndpoint: otlpEndpoint, otlpDisabled: otlpDisabled}
+	opts := renderOptions{imageVolumeSupported: imageVolumeSupported, otlpEndpoint: otlpEndpoint, otlpDisabled: otlpDisabled, homeRecord: homeRec}
 	held, err := r.heldGitHubOrg(ctx, agent)
 	if err != nil {
 		return err
@@ -5544,7 +5549,9 @@ func (r *PlatformAgentReconciler) forgetUsageStatus(agent *agentv1alpha1.Platfor
 // spec and the home-channel record, or "" when the condition is to be absent:
 // the next stack holds no chat backend, or each one it holds has a home
 // channel, from the CR or (Slack) admitted from the record. With both
-// backends lacking one, the message carries both sentences, Chat first. A
+// backends lacking one, the message carries both sentences, Chat first, and
+// each says the gateway keeps the posts; with one lacking it, its sentence
+// says the posts go to the other's home channel meanwhile. A
 // malformed home channel is not this condition's: the gateway refuses it at
 // start and says so. On Slack with the CR field empty the base sentence
 // carries at most one more: why the record did not stand in (manual, not an
@@ -5552,8 +5559,12 @@ func (r *PlatformAgentReconciler) forgetUsageStatus(agent *agentv1alpha1.Platfor
 func homeChannelUnsetMessage(agent *agentv1alpha1.PlatformAgent, rec homeChannelRecord) string {
 	var parts []string
 	if a2aChatArmed(agent) && strings.TrimSpace(agent.Spec.Integration.GoogleChat.HomeChannel) == "" {
+		meanwhile := homeChannelUnsetKept
+		if a2aSlackHasHome(agent, rec) {
+			meanwhile = homeChannelUnsetToSlackRoute
+		}
 		parts = append(parts, fmt.Sprintf(homeChannelUnsetMessageFormat, "Google Chat",
-			"spec.integration.googleChat.homeChannel", "GOOGLE_CHAT_HOME_CHANNEL", "a Chat space name (spaces/<id>)", homeChannelUnsetKept))
+			"spec.integration.googleChat.homeChannel", "GOOGLE_CHAT_HOME_CHANNEL", "a Chat space name (spaces/<id>)", meanwhile))
 	}
 	if msg := slackHomeChannelUnsetMessage(agent, rec); msg != "" {
 		parts = append(parts, msg)
@@ -5567,8 +5578,12 @@ func slackHomeChannelUnsetMessage(agent *agentv1alpha1.PlatformAgent, rec homeCh
 	if !a2aSlackArmed(agent) || strings.TrimSpace(agent.Spec.Integration.Slack.HomeChannel) != "" || rec.channel != "" {
 		return ""
 	}
+	meanwhile := homeChannelUnsetKept
+	if a2aGchatHasHome(agent) {
+		meanwhile = homeChannelUnsetToGchat
+	}
 	msg := fmt.Sprintf(homeChannelUnsetMessageFormat, "Slack",
-		"spec.integration.slack.homeChannel", "SLACK_HOME_CHANNEL", "a channel id (C... or G...)", homeChannelUnsetKept)
+		"spec.integration.slack.homeChannel", "SLACK_HOME_CHANNEL", "a channel id (C... or G...)", meanwhile)
 	switch {
 	case slackHomeChannelPolicy(agent) == slackHomeChannelPolicyManual:
 		return msg + homeChannelUnsetManualSuffix

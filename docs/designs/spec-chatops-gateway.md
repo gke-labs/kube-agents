@@ -1685,11 +1685,10 @@ read: at a start that has one (the CR's, or on Slack the projected file's), or a
 home request that finds the projected file naming one (Slack, with the learn armed). The
 requester's answer is the same refusal, worded to say the post is kept and carrying `kept`;
 the relay records its own undelivered line as before, and the alert path records the alert as
-kept. For the posts to reach the route at all the agent has to be
-routed with no home channel: the operator names every route the gateway arms
-(`A2A_NOTIFY_PLATFORM`, below), home channel or not (`a2aNotifyPlatforms`). Each backend keeps
-its own refused posts under its own key. The `HomeChannelUnset` condition names every armed
-platform without a home channel. The gateway writes nothing to the
+kept. Home posts go to every platform with a home channel; with none, every armed
+platform keeps them for its digest (`A2A_NOTIFY_PLATFORM`, below; `a2aNotifyHomePlatforms`).
+Each backend keeps its own refused posts under its own key. The `HomeChannelUnset` condition
+names every armed platform without a home channel, and says where its posts go meanwhile. The gateway writes nothing to the
 home-channel record, and the operator does not yet read the count. The answer goes out once the first part has landed; a long text is chunked, and
 the rest follows into the same thread. A request the gateway took and did not answer in
 time may still post, so `a2a notify` exits with its own status then, and the alert path
@@ -1708,11 +1707,14 @@ rather than lost. The agent-side callers
 other platform through `hermes send` as before (a day on with no conversation to take onboarding's
 first report, that report is a ledger issue on GitHub, and a home line on each routed platform links it the same way).
 `A2A_NOTIFY_PLATFORM` holds a comma-separated list of platform names, and a single name is a list of one;
-these are the agent's platform names (`google_chat`, `slack`), not the gateway's backend names its boot log prints (`gchat`, `slack`). The operator renders `google_chat` exactly when `a2aChatArmed` holds and `homeChannel` is a space
-name or unset (`a2aGchatNotifyArmed`), and `slack` by the Slack rule below, Chat first (`a2aNotifyPlatforms`). The kanban notifier's report back to a gateway
+these are the agent's platform names (`google_chat`, `slack`), not the gateway's backend names its boot log prints (`gchat`, `slack`). A platform's route is armed for `google_chat` exactly when `a2aChatArmed` holds and `homeChannel` is a space
+name or unset (`a2aGchatNotifyArmed`), and for `slack` by the Slack rule below. The operator
+renders in `A2A_NOTIFY_PLATFORM` every armed platform with a home channel, Chat first, and every
+armed platform when none has one (`a2aNotifyHomePlatforms`). The alert picks one platform from
+that list, Chat first. The kanban notifier's report back to a gateway
 conversation (below), and onboarding's first report into the conversation the user first wrote in,
 are armed by their own variable, `A2A_NOTIFY_CONVERSATIONS`, a comma-separated list of the
-platforms the gateway serves (read by `chat_notify.gateway_platforms()` on the agent side and by the kanban patches' own copies), which the operator renders from the same list; on Chat
+platforms the gateway serves (read by `chat_notify.gateway_platforms()` on the agent side and by the kanban patches' own copies), which names every armed route, home channel or not (`a2aNotifyConversationPlatforms`); on Chat
 the gateway arms the route with `homeChannel` unset (the route then
 serves conversation requests only) or a space name; the Slack render is below. The Hermes kanban notifier, which posts a card's events into the thread the card
 subscribes to and wakes its creator when a card blocks or fails, reaches the same route
@@ -1765,11 +1767,14 @@ arrive.
 Slack has the same route on its own subject, `chat.notify.slack`. Home posts are armed when the
 gateway holds Slack (`a2aSlackArmed`) and `slack.homeChannel`, carried as
 `A2A_SLACK_HOME_CHANNEL`, is a channel id (`C...`, or `G...` for a private channel). The agent
-is routed to the subject (`A2A_NOTIFY_PLATFORM` names `slack`) with that id, and with the field
-unset (the gateway keeps what it refuses until a channel is set or learned). Conversation posts are armed whenever the gateway holds
+is routed to the subject (`A2A_NOTIFY_PLATFORM` names `slack`) with that id or an admitted
+learned one. With no home channel it is routed only when no armed platform has one (the gateway
+keeps what it refuses until a channel is set or learned). Conversation posts are armed whenever the gateway holds
 Slack, `homeChannel` set or not, and `A2A_NOTIFY_CONVERSATIONS` then names `slack`
 (`a2aSlackNotifyArmed`); a `homeChannel` that is set but is not a channel id turns the whole
-route off, as on Chat. With both backends armed both variables read `google_chat,slack`.
+route off, as on Chat. With both backends armed `A2A_NOTIFY_CONVERSATIONS` reads
+`google_chat,slack`, and `A2A_NOTIFY_PLATFORM` names the ones with a home channel, or both when
+neither has one.
 
 **The home-channel record.** Under `next`, Slack on the gateway or not, the operator owns a ConfigMap
 `<agent>-home-channel` with no data, applied beside the gateway Role and torn down with the stack.
@@ -2401,7 +2406,9 @@ with the backend that delivered it, and a direct message names its backend as
 restarts, while a chat backend that stops is run again after a backoff and the rest
 keep going. The inject and A2A doors sit beside the backends, for the reason the inject
 section gives. The operator renders every backend the CR enables into the one gateway,
-Chat and Slack together when both are. Decided 2026-11-12.
+Chat and Slack together when both are. Decided 2026-11-12. Home posts go to every platform with
+a home channel; with none, every armed platform keeps them for its digest. Revised 2026-11-13,
+because an alert picks one platform and stops when the gateway keeps it.
 
 `verifiedBy` is `slack-socket-mode+principal-map` when our table joined the sender to a
 principal, and `slack-socket-mode` when it did not: either way Slack authenticated the
@@ -2747,8 +2754,8 @@ install that never set the field keeps its gateway pod unchanged; the gateway th
 the bucket, marks no answer and hands the adapter no recorder, so a tap on a button already posted
 is acked and changes nothing (Slack still fills the tapped icon; no box opens). A Google Chat install
 turns it off with `spec.integration.googleChat.answerFeedback: false` (default `true`), which the
-operator renders as `A2A_GOOGLE_CHAT_ANSWER_FEEDBACK=false` by the same rule. The gateway holds one
-chat backend, so either name turns off the one global flag (`AnswerFeedbackOff`); a tap or note
+operator renders as `A2A_GOOGLE_CHAT_ANSWER_FEEDBACK=false` by the same rule. Either name is
+one switch for every backend the gateway holds (`AnswerFeedbackOff`); a tap or note
 click on a Google Chat message already posted is logged and acked and changes nothing.
 
 ## The console adapter (added 9/23)

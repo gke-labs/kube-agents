@@ -1540,10 +1540,10 @@ func a2aSlackNotifyArmed(agent *agentv1alpha1.PlatformAgent) bool {
 	return strings.TrimSpace(agent.Spec.Integration.Slack.HomeChannel) == "" || a2aSlackHomeChannel(agent) != ""
 }
 
-// a2aNotifyPlatforms is every platform whose chat.notify route the gateway
-// arms, Chat first: the platforms the agent routes its proactive posts and
-// conversation reports to (A2A_NOTIFY_PLATFORM, A2A_NOTIFY_CONVERSATIONS).
-func a2aNotifyPlatforms(agent *agentv1alpha1.PlatformAgent) []string {
+// a2aNotifyConversationPlatforms is every platform whose chat.notify route
+// the gateway arms, Chat first: the platforms a kanban card's report and
+// onboarding's first report can go back to (A2A_NOTIFY_CONVERSATIONS).
+func a2aNotifyConversationPlatforms(agent *agentv1alpha1.PlatformAgent) []string {
 	var platforms []string
 	if a2aGchatNotifyArmed(agent) {
 		platforms = append(platforms, a2aNotifyPlatformGchat)
@@ -1552,6 +1552,37 @@ func a2aNotifyPlatforms(agent *agentv1alpha1.PlatformAgent) []string {
 		platforms = append(platforms, a2aNotifyPlatformSlack)
 	}
 	return platforms
+}
+
+// a2aNotifyHomePlatforms is where the agent sends its proactive posts
+// (A2A_NOTIFY_PLATFORM): every armed platform that has a home channel, Chat
+// first, Slack's from the CR or the admitted record (a2aSlackHomeEffective).
+// When none has one, it is every armed platform, and the gateway keeps each
+// platform's posts for the digest it posts once a channel is set.
+func a2aNotifyHomePlatforms(agent *agentv1alpha1.PlatformAgent, rec homeChannelRecord) []string {
+	var platforms []string
+	if a2aGchatHasHome(agent) {
+		platforms = append(platforms, a2aNotifyPlatformGchat)
+	}
+	if a2aSlackHasHome(agent, rec) {
+		platforms = append(platforms, a2aNotifyPlatformSlack)
+	}
+	if len(platforms) == 0 {
+		return a2aNotifyConversationPlatforms(agent)
+	}
+	return platforms
+}
+
+// a2aGchatHasHome is whether Chat's chat.notify route is armed with a home
+// channel to post to.
+func a2aGchatHasHome(agent *agentv1alpha1.PlatformAgent) bool {
+	return a2aGchatNotifyArmed(agent) && a2aGchatHomeSpace(agent) != ""
+}
+
+// a2aSlackHasHome is whether Slack's chat.notify route is armed with a home
+// channel to post to, from the CR or the admitted record.
+func a2aSlackHasHome(agent *agentv1alpha1.PlatformAgent, rec homeChannelRecord) bool {
+	return a2aSlackNotifyArmed(agent) && a2aSlackHomeEffective(agent, rec) != ""
 }
 
 // a2aSlackHomeChannel is slack.homeChannel trimmed, when it is a public

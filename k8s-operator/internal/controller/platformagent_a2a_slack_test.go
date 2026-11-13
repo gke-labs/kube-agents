@@ -894,8 +894,9 @@ func TestTheSlackHomeChannelReachesTheArmedGateway(t *testing.T) {
 // unset, the gateway keeps the refused posts for the digest), and the kanban
 // notifier to send a card's report back to its conversation whenever the
 // gateway arms Slack's route (home channel unset or a channel id). Otherwise
-// posts would go to a subject nobody answers. With Chat beside it both are
-// routed, Chat first.
+// posts would go to a subject nobody answers. With Chat beside it both carry
+// conversation reports, Chat first, and home posts go to the platforms that
+// have a home channel.
 func TestTheAgentRoutesSlackProactivePostsExactlyWhenArmed(t *testing.T) {
 	withSlackHome := func(agent *agentv1alpha1.PlatformAgent, home string) *agentv1alpha1.PlatformAgent {
 		agent.Spec.Integration.Slack.HomeChannel = home
@@ -941,21 +942,24 @@ func TestTheAgentRoutesSlackProactivePostsExactlyWhenArmed(t *testing.T) {
 			}
 		})
 	}
-	// Both backends share the gateway: the agent is routed to both, Chat
-	// first, on both variables, and carries Slack's home only when the CR
-	// sets one.
-	for _, slackHome := range []string{"C0HOME", ""} {
+	// Both backends share the gateway: both carry conversation reports, Chat
+	// first; home posts go to both only when Slack has a home beside Chat's.
+	// The agent carries Slack's home only when the CR sets one.
+	for _, tc := range []struct{ slackHome, wantPlatform string }{
+		{"C0HOME", "google_chat,slack"},
+		{"", "google_chat"},
+	} {
 		both := chatAndSlackTestAgent("next")
-		both.Spec.Integration.Slack.HomeChannel = slackHome
+		both.Spec.Integration.Slack.HomeChannel = tc.slackHome
 		both.Spec.Integration.GoogleChat.HomeChannel = "spaces/AAAA"
 		env := envMapOf(brokerContainerNamed(buildPodTemplateSpec(both, "h", "h", "h", "h", nil, renderOptions{}).Spec.Containers, "platform-agent").Env)
-		for _, name := range []string{a2aNotifyPlatformEnvVar, a2aNotifyConversationsEnvVar} {
-			if got := env[name].Value; got != "google_chat,slack" {
-				t.Errorf("Chat and Slack (slack home %q): %s = %q, want %q", slackHome, name, got, "google_chat,slack")
+		for name, want := range map[string]string{a2aNotifyPlatformEnvVar: tc.wantPlatform, a2aNotifyConversationsEnvVar: "google_chat,slack"} {
+			if got := env[name].Value; got != want {
+				t.Errorf("Chat and Slack (slack home %q): %s = %q, want %q", tc.slackHome, name, got, want)
 			}
 		}
-		if home, ok := env["SLACK_HOME_CHANNEL"]; ok != (slackHome != "") || home.Value != slackHome {
-			t.Errorf("Chat and Slack: SLACK_HOME_CHANNEL = %q (present=%v), want %q", home.Value, ok, slackHome)
+		if home, ok := env["SLACK_HOME_CHANNEL"]; ok != (tc.slackHome != "") || home.Value != tc.slackHome {
+			t.Errorf("Chat and Slack: SLACK_HOME_CHANNEL = %q (present=%v), want %q", home.Value, ok, tc.slackHome)
 		}
 	}
 }

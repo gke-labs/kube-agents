@@ -70,7 +70,7 @@ The pieces that make an alert answerable — a thread, a routing row bound to it
 and the report stored against that thread — are reused unchanged.
 
 Under `spec.mode: next` the post leg is `a2a notify` through the A2A gateway rather
-than `hermes send`, for the platform the gateway holds (spec-chatops-gateway.md,
+than `hermes send`, for the platforms the gateway serves (spec-chatops-gateway.md,
 "Proactive posts: the chat.notify route"). The report still lands in a thread and the
 same `incidents` row is stored against it, but a reply typed into it reaches the A2A
 gateway and runs through the hermes-bridge's `api` executor, never through the Hermes
@@ -650,11 +650,13 @@ An install with no chat route gets no send at all: when the managed scope turns
 every platform off and nothing routes one through the gateway — an install with
 neither Google Chat nor Slack, or one whose home channel is malformed, which routes
 nothing — the relay answers 502 without posting, and the detail says that no route
-exists. A `next` install whose gateway holds a chat platform with no home channel is
-routed anyway: the operator names that platform in `A2A_NOTIFY_PLATFORM` (a
-comma-separated list of platform names, every one the gateway routes), the relay
+exists. Home posts go to every platform with a home channel; with none, every armed
+platform keeps them for its digest. So a `next` install whose gateway holds no platform
+with a home channel is routed anyway: the operator names every armed platform in
+`A2A_NOTIFY_PLATFORM` (a comma-separated list of platform names), the relay
 sends, and the gateway refuses the post and keeps it for the digest it posts once a
-home channel is set (the gateway design, "Proactive posts"). The 502's detail is then
+home channel is set (the gateway design, "Proactive posts"). With a home channel on one
+platform, the operator names only that platform and the report posts there. The 502's detail is then
 the relay's `composed but not delivered to <platform>`. The gateway's refusal, which
 says the post is kept, is in the gateway's and the session server's logs. A pod
 rendered before the operator routed it still answers the platform-naming detail

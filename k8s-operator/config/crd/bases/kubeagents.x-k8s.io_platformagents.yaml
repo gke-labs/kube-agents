@@ -12645,7 +12645,7 @@ spec:
                     peopleSeen7d:
                       description: |-
                         PeopleSeen7d is the A2A gateway's count now of the distinct people who
-                        wrote on the chat platform it serves within the last 7 days:
+                        wrote on the chat platforms it serves within the last 7 days:
                         kubeagents_a2a_gateway_people_seen under window 7d, the largest reading
                         across gateway pods. A reading, not an accumulation: it falls as a
                         person's last message ages out of the window. A 0 is a reading. Absent

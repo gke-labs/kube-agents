@@ -89,7 +89,8 @@ mcp_servers:
       # post fails verification. The bus token is a file mount, not
       # environment, so nothing else is needed. A2A_NOTIFY_PLATFORM and
       # A2A_NOTIFY_CONVERSATIONS each hold a comma-separated list of platform
-      # names (the operator renders one name today). With the first empty,
+      # names, Chat first: every armed route in the second, every platform
+      # with a home channel in the first. With the first empty,
       # routed_platforms() derives Slack from the conversations list and a
       # learned home channel, so the child needs both.
       A2A_NOTIFY_PLATFORM: "${A2A_NOTIFY_PLATFORM}"

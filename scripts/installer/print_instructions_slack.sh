@@ -41,8 +41,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/common.sh" "$@"
 
 # A standalone run takes the mode from install.env alone, as install.sh's own
-# bootstrap does. An exported GOOGLE_CHAT_ENABLED or SLACK_HOME_CHANNEL the
-# file does not assign is kept: install.sh applies those too.
+# bootstrap does. An exported SLACK_HOME_CHANNEL the file does not assign is
+# kept: install.sh applies it too.
 if [ -z "${SLACK_STEPS_PLATFORM_AGENT_MODE+set}" ] && [ -f "$(install_env_file_for_state)" ]; then
   unset PLATFORM_AGENT_MODE
 fi
@@ -53,7 +53,6 @@ load_state
 if [ -n "${SLACK_STEPS_PLATFORM_AGENT_MODE+set}" ]; then
   PLATFORM_AGENT_MODE="$SLACK_STEPS_PLATFORM_AGENT_MODE"
   SLACK_ENABLED="${SLACK_STEPS_SLACK_ENABLED:-}"
-  GOOGLE_CHAT_ENABLED="${SLACK_STEPS_GOOGLE_CHAT_ENABLED:-}"
   SLACK_HOME_CHANNEL="${SLACK_STEPS_HOME_CHANNEL:-}"
   # As in the Google Chat printer.
   NAMESPACE="${SLACK_STEPS_NAMESPACE:-${NAMESPACE:-}}"
@@ -106,7 +105,7 @@ if is_truthy "${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}"; then
 
   echo -e "${C_CYAN}${C_BOLD}--- [Slack Integration Instructions] ---${C_RESET}"
   if slack_moves_to_a2a_gateway "${PLATFORM_AGENT_MODE:-$SLACK_UNRECORDED_PLATFORM_AGENT_MODE}" \
-    "${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}" "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}"; then
+    "${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}"; then
     print_a2a_gateway_steps
     exit 0
   fi

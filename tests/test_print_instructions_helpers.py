@@ -158,7 +158,7 @@ class SlackStepsFollowTheModeTest(unittest.TestCase):
         self.assertNotIn("No home channel is configured", out)
 
     def test_the_namespace_the_run_used_wins_over_install_env(self):
-        applied = {"SLACK_STEPS_SLACK_ENABLED": "true", "SLACK_STEPS_GOOGLE_CHAT_ENABLED": "false",
+        applied = {"SLACK_STEPS_SLACK_ENABLED": "true",
                    "SLACK_STEPS_HOME_CHANNEL": "", "SLACK_STEPS_NAMESPACE": "custom-ns"}
         out = self._run(self._env(mode="today") + "NAMESPACE=file-ns\n",
                         {**applied, "SLACK_STEPS_PLATFORM_AGENT_MODE": "today"})
@@ -184,15 +184,12 @@ class SlackStepsFollowTheModeTest(unittest.TestCase):
         file_says_today = self._env(mode="today", gchat=True)
         applied_slack_only = {"SLACK_STEPS_PLATFORM_AGENT_MODE": "next",
                               "SLACK_STEPS_SLACK_ENABLED": "true",
-                              "SLACK_STEPS_GOOGLE_CHAT_ENABLED": "false",
                               "SLACK_STEPS_HOME_CHANNEL": self._NEXT_HOME}
         out = self._run(file_says_today, applied_slack_only)
         self._assert_next(out)
         self.assertIn(f"Invite the app to the home channel {self._NEXT_HOME}", out)
-        # Google Chat applied beside Slack leaves Slack on the gateway; an applied today moves it off.
-        applied_both = {**applied_slack_only, "SLACK_STEPS_GOOGLE_CHAT_ENABLED": "true"}
-        self._assert_next(self._run(self._env(mode="next"), applied_both))
-        self._assert_today(self._run(self._env(mode="next"), {**applied_both, "SLACK_STEPS_PLATFORM_AGENT_MODE": "today"}))
+        # An applied today moves Slack off the gateway.
+        self._assert_today(self._run(self._env(mode="next"), {**applied_slack_only, "SLACK_STEPS_PLATFORM_AGENT_MODE": "today"}))
         # Slack added on a re-run over a file that records it off.
         file_says_no_slack = self._env(mode="next").replace("SLACK_ENABLED=true", "SLACK_ENABLED=false")
         self._assert_next(self._run(file_says_no_slack, applied_slack_only))
@@ -486,10 +483,11 @@ class ChatSetupChecklistsTest(unittest.TestCase):
         handoff = printed["print_instructions_slack"]
         for line in ("ARGS=--dry-run", "KUBE_AGENTS_INSTALL_ENV=/the/run/install.env",
                      "SLACK_STEPS_PLATFORM_AGENT_MODE=today", "SLACK_STEPS_SLACK_ENABLED=true",
-                     "SLACK_STEPS_GOOGLE_CHAT_ENABLED=false", "SLACK_STEPS_HOME_CHANNEL=C123",
-                     "SLACK_STEPS_NAMESPACE=custom-ns"):
+                     "SLACK_STEPS_HOME_CHANNEL=C123", "SLACK_STEPS_NAMESPACE=custom-ns"):
             with self.subTest(line=line):
                 self.assertIn(line, handoff)
+        # Google Chat beside Slack does not change where Slack goes, so it is not handed over.
+        self.assertNotIn("SLACK_STEPS_GOOGLE_CHAT_ENABLED", handoff)
 
     def test_a_toggle_is_read_the_way_the_tfvars_generator_reads_it(self):
         out, printed = self._run({**self._CHAT, "GOOGLE_CHAT_ENABLED": "yes"})

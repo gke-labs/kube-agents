@@ -177,9 +177,10 @@ var SensitiveEnvVars = map[string]struct{}{
 	"A2A_BUS_USER":       {},
 	// A2A_NOTIFY_PLATFORM turns the agent's proactive posts from Hermes to
 	// the gateway's chat.notify route. It holds the routed platforms,
-	// comma-separated; the operator renders one name, exactly when the next
-	// stack holds the chat backend. An override either way leaves posts going
-	// to a platform that is not there.
+	// comma-separated, Chat first: every platform with a home channel, or
+	// every platform whose route is armed when none has one, under the next
+	// stack. An override either way leaves posts going to a platform that is
+	// not there.
 	"A2A_NOTIFY_PLATFORM": {},
 	// A2A_NOTIFY_CONVERSATIONS arms the kanban notifier's report back to the
 	// gateway conversation a card was filed in, on the same route. It holds
@@ -3158,7 +3159,7 @@ type AgentUsageStatus struct {
 	ProposalsMergedUntouched *int64 `json:"proposalsMergedUntouched,omitempty"`
 
 	// PeopleSeen7d is the A2A gateway's count now of the distinct people who
-	// wrote on the chat platform it serves within the last 7 days:
+	// wrote on the chat platforms it serves within the last 7 days:
 	// kubeagents_a2a_gateway_people_seen under window 7d, the largest reading
 	// across gateway pods. A reading, not an accumulation: it falls as a
 	// person's last message ages out of the window. A 0 is a reading. Absent

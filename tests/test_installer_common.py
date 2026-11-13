@@ -6154,6 +6154,19 @@ class NextHomeChannelUnsetWarningTest(unittest.TestCase):
         self.assertEqual(sum(l.startswith("WARN: No home channel:") for l in lines), 2, out)
         self.assertTrue(lines[-1].startswith("INFO: Set SLACK_HOME_CHANNEL"), out)
 
+    def test_with_one_home_the_other_platforms_posts_go_there(self):
+        # Home posts go to every platform with a home channel, so with one set
+        # the other's posts are not kept; the summary says the same.
+        for kw, there in (({"chat": "true", "slack_home": "C0123ABCD"}, "Slack's home channel"),
+                          ({"chat": "true", "chat_home": "spaces/AAA"}, "Google Chat's home channel")):
+            with self.subTest(**kw):
+                out = self._run(summary=True, **kw).stdout
+                self.assertEqual(out.count(f"go to {there} meanwhile"), 2, out)
+                self.assertNotIn("keeps them for one digest", out)
+        both_unset = self._run(chat="true").stdout
+        self.assertEqual(both_unset.count("keeps them for one digest"), 2, both_unset)
+        self.assertNotIn("meanwhile", both_unset)
+
     def test_the_message_names_no_hermes_fallback(self):
         for kw in ({}, {"slack": "false", "chat": "true"}, {"chat": "true"}):
             with self.subTest(**kw):
