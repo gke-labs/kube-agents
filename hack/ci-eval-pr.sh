@@ -423,8 +423,9 @@ readonly EVAL_SCOPE_READ_ATTEMPTS=3
 readonly UNIT_LOCK_ALLOWANCE_SECONDS=600
 # The longest a unit holding a state lock (unit_state_lock) keeps its stack
 # applied: oobe-first-run-audits' own_wait plus its chain_wait
-# (bench/tf/prebuilt/oobe-first-run-audits/main.tf).
-readonly STATE_LOCK_HOLD_SECONDS=7200
+# (bench/tf/prebuilt/oobe-first-run-audits/main.tf). The stack runs one wait
+# long or the other, never both, but the sum is the bound its test holds.
+readonly STATE_LOCK_HOLD_SECONDS=11400
 # How long a stack-bearing unit that found its state lock busy waits, with the
 # infra lock given back, before it queues for the infra lock again.
 readonly STATE_LOCK_RETRY_SECONDS=30
@@ -1493,9 +1494,8 @@ BENCH_GITOPS_WRITE_MARKER_RE="^[[:space:]]*variable[[:space:]]+\"${BENCH_GITOPS_
 # project role that the fleet creates there for an eval stack's
 # ConfigConnectorContext. Given to a writing stack's unit as
 # TF_VAR_kcc_cluster_name, TF_VAR_kcc_cluster_location and
-# TF_VAR_kcc_google_service_account. No stack on main reads them yet: the
-# stalled Config Connector case's stack (#4594) does, when it declares the
-# marker.
+# TF_VAR_kcc_google_service_account. The stalled Config Connector case's
+# stack (bench/tf/prebuilt/kcc-stalled-declaration) reads them.
 KCC_FLEET_SLOT="a"
 KCC_EVAL_CONTEXT_ACCOUNT="kcc-eval-context"
 # The mint itself, shared with step 0 (hack/ci-revalidate.sh); see
@@ -2048,7 +2048,7 @@ ledger_audit_id_for_task() { # <task.yaml, relative to BENCH_DIR or absolute>
 
 # Every stream lock a case's unit holds: the stream it grades and the ones its
 # task.yaml declares in `audit_streams:` (a case whose stack starts real audit
-# runs; oobe-first-run-audits starts five), read with the YAML parser by
+# runs), read with the YAML parser by
 # kube_agents_bench.audit_streams once before the fan-out. Sorted and each
 # once, so a unit holding several always takes them in the same order and two
 # such units cannot each hold what the other waits on.
@@ -2141,7 +2141,8 @@ probe_gitlab_ledger_path() { # <label>
 # would not come clean both stay 1, as does a GitLab agent token that is not
 # in hand.
 reset_agent_pulls() { # <label>  -> 0 when the repository is clean, non-zero when a unit must not run on it
-  local label="$1" token out rc=0 slug record diagnostics mint_rc=0
+  local label="$1" token out rc=0 slug record diagnostics mint_rc=0 kcc_cluster
+  local kcc_args=()
   if [ "${EVAL_FORGE_KIND:-github}" != "gitlab" ] && [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
     echo "Agent pulls reset (${label}): skipped, EVAL_LEDGER_APP_KEY_FILE is unset and the mounted PAT is a read credential; the repository keeps whatever the agent left"
     return 0
@@ -2173,10 +2174,19 @@ reset_agent_pulls() { # <label>  -> 0 when the repository is clean, non-zero whe
   # carries its own proof of what each unit started on.
   slug="$(printf '%s' "${label}" | tr -c 'A-Za-z0-9._-' '_')"
   record="${ARTIFACT_DIR}/agent-pulls-reset/${slug}.json"
+  # The Config Connector stack's declaration is under the real name of the
+  # KCC_FLEET_SLOT cluster, read from the .fleet-context as the stack's own
+  # inputs are (export_writing_stack_inputs); without it, the helper uses the
+  # name of the fleet's default prefix. GitHub only: the GitLab path deletes
+  # no file.
+  kcc_cluster="$(fleet_context_value "cluster.${KCC_FLEET_SLOT}")"
+  if [ -n "${kcc_cluster}" ] && [ "${EVAL_FORGE_KIND:-github}" != "gitlab" ]; then
+    kcc_args=(--kcc-cluster "${kcc_cluster}")
+  fi
   # The token rides in the environment of this one process, never on argv.
   out="$(AGENT_PULLS_RESET_TOKEN="${token}" python3 "${SCRIPT_DIR}/ci_reset_agent_pulls.py" \
     --repo "${EVAL_LEDGER_REPO}" --project "${PROJECT_ID}" --build "${BUILD_ID:-local}" \
-    --scope "${label}" --record "${record}" ${EVAL_FORGE_HELPER_ARGS[@]+"${EVAL_FORGE_HELPER_ARGS[@]}"} 2>&1)" || rc=$?
+    --scope "${label}" --record "${record}" ${kcc_args[@]+"${kcc_args[@]}"} ${EVAL_FORGE_HELPER_ARGS[@]+"${EVAL_FORGE_HELPER_ARGS[@]}"} 2>&1)" || rc=$?
   [ -n "${out}" ] && printf '%s\n' "${out}" | sed "s/^/Agent pulls reset (${label}): /"
   if [ "${rc}" -ne 0 ]; then
     echo "WARNING: Agent pulls reset (${label}): the helper exited ${rc}; the repository is not clean (${record}), and a unit that requests a pull request does not run on it." >&2
@@ -3071,8 +3081,8 @@ export JUDGE_PROVIDER="google"
 # distinct judge model is blocked on one
 # fact this repository cannot prove: that kube-agents-gemini-api-key serves a
 # second model. The tree says it should -- the chart's default for the same
-# GEMINI_API_KEY family is gemini-3.5-flash (charts/kube-agents/templates/
-# litellm.yaml, docs/site .../inference-gateway.md) -- so the switch is one
+# GEMINI_API_KEY family is gemini-3.8-flash (charts/kube-agents/templates/
+# _helpers.tpl, docs/site .../inference-gateway.md) -- so the switch is one
 # verified run away: confirm the key against the candidate model, then set
 # JUDGE_MODEL_OVERRIDE in the Prow job env (or flip the default here) without
 # touching the agent line.
@@ -4657,12 +4667,12 @@ unit_cost_hint() {
     bootstrap-inventory-ranking-delivery) echo 600 ;;
     # The same stack and wait, planting the report with no critical finding.
     bootstrap-inventory-posture-scope) echo 600 ;;
-    # A stack, but off the infra lock (infra_lock_exempt): the unit waits for
-    # the previous repetition's audits to finish (wait_platform_runs), then the
-    # stack waits for the stage to run the four one after another (1-15 min
-    # each, #985; up to its chain_wait, 3600s). 2530-3144s a repetition on the
-    # nightly of 2026-10-09; the top of the list, so it launches first, its
-    # repetitions back to back.
+    # A stack, but off the infra lock (infra_lock_exempt). On a lease its first
+    # repetition waits out the install's own first-run chain, which ended
+    # 52-115 min after the fan-out on the 2026-11-10 presubmits, and the other
+    # two read the same chain at once. Kept at 3000 to keep it the top of the
+    # list, so it launches first, its repetitions back to back; off the infra
+    # lock, it is in none of the stack chains this hint prices.
     oobe-first-run-audits) echo 3000 ;;
     # Off the infra lock too (infra_lock_exempt), unmeasured: priced as
     # autoops-warning-event-triage, the same plant-then-card shape, so it
@@ -4711,6 +4721,14 @@ unit_cost_hint() {
     # orders it only among that phase's units.
     gce-startup-script-failure | networking-world-open-ingress) echo 900 ;;
     obtainability-pdb-kustomize-overlay) echo 900 ;;
+    # The stockout audit of stockout-pinned-pool, registered 2026-11-10
+    # unmeasured, plus a stack that plants one Config Connector object and
+    # one GitOps file. The plant and the teardown can wait up to about 15
+    # minutes together (CONTEXT_WAIT_S, READY_WAIT_S, DELETE_TIMEOUT_S and
+    # NAMESPACE_WAIT_S in its plant.py), so the hint is the 900s band plus
+    # those 900s. writes_alone, so it orders the case only among the second
+    # phase's units.
+    fleet-audit-manifest-fix-names-stalled-config-connector) echo 1800 ;;
     # One delegated card that reads the live Deployment, the GitOps directory
     # and the chart repository (about six minutes on a dev install, #5161),
     # plus the stack's plant and teardown (four commits, a workload, a
@@ -4952,6 +4970,7 @@ unit_delegation_timeout() {
     obtainability-planted-orphan-service) echo 3000 ;;
     gce-startup-script-failure | networking-world-open-ingress) echo 3000 ;;
     obtainability-pdb-kustomize-overlay) echo 3000 ;;
+    fleet-audit-manifest-fix-names-stalled-config-connector) echo 3000 ;;
     # A compliance-audit run on a pool install; a multi-stream audit took
     # 834 s and 1310 s on a dev install (#3933), so the wait is the audit band's.
     fleet-audit-as-many-excluded-as-managed) echo 3000 ;;
@@ -5116,7 +5135,7 @@ fi
 #                 finish lands in this lane's fresh one. Taken after the task
 #                 lock, keyed on the audit id, by units that write one and by
 #                 units that declare the streams their stack starts audits on
-#                 (audit_streams; oobe-first-run-audits holds five).
+#                 (audit_streams).
 #                 A task-lock holder on a shared stream waits its turn on
 #                 the stream before its own run, so both deadlines scale by
 #                 the cases on the stream (stream_case_count).

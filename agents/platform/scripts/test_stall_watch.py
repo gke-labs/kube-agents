@@ -2217,6 +2217,42 @@ class ClusterRead(Base):
         self.assertEqual(len(whole), 4)
 
 
+class EmptyCluster(Base):
+    """A cluster with no namespace to watch asks for no kind, so the watch
+    skips the served-kinds call and the wildcard discovery there, and still
+    records the cluster as read (#5542)."""
+
+    def cluster_calls(self, fake, name):
+        """Every call on the cluster after its credential fetch, kubectl or a read."""
+        return [argv[:3] for argv, kubeconfig, _ in fake.calls if kubeconfig and argv[:1] != ["gcloud"] and fake._cluster_from(kubeconfig)[1] == name]
+
+    def test_a_cluster_with_no_namespace_to_watch_gets_only_its_listing(self):
+        with patch.dict(os.environ, {stall_watch.KINDS_ENV: "deployments," + stall_watch.KCC_KINDS_WILDCARD}):
+            _, fake = self.run_tick({"full": {"payments": []}, "empty": {}}, served=KCC_SERVED, objects=KCC_OBJECTS, namespaces_extra=["kube-system"])
+        self.assertEqual(self.cluster_calls(fake, "empty"), [["kubectl", "get", "namespaces"]], "no api-resources and no discovery")
+        full = self.cluster_calls(fake, "full")
+        self.assertIn(["kubectl", "api-resources", "--namespaced=true"], full, "a cluster with a namespace to watch still asks")
+        self.assertTrue(fake.discoveries(), "and its wildcard discovery still runs")
+        timing = self.ledger()[stall_watch.CLUSTER_TIMINGS_KEY][cid("empty")]
+        self.assertEqual((timing[stall_watch.TIMING_NAMESPACES_KEY], timing[stall_watch.TIMING_SCANS_KEY], timing[stall_watch.TIMING_CUT_KEY]), (0, 0, False))
+        self.assertNotIn(cid("empty"), self.ledger()["unreadable"])
+
+    def test_a_cluster_whose_namespaces_are_all_excluded_closes_its_card_as_excluded_without_the_kinds_call(self):
+        fleet = {"c": {"checkout": [DEPLOYMENT_ROW]}}
+        self.run_tick(fleet)
+        tid = self.card_of("checkout")
+        with patch.dict(os.environ, {stall_watch.EXCLUDE_NAMESPACES_ENV: "checkout"}):
+            lines, fake = self.run_tick(fleet, now="2026-10-02T12:30:00+00:00")
+        self.assertEqual(self.cluster_calls(fake, "c"), [["kubectl", "get", "namespaces"]])
+        self.assertEqual(self.board.cards[tid]["status"], "done")
+        self.assertEqual(lines, [f"{stall_watch.CLEARED_PREFIX} in {label('c')} / `checkout`: the namespace was excluded from the watch; card `{tid}` closed"])
+
+    def test_a_failing_kinds_call_cannot_make_an_empty_cluster_unreadable(self):
+        served = subprocess.TimeoutExpired("kubectl", stall_watch.API_RESOURCES_TIMEOUT_SECONDS)
+        self.run_tick({"full": {"ns": []}, "empty": {}}, served=served)
+        self.assertEqual(set(self.ledger()["unreadable"]), {cid("full")}, "the empty cluster makes no such call")
+
+
 class Parallel(Base):
     """Clusters are read SCAN_WORKERS at a time, and the ledger does not
     depend on the order they finish in."""

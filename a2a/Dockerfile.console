@@ -12,7 +12,7 @@
 # Dockerfile.worker spell them, so `make mirror-images` and
 # hack/check-image-inventory.sh cover this build too.
 ARG NODE_IMAGE=node
-ARG NODE_VERSION=22-slim
+ARG NODE_VERSION=24-slim
 ARG GOLANG_IMAGE=golang
 ARG GOLANG_VERSION=1.27-alpine
 ARG DISTROLESS_IMAGE=gcr.io/distroless/static

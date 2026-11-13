@@ -16,6 +16,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import chat_notify  # noqa: E402
 import chat_platforms as cp  # noqa: E402
 
 
@@ -207,6 +208,15 @@ class ManagedScopeTest(unittest.TestCase):
     def test_unreadable_managed_scope_degrades_to_the_sources_below(self):
         with _managed("platforms: [not a mapping\n"), _env(SLACK_RELAY_URL="http://x"):
             self.assertEqual(cp.enabled_chat_platforms(), ["slack"])
+
+
+    def test_enabled_platforms_count_every_routed_platform(self):
+        # Under next the managed scope turns off the Hermes consumer of every
+        # platform the gateway holds; each routed platform still counts.
+        with _managed("platforms:\n  google_chat:\n    enabled: false\n"
+                      "  slack:\n    enabled: false\n"), \
+             _env(**{chat_notify.NOTIFY_PLATFORM_ENV: "google_chat,slack"}):
+            self.assertEqual(cp.enabled_chat_platforms(), ["google_chat", "slack"])
 
 
 class ConfigPathContractTest(unittest.TestCase):

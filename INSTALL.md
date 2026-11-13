@@ -1191,7 +1191,10 @@ make docker-push IMG=$IMG
 
 ### Step 4: Deploy the Operator & CRDs
 
-Install the Custom Resource Definitions (CRDs) and deploy the controller manager deployment:
+Install the Custom Resource Definitions (CRDs) and deploy the controller manager deployment.
+`make deploy` applies `config/default` and then `config/profiles`, which creates the profile
+namespace (`kubeagents-system-profiles`, where `mode: next` runs profile workers) with the
+operator's namespaced Role and its RoleBinding in it; `make undeploy` deletes that namespace too:
 
 ```bash
 make install
@@ -1286,7 +1289,7 @@ describes the token. A Bitbucket forge is declared the same way, with `provider:
 ```bash
 # Deploy LiteLLM Gateway
 export MODEL_PROVIDER=gemini
-export MODEL_DEFAULT_NAME=gemini-3.5-flash
+export MODEL_DEFAULT_NAME=gemini-3.8-flash
 # For MODEL_PROVIDER=vertex_ai also export PROJECT_ID, LITELLM_KSA_NAME,
 # LITELLM_GSA_NAME, VERTEX_PROJECT_ID, and VERTEX_LOCATION — the vertex overlay
 # renders the gateway's Workload Identity ServiceAccount from them.
