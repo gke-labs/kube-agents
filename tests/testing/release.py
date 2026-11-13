@@ -493,7 +493,7 @@ def create_mock_go_binary(bin_dir, log_file=None, fail_build=False):
     log_path = log_file if log_file else (bin_path / "go.log")
     build_exit = "exit 1" if fail_build else ""
     content = f"""#!/bin/sh
-echo "GOOS=$GOOS GOARCH=$GOARCH CGO_ENABLED=$CGO_ENABLED GOFLAGS=$GOFLAGS go $@" >> "{log_path}"
+echo "GOOS=$GOOS GOARCH=$GOARCH CGO_ENABLED=$CGO_ENABLED GOFLAGS=$GOFLAGS GOTOOLCHAIN=$GOTOOLCHAIN go $@" >> "{log_path}"
 if [ "$1" = "build" ]; then
   {build_exit}
   out=""

@@ -234,6 +234,10 @@ class PackageReleaseBundleTest(unittest.TestCase):
             self.assertIn(zip_path.name, checksums_content)
             self.assertIn(chart_path.name, checksums_content)
             self.assertIn(spdx_fs.name, checksums_content)
+            # The k8s-api-proxy archives are staged with the bundle, so the checksums cover them.
+            proxy_archive = dist_dir / f"k8s-api-proxy_{MOCK_RELEASE_BUNDLE_VERSION}_linux_amd64.tar.gz"
+            self.assertTrue(proxy_archive.exists(), f"{proxy_archive.name} missing from {dist_dir}")
+            self.assertIn(proxy_archive.name, checksums_content)
             self.assertNotIn("checksums.txt", checksums_content)
 
     def test_idempotent_rerun(self):

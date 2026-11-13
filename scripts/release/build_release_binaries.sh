@@ -6,19 +6,18 @@
 # GitHub Release cover the archives like every other asset.
 #
 # Usage: ./scripts/release/build_release_binaries.sh <TAG_NAME>
-#   DIST_DIR        where the archives go (default: build/dist)
-#   RELEASE_COMMIT  the commit to build (default: the commit the tag points to)
+#   DIST_DIR           where the archives go (default: build/dist)
+#   RELEASE_COMMIT     the commit to build (default: the commit the tag points to)
+#   RELEASE_REPO_ROOT  the repository to build from (default: this checkout)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CALLER_REPO_ROOT="${REPO_ROOT:-}"
-
 # shellcheck source=scripts/release/common.sh
 source "${SCRIPT_DIR}/common.sh"
 
-# common.sh points REPO_ROOT at this script's checkout; a caller's REPO_ROOT,
-# naming the repository to build from, wins over it.
-REPO_ROOT="${CALLER_REPO_ROOT:-${REPO_ROOT}}"
+# common.sh points REPO_ROOT at this script's checkout. A variable of its own
+# rather than an inherited REPO_ROOT, which every other release script ignores.
+REPO_ROOT="${RELEASE_REPO_ROOT:-${REPO_ROOT}}"
 
 # The Go module each binary is built from, and its main package within it.
 readonly BINARY_NAME="k8s-api-proxy"
@@ -35,6 +34,9 @@ readonly BINARY_PLATFORMS=(
 # The same flags deploy/kube-proxy/Dockerfile builds the image's binary with,
 # plus -trimpath so the binary carries no runner path.
 readonly BINARY_LDFLAGS="-s -w"
+# The toolchain already installed, as the Dockerfile sets: a release commit
+# needing a newer one fails rather than downloads one mid-release.
+readonly BINARY_GOTOOLCHAIN="local"
 # Files copied beside the binary in each archive, relative to the repository root.
 readonly BINARY_ARCHIVE_FILES=(
   "LICENSE"
@@ -61,9 +63,12 @@ else
   commit_sha="$(cd "${REPO_ROOT}" && resolve_release_commit "${TAG_NAME}")"
 fi
 
-if ! git -C "${REPO_ROOT}" cat-file -e "${commit_sha}:${BINARY_MODULE_DIR}/go.mod" 2>/dev/null; then
-  # A patch on a release line cut before the module existed ships no binary.
-  echo "ℹ️ ${BINARY_MODULE_DIR}/go.mod does not exist at ${commit_sha:0:7}; no ${BINARY_NAME} binaries for ${TAG_NAME}."
+# A patch on a release line cut before the binary's main package existed (the
+# module landed in 0.21, cmd/k8s-api-proxy in 0.24) ships no binary. Skipped
+# rather than failed: the GA tag is already public when the bundle is built.
+main_package_path="${BINARY_MODULE_DIR}/${BINARY_MAIN_PACKAGE#./}"
+if ! git -C "${REPO_ROOT}" cat-file -e "${commit_sha}:${main_package_path}" 2>/dev/null; then
+  echo "ℹ️ ${main_package_path} does not exist at ${commit_sha:0:7}; no ${BINARY_NAME} binaries for ${TAG_NAME}."
   exit 0
 fi
 
@@ -99,7 +104,7 @@ for platform in "${BINARY_PLATFORMS[@]}"; do
   echo "==> ${goos}/${goarch}"
   (
     cd "${source_dir}/${BINARY_MODULE_DIR}"
-    CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" GOFLAGS=-mod=readonly \
+    CGO_ENABLED=0 GOOS="${goos}" GOARCH="${goarch}" GOFLAGS=-mod=readonly GOTOOLCHAIN="${BINARY_GOTOOLCHAIN}" \
       go build -trimpath -ldflags="${BINARY_LDFLAGS}" -o "${stage}/${BINARY_NAME}" "${BINARY_MAIN_PACKAGE}"
   )
   if [ ! -f "${stage}/${BINARY_NAME}" ]; then

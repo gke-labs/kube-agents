@@ -48,7 +48,7 @@ class BuildReleaseBinariesTest(unittest.TestCase):
             env=get_isolated_test_env(
                 overrides={
                     "PATH": str(self.bin_dir),
-                    "REPO_ROOT": self.repo_dir,
+                    "RELEASE_REPO_ROOT": self.repo_dir,
                     "DIST_DIR": str(self.dist),
                     **(env or {}),
                 },
@@ -56,12 +56,14 @@ class BuildReleaseBinariesTest(unittest.TestCase):
             cwd=self.repo_dir,
         )
 
-    def _commit_module_and_tag(self):
+    def _commit_module_and_tag(self, with_main=True):
         root = pathlib.Path(self.repo_dir)
         module = root / "k8s-api-proxy"
-        (module / "cmd" / "k8s-api-proxy").mkdir(parents=True)
+        module.mkdir()
         (module / "go.mod").write_text("module github.com/gke-labs/kube-agents/k8s-api-proxy\n")
-        (module / "cmd" / "k8s-api-proxy" / "main.go").write_text("package main\n\nfunc main() {}\n")
+        if with_main:
+            (module / "cmd" / "k8s-api-proxy").mkdir(parents=True)
+            (module / "cmd" / "k8s-api-proxy" / "main.go").write_text("package main\n\nfunc main() {}\n")
         (module / "README.md").write_text(_README_AT_RELEASE)
         (root / "LICENSE").write_text("Apache License\n")
         self.git("add", ".")
@@ -109,7 +111,7 @@ class BuildReleaseBinariesTest(unittest.TestCase):
         self.assertEqual(len(builds), len(_PLATFORMS))
         for line, platform in zip(builds, _PLATFORMS):
             goos, goarch = platform.split("/")
-            self.assertIn(f"GOOS={goos} GOARCH={goarch} CGO_ENABLED=0 GOFLAGS=-mod=readonly", line)
+            self.assertIn(f"GOOS={goos} GOARCH={goarch} CGO_ENABLED=0 GOFLAGS=-mod=readonly GOTOOLCHAIN=local", line)
             self.assertIn("-trimpath", line)
             self.assertIn("-ldflags=-s -w", line)
             self.assertIn("./cmd/k8s-api-proxy", line)
@@ -141,6 +143,15 @@ class BuildReleaseBinariesTest(unittest.TestCase):
         proc = self._run([MOCK_TARGET_RELEASE_TAG], env={"CI": "true"}, with_go=False)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("no k8s-api-proxy binaries", proc.stdout)
+        self.assertFalse(self.dist.exists() and any(self.dist.iterdir()))
+
+    def test_skips_a_module_without_the_main_package(self):
+        # Lines 0.21 to 0.23 carry the module but not cmd/k8s-api-proxy.
+        self._commit_module_and_tag(with_main=False)
+
+        proc = self._run([MOCK_TARGET_RELEASE_TAG], env={"CI": "true"}, with_go=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("k8s-api-proxy/cmd/k8s-api-proxy does not exist", proc.stdout)
         self.assertFalse(self.dist.exists() and any(self.dist.iterdir()))
 
     def test_go_is_mandatory_in_ci(self):
