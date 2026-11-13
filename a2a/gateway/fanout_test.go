@@ -161,6 +161,7 @@ func childEndedLogged(t *testing.T, r *rig, childID string) {
 // result or its end and reason. The root's terminal is told once, at the
 // wake's end, and no child carries a chain end.
 func TestAFanOutWakesOnceWithEveryResult(t *testing.T) {
+	t.Parallel()
 	r, spawn, obs := startFanOutRig(t, 3)
 	ctx := context.Background()
 	conv := "discord:g1/t-fanout-wake"
@@ -243,6 +244,7 @@ func TestAFanOutWakesOnceWithEveryResult(t *testing.T) {
 // text, so a fan-out's wake is no larger than a single child's; the room
 // still has every result whole.
 func TestAFanOutWakeCutsEachResultToItsShare(t *testing.T) {
+	t.Parallel()
 	r, spawn := startBatchRig(t, 2)
 	conv := "discord:g1/t-fanout-cut"
 	f := fanOut(t, r, spawn, conv, platformTask("one"), platformTask("two"))
@@ -283,6 +285,7 @@ func TestAFanOutWakeCutsEachResultToItsShare(t *testing.T) {
 // children run, so a stop reaches it; once stopped, no child's end wakes the
 // session, and the chain ends once, canceled, when the last child ends.
 func TestAStoppedFanOutWakesNothing(t *testing.T) {
+	t.Parallel()
 	r, spawn, obs := startFanOutRig(t, 2)
 	ctx := context.Background()
 	conv := "discord:g1/t-fanout-stop"
@@ -311,6 +314,7 @@ func TestAStoppedFanOutWakesNothing(t *testing.T) {
 // children end the chain canceled with no wake, and one canceled beside one
 // completed wakes once, the canceled one shown as stopped.
 func TestACanceledChildCountsAsEnded(t *testing.T) {
+	t.Parallel()
 	cancelChild := func(t *testing.T, r *rig, conv string, f fannedOut, i int) {
 		putRecord(t, r, conv, func(rec *SessionRecord) { rec.MarkCanceled(f.kids[i].ID) })
 		publishFinal(t, r, f.envs[i], targetPlatform, lib.StateCanceled, "stopped")
@@ -352,6 +356,7 @@ func TestACanceledChildCountsAsEnded(t *testing.T) {
 // question for the session to ask once. Its later canceled terminal posts
 // nothing and wakes nothing.
 func TestAFanOutChildsQuestionIsItsResult(t *testing.T) {
+	t.Parallel()
 	r, spawn := startBatchRig(t, 2)
 	ctx := context.Background()
 	conv := "discord:g1/t-fanout-ask"
@@ -402,6 +407,7 @@ func TestAFanOutChildsQuestionIsItsResult(t *testing.T) {
 // delegation, so a child's question pauses the conversation as it always
 // has: posted to the room, and the child left running.
 func TestABatchOfOneStillPausesOnAQuestion(t *testing.T) {
+	t.Parallel()
 	r, spawn := startBatchRig(t, 3)
 	ctx := context.Background()
 	conv := "discord:g1/t-fanout-ask-one"
@@ -423,6 +429,7 @@ func TestABatchOfOneStillPausesOnAQuestion(t *testing.T) {
 // batch runs lists every child still running by its addressee and target,
 // with its state, and leaves out the ones that ended.
 func TestStatusDuringAFanOutListsTheLiveChildren(t *testing.T) {
+	t.Parallel()
 	r, spawn, _ := startFanOutRig(t, 3)
 	ctx := context.Background()
 	conv := "discord:g1/t-fanout-status"
@@ -463,6 +470,7 @@ func TestStatusDuringAFanOutListsTheLiveChildren(t *testing.T) {
 // for is not something to guess. The notice counts the children still
 // running.
 func TestASteerDuringAFanOutIsRefused(t *testing.T) {
+	t.Parallel()
 	r, spawn := startBatchRig(t, 3)
 	conv := "discord:g1/t-fanout-steer"
 	f := fanOut(t, r, spawn, conv, platformTask("one"), platformTask("two"), platformTask("three"))
@@ -562,6 +570,7 @@ func TestChainLastFindsAFanOutsWake(t *testing.T) {
 // gateway restarted before the chain's end still frames that end with
 // cardsPending.
 func TestTheCardsPendingMarkSurvivesARestart(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	r.adapter.setTakesTerminals()
 	conv := consoleKeyPrefix + "t-cards-restart"
@@ -599,6 +608,7 @@ func TestTheCardsPendingMarkSurvivesARestart(t *testing.T) {
 // the other two, and only those, on the next gateway; the parent's link
 // list and the record are whole.
 func TestABatchCutShortByARestartFinishesOnRedelivery(t *testing.T) {
+	t.Parallel()
 	r, spawn := startBatchRig(t, 3)
 	ctx := context.Background()
 	conv := "discord:g1/t-fanout-restart"
@@ -651,6 +661,7 @@ func TestABatchCutShortByARestartFinishesOnRedelivery(t *testing.T) {
 // was cut short has the children already on the bus canceled when the
 // request comes back, rather than the rest minted.
 func TestABatchCutShortThenStoppedIsWithdrawn(t *testing.T) {
+	t.Parallel()
 	r, spawn := startBatchRig(t, 2)
 	ctx := context.Background()
 	conv := "discord:g1/t-fanout-restart-stop"
@@ -694,6 +705,7 @@ func TestABatchCutShortThenStoppedIsWithdrawn(t *testing.T) {
 // the relay never delivered them (the gateway was down); the next turn's
 // heal finds each, and the last wakes the session once with every result.
 func TestAHealFinishesAFanOut(t *testing.T) {
+	t.Parallel()
 	r, spawn := startBatchRig(t, 2)
 	conv := "discord:g1/t-fanout-heal"
 	f := fanOut(t, r, spawn, conv, platformTask("one"), platformTask("two"))
@@ -722,6 +734,7 @@ func TestAHealFinishesAFanOut(t *testing.T) {
 // cancel couldn't be published keeps that child on the record. Its end is
 // the chain's: the root is told once, canceled, and nothing wakes.
 func TestAWithdrawnBatchWithAKeptChildEndsItsChainOnce(t *testing.T) {
+	t.Parallel()
 	r, spawn, obs := startFanOutRig(t, 2)
 	ctx := context.Background()
 	conv := "discord:g1/t-fanout-withdrawn-kept"
@@ -751,6 +764,7 @@ func TestAWithdrawnBatchWithAKeptChildEndsItsChainOnce(t *testing.T) {
 // TestAWithdrawnBatchWakesNothing: a withdrawn batch's last child ends the
 // chain canceled with no wake, even one the gateway never stopped.
 func TestAWithdrawnBatchWakesNothing(t *testing.T) {
+	t.Parallel()
 	r, spawn := startBatchRig(t, 2)
 	rec := &SessionRecord{Key: "discord:g1/t-withdrawn-unit", Tasks: []TaskRef{
 		{ID: "p", BatchSize: 2, Children: []string{"k1"}, DelegationEnd: notStartedEnd(whyChildOffBus)},
@@ -787,6 +801,7 @@ func TestAFanOutWakeFencesEachResult(t *testing.T) {
 // request the plan recorded: nothing more is minted, and the child already
 // on the bus is canceled.
 func TestARedeliveredBatchOfAnotherSizeIsWithdrawn(t *testing.T) {
+	t.Parallel()
 	r, spawn := startBatchRig(t, 3)
 	ctx := context.Background()
 	conv := "discord:g1/t-fanout-resize"
@@ -818,6 +833,7 @@ func TestARedeliveredBatchOfAnotherSizeIsWithdrawn(t *testing.T) {
 // delegating turn's own terminal on the next gateway reads the request back
 // from the stream and finishes the batch.
 func TestABatchCutShortFinishesFromTheStream(t *testing.T) {
+	t.Parallel()
 	r, spawn := startBatchRig(t, 3)
 	ctx := context.Background()
 	conv := "discord:g1/t-fanout-fold"
@@ -845,6 +861,7 @@ func TestABatchCutShortFinishesFromTheStream(t *testing.T) {
 // handed work to cards, found by the heal, marks the chain's root, so the
 // wake's end frames with cardsPending.
 func TestAHealedConsoleFanOutSaysCardsPending(t *testing.T) {
+	t.Parallel()
 	r, spawn := startBatchRig(t, 2)
 	r.adapter.setTakesTerminals()
 	conv := consoleKeyPrefix + "t-fanout-heal-cards"
@@ -876,6 +893,7 @@ func TestAHealedConsoleFanOutSaysCardsPending(t *testing.T) {
 // TestTheHealLeavesAnEndedChildAlone: a child whose end the relay already
 // delivered is not healed again: no second status card for it.
 func TestTheHealLeavesAnEndedChildAlone(t *testing.T) {
+	t.Parallel()
 	r, spawn := startBatchRig(t, 2)
 	conv := "discord:g1/t-fanout-heal-once"
 	f := fanOut(t, r, spawn, conv, platformTask("one"), platformTask("two"))
@@ -900,6 +918,7 @@ func TestTheHealLeavesAnEndedChildAlone(t *testing.T) {
 // profile with no parameters is named in the wake by the cluster its pin
 // resolved to.
 func TestAPinnedChildIsNamedByItsResolvedTarget(t *testing.T) {
+	t.Parallel()
 	r, spawn, _ := startFanOutRig(t, 2)
 	r.g.profiles.put("prod-east", &lib.AgentCard{Name: "prod-east", Parameters: clusterParams,
 		ClusterRef: &lib.ClusterRef{ProjectID: "p1", Location: "us-east1", Cluster: "prod"}})
@@ -914,6 +933,7 @@ func TestAPinnedChildIsNamedByItsResolvedTarget(t *testing.T) {
 // for input counts as ended whether or not its cancel went out: it doesn't
 // hold the conversation's one live delegation, and the wake still runs.
 func TestAQuestionWhoseCancelFailsStillEndsTheChild(t *testing.T) {
+	t.Parallel()
 	r, spawn := startBatchRig(t, 2)
 	ctx := context.Background()
 	conv := "discord:g1/t-fanout-ask-nocancel"
@@ -933,6 +953,7 @@ func TestAQuestionWhoseCancelFailsStillEndsTheChild(t *testing.T) {
 // TestALongQuestionIsCutAndSaysSo: a question over its share is cut, and
 // the wake says it was posted nowhere else, so the session asks again.
 func TestALongQuestionIsCutAndSaysSo(t *testing.T) {
+	t.Parallel()
 	r, spawn := startBatchRig(t, 2)
 	conv := "discord:g1/t-fanout-ask-long"
 	f := fanOut(t, r, spawn, conv, platformTask("one"), platformTask("two"))
