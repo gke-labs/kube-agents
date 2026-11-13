@@ -649,9 +649,11 @@ MAX_READ_CHARS_FACTOR = 6
 MAX_READ_CHARS_FLOOR = 65536
 READ_COST_CHARS = 16
 # A script that stood in double quotes keeps the backslash ahead of a `$` or a
-# backtick; the shell that runs the script reads them as a substitution's start.
-SCRIPT_ESCAPED_SUBSTITUTION_RE = re.compile(r"\\([$`])")
-SCRIPT_ESCAPED_SUBSTITUTION_REPLACEMENT = r"\1"
+# backtick; the shell that runs the script reads them as a substitution's
+# start. A backslash that another backslash escapes is no such backslash: in
+# `"\\$(env)"` the pair is one literal backslash and the `$(` is live.
+SCRIPT_ESCAPED_SUBSTITUTION_RE = re.compile(r"(?<!\\)((?:\\\\)*)\\([$`])")
+SCRIPT_ESCAPED_SUBSTITUTION_REPLACEMENT = r"\1\2"
 SHELL_BACKTICK = "`"
 SUBSHELL_OPEN = "("
 SUBSHELL_CLOSE = ")"

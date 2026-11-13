@@ -885,6 +885,8 @@ class TestSecretReadDetector(unittest.TestCase):
         'kubectl exec p -- sh -c "echo \\"\\$(env)\\""',
         'ssh host "curl -H \\"Authorization: Bearer \\$(gcloud auth print-access-token)\\" https://x"',
         'bash -c "echo \\`env\\`"',
+        # a backslash that another backslash escapes leaves the `$(` behind it live
+        'bash -c \'echo "\\\\$(env)"\'',
         # a quoted script of one word: it holds a shell operator or a backtick and no blank
         "ssh host 'env|sort'",
         "ssh host 'ls;env'",
