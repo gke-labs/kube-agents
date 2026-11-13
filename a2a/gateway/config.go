@@ -35,6 +35,15 @@ const defaultMaxSessions = 10
 // field's comment carries the rationale.
 const defaultDelegationDepthMax = 3
 
+// defaultDelegationWidthMax is what DelegationWidthMax means when unset; the
+// field's comment carries the rationale.
+const defaultDelegationWidthMax = 1
+
+// delegationWidthBuiltMax is the widest A2A_DELEGATION_WIDTH_MAX FromEnv
+// accepts: one, until a batch's aggregated wake and its stop are built
+// (#5682). Raising it is what turns fan-out on.
+const delegationWidthBuiltMax = 1
+
 // defaultScopeFile is where the operator projects the install's rendered
 // spec.scope into the gateway pod: the same scope.json, at the same path, the
 // platform agent reads.
@@ -650,6 +659,22 @@ type Config struct {
 	// (A2A_DELEGATE_TOOL on the worker side), not a typo to paper over.
 	DelegationDepthMax int
 
+	// DelegationWidthMax bounds how many children one delegation may ask
+	// for (A2A_DELEGATION_WIDTH_MAX): a session's batch of more is refused
+	// whole, with a notice naming the bound. Each turn's delegateTargets
+	// part advertises it when over one, and the session's tool offers a
+	// batch only then. Width bounds what one conversation asks for, not
+	// what runs at once: the dispatcher queues children to each profile's
+	// concurrency.
+	//
+	// Zero means 1, a single child. FromEnv accepts only 1 for now: a batch's
+	// children can't yet be stopped together, and each would wake the
+	// session on its own, so an operator can't turn fan-out on until its
+	// results and stop are built (delegationWidthBuiltMax). Tests and
+	// embedders that build Config directly may set more, to exercise the
+	// mint. FromEnv also refuses a value under 1, as it does the depth bound.
+	DelegationWidthMax int
+
 	// ScopeFile is the rendered spec.scope a profile task's target is
 	// checked against (A2A_SCOPE_FILE; checkTargetScope). It is read per
 	// routed task, so an edit reaches the gateway without a restart. A
@@ -953,6 +978,15 @@ func FromEnv() (*Config, error) {
 		return nil, fmt.Errorf("A2A_DELEGATION_DEPTH_MAX %q: need an integer >= 1", depthMax)
 	}
 	cfg.DelegationDepthMax = dm
+	widthMax := envOr("A2A_DELEGATION_WIDTH_MAX", strconv.Itoa(defaultDelegationWidthMax))
+	wm, err := strconv.Atoi(widthMax)
+	if err != nil || wm < 1 || wm > lib.DelegateBatchMax {
+		return nil, fmt.Errorf("A2A_DELEGATION_WIDTH_MAX %q: need an integer from 1 to %d", widthMax, lib.DelegateBatchMax)
+	}
+	if wm > delegationWidthBuiltMax {
+		return nil, fmt.Errorf("A2A_DELEGATION_WIDTH_MAX %q: at most %d for now; fan-out's results and stop are not built yet (#5682)", widthMax, delegationWidthBuiltMax)
+	}
+	cfg.DelegationWidthMax = wm
 	busyAt := envOr(busyNoticeAtEnv, strconv.Itoa(defaultBusyNoticeAt))
 	ba, err := strconv.Atoi(busyAt)
 	if err != nil || ba < 1 {

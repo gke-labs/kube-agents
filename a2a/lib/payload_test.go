@@ -404,3 +404,106 @@ func TestTaskParametersChangeRequestedRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+// A batch rides the optional tasks list, beside the single fields, and a
+// request without one is the single shape on the wire, byte for byte.
+func TestADelegateBatchRoundTripsAndTheSingleShapeIsUnchanged(t *testing.T) {
+	data, err := json.Marshal(DelegateRequest{Tasks: []DelegateTask{
+		{Addressee: "cluster", Text: "look at dev", Parameters: map[string]string{"cluster": "dev"}},
+		{Addressee: "platform", Text: "and the fleet"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `{"tasks":[{"addressee":"cluster","text":"look at dev","parameters":{"cluster":"dev"}},{"addressee":"platform","text":"and the fleet"}]}`
+	if string(data) != want {
+		t.Fatalf("wire = %s\nwant   %s", data, want)
+	}
+	var got DelegateRequest
+	if err := json.Unmarshal(data, &got); err != nil || len(got.Tasks) != 2 || got.Tasks[0].Parameters["cluster"] != "dev" {
+		t.Fatalf("decoded %+v, %v", got, err)
+	}
+	single, _ := json.Marshal(DelegateRequest{Addressee: "platform", Text: "do it"})
+	if string(single) != `{"addressee":"platform","text":"do it"}` {
+		t.Fatalf("single wire = %s", single)
+	}
+}
+
+// DelegateEntries is the request as entries to mint: one for the single
+// shape, each batch entry for a batch.
+func TestDelegateEntriesReadsEitherShape(t *testing.T) {
+	single := DelegateRequest{Addressee: "platform", Text: "x", Parameters: map[string]string{"a": "b"}}
+	if got := single.Entries(); len(got) != 1 || got[0].Addressee != "platform" || got[0].Text != "x" || got[0].Parameters["a"] != "b" {
+		t.Fatalf("single entries = %+v", got)
+	}
+	batch := DelegateRequest{Tasks: []DelegateTask{{Addressee: "a", Text: "1"}, {Addressee: "b", Text: "2"}}}
+	if got := batch.Entries(); len(got) != 2 || got[1].Addressee != "b" {
+		t.Fatalf("batch entries = %+v", got)
+	}
+	if !batch.IsBatch() || single.IsBatch() {
+		t.Fatal("IsBatch reads the wrong shape")
+	}
+}
+
+func TestValidateDelegateRequest(t *testing.T) {
+	entry := DelegateTask{Addressee: "platform", Text: "x"}
+	many := make([]DelegateTask, DelegateBatchMax+1)
+	for i := range many {
+		many[i] = entry
+	}
+	for name, tc := range map[string]struct {
+		req  DelegateRequest
+		want string
+	}{
+		"the single shape":         {req: DelegateRequest{Addressee: "platform", Text: "x"}},
+		"a batch at the ceiling":   {req: DelegateRequest{Tasks: many[:DelegateBatchMax]}},
+		"both shapes set":          {req: DelegateRequest{Addressee: "platform", Text: "x", Tasks: []DelegateTask{entry}}, want: "either"},
+		"parameters beside tasks":  {req: DelegateRequest{Parameters: map[string]string{"a": "b"}, Tasks: []DelegateTask{entry}}, want: "either"},
+		"an empty batch":           {req: DelegateRequest{Tasks: []DelegateTask{}}, want: "empty"},
+		"a batch over the ceiling": {req: DelegateRequest{Tasks: many}, want: fmt.Sprintf("at most %d", DelegateBatchMax)},
+		"an entry over the cap": {req: DelegateRequest{Tasks: []DelegateTask{entry, {Addressee: "platform", Text: strings.Repeat("x", DelegateTextCap+1)}}},
+			want: "task 2"},
+		"an entry with blank text": {req: DelegateRequest{Tasks: []DelegateTask{entry, {Addressee: "platform", Text: " "}}}, want: "task 2"},
+		"single text over the cap": {req: DelegateRequest{Addressee: "platform", Text: strings.Repeat("x", DelegateTextCap+1)}, want: "too long"},
+		"single blank text":        {req: DelegateRequest{Addressee: "platform", Text: " "}, want: "text"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := ValidateDelegateRequest(tc.req)
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("refused: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want one naming %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// The width a turn may fan out to rides the delegateTargets part, absent
+// meaning one, and is held to the batch ceiling like everything else there.
+func TestDelegateTargetsCarryTheWidth(t *testing.T) {
+	want := DelegateTargets{Targets: []DelegateTarget{{Name: "platform"}}, WidthMax: 4}
+	part, err := DelegateTargetsPart(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := DelegateTargetsOf([]Part{part})
+	if err != nil || !ok || got.WidthMax != 4 || got.Width() != 4 {
+		t.Fatalf("got %+v ok=%v err=%v", got, ok, err)
+	}
+	if w := (DelegateTargets{}).Width(); w != 1 {
+		t.Fatalf("absent width = %d, want 1", w)
+	}
+	plain, _ := DelegateTargetsPart(DelegateTargets{Targets: []DelegateTarget{{Name: "platform"}}})
+	if strings.Contains(string(plain.Data), "widthMax") {
+		t.Fatalf("an unset width is on the wire: %s", plain.Data)
+	}
+	for _, w := range []int{-1, DelegateBatchMax + 1} {
+		if _, err := DelegateTargetsPart(DelegateTargets{Targets: []DelegateTarget{}, WidthMax: w}); err == nil {
+			t.Errorf("width %d accepted", w)
+		}
+	}
+}

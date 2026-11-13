@@ -345,3 +345,21 @@ func TestAFreshIncarnationPastTheCapSendsNoList(t *testing.T) {
 		t.Fatal("a fresh incarnation past the cap carried a list; want none, so the tool names platform")
 	}
 }
+
+// The turn's part advertises the delegation width only when it is over one,
+// so at the default the part is what it was before batches, and a session's
+// tool offers the single shape.
+func TestDelegateTargetsAdvertiseAWidthOverOne(t *testing.T) {
+	d := newProfileDirectory()
+	r := TaskRequester{Backend: "discord", Subject: "u1"}
+	for _, tc := range []struct{ width, want int }{{0, 0}, {1, 0}, {10, 10}} {
+		g := &Gateway{cfg: &Config{DelegationWidthMax: tc.width}}
+		got := g.delegateTargets(r, nil, false, d)
+		if got.WidthMax != tc.want {
+			t.Errorf("width %d: advertised %d, want %d", tc.width, got.WidthMax, tc.want)
+		}
+		if _, err := lib.DelegateTargetsPart(got); err != nil {
+			t.Errorf("width %d: the list doesn't build a part: %v", tc.width, err)
+		}
+	}
+}

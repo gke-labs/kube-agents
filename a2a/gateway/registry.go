@@ -352,15 +352,20 @@ type TaskRef struct {
 	// wake turn is started on the child's terminal and names the child. Depth
 	// counts delegations: a child's is its parent's plus one, a wake inherits
 	// its child's, and a turn at the bound may not delegate again. Children
-	// is a slice although one child runs at a time, so fan-out is one
-	// condition later rather than a record migration. Role, ParentTaskID and
+	// holds every child the turn's request minted: one, or each of a batch
+	// (mintBatch). Role, ParentTaskID and
 	// Depth are empty on a human turn, and Children is empty on one that did
 	// not delegate; all four are empty on entries written before they
 	// existed.
 	// StatusMsgID is the rolling-line message of a turn that delegated:
 	// the child takes ActiveTask, and with it the only other copy, so the
-	// parent's line is kept here to close on the parent's terminal.
-	StatusMsgID  string   `json:"statusMsgId,omitempty"`
+	// parent's line is kept here to close on the parent's terminal. A batch
+	// child, which never takes ActiveTask, keeps its own line here too.
+	StatusMsgID string `json:"statusMsgId,omitempty"`
+	// LineNote is a batch child's "(delegated to <addressee>)" note, kept
+	// with its line because the child never holds the active task, whose
+	// LineNote the single-child path reads.
+	LineNote     string   `json:"lineNote,omitempty"`
 	Role         string   `json:"role,omitempty"`
 	ParentTaskID string   `json:"parentTaskId,omitempty"`
 	Children     []string `json:"children,omitempty"`
