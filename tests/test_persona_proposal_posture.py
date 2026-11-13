@@ -136,6 +136,7 @@ class PlatformPersonaProposesInTheReply(unittest.TestCase):
         for phrase in (
             "Nor does a card add a deliverable the user did not ask for.",
             "only when the user's words asked for it, and then word for word",
+            "a create or change card's own pull request, above, stays",
             "never \"and any remediation PRs required by the SOP\"",
         ):
             with self.subTest(phrase=phrase):
