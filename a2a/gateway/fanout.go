@@ -423,6 +423,10 @@ const (
 	noticeFanOutSteer = "⚠️ %d delegated tasks are running. Say stop to cancel them."
 	// noticeFanOutSteerOne is noticeFanOutSteer for one.
 	noticeFanOutSteerOne = "⚠️ 1 delegated task is running. Say stop to cancel it."
+	// noticeSessionOnDuringFanOut answers a bare /session while a batch
+	// runs: a message meanwhile is refused (refuseFanOutSteer), not a steer,
+	// so it is the one after the batch's wake that opens the pod.
+	noticeSessionOnDuringFanOut = "🧵 session route on — %d delegated tasks are running, and a message sent meanwhile is not passed on (say `stop` to cancel them); once they and the reply to their results finish, the next message opens a session pod; `/session off` returns to `%s`"
 )
 
 // The state words a status gives a running child.

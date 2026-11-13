@@ -1123,3 +1123,52 @@ func TestAWithdrawnBatchsKeptChildOutlivesTheHistoryCap(t *testing.T) {
 		t.Fatal("a withdrawn batch woke the session")
 	}
 }
+
+// TestASessionCommandSteerDuringAFanOutIsRefused: "/session <text>" on a
+// session-routed conversation whose batch runs is a steer like any other
+// text, so it is refused the same way: nothing reaches the parent's ended
+// turn.
+func TestASessionCommandSteerDuringAFanOutIsRefused(t *testing.T) {
+	t.Parallel()
+	r, spawn := startBatchRig(t, 2)
+	conv := "discord:g1/t-fanout-session-steer"
+	f := fanOut(t, r, spawn, conv, platformTask("one"), platformTask("two"))
+	sessionRigTurn(r, conv, "steer-1", "/session also check memory")
+	waitFor(t, "the refusal", postedContaining(r, fmt.Sprintf(noticeFanOutSteer, 2)))
+	for _, e := range inSubjectEnvelopes(t, r.url, f.session) {
+		if e.Kind == lib.KindMessage && e.TaskID == f.origin.TaskID && strings.Contains(envText(t, e), "memory") {
+			t.Fatal("the steer reached the parent's turn")
+		}
+	}
+	if len(spawn.calls()) != 1 {
+		t.Fatal("the steer started a turn")
+	}
+}
+
+// TestABareSessionCommandDuringAFanOutIsTruthful: a bare "/session" on a
+// conversation not yet session-routed while a batch runs doesn't promise
+// that the next message reaches a running task: it says the delegated tasks
+// run and that a message meanwhile is not sent.
+func TestABareSessionCommandDuringAFanOutIsTruthful(t *testing.T) {
+	t.Parallel()
+	r, spawn := startBatchRig(t, 2)
+	ctx := context.Background()
+	conv := "discord:g1/t-fanout-bare-session"
+	fanOut(t, r, spawn, conv, platformTask("one"), platformTask("two"))
+	rec, err := r.g.reg.Get(ctx, conv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec.SessionRouted = false
+	if err := r.g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	sessionRigTurn(r, conv, "bare-1", "/session")
+	want := fmt.Sprintf(noticeSessionOnDuringFanOut, 2, "platform")
+	waitFor(t, "the fan-out reply", postedContaining(r, want))
+	for _, p := range r.adapter.postTexts() {
+		if strings.Contains(p, "the running task finishes first") {
+			t.Fatalf("a bare /session promised a running task during a fan-out: %s", p)
+		}
+	}
+}

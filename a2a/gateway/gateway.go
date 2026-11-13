@@ -2567,7 +2567,14 @@ func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg In
 		rec.Profile = sessionProfile
 	}
 	g.log.Info("session route on", "conversation", rec.Key, "firstTurn", rest != "", "taskRunning", running)
+	fanOutRunning := running && rec.fanOutPending(rec.ActiveTask.TaskID)
 	switch {
+	case rest == "" && fanOutRunning:
+		// A message while the batch runs is refused, not a steer, so the
+		// running-task promise below would be false.
+		parent, _ := rec.TaskRefFor(rec.ActiveTask.TaskID)
+		g.post(rec.Key, fmt.Sprintf(noticeSessionOnDuringFanOut, rec.batchLeft(parent), g.cfg.DefaultAddressee))
+		return true
 	case rest == "" && running:
 		// Truthful about the order: the next message steers the running
 		// task (the steer case below), so it is the one after the task
@@ -2576,6 +2583,12 @@ func (g *Gateway) sessionCommand(ctx context.Context, rec *SessionRecord, msg In
 		return true
 	case rest == "":
 		g.post(rec.Key, sessionOnAck(backend, rec.Kind, conversationIsOwnThread(backend, rec.Key), g.cfg.DefaultAddressee))
+		return true
+	case fanOutRunning && rec.AddressedToOwnSession():
+		// The steer case's text during a batch: refused as a plain message
+		// is (routeTurn), never steered into the parent's ended turn.
+		parent, _ := rec.TaskRefFor(rec.ActiveTask.TaskID)
+		g.refuseFanOutSteer(rec, parent)
 		return true
 	case running && rec.AddressedToOwnSession():
 		// Already on the route with its own task running: the text is what
