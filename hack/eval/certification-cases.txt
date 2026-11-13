@@ -72,11 +72,12 @@
 # reads a CA bundle's notAfter; the gap is #4960.
 ./tasks/security-expiring-node-bootstrap-and-webhook-certs/task.yaml
 # Capability row: security, Workload Identity, RBAC and CVEs; the compliance
-# audit on a fail-closed admission webhook whose backend Service does not exist
-# (the planted ValidatingWebhookConfiguration strict-policy-webhook, failurePolicy
-# Fail on an inert group, its clientConfig.service in a namespace nothing
-# creates). A declared gap, expected_fail: no compliance check reads an
-# admission webhook configuration; the gap is #5335.
+# audit names a fail-closed admission webhook whose backend Service does not
+# exist (the planted ValidatingWebhookConfiguration strict-policy-webhook,
+# failurePolicy Fail on an inert group, its clientConfig.service in a namespace
+# nothing creates). Check 2.18 files it (#5335 closed); a declared gap,
+# expected_fail, on the ledger cut that drops a major finding's body once the
+# criticals fill the budget; the gap is #5052.
 ./tasks/security-webhook-blocks-config-management-system/task.yaml
 # Capability row: security, Workload Identity, RBAC and CVEs; the compliance
 # audit on a ServiceAccount whose Workload Identity annotation names a Google

@@ -194,3 +194,28 @@ func TestSlackAPIMethodLabelIsClosed(t *testing.T) {
 		}
 	}
 }
+
+// An ask's first-ack time runs from the adapter receiving it to the gateway
+// having drawn its arrival reaction; an adapter that sets no arrival observes
+// nothing.
+func TestAnAsksFirstAckIsTimedFromItsArrival(t *testing.T) {
+	r := startSlackGateRig(t, []string{"U1"}, false)
+	r.adapter.inbox <- InboundMessage{Conversation: "slack:D1", Kind: "dm", AuthorID: "U1", MessageID: "1.0",
+		Text: "why is checkout slow?", ArrivedAt: time.Now().Add(-2 * time.Second)}
+	r.awaitTask(t, "platform")
+	h := r.g.metrics.slackFirstAckSecs.WithLabelValues()
+	waitFor(t, "the first ack observed", func() bool { return histogramCount(t, h) == 1 })
+	var out dto.Metric
+	if err := h.(prometheus.Metric).Write(&out); err != nil {
+		t.Fatal(err)
+	}
+	if sum := out.GetHistogram().GetSampleSum(); sum < 2 {
+		t.Fatalf("first-ack sum = %v, want at least the 2 s since the message arrived", sum)
+	}
+
+	m := NewMetrics()
+	m.slackFirstAck(time.Time{}, time.Now())
+	if got := histogramCount(t, m.slackFirstAckSecs.WithLabelValues()); got != 0 {
+		t.Fatalf("an unset arrival observed %d", got)
+	}
+}

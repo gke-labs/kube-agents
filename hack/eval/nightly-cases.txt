@@ -564,12 +564,12 @@
 ./tasks/upgrades-zonal-control-plane-outage-warned/task.yaml
 
 # The oobe job's first-run audits stage (docs/designs/oobe.md): once the
-# onboarding scan settles, four fleet audits start instead of waiting for their
-# schedules, one after another. The stack arms the stage with two archived
-# stand-in cards, the scan marker and the hand-off's record, and puts back the
-# oobe job the image ships;
-# the verifier reads the Platform Agent's cron runs. Nightly rather than presubmit
-# because each repetition runs four real audits back to back. Off the infra
+# onboarding scan settles, four fleet audits and the upgrade retrospective start
+# instead of waiting for their schedules, one after another. On the lease's fresh
+# install the case grades the install's own chain and arms nothing (on a long-lived
+# install the stack arms a stand-in); the verifier reads the Platform Agent's cron
+# runs. Nightly from its registration; its first repetition waits out the
+# install's own chain, up to about two hours after the fan-out. Off the infra
 # lock (the 2026-10-15 paragraph of nightly-budget-history.txt).
 ./tasks/oobe-first-run-audits/task.yaml
 
@@ -1068,9 +1068,9 @@
 ./tasks/cluster-agent-autopilot-headroom-invariant/task.yaml
 
 # A cluster-wide "what is failing?" question across the seeded fleet: at least
-# one worker runs workload_triage.py, the healthy-cluster worker (seeded-c;
-# seeded-b's kube-system has Unschedulable pods, #5377) finishes without
-# polling, exploring system namespaces, or re-scanning,
+# one worker runs workload_triage.py, the healthy-cluster worker (seeded-b;
+# seeded-c's ComputeClass workloads sit Unschedulable on some pool projects,
+# #5684) finishes without polling, exploring system namespaces, or re-scanning,
 # and the crashloop-workload role's payments-api is still named OOMKilled
 # (#3181). deployer: noop, one fan-out round trip; reads the seeded fleet's
 # crashloop-workload role. `validated: false` until its first observed nightly

@@ -414,8 +414,9 @@ readonly EVAL_SCOPE_READ_ATTEMPTS=3
 readonly UNIT_LOCK_ALLOWANCE_SECONDS=600
 # The longest a unit holding a state lock (unit_state_lock) keeps its stack
 # applied: oobe-first-run-audits' own_wait plus its chain_wait
-# (bench/tf/prebuilt/oobe-first-run-audits/main.tf).
-readonly STATE_LOCK_HOLD_SECONDS=7200
+# (bench/tf/prebuilt/oobe-first-run-audits/main.tf). The stack runs one wait
+# long or the other, never both, but the sum is the bound its test holds.
+readonly STATE_LOCK_HOLD_SECONDS=11400
 # How long a stack-bearing unit that found its state lock busy waits, with the
 # infra lock given back, before it queues for the infra lock again.
 readonly STATE_LOCK_RETRY_SECONDS=30
@@ -1416,7 +1417,7 @@ export BENCH_TF_ROOT="./tf"
 #
 # EVAL_LEDGER_APP_KEY_FILE set: mint an installation token from App 4739812
 # instead, once per fan-out unit, because a token lasts an hour and units
-# launch across the whole run; grading's mint asks for its three reads
+# launch across the whole run; grading's mint asks for its four reads
 # explicitly (LEDGER_GRADING_MINT_BODY), and the ledger reset below mints its
 # own, narrowed to one repository and issues: write. Unset: the mounted PAT stands. A mint that
 # fails after its retries stops the run at preflight and costs a unit its
@@ -1453,12 +1454,14 @@ LEDGER_TOKEN_RENEW_TICK_SECONDS=10
 # After a renewal that failed, the next attempt comes this soon rather than a
 # whole period later, when the token in the file would already be dead.
 LEDGER_TOKEN_RENEW_RETRY_SECONDS=60
-# What the grading mint asks for: the three reads docs/ci-pool-projects.md 5.4
-# documents, requested explicitly so BENCH_GITHUB_TOKEN's reach is pinned at
-# mint rather than inherited from the installation's whole grant -- which,
-# since 2026-09-22, includes issues: write on every pool repository for the
-# ledger reset. An omitted body on this endpoint means "everything granted".
-LEDGER_GRADING_MINT_BODY='{"permissions":{"issues":"read","pull_requests":"read","metadata":"read"}}'
+# What the grading mint asks for: the four reads docs/ci-pool-projects.md 5.4
+# documents (contents: read since #5519, so the github_writes safeguard can
+# list a branch pushed with no pull request behind it), requested explicitly
+# so BENCH_GITHUB_TOKEN's reach is pinned at mint rather than inherited
+# from the installation's whole grant -- which, since 2026-09-22, includes
+# issues: write on every pool repository for the ledger reset. An omitted
+# body on this endpoint means "everything granted".
+LEDGER_GRADING_MINT_BODY='{"permissions":{"issues":"read","pull_requests":"read","contents":"read","metadata":"read"}}'
 # What the agent-pulls reset asks for (reset_agent_pulls, below): pull_requests
 # to close, contents to delete a branch, issues to label an audit pull request
 # before its close. Narrowed to the leased repository at mint, as the ledger
@@ -2037,7 +2040,7 @@ ledger_audit_id_for_task() { # <task.yaml, relative to BENCH_DIR or absolute>
 
 # Every stream lock a case's unit holds: the stream it grades and the ones its
 # task.yaml declares in `audit_streams:` (a case whose stack starts real audit
-# runs; oobe-first-run-audits starts five), read with the YAML parser by
+# runs), read with the YAML parser by
 # kube_agents_bench.audit_streams once before the fan-out. Sorted and each
 # once, so a unit holding several always takes them in the same order and two
 # such units cannot each hold what the other waits on.
@@ -3008,7 +3011,7 @@ export TF_VAR_prow_build_id="${BUILD_ID:-}"
 export TF_VAR_prow_pull_number="${PULL_NUMBER:-}"
 
 # 4. Token & Model Configuration
-# Dynamically fetches API_SERVER_KEY from GKE secret and locks down Gemini 3.1
+# Dynamically fetches API_SERVER_KEY from GKE secret and locks down the agent model
 PLATFORM_AGENT_TOKEN="$(kubectl get secret platform-agent-secrets -n "${TARGET_NAMESPACE}" -o jsonpath='{.data.API_SERVER_KEY}' | base64 --decode)"
 export PLATFORM_AGENT_TOKEN
 # Under EVAL_MODE_NEXT=1 the deploy flipped the install to next, armed the
@@ -4618,12 +4621,12 @@ unit_cost_hint() {
     bootstrap-inventory-ranking-delivery) echo 600 ;;
     # The same stack and wait, planting the report with no critical finding.
     bootstrap-inventory-posture-scope) echo 600 ;;
-    # A stack, but off the infra lock (infra_lock_exempt): the unit waits for
-    # the previous repetition's audits to finish (wait_platform_runs), then the
-    # stack waits for the stage to run the four one after another (1-15 min
-    # each, #985; up to its chain_wait, 3600s). 2530-3144s a repetition on the
-    # nightly of 2026-10-09; the top of the list, so it launches first, its
-    # repetitions back to back.
+    # A stack, but off the infra lock (infra_lock_exempt). On a lease its first
+    # repetition waits out the install's own first-run chain, which ended
+    # 52-115 min after the fan-out on the 2026-11-10 presubmits, and the other
+    # two read the same chain at once. Kept at 3000 to keep it the top of the
+    # list, so it launches first, its repetitions back to back; off the infra
+    # lock, it is in none of the stack chains this hint prices.
     oobe-first-run-audits) echo 3000 ;;
     # Off the infra lock too (infra_lock_exempt), unmeasured: priced as
     # autoops-warning-event-triage, the same plant-then-card shape, so it
@@ -5077,7 +5080,7 @@ fi
 #                 finish lands in this lane's fresh one. Taken after the task
 #                 lock, keyed on the audit id, by units that write one and by
 #                 units that declare the streams their stack starts audits on
-#                 (audit_streams; oobe-first-run-audits holds five).
+#                 (audit_streams).
 #                 A task-lock holder on a shared stream waits its turn on
 #                 the stream before its own run, so both deadlines scale by
 #                 the cases on the stream (stream_case_count).

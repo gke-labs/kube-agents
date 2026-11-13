@@ -39,8 +39,8 @@ import (
 // rather than exiting: its pod reads not ready (the readinessProbe on
 // /readyz is the relay bind and nothing else). The gateway is leader-elected
 // and only the leader binds, so with two replicas the standby reads Ready
-// while the leader waits, and the CR reads Ready over a gateway relaying
-// nothing (whether Ready should follow the leader is #5593). Once
+// while the leader waits. Ready follows the leader rather than the standby
+// (a2aGatewayReadyByLeader); this reason says why the leader waits. Once
 // BusProvisioned is True the Job has created the stream, so a leader still
 // waiting is not seeing a stream that exists, or one that was lost since:
 // its NATS identity lands in another account, its credentials are wrong, or
@@ -103,6 +103,12 @@ type a2aGatewayLeaderRead struct {
 	Pod        *corev1.Pod
 	Ready      bool
 	AcquiredAt time.Time
+	// RenewedAt and LeaseDuration are the Lease's renewTime and
+	// leaseDurationSeconds, zero when the Lease does not carry them; Ready
+	// following the leader (a2aGatewayReadyByLeader) reads them to tell a
+	// holder that stopped renewing from a current one.
+	RenewedAt     time.Time
+	LeaseDuration time.Duration
 }
 
 // a2aGatewayLeader reads the A2A gateway's elected leader. It returns nil
@@ -111,7 +117,41 @@ type a2aGatewayLeaderRead struct {
 // The Lease comes from the cache (the operator watches it), the pod from
 // the live reader, since its readiness is the question. A read that failed
 // for another reason is returned as the error.
+//
+// Within a status pass (withA2AGatewayLeaderMemo) the first read is kept and
+// returned to every later caller, so Ready and the TASKS-wait reason judge
+// the same holder from one live pod read.
 func (r *PlatformAgentReconciler) a2aGatewayLeader(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (*a2aGatewayLeaderRead, error) {
+	memo, _ := ctx.Value(a2aGatewayLeaderMemoKey{}).(*a2aGatewayLeaderMemo)
+	if memo != nil && memo.done {
+		return memo.read, memo.err
+	}
+	read, err := r.readA2AGatewayLeader(ctx, agent)
+	if memo != nil {
+		memo.read, memo.err, memo.done = read, err, true
+	}
+	return read, err
+}
+
+// a2aGatewayLeaderMemoKey and a2aGatewayLeaderMemo hold one status pass's
+// leader read (a2aGatewayLeader).
+type a2aGatewayLeaderMemoKey struct{}
+
+type a2aGatewayLeaderMemo struct {
+	read *a2aGatewayLeaderRead
+	err  error
+	done bool
+}
+
+// withA2AGatewayLeaderMemo scopes one leader read to the context's lifetime:
+// the status pass that calls it. Not safe for concurrent callers; a pass is
+// one goroutine.
+func withA2AGatewayLeaderMemo(ctx context.Context) context.Context {
+	return context.WithValue(ctx, a2aGatewayLeaderMemoKey{}, &a2aGatewayLeaderMemo{})
+}
+
+// readA2AGatewayLeader is a2aGatewayLeader's read, unmemoised.
+func (r *PlatformAgentReconciler) readA2AGatewayLeader(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (*a2aGatewayLeaderRead, error) {
 	lease := &coordinationv1.Lease{}
 	if err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aGatewayLeaseName(agent)}, lease); err != nil {
 		if apierrors.IsNotFound(err) {
@@ -135,6 +175,12 @@ func (r *PlatformAgentReconciler) a2aGatewayLeader(ctx context.Context, agent *a
 	read := &a2aGatewayLeaderRead{Pod: pod}
 	if lease.Spec.AcquireTime != nil {
 		read.AcquiredAt = lease.Spec.AcquireTime.Time
+	}
+	if lease.Spec.RenewTime != nil {
+		read.RenewedAt = lease.Spec.RenewTime.Time
+	}
+	if lease.Spec.LeaseDurationSeconds != nil {
+		read.LeaseDuration = time.Duration(*lease.Spec.LeaseDurationSeconds) * time.Second
 	}
 	if gateway := a2aGatewayContainerStatus(pod); gateway != nil {
 		read.Ready = gateway.Ready

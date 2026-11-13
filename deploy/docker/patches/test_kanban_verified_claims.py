@@ -516,8 +516,8 @@ class SchemaTest(unittest.TestCase):
     def test_the_description_keeps_claims_off_a_yes_or_no_answer(self):
         # A worker reads this as it fills the field; the evidence would turn an answer into a report.
         self.assertIn(
-            "On a yes-or-no question or a status check, even one that closes by asking for a report or summary, "
-            "leave it out and call nothing verified",
+            "On a yes-or-no question or a status check, even one that closes by asking for a report or summary "
+            'or ends with a line that starts "Propose only", leave it out and call nothing verified',
             kvc.PARAM_DESCRIPTION,
         )
         self.assertIn("unless the card asks for verified claims", kvc.PARAM_DESCRIPTION)

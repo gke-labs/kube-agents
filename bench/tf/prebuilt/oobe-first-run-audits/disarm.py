@@ -16,6 +16,9 @@
 
 Usage: python3 - <home> <hermes> < disarm.py
 
+Removes own_stage.py's OWN_STATE first, the record of a run that graded the install's own
+first run and armed nothing.
+
 Puts the markers back as they were. Removes the `oobe` job when arm.py put it there
 and it has not already removed itself, and puts back the job arm.py found in the store
 when the stage has since removed it, and archives the stand-in cards again in case an arm
@@ -33,6 +36,7 @@ from cron.jobs import _jobs_lock, compute_next_run, load_jobs, remove_job, save_
 
 home, HERMES = sys.argv[1:3]
 STATE = os.path.join(home, ".bench-oobe.json")
+OWN_STATE = os.path.join(home, ".bench-oobe-own.json")
 SCAN_MARKER = os.path.join(home, ".bootstrap_scan_filed")
 AUDITS_MARKER = os.path.join(home, ".oobe_audits_fired")
 HANDOFF_MARKER = os.path.join(home, ".bootstrap_handoff_filed")
@@ -55,6 +59,10 @@ def restore(path, text):
     os.replace(tmp, path)
 
 
+try:
+    os.remove(OWN_STATE)
+except FileNotFoundError:
+    pass
 if not os.path.exists(STATE):
     print("the stage was not armed")
     sys.exit(0)

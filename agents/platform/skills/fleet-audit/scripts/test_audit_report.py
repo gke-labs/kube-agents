@@ -46,6 +46,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "scripts"))
 import audit_report  # noqa: E402
 import credential_proxy_client  # noqa: E402
 import gitops_workspace  # noqa: E402
+import no_live_kubectl  # noqa: E402
 import providers  # noqa: E402
 import vcs_broker  # noqa: E402
 import vcs_client  # noqa: E402
@@ -55,6 +56,23 @@ import workspace_paths  # noqa: E402
 # need not each carry a manifest; the guard's own tests put this back.
 REAL_COLLECTOR_AUDITS = audit_report.COLLECTOR_AUDITS
 SKILL_ROOT = Path(__file__).resolve().parents[1]
+
+
+def setUpModule():
+    # No test here reaches a cluster: a read of the state ConfigMap that a test
+    # leaves unstubbed is unreadable, and any other kubectl found on PATH fails
+    # the module.
+    global _NO_KUBECTL
+    _NO_KUBECTL = no_live_kubectl.install()
+
+
+def tearDownModule():
+    _NO_KUBECTL.uninstall()
+
+
+class TestNoLiveKubectl(unittest.TestCase):
+    def test_no_test_in_this_module_can_reach_a_cluster(self):
+        no_live_kubectl.assert_in_force(self, _NO_KUBECTL)
 
 
 def skill_text() -> str:
@@ -82,6 +100,8 @@ DECLARING_AUDIT = "obtainability-audit"
 # is the patch stream.
 NON_DECLARING_AUDIT = "ai-security-audit"
 NOW = datetime(2026, 8, 1, 9, 30, tzinfo=timezone.utc)
+# The stamp a later `start` leaves in the run record (`a_later_start_lands_after_the_staleness_check`).
+LATER_START = "2099-01-01T00:00:00Z"
 # How far the run-record stamp may sit from wall-clock and still be this run's.
 # Wide enough for a loaded CI worker, narrow enough that a hardcoded date fails.
 STAMP_TOLERANCE_SECONDS = 300
@@ -1233,6 +1253,30 @@ class BaseTestCase(unittest.TestCase):
                 *argv_extra,
             ]
         )
+
+    def a_later_start_lands_after_the_staleness_check(self):
+        """Make a later `start` rewrite the run record as soon as `finish`'s
+        `findings_predate_run` has passed (#4268). Returns the start the
+        record holds now, as an envelope carries it."""
+        record = Path(audit_report.run_record_path_for(AUDIT))
+        own = json.loads(record.read_text())[audit_report.RUN_RECORD_STARTED_KEY]
+        real = audit_report.findings_predate_run
+
+        def next_start_lands_after_the_check(*args, **kwargs):
+            stale_since = real(*args, **kwargs)
+            data = json.loads(record.read_text())
+            data[audit_report.RUN_RECORD_STARTED_KEY] = LATER_START
+            record.write_text(json.dumps(data))
+            return stale_since
+
+        self.patch_attr("findings_predate_run", next_start_lands_after_the_check)
+        return datetime.fromtimestamp(audit_report._utc_seconds(own), timezone.utc).isoformat()
+
+    def assert_the_envelope_keeps_its_runs_start(self, envelope, own):
+        """The later start landed in the run record, and `envelope` carries `own`."""
+        record = json.loads(Path(audit_report.run_record_path_for(AUDIT)).read_text())
+        self.assertEqual(record[audit_report.RUN_RECORD_STARTED_KEY], LATER_START, "the later start did not land")
+        self.assertEqual(envelope[audit_report.ENVELOPE_STARTED_KEY], own)
 
     def git_add_calls(self, recorder):
         # "add" is not at a fixed index: the harness passes git-level flags
@@ -31054,6 +31098,29 @@ class TestReportStore(HarnessTestCase):
     def stored(self):
         return json.loads((self.store_dir() / "latest.json").read_text())
 
+    def test_a_later_start_during_finish_does_not_stamp_a_clean_runs_envelope(self):
+        """#4268: a `finish` with no findings passes on the start `finish`
+        read before its checks, as the no-forge one does."""
+        self.record_run(audit=AUDIT)
+        own = self.a_later_start_lands_after_the_staleness_check()
+        self.harness.replies = {"issue-list": {"issues": []}}
+        self.assertEqual(self.run_finish(make_doc(findings=[])), 0, self.err)
+        self.assert_the_envelope_keeps_its_runs_start(self.stored(), own)
+
+    def test_a_later_start_during_finish_does_not_stamp_a_ledger_runs_envelope(self):
+        """#4268: a `finish` that writes the ledger issue passes on the start
+        `finish` read before its checks, as the no-forge one does."""
+        self.record_run(audit=AUDIT)
+        own = self.a_later_start_lands_after_the_staleness_check()
+        self.harness.replies = {
+            "issue-list": {"issues": []},
+            "issue-create": created("issue", "https://github.com/acme/fleet/issues/7"),
+        }
+        self.touch("clusters/prod-us-east/payments-netpol.yaml")
+        self.assertEqual(self.run_finish(make_doc()), 0, self.err)
+        self.assertEqual(self.stdout_json()["status"], "OPENED")
+        self.assert_the_envelope_keeps_its_runs_start(self.stored(), own)
+
     def test_a_written_report_is_read_back_for_the_same_ledger(self):
         audit_report.write_report(AUDIT, self.envelope(), NOW)
         memory = audit_report.read_report_memory(AUDIT, 42, "acme/fleet")
@@ -32984,29 +33051,13 @@ class TestNoForge(BaseTestCase):
         has passed leaves the envelope with this run's own start, so a read
         placed anywhere after that check fails here."""
         self.start()
-        record = Path(audit_report.run_record_path_for(AUDIT))
-        own = json.loads(record.read_text())[audit_report.RUN_RECORD_STARTED_KEY]
-        real = audit_report.findings_predate_run
-
-        def next_start_lands_after_the_check(*args, **kwargs):
-            stale_since = real(*args, **kwargs)
-            data = json.loads(record.read_text())
-            data[audit_report.RUN_RECORD_STARTED_KEY] = "2099-01-01T00:00:00Z"
-            record.write_text(json.dumps(data))
-            return stale_since
-
-        self.patch_attr("findings_predate_run", next_start_lands_after_the_check)
+        own = self.a_later_start_lands_after_the_staleness_check()
         path = audit_report.findings_path_for(AUDIT)
         Path(path).write_text(json.dumps(make_doc(findings=THREE_SEVERITIES)), encoding="utf-8")
         self.assertEqual(self.run_main(["finish", "--audit", AUDIT, "--findings-file", path, "--scheduled"]), 0, self.err)
 
-        later = json.loads(record.read_text())[audit_report.RUN_RECORD_STARTED_KEY]
-        self.assertEqual(later, "2099-01-01T00:00:00Z", "the later start did not land")
         latest = json.loads((self.store() / "latest.json").read_text())
-        self.assertEqual(
-            latest[audit_report.ENVELOPE_STARTED_KEY],
-            datetime.fromtimestamp(audit_report._utc_seconds(own), timezone.utc).isoformat(),
-        )
+        self.assert_the_envelope_keeps_its_runs_start(latest, own)
 
     def test_the_delta_runs_against_the_previous_no_forge_report(self):
         doc = make_doc(findings=THREE_SEVERITIES)
@@ -35412,6 +35463,15 @@ class TestStoreLedger(HarnessTestCase):
             "labels": [],
             "body": audit_report.delta_block(ids) + "\n" + audit_report.remediation_stream_marker(AUDIT),
         }
+
+    def test_a_later_start_during_finish_does_not_stamp_the_store_ledger_envelope(self):
+        """#4268: the store-ledger `finish` passes on the start `finish` read
+        before its checks, as the no-forge one does."""
+        self.start()
+        self.touch(self.NETPOL)
+        own = self.a_later_start_lands_after_the_staleness_check()
+        self.assertEqual(self.finish(make_doc()), 0, self.err)
+        self.assert_the_envelope_keeps_its_runs_start(self.latest(), own)
 
     # -- the decision ----------------------------------------------------------
 

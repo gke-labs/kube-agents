@@ -180,6 +180,7 @@ AUDITS: dict[str, AuditSpec] = {
             "lb-world-open",
             "anonymous-rbac-binding",
             "configsync-reconciler-stalled",
+            "webhook-backend-unreachable",
         ),
         # The two compliance checks that judge a posture an owner may choose:
         # a namespace that talks to nothing and so carries no NetworkPolicy
@@ -1189,6 +1190,7 @@ CHECK_PHRASES = {
     "lb-world-open": "{object} is a load balancer open to the internet",
     "anonymous-rbac-binding": "{object} grants access to anonymous users",
     "configsync-reconciler-stalled": "{object} is stuck in Config Sync",
+    "webhook-backend-unreachable": "{object} is a fail-closed webhook with no reachable backend",
     # Upgrade & Patch Readiness Audit
     "master-behind": "control plane is behind its release channel",
     "pool-skew": "{object} node pool lags the control plane",
@@ -2794,6 +2796,96 @@ def _manifest_delta():
     import manifest_delta
 
     return manifest_delta
+
+
+# The install's auto-merge switch (`KUBEAGENTS_AUTOMERGE`, read by
+# kubeagents_switches.py in the shared scripts directory). Anything but "off"
+# has every disruption-budget fix checked against its cluster before its pull
+# request opens, and the answer written into the body (pdb_safety.py).
+AUTOMERGE_SWITCH = "AUTOMERGE"
+SWITCH_OFF = "off"
+AUTOMERGE_PRACTICE = "practice"
+# The collector outcome that says it read a cluster under the install's scope.
+COLLECTED_OUTCOME = "collected"
+
+
+def automerge_switch() -> str:
+    """The install's auto-merge switch; "off" where the switch module is absent
+    or fails, so a broken switch neither turns the checks on nor stops a fix."""
+    try:
+        from kubeagents_switches import switch  # lazy, as gitops_workspace is
+
+        return switch(AUTOMERGE_SWITCH)
+    except Exception as exc:  # noqa: BLE001 -- any failure reads as the default
+        if not isinstance(exc, ImportError):
+            log(f"WARNING: the {AUTOMERGE_SWITCH} switch could not be read ({type(exc).__name__}: {exc}); reading it as off")
+        return SWITCH_OFF
+
+
+def pdb_safety_section(group: list[dict], snapshot: dict[str, bytes], manifest: dict | None, noun: str) -> str:
+    """The safety-check section for a group's disruption-budget fixes, or "".
+
+    "" while the auto-merge switch is off, and for a group with no `no-pdb`
+    manifest fix. The group is eligible for auto-merge only when every finding
+    in it is such a fix and every check on every one passed; anything else
+    still opens, for a person to review. A check that crashes is a failed
+    check, never a refused pull request.
+    """
+    if automerge_switch() == SWITCH_OFF:
+        return ""
+    budgets = [
+        f
+        for f in group
+        if str(f.get("check") or "") == GENERATED_FIX_CHECK
+        and (f.get("remediation") or {}).get("kind") == MANIFEST_REMEDIATION_KIND
+    ]
+    if not budgets:
+        return ""
+    here = str(Path(__file__).resolve().parent)
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import pdb_safety  # lazy, as manifest_delta is
+
+    read = {
+        str(entry.get("name") or "")
+        for entry in _manifest_clusters(manifest)
+        if entry.get("outcome") == COLLECTED_OUTCOME
+    }
+    answers = []
+    for finding in budgets:
+        path = str((finding.get("remediation") or {}).get("path") or "")
+        raw = snapshot.get(path)
+        if GENERATED_THIS_RUN.get(str(finding.get("id", ""))) != path:
+            # Byte-exact text at a path the worker chose (over a committed
+            # file, or in another cluster's tree) is a fix for a person to read.
+            answers.append({
+                "finding_id": str(finding.get("id", "")),
+                "command": "",
+                "eligible": False,
+                "checks": pdb_safety._unanswered(
+                    "the audit did not write this file on this run at the path it chooses for the budget, so it was not read again"
+                ),
+            })
+            continue
+        try:
+            answer = pdb_safety.check_fix(
+                finding,
+                raw.decode("utf-8", errors="replace") if raw is not None else None,
+                in_manifest=str(finding.get("cluster") or "") in read,
+            )
+        except Exception as exc:  # noqa: BLE001 -- a crash is a failed check, and the fix still opens
+            answer = {
+                "finding_id": str(finding.get("id", "")),
+                "command": "",
+                "eligible": False,
+                "checks": pdb_safety._unanswered(f"the check failed ({type(exc).__name__}: {exc})"),
+            }
+        answers.append(answer)
+    eligible = len(budgets) == len(group) and all(a["eligible"] for a in answers)
+    log(f"SAFETY: {', '.join(a['finding_id'] for a in answers)}: auto-merge {'eligible' if eligible else 'not eligible'}")
+    return pdb_safety.render_section(
+        answers, eligible=eligible, noun=noun, clean=publishable_text, practice=automerge_switch() == AUTOMERGE_PRACTICE
+    )
 
 
 def set_sweep_waived(waived: bool) -> None:
@@ -14763,6 +14855,7 @@ def render_remediation_pr_body(
     generated_at: datetime,
     noun: str = DEFAULT_PROPOSAL_NOUN,
     unlabelled: bool = False,
+    safety: str = "",
 ) -> str:
     """The body of one remediation pull request.
 
@@ -14773,6 +14866,8 @@ def render_remediation_pr_body(
 
     `unlabelled` is a forge with no labels: the body then also carries the
     stream marker, which is how the next run finds this pull request.
+
+    `safety` is `pdb_safety_section`'s answer, placed after the files.
     """
     ordered = sort_findings(group)
     ids = sorted(str(f.get("id", "")) for f in ordered if f.get("id"))
@@ -14797,6 +14892,8 @@ def render_remediation_pr_body(
     out += ["## Files", ""]
     for path in paths:
         out.append(f"- [`{path}`]({path})")
+    if safety:
+        out += ["", safety]
 
     out += [
         "",
@@ -17527,6 +17624,7 @@ def open_remediation_pr(
     existing: dict | None,
     generated_at: datetime,
     noun: str | None = None,
+    manifest: dict | None = None,
 ) -> str | None:
     """Land the group's files on their own branch, then open or refresh its PR.
 
@@ -17594,6 +17692,8 @@ def open_remediation_pr(
     # Known from `ensure_labels`, which every run calls first; a forge not yet
     # known is taken to have labels, and the label write below corrects it.
     labelled = _LABELS.get(repo, True)
+    # Read once: the label fallback below re-renders the same body.
+    safety = pdb_safety_section(group, snapshot, manifest, noun or _proposal_noun(repo))
     body = render_remediation_pr_body(
         audit_id,
         group,
@@ -17601,6 +17701,7 @@ def open_remediation_pr(
         generated_at=generated_at,
         noun=noun or _proposal_noun(repo),
         unlabelled=not labelled,
+        safety=safety,
     )
     title = remediation_pr_title(audit_id, group)
     highest = next(
@@ -17663,6 +17764,7 @@ def open_remediation_pr(
                         generated_at=generated_at,
                         noun=noun or _proposal_noun(repo),
                         unlabelled=True,
+                        safety=safety,
                     ),
                 },
             )
@@ -18965,6 +19067,13 @@ def plan_generated_fixes(
     return planned, answered
 
 
+#: Finding id to the path `write_generated_fixes` wrote its budget at, in this
+#: process. The safety checks read only these: `plan_generated_fixes` put the
+#: file beside the declaration under the generated name and refused a path that
+#: already held a file, which a worker-supplied path never went through.
+GENERATED_THIS_RUN: dict[str, str] = {}
+
+
 def write_generated_fixes(findings: list[dict], planned: dict[str, tuple[str, str]], root: Path) -> None:
     """Write each planned fix and make it the finding's `manifest` remediation."""
     for finding in findings:
@@ -18980,6 +19089,7 @@ def write_generated_fixes(findings: list[dict], planned: dict[str, tuple[str, st
         remediation.update(
             {"kind": "manifest", "path": path, "note": GENERATED_FIX_NOTE + (f" {note}" if note else "")}
         )
+        GENERATED_THIS_RUN[fid] = path
         log(f"GENERATED: {fid}'s PodDisruptionBudget at {path}")
 
 
@@ -22749,10 +22859,12 @@ def _open_promoted_prs(
     generated_at: datetime,
     noun: str | None = None,
     on_open: Callable[[], None] = lambda: None,
+    manifest: dict | None = None,
 ) -> list[str]:
     """Open (or refresh) one pull request per group holding a promoted finding.
 
-    `on_open` runs after each one, before the next is tried.
+    `on_open` runs after each one, before the next is tried. `manifest` is the
+    run's collector manifest, which `pdb_safety_section` needs.
 
     Groups are computed over the *whole* finding set, not just the promoted
     ids: if a critical finding shares its remediation file with a minor one,
@@ -22806,6 +22918,7 @@ def _open_promoted_prs(
                     existing=pr_by_finding.get(fid),
                     generated_at=generated_at,
                     noun=noun,
+                    manifest=manifest,
                 )
             except BrokerUnavailable:
                 # The broker is gone, not this group: the next group would fail
@@ -23366,6 +23479,7 @@ def handle_remediate(args: argparse.Namespace) -> None:
         issue_number=issue_number,
         generated_at=now,
         noun=noun,
+        manifest=manifest,
     )
     print(
         json.dumps(
@@ -24604,6 +24718,7 @@ def _finish_store_ledger(
         # As each opens: a `finish` that dies after one is re-run, and the
         # re-run must not sweep again.
         on_open=lambda: save_chat_verdict(audit_id, repo, False, [], now, news=True),
+        manifest=manifest,
     )
     if prs_opened:
         pr_by_finding, _ = reconcile_remediation_prs(
@@ -26925,6 +27040,7 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
         # As each opens, and not only before the store write: a `finish` that
         # dies after one is re-run, and the re-run must not sweep again.
         on_open=lambda: save_chat_verdict(audit_id, repo, False, new_marked or [], now, news=True),
+        manifest=manifest,
     )
 
     # What the live ledger renders once this branch is done, for the store.
