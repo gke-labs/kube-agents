@@ -85,6 +85,25 @@ func TestNotifyHomeAlertAndItsTriageCarryOneRating(t *testing.T) {
 	}
 }
 
+// A reply in an alert's thread (the triage card's plan, a later note) is not
+// the agent's own post and carries no controls, keyed or not.
+func TestNotifyHomeThreadReplyIsNotRated(t *testing.T) {
+	n, p, _ := newRatedHomeNotifier(t)
+	alert := serveJSON(t, n, lib.NotifyRequest{Text: "🚨 seeded-b: CrashLoopBackOff", Update: "alert-s1"})
+	if alert.Error != "" {
+		t.Fatalf("alert = %+v", alert)
+	}
+	plan := serveJSON(t, n, homeKeyed("plan", "plan-c1-1", alert.ThreadID))
+	note := serveJSON(t, n, lib.NotifyRequest{Text: "a note under the alert", Thread: alert.ThreadID})
+	if plan.Error != "" || note.Error != "" {
+		t.Fatalf("plan = %+v, note = %+v", plan, note)
+	}
+	// The note posts as plain text (PostNotify), which records no mark.
+	if len(p.all()) != 3 || len(p.posted) != 2 || p.posted[0] == "" || p.posted[1] != "" {
+		t.Fatalf("posts = %d, marks = %q; want 3 posts, the alert rated and the plan not", len(p.all()), p.posted)
+	}
+}
+
 // A home post with no update key is a report.
 func TestNotifyHomeUnkeyedPostIsRatedAsAReport(t *testing.T) {
 	n, p, _ := newRatedHomeNotifier(t)

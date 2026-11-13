@@ -2626,7 +2626,9 @@ rating and what kind of message was rated (`answer`: `reply` for the chain's own
 card's report that settled the ask, `other` when no session record names the rated task).
 
 The posts the agent makes on its own in the home channel (the chat.notify route's home requests: an
-alert, a scheduled or audit report, a digest) carry the same controls, after the post's own buttons.
+alert, a scheduled or audit report, a digest) carry the same controls, after the post's own buttons:
+the post that opens a thread, and the edit of it under the same key, never a reply in the thread
+(the triage card's plan or progress).
 They are rated under an id of the post's own rather than a task id: `alert-` for a keyed post, whose
 hash of the update key keeps the id through the triage edit that rewrites it, `report-` for any
 other, random. The record keeps the kind and no ask, the rating counts in `post_feedback_total` by
