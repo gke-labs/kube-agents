@@ -1201,8 +1201,9 @@ not be silent about it.
   the persona. The body may also carry `"intent":"confirm"`, which submits the turn with a change
   requested. The door accepts it only when the gateway has `A2A_INJECT_CONFIRM=true`, which the
   operator renders only under `A2A_INJECT_BACKEND` (eval installs), and refuses it otherwise. A
-  confirm skips the text paths (the stop, feedback, session and status matchers), so it is not a
-  typed message. The harness sends none of them as a prompt, and a case whose prompt opens with
+  confirm skips the stop, feedback and status matchers, so it is not a typed message. Two text
+  paths still read it as they read a typed turn: after the session flip, `/session <text>` unwraps
+  to `<text>`, and text that opens with `delegate` spawns a session worker. The harness sends none of them as a prompt, and a case whose prompt opens with
   one is the case's defect; a stopped ask's `stop`, sent during or after the opening turn, is the one it
   sends itself. The reply carries the task id, so the caller can await a named task rather
   than guessing which post belongs to its submission, and the gateway's first-event grace, so the
