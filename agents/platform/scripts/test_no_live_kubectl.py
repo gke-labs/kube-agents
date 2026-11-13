@@ -142,6 +142,23 @@ class TestUninstall(GuardTestCase):
             guard.uninstall()
             self.assertEqual(os.environ["PATH"], "/changed/after/the/guard")
 
+    def test_a_newline_in_an_argument_stays_in_one_recorded_call(self):
+        guard = no_live_kubectl.install()
+        subprocess.run(["kubectl", "annotate", "deploy/x", "note=first\nsecond"], capture_output=True)
+        self.assertEqual(guard.calls(), ["annotate deploy/x note=first\nsecond"])
+        with self.assertRaises(AssertionError) as raised:
+            guard.uninstall()
+        self.assertIn("1 kubectl call(s)", str(raised.exception))
+
+    def test_bytes_that_are_not_utf8_do_not_stop_the_cleanup(self):
+        guard = no_live_kubectl.install()
+        stand_in = guard.stand_in
+        subprocess.run([b"kubectl", b"get", b"\xff\xfe"], capture_output=True)
+        with self.assertRaises(AssertionError) as raised:
+            guard.uninstall()
+        self.assertIn("1 kubectl call(s)", str(raised.exception))
+        self.assertFalse(stand_in.exists())
+
     def test_a_pinned_state_read_does_not_fail_the_module(self):
         guard = no_live_kubectl.install()
         subprocess.run(STATE_READ, capture_output=True, text=True)

@@ -61,8 +61,10 @@ _NO_MOUNT_DIR = "no-such-mount"
 STAND_IN_EXIT_CODE = 97
 STAND_IN_MESSAGE = "kubectl is not available in unit tests (no_live_kubectl)"
 STAND_IN_MODE = 0o755
+# One NUL-ended record a call: an argument can hold a newline.
+_CALL_END = "\0"
 _STAND_IN_SCRIPT = """#!/bin/sh
-printf '%s\\n' "$*" >> "{calls}"
+printf '%s\\0' "$*" >> "{calls}"
 echo "{message}" >&2
 exit {code}
 """
@@ -127,7 +129,10 @@ class Guard:
 
     def calls(self) -> list[str]:
         """The arguments of each call the stand-in took, oldest first."""
-        return self._calls.read_text(encoding="utf-8").splitlines()
+        # errors="replace": an argument need not be UTF-8, and `uninstall()`
+        # must still get to its cleanup and its report.
+        recorded = self._calls.read_text(encoding="utf-8", errors="replace")
+        return recorded.split(_CALL_END)[:-1]
 
     def uninstall(self) -> None:
         global _ACTIVE
