@@ -2858,7 +2858,20 @@ every message through either stamps its own backend.
   connection is answered with the task the first attempt started, and starts nothing.
 - `tasks/get` returns the `Task` as the door holds it. Scoped to the caller: a task another
   caller started is not found rather than forbidden, so the door confirms no id it will not
-  serve.
+  serve. The door holds tasks in the active gateway's memory only, so after a gateway restart
+  or a failover to another replica the new gateway doesn't know a task the old one accepted.
+  The task itself is not lost: its executor may have finished it or may still be running it.
+  Every not-found answer (`-32001`, here and for `tasks/cancel` and a follow-up's `taskId`)
+  carries `data` a client acts on without reading the message: `reason`, `servingSince` (when
+  this gateway started serving the door) and `mayHaveRun: true`. `reason` is `evicted` for the
+  caller's own task the door dropped to stay inside its bounds, and `not-held-since-serving`
+  for anything else: a task submitted before `servingSince`, the caller's own task evicted so long
+  ago that the door no longer remembers it (it keeps 4096 such ids), and equally another caller's
+  id or one no door minted, so the answer still confirms nothing. A client that resubmits with a
+  new `messageId` starts the task again and should expect possible duplicate work: the
+  `messageId` dedupe lives in the same memory, so a repeated `messageId` doesn't dedupe across a
+  restart. On the same gateway a repeated `messageId` still names the original task, so
+  resubmitting an evicted task with its original `messageId` doesn't start a new run.
 - `tasks/cancel` is a cancel turn on the task's conversation - the same `kind: cancel` envelope
   the inject door's cancel route and the chat path's `stop` publish - answered once the cancel is
   on the bus (`TaskObserver.CancelPublished`) with the `Task` as it stands. The executor decides
