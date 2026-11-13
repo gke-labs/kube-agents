@@ -1248,6 +1248,26 @@ class TestSlackIncidentAlertDelivery(unittest.TestCase):
             self._run(lambda _platform, _msg, _session: "spaces/AAA/threads/T1")
         session_kv_server._record_alert_title.assert_called_once()
 
+    def test_the_alert_goes_to_one_platform_when_both_are_routed(self):
+        # both routed: _trigger_agent_troubleshooter posts the initial alert to google_chat only (CHAT_PLATFORMS order),
+        # registers one session route, and logs the "will not receive it" warning naming slack.
+        argvs = []
+
+        def notify(argv, **_kwargs):
+            argvs.append(argv)
+            return session_kv_server.subprocess.CompletedProcess(
+                argv, 0, stdout=json.dumps({"message_id": "m1", "thread_id": "spaces/AAA/threads/T1"}), stderr="")
+
+        pool = park_triage_starts()
+        with patch.dict(os.environ, {chat_notify.NOTIFY_PLATFORM_ENV: "google_chat,slack"}), \
+             patch.object(session_kv_server.subprocess, "run", side_effect=notify), \
+             self.assertLogs("session_kv_server", level="WARNING") as logs:
+            session_kv_server.trigger_agent_troubleshooter("s1", "alert", {}, 7, slack_alert_msg="slack alert")
+            pool.run()
+        self.assertEqual([argv[:4] for argv in argvs], [[chat_notify.A2A_CLI, "notify", "--platform", "google_chat"]])
+        session_kv_server._register_session_routing.assert_called_once_with("s1", "google_chat", "spaces/AAA/threads/T1")
+        self.assertTrue(any("slack will not receive it" in line for line in logs.output), logs.output)
+
 
 class TestAlertTitleRecord(unittest.TestCase):
     def setUp(self):
@@ -5338,6 +5358,43 @@ class TestRelayWithNoChatRoute(unittest.TestCase):
         _, mocks = self._post()
         self.assertEqual(
             [call.args[0] for call in mocks["_send_to_chat"].call_args_list], ["slack"])
+
+    def test_the_no_route_error_names_every_gateway_platform_without_a_home(self):
+        with patch.dict(os.environ, {chat_notify.NOTIFY_CONVERSATIONS_ENV: "google_chat,slack",
+                                     chat_notify.NOTIFY_PLATFORM_ENV: ""}, clear=False):
+            msg = session_kv_server._no_chat_route_error()
+        self.assertIn("not delivered to google_chat (no home channel: set", msg)
+        self.assertIn("not delivered to slack (no home channel: set", msg)
+        self.assertIn("; ", msg)
+
+    def test_the_relay_posts_one_leg_per_routed_platform(self):
+        # both platforms routed, no earlier delivery: relay_cron_report sends one leg to google_chat and one to slack,
+        # each through the gateway (`a2a notify --platform <p>`), and never two legs to one platform.
+        os.environ[chat_notify.NOTIFY_CONVERSATIONS_ENV] = "google_chat,slack"
+        os.environ[chat_notify.NOTIFY_PLATFORM_ENV] = "google_chat,slack"
+        argvs = []
+
+        def notify(argv, **_kwargs):
+            argvs.append(argv)
+            return session_kv_server.subprocess.CompletedProcess(
+                argv, 0, stdout=json.dumps({"message_id": "m1", "thread_id": "t1"}), stderr="")
+
+        outbound = [
+            patch.object(session_kv_server, name, return_value=None)
+            for name in ("_post_audit_blocks", "_post_failed_audit_via_gateway", "_slack_audit_headline",
+                         "_failed_audit_line")
+        ]
+        for patcher in outbound:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        with patch.object(session_kv_server.subprocess, "run", side_effect=notify):
+            response = self.client.post(
+                "/v1/cron-reports",
+                json={"job_id": "fleet-wide-cost-analysis", "profile": "platform", "report": "finding"},
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(all(argv[:3] == [chat_notify.A2A_CLI, "notify", "--platform"] for argv in argvs), argvs)
+        self.assertEqual(sorted(argv[3] for argv in argvs), ["google_chat", "slack"])
 
     def test_an_install_no_source_describes_keeps_the_fallback(self):
         """No file says anything, so nothing is explicitly off: the relay still

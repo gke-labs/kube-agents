@@ -2846,6 +2846,9 @@ HOME_CHANNEL_SETTINGS: Dict[str, str] = {
 # The refusal when no platform can be named: no chat at all, a malformed home
 # channel the gateway refuses, or a backend this file has no route for.
 NO_CHAT_ROUTE_ERROR = "no Google Chat or Slack route to post to; check the chat integration and homeChannel"
+# Joins the per-platform refusals when the gateway holds more than one backend
+# with no home channel.
+NO_CHAT_ROUTE_JOIN = "; "
 
 
 def _mapping(value: object) -> dict:
@@ -2964,12 +2967,12 @@ def enabled_chat_platforms() -> list[str]:
        than dropped because it is the truth on the installs that do write it.
     3. The environment signals above, for an install neither file describes.
 
-    One thing outranks all three: the platform ``chat_notify.routed_platform()``
+    One thing outranks all three: the platforms ``chat_notify.routed_platforms()``
     names, from ``A2A_NOTIFY_PLATFORM`` or the projected home-channel file. Under
     ``spec.mode: next`` the
-    managed scope says that platform's Hermes consumer is off because the A2A
-    gateway holds the backend, and posts to it go through the gateway instead,
-    so it is still a platform this install posts to, with a home channel or
+    managed scope says each such platform's Hermes consumer is off because the
+    A2A gateway holds its backend, and posts to it go through the gateway
+    instead, so each is still a platform this install posts to, with a home channel or
     (when it is the only chat platform) without one, the gateway keeping the
     refused posts for a digest. The operator renders the variable only then,
     and it is reserved against every other source.
@@ -3072,17 +3075,18 @@ def _no_chat_route_error() -> str:
     It reaches `last_delivery_error` through the relay adapter and the 502, and
     from there the dashboard, `hermes cron list`, the cronjob tool's reply in
     chat and the `chat_delivery_watch` ledger issue. The gateway names its
-    backend whether or not a home channel is set, so with one named the cause is
-    the missing home channel; without one this cannot tell no chat from a
-    misconfigured one, so it guesses at neither. A pod the operator has routed
-    never reaches this: its send goes to the gateway, whose refusal says the
-    post is kept.
+    backends whether or not a home channel is set, so with any named the cause
+    is the missing home channel, one sentence per platform; without one this
+    cannot tell no chat from a misconfigured one, so it guesses at neither. A
+    pod the operator has routed never reaches this: its send goes to the
+    gateway, whose refusal says the post is kept.
     """
-    platform = chat_notify.gateway_platform()
-    setting = HOME_CHANNEL_SETTINGS.get(platform)
-    if setting:
-        return f"composed but not delivered to {platform} (no home channel: set {setting})"
-    return NO_CHAT_ROUTE_ERROR
+    refusals = [
+        f"composed but not delivered to {platform} (no home channel: set {HOME_CHANNEL_SETTINGS[platform]})"
+        for platform in chat_notify.gateway_platforms()
+        if platform in HOME_CHANNEL_SETTINGS
+    ]
+    return NO_CHAT_ROUTE_JOIN.join(refusals) or NO_CHAT_ROUTE_ERROR
 
 
 def get_active_platform(platforms: Optional[list[str]] = None) -> str:
