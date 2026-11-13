@@ -4622,8 +4622,9 @@ unit_cost_hint() {
     # A stack, but off the infra lock (infra_lock_exempt). On a lease its first
     # repetition waits out the install's own first-run chain, which ended
     # 52-115 min after the fan-out on the 2026-11-10 presubmits, and the other
-    # two read the same chain at once; the top of the list, so it launches
-    # first, its repetitions back to back.
+    # two read the same chain at once. Kept at 3000 to keep it the top of the
+    # list, so it launches first, its repetitions back to back; off the infra
+    # lock, it is in none of the stack chains this hint prices.
     oobe-first-run-audits) echo 3000 ;;
     # Off the infra lock too (infra_lock_exempt), unmeasured: priced as
     # autoops-warning-event-triage, the same plant-then-card shape, so it

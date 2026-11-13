@@ -434,8 +434,8 @@ newest, per repository store) or during it. An audit whose stores need no URL (a
 open ledger, or no record before the turn) passes on the mention alone; which audit a URL is given
 to is the judge's to grade. `oobe_audits_started`, in its own module
 (`bench/kube_agents_bench/oobe.py`), reads the stack's state file and the Platform Agent's
-`cron/executions.db` in the agent pod (with no state file, the install's own first run, provided the
-stage's record is less than a day old; otherwise an error), and passes when the stage's `.oobe_audits_fired` lists each
+`cron/executions.db` in the agent pod (with no state file, the install's own first run when the stack
+chose it, which it records in `.bench-oobe-own.json`; with neither, an error), and passes when the stage's `.oobe_audits_fired` lists each
 of the five first-run audits as marked due and each has a run claimed since the stage marked it
 that got going (running, completed, or ended after its start), each starting only after the one before it in the chain ended.
 `workload_incident_folded`, in its own module (`bench/kube_agents_bench/incidents.py`), reads a

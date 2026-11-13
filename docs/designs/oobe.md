@@ -328,9 +328,10 @@ an image without the job, no audit runs. Green, from the verifier on a dev insta
 real audit runs only when it re-arms the stage, and it declares no streams. Every unit on an audit stream first waits, up to two hours, while the install
 has a run of that audit claimed, running or marked due, a stage under way is to mark it next, or a
 stage this case armed and could not disarm has still to run it (`wait_platform_runs` in
-`hack/ci-eval-pr.sh`). That keeps the nightly's audit cases from running beside this case's last
-audit or a run the fresh CI install started itself, and holds the next repetition's arm until the
-last run ends. A fresh install's chain is waited on only once it has started, and only for the audit
+`hack/ci-eval-pr.sh`). That keeps the nightly's audit cases from running beside a run the fresh CI
+install started itself. A stand-in armed on a long-lived install starts five real runs with no
+stream lock held, so run it there alone; the stage itself holds a repetition's first mark until the
+previous one's audit has ended. A fresh install's chain is waited on only once it has started, and only for the audit
 it marks next, which costs a case at most about two audit runs (the one before it, then its own): an audit the chain reaches later, after the case's run holds the
 stream's in-flight note, has its `start` refused, and only between two repositories of a run can
 the install's run take the stream and leave the case's run partial. Waiting out the whole chain
@@ -342,8 +343,8 @@ forge: the shared install has a repository, and removing it mid-run would break 
 
 - **Chain length.** Each audit took one to eight minutes on a four-cluster install with
   the install's default model, so with the retrospective fifth the stage is done, the four audits ended
-  and the fifth started, within about forty minutes of the scan there, inside the eval stack's
-  hour-long wait. On a large fleet the last audit may land an hour or more after the scan.
+  and the fifth started, within about forty minutes of the scan there. On the 2026-11-10 presubmits a
+  fresh install's chain ended 52-115 minutes after the fan-out, inside the eval stack's `own_wait`. On a large fleet the last audit may land an hour or more after the scan.
 - **Output volume.** How many pull requests and chat lines a first run produces on a real fleet. If
   it reads as noise, day one narrows to fewer audits. The inventory report no longer duplicates any
   of the four (#2386), so the choice is about volume, not overlap.

@@ -18,10 +18,9 @@
 scan settles -- the four fleet audits, then the upgrade retrospective -- by marking each
 due on that profile's roster. A started audit leaves a
 row in the profile's ``cron/executions.db``. On a fresh install the case's stack
-(``bench/tf/prebuilt/oobe-first-run-audits``) arms nothing and writes no state file, and
-this grades the install's own chain, provided the stage's record was written within
-FRESH_SECONDS; on a long-lived install the stack records when it armed the stage in its
-state file. The stage records when it marked each audit; this passes when every audit it
+(``bench/tf/prebuilt/oobe-first-run-audits``) arms nothing and records that it chose the
+install's own first run (OWN_STATE_FILE), and this grades that chain; on a long-lived install
+the stack records when it armed the stage in its state file. The stage records when it marked each audit; this passes when every audit it
 marked has a run of its own claimed at or after its mark that got going (running, completed, or
 ended after it started), and every other audit is one it adopted (a run completed since the
 sweep).
@@ -33,7 +32,6 @@ Its own module rather than a section of ``verifiers.py``, registered through the
 import json
 import os
 import shlex
-import time
 from datetime import datetime
 from typing import Any, Callable, Literal
 
@@ -53,9 +51,9 @@ STATE_FILE = f"{DATA_ROOT}/.bench-oobe.json"
 AUDITS_MARKER = f"{DATA_ROOT}/.oobe_audits_fired"
 PLATFORM_EXECUTIONS_DB = f"{DATA_ROOT}/profiles/platform/cron/executions.db"
 STARTS_READ = "__OOBE_STARTS_READ__"
-# bench/tf/prebuilt/oobe-first-run-audits/own_stage.py: FRESH_SECONDS, how recent the stage's
-# record must be for the install's own chain to be graded.
-FRESH_SECONDS = 24 * 60 * 60
+# bench/tf/prebuilt/oobe-first-run-audits/own_stage.py: OWN_STATE, written when the stack found
+# the install's own first run recent and armed nothing.
+OWN_STATE_FILE = f"{DATA_ROOT}/.bench-oobe-own.json"
 # A run that got going by its status; a run that ended otherwise counts too when it has a
 # started_at (it began, then failed or was cut off). A row with no start time ran nothing.
 STARTED_STATUSES = ("running", "completed")
@@ -74,17 +72,17 @@ DEFAULT_AGENT_DEPLOYMENT = "platform-agent-gateway"
 _STARTS_SCRIPT = """
 import json, os, sqlite3, sys
 from datetime import datetime
-state, marker, db, sentinel, audits = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5:]
+state, own_state, marker, db, sentinel, audits = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6:]
 SQLITE_BUSY_TIMEOUT = 10
 SKIPPED = "skipped"
 out = {"applied_at": None, "marked": [], "adopted": [], "runs": {}, "error": None, "held": {}, "gave_up": [], "skipped": None,
-       "own": False, "at": None}
+       "own": False}
 marks = {}
 try:
     out["applied_at"] = json.load(open(state))["applied_at"]
 except FileNotFoundError:
-    # Nothing armed: the install's own first run is the one graded.
-    out["own"] = True
+    # Nothing armed: the install's own first run is graded if the stack chose it.
+    out["own"] = os.path.exists(own_state)
 except (OSError, ValueError, KeyError, TypeError) as exc:
     out["error"] = "%s: %s" % (state, exc)
 try:
@@ -95,8 +93,6 @@ try:
     out["gave_up"] = recorded.get("gave_up") or []
     out["skipped"] = recorded.get("reason") if recorded.get("skipped") else None
     marks = {a: t for a, t in (recorded.get("marks") or {}).items() if isinstance(t, (int, float))}
-    at = recorded.get("at")
-    out["at"] = at if isinstance(at, (int, float)) else None
 except (OSError, ValueError, AttributeError, TypeError):
     pass
 # The install's own chain: its window opens at the stage's first mark (each audit's own
@@ -132,7 +128,7 @@ def agent_shell(script: str, timeout: float) -> str:
 def starts_command() -> str:
     """The ``sh -c`` line that runs the read in the agent container."""
     args = " ".join(
-        shlex.quote(a) for a in [STATE_FILE, AUDITS_MARKER, PLATFORM_EXECUTIONS_DB, STARTS_READ, *FIRST_RUN_AUDITS]
+        shlex.quote(a) for a in [STATE_FILE, OWN_STATE_FILE, AUDITS_MARKER, PLATFORM_EXECUTIONS_DB, STARTS_READ, *FIRST_RUN_AUDITS]
     )
     return (
         f'PY={shlex.quote(HERMES_PYTHON)}; [ -x "$PY" ] || PY={shlex.quote(FALLBACK_PYTHON)}; '
@@ -189,22 +185,12 @@ class OobeAuditsStartedVerifier(_OnboardingPollVerifier):
         if read.get("error"):
             return "error", f"the stack's state file or the Platform Agent's cron store could not be read: {read['error']}", read
         own = bool(read.get("own"))
-        if own:
-            # No state file is the install's own first run only when that run is recent: never a
-            # pass on a long-lived install's chain from long ago.
-            at = read.get("at")
-            if not isinstance(at, (int, float)) or time.time() - at >= FRESH_SECONDS:
-                when = "left no record" if not isinstance(at, (int, float)) else f"was last recorded {int((time.time() - at) // 3600)}h ago"
-                return "error", (
-                    f"there is no {STATE_FILE}, and the install's own first-run stage {when}: "
-                    "the stack neither armed the stage nor found a recent first run"
-                ), read
         if read.get("applied_at"):
             armed = datetime.fromisoformat(read["applied_at"]).isoformat()
         elif own:
             armed = "the install's first run began"
         else:
-            return "error", f"there is no {STATE_FILE}: the stack did not arm the stage", read
+            return "error", f"there is no {STATE_FILE} or {OWN_STATE_FILE}: the stack neither armed the stage nor chose the install's own first run", read
         runs, marked = read["runs"], set(read.get("marked") or [])
         # An audit the stage passed over because it had completed a run since the sweep (a
         # scheduled one): already had, so not required to be the stage's, and outside the chain.

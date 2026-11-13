@@ -29,8 +29,10 @@ Prints `pending` or `clear`.
 
 With `fresh`, prints whether the install's own first run is this install's: `fresh` when the
 stage's record was last written (its `at`, which the disarm restores with the rest) within
-FRESH_SECONDS, `stale` otherwise or with no record. A fresh first run is the one the case grades;
-on a stale one (a long-lived install that onboarded long ago) the stack arms a stand-in.
+FRESH_SECONDS, `stale` otherwise or with no record. A fresh first run is the one the case grades,
+and this records that decision in OWN_STATE for the verifier, which reads it rather than judging
+the record's age a second time; the disarm removes it. On a stale one (a long-lived install that
+onboarded long ago) the stack arms a stand-in.
 """
 
 import json
@@ -46,6 +48,8 @@ AUDITS_MARKER = os.path.join(home, ".oobe_audits_fired")
 COMPLETED_MARKER = os.path.join(home, ".bootstrap_completed")
 DONE_KEY = "done"
 AT_KEY = "at"
+# bench/kube_agents_bench/oobe.py: OWN_STATE_FILE; disarm.py removes it.
+OWN_STATE = os.path.join(home, ".bench-oobe-own.json")
 # agents/chat/scripts/oobe.py: NEW_INSTALL_SECONDS, the stage's own idea of a new install. A
 # nightly shard grades this case up to its fourteen-hour budget after the install's first run.
 FRESH_SECONDS = 24 * 60 * 60
@@ -57,6 +61,11 @@ if sys.argv[2:] == ["fresh"]:
     except (OSError, ValueError, AttributeError):
         at = None
     fresh = isinstance(at, (int, float)) and time.time() - at < FRESH_SECONDS
+    if fresh:
+        tmp = OWN_STATE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"first_run_at": at, "decided_at": time.time()}, fh)
+        os.replace(tmp, OWN_STATE)
     print("fresh" if fresh else "stale")
     sys.exit(0)
 

@@ -471,6 +471,8 @@ class PlantScriptsTest(unittest.TestCase):
         import time
         (self.home / ".oobe_audits_fired").write_text(json.dumps({"done": True, "at": time.time() - 3600}))
         self.assertEqual(self._fresh(), "fresh")
+        # The choice is recorded for the verifier, which reads it rather than the clock.
+        self.assertTrue((self.home / ".bench-oobe-own.json").exists())
         # A stage that skipped the audits on this install is this install's first run too.
         (self.home / ".oobe_audits_fired").write_text(json.dumps({"done": True, "skipped": True, "at": time.time()}))
         self.assertEqual(self._fresh(), "fresh")
@@ -483,6 +485,13 @@ class PlantScriptsTest(unittest.TestCase):
         self.assertEqual(self._fresh(), "stale")
         (self.home / ".oobe_audits_fired").unlink()
         self.assertEqual(self._fresh(), "stale")
+        self.assertFalse((self.home / ".bench-oobe-own.json").exists())
+
+    def test_the_disarm_removes_the_own_choice(self):
+        (self.home / ".bench-oobe-own.json").write_text("{}")
+        done = self._run("disarm.py", str(self.home), str(self.hermes))
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertFalse((self.home / ".bench-oobe-own.json").exists())
 
     def test_a_disarm_puts_back_the_record_and_its_age(self):
         # The arm removes the record and the disarm restores it whole, `at` included, so a
