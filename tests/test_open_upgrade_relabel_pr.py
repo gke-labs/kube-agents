@@ -31,6 +31,7 @@ SCRIPT = "scripts/release/open_upgrade_relabel_pr.sh"
 BRANCH = "relabel-upgrade-table/1.0.0"
 STUB = """#!/bin/sh
 echo "$(basename "$0") $*" >> "{log}"
+if [ "$(basename "$0")" = npx ]; then echo "npx GH_TOKEN=${{GH_TOKEN:-unset}}" >> "{log}"; fi
 if [ "$(basename "$0")" = gh ] && [ "$1 $2" = "pr list" ]; then printf '%s' "${{STUB_OPEN_PR:-}}"; fi
 exit 0
 """
@@ -91,6 +92,14 @@ class OpenUpgradeRelabelPrTest(unittest.TestCase):
         self.assertIn("relabel the rows 1.0.0 shipped, fixing main's Documentation Checks", create[0])
         self.assertIn("`a shipped change` → 1.0.0", self.log.read_text(encoding="utf-8"))
         self.assertTrue(any(c.startswith("npx --yes prettier@3.9.6 --write") for c in self.calls()))
+
+    def test_prettier_from_npm_never_sees_the_token(self):
+        self.repo.commit("feat: shipped", row=row("pending", "a shipped change"))
+        self.repo.tag("1.0.0")
+        result = self.run_script(GH_TOKEN="a-test-token")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("npx GH_TOKEN=unset", self.calls())
+        self.assertNotIn("a-test-token", self.log.read_text(encoding="utf-8"))
 
     def test_nothing_to_relabel_pushes_nothing_and_opens_nothing(self):
         self.repo.commit("feat: not yet", row=row("pending", "an unshipped change"))

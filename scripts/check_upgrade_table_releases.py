@@ -6,7 +6,8 @@
 The "Breaking changes in recent releases" table labels each row with the release an operator
 first meets the change in. A label a pull request writes for the release its author expects next
 is often wrong, because a release can be cut from an earlier commit, so a new row says `pending`
-and is relabelled after its release ships. Once a
+and is relabelled after its release ships: the release job opens the pull request that does it
+(scripts/release/open_upgrade_relabel_pr.sh), by pending_row_release and labelled_row_problem below. Once a
 release is tagged, this check finds the commit that added each row labelled with it (the oldest
 commit whose diff adds a release or `pending` row whose change cell is the change text, after the
 last commit that removed such a row) and requires the tag to contain that commit, or the tag's own copy of the table to hold the row (a change and its row cherry-picked
@@ -429,28 +430,36 @@ def problems(traced: dict[str, str]) -> list[tuple[Row, str]]:
             continue
         if row.release not in tags or tag_time(row.release) < table_time:
             continue
-        where = f"{UPGRADE_PAGE}:{row.line}"
-        if row.change in traced:
-            if git_ok("merge-base", "--is-ancestor", traced[row.change], f"refs/tags/{row.release}"):
-                continue
-            found.append((row, f"{where}: the row \"{row.change}\" is labelled {row.release}, but {row.release} "
-                               f"does not contain {traced[row.change][:12]}, the commit {TRACES_FILE} names for it"))
-            continue
-        commit = row_commit(row.change)
-        if commit is None:
-            found.append((row, f"{where}: no commit in this history adds the row \"{row.change}\", so its "
-                               f"{row.release} label cannot be checked"))
-            continue
-        if git_ok("merge-base", "--is-ancestor", commit, f"refs/tags/{row.release}"):
-            continue
-        if any(tagged.change == row.change for tagged in rows(page_at(row.release))):
-            continue
-        first = first_release_containing(commit)
-        label = f"{first}, the first release that contains it" if first else f"{PENDING}: no release contains it yet"
-        found.append((row, f"{where}: the row \"{row.change}\" is labelled {row.release}, but {row.release} "
-                           f"does not contain {commit[:12]}, the commit that added it. Relabel it as {label}."
-                           + TRACE_HINT))
+        if problem := labelled_row_problem(row, traced):
+            found.append((row, problem))
     return found
+
+
+def labelled_row_problem(row: Row, traced: dict[str, str]) -> str | None:
+    """Why a row labelled with a tagged release is wrong, or None when that release contains it.
+
+    The release job's relabel (relabel_upgrade_table_pending.py) asks this of each label it would write,
+    and leaves a row `pending` rather than write one this rejects.
+    """
+    where = f"{UPGRADE_PAGE}:{row.line}"
+    if row.change in traced:
+        if git_ok("merge-base", "--is-ancestor", traced[row.change], f"refs/tags/{row.release}"):
+            return None
+        return (f"{where}: the row \"{row.change}\" is labelled {row.release}, but {row.release} "
+                f"does not contain {traced[row.change][:12]}, the commit {TRACES_FILE} names for it")
+    commit = row_commit(row.change)
+    if commit is None:
+        return (f"{where}: no commit in this history adds the row \"{row.change}\", so its "
+                f"{row.release} label cannot be checked")
+    if git_ok("merge-base", "--is-ancestor", commit, f"refs/tags/{row.release}"):
+        return None
+    if any(tagged.change == row.change for tagged in rows(page_at(row.release))):
+        return None
+    first = first_release_containing(commit)
+    label = f"{first}, the first release that contains it" if first else f"{PENDING}: no release contains it yet"
+    return (f"{where}: the row \"{row.change}\" is labelled {row.release}, but {row.release} "
+            f"does not contain {commit[:12]}, the commit that added it. Relabel it as {label}."
+            + TRACE_HINT)
 
 
 def comparison_base() -> str | None:

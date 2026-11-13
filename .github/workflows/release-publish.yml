@@ -295,6 +295,8 @@ jobs:
   relabel-upgrade-table:
     name: Open the Upgrade-Table Relabel Pull Request
     runs-on: ubuntu-latest
+    # The workflow's concurrency group is held until this job ends.
+    timeout-minutes: 10
     needs: publish-release
     if: |
       github.repository == 'gke-labs/kube-agents' &&
@@ -322,7 +324,9 @@ jobs:
           ref: refs/heads/main
           fetch-depth: 0
           fetch-tags: true
-          token: ${{ steps.relabel-token.outputs.token }}
+          # The script hands the token to its push alone, so nothing it runs
+          # before (the relabel, prettier from npm) can read it from .git/config.
+          persist-credentials: false
 
       - name: Relabel and open the pull request
         env:

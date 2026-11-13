@@ -37,14 +37,15 @@ GIT_USER_EMAIL="${GIT_USER_EMAIL:-kube-agents-release-bot@users.noreply.github.c
 
 cd "${REPO_ROOT}"
 
-relabelled="$(python3 scripts/relabel_upgrade_table_pending.py)"
+# Neither the relabel nor prettier (fetched from npm) needs the token, so neither gets it.
+relabelled="$(env -u GH_TOKEN python3 scripts/relabel_upgrade_table_pending.py)"
 if [ -z "${relabelled}" ]; then
   echo "✅ No pending row of the upgrade table is in a release; nothing to relabel."
   exit 0
 fi
 
 # A label wider than the column changes its alignment; prettier puts the table back as CI checks it.
-npx --yes "prettier@${PRETTIER_VERSION}" --write "${UPGRADE_PAGE}" >/dev/null
+env -u GH_TOKEN npx --yes "prettier@${PRETTIER_VERSION}" --write "${UPGRADE_PAGE}" >/dev/null
 
 if git diff --quiet -- "${UPGRADE_PAGE}"; then
   echo "✅ The relabel left the page unchanged; nothing to open."
@@ -53,14 +54,19 @@ fi
 
 rows="$(printf '%s\n' "${relabelled}" | awk -F '\t' '{printf "- `%s` → %s\n", $2, $1}')"
 
-git switch --create "${RELABEL_BRANCH}"
+git switch -C "${RELABEL_BRANCH}"
 git -c user.name="${GIT_USER_NAME}" -c user.email="${GIT_USER_EMAIL}" commit --quiet -m "${COMMIT_MESSAGE}" -- "${UPGRADE_PAGE}"
-# The branch is this script's own, named for the release, so a re-run replaces it.
-git push --force origin "HEAD:refs/heads/${RELABEL_BRANCH}"
+# The branch is this script's own, named for the release, so a re-run replaces it. The checkout keeps no
+# credentials (persist-credentials: false); the token is handed to this one push as a header.
+push_auth=()
+if [ -n "${GH_TOKEN:-}" ]; then
+  push_auth=(-c "http.https://github.com/.extraheader=AUTHORIZATION: basic $(printf 'x-access-token:%s' "${GH_TOKEN}" | base64 | tr -d '\n')")
+fi
+git ${push_auth[@]+"${push_auth[@]}"} push --force origin "HEAD:refs/heads/${RELABEL_BRANCH}"
 
 # read, not $(cat <<EOF): bash 3.2 misparses an apostrophe in a here-document inside $(...).
 IFS= read -r -d '' body <<EOF || true
-Release ${RELEASE_VERSION} contains these rows of the upgrade page's breaking-changes table, which still said \`pending\`:
+These rows of the upgrade page's breaking-changes table still said \`pending\`, though a release now contains each. Each is relabelled with the first release that contains it:
 
 ${rows}
 

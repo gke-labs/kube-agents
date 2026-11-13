@@ -37,16 +37,28 @@ OUTPUT_SEPARATOR = "\t"
 LINE_BREAK = "\n"
 
 
-def relabels(page: str, tags: set[str], traced: dict[str, str]) -> list[tuple[check.Row, str]]:
-    """Each `pending` row of `page` that a release contains, with that release, in page order."""
-    found = []
+def relabels(page: str, tags: set[str], traced: dict[str, str]) -> tuple[list[tuple[check.Row, str]], list[str]]:
+    """Each `pending` row of `page` that a release contains, with that release, in page order; and why any
+    such row is left `pending`.
+
+    A row is relabelled only when the check would accept the new label (labelled_row_problem). The one
+    case it would not: a row TRACES_FILE names a main commit for, which reached a release by a cherry-pick
+    that release's table holds. The check reads a labelled traced row by its commit alone, so that row is
+    left for a person to label and trace.
+    """
+    found, left = [], []
     for row in check.rows(page):
         if row.release != check.PENDING:
             continue
         shipping = check.pending_row_release(row, tags, traced)
-        if shipping is not None:
-            found.append((row, shipping[0]))
-    return found
+        if shipping is None:
+            continue
+        labelled = check.Row(row.line, shipping[0], row.change)
+        if problem := check.labelled_row_problem(labelled, traced):
+            left.append(f"left {check.PENDING}: {problem}")
+            continue
+        found.append((row, shipping[0]))
+    return found, left
 
 
 def relabelled(page: str, labels: list[tuple[check.Row, str]]) -> str:
@@ -71,7 +83,9 @@ def main() -> int:
     traced, _ = check.traces()
     page_path = Path(check.git("rev-parse", "--show-toplevel").strip()) / check.UPGRADE_PAGE
     page = page_path.read_text(encoding="utf-8")
-    labels = relabels(page, check.release_tags(), traced)
+    labels, left = relabels(page, check.release_tags(), traced)
+    for note in left:
+        print(f"{check.WARNING_PREFIX}{note}", file=sys.stderr)
     if labels:
         page_path.write_text(relabelled(page, labels), encoding="utf-8")
     for row, release in labels:

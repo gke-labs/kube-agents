@@ -76,6 +76,21 @@ class RelabelUpgradeTablePendingTest(unittest.TestCase):
         relabel(self.repo)
         self.assertIn("| 10.10.10 | a shipped change | x |", page(self.repo))
 
+    def test_a_traced_row_a_release_holds_only_by_cherry_pick_stays_pending_with_a_warning(self):
+        """The check reads a labelled traced row by its commit alone, so a label from the release's own
+        table would fail it: the row is left for a person."""
+        base = self.repo.git("rev-parse", "HEAD").strip()
+        shipped = self.repo.commit("feat: c", row=row("pending", "a cherry-picked change"))
+        self.repo.git("checkout", "-q", "-b", "release-line", base)
+        self.repo.git("cherry-pick", shipped)
+        self.repo.tag("1.0.0")
+        self.repo.git("checkout", "-q", "main")
+        self.repo.trace(f"{shipped} a cherry-picked change")
+        code, out, err = relabel(self.repo)
+        self.assertEqual((code, out), (0, ""))
+        self.assertIn("left pending:", err)
+        self.assertIn("| pending | a cherry-picked change | x |", page(self.repo))
+
     def test_a_shallow_clone_is_refused(self):
         self.repo.commit("feat: shipped", row=row("pending", "a shipped change"))
         shallow = Path(self.tmp.name) / "shallow"
