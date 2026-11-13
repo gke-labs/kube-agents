@@ -12424,6 +12424,37 @@ spec:
                         type: string
                       type: array
                       x-kubernetes-list-type: set
+                    autonomousNegativeFeedbackTotal:
+                      description: |-
+                        AutonomousNegativeFeedbackTotal is the cumulative count of
+                        thumbs-downs verified chat users gave the posts the agent made on its
+                        own (alerts and scheduled or audit reports), counted apart from the
+                        answers NegativeFeedbackTotal counts so a thumbs-down on a noisy alert
+                        reads as noise rather than a bad answer:
+                        kubeagents_a2a_gateway_post_feedback_total under rating down, summed
+                        over its other labels, one count each time a user's rating of a post
+                        becomes down, so a repeated tap adds nothing. Read every five minutes
+                        and kept monotonic the same way as ToolExecutionsTotal. Next mode
+                        only: on a today-mode install this stays at 0. Does not move
+                        LastActiveTime: a rating is a person's verdict on a post, not the
+                        agent at work.
+                      format: int64
+                      type: integer
+                    autonomousPositiveFeedbackTotal:
+                      description: |-
+                        AutonomousPositiveFeedbackTotal is the cumulative count of thumbs-ups
+                        verified chat users gave the posts the agent made on its own (alerts
+                        and scheduled or audit reports), counted apart from the answers
+                        PositiveFeedbackTotal counts so a post's rating never reads as an
+                        answer's: kubeagents_a2a_gateway_post_feedback_total under rating up,
+                        summed over its other labels, one count each time a user's rating of a
+                        post becomes up, so a repeated tap adds nothing. Read every five
+                        minutes and kept monotonic the same way as ToolExecutionsTotal. Next
+                        mode only: on a today-mode install this stays at 0. Does not move
+                        LastActiveTime: a rating is a person's verdict on a post, not the
+                        agent at work.
+                      format: int64
+                      type: integer
                     backgroundTasksGaveUpTotal:
                       description: |-
                         BackgroundTasksGaveUpTotal is the cumulative count of background cards on
@@ -12588,9 +12619,10 @@ spec:
                         moved: a brokered command ran or was refused, a proposal was opened, a
                         chat message reached the gateway, or an event was accepted for triage;
                         BrokerFailuresTotal, ChatTurnsErroredTotal, BackgroundTasksGaveUpTotal,
-                        NegativeFeedbackTotal, PositiveFeedbackTotal and the three inference
-                        totals (InputTokensTotal, OutputTokensTotal, SpendMicrosUSDTotal) alone
-                        leave it where it was, and the six proposal readings never move it.
+                        NegativeFeedbackTotal, PositiveFeedbackTotal, the two autonomous
+                        feedback totals and the three inference totals (InputTokensTotal,
+                        OutputTokensTotal, SpendMicrosUSDTotal) alone leave it where it was,
+                        and the six proposal readings never move it.
                         Scheduled maintenance jobs that run brokered commands move it too --
                         the Controller Stall Watch cron runs some every 30 minutes by default
                         -- so it marks agent activity of any origin, not human or operator use
