@@ -1503,6 +1503,24 @@ func TestPodUsageSource_ReadsTheDispatchersFailingBoards(t *testing.T) {
 		t.Fatalf("an age past int64: err %v, want a sample error", err)
 	}
 
+	// A stuck board needs no failed tick.
+	reading, err = scrape(chat(
+		"# TYPE kubeagents_kanban_dispatcher_stuck_seconds gauge",
+		`kubeagents_kanban_dispatcher_stuck_seconds{board="default"} 250`,
+	), usageChatCounters)
+	if err != nil {
+		t.Fatalf("Scrape with a stuck board: %v", err)
+	}
+	wantStuck := []usageDispatcherStuck{{Board: "default", Seconds: 250}}
+	if reading.Dispatcher == nil || len(reading.Dispatcher.Failing) != 0 || !reflect.DeepEqual(reading.Dispatcher.Stuck, wantStuck) {
+		t.Fatalf("stuck dispatcher = %+v, want %+v and no failing boards", reading.Dispatcher, wantStuck)
+	}
+	_, err = scrape(chat(`kubeagents_kanban_dispatcher_stuck_seconds{board="default"} 1e20`), usageChatCounters)
+	var stuckErr *usageScrapeError
+	if !errors.As(err, &stuckErr) || stuckErr.Kind != usageScrapeKindSample {
+		t.Fatalf("a stuck age past a time.Duration: err %v, want a sample error", err)
+	}
+
 	many := make([]string, 0, usageDispatcherBoardCeiling+1)
 	for i := 0; i <= usageDispatcherBoardCeiling; i++ {
 		many = append(many, fmt.Sprintf(`kubeagents_kanban_dispatcher_failed_ticks{board="b%d",error="OSError"} 1`, i))

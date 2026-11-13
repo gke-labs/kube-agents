@@ -214,7 +214,7 @@ CI enforcement: `make docs-check` runs the same checks as
   once a release is tagged, every row of the upgrade page's breaking-changes
   table labelled with it must come from a commit the tag contains (or sit in the
   tag's own copy of the table). Write `pending` for a new row; it fails once a
-  release contains it, and the message names the release to write. For a
+  release contains it, and the message names the release to write. The release job opens a pull request that relabels such rows once a release is tagged (`scripts/release/open_upgrade_relabel_pr.sh`). For a
   reworded shipped row or a row added after its release was tagged,
   `scripts/upgrade_table_traces.txt` names the commit that shipped the change,
   and the tag must contain that commit instead. A pull request or merge group

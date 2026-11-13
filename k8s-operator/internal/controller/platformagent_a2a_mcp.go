@@ -189,6 +189,8 @@ func buildA2AMCPDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deploymen
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},
 				Spec: withA2AMCPBrokerAccess(agent, corev1.PodSpec{
+					// ndots:3, see brokerCallerPodDNSConfig.
+					DNSConfig: brokerCallerPodDNSConfig(),
 					// It never talks to the API server.
 					AutomountServiceAccountToken: ptr.To(false),
 					SecurityContext: &corev1.PodSecurityContext{

@@ -70,8 +70,9 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # chart ships selects agent bindings by that suffix, so a name outside it goes
 # unselected; the plan is refused instead (variables.tf has the detail).
 # The installer front doors regenerate this file on every run, so through
-# install.sh/upgrade.sh set PLATFORM_AGENT_GSA_NAME, GITHUB_MINTER_GSA_NAME and
-# LITELLM_GSA_NAME in install.env instead of editing here. The KSA name has no
+# install.sh/upgrade.sh set PLATFORM_AGENT_GSA_NAME, GITHUB_MINTER_GSA_NAME,
+# GITHUB_MINTER_KSA_NAME and LITELLM_GSA_NAME in install.env instead of editing
+# here (install.sh names and records a new install's minter KSA itself). The KSA name has no
 # install.env key of its own yet, so it goes in the same file as
 # TF_VAR_agent_ksa_name=... — the generator never writes agent_ksa_name, so
 # nothing in this file overrides it.
@@ -79,6 +80,7 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # github_minter_service_account_id = "kubeagents-github-minter-gsa-2"
 # litellm_service_account_id       = "kubeagents-litellm-gsa-2"
 # agent_ksa_name                   = "kubeagents-platform-2-agent"
+# github_minter_ksa_name           = "<cluster>-github-minter"
 
 # Cluster tuning
 # deletion_protection = true
