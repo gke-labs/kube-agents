@@ -282,6 +282,16 @@ SOURCES: dict[str, Source] = {
         "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
         ("kind: Deployment", "policy.json"),
     ),
+    # The spec.mode: next fixture: the only golden that renders the roles the
+    # operator mints for the A2A stack (the A2A gateway's and the auth
+    # callout's, and the dispatcher's once it renders by default). Not in
+    # _GOLDEN_KEYS: the today-mode invariants that walk those don't hold for
+    # next by design, so a test that wants it reads it by name.
+    "golden_next": Source(
+        "k8s-operator/internal/testing/testdata/platform/expected/"
+        "platformagent-next.yaml",
+        ("name: platformagent-a2a-gateway", "name: platformagent-a2a-callout"),
+    ),
     "golden_scoped_sa": Source(
         "k8s-operator/internal/testing/testdata/platform/expected/"
         "platformagent-scoped-sa.yaml",
@@ -644,7 +654,7 @@ SOURCES: dict[str, Source] = {
     # test can hold them equal.
     "a2a_worker_adapter_mcp": Source(
         "a2a/worker-adapter/mcp.go",
-        ("func delegateToolSchema(", '"required": []string{"addressee", "text"}'),
+        ("func delegateToolSchema(", 'required := []string{"addressee", "text"}'),
     ),
     # The gateway's side of the delegate artifact: the switch that routes it
     # off the ordinary chat-rendering path, and the gateway's own copy of the

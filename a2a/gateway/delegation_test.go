@@ -12,7 +12,6 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -120,6 +119,7 @@ func platformSubmissions(t *testing.T, r *rig) int {
 // capability resolves for platform, it is the active task, the chain is on
 // the record, and the parent's own terminal does not disturb it.
 func TestADelegateArtifactMintsAChildToPlatform(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	ctx := context.Background()
 	conv := "discord:g1/thread-del"
@@ -253,6 +253,7 @@ func TestADelegateArtifactMintsAChildToPlatform(t *testing.T) {
 // restart or a failed relay write at that point must not leave the child on
 // record with a parent that looks like it never delegated.
 func TestTheParentsLinkIsWrittenWithTheChild(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	ctx := context.Background()
 	conv := "discord:g1/t-link"
@@ -298,6 +299,7 @@ func TestTheParentsLinkIsWrittenWithTheChild(t *testing.T) {
 // TestDelegateAllowlist: the check against the platform agent's list for the
 // requester's backend. The rig's backend is discord and its author 1001.
 func TestDelegateAllowlist(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name  string
 		lists map[string][]string
@@ -342,6 +344,7 @@ func TestDelegateAllowlist(t *testing.T) {
 // TestDelegateRefusalsWithANotice: the refusals the conversation is told
 // about. Each mints nothing.
 func TestDelegateRefusalsWithANotice(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name      string
 		addressee string
@@ -396,6 +399,7 @@ func TestDelegateRefusalsWithANotice(t *testing.T) {
 // TestADepthUnderTheBoundMints: the bound refuses at the bound, not one
 // short of it.
 func TestADepthUnderTheBoundMints(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	conv := "discord:g1/t-depth-ok"
 	exec, origin, _ := sessionTurn(t, r, spawn, conv, "x")
@@ -418,6 +422,7 @@ func TestADepthUnderTheBoundMints(t *testing.T) {
 // TestADelegateIsIgnoredAndLogged: the cases that mint nothing and tell the
 // conversation nothing, each observable as its warning line.
 func TestADelegateIsIgnoredAndLogged(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		// edit runs on the stored record before the artifact is published.
@@ -523,6 +528,7 @@ func assertNoNoticeAtTheEnd(t *testing.T, r *rig, exec *lib.TaskExecution, taskI
 // TestARepeatDelegateMintsNoSecondChild: one child at a time, and a repeat
 // from the parent is ignored and logged, not refused with a notice.
 func TestARepeatDelegateMintsNoSecondChild(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	ctx := context.Background()
 	conv := "discord:g1/t-busy"
@@ -557,6 +563,7 @@ func TestARepeatDelegateMintsNoSecondChild(t *testing.T) {
 // conversation's events in order, so by the time it lands the late artifact
 // has been dealt with.
 func TestADelegateAfterTheTerminalMintsNothing(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	ctx := context.Background()
 	conv := "discord:g1/t-late"
@@ -585,6 +592,7 @@ func TestADelegateAfterTheTerminalMintsNothing(t *testing.T) {
 // way the relay finds the turn detached and canceled, ignores the request
 // as stale, posts nothing about it, and nothing reaches platform.
 func TestAStoppedTurnDoesNotDelegate(t *testing.T) {
+	t.Parallel()
 	assertIgnored := func(t *testing.T, r *rig, exec *lib.TaskExecution, taskID string) {
 		t.Helper()
 		waitFor(t, "ignore line", loggedContaining(r, "delegation ignored", "rule="+ruleDelegationStale, "stopped=true", taskID))
@@ -652,6 +660,7 @@ func TestAStoppedTurnDoesNotDelegate(t *testing.T) {
 // audit lines carry it cut to delegateAddresseeLogCap, and the request is
 // refused under the target rule as any other addressee would be.
 func TestAnOversizedAddresseeIsCappedInTheAuditLines(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	ctx := context.Background()
 	conv := "discord:g1/t-long-addressee"
@@ -686,6 +695,7 @@ func TestAnOversizedAddresseeIsCappedInTheAuditLines(t *testing.T) {
 // TestADelegateFromAFixedRoutePlatformTaskIsIgnored: platform may not
 // delegate to itself; only the conversation's own session may ask.
 func TestADelegateFromAFixedRoutePlatformTaskIsIgnored(t *testing.T) {
+	t.Parallel()
 	r, _ := startRigWithSpawner(t)
 	ctx := context.Background()
 	conv := "discord:g1/t-fixed"
@@ -704,6 +714,7 @@ func TestADelegateFromAFixedRoutePlatformTaskIsIgnored(t *testing.T) {
 // child was addressed to platform, not to the session, so that is not a
 // request from the conversation's session turn and mints nothing.
 func TestTheSessionCannotDelegateForItsChild(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	ctx := context.Background()
 	conv := "discord:g1/t-forchild"
@@ -753,6 +764,7 @@ func postIndex(r *rig, needle string) int {
 // session's "delegated to platform" and then the refusal, so the notice waits
 // for the delegating turn's terminal, from the executor or the supervisor.
 func TestARefusalFollowsTheDelegatingTurnsAnswer(t *testing.T) {
+	t.Parallel()
 	const notice = `there is no agent profile named "chat-other-1"`
 	for _, supervisor := range []bool{false, true} {
 		name := "executor terminal"
@@ -795,7 +807,7 @@ func TestARefusalFollowsTheDelegatingTurnsAnswer(t *testing.T) {
 // submission to platform; given platform, a wake's on a fresh incarnation.
 func narrowTasksStream(t *testing.T, url, session string) {
 	t.Helper()
-	nc, err := nats.Connect(url)
+	nc, err := connectTest(url)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -821,6 +833,7 @@ func narrowTasksStream(t *testing.T, url, session string) {
 // leaves the parent the conversation's task with no child, no child entry in
 // the history and no index entry for the child.
 func TestAChildThatCannotReachTheBusLeavesNoChain(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	ctx := context.Background()
 	conv := "discord:g1/t-nobus"
@@ -869,6 +882,7 @@ func TestAChildThatCannotReachTheBusLeavesNoChain(t *testing.T) {
 // detaches the child without ending it; a later turn's request is refused,
 // after that turn's answer, naming the running child.
 func TestOneLiveChildPerConversation(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	ctx := context.Background()
 	conv := "discord:g1/t-onelive"
@@ -1028,6 +1042,7 @@ func delegated(t *testing.T, r *rig, spawn *fakeSpawner, conv, backend string) (
 // posts its result, then one wake turn starts on a fresh incarnation under
 // the delegating turn's attribution, with the chain and depth on the record.
 func TestTheChildsTerminalWakesTheSessionWithTheResult(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	ctx := context.Background()
 	conv := "discord:g1/t-wake"
@@ -1093,6 +1108,7 @@ func TestTheChildsTerminalWakesTheSessionWithTheResult(t *testing.T) {
 // terminals wake the session; a supervisor's canceled on a child nobody
 // stopped is a failure.
 func TestAChildsEndWakesWithTheOutcome(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name       string
 		supervisor bool
@@ -1130,6 +1146,7 @@ func TestAChildsEndWakesWithTheOutcome(t *testing.T) {
 // depth, so a session that delegates on every wake stops at the bound however
 // often platform rejects it.
 func TestRejectionsCannotGrowTheChainPastTheBound(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	ctx := context.Background()
 	conv := "discord:g1/t-wake-loop"
@@ -1183,6 +1200,7 @@ func TestRejectionsCannotGrowTheChainPastTheBound(t *testing.T) {
 // is canceled (observeChildEnd), and a result that raced the stop is never
 // delivered as the root's.
 func TestAHumanStopOnTheChildDoesNotWake(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		end  func(t *testing.T, r *rig, child *lib.Envelope)
@@ -1239,6 +1257,7 @@ func TestAHumanStopOnTheChildDoesNotWake(t *testing.T) {
 // MaxSessions; refused, the result is still the conversation's and the
 // standard cap notice says why nothing followed it.
 func TestTheWakeHonoursTheCapAndTheResultStands(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawnerCap(t, "platform", 1, nil)
 	ctx := context.Background()
 	conv := "discord:g1/t-wake-cap"
@@ -1271,6 +1290,7 @@ func TestTheWakeHonoursTheCapAndTheResultStands(t *testing.T) {
 // requester and attribution while the child ran; the result stands, a notice
 // says the session was not woken, and nothing is spawned.
 func TestNoWakeWhenTheRequesterAgedOut(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	conv := "discord:g1/t-wake-ttl"
 	origin, _, child := delegated(t, r, spawn, conv, "")
@@ -1295,6 +1315,7 @@ func TestNoWakeWhenTheRequesterAgedOut(t *testing.T) {
 // line still reaches its completed line (keyed on the line the parent's
 // entry keeps, not on which task is active).
 func TestChildBeforeParentTerminalStillClosesTheParentsLine(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	ctx := context.Background()
 	conv := "discord:g1/t-wake-order"
@@ -1329,6 +1350,7 @@ func TestChildBeforeParentTerminalStillClosesTheParentsLine(t *testing.T) {
 // TestAWakeAfterAGatewayRestartStillCarriesTheRequester: the requester and
 // attribution are on the record, so a second gateway wakes the session.
 func TestAWakeAfterAGatewayRestartStillCarriesTheRequester(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	conv := "discord:g1/t-wake-restart"
 	origin, session, child := delegated(t, r, spawn, conv, "")
@@ -1352,6 +1374,7 @@ func TestAWakeAfterAGatewayRestartStillCarriesTheRequester(t *testing.T) {
 // lib.DelegateTextCap bytes of the child's result, cut on a rune boundary and
 // marked, while the conversation still gets the whole result.
 func TestAnOverCapResultIsTruncatedInTheWake(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	_, _, child := delegated(t, r, spawn, "discord:g1/t-wake-big", "")
 	big := strings.Repeat("é", lib.DelegateTextCap) // two bytes a rune: twice the cap
@@ -1388,6 +1411,7 @@ func TestAnOverCapResultIsTruncatedInTheWake(t *testing.T) {
 // platform's in subject for the child's task, spawns nothing, and a status ask
 // replays the child.
 func TestHumanTextWhileTheChildRunsSteersTheChild(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	ctx := context.Background()
 	conv := "discord:g1/t-steer"
@@ -1417,6 +1441,7 @@ func TestHumanTextWhileTheChildRunsSteersTheChild(t *testing.T) {
 // publishes the cancel on platform's in subject for the child, and the
 // child's history entry records it (the mark wakeSession reads).
 func TestAStopOnTheChildCancelsItOnPlatform(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	ctx := context.Background()
 	conv := "discord:g1/t-stop-child"
@@ -1446,6 +1471,7 @@ func TestAStopOnTheChildCancelsItOnPlatform(t *testing.T) {
 // is still running leaves it the conversation's task: the new gateway's heal
 // does not release it, and a status ask reports it.
 func TestHealAfterRestartSeesTheChildAsActive(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	ctx := context.Background()
 	conv := "discord:g1/t-heal"
@@ -1476,6 +1502,7 @@ func TestHealAfterRestartSeesTheChildAsActive(t *testing.T) {
 // does not wake the session (a wake follows a child's terminal, and a child
 // that never started has none).
 func TestAHealedChildNoLongerBlocksADelegation(t *testing.T) {
+	t.Parallel()
 	const grace = 500 * time.Millisecond
 	r, spawn := startRigWithSpawnerCap(t, "platform", 0, func(c *Config) { c.FirstEventGrace = grace })
 	ctx := context.Background()
@@ -1630,6 +1657,7 @@ func awaitSteerAuthors(t *testing.T, r *rig, conv, taskID string, n int) TaskRef
 // delegating turn, so the mint checks each steer author against the target's
 // list as well as the requester (1001). 1002 steers.
 func TestDelegateChecksEverySteerAuthor(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name  string
 		lists map[string][]string
@@ -1707,6 +1735,7 @@ func childSteers(t *testing.T, r *rig, child *lib.Envelope) int {
 // was. Refused: the target-only notice, nothing published, no author
 // recorded. Allowed: published on the child's in subject and acknowledged.
 func TestAnOffListSteerIntoTheChildIsRefusedAndNotSent(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name, author string
 		sent         bool
@@ -1754,6 +1783,7 @@ func TestAnOffListSteerIntoTheChildIsRefusedAndNotSent(t *testing.T) {
 // off-list author never gets this far: the steer itself is refused
 // (TestAnOffListSteerIntoTheChildIsRefusedAndNotSent).
 func TestASteerIntoTheChildTravelsToTheWake(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawnerCap(t, "platform", 0, func(c *Config) {
 		c.TargetAllowedUsers = map[string]map[string][]string{targetPlatform: {"discord": {"1001", "1002"}}}
 	})
@@ -1793,6 +1823,7 @@ func TestASteerIntoTheChildTravelsToTheWake(t *testing.T) {
 // extended and the entry is marked, and a marked entry's delegation is
 // refused rather than checked against a list that dropped someone.
 func TestSteerAuthorsPastTheCapRefuse(t *testing.T) {
+	t.Parallel()
 	requester := &TaskRequester{Backend: "discord", Subject: "hmac:r"}
 	ref := TaskRef{Requester: requester}
 	for i := 0; i < steerAuthorCap; i++ {
@@ -1834,7 +1865,7 @@ func TestSteerAuthorsPastTheCapRefuse(t *testing.T) {
 // delivered" that the heal exists to find.
 func drainRelayDurable(t *testing.T, url string) {
 	t.Helper()
-	nc, err := nats.Connect(url)
+	nc, err := connectTest(url)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1871,6 +1902,7 @@ func drainRelayDurable(t *testing.T, url string) {
 // would have; a duplicate of that terminal arriving later neither posts
 // nor wakes.
 func TestAHealThatFindsTheChildsTerminalWakesTheSession(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	ctx := context.Background()
 	conv := "discord:g1/t-heal-wake"
@@ -1948,6 +1980,7 @@ func incarnationAuthors(t *testing.T, r *rig, conv string) (*SessionRecord, []Ta
 // same incarnation" is put on the record directly; the next turn's fresh
 // incarnation starts clean and the same on-list delegation mints.
 func TestAnEarlierAuthorInTheIncarnationRefusesTheDelegation(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawnerCap(t, "platform", 0, func(c *Config) {
 		c.TargetAllowedUsers = map[string]map[string][]string{targetPlatform: {"discord": {"1001"}}}
 	})
@@ -1987,6 +2020,7 @@ func TestAnEarlierAuthorInTheIncarnationRefusesTheDelegation(t *testing.T) {
 // TestTheIncarnationSetRecordsSteersHashed: a steer into the incarnation
 // joins its set as the requester did, hashed, the id nowhere in the record.
 func TestTheIncarnationSetRecordsSteersHashed(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	conv := "discord:g1/t-incarnation-steer"
 	_, origin, _ := sessionTurn(t, r, spawn, conv, "first")
@@ -2013,6 +2047,7 @@ func TestTheIncarnationSetRecordsSteersHashed(t *testing.T) {
 // set after the mint (a member, an older age, the mark) is nothing the wake's
 // own turn would add, so only the seed can carry it.
 func TestAWakesIncarnationStartsFromTheParents(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	ctx := context.Background()
 	conv := "discord:g1/t-incarnation-wake"
@@ -2070,6 +2105,7 @@ func TestAWakesIncarnationStartsFromTheParents(t *testing.T) {
 // bound cleared it, the set no longer lists everyone; the incarnation's
 // delegations are refused until a fresh one.
 func TestAnIncompleteIncarnationSetRefuses(t *testing.T) {
+	t.Parallel()
 	var rec SessionRecord
 	rec.BusSession = "chat-a"
 	for i := 0; i < sessionAuthorCap; i++ {
@@ -2109,7 +2145,7 @@ func TestAnIncompleteIncarnationSetRefuses(t *testing.T) {
 func capSessionRecordSize(t *testing.T, r *rig, conv string, slack int) {
 	t.Helper()
 	size := len(rawSessionRecord(t, r.g.reg, conv))
-	nc, err := nats.Connect(r.url)
+	nc, err := connectTest(r.url)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2135,6 +2171,7 @@ func capSessionRecordSize(t *testing.T, r *rig, conv string, slack int) {
 // between the two cannot leave steer text in the session with its author
 // off the record. A write that fails sends nothing and says so.
 func TestASteerIsNotSentUnlessItsAuthorIsOnRecord(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	conv := "discord:g1/t-steer-durable"
 	_, origin, session := sessionTurn(t, r, spawn, conv, "first")
@@ -2173,6 +2210,7 @@ func armDoorMap(t *testing.T, c *Config) {
 // that backend (gke-labs#2478 is the CR field that would render one). A
 // blank door list is still the ordinary nobody.
 func TestTheDoorWithNoListMayNotDelegate(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name  string
 		lists map[string][]string
@@ -2214,6 +2252,7 @@ func TestTheDoorWithNoListMayNotDelegate(t *testing.T) {
 // steer author or an incarnation-set member on backend a2a with no list for
 // it refuses, under the door's rule.
 func TestADoorAuthorWithNoListRefusesAChatTurnsDelegation(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name  string
 		edit  func(rec *SessionRecord, parent string, door TaskRequester)
@@ -2253,6 +2292,7 @@ func TestADoorAuthorWithNoListRefusesAChatTurnsDelegation(t *testing.T) {
 // held to the A2A door's rule (doorUnlisted says why): with no list for it,
 // its turns delegate as a chat backend's do.
 func TestTheInjectDoorWithNoListMayDelegate(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawnerCap(t, "platform", 0, func(c *Config) { armInjectMap(t, c) })
 	exec, _, _ := sessionTurnVia(t, r, spawn, injectKeyPrefix+"case-nolist", injectBackend, "do a thing")
 	if err := exec.PublishArtifact(context.Background(), delegateArtifact(t, "platform", "x")); err != nil {
@@ -2336,6 +2376,7 @@ func TestTheWakeOpensWithTheAsk(t *testing.T) {
 // text, capped, is on its history entry; a wake whose delegating turn has
 // none (a legacy entry) opens with today's header.
 func TestTheTurnsAskIsOnItsEntryAndAWakeWithoutOneFallsBack(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	ctx := context.Background()
 	conv := "discord:g1/t-wake-noask"
@@ -2363,6 +2404,7 @@ func TestTheTurnsAskIsOnItsEntryAndAWakeWithoutOneFallsBack(t *testing.T) {
 // TestAskTTLClearsTheRequestCopy: the turn's request text is user content at
 // rest in the session KV, bounded by AskTTL with the requester copy.
 func TestAskTTLClearsTheRequestCopy(t *testing.T) {
+	t.Parallel()
 	r := startRigWith(t, func(c *Config) { c.AskTTL = time.Minute })
 	conv := "discord:g1/thread-ttl-request"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "m-1", Text: "what changed?"}
@@ -2412,6 +2454,7 @@ func TestTheWakesAskStaysWithinItsCapAfterRunsAreBroken(t *testing.T) {
 // relay's render state is gone, and the wake still carries the result read
 // from the stream, not the non-text stand-in.
 func TestAConsoleWakeCarriesTheResultAfterRenderStateIsLost(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	conv := consoleKeyPrefix + "t-wake-lost"
 	_, _, child := delegated(t, r, spawn, conv, "")
@@ -2448,6 +2491,7 @@ func turnsWake(childID string) string {
 // the result. The wake carries both, in order, the follow-up's marked, so the
 // parent session reads the answer to what it asked and not only the last.
 func TestAChildsTurnAnswersAllReachTheWake(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	ctx := context.Background()
 	_, _, child := delegated(t, r, spawn, "discord:g1/t-wake-turns", "")
@@ -2469,6 +2513,7 @@ func TestAChildsTurnAnswersAllReachTheWake(t *testing.T) {
 // was relayed before a restart and the terminal after it, so the relay's
 // render state never held it; the wake reads it from the stream.
 func TestAChildsTurnAnswersReachTheWakeAfterRenderStateIsLost(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	ctx := context.Background()
 	_, _, child := delegated(t, r, spawn, "discord:g1/t-wake-turns-lost", "")
@@ -2493,6 +2538,7 @@ func TestAChildsTurnAnswersReachTheWakeAfterRenderStateIsLost(t *testing.T) {
 // the partial list and says the earlier answers could not be read, then the
 // result or the failure text.
 func TestAWakeWhoseTurnsCannotBeReadSaysSo(t *testing.T) {
+	t.Parallel()
 	const unread = "(the answers to any earlier turns could not be read from the stream)"
 	for _, tc := range []struct {
 		name   string
@@ -2550,6 +2596,7 @@ func TestAWakeWhoseTurnsCannotBeReadSaysSo(t *testing.T) {
 // TestAHealedChildsTurnAnswersAllReachTheWake: the heal's wake reads the
 // turns off the replayed task, in turn order, then the result.
 func TestAHealedChildsTurnAnswersAllReachTheWake(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	conv := "discord:g1/t-heal-wake-turns"
 	_, _, child := delegated(t, r, spawn, conv, "")
@@ -2643,6 +2690,7 @@ func failedTurnsWake(childID, outcome, reason string) string {
 // then its failure text unchanged; the parent still reads the answer to what
 // it asked.
 func TestAFailedChildsTurnAnswersReachTheWake(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name       string
 		supervisor bool
@@ -2680,6 +2728,7 @@ func TestAFailedChildsTurnAnswersReachTheWake(t *testing.T) {
 // child carries its turns then the failure text, and with no turns the failure
 // text alone, as before.
 func TestAHealedFailedChildsTurnAnswersReachTheWake(t *testing.T) {
+	t.Parallel()
 	const reason = "reason: deadline-exceeded - killed after 2h0m0s"
 	for _, turns := range []bool{true, false} {
 		t.Run(fmt.Sprintf("turns=%v", turns), func(t *testing.T) {
@@ -2798,6 +2847,7 @@ func TestTheWakeWithCardsPendingIncludesNote(t *testing.T) {
 // delegated child completes with terminal mark signaling pending cards,
 // the gateway wakes the parent session with wakeCardsPendingNote.
 func TestAChildEndingWithCardsPendingWakesWithPendingNote(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	conv := "discord:g1/t-wake-cards-pending"
 	_, _, child := delegated(t, r, spawn, conv, "")
@@ -2854,6 +2904,7 @@ func TestAChildEndingWithCardsPendingWakesWithPendingNote(t *testing.T) {
 // an active task for a completed child whose terminal carries a cards mark, the
 // replayed wake includes wakeCardsPendingNote.
 func TestAHealWithCardsPendingWakesWithPendingNote(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	conv := "discord:g1/t-heal-cards-pending"
 	_, _, child := delegated(t, r, spawn, conv, "")
@@ -2928,6 +2979,7 @@ func handOff(t *testing.T, exec *lib.TaskExecution) {
 // carries the cards-pending note. The child's terminal here has no chat
 // message at all.
 func TestAHandoffWithoutTheMarkStillWakesSayingTheCardIsRunning(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	conv := "slack:C1/t-handoff-nomark"
 	_, _, child := delegated(t, r, spawn, conv, "")
@@ -2950,6 +3002,7 @@ func TestAHandoffWithoutTheMarkStillWakesSayingTheCardIsRunning(t *testing.T) {
 // TestAHealedHandoffWithoutTheMarkWakesSayingTheCardIsRunning: the same
 // terminal found by a heal after a restart reads the handoff off the fold.
 func TestAHealedHandoffWithoutTheMarkWakesSayingTheCardIsRunning(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	conv := "slack:C1/t-heal-handoff-nomark"
 	_, _, child := delegated(t, r, spawn, conv, "")
@@ -2970,6 +3023,7 @@ func TestAHealedHandoffWithoutTheMarkWakesSayingTheCardIsRunning(t *testing.T) {
 
 // TestAChildWithNeitherSignalWakesWithoutTheNote: no mark, no handoff.
 func TestAChildWithNeitherSignalWakesWithoutTheNote(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	conv := "slack:C1/t-no-handoff"
 	_, _, child := delegated(t, r, spawn, conv, "")
@@ -2986,6 +3040,7 @@ func TestAChildWithNeitherSignalWakesWithoutTheNote(t *testing.T) {
 // The new process has no render state, so the wake's signal comes from the
 // replay of the stream (relay.go's fold read).
 func TestAHandoffAckedBeforeARestartIsReadOffTheReplay(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	conv := "slack:C1/t-replay-handoff"
 	_, _, child := delegated(t, r, spawn, conv, "")
@@ -3008,6 +3063,7 @@ func TestAHandoffAckedBeforeARestartIsReadOffTheReplay(t *testing.T) {
 // target gets a child on the pinned profile's child queue, at the requester's
 // tier, with the target as its parameters.
 func TestADelegationToAProfileIsSubmittedForTheResolvedProfile(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	scope := filepath.Join(t.TempDir(), "scope.json")
 	if err := os.WriteFile(scope, []byte(`{"present":true,"projects":["p1"]}`), 0o600); err != nil {

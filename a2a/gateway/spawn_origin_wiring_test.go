@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -39,7 +38,7 @@ func TestStartTaskSpawnsWithThePublishedOriginSequence(t *testing.T) {
 		t.Fatalf("spawned with the %q sentinel on a task whose submission the gateway had just published and acked; the worker will scan, which is what this fix exists to stop", lib.OriginSeqUnknown)
 	}
 
-	nc, err := nats.Connect(r.url)
+	nc, err := connectTest(r.url)
 	if err != nil {
 		t.Fatal(err)
 	}

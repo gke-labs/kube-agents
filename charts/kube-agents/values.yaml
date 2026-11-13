@@ -170,6 +170,21 @@ operator:
   # "MCP server" reference page.
   mcpServer:
     enabled: false
+  # The AgentProfile dispatcher (<agent>-a2a-dispatcher), which offers each
+  # profile task to a worker in the profile's warm pool, or runs an unattended
+  # one as a Job. Rendered beside every platformAgent.mode: next PlatformAgent
+  # the operator manages; under "today" the operator renders nothing for it.
+  # false sets A2A_PROFILE_DISPATCHER=false on the controller manager, which
+  # removes the dispatcher's Deployment and its bus principal, so AgentProfiles
+  # then publish cards that nothing dispatches. An A2A_PROFILE_DISPATCHER entry
+  # in extraEnv wins. Its image is the release set's a2a-dispatcher, with
+  # A2A_DISPATCHER_IMAGE (in extraEnv) the override. It has a ceiling of about
+  # 200 AgentProfiles that allow unattended under Job mode, about 650 at two
+  # tiers otherwise: the operator binds them oldest first while the
+  # dispatcher's identity and config fit, leaves newer ones unbound, and says
+  # so in the PlatformAgent's DispatcherCeiling condition.
+  profileDispatcher:
+    enabled: true
   # Slack member ids of end-to-end test users, meant for CI and eval installs;
   # integration.slack.allowedUsers is still the gate on who is served.
   # A post such a user makes with a user token through an app carries the
@@ -384,6 +399,8 @@ litellm:
   # 3.x model a value also replaces the thinking key the chart renders there
   # to get Gemini's thoughts back ("Gemini's thoughts" on the same page); both
   # ask for them. Chart-only; the kustomize dev base carries no such key.
+  # A vLLM server passes it to the model's chat template as written;
+  # the template decides what each level means (site: inference-gateway page).
   reasoningEffort: ""
   # Renders litellm_settings.drop_params: true (also enabled automatically when
   # fallback.reasoningEffort is set), so a parameter the
@@ -544,7 +561,7 @@ litellm:
     # copies: a chart pinned to a version the mirror was never populated with
     # is an ImagePullBackOff. This pin sat a release behind the kustomize base
     # for exactly that reason.
-    tag: v1.106.0
+    tag: v1.108.6
     pullPolicy: IfNotPresent
   replicaCount: 2
   # Rollout strategy — the canonical home for this argument. The chart template
@@ -857,7 +874,7 @@ hindsight:
     # this tag — the pg15 line among them. Read them there before changing it.
     image:
       repository: docker.io/pgvector/pgvector
-      tag: "0.8.6-pg15@sha256:a947c45cdc5906a1bc951f20a8709e321256343ee0f251e4ae00b5e7def4e6da"
+      tag: "0.8.7-pg15@sha256:88164492558c9773a1e17a8305abaca7863e05b3d8bbcdb792774890a2047e06"
       pullPolicy: IfNotPresent
     # Ephemeral storage is the run and tmp emptyDirs' sizeLimits (64Mi and 1Gi,
     # templates/hindsight.yaml) plus 64Mi for the container's logs; the limit
@@ -971,7 +988,7 @@ githubMinter:
 fluentBit:
   image:
     repository: docker.io/fluent/fluent-bit
-    tag: "5.1.2"
+    tag: "5.1.5"
 
 # The shell sandbox StatefulSet the operator renders beside every agent pod.
 # Same shape as fluentBit above and for the same reason: the chart never renders
@@ -1600,7 +1617,7 @@ platformAgent:
     # images.json like every other third-party image.
     image:
       repository: docker.io/alpine/k8s
-      tag: "1.36.5"
+      tag: "1.36.6"
     # How long to wait for AgentProfile finalizers to clear before deleting
     # the PlatformAgent CR.
     agentProfileTimeout: 30s
@@ -2019,12 +2036,15 @@ webConsole:
   enabled: false
   # GET /api/environment and PlatformAgent state: versions, install and
   # last-rollout dates, and counts of nodes, namespaces, pods and controllers
-  # for feedback reports, plus reading and patching the PlatformAgent resource
-  # for repository topology, preferred model annotations, and applied PR
-  # annotations. Needs a service account with list on those kinds and get/patch
-  # on the PlatformAgent, which the chart creates. The console discards the
-  # listed items; the only names GET /api/environment returns are the
-  # kube-agents Helm release, its namespace and the owning Argo CD Application.
+  # for feedback reports, the PlatformAgent's status.usage block (counters,
+  # top tools and token totals, for the feedback attachment and the banner's
+  # since-install figures), plus reading and patching the PlatformAgent
+  # resource for repository topology, preferred model annotations, and applied
+  # PR annotations. Needs a service account with list on those kinds and
+  # get/patch on the PlatformAgent, which the chart creates. The console
+  # discards the listed items; the only names GET /api/environment returns are
+  # the kube-agents Helm release, its namespace and the owning Argo CD
+  # Application.
   environment:
     enabled: true
   # "Polish with Gemini" in the feedback form: POST /api/assist sends the
@@ -2106,9 +2126,12 @@ profiles:
       skills, returning either a grounded Root Cause Analysis with a proposed
       GitOps fix or a redacted Google Cloud Support Escalation Bundle.
     persona:
-      # Placeholder image reference required by the AgentProfile CRD schema;
-      # today the gateway scaffolds `tse` from `/opt/tse-template` in the
-      # platform-agent image until the per-profile Job dispatcher lands.
+      # Placeholder image reference required by the AgentProfile CRD schema:
+      # tse has no persona image of its own yet (#3842). On a next install the
+      # profile dispatcher (on by default) gives every bound profile a warm
+      # worker, and tse's crash-loops at its persona step until #3842 ships
+      # one; Kanban to tse still works. Leave tse off there, or switch the
+      # dispatcher off (operator.profileDispatcher.enabled: false).
       image:
         repository: ghcr.io/gke-labs/kube-agents/platform-agent
         tag: "" # defaults to platformAgent.deployment.image.tag or Chart.appVersion
@@ -2136,8 +2159,8 @@ profiles:
         memory: 2Gi
   # The generic cluster agent (#3658): a read-only SRE for one GKE cluster,
   # which each task names by its project, location and cluster parameters
-  # (`agents/cluster/persona`). Its workers come from the profile dispatcher, so
-  # no pod runs it until the operator runs one. The credential broker holds each
+  # (`agents/cluster/persona`). Its workers come from the profile dispatcher,
+  # which runs by default. The credential broker holds each
   # task's kubectl and gcloud calls to the task's target.
   cluster:
     enabled: false

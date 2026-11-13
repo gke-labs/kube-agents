@@ -349,6 +349,33 @@ MUTATIONS: list[Mutation] = [
         "reach tiers through a wildcard resource, which a resource-name match misses",
     ),
     Mutation(
+        # Next mode reads tiers through an operator-rendered ConfigMap, so no
+        # role it mints needs them. A builder that grants them shows up in the
+        # next golden when it is regenerated, which is what this edits.
+        "A4-next-gateway-reads-tiers",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent-next.yaml",
+        ("rules:\n  - apiGroups:\n      - \"\"\n    resources:\n      - pods\n    verbs:\n"
+         "      - create\n      - get\n      - list\n      - watch\n      - delete",
+         "rules:\n  - apiGroups:\n      - kubeagents.x-k8s.io\n    resources:\n      - tiers\n"
+         "    verbs:\n      - get\n      - list\n      - watch\n"
+         "  - apiGroups:\n      - \"\"\n    resources:\n      - pods\n    verbs:\n"
+         "      - create\n      - get\n      - list\n      - watch\n      - delete"),
+        "test_A4_only_cluster_administrators_write_tiers",
+        "let the next-mode A2A gateway read tiers directly, as tier-aware "
+        "routing might, instead of through the operator's ConfigMap",
+    ),
+    Mutation(
+        "A4-next-callout-wildcard-resource",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent-next.yaml",
+        ("rules:\n  - apiGroups:\n      - \"\"\n    resourceNames:\n      - platformagent-a2a-authmap-0\n",
+         "rules:\n  - apiGroups:\n      - kubeagents.x-k8s.io\n    resources:\n      - '*'\n"
+         "    verbs:\n      - get\n"
+         "  - apiGroups:\n      - \"\"\n    resourceNames:\n      - platformagent-a2a-authmap-0\n"),
+        "test_A4_only_cluster_administrators_write_tiers",
+        "give the next-mode auth callout a wildcard read on the operator's API "
+        "group, which reaches tiers without naming them",
+    ),
+    Mutation(
         "A4-operator-tiers-wildcard-subresource",
         "charts/kube-agents/templates/operator-rbac.yaml",
         ("  # END GENERATED RULES",
@@ -2360,32 +2387,76 @@ Mutation(
         "site instead of referencing lib.ArtifactDelegate",
     ),
     Mutation(
-        "C1-delegate-text-cap-hand-spelled-in-delegation",
+        "C1-delegate-gateway-skips-the-shared-validator",
         "a2a/gateway/delegation.go",
-        ('len(req.Text) > lib.DelegateTextCap {', 'len(req.Text) > 16*1024 {'),
+        (
+            "if !parsed || lib.ValidateDelegateRequest(req) != nil || (resuming && len(req.Tasks) != parent.BatchSize) {",
+            "if !parsed || (resuming && len(req.Tasks) != parent.BatchSize) {",
+        ),
         "test_C1_the_delegate_text_cap_is_spelled_once",
-        "hand-type the cap in the gateway's own length check instead of "
-        "referencing lib.DelegateTextCap -- agrees with the constant today "
-        "and silently stops the day someone edits only the constant",
+        "drop the gateway's call to lib.ValidateDelegateRequest: an "
+        "over-length text, or a malformed batch, that reached the bus without "
+        "the adapter would then be minted, and the gateway's line of defence "
+        "is gone (#5682 moved the cap check into the shared validator)",
     ),
     Mutation(
-        "C1-delegate-text-cap-shifted-in-delegation",
+        "C1-delegate-gateway-validates-only-a-resumed-batch",
         "a2a/gateway/delegation.go",
-        ('len(req.Text) > lib.DelegateTextCap {', 'len(req.Text) > 1<<14 {'),
+        (
+            "if !parsed || lib.ValidateDelegateRequest(req) != nil || (resuming && len(req.Tasks) != parent.BatchSize) {",
+            "if !parsed || (resuming && lib.ValidateDelegateRequest(req) != nil) || (resuming && len(req.Tasks) != parent.BatchSize) {",
+        ),
         "test_C1_the_delegate_text_cap_is_spelled_once",
-        "spell the gateway's cap as a shift the magic-number regex does not "
-        "name; only the positive check, scoped to handleDelegateRequest, "
-        "sees that the shared constant is gone from the check (the rest of "
-        "delegation.go still references it)",
+        "AND the gateway's call to lib.ValidateDelegateRequest with the "
+        "resumed-batch term beside it: the call is still in "
+        "handleDelegateRequest, but only a batch finished after a restart "
+        "is validated, so a fresh over-length or malformed request that "
+        "reached the bus without the adapter is minted",
     ),
     Mutation(
-        "C1-delegate-text-cap-shifted-under-a-comment-naming-it",
-        "a2a/gateway/delegation.go",
-        ('len(req.Text) > lib.DelegateTextCap {', 'len(req.Text) > 1<<14 { // lib.DelegateTextCap, as a shift'),
+        "C1-delegate-validator-cap-hand-spelled",
+        "a2a/lib/payload.go",
+        ("case len(text) > DelegateTextCap:", "case len(text) > 16*1024:"),
         "test_C1_the_delegate_text_cap_is_spelled_once",
-        "spell the gateway's cap as a shift and leave the constant's name in "
-        "a comment on the same line; only a pin that reads the function's "
-        "code without its comments sees the constant gone",
+        "hand-type the cap in lib's shared validator instead of referencing "
+        "DelegateTextCap -- agrees with the constant today and silently "
+        "stops the day someone edits only the constant",
+    ),
+    Mutation(
+        "C1-delegate-validator-cap-shifted",
+        "a2a/lib/payload.go",
+        ("case len(text) > DelegateTextCap:", "case len(text) > 1<<14:"),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "spell the validator's cap as a shift the magic-number regex does not "
+        "name; only the positive check, scoped to validateDelegateText, sees "
+        "that the shared constant is gone from the comparison",
+    ),
+    Mutation(
+        "C1-delegate-validator-skips-batch-entries",
+        "a2a/lib/payload.go",
+        ("validateDelegateText(e.Text)", "validateDelegateText(r.Text)"),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "cap the request's top-level text inside the batch loop instead of "
+        "each entry's: every batch entry then goes uncapped, through the "
+        "adapter and the gateway alike",
+    ),
+    Mutation(
+        "C1-delegate-validator-skips-the-single-text",
+        "a2a/lib/payload.go",
+        ("if err := validateDelegateText(r.Text); err != nil {", "if err := error(nil); err != nil {"),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "stop capping a single (non-batch) request's text in the shared "
+        "validator: the gateway then mints an over-length single task that "
+        "reached the bus without the adapter",
+    ),
+    Mutation(
+        "C1-delegate-wire-tasks-renamed",
+        "a2a/lib/payload.go",
+        ('json:"tasks,omitempty"', 'json:"batch,omitempty"'),
+        "test_C1_the_delegate_tool_schema_names_agree_with_the_wire_shape",
+        "rename the batch's wire field without touching the tool schema: the "
+        "model sends `tasks` by the schema and the adapter reads a `batch` "
+        "that was never sent",
     ),
     Mutation(
         "C1-delegate-text-cap-hand-spelled-in-worker-adapter",

@@ -50,8 +50,9 @@ fixtures: []
 verification_spec:
   # The pull request: opened by this run, in the lane's repository, touching
   # nothing but the node pool's file. Its body's Replacement line is read by
-  # hand per run: no check reads a pull request body, and `content` reads
-  # only files a pull request adds.
+  # hand per run: `body_contains` matches fixed substrings and cannot judge
+  # whether the line names the right replacement, and `content` reads only
+  # files a pull request adds.
   - name: one-pull-request-edits-only-the-node-pool
     role: objective
     mode: assert

@@ -381,7 +381,9 @@ func TestActivity_ChildGetsItsOwnManagedScope(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(src, "config.yaml"), []byte("model:\n  default: pinned/model\nhooks:\n  outbound:\n    - name: theirs\n      url: https://audit.example/\n      events: [post_tool_call]\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(src, ".env"), []byte("PINNED_KEY=pinned-value\n"), 0o600); err != nil {
+	// Not a credential-shaped key: the child prints the .env through its
+	// answer, which the bridge scrubs before publishing (scrubAnswer).
+	if err := os.WriteFile(filepath.Join(src, ".env"), []byte("PINNED_SETTING=pinned-value\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	scratch := t.TempDir()
@@ -403,7 +405,7 @@ print("ENV=" + open(os.path.join(d, ".env")).read().strip())
 	if !strings.Contains(out, "DIR="+want) {
 		t.Fatalf("child scope dir: %s", out)
 	}
-	for _, needle := range []string{"default: pinned/model", "name: theirs", "name: " + hookEntryName, "url: " + b.ActivityURL(), "secret_env: " + ActivitySecretEnv, "- pre_tool_call", "- post_tool_call", "- post_api_request", "timeout: 10", "ENV=PINNED_KEY=pinned-value"} {
+	for _, needle := range []string{"default: pinned/model", "name: theirs", "name: " + hookEntryName, "url: " + b.ActivityURL(), "secret_env: " + ActivitySecretEnv, "- pre_tool_call", "- post_tool_call", "- post_api_request", "timeout: 10", "ENV=PINNED_SETTING=pinned-value"} {
 		if !strings.Contains(out, needle) {
 			t.Fatalf("child scope lacks %q:\n%s", needle, out)
 		}

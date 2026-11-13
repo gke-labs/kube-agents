@@ -54,6 +54,7 @@ func editsOf(r *rig, messageID string) []string {
 // rating mark, so it notifies, and the task's live message ends as the bare
 // mark: nothing reads "completed" under the ask.
 func TestAnAnswerOnLineBackendEndsTheLineWithTheBareMarkAfterTheAnswerPosts(t *testing.T) {
+	t.Parallel()
 	r := startLineAnsweringRig(t)
 	origin := startChatTask(t, r, "discord:g1/answer-on-line", false)
 	line := lineID(t, r)
@@ -83,6 +84,7 @@ func TestAnAnswerOnLineBackendEndsTheLineWithTheBareMarkAfterTheAnswerPosts(t *t
 // A laid-out answer posts laid out, as on any backend, and the line ends as
 // the bare mark.
 func TestAnAnswerOnLineBackendPostsALaidOutAnswer(t *testing.T) {
+	t.Parallel()
 	r := startLineAnsweringRig(t)
 	origin := startChatTask(t, r, "discord:g1/answer-on-line-laid-out", true)
 	line := lineID(t, r)
@@ -101,6 +103,7 @@ func TestAnAnswerOnLineBackendPostsALaidOutAnswer(t *testing.T) {
 // A turn that handed the ask to cards puts its acknowledgement on the line,
 // unrated, and no post follows: the card's plan and report do.
 func TestAnAnswerOnLineBackendGetsTheHandOffLineOnTheLine(t *testing.T) {
+	t.Parallel()
 	r := startLineAnsweringRig(t)
 	origin := startChatTask(t, r, "discord:g1/answer-on-line-cards", false)
 	line := lineID(t, r)
@@ -132,6 +135,7 @@ func TestAnAnswerOnLineBackendGetsTheHandOffLineOnTheLine(t *testing.T) {
 // An acknowledgement edit that does not land is posted as on any backend,
 // and the line ends as the bare mark.
 func TestAnAnswerOnLineBackendPostsTheAcknowledgementWhenTheEditFails(t *testing.T) {
+	t.Parallel()
 	r := startLineAnsweringRig(t)
 	origin := startChatTask(t, r, "discord:g1/answer-on-line-fails", false)
 	line := lineID(t, r)
@@ -157,6 +161,7 @@ func TestAnAnswerOnLineBackendPostsTheAcknowledgementWhenTheEditFails(t *testing
 // A task that fails keeps its notice and its terminal edit: only a
 // completed task ends as the bare mark.
 func TestAnAnswerOnLineBackendKeepsTheFailedLine(t *testing.T) {
+	t.Parallel()
 	r := startLineAnsweringRig(t)
 	origin := startChatTask(t, r, "discord:g1/answer-on-line-failed", false)
 	line := lineID(t, r)
@@ -174,6 +179,7 @@ func TestAnAnswerOnLineBackendKeepsTheFailedLine(t *testing.T) {
 // bare mark is written there, and its line ends stopped. Nothing a stopped
 // task writes reaches the room, so its acknowledgement isn't posted either.
 func TestAnAnswerOnLineBackendKeepsTheTerminalEditOfAStoppedTask(t *testing.T) {
+	t.Parallel()
 	r := startLineAnsweringRig(t)
 	conv := "discord:g1/answer-on-line-stopped"
 	origin := startChatTask(t, r, conv, false)

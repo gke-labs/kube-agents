@@ -10,10 +10,9 @@ when the bot's first reply is a refusal or a not-started notice, or on next when
 fails (quoting it), and asserts an answer saying 5 arrived in time and, on next, that it
 opens on a bold headline; it records Slack's timestamps for each leg.
 
-The bot's reaction on the ask is asserted on today, where the arrival reaction stays up
-for the turn. On next it comes only from the hermes-bridge's 60-second progress
-heartbeat, so a faster turn shows none (#5499): there the check is expected to fail, and
-reports, rather than fails, until that is fixed.
+The bot's reaction on the ask is asserted in both modes: today's Slack adapter and next's
+A2A gateway each draw it the moment they accept the ask, and take it off once the answer
+posts.
 
 It skips while the user token, the channel or the bot's member id is unset. The Slack
 client is hack/slack-live-check/harness.py's, loaded from the checkout.
@@ -52,12 +51,10 @@ CHANNEL_ENV = "E2E_SLACK_CHANNEL_ID"
 BOT_USER_ENV = "E2E_SLACK_BOT_USER_ID"
 REQUIRED_ENV = (USER_TOKEN_ENV, CHANNEL_ENV, BOT_USER_ENV)
 # "next" where the install runs spec.mode next (e2e-run.yml sets it there): the answer is
-# the gateway's Block Kit, so its headline is asserted, and the reaction check is the
-# expected failure #5499 records. Unset, the PlatformAgent's spec.mode is read with
+# the gateway's Block Kit, so its headline is asserted. Unset, the PlatformAgent's spec.mode is read with
 # kubectl, so a manual run against any cluster asserts what its mode promises.
 MODE_ENV = "E2E_SLACK_MODE"
 MODE_NEXT = "next"
-REACTION_GAP_ISSUE = "#5499"
 
 TEST_TIMEOUT_SEC = int(os.environ.get("TEST_TIMEOUT_SEC", "120"))
 POLL_INTERVAL_SEC = float(os.environ.get("SLACK_POLL_INTERVAL_SEC", "1.5"))
@@ -323,10 +320,7 @@ def test_slack_agent_math_response(slack_settings) -> None:
         pass
     elif next_mode:
         assert timeline.answer_headline, f"The answer does not open on a bold headline: blocks={json.dumps(answer.get('blocks'))[:400]}"
-        if timeline.reaction:
-            print(f"[E2E Slack] the bot reacted on next; {REACTION_GAP_ISSUE} may be fixed, so make this check hard")
-        else:
-            print(f"[E2E Slack] expected failure: no reaction on the ask on next ({REACTION_GAP_ISSUE})")
+        assert timeline.reaction, "The bot never reacted to the ask"
     else:
         assert timeline.reaction, "The bot never reacted to the ask"
     print(f"[E2E Slack SUCCESS] answer: {timeline.answer_text[:120]!r}")

@@ -50,6 +50,10 @@ import (
 // never reads the map.
 func TestTheIdentityMapShardsStayUnderTheConfigMapLimitAtFleetScale(t *testing.T) {
 	withOperatorBusPrincipal(t)
+	// With the dispatcher off: on, only the profiles its identity can carry
+	// are bound, and this measures 2,500 (TestTheDispatcherCeiling holds the
+	// dispatcher's side, gke-labs/kube-agents#5381).
+	t.Setenv(a2aProfileDispatcherEnvVar, "false")
 	agent := authMapTestAgent()
 	const profileCount = 2500
 	profiles := make([]agentv1alpha1.AgentProfile, 0, profileCount)

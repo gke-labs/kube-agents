@@ -16,6 +16,7 @@ import (
 // it: a backend that draws a Stop control draws it while the task runs and
 // takes it off when the task ends.
 func TestTheLiveLineCarriesStopUntilTheTerminal(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	origin := startChatTask(t, r, "discord:g1/stop-line", true)
 	waitFor(t, "the working line with Stop", func() bool {
@@ -86,6 +87,7 @@ func TestTheHealEndsTheLiveLineWithoutStop(t *testing.T) {
 // closes it as canceled, without Stop, and the new task's line carries the
 // control instead.
 func TestANewTurnClosesASupersededStoppedLine(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	conv := "discord:g1/superseded-line"
 	startChatTask(t, r, conv, false)
@@ -124,6 +126,7 @@ func TestANewTurnClosesASupersededStoppedLine(t *testing.T) {
 // "canceled" with no "canceled" notice posted. A second press changes
 // nothing.
 func TestAChatStopPressAnswersOnTheLine(t *testing.T) {
+	t.Parallel()
 	r := startGchatRig(t, []string{"user@example.com"}, false)
 	conv := "gchat:spaces/S1/threads/T-press"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "user@example.com", MessageID: "spaces/S1/messages/M1", Text: "explain node upgrades"}
@@ -180,6 +183,7 @@ func TestAChatStopPressAnswersOnTheLine(t *testing.T) {
 // pressed on, and cancels nothing: the running task keeps its line and its
 // Stop, and ends as it would have.
 func TestAStalePressAnswersOnItsOwnLineAndCancelsNothing(t *testing.T) {
+	t.Parallel()
 	r := startGchatRig(t, []string{"user@example.com"}, false)
 	conv := "gchat:spaces/S1/threads/T-stale"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "user@example.com", MessageID: "spaces/S1/messages/M1", Text: "explain node upgrades"}
@@ -260,6 +264,7 @@ func TestAPressWithNoLineSpeaksAsATypedStop(t *testing.T) {
 // record knows ended otherwise leaves the line its end wrote, since the
 // terminal edit may have landed a moment before the press.
 func TestAStalePressOnAKnownTaskKeepsOrRestoresItsTerminalLine(t *testing.T) {
+	t.Parallel()
 	r := startGchatRig(t, []string{"user@example.com"}, false)
 	conv := "gchat:spaces/S1/threads/T-known"
 	say := func(id, text string) {
@@ -339,6 +344,7 @@ func TestAStalePressOnAKnownTaskKeepsOrRestoresItsTerminalLine(t *testing.T) {
 // edits of a detached task carry no Stop meanwhile. A press whose message is
 // not the task's own line (a delegating parent's) closes that message too.
 func TestAPressRetriesAFailedCloseAndClosesThePressedLine(t *testing.T) {
+	t.Parallel()
 	r := startGchatRig(t, []string{"user@example.com"}, false)
 	conv := "gchat:spaces/S1/threads/T-retry"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "user@example.com", MessageID: "spaces/S1/messages/M1", Text: "explain node upgrades"}
@@ -398,6 +404,7 @@ func TestAPressRetriesAFailedCloseAndClosesThePressedLine(t *testing.T) {
 // With the card stop armed, a press on the running task takes the typed
 // stop's path: the cancel sent post, the cards stopped, their replies.
 func TestAPressWithTheCardStopArmedIsATypedStop(t *testing.T) {
+	t.Parallel()
 	r := startGchatRig(t, []string{"user@example.com"}, false, func(c *Config) {
 		c.CardStop = true
 		c.CardStopTimeout = 200 * time.Millisecond
@@ -448,6 +455,7 @@ func awaitTaskAfter(t *testing.T, r *rig, addressee string, seen *lib.Envelope) 
 // makes it "canceled" with no "canceled" notice posted. The typed messages
 // themselves are not edited.
 func TestAChatTypedStopAnswersOnTheLine(t *testing.T) {
+	t.Parallel()
 	r := startGchatRig(t, []string{"user@example.com"}, false)
 	conv := "gchat:dm/spaces/S1/threads/T-typed"
 	say := func(id, text string) {
@@ -555,6 +563,7 @@ func TestAChatTypedStopWithNoLineKeepsItsPosts(t *testing.T) {
 // stop's path: the "cancel sent" post, the cards stopped, their replies,
 // and the line left to the relay.
 func TestAChatTypedStopWithTheCardStopArmedKeepsItsPosts(t *testing.T) {
+	t.Parallel()
 	r := startGchatRig(t, []string{"user@example.com"}, false, func(c *Config) {
 		c.CardStop = true
 		c.CardStopTimeout = 200 * time.Millisecond
@@ -584,6 +593,7 @@ func TestAChatTypedStopWithTheCardStopArmedKeepsItsPosts(t *testing.T) {
 // its contract. The relay's "canceled" notice is gone: nothing a stopped
 // task writes reaches the room.
 func TestADiscordTypedStopKeepsItsPosts(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	conv := "discord:g1/typed-stop"
 	origin := startChatTask(t, r, conv, false)
@@ -622,6 +632,7 @@ func TestADiscordTypedStopKeepsItsPosts(t *testing.T) {
 // on the line: "could not send the stop", with the Stop control kept for
 // another try, and nothing posted. The task stays attached and unmarked.
 func TestAChatTypedStopThatCannotSendSaysSoOnTheLine(t *testing.T) {
+	t.Parallel()
 	r := startGchatRig(t, []string{"user@example.com"}, false)
 	conv := "gchat:spaces/S1/threads/T-typed-nosend"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "user@example.com", MessageID: "spaces/S1/messages/M1", Text: "explain node upgrades"}
@@ -659,6 +670,7 @@ func TestAChatTypedStopThatCannotSendSaysSoOnTheLine(t *testing.T) {
 // cancel went, so the typed stop's post says so, and the line stays open
 // for the next stop to close.
 func TestAChatTypedStopWhoseCloseFailsPostsTheNotice(t *testing.T) {
+	t.Parallel()
 	r := startGchatRig(t, []string{"user@example.com"}, false)
 	conv := "gchat:spaces/S1/threads/T-close-fails"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "user@example.com", MessageID: "spaces/S1/messages/M1", Text: "explain node upgrades"}
@@ -698,6 +710,7 @@ func TestAChatTypedStopWhoseCloseFailsPostsTheNotice(t *testing.T) {
 // the press before the gate reads it, named viewer or not. The task runs
 // on. (A typed message from the same member still gets the notice once.)
 func TestAChatStopPressFromAnUnlistedMemberPostsNoNotice(t *testing.T) {
+	t.Parallel()
 	r := startGchatRig(t, []string{"user@example.com"}, false)
 	conv := "gchat:spaces/S1/threads/T-unlisted-press"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "user@example.com", MessageID: "spaces/S1/messages/M1", Text: "explain node upgrades"}

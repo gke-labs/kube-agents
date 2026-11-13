@@ -2427,8 +2427,9 @@ as `slack:<user_id>`, the principal they get as a requester.
 
 **Reactions, clicks and Agent Sessions.** The adapter draws a chat message's `mark`
 (spec-a2a-payloads.md) as reactions on the asking message: today's emoji per ask kind, ⏸️ for
-`blocked`, ❌ for `failed`, nothing for `done`. The gateway owns the state (the chain's newest
-task's mark, the terminal default, a conversation notify's mark) and records what it drew on
+`blocked`, ❌ for `failed`, nothing for `done`. The gateway owns the state (the ask's kind drawn
+when its first task is accepted, `a2a/lib/askkind`; the chain's newest task's mark, the terminal
+default, a conversation notify's mark) and records what it drew on
 the chain's root history entry, so a mark draws only its difference, across a restart too; the
 adapter owns which emoji a token shows, and removes only its own reactions. A delegated child's
 terminal takes no default, since it is relayed before the wake that digests it exists: the
@@ -2958,7 +2959,20 @@ every message through either stamps its own backend.
   connection is answered with the task the first attempt started, and starts nothing.
 - `tasks/get` returns the `Task` as the door holds it. Scoped to the caller: a task another
   caller started is not found rather than forbidden, so the door confirms no id it will not
-  serve.
+  serve. The door holds tasks in the active gateway's memory only, so after a gateway restart
+  or a failover to another replica the new gateway doesn't know a task the old one accepted.
+  The task itself is not lost: its executor may have finished it or may still be running it.
+  Every not-found answer (`-32001`, here and for `tasks/cancel` and a follow-up's `taskId`)
+  carries `data` a client acts on without reading the message: `reason`, `servingSince` (when
+  this gateway started serving the door) and `mayHaveRun: true`. `reason` is `evicted` for the
+  caller's own task the door dropped to stay inside its bounds, and `not-held-since-serving`
+  for anything else: a task submitted before `servingSince`, the caller's own task evicted so long
+  ago that the door no longer remembers it (it keeps 4096 such ids), and equally another caller's
+  id or one no door minted, so the answer still confirms nothing. A client that resubmits with a
+  new `messageId` starts the task again and should expect possible duplicate work: the
+  `messageId` dedupe lives in the same memory, so a repeated `messageId` doesn't dedupe across a
+  restart. On the same gateway a repeated `messageId` still names the original task, so
+  resubmitting an evicted task with its original `messageId` doesn't start a new run.
 - `tasks/cancel` is a cancel turn on the task's conversation - the same `kind: cancel` envelope
   the inject door's cancel route and the chat path's `stop` publish - answered once the cancel is
   on the bus (`TaskObserver.CancelPublished`) with the `Task` as it stands. The executor decides
@@ -3117,11 +3131,19 @@ as above, and an elected gateway's term waits for the `session-state` bucket the
 (`waiting for the bus: ...`), but only for 60 seconds: past that it gives the Lease up, so a
 standby whose bus works can take it, and stands back for a lease's duration before campaigning
 again in the same process (it doesn't exit, so a bus outage puts no replica into
-CrashLoopBackOff). A standby answers 200 once it is connected and has read
+CrashLoopBackOff). A term already under way gives the Lease up too once its connection has been
+down for those 60 seconds without a break (a reconnect starts the count again), and then the process
+exits as it does on a lost Lease, so the restarted container stands by with fresh adapters and
+doors. And a leader whose relay has bound reads not Ready while its connection is down (`waiting
+for the bus: the NATS connection is down, so the bound event relay ... can't deliver`), since the
+relay delivers nothing then. In a full outage every replica reads not Ready, the leader exits once,
+and the Lease then passes between the replicas about every 84 seconds (60 of waiting, 24 of
+standing back) without any of them exiting or writing a term number, until the bus answers. A standby answers 200 once it is connected and has read
 the Lease (`standby: connected, lease held by <pod>`), so a rolling update's new pod reads Ready
 as a standby before an old one stops ([gateway-replicas.md](gateway-replicas.md)). So at two
-replicas a Ready standby keeps the Deployment, and the CR, Ready while the leader waits; the
-leader's own `/readyz` still names the wait. Its progress
+replicas a Ready standby keeps the Deployment Ready while the leader waits. The CR's `Ready` does
+not follow the standby: past a 30-second grace from the leader's election it counts the gateway not
+ready and names the leader. The leader's own `/readyz` still names the wait. Its progress
 deadline is 1800 seconds rather than Kubernetes' 600, so a wait on a slow provision Job does not
 read `ProgressDeadlineExceeded` and end a `kubectl rollout status` early; past 1800 seconds it does,
 while the gateway keeps waiting and the CR keeps reading `Provisioning`.
