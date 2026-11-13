@@ -721,7 +721,18 @@ turn except the incarnation's author set, since a warm worker is reset between t
 session turn, it delegates once: a second request from the same task is dropped as a repeat,
 because nothing yet tells a new request from a redelivered one. A session turn's one request may
 be a batch (above, the delegation primitive); a profile task's may not yet, since nothing lets a
-parent waiting open take several child results. A child's
+parent waiting open take several child results. A profile parent is also held to its own chain
+and scope, checked at the child's mint because the child is a fresh root the verifier never
+compares with its parent. Each profile task records its scope and the profiles of the waiting
+profile tasks above it (its chain) when it's minted. The chain starts afresh at a top submission,
+a session turn or a wake, none of which is a profile task waiting open. A child is refused when
+its resolved profile is already on the chain (`delegation.profile-cycle`), except that the chain's
+head may start one child of its own profile; when its target lies outside the parent's scope
+(`delegation.parent-scope`: a cluster-scoped parent's children stay inside its cluster, and a
+targetless child under one is refused, while a parent with the install's scope may target any
+cluster the install admits); when the parent's scope and chain aren't on its record
+(`delegation.parent-scope-unknown`, failing closed); and when the parent runs at `unattended`
+(`delegation.unattended-parent`), whose trigger binding a child's grant doesn't carry yet. A child's
 end reaches a profile parent as a `childResult` message on the parent's `.in`, which the parent
 reads while it waits open, and the parent holds the conversation again, so a stop or a steer
 reaches it. A session parent is woken as before. A top-level profile task's own end is its

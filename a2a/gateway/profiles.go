@@ -67,6 +67,14 @@ const (
 	// noticeProfileParentToPlatform refuses a profile task's delegation to
 	// platform, whose child would be minted wider than its parent.
 	noticeProfileParentToPlatform = "an agent profile's task delegates only to another agent profile"
+	// The profile parent's chain and scope refusals (#5686). The chain and
+	// scope named are the parent's own.
+	noticeProfileCycle       = "%s is already on this task's chain (%s)"
+	noticeOutsideParentScope = "%s is outside this task's scope (%s)"
+	noticeParentScopeUnknown = "this task's scope is not on record"
+	noticeUnattendedParent   = "a triggered task can't delegate yet"
+	// noticeChainSeparator joins a chain's profiles in noticeProfileCycle.
+	noticeChainSeparator = " → "
 	// noticePlatformTakesNoParameters: platform takes its target from the text.
 	noticePlatformTakesNoParameters = "platform takes no parameters; put the target in the text"
 	// noticeProfileWhileRunning refuses a turn naming a profile while the

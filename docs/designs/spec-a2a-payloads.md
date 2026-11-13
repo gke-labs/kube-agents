@@ -186,7 +186,7 @@ One of them is now decided the other way.
   the Verified identity section below.
 - `authority` carries a _reference_ to an attenuating capability held in KV - who
   originally asked, what scope they hold, what this hop is permitted to do, each further
-  hop a strict subset - per the capability envelope design
+  hop never wider than the one before it on any axis (equal is allowed) - per the capability envelope design
   (`docs/architecture/09-capability-envelope.md`): no token format, nothing signed in the
   envelope, the message carries a lookup id. The A2A `auth-required` task state is
   reserved alongside it. **Armed 9/9**; the Authority section below states the rule.

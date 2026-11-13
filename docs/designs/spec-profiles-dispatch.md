@@ -150,8 +150,10 @@ limits in check:
 
 Very wide work fans out in layers: a coordinator profile (per project or region) above the
 cluster agents, each layer a different profile. Precisely (decided 2026-10-22, worded here
-to close the gaps review found): only a **`top`** task may start children of its own profile,
-and **no profile appears twice on a task's ancestor chain** otherwise. So a `child` task never
+to close the gaps review found): only the **head of a chain** may start children of its own profile,
+and **no profile appears twice on a task's ancestor chain** otherwise. The head is a `top` task, or
+the first profile task under a session turn or a wake: neither a session nor a wake's ended child
+is a profile task waiting open, so the chain starts afresh there. So a task below the head never
 starts a child of its own profile, and A → B → A cycles are refused. The gateway checks the
 chain when it mints a child. A waiting parent's time cap stays the backstop, and resource
 cycles across separate chains (two chains each waiting on the other's profile) are left to
