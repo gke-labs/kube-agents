@@ -47,6 +47,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import tempfile
 import time
 from pathlib import Path
@@ -95,6 +96,12 @@ _dm_channels: dict[tuple[str, str], str] = {}
 _DM_CHANNELS_MAX = 500
 
 
+#: A Slack member id, the only setter the adapter records.
+_MEMBER_ID_RE = re.compile(r"[UW][A-Z0-9]{2,20}")
+#: Year 9999, inside every platform's time.gmtime range.
+_SET_AT_MAX = 253402300799
+
+
 def enabled() -> bool:
     """Whether ``KUBEAGENTS_DIAL`` is ``on``; unset or anything else is off."""
     return os.environ.get(FLAG_ENV, "").strip().lower() == "on"
@@ -132,8 +139,13 @@ def read_state() -> dict:
         return state
     if raw.get("level") in LEVEL_VALUES:
         state["level"] = raw["level"]
-        state["set_by"] = str(raw.get("set_by") or "")
-        state["set_at"] = raw.get("set_at") if isinstance(raw.get("set_at"), int) else 0
+        # Both reach the tab: set_by inside Slack mrkdwn, set_at through
+        # time.gmtime. A hand-edited or damaged record must not inject markup
+        # or stop the tab drawing, so anything out of shape is dropped.
+        set_by = str(raw.get("set_by") or "")
+        state["set_by"] = set_by if _MEMBER_ID_RE.fullmatch(set_by) else ""
+        set_at = raw.get("set_at")
+        state["set_at"] = set_at if type(set_at) is int and 0 < set_at <= _SET_AT_MAX else 0
     if isinstance(raw.get("kinds"), dict):
         state["kinds"] = {str(k): v is True for k, v in raw["kinds"].items()}
     return state

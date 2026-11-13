@@ -248,6 +248,18 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(stored["kinds"], {"missing-pdb": {"env": "dev"}})
         self.assertEqual((stored["extra"], stored["level"]), (1, "explain"))
 
+    def test_a_damaged_setter_or_time_is_dropped_and_the_tab_still_draws(self):
+        path = Path(self.home) / dial.STATE_NAME
+        path.parent.mkdir(parents=True)
+        for set_by, set_at in (("<!channel>", 10**30), ("U0X> *bold*", -5), ("UADMIN", True), ("", 2**63)):
+            with self.subTest(set_by=set_by, set_at=set_at):
+                path.write_text(json.dumps({"level": "explain", "set_by": set_by, "set_at": set_at}))
+                state = dial.read_state()
+                self.assertEqual(state["set_at"], 0)
+                self.assertNotIn("<!channel>", shown(dial.blocks(state, True)))
+                run(dial.opened(self.adapter, {"user": "UADMIN", "channel": "D1", "tab": "home"}))
+                self.assertIn("actions", [b["type"] for b in self.published()])
+
     def test_unreadable_record_is_never_overwritten(self):
         path = Path(self.home) / dial.STATE_NAME
         path.parent.mkdir(parents=True)
