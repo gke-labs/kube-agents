@@ -99,3 +99,15 @@ go test -race ./...
 
 `k8sapiproxy-test.yml` runs those and gosec, built from `k8s-operator/go.mod`'s pin (this module
 declares none); `make gosec` at the repository root runs the same scan over this module.
+
+Every kube-agents release `X.Y.Z` tags this module `k8s-api-proxy/vX.Y.Z` at the release commit,
+so a program can embed the handler with its own authenticator, upstream transport and audit sink:
+
+```bash
+go get github.com/gke-labs/kube-agents/k8s-api-proxy@latest  # or @vX.Y.Z
+```
+
+The module is v0: `Config`, `Policy` and its modes, `CallerAuthenticator`, `UpstreamTransport`,
+`AuditSink`, `CacheStore` and `AuditEvent` may change in any release. The version moves with every
+kube-agents release, whether or not this module changed; a release at `1.0.0` or later tags no
+module until the module's own versioning is decided.
