@@ -453,6 +453,14 @@ class FlagSetIsNextTest(unittest.TestCase):
                 "--set-string",
                 f"{key}.image.tag={_TAG}",
             ]
+        # The A2A door, for the card-wait stopped ask (#5407), under the name
+        # the operator reads it by.
+        expected += [
+            "--set-string",
+            f"operator.extraEnv[11].name={go_constant(_A2A_MANIFESTS, 'a2aAgentDoorEnvVar')}",
+            "--set-string",
+            "operator.extraEnv[11].value=true",
+        ]
         self.assertEqual(args, expected)
         # Nothing names the executor setting, under any index: set to anything,
         # the operator renders BRIDGE_EXECUTOR and the lane stops measuring the
@@ -609,7 +617,8 @@ class FlagSetIsNextTest(unittest.TestCase):
         self.assertEqual(values[9], "operator.extraEnv[9].value=true")
         # The dispatcher, at the candidate's published image.
         self.assertEqual(values[10], f"operator.extraEnv[10].value={_RC_REGISTRY_PREFIX}/a2a-dispatcher:{_RC_COMMIT_SHA}")
-        self.assertEqual(len(values), 11, values)
+        self.assertEqual(values[11], "operator.extraEnv[11].value=true")
+        self.assertEqual(len(values), 12, values)
         self.assertNotIn(_AR_REPO, result.stdout)
         # The names are the ones the release publishes.
         common = text(_REPO_ROOT / "scripts" / "release" / "common.sh")

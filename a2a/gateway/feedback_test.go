@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -20,7 +19,7 @@ import (
 // before the gateway runs, with maxAge as its retention (zero: none).
 func withFeedbackBucket(t *testing.T, maxAge time.Duration) func(*Config) {
 	return func(cfg *Config) {
-		nc, err := nats.Connect(cfg.NATSURL)
+		nc, err := connectTest(cfg.NATSURL)
 		if err != nil {
 			t.Fatalf("connect: %v", err)
 		}
@@ -72,6 +71,7 @@ func completeTurn(t *testing.T, r *rig, conv, messageID, result string) *lib.Env
 }
 
 func TestAnswerIsMarkedForFeedbackWhenTheBucketKeepsRatings(t *testing.T) {
+	t.Parallel()
 	r := startRigWith(t, withFeedbackBucket(t, 30*24*time.Hour))
 	waitFor(t, "feedback on", func() bool { return r.g.feedback.Load() != nil })
 	origin := completeTurn(t, r, "discord:g1/fb1", "d-1", "the fleet is fine")
@@ -87,6 +87,7 @@ func TestAnswerIsMarkedForFeedbackWhenTheBucketKeepsRatings(t *testing.T) {
 }
 
 func TestLongAnswerIsMarkedOnItsLastChunkOnly(t *testing.T) {
+	t.Parallel()
 	r := startRigWith(t, withFeedbackBucket(t, 24*time.Hour))
 	waitFor(t, "feedback on", func() bool { return r.g.feedback.Load() != nil })
 	long := strings.Repeat("word ", discordChunk/2)
@@ -106,6 +107,7 @@ func TestLongAnswerIsMarkedOnItsLastChunkOnly(t *testing.T) {
 }
 
 func TestNoFeedbackBucketMarksNothing(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	completeTurn(t, r, "discord:g1/fb3", "d-1", "the fleet is fine")
 	if got := r.adapter.feedbackMarks(); len(got) != 0 {
@@ -114,6 +116,7 @@ func TestNoFeedbackBucketMarksNothing(t *testing.T) {
 }
 
 func TestFeedbackBucketWithoutMaxAgeLeavesFeedbackOff(t *testing.T) {
+	t.Parallel()
 	r := startRigWith(t, withFeedbackBucket(t, 0))
 	completeTurn(t, r, "discord:g1/fb4", "d-1", "the fleet is fine")
 	if r.g.feedback.Load() != nil || len(r.adapter.feedbackMarks()) != 0 {
@@ -122,6 +125,7 @@ func TestFeedbackBucketWithoutMaxAgeLeavesFeedbackOff(t *testing.T) {
 }
 
 func TestAnswerFeedbackTurnedOffMarksNothingWhateverTheBucket(t *testing.T) {
+	t.Parallel()
 	bucket := withFeedbackBucket(t, 24*time.Hour)
 	r := startRigWith(t, func(cfg *Config) {
 		bucket(cfg)
@@ -195,6 +199,7 @@ func TestFeedbackTargetIsTheChainsFinalAnswerOnly(t *testing.T) {
 }
 
 func TestDeskKeepsADownRatingWithItsNoteAndAnUpReplacesIt(t *testing.T) {
+	t.Parallel()
 	r := startRigWith(t, withFeedbackBucket(t, 24*time.Hour))
 	waitFor(t, "feedback on", func() bool { return r.g.feedback.Load() != nil })
 	desk := r.g.feedback.Load()
@@ -289,6 +294,7 @@ func TestDeskKeepsADownRatingWithItsNoteAndAnUpReplacesIt(t *testing.T) {
 // card's report on a chain that handed its ask to cards, and other when no
 // session record names the rated task.
 func TestDeskCountsACardAnswerAndAnUnknownOneApart(t *testing.T) {
+	t.Parallel()
 	r := startRigWith(t, withFeedbackBucket(t, 24*time.Hour))
 	waitFor(t, "feedback on", func() bool { return r.g.feedback.Load() != nil })
 	desk := r.g.feedback.Load()
@@ -329,6 +335,7 @@ func TestDeskCountsACardAnswerAndAnUnknownOneApart(t *testing.T) {
 // The metric counts rating changes: a first rating and each flip count once,
 // a repeat of the rating already kept does not.
 func TestDeskCountsOnlyARatingChange(t *testing.T) {
+	t.Parallel()
 	r := startRigWith(t, withFeedbackBucket(t, 24*time.Hour))
 	waitFor(t, "feedback on", func() bool { return r.g.feedback.Load() != nil })
 	desk := r.g.feedback.Load()
@@ -363,6 +370,7 @@ func TestDeskCountsOnlyARatingChange(t *testing.T) {
 
 // A rating the bucket did not keep is not counted.
 func TestDeskDoesNotCountARatingItCouldNotKeep(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	// A completed turn first, so the gateway is running (Rate reads its run
 	// context) and the rated task has a session record.
@@ -409,6 +417,7 @@ func TestDeskReRatingKeepsTheNote(t *testing.T) {
 }
 
 func TestDeskKeepsAnUpAsAGoodAnswerAndTalliesTheWeek(t *testing.T) {
+	t.Parallel()
 	r := startRigWith(t, withFeedbackBucket(t, 24*time.Hour))
 	waitFor(t, "feedback on", func() bool { return r.g.feedback.Load() != nil })
 	desk := r.g.feedback.Load()
@@ -470,6 +479,7 @@ func TestDeskKeepsAnUpAsAGoodAnswerAndTalliesTheWeek(t *testing.T) {
 // Rate reports whether the kept record holds the ask: a chain's own ask, or
 // none for a conversation with no session on record.
 func TestDeskReportsWhetherTheAskIsKept(t *testing.T) {
+	t.Parallel()
 	r := startRigWith(t, withFeedbackBucket(t, 24*time.Hour))
 	waitFor(t, "feedback on", func() bool { return r.g.feedback.Load() != nil })
 	desk := r.g.feedback.Load()
@@ -487,6 +497,7 @@ func TestDeskReportsWhetherTheAskIsKept(t *testing.T) {
 }
 
 func TestDeskReRatingAfterTheAskIsGoneKeepsTheKeptAsk(t *testing.T) {
+	t.Parallel()
 	r := startRigWith(t, withFeedbackBucket(t, 24*time.Hour))
 	waitFor(t, "feedback on", func() bool { return r.g.feedback.Load() != nil })
 	desk := r.g.feedback.Load()

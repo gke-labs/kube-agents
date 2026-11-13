@@ -988,7 +988,7 @@ githubMinter:
 fluentBit:
   image:
     repository: docker.io/fluent/fluent-bit
-    tag: "5.1.2"
+    tag: "5.1.5"
 
 # The shell sandbox StatefulSet the operator renders beside every agent pod.
 # Same shape as fluentBit above and for the same reason: the chart never renders
@@ -1617,7 +1617,7 @@ platformAgent:
     # images.json like every other third-party image.
     image:
       repository: docker.io/alpine/k8s
-      tag: "1.36.5"
+      tag: "1.36.6"
     # How long to wait for AgentProfile finalizers to clear before deleting
     # the PlatformAgent CR.
     agentProfileTimeout: 30s
@@ -2036,12 +2036,15 @@ webConsole:
   enabled: false
   # GET /api/environment and PlatformAgent state: versions, install and
   # last-rollout dates, and counts of nodes, namespaces, pods and controllers
-  # for feedback reports, plus reading and patching the PlatformAgent resource
-  # for repository topology, preferred model annotations, and applied PR
-  # annotations. Needs a service account with list on those kinds and get/patch
-  # on the PlatformAgent, which the chart creates. The console discards the
-  # listed items; the only names GET /api/environment returns are the
-  # kube-agents Helm release, its namespace and the owning Argo CD Application.
+  # for feedback reports, the PlatformAgent's status.usage block (counters,
+  # top tools and token totals, for the feedback attachment and the banner's
+  # since-install figures), plus reading and patching the PlatformAgent
+  # resource for repository topology, preferred model annotations, and applied
+  # PR annotations. Needs a service account with list on those kinds and
+  # get/patch on the PlatformAgent, which the chart creates. The console
+  # discards the listed items; the only names GET /api/environment returns are
+  # the kube-agents Helm release, its namespace and the owning Argo CD
+  # Application.
   environment:
     enabled: true
   # "Polish with Gemini" in the feedback form: POST /api/assist sends the

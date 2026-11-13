@@ -8,7 +8,9 @@ collect_agent_pod_diagnostics, which both the eval's exit trap and the failure
 dumper call, now reads every pod carrying the operator's A2A component label,
 and every session pod the gateway spawned, and writes
 a2a-<component>-<pod>.log plus a2a-<component>-<pod>-previous.log for one
-with a restarted container.
+with a restarted container. For each bus server it also reads the server's
+/jsz, /routez and /varz from inside the pod, each under a `timeout` bound, and
+records the bus pods' images (a2a-nats-images.txt).
 
 ci-env.sh is sourced whole and the real collector runs, with `kubectl` on PATH
 replaced by a stub that answers the pod listings from fixtures and the log
@@ -58,10 +60,22 @@ _KUBECTL_STUB = textwrap.dedent(
         fi
         case "${args}" in
           *" -l kubeagents.x-k8s.io/a2a-component "*) cat "${KUBECTL_COMPONENT_LISTING}" ;;
+          *" -l kubeagents.x-k8s.io/a2a-component=nats "*) printf '%s\tnats=docker.io/library/nats@sha256:aaa reloader=docker.io/natsio/r@sha256:bbb \n' platform-agent-a2a-nats-0 ;;
           *" -l app.kubernetes.io/component=a2a-session "*) cat "${KUBECTL_SESSION_LISTING}" ;;
           # The agent diagnostics' own namespace-wide pod status read.
           *) : ;;
         esac
+        ;;
+      *" exec pod/"*)
+        pod="${args#* exec pod/}"
+        pod="${pod%% *}"
+        url="${args% }"
+        url="${url##* }"
+        if [ -n "${KUBECTL_EXEC_FAILS:-}" ]; then
+          echo "error: unable to upgrade connection: container not found" >&2
+          exit 1
+        fi
+        printf '{"pod":"%s","url":"%s"}\n' "${pod}" "${url}"
         ;;
       *" logs pod/"*)
         pod="${args#* logs pod/}"
@@ -78,8 +92,21 @@ _KUBECTL_STUB = textwrap.dedent(
 )
 
 
+# A `timeout` that logs its bound and runs the command, so a test can pin that
+# every exec runs under it.
+_TIMEOUT_STUB = textwrap.dedent(
+    """\
+    #!/usr/bin/env bash
+    echo "timeout $*" >> "${KUBECTL_CALL_LOG}"
+    [ "$1" = "--foreground" ] && shift
+    shift
+    exec "$@"
+    """
+)
+
+
 class A2AComponentLogsTest(unittest.TestCase):
-    def collect(self, *, component_listing=_COMPONENT_LISTING, session_listing=_SESSION_LISTING, list_fails=False, prefix=""):
+    def collect(self, *, component_listing=_COMPONENT_LISTING, session_listing=_SESSION_LISTING, list_fails=False, prefix="", exec_fails=False):
         """Runs collect_agent_pod_diagnostics under `set -euo pipefail`, as the
         eval's trap does. Returns the result, the artifacts dir and the calls."""
         tmp = tempfile.TemporaryDirectory()
@@ -90,6 +117,9 @@ class A2AComponentLogsTest(unittest.TestCase):
         kubectl = bin_dir / "kubectl"
         kubectl.write_text(_KUBECTL_STUB)
         kubectl.chmod(kubectl.stat().st_mode | stat.S_IEXEC)
+        timeout = bin_dir / "timeout"
+        timeout.write_text(_TIMEOUT_STUB)
+        timeout.chmod(timeout.stat().st_mode | stat.S_IEXEC)
         artifacts = root / "artifacts"
         calls = root / "calls.log"
         calls.touch()
@@ -103,6 +133,7 @@ class A2AComponentLogsTest(unittest.TestCase):
                 "KUBECTL_SESSION_LISTING": str(root / "session.txt"),
                 "AGENT_CLUSTER_CONTEXT": _CONTEXT,
                 "KUBECTL_LIST_FAILS": "1" if list_fails else "",
+                "KUBECTL_EXEC_FAILS": "1" if exec_fails else "",
             },
             bin_dir=str(bin_dir),
             absent=("TARGET_NAMESPACE", "NAMESPACE"),
@@ -190,6 +221,57 @@ class A2AComponentLogsTest(unittest.TestCase):
         self.assertLess(bound, 60)
         self.assertEqual(len(current), bound)
         self.assertIn(f"truncated: read the first {bound} pods", (artifacts / "a2a-component-pods.txt").read_text())
+
+
+    def test_a_bus_server_gets_its_monitoring_views_and_the_images_on_record(self) -> None:
+        # The meta cluster's peer state (/jsz), the routes and the build:
+        # what a "no suitable peers for placement" on three serving servers
+        # needs (#5644's today smoke run), read from inside each server's pod.
+        result, artifacts, calls = self.collect()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for path in ("jsz", "routez", "varz"):
+            with self.subTest(path=path):
+                dump = (artifacts / f"a2a-nats-{_NATS}-{path}.json").read_text()
+                self.assertIn(f'"pod":"{_NATS}"', dump)
+                self.assertIn(f"http://127.0.0.1:8222/{path}", dump)
+        execs = [c for c in calls if " exec pod/" in f" {c}" and not c.startswith("timeout ")]
+        self.assertEqual(len(execs), 3, execs)
+        bound = lift_constant("A2A_DIAG_NATS_EXEC_BOUND_SECONDS", _CI_ENV.read_text(), _CI_ENV).split("=", 1)[1].strip()
+        bounded = [c for c in calls if c.startswith(f"timeout --foreground {bound} kubectl ") and f" exec pod/{_NATS} " in c]
+        self.assertEqual(len(bounded), 3, calls)
+        for read in execs:
+            self.assertIn(f"exec pod/{_NATS} ", read)
+            self.assertIn(f"--context {_CONTEXT}", read)
+            self.assertIn(f"-n {_NS}", read)
+            self.assertIn("-c nats", read)
+            self.assertIn("wget -qO- -T ", read)
+        images = (artifacts / "a2a-nats-images.txt").read_text()
+        self.assertIn("nats=docker.io/library/nats@sha256:aaa", images)
+
+    def test_the_rollback_prefix_reaches_the_bus_server_files(self) -> None:
+        result, artifacts, _ = self.collect(prefix="rollback-")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((artifacts / f"rollback-a2a-nats-{_NATS}-jsz.json").exists())
+        self.assertTrue((artifacts / "rollback-a2a-nats-images.txt").exists())
+        self.assertFalse((artifacts / f"a2a-nats-{_NATS}-jsz.json").exists())
+
+    def test_only_bus_servers_are_read_from_inside(self) -> None:
+        _, _, calls = self.collect()
+        for pod in (_CRASHING, _READY, _SESSION):
+            with self.subTest(pod=pod):
+                self.assertFalse(any(f" exec pod/{pod} " in f" {c} " for c in calls))
+
+    def test_a_server_that_does_not_answer_leaves_the_error_and_does_not_fail_the_step(self) -> None:
+        result, artifacts, _ = self.collect(exec_fails=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("collector returned=0", result.stdout)
+        self.assertIn("unable to upgrade connection", (artifacts / f"a2a-nats-{_NATS}-jsz.json").read_text())
+
+    def test_no_bus_server_means_no_image_listing(self) -> None:
+        result, artifacts, calls = self.collect(component_listing=f"{_READY}\tcallout\t0\n", session_listing="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((artifacts / "a2a-nats-images.txt").exists())
+        self.assertEqual([c for c in calls if " exec pod/" in f" {c}"], [])
 
 
 if __name__ == "__main__":

@@ -94,20 +94,20 @@ Pinned here so `make mirror-images` and the install ask for the same version.
 | Image | Upstream reference | Pin | Override | Pulled by |
 | ----- | ------------------ | --- | -------- | --------- |
 | `litellm` | `ghcr.io/berriai/litellm` | `v1.106.0` | `LITELLM_IMAGE` | The LiteLLM gateway, from either the chart or the kustomize integration. |
-| `fluent-bit` | `docker.io/fluent/fluent-bit` | `5.1.2` | `FLUENT_BIT_IMAGE` | The logging sidecar the operator injects into every agent pod. |
+| `fluent-bit` | `docker.io/fluent/fluent-bit` | `5.1.5` | `FLUENT_BIT_IMAGE` | The logging sidecar the operator injects into every agent pod. |
 | `nats` | `docker.io/library/nats` | `2.10-alpine` | `A2A_NATS_IMAGE` | The NATS StatefulSet the operator renders under spec.mode: next, and nothing under spec.mode: today. |
 | `nats-box` | `docker.io/natsio/nats-box` | `0.14.5` | `A2A_PROVISION_IMAGE` | The provision Job the operator runs against that NATS under spec.mode: next, and nothing under spec.mode: today. |
 | `nats-server-config-reloader` | `docker.io/natsio/nats-server-config-reloader` | `0.25.0@sha256:24bacde6b844f8875f93424ed153d33b3d9e9367fcccc14b683eb71fab3a4d8c` | `A2A_NATS_RELOADER_IMAGE` | A sidecar in the NATS pod the operator renders under spec.mode: next, and nothing under spec.mode: today. |
 | `prometheus-nats-exporter` | `docker.io/natsio/prometheus-nats-exporter` | `0.20.3@sha256:4b8ddc1c86fec360b5cd3d5e1fbc6fb52bdafd5805bba3901cc52926538af255` | `A2A_NATS_EXPORTER_IMAGE` | The metrics sidecar in each pod of that NATS StatefulSet under spec.mode: next, and nothing under spec.mode: today. |
-| `k8s` | `docker.io/alpine/k8s` | `1.36.5` | — | The chart's pre-delete cleanup hook Job. |
+| `k8s` | `docker.io/alpine/k8s` | `1.36.6` | — | The chart's pre-delete cleanup hook Job. |
 | `github-token-minter-server` | `us-docker.pkg.dev/abcxyz-artifacts/docker-images/github-token-minter-server` | `v2.7.1-amd64` | `GITHUB_MINTER_IMAGE` | The optional GitHub integration. |
 | `hindsight-api` | `ghcr.io/vectorize-io/hindsight-api` | `0.10.2@sha256:1ba631f950a04460feff6b1e212bad3cdf127b0cfb3d765bdcba12f512481d7b` | `HINDSIGHT_API_IMAGE` | The chart, when the memory provider uses Hindsight (make deploy-hindsight for the kustomize dev path). |
 | `hindsight-postgresql` | `docker.io/pgvector/pgvector` | `0.8.6-pg15@sha256:a947c45cdc5906a1bc951f20a8709e321256343ee0f251e4ae00b5e7def4e6da` | `HINDSIGHT_POSTGRES_IMAGE` | The chart, alongside the Hindsight API. |
-| `cert-manager-controller` | `quay.io/jetstack/cert-manager-controller` | `v1.21.2` | — | cert-manager, installed by the full-install composition unless enable_cert_manager is false. |
-| `cert-manager-cainjector` | `quay.io/jetstack/cert-manager-cainjector` | `v1.21.2` | — | cert-manager, installed by the full-install composition unless enable_cert_manager is false. |
-| `cert-manager-webhook` | `quay.io/jetstack/cert-manager-webhook` | `v1.21.2` | — | cert-manager, installed by the full-install composition unless enable_cert_manager is false. |
-| `cert-manager-acmesolver` | `quay.io/jetstack/cert-manager-acmesolver` | `v1.21.2` | — | cert-manager's controller, via its --acme-http01-solver-image flag. Never pulled by kube-agents itself; the copy exists so a mirrored cert-manager install can point the flag at it. |
-| `cert-manager-startupapicheck` | `quay.io/jetstack/cert-manager-startupapicheck` | `v1.21.2` | — | cert-manager, installed by the full-install composition unless enable_cert_manager is false. Runs once per install as a post-install hook Job. |
+| `cert-manager-controller` | `quay.io/jetstack/cert-manager-controller` | `v1.21.3` | — | cert-manager, installed by the full-install composition unless enable_cert_manager is false. |
+| `cert-manager-cainjector` | `quay.io/jetstack/cert-manager-cainjector` | `v1.21.3` | — | cert-manager, installed by the full-install composition unless enable_cert_manager is false. |
+| `cert-manager-webhook` | `quay.io/jetstack/cert-manager-webhook` | `v1.21.3` | — | cert-manager, installed by the full-install composition unless enable_cert_manager is false. |
+| `cert-manager-acmesolver` | `quay.io/jetstack/cert-manager-acmesolver` | `v1.21.3` | — | cert-manager's controller, via its --acme-http01-solver-image flag. Never pulled by kube-agents itself; the copy exists so a mirrored cert-manager install can point the flag at it. |
+| `cert-manager-startupapicheck` | `quay.io/jetstack/cert-manager-startupapicheck` | `v1.21.3` | — | cert-manager, installed by the full-install composition unless enable_cert_manager is false. Runs once per install as a post-install hook Job. |
 
 ### Base images
 
@@ -116,7 +116,7 @@ Needed only to rebuild the images above from source, not to run an install. Each
 | Image | Upstream reference | Pin | Override | Pulled by |
 | ----- | ------------------ | --- | -------- | --------- |
 | `hermes-agent` | `docker.io/nousresearch/hermes-agent` | `HERMES_AGENT_TAG` in [`tags.env`](https://github.com/gke-labs/kube-agents/blob/main/tags.env) | `HERMES_AGENT_IMAGE` | deploy/docker/Dockerfile (agent-base stage). |
-| `envoy` | `docker.io/envoyproxy/envoy` | `v1.39.1` | `ENVOY_IMAGE` | deploy/docker/Dockerfile (envoy-bin stage). |
+| `envoy` | `docker.io/envoyproxy/envoy` | `v1.39.6` | `ENVOY_IMAGE` | deploy/docker/Dockerfile (envoy-bin stage). |
 | `golang` | `docker.io/library/golang` | `1.27-alpine` | `GOLANG_IMAGE` | deploy/docker/Dockerfile, deploy/kube-proxy/Dockerfile, k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.dispatcher, a2a/Dockerfile.gateway, a2a/Dockerfile.hermes-bridge, a2a/Dockerfile.verifier, a2a/Dockerfile.web-console, a2a/Dockerfile.worker and a2a/Dockerfile.console builder stages. |
 | `node` | `docker.io/library/node` | `22-slim` | `NODE_IMAGE` | a2a/Dockerfile.worker runtime stage and a2a/Dockerfile.console page build stage. |
 | `python` | `docker.io/library/python` | `3.14-slim` | `PYTHON_IMAGE` | examples/inference-replay/replay-proxy/Dockerfile, hack/replay-proxy/Dockerfile and deploy/sandbox/Dockerfile. |
@@ -260,8 +260,8 @@ most:
 - `--dry-run` — print the copy plan and copy nothing.
 
 Destinations are flat, named after the inventory entry's `name`, so
-`quay.io/jetstack/cert-manager-webhook:v1.21.2` lands as
-`<prefix>/cert-manager-webhook:v1.21.2`. The `name`, not the repository's trailing segment —
+`quay.io/jetstack/cert-manager-webhook:v1.21.3` lands as
+`<prefix>/cert-manager-webhook:v1.21.3`. The `name`, not the repository's trailing segment —
 they are the same word for almost every entry, but where they differ the name wins, and
 `docker.io/pgvector/pgvector` lands as `<prefix>/hindsight-postgresql`. Every consumer below
 assumes that flat layout.

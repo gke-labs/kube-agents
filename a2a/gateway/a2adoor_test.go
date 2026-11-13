@@ -362,6 +362,7 @@ func (r *a2aRig) getUntil(t *testing.T, caller, taskID, what string, cond func(a
 // relay handed over whole (DeliverableObserver), not the last chunk; the
 // chunks are the task's history.
 func TestA2AResultArtifactIsWholeWhenTheRelayChunksIt(t *testing.T) {
+	t.Parallel()
 	primary := newFakeAdapter()
 	r := startA2ARigWith(t, func(door *A2ADoor) Adapter {
 		return WithSideDoors(primary, []DoorSpec{A2ADoorSpec(door)}, nil)
@@ -400,6 +401,7 @@ func TestA2AResultArtifactIsWholeWhenTheRelayChunksIt(t *testing.T) {
 // the top-level reply already does; lib.Message has no kind and is not
 // what the door puts on the wire.
 func TestA2ATaskMessagesCarryTheKindDiscriminator(t *testing.T) {
+	t.Parallel()
 	r := startA2ARig(t)
 	sent := r.sendAsync(a2aTestCaller, sendParams("kinds?", "m-1", "", true))
 	r.complete(t, r.awaitTask(t, "platform"), "done")
@@ -841,6 +843,7 @@ func TestA2ATurnLogIsBoundedInBytesAndSaysSo(t *testing.T) {
 // would route it as a new task or a steer of the next one), as is a
 // follow-up on a task that is no longer the conversation's active one.
 func TestA2AFollowUpOnACancelledTaskIsRefused(t *testing.T) {
+	t.Parallel()
 	r := startA2ARig(t)
 	task := taskOf(t, r.rpc(t, a2aTestCaller, a2aMethodSend, sendParams("long job", "m-1", "ctx-1", false)))
 	r.awaitTask(t, "platform")
@@ -916,6 +919,7 @@ func TestA2ACardIsServedWithoutAToken(t *testing.T) {
 // TestA2ARPCRequiresTheBearerToken: no token and a wrong token are both a
 // 401 before the body is read, and the refusal does not say which.
 func TestA2ARPCRequiresTheBearerToken(t *testing.T) {
+	t.Parallel()
 	r := startA2ARig(t)
 	for _, token := range []string{"", "wrong-token", strings.ToUpper(a2aTestToken)} {
 		_, status := r.rawRPC(t, token, a2aTestCaller, a2aMethodSend, sendParams("hi", "m-1", "", false))
@@ -932,6 +936,7 @@ func TestA2ARPCRequiresTheBearerToken(t *testing.T) {
 // with the Task once its submission is on the bus; the envelope carries the
 // text, and its authority block names the door and the mapped eval identity.
 func TestA2AMessageSendStartsATaskTheBusAttributesToTheDoor(t *testing.T) {
+	t.Parallel()
 	r := startA2ARig(t)
 	task := taskOf(t, r.rpc(t, a2aTestCaller, a2aMethodSend, sendParams("do the thing", "m-1", "ctx-1", false)))
 	if task.ID == "" {
@@ -987,6 +992,7 @@ func TestA2AMessageSendStartsATaskTheBusAttributesToTheDoor(t *testing.T) {
 // the Task has a completed status and the deliverable as its result
 // artifact, which is where an A2A client reads the answer.
 func TestA2ATasksGetCarriesTheResultAsAnArtifact(t *testing.T) {
+	t.Parallel()
 	r := startA2ARig(t)
 	task := taskOf(t, r.rpc(t, a2aTestCaller, a2aMethodSend, sendParams("audit the fleet", "m-1", "", false)))
 	origin := r.awaitTask(t, "platform")
@@ -1016,6 +1022,7 @@ func TestA2ATasksGetCarriesTheResultAsAnArtifact(t *testing.T) {
 // TestA2ABlockingSendReturnsTheCompletedTask: configuration.blocking holds
 // the send until the terminal, which is the one-call curl demo.
 func TestA2ABlockingSendReturnsTheCompletedTask(t *testing.T) {
+	t.Parallel()
 	r := startA2ARig(t)
 	sent := r.sendAsync(a2aTestCaller, sendParams("what is the answer?", "m-1", "", true))
 	r.complete(t, r.awaitTask(t, "platform"), "42")
@@ -1032,6 +1039,7 @@ func TestA2ABlockingSendReturnsTheCompletedTask(t *testing.T) {
 // does not carry is dropped by the gateway, the send says so, and nothing
 // reaches the bus. Nothing is defaulted.
 func TestA2AUnmappedCallerIsRefusedAndStartsNothing(t *testing.T) {
+	t.Parallel()
 	r := startA2ARig(t)
 	resp := r.rpc(t, a2aTestUnknownCaller, a2aMethodSend, sendParams("let me in", "m-1", "", false))
 	if resp.Error == nil || resp.Error.Code != a2aErrAuthenticationFail {
@@ -1050,6 +1058,7 @@ func TestA2AUnmappedCallerIsRefusedAndStartsNothing(t *testing.T) {
 // TestA2AMetadataCallerIsHonouredWhenThereIsNoHeader: a client that cannot
 // set headers names itself in the message metadata.
 func TestA2AMetadataCallerIsHonouredWhenThereIsNoHeader(t *testing.T) {
+	t.Parallel()
 	r := startA2ARig(t)
 	params := sendParams("hello from metadata", "m-1", "", false)
 	params["message"].(map[string]any)["metadata"] = map[string]any{a2aCallerMetadataKey: a2aTestCaller}
@@ -1083,6 +1092,7 @@ func TestA2ATasksGetIsScopedToTheCaller(t *testing.T) {
 // TestA2ADuplicateMessageIDAnswersWithTheSameTask: a retry of message/send
 // with the same messageId is the same submission, not a second task.
 func TestA2ADuplicateMessageIDAnswersWithTheSameTask(t *testing.T) {
+	t.Parallel()
 	r := startA2ARig(t)
 	first := taskOf(t, r.rpc(t, a2aTestCaller, a2aMethodSend, sendParams("once", "m-dup", "ctx-1", false)))
 	second := taskOf(t, r.rpc(t, a2aTestCaller, a2aMethodSend, sendParams("once", "m-dup", "ctx-1", false)))
@@ -1105,6 +1115,7 @@ func TestA2ADuplicateMessageIDAnswersWithTheSameTask(t *testing.T) {
 // cancel for it on the bus; the Task comes back as it stands and the client
 // polls for the executor's terminal.
 func TestA2ACancelPublishesAKindCancel(t *testing.T) {
+	t.Parallel()
 	r := startA2ARig(t)
 	task := taskOf(t, r.rpc(t, a2aTestCaller, a2aMethodSend, sendParams("long job", "m-1", "", false)))
 	origin := r.awaitTask(t, "platform")
@@ -1220,6 +1231,7 @@ func TestA2ACancelOnATaskThatCompletedIsRefused(t *testing.T) {
 // method it does not have, a stream it does not serve yet, and a part it
 // cannot route.
 func TestA2AProtocolRefusals(t *testing.T) {
+	t.Parallel()
 	r := startA2ARig(t)
 	if resp := r.rpc(t, a2aTestCaller, "tasks/resubscribe", map[string]any{"id": "x"}); resp.Error == nil || resp.Error.Code != rpcMethodNotFound {
 		t.Errorf("unknown method: %+v", resp)
@@ -1279,6 +1291,7 @@ func TestA2AConfigGuards(t *testing.T) {
 // with a notice and no new task. The door returns that notice as a Message
 // rather than an error, and the steer is on the bus.
 func TestA2AFollowUpOnARunningTaskReturnsTheGatewaysReply(t *testing.T) {
+	t.Parallel()
 	r := startA2ARig(t)
 	task := taskOf(t, r.rpc(t, a2aTestCaller, a2aMethodSend, sendParams("long job", "m-1", "ctx-1", false)))
 	origin := r.awaitTask(t, "platform")
@@ -1331,6 +1344,7 @@ func TestA2AFollowUpOnARunningTaskReturnsTheGatewaysReply(t *testing.T) {
 // TestA2AMetadataCallerReachesGetAndCancel: the client that cannot set
 // headers can poll and cancel what it started.
 func TestA2AMetadataCallerReachesGetAndCancel(t *testing.T) {
+	t.Parallel()
 	r := startA2ARig(t)
 	params := sendParams("hello from metadata", "m-1", "", false)
 	params["message"].(map[string]any)["metadata"] = map[string]any{a2aCallerMetadataKey: a2aTestCaller}
@@ -1364,6 +1378,7 @@ func TestA2AMetadataCallerReachesGetAndCancel(t *testing.T) {
 // through that stack still returns the task, and the chat backend sees no
 // post for it.
 func TestA2ADoorUnderTheCompositeStillSeesItsTasks(t *testing.T) {
+	t.Parallel()
 	primary := newFakeAdapter()
 	r := startA2ARigWith(t, func(door *A2ADoor) Adapter {
 		return WithSideDoors(primary, []DoorSpec{A2ADoorSpec(door)}, nil)
