@@ -1333,7 +1333,7 @@ parse_args() {
         SCOPE_FLAG_PASSED="true"
         PARAM_SCOPED_SA_POOL_MAX_ACCOUNTS="${1#*=}"
         require_scope_flag_value "${1%%=*}" "$PARAM_SCOPED_SA_POOL_MAX_ACCOUNTS"; shift ;;
-      --enable-gvisor|--enable-gvisor=*) PARAM_ENABLE_GVISOR="$(flag_bool_value "$1")"; shift ;;
+      --enable-gvisor|--enable-gvisor=*) PARAM_ENABLE_GVISOR="$(flag_bool_value "$1")"; PARAM_ENABLE_GVISOR_FROM_FLAG="true"; shift ;;
       # Validated here and again in main(). The second check is not redundant:
       # PARAM_ENABLE_WEBUI is seeded from the recorded value and resolved with
       # ${VAR:-...}, which reads an empty assignment as "unset" and hands back
@@ -4285,6 +4285,13 @@ run_lifecycle_apply() {
     export KUBE_AGENTS_STATE_BUCKET="${KUBE_AGENTS_STATE_BUCKET:-$DEFAULT_KUBE_AGENTS_STATE_BUCKET}"
     export KUBE_AGENTS_STATE_PREFIX
     KUBE_AGENTS_STATE_PREFIX="$(tf_state_prefix)"
+    # An explicit --enable-gvisor=false, or the control panel's switch turned
+    # off, is the confirmation lifecycle.sh's guard_gvisor_pool_teardown asks
+    # for before it destroys a live gVisor pool. A value that only came from
+    # install.env is not: that is the line a lost or wrong file gets wrong.
+    if [ "${PARAM_ENABLE_GVISOR_FROM_FLAG:-}" = "true" ] && [ "${PARAM_ENABLE_GVISOR:-}" = "false" ]; then
+      export KUBEAGENTS_ALLOW_NODE_POOL_DESTROY=true
+    fi
     ./lifecycle.sh apply -auto-approve -input=false
   ) 2>&1 | tee "$log_file" || ps=("${PIPESTATUS[@]}")
 
@@ -6996,11 +7003,15 @@ run_menu_system() {
   local custom_roles="${PLATFORM_AGENT_CUSTOM_ROLES:-}"
   # Not the fresh-install default. The control panel describes an install that
   # already exists and its Save & Apply re-applies what it displays, so an
-  # install.env with no ENABLE_GVISOR has to read as the standard runtime —
-  # that is what such a cluster is actually running. Defaulting on here would
-  # show "gVisor Sandbox" for an unsandboxed install and then provision a node
-  # pool nobody asked for on the next apply.
-  local enable_gvisor="${ENABLE_GVISOR:-false}"
+  # install.env with no ENABLE_GVISOR has to read as what the cluster runs:
+  # resolve_existing_install_gvisor asks it, the same reader the Terraform
+  # variables use, so the panel and the apply cannot disagree. A default of
+  # true would show "gVisor Sandbox" for an unsandboxed install and provision a
+  # pool nobody asked for; a default of false showed a Standard install's pool
+  # as off and destroyed it on the next apply.
+  local enable_gvisor
+  enable_gvisor="$(resolve_existing_install_gvisor "$project_id" "$cluster_name" "$region")"
+  local enable_gvisor_shown="$enable_gvisor"
   # DEFAULT_ENABLE_WEBUI is "false" and the paragraph above applies to it too:
   # the panel has to read as what an unconfigured install is running. Flipping
   # that default on would make this show a dashboard nobody deployed, so the
@@ -7175,6 +7186,11 @@ run_menu_system() {
         export PARAM_PROJECT_ID="$project_id" PARAM_CLUSTER_NAME="$cluster_name" PARAM_REGION="$region"
         export PARAM_ENABLE_WEBUI="$enable_webui" PARAM_MODEL_PROVIDER="$model_provider"
         export PARAM_PERMISSION_SET="$permission_set" PARAM_ENABLE_GVISOR="$enable_gvisor"
+        # Switched off here, from on: the operator's own act, which is the
+        # confirmation the apply's gVisor pool guard asks for.
+        if [ "${enable_gvisor_shown:-}" = "true" ] && [ "$enable_gvisor" = "false" ]; then
+          export PARAM_ENABLE_GVISOR_FROM_FLAG="true"
+        fi
         export GOOGLE_CHAT_ENABLED="$google_chat_enabled" SLACK_ENABLED="$slack_enabled"
         # The check main() makes at step 7, before anything is saved; back to
         # the menu on failure.

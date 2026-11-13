@@ -17,8 +17,8 @@
 # none of them inline, and a point of use reads its DEFAULT_* key rather than
 # repeating the value. The exception is a fallback that deliberately differs
 # from the fresh-install default because it describes an install that already
-# exists -- `${ENABLE_GVISOR:-false}` here and in install.sh's control panel,
-# each with the argument beside it. Precedence is
+# exists -- ENABLE_GVISOR, which resolve_existing_install_gvisor reads from the
+# live cluster for both this file and install.sh's control panel. Precedence is
 # install.defaults.env → an exported environment variable → install.env → a flag.
 # install.env is sourced with `set -a`, which is what puts it above the export.
 #
@@ -4367,6 +4367,38 @@ check_service_account_ownership() {
 #
 # Empty on every failure, including the ordinary one: state written before the
 # composition had this output carries no value for it. Callers fall back.
+# Whether the install this state records runs the agent sandboxed, for
+# resolve_existing_install_gvisor when install.env is silent. Prints true when
+# the state holds the gVisor node pool (Standard) or the agent release renders
+# runtimeClassName gvisor (Autopilot's sandbox, which has no pool), false when
+# it holds the release without either, and nothing when there is no state to
+# read or no release in it: the caller decides what an unknown means.
+tf_state_runs_gvisor() {
+  local state
+  state=$(tf_state_read "$@") || return 0
+  printf '%s' "$state" | python3 -c '
+import json, re, sys
+try:
+    doc = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+release = None
+for res in doc.get("resources", []):
+    if res.get("mode") != "managed" or not res.get("instances"):
+        continue
+    if res.get("type") == "google_container_node_pool" and res.get("name") == "gvisor":
+        print("true")
+        sys.exit(0)
+    if res.get("type") == "helm_release" and res.get("name") == "kube_agents":
+        release = res
+if release is None:
+    sys.exit(0)
+values = (release["instances"][0].get("attributes") or {}).get("values") or []
+pattern = re.compile(r"[\"\x27]?runtimeClassName[\"\x27]?\s*:\s*[\"\x27]?gvisor\b")
+print("true" if any(isinstance(v, str) and pattern.search(v) for v in values) else "false")
+'
+}
+
 tf_state_image_tag() {
   local state
   state=$(tf_state_read) || return 0
@@ -4895,6 +4927,74 @@ is_existing_cluster_network_policy_satisfied() {
 # create_cluster = true — flipping it off would remove the resource from
 # configuration and plan the cluster's destruction (lifecycle.sh guards this
 # too).
+# What ENABLE_GVISOR means for an install that already exists, read the same
+# way by every caller that re-renders one: the Terraform variables below and
+# install.sh's control panel. A set, non-empty ENABLE_GVISOR wins, from
+# install.env, the environment or a flag. With no key, the answer is what the
+# cluster runs, not a default: install.sh defaults a fresh install ON, and a
+# fallback of false here planned the destruction of a Standard install's
+# gVisor pool on the next upgrade whenever its install.env lacked the line.
+# The Terraform state answers first, for both shapes: the gVisor pool on
+# Standard, the agent release's runtimeClassName on Autopilot. With no state,
+# Standard lists its node pools; Autopilot has none to list and keeps the
+# sandbox, since a fresh install defaults it on and only an explicit
+# ENABLE_GVISOR="false" may turn it off. A cluster that does not exist yet has nothing
+# to read; install.sh exports its own default before reaching here, and
+# uninstall.sh exports false, so neither falls through to the probe.
+# Prints true or false on stdout; everything it says goes to stderr.
+resolve_existing_install_gvisor() { # <project> <cluster> <location> [cluster_mode]
+  local project="$1" cluster="$2" location="$3" mode="${4:-}"
+  if [ -n "${ENABLE_GVISOR:-}" ]; then
+    printf '%s' "$ENABLE_GVISOR"
+    return 0
+  fi
+  # The Terraform state first: it is what the apply will diff against, and it
+  # answers for both shapes (the pool on Standard, the release's
+  # runtimeClassName on Autopilot).
+  local recorded
+  recorded="$(tf_state_runs_gvisor "$project" "$cluster")"
+  if [ "$recorded" = "true" ]; then
+    print_info "install.env has no ENABLE_GVISOR; this install's Terraform state runs the agent sandboxed (gVisor), so this run keeps it. Add ENABLE_GVISOR=\"true\" to install.env to say so." >&2
+    printf 'true'
+    return 0
+  fi
+  if [ -z "$mode" ]; then
+    local autopilot
+    autopilot="$(trap - ERR; gcloud container clusters describe "$cluster" --location "$location" \
+      --project "$project" --format="value(autopilot.enabled)" 2>/dev/null || true)"
+    case "${autopilot//[[:space:]]/}" in
+      True|true) mode="autopilot" ;;
+      *) mode="standard" ;;
+    esac
+  fi
+  if [ "$mode" = "autopilot" ]; then
+    if [ "$recorded" = "false" ]; then
+      printf 'false'
+      return 0
+    fi
+    # No state to read. Autopilot has no pool to list, and a fresh install
+    # defaults the sandbox on (install.defaults.env DEFAULT_ENABLE_GVISOR), so
+    # the sandbox stays on: only an explicit ENABLE_GVISOR="false" turns it off.
+    print_warning "install.env has no ENABLE_GVISOR and this install's Terraform state could not be read, so this run keeps the agent sandboxed on Autopilot cluster '${cluster}'. If it runs on the standard runtime on purpose, add ENABLE_GVISOR=\"false\" to install.env." >&2
+    printf 'true'
+    return 0
+  fi
+  local pool="${GVISOR_POOL_NAME:-$DEFAULT_GVISOR_POOL_NAME}" pools rc=0
+  pools="$(trap - ERR; gcloud container node-pools list --cluster "$cluster" --location "$location" \
+    --project "$project" --format="value(name)" 2>/dev/null)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    print_warning "install.env has no ENABLE_GVISOR, and the node pools of '${cluster}' could not be listed to tell whether it runs the gVisor pool '${pool}'. Reading it as off; the apply refuses to destroy a gVisor pool it finds in state. Add ENABLE_GVISOR=\"true\" or \"false\" to install.env to say which." >&2
+    printf 'false'
+    return 0
+  fi
+  if grep -Fxq "$pool" <<<"$pools"; then
+    print_info "install.env has no ENABLE_GVISOR; cluster '${cluster}' runs the gVisor pool '${pool}', so this run keeps it. Add ENABLE_GVISOR=\"true\" to install.env to say so." >&2
+    printf 'true'
+  else
+    printf 'false'
+  fi
+}
+
 write_tfvars_from_state() {
   local dest="$1"
   local image_tag="${2:-${IMAGE_TAG:-$IMAGE_TAG_FALLBACK}}"
@@ -5240,23 +5340,19 @@ write_tfvars_from_state() {
   # module for one there fails the plan. Deriving both from the probed
   # cluster_mode keeps --enable-gvisor=true meaning the same thing on either shape.
   #
-  # The fallback stays false even though a fresh install now defaults to the
-  # sandbox. install.sh owns that default and exports ENABLE_GVISOR before
-  # calling this function, so the fallback here
-  # never decides a new install — it only decides the callers that read an
-  # install that already exists. uninstall.sh is the one that matters:
-  # install.env is optional there, and the documented `curl … | bash` teardown
-  # runs from a fresh clone that has none. Defaulting on for that caller would
-  # let the Autopilot version-floor check below abort a destroy, leaving an
-  # install with no working way to remove itself.
-  #
-  # The fallback only reaches the teardown that has no install.env, which is not
-  # the ordinary one — a teardown from the checkout that installed loads an
-  # install.env saying ENABLE_GVISOR="true". uninstall.sh therefore exports false
-  # itself before calling this, and the comment there is where that argument
-  # lives. Do not read the fallback as protecting the teardown on its own.
-  local gvisor_node_pool="false" agent_runtime_class=""
-  if is_truthy "${ENABLE_GVISOR:-false}"; then
+  # With no ENABLE_GVISOR, an existing cluster's own state decides
+  # (resolve_existing_install_gvisor, above), never a default in either
+  # direction. A cluster this run creates has none to read: install.sh exports
+  # its default before calling this, so the false below decides only a caller
+  # that brings neither, and uninstall.sh exports false itself so the
+  # Autopilot version-floor check below can never abort a teardown.
+  local gvisor_node_pool="false" agent_runtime_class="" gvisor_intent="false"
+  if [ "$cluster_exists" = "true" ]; then
+    gvisor_intent="$(resolve_existing_install_gvisor "${PROJECT_ID}" "${CLUSTER_NAME}" "${REGION}" "$cluster_mode")"
+  elif [ -n "${ENABLE_GVISOR:-}" ]; then
+    gvisor_intent="$ENABLE_GVISOR"
+  fi
+  if is_truthy "$gvisor_intent"; then
     agent_runtime_class="gvisor"
     if [ "$cluster_mode" = "standard" ]; then
       gvisor_node_pool="true"

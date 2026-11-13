@@ -48,6 +48,10 @@
 #      decided at the last apply, a profile other than the one that apply
 #      recorded (two root outputs), since a kept profile names none and a
 #      changed one names nothing about an attribute an explicit line set.
+#      The gVisor pool can also be dropped outright: a run whose
+#      enable_gvisor_node_pool comes out false plans its destruction.
+#      `guard_gvisor_pool_teardown` refuses that unless
+#      KUBEAGENTS_ALLOW_NODE_POOL_DESTROY=true says it is meant.
 #   7. A state left by an interrupted install can hold the cluster's CMEK
 #      entries next to a create_cluster that the retry computes as false, and
 #      the module then plans their destruction. `forget_unmanaged_cluster_kms`
@@ -1156,6 +1160,37 @@ guard_node_pool_shape() {
   done
 }
 
+# The gVisor pool is the one node pool an apply can drop on its own: its
+# count is enable_gvisor_node_pool, and a run that renders that false plans the
+# pool's destruction under -auto-approve, taking the sandboxed agent's nodes
+# with it. The installer renders false whenever ENABLE_GVISOR reads false, and
+# for a long time an install.env with no ENABLE_GVISOR read false on upgrade
+# while install.sh had defaulted the pool on, so every Standard upgrade from
+# such a file planned the destroy. resolve_existing_install_gvisor now reads the
+# live pool instead; this guard is the second line, for any other way the flag
+# comes out false (a hand-edited install.env, a pool the listing could not
+# see). Turning the sandbox off on purpose is a deliberate act and says so:
+# KUBEAGENTS_ALLOW_NODE_POOL_DESTROY=true, which upgrade.sh sets for
+# --allow-node-pool-destroy and install.sh for an explicit
+# --enable-gvisor=false or the control panel's switch turned off. Same shape
+# as guard_standard_node_count.
+guard_gvisor_pool_teardown() {
+  load_state
+  in_state "$GVISOR_POOL_ADDRESS" || return 0
+  local enabled
+  enabled=$(tfvar enable_gvisor_node_pool)
+  [[ "$enabled" == "true" ]] && return 0
+  if [[ "${KUBEAGENTS_ALLOW_NODE_POOL_DESTROY:-}" == "true" ]]; then
+    warn "enable_gvisor_node_pool is '$enabled' and the gVisor pool is in state ($GVISOR_POOL_ADDRESS): this apply destroys it, as KUBEAGENTS_ALLOW_NODE_POOL_DESTROY=true confirms."
+    return 0
+  fi
+  warn "enable_gvisor_node_pool resolved to '$enabled', but this state's cluster runs the gVisor pool ($GVISOR_POOL_ADDRESS)."
+  warn "Applying now would DESTROY that pool under -auto-approve, and the agent pod, which runs on it, with nowhere sandboxed to go."
+  warn "To keep it, set ENABLE_GVISOR=\"true\" in install.env (or enable_gvisor_node_pool = true in terraform.tfvars for a hand-driven apply)."
+  warn "To turn the sandbox off on purpose, re-run with --allow-node-pool-destroy (upgrade.sh) or KUBEAGENTS_ALLOW_NODE_POOL_DESTROY=true."
+  exit 1
+}
+
 # account_id on google_service_account.agent is ForceNew, and the resource
 # carries neither create_before_destroy nor prevent_destroy. If a custom
 # override line in install.env goes missing, the next apply resolves
@@ -2032,6 +2067,7 @@ case "${1:-}" in
     guard_release_namespace
     guard_standard_node_count
     guard_node_pool_shape
+    guard_gvisor_pool_teardown
     guard_pubsub_subscription
     guard_drift_adoption
     forget_unmanaged_cluster_kms
@@ -2096,7 +2132,7 @@ case "${1:-}" in
     # The line range is the header comment above, so it moves whenever that
     # comment grows. It ends at the blank comment line before `set -euo
     # pipefail`.
-    sed -n '2,104p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,108p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit 1
     ;;
 esac
