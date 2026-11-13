@@ -59,11 +59,17 @@ func (g *Gateway) profileChildRefusal(rec *SessionRecord, parent TaskRef, route 
 		return ruleDelegationProfileCycle, fmt.Sprintf(noticeProfileCycle, route.Profile, strings.Join(chain, noticeChainSeparator))
 	}
 	if !g.parentScopeHolds(capability.Scope(parent.Scope), route.Scope) {
-		parentCluster := scopeForRoom(capability.Scope(parent.Scope))
+		parentCluster, isCluster := clusterForRoom(capability.Scope(parent.Scope))
+		if !isCluster {
+			// Neither a cluster nor this install's scope: nothing the room can
+			// read as a scope, and nothing to delegate within.
+			return ruleDelegationParentScope, noticeParentScopeStale
+		}
 		if route.Scope == capability.NamespaceScope(g.cfg.Namespace) {
 			return ruleDelegationParentScope, fmt.Sprintf(noticeChildWiderThanParent, parentCluster)
 		}
-		return ruleDelegationParentScope, fmt.Sprintf(noticeOutsideParentScope, scopeForRoom(route.Scope), parentCluster)
+		childCluster, _ := clusterForRoom(route.Scope)
+		return ruleDelegationParentScope, fmt.Sprintf(noticeOutsideParentScope, childCluster, parentCluster)
 	}
 	if !chainAgreesWithRecord(rec, parent) {
 		return ruleDelegationParentChainMismatch, noticeParentChainMismatch
@@ -113,13 +119,14 @@ func chainAgreesWithRecord(rec *SessionRecord, parent TaskRef) bool {
 	return i < 0
 }
 
-// scopeForRoom is a cluster scope as the room reads it, "cluster
-// project/location/cluster", the way the other target notices write one. Any
-// other scope is shown as it is.
-func scopeForRoom(s capability.Scope) string {
+// clusterForRoom is a cluster scope as the room reads it, "cluster
+// project/location/cluster", the way the other target notices write one, and
+// whether s is a cluster scope at all. A child's route scope is a cluster or
+// the install's namespace scope, and the caller handles the latter first.
+func clusterForRoom(s capability.Scope) (string, bool) {
 	segs := strings.Split(string(s), "/")
 	if len(segs) == clusterScopeSegments && segs[0] == scopeKindProject && segs[2] == scopeKindLocation && segs[4] == scopeKindCluster {
-		return scopeKindCluster + " " + strings.Join([]string{segs[1], segs[3], segs[5]}, "/")
+		return scopeKindCluster + " " + strings.Join([]string{segs[1], segs[3], segs[5]}, "/"), true
 	}
-	return string(s)
+	return "", false
 }
