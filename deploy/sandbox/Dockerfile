@@ -637,6 +637,10 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          through credential_proxy_client and sizes their pools
 #                          from it, falling back to four. Every sweep collector
 #                          imports it at load
+#   logging_reads.py       a `gcloud logging read` through the broker's Cloud API
+#                          relay (credential_proxy_client.ApiSession), for the
+#                          stockout collector and the readiness report's audit-log
+#                          rules; when the relay does not answer, they run gcloud
 #   vcs_client.py          the client half of the verb surface: it composes a
 #                          request, sends it over the line above, and raises on a
 #                          refusal. `vcs.py`, `forge.py`, submit-suggestion,
@@ -725,6 +729,7 @@ COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/clean_merges.py \
      agents/platform/scripts/collector_run.py \
      agents/platform/scripts/broker_admission.py \
+     agents/platform/scripts/logging_reads.py \
      agents/platform/scripts/vcs_client.py \
      agents/platform/scripts/workspace_paths.py \
      agents/platform/scripts/gke_endpoint.py \
