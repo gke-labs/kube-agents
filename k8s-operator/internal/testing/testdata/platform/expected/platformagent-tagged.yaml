@@ -2033,6 +2033,10 @@ spec:
             - mountPath: /var/lib/fluent-bit
               name: system-metadata
               subPath: fluent-bit-state/platformagent
+      dnsConfig:
+        options:
+          - name: ndots
+            value: "3"
       initContainers:
         - args:
             - |-

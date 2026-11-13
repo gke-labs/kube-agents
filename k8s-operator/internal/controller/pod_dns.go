@@ -23,9 +23,10 @@ import (
 
 // brokerCallerPodNdots is the resolver's ndots on the pods that dial the
 // broker and the kube-api proxy: the shell sandbox, the profile workers (Job
-// and warm pool) and the broker tiers. The session pods the gateway spawns
-// set the same value (a2a/gateway/spawn.go, sessionPodNdots); keep the two in
-// step.
+// and warm pool), the broker tiers, the gateway, the A2A gateway, the A2A MCP
+// server and the scope publisher. The session pods the gateway spawns set the
+// same value (a2a/gateway/spawn.go, sessionPodNdots), and a test in each
+// module reads the other's constant, so the two cannot drift apart.
 //
 // Kubernetes' default is ndots:5, so the 4-dot service names the operator
 // renders (CREDENTIAL_PROXY_URL, KUBE_PROXY_URL: <svc>.<ns>.svc.cluster.local)

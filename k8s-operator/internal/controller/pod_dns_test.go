@@ -17,27 +17,38 @@ limitations under the License.
 package controller
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"path/filepath"
+	"strconv"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/utils/ptr"
 )
 
 // Every pod that dials the broker or the kube-api proxy by its 4-dot service
-// name sets ndots:3, so the name is asked as written first (#5590): the shell
-// sandbox, the broker and its exec tier, and the profile workers, both the
-// Job template and the warm pool. The DNS policy stays the default
+// name sets ndots:3, so the name is asked as written first (#5590, #5609): the
+// shell sandbox, the broker and its exec tier, the profile workers (the Job
+// template and the warm pool), the gateway, the A2A gateway, the A2A MCP
+// server and the scope publisher. The DNS policy stays the default
 // (ClusterFirst), so the cluster's nameservers and search list still apply.
 func TestBrokerCallerPodsSetNdots3(t *testing.T) {
 	a2a := a2aTestAgent()
 	profile := unattendedProfile(a2a, "tse")
 	execAgent := execTierTestAgent(ptr.To(int32(2)))
 	pods := map[string]corev1.PodSpec{
-		"shell sandbox": buildShellSandboxStatefulSet(shellSandboxTestAgent(), "sandbox-ssh", "http://broker:8080", "settings-hash").Spec.Template.Spec,
-		"broker":        buildCredentialProxyDeployment(execAgent, "hash").Spec.Template.Spec,
-		"exec tier":     buildCredentialProxyExecTierDeployment(execAgent, buildCredentialProxyDeployment(execAgent, "hash")).Spec.Template.Spec,
-		"worker Job":    buildProfileJobTemplate(a2a, &profile, false).Spec,
-		"warm pool":     buildProfilePool(a2a, &profile, "read", "agentprofile-tse-read", false).Spec.Template.Spec,
+		"shell sandbox":   buildShellSandboxStatefulSet(shellSandboxTestAgent(), "sandbox-ssh", "http://broker:8080", "settings-hash").Spec.Template.Spec,
+		"broker":          buildCredentialProxyDeployment(execAgent, "hash").Spec.Template.Spec,
+		"exec tier":       buildCredentialProxyExecTierDeployment(execAgent, buildCredentialProxyDeployment(execAgent, "hash")).Spec.Template.Spec,
+		"worker Job":      buildProfileJobTemplate(a2a, &profile, false).Spec,
+		"warm pool":       buildProfilePool(a2a, &profile, "read", "agentprofile-tse-read", false).Spec.Template.Spec,
+		"gateway":         buildPodTemplateSpec(a2a, "h", "h", "h", "h", nil, renderOptions{}).Spec,
+		"A2A gateway":     buildA2AGatewayDeployment(a2a).Spec.Template.Spec,
+		"A2A MCP server":  buildA2AMCPDeployment(a2a).Spec.Template.Spec,
+		"scope publisher": buildScopePublisherJob(a2a, time.Unix(0, 0), "hash").Spec.Template.Spec,
 	}
 	for name, spec := range pods {
 		if spec.DNSPolicy != "" && spec.DNSPolicy != corev1.DNSClusterFirst {
@@ -61,4 +72,51 @@ func TestBrokerCallerPodsSetNdots3(t *testing.T) {
 			t.Errorf("%s: ndots options %v, want exactly one, 3", name, ndots)
 		}
 	}
+}
+
+// The gateway is a separate Go module, so its session pods carry a copy of
+// the value (sessionPodNdots in a2a/gateway/spawn.go). This reads that file,
+// so a change here that leaves the gateway behind fails; the gateway's
+// TestSessionPodNdotsIsTheOperators is the same check from the other side,
+// because each module's tests run only when that module changes.
+func TestBrokerCallerPodNdotsIsTheGateways(t *testing.T) {
+	path := filepath.Join("..", "..", "..", "a2a", "gateway", "spawn.go")
+	if got := stringConstantIn(t, path, "sessionPodNdots"); got != brokerCallerPodNdots {
+		t.Errorf("the gateway's sessionPodNdots is %q and brokerCallerPodNdots is %q; change both together", got, brokerCallerPodNdots)
+	}
+}
+
+// stringConstantIn is the value of the string constant name that the Go file
+// at path declares.
+func stringConstantIn(t *testing.T, path, name string) string {
+	t.Helper()
+	file, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, decl := range file.Decls {
+		gen, ok := decl.(*ast.GenDecl)
+		if !ok || gen.Tok != token.CONST {
+			continue
+		}
+		for _, spec := range gen.Specs {
+			values := spec.(*ast.ValueSpec)
+			for i, ident := range values.Names {
+				if ident.Name != name || i >= len(values.Values) {
+					continue
+				}
+				lit, ok := values.Values[i].(*ast.BasicLit)
+				if !ok || lit.Kind != token.STRING {
+					t.Fatalf("%s: %s is not a string literal", path, name)
+				}
+				value, err := strconv.Unquote(lit.Value)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return value
+			}
+		}
+	}
+	t.Fatalf("%s declares no constant %s", path, name)
+	return ""
 }
