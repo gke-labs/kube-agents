@@ -1189,7 +1189,7 @@ func TestAPI_FollowUpTurnDoesNotSendAfterTheTaskStops(t *testing.T) {
 			}
 			tc.prepare(run)
 			defer b.closing.Store(false)
-			if _, ok := b.apiTurn(run, tc.ctx, "a2a-ctx-"+taskID, "next", steer, 2, "turn 1's answer"); ok {
+			if _, ok := b.apiTurn(run, tc.ctx, "a2a-ctx-"+taskID, "next", steer, 2, "turn 1's answer", apiTurnKey(run.origin.TaskID, steer)); ok {
 				t.Fatal("a follow-up turn answered after the task stopped")
 			}
 			if n := len(stub.seen()); n != 0 {
@@ -1224,7 +1224,7 @@ func TestAPI_FollowUpTurnDoesNotSendAfterTheTaskStops(t *testing.T) {
 	// Control: with nothing stopping it, the same call sends the turn under
 	// the follow-up's key, and the follow-up leaves the queue.
 	run, steer := idleRun(t, b, "task-api-nosend-control")
-	text, ok := b.apiTurn(run, context.Background(), "a2a-ctx-control", "next", steer, 2, "turn 1's answer")
+	text, ok := b.apiTurn(run, context.Background(), "a2a-ctx-control", "next", steer, 2, "turn 1's answer", apiTurnKey(run.origin.TaskID, steer))
 	if !ok || text != "answer to next" {
 		t.Fatalf("control: ok %v text %q", ok, text)
 	}
@@ -1894,7 +1894,7 @@ func TestAPI_CancelBetweenTurnsStaysCanceledWhenTheResultCopyFails(t *testing.T)
 		t.Fatalf("nextSteer = %v, want the queued follow-up", got)
 	}
 	run.canceled.Store(true)
-	if _, ok := b.apiTurn(run, context.Background(), "a2a-ctx-copyfail", "next", steer, 2, "turn 1's answer"); ok {
+	if _, ok := b.apiTurn(run, context.Background(), "a2a-ctx-copyfail", "next", steer, 2, "turn 1's answer", apiTurnKey(run.origin.TaskID, steer)); ok {
 		t.Fatal("a follow-up turn answered after the cancel")
 	}
 	if final := terminal("task-api-copyfail"); final.Status.State != lib.StateCanceled ||

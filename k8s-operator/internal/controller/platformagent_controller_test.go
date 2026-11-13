@@ -855,6 +855,9 @@ func TestPlatformAgentReconciler_Reconcile_PodUnschedulable(t *testing.T) {
 				"app": "test-agent-unschedulable-gateway",
 			},
 		},
+		// As the agent pod renders it: the CR's RuntimeClass on the pod,
+		// which is what lets the scan blame the RuntimeClass.
+		Spec: corev1.PodSpec{RuntimeClassName: ptr.To("gvisor")},
 		Status: corev1.PodStatus{
 			Phase: corev1.PodPending,
 			Conditions: []corev1.PodCondition{
@@ -1085,7 +1088,7 @@ func reconcileInvalidCredentialProxyResources(t *testing.T, override *corev1.Res
 		t.Fatalf("mark shell sandbox ready: %v", err)
 	}
 	r.APIReader = cl
-	phase, err := r.updateStatusReady(ctx, updated, "", otlpSourceNone, r.resolveNetpolProfile(ctx, updated), a2aStateFrom(t, ctx, r, updated))
+	phase, _, err := r.updateStatusReady(ctx, updated, "", otlpSourceNone, r.resolveNetpolProfile(ctx, updated), a2aStateFrom(t, ctx, r, updated))
 	if err != nil {
 		t.Fatalf("updateStatusReady failed: %v", err)
 	}
@@ -5271,7 +5274,7 @@ func TestReconcileNetworkPolicy_StatusReporting(t *testing.T) {
 	}
 
 	profile := r.resolveNetpolProfile(ctx, agent)
-	phase, err := r.updateStatusReady(ctx, agent, "http://otel:4318", "Spec", profile, a2aProvisionState{})
+	phase, _, err := r.updateStatusReady(ctx, agent, "http://otel:4318", "Spec", profile, a2aProvisionState{})
 	if err != nil {
 		t.Fatalf("updateStatusReady failed: %v", err)
 	}
@@ -5361,7 +5364,7 @@ func TestReconcileNetworkPolicy_StatusReporting_Disabled(t *testing.T) {
 	}
 
 	profile := r.resolveNetpolProfile(ctx, agent)
-	if _, err := r.updateStatusReady(ctx, agent, "http://otel:4318", "Spec", profile, a2aProvisionState{}); err != nil {
+	if _, _, err := r.updateStatusReady(ctx, agent, "http://otel:4318", "Spec", profile, a2aProvisionState{}); err != nil {
 		t.Fatalf("updateStatusReady failed: %v", err)
 	}
 

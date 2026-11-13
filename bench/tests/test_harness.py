@@ -5109,7 +5109,7 @@ def test_a_card_wake_refuses_an_unknown_transport(
 
     result = KubeAgentsHarness().run(_REPLAY_PROMPT)
 
-    assert result.errors == ["AGENT_TRANSPORT must be one of ['api', 'inject'], got 'smoke-signal'"]
+    assert result.errors == ["AGENT_TRANSPORT must be one of ['api', 'inject', 'slack'], got 'smoke-signal'"]
     # Only the run-start clock read: nothing planted.
     assert scripts == [harness._POD_CLOCK_SCRIPT]
     assert stub_agent.requests == []
@@ -5744,6 +5744,92 @@ def test_settle_records_a_capture_gap_on_the_trajectory(
         assert res.trajectory[-2]["agent"] == "cluster-a"
     assert harness.worker_trajectory.GAP_ENTRY in harness._FRONT_DOOR_NON_ACTION_TOOLS
     assert not any(harness.INFRA_FAILURE_MARKER in e for e in res.errors)
+
+
+@pytest.mark.parametrize(
+    "card, entries, commands, summary, expected",
+    [
+        (("done", None), [], [], {}, True),
+        (("blocked", "needs_input"), [], [], {}, True),
+        (("blocked", "dependency"), [], [], {}, True),
+        (("blocked", "capability"), [], [], {}, True),
+        (("blocked", "needs_input", "spawn failed"), [], [], {}, False),
+        (("blocked", "transient"), [], [], {}, False),
+        (("blocked", "capacity"), [], [], {}, False),
+        (("blocked", None), [], [], {}, False),
+        (("archived", None), [], [], {}, False),
+        (("failed", None), [], [], {}, False),
+        (None, [], [], {}, False),
+        (("done", None), [{"name": "kanban_show", "agent": "platform", "task": "t_1"}], [], {}, False),
+        (("done", None), [], [{"task": "t_1", "command": "ls"}], {}, False),
+        (("done", None), [], [], {"clipped": ["calls"], "errors": []}, False),
+    ],
+    ids=[
+        "done", "needs-input", "dependency", "capability", "breaker-after-a-block", "rate-limit-transient", "capacity",
+        "breaker-gave-up", "archived", "failed", "not-on-board", "worker-entry", "worker-command", "capture-gap",
+    ],
+)
+def test_settle_records_cards_closed_with_no_worker_call(
+    card, entries, commands, summary, expected, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#5371: ``_settle`` writes ``worker_trajectory.NO_WORKER_CALLS_ENTRY``
+    only when every awaited card was closed by an agent (done, or one of
+    ``kanban_block``'s kinds), the read is clean and the capture holds no
+    worker entry or logged command. The platform's own blocks (breaker,
+    rate-limit guardrail, admission) and a gap never earn it."""
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: {"t_1": ""})
+    monkeypatch.setattr(harness, "_worker_commands", lambda logs: list(commands))
+    monkeypatch.setattr(
+        harness.worker_trajectory,
+        "capture",
+        lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(entries=[dict(e) for e in entries], summary=summary),
+    )
+    on_board = (
+        {}
+        if card is None
+        else {"t_1": harness.board.BoardCard(card[0], block_kind=card[1], error=card[2] if len(card) > 2 else None)}
+    )
+    monkeypatch.setattr(harness.board, "read_board_cards", lambda shell, ids, to: on_board)
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1"])
+
+    marked = [e for e in res.trajectory if e.get("name") == harness.worker_trajectory.NO_WORKER_CALLS_ENTRY]
+    assert marked == ([harness.worker_trajectory.no_worker_calls_entry(["t_1"])] if expected else [])
+    assert harness.worker_trajectory.NO_WORKER_CALLS_ENTRY in harness._FRONT_DOOR_NON_ACTION_TOOLS
+
+
+@pytest.mark.parametrize(
+    "statuses, logs, expected",
+    [
+        ({"t_1": "done", "t_2": "done"}, {"t_1": "", "t_2": ""}, True),
+        ({"t_1": "done", "t_2": "running"}, {"t_1": "", "t_2": ""}, False),
+        ({"t_1": "done", "t_2": "done"}, {"t_1": "", "t_2": None}, False),
+    ],
+    ids=["both-closed", "one-open", "one-log-unread"],
+)
+def test_settle_records_no_worker_calls_only_when_every_card_closed_and_every_log_read(
+    statuses, logs, expected, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#5371: with two awaited cards, one card still open or one worker log
+    unread keeps ``worker_trajectory.NO_WORKER_CALLS_ENTRY`` off the trajectory."""
+    monkeypatch.setattr(harness, "_worker_logs", lambda awaited, to: dict(logs))
+    monkeypatch.setattr(harness, "_worker_commands", lambda logs: [])
+    monkeypatch.setattr(
+        harness.worker_trajectory,
+        "capture",
+        lambda shell, awaited, to: harness.worker_trajectory.WorkerCapture(entries=[], summary={}),
+    )
+    on_board = {t: harness.board.BoardCard(s) for t, s in statuses.items()}
+    monkeypatch.setattr(harness.board, "read_board_cards", lambda shell, ids, to: on_board)
+    monkeypatch.setattr(harness, "_agent_shell", lambda cmd, to: "")
+
+    res = harness.AgentResult(output="router ack", trajectory=[{"name": "kanban_create"}])
+    harness.KubeAgentsHarness._settle(res, [], ["t_1", "t_2"])
+
+    marked = [e for e in res.trajectory if e.get("name") == harness.worker_trajectory.NO_WORKER_CALLS_ENTRY]
+    assert marked == ([harness.worker_trajectory.no_worker_calls_entry(["t_1", "t_2"])] if expected else [])
 
 
 @pytest.mark.parametrize("awaited", [["t_1"], []], ids=["delegated", "no-card"])
@@ -6801,3 +6887,45 @@ def test_a_run_whose_prompt_names_the_agent_cluster_without_a_context_is_a_setup
     assert "AGENT_CLUSTER_CONTEXT" in result.errors[0]
     snap = transcript.get()
     assert snap is not None and snap.output == ""
+
+
+# ------------------------------------------------ a fleet fixture's cluster in a prompt
+
+
+def _fleet_context(tmp_path, monkeypatch, text: str):
+    (tmp_path / ".fleet-context").write_text(text, encoding="utf-8")
+    monkeypatch.setenv("BENCH_FLEET_KUBECONFIG_DIR", str(tmp_path))
+
+
+def test_the_fleet_cluster_placeholders_expand_from_the_runners_context(tmp_path, monkeypatch):
+    _fleet_context(tmp_path, monkeypatch, "project=evals-3\nslot.crashloop-workload=b\ncluster.b=seeded-b\nlocation.b=us-central1-a\n")
+    prompt = ("why does payments-api restart on {{FLEET_CLUSTER_NAME:crashloop-workload}} "
+              "(project {{FLEET_CLUSTER_PROJECT:crashloop-workload}}, location {{FLEET_CLUSTER_LOCATION:crashloop-workload}})")
+    expanded, problem = harness.expand_fleet_cluster_placeholders(prompt)
+    assert problem is None
+    assert expanded == "why does payments-api restart on seeded-b (project evals-3, location us-central1-a)"
+
+
+def test_a_prompt_without_fleet_placeholders_needs_no_fleet(monkeypatch):
+    monkeypatch.delenv("BENCH_FLEET_KUBECONFIG_DIR", raising=False)
+    assert harness.expand_fleet_cluster_placeholders("list the pods") == ("list the pods", None)
+
+
+def test_an_unresolved_fleet_role_is_a_setup_problem_not_the_models(tmp_path, monkeypatch):
+    prompt = "about {{FLEET_CLUSTER_NAME:crashloop-workload}}"
+    monkeypatch.delenv("BENCH_FLEET_KUBECONFIG_DIR", raising=False)
+    _, problem = harness.expand_fleet_cluster_placeholders(prompt)
+    assert problem is not None and "fleet" in problem
+    # A slot for another role only.
+    _fleet_context(tmp_path, monkeypatch, "project=evals-3\nslot.idle-nodepool=a\ncluster.a=seeded-a\nlocation.a=us-east1\n")
+    _, problem = harness.expand_fleet_cluster_placeholders(prompt)
+    assert problem is not None and "crashloop-workload" in problem
+    # The role's slot was recorded but never reached.
+    _fleet_context(tmp_path, monkeypatch, "project=evals-3\nslot.crashloop-workload=b\ncluster.a=seeded-a\nlocation.a=us-east1\n")
+    expanded, problem = harness.expand_fleet_cluster_placeholders(prompt)
+    assert problem is not None and "never reached" in problem
+    assert expanded == prompt
+    # A reached slot with no location recorded can't name the target either.
+    _fleet_context(tmp_path, monkeypatch, "project=evals-3\nslot.crashloop-workload=b\ncluster.b=seeded-b\n")
+    _, problem = harness.expand_fleet_cluster_placeholders(prompt)
+    assert problem is not None and "never reached" in problem

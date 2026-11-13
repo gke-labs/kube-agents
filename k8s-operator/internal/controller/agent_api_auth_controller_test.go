@@ -183,7 +183,7 @@ func TestReconcileInvalidAgentAPIAuthResources(t *testing.T) {
 				}
 			}
 			r.APIReader = cl
-			phase, err := r.updateStatusReady(ctx, updated, "", otlpSourceNone, r.resolveNetpolProfile(ctx, updated), a2aStateFrom(t, ctx, r, updated))
+			phase, _, err := r.updateStatusReady(ctx, updated, "", otlpSourceNone, r.resolveNetpolProfile(ctx, updated), a2aStateFrom(t, ctx, r, updated))
 			if err != nil {
 				t.Fatalf("updateStatusReady failed: %v", err)
 			}

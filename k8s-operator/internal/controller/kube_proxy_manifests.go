@@ -34,6 +34,9 @@ import (
 )
 
 const (
+	// The kube-api proxy URL on the gateway's platform-agent container
+	// (buildPodTemplateSpec); gke_endpoint.KUBE_PROXY_ENVS reads it.
+	kubeProxyInUseURLEnv                 = "KUBE_PROXY_IN_USE_URL"
 	kubeProxyPort                  int32 = 8443
 	kubeProxyMetricsPort           int32 = 8444
 	kubeProxyMetricsPortName             = "kube-metrics"            // #nosec G101 -- Container port name, not a credential

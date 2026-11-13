@@ -38,6 +38,7 @@ CRD_FILES = {
     "PlatformAgent": CRD_DIR / "kubeagents.x-k8s.io_platformagents.yaml",
     "AgentProfile": CRD_DIR / "kubeagents.x-k8s.io_agentprofiles.yaml",
     "AgentPlugin": CRD_DIR / "kubeagents.x-k8s.io_agentplugins.yaml",
+    "Tier": CRD_DIR / "kubeagents.x-k8s.io_tiers.yaml",
 }
 
 FIXTURE = textwrap.dedent(
@@ -669,7 +670,8 @@ def schema_constraints(schema: dict, generated: list[tuple[str, str]]) -> list[t
             if marker in generate_docs.SCHEMA_IMPLIED_MARKERS and prefix + marker not in emitted:
                 continue
             value = node[key]
-            value = ";".join(value) if isinstance(value, list) else str(value)
+            # An enum may be of integers (busReplicas: 1;3) as well as strings.
+            value = ";".join(str(v) for v in value) if isinstance(value, list) else str(value)
             out.append((prefix + marker, value))
     return out
 

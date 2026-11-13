@@ -53,7 +53,9 @@ references.
 
 `prompt` is what the agent is given. Write it as the user would write it, not as a
 checklist — a prompt that enumerates the answer measures instruction-following rather
-than the journey. `{{CLUSTER_NAME}}` and `{{PROJECT_ID}}` are substituted by the runner.
+than the journey. `{{CLUSTER_NAME}}` and `{{PROJECT_ID}}` are substituted by the runner, and the
+harness fills in the cluster placeholders `bench/CUSTOM-TASKS.md` lists (`{{AGENT_CLUSTER_*}}`,
+`{{FLEET_CLUSTER_*:<role>}}`).
 A first line of `[bench:slack-question-wake]` makes the run a replay of the wake a card blocked
 on a question sends, rather than an ask
 ([`bench/kube_agents_bench/card_wake.py`](../../bench/kube_agents_bench/card_wake.py)); a replay
@@ -72,8 +74,13 @@ prompt an ask the harness stops once it has filed a card
 only over the inject transport, so the case needs an entry in
 `hack/eval/api-lane-exclusions.txt`. `[bench:stop-mid-turn]`, optionally with `after=<seconds>` and
 `observe=<seconds>`, is the same stop sent while the opening turn still runs, `after` seconds after
-the harness first sees it working; a run whose stopped turn filed no card passes. The harness
-writes two entries for either case, `harness_stop_sent` and `harness_cards_stopped`, and the case's
+the harness first sees it working; a run whose stopped turn filed no card passes.
+`[bench:stop-in-card-wait]`, optionally with `deadline=<seconds>` and `observe=<seconds>`, sends the
+ask through the gateway's A2A door, whose turns hold for their cards, whatever the lane's transport.
+It cancels the door task (`tasks/cancel`) once a card filed since the send is on the board while the
+task still works. No card within `deadline`, or a task that ends before any card, is
+infrastructure, not a pass. The next lane turns the door on for it, so an eval install runs with a
+door a default install doesn't have. The harness writes two entries for any of these cases, `harness_stop_sent` and `harness_cards_stopped`, and the case's
 `tool_called` objectives name them.
 A first line of `[bench:reply-under-pushed-report]`, with `opening:`, `report:` and `reply:`
 lines under it, sends the opening as turn one, stores the report for the conversation in the
@@ -177,7 +184,7 @@ lock for the whole unit, beside the stream a `ledger_issue_contains` check names
 (`hack/ci-eval-pr.sh`, `task_streams`, reading the key with the YAML parser the lint uses), and
 releases them when devops-bench returns. A run that outlasts the unit is covered by the next
 unit on the stream, which waits for it first (`wait_platform_runs`), so an audit case does not
-run beside the case's runs and grade their ledger. `oobe-first-run-audits` carries the four it
+run beside the case's runs and grade their ledger. `oobe-first-run-audits` carries the five it
 starts. devops-bench ignores the key.
 
 `scope_exclude` is for a case whose precondition is an install that leaves some seeded
@@ -202,9 +209,13 @@ excludes every slot. devops-bench ignores the key.
 The runner pauses most of the Platform Agent's clock-started audits at lease time and again
 right before the fan-out (`scheduled_audits`, #3020), so their scheduled runs can't write to the GitOps
 repository in the middle of an eval and be charged to whichever cases are running. It leaves the
-four the `oobe` stage starts (the stage holds a paused audit rather than starting it), the
-`no_agent` jobs, and any job the image doesn't ship. Those four still run on their clock, so a
-write from one of them mid-eval is still possible. An audit case starts its own run from its
+`no_agent` jobs and any job the image doesn't ship. The five audits the `oobe` stage starts on a
+fresh install are paused once the stage is done, or before that once it has fired or adopted the
+audit, and no run of it is due or under way, since the stage holds a paused audit rather than
+starting it; every pause pass applies
+that, and a watch through the fan-out repeats it every few minutes, except while the
+`oobe-first-run-audits` stack has the stage armed. Until then a write from one of them mid-eval
+is still possible. `hack/ci_pause_scheduled_audits.py`'s header has the rule in full. An audit case starts its own run from its
 prompt, which a paused schedule doesn't affect. A pause that still fails after its attempts
 stops the run as an infrastructure failure rather than letting a scheduled audit's writes be
 charged to the cases.
@@ -302,7 +313,7 @@ entry for every slot it means; its `fixture_roles` names the seeded-fleet
 roles whose clusters the patterns require a line about, each resolved to its slot's own
 credential (`clusters/<slot>.kubeconfig`, written for every seeded cluster the runner reached,
 before any role on it is confirmed), and a slot the runner did not reach returns
-`status: "error"`, the cluster being absent from the project rather than missed by the agent), `report_manifest` (the fenced code blocks in the same text, parsed as YAML: one document of `kind` carries every `fields` value and a label selector that selects every `selects` set and no `excludes` set), `answer_first` (each delivered card result, raw:
+`status: "error"`, the cluster being absent from the project rather than missed by the agent), `report_manifest` (the fenced code blocks in the same text, parsed as YAML: one document of `kind` carries every `fields` value and a label selector that selects every `selects` set and no `excludes` set), `answer_first` (each delivered card result, raw, less its trailing `[next: ...]` step lines:
 it opens on one bold sentence, has no heading, stays
 under its character and sentence caps, and no later sentence matches a
 `recap_patterns` regex; each of the case's `lead_terms` appears in at least one result's
@@ -331,7 +342,10 @@ shell words: it removes only the pattern argument of a command that is one
 grep and nothing else, and refuses a control operator, a redirect other than
 `>` to `/dev/null`, a comment, a substitution, a collapsed chain, a braced expansion other than
 `${NAME}` or `${NAME:-…}`, a read of the last argument (`$_`) or of a variable through another
-(`${!NAME}`), and an ANSI-C quote); or with `required_runs` a script by its basename and the flags that must
+(`${!NAME}`), and an ANSI-C quote; neither exemption reads a row of a card whose tagged `terminal`
+calls include one that may hold more than one line, which the row joins with a space, or of a card
+with a clipped code-tool call, and a card whose calls did not reach the trajectory is read from its
+rows alone); or with `required_runs` a script by its basename and the flags that must
 follow it on the same shell segment, read from the command's argv as the shell splits
 it, so a quoted mention of the invocation is one word and not a run, and a run made through a script file or a shell's standard input is not read, since the argv names the file or the shell; each flag is read as the exact word, so the script named is built with `allow_abbrev=False`; `word_patterns` are regular expressions each of which some later word of the segment must match on its own, and `forbidden_runs` is the same shape for a run no worker may make, such as a `kubectl get` of the objects a script grades; with `after_result_pattern` the commands come from the workers' tagged `terminal` and `execute_code` calls in the trajectory instead, with their results as the record stores them, a JSON string with newlines escaped, and the forbidden set applies only to the calls after the first whose result matched, failed or not, one window per delegated card and the cards its worker fanned out; `forbidden_result_patterns` then grade the later results too; a trajectory with no tagged call at all, none readable (every code-tool argument withheld), a call with no numeric time, or a capture with gaps and no hit, is `status: "error"`, where a worker whose tagged calls are all MCP calls grades as zero commands), `worker_agents` (regular expressions every one of which must match the
 profile at least one delegated worker ran as, read from the tags the harness puts on the
@@ -379,7 +393,7 @@ line on a row scanned in full, so an audit relayed empty does not pass).
 completed cluster cards has a block line) or `ranking_card_filed` (the newest unarchived card keyed
 `bootstrap-inventory-prioritize` filed at or after the sweep carries the hand-off's own body and is
 not `blocked`, `triage`, `failed` or `cancelled`) or `raw_report_no_first_run_audit_checks` (the
-same parse, and no block line carries a check from the roster of one of the four audits the `oobe`
+same parse, and no block line carries a check from the roster of one of the five audits the `oobe`
 stage runs after the scan).
 
 `bootstrap_findings` reads the shell sandbox of the install under test:
@@ -422,7 +436,7 @@ open ledger, or no record before the turn) passes on the mention alone; which au
 to is the judge's to grade. `oobe_audits_started`, in its own module
 (`bench/kube_agents_bench/oobe.py`), reads the stack's state file and the Platform Agent's
 `cron/executions.db` in the agent pod, and passes when the stage's `.oobe_audits_fired` lists each
-of the four first-run audits as marked due and each has a run claimed since the stage marked it
+of the five first-run audits as marked due and each has a run claimed since the stage marked it
 that got going (running, completed, or ended after its start), each starting only after the one before it in the chain ended.
 `workload_incident_folded`, in its own module (`bench/kube_agents_bench/incidents.py`), reads a
 workload's rows of one object `kind` (default `Pod`) from the Session KV server's event ledger in the agent pod and passes when at least

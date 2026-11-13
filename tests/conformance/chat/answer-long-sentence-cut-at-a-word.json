@@ -1,0 +1,18 @@
+{
+  "name": "answer-long-sentence-cut-at-a-word",
+  "source": "agents/platform/scripts/test_slack_presenter.py::SplitAnswerTest::test_a_long_first_sentence_with_no_clause_keeps_its_tail",
+  "notes": "A first sentence past the headline cap with no clause break outside its parenthetical is cut at the last word before the bracket: the headline ends on an ellipsis, the detail opens on one, and no word is dropped.",
+  "input": {
+    "markdown": "platform is currently running the live cluster count and will post the result here when it finishes (its last completed count 14 hours ago found 209 running GKE clusters across all 42 GCP projects in scope)."
+  },
+  "expected": [
+    {
+      "carrier": "result",
+      "chat": {
+        "schema": "kube-agents.chat/v1",
+        "headline": "platform is currently running the live cluster count and will post the result here when it finishes…",
+        "detail": "…(its last completed count 14 hours ago found 209 running GKE clusters across all 42 GCP projects in scope)."
+      }
+    }
+  ]
+}

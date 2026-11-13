@@ -1,10 +1,13 @@
 """The replay lane's report: what was served, and whether replayed runs got the verdicts the nightly did.
 
 The lane (examples/inference-replay/eval-design.md, Rollout step 2) runs a
-roster of cases on main's code with the proxy in replay mode, served from what
-recent nightlies recorded (fetch_cache.py). collect_shadow.py keeps the lane's
-lines and stored text on the job's machine and calls this from its last pass.
-It writes, into `--out`:
+roster of cases with the proxy in replay mode, served from what recent
+nightlies recorded (fetch_cache.py), on the commit the newest recording night
+ran (fetch_cache.py --print-commit), or on main when no record names one.
+collect_shadow.py keeps the lane's lines and stored text on the job's machine
+and calls this from its last pass, with that commit and where it came from
+(`--commit`, `--commit-source`: hack/ci-env.sh reads REPLAY_LANE_COMMIT_SOURCE,
+which the Prow job exports). It writes, into `--out`:
 
 - `replay.json`: analyze_replay.py's report over the lane's lines: per
   conversation, what was served before the first miss, and the first-miss
@@ -21,7 +24,12 @@ It writes, into `--out`:
   `unknown_reasons`. The recording night is the one that first wrote the
   answer, which can be as old as the bucket's lifecycle; the fetch reads runs
   that far back;
-- `summary.txt`: the counts, for the job log.
+- `summary.txt`: the commit replayed and the counts. Its lines also go to the job log, where the
+  collector masks long hex runs, the commit included; the file in the bucket keeps it whole.
+
+`verdicts.json` and `summary.txt` both name the commit replayed (`commit`,
+empty when git could not say) and its source (`commit_source`: `recording`,
+`main`, or empty when the job did not say).
 
 Both JSON files hold hashes and scrubbed snippets of requests, so they go to the
 private bucket only. The summary holds case names and counts.
@@ -36,6 +44,7 @@ import sys
 from typing import Any, Dict, List, Optional, Sequence
 
 import analyze_replay
+import collect_shadow as CS
 import publish_cache as P
 import run_attribution as RA
 
@@ -49,6 +58,15 @@ UNKNOWN = analyze_replay.VERDICT_UNKNOWN
 RUN_UNATTRIBUTED = "run_unattributed"
 RECORDING_BUILD_UNRECORDED = "recording_build_unrecorded"
 NO_VERDICT = "no_verdict"
+# The report's commit fields, and how the summary reads each source.
+REPORT_COMMIT = "commit"
+REPORT_COMMIT_SOURCE = "commit_source"
+UNKNOWN_COMMIT = "an unknown commit"
+COMMIT_SOURCE_TEXT = {
+    CS.COMMIT_SOURCE_RECORDING: "the commit the newest recording night ran",
+    CS.COMMIT_SOURCE_MAIN: "main, as a fallback: no recording named a commit, or it could not be fetched",
+    "": "where it came from was not stated",
+}
 PERCENT = 100.0
 PERCENT_DECIMALS = 1
 TEXT_ENCODING = "utf-8"
@@ -170,8 +188,15 @@ def verdicts(keep_dir: str, verdicts_dir: str, nightly_runs: Dict[str, List[Dict
     }
 
 
+def commit_line(report: Dict[str, Any]) -> str:
+    source = str(report.get(REPORT_COMMIT_SOURCE) or "")
+    return (f"replayed on {report.get(REPORT_COMMIT) or UNKNOWN_COMMIT}:"
+            f" {COMMIT_SOURCE_TEXT.get(source, COMMIT_SOURCE_TEXT[''])}")
+
+
 def summary_text(replay: Dict[str, Any], report: Dict[str, Any]) -> str:
     out = [
+        commit_line(report),
         f"replay lane: {replay['requests']} requests in {replay['conversations']} conversations;"
         f" served {replay['served_token_percent']}% of prompt tokens"
         f" ({replay['served_before_first_miss_token_percent']}% before each conversation's first miss,"
@@ -189,12 +214,15 @@ def summary_text(replay: Dict[str, Any], report: Dict[str, Any]) -> str:
     return "\n".join(out) + "\n"
 
 
-def write_report(keep_dir: str, verdicts_dir: str, nightly_runs_path: str, out_dir: str) -> str:
+def write_report(keep_dir: str, verdicts_dir: str, nightly_runs_path: str, out_dir: str,
+                 commit: str = "", commit_source: str = "") -> str:
     nightly_runs = RA.read_json(nightly_runs_path) if nightly_runs_path else None
     if not isinstance(nightly_runs, dict):
         nightly_runs = {}
     replay = analyze_replay.summarize(analyze_replay.load(lane_segments(keep_dir)))
     report = verdicts(keep_dir, verdicts_dir, nightly_runs)
+    report[REPORT_COMMIT] = commit
+    report[REPORT_COMMIT_SOURCE] = commit_source
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, REPLAY_REPORT), "w", encoding=TEXT_ENCODING) as handle:
         json.dump(replay, handle, indent=2, sort_keys=True)
@@ -212,8 +240,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--verdicts-dir", required=True, help="where bench-gate wrote case-<name>.json")
     parser.add_argument("--nightly-runs", default="", help="fetch_cache.py's runs per recording build")
     parser.add_argument("--out", required=True)
+    parser.add_argument("--commit", default="", type=CS._shaped(CS.COMMIT_SHAPE, "commit id"),
+                        help="the commit the lane replayed on")
+    parser.add_argument("--commit-source", default="", choices=CS.COMMIT_SOURCES,
+                        help="whether that commit is the recording night's or main")
     args = parser.parse_args(argv)
-    sys.stdout.write(write_report(args.keep_dir, args.verdicts_dir, args.nightly_runs, args.out))
+    sys.stdout.write(write_report(args.keep_dir, args.verdicts_dir, args.nightly_runs, args.out,
+                                  commit=args.commit, commit_source=args.commit_source))
     return 0
 
 

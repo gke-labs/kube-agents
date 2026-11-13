@@ -1,0 +1,35 @@
+{{- /*
+The two tiers an install with the platform agent starts with (#3659; docs/designs/spec-profiles-dispatch.md,
+"Tiers and identity"): read, which people's tasks run at, and unattended, a
+trigger's. The chart owns these two, so an edit to either is reverted on the next
+upgrade; an install's own tiers go under other names.
+
+Nothing reads a Tier yet: the capability verifier and the gateway use their built-in
+read and unattended tiers, and writeMode isn't enforced. Rendered only when the API
+server serves the Tier kind, so a helm upgrade that hasn't applied crds/ skips them
+rather than failing on an unknown kind (upgrade.sh applies crds/ first).
+*/}}
+{{- if and .Values.platformAgent.enabled (.Capabilities.APIVersions.Has "kubeagents.x-k8s.io/v1alpha1/Tier") }}
+---
+apiVersion: kubeagents.x-k8s.io/v1alpha1
+kind: Tier
+metadata:
+  name: read
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  mode: interactive
+  writeMode: propose
+---
+apiVersion: kubeagents.x-k8s.io/v1alpha1
+kind: Tier
+metadata:
+  name: unattended
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  mode: unattended
+  writeMode: propose
+{{- end }}

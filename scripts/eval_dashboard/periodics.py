@@ -381,7 +381,7 @@ WATCHED = (
     Periodic(
         REPLAY_LANE_JOB, "inference replay lane", REPLAY_LANE_STALE_AFTER, None,
         "Inference replay lane", "the replay lane is not measuring replay", "the replay lane is measuring replay again",
-        "runs daily at 06:00 UTC and replays the next-mode nightlies' recorded model answers on main, reporting the served share and verdict agreement under replay-shadow/replay-lane/",
+        "runs daily at 06:00 UTC and replays the next-mode nightlies' recorded model answers on the commit the newest night ran, reporting the served share and verdict agreement under replay-shadow/replay-lane/",
         "the served share and verdict agreement go unmeasured until the lane runs green again.",
         f"{RUNBOOK_ROOT}docs/ci-pool-projects.md#511-the-replay-lane",
         logs_root=EVAL_NIGHTLY_LOGS_ROOT,

@@ -40,7 +40,11 @@ const (
 	litellmNetworkPolicyName = "litellm-policy"
 	litellmDeploymentName    = "litellm"
 	litellmAppName           = "litellm"
-	podLabelApp              = "app"
+	// litellmContainerName is the LiteLLM container in the chart's pod, the
+	// one the usage poller reads and the CI log collector tails; the
+	// replay-shadow proxy under the same app label never uses it.
+	litellmContainerName = "litellm-container"
+	podLabelApp          = "app"
 
 	litellmPort  int32 = 8080
 	dnsPort            = 53

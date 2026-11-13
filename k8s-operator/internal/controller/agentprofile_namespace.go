@@ -358,9 +358,19 @@ func (r *PlatformAgentReconciler) reconcileProfileFence(ctx context.Context, age
 		if err == nil {
 			logf.FromContext(ctx).V(1).Info("profile namespace absent; the chart creates it, and profile work renders nothing until it exists",
 				"namespace", profileNamespaceName(agent))
+			// Nothing is written there while it is absent (a flip to today
+			// removes it with its RoleBinding), so its denials must not stand
+			// against this agent; Observe adds it back the pass it returns.
+			r.RBAC.Forget(profileNamespaceName(agent))
 		}
 		return false, err
 	}
+	// The namespace exists, so the operator's writes there are about to
+	// start: the RBAC self-check probes the namespaced Role's verbs in it
+	// from now on (once inline, then on the ticker), and reportRBACSkew
+	// reads the denials as this agent's. handleDeletion forgets it, and so
+	// does the branch above once the namespace is gone.
+	r.RBAC.Observe(profileNamespaceName(agent))
 	if err := r.applyManaged(ctx, agent, buildProfileNetworkPolicy(agent, dnsClusterIPs)); err != nil {
 		return false, fmt.Errorf("failed to apply the profile NetworkPolicy: %w", err)
 	}

@@ -208,6 +208,28 @@ readonly A2A_DIAG_LOG_MAX_BYTES=$((4 * 1024 * 1024))
 # into hundreds of files. The operator renders under a dozen pods and the
 # gateway caps sessions at A2A_MAX_SESSIONS, so a healthy install is well under.
 readonly A2A_DIAG_MAX_PODS=40
+# Each bus server's own view, read from its monitoring port inside its pod:
+# /jsz carries the JetStream meta cluster, and on its leader every peer with
+# current and offline, the state a stream placement counts (a create refused
+# "no suitable peers for placement" on three servers that all serve is
+# otherwise undiagnosable from logs: #5644's today smoke run); /routez the
+# routes the server holds; /varz its version and build. The image each
+# server's containers ran goes to a2a-nats-images.txt, so servers on
+# different builds of a floating tag show. Each read is bounded by
+# `timeout`, not by --request-timeout: that governs plain API calls and not an
+# exec's stream, so a wedged node tunnel would otherwise hold the exit trap
+# (the credential-proxy scrape above has the same bound for the same reason).
+# 3 servers x 3 reads x the bound caps the whole at 90s.
+readonly A2A_DIAG_NATS_COMPONENT="nats"
+readonly A2A_DIAG_NATS_CONTAINER="nats"
+readonly A2A_DIAG_NATS_MONITOR_URL="http://127.0.0.1:8222"
+readonly A2A_DIAG_NATS_MONITOR_PATHS="jsz routez varz"
+readonly A2A_DIAG_NATS_READ_MAX_BYTES=$((1024 * 1024))
+readonly A2A_DIAG_NATS_EXEC_BOUND_SECONDS=10
+# wget's own read timeout, inside the exec's bound, so a monitor that accepts
+# and then stalls ends the read before the bound kills the exec.
+readonly A2A_DIAG_NATS_WGET_TIMEOUT_SECONDS=5
+readonly A2A_DIAG_NATS_IMAGES_JSONPATH='{range .items[*]}{.metadata.name}{"\t"}{range .status.containerStatuses[*]}{.name}={.imageID}{" "}{end}{"\n"}{end}'
 
 # ─── Inference-replay shadow mode ────────────────────────────────────────────
 # On by default (EVAL_REPLAY_SHADOW=false turns it off), this puts the shadow-mode replay proxy
@@ -294,6 +316,16 @@ readonly REPLAY_MODE_STOP_WAIT_SECONDS=255
 # beside its logs (charts/kube-agents/templates/litellm.yaml).
 readonly REPLAY_LANE_CACHE_MAX_AGE_HOURS=30
 readonly REPLAY_LANE_CACHE_MAX_BYTES=$((512 * 1024 * 1024))
+# A recording names the commit its checkout was at, and the lane's report the
+# commit it replayed: a full SHA-1, publish_cache.COMMIT_PATTERN. Anything else
+# goes to the collector as empty, which it takes, rather than as a value it
+# would refuse and so collect nothing.
+readonly REPLAY_COMMIT_RE='^[0-9a-f]{40}$'
+# What the lane's Prow job exports as REPLAY_LANE_COMMIT_SOURCE: it checked out
+# the commit the newest recording night ran (fetch_cache.py --print-commit), or
+# stayed on main because no record named one or the fetch failed.
+readonly REPLAY_LANE_COMMIT_SOURCE_RECORDING="recording"
+readonly REPLAY_LANE_COMMIT_SOURCE_MAIN="main"
 # The variable the chart stamps the mode into, read back the same way: the
 # deploy decides the mode once, and the eval's collector runs in that mode.
 readonly REPLAY_SHADOW_PROXY_MODE_VAR="REPLAY_MODE"
@@ -320,6 +352,8 @@ readonly REPLAY_SHADOW_COLLECTOR_POLL_SECONDS=1
 readonly REPLAY_SHADOW_COLLECTOR_LOG="replay-shadow-collector.log"
 REPLAY_SHADOW_COLLECTOR_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/replay-proxy/collect_shadow.py"
 REPLAY_CACHE_FETCH_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/replay-proxy/fetch_cache.py"
+# A directory in this checkout, for the commit it is at (_replay_checkout_commit).
+REPLAY_CHECKOUT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 ensure_helm() {
   if command -v helm >/dev/null 2>&1; then
@@ -896,11 +930,44 @@ replay_shadow_helm_args() {
 # resolution decide; the proxy then bounds its own cache (REPLAY_DATA_MAX_BYTES).
 # Record and replay keep what they copy in a private directory on this machine
 # (REPLAY_KEEP_DIR), never the artifacts.
+#
+# A recording collector passes the checkout's commit (--commit), which every
+# publish record names; the lane's passes the commit it replays on and
+# REPLAY_LANE_COMMIT_SOURCE (--lane-commit, --lane-commit-source), which its
+# report names.
 REPLAY_SHADOW_COLLECTOR_PID=""
 REPLAY_SHADOW_COLLECTOR_WAIT_SECONDS=""
 REPLAY_KEEP_DIR=""
 REPLAY_LANE_SEED_DIR=""
 REPLAY_LANE_NIGHTLY_RUNS=""
+# The commit this checkout is at, or nothing when git can't say or prints
+# something other than a full SHA-1 (REPLAY_COMMIT_RE).
+_replay_checkout_commit() {
+  local commit=""
+  if [ -n "${REPLAY_CHECKOUT_DIR:-}" ] && command -v git >/dev/null 2>&1; then
+    commit="$(git -C "${REPLAY_CHECKOUT_DIR}" rev-parse --verify --quiet HEAD 2>/dev/null)" || commit=""
+  fi
+  if [ -n "${commit}" ] && ! [[ "${commit}" =~ ${REPLAY_COMMIT_RE} ]]; then
+    echo "WARNING: git names this checkout's commit '${commit}', not a full SHA-1; the collector is told none." >&2
+    commit=""
+  fi
+  echo "${commit}"
+}
+
+# The lane's REPLAY_LANE_COMMIT_SOURCE, or nothing when it is unset or neither
+# REPLAY_LANE_COMMIT_SOURCE_RECORDING nor REPLAY_LANE_COMMIT_SOURCE_MAIN.
+_replay_lane_commit_source() {
+  case "${REPLAY_LANE_COMMIT_SOURCE:-}" in
+  "${REPLAY_LANE_COMMIT_SOURCE_RECORDING}" | "${REPLAY_LANE_COMMIT_SOURCE_MAIN}")
+    echo "${REPLAY_LANE_COMMIT_SOURCE}"
+    ;;
+  "") ;;
+  *)
+    echo "WARNING: REPLAY_LANE_COMMIT_SOURCE='${REPLAY_LANE_COMMIT_SOURCE}' is neither ${REPLAY_LANE_COMMIT_SOURCE_RECORDING} nor ${REPLAY_LANE_COMMIT_SOURCE_MAIN}; the lane's report leaves it unstated." >&2
+    ;;
+  esac
+}
+
 start_replay_shadow_collector() {
   [ -z "${REPLAY_SHADOW_COLLECTOR_PID}" ] || return 0
   if ! resolve_replay_shadow; then
@@ -997,12 +1064,14 @@ start_replay_shadow_collector() {
     args+=(--mode "${mode}" --keep-dir "${REPLAY_KEEP_DIR}" --cache-subdir "${REPLAY_CACHE_SUBDIR}"
       --publish-bucket "${REPLAY_CACHE_BUCKET}" --verdicts-dir "${artifact_dir}"
       --publish-interval "${REPLAY_RECORD_PUBLISH_INTERVAL_SECONDS}"
-      --job-name "${JOB_NAME:-}" --eval-mode-next "${EVAL_MODE_NEXT:-}" --forge "${EVAL_FORGE:-}")
+      --job-name "${JOB_NAME:-}" --eval-mode-next "${EVAL_MODE_NEXT:-}" --forge "${EVAL_FORGE:-}"
+      --commit "$(_replay_checkout_commit)")
     ;;
   "${REPLAY_MODE_REPLAY}")
     args+=(--mode "${mode}" --keep-dir "${REPLAY_KEEP_DIR}" --cache-subdir "${REPLAY_CACHE_SUBDIR}"
       --seed-dir "${REPLAY_LANE_SEED_DIR:-}" --verdicts-dir "${artifact_dir}"
-      --nightly-runs "${REPLAY_LANE_NIGHTLY_RUNS:-}")
+      --nightly-runs "${REPLAY_LANE_NIGHTLY_RUNS:-}"
+      --lane-commit "$(_replay_checkout_commit)" --lane-commit-source "$(_replay_lane_commit_source)")
     ;;
   esac
   if [ "${mode}" != "${REPLAY_MODE_SHADOW}" ]; then
@@ -1273,7 +1342,7 @@ collect_a2a_component_logs() {
       -o jsonpath="${A2A_DIAG_PODS_JSONPATH}" 2>&1 || true
   } > "${listing}" || true
 
-  local line rest pod component restarts base read_pods=0
+  local line rest pod component restarts base read_pods=0 read_nats=
   while IFS= read -r line; do
     # Only pod lines: an error kubectl wrote into the listing has no tab.
     [[ "${line}" == *$'\t'* ]] || continue
@@ -1303,7 +1372,34 @@ collect_a2a_component_logs() {
           | last_bytes "${A2A_DIAG_LOG_MAX_BYTES}" "${artifact_dir}/${prefix}${base}-previous.log" || true
         ;;
     esac
+    if [ "${component}" = "${A2A_DIAG_NATS_COMPONENT}" ]; then
+      collect_a2a_nats_monitor "${artifact_dir}" "${prefix}" "${ns}" "${pod}" "${base}" "${kctl[@]}"
+      read_nats=1
+    fi
   done < <(cat "${listing}" 2>/dev/null || true)
+  if [ -n "${read_nats:-}" ]; then
+    "${kctl[@]}" get pods -n "${ns}" -l "${A2A_DIAG_COMPONENT_LABEL}=${A2A_DIAG_NATS_COMPONENT}" \
+      -o jsonpath="${A2A_DIAG_NATS_IMAGES_JSONPATH}" > "${artifact_dir}/${prefix}a2a-nats-images.txt" 2>&1 || true
+  fi
+  return 0
+}
+
+# collect_a2a_nats_monitor reads one bus server's monitoring endpoints
+# (A2A_DIAG_NATS_MONITOR_PATHS) from inside its pod, one file each:
+# <base>-<path>.json. Same contract as its caller: every command ends in
+# `|| true`, so a server that doesn't answer leaves the error in its file.
+collect_a2a_nats_monitor() {
+  local artifact_dir="$1" prefix="$2" ns="$3" pod="$4" base="$5"
+  shift 5
+  local kctl=("$@")
+  local path
+  local bound=(timeout --foreground "${A2A_DIAG_NATS_EXEC_BOUND_SECONDS}")
+  command -v timeout >/dev/null 2>&1 || bound=()
+  for path in ${A2A_DIAG_NATS_MONITOR_PATHS}; do
+    ${bound[@]+"${bound[@]}"} "${kctl[@]}" exec "pod/${pod}" -n "${ns}" -c "${A2A_DIAG_NATS_CONTAINER}" -- \
+      wget -qO- -T "${A2A_DIAG_NATS_WGET_TIMEOUT_SECONDS}" "${A2A_DIAG_NATS_MONITOR_URL}/${path}" 2>&1 \
+      | last_bytes "${A2A_DIAG_NATS_READ_MAX_BYTES}" "${artifact_dir}/${prefix}${base}-${path}.json" || true
+  done
   return 0
 }
 

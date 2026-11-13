@@ -93,6 +93,11 @@ func (d *profileDirectory) sortedCards() []lib.AgentCard {
 // the list's.
 func (g *Gateway) delegateTargets(r TaskRequester, authors []TaskRequester, authorsUnknown bool, profiles profileLister) lib.DelegateTargets {
 	out := lib.DelegateTargets{Targets: []lib.DelegateTarget{}}
+	// The width rides the part only when it offers a batch, so at one the
+	// part is the shape a session pod built before batches reads.
+	if g.cfg != nil && g.cfg.DelegationWidthMax > 1 {
+		out.WidthMax = g.cfg.DelegationWidthMax
+	}
 	if authorsUnknown {
 		return out
 	}

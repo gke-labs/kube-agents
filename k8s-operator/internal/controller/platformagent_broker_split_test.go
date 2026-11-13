@@ -150,6 +150,14 @@ func TestTheBrokerIsNotInTheAgentPod(t *testing.T) {
 	if value, _ := brokerEnvValue(agentContainer.Env, "CREDENTIAL_PROXY_TOKEN_FILE"); value != credentialProxyTokenMountPath+"/token" {
 		t.Errorf("expected the agent to present a projected token, got %q", value)
 	}
+	// The kube-api proxy URL, under the name gke_endpoint reads here and the same
+	// value the shell sandbox gets as KUBE_PROXY_URL; not KUBE_PROXY_URL itself.
+	if value, _ := brokerEnvValue(agentContainer.Env, kubeProxyInUseURLEnv); value != kubeProxyURL(agent) {
+		t.Errorf("expected %s = %q, got %q", kubeProxyInUseURLEnv, kubeProxyURL(agent), value)
+	}
+	if _, found := brokerEnvValue(agentContainer.Env, "KUBE_PROXY_URL"); found {
+		t.Errorf("the agent container must not carry KUBE_PROXY_URL")
+	}
 	// The remote MCP servers reach Google through the broker, on every install
 	// and in both modes: the address is set unconditionally, unlike the relay
 	// URLs above, which follow the chat backends.

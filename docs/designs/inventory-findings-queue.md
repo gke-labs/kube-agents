@@ -981,7 +981,9 @@ which is most of them. It adds nothing until the first inventory report's delive
 absent, since a claim there can be released), so that report stays the first thing the user hears; an install that never ran onboarding is not held. The hold
 ends 24 hours (`FIRST_REPORT_HOLD_HOURS`) after the sweep was filed, by the marker's `filed_at` line
 or, failing that, its mtime: a report still undelivered by then means onboarding stalled, and
-holding on would add nothing ever again. Each run that is held, or would be but for that limit, says
+holding on would add nothing ever again. It is also when the delivery stage files a report nobody has
+aligned to as a ledger issue, and a week after the sweep it retires one it could not file (`oobe.md`
+§3). Each run that is held, or would be but for that limit, says
 which on stderr. And a run that fails before it posts, a failed queue read included, exits non-zero,
 which the scheduler posts, at most once a UTC day; later failures that day go to stderr. The day's
 state (the daily part sent, the items added today and the ids of the findings they named, the

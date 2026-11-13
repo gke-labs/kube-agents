@@ -838,7 +838,7 @@ class CallSiteTest(unittest.TestCase):
         self.assertNotIn("mint_data = None", mint)
         body_line = lifted_line(r"^LEDGER_GRADING_MINT_BODY=.*$")
         body = json.loads(body_line.split("=", 1)[1].strip().strip("'"))
-        self.assertEqual(body, {"permissions": {"issues": "read", "pull_requests": "read", "metadata": "read"}})
+        self.assertEqual(body, {"permissions": {"issues": "read", "pull_requests": "read", "contents": "read", "metadata": "read"}})
         self.assertNotIn("repositories", body)
         self.assertIn('LEDGER_MINT_BODY="${LEDGER_GRADING_MINT_BODY}" _ledger_token_mint', lifted("mint_ledger_token"))
         self.assertNotIn("write", body_line)

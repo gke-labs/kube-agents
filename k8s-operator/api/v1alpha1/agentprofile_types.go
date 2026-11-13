@@ -90,6 +90,15 @@ type AgentProfileSpec struct {
 	// +optional
 	ClusterRef *AgentProfileClusterRef `json:"clusterRef,omitempty"`
 
+	// YieldToPinned hands a task addressed to this profile to the profile
+	// pinned to the task's target cluster (clusterRef), when there is one.
+	// Set it on the generic cluster agent, whose pinned profiles are its
+	// per-cluster variants. Leave it unset on a specialist: a task addressed
+	// to one by name keeps its own persona on a pinned cluster. It has no
+	// effect on a pinned profile, or on one that takes no target.
+	// +optional
+	YieldToPinned bool `json:"yieldToPinned,omitempty"`
+
 	// Lifecycle bounds one task's wall clock and how long the finished Job
 	// lingers.
 	// +required

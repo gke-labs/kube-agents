@@ -41,7 +41,9 @@ class LaneReportTest(unittest.TestCase):
             handle.write("\n".join(json.dumps(e) for e in self.world.lines) + "\n")
         with open(self.nightly, "w") as handle:
             json.dump(nightly_runs, handle)
-        summary = lane_report.write_report(self.keep, self.world.verdicts, self.nightly, self.out)
+        named = getattr(self, "report_commit", None)
+        commit = {"commit": named[0], "commit_source": named[1]} if named else {}
+        summary = lane_report.write_report(self.keep, self.world.verdicts, self.nightly, self.out, **commit)
         with open(os.path.join(self.out, "verdicts.json")) as handle:
             return json.load(handle), summary
 
@@ -61,6 +63,23 @@ class LaneReportTest(unittest.TestCase):
         self.assertIn("case-a: lane 1/2", summary)
         for name in ("replay.json", "verdicts.json", "summary.txt"):
             self.assertTrue(os.path.isfile(os.path.join(self.out, name)))
+
+    def test_the_report_names_the_commit_replayed_and_where_it_came_from(self):
+        self.world.run("case-a", 1, "pass", ["t_00000001"])
+        self.conversation("t_00000001", (True, True))
+        commit = "ab" * 20
+        for source, text in (("recording", f"replayed on {commit}: the commit the newest recording night ran"),
+                             ("main", f"replayed on {commit}: main, as a fallback"),
+                             ("", f"replayed on {commit}: where it came from was not stated")):
+            with self.subTest(source=source):
+                self.report_commit = (commit, source)
+                report, summary = self.report({NIGHT: [{"case": "case-a", "rep": 1, "outcome": "pass"}]})
+                self.assertEqual((report["commit"], report["commit_source"]), (commit, source))
+                self.assertTrue(summary.startswith(text), summary)
+        self.report_commit = ("", "")
+        report, summary = self.report({})
+        self.assertEqual((report["commit"], report["commit_source"]), ("", ""))
+        self.assertTrue(summary.startswith("replayed on an unknown commit"), summary)
 
     def test_a_served_run_with_no_verdict_is_unknown_not_a_mismatch(self):
         for outcome in ("infra", "blocked", "not_applicable"):

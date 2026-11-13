@@ -27,7 +27,7 @@ import (
 // Secret, the StatefulSet on hash "h1", and its pod.
 func a2aReloadFixture(t *testing.T, liveConf string, annotations map[string]string) (*PlatformAgentReconciler, *agentv1alpha1.PlatformAgent, *appsv1.StatefulSet, *record.FakeRecorder) {
 	t.Helper()
-	agent := a2aTestAgent()
+	agent := a2aSingleServerTestAgent()
 	sts := buildA2ANATSStatefulSet(agent, "h1")
 	sts.UID = "sts-uid"
 	secret := &corev1.Secret{

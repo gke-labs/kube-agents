@@ -88,13 +88,21 @@ RECORD_DECISIONS = "decisions"
 RECORD_LOST_LINES = "lost_lines"
 RECORD_OBJECTS = "objects"
 # The recording job: its Prow job name, the install mode it graded (next or
-# today) and its forge (github when EVAL_FORGE is unset). The lane fetches
-# objects only from records whose mode and forge match its own run's, so a
-# GitLab or today-mode night's answers, which it can't hit, never take its room.
+# today), its forge (github when EVAL_FORGE is unset) and the commit its
+# checkout was at (empty when git could not say; records written before it
+# have none). The lane fetches objects only from records whose mode and forge
+# match its own run's, so a GitLab or today-mode night's answers, which it
+# can't hit, never take its room, and replays on the newest night's commit
+# (fetch_cache.py --print-commit).
 RECORD_JOB = "job"
 JOB_NAME = "name"
 JOB_MODE = "mode"
 JOB_FORGE = "forge"
+JOB_COMMIT = "commit"
+# A full SHA-1 commit id, as `git rev-parse HEAD` prints it (hack/ci-env.sh's
+# REPLAY_COMMIT_RE, which tests/test_ci_replay_shadow.py holds equal to this).
+COMMIT_PATTERN = r"[0-9a-f]{40}"
+COMMIT_RE = re.compile(rf"^{COMMIT_PATTERN}\Z")
 MODE_NEXT = "next"
 MODE_TODAY = "today"
 DEFAULT_FORGE = "github"
@@ -400,10 +408,10 @@ class Publisher:
         return report
 
 
-def job_identity(name: str, mode_next: str, forge: str) -> Dict[str, str]:
-    """The record's job block from the eval's own settings (EVAL_MODE_NEXT, EVAL_FORGE)."""
+def job_identity(name: str, mode_next: str, forge: str, commit: str = "") -> Dict[str, str]:
+    """The record's job block from the eval's own settings (EVAL_MODE_NEXT, EVAL_FORGE) and its checkout's commit."""
     return {JOB_NAME: name, JOB_MODE: MODE_NEXT if mode_next == "1" else MODE_TODAY,
-            JOB_FORGE: forge or DEFAULT_FORGE}
+            JOB_FORGE: forge or DEFAULT_FORGE, JOB_COMMIT: commit}
 
 
 def _size(path: str) -> int:
