@@ -407,7 +407,7 @@ func TestTheIngressLineRecordsChangeRequested(t *testing.T) {
 			}
 			r := startRigWithLogger(t, func(c *Config) { c.ScopeFile = scope; c.Namespace = "kubeagents-system" },
 				slog.New(slog.NewTextHandler(logs, nil)))
-			r.g.profiles.put("cluster", &lib.AgentCard{Name: "cluster", Parameters: clusterParams})
+			r.g.profiles.put("cluster", &lib.AgentCard{Name: "cluster", Parameters: clusterParams, YieldToPinned: true})
 			r.g.profiles.put("prod-east", &lib.AgentCard{Name: "prod-east", Parameters: clusterParams,
 				ClusterRef: &lib.ClusterRef{ProjectID: "p1", Location: "us-east1", Cluster: "prod"}})
 			r.adapter.inbox <- tc.turn
