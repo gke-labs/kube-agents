@@ -21,6 +21,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
+	"net/url"
 	"reflect"
 	"slices"
 	"strconv"
@@ -40,6 +42,11 @@ const (
 	// scrapeTestStallTimeout is the client timeout the stalled-body case
 	// shortens the scrape to, so the test does not wait the real one.
 	scrapeTestStallTimeout = 300 * time.Millisecond
+	// scrapeTestIdleCloseWait bounds how long the closed-idle case holds the
+	// request back waiting for the transport to close the connection on its
+	// own; the peer closes on accept, so the wait is a scheduler's, and the
+	// bound only keeps a transport that never closes from hanging the test.
+	scrapeTestIdleCloseWait = 5 * time.Second
 )
 
 var scrapeTestReasons = []string{"BackOff", "Failed", "Unhealthy", "FailedScheduling", "OOMKilling"}
@@ -93,6 +100,40 @@ func serveBody(t *testing.T, status int, body string) string {
 	}))
 	t.Cleanup(srv.Close)
 	return strings.TrimPrefix(srv.URL, "http://")
+}
+
+// acceptThenClose returns the address of a listener that accepts one
+// connection and closes it without writing a byte.
+func acceptThenClose(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		conn.Close()
+	}()
+	return ln.Addr().String()
+}
+
+// closeSignallingConn is a net.Conn whose Close also sends on closed, so a
+// test can tell when the transport closed the connection itself.
+type closeSignallingConn struct {
+	net.Conn
+	closed chan struct{}
+}
+
+func (c *closeSignallingConn) Close() error {
+	select {
+	case c.closed <- struct{}{}:
+	default:
+	}
+	return c.Conn.Close()
 }
 
 func scrapeKind(t *testing.T, err error) string {
@@ -763,24 +804,52 @@ func TestPodUsageSource_FailedScrapes(t *testing.T) {
 		// pipe, or a clean EOF, never a status line. Nothing answered, so the
 		// kind is connect (the NetworkPolicy/listener guidance), not the
 		// malformed-response kind that says the listener answered.
-		ln, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer ln.Close()
-		go func() {
-			conn, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			conn.Close()
-		}()
-		_, err = newPodUsageSource().Scrape(context.Background(), ln.Addr().String(), usageMetricsPath, []string{usageCounterEventsIngested}, nil)
+		_, err := newPodUsageSource().Scrape(context.Background(), acceptThenClose(t), usageMetricsPath, []string{usageCounterEventsIngested}, nil)
 		if err == nil {
 			t.Fatal("a peer that answered nothing scraped successfully")
 		}
 		if got := scrapeKind(t, err); got != usageScrapeKindConnect {
 			t.Errorf("kind = %q, want %q: the peer accepted and closed without answering", got, usageScrapeKindConnect)
+		}
+	})
+	t.Run("a peer that accepts then closes before the request is registered", func(t *testing.T) {
+		// The same close, reported the transport's other way. The transport
+		// starts its read loop as soon as the connection is dialled, and
+		// fires the request trace's GotConn in the caller before it registers
+		// the request with that loop; a close the loop sees with no request
+		// registered makes it close the connection itself with the closed-idle
+		// sentinel, neither an EOF nor a net error. The case above reaches
+		// that shape about once in 150 scrapes; holding GotConn until the
+		// transport has closed the dialled connection reaches it every time,
+		// so a classifier that handles only the common shape -- or a Go
+		// release that rewords the sentinel -- fails here rather than once in
+		// a hundred runs. Still nothing answered, still connect.
+		source := newPodUsageSource()
+		transport := source.client.Transport.(*http.Transport)
+		dial := transport.DialContext
+		closed := make(chan struct{}, 1)
+		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, err := dial(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			return &closeSignallingConn{Conn: conn, closed: closed}, nil
+		}
+		ctx := httptrace.WithClientTrace(context.Background(), &httptrace.ClientTrace{
+			GotConn: func(httptrace.GotConnInfo) {
+				select {
+				case <-closed:
+				case <-time.After(scrapeTestIdleCloseWait):
+					t.Error("the transport did not close the connection the peer dropped")
+				}
+			},
+		})
+		_, err := source.Scrape(ctx, acceptThenClose(t), usageMetricsPath, []string{usageCounterEventsIngested}, nil)
+		if err == nil {
+			t.Fatal("a peer that answered nothing scraped successfully")
+		}
+		if got := scrapeKind(t, err); got != usageScrapeKindConnect {
+			t.Errorf("kind = %q, want %q: the peer accepted and closed before the request was registered", got, usageScrapeKindConnect)
 		}
 	})
 	t.Run("a listener that stalls mid-body", func(t *testing.T) {
@@ -803,6 +872,39 @@ func TestPodUsageSource_FailedScrapes(t *testing.T) {
 			t.Errorf("a stalled body: %v, want kind %q", err, usageScrapeKindBodyTimeout)
 		}
 	})
+}
+
+// The accept-then-close case above reaches the classifier two ways, by a race
+// inside the transport: as an EOF wrapped in a net error, or -- when the close
+// reaches the transport's read loop before the request is registered with it
+// -- as the plain closed-idle sentinel. The second is matched on the innermost
+// cause's text, by equality: a wrapper's text that quotes the sentinel around
+// bytes a peer chose is a malformed response, not a connection the peer never
+// answered on.
+func TestUsageConnectKind_TheClosedIdleSentinelIsConnect(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		kind string
+	}{
+		{
+			"the transport's closed-idle sentinel, as client.Do wraps it",
+			&url.Error{Op: "Get", URL: "http://10.0.0.1:9090" + usageMetricsPath, Err: errors.New(usageClosedIdleErrorText)},
+			usageScrapeKindConnect,
+		},
+		{
+			"a malformed status line whose quoted bytes are the sentinel's text",
+			&url.Error{Op: "Get", URL: "http://10.0.0.1:9090" + usageMetricsPath, Err: fmt.Errorf("malformed HTTP response %q", usageClosedIdleErrorText)},
+			usageScrapeKindMalformed,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := usageConnectKind(tc.err); got != tc.kind {
+				t.Errorf("usageConnectKind(%v) = %q, want %q", tc.err, got, tc.kind)
+			}
+		})
+	}
 }
 
 // A line past the bound in a family the poller does not read is skipped, not a

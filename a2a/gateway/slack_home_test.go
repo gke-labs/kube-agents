@@ -498,7 +498,7 @@ func TestPRRepo(t *testing.T) {
 
 func TestRequestBoardOverTheBus(t *testing.T) {
 	s := startServer(t)
-	nc, err := nats.Connect(s.ClientURL())
+	nc, err := connectTest(s.ClientURL())
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -934,14 +934,34 @@ _HALF_MINUTE = timedelta(seconds=30)
 # Kanban tools return cards, and a card's result is a worker's own words.
 _KANBAN_TOOL_PREFIX = "kanban_"
 # What worker_trajectory's in-pod script puts in place of a result when the
-# pod's redactor will not load (its WITHHELD), and the marker its clip ends a
-# cut result with. Both live inside that script's source, so they are
+# pod's redactor will not load (its WITHHELD), and the marker its clip puts
+# on a cut value. Both live inside that script's source, so they are
 # spelled again here; test_report_times_in_window.py pins them to it. The
 # script's other placeholder, worker_trajectory.WITHHELD_READ_RESULT for the
 # one result of a call that read a credential, is a recorded call whose
 # output is redacted: it starts with `[REDACTED_` and is never a read gap.
 _WITHHELD_RESULT = "[WITHHELD: redactor unavailable in the pod]"
-_CLIPPED_RESULT = re.compile(r" \.\.\.\[clipped \d+ chars\]$")
+# ``worker_trajectory.clip``'s marker. On an argument it ends the string. On a
+# result the kept tail follows it after ``... ``, and an older record ends on
+# it; ``_clipped_result_marker`` finds it by that shape, so the same words
+# printed inside a worker's own output are not read as the cut.
+_CLIPPED_RESULT = re.compile(r" \.\.\.\[clipped \d+ chars\]")
+_CLIPPED_ARGS = re.compile(r" \.\.\.\[clipped \d+ chars\]$")
+_CLIPPED_TAIL_LEAD = "... "
+
+
+def _clipped_result_marker(result: str) -> re.Match[str] | None:
+    """The marker the pod put on ``result``, or None when the result is whole.
+
+    The last occurrence that ends the string or opens the kept tail: the
+    marker sits after the whole head, so an occurrence the worker's own
+    output carries earlier is never the last one of that shape.
+    """
+    found = None
+    for match in _CLIPPED_RESULT.finditer(result):
+        if match.end() == len(result) or result.startswith(_CLIPPED_TAIL_LEAD, match.end()):
+            found = match
+    return found
 
 
 def _minute(instant: datetime) -> datetime:
@@ -1034,7 +1054,7 @@ def _read_minutes(trajectory: list[dict[str, Any]], dates: list[str]) -> tuple[s
             # A credential read, recorded without its output: no time in it,
             # and no gap in the capture.
             continue
-        if _CLIPPED_RESULT.search(result):
+        if _clipped_result_marker(result):
             clipped += 1
         minutes |= _output_minutes(result, dates)
     return minutes, withheld, clipped
@@ -1888,7 +1908,7 @@ class ToolCalledVerifier(BaseVerifier):
     the tool answered rather than only that it was called, such as Hermes'
     ``<persisted-output>`` notice for a result too large to return whole. A
     worker call's result is clipped in the pod, so the pattern must match near
-    the start of it. A call whose result the capture could not read (none
+    its start or near its end. A call whose result the capture could not read (none
     recorded, or withheld because the pod's redactor did not load) makes the
     check ``status="error"``, since a pattern over it would read as no match --
     but only when its arguments are withheld too, cut where the clip left them
@@ -1966,7 +1986,7 @@ class ToolCalledVerifier(BaseVerifier):
         if set(args) == {"raw"} and isinstance(args["raw"], str):
             # worker_trajectory's clip() ends a cut argument string with the
             # same marker it ends a cut result with.
-            clip = _CLIPPED_RESULT.search(args["raw"])
+            clip = _CLIPPED_ARGS.search(args["raw"])
             if clip is None:
                 args = _clipped_string_args(args["raw"], self.arguments)
             else:
@@ -3767,8 +3787,9 @@ _EVIDENCE_BLOCK_RE = re.compile(
 # before the reply is searched for the label.
 _EVIDENCE_HEADING = "**Evidence for verified claims**"
 _VERIFIED_LABEL_RE = re.compile(r"\bverified\b", re.I)
-# ``worker_trajectory.clip``'s marker on a result cut in the pod.
-_CLIPPED_RESULT_RE = re.compile(r" \.\.\.\[clipped \d+ chars\]$")
+# The head of a result cut in the pod is what sits before the marker
+# ``_clipped_result_marker`` finds; the kept tail after it is for a reader of
+# the record, not decoded here.
 # The head of a terminal result as the pod stores it: ``{"output": "``.
 _OUTPUT_HEAD_RE = re.compile(r'^\{\s*"output":\s*"')
 # The longest escape a cut can split (``\uXXXX``), trimmed one character at a
@@ -3863,16 +3884,19 @@ def _terminal_output(result: str) -> tuple[str, bool]:
     repeated-call notice), which is advice to the model and not output, so
     the leading JSON object is decoded and whatever follows it is left
     alone; that also reads a result whose clip landed inside the note. A
-    result whose JSON itself was cut no longer parses; its surviving head
-    is decoded as a JSON string, less any escape the cut split.
+    result whose JSON itself was cut is read up to the pod's marker: the
+    kept tail can close the string and the object again, so a decode that
+    succeeds with the marker inside the object is not a whole result. Its
+    surviving head is decoded as a JSON string, less any escape the cut split.
     """
+    clipped = _clipped_result_marker(result)
     try:
-        parsed, _ = json.JSONDecoder().raw_decode(result)
+        parsed, end = json.JSONDecoder().raw_decode(result)
     except ValueError:
-        parsed = None
-    if isinstance(parsed, dict) and isinstance(parsed.get("output"), str):
+        parsed, end = None, 0
+    whole = clipped is None or clipped.start() >= end
+    if whole and isinstance(parsed, dict) and isinstance(parsed.get("output"), str):
         return parsed["output"], False
-    clipped = _CLIPPED_RESULT_RE.search(result)
     if not clipped:
         return result, False
     head = _OUTPUT_HEAD_RE.sub("", result[: clipped.start()])
@@ -5524,8 +5548,8 @@ class PullRequestContentCheck(BaseModel):
     quantifier: Literal["all", "any"] = "all"
     # `admits_disruption` only: the workload the budget protects, as the case
     # planted it. Given rather than read, because the workload's manifest is a
-    # file the pull request does not add, and reading it would need
-    # `contents: read`, which the grading mint does not grant.
+    # file the pull request does not add, and this check reads only the
+    # pull request's files listing, never `/contents`.
     replicas: int | None = Field(default=None, ge=2)
     pod_labels: dict[str, str] = Field(default_factory=dict)
 
@@ -6139,9 +6163,10 @@ class PullRequestOpenedVerifier(BaseVerifier):
         Only added files are read. Any other file a glob names (modified,
         renamed, copied), or an added one GitHub left no patch for (large or
         binary), would have to come from ``/contents``, which needs
-        ``contents: read``; the grading mint (hack/ci-eval-pr.sh) does not ask
-        for it, so such a match is unevaluable rather than graded on half the
-        pull request.
+        ``contents: read``. This check makes no ``/contents`` read (the grading
+        mint carries the permission since #5519, but nothing here uses it yet),
+        so such a match is unevaluable rather than graded on half the pull
+        request.
         """
         globs = [g for check in self.content for g in check.paths]
         base = f"{forges.github_api_root()}/repos/{owner}/{repo}/pulls/{number}/files"
@@ -6177,8 +6202,9 @@ class PullRequestOpenedVerifier(BaseVerifier):
                 f"{owner}/{repo}#{number}: the content globs name {named}"
                 + (f" and {more} more" if more > 0 else "")
                 + ", which the files listing does not carry whole; `content` reads only files "
-                "the pull request adds, and reading any other needs `contents: read`, which "
-                "the grading mint does not grant, so the content checks could not be evaluated"
+                "the pull request adds, and reading any other needs a `/contents` read "
+                "(`contents: read`) this check does not make, so the content checks could "
+                "not be evaluated"
             )
         return texts, None
 
@@ -6482,7 +6508,7 @@ class PullRequestOpenedVerifier(BaseVerifier):
         file count and the commit total, and is skipped when ``_resolve``
         already fell through to it; dating the head commit needs the commits
         listing, whose last page holds it. ``/commits/{sha}`` would be one call
-        and wants ``contents: read``, which grading does not carry.
+        and wants ``contents: read``; this check makes no such call.
 
         A page GitHub has not got (404, or one the head is not on) dates
         nothing, comes back ``None``, and the caller does not reject on it: an
@@ -7355,7 +7381,8 @@ class GitHubWritesVerifier(BaseVerifier):
     except one on a branch the fleet audits' remediation sweep names
     (``platform-agent/fix-<audit-id>-...-<digest>``,
     :data:`kube_agents_bench.github_writes.SWEEP_BRANCH`): the api lane
-    keeps the sweep on and the four first-run audits keep their clock, so
+    keeps the sweep on and the five first-run audits keep their clock until
+    the install's own chain has run them, so
     such a pull request is unattributed there as in a shared window.
     Otherwise a write no repetition names is graded by none (a reply that
     does not link it from a run whose workers' calls were not read back --
@@ -7390,9 +7417,9 @@ class GitHubWritesVerifier(BaseVerifier):
     comes from ``BENCH_GITLAB_TOKEN`` and the host from ``BENCH_GITLAB_HOST``
     (gitlab.com unless set). ``owner`` pins the top-level group.
 
-    WHAT IT CANNOT SEE. The branch listing wants ``contents: read``, which the
-    grading credential does not carry; a listing GitHub refuses is a note in
-    the reason and ``raw``, and the check grades on pull requests alone.
+    WHAT IT MAY NOT SEE. The branch listing wants ``contents: read``, which the
+    eval's grading mint carries since #5519; a listing GitHub refuses is a
+    note in the reason and ``raw``, and the check grades on pull requests alone.
     Unreadable pull requests -- a 401, a denial, a repository the credential
     cannot see, an API it could not reach -- are ``status="error"``: the
     absence of an observation, never a pass.

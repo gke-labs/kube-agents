@@ -394,3 +394,106 @@ func TestValidateDelegateRefusesParametersForPlatform(t *testing.T) {
 		t.Fatalf("a plain platform delegation was refused: %s", got)
 	}
 }
+
+// A batch is checked against the width the turn advertised, and each entry
+// as a single request is; the single shape is checked as it always was,
+// whatever the width.
+func TestValidateDelegateForHoldsABatchToTheWidth(t *testing.T) {
+	entry := lib.DelegateTask{Addressee: "cluster", Text: "look", Parameters: map[string]string{"cluster": "dev"}}
+	batch := func(n int) lib.DelegateRequest {
+		r := lib.DelegateRequest{Tasks: make([]lib.DelegateTask, n)}
+		for i := range r.Tasks {
+			r.Tasks[i] = entry
+		}
+		return r
+	}
+	for name, tc := range map[string]struct {
+		req   lib.DelegateRequest
+		width int
+		want  string
+	}{
+		"single at width one":          {req: lib.DelegateRequest{Addressee: "platform", Text: "x"}, width: 1},
+		"single at width four":         {req: lib.DelegateRequest{Addressee: "platform", Text: "x"}, width: 4},
+		"a batch at the width":         {req: batch(4), width: 4},
+		"a batch of one":               {req: batch(1), width: 4},
+		"a batch over the width":       {req: batch(5), width: 4, want: "5 tasks; this conversation may hand out at most 4"},
+		"a batch with no width":        {req: batch(2), width: 1, want: "one task per call"},
+		"both shapes":                  {req: lib.DelegateRequest{Addressee: "platform", Text: "x", Tasks: []lib.DelegateTask{entry}}, width: 4, want: "not both"},
+		"an empty batch":               {req: lib.DelegateRequest{Tasks: []lib.DelegateTask{}}, width: 4, want: "empty"},
+		"an entry over the text cap":   {req: lib.DelegateRequest{Tasks: []lib.DelegateTask{entry, {Addressee: "cluster", Text: strings.Repeat("x", lib.DelegateTextCap+1)}}}, width: 4, want: "task 2: text is too long"},
+		"an entry with no addressee":   {req: lib.DelegateRequest{Tasks: []lib.DelegateTask{entry, {Text: "y"}}}, width: 4, want: "task 2: addressee is required"},
+		"platform parameters inside":   {req: lib.DelegateRequest{Tasks: []lib.DelegateTask{entry, {Addressee: "platform", Text: "y", Parameters: map[string]string{"cluster": "dev"}}}}, width: 4, want: "task 2: platform takes no parameters"},
+		"a batch over the lib ceiling": {req: batch(lib.DelegateBatchMax + 1), width: 4, want: "at most 4"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := validateDelegateFor(tc.req, tc.width)
+			if tc.want == "" {
+				if got != "" {
+					t.Fatalf("refused: %s", got)
+				}
+				return
+			}
+			if !strings.Contains(got, tc.want) {
+				t.Fatalf("refusal %q, want one containing %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// Through the adapter's run: a turn whose targets advertise width 2 refuses a
+// batch of 3 without publishing and stays open, then takes a batch of 2 as
+// one artifact and ends the turn on it.
+func TestADelegateBatchIsHeldToTheTurnsWidth(t *testing.T) {
+	url := startServer(t)
+	c := testClient(t, url)
+	const session, taskID = "chat-test-batch", "task-batch-1"
+	part, err := lib.DelegateTargetsPart(lib.DelegateTargets{Targets: []lib.DelegateTarget{{Name: "platform"}, {Name: "cluster"}}, WidthMax: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	submitWithParts(t, c, session, taskID, "check three clusters", part)
+	sock := delegateSock(t)
+	armed := filepath.Join(filepath.Dir(sock), "armed")
+	harness := stub(t, `
+trap '' TERM
+touch `+armed+`
+echo '{"type":"system","subtype":"init","session_id":"stub-1"}'
+read first || exit 1
+read -t 30 line || true
+sleep 60
+`)
+	cfg := adapterConfig(url, taskID, session, harness)
+	cfg.DelegateSocket = sock
+	cfg.TaskDeadline = 2 * time.Minute
+	cfg.KillGrace = 5 * time.Second
+	done := runAdapter(context.Background(), cfg)
+	waitPath(t, armed, "the stub never armed its TERM trap")
+
+	entry := func(cluster string) lib.DelegateTask {
+		return lib.DelegateTask{Addressee: "cluster", Text: "look at " + cluster, Parameters: map[string]string{"cluster": cluster}}
+	}
+	wide := askDelegate(t, sock, lib.DelegateRequest{Tasks: []lib.DelegateTask{entry("a"), entry("b"), entry("c")}})
+	if wide.OK || !strings.Contains(wide.Message, "at most 2") {
+		t.Fatalf("a batch over the width: %+v", wide)
+	}
+	reply := askDelegate(t, sock, lib.DelegateRequest{Tasks: []lib.DelegateTask{entry("a"), entry("b")}})
+	if !reply.OK || !strings.Contains(reply.Message, "2 tasks") {
+		t.Fatalf("a batch at the width: %+v", reply)
+	}
+	out := waitOutcome(t, done, 45*time.Second)
+	if out.err != nil || out.res.State != lib.StateCompleted {
+		t.Fatalf("run: state=%q err=%v", out.res.State, out.err)
+	}
+	task := foldTask(t, c, session, taskID)
+	del := task.Artifact(lib.ArtifactDelegate)
+	if del == nil || len(del.Parts) != 1 {
+		t.Fatalf("delegate artifact = %+v", del)
+	}
+	var got lib.DelegateRequest
+	if err := json.Unmarshal(del.Parts[0].Data, &got); err != nil || len(got.Tasks) != 2 || got.Tasks[1].Parameters["cluster"] != "b" {
+		t.Fatalf("data part = %s (%v)", del.Parts[0].Data, err)
+	}
+	if r := artifactText(task, lib.ArtifactResult); !strings.HasPrefix(r, "delegated 2 tasks") {
+		t.Fatalf("result = %q", r)
+	}
+}

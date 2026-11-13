@@ -153,7 +153,7 @@
       "name": "litellm",
       "origin": "third-party",
       "repository": "ghcr.io/berriai/litellm",
-      "tag": "v1.106.0",
+      "tag": "v1.108.6",
       "override": "LITELLM_IMAGE",
       "pulledBy": "The LiteLLM gateway, from either the chart or the kustomize integration.",
       "description": "The model gateway the agent's baked default endpoint points at."
@@ -162,7 +162,7 @@
       "name": "fluent-bit",
       "origin": "third-party",
       "repository": "docker.io/fluent/fluent-bit",
-      "tag": "5.1.2",
+      "tag": "5.1.5",
       "override": "FLUENT_BIT_IMAGE",
       "pulledBy": "The logging sidecar the operator injects into every agent pod.",
       "description": "Ships agent container logs off the pod."
@@ -207,7 +207,7 @@
       "name": "k8s",
       "origin": "third-party",
       "repository": "docker.io/alpine/k8s",
-      "tag": "1.36.5",
+      "tag": "1.36.6",
       "pulledBy": "The chart's pre-delete cleanup hook Job.",
       "description": "alpine/k8s — kubectl plus a shell, for the hook that deletes the PlatformAgent CR before Helm removes the operator. The name is the trailing path segment because the chart renders this one: kube-agents.imageRepository rewrites onto <prefix>/<trailing name>, which has to be the destination mirror_images.sh writes (<prefix>/<name>)."
     },
@@ -233,10 +233,10 @@
       "name": "hindsight-postgresql",
       "origin": "third-party",
       "repository": "docker.io/pgvector/pgvector",
-      "tag": "0.8.6-pg15@sha256:a947c45cdc5906a1bc951f20a8709e321256343ee0f251e4ae00b5e7def4e6da",
+      "tag": "0.8.7-pg15@sha256:88164492558c9773a1e17a8305abaca7863e05b3d8bbcdb792774890a2047e06",
       "override": "HINDSIGHT_POSTGRES_IMAGE",
       "pulledBy": "The chart, alongside the Hindsight API.",
-      "description": "Postgres with the pgvector extension, the store behind the Hindsight API. The pg15 line, not a newer one: the StatefulSet keeps its data on a PVC, and Postgres refuses a data directory written by another major, so moving off pg15 is a pg_upgrade rather than a tag change. Postgres 15 is supported upstream until November 2027, though Hindsight's own floor is Postgres 15 too, so this sits at the oldest major it supports and a release that raises that floor forces the pg_upgrade sooner. Upstream also rebuilds a version tag in place when the Postgres base is patched, which is what the digest half of the pin holds still."
+      "description": "Postgres with the pgvector extension, the store behind the Hindsight API. The pg15 line, not a newer one: the StatefulSet keeps its data on a PVC, and Postgres refuses a data directory written by another major, so moving off pg15 is a pg_upgrade rather than a tag change. Postgres 15 is supported upstream until November 2027, though Hindsight's own floor is Postgres 15 too, so this sits at the oldest major it supports and a release that raises that floor forces the pg_upgrade sooner. Upstream also rebuilds a version tag in place when the Postgres base is patched, which is what the digest half of the pin holds still. A pgvector version bump changes the library but not an existing database's catalog version; run `ALTER EXTENSION vector UPDATE` when an upgrade script carries more than comments."
     },
     {
       "name": "cert-manager-controller",
@@ -294,7 +294,7 @@
       "name": "envoy",
       "origin": "build-time",
       "repository": "docker.io/envoyproxy/envoy",
-      "tag": "v1.39.1",
+      "tag": "v1.39.6",
       "buildArg": "ENVOY_IMAGE",
       "pulledBy": "deploy/docker/Dockerfile (envoy-bin stage).",
       "description": "Source of the envoy binary copied into the credential-proxy image."
