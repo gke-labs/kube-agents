@@ -1056,6 +1056,13 @@ class ConversationPrimingTest(unittest.TestCase):
         warning = next(line for line in logs.output if "does not serve" in line)
         self.assertIn("A2A_NOTIFY_CONVERSATIONS=slack)", warning, "the warning names the served list")
 
+    def test_an_empty_served_list_logs_as_unset(self):
+        with mock.patch.dict("os.environ", {"A2A_NOTIFY_CONVERSATIONS": ""}), \
+                self.assertLogs(plugin.logger, level="WARNING") as logs:
+            self.assertIsNone(self._bridge_call())
+        warning = next(line for line in logs.output if "does not serve" in line)
+        self.assertIn("A2A_NOTIFY_CONVERSATIONS=<unset>)", warning)
+
     def test_chat_notify_is_loaded_once(self):
         with mock.patch.object(plugin, "_load_image_module", wraps=plugin._load_image_module) as load:
             self._bridge_call(session_id="a2a-ctx-none-1")

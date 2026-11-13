@@ -155,6 +155,8 @@ SCAN_JOB_ID = "bootstrap-inventory-scan"
 DELIVERY_JOB_ID = "bootstrap-inventory-delivery"
 # The job that runs this stage, and so the one the plugin links to the chat.
 OOBE_JOB_ID = "oobe"
+# What a reason prints for an empty served-platform list.
+UNSET_LABEL = "<unset>"
 
 # The delivered report is renamed here rather than deleted. It is the only copy
 # of a sweep that can take many minutes over a whole fleet, and a chat message
@@ -823,7 +825,7 @@ def _conversation_ready(data_dir: Path, conversation: dict) -> bool:
     elif platform not in (served := chat_notify.gateway_platforms()):
         reason = (
             f"the gateway does not serve {platform} conversations to this run "
-            f"({chat_notify.NOTIFY_CONVERSATIONS_ENV}={chat_notify.PLATFORM_LIST_SEPARATOR.join(served)!r}); the report waits"
+            f"({chat_notify.NOTIFY_CONVERSATIONS_ENV}={chat_notify.PLATFORM_LIST_SEPARATOR.join(served) or UNSET_LABEL}); the report waits"
         )
     else:
         reason = chat_notify.bus_unreachable_reason()

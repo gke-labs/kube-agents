@@ -6469,7 +6469,7 @@ def relay_cron_report(
     with neither platform, or a pod rendered before the operator routed its only
     platform without a home channel (a routed pod sends, and the gateway refuses
     and keeps the post). The error
-    names the platform and the setting that arms it, in the wording
+    names each platform without a home channel and the setting that arms it, in the wording
     `chat_delivery_watch` reads the platform from; see
     :func:`_no_chat_route_error`.
 

@@ -727,6 +727,11 @@ class ContractTest(unittest.TestCase):
         self.assertEqual(kanban_chat_notify.PLATFORM_LIST_SEPARATOR, chat_notify.PLATFORM_LIST_SEPARATOR)
         self.assertEqual(kanban_chat_notify.platform_list("a, b,,a"), ["a", "b"])
         self.assertEqual(kanban_chat_notify.platform_list("a, b,,a"), chat_notify.platform_list("a, b,,a"))
+        import kanban_event_routing
+        listed = "google_chat, slack,,slack"
+        with mock.patch.dict(os.environ, {kanban_event_routing.NOTIFY_CONVERSATIONS_ENV: listed}):
+            self.assertEqual(kanban_event_routing._served_conversation_platforms(), ["google_chat", "slack"])
+        self.assertEqual(chat_notify.platform_list(listed), ["google_chat", "slack"])
 
     def test_the_conversation_route_is_spelled_alike_where_it_is_written_and_read(self):
         # session_kv_server writes it, kanban_event_routing addresses the card

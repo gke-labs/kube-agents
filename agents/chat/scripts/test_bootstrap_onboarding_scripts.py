@@ -815,6 +815,11 @@ class DeliveryToConversationTest(unittest.TestCase):
                 self.assertEqual(self._attempts()["attempts"], 0)
                 self.assertIn("the report waits", self._attempts()["last_reason"])
 
+    def test_an_empty_served_list_reads_as_unset_in_the_reason(self):
+        with mock.patch.dict(os.environ, {"A2A_NOTIFY_CONVERSATIONS": ""}):
+            self._run()
+        self.assertIn("(A2A_NOTIFY_CONVERSATIONS=<unset>)", self._attempts()["last_reason"])
+
     def test_a_block_does_not_restart_the_wait_after_an_attempt(self):
         record = {"attempts": 1, "last_reason": "refused", "last_at": 1000.0}
         (self.d / bootstrap_delivery.CONVERSATION_ATTEMPTS_FILE).write_text(json.dumps(record), encoding="utf-8")
