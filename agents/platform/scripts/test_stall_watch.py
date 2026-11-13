@@ -3021,6 +3021,28 @@ class ResolvedScope(Base):
         self.assertEqual(len(said), 1, lines)
         self.assertTrue(said[0].startswith(stall_watch.DRY_RUN_PREFIX))
 
+    def test_an_unrouted_stall_at_the_cap_is_said_as_unrouted_not_promised_an_alert(self):
+        self.next_mode()
+        fleet = {"c": {"catalog": []}, f"{self.MEMBER}:m": {"storefront": GATEWAY_ROWS}}
+        for dry_run in (True, False):
+            with self.subTest(dry_run=dry_run), patch.object(stall_watch, "MAX_ALERTS_PER_TICK", 0):
+                lines, _ = self.run_tick(fleet, unmanaged=("c", "m"), dry_run=dry_run)
+                self.assertFalse(any("alerts follow" in l for l in lines), lines)
+                self.assertEqual(len(self.unrouted(lines)), 1, lines)
+
+    def test_an_unrouted_stall_that_still_holds_an_episode_is_said_once(self):
+        # Alerted while the cluster had a profile; the card never came, the
+        # alert expired, and the profile has gone since.
+        self.next_mode()
+        self.kv.file_cards = False
+        fleet = {"c": {"catalog": []}, f"{self.MEMBER}:m": {"checkout": [DEADLINE_ROW]}}
+        self.run_tick(fleet, unmanaged=("c",), now="2026-10-02T12:00:00+00:00")
+        self.assertEqual(len(self.kv.alerts), 1)
+        lines, _ = self.run_tick(fleet, unmanaged=("c", "m"), now="2026-10-03T12:00:00+00:00")
+        self.assertEqual(len(self.unrouted(lines)), 1, lines)
+        again, _ = self.run_tick(fleet, unmanaged=("c", "m"), now="2026-10-03T12:30:00+00:00")
+        self.assertEqual(self.unrouted(again), [], "said once while it stays stalled")
+
     def test_an_excluded_member_cluster_leaves_the_roster(self):
         self.next_mode()
         fleet = {"c": {"catalog": []}, f"{self.MEMBER}:m": {"storefront": GATEWAY_ROWS}}

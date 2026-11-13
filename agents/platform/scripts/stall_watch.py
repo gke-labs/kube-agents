@@ -2805,6 +2805,7 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
             candidates[scope] = []
     raised = held = 0
     unrouted: list[str] = []
+    opened: set[str] = set()
     refusal: str | None = None
     for scope in sorted(candidates, key=lambda sc: (scope_first_seen(state, sc), sc)):
         new_rows = candidates[scope]
@@ -2823,12 +2824,13 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
                 what, shown = f"would comment on card `{episode.get('card') or 'not yet filed'}` for", new_rows
             elif not would_raise(state, sweep, scope, now, min_age):
                 continue
+            elif cluster_agent_for(project, name, location) is None:
+                # The same check a real alert makes, in the same place: no
+                # profile, no alert, and no promise of one at the cap.
+                unrouted.append(scope)
+                continue
             elif raised >= MAX_ALERTS_PER_TICK:
                 held += 1
-                continue
-            elif cluster_agent_for(project, name, location) is None:
-                # The same check a real alert makes: no profile, no alert.
-                unrouted.append(scope)
                 continue
             else:
                 what, shown = "would raise an alert for", rows
@@ -2864,13 +2866,8 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
                 previous = episode
         if not would_raise(state, sweep, scope, now, min_age):
             continue
-        if refusal is not None:
-            # The server refused this tick's first alert; the rest wait for the
-            # next tick rather than each spending a timeout on the same answer.
-            continue
-        if raised >= MAX_ALERTS_PER_TICK:
-            held += 1
-            continue
+        # The profile is checked before the cap and a refusal, so a stall no
+        # alert can follow for is never counted among those held for one.
         assignee = cluster_agent_for(project, name, location)
         if assignee is None:
             # Outside next mode the profile went between the sweep and the
@@ -2879,6 +2876,13 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
             # stall is said in chat rather than lost (below).
             sys.stderr.write(f"stall_watch: {cid} has no Cluster Agent profile; no alert for {scope}\n")
             unrouted.append(scope)
+            continue
+        if refusal is not None:
+            # The server refused this tick's first alert; the rest wait for the
+            # next tick rather than each spending a timeout on the same answer.
+            continue
+        if raised >= MAX_ALERTS_PER_TICK:
+            held += 1
             continue
         payload = stall_payload(project, name, location, namespace, assignee, rows, scope_first_seen(state, scope) or now)
         try:
@@ -2903,12 +2907,15 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
             sys.stderr.write(f"stall_watch: no alert for {scope}: {refusal}\n")
             continue
         raised += 1
+        opened.add(scope)
     # A namespace already said stays said while its rows stay ledgered: a tick
     # that did not read it, held it at the cap, or saw only some of the set
-    # clear is not news. It is forgotten once its rows go or an alert opens
-    # an episode for it, so a stall that comes back is said again.
+    # clear is not news. It is forgotten once its rows go or this tick's alert
+    # opens an episode for it, so a stall that comes back is said again; an
+    # older episode it still holds (an expired alert, a finished card) does
+    # not make it news again.
     ledgered = {scope_key(e["cluster"], e["namespace"]) for e in state["stalls"].values()}
-    said = {scope for scope in state.get(UNROUTED_KEY) or [] if scope in ledgered and scope not in episodes}
+    said = {scope for scope in state.get(UNROUTED_KEY) or [] if scope in ledgered and scope not in opened}
     fresh = sorted(set(unrouted) - said)
     if fresh:
         shown = names_text([scope_label_text(scope) for scope in fresh])
