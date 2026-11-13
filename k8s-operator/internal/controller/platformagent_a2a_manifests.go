@@ -7708,11 +7708,6 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	if err := r.applyA2AAgentDoor(ctx, agent); err != nil {
 		return state, err
 	}
-	// The install's tiers, which the verifier, the gateway and the callout
-	// mount (optional, so ordering against their Deployments doesn't matter).
-	if err := r.applyA2ATiers(ctx, agent); err != nil {
-		return state, err
-	}
 
 	// The gateway is what dispatches: it spawns the session pods, and a
 	// session pod's bus credential is minted by the auth callout. So this is
