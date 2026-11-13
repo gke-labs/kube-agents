@@ -548,7 +548,8 @@ func (rec *SessionRecord) takeCardsPending(rootID string) bool {
 }
 
 // trimHistory holds rec.Tasks to taskHistoryCap, dropping the oldest entries
-// first, but never a live node of a fan-out still running: its parent, the
+// first, but never a live node of a fan-out still running, withdrawn or
+// not, while a child it counts (batchLeft) has yet to end: its parent, the
 // chain's root and every child, ended or not, since the wake reads each
 // child's end and the root carries the chain's mark. Nor the active task's
 // entry. A history whose live nodes alone pass the cap keeps them all; a
@@ -563,7 +564,10 @@ func (rec *SessionRecord) trimHistory() {
 		live[rec.ActiveTask.TaskID] = true
 	}
 	for _, ref := range rec.Tasks {
-		if !rec.fanOutPending(ref.ID) {
+		// Not fanOutPending: a withdrawn batch (DelegationEnd) whose kept
+		// child still runs is live too, since that child's end is the
+		// chain's (batchLeft counts it).
+		if !ref.fanOut() || rec.batchLeft(ref) == 0 {
 			continue
 		}
 		live[ref.ID], live[ref.rootID()] = true, true

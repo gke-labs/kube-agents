@@ -1016,3 +1016,110 @@ func TestAWithdrawnBatchLeavesAChildThatAlreadyEndedAlone(t *testing.T) {
 		t.Fatalf("the parent still links %v after the withdrawal", pref.Children)
 	}
 }
+
+// TestTheHistoryCapKeepsAWithdrawnBatchsKeptChild: a withdrawn batch
+// (DelegationEnd) whose child stayed on the record, its cancel unpublished,
+// is still live: the chain ends when that child does, so the parent, the
+// root and the child are kept however old. Once the child has ended, the
+// chain is history like any other.
+func TestTheHistoryCapKeepsAWithdrawnBatchsKeptChild(t *testing.T) {
+	rec := &SessionRecord{}
+	rec.Tasks = append(rec.Tasks,
+		TaskRef{ID: "root", BatchSize: 2, Children: []string{"k1"}, DelegationEnd: notStartedEnd(whyChildOffBus)},
+		TaskRef{ID: "k1", Role: taskRoleChild, ParentTaskID: "root", RootTaskID: "root", BatchIndex: 1})
+	for i := range taskHistoryCap {
+		rec.Tasks = append(rec.Tasks, TaskRef{ID: fmt.Sprintf("old-%d", i)})
+	}
+	rec.trimHistory()
+	for _, id := range []string{"root", "k1"} {
+		if _, ok := rec.TaskRefFor(id); !ok {
+			t.Fatalf("the withdrawn batch's live %s was evicted", id)
+		}
+	}
+	if len(rec.Tasks) != taskHistoryCap {
+		t.Fatalf("history = %d entries, want the cap %d", len(rec.Tasks), taskHistoryCap)
+	}
+
+	rec.setBatchEnd("k1", &BatchEnd{State: lib.StateCanceled})
+	rec.Tasks = append(rec.Tasks, TaskRef{ID: "newest"})
+	rec.trimHistory()
+	if _, ok := rec.TaskRefFor("root"); ok || len(rec.Tasks) != taskHistoryCap {
+		t.Fatalf("an ended withdrawn batch's root kept past the cap: %d entries", len(rec.Tasks))
+	}
+}
+
+// TestAWithdrawnBatchsKeptChildOutlivesTheHistoryCap: a withdrawn batch
+// whose kept child runs on while later turns pass the history cap still
+// ends its chain once, on the root, canceled: the parent, the root and the
+// child stay on the record, and nothing wakes or says the requester is gone.
+func TestAWithdrawnBatchsKeptChildOutlivesTheHistoryCap(t *testing.T) {
+	t.Parallel()
+	r, spawn, obs := startFanOutRig(t, 2)
+	ctx := context.Background()
+	conv := "discord:g1/t-fanout-withdrawn-kept-cap"
+	exec, origin, session := sessionTurn(t, r, spawn, conv, "x")
+	narrowTasksStream(t, r.url, session)
+	art := delegateBatchArtifact(t, clusterTask("dev", "first"), platformTask("second"))
+	if err := exec.PublishArtifact(ctx, art); err != nil {
+		t.Fatal(err)
+	}
+	first := submissionOn(t, r, "cluster")
+	waitFor(t, "the failed cancel", loggedContaining(r, "cancel publish failed for a withdrawn batch child", first.TaskID))
+	completeTask(t, exec, "delegated the checks")
+	waitFor(t, "parent terminal relayed", postedContaining(r, "delegated the checks"))
+	waitFor(t, "the active slot released", func() bool {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		return rec.ActiveTask == nil
+	})
+
+	// Later turns: a history at the cap, then one more turn, which trims.
+	rec, err := r.g.reg.Get(ctx, conv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range taskHistoryCap {
+		rec.Tasks = append(rec.Tasks, TaskRef{ID: fmt.Sprintf("later-%d", i), Addressee: session})
+	}
+	if err := r.g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	sessionRigTurn(r, conv, "later-turn", "and the next thing")
+	r.awaitTask(t, session)
+	waitFor(t, "the later turn trimmed the history", func() bool {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		_, ok := rec.TaskRefFor("later-0")
+		return !ok || len(rec.Tasks) <= taskHistoryCap+2
+	})
+	rec, _ = r.g.reg.Get(ctx, conv)
+	for _, id := range []string{origin.TaskID, first.TaskID} {
+		if _, ok := rec.TaskRefFor(id); !ok {
+			t.Fatalf("the withdrawn batch's live %s was evicted", id)
+		}
+	}
+
+	if err := r.execFor(t, first, "cluster").PublishStatus(ctx, lib.StateCanceled, true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the root's terminal", func() bool { _, ok := obs.terminalFor(origin.TaskID); return ok })
+	if end, _ := obs.terminalFor(origin.TaskID); end.state != lib.StateCanceled {
+		t.Fatalf("root terminal = %+v, want canceled", end)
+	}
+	terminals := 0
+	for _, e := range obs.events() {
+		if e.task == first.TaskID {
+			t.Fatalf("the observer was told about the child %s: %v", first.TaskID, obs.kinds())
+		}
+		if e.task == origin.TaskID && e.kind == "terminal" {
+			terminals++
+		}
+	}
+	if terminals != 1 {
+		t.Fatalf("root terminals = %d, want 1: %v", terminals, obs.kinds())
+	}
+	if postedContaining(r, noticeWakeNoRequester)() {
+		t.Fatal("a withdrawn batch said its requester was gone")
+	}
+	if len(spawn.calls()) != 1 || wakeEntries(t, r, conv) != 0 {
+		t.Fatal("a withdrawn batch woke the session")
+	}
+}
