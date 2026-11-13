@@ -561,7 +561,7 @@ litellm:
     # copies: a chart pinned to a version the mirror was never populated with
     # is an ImagePullBackOff. This pin sat a release behind the kustomize base
     # for exactly that reason.
-    tag: v1.106.0
+    tag: v1.108.6
     pullPolicy: IfNotPresent
   replicaCount: 2
   # Rollout strategy — the canonical home for this argument. The chart template
@@ -874,7 +874,7 @@ hindsight:
     # this tag — the pg15 line among them. Read them there before changing it.
     image:
       repository: docker.io/pgvector/pgvector
-      tag: "0.8.6-pg15@sha256:a947c45cdc5906a1bc951f20a8709e321256343ee0f251e4ae00b5e7def4e6da"
+      tag: "0.8.7-pg15@sha256:88164492558c9773a1e17a8305abaca7863e05b3d8bbcdb792774890a2047e06"
       pullPolicy: IfNotPresent
     # Ephemeral storage is the run and tmp emptyDirs' sizeLimits (64Mi and 1Gi,
     # templates/hindsight.yaml) plus 64Mi for the container's logs; the limit
@@ -988,7 +988,7 @@ githubMinter:
 fluentBit:
   image:
     repository: docker.io/fluent/fluent-bit
-    tag: "5.1.2"
+    tag: "5.1.5"
 
 # The shell sandbox StatefulSet the operator renders beside every agent pod.
 # Same shape as fluentBit above and for the same reason: the chart never renders
@@ -1617,7 +1617,7 @@ platformAgent:
     # images.json like every other third-party image.
     image:
       repository: docker.io/alpine/k8s
-      tag: "1.36.5"
+      tag: "1.36.6"
     # How long to wait for AgentProfile finalizers to clear before deleting
     # the PlatformAgent CR.
     agentProfileTimeout: 30s

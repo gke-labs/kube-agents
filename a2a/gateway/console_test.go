@@ -40,7 +40,7 @@ func startConsoleRig(t *testing.T) *consoleRig {
 		t.Fatalf("NewConsoleAdapter: %v", err)
 	}
 	t.Cleanup(a.Close)
-	browser, err := nats.Connect(s.ClientURL())
+	browser, err := connectTest(s.ClientURL())
 	if err != nil {
 		t.Fatalf("browser connect: %v", err)
 	}
@@ -642,7 +642,7 @@ func TestConsoleRecoversARefusedSubscriptionOnReconnect(t *testing.T) {
 		return strings.Contains(logs.String(), "console connection restored")
 	})
 
-	browser, err := nats.Connect(s2.ClientURL(), nats.UserInfo("browser", "pw"))
+	browser, err := connectTest(s2.ClientURL(), nats.UserInfo("browser", "pw"))
 	if err != nil {
 		t.Fatal(err)
 	}

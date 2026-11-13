@@ -14728,6 +14728,19 @@ def _select_pr_by_head(prs: list[dict], branch: str, alternate: str | None = Non
     return None
 
 
+def remediation_target(group: list[dict]) -> dict | None:
+    """The finding a group fixes, for the post-merge check, else None.
+
+    Only a group of one GENERATED_FIX_CHECK finding: the check re-checks one
+    workload, so a group fixing several is not followed.
+    """
+    if len(group) != 1 or str(group[0].get("check", "")) != GENERATED_FIX_CHECK:
+        return None
+    finding = group[0]
+    return {key: str(finding.get(field) or "") for key, field in
+            (("finding_id", "id"), ("cluster", "cluster"), ("namespace", "namespace"), ("object", "object"))}
+
+
 def remediation_pr_title(audit_id: str, group: list[dict]) -> str:
     """One subject for the whole group, named after what it fixes."""
     ordered = sort_findings(group)
@@ -15190,8 +15203,11 @@ def broker_lost(exc: BaseException) -> bool:
 _LAST_REFUSAL: dict[str, str] = {}
 
 
-def forge(verb: str, repo: str, payload: dict) -> dict:
+def forge(verb: str, repo: str, payload: dict, target: dict | None = None) -> dict:
     """One forge verb against `repo`, through the broker. Raises ForgeError.
+
+    `target` names the finding a `proposal-create` fixes, for the record the
+    agent pod's hook reads (`vcs_client.TARGET_FIELD`); it is not sent.
 
     Issues, pull requests, comments and labels all go this way. There is no
     `gh` in the sandbox to run: the broker holds the credential and answers in
@@ -15213,6 +15229,8 @@ def forge(verb: str, repo: str, payload: dict) -> dict:
     # call it just made failed.
     _LAST_REFUSAL.pop(repo, None)
     try:
+        if target:
+            return vcs_client.forge(verb, dict(payload), repository=repo, target=target)
         return vcs_client.forge(verb, dict(payload), repository=repo)
     except vcs_client.VcsError as exc:
         _LAST_REFUSAL[repo] = exc.code or ""
@@ -17594,6 +17612,7 @@ def open_remediation_pr(
                 "proposal-create",
                 repo,
                 {"source": branch, "target": base, "title": title, "body": body},
+                target=remediation_target(group),
             ).get("proposal") or {}
         except ForgeError:
             # The forge refuses a second pull request from one branch. One is
