@@ -55,8 +55,8 @@ func TestMain(m *testing.M) {
 // there, so none of them dials NATS. Each case pins A2A_CHAT_DISPLAY_MODE to
 // empty because FromEnv validates it before NATS_URL: a CI environment with
 // a stray value there would otherwise change which error fires. The Slack
-// pair is cleared for the same reason — it arms a third backend, so a stray
-// SLACK_BOT_TOKEN turns a one-backend case into a two-backend refusal.
+// pair is cleared for the same reason: a stray SLACK_BOT_TOKEN arms Slack,
+// and half a pair turns any case into the half-pair refusal.
 func TestRealMainRefusesBadConfigBeforeDialing(t *testing.T) {
 	cases := []struct {
 		name string
@@ -69,47 +69,12 @@ func TestRealMainRefusesBadConfigBeforeDialing(t *testing.T) {
 			want: "NATS_URL",
 		},
 		{
-			name: "two backends set",
-			env: map[string]string{
-				"NATS_URL":            "nats://127.0.0.1:1",
-				"DISCORD_TOKEN":       "tok",
-				"A2A_GCHAT_RELAY_URL": "http://relay",
-			},
-			// The refusal names what is armed, so an operator reading it
-			// knows which variable to unset.
-			want: "more than one chat backend is configured",
-		},
-		{
-			name: "slack and discord set",
-			env: map[string]string{
-				"NATS_URL":        "nats://127.0.0.1:1",
-				"DISCORD_TOKEN":   "tok",
-				"SLACK_BOT_TOKEN": "xoxb-tok",
-				"SLACK_APP_TOKEN": "xapp-tok",
-			},
-			want: "more than one chat backend is configured (the SLACK_BOT_TOKEN+SLACK_APP_TOKEN pair, DISCORD_TOKEN)",
-		},
-		{
 			name: "half a slack pair",
 			env: map[string]string{
 				"NATS_URL":        "nats://127.0.0.1:1",
 				"SLACK_BOT_TOKEN": "xoxb-tok",
 			},
 			want: "SLACK_BOT_TOKEN and SLACK_APP_TOKEN arm Slack together",
-		},
-		{
-			// The door is a side door: beside one real backend it is
-			// accepted, so the refusal here is the two BACKENDS, and the
-			// message must not send the reader to unset the door.
-			name: "two backends with the door open as well",
-			env: map[string]string{
-				"NATS_URL":            "nats://127.0.0.1:1",
-				"DISCORD_TOKEN":       "tok",
-				"A2A_GCHAT_RELAY_URL": "http://relay",
-				"A2A_INJECT_LISTEN":   ":8099",
-				"A2A_INJECT_TOKEN":    "s3cret",
-			},
-			want: "more than one chat backend is configured",
 		},
 		{
 			// A door with no token never arms. The fence in front of it does
@@ -278,7 +243,7 @@ func TestBuildAdaptersIncludesTheConsole(t *testing.T) {
 	s := startTestServer(t)
 	cfg := &gateway.Config{NATSURL: s.ClientURL(), DiscordToken: "x"}
 	primary := newFakePrimary()
-	m, err := buildAdapters(cfg, primary, nil, slog.Default())
+	m, err := buildAdapters(cfg, map[string]gateway.Adapter{"discord": primary}, nil, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -287,6 +252,58 @@ func TestBuildAdaptersIncludesTheConsole(t *testing.T) {
 	}
 	if _, err := m.Post("discord:g/c", "hi"); err != nil {
 		t.Errorf("primary not wired: %v", err)
+	}
+}
+
+// TestBuildAdaptersCarriesEveryRealBackend proves two armed backends both sit
+// behind the mux beside the console: a post to each prefix reaches its own
+// adapter.
+func TestBuildAdaptersCarriesEveryRealBackend(t *testing.T) {
+	s := startTestServer(t)
+	cfg := &gateway.Config{NATSURL: s.ClientURL(), GchatRelayURL: "http://relay", SlackBotToken: "xoxb-1", SlackAppToken: "xapp-1"}
+	gchat, slack := newFakePrimary(), newFakePrimary()
+	m, err := buildAdapters(cfg, map[string]gateway.Adapter{"gchat": gchat, "slack": slack}, nil, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, conv := range []string{"console:tab-1", "gchat:spaces/A", "slack:C1/1.1"} {
+		if _, err := m.Post(conv, "hi"); err != nil {
+			t.Errorf("%s not wired: %v", conv, err)
+		}
+	}
+	if len(gchat.posts) != 1 || len(slack.posts) != 1 {
+		t.Fatalf("posts reached gchat=%d slack=%d, want one each", len(gchat.posts), len(slack.posts))
+	}
+}
+
+// TestChatNotifiersArmOnePerBackend proves each real backend gets its own
+// chat.notify route, in cfg.Backends() order, and that one backend's
+// malformed home channel leaves the other's route armed.
+func TestChatNotifiersArmOnePerBackend(t *testing.T) {
+	gchat, err := gateway.NewGoogleChatAdapter("http://relay.invalid", "/nonexistent/token", slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	slack, err := gateway.NewSlackAdapter("xoxb-stub", "xapp-stub", slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	conversations := func(gateway.Adapter) gateway.NotifyConversations { return stubConversations{} }
+	// The malformed-home case below logs its refusal by design; keep it out of the test output.
+	quiet := slog.New(slog.NewTextHandler(io.Discard, nil))
+	cfg := &gateway.Config{GchatRelayURL: "http://relay.invalid", SlackBotToken: "xoxb-stub", SlackAppToken: "xapp-stub",
+		GchatHomeChannel: "spaces/AAAA", SlackHomeChannel: "C0HOME"}
+	ns := chatNotifiers(cfg, map[string]gateway.Adapter{"gchat": gchat, "slack": slack}, conversations, quiet)
+	if len(ns) != 2 {
+		t.Fatalf("%d routes armed, want 2", len(ns))
+	}
+	if ns[0].Backend() != lib.NotifyPlatformGchat || ns[1].Backend() != lib.NotifyPlatformSlack {
+		t.Fatalf("routes = %s, %s; want %s then %s", ns[0].Backend(), ns[1].Backend(), lib.NotifyPlatformGchat, lib.NotifyPlatformSlack)
+	}
+	// A malformed Slack home arms Chat's route alone.
+	cfg.SlackHomeChannel = "#ops"
+	if ns := chatNotifiers(cfg, map[string]gateway.Adapter{"gchat": gchat, "slack": slack}, conversations, quiet); len(ns) != 1 || ns[0].Backend() != lib.NotifyPlatformGchat {
+		t.Fatalf("with a malformed Slack home: %d routes, want Chat's alone", len(ns))
 	}
 }
 
@@ -313,9 +330,9 @@ func TestComposeAdaptersKeepsTheDoorOnTop(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			var primary gateway.Adapter
+			var backends map[string]gateway.Adapter
 			if tc.primary != nil {
-				primary = tc.primary
+				backends = map[string]gateway.Adapter{"discord": tc.primary}
 			}
 			doors := []gateway.DoorSpec{gateway.InjectDoorSpec(door)}
 			if tc.cfg.A2ADoorArmed() {
@@ -325,7 +342,7 @@ func TestComposeAdaptersKeepsTheDoorOnTop(t *testing.T) {
 				}
 				doors = append(doors, gateway.A2ADoorSpec(a2a))
 			}
-			a, err := composeAdapters(tc.cfg, primary, doors, nil, slog.Default())
+			a, err := composeAdapters(tc.cfg, backends, doors, nil, slog.Default())
 			if err != nil {
 				t.Fatal(err)
 			}

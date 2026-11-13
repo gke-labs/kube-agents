@@ -1179,11 +1179,10 @@ credential that may publish on `.in`. Going through the gateway instead means th
 that credential, mints the ids and the `authority` block itself, and the harness needs neither a
 NATS client nor a principal of its own.
 
-**A side door, not a fourth backend.** The one-backend guard refuses two real backends because
-two processes on one relay durable split its event deliveries, and the symptom is a gateway that
-looks healthy and answers half the messages. A local HTTP door has no such failure mode, so it
-may sit beside exactly one real backend and the guard keeps refusing two of those - which is what
-lets one install run the eval door and the Chat relay and compare them. The door alone also
+**A side door, not a fourth backend.** A local HTTP door consumes nothing and competes for
+nothing, so it sits beside the backends - which is what lets one install run the eval door and
+the Chat relay and compare them. What the config refuses is half a Slack pair or no ingress at
+all. The door alone also
 counts as an ingress, so an eval install with neither a Discord token nor a Chat relay starts its
 gateway instead of crash-looping. That last sentence is a decision, not an assumption of this
 section: the A2A owner decided it on the eval transport's design doc (`eval-next-transport.md`,
@@ -1436,8 +1435,8 @@ not watched, is seen within one requeue; a door flag comes back with the operato
 changing it causes, and Chat or Slack with the CR edit. An eval install with this door armed has an ingress
 the guard accepts, by the decision recorded above, and the render counts the door as a backend
 for the same reason. An install that enables Google Chat or Slack under `next` has a backend
-by that fact alone: the render asks the CR before it reads any Secret, and, because the gateway
-refuses two real backends, renders one of them in this order - Chat, then Slack, then the
+by that fact alone: the render asks the CR before it reads any Secret, and, because the operator
+renders one backend today, renders one of them in this order - Chat, then Slack, then the
 `discord-bot` reference - so a `discord-bot` Secret left in the namespace does not stop a Chat
 or Slack gateway starting. With both integrations enabled, Chat holds the gateway and Slack
 stays on the legacy consumer rather than reaching nobody. The Slack refs are rendered on the
@@ -2392,13 +2391,19 @@ question, sanitised. That state is process
 memory too, so after a restart the next verified ask in a thread may title it again. `assistant_thread_started`, and `app_home_opened` on the Messages tab, get today's
 three suggested prompts. `agent_session_stopped` is the Stop button, above.
 
-**One backend per gateway process.** The relay binds one durable, and two gateways on
-one durable split event deliveries - so config counts the armed backends and refuses
-any combination but exactly one: a Slack pair, a Discord token, and a gchat relay URL
-are mutually exclusive, and none of the three is also a refusal. A second backend is a
-second Deployment with its own durable, when we want one. The inject side door is not
-in that count - it may sit beside any one of the three, for the reason the inject
-section gives - and neither is the console adapter, which has no durable to split.
+**Every armed backend in one gateway process.** Config lists the armed backends
+(`Backends()`: gchat, slack and discord, in that order) and refuses only half a Slack
+pair or no ingress at all. Several backends in one process split nothing. Each backend is
+its own transport: Chat a Pub/Sub pull through the broker, Slack a Socket Mode connection,
+Discord its gateway websocket. None shares a durable with another. The task-event relay
+durable is the gateway process's own, bound once per process, and the election keeps one
+leader per Deployment. The mux stamps each inbound message
+with the backend that delivered it, and a direct message names its backend as
+`<backend>:<id>`. The console stays the essential backend: when it stops, the process
+restarts, while a chat backend that stops is run again after a backoff and the rest
+keep going. The inject and A2A doors sit beside the backends, for the reason the inject
+section gives. The operator renders one backend into the gateway today, Chat ahead of
+Slack. Decided 2026-11-12.
 
 `verifiedBy` is `slack-socket-mode+principal-map` when our table joined the sender to a
 principal, and `slack-socket-mode` when it did not: either way Slack authenticated the
@@ -2811,14 +2816,20 @@ arriving on a Discord conversation is an unmapped id and drops. One shared princ
 posture until the account split gives each person a credential, at which point the entry
 becomes one inbound subject per principal and nothing else here changes.
 
-**Backend per message.** One gateway process runs its configured chat backend and the console
+**Backend per message.** One gateway process runs every armed chat backend and the console
 together, through a mux that dispatches `post`/`edit`/`roster` on the conversation prefix.
-The console adapter stamps its own backend on every message it delivers, the way the inject
-door does, so `authority.requester.backend`, the drop notice and verification name the console
-rather than the configured backend. Where there is no message to ask (the relay holding a
-session record), the `console:` prefix answers the same question. `openDirect` takes a bare
-user id and goes to the configured backend. With no real backend, as on an inject-only eval
-install, the console is the only chat backend and runs without a mux. With no backend and no
+The console stamps its own messages, the mux stamps every chat-backend message that names no
+backend with the key of the adapter that delivered it, and the inject and A2A doors each stamp
+their own beside the mux. So `authority.requester.backend`, the drop notice and verification
+name the backend the message came in on. Where there is no message to ask (the relay holding a
+session record), the conversation prefix answers the same question. `openDirect` takes a user
+id as `<backend>:<id>` and goes to that backend with the bare id. The direct-message rule is
+the mux's: a chat backend name the mux knows (`gchat`, `slack`, `discord`, `console`) that is
+not armed is refused by name. With exactly one real backend armed, any id without a known
+backend prefix goes whole to it; with several, a bare or unknown-prefixed id is refused. With
+no real backend, as on an inject-only eval install, the console is the only chat backend and
+runs without a mux. There the console alone refuses every direct message, so no refusal names a
+backend. With no backend and no
 door, `A2A_CONSOLE_DOOR=true` lets the gateway start on the console alone; the operator renders
 it on every next gateway (2026-10-22), so every `mode: next` install runs one.
 
@@ -2830,12 +2841,12 @@ the backend that owns the conversation, since the Slack adapter learns its sessi
 from them. The console runs whenever the gateway runs, so an inject-only gateway also exits when the console
 adapter does.
 
-**The console outlives the chat backend.** The console is the way in when chat is broken, so
-the two do not share a fate. When the console adapter stops, the gateway exits and restarts.
-When the chat backend stops (a bad or revoked Discord or Slack token, a Socket Mode give-up),
-the mux logs `chat backend stopped` at error with the backend in a `backend` field, and runs
-that backend again after a delay that doubles from one second to a one-minute cap, while the
-console keeps serving. A run that lasted at least the cap starts the doubling over. A backend
+**The console outlives each chat backend.** The console is the way in when chat is broken, so
+the console and the chat backends do not share a fate. When the console adapter stops, the
+gateway exits and restarts. When a chat backend stops (a bad or revoked Discord or Slack token,
+a Socket Mode give-up), the mux logs `chat backend stopped` at error with the backend in a
+`backend` field, and runs that backend again after a delay that doubles from one second to a
+one-minute cap, while the console and the other chat backends keep serving. A run that lasted at least the cap starts the doubling over. A backend
 that returns without an error while the gateway is still running has stopped all the same and is
 handled the same way. Google Chat never takes this path, since its adapter retries pulls itself.
 A dead chat backend therefore shows as that log line on a Running pod, not as a restart.
@@ -2897,7 +2908,11 @@ every message through either stamps its own backend.
 - `tasks/cancel` is a cancel turn on the task's conversation - the same `kind: cancel` envelope
   the inject door's cancel route and the chat path's `stop` publish - answered once the cancel is
   on the bus (`TaskObserver.CancelPublished`) with the `Task` as it stands. The executor decides
-  when the task is canceled; the client polls `tasks/get` for that terminal as for any other.
+  when the task is canceled; the client polls `tasks/get` for that terminal as for any other. Once
+  a cancel for the task is on the bus, any later `tasks/cancel` (a retry after a lost response)
+  is answered with the `Task` and publishes nothing, whatever terminal it has reached since:
+  `canceled`, or `completed` or `failed` if the turn finished before the cancel took. A task that
+  ended with no cancel published refuses one with `TaskNotCancelableError` (-32002).
 - `message/stream` is refused as unsupported and the card says `streaming: false`. It lands
   next, as SSE frames from the same observer hooks.
 
