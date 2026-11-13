@@ -138,10 +138,11 @@ For the providers, build a mirror on a connected machine, from the same release'
 
 ```bash
 cd terraform/examples/full-install
+terraform init -backend=false
 terraform providers mirror -platform=linux_amd64 /path/to/provider-mirror
 ```
 
-Add a `-platform` for each OS and architecture the install will run on (`darwin_arm64` for an Apple-silicon laptop). No lock file is committed, so the mirror's contents decide which provider versions the install uses. Copy the directory to the restricted machine, or serve it over HTTPS, and point the Terraform CLI at it in `~/.terraformrc` (or the file `TF_CLI_CONFIG_FILE` names):
+The `init` registers the composition's local modules, which `providers mirror` reads to find the providers only they declare; without it the command stops with `Module not installed`. Add a `-platform` for each OS and architecture the install will run on (`darwin_arm64` for an Apple-silicon laptop). No lock file is committed, so the mirror's contents decide which provider versions the install uses. Copy the directory to the restricted machine, or serve it over HTTPS, and point the Terraform CLI at it in `~/.terraformrc` (or the file `TF_CLI_CONFIG_FILE` names):
 
 ```hcl
 provider_installation {
