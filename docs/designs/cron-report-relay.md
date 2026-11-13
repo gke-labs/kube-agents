@@ -650,13 +650,13 @@ An install with no chat route gets no send at all: when the managed scope turns
 every platform off and nothing routes one through the gateway — an install with
 neither Google Chat nor Slack, or one whose home channel is malformed, which routes
 nothing — the relay answers 502 without posting, and the detail says that no route
-exists. Home posts go to every platform with a home channel; with none, every armed
-platform keeps them for its digest. So a `next` install whose gateway holds no platform
-with a home channel is routed anyway: the operator names every armed platform in
-`A2A_NOTIFY_PLATFORM` (a comma-separated list of platform names), the relay
-sends, and the gateway refuses the post and keeps it for the digest it posts once a
+exists. The operator names every armed platform in `A2A_NOTIFY_PLATFORM` (a
+comma-separated list of platform names), and the agent sends home posts to the ones with a
+home channel it can see (`chat_notify.routed_platforms()`). So a `next` install whose
+gateway holds no platform with a home channel is routed anyway: the relay sends to every
+armed platform, and the gateway refuses the post and keeps it for the digest it posts once a
 home channel is set (the gateway design, "Proactive posts"). With a home channel on one
-platform, the operator names only that platform and the report posts there. The 502's detail is then
+platform, the agent sends only to that platform and the report posts there. The 502's detail is then
 the relay's `composed but not delivered to <platform>`. The gateway's refusal, which
 says the post is kept, is in the gateway's and the session server's logs. A pod
 rendered before the operator routed it still answers the platform-naming detail

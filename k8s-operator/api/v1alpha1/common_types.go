@@ -176,11 +176,11 @@ var SensitiveEnvVars = map[string]struct{}{
 	"A2A_BUS_TOKEN_FILE": {},
 	"A2A_BUS_USER":       {},
 	// A2A_NOTIFY_PLATFORM turns the agent's proactive posts from Hermes to
-	// the gateway's chat.notify route. It holds the routed platforms,
-	// comma-separated, Chat first: every platform with a home channel, or
-	// every platform whose route is armed when none has one, under the next
-	// stack. An override either way leaves posts going to a platform that is
-	// not there.
+	// the gateway's chat.notify route. It holds every platform whose route is
+	// armed under the next stack, comma-separated, Chat first; the agent sends
+	// home posts to the ones with a home channel it can see, or to all of them
+	// when none has one. An override either way leaves posts going to a
+	// platform that is not there.
 	"A2A_NOTIFY_PLATFORM": {},
 	// A2A_NOTIFY_CONVERSATIONS arms the kanban notifier's report back to the
 	// gateway conversation a card was filed in, on the same route. It holds

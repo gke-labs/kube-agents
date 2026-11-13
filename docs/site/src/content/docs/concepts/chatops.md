@@ -51,7 +51,7 @@ When no home channel is set and the install's first chat message, on either plat
 
 Under `spec.mode: next` only the resource field counts. The operator hands it to the A2A gateway, which posts the agent's proactive messages to that space and nowhere else, and `/sethome` does not reach it. The field must name a space (`spaces/<id>`); with it unset or malformed the agent posts nothing to Google Chat unprompted. Unset, the PlatformAgent carries the [`HomeChannelUnset`](/kube-agents/operator/platformagent-crd/#status) condition and the installer warns before it applies.
 
-Home posts go to every platform with a home channel. With none, the gateway refuses them and keeps each platform's posts apart, up to fifty for thirty days. It posts one digest once that platform's home channel is set.
+The agent sends home posts to each platform on the gateway that has a home channel. A Slack channel the gateway learned counts. When no platform has one, the gateway refuses them and keeps each platform's posts apart, up to fifty for thirty days. It posts one digest once that platform's home channel is set.
 
 ### What it looks like end to end
 
@@ -131,7 +131,7 @@ It is optional at install time. Leave the prompt empty and, if the install's fir
 
 Under `spec.mode: next` the home channel is `spec.integration.slack.homeChannel` on the PlatformAgent, or, with the field empty, the channel the gateway learns from the first mention (below). The operator hands it to the A2A gateway, which posts the agent's proactive messages (alerts, scheduled reports, and the fleet audit's report card) into that channel and nowhere else, as new threads or as replies in them. `/sethome` does not reach it: an allowed member moves it from the app's Home tab (below). The field must be a channel ID (`C...`, or `G...` for a private channel), not a name; with it set to something else the agent posts nothing to Slack unprompted.
 
-Until a home channel exists, the gateway keeps the posts it refused, up to fifty for thirty days, and posts one digest into the channel once one is set.
+Until a home channel exists, the gateway keeps the posts it refused, up to fifty for thirty days, and posts one digest into the channel once one is set. It refuses and keeps them only when no platform on the gateway has a home channel. With Google Chat holding one, Slack's home posts go to Chat until Slack has its own.
 
 With it unset and `spec.integration.slack.homeChannelPolicy` `auto` (the default), the first top-level mention of the agent in a channel makes that channel the home channel. The gateway checks the channel first: not a direct message, not archived, not shared through Slack Connect, and the app a member. It then records the channel in the `<agent>-home-channel` ConfigMap beside the gateway and posts one line in the mention's thread. The operator projects the recorded channel into a file it mounts in the agent pod and the gateway pod; both read it within about a minute, and no pod restarts. Until the learn the PlatformAgent carries the [`HomeChannelUnset`](/kube-agents/operator/platformagent-crd/#status) condition and the installer warns before it applies.
 
@@ -601,7 +601,7 @@ When no card can be built, the report is posted as text, reshaped with a headlin
 - **Google Chat**: to the space that owns the interaction, or the space set via `GOOGLE_CHAT_HOME_CHANNEL`.
 - **Slack**: to `SLACK_HOME_CHANNEL`.
 
-An alert goes to **one** of them, not both: it opens a thread that the triage turn then replies into, and a thread belongs to a single platform. With both integrations enabled the alert goes to Google Chat, falling through to Slack if that send is not accepted. Under `spec.mode: next` the alert picks one platform, Chat first, among the platforms that have a home channel. With none, the gateway keeps it for the digest on the first platform. A scheduled report has no such constraint and is posted to every enabled interactive platform (Google Chat and Slack; Microsoft Teams is not enumerated by the delivery resolver) — [the relay design](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/cron-report-relay.md) is canonical for both rules.
+An alert goes to **one** of them, not both: it opens a thread that the triage turn then replies into, and a thread belongs to a single platform. With both integrations enabled the alert goes to Google Chat, falling through to Slack if that send is not accepted. Under `spec.mode: next` the agent picks one platform for the alert, Chat first, among the platforms that have a home channel. With none, the gateway keeps it for the digest on the first platform. A scheduled report has no such constraint and is posted to every enabled interactive platform (Google Chat and Slack; Microsoft Teams is not enumerated by the delivery resolver) — [the relay design](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/cron-report-relay.md) is canonical for both rules.
 
 A governance watchdog's findings live on its ledger issue and the remediation pull requests that link back to it. Its scheduled report on this path is usually one line of counts ending with the ledger link, so the report to read is the issue — see [Proactive autonomy](/kube-agents/overview/proactive-autonomy/) and [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/) for the schedules.
 

@@ -550,13 +550,13 @@ with Google Chat off.
    - `SLACK_HOME_CHANNEL` in `install.env` is the ID of the channel for alerts and scheduled
      reports: `C…`, or `G…` for some private channels. Under `next` the gateway posts the agent's
      proactive messages to this channel, or, with it empty and `homeChannelPolicy` auto (the
-     default), to the channel of the first top-level mention of the agent. A home channel set with
-     `/sethome` lives in the Planning Agent's
-     profile and does not carry over. A DM ID (`D…`) or a channel name turns off the gateway's
+     default), to the channel of the first top-level mention of the agent. A `/sethome` home
+     channel does not carry over. A DM ID (`D…`) or a channel name turns off the gateway's
      notify route, and with it the reports of board cards
      ([Slack app setup → Home channel](/kube-agents/install/slack-app/#home-channel)). With no home
-     channel those posts are refused while conversations keep working: the run warns, and the
-     `PlatformAgent` carries the `HomeChannelUnset` condition.
+     channel those posts go to Google Chat's home channel, or are refused when Chat has none either,
+     while conversations keep working. The run warns, and the `PlatformAgent` carries
+     `HomeChannelUnset`.
    - Keep the agent image at the operator's release. A learned home channel reaches the agent through
      a file the operator mounts; an older agent image reads env only and never sees it, while the CR
      shows no condition.
