@@ -3027,8 +3027,9 @@ def _resolve_chat_platforms() -> tuple[list[str], Dict[str, bool]]:
 
     Checks `chat_notify.routes(name)` first so `spec.mode: next` installs where
     the operator renders `platforms.<p>.enabled: false` into `/etc/hermes/config.yaml`
-    while routing notifications through the gateway (`A2A_NOTIFY_PLATFORM` or the
-    projected home-channel file) resolve that
+    while routing notifications through the gateway (`A2A_NOTIFY_PLATFORM`, the
+    projected home-channel file, or with neither, the `A2A_NOTIFY_CONVERSATIONS`
+    fallback) resolve that
     platform as enabled in both `enabled_chat_platforms` and `_chat_platforms_disabled`.
     """
     from_managed = _platforms_enabled_in(MANAGED_CONFIG_PATH)
@@ -3084,10 +3085,12 @@ def _no_chat_route_error() -> str:
     chat and the `chat_delivery_watch` ledger issue. The gateway names its
     backends whether or not a home channel is set, so with any named the cause
     is the missing home channel, one sentence per platform; without one this
-    cannot tell no chat from a misconfigured one, so it guesses at neither. A
-    pod whose gateway arms any route rarely reaches this: with no home channel
-    anywhere, ``chat_notify.routed_platforms()`` names every armed route, and
-    the gateway's refusal says the post is kept.
+    cannot tell no chat from a misconfigured one, so it guesses at neither.
+    :func:`relay_cron_report` never reaches the per-platform branch:
+    ``chat_notify.routed_platforms()`` is empty only when no route is armed, and
+    then ``gateway_platforms()`` is empty too. The branch stays because
+    ``chat_delivery_watch.platforms_from`` reads its wording from ledger rows
+    that older pods wrote.
     """
     refusals = [
         f"composed but not delivered to {platform} (no home channel: set {HOME_CHANNEL_SETTINGS[platform]})"
@@ -6484,12 +6487,10 @@ def relay_cron_report(
 
     An install with no chat route gets no send at all, where the fallback to
     DEFAULT_CHAT_PLATFORM would post to a platform it may not have (#3385): one
-    with neither platform, or a pod rendered before the operator routed its only
-    platform without a home channel (a routed pod sends, and the gateway refuses
-    and keeps the post). The error
-    names each platform without a home channel and the setting that arms it, in the wording
-    `chat_delivery_watch` reads the platform from; see
-    :func:`_no_chat_route_error`.
+    with no armed route. An armed route with no home channel is routed through
+    the fallback, sends, and the gateway refuses and keeps the post. The
+    platform-naming wording of :func:`_no_chat_route_error` is reached only
+    with no armed route, so this path never produces it; see that function.
 
     No agent turn runs over the report. One did, to have the Chat Agent present
     it, and the turn replaced reports with replies about them ("noted.", a line

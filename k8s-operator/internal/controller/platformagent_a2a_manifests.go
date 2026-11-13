@@ -690,8 +690,8 @@ const (
 	// variable because the route serves conversations with no home channel,
 	// while A2A_NOTIFY_PLATFORM sends every proactive post to the home channel
 	// and so needs one. The cron relay (agents/platform/scripts/chat_notify.py,
-	// gateway_platforms) reads it too, as a comma-separated list, to name the
-	// platforms whose home channel is missing when it refuses a report.
+	// routed_platforms) reads it too, as a comma-separated list: the home-post
+	// fallback when no armed route has a home channel.
 	a2aNotifyConversationsEnvVar = "A2A_NOTIFY_CONVERSATIONS"
 	// The prefix of a Chat space resource name.
 	a2aGchatSpacePrefix      = "spaces/"

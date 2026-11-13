@@ -270,7 +270,7 @@ informational churn. Each is **counted**, on its own line above the body:
   metric that does not exist.
 
 A third class exists on a headless install (`platforms.google_chat.enabled: false` and
-`platforms.slack.enabled: false` with nothing routed through the gateway (`A2A_NOTIFY_PLATFORM` empty and no learned Slack home channel)): **alerts dispatched without
+`platforms.slack.enabled: false` with no armed route at all (`A2A_NOTIFY_CONVERSATIONS` empty, so `routed_platforms()` is empty; a single-platform install with no home channel is routed through the fallback and sends)): **alerts dispatched without
 a chat platform** (`notified = 2`, `NOTIFIED_HEADLESS`). `trigger_agent_troubleshooter` stamps `2`
 via `mark_delivery_headless` and queues the triage start without attempting a chat post, and
 `filter_and_aggregate_events` tallies those rows in `dispatched_headless` rather than

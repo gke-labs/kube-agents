@@ -370,7 +370,8 @@ def resolve(runner: Any, platform: Any, adapter: Any, sub: Optional[dict] = None
 
     A subscription addressed to a gateway conversation gets the conversation
     stand-in, armed by A2A_NOTIFY_CONVERSATIONS; any other gets the home stand-in,
-    armed by A2A_NOTIFY_PLATFORM.
+    armed when :func:`routed_platforms` names the platform, which it can do with
+    A2A_NOTIFY_PLATFORM absent.
     """
     if adapter is not None:
         return adapter
