@@ -10,9 +10,9 @@ and the HTTPRoute Accepted and ResolvedRefs with no backend available
 (EndpointsNotFound).
 
 Reads the API server address and its CA from the environment and takes a
-fresh access token (it talks to the API server itself, not through the
-kubernetes provider's credential): from Application Default Credentials,
-the google provider's identity, falling back to `gcloud auth print-access-token`.
+fresh access token (the plan-time token the kubernetes provider holds can
+expire during a long apply): from Application Default Credentials, the
+provider's own identity, falling back to `gcloud auth print-access-token`.
 GETs each object for its generation and merge-patches its status
 subresource. Standard library only: the reconcile image carries python3 and
 gcloud, and kubectl is not promised. Exits non-zero, with the API's answer, on
