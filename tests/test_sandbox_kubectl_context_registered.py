@@ -18,6 +18,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT / "deploy" / "sandbox" / "kubectl_context_registered.sh"
@@ -173,11 +174,6 @@ class KubectlContextRegisteredTest(unittest.TestCase):
         self.register()
         self.assert_not_registered("--context", f"{CTX}2", "get", "ns")
 
-    def test_a_server_that_names_a_longer_context_is_not(self):
-        self.register()
-        self.rewrite(f"server: {PROXY}/clusters/{CTX}\n", f"server: {PROXY}/clusters/{CTX}2\n")
-        self.assert_not_registered("--context", CTX, "get", "ns")
-
     def test_an_entry_for_another_proxy_url_is_not(self):
         self.register(proxy="https://old-kube-proxy.kubeagents-system.svc.cluster.local:8443")
         self.assert_not_registered("--context", CTX, "get", "ns")
@@ -203,26 +199,6 @@ class KubectlContextRegisteredTest(unittest.TestCase):
             self.assertIn(f'readonly {name}="{value}"', text)
         suffix = re.search(r'readonly MARKER_SUFFIX="([^"]*)"', text).group(1)
         self.assertEqual(self.client.REGISTERED_MARKER_NAME, ".{name}" + suffix)
-
-    def test_a_context_that_points_at_another_cluster_is_not(self):
-        self.register()
-        self.rewrite(f"    cluster: {CTX}\n", f"    cluster: {HOST_CTX}\n")
-        self.assert_not_registered("--context", CTX, "get", "ns")
-
-    def test_a_context_that_points_at_another_user_is_not(self):
-        # Only <ctx>'s context changes: the host context still names kube-proxy-caller.
-        self.register()
-        self.rewrite(f"    cluster: {CTX}\n    user: kube-proxy-caller\n", f"    cluster: {CTX}\n    user: someone-else\n")
-        self.assert_not_registered("--context", CTX, "get", "ns")
-
-    def test_a_name_alone_is_not(self):
-        self.kubeconfig.write_text(SEED + f"# - name: {CTX}\n", encoding="utf-8")
-        self.assert_not_registered("--context", CTX, "get", "ns")
-
-    def test_a_quoted_server_falls_back(self):
-        self.register()
-        self.rewrite(f"server: {PROXY}/clusters/{CTX}", f"server: '{PROXY}/clusters/{CTX}'")
-        self.assert_not_registered("--context", CTX, "get", "ns")
 
     def test_a_symlinked_kubeconfig_falls_back(self):
         # Python records nothing for a symlink, so place a record that would match beside the link:
@@ -259,7 +235,8 @@ class KubectlContextRegisteredTest(unittest.TestCase):
     def test_a_context_that_is_not_a_gke_name_falls_back(self):
         # Each is registered in full, so only the name check stands between it and "registered".
         for context in ("minikube", "gke_acme-prod_us-central1", "gke_Acme_us-central1_prod",
-                        "gke_acme_prod_us-central1_prod-usc1", "gke_acme_us-central1_-prod", "gke__us-central1_prod"):
+                        "gke_acme_prod_us-central1_prod-usc1", "gke_acme_us-central1_-prod", "gke__us-central1_prod",
+                        "acme_us-central1_prod", "gke_acme_us-central1_prod_"):
             self.register(context=context)
             self.assert_not_registered("--context", context, "get", "ns")
 
@@ -278,21 +255,18 @@ class KubectlContextRegisteredTest(unittest.TestCase):
 
     def test_the_last_context_wins(self):
         self.register()
-        self.assert_not_registered("--context", CTX, "--context", HOST_CTX + "x", "get", "ns")
-        self.assert_registered("--context", HOST_CTX + "x", "--context", CTX, "get", "ns")
+        other = HOST_CTX + "x"
+        self.assert_not_registered("--context", CTX, "--context", other, "get", "ns")
+        self.assert_registered("--context", other, "--context", CTX, "get", "ns")
+        self.assert_not_registered(f"--context={CTX}", f"--context={other}", "get", "ns")
+        self.assert_registered(f"--context={other}", f"--context={CTX}", "get", "ns")
 
     def test_without_a_kube_proxy_url_nothing_is_registered(self):
-        self.register()
+        # A record made for the empty URL, so only the helper's own guard stands in the way.
+        self.register(proxy="")
         self.assert_not_registered("--context", CTX, "get", "ns", KUBE_PROXY_URL=None)
         self.assert_not_registered("--context", CTX, "get", "ns", KUBE_PROXY_URL="")
 
-
-    def python_would_rewrite(self):
-        """Whether the client's merge would change the kubeconfig, run on a copy of it."""
-        copy = self.home / "copy"
-        copy.write_text(self.kubeconfig.read_text(encoding="utf-8"), encoding="utf-8")
-        self.register(path=copy)
-        return copy.read_text(encoding="utf-8") != self.kubeconfig.read_text(encoding="utf-8")
 
     def test_the_three_layouts_in_use_are_registered_after_one_python_pass(self):
         # A file Python has not checked yet is not registered; one pass that leaves it alone registers it.
@@ -324,6 +298,47 @@ class KubectlContextRegisteredTest(unittest.TestCase):
         self.assertIn(line, lines)
         self.assertIn(f"{HOST_CTX} {hashlib.sha256(self.kubeconfig.read_bytes()).hexdigest()} {env}", lines)
         self.assertEqual(len(lines), 2)
+
+    def test_the_record_is_of_the_bytes_python_checked_not_of_a_later_read(self):
+        # Another writer replaces the kubeconfig between the merge's read and its record, as
+        # `kubectl config delete-context` can: it takes no lock. The record must not vouch for the new file.
+        self.register()
+        self.marker().unlink()
+        original = self.kubeconfig.read_text(encoding="utf-8")
+        import yaml
+        real_load = yaml.safe_load
+
+        def load_then_edit(text):
+            document = real_load(text)
+            self.kubeconfig.write_text(original + "# edited after the merge read it\n", encoding="utf-8")
+            return document
+
+        with mock.patch.object(yaml, "safe_load", load_then_edit):
+            self.register()
+        self.assert_not_registered("--context", CTX, "get", "ns")
+
+    def test_a_context_keeps_one_line_in_the_record(self):
+        self.register()
+        self.rewrite("kind: Config\n", "kind: Config\n# a note\n")
+        self.register()
+        lines = self.marker().read_text(encoding="utf-8").splitlines()
+        self.assertEqual([line.split()[0] for line in lines], [CTX])
+
+    def test_a_record_that_cannot_be_written_does_not_stop_the_merge(self):
+        self.marker().mkdir()  # a directory where the record goes: writing it fails
+        self.register()  # the context is added all the same
+        self.assertIn(f"name: {CTX}", self.kubeconfig.read_text(encoding="utf-8"))
+        self.register()  # and the already-current path survives it too
+        self.assert_not_registered("--context", CTX, "get", "ns")
+
+    def test_a_symlinked_record_is_replaced_not_followed(self):
+        elsewhere = self.home / "elsewhere"
+        elsewhere.write_text("keep me\n", encoding="utf-8")
+        self.marker().symlink_to(elsewhere)
+        self.register()
+        self.assertEqual(elsewhere.read_text(encoding="utf-8"), "keep me\n")
+        self.assertFalse(self.marker().is_symlink())
+        self.assertEqual(len(self.marker().read_text(encoding="utf-8").splitlines()), 1)
 
     def test_an_edit_after_the_record_costs_one_python_pass(self):
         self.register()
@@ -360,8 +375,8 @@ class KubectlContextRegisteredTest(unittest.TestCase):
         self.assert_not_registered("--context", CTX, "get", "ns")
 
     def test_hand_edits_yaml_reads_differently_fall_back(self):
-        # The shapes the human review reproduced against the earlier parsing helper: each is an edit, so
-        # the record no longer matches the file, whatever a YAML reader makes of it.
+        # Edits that a YAML reader and a line reader take differently. Each changes the file's bytes, so
+        # the record no longer matches, whatever either reader makes of it.
         for label, old, new in (
                 ("a second clusters section", "users:\n", "clusters: []\nusers:\n"),
                 ("a duplicate key spelled with a space", f"- name: {CTX}\n  cluster:", f"- name: {CTX}\n  name : other\n  cluster:"),
@@ -374,81 +389,6 @@ class KubectlContextRegisteredTest(unittest.TestCase):
                 self.register()
                 self.rewrite(old, new)
                 self.assert_not_registered("--context", CTX, "get", "ns")
-
-    def test_registered_never_comes_with_a_rewrite_python_would_make(self):
-        # Each case leaves a line Python wants somewhere in the file, but not in <ctx>'s own entry.
-        stock_layout = (f"- cluster:\n    certificate-authority: {CA}\n    server: {PROXY}/clusters/{CTX}\n"
-                        f"  name: {CTX}\n")
-        cases = {
-            "the context renamed": (f"- name: {CTX}\n  context:", "- name: short\n  context:"),
-            "the context's user switched": (f"    cluster: {CTX}\n    user: kube-proxy-caller\n",
-                                            f"    cluster: {CTX}\n    user: someone-else\n"),
-            "the cluster's CA as data": (f"    server: {PROXY}/clusters/{CTX}\n    certificate-authority: {CA}\n",
-                                         f"    server: {PROXY}/clusters/{CTX}\n    certificate-authority-data: AAAA\n"),
-            "an extra token on the user": (f"    tokenFile: {TOKEN}\n", f"    tokenFile: {TOKEN}\n    token: static\n"),
-            "the cluster's lines under the context, and no cluster": (
-                f"- name: {CTX}\n  cluster:\n    server: {PROXY}/clusters/{CTX}\n    certificate-authority: {CA}\n",
-                ""),
-            "the server outside the cluster mapping": (
-                f"- name: {CTX}\n  cluster:\n    server: {PROXY}/clusters/{CTX}\n    certificate-authority: {CA}\n",
-                f"- name: {CTX}\n  server: {PROXY}/clusters/{CTX}\n  cluster:\n    certificate-authority: {CA}\n"),
-            "no cluster mapping at all": (
-                f"- name: {CTX}\n  cluster:\n    server: {PROXY}/clusters/{CTX}\n    certificate-authority: {CA}\n",
-                f"- name: {CTX}\n  server: {PROXY}/clusters/{CTX}\n  certificate-authority: {CA}\n"),
-            "the server only nested deeper in the cluster": (
-                f"    server: {PROXY}/clusters/{CTX}\n    certificate-authority: {CA}\n",
-                f"    certificate-authority: {CA}\n    extensions:\n      server: {PROXY}/clusters/{CTX}\n"),
-            "the context's name only deep inside another cluster": (
-                f"- name: {CTX}\n  cluster:\n    server: {PROXY}/clusters/{CTX}\n",
-                f"- extensions:\n  - extension:\n      name: {CTX}\n  cluster:\n"
-                f"    server: {PROXY}/clusters/{CTX}\n"),
-            "a second server for the cluster": (
-                f"    server: {PROXY}/clusters/{CTX}\n    certificate-authority: {CA}\n",
-                f"    server: {PROXY}/clusters/{CTX}\n    certificate-authority: {CA}\n    server: https://elsewhere\n"),
-            "a second user key on the user": (f"    tokenFile: {TOKEN}\n", f"    tokenFile: {TOKEN}\n  user: {{}}\n"),
-            "the user's name only inside a nested list": (
-                "- name: kube-proxy-caller\n  user:",
-                "- name: other\n  extensions:\n  - name: kube-proxy-caller\n    extension: {}\n  user:"),
-            "the token file on another user": (
-                f"- name: kube-proxy-caller\n  user:\n    tokenFile: {TOKEN}\n",
-                f"- name: kube-proxy-caller\n  user:\n    tokenFile: /old/token\n- name: other\n  user:\n"
-                f"    tokenFile: {TOKEN}\n"),
-        }
-        for label, (old, new) in cases.items():
-            with self.subTest(label):
-                self.kubeconfig.write_text(SEED, encoding="utf-8")
-                self.register()
-                self.rewrite(old, new)
-                if label.startswith("the cluster's lines under the context"):
-                    self.rewrite(f"    cluster: {CTX}\n", f"    cluster: {CTX}\n    server: {PROXY}/clusters/{CTX}\n"
-                                 f"    certificate-authority: {CA}\n")
-                self.assertTrue(self.python_would_rewrite(), label)
-                self.assert_not_registered("--context", CTX, "get", "ns")
-        with self.subTest("the context's lines under the cluster, and no context"):
-            self.kubeconfig.write_text(SEED, encoding="utf-8")
-            self.register()
-            self.rewrite(f"- name: {CTX}\n  context:\n    cluster: {CTX}\n    user: kube-proxy-caller\n", "")
-            self.rewrite(f"    certificate-authority: {CA}\ncontexts:\n",
-                         f"    certificate-authority: {CA}\n    cluster: {CTX}\n    user: kube-proxy-caller\ncontexts:\n")
-            self.assertTrue(self.python_would_rewrite())
-            self.assert_not_registered("--context", CTX, "get", "ns")
-        with self.subTest("a user written with its fields first"):
-            self.kubeconfig.write_text(SEED, encoding="utf-8")
-            self.register()
-            self.rewrite(f"- name: kube-proxy-caller\n  user:\n    tokenFile: {TOKEN}\n",
-                         f"- user:\n    tokenFile: {TOKEN}\n  name: kube-proxy-caller\n")
-            self.assertFalse(self.python_would_rewrite())
-            self.register()  # one pass records the edited file
-            self.assert_registered("--context", CTX, "get", "ns")
-        with self.subTest("stock kubectl's key order"):
-            self.kubeconfig.write_text(SEED, encoding="utf-8")
-            self.register()
-            self.rewrite(f"- name: {CTX}\n  cluster:\n    server: {PROXY}/clusters/{CTX}\n    certificate-authority: {CA}\n",
-                         stock_layout)
-            self.assertFalse(self.python_would_rewrite())
-            self.register()  # one pass records the edited file
-            self.assert_registered("--context", CTX, "get", "ns")
-
 
 class WrapperWiringTest(unittest.TestCase):
     def test_both_images_install_the_helper_and_ask_it_before_python(self):

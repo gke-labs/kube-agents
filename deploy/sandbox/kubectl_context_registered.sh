@@ -17,6 +17,13 @@ readonly CONTEXT_FLAG="--context"
 readonly KUBECONFIG_FLAG="--kubeconfig"
 readonly END_OF_FLAGS="--"
 readonly NOT_REGISTERED=1
+# A GKE context is gke_<project>_<location>_<cluster>; kubectl's default kubeconfig is under HOME.
+readonly CONTEXT_PREFIX="gke_"
+readonly CONTEXT_SEPARATOR="_"
+readonly DEFAULT_KUBECONFIG="/.kube/config"
+# What the client hashes for the environment: the three values joined by a newline
+# (REGISTERED_MARKER_ENV_SEPARATOR in credential_proxy_client.py).
+readonly ENV_DIGEST_FORMAT='%s\n%s\n%s'
 # Beside a kubeconfig `<dir>/<name>`, Python's record is `<dir>/.<name>.contexts-registered`
 # (REGISTERED_MARKER_NAME in credential_proxy_client.py).
 readonly MARKER_SUFFIX=".contexts-registered"
@@ -43,14 +50,16 @@ for argument in "$@"; do
 done
 
 # gke_<project>_<location>_<cluster>, each part [a-z0-9][a-z0-9-]*, as parse_gke_context requires.
+# A trailing separator is refused here: the split below would drop the empty last part.
 case "${context}" in
-gke_*_*_*) ;;
+*"${CONTEXT_SEPARATOR}") exit "${NOT_REGISTERED}" ;;
+"${CONTEXT_PREFIX}"*) ;;
 *) exit "${NOT_REGISTERED}" ;;
 esac
-parts="${context#gke_}"
+parts="${context#"${CONTEXT_PREFIX}"}"
 old_ifs="${IFS}"
 set -f # a part must not be glob-expanded against the working directory
-IFS=_
+IFS="${CONTEXT_SEPARATOR}"
 # shellcheck disable=SC2086 # splitting on `_` is the point
 set -- ${parts}
 IFS="${old_ifs}"
@@ -66,7 +75,7 @@ done
 kubeconfig="${KUBECONFIG:-}"
 case "${kubeconfig}" in
 *:*) exit "${NOT_REGISTERED}" ;;
-"") kubeconfig="${HOME:-}/.kube/config" ;;
+"") kubeconfig="${HOME:-}${DEFAULT_KUBECONFIG}" ;;
 esac
 [ -f "${kubeconfig}" ] && [ ! -L "${kubeconfig}" ] || exit "${NOT_REGISTERED}"
 
@@ -83,5 +92,6 @@ kubeconfig_name="$(basename -- "${kubeconfig}")"
 marker="${kubeconfig_dir}/.${kubeconfig_name}${MARKER_SUFFIX}"
 [ -f "${marker}" ] && [ ! -L "${marker}" ] || exit "${NOT_REGISTERED}"
 file_digest="$(sha256sum <"${kubeconfig}")" || exit "${NOT_REGISTERED}"
-env_digest="$(printf '%s\n%s\n%s' "${proxy_url}" "${ca_file}" "${token_file}" | sha256sum)" || exit "${NOT_REGISTERED}"
+# shellcheck disable=SC2059 # the format is a constant, named above
+env_digest="$(printf "${ENV_DIGEST_FORMAT}" "${proxy_url}" "${ca_file}" "${token_file}" | sha256sum)" || exit "${NOT_REGISTERED}"
 grep -Fqx -- "${context} ${file_digest%% *} ${env_digest%% *}" "${marker}"

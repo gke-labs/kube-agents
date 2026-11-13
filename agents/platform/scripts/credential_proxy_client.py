@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import http.client
 import json
 import math
@@ -24,7 +25,7 @@ from pathlib import Path
 # on the caller's clock (#5578). `argparse` is imported in `parse_args`, and
 # `ClusterTarget` is a plain class, not a dataclass: `dataclasses` pulls in
 # `inspect`. A call through the `gcloud` or `kubectl` name uses neither.
-# (`tempfile` stays: `urllib.request` imports it anyway.)
+# (`hashlib` and `tempfile` stay: `urllib.request` imports them anyway.)
 
 
 # What this client may be invoked *as*, which is a different list from what the
@@ -1168,8 +1169,6 @@ def _record_registered_context(
     """Record that `content`, the bytes of `path` the merge checked or wrote, holds `context`'s current
     entries. Called under the merge's lock; the digest is of those bytes, never of a later read, so a
     writer that does not take the lock can only make the line stale, never vouch for unchecked bytes."""
-    import hashlib  # here, not at the top: the shim's brokered start pays for every top-level import
-
     marker = path.with_name(REGISTERED_MARKER_NAME.format(name=path.name))
     file_digest = hashlib.sha256(content).hexdigest()
     env_digest = hashlib.sha256(
