@@ -114,14 +114,27 @@ class TestParse(unittest.TestCase):
         self.assertIn("automerge.deny[0]", rules.error)
         self.assertFalse(ar.decide(rules, "no-pdb", "dev").allowed)
 
-    def test_unknown_fix_type_warns_and_never_matches(self):
+    def test_unknown_fix_type_refuses_the_file(self):
         rules = ar.parse("version: 1\nautomerge: {allow: [{fix: no-pbd, environments: [dev]}]}\n")
-        self.assertEqual(rules.status, ar.LOADED)
-        self.assertEqual(len(rules.warnings), 1)
-        self.assertIn("no-pbd", rules.warnings[0])
+        self.assertEqual(rules.status, ar.INVALID)
+        self.assertIn("no-pbd", rules.error)
         self.assertFalse(ar.decide(rules, "no-pdb", "dev").allowed)
-        # Asked about the unknown type itself, the rule still does not match.
         self.assertFalse(ar.decide(rules, "no-pbd", "dev").allowed)
+
+    def test_misspelt_deny_fix_does_not_leave_allow_in_force(self):
+        text = (
+            "version: 1\nautomerge:\n  allow:\n    - fix: no-pdb\n      environments: [dev, prod]\n"
+            "  deny:\n    - fix: no-pbd\n      environments: [prod]\n"
+        )
+        rules = ar.parse(text)
+        self.assertEqual(rules.status, ar.INVALID)
+        self.assertIn("automerge.deny[0].fix", rules.error)
+        self.assertFalse(ar.decide(rules, "no-pdb", "prod").allowed)
+        self.assertFalse(ar.decide(rules, "no-pdb", "dev").allowed)
+
+    def test_a_wildcard_deny_still_parses(self):
+        rules = ar.parse("version: 1\nautomerge: {allow: [{fix: no-pdb, environments: [dev]}], deny: [{fix: '*', environments: [prod]}]}\n")
+        self.assertEqual(rules.status, ar.LOADED)
 
 
 class TestDecide(unittest.TestCase):

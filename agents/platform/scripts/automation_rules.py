@@ -161,8 +161,12 @@ def _parse_rule(raw: Any, where: str, *, wildcard_ok: bool, warnings: list[str])
             raise RulesError(
                 f"{where}.environments[{index}]: expected an environment label value such as `dev`{hint}"
             )
+    # Refused, not warned: a misspelt deny rule kept but never matching would
+    # leave the allow rules beside it in force. A file written for a newer
+    # kube-agents is refused by an older one, and a refused file allows nothing.
     if fix != WILDCARD and fix not in KNOWN_FIX_TYPES:
-        warnings.append(f"{where}.fix: `{fix}` is not a fix kube-agents opens; the rule never matches")
+        known = ", ".join(f"`{name}`" for name in sorted(KNOWN_FIX_TYPES))
+        raise RulesError(f"{where}.fix: `{fix}` is not a fix kube-agents opens (known: {known})")
     return Rule(fix=fix, environments=tuple(envs))
 
 
@@ -290,8 +294,8 @@ def decide(rules: Rules, fix_type: str, environment: str) -> Decision:
         if rule.matches(fix_type, environment):
             return Decision(False, f"denied by automerge.deny[{index}]")
     for index, rule in enumerate(rules.allow):
-        # An allow rule for a fix type kube-agents does not know never matches,
-        # even when asked about that type: the parser's warning says so.
+        # The parser refuses a rule naming a fix type kube-agents does not know;
+        # this guard keeps a hand-built Rules from matching one either.
         if rule.fix in KNOWN_FIX_TYPES and rule.matches(fix_type, environment):
             return Decision(True, f"allowed by automerge.allow[{index}]")
     return Decision(False, f"no allow rule names {fix_type} in {environment}")

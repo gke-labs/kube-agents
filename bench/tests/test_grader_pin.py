@@ -60,8 +60,12 @@ def _lift(pattern: str, flags: int = re.MULTILINE | re.DOTALL) -> str:
     return match.group(0)
 
 
+GRADER_CONSTANTS = ("EVAL_GRADER_TREE", "EVAL_GRADER_CASES_DIR", "EVAL_FLEET_CATALOG", "EVAL_GRADER_VENV_DIR")
+
+
 def _constants() -> str:
-    return _lift(r'^readonly EVAL_GRADER_TREE=.*?\nreadonly EVAL_FLEET_CATALOG=[^\n]*')
+    # Each by name, whatever order the script declares them in.
+    return "\n".join(_lift(rf"^readonly {name}=[^\n]*") for name in GRADER_CONSTANTS)
 
 
 def _function(name: str) -> str:
@@ -127,7 +131,7 @@ def test_the_grader_comes_from_the_base_and_the_cases_from_the_change(change, tm
     repo, base = change
     out = tmp_path / "out"
     out.mkdir()
-    proc = _bash("\n".join([_constants(), _function("pin_grader"), f'pin_grader "{repo}" "{base}" "{out}"']))
+    proc = _bash("\n".join([_constants(), _function("drop_stray_grader_venv"), _function("pin_grader"), f'pin_grader "{repo}" "{base}" "{out}"']))
     assert proc.returncode == 0, proc.stderr
     bench = out / "bench"
     # The change's grader edit is ignored.
@@ -142,7 +146,7 @@ def test_a_sha_that_is_not_a_commit_fails_the_extraction(change, tmp_path):
     repo, _ = change
     out = tmp_path / "out"
     out.mkdir()
-    proc = _bash("\n".join([_constants(), _function("pin_grader"), f'pin_grader "{repo}" "{"0" * 40}" "{out}"']))
+    proc = _bash("\n".join([_constants(), _function("drop_stray_grader_venv"), _function("pin_grader"), f'pin_grader "{repo}" "{"0" * 40}" "{out}"']))
     assert proc.returncode != 0
 
 
