@@ -1015,6 +1015,11 @@ def register_plugin(ctx: Any) -> None:
         # TEAMS_ALLOWED_USERS and every sender gets the pairing prompt.
         allowed_users_env="TEAMS_ALLOWED_USERS",
         allow_all_env="TEAMS_ALLOW_ALL_USERS",
+        # The cron scheduler addresses a platform's home channel only through
+        # this entry field; without it `deliver: teams` is not a valid target
+        # and no proactive report can reach Teams (the operator already
+        # renders TEAMS_HOME_CHANNEL).
+        cron_deliver_env_var="TEAMS_HOME_CHANNEL",
     )
 
 
@@ -1076,6 +1081,8 @@ def install() -> None:
                     entry_fields["allowed_users_env"] = "TEAMS_ALLOWED_USERS"
                 if "allow_all_env" in entry_dataclass_fields:
                     entry_fields["allow_all_env"] = "TEAMS_ALLOW_ALL_USERS"
+                if "cron_deliver_env_var" in entry_dataclass_fields:
+                    entry_fields["cron_deliver_env_var"] = "TEAMS_HOME_CHANNEL"
                 entry = platform_entry_cls(**entry_fields)
                 singleton.register(entry)
         except Exception:

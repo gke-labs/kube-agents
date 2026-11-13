@@ -476,6 +476,9 @@ class TestTeamsRelayPatch(unittest.IsolatedAsyncioTestCase):
         # while they were missing (live test, 2026-11-12).
         self.assertEqual(registered[0]["allowed_users_env"], "TEAMS_ALLOWED_USERS")
         self.assertEqual(registered[0]["allow_all_env"], "TEAMS_ALLOW_ALL_USERS")
+        # The cron scheduler reads the home channel through this field; a real
+        # tenant got no proactive reports while it was missing (2026-11-12).
+        self.assertEqual(registered[0]["cron_deliver_env_var"], "TEAMS_HOME_CHANNEL")
 
     async def test_teams_relay_adapter_lifecycle_and_message_processing(self):
         from gateway.platform_registry import PlatformRegistry, platform_registry
