@@ -52,8 +52,8 @@ false`, with the same effect as the Slack field. The chart carries the value.
   them. Unchanged.
 - The Slack follow-ups #3374 (file a 👎 as an issue), #3447 and #3481. They stay Slack issues and
   would reach Google Chat through the shared recorder when they land.
-- Running Slack and Google Chat in one gateway (#3094). The gateway holds one chat backend under
-  `next`, so the off switch stays one global flag with two names.
+- A per-platform off switch. Slack and Google Chat now run in one gateway under `next` (#3094),
+  and the off switch stays one global flag with two names: either turns feedback off on both.
 - Ratings on home-channel posts (alerts, scheduled reports). The notifier marks only the card
   report that answers an ask in its conversation; home posts are not marked on Slack either.
 

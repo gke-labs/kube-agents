@@ -8116,7 +8116,7 @@ class NextHomeChannelUnsetWiringTest(unittest.TestCase):
 
 class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
     """#2812 on install.sh. A run whose mode is next (--mode=next, or
-    PLATFORM_AGENT_MODE=next in install.env), with Slack on and Chat off,
+    PLATFORM_AGENT_MODE=next in install.env), with Slack on, Chat on or off,
     hands Slack to the A2A gateway. It refuses an email in the allowlist, a
     home channel that is not a channel id, or a list of bot tokens.
 

@@ -3722,7 +3722,7 @@ class ScopeCheckWiringTest(unittest.TestCase):
 
 class FullArmRefusesNextSlackGatewaySettingsTest(unittest.TestCase):
     """#2812 on upgrade.sh. The full arm applies PLATFORM_AGENT_MODE from
-    install.env. With next, Slack on and Chat off, Slack moves to the A2A
+    install.env. With next and Slack on, Chat on or off, Slack moves to the A2A
     gateway, so the arm refuses an email in SLACK_ALLOWED_USERS, a
     SLACK_HOME_CHANNEL that is not a channel id, or a list of bot tokens.
     The refusal sits beside refuse_full_apply_dropping_next and before the

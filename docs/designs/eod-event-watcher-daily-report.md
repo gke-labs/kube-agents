@@ -61,7 +61,7 @@ CR — `spec.integration.googleChat.homeChannel`, which the operator renders int
 field is the only way. The operator renders the Google Chat field into the gateway as
 `A2A_GCHAT_HOME_CHANNEL` rather than into the agent, so there the check below reads `<unset>`; read
 `spec.integration.googleChat.homeChannel` on the `PlatformAgent` instead. A `next` install whose
-only chat platform is the gateway's and has no home channel sends anyway: the gateway refuses the
+gateway holds a chat platform with no home channel sends anyway: the gateway refuses the
 recap, keeps it, and names it in the digest it posts once a home channel is set; the recorded error
 is the relay's `composed but not delivered to <platform>`, as above. Alerts on such an install are
 sent too, refused and kept, and the recap lists each as not delivered with the keep as the reason

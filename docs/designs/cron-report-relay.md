@@ -650,9 +650,9 @@ An install with no chat route gets no send at all: when the managed scope turns
 every platform off and nothing routes one through the gateway — an install with
 neither Google Chat nor Slack, or one whose home channel is malformed, which routes
 nothing — the relay answers 502 without posting, and the detail says that no route
-exists. A `next` install whose only chat platform is held by the gateway with no home
-channel is routed anyway: the operator renders `A2A_NOTIFY_PLATFORM` for it (a
-comma-separated list of platform names, one today), the relay
+exists. A `next` install whose gateway holds a chat platform with no home channel is
+routed anyway: the operator names that platform in `A2A_NOTIFY_PLATFORM` (a
+comma-separated list of platform names, every one the gateway routes), the relay
 sends, and the gateway refuses the post and keeps it for the digest it posts once a
 home channel is set (the gateway design, "Proactive posts"). The 502's detail is then
 the relay's `composed but not delivered to <platform>`. The gateway's refusal, which

@@ -161,10 +161,9 @@ def platform_list(raw: str) -> list[str]:
 def routed_platforms() -> list[str]:
     """The platforms whose posts go through the gateway, or [] when none does.
 
-    The rendered env names them when the CR sets the home channel, and when the
-    gateway's backend is the install's only chat platform with no home channel
-    set: the gateway then refuses each post and keeps it for the digest it
-    posts once one is. A learned channel is never rendered into the pod, so
+    The rendered env names every platform whose route the gateway arms, with
+    the CR's home channel or without one. Without one the gateway refuses
+    each post and keeps it for the digest it posts once one is set. A learned channel is never rendered into the pod, so
     with the env empty the answer is derived: the gateway holds Slack
     (``A2A_NOTIFY_CONVERSATIONS``) and the projected file names a home channel.
     A non-empty env wins over the file.

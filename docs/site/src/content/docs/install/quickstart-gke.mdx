@@ -146,7 +146,7 @@ Only run the real install after I say yes.
 
    `Slack relay enabled workspaces=1` (one per bot token) means the bot is connected. `Slack bot token authentication failed` names the Slack error for a token Slack refused, and `Slack relay initialization failed; retrying` repeats every 30 seconds until one token authenticates. The pattern leaves out `Slack relay operation failed`, which is one Slack call the agent made failing later, not the connection.
 
-   A first install runs `spec.mode: next` unless you passed `--mode=today` or mirrored its third-party images. A `next` install runs more pods and reports more conditions, and with Slack as its only chat platform its Slack connects from a different pod: check it with [Verify a `spec.mode: next` install](#verify-a-specmode-next-install) as well.
+   A first install runs `spec.mode: next` unless you passed `--mode=today` or mirrored its third-party images. A `next` install runs more pods and reports more conditions, and with Slack enabled its Slack connects from a different pod: check it with [Verify a `spec.mode: next` install](#verify-a-specmode-next-install) as well.
 
 5. **Talk to the agent.**
 
