@@ -839,8 +839,10 @@ func (n *Notifier) post(job notifyJob) {
 	// A home post the agent made on its own carries the rating controls on
 	// its last chunk (postHomeText), as a rated answer's text does.
 	feedback := ""
-	if job.req.Conversation == "" {
-		feedback = n.homeFeedback(job.req.Update, job.req.Thread)
+	// Only a post that opens a thread: a keyed edit that fell through to
+	// chunks here is a reply under its alert, which keeps the controls.
+	if job.req.Conversation == "" && job.req.Thread == "" {
+		feedback = n.homeFeedback(job.req.Update, "")
 	}
 	chunks := chatChunks(job.req.Text, discordChunk)
 	for i, chunk := range chunks {

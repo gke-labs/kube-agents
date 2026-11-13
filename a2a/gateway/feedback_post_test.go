@@ -104,6 +104,23 @@ func TestNotifyHomeThreadReplyIsNotRated(t *testing.T) {
 	}
 }
 
+// A keyed edit of a rated alert too long for one message falls through to
+// chunked replies in its thread, which carry no second set of controls.
+func TestNotifyLongKeyedEditOfARatedAlertAddsNoControls(t *testing.T) {
+	n, p, _ := newRatedHomeNotifier(t)
+	alert := serveJSON(t, n, lib.NotifyRequest{Text: "🚨 seeded-b: CrashLoopBackOff", Update: "alert-s1"})
+	if alert.Error != "" {
+		t.Fatalf("alert = %+v", alert)
+	}
+	long := strings.Repeat("a line of the triage report\n", discordChunk/20)
+	if got := serveJSON(t, n, lib.NotifyRequest{Text: long, Update: "alert-s1", Thread: alert.ThreadID}); got.Error != "" {
+		t.Fatalf("long edit = %+v", got)
+	}
+	if len(p.posted) != 1 {
+		t.Fatalf("rated posts = %q, want only the alert", p.posted)
+	}
+}
+
 // A home post with no update key is a report.
 func TestNotifyHomeUnkeyedPostIsRatedAsAReport(t *testing.T) {
 	n, p, _ := newRatedHomeNotifier(t)
