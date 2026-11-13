@@ -211,6 +211,58 @@ class HomePostPlatformsTest(unittest.TestCase):
         self.assertEqual(kanban_chat_notify.routed_platforms(), ["google_chat", "slack"])
 
 
+class RoutedPlatformsCopiesAgreeTest(unittest.TestCase):
+    """The patch cannot import chat_notify, so it carries its own
+    routed_platforms; over every env and projected-file combination the two
+    copies give the same list."""
+
+    PLATFORM_VALUES = (None, "google_chat", "slack", "google_chat,slack")
+    CONVERSATIONS_VALUES = (None, "google_chat", "slack", "google_chat,slack")
+    FILE_VALUES = (None, "", "C0BUCG2F43E")
+
+    def setUp(self):
+        scripts = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "agents", "platform", "scripts")
+        sys.path.insert(0, os.path.abspath(scripts))
+        try:
+            import chat_notify
+        finally:
+            sys.path.pop(0)
+        self.chat_notify = chat_notify
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", self.dir], check=False))
+        for module in (kanban_chat_notify, chat_notify):
+            directory = mock.patch.object(module, "HOME_FILE_DIR", self.dir)
+            directory.start()
+            self.addCleanup(directory.stop)
+
+    def _set_file(self, value):
+        path = os.path.join(self.dir, kanban_chat_notify.HOME_FILE_KEY)
+        if value is None:
+            if os.path.exists(path):
+                os.remove(path)
+            return
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(value)
+
+    def test_the_two_copies_agree_on_every_cell(self):
+        for platform in self.PLATFORM_VALUES:
+            for conversations in self.CONVERSATIONS_VALUES:
+                for file_value in self.FILE_VALUES:
+                    env = {
+                        kanban_chat_notify.NOTIFY_PLATFORM_ENV: platform,
+                        kanban_chat_notify.NOTIFY_CONVERSATIONS_ENV: conversations,
+                    }
+                    with self.subTest(platform=platform, conversations=conversations, file=file_value):
+                        self._set_file(file_value)
+                        with mock.patch.dict(os.environ, {}):
+                            for name, value in env.items():
+                                os.environ.pop(name, None)
+                                if value is not None:
+                                    os.environ[name] = value
+                            self.assertEqual(kanban_chat_notify.routed_platforms(),
+                                             self.chat_notify.routed_platforms())
+
+
 class _Runner:
     config = types.SimpleNamespace(multiplex_profiles=False)
 
