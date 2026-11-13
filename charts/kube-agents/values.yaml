@@ -561,7 +561,7 @@ litellm:
     # copies: a chart pinned to a version the mirror was never populated with
     # is an ImagePullBackOff. This pin sat a release behind the kustomize base
     # for exactly that reason.
-    tag: v1.106.0
+    tag: v1.108.6
     pullPolicy: IfNotPresent
   replicaCount: 2
   # Rollout strategy — the canonical home for this argument. The chart template
@@ -804,7 +804,7 @@ hindsight:
     # tag, because that is what mirror-images pushes.
     image:
       repository: ghcr.io/vectorize-io/hindsight-api
-      tag: "0.10.2@sha256:1ba631f950a04460feff6b1e212bad3cdf127b0cfb3d765bdcba12f512481d7b"
+      tag: "0.10.3@sha256:f80f304db313cbc8775acd601fda7d094f5854ebf9bc252d8134eb9276d56b40"
       pullPolicy: IfNotPresent
     # Rollout strategy for the hindsight-api Deployment.
     #
