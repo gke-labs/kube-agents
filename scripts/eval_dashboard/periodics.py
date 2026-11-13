@@ -241,7 +241,7 @@ CERTIFICATION_STALE_AFTER = timedelta(days=8)
 REPLAY_LANE_JOB = "ci-kube-agents-eval-replay-lane"
 REPLAY_LANE_STALE_AFTER = timedelta(hours=36)
 RECONCILE_POSTSUBMIT_JOB = "post-kube-agents-fleet-reconcile"
-# A watched job whose failed build is retired by another job's later pass:
+# A watched job whose failed build is retired by another job's later run:
 # the postsubmit has no window, and the daily that followed it did its work.
 SUPERSEDED_BY = {RECONCILE_POSTSUBMIT_JOB: RECONCILE_DAILY_JOB}
 SUPERSEDED_RECOVERY = "recovery"
@@ -1146,11 +1146,13 @@ def _whole_pass(artifact: dict) -> bool:
     return artifact.get(REPORT_KEY_MODE) == REPORT_MODE_ALL and isinstance(visited, int) and isinstance(mapped, int) and visited == mapped
 
 
-def _reached(artifact, projects: list[str]) -> bool:
+def _reached(artifact, projects: list[str], applied: bool = False) -> bool:
     """True when the report holds every named project with an outcome that
-    means it was held and planned (not busy, not not_reached). A project a
-    whole pass does not list at all has left the pool (a stray registration
-    removed, a mapping row retired), and counts as dealt with."""
+    means it was held and planned (not busy, not not_reached); with
+    `applied`, one that is not a failure either, which is what a run that
+    failed elsewhere has to show. A project a whole pass does not list at
+    all has left the pool (a stray registration removed, a mapping row
+    retired), and counts as dealt with."""
     outcomes = _outcomes(artifact)
     if outcomes is None:
         return False
@@ -1163,20 +1165,24 @@ def _reached(artifact, projects: list[str]) -> bool:
             continue
         if not isinstance(entry, dict) or entry.get(REPORT_KEY_OUTCOME) in RECONCILE_UNREACHED_OUTCOMES:
             return False
+        if applied and entry.get(REPORT_KEY_OUTCOME) in RECONCILE_NAMED_OUTCOMES:
+            return False
     return True
 
 
 def _supersession(job: str, readings: dict[str, dict]) -> str | None:
     """How the superseding job's latest build relates to this job's failed
-    one: SUPERSEDED_RECOVERY when it passed later having reached every
-    project the failed build named (a build naming none needs a whole pass),
-    at the same fleet tree (a failed build's pre-input-hash git id is not compared), SUPERSEDED_SILENCE
-    when it failed later on a build that owes a hand step (its own note is
-    the current story; nothing recovered), None otherwise. A later pass that
-    never reached them (busy, not reached), applied another tree of the same
-    kind, or carries the git id against a hashed failure, is None; so is a
-    later failure the next run retries, which writes no note of its own
-    (unless a project persists, and then both stories stand)."""
+    one: SUPERSEDED_RECOVERY when a later run reached every project the
+    failed build named at the same fleet tree (a failed build's
+    pre-input-hash git id is not compared): a pass that held and planned
+    them, or a run that failed elsewhere and applied them (a build naming
+    none needs a whole pass that passed); SUPERSEDED_SILENCE when it failed
+    later on a build that owes a hand step and did not do that (its own note
+    is the current story); None otherwise. A later run that never reached
+    them (busy, not reached), applied another tree of the same kind, or
+    carries the git id against a hashed failure, is no recovery; a later
+    failure the next run retries writes no note of its own (unless a project
+    persists, and then both stories stand) and silences nothing."""
     other = SUPERSEDED_BY.get(job)
     if not other:
         return None
@@ -1186,16 +1192,18 @@ def _supersession(job: str, readings: dict[str, dict]) -> str | None:
     when, later = parse_iso(mine.get(KEY_FINISHED_AT)), parse_iso(theirs.get(KEY_FINISHED_AT))
     if when is None or later is None or later <= when:
         return None
-    if not theirs.get(KEY_PASSED):
-        return SUPERSEDED_SILENCE if actionable_failure(theirs.get(KEY_ARTIFACT)) else None
+    passed = bool(theirs.get(KEY_PASSED))
+    # What a later failed run is when it did not recover this one: its own
+    # note when it owes a hand step, nothing otherwise.
+    otherwise = None if passed else (SUPERSEDED_SILENCE if actionable_failure(theirs.get(KEY_ARTIFACT)) else None)
     if _outcomes(mine.get(KEY_ARTIFACT)) is None:
         # A failed build whose report is absent or cut short names no project
         # because nothing can be read, not because nothing failed: a later
         # pass cannot be shown to have reached what it does not name.
-        return None
+        return otherwise
     tree, later_tree = _fleet_tree(mine.get(KEY_ARTIFACT)), _fleet_tree(theirs.get(KEY_ARTIFACT))
     if not tree or not later_tree:
-        return None
+        return otherwise
     legacy = bool(_LEGACY_FLEET_TREE.fullmatch(tree) and _INPUT_HASH_FLEET_TREE.fullmatch(later_tree))
     if not legacy and tree != later_tree:
         # A daily that reached the project at another tree (one it started
@@ -1207,14 +1215,14 @@ def _supersession(job: str, readings: dict[str, dict]) -> str | None:
         # out main after that build's merge, so the reach check decides
         # alone. The other way round (an old-kind daily, a new-kind failure)
         # is a daily from before the merge, and proves nothing.
-        return None
+        return otherwise
     named = _named_failures(mine.get(KEY_ARTIFACT))
     if not named:
         # Failed above the projects (busy for its whole budget, a Boskos or
         # mapping fault): nothing was reached, so only a whole pass at this
         # tree has done what it did not.
-        return SUPERSEDED_RECOVERY if _whole_pass(theirs.get(KEY_ARTIFACT) or {}) else None
-    return SUPERSEDED_RECOVERY if _reached(theirs.get(KEY_ARTIFACT), named) else None
+        return SUPERSEDED_RECOVERY if passed and _whole_pass(theirs.get(KEY_ARTIFACT) or {}) else otherwise
+    return SUPERSEDED_RECOVERY if _reached(theirs.get(KEY_ARTIFACT), named, applied=not passed) else otherwise
 
 
 def _fleet_tree(artifact) -> str | None:
@@ -1226,15 +1234,16 @@ def _fleet_tree(artifact) -> str | None:
 def superseded_jobs(readings: dict[str, dict], carried: dict | None = None) -> dict[str, dict]:
     """`{job: {build, recovery[, by]}}` for the watched jobs whose latest
     failed build a later build of their superseding job has dealt with; `by`
-    is the run a recovery was decided on (build, finished_at, summary), what
-    the clear cites. Carried in health.json and handed back as `carried`
+    is the run a recovery was decided on (build, finished_at, summary,
+    passed), what the clear cites. Carried in health.json and handed back as `carried`
     next tick, so the decision sticks for as long as the failed build is the
     job's latest: a tick blind to either job, or a later failing daily, does
     not re-open a retired failure as news. A silence becomes a recovery once
-    a later pass reaches the projects, and ends when a later pass does not
-    reach them, or a later failing daily owes no hand step and so writes no
-    note to stand in (the failure is back in the notes, not as news); a new
-    failed build is decided afresh."""
+    a later run reaches the projects (a pass, or a run that failed elsewhere
+    and applied them), and ends when a later pass does not reach them, or a
+    later failing daily neither reaches them nor owes a hand step, and so
+    writes no note to stand in (the failure is back in the notes, not as
+    news); a new failed build is decided afresh."""
     carried = carried if isinstance(carried, dict) else {}
     latest = runs(readings)
     out = {}
@@ -1266,7 +1275,7 @@ def superseded_jobs(readings: dict[str, dict], carried: dict | None = None) -> d
         entry = {SUPERSEDED_KEY_BUILD: build, SUPERSEDED_KEY_RECOVERY: bool((before or {}).get(SUPERSEDED_KEY_RECOVERY)) or ground == SUPERSEDED_RECOVERY}
         if ground == SUPERSEDED_RECOVERY:
             run = latest.get(other) or {}
-            entry[SUPERSEDED_KEY_BY] = {key: run.get(key) for key in (KEY_BUILD, KEY_FINISHED_AT, KEY_SUMMARY)}
+            entry[SUPERSEDED_KEY_BY] = {key: run.get(key) for key in (KEY_BUILD, KEY_FINISHED_AT, KEY_SUMMARY, KEY_PASSED)}
         elif isinstance((before or {}).get(SUPERSEDED_KEY_BY), dict):
             entry[SUPERSEDED_KEY_BY] = before[SUPERSEDED_KEY_BY]
         out[job] = entry

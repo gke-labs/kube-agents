@@ -619,15 +619,17 @@ class AssessTest(unittest.TestCase):
 
     def test_a_failed_postsubmit_is_retired_once_a_later_daily_has_dealt_with_its_projects(self):
         # The postsubmit has no window to retire it. A later daily that
-        # reached the projects it failed on is the recovery; one that passed
-        # without reaching them is not; one that failed is the current story
-        # about the fleet, so the older failure is not news beside it.
+        # reached the projects it failed on is the recovery (a pass, or a run
+        # that failed elsewhere and applied them); one that passed without
+        # reaching them is not; one that failed on a build that owes a hand
+        # step, without reaching them, is the current story about the fleet,
+        # so the older failure is not news beside it.
         failed = self.reading(POST, NOW - timedelta(days=2), passed=False, artifact={"fleet_tree": "t1", "summary": {"refused": 1}, "outcomes": {"kube-agents-evals-9": {"outcome": "failed", "detail": "lock"}}})
         reached = self.reading(DAILY, NOW - timedelta(hours=1), artifact={"fleet_tree": "t1", "summary": {"converged": 35}, "outcomes": {"kube-agents-evals-9": {"outcome": "converged", "detail": ""}}})
         decided = periodics.superseded_jobs({POST.job: failed, DAILY.job: reached})
         # The run the recovery was decided on rides with it: what the clear
         # cites, whether or not the tick that sends it read the daily.
-        by = {key: periodics.runs({DAILY.job: reached})[DAILY.job][key] for key in ("build", "finished_at", "summary")}
+        by = {key: periodics.runs({DAILY.job: reached})[DAILY.job][key] for key in ("build", "finished_at", "summary", "passed")}
         self.assertEqual(decided, {POST.job: {"build": "100", "recovery": True, "by": by}})
         self.assertEqual(by["build"], "100")
         self.assertEqual(periodics.assess({POST.job: failed, DAILY.job: reached}, NOW, {}, superseded=decided), {})
@@ -677,6 +679,23 @@ class AssessTest(unittest.TestCase):
         refused = self.reading(POST, NOW - timedelta(days=2), passed=False, artifact={"fleet_tree": "t1", "summary": {"refused": 1}, "outcomes": {"kube-agents-evals-9": {"outcome": "refused", "detail": "delete x"}}})
         readings = {POST.job: refused, DAILY.job: daily_retry}
         self.assertEqual(sorted(periodics.assess(readings, NOW, {}, streaks=periodics.streaks(readings, None), superseded=periodics.superseded_jobs(readings))), [POST.job])
+        # A daily that failed elsewhere but reached and applied the project at
+        # the same tree is the recovery, cited like a pass; one in which the
+        # project failed again, or was not held, is not, whatever else it did.
+        applied_elsewhere_failed = self.reading(DAILY, NOW - timedelta(hours=1), passed=False, build="200", artifact={"fleet_tree": "t1", "summary": {"applied": 1, "failed": 1}, "outcomes": {"kube-agents-evals-9": {"outcome": "applied", "detail": "2 to add"}, "kube-agents-evals-2": {"outcome": "failed", "detail": "ZONE_RESOURCE_POOL_EXHAUSTED"}}})
+        decided = periodics.superseded_jobs({POST.job: refused, DAILY.job: applied_elsewhere_failed})
+        self.assertEqual((decided[POST.job]["recovery"], decided[POST.job]["by"]["build"], decided[POST.job]["by"]["passed"]), (True, "200", False))
+        self.assertEqual(periodics.assess({POST.job: refused, DAILY.job: applied_elsewhere_failed}, NOW, {}, streaks=periodics.streaks({POST.job: refused, DAILY.job: applied_elsewhere_failed}, None), superseded=decided), {})
+        failed_again = self.reading(DAILY, NOW - timedelta(hours=1), passed=False, artifact={"fleet_tree": "t1", "summary": {"failed": 1}, "outcomes": {"kube-agents-evals-9": {"outcome": "failed", "detail": "ZONE_RESOURCE_POOL_EXHAUSTED"}}})
+        self.assertEqual(periodics.superseded_jobs({POST.job: refused, DAILY.job: failed_again}), {})
+        other_tree_failed = self.reading(DAILY, NOW - timedelta(hours=1), passed=False, artifact={"fleet_tree": "t0", "summary": {"applied": 1, "failed": 1}, "outcomes": {"kube-agents-evals-9": {"outcome": "applied", "detail": ""}, "kube-agents-evals-2": {"outcome": "failed", "detail": "x"}}})
+        self.assertEqual(periodics.superseded_jobs({POST.job: refused, DAILY.job: other_tree_failed}), {})
+        # A failed run that applied the project while owing a hand step elsewhere recovers rather than silences.
+        locked_elsewhere = self.reading(DAILY, NOW - timedelta(hours=1), passed=False, artifact={"fleet_tree": "t1", "outcomes": {"kube-agents-evals-9": {"outcome": "applied", "detail": ""}, "kube-agents-evals-2": {"outcome": "failed", "detail": "Error acquiring the state lock: ID 1"}}})
+        self.assertEqual(periodics.superseded_jobs({POST.job: refused, DAILY.job: locked_elsewhere})[POST.job]["recovery"], True)
+        # A failed build naming no project still needs a whole pass that passed.
+        whole_failed = self.reading(DAILY, NOW - timedelta(hours=1), passed=False, artifact={"fleet_tree": "t1", "mode": "all", "visited": 2, "mapped": 2, "outcomes": {"kube-agents-evals-9": {"outcome": "applied", "detail": ""}, "kube-agents-evals-2": {"outcome": "failed", "detail": "x"}}})
+        self.assertEqual(periodics.superseded_jobs({POST.job: nameless, DAILY.job: whole_failed}), {})
         # A silence carried from a daily that was news ends on the next daily
         # that is not: the carried map is not kept over a retry-shaped failure.
         silenced = periodics.superseded_jobs({POST.job: refused, DAILY.job: daily_failed})

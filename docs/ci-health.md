@@ -583,8 +583,9 @@ read build and carried across ticks; a failed build that did not reach a
 project (busy) keeps its count, and a clean build clears every count. A tick
 that could not fetch the previous `health.json` has no counts to carry, so it
 notes any failed build rather than hide one already told. A
-recovery needs a build that passed: a failed check under the threshold writes
-no note and is not one. One whose latest finished
+recovery needs a build that passed, or for the postsubmit reconcile a later
+daily run that reached its projects (below): a failed check under the
+threshold writes no note and is not one. One whose latest finished
 build is older than its stale window (two hours for the sweep, 36 hours for the
 daily reconcile and the daily replay lane, eight days for the weekly certification slice; the postsubmit runs on merges, so no age makes it stale) is `STALE`, whatever that build's
 verdict, measured on the wall clock rather than data.json's horizon, as the
@@ -623,7 +624,7 @@ digest carries it daily), a job that has stopped (in grey, whether or not its
 last build failed; the same grey when its latest build carries no readable
 finish time, since the window cannot be measured), and one when a job the space
 was told about passes again, on a reading only, or, for the postsubmit
-reconcile, when a later daily pass at the same fleet tree reached the projects it failed on (a failed build's git id, the tree reports carried before the input hash, is not compared with the daily's hash). The failed and stopped
+reconcile, when a later daily run at the same fleet tree reached the projects it failed on (a pass that held and planned them, or a run that failed elsewhere and applied them; a failed build's git id, the tree reports carried before the input hash, is not compared with the daily's hash). The failed and stopped
 messages are four lines, the failed one with the report's detail lines and a
 "how it died" line (the log line that says so, the node, a Warning pod event)
 under its second: a headline naming where and what stopped happening ("Eval GitOps repos:
