@@ -313,7 +313,9 @@ func slackAnsweredOptions(m OutMessage, line string) ([]slack.MsgOption, error) 
 	if m.Chat == nil {
 		if utf8.RuneCountInString(text) > slackChatSectionMax {
 			if m.Feedback != "" {
-				return slackRatedTextOptions(m)
+				opts, err := slackRatedTextOptions(m)
+				// chat.update keeps a side bar it is not sent.
+				return append(opts, slack.MsgOptionAttachments([]slack.Attachment{}...)), err
 			}
 			return slackMessageOptions(m)
 		}

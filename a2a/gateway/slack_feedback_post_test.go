@@ -152,6 +152,45 @@ func TestSlackRefusedRatedHomePostKeepsItsLayout(t *testing.T) {
 	}
 }
 
+func (f *refusingRatedSlackAPI) UpdateMessage(channelID, timestamp string, options ...slack.MsgOption) (string, string, string, error) {
+	if blocks := sentUpdateForm(channelID, timestamp, options...).Get("blocks"); strings.Contains(blocks, slackContextActionsBlock) {
+		f.refused++
+		return "", "", "", slack.SlackErrorResponse{Err: "invalid_blocks"}
+	}
+	return f.fakeSlackAPI.UpdateMessage(channelID, timestamp, options...)
+}
+
+// A rated edit Slack refuses is made once more without the controls, so the
+// triage still rewrites the alert in place with its own buttons.
+func TestSlackRefusedRatedEditKeepsItsLayout(t *testing.T) {
+	a, api := newRatedHomeSlackAdapter()
+	refusing := &refusingRatedSlackAPI{fakeSlackAPI: api}
+	a.api = refusing
+	if err := a.EditNotifyMessage("C0HOME", "1.0", "1.0", testDriftAlert()); err != nil {
+		t.Fatal(err)
+	}
+	if refusing.refused != 1 || len(api.updatedBlocks) != 1 {
+		t.Fatalf("refused = %d, updated = %d; want one refusal and one edit without the controls", refusing.refused, len(api.updatedBlocks))
+	}
+	got := decodedBlocks(t, api.updatedBlocks[0])
+	if got[len(got)-1]["type"] != slackBlockActionsT {
+		t.Errorf("the edit landed as %s, want the alert's own buttons last", api.updatedBlocks[0])
+	}
+}
+
+// A long text edit of an answered, rated message clears the side bar a laid-out
+// version had, as every other text edit does.
+func TestSlackLongRatedAnsweredEditClearsTheSideBar(t *testing.T) {
+	m := OutMessage{Text: strings.Repeat("a long triage line\n", slackChatSectionMax/10), Feedback: testPostAlertID}
+	opts, err := slackAnsweredOptions(m, "✓ Jayanti: Put Git's version back")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, attachments := sentBlocks(t, opts); strings.Contains(attachments, "blocks") || attachments == "" {
+		t.Errorf("attachments = %q, want the side bar sent empty", attachments)
+	}
+}
+
 // Without the recorder (feedback off) a marked home post draws no controls.
 func TestSlackHomePostDrawsNoRatingWithoutTheRecorder(t *testing.T) {
 	api := &fakeSlackAPI{}

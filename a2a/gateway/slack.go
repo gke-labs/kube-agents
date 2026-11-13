@@ -1148,6 +1148,20 @@ func (s *SlackAdapter) EditMessage(conversation, messageID string, m OutMessage)
 	if !s.rates(m) {
 		m.Feedback = ""
 	}
+	err := s.editMessage(channel, conversation, messageID, m)
+	if m.Feedback != "" && errors.Is(err, ErrLayoutRefused) {
+		// The rating controls must not cost the edit its layout, or the
+		// keyed edit its message: the same edit once more without them.
+		s.log.Warn("slack: a rated edit was refused; editing without the rating controls", "channel", channel, "err", err)
+		m.Feedback = ""
+		err = s.editMessage(channel, conversation, messageID, m)
+	}
+	return err
+}
+
+// editMessage is one EditMessage attempt, with the rating controls when m
+// is marked for rating.
+func (s *SlackAdapter) editMessage(channel, conversation, messageID string, m OutMessage) error {
 	var opts []slack.MsgOption
 	var err error
 	if m.Feedback != "" {
