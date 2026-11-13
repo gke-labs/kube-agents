@@ -692,11 +692,16 @@ def _from_resolved(path: str, management_project: str | None) -> ScopeClusters:
         if project in seen or left_out(project):
             continue
         seen.add(project)
-        listed = None if note else _listed_entry(project, clusters_map.get(project), excluded)
-        if listed is None and not note and row.get("outcome") == OUTCOME_API_DISABLED:
+        if note:
+            listed = None
+        elif row.get("outcome") == OUTCOME_API_DISABLED:
             # The clusters API is off, so the project has no GKE clusters: an
-            # empty list the publisher answered, not one invented here.
+            # empty list the publisher answered, not one invented here. Checked
+            # before the map, where the publisher carries an older run's entry
+            # for any outcome that is not ok, api-disabled included.
             listed = ProjectClusters(project, STATUS_LISTED, (), at=document.get("resolvedAt"))
+        else:
+            listed = _listed_entry(project, clusters_map.get(project), excluded)
         if listed is not None:
             entries.append(listed)
         else:

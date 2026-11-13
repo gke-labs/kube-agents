@@ -543,6 +543,16 @@ class ListScopeClustersTest(unittest.TestCase):
         self.assertEqual(entry.status, fst.STATUS_LISTED)
         self.assertEqual(entry.clusters, ())
 
+    def test_an_api_disabled_member_is_listed_empty_over_a_carried_entry(self):
+        # The publisher keeps a member's previous entry whenever this run's
+        # outcome is not ok, api-disabled included: the API being off now
+        # outranks the clusters an older run listed.
+        got = self._next(_resolved([("member-a", "api-disabled")], clusters={"member-a": {"at": "2026-11-01T12:00:00Z", "clusters": [["l", "gone"]]}}))
+        entry = got.by_project()["member-a"]
+        self.assertEqual(entry.status, fst.STATUS_LISTED)
+        self.assertEqual(entry.clusters, ())
+        self.assertNotEqual(entry.at, "2026-11-01T12:00:00Z")
+
     def test_a_malformed_entry_is_unread(self):
         got = self._next(_resolved([("member-a", "ok")], clusters={"member-a": {"at": "2026-11-10T12:00:00Z", "clusters": [["only-one"]]}}))
         self.assertEqual(got.by_project()["member-a"].status, fst.STATUS_UNREAD)
