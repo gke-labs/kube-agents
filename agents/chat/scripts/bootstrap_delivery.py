@@ -107,9 +107,10 @@ report is delivered regardless, and the registration is best-effort the
 same way.
 
 The claim is what makes "one delivery run per report" true rather than merely likely.
-``.bootstrap_completed`` is created with ``O_CREAT | O_EXCL`` *before* anything
-reaches stdout, so of two runs racing on the same report — a scheduled tick and
-the plugin's ``trigger_job``, say — exactly one can win the create and emit;
+``.bootstrap_completed`` is linked into place (``os.link``, which fails when the
+name exists) *before* anything reaches stdout, so of two runs racing on the same
+report — a scheduled tick and the plugin's ``trigger_job``, say — exactly one can
+win the link and emit;
 the loser exits silently. Checking the marker and then writing it after
 delivery would leave both runs inside the same window, and the user would be
 sent the entire onboarding report twice.
@@ -240,6 +241,20 @@ RETIRE_AFTER_SECONDS = 2 * CONVERSATION_POST_MAX_SECONDS + CLAIM_MARGIN_SECONDS
 # A conversation-path claim this old with no outcome recorded belongs to a run
 # that never finished its post (a pod restart between the claim and the answer).
 STALE_CLAIM_SECONDS = CONVERSATION_POST_MAX_SECONDS + CLAIM_MARGIN_SECONDS
+# The delivery claim holds the path that took it (``_claim_delivery`` links a written file into
+# place), so the lock and its holder are one file. An empty file is a claim from before the
+# tag (an older build, or a hand); ``_claim_path`` reads it as "", or as the no-human path's
+# when that path's old marker is beside it.
+COMPLETED_FILE = ".bootstrap_completed"
+CLAIM_PATH_ORIGIN = "origin"
+CLAIM_PATH_CONVERSATION = "conversation"
+CLAIM_PATH_NO_HUMAN = "no-human"
+# A claim that is there but could not be read this tick: nothing settles or releases on it.
+CLAIM_PATH_UNREADABLE = "unreadable"
+# The marker builds before the tag wrote beside a no-human claim. Read only beside an empty claim
+# (one such build took and a restart left), so an upgrade mid-claim does not settle it unfiled;
+# removed with the claim.
+LEGACY_REPORT_CLAIMING_FILE = ".bootstrap_report_claiming"
 
 # By absolute path, so no PATH entry picks the binary. A function defined under
 # this name in a ~/.bashrc the model wrote, which older sandbox images allow,
@@ -522,11 +537,6 @@ REPORT_ISSUE_SWEEP_MARKER = "<!-- onboarding-first-report sweep={sweep} -->"
 # Written by the retire path beside the claim; with REPORT_FILED_FILE it is
 # what tells a claim this path kept from one its run died holding.
 REPORT_RETIRED_FILE = ".bootstrap_report_retired"
-# Written by the no-human path just before it claims and removed with every
-# release of that claim: a claim beside it with neither record above is one a
-# run died holding, and the stale-claim rule releases it; the origin path, which
-# never writes it, keeps its claim settled the moment it exists, as before.
-REPORT_CLAIMING_FILE = ".bootstrap_report_claiming"
 REPORT_ISSUE_TITLE = "First-run inventory report ({date} UTC)"
 REPORT_ISSUE_INTRO = (
     "Onboarding's first-run inventory report, filed here on {date} UTC because no chat thread could take it: "
@@ -726,91 +736,44 @@ def delivery_settled(data_dir: Path) -> bool:
     on the conversation path once the report's post recorded an outcome, and on the path with no
     human once the filing or the retire is on record; a claim that run died holding is released
     like a stale conversation claim."""
-    if (data_dir / REPORT_CLAIMING_FILE).exists():
+    tag = _claim_path(data_dir)
+    if tag == CLAIM_PATH_UNREADABLE:
+        return False  # decided on a tick that can read it
+    if tag == CLAIM_PATH_NO_HUMAN:
         # This path's claim: its own record settles it, whatever a conversation bound a moment
         # later says; that conversation's run finds the report archived and posts nothing.
         return (data_dir / REPORT_FILED_FILE).exists() or (data_dir / REPORT_RETIRED_FILE).exists()
+    if tag == CLAIM_PATH_ORIGIN:
+        return True  # delivered in the claiming run, whatever binds after
+    if tag == CLAIM_PATH_CONVERSATION:
+        return _outcome_recorded(data_dir)
+    # An older build's claim (empty) or none: told apart as before, by the bound conversation.
     if _bound_conversation(data_dir) is not None:
         return _outcome_recorded(data_dir)
     return True
 
 
-def _mark_claiming(data_dir: Path) -> bool:
-    """Mark the claim about to be taken as this path's; without the mark no claim is taken, since an
-    unmarked claim that then dies would read as a delivered origin claim and retire the jobs.
+def _claim_path(data_dir: Path) -> str | None:
+    """The tag inside ``.bootstrap_completed`` (a ``CLAIM_PATH_*``), None when there is no claim.
 
-    ``O_EXCL``, so a marker already there is never overwritten: it is another no-human run's (a manual
-    run beside the tick), either holding the claim or about to take it, and this run yields to it. A
-    marker with no claim behind it that is older than ``STALE_CLAIM_SECONDS`` was left by a run that
-    died between its mark and its claim; it is taken over."""
-    marker = data_dir / REPORT_CLAIMING_FILE
-    for _ in range(2):
-        try:
-            fd = os.open(str(marker), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-        except FileExistsError:
-            if (data_dir / ".bootstrap_completed").exists():
-                return False
-            try:
-                if time.time() - marker.stat().st_mtime < STALE_CLAIM_SECONDS:
-                    return False
-                marker.unlink()
-            except OSError:
-                return False
-            continue
-        except OSError as e:
-            sys.stderr.write(f"bootstrap_delivery: could not record the claim's path, not claiming: {e}\n")
-            return False
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(f"{time.time()}\n")
-        except OSError as e:
-            # The marker exists but its write failed: take it back, or it holds every later run for
-            # STALE_CLAIM_SECONDS and makes a human's claim in that window read as a stale one of ours.
-            sys.stderr.write(f"bootstrap_delivery: could not write the claim's path marker, not claiming: {e}\n")
-            try:
-                marker.unlink()
-            except OSError:
-                pass
-            return False
-        return True
-    return False
-
-
-def _unmark_claiming(data_dir: Path) -> None:
-    """A lost claim is an origin run's (it got there first, with no marker of its own): the marker
-    this run wrote must not make theirs read as one of this path's with no record. A marker another
-    no-human run wrote is never this run's to remove: ``_mark_claiming`` does not write over one."""
+    An empty file is a claim an older build took before the tag: the no-human path's when its old
+    marker is beside it, else "" and read as an unmarked claim was (origin or conversation, by the
+    bound conversation). ``CLAIM_PATH_UNREADABLE`` when the file is there but cannot be read.
+    """
     try:
-        (data_dir / REPORT_CLAIMING_FILE).unlink()
+        tag = (data_dir / COMPLETED_FILE).read_text(encoding="utf-8", errors="replace").strip()
     except FileNotFoundError:
-        pass
+        return None
     except OSError as e:
-        sys.stderr.write(f"bootstrap_delivery: could not drop the claim's path marker: {e}\n")
-
-
-def _claim_for_this_path(data_dir: Path) -> bool:
-    if not _mark_claiming(data_dir):
-        return False
-    if _claim_delivery(data_dir):
-        return True
-    _unmark_claiming(data_dir)
-    return False
-
-
-def _drop_orphan_claiming_marker(data_dir: Path) -> None:
-    """Remove a no-human path marker that has no claim behind it, before a human's claim."""
-    if (data_dir / ".bootstrap_completed").exists():
-        return
-    try:
-        (data_dir / REPORT_CLAIMING_FILE).unlink()
-    except FileNotFoundError:
-        pass
-    except OSError as e:
-        sys.stderr.write(f"bootstrap_delivery: could not drop an orphan claim marker: {e}\n")
+        sys.stderr.write(f"bootstrap_delivery: could not read the claim's path: {e}\n")
+        return CLAIM_PATH_UNREADABLE
+    if not tag and (data_dir / LEGACY_REPORT_CLAIMING_FILE).exists():
+        return CLAIM_PATH_NO_HUMAN
+    return tag
 
 
 def _release_claim(data_dir: Path) -> None:
-    for name in (".bootstrap_completed", REPORT_CLAIMING_FILE):
+    for name in (COMPLETED_FILE, LEGACY_REPORT_CLAIMING_FILE):
         try:
             (data_dir / name).unlink()
         except FileNotFoundError:
@@ -821,7 +784,7 @@ def _release_claim(data_dir: Path) -> None:
 
 def _release_stale_claim(data_dir: Path, claimed_at: float) -> None:
     """Release a claim whose run never recorded an outcome: a conversation-path one, or a no-human
-    one (``REPORT_CLAIMING_FILE`` beside it), each recorded in its own record.
+    one (by the tag inside it), each recorded in its own record.
 
     Only past ``STALE_CLAIM_SECONDS``, so a run still posting keeps it. A conversation-path release
     counts as an attempt unless one was already recorded after the claim. A no-human release is
@@ -830,7 +793,10 @@ def _release_stale_claim(data_dir: Path, claimed_at: float) -> None:
     """
     if time.time() - claimed_at < STALE_CLAIM_SECONDS:
         return
-    no_human = (data_dir / REPORT_CLAIMING_FILE).exists()
+    tag = _claim_path(data_dir)
+    if tag == CLAIM_PATH_UNREADABLE:
+        return  # released on a tick that can read whose it is
+    no_human = tag == CLAIM_PATH_NO_HUMAN
     name = REPORT_ATTEMPTS_FILE if no_human else CONVERSATION_ATTEMPTS_FILE
     try:
         last = float(_read_attempts(data_dir, name).get(ATTEMPTS_AT))
@@ -881,7 +847,7 @@ def _conversation_ready(data_dir: Path, conversation: dict) -> bool:
 def _completed_at(data_dir: Path) -> float | None:
     """When the delivery claim was taken, or None if it has not been."""
     try:
-        return (data_dir / ".bootstrap_completed").stat().st_mtime
+        return (data_dir / COMPLETED_FILE).stat().st_mtime
     except FileNotFoundError:
         return None
 
@@ -907,27 +873,36 @@ def _read_report(data_dir: Path, in_sandbox: bool) -> bytes | None:
         return None
 
 
-def _claim_delivery(data_dir: Path) -> bool:
-    """Atomically claim the right to deliver the report. True if we won.
+def _claim_delivery(data_dir: Path, tag: str) -> bool:
+    """Atomically claim the right to deliver the report for ``tag``'s path. True if we won.
 
-    ``O_CREAT | O_EXCL`` is a single filesystem operation, so this is the point
-    at which "may I deliver?" and "I am delivering" become indivisible. Called
-    before the first byte of the report is written to stdout.
+    The tag is written to a private file and linked into place as ``.bootstrap_completed``:
+    ``os.link`` fails when the name exists, so the claim is exclusive, and the name never exists
+    without its content, so a run killed mid-claim leaves no claim or a tagged one (an empty
+    claim would read as an older build's, ``_claim_path``). Called before the first byte of the
+    report is written to stdout.
 
     A False return means another run already claimed it: the caller must emit
     nothing at all.
     """
-    completed = data_dir / ".bootstrap_completed"
+    completed = data_dir / COMPLETED_FILE
+    staged = data_dir / f"{COMPLETED_FILE}.{os.getpid()}"
     try:
-        fd = os.open(str(completed), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-    except FileExistsError:
-        return False  # another run got there first
+        staged.write_text(tag + "\n", encoding="utf-8")
+        try:
+            os.link(staged, completed)
+        except FileExistsError:
+            return False  # another run got there first
     except OSError as e:
         # Cannot claim -> cannot safely deliver. Staying silent costs a retry
         # next tick; delivering unclaimed risks sending the report twice.
         sys.stderr.write(f"bootstrap_delivery: could not claim delivery: {e}\n")
         return False
-    os.close(fd)
+    finally:
+        try:
+            staged.unlink()
+        except OSError:
+            pass
     return True
 
 
@@ -2235,7 +2210,7 @@ def _retire_undelivered(data_dir: Path, in_sandbox: bool) -> int:
         sys.stderr.write(f"bootstrap_delivery: the shell sandbox did not answer: {e}\n")
         return 0
     _register_findings(data_dir, _no_ranking(data_dir), files)
-    if not _claim_for_this_path(data_dir):
+    if not _claim_delivery(data_dir, CLAIM_PATH_NO_HUMAN):
         return 0
     if _someone_is_here(data_dir):
         # A human arrived during the reads above (a today platform has no sweep-age guard): their
@@ -2285,7 +2260,7 @@ def _record_issue_left_open(data_dir: Path, in_sandbox: bool, sweep: str, record
         sys.stderr.write(f"bootstrap_delivery: {reason}\n")
         _write_attempts(data_dir, {**record, ATTEMPTS_REASON: reason, REPORT_CAP_LOOKUP_DONE: True}, REPORT_ATTEMPTS_FILE)
         return 0
-    if not _claim_for_this_path(data_dir):
+    if not _claim_delivery(data_dir, CLAIM_PATH_NO_HUMAN):
         return 0
     if _someone_is_here(data_dir):
         _release_claim(data_dir)
@@ -2368,7 +2343,7 @@ def _file_without_thread(data_dir: Path, in_sandbox: bool, sweep: str, filed_at:
         return 0
     suppressed = _register_findings(data_dir, no_ranking, files)
 
-    if not _claim_for_this_path(data_dir):
+    if not _claim_delivery(data_dir, CLAIM_PATH_NO_HUMAN):
         return 0
     if _someone_is_here(data_dir):
         # A human arrived during the reads above: the report is theirs, through their thread.
@@ -2520,13 +2495,9 @@ def main(data_dir: Path | None = None) -> int:
     home = bool(chat_notify.routed_platform()) if conversation is not None else True
     note = _safe_audits_note(data_dir, no_ranking is True, home)
 
-    # A no-human run killed between its marker and its claim leaves the marker with no claim
-    # behind it; a claim taken beside it would read as that path's and never settle. A no-human
-    # run that is mid-claim right now re-checks for this human after its claim and releases.
-    _drop_orphan_claiming_marker(data_dir)
     # The cheap check above is advisory; this is the decision. Nothing may be
     # written to stdout before it succeeds.
-    if not _claim_delivery(data_dir):
+    if not _claim_delivery(data_dir, CLAIM_PATH_CONVERSATION if conversation is not None else CLAIM_PATH_ORIGIN):
         return 0  # another run is delivering this report — stay silent
 
     if conversation is not None:

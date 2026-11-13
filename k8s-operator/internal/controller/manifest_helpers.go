@@ -51,7 +51,7 @@ func fallbackPlatformAgentImage() string {
 }
 
 const (
-	fallbackFluentBitImage = "fluent/fluent-bit:5.1.2"
+	fallbackFluentBitImage = "fluent/fluent-bit:5.1.5"
 
 	// Operator-level image overrides for installs that mirror images into a
 	// private registry. Set on the controller-manager Deployment; a CR's
