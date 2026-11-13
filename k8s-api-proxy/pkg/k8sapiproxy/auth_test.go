@@ -244,3 +244,69 @@ func TestHandlerWithTokenReviewAuthenticator(t *testing.T) {
 		t.Errorf("failed review: code %d, body %s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestTokenReviewAuthenticatorMultipleAudiences(t *testing.T) {
+	const (
+		sessionAudience = "kubeagents-credential-proxy-session"
+		profileAudience = "kubeagents-credential-proxy-profile"
+		sessionUsername = "system:serviceaccount:agents:agent-a2a-session"
+		profileUsername = "system:serviceaccount:agents-profile-sre:sre-worker"
+	)
+	fake := &fakeTokenReviewServer{
+		status: authenticationv1.TokenReviewStatus{
+			Authenticated: true,
+			Audiences:     []string{profileAudience},
+			User:          authenticationv1.UserInfo{Username: profileUsername, UID: "uid-p"},
+		},
+	}
+	srv := httptest.NewServer(fake)
+	t.Cleanup(srv.Close)
+	a, err := NewTokenReviewAuthenticator(TokenReviewConfig{
+		Kubernetes:     &rest.Config{Host: srv.URL, BearerToken: testReviewerToken, ContentConfig: jsonContent},
+		Audience:       testAudience,
+		AllowedCallers: []string{shellUsername},
+		AudienceCallers: map[string][]string{
+			sessionAudience: {sessionUsername},
+			profileAudience: {profileUsername},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewTokenReviewAuthenticator: %v", err)
+	}
+	id, err := a.AuthenticateRequest(bearerRequest("profile-token"))
+	if err != nil {
+		t.Fatalf("AuthenticateRequest: %v", err)
+	}
+	if id.Username != profileUsername {
+		t.Errorf("Username = %q, want %q", id.Username, profileUsername)
+	}
+	if len(fake.reviews[0].Spec.Audiences) != 3 {
+		t.Errorf("Audiences = %v, want 3 audiences", fake.reviews[0].Spec.Audiences)
+	}
+
+	// Cross-audience caller is rejected: shellUsername cannot present profileAudience.
+	fake.status.User.Username = shellUsername
+	if _, err := a.AuthenticateRequest(bearerRequest("cross-audience-token")); err == nil {
+		t.Errorf("expected cross-audience caller %q on %q to be rejected", shellUsername, profileAudience)
+	}
+
+	// Colliding audience between Audience and AudienceCallers is rejected at construction.
+	if _, err := NewTokenReviewAuthenticator(TokenReviewConfig{
+		Kubernetes:      &rest.Config{Host: srv.URL, ContentConfig: jsonContent},
+		Audience:        testAudience,
+		AllowedCallers:  []string{shellUsername},
+		AudienceCallers: map[string][]string{testAudience: {sessionUsername}},
+	}); err == nil {
+		t.Errorf("expected duplicate audience %q in AudienceCallers to be rejected", testAudience)
+	}
+
+	// Overlapping caller across AllowedCallers and AudienceCallers is rejected at construction.
+	if _, err := NewTokenReviewAuthenticator(TokenReviewConfig{
+		Kubernetes:      &rest.Config{Host: srv.URL, ContentConfig: jsonContent},
+		Audience:        testAudience,
+		AllowedCallers:  []string{shellUsername, sessionUsername},
+		AudienceCallers: map[string][]string{sessionAudience: {sessionUsername}},
+	}); err == nil {
+		t.Errorf("expected caller %q bound to two audiences to be rejected", sessionUsername)
+	}
+}

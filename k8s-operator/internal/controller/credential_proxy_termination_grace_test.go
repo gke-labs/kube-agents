@@ -20,6 +20,8 @@ import (
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/utils/ptr"
 )
 
@@ -74,5 +76,44 @@ func TestTheExecTierHoldsItsLongestCommand(t *testing.T) {
 	}
 	if got := broker.Spec.Template.Spec.TerminationGracePeriodSeconds; got == nil || *got != credentialProxyTerminationGraceSeconds {
 		t.Errorf("broker terminationGracePeriodSeconds = %v, want credentialProxyTerminationGraceSeconds (%d) left as it was", got, credentialProxyTerminationGraceSeconds)
+	}
+}
+
+// TestTheExecTierProbeFindsADrainQuickly pins the exec pods' readiness probe:
+// a draining exec pod fails /healthz, and three failures 3s apart take it out
+// of the Service, so at one replica callers fall back to the stateful broker in
+// about 9s. The broker keeps its own probe.
+func TestTheExecTierProbeFindsADrainQuickly(t *testing.T) {
+	agent := execTierTestAgent(ptr.To(int32(1)))
+	broker := buildCredentialProxyDeployment(agent, brokerTestPolicyHash)
+	brokerBefore := broker.DeepCopy()
+	dep := buildCredentialProxyExecTierDeployment(agent, broker)
+
+	probe := func(d *appsv1.Deployment) *corev1.Probe {
+		for _, c := range d.Spec.Template.Spec.Containers {
+			if c.Name == credentialProxyContainerName {
+				return c.ReadinessProbe
+			}
+		}
+		return nil
+	}
+	execProbe, brokerProbe := probe(dep), probe(broker)
+	if execProbe == nil || brokerProbe == nil {
+		t.Fatalf("readiness probes: exec %v, broker %v; want both set", execProbe, brokerProbe)
+	}
+	got := [3]int32{execProbe.PeriodSeconds, execProbe.TimeoutSeconds, execProbe.FailureThreshold}
+	want := [3]int32{credentialProxyExecTierReadinessPeriodSeconds, credentialProxyExecTierReadinessTimeoutSeconds,
+		credentialProxyExecTierReadinessFailureThreshold}
+	if got != want {
+		t.Errorf("exec readiness period/timeout/threshold = %v, want %v", got, want)
+	}
+	if execProbe.TimeoutSeconds >= execProbe.PeriodSeconds {
+		t.Errorf("exec readiness timeout %ds is not inside its %ds period", execProbe.TimeoutSeconds, execProbe.PeriodSeconds)
+	}
+	if !equality.Semantic.DeepEqual(brokerProbe, probe(brokerBefore)) {
+		t.Errorf("building the exec tier changed the broker's probe: %+v", brokerProbe)
+	}
+	if execProbe.HTTPGet == nil || execProbe.HTTPGet.Path != "/healthz" {
+		t.Errorf("exec readiness probe = %+v, want the /healthz the draining runtime fails", execProbe.HTTPGet)
 	}
 }

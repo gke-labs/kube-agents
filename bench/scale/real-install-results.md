@@ -49,7 +49,8 @@ up to 3.6 times as long.
 The test found six defects in the product:
 
 1. The event watcher does not watch clusters that are registered after it starts. On a new install
-   it watches no cluster until the gateway restarts.
+   it watches no cluster until the gateway restarts. (Fixed by #4496, which merged on 2026-11-02 after
+   this run: the watcher re-reads its profiles every minute. Checked live on 2026-11-11, #3932.)
 2. The upgrade report is not stable in scope. In 4 of the 5 finished fleet-wide reports it reported
    on clusters that the install is told to exclude, and once it left out the managed clusters.
 3. The fleet health answers also count the excluded clusters.
@@ -90,7 +91,7 @@ the Result column says whether the data confirms the prediction.
 
 | Item                             | Value                                                                                                                                                                                                                                                                                                                                                                  |
 | -------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Build                            | `main` at `0108e59d`, `spec.mode: next`, model `vertex_ai/gemini-3.5-flash`                                                                                                                                                                                                                                                                                            |
+| Build                            | `main` at `0108e59d`, `spec.mode: next`, the install's default model on Vertex AI                                                                                                                                                                                                                                                                                      |
 | Install                          | New install with `install.sh` on 2026-10-29 (uninstall first), no GitOps repository. The first-run window starts from a reset: the runner deleted and re-created the agent's data volumes, which clears all agent state and starts the first-run flow again. The operator, credential proxy and A2A Pods ran from the install on 2026-10-29; they hold no agent state. |
 | Host cluster                     | `scale-host`, zonal Standard, 2 × e2-standard-4 (default and gVisor pools)                                                                                                                                                                                                                                                                                             |
 | Agent                            | limit 8 CPU, 16 GB                                                                                                                                                                                                                                                                                                                                                     |
@@ -336,7 +337,7 @@ starts per window and the quota suppressed almost all of them.
 9. **A new install does not watch the clusters it registers after start.** On a new install the
    event watcher starts before the first reconcile creates the Cluster Agent profiles, so it watches
    none of them until the gateway restarts. The first-run measurement therefore under-counts the
-   event watcher's load.
+   event watcher's load. (Fixed since by #4496; see finding 1.)
 10. **At 40 clusters the session quota carries the event load.** With the watcher watching every
     cluster, it asked for about 100 to 250 triage sessions per minute, mostly for the 785 Pods that
     the test fleet cannot schedule. The quota suppressed nearly all of them.
@@ -477,8 +478,8 @@ measure it without the cost of real nodes.
 ## Cost
 
 Prices are on-demand list prices for `us-central1`. Token prices are from LiteLLM's model cost
-map for `vertex_ai/gemini-3.5-flash`: $1.50 per million input tokens, $0.15 per million cached
-input tokens, $9.00 per million output tokens.
+map for the install's model: $1.50 per million input tokens, $0.15 per million cached input
+tokens, $9.00 per million output tokens.
 
 | Item                                                                           | Per hour      |
 | ------------------------------------------------------------------------------ | ------------- |

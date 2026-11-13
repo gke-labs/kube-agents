@@ -3108,12 +3108,23 @@ class InstallerCommonTest(unittest.TestCase):
          "name": "minter", "instances": [{"attributes": {"name": "github-token-minter-key"}}]},
         {"module": "module.github_minter[0]", "mode": "managed", "type": "google_service_account",
          "name": "minter", "instances": [{"attributes": {"account_id": "kubeagents-github-minter-gsa"}}]},
+        {"module": "module.github_minter[0]", "mode": "managed", "type": "google_service_account_iam_member",
+         "name": "workload_identity", "instances": [{"attributes": {
+             "member": "serviceAccount:test-project.svc.id.goog[kubeagents-system/kubeagents-github-minter]"}}]},
     ]
+    _EXISTING = ["github-token-minter-keyring", "github-token-minter-key", "kubeagents-github-minter-gsa",
+                 "kubeagents-github-minter"]
 
     def test_minter_derived_names_follow_the_cluster(self):
         proc = self._run('minter_derived_names ka-today-1')
         self.assertEqual(proc.stdout.strip().split("|"),
-                         ["ka-today-1-minter-keyring", "ka-today-1-minter-key", "ka-today-1-minter"])
+                         ["ka-today-1-minter-keyring", "ka-today-1-minter-key", "ka-today-1-minter",
+                          "ka-today-1-github-minter"])
+
+    def test_the_longest_cluster_name_still_gives_a_valid_ksa_name(self):
+        """A GKE cluster name is at most 40 characters; the KSA must stay a DNS-1123 label."""
+        ksa = self._run(f"minter_derived_names {'a' * 40}").stdout.strip().split("|")[3]
+        self.assertRegex(ksa, r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$")
 
     def test_a_long_cluster_name_still_gives_a_valid_distinct_gsa_id(self):
         """A GSA id is 6-30 characters; two long names sharing a prefix stay apart."""
@@ -3124,27 +3135,40 @@ class InstallerCommonTest(unittest.TestCase):
             ids.append(gsa)
         self.assertNotEqual(ids[0], ids[1])
 
-    def test_tf_state_minter_names_reads_the_three_names(self):
+    def test_tf_state_minter_names_reads_the_four_names(self):
+        """The KSA is the one the Workload Identity member names."""
         proc = self._run('tf_state_minter_names; echo "rc=$?"', gcloud_stdout=_state_doc(self._MINTER_STATE))
-        self.assertIn("github-token-minter-keyring|github-token-minter-key|kubeagents-github-minter-gsa", proc.stdout)
+        self.assertIn("|".join(self._EXISTING), proc.stdout)
         self.assertIn("rc=0", proc.stdout)
 
     def test_an_install_with_a_minter_in_state_keeps_its_names(self):
         """The existing install: the names its state holds, whatever the cluster is called."""
         proc = self._run("minter_name_defaults test-project ka-today-1", gcloud_stdout=_state_doc(self._MINTER_STATE))
-        self.assertEqual(proc.stdout.strip().split("|"),
-                         ["github-token-minter-keyring", "github-token-minter-key", "kubeagents-github-minter-gsa"])
+        self.assertEqual(proc.stdout.strip().split("|"), self._EXISTING)
+
+    def test_an_install_keeps_the_ksa_its_binding_names(self):
+        """A KSA set on an earlier run is read back from the binding, not re-derived."""
+        state = self._MINTER_STATE[:3] + [dict(self._MINTER_STATE[3], instances=[{"attributes": {
+            "member": "serviceAccount:test-project.svc.id.goog[kubeagents-system/c1-github-minter]"}}])]
+        proc = self._run("minter_name_defaults test-project ka-today-1", gcloud_stdout=_state_doc(state))
+        self.assertEqual(proc.stdout.strip().split("|")[3], "c1-github-minter")
 
     def test_a_state_holding_only_some_minter_names_keeps_each_in_its_place(self):
         """An interrupted destroy leaves only the GSA: the empty ring and key fields stay empty."""
         proc = self._run("minter_name_defaults test-project ka-today-1",
-                         gcloud_stdout=_state_doc(self._MINTER_STATE[2:]))
-        self.assertEqual(proc.stdout.strip().split("|"),
-                         ["github-token-minter-keyring", "github-token-minter-key", "kubeagents-github-minter-gsa"])
+                         gcloud_stdout=_state_doc(self._MINTER_STATE[2:3]))
+        self.assertEqual(proc.stdout.strip().split("|"), self._EXISTING)
         custom_gsa = [dict(self._MINTER_STATE[2], instances=[{"attributes": {"account_id": "my-minter"}}])]
         proc = self._run("minter_name_defaults test-project ka-today-1", gcloud_stdout=_state_doc(custom_gsa))
         self.assertEqual(proc.stdout.strip().split("|"),
-                         ["github-token-minter-keyring", "github-token-minter-key", "my-minter"])
+                         ["github-token-minter-keyring", "github-token-minter-key", "my-minter",
+                          "kubeagents-github-minter"])
+
+    def test_a_new_minter_stopped_before_its_binding_keeps_the_derived_ksa(self):
+        """The GSA is this cluster's derived one and no binding exists yet: the KSA is derived too."""
+        state = [dict(self._MINTER_STATE[2], instances=[{"attributes": {"account_id": "ka-today-1-minter"}}])]
+        proc = self._run("minter_name_defaults test-project ka-today-1", gcloud_stdout=_state_doc(state))
+        self.assertEqual(proc.stdout.strip().split("|")[2:], ["ka-today-1-minter", "ka-today-1-github-minter"])
 
     def test_an_install_without_a_minter_in_state_derives_its_names(self):
         proc = self._run("minter_name_defaults test-project ka-today-1", gcloud_stdout=_state_doc([]))
@@ -3158,8 +3182,7 @@ class InstallerCommonTest(unittest.TestCase):
         """Not knowing whether this install has a minter, it must not rename one."""
         proc = self._run('print_warning() { echo "WARN: $*"; }; minter_name_defaults test-project ka-today-1',
                          gcloud_exit=1, gcloud_stderr="ERROR: 503 Service Unavailable")
-        self.assertEqual(proc.stdout.strip().splitlines()[-1].split("|"),
-                         ["github-token-minter-keyring", "github-token-minter-key", "kubeagents-github-minter-gsa"])
+        self.assertEqual(proc.stdout.strip().splitlines()[-1].split("|"), self._EXISTING)
         self.assertIn("keeps the project-wide default names", proc.stderr + proc.stdout)
 
     def _key_owner(self, describe_rc=0, labels="", labels_rc=0):
@@ -3684,7 +3707,14 @@ class HelmReleaseSelfHealingTest(unittest.TestCase):
                     target = bin_dir / name
                     target.write_text(content)
                     target.chmod(target.stat().st_mode | stat.S_IEXEC)
-            full_env = get_isolated_test_env(overrides=env_overrides or {}, bin_dir=str(bin_dir))
+            # An empty kubeconfig of the test's own: ensure_clean_helm_release
+            # asks kubectl for a pending release's Secret, and a developer's
+            # default context must never answer a unit test.
+            kubeconfig = pathlib.Path(tmp) / "kubeconfig"
+            kubeconfig.touch()
+            full_env = get_isolated_test_env(
+                overrides={"KUBECONFIG": str(kubeconfig), **(env_overrides or {})}, bin_dir=str(bin_dir)
+            )
             body = (
                 f'set -u\n'
                 f'{_PRINT_STUBS}\n'
@@ -6244,6 +6274,7 @@ cluster_mode = "autopilot"
 namespace    = "agents-ns"
 """
 _MAIN_TF = _REPO_ROOT / "terraform" / "examples" / "full-install" / "main.tf"
+_FOOTPRINT_PROFILES = _REPO_ROOT / "tests" / "data" / "footprint_profiles.json"
 
 # The `--set` each tfvars key becomes, as terraform/examples/full-install/main.tf
 # maps them onto the chart.
@@ -6635,24 +6666,41 @@ class FootprintSummaryTest(unittest.TestCase):
         self.assertIn("rc=0", proc.stdout, proc.stderr)
         self.assertIn("      Release footprint (pod requests, as the quota preflight sums them):", proc.stdout)
         self.assertIn(_FOOTPRINT_LABEL, proc.stdout)
-        # 200Gi on the two data claims plus Hindsight's claim, the minter and the console,
-        # and, since the tfvars say next, the NATS bus's 40Gi JetStream claim and the
-        # next-mode pods the preflight now sums (the A2A gateway's standby among them): the
-        # settings the tfvars carry reached the render.
-        self.assertIn("Persistent storage:  450 GiB over 6 claims", proc.stdout)
-        self.assertIn("Pods:                23", proc.stdout)
-        # The tfvars say autopilot, so the credential proxy is counted at the operator's
-        # Autopilot requests, 2 CPU and 2Gi, as the notes count it on such a cluster; on
-        # standard the same tfvars sum footprint.yaml's 500m and 1Gi.
-        self.assertIn("CPU requests:        5.900 cores", proc.stdout)
-        self.assertIn("Memory requests:     16.38 GiB", proc.stdout)
-        standard = self._run(
-            f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"',
-            tfvars=_FOOTPRINT_TFVARS.replace('cluster_mode = "autopilot"', 'cluster_mode = "standard"'),
+        # The expected totals are the installer profile's in tests/data/footprint_profiles.json,
+        # which `make docs-generate` renders from the same chart template with these
+        # tfvars' --set values (held equal to _FOOTPRINT_EXPECTED_SETS below), and docs-check
+        # keeps current. So this checks that the tfvars reach the render under the right
+        # keys and that the installer prints what the notes print, not the arithmetic,
+        # which tests/test_quota_preflight.py pins from hand-kept constants. The tfvars say
+        # autopilot, so the credential proxy is counted at the operator's Autopilot
+        # requests; on standard the same tfvars sum footprint.yaml's.
+        profiles = json.loads(_FOOTPRINT_PROFILES.read_text())["profiles"]
+        for key, output in (("installer-autopilot", proc), ("installer-standard", None)):
+            profile = profiles[key]
+            self.assertEqual(
+                [f"--set {item}" for item in profile["sets"]], _FOOTPRINT_EXPECTED_SETS,
+                f"{key} in {_FOOTPRINT_PROFILES.name} renders other values than the installer passes",
+            )
+            if output is None:
+                output = self._run(
+                    f'print_footprint_summary "{_REPO_ROOT}" "$TFVARS"; echo "rc=$?"',
+                    tfvars=_FOOTPRINT_TFVARS.replace('cluster_mode = "autopilot"', 'cluster_mode = "standard"'),
+                )
+                self.assertIn("rc=0", output.stdout, output.stderr)
+            r = profile["requirements"]
+            gib = 1024**3
+            self.assertIn(f"CPU requests:        {r['requestsCpu'] / 1000:.3f} cores", output.stdout, key)
+            self.assertIn(f"Memory requests:     {r['requestsMemory'] / gib:.2f} GiB", output.stdout, key)
+            self.assertIn(f"Pods:                {r['pods']}\n", output.stdout, key)
+            self.assertIn(
+                f"Persistent storage:  {r['requestsStorage'] / gib:.0f} GiB over {r['persistentVolumeClaims']} claims",
+                output.stdout, key,
+            )
+        # Autopilot counts the credential proxy higher, so the two profiles differ.
+        self.assertGreater(
+            profiles["installer-autopilot"]["requirements"]["requestsCpu"],
+            profiles["installer-standard"]["requirements"]["requestsCpu"],
         )
-        self.assertIn("rc=0", standard.stdout, standard.stderr)
-        self.assertIn("CPU requests:        4.400 cores", standard.stdout)
-        self.assertIn("Memory requests:     15.38 GiB", standard.stdout)
         # The tfvars say next, so the installer prints the caveat the notes print.
         self.assertIn("Not counted: the session pods", proc.stdout)
         # Byte for byte what NOTES.txt prints for the same values: one arithmetic, one

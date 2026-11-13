@@ -270,7 +270,7 @@ func TestAVerifierCrashLoopDuringAProvisionJobReRunIsAFault(t *testing.T) {
 		t.Fatal("precondition: the re-rendered provision Job already reads complete, so this pass is not the re-run window")
 	}
 
-	phase, err := r.updateStatusReady(ctx, stored, "", otlpSourceNone, r.resolveNetpolProfile(ctx, stored), state)
+	phase, _, err := r.updateStatusReady(ctx, stored, "", otlpSourceNone, r.resolveNetpolProfile(ctx, stored), state)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -323,7 +323,7 @@ func TestAVerifierCrashLoopOnAFreshInstallStillReadsProvisioning(t *testing.T) {
 		t.Fatal("precondition: the provision Job reads complete on a fresh install")
 	}
 
-	phase, err := r.updateStatusReady(ctx, stored, "", otlpSourceNone, r.resolveNetpolProfile(ctx, stored), state)
+	phase, _, err := r.updateStatusReady(ctx, stored, "", otlpSourceNone, r.resolveNetpolProfile(ctx, stored), state)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -381,7 +381,7 @@ func TestTheFirstPassThatSeesTheJobCompleteAlreadyTreatsACrashLoopAsAFault(t *te
 		t.Fatal("precondition: reconcileA2A wrote the provisioned-once record, so the two readings agree by the time the scan runs")
 	}
 
-	phase, err := r.updateStatusReady(ctx, stored, "", otlpSourceNone, r.resolveNetpolProfile(ctx, stored), state)
+	phase, _, err := r.updateStatusReady(ctx, stored, "", otlpSourceNone, r.resolveNetpolProfile(ctx, stored), state)
 	if err != nil {
 		t.Fatal(err)
 	}

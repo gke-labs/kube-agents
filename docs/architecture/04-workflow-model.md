@@ -15,8 +15,9 @@
 
 Every change in `kube-agents` follows one loop: **an agent proposes a declarative change → a human
 approves it (PR merge) → the customer's CI/CD applies it (and the kube-agents controller reconciles agents).** Agents never mutate
-infrastructure directly, and **no change reaches a cluster without a human approving the merge —
-there is no auto-merge for any tier.** "Autonomy" governs how the agent **proposes**, not whether a
+infrastructure directly, and **by default no change reaches a cluster without a human approving the
+merge.** Auto-merge is off unless a repository opts in through a rules file a human merges, and even
+then kube-agents never merges its own pull request (§2). "Autonomy" governs how the agent **proposes**, not whether a
 human approves: the agent authors and opens PRs proactively for reversible, in-scope work; for
 destructive, irreversible, cross-scope, or high-sensitivity actions it additionally **halts and flags
 for the specific tier authority** (§2.2) — regardless of the agent's confidence. Either way, a human
@@ -77,8 +78,8 @@ artifact; **it integrates with the customer's existing CI/CD and IaC rather than
 | Provisioning artifact          | **KCC YAML or Terraform HCL** (per customer requirements)                                       | the agent generates whichever format the customer standardizes on                                                                          |
 | Actuation (deploy + reconcile) | **the customer's CI/CD pipeline** (GitHub Actions / CircleCI / Jenkins / …)                     | applies the merged artifact (`kubectl apply`, `terraform apply`, …); kube-agents does not bundle a GitOps engine                           |
 | Agent lifecycle                | **kube-agents controller** (`k8s-operator/`, extended)                                          | reconciles each `Agent` CR (Hermes harness) into an isolated pod; sets per-pod SA / namespace / runtimeClass on **Scion**'s verified model |
-| Curated shared knowledge       | **OKF** (markdown+frontmatter in git)                                                           | ad-hoc wikis / tribal knowledge                                                                                                            |
-| Semantic recall                | **mem0** (Qdrant) — _deferred post-v1_                                                          | —                                                                                                                                          |
+| Curated shared knowledge       | **OKF** (markdown+frontmatter in git)                                                           | ad-hoc wikis / tribal knowledge (proposed `kube-agents-decisions` index; [memory.md](../designs/memory.md))                                |
+| Cross-tier semantic recall     | **mem0** (Qdrant) — _deferred post-v1_                                                          | —                                                                                                                                          |
 | Session / runtime state        | **`session_db.sqlite` + `kube_agents_memory`**                                                  | —                                                                                                                                          |
 | Cross-agent coordination       | **durable state** (GitOps repo + OKF), reacted to via **event triggers**, heartbeat as backstop | **No synchronous agent-to-agent calls** — agents stay decoupled by design ([02](02-agent-personas.md) §2.3)                                |
 
@@ -101,8 +102,11 @@ direct-mutation path, where agents call `create_cluster` / the `gke` MCP server 
 
 ## 2. Autonomy vs. human approval
 
-**Every mutation is human-approved at merge — there is no auto-merge for any tier** (the #1
-invariant). "Autonomy" is about how the agent _proposes_, never about skipping approval: the default
+**Every mutation is human-approved at merge by default** (the #1 invariant). Auto-merge is off
+unless a repository opts in, per fix type and environment, through a rules file
+(`.kube-agents/automation.yaml`) that a human merges; even then kube-agents never merges its own
+pull request, the customer's pipeline does, and mandatory-gate classes (§2.2) are never eligible
+([design #5054](https://github.com/gke-labs/kube-agents/pull/5054)). "Autonomy" is about how the agent _proposes_, never about skipping approval: the default
 is **biased toward proposing proactively** for safe work, and **hard-stops that halt-and-flag for a
 specific tier authority** for consequential work. This reconciles `SOUL.md`'s "User Intent Priority"
 (act — i.e. _propose_ — when the answer would just be "yes") with its "destructive operations always
@@ -147,8 +151,9 @@ Who approves depends on the blast radius, aligned to the containment hierarchy:
 | Cluster provisioning, fleet policy               | Platform Agent       | Platform team (human)                              |
 | Provisioning a Cluster Admin Agent               | Platform Agent       | Platform team (human)                              |
 
-**Rule:** an agent may propose changes to the tier it governs, and **a human always approves the
-merge — every change, no exceptions, no auto-merge.** Mandatory-gate classes (§2.2) additionally
+**Rule:** an agent may propose changes to the tier it governs, and **a human approves the merge** —
+every change, unless the repository's rules file opts that fix type into its own pipeline's
+auto-merge (§2); an agent never merges. Mandatory-gate classes (§2.2) additionally
 require the approver to be the **human owning that tier** (not just any reviewer). Agents never
 approve other agents' — or their own — changes; approval authority stays with humans at the
 appropriate layer.
@@ -370,7 +375,9 @@ Every step is declarative, reviewed, attributable, and revertible.
 - **Only write path is a merged PR:** a direct cluster/cloud mutation with an agent identity **fails**;
   the same change via PR → merge → CI/CD **succeeds** and is attributed (trace/session/requester + PR
   URL).
-- **No auto-merge:** no tier can merge its own PR; every merge requires a human (branch protection).
+- **No agent merge:** no tier can merge its own PR. A merge requires a human (branch protection)
+  unless the repository's rules file opts that fix type into its own pipeline's auto-merge, which a
+  human merged first.
 - **Mandatory gates:** a destructive / cross-scope / project-level change cannot merge without the
   tier's human owner approving (simulate; expect a required review).
 - **Heartbeat via the loop:** a cron/heartbeat that wants a change opens a PR — never a direct mutation

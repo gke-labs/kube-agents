@@ -353,6 +353,20 @@ variable "github_minter_service_account_id" {
   default     = null
 }
 
+variable "github_minter_ksa_name" {
+  description = "Kubernetes ServiceAccount the GitHub token minter runs as, and the KSA half of its Workload Identity binding. The Workload Identity member is project/namespace/KSA with no cluster in it, so installs in one project that share the namespace and this name can each act as the other's minter GSA, however differently the GSAs are named. The installer gives a new install <cluster>-github-minter and records it as GITHUB_MINTER_KSA_NAME in install.env. One variable feeds both consumers, the github-minter module's ksa_name and the chart's githubMinter.ksaName, so the binding and the pod cannot name different KSAs. The default is the name both used before this variable existed, so an install that never sets it does not move. Distinct names stop accidental cross-use only: anyone who can create a ServiceAccount in this namespace on any cluster in the project can still create one by this name, so the boundary between installs that must not trust each other is a project of their own."
+  type        = string
+  nullable    = false
+  default     = "kubeagents-github-minter"
+
+  # A label, as agent_ksa_name is: the value is interpolated into the Workload
+  # Identity member string.
+  validation {
+    condition     = can(regex("^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$", var.github_minter_ksa_name))
+    error_message = "github_minter_ksa_name must be a DNS-1123 label: lowercase letters, digits and hyphens, 1-63 characters, starting and ending with a letter or digit."
+  }
+}
+
 variable "litellm_service_account_id" {
   description = "IAM service account ID for the LiteLLM gateway's Vertex AI GSA (model_provider = vertex_ai only). One fixed name per project, so a second Vertex install in the same project must set its own. A real default rather than null: the module it reaches (kube-agents-iam) defaults to the AGENT's name, which a null would select."
   type        = string
@@ -768,17 +782,17 @@ variable "github_repo" {
 }
 
 variable "gitops_forge" {
-  description = "Which forge holds the GitOps repository: github (the default; github_repo and the GitHub App minter, on github.com or, with gitops_host, on a GitHub Enterprise Server) or gitlab (gitlab_repo, with the access token in the Kubernetes Secret gitlab_token_secret_name names). A gitlab install, and a github install with gitops_host, declare one forge and its gitops repository through spec.integration.forges/repositories. A gitlab install must leave github_repo and enable_github_minter unset."
+  description = "Which forge holds the GitOps repository: github (the default; github_repo and the GitHub App minter, on github.com or, with gitops_host, on a GitHub Enterprise Server), gitlab (gitlab_repo, with the access token in the Kubernetes Secret gitlab_token_secret_name names), bitbucket (Bitbucket Cloud, at bitbucket.org) or bitbucket-datacenter (gitops_repo_path, with the token in the Secret gitops_token_secret_name names). A gitlab or Bitbucket install, and a github install with gitops_host, declare one forge and its gitops repository through spec.integration.forges/repositories. A gitlab or Bitbucket install must leave github_repo and enable_github_minter unset."
   type        = string
   default     = "github"
   validation {
-    condition     = contains(["github", "gitlab"], var.gitops_forge)
-    error_message = "gitops_forge must be github or gitlab."
+    condition     = contains(["github", "gitlab", "bitbucket", "bitbucket-datacenter"], var.gitops_forge)
+    error_message = "gitops_forge must be github, gitlab, bitbucket or bitbucket-datacenter."
   }
 }
 
 variable "gitops_host" {
-  description = "Hostname of the forge holding the GitOps repository: with gitops_forge = github, a GitHub Enterprise Server (e.g. github.example.com); with gitops_forge = gitlab, a self-managed GitLab instance (e.g. gitlab.example.com). Empty is the forge's own host (github.com or gitlab.com). A bare hostname: no scheme, path or port. For github, a host that GitHub operates (github.com, githubusercontent.com, ghe.com and the like) is refused. On a GitHub Enterprise Server the composition declares the github forge at this host in spec.integration.forges, with github_repo's owner as its namespace, and the chart points the token minter at https://<host>/api/v3."
+  description = "Hostname of the forge holding the GitOps repository: with gitops_forge = github, a GitHub Enterprise Server (e.g. github.example.com); with gitops_forge = gitlab, a self-managed GitLab instance (e.g. gitlab.example.com); with gitops_forge = bitbucket-datacenter, the instance's hostname (required; the instance must serve at the root path on port 443). Bitbucket Cloud (bitbucket) takes no host. Empty is the forge's own host (github.com or gitlab.com). A bare hostname: no scheme, path or port. For github, a host that GitHub operates (github.com, githubusercontent.com, ghe.com and the like) is refused. On a GitHub Enterprise Server the composition declares the github forge at this host in spec.integration.forges, with github_repo's owner as its namespace, and the chart points the token minter at https://<host>/api/v3."
   type        = string
   default     = ""
   validation {
@@ -811,6 +825,38 @@ variable "gitlab_ca_secret_name" {
     condition     = var.gitlab_ca_secret_name == "" || (can(regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$", var.gitlab_ca_secret_name)) && length(var.gitlab_ca_secret_name) <= 253)
     error_message = "gitlab_ca_secret_name must be a valid Kubernetes Secret name (lowercase DNS subdomain)."
   }
+}
+
+variable "gitops_repo_path" {
+  description = "The GitOps repository on a Bitbucket forge: workspace/repo-slug on Bitbucket Cloud (bitbucket), PROJECTKEY/repo-slug on Bitbucket Data Center (bitbucket-datacenter). Read only when gitops_forge is bitbucket or bitbucket-datacenter; a GitLab install names its project in gitlab_repo."
+  type        = string
+  default     = ""
+}
+
+variable "gitops_token_secret_name" {
+  description = "Name of the Kubernetes Secret, in the agent's namespace, holding a Bitbucket forge's token under the key `token`, and an optional read-only token for context repositories under `read-token`. Empty is bitbucket-forge-token. The installer creates it from a prompt or a token file after the apply; Terraform only names it, so the token never reaches the plan or the state. Read only when gitops_forge is bitbucket or bitbucket-datacenter."
+  type        = string
+  default     = ""
+  validation {
+    condition     = var.gitops_token_secret_name == "" || (can(regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$", var.gitops_token_secret_name)) && length(var.gitops_token_secret_name) <= 253)
+    error_message = "gitops_token_secret_name must be a valid Kubernetes Secret name (lowercase DNS subdomain)."
+  }
+}
+
+variable "gitops_ca_secret_name" {
+  description = "Name of the Secret, in the agent's namespace, holding the PEM CA that signed a Bitbucket Data Center instance's TLS certificate, under the key `ca.crt`. The broker trusts it for that host only. Empty: the system CAs only. Read only when gitops_forge is bitbucket-datacenter."
+  type        = string
+  default     = ""
+  validation {
+    condition     = var.gitops_ca_secret_name == "" || (can(regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$", var.gitops_ca_secret_name)) && length(var.gitops_ca_secret_name) <= 253)
+    error_message = "gitops_ca_secret_name must be a valid Kubernetes Secret name (lowercase DNS subdomain)."
+  }
+}
+
+variable "gitops_identity" {
+  description = "Bitbucket only: the account the forge's token acts as, written to the forge's identity field. On Bitbucket Cloud, the account UUID, needed for a workspace, project or repository access token, which cannot name its own account; an API token needs none. On Bitbucket Data Center, rarely needed: the broker reads the login from the X-AUSERNAME response header. Empty: none."
+  type        = string
+  default     = ""
 }
 
 variable "github_ca_secret_name" {
@@ -908,7 +954,7 @@ variable "enable_cert_manager" {
 variable "cert_manager_version" {
   description = "cert-manager chart version. Values below 1.15.x need the crds.enabled key in main.tf renamed back to installCRDs."
   type        = string
-  default     = "v1.21.2"
+  default     = "v1.21.3"
 }
 
 variable "enable_webhooks" {
@@ -1061,4 +1107,10 @@ variable "extra_helm_values" {
   description = "Extra values for the kube-agents Helm release, covering chart settings this composition does not expose as its own variable (telemetry.otlpEndpoint, litellm.otel, the resource blocks, the PlatformAgent harness knobs). Passed as a second values document, so Helm deep-merges it key by key over the ones computed here and anything set wins. Setting a key the composition also computes — platformAgent.harness.clusterName, say — overrides it, which is rarely what you want."
   type        = any
   default     = {}
+}
+
+variable "disallow_secrets_read" {
+  description = "Omit core secrets (get, list, watch) from the reader ClusterRole (spec.security.disallowSecretsRead on the PlatformAgent CR). Null leaves the field unset on the CR so new installs grant secrets read access and existing installs keep their current ClusterRole permissions."
+  type        = bool
+  default     = null
 }

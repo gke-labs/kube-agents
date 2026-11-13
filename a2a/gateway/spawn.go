@@ -29,6 +29,21 @@ import (
 // switch; a setting, not surgery (retarget 8/26).
 const RouteSession = "session"
 
+// sessionPodNdots is the resolver's ndots on a session pod. Kubernetes'
+// default is 5, so the 4-dot broker and kube-api proxy URLs
+// (<svc>.<ns>.svc.cluster.local) would go through all six search domains
+// first: up to 14 A/AAAA queries per lookup (#5590). With 3 they are asked
+// as written first, and the 2-dot NATS_URL host keeps the search list order
+// (musl libc does not fall back to it for a name with ndots or more dots).
+// The operator sets the same value on the pods it renders that dial the
+// broker (brokerCallerPodNdots in k8s-operator/internal/controller/pod_dns.go
+// lists them), and a test in each module reads the other's constant, so the
+// two cannot drift apart.
+const sessionPodNdots = "3"
+
+// resolverNdotsOption is the resolv.conf option sessionPodNdots sets.
+const resolverNdotsOption = "ndots"
+
 const (
 	// sweepInterval paces the orphan sweep; sweepPassTimeout bounds one
 	// pass, so a hung stream or API call cannot make passes pile up.
@@ -129,9 +144,9 @@ const (
 	// 1000 (the shell sandbox's buildShellSandboxCredentialProxyTokenVolume
 	// argues the same). Spelled identically in credential_proxy.py and the
 	// operator's platformagent_broker_split.go.
-	credentialProxySessionAudience        = "kubeagents-credential-proxy-session" // #nosec G101 -- audience name
-	credentialProxyTokenVolume            = "credential-proxy-token"              // #nosec G101 -- volume name
-	credentialProxyTokenMountPath         = "/var/run/secrets/kubeagents/credential-proxy"
+	credentialProxySessionAudience        = "kubeagents-credential-proxy-session"          // #nosec G101 -- audience name
+	credentialProxyTokenVolume            = "credential-proxy-token"                       // #nosec G101 -- volume name
+	credentialProxyTokenMountPath         = "/var/run/secrets/kubeagents/credential-proxy" // #nosec G101 -- mount path
 	credentialProxyTokenFile              = "token"
 	credentialProxyTokenMode              = 0444
 	credentialProxyTokenExpirationSeconds = 3600
@@ -139,6 +154,10 @@ const (
 	// get-credentials returns ($HERMES_HOME/.kubeconfigs); the pod's
 	// scratch emptyDir, the one writable place.
 	sessionHermesHome = "/scratch"
+
+	kubeProxyCAVolume    = "kube-proxy-ca"
+	kubeProxyCAMountPath = "/var/run/secrets/kubeagents/kube-proxy-ca"
+	kubeProxyCAFile      = "ca.crt"
 
 	labelPartOf = "app.kubernetes.io/part-of"
 	partOfValue = "a2a-next"
@@ -384,6 +403,11 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 		},
 		Spec: corev1.PodSpec{
 			RestartPolicy: corev1.RestartPolicyNever,
+			// ndots:3, so the broker and kube-api proxy URLs (4 dots) are
+			// asked as written first: 2 DNS queries, not up to 14 (#5590).
+			DNSConfig: &corev1.PodDNSConfig{
+				Options: []corev1.PodDNSConfigOption{{Name: resolverNdotsOption, Value: ptr.To(sessionPodNdots)}},
+			},
 			// The session ServiceAccount, which holds no RBAC at all: it
 			// exists so the kubelet can mint the bus token below against an
 			// identity the callout's map is keyed on.
@@ -588,6 +612,23 @@ func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, prim
 				}}},
 			}},
 		})
+		if s.cfg.KubeProxyURL != "" {
+			c.Env = append(c.Env, corev1.EnvVar{Name: "KUBE_PROXY_URL", Value: s.cfg.KubeProxyURL})
+			if s.cfg.KubeProxyHostContext != "" {
+				c.Env = append(c.Env, corev1.EnvVar{Name: "KUBE_PROXY_HOST_CONTEXT", Value: s.cfg.KubeProxyHostContext})
+			}
+		}
+		if s.cfg.KubeProxyCAConfigMap != "" {
+			c.Env = append(c.Env, corev1.EnvVar{Name: "KUBE_PROXY_CA_FILE", Value: kubeProxyCAMountPath + "/" + kubeProxyCAFile})
+			c.VolumeMounts = append(c.VolumeMounts, corev1.VolumeMount{Name: kubeProxyCAVolume, MountPath: kubeProxyCAMountPath, ReadOnly: true})
+			pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
+				Name: kubeProxyCAVolume,
+				VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{Name: s.cfg.KubeProxyCAConfigMap},
+					Items:                []corev1.KeyToPath{{Key: kubeProxyCAFile, Path: kubeProxyCAFile}},
+				}},
+			})
+		}
 	}
 	created, err := s.client.CoreV1().Pods(s.cfg.Namespace).Create(ctx, pod, metav1.CreateOptions{})
 	if err != nil {

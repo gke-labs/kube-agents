@@ -563,6 +563,100 @@ func TestReconcileRBAC_DeletesLegacyRBAC_ServiceAccountSwap(t *testing.T) {
 	}
 }
 
+func TestReconcileRBAC_DisallowSecretsReadAndExistingInstallPreservation(t *testing.T) {
+	scheme := setupScheme()
+	roleName := "kubeagents:minimal:test-ns:test-agent"
+
+	t.Run("new install with unset DisallowSecretsRead grants secrets", func(t *testing.T) {
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		}
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+		r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+		if err := r.reconcileRBAC(context.Background(), agent); err != nil {
+			t.Fatalf("reconcileRBAC failed: %v", err)
+		}
+		var role rbacv1.ClusterRole
+		if err := cl.Get(context.Background(), client.ObjectKey{Name: roleName}, &role); err != nil {
+			t.Fatalf("Get ClusterRole failed: %v", err)
+		}
+		if !clusterRoleGrantsCoreSecrets(&role) {
+			t.Fatalf("expected new install ClusterRole to grant secrets, got %v", role.Rules[0].Resources)
+		}
+	})
+
+	t.Run("existing install without secrets keeps existing RBAC when DisallowSecretsRead is unset", func(t *testing.T) {
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		}
+		existingRole := buildMinimalPlatformRoleWithSecrets(agent, false)
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, existingRole).WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+		r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+		if err := r.reconcileRBAC(context.Background(), agent); err != nil {
+			t.Fatalf("reconcileRBAC failed: %v", err)
+		}
+		var role rbacv1.ClusterRole
+		if err := cl.Get(context.Background(), client.ObjectKey{Name: roleName}, &role); err != nil {
+			t.Fatalf("Get ClusterRole failed: %v", err)
+		}
+		if clusterRoleGrantsCoreSecrets(&role) {
+			t.Fatalf("expected existing ClusterRole without secrets to omit secrets when DisallowSecretsRead is unset, got %v", role.Rules[0].Resources)
+		}
+	})
+
+	t.Run("existing install without secrets adds secrets when DisallowSecretsRead is false", func(t *testing.T) {
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+			Spec: agentv1alpha1.PlatformAgentSpec{
+				AgentSpec: agentv1alpha1.AgentSpec{
+					Security: &agentv1alpha1.SecuritySpec{
+						DisallowSecretsRead: ptr.To(false),
+					},
+				},
+			},
+		}
+		existingRole := buildMinimalPlatformRoleWithSecrets(agent, false)
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, existingRole).WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+		r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+		if err := r.reconcileRBAC(context.Background(), agent); err != nil {
+			t.Fatalf("reconcileRBAC failed: %v", err)
+		}
+		var role rbacv1.ClusterRole
+		if err := cl.Get(context.Background(), client.ObjectKey{Name: roleName}, &role); err != nil {
+			t.Fatalf("Get ClusterRole failed: %v", err)
+		}
+		if !clusterRoleGrantsCoreSecrets(&role) {
+			t.Fatalf("expected DisallowSecretsRead=false to grant secrets on existing ClusterRole, got %v", role.Rules[0].Resources)
+		}
+	})
+
+	t.Run("DisallowSecretsRead=true omits secrets on new and existing installs", func(t *testing.T) {
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+			Spec: agentv1alpha1.PlatformAgentSpec{
+				AgentSpec: agentv1alpha1.AgentSpec{
+					Security: &agentv1alpha1.SecuritySpec{
+						DisallowSecretsRead: ptr.To(true),
+					},
+				},
+			},
+		}
+		existingRole := buildMinimalPlatformRoleWithSecrets(agent, true)
+		cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, existingRole).WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+		r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+		if err := r.reconcileRBAC(context.Background(), agent); err != nil {
+			t.Fatalf("reconcileRBAC failed: %v", err)
+		}
+		var role rbacv1.ClusterRole
+		if err := cl.Get(context.Background(), client.ObjectKey{Name: roleName}, &role); err != nil {
+			t.Fatalf("Get ClusterRole failed: %v", err)
+		}
+		if clusterRoleGrantsCoreSecrets(&role) {
+			t.Fatalf("expected DisallowSecretsRead=true to omit secrets, got %v", role.Rules[0].Resources)
+		}
+	})
+}
+
 func TestPlatformAgentReconciler_Reconcile_MissingRuntimeClass(t *testing.T) {
 	scheme := setupScheme()
 
@@ -761,6 +855,9 @@ func TestPlatformAgentReconciler_Reconcile_PodUnschedulable(t *testing.T) {
 				"app": "test-agent-unschedulable-gateway",
 			},
 		},
+		// As the agent pod renders it: the CR's RuntimeClass on the pod,
+		// which is what lets the scan blame the RuntimeClass.
+		Spec: corev1.PodSpec{RuntimeClassName: ptr.To("gvisor")},
 		Status: corev1.PodStatus{
 			Phase: corev1.PodPending,
 			Conditions: []corev1.PodCondition{
@@ -991,7 +1088,7 @@ func reconcileInvalidCredentialProxyResources(t *testing.T, override *corev1.Res
 		t.Fatalf("mark shell sandbox ready: %v", err)
 	}
 	r.APIReader = cl
-	phase, err := r.updateStatusReady(ctx, updated, "", otlpSourceNone, r.resolveNetpolProfile(ctx, updated), a2aStateFrom(t, ctx, r, updated))
+	phase, _, err := r.updateStatusReady(ctx, updated, "", otlpSourceNone, r.resolveNetpolProfile(ctx, updated), a2aStateFrom(t, ctx, r, updated))
 	if err != nil {
 		t.Fatalf("updateStatusReady failed: %v", err)
 	}
@@ -5177,7 +5274,7 @@ func TestReconcileNetworkPolicy_StatusReporting(t *testing.T) {
 	}
 
 	profile := r.resolveNetpolProfile(ctx, agent)
-	phase, err := r.updateStatusReady(ctx, agent, "http://otel:4318", "Spec", profile, a2aProvisionState{})
+	phase, _, err := r.updateStatusReady(ctx, agent, "http://otel:4318", "Spec", profile, a2aProvisionState{})
 	if err != nil {
 		t.Fatalf("updateStatusReady failed: %v", err)
 	}
@@ -5267,7 +5364,7 @@ func TestReconcileNetworkPolicy_StatusReporting_Disabled(t *testing.T) {
 	}
 
 	profile := r.resolveNetpolProfile(ctx, agent)
-	if _, err := r.updateStatusReady(ctx, agent, "http://otel:4318", "Spec", profile, a2aProvisionState{}); err != nil {
+	if _, _, err := r.updateStatusReady(ctx, agent, "http://otel:4318", "Spec", profile, a2aProvisionState{}); err != nil {
 		t.Fatalf("updateStatusReady failed: %v", err)
 	}
 

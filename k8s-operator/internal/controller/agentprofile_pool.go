@@ -40,7 +40,7 @@ const (
 	// profileWorkerResetPathsEnv is lib.EnvProfileResetPaths: the
 	// directories the worker empties after every task.
 	profileWorkerResetPathsEnv = "A2A_PROFILE_RESET_PATHS"
-	// profileWorkerUID is the worker image's user (a2a-worker, node:22's
+	// profileWorkerUID is the worker image's user (a2a-worker, the node base image's
 	// node user), and its FSGroup.
 	profileWorkerUID = 1000
 	// profileWorkerStatusPort is lib.ProfileWorkerStatusPort: /readyz and
@@ -91,9 +91,10 @@ const (
 
 	// profileWorkerImagePath is the worker image's PATH, which the tools'
 	// bin directories go in front of.
-	// The credential proxy's shims come first, as the image puts them
-	// (a2a/Dockerfile.worker): kubectl and gcloud resolve to them, and the
-	// image ships no native binary under those names.
+	// /opt/credential-proxy/bin comes first (gcloud shim), followed by
+	// /usr/local/bin/kubectl (a2a/Dockerfile.worker), which routes through
+	// <agent>-kube-proxy when KUBE_PROXY_URL is set and delegates to
+	// credential-proxy-exec kubectl on AgentProfile workers where it is unset.
 	profileWorkerImagePath = "/opt/credential-proxy/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 	// profileWorkerModelKey only satisfies the harness's "an API key exists"
@@ -212,7 +213,10 @@ func buildProfileWorkerPodSpec(agent *agentv1alpha1.PlatformAgent, profile *agen
 		ServiceAccountName:           serviceAccount,
 		AutomountServiceAccountToken: ptr.To(false),
 		RestartPolicy:                restart,
-		RuntimeClassName:             shellSandboxRuntimeClassName(agent),
+		// ndots:3, see brokerCallerPodDNSConfig: the Job template and the
+		// warm pool both use this pod spec.
+		DNSConfig:        brokerCallerPodDNSConfig(),
+		RuntimeClassName: shellSandboxRuntimeClassName(agent),
 		SecurityContext: &corev1.PodSecurityContext{
 			RunAsNonRoot:   ptr.To(true),
 			RunAsUser:      ptr.To(int64(profileWorkerUID)),

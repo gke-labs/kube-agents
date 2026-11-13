@@ -1583,7 +1583,11 @@ class ImageOwnedForceSyncTest(unittest.TestCase):
         lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
         start = next(i for i, line in enumerate(lines) if line.startswith("# 2a. "))
         end = next(i for i in range(start, len(lines)) if lines[i] == "fi")
-        names = ("onboarding/scan_in_progress.md", "onboarding/scan_completed.md")
+        # Every prompt the image ships, so a new one the entrypoint's list does not name fails here.
+        names = sorted(
+            f"onboarding/{p.name}" for p in (_REPO / "agents" / "chat" / "defaults" / "onboarding").glob("*.md")
+        )
+        self.assertIn("onboarding/report_filed.md", names)
         with tempfile.TemporaryDirectory() as tmp:
             image = pathlib.Path(tmp) / "defaults"
             pvc = pathlib.Path(tmp) / "data"

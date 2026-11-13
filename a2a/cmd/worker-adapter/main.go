@@ -124,7 +124,8 @@ const (
 	delegateToolID = "mcp__" + workeradapter.DelegateMCPServer + "__" + workeradapter.DelegateToolName
 	// delegatePrompt tells the model the tool exists and when to reach for
 	// it; the tool's own schema (mcp.go) covers how to call it.
-	delegatePrompt = "You can hand a task to another agent with the `delegate` tool (addressee `platform` is the platform agent, which can read and act on the fleet). " +
+	delegatePrompt = "You can hand a task to another agent with the `delegate` tool. Its addressee field lists the agents you may use this turn: usually `platform`, the platform agent, which can read and act on the fleet, and any agent profile this conversation can reach. If it says no agent is available, don't call it. " +
+		"When the person asks for one of those agents by name, delegate to it under that name. " +
 		"The gateway checks that the user may reach that agent before anything runs. Calling `delegate` ends your turn; the agent's result arrives as your next turn, so say what you are delegating and why in one line first. " +
 		"Delegate when the ask needs the fleet, a cluster or privileges you do not have; answer yourself when you can."
 
@@ -139,17 +140,40 @@ func main() {
 	os.Exit(run())
 }
 
+// serveMCP is `worker-adapter mcp`: the delegate MCP server over in and out,
+// at the socket the adapter named and with the delegate targets it wrote into
+// this process's env for the turn.
+func serveMCP(ctx context.Context, in io.Reader, out io.Writer, log *slog.Logger) error {
+	return workeradapter.ServeDelegateMCP(ctx, in, out, workeradapter.DelegateSocketPath(), workeradapter.DelegateTargetsFromEnv(log), log)
+}
+
 func run() int {
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	slog.SetDefault(log)
 
-	// `worker-adapter mcp` is not a task run: it is the stdio MCP server the
-	// harness launches as a subprocess of itself, forwarding the session's
-	// one delegate tool call to this adapter process over a unix socket
-	// (worker-adapter/mcp.go). It has none of the task env below, so it is
-	// dispatched before configFromEnv rather than folded into it.
+	// The two subcommands are not task runs: each is a stdio MCP server the
+	// harness launches as a subprocess of itself, with none of the task env
+	// below, so they are dispatched before configFromEnv rather than folded
+	// into it.
+	//
+	// `worker-adapter mcp-relay <url>` is what a profile persona's broker
+	// servers are rendered as (worker-adapter/mcprelay.go): it carries
+	// messages to the broker's relay with the pod's credentials.
+	if len(os.Args) > 1 && os.Args[1] == workeradapter.MCPRelayCommand {
+		if len(os.Args) != 3 {
+			fmt.Fprintln(os.Stderr, "usage: worker-adapter mcp-relay <broker relay URL>")
+			return 2
+		}
+		if err := workeradapter.ServeMCPRelay(context.Background(), os.Args[2], os.Stdin, os.Stdout, log); err != nil && !errors.Is(err, io.EOF) {
+			fmt.Fprintln(os.Stderr, "mcp-relay:", err)
+			return 1
+		}
+		return 0
+	}
+	// `worker-adapter mcp` forwards the session's one delegate tool call to
+	// this adapter process over a unix socket (worker-adapter/mcp.go).
 	if len(os.Args) > 1 && os.Args[1] == "mcp" {
-		if err := workeradapter.ServeDelegateMCP(context.Background(), os.Stdin, os.Stdout, workeradapter.DelegateSocketPath(), log); err != nil && !errors.Is(err, io.EOF) {
+		if err := serveMCP(context.Background(), os.Stdin, os.Stdout, log); err != nil && !errors.Is(err, io.EOF) {
 			fmt.Fprintln(os.Stderr, "mcp:", err)
 			return 1
 		}
@@ -197,7 +221,9 @@ func run() int {
 			ConfigRoot: envOrDefault(lib.EnvProfileConfigRoot, lib.ProfileConfigRoot),
 			// The broker's task-token file (#3889's proxy confinement).
 			TaskTokenFile: os.Getenv("CREDENTIAL_PROXY_TASK_TOKEN_FILE"),
-			ResetPaths:    resetPaths(os.Getenv(lib.EnvProfileResetPaths)),
+			// The persona's MCP servers through the broker's relay (#5495).
+			Relay:      workeradapter.ProfileRelay(selfPath(), os.Getenv),
+			ResetPaths: resetPaths(os.Getenv(lib.EnvProfileResetPaths)),
 		}
 		if err := workeradapter.RunProfileWorker(ctx, cfg, pw); err != nil {
 			log.Error("profile worker failed", "err", err)
@@ -440,10 +466,7 @@ func harnessCommand() []string {
 		// and speaks MCP to it over stdio; strictMCPConfigFlag above keeps a
 		// stray project or user MCP config from adding tools the gateway
 		// never vetted.
-		self, err := os.Executable()
-		if err != nil || self == "" {
-			self = "/usr/local/bin/worker-adapter"
-		}
+		self := selfPath()
 		sock := workeradapter.DelegateSocketPath()
 		mcpCfg, _ := json.Marshal(map[string]any{workeradapter.MCPServersKey: map[string]any{
 			workeradapter.DelegateMCPServer: map[string]any{
@@ -671,7 +694,7 @@ func readPrimer(log *slog.Logger) string {
 	if path == "" {
 		return ""
 	}
-	b, err := os.ReadFile(path) // #nosec G304 -- the spawner's own mount path
+	b, err := os.ReadFile(path) // #nosec G304 G703 -- the spawner's own mount path (lib.EnvPrimerFile)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			log.Warn("could not read the transcript primer; this turn runs without the conversation so far", "path", path, "error", err)
@@ -687,4 +710,15 @@ func envOrDefault(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// selfPath is this binary's path, for the harness to launch it again as an
+// MCP server (`mcp`, `mcp-relay`): the image's install path when the running
+// executable can't be found.
+func selfPath() string {
+	self, err := os.Executable()
+	if err != nil || self == "" {
+		return "/usr/local/bin/worker-adapter"
+	}
+	return self
 }

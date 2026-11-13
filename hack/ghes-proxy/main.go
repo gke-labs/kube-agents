@@ -134,7 +134,7 @@ const shutdownGrace = 25 * time.Second
 // must wait for Shutdown itself, or the process exits mid-request.
 func serve(ctx context.Context, srv *http.Server, start func() error, grace time.Duration) error {
 	done := make(chan error, 1)
-	go func() {
+	go func() { // #nosec G118 -- runs after ctx is done, so the shutdown deadline needs a context that ctx's cancel does not end
 		<-ctx.Done()
 		shutdown, cancel := context.WithTimeout(context.Background(), grace)
 		defer cancel()

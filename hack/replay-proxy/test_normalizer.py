@@ -85,6 +85,30 @@ class IdentifierTest(unittest.TestCase):
         out = normalizer.Normalizer(NOW, False).walk({"current_run_id": 190, "parent_run_id": 7})
         self.assertNotIn("190", json.dumps(out))
 
+    def test_kanban_comment_id_is_swapped(self):
+        # kanban_comment's result: the comment's row id counts every comment on
+        # the install's board, so each run gets a later one (41, then 43).
+        def comment(cid, task="t_57626387"):
+            return {"role": "tool", "tool_call_id": "call_1", "content": json.dumps({
+                "ok": True, "task_id": task, "comment_id": cid, "task_status": "running",
+                "comment_reaches": "the worker running this card right now", "completion_posts_to_chat": True})}
+        self.assertEqual(fp({"model": "m", "messages": [comment(41)]}),
+                         fp({"model": "m", "messages": [comment(43, task="t_f3c26f19")]}))
+        out = normalizer.Normalizer(NOW, False).walk({"comment_id": 41})
+        self.assertEqual(out, {"comment_id": "⟦NUM_1⟧"})
+        self.assertEqual(norm('comment_id: 41'), norm('comment_id: 43'))
+        self.assertEqual(norm('"comment_id": "41"'), '"comment_id": "⟦NUM_1⟧"')
+        # What the card is doing stays in the key.
+        self.assertNotEqual(norm(json.dumps({"comment_id": 41, "task_status": "running"})),
+                            norm(json.dumps({"comment_id": 41, "task_status": "done"})))
+
+    def test_comment_id_lookalikes_stay_literal(self):
+        for text in ('"comment_count": 41', '"comments": 41', 'last_comment_id: 41', 'xcomment_id=41',
+                     'comment 41'):
+            self.assertNotIn("⟦NUM", norm(text), text)
+        out = normalizer.Normalizer(NOW, False).walk({"last_comment_id": 41, "comment_count": 41, "comment_id": "c-41"})
+        self.assertEqual(out, {"comment_count": 41, "comment_id": "c-41", "last_comment_id": 41})
+
     def test_heartbeat_events_are_left_out_of_the_key(self):
         def card(events):
             return norm(json.dumps({"task": {"id": "t_11111111", "status": "running"}, "events": events}))
@@ -248,6 +272,94 @@ class StderrOrderTest(unittest.TestCase):
         warning = "WARNING: something"
         self.assertNotEqual(norm(warning + "\nlimit: 16"), norm(warning + "\nlimit: 64"))
         self.assertEqual(norm(warning), warning)
+
+
+def skill_result(references, scripts, **extra):
+    """A skill_view result as Hermes writes one (tools/skills_tool.py), with its linked files in the order given."""
+    result = {"success": True, "name": "fleet-audit", "tags": ["audit", "fleet"], "related_skills": ["submit-suggestion"],
+              "content": "---\nname: fleet-audit\n---\n# fleet-audit", "path": "fleet-audit/SKILL.md",
+              "linked_files": {"references": references, "scripts": scripts}}
+    result.update(extra)
+    return json.dumps(result)
+
+
+def tool_conversation(tool_name, content, call_id="call_1__thought__QUJD"):
+    """A request whose last message is `content`, returned by a call to `tool_name`."""
+    call = {"id": call_id, "type": "function",
+            "function": {"name": tool_name, "arguments": json.dumps({"name": "fleet-audit"})}}
+    return {"model": "m", "messages": [
+        {"role": "user", "content": "audit the fleet"},
+        {"role": "assistant", "content": "", "tool_calls": [call]},
+        {"role": "tool", "tool_call_id": call_id, "content": content},
+    ]}
+
+
+class SkillViewListingTest(unittest.TestCase):
+    def test_a_notice_hermes_appended_keeps_the_listing_sorted(self):
+        # Hermes appends its iteration-budget warning to the last tool message:
+        # the content is then JSON followed by text, and the listing still keys alike.
+        notice = "\n\n[Iteration budget: 3 of 90 iterations left.]"
+        recorded = skill_result(["references/ledger.md", "references/finish.md"], ["scripts/a.py"]) + notice
+        replayed = skill_result(["references/finish.md", "references/ledger.md"], ["scripts/a.py"]) + notice
+        self.assertEqual(fp(tool_conversation("skill_view", recorded)), fp(tool_conversation("skill_view", replayed)))
+        other = skill_result(["references/finish.md", "references/ledger.md"], ["scripts/a.py"]) + "\n\nanother notice"
+        self.assertNotEqual(fp(tool_conversation("skill_view", recorded)), fp(tool_conversation("skill_view", other)))
+
+    def test_linked_files_in_another_order_key_the_same(self):
+        recorded = skill_result(["references/ledger.md", "references/finish.md"], ["scripts/b.py", "scripts/a.py"])
+        replayed = skill_result(["references/finish.md", "references/ledger.md"], ["scripts/a.py", "scripts/b.py"])
+        self.assertEqual(fp(tool_conversation("skill_view", recorded)), fp(tool_conversation("skill_view", replayed)))
+
+    def test_available_files_in_another_order_key_the_same(self):
+        def missing(files):
+            return json.dumps({"success": False, "error": "File 'x.md' not found in skill 'fleet-audit'.",
+                               "available_files": {"references": files}})
+        self.assertEqual(fp(tool_conversation("skill_view", missing(["references/b.md", "references/a.md"]))),
+                         fp(tool_conversation("skill_view", missing(["references/a.md", "references/b.md"]))))
+
+    def test_a_different_set_of_files_keys_differently(self):
+        one = skill_result(["references/ledger.md", "references/finish.md"], ["scripts/a.py"])
+        other = skill_result(["references/ledger.md", "references/clean-run.md"], ["scripts/a.py"])
+        self.assertNotEqual(fp(tool_conversation("skill_view", one)), fp(tool_conversation("skill_view", other)))
+        moved = skill_result(["references/ledger.md"], ["scripts/a.py", "references/finish.md"])
+        self.assertNotEqual(fp(tool_conversation("skill_view", one)), fp(tool_conversation("skill_view", moved)),
+                            "a file in another group is another listing")
+
+    def test_another_tools_listing_keeps_its_order(self):
+        recorded = skill_result(["references/ledger.md", "references/finish.md"], ["scripts/b.py", "scripts/a.py"])
+        replayed = skill_result(["references/finish.md", "references/ledger.md"], ["scripts/a.py", "scripts/b.py"])
+        self.assertNotEqual(fp(tool_conversation("read_file", recorded)), fp(tool_conversation("read_file", replayed)))
+
+    def test_a_result_answering_no_skill_view_call_keeps_its_order(self):
+        # The call is matched by id: a tool message naming another call is not read as skill_view's.
+        recorded = skill_result(["references/ledger.md", "references/finish.md"], ["scripts/a.py"])
+        replayed = skill_result(["references/finish.md", "references/ledger.md"], ["scripts/a.py"])
+
+        def answering_other(content):
+            body = tool_conversation("skill_view", content)
+            body["messages"][-1] = dict(body["messages"][-1], tool_call_id="call_2")
+            return body
+        self.assertNotEqual(fp(answering_other(recorded)), fp(answering_other(replayed)))
+
+    def test_the_results_other_fields_are_unchanged(self):
+        content = skill_result(["references/ledger.md", "references/finish.md"], ["scripts/b.py", "scripts/a.py"])
+        walked = normalizer.normalize_request(tool_conversation("skill_view", content), NOW).messages[-1]
+        expected = json.loads(content)
+        expected["linked_files"] = {"references": ["references/finish.md", "references/ledger.md"],
+                                    "scripts": ["scripts/a.py", "scripts/b.py"]}
+        self.assertEqual(json.loads(walked["content"]), expected)
+        self.assertEqual(json.loads(walked["content"])["tags"], ["audit", "fleet"], "tags keep their order")
+        flipped = skill_result(["references/ledger.md", "references/finish.md"], ["scripts/b.py", "scripts/a.py"],
+                               tags=["fleet", "audit"])
+        self.assertNotEqual(fp(tool_conversation("skill_view", content)), fp(tool_conversation("skill_view", flipped)))
+
+    def test_a_result_already_in_order_keeps_its_text(self):
+        content = skill_result(["references/a.md"], ["scripts/a.py"])
+        message = {"role": "tool", "tool_call_id": "call_1", "content": content}
+        walker = normalizer.Normalizer(NOW, keep_ips=False)
+        walker.skill_view_calls.add("call_1")
+        self.assertIs(walker.skill_listings_sorted(message), message)
+        self.assertEqual(normalizer.sorted_skill_listings("<persisted-output>"), "<persisted-output>")
 
 
 class AnswerSlotTest(unittest.TestCase):
@@ -912,6 +1024,195 @@ class RunNameTest(unittest.TestCase):
         self.assertEqual(norm("operation-999999999999-9f9999"), "operation-999999999999-9f9999")
 
 
+def not_found(path="/opt/data/AGENTS.md", similar=None, error=None):
+    """A read_file result for a missing file as Hermes writes one (tools/file_operations.py), `similar_files` left out when empty."""
+    result = {"content": "", "total_lines": 0, "file_size": 0, "truncated": False, "is_binary": False,
+              "is_image": False, "error": error or f"File not found: {path}"}
+    if similar:
+        result["similar_files"] = similar
+    return json.dumps(result)
+
+
+def read_file_conversation(content, tool_name="read_file", call_id="call_1__thought__QUJD", answered=None):
+    """A request whose last message is `content`, returned by a call to `tool_name` (answering `answered`, else that call)."""
+    call = {"id": call_id, "type": "function",
+            "function": {"name": tool_name, "arguments": json.dumps({"path": "/opt/data/AGENTS.md"})}}
+    return {"model": "m", "messages": [
+        {"role": "user", "content": "look at the inventory"},
+        {"role": "assistant", "content": "", "tool_calls": [call]},
+        {"role": "tool", "tool_call_id": answered or call_id, "content": content},
+    ]}
+
+
+class SimilarFilesTest(unittest.TestCase):
+    WITH_INVENTORY = ["/opt/data/INVENTORY.md", "/opt/data/INVENTORY.raw.md", "/opt/data/SETTINGS.md"]
+    WITHOUT_INVENTORY = ["/opt/data/INVENTORY.raw.md", "/opt/data/SETTINGS.md"]
+
+    def test_a_not_found_result_keys_alike_whatever_files_it_lists(self):
+        # Whether INVENTORY.md exists yet is another agent's timing; Hermes leaves the key out when nothing is like it.
+        keys = {fp(read_file_conversation(not_found(similar=similar)))
+                for similar in (self.WITH_INVENTORY, self.WITHOUT_INVENTORY, None)}
+        self.assertEqual(len(keys), 1)
+
+    def test_the_rest_of_the_result_still_counts(self):
+        self.assertNotEqual(fp(read_file_conversation(not_found(similar=self.WITH_INVENTORY))),
+                            fp(read_file_conversation(not_found("/opt/data/SOUL.md", similar=self.WITH_INVENTORY))))
+        walked = normalizer.normalize_request(read_file_conversation(not_found(similar=self.WITH_INVENTORY)), NOW)
+        self.assertEqual(json.loads(walked.messages[-1]["content"]), json.loads(not_found()))
+
+    def test_a_notice_hermes_appended_keeps_the_list_dropped(self):
+        notice = "\n\n[Tool loop warning: same_tool_failure_warning; count=3; read_file has failed 3 times this turn.]"
+        keys = {fp(read_file_conversation(not_found(similar=similar) + notice))
+                for similar in (self.WITH_INVENTORY, self.WITHOUT_INVENTORY, None)}
+        self.assertEqual(len(keys), 1)
+        self.assertNotEqual(fp(read_file_conversation(not_found(similar=self.WITH_INVENTORY) + notice)),
+                            fp(read_file_conversation(not_found(similar=self.WITH_INVENTORY) + "\n\nanother notice")))
+
+    def test_a_successful_read_is_untouched(self):
+        content = json.dumps({"content": "1|# Inventory", "total_lines": 1, "file_size": 12, "truncated": False,
+                              "is_binary": False, "is_image": False})
+        self.assertEqual(normalizer.without_similar_files(content), (content, []))
+        self.assertIs(normalizer.without_similar_files(content)[0], content)
+
+    def test_an_error_other_than_not_found_keeps_its_list(self):
+        def denied(similar):
+            return not_found(similar=similar, error="Permission denied: /opt/data/AGENTS.md")
+        self.assertNotEqual(fp(read_file_conversation(denied(self.WITH_INVENTORY))),
+                            fp(read_file_conversation(denied(self.WITHOUT_INVENTORY))))
+
+    def test_another_tools_result_keeps_its_list(self):
+        self.assertNotEqual(fp(read_file_conversation(not_found(similar=self.WITH_INVENTORY), tool_name="terminal")),
+                            fp(read_file_conversation(not_found(similar=self.WITHOUT_INVENTORY), tool_name="terminal")))
+
+    def test_a_result_answering_no_read_file_call_keeps_its_list(self):
+        # The call is matched by id: a tool message naming another call is not read as read_file's.
+        self.assertNotEqual(fp(read_file_conversation(not_found(similar=self.WITH_INVENTORY), answered="call_2")),
+                            fp(read_file_conversation(not_found(similar=self.WITHOUT_INVENTORY), answered="call_2")))
+
+    def test_a_result_with_nothing_to_drop_keeps_its_text(self):
+        content = not_found()
+        message = {"role": "tool", "tool_call_id": "call_1", "content": content}
+        walker = normalizer.Normalizer(NOW, keep_ips=False)
+        walker.read_file_calls.add("call_1")
+        self.assertIs(walker.similar_files_dropped(message), message)
+        self.assertEqual(walker.mapping.dropped_files, set())
+        self.assertEqual(normalizer.without_similar_files("<persisted-output>"), ("<persisted-output>", []))
+
+    def test_a_dropped_file_counts_against_an_answer_by_its_name(self):
+        mapping = normalizer.normalize_request(read_file_conversation(not_found(similar=self.WITH_INVENTORY)), NOW).mapping
+        # A tool call's arguments are a JSON string: a name starting a line follows an escaped `\n`.
+        escaped = json.dumps({"content": "Files:\nINVENTORY.md lists the fleet\n\tSETTINGS.md\r\nINVENTORY.raw.md"})
+        for answer in ('{"path": "/opt/data/INVENTORY.md"}', "cd /opt/data && cat INVENTORY.md", "SETTINGS.md.",
+                       escaped, json.dumps({"content": "x\nINVENTORY.md"}), json.dumps({"content": "x\tSETTINGS.md"}),
+                       json.dumps({"content": "x\rSETTINGS.md"})):
+            with self.subTest(answer=answer):
+                self.assertTrue(mapping.answer_names_dropped_file(answer))
+        self.assertEqual(mapping.dropped_files, {"INVENTORY.md", "INVENTORY.raw.md", "SETTINGS.md"})
+        for answer in ('{"path": "/opt/data/AGENTS.md"}', "OLD_INVENTORY.md", "INVENTORY.mdx", "an inventory",
+                       "cp INVENTORY.md.bak /tmp"):
+            with self.subTest(answer=answer):
+                self.assertFalse(mapping.answer_names_dropped_file(answer))
+        # A name with no extension is not the start of a longer file name.
+        bare = normalizer.normalize_request(read_file_conversation(not_found(similar=["/opt/data/config"])), NOW).mapping
+        self.assertTrue(bare.answer_names_dropped_file("cat config."))
+        self.assertFalse(bare.answer_names_dropped_file("cat config.yaml"))
+        self.assertEqual(normalizer.normalize_request(
+            read_file_conversation(not_found(similar=self.WITH_INVENTORY), tool_name="terminal"), NOW).mapping.dropped_files,
+            set(), "nothing is dropped from another tool's result, so nothing counts")
+
+    def test_a_dropped_name_holding_a_bound_identifier_counts_as_written(self):
+        # Normalized, the name would read `⟦EVALPROJECT_1⟧-notes.md`; the answer is read as written.
+        body = read_file_conversation(not_found(similar=["/opt/data/kube-agents-evals-22-notes.md"]))
+        body["messages"][0]["content"] = "look at the inventory for kube-agents-evals-22"
+        mapping = normalizer.normalize_request(body, NOW).mapping
+        self.assertTrue(mapping.answer_names_dropped_file('{"path": "/opt/data/kube-agents-evals-22-notes.md"}'))
+        self.assertFalse(mapping.answer_names_dropped_file('{"path": "/opt/data/kube-agents-evals-21-notes.md"}'))
+
+
+def spent_notice(number, revision, outcome="The repository no longer holds the branch, so the name is free."):
+    """submit_suggestion prepare's output after it found a spent proposal on the branch (`clear_spent_branch`)."""
+    return json.dumps({"output": (
+        "[2026-11-12 02:08:09] [SRE-AUTH] 'platform-agent/fix-payments-api' was the source of "
+        f"https://github.com/gke-agentic/kube-agents-evals-22-infra/pull/{number}, which is closed. That proposal's "
+        f"last revision, {revision}, is not in 'main', so it was squash-merged or closed rather than merged whole. "
+        f"{outcome}\n" + json.dumps({"branch": "platform-agent/fix-payments-api", "base": "main", "proposal": ""})),
+        "exit_code": 0, "error": None})
+
+
+class SpentProposalTest(unittest.TestCase):
+    def test_an_earlier_runs_proposal_keys_alike(self):
+        self.assertEqual(norm(spent_notice(1399, "3ef98c4e29cf")), norm(spent_notice(1398, "141a5bb53467")))
+        output = json.loads(norm(spent_notice(1399, "3ef98c4e29cf")))["output"]
+        self.assertIn("/⟦EVALPROJECT_1⟧-infra/pull/⟦PULL_1⟧, which is closed. That proposal's last revision, ⟦COMMIT_1⟧,",
+                      output)
+
+    def test_the_deleted_or_held_branch_revision(self):
+        deleted = "Deleted the spent branch at {}; the name is free."
+        self.assertEqual(norm(spent_notice(1385, "2d5fee9a5002", deleted.format("2d5fee9a5002"))),
+                         norm(spent_notice(1387, "4ce9be6a80ee", deleted.format("4ce9be6a80ee"))))
+        self.assertEqual(norm("The repository held the branch at 2d5fee9a5002, and deleting it did not complete"),
+                         "The repository held the branch at ⟦COMMIT_1⟧, and deleting it did not complete")
+        self.assertEqual(norm("The repository still holds the branch at 2d5fee9a5002, so"),
+                         "The repository still holds the branch at ⟦COMMIT_1⟧, so")
+
+    def test_a_gitlab_proposal(self):
+        def gitlab(number):
+            return spent_notice(number, "3ef98c4e29cf").replace(
+                f"github.com/gke-agentic/kube-agents-evals-22-infra/pull/{number}",
+                f"gitlab.com/grp/sub/kube-agents-evals-22-infra/-/merge_requests/{number}")
+        self.assertIn("/-/merge_requests/⟦PULL_1⟧, which is closed", json.loads(norm(gitlab(12)))["output"])
+        self.assertEqual(norm(gitlab(12)), norm(gitlab(31)))
+        self.assertEqual(normalizer.normalize_request(request(gitlab(12)), NOW).mapping.proposal_numbers, {"12"})
+        self.assertEqual(norm("https://gitlab.com/grp/x/-/merge_requests/12"), "https://gitlab.com/grp/x/-/merge_requests/12")
+
+    def test_a_proposal_number_only_a_recent_work_digest_holds_counts_against_an_answer(self):
+        # The digest is dropped from the key; its unrestorable values still count (merge_unrestorable).
+        card = ("card t_bbbbbbbb\n\n## Recent work by @platform\n- t_deadbeef — 'platform-agent/b' was the source of "
+                "https://github.com/gke-agentic/x/pull/1399, which is closed.")
+        walker = normalizer.Normalizer(NOW, False)
+        walker.text(card)
+        self.assertTrue(walker.mapping.answer_repeats_bare_number("vcs.py proposal view 1399"))
+        self.assertFalse(walker.mapping.answer_repeats_bare_number("vcs.py proposal view 1400"))
+        self.assertEqual(walker.mapping.counts, {"TASK": 1}, "nothing in the digest is keyed")
+
+    def test_the_proposals_state_still_counts(self):
+        self.assertNotEqual(norm(spent_notice(1399, "3ef98c4e29cf")),
+                            norm(spent_notice(1399, "3ef98c4e29cf").replace("which is closed", "which is merged")))
+
+    def test_numbers_and_hex_outside_the_notice_stay(self):
+        for raw in ("https://github.com/gke-agentic/x/pull/1399", "merge PR #1399", "number: 1399",
+                    "revision 3ef98c4e29cf", "busybox@sha256:3ef98c4e29cf0a1b", "last revision, 1.35.8, is",
+                    "was the source of https://github.com/gke-agentic/x/pull/1399 (closed)"):
+            with self.subTest(raw=raw):
+                self.assertEqual(norm(raw), raw)
+        # In the same request: the notice's number is bound, the same number elsewhere stays literal.
+        mixed = normalizer.Normalizer(NOW, False)
+        mixed.text(spent_notice(1399, "3ef98c4e29cf"))
+        self.assertEqual(mixed.text("see https://github.com/gke-agentic/x/pull/1399"),
+                         "see https://github.com/gke-agentic/x/pull/1399")
+
+    def test_an_answer_holding_the_number_is_not_saved_and_it_is_never_put_back(self):
+        mapping = normalizer.normalize_request(request(spent_notice(175, "3ef98c4e29cf")), NOW).mapping
+        for answer in ("vcs.py proposal view 175 --repo x", "closed [PR #175](https://github.com/x/y/pull/175)",
+                       "175 MiB"):
+            with self.subTest(answer=answer):
+                self.assertTrue(mapping.answer_repeats_bare_number(answer))
+                self.assertEqual(mapping.apply_to_answer(answer), answer, "a proposal number is never swapped in")
+        for answer in ("1750m CPU", "PR #176", "2175 restarts"):
+            with self.subTest(answer=answer):
+                self.assertFalse(mapping.answer_repeats_bare_number(answer))
+        self.assertEqual(mapping.proposal_numbers, {"175"})
+
+    def test_the_revision_is_served_with_this_runs_and_a_shortened_one_is_not_saved(self):
+        recorded = normalizer.normalize_request(request(spent_notice(1399, "3ef98c4e29cf")), NOW).mapping
+        replayed = normalizer.normalize_request(request(spent_notice(1398, "141a5bb53467")), NOW).mapping
+        stored = recorded.apply_to_answer("git show 3ef98c4e29cf")
+        self.assertEqual(stored, "git show ⟦COMMIT_1⟧")
+        self.assertEqual(replayed.restore(stored), ("git show 141a5bb53467", []))
+        self.assertTrue(recorded.identifier_left_literal(recorded.apply_to_answer("git show 3ef98c4")))
+        self.assertFalse(recorded.answer_repeats_bare_number("git show 3ef98c4e29cf"))
+
+
 class NestedJsonTest(unittest.TestCase):
     def test_tool_result_json_is_normalized_inside(self):
         content = json.dumps({"output": "pod web-7d4b9c8f6d-x2k9p age: 5m", "exit_code": 0, "pid": 4821})
@@ -1021,6 +1322,33 @@ class AnswerMappingTest(unittest.TestCase):
             self.assertTrue(mapping.answer_repeats_bare_number(answer), answer)
 
 
+    def test_an_answer_repeating_a_comment_id_is_refused(self):
+        # A row id is never swapped into an answer, so one repeating it is not
+        # stored: replayed, it would name the recording's comment.
+        tool = {"role": "tool", "tool_call_id": "call_1",
+                "content": json.dumps({"ok": True, "task_id": "t_11111111", "comment_id": 41})}
+        mapping = normalizer.normalize_request({"model": "m", "messages": [tool]}, NOW).mapping
+        self.assertEqual(mapping.apply_to_answer("posted comment 41"), "posted comment 41")
+        for answer in ("posted comment 41 on the card", "comment #41", '{"comment_id": 41}', "comment_id is 41",
+                       "Comment 41 has been posted", "Comment #41:", "COMMENT 41"):
+            self.assertTrue(mapping.answer_repeats_bare_number(answer), answer)
+        for answer in ("41 pods are pending", "comments 41", "port 41", "comment_id 410", "commented 41 times"):
+            self.assertFalse(mapping.answer_repeats_bare_number(answer), answer)
+
+    def test_the_word_comment_counts_only_against_a_comment_id(self):
+        # "comment" is an ordinary word: an answer putting another key's swapped
+        # number after it (a generation, a row id) is still stored.
+        tool = {"role": "tool", "tool_call_id": "call_1",
+                "content": json.dumps({"metadata": {"generation": 2, "id": 7}, "status": {"observedGeneration": 2}})}
+        mapping = normalizer.normalize_request({"model": "m", "messages": [tool]}, NOW).mapping
+        for answer in ("I left a comment: 2 pods are pending", "Here is the comment:\n\n2. Root cause",
+                       "comment (7)", "kubectl annotate deploy/web comment=2"):
+            self.assertFalse(mapping.answer_repeats_bare_number(answer), answer)
+        self.assertTrue(mapping.answer_repeats_bare_number("generation: 2"))
+        # The same word does count once a comment id was swapped, in text as in JSON.
+        text = {"role": "tool", "tool_call_id": "call_2", "content": "posted, comment_id: 2"}
+        mapping = normalizer.normalize_request({"model": "m", "messages": [text]}, NOW).mapping
+        self.assertTrue(mapping.answer_repeats_bare_number("I left a comment: 2 pods are pending"))
 
 class HistorySwapTest(unittest.TestCase):
     """An answer comes back in the next request's history keyed as apply_to_answer stored it."""

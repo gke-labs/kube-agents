@@ -17,6 +17,11 @@
 # step 5 hands the operator their references, the bridge's settings and the
 # inject door, step 6b flips and gates; the constants block below says what
 # each does). Unset, nothing behaves differently either.
+#
+# The web console is installed on every lane (webConsole.enabled=true in step
+# 5, from the image step 4 builds or the candidate publishes) and gated under
+# today (6a) and, under the flag, under next (the end of 6b): its routes answer
+# and a chat turn through it gets a reply (#2462).
 # ==============================================================================
 
 set -euo pipefail
@@ -102,6 +107,18 @@ readonly EVAL_ALERT_DAILY_LIMIT_DRIFT="0"
 # floor of 270 s, a margin of 120 s. tests/test_ci_deploy_alert_quota.py holds
 # it between them.
 readonly EVAL_INCIDENT_WORKLOAD_DEDUP_SECONDS="150"
+
+# The namespace whose events the k8s event watcher does not forward on an eval
+# install (spec.harness.eventWatcher.alertExclude, a namespace rule on every
+# cluster). bench/tf/prebuilt/kcc-stalled-declaration plants a
+# ContainerNodePool there that Config Connector holds at DependencyNotFound
+# for the whole run. DependencyNotFound is on the watcher's reason list, so
+# without this rule an event on the object opens an incident and a triage card
+# in the middle of the case, and the card can stay for later cases on the same
+# install. The stall watch has its own opt-out, an annotation the stack sets.
+# Equal to the stack's kcc_namespace; tests/test_ci_deploy_mode_next.py holds
+# the two equal.
+readonly EVAL_EVENT_WATCHER_EXCLUDED_NAMESPACE="eval-kcc-stalled"
 
 # The subscription the drift detector pulls from. The pool project's own
 # provisioning owns the resource: scripts/provision_ci_pool_project.sh sets
@@ -389,6 +406,16 @@ readonly CHART_CRD_DIR="charts/kube-agents/crds/"
 # operator to clear its finalizer before uninstallation. Matches
 # charts/kube-agents/values.yaml cleanupHook.timeout (120s).
 readonly PLATFORM_AGENT_CR_DELETE_TIMEOUT="120s"
+# The NATS StatefulSet mode: next renders, and the claims its
+# volumeClaimTemplates materialise, <template>-<statefulset>-<ordinal>
+# (a2aNATSName and a2aNATSDataClaim in platformagent_a2a_manifests.go). A
+# claim left by an earlier lease pins its server to the old disk's zone, where
+# topology spread can leave it unschedulable (#5658); 5b″ and 6b delete such
+# claims while no StatefulSet owns them. The delete is bounded like the
+# teardown's.
+readonly A2A_NATS_STATEFULSET_NAME="${PLATFORM_AGENT_CR_NAME}-a2a-nats"
+readonly A2A_NATS_CLAIM_NAME_RE="^persistentvolumeclaim/data-${A2A_NATS_STATEFULSET_NAME}-[0-9]+\$"
+readonly A2A_NATS_CLAIM_DELETE_TIMEOUT="60s"
 # The Prow jobs that deploy under the flag with no PULL_NUMBER: the
 # merge-blocking presubmit in a batch Tide ran (it grades next since next became
 # the mode new installs get, #2007, "The cutover itself"); the main nightly's
@@ -427,6 +454,48 @@ readonly CREDENTIAL_PROXY_DEPLOYMENT_NAME="${PLATFORM_AGENT_CR_NAME}-credential-
 # scripts/release/common.sh publish them by.
 readonly PLUGIN_IMAGE_PUBSUB_PLATFORM="pubsub-platform"
 readonly PLUGIN_IMAGE_STOCKOUT_INVESTIGATOR="gke-stockout-investigator"
+# The web console (a2a/cmd/web-console), installed on every lane so the
+# presubmit and the nightlies run it where a person would (#2462): step 4
+# builds its image beside the others (cloudbuild-ci.yaml's web-console step;
+# the release-candidate path installs the candidate's published one, which
+# docker-publish-ghcr.yml publishes under this name and
+# scripts/release/common.sh requires), step 5 turns it on with that image, and
+# gate_web_console (6a, and the end of 6b under next) reads its routes and
+# sends a chat turn through it.
+readonly WEB_CONSOLE_IMAGE_NAME="web-console"
+# The chart names the console's Deployment and Service <release>-web-console
+# (charts/kube-agents/templates/web-console.yaml) and serves it on 8080.
+readonly WEB_CONSOLE_NAME="${HELM_RELEASE_NAME}-web-console"
+readonly WEB_CONSOLE_PORT=8080
+# The local end of the gate's port-forward.
+readonly WEB_CONSOLE_LOCAL_PORT=18080
+readonly WEB_CONSOLE_PF_LOG="/tmp/pf-web-console.log"
+# What the gate reads and sends through the tunnel (the routes, the keys, the
+# header, the turn and the session shape) is hack/web-console-probe.sh's,
+# sourced in section 2 and shared with the round trip.
+readonly WEB_CONSOLE_ROLLOUT_TIMEOUT="600s"
+readonly WEB_CONSOLE_EXISTS_ATTEMPTS=60
+readonly WEB_CONSOLE_POLL_SECONDS=5
+# Every attempt gets a fresh tunnel (step 7 says why) after this pause; a
+# read route gets a bounded wait; the chat turn's deadline outlasts the
+# console's own turn timeout (turnTimeout, 300 s), after which the console
+# answers 504 and the next attempt sends another turn, so a quota backoff
+# that outlasts one turn is spent across attempts (five of them give the
+# turn more than three times step 7's own deadline). A 4xx, or a 200 whose
+# body is not what the route returns, is not retried: a fresh tunnel would not
+# change it (web_console_probe says which is which).
+readonly WEB_CONSOLE_GATE_ATTEMPTS=5
+readonly WEB_CONSOLE_RETRY_SECONDS=10
+readonly WEB_CONSOLE_PORT_FORWARD_WAIT_SECONDS=30
+readonly WEB_CONSOLE_ROUTE_MAX_TIME_SECONDS=60
+readonly WEB_CONSOLE_CHAT_MAX_TIME_SECONDS=330
+# How much of the console's log the failure dump shows.
+readonly WEB_CONSOLE_DIAG_LOG_LINES=100
+# How many reads, WEB_CONSOLE_POLL_SECONDS apart, a Degraded CR phase gets to
+# clear after the turn before the gate fails on it: the operator rewrites the
+# status on its next pass, which the agent Deployment's status moving starts.
+# A read that returns no phase spends one of them too and never passes.
+readonly WEB_CONSOLE_CR_ATTEMPTS=12
 # Section 7b: the Pub/Sub platform adapter must pull through the credential
 # broker. The adapter logs the first line when it connects; the broker logs
 # the second for every relayed pull. The route is the stockout investigator's
@@ -460,6 +529,10 @@ readonly MODE_NEXT_HELM_TIMEOUT="600s"
 readonly MODE_NEXT_GENERATION_ATTEMPTS=60
 readonly MODE_NEXT_POLL_SECONDS=5
 readonly MODE_NEXT_ROLLOUT_TIMEOUT="600s"
+# The bus's servers past its quorum: each waits Pending for a node of its own
+# (the operator's hostname spread), and on Autopilot that node is a scale-up
+# that can take longer than one rollout budget (gate_mode_next_bus).
+readonly MODE_NEXT_BUS_FULL_TIMEOUT="900s"
 # The inject door: one name for its Service, token Secret, principal map and
 # NetworkPolicy, and the key the token sits under (a2aInjectName,
 # a2aInjectTokenKey). hack/ci-eval-pr.sh reads the same Secret for the
@@ -478,6 +551,15 @@ readonly A2A_GATEWAY_ELECTION_ON="true"
 # it onto the gateway from its own environment; only an exact "true" arms it.
 readonly A2A_CARD_STOP_ENV_VAR="A2A_CARD_STOP"
 readonly A2A_CARD_STOP_ON="true"
+# The gateway's A2A door (k8s-operator platformagent_a2a_manifests.go,
+# a2aAgentDoorEnvVar): on for the next lane, so the card-wait stopped ask
+# (bench stop_hook.CARD_WAIT_DIRECTIVE, #5407) can stop a turn while it holds
+# for its cards, which only console, MCP and A2A door turns do. A default
+# install leaves the door off; the lane diverges here on purpose. The door
+# authenticates every call with its own per-install token, which
+# hack/ci-eval-pr.sh reads from the Secret the operator renders.
+readonly A2A_AGENT_DOOR_ENV_VAR="A2A_AGENT_DOOR"
+readonly A2A_AGENT_DOOR_ON="true"
 # The bridge sidecar. The operator renders it into the agent pod under next
 # (platformagent_a2a_bridge.go): its bus identity, its env and the bus token
 # it must not mount are the operator's, not this script's. The script names
@@ -511,10 +593,8 @@ readonly EVAL_TASK_PARALLELISM_DEFAULT=4
 readonly BRIDGE_QUEUE_CAPACITY=1024
 # The TASKS consumer budget's terms, as the operator sizes it
 # (k8s-operator/internal/controller/platformagent_a2a_manifests.go): a fresh
-# stream is created at max(budget, A2A_TASKS_FLOOR) - plus 64 for the
-# AgentProfile durables when the operator renders the dispatcher, which this
-# lane leaves off (no A2A_DISPATCHER_IMAGE, step 4), as a default install
-# does - where the budget is
+# stream is created at max(budget, A2A_TASKS_FLOOR) - the AgentProfile
+# dispatcher's durables are on PROFILE_SUBMITS, not TASKS - where the budget is
 # maxSessions * A2A_SESSION_CONSUMERS + A2A_RESERVE_FIXED +
 # A2A_RESERVE_PER_WORKER * (the bridge workers the pod runs, rendered or
 # declared); provisioning never edits a stream that exists, and a later
@@ -621,14 +701,14 @@ readonly MODE_NEXT_ENTRYPOINT_MATCH_LINES=40
 # platformagent_a2a_manifests.go, a2aCalloutImage in platformagent_a2a_callout.go,
 # a2aVerifierImage in platformagent_a2a_verifier.go, a2aConsoleImage in
 # platformagent_a2a_console.go) and the repository names step 4 pushes the
-# builds under. The AgentProfile dispatcher's image is built and pushed too
-# (A2A_DISPATCHER_IMAGE_NAME), but its override, A2A_DISPATCHER_IMAGE, is not
-# set: the dispatcher is off by default until profiles dispatch end to end.
+# builds under, and the AgentProfile dispatcher's (a2aDispatcherImage in
+# platformagent_a2a_dispatcher.go), which runs by default.
 readonly A2A_GATEWAY_IMAGE_ENV_VAR="A2A_GATEWAY_IMAGE"
 readonly A2A_CALLOUT_IMAGE_ENV_VAR="A2A_CALLOUT_IMAGE"
 readonly A2A_WORKER_IMAGE_ENV_VAR="A2A_WORKER_IMAGE"
 readonly A2A_VERIFIER_IMAGE_ENV_VAR="A2A_VERIFIER_IMAGE"
 readonly A2A_CONSOLE_IMAGE_ENV_VAR="A2A_CONSOLE_IMAGE"
+readonly A2A_DISPATCHER_IMAGE_ENV_VAR="A2A_DISPATCHER_IMAGE"
 # Two of the rendered bridge's four operator settings (a2aBridgeImageEnvVar
 # and a2aBridgeConcurrencyOperatorEnvVar in platformagent_a2a_bridge.go): its
 # image and its BRIDGE_CONCURRENCY. The operator reads them from its own
@@ -645,6 +725,13 @@ readonly A2A_WORKER_IMAGE_NAME="a2a-worker"
 readonly A2A_VERIFIER_IMAGE_NAME="a2a-verifier"
 readonly A2A_CONSOLE_IMAGE_NAME="a2a-console"
 readonly A2A_DISPATCHER_IMAGE_NAME="a2a-dispatcher"
+# The cluster AgentProfile's persona image (a2a/Dockerfile.persona-cluster,
+# context agents/cluster/persona), built beside the A2A images so the lane runs
+# this tree's persona.
+readonly PERSONA_CLUSTER_IMAGE_NAME="persona-cluster"
+# The tse AgentProfile's persona image (a2a/Dockerfile.persona-tse, context
+# agents/tse/persona), built the same way (#3842).
+readonly PERSONA_TSE_IMAGE_NAME="persona-tse"
 # The bridge image goes to the operator too (A2A_BRIDGE_IMAGE_ENV_VAR), which
 # renders the bridge sidecar from it.
 readonly A2A_BRIDGE_IMAGE_NAME="hermes-bridge"
@@ -710,10 +797,21 @@ if ! command -v ssh-keygen >/dev/null 2>&1; then
   exit 1
 fi
 
+# The web console gate (6a) reads the console's JSON with python3, which the
+# round trip (hack/rollback-roundtrip.sh) and the eval already need; checked
+# here so a runner without it fails before the build rather than after it.
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "ERROR: python3 is required to verify the web console's routes"
+  exit 1
+fi
+
 # ─── 2. Configuration Environment Variables ───────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/ci-env.sh"
 source "${SCRIPT_DIR}/../tags.env"
+# The web console probe the gate in 6a runs, shared with the round trip.
+# shellcheck source=hack/web-console-probe.sh
+source "${SCRIPT_DIR}/web-console-probe.sh"
 # EVAL_REPLAY_SHADOW and its bucket and job tags (resolve_replay_shadow in
 # ci-env.sh), checked before anything is built, the way the session-affinity
 # settings are above.
@@ -725,6 +823,8 @@ stop_deploy_heartbeat() { kill "${DEPLOY_HEARTBEAT_PID:-}" 2>/dev/null || true; 
 deploy_exit() {
   dump_prow_artifacts_on_failure
   stop_deploy_heartbeat
+  # The web console gate's tunnel (6a), if a failure left one open.
+  kill "${WEB_CONSOLE_PF_PID:-}" 2>/dev/null || true
 }
 trap deploy_exit EXIT
 
@@ -788,8 +888,10 @@ A2A_OPERATOR_ENV_ARGS=()
 # first-run chain included) writes one whenever a pool repository declares a
 # workload with a major finding (#3439). spec.deployment.env carries the
 # switch; the operator forwards it to the shell sandbox, where finish runs.
-# It also enables the optional `tse` AgentProfile so `mode: next` eval lanes
-# scaffold `/opt/data/profiles/tse` (#3492). Empty on the today lane, so that
+# It also enables the `cluster` AgentProfile and the optional `tse` one, which
+# the profile dispatcher serves (their images are set with the A2A overrides
+# below). tse also scaffolds `/opt/data/profiles/tse` for the Kanban case
+# (#3492); its persona image is #3842's. Empty on the today lane, so that
 # release stays byte-for-byte the same.
 # env[3], set on every lane in the install below, turns the broker's proposal
 # readings sweep off (CREDENTIAL_PROXY_VCS_READINGS=off). Its hourly forge
@@ -801,6 +903,7 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   MODE_NEXT_ENV_ARGS=(
     --set-string "platformAgent.deployment.env[4].name=KUBEAGENTS_AUDIT_AUTO_PROMOTE"
     --set-string "platformAgent.deployment.env[4].value=false"
+    --set "profiles.cluster.enabled=true"
     --set "profiles.tse.enabled=true"
   )
 fi
@@ -904,6 +1007,9 @@ if [ -n "${RC_COMMIT_SHA:-}" ]; then
     --set-string "agentSandbox.image.tag=${TAG}"
     --set-string "plugins.pubsubPlatform.image.tag=${TAG}"
     --set-string "plugins.stockoutInvestigator.image.tag=${TAG}"
+    # The web console too: the chart defaults its repository to the published
+    # one, so the tag is the whole of it.
+    --set-string "webConsole.image.tag=${TAG}"
   )
   DEPLOY_SOURCE="release candidate ${RC_COMMIT_SHA:0:7} from ${RC_REGISTRY_PREFIX}"
 else
@@ -918,13 +1024,17 @@ else
     --set-string "plugins.pubsubPlatform.image.tag=${TAG}"
     --set-string "plugins.stockoutInvestigator.image.repository=${AR_REPO}/${PLUGIN_IMAGE_STOCKOUT_INVESTIGATOR}"
     --set-string "plugins.stockoutInvestigator.image.tag=${TAG}"
+    # The web console, from the image step 4 builds beside the others
+    # (cloudbuild-ci.yaml's web-console step).
+    --set-string "webConsole.image.repository=${AR_REPO}/${WEB_CONSOLE_IMAGE_NAME}"
+    --set-string "webConsole.image.tag=${TAG}"
   )
   DEPLOY_SOURCE="PR #${PULL_NUMBER:-local} build (${TAG})"
 fi
 
 # vertex_ai stays the default, for the presubmits' concurrency. On 2026-09-02
 # every smoke run redded on 429s from one shared Gemini Developer API key's
-# fixed paid-tier-3 quota -- 8,000,000 input tokens/minute for gemini-3.1-pro,
+# fixed paid-tier-3 quota -- 8,000,000 input tokens/minute for the model then in use,
 # named in the error body -- with five concurrent builds drawing ~94k-token
 # turns from one shared minute window (#1097; the full diagnosis with build
 # artifacts is on #1184). Vertex AI serves the same Gemini models under dynamic
@@ -940,6 +1050,26 @@ fi
 # Anyone flipping MODEL_DEFAULT_NAME: ci-eval-pr.sh stamps records with its
 # own AGENT_MODEL_OVERRIDE, so flip both or the eval version key names a
 # model the install is not serving.
+# --- agent model required in a Prow job: begin
+# In a Prow job (JOB_NAME is set by Prow and by nothing else, as the flag
+# guard below says) the lane's config sets all three, read from the build
+# cluster's eval-model Secret, and this public script names none: a job that
+# arrives without them stops here, before the image build and the Helm
+# install, instead of deploying the local default below, a model nobody
+# chose. AGENT_MODEL_OVERRIDE is hack/ci-eval-pr.sh's, checked here too so
+# the lease is not spent on a deploy whose records would stamp the default.
+# A local run keeps the defaults.
+if [ -n "${JOB_NAME:-}" ]; then
+  for required_model_var in MODEL_PROVIDER MODEL_DEFAULT_NAME AGENT_MODEL_OVERRIDE; do
+    if [ -z "${!required_model_var:-}" ]; then
+      # Two lines: the CI health digest quotes the FATAL line cut at 200 characters.
+      echo "FATAL: ${required_model_var} is unset or empty; a Prow job sets it from the build cluster's eval-model Secret (docs/ci-pool-projects.md 5.10)." >&2
+      echo "The lane's config in oss-test-infra reads the Secret; this repository's scripts default the model only outside Prow." >&2
+      exit 1
+    fi
+  done
+fi
+# --- agent model required in a Prow job: end
 export MODEL_PROVIDER="${MODEL_PROVIDER:-vertex_ai}"
 # --- agent key: begin
 # Sets AGENT_GEMINI_API_KEY, the key the agent's credentials secret carries.
@@ -968,6 +1098,26 @@ resolve_agent_gemini_api_key() {
 # --- agent key: end
 resolve_agent_gemini_api_key
 export MODEL_DEFAULT_NAME="${MODEL_DEFAULT_NAME:-gemini-3.1-pro-preview}"
+# --- reasoning effort: begin
+# The reasoning effort the gateway asks the model for on every request, the
+# chart's litellm.reasoningEffort: low, medium or high, or empty for the
+# model's own default. A certification run names it beside the model, and
+# hack/ci-eval-pr.sh stamps the same variable on every case record, so a
+# record says which effort the agent ran at and a window never pools two
+# efforts. Checked here, before the lease is spent on a deploy the chart's
+# schema would refuse at step 5c. The deploy never sets litellm.dropParams,
+# so an effort a provider does not take fails its requests loudly rather
+# than being dropped in silence. The FATAL line names the effort only.
+export EVAL_REASONING_EFFORT="${EVAL_REASONING_EFFORT:-}"
+case "${EVAL_REASONING_EFFORT}" in
+  "" | low | medium | high) ;;
+  *)
+    echo "FATAL: EVAL_REASONING_EFFORT='${EVAL_REASONING_EFFORT}' is not low, medium, high or empty (the model default)." >&2
+    exit 1
+    ;;
+esac
+echo "Agent model for this install: ${MODEL_PROVIDER}/${MODEL_DEFAULT_NAME}, reasoning effort: ${EVAL_REASONING_EFFORT:-model default}"
+# --- reasoning effort: end
 # Default to enforcing CMEK database encryption on CI evaluation clusters.
 # Set ALLOW_UNENCRYPTED_SECRETS=true to bypass CMEK checks on unencrypted test clusters.
 export ALLOW_UNENCRYPTED_SECRETS="${ALLOW_UNENCRYPTED_SECRETS:-false}"
@@ -1736,6 +1886,8 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   A2A_CONSOLE_URI="${A2A_IMAGE_PREFIX}/${A2A_CONSOLE_IMAGE_NAME}:${TAG}"
   A2A_BRIDGE_URI="${A2A_IMAGE_PREFIX}/${A2A_BRIDGE_IMAGE_NAME}:${TAG}"
   A2A_DISPATCHER_URI="${A2A_IMAGE_PREFIX}/${A2A_DISPATCHER_IMAGE_NAME}:${TAG}"
+  PERSONA_CLUSTER_URI="${A2A_IMAGE_PREFIX}/${PERSONA_CLUSTER_IMAGE_NAME}:${TAG}"
+  PERSONA_TSE_URI="${A2A_IMAGE_PREFIX}/${PERSONA_TSE_IMAGE_NAME}:${TAG}"
   A2A_OPERATOR_ENV_ARGS=(
     --set-string "operator.extraEnv[0].name=${A2A_GATEWAY_IMAGE_ENV_VAR}"
     --set-string "operator.extraEnv[0].value=${A2A_GATEWAY_URI}"
@@ -1766,10 +1918,26 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     # on by default, and set here so the lane doesn't depend on the default.
     --set-string "operator.extraEnv[9].name=${A2A_GATEWAY_ELECTION_ENV_VAR}"
     --set-string "operator.extraEnv[9].value=${A2A_GATEWAY_ELECTION_ON}"
-    # No A2A_DISPATCHER_IMAGE: the AgentProfile dispatcher is off by default
-    # until profiles dispatch end to end, and the lane installs what a
-    # default install does. Its image is still built (step 4) so the build
-    # stays green; setting the override here is how the lane would turn it on.
+    # The AgentProfile dispatcher runs by default, so the lane runs it too,
+    # from this build: unoverridden, the operator derives its image from the
+    # operator's registry, as it would the verifier's.
+    --set-string "operator.extraEnv[10].name=${A2A_DISPATCHER_IMAGE_ENV_VAR}"
+    --set-string "operator.extraEnv[10].value=${A2A_DISPATCHER_URI}"
+    # The profiles' images. Unset, the chart takes each from ghcr at the agent
+    # image's tag, which on this lane is a CI tag ghcr never has, and the
+    # profile's worker never pulls. The cluster and tse profiles run this
+    # build's personas and worker.
+    --set-string "profiles.cluster.persona.image.repository=${A2A_IMAGE_PREFIX}/${PERSONA_CLUSTER_IMAGE_NAME}"
+    --set-string "profiles.cluster.persona.image.tag=${TAG}"
+    --set-string "profiles.cluster.harness.image.repository=${A2A_IMAGE_PREFIX}/${A2A_WORKER_IMAGE_NAME}"
+    --set-string "profiles.cluster.harness.image.tag=${TAG}"
+    --set-string "profiles.tse.persona.image.repository=${A2A_IMAGE_PREFIX}/${PERSONA_TSE_IMAGE_NAME}"
+    --set-string "profiles.tse.persona.image.tag=${TAG}"
+    --set-string "profiles.tse.harness.image.repository=${A2A_IMAGE_PREFIX}/${A2A_WORKER_IMAGE_NAME}"
+    --set-string "profiles.tse.harness.image.tag=${TAG}"
+    # The A2A door, for the card-wait stopped ask (above).
+    --set-string "operator.extraEnv[11].name=${A2A_AGENT_DOOR_ENV_VAR}"
+    --set-string "operator.extraEnv[11].value=${A2A_AGENT_DOOR_ON}"
   )
 fi
 
@@ -1781,7 +1949,7 @@ fi
 if [ -n "${RC_COMMIT_SHA:-}" ]; then
   echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Skipping image builds: installing published images at ${RC_COMMIT_SHA:0:7} ==="
   if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
-    echo "EVAL_MODE_NEXT=1: the A2A gateway, auth callout, worker, verifier, dispatcher and console images and the Hermes bridge sidecar are the candidate's published ones, from ${A2A_IMAGE_PREFIX}"
+    echo "EVAL_MODE_NEXT=1: the A2A gateway, auth callout, worker, verifier, dispatcher and console images, the cluster and tse personas and the Hermes bridge sidecar are the candidate's published ones, from ${A2A_IMAGE_PREFIX}"
   fi
 else
   STEP_START=$SECONDS
@@ -1807,6 +1975,9 @@ else
   # release-candidate path installs the candidate's published ones, section
   # 2a, and skipped this section above), so they are always built here.
   PLUGIN_IMAGE_SUBSTITUTIONS=",_PUBSUB_PLATFORM_URI=${AR_REPO}/${PLUGIN_IMAGE_PUBSUB_PLATFORM}:${TAG},_STOCKOUT_INVESTIGATOR_URI=${AR_REPO}/${PLUGIN_IMAGE_STOCKOUT_INVESTIGATOR}:${TAG}"
+  # The web console, built on every lane for the same reason: the deploy
+  # installs it on every lane, at the reference section 2a gave the chart.
+  WEB_CONSOLE_BUILD_SUBSTITUTIONS=",_WEB_CONSOLE_URI=${AR_REPO}/${WEB_CONSOLE_IMAGE_NAME}:${TAG}"
   A2A_BUILD_SUBSTITUTIONS=""
   REPLAY_SHADOW_BUILD_SUBSTITUTIONS=""
   if [ -n "${REPLAY_SHADOW_PROXY_URI:-}" ]; then
@@ -1814,8 +1985,8 @@ else
     echo "Shadow replay proxy: also building its image"
   fi
   if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
-    A2A_BUILD_SUBSTITUTIONS=",_A2A_GATEWAY_URI=${A2A_GATEWAY_URI},_A2A_CALLOUT_URI=${A2A_CALLOUT_URI},_A2A_WORKER_URI=${A2A_WORKER_URI},_A2A_VERIFIER_URI=${A2A_VERIFIER_URI},_A2A_CONSOLE_URI=${A2A_CONSOLE_URI},_A2A_BRIDGE_URI=${A2A_BRIDGE_URI},_A2A_DISPATCHER_URI=${A2A_DISPATCHER_URI}"
-    echo "EVAL_MODE_NEXT=1: also building the A2A gateway, auth callout, worker, verifier, dispatcher and console images and the Hermes bridge sidecar"
+    A2A_BUILD_SUBSTITUTIONS=",_A2A_GATEWAY_URI=${A2A_GATEWAY_URI},_A2A_CALLOUT_URI=${A2A_CALLOUT_URI},_A2A_WORKER_URI=${A2A_WORKER_URI},_A2A_VERIFIER_URI=${A2A_VERIFIER_URI},_A2A_CONSOLE_URI=${A2A_CONSOLE_URI},_A2A_BRIDGE_URI=${A2A_BRIDGE_URI},_A2A_DISPATCHER_URI=${A2A_DISPATCHER_URI},_PERSONA_CLUSTER_URI=${PERSONA_CLUSTER_URI},_PERSONA_TSE_URI=${PERSONA_TSE_URI}"
+    echo "EVAL_MODE_NEXT=1: also building the A2A gateway, auth callout, worker, verifier, dispatcher and console images, the cluster and tse personas and the Hermes bridge sidecar"
   fi
   # Submitted asynchronously and polled, never streamed (#3129). Without
   # --async, `gcloud builds submit` tails the build log from storage and
@@ -1836,7 +2007,7 @@ else
   CLOUD_BUILD_ID=""
   CLOUD_BUILD_LOG_URL=""
   CLOUD_BUILD_SUBMIT_OUT="$(with_deadline "${BUILD_SUBMIT_TIMEOUT_SECONDS}" gcloud builds submit --async --config="deploy/docker/cloudbuild-ci.yaml" \
-    --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_SANDBOX_URI=${AR_REPO}/agent-sandbox:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG},_KUBE_PROXY_URI=${AR_REPO}/kube-proxy:${TAG}${PLUGIN_IMAGE_SUBSTITUTIONS},_CACHE_IMAGE=${CACHE_IMAGE},_BUILDCACHE_IMAGE=${BUILDCACHE_IMAGE},_PROXY_BUILDCACHE_IMAGE=${PROXY_BUILDCACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_KUBE_AGENTS_VERSION=${TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false}${A2A_BUILD_SUBSTITUTIONS}${REPLAY_SHADOW_BUILD_SUBSTITUTIONS}" \
+    --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_SANDBOX_URI=${AR_REPO}/agent-sandbox:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG},_KUBE_PROXY_URI=${AR_REPO}/kube-proxy:${TAG}${PLUGIN_IMAGE_SUBSTITUTIONS}${WEB_CONSOLE_BUILD_SUBSTITUTIONS},_CACHE_IMAGE=${CACHE_IMAGE},_BUILDCACHE_IMAGE=${BUILDCACHE_IMAGE},_PROXY_BUILDCACHE_IMAGE=${PROXY_BUILDCACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_KUBE_AGENTS_VERSION=${TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false}${A2A_BUILD_SUBSTITUTIONS}${REPLAY_SHADOW_BUILD_SUBSTITUTIONS}" \
     --project="${PROJECT_ID}" "${BUILD_WORKER_ARGS[@]}" --quiet --format="value(id,logUrl)" .)" || {
     echo "ERROR: gcloud builds submit exited $? before returning a build id (deadline ${BUILD_SUBMIT_TIMEOUT_SECONDS}s)" >&2
     exit 1
@@ -2056,6 +2227,47 @@ echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Applying the chart's CRDs (server-s
 kubectl apply --server-side --force-conflicts -f "${SCRIPT_DIR}/../${CHART_CRD_DIR}" >/dev/null
 echo "✓ CRDs applied from ${CHART_CRD_DIR}"
 
+# ─── 5b″. Delete NATS claims no StatefulSet owns ───────────────────────────
+# Teardown deletes them (hack/ci-teardown.sh Step 6), but a pool project that
+# already holds one, or a run killed before its teardown, would fail this
+# deploy's NATS gate on it. With no StatefulSet the claims are unowned and
+# unmounted; with one, they are its data and stay. Never fatal: a failure here
+# leaves the run where it was, and the NATS gate reports it.
+#
+# Called twice. Here it takes claims a teardown left. A next-mode run killed
+# before its teardown leaves its StatefulSet standing, so this call skips;
+# 5c's install then renders mode today, cleanupA2A deletes the StatefulSet and
+# keeps its claims (WhenDeleted: Retain), and 6b's flip back to next would
+# bind them. 6b calls it again before that flip, once the StatefulSet is gone.
+delete_orphaned_nats_claims() {
+  local sts claims
+  if ! sts="$(kubectl get statefulset "${A2A_NATS_STATEFULSET_NAME}" -n "${NAMESPACE}" \
+    --ignore-not-found -o name 2>&1)"; then
+    echo "WARNING: could not check for statefulset/${A2A_NATS_STATEFULSET_NAME} (${sts}); leaving any NATS claims in place."
+    return 0
+  fi
+  if [ -n "${sts}" ]; then
+    echo "statefulset/${A2A_NATS_STATEFULSET_NAME} exists; leaving its claims in place."
+    return 0
+  fi
+  if ! claims="$(kubectl get persistentvolumeclaims -n "${NAMESPACE}" -o name 2>&1)"; then
+    echo "WARNING: could not list claims in ${NAMESPACE} (${claims}); leaving any NATS claims in place."
+    return 0
+  fi
+  claims="$(grep -E "${A2A_NATS_CLAIM_NAME_RE}" <<<"${claims}" || true)"
+  if [ -z "${claims}" ]; then
+    return 0
+  fi
+  while IFS= read -r claim; do
+    echo "WARNING: ${claim} outlived its StatefulSet (a previous lease left it, #5658); deleting it."
+    if ! kubectl delete -n "${NAMESPACE}" "${claim}" --ignore-not-found \
+      --timeout="${A2A_NATS_CLAIM_DELETE_TIMEOUT}"; then
+      echo "WARNING: could not delete ${claim}; the NATS server that mounts it may not schedule."
+    fi
+  done <<<"${claims}"
+}
+delete_orphaned_nats_claims
+
 # ─── 5c. Deploy the chart ─────────────────────────────────────────────────────
 # Named in the build log so a run's dispatcher behaviour can be read against
 # the cap it was given without opening the rendered CR.
@@ -2082,6 +2294,7 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set-file "platformAgent.credentials.data.SANDBOX_SSH_PUBLIC_KEY=${SANDBOX_KEY_DIR}/id_sandbox.pub" \
     --set-string "litellm.modelProvider=${MODEL_PROVIDER}" \
     --set-string "litellm.modelDefaultName=${MODEL_DEFAULT_NAME}" \
+    --set-string "litellm.reasoningEffort=${EVAL_REASONING_EFFORT:-}" \
     --set "litellm.fallback.numRetries=${EVAL_LITELLM_NUM_RETRIES}" \
     --set "litellm.fallback.retryAfterSeconds=${EVAL_LITELLM_RETRY_AFTER_SECONDS}" \
     --set-string "litellm.vertex.serviceAccountAnnotations.iam\.gke\.io/gcp-service-account=${LITELLM_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
@@ -2098,11 +2311,13 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set-string "platformAgent.deployment.env[2].value=${EVAL_INCIDENT_WORKLOAD_DEDUP_SECONDS}" \
     --set-string "platformAgent.deployment.env[3].name=CREDENTIAL_PROXY_VCS_READINGS" \
     --set-string "platformAgent.deployment.env[3].value=off" \
+    --set-string "platformAgent.harness.eventWatcher.alertExclude[0].namespace=${EVAL_EVENT_WATCHER_EXCLUDED_NAMESPACE}" \
     --set "platformAgent.harness.driftDetector.enabled=true" \
     --set-string "platformAgent.harness.driftDetector.subscription=${EVAL_DRIFT_SUBSCRIPTION}" \
     --set "plugins.pubsubPlatform.enabled=true" \
     --set "plugins.stockoutInvestigator.enabled=true" \
     --set "plugins.stockoutInvestigator.applyTuning=false" \
+    --set "webConsole.enabled=true" \
     ${A2A_OPERATOR_ENV_ARGS[@]+"${A2A_OPERATOR_ENV_ARGS[@]}"} \
     ${MODE_NEXT_ENV_ARGS[@]+"${MODE_NEXT_ENV_ARGS[@]}"} \
     ${REPLAY_SHADOW_HELM_ARGS[@]+"${REPLAY_SHADOW_HELM_ARGS[@]}"} \
@@ -2241,6 +2456,138 @@ if [[ "${drift_detector_started}" != "true" ]]; then
 fi
 echo "✓ Rollout verification finished in $((SECONDS - STEP_START))s"
 
+# ─── 6a. The web console ──────────────────────────────────────────────────────
+# Step 5 installed the console (webConsole.enabled=true) from the image step
+# 4 built, so the lanes run it where a person would: through a port-forward to
+# its Service, which is the only way in (the chart's Service is ClusterIP
+# behind a deny-all ingress NetworkPolicy). The gate is what #2462 asks for,
+# made automatic: the console's Deployment rolls out, its page and every read
+# route answer (200 and a JSON object, the two metadata routes with the keys
+# the page reads), one chat turn through it reaches the agent and gets a
+# reply, the session's messages show the user's row and the assistant's, and
+# the CR is not Degraded afterwards. It runs here under today, and again at the
+# end of 6b under next, where the console still reaches the agent on the
+# Hermes API the today path keeps beside the bus
+# (docs/designs/spec-mode-switch.md); hack/rollback-roundtrip.sh runs the same
+# checks after each flip. The console holds the agent's key itself, so the
+# gate carries none: it sends what a browser sends, the loopback Host the
+# tunnel gives it and the console's own header on the POST.
+#
+# The requests themselves are hack/web-console-probe.sh's (web_console_probe,
+# shared with the round trip so the two cannot drift). Fresh tunnel per
+# attempt, as step 7, and the probe's split of answers: no answer, a 5xx (the
+# console's own 502 for an agent it could not reach, 503 for a busy one, 504
+# for a turn past its timeout) or a turn that ended with no assistant text is
+# worth another attempt; a 4xx, or a 200 whose body is not what the route
+# returns, is not, since the same request through a fresh tunnel gets the
+# same answer. The failure line names the route and quotes the start of its
+# body; the console's log and the CR's status follow it.
+WEB_CONSOLE_PF_PID=""
+stop_web_console_port_forward() {
+  if [ -n "${WEB_CONSOLE_PF_PID}" ]; then
+    kill "${WEB_CONSOLE_PF_PID}" 2>/dev/null || true
+    wait "${WEB_CONSOLE_PF_PID}" 2>/dev/null || true
+    WEB_CONSOLE_PF_PID=""
+  fi
+}
+
+dump_web_console_state() {
+  local label="$1"
+  echo "=== Debug: web console port-forward log (tail) ==="
+  tail -n "${WEB_CONSOLE_DIAG_LOG_LINES}" "${WEB_CONSOLE_PF_LOG}" 2>/dev/null || true
+  echo "=== Debug: web console ==="
+  kubectl get "deployment/${WEB_CONSOLE_NAME}" "svc/${WEB_CONSOLE_NAME}" -n "${NAMESPACE}" || true
+  kubectl logs -n "${NAMESPACE}" "deployment/${WEB_CONSOLE_NAME}" --tail="${WEB_CONSOLE_DIAG_LOG_LINES}" || true
+  kubectl get pods -n "${NAMESPACE}" || true
+  report_cr_status "web-console-${label}"
+}
+
+# <label> names the mode in the log and the status artifact (today, next).
+gate_web_console() {
+  local label="$1" attempt rc read_pair pair="" phase="" gate_start=$SECONDS
+  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Verifying the web console under ${label} ==="
+  for _ in $(seq 1 "${WEB_CONSOLE_EXISTS_ATTEMPTS}"); do
+    kubectl get "deployment/${WEB_CONSOLE_NAME}" -n "${NAMESPACE}" >/dev/null 2>&1 && break
+    sleep "${WEB_CONSOLE_POLL_SECONDS}"
+  done
+  if ! kubectl rollout status "deployment/${WEB_CONSOLE_NAME}" -n "${NAMESPACE}" --timeout="${WEB_CONSOLE_ROLLOUT_TIMEOUT}"; then
+    echo "ERROR: deployment/${WEB_CONSOLE_NAME} rollout failed under ${label}"
+    kubectl describe "deployment/${WEB_CONSOLE_NAME}" -n "${NAMESPACE}" || true
+    dump_web_console_state "${label}"
+    exit 1
+  fi
+  echo "✓ deployment/${WEB_CONSOLE_NAME} rolled out under ${label}"
+
+  WEB_CONSOLE_BODY_FILE="$(mktemp)"
+  WEB_CONSOLE_DETAIL="no attempt ran"
+  rc=1
+  : >"${WEB_CONSOLE_PF_LOG}"
+  for ((attempt = 1; attempt <= WEB_CONSOLE_GATE_ATTEMPTS; attempt++)); do
+    # Kill any previous tunnel and start a fresh one; the log is appended so
+    # a failure dump shows every attempt, not just the last.
+    stop_web_console_port_forward
+    echo "--- web console port-forward attempt ${attempt}/${WEB_CONSOLE_GATE_ATTEMPTS} (${label}) ---" >>"${WEB_CONSOLE_PF_LOG}"
+    kubectl port-forward "svc/${WEB_CONSOLE_NAME}" -n "${NAMESPACE}" "${WEB_CONSOLE_LOCAL_PORT}:${WEB_CONSOLE_PORT}" >>"${WEB_CONSOLE_PF_LOG}" 2>&1 &
+    WEB_CONSOLE_PF_PID=$!
+    for _ in $(seq 1 "${WEB_CONSOLE_PORT_FORWARD_WAIT_SECONDS}"); do
+      (exec 3<>"/dev/tcp/127.0.0.1/${WEB_CONSOLE_LOCAL_PORT}") 2>/dev/null && break
+      sleep 1
+    done
+    rc=0
+    web_console_probe "http://127.0.0.1:${WEB_CONSOLE_LOCAL_PORT}" "${WEB_CONSOLE_ROUTE_MAX_TIME_SECONDS}" "${WEB_CONSOLE_CHAT_MAX_TIME_SECONDS}" || rc=$?
+    [ "${rc}" -eq 0 ] && break
+    if [ "${rc}" -ne "${WEB_CONSOLE_PROBE_RETRY}" ]; then
+      echo "web console attempt ${attempt}/${WEB_CONSOLE_GATE_ATTEMPTS} (${label}) failed: ${WEB_CONSOLE_DETAIL}; a fresh tunnel would not change that"
+      break
+    fi
+    if [ "${attempt}" -lt "${WEB_CONSOLE_GATE_ATTEMPTS}" ]; then
+      echo "web console attempt ${attempt}/${WEB_CONSOLE_GATE_ATTEMPTS} (${label}) failed: ${WEB_CONSOLE_DETAIL}; respawning the tunnel in ${WEB_CONSOLE_RETRY_SECONDS}s"
+      sleep "${WEB_CONSOLE_RETRY_SECONDS}"
+    else
+      echo "web console attempt ${attempt}/${WEB_CONSOLE_GATE_ATTEMPTS} (${label}) failed: ${WEB_CONSOLE_DETAIL}"
+    fi
+  done
+  stop_web_console_port_forward
+  rm -f "${WEB_CONSOLE_BODY_FILE}"
+  if [ "${rc}" -ne 0 ]; then
+    echo "ERROR: the web console failed under ${label}: ${WEB_CONSOLE_DETAIL}"
+    dump_web_console_state "${label}"
+    exit 1
+  fi
+
+  # The CR after the turn: a console that drove something on the bus side
+  # Degraded shows up here. The operator's status can lag a pod by one pass,
+  # so a Degraded is re-read a bounded number of times before it fails. A
+  # read that returns no phase (the read swallows a failed GET, and the CR
+  # carries a status once its provisioning Job has run, so nothing read is
+  # no answer) is one more read against the same bound, never a pass, as in
+  # gate_cr_not_degraded; phase and pair keep the last read that answered,
+  # so a window that ends unread fails on that answer, or, with none, as
+  # unread.
+  for _ in $(seq 1 "${WEB_CONSOLE_CR_ATTEMPTS}"); do
+    read_pair="$(kubectl get platformagent "${PLATFORM_AGENT_CR_NAME}" -n "${NAMESPACE}" -o jsonpath="${CR_PHASE_READY_JSONPATH}" 2>/dev/null || true)"
+    if [ -n "${read_pair%%$'\t'*}" ]; then
+      pair="${read_pair}"
+      phase="${pair%%$'\t'*}"
+      [ "${phase}" = "${CR_PHASE_DEGRADED}" ] || break
+    fi
+    sleep "${WEB_CONSOLE_POLL_SECONDS}"
+  done
+  if [ -z "${phase}" ]; then
+    echo "ERROR: ${PLATFORM_AGENT_CR_NAME} is unread with the web console on under ${label}: all ${WEB_CONSOLE_CR_ATTEMPTS} reads after the turn returned no phase, so there is no phase or Ready condition to judge"
+    dump_web_console_state "${label}"
+    exit 1
+  fi
+  if [ "${phase}" = "${CR_PHASE_DEGRADED}" ]; then
+    echo "ERROR: ${PLATFORM_AGENT_CR_NAME} is ${phase} with the web console on under ${label}; Ready condition: ${pair#*$'\t'}"
+    dump_web_console_state "${label}"
+    exit 1
+  fi
+  echo "✓ web console verified under ${label} in $((SECONDS - gate_start))s (attempt ${attempt}/${WEB_CONSOLE_GATE_ATTEMPTS}; ${PLATFORM_AGENT_CR_NAME} is ${phase}: ${pair#*$'\t'})"
+}
+
+gate_web_console today
+
 # ─── 6b. EVAL_MODE_NEXT: switch to spec.mode: next and gate the bus ──────────
 # Everything above proved the today-mode install. From here the mode is set
 # through the chart (a `helm upgrade --reuse-values` of step 5's release with
@@ -2333,6 +2680,59 @@ gate_mode_next_rollout() {
     exit 1
   fi
   echo "✓ ${workload} rolled out $((gate_start - MODE_NEXT_START))s..$((SECONDS - MODE_NEXT_START))s after the mode switch"
+}
+
+# Waits for the A2A bus, then for the rest of its servers; on failure
+# describes it, dumps the stack and stops the deploy. A multi-server bus
+# serves once a quorum of its servers (two of three) is Ready, and each
+# server waits Pending for a node of its own (the operator's hostname spread
+# is DoNotSchedule, so two servers never share a node): on Autopilot every
+# further server waits on a node scale-up, which can outlast one rollout
+# budget. So the bus passes at a quorum within MODE_NEXT_ROLLOUT_TIMEOUT, and
+# the remaining servers get MODE_NEXT_BUS_FULL_TIMEOUT more. Meanwhile the
+# PlatformAgent's Ready message names each server that is not Ready and the
+# scheduler's reason (a2aNATSShortNote), which the dump prints on failure.
+gate_mode_next_bus() {
+  local workload="$1"
+  local gate_start=$SECONDS want ready quorum deadline
+  for _ in $(seq 1 "${MODE_NEXT_GENERATION_ATTEMPTS}"); do
+    kubectl get "${workload}" -n "${NAMESPACE}" >/dev/null 2>&1 && break
+    sleep "${MODE_NEXT_POLL_SECONDS}"
+  done
+  want="$(kubectl get "${workload}" -n "${NAMESPACE}" -o jsonpath='{.spec.replicas}' 2>/dev/null)" || want=""
+  want="${want:-1}"
+  quorum=$(( want / 2 + 1 ))
+  deadline=$(( gate_start + ${MODE_NEXT_ROLLOUT_TIMEOUT%s} ))
+  while :; do
+    # A read the API drops is one more poll, not the end of the deploy.
+    ready="$(kubectl get "${workload}" -n "${NAMESPACE}" -o jsonpath='{.status.readyReplicas}' 2>/dev/null)" || ready=""
+    ready="${ready:-0}"
+    [ "${ready}" -ge "${quorum}" ] && break
+    if [ "${SECONDS}" -ge "${deadline}" ]; then
+      echo "ERROR: ${workload} has ${ready} of ${want} servers Ready, short of its quorum of ${quorum}, after ${MODE_NEXT_ROLLOUT_TIMEOUT} under mode: next"
+      kubectl describe "${workload}" -n "${NAMESPACE}" || true
+      dump_mode_next_state
+      exit 1
+    fi
+    sleep "${MODE_NEXT_POLL_SECONDS}"
+  done
+  echo "✓ ${workload} serving on ${ready} of ${want} servers (quorum ${quorum}) $((gate_start - MODE_NEXT_START))s..$((SECONDS - MODE_NEXT_START))s after the mode switch"
+  if [ "${ready}" -lt "${want}" ]; then
+    deadline=$(( SECONDS + ${MODE_NEXT_BUS_FULL_TIMEOUT%s} ))
+    while :; do
+      ready="$(kubectl get "${workload}" -n "${NAMESPACE}" -o jsonpath='{.status.readyReplicas}' 2>/dev/null)" || ready=""
+      ready="${ready:-0}"
+      [ "${ready}" -ge "${want}" ] && break
+      if [ "${SECONDS}" -ge "${deadline}" ]; then
+        echo "ERROR: ${workload} still has ${ready} of ${want} servers Ready ${MODE_NEXT_BUS_FULL_TIMEOUT} after reaching its quorum under mode: next; the PlatformAgent's Ready message names the missing server and why"
+        kubectl describe "${workload}" -n "${NAMESPACE}" || true
+        dump_mode_next_state
+        exit 1
+      fi
+      sleep "${MODE_NEXT_POLL_SECONDS}"
+    done
+  fi
+  echo "✓ ${workload} rolled out: ${want} of ${want} servers Ready $((SECONDS - MODE_NEXT_START))s after the mode switch"
 }
 
 # Waits for the agent Deployment's generation to move past the one given,
@@ -2620,6 +3020,9 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   STEP_START=$SECONDS
   MODE_NEXT_START=$SECONDS
   echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Switching ${PLATFORM_AGENT_CR_NAME} to mode: next through platformAgent.mode (EVAL_MODE_NEXT=1) ==="
+  # Claims a killed next-mode lease left, which 5c's flip to today released
+  # from their StatefulSet but kept (5b″ says why), before next binds them.
+  delete_orphaned_nats_claims
   # The mode and the session cap in one values document, so the first render
   # -- and the first provisioning Job -- sees both. Section 2b sized the cap so
   # the budget that Job measures, which counts the rendered bridge's workers,
@@ -2644,7 +3047,7 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   kubectl get configmap "${PLATFORM_AGENT_CR_NAME}-config" -n "${NAMESPACE}" -o jsonpath='{.data.managed\.env}' || true
   echo
 
-  gate_mode_next_rollout "statefulset/${PLATFORM_AGENT_CR_NAME}-a2a-nats"
+  gate_mode_next_bus "statefulset/${PLATFORM_AGENT_CR_NAME}-a2a-nats"
   gate_mode_next_rollout "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-callout"
 
   # The one run, against a bus with no streams. Its budget already counts
@@ -2725,6 +3128,11 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
   # now, and the backoff it may still be in has been running against the two
   # rollouts above rather than in front of them.
   gate_mode_next_rollout "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-verifier"
+
+  # The console again, now under next (6a says what it checks): the today
+  # path it talks to is still there beside the bus, and the CR stays out of
+  # Degraded with the console on.
+  gate_web_console next
 
   # What the run has to show for itself, for the artifact log: the CR status,
   # the stack the mode rendered, the ungated gateway, and the entrypoint's

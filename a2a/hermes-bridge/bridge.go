@@ -70,6 +70,15 @@ const (
 	// dump the cap dropped.
 	stderrTailBytes = 2048
 	stdoutTailBytes = 2048
+	// failureScrubWindowBytes is how much of each stream's end the cli
+	// executor keeps for a failed run's terminal: the window is scrubbed
+	// as an answer is (scrubAnswer) and only then cut to the tail sizes
+	// above, as the api executor scrubs a body before its tail, so a
+	// private key whose armour header is further from the end than the
+	// tail, or a value or label the cut would split, is still read whole.
+	// A secret a byte of which reaches the quoted tail is read whole when
+	// it starts within the window: up to 62 KiB before the tail.
+	failureScrubWindowBytes = 64 << 10
 	// cliStdoutCap bounds what the cli executor keeps of a child's stdout,
 	// which is the answer it publishes as the result artifact: the api
 	// executor's apiResponseCap, so the two executors refuse the same size.
@@ -790,7 +799,7 @@ func (b *Bridge) accept(ctx context.Context, env *lib.Envelope) {
 			b.finalize(run, lib.StateFailed, shutdownReason, nil)
 			return
 		}
-		go b.runCardStop(ctx, run)
+		go b.runCardStop(ctx, run) // #nosec G118 -- runCardStop detaches its stop context on purpose; cancel and shutdown end it through cancelReq, the way they end a turn
 		return
 	}
 	select {
@@ -1103,7 +1112,7 @@ func (b *Bridge) publishTurnAnswer(run *taskRun, turn int, text string) bool {
 		return false
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), finalizePublishTimeout)
-	err := b.publishTurn(ctx, run, fmt.Sprintf("artifact-%s-turn-%d", run.origin.TaskID, turn), visibleOr(text))
+	err := b.publishTurn(ctx, run, fmt.Sprintf("artifact-%s-turn-%d", run.origin.TaskID, turn), visibleOr(scrubAnswer(run, text)))
 	cancel()
 	run.noticeMu.Unlock()
 	if err != nil {
@@ -1496,14 +1505,15 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 	}
 
 	argv := promptArgv(b.cfg.Command, prompt)
-	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd := exec.Command(argv[0], argv[1:]...) // #nosec G204 -- Command is the bridge's configured executor; argv goes to exec without a shell
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	// stdout is the answer, kept to the cap; stdoutTail is the last
-	// stdoutTailBytes of the same stream for a failed run's terminal, which
-	// the cap cannot cut (the two writers' comments at the constants).
+	// failureScrubWindowBytes of the same stream for a failed run's
+	// terminal, which the cap cannot cut (the writers' comments at the
+	// constants).
 	stdout := newBoundedBuffer(b.stdoutCap)
-	stdoutTail := newTailBuffer(stdoutTailBytes)
-	stderr := newTailBuffer(stderrTailBytes)
+	stdoutTail := newTailBuffer(failureScrubWindowBytes)
+	stderr := newTailBuffer(failureScrubWindowBytes)
 	cmd.Stdout = io.MultiWriter(stdout, stdoutTail)
 	cmd.Stderr = stderr
 	// WaitDelay bounds the reap. Neither stream is an *os.File, so os/exec
@@ -1635,7 +1645,10 @@ func (b *Bridge) runTask(ctx context.Context, run *taskRun) {
 			b.publishUsageLocked(run, lib.Usage{DurationMs: turnMillis(reaped.Sub(started))})
 		}
 		run.mu.Unlock()
-		b.finalize(run, lib.StateFailed, failureReason(err, stdoutTail.String(), stderr.String())+cliStdoutCutNote(b.stdoutCap, stdout.Dropped()), nil)
+		// The tails can carry what the answer would (stdout is the answer
+		// stream): each window scrubbed as an answer is (scrubAnswer),
+		// then cut to its tail (failureReason).
+		b.finalize(run, lib.StateFailed, failureReason(err, scrubAnswer(run, stdoutTail.String()), scrubAnswer(run, stderr.String()))+cliStdoutCutNote(b.stdoutCap, stdout.Dropped()), nil)
 	}
 }
 
@@ -1706,7 +1719,8 @@ func argvText(prompt string) string {
 
 // failureReason is the terminal message for a subprocess that exited
 // non-zero: the reason token, the exit error, the session id if hermes
-// printed one, and a bounded tail of each stream. Exit 75 (EX_TEMPFAIL) is
+// printed one, and a bounded tail of each stream (each cut here, after
+// the caller scrubbed the window it passes). Exit 75 (EX_TEMPFAIL) is
 // the rate-limit exit and gets its own token; everything else is
 // hermes-exited-nonzero. Newlines are kept: the message is a text part, and
 // the tails are read by a person.
@@ -1721,7 +1735,7 @@ func failureReason(err error, stdout, stderr string) string {
 	if session := hermesSessionID(stderr); session != "" {
 		fmt.Fprintf(&sb, "; session: %s", session)
 	}
-	fmt.Fprintf(&sb, "; stdout tail: %s; stderr tail: %s", tail(stdout, stdoutTailBytes), stderr)
+	fmt.Fprintf(&sb, "; stdout tail: %s; stderr tail: %s", tail(stdout, stdoutTailBytes), tail(stderr, stderrTailBytes))
 	return sb.String()
 }
 
@@ -1840,7 +1854,26 @@ func (b *Bridge) finalizeCopy(run *taskRun, state lib.TaskState, msg string, res
 	b.finalizeResult(run, state, msg, &resultCopy, nil, true)
 }
 
+// clearSeenSecrets empties and closes the task's seen-values set, and
+// says at debug how many values the set refused because a pool was full of
+// earlier results' entries: a count only, never a value.
+func (b *Bridge) clearSeenSecrets(run *taskRun) {
+	a := run.act.Load()
+	if a == nil {
+		return
+	}
+	if n := a.secrets.clear(); n > 0 {
+		b.cfg.Logger.Debug(fmt.Sprintf("seen-set refused %d values", n), "task", run.origin.TaskID, "refused", n)
+	}
+}
+
 func (b *Bridge) finalizeResult(run *taskRun, state lib.TaskState, msg string, resultOutput *string, data []byte, copyOnly bool) {
+	// The answer as it goes on TASKS, the chat message folded from it
+	// included: scrubbed (scrubAnswer), before any lock, as the fold is.
+	if resultOutput != nil {
+		scrubbed := scrubAnswer(run, *resultOutput)
+		resultOutput = &scrubbed
+	}
 	// noticeMu first and for the whole of it: no steer notice can be in
 	// flight past this, and a second finalizer waits here, then leaves on
 	// stateDone, as it always waited on mu.
@@ -1882,8 +1915,9 @@ func (b *Bridge) finalizeResult(run *taskRun, state lib.TaskState, msg string, r
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), finalizePublishTimeout)
 	if resultOutput != nil {
-		// The chat message is read from the answer as the agent wrote it; the text a
-		// person sees carries no step line (visibleText).
+		// The chat message is read from the scrubbed answer (resultOutput was
+		// replaced with scrubAnswer's copy above); the text a person sees
+		// carries no step line (visibleText).
 		if err := b.resultPublish(ctx, run, visibleOr(*resultOutput), chat); err != nil && copyOnly {
 			b.cfg.Logger.Error("result publish failed; the answer is on the stream as a turn, so the terminal keeps its state",
 				"task", run.origin.TaskID, "state", state, "err", err)
@@ -1895,6 +1929,8 @@ func (b *Bridge) finalizeResult(run *taskRun, state lib.TaskState, msg string, r
 	b.publishHandoff(ctx, run, state)
 	err := b.publishTerminal(ctx, run, state, msg)
 	cancel()
+	// The task's answers are out: the values seen for their scrub go.
+	b.clearSeenSecrets(run)
 	run.mu.Unlock()
 	b.waitActivity(run)
 	if err != nil {

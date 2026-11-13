@@ -42,6 +42,9 @@ import yaml
 from devops_bench.tasks.schema import Task as DevopsBenchTask
 
 from kube_agents_bench import pushed_report, scope_exclude, stop_hook, worker_trajectory
+from kube_agents_bench.lane import REQUESTED_KEY as _REQUESTED_KEY
+from kube_agents_bench.lane import LaneSafeguardsError as _LaneSafeguardsError
+from kube_agents_bench.lane import declared_pull_requests as _lane_declared_pull_requests
 from kube_agents_bench.lane import requested_pull_requests as _lane_requested_pull_requests
 
 __all__ = [
@@ -70,7 +73,8 @@ __all__ = [
 # - this repository's: what this package and the case tooling read --
 #   ``domain``, ``fixtures``, ``owner``, ``expected_fail``,
 #   ``tool_calls_optional``, ``audit_streams``, ``scope_exclude`` (read by
-#   ``scope_exclude.py``), ``writes_alone`` (read by ``lane.py``), ``suite``
+#   ``scope_exclude.py``), ``writes_alone`` and ``requested_pull_requests``
+#   (read by ``lane.py`` and by ``load_case``), ``suite``
 #   (``certification``: the case runs on the certification lane only, read by
 #   scripts/validate_bench_cases.py against hack/eval/certification-cases.txt)
 #   -- and ``task_version``, a
@@ -86,6 +90,7 @@ REPOSITORY_CASE_KEYS = frozenset(
     {
         "domain", "fixtures", "owner", "expected_fail", "tool_calls_optional",
         "audit_streams", scope_exclude.KEY, "task_version", "writes_alone", "suite",
+        _REQUESTED_KEY,
     }
 )
 CASE_KEYS = DEVOPS_BENCH_CASE_KEYS | REPOSITORY_CASE_KEYS
@@ -116,8 +121,10 @@ NOOP_DEPLOYER = "noop"
 # the pod instead, when the turn ran under the bridge's api executor, and
 # puts them on the trajectory tagged with the worker's profile. The scorer
 # grades these checks on an inject record that carries tagged worker
-# entries and no ``worker_trajectory.GAP_ENTRY`` (a capture with gaps), and
-# sets them aside on any other inject record. Two kinds stay set aside on a
+# entries and no ``worker_trajectory.GAP_ENTRY`` (a capture with gaps), grades
+# the ``workers``-scope ``tool_called`` ones on a record carrying
+# ``worker_trajectory.NO_WORKER_CALLS_ENTRY`` and no worker entry, and sets them
+# aside on any other inject record. Two kinds stay set aside on a
 # record with the workers too: a check that also reads the router's own
 # calls, on a record whose door did not vouch for them, and a check that
 # reads what the trace never carries (a router call's result or argument
@@ -142,6 +149,7 @@ HARNESS_WRITTEN_ENTRIES = frozenset(
         stop_hook.CARDS_STOPPED_ENTRY,
         pushed_report.PLANT_ENTRY,
         worker_trajectory.GAP_ENTRY,
+        worker_trajectory.NO_WORKER_CALLS_ENTRY,
     }
 )
 _TOOL_CALLED_NAMES_KEY = "tool_names"
@@ -149,6 +157,8 @@ _TOOL_CALLED_NAMES_KEY = "tool_names"
 # (``verifiers.ToolCalledVerifier``: ``router`` is the default).
 _TOOL_CALLED_SCOPE_KEY = "scope"
 _TOOL_CALLED_ROUTER_SCOPE = "router"
+# The scope that reads the delegated workers' calls alone.
+_TOOL_CALLED_WORKERS_SCOPE = "workers"
 # The scope that reads the router's calls and the workers' together.
 _TOOL_CALLED_ALL_SCOPE = "all"
 # The worker-blind type that reads every tool output, the router's included.
@@ -246,7 +256,9 @@ class CaseSpec:
     ran under the bridge's api executor and tags their entries, so the
     scorer grades these entries on an inject record that carries tagged
     worker entries and no capture gap, and sets them aside on any other
-    inject record (``scoring._inject_lane_view``). A compound mixing such a
+    inject record (``scoring._inject_lane_view``), bar
+    ``worker_calls_checks`` on a record carrying
+    ``worker_trajectory.NO_WORKER_CALLS_ENTRY``. A compound mixing such a
     leaf with a router-scope ``tool_called`` lands here, not in
     ``trace_blind_checks``: its worker leaf would still error with the
     trace shown, and grading the compound would block on it. The two sets
@@ -268,6 +280,14 @@ class CaseSpec:
     tool output, the router's included). Set aside on every inject record,
     workers or none."""
 
+    worker_calls_checks: frozenset[str] = frozenset()
+    """The entries in ``worker_blind_checks`` whose every leaf is a
+    ``tool_called`` in the ``workers`` scope with no ``result`` pattern. On a
+    record carrying ``worker_trajectory.NO_WORKER_CALLS_ENTRY`` (the cards
+    closed, a clean capture, no worker entry) these alone grade, on zero
+    worker calls; the other worker-reading entries stay set aside, since their
+    verifiers read a capture that holds nothing (``scoring._inject_lane_view``)."""
+
     tool_calls_optional: bool = False
     """``tool_calls_optional:``, for a case a correct agent can answer without
     calling a tool -- a first-turn greeting, a reply that names a command.
@@ -277,15 +297,17 @@ class CaseSpec:
     Absent means False."""
 
     requested_pull_requests: int = 0
-    """How many pull requests the case's own requesting checks ask for (leaves
-    of a type in ``lane.REQUESTING_CHECK_TYPES``). The infra carve-out in
-    ``scoring.classify_rep`` fires only when this is non-zero: an empty report
-    on an infra-ended rep mischarges a *requested* pull request as unrequested,
-    but on a case that requested none a write is a genuine forbidden action and
-    still blocks. A case that requests a pull request only through the lane
-    ``requesting:`` listing (its own checks ask for none) is not distinguished
-    here: the scorer is pinned to the ``bench/`` tree and cannot read the lane
-    file, so its infra-ended rep still blocks (tracked in #4778)."""
+    """How many pull requests the case requests: the larger of what its own
+    requesting checks ask for (leaves of a type in
+    ``lane.REQUESTING_CHECK_TYPES``) and the count it declares at its top
+    level under ``requested_pull_requests``, for a case that opens more pull
+    requests by design than its checks grade or a placeholder for a case the
+    persona answers with a pull request before its own check lands. The
+    write-safeguard carve-outs in ``scoring.classify_rep`` fire only when this
+    is non-zero, and hold the charged writes to it: on a case that requested
+    none a write is a genuine forbidden action and still blocks. Both counts
+    are in the task file, which is why they live there: the scorer is pinned
+    to the ``bench/`` tree and cannot read the lane file under ``hack/``."""
 
 
 def _leaves(node: Any) -> list[dict[str, Any]]:
@@ -377,6 +399,29 @@ def _negates_every_leaf(node: Any, *, negations: int = 0) -> bool:
     return False
 
 
+def _calls_the_workers_only(leaf: dict[str, Any]) -> bool:
+    """Whether a leaf is a ``tool_called`` in the ``workers`` scope with no ``result`` pattern."""
+    return (
+        str(leaf.get("type") or "") in TRACE_GRADABLE_CHECK_TYPES
+        and leaf.get(_TOOL_CALLED_SCOPE_KEY) == _TOOL_CALLED_WORKERS_SCOPE
+        and leaf.get(_TOOL_CALLED_RESULT_KEY) is None
+    )
+
+
+def _worker_calls_checks(spec: Any, workers: frozenset[str]) -> frozenset[str]:
+    """The names in ``workers`` whose every leaf passes :func:`_calls_the_workers_only`."""
+    if not isinstance(spec, list):
+        return frozenset()
+    return frozenset(
+        str(entry["name"])
+        for entry in spec
+        if isinstance(entry, dict)
+        and str(entry.get("name")) in workers
+        and (leaves := _leaves(entry.get("check")))
+        and all(_calls_the_workers_only(leaf) for leaf in leaves)
+    )
+
+
 def _transport_blind_checks(
     spec: Any,
 ) -> tuple[frozenset[str], frozenset[str], frozenset[str], frozenset[str], frozenset[str]]:
@@ -453,9 +498,8 @@ def load_case(task_yaml: str | Path) -> CaseSpec:
     grade honestly — a missing file, a document that is not a mapping, or a
     declared id that disagrees with the directory.
 
-    The case's ``requested_pull_requests`` is the count of its own requesting
-    checks. A lane-only ``requesting:`` listing is not read here; see that
-    field's note.
+    The case's ``requested_pull_requests`` is the larger of the count of its
+    own requesting checks and the top-level ``requested_pull_requests`` key.
     """
     path = Path(task_yaml)
     if not path.is_file():
@@ -511,6 +555,11 @@ def load_case(task_yaml: str | Path) -> CaseSpec:
     declares_spec = isinstance(spec, list) and len(spec) > 0
 
     expected_fail_raw = doc.get("expected_fail", False)
+    try:
+        declared = _lane_declared_pull_requests(doc, where=str(path))
+    except _LaneSafeguardsError as exc:
+        raise CaseSpecError(str(exc)) from exc
+
     expected_fail = _coerce_bool(expected_fail_raw, field="expected_fail", path=path)
     tool_calls_optional = _coerce_bool(
         doc.get("tool_calls_optional", False), field="tool_calls_optional", path=path
@@ -539,6 +588,7 @@ def load_case(task_yaml: str | Path) -> CaseSpec:
         worker_blind_checks=worker_blind,
         worker_router_checks=worker_router,
         worker_untraced_checks=worker_untraced,
+        worker_calls_checks=_worker_calls_checks(spec, worker_blind),
         tool_calls_optional=tool_calls_optional,
-        requested_pull_requests=_lane_requested_pull_requests(spec),
+        requested_pull_requests=max(_lane_requested_pull_requests(spec), declared),
     )

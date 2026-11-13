@@ -141,7 +141,8 @@ def project_gke_cluster(body: bytes) -> bytes | None:
 def project_gke_cluster_list(body: bytes) -> bytes | None:
     """The relayed form of a `clusters.list` answer, or None if it is not one.
 
-    `missingZones` is kept so the answer still says when a list is partial. The
+    `missingZones` is kept so the answer still says when a list is partial.
+    stall_watch reads it as its "incomplete listing" signal, so it must stay. The
     reconcile does not need it: it reads a list only as proof that a cluster exists,
     never as proof of absence, so a partial list cannot delete anything.
     """
@@ -163,6 +164,11 @@ def project_gke_cluster_list(body: bytes) -> bytes | None:
         kept["missingZones"] = missing
     return json.dumps(kept, separators=(",", ":")).encode()
 
+
+# The cluster read the shim's get-credentials check uses; the broker refuses it
+# for an excluded cluster when the check's header is set
+# (credential_proxy.GET_CREDENTIALS_CHECK_HEADER).
+GKE_CLUSTER_GET_RULE = "gcp.api.container.clusters-get"
 
 API_READ_ROUTES: tuple[ApiRoute, ...] = (
     # Per-container usage history for the cost stream's collector
@@ -214,7 +220,9 @@ API_READ_ROUTES: tuple[ApiRoute, ...] = (
     # The Cluster Agent reconcile's two reads (#3703, approved by @bnaylor 10-28 as
     # exactly these two read-only routes): every cluster in a project, and whether one
     # cluster still exists. Both answers are projected to name, location, status and
-    # id; node pools, operations and every write stay refused.
+    # id; node pools, operations and every write stay refused. The get is also the
+    # shim's check before it answers a get-credentials itself (#5447), and the list
+    # is also stall_watch's cluster listing (#5598).
     ApiRoute(
         "container.googleapis.com",
         API_READ_METHOD,
@@ -226,7 +234,7 @@ API_READ_ROUTES: tuple[ApiRoute, ...] = (
         "container.googleapis.com",
         API_READ_METHOD,
         re.compile(rf"^v1/projects/{PROJECT}/locations/{GKE_LOCATION}/clusters/{GKE_CLUSTER}$"),
-        "gcp.api.container.clusters-get",
+        GKE_CLUSTER_GET_RULE,
         project_gke_cluster,
     ),
 )

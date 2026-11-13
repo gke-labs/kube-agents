@@ -50,12 +50,12 @@
 #
 # WHY THESE. The two vcs cases exist to exercise the forge (a branch reused
 # after its first proposal closed; a second revision read back before it is
-# described) and pass 100 % and 92 % on the GitHub nightly over 30 days, so
+# described) and pass above the bar on the GitHub nightly over 30 days, so
 # a red here points at GitLab, not at the agent. No ledger case is in the
-# lane: the compliance canary published a ledger in about half its runs on
+# lane: the compliance canary published a ledger only in some of its runs on
 # either forge, the agent's doing, until 2026-10-23, and has no GitLab record
-# since (a GitHub roster seat since 2026-11-02 on 95.6 % of its presubmit
-# repetitions there); consistency-drift-outlier, which passes on the GitHub
+# since (a GitHub roster seat since 2026-11-02 on its presubmit record
+# there); consistency-drift-outlier, which passes on the GitHub
 # nightlies (a roster seat since 2026-10-26), has no GitLab record yet. So the ledger path is proven by the harness, not by a case: the
 # lease-time probe, probe_gitlab_ledger_path in the script and
 # docs/ci-pool-projects.md 5.6. That says the forge takes a ledger; whether

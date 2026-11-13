@@ -1,10 +1,13 @@
 """The chart renders a PodMonitoring for each of the agent's pods that serves metrics.
 
-Four today: the gateway pod, where the k8s-event-watcher serves its metrics on the
+The gateway pod, where the k8s-event-watcher serves its metrics on the
 agent-api-auth sidecar; the credential-proxy pod, where the broker serves its
 own on a metrics-only listener; the kube-proxy pod, where k8s-api-proxy serves its
-own on a metrics-only listener; and the A2A gateway pod a `spec.mode: next`
-install runs, which serves its own on a metrics-only listener too. For each,
+own on a metrics-only listener; the A2A gateway pod a `spec.mode: next`
+install runs, which serves its own on a metrics-only listener too; and the
+same install's NATS pods, where an exporter sidecar serves the bus's JetStream
+figures. The NATS row is held to the next-mode golden, which renders the
+bus, and has a PodMonitoring alone (no ServiceMonitor or VMPodScrape). For each,
 three things have to agree for the scrape to work: the port the operator
 declares on the container, the number in the PodMonitoring, and the labels the
 operator puts on the pod. The chart cannot read the operator, so the structural
@@ -35,6 +38,10 @@ _TEMPLATE = _CHART / "templates" / "platform-agent-monitoring.yaml"
 _HELPERS = _CHART / "templates" / "_helpers.tpl"
 _GOLDEN = (
     _REPO_ROOT / "k8s-operator" / "internal" / "testing" / "testdata" / "platform" / "expected" / "platformagent.yaml"
+)
+_NEXT_GOLDEN = _GOLDEN.with_name("platformagent-next.yaml")
+_OPERATOR_A2A_SOURCE = (
+    _REPO_ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_a2a_manifests.go"
 )
 _KIND_UP = _REPO_ROOT / "hack" / "kind-up.sh"
 _A2A_FIXTURE = (
@@ -118,6 +125,26 @@ _SCRAPES = (
 )
 
 
+# The NATS exporter's row: a StatefulSet in the next-mode golden, scraped by a
+# PodMonitoring with no ServiceMonitor or VMPodScrape beside it, so it sits
+# outside _SCRAPES (whose rows all carry both).
+_NATS_SCRAPE = {
+    "suffix": "-a2a-nats-monitoring",
+    "fixture": _NEXT_GOLDEN,
+    "deployment": "platformagent-a2a-nats",
+    "container": "nats-exporter",
+    "port_name": "nats-metrics",
+    "selector_keys": ("app",),
+    # The per-consumer series, labelled by consumer name, are dropped: every
+    # ephemeral consumer would mint new ones. Nothing else is.
+    "metric_relabeling": [{"sourceLabels": ["__name__"], "regex": "jetstream_consumer_.*", "action": "drop"}],
+}
+# Every row with a PodMonitoring, in template order.
+_POD_MONITORING_SCRAPES = _SCRAPES + (_NATS_SCRAPE,)
+# The workload kinds a row's pod template can come from.
+_WORKLOAD_KINDS = ("Deployment", "StatefulSet")
+
+
 def _scrape_port(scrape):
     """The port a row's PodMonitoring has to scrape, from the golden or the A2A fixture."""
     fixture = scrape.get("fixture", _GOLDEN)
@@ -127,7 +154,7 @@ def _scrape_port(scrape):
 def _manifest_port(fixture, deployment, container, port_name):
     """The named containerPort the operator declares, read from the golden or fixture render."""
     for document in yaml.safe_load_all(fixture.read_text()):
-        if not isinstance(document, dict) or document.get("kind") != "Deployment":
+        if not isinstance(document, dict) or document.get("kind") not in _WORKLOAD_KINDS:
             continue
         if document["metadata"]["name"] != deployment:
             continue
@@ -144,7 +171,7 @@ def _manifest_port(fixture, deployment, container, port_name):
 def _manifest_pod_labels(fixture, deployment):
     """The pod-template labels the operator puts on the named Deployment, from the golden or fixture."""
     for document in yaml.safe_load_all(fixture.read_text()):
-        if isinstance(document, dict) and document.get("kind") == "Deployment" and document["metadata"]["name"] == deployment:
+        if isinstance(document, dict) and document.get("kind") in _WORKLOAD_KINDS and document["metadata"]["name"] == deployment:
             return document["spec"]["template"]["metadata"]["labels"]
     raise AssertionError(f"no Deployment {deployment} in {fixture}")
 
@@ -191,13 +218,27 @@ class MonitoringShapeTest(unittest.TestCase):
         # homes, and this is what keeps them one. The template lists the
         # scrapes in _SCRAPES order.
         ports = re.findall(r"^\s+- port: (\d+)$", self.template, re.MULTILINE)
-        self.assertEqual(
-            ports,
-            [str(_scrape_port(s)) for s in _SCRAPES],
-        )
+        want = []
+        for scrape in _SCRAPES:
+            want.append(str(_scrape_port(scrape)))
+            # The exec tier's PodMonitoring follows the broker's, rendered only
+            # while the tier is on, so it is not a _SCRAPES row.
+            if scrape["suffix"] == "-credential-proxy-monitoring":
+                want.append(str(_manifest_port(_EXEC_GOLDEN, f"{_GOLDEN_AGENT}-credential-proxy-exec-tier",
+                                               "envoy-credential-proxy", "cred-metrics")))
+        # The NATS exporter's PodMonitoring is the template's last.
+        want.append(str(_scrape_port(_NATS_SCRAPE)))
+        self.assertEqual(ports, want)
+
+    def test_the_nats_port_is_the_operators_constant(self):
+        # The golden is rendered from a2aNATSMetricsPort; reading the
+        # constant too names the source when the two disagree.
+        match = re.search(r"^\s*a2aNATSMetricsPort\s+int32\s*=\s*(\d+)\s*$", _OPERATOR_A2A_SOURCE.read_text(), re.MULTILINE)
+        self.assertIsNotNone(match, "a2aNATSMetricsPort not found in the operator source")
+        self.assertEqual(int(match.group(1)), _scrape_port(_NATS_SCRAPE))
 
     def test_the_selectors_are_the_operators_pod_labels(self):
-        for scrape in _SCRAPES:
+        for scrape in _POD_MONITORING_SCRAPES:
             with self.subTest(scrape=scrape["suffix"]):
                 for key, value in _selector(scrape, "{{ .Values.platformAgent.name }}").items():
                     # A value YAML would read as anything but a string (the
@@ -235,7 +276,7 @@ class MonitoringRenderTest(unittest.TestCase):
             capture_output=True, text=True,
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        suffixes = tuple(scrape["suffix"] for scrape in _SCRAPES)
+        suffixes = tuple(scrape["suffix"] for scrape in _POD_MONITORING_SCRAPES)
         return {
             document["metadata"]["name"]: document
             for document in yaml.safe_load_all(proc.stdout)
@@ -249,11 +290,11 @@ class MonitoringRenderTest(unittest.TestCase):
         # CRD still does not. With the API served, one per scraped pod.
         self.assertEqual(self._monitorings(), {})
         rendered = self._monitorings(*_ON_GKE)
-        self.assertEqual(sorted(rendered), sorted({_AGENT + s["suffix"] for s in _SCRAPES}))
+        self.assertEqual(sorted(rendered), sorted({_AGENT + s["suffix"] for s in _POD_MONITORING_SCRAPES}))
         # One PodMonitoring per suffix; its endpoints are the rows that share the
-        # suffix, in _SCRAPES order (one each today).
-        for suffix in dict.fromkeys(s["suffix"] for s in _SCRAPES):
-            rows = [s for s in _SCRAPES if s["suffix"] == suffix]
+        # suffix, in template order (one each today).
+        for suffix in dict.fromkeys(s["suffix"] for s in _POD_MONITORING_SCRAPES):
+            rows = [s for s in _POD_MONITORING_SCRAPES if s["suffix"] == suffix]
             with self.subTest(scrape=suffix):
                 monitoring = rendered[_AGENT + suffix]
                 self.assertEqual(monitoring["spec"]["selector"], {"matchLabels": _selector(rows[0], _AGENT)})
@@ -263,13 +304,14 @@ class MonitoringRenderTest(unittest.TestCase):
                         "port": _scrape_port(row),
                         "path": "/metrics",
                         "interval": "30s",
+                        **({"metricRelabeling": row["metric_relabeling"]} if "metric_relabeling" in row else {}),
                     } for row in rows],
                 )
 
     def test_the_names_and_selectors_follow_the_agent_name(self):
         rendered = self._monitorings(*_ON_GKE, "--set", "platformAgent.name=custom")
-        self.assertEqual(sorted(rendered), sorted({"custom" + s["suffix"] for s in _SCRAPES}))
-        for scrape in _SCRAPES:
+        self.assertEqual(sorted(rendered), sorted({"custom" + s["suffix"] for s in _POD_MONITORING_SCRAPES}))
+        for scrape in _POD_MONITORING_SCRAPES:
             with self.subTest(scrape=scrape["suffix"]):
                 self.assertEqual(
                     rendered["custom" + scrape["suffix"]]["spec"]["selector"]["matchLabels"],
@@ -278,7 +320,7 @@ class MonitoringRenderTest(unittest.TestCase):
 
     def test_true_renders_them_without_asking_the_cluster(self):
         rendered = self._monitorings("--set", "platformAgent.podMonitoring=true")
-        self.assertEqual(sorted(rendered), sorted({_AGENT + s["suffix"] for s in _SCRAPES}))
+        self.assertEqual(sorted(rendered), sorted({_AGENT + s["suffix"] for s in _POD_MONITORING_SCRAPES}))
 
     def test_false_renders_nothing_even_where_the_api_is_served(self):
         self.assertEqual(self._monitorings(*_ON_GKE, "--set", "platformAgent.podMonitoring=false"), {})
@@ -635,3 +677,49 @@ class MonitoringRenderTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+_EXEC_GOLDEN = _GOLDEN.with_name("platformagent-exec-2.yaml")
+_EXEC_VALUE = "platformAgent.deployment.credentialProxy.exec.replicas"
+_EXEC_KEYS = ("app", "kubeagents.x-k8s.io/component")
+
+
+@unittest.skipUnless(shutil.which("helm"), "helm is not installed")
+class ExecTierMonitoringRenderTest(unittest.TestCase):
+    """Every scrape object for the stateful broker has an exec-tier counterpart while
+    the tier renders, on the operator's exec pod labels and metrics port."""
+
+    def _render(self, replicas):
+        proc = subprocess.run(
+            ["helm", "template", "test-release", str(_CHART), *_REQUIRED, *_ON_GKE,
+             "--set", "platformAgent.serviceMonitor=true", "--set", "platformAgent.vmPodScrape=true",
+             "--set", "platformAgent.monitoringScraperNamespace=scrapers",
+             "--set", f"{_EXEC_VALUE}={replicas}"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return {(d["kind"], d["metadata"]["name"]): d for d in yaml.safe_load_all(proc.stdout) if isinstance(d, dict)}
+
+    def test_nothing_for_the_tier_at_zero(self):
+        self.assertFalse([key for key in self._render(0) if "exec-tier" in key[1]])
+
+    def test_each_scrape_object_has_an_exec_tier_counterpart(self):
+        docs = self._render(2)
+        labels = _manifest_pod_labels(_EXEC_GOLDEN, f"{_GOLDEN_AGENT}-credential-proxy-exec-tier")
+        want = {key: labels[key].replace(_GOLDEN_AGENT, _AGENT) for key in _EXEC_KEYS}
+        port = _manifest_port(_EXEC_GOLDEN, f"{_GOLDEN_AGENT}-credential-proxy-exec-tier", "envoy-credential-proxy", "cred-metrics")
+        monitoring = docs[("PodMonitoring", f"{_AGENT}-credential-proxy-exec-tier-monitoring")]
+        self.assertEqual(monitoring["spec"]["selector"]["matchLabels"], want)
+        self.assertEqual(monitoring["spec"]["endpoints"][0]["port"], port)
+        service = docs[("Service", f"{_AGENT}-cred-metrics-exec-tier")]
+        self.assertEqual(service["spec"]["selector"], want)
+        self.assertEqual(service["spec"]["ports"][0]["port"], port)
+        monitor = docs[("ServiceMonitor", f"{_AGENT}-cred-metrics-exec-tier")]
+        self.assertEqual(monitor["spec"]["selector"]["matchLabels"], {"app": f"{_AGENT}-cred-metrics-exec-tier"})
+        scrape = docs[("VMPodScrape", f"{_AGENT}-cred-metrics-exec-tier")]
+        self.assertEqual(scrape["spec"]["selector"]["matchLabels"], want)
+        netpol = docs[("NetworkPolicy", f"{_AGENT}-cred-mon-exec-tier-netpol")]
+        self.assertEqual(netpol["spec"]["podSelector"]["matchLabels"], {"app": want["app"]})
+        self.assertEqual(netpol["spec"]["ingress"][0]["ports"][0]["port"], port)
+        # The stateful broker's objects are unchanged beside them.
+        self.assertIn(("PodMonitoring", f"{_AGENT}-credential-proxy-monitoring"), docs)

@@ -36,13 +36,31 @@ type InboundMessage struct {
 	MessageID string
 	// Text is the message content.
 	Text string
+	// Quoted is the turn's text when it reaches an agent: the member's words
+	// followed by the message they quoted, framed; empty when the message
+	// quotes nothing. Text stays the member's own words so the gateway's
+	// command matchers read them: a stop or a status ask quoted onto an
+	// alert is answered on the words alone, and the router puts Quoted in
+	// Text's place only for a turn that reaches an agent (agentText). Set by
+	// Google Chat's quote-in-reply (gchat.go, quotedAsk); empty on every
+	// other path.
+	Quoted string
+	// QuotedUnread marks a message that quoted one the adapter could not
+	// read (the read refused or timed out, or a card or an image with no
+	// text), so the words travel alone: Quoted is empty and the member is
+	// owed one line saying so. The router posts that line only for a turn
+	// that reaches an agent (noteUnreadQuote), since a command it answers
+	// itself never needed the quote. Set with words beside the quote; a
+	// bare quote that could not be read is no turn (gchat.go, quotedAsk).
+	QuotedUnread bool
 
-	// Backend names the ingress this message arrived through, and empty
-	// means the gateway's own configured backend. It exists because one
-	// gateway can now have two ingresses: the inject side door may be armed
-	// beside a real backend, and attribution is a property of the message
-	// rather than of the process. A message that says nothing is attributed
-	// to the configured backend, which is every chat backend's case.
+	// Backend names the ingress this message arrived through. It exists
+	// because one gateway has several ingresses: every armed chat backend
+	// runs behind the mux, and the side doors sit beside them, so
+	// attribution is a property of the message rather than of the process.
+	// Behind the mux every chat message carries its adapter's key (mux.go,
+	// Run). Empty means the gateway's own configured backend, which is only
+	// the case for a hand-built single-adapter gateway with no mux.
 	Backend string
 
 	// Profile, when set, addresses this turn to an AgentProfile, with
@@ -87,6 +105,10 @@ type InboundMessage struct {
 	// settles on the answer, and the ask keeps ⏸️. False on every backend
 	// but Slack.
 	Answer bool
+	// ArrivedAt is when the adapter received the message, set by the Slack
+	// adapter only: the start of slack_first_ack_seconds, which ends when the
+	// gateway has drawn the ask's arrival reaction (drawArrivalMark).
+	ArrivedAt time.Time
 	// Unaddressed marks a message the sender did not address to the bot,
 	// delivered only because of where it was typed: today an unmentioned
 	// Slack reply under one of the bot's own posts (an alert, or another
@@ -101,6 +123,14 @@ type InboundMessage struct {
 	// channel reads; the adapter tells them privately. False on every other
 	// path, and on every backend but Slack.
 	Shortcut bool
+	// Viewer is the sender as the backend addresses a message to one reader
+	// alone: Google Chat's `users/<id>` resource name, which a click's event
+	// carries beside the email in AuthorID, and which a private post names
+	// (PrivatePoster). The gateway posts a refused Stop press's notice to
+	// it (stopgate.go). Empty when the event named the sender by no such
+	// name, so nothing is addressed to a name that is not a user's; empty
+	// on a typed message, and on every backend but Google Chat.
+	Viewer string
 }
 
 // IntentCancel is the only Intent today: stop the conversation's running
@@ -207,7 +237,8 @@ type VerifiedObserver interface {
 
 // StatusShower is the optional extension an Adapter implements when its
 // backend shows a task's status itself, so the relay's rolling line ("⏳
-// submitted…" edited on to "✅ completed") would only repeat it. The Slack
+// submitted…" edited on to "✅ completed", or on a LineAnswerer to the
+// acknowledgement or a bare mark) would only repeat it. The Slack
 // adapter does, with Agent Sessions' Working… status, the ask's reaction and
 // the plan rows, as the today path shows no receipt either. With it true the
 // gateway posts no placeholder for a task, so the relay has no line to edit
@@ -217,6 +248,44 @@ type VerifiedObserver interface {
 // the backend that owns it.
 type StatusShower interface {
 	ShowsTaskStatus(conversation string) bool
+}
+
+// PrivatePoster is the optional extension an Adapter implements when its
+// backend can post a message in a conversation that one member alone sees:
+// Google Chat's privateMessageViewer, the Chat adapter's note card
+// mechanism (gchat_feedback.go). The gateway uses it for the one line a
+// refused Stop press tells its presser (stopgate.go, refusedPressNotice),
+// with viewer the presser as InboundMessage.Viewer named them. Asked per
+// conversation, so a wrapper (the mux, the side door) forwards it to the
+// backend that owns it, and answers errNoPrivatePosts for one that has no
+// private post, which the caller logs.
+type PrivatePoster interface {
+	PostPrivate(conversation, viewer, text string) error
+}
+
+// errNoPrivatePosts is PostPrivate's answer from a wrapper whose owning
+// backend implements no PrivatePoster.
+var errNoPrivatePosts = errors.New("the conversation's backend posts no private message")
+
+// LineAnswerer is the optional extension an Adapter implements when a
+// completed task's live message, the "⏳ submitted…" line, should end as
+// the ask's reaction comes off on Slack rather than read "✅ completed". A
+// backend with no reaction and no Working… status (Google Chat) has the
+// line as its only receipt of the ask, and the terminal edit left it
+// reading "✅ completed" under the question, above the answer, where Slack
+// shows no line at all. With it true the relay edits the line into the
+// acknowledgement of a turn that handed the ask to cards (the plan and the
+// report that follow are posts, and notify), and ends every other completed
+// task's line as a bare "✅" (lineDoneMark) after its answer posts: a Chat
+// edit raises no notification, so an answer that arrives minutes after the
+// ask has to post. An edit that does not land posts the acknowledgement as
+// on any backend, and the terminal edit follows. A failed, canceled or
+// rejected task keeps its terminal edit and its notice. Asked per
+// conversation, so a wrapper (the mux, the side door) answers for the
+// backend that owns it, and a door keeps its line, which its caller reads
+// as data.
+type LineAnswerer interface {
+	AnswersOnLine(conversation string) bool
 }
 
 // OutMessage is one post or edit as a value: the text, and the chat message

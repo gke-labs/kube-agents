@@ -62,6 +62,7 @@ rules:
       - limitranges
       - configmaps
       - serviceaccounts
+      - secrets
     verbs:
       - get
       - list
@@ -401,12 +402,17 @@ data:
       ssh_key: /etc/sandbox-ssh/id_ed25519
       ssh_port: 2222
       ssh_user: agent
+      timeout: 180
       workspace_root: /opt/data
   managed.env: |
     API_SERVER_KEY=cluster-internal-trusted
     HERMES_HOME_MODE=2770
     KUBEAGENTS_MODE=today
+    KUBEAGENTS_POST_MERGE_CHECK=off
+    KUBEAGENTS_AUTOMERGE=off
+    KUBEAGENTS_DIAL=off
     KUBEAGENTS_SCOPE_FILE=/etc/kube-agents/scope.json
+    KUBEAGENTS_RESOLVED_SCOPE_FILE=
     RECONCILE_PROJECT=
     GKE_PROJECT_ID=example-project
     STALL_WATCH_EXCLUDE_NAMESPACES=
@@ -696,6 +702,26 @@ metadata:
 type: Opaque
 ---
 apiVersion: v1
+data:
+  ca.crt: <GENERATED_FOR_TESTS>
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-kube-proxy-ca-bundle
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
+apiVersion: v1
 kind: Service
 metadata:
   labels:
@@ -789,7 +815,7 @@ spec:
             - name: CREDENTIAL_PROXY_AUDIENCE
               value: kubeagents-credential-proxy
             - name: CREDENTIAL_PROXY_ALLOWED_CALLERS
-              value: system:serviceaccount:kubeagents-system:platformagent-gateway-agent,system:serviceaccount:kubeagents-system:platformagent-shell
+              value: system:serviceaccount:kubeagents-system:platformagent-shell
             - name: CREDENTIAL_PROXY_KUBE_CA_FILE
               value: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
             - name: CREDENTIAL_PROXY_KUBE_TOKEN_FILE
@@ -800,6 +826,10 @@ spec:
               value: "true"
             - name: OTEL_RESOURCE_ATTRIBUTES
               value: service.namespace=kubeagents-system,k8s.namespace.name=kubeagents-system,kubeagents.agent_type=platform,kubeagents.agent_name=platformagent
+            - name: KUBE_PROXY_SCOPE_FILE
+              value: /etc/kube-agents/scope/scope.json
+            - name: KUBE_PROXY_EXCLUDE_HOST_CLUSTER_ID
+              value: gke_example-project_us-central1-a_cluster-a
           image: ghcr.io/gke-labs/kube-agents/kube-proxy:latest
           imagePullPolicy: IfNotPresent
           lifecycle:
@@ -843,6 +873,9 @@ spec:
             - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
               name: event-watcher-ksa-token
               readOnly: true
+            - mountPath: /etc/kube-agents/scope
+              name: platform-agent-scope-vol
+              readOnly: true
       securityContext:
         fsGroup: 10000
         runAsNonRoot: true
@@ -861,6 +894,14 @@ spec:
           topologyKey: kubernetes.io/hostname
           whenUnsatisfiable: ScheduleAnyway
       volumes:
+        - configMap:
+            defaultMode: 292
+            items:
+              - key: scope.json
+                path: scope.json
+            name: platformagent-config
+            optional: true
+          name: platform-agent-scope-vol
         - name: kube-proxy-tls
           secret:
             defaultMode: 288
@@ -1144,6 +1185,10 @@ spec:
               name: data
               readOnly: true
               subPath: profiles/platform/governance
+      dnsConfig:
+        options:
+          - name: ndots
+            value: "3"
       enableServiceLinks: false
       initContainers:
         - args:
@@ -1438,6 +1483,8 @@ spec:
               value: system:serviceaccount:kubeagents-system:platformagent-gateway-agent,system:serviceaccount:kubeagents-system:platformagent-shell
             - name: CREDENTIAL_PROXY_WATCHER_AUDIENCE
               value: kubeagents-credential-proxy-watcher
+            - name: CREDENTIAL_PROXY_SCOPE_FILE
+              value: /etc/kube-agents/scope/scope.json
             - name: CREDENTIAL_PROXY_KUBE_CA_FILE
               value: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
             - name: CREDENTIAL_PROXY_KUBE_TOKEN_FILE
@@ -1517,6 +1564,13 @@ spec:
             - mountPath: /etc/gitops
               name: gitops-state-volume
               readOnly: true
+            - mountPath: /etc/kube-agents/scope
+              name: platform-agent-scope-vol
+              readOnly: true
+      dnsConfig:
+        options:
+          - name: ndots
+            value: "3"
       securityContext:
         fsGroup: 10000
         runAsNonRoot: true
@@ -1573,6 +1627,14 @@ spec:
             defaultMode: 420
             name: platformagent-gitops-state
           name: gitops-state-volume
+        - configMap:
+            defaultMode: 292
+            items:
+              - key: scope.json
+                path: scope.json
+            name: platformagent-config
+            optional: true
+          name: platform-agent-scope-vol
 status: {}
 ---
 apiVersion: policy/v1
@@ -1767,6 +1829,7 @@ spec:
               value: /etc/hermes
             - name: KUBEAGENTS_SCOPE_FILE
               value: /etc/kube-agents/scope.json
+            - name: KUBEAGENTS_RESOLVED_SCOPE_FILE
             - name: RECONCILE_PROJECT
             - name: HERMES_HOME_MODE
               value: "2770"
@@ -1777,6 +1840,8 @@ spec:
             - name: CREDENTIAL_PROXY_URL
             - name: CREDENTIAL_PROXY_TOKEN_FILE
               value: /var/run/secrets/kubeagents/credential-proxy/token
+            - name: KUBE_PROXY_IN_USE_URL
+              value: https://platformagent-kube-proxy.kubeagents-system.svc.cluster.local:8443
             - name: KUBE_AGENTS_MCP_RELAY_URL
               value: http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765/v1/mcp
             - name: PUBSUB_RELAY_URL
@@ -1938,7 +2003,7 @@ spec:
         - args:
             - -c
             - /fluent-bit/etc/fluent-bit.conf
-          image: fluent/fluent-bit:5.1.2
+          image: fluent/fluent-bit:5.1.5
           name: fluent-bit
           resources:
             limits:
@@ -1970,6 +2035,10 @@ spec:
             - mountPath: /var/lib/fluent-bit
               name: system-metadata
               subPath: fluent-bit-state/platformagent
+      dnsConfig:
+        options:
+          - name: ndots
+            value: "3"
       initContainers:
         - args:
             - |-

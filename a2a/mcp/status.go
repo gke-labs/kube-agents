@@ -119,7 +119,7 @@ func FormatBusStatusMarkdown(st BusStatus) string {
 		sb.WriteString("### Streams\n\n| Stream | Messages | Size | Capacity | Consumers |\n| :--- | ---: | ---: | ---: | ---: |\n")
 		for _, s := range st.Streams {
 			fmt.Fprintf(&sb, "| `%s` | %d | %s | %s | %d |\n",
-				s.Name, s.Messages, formatBytes(int64(s.Bytes)), formatBytes(s.MaxBytes), s.Consumers)
+				s.Name, s.Messages, formatBytes(int64(s.Bytes)), formatBytes(s.MaxBytes), s.Consumers) // #nosec G115 -- a stream's byte count is below 2^63
 		}
 		sb.WriteString("\n")
 	}

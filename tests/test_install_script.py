@@ -128,8 +128,8 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
 
     # apply_minter_name_defaults (#3504): a name the operator gave wins; the
     # rest come from minter_name_defaults, stubbed here to known values.
-    _MINTER_STUB = "minter_name_defaults() { printf 'derived-ring|derived-key|derived-gsa\\n'; }"
-    _MINTER_SHOW = 'echo "ring=$PARAM_KMS_KEYRING key=$PARAM_KMS_KEY gsa=$GITHUB_MINTER_GSA_NAME"'
+    _MINTER_STUB = "minter_name_defaults() { printf 'derived-ring|derived-key|derived-gsa|derived-ksa\\n'; }"
+    _MINTER_SHOW = 'echo "ring=$PARAM_KMS_KEYRING key=$PARAM_KMS_KEY gsa=$GITHUB_MINTER_GSA_NAME ksa=$GITHUB_MINTER_KSA_NAME"'
 
     def _apply_minter_names(self, env=None):
         return self._run_install_func(
@@ -137,7 +137,7 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
 
     def test_a_new_install_naming_nothing_gets_the_per_install_names(self):
         proc = self._apply_minter_names()
-        self.assertIn("ring=derived-ring key=derived-key gsa=derived-gsa", proc.stdout, proc.stderr)
+        self.assertIn("ring=derived-ring key=derived-key gsa=derived-gsa ksa=derived-ksa", proc.stdout, proc.stderr)
 
     def test_minter_names_the_operator_gave_are_kept(self):
         """install.env or the environment naming them: never replaced, so an
@@ -146,13 +146,14 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
             "KMS_KEYRING": "github-token-minter-keyring",
             "KMS_KEY": "github-token-minter-key",
             "GITHUB_MINTER_GSA_NAME": "kubeagents-github-minter-gsa",
+            "GITHUB_MINTER_KSA_NAME": "kubeagents-github-minter",
         })
-        self.assertIn("ring=github-token-minter-keyring key=github-token-minter-key gsa=kubeagents-github-minter-gsa",
-                      proc.stdout, proc.stderr)
+        self.assertIn("ring=github-token-minter-keyring key=github-token-minter-key gsa=kubeagents-github-minter-gsa"
+                      " ksa=kubeagents-github-minter", proc.stdout, proc.stderr)
 
     def test_a_partly_named_minter_keeps_what_was_named(self):
         proc = self._apply_minter_names(env={"KMS_KEYRING": "my-ring"})
-        self.assertIn("ring=my-ring key=derived-key gsa=derived-gsa", proc.stdout, proc.stderr)
+        self.assertIn("ring=my-ring key=derived-key gsa=derived-gsa ksa=derived-ksa", proc.stdout, proc.stderr)
 
     # confirm_minter_key_owner (#3504), with the state read and the owner read stubbed.
     def _confirm_owner(self, owner, owner_rc=0, state_names="", env=None, answer=None):
@@ -8010,7 +8011,7 @@ class PlatformAgentModeTest(unittest.TestCase):
         warning = text.index('if [ "$platform_agent_mode" = "next" ] && [ -n "$third_party_registry_prefix" ]; then', main_start)
         self.assertLess(text.index('local third_party_registry_prefix=', main_start), warning)
         self.assertLess(exported, warning)
-        self.assertIn("A2A_NATS_IMAGE and A2A_PROVISION_IMAGE", text[warning : warning + 900])
+        self.assertIn("A2A_NATS_IMAGE, A2A_PROVISION_IMAGE, A2A_NATS_RELOADER_IMAGE and A2A_NATS_EXPORTER_IMAGE", text[warning : warning + 900])
 
     def test_a_bad_value_from_the_shell_on_a_first_install_names_the_shell(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -11513,6 +11514,7 @@ class DomainScopedFlagsTest(unittest.TestCase):
         "--enable-hermes-dashboard": "PARAM_ENABLE_WEBUI",
         "--enable-web-console": "PARAM_ENABLE_WEB_CONSOLE",
         "--enable-gke-backup-plan": "PARAM_ENABLE_GKE_BACKUP_PLAN",
+        "--disallow-secrets-read": "PARAM_DISALLOW_SECRETS_READ",
         "--enable-pubsub-platform": "PARAM_ENABLE_PUBSUB_PLATFORM",
         "--enable-stockout-investigator": "PARAM_ENABLE_STOCKOUT_INVESTIGATOR",
         "--enable-drift-detector": "PARAM_ENABLE_DRIFT_DETECTOR",
@@ -13283,6 +13285,7 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
         "--enable-google-chat",
         "--enable-slack",
         "--enable-gke-backup-plan",
+        "--disallow-secrets-read",
         "--enable-pubsub-platform",
         "--enable-stockout-investigator",
         "--enable-drift-detector",
@@ -13339,6 +13342,7 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
         "--enable-google-chat": "GOOGLE_CHAT_ENABLED",
         "--enable-slack": "SLACK_ENABLED",
         "--enable-gke-backup-plan": "ENABLE_GKE_BACKUP_PLAN",
+        "--disallow-secrets-read": "DISALLOW_SECRETS_READ",
         "--enable-pubsub-platform": "ENABLE_PUBSUB_PLATFORM",
         "--enable-stockout-investigator": "ENABLE_STOCKOUT_INVESTIGATOR",
         "--enable-drift-detector": "ENABLE_DRIFT_DETECTOR",
@@ -13402,6 +13406,7 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
             "PARAM_ENABLE_GOOGLE_CHAT",
             "PARAM_ENABLE_SLACK",
             "PARAM_ENABLE_GKE_BACKUP_PLAN",
+            "PARAM_DISALLOW_SECRETS_READ",
             "PARAM_ENABLE_PUBSUB_PLATFORM",
             "PARAM_ENABLE_STOCKOUT_INVESTIGATOR",
             "PARAM_ENABLE_DRIFT_DETECTOR",
@@ -13431,6 +13436,10 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
                 encoding="utf-8",
             )
             seeded_env.chmod(0o600)
+            # main() asks kubectl for its current context; the developer's
+            # default kubeconfig must not be what answers.
+            kubeconfig = pathlib.Path(tmp) / "kubeconfig"
+            kubeconfig.touch()
             driver = (
                 f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
                 "command() { return 0; }\n"
@@ -13459,7 +13468,7 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
                 capture_output=True,
                 text=True,
                 env=get_isolated_test_env(
-                    overrides={"KUBE_AGENTS_INSTALL_ENV": str(seeded_env)},
+                    overrides={"KUBE_AGENTS_INSTALL_ENV": str(seeded_env), "KUBECONFIG": str(kubeconfig)},
                 ),
                 cwd=str(_REPO_ROOT),
             )

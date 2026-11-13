@@ -96,6 +96,7 @@ func TestDelegateTargetsSkipBadNamesAndStopAtTheCap(t *testing.T) {
 // The submission to a conversation's own session pod carries the list, and a
 // profile added after the pod's first turn is in the next turn's.
 func TestASessionTurnCarriesItsDelegateTargets(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawnerRoute(t, RouteSession)
 	r.g.profiles.put("e2e5", &lib.AgentCard{Name: "e2e5", Description: "reads one cluster"})
 	r.adapter.inbox <- InboundMessage{Conversation: "discord:g1/t-dt", Kind: "group", AuthorID: "1001", MessageID: "dt-1", Text: "use e2e5"}
@@ -113,6 +114,7 @@ func TestASessionTurnCarriesItsDelegateTargets(t *testing.T) {
 // A turn addressed to platform or to a profile carries no list: neither runs
 // a session's delegate tool.
 func TestAPlatformTurnCarriesNoDelegateTargets(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	r.g.profiles.put("e2e5", &lib.AgentCard{Name: "e2e5"})
 	r.adapter.inbox <- InboundMessage{Conversation: "discord:g1/t-pl", Kind: "group", AuthorID: "1001", MessageID: "pl-1", Text: "hello"}
@@ -157,6 +159,27 @@ func TestDelegateTargetsCarryParametersAndStayInsideTheBytes(t *testing.T) {
 	}
 }
 
+// A profile pinned to a cluster takes its target from the pin, so the list
+// offers none of project, location and cluster for it, only what else it takes.
+func TestAPinnedProfileOffersNoTargetParameters(t *testing.T) {
+	d := newProfileDirectory()
+	extra := lib.ProfileParameter{Name: "namespace"}
+	d.put("pinned", &lib.AgentCard{Name: "pinned", ClusterRef: &lib.ClusterRef{ProjectID: "p1", Location: "us-east1", Cluster: "web-1"},
+		Parameters: append(append([]lib.ProfileParameter{}, clusterParams...), extra)})
+	d.put("unpinned", &lib.AgentCard{Name: "unpinned", Parameters: clusterParams})
+	got := (&Gateway{}).delegateTargets(TaskRequester{Backend: "discord", Subject: "u1"}, nil, false, d)
+	params := map[string][]lib.ProfileParameter{}
+	for _, target := range got.Targets {
+		params[target.Name] = target.Parameters
+	}
+	if want := []lib.ProfileParameter{extra}; !reflect.DeepEqual(params["pinned"], want) {
+		t.Fatalf("pinned offers %+v, want %+v", params["pinned"], want)
+	}
+	if !reflect.DeepEqual(params["unpinned"], clusterParams) {
+		t.Fatalf("unpinned offers %+v, want %+v", params["unpinned"], clusterParams)
+	}
+}
+
 // Everyone whose text reached the session is held to the target's lists, as
 // the delegation holds them: an off-list author takes a listed profile out,
 // and an incomplete set leaves nothing.
@@ -180,6 +203,7 @@ func TestDelegateTargetsHoldEveryoneInTheSession(t *testing.T) {
 
 // A wake runs without the delegate tool, so its submission carries no list.
 func TestAWakeCarriesNoDelegateTargets(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawnerRoute(t, RouteSession)
 	rec := &SessionRecord{Key: "discord:g1/t-wk", ContextID: "ctx-wk", Kind: "group"}
 	r.adapter.inbox <- InboundMessage{Conversation: rec.Key, Kind: "group", AuthorID: "1001", MessageID: "wk-1", Text: "hello"}
@@ -250,6 +274,7 @@ func TestDelegateAuthorsAreWhomTheDelegationWillCheck(t *testing.T) {
 // Whatever the cards, the list the gateway builds is a part it can send: a
 // list cut short by the byte bound still fits once it says it was cut.
 func TestEveryDelegateTargetsListBuildsAPart(t *testing.T) {
+	t.Parallel()
 	var params []lib.ProfileParameter
 	for j := 0; j < lib.TaskParametersMax; j++ {
 		params = append(params, lib.ProfileParameter{Name: fmt.Sprintf("parameter_number_%02d", j), Required: true})
@@ -271,6 +296,7 @@ func TestEveryDelegateTargetsListBuildsAPart(t *testing.T) {
 // conversation's record, whose turns the new pod's primer replays, though the
 // set isn't seeded until the pod spawns.
 func TestAFreshIncarnationsListCountsTheRecordsPeople(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawnerRoute(t, RouteSession)
 	me := TaskRequester{Backend: "discord", Subject: requesterSubject(r.g.ps, "discord", "1001")}
 	offList := TaskRequester{Backend: "discord", Subject: "someone-else"}
@@ -301,6 +327,7 @@ func TestAFreshIncarnationsListCountsTheRecordsPeople(t *testing.T) {
 // list at all, so its tool falls back to platform: the primer may keep fewer
 // turns than the record holds, and the pod's seeded set may be under the cap.
 func TestAFreshIncarnationPastTheCapSendsNoList(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawnerRoute(t, RouteSession)
 	conv := "discord:g1/t-busy"
 	rec := &SessionRecord{Key: conv, ContextID: "ctx-busy", Kind: "group", Addressee: "platform"}
@@ -316,5 +343,23 @@ func TestAFreshIncarnationPastTheCapSendsNoList(t *testing.T) {
 	origin := r.awaitTask(t, spawn.calls()[0].Session)
 	if _, found, _ := lib.DelegateTargetsOf(messageParts(t, origin)); found {
 		t.Fatal("a fresh incarnation past the cap carried a list; want none, so the tool names platform")
+	}
+}
+
+// The turn's part advertises the delegation width only when it is over one,
+// so at the default the part is what it was before batches, and a session's
+// tool offers the single shape.
+func TestDelegateTargetsAdvertiseAWidthOverOne(t *testing.T) {
+	d := newProfileDirectory()
+	r := TaskRequester{Backend: "discord", Subject: "u1"}
+	for _, tc := range []struct{ width, want int }{{0, 0}, {1, 0}, {10, 10}} {
+		g := &Gateway{cfg: &Config{DelegationWidthMax: tc.width}}
+		got := g.delegateTargets(r, nil, false, d)
+		if got.WidthMax != tc.want {
+			t.Errorf("width %d: advertised %d, want %d", tc.width, got.WidthMax, tc.want)
+		}
+		if _, err := lib.DelegateTargetsPart(got); err != nil {
+			t.Errorf("width %d: the list doesn't build a part: %v", tc.width, err)
+		}
 	}
 }

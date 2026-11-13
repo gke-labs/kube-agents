@@ -64,6 +64,9 @@ Each flag reads its default from an environment variable.
 | `Dockerfile`                | The image.                                                  |
 | `manifests/*.yaml.template` | The Secret, the Deployment and the Service, for `envsubst`. |
 
+`ghes-proxy-test.yml` runs `gofmt`, `go vet`, gosec and the tests; `make gosec` at the repository
+root runs the same scan over this module.
+
 ## Make the certificates
 
 ```bash

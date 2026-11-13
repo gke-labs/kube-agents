@@ -85,8 +85,8 @@
       "repository": "ghcr.io/gke-labs/kube-agents/a2a-worker",
       "tagPolicy": "release",
       "override": "A2A_WORKER_IMAGE",
-      "pulledBy": "The session pods the A2A gateway spawns under spec.mode: next; the operator passes its resolution to the gateway as A2A_WORKER_IMAGE. The image also carries the credential broker's shim as `kubectl` and `gcloud`, used only when the operator's A2A_SESSION_CLUSTER_VIEW flag gives a session pod its read-only cluster view.",
-      "description": "The session worker of the A2A next stack (a2a/Dockerfile.worker): the agent SDK, the worker adapter, the session agent's persona and read-only skills (a2a/cmd/session-persona), the credential broker's shim as kubectl and gcloud for the flag-gated cluster view, and jq, which the cluster agent's persona requires when the image runs its profile workers."
+      "pulledBy": "The session pods the A2A gateway spawns under spec.mode: next; the operator passes its resolution to the gateway as A2A_WORKER_IMAGE. The image carries stock `kubectl` (wired to `<name>-kube-proxy` on session pods under A2A_SESSION_CLUSTER_VIEW, and falling back to the credential broker shim on AgentProfile workers) plus the credential broker's shim as `gcloud`.",
+      "description": "The session worker of the A2A next stack (a2a/Dockerfile.worker): the agent SDK, the worker adapter, the session agent's persona and read-only skills (a2a/cmd/session-persona), stock kubectl wired to kube-proxy for session pods (falling back to the credential broker shim for AgentProfile workers), the credential broker's shim as gcloud, and jq, which the cluster agent's persona requires when the image runs its profile workers."
     },
     {
       "name": "persona-cluster",
@@ -137,7 +137,7 @@
       "repository": "ghcr.io/gke-labs/kube-agents/a2a-dispatcher",
       "tagPolicy": "release",
       "override": "A2A_DISPATCHER_IMAGE",
-      "pulledBy": "The AgentProfile dispatcher Deployment the operator renders under spec.mode: next when A2A_DISPATCHER_IMAGE is set, and nothing otherwise: it is off by default until profiles dispatch end to end, so the operator derives nothing for it. Nothing under spec.mode: today.",
+      "pulledBy": "The AgentProfile dispatcher Deployment the operator renders under spec.mode: next, unless `operator.profileDispatcher.enabled` is `false`. Nothing under spec.mode: today.",
       "description": "The AgentProfile dispatcher: the only reader of the profiles' shared durables, it holds each submission for the life of its task and hands it to a ready worker under a lease (a2a/Dockerfile.dispatcher)."
     },
     {
@@ -161,7 +161,7 @@
       "name": "litellm",
       "origin": "third-party",
       "repository": "ghcr.io/berriai/litellm",
-      "tag": "v1.106.0",
+      "tag": "v1.108.6",
       "override": "LITELLM_IMAGE",
       "pulledBy": "The LiteLLM gateway, from either the chart or the kustomize integration.",
       "description": "The model gateway the agent's baked default endpoint points at."
@@ -170,7 +170,7 @@
       "name": "fluent-bit",
       "origin": "third-party",
       "repository": "docker.io/fluent/fluent-bit",
-      "tag": "5.1.2",
+      "tag": "5.1.5",
       "override": "FLUENT_BIT_IMAGE",
       "pulledBy": "The logging sidecar the operator injects into every agent pod.",
       "description": "Ships agent container logs off the pod."
@@ -194,10 +194,28 @@
       "description": "Carries the nats CLI the provisioning script drives to create the streams and buckets. Same pin and override arrangement as nats."
     },
     {
+      "name": "nats-server-config-reloader",
+      "origin": "third-party",
+      "repository": "docker.io/natsio/nats-server-config-reloader",
+      "tag": "0.25.0@sha256:24bacde6b844f8875f93424ed153d33b3d9e9367fcccc14b683eb71fab3a4d8c",
+      "override": "A2A_NATS_RELOADER_IMAGE",
+      "pulledBy": "A sidecar in the NATS pod the operator renders under spec.mode: next, and nothing under spec.mode: today.",
+      "description": "Signals nats-server to reload its config when the operator changes only the bus's permissions, so an AgentProfile added or removed doesn't restart the bus. From nats-io, the same publisher as nats. Pinned by digest as well as tag; same override arrangement as nats."
+    },
+    {
+      "name": "prometheus-nats-exporter",
+      "origin": "third-party",
+      "repository": "docker.io/natsio/prometheus-nats-exporter",
+      "tag": "0.20.3@sha256:4b8ddc1c86fec360b5cd3d5e1fbc6fb52bdafd5805bba3901cc52926538af255",
+      "override": "A2A_NATS_EXPORTER_IMAGE",
+      "pulledBy": "The metrics sidecar in each pod of that NATS StatefulSet under spec.mode: next, and nothing under spec.mode: today.",
+      "description": "Reads the NATS server's monitor port over the pod's loopback and serves its JetStream stream and storage figures for Managed Prometheus to scrape. Same override arrangement as nats; pinned by digest as well as tag."
+    },
+    {
       "name": "k8s",
       "origin": "third-party",
       "repository": "docker.io/alpine/k8s",
-      "tag": "1.36.5",
+      "tag": "1.36.6",
       "pulledBy": "The chart's pre-delete cleanup hook Job.",
       "description": "alpine/k8s — kubectl plus a shell, for the hook that deletes the PlatformAgent CR before Helm removes the operator. The name is the trailing path segment because the chart renders this one: kube-agents.imageRepository rewrites onto <prefix>/<trailing name>, which has to be the destination mirror_images.sh writes (<prefix>/<name>)."
     },
@@ -214,7 +232,7 @@
       "name": "hindsight-api",
       "origin": "third-party",
       "repository": "ghcr.io/vectorize-io/hindsight-api",
-      "tag": "0.10.2@sha256:1ba631f950a04460feff6b1e212bad3cdf127b0cfb3d765bdcba12f512481d7b",
+      "tag": "0.10.3@sha256:f80f304db313cbc8775acd601fda7d094f5854ebf9bc252d8134eb9276d56b40",
       "override": "HINDSIGHT_API_IMAGE",
       "pulledBy": "The chart, when the memory provider uses Hindsight (make deploy-hindsight for the kustomize dev path).",
       "description": "Serves the agents' long-term memory. Pinned by digest as well as tag; a mirrored install pulls the copy by tag, because that is what 'make mirror-images' pushes."
@@ -223,16 +241,16 @@
       "name": "hindsight-postgresql",
       "origin": "third-party",
       "repository": "docker.io/pgvector/pgvector",
-      "tag": "0.8.6-pg15@sha256:a947c45cdc5906a1bc951f20a8709e321256343ee0f251e4ae00b5e7def4e6da",
+      "tag": "0.8.7-pg15@sha256:88164492558c9773a1e17a8305abaca7863e05b3d8bbcdb792774890a2047e06",
       "override": "HINDSIGHT_POSTGRES_IMAGE",
       "pulledBy": "The chart, alongside the Hindsight API.",
-      "description": "Postgres with the pgvector extension, the store behind the Hindsight API. The pg15 line, not a newer one: the StatefulSet keeps its data on a PVC, and Postgres refuses a data directory written by another major, so moving off pg15 is a pg_upgrade rather than a tag change. Postgres 15 is supported upstream until November 2027, though Hindsight's own floor is Postgres 15 too, so this sits at the oldest major it supports and a release that raises that floor forces the pg_upgrade sooner. Upstream also rebuilds a version tag in place when the Postgres base is patched, which is what the digest half of the pin holds still."
+      "description": "Postgres with the pgvector extension, the store behind the Hindsight API. The pg15 line, not a newer one: the StatefulSet keeps its data on a PVC, and Postgres refuses a data directory written by another major, so moving off pg15 is a pg_upgrade rather than a tag change. Postgres 15 is supported upstream until November 2027, though Hindsight's own floor is Postgres 15 too, so this sits at the oldest major it supports and a release that raises that floor forces the pg_upgrade sooner. Upstream also rebuilds a version tag in place when the Postgres base is patched, which is what the digest half of the pin holds still. A pgvector version bump changes the library but not an existing database's catalog version; run `ALTER EXTENSION vector UPDATE` when an upgrade script carries more than comments."
     },
     {
       "name": "cert-manager-controller",
       "origin": "third-party",
       "repository": "quay.io/jetstack/cert-manager-controller",
-      "tag": "v1.21.2",
+      "tag": "v1.21.3",
       "pulledBy": "cert-manager, installed by the full-install composition unless enable_cert_manager is false.",
       "description": "Issues the webhook serving certificates the operator's webhooks need."
     },
@@ -240,7 +258,7 @@
       "name": "cert-manager-cainjector",
       "origin": "third-party",
       "repository": "quay.io/jetstack/cert-manager-cainjector",
-      "tag": "v1.21.2",
+      "tag": "v1.21.3",
       "pulledBy": "cert-manager, installed by the full-install composition unless enable_cert_manager is false.",
       "description": "Injects CA bundles into webhook configurations."
     },
@@ -248,7 +266,7 @@
       "name": "cert-manager-webhook",
       "origin": "third-party",
       "repository": "quay.io/jetstack/cert-manager-webhook",
-      "tag": "v1.21.2",
+      "tag": "v1.21.3",
       "pulledBy": "cert-manager, installed by the full-install composition unless enable_cert_manager is false.",
       "description": "cert-manager's own admission webhook."
     },
@@ -256,7 +274,7 @@
       "name": "cert-manager-acmesolver",
       "origin": "third-party",
       "repository": "quay.io/jetstack/cert-manager-acmesolver",
-      "tag": "v1.21.2",
+      "tag": "v1.21.3",
       "pulledBy": "cert-manager's controller, via its --acme-http01-solver-image flag. Never pulled by kube-agents itself; the copy exists so a mirrored cert-manager install can point the flag at it.",
       "description": "Solver pod cert-manager runs for ACME HTTP-01 challenges."
     },
@@ -264,7 +282,7 @@
       "name": "cert-manager-startupapicheck",
       "origin": "third-party",
       "repository": "quay.io/jetstack/cert-manager-startupapicheck",
-      "tag": "v1.21.2",
+      "tag": "v1.21.3",
       "pulledBy": "cert-manager, installed by the full-install composition unless enable_cert_manager is false. Runs once per install as a post-install hook Job.",
       "description": "One-shot check that the cert-manager API is actually serving before the install is declared done."
     },
@@ -284,7 +302,7 @@
       "name": "envoy",
       "origin": "build-time",
       "repository": "docker.io/envoyproxy/envoy",
-      "tag": "v1.39.1",
+      "tag": "v1.39.6",
       "buildArg": "ENVOY_IMAGE",
       "pulledBy": "deploy/docker/Dockerfile (envoy-bin stage).",
       "description": "Source of the envoy binary copied into the credential-proxy image."
@@ -302,7 +320,7 @@
       "name": "node",
       "origin": "build-time",
       "repository": "docker.io/library/node",
-      "tag": "22-slim",
+      "tag": "24-slim",
       "buildArg": "NODE_IMAGE",
       "pulledBy": "a2a/Dockerfile.worker runtime stage and a2a/Dockerfile.console page build stage.",
       "description": "Node runtime for the session worker image, which installs the agent SDK's platform package to get the harness binary, and the stage that builds the console page."
@@ -329,7 +347,7 @@
       "name": "busybox",
       "origin": "build-time",
       "repository": "docker.io/library/busybox",
-      "tag": "musl@sha256:ea2b9914a16a4ac1981994af97b318f7c7d4db76b580c56177f08bf76f4a0be8",
+      "tag": "musl@sha256:80e38f9a1b39188b8bdb28879178edb322a4402b081a9aedda1924609decd6f6",
       "pulledBy": "agentplugins/*/Dockerfile and a2a/Dockerfile.persona-* base images.",
       "description": "Minimal userland (sh, cp, ls) base image for plugin and persona images to support staging init containers."
     }

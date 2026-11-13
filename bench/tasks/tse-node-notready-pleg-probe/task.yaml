@@ -6,7 +6,8 @@
 # bound (profiles.tse.enabled=true, set on EVAL_MODE_NEXT=1 installs by
 # MODE_NEXT_ENV_ARGS in hack/ci-deploy.sh, so the operator projects
 # KUBE_AGENTS_ENABLED_PROFILES=tse and the entrypoint scaffolds
-# /opt/data/profiles/tse). Registered in hack/eval/nightly-cases.txt (#3492).
+# /opt/data/profiles/tse). Registered in hack/eval/nightly-cases.txt (#3492);
+# parked by #5394 while tse's persona image was a placeholder, back with #3842.
 id: tse-node-notready-pleg-probe
 name: GKE Support Agent (tse) node NotReady PLEG triage and escalation bundle
 

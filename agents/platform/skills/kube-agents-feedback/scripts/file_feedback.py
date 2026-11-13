@@ -35,8 +35,25 @@ text). Output is one JSON line on stdout, the broker's object as received:
 `fallback` names the tracker and the form's short link on every answer, so a
 report the install could not file can be handed back with where to file it.
 
+The second subcommand renders the install's usage summary for a report whose
+author opted into attaching it (docs/designs/chat-feedback-command.md, §8). It
+reads the ``PlatformAgent`` resource through the sandbox's brokered ``kubectl``
+(a context-less read of the host cluster; the agent's Role grants ``get`` on
+the resource) and nothing in a pod, so the token, spend, latency and task
+lines read ``unavailable``. The block is audited as ``feedback_summary`` audits
+its own, and a hit prints how many identifiers it found, never which:
+
+    file_feedback.py summary [--namespace NS] [--name NAME]
+
+    <the fenced block>                                               (exit 0)
+    {"status": "BLOCKED", "reason": "...", "fallback": {...}}         (exit 1; no block)
+
+``submit`` takes no flag for it: the block a report carries is the one the
+person saw in the draft, copied into ``environment`` by the front door.
+
 Run:
     file_feedback.py submit --payload-file payload.json [--state-dir DIR]
+    file_feedback.py summary [--namespace NS] [--name NAME]
 """
 
 from __future__ import annotations
@@ -61,6 +78,7 @@ sys.path.append(str(Path(__file__).resolve().parents[3] / "scripts"))
 
 import credential_proxy_client  # noqa: E402
 import feedback_broker  # noqa: E402
+import feedback_summary  # noqa: E402
 
 BROKER_ENDPOINT_VAR = "CREDENTIAL_PROXY_URL"
 ROUTE = feedback_broker.ROUTE
@@ -104,6 +122,20 @@ LOST_MESSAGE = (
     "the broker's answer was lost after the request went out ({error}); the marker "
     "is kept, and rerunning the same command only asks the broker to read the tracker"
 )
+# The summary's refusals. The count stands in for the identifiers on purpose:
+# naming them on stdout would put in the card result what the audit kept out
+# of the block.
+REASON_SUMMARY_UNREADABLE = (
+    "the PlatformAgent {name} in {namespace} could not be read, so no usage "
+    "summary was rendered; nothing is attached"
+)
+REASON_SUMMARY_LEAK = (
+    "the usage summary names {count} identifier(s) read from the resource, so "
+    "it is not shown; nothing is attached"
+)
+SUMMARY_COMMAND = "summary"
+#: The block's closing fence, which the rating form sits directly above.
+SUMMARY_FENCE = "```"
 
 
 class BrokerAnswerLost(Exception):
@@ -290,6 +322,43 @@ def submit(payload_path: Path, state_dir: Path) -> int:
     return _blocked(REASON_BROKER_ANSWER.format(code=code))
 
 
+def _without_rating_form(text: str) -> str:
+    """The block less the rating form ``render`` ends it with.
+
+    The form (``feedback:``, a rating line, two prompts) is for a person to
+    fill in before pasting the block into an email. An attached block goes
+    into a public issue's environment field as it stands, where an empty form
+    reads as a rating nobody gave, so it is cut here, after the audit ran over
+    the whole block: what is printed is a subset of what was checked.
+    """
+    lines = text.split("\n")
+    form = list(feedback_summary.FEEDBACK_TEMPLATE)
+    if lines[-1] == SUMMARY_FENCE and lines[-1 - len(form):-1] == form:
+        del lines[-1 - len(form):-1]
+    return "\n".join(lines)
+
+
+def summary(namespace: str, name: str) -> int:
+    """Print the install's audited usage summary, or a BLOCKED line and no block.
+
+    Resource only: ``in_pod`` is off because ``exec`` is a write verb to the
+    broker's command policy, and no context or kubeconfig is passed because
+    the shim's context-less read is the host cluster. The audit is the one
+    ``feedback_summary.main`` runs, through the same helper.
+    """
+    options = feedback_summary.Options(namespace=namespace, name=name, in_pod=False)
+    try:
+        snapshot = feedback_summary.collect(options)
+    except feedback_summary.CollectError as error:
+        print(f"{feedback_summary.LOG_PREFIX}{error}", file=sys.stderr)
+        return _blocked(REASON_SUMMARY_UNREADABLE.format(name=name, namespace=namespace))
+    text, leaked = feedback_summary.audited_block(snapshot)
+    if leaked:
+        return _blocked(REASON_SUMMARY_LEAK.format(count=len(leaked)))
+    print(_without_rating_form(text))
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -300,7 +369,16 @@ def main() -> int:
         help="where the submission marker lives; use the task workspace so a "
              "rerun sees its own earlier attempt",
     )
+    summary_parser = subparsers.add_parser(
+        SUMMARY_COMMAND, help="print the install's audited usage summary for a report's environment; files nothing",
+    )
+    summary_parser.add_argument("--namespace", "-n", default=feedback_summary.DEFAULT_NAMESPACE)
+    summary_parser.add_argument(
+        "--name", default=feedback_summary.DEFAULT_AGENT_NAME, help="the PlatformAgent resource",
+    )
     args = parser.parse_args()
+    if args.command == SUMMARY_COMMAND:
+        return summary(args.namespace, args.name)
     return submit(args.payload_file, args.state_dir)
 
 

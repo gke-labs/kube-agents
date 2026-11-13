@@ -801,7 +801,17 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
         `auto-enqueue.yml` alone also mints Pull requests write, for the
         enqueue sweep above: it turns auto-merge on and off and dequeues, and
         the script scan holds it to that. Its key is read nowhere else, so no
-        other workflow can mint the same token. A new grant is a red test and
+        other workflow can mint the same token. `ci-health.yml` mints Issues
+        write for the bots' issue repository (`KUBE_AGENTS_ISSUES_REPO`, a
+        different App and key, `ISSUES_APP_PRIVATE_KEY`), scoped to that one
+        repository; it files, edits and closes the bots' own issues and
+        nothing else. `release-publish.yml`'s `relabel-upgrade-table` job also
+        mints Pull requests write, with Contents write and without Workflows:
+        after a release it pushes a docs-only branch and opens the pull request
+        that relabels the upgrade table's `pending` rows (#5673). It cannot land
+        that change itself: main takes a pull request only through review and
+        the merge queue, and `lgtm` comes only from the OWNERS file's people,
+        which lists no machine account. A new grant is a red test and
         a conversation, as for the holder list above, and so is a minting step
         that names no scope, which gets every permission the App holds.
         """
@@ -832,6 +842,8 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
             "staging-promotion-pipeline.yml",
         ) for scope in release}
         expected |= {("auto-enqueue.yml", scope) for scope in release | {"permission-pull-requests"}}
+        expected.add(("ci-health.yml", "permission-issues"))
+        expected.add(("release-publish.yml", "permission-pull-requests"))
         self.assertEqual(expected, grants)
         self.assertEqual({"auto-enqueue.yml"}, key_readers)
 

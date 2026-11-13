@@ -54,12 +54,13 @@ On a GitHub Enterprise Server run (``BENCH_FORGE=github`` with
 ``BENCH_GITHUB_API_ROOT`` when set, and a pull request the reply names is one
 whose URL is on ``BENCH_GITHUB_HOST``.
 
-What it cannot see, and says so: the branch listing wants ``contents: read``,
-which the grading credential does not carry today (docs/ci-pool-projects.md
-5.5), so a listing GitHub refuses leaves ``branches_observed`` false and a
-note in the report rather than an error. A pull request is the write a
+What it may not see, and says so: the branch listing wants ``contents: read``.
+The eval's grading mint asks for it (``LEDGER_GRADING_MINT_BODY`` in
+hack/ci-eval-pr.sh, since #5519; docs/ci-pool-projects.md 5.5). A credential
+without it, or a listing GitHub refuses, leaves ``branches_observed`` false
+and a note in the report rather than an error. A pull request is the write a
 branch exists for, and the pull-request listing needs only
-``pull_requests: read``; the branch half is best effort until the grant.
+``pull_requests: read``, so the branch half stays best effort.
 """
 
 from __future__ import annotations
@@ -282,6 +283,15 @@ BRANCH_NAME_SEPARATORS = ("/", "-", "_")
 Transport = Callable[[str, str, float], tuple[int, Any]]
 
 
+def _read_handled(status: int) -> None:
+    """Tell the forge-unavailable decision (verifiers) that the read just made
+    answered ``status`` as control flow: this module reads it as "not there"
+    or "will not say", never as the check's error."""
+    from kube_agents_bench import verifiers  # lazy: verifiers imports this module
+
+    verifiers._forge_read_handled(status)
+
+
 class GitHubUnreadable(Exception):
     """The API would not answer for the repository: a fault of ours, never a
     grade. The message names what to fix."""
@@ -433,6 +443,7 @@ class GitHubClient:
         """
         status, payload = self.get(f"/repos/{repo}/pulls/{number}")
         if status == STATUS_NOT_FOUND:
+            _read_handled(status)
             return None
         self._refuse(status, repo, f"pull request #{number}", "pull_requests: read")
         if not isinstance(payload, dict):
@@ -446,6 +457,7 @@ class GitHubClient:
             f"/repos/{repo}/pulls/{number}/commits?per_page={PR_COMMITS_PAGE_SIZE}&page={page}"
         )
         if status == STATUS_NOT_FOUND:
+            _read_handled(status)
             return None
         self._refuse(status, repo, f"pull request #{number}'s commits", "pull_requests: read")
         if not isinstance(commits, list):
@@ -491,6 +503,7 @@ class GitHubClient:
             f"/repos/{repo}/git/matching-refs/heads/{urllib.parse.quote(prefix, safe='/')}"
         )
         if status in (STATUS_FORBIDDEN, STATUS_NOT_FOUND):
+            _read_handled(status)
             return None
         self._refuse(status, repo, "the branch listing", "contents: read")
         if not isinstance(payload, list):
@@ -512,6 +525,7 @@ class GitHubClient:
             f"/repos/{repo}/branches/{urllib.parse.quote(branch, safe='/')}"
         )
         if status in (STATUS_FORBIDDEN, STATUS_NOT_FOUND):
+            _read_handled(status)
             return None
         self._refuse(status, repo, f"the branch {branch}", "contents: read")
         commit = ((payload or {}).get("commit") or {}) if isinstance(payload, dict) else {}
@@ -639,6 +653,7 @@ class GitLabClient:
         ``sha`` directly, so one commit read dates it."""
         status, payload = self.get(f"{self.project_path(repo)}/merge_requests/{number}")
         if status == STATUS_NOT_FOUND:
+            _read_handled(status)
             return None
         self._refuse(status, repo, f"merge request !{number}")
         head_sha = str((payload or {}).get("sha") or "") if isinstance(payload, dict) else ""
@@ -646,6 +661,7 @@ class GitLabClient:
             return None
         status, commit = self.get(f"{self.project_path(repo)}/repository/commits/{head_sha}")
         if status == STATUS_NOT_FOUND:
+            _read_handled(status)
             return None
         self._refuse(status, repo, f"merge request !{number}'s head commit")
         if not isinstance(commit, dict):
@@ -680,6 +696,7 @@ class GitLabClient:
                 f"&per_page={PAGE_SIZE}&page={page}"
             )
             if status == STATUS_FORBIDDEN:
+                _read_handled(status)
                 return None
             self._refuse(status, repo, "the branch listing")
             if not isinstance(payload, list):
@@ -702,6 +719,7 @@ class GitLabClient:
             f"{self.project_path(repo)}/repository/branches/{urllib.parse.quote(branch, safe='')}"
         )
         if status in (STATUS_FORBIDDEN, STATUS_NOT_FOUND):
+            _read_handled(status)
             return None
         self._refuse(status, repo, f"the branch {branch}")
         commit = ((payload or {}).get("commit") or {}) if isinstance(payload, dict) else {}

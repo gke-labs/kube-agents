@@ -47,6 +47,7 @@ import (
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -293,8 +294,8 @@ func TestBuildA2ANATSStatefulSet(t *testing.T) {
 	if sts.Name != "test-agent-a2a-nats" {
 		t.Errorf("statefulset name = %q", sts.Name)
 	}
-	if got := *sts.Spec.Replicas; got != 1 {
-		t.Errorf("replicas = %d, want 1 (single node R1 is the dev posture)", got)
+	if got := *sts.Spec.Replicas; got != int32(agentv1alpha1.DefaultBusReplicas) {
+		t.Errorf("replicas = %d, want %d (a three-server cluster is the default)", got, agentv1alpha1.DefaultBusReplicas)
 	}
 	if len(sts.Spec.VolumeClaimTemplates) != 1 {
 		t.Fatalf("expected one volumeClaimTemplate (JetStream file store on a PV), got %d", len(sts.Spec.VolumeClaimTemplates))
@@ -332,16 +333,16 @@ func TestBuildA2AProvisionJob(t *testing.T) {
 	}
 
 	for _, want := range []string{
-		// TASKS: a2a.tasks.>, 72h, 20GiB
-		"TASKS", "a2a.tasks.>", "--max-age=72h", "21474836480",
+		// TASKS: a2a.tasks.>, 72h, 8GiB
+		"TASKS", "a2a.tasks.>", "--max-age=72h", "--max-bytes=8589934592 ",
 		// DIRECTORY: last-value, 1GiB
 		"DIRECTORY", "a2a.agents.>", "--max-msgs-per-subject=1",
 		// TOPICS-STATE: 8-deep, no age, the state topics
 		"TOPICS-STATE", "--max-msgs-per-subject=8",
 		"a2a.topics.agent.platform.upgrade-readiness", "a2a.topics.agent.platform.topology-skew", "a2a.topics.shared.blueprint",
 		"nats stream edit TOPICS-STATE --subjects=",
-		// TOPICS-JOURNAL: 30d, 5GiB, the journal topic
-		"TOPICS-JOURNAL", "--max-age=720h", "5368709120", "a2a.topics.shared.annotations",
+		// TOPICS-JOURNAL: 30d, 1GiB, the journal topic
+		"TOPICS-JOURNAL", "--max-age=720h", "--max-bytes=1073741824 ", "a2a.topics.shared.annotations",
 		// max_bytes discipline
 		"1073741824", "--discard=old",
 		// KV buckets, capped like the streams
@@ -1068,10 +1069,12 @@ func TestProbeTopicIsProvisionedAndWriterless(t *testing.T) {
 
 // Without this policy every pod in the cluster reaches 4222/8222/9222 while
 // the bus grants do the real refusing. The network layer now agrees with
-// them: 4222 from exactly the enumerated bus clients, and no pod-network
-// peer at all for 8222 (monitor) or 9222 (ws) — the demo port-forward and
-// the kubelet readiness probe both enter via the node, which NetworkPolicy
-// does not govern, and that is the decided posture rather than an accident.
+// them: 4222 from exactly the enumerated bus clients, 9222 (ws) from the
+// console server, and 8222 (monitor) from the operator's pod, and only when
+// the operator knows its own namespace, which this test's environment
+// doesn't set (TestTheMonitorPortAdmitsTheOperatorAlone covers that case).
+// The demo port-forward and the kubelet readiness probe both enter via the
+// node, which NetworkPolicy does not govern.
 func TestBuildA2ANATSNetworkPolicy(t *testing.T) {
 	np := buildA2ANATSNetworkPolicy(a2aTestAgent())
 
@@ -1085,9 +1088,14 @@ func TestBuildA2ANATSNetworkPolicy(t *testing.T) {
 		t.Errorf("policy types = %v, want ingress only", np.Spec.PolicyTypes)
 	}
 
-	if len(np.Spec.Ingress) != 2 {
-		t.Fatalf("expected exactly two ingress rules (4222 for bus clients, 9222 for the console server), got %d: %+v",
-			len(np.Spec.Ingress), np.Spec.Ingress)
+	// 4222 for bus clients, 9222 for the console server, the exporter's
+	// port for the metrics collector (TestTheBusFenceAdmitsTheCollector
+	// OnTheExporterPortAlone has the third), and 6222 between the servers of
+	// the default three-server bus (TestTheBusFenceAdmitsRoutes
+	// FromItsOwnServersOnly has the fourth).
+	if len(np.Spec.Ingress) != 4 {
+		t.Fatalf("expected exactly four ingress rules (4222 for bus clients, 9222 for the console server, %d for the metrics collector, 6222 for routes), got %d: %+v",
+			a2aNATSMetricsPort, len(np.Spec.Ingress), np.Spec.Ingress)
 	}
 	rule := np.Spec.Ingress[0]
 	if len(rule.Ports) != 1 || rule.Ports[0].Port.IntVal != 4222 || *rule.Ports[0].Protocol != corev1.ProtocolTCP {
@@ -1334,7 +1342,7 @@ func TestGatewayIsToldAboutTheClusterViewOnlyUnderTheFlag(t *testing.T) {
 	}
 	t.Setenv(a2aSessionClusterViewEnvVar, "")
 	off := envOf()
-	for _, name := range []string{"A2A_SESSION_CLUSTER_VIEW", "A2A_CREDENTIAL_PROXY_URL"} {
+	for _, name := range []string{"A2A_SESSION_CLUSTER_VIEW", "A2A_CREDENTIAL_PROXY_URL", "A2A_KUBE_PROXY_URL", "A2A_KUBE_PROXY_CA_CONFIGMAP", "A2A_KUBE_PROXY_HOST_CONTEXT"} {
 		if _, ok := off[name]; ok {
 			t.Errorf("%s rendered with the flag off", name)
 		}
@@ -1346,6 +1354,15 @@ func TestGatewayIsToldAboutTheClusterViewOnlyUnderTheFlag(t *testing.T) {
 	}
 	if on["A2A_CREDENTIAL_PROXY_URL"].Value != credentialProxyBaseURL(agent) {
 		t.Errorf("A2A_CREDENTIAL_PROXY_URL = %+v, want %s", on["A2A_CREDENTIAL_PROXY_URL"], credentialProxyBaseURL(agent))
+	}
+	if on["A2A_KUBE_PROXY_URL"].Value != kubeProxyURL(agent) {
+		t.Errorf("A2A_KUBE_PROXY_URL = %+v, want %s", on["A2A_KUBE_PROXY_URL"], kubeProxyURL(agent))
+	}
+	if on["A2A_KUBE_PROXY_CA_CONFIGMAP"].Value != kubeProxyCABundleName(agent) {
+		t.Errorf("A2A_KUBE_PROXY_CA_CONFIGMAP = %+v, want %s", on["A2A_KUBE_PROXY_CA_CONFIGMAP"], kubeProxyCABundleName(agent))
+	}
+	if on["A2A_KUBE_PROXY_HOST_CONTEXT"].Value != hostClusterContextName(agent) {
+		t.Errorf("A2A_KUBE_PROXY_HOST_CONTEXT = %+v, want %s", on["A2A_KUBE_PROXY_HOST_CONTEXT"], hostClusterContextName(agent))
 	}
 }
 
@@ -1460,8 +1477,8 @@ func TestSessionNetworkPolicyReachesTheBrokerOnlyUnderTheFlag(t *testing.T) {
 	}
 	t.Setenv(a2aSessionClusterViewEnvVar, "true")
 	np := buildA2ASessionNetworkPolicy(agent, []string{"10.96.0.10"})
-	if len(np.Spec.Egress) != 4 {
-		t.Fatalf("flag on: %d egress rules, want 4", len(np.Spec.Egress))
+	if len(np.Spec.Egress) != 5 {
+		t.Fatalf("flag on: %d egress rules, want 5", len(np.Spec.Egress))
 	}
 	if len(np.Spec.Ingress) != 0 {
 		t.Fatalf("the view opened ingress: %+v", np.Spec.Ingress)
@@ -1473,6 +1490,14 @@ func TestSessionNetworkPolicyReachesTheBrokerOnlyUnderTheFlag(t *testing.T) {
 	if len(broker.To) != 1 || broker.To[0].PodSelector == nil ||
 		!reflect.DeepEqual(broker.To[0].PodSelector.MatchLabels, credentialProxySelector(agent)) {
 		t.Fatalf("broker rule peer = %+v, want the broker pod selector %v", broker.To, credentialProxySelector(agent))
+	}
+	kubeProxy := np.Spec.Egress[4]
+	if len(kubeProxy.Ports) != 1 || int32(kubeProxy.Ports[0].Port.IntValue()) != kubeProxyPort {
+		t.Fatalf("kube-proxy rule ports = %+v, want %d only", kubeProxy.Ports, kubeProxyPort)
+	}
+	if len(kubeProxy.To) != 1 || kubeProxy.To[0].PodSelector == nil ||
+		!reflect.DeepEqual(kubeProxy.To[0].PodSelector.MatchLabels, kubeProxySelector(agent)) {
+		t.Fatalf("kube-proxy rule peer = %+v, want the kube-proxy pod selector %v", kubeProxy.To, kubeProxySelector(agent))
 	}
 }
 
@@ -1600,6 +1625,15 @@ func TestBuildA2ASessionQuota(t *testing.T) {
 		t.Fatalf("tuned quota = %d, want %d", pods.Value(), want)
 	}
 
+	// A single-server bus runs two NATS pods fewer, and the derived count
+	// follows the StatefulSet's replicas.
+	one := 1
+	agent.Spec.Harness.Tuning.BusReplicas = &one
+	if single := buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]; single.Value() != pods.Value()-2 {
+		t.Fatalf("single-server quota = %d, want %d (two NATS servers fewer)", single.Value(), pods.Value()-2)
+	}
+	agent.Spec.Harness.Tuning.BusReplicas = nil
+
 	// The MCP server is one more standing pod, only while its flag is on (#3869).
 	without := pods.Value()
 	t.Setenv(a2aMCPDoorEnvVar, "true")
@@ -1607,10 +1641,11 @@ func TestBuildA2ASessionQuota(t *testing.T) {
 		t.Fatalf("tuned quota with the MCP server = %d, want %d (one more than without it)", pods.Value(), without+1)
 	}
 
-	// And the profile dispatcher, one more while its image is set (#4808).
-	t.Setenv(a2aDispatcherImageEnvVar, "example.com/dispatcher:1")
-	if pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]; pods.Value() != without+2 {
-		t.Fatalf("tuned quota with the MCP server and the dispatcher = %d, want %d (two more than without them)", pods.Value(), without+2)
+	// And the profile dispatcher, on by default (counted above), one fewer
+	// switched off.
+	t.Setenv(a2aProfileDispatcherEnvVar, "false")
+	if pods = buildA2ASessionQuota(agent).Spec.Hard[corev1.ResourcePods]; pods.Value() != without {
+		t.Fatalf("tuned quota with the MCP server and the dispatcher off = %d, want %d", pods.Value(), without)
 	}
 }
 
@@ -6227,7 +6262,10 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 	// callout issues exactly the callout rows.
 	wantUsers := append(slices.Clone(staticRows), a2aCalloutConfUser, sysUser)
 	slices.Sort(wantUsers)
-	gotUsers := a2aConfUserNames(conf)
+	// Users only: the cluster block renders none (routes authenticate by
+	// certificate, TestTheRoutesAuthenticateByCertificateOnly), and it is cut
+	// out so a stray "user:" in it would not pass for an account user.
+	gotUsers := a2aConfUserNames(a2aClusterBlockRe.ReplaceAllString(conf, ""))
 	slices.Sort(gotUsers)
 	if !slices.Equal(gotUsers, wantUsers) {
 		t.Fatalf("nats.conf users = %v, want %v; a new user needs a row in this test's table before it ships, and a row with no user is stale", gotUsers, wantUsers)
@@ -6977,9 +7015,10 @@ func TestA2AInjectBackendIsRemovedWhenTheFlagGoesOff(t *testing.T) {
 }
 
 // TestA2AInjectFlagOffRemovalReadsTheSecretUncached: the flag-off path reads
-// four objects before deleting them, and the fourth is a Secret. The operator
-// ships secrets with get only, so a cached Get of one starts an informer
-// whose LIST is forbidden and blocks the single reconcile worker for good --
+// four objects before deleting them, and the fourth is a Secret. The manager
+// does not watch Secrets, so a cached Get of one starts a cluster-wide Secret
+// informer that holds every Secret in memory and blocks the single reconcile
+// worker in WaitForCacheSync wherever list/watch on secrets is trimmed --
 // the fake client cannot show that hang (its cache is the store), so this
 // test fails the cached path outright and passes only if the Secret is read
 // through the reader the other A2A Secrets use.
@@ -7000,7 +7039,7 @@ func TestA2AInjectFlagOffRemovalReadsTheSecretUncached(t *testing.T) {
 	cached := interceptor.NewClient(base, interceptor.Funcs{
 		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
 			if _, ok := obj.(*corev1.Secret); ok && strict.Load() {
-				return fmt.Errorf("cached Get of Secret %s: on the shipped RBAC this starts an informer whose LIST is forbidden, and the reconcile worker blocks in WaitForCacheSync", key)
+				return fmt.Errorf("cached Get of Secret %s: starts an unwatched cluster-wide Secret informer instead of reading through APIReader", key)
 			}
 			return c.Get(ctx, key, obj, opts...)
 		},
@@ -7685,8 +7724,10 @@ func TestTheProvisionJobRunsOnAnOldTemplateReplica(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Two pods, one ready, none on the current template: a roll in progress
-	// or wedged at maxUnavailable 0.
+	// or wedged at maxUnavailable 0. The bus is up; this test is about the
+	// callout gate alone.
 	reportCalloutStatus(t, ctx, cl, agent, 2, 1, 0)
+	reportBusRolledOut(t, ctx, cl, agent)
 	state, err := r.reconcileA2A(ctx, agent, homeChannelRecord{})
 	if err != nil {
 		t.Fatal(err)
@@ -8642,10 +8683,10 @@ func TestA2AStandingPodsCountTheConditionalWorkloads(t *testing.T) {
 			t.Fatalf("standing pods with the MCP door = %d, want %d", got, base+1)
 		}
 	})
-	t.Run("the dispatcher", func(t *testing.T) {
-		t.Setenv(a2aDispatcherImageEnvVar, "example.com/dispatcher:dev")
-		if got := a2aStandingPods(a2aTestAgent()); got != base+1 {
-			t.Fatalf("standing pods with the dispatcher = %d, want %d", got, base+1)
+	t.Run("the dispatcher switched off", func(t *testing.T) {
+		t.Setenv(a2aProfileDispatcherEnvVar, "false")
+		if got := a2aStandingPods(a2aTestAgent()); got != base-1 {
+			t.Fatalf("standing pods with the dispatcher off = %d, want %d", got, base-1)
 		}
 	})
 }
@@ -8881,6 +8922,313 @@ func TestA2AChartPodsDiscardWarnsOncePerGenerationAndValue(t *testing.T) {
 				t.Fatalf("%d %s events for a bad value back after a usable one, want 1", got, a2aChartPodsDiscardedReason)
 			}
 		})
+	}
+}
+
+// a2aNATSExporterOf is the exporter sidecar in a rendered NATS pod, or nil.
+func a2aNATSExporterOf(spec corev1.PodSpec) *corev1.Container {
+	for i := range spec.Containers {
+		if spec.Containers[i].Name == a2aNATSExporterContainerName {
+			return &spec.Containers[i]
+		}
+	}
+	return nil
+}
+
+// The exporter sidecar rides every NATS pod, on a one-server bus and on each
+// server of a cluster, at the pinned default unless A2A_NATS_EXPORTER_IMAGE
+// names another, and the server stays the first container (every other test
+// reads Containers[0] as the server). It reads its own server's monitor port
+// over loopback, by the constant, and listens on a2aNATSMetricsPort.
+func TestTheNATSPodCarriesTheExporterSidecar(t *testing.T) {
+	wantURL := "http://127.0.0.1:" + strconv.Itoa(a2aNATSMonitorPort)
+	for _, replicas := range []int{1, 3} {
+		t.Run(fmt.Sprintf("busReplicas %d", replicas), func(t *testing.T) {
+			t.Setenv(a2aNATSExporterImageEnvVar, "")
+			agent := a2aTestAgentWithBusReplicas(replicas)
+			sts := buildA2ANATSStatefulSet(agent, "conf-hash")
+			if got := int(*sts.Spec.Replicas); got != replicas {
+				t.Fatalf("rendered %d servers, want %d", got, replicas)
+			}
+			spec := sts.Spec.Template.Spec
+			names := make([]string, 0, len(spec.Containers))
+			for _, c := range spec.Containers {
+				names = append(names, c.Name)
+			}
+			if !slices.Equal(names, []string{"nats", buildA2ANATSReloaderContainer().Name, a2aNATSExporterContainerName}) {
+				t.Fatalf("containers = %v, want the server first, its config reloader, then the exporter", names)
+			}
+			exporter := a2aNATSExporterOf(spec)
+			if exporter == nil {
+				t.Fatalf("no %s container in the NATS pod", a2aNATSExporterContainerName)
+			}
+			if exporter.Image != defaultA2ANATSExporterImage {
+				t.Errorf("exporter image = %q, want the pinned default %q", exporter.Image, defaultA2ANATSExporterImage)
+			}
+			if !strings.HasSuffix(defaultA2ANATSExporterImage, "@sha256:4b8ddc1c86fec360b5cd3d5e1fbc6fb52bdafd5805bba3901cc52926538af255") {
+				t.Errorf("the default exporter image %q is not pinned to the reviewed index digest", defaultA2ANATSExporterImage)
+			}
+			wantArgs := []string{"-port=" + strconv.Itoa(int(a2aNATSMetricsPort)), "-varz", "-jsz=all", wantURL}
+			if !reflect.DeepEqual(exporter.Args, wantArgs) {
+				t.Errorf("exporter args = %q, want %q (the monitor port over loopback, and nothing else)", exporter.Args, wantArgs)
+			}
+			wantCommand := []string{"/bin/sh", "-c", a2aNATSExporterSupervisor, a2aNATSExporterBinary}
+			if !reflect.DeepEqual(exporter.Command, wantCommand) {
+				t.Errorf("exporter command = %q, want the supervisor loop running %s", exporter.Command, a2aNATSExporterBinary)
+			}
+			if !reflect.DeepEqual(exporter.Env, []corev1.EnvVar{{Name: "GOMEMLIMIT", Value: a2aNATSExporterGoMemLimit}}) {
+				t.Errorf("exporter env = %+v, want GOMEMLIMIT=%s and nothing else", exporter.Env, a2aNATSExporterGoMemLimit)
+			}
+			if len(exporter.Ports) != 1 || exporter.Ports[0].Name != a2aNATSMetricsPortName ||
+				exporter.Ports[0].ContainerPort != a2aNATSMetricsPort || (exporter.Ports[0].Protocol != "" && exporter.Ports[0].Protocol != corev1.ProtocolTCP) {
+				t.Errorf("exporter ports = %+v, want one TCP %s on %d", exporter.Ports, a2aNATSMetricsPortName, a2aNATSMetricsPort)
+			}
+
+			t.Setenv(a2aNATSExporterImageEnvVar, "mirror.example/prometheus-nats-exporter:0.20.3")
+			if got := a2aNATSExporterOf(buildA2ANATSStatefulSet(agent, "conf-hash").Spec.Template.Spec); got == nil || got.Image != "mirror.example/prometheus-nats-exporter:0.20.3" {
+				t.Errorf("%s ignored: exporter = %+v", a2aNATSExporterImageEnvVar, got)
+			}
+		})
+	}
+}
+
+// An install that overrides the NATS image and not the exporter's mirrors the
+// bus's images, and the default exporter reference would not pull there. The
+// pod renders without the sidecar then, so a missing image cannot keep a
+// server out of the bus, and the reconcile warns.
+func TestTheNATSPodOmitsTheExporterWhenOnlyTheServerImageIsOverridden(t *testing.T) {
+	for _, tc := range []struct {
+		nats, exporter string
+		wantExporter   bool
+	}{
+		{"", "", true},
+		{"", "mirror.example/prometheus-nats-exporter:0.20.3", true},
+		{"mirror.example/nats:2.10-alpine", "mirror.example/prometheus-nats-exporter:0.20.3", true},
+		{"mirror.example/nats:2.10-alpine", "", false},
+	} {
+		t.Run(fmt.Sprintf("nats %q exporter %q", tc.nats, tc.exporter), func(t *testing.T) {
+			t.Setenv(a2aNATSImageEnvVar, tc.nats)
+			t.Setenv(a2aNATSExporterImageEnvVar, tc.exporter)
+			for _, replicas := range []int{1, 3} {
+				spec := buildA2ANATSStatefulSet(a2aTestAgentWithBusReplicas(replicas), "h").Spec.Template.Spec
+				if got := a2aNATSExporterOf(spec) != nil; got != tc.wantExporter {
+					t.Errorf("busReplicas %d: exporter rendered = %v, want %v", replicas, got, tc.wantExporter)
+				}
+				if len(spec.Containers) == 0 || spec.Containers[0].Name != "nats" {
+					t.Errorf("busReplicas %d: the server is not the pod's first container", replicas)
+				}
+			}
+		})
+	}
+}
+
+func TestTheReconcileWarnsWhenTheExporterIsOmitted(t *testing.T) {
+	for _, tc := range []struct {
+		exporter string
+		wantWarn bool
+	}{{"", true}, {"mirror.example/prometheus-nats-exporter:0.20.3", false}} {
+		t.Run(fmt.Sprintf("exporter %q", tc.exporter), func(t *testing.T) {
+			t.Setenv(a2aNATSImageEnvVar, "mirror.example/nats:2.10-alpine")
+			t.Setenv(a2aNATSExporterImageEnvVar, tc.exporter)
+			agent := a2aTestAgent()
+			scheme := setupScheme()
+			cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, discordBotSecret(agent)).
+				WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+				WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+			rec := record.NewFakeRecorder(256)
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: rec, OperatorNamespace: agent.Namespace}
+			if _, err := r.reconcileA2A(context.Background(), agent, homeChannelRecord{}); err != nil {
+				t.Fatal(err)
+			}
+			warned := false
+			for len(rec.Events) > 0 {
+				e := <-rec.Events
+				if strings.HasPrefix(e, corev1.EventTypeWarning+" "+a2aNATSExporterOmittedReason+" ") {
+					warned = strings.Contains(e, a2aNATSExporterImageEnvVar)
+				}
+			}
+			if warned != tc.wantWarn {
+				t.Errorf("warned naming %s = %v, want %v", a2aNATSExporterImageEnvVar, warned, tc.wantWarn)
+			}
+		})
+	}
+}
+
+// The exporter runs as the server does: non-root (the image sets no USER, so
+// the UID is the pod's to say), no escalation, a read-only root, no
+// capabilities, the runtime's seccomp profile, and requests and limits a
+// limits-requiring ResourceQuota admits. No preStop: it exits on SIGTERM while
+// the server's lame duck runs.
+func TestTheNATSExporterIsHardened(t *testing.T) {
+	for _, replicas := range []int{1, 3} {
+		t.Run(fmt.Sprintf("busReplicas %d", replicas), func(t *testing.T) {
+			exporter := a2aNATSExporterOf(buildA2ANATSStatefulSet(a2aTestAgentWithBusReplicas(replicas), "h").Spec.Template.Spec)
+			if exporter == nil {
+				t.Fatal("no exporter container")
+			}
+			sc := exporter.SecurityContext
+			if sc == nil {
+				t.Fatal("exporter has no securityContext")
+			}
+			if sc.RunAsNonRoot == nil || !*sc.RunAsNonRoot {
+				t.Errorf("runAsNonRoot = %v, want true", sc.RunAsNonRoot)
+			}
+			if sc.RunAsUser == nil || *sc.RunAsUser == 0 || sc.RunAsGroup == nil || *sc.RunAsGroup == 0 {
+				t.Errorf("runAsUser/runAsGroup = %v/%v, want an explicit non-root pair", sc.RunAsUser, sc.RunAsGroup)
+			}
+			if sc.AllowPrivilegeEscalation == nil || *sc.AllowPrivilegeEscalation {
+				t.Errorf("allowPrivilegeEscalation = %v, want false", sc.AllowPrivilegeEscalation)
+			}
+			if sc.ReadOnlyRootFilesystem == nil || !*sc.ReadOnlyRootFilesystem {
+				t.Errorf("readOnlyRootFilesystem = %v, want true", sc.ReadOnlyRootFilesystem)
+			}
+			if sc.Capabilities == nil || !reflect.DeepEqual(sc.Capabilities.Drop, []corev1.Capability{"ALL"}) || len(sc.Capabilities.Add) != 0 {
+				t.Errorf("capabilities = %+v, want drop ALL and add nothing", sc.Capabilities)
+			}
+			if sc.SeccompProfile == nil || sc.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
+				t.Errorf("seccompProfile = %+v, want RuntimeDefault", sc.SeccompProfile)
+			}
+			if sc.Privileged != nil && *sc.Privileged {
+				t.Error("exporter is privileged")
+			}
+			for _, name := range []corev1.ResourceName{corev1.ResourceCPU, corev1.ResourceMemory, corev1.ResourceEphemeralStorage} {
+				if _, ok := exporter.Resources.Requests[name]; !ok {
+					t.Errorf("exporter has no %s request", name)
+				}
+				if _, ok := exporter.Resources.Limits[name]; !ok {
+					t.Errorf("exporter has no %s limit", name)
+				}
+			}
+			if exporter.Lifecycle != nil {
+				t.Errorf("exporter lifecycle = %+v, want none (no preStop: it exits on SIGTERM)", exporter.Lifecycle)
+			}
+			if len(exporter.VolumeMounts) != 0 {
+				t.Errorf("exporter mounts %+v, want nothing (it reads the server over loopback)", exporter.VolumeMounts)
+			}
+		})
+	}
+}
+
+// The collector and the operator reach the exporter, and the collector
+// nothing else on the NATS pod: one rule names a2aNATSMetricsPort, its one
+// port is that TCP port, and its peers are every pod in the managed-Prometheus
+// namespace (the selector the A2A gateway's metrics rule uses) and, when the
+// operator knows its own identity, the operator's pod.
+func TestTheBusFenceAdmitsTheCollectorAndTheOperatorOnTheExporterPortAlone(t *testing.T) {
+	for _, tc := range []struct {
+		replicas     int
+		operatorNS   string
+		wantOperator bool
+	}{{1, "", false}, {3, "", false}, {1, "kube-agents-system", true}, {3, "kube-agents-system", true}} {
+		t.Run(fmt.Sprintf("busReplicas %d, operator namespace %q", tc.replicas, tc.operatorNS), func(t *testing.T) {
+			t.Setenv(operatorNamespaceEnvVar, tc.operatorNS)
+			t.Setenv(operatorServiceAccountEnvVar, "kube-agents-operator")
+			np := buildA2ANATSNetworkPolicy(a2aTestAgentWithBusReplicas(tc.replicas))
+			var rules []networkingv1.NetworkPolicyIngressRule
+			for _, rule := range np.Spec.Ingress {
+				for _, p := range rule.Ports {
+					if p.Port != nil && p.Port.IntValue() == int(a2aNATSMetricsPort) {
+						rules = append(rules, rule)
+						break
+					}
+				}
+			}
+			if len(rules) != 1 {
+				t.Fatalf("the fence has %d rules naming %d, want exactly one", len(rules), a2aNATSMetricsPort)
+			}
+			rule := rules[0]
+			if len(rule.Ports) != 1 || rule.Ports[0].Protocol == nil || *rule.Ports[0].Protocol != corev1.ProtocolTCP ||
+				rule.Ports[0].EndPort != nil || rule.Ports[0].Port.IntValue() != int(a2aNATSMetricsPort) {
+				t.Errorf("the collector rule opens %+v, want TCP %d alone", rule.Ports, a2aNATSMetricsPort)
+			}
+			want := map[string]string{labelMetadataName: gmpNamespace}
+			wantPeers := 1
+			if tc.wantOperator {
+				wantPeers = 2
+			}
+			if len(rule.From) != wantPeers || rule.From[0].PodSelector != nil || rule.From[0].IPBlock != nil ||
+				rule.From[0].NamespaceSelector == nil || len(rule.From[0].NamespaceSelector.MatchExpressions) != 0 ||
+				!reflect.DeepEqual(rule.From[0].NamespaceSelector.MatchLabels, want) {
+				t.Fatalf("the exporter rule's peers = %+v, want the namespace %s first, and %d peers", rule.From, gmpNamespace, wantPeers)
+			}
+			if !tc.wantOperator {
+				return
+			}
+			// The operator's pod, by the namespace it runs in and the
+			// bus-client label its pod template carries: the bus-stream
+			// check's scrape (BusStreamPoller), and nothing wider.
+			operator := rule.From[1]
+			if operator.IPBlock != nil || operator.NamespaceSelector == nil || operator.PodSelector == nil ||
+				len(operator.NamespaceSelector.MatchExpressions) != 0 || len(operator.PodSelector.MatchExpressions) != 0 ||
+				!reflect.DeepEqual(operator.NamespaceSelector.MatchLabels, map[string]string{corev1.LabelMetadataName: tc.operatorNS}) ||
+				!reflect.DeepEqual(operator.PodSelector.MatchLabels, map[string]string{a2aOperatorBusClientLabel: a2aOperatorBusClientLabelValue}) {
+				t.Errorf("the exporter rule's operator peer = %+v, want the operator pod in %s alone", operator, tc.operatorNS)
+			}
+		})
+	}
+}
+
+// 8222 is reached through the operator's own rule alone (#4226's reload
+// confirmation; TestTheMonitorPortAdmitsTheOperatorAlone holds its peer): no
+// other ingress rule on the bus fence names it, by number or by the container
+// port's name, covers it with a range, or opens every port. Without the
+// operator's identity there is no such rule and nothing names 8222 at all.
+// The readiness probe enters from the node and the exporter over loopback,
+// neither of which the fence governs.
+func TestTheBusFenceAdmitsNoPeerOnTheMonitorPort(t *testing.T) {
+	for _, identity := range []bool{false, true} {
+		for _, replicas := range []int{1, 3} {
+			t.Run(fmt.Sprintf("operator identity %v, busReplicas %d", identity, replicas), func(t *testing.T) {
+				if identity {
+					t.Setenv(operatorNamespaceEnvVar, "kube-agents-system")
+					t.Setenv(operatorServiceAccountEnvVar, "kube-agents-controller-manager")
+				} else {
+					t.Setenv(operatorNamespaceEnvVar, "")
+					t.Setenv(operatorServiceAccountEnvVar, "")
+				}
+				operatorRules := 0
+				np := buildA2ANATSNetworkPolicy(a2aTestAgentWithBusReplicas(replicas))
+				for i, rule := range np.Spec.Ingress {
+					// The operator's own 8222 rule: that one port, by
+					// number, from the operator's peer and nothing else.
+					if len(rule.Ports) == 1 && rule.Ports[0].Port != nil && rule.Ports[0].Port.Type == intstr.Int &&
+						rule.Ports[0].Port.IntValue() == a2aNATSMonitorPort && rule.Ports[0].EndPort == nil &&
+						reflect.DeepEqual(rule.From, a2aOperatorNATSPeers()) && len(rule.From) > 0 {
+						operatorRules++
+						continue
+					}
+					if len(rule.Ports) == 0 {
+						t.Errorf("ingress rule %d opens every port, 8222 included: %+v", i, rule)
+					}
+					for _, p := range rule.Ports {
+						if p.Port == nil {
+							t.Errorf("ingress rule %d opens every port, 8222 included: %+v", i, p)
+							continue
+						}
+						if p.Port.Type == intstr.String {
+							if p.Port.StrVal == "monitor" {
+								t.Errorf("ingress rule %d admits the monitor port by name: %+v", i, rule)
+							}
+							continue
+						}
+						lo, hi := p.Port.IntValue(), p.Port.IntValue()
+						if p.EndPort != nil {
+							hi = int(*p.EndPort)
+						}
+						if lo <= a2aNATSMonitorPort && a2aNATSMonitorPort <= hi {
+							t.Errorf("ingress rule %d admits %d: %+v", i, a2aNATSMonitorPort, rule)
+						}
+					}
+				}
+				want := 0
+				if identity {
+					want = 1
+				}
+				if operatorRules != want {
+					t.Errorf("%d operator rules on 8222, want %d", operatorRules, want)
+				}
+			})
+		}
 	}
 }
 

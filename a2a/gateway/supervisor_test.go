@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -21,7 +20,7 @@ import (
 // since the split replay is the pair. Error-returning (no *testing.T) so the
 // fake spawner's onDelete hook can call it from the gateway's own goroutine.
 func eventsEnvelopes(url, addressee string) ([]*lib.Envelope, error) {
-	nc, err := nats.Connect(url)
+	nc, err := connectTest(url)
 	if err != nil {
 		return nil, err
 	}
@@ -115,6 +114,7 @@ func terminalFor(t *testing.T, url, addressee, taskID string) *lib.StatusUpdate 
 // — state `canceled`, because the supervisor is finishing the requester's
 // cancel, not reporting an error (assertion 13's enumeration).
 func TestDelegateOverDetachedPublishesCanceledBeforeDelete(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	conv := "discord:g1/thread-sup1"
 
@@ -170,6 +170,7 @@ func TestDelegateOverDetachedPublishesCanceledBeforeDelete(t *testing.T) {
 // harness is still working — the supervisor rule is what keeps that from
 // being a silent stop.
 func TestReapDetachedPublishesCanceledBeforeDelete(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	conv := "discord:g1/thread-sup2"
 	rec := &SessionRecord{
@@ -211,6 +212,7 @@ func TestReapDetachedPublishesCanceledBeforeDelete(t *testing.T) {
 // incarnation owes the stream nothing — only a detached task has a
 // supervisor debt.
 func TestReapIdlePodWithoutTaskPublishesNothing(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	conv := "discord:g1/thread-sup3"
 	rec := &SessionRecord{
@@ -239,6 +241,7 @@ func TestReapIdlePodWithoutTaskPublishesNothing(t *testing.T) {
 // The durable evidence is the task history's Canceled mark — ActiveTask may
 // long since have moved on.
 func TestSweepStateFollowsTheSupervisorRule(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 
 	// Two orphaned pods in terminal phase: one whose task the requester
@@ -341,6 +344,7 @@ func TestMintAdoptsTheRaceWinner(t *testing.T) {
 // publish nothing, or the gateway itself authors the protocol error
 // assertion 10 makes every consumer surface.
 func TestNoSecondFinalWhenWorkerAlreadyConfirmed(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	conv := "discord:g1/thread-sup5"
 	// A detached task whose executor's own final canceled is already on
@@ -397,6 +401,7 @@ func TestNoSecondFinalWhenWorkerAlreadyConfirmed(t *testing.T) {
 // successor, not publish toward the dead addressee and wedge the
 // conversation (S9 review finding 4).
 func TestSessionRoutePlainAskRetiresDeadIncarnation(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawnerRoute(t, RouteSession)
 	conv := "discord:g1/thread-sup6"
 	rec := &SessionRecord{
@@ -501,7 +506,7 @@ func TestAskBoundClearsOnlyTheCopy(t *testing.T) {
 // erases.
 func subjectEnvelopes(t *testing.T, url, subject string) []*lib.Envelope {
 	t.Helper()
-	nc, err := nats.Connect(url)
+	nc, err := connectTest(url)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -544,6 +549,7 @@ func subjectEnvelopes(t *testing.T, url, subject string) []*lib.Envelope {
 // retires the active task exactly as it would an executor's own terminal.
 // The record starts with the task active so the retirement is observable.
 func TestSupervisorTerminalLandsOnTheSupervisorSubjectAndStillRelays(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	conv := "discord:g1/thread-split1"
 	rec := &SessionRecord{

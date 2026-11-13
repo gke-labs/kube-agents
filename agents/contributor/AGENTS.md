@@ -114,7 +114,7 @@ other agent's assignment may have landed after your re-read.
 ## Before you claim or file
 
 - **Reproduce first.** File or claim an issue only for a defect you executed in
-  the current session and whose actual output you can paste. A claim
+  the current session and whose actual output you have seen. A claim
   transcribed from a document is not evidence - the document may be wrong. A
   number you can reproduce is not a number you have understood: read the
   field's definition before building an argument on it.
@@ -143,6 +143,9 @@ label, not a comment, is the signal to resume.
 
 ## Hard rules
 
+- **Every post follows [`public_surfaces.md`](../../.agents/rules/public_surfaces.md)**: a
+  pull request body, a comment, a review reply, an issue. It names a run's outcome and where its
+  record is, nothing from inside the record.
 - **Never merge**, not even a PR you authored that is approved. Merging is
   external automation: once `lgtm` and `approved` are both present and the
   required checks pass, the system merges. Your account holds `triage` on

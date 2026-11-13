@@ -29,20 +29,19 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 LANE_FILE = REPO_ROOT / "hack" / "eval" / "inject-lane-safeguards.yaml"
 TASKS = REPO_ROOT / "bench" / "tasks"
 # A presubmit case that requests no pull request, neither through its own
-# checks nor through the file's `requesting:` list, and a case that requests
+# checks nor through a `requested_pull_requests:` key, and a case that requests
 # one (its objective is a pull_request_opened check). Not
-# obtainability-remediation-proposal: it asks for a proposal, the lane file
-# no longer lists it among the requesting, and it is the case the
-# zero-allowance safeguard exists to watch.
+# obtainability-remediation-proposal: it asks for a proposal, it declares no
+# count of its own, and it is the case the zero-allowance safeguard exists to
+# watch.
 READ_ONLY_CASE = "reliability-pdb-probe"
 REQUESTING_CASE = "pdb-remediation-pr"
 # A stopped ask (stop_hook.py): it requests no pull request, and runs alone
 # in the second phase on the inject lane, the only lane that carries it.
 STOPPED_ASK_CASE = "chat-stop-halts-delegated-remediation"
-# The count a scratch lane file's `requesting:` entry gives READ_ONLY_CASE,
-# so the listed path is tested without pinning the real file's entries,
-# whose contents scripts/test_eval_rosters.py owns.
-LISTED_COUNT = 2
+# The count a scratch copy of READ_ONLY_CASE declares under the task key, so
+# the declared path is tested without editing a shipped task.
+DECLARED_COUNT = 2
 
 
 def load(path: Path) -> dict:
@@ -258,11 +257,11 @@ def test_the_cli_prints_case_and_path_per_task_and_fails_loudly(tmp_path, capsys
         f"0 {READ_ONLY_CASE} {tmp_path / READ_ONLY_CASE / 'task.yaml'}",
         f"1 {REQUESTING_CASE} {tmp_path / REQUESTING_CASE / 'task.yaml'}",
     ]
-    # A `requesting:` entry reaches the line too.
-    listed_file = scratch_lane_file(tmp_path, {READ_ONLY_CASE: LISTED_COUNT})
-    rc = lane.main(["--safeguards", str(listed_file), "--out-dir", str(tmp_path / "listed"), str(TASKS / READ_ONLY_CASE / "task.yaml")])
+    # A task's own `requested_pull_requests:` key reaches the line too.
+    declared = declared_task(tmp_path / "declared-src", READ_ONLY_CASE, DECLARED_COUNT)
+    rc = lane.main(["--safeguards", str(LANE_FILE), "--out-dir", str(tmp_path / "declared"), str(declared)])
     assert rc == 0
-    assert capsys.readouterr().out.splitlines() == [f"{LISTED_COUNT} {READ_ONLY_CASE} {tmp_path / 'listed' / READ_ONLY_CASE / 'task.yaml'}"]
+    assert capsys.readouterr().out.splitlines() == [f"{DECLARED_COUNT} {READ_ONLY_CASE} {tmp_path / 'declared' / READ_ONLY_CASE / 'task.yaml'}"]
 
 
 def test_the_copies_have_somewhere_to_go():
@@ -271,53 +270,58 @@ def test_the_copies_have_somewhere_to_go():
         lane.main(["--safeguards", str(LANE_FILE), str(TASKS / READ_ONLY_CASE / "task.yaml")])
 
 
-def scratch_lane_file(tmp_path: Path, requesting: dict[str, int]) -> Path:
-    """The real lane file's safeguards under a `requesting:` mapping of our own."""
-    path = tmp_path / "lane-with-requesting.yaml"
-    path.write_text(yaml.safe_dump({"requesting": requesting, "safeguards": lane.load_lane_safeguards(LANE_FILE)}))
-    return path
+def declared_task(where: Path, case: str, count) -> Path:
+    """A copy of a shipped task under ``where/<case>/task.yaml`` that declares
+    ``requested_pull_requests: <count>`` at its top level."""
+    source = load(TASKS / case / "task.yaml")
+    target = where / case / "task.yaml"
+    target.parent.mkdir(parents=True)
+    target.write_text(yaml.safe_dump({**source, lane.REQUESTED_KEY: count}, sort_keys=False))
+    return target
 
 
-def test_the_real_requesting_list_is_well_formed():
-    # Its contents are pinned by scripts/test_eval_rosters.py, which also
-    # fails an entry whose count does not exceed what the case's own checks
-    # already request.
-    listed = lane.load_lane_requesting(LANE_FILE)
-    assert all(isinstance(case, str) and count >= 1 for case, count in listed.items())
-    assert READ_ONLY_CASE not in listed
-
-
-def test_the_requesting_list_is_read_and_gives_its_case_an_allowance(tmp_path):
-    listed = lane.load_lane_requesting(scratch_lane_file(tmp_path, {READ_ONLY_CASE: LISTED_COUNT}))
-    assert listed == {READ_ONLY_CASE: LISTED_COUNT}
-    safeguards = lane.load_lane_safeguards(LANE_FILE)
-    copy, requested = lane.copy_task(TASKS / READ_ONLY_CASE / "task.yaml", safeguards, tmp_path, listed[READ_ONLY_CASE])
-    assert requested == LISTED_COUNT
-    assert lane._leaves(load(copy)["verification_spec"][-1]["check"])[0][lane.REQUESTED_FIELD] == LISTED_COUNT
-    # The larger of the two counts wins; a case with its own check and no
-    # entry keeps its own.
-    _, requested = lane.copy_task(TASKS / REQUESTING_CASE / "task.yaml", safeguards, tmp_path / "b", 0)
-    assert requested == 1
-    _, requested = lane.copy_task(TASKS / REQUESTING_CASE / "task.yaml", safeguards, tmp_path / "c", 3)
-    assert requested == 3
-
-
-@pytest.mark.parametrize(
-    "text, needle",
-    [
-        ("safeguards: []\nrequesting: [a]\n", "must map case ids to counts"),
-        ("safeguards: []\nrequesting: {a: 0}\n", "count of at least 1"),
-        ("safeguards: []\nrequesting: {a: true}\n", "count of at least 1"),
-        ("safeguards: []\nrequesting: {a: one}\n", "count of at least 1"),
-    ],
-)
-def test_a_malformed_requesting_list_is_refused(tmp_path, text, needle):
+def test_a_lane_file_that_still_carries_the_retired_requesting_map_is_refused(tmp_path):
+    """The count moved into each task's own key; a map left in the lane file
+    would be an allowance nothing reads, so the file is refused."""
     path = tmp_path / "lane.yaml"
-    path.write_text(text)
-    with pytest.raises(lane.LaneSafeguardsError, match=needle):
-        lane.load_lane_requesting(path)
-    path.write_text("safeguards: []\n")
-    assert lane.load_lane_requesting(path) == {}
+    path.write_text(yaml.safe_dump({"requesting": {READ_ONLY_CASE: 2}, "safeguards": lane.load_lane_safeguards(LANE_FILE)}))
+    with pytest.raises(lane.LaneSafeguardsError, match="`requesting:` is retired"):
+        lane.load_lane_safeguards(path)
+    assert lane.RETIRED_REQUESTING_KEY not in load(LANE_FILE)
+
+
+def test_a_tasks_own_requested_pull_requests_key_sets_its_allowance(tmp_path):
+    """The task's top-level key is the count's home both the lane and the
+    pinned grader read; the larger of the key and the task's requesting
+    leaves is the allowance the copy carries."""
+    safeguards = lane.load_lane_safeguards(LANE_FILE)
+    source = load(TASKS / REQUESTING_CASE / "task.yaml")
+    own = lane.requested_pull_requests(source["verification_spec"])
+    declared = declared_task(tmp_path / "declared", REQUESTING_CASE, own + 1)
+    copy, requested = lane.copy_task(declared, safeguards, tmp_path / "out")
+    assert requested == own + 1
+    assert lane._leaves(load(copy)["verification_spec"][-1]["check"])[0][lane.REQUESTED_FIELD] == own + 1
+    # A key below the leaves changes nothing, and a task with no key keeps its leaves.
+    below = declared_task(tmp_path / "below", REQUESTING_CASE, 0)
+    assert lane.copy_task(below, safeguards, tmp_path / "out2")[1] == own
+    assert lane.declared_pull_requests(source) == 0
+    assert lane.requested_for(source["verification_spec"], 3) == 3
+
+
+def test_the_spent_branch_case_declares_both_its_pull_requests():
+    """It opens one pull request and closes it to spend the branch name, then
+    opens the one its check grades, and the reply names both: its one leaf
+    would allow one, so its task declares two."""
+    doc = load(TASKS / "vcs-spent-branch-reuse" / "task.yaml")
+    assert lane.requested_pull_requests(doc["verification_spec"]) == 1
+    assert lane.declared_pull_requests(doc) == 2
+
+
+@pytest.mark.parametrize("value", [True, "2", -1])
+def test_a_requested_pull_requests_key_that_is_not_a_count_is_refused_by_the_lane(tmp_path, value):
+    bad = declared_task(tmp_path, READ_ONLY_CASE, value)
+    with pytest.raises(lane.LaneSafeguardsError, match="must be a non-negative integer"):
+        lane.copy_task(bad, lane.load_lane_safeguards(LANE_FILE), tmp_path / "out")
 
 
 def test_the_cli_line_survives_a_path_with_a_space(tmp_path, capsys):

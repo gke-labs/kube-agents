@@ -17,12 +17,17 @@ limitations under the License.
 package controller
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -33,13 +38,13 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 	authorizationv1client "k8s.io/client-go/kubernetes/typed/authorization/v1"
 	k8stesting "k8s.io/client-go/testing"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-	"sigs.k8s.io/yaml"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -84,30 +89,106 @@ func denyPDBPatch(attrs *authorizationv1.ResourceAttributes) bool {
 	return attrs.Group == "policy" && attrs.Resource == "poddisruptionbudgets" && attrs.Verb == "patch"
 }
 
+// generatedRoles is role.yaml parsed into its documents: the ClusterRole the
+// markers without `namespace=` produce, and the Role the one with it does.
+type generatedRoles struct {
+	clusterRole rbacv1.ClusterRole
+	roles       []rbacv1.Role
+}
+
+// strictJSON decodes one document into v and refuses unknown fields, the
+// json counterpart of yaml.UnmarshalStrict for a document the YAML decoder has
+// already turned into JSON.
+func strictJSON(doc json.RawMessage, v any) error {
+	dec := json.NewDecoder(bytes.NewReader(doc))
+	dec.DisallowUnknownFields()
+	return dec.Decode(v)
+}
+
+// loadGeneratedRoles reads role.yaml document by document. controller-gen
+// writes the namespaced Role into the same file after the ClusterRole, and a
+// single-object parse would read the first document and silently drop the
+// rest -- the Secret grant among them. The apimachinery decoder splits the
+// stream, so a separator written with trailing whitespace or CRLF line ends
+// still parses as two documents rather than one.
+func loadGeneratedRoles(t *testing.T) generatedRoles {
+	t.Helper()
+	raw, err := os.ReadFile(generatedRolePath)
+	if err != nil {
+		t.Fatalf("read %s: %v", generatedRolePath, err)
+	}
+	var out generatedRoles
+	var clusterRoles int
+	decoder := utilyaml.NewYAMLOrJSONDecoder(bytes.NewReader(raw), len(raw))
+	for {
+		var doc json.RawMessage
+		if err := decoder.Decode(&doc); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			t.Fatalf("parse %s: %v", generatedRolePath, err)
+		}
+		if len(bytes.TrimSpace(doc)) == 0 || string(bytes.TrimSpace(doc)) == "null" {
+			continue
+		}
+		var kind metav1.TypeMeta
+		if err := json.Unmarshal(doc, &kind); err != nil {
+			t.Fatalf("parse %s: %v", generatedRolePath, err)
+		}
+		switch kind.Kind {
+		case "ClusterRole":
+			clusterRoles++
+			if err := strictJSON(doc, &out.clusterRole); err != nil {
+				t.Fatalf("parse %s ClusterRole: %v", generatedRolePath, err)
+			}
+		case "Role":
+			var role rbacv1.Role
+			if err := strictJSON(doc, &role); err != nil {
+				t.Fatalf("parse %s Role: %v", generatedRolePath, err)
+			}
+			out.roles = append(out.roles, role)
+		default:
+			t.Fatalf("%s carries a %q document; controller-gen writes only ClusterRole and Role", generatedRolePath, kind.Kind)
+		}
+	}
+	if clusterRoles != 1 {
+		t.Fatalf("%s carries %d ClusterRole documents, want 1", generatedRolePath, clusterRoles)
+	}
+	if len(out.clusterRole.Rules) == 0 {
+		t.Fatalf("%s parsed to no ClusterRole rules; every comparison would pass vacuously", generatedRolePath)
+	}
+	return out
+}
+
 // permissionKey identifies one grant for comparison. resourceNames is part of
 // that identity rather than decoration on it: a rule scoped to one name
 // authorizes strictly less than the same (verb, resource) unscoped, and a
 // SelfSubjectAccessReview that omits the name asks for the unscoped form. Key
 // without the names and the two sides match while the probe asks the API
 // server a question role.yaml does not answer -- which is the live failure
-// that put the Name field on requiredPermission in the first place.
-func permissionKey(verb, group, resource string, names []string) string {
+// that put the Name field on requiredPermission in the first place. The
+// namespaced flag is part of the identity for the same reason: a grant held
+// through a Role answers only the review that names its namespace.
+func permissionKey(verb, group, resource string, names []string, namespaced bool) string {
 	key := describePermission(verb, group, resource)
-	if len(names) == 0 {
-		return key
+	if len(names) > 0 {
+		sorted := append([]string(nil), names...)
+		sort.Strings(sorted)
+		key += " [" + strings.Join(sorted, ",") + "]"
 	}
-	sorted := append([]string(nil), names...)
-	sort.Strings(sorted)
-	return key + " [" + strings.Join(sorted, ",") + "]"
+	if namespaced {
+		key += rbacNamespacedLabelSuffix
+	}
+	return key
 }
 
-func permissionSet(rules []rbacv1.PolicyRule) map[string]struct{} {
+func permissionSet(rules []rbacv1.PolicyRule, namespaced bool) map[string]struct{} {
 	set := map[string]struct{}{}
 	for _, rule := range rules {
 		for _, group := range rule.APIGroups {
 			for _, resource := range rule.Resources {
 				for _, verb := range rule.Verbs {
-					set[permissionKey(verb, group, resource, rule.ResourceNames)] = struct{}{}
+					set[permissionKey(verb, group, resource, rule.ResourceNames, namespaced)] = struct{}{}
 				}
 			}
 		}
@@ -132,15 +213,13 @@ func sortedDifference(a, b map[string]struct{}) []string {
 // marker change that forgets it would leave the self-check silently checking
 // yesterday's role.
 func TestRequiredPermissionsMatchTheGeneratedRole(t *testing.T) {
-	raw, err := os.ReadFile(generatedRolePath)
-	if err != nil {
-		t.Fatalf("read %s: %v", generatedRolePath, err)
+	roles := loadGeneratedRoles(t)
+	generated := permissionSet(roles.clusterRole.Rules, false)
+	for _, role := range roles.roles {
+		for key := range permissionSet(role.Rules, true) {
+			generated[key] = struct{}{}
+		}
 	}
-	var role rbacv1.ClusterRole
-	if err := yaml.Unmarshal(raw, &role); err != nil {
-		t.Fatalf("parse %s: %v", generatedRolePath, err)
-	}
-	generated := permissionSet(role.Rules)
 
 	// Built from the flattened tuples rather than from requiredPermissions,
 	// because the tuples are what probeRBAC actually puts on the wire. A
@@ -157,7 +236,7 @@ func TestRequiredPermissionsMatchTheGeneratedRole(t *testing.T) {
 		if tuple.name != "" {
 			names = []string{tuple.name}
 		}
-		probed[permissionKey(tuple.verb, tuple.group, resource, names)] = struct{}{}
+		probed[permissionKey(tuple.verb, tuple.group, resource, names, tuple.namespaced)] = struct{}{}
 	}
 
 	if missing := sortedDifference(generated, probed); len(missing) > 0 {
@@ -175,11 +254,11 @@ func TestProbeRBACNamesEachDeniedPermission(t *testing.T) {
 		return denyPDBPatch(attrs) ||
 			(attrs.Resource == "pods" && attrs.Subresource == "log" && attrs.Verb == "get")
 	}}
-	denied, err := probeRBAC(context.Background(), authorizer.reviews())
+	denied, err := probeLabels(context.Background(), authorizer.reviews(), "", nil)
 	if err != nil {
 		t.Fatalf("probe failed: %v", err)
 	}
-	want := []string{"get pods/log", "patch poddisruptionbudgets.policy"}
+	want := []string{"get pods/log", "patch poddisruptionbudgets.policy" + rbacNamespacedLabelSuffix}
 	got := append([]string(nil), denied...)
 	sort.Strings(got)
 	if strings.Join(got, ",") != strings.Join(want, ",") {
@@ -205,7 +284,7 @@ func TestTheScopedBindProbeCarriesItsResourceName(t *testing.T) {
 		}
 		return attrs.Name != a2aAuthDelegatorRole
 	}}
-	denied, err := probeRBAC(context.Background(), authorizer.reviews())
+	denied, err := probeLabels(context.Background(), authorizer.reviews(), "", nil)
 	if err != nil {
 		t.Fatalf("probe failed: %v", err)
 	}
@@ -230,8 +309,110 @@ func TestTheScopedBindProbeCarriesItsResourceName(t *testing.T) {
 	}
 }
 
+// isNamespacedWrite reports whether attrs is one of the tuples the markers
+// declare with `namespace=`: the write verbs of every rendered kind, the half
+// of the grant that is a Role in the install namespace. Read off the probe
+// list itself, so the fakes follow the markers.
+func isNamespacedWrite(attrs *authorizationv1.ResourceAttributes) bool {
+	for _, tuple := range flattenRequiredPermissions() {
+		if tuple.namespaced && tuple.group == attrs.Group && tuple.resource == attrs.Resource &&
+			tuple.subresource == attrs.Subresource && tuple.verb == attrs.Verb {
+			return true
+		}
+	}
+	return false
+}
+
+// The write verbs are a Role in the install namespace, so the probe has to
+// ask about that namespace: an authorizer that grants them there and nowhere
+// else -- which is what a RoleBinding is -- must satisfy the check, and the
+// cluster-scoped tuples, the reads among them, must still be reviewed
+// cluster-wide, or a ClusterRole shortfall would hide behind a namespaced
+// yes.
+func TestTheNamespacedProbeCarriesTheOperatorsNamespace(t *testing.T) {
+	const operatorNamespace = "kubeagents-system"
+	// Counted atomically: the probe reviews rbacProbeConcurrency tuples at once.
+	var namespacedReviews, clusterReviews atomic.Int64
+	authorizer := &fakeAuthorizer{deny: func(attrs *authorizationv1.ResourceAttributes) bool {
+		if isNamespacedWrite(attrs) {
+			namespacedReviews.Add(1)
+			return attrs.Namespace != operatorNamespace
+		}
+		clusterReviews.Add(1)
+		return attrs.Namespace != ""
+	}}
+	denied, err := probeLabels(context.Background(), authorizer.reviews(), operatorNamespace, nil)
+	if err != nil {
+		t.Fatalf("probe failed: %v", err)
+	}
+	if len(denied) != 0 {
+		t.Fatalf("write verbs granted in the operator's namespace, probed there, must report nothing denied; got %v", denied)
+	}
+	if namespacedReviews.Load() == 0 || clusterReviews.Load() == 0 {
+		t.Fatalf("the probe sent %d namespaced and %d cluster-wide reviews; both halves of the role must be asked about", namespacedReviews.Load(), clusterReviews.Load())
+	}
+
+	// The bound is real: the same grant probed with no namespace is a
+	// shortfall, and the label says which namespace was meant.
+	denied, err = probeLabels(context.Background(), authorizer.reviews(), "", nil)
+	if err != nil {
+		t.Fatalf("probe failed: %v", err)
+	}
+	if len(denied) == 0 {
+		t.Fatal("a namespaced grant probed cluster-wide must be denied; the fake is not testing the namespace")
+	}
+	for _, label := range denied {
+		if !strings.HasSuffix(label, rbacNamespacedLabelSuffix) {
+			t.Errorf("denied %q; only the namespaced write verbs were withheld and each should be labelled namespaced", label)
+		}
+	}
+	if !slices.ContainsFunc(denied, func(label string) bool { return strings.HasPrefix(label, "create secrets ") }) {
+		t.Errorf("the Secret writes must be among the namespaced denials; got %v", denied)
+	}
+}
+
+// TestTheMinimalRoleSecretsReadLabelsAreTheProbesOwn pins the contract between
+// the self-check and resolveMinimalRoleSecretsRead, which reads the denial of
+// `list secrets` and `watch secrets` out of Denied() to keep an upgraded
+// install's minimal role as it is. That match holds only while the Secret
+// read tuples are probed cluster-wide: a namespaced tuple is labelled with
+// rbacNamespacedLabelSuffix, the strings would no longer be equal, and the
+// operator would widen the agent's role on a cluster that denies it the verbs.
+// Two halves: the probe sends the tuples under exactly those labels, and a
+// cluster that denies the two verbs cluster-wide is reported under them.
+func TestTheMinimalRoleSecretsReadLabelsAreTheProbesOwn(t *testing.T) {
+	want := map[string]bool{rbacSecretsListLabel: false, rbacSecretsWatchLabel: false}
+	for _, tuple := range flattenRequiredPermissions() {
+		if _, ok := want[tuple.label]; !ok {
+			continue
+		}
+		if tuple.namespaced {
+			t.Errorf("tuple %q is probed namespaced; resolveMinimalRoleSecretsRead matches the cluster-wide label", tuple.label)
+		}
+		want[tuple.label] = true
+	}
+	for label, found := range want {
+		if !found {
+			t.Errorf("no tuple is labelled %q; resolveMinimalRoleSecretsRead would never see it denied", label)
+		}
+	}
+
+	authorizer := &fakeAuthorizer{deny: func(attrs *authorizationv1.ResourceAttributes) bool {
+		return attrs.Resource == "secrets" && attrs.Namespace == "" && (attrs.Verb == "list" || attrs.Verb == "watch")
+	}}
+	checker := NewRBACChecker(authorizer.reviews(), "kubeagents-system")
+	if _, err := checker.Probe(context.Background()); err != nil {
+		t.Fatalf("probe failed: %v", err)
+	}
+	denied := checker.Denied()
+	sort.Strings(denied)
+	if got := strings.Join(denied, ","); got != rbacSecretsListLabel+","+rbacSecretsWatchLabel {
+		t.Fatalf("Denied() = %v, want exactly [%s %s]", denied, rbacSecretsListLabel, rbacSecretsWatchLabel)
+	}
+}
+
 func TestProbeRBACWithEverythingGrantedReportsNothing(t *testing.T) {
-	denied, err := probeRBAC(context.Background(), (&fakeAuthorizer{}).reviews())
+	denied, err := probeLabels(context.Background(), (&fakeAuthorizer{}).reviews(), "", nil)
 	if err != nil {
 		t.Fatalf("probe failed: %v", err)
 	}
@@ -242,7 +423,7 @@ func TestProbeRBACWithEverythingGrantedReportsNothing(t *testing.T) {
 
 func TestProbeRBACErrorIsNotADenial(t *testing.T) {
 	authorizer := &fakeAuthorizer{err: errors.New("the API server is away")}
-	denied, err := probeRBAC(context.Background(), authorizer.reviews())
+	denied, err := probeLabels(context.Background(), authorizer.reviews(), "", nil)
 	if err == nil {
 		t.Fatal("expected the transport error to surface")
 	}
@@ -253,7 +434,7 @@ func TestProbeRBACErrorIsNotADenial(t *testing.T) {
 
 func TestTheCheckerReprobesOnItsOwnTickerAndKeepsTheLastAnswerOnError(t *testing.T) {
 	authorizer := &fakeAuthorizer{deny: denyPDBPatch}
-	checker := NewRBACChecker(authorizer.reviews())
+	checker := NewRBACChecker(authorizer.reviews(), "")
 	checker.interval = 10 * time.Millisecond
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -311,7 +492,7 @@ func TestProbeRBACReportsDenialsInDeclarationOrder(t *testing.T) {
 		}
 	}
 	for i := 0; i < 5; i++ {
-		denied, err := probeRBAC(context.Background(), authorizer.reviews())
+		denied, err := probeLabels(context.Background(), authorizer.reviews(), "", nil)
 		if err != nil {
 			t.Fatalf("probe failed: %v", err)
 		}
@@ -329,7 +510,7 @@ func TestProbeRBACHonoursItsTimeout(t *testing.T) {
 		review.Status.Allowed = true
 		return true, review, nil
 	})
-	checker := NewRBACChecker(clientset.AuthorizationV1().SelfSubjectAccessReviews())
+	checker := NewRBACChecker(clientset.AuthorizationV1().SelfSubjectAccessReviews(), "")
 	checker.timeout = 20 * time.Millisecond
 	started := time.Now()
 	denied, err := checker.Probe(context.Background())
@@ -379,7 +560,7 @@ func TestReconcileReportsAnOutOfDateClusterRoleAndKeepsGoing(t *testing.T) {
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
 	authorizer := &fakeAuthorizer{deny: denyPDBPatch}
-	checker := NewRBACChecker(authorizer.reviews())
+	checker := NewRBACChecker(authorizer.reviews(), "")
 	if _, err := checker.Probe(context.Background()); err != nil {
 		t.Fatalf("boot probe: %v", err)
 	}
@@ -467,7 +648,7 @@ func TestAStandingRBACDenialDoesNotWriteStatusEveryPass(t *testing.T) {
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(funcs).
 		Build()
-	checker := NewRBACChecker((&fakeAuthorizer{deny: denyPDBPatch}).reviews())
+	checker := NewRBACChecker((&fakeAuthorizer{deny: denyPDBPatch}).reviews(), "")
 	if _, err := checker.Probe(context.Background()); err != nil {
 		t.Fatalf("boot probe: %v", err)
 	}
@@ -510,7 +691,7 @@ func TestTheRBACSkewYieldsToAnotherDegradedReason(t *testing.T) {
 		WithObjects(agent).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		Build()
-	checker := NewRBACChecker((&fakeAuthorizer{deny: denyPDBPatch}).reviews())
+	checker := NewRBACChecker((&fakeAuthorizer{deny: denyPDBPatch}).reviews(), "")
 	if _, err := checker.Probe(context.Background()); err != nil {
 		t.Fatalf("boot probe: %v", err)
 	}
@@ -530,20 +711,20 @@ func TestTheRBACSkewYieldsToAnotherDegradedReason(t *testing.T) {
 }
 
 // TestTheEventWriteIsProbed: the Recorder's create on events is a permission
-// an older ClusterRole does not hold (it granted events read-only), and the
+// an older install's RBAC does not hold (it granted events read-only), and the
 // self-check has to name it rather than let the recorder fail quietly in the
-// background.
+// background. The write is namespaced, so the label says so.
 func TestTheEventWriteIsProbed(t *testing.T) {
 	authorizer := &fakeAuthorizer{deny: func(attrs *authorizationv1.ResourceAttributes) bool {
 		return attrs.Group == "" && attrs.Resource == "events" && (attrs.Verb == "create" || attrs.Verb == "patch")
 	}}
-	denied, err := probeRBAC(context.Background(), authorizer.reviews())
+	denied, err := probeLabels(context.Background(), authorizer.reviews(), "", nil)
 	if err != nil {
 		t.Fatalf("probe failed: %v", err)
 	}
 	got := append([]string(nil), denied...)
 	sort.Strings(got)
-	if want := []string{"create events", "patch events"}; strings.Join(got, ",") != strings.Join(want, ",") {
+	if want := []string{"create events" + rbacNamespacedLabelSuffix, "patch events" + rbacNamespacedLabelSuffix}; strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("denied = %v, want %v", denied, want)
 	}
 }
