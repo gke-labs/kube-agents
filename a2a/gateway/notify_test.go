@@ -218,6 +218,7 @@ func TestNotifyReportsAFirstPostFailure(t *testing.T) {
 // is dropped unanswered - the gateway does not reply on a subject the
 // requester chose freely.
 func TestNotifyAnswersOnlyInTheReplyNamespace(t *testing.T) {
+	t.Parallel()
 	s := startServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -333,6 +334,7 @@ func TestNotifyRefusesWhenTheQueueIsFull(t *testing.T) {
 // left silent (silence reads as "may have posted" and is not retried). A
 // request arriving after Stop is refused, not sent on the closed queue.
 func TestStopAnswersEveryAcceptedRequest(t *testing.T) {
+	t.Parallel()
 	s := startServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -464,6 +466,7 @@ func TestRunServesUntilItsContextEnds(t *testing.T) {
 // A bind that cannot succeed (the client is closed) is retried, not given
 // up on, until the context ends.
 func TestRunRetriesAFailedBind(t *testing.T) {
+	t.Parallel()
 	s := startServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
@@ -951,6 +954,7 @@ func TestARecordThatDoesntDecodeIsMarkedAsSuch(t *testing.T) {
 // answered with the stopping refusal marked retry, which the CLI turns into
 // "route unavailable" rather than a failure charged to the destination.
 func TestARequestWhileStoppingIsARetry(t *testing.T) {
+	t.Parallel()
 	s := startServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()

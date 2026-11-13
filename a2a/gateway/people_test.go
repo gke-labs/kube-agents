@@ -208,6 +208,7 @@ func awaitSubmissions(t *testing.T, r *rig, n int) {
 }
 
 func TestNoPeopleBucketCountsNobody(t *testing.T) {
+	t.Parallel()
 	r := startPeopleRig(t, nil) // provision() creates no people bucket
 	waitFor(t, "no bucket log", func() bool {
 		return strings.Contains(r.logs.String(), "people count is off: no people bucket")
@@ -230,6 +231,7 @@ func TestAPeopleBucketWithoutAMaxAgeIsLeftAlone(t *testing.T) {
 }
 
 func TestAChatTurnWritesItsPersonOnceAnHour(t *testing.T) {
+	t.Parallel()
 	r := startPeopleRig(t, withPeopleBucket(t, peopleTestTTL))
 	clock := fixPeopleClock(t, r)
 	waitPeopleLoaded(t, r)
@@ -272,6 +274,7 @@ func TestAChatTurnWritesItsPersonOnceAnHour(t *testing.T) {
 }
 
 func TestTheHourlyBoundSurvivesARestart(t *testing.T) {
+	t.Parallel()
 	key := testPeopleKey(t, peopleTestPrincipal)
 	before := time.Now().Add(-10 * time.Minute).UTC().Truncate(time.Second)
 	r := startPeopleRig(t, func(c *Config) {
@@ -300,6 +303,7 @@ func TestTheHourlyBoundSurvivesARestart(t *testing.T) {
 }
 
 func TestDoorAndConsoleTurnsAreNotPeople(t *testing.T) {
+	t.Parallel()
 	t.Run("inject door", func(t *testing.T) {
 		r := startInjectRigWith(t, withPeopleBucket(t, peopleTestTTL))
 		waitFor(t, "people on", func() bool { return r.g.people.Load() != nil })
@@ -337,6 +341,7 @@ func TestDoorAndConsoleTurnsAreNotPeople(t *testing.T) {
 }
 
 func TestAFailedPutLeavesTheTurnAlone(t *testing.T) {
+	t.Parallel()
 	r := startPeopleRig(t, func(c *Config) {
 		createPeopleBucket(t, c.NATSURL, jetstream.KeyValueConfig{History: 1, TTL: peopleTestTTL, MaxBytes: 1})
 	})
@@ -349,6 +354,7 @@ func TestAFailedPutLeavesTheTurnAlone(t *testing.T) {
 }
 
 func TestAFailedPutKeepsAPriorEntry(t *testing.T) {
+	t.Parallel()
 	key := testPeopleKey(t, peopleTestPrincipal)
 	prior := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Second)
 	r := startPeopleRig(t, func(c *Config) {
@@ -380,6 +386,7 @@ func TestAFailedPutKeepsAPriorEntry(t *testing.T) {
 }
 
 func TestPeopleSeenOffWritesNothingAndPurges(t *testing.T) {
+	t.Parallel()
 	var kv jetstream.KeyValue
 	r := startPeopleRig(t, func(c *Config) {
 		kv = createPeopleBucket(t, c.NATSURL, jetstream.KeyValueConfig{History: 1, TTL: peopleTestTTL})

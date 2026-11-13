@@ -168,6 +168,7 @@ func never[T any](t *testing.T, ch <-chan T, during time.Duration, what string) 
 // still holds the lease, then releases it, and the standby starts at once,
 // with no hold on its relay since the lease was given up cleanly.
 func TestOneGatewayLeadsAndTheLeaseMovesOnSIGTERM(t *testing.T) {
+	t.Parallel()
 	cs := fake.NewClientset(heldLease("", 1))
 	a := runCampaign(t, cs, "pod-a")
 	opts := receive(t, a.leading, 5*time.Second, "pod-a leading")
@@ -208,6 +209,7 @@ func TestOneGatewayLeadsAndTheLeaseMovesOnSIGTERM(t *testing.T) {
 // released (it crashed) is waited out for the lease's duration, and the new
 // leader's relay waits AckWait for the dead one's held events.
 func TestATakeoverFromAnExpiredLeaseHoldsTheRelayBack(t *testing.T) {
+	t.Parallel()
 	cs := fake.NewClientset(heldLease("pod-dead", int32(testLeaseDuration/time.Second)))
 	start := time.Now()
 	b := runCampaign(t, cs, "pod-b")
@@ -256,6 +258,7 @@ func TestNoLeaseYetHoldsTheRelayBack(t *testing.T) {
 // and a release would tell the next taker nobody holds any. Left to expire,
 // it still names a holder, and the next taker holds its relay too.
 func TestACutShortCrashTakeoverKeepsTheMarker(t *testing.T) {
+	t.Parallel()
 	cs := fake.NewClientset(heldLease("pod-dead", int32(testLeaseDuration/time.Second)))
 	b := runCampaign(t, cs, "pod-b")
 	if opts := receive(t, b.leading, 3*testLeaseDuration, "pod-b taking the expired lease"); opts.RelayBindDelay != relayAckWait {
@@ -290,6 +293,7 @@ func TestAReleasedLeaseStartsWithoutTheHoldBack(t *testing.T) {
 // the lease is given up, and Run reports the lost leadership the process
 // exits on.
 func TestAFencedWriteStepsTheGatewayDown(t *testing.T) {
+	t.Parallel()
 	cs := fake.NewClientset(heldLease("", 1))
 	a := runCampaign(t, cs, "pod-a")
 	receive(t, a.leading, 5*time.Second, "pod-a leading")
@@ -331,6 +335,7 @@ func failRenewalsOf(cs *fake.Clientset, identity string) *atomic.Bool {
 // still named the holder while it stops, gives the lease up only once its
 // work has stopped, and reports the lost leadership.
 func TestLosingTheLeaseStepsDownWithTheShortDrain(t *testing.T) {
+	t.Parallel()
 	cs := fake.NewClientset(heldLease("", 1))
 	failing := failRenewalsOf(cs, "pod-a")
 	a := runCampaign(t, cs, "pod-a")
@@ -354,6 +359,7 @@ func TestLosingTheLeaseStepsDownWithTheShortDrain(t *testing.T) {
 // learns of the new term from a fenced write, before its stale view of the
 // lease catches up, must not clear the new leader's hold when it stops.
 func TestAFencedGatewayLeavesTheNewLeadersLeaseAlone(t *testing.T) {
+	t.Parallel()
 	// From a released lease, so pod-a's term isn't a crash takeover, which
 	// keeps its lease without reaching the release at all.
 	cs := fake.NewClientset(heldLease("", 1))
@@ -383,6 +389,7 @@ func TestAFencedGatewayLeavesTheNewLeadersLeaseAlone(t *testing.T) {
 // TestAStandbyStopsAtOnceOnSIGTERM: a replica waiting for the lease has no
 // work to stop.
 func TestAStandbyStopsAtOnceOnSIGTERM(t *testing.T) {
+	t.Parallel()
 	cs := fake.NewClientset(heldLease("pod-x", 3600))
 	b := runCampaign(t, cs, "pod-b")
 	time.Sleep(3 * testRetryPeriod)
@@ -471,6 +478,7 @@ func elect(t *testing.T, cs kubernetes.Interface, r *rig, identity string) <-cha
 // the standby's backend waits. On the leader's SIGTERM the standby takes
 // the lease, starts term 2, and answers the message.
 func TestTheWorkFollowsTheLease(t *testing.T) {
+	t.Parallel()
 	base, _ := startRigWithSpawnerCap(t, targetPlatform, 0, nil)
 	base.stop()
 	<-base.ran
@@ -531,6 +539,7 @@ func TestADeposedGatewaysFencedWriteStepsItDown(t *testing.T) {
 // TestATurnTakenAtTheStopIsDropped: once the gateway is stopping, a turn
 // still queued is logged and dropped, not run on an ended context.
 func TestATurnTakenAtTheStopIsDropped(t *testing.T) {
+	t.Parallel()
 	r, _ := startRigWithSpawner(t)
 	waitRunning(t, r)
 	r.stop()
@@ -549,6 +558,7 @@ func TestATurnTakenAtTheStopIsDropped(t *testing.T) {
 // lock (held by a relay render, a reap or a sweep), is dropped once it gets
 // the lock after the stop began.
 func TestATurnWaitingOnTheLockWhenTheStopBeginsIsDropped(t *testing.T) {
+	t.Parallel()
 	r, _ := startRigWithSpawner(t)
 	waitRunning(t, r)
 	conv := "discord:g1/t-lock-wait"
@@ -571,6 +581,7 @@ func TestATurnWaitingOnTheLockWhenTheStopBeginsIsDropped(t *testing.T) {
 // TestAHeldBackRelayBindsAfterItsDelay: ingress starts at once and the
 // relay's durable is bound only once the delay has passed.
 func TestAHeldBackRelayBindsAfterItsDelay(t *testing.T) {
+	t.Parallel()
 	const delay = 2 * time.Second
 	base, _ := startRigWithSpawnerCap(t, targetPlatform, 0, nil)
 	// The base rig may have bound the durable before it stopped; it's
@@ -609,6 +620,7 @@ func TestAHeldBackRelayBindsAfterItsDelay(t *testing.T) {
 // them. Binding at once would post the second, then the first once its
 // AckWait ran out. Takes AckWait (30s), the server's default.
 func TestACrashTakeoverRendersTheDeadLeadersHeldEventsFirst(t *testing.T) {
+	t.Parallel()
 	if testing.Short() {
 		t.Skip("waits out the relay's AckWait")
 	}
@@ -722,6 +734,7 @@ func (g *giveUpLeader) attempts() int {
 // Run returning (a return is the process exiting, and a restart loop under
 // the kubelet's backoff).
 func TestABusGiveUpCampaignsAgainInProcess(t *testing.T) {
+	t.Parallel()
 	cs := fake.NewClientset(heldLease("", 1))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -759,6 +772,7 @@ func TestABusGiveUpCampaignsAgainInProcess(t *testing.T) {
 // standby whose bus works take the lease, rather than the replica that gave
 // up winning it straight back.
 func TestABusGiveUpHandsTheLeaseToTheStandby(t *testing.T) {
+	t.Parallel()
 	cs := fake.NewClientset(heldLease("", 1))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

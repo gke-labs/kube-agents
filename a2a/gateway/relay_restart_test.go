@@ -54,6 +54,7 @@ func postsContaining(r *rig, needle string) int {
 // and the stopped one rendered none. Before the relay acked after render,
 // both events were acked on enqueue and lost.
 func TestAGatewayStoppedMidBatchLosesAndRepeatsNothing(t *testing.T) {
+	t.Parallel()
 	r, _ := startRigWithSpawner(t)
 	conv := "discord:g1/t-mid-batch"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "dm", AuthorID: "1001", MessageID: "m-mid", Text: "how is the fleet?"}
@@ -153,6 +154,7 @@ func (f *fakeDelivery) Term() error                   { return nil }
 // again. The record's sequences are all that says it was rendered: the next
 // gateway's in-memory relay state is empty, and the task is still live.
 func TestTheRelayRendersADeliveryItAlreadyRenderedOnce(t *testing.T) {
+	t.Parallel()
 	r, _ := startRigWithSpawner(t)
 	waitRunning(t, r)
 	conv := "discord:g1/t-redelivered"
@@ -228,6 +230,7 @@ func (h *holdingAdapter) EditMessage(conversation, messageID string, m OutMessag
 // writes its record and acks it before it gives the rest back, so the next
 // gateway doesn't post the answer again.
 func TestABatchRenderingWhenTheGatewayStopsIsPostedOnce(t *testing.T) {
+	t.Parallel()
 	const answer = "slow door answer 77"
 	h := &holdingAdapter{needle: answer, entered: make(chan struct{}), release: make(chan struct{})}
 	r, _ := startRigWithSpawnerAdapter(t, "platform", defaultMaxSessions, nil, func(a *fakeAdapter) Adapter {
@@ -282,6 +285,7 @@ func TestABatchRenderingWhenTheGatewayStopsIsPostedOnce(t *testing.T) {
 // its original (a hold that outlived AckWait) renders once, and both copies
 // are acked.
 func TestADuplicateInOneBatchRendersOnce(t *testing.T) {
+	t.Parallel()
 	r, _ := startRigWithSpawner(t)
 	waitRunning(t, r)
 	conv := "discord:g1/t-dup-batch"
@@ -315,6 +319,7 @@ func TestADuplicateInOneBatchRendersOnce(t *testing.T) {
 // acks nothing; the next gateway renders it again rather than finding it
 // recorded as rendered.
 func TestABatchTheStopDrainGaveUpOnRecordsAndAcksNothing(t *testing.T) {
+	t.Parallel()
 	const question = "which cluster did you mean, 43?"
 	h := &holdingAdapter{needle: question, entered: make(chan struct{}), release: make(chan struct{})}
 	r, _ := startRigWithSpawnerAdapter(t, "platform", defaultMaxSessions, nil, func(a *fakeAdapter) Adapter {
@@ -379,6 +384,7 @@ func TestABatchTheStopDrainGaveUpOnRecordsAndAcksNothing(t *testing.T) {
 // task went to platform, so the relay drops it and posts nothing, and the
 // task's own terminal still renders.
 func TestATerminalOnAnotherAddresseesSubjectIsNotTheTasks(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	r.adapter.inbox <- InboundMessage{
 		Conversation: "discord:g1/t-forged", Kind: "group",

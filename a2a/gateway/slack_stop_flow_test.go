@@ -123,6 +123,7 @@ func askAndAnswer(t *testing.T, d *slackDMRig) *lib.Envelope {
 }
 
 func TestSlackStopButtonStopsTheCardsWithItsOwnReply(t *testing.T) {
+	t.Parallel()
 	d := slackStopRig(t)
 	askAndAnswer(t, d)
 
@@ -145,6 +146,7 @@ func TestSlackStopButtonStopsTheCardsWithItsOwnReply(t *testing.T) {
 }
 
 func TestSlackStopButtonCancelsTheTurnQuietly(t *testing.T) {
+	t.Parallel()
 	d := slackStopRig(t)
 	ctx := context.Background()
 	d.adapter.events <- slackMsg("im", "D1", "U1", "check the pods on x", "100.1", "")
@@ -183,6 +185,7 @@ func TestSlackStopButtonCancelsTheTurnQuietly(t *testing.T) {
 }
 
 func TestSlackStopButtonDuringACardStopCancelsANewTurnAndFollowsUp(t *testing.T) {
+	t.Parallel()
 	d := slackStopRig(t)
 	ctx := context.Background()
 	askAndAnswer(t, d)
@@ -239,6 +242,7 @@ func TestSlackStopButtonDuringACardStopCancelsANewTurnAndFollowsUp(t *testing.T)
 }
 
 func TestSlackStopButtonFallbackIsItsOwn(t *testing.T) {
+	t.Parallel()
 	d := slackStopRig(t)
 	askAndAnswer(t, d)
 
@@ -256,6 +260,7 @@ func TestSlackStopButtonFallbackIsItsOwn(t *testing.T) {
 }
 
 func TestSlackStopButtonFailedControlKeepsPressStopAgain(t *testing.T) {
+	t.Parallel()
 	d := slackStopRig(t)
 	askAndAnswer(t, d)
 
@@ -282,6 +287,7 @@ func TestSlackStopUnconfirmedFinalDropsTheRetry(t *testing.T) {
 }
 
 func TestSlackStopButtonFromSomeoneElseStopsNothing(t *testing.T) {
+	t.Parallel()
 	d := slackStopRig(t)
 	askAndAnswer(t, d)
 	conv := "slack:dm/D1/100.1"
@@ -299,6 +305,7 @@ func TestSlackStopButtonFromSomeoneElseStopsNothing(t *testing.T) {
 }
 
 func TestSlackStopButtonOnAThreadThatRanNothingSendsNoControl(t *testing.T) {
+	t.Parallel()
 	d := slackStopRig(t)
 	pressStop(d, "U1", "100.1", "200.1")
 	d.awaitPost(t, "the nothing-running reply", "D1", "100.1", slackStopNothingReply)
@@ -308,6 +315,7 @@ func TestSlackStopButtonOnAThreadThatRanNothingSendsNoControl(t *testing.T) {
 }
 
 func TestSlackStopButtonFromAnUnlistedMemberPostsNoNotice(t *testing.T) {
+	t.Parallel()
 	d := slackStopRig(t)
 	askAndAnswer(t, d)
 	conv := "slack:dm/D1/100.1"
@@ -322,6 +330,7 @@ func TestSlackStopButtonFromAnUnlistedMemberPostsNoNotice(t *testing.T) {
 }
 
 func TestTypedStopFromSomeoneElseKeepsTheCardStop(t *testing.T) {
+	t.Parallel()
 	d := slackStopRig(t)
 	askAndAnswer(t, d)
 

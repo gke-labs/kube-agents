@@ -119,6 +119,7 @@ func profileTurn(conversation, profile string, params map[string]string) Inbound
 }
 
 func TestProfileTurn_IsMintedForTheResolvedProfileAndSubmittedOnSubmit(t *testing.T) {
+	t.Parallel()
 	r := startProfileRig(t)
 	r.adapter.inbox <- profileTurn("discord:1/1", "cluster", targetParams("p1", "us-east1", "prod"))
 
@@ -165,6 +166,7 @@ func TestProfileTurn_IsMintedForTheResolvedProfileAndSubmittedOnSubmit(t *testin
 }
 
 func TestProfileTurn_ARefusalPostsWhyAndSubmitsNothing(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name, profile string
 		params        map[string]string
@@ -199,6 +201,7 @@ func TestProfileTurn_ARefusalPostsWhyAndSubmitsNothing(t *testing.T) {
 }
 
 func TestDeliverChildResult_ReachesAProfileParentOnItsIn(t *testing.T) {
+	t.Parallel()
 	r := startProfileRig(t)
 	rec := &SessionRecord{Key: "discord:3/3", ContextID: "ctx-3", Tasks: []TaskRef{
 		{ID: "task-parent", Addressee: "cluster", Tier: "read", CorrelationID: "corr-p",
@@ -279,6 +282,7 @@ func submissionOn(t *testing.T, r *rig, profile string) *lib.Envelope {
 // reaches it as a childResult and gives it the conversation back, a stop
 // while it waits cancels it, and its own end is the chain's end.
 func TestAProfileParentDelegatesWaitsAndEndsItsChain(t *testing.T) {
+	t.Parallel()
 	r := startProfileRig(t)
 	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
 	ctx := context.Background()
@@ -374,6 +378,7 @@ func TestAProfileParentDelegatesWaitsAndEndsItsChain(t *testing.T) {
 // the conversation while it runs, and a stop cancels it and the profile task
 // waiting on it.
 func TestAStopWhileAProfileChildRunsCancelsTheWaitingParent(t *testing.T) {
+	t.Parallel()
 	r := startProfileRig(t)
 	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
 	ctx := context.Background()
@@ -415,6 +420,7 @@ func TestAStopWhileAProfileChildRunsCancelsTheWaitingParent(t *testing.T) {
 // TestAStopOfAPlatformTaskWritesNoStopRecord: the record is the dispatcher's,
 // and a task addressed to platform never went through it.
 func TestAStopOfAPlatformTaskWritesNoStopRecord(t *testing.T) {
+	t.Parallel()
 	r := startProfileRig(t)
 	conv := "discord:8/8"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "dm", AuthorID: "1001", MessageID: "m-8a", Text: "how is the fleet?"}
@@ -489,6 +495,7 @@ func dispatchStopCount(t *testing.T, url string) uint64 {
 }
 
 func TestAProfileTurnWhileATaskRunsIsRefusedNotSteered(t *testing.T) {
+	t.Parallel()
 	r := startProfileRig(t)
 	conv := "discord:7/7"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "dm", AuthorID: "1001", MessageID: "m-7a", Text: "how is the fleet?"}
@@ -581,6 +588,7 @@ func TestARefusedDelegationLeavesAProfileTasksResultAlone(t *testing.T) {
 // parent is cancelled, and a child's end arriving later must neither post to
 // the parent's .in nor restore it as the conversation's task.
 func TestAChildResultIsNotDeliveredToACancelledOrEndedParent(t *testing.T) {
+	t.Parallel()
 	r := startProfileRig(t)
 	for _, parent := range []TaskRef{
 		{ID: "task-parent-c", Addressee: "chat", Tier: "read", CorrelationID: "corr-c", Canceled: true},
@@ -604,6 +612,7 @@ func TestAChildResultIsNotDeliveredToACancelledOrEndedParent(t *testing.T) {
 // durable only for each tier the profile allows, so a submission at another
 // would sit unconsumed until the heal; the gateway refuses it first.
 func TestAProfileThatDoesntRunAtTheTierIsRefusedUpFront(t *testing.T) {
+	t.Parallel()
 	r := startProfileRig(t)
 	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat", Tiers: []string{"unattended"}})
 	conv := "discord:12/12"
@@ -634,6 +643,7 @@ func TestAChildResultThatFailsToPublishStillRestoresTheProfileParent(t *testing.
 }
 
 func TestAChildResultIsNotDeliveredToAParentTheRelayEnded(t *testing.T) {
+	t.Parallel()
 	r := startProfileRig(t)
 	rec := &SessionRecord{Key: "discord:14/14", ContextID: "ctx-14", Tasks: []TaskRef{
 		{ID: "task-parent", Addressee: "cluster", Tier: "read", CorrelationID: "corr-p",
@@ -678,6 +688,7 @@ func TestARestoredProfileParentGetsItsRollingLineBack(t *testing.T) {
 }
 
 func TestATargetTheMergeMakesInvalidIsRefusedBeforeTheMint(t *testing.T) {
+	t.Parallel()
 	r := startProfileRig(t)
 	r.g.profiles.put("odd", &lib.AgentCard{Name: "odd",
 		ClusterRef: &lib.ClusterRef{ProjectID: "p1", Location: "us-east1", Cluster: "my prod"}})
@@ -690,6 +701,7 @@ func TestATargetTheMergeMakesInvalidIsRefusedBeforeTheMint(t *testing.T) {
 }
 
 func TestAStopDuringAWakeLeavesTheEndedProfileChildAlone(t *testing.T) {
+	t.Parallel()
 	r := startProfileRig(t)
 	rec := &SessionRecord{Key: "discord:17/17", ContextID: "ctx-17", Tasks: []TaskRef{
 		{ID: "task-turn", Addressee: "chat-otter-1a2b", CorrelationID: "corr-t"},
@@ -728,6 +740,7 @@ func TestAStopLeavesAProfileParentTheRelayEndedAlone(t *testing.T) {
 // name the target profile doesn't declare refuses the delegation, naming
 // what the profile takes, with nothing submitted.
 func TestAProfileParentDelegatesWithTheTargetsParameters(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name      string
 		params    map[string]string
@@ -784,6 +797,7 @@ func TestAProfileParentDelegatesWithTheTargetsParameters(t *testing.T) {
 // which holds parameters to its card too: one it doesn't declare is refused
 // before any submission, not handed on to a profile that ignores it.
 func TestADelegationToANoTargetProfileIsHeldToItsCard(t *testing.T) {
+	t.Parallel()
 	r := startProfileRig(t)
 	r.g.profiles.put("chat", &lib.AgentCard{Name: "chat"})
 	r.g.profiles.put("triage", &lib.AgentCard{Name: "triage"})
