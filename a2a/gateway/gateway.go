@@ -3048,6 +3048,10 @@ type taskStart struct {
 	// CorrelationID empty mints a fresh one, which is a human turn: the
 	// originating user interaction. A child rides its parent's.
 	CorrelationID string
+	// ProfileChain goes onto a profile task's history entry (TaskRef):
+	// the waiting profile tasks above it, set only by a profile parent's
+	// child mint.
+	ProfileChain []string
 	// Role, ParentTaskID and Depth go onto the history entry as the
 	// delegation chain; all zero for a human turn.
 	Role         string
@@ -3284,6 +3288,8 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	ref.carrySteerAuthors(TaskRef{SteerAuthors: ts.SteerAuthors, SteerAuthorsOverflow: ts.SteerAuthorsOverflow})
 	if ts.Route != nil {
 		ref.Tier = string(ts.Route.Tier)
+		ref.Scope = string(ts.Route.Scope)
+		ref.ProfileChain = ts.ProfileChain
 	}
 	rec.Tasks = append(rec.Tasks, ref)
 	if ts.LinkParent {
