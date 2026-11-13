@@ -344,3 +344,24 @@ func TestBucketedGrantsLiftTheIdentityCeiling(t *testing.T) {
 	}
 	t.Logf("fit %d (%s) without bucketed grants, %d (%s) with", off.fit, off.limit, on.fit, on.limit)
 }
+
+// A draining profile whose name happens to be a live profile's map user
+// (profile-<p>-<t>) drains without failing the map: the mirror applies the
+// same predicate drainingDispatchProfiles does, and such a name is no
+// addressee (#5553, round 3).
+func TestADrainingNameThatIsAProfileEntryUserDoesNotFailTheMap(t *testing.T) {
+	withDispatcher(t)
+	withBucketedGrants(t)
+	withOperatorBusPrincipal(t)
+	agent := authMapTestAgent()
+	live := testAgentProfile(agent.Namespace, "tse")
+	name := agentProfileMapUser(&live, agentv1alpha1.AgentProfileTierRead)
+	applied := &a2aDispatchConfig{Profiles: []a2aDispatchProfile{{Name: name, Tiers: []string{"read"}}}}
+	draining := drainingDispatchProfiles(applied, map[string]bool{}, time.Now(), a2aDrainingNameExclusions(agent)...)
+	if len(draining) != 1 {
+		t.Fatalf("draining = %+v, want %s", draining, name)
+	}
+	if _, err := renderA2AAuthMapDraining(agent, []agentv1alpha1.AgentProfile{live}, draining); err != nil {
+		t.Errorf("the map failed with draining %q beside live tse: %v", name, err)
+	}
+}

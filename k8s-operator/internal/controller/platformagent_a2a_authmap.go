@@ -29,7 +29,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
-	"slices"
 )
 
 // The identity-to-permissions map: what the operator renders and the auth
@@ -565,8 +564,13 @@ func validateA2AAuthMapIdentities(identities []a2aAuthMapIdentity, principals ..
 			}
 			seenDraining := map[string]bool{}
 			for _, p := range id.Draining {
-				if !isDNS1123LabelToken(p) || seenDraining[p] || !a2aCanDrainAs(p, principals) ||
-					slices.ContainsFunc(identities, func(o a2aAuthMapIdentity) bool { return o.User == p }) {
+				// a2aCanDrainAs alone, the one predicate drainingDispatchProfiles
+				// also applies, so a name carried into draining is never
+				// refused here (#5553, rounds 1-3). A profile entry's user
+				// (profile-<p>-<t>) isn't an addressee, so a draining
+				// profile that happens to share one collides with nothing,
+				// and the callout doesn't check it either.
+				if !isDNS1123LabelToken(p) || seenDraining[p] || !a2aCanDrainAs(p, principals) {
 					return fmt.Errorf("identity %d: user %q lists draining profile %q, which is not a dot-free DNS-1123 label, is listed twice, or is a reserved addressee, a principal's or map user's name, or a dispatcher bucket user", i, id.User, p)
 				}
 				seenDraining[p] = true
