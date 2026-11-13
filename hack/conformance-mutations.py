@@ -2397,6 +2397,16 @@ Mutation(
         "is gone (#5682 moved the cap check into the shared validator)",
     ),
     Mutation(
+        "C1-delegate-gateway-validates-only-some-requests",
+        "a2a/gateway/delegation.go",
+        ("if !parsed || lib.ValidateDelegateRequest(req) != nil {",
+         "if !parsed || lib.ValidateDelegateRequest(req) != nil && len(req.Tasks) > 0 {"),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "condition the gateway's validator call so it guards only batches: "
+        "the call still appears, but a single over-length task that reached "
+        "the bus without the adapter is minted",
+    ),
+    Mutation(
         "C1-delegate-validator-cap-hand-spelled",
         "a2a/lib/payload.go",
         ("case len(text) > DelegateTextCap:", "case len(text) > 16*1024:"),

@@ -1808,10 +1808,12 @@ class C1IsolationIsStructural(unittest.TestCase):
         # request lib.ValidateDelegateRequest refuses, and the validator caps
         # the single task's text and every batch entry's.
         gateway = _go_code(h.text("a2a_gateway_delegation"), "handleDelegateRequest")
+        # Followed only by `||` or the block: an `&&` after the call (a
+        # condition on it) would validate only some requests and mint the rest.
         self.assertRegex(
             gateway,
-            r"lib\.ValidateDelegateRequest\(req\)\s*!=\s*nil",
-            "the gateway's handleDelegateRequest no longer refuses a request lib.ValidateDelegateRequest refuses",
+            r"if\s+!parsed\s*\|\|\s*lib\.ValidateDelegateRequest\(req\)\s*!=\s*nil\s*(?:\|\||\{)",
+            "the gateway's handleDelegateRequest no longer refuses every request lib.ValidateDelegateRequest refuses",
         )
         self.assertNotRegex(gateway, magic_number, "the gateway's handleDelegateRequest hand-spells the delegate text cap")
 
