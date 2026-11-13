@@ -316,14 +316,6 @@ class UsageCountersSeriesNamesTest(unittest.TestCase):
         self.assertEqual(_go_const(feedback_go, "FeedbackUp"), _go_const(_SCRAPE_GO, "a2aRatingUp"))
         self.assertEqual(_go_const(feedback_go, "FeedbackDown"), _go_const(_SCRAPE_GO, "a2aRatingDown"))
 
-    def test_the_a2a_gateways_post_ratings_are_the_autonomous_feedback_counters_family(self):
-        """The ratings of the posts the agent made on its own are a family of their own,
-        split on the same rating label and values as the answer ratings: down into
-        autonomousNegativeFeedbackTotal, up into autonomousPositiveFeedbackTotal."""
-        name = "_".join(_go_const(_A2A_METRICS_GO, c) for c in ("metricsNamespace", "metricsSubsystem", "postFeedbackName"))
-        self.assertEqual(name, _go_const(_SCRAPE_GO, "a2aPostFeedbackSeries"))
-        self.assertNotEqual(name, _go_const(_SCRAPE_GO, "a2aAnswerFeedbackSeries"))
-
     def test_the_errored_states_the_poller_filters_on_are_the_a2a_libs_failed_and_rejected(self):
         """The state values are the A2A library's constants; the gateway emits them
         through its terminal list, and the operator's map is the second copy."""

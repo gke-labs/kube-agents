@@ -143,9 +143,8 @@ const (
 // eventsIngestedTotal, remediationsProposedTotal, chatMessagesInboundTotal,
 // sessionsTotal, chatSessionsTotal, toolExecutionsBlockedTotal,
 // brokerFailuresTotal, chatTurnsErroredTotal, backgroundTasksGaveUpTotal,
-// negativeFeedbackTotal, positiveFeedbackTotal,
-// autonomousNegativeFeedbackTotal, autonomousPositiveFeedbackTotal,
-// inputTokensTotal, outputTokensTotal, spendMicrosUSDTotal, lastActiveTime and
+// negativeFeedbackTotal, positiveFeedbackTotal, inputTokensTotal,
+// outputTokensTotal, spendMicrosUSDTotal, lastActiveTime and
 // lastHumanActiveTime on every PlatformAgent, the two cluster gauges, the six
 // proposal readings, the two people readings (peopleSeen7d, peopleSeen30d),
 // the broker's top tools (topTools) and the nine origin readings
@@ -1288,9 +1287,6 @@ func usageStatusSeed(agent *agentv1alpha1.PlatformAgent, now time.Time) usageSee
 		usageCounterInputTokens:           usageStatusFloor(agent.Status.Usage.InputTokensTotal),
 		usageCounterOutputTokens:          usageStatusFloor(agent.Status.Usage.OutputTokensTotal),
 		usageCounterSpendMicros:           usageStatusFloor(agent.Status.Usage.SpendMicrosUSDTotal),
-		// The ratings of the posts the agent made on its own.
-		usageCounterAutonomousNegativeFeedback: usageStatusFloor(agent.Status.Usage.AutonomousNegativeFeedbackTotal),
-		usageCounterAutonomousPositiveFeedback: usageStatusFloor(agent.Status.Usage.AutonomousPositiveFeedbackTotal),
 		// sessionsTotal split between the halves (usageStatusSessionsSeed);
 		// the read-back bound holds the pair's sum to it (usageDocumentInvalid).
 		usageCounterSessionsTriage:        triageSessions,
@@ -1473,8 +1469,6 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	background := doc.Totals[usageCounterBackgroundTasksGaveUp]
 	negative := doc.Totals[usageCounterNegativeFeedback]
 	positive := doc.Totals[usageCounterPositiveFeedback]
-	postNegative := doc.Totals[usageCounterAutonomousNegativeFeedback]
-	postPositive := doc.Totals[usageCounterAutonomousPositiveFeedback]
 	tokensIn := doc.Totals[usageCounterInputTokens]
 	tokensOut := doc.Totals[usageCounterOutputTokens]
 	spend := doc.Totals[usageCounterSpendMicros]
@@ -1485,7 +1479,7 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	wantRegistered, wantMonitored := usageGaugeFields(gauges)
 	// The first-schema counters are in every served CRD that has status.usage;
 	// the gauges, the chat counter, the blocked counter, the failures
-	// counter, the errored counter, the background-tasks counter, the four
+	// counter, the errored counter, the background-tasks counter, the two
 	// feedback counters, the chat sessions, the proposal readings, the people
 	// readings and the origin readings arrived later, each at its own
 	// release, and a CRD at a previous schema prunes some or all of them, so
@@ -1504,8 +1498,6 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	backgroundPruned := p.newerFieldPruned(agent, usageCounterBackgroundTasksGaveUp)
 	feedbackPruned := p.newerFieldPruned(agent, usageCounterNegativeFeedback)
 	positivePruned := p.newerFieldPruned(agent, usageCounterPositiveFeedback)
-	postNegativePruned := p.newerFieldPruned(agent, usageCounterAutonomousNegativeFeedback)
-	postPositivePruned := p.newerFieldPruned(agent, usageCounterAutonomousPositiveFeedback)
 	chatSessionsPruned := p.newerFieldPruned(agent, usageStatusFieldChatSessions)
 	inferencePruned := p.newerFieldPruned(agent, usageNewerFieldInference)
 	humanPruned := p.newerFieldPruned(agent, usageNewerFieldLastHumanActive)
@@ -1524,7 +1516,6 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 		(!blockedPruned && usage.ToolExecutionsBlockedTotal < blocked) || (!failuresPruned && usage.BrokerFailuresTotal < failures) ||
 		(!erroredPruned && usage.ChatTurnsErroredTotal < errored) || (!backgroundPruned && usage.BackgroundTasksGaveUpTotal < background) ||
 		(!feedbackPruned && usage.NegativeFeedbackTotal < negative) || (!positivePruned && usage.PositiveFeedbackTotal < positive) ||
-		(!postNegativePruned && usage.AutonomousNegativeFeedbackTotal < postNegative) || (!postPositivePruned && usage.AutonomousPositiveFeedbackTotal < postPositive) ||
 		(!chatSessionsPruned && usage.ChatSessionsTotal < chatSessions) ||
 		(!inferencePruned && (usage.InputTokensTotal < tokensIn || usage.OutputTokensTotal < tokensOut || usage.SpendMicrosUSDTotal < spend)) || readingsMoved || topToolsMoved
 	// sessionsTotal is in the first schema beside the first three counters
@@ -1545,8 +1536,6 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	usage.BackgroundTasksGaveUpTotal = background
 	usage.NegativeFeedbackTotal = negative
 	usage.PositiveFeedbackTotal = positive
-	usage.AutonomousNegativeFeedbackTotal = postNegative
-	usage.AutonomousPositiveFeedbackTotal = postPositive
 	usage.SessionsTotal = sessions
 	// Written only while unpruned, so a patch for another counter does not
 	// carry it and refresh a fresh pruning record.
@@ -1645,12 +1634,6 @@ func (p *UsageCounterPoller) projectStatus(ctx context.Context, agent *agentv1al
 	}
 	if positive > 0 {
 		p.noteNewerFieldEcho(ctx, agent, usageCounterPositiveFeedback, agent.Status.Usage.PositiveFeedbackTotal == positive)
-	}
-	if postNegative > 0 {
-		p.noteNewerFieldEcho(ctx, agent, usageCounterAutonomousNegativeFeedback, agent.Status.Usage.AutonomousNegativeFeedbackTotal == postNegative)
-	}
-	if postPositive > 0 {
-		p.noteNewerFieldEcho(ctx, agent, usageCounterAutonomousPositiveFeedback, agent.Status.Usage.AutonomousPositiveFeedbackTotal == postPositive)
 	}
 	// Gated on !chatSessionsPruned as well, unlike the counters above, so a
 	// fresh pruning record is not refreshed by a patch for another field.

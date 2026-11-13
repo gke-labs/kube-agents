@@ -115,13 +115,6 @@ const (
 	a2aRatingLabel          = "rating"
 	a2aRatingUp             = "up"
 	a2aRatingDown           = "down"
-	// a2aPostFeedbackSeries is the A2A gateway's count of the ratings
-	// verified senders gave the posts it made on its own (alerts and
-	// scheduled or audit reports), by platform, rating and kind: under
-	// a2aRatingUp autonomousPositiveFeedbackTotal, under a2aRatingDown
-	// autonomousNegativeFeedbackTotal, each summed over the family's other
-	// labels and never into the answer counters (a2a/gateway/metrics.go).
-	a2aPostFeedbackSeries = "kubeagents_a2a_gateway_post_feedback_total"
 	// a2aMessagesInboundSeries is the A2A gateway's counter of the chat
 	// messages it accepted as turns, by platform: the same counter on a
 	// next-mode install, where Chat ingress is the A2A gateway's rather than
@@ -426,10 +419,6 @@ func usageSeriesFor(counter string) (family string, filter usageLabelFilter) {
 		return chatFeedbackNegativeSeries, nil
 	case usageCounterPositiveFeedback:
 		return a2aAnswerFeedbackSeries, usageLabelFilter{a2aRatingLabel: {a2aRatingUp: true}}
-	case usageCounterAutonomousNegativeFeedback:
-		return a2aPostFeedbackSeries, usageLabelFilter{a2aRatingLabel: {a2aRatingDown: true}}
-	case usageCounterAutonomousPositiveFeedback:
-		return a2aPostFeedbackSeries, usageLabelFilter{a2aRatingLabel: {a2aRatingUp: true}}
 	case usageCounterInputTokens:
 		return litellmInputSeries, nil
 	case usageCounterOutputTokens:

@@ -462,12 +462,14 @@ You have one rating per answer, so a 👍 on an answer you gave a 👎 replaces 
 
 What a rating keeps can include cluster names and whatever else the question and answer held. It is stored in the `feedback` bucket of the install's NATS server, and only the gateway can read or write its records. The setup job can list the bucket's keys, which hold the task and a string derived from the rater's Slack member ID or Google Chat address. The bucket drops each record 30 days after it was given. Nothing is sent anywhere else. An install whose NATS server has no such bucket draws no buttons; the gateway checks for one again every minute for half an hour after it starts.
 
-The counts are on the gateway's metrics and in the `PlatformAgent`'s `status.usage` as `negativeFeedbackTotal` and `positiveFeedbackTotal`; ratings on the alerts and reports the agent posts on its own count apart, as `autonomousNegativeFeedbackTotal` and `autonomousPositiveFeedbackTotal` ([Observability](/kube-agents/concepts/observability/)). To read what was kept, run the gateway's export in its pod. It writes a tar with a directory per rating, each holding a draft `task.yaml` for an evaluation case and the question, answer and any note as `transcript.md`; for an alert or report it holds the post and says nobody asked:
+The counts are on the gateway's metrics and in the `PlatformAgent`'s `status.usage` as `negativeFeedbackTotal` and `positiveFeedbackTotal` ([Observability](/kube-agents/concepts/observability/)). To read what was kept, run the gateway's export in its pod. It writes a tar with a directory per rating, each holding a draft `task.yaml` for an evaluation case and the question, answer and any note as `transcript.md`:
 
 ```bash
 kubectl exec -n kubeagents-system deploy/<name>-a2a-gateway -- \
     /gateway feedback export --since 7d > feedback.tar
 ```
+
+For an alert or report, `transcript.md` holds the post and says nobody asked, and the draft's prompt names the trigger to plant instead of a question.
 
 To turn it off, set `spec.integration.slack.answerFeedback: false` or `spec.integration.googleChat.answerFeedback: false` in the `PlatformAgent` CR, for the platform the install uses, or the chart's `platformAgent.integration.<slack|googleChat>.answerFeedback`. On an install made with `install.sh`, put that value in a `TF_VAR_extra_helm_values` line in `install.env`, for example `TF_VAR_extra_helm_values='{platformAgent={integration={googleChat={answerFeedback=false}}}}'`. Answers, alerts and reports then carry no buttons and nothing is kept. Tapping a button already posted counts nothing, keeps nothing and opens no box; Slack still highlights the tapped button. Ratings kept before you turned it off stay until the bucket drops them.
 

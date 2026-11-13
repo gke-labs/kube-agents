@@ -124,8 +124,6 @@ var usageExportFields = []usageExportField{
 	{name: "backgroundTasksGaveUpTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.BackgroundTasksGaveUpTotal })},
 	{name: "negativeFeedbackTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.NegativeFeedbackTotal })},
 	{name: "positiveFeedbackTotal", read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.PositiveFeedbackTotal })},
-	{name: usageCounterAutonomousNegativeFeedback, read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.AutonomousNegativeFeedbackTotal })},
-	{name: usageCounterAutonomousPositiveFeedback, read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.AutonomousPositiveFeedbackTotal })},
 	{name: usageCounterInputTokens, read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.InputTokensTotal })},
 	{name: usageCounterOutputTokens, read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.OutputTokensTotal })},
 	{name: usageCounterSpendMicros, read: usageInt(func(u *agentv1alpha1.AgentUsageStatus) int64 { return u.SpendMicrosUSDTotal })},
