@@ -15,8 +15,9 @@ on the listener the operator's usage poller reads, and the poller sets the
 PlatformAgent's ``KanbanDispatcherFailing`` condition from it.
 
 The corrupt-board path upstream quarantines is not counted: it logs its own
-error and pauses the board, and a quarantined board's skipped ticks leave its
-streak as it was.
+error and pauses the board. That tick ends with no result, and the registry
+then stops counting the board's other tries, so a quarantine that lasts drops
+the board's streak and its stuck state after the stale window.
 
 Never raises: the dispatcher must run as upstream ships it when the plugin is
 absent. The registry is the one ``chat_turn_metrics`` finds, reached the same

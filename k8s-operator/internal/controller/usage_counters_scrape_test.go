@@ -1515,6 +1515,16 @@ func TestPodUsageSource_ReadsTheDispatchersFailingBoards(t *testing.T) {
 	if reading.Dispatcher == nil || len(reading.Dispatcher.Failing) != 0 || !reflect.DeepEqual(reading.Dispatcher.Stuck, wantStuck) {
 		t.Fatalf("stuck dispatcher = %+v, want %+v and no failing boards", reading.Dispatcher, wantStuck)
 	}
+	// More stuck boards than the ceiling is a broken body, as it is for streaks.
+	manyStuck := make([]string, 0, usageDispatcherBoardCeiling+1)
+	for i := 0; i <= usageDispatcherBoardCeiling; i++ {
+		manyStuck = append(manyStuck, fmt.Sprintf(`kubeagents_kanban_dispatcher_stuck_seconds{board="b%d"} 400`, i))
+	}
+	_, err = scrape(chat(manyStuck...), usageChatCounters)
+	var stuckCeilingErr *usageScrapeError
+	if !errors.As(err, &stuckCeilingErr) || stuckCeilingErr.Kind != usageScrapeKindSample {
+		t.Fatalf("past the stuck-board ceiling: err %v, want a sample error", err)
+	}
 	_, err = scrape(chat(`kubeagents_kanban_dispatcher_stuck_seconds{board="default"} 1e20`), usageChatCounters)
 	var stuckErr *usageScrapeError
 	if !errors.As(err, &stuckErr) || stuckErr.Kind != usageScrapeKindSample {

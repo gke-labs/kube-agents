@@ -59,7 +59,11 @@ const (
 	kanbanDispatcherStuckLimit = 300 * time.Second
 
 	kanbanDispatcherReasonTicksFailing = "TicksFailing"
-	kanbanDispatcherReasonTicking      = "Ticking"
+	// kanbanDispatcherReasonTickStuck is the True reason while any board is
+	// stuck. Its own reason, so that the poller rewrites the message and its
+	// hint when the cause changes between a streak and a stuck board.
+	kanbanDispatcherReasonTickStuck = "TickStuck"
+	kanbanDispatcherReasonTicking   = "Ticking"
 
 	// kanbanDispatcherLabelMax bounds the board and error class the message
 	// quotes, both label values off the listener.
@@ -98,10 +102,10 @@ func kanbanDispatcherBoardFailing(f usageDispatcherFailure) bool {
 }
 
 // kanbanDispatcherCondition is the condition a reading calls for, given the
-// one the CR carries. True while a board's streak meets a streak rule or a
-// board is stuck; False once no board does, but only on a CR that carried the
-// condition, so an agent whose dispatcher never failed or stuck gets none. nil
-// means leave the CR as it is.
+// one the CR carries. True while a board is stuck (reason TickStuck) or a
+// board's streak meets a streak rule (reason TicksFailing); False once no
+// board does, but only on a CR that carried the condition, so an agent whose
+// dispatcher never failed or stuck gets none. nil means leave the CR as it is.
 func kanbanDispatcherCondition(agent *agentv1alpha1.PlatformAgent, reading *usageDispatcherReading) *metav1.Condition {
 	var worst *usageDispatcherFailure
 	failing := 0
@@ -134,13 +138,16 @@ func kanbanDispatcherCondition(agent *agentv1alpha1.PlatformAgent, reading *usag
 		}
 	}
 	cond := &metav1.Condition{Type: kanbanDispatcherFailingCondition, ObservedGeneration: agent.Generation}
-	if worst == nil && stuck != nil {
+	// A stuck board wins over a streak, also on the same board: a locked board
+	// meets a streak rule too after about an hour, and its cause is still the
+	// lock, so it keeps the stuck message and hint.
+	if stuck != nil {
 		msg := fmt.Sprintf("A kanban dispatcher tick on board %q waited on its database (it ran past %s, or failed on a lock after a busy timeout), and no good tick has followed in the %s since it began; the board may be locked.",
 			kanbanDispatcherLabel(stuck.Board), kanbanDispatcherStuckLimit, time.Duration(stuck.Seconds)*time.Second)
 		if failing > 1 {
 			msg += fmt.Sprintf(" %d boards are failing.", failing)
 		}
-		cond.Status, cond.Reason, cond.Message = metav1.ConditionTrue, kanbanDispatcherReasonTicksFailing, msg+" "+kanbanDispatcherStuckHint
+		cond.Status, cond.Reason, cond.Message = metav1.ConditionTrue, kanbanDispatcherReasonTickStuck, msg+" "+kanbanDispatcherStuckHint
 		return cond
 	}
 	if worst != nil {
@@ -166,8 +173,8 @@ func kanbanDispatcherCondition(agent *agentv1alpha1.PlatformAgent, reading *usag
 }
 
 // projectKanbanDispatcher writes the condition when its status or reason
-// changed. The message is left as written while the status holds, as the data
-// volume's is. The patch carries the resource version, because it replaces
+// changed. The message is left as written while both hold, as the data
+// volume's is; a change of cause changes the reason, so the message follows it. The patch carries the resource version, because it replaces
 // the conditions list whole; a conflict is left for the next poll.
 func (p *UsageCounterPoller) projectKanbanDispatcher(ctx context.Context, agent *agentv1alpha1.PlatformAgent, reading *usageDispatcherReading) error {
 	if reading == nil {

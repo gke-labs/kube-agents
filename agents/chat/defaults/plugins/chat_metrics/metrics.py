@@ -149,7 +149,8 @@ KANBAN_DISPATCHER_FAILING_SECONDS_METRIC = "kubeagents_kanban_dispatcher_failing
 # A board with no tick in progress whose last failure is older than this is
 # dropped at render: the dispatcher stopped ticking it (archived, quarantined as
 # corrupt, or the dispatcher paused), and no good tick will come to end its
-# streak.
+# streak. The ready probe and auto-decompose still reach a quarantined board;
+# they do not count as tries while it is quarantined (record_dispatch_tick_end).
 DISPATCH_FAILURE_STALE_SECONDS = 600.0
 # The streak's age stops growing this long after the board was last tried, so a
 # board the dispatcher stopped trying cannot age into the condition on a few
@@ -160,8 +161,9 @@ DISPATCH_FAILURE_AGE_GRACE_SECONDS = 250.0
 # 20 to 36 minutes apart on a fully locked board, build a streak. Only the tick
 # counts: auto-decompose can run a model call per board, so a long one can be
 # healthy. A board stays stuck through its later tries and ticks until a good
-# tick, or until the dispatcher stops trying it (DISPATCH_FAILURE_STALE_SECONDS);
-# the value is the seconds since the stuck tick began. The operator sets
+# tick, until a tick fails for another reason without such a wait, or until the
+# dispatcher stops trying it (DISPATCH_FAILURE_STALE_SECONDS), which a corrupt
+# quarantine counts as; the value is the seconds since the stuck tick began. The operator sets
 # KanbanDispatcherFailing for a stuck board (usage_counters_scrape.go's
 # kanbanDispatcherStuckSecondsSeries).
 KANBAN_DISPATCHER_STUCK_SECONDS_METRIC = "kubeagents_kanban_dispatcher_stuck_seconds"
@@ -179,9 +181,14 @@ STUCK_TICK_SECONDS = 300.0
 # only after waiting a full timeout (about 242 s per tick, two timeouts, on a
 # board in rollback-journal mode in the live runs), a good tick never fails, and
 # a fast failure, or a slow one of another kind, is left to the streak rules.
-# 120 s is Hermes' DEFAULT_BUSY_TIMEOUT_MS (hermes_cli/kanban_db_connect.py),
-# which HERMES_KANBAN_BUSY_TIMEOUT_MS can change; the gateway does not set it.
+# The floor is Hermes' busy timeout for the board: DEFAULT_BUSY_TIMEOUT_MS
+# (hermes_cli/kanban_db_connect.py), 120 s, unless HERMES_KANBAN_BUSY_TIMEOUT_MS
+# changes it. The dispatcher runs in this process, so the registry reads the
+# same variable when it is made (stuck_lock_wait_seconds).
 STUCK_LOCK_WAIT_SECONDS = 120.0
+KANBAN_BUSY_TIMEOUT_ENV = "HERMES_KANBAN_BUSY_TIMEOUT_MS"
+KANBAN_BUSY_TIMEOUT_MINIMUM_MS = 1
+MILLISECONDS_PER_SECOND = 1000.0
 PROCESS_START_TIME_METRIC = "process_start_time_seconds"
 PROCESS_START_TIME_SECONDS = time.time()
 METRICS_PATH = "/metrics"
@@ -353,6 +360,23 @@ def platform_label(hermes_platform: str) -> str:
     return HERMES_PLATFORM_LABELS.get(str(hermes_platform or "").strip().lower(), LABEL_OTHER)
 
 
+def stuck_lock_wait_seconds() -> float:
+    """The lock rule's floor: Hermes' busy timeout for the board, in seconds.
+
+    Read as Hermes reads it (kanban_db._env_int): an integer number of
+    milliseconds; absent, empty, not an integer or below the minimum is the
+    default."""
+    raw = os.environ.get(KANBAN_BUSY_TIMEOUT_ENV, "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+        except ValueError:
+            return STUCK_LOCK_WAIT_SECONDS
+        if parsed >= KANBAN_BUSY_TIMEOUT_MINIMUM_MS:
+            return parsed / MILLISECONDS_PER_SECOND
+    return STUCK_LOCK_WAIT_SECONDS
+
+
 class ChatMetrics:
     """Four counters, by platform: inbound messages, new sessions, errored turns
     and thumbs-downs; the board's gave_up cards and the proposals ledger, read
@@ -367,6 +391,7 @@ class ChatMetrics:
         self._kanban = kanban or KanbanGaveUpCounter()
         self._proposals = proposals or ProposalsOpenedGauge()
         self._clock = clock
+        self._lock_wait_seconds = stuck_lock_wait_seconds()
         self._lock = threading.Lock()
         self._inbound: dict[str, int] = {}
         self._sessions: dict[str, int] = {}
@@ -382,6 +407,9 @@ class ChatMetrics:
         self._dispatch_tick_started: dict[str, float] = {}
         # stuck board -> [when the stuck tick began, when its last try ended]
         self._dispatch_stuck: dict[str, list[float]] = {}
+        # boards in the corrupt-board quarantine that still have a streak or a
+        # stuck state: their ready-probe and auto-decompose tries do not count
+        self._dispatch_quarantined: set[str] = set()
 
     def prime(self) -> None:
         """Take the board's baseline now rather than at the first scrape."""
@@ -409,6 +437,8 @@ class ChatMetrics:
         set) adds one to the board's streak; a good tick (``""``) ends it.
         ``locked`` says the failure was a database lock or busy error."""
         with self._lock:
+            # A tick with a result, good or failed, ends a quarantine.
+            self._dispatch_quarantined.discard(board)
             if not error_class:
                 self._dispatch_failures.pop(board, None)
                 self._dispatch_tried.pop(board, None)
@@ -419,12 +449,16 @@ class ChatMetrics:
             now = self._clock()
             # A failed tick that ran past the limit leaves the board stuck,
             # also when no scrape saw it running, and so does a lock failure
-            # after a full busy timeout.
+            # after a full busy timeout. A failure of another kind that did
+            # neither ends the stuck state: the board no longer waits on its
+            # database, and its streak carries the new cause.
             tick_started = self._dispatch_tick_started.pop(board, None)
             if tick_started is not None:
                 ran = now - tick_started
-                if ran > STUCK_TICK_SECONDS or (locked and ran >= STUCK_LOCK_WAIT_SECONDS):
+                if ran > STUCK_TICK_SECONDS or (locked and ran >= self._lock_wait_seconds):
                     self._dispatch_stuck.setdefault(board, [tick_started, now])
+                elif not locked:
+                    self._dispatch_stuck.pop(board, None)
             streak, _, at, began = self._dispatch_failures.get(board, (0, "", 0.0, now))
             # The gap that counts is from the last try before this one to this
             # try's start; a locked board's tries follow each other closely even
@@ -443,8 +477,6 @@ class ChatMetrics:
             stuck = self._dispatch_stuck.get(board)
             if stuck is not None and board not in self._dispatch_ticking and now - stuck[1] > DISPATCH_FAILURE_STALE_SECONDS:
                 del self._dispatch_stuck[board]
-            if tick:
-                self._dispatch_tick_started[board] = now
             if board in self._dispatch_failures and board not in self._dispatch_ticking:
                 # Drop a streak past the window first, as render() would have:
                 # this try must not carry it on.
@@ -452,6 +484,14 @@ class ChatMetrics:
                 if now - max(at, self._dispatch_tried.get(board, at)) > DISPATCH_FAILURE_STALE_SECONDS:
                     del self._dispatch_failures[board]
                     self._dispatch_tried.pop(board, None)
+            if board not in self._dispatch_failures and board not in self._dispatch_stuck:
+                self._dispatch_quarantined.discard(board)
+            if board in self._dispatch_quarantined and not tick:
+                # A quarantined board's ready probe or auto-decompose: not a
+                # try, so it does not keep the streak or the stuck state.
+                return
+            if tick:
+                self._dispatch_tick_started[board] = now
             self._dispatch_ticking[board] = now
 
     def record_dispatch_tick_end(self, board: str) -> None:
@@ -460,11 +500,24 @@ class ChatMetrics:
             self._dispatch_ticking.pop(board, None)
             # A tick still marked here recorded no result (record_dispatch_tick
             # takes the mark): the corrupt-board branch, which quarantines the
-            # board and is not counted. A stuck state this tick set goes with it.
+            # board for five minutes at a time. Hermes takes that branch also
+            # when a race makes a board look corrupt for one tick, so the
+            # streak and the stuck state stay. But while the board is
+            # quarantined, this tick and the other tries, which still reach the
+            # board, do not refresh them: a quarantine that lasts drops the
+            # board after the stale window, and a short one keeps it whole. A
+            # stuck state that this very tick set (a scrape saw it past the
+            # limit) goes at once: the tick was not a wait on a lock.
             tick_started = self._dispatch_tick_started.pop(board, None)
-            stuck = self._dispatch_stuck.get(board)
-            if tick_started is not None and stuck is not None and stuck[0] == tick_started:
-                del self._dispatch_stuck[board]
+            if tick_started is not None:
+                stuck = self._dispatch_stuck.get(board)
+                if stuck is not None and stuck[0] == tick_started:
+                    del self._dispatch_stuck[board]
+                if board in self._dispatch_failures or board in self._dispatch_stuck:
+                    self._dispatch_quarantined.add(board)
+                return
+            if board in self._dispatch_quarantined:
+                return
             if board in self._dispatch_failures:
                 self._dispatch_tried[board] = self._clock()
             if board in self._dispatch_stuck:
@@ -496,6 +549,7 @@ class ChatMetrics:
                           if b not in self._dispatch_ticking and now - tried > DISPATCH_FAILURE_STALE_SECONDS]:
                 del self._dispatch_stuck[board]
             dispatch_stuck = sorted((b, since) for b, (since, _) in self._dispatch_stuck.items())
+            self._dispatch_quarantined.intersection_update(set(self._dispatch_failures) | set(self._dispatch_stuck))
         lines = [
             f"# HELP {CHAT_INBOUND_METRIC} Chat messages that reached the gateway's dispatch hook, by platform.",
             f"# TYPE {CHAT_INBOUND_METRIC} counter",
@@ -553,7 +607,7 @@ class ChatMetrics:
             age = min(now, live[board] + DISPATCH_FAILURE_AGE_GRACE_SECONDS) - began
             lines.append(f'{KANBAN_DISPATCHER_FAILING_SECONDS_METRIC}{{{BOARD_LABEL}="{_label_value(board)}",{ERROR_LABEL}="{_label_value(error_class)}"}} {int(max(0.0, age))}')
         lines += [
-            f"# HELP {KANBAN_DISPATCHER_STUCK_SECONDS_METRIC} Seconds since a kanban dispatcher tick began that ran longer than {int(STUCK_TICK_SECONDS)} s, or failed on a database lock after at least {int(STUCK_LOCK_WAIT_SECONDS)} s, on a board, until a good tick or the dispatcher stops trying the board.",
+            f"# HELP {KANBAN_DISPATCHER_STUCK_SECONDS_METRIC} Seconds since a kanban dispatcher tick began that ran longer than {int(STUCK_TICK_SECONDS)} s, or failed on a database lock after at least {self._lock_wait_seconds:g} s, on a board, until a good tick, a quick failure of another kind, or ten minutes with no try that counts.",
             f"# TYPE {KANBAN_DISPATCHER_STUCK_SECONDS_METRIC} gauge",
         ]
         for board, since in dispatch_stuck:
