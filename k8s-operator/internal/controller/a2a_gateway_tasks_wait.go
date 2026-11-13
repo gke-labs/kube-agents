@@ -117,7 +117,41 @@ type a2aGatewayLeaderRead struct {
 // The Lease comes from the cache (the operator watches it), the pod from
 // the live reader, since its readiness is the question. A read that failed
 // for another reason is returned as the error.
+//
+// Within a status pass (withA2AGatewayLeaderMemo) the first read is kept and
+// returned to every later caller, so Ready and the TASKS-wait reason judge
+// the same holder from one live pod read.
 func (r *PlatformAgentReconciler) a2aGatewayLeader(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (*a2aGatewayLeaderRead, error) {
+	memo, _ := ctx.Value(a2aGatewayLeaderMemoKey{}).(*a2aGatewayLeaderMemo)
+	if memo != nil && memo.done {
+		return memo.read, memo.err
+	}
+	read, err := r.readA2AGatewayLeader(ctx, agent)
+	if memo != nil {
+		memo.read, memo.err, memo.done = read, err, true
+	}
+	return read, err
+}
+
+// a2aGatewayLeaderMemoKey and a2aGatewayLeaderMemo hold one status pass's
+// leader read (a2aGatewayLeader).
+type a2aGatewayLeaderMemoKey struct{}
+
+type a2aGatewayLeaderMemo struct {
+	read *a2aGatewayLeaderRead
+	err  error
+	done bool
+}
+
+// withA2AGatewayLeaderMemo scopes one leader read to the context's lifetime:
+// the status pass that calls it. Not safe for concurrent callers; a pass is
+// one goroutine.
+func withA2AGatewayLeaderMemo(ctx context.Context) context.Context {
+	return context.WithValue(ctx, a2aGatewayLeaderMemoKey{}, &a2aGatewayLeaderMemo{})
+}
+
+// readA2AGatewayLeader is a2aGatewayLeader's read, unmemoised.
+func (r *PlatformAgentReconciler) readA2AGatewayLeader(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (*a2aGatewayLeaderRead, error) {
 	lease := &coordinationv1.Lease{}
 	if err := r.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aGatewayLeaseName(agent)}, lease); err != nil {
 		if apierrors.IsNotFound(err) {

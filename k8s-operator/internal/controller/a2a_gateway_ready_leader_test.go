@@ -294,3 +294,34 @@ func TestAFailedLeaderReadFallsBackToTheDeployment(t *testing.T) {
 		t.Errorf("gateway counted %d ready on a failed leader read, want the Deployment's 1", w.ready)
 	}
 }
+
+// One status pass reads the leader's pod once: Ready and the TASKS-wait
+// reason both ask, in the live shape where both do (count split, bus
+// provisioned, NATS up), and must judge the same holder.
+func TestOneStatusPassReadsTheLeaderOnce(t *testing.T) {
+	r, stored, state := settledA2AInstall(t)
+	ctx := context.Background()
+	haGateway(t, r, stored, 2, 1)
+	agentGatewayReady(t, r, stored)
+	leader := waitingLeader(t, r, stored, 10*time.Minute)
+	standbyGateway(t, r, stored)
+	reads := 0
+	counting := interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*corev1.Pod); ok && key.Name == leader.Name {
+				reads++
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
+	counted := &PlatformAgentReconciler{Client: counting, APIReader: counting, Scheme: r.Scheme}
+	if _, _, err := counted.updateStatusReady(ctx, stored, "", otlpSourceNone, counted.resolveNetpolProfile(ctx, stored), state); err != nil {
+		t.Fatal(err)
+	}
+	if d := meta.FindStatusCondition(stored.Status.Conditions, degradedConditionType); d == nil || d.Reason != conditionReasonA2AGatewayWaitingForTasks {
+		t.Fatalf("precondition: Degraded = %+v, want the TASKS wait, so both consumers ran", d)
+	}
+	if reads != 1 {
+		t.Errorf("leader pod read %d times in one pass, want 1", reads)
+	}
+}

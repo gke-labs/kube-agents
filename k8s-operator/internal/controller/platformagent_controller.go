@@ -4835,6 +4835,9 @@ func (r *PlatformAgentReconciler) liveAgentSatisfies(ctx context.Context, agent 
 // provisioning Job is complete and what it is called, so the status write neither
 // re-reads the Job nor re-renders it to learn its name.
 func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *agentv1alpha1.PlatformAgent, otlpEndpoint, otlpSource string, netpolProfile netpolProfile, a2a a2aProvisionState) (string, time.Duration, error) {
+	// One leader read for the whole pass: Ready (readSplitWorkloads) and the
+	// TASKS-wait reason both ask, and should see the same holder.
+	ctx = withA2AGatewayLeaderMemo(ctx)
 	newDeploymentStatusName := ""
 	newDeploymentStatusReadyReplicas := int32(0)
 	var errWorkload error
