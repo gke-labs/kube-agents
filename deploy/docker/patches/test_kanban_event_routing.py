@@ -189,6 +189,13 @@ class CompressedSessionTest(unittest.TestCase):
         self.assertEqual(got, ("api_server", "a2a-ctx-1", None))
         self.assertTrue(any("no notifier serves" in line for line in logs.output), logs.output)
 
+    def test_a_route_on_any_platform_the_list_names_is_delivered(self):
+        with mock.patch.dict("os.environ", {"A2A_NOTIFY_CONVERSATIONS": "google_chat,slack"}):
+            self.assertEqual(
+                resolve_chat_route("api_server", "a2a-ctx-1", None, db_path=self.db),
+                ("slack", "a2a-ctx-1", "slack:dm/D1"),
+            )
+
     def test_a_console_card_reports_to_its_conversation_naming_the_turn(self):
         # The console's route is served whatever A2A_NOTIFY_CONVERSATIONS names
         # (here slack), and the card snapshots the turn's task after '#'.
