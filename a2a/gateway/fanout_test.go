@@ -966,3 +966,53 @@ func TestALongQuestionIsCutAndSaysSo(t *testing.T) {
 		t.Fatalf("the cut question isn't named: %s", got[:min(len(got), 600)])
 	}
 }
+
+// TestAWithdrawnBatchLeavesAChildThatAlreadyEndedAlone: a batch cut short
+// by a restart whose first child has already ended is withdrawn when its
+// request comes back another size. The ended child gets no cancel and no
+// second terminal line, and it leaves the parent's children, so the
+// parent's own end can end the chain.
+func TestAWithdrawnBatchLeavesAChildThatAlreadyEndedAlone(t *testing.T) {
+	t.Parallel()
+	r, spawn := startBatchRig(t, 3)
+	ctx := context.Background()
+	conv := "discord:g1/t-fanout-ended-withdraw"
+	r.g.beforeBatchChild = func(i int) bool { return i == 1 }
+	exec, origin, _ := sessionTurn(t, r, spawn, conv, "x")
+	if err := exec.PublishArtifact(ctx, delegateBatchArtifact(t, platformTask("one"), platformTask("two"), platformTask("three"))); err != nil {
+		t.Fatal(err)
+	}
+	first := awaitSubmission(t, r, targetPlatform, 0)
+	waitFor(t, "the cut-short mint", loggedContaining(r, "delegation batch cut short"))
+	r2, _ := restartRig(t, r)
+	child := r2.execFor(t, first, targetPlatform)
+	if err := child.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the first child's end recorded", func() bool {
+		rec, _ := r2.g.reg.Get(ctx, conv)
+		ref, ok := rec.TaskRefFor(first.TaskID)
+		return ok && ref.BatchEnd != nil
+	})
+	if err := exec.PublishArtifact(ctx, delegateBatchArtifact(t, platformTask("one"), platformTask("two"))); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the batch withdrawn", func() bool {
+		rec, _ := r2.g.reg.Get(ctx, conv)
+		pref, _ := rec.TaskRefFor(origin.TaskID)
+		return pref.DelegationEnd != ""
+	})
+	for _, e := range inSubjectEnvelopes(t, r2.url, targetPlatform) {
+		if e.Kind == lib.KindCancel && e.TaskID == first.TaskID {
+			t.Fatalf("a cancel went to child %s, which had already ended", first.TaskID)
+		}
+	}
+	if n := strings.Count(r2.logs.String(), "task terminal") - strings.Count(strings.ReplaceAll(r2.logs.String(), first.TaskID, ""), "task terminal"); n > 1 {
+		t.Fatalf("child %s has %d terminal lines, want 1", first.TaskID, n)
+	}
+	rec, _ := r2.g.reg.Get(ctx, conv)
+	pref, _ := rec.TaskRefFor(origin.TaskID)
+	if len(pref.Children) != 0 {
+		t.Fatalf("the parent still links %v after the withdrawal", pref.Children)
+	}
+}
