@@ -944,6 +944,13 @@ func (a *GoogleChatAdapter) Roster(conversation string) ([]string, bool, error) 
 	return ids, out.NextPageToken == "", nil
 }
 
+// AnswersOnLine is true for every Google Chat conversation (LineAnswerer):
+// the adapter draws no reaction and no Working… status, so the task's line
+// is the ask's one receipt, and it ends as the reaction would come off. The
+// proxy refuses to delete a message (its destructive-method rule), so the
+// line cannot go; it becomes the hand-off acknowledgement, or a bare mark.
+func (a *GoogleChatAdapter) AnswersOnLine(string) bool { return true }
+
 // React and RemoveReaction draw no mark on Google Chat: its relay holds app
 // credentials, and Chat's reaction API takes user credentials only, so a nil
 // no-op (Adapter).

@@ -1,0 +1,20 @@
+# Binds the namespaced half of the generated manager role: the Role document
+# in role.yaml, which carries the operator's Secret write verbs in the install
+# namespace. The ClusterRole half is bound by role_binding.yaml. Both come
+# from the same +kubebuilder:rbac markers; a marker with `namespace=` lands
+# here, one without lands in the ClusterRole.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/name: kube-agents-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: manager-namespaced-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: manager-role
+subjects:
+  - kind: ServiceAccount
+    name: controller
+    namespace: system

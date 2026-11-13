@@ -338,9 +338,9 @@ jq -r '.images[] | select(.tagFrom) | "\(.name)\t\(.tagFrom.file)\t\(.tagFrom.ke
 # 2. The pins compiled into the operator. Each is an image the operator falls
 #    back to when its env var is unset, so a drift here mirrors the wrong tag
 #    with nothing to catch it at render time. fluent-bit reaches every agent
-#    pod. nats, nats-box and the config reloader reach only a `spec.mode: next` install, which no
-#    chart render in check 3 turns on, so this is the only check that sees
-#    them (#1557). The constants keep Docker Hub's short spelling because that
+#    pod. nats, nats-box, the config reloader and prometheus-nats-exporter reach
+#    only a `spec.mode: next` install, which no chart render in check 3 turns on,
+#    so this is the only check that sees them (#1557). The constants keep Docker Hub's short spelling because that
 #    is the string the operator renders into the pod template; the comparison
 #    is on the normalised form, the same way check 1 reads a Dockerfile ARG.
 #    The first-party next defaults (gateway, worker, callout, capability
@@ -364,6 +364,7 @@ check_operator_pin fluent-bit k8s-operator/internal/controller/manifest_helpers.
 check_operator_pin nats k8s-operator/internal/controller/platformagent_a2a_manifests.go defaultA2ANATSImage
 check_operator_pin nats-box k8s-operator/internal/controller/platformagent_a2a_manifests.go defaultA2AProvisionImage
 check_operator_pin nats-server-config-reloader k8s-operator/internal/controller/platformagent_a2a_nats_reload.go defaultA2ANATSReloaderImage
+check_operator_pin prometheus-nats-exporter k8s-operator/internal/controller/platformagent_a2a_manifests.go defaultA2ANATSExporterImage
 
 # A compiled image name for a release image the operator renders: the
 # constant must be the inventory entry's name, and the entry's repository
@@ -481,10 +482,12 @@ image_refs() {
 # registry port (host:5000/name) is not mistaken for one. ref_pin keeps the
 # digest (tag@sha256:...), because that is the form images.json pins a tag and
 # a digest together with and what the chart's default render must match byte for
-# byte. No render reaches that branch today: images.json pins four entries as
-# tag@digest — hindsight-api, hindsight-postgresql, busybox and, through
-# tags.env, the Hermes base — and the last two are build-time while the
-# Hindsight pair sits behind hindsight.enabled, which no render below turns on.
+# byte. No render reaches that branch today: images.json pins six entries as
+# tag@digest — hindsight-api, hindsight-postgresql, busybox,
+# nats-server-config-reloader, prometheus-nats-exporter and, through tags.env,
+# the Hermes base. busybox and the Hermes base are build-time, the Hindsight
+# pair sits behind hindsight.enabled, which no render below turns on, and the
+# reloader and the exporter are the operator's to render, not the chart's.
 # The branch is what keeps the comparison right when one of them does reach a
 # render.
 split_ref() {

@@ -31,11 +31,14 @@ to relabel it with. A reworded row traces to the rewording commit, so a change t
 a `pending` row a release already contains fails: to reword it, label the new text with the release
 and name its shipped commit in TRACES_FILE; to drop it, relabel it first and remove it in a later
 change. A push to main has no base to compare with, so this part runs on pull requests, merge groups
-and local runs only. Nor does it see a reword merged after a release's candidate was cut and before
-its tag: no release contains the row yet when the reword is checked. Each new row with a trace entry
-excuses one removed row of its release, so a new late row added in the same change as a removal also
-excuses it. A `pending` row no commit can be found for is reported, as any row is. A Release cell that is neither a release number nor `pending`
-fails, so a misspelt label is not skipped.
+and local runs only. Each new row with a trace entry excuses one removed row of its release, so a new
+late row added in the same change as a removal also excuses it. The rule also reads open release
+candidates (the pipeline's `staging_*` tags on main that the newest release does not contain): a change
+that removes a `pending` row such a candidate contains fails until that release is tagged, since the
+release will ship the old text, and no trace entry excuses it. If a release is cut from an older
+candidate than the one that holds the row, that change fails although the row does not ship. A
+`pending` row no commit can be found for is reported, as any row is. A Release cell that is neither a
+release number nor `pending` fails, so a misspelt label is not skipped.
 
 The check needs the history and the release tags, so it fails on a shallow clone or one with no
 release tag rather than pass with nothing to compare.
@@ -79,6 +82,10 @@ TABLE_LINE = re.compile(rf"^\| (?:{PENDING}|\d+\.\d+\.\d+)\s*\|\s*(?:#\d+:\s*)?(
 ADDED = "+"
 REMOVED = "-"
 RELEASE_TAG = re.compile(r"^\d+\.\d+\.\d+$")
+# A release candidate: a release is cut from one of these commits on main a day or so before its tag. The
+# shape is the release pipeline's own (STAGING_TAG_SHAPE_REGEX in scripts/release/common.sh).
+CANDIDATE_TAG = re.compile(r"^staging_[0-9]{10}_[0-9a-f]{7}$")
+CANDIDATE_GLOB = "staging_*"
 # The table's lines start with this; its first two are the header (first cells RELEASE_HEADER) and the
 # separator. The first line after it that does not start with this ends it, and so does a heading.
 RELEASE_HEADER = ("Release", "Change")
@@ -135,6 +142,17 @@ def rows(text: str) -> list[Row]:
 
 def release_tags() -> set[str]:
     return {tag for tag in git("tag", "--list").split() if RELEASE_TAG.match(tag)}
+
+
+def open_candidates(tags: set[str]) -> list[str]:
+    """The release candidates on this history that the newest release does not contain, oldest first.
+
+    The pipeline tags candidates on main and cuts each release from one, so the newest release contains
+    every earlier candidate on main. A candidate tag off main is not one the pipeline made, and is not read.
+    """
+    newest = max(tags, key=version_key)
+    listed = git("tag", "--list", "--merged", "HEAD", "--no-merged", f"refs/tags/{newest}", CANDIDATE_GLOB).split()
+    return sorted(tag for tag in listed if CANDIDATE_TAG.match(tag))
 
 
 def commits_adding(text: str) -> list[str]:
@@ -201,7 +219,8 @@ def change_key(change: str) -> str:
 
 def removed_pending_problems(base: str, tags: set[str], traced: dict[str, str],
                              base_traced: dict[str, str]) -> list[str]:
-    """The `pending` rows of the base page that a release already contains and that this change removes.
+    """The `pending` rows of the base page that a release, or an open release candidate, already contains
+    and that this change removes.
 
     A reword of such a row would otherwise trace to the rewording commit and pass. The row is excused when
     this change adds a row labelled with that release with a TRACES_FILE entry, which is how a reword is
@@ -215,6 +234,7 @@ def removed_pending_problems(base: str, tags: set[str], traced: dict[str, str],
     base_texts = {row.change for row in base_rows}
     # Rows this change adds with a trace entry: a recorded reword, if one is labelled with the release.
     recorded = [row for row in current if row.change not in base_texts and row.change in traced]
+    candidates = None  # read once, and only if a removed row is in no release
     for row in base_rows:
         if row.release != PENDING or row.change in texts:
             continue
@@ -222,6 +242,15 @@ def removed_pending_problems(base: str, tags: set[str], traced: dict[str, str],
         commit = base_traced.get(row.change.strip()) or row_commit(row.change, base)
         shipping = shipping_release(row.change, commit, tags)
         if shipping is None:
+            candidates = open_candidates(tags) if candidates is None else candidates
+            # Candidates are on main, so the one that holds the row holds the commit that added it.
+            candidate = next((tag for tag in candidates
+                              if commit and git_ok("merge-base", "--is-ancestor", commit, f"refs/tags/{tag}")), None)
+            if candidate is not None:
+                found.append(f"{UPGRADE_PAGE}: this change removes the {PENDING} row \"{row.change}\", which the "
+                             f"release candidate {candidate} already contains, so its release ships the old text. "
+                             "Keep the text until that release is tagged; then reword it with the release label and "
+                             f"an entry in {TRACES_FILE}, or relabel it first to drop it.")
             continue
         tag, by_commit = shipping
         # Each recorded row excuses one removed row; the release-row check already requires that release
@@ -465,7 +494,8 @@ def main() -> int:
         warned_traces, failed_traces = [], trace_problems
     for problem in warned_traces:
         print(WARNING_PREFIX + problem, file=sys.stderr)
-    # A change that removes a shipped `pending` row's text fails; a push has no base, so it is not read there.
+    # A change that removes the text of a `pending` row a release or an open candidate already contains
+    # fails; a push has no base, so it is not read there.
     base_traced = {change: commit for change, (_, commit) in base_entries.items()}
     removed = removed_pending_problems(base, release_tags(), traced, base_traced) if base is not None else []
     for problem in failed + failed_traces + cells + removed:

@@ -107,7 +107,7 @@ func startProfileRig(t *testing.T) *rig {
 		t.Fatal(err)
 	}
 	r := startRigWith(t, func(c *Config) { c.ScopeFile = scope; c.Namespace = "kubeagents-system" })
-	r.g.profiles.put("cluster", &lib.AgentCard{Name: "cluster", Parameters: clusterParams})
+	r.g.profiles.put("cluster", &lib.AgentCard{Name: "cluster", Parameters: clusterParams, YieldToPinned: true})
 	r.g.profiles.put("prod-east", &lib.AgentCard{Name: "prod-east", Parameters: clusterParams,
 		ClusterRef: &lib.ClusterRef{ProjectID: "p1", Location: "us-east1", Cluster: "prod"}})
 	return r
@@ -153,13 +153,13 @@ func TestProfileTurn_IsMintedForTheResolvedProfileAndSubmittedOnSubmit(t *testin
 		t.Fatalf("grant = %+v, want read for prod-east at its cluster, delegated to the dispatcher", entry)
 	}
 	// The grant answers the dispatcher's question for this task and no other.
-	if err := capability.PermitsProfile(entry, "prod-east", capability.TierRead, "project/p1/location/us-east1/cluster/prod"); err != nil {
+	if err := capability.PermitsProfile(entry, "prod-east", capability.TierRead, "project/p1/location/us-east1/cluster/prod", nil); err != nil {
 		t.Fatalf("PermitsProfile for the minted target: %v", err)
 	}
-	if err := capability.PermitsProfile(entry, "prod-east", capability.TierRead, "project/p1/location/us-east1/cluster/dev"); err == nil {
+	if err := capability.PermitsProfile(entry, "prod-east", capability.TierRead, "project/p1/location/us-east1/cluster/dev", nil); err == nil {
 		t.Fatal("the grant permits a cluster it wasn't minted for")
 	}
-	if err := capability.PermitsProfile(entry, "cluster", capability.TierRead, "project/p1/location/us-east1/cluster/prod"); err == nil {
+	if err := capability.PermitsProfile(entry, "cluster", capability.TierRead, "project/p1/location/us-east1/cluster/prod", nil); err == nil {
 		t.Fatal("the grant permits a profile it wasn't minted for")
 	}
 }

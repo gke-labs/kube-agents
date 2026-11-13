@@ -24,10 +24,13 @@
 # (k8s-operator/internal/controller/platformagent_a2a_manifests.go, cleanupA2A
 # and the a2aPreBusTeardown and a2aBusTeardown lists it walks, neither of
 # which names either object):
-#   - the JetStream PVC data-<cr>-a2a-nats-0. The NATS StatefulSet's
+#   - the JetStream PVC data-<cr>-a2a-nats-0 (a three-server bus keeps -1 and
+#     -2 the same way; this run checks -0, which every bus has). The NATS StatefulSet's
 #     volumeClaimTemplate (a2aNATSDataClaim, "data") stamps it out, so it has
-#     no owner reference, and the StatefulSet sets no PVC retention policy,
-#     whose default keeps the claim when the StatefulSet goes. The flip
+#     no owner reference, and the StatefulSet's PVC retention policy keeps
+#     claims when the StatefulSet itself is deleted (WhenDeleted: Retain), and
+#     in this release on a scale-down too (WhenScaled: Retain; #4225 changes
+#     that with the migration). The flip
 #     forward renders the same template under the same StatefulSet name, and
 #     the StatefulSet controller binds the claim of that name that is already
 #     there.
@@ -135,6 +138,22 @@ readonly AGENT_API_PROMPT="ping"
 readonly AGENT_API_ACCEPT_MARKERS="output assistant pong"
 readonly AGENT_LOCAL_PORT_DEFAULT=28541
 
+# ─── The web console ─────────────────────────────────────────────────────────
+# The deploy's console gate (hack/ci-deploy.sh, 6a), run again after pre and
+# after every leg through the probe both share (hack/web-console-probe.sh,
+# sourced below SCRIPT_DIR): the console's Deployment is rolled out, its page
+# and read routes answer, one turn through its chat route gets a reply, and
+# the session's messages show the user's row and the assistant's. The console
+# is the chart's, named off the Helm release rather than the CR
+# (<release>-web-console, charts/kube-agents/templates/web-console.yaml);
+# ROLLBACK_WEB_CONSOLE_NAME overrides the lane's release name. An install with
+# no such Service gets a SKIP: the lane installs the console, a dev install
+# may not. tests/test_rollback_roundtrip.py holds the default to the lane's
+# release.
+readonly WEB_CONSOLE_NAME_DEFAULT="kube-agents-web-console"
+readonly WEB_CONSOLE_PORT=8080
+readonly WEB_CONSOLE_LOCAL_PORT_DEFAULT=28080
+
 # ─── The bus task ────────────────────────────────────────────────────────────
 # One task through the inject door (a2aInjectPort; token under a2aInjectTokenKey
 # in the Secret beside it), awaited to its terminal by the lane's client.
@@ -194,6 +213,16 @@ readonly DEFAULT_UNSCHEDULABLE_TIMEOUT=300
 # One today turn's request, and how many fresh tunnels it gets.
 readonly DEFAULT_TURN_TIMEOUT=120
 readonly DEFAULT_TURN_ATTEMPTS=5
+# One console read route's request, and one console turn's: the latter
+# outlasts the console's own turn timeout (turnTimeout, 300 s), after which
+# the console answers 504 and the next attempt sends another turn. Two
+# tunnels, not the today turn's five: the run makes up to four console
+# checks inside the one-hour bound hack/ci-eval-pr.sh gives it, and each
+# turn is already retried inside Hermes, so the second attempt is for a
+# dropped tunnel or a turn the console cut off, not a third try at the model.
+readonly DEFAULT_CONSOLE_ROUTE_TIMEOUT=60
+readonly DEFAULT_CONSOLE_TURN_TIMEOUT=330
+readonly DEFAULT_CONSOLE_TURN_ATTEMPTS=2
 # One bus task, submission to terminal; and how many fresh tunnels a door
 # that could not be reached gets.
 readonly DEFAULT_BUS_TASK_TIMEOUT=900
@@ -213,6 +242,9 @@ readonly CLIENT_ERR_TAIL_LINES=5
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly BENCH_DIR="${SCRIPT_DIR}/../bench"
+# The web console probe assert_web_console runs, shared with the deploy's gate.
+# shellcheck source=hack/web-console-probe.sh
+source "${SCRIPT_DIR}/web-console-probe.sh"
 
 NAMESPACE="${1:-${ROLLBACK_NAMESPACE:-${DEFAULT_NAMESPACE}}}"
 CR_NAME="${2:-${ROLLBACK_CR_NAME:-${DEFAULT_CR_NAME}}}"
@@ -230,6 +262,11 @@ SETTLE_TIMEOUT="${ROLLBACK_SETTLE_TIMEOUT:-${DEFAULT_SETTLE_TIMEOUT}}"
 UNSCHEDULABLE_TIMEOUT="${ROLLBACK_UNSCHEDULABLE_TIMEOUT:-${DEFAULT_UNSCHEDULABLE_TIMEOUT}}"
 TURN_TIMEOUT="${ROLLBACK_TURN_TIMEOUT:-${DEFAULT_TURN_TIMEOUT}}"
 TURN_ATTEMPTS="${ROLLBACK_TURN_ATTEMPTS:-${DEFAULT_TURN_ATTEMPTS}}"
+CONSOLE_ROUTE_TIMEOUT="${ROLLBACK_CONSOLE_ROUTE_TIMEOUT:-${DEFAULT_CONSOLE_ROUTE_TIMEOUT}}"
+CONSOLE_TURN_TIMEOUT="${ROLLBACK_CONSOLE_TURN_TIMEOUT:-${DEFAULT_CONSOLE_TURN_TIMEOUT}}"
+CONSOLE_TURN_ATTEMPTS="${ROLLBACK_CONSOLE_TURN_ATTEMPTS:-${DEFAULT_CONSOLE_TURN_ATTEMPTS}}"
+WEB_CONSOLE_NAME="${ROLLBACK_WEB_CONSOLE_NAME:-${WEB_CONSOLE_NAME_DEFAULT}}"
+WEB_CONSOLE_LOCAL_PORT="${ROLLBACK_WEB_CONSOLE_LOCAL_PORT:-${WEB_CONSOLE_LOCAL_PORT_DEFAULT}}"
 BUS_TASK_TIMEOUT="${ROLLBACK_BUS_TASK_TIMEOUT:-${DEFAULT_BUS_TASK_TIMEOUT}}"
 BUS_TASK_ATTEMPTS="${ROLLBACK_BUS_TASK_ATTEMPTS:-${DEFAULT_BUS_TASK_ATTEMPTS}}"
 PORT_FORWARD_WAIT="${ROLLBACK_PORT_FORWARD_WAIT:-${DEFAULT_PORT_FORWARD_WAIT}}"
@@ -240,6 +277,7 @@ INJECT_LOCAL_PORT="${ROLLBACK_INJECT_LOCAL_PORT:-${INJECT_LOCAL_PORT_DEFAULT}}"
 # AGENT_INJECT_URL works: for an install already reachable from here.
 AGENT_URL="${ROLLBACK_AGENT_URL:-}"
 INJECT_URL="${ROLLBACK_INJECT_URL:-}"
+WEB_CONSOLE_URL="${ROLLBACK_WEB_CONSOLE_URL:-}"
 # Optional: every PASS, FAIL and SKIP line is appended here too.
 RESULTS_FILE="${ROLLBACK_RESULTS_FILE:-}"
 # Where the run leaves the install: next (the round trip) or today (a third
@@ -919,6 +957,47 @@ assert_today_turn() {
   fail "${name}" "no answer from ${AGENT_API_PATH} in ${TURN_ATTEMPTS} attempts; last: ${detail:0:300}"
 }
 
+# ─── The web console ─────────────────────────────────────────────────────────
+# The probe is hack/web-console-probe.sh's: WEB_CONSOLE_PROBE_RETRY for an
+# answer another tunnel or turn may change, 1 for one it would not, and
+# WEB_CONSOLE_DETAIL naming the route either way.
+assert_web_console() {
+  local name="$1" present state attempt url rc
+  present="$(k_read get svc "${WEB_CONSOLE_NAME}" --ignore-not-found -o name)" || fail "${name}" "svc/${WEB_CONSOLE_NAME} could not be read"
+  if [ -z "${present}" ]; then
+    skip "${name}" "no svc/${WEB_CONSOLE_NAME}: the install has no web console (webConsole.enabled), so nothing is checked"
+    return 0
+  fi
+  state="$(rollout_state deployment "${WEB_CONSOLE_NAME}")"
+  [ "${state}" = "ok" ] || fail "${name}" "deployment/${WEB_CONSOLE_NAME} is not rolled out: ${state}"
+  WEB_CONSOLE_BODY_FILE="$(mktemp)"
+  WEB_CONSOLE_DETAIL="no attempt ran"
+  rc=1
+  for ((attempt = 1; attempt <= CONSOLE_TURN_ATTEMPTS; attempt++)); do
+    url="${WEB_CONSOLE_URL}"
+    if [ -z "${url}" ]; then
+      if ! start_port_forward "svc/${WEB_CONSOLE_NAME}" "${WEB_CONSOLE_LOCAL_PORT}" "${WEB_CONSOLE_PORT}"; then
+        WEB_CONSOLE_DETAIL="the port-forward to svc/${WEB_CONSOLE_NAME} did not listen within ${PORT_FORWARD_WAIT}s"
+        rc="${WEB_CONSOLE_PROBE_RETRY}"
+        continue
+      fi
+      url="http://127.0.0.1:${WEB_CONSOLE_LOCAL_PORT}"
+    fi
+    rc=0
+    web_console_probe "${url}" "${CONSOLE_ROUTE_TIMEOUT}" "${CONSOLE_TURN_TIMEOUT}" || rc=$?
+    stop_port_forward
+    if [ "${rc}" -eq 0 ]; then
+      rm -f "${WEB_CONSOLE_BODY_FILE}"
+      pass "${name}" "deployment/${WEB_CONSOLE_NAME} rolled out; ${WEB_CONSOLE_DETAIL} (attempt ${attempt}/${CONSOLE_TURN_ATTEMPTS})"
+      return 0
+    fi
+    [ "${rc}" -eq "${WEB_CONSOLE_PROBE_RETRY}" ] || break
+    note "${name}: attempt ${attempt}/${CONSOLE_TURN_ATTEMPTS}: ${WEB_CONSOLE_DETAIL}"
+  done
+  rm -f "${WEB_CONSOLE_BODY_FILE}"
+  fail "${name}" "${WEB_CONSOLE_DETAIL}"
+}
+
 # ─── The bus task ────────────────────────────────────────────────────────────
 # Through the lane's own client. Exits 0 on a completed terminal, the
 # unreachable status when nothing could be submitted, 1 otherwise; prints one
@@ -1071,6 +1150,7 @@ flip_to_today() {
   wait_settled "${leg}.nothing-stuck" "${MODE_TODAY}" "${SETTLE_TIMEOUT}"
   assert_not_degraded "${leg}.not-degraded"
   assert_today_turn "${leg}.today-turn"
+  assert_web_console "${leg}.web-console"
 }
 
 # ─── The run ─────────────────────────────────────────────────────────────────
@@ -1111,6 +1191,7 @@ PVC_UID="${ASSERTED_UID}"
 assert_present "pre.creds-present" secret "${CREDS_SECRET}"
 CREDS_UID="${ASSERTED_UID}"
 assert_bus_task "pre.bus-task"
+assert_web_console "pre.web-console"
 
 # Leg 1: next -> today.
 CURRENT_LEG="leg1"
@@ -1199,6 +1280,7 @@ wait_rolled "leg2.gateway-serving" deployment "${A2A_GATEWAY_NAME}" "${ROLLOUT_T
 assert_bus_task "leg2.bus-task"
 wait_settled "leg2.nothing-stuck" "${MODE_NEXT}" "${SETTLE_TIMEOUT}"
 assert_not_degraded "leg2.not-degraded"
+assert_web_console "leg2.web-console"
 
 ROUTE="next -> today -> next"
 if [ "${END_MODE}" = "${MODE_TODAY}" ]; then
