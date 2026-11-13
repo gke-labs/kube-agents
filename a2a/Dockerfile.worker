@@ -114,7 +114,14 @@ RUN apt-get update \
          'exec /usr/local/libexec/kubectl "$@"' \
          >/usr/local/bin/kubectl \
     && chmod 0755 /usr/local/bin/kubectl
-COPY --chmod=0755 agents/platform/scripts/credential_proxy_client.py /opt/credential-proxy/libexec/credential-proxy-exec
+# credential-proxy-exec is a launcher that imports the client as a module, so
+# Python loads the client from bytecode compiled here and does not compile its
+# source at every brokered call (deploy/sandbox/Dockerfile says more).
+COPY --chmod=0755 deploy/shared/credential-proxy-exec.py /opt/credential-proxy/libexec/credential-proxy-exec
+COPY --chmod=0644 agents/platform/scripts/credential_proxy_client.py /opt/credential-proxy/libexec/credential_proxy_client.py
+RUN python3 -m compileall -q --invalidation-mode unchecked-hash /opt/credential-proxy/libexec/credential_proxy_client.py \
+    && python3 -v /opt/credential-proxy/libexec/credential-proxy-exec --help 2>&1 \
+       | grep "code object from '/opt/credential-proxy/libexec/__pycache__/credential_proxy_client\.cpython-[0-9]*\.pyc'" >/dev/null
 RUN mkdir -p /opt/credential-proxy/bin \
     && for binary in gcloud; do \
          ln -s /opt/credential-proxy/libexec/credential-proxy-exec "/opt/credential-proxy/bin/${binary}"; \
