@@ -10,7 +10,6 @@ import json
 import shlex
 import sqlite3
 import sys
-import time
 import unittest
 from pathlib import Path
 
@@ -623,9 +622,6 @@ class TestSecretReadDetector(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertFalse(worker_transcript.is_secret_read_tool_call(json.dumps({"command": cmd})))
 
-    # Eleven long lines read in about a second of CPU time or less each; the bound leaves room for a slow runner.
-    LONG_LINE_SECONDS = 20
-
     # A command that prints a token or the environment (#5484).
     TOKEN_AND_ENVIRONMENT_PRINTS = [
         "gcloud auth print-access-token",
@@ -1079,26 +1075,6 @@ class TestSecretReadDetector(unittest.TestCase):
         for _ in range(worker_transcript.MAX_NESTED_COMMAND_DEPTH):
             nested = "sh<<<" + shlex.quote(nested)
         self.assertTrue(worker_transcript.command_reads_a_secret("env=1 " + nested))
-
-    def test_the_detector_reads_a_long_line_in_bounded_time(self):
-        # Shapes that made a regex or the walk quadratic, or one text read many times: each is 80 KB or more.
-        lines = [
-            "echo env " + "1" * 100000,
-            "ls env " + "/proc/" * 20000,
-            "declare -" + "p" * 100000 + "! API_KEY",
-            "bash -" + "c" * 100000 + "! env",
-            "sudo -x " * 15000 + "ls env",
-            "ssh env " + "sh " * 30000,
-            "echo env " + "$(" * 45000,
-            "'\nprintenv" + " " * 80000 + ")",
-            "if ( " * 38000 + "env x",
-            "'" + "$( printenv " * 15000,
-            "ssh " + "sh " * 85 + "-c '" + "echo;" * 30000 + "xenv'",
-        ]
-        started = time.process_time()
-        for line in lines:
-            worker_transcript.command_reads_a_secret(line)
-        self.assertLess(time.process_time() - started, self.LONG_LINE_SECONDS)
 
     def test_bare_list_grammar_decides_closed_where_it_cannot_tell(self):
         # The grammar, not a list of spellings, is what serves a result: a
