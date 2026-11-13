@@ -13216,7 +13216,7 @@ def mcp_relay_decision(
         return mcp_policy.evaluate(server_name, message), None
     offered = mcp_policy.PROFILE_SERVER_TOOLS.get(server_name, frozenset())
     # A report credential confines nothing, so it is no task here (#5619).
-    if principal.task is None or principal.task.report_only:
+    if principal.task is None or getattr(principal.task, "report_only", False):
         return (
             command_policy.Decision(
                 allowed=False,
@@ -13453,7 +13453,7 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
             )
             return False
         task = self.principal.task
-        if task is not None and task.report_only and not report_credential_permits(self.command, self.path):
+        if task is not None and getattr(task, "report_only", False) and not report_credential_permits(self.command, self.path):
             # Default deny (REPORT_CREDENTIAL_ROUTES): a credential with no
             # target never reaches a route that confines by one.
             LOGGER.warning(
