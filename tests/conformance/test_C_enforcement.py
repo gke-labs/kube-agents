@@ -1765,8 +1765,10 @@ class C1IsolationIsStructural(unittest.TestCase):
         arrives anyway (`handleDelegateRequest`'s own comment: "the adapter
         holds the same cap", because the adapter's check is bypassable by
         anything that can reach the bus directly, so this is a second,
-        independent line of defence rather than a redundant one). Both call
-        `lib.DelegateTextCap`; a hand-typed `16 * 1024` or `16384` on either
+        independent line of defence rather than a redundant one). The
+        gateway's half runs through `lib.ValidateDelegateRequest`, which
+        caps the single task's text and every batch entry's (#5682). Both
+        reach `lib.DelegateTextCap`; a hand-typed `16 * 1024` or `16384` on either
         side compiles, passes every Go suite today, and silently stops
         agreeing with lib.DelegateTextCap's definition the day someone edits
         only that constant.
@@ -1779,16 +1781,42 @@ class C1IsolationIsStructural(unittest.TestCase):
         )
         magic_number = re.compile(r"\b16\s*\*\s*1024\b|\b16384\b")
         # Scoped to the function that makes the check, and to its code
-        # without comments (_go_code): elsewhere in delegation.go the wake's
-        # budget and two comments name the constant too, and a comment inside
-        # the function could name it beside a hand-spelled check.
-        for key, function, what in (
-            ("a2a_worker_adapter_delegate", "validateDelegate", "the worker-adapter's validateDelegate"),
-            ("a2a_gateway_delegation", "handleDelegateRequest", "the gateway's handleDelegateRequest"),
-        ):
-            body = _go_code(h.text(key), function)
-            self.assertIn("lib.DelegateTextCap", body, f"{what} no longer references the shared cap")
-            self.assertNotRegex(body, magic_number, f"{what} hand-spells the delegate text cap")
+        # without comments (_go_code): elsewhere the wake's budget and some
+        # comments name the constant too, and a comment inside a function
+        # could name it beside a hand-spelled check.
+        adapter = _go_code(h.text("a2a_worker_adapter_delegate"), "validateDelegate")
+        self.assertIn("lib.DelegateTextCap", adapter, "the worker-adapter's validateDelegate no longer references the shared cap")
+        self.assertNotRegex(adapter, magic_number, "the worker-adapter's validateDelegate hand-spells the delegate text cap")
+
+        # The gateway's half is lib's shared validator, since a request may be
+        # one task or a batch (#5682): handleDelegateRequest ignores any
+        # request lib.ValidateDelegateRequest refuses, and the validator caps
+        # the single task's text and every batch entry's.
+        gateway = _go_code(h.text("a2a_gateway_delegation"), "handleDelegateRequest")
+        self.assertRegex(
+            gateway,
+            r"lib\.ValidateDelegateRequest\(req\)\s*!=\s*nil",
+            "the gateway's handleDelegateRequest no longer refuses a request lib.ValidateDelegateRequest refuses",
+        )
+        self.assertNotRegex(gateway, magic_number, "the gateway's handleDelegateRequest hand-spells the delegate text cap")
+
+        validate = _go_code(payload, "ValidateDelegateRequest")
+        self.assertIn(
+            "validateDelegateText(r.Text)", validate,
+            "lib.ValidateDelegateRequest no longer caps a single task's text",
+        )
+        self.assertRegex(
+            validate,
+            r"for\s+\w+,\s*(\w+)\s*:=\s*range\s+r\.Tasks\s*\{[^}]*validateDelegateText\(\1\.Text\)",
+            "lib.ValidateDelegateRequest no longer caps every batch entry's text",
+        )
+        text_check = _go_code(payload, "validateDelegateText")
+        self.assertRegex(
+            text_check,
+            r"len\(text\)\s*>\s*DelegateTextCap\b",
+            "lib's validateDelegateText no longer compares the text with DelegateTextCap",
+        )
+        self.assertNotRegex(text_check, magic_number, "lib's validateDelegateText hand-spells the delegate text cap")
 
     def test_C1_the_delegate_tool_schema_names_agree_with_the_wire_shape(self) -> None:
         """The MCP tool schema and `lib.DelegateRequest` spell the same fields.
@@ -1811,27 +1839,48 @@ class C1IsolationIsStructural(unittest.TestCase):
         struct = payload.split("type DelegateRequest struct {")[1].split("\n}")[0]
         # A tag's name runs to its first comma or quote: `json:"parameters,omitempty"`.
         all_tags = sorted(re.findall(r'`json:"(\w+)[,"]', struct))
+        # Named in full, so a fifth field fails here rather than slipping past:
+        # one task's three fields, and `tasks`, the batch (#5682).
         self.assertEqual(
-            ["addressee", "parameters", "text"],
+            ["addressee", "parameters", "tasks", "text"],
             all_tags,
             "lib.DelegateRequest's wire shape changed; this test compared nothing",
         )
+        entry_tags = [t for t in all_tags if t != "tasks"]
+        task = payload.split("type DelegateTask struct {")[1].split("\n}")[0]
+        self.assertEqual(
+            entry_tags,
+            sorted(re.findall(r'`json:"(\w+)[,"]', task)),
+            "lib.DelegateTask's fields no longer match a single request's",
+        )
         mcp = h.text("a2a_worker_adapter_mcp")
         schema = mcp.split("func delegateToolSchema(")[1].split("\n}\n")[0]
-        # A property opens its own line; `additionalProperties` inside one doesn't.
+        # One task's properties are built once (entry) and used both at the
+        # top and as each batch item's. A property opens its own line;
+        # `additionalProperties` inside one doesn't.
         properties = sorted(re.findall(r'^\s*"(\w+)":\s*map\[string\]any\{"type": "(?:string|object)"', schema, re.M))
         self.assertEqual(
-            all_tags,
+            entry_tags,
             properties,
-            "the tool schema's declared properties no longer match lib.DelegateRequest's json tags",
+            "the tool schema's task properties no longer match lib.DelegateRequest's json tags",
+        )
+        self.assertRegex(
+            schema,
+            r'props\["tasks"\]\s*=\s*map\[string\]any\{\s*"type":\s*"array"',
+            "the tool schema no longer offers the batch under lib.DelegateRequest's `tasks` tag",
+        )
+        self.assertRegex(
+            schema,
+            r'"items":\s*map\[string\]any\{[^}]*"properties":\s*entry\(\)',
+            "a batch item's properties are no longer one task's",
         )
         # `parameters` is optional on both sides: platform takes none, and the
         # wire struct's tag is omitempty.
-        required_block = re.search(r'"required":\s*\[\]string\{([^}]*)\}', schema)
+        required_block = re.search(r'required\s*:=\s*\[\]string\{([^}]*)\}', schema)
         self.assertIsNotNone(required_block, "delegateToolSchema's required list moved or changed shape")
         required = sorted(re.findall(r'"(\w+)"', required_block.group(1)))
         self.assertEqual(
-            [t for t in all_tags if t != "parameters"],
+            [t for t in entry_tags if t != "parameters"],
             required,
             "the tool schema's required list no longer matches lib.DelegateRequest's json tags",
         )
