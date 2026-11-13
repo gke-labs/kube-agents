@@ -153,6 +153,26 @@ NAMESPACED_WRITE_KINDS = frozenset({
 # read in the Role is a 403 wherever the Role is not bound, and the operator
 # reads in namespaces it does not write in.
 NAMESPACED_READ_KINDS = frozenset()
+# The verbs each kind carries in the Role document. The four writes unless
+# the kind says otherwise: the Recorder creates and patches Events, the
+# dry run creates PodTemplates. One row per exception; the rest are the
+# four writes, so a verb dropped from any kind is a red row here and not
+# only in the Go parity test.
+NAMESPACED_VERBS_BY_KIND = {
+    (CORE_API_GROUP, "events"): frozenset({"create", "patch"}),
+    (CORE_API_GROUP, "podtemplates"): frozenset({"create"}),
+}
+# The kustomize deploy recipe: config/profiles is applied after config/default
+# and a failed first apply fails the target. The profile namespace's
+# release-namespace annotation is the install namespace, which the operator
+# checks against the agent's namespace before it treats the namespace as the
+# profile namespace; a wrong value renders every profile as absent.
+OPERATOR_MAKEFILE = REPO_ROOT / "k8s-operator" / "Makefile"
+PROFILES_NAMESPACE_MANIFEST = KUSTOMIZE_PROFILES_DIR / "namespace.yaml"
+DEPLOY_RECIPE_PROFILES_LINE = 'kubectl apply --server-side -f - && \\\n\t$(KUSTOMIZE) build "$$tmp/config/profiles" | kubectl apply --server-side -f -'
+RELEASE_NAMESPACE_ANNOTATION = "meta.helm.sh/release-namespace"
+PROFILE_COMPONENT_LABEL = "app.kubernetes.io/component"
+PROFILE_COMPONENT = "profiles"
 READ_VERBS = frozenset({"get", "list", "watch"})
 WRITE_VERBS = frozenset({"create", "update", "patch", "delete"})
 PLATFORM_AGENT_KIND = "PlatformAgent"
@@ -363,6 +383,36 @@ class OperatorSecretsGrantTest(unittest.TestCase):
         self.assertEqual(ROLE_KIND, copies[0].get("kind"))
         self.assertEqual(_namespaced_role(self).get("rules"), copies[0].get("rules"))
 
+    def test_every_namespaced_kind_carries_its_verbs_in_the_role_document(self):
+        # Per kind, not per rule: controller-gen folds kinds with the same
+        # verbs into one rule, so a verb dropped from one marker splits that
+        # kind out of the shared rule and this reads the union over every
+        # rule that names it.
+        role = _namespaced_role(self)
+        for kind in sorted(NAMESPACED_WRITE_KINDS):
+            with self.subTest(kind=kind):
+                verbs = {
+                    verb
+                    for rule in role.get("rules") or []
+                    if kind in _rule_kinds(rule)
+                    for verb in (rule.get("verbs") or [])
+                }
+                self.assertEqual(NAMESPACED_VERBS_BY_KIND.get(kind, WRITE_VERBS), verbs)
+
+    def test_make_deploy_applies_the_profile_kustomization_and_its_namespace_names_the_install(self):
+        # The profile namespace's Role only reaches a cluster if make deploy
+        # applies config/profiles, and the operator only trusts the namespace
+        # if its release-namespace annotation names the install namespace.
+        recipe = OPERATOR_MAKEFILE.read_text(encoding="utf-8")
+        self.assertIn(
+            DEPLOY_RECIPE_PROFILES_LINE, recipe,
+            "make deploy must apply config/profiles after config/default, joined with && so a failed first apply fails the target",
+        )
+        namespace = yaml.safe_load(PROFILES_NAMESPACE_MANIFEST.read_text(encoding="utf-8"))
+        self.assertEqual("Namespace", namespace.get("kind"))
+        self.assertEqual(INSTALL_NAMESPACE, (namespace.get("metadata", {}).get("annotations") or {}).get(RELEASE_NAMESPACE_ANNOTATION))
+        self.assertEqual(PROFILE_COMPONENT, (namespace.get("metadata", {}).get("labels") or {}).get(PROFILE_COMPONENT_LABEL))
+
     def test_the_cluster_role_grants_no_write_verb_on_a_namespaced_kind(self):
         # The general form of the Secret invariant: every kind the operator
         # renders is written in the agent's namespace or its profile namespace
@@ -516,6 +566,9 @@ class OperatorSecretsGrantTest(unittest.TestCase):
             entries[0].get("paths"),
             [
                 "k8s-operator/config/rbac/**",
+                # The Role document's copy for the profile namespace's
+                # kustomization: the same rules, the same reason.
+                str(PROFILE_ROLE_COPY.relative_to(REPO_ROOT)),
                 "k8s-operator/internal/testing/testdata/platform/expected/**",
             ],
         )

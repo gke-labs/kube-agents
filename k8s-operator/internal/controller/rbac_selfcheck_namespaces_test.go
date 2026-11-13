@@ -104,6 +104,73 @@ func TestTheProbeCoversEveryAgentNamespaceItHasHeardOf(t *testing.T) {
 	}
 }
 
+// End to end through Reconcile: an agent in the install namespace whose
+// profile namespace has no RoleBinding gets Degraded/RBACIncomplete naming
+// the profile namespace. This is the pin on reportRBACSkew reading the
+// profile namespace's denials as the agent's own: with DeniedFor asked
+// about agent.Namespace alone, the profile namespace's denials reach no
+// condition and every profile-namespace write fails forbidden in silence.
+func TestReconcileReportsAMissingRoleBindingInTheProfileNamespace(t *testing.T) {
+	const operatorNamespace = "kubeagents-system"
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       "platform-agent",
+			Namespace:  operatorNamespace,
+			Finalizers: []string{platformAgentFinalizer},
+		},
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, shellSandboxKeysSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+	// The writes are granted in the operator's namespace and nowhere else:
+	// the profile namespace, once observed, is denied every namespaced verb.
+	checker := NewRBACChecker(secretsOnlyIn(operatorNamespace).reviews(), operatorNamespace)
+	if _, err := checker.Probe(context.Background()); err != nil {
+		t.Fatalf("boot probe: %v", err)
+	}
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, RBAC: checker, OperatorNamespace: operatorNamespace}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+	ctx := context.Background()
+
+	// The agent is in the operator's namespace, so nothing is denied for it
+	// before the profile namespace enters the picture.
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("first reconcile: %v", err)
+	}
+	stored := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, stored); err != nil {
+		t.Fatalf("re-read agent: %v", err)
+	}
+	if degraded := meta.FindStatusCondition(stored.Status.Conditions, degradedConditionType); degraded != nil && degraded.Reason == reasonRBACIncomplete {
+		t.Fatalf("an agent in the operator's namespace with nothing observed must not be RBACIncomplete; got %+v", degraded)
+	}
+
+	// The fence pass over a ready profile namespace is what observes it
+	// (TestTheProfileFenceObservesAndForgetsTheProfileNamespace); here the
+	// checker is told directly, and the next reconcile has to carry the
+	// denial onto the CR, naming the profile namespace.
+	checker.Observe(profileNamespaceName(agent))
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("second reconcile: %v", err)
+	}
+	if err := cl.Get(ctx, req.NamespacedName, stored); err != nil {
+		t.Fatalf("re-read agent: %v", err)
+	}
+	degraded := meta.FindStatusCondition(stored.Status.Conditions, degradedConditionType)
+	if degraded == nil || degraded.Status != metav1.ConditionTrue || degraded.Reason != reasonRBACIncomplete {
+		t.Fatalf("expected Degraded=True/%s naming the profile namespace, got %+v", reasonRBACIncomplete, degraded)
+	}
+	for _, want := range []string{"create deployments.apps (in namespace " + profileNamespaceName(agent) + ")", "RoleBinding"} {
+		if !strings.Contains(degraded.Message, want) {
+			t.Errorf("condition message %q does not name %q", degraded.Message, want)
+		}
+	}
+}
+
 // The fence pass is where the reconcile learns the profile namespace exists,
 // so it is where the self-check starts probing it, and the pass that finds
 // it gone (a flip to today removes it with its RoleBinding) is where the
