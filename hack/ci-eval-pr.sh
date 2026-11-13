@@ -3508,6 +3508,23 @@ with open(path, "w", encoding="utf-8") as fh:
 ' "${ARTIFACT_DIR}/${REPLAY_LANE_ARMS_FILE}" "${EVAL_REPETITIONS}" "$1" "${REPLAY_LANE_SAFETY_NAMES}"
 }
 
+# run_replay_lane_live_arm: on the replay lane, the live arm runs while every
+# proxy pod's cache is still empty, so each of its requests misses and goes to
+# the model; then the cache goes in and the collector starts, and every unit
+# launched after this is replayed. A no-op off the lane. Uses the fan-out's
+# UNIT_QUEUE_LIVE and LIVE_TOTAL, set before it is called.
+run_replay_lane_live_arm() {
+  [ "${EVAL_REPLAY_LANE:-}" = "true" ] || return 0
+  if [ "${LIVE_TOTAL:-0}" -gt 0 ]; then
+    echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] the replay lane's live arm: ${LIVE_TOTAL} unit(s) of ${REPLAY_LANE_SAFETY_NAMES}, before the cache is seeded"
+    launch_units "${UNIT_QUEUE_LIVE}" "${EVAL_TASK_PARALLELISM}" "${EVAL_UNIT_LAUNCH_STAGGER_SECONDS}"
+    wait
+  fi
+  seed_replay_lane_cache || exit 1
+  write_replay_lane_arms "$(date -u +%s)"
+  start_replay_shadow_collector
+}
+
 # Which part of the nightly matrix this run takes, so the nightly can run as
 # several periodics on leased projects of their own: the cases that request a pull request
 # run one unit at a time after every other unit (unit_phase, below), and on
@@ -6057,19 +6074,7 @@ profile_begin "task fan-out: $((LIVE_TOTAL + UNIT_TOTAL + WRITER_TOTAL + SCOPE_T
 # board's created_at, which the gateway pod stamps); the install's own earlier
 # cards are left alone.
 EVAL_FANOUT_STARTED_EPOCH="$(date -u +%s)"
-# The replay lane's live arm, while every proxy pod's cache is still empty:
-# each request misses and goes to the model. Then the cache goes in, the
-# collector starts, and everything after this is replayed.
-if [ "${LIVE_TOTAL}" -gt 0 ]; then
-  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] the replay lane's live arm: ${LIVE_TOTAL} unit(s) of ${REPLAY_LANE_SAFETY_NAMES}, before the cache is seeded"
-  launch_units "${UNIT_QUEUE_LIVE}" "${EVAL_TASK_PARALLELISM}" "${EVAL_UNIT_LAUNCH_STAGGER_SECONDS}"
-  wait
-fi
-if [ "${EVAL_REPLAY_LANE:-}" = "true" ]; then
-  seed_replay_lane_cache || exit 1
-  write_replay_lane_arms "$(date -u +%s)"
-  start_replay_shadow_collector
-fi
+run_replay_lane_live_arm
 launch_units "${UNIT_QUEUE}" "${EVAL_TASK_PARALLELISM}" "${EVAL_UNIT_LAUNCH_STAGGER_SECONDS}"
 wait
 if [ "${WRITER_TOTAL}" -gt 0 ]; then

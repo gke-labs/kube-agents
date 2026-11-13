@@ -997,17 +997,22 @@ class EvalWiringTest(unittest.TestCase):
         # Every unit before the seed meets an empty cache, so it runs live.
         def at(line):
             return self.lines.index(line)
-        live = at('  launch_units "${UNIT_QUEUE_LIVE}" "${EVAL_TASK_PARALLELISM}" "${EVAL_UNIT_LAUNCH_STAGGER_SECONDS}"')
-        seed = at("  seed_replay_lane_cache || exit 1")
-        arms = at('  write_replay_lane_arms "$(date -u +%s)"')
-        collector = at("  start_replay_shadow_collector")
-        replayed = at('launch_units "${UNIT_QUEUE}" "${EVAL_TASK_PARALLELISM}" "${EVAL_UNIT_LAUNCH_STAGGER_SECONDS}"')
-        self.assertEqual(self.lines[live + 1], "  wait", "the live arm finishes before the seed")
+        start = at("run_replay_lane_live_arm() {")
+        end = self.lines.index("}", start)
+        body = self.lines[start:end]
+        self.assertEqual(body[1], '  [ "${EVAL_REPLAY_LANE:-}" = "true" ] || return 0', "a no-op off the lane")
+        live = body.index('    launch_units "${UNIT_QUEUE_LIVE}" "${EVAL_TASK_PARALLELISM}" "${EVAL_UNIT_LAUNCH_STAGGER_SECONDS}"')
+        seed = body.index("  seed_replay_lane_cache || exit 1")
+        arms = body.index('  write_replay_lane_arms "$(date -u +%s)"')
+        collector = body.index("  start_replay_shadow_collector")
+        self.assertEqual(body[live + 1], "    wait", "the live arm finishes before the seed")
         self.assertLess(live, seed)
         self.assertLess(seed, arms)
         self.assertLess(arms, collector)
-        self.assertLess(collector, replayed)
-        self.assertEqual(self.lines[seed - 1], 'if [ "${EVAL_REPLAY_LANE:-}" = "true" ]; then')
+        # The fan-out calls it right before the main queue, which is then replayed.
+        replayed = at('launch_units "${UNIT_QUEUE}" "${EVAL_TASK_PARALLELISM}" "${EVAL_UNIT_LAUNCH_STAGGER_SECONDS}"')
+        self.assertEqual(self.lines[replayed - 1], "run_replay_lane_live_arm")
+        self.assertGreater(replayed, end, "defined before the fan-out calls it")
         self.assertEqual(sum(1 for l in self.lines if l.strip() == "seed_replay_lane_cache || exit 1"), 1)
 
     # The script's decision on whether the run records, run as written: from
