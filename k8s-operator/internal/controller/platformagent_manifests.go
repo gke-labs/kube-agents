@@ -3956,6 +3956,9 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			Annotations: mergeAnnotations(defaultAnnotations, podAnnotations),
 		},
 		Spec: corev1.PodSpec{
+			// ndots:3, see brokerCallerPodDNSConfig: the relay clients here
+			// dial the broker by its 4-dot Service name.
+			DNSConfig: brokerCallerPodDNSConfig(),
 			// No ShareProcessNamespace, and under mode: next the field is
 			// load-bearing rather than a default. The agent container holds
 			// the A2A bus credential — since A5 not as NATS_PASSWORD in its

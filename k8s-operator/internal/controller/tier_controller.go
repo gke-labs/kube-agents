@@ -31,9 +31,10 @@ import (
 // tierReasonRead is the Accepted reason on a tier the operator has read.
 const tierReasonRead = "Read"
 
-// TierReconciler reports each Tier as read (#3659). Nothing consumes a tier
-// yet: the capability verifier and the gateway still use their built-in read
-// and unattended tiers, so this writes status and nothing else. The CRD's
+// TierReconciler reports each Tier as read (#3659). The PlatformAgent
+// controller renders the Tiers into the tiers file the verifier, gateway and
+// auth callout load (platformagent_a2a_tiers.go); no AgentProfile can list one
+// yet. This writes status and nothing else. The CRD's
 // schema already refuses an unknown mode or write mode and a name that isn't
 // a subject token.
 type TierReconciler struct {
@@ -53,10 +54,12 @@ func (r *TierReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		Type:               agentv1alpha1.TierConditionAccepted,
 		Status:             metav1.ConditionTrue,
 		Reason:             tierReasonRead,
-		Message:            "the operator read this tier; no component enforces tiers from CRs yet",
+		Message:            "the verifier, the gateway and the callout load this tier at its mode's verbs; no AgentProfile can list it yet",
 		ObservedGeneration: tier.Generation,
 	}
-	if tier.Status.ObservedGeneration == tier.Generation && meta.IsStatusConditionPresentAndEqual(tier.Status.Conditions, cond.Type, cond.Status) {
+	// The message too, so a tier read under an earlier message is rewritten.
+	if old := meta.FindStatusCondition(tier.Status.Conditions, cond.Type); tier.Status.ObservedGeneration == tier.Generation &&
+		old != nil && old.Status == cond.Status && old.Reason == cond.Reason && old.Message == cond.Message {
 		return ctrl.Result{}, nil
 	}
 	meta.SetStatusCondition(&tier.Status.Conditions, cond)

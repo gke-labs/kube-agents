@@ -3,7 +3,9 @@
 #
 # Each case runs once with AGENT_TRANSPORT=slack: a test user mentions the
 # install's bot in a CI channel and bench/kube_agents_bench/slack_transport.py
-# reads the thread back, timing post -> first reaction -> ack -> answer. The
+# reads the thread back, timing post -> first reaction -> ack -> answer. A
+# "then:" line adds a second turn in the same thread (BENCH_SLACK_THEN), timed
+# as slack_then_* and not graded. The
 # lane gates nothing and always exits 0; a case's result and timing land under
 # ${SLACK_LANE_ARTIFACTS}.
 #
@@ -59,10 +61,18 @@ main() {
   mkdir -p "${SLACK_LANE_ARTIFACTS}"
   local summary="${SLACK_LANE_ARTIFACTS}/${SUMMARY_FILE_NAME}"
   : >"${summary}"
-  local case_id dir log timing rc
-  while IFS= read -r case_id; do
-    case_id="${case_id%%#*}"
-    case_id="$(echo "${case_id}" | tr -d '[:space:]')"
+  local line case_id reply dir log timing rc
+  while IFS= read -r line; do
+    # "<case id>", or "<case id> then: <reply>" for a second turn in the thread;
+    # split before the comment strip, so a reply may hold a "#", but only when no
+    # "#" comes before " then: " (a commented-out reply is a comment).
+    reply=""
+    case "${line%% then: *}" in
+      "${line}" | *#*) ;;
+      *) reply="${line#* then: }"; line="${line%% then: *}" ;;
+    esac
+    line="${line%%#*}"
+    case_id="$(echo "${line}" | tr -d '[:space:]')"
     [ -n "${case_id}" ] || continue
     dir="${SLACK_LANE_ARTIFACTS}/${case_id}"
     mkdir -p "${dir}"
@@ -72,7 +82,7 @@ main() {
     # A run that fails before writing its timing must not report the last run's.
     rm -f -- "${dir}/${TIMING_FILE_NAME}" "${timing}"
     # The token reaches the child's environment only, never a file or argv.
-    (cd "${BENCH_DIR}" && AGENT_TRANSPORT=slack \
+    (cd "${BENCH_DIR}" && AGENT_TRANSPORT=slack BENCH_SLACK_THEN="${reply}" \
       BENCH_SLACK_USER_TOKEN="${token}" BENCH_SLACK_CHANNEL_ID="${channel}" BENCH_SLACK_BOT_USER_ID="${bot}" \
       KUBE_AGENTS_TIMING_FILE="${dir}/${TIMING_FILE_NAME}" BENCH_SLACK_TIMING_FILE="${timing}" \
       uv run devops-bench "./tasks/${case_id}" --agent-type kubeagents >"${log}" 2>&1) || rc=$?

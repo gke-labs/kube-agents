@@ -17,3 +17,8 @@ output "service_account_id" {
   description = "Account id of the minter's GSA (the part before the @). The chart's githubMinter.gsaName annotates the minter KSA with it, so read it from here rather than from the input: a null input selects this module's default, and the annotation has to follow whichever name the module actually created."
   value       = google_service_account.minter.account_id
 }
+
+output "workload_identity_member" {
+  description = "The Workload Identity member the minter GSA trusts: serviceAccount:<project>.svc.id.goog[<namespace>/<ksa_name>]. The pool is project-wide, so this names no cluster."
+  value       = google_service_account_iam_member.workload_identity.member
+}

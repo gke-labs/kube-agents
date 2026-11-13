@@ -375,6 +375,16 @@ func (s *stubUsageSource) setDispatcher(addr string, failing ...usageDispatcherF
 	s.readings[addr] = reading
 }
 
+// setDispatcherStuck gives addr's reading the plugin's stuck boards beside the
+// failing ones.
+func (s *stubUsageSource) setDispatcherStuck(addr string, stuck []usageDispatcherStuck, failing ...usageDispatcherFailure) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	reading := s.readings[addr]
+	reading.Dispatcher = &usageDispatcherReading{Failing: failing, Stuck: stuck}
+	s.readings[addr] = reading
+}
+
 // setDataVolume gives addr's reading the watcher's data volume series, which
 // set leaves in place.
 func (s *stubUsageSource) setDataVolume(addr string, total, free int64) {
