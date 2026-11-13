@@ -1861,6 +1861,8 @@ spec:
             - name: CREDENTIAL_PROXY_URL
             - name: CREDENTIAL_PROXY_TOKEN_FILE
               value: /var/run/secrets/kubeagents/credential-proxy/token
+            - name: KUBE_PROXY_IN_USE_URL
+              value: https://platformagent-kube-proxy.kubeagents-system.svc.cluster.local:8443
             - name: KUBE_AGENTS_MCP_RELAY_URL
               value: http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765/v1/mcp
             - name: PUBSUB_RELAY_URL
@@ -2022,7 +2024,7 @@ spec:
         - args:
             - -c
             - /fluent-bit/etc/fluent-bit.conf
-          image: fluent/fluent-bit:5.1.2
+          image: fluent/fluent-bit:5.1.5
           name: fluent-bit
           resources:
             limits:

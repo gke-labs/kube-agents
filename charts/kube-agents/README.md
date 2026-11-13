@@ -603,7 +603,8 @@ itself. With `webConsole.environment.enabled` (the default) the chart also
 renders the console's ServiceAccount, a ClusterRole that lists nodes,
 namespaces, pods and workloads, and a namespaced Role that lists ReplicaSets and
 gets/patches the `PlatformAgent` resource (for repository topology, preferred
-model annotations, and applied PR annotations). `webConsole.resources` is
+model annotations, applied PR annotations, and the `status.usage` block behind
+the banner's totals and the feedback attachment). `webConsole.resources` is
 sized to run under its requests, which is what GKE Autopilot without Pod
 bursting clamps the limits to; the console reads the memory limit the cluster
 admitted through the Downward API and sets its Go soft memory limit to nine

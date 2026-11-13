@@ -706,13 +706,18 @@ LEDGER_INSTALLATION_ID = 157029058
 GITHUB_INSTALLATION_TOKEN_URL = (
     "https://api.github.com/app/installations/{installation}/access_tokens"
 )
-# What this script's probe mint asks for: the same three reads the eval's
+# What this script's probe mint asks for: the same four reads the eval's
 # grading mint pins (LEDGER_GRADING_MINT_BODY in hack/ci-eval-pr.sh; a test
 # holds the two equal). An omitted body would mint the installation's whole
 # grant, which includes issues: write (2026-09-22, the ledger reset) and
 # pull_requests and contents write (2026-10-01, the repository reset) on every
 # pool repository; a read probe has no business holding that.
-LEDGER_READ_PERMISSIONS = {"issues": "read", "pull_requests": "read", "metadata": "read"}
+LEDGER_READ_PERMISSIONS = {
+    "issues": "read",
+    "pull_requests": "read",
+    "contents": "read",
+    "metadata": "read",
+}
 
 # Its private key, read from the cluster rather than the operator's disk: a
 # local copy answers a question nobody asked. `build-kube-agents` is the Prow
@@ -4033,7 +4038,7 @@ def _mint_ledger_token(pem: str, timeout: int = 15) -> Tuple[Optional[str], str,
     returned, never logged: it is a live credential for every repository in the
     installation.
 
-    The token is narrowed to LEDGER_READ_PERMISSIONS, the three reads grading
+    The token is narrowed to LEDGER_READ_PERMISSIONS, the four reads grading
     pins, whatever the App is granted.
     """
 

@@ -339,6 +339,19 @@ FIXTURE_NOT_READY = {
         "#5143: needs a Standard seeded cluster with a manual node pool under a ComputeClass "
         "whose auto-creation is off; the lane's host clusters are Autopilot"
     ),
+    # Needs a pool with a live node whose surge node, or green pool, draws more
+    # of a regional quota than the project has left. GKE bounds the surge by
+    # the pool's live nodes, so a zero-node pool is not a fixture; the suite's
+    # fixture rules forbid a quota edit; and the smallest honest shape, one
+    # live c3-standard-176 against C3_CPUS 300, costs about $9 an hour
+    # standing or about $7 a repetition on a per-run cluster that depends on
+    # each project's family quota. #2567 item 2 proposes the check and owns
+    # the gap; the fixture is the cost decision its case header states.
+    "upgrade-surge-bluegreen-gce-quota-exhaustion": (
+        "#2567 item 2: needs a pool with a live node whose surge node or green pool exceeds a "
+        "regional family quota; a zero-node pool surges nothing, and a populated one costs about "
+        "$9 an hour standing or about $7 a run on a per-run cluster"
+    ),
     # Needs Config Sync's RootSync CRD and one root-sync object reporting
     # Stalled=True on a seeded cluster. No pool project enables the GKE Hub
     # API, so Config Sync is installed nowhere, and the seeded fleet plants no

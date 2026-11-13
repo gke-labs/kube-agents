@@ -1229,7 +1229,7 @@ injects into every agent pod — so nothing else sets them:
 ```bash
 kubectl set env deployment/kubeagents-controller-manager -n kubeagents-system \
   PLATFORM_AGENT_IMAGE=registry.example.com/kube-agents/platform-agent:latest \
-  FLUENT_BIT_IMAGE=registry.example.com/kube-agents/fluent-bit:5.1.2
+  FLUENT_BIT_IMAGE=registry.example.com/kube-agents/fluent-bit:5.1.5
 ```
 
 The Helm chart does this for you when a registry prefix

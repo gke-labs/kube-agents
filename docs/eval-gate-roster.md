@@ -793,6 +793,11 @@ back to `next` and to `today` again before the matrix, and a rollback that fails
 The matrix is the presubmit's, roster included, so a case graded only over the api transport is
 graded there, but the job does not block a merge.
 
+Every lane's deploy installs the web console and gates it (its read routes and a chat turn through
+it): under `today` on every deploy, and under `next` as well on a deploy that runs with
+`EVAL_MODE_NEXT=1`; the round trip repeats the same checks before its first flip and after each
+leg, and skips them on an install that has no console.
+
 A check the transport blinds is the scorer's business. The harness reads no card ids, no worker's
 entries and no results off the door's trace. The delegation wait now reads the cards and the workers from the pod
 when the turn ran under the bridge's `api` executor and puts the workers' calls on the record, so the
@@ -842,7 +847,8 @@ The file needs an `eval-crew` approval, as `presubmit-cases.txt` does: it change
 pull request runs.
 
 Its mirror, `hack/eval/api-lane-exclusions.txt`, names the cases only the inject lane can carry:
-the stopped asks (a `stop` sent on the conversation during or after the opening turn,
+the stopped asks (a `stop` sent on the conversation during or after the opening turn, or an A2A
+door task cancelled while its turn holds for its cards,
 [`bench/kube_agents_bench/stop_hook.py`](../bench/kube_agents_bench/stop_hook.py)), and a case
 graded on the question a delegated card paused on, which only the inject lane's board read folds
 into the reply, and the reply-under-pushed-report replays (a report stored for the conversation

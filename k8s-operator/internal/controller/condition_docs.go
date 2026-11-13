@@ -33,6 +33,8 @@ var degradedConditionReasons = []string{
 	conditionReasonInvalidGitRepoURL,
 	conditionReasonCorruptManagedRepos,
 	conditionReasonMinterPruningHeld,
+	conditionReasonA2ABusStreamsMissing,
+	conditionReasonA2AGatewayWaitingForTasks,
 	conditionReasonInvalidCredentialProxyResources,
 	conditionReasonInvalidAgentAPIAuthResources,
 	conditionReasonInvalidShellSandboxResources,
@@ -45,7 +47,7 @@ var platformAgentConditionDocs = []conditionDoc{
 	{
 		Type:    readyConditionType,
 		Written: "Always",
-		Meaning: "Tracks `phase`; its `reason` and `message` carry whatever the reconcile is waiting on, including the reasons that park `phase: Degraded` (`RuntimeClassNotFound`, `ShellSandboxCannotBeDisabled`, `ForbiddenVolumeMount`, `EgressAllowlistRefused`, `ModeNotRecognized`, `ShellSandboxKeysMissing`, and under `mode: next` `A2AProvisionFailed`). [What `Ready` reports](#what-ready-reports) says what the last three mean and how a failed provisioning Job is cleared. Under `spec.deployment.scaleToZero: true` it reads `False` with reason `ScaledToZero` beside `phase: Paused` once the gateway has no ready replica; the same section says when.",
+		Meaning: "Tracks `phase`; its `reason` and `message` carry whatever the reconcile is waiting on, including the reasons that park `phase: Degraded` (`RuntimeClassNotFound`, `ShellSandboxCannotBeDisabled`, `ForbiddenVolumeMount`, `EgressAllowlistRefused`, `ModeNotRecognized`, `ShellSandboxKeysMissing`, and under `mode: next` `A2AProvisionFailed`). [What `Ready` reports](#what-ready-reports) says what the last three mean and how a failed provisioning Job is cleared. Under `spec.deployment.scaleToZero: true` it reads `False` with reason `ScaledToZero` beside `phase: Paused` once the gateway has no ready replica; the same section says when. Under `mode: next` with the A2A gateway's election on, the gateway counts as ready only while its elected leader is, after a 30-second grace from the leader's election; with no current leader (no holder, its pod gone, or a holder that stopped renewing) it counts its ready replicas.",
 	},
 	{
 		Type:    degradedConditionType,
@@ -87,6 +89,11 @@ var platformAgentConditionDocs = []conditionDoc{
 		Type:    busProvisionedConditionType,
 		Written: "Under `mode: next`, from the first pass that sees the bus provisioning Job complete, whichever phase that pass ends on; kept through the Job's later re-runs and removed with the stack when the mode flips to `today`",
 		Meaning: "`status: True`, `Reason: ProvisionJobComplete`. The record that lets `Ready` stop counting the Job: the finished Job is removed by its 24 h TTL and rendered again, and a spec edit renders a new one under a new digest, and neither re-run should flip a Ready install to `Provisioning` for the minute it takes. Until this condition exists the Job counts, so an install upgraded from an operator that never counted the Job (one that could read `Ready` over an unprovisioned bus) does not inherit a completion nobody saw. The message names the Job that first provisioned the bus. A re-run that fails is still reported as `A2AProvisionFailed`.",
+	},
+	{
+		Type:    busStreamsPresentConditionType,
+		Written: "Under `mode: next`, once `BusProvisioned` is True",
+		Meaning: "Whether the streams and KV buckets the provisioning Job creates are still on the bus, read every five minutes from the bus's metrics exporter on port 7777. `True`, `AllPresent`: every one was seen. `False`, `StreamsMissing`: three polls in a row found the ones the message names missing, and the operator deletes the completed provisioning Job so it runs again and recreates them (`Reprovisioning` while it runs); when the re-run recreated `TASKS`, an `A2ABusTasksRecreated` Warning and a note on this condition say to restart the A2A gateway and the agent pod, whose `TASKS` consumers don't come back on their own; the operator doesn't restart them. Re-runs are at most one per 15 minutes and three per 6 hours, recorded in the `kubeagents.x-k8s.io/a2a-bus-reprovision` annotation. A re-run that completed without bringing them back stops the re-runs for those names (`ReprovisionDidNotRestore`) until they are back or the annotation is removed; a later loss after a restore is re-run as usual. A failed Job is not re-run. While `False`, `Degraded` reads `A2ABusStreamsMissing`. `Unknown`, `DetectionUnavailable`: the bus runs without its exporter ([`A2A_NATS_EXPORTER_IMAGE`](/kube-agents/deploy/docker-images/)). `Unknown`, `ExporterUnreachable`: three polls in a row had no usable answer. No verdict is taken while the bus rolls, converts or provisions, and the condition keeps its last one meanwhile, however long that lasts; the bus's own conditions report the rollout.",
 	},
 	{
 		Type:    a2aVerifierConditionType,

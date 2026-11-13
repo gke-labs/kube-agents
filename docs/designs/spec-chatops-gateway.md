@@ -2,7 +2,7 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters, the console adapter, and the A2A door with its eval and Google sign-in identity classes); the operator renders the gateway Deployment, its env, the `A2A_SPAWN_SESSIONS` arming and the console door (`A2A_CONSOLE_DOOR=true`, so a gateway with no chat backend starts on the console alone) under `mode: next` (`platformagent_a2a_manifests.go`), with the metrics listener (`A2A_METRICS_PORT`, container port `a2a-metrics`) and the gateway's own metrics-only NetworkPolicy (the collector and the operator, on 9096) on every next gateway (see "Metrics"), plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, and under its own flag the A2A door and the same four objects (but not yet the door's Google sign-in env); and, when `spec.integration.googleChat` is enabled under `next`, the Google Chat adapter's env (the home channel the chat.notify route posts to included), its projected relay token, and the broker's side of it (the A2A relay instance on the install's one subscription, `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod); the legacy Hermes consumer is not rendered under `next`, so the composition's one Chat subscription is the whole of the Pub/Sub the install needs; and, when `spec.integration.slack` is enabled under `next` and Chat is not, the Slack adapter's env (`SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` through the CR's `botTokenSecretRef` and `appTokenSecretRef`, and the CR's `allowedUsers` as `A2A_SLACK_ALLOWED_USERS` and `A2A_SLACK_ALLOW_ALL_USERS`, and the home channel the chat.notify route posts to as `A2A_SLACK_HOME_CHANNEL`), with the legacy consumer - the broker's Socket Mode relay and the Hermes slack platform - not rendered, so one Slack app has one Socket Mode connection; and the `a2a-slack-principal-map` mount either; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); the session pod's temporary read-only cluster view (a third broker caller under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, off by default) is built, and now that gateway-side `AllowedUsers` enforcement has shipped it retires on the default flip (#2371), not at that enforcement's landing; the gateway-minted child task is built (a session asks with the `delegate` artifact; the gateway checks the platform agent's allowlist - the turn's requester, every steer author, and every author the conversation's current incarnation has seen - mints with the turn's authority and `via`, and wakes the session on the child's terminal; one child at a time, `A2A_DELEGATION_DEPTH_MAX` 3); the session pod's persona and the cluster agent's read-only GKE diagnosis skills ship in the worker image (`a2a/cmd/session-persona`); not yet the `chat` profile's own skills (discovery and standing state, below) or the default flip
+- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord, Google Chat and Slack adapters, the console adapter, and the A2A door with its eval and Google sign-in identity classes); the operator renders the gateway Deployment, its env, the `A2A_SPAWN_SESSIONS` arming and the console door (`A2A_CONSOLE_DOOR=true`, so a gateway with no chat backend starts on the console alone) under `mode: next` (`platformagent_a2a_manifests.go`), with the metrics listener (`A2A_METRICS_PORT`, container port `a2a-metrics`) and the gateway's own metrics-only NetworkPolicy (the collector and the operator, on 9096) on every next gateway (see "Metrics"), plus, under its own eval flag, the inject backend below and its Service, principal map, token Secret and gateway fence, and under its own flag the A2A door and the same four objects (but not yet the door's Google sign-in env); and, when `spec.integration.googleChat` is enabled under `next`, the Google Chat adapter's env (the home channel the chat.notify route posts to included), its projected relay token, and the broker's side of it (the A2A relay instance on the install's one subscription, `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod); the legacy Hermes consumer is not rendered under `next`, so the composition's one Chat subscription is the whole of the Pub/Sub the install needs; and, when `spec.integration.slack` is enabled under `next` and Chat is not, the Slack adapter's env (`SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` through the CR's `botTokenSecretRef` and `appTokenSecretRef`, and the CR's `allowedUsers` as `A2A_SLACK_ALLOWED_USERS` and `A2A_SLACK_ALLOW_ALL_USERS`, and the home channel the chat.notify route posts to as `A2A_SLACK_HOME_CHANNEL`), with the legacy consumer - the broker's Socket Mode relay and the Hermes slack platform - not rendered, so one Slack app has one Socket Mode connection; and the `a2a-slack-principal-map` mount either; of the pieces "Sessions by default" names as transition work, the `/session` opt-in is built (`a2a/gateway`: `/session`, `/session <text>`, `/session off`); the session pod's temporary read-only cluster view (a third broker caller under the operator's `A2A_SESSION_CLUSTER_VIEW` flag, off by default) is built, and now that gateway-side `AllowedUsers` enforcement has shipped it retires on the default flip (#2371), not at that enforcement's landing; the gateway-minted child task is built (a session asks with the `delegate` artifact; the gateway checks the platform agent's allowlist - the turn's requester, every steer author, and every author the conversation's current incarnation has seen - mints with the turn's authority and `via`, and wakes the session on the child's terminal; one live delegation per conversation, `A2A_DELEGATION_DEPTH_MAX` 3, and `A2A_DELEGATION_WIDTH_MAX` held at 1, the only value the gateway accepts until a batch's aggregated wake and stop are built); the session pod's persona and the cluster agent's read-only GKE diagnosis skills ship in the worker image (`a2a/cmd/session-persona`); not yet the `chat` profile's own skills (discovery and standing state, below) or the default flip
 
 ## Purpose
 
@@ -423,7 +423,13 @@ and the same requester.
 **The request is the reserved `delegate` artifact** on the session's own task, one `data` part
 shaped as `lib.DelegateRequest` (`{"addressee": "platform", "text": "..."}`), its text bounded at
 `lib.DelegateTextCap` (16 KiB) - the same bound the wake's result is held to in the other
-direction. The worker adapter serves it to the harness as one MCP tool, `mcp__a2a__delegate`,
+direction. A request may instead carry a batch, `{"tasks": [{"addressee", "text", "parameters"?}, …]}`,
+one entry per child, each held to the same text cap; it sets the single fields or `tasks`, never
+both. The tool offers `tasks` only when the turn's `delegateTargets` part advertises a width over
+one (`widthMax`, from `A2A_DELEGATION_WIDTH_MAX`), so a pod talking to a gateway that predates
+batches sees the single-child tool unchanged, and the adapter refuses a batch longer than the width
+it was told before anything is published. A batch is still one call, one artifact and the end of
+the turn. The worker adapter serves it to the harness as one MCP tool, `mcp__a2a__delegate`,
 over a stdio server the harness is started with via `--mcp-config` (every harness argv, with the
 tool or without it, also carries `--strict-mcp-config` and `--setting-sources user`, so no turn
 loads MCP servers or project settings from the scratch directory, which an earlier turn in a
@@ -453,7 +459,11 @@ else is refused (`delegation.target`).
 Depth is bounded by `A2A_DELEGATION_DEPTH_MAX` (default 3; a child's depth is its parent's plus
 one, and a wake inherits its child's) - `FromEnv` refuses a configured value under 1 at boot
 rather than read it as "off", which is the worker's own `A2A_DELEGATE_TOOL` switch, a different
-knob. An absent `AllowedUsers`, or one that renders as `[""]`, admits every authenticated user, the
+knob. Width, the number of children one request may ask for, is bounded by
+`A2A_DELEGATION_WIDTH_MAX`. For now `FromEnv` accepts only 1 and refuses anything wider at boot:
+a batch's children don't yet report back in one wake or stop together, so fan-out stays off until
+they do, and the ceiling it will open to is `lib.DelegateBatchMax` (16). A batch wider than the setting is refused whole,
+with a notice naming the cap, so the session can split it or choose (`delegation.width`). An absent `AllowedUsers`, or one that renders as `[""]`, admits every authenticated user, the
 same as today's ingress door; a list present but blank once its entries are trimmed and split
 admits nobody, the rule #2207 already holds for the Chat ingress list. The A2A door (backend
 `a2a`) is the exception that fails closed: its principal map admits programs, not people an
@@ -479,11 +489,21 @@ the next cold start, which fails closed. A turn whose requester is no longer on
 record (cleared at `A2A_ASK_TTL`, with its text) is left out of the primer whole, so the pod never
 reads text whose authors the check can't count. The bound is the conversation as the primer
 carries it, not one incarnation. What else a session carries across incarnations is
-#2370. One live child per conversation, a detached-but-still-running one counting as live:
-the delegating turn's own repeat is ignored and logged, while a later turn's request reaching the
-gateway while that child still runs is refused with a notice naming the running task
-(`delegation.busy`) - a human asking again deserves an answer, the turn that already got one does
-not. Every refusal names the target only, held until the delegating turn's own answer has posted
+#2370. One live delegation per conversation, a detached-but-still-running child counting as live:
+the delegating turn's own repeat, a batch included, is ignored and logged, while a later turn's
+request reaching the gateway while any child of an earlier request still runs is refused with a
+notice naming the running task (`delegation.busy`) - a human asking again deserves an answer, the
+turn that already got one does not. A batch of two or more checks every entry as a single child is
+checked (target, parameters, the lists, depth) before it mints any, so one entry that fails refuses
+the whole batch with nothing minted. Its children don't take the conversation's active task or
+its addressee: the delegating turn keeps both, and each child records its parent, which lists them
+all. A child that can't be submitted partway through withdraws the batch: the children already
+submitted are canceled and dropped from the record, except one whose cancel couldn't be published, which stays on it, marked canceled, so a stop and the reaper can still find it. A batch of one is a
+single child, which takes the active task as before. Width bounds what one conversation asks for,
+not what runs at once: children queue at the dispatcher, held to each profile's concurrency. At the
+`cluster` profile's default concurrency of 2, ten children run two at a time, about five rounds
+of one cluster task. The batch's results, gathered into one wake, and a stop that cancels every
+child are the next steps of fan-out and aren't built yet. Every refusal names the target only, held until the delegating turn's own answer has posted
 so the room reads "delegated to platform" first and the refusal after it; the audit line carries
 the rule, the backend, and the hashed subject that failed it. A steer into the running child is
 checked the same way before it is recorded or published (`delegation.child-steer`, or
@@ -699,7 +719,9 @@ refused") and submits nothing. A turn naming a profile while the conversation ha
 steered into that task. A profile task may delegate in turn, under the same checks as a session
 turn except the incarnation's author set, since a warm worker is reset between tasks. Like a
 session turn, it delegates once: a second request from the same task is dropped as a repeat,
-because nothing yet tells a new request from a redelivered one. A child's
+because nothing yet tells a new request from a redelivered one. A session turn's one request may
+be a batch (above, the delegation primitive); a profile task's may not yet, since nothing lets a
+parent waiting open take several child results. A child's
 end reaches a profile parent as a `childResult` message on the parent's `.in`, which the parent
 reads while it waits open, and the parent holds the conversation again, so a stop or a steer
 reaches it. A session parent is woken as before. A top-level profile task's own end is its
@@ -2858,7 +2880,20 @@ every message through either stamps its own backend.
   connection is answered with the task the first attempt started, and starts nothing.
 - `tasks/get` returns the `Task` as the door holds it. Scoped to the caller: a task another
   caller started is not found rather than forbidden, so the door confirms no id it will not
-  serve.
+  serve. The door holds tasks in the active gateway's memory only, so after a gateway restart
+  or a failover to another replica the new gateway doesn't know a task the old one accepted.
+  The task itself is not lost: its executor may have finished it or may still be running it.
+  Every not-found answer (`-32001`, here and for `tasks/cancel` and a follow-up's `taskId`)
+  carries `data` a client acts on without reading the message: `reason`, `servingSince` (when
+  this gateway started serving the door) and `mayHaveRun: true`. `reason` is `evicted` for the
+  caller's own task the door dropped to stay inside its bounds, and `not-held-since-serving`
+  for anything else: a task submitted before `servingSince`, the caller's own task evicted so long
+  ago that the door no longer remembers it (it keeps 4096 such ids), and equally another caller's
+  id or one no door minted, so the answer still confirms nothing. A client that resubmits with a
+  new `messageId` starts the task again and should expect possible duplicate work: the
+  `messageId` dedupe lives in the same memory, so a repeated `messageId` doesn't dedupe across a
+  restart. On the same gateway a repeated `messageId` still names the original task, so
+  resubmitting an evicted task with its original `messageId` doesn't start a new run.
 - `tasks/cancel` is a cancel turn on the task's conversation - the same `kind: cancel` envelope
   the inject door's cancel route and the chat path's `stop` publish - answered once the cancel is
   on the bus (`TaskObserver.CancelPublished`) with the `Task` as it stands. The executor decides
@@ -3017,11 +3052,19 @@ as above, and an elected gateway's term waits for the `session-state` bucket the
 (`waiting for the bus: ...`), but only for 60 seconds: past that it gives the Lease up, so a
 standby whose bus works can take it, and stands back for a lease's duration before campaigning
 again in the same process (it doesn't exit, so a bus outage puts no replica into
-CrashLoopBackOff). A standby answers 200 once it is connected and has read
+CrashLoopBackOff). A term already under way gives the Lease up too once its connection has been
+down for those 60 seconds without a break (a reconnect starts the count again), and then the process
+exits as it does on a lost Lease, so the restarted container stands by with fresh adapters and
+doors. And a leader whose relay has bound reads not Ready while its connection is down (`waiting
+for the bus: the NATS connection is down, so the bound event relay ... can't deliver`), since the
+relay delivers nothing then. In a full outage every replica reads not Ready, the leader exits once,
+and the Lease then passes between the replicas about every 84 seconds (60 of waiting, 24 of
+standing back) without any of them exiting or writing a term number, until the bus answers. A standby answers 200 once it is connected and has read
 the Lease (`standby: connected, lease held by <pod>`), so a rolling update's new pod reads Ready
 as a standby before an old one stops ([gateway-replicas.md](gateway-replicas.md)). So at two
-replicas a Ready standby keeps the Deployment, and the CR, Ready while the leader waits; the
-leader's own `/readyz` still names the wait. Its progress
+replicas a Ready standby keeps the Deployment Ready while the leader waits. The CR's `Ready` does
+not follow the standby: past a 30-second grace from the leader's election it counts the gateway not
+ready and names the leader. The leader's own `/readyz` still names the wait. Its progress
 deadline is 1800 seconds rather than Kubernetes' 600, so a wait on a slow provision Job does not
 read `ProgressDeadlineExceeded` and end a `kubectl rollout status` early; past 1800 seconds it does,
 while the gateway keeps waiting and the CR keeps reading `Provisioning`.
