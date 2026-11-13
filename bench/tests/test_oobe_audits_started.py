@@ -62,6 +62,7 @@ CREATE TABLE executions (
 )
 """
 ARMED = datetime(2026, 10, 6, 20, 0, 0, tzinfo=timezone.utc)
+NOW = datetime.now(timezone.utc).replace(microsecond=0)
 
 
 def _local_shell(script: str, timeout: float) -> str:
@@ -319,9 +320,9 @@ def test_another_jobs_run_does_not_count(store: Store) -> None:
 
 
 def test_no_state_file_and_no_own_choice_is_an_error(store: Store) -> None:
-    # The stack did not run, or ran nothing: an old chain on the install is not graded.
-    store.marker.write_text(json.dumps({"fired": list(oobe.FIRST_RUN_AUDITS), "at": ARMED.timestamp()}))
-    store.chain(ARMED)
+    # The stack did not run, or ran nothing: even a recent chain is not graded without its choice.
+    store.marker.write_text(json.dumps({"fired": list(oobe.FIRST_RUN_AUDITS), "at": NOW.timestamp()}))
+    store.chain(NOW - timedelta(minutes=30))
     result = _verify()
     assert result.status == "error"
     assert "neither armed the stage nor chose the install's own first run" in result.reason
@@ -329,7 +330,6 @@ def test_no_state_file_and_no_own_choice_is_an_error(store: Store) -> None:
 
 # --- the install's own first run (no state file) ------------------------------
 
-NOW = datetime.now(timezone.utc).replace(microsecond=0)
 
 
 def _own_record(store: Store, at: datetime, **extra) -> None:
