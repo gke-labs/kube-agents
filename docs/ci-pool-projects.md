@@ -609,8 +609,10 @@ conversation's verdict against its recording's) is in the shadow bucket under
 ([the watched periodics](ci-health.md#the-watched-periodics)), so a failed or stale run is a
 health note and a digest line. It stops red before its cases when no answer arrived, a key was
 refused or the records could not be listed (the download's summary line in the job log names
-which, by its error class), or when a proxy pod did not take the cache (the seed line above the
-error counts them).
+which, by its error class), and after its live arm when a proxy pod did not take the cache (the
+seed line above the error counts them). Its safety cases (`hack/eval/replay-lane-safety-cases.txt`)
+run live before the cache is seeded and then replayed, and `summary.txt` gives each a
+`live x/n, replayed y/n` line.
 [`hack/replay-proxy/README.md`](../hack/replay-proxy/README.md#record-and-replay-the-replay-lane)
 explains each, and how the commit is chosen. Because the lane replays on that commit, a prompt or
 normalizer change that merges after the nightlies check out `main` (00:00 UTC) doesn't change that
