@@ -1710,6 +1710,17 @@ class ReportCredentialTest(unittest.TestCase):
                 status, body = self.request(method, path)
                 self.assertNotEqual(credential_proxy.RULE_REPORT_CREDENTIAL_ROUTE, body.get("rule"), body)
 
+    def test_the_mcp_relay_treats_a_report_credential_as_no_task(self):
+        # Unreachable past the route gate; held here so the relay's own check
+        # never reads "has a task" as "is confined".
+        principal = CredentialProxyHandler.profile_gate.admit(self.principal, REPORT["token"])
+        decision, offered = credential_proxy.mcp_relay_decision(principal, "developer_knowledge", {
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "search_documents", "arguments": {"query": "x"}},
+        })
+        self.assertFalse(decision.allowed)
+        self.assertEqual(credential_proxy.RULE_TASK_CREDENTIAL, decision.rule_id)
+
     def test_a_targeted_credential_is_not_held_to_the_report_routes(self):
         self.identities = {PROFILE_SA: task_credential.ProfileIdentity("auditor", "read")}
         self.set_gate()
@@ -1774,6 +1785,19 @@ class ReportCredentialRoutesTest(unittest.TestCase):
             ("PATCH", f"{REPORT_STREAM}/latest"),
             ("POST", f"{REPORT_STREAM}/latest"),
             ("get", "/v1/audit-reports"),
+            # Escaped traversal and control characters in the store key.
+            ("PUT", "/v1/audit-reports/a/%2e%2e/latest"),
+            ("PUT", "/v1/audit-reports/a/.%2e/latest"),
+            ("PUT", "/v1/audit-reports/a/%2E/latest"),
+            ("PUT", "/v1/audit-reports/a/..%2F..%2Fetc/latest"),
+            ("PUT", "/v1/audit-reports/a/acme%2F..%2Fother/latest"),
+            ("PUT", "/v1/audit-reports/a/acme%252F%252E%252E/latest"),
+            ("PUT", "/v1/audit-reports/a/acme%2F/latest"),
+            ("PUT", "/v1/audit-reports/a/%2Facme/latest"),
+            ("PUT", "/v1/audit-reports/a/%00/latest"),
+            ("PUT", "/v1/audit-reports/a/acme%0Agitops/latest"),
+            ("PUT", "/v1/audit-reports/a/acme%7Fgitops/latest"),
+            ("PUT", "/v1/audit-reports/a/%25252525252e/latest"),
         ):
             with self.subTest(method=method, path=path):
                 self.assertFalse(credential_proxy.report_credential_permits(method, path))

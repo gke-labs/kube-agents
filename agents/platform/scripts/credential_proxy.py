@@ -2709,10 +2709,10 @@ def required_roles(path: str) -> tuple[str, ...]:
 AUDIT_REPORTS_PREFIX = "/v1/audit-reports"
 # One path segment each. An audit id is a DNS-1123 label. A store key is the
 # file store's repository directory as one URL segment (`owner%2Fname`, a
-# non-GitHub path escaped again), never `.` or `..`. A run is the ring's
-# `%Y%m%dT%H%M%S.%fZ` stamp (audit_report.REPORT_STAMP_FORMAT). The routes
-# validate each segment again; these are the allowlist's shapes, not the
-# store's checks.
+# non-GitHub path escaped again); `_report_store_key_is_plain` refuses one that
+# decodes to an empty, `.` or `..` part or a control character, in any escaping.
+# A run is the ring's `%Y%m%dT%H%M%S.%fZ` stamp
+# (audit_report.REPORT_STAMP_FORMAT). The routes validate each segment again.
 _REPORT_AUDIT_ID = r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
 _REPORT_STORE_KEY = r"(?!\.{1,2}/)[A-Za-z0-9._~%-]+"
 _REPORT_RUN_STAMP = r"[0-9]{8}T[0-9]{6}\.[0-9]{6}Z"
@@ -2740,9 +2740,33 @@ REPORT_CREDENTIAL_ROUTES: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 
+def _report_store_key_is_plain(key: str) -> bool:
+    """False for a store key that decodes, at any depth, to a traversal or a control character.
+
+    Decoded until it stops changing (a key is escaped at most twice), then
+    split on `/`: no part may be empty, `.` or `..`, and nothing may be below
+    U+0020 or be U+007F.
+    """
+    decoded = key
+    for _ in range(4):
+        step = urllib.parse.unquote(decoded)
+        if step == decoded:
+            break
+        decoded = step
+    else:
+        return False
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in decoded):
+        return False
+    return all(part not in ("", ".", "..") for part in decoded.split("/"))
+
+
 def report_credential_permits(method: str, path: str) -> bool:
     """Whether a report credential may make this request (REPORT_CREDENTIAL_ROUTES)."""
-    return any(method == allowed and pattern.fullmatch(path) for allowed, pattern in REPORT_CREDENTIAL_ROUTES)
+    if not any(method == allowed and pattern.fullmatch(path) for allowed, pattern in REPORT_CREDENTIAL_ROUTES):
+        return False
+    segments = path.split("/")
+    # ["", "v1", "audit-reports", <audit id>, <store key>, ...]: the list route has no key.
+    return len(segments) < 5 or _report_store_key_is_plain(segments[4])
 
 
 def exec_pod_serves(method: str, path: str) -> bool:
@@ -13191,7 +13215,8 @@ def mcp_relay_decision(
     if principal is None or principal.role != CALLER_ROLE_PROFILE:
         return mcp_policy.evaluate(server_name, message), None
     offered = mcp_policy.PROFILE_SERVER_TOOLS.get(server_name, frozenset())
-    if principal.task is None:
+    # A report credential confines nothing, so it is no task here (#5619).
+    if principal.task is None or principal.task.report_only:
         return (
             command_policy.Decision(
                 allowed=False,
