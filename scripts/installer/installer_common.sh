@@ -4354,19 +4354,6 @@ check_service_account_ownership() {
   return 1
 }
 
-# The image tag this install's Terraform state RECORDS, which is not the tag
-# the cluster is serving: the redeploy workflows move the running tag with
-# `helm upgrade` and never run Terraform. A drift plan needs this one, or every
-# out-of-band redeploy reads as a pending change to helm_release.kube_agents.
-#
-# Read from the state object in GCS rather than through `terraform output`,
-# for the reason tf_state_has_cluster gives and one more: this runs BEFORE
-# terraform.tfvars is generated -- the tag is an input to that file -- and
-# lifecycle.sh's backend setup needs tfvars to resolve the bucket. The
-# coordinates here come from the environment instead, so there is no such loop.
-#
-# Empty on every failure, including the ordinary one: state written before the
-# composition had this output carries no value for it. Callers fall back.
 # Whether the install this state records runs the agent sandboxed, for
 # resolve_existing_install_gvisor when install.env is silent. Prints true when
 # the state holds the gVisor node pool (Standard) or the agent release renders
@@ -4394,11 +4381,29 @@ for res in doc.get("resources", []):
 if release is None:
     sys.exit(0)
 values = (release["instances"][0].get("attributes") or {}).get("values") or []
-pattern = re.compile(r"[\"\x27]?runtimeClassName[\"\x27]?\s*:\s*[\"\x27]?gvisor\b")
-print("true" if any(isinstance(v, str) and pattern.search(v) for v in values) else "false")
+# The composition\x27s own document is the first; a later one is
+# extra_helm_values, where a runtimeClassName can belong to something else
+# (the shell sandbox). Within it, only the one under availability counts, and
+# the match stops at the next top-level key.
+pattern = re.compile(r"availability[\"\x27]?\s*:(?:(?!\n\S).)*?runtimeClassName[\"\x27]?\s*:\s*[\"\x27]?gvisor\b", re.S)
+first = values[0] if values and isinstance(values[0], str) else ""
+print("true" if pattern.search(first) else "false")
 '
 }
 
+# The image tag this install's Terraform state RECORDS, which is not the tag
+# the cluster is serving: the redeploy workflows move the running tag with
+# `helm upgrade` and never run Terraform. A drift plan needs this one, or every
+# out-of-band redeploy reads as a pending change to helm_release.kube_agents.
+#
+# Read from the state object in GCS rather than through `terraform output`,
+# for the reason tf_state_has_cluster gives and one more: this runs BEFORE
+# terraform.tfvars is generated -- the tag is an input to that file -- and
+# lifecycle.sh's backend setup needs tfvars to resolve the bucket. The
+# coordinates here come from the environment instead, so there is no such loop.
+#
+# Empty on every failure, including the ordinary one: state written before the
+# composition had this output carries no value for it. Callers fall back.
 tf_state_image_tag() {
   local state
   state=$(tf_state_read) || return 0
@@ -4916,17 +4921,6 @@ is_existing_cluster_network_policy_satisfied() {
 }
 
 
-# Writes the terraform.tfvars the full-install composition consumes, from the
-# install.env variable set in the environment (load it first). The same
-# generator runs from install.sh, upgrade.sh, and uninstall.sh, so the three
-# front-ends can never describe different installs.
-#
-# create_cluster comes from a liveness probe, not from the interview, so
-# "use an existing cluster" against a name that does not exist still creates
-# it. A cluster that exists but is already in OUR state stays
-# create_cluster = true — flipping it off would remove the resource from
-# configuration and plan the cluster's destruction (lifecycle.sh guards this
-# too).
 # What ENABLE_GVISOR means for an install that already exists, read the same
 # way by every caller that re-renders one: the Terraform variables below and
 # install.sh's control panel. A set, non-empty ENABLE_GVISOR wins, from
@@ -4967,15 +4961,17 @@ resolve_existing_install_gvisor() { # <project> <cluster> <location> [cluster_mo
       *) mode="standard" ;;
     esac
   fi
+  # A state that holds the release and no sandbox answers for either shape: a
+  # live pool it does not record is not this install's to plan around.
+  if [ "$recorded" = "false" ]; then
+    printf 'false'
+    return 0
+  fi
   if [ "$mode" = "autopilot" ]; then
-    if [ "$recorded" = "false" ]; then
-      printf 'false'
-      return 0
-    fi
     # No state to read. Autopilot has no pool to list, and a fresh install
     # defaults the sandbox on (install.defaults.env DEFAULT_ENABLE_GVISOR), so
     # the sandbox stays on: only an explicit ENABLE_GVISOR="false" turns it off.
-    print_warning "install.env has no ENABLE_GVISOR and this install's Terraform state could not be read, so this run keeps the agent sandboxed on Autopilot cluster '${cluster}'. If it runs on the standard runtime on purpose, add ENABLE_GVISOR=\"false\" to install.env." >&2
+    print_warning "install.env has no ENABLE_GVISOR and this install's Terraform state could not be read or records no release, so this run keeps the agent sandboxed on Autopilot cluster '${cluster}'. If it runs on the standard runtime on purpose, add ENABLE_GVISOR=\"false\" to install.env." >&2
     printf 'true'
     return 0
   fi
@@ -4995,6 +4991,17 @@ resolve_existing_install_gvisor() { # <project> <cluster> <location> [cluster_mo
   fi
 }
 
+# Writes the terraform.tfvars the full-install composition consumes, from the
+# install.env variable set in the environment (load it first). The same
+# generator runs from install.sh, upgrade.sh, and uninstall.sh, so the three
+# front-ends can never describe different installs.
+#
+# create_cluster comes from a liveness probe, not from the interview, so
+# "use an existing cluster" against a name that does not exist still creates
+# it. A cluster that exists but is already in OUR state stays
+# create_cluster = true — flipping it off would remove the resource from
+# configuration and plan the cluster's destruction (lifecycle.sh guards this
+# too).
 write_tfvars_from_state() {
   local dest="$1"
   local image_tag="${2:-${IMAGE_TAG:-$IMAGE_TAG_FALLBACK}}"

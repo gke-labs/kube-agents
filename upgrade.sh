@@ -1806,6 +1806,10 @@ main() {
     full|harness|operator) ;;
     *) print_error "Unsupported upgrade mode '$PARAM_UPGRADE_MODE'. Use full, harness, or operator."; exit 1 ;;
   esac
+  if [ "$PARAM_ALLOW_NODE_POOL_DESTROY" = "true" ] && [ "$PARAM_UPGRADE_MODE" != "full" ]; then
+    print_error "--allow-node-pool-destroy applies to --upgrade-mode=full, the only mode that runs Terraform. Harness and operator upgrades touch no node pool."
+    exit 1
+  fi
   if [ "$PARAM_DROP_UNDECLARED_VALUES" = "true" ] && [ "$PARAM_UPGRADE_MODE" = "full" ]; then
     print_error "--drop-undeclared-values applies to --upgrade-mode=operator and harness, which reuse the release's recorded values. A full upgrade renders them from install.env."
     exit 1

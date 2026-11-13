@@ -2259,14 +2259,38 @@ class InstallerCommonTest(unittest.TestCase):
         self.assertIn("keeps the agent sandboxed on Autopilot", proc.stderr)
 
     @staticmethod
-    def _release_state(runtime_class):
-        values = '"platformAgent":\n  "deployment":\n    "availability":\n      "runtimeClassName": "%s"\n' % runtime_class
+    def _release_state(runtime_class, extra_values=None, quote='"', cluster="autopilot"):
+        q = quote
+        values = (f'{q}platformAgent{q}:\n  {q}deployment{q}:\n    {q}availability{q}:\n'
+                  f'      {q}runtimeClassName{q}: {q}{runtime_class}{q}\n'
+                  f'{q}harness{q}:\n  {q}enabled{q}: true\n')
         return _state_doc([
-            {"mode": "managed", "type": "google_container_cluster", "name": "autopilot",
+            {"mode": "managed", "type": "google_container_cluster", "name": cluster,
              "instances": [_cluster_instance()]},
             {"mode": "managed", "type": "helm_release", "name": "kube_agents",
-             "instances": [{"attributes": {"values": [values]}}]},
+             "instances": [{"attributes": {"values": [values] + (extra_values or [])}}]},
         ])
+
+    def test_tfvars_unset_gvisor_reads_only_the_agents_own_runtime_class(self):
+        # extra_helm_values is the second document; a runtimeClassName there
+        # belongs to something else (the shell sandbox), not the agent.
+        extra = '"harness":\n  "experimental":\n    "shellSandbox":\n      "runtimeClassName": "gvisor"\n'
+        proc, content = self._tfvars_unset_gvisor("exit 1", autopilot=True,
+                                                  state=self._release_state("", extra_values=[extra]))
+        self.assertIn('agent_runtime_class        = ""', content)
+
+    def test_tfvars_unset_gvisor_reads_a_single_quoted_release(self):
+        proc, content = self._tfvars_unset_gvisor("exit 1", autopilot=True,
+                                                  state=self._release_state("gvisor", quote="\x27"))
+        self.assertIn('agent_runtime_class        = "gvisor"', content)
+
+    def test_tfvars_unset_gvisor_trusts_a_standard_state_without_the_pool(self):
+        # The state holds the release and no pool: a live pool it does not
+        # record is not this install's, and planning it would 409.
+        proc, content = self._tfvars_unset_gvisor("printf 'default-pool\\ngvisor-pool\\n'",
+                                                  state=self._release_state("", cluster="standard"))
+        self.assertIn("enable_gvisor_node_pool    = false", content)
+        self.assertNotIn("so this run keeps it", proc.stderr)
 
     def test_tfvars_unset_gvisor_on_autopilot_keeps_a_sandbox_the_state_records(self):
         # A fresh Autopilot install defaults the sandbox on too
@@ -2339,7 +2363,11 @@ class InstallerCommonTest(unittest.TestCase):
 
     def test_uninstall_exports_gvisor_false_before_rendering(self):
         text = (_REPO_ROOT / "uninstall.sh").read_text()
-        self.assertIn('export ENABLE_GVISOR="false"', text)
+        export = text.index('export ENABLE_GVISOR="false"')
+        calls = [i for i in range(len(text)) if text.startswith("write_tfvars_from_state", i)
+                 and not text[text.rfind("\n", 0, i) + 1:i].lstrip().startswith("#")]
+        self.assertTrue(calls, "uninstall.sh renders no tfvars")
+        self.assertLess(export, min(calls), "the export must come before every render")
 
     def _tfvars(self, env, **run_kwargs):
         """Generate a terraform.tfvars and return its text.
