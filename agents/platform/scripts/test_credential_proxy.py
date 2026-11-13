@@ -12277,6 +12277,25 @@ class VcsRouteTest(unittest.TestCase):
                     self.assertTrue(any(credential_proxy.RULE_VCS_WRITE_MODE in line for line in logs.output))
         self.assertEqual([], refreshed)
 
+    def test_the_dial_at_explain_refuses_a_write_and_names_the_dial(self):
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        self.addCleanup(setattr, vcs_broker, "_dial_level", None)
+        vcs_broker._dial_level = None
+        with mock.patch.dict(os.environ, {vcs_broker.WRITE_MODE_ENV: "", vcs_broker.DIAL_ENV: "on"}), \
+                mock.patch.object(vcs_broker, "DIAL_STATE_FILE", os.path.join(scratch.name, "dial")), \
+                mock.patch.object(credential_proxy, "managed_repositories", return_value=frozenset()):
+            status, payload = self._handler(
+                "/v1/vcs/proposal-create", {"repository": "https://github.com/acme/infra"}, self.broker()
+            )
+            self.assertEqual((HTTPStatus.FORBIDDEN, "WRITE_MODE_NONE"), (status, payload["code"]))
+            self.assertIn("autonomy dial is at Explain", payload["detail"])
+            vcs_broker.set_dial_level("propose")
+            status, payload = self._handler(
+                "/v1/vcs/proposal-create", {"repository": "https://github.com/acme/infra"}, self.broker()
+            )
+            self.assertEqual("REPOSITORY_NOT_MANAGED", payload.get("code"), "propose reaches the next gate, no restart")
+
     def test_write_mode_none_keeps_reads_and_issues(self):
         # Past the write-mode check, these reach the managed-list gate, which
         # refuses an unregistered repository with its own code.

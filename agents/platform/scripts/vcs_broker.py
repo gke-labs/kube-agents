@@ -2506,8 +2506,9 @@ def write_mode(environ: Mapping[str, str] | None = None) -> tuple[str, str]:
     autonomy dial (`dial_level`), whose Explain is `none`. Unset or empty env
     is `propose`. A value that is neither mode is `none`: a setting someone
     wrote to restrict the agent must not lift the restriction because it was
-    misspelt. When the dial is what restricts, the raw value is `none`, so
-    `write_mode_detail` says nothing about the env.
+    misspelt. When the dial is what restricts, the raw value is
+    :data:`WRITE_MODE_DIAL_RAW`, so `write_mode_detail` names the dial rather
+    than the env.
     """
     raw = (os.environ if environ is None else environ).get(WRITE_MODE_ENV, "")
     value = raw.strip().lower()
@@ -2516,7 +2517,7 @@ def write_mode(environ: Mapping[str, str] | None = None) -> tuple[str, str]:
     else:
         mode = value if value in WRITE_MODES else WRITE_MODE_NONE
     if mode == WRITE_MODE_PROPOSE and dial_level(environ) == DIAL_EXPLAIN:
-        return WRITE_MODE_NONE, WRITE_MODE_NONE
+        return WRITE_MODE_NONE, WRITE_MODE_DIAL_RAW
     return mode, raw
 
 
@@ -2525,12 +2526,14 @@ def write_mode(environ: Mapping[str, str] | None = None) -> tuple[str, str]:
 # restart. Nothing in the broker calls set_dial_level() yet; the Slack adapter's
 # report is its intended caller. Only while `KUBEAGENTS_DIAL` is `on` (the broker
 # gets spec.deployment.env); off, the dial is not a source at all. On, a broker
-# with no level set since it started reads the level it last stored on its own
-# volume, and with none stored, Explain: it fails closed. The dial only ever
-# restricts.
+# with no level set since it started reads the level it last stored on its
+# state emptyDir (kept across a container restart, not a new Pod), and with none
+# stored, Explain: it fails closed. The dial only ever restricts.
 DIAL_ENV = "KUBEAGENTS_DIAL"
-DIAL_STATE_FILE_ENV = "KUBEAGENTS_DIAL_STATE_FILE"
+# On the broker's state emptyDir: it outlives a container restart, not the Pod.
 DIAL_STATE_FILE = "/var/lib/credential-proxy/dial-level"
+# write_mode()'s raw value when the dial, not the env, is what restricts.
+WRITE_MODE_DIAL_RAW = "dial:explain"
 DIAL_EXPLAIN = "explain"
 DIAL_PROPOSE = "propose"
 DIAL_AUTOMERGE = "automerge"
@@ -2544,8 +2547,8 @@ def dial_enabled(environ: Mapping[str, str] | None = None) -> bool:
     return (os.environ if environ is None else environ).get(DIAL_ENV, "").strip().lower() == "on"
 
 
-def _dial_state_path(environ: Mapping[str, str] | None = None) -> Path:
-    return Path((os.environ if environ is None else environ).get(DIAL_STATE_FILE_ENV, "") or DIAL_STATE_FILE)
+def _dial_state_path() -> Path:
+    return Path(DIAL_STATE_FILE)
 
 
 def dial_level(environ: Mapping[str, str] | None = None) -> str | None:
@@ -2556,18 +2559,18 @@ def dial_level(environ: Mapping[str, str] | None = None) -> str | None:
         if _dial_level is not None:
             return _dial_level
     try:
-        stored = _dial_state_path(environ).read_text(encoding="utf-8").strip()
+        stored = _dial_state_path().read_text(encoding="utf-8").strip()
     except OSError:
         stored = ""
     return stored if stored in DIAL_LEVELS else DIAL_EXPLAIN
 
 
-def set_dial_level(level: str, environ: Mapping[str, str] | None = None) -> None:
+def set_dial_level(level: str) -> None:
     """Record the level the gateway reported; ValueError for anything but a level."""
     global _dial_level, _dial_reported
     if level not in DIAL_LEVELS:
         raise ValueError(f"level must be one of {', '.join(DIAL_LEVELS)}")
-    path = _dial_state_path(environ)
+    path = _dial_state_path()
     with _dial_lock:
         _dial_level = level
         _dial_reported = True
@@ -2589,7 +2592,12 @@ def dial_reported() -> bool:
 
 
 def write_mode_detail(raw: str) -> str:
-    """Why `raw` reads as `none` when it is neither mode, or "" when it is one (or unset)."""
+    """Why `raw` reads as `none` when it is neither mode or the dial restricts, or "" when it is one (or unset)."""
+    if raw == WRITE_MODE_DIAL_RAW:
+        return (
+            f"{DIAL_ENV} is on and the autonomy dial is at Explain, which the broker treats as none; "
+            "with no level set since this broker Pod started it reads Explain"
+        )
     value = raw.strip().lower()
     if not value or value in WRITE_MODES:
         return ""
@@ -2707,6 +2715,7 @@ __all__ = [
     "DIAL_EXPLAIN",
     "DIAL_LEVELS",
     "DIAL_PROPOSE",
+    "WRITE_MODE_DIAL_RAW",
     "dial_enabled",
     "dial_level",
     "dial_reported",

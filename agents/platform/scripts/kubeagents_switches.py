@@ -19,7 +19,8 @@ has the managed values in its environment either: session_kv_server starts
 before Hermes loads any .env.
 
 The variable is the answer only where neither file exists, as in a checkout or
-the credential broker, which no feature should ask.
+the credential broker. The broker does not ask here: it reads `KUBEAGENTS_DIAL`
+from its own env (`vcs_broker.dial_enabled`), and that only ever restricts.
 Any value a switch does not know, unset included, reads as "off".
 """
 

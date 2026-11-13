@@ -446,8 +446,9 @@ report issue. Unset or `propose` is the default: the agent pushes branches and o
 Any other value is treated as `none`.
 
 With `KUBEAGENTS_DIAL` set to `on`, the broker also reads the autonomy dial's level, and the stricter
-of the two applies: at Explain the broker refuses what `none` refuses. The broker keeps the last level
-it was given on its own volume, and until it has one it reads Explain. Nothing sets the level yet, so
+of the two applies: at Explain the broker refuses what `none` refuses, and the refusal's detail names
+the dial. The broker keeps the last level it was given for as long as its Pod lives; a new broker Pod,
+which every operator roll makes, reads Explain until it is given one. Nothing sets the level yet, so
 turning `KUBEAGENTS_DIAL` on today makes the install explain-only.
 
 ## Change control & safety
