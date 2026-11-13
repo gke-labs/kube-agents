@@ -2000,6 +2000,33 @@ class DeliveryWithoutThreadTest(unittest.TestCase):
         self.assertTrue((self.d / COMPLETED).exists(), "the issue is the record; the line is best effort")
         self.assertTrue(any("exited 4" in n for n in self._note_texts()))
 
+    def test_the_home_line_lands_on_every_routed_platform(self):
+        self._filed(self.DAY + self.HOUR)
+        def run(argv, **_kwargs):
+            self.runs.append(argv)
+            if argv[3] == "google_chat":
+                raise OSError("no a2a binary")
+            return subprocess.CompletedProcess(argv, 0, "{}\n", "")
+        with (
+            mock.patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "google_chat,slack"}),
+            mock.patch.object(bootstrap_delivery.subprocess, "run", side_effect=run),
+        ):
+            self.assertEqual(self._main(), 0)
+        self.assertEqual([argv[:4] for argv in self.runs], [
+            [chat_notify.A2A_CLI, "notify", "--platform", "google_chat"],
+            [chat_notify.A2A_CLI, "notify", "--platform", "slack"],
+        ], "a failure on google_chat does not skip slack")
+        line_notes = [n for n in self._note_texts() if "the home line" in n]
+        self.assertEqual(line_notes, [
+            bootstrap_delivery.HOME_LINE_PLATFORM_PREFIX.format(platform="google_chat")
+            + bootstrap_delivery.REPORT_HOME_LINE_NOTE.format(
+                outcome=bootstrap_delivery.HOME_LINE_FAILED.format(
+                    code=bootstrap_delivery.HOME_LINE_NO_EXIT, detail=OSError("no a2a binary"))),
+            bootstrap_delivery.HOME_LINE_PLATFORM_PREFIX.format(platform="slack")
+            + bootstrap_delivery.REPORT_HOME_LINE_NOTE.format(outcome=bootstrap_delivery.HOME_LINE_POSTED),
+        ])
+        self.assertTrue((self.d / COMPLETED).exists())
+
     def test_no_routed_platform_posts_no_home_line(self):
         self._filed(self.DAY + self.HOUR)
         with mock.patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "", "A2A_NOTIFY_CONVERSATIONS": ""}):

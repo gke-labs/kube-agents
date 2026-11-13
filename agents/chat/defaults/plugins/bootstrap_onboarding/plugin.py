@@ -566,19 +566,19 @@ def _prime_conversation(data_dir: Path, session_id: str, turn_id: str = "") -> O
     try:
         chat_notify = _load_chat_notify()
         route = chat_notify.conversation_route(session_id)
-        served = chat_notify.gateway_platform()
+        served = chat_notify.gateway_platforms()
     except Exception as e:
         logger.warning("Could not read the conversation route for %s: %s", session_id, e)
         return None
     if not route or route["platform"] not in DURABLE_CHAT_PLATFORMS:
         return None
-    if served != route["platform"]:
+    if route["platform"] not in served:
         if route["platform"] in _unserved_warned:
             return None
         _unserved_warned.add(route["platform"])
         logger.warning(
-            "The gateway does not serve %s conversations here (%s=%r); leaving onboarding unprimed.",
-            route["platform"], chat_notify.NOTIFY_CONVERSATIONS_ENV, served,
+            "The gateway does not serve %s conversations here (%s=%s); leaving onboarding unprimed.",
+            route["platform"], chat_notify.NOTIFY_CONVERSATIONS_ENV, chat_notify.PLATFORM_LIST_SEPARATOR.join(served),
         )
         return None
     if _scan_too_old(data_dir):
