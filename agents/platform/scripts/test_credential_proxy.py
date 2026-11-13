@@ -16425,7 +16425,7 @@ def yaml_value(text):
 # outside the enum fails Envoy's validation, and any other shape fails the
 # load. A UInt32Value takes a JSON number with no fraction or a string
 # spelling one, from 0 to 2**32 - 1; anything else fails the load (Envoy
-# 1.39.1, --mode validate, on each shape the tests below name). pyyaml's
+# 1.39.1 and re-checked on 1.39.6, --mode validate, on each shape the tests below name). pyyaml's
 # integers are Envoy's: yaml-cpp converts a scalar with the base left to its
 # prefix, so both read 010 as 8 and 0x10 as 16, which Envoy's /clusters page
 # shows.
@@ -16798,7 +16798,7 @@ class ThreadCapDefaultTest(unittest.TestCase):
     def test_a_quoted_digit_priority_is_the_number_envoy_reads(self):
         # pyyaml keeps a quoted scalar a string, and so does Envoy's YAML
         # loader; proto-JSON, given a string that is not an enum value's
-        # name, reads the number it spells. Envoy 1.39.1 loads
+        # name, reads the number it spells. Envoy 1.39.1 and 1.39.6 load
         # `priority: "0"` and its /clusters page shows the DEFAULT breaker at
         # that threshold's count, so the cap has to read it the same way
         # rather than fall to 1024 under a breaker of 4096; `"2"` fails
@@ -16820,7 +16820,7 @@ class ThreadCapDefaultTest(unittest.TestCase):
             self.assertIsNone(credential_proxy._routing_priority(value), value)
 
     def test_a_count_is_bounded_by_uint32_and_an_integer_is_read_as_envoy_reads_it(self):
-        # max_connections is a UInt32Value: Envoy 1.39.1 refuses to load
+        # max_connections is a UInt32Value: Envoy 1.39.1 and 1.39.6 refuse to load
         # 4294967296 (`integer out of range`) and loads 4294967295, so the
         # first is not a count and the second is. An integer pyyaml read
         # from the file needs no re-reading: yaml-cpp converts a scalar with

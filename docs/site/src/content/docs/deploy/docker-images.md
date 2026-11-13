@@ -116,7 +116,7 @@ Needed only to rebuild the images above from source, not to run an install. Each
 | Image | Upstream reference | Pin | Override | Pulled by |
 | ----- | ------------------ | --- | -------- | --------- |
 | `hermes-agent` | `docker.io/nousresearch/hermes-agent` | `HERMES_AGENT_TAG` in [`tags.env`](https://github.com/gke-labs/kube-agents/blob/main/tags.env) | `HERMES_AGENT_IMAGE` | deploy/docker/Dockerfile (agent-base stage). |
-| `envoy` | `docker.io/envoyproxy/envoy` | `v1.39.1` | `ENVOY_IMAGE` | deploy/docker/Dockerfile (envoy-bin stage). |
+| `envoy` | `docker.io/envoyproxy/envoy` | `v1.39.6` | `ENVOY_IMAGE` | deploy/docker/Dockerfile (envoy-bin stage). |
 | `golang` | `docker.io/library/golang` | `1.27-alpine` | `GOLANG_IMAGE` | deploy/docker/Dockerfile, deploy/kube-proxy/Dockerfile, k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.dispatcher, a2a/Dockerfile.gateway, a2a/Dockerfile.hermes-bridge, a2a/Dockerfile.verifier, a2a/Dockerfile.web-console, a2a/Dockerfile.worker and a2a/Dockerfile.console builder stages. |
 | `node` | `docker.io/library/node` | `22-slim` | `NODE_IMAGE` | a2a/Dockerfile.worker runtime stage and a2a/Dockerfile.console page build stage. |
 | `python` | `docker.io/library/python` | `3.14-slim` | `PYTHON_IMAGE` | examples/inference-replay/replay-proxy/Dockerfile, hack/replay-proxy/Dockerfile and deploy/sandbox/Dockerfile. |

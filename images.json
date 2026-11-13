@@ -294,7 +294,7 @@
       "name": "envoy",
       "origin": "build-time",
       "repository": "docker.io/envoyproxy/envoy",
-      "tag": "v1.39.1",
+      "tag": "v1.39.6",
       "buildArg": "ENVOY_IMAGE",
       "pulledBy": "deploy/docker/Dockerfile (envoy-bin stage).",
       "description": "Source of the envoy binary copied into the credential-proxy image."
