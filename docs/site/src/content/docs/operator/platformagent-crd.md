@@ -1656,7 +1656,7 @@ writers carry the field through as they read it, so a pass that ends `Degraded` 
 
 `profileSubmitMaxAgeSeconds` is the live `PROFILE_SUBMITS` stream's max age, as the A2A
 provision Job last read it, when it is longer than this release creates the stream with (`0` is no
-age limit). Provisioning never edits an existing stream, so a stream created by an older release
+age limit). Provisioning never changes an existing stream's max age, so a stream created by an older release
 with a longer max age, or edited by hand, keeps its own. The dispatch config's submit retention is
 the longer of the two, so a finished task's tombstone outlives its submission, up to a year: a
 stream with no age limit, or one longer than a year, gets a year.
@@ -1738,6 +1738,13 @@ running unbounded, and the pass that first sees the Job complete records a `Warn
 `TasksSubjectCapMissing`, naming the Job, the live and rendered caps, and the `nats stream edit` that
 closes the gap with what that edit costs. A stream carrying some other finite cap is drift, not that
 gap, and stays in the Job's pod log.
+
+The byte caps of `TASKS` (8 GiB) and `TOPICS-JOURNAL` (1 GiB) apply to streams this release
+creates. An existing stream above its cap keeps it, since provisioning does not edit a stream. The
+operator then records a `Warning` Event on the `PlatformAgent`, reason `A2ABusStreamCapAboveRender`.
+It names the stream, its live and new `max_bytes`, what it holds, and the `nats stream edit` that
+lowers it. It also says whether applying the edit now is safe: a stream holding under half the new
+cap evicts nothing when lowered.
 
 The Event is recorded once per Job run, so roughly daily while the gap stands, because the finished
 Job is removed by its TTL and run again; Events themselves expire on the cluster's event TTL (an hour
