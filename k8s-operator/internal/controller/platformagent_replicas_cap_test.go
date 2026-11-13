@@ -164,7 +164,7 @@ func TestReplicasLimitedConditionFollowsTheSpec(t *testing.T) {
 	// The condition is inside the unchanged comparison as well as the write:
 	// a status pass over the same state must not write again (#1392).
 	settled := got.ResourceVersion
-	if _, err := r.updateStatusReady(ctx, got, "", otlpSourceNone, r.resolveNetpolProfile(ctx, got), a2aProvisionState{}); err != nil {
+	if _, _, err := r.updateStatusReady(ctx, got, "", otlpSourceNone, r.resolveNetpolProfile(ctx, got), a2aProvisionState{}); err != nil {
 		t.Fatalf("updateStatusReady (settled) failed: %v", err)
 	}
 	again := &agentv1alpha1.PlatformAgent{}

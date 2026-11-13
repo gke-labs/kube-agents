@@ -26,20 +26,21 @@ to put in a diff otherwise. Three paths lead there:
   printed `"ledger": "store"` (a forge with no issue tracker, or no labels), there is no ledger to
   comment on: the person asks in chat, and that is a direct ask (below).
 - **A direct ask.** A collaborator asking the agent, in the agent's own task, to fix a named
-  finding; the agent answers with the `remediate` subcommand. A request to run the audit or follow its SOP
-  is not one, and neither is a criterion that defers to the SOP, such as "any remediation PRs
-  required by the SOP": the SOP's pull requests are the ones `finish`'s sweep opens, and with the
-  switch off it opens none. Without an ask, open nothing and report the ledger; never run
-  `remediate` on your own initiative (#2953). A direct ask is uncapped for the same reason as
+  finding; the agent answers with the `remediate` subcommand. Uncapped for the same reason as
   `/remediate` — and distinct from a comment read on the ledger, which is the harness's to answer
   (`start` reports the ones that passed its gates as `pending_remediation_requests`). Fresh pull
   requests only: a finding whose pull request a human closed is reported as `superseded`, never
   re-proposed — a direct ask carries no GitHub identity, so the after-the-close escape hatch
-  ([ledger.md](ledger.md)) stays with the write-gated comment. A task that tells you to open the
-  audit's fixes is a direct ask for each fix the ledger lists as awaiting `/remediate`, a
-  PodDisruptionBudget `finish` wrote itself included: run `remediate` for them in the same task. On
-  an install whose switch is off, that is the only way they open before a person comments, so do not
-  end the task telling the requester to comment `/remediate`.
+  ([ledger.md](ledger.md)) stays with the write-gated comment. When the request itself asks for the
+  audit's fixes to be opened ("open the fixes", "open every PodDisruptionBudget the audit wrote"),
+  that is a direct ask for each fix it asks for, by id or as a set, that the ledger lists as awaiting
+  a fix, a PodDisruptionBudget `finish` wrote itself included: run `remediate` for them in the same
+  task. On an install whose switch is off, that is the only way they open before a person comments,
+  so do not end such a task telling the requester to comment `/remediate`. A request only to run an
+  audit or follow its SOP is not a direct ask, and neither is a line that attributes remediation pull
+  requests to the SOP (a card's "remediation PRs required by the SOP"): the SOP's pull requests are
+  the sweep's and the ledger's, so such a run opens no pull request beyond what `finish` opened, and
+  its answer names the findings the ledger lists as awaiting a fix.
 
 Every `/remediate` gets exactly one answer, and the answer is never silence:
 

@@ -13435,6 +13435,10 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
                 encoding="utf-8",
             )
             seeded_env.chmod(0o600)
+            # main() asks kubectl for its current context; the developer's
+            # default kubeconfig must not be what answers.
+            kubeconfig = pathlib.Path(tmp) / "kubeconfig"
+            kubeconfig.touch()
             driver = (
                 f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
                 "command() { return 0; }\n"
@@ -13463,7 +13467,7 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
                 capture_output=True,
                 text=True,
                 env=get_isolated_test_env(
-                    overrides={"KUBE_AGENTS_INSTALL_ENV": str(seeded_env)},
+                    overrides={"KUBE_AGENTS_INSTALL_ENV": str(seeded_env), "KUBECONFIG": str(kubeconfig)},
                 ),
                 cwd=str(_REPO_ROOT),
             )

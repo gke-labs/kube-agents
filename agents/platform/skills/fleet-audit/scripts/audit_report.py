@@ -2815,20 +2815,25 @@ def sweep_off_reason() -> str:
 def sweep_off_next_step(noun: str) -> str:
     """What the worker reads when the sweep opens nothing: the two ways a fix
     still opens. A worker that read only "`/remediate` requests" stopped at the
-    ledger when its own task had asked for the fixes, and opened nothing. A
-    worker that read "when this task asks you to open fixes" beside a card
-    criterion the Planning Agent had added ("any remediation PRs required by
-    the SOP") ran `remediate` on an audit nobody asked to fix (#2953), so the
-    hint says what is not an ask."""
+    ledger when its own task had asked for the fixes, and opened nothing.
+
+    The direct ask is narrow on purpose. Worded as "when this task asks you to
+    open fixes", a worker on an audit-only ask read its card's "remediation
+    pull requests required by the SOP" as the ask and opened an unrequested
+    pull request: a PodDisruptionBudget (nightly 2026-11-11,
+    obtainability-planted-pdb) and a Pod Security fix (#5093's smoke,
+    compliance-rbac-overgrant). Keyed on what the request asks, not on whose
+    words carry it: the worker sees only the planner's card, so a paraphrased
+    "open every PodDisruptionBudget" still counts."""
     return (
-        f"the automatic sweep opens nothing. A `/remediate` comment on the ledger opens a {noun}, and so "
-        "does a direct ask: when this task tells you to open the audit's fixes, run `remediate --finding <id> "
-        "--manifest-file <the collector manifest>` for each one the ledger lists as awaiting `/remediate`, "
-        "a PodDisruptionBudget `finish` writes itself included. A request to run the audit is not that ask, "
-        "and neither is a criterion that defers to the SOP, such as \"any remediation PRs required by the "
-        "SOP\": the SOP's pull requests are the ones this sweep opens, and with the sweep off it opens none. "
-        "Then open nothing and report the ledger. Never run `remediate` on your own initiative, and never "
-        "post `/remediate` yourself."
+        f"the automatic sweep opens nothing, and that is the answer for a run that was asked only to audit. "
+        f"A `/remediate` comment on the ledger opens a {noun}, and so does a direct ask: only when the request "
+        "itself asks for fixes to be opened (\"open the fixes\", \"open every PodDisruptionBudget the audit "
+        "wrote\", \"remediate <finding>\"), run `remediate --finding <id> --manifest-file <the collector "
+        "manifest>` for each fix it asks for, by id or as a set, that the ledger lists as awaiting a fix, a "
+        "PodDisruptionBudget `finish` writes itself included. A request only to run an audit or follow its "
+        "SOP is not that ask, and neither is a line that attributes remediation pull requests to the SOP: "
+        "stop at the ledger and name the findings it lists as awaiting a fix. Never post `/remediate` yourself."
     )
 
 # The collector manifest (docs/designs/fleet-audit-collector-manifest.md).
@@ -14723,6 +14728,19 @@ def _select_pr_by_head(prs: list[dict], branch: str, alternate: str | None = Non
     return None
 
 
+def remediation_target(group: list[dict]) -> dict | None:
+    """The finding a group fixes, for the post-merge check, else None.
+
+    Only a group of one GENERATED_FIX_CHECK finding: the check re-checks one
+    workload, so a group fixing several is not followed.
+    """
+    if len(group) != 1 or str(group[0].get("check", "")) != GENERATED_FIX_CHECK:
+        return None
+    finding = group[0]
+    return {key: str(finding.get(field) or "") for key, field in
+            (("finding_id", "id"), ("cluster", "cluster"), ("namespace", "namespace"), ("object", "object"))}
+
+
 def remediation_pr_title(audit_id: str, group: list[dict]) -> str:
     """One subject for the whole group, named after what it fixes."""
     ordered = sort_findings(group)
@@ -15185,8 +15203,11 @@ def broker_lost(exc: BaseException) -> bool:
 _LAST_REFUSAL: dict[str, str] = {}
 
 
-def forge(verb: str, repo: str, payload: dict) -> dict:
+def forge(verb: str, repo: str, payload: dict, target: dict | None = None) -> dict:
     """One forge verb against `repo`, through the broker. Raises ForgeError.
+
+    `target` names the finding a `proposal-create` fixes, for the record the
+    agent pod's hook reads (`vcs_client.TARGET_FIELD`); it is not sent.
 
     Issues, pull requests, comments and labels all go this way. There is no
     `gh` in the sandbox to run: the broker holds the credential and answers in
@@ -15208,6 +15229,8 @@ def forge(verb: str, repo: str, payload: dict) -> dict:
     # call it just made failed.
     _LAST_REFUSAL.pop(repo, None)
     try:
+        if target:
+            return vcs_client.forge(verb, dict(payload), repository=repo, target=target)
         return vcs_client.forge(verb, dict(payload), repository=repo)
     except vcs_client.VcsError as exc:
         _LAST_REFUSAL[repo] = exc.code or ""
@@ -17589,6 +17612,7 @@ def open_remediation_pr(
                 "proposal-create",
                 repo,
                 {"source": branch, "target": base, "title": title, "body": body},
+                target=remediation_target(group),
             ).get("proposal") or {}
         except ForgeError:
             # The forge refuses a second pull request from one branch. One is
@@ -18287,7 +18311,7 @@ def unwritten_refusal_message(
         # The second sentence is #2953: a worker wrote the fixes and then opened them.
         "can open a pull request for them. Writing a fix opens nothing unless a person's "
         "`/remediate` already asks for it: it waits in the ledger as awaiting `/remediate`, "
-        "and you run `remediate` only when this task tells you to open the audit's fixes."
+        "and you run `remediate` only when the request itself asks for fixes to be opened."
         if sweep_off
         else f"{len(unwritten)} finding(s) qualify for an automatic pull request, but "
         "their fix is not written."
@@ -26684,14 +26708,14 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
             f"{fid}: the collector ran this check on this cluster and emitted no "
             "candidate for this object, so the sweep will not open a pull request "
             f"on it. A person who has read it and wants one comments `/remediate {fid}`; never you. "
-            "A task that tells you to open the audit's fixes runs `remediate` instead."
+            "A request that itself asks for fixes to be opened runs `remediate` instead."
         )
     for fid in plan.needs_triage:
         log(
             f"{fid}: the collector flagged this and stands behind it, and marked "
             f"the fix `{triage_reasons.get(fid, '?')}` as needing a judgement it could not make, so the sweep will "
             f"not open a pull request on it. A person comments `/remediate {fid}` once they "
-            "have decided; never you. A task that tells you to open the audit's fixes runs "
+            "have decided; never you. A request that itself asks for fixes to be opened runs "
             "`remediate` instead."
         )
     for fid in plan.already_open:

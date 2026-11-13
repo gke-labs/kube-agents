@@ -35,14 +35,13 @@ func withDispatcher(t *testing.T) {
 	t.Setenv(a2aDispatcherImageEnvVar, testDispatcherImage)
 }
 
-// The dispatcher is off by default until profiles dispatch end to end:
-// with A2A_DISPATCHER_IMAGE unset the operator renders none of it, even
-// where the release set would resolve its image (OPERATOR_IMAGE set). No
-// Deployment, no dispatch ConfigMap, no identity-map entry (and none of
-// the operator's own grants for the profile durables). TASKS is the same
-// size either way: the durables are on PROFILE_SUBMITS (contract addendum
-// 7). Setting the image turns all of it on.
-func TestNoDispatcherImageRendersNoDispatcher(t *testing.T) {
+// The dispatcher is on by default, at the release set's image, and off only
+// at A2A_PROFILE_DISPATCHER=false (the chart's operator.profileDispatcher
+// .enabled). Off, the operator renders none of it: no Deployment, no dispatch
+// ConfigMap, no identity-map entry (and none of the operator's own grants for
+// the profile durables). TASKS is the same size either way: the durables are
+// on PROFILE_SUBMITS (contract addendum 7).
+func TestTheDispatcherIsOnByDefaultAndOffAtFalse(t *testing.T) {
 	agent := a2aTestAgent()
 	hasIdentity := func() bool {
 		doc, err := renderA2AAuthMap(agent, nil)
@@ -58,15 +57,23 @@ func TestNoDispatcherImageRendersNoDispatcher(t *testing.T) {
 	}
 	t.Setenv(a2aDispatcherImageEnvVar, "")
 	t.Setenv(operatorImageEnvVar, "registry.example/kube-agents/k8s-operator:1.2.3")
-	// The release set knows the image; the default doesn't use it yet.
-	if got, want := a2aDispatcherReleaseImage(), "registry.example/kube-agents/a2a-dispatcher:1.2.3"; got != want {
-		t.Errorf("the release image resolves to %q, want %q", got, want)
+	// On by default, at the release set's image.
+	if got, want := a2aDispatcherImage(), "registry.example/kube-agents/a2a-dispatcher:1.2.3"; got != want || !a2aDispatcherEnabled() {
+		t.Errorf("by default the dispatcher's image is %q (on %v), want %q", got, a2aDispatcherEnabled(), want)
 	}
+	// Only "false" turns it off.
+	for _, v := range []string{"", "true", "no", "0", "FALSE "} {
+		t.Setenv(a2aProfileDispatcherEnvVar, v)
+		if !a2aDispatcherEnabled() {
+			t.Errorf("%s=%q turned the dispatcher off; only \"false\" does", a2aProfileDispatcherEnvVar, v)
+		}
+	}
+	t.Setenv(a2aProfileDispatcherEnvVar, "false")
 	if a2aDispatcherEnabled() || a2aDispatcherImage() != "" {
-		t.Fatalf("the dispatcher is on with A2A_DISPATCHER_IMAGE unset (image %q)", a2aDispatcherImage())
+		t.Fatalf("the dispatcher is on with %s=false (image %q)", a2aProfileDispatcherEnvVar, a2aDispatcherImage())
 	}
 	if hasIdentity() {
-		t.Error("the identity map carries the dispatcher with A2A_DISPATCHER_IMAGE unset")
+		t.Error("the identity map carries the dispatcher with it switched off")
 	}
 	tasksWithout := a2aTasksMaxConsumers(agent)
 	if want := max(a2aTasksConsumerBudget(agent), a2aTasksMaxConsumersFloor); tasksWithout != want {
@@ -94,13 +101,14 @@ func TestNoDispatcherImageRendersNoDispatcher(t *testing.T) {
 		{&corev1.ServiceAccount{}, types.NamespacedName{Namespace: agent.Namespace, Name: name}},
 	} {
 		if err := c.Get(ctx, check.key, check.obj); !apierrors.IsNotFound(err) {
-			t.Errorf("%T %s rendered with A2A_DISPATCHER_IMAGE unset: %v", check.obj, check.key, err)
+			t.Errorf("%T %s rendered with the dispatcher switched off: %v", check.obj, check.key, err)
 		}
 	}
 
+	t.Setenv(a2aProfileDispatcherEnvVar, "")
 	withDispatcher(t)
 	if !hasIdentity() {
-		t.Error("with an image, the identity map has no dispatcher")
+		t.Error("switched back on, the identity map has no dispatcher")
 	}
 	if got := a2aTasksMaxConsumers(agent); got != tasksWithout {
 		t.Errorf("with an image, TASKS is created at %d, want %d: the profile durables take no TASKS slot", got, tasksWithout)
@@ -278,7 +286,7 @@ func TestRemovingTheDispatcherImageRemovesTheDispatcher(t *testing.T) {
 			t.Fatalf("precondition: %T %s not rendered: %v", check.obj, check.key, err)
 		}
 	}
-	t.Setenv(a2aDispatcherImageEnvVar, "")
+	t.Setenv(a2aProfileDispatcherEnvVar, "false")
 	if profileErr, err := r.reconcileA2ADispatcher(ctx, agent, nil, true); err != nil || profileErr != nil {
 		t.Fatalf("remove: %v / %v", err, profileErr)
 	}
@@ -315,7 +323,7 @@ func TestRemovingTheDispatcherImageRemovesTheDispatcher(t *testing.T) {
 // durables live on PROFILE_SUBMITS, whose cap is their allowance.
 func TestTheProfileDurablesTakeNoTasksSlot(t *testing.T) {
 	agent := a2aTestAgent()
-	t.Setenv(a2aDispatcherImageEnvVar, "")
+	t.Setenv(a2aProfileDispatcherEnvVar, "false")
 	without := a2aTasksMaxConsumers(agent)
 	withDispatcher(t)
 	if got := a2aTasksMaxConsumers(agent); got != without {
@@ -460,12 +468,12 @@ func TestATaskDeadlinePastTheCapIsClampedAndWarned(t *testing.T) {
 	}
 }
 
-// With no dispatcher image, a next install renders exactly what it did
-// before the dispatcher existed: no dispatcher principal, no durable grants
+// Switched off, a next install renders exactly what it did before the
+// dispatcher existed: no dispatcher principal, no durable grants
 // on the operator, TASKS sized for sessions alone, no dispatcher objects,
 // and no durable syncs from the AgentProfile controller.
-func TestDefaultOffRendersNoDispatcherAndNoGrantsForIt(t *testing.T) {
-	t.Setenv(a2aDispatcherImageEnvVar, "")
+func TestSwitchedOffRendersNoDispatcherAndNoGrantsForIt(t *testing.T) {
+	t.Setenv(a2aProfileDispatcherEnvVar, "false")
 	withOperatorBusPrincipal(t)
 	agent := a2aTestAgent()
 	doc, err := renderA2AAuthMap(agent, []agentv1alpha1.AgentProfile{testAgentProfile(agent.Namespace, "tse")})
@@ -684,4 +692,65 @@ func TestARepairedSigningKeyRollsTheDispatcher(t *testing.T) {
 	if after := hash(); after == before {
 		t.Errorf("the signing key was repaired and the dispatcher's pod template didn't change (%s)", after)
 	}
+}
+
+// dispatcherGrantsGoldenPath is the per-profile half of the dispatcher's
+// grants at a small N, as the operator spells it with the bucketed-grants
+// flag off. lib.DispatcherGrants checks the same file
+// (a2a/lib/dispatchgrants_test.go): lib is the one spelling with the flag on
+// (#5381), and this module can't import it, so the file is what holds the
+// two spellings equal until the flag-off render is deleted.
+const dispatcherGrantsGoldenPath = "../../../a2a/lib/testdata/dispatcher-grants-golden.json"
+
+type dispatcherGrantsGoldenProfile struct {
+	Name     string   `json:"name"`
+	Tiers    []string `json:"tiers,omitempty"`
+	Draining bool     `json:"draining,omitempty"`
+}
+
+type dispatcherGrantsGolden struct {
+	Profiles  []dispatcherGrantsGoldenProfile `json:"profiles"`
+	Publish   []string                        `json:"publish"`
+	Subscribe []string                        `json:"subscribe"`
+}
+
+func TestDispatcherGrantsGoldenFixture(t *testing.T) {
+	agent := a2aTestAgent()
+	golden := dispatcherGrantsGolden{Profiles: []dispatcherGrantsGoldenProfile{
+		{Name: "alpha", Tiers: []string{agentv1alpha1.AgentProfileTierRead, agentv1alpha1.AgentProfileTierUnattended}},
+		{Name: "beta", Tiers: []string{agentv1alpha1.AgentProfileTierRead}},
+		{Name: "gone", Draining: true},
+	}}
+	var names, durables []string
+	for _, p := range golden.Profiles {
+		names = append(names, p.Name)
+		for _, tier := range p.Tiers {
+			for _, kind := range a2aSubmitKinds {
+				durables = append(durables, profileDurableName(p.Name, tier, kind))
+			}
+		}
+	}
+	fixed := dispatcherIdentity(agent, agent.Namespace, nil, nil)
+	full := dispatcherIdentity(agent, agent.Namespace, names, durables)
+	golden.Publish = without(full.publish, fixed.publish)
+	golden.Subscribe = without(full.subscribe, fixed.subscribe)
+	var buf strings.Builder
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(golden); err != nil {
+		t.Fatal(err)
+	}
+	checkFixture(t, dispatcherGrantsGoldenPath, buf.String())
+}
+
+// without is s with every element of drop removed, in s's order.
+func without(s, drop []string) []string {
+	out := []string{}
+	for _, x := range s {
+		if !slices.Contains(drop, x) {
+			out = append(out, x)
+		}
+	}
+	return out
 }

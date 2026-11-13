@@ -75,6 +75,7 @@ func countNoticeReads(t *testing.T, r *rig) func(taskID string) int {
 // stream is still empty, and the conversation's next message is what the heal
 // releases it on, as the notice says.
 func TestNoFirstEventNoticePostsOnceWithoutATurn(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	ctx := context.Background()
 	conv := "discord:g1/thread-notice-once"
@@ -153,6 +154,7 @@ func TestNoFirstEventNoticeNotRepeatedAfterRestart(t *testing.T) {
 // stream, and a task with nothing yet but still inside the grace, get no
 // notice.
 func TestNoFirstEventNoticeSkipsTasksThatStarted(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	ctx := context.Background()
 
@@ -270,6 +272,7 @@ func TestNoFirstEventNoticeSkipsDetachedAndStaleScans(t *testing.T) {
 // consumer on TASKS each time, out of a consumer budget sized without this
 // caller; the question is answered with direct gets instead.
 func TestNoFirstEventNoticeOpensNoConsumer(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	ctx := context.Background()
 	const conversations = 5
@@ -346,6 +349,7 @@ func TestNoFirstEventNoticeOpensNoConsumer(t *testing.T) {
 // replays the task (one ephemeral consumer, as before this check existed);
 // the steer must not add a second.
 func TestSteerOpensNoConsumerOfItsOwn(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	ctx := context.Background()
 	conv := "discord:g1/thread-steer-budget"
@@ -388,6 +392,7 @@ func TestSteerOpensNoConsumerOfItsOwn(t *testing.T) {
 // task with nothing on its stream is still sent, but the acknowledgement
 // promises no reply on either route, and says when the conversation frees up.
 func TestSteerIntoTaskWithNoFirstEventPromisesNoReply(t *testing.T) {
+	t.Parallel()
 	for name, seed := range map[string]func(*testing.T, *rig, string, time.Duration) *SessionRecord{
 		"fixed":   seedTasklessFixed,
 		"session": seedTasklessDelegate,

@@ -189,13 +189,20 @@ SCENARIO_BATCH_WAIT = (
 )
 
 KNOWN_UNREGISTERED = {
-    # Grades whom a /session turn delegated to (delegated_to); the cluster child
-    # it delegates to only runs where the AgentProfile dispatcher does, which the
-    # CI next lane turns on, with profiles.cluster, in the dispatcher flip (#5394). That pull request
-    # registers the case in hack/eval/nightly-cases.txt and on
-    # hack/eval/api-lane-exclusions.txt, and removes this entry.
-    "session-delegates-to-the-profile-asked-for": (
-        "#5394: needs the AgentProfile dispatcher, which the CI next lane gets from #5394; registered there"
+    # Parked from hack/eval/nightly-cases.txt by the dispatcher flip (#5394):
+    # its tse profile's persona image is a placeholder a dispatched worker can't
+    # stage, so the CI next lane stops enabling tse until #3842 gives it a real
+    # one. #3842 re-enables tse on the lane, puts the case back and removes this.
+    "tse-node-notready-pleg-probe": (
+        "#3842: the CI next lane enables tse again once #3842 gives it a real persona image"
+    ),
+    # The cluster agent as a dispatched profile diagnosing a fleet fixture
+    # (#3658). Like the case above, its child runs only where the dispatcher
+    # does; it is registered in hack/eval/nightly-cases.txt and on
+    # hack/eval/api-lane-exclusions.txt once #5394 turns the dispatcher on in
+    # the CI next lane, and this entry goes then.
+    "cluster-profile-names-the-oom-kill": (
+        "#5394: needs the AgentProfile dispatcher and profiles.cluster, which the CI next lane gets from #5394"
     ),
     # Provisions its own cluster, so registering it costs every pull request
     # a second multi-minute provision. Whether it belongs in presubmit or
@@ -326,6 +333,19 @@ FIXTURE_NOT_READY = {
         "#5143: needs a Standard seeded cluster with a manual node pool under a ComputeClass "
         "whose auto-creation is off; the lane's host clusters are Autopilot"
     ),
+    # Needs a pool with a live node whose surge node, or green pool, draws more
+    # of a regional quota than the project has left. GKE bounds the surge by
+    # the pool's live nodes, so a zero-node pool is not a fixture; the suite's
+    # fixture rules forbid a quota edit; and the smallest honest shape, one
+    # live c3-standard-176 against C3_CPUS 300, costs about $9 an hour
+    # standing or about $7 a repetition on a per-run cluster that depends on
+    # each project's family quota. #2567 item 2 proposes the check and owns
+    # the gap; the fixture is the cost decision its case header states.
+    "upgrade-surge-bluegreen-gce-quota-exhaustion": (
+        "#2567 item 2: needs a pool with a live node whose surge node or green pool exceeds a "
+        "regional family quota; a zero-node pool surges nothing, and a populated one costs about "
+        "$9 an hour standing or about $7 a run on a per-run cluster"
+    ),
     # Needs Config Sync's RootSync CRD and one root-sync object reporting
     # Stalled=True on a seeded cluster. No pool project enables the GKE Hub
     # API, so Config Sync is installed nowhere, and the seeded fleet plants no
@@ -373,18 +393,6 @@ FIXTURE_NOT_READY = {
         "#3560: needs an eval install with more than ten clusters in scope, so a "
         "fleet question reaches the ten-card fan-out bound; the seeded fleet and "
         "every dev install have five or fewer"
-    ),
-    # Needs the seeded fleet's seeded-crd-gate on slot b (role
-    # readiness-crd-webhook, defects-b.tf), which the pull request that adds
-    # this entry plants in the stack; merging plants nothing, the reconcile's
-    # postsubmit does, and a role the runner cannot resolve is
-    # FleetRoleUnresolved, a rung-2 red on the certification lane. The
-    # un-park pull request cites the reconcile report that visited every pool
-    # project and the scan that reads the role healthy on each. The gap the
-    # case records is #2567 (item 1).
-    "upgrade-webhook-blocks-capacitybuffers-crd": (
-        "#2567 (item 1): waits for the fleet reconcile to plant seeded-crd-gate "
-        "(role readiness-crd-webhook) on every pool project and the scan to read it healthy"
     ),
     "upgrades-readiness-lb-drain-timeout": (
         "#3524: needs bench/tf/fleet's drain-timeout backend service on seeded-b's default "
@@ -936,6 +944,66 @@ def _cluster_placeholders(node: Any, where: str, problems: list[str], slots: set
         _cluster_placeholders(child, where, problems, slots, parked)
 
 
+# `{{FLEET_CLUSTER_PROJECT|LOCATION|NAME:<role>}}` in a prompt, as
+# bench/kube_agents_bench/harness.py's _FLEET_CLUSTER_PLACEHOLDER reads it
+# (restated, as CLUSTER_PLACEHOLDER is; the harness owns it).
+FLEET_PROMPT_PLACEHOLDER = re.compile(r"\{\{FLEET_CLUSTER_(PROJECT|LOCATION|NAME):([a-z0-9]+(?:-[a-z0-9]+)*)\}\}")
+# Any spelling an author may have meant as one (one brace, inner spaces, any
+# case), as CLUSTER_PLACEHOLDER_LOOSE reads `{cluster:`: the opener a
+# malformed placeholder and one outside the prompt are caught by.
+FLEET_PLACEHOLDER_LOOSE = re.compile(r"\{+\s*fleet_cluster", re.IGNORECASE)
+
+
+def _strings_outside_prompt(node: Any, path: str, out: list[tuple[str, str]]) -> None:
+    """Every string in a case spec but its top-level prompt, with where it is."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if path == "" and key == "prompt":
+                continue
+            _strings_outside_prompt(value, f"{path}.{key}" if path else str(key), out)
+    elif isinstance(node, list):
+        for i, value in enumerate(node):
+            _strings_outside_prompt(value, f"{path}[{i}]", out)
+    elif isinstance(node, str):
+        out.append((path, node))
+
+
+def _fleet_prompt_placeholders(spec: dict[str, Any], problems: list[str], parked: bool) -> None:
+    """Every `{{FLEET_CLUSTER_*:<role>}}` in the prompt is well-formed, names a
+    role the case lists in `fixtures:`, and (unless parked) a catalogue role.
+    A misspelled one reaches the model as literal text and is graded as the
+    model's failure; a role the runner doesn't provision fails every run as
+    infrastructure."""
+    # Only the prompt is expanded (harness.py's run()); anywhere else the
+    # placeholder stays literal text.
+    elsewhere: list[tuple[str, str]] = []
+    _strings_outside_prompt(spec, "", elsewhere)
+    for where, value in elsewhere:
+        if FLEET_PLACEHOLDER_LOOSE.search(value):
+            problems.append(f"{where} carries a fleet placeholder, which only the prompt expands")
+    prompt = spec.get("prompt")
+    if not isinstance(prompt, str) or not FLEET_PLACEHOLDER_LOOSE.search(prompt):
+        return
+    if FLEET_PLACEHOLDER_LOOSE.search(FLEET_PROMPT_PLACEHOLDER.sub("", prompt)):
+        problems.append(
+            "prompt carries a malformed fleet placeholder; the form is "
+            "{{FLEET_CLUSTER_PROJECT:<role>}}, ..._LOCATION or ..._NAME, with a lowercase role"
+        )
+    raw_fixtures = spec.get("fixtures")
+    fixtures = {f for f in raw_fixtures if isinstance(f, str)} if isinstance(raw_fixtures, list) else set()
+    # A project-scoped role (cluster_slot: null) has no cluster for the
+    # runner to record, so a placeholder naming it fails every run.
+    slot_roles = _catalog_slot_roles()
+    for role in sorted({m.group(2) for m in FLEET_PROMPT_PLACEHOLDER.finditer(prompt)}):
+        if role not in fixtures:
+            problems.append(f"prompt names fleet role {role!r}, which the case's 'fixtures:' doesn't list")
+        if not parked and role not in slot_roles:
+            problems.append(
+                f"prompt names fleet role {role!r}, which has no cluster slot in bench/tf/fleet/fixtures.json; "
+                "the runner records no cluster for it"
+            )
+
+
 def _catalog_roles() -> dict[str, Any]:
     """Roles in bench/tf/fleet/fixtures.json, which owns the vocabulary."""
     try:
@@ -1329,6 +1397,7 @@ def validate_case(
     spec = _load_yaml(path)
     if not isinstance(spec, dict):
         return [f"{path}: does not parse to a mapping"]
+    _fleet_prompt_placeholders(spec, problems, name in FIXTURE_NOT_READY)
 
     # The suite. A certification case says so in its file and sits in the
     # certification roster; one without the other is a case on the wrong lane.

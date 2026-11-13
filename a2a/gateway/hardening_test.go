@@ -31,6 +31,7 @@ import (
 // as at deletion: the terminal goes on the stream, the relay renders it,
 // and the conversation is free for the next ask.
 func TestSpawnFailureClosesTheTaskAsItsSupervisor(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	spawn.failSpawns(errors.New(`pods "chat-x" is forbidden: exceeded quota`))
 	conv := "discord:g1/thread-spawnfail"
@@ -78,6 +79,7 @@ func TestSpawnFailureClosesTheTaskAsItsSupervisor(t *testing.T) {
 // none gets a line that promises nothing
 // (TestSteerIntoTaskWithNoFirstEventPromisesNoReply).
 func TestSteerAckIsRouteConditioned(t *testing.T) {
+	t.Parallel()
 	t.Run("fixed route says it takes it next", func(t *testing.T) {
 		r := startRig(t)
 		conv := "discord:g1/thread-ackfixed"
@@ -134,6 +136,7 @@ func TestSteerAckIsRouteConditioned(t *testing.T) {
 // terminal — must be answered deterministically, never published as a task
 // that literally reads "stop".
 func TestStopWithNothingToStopStartsNoTask(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	conv := "discord:g1/thread-stopguard"
 
@@ -191,6 +194,7 @@ func TestStopWithNothingToStopStartsNoTask(t *testing.T) {
 // on the rollout" is a NEW task even on such an addressee, never a replay
 // of the dead one.
 func TestAfterAStopTheWideMatcherStaysOffForANoResumeAddressee(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	r.g.mu.Lock()
 	r.g.steersRefusedBy["platform"] = true
@@ -224,6 +228,7 @@ func TestAfterAStopTheWideMatcherStaysOffForANoResumeAddressee(t *testing.T) {
 // non-exact ask is a NEW task, not a replay of the dead one — while the
 // exact phrases still answer status.
 func TestAfterAStopANonExactStatusAskIsANewTask(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	conv := "discord:g1/thread-detachwide"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group",
@@ -251,6 +256,7 @@ func TestAfterAStopANonExactStatusAskIsANewTask(t *testing.T) {
 // for an executor that refuses follow-ups is
 // TestNoResumeAddresseeGetsTheWideStatusMatcher).
 func TestFixedRouteWideAskIsASteer(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	conv := "discord:g1/thread-wide"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "w-1", Text: "check the fleet"}
@@ -272,6 +278,7 @@ func TestFixedRouteWideAskIsASteer(t *testing.T) {
 // `final: true` assertion 10 forbids. TaskNotFound (a real "no events"
 // answer) still proceeds; that case is covered by the supervisor tests.
 func TestPreDeleteGuardKeepsPodWhenReplayFails(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	rec := &SessionRecord{Key: "discord:g1/thread-guard", ContextID: "ctx-guard",
 		BusSession: "chat-guard-0001", Addressee: "chat-guard-0001", PodName: "chat-guard-0001",
@@ -296,6 +303,7 @@ func TestPreDeleteGuardKeepsPodWhenReplayFails(t *testing.T) {
 // was lost (an acked event is never redelivered), so the heal posts the
 // replayed status card instead of clearing silently.
 func TestHealPostsTheLostTerminal(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	conv := "discord:g1/thread-heal"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group",
@@ -345,6 +353,7 @@ func TestHealPostsTheLostTerminal(t *testing.T) {
 // other terminals post no result, so their tail is genuine context and
 // stays.
 func TestCompletedResultRendersExactlyOnce(t *testing.T) {
+	t.Parallel()
 	const answer = "There once was a pod in a queue"
 	r := startRig(t)
 	conv := "discord:g1/thread-double"
@@ -399,6 +408,7 @@ func TestCompletedResultRendersExactlyOnce(t *testing.T) {
 // post no result, so the last narration on the rolling line is genuine
 // context there and must survive the completed-tail fix.
 func TestNonCompletedTerminalKeepsTheNarrationTail(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	conv := "discord:g1/thread-failtail"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group",

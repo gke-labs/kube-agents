@@ -220,7 +220,13 @@ CLAIM_TOKEN_FIELD = "claim"
 #: field on the record. The hook sends it back with the claim, so it needs no
 #: per-forge grammar for the proposal's url.
 REPO_FIELD = "repo"
-PROPOSAL_OPENED_FIELDS = ("url", "number", "title", CLAIM_TOKEN_FIELD, REPO_FIELD)
+#: The record's field for what the proposal fixes: the fleet audit's finding
+#: (`finding_id`, `cluster`, `namespace`, `object`), set by the caller that
+#: opened it and never sent to the broker. The hook records the proposal for the
+#: post-merge check only when it has one; Session KV derives the kind of fix
+#: from the finding id, and the check verifies the fix itself.
+TARGET_FIELD = "target"
+PROPOSAL_OPENED_FIELDS = ("url", "number", "title", CLAIM_TOKEN_FIELD, REPO_FIELD, TARGET_FIELD)
 
 
 @functools.lru_cache(maxsize=1)
@@ -260,19 +266,22 @@ def _on_the_wire(repository: object) -> object:
     return _registered_urls().get(repository.lower(), repository)
 
 
-def call(verb: str, payload: dict) -> dict:
-    """`POST /v1/vcs/<verb>`, and the stderr record of a proposal it opened (`PROPOSAL_OPENED_KEY`)."""
+def call(verb: str, payload: dict, target: dict | None = None) -> dict:
+    """`POST /v1/vcs/<verb>`, and the stderr record of a proposal it opened (`PROPOSAL_OPENED_KEY`).
+
+    `target` goes on that record only (`TARGET_FIELD`), never to the broker.
+    """
     answer = _call(verb, payload)
     if verb.replace("_", "-") == PROPOSAL_CREATE_VERB:
         claim = None
         if isinstance(answer, dict) and CLAIM_TOKEN_FIELD in answer:
             answer = dict(answer)
             claim = answer.pop(CLAIM_TOKEN_FIELD)
-        _say_opened(answer, claim)
+        _say_opened(answer, claim, target)
     return answer
 
 
-def _say_opened(answer: object, claim: object = None) -> None:
+def _say_opened(answer: object, claim: object = None, target: dict | None = None) -> None:
     """Write the `PROPOSAL_OPENED_KEY` record for the proposal in `answer`, if it names one.
 
     `claim` is the token `call()` took from the answer's top level. An answer
@@ -290,13 +299,15 @@ def _say_opened(answer: object, claim: object = None) -> None:
     fields = {
         field: proposal.get(field)
         for field in PROPOSAL_OPENED_FIELDS
-        if field not in (CLAIM_TOKEN_FIELD, REPO_FIELD)
+        if field not in (CLAIM_TOKEN_FIELD, REPO_FIELD, TARGET_FIELD)
     }
     if claim is not None:
         fields[CLAIM_TOKEN_FIELD] = claim
     repo = answer.get(REPO_FIELD)
     if isinstance(repo, str) and repo:
         fields[REPO_FIELD] = repo
+    if isinstance(target, dict) and target:
+        fields[TARGET_FIELD] = target
     record = {PROPOSAL_OPENED_KEY: PROPOSAL_OPENED_EVENT, "proposal": fields}
     # A process started with fd 2 closed has no `sys.stderr`, and `print` would then
     # write to stdout, ahead of the one JSON document the callers print there.
@@ -1561,7 +1572,7 @@ def discard(spec: str | None = None, key: str | None = None) -> dict:
 # ---- collaboration verbs --------------------------------------------------
 
 
-def forge(verb: str, payload: dict, repository: str | None = None) -> dict:
+def forge(verb: str, payload: dict, repository: str | None = None, target: dict | None = None) -> dict:
     """Every forge call: name the repository, POST, print what comes back.
 
     The repository is the only thing resolved locally, and only so a caller
@@ -1573,4 +1584,6 @@ def forge(verb: str, payload: dict, repository: str | None = None) -> dict:
         payload["repository"] = repository
     else:
         payload["repository"] = resolve_session(None)["spec"]
-    return call(verb, {key: value for key, value in payload.items() if value is not None})
+    sent = {key: value for key, value in payload.items() if value is not None}
+    # Only a caller naming a target passes one, so a stand-in for `call` keeps its two arguments.
+    return call(verb, sent, target=target) if target else call(verb, sent)
