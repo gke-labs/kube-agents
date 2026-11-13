@@ -1112,10 +1112,10 @@ func a2aStreamPolicies(replicas int) []busmigrate.StreamPolicy {
 			MaxBytes: maxBytes, MaxAge: ttl, Discard: nats.DiscardNew, MaxMsgsPerSubject: 1, AllowRollup: true, DenyDelete: true, AllowDirect: true, Replicas: replicas}
 	}
 	return []busmigrate.StreamPolicy{
-		stream("TASKS", []string{"a2a.tasks.>"}, 3*day, 21474836480, 4096),
+		stream("TASKS", []string{"a2a.tasks.>"}, 3*day, a2aTasksMaxBytes, 4096),
 		stream("DIRECTORY", []string{"a2a.agents.>"}, 0, 1073741824, 1),
 		stream(a2aTopicsStateStream, []string{"a2a.topics.agent.platform.upgrade-readiness", a2aTopologySkewSubject, "a2a.topics.shared.blueprint", "a2a.topics.shared.probe"}, 0, 1073741824, 8),
-		stream("TOPICS-JOURNAL", []string{"a2a.topics.shared.annotations"}, 30*day, 5368709120, -1),
+		stream("TOPICS-JOURNAL", []string{"a2a.topics.shared.annotations"}, 30*day, a2aTopicsJournalMaxBytes, -1),
 		kv("runtime-state", 268435456, 0),
 		kv("session-state", 268435456, 0),
 		kv("cap", 268435456, 0),
@@ -1761,9 +1761,10 @@ func (r *PlatformAgentReconciler) recordClearReport(ctx context.Context, agent *
 // the cap the restore would put on it (busMigrationStreamsOverCap).
 const reasonA2ABusMigrationStreamsOverCap = "A2ABusMigrationStreamsOverCap"
 
-// a2aBusJszPath is the monitoring endpoint's JetStream report, with each
-// stream's state.
-const a2aBusJszPath = "/jsz?streams=true"
+// a2aBusJszStreamsPath is the monitoring endpoint's JetStream report, with
+// each stream's state (the meta group check reads the summary alone,
+// a2aBusJszPath).
+const a2aBusJszStreamsPath = "/jsz?streams=true"
 
 // a2aBusStream is one stream's state as the bus's /jsz reports it: what
 // the restore's rendered-limit check reads from the snapshot.
@@ -1821,7 +1822,7 @@ func (r *PlatformAgentReconciler) a2aBusStreamState(ctx context.Context, agent *
 	}
 	ctx, cancel := context.WithTimeout(ctx, a2aBusVarzTimeout)
 	defer cancel()
-	url := fmt.Sprintf("http://%s.%s.svc:%d%s", a2aNATSName(agent), agent.Namespace, a2aNATSMonitorPort, a2aBusJszPath)
+	url := fmt.Sprintf("http://%s.%s.svc:%d%s", a2aNATSName(agent), agent.Namespace, a2aNATSMonitorPort, a2aBusJszStreamsPath)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err

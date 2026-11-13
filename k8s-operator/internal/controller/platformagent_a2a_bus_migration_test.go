@@ -1578,8 +1578,8 @@ func TestTheSnapshotPhaseCreatesAOnePodStage(t *testing.T) {
 	if got.Value() < caps || got.Value() > caps*12/10 || got.Value()%(1<<30) != 0 {
 		t.Errorf("stage request %s for %d bytes of caps; want at least the caps, within 20%%, in whole GiB", got.String(), caps)
 	}
-	if got.String() != "32Gi" {
-		t.Errorf("stage request %s, want 32Gi for today's caps (28.9 GiB with 10%% headroom)", got.String())
+	if got.String() != "15Gi" {
+		t.Errorf("stage request %s, want 15Gi for today's caps (13.0 GiB, 14.3 GiB with 10%% headroom)", got.String())
 	}
 }
 

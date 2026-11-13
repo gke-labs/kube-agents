@@ -499,7 +499,20 @@ RUN groupadd --gid 1001 hermes && \
 # these wrappers resolve, run, and report "credential proxy unavailable" — which
 # is the honest answer, and a much better one than a kubectl that is silently
 # absent.
-COPY --chmod=0755 agents/platform/scripts/credential_proxy_client.py /usr/local/bin/credential-proxy-exec
+#
+# credential-proxy-exec is a launcher that imports the client as a module, so
+# Python loads the client from bytecode compiled here and does not compile its
+# source at every brokered call. `unchecked-hash` bytecode is loaded without a
+# look at the source, and PYTHONDONTWRITEBYTECODE=1 does not stop compileall
+# from writing it. No `-o`, as for the standard library above. An edit of the
+# module in a running container has no effect until it is compiled again.
+# /opt/defaults/scripts keeps its own copy, with no bytecode beside it.
+COPY --chmod=0755 deploy/shared/credential-proxy-exec.py /opt/credential-proxy/libexec/credential-proxy-exec
+COPY --chmod=0644 agents/platform/scripts/credential_proxy_client.py /opt/credential-proxy/libexec/credential_proxy_client.py
+RUN python3 -m compileall -q --invalidation-mode unchecked-hash /opt/credential-proxy/libexec/credential_proxy_client.py && \
+    ln -s /opt/credential-proxy/libexec/credential-proxy-exec /usr/local/bin/credential-proxy-exec && \
+    python3 -v /usr/local/bin/credential-proxy-exec --help 2>&1 | \
+        grep "code object from '/opt/credential-proxy/libexec/__pycache__/credential_proxy_client\.cpython-[0-9]*\.pyc'" >/dev/null
 COPY --chmod=0755 deploy/shared/credential-proxy-path.sh /etc/profile.d/credential-proxy-path.sh
 COPY --chmod=0644 deploy/sandbox/sshd_config /etc/ssh/sshd_config
 COPY --chmod=0755 deploy/sandbox/entrypoint.sh /usr/local/bin/sandbox-entrypoint
@@ -584,9 +597,10 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          the only way out of this container that carries a
 #                          credential. Imported by vcs_client, and through it by
 #                          every verb. The same file is also COPYed to
-#                          /usr/local/bin/credential-proxy-exec above, as the
-#                          kubectl/gcloud shim; that copy is not importable by
-#                          module name, so it is staged here as well
+#                          /opt/credential-proxy/libexec above, for the
+#                          kubectl/gcloud shim's launcher; that folder is not
+#                          on these scripts' module path, so it is staged here
+#                          as well
 #   credential_shapes.py   the token shapes the feedback gate refuses and the broker
 #                          redacts before logging: one list, imported by
 #                          feedback_broker and submit_suggestion here and by
@@ -611,6 +625,9 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          files entrypoint.sh writes, then the session's variables
 #   automation_rules.py    checks a GitOps checkout's .kube-agents/automation.yaml,
 #                          the checkouts being here; imports kubeagents_switches
+#   post_merge_stepdown.py opens the revert and the rules-file pull request for an
+#                          auto-merged fix still broken after merge; imports
+#                          automation_rules, kubeagents_switches and vcs_client
 #   broker_admission.py    how wide the fleet-audit collectors sweep: it reads what
 #                          the broker admits at once (GET /v1/exec/admission)
 #                          through credential_proxy_client and sizes their pools
@@ -699,6 +716,7 @@ COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/fleet_scope_args.py \
      agents/platform/scripts/kubeagents_switches.py \
      agents/platform/scripts/automation_rules.py \
+     agents/platform/scripts/post_merge_stepdown.py \
      agents/platform/scripts/collector_run.py \
      agents/platform/scripts/broker_admission.py \
      agents/platform/scripts/vcs_client.py \

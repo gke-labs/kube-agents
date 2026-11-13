@@ -866,6 +866,7 @@ func buildA2ACalloutDeployment(agent *agentv1alpha1.PlatformAgent, taskSigningPu
 			},
 		},
 	}
+	withA2ATiersFile(agent, &dep.Spec.Template.Spec, "callout")
 	busMigrationFreezeCallout(agent, dep)
 	return dep
 }

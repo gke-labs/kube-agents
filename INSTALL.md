@@ -1191,7 +1191,10 @@ make docker-push IMG=$IMG
 
 ### Step 4: Deploy the Operator & CRDs
 
-Install the Custom Resource Definitions (CRDs) and deploy the controller manager deployment:
+Install the Custom Resource Definitions (CRDs) and deploy the controller manager deployment.
+`make deploy` applies `config/default` and then `config/profiles`, which creates the profile
+namespace (`kubeagents-system-profiles`, where `mode: next` runs profile workers) with the
+operator's namespaced Role and its RoleBinding in it; `make undeploy` deletes that namespace too:
 
 ```bash
 make install
@@ -1631,7 +1634,7 @@ When the checks in the entry above pass and a message still gets no reply, follo
   kubectl logs deploy/platform-agent-a2a-gateway -n kubeagents-system | grep console-only
   ```
   A match means no chat backend reached the gateway: check the backend's configuration (the `discord-bot` Secret's `token` key, or the CR's Google Chat or Slack settings).
-- **`next`: read the gateway's log.** Once it is up it logs `a2a gateway starting` naming the `backend` (a startup failure is logged before that line), a Slack gateway then logs `slack connected`, and every message that becomes a task logs `ingress` and, when it ends, `task terminal`.
+- **`next`: read the gateway's log.** Once it is up it logs `a2a gateway starting` naming the `backends` (a startup failure is logged before that line), a Slack gateway then logs `slack connected`, and every message that becomes a task logs `ingress` and, when it ends, `task terminal`.
 
   ```bash
   kubectl logs -n kubeagents-system deploy/platform-agent-a2a-gateway | tail -n 100

@@ -101,7 +101,7 @@ Pinned here so `make mirror-images` and the install ask for the same version.
 | `prometheus-nats-exporter` | `docker.io/natsio/prometheus-nats-exporter` | `0.20.3@sha256:4b8ddc1c86fec360b5cd3d5e1fbc6fb52bdafd5805bba3901cc52926538af255` | `A2A_NATS_EXPORTER_IMAGE` | The metrics sidecar in each pod of that NATS StatefulSet under spec.mode: next, and nothing under spec.mode: today. |
 | `k8s` | `docker.io/alpine/k8s` | `1.36.6` | — | The chart's pre-delete cleanup hook Job. |
 | `github-token-minter-server` | `us-docker.pkg.dev/abcxyz-artifacts/docker-images/github-token-minter-server` | `v2.7.1-amd64` | `GITHUB_MINTER_IMAGE` | The optional GitHub integration. |
-| `hindsight-api` | `ghcr.io/vectorize-io/hindsight-api` | `0.10.2@sha256:1ba631f950a04460feff6b1e212bad3cdf127b0cfb3d765bdcba12f512481d7b` | `HINDSIGHT_API_IMAGE` | The chart, when the memory provider uses Hindsight (make deploy-hindsight for the kustomize dev path). |
+| `hindsight-api` | `ghcr.io/vectorize-io/hindsight-api` | `0.10.3@sha256:f80f304db313cbc8775acd601fda7d094f5854ebf9bc252d8134eb9276d56b40` | `HINDSIGHT_API_IMAGE` | The chart, when the memory provider uses Hindsight (make deploy-hindsight for the kustomize dev path). |
 | `hindsight-postgresql` | `docker.io/pgvector/pgvector` | `0.8.7-pg15@sha256:88164492558c9773a1e17a8305abaca7863e05b3d8bbcdb792774890a2047e06` | `HINDSIGHT_POSTGRES_IMAGE` | The chart, alongside the Hindsight API. |
 | `cert-manager-controller` | `quay.io/jetstack/cert-manager-controller` | `v1.21.3` | — | cert-manager, installed by the full-install composition unless enable_cert_manager is false. |
 | `cert-manager-cainjector` | `quay.io/jetstack/cert-manager-cainjector` | `v1.21.3` | — | cert-manager, installed by the full-install composition unless enable_cert_manager is false. |
@@ -118,10 +118,10 @@ Needed only to rebuild the images above from source, not to run an install. Each
 | `hermes-agent` | `docker.io/nousresearch/hermes-agent` | `HERMES_AGENT_TAG` in [`tags.env`](https://github.com/gke-labs/kube-agents/blob/main/tags.env) | `HERMES_AGENT_IMAGE` | deploy/docker/Dockerfile (agent-base stage). |
 | `envoy` | `docker.io/envoyproxy/envoy` | `v1.39.6` | `ENVOY_IMAGE` | deploy/docker/Dockerfile (envoy-bin stage). |
 | `golang` | `docker.io/library/golang` | `1.27-alpine` | `GOLANG_IMAGE` | deploy/docker/Dockerfile, deploy/kube-proxy/Dockerfile, k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.dispatcher, a2a/Dockerfile.gateway, a2a/Dockerfile.hermes-bridge, a2a/Dockerfile.verifier, a2a/Dockerfile.web-console, a2a/Dockerfile.worker and a2a/Dockerfile.console builder stages. |
-| `node` | `docker.io/library/node` | `22-slim` | `NODE_IMAGE` | a2a/Dockerfile.worker runtime stage and a2a/Dockerfile.console page build stage. |
+| `node` | `docker.io/library/node` | `24-slim` | `NODE_IMAGE` | a2a/Dockerfile.worker runtime stage and a2a/Dockerfile.console page build stage. |
 | `python` | `docker.io/library/python` | `3.14-slim` | `PYTHON_IMAGE` | examples/inference-replay/replay-proxy/Dockerfile, hack/replay-proxy/Dockerfile and deploy/sandbox/Dockerfile. |
 | `distroless-static` | `gcr.io/distroless/static` | `nonroot` | `DISTROLESS_IMAGE` | deploy/kube-proxy/Dockerfile, k8s-operator/Dockerfile, a2a/Dockerfile.authcallout, a2a/Dockerfile.dispatcher, a2a/Dockerfile.gateway, a2a/Dockerfile.verifier, a2a/Dockerfile.web-console and a2a/Dockerfile.console runtime stages. |
-| `busybox` | `docker.io/library/busybox` | `musl@sha256:ea2b9914a16a4ac1981994af97b318f7c7d4db76b580c56177f08bf76f4a0be8` | — | agentplugins/*/Dockerfile and a2a/Dockerfile.persona-* base images. |
+| `busybox` | `docker.io/library/busybox` | `musl@sha256:80e38f9a1b39188b8bdb28879178edb322a4402b081a9aedda1924609decd6f6` | — | agentplugins/*/Dockerfile and a2a/Dockerfile.persona-* base images. |
 
 <!-- prettier-ignore-end -->
 <!-- END GENERATED: container-images -->
