@@ -14285,5 +14285,32 @@ print_generate_only_handoff "/tmp/test-repo" "test-proj" "test-cluster" "us-cent
         self.assertIn("for tool in git gcloud kubectl gh helm jq terraform gke-gcloud-auth-plugin python3; do", self.text)
 
 
+class EmptyArrayExpansionsAreGuardedTest(unittest.TestCase):
+    """Three arrays that can be empty are expanded in the form bash 3.2 accepts.
+
+    Under `set -u`, bash before 4.4 (macOS's /bin/bash is 3.2) reads the
+    expansion of an empty array as an unbound variable. The behavioural tests
+    for these sites cannot see the guard missing on the bash CI runs, so this
+    pins the shape for the arrays named here, and for no other array: every
+    `${name[@]}` or `${name[*]}` is the inner half of `${name[@]+"${name[@]}"}`.
+    """
+
+    # (file, array).
+    GUARDED_ARRAYS = (
+        (_INSTALL_SH, "ctx_flag"),
+        (_INSTALL_SH, "segs"),
+        (_REPO_ROOT / "uninstall.sh", "dispatch_args"),
+    )
+
+    def test_each_expansion_of_these_arrays_is_guarded(self):
+        for path, array in self.GUARDED_ARRAYS:
+            source = path.read_text()
+            guarded = source.count(f'${{{array}[@]+"${{{array}[@]}}"}}')
+            expansions = len(re.findall(rf"\$\{{{array}\[[@*]\]\}}", source))
+            with self.subTest(file=path.name, array=array):
+                self.assertGreaterEqual(guarded, 1)
+                self.assertEqual(expansions, guarded, f"{path.name}: a bare expansion of {array} is back")
+
+
 if __name__ == "__main__":
     unittest.main()
