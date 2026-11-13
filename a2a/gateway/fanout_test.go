@@ -966,3 +966,209 @@ func TestALongQuestionIsCutAndSaysSo(t *testing.T) {
 		t.Fatalf("the cut question isn't named: %s", got[:min(len(got), 600)])
 	}
 }
+
+// TestAWithdrawnBatchLeavesAChildThatAlreadyEndedAlone: a batch cut short
+// by a restart whose first child has already ended is withdrawn when its
+// request comes back another size. The ended child gets no cancel and no
+// second terminal line, and it leaves the parent's children, so the
+// parent's own end can end the chain.
+func TestAWithdrawnBatchLeavesAChildThatAlreadyEndedAlone(t *testing.T) {
+	t.Parallel()
+	r, spawn := startBatchRig(t, 3)
+	ctx := context.Background()
+	conv := "discord:g1/t-fanout-ended-withdraw"
+	r.g.beforeBatchChild = func(i int) bool { return i == 1 }
+	exec, origin, _ := sessionTurn(t, r, spawn, conv, "x")
+	if err := exec.PublishArtifact(ctx, delegateBatchArtifact(t, platformTask("one"), platformTask("two"), platformTask("three"))); err != nil {
+		t.Fatal(err)
+	}
+	first := awaitSubmission(t, r, targetPlatform, 0)
+	waitFor(t, "the cut-short mint", loggedContaining(r, "delegation batch cut short"))
+	r2, _ := restartRig(t, r)
+	child := r2.execFor(t, first, targetPlatform)
+	if err := child.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the first child's end recorded", func() bool {
+		rec, _ := r2.g.reg.Get(ctx, conv)
+		ref, ok := rec.TaskRefFor(first.TaskID)
+		return ok && ref.BatchEnd != nil
+	})
+	if err := exec.PublishArtifact(ctx, delegateBatchArtifact(t, platformTask("one"), platformTask("two"))); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the batch withdrawn", func() bool {
+		rec, _ := r2.g.reg.Get(ctx, conv)
+		pref, _ := rec.TaskRefFor(origin.TaskID)
+		return pref.DelegationEnd != ""
+	})
+	for _, e := range inSubjectEnvelopes(t, r2.url, targetPlatform) {
+		if e.Kind == lib.KindCancel && e.TaskID == first.TaskID {
+			t.Fatalf("a cancel went to child %s, which had already ended", first.TaskID)
+		}
+	}
+	if n := strings.Count(r2.logs.String(), "task terminal") - strings.Count(strings.ReplaceAll(r2.logs.String(), first.TaskID, ""), "task terminal"); n > 1 {
+		t.Fatalf("child %s has %d terminal lines, want 1", first.TaskID, n)
+	}
+	rec, _ := r2.g.reg.Get(ctx, conv)
+	pref, _ := rec.TaskRefFor(origin.TaskID)
+	if len(pref.Children) != 0 {
+		t.Fatalf("the parent still links %v after the withdrawal", pref.Children)
+	}
+}
+
+// TestTheHistoryCapKeepsAWithdrawnBatchsKeptChild: a withdrawn batch
+// (DelegationEnd) whose child stayed on the record, its cancel unpublished,
+// is still live: the chain ends when that child does, so the parent, the
+// root and the child are kept however old. Once the child has ended, the
+// chain is history like any other.
+func TestTheHistoryCapKeepsAWithdrawnBatchsKeptChild(t *testing.T) {
+	rec := &SessionRecord{}
+	rec.Tasks = append(rec.Tasks,
+		TaskRef{ID: "root", BatchSize: 2, Children: []string{"k1"}, DelegationEnd: notStartedEnd(whyChildOffBus)},
+		TaskRef{ID: "k1", Role: taskRoleChild, ParentTaskID: "root", RootTaskID: "root", BatchIndex: 1})
+	for i := range taskHistoryCap {
+		rec.Tasks = append(rec.Tasks, TaskRef{ID: fmt.Sprintf("old-%d", i)})
+	}
+	rec.trimHistory()
+	for _, id := range []string{"root", "k1"} {
+		if _, ok := rec.TaskRefFor(id); !ok {
+			t.Fatalf("the withdrawn batch's live %s was evicted", id)
+		}
+	}
+	if len(rec.Tasks) != taskHistoryCap {
+		t.Fatalf("history = %d entries, want the cap %d", len(rec.Tasks), taskHistoryCap)
+	}
+
+	rec.setBatchEnd("k1", &BatchEnd{State: lib.StateCanceled})
+	rec.Tasks = append(rec.Tasks, TaskRef{ID: "newest"})
+	rec.trimHistory()
+	if _, ok := rec.TaskRefFor("root"); ok || len(rec.Tasks) != taskHistoryCap {
+		t.Fatalf("an ended withdrawn batch's root kept past the cap: %d entries", len(rec.Tasks))
+	}
+}
+
+// TestAWithdrawnBatchsKeptChildOutlivesTheHistoryCap: a withdrawn batch
+// whose kept child runs on while later turns pass the history cap still
+// ends its chain once, on the root, canceled: the parent, the root and the
+// child stay on the record, and nothing wakes or says the requester is gone.
+func TestAWithdrawnBatchsKeptChildOutlivesTheHistoryCap(t *testing.T) {
+	t.Parallel()
+	r, spawn, obs := startFanOutRig(t, 2)
+	ctx := context.Background()
+	conv := "discord:g1/t-fanout-withdrawn-kept-cap"
+	exec, origin, session := sessionTurn(t, r, spawn, conv, "x")
+	narrowTasksStream(t, r.url, session)
+	art := delegateBatchArtifact(t, clusterTask("dev", "first"), platformTask("second"))
+	if err := exec.PublishArtifact(ctx, art); err != nil {
+		t.Fatal(err)
+	}
+	first := submissionOn(t, r, "cluster")
+	waitFor(t, "the failed cancel", loggedContaining(r, "cancel publish failed for a withdrawn batch child", first.TaskID))
+	completeTask(t, exec, "delegated the checks")
+	waitFor(t, "parent terminal relayed", postedContaining(r, "delegated the checks"))
+	waitFor(t, "the active slot released", func() bool {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		return rec.ActiveTask == nil
+	})
+
+	// Later turns: a history at the cap, then one more turn, which trims.
+	rec, err := r.g.reg.Get(ctx, conv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range taskHistoryCap {
+		rec.Tasks = append(rec.Tasks, TaskRef{ID: fmt.Sprintf("later-%d", i), Addressee: session})
+	}
+	if err := r.g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	sessionRigTurn(r, conv, "later-turn", "and the next thing")
+	r.awaitTask(t, session)
+	waitFor(t, "the later turn trimmed the history", func() bool {
+		rec, _ := r.g.reg.Get(ctx, conv)
+		_, ok := rec.TaskRefFor("later-0")
+		return !ok || len(rec.Tasks) <= taskHistoryCap+2
+	})
+	rec, _ = r.g.reg.Get(ctx, conv)
+	for _, id := range []string{origin.TaskID, first.TaskID} {
+		if _, ok := rec.TaskRefFor(id); !ok {
+			t.Fatalf("the withdrawn batch's live %s was evicted", id)
+		}
+	}
+
+	if err := r.execFor(t, first, "cluster").PublishStatus(ctx, lib.StateCanceled, true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the root's terminal", func() bool { _, ok := obs.terminalFor(origin.TaskID); return ok })
+	if end, _ := obs.terminalFor(origin.TaskID); end.state != lib.StateCanceled {
+		t.Fatalf("root terminal = %+v, want canceled", end)
+	}
+	terminals := 0
+	for _, e := range obs.events() {
+		if e.task == first.TaskID {
+			t.Fatalf("the observer was told about the child %s: %v", first.TaskID, obs.kinds())
+		}
+		if e.task == origin.TaskID && e.kind == "terminal" {
+			terminals++
+		}
+	}
+	if terminals != 1 {
+		t.Fatalf("root terminals = %d, want 1: %v", terminals, obs.kinds())
+	}
+	if postedContaining(r, noticeWakeNoRequester)() {
+		t.Fatal("a withdrawn batch said its requester was gone")
+	}
+	if len(spawn.calls()) != 1 || wakeEntries(t, r, conv) != 0 {
+		t.Fatal("a withdrawn batch woke the session")
+	}
+}
+
+// TestASessionCommandSteerDuringAFanOutIsRefused: "/session <text>" on a
+// session-routed conversation whose batch runs is a steer like any other
+// text, so it is refused the same way: nothing reaches the parent's ended
+// turn.
+func TestASessionCommandSteerDuringAFanOutIsRefused(t *testing.T) {
+	t.Parallel()
+	r, spawn := startBatchRig(t, 2)
+	conv := "discord:g1/t-fanout-session-steer"
+	f := fanOut(t, r, spawn, conv, platformTask("one"), platformTask("two"))
+	sessionRigTurn(r, conv, "steer-1", "/session also check memory")
+	waitFor(t, "the refusal", postedContaining(r, fmt.Sprintf(noticeFanOutSteer, 2)))
+	for _, e := range inSubjectEnvelopes(t, r.url, f.session) {
+		if e.Kind == lib.KindMessage && e.TaskID == f.origin.TaskID && strings.Contains(envText(t, e), "memory") {
+			t.Fatal("the steer reached the parent's turn")
+		}
+	}
+	if len(spawn.calls()) != 1 {
+		t.Fatal("the steer started a turn")
+	}
+}
+
+// TestABareSessionCommandDuringAFanOutIsTruthful: a bare "/session" on a
+// conversation not yet session-routed while a batch runs doesn't promise
+// that the next message reaches a running task: it says the delegated tasks
+// run and that a message meanwhile is not sent.
+func TestABareSessionCommandDuringAFanOutIsTruthful(t *testing.T) {
+	t.Parallel()
+	r, spawn := startBatchRig(t, 2)
+	ctx := context.Background()
+	conv := "discord:g1/t-fanout-bare-session"
+	fanOut(t, r, spawn, conv, platformTask("one"), platformTask("two"))
+	rec, err := r.g.reg.Get(ctx, conv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec.SessionRouted = false
+	if err := r.g.reg.Put(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	sessionRigTurn(r, conv, "bare-1", "/session")
+	want := fmt.Sprintf(noticeSessionOnDuringFanOut, 2, "platform")
+	waitFor(t, "the fan-out reply", postedContaining(r, want))
+	for _, p := range r.adapter.postTexts() {
+		if strings.Contains(p, "the running task finishes first") {
+			t.Fatalf("a bare /session promised a running task during a fan-out: %s", p)
+		}
+	}
+}

@@ -519,7 +519,11 @@ func (g *Gateway) withdrawBatch(ctx context.Context, rec *SessionRecord, taskID 
 	kept := map[string]bool{}
 	for _, id := range minted {
 		ref, ok := rec.TaskRefFor(id)
-		if !ok {
+		// A child that already ended (a batch cut short whose first children
+		// finished before the request came back) needs no cancel and has its
+		// terminal line already. Not kept, so it leaves the record and the
+		// parent's children below, and the parent's own end ends the chain.
+		if !ok || ref.BatchEnd != nil {
 			continue
 		}
 		g.publishDispatchStop(ctx, ref)

@@ -4495,13 +4495,54 @@ FLEET_RESOURCE_ROLES = {
     # runs bench/tf/fleet/seeded_b_pin.py, whose reads are `gcloud container
     # get-server-config` and `clusters describe` as the reconciler.
     "external": {"roles/container.admin"},
-    "google_client_config": set(),
 }
 # Every kubernetes_* resource is an in-cluster write, which container.admin
 # grants through the GKE IAM webhook.
 FLEET_KUBERNETES_ROLES = {"roles/container.admin"}
 # Needed by every google_* call regardless of type.
 FLEET_PROVIDER_ROLES = {"roles/serviceusage.serviceUsageConsumer"}
+
+
+class FleetKubernetesProvidersUseExecAuthTest(unittest.TestCase):
+    """Every `provider "kubernetes"` block in the fleet stack authenticates
+    through gke-gcloud-auth-plugin on each call and carries no `token`.
+
+    hack/fleet_reconcile.py saves the plan and applies it, so a token read at
+    plan time travels inside the plan and is dead an hour later; a project
+    whose node pools roll before its in-cluster fixtures then fails every
+    Kubernetes write with Unauthorized. Read through the HCL tokenizer the
+    next class loads, so a commented-out `exec` or a brace inside a comment
+    is read as HCL reads it.
+    """
+
+    _FLEET = checker._ROOT / "bench" / "tf" / "fleet"
+    _PLUGIN = "gke-gcloud-auth-plugin"
+    _PROVIDER_BLOCK, _PROVIDER_LABELS, _KUBERNETES = "provider", 1, "kubernetes"
+    _TOKEN_ATTRIBUTE, _EXEC_BLOCK = "token", "exec"
+    _API_VERSION_ATTRIBUTE, _COMMAND_ATTRIBUTE = "api_version", "command"
+
+    @classmethod
+    def _kubernetes_providers(cls, fleet):
+        """(file name, attributes, [exec block attributes]) per kubernetes provider."""
+        hcl, providers = FleetResourceTypesAreCoveredByReconcilerRolesTest._tokenizer(), []
+        for path in sorted(fleet.glob("*.tf")):
+            for labels, body in hcl._blocks(hcl._tokens(path.read_text()), cls._PROVIDER_BLOCK, cls._PROVIDER_LABELS):
+                if labels[0] == cls._KUBERNETES:
+                    execs = [hcl._attributes(block) for block in hcl._nested_blocks(body, cls._EXEC_BLOCK)]
+                    providers.append((path.name, hcl._attributes(body), execs))
+        return providers
+
+    def test_every_kubernetes_provider_runs_the_plugin_and_bakes_no_token(self):
+        providers = self._kubernetes_providers(self._FLEET)
+        self.assertTrue(providers, 'no provider "kubernetes" block under %s' % self._FLEET)
+        for name, attributes, execs in providers:
+            with self.subTest(file=name):
+                self.assertNotIn(self._TOKEN_ATTRIBUTE, attributes, "%s: a kubernetes provider reads a token at plan time" % name)
+                self.assertEqual(len(execs), 1, "%s: a kubernetes provider without one exec block" % name)
+                self.assertIn(self._API_VERSION_ATTRIBUTE, execs[0], "%s: the exec block sets no api_version" % name)
+                command = execs[0].get(self._COMMAND_ATTRIBUTE)
+                self.assertIsNotNone(command, "%s: the exec block sets no command" % name)
+                self.assertEqual(command[1].strip('"'), self._PLUGIN, "%s: the exec command is not the plugin" % name)
 
 
 class FleetResourceTypesAreCoveredByReconcilerRolesTest(unittest.TestCase):
