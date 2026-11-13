@@ -4952,6 +4952,12 @@ resolve_existing_install_gvisor() { # <project> <cluster> <location> [cluster_mo
     printf 'true'
     return 0
   fi
+  # A state that holds the release and no sandbox answers for either shape: a
+  # live pool it does not record is not this install's to plan around.
+  if [ "$recorded" = "false" ]; then
+    printf 'false'
+    return 0
+  fi
   if [ -z "$mode" ]; then
     local autopilot
     autopilot="$(trap - ERR; gcloud container clusters describe "$cluster" --location "$location" \
@@ -4960,12 +4966,6 @@ resolve_existing_install_gvisor() { # <project> <cluster> <location> [cluster_mo
       True|true) mode="autopilot" ;;
       *) mode="standard" ;;
     esac
-  fi
-  # A state that holds the release and no sandbox answers for either shape: a
-  # live pool it does not record is not this install's to plan around.
-  if [ "$recorded" = "false" ]; then
-    printf 'false'
-    return 0
   fi
   if [ "$mode" = "autopilot" ]; then
     # No state to read. Autopilot has no pool to list, and a fresh install
@@ -5175,8 +5175,10 @@ write_tfvars_from_state() {
 
   # MEMORY is the one key whose absence from install.env costs DATA rather than
   # re-creatable infrastructure. Every other key the generator defaults --
-  # ENABLE_GVISOR, ENABLE_GKE_BACKUP_PLAN, ENABLE_STOCKOUT_INVESTIGATOR and the
-  # rest -- names something Terraform can build again; this one names the
+  # ENABLE_GKE_BACKUP_PLAN, ENABLE_STOCKOUT_INVESTIGATOR and the rest -- names
+  # something Terraform can build again (ENABLE_GVISOR, also read from the live
+  # install, does so for the sandbox rather than for data:
+  # resolve_existing_install_gvisor); this one names the
   # hindsight-postgresql StatefulSet and the volume holding the database. So it
   # is the one the generator goes and asks the cluster about when nobody told
   # it, rather than taking the project default.

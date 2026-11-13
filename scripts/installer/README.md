@@ -248,7 +248,7 @@ whatever the default does not mention. `ENABLE_GVISOR` is the exception: absent,
 from the live install (the Terraform state's gVisor pool or the release's runtimeClassName,
 then the cluster's node pools; Autopilot with no state keeps the sandbox), and `lifecycle.sh`
 refuses an apply that would destroy a gVisor pool unless `KUBEAGENTS_ALLOW_NODE_POOL_DESTROY=true`
-(`upgrade.sh --allow-node-pool-destroy`) confirms it (#5824); `MEMORY` absent falls back to `file` unless
+(`upgrade.sh --allow-node-pool-destroy`) confirms it; `MEMORY` absent falls back to `file` unless
 `write_tfvars_from_state` finds a live Hindsight deployment (`hindsight-postgresql` or
 `hindsight-api`) on the target cluster, in which case `kube_agents_memory` is preserved
 (`--memory=file` or `MEMORY=file` is required to tear it down);

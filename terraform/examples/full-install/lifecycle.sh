@@ -1172,7 +1172,7 @@ guard_node_pool_shape() {
 # see). Turning the sandbox off on purpose is a deliberate act and says so:
 # KUBEAGENTS_ALLOW_NODE_POOL_DESTROY=true, which upgrade.sh sets for
 # --allow-node-pool-destroy and install.sh for an explicit
-# --enable-gvisor=false or the control panel's switch turned off. Same shape
+# --enable-gvisor=false or "No" at its interview's gVisor prompt. Same shape
 # as guard_standard_node_count.
 guard_gvisor_pool_teardown() {
   load_state
@@ -1187,7 +1187,7 @@ guard_gvisor_pool_teardown() {
   warn "enable_gvisor_node_pool resolved to '$enabled', but this state's cluster runs the gVisor pool ($GVISOR_POOL_ADDRESS)."
   warn "Applying now would DESTROY that pool under -auto-approve, and the agent pod, which runs on it, with nowhere sandboxed to go."
   warn "To keep it, set ENABLE_GVISOR=\"true\" in install.env (or enable_gvisor_node_pool = true in terraform.tfvars for a hand-driven apply)."
-  warn "To turn the sandbox off on purpose, re-run with --allow-node-pool-destroy (upgrade.sh), --enable-gvisor=false (install.sh),"
+  warn "To turn the sandbox off on purpose, re-run with --allow-node-pool-destroy (upgrade.sh), --enable-gvisor=false or \"No\" at the gVisor prompt (install.sh),"
   warn "or KUBEAGENTS_ALLOW_NODE_POOL_DESTROY=true for a hand-driven apply."
   exit 1
 }

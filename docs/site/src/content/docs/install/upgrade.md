@@ -759,7 +759,8 @@ Every one of these stops the run before any of the new release is applied. The f
 settled before the run touches the cluster at all. The last six need the cluster: they are settled
 after `kubectl` has been pointed at it, and except for the breaking-change check, after a real run's
 pre-flight Secret backfills (a plan skips those). They still run before any CRD, chart or Terraform
-change of the new release.
+change of the new release. One is the exception: the gVisor node-pool refusal comes from the
+Terraform apply itself, so a full upgrade it stops has already applied the new release's CRDs.
 
 - **The sources do not match the release.** The checkout's `HEAD` is not the release's commit, the
   tree has uncommitted changes, or an unpacked tree names a release other than the one asked for —
@@ -788,7 +789,8 @@ change of the new release.
   warns instead. A move between two release tags to the newer one is not checked, and neither is a
   run whose tag is read off the install. See [Rolling back a release](/kube-agents/deploy/rollback/).
 - **The apply would destroy the gVisor node pool.** A full upgrade whose `ENABLE_GVISOR` resolves
-  to `false` on a Standard install that runs the gVisor pool stops before `terraform apply`. With no
+  to `false` on a Standard install that runs the gVisor pool stops before `terraform apply`, after
+  the CRDs (see above). With no
   `ENABLE_GVISOR` in `install.env`, the upgrade reads the live install instead: the Terraform state,
   then the cluster's node pools. On Autopilot with no state to read, it keeps the sandbox. To keep
   the pool, set `ENABLE_GVISOR="true"`. To turn the sandbox off on purpose, re-run with
