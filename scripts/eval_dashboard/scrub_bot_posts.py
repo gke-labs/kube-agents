@@ -422,6 +422,10 @@ def plan_infrastructure(issue: dict) -> Action:
 def issue_kind(issue: dict) -> tuple[str, str | None]:
     """Which bot issue this is, and its key (the case, job or slug)."""
     body = text_of(issue)
+    if nightly_bugs.GROUP_MARKER_RE.search(body):
+        # A group issue carries every case's marker and postdates the
+        # scrub: rewritten to one case's body, it would drop the others.
+        return KIND_OTHER, None
     marker = nightly_bugs.BOT_MARKER_RE.search(body)
     if marker:
         return {nightly_bugs.KIND_RED: KIND_NIGHTLY_RED, nightly_bugs.KIND_INFRA: KIND_NIGHTLY_INFRA, nightly_bugs.KIND_LOST: KIND_NIGHTLY_LOST}[marker.group(1)], marker.group(2)

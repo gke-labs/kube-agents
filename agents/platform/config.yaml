@@ -50,6 +50,11 @@ mcp_servers:
       GKE_PROJECT_ID: "${GKE_PROJECT_ID}"
       GKE_LOCATION: "${GKE_LOCATION}"
       GKE_CLUSTER_NAME: "${GKE_CLUSTER_NAME}"
+      # The kube-api proxy's URL, which the operator sets on this container
+      # when the shell's kubectl goes through that proxy. gke_endpoint reads it
+      # to skip choosing get-credentials endpoint flags that would not reach
+      # the kubeconfig (gke_endpoint.KUBE_PROXY_ENVS).
+      KUBE_PROXY_IN_USE_URL: "${KUBE_PROXY_IN_USE_URL}"
       # Hermes hands a stdio MCP server only a safe baseline (PATH, HOME, …) plus the
       # keys named here (`_build_safe_env` in hermes `tools/mcp_tool.py`), so without
       # this line the `hermes send` behind send_notification has no home channel and

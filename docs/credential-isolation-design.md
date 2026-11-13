@@ -804,11 +804,27 @@ on the sandbox side. The visible pin
 that profile scaffolding records and the Cluster Agent preflight inspects
 therefore still exists, without being what a later command opens.
 
+With the kube-api proxy in use (`KUBE_PROXY_URL` set in the shell sandbox),
+the shim answers a `get-credentials` that names its cluster, one location and
+`--project` itself (#5447). One `/v1/gcp/` read of the cluster (the relay's
+`gcp.api.container.clusters-get` route, on the broker's identity) checks that
+the cluster exists and is running. Then the shim writes the same kube-proxy
+kubeconfig it builds from a broker answer. No broker command runs, so there is
+no command audit line (the relay's line names the principal and the path) and
+no managed kubeconfig is filed for that cluster. Any other answer, any other
+argv, and a profile task's call go to the broker as above. The read carries the
+`X-Kube-Agents-Get-Credentials-Check` header, and the broker refuses it for a
+cluster `spec.scope.exclude.clusters` names, so the call goes to the broker's
+`get-credentials`, which refuses that cluster itself. The header only narrows:
+without it the read is unchanged, so other control-plane reads of an excluded
+cluster stay allowed.
+
 Consequences:
 
 - Naming a cluster is not additional authority. `get-credentials` is bound by
   the same Workload Identity the broker already holds, so the sandbox can only
-  name clusters that identity could already reach.
+  name clusters that identity could already reach. The relay read that answers
+  a `get-credentials` in the shim runs on that identity too.
 - Only GKE contexts are supported, because the context name is what makes
   regeneration possible. A pin the proxy cannot regenerate from — no
   `current-context`, a non-GKE context name, or a merged `path1:path2` list — is

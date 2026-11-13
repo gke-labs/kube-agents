@@ -171,7 +171,9 @@ type a2aAuthMapIdentity struct {
 	// Narrowing is omitted for the ordinary principals, so adding it changed
 	// no existing entry's bytes and therefore no existing version. Where it
 	// is set, the callout ignores Grants entirely and derives them from the
-	// claim it attested — and refuses the map if Grants is not empty.
+	// claim it attested — and refuses the map if Grants is not empty. The
+	// exception is "dispatcher" (#5381): its Grants are served as written to
+	// its control connection, and its per-profile grants are derived.
 	Narrowing string `json:"narrowing,omitempty"`
 
 	// Profile and Topics are set only on an AgentProfile's entry, which
@@ -186,6 +188,12 @@ type a2aAuthMapIdentity struct {
 	// Tier is the tier a profile entry's pods run at (#3655): one entry, and
 	// one ServiceAccount, per tier the profile allows. Omitted elsewhere.
 	Tier string `json:"tier,omitempty"`
+
+	// Draining is set only on the dispatcher's entry when it narrows on
+	// "dispatcher" (#5381): the profiles it still drains, by name, which have
+	// no profile entry for the callout to derive their grants from. Omitted
+	// elsewhere.
+	Draining []string `json:"draining,omitempty"`
 }
 
 // a2aAuthMapTopics mirrors the callout's TopicGrants.
@@ -205,7 +213,7 @@ type a2aAuthMapDocument struct {
 	// watches each name, and refuses a document whose stamps disagree with
 	// what it was told or with the name it arrived under. Plain ints
 	// rather than omitted at zero, so shard 0 of 1 carries the keys too
-	// and the schema is one shape (a2aIdentityMapSchema, schema 5).
+	// and the schema is one shape (a2aIdentityMapSchema, since schema 5).
 	Shard  int `json:"shard"`
 	Shards int `json:"shards"`
 
@@ -247,18 +255,21 @@ func renderA2AAuthMapDraining(agent *agentv1alpha1.PlatformAgent, profiles []age
 		})
 	}
 	identities = append(identities, agentProfileMapEntries(agent, profiles)...)
-	// The dispatcher, when this operator has an image for it. Its grants
-	// name each durable the operator creates, so it is built here, from the
-	// same profiles (platformagent_a2a_dispatcher.go).
+	// The dispatcher, unless it is switched off. Its grants name each
+	// durable the operator creates, so it is built here, from the same
+	// profiles (platformagent_a2a_dispatcher.go). Past the ceiling one shard
+	// can carry it is left out, and the operator runs no dispatcher
+	// (a2aDispatcherCeiling, gke-labs/kube-agents#5381).
 	if a2aDispatcherEnabled() {
-		names, durables := dispatcherGrantNames(agent, profiles, draining)
-		id := dispatcherIdentity(agent, agent.Namespace, names, durables)
-		identities = append(identities, a2aAuthMapIdentity{
-			ServiceAccount: id.serviceAccount,
-			User:           id.user,
-			Account:        id.account,
-			Grants:         a2aAuthMapGrants{Publish: id.publish, Subscribe: id.subscribe},
-		})
+		_, over, err := a2aDispatcherCeiling(agent, profiles, draining)
+		if err != nil {
+			return a2aAuthMapDocument{}, err
+		}
+		if !over {
+			// Bucketed or not (dispatcherMapEntry); unbucketed, it is
+			// a2aDispatcherMapEntry's entry, which the ceiling measured.
+			identities = append(identities, dispatcherMapEntry(agent, profiles, draining))
+		}
 	}
 
 	// Refuse here what the callout would refuse there.
@@ -279,7 +290,7 @@ func renderA2AAuthMapDraining(agent *agentv1alpha1.PlatformAgent, profiles []age
 	// enforcement point and cannot be removed; this one exists so the failure
 	// surfaces as a reconcile error naming the offending entry, at the moment
 	// it is introduced, instead of as a condition that quietly lies.
-	if err := validateA2AAuthMapIdentities(identities); err != nil {
+	if err := validateA2AAuthMapIdentities(identities, a2aDrainingNameExclusions(agent)...); err != nil {
 		return a2aAuthMapDocument{}, err
 	}
 
@@ -313,17 +324,7 @@ func renderA2AAuthMapDraining(agent *agentv1alpha1.PlatformAgent, profiles []age
 // Greedy and in order, so the same identities always cut the same way and an
 // unchanged map never moves an entry between shards.
 func shardA2AAuthMap(doc a2aAuthMapDocument) ([]a2aAuthMapDocument, error) {
-	prefix := strings.Repeat(a2aAuthMapIndent, a2aAuthMapIdentityDepth)
-	// The bytes one identity adds to a shard's body: its indented encoding
-	// at the depth it is rendered, the indent before its first line, and
-	// the separator after it.
-	entryBytes := func(id a2aAuthMapIdentity) (int, error) {
-		body, err := encodeA2AJSONPrefixed(id, prefix, a2aAuthMapIndent)
-		if err != nil {
-			return 0, err
-		}
-		return len(prefix) + len(body) + len(",\n"), nil
-	}
+	entryBytes := a2aAuthMapEntryBytes
 
 	var cuts [][]a2aAuthMapIdentity
 	var current []a2aAuthMapIdentity
@@ -360,6 +361,19 @@ func shardA2AAuthMap(doc a2aAuthMapDocument) ([]a2aAuthMapDocument, error) {
 
 // buildA2AAuthMapConfigMaps renders the map into the shards the callout
 // watches, in index order, and returns the version it rendered.
+// a2aAuthMapEntryBytes is the bytes one identity adds to a shard's body: its
+// indented encoding at the depth it is rendered, the indent before its first
+// line, and the separator after it. The shard partition and the dispatcher's
+// ceiling (a2aDispatcherCeiling) measure with it.
+func a2aAuthMapEntryBytes(id a2aAuthMapIdentity) (int, error) {
+	prefix := strings.Repeat(a2aAuthMapIndent, a2aAuthMapIdentityDepth)
+	body, err := encodeA2AJSONPrefixed(id, prefix, a2aAuthMapIndent)
+	if err != nil {
+		return 0, err
+	}
+	return len(prefix) + len(body) + len(",\n"), nil
+}
+
 func buildA2AAuthMapConfigMaps(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, draining []a2aDispatchProfile) ([]*corev1.ConfigMap, string, error) {
 	doc, err := renderA2AAuthMapDraining(agent, profiles, draining)
 	if err != nil {
@@ -440,7 +454,9 @@ func encodeA2AJSONPrefixed(v any, prefix, indent string) ([]byte, error) {
 //
 //   - An empty map would refuse every connection on a callout that reports
 //     itself perfectly healthy.
-//   - A narrowed entry MUST carry no grants. If it could carry both, one map
+//   - A narrowed entry MUST carry no grants, except a `dispatcher` entry,
+//     whose grants are its control connection's and must be non-empty on
+//     both sides (#5381). If any other could carry both, one map
 //     edit -- or one code path that forgot to narrow -- would hand every
 //     session pod whatever was written there, which is the shared `worker`
 //     credential reborn. This is the rule most likely to be tripped by an
@@ -455,11 +471,15 @@ func encodeA2AJSONPrefixed(v any, prefix, indent string) ([]byte, error) {
 //     normally in every other respect.
 //   - The account becomes the audience of the user JWT the callout signs, so
 //     it decides which account a connection lands in. Only APP and TRUSTED
-//     are mintable, a narrowed entry only into APP; SYS above all is not.
+//     are mintable, a narrowed entry only into APP (a `dispatcher` entry
+//     only into TRUSTED); SYS above all is not.
 //   - Duplicate ServiceAccounts make the grant set a function of map order,
 //     and duplicate users re-create the shared-credential problem and collide
 //     on each other's inbox prefix.
-func validateA2AAuthMapIdentities(identities []a2aAuthMapIdentity) error {
+//
+// principals are the names a draining profile may not take
+// (a2aDrainingNameExclusions).
+func validateA2AAuthMapIdentities(identities []a2aAuthMapIdentity, principals ...string) error {
 	if len(identities) == 0 {
 		return fmt.Errorf("the rendered identity map serves no identities; the callout would refuse it and every bus connection with it")
 	}
@@ -481,8 +501,15 @@ func validateA2AAuthMapIdentities(identities []a2aAuthMapIdentity) error {
 		if id.Account != a2aAccountApp && id.Account != a2aAccountControl {
 			return fmt.Errorf("identity %d: user %q names account %q, which the callout will not mint into (allowed: [%s %s])", i, id.User, id.Account, a2aAccountControl, a2aAccountApp)
 		}
-		if id.Narrowing != "" && id.Account != a2aAccountApp {
+		if id.Narrowing == a2aNarrowingDispatcher {
+			if id.Account != a2aAccountControl {
+				return fmt.Errorf("identity %d: user %q narrows on %q and must land in account %q, not %q", i, id.User, id.Narrowing, a2aAccountControl, id.Account)
+			}
+		} else if id.Narrowing != "" && id.Account != a2aAccountApp {
 			return fmt.Errorf("identity %d: user %q narrows on %q and must land in account %q, not %q", i, id.User, id.Narrowing, a2aAccountApp, id.Account)
+		}
+		if id.Narrowing != a2aNarrowingDispatcher && len(id.Draining) > 0 {
+			return fmt.Errorf("identity %d: user %q lists draining profiles but narrows on %q; only %q reads them", i, id.User, id.Narrowing, a2aNarrowingDispatcher)
 		}
 		hasGrants := len(id.Grants.Publish) > 0 || len(id.Grants.Subscribe) > 0
 		if id.Narrowing != a2aNarrowingProfile && (id.Profile != "" || id.Topics != nil) {
@@ -527,6 +554,27 @@ func validateA2AAuthMapIdentities(identities []a2aAuthMapIdentity) error {
 					}
 				}
 			}
+		case a2aNarrowingDispatcher:
+			// The entry's grants are its control connection's, served as
+			// written, so both sides must be non-empty (the "" case's rule).
+			// Its per-profile grants are the callout's to derive.
+			if len(id.Grants.Publish) == 0 || len(id.Grants.Subscribe) == 0 {
+				return fmt.Errorf("identity %d: user %q has %d publish and %d subscribe grants; an empty side is minted as unrestricted on that side, not as closed",
+					i, id.User, len(id.Grants.Publish), len(id.Grants.Subscribe))
+			}
+			seenDraining := map[string]bool{}
+			for _, p := range id.Draining {
+				// a2aCanDrainAs alone, the one predicate drainingDispatchProfiles
+				// also applies, so a name carried into draining is never
+				// refused here (#5553, rounds 1-3). A profile entry's user
+				// (profile-<p>-<t>) isn't an addressee, so a draining
+				// profile that happens to share one collides with nothing,
+				// and the callout doesn't check it either.
+				if !isDNS1123LabelToken(p) || seenDraining[p] || !a2aCanDrainAs(p, principals) {
+					return fmt.Errorf("identity %d: user %q lists draining profile %q, which is not a dot-free DNS-1123 label, is listed twice, or is a reserved addressee, a principal's or map user's name, or a dispatcher bucket user", i, id.User, p)
+				}
+				seenDraining[p] = true
+			}
 		default:
 			return fmt.Errorf("identity %d: user %q names narrowing %q, which the callout does not implement", i, id.User, id.Narrowing)
 		}
@@ -538,6 +586,28 @@ func validateA2AAuthMapIdentities(identities []a2aAuthMapIdentity) error {
 		}
 		seenSA[id.ServiceAccount] = true
 		seenUser[id.User] = true
+	}
+	// The callout's set rules for the dispatcher's entry: one per map, and
+	// its bucket users (<user>-b<n>) are names no entry or profile may hold.
+	dispatchers := 0
+	for i, id := range identities {
+		if id.Narrowing != a2aNarrowingDispatcher {
+			continue
+		}
+		if dispatchers++; dispatchers > 1 {
+			return fmt.Errorf("identity %d: a second entry narrows on %q", i, a2aNarrowingDispatcher)
+		}
+		for b := 0; b < a2aDispatcherBuckets; b++ {
+			u := fmt.Sprintf("%s-b%d", id.User, b)
+			if !isDNS1123LabelToken(u) {
+				return fmt.Errorf("identity %d: user %q is too long for its bucket user %q", i, id.User, u)
+			}
+			for j, other := range identities {
+				if other.User == u || (other.Narrowing == a2aNarrowingProfile && other.Profile == u) {
+					return fmt.Errorf("identity %d: %q is dispatcher %q's bucket user", j, u, id.User)
+				}
+			}
+		}
 	}
 	return nil
 }

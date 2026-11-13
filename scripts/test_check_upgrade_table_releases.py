@@ -511,6 +511,60 @@ class CheckUpgradeTableReleasesTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn('this change removes the pending row "change t", which 1.0.0 already contains', err)
 
+    def _removed_pending_row(self):
+        """Remove the `pending` row "change q" from the page, with origin/main at the commit that has it."""
+        self.repo.git("update-ref", "refs/remotes/origin/main", "HEAD")
+        self.repo.rows = [r for r in self.repo.rows if "change q" not in r]
+        self.repo.write_page()
+        return self.repo.check()
+
+    def test_removing_a_pending_row_an_open_candidate_contains_fails(self):
+        self.repo.commit("feat: q", row=row("pending", "change q"))
+        self.repo.tag("staging_2611100000_abc1234")
+        code, err = self._removed_pending_row()
+        self.assertEqual(code, 1)
+        self.assertIn('removes the pending row "change q", which the release candidate staging_2611100000_abc1234 '
+                      "already contains, so its release ships the old text", err)
+
+    def test_a_candidate_a_release_contains_gives_the_release_message(self):
+        self.repo.commit("feat: q", row=row("pending", "change q"))
+        self.repo.tag("staging_2611100000_abc1234")
+        self.repo.tag("1.0.0")
+        code, err = self._removed_pending_row()
+        self.assertEqual(code, 1)
+        self.assertIn('removes the pending row "change q", which 1.0.0 already contains', err)
+        self.assertNotIn("release candidate", err)
+
+    def test_removing_a_pending_row_no_candidate_contains_passes(self):
+        self.repo.tag("staging_2611100000_abc1234")  # cut before the row was written
+        self.repo.commit("feat: q", row=row("pending", "change q"))
+        self.assertEqual(self._removed_pending_row(), (0, ""))
+
+    def test_a_tag_that_only_looks_like_a_candidate_is_ignored(self):
+        self.repo.commit("feat: q", row=row("pending", "change q"))
+        self.repo.tag("staging_manual")  # matches the glob, not the pipeline's shape
+        self.assertEqual(self._removed_pending_row(), (0, ""))
+
+    def test_a_candidate_tag_off_main_is_ignored(self):
+        base = self.repo.commit("feat: before the branch point")
+        self.repo.commit("feat: q", row=row("pending", "change q"))
+        self.repo.git("checkout", "-q", "-b", "elsewhere", base)
+        self.repo.write_page()
+        self.repo.commit("feat: q, elsewhere")
+        self.repo.tag("staging_2611100000_abc1234")  # not on main: not a candidate the pipeline made
+        self.repo.git("checkout", "-q", "main")
+        self.assertEqual(self._removed_pending_row(), (0, ""))
+
+    def test_a_released_candidate_that_held_an_earlier_copy_of_the_row_is_not_open(self):
+        self.repo.commit("feat: q", row=row("pending", "change q"))
+        self.repo.tag("staging_2611100000_abc1234")  # holds the row, and 1.0.0 ships it below
+        self.repo.rows = [r for r in self.repo.rows if "change q" not in r]
+        self.repo.write_page()
+        self.repo.commit("revert: q")
+        self.repo.tag("1.0.0")  # contains the candidate, but not the row
+        self.repo.commit("feat: q again", row=row("pending", "change q"))
+        self.assertEqual(self._removed_pending_row(), (0, ""))
+
     def test_a_push_does_not_read_a_removed_pending_row(self):
         self._shipped_pending_row()
         self.repo.reword("change q", "change q, reworded")

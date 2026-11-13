@@ -3684,7 +3684,14 @@ class HelmReleaseSelfHealingTest(unittest.TestCase):
                     target = bin_dir / name
                     target.write_text(content)
                     target.chmod(target.stat().st_mode | stat.S_IEXEC)
-            full_env = get_isolated_test_env(overrides=env_overrides or {}, bin_dir=str(bin_dir))
+            # An empty kubeconfig of the test's own: ensure_clean_helm_release
+            # asks kubectl for a pending release's Secret, and a developer's
+            # default context must never answer a unit test.
+            kubeconfig = pathlib.Path(tmp) / "kubeconfig"
+            kubeconfig.touch()
+            full_env = get_isolated_test_env(
+                overrides={"KUBECONFIG": str(kubeconfig), **(env_overrides or {})}, bin_dir=str(bin_dir)
+            )
             body = (
                 f'set -u\n'
                 f'{_PRINT_STUBS}\n'

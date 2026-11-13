@@ -37,7 +37,7 @@ The Service is `ClusterIP` and the pod's NetworkPolicy denies all ingress, so th
 
 ## Web console
 
-The web console is a browser chat page for installs with no chat platform: an evaluation cluster, a workshop seat or a demo. It shows event triage and scheduled checks as channels you can reply in, holds your own chat threads, and shows the model and LiteLLM usage. The chart renders it when `webConsole.enabled` is true, which `install.sh --enable-web-console` sets; it is off by default. It works in either mode, since it talks to the agent's own API rather than the bus. [Web console](/kube-agents/deploy/web-console/) is canonical: the port-forward, the layout, the threads, and what the page holds and does not.
+The web console is a browser chat page for installs with no chat platform: an evaluation cluster, a workshop seat or a demo. It shows event triage and scheduled checks as channels you can reply in, holds your own chat threads, and shows the model and token usage. The chart renders it when `webConsole.enabled` is true, which `install.sh --enable-web-console` sets; it is off by default. It works in either mode, since it talks to the agent's own API rather than the bus. [Web console](/kube-agents/deploy/web-console/) is canonical: the port-forward, the layout, the threads, and what the page holds and does not.
 
 ## Hermes dashboard
 

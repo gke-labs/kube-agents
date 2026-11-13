@@ -8010,7 +8010,7 @@ class PlatformAgentModeTest(unittest.TestCase):
         warning = text.index('if [ "$platform_agent_mode" = "next" ] && [ -n "$third_party_registry_prefix" ]; then', main_start)
         self.assertLess(text.index('local third_party_registry_prefix=', main_start), warning)
         self.assertLess(exported, warning)
-        self.assertIn("A2A_NATS_IMAGE, A2A_PROVISION_IMAGE and A2A_NATS_RELOADER_IMAGE", text[warning : warning + 900])
+        self.assertIn("A2A_NATS_IMAGE, A2A_PROVISION_IMAGE, A2A_NATS_RELOADER_IMAGE and A2A_NATS_EXPORTER_IMAGE", text[warning : warning + 900])
 
     def test_a_bad_value_from_the_shell_on_a_first_install_names_the_shell(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -13435,6 +13435,10 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
                 encoding="utf-8",
             )
             seeded_env.chmod(0o600)
+            # main() asks kubectl for its current context; the developer's
+            # default kubeconfig must not be what answers.
+            kubeconfig = pathlib.Path(tmp) / "kubeconfig"
+            kubeconfig.touch()
             driver = (
                 f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
                 "command() { return 0; }\n"
@@ -13463,7 +13467,7 @@ class ToggleValuesAreValidatedTest(unittest.TestCase):
                 capture_output=True,
                 text=True,
                 env=get_isolated_test_env(
-                    overrides={"KUBE_AGENTS_INSTALL_ENV": str(seeded_env)},
+                    overrides={"KUBE_AGENTS_INSTALL_ENV": str(seeded_env), "KUBECONFIG": str(kubeconfig)},
                 ),
                 cwd=str(_REPO_ROOT),
             )

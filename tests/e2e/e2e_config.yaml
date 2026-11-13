@@ -166,3 +166,16 @@ suites:
       STOCKOUT_SCENARIOS: "all"
     tests:
       - "tests/e2e/test_stockout_investigation.py"
+
+  # ----------------------------------------------------------------------------
+  # 8. Slack Agent E2E Environment
+  # ----------------------------------------------------------------------------
+  # A real conversation through Slack: a test user mentions the bot in a CI
+  # channel and the test reads the thread back (tests/e2e/README.md, "Slack E2E
+  # test"). It skips while E2E_SLACK_USER_TOKEN, E2E_SLACK_CHANNEL_ID or
+  # E2E_SLACK_BOT_USER_ID is unset, so an environment without the Slack test
+  # account reports a skip rather than a failure.
+  - name: "slack"
+    description: "Slack ingress, reaction, ack and Block Kit answer E2E test suite"
+    tests:
+      - "tests/e2e/slack_agent_test.py"

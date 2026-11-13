@@ -658,7 +658,7 @@ func TestTheDroppedVolumeConditionFollowsTheGatewayRollout(t *testing.T) {
 			r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme}
 			ctx := context.Background()
 
-			if _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aProvisionState{}); err != nil {
+			if _, _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aProvisionState{}); err != nil {
 				t.Fatalf("updateStatusReady failed: %v", err)
 			}
 			cond := meta.FindStatusCondition(agent.Status.Conditions, hostPathDroppedConditionType)
@@ -681,7 +681,7 @@ func TestTheDroppedVolumeConditionFollowsTheGatewayRollout(t *testing.T) {
 				t.Fatalf("reading the PlatformAgent back: %v", err)
 			}
 			settledVersion := stored.ResourceVersion
-			if _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aProvisionState{}); err != nil {
+			if _, _, err := r.updateStatusReady(ctx, agent, "", otlpSourceNone, r.resolveNetpolProfile(ctx, agent), a2aProvisionState{}); err != nil {
 				t.Fatalf("updateStatusReady (settled) failed: %v", err)
 			}
 			if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), stored); err != nil {

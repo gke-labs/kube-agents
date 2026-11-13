@@ -73,6 +73,7 @@ func newUnprovisionedGateway(t *testing.T) (*Gateway, string, context.Context) {
 }
 
 func TestGatewayWaitsForTheTasksStreamAndIsNotReadyUntilItBinds(t *testing.T) {
+	t.Parallel()
 	g, url, ctx := newUnprovisionedGateway(t)
 	base := startMetricsServerWith(t, g.Metrics(), g.Readiness)
 
@@ -130,6 +131,7 @@ func TestTheRelayWaitsForItsStream(t *testing.T) {
 // still look for the bucket once the relay binds, not have given up while it
 // waited.
 func TestFeedbackRetriesStartOnceTheRelayBinds(t *testing.T) {
+	t.Parallel()
 	g, url, ctx := newUnprovisionedGateway(t)
 	g.feedbackRetry = 10 * time.Millisecond // 30 retries: 300ms
 	runGateway(t, ctx, g.Run)
@@ -148,6 +150,7 @@ func TestFeedbackRetriesStartOnceTheRelayBinds(t *testing.T) {
 // The people bucket comes from the same provision Job as TASKS, so its
 // retries start once the relay binds too, as feedback's do.
 func TestPeopleRetriesStartOnceTheRelayBinds(t *testing.T) {
+	t.Parallel()
 	g, url, ctx := newUnprovisionedGateway(t)
 	g.peopleRetry = 10 * time.Millisecond // 30 retries: 300ms
 	runGateway(t, ctx, g.Run)
@@ -165,6 +168,7 @@ func TestPeopleRetriesStartOnceTheRelayBinds(t *testing.T) {
 // A start after a crash holds the bind back on purpose; readiness says so
 // rather than blaming the stream, and turns ready once the held bind lands.
 func TestReadinessNamesAHeldBackBind(t *testing.T) {
+	t.Parallel()
 	g, url, ctx := newUnprovisionedGateway(t)
 	provision(t, url)
 	runGateway(t, ctx, func(ctx context.Context) error { return g.RunWith(ctx, RunOptions{RelayBindDelay: 2 * time.Second}) })
@@ -229,6 +233,7 @@ func TestReadinessNamesABusOutage(t *testing.T) {
 // the bucket, reporting the wait through Readiness, rather than ending the
 // term before it starts.
 func TestATermStartWaitsForTheSessionStateBucket(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	ctx := context.Background()
 	js := r.bus.JetStream()

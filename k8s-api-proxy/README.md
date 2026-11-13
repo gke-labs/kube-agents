@@ -86,3 +86,6 @@ gofmt -l .
 go vet ./...
 go test -race ./...
 ```
+
+`k8sapiproxy-test.yml` runs those and gosec, built from `k8s-operator/go.mod`'s pin (this module
+declares none); `make gosec` at the repository root runs the same scan over this module.

@@ -1,5 +1,5 @@
 {
-  "version": "d4f1d56397168455",
+  "version": "84037acf34fcd90f",
   "shard": 0,
   "shards": 1,
   "identities": [
@@ -115,7 +115,10 @@
       "grants": {
         "publish": [
           "a2a.agents.*",
-          "$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.*"
+          "$JS.API.DIRECT.GET.DIRECTORY.a2a.agents.*",
+          "$JS.API.CONSUMER.CREATE.PROFILE_SUBMITS.*.a2a.submit.*.*.*.*",
+          "$JS.API.CONSUMER.INFO.PROFILE_SUBMITS.*",
+          "$JS.API.CONSUMER.DELETE.PROFILE_SUBMITS.*"
         ],
         "subscribe": [
           "_INBOX.operator.>"
@@ -153,6 +156,48 @@
       "narrowing": "profile",
       "profile": "cluster-a",
       "tier": "read"
+    },
+    {
+      "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-dispatcher",
+      "user": "dispatcher",
+      "account": "TRUSTED",
+      "grants": {
+        "publish": [
+          "$JS.API.CONSUMER.INFO.PROFILE_SUBMITS.profile-auditor-read-top",
+          "$JS.API.CONSUMER.MSG.NEXT.PROFILE_SUBMITS.profile-auditor-read-top",
+          "$JS.ACK.PROFILE_SUBMITS.profile-auditor-read-top.>",
+          "$JS.API.CONSUMER.INFO.PROFILE_SUBMITS.profile-auditor-read-child",
+          "$JS.API.CONSUMER.MSG.NEXT.PROFILE_SUBMITS.profile-auditor-read-child",
+          "$JS.ACK.PROFILE_SUBMITS.profile-auditor-read-child.>",
+          "$JS.API.CONSUMER.INFO.PROFILE_SUBMITS.profile-cluster-a-read-top",
+          "$JS.API.CONSUMER.MSG.NEXT.PROFILE_SUBMITS.profile-cluster-a-read-top",
+          "$JS.ACK.PROFILE_SUBMITS.profile-cluster-a-read-top.>",
+          "$JS.API.CONSUMER.INFO.PROFILE_SUBMITS.profile-cluster-a-read-child",
+          "$JS.API.CONSUMER.MSG.NEXT.PROFILE_SUBMITS.profile-cluster-a-read-child",
+          "$JS.ACK.PROFILE_SUBMITS.profile-cluster-a-read-child.>",
+          "a2a.tasks.auditor.*.supervisor",
+          "$JS.API.DIRECT.GET.DISPATCH_STOPS.a2a.stop.auditor.*",
+          "a2a.tasks.cluster-a.*.supervisor",
+          "$JS.API.DIRECT.GET.DISPATCH_STOPS.a2a.stop.cluster-a.*",
+          "$KV.PROFILE_LEASES.>",
+          "$JS.API.STREAM.INFO.KV_PROFILE_LEASES",
+          "$JS.API.DIRECT.GET.KV_PROFILE_LEASES.>",
+          "$JS.API.CONSUMER.CREATE.KV_PROFILE_LEASES.>",
+          "$JS.API.CONSUMER.DELETE.KV_PROFILE_LEASES.*",
+          "$JS.FC.KV_PROFILE_LEASES.>",
+          "a2a.dispatch.*.*.*",
+          "a2a.cap.verify.dispatcher",
+          "_INBOX.dispatcher.>"
+        ],
+        "subscribe": [
+          "a2a.stop.auditor.*",
+          "a2a.stop.cluster-a.*",
+          "a2a.dispatch.*.*.*.accept",
+          "a2a.dispatch.*.*.*.lease",
+          "a2a.cap.reply.dispatcher.>",
+          "_INBOX.dispatcher.>"
+        ]
+      }
     }
   ]
 }

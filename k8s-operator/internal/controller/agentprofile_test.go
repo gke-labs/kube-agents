@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"maps"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -173,6 +174,7 @@ func agentProfileSpecPaths() []string {
 		p.Spec.Tools = []agentv1alpha1.AgentProfileTool{{Name: "jq", Image: "registry.example/jq:1"}}
 		p.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead}
 		p.Spec.Parameters = []agentv1alpha1.AgentProfileParameter{{Name: "cluster", Required: true}}
+		p.Spec.YieldToPinned = true
 	})
 	raw, _ := json.Marshal(p.Spec)
 	var top map[string]json.RawMessage
@@ -532,6 +534,9 @@ func TestAMalformedOperatorPrincipalRendersNoEntryAndFailsNothing(t *testing.T) 
 // With them, its entry is the directory and its inbox, nothing else.
 func TestTheOperatorsBusIdentityIsTheDirectoryAndNothingElse(t *testing.T) {
 	withOperatorBusPrincipal(t)
+	// With the dispatcher off: on, the operator also syncs the profiles'
+	// durables, which the dispatcher's tests hold.
+	t.Setenv(a2aProfileDispatcherEnvVar, "false")
 	agent := a2aTestAgent()
 	e, ok := renderedMapEntries(t, agent, nil)[a2aOperatorBusUser]
 	if !ok {
@@ -613,10 +618,11 @@ func checkFixture(t *testing.T, path, rendered string) {
 // holds its hand-built envelope to the protocol.
 func TestTheAgentCardFixtureIsWhatTheOperatorRenders(t *testing.T) {
 	at := time.Date(2026, 10, 6, 0, 0, 0, 0, time.UTC)
-	// With declared parameters, so the a2a contract test can hold the
-	// routing fields' names to lib.AgentCard's.
+	// With declared parameters and yieldToPinned, so the a2a contract test
+	// can hold the routing fields' names to lib.AgentCard's.
 	card := desiredAgentCard(ptr.To(testAgentProfile("ns", "auditor", func(p *agentv1alpha1.AgentProfile) {
 		p.Spec.Parameters = []agentv1alpha1.AgentProfileParameter{{Name: "project", Required: true}, {Name: "location", Required: true}, {Name: "cluster", Required: true}}
+		p.Spec.YieldToPinned = true
 	})))
 	body, err := renderDirectoryEnvelope("auditor", &card, at, "000000000000000000000000")
 	if err != nil {
@@ -1479,6 +1485,46 @@ func TestAProfileServiceAccountChangeWakesItsProfile(t *testing.T) {
 	}
 }
 
+// A ServiceAccount in a profile namespace named like a profile's may be one a
+// profile would land on and doesn't own, whatever its labels say, which
+// refuses that profile and moves the dispatcher ceiling's cut for every newer
+// one: its event re-reconciles every profile in the agent's namespace. One
+// with another name wakes only its labelled profile, or none.
+func TestAProfileNamedServiceAccountWakesEveryProfile(t *testing.T) {
+	agent := a2aTestAgent()
+	a, b := testAgentProfile(agent.Namespace, "auditor"), testAgentProfile(agent.Namespace, "triage")
+	c := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(&a, &b).Build()
+	sa := func(name, ns string, labels map[string]string) *corev1.ServiceAccount {
+		return &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, Labels: labels}}
+	}
+	woke := func(obj *corev1.ServiceAccount) []string {
+		names := []string{}
+		for _, r := range profileServiceAccountRequests(context.Background(), c, obj) {
+			names = append(names, r.Name)
+		}
+		slices.Sort(names)
+		return names
+	}
+	profilesNS := agent.Namespace + "-profiles"
+	// Named like a profile's, it may be foreign whatever its labels say: a
+	// stale copy labelled with the profile's name but an old UID, or one
+	// labelled with another profile's name.
+	for _, labels := range []map[string]string{nil, {agentProfileNameLabel: "auditor"}, {agentProfileNameLabel: "triage"}} {
+		if got := woke(sa("agentprofile-auditor-read", profilesNS, labels)); !slices.Equal(got, []string{"auditor", "triage"}) {
+			t.Errorf("a profile-named ServiceAccount labelled %v woke %v, want every profile", labels, got)
+		}
+	}
+	if got := woke(sa("default", profilesNS, map[string]string{agentProfileNameLabel: "auditor"})); !slices.Equal(got, []string{"auditor"}) {
+		t.Errorf("a labelled ServiceAccount with another name woke %v, want its own profile", got)
+	}
+	if got := woke(sa("default", profilesNS, nil)); len(got) != 0 {
+		t.Errorf("an unlabelled ServiceAccount with another name woke %v, want none", got)
+	}
+	if got := woke(sa("agentprofile-auditor-read", agent.Namespace, nil)); len(got) != 0 {
+		t.Errorf("a ServiceAccount outside a profile namespace woke %v", got)
+	}
+}
+
 // Two tiers get two ServiceAccounts in the profile namespace, and dropping a
 // tier deletes its ServiceAccount and leaves the other.
 func TestEachTierGetsAServiceAccountAndADroppedTierLosesIt(t *testing.T) {
@@ -1625,15 +1671,20 @@ func TestAProfileServiceAccountChangeWakesTheAgentBesideIt(t *testing.T) {
 	}
 }
 
-// The card carries the profile's tiers, its pinned cluster and its declared
-// parameters, which is what the gateway routes on.
+// The card carries the profile's tiers, its pinned cluster, its declared
+// parameters and whether it yields to pinned profiles, which is what the
+// gateway routes on.
 func TestTheCardCarriesWhatTheGatewayRoutesOn(t *testing.T) {
 	p := testAgentProfile("ns", "prod-a", func(p *agentv1alpha1.AgentProfile) {
 		p.Spec.AllowedTiers = []string{agentv1alpha1.AgentProfileTierRead, agentv1alpha1.AgentProfileTierUnattended}
 		p.Spec.ClusterRef = &agentv1alpha1.AgentProfileClusterRef{ProjectID: "p", Location: "us-central1", Cluster: "a"}
 		p.Spec.Parameters = []agentv1alpha1.AgentProfileParameter{{Name: "namespace"}}
+		p.Spec.YieldToPinned = true
 	})
 	card := desiredAgentCard(&p)
+	if !card.YieldToPinned {
+		t.Error("yieldToPinned didn't reach the card")
+	}
 	if !slices.Equal(card.Tiers, []string{"read", "unattended"}) {
 		t.Errorf("tiers = %v", card.Tiers)
 	}
@@ -1645,7 +1696,7 @@ func TestTheCardCarriesWhatTheGatewayRoutesOn(t *testing.T) {
 	}
 	// A profile with neither: read alone, no pin, no parameters.
 	bare := desiredAgentCard(ptr.To(testAgentProfile("ns", "bare")))
-	if !slices.Equal(bare.Tiers, []string{"read"}) || bare.ClusterRef != nil || bare.Parameters != nil {
+	if !slices.Equal(bare.Tiers, []string{"read"}) || bare.ClusterRef != nil || bare.Parameters != nil || bare.YieldToPinned {
 		t.Errorf("bare card = %+v", bare)
 	}
 }
@@ -1772,5 +1823,61 @@ func TestTheClusterProfileExampleIsAGenericAndAPinnedProfile(t *testing.T) {
 	}
 	if pinned != 1 {
 		t.Errorf("%d documents set clusterRef, want exactly the pinned one", pinned)
+	}
+}
+
+// The finalizer is written as a merge patch of metadata alone, never as an
+// Update of the whole profile: an Update sends the spec back as this
+// operator's Go type knows it, which drops any field a newer CRD added (an
+// older operator stripped yieldToPinned from a profile created in the same
+// upgrade, #5435). Both the add and the release are checked.
+func TestTheFinalizerIsPatchedWithoutTouchingTheSpec(t *testing.T) {
+	withOperatorBusPrincipal(t)
+	agent := a2aTestAgent()
+	p := testAgentProfile(agent.Namespace, "auditor")
+	h := newProfileHarness(t, agent, &p)
+	var updates int
+	var patches []map[string]json.RawMessage
+	inner := h.c
+	h.c = interceptor.NewClient(inner.(client.WithWatch), interceptor.Funcs{
+		Update: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.UpdateOption) error {
+			if _, ok := obj.(*agentv1alpha1.AgentProfile); ok {
+				updates++
+			}
+			return cl.Update(ctx, obj, opts...)
+		},
+		Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if _, ok := obj.(*agentv1alpha1.AgentProfile); ok && patch.Type() == types.MergePatchType {
+				data, err := patch.Data(obj)
+				if err != nil {
+					return err
+				}
+				var top map[string]json.RawMessage
+				if err := json.Unmarshal(data, &top); err != nil {
+					return err
+				}
+				patches = append(patches, top)
+			}
+			return cl.Patch(ctx, obj, patch, opts...)
+		},
+	})
+	h.r.Client = h.c
+
+	h.reconcile(agent.Namespace, "auditor")
+	if err := h.c.Delete(context.Background(), h.profile(agent.Namespace, "auditor")); err != nil {
+		t.Fatal(err)
+	}
+	h.reconcile(agent.Namespace, "auditor")
+
+	if updates != 0 {
+		t.Errorf("the profile was written with Update %d time(s); a finalizer change must not send the spec", updates)
+	}
+	if len(patches) != 2 {
+		t.Fatalf("got %d merge patch(es) on the profile, want the finalizer's add and release", len(patches))
+	}
+	for i, top := range patches {
+		if _, ok := top["spec"]; ok || len(top) != 1 || top["metadata"] == nil {
+			t.Errorf("patch %d touches more than metadata: %v", i, slices.Sorted(maps.Keys(top)))
+		}
 	}
 }

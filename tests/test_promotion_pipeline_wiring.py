@@ -319,8 +319,8 @@ class PromotionPipelineWiringTest(unittest.TestCase):
     def test_the_eval_wait_makes_its_credential_the_active_account(self):
         """The poller's `gcloud storage` reads run as the active account, which
         the explicit `gcloud auth login --cred-file` makes the auth step's
-        credential. (The reads were gsutil's until 2026-10, and gsutil ignored
-        GOOGLE_GHA_CREDS_PATH outright: every listing failed on anonymous
+        credential. (Until 2026-10 the reads used the legacy storage client,
+        which ignored GOOGLE_GHA_CREDS_PATH outright: every listing failed on anonymous
         credentials, no build was ever found, and the job reported `never_ran`,
         which reads as a broken eval lane rather than a missing login.
         ci-health.yml paid forty failed ticks to learn this.)

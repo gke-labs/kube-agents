@@ -5,11 +5,13 @@ the JetStream PVC and the bus creds Secret come through with their UIDs. Here
 it runs end to end, unmodified, with `kubectl` on PATH replaced by a small
 simulator of the operator (FAKE_KUBECTL below: a CR patch bumps generations,
 and a few kubectl calls later the "reconcile" lands, tearing the A2A stack
-down under today and rendering it again under next) and both doors served by
-a local HTTP server, so the today turn is a real POST and the bus task is the
-lane's own inject client talking to a fake gateway. Each failure case changes
-one thing about what the simulated operator does and checks the run stops on
-the assertion that names it.
+down under today and rendering it again under next) and both doors and the
+web console served by a local HTTP server, so the today turn is a real POST,
+the bus task is the lane's own inject client talking to a fake gateway, and
+the console checks after pre and every leg are real requests to a console
+that answers as a2a/cmd/web-console does. Each failure case changes one
+thing about what the simulated operator does and checks the run stops on the
+assertion that names it.
 
 The wiring in hack/ci-eval-pr.sh is pinned at the end: it runs only under
 EVAL_MODE_NEXT=1 on a run that is not a pull request's, after the suite
@@ -48,6 +50,18 @@ _CR = "platform-agent"
 _API_KEY = "agent-api-key"
 _PVC = "data-platform-agent-a2a-nats-0"
 _CREDS = "platform-agent-a2a-nats-creds"
+# The chart's console objects, named off the lane's Helm release.
+_CONSOLE = "kube-agents-web-console"
+_CONSOLE_SESSION_ID_RE = re.compile(r"^web-console-[0-9a-f]{32}$")
+_CONSOLE_READ_ROUTES = (
+    "/api/insights",
+    "/api/environment",
+    "/api/channels/alerts/posts",
+    "/api/channels/scheduled/posts",
+    "/api/models",
+    "/api/repositories",
+    "/api/patches",
+)
 _BRIDGE = {
     "name": "hermes-bridge",
     "image": "bridge:dev",
@@ -126,6 +140,7 @@ _PASSING_ORDER = [
     "pre.pvc-present",
     "pre.creds-present",
     "pre.bus-task",
+    "pre.web-console",
     "leg1.sidecars-unset.patched",
     "leg1.sidecars-unset.reconciled",
     "leg1.sidecars-unset.agent-rolled",
@@ -140,6 +155,7 @@ _PASSING_ORDER = [
     "leg1.nothing-stuck",
     "leg1.not-degraded",
     "leg1.today-turn",
+    "leg1.web-console",
     "leg2.mode-next.patched",
     "leg2.mode-next.reconciled",
     "leg2.nats-ready",
@@ -161,6 +177,7 @@ _PASSING_ORDER = [
     "leg2.bus-task",
     "leg2.nothing-stuck",
     "leg2.not-degraded",
+    "leg2.web-console",
 ]
 
 # What ROLLBACK_END_MODE=today adds to a run on an install with no declared
@@ -177,6 +194,7 @@ _LEG3_ORDER = [
     "leg3.nothing-stuck",
     "leg3.not-degraded",
     "leg3.today-turn",
+    "leg3.web-console",
 ]
 
 # The simulated operator. State is one JSON file; every kubectl call is one
@@ -567,6 +585,12 @@ def healthy_next_state(sidecars: list | None = None, **scenario) -> dict:
         "deployment/platform-agent-gateway": workload("Deployment", "platform-agent-gateway", 7),
         "pod/platform-agent-a2a-nats-0": {"spec": {"volumes": [{"name": "data", "persistentVolumeClaim": {"claimName": _PVC}}]}},
     }
+    # The console the lane installs (webConsole.enabled=true in
+    # hack/ci-deploy.sh): its Service and Deployment, which no flip touches.
+    # `console_absent` is a dev install without it.
+    if not scenario.get("console_absent"):
+        objects[f"svc/{_CONSOLE}"] = {"uid": "console-svc-1", "spec": {"selector": {"app.kubernetes.io/name": "web-console"}}}
+        objects[f"deployment/{_CONSOLE}"] = workload("Deployment", _CONSOLE)
     spec: dict = {"mode": "next", "harness": {}}
     if sidecars:
         spec["deployment"] = {"sidecars": sidecars}
@@ -592,10 +616,12 @@ def healthy_next_state(sidecars: list | None = None, **scenario) -> dict:
 
 
 class _Door(http.server.BaseHTTPRequestHandler):
-    """The agent API and the inject door, answering from the simulated state."""
+    """The agent API, the inject door and the web console, answering from the
+    simulated state."""
 
     state_path: pathlib.Path
     cancels_path: pathlib.Path
+    console_path: pathlib.Path
 
     def log_message(self, *args) -> None:  # noqa: D401 - silence the default access log
         pass
@@ -610,6 +636,71 @@ class _Door(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    def _page(self, body: bytes) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _console_leg(self, state: dict) -> str:
+        # The console checks are the same requests after pre and every leg,
+        # so the leg is read from the flips the state has seen: none is pre,
+        # one to today is leg 1, one forward is leg 2, two to today is leg 3.
+        today = state["patches"].count({"spec": {"mode": "today"}})
+        forward = state["patches"].count({"spec": {"mode": "next"}})
+        if today >= 2:
+            return "leg3"
+        if forward >= 1:
+            return "leg2"
+        if today == 1:
+            return "leg1"
+        return "pre"
+
+    def _record_console(self, line: str) -> None:
+        with self.console_path.open("a") as log:
+            log.write(line + "\n")
+
+    def _console_get(self, state: dict) -> bool:
+        """Answers a console GET; False when the path is not the console's."""
+        path = self.path
+        if path == "/healthz":
+            self._reply(200, {"status": "ok"})
+        elif path == "/":
+            self._page(b"<!doctype html>\n<html lang=\"en\"><head><title>kube-agents</title></head></html>\n")
+        elif path == "/api/insights":
+            self._reply(200, {"model": {}, "usage": {}, "identity": {}, "cluster": {"name": "c"}, "repositories": []})
+        elif path == "/api/environment":
+            self._reply(200, {"versions": {"chart": "0.1.0"}, "install": {}, "counts": {"nodes": 3}, "read_at": "now"})
+        elif path in ("/api/channels/alerts/posts", "/api/channels/scheduled/posts"):
+            self._reply(200, {"channel": path.split("/")[3], "posts": []})
+        elif path in ("/api/models", "/api/repositories", "/api/patches"):
+            self._reply(200, {"ok": True})
+        elif path.startswith("/api/sessions/") and path.endswith("/messages"):
+            sid = path[len("/api/sessions/") : -len("/messages")]
+            messages = [{"id": 1, "role": "user", "content": "hi"}, {"id": 2, "role": "assistant", "content": "pong"}]
+            self._reply(200, {"session_id": sid, "latest_id": 2, "messages": messages})
+        else:
+            return False
+        self._record_console(f"{self._console_leg(state)} GET {path}")
+        return True
+
+    def _console_chat(self, state: dict, body: dict) -> None:
+        leg = self._console_leg(state)
+        sid = body.get("session_id", "")
+        self._record_console(f"{leg} POST /api/chat {sid} header={self.headers.get('X-Kube-Agents-Console', '')}")
+        if self.headers.get("X-Kube-Agents-Console") != "1":
+            self._reply(403, {"error": "missing_console_header"})
+            return
+        if not (self.headers.get("Content-Type") or "").startswith("application/json"):
+            self._reply(415, {"error": "json_required"})
+            return
+        if state["scenario"].get("console_chat_fails_on") == leg:
+            # The console's own answer for an agent it could not reach.
+            self._reply(502, {"error": "agent_error", "detail": "could not reach the agent gateway", "session_id": sid})
+            return
+        self._reply(200, {"session_id": sid, "reply": "pong", "created": True})
 
     def _door_token(self, state: dict) -> str:
         secret = state["objects"].get("secret/platform-agent-a2a-inject")
@@ -632,6 +723,9 @@ class _Door(http.server.BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         body = json.loads(self.rfile.read(length) or b"{}")
         auth = self.headers.get("Authorization", "")
+        if self.path == "/api/chat":
+            self._console_chat(state, body)
+            return
         if self.path == "/v1/responses":
             if auth != f"Bearer {_API_KEY}" or state["scenario"].get("today_turn_fails_on") == self._today_leg(state):
                 self._reply(401, {"error": "no"})
@@ -664,6 +758,8 @@ class _Door(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         state = self._state()
+        if self._console_get(state):
+            return
         if not self.path.startswith("/conversations/"):
             self._reply(404, {})
             return
@@ -700,7 +796,10 @@ class Sim:
         self.pf_pids = root / "pf_pids"
         self.cancels = root / "cancels"
         self.cancels.touch()
-        handler = type("Door", (_Door,), {"state_path": self.state_path, "cancels_path": self.cancels})
+        # Every console request, one line each: "<leg> <method> <path> ...".
+        self.console_log = root / "console-requests"
+        self.console_log.touch()
+        handler = type("Door", (_Door,), {"state_path": self.state_path, "cancels_path": self.cancels, "console_path": self.console_log})
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -720,6 +819,7 @@ class Sim:
                 "FAKE_KUBE_STATE": str(self.state_path),
                 "ROLLBACK_AGENT_URL": url,
                 "ROLLBACK_INJECT_URL": url,
+                "ROLLBACK_WEB_CONSOLE_URL": url,
                 "ROLLBACK_RESULTS_FILE": str(self.results),
                 "ROLLBACK_KUBE_CONTEXT": "gke_test_ctx",
                 "FAKE_PF_PIDS": str(self.pf_pids),
@@ -1522,6 +1622,74 @@ class SidecarRoundTripTest(RoundTripTest):
         self.assert_unset_and_restored(bridge_with(env_from=[{"configMapRef": {"name": "bridge-env"}}]))
 
 
+class WebConsoleRoundTripTest(RoundTripTest):
+    """The console checks after pre and every leg: the deploy's gate
+    (hack/ci-deploy.sh, 6a) run again where a flip could have broken the
+    Hermes path the console talks to."""
+
+    def console_requests(self, sim: Sim) -> list[str]:
+        return sim.console_log.read_text().splitlines()
+
+    def test_every_leg_reads_the_routes_and_sends_a_turn(self) -> None:
+        result, _, sim = self.run_sim(healthy_next_state(sidecars=[]), ROLLBACK_END_MODE="today")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for leg in ("pre", "leg1", "leg2", "leg3"):
+            with self.subTest(leg=leg):
+                lines = [line for line in self.console_requests(sim) if line.startswith(f"{leg} ")]
+                paths = [line.split(" ")[2] for line in lines]
+                self.assertEqual(paths[:2], ["/healthz", "/"])
+                self.assertEqual(paths[2:9], list(_CONSOLE_READ_ROUTES))
+                self.assertEqual(paths[9], "/api/chat")
+                sid = lines[9].split(" ")[3]
+                self.assertRegex(sid, _CONSOLE_SESSION_ID_RE)
+                self.assertTrue(lines[9].endswith(" header=1"), lines[9])
+                self.assertEqual(paths[10:], [f"/api/sessions/{sid}/messages"])
+                self.assertIn(f"PASS {leg}.web-console: deployment/{_CONSOLE} rolled out; every route answered 200, the turn on session {sid} got a reply, and the session shows the user and assistant rows (attempt 1/2)", result.stdout)
+
+    def test_a_turn_the_console_cannot_run_on_leg_3_fails_there_after_its_tunnels(self) -> None:
+        # The console's own 502 for an agent it could not reach: a fresh
+        # tunnel is worth a try, so the attempts run out before the FAIL.
+        result, _, sim = self.run_sim(healthy_next_state(sidecars=[], console_chat_fails_on="leg3"), ROLLBACK_END_MODE="today")
+        self.assert_fails_at(result, "leg3.web-console", "/api/chat: HTTP 502: ")
+        self.assertIn("PASS leg2.web-console", result.stdout)
+        self.assertIn("PASS leg3.today-turn", result.stdout)
+        self.assertIn("leg3.web-console: attempt 1/2: /api/chat: HTTP 502: ", result.stdout)
+        self.assertEqual(len([line for line in self.console_requests(sim) if line.startswith("leg3 POST /api/chat")]), 2)
+
+    def test_a_4xx_is_not_retried(self) -> None:
+        # A 4xx is the same through a fresh tunnel. A base URL under a path
+        # the door does not serve answers 404 to /healthz, the first request,
+        # and the run fails on it without a second attempt.
+        sim = Sim(healthy_next_state(sidecars=[]))
+        self.addCleanup(sim.close)
+        result = sim.run(ROLLBACK_WEB_CONSOLE_URL=f"http://127.0.0.1:{sim.server.server_address[1]}/nowhere")
+        self.assert_fails_at(result, "pre.web-console", "/healthz: HTTP 404: ")
+        self.assertNotIn("pre.web-console: attempt", result.stdout)
+        self.assertEqual(self.console_requests(sim), [])
+
+    def test_no_console_service_skips_the_checks(self) -> None:
+        result, _, sim = self.run_sim(healthy_next_state(sidecars=[], console_absent=True), ROLLBACK_END_MODE="today")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for leg in ("pre", "leg1", "leg2", "leg3"):
+            self.assertIn(f"SKIP {leg}.web-console: no svc/{_CONSOLE}: the install has no web console (webConsole.enabled), so nothing is checked", result.stdout)
+        self.assertNotIn(".web-console", " ".join(passed(result)))
+        self.assertEqual(self.console_requests(sim), [])
+
+    def test_a_console_that_is_not_rolled_out_fails_before_any_request(self) -> None:
+        state = healthy_next_state(sidecars=[])
+        state["objects"][f"deployment/{_CONSOLE}"]["status"]["readyReplicas"] = 0
+        state["objects"][f"deployment/{_CONSOLE}"]["status"]["availableReplicas"] = 0
+        result, _, sim = self.run_sim(state)
+        self.assert_fails_at(result, "pre.web-console", f"deployment/{_CONSOLE} is not rolled out: 0/1 ready")
+        self.assertEqual(self.console_requests(sim), [])
+
+    def test_the_console_name_defaults_to_the_lanes_release(self) -> None:
+        script = _SCRIPT.read_text()
+        self.assertIn('readonly WEB_CONSOLE_NAME_DEFAULT="kube-agents-web-console"', script)
+        self.assertIn('readonly HELM_RELEASE_NAME="kube-agents"', _CI_DEPLOY.read_text())
+        self.assertIn('WEB_CONSOLE_NAME="${ROLLBACK_WEB_CONSOLE_NAME:-${WEB_CONSOLE_NAME_DEFAULT}}"', script)
+
+
 class NamesMatchTheOperatorTest(unittest.TestCase):
     """The names the script derives are the ones the operator renders."""
 
@@ -1548,8 +1716,10 @@ class NamesMatchTheOperatorTest(unittest.TestCase):
     def test_the_claim_the_pvc_name_is_built_from_is_the_statefulsets(self) -> None:
         c = self.constants()
         self.assertEqual(c["NATS_DATA_CLAIM"], self.go(_A2A_MANIFESTS, r'^const a2aNATSDataClaim = "([^"]+)"'))
-        # The operator's own spelling of the claim's name, which the script copies.
-        self.assertIn('a2aNATSDataClaim + "-" + a2aNATSName(agent) + "-0"', _CONTROLLER.read_text())
+        # The operator's own spelling of the claim's name, which the script
+        # copies for ordinal 0 (the claim every bus has).
+        self.assertIn('a2aNATSDataClaim + "-" + a2aNATSName(agent) + "-" + strconv.Itoa(ordinal)', _A2A_MANIFESTS.read_text())
+        self.assertIn("a2aNATSDataClaimName(agent, ordinal)", _CONTROLLER.read_text())
         self.assertEqual(c["NATS_ORDINAL_SUFFIX"], "-0")
 
     def test_the_other_names_and_ports(self) -> None:
@@ -1580,11 +1750,12 @@ class NamesMatchTheOperatorTest(unittest.TestCase):
         cleanup = cleanup[: cleanup.index("\nfunc ")]
         self.assertNotIn("a2aCredsSecretName", cleanup)
         self.assertNotIn("PersistentVolumeClaim", cleanup)
-        # And the StatefulSet sets no PVC retention policy, so its default
-        # (Retain) keeps the claim when the StatefulSet is deleted.
+        # And the StatefulSet's PVC retention policy keeps the claim when the
+        # StatefulSet is deleted (and, in this release, on a scale-down too;
+        # #4225 changes WhenScaled with the migration).
         sts = text[text.index("func buildA2ANATSStatefulSet(") :]
         sts = sts[: sts.index("\nfunc ")]
-        self.assertNotIn("PersistentVolumeClaimRetentionPolicy", sts)
+        self.assertIn("WhenDeleted: appsv1.RetainPersistentVolumeClaimRetentionPolicyType", sts)
 
     def test_the_capacity_wait_is_the_deploy_gates(self) -> None:
         # #2427's gate after the sidecar patch and the not-degraded checks

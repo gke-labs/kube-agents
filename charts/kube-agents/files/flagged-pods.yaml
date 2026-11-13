@@ -29,13 +29,3 @@ pods:
     memoryBytesLimit: 268435456
     ephemeralStorageBytesRequest: 0
     ephemeralStorageBytesLimit: 0
-  - name: dispatcher
-    env: A2A_DISPATCHER_IMAGE
-    enabledWhen: nonBlank
-    replicas: 1
-    cpuMillisRequest: 50
-    cpuMillisLimit: 500
-    memoryBytesRequest: 67108864
-    memoryBytesLimit: 268435456
-    ephemeralStorageBytesRequest: 0
-    ephemeralStorageBytesLimit: 0

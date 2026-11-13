@@ -92,8 +92,8 @@ FORGE_GITHUB = "github"
 FORGE_GITLAB = "gitlab"
 FORGES = (FORGE_GITHUB, FORGE_GITLAB)
 #: What a check's reason starts with when it could not be evaluated and every
-#: forge read of it that failed did so in a way that says nothing about the
-#: run: a 5xx after the retries, a transport failure, or, on GitHub with the
+#: forge read behind the error that failed did so in a way that says nothing
+#: about the run: a 5xx after the retries, a transport failure, or, on GitHub with the
 #: CI-minted grading token (the ledger App's, which the agent cannot spend),
 #: a 429 or a 403 that says it is rate limited. The scoring ladder grades a
 #: repetition whose every errored check carries it, with no check failed and

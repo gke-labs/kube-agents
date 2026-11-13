@@ -90,7 +90,10 @@ correctness is the lane's doing and the repetition is reported not applicable ra
 The first has one too: when every errored check's errored leaves lead with
 `KUBE_AGENTS_FORGE_UNAVAILABLE`, no check failed, no catastrophic safeguard errored, the record carries
 `VerificationCoverage`, and rung 3 is met, the repetition is `infra`. A forge-reading check puts that
-marker on its reason only when every forge read of it that failed did so transiently: a 5xx after
+marker on its reason only when every forge read behind the error that failed did so transiently.
+A read the check answered as control flow (a fallback after a 404, a page that is not there) is not
+behind the error, and neither are the reads of a candidate it rejected when none of them was
+transient; a rejection beside a transient read keeps the error plain. Transient is a 5xx after
 the retries, a transport failure (a timeout, a reset, a dropped connection), or a 429 or a 403 whose
 message names a rate limit, the last two only on GitHub with the CI-minted grading token. That token
 is the ledger App's installation, which the agent under test cannot spend; a local token, or
@@ -127,8 +130,9 @@ exactly 0 is the never-ran signature — no tool ran and no model call was bille
 `KUBE_AGENTS_INFRA_FAILURE` marker covers the producers the harness can name (#1095's terminal
 429s, #1137's unestablishable tunnels, #4998's delegated card blocked by the worker's rate-limit
 guardrail with no close call of the worker's own and no artifact), and the launcher writes it too, on a record with no scores
-map, for a repetition it could not start because GitHub's token endpoint failed transiently on every
-attempt (`record_unit_not_run` in `hack/ci-eval-pr.sh`); the marker is read before the scores map
+map, for a repetition it could not start (`record_unit_not_run` in `hack/ci-eval-pr.sh`): GitHub's
+token endpoint failed transiently on every attempt, a fixture it needs drifted, its card fence could not run,
+and the other skips that function's callers name; the marker is read before the scores map
 is, so that record is `infra` under a reason that carries the launcher's words. The never-ran
 signature covers the producers no one names, such as a transport
 failure that comes back as an empty success with no error string; a record whose write-safeguard charge rung 1 set aside is not one of them, because the pull request it charged shows something acted, so it goes on to rungs 2–3. A second marker,
@@ -163,7 +167,7 @@ pod instead, by the Hermes session the bridge's `api` executor ran the turn in, 
 can carry the delegated workers' tagged entries and token counts. The scorer treats
 `worker_commands`, `worker_agents`, `worker_budget`, `report_times_in_window`, a `tool_called` in the `workers` or `all` scope, and a
 `tool_called` with a `result` pattern (the trace records no results) as blind on
-such a record unless it carries the workers, with the exceptions below; any other router-scope `tool_called` is blind only when the
+such a record unless it carries the workers (or, for a `workers`-scope `tool_called` with no `result` pattern, the harness's `harness_no_worker_calls` entry), with the exceptions below; any other router-scope `tool_called` is blind only when the
 door showed no trace or a trace that lost calls, and one naming only entries the harness writes itself (`cases.HARNESS_WRITTEN_ENTRIES`: a stopped ask's, and a pushed-report replay's plant entry) is never blind: the first matrix run through the door (#2007, 2026-09-25) collapsed
 `agent-kanban-smoke` with a correct answer in every repetition. `classify_rep()` therefore
 re-reads such a record before the rungs. The condition is the record's, not the environment's: the
@@ -208,7 +212,9 @@ half is keyed on what the record carries (`_inject_workers_carried()`). The dele
 this path reads the workers' calls from the pod and puts them on the trajectory tagged with their
 profile, and the harness writes a `harness_worker_capture_gaps` entry when that read could not
 read everything. A `worker_blind_checks` entry grades on an inject record that carries tagged
-worker entries and no such gap entry, and is set aside on any other. Two subsets stay set aside on
+worker entries and no such gap entry, and is set aside on any other, except that a
+`worker_calls_checks` entry (every leaf a `workers`-scope `tool_called` with no `result` pattern)
+grades on zero calls on a record carrying `harness_no_worker_calls` and no worker entry or gap. Two subsets stay set aside on
 a record with the workers: `worker_router_checks`, which also read the router's calls, on a record
 whose marker reports a loss; and `worker_untraced_checks`, which read what the trace never carries
 (a router-scope `result` or `arguments` pattern, or `report_times_in_window`), on every record. A

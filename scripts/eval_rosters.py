@@ -330,13 +330,14 @@ def _script_number(pattern: re.Pattern, script_text: str, what: str) -> int:
 
 
 # The first prompt lines that make a case a stopped ask
-# (bench/kube_agents_bench/stop_hook.py, STOP_DIRECTIVE and
-# MID_TURN_DIRECTIVE). hack/ci-eval-pr.sh's unit_phase runs a stopped ask in
+# (bench/kube_agents_bench/stop_hook.py, STOP_DIRECTIVE, MID_TURN_DIRECTIVE
+# and CARD_WAIT_DIRECTIVE). hack/ci-eval-pr.sh's unit_phase runs a stopped ask in
 # the serial second phase beside the requesting cases;
 # scripts/test_eval_rosters.py holds this text read to
 # stop_hook.is_stopped_ask.
 STOP_DIRECTIVE = "[bench:stop-after-first-card]"
 MID_TURN_DIRECTIVE = "[bench:stop-mid-turn]"
+CARD_WAIT_DIRECTIVE = "[bench:stop-in-card-wait]"
 
 
 def is_stopped_ask(case: str, tasks_dir: pathlib.Path = TASKS_DIR) -> bool:
@@ -345,7 +346,7 @@ def is_stopped_ask(case: str, tasks_dir: pathlib.Path = TASKS_DIR) -> bool:
     return any(
         directive in line.split("#", 1)[0]
         for line in text.splitlines()
-        for directive in (STOP_DIRECTIVE, MID_TURN_DIRECTIVE)
+        for directive in (STOP_DIRECTIVE, MID_TURN_DIRECTIVE, CARD_WAIT_DIRECTIVE)
     )
 
 

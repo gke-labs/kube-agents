@@ -15,12 +15,13 @@
 # The scenario driver for bench/tasks/oobe-first-run-audits: put a long-lived
 # install where a fresh one is when its onboarding inventory scan settles, so the
 # `oobe` job's first-run audits stage fires, and let the verifier read whether the
-# four audits were started.
+# five audits were started.
 #
 # arm.py (beside this file) files two archived stand-in cards, a sweep and a
 # ranking card after it, points `.bootstrap_scan_filed` at the sweep and the
 # hand-off's `.bootstrap_handoff_filed` at the ranking card, removes
-# `.oobe_audits_fired`, and puts back the `oobe` job when the deployed image ships
+# `.oobe_audits_fired`, resumes the audits an eval run paused after the install's own
+# chain (arm.py says why), and puts back the `oobe` job when the deployed image ships
 # one: an install that finished onboarding before the job existed never got it.
 # An image without the job gets nothing put back, so nothing starts the audits.
 #
@@ -32,7 +33,7 @@
 # job there is nothing to wait for.
 #
 # Waiting on running audits is the runner's job, not this stack's: it holds the
-# four streams' locks for the unit (the case's `audit_streams`), and every unit on
+# five streams' locks for the unit (the case's `audit_streams`), and every unit on
 # one of them, the next repetition of this case included, first waits, up to its
 # bound, for a run the install started there or a pending stage has still to start
 # (hack/ci-eval-pr.sh: wait_platform_runs). Run by hand, without the runner, the
@@ -61,8 +62,8 @@ locals {
   arm_b64    = base64encode(file("${path.module}/arm.py"))
   disarm_b64 = base64encode(file("${path.module}/disarm.py"))
   own_b64    = base64encode(file("${path.module}/own_stage.py"))
-  # A fresh CI install's scan settles about 17 minutes after boot, then its chain runs three
-  # audits and claims the fourth (one to 45 minutes each). The runner holds the onboarding
+  # A fresh CI install's scan settles about 17 minutes after boot, then its chain runs four
+  # audits and claims the fifth (one to 45 minutes each). The runner holds the onboarding
   # state lock while this waits, and hack/ci-eval-pr.sh sizes that lock's deadline from
   # own_wait plus chain_wait (STATE_LOCK_HOLD_SECONDS), so a change here changes that too.
   own_wait = 3600

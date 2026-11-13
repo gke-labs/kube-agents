@@ -137,3 +137,66 @@ func TestKanbanDispatcher_ALongBoardIsCut(t *testing.T) {
 		t.Fatalf("message = %+v", cond)
 	}
 }
+
+// A locked board: each tick waits out the SQLite busy timeout, so failures
+// come about 125 s apart. The condition turns True at the first poll after
+// the streak is a poll old with at least the minimum ticks, long before 60.
+func TestKanbanDispatcher_ALockedBoardSetsItByTheStreaksAge(t *testing.T) {
+	h := dispatcherHarness(t)
+	locked := func(ticks, seconds int64) usageDispatcherFailure {
+		return usageDispatcherFailure{Board: "default", Error: "OperationalError", Ticks: ticks, Seconds: seconds, HasAge: true}
+	}
+	h.stub.setDispatcher(chatAddr(), locked(2, 250))
+	h.poll(5)
+	if cond := dispatcherCondition(h); cond != nil {
+		t.Fatalf("at 2 ticks over 250 s: condition %+v, want none", cond)
+	}
+	h.stub.setDispatcher(chatAddr(), locked(3, 375))
+	h.poll(10)
+	cond := dispatcherCondition(h)
+	if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != kanbanDispatcherReasonTicksFailing {
+		t.Fatalf("at 3 ticks over 375 s: condition %+v, want True", cond)
+	}
+	if !strings.Contains(cond.Message, `failed 3 ticks in a row over 6m15s on board "default"`) {
+		t.Fatalf("message = %q", cond.Message)
+	}
+	h.stub.setDispatcher(chatAddr())
+	h.poll(15)
+	if cond := dispatcherCondition(h); cond == nil || cond.Status != metav1.ConditionFalse {
+		t.Fatalf("after a good tick: condition %+v, want False", cond)
+	}
+}
+
+// One slow failure (or one before a tick that hangs) never sets it, however
+// old, nor do two; recovery leaves the CR without the condition.
+func TestKanbanDispatcher_FewerThanTheMinimumTicksNeverSetIt(t *testing.T) {
+	h := dispatcherHarness(t)
+	for i, ticks := range []int64{1, kanbanDispatcherMinFailingTicks - 1} {
+		h.stub.setDispatcher(chatAddr(), usageDispatcherFailure{Board: "default", Error: "OperationalError", Ticks: ticks, Seconds: 900, HasAge: true})
+		h.poll(5 * (i + 1))
+		if cond := dispatcherCondition(h); cond != nil {
+			t.Fatalf("at %d ticks over 900 s: condition %+v, want none", ticks, cond)
+		}
+	}
+	h.stub.setDispatcher(chatAddr())
+	h.poll(15)
+	if cond := dispatcherCondition(h); cond != nil {
+		t.Fatalf("after recovery: condition %+v, want none", cond)
+	}
+}
+
+// A plugin without the age family keeps the tick rule: an old streak of 30
+// ticks does not set it, 60 does.
+func TestKanbanDispatcher_WithoutTheAgeTheTickRuleStands(t *testing.T) {
+	h := dispatcherHarness(t)
+	h.stub.setDispatcher(chatAddr(), usageDispatcherFailure{Board: "default", Error: "OSError", Ticks: kanbanDispatcherFailingTicks / 2})
+	h.poll(5)
+	if cond := dispatcherCondition(h); cond != nil {
+		t.Fatalf("at 30 ticks with no age: condition %+v, want none", cond)
+	}
+	h.stub.setDispatcher(chatAddr(), usageDispatcherFailure{Board: "default", Error: "OSError", Ticks: kanbanDispatcherFailingTicks})
+	h.poll(10)
+	if cond := dispatcherCondition(h); cond == nil || cond.Status != metav1.ConditionTrue || strings.Contains(cond.Message, " over ") {
+		t.Fatalf("at 60 ticks with no age: condition %+v, want True with no age in the message", cond)
+	}
+}

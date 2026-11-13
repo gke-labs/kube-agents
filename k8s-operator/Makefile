@@ -69,6 +69,13 @@ fmt: ## Run go fmt against code.
 vet: ## Run go vet against code.
 	go vet ./...
 
+# GO_TEST_TIMEOUT is go test's per-package -timeout. internal/controller
+# alone runs about 575s under CI, against go test's 600s default, so the
+# default fails the run at random as tests are added. 20m keeps the package
+# clear of it and the whole job inside k8s-operator-test.yml's 25-minute
+# timeout-minutes (the Run Tests step takes ~10-12 minutes today).
+GO_TEST_TIMEOUT ?= 20m
+
 .PHONY: test
 test: manifests generate fmt vet test-python ## Run tests.
 # KUBEBUILDER_ASSETS comes from envtest-path, which installs the binaries if
@@ -103,7 +110,7 @@ test: manifests generate fmt vet test-python ## Run tests.
 		echo "Error: envtest-path gave '$$assets', which holds no kube-apiserver." >&2; \
 		exit 1; \
 	fi; \
-	KUBEBUILDER_ASSETS="$$assets" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
+	KUBEBUILDER_ASSETS="$$assets" go test -timeout $(GO_TEST_TIMEOUT) $$(go list ./... | grep -v /e2e) -coverprofile cover.out
 
 .PHONY: test-python
 # Discovery, not a hand-maintained list, so a new test file beside
@@ -199,10 +206,12 @@ deploy: kustomize check-img ## Deploy controller to the K8s cluster specified in
 	@tmp="$$(mktemp -d)"; trap 'rm -rf "$$tmp"' EXIT; \
 	cp -R config "$$tmp/config"; \
 	(cd "$$tmp/config/manager" && $(KUSTOMIZE) edit set image controller=${IMG}); \
-	$(KUSTOMIZE) build "$$tmp/config/default" | kubectl apply --server-side -f -
+	$(KUSTOMIZE) build "$$tmp/config/default" | kubectl apply --server-side -f - && \
+	$(KUSTOMIZE) build "$$tmp/config/profiles" | kubectl apply --server-side -f -
 
 .PHONY: undeploy
 undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
+	$(KUSTOMIZE) build config/profiles | kubectl delete --ignore-not-found=$(ignore-not-found) -f -
 	$(KUSTOMIZE) build config/default | kubectl delete --ignore-not-found=$(ignore-not-found) -f -
 
 # The integration manifests carry `image: $${..._IMAGE}` so a mirrored install
