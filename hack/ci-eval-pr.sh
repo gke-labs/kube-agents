@@ -44,6 +44,15 @@ readonly EVAL_CERTIFICATION_CASES_FILE="eval/certification-cases.txt"
 # What the replay lane runs (EVAL_REPLAY_LANE=true, hack/ci-env.sh): each entry
 # a registered case, replayed from the nightlies' recordings, gating nothing.
 readonly EVAL_REPLAY_LANE_CASES_FILE="eval/replay-lane-cases.txt"
+# The lane's safety cases: each runs EVAL_REPETITIONS times live, before the
+# cache is seeded, then as many times replayed, so the lane's report can set
+# the two pass rates side by side (hack/replay-proxy/README.md, "In CI").
+readonly EVAL_REPLAY_LANE_SAFETY_CASES_FILE="eval/replay-lane-safety-cases.txt"
+# A safety case's arms: live, then replayed, EVAL_REPETITIONS each.
+readonly REPLAY_LANE_SAFETY_ARMS=2
+# Where the lane tells lane_report.py which repetitions were live (its
+# ARMS_FILE), beside bench-gate's case-<name>.json.
+readonly REPLAY_LANE_ARMS_FILE="replay-lane-arms.json"
 # The stack-bearing cases of the nightly's main part that run in main-b,
 # main-c, main-d and main-e, when EVAL_NIGHTLY_PART splits that part in five
 # (#3384, #4238): a stack-bearing case on no list runs in main-a, which
@@ -1332,13 +1341,15 @@ export AGENT_CLUSTER_CONTEXT="gke_${PROJECT_ID}_${REGION}_${HOST_CLUSTER_NAME}"
 # From here to the EXIT trap, a replaced agent pod or restarted container is
 # on record however early it happens (collect_agent_pod_diagnostics).
 start_agent_pod_watch
-# On the replay lane, the nightlies' recorded answers go into every proxy pod
-# before any case runs; with nothing to replay the lane stops here, having
-# measured nothing (hack/ci-env.sh). A no-op on every other run.
+# On the replay lane, the nightlies' recorded answers are fetched before any
+# case runs; with nothing to replay the lane stops here, having measured
+# nothing (hack/ci-env.sh). A no-op on every other run. The lane seeds them
+# into the proxy pods and starts its collector at the fan-out, after its live
+# arm (seed_replay_lane_cache).
 prepare_replay_lane_cache || exit 1
 # Under EVAL_REPLAY_SHADOW=true, the shadow proxy's lines and stored text go
 # to the private bucket from here on, while the eval runs (hack/ci-env.sh).
-start_replay_shadow_collector
+[ "${EVAL_REPLAY_LANE:-}" = "true" ] || start_replay_shadow_collector
 export AGENT_SERVICE_NAME="platform-agent"
 export AGENT_NAMESPACE="${TARGET_NAMESPACE}"
 
@@ -3406,6 +3417,8 @@ esac
 # history (the recorder decision and the dashboard hook below both skip it);
 # its report is the collector's, in the private shadow bucket. It runs on the
 # presubmit tier's defaults and GitHub only.
+# The safety cases' names, comma-separated; set only on the lane, below.
+REPLAY_LANE_SAFETY_NAMES=""
 case "${EVAL_REPLAY_LANE:-false}" in
   false) ;;
   true)
@@ -3429,14 +3442,71 @@ case "${EVAL_REPLAY_LANE:-false}" in
         exit 1
       fi
     done
+    # The safety cases join the matrix at twice the repetitions
+    # (case_repetitions): the first EVAL_REPETITIONS run live, before the
+    # cache is seeded, the rest replayed. Registered, and in neither list twice.
+    REPLAY_LANE_SAFETY_CASES_PATH="${SCRIPT_DIR}/${EVAL_REPLAY_LANE_SAFETY_CASES_FILE}"
+    REPLAY_LANE_SAFETY_ENTRIES=""
+    if [ -f "${REPLAY_LANE_SAFETY_CASES_PATH}" ]; then
+      REPLAY_LANE_SAFETY_ENTRIES="$(roster_entries "${REPLAY_LANE_SAFETY_CASES_PATH}")"
+    fi
+    while IFS= read -r ENTRY; do
+      [ -n "${ENTRY}" ] || continue
+      if ! printf '%s\n' "${PRESUBMIT_ENTRIES}" "${NIGHTLY_ENTRIES}" | grep -qxF -- "${ENTRY}"; then
+        echo "ERROR: ${REPLAY_LANE_SAFETY_CASES_PATH}: '${ENTRY}' is in neither ${PRESUBMIT_CASES_FILE} nor ${NIGHTLY_CASES_FILE}; the lane replays what the nightly records." >&2
+        exit 1
+      fi
+      if printf '%s\n' "${REPLAY_LANE_TASKS[@]}" | grep -qxF -- "${ENTRY}"; then
+        echo "ERROR: ${REPLAY_LANE_SAFETY_CASES_PATH}: '${ENTRY}' is already in the lane's matrix (${EVAL_REPLAY_LANE_CASES_FILE} or above); a case is listed once." >&2
+        exit 1
+      fi
+      REPLAY_LANE_TASKS+=("${ENTRY}")
+      REPLAY_LANE_SAFETY_NAMES="${REPLAY_LANE_SAFETY_NAMES:+${REPLAY_LANE_SAFETY_NAMES},}$(basename "$(dirname "${ENTRY}")")"
+    done <<< "${REPLAY_LANE_SAFETY_ENTRIES}"
     TASKS=("${REPLAY_LANE_TASKS[@]}")
     echo "EVAL_REPLAY_LANE=true: the replay lane replays ${#TASKS[@]} case(s) (${EVAL_REPLAY_LANE_CASES_FILE}); nothing it grades is recorded or gates anything"
+    echo "EVAL_REPLAY_LANE=true: safety cases, each run live before the cache is seeded and then replayed (${EVAL_REPLAY_LANE_SAFETY_CASES_FILE}): ${REPLAY_LANE_SAFETY_NAMES:-none}"
     ;;
   *)
     echo "ERROR: EVAL_REPLAY_LANE must be 'true' or 'false', got '${EVAL_REPLAY_LANE}'." >&2
     exit 1
     ;;
 esac
+
+# case_repetitions <task-name>: how many repetitions a case runs. A replay-lane
+# safety case runs a live arm and then a replayed one, EVAL_REPETITIONS each;
+# every other case runs EVAL_REPETITIONS. A safety case's repetitions are
+# numbered on: 1..EVAL_REPETITIONS live, the rest replayed (first_queued_rep).
+case_repetitions() {
+  case ",${REPLAY_LANE_SAFETY_NAMES:-}," in
+    *",$1,"*) echo $((EVAL_REPETITIONS * REPLAY_LANE_SAFETY_ARMS)) ;;
+    *) echo "${EVAL_REPETITIONS}" ;;
+  esac
+}
+
+# first_queued_rep <task-name>: the first repetition the main fan-out launches:
+# past the live arm for a safety case, whose live repetitions run before the
+# cache is seeded.
+first_queued_rep() {
+  case ",${REPLAY_LANE_SAFETY_NAMES:-}," in
+    *",$1,"*) echo $((EVAL_REPETITIONS + 1)) ;;
+    *) echo 1 ;;
+  esac
+}
+
+# write_replay_lane_arms <seeded-at epoch seconds>: tells lane_report.py (its
+# ARMS_FILE) which safety cases ran a live arm, how many repetitions it was,
+# and when replay began, beside bench-gate's case files in the collector's
+# --verdicts-dir.
+write_replay_lane_arms() {
+  [ -n "${REPLAY_LANE_SAFETY_NAMES:-}" ] || return 0
+  python3 -c '
+import json, sys
+path, live_reps, seeded_at, names = sys.argv[1], int(sys.argv[2]), float(sys.argv[3]), sys.argv[4]
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump({"live_reps": live_reps, "replayed_from": seeded_at, "cases": names.split(",")}, fh)
+' "${ARTIFACT_DIR}/${REPLAY_LANE_ARMS_FILE}" "${EVAL_REPETITIONS}" "$1" "${REPLAY_LANE_SAFETY_NAMES}"
+}
 
 # Which part of the nightly matrix this run takes, so the nightly can run as
 # several periodics on leased projects of their own: the cases that request a pull request
@@ -5223,13 +5293,13 @@ release_state_lock() { # <task-name>
 grade_case() { # <task-path> <task-name>
   local task="$1" name="$2" rep run_dir start_ms end_ms rep_result
   local result_args=()
-  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Grading Task: ${name} (${task}) x${EVAL_REPETITIONS} <<<"
+  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Grading Task: ${name} (${task}) x$(case_repetitions "${name}") <<<"
   # One --result per repetition, positionally. A repetition that produced no
   # run directory contributes the literal MISSING, so the gate can tell "died
   # before writing anything" from "wrote an unusable record". The harness log
   # is kept for every repetition, green ones included: a green record is the
   # raw material for the baseline store.
-  for rep in $(seq 1 "${EVAL_REPETITIONS}"); do
+  for rep in $(seq 1 "$(case_repetitions "${name}")"); do
     run_dir="$(cat "${STATE_DIR}/${name}.rep${rep}.dir" 2>/dev/null || true)"
     start_ms="$(cat "${STATE_DIR}/${name}.rep${rep}.start" 2>/dev/null || echo 0)"
     end_ms="$(cat "${STATE_DIR}/${name}.rep${rep}.end" 2>/dev/null || echo 0)"
@@ -5377,7 +5447,7 @@ skip_unit() { # <task-path> <task-name> <rep> <streams> <has-stack> <why, for th
   release_state_lock "${name}"
   lock_release "${STATE_DIR}/lock-task-${name}"
   echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} ${why}" >&2
-  if [ "${finished_reps}" -ge "${EVAL_REPETITIONS}" ]; then
+  if [ "${finished_reps}" -ge "$(case_repetitions "${name}")" ]; then
     finish_case "${task}" "${name}"
   fi
 }
@@ -5446,7 +5516,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
     drift_reps="$(finished_rep_count "${name}")"
     lock_release "${STATE_DIR}/lock-task-${name}"
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} did not run: a fixture it needs drifted on the leased project" >&2
-    if [ "${drift_reps}" -ge "${EVAL_REPETITIONS}" ]; then
+    if [ "${drift_reps}" -ge "$(case_repetitions "${name}")" ]; then
       finish_case "${task}" "${name}"
     fi
     return 0
@@ -5462,7 +5532,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
     unfenced_reps="$(finished_rep_count "${name}")"
     lock_release "${STATE_DIR}/lock-task-${name}"
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} did not run: its card fence could not run before it" >&2
-    if [ "${unfenced_reps}" -ge "${EVAL_REPETITIONS}" ]; then
+    if [ "${unfenced_reps}" -ge "$(case_repetitions "${name}")" ]; then
       finish_case "${task}" "${name}"
     fi
     return 0
@@ -5508,7 +5578,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
     release_streams "${streams}"
     lock_release "${STATE_DIR}/lock-task-${name}"
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} did not run: the install's gateway is gone" >&2
-    if [ "${gone_reps}" -ge "${EVAL_REPETITIONS}" ]; then
+    if [ "${gone_reps}" -ge "$(case_repetitions "${name}")" ]; then
       finish_case "${task}" "${name}"
     fi
     return 0
@@ -5742,7 +5812,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   # fan-out must still leave every completed unit's log in the artifacts.
   cp "${log}" "${ARTIFACT_DIR}/eval_${name}_rep${rep}.log" 2>/dev/null || true
   echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] finished ${name} rep ${rep} in $(((end - start) / 1000))s"
-  if [ "${finished_reps}" -ge "${EVAL_REPETITIONS}" ]; then
+  if [ "${finished_reps}" -ge "$(case_repetitions "${name}")" ]; then
     finish_case "${task}" "${name}"
   fi
 }
@@ -5810,28 +5880,44 @@ unit_phase() { # <task-name> -> 2 for a scope-excluding case, 1 for a case that 
     *) echo 0 ;;
   esac
 }
-UNIT_QUEUE="$(
-  for REP in $(seq 1 "${EVAL_REPETITIONS}"); do
-    i=0
-    for TASK in "${TASKS[@]}"; do
-      if [ "$(unit_phase "${TASK_NAMES[i]}")" = "0" ]; then
+# A replay-lane safety case runs its live arm in the first phase's own queue,
+# before the cache is seeded, so it must be a first-phase case.
+for i in "${!TASK_NAMES[@]}"; do
+  if [ "$(first_queued_rep "${TASK_NAMES[i]}")" != "1" ] && [ "$(unit_phase "${TASK_NAMES[i]}")" != "0" ]; then
+    echo "ERROR: ${EVAL_REPLAY_LANE_SAFETY_CASES_FILE}: ${TASK_NAMES[i]} runs after every other unit (it writes, stops or excludes scope), so its live arm cannot run before the cache is seeded; take it off the list." >&2
+    exit 1
+  fi
+done
+# The replay lane's live arm: each safety case's first EVAL_REPETITIONS
+# repetitions, run before seed_replay_lane_cache. Empty off the lane.
+UNIT_QUEUE_LIVE="$(
+  for i in "${!TASK_NAMES[@]}"; do
+    if [ "$(first_queued_rep "${TASK_NAMES[i]}")" != "1" ]; then
+      for REP in $(seq 1 "${EVAL_REPETITIONS}"); do
         printf '%s %s %s\n' "${REP}" "$(unit_cost_hint "${TASK_NAMES[i]}")" "$i"
-      fi
-      i=$((i + 1))
-    done
+      done
+    fi
+  done | sort -k2,2rn -k3,3n -k1,1n
+)"
+UNIT_QUEUE="$(
+  for i in "${!TASK_NAMES[@]}"; do
+    if [ "$(unit_phase "${TASK_NAMES[i]}")" = "0" ]; then
+      for REP in $(seq "$(first_queued_rep "${TASK_NAMES[i]}")" "$(case_repetitions "${TASK_NAMES[i]}")"); do
+        printf '%s %s %s\n' "${REP}" "$(unit_cost_hint "${TASK_NAMES[i]}")" "$i"
+      done
+    fi
   done | sort -k2,2rn -k3,3n -k1,1n
 )"
 UNIT_QUEUE_WRITERS="$(
-  for REP in $(seq 1 "${EVAL_REPETITIONS}"); do
-    i=0
-    for TASK in "${TASKS[@]}"; do
-      if [ "$(unit_phase "${TASK_NAMES[i]}")" = "1" ]; then
+  for i in "${!TASK_NAMES[@]}"; do
+    if [ "$(unit_phase "${TASK_NAMES[i]}")" = "1" ]; then
+      for REP in $(seq 1 "${EVAL_REPETITIONS}"); do
         printf '%s %s %s\n' "${REP}" "$(unit_cost_hint "${TASK_NAMES[i]}")" "$i"
-      fi
-      i=$((i + 1))
-    done
+      done
+    fi
   done | sort -k2,2rn -k3,3n -k1,1n
 )"
+LIVE_TOTAL="$(printf '%s\n' "${UNIT_QUEUE_LIVE}" | grep -c . || true)"
 UNIT_TOTAL="$(printf '%s\n' "${UNIT_QUEUE}" | grep -c . || true)"
 WRITER_TOTAL="$(printf '%s\n' "${UNIT_QUEUE_WRITERS}" | grep -c . || true)"
 
@@ -5944,7 +6030,7 @@ EOF_UNIT_QUEUE
         sleep "${pause}"
       fi
     fi
-    echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] launching ${TASK_NAMES[IDX]} rep ${REP}/${EVAL_REPETITIONS}"
+    echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] launching ${TASK_NAMES[IDX]} rep ${REP}/$(case_repetitions "${TASK_NAMES[IDX]}")"
     UNIT_SEQ=$((${UNIT_SEQ:-0} + 1))
     run_one_unit "${TASKS[IDX]}" "${TASK_NAMES[IDX]}" "${REP}" "${TASK_REUSE[IDX]}" "${TASK_HAS_STACK[IDX]}" "${UNIT_SEQ}" "${TASK_STREAMS[IDX]}" &
     task_jobs="${task_jobs} $!:${IDX}"
@@ -5966,11 +6052,24 @@ while IFS= read -r SCOPE_LINE; do
 done <<<"${SCOPE_EXCLUDE_CASES:-}"
 SCOPE_TOTAL=$(( ${#SCOPE_EXCLUDE_LINES[@]} * EVAL_REPETITIONS ))
 
-profile_begin "task fan-out: $((UNIT_TOTAL + WRITER_TOTAL + SCOPE_TOTAL)) units, parallelism=${EVAL_TASK_PARALLELISM}"
+profile_begin "task fan-out: $((LIVE_TOTAL + UNIT_TOTAL + WRITER_TOTAL + SCOPE_TOTAL)) units, parallelism=${EVAL_TASK_PARALLELISM}"
 # The cards fence_live_cards may archive are the ones filed from here on (the
 # board's created_at, which the gateway pod stamps); the install's own earlier
 # cards are left alone.
 EVAL_FANOUT_STARTED_EPOCH="$(date -u +%s)"
+# The replay lane's live arm, while every proxy pod's cache is still empty:
+# each request misses and goes to the model. Then the cache goes in, the
+# collector starts, and everything after this is replayed.
+if [ "${LIVE_TOTAL}" -gt 0 ]; then
+  echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] the replay lane's live arm: ${LIVE_TOTAL} unit(s) of ${REPLAY_LANE_SAFETY_NAMES}, before the cache is seeded"
+  launch_units "${UNIT_QUEUE_LIVE}" "${EVAL_TASK_PARALLELISM}" "${EVAL_UNIT_LAUNCH_STAGGER_SECONDS}"
+  wait
+fi
+if [ "${EVAL_REPLAY_LANE:-}" = "true" ]; then
+  seed_replay_lane_cache || exit 1
+  write_replay_lane_arms "$(date -u +%s)"
+  start_replay_shadow_collector
+fi
 launch_units "${UNIT_QUEUE}" "${EVAL_TASK_PARALLELISM}" "${EVAL_UNIT_LAUNCH_STAGGER_SECONDS}"
 wait
 if [ "${WRITER_TOTAL}" -gt 0 ]; then

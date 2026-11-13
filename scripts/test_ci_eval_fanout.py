@@ -179,6 +179,8 @@ class QueueOrderTest(unittest.TestCase):
                 # (the inject lane's second phase); with the list unset every
                 # task is in this queue, as on the api lane.
                 lifted("unit_phase"),
+                lifted("case_repetitions"),
+                lifted("first_queued_rep"),
                 f"EVAL_REPETITIONS={reps}",
                 f'INJECT_LANE_REQUESTING="{requesting}"',
                 # compliance carries a 1000 hint, the probe 200: order within a
@@ -376,6 +378,7 @@ EVAL_CLUSTER_NAME=c; EVAL_DEFAULT_LOCATION=l; SEEDED_TASK_CLUSTER=; SEEDED_TASK_
             # The count of finished repetitions the unit reads under its
             # task lock, and the unwinding its skip paths share.
             lifted("finished_rep_count"),
+            lifted("case_repetitions"),
             lifted("skip_unit"),
             # What the unit does when the install is gone (#3129): the code
             # wait_platform_runs returns for it and the marker that latches it.
@@ -836,6 +839,7 @@ class StateLockTest(unittest.TestCase):
                 lifted_constant("EVAL_SHAPE_FILE"),
                 lifted("unit_task_path"),
                 lifted("finished_rep_count"),
+                lifted("case_repetitions"),
                 lifted("skip_unit"),
                 lifted("run_one_unit"),
                 PerCaseGradingTest.UNIT_STUBS,
@@ -880,6 +884,7 @@ class StateLockTest(unittest.TestCase):
                 lifted_constant("EVAL_SHAPE_FILE"),
                 lifted("unit_task_path"),
                 lifted("finished_rep_count"),
+                lifted("case_repetitions"),
                 lifted("skip_unit"),
                 lifted("run_one_unit"),
                 PerCaseGradingTest.UNIT_STUBS,
@@ -923,6 +928,7 @@ class StateLockTest(unittest.TestCase):
                 lifted_constant("EVAL_SHAPE_FILE"),
                 lifted("unit_task_path"),
                 lifted("finished_rep_count"),
+                lifted("case_repetitions"),
                 lifted("skip_unit"),
                 lifted("run_one_unit"),
                 PerCaseGradingTest.UNIT_STUBS,
@@ -984,6 +990,7 @@ class StateLockTest(unittest.TestCase):
                 lifted_constant("EVAL_SHAPE_FILE"),
                 lifted("unit_task_path"),
                 lifted("finished_rep_count"),
+                lifted("case_repetitions"),
                 lifted("skip_unit"),
                 lifted("run_one_unit"),
                 PerCaseGradingTest.UNIT_STUBS,

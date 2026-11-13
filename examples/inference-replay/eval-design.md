@@ -873,6 +873,9 @@ before stage 3 of the rollout (turning replay on):
    it asks: it measures replay on unchanged code, and the drift `main` takes overnight is shadow
    mode's to measure. A regression in the lane's own code is then caught a night later. It reports what was
    served before each first miss, the miss causes, and each case's verdicts beside the nightly's.
+   Only passing runs' answers are published, so replay could push a flaky case toward passing; the
+   lane's safety cases (`hack/eval/replay-lane-safety-cases.txt`) therefore run live before the
+   cache is seeded and then replayed, and the report sets the two pass rates side by side.
    The bucket's grants say who uploaded, not that nothing touched the night. A presubmit leased
    into the same pool project as a running nightly can reach the nightly's proxy, or the LiteLLM
    behind it, with the Prow runner's `roles/container.admin`, and the nightly then publishes what

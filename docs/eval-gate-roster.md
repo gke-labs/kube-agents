@@ -1027,6 +1027,8 @@ is a registered case the inject lane runs, so the nightly has recorded it. The r
 reaches it: the script arms no roster case there, and the lane appends nothing to the evidence
 store and publishes no dashboard. Its record is its report in the shadow bucket
 ([`hack/replay-proxy/README.md`](../hack/replay-proxy/README.md#record-and-replay-the-replay-lane)).
+`hack/eval/replay-lane-safety-cases.txt` follows the same rules; the lane runs each of its cases
+live and then replayed.
 
 ## Demoting a flaky case
 
