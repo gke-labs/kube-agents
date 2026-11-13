@@ -1409,6 +1409,13 @@
 # image was a placeholder; back with #3842.
 ./tasks/tse-node-notready-pleg-probe/task.yaml
 
+# #3842: the GKE Support Agent (tse), asked through a /session turn, runs as a
+# dispatched profile on its own persona image and names the crashloop-workload
+# fixture's OOM kill from its own reads, read-only. Inject lane only
+# (hack/eval/api-lane-exclusions.txt). Needs the dispatcher and profiles.tse,
+# which the CI next lane enables.
+./tasks/tse-profile-names-the-oom-kill/task.yaml
+
 # The API deprecation scan reads a repository over the broker's snapshot
 # ceiling in parts (#4279). The fixture, gke-agentic/kube-agents-evals-large-gitops
 # (#4705), is a public tree over the ceiling with one manifest on a removed

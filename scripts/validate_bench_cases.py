@@ -190,9 +190,10 @@ SCENARIO_BATCH_WAIT = (
 
 KNOWN_UNREGISTERED = {
     # The cluster agent as a dispatched profile diagnosing a fleet fixture
-    # (#3658). Its child runs only where the dispatcher does; it is registered in hack/eval/nightly-cases.txt and on
-    # hack/eval/api-lane-exclusions.txt once #5394 turns the dispatcher on in
-    # the CI next lane, and this entry goes then.
+    # (#3658). Its child runs only where the dispatcher does, which the CI
+    # next lane has since #5394; #5500's follow-up registers it in
+    # hack/eval/nightly-cases.txt and on hack/eval/api-lane-exclusions.txt,
+    # and this entry goes then.
     "cluster-profile-names-the-oom-kill": (
         "#5394: needs the AgentProfile dispatcher and profiles.cluster, which the CI next lane gets from #5394"
     ),
