@@ -34,6 +34,12 @@ routes Service on 6222, authenticated to each other by mutual TLS under the bus 
 a hostname topology spread keep one drain to one server, and a lame-duck `preStop` moves
 clients off a stopping server rather than dropping them.
 
+**Amended 11/12 (#5708):** the serving certificate also names `<bus>-route0`, `-route1` and
+`-route2`, the per-server route Services a later change dials. A route checks its peer against
+the name it dialled. If the certificate and the route list changed in one roll, a server
+already on the new routes would be refused by a peer still serving the old certificate.
+Naming them a release ahead makes the later switch a config change alone.
+
 **Changing the server count empties the bus.** A server that restarts in cluster mode
 finds its standalone streams unassigned in the new metadata layer and deletes them as
 orphans; going back, a standalone server refuses to load an R3 stream. Either way the
@@ -1153,8 +1159,9 @@ cert-manager, which the chart does not install. Three objects, all owned by the
 | Secret `<name>-a2a-nats-tls` (`kubernetes.io/tls`) | the serving pair, one year, with `ca.crt` beside it    |
 | ConfigMap `<name>-a2a-nats-ca-bundle`              | the CA's public certificate alone, which clients mount |
 
-The serving certificate names the NATS Service's in-cluster names and nothing else: no
-localhost, no IP, no external host. Tooling that reaches the bus through a port-forward
+The serving certificate names the in-cluster names of the NATS client Service, the routes
+Service and each server's route Service (`<bus>-route0` to `-route2`, for every server count),
+and nothing else: no localhost, no IP, no external host. Tooling that reaches the bus through a port-forward
 sets the TLS server name to the Service name (`NATS_TLS_SERVER_NAME` for clients built on
 `a2a/lib`). Both Secrets are on the webhook's bus-credential list: a user volume mounting
 either is refused, since the serving key lets a pod impersonate the bus and the CA key

@@ -2778,6 +2778,18 @@ func a2aNATSRoutesName(agent *agentv1alpha1.PlatformAgent) string {
 	return a2aNATSName(agent) + "-routes"
 }
 
+// a2aNATSRouteName is the name server i's own route Service is to have, for
+// routes that dial each server by name (#5708). The serving certificate names
+// these before anything dials them (a2aNATSDNSNames): a route checks its peer
+// against the name it dialled, so a server that rolled onto routes by these
+// names while a peer still served a certificate without them would be cut off
+// from it. With every certificate already carrying them, that switch is a
+// config change alone. "-route<i>" is as long as "-routes", so no agent name
+// that fits the routes Service is too long for these.
+func a2aNATSRouteName(agent *agentv1alpha1.PlatformAgent, i int) string {
+	return a2aNATSName(agent) + "-route" + strconv.Itoa(i)
+}
+
 // buildA2ANATSConfigSecret renders nats.conf with the real credentials from
 // the creds Secret. This Secret's Data is the one place the passwords are
 // meant to appear; a2aConfigRolloutHash covers the rest of the render.
