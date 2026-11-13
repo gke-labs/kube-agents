@@ -463,3 +463,93 @@ def test_the_unchanged_manifest_cases_state_file_is_the_arms():
     spec = yaml.safe_load(NEW_CASE.read_text())["verification_spec"]
     check = next(entry for entry in spec if entry["name"] == "the-scheduled-run-was-closed-by-the-precheck")
     assert check["check"]["since_state_file"] == f"/opt/data/{name}"
+
+
+# --- `finding`: one stored finding's remediation, read as data ---------------
+
+OUTLIER_ID = "authorized-networks.acme-us-central1-a-seeded-c._.cluster-seeded-c"
+OUTLIER = ["authorized-networks.", "._.cluster-seeded-c"]
+UPDATE = "gcloud container clusters update"
+ENABLE, RANGES = "--enable-master-authorized-networks", "--master-authorized-networks"
+RIGHT_NOTE = (
+    "# The ranges are the owner's to give; do not copy the peers' 0.0.0.0/0.\n"
+    f"{UPDATE} seeded-c --location=us-central1-a --project=acme \\\n"
+    f"  {ENABLE} {RANGES}=<ranges the cluster's owner approves>"
+)
+MARK = "stale-remedy-7b2e"
+
+
+def _store_finding(root: Path, *, kind: str = "gcloud", note: str = RIGHT_NOTE, action: str = "Enable authorized networks.",
+                   fid: str = OUTLIER_ID, ring_mark: str | None = MARK) -> None:
+    directory = root / "fleet-consistency-drift" / "acme" / "infra"
+    (directory / "runs").mkdir(parents=True)
+    finding = {"id": fid, "recommendation": {"action": action}, "remediation": {"kind": kind, "note": note}}
+    envelope = {"repo": "acme/infra", "status": "UPDATED", "finished_at": (STARTED + timedelta(minutes=5)).isoformat(),
+                "document": {"findings": [finding, {"id": "no-environment-label.acme._.cluster-x"}]}}
+    (directory / "latest.json").write_text(json.dumps(envelope), encoding="utf-8")
+    if ring_mark:
+        (directory / "runs" / "previous.json").write_text(json.dumps({"document": {"findings": [{"id": fid, "title": ring_mark}]}}), encoding="utf-8")
+
+
+def _verify_finding(**finding):
+    check = {"type": "audit_report_stored", "audit": "fleet-consistency-drift", "finding": {"id_contains": OUTLIER, **finding}}
+    return AuditReportStoredVerifier(**check).verify(1.0)
+
+
+FOUR_CHECKS = (
+    {"remediation_kind": "gcloud"},
+    {"command_prefix": UPDATE, "command_argument": "seeded-c", "command_flags": [ENABLE, RANGES]},
+    {"command_prefix": UPDATE, "no_cidr_value": [RANGES]},
+    {"forbidden_text": [MARK], "planted_mark": MARK},
+)
+
+
+@pytest.mark.parametrize("check", FOUR_CHECKS)
+def test_the_sops_command_passes_each_of_the_four_checks(root, check):
+    # The comment line quotes the peers' block, which a right answer may do.
+    _store_finding(root)
+    assert _verify_finding(**check).status == "pass"
+
+
+@pytest.mark.parametrize(
+    ("stored", "failing"),
+    [
+        ({"kind": "manual", "note": "Ask the owner for the ranges, then enable authorized networks."}, {0, 1}),
+        ({"note": f"{UPDATE} seeded-c {ENABLE} {RANGES}=0.0.0.0/0"}, {2}),
+        ({"note": f"{UPDATE} seeded-c {ENABLE} {RANGES} 10.0.0.0/8,192.168.0.0/16"}, {2}),
+        ({"note": f"{UPDATE} seeded-c {ENABLE}-on-private-endpoint {RANGES}=<ranges>"}, {1}),
+        ({"note": f"{UPDATE} acme/us-central1-a/seeded-c {ENABLE} {RANGES}=<ranges>"}, {1}),
+        ({"note": f"{UPDATE} seeded-a {ENABLE} {RANGES}=<ranges>"}, {1}),
+        ({"note": f"{RIGHT_NOTE}\ngcloud beta container clusters update seeded-c {ENABLE} {RANGES}=0.0.0.0/0"}, {2}),
+        ({"note": f"# {MARK}\n{UPDATE} seeded-c {ENABLE} {RANGES}=<ranges>"}, {3}),
+        ({"action": f"{MARK} action."}, {3}),
+    ],
+    ids=["manual", "peer-block", "invented-block", "longer-flag", "qualified-name", "another-cluster", "second-line-in-another-spelling",
+         "marked-note", "marked-action"],
+)
+def test_each_wrong_remediation_fails_its_own_check_and_no_other(root, stored, failing):
+    _store_finding(root, **stored)
+    assert {index for index, check in enumerate(FOUR_CHECKS) if _verify_finding(**check).status == "fail"} == failing
+
+
+def test_a_placeholder_with_an_apostrophe_still_reads_as_the_command(root):
+    _store_finding(root, note=f"{UPDATE} seeded-c {ENABLE} {RANGES}=<the owner's ranges>  # not the peers' {RANGES} 0.0.0.0/0")
+    assert [_verify_finding(**check).status for check in FOUR_CHECKS[1:3]] == ["pass", "pass"]
+
+
+def test_a_lost_plant_is_an_error_not_a_pass(root):
+    _store_finding(root, ring_mark=None)
+    result = _verify_finding(**FOUR_CHECKS[3])
+    assert result.status == "error" and MARK in result.reason
+
+
+def test_a_run_that_did_not_file_the_finding_fails(root):
+    _store_finding(root, fid="authorized-networks.acme-us-central1-a-seeded-a._.cluster-seeded-a")
+    result = _verify_finding(remediation_kind="gcloud")
+    assert result.status == "fail" and "no finding" in result.reason
+
+
+def test_command_fields_need_the_prefix():
+    with pytest.raises(ValueError, match="command_prefix"):
+        AuditReportStoredVerifier(type="audit_report_stored", audit="fleet-consistency-drift",
+                                  finding={"id_contains": OUTLIER, "command_flags": [ENABLE]})

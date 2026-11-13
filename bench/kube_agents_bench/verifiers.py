@@ -217,6 +217,17 @@ REPORT_STORE_ROOT = "/opt/data/fleet-audit/reports"
 # run that could not name its start (the key, null).
 _ENVELOPE_STARTED_KEY = "started_at"
 _REPORT_STORE_READ = "__FLEET_AUDIT_REPORT_STORE__"
+# The store's ring of earlier envelopes, beside `latest.json`
+# (audit_report.REPORT_RUNS_DIR); a planted previous run stays there after the
+# run under test has written its own `latest.json`.
+_REPORT_RUNS_DIR = "runs"
+# A literal IPv4 range, the thing a remediation command must not carry where
+# the SOP says the value is the owner's to give.
+_CIDR_LITERAL_RE = re.compile(r"(?<![\d.])\d{1,3}(?:\.\d{1,3}){3}/\d{1,2}(?!\d)")
+_SHELL_COMMENT_PREFIX = "#"
+_SHELL_TRAILING_COMMENT = " #"
+_SHELL_LINE_CONTINUATION = "\\\n"
+_FLAG_PREFIX = "--"
 _FANOUT_READ_TIMEOUT_SEC = 60.0
 _ONBOARDING_READ_TIMEOUT_SEC = 60.0
 # A forge read that fails in transport (a socket timeout, a reset, a dropped
@@ -9722,7 +9733,9 @@ class FindingsItemStateVerifier(_OnboardingPollVerifier):
         return "pass", f"all {len(self.finding_ids)} row(s) are {self.state}", raw
 
 
-def report_store_command(audit: str, keys: tuple[str, ...] = (), excerpts: bool = False) -> str:
+def report_store_command(
+    audit: str, keys: tuple[str, ...] = (), excerpts: bool = False, fragments: tuple[str, ...] = (), mark: str = ""
+) -> str:
     """The ``sh -c`` line that prints every ``latest.json`` of ``audit`` in the store.
 
     One JSON list after :data:`_REPORT_STORE_READ`: per repository directory,
@@ -9732,7 +9745,11 @@ def report_store_command(audit: str, keys: tuple[str, ...] = (), excerpts: bool 
     and the ids of the findings in its ``document`` (this run's own, never ids it
     only carried), or the ``error`` that kept it unread. With ``excerpts``, also
     each finding's ``evidence.excerpt`` as ``finding_excerpts`` (id -> excerpt),
-    which ``finish`` takes from the collector. The rest stays in the pod.
+    which ``finish`` takes from the collector. With ``fragments``, also
+    the ``recommendation`` and ``remediation`` of each finding whose id contains
+    every fragment (``findings``); with ``mark``, how many envelopes of that
+    directory, ``latest.json`` and the ring, hold it (``mark_envelopes``). The
+    rest stays in the pod.
     """
     wanted = tuple(dict.fromkeys(("status", "repo", "finished_at", *keys)))
     script = f"""
@@ -9752,6 +9769,19 @@ for path in sorted(glob.glob(os.path.join({REPORT_STORE_ROOT!r}, {audit!r}, "*",
                 str(f.get("id", "")): str((f.get("evidence") or {{}}).get("excerpt") or "")
                 for f in findings if isinstance(f, dict)
             }}
+        if {fragments!r}:
+            entry["findings"] = [
+                {{"id": str(f.get("id", "")), "recommendation": f.get("recommendation"), "remediation": f.get("remediation")}}
+                for f in findings
+                if isinstance(f, dict) and all(part in str(f.get("id", "")) for part in {fragments!r})
+            ]
+        if {mark!r}:
+            ring = glob.glob(os.path.join(os.path.dirname(path), {_REPORT_RUNS_DIR!r}, "*.json"))
+            held = 0
+            for stored in [path, *ring]:
+                with open(stored, encoding="utf-8") as handle:
+                    held += {mark!r} in handle.read()
+            entry["mark_envelopes"] = held
         out.append(entry)
     except Exception as exc:
         out.append({{"path": path, "error": str(exc)}})
@@ -9778,10 +9808,16 @@ def read_fired_at(shell: Callable[[str, float], str], path: str, timeout: float)
 
 
 def read_report_store(
-    shell: Callable[[str, float], str], audit: str, timeout: float, keys: tuple[str, ...] = (), excerpts: bool = False
+    shell: Callable[[str, float], str],
+    audit: str,
+    timeout: float,
+    keys: tuple[str, ...] = (),
+    excerpts: bool = False,
+    fragments: tuple[str, ...] = (),
+    mark: str = "",
 ) -> list[dict[str, Any]] | None:
     """The store listing ``report_store_command`` prints, or None when the pod gave none."""
-    reply = shell(report_store_command(audit, keys, excerpts), timeout)
+    reply = shell(report_store_command(audit, keys, excerpts, fragments, mark), timeout)
     marker = reply.find(_REPORT_STORE_READ)
     if marker < 0:
         return None
@@ -9790,6 +9826,119 @@ def read_report_store(
     except (IndexError, json.JSONDecodeError):
         return None
     return [entry for entry in listing if isinstance(entry, dict)] if isinstance(listing, list) else None
+
+
+def remediation_commands(note: str, prefix: str) -> list[list[str]]:
+    """The arguments of each command line in ``note`` that opens with ``prefix``.
+
+    Read as a shell reads the note: comment lines and trailing comments are
+    not commands, a backslash joins a line to the next, and the words of
+    ``prefix`` must be the line's first words (an empty ``prefix`` is every
+    command line). A line a shell could not split (an apostrophe in a
+    placeholder) is split on spaces instead.
+    """
+    want = prefix.split()
+    found = []
+    for line in note.replace(_SHELL_LINE_CONTINUATION, " ").splitlines():
+        # Cut the trailing comment before any split: an apostrophe on each
+        # side of the `#` would otherwise quote it into the command.
+        line = line.strip().split(_SHELL_TRAILING_COMMENT, 1)[0]
+        if not line or line.startswith(_SHELL_COMMENT_PREFIX):
+            continue
+        try:
+            argv = shlex.split(line)
+        except ValueError:
+            argv = line.split()
+        if argv[: len(want)] == want:
+            found.append(argv[len(want):])
+    return found
+
+
+def flag_values(argv: list[str], flag: str) -> list[str] | None:
+    """Each value ``flag`` takes in ``argv`` (``""`` for a bare flag), or None when it is absent.
+
+    The flag is matched whole: ``--enable-x`` is not ``--enable-x-on-y``.
+    """
+    values = []
+    for index, word in enumerate(argv):
+        if word == flag:
+            following = argv[index + 1] if index + 1 < len(argv) else ""
+            values.append("" if following.startswith(_FLAG_PREFIX) else following)
+        elif word.startswith(f"{flag}="):
+            values.append(word[len(flag) + 1:])
+    return values or None
+
+
+class StoredFindingCheck(BaseModel):
+    """One assertion over one finding of the stored document, read as data.
+
+    The finding is the one whose id contains every ``id_contains`` fragment.
+    ``remediation_kind`` is its ``remediation.kind``. The command fields read
+    ``remediation.note`` as commands (:func:`remediation_commands`): some line
+    opening with ``command_prefix`` must carry ``command_argument`` as a whole
+    word and every flag of ``command_flags``; no command line of the note,
+    whatever it opens with, may give a flag of ``no_cidr_value`` a literal
+    IPv4 range. ``forbidden_text`` must not occur
+    in the finding's ``recommendation`` or ``remediation``. ``planted_mark`` is
+    the mark of a previous run the case's stack planted: when no envelope of
+    the store holds it, the plant is gone and the check is an error, not a pass.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id_contains: list[str] = Field(min_length=1)
+    remediation_kind: str | None = None
+    command_prefix: str | None = None
+    command_argument: str | None = None
+    command_flags: list[str] = Field(default_factory=list)
+    no_cidr_value: list[str] = Field(default_factory=list)
+    forbidden_text: list[str] = Field(default_factory=list)
+    planted_mark: str | None = None
+
+    @model_validator(mode="after")
+    def _command_fields_need_a_prefix(self) -> "StoredFindingCheck":
+        if (self.command_argument or self.command_flags or self.no_cidr_value) and not self.command_prefix:
+            raise ValueError("command_argument, command_flags and no_cidr_value read the lines command_prefix names")
+        return self
+
+    def problems(self, finding: dict[str, Any]) -> list[str]:
+        """What this finding lacks, as reasons; empty when it passes."""
+        remediation = finding.get("remediation") if isinstance(finding.get("remediation"), dict) else {}
+        found = []
+        if self.remediation_kind is not None and remediation.get("kind") != self.remediation_kind:
+            found.append(f"remediation.kind is {remediation.get('kind')!r}, not {self.remediation_kind!r}")
+        if self.command_prefix:
+            lines = remediation_commands(str(remediation.get("note") or ""), self.command_prefix)
+            # A note with no such line gives no flag a literal range: that is
+            # the command check's red, never the range check's.
+            if not lines and (self.command_argument or self.command_flags):
+                found.append(f"remediation.note has no command line opening with {self.command_prefix!r}")
+            elif self.command_argument or self.command_flags:
+                complete = [
+                    argv
+                    for argv in lines
+                    if (not self.command_argument or self.command_argument in argv)
+                    and all(flag_values(argv, flag) is not None for flag in self.command_flags)
+                ]
+                if not complete:
+                    found.append(
+                        f"no {self.command_prefix!r} line names {self.command_argument!r} with every flag of {self.command_flags}"
+                    )
+            # Every command line, not only the prefixed ones: a second line
+            # in another spelling (`gcloud beta ...`) is still a command the
+            # reader is told to run.
+            every_line = remediation_commands(str(remediation.get("note") or ""), "")
+            for flag in self.no_cidr_value:
+                literal = [
+                    value for argv in every_line for value in flag_values(argv, flag) or [] if _CIDR_LITERAL_RE.search(value)
+                ]
+                if literal:
+                    found.append(f"{flag} is given a literal range: {literal}")
+        text = json.dumps([finding.get("recommendation"), finding.get("remediation")])
+        held = [word for word in self.forbidden_text if word in text]
+        if held:
+            found.append(f"its recommendation or remediation holds {held}")
+        return found
 
 
 @VERIFIERS.register("audit_report_stored")
@@ -9819,6 +9968,8 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
     it: what the collector observed and ``finish`` published, read where it was
     stored rather than from a ledger body that may cut it. ``current_ids`` is not read: it
     also carries ids a run held without finding them.
+    ``finding`` reads one finding's recommendation and remediation as data
+    (:class:`StoredFindingCheck`).
 
     No envelope from this run is a fail: the audit published nothing where the
     store's readers look. A pod that cannot be read, or a run with no start
@@ -9833,6 +9984,7 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
     required_evidence_phrases: list[str] = Field(default_factory=list)
     # Top-level envelope keys and the value each must hold on this run's envelope.
     required_envelope: dict[str, Any] = Field(default_factory=dict)
+    finding: StoredFindingCheck | None = None
     # A JSON file in the agent container whose ``fired_at`` (ISO-8601, as the
     # audit-chat-report and unchanged-manifest-digest stacks' arm.py write it)
     # replaces the run's start as the lower bound, with no skew allowance: the
@@ -9867,13 +10019,26 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
         read_any = False
         for shell in (onboarding.sandbox_shell, onboarding.agent_shell):
             listing = read_report_store(
-                shell, self.audit, read_timeout, tuple(self.required_envelope), bool(self.required_evidence_phrases)
+                shell,
+                self.audit,
+                read_timeout,
+                tuple(self.required_envelope),
+                bool(self.required_evidence_phrases),
+                tuple(self.finding.id_contains) if self.finding else (),
+                (self.finding.planted_mark or "") if self.finding else "",
             )
             if listing is not None:
                 read_any = True
                 envelopes.extend(listing)
         if not read_any:
             return "error", "neither the sandbox nor the agent container could be read", None
+        if self.finding and self.finding.planted_mark and not any(e.get("mark_envelopes") for e in envelopes):
+            return (
+                "error",
+                f"no stored {self.audit} envelope holds {self.finding.planted_mark!r}: the previous run the "
+                "stack planted is gone, so this run was not measured against it",
+                None,
+            )
         fresh = []
         started_early = 0
         for envelope in envelopes:
@@ -9941,6 +10106,19 @@ class AuditReportStoredVerifier(_OnboardingPollVerifier):
                 failures.append(f"{envelope.get('repo')}: a finding in its document has an id containing {present}")
             elif unevidenced:
                 failures.append(f"{envelope.get('repo')}: no matched finding's evidence contains {unevidenced}")
+            elif self.finding and not envelope.get("findings"):
+                failures.append(
+                    f"{envelope.get('repo')}: no finding in its document has an id containing every one of "
+                    f"{self.finding.id_contains}"
+                )
+            elif self.finding and (
+                wrong_findings := [
+                    f"{finding.get('id')}: {'; '.join(problems)}"
+                    for finding in envelope["findings"]
+                    if (problems := self.finding.problems(finding))
+                ]
+            ):
+                failures.append(f"{envelope.get('repo')}: " + " | ".join(wrong_findings))
             else:
                 return "pass", f"{envelope.get('repo')}: {envelope.get('status')} with {len(ids)} finding(s)", raw
         return "fail", "; ".join(failures), raw
