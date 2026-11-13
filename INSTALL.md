@@ -1191,7 +1191,10 @@ make docker-push IMG=$IMG
 
 ### Step 4: Deploy the Operator & CRDs
 
-Install the Custom Resource Definitions (CRDs) and deploy the controller manager deployment:
+Install the Custom Resource Definitions (CRDs) and deploy the controller manager deployment.
+`make deploy` applies `config/default` and then `config/profiles`, which creates the profile
+namespace (`kubeagents-system-profiles`, where `mode: next` runs profile workers) with the
+operator's namespaced Role and its RoleBinding in it; `make undeploy` deletes that namespace too:
 
 ```bash
 make install
