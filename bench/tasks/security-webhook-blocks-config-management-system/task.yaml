@@ -1,19 +1,27 @@
 # Security, Workload Identity, RBAC and CVEs (compliance-audit): the planted
 # ValidatingWebhookConfiguration has failurePolicy Fail and a backend the API
 # server cannot reach (its clientConfig.service names a Service that does not
-# exist), and no compliance check reads an admission webhook configuration.
-# A declared gap: expected_fail until the check lands
-# (gke-labs/kube-agents#5335). What the fixture plants versus the
+# exist). Check 2.18 (`webhook-backend-unreachable`) names it: the collector
+# lists it as a candidate, the audit's document carries it, and its id reaches
+# the ledger (gke-labs/kube-agents#5335, closed by the check). The case stays a
+# declared gap, expected_fail, on the ledger cut: once the critical findings
+# fill the ledger body's budget, every major and minor finding is dropped from
+# the body and survives only as a clipped id, so the finding is filed but has
+# no `Where:` line this case can read (gke-labs/kube-agents#5052). On a fleet
+# with fewer criticals the customer sees it. The marker is case-level (the
+# format has no per-check marker): it covers the one objective, the ledger-body
+# finding read; the three safeguards stay graded, and the record of the check
+# is the collector's candidate, the findings document and the ledger's id.
+# What the fixture plants versus the
 # customer failure: the fixture plants a fail-closed webhook on an inert API
 # group, scoped by selector to a bench label, whose backend Service does not
-# exist; the customer failure is the same fail-closed webhook on real
-# resources with no system-namespace exemption, which refuses every write
-# the config-management system makes. The plant's rule and selectors are
-# inert by design (the suite's fixture rules in bench/README.md), so the
-# check this case waits for reads backend reachability of any fail-closed
-# webhook, with the rules' reach as severity, never as the trigger. A check
-# that reads only the namespaceSelector exemption does not flip this case:
-# the planted selector excludes the system namespaces by construction.
+# exist; the customer failure is the same fail-closed webhook on real resources
+# with no system-namespace exemption, which refuses every write the
+# config-management system makes. The plant's rule and selectors are inert by
+# design (the suite's fixture rules in bench/README.md), so the check reads
+# backend reachability of any fail-closed webhook, with the rules' reach as
+# severity (`major` here: the selector admits neither kube-system nor
+# config-management-system), never as the trigger.
 id: security-webhook-blocks-config-management-system
 name: "Fail-Closed Admission Webhook Whose Backend Service Does Not Exist (webhook backend reachability check)"
 domain: security
