@@ -186,9 +186,10 @@ var requiredPermissions = []requiredPermission{
 	// drop spec fields a newer CRD added) and writes status with
 	// Status().Update; the PlatformAgent reconciler lists them into the
 	// identity map.
+	// No agentprofiles/finalizers: nothing carries an owner reference to a
+	// profile, so owner-references admission never asks for it.
 	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentprofiles"}, Verbs: []string{"get", "list", "watch", "patch"}},
 	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentprofiles/status"}, Verbs: []string{"get", "update"}},
-	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentprofiles/finalizers"}, Verbs: []string{"update"}},
 	// tiers: the Tier reconciler reads each tier and writes its Accepted
 	// condition (#3659). Nothing else: tiers are cluster administrators' to
 	// write.

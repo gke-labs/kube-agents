@@ -144,13 +144,6 @@ rules:
   - apiGroups:
       - kubeagents.x-k8s.io
     resources:
-      - agentprofiles/finalizers
-      - platformagents/finalizers
-    verbs:
-      - update
-  - apiGroups:
-      - kubeagents.x-k8s.io
-    resources:
       - agentprofiles/status
     verbs:
       - get
@@ -172,6 +165,12 @@ rules:
       - patch
       - update
       - watch
+  - apiGroups:
+      - kubeagents.x-k8s.io
+    resources:
+      - platformagents/finalizers
+    verbs:
+      - update
   - apiGroups:
       - kubeagents.x-k8s.io
     resources:

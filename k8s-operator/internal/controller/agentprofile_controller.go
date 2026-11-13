@@ -121,12 +121,13 @@ type AgentProfileReconciler struct {
 // Every verb has a caller (tests/test_operator_secrets_grant.py names them): the reads are the
 // For() informer, the identity map's List and r.Get; `patch` is patchFinalizers' merge patch,
 // the one write to the profile itself (an Update would drop spec fields a newer CRD added,
-// which is why there is no `update` here); the status is written with Status().Update; the
-// finalizers verb is what owner-references admission requires, because the profile's
-// ServiceAccounts carry a controller reference.
+// which is why there is no `update` here); the status is written with Status().Update. There
+// is no `agentprofiles/finalizers` verb: nothing the operator renders carries an owner
+// reference to a profile (the profile's ServiceAccounts carry labels only and outlive it), so
+// owner-references admission never asks for it, and the finalizer itself is a field of the
+// main resource, written by the merge patch above.
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentprofiles,verbs=get;list;watch;patch
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentprofiles/status,verbs=get;update
-// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentprofiles/finalizers,verbs=update
 
 // Reconcile renders one profile.
 func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {

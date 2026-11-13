@@ -162,16 +162,23 @@ NAMESPACED_VERBS_BY_KIND = {
     (CORE_API_GROUP, "events"): frozenset({"create", "patch"}),
     (CORE_API_GROUP, "podtemplates"): frozenset({"create"}),
 }
-# The custom resources' verbs on the ClusterRole, each with the code that
-# calls it. A verb with no caller is a grant the operator never uses, and on a
-# cluster-scoped grant that is authority over every namespace for nothing:
-# `create` and `delete` on `platformagents` were that until this table. The
-# `get` on each status subresource has no caller either; it is the read half
-# of a subresource the controller writes and is kept as such, named here so a
-# reader does not go looking for one. `tiers` is left to its own owner.
+# The custom resources' verbs on the ClusterRole, each write verb with the
+# code that calls it. A verb with no caller is a grant the operator never
+# uses, and on a cluster-scoped grant that is authority over every namespace
+# for nothing: `create` and `delete` on `platformagents` were that until this
+# table. The reads are kept whole: `list` and `watch` feed the informers and
+# `get` is the read half of every kind the controller writes or watches, kept
+# where nothing sends a GET today (the status subresources, agentplugins,
+# agentprofiles) and named here so a reader does not go looking for a caller.
+# `tiers` is left to its own owner.
 #
-#   platformagents            get: r.Get in Reconcile; list/watch: the For()
-#                             informer and the webhook's List; update: the
+#   platformagents            get: the uncached reads (r.APIReader.Get in
+#                             platformagent_controller.go, podReader in
+#                             platformagent_a2a_bus_streams.go, a2aReader in
+#                             agentprofile_namespace.go); list/watch: the For()
+#                             informer and the Lists outside it (the webhook's,
+#                             the usage poller's, the bus-stream check's, the
+#                             profile reconciler's); update: the
 #                             finalizer (AddFinalizer/RemoveFinalizer with
 #                             r.Update); patch: the bus-stream annotation
 #                             merge patch (platformagent_a2a_bus_streams.go).
@@ -181,17 +188,24 @@ NAMESPACED_VERBS_BY_KIND = {
 #                             blockOwnerDeletion on every rendered object, and
 #                             the API server's owner-references admission
 #                             requires it on the owner's finalizers.
-#   agentplugins              get/list/watch: the Watches() informer and r.Get.
+#   agentplugins              list/watch: the Watches() informer and two
+#                             Lists in platformagent_controller.go; get: the
+#                             read half (no Get of a plugin is sent).
 #   agentplugins/status       patch: Status().Patch (the plugin conditions);
 #                             get: the read half.
-#   agentprofiles             get/list/watch: the For() informer and the
-#                             identity map's List; patch: patchFinalizers'
-#                             merge patch (an Update would drop spec fields a
-#                             newer CRD added).
+#   agentprofiles             list/watch: the For() informer and the identity
+#                             map's List; get: the read half (the reconciler's
+#                             Get is served by the informer; its uncached
+#                             reader reads ServiceAccounts only); patch:
+#                             patchFinalizers' merge patch (an Update would
+#                             drop spec fields a newer CRD added).
 #   agentprofiles/status      update: Status().Update (writeStatus); get: the
 #                             read half.
-#   agentprofiles/finalizers  update: the profile's ServiceAccounts carry a
-#                             controller reference, as above.
+#   (no agentprofiles/finalizers: nothing the operator renders carries an
+#                             owner reference to a profile, the profile's
+#                             ServiceAccounts carry labels only and outlive
+#                             it, and the finalizer is a field of the main
+#                             resource written by the merge patch above.)
 CR_API_GROUP = "kubeagents.x-k8s.io"
 CR_VERBS_BY_RESOURCE = {
     "platformagents": frozenset({"get", "list", "watch", "update", "patch"}),
@@ -201,8 +215,16 @@ CR_VERBS_BY_RESOURCE = {
     "agentplugins/status": frozenset({"get", "patch"}),
     "agentprofiles": frozenset({"get", "list", "watch", "patch"}),
     "agentprofiles/status": frozenset({"get", "update"}),
-    "agentprofiles/finalizers": frozenset({"update"}),
 }
+# Subresources the ClusterRole must not name at all: a row here with any verb
+# is a grant with no caller (see the table's note on agentprofiles/finalizers).
+CR_RESOURCES_WITHOUT_A_GRANT = frozenset({"agentprofiles/finalizers"})
+# The other kubeagents.x-k8s.io resources the ClusterRole names, outside this
+# table: the Tier CRD's (its owner's grant; `tiers/status` `patch` has no
+# caller today) and the dispatcher's params, whose reads stay cluster-wide
+# (see the markers). A new CRD's marker lands here or in the table, so a
+# grant nobody has classified is red rather than unexamined.
+CR_RESOURCES_OUTSIDE_THE_TABLE = frozenset({"tiers", "tiers/status", "dispatchjobtemplates"})
 # The kustomize deploy recipe: config/profiles is applied after config/default
 # and a failed first apply fails the target. The profile namespace's
 # release-namespace annotation is the install namespace, which the operator
@@ -476,6 +498,23 @@ class OperatorSecretsGrantTest(unittest.TestCase):
                             for verb in (rule.get("verbs") or [])
                         }
                         self.assertEqual(want, verbs)
+                for resource in sorted(CR_RESOURCES_WITHOUT_A_GRANT):
+                    with self.subTest(source=source, resource=resource):
+                        self.assertFalse(
+                            [rule for rule in rules if CR_API_GROUP in (rule.get("apiGroups") or []) and resource in (rule.get("resources") or [])],
+                            f"{source}: {resource} is granted and nothing calls it",
+                        )
+                named = {
+                    resource
+                    for rule in rules
+                    if CR_API_GROUP in (rule.get("apiGroups") or [])
+                    for resource in (rule.get("resources") or [])
+                }
+                self.assertEqual(
+                    set(CR_VERBS_BY_RESOURCE) | CR_RESOURCES_OUTSIDE_THE_TABLE,
+                    named,
+                    f"{source}: a kubeagents.x-k8s.io resource on the ClusterRole is not classified in this test",
+                )
 
     def test_the_cluster_role_grants_no_write_verb_on_a_namespaced_kind(self):
         # The general form of the Secret invariant: every kind the operator
