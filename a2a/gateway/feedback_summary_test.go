@@ -505,6 +505,7 @@ func (f fakeUsageSource) ServerVersion(context.Context) (string, error) { return
 // gateway's own answer, like the bare form: one fenced block, no task, no
 // change to the conversation's state.
 func TestFeedbackSummaryPostsTheBlockAndStartsNoTask(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	r.g.usage = fakeUsageSource{cr: summaryCR(), version: "v1.33.4-gke.1234000"}
 	conv := "discord:g1/thread-fbs1"
@@ -572,6 +573,7 @@ func TestFeedbackSummaryDoesNotRefuseAModelSegmentEqualToTheClusterName(t *testi
 }
 
 func TestFeedbackSummaryUnavailableWhenTheResourceCannotBeRead(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	r.g.usage = fakeUsageSource{err: errors.New("platformagents.kubeagents.x-k8s.io is forbidden")}
 	conv := "discord:g1/thread-fbs3"

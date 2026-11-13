@@ -209,6 +209,11 @@ keeps the container's env free of a duplicate name. `| default dict` because
 - name: A2A_MCP_DOOR
   value: "true"
 {{- end -}}
+{{- $dispatcher := (.Values.operator.profileDispatcher | default dict) -}}
+{{- if and (hasKey $dispatcher "enabled") (eq (toString $dispatcher.enabled) "false") (not (hasKey $named "A2A_PROFILE_DISPATCHER")) }}
+- name: A2A_PROFILE_DISPATCHER
+  value: "false"
+{{- end -}}
 {{- with (.Values.operator.slackTestUsers | default list) }}
 {{- if not (hasKey $named "A2A_SLACK_TEST_USERS") }}
 - name: A2A_SLACK_TEST_USERS
@@ -964,7 +969,7 @@ callbacks is the formatted list of LiteLLM callbacks, built by the caller.
   `thought`, where nothing downstream can tell it from the answer; asking for
   the thoughts gives them a channel of their own. Of the
   settings LiteLLM maps to includeThoughts, this is the one that changes
-  nothing else: with no budget_tokens, LiteLLM v1.106.0
+  nothing else: with no budget_tokens, LiteLLM v1.108.6
   (VertexGeminiConfig._map_thinking_param) sends includeThoughts alone on
   Gemini 3.x, no thinkingLevel, so the model keeps its own depth; on 2.5 it
   sends no thinkingBudget either.
@@ -1059,7 +1064,7 @@ callbacks is the formatted list of LiteLLM callbacks, built by the caller.
 {{- /*
   The spend ceiling, as router_settings.provider_budget_config for the one
   provider every alias routes to. LiteLLM's router budget limiter
-  (litellm/router_strategy/budget_limiter.py, v1.106.0) adds each response's
+  (litellm/router_strategy/budget_limiter.py, v1.108.6) adds each response's
   cost to a per-provider counter in the router's cache, filters the provider's
   deployments out once the counter reaches budget_limit, and lets the counter
   expire time_period after the window opened (at router start for the first
@@ -3452,7 +3457,9 @@ spec, e.g. (list "deployment" "credentialProxy")> "field" <the property that mus
     {{- end -}}
   {{- end -}}
   {{- /* Standing pods behind an operator flag (files/flagged-pods.yaml: the MCP server,
-         #3869; the profile dispatcher, #4808). The operator renders each only while
+         #3869). The profile dispatcher, on by default, is in footprint.yaml; switched off
+         (operator.profileDispatcher.enabled false) it is still counted, which over-counts
+         by its one pod in the safe direction. The operator renders each only while
          its flag is set (operator.mcpServer.enabled or operator.extraEnv), so no golden
          renders it and footprint.yaml has no entry for it. An entry's flag is read as the operator reads it, the last setting
          winning: enabledWhen "true" takes only that value, nonBlank any value that isn't blank.

@@ -91,9 +91,21 @@ VALUE_SPAN_LINE = "line"
 VALUE_SPAN_TOKEN = "token"
 TEXT_ARG_KEYS = ("content",)
 # A backslash-escaped space continues a shell word (`password=my\ secret\
-# phrase` is one value). `scrub_step_text` folds each to a character no rule
-# reads as whitespace before the redactor runs, so the redactor and the
-# supplement see one token, and the supplement unfolds what survives.
+# phrase` is one value). `scrub_step_text` folds each to a character the
+# value rules do not read as whitespace before the redactor runs, so the
+# redactor and the supplement see one token, and the supplement unfolds what
+# survives.
+# Every `\ ` folds, also after an even backslash run, where bash ends the word
+# (`a\\ b` is `a\` and `b`): `eval`, `ssh host …`, `watch` and a nested
+# `bash -c "…"` read the words again and halve the run, so there the space
+# does not split, and a value rule reading one word masks the value either
+# way. The CLI flag rules also read a flag right after the mark as a new
+# word, in a second pass after every other supplement rule (the
+# `*_AT_FOLD_RE` rules), which covers the plain reading. A last pass, not a
+# wider first one: a match that started at the mark could take the text a
+# real flag's match needs (`my\ -prod.cnf -p S`), or a command word a later
+# rule reads. Masking a value too many is harmless, and
+# missing one is not.
 SHELL_ESCAPED_SPACE = "\\ "
 SHELL_ESCAPED_SPACE_FOLD = "\ue000"
 # A line that opens a JSON document; the manifest marker that licenses the
@@ -115,11 +127,11 @@ BASE64_QUANTUM_CHARS = 4
 BASE64_PADDING_CHAR = "="
 BASE64_DECODED_TEXT_WHITESPACE = "\n\r\t"
 BASE64_DECODED_TEXT_ENCODING = "utf-8"
-# The separator a `NAME=value` token is rescanned on, the character the
-# shell continuation folds to, and the whitespace an indent or a line's tail
-# is made of.
+# The separator a `NAME=value` token is rescanned on, the blank the masking
+# fold joins an even backslash run's lines with, and the whitespace an indent
+# or a line's tail is made of.
 EQUALS_SEPARATOR = "="
-SHELL_CONTINUATION_FOLD = " "
+SHELL_MASK_JOIN = " "
 INDENT_CHAR = " "
 INLINE_WHITESPACE = " \t"
 LINE_BREAK = "\n"
@@ -200,6 +212,23 @@ CLI_USERPASS_ARG_RE = re.compile(
 CLI_SHORT_P_RE = re.compile(
     r"(?P<prefix>\b(?:mysql|mysqldump|mariadb|mysqladmin|sshpass|mongosh|mongo|redis-cli|az\s+login|(?:docker|helm(?:\s+registry)?)\s+login)\b"
     r"[^\r\n;|&]{0,512}?\s-(?:p|a)[ \t=]*)"
+    r"(?P<val>\"(?:[^\"\\\r\n]|\\.)*\"|'[^'\r\n]*'|[^\s\"']+)"
+)
+# The three rules above, for a flag that starts right after the escaped-space
+# mark, run as a second pass (see `SHELL_ESCAPED_SPACE`). The user part of
+# `user:pass` stops at the mark, so a run of `\ -u` costs linear time.
+CLI_LONG_FLAG_AT_FOLD_RE = re.compile(
+    r"(?P<prefix>" + SHELL_ESCAPED_SPACE_FOLD + r"--)(?P<flag>[A-Za-z0-9][A-Za-z0-9_-]*)(?P<sep>[ \t=]+)"
+    r"(?P<val>\"(?:[^\"\\\r\n]|\\.)*\"|'[^'\r\n]*'|\S+)"
+)
+CLI_USERPASS_ARG_AT_FOLD_RE = re.compile(
+    r"(?P<prefix>" + SHELL_ESCAPED_SPACE_FOLD + r"(?:-u|--user)[ \t=]*)"
+    r"(?:(?P<quote>[\"'])(?P<quser>[^:\s\"'" + SHELL_ESCAPED_SPACE_FOLD + r"]+:)(?P<qval>(?:(?!(?P=quote))[^\r\n])+)(?P=quote)"
+    r"|(?P<user>[^:\s\"'" + SHELL_ESCAPED_SPACE_FOLD + r"]+:)(?P<val>\"(?:[^\"\\\r\n]|\\.)*\"|'[^'\r\n]*'|[^\s\"']+))"
+)
+CLI_SHORT_P_AT_FOLD_RE = re.compile(
+    r"(?P<prefix>\b(?:mysql|mysqldump|mariadb|mysqladmin|sshpass|mongosh|mongo|redis-cli|az\s+login|(?:docker|helm(?:\s+registry)?)\s+login)\b"
+    r"[^\r\n;|&]{0,512}?" + SHELL_ESCAPED_SPACE_FOLD + r"-(?:p|a)[ \t=]*)"
     r"(?P<val>\"(?:[^\"\\\r\n]|\\.)*\"|'[^'\r\n]*'|[^\s\"']+)"
 )
 # The two rules above end a command's segment at `;`, `|` or `&`, but a
@@ -287,10 +316,21 @@ SENSITIVE_KEY_SUFFIXES = (
 )
 BASE64_SECRET_VALUE_RE = re.compile(r"^[A-Za-z0-9+/]{4,}={0,2}$")
 INLINE_JSON_OBJECT_RE = re.compile(r"\{[^{}]+\}")
-# A shell joins a backslash-newline before it parses, so the detector folds
-# the continuation (and the indentation after it) to one space first; every
-# rule below is segment-bounded and would otherwise see two commands.
-SHELL_CONTINUATION_RE = re.compile(r"\\\r?\n[ \t]*")
+# A shell removes a backslash-newline before it parses, joining the two lines
+# with nothing between them, so the detector removes it first; every rule below
+# is segment-bounded and would otherwise see two commands. Only an odd run of
+# backslashes ends in a continuation: in an even run each pair is one literal
+# backslash, and the newline still ends the command. A backslash before a CR
+# escapes the CR, and the LF after it still ends the command, so CRLF is no
+# continuation either. The masking path (`fold_shell_command`) also joins an
+# even run, or a run before CRLF, as this file did before it counted
+# backslashes: the last backslash, the break and the indentation become a
+# space. Bash ends the command there, but a nested `bash -c "…"` halves the
+# run inside double quotes and continues the line, so the credential rules
+# read it joined: masking a value too many is harmless, and missing one is not.
+# Both folds are one pass over the command (`_fold_line_breaks`).
+SHELL_CRLF = "\r\n"
+SHELL_INDENT_CHARS = " \t"
 # The tool-call argument keys that carry a shell command, in the order
 # `is_secret_read_tool_call` and `scrub_step_text` read them.
 COMMAND_ARG_KEYS = ("command", "cmd")
@@ -808,6 +848,9 @@ def blank_named_values(redactor: Any, text: str, value_span: str = VALUE_SPAN_TO
     def _mask_userpass_segment(match: "re.Match[str]", source: str) -> str:
         return CLI_USERPASS_ARG_RE.sub(_mask_userpass, source[match.start() : match.end()])
 
+    def _mask_userpass_segment_at_fold(match: "re.Match[str]", source: str) -> str:
+        return CLI_USERPASS_ARG_AT_FOLD_RE.sub(_mask_userpass, source[match.start() : match.end()])
+
     def _mask_userpass(match: "re.Match[str]") -> str:
         quote = match.group("quote") or ""
         user = match.group("quser") if quote else match.group("user")
@@ -839,6 +882,11 @@ def blank_named_values(redactor: Any, text: str, value_span: str = VALUE_SPAN_TO
     text = sub_named_pairs(TEXT_COLON_KV_RE, text, _mask_colon_kv, extend)
     text = QUOTED_COLON_KV_RE.sub(_mask_quoted_colon_kv, text)
     text = sub_named_pairs(TEXT_EQUALS_KV_RE, text, _mask_equals_kv, extend)
+    # The second pass, last: every rule above has read the text as before, so
+    # these only add masks (`SHELL_ESCAPED_SPACE`).
+    text = CLI_LONG_FLAG_AT_FOLD_RE.sub(_mask_long_flag, text)
+    text = sub_shell_segments(CLI_USERPASS_FLAG_RE, text, _mask_userpass_segment_at_fold)
+    text = sub_shell_segments(CLI_SHORT_P_AT_FOLD_RE, text, _mask_short_p)
     return text.replace(SHELL_ESCAPED_SPACE_FOLD, SHELL_ESCAPED_SPACE)
 
 
@@ -997,13 +1045,53 @@ def supplement_redact(
     return value
 
 
+def _fold_line_breaks(command: str, masking: bool) -> str:
+    """``command`` with each backslash run before a line break folded, in one pass: an odd run
+    before an LF loses its last backslash and the LF, and the indentation after it stays as the
+    blank between words; with ``masking``, an even run or a run before CRLF also loses its last
+    backslash, the break and the indentation, which become ``SHELL_MASK_JOIN``."""
+    out: list[str] = []
+    i, n = 0, len(command)
+    while i < n:
+        if command[i] != SHELL_ESCAPE:
+            out.append(command[i])
+            i += 1
+            continue
+        j = i
+        while j < n and command[j] == SHELL_ESCAPE:
+            j += 1
+        run = j - i
+        if command.startswith(LINE_BREAK, j) and run % 2:
+            out.append(SHELL_ESCAPE * (run - 1))
+            i = j + len(LINE_BREAK)
+        elif masking and (command.startswith(LINE_BREAK, j) or command.startswith(SHELL_CRLF, j)):
+            k = j + (len(LINE_BREAK) if command.startswith(LINE_BREAK, j) else len(SHELL_CRLF))
+            while k < n and command[k] in SHELL_INDENT_CHARS:
+                k += 1
+            out.append(SHELL_ESCAPE * (run - 1) + SHELL_MASK_JOIN)
+            i = k
+        else:
+            out.append(SHELL_ESCAPE * run)
+            i = j
+    return "".join(out)
+
+
+def fold_shell_continuations(command: str) -> str:
+    """``command`` with each backslash-newline continuation removed, as the shell
+    removes it: ``kube\\<newline>ctl`` is one word, and the indentation after a
+    continuation stays as the blank between words. An escaped backslash before
+    a newline is not a continuation."""
+    return _fold_line_breaks(command, masking=False)
+
+
 def fold_shell_command(command: str) -> str:
-    """A command as the shell would read it: a backslash-newline continuation
-    joined to its line, and an escaped space folded to one token character
-    (`SHELL_ESCAPED_SPACE_FOLD`, unfolded by `blank_named_values`)."""
-    return SHELL_CONTINUATION_RE.sub(SHELL_CONTINUATION_FOLD, command).replace(
-        SHELL_ESCAPED_SPACE, SHELL_ESCAPED_SPACE_FOLD
-    )
+    """A command as the credential rules read it: a backslash-newline
+    continuation joined to its line (an even run or a CRLF joined with a space,
+    see `_fold_line_breaks`), and every escaped space folded to one token
+    character (`SHELL_ESCAPED_SPACE_FOLD`, unfolded by `blank_named_values`),
+    also after an even backslash run; the CLI flag rules read a flag after
+    the mark as a new word in a second pass (`SHELL_ESCAPED_SPACE`)."""
+    return _fold_line_breaks(command, masking=True).replace(SHELL_ESCAPED_SPACE, SHELL_ESCAPED_SPACE_FOLD)
 
 
 def scrub_step_text(redactor: Any, kind: str, text: str, withheld: str) -> str:
@@ -1319,7 +1407,7 @@ def _simple_command_reads_a_secret(command: str, depth: int) -> bool:
 
 
 def _command_reads_a_secret(command: str, depth: int) -> bool:
-    folded = SHELL_CONTINUATION_RE.sub(SHELL_CONTINUATION_FOLD, command)
+    folded = fold_shell_continuations(command)
     if SECRET_READ_COMMAND_RE.search(folded):
         return True
     return any(_simple_command_reads_a_secret(simple, depth) for simple in split_shell_commands(folded))

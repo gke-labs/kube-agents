@@ -222,11 +222,13 @@ infrastructure paragraph below says what the harness does with it.
 
 **The door is not a backend in the one-backend guard's sense (decided 2026-09-17).** The guard in
 `a2a/gateway/config.go` exists so a two-backend misconfiguration cannot silently stop consuming
-Chat; a localhost door has no silent-stop failure mode, so it is a side door that may sit beside
-exactly one real backend, and the guard keeps refusing two real ones. The door beside a real
+Chat; a localhost door has no silent-stop failure mode, so it was a side door that could sit beside
+exactly one real backend then, and the guard refused two real ones at the time. The door beside a real
 backend is therefore not a refusal, which is what lets stage 2 run the inject and Chat transports
 against one install and compare them, and meets the A2A owner's condition that the guard change
-be coordinated with the Slack adapter in flight.
+be coordinated with the Slack adapter in flight. The guard was narrowed on 2026-11-12, so the
+gateway now runs every armed backend (the gateway spec's "Every armed backend in one gateway
+process").
 The door alone is also enough for the gateway to start (decided 2026-09-17 by the A2A owner,
 whose reason is that this is what makes the adapter the answer for an eval install with no real
 backend), and the eval install has none until stage 2 gives it one; the adapter's change makes
@@ -234,7 +236,7 @@ the guard say so in code and in the gateway spec's test-backend section. What th
 the guard's no-backend refusal, which on a gateway with the door rendered can no longer tell an
 install that wants no real backend from one whose relay URL failed to render. The adapter's
 guard change drops only that refusal, only when a door is rendered (the inject door, or the A2A
-door beside it, which shares the exemption), and keeps the two-backend refusal. And the door-alone start is not silent: the gateway logs it and the read route reports
+door beside it, which shares the exemption), and kept the two-backend refusal then. And the door-alone start is not silent: the gateway logs it and the read route reports
 the armed backend as inject-only, so stage 2's preflight reads the armed backend and fails the
 run as infrastructure when Chat is not the one, before any case grades. The stage-2 change that
 renders the gateway's relay URL adds it to the operator's golden set, which is where a failed
@@ -441,7 +443,7 @@ before the bus exists crash-loops the agent's pod). The worker count is sized ag
 bridge's fixed queue as well: the queue behind the workers holds 1024 accepted tasks before the bridge finalizes one
 as `bridge-queue-overflow`, over a hundred times any fan-out the job runs. The operator
 sizes the `TASKS` consumer reserve from that `A2A_BRIDGE_CONCURRENCY` too, from the first `next`
-render, and provisioning never edits a stream that exists, so the first provision has to fit
+render, and provisioning never changes an existing stream's max_consumers, so the first provision has to fit
 the bridge's workers. The deploy therefore sizes the first provision for the bridge (decided
 2026-09-30 on gke-labs/kube-agents#2077): its mode change also sets `spec.harness.tuning.maxSessions` to the
 largest value whose budget at the lane's worker count fits the 64-consumer floor the first
@@ -574,9 +576,10 @@ allowed-users gate are exactly as "The Google Chat adapter" section has them, th
 as `A2A_GCHAT_ALLOWED_USERS` and `A2A_GCHAT_ALLOW_ALL_USERS` from the CR's list; Google Chat enabled on the CR is a backend the operator's own check (`a2aGatewayBackend`; removed 2026-10-22, when every next install began running a console-only gateway) recognises, so a Chat install's
 gateway renders and starts without a Discord Secret; and the one-backend guard is settled by
 precedence rather than by a guard change: the render omits the Discord reference when Chat is
-armed, the relay URL beside a Slack credential stays the gateway's refusal, and the inject door
+armed, the relay URL beside a Slack credential was the gateway's refusal at the time, and the inject door
 beside the relay URL is not one (stage 1), so the install this stage wires runs both
-transports. A render that drops the relay URL still leaves a gateway on the door alone, which
+transports. The gateway's guard was narrowed on 2026-11-12 to run every armed backend (the
+gateway spec's "Every armed backend in one gateway process"). A render that drops the relay URL still leaves a gateway on the door alone, which
 the read route reports as inject-only and the stage's preflight fails as infrastructure before
 any case runs.
 
@@ -677,9 +680,11 @@ the TASKS budget counts its workers from the first `next` render, so the mode ch
 change and the one provisioning Job is already sized for the bridge. The bridge enters the agent
 pod only once the bus is provisioned (the CR's `BusProvisioned` condition), so the agent
 Deployment rolls twice, once for the mode change and once after the Job for the bridge, and the
-step gates both rolls. The step ends on the
+step gates both rolls. The step waits for the
 bridge's own log line that it is consuming `platform` tasks, because a flip without a consuming
-bridge leaves a bus on which nobody answers. It reports the A2A gateway's state and last log
+bridge leaves a bus on which nobody answers, then gates the verifier's rollout and the web
+console under `next` (the same read routes and chat turn the deploy gated under `today`, through
+the console's port-forward). It reports the A2A gateway's state and last log
 lines and does not gate on it: the door gives the gateway the backend it lacked, so it now
 starts, but a gateway that is down is what the harness classifies as infrastructure on every
 case, and gating it is the change that follows the first measured run through the door. The
@@ -699,7 +704,10 @@ lane's exclusion list (`hack/eval/inject-lane-exclusions.txt`, keyed on `AGENT_T
 than on this flag) leaves out the cases whose premise needs the chat front door, and its mirror
 (`hack/eval/api-lane-exclusions.txt`) keeps the cases only the door can carry off every other
 lane; the deploy also arms the card stop (`A2A_CARD_STOP`) on the install, which those cases
-grade. The lane safeguards (`hack/eval/inject-lane-safeguards.yaml`) hang off neither the flag
+grade, and turns on the gateway's A2A door (`A2A_AGENT_DOOR`) for the card-wait stopped ask, which
+cancels a door task while its turn holds for its cards. The script exports that door's own token
+(`AGENT_A2A_DOOR_TOKEN`) beside the inject one. An eval install therefore runs with a door a
+default install doesn't have. The lane safeguards (`hack/eval/inject-lane-safeguards.yaml`) hang off neither the flag
 nor the transport: on both lanes they are appended to a scratch copy of every remaining task
 file, which the unit hands devops-bench, over the leased project's GitOps repository exported as
 `BENCH_GITOPS_REPO` (the run refuses to start without one), with the cases that request a pull
@@ -717,8 +725,10 @@ since nobody reads the report there and the today lane below proves the same pat
 and back to `next`, with any CR-declared `spec.deployment.sidecars` unset before the first flip
 and declared again after the second (the lane declares none: the bridge the operator renders
 leaves and returns with the mode), and asserts that the JetStream PVC and the bus creds Secret keep their
-UIDs, that the agent answers a turn under `today`, and that a task completes over the bus
-afterwards. It is reported, not gated: its own section of the log and two artifacts
+UIDs, that the agent answers a turn under `today`, that a task completes over the bus
+afterwards, and, before the first flip and after each leg, that the web console's read routes
+answer and a chat turn through it gets a reply (a `SKIP` on an install with no console, which the
+lane always has). It is reported, not gated: its own section of the log and two artifacts
 (`rollback-roundtrip.log`, `rollback-roundtrip.txt`), no case in the matrix, and no effect
 on the job's exit status. It is skipped when the job is too old for its one-hour bound to end
 inside the job's deadline, counted from its Prow `BUILD_ID` or, when that gives no start, from

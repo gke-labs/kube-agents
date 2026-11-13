@@ -258,7 +258,7 @@ func TestProbeRBACNamesEachDeniedPermission(t *testing.T) {
 	if err != nil {
 		t.Fatalf("probe failed: %v", err)
 	}
-	want := []string{"get pods/log", "patch poddisruptionbudgets.policy"}
+	want := []string{"get pods/log", "patch poddisruptionbudgets.policy" + rbacNamespacedLabelSuffix}
 	got := append([]string(nil), denied...)
 	sort.Strings(got)
 	if strings.Join(got, ",") != strings.Join(want, ",") {
@@ -309,24 +309,32 @@ func TestTheScopedBindProbeCarriesItsResourceName(t *testing.T) {
 	}
 }
 
-// isSecretWrite reports whether attrs is one of the Secret write verbs, the
-// half of the Secret grant that is a Role in the install namespace.
-func isSecretWrite(attrs *authorizationv1.ResourceAttributes) bool {
-	return attrs.Resource == "secrets" && slices.Contains(rbacSecretWriteVerbs, attrs.Verb)
+// isNamespacedWrite reports whether attrs is one of the tuples the markers
+// declare with `namespace=`: the write verbs of every rendered kind, the half
+// of the grant that is a Role in the install namespace. Read off the probe
+// list itself, so the fakes follow the markers.
+func isNamespacedWrite(attrs *authorizationv1.ResourceAttributes) bool {
+	for _, tuple := range flattenRequiredPermissions() {
+		if tuple.namespaced && tuple.group == attrs.Group && tuple.resource == attrs.Resource &&
+			tuple.subresource == attrs.Subresource && tuple.verb == attrs.Verb {
+			return true
+		}
+	}
+	return false
 }
 
-// The Secret write verbs are a Role in the install namespace, so the probe
-// has to ask about that namespace: an authorizer that grants them there and
-// nowhere else -- which is what a RoleBinding is -- must satisfy the check,
-// and the cluster-scoped tuples, the Secret reads among them, must still be
-// reviewed cluster-wide, or a ClusterRole shortfall would hide behind a
-// namespaced yes.
+// The write verbs are a Role in the install namespace, so the probe has to
+// ask about that namespace: an authorizer that grants them there and nowhere
+// else -- which is what a RoleBinding is -- must satisfy the check, and the
+// cluster-scoped tuples, the reads among them, must still be reviewed
+// cluster-wide, or a ClusterRole shortfall would hide behind a namespaced
+// yes.
 func TestTheNamespacedProbeCarriesTheOperatorsNamespace(t *testing.T) {
 	const operatorNamespace = "kubeagents-system"
 	// Counted atomically: the probe reviews rbacProbeConcurrency tuples at once.
 	var namespacedReviews, clusterReviews atomic.Int64
 	authorizer := &fakeAuthorizer{deny: func(attrs *authorizationv1.ResourceAttributes) bool {
-		if isSecretWrite(attrs) {
+		if isNamespacedWrite(attrs) {
 			namespacedReviews.Add(1)
 			return attrs.Namespace != operatorNamespace
 		}
@@ -338,7 +346,7 @@ func TestTheNamespacedProbeCarriesTheOperatorsNamespace(t *testing.T) {
 		t.Fatalf("probe failed: %v", err)
 	}
 	if len(denied) != 0 {
-		t.Fatalf("Secret verbs granted in the operator's namespace, probed there, must report nothing denied; got %v", denied)
+		t.Fatalf("write verbs granted in the operator's namespace, probed there, must report nothing denied; got %v", denied)
 	}
 	if namespacedReviews.Load() == 0 || clusterReviews.Load() == 0 {
 		t.Fatalf("the probe sent %d namespaced and %d cluster-wide reviews; both halves of the role must be asked about", namespacedReviews.Load(), clusterReviews.Load())
@@ -354,9 +362,12 @@ func TestTheNamespacedProbeCarriesTheOperatorsNamespace(t *testing.T) {
 		t.Fatal("a namespaced grant probed cluster-wide must be denied; the fake is not testing the namespace")
 	}
 	for _, label := range denied {
-		if !strings.Contains(label, "secrets") || !strings.HasSuffix(label, rbacNamespacedLabelSuffix) {
-			t.Errorf("denied %q; only the Secret write verbs were withheld and each should be labelled namespaced", label)
+		if !strings.HasSuffix(label, rbacNamespacedLabelSuffix) {
+			t.Errorf("denied %q; only the namespaced write verbs were withheld and each should be labelled namespaced", label)
 		}
+	}
+	if !slices.ContainsFunc(denied, func(label string) bool { return strings.HasPrefix(label, "create secrets ") }) {
+		t.Errorf("the Secret writes must be among the namespaced denials; got %v", denied)
 	}
 }
 
@@ -700,9 +711,9 @@ func TestTheRBACSkewYieldsToAnotherDegradedReason(t *testing.T) {
 }
 
 // TestTheEventWriteIsProbed: the Recorder's create on events is a permission
-// an older ClusterRole does not hold (it granted events read-only), and the
+// an older install's RBAC does not hold (it granted events read-only), and the
 // self-check has to name it rather than let the recorder fail quietly in the
-// background.
+// background. The write is namespaced, so the label says so.
 func TestTheEventWriteIsProbed(t *testing.T) {
 	authorizer := &fakeAuthorizer{deny: func(attrs *authorizationv1.ResourceAttributes) bool {
 		return attrs.Group == "" && attrs.Resource == "events" && (attrs.Verb == "create" || attrs.Verb == "patch")
@@ -713,7 +724,7 @@ func TestTheEventWriteIsProbed(t *testing.T) {
 	}
 	got := append([]string(nil), denied...)
 	sort.Strings(got)
-	if want := []string{"create events", "patch events"}; strings.Join(got, ",") != strings.Join(want, ",") {
+	if want := []string{"create events" + rbacNamespacedLabelSuffix, "patch events" + rbacNamespacedLabelSuffix}; strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("denied = %v, want %v", denied, want)
 	}
 }

@@ -977,7 +977,7 @@ type TuningSpec struct {
 	// cannot hold the configured concurrency refuses a legitimate session's
 	// consumer create at load. That one is capacity, not a control - it is
 	// sized to fit this cap rather than to enforce it - and because
-	// provisioning never edits an existing stream, an install whose TASKS
+	// provisioning never changes an existing stream's max_consumers, an install whose TASKS
 	// stream is too small for the configured cap makes the provision Job
 	// fail rather than letting the shortfall surface later as a legitimate
 	// session's consumer create being refused and reported as a task
@@ -2792,9 +2792,12 @@ type AgentStatus struct {
 
 	// BusReplicas is the A2A bus's NATS server count under spec.mode: next:
 	// the count the bus already runs, which spec.harness.tuning.busReplicas
-	// does not change; for a new bus, that field, or 3. Re-derived from the
-	// cluster on every reconcile, so it is a reading of the bus rather than a
-	// setting.
+	// does not change; for a new bus, that field, or 3. Re-derived on every
+	// reconcile under next, so it is a reading of the bus rather than a
+	// setting. Under spec.mode: today it is left at the count the bus last
+	// ran, so that a flip back returns the bus at that count rather than the
+	// count its kept data claims imply; it is not a claim that a bus is
+	// running, and with the claims deleted it no longer decides anything.
 	// +optional
 	BusReplicas int32 `json:"busReplicas,omitempty"`
 
@@ -2842,7 +2845,7 @@ type AgentStatus struct {
 	// in seconds, when the A2A provision Job last found it longer than this
 	// operator creates the stream with (0 when the stream has no age limit).
 	// It is absent when the stream is no longer than that, or before a report.
-	// Provisioning never edits an existing stream, so one an older operator
+	// Provisioning never changes an existing stream's max age, so one an older operator
 	// created longer, or one edited by hand, can keep submissions longer than
 	// this operator would, and the dispatcher is told the longer of the two
 	// (up to a year): a finished task's tombstone has to outlive its

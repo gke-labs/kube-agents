@@ -96,6 +96,7 @@ func TestSlackSessionTitleRefusedAndAccepted(t *testing.T) {
 // checks the output against that pattern, not against the rule that built it,
 // over the BMP and the two supplementary planes that hold letters and emoji.
 func TestSlackSessionTitleNoCompatibilityForm(t *testing.T) {
+	t.Parallel()
 	const checkedEnd = 0x2FFFF
 	seen := map[rune]bool{}
 	for code := rune(0); code <= checkedEnd; code++ {
