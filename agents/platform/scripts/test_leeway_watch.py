@@ -1766,6 +1766,34 @@ class ResolvedScopeTests(unittest.TestCase):
         self.assertIn("denied", scan_errors["member-b"])
         self.assertEqual(error_kinds["member-b"], watch.ERROR_KIND_SCAN_FAILED)
 
+    def test_an_explicit_roster_with_an_unusable_resolved_scope_retires_nothing_on_its_members(self) -> None:
+        """LEEWAY_WATCH_PROJECTS names a member, the resolved scope is missing:
+        the member is never scanned, so a finding it holds is not retired."""
+
+        def sandbox(argv, **kw):
+            if argv[0] == "gcloud":
+                return subprocess.CompletedProcess(args=argv, returncode=0, stdout="m1\tus-central1\n", stderr="")
+            target = argv[argv.index(watch.CLUSTERS_FLAG) + 1]
+            return completed_json(make_report([{"cluster": c, "status": "ok"} for c in target.split(",")]))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "scope.json").write_text(json.dumps({"present": True, "projects": [], "folders": ["1"]}), encoding="utf-8")
+            env = {
+                watch.WATCH_HOME_ENV: str(root / "leeway"), watch.CLUSTERS_ENV: "", watch.PROJECTS_ENV: "mgmt,member-a",
+                watch.MANAGEMENT_PROJECT_ENV: "mgmt", "PLATFORM_AGENT_HOME": tmp,
+                watch.fleet_scope_targets.SCOPE_FILE_ENV: str(root / "scope.json"),
+                watch.fleet_scope_targets.RESOLVED_SCOPE_FILE_ENV: str(root / "resolved-scope.json"),
+            }
+            with mock.patch.dict(os.environ, env), mock.patch.object(watch.sandbox_exec, "run", side_effect=sandbox):
+                _, _, scan_errors, _, scanned, _ = watch.sweep_fleet({}, T0, time.monotonic() + 3600)
+        self.assertNotIn("member-a", scanned)
+        self.assertTrue(scan_errors, "the members the unusable scope could not name are a scan error")
+        self.assertFalse(watch.can_retire_finding(
+            "member-a/us-central1/a1", {"cluster": "member-a/us-central1/a1"},
+            {"mgmt/us-central1/m1"}, {}, scanned, scan_errors,
+        ))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1333,7 +1333,13 @@ def sweep_fleet(
             proj: [CLUSTER_KEY_SEPARATOR.join(t) for t in entry.clusters or ()] for proj, entry in entries.items()
         }
         explicit = {p.strip() for p in os.environ.get(PROJECTS_ENV, "").split(CSV_SEPARATOR) if p.strip()}
-        names = [proj for proj in entries if not explicit or proj in explicit]
+        # LEEWAY_WATCH_PROJECTS narrows the sweep, but never past the row an
+        # unusable resolved scope leaves for the members it could not name:
+        # that row is a scan error, so nothing a member holds is retired.
+        names = [
+            proj for proj in entries
+            if not explicit or proj in explicit or proj == fleet_scope_targets.UNRESOLVED_SCOPE_ROW
+        ]
         target_projects = order_by_least_recent(names, project_runs)
     else:
         known_triples_by_proj = roster_clusters_by_project()
