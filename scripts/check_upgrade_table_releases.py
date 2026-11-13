@@ -267,18 +267,31 @@ def removed_pending_problems(base: str, tags: set[str], traced: dict[str, str],
     return found
 
 
-def pending_row_problem(row: Row, tags: set[str], traced: dict[str, str]) -> str | None:
-    """Why a `pending` row must be relabelled, or None while no release contains it.
+def pending_row_commit(row: Row, traced: dict[str, str]) -> str | None:
+    """The commit a `pending` row is traced to: the one TRACES_FILE names for it, or the one that added it."""
+    return traced.get(row.change) or row_commit(row.change)
+
+
+def pending_row_release(row: Row, tags: set[str], traced: dict[str, str]) -> tuple[str, bool] | None:
+    """The first release that contains a `pending` row, and whether it was by the row's commit; None while
+    no release does.
 
     A release contains the row when its tag contains the commit that added the row (or the commit
     TRACES_FILE names for it), or when its own copy of the table holds the row (a change and its row
     cherry-picked to the release branch). Every release tag is read, so a `pending` row never passes
-    once any release has shipped that commit.
+    once any release has shipped that commit. The release job's relabel
+    (relabel_upgrade_table_pending.py) calls this too, so the relabel and this check apply one rule.
     """
-    commit = traced.get(row.change) or row_commit(row.change)
+    return shipping_release(row.change, pending_row_commit(row, traced), tags)
+
+
+def pending_row_problem(row: Row, tags: set[str], traced: dict[str, str]) -> str | None:
+    """Why a `pending` row must be relabelled (pending_row_release names the release), or None while no
+    release contains it."""
+    commit = pending_row_commit(row, traced)
     named = f"the commit {TRACES_FILE} names for it" if row.change in traced else "the commit that added it"
     where = f"{UPGRADE_PAGE}:{row.line}"
-    shipping = shipping_release(row.change, commit, tags)
+    shipping = pending_row_release(row, tags, traced)
     if shipping is not None:
         tag, by_commit = shipping
         shipped = f"{commit[:12]}, {named}" if by_commit else "the row in its own copy of the table"
