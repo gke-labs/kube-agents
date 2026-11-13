@@ -1787,6 +1787,21 @@ class C1IsolationIsStructural(unittest.TestCase):
         adapter = _go_code(h.text("a2a_worker_adapter_delegate"), "validateDelegate")
         self.assertIn("lib.DelegateTextCap", adapter, "the worker-adapter's validateDelegate no longer references the shared cap")
         self.assertNotRegex(adapter, magic_number, "the worker-adapter's validateDelegate hand-spells the delegate text cap")
+        # The adapter's entry point takes one task or a batch: a single task
+        # goes to validateDelegate, and so does every batch entry, with that
+        # entry's own text. A batch past this loop is published unchecked.
+        entry = _go_code(h.text("a2a_worker_adapter_delegate"), "validateDelegateFor")
+        self.assertIn("return validateDelegate(req)", entry, "the worker-adapter no longer caps a single delegate request")
+        self.assertRegex(
+            entry,
+            r"for\s+\w+,\s*(\w+)\s*:=\s*range\s+req\.Tasks\s*\{\s*if\s+why\s*:=\s*validateDelegate\(lib\.DelegateRequest\{[^}]*\bText:\s*\1\.Text\b",
+            "the worker-adapter no longer caps each batch entry's own text",
+        )
+        self.assertRegex(
+            h.text("a2a_worker_adapter"),
+            r"validateDelegateFor\(ask\.req,",
+            "the worker-adapter no longer validates a delegate request before publishing it",
+        )
 
         # The gateway's half is lib's shared validator, since a request may be
         # one task or a batch (#5682): handleDelegateRequest ignores any
