@@ -24,7 +24,8 @@ import (
 // original's answers):
 //
 //   - the answer on the result: its first sentence as the headline, cut at
-//     a clause past the cap, and the rest as the detail, or under "why" when
+//     a clause past the cap, or at a word with an ellipsis when no clause
+//     fits, and the rest as the detail, or under "why" when
 //     the rest is longer than a detail holds (split_answer); an answer that
 //     ends by asking which of its options to take offers them as choices
 //     (answer_choices, chat_choices.go), and one that declares its next step
@@ -603,7 +604,8 @@ func clipRunes(text string, limit int) string {
 
 // splitAnswer is the presenter's split_answer: the first sentence of the
 // first paragraph as a plain headline, cut at a clause when it runs past the
-// cap (clauseCut), and the rest as markdown sections.
+// cap (clauseCut), or at a word with an ellipsis when no clause fits
+// (wordCut), and the rest as markdown sections.
 func splitAnswer(md string) (string, []string) {
 	paras := paragraphs(strings.ReplaceAll(md, "\x00", ""))
 	if len(paras) == 0 {
@@ -632,7 +634,13 @@ func splitAnswer(md string) (string, []string) {
 	sentence, remainder := firstSentence(held)
 	sentence, remainder = restoreCode(sentence, spans, false), restoreCode(remainder, spans, false)
 	if runeLen(plainLine(sentence)) > chatHeadlineMax {
-		if head, overflow, ok := clauseCut(sentence); ok {
+		head, overflow, ok := clauseCut(sentence)
+		if !ok {
+			// No clause fits: a word cut with an ellipsis, so the clipped
+			// words read on in the detail rather than being dropped.
+			head, overflow, ok = wordCut(sentence)
+		}
+		if ok {
 			sentence = head
 			if remainder != "" {
 				overflow += " " + remainder
