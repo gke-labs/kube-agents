@@ -288,9 +288,14 @@ class KubectlContextRegisteredTest(unittest.TestCase):
         path = path or self.kubeconfig
         return path.with_name(f".{path.name}.contexts-registered")
 
+    @staticmethod
+    def env_digest(*version):
+        """The record's environment digest; with no version, as a client from before the version made it."""
+        return hashlib.sha256("\n".join((*version, PROXY, CA, TOKEN)).encode()).hexdigest()
+
     def test_python_records_the_bytes_it_checked_or_wrote(self):
         self.register()  # writes the context
-        env = hashlib.sha256(f"{PROXY}\n{CA}\n{TOKEN}".encode()).hexdigest()
+        env = self.env_digest(self.client.REGISTERED_MARKER_VERSION)
         line = f"{CTX} {hashlib.sha256(self.kubeconfig.read_bytes()).hexdigest()} {env}"
         self.assertEqual(self.marker().read_text(encoding="utf-8").splitlines(), [line])
         self.register(context=HOST_CTX)  # already current: recorded without a rewrite, the other line kept
@@ -373,6 +378,33 @@ class KubectlContextRegisteredTest(unittest.TestCase):
         self.assert_not_registered("--context", CTX, "get", "ns")
         self.marker().write_text(f"{context} {file_digest} {env_digest} extra\n", encoding="utf-8")
         self.assert_not_registered("--context", CTX, "get", "ns")
+
+    def test_the_record_version_is_the_clients(self):
+        version = re.search(r'readonly RECORD_VERSION="([^"]*)"', HELPER.read_text(encoding="utf-8")).group(1)
+        self.assertEqual(version, self.client.REGISTERED_MARKER_VERSION)
+
+    def test_a_record_from_another_version_costs_one_python_pass(self):
+        # The record outlives the image. One an older client made must not vouch for this client's
+        # merge: the helper falls back, and one pass that rewrites nothing records the file again.
+        with mock.patch.object(self.client, "REGISTERED_MARKER_VERSION", "0"):
+            self.register()
+        self.check_an_old_record_costs_one_python_pass()
+
+    def test_a_record_without_a_version_costs_one_python_pass(self):
+        # The line as the client wrote it before the record had a version.
+        self.register()
+        file_digest = hashlib.sha256(self.kubeconfig.read_bytes()).hexdigest()
+        self.marker().write_text(f"{CTX} {file_digest} {self.env_digest()}\n", encoding="utf-8")
+        self.check_an_old_record_costs_one_python_pass()
+
+    def check_an_old_record_costs_one_python_pass(self):
+        registered = self.kubeconfig.read_text(encoding="utf-8")
+        self.assert_not_registered("--context", CTX, "get", "ns")
+        self.register()
+        self.assertEqual(self.kubeconfig.read_text(encoding="utf-8"), registered, "the pass rewrote nothing")
+        lines = self.marker().read_text(encoding="utf-8").splitlines()
+        self.assertEqual([line.split()[0] for line in lines], [CTX], "the old line is replaced, not kept")
+        self.assert_registered("--context", CTX, "get", "ns")
 
     def test_hand_edits_yaml_reads_differently_fall_back(self):
         # Edits that a YAML reader and a line reader take differently. Each changes the file's bytes, so
