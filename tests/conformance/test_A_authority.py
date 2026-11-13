@@ -14,6 +14,8 @@ mechanism is different, because these assertions run without a cluster.
 from __future__ import annotations
 
 import asyncio
+import email.message
+import json
 import re
 import textwrap
 import unittest
@@ -473,6 +475,68 @@ class A3AProfileWorkerReachesOnlyItsTasksTarget(unittest.TestCase):
         profile = h.credential_proxy.CALLER_ROLE_PROFILE
         reached = sorted(prefix for prefix, roles in h.credential_proxy.ROUTE_ROLES if profile in roles)
         self.assertEqual(sorted(["/v1/exec", h.mcp_policy.MCP_RELAY_PREFIX]), reached)
+
+    # A report credential (#5619): the one task credential with no target.
+    FIXTURES = h.REPO_ROOT / "a2a" / "taskcred" / "testdata" / "credential_proxy_fixtures.json"
+
+    def _fixtures(self) -> tuple[dict, dict]:
+        doc = json.loads(self.FIXTURES.read_text(encoding="utf-8"))
+        return doc, {case["name"]: case for case in doc["cases"]}
+
+    def test_A3_only_an_unattended_task_a_trigger_started_omits_the_target(self) -> None:
+        doc, cases = self._fixtures()
+        verify = h.task_credential.verify
+        for name in ("no target", "no target, a trigger, at the read tier", "no target, unattended, no trigger"):
+            with self.subTest(name=name):
+                case = cases[name]
+                with self.assertRaises(h.task_credential.TaskCredentialError):
+                    verify(case["token"], tuple(doc["trusted"]), case["now"], doc["max_lifetime_seconds"])
+        report = cases["a report credential: unattended, a builtin schedule trigger, no target"]
+        claims = verify(report["token"], tuple(doc["trusted"]), report["now"], doc["max_lifetime_seconds"])
+        self.assertTrue(claims.report_only)
+
+    def test_A3_a_report_credential_reaches_the_audit_report_routes_alone(self) -> None:
+        cp = h.credential_proxy
+        doc, cases = self._fixtures()
+        report = cases["a report credential: unattended, a builtin schedule trigger, no target"]
+        workload = "system:serviceaccount:kubeagents-profiles:agentprofile-auditor-unattended"
+        principal = cp.Principal(
+            workload=workload, uid="sa-uid", role=cp.CALLER_ROLE_PROFILE,
+            pod=report["claims"]["pod"], pod_uid=report["claims"]["pod_uid"],
+        )
+        gate = cp.ProfileTaskGate(
+            trusted=tuple(doc["trusted"]),
+            identities={workload: h.task_credential.ProfileIdentity("auditor", "unattended")},
+            max_lifetime_raw=f"{doc['max_lifetime_seconds']}s",
+            clock=lambda: report["now"],
+        )
+
+        def admit(method: str, path: str) -> tuple[bool, list]:
+            handler = cp.CredentialProxyHandler.__new__(cp.CredentialProxyHandler)
+            handler.headers = email.message.Message()
+            handler.headers[cp.TASK_CREDENTIAL_HEADER] = report["token"]
+            handler.command, handler.path, handler.profile_gate = method, path, gate
+            replies: list = []
+            handler._json = lambda status, body: replies.append((status, body))
+            return handler._admit_task(principal), replies
+
+        for method, path in (
+            ("POST", "/v1/exec"),
+            ("POST", h.mcp_policy.MCP_RELAY_PREFIX + "gke"),
+            ("GET", cp.API_RELAY_PREFIX + "projects/proj-a"),
+            ("POST", "/v1/vcs/issue-view"),
+            ("GET", "/v1/a-route-added-later"),
+        ):
+            with self.subTest(method=method, path=path):
+                admitted, replies = admit(method, path)
+                self.assertFalse(admitted)
+                self.assertEqual(cp.RULE_REPORT_CREDENTIAL_ROUTE, replies[0][1]["rule"])
+        admitted, replies = admit("GET", "/v1/audit-reports/compliance-audit/acme%2Fgitops/latest")
+        self.assertTrue(admitted, replies)
+        for method, pattern in cp.REPORT_CREDENTIAL_ROUTES:
+            with self.subTest(pattern=pattern.pattern):
+                self.assertIn(method, ("GET", "PUT", "DELETE"))
+                self.assertTrue(pattern.pattern.startswith(cp.AUDIT_REPORTS_PREFIX), pattern.pattern)
 
     def test_A3_a_profile_worker_reaches_no_cluster_through_mcp(self) -> None:
         # The relay has no per-task target check, so a profile worker reaches

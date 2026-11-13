@@ -2705,6 +2705,46 @@ def required_roles(path: str) -> tuple[str, ...]:
     return ()
 
 
+# The audit-report store (#5619, docs/designs/scheduling-on-profiles.md §1).
+AUDIT_REPORTS_PREFIX = "/v1/audit-reports"
+# One path segment each. An audit id is a DNS-1123 label. A store key is the
+# file store's repository directory as one URL segment (`owner%2Fname`, a
+# non-GitHub path escaped again), never `.` or `..`. A run is the ring's
+# `%Y%m%dT%H%M%S.%fZ` stamp (audit_report.REPORT_STAMP_FORMAT). The routes
+# validate each segment again; these are the allowlist's shapes, not the
+# store's checks.
+_REPORT_AUDIT_ID = r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
+_REPORT_STORE_KEY = r"(?!\.{1,2}/)[A-Za-z0-9._~%-]+"
+_REPORT_RUN_STAMP = r"[0-9]{8}T[0-9]{6}\.[0-9]{6}Z"
+_REPORT_STREAM = f"{AUDIT_REPORTS_PREFIX}/{_REPORT_AUDIT_ID}/{_REPORT_STORE_KEY}"
+
+# Every (method, path) a report credential reaches, and nothing else: a default-
+# deny allowlist. A report credential (task_credential.REPORT_TIER) names no
+# target, so it confines nothing, and on any route that confines by target
+# (/v1/exec, the relays) it would read as a task with no cluster. So it is
+# refused on every route not listed here, by ``report_credential_permits``,
+# before any route runs; a route added to the broker later is refused to it
+# until it is added here by name. Matched whole against the raw request path:
+# no query string, no trailing slash, no extra segment.
+REPORT_CREDENTIAL_ROUTES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    # The streams the store holds, for report_status and report_query.
+    ("GET", re.compile(AUDIT_REPORTS_PREFIX)),
+    ("GET", re.compile(f"{_REPORT_STREAM}/latest")),
+    ("GET", re.compile(f"{_REPORT_STREAM}/runs")),
+    ("GET", re.compile(f"{_REPORT_STREAM}/runs/{_REPORT_RUN_STAMP}")),
+    # finish's writes: the ring entry, then latest as its copy, and dropping a
+    # latest that no longer describes the ledger.
+    ("PUT", re.compile(f"{_REPORT_STREAM}/runs/{_REPORT_RUN_STAMP}")),
+    ("PUT", re.compile(f"{_REPORT_STREAM}/latest")),
+    ("DELETE", re.compile(f"{_REPORT_STREAM}/latest")),
+)
+
+
+def report_credential_permits(method: str, path: str) -> bool:
+    """Whether a report credential may make this request (REPORT_CREDENTIAL_ROUTES)."""
+    return any(method == allowed and pattern.fullmatch(path) for allowed, pattern in REPORT_CREDENTIAL_ROUTES)
+
+
 def exec_pod_serves(method: str, path: str) -> bool:
     """Whether an exec pod serves ``method`` on ``path``.
 
@@ -4689,6 +4729,8 @@ TASK_CREDENTIAL_MAX_LIFETIME_ENV = "A2A_TASK_CREDENTIAL_MAX_LIFETIME"
 # refusals are task_confinement.RULE_TASK_TARGET, except a local-only-shaped
 # command the read-only policy refuses, which carries a denylist or policy rule.
 RULE_TASK_CREDENTIAL = "caller.task-credential"
+# A report credential on a route outside REPORT_CREDENTIAL_ROUTES.
+RULE_REPORT_CREDENTIAL_ROUTE = "caller.report-credential-route"
 
 
 class TaskCredentialRefused(Exception):
@@ -4736,7 +4778,9 @@ class ProfileTaskGate:
 
         Raises TaskCredentialRefused for a credential that is present and
         fails: one that doesn't verify, is bound to another pod, UID, profile
-        or tier, or names a target that isn't a GKE cluster.
+        or tier, or names a target that isn't a GKE cluster. A report
+        credential (no target) is admitted with no ``task_target``; the
+        handler holds it to REPORT_CREDENTIAL_ROUTES.
         """
         if token is None or not token.strip():
             return principal
@@ -4757,6 +4801,8 @@ class ProfileTaskGate:
             )
         except verifier.TaskCredentialError as exc:
             raise TaskCredentialRefused(f"{exc} (jti {claims.jti})") from exc
+        if claims.report_only:
+            return replace(principal, caller=f"task {claims.task} jti {claims.jti}", task=claims, task_target=None)
         target = task_confinement.target_from_claims(
             claims.target.project, claims.target.location, claims.target.cluster
         )
@@ -13378,6 +13424,26 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
                     "code": "SECURITY_POLICY_BLOCKED",
                     "rule": RULE_TASK_CREDENTIAL,
                     "message": f"The task credential was refused: {exc}.",
+                },
+            )
+            return False
+        task = self.principal.task
+        if task is not None and task.report_only and not report_credential_permits(self.command, self.path):
+            # Default deny (REPORT_CREDENTIAL_ROUTES): a credential with no
+            # target never reaches a route that confines by one.
+            LOGGER.warning(
+                "refused a report credential outside the audit-report routes method=%s path=%s principal=%s",
+                _sanitize_for_logging(self.command),
+                _sanitize_for_logging(self.path),
+                _sanitize_for_logging(self.principal.describe(), max_length=PRINCIPAL_LOG_LENGTH),
+            )
+            self._json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "blocked",
+                    "code": "SECURITY_POLICY_BLOCKED",
+                    "rule": RULE_REPORT_CREDENTIAL_ROUTE,
+                    "message": "A report credential names no cluster and reaches only the audit-report routes.",
                 },
             )
             return False

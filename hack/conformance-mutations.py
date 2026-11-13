@@ -94,6 +94,25 @@ MUTATIONS: list[Mutation] = [
         "forge read no task target confines",
     ),
     Mutation(
+        "A3-report-credential-any-route",
+        "agents/platform/scripts/credential_proxy.py",
+        ("        if task is not None and task.report_only and not report_credential_permits(self.command, self.path):\n",
+         "        if False:\n"),
+        "test_A3_a_report_credential_reaches_the_audit_report_routes_alone",
+        "let a report credential reach every route, since a fleet audit only "
+        "ever calls the store -- until its model output calls /v1/exec with "
+        "no target to confine it",
+    ),
+    Mutation(
+        "A3-report-credential-any-tier",
+        "agents/platform/scripts/task_credential.py",
+        ('    if target_claim is None and (_string(nats, "tier", "nats") != REPORT_TIER or trigger is None):\n',
+         "    if False:\n"),
+        "test_A3_only_an_unattended_task_a_trigger_started_omits_the_target",
+        "accept any proxy credential with no target, as Go does, so a chat "
+        "task that names no cluster also reaches the store",
+    ),
+    Mutation(
         "A3-profile-reaches-gke-mcp",
         "agents/platform/scripts/mcp_policy.py",
         ('    "developer_knowledge": frozenset({"get_documents", "search_documents"}),\n}',

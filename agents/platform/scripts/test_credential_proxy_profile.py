@@ -1558,5 +1558,226 @@ class IsolatedExecutionTest(unittest.TestCase):
             executor.execute(confined.argv, confined=dataclasses.replace(confined, get_credentials=True))
 
 
+REPORT = CASES["a report credential: unattended, a builtin schedule trigger, no target"]
+REPORT_STREAM = "/v1/audit-reports/compliance-audit/acme%2Fgitops"
+RUN = "20261113T120000.123456Z"
+# Every route REPORT_CREDENTIAL_ROUTES admits, one request each.
+REPORT_ROUTES = (
+    ("GET", "/v1/audit-reports"),
+    ("GET", f"{REPORT_STREAM}/latest"),
+    ("GET", f"{REPORT_STREAM}/runs"),
+    ("GET", f"{REPORT_STREAM}/runs/{RUN}"),
+    ("PUT", f"{REPORT_STREAM}/runs/{RUN}"),
+    ("PUT", f"{REPORT_STREAM}/latest"),
+    ("DELETE", f"{REPORT_STREAM}/latest"),
+)
+
+
+def broker_route_paths() -> list[str]:
+    """Every path the broker routes, read from its source and its route tables.
+
+    The /v1/ string literals in credential_proxy.py, the prefixes the handler
+    dispatches on, and every ROUTE_ROLES prefix: so a route added to the broker
+    later is walked here without anyone listing it.
+    """
+    source = Path(credential_proxy.__file__).read_text(encoding="utf-8")
+    paths = set(re.findall(r'"(/v1/[A-Za-z0-9_./-]*)"', source))
+    paths |= {
+        credential_proxy.ADMISSION_PATH,
+        credential_proxy.API_RELAY_PREFIX,
+        credential_proxy.watcher_policy.WATCHER_GCP_PREFIX,
+        credential_proxy.watcher_policy.PLATFORM_PUBSUB_PREFIX,
+        credential_proxy.watcher_policy.WATCHER_K8S_PREFIX,
+        credential_proxy.mcp_policy.MCP_RELAY_PREFIX,
+        credential_proxy.feedback_broker.ROUTE,
+    }
+    paths |= {prefix for prefix, _ in credential_proxy.ROUTE_ROLES}
+    # A prefix is walked with something under it, as a caller would send.
+    return sorted(path + "x" if path.endswith("/") else path for path in paths)
+
+
+class ReportCredentialTest(unittest.TestCase):
+    """A report credential (#5619): no target, admitted to the audit-report routes alone."""
+
+    _restore = staticmethod(ProfileRouteTest._restore)
+    set_gate = ProfileRouteTest.set_gate
+
+    def setUp(self):
+        # The profile route server, with the identity at the unattended tier.
+        ProfileRouteTest.setUp(self)
+        self.identities = {PROFILE_SA: task_credential.ProfileIdentity("auditor", "unattended")}
+        self.set_gate()
+
+    def request(self, method, path, token=REPORT["token"]):
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=10)
+        self.addCleanup(connection.close)
+        headers = {"Content-Type": "application/json"}
+        if token is not None:
+            headers[credential_proxy.TASK_CREDENTIAL_HEADER] = token
+        body = b"{}" if method in ("POST", "PUT") else None
+        connection.request(method, path, body=body, headers=headers)
+        response = connection.getresponse()
+        raw = response.read()
+        try:
+            return response.status, json.loads(raw) if raw else {}
+        except ValueError:
+            return response.status, {"raw": raw.decode("utf-8", "replace")}
+
+    def assert_report_refused(self, status, body):
+        self.assertEqual(403, status, body)
+        self.assertEqual(credential_proxy.RULE_REPORT_CREDENTIAL_ROUTE, body.get("rule"), body)
+        self.assertEqual([], self.executor.calls, "a report credential reached the executor")
+
+    # -- the gate ------------------------------------------------------------
+
+    def test_the_gate_admits_a_report_credential_with_no_target(self):
+        principal = CredentialProxyHandler.profile_gate.admit(self.principal, REPORT["token"])
+        self.assertTrue(principal.task.report_only)
+        self.assertIsNone(principal.task.target)
+        self.assertIsNone(principal.task_target)
+        self.assertEqual("compliance-audit", principal.task.trigger.stream)
+
+    def test_the_gate_still_binds_a_report_credential_to_its_pod_and_tier(self):
+        for identities in (
+            {PROFILE_SA: task_credential.ProfileIdentity("auditor", "read")},
+            {PROFILE_SA: task_credential.ProfileIdentity("other", "unattended")},
+            {},
+        ):
+            with self.subTest(identities=identities):
+                self.set_gate(identities=identities)
+                with self.assertRaises(credential_proxy.TaskCredentialRefused):
+                    CredentialProxyHandler.profile_gate.admit(self.principal, REPORT["token"])
+        self.set_gate()
+        other_pod = dataclasses.replace(self.principal, pod="auditor-unattended-zzzzz")
+        with self.assertRaises(credential_proxy.TaskCredentialRefused):
+            CredentialProxyHandler.profile_gate.admit(other_pod, REPORT["token"])
+
+    # -- default deny ----------------------------------------------------------
+
+    def test_a_report_credential_runs_nothing_on_exec(self):
+        for argv in (["kubectl", "get", "pods"], ["gcloud", "config", "list"], ["kubectl", "version", "--client"]):
+            with self.subTest(argv=argv):
+                connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=10)
+                self.addCleanup(connection.close)
+                connection.request(
+                    "POST", "/v1/exec", body=json.dumps({"argv": argv}).encode("utf-8"),
+                    headers={"Content-Type": "application/json", credential_proxy.TASK_CREDENTIAL_HEADER: REPORT["token"]},
+                )
+                response = connection.getresponse()
+                self.assert_report_refused(response.status, json.loads(response.read()))
+
+    def test_every_broker_route_refuses_a_report_credential(self):
+        paths = broker_route_paths()
+        self.assertIn("/v1/exec", paths)
+        self.assertIn(credential_proxy.mcp_policy.MCP_RELAY_PREFIX + "x", paths)
+        for path in paths:
+            for method in ("GET", "POST"):
+                if credential_proxy.report_credential_permits(method, path):
+                    continue
+                with self.subTest(method=method, path=path):
+                    status, body = self.request(method, path)
+                    self.assertEqual(403, status, body)
+                    # A route the profile role doesn't reach is refused by the
+                    # role table first; every other one by the allowlist.
+                    if credential_proxy.required_roles(path) and credential_proxy.CALLER_ROLE_PROFILE not in (
+                        credential_proxy.required_roles(path)
+                    ):
+                        self.assertEqual("CALLER_ROLE_FORBIDDEN", body.get("code"), body)
+                    else:
+                        self.assertEqual(credential_proxy.RULE_REPORT_CREDENTIAL_ROUTE, body.get("rule"), body)
+        self.assertEqual([], self.executor.calls)
+
+    def test_a_route_nobody_listed_is_refused(self):
+        # The mutant: a route added to the broker later, with no allowlist
+        # entry, is refused to a report credential without any change here.
+        for method, path in (
+            ("GET", "/v1/findings"),
+            ("POST", "/v1/findings"),
+            ("GET", "/v1/a-route-added-later"),
+            ("POST", "/v1/audit-reports"),
+            ("POST", f"{REPORT_STREAM}/runs/{RUN}"),
+        ):
+            with self.subTest(method=method, path=path):
+                self.assert_report_refused(*self.request(method, path))
+
+    def test_a_listed_route_passes_the_gate(self):
+        # No handler serves these yet (#5619 PR 3): past the gate, GET is the
+        # broker's unknown-route answer, not the allowlist's refusal.
+        for method, path in REPORT_ROUTES:
+            if method != "GET":
+                continue
+            with self.subTest(path=path):
+                status, body = self.request(method, path)
+                self.assertNotEqual(credential_proxy.RULE_REPORT_CREDENTIAL_ROUTE, body.get("rule"), body)
+
+    def test_a_targeted_credential_is_not_held_to_the_report_routes(self):
+        self.identities = {PROFILE_SA: task_credential.ProfileIdentity("auditor", "read")}
+        self.set_gate()
+        status, body = self.request("GET", "/v1/a-route-added-later", token=VALID["token"])
+        self.assertNotEqual(credential_proxy.RULE_REPORT_CREDENTIAL_ROUTE, body.get("rule"), body)
+
+
+class ReportCredentialRoutesTest(unittest.TestCase):
+    """REPORT_CREDENTIAL_ROUTES, pinned: an entry added or widened fails here."""
+
+    def test_the_allowlist_is_exactly_the_audit_report_routes(self):
+        self.assertEqual(
+            [
+                ("GET", "/v1/audit-reports"),
+                ("GET", "{stream}/latest"),
+                ("GET", "{stream}/runs"),
+                ("GET", "{stream}/runs/{run}"),
+                ("PUT", "{stream}/runs/{run}"),
+                ("PUT", "{stream}/latest"),
+                ("DELETE", "{stream}/latest"),
+            ],
+            [
+                (method, pattern.pattern.replace(credential_proxy._REPORT_STREAM, "{stream}").replace(
+                    credential_proxy._REPORT_RUN_STAMP, "{run}"))
+                for method, pattern in credential_proxy.REPORT_CREDENTIAL_ROUTES
+            ],
+        )
+
+    def test_each_listed_route_is_permitted(self):
+        for method, path in REPORT_ROUTES:
+            with self.subTest(method=method, path=path):
+                self.assertTrue(credential_proxy.report_credential_permits(method, path))
+
+    def test_a_non_github_store_key_is_one_segment(self):
+        # github.example.com/team/sub/repo: host, then the path with its own
+        # slashes escaped, then the whole key escaped as one segment.
+        key = "github.example.com%2Fteam%252Fsub%252Frepo"
+        self.assertTrue(credential_proxy.report_credential_permits("GET", f"/v1/audit-reports/fleet-audit/{key}/latest"))
+        self.assertTrue(credential_proxy.report_credential_permits("PUT", f"/v1/audit-reports/fleet-audit/{key}/runs/{RUN}"))
+
+    def test_near_misses_are_refused(self):
+        for method, path in (
+            ("GET", "/v1/audit-reports/"),
+            ("GET", "/v1/audit-reports?all=1"),
+            ("GET", f"{REPORT_STREAM}/latest/"),
+            ("GET", f"{REPORT_STREAM}/latest?x=1"),
+            ("GET", f"{REPORT_STREAM}/latest#frag"),
+            ("GET", f"{REPORT_STREAM}/runs/{RUN}/x"),
+            ("GET", f"{REPORT_STREAM}/runs/20261113T120000Z"),
+            ("GET", f"{REPORT_STREAM}/runs/../latest"),
+            ("GET", "/v1/audit-reports/compliance-audit/../latest"),
+            ("GET", "/v1/audit-reports/compliance-audit/./latest"),
+            ("GET", "/v1/audit-reports/compliance-audit/acme/gitops/latest"),
+            ("GET", "/v1/audit-reports/Compliance-Audit/acme%2Fgitops/latest"),
+            ("GET", "/v1/audit-reports/-audit/acme%2Fgitops/latest"),
+            ("GET", "/v1/audit-reports/compliance-audit//latest"),
+            ("GET", "/v1/audit-reportsx"),
+            ("GET", "//v1/audit-reports"),
+            ("PUT", f"{REPORT_STREAM}/runs"),
+            ("DELETE", f"{REPORT_STREAM}/runs/{RUN}"),
+            ("DELETE", "/v1/audit-reports"),
+            ("PATCH", f"{REPORT_STREAM}/latest"),
+            ("POST", f"{REPORT_STREAM}/latest"),
+            ("get", "/v1/audit-reports"),
+        ):
+            with self.subTest(method=method, path=path):
+                self.assertFalse(credential_proxy.report_credential_permits(method, path))
+
+
 if __name__ == "__main__":
     unittest.main()

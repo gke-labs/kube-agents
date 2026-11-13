@@ -363,7 +363,10 @@ leave open:
   `proxyToken` (audience `credential-proxy`) carries the cluster the verifier checked at
   admission, and a task that names no cluster gets none. When an unattended trigger submitted the
   task, `proxyToken` also carries that `trigger` (`{name, origin, stream}`), which the verifier
-  found equal to the grant's at admission (added 11/11, #4685). Both name the task, its profile and
+  found equal to the grant's at admission (added 11/11, #4685). The broker also accepts a
+  `proxyToken` with no cluster when its tier is `unattended` and it carries a trigger: a report
+  credential, which reaches only the audit-report routes and is refused on every other route,
+  `/v1/exec` included (#5619). The dispatcher doesn't mint one yet. Both name the task, its profile and
   tier, the pod, and the pod's UID as the pool saw it at the offer. Both expire at the
   offer's deadline plus the callout's 30s clock skew, and never later than
   `A2A_TASK_CREDENTIAL_MAX_LIFETIME` (6h by default) from the mint. An offer or an abandon
