@@ -22484,6 +22484,78 @@ class TestDraftFindings(BaseTestCase):
         )
         self.assertEqual(json.loads(out.read_text())["findings"][0]["check"], "netpol-missing")
 
+    def draft(self, *extra):
+        path = self.tmp_path / "manifest.json"
+        path.write_text(json.dumps(self.manifest()), encoding="utf-8")
+        self.out = self.err = ""
+        return self.run_main(["draft", "--audit", AUDIT, "--manifest-file", str(path), *extra])
+
+    def test_the_draft_goes_to_the_findings_path_and_not_through_the_worker(self):
+        """With no --out the document is on disk where `finish` reads it, and the
+        output is a status line: a document printed to stdout enters the worker's
+        context and has to be sent back through one tool call to become a file."""
+        Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
+        self.assertEqual(self.draft(), 0, self.err)
+        written = json.loads(Path(audit_report.findings_path_for(AUDIT)).read_text(encoding="utf-8"))
+        self.assertEqual(written["findings"][0]["check"], "netpol-missing")
+        said = self.out + self.err
+        self.assertNotIn('"findings"', said)
+        self.assertIn(f"wrote {audit_report.findings_path_for(AUDIT)}", said)
+        self.assertIn("in place", said)
+        self.assertIn("Never send the document, or a block of its findings, through a tool call", said)
+        self.assertIn("one `patch` for one finding's fields", said)
+        # The card gate reads a JSON line with these key pairs as a `start` or a `finish`.
+        for line in said.splitlines():
+            self.assertFalse(line.lstrip().startswith("{"), line)
+
+    def test_a_dash_prints_the_draft_for_a_person(self):
+        self.assertEqual(self.draft("--out", audit_report.DRAFT_STDOUT), 0, self.err)
+        self.assertEqual(json.loads(self.out)["findings"][0]["check"], "netpol-missing")
+        self.assertFalse(Path(audit_report.findings_path_for(AUDIT)).exists())
+
+    def test_a_second_draft_does_not_erase_filled_findings(self):
+        Path(audit_report.SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
+        target = Path(audit_report.findings_path_for(AUDIT))
+        self.assertEqual(self.draft(), 0, self.err)
+        self.assertEqual(self.draft(), 0, "an unfilled draft is replaced: " + self.err)
+        document = json.loads(target.read_text(encoding="utf-8"))
+        document["findings"][0]["recommendation"] = {"action": "a", "rationale": "r", "risk": "k"}
+        target.write_text(json.dumps(document), encoding="utf-8")
+        with self.assertRaises(SystemExit) as refused:
+            self.draft()
+        self.assertIn("already has findings you filled", str(refused.exception))
+        self.assertEqual(json.loads(target.read_text(encoding="utf-8"))["findings"][0]["recommendation"]["action"], "a")
+        self.assertEqual(self.draft("--overwrite"), 0, self.err)
+        self.assertEqual(json.loads(target.read_text(encoding="utf-8"))["findings"][0]["recommendation"]["action"], "")
+
+    def test_the_fill_step_bounds_a_tool_call_under_half_the_stale_bound(self):
+        """A tool call's arguments arrive only when complete, so the call must be written well
+        inside the runtime's stale bound: by the fill step an audit's prompt is large, which is the
+        300 s tier (the configured base when that is higher), and a slow writer produces 25 tokens a
+        second at about 3.5 characters each."""
+        large_prompt_stale_seconds = 300
+        slow_chars_per_second = 25 * 3.5
+        config = (Path(__file__).resolve().parents[3] / "config.yaml").read_text(encoding="utf-8")
+        base = int(re.search(r"^\s*stale_timeout_seconds:\s*(\d+)\s*$", config, re.M).group(1))
+        bound = max(base, large_prompt_stale_seconds)
+        self.assertLessEqual(audit_report.DRAFT_FILL_CALL_CHARS / slow_chars_per_second, bound / 2)
+        self.assertIn(str(audit_report.DRAFT_FILL_CALL_CHARS), audit_report.DRAFT_FILL_HINT)
+        skill = (Path(__file__).resolve().parents[1] / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn(f"about {audit_report.DRAFT_FILL_CALL_CHARS:,} characters", skill)
+
+    def test_no_procedure_orders_the_document_through_one_call(self):
+        """Three procedures said "in one shot"; a worker that obeys writes the whole
+        document as one tool call, which is the call the runtime drops."""
+        governance = Path(__file__).resolve().parents[3] / "governance"
+        skill = Path(__file__).resolve().parents[1]
+        texts = list(governance.glob("*_sop.md")) + [skill / "SKILL.md"] + list((skill / "references").glob("*.md"))
+        self.assertTrue(texts)
+        for text in texts:
+            with self.subTest(file=text.name):
+                body = text.read_text(encoding="utf-8")
+                self.assertNotIn("in one shot", body)
+                self.assertNotIn("Write the whole document", body)
+
 
 class TestUnwrittenSweepFixes(HarnessTestCase):
     """`finish` refuses a fix the sweep would open and nobody wrote, until it is

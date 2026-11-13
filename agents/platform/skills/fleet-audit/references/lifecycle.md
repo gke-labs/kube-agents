@@ -122,7 +122,7 @@ branch. It prints exactly one JSON line:
   "checks_contract": "Run every check above against every cluster you can read. …",
   "next_steps": [
     "Read the SOP at /opt/data/profiles/platform/governance/compliance_audit_sop.md in full, then …",
-    "Write the findings document at /opt/data/scratch/findings_compliance-audit.json, starting it with …/scripts/audit_report.py draft --audit compliance-audit --manifest-file /opt/data/scratch/manifest_compliance-audit.json. Its rules are in …/references/findings-document.md.",
+    "Run …/scripts/audit_report.py draft --audit compliance-audit --manifest-file /opt/data/scratch/manifest_compliance-audit.json: it writes the findings document to /opt/data/scratch/findings_compliance-audit.json. Fill each finding's `recommendation` and `remediation` in that file, in place: … Its rules are in …/references/findings-document.md.",
     "Run …/scripts/audit_report.py finish --audit compliance-audit --findings-file … --manifest-file /opt/data/scratch/manifest_compliance-audit.json. Its output and exit codes are in …/references/finish.md."
   ]
 }
@@ -284,12 +284,13 @@ All three exit 2 in directory mode, where the clone already holds the file.
 
 #### Between the collector and `finish`: `draft` and `precheck`
 
-`audit_report.py draft --audit <audit-id> --manifest-file <manifest> [--out <path>]` starts the
-findings document from the collector's manifest: `scope.clusters` with each collected target's
+`audit_report.py draft --audit <audit-id> --manifest-file <manifest> [--out <path>]` writes the
+findings document to the run's `findings_path` (or to `--out`) from the collector's manifest: `scope.clusters` with each collected target's
 `checks_run` copied from the commands it ran, `scope.skipped` for every target it could not read, and
 one finding per candidate carrying its evidence, impact and severity. It leaves each finding's
 `recommendation` empty and its `remediation` `manual`, because those are the judgement the collector
-cannot make: write them, and `finish` has nothing else to reject.
+cannot make: write them into the file in place, as step 3 of the skill says, and `finish` has nothing
+else to reject. A second `draft` refuses to replace a document you have filled (`--overwrite` starts it again).
 
 `audit_report.py precheck --audit <audit-id> --manifest-file <manifest> [--repo "<owner>/<repo>"] [--scheduled]`
 runs after the collector command and before the drafting by hand, where the SOP puts it (two
