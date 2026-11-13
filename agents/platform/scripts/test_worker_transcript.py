@@ -885,6 +885,36 @@ class TestSecretReadDetector(unittest.TestCase):
         'kubectl exec p -- sh -c "echo \\"\\$(env)\\""',
         'ssh host "curl -H \\"Authorization: Bearer \\$(gcloud auth print-access-token)\\" https://x"',
         'bash -c "echo \\`env\\`"',
+        # a quoted script of one word: it holds a shell operator or a backtick and no blank
+        "ssh host 'env|sort'",
+        "ssh host 'ls;env'",
+        "ssh host '(env)'",
+        "ssh host '`env`'",
+        "watch 'env|sort'",
+        "parallel 'printenv|cat' ::: a",
+        "sh -c 'A=1;env'",
+        "bash -c 'FOO=1;printenv'",
+        "trap 'A=1;env' EXIT",
+        "gcloud compute ssh vm -- 'env|sort'",
+        # the value of `--command`
+        "su - root --command=env",
+        "runuser -l app --command=env",
+        "flock /tmp/l --command=env",
+        # a substitution runs to the `)` that closes it
+        'curl -H "Authorization: Bearer $(gcloud --format=\'value(token)\' auth print-access-token)" https://x',
+        'echo "$( (true); env )"',
+        'echo "$(f() { env; }; f)"',
+        # a token printer behind its group word, whatever the command word is
+        'FOO=1 "$GCLOUD" auth print-access-token',
+        'sudo "$GCLOUD" auth print-access-token',
+        'timeout 5 "$GCLOUD" auth print-access-token',
+        '"$G" config config-helper --format=json',
+        # a `--` behind a word that runs a command elsewhere
+        "ssh host printenv -- GITHUB_TOKEN",
+        "docker exec c declare -p -- API_KEY",
+        "ssh host env --",
+        "ssh -- host env",
+        "chroot -- /host env",
         # a function's head opens its body
         "f() { env; }; f",
         "f () { env; }; f",
@@ -1007,6 +1037,17 @@ class TestSecretReadDetector(unittest.TestCase):
         "cat <<< env",
         "declare -f myfunc",
         "command -V env",
+        # a quoted script of one word that prints nothing of the environment
+        "ssh host 'ls;pwd;echo env'",
+        "sh -c 'A=1;ls env'",
+        "su - root --command='ls env'",
+        # a token printer's name with no group word ahead of it
+        "grep -rn print-access-token docs/",
+        "git log --grep config-helper",
+        # a `--` behind a word that runs a command elsewhere, with another command
+        "ssh host -- ls env",
+        "nsenter -t 1 -m -- ls env",
+        "ssh -p 22 host -- ls env",
         # a comment that names a dump word
         "kubectl get pods  # then run env",
         "echo hi # printenv",

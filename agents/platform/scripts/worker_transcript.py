@@ -504,14 +504,15 @@ SECRET_READ_COMMAND_RE = re.compile(
 # - behind a prefix word (`COMMAND_PREFIX_WORDS`), as the first word that is no
 #   option, number or assignment; a word right after an option may be that
 #   option's value, so the word behind it is read as the command too;
-# - as the word after a `-c` of a shell, `su`, `script` and the like
-#   (`SCRIPT_FLAG_WORDS`), read as a script;
+# - as the word after a `-c` or the value of `--command` of a shell, `su`,
+#   `script` and the like (`SCRIPT_FLAG_WORDS`), read as a script;
 # - behind a word that runs a command elsewhere (`REMOTE_COMMAND_WORDS`,
 #   `OPERAND_COMMAND_WORDS`): after `--` when the command has one, else as any
 #   later word that names a command.
-# A quoted argument of several words is read as a script of its own when a
-# word on its command runs one (`SCRIPT_RUNNING_WORDS`), or when it spans
-# lines; elsewhere it is prose or another language (`git commit -m "..."`,
+# A quoted argument is read as a script of its own when a word on its command
+# runs one (`SCRIPT_RUNNING_WORDS`) and the argument holds a blank, a shell
+# operator or a backtick (`ssh host 'env|sort'`), or when it spans lines;
+# elsewhere it is prose or another language (`git commit -m "..."`,
 # `python3 -c "..."`, `jq '...'`).
 # Where the rule cannot read, it decides on less. Text with an unclosed quote
 # is read line by line; one such line, such text of many lines, a long
@@ -525,18 +526,26 @@ SECRET_READ_COMMAND_RE = re.compile(
 # `gcloud auth`, as the first group behind `gcloud`: every subcommand withholds
 # but the ones named here, which print no token, and a flag right behind
 # `auth` withholds, since it may take the subcommand's place as its value. A
-# token printer withholds wherever it stands on a command that holds `gcloud`,
-# or whose command word is an expansion.
+# token printer withholds on any command where its group word (`auth`,
+# `config`) stands ahead of it, whatever the command word is (`sudo "$GCLOUD"
+# auth print-access-token`).
 GCLOUD_BINARY = "gcloud"
 GCLOUD_AUTH_GROUP = "auth"
 GCLOUD_RELEASE_TRACKS = frozenset(("alpha", "beta"))
 GCLOUD_AUTH_SERVED = frozenset(("list", "login", "revoke", "activate-service-account", "configure-docker"))
 GCLOUD_AUTH_SCOPE = "application-default"
 GCLOUD_AUTH_SCOPE_SERVED = frozenset(("login", "revoke", "set-quota-project"))
-GCLOUD_TOKEN_PRINTERS = frozenset(("print-access-token", "print-identity-token", "config-helper"))
+GCLOUD_CONFIG_GROUP = "config"
+# Each token printer with the group word that stands ahead of it.
+GCLOUD_TOKEN_PRINTER_GROUPS = {
+    "print-access-token": GCLOUD_AUTH_GROUP,
+    "print-identity-token": GCLOUD_AUTH_GROUP,
+    "config-helper": GCLOUD_CONFIG_GROUP,
+}
+GCLOUD_TOKEN_PRINTERS = frozenset(GCLOUD_TOKEN_PRINTER_GROUPS)
 # `gcloud compute ssh`: the remote command is behind `--`, or is the value of `--command`.
 GCLOUD_SSH_COMMAND = "ssh"
-GCLOUD_SSH_COMMAND_FLAG = "--command"
+SCRIPT_LONG_FLAG = "--command"
 # The environment: `env` with no command behind its options, and `printenv`,
 # `export`, `declare`, `typeset` or `readonly` with no name, print all of it;
 # bare `set` prints every variable. With a name, `printenv` and a declaring
@@ -556,13 +565,14 @@ WORD_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 # A cluster of short flags (`-p`, `-px`, `-lc`); a long option (`--project`) is another command's.
 SHORT_FLAG_CLUSTER_RE = re.compile(r"^-[A-Za-z]+$")
 # A process's environment is the file `environ` under `/proc/<pid>`. A path
-# under `/proc` withholds, in any quoting and for any reader, when it names
-# `environ` or when its file part, below the process's directory, is a glob or
-# an expansion (`/proc/self/e*`, `/proc/1/$F`; `/proc/sys/vm/*` is no
-# process's). A word that ends in `/environ`
-# withholds too (`/proc/$(pgrep x)/environ`, `./environ`), and so does a file
-# named `environ` behind a file reader or as a command's input, since the
-# shell may stand in the process's directory.
+# under `/proc` withholds, quoted as a whole or not and for any reader, when
+# it names `environ` or when its file part, below the process's directory, is
+# a glob or an expansion (`/proc/self/e*`, `/proc/1/$F`; `/proc/sys/vm/*` is
+# no process's). A quote inside the path ends it for this rule
+# (`/proc/"self"/e*` is not seen). A word that ends in `/environ` withholds
+# too (`/proc/$(pgrep x)/environ`, `./environ`), and so does a file named
+# `environ` behind a file reader or as a command's input, since the shell may
+# stand in the process's directory.
 PROC_PATH_RE = re.compile(r"(?<![\w.-])/proc/[^\s'\"`;|&<>()]*")
 PROC_PROCESS_DEPTH = 2
 PROC_PROCESS_INDEX = 1
@@ -597,10 +607,15 @@ EVAL_BUILTIN = "eval"
 EVAL_WORD_JOIN = " "
 # Words that run a command elsewhere. Behind `REMOTE_COMMAND_WORDS` a command
 # follows only a verb that runs one; behind `OPERAND_COMMAND_WORDS` it follows
-# an operand (a host, a directory, a lock file).
+# an operand (a host, a directory, a lock file). With a `--` the command
+# starts behind it, or one word on when the operand stands there too (`ssh --
+# host env`); ahead of the `--` a later word that names a command still
+# counts, since the `--` may be the inner command's (`ssh host printenv --
+# NAME`).
 REMOTE_COMMAND_WORDS = frozenset(("kubectl", "oc", "docker", "docker-compose", "podman", "nerdctl", "crictl"))
 REMOTE_COMMAND_VERBS = frozenset(("exec", "run"))
 OPERAND_COMMAND_WORDS = frozenset(("ssh", "nsenter", "chroot", "runuser", "flock"))
+OPERAND_AND_COMMAND_WIDTH = 2
 REMOTE_NAMED_COMMAND_WORDS = TOKEN_OR_ENVIRONMENT_COMMAND_WORDS | SHELL_BINARIES
 # A word that may be an argument names a command by its bare name or by a path into a `bin` directory.
 BINARY_DIRECTORY_SUFFIX = "bin"
@@ -643,6 +658,7 @@ SUBSHELL_CLOSE = ")"
 SHELL_COMMAND_END = ";"
 SHELL_EXPANSION = "$"
 SUBSTITUTION_OPEN = SHELL_EXPANSION + SUBSHELL_OPEN
+PARENTHESIS_RE = re.compile(r"[()]")
 # A backtick pair, written as the substitution it is.
 BACKTICK_OPENS = f" {SUBSTITUTION_OPEN} "
 BACKTICK_CLOSES = f" {SUBSHELL_CLOSE} "
@@ -1668,8 +1684,8 @@ def _first_operands(words: Sequence[str], start: int) -> List[int]:
     return found
 
 
-def _words_print_token_or_environment(words: Sequence[str], continued: bool, depth: int, budget: List[int]) -> bool:
-    """Whether one command's words print a token or the environment; `continued` when the words follow a substitution."""
+def _words_print_token_or_environment(words: Sequence[str], depth: int, budget: List[int]) -> bool:
+    """Whether one command's words print a token or the environment."""
     words = list(words)
     if words[:1] == [FUNCTION_KEYWORD]:
         words = words[FUNCTION_HEAD_WIDTH:]
@@ -1677,10 +1693,8 @@ def _words_print_token_or_environment(words: Sequence[str], continued: bool, dep
         return False
     if any(word.endswith(ENVIRON_PATH_SUFFIX) for word in words):
         return True
-    if not GCLOUD_TOKEN_PRINTERS.isdisjoint(words):
-        # A token printer: on a command that holds `gcloud`, or whose command word cannot be read.
-        if continued or not words[0] or SHELL_EXPANSION in words[0] or any(_base_word(word) == GCLOUD_BINARY for word in words):
-            return True
+    if any(GCLOUD_TOKEN_PRINTER_GROUPS[word] in words[:index] for index, word in enumerate(words) if word in GCLOUD_TOKEN_PRINTERS):
+        return True
     steps = 0
     starts, read = [(0, False)], set()
     while starts:
@@ -1705,13 +1719,15 @@ def _words_print_token_or_environment(words: Sequence[str], continued: bool, dep
                     return True
                 if base in SHELL_BINARIES:
                     continue
+            if any(_script_value_prints(script, depth, budget) for script in _flag_values(rest, SCRIPT_LONG_FLAG)):
+                return True
         if base == GCLOUD_BINARY:
             if _gcloud_prints_token(rest):
                 return True
             if GCLOUD_SSH_COMMAND in rest:
                 if END_OF_FLAGS in rest:
                     starts.append((behind + rest.index(END_OF_FLAGS) + 1, False))
-                if any(_script_value_prints(script, depth, budget) for script in _flag_values(rest, GCLOUD_SSH_COMMAND_FLAG)):
+                if any(_script_value_prints(script, depth, budget) for script in _flag_values(rest, SCRIPT_LONG_FLAG)):
                     return True
         elif base == ENV_BINARY:
             command = _env_command_index(rest)
@@ -1725,10 +1741,15 @@ def _words_print_token_or_environment(words: Sequence[str], continued: bool, dep
             if any(_is_environ_file(word) for word in rest):
                 return True
         elif base in REMOTE_COMMAND_WORDS or base in OPERAND_COMMAND_WORDS:
+            named_among = rest
             if END_OF_FLAGS in rest:
-                starts.append((behind + rest.index(END_OF_FLAGS) + 1, False))
-            elif base in OPERAND_COMMAND_WORDS or not REMOTE_COMMAND_VERBS.isdisjoint(rest):
-                starts.extend((behind + index, False) for index, word in enumerate(rest) if _is_named_word(word, REMOTE_NAMED_COMMAND_WORDS))
+                dashes = rest.index(END_OF_FLAGS)
+                starts.append((behind + dashes + 1, False))
+                if base in OPERAND_COMMAND_WORDS and all(word.startswith(OPTION_PREFIXES) for word in rest[:dashes]):
+                    starts.append((behind + dashes + OPERAND_AND_COMMAND_WIDTH, False))
+                named_among = rest[:dashes]
+            if base in OPERAND_COMMAND_WORDS or not REMOTE_COMMAND_VERBS.isdisjoint(rest):
+                starts.extend((behind + index, False) for index, word in enumerate(named_among) if _is_named_word(word, REMOTE_NAMED_COMMAND_WORDS))
         elif base == EVAL_BUILTIN:
             if _quoted_script_prints(EVAL_WORD_JOIN.join(rest), depth, budget):
                 return True
@@ -1770,8 +1791,13 @@ def _quoted_script_prints(script: str, depth: int, budget: List[int]) -> bool:
     return depth >= MAX_NESTED_COMMAND_DEPTH or script_prints_token_or_environment(script, depth + 1, budget)
 
 
+def _is_quoted_script(word: str) -> bool:
+    """Whether a shell word can be a quoted script: it holds a blank, a shell operator or a backtick, which only quotes keep in one word."""
+    return _holds_whitespace(word) or SHELL_BACKTICK in word or not SHELL_PUNCTUATION_CHARS.isdisjoint(word)
+
+
 def _script_value_prints(script: str, depth: int, budget: List[int]) -> bool:
-    """Whether a script that is a flag's value, of one word or several, prints a token or the environment."""
+    """Whether a script that is one argument, of one word or several, prints a token or the environment."""
     return _quoted_script_prints(script, depth, budget) if _holds_whitespace(script) else _script_word_prints(script, depth, budget)
 
 
@@ -1844,15 +1870,25 @@ def _backticks_as_substitutions(text: str) -> str:
 
 
 def _substitution_texts(text: str) -> Optional[List[str]]:
-    """The text inside each `$(` outside single quotes, to its first `)`; None when the line holds more than the limit."""
+    """The text inside each `$(` outside single quotes, to the `)` that closes it; None when the line holds more than the limit.
+
+    The `)` is the one that balances the parentheses behind the `$(`
+    (`$(gcloud --format='value(token)' auth print-access-token)`); with none,
+    the text runs to the end.
+    """
     texts: List[str] = []
     for _, end, mark, quote in _shell_marks(text):
         if mark != SUBSTITUTION_OPEN or quote == SHELL_SINGLE_QUOTE:
             continue
         if len(texts) >= MAX_READ_SUBSTITUTIONS:
             return None
-        close = text.find(SUBSHELL_CLOSE, end)
-        texts.append(text[end : len(text) if close < 0 else close])
+        close, depth = len(text), 1
+        for paren in PARENTHESIS_RE.finditer(text, end):
+            depth += 1 if paren.group() == SUBSHELL_OPEN else -1
+            if not depth:
+                close = paren.start()
+                break
+        texts.append(text[end:close])
     return texts
 
 
@@ -1878,7 +1914,7 @@ def _line_prints_token_or_environment(text: str, depth: int, budget: List[int]) 
         return bool(UNSPLIT_LINE_RE.search(text))
     segment: List[str] = []
     here_strings: List[str] = []
-    continued = foreign = False
+    foreign = False
     prefix_only = True
     # The redirection operator whose target the next word is.
     redirect: Optional[str] = None
@@ -1913,16 +1949,16 @@ def _line_prints_token_or_environment(text: str, depth: int, budget: List[int]) 
             if SHELL_COMMAND_END not in token:
                 continue
         if not foreign:
-            if _words_print_token_or_environment(segment, continued, depth, budget):
+            if _words_print_token_or_environment(segment, depth, budget):
                 return True
             # A shell reads a here-string as its script (`bash <<< env`).
             if any(_base_word(word) in SHELL_BINARIES for word in segment) and any(_script_word_prints(script, depth, budget) for script in here_strings):
                 return True
-            # A quoted argument of several words on one line is a script where a word on the command runs one.
+            # A quoted argument on one line is a script where a word on the command runs one.
             if any(_base_word(word) in SCRIPT_RUNNING_WORDS for word in segment):
-                if any(_quoted_script_prints(word, depth, budget) for word in (*segment, *here_strings) if _holds_whitespace(word) and LINE_BREAK not in word):
+                if any(_script_value_prints(word, depth, budget) for word in (*segment, *here_strings) if _is_quoted_script(word) and LINE_BREAK not in word):
                     return True
-        continued, foreign, prefix_only, segment, here_strings = SUBSHELL_CLOSE in token, False, True, [], []
+        foreign, prefix_only, segment, here_strings = False, True, [], []
         redirect = token if redirects else None
     return False
 
