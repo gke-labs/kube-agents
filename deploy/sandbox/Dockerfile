@@ -587,7 +587,8 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          module name, so it is staged here as well
 #   credential_shapes.py   the token shapes the feedback gate refuses and the broker
 #                          redacts before logging: one list, imported by
-#                          feedback_broker here and by credential_proxy off-pod
+#                          feedback_broker and submit_suggestion here and by
+#                          credential_proxy off-pod
 #   feedback_broker.py     the constants the kube-agents-feedback client reads (the
 #                          route, the statuses, the fallback links, the payload's
 #                          normalisation); the same module's broker half files the

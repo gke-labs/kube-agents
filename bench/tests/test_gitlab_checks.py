@@ -265,6 +265,17 @@ def test_path_clauses_are_unevaluable_on_gitlab_not_a_pass(env, gitlab, clause, 
     assert clause in result.reason and "not implemented for GitLab" in result.reason
 
 
+def test_body_contains_reads_the_merge_request_description(env, gitlab):
+    route_mr3(gitlab, description="Applies a PDB for the checkout deployment.")
+    stash(f"Opened {MR3_URL}")
+    result = pr_check(body_contains=["## Evidence"]).verify(30)
+    assert result.success is False
+    assert result.status == "fail", result.reason
+    assert "body_contains" in result.reason
+    route_mr3(gitlab, description="Adds a PDB.\n\n## Evidence\n\n**Finding:** no PDB\n")
+    assert pr_check(body_contains=["## Evidence"]).verify(30).success is True
+
+
 def test_a_merge_request_opened_in_the_run_passes(env, gitlab):
     route_mr3(gitlab)
     stash(f"Opened {MR3_URL}")
