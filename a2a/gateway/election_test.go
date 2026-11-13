@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	coordinationv1 "k8s.io/api/coordination/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -587,7 +586,7 @@ func TestAHeldBackRelayBindsAfterItsDelay(t *testing.T) {
 	// The base rig may have bound the durable before it stopped; it's
 	// cleared below, inside the delay, so only the held-back bind counts.
 	r, _ := restartRigWith(t, base, nil, RunOptions{RelayBindDelay: delay})
-	nc, err := nats.Connect(r.url)
+	nc, err := connectTest(r.url)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -644,7 +643,7 @@ func TestACrashTakeoverRendersTheDeadLeadersHeldEventsFirst(t *testing.T) {
 	// The dead leader: it bound the relay durable, took the first notice,
 	// and died without acking or giving it back.
 	dies := func() {
-		nc, err := nats.Connect(r.url)
+		nc, err := connectTest(r.url)
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -23,7 +22,7 @@ import (
 // through it.
 func waitRunning(t *testing.T, r *rig) {
 	t.Helper()
-	nc, err := nats.Connect(r.url)
+	nc, err := connectTest(r.url)
 	if err != nil {
 		t.Fatal(err)
 	}

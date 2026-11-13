@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/gke-labs/kube-agents/a2a/capability"
@@ -27,7 +26,7 @@ type subjectEnvelope struct {
 // PROFILE_SUBMITS for a submission filter, on TASKS otherwise.
 func streamEnvelopes(t *testing.T, url, filter string) []subjectEnvelope {
 	t.Helper()
-	nc, err := nats.Connect(url)
+	nc, err := connectTest(url)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +71,7 @@ func mintedEntry(t *testing.T, url string, ref *capability.Ref) capability.Entry
 	if ref == nil {
 		t.Fatal("no capability on the task")
 	}
-	nc, err := nats.Connect(url)
+	nc, err := connectTest(url)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -443,7 +442,7 @@ func TestAStopOfAPlatformTaskWritesNoStopRecord(t *testing.T) {
 // direct get of the last message on its subject.
 func dispatchStopFor(t *testing.T, url, profile, taskID string) (*lib.DispatchStop, bool) {
 	t.Helper()
-	nc, err := nats.Connect(url)
+	nc, err := connectTest(url)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -472,7 +471,7 @@ func dispatchStopFor(t *testing.T, url, profile, taskID string) (*lib.DispatchSt
 // dispatchStopCount is how many stop records the stream holds.
 func dispatchStopCount(t *testing.T, url string) uint64 {
 	t.Helper()
-	nc, err := nats.Connect(url)
+	nc, err := connectTest(url)
 	if err != nil {
 		t.Fatal(err)
 	}

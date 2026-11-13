@@ -12,7 +12,6 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -808,7 +807,7 @@ func TestARefusalFollowsTheDelegatingTurnsAnswer(t *testing.T) {
 // submission to platform; given platform, a wake's on a fresh incarnation.
 func narrowTasksStream(t *testing.T, url, session string) {
 	t.Helper()
-	nc, err := nats.Connect(url)
+	nc, err := connectTest(url)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1823,7 +1822,7 @@ func TestSteerAuthorsPastTheCapRefuse(t *testing.T) {
 // delivered" that the heal exists to find.
 func drainRelayDurable(t *testing.T, url string) {
 	t.Helper()
-	nc, err := nats.Connect(url)
+	nc, err := connectTest(url)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2103,7 +2102,7 @@ func TestAnIncompleteIncarnationSetRefuses(t *testing.T) {
 func capSessionRecordSize(t *testing.T, r *rig, conv string, slack int) {
 	t.Helper()
 	size := len(rawSessionRecord(t, r.g.reg, conv))
-	nc, err := nats.Connect(r.url)
+	nc, err := connectTest(r.url)
 	if err != nil {
 		t.Fatal(err)
 	}

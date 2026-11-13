@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -21,7 +20,7 @@ import (
 // since the split replay is the pair. Error-returning (no *testing.T) so the
 // fake spawner's onDelete hook can call it from the gateway's own goroutine.
 func eventsEnvelopes(url, addressee string) ([]*lib.Envelope, error) {
-	nc, err := nats.Connect(url)
+	nc, err := connectTest(url)
 	if err != nil {
 		return nil, err
 	}
@@ -507,7 +506,7 @@ func TestAskBoundClearsOnlyTheCopy(t *testing.T) {
 // erases.
 func subjectEnvelopes(t *testing.T, url, subject string) []*lib.Envelope {
 	t.Helper()
-	nc, err := nats.Connect(url)
+	nc, err := connectTest(url)
 	if err != nil {
 		t.Fatal(err)
 	}

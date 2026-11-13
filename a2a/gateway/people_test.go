@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -49,7 +48,7 @@ const peopleTestPrincipal = "test:bnaylor"
 // peopleBucketJS connects to the rig's server for a test's own KV calls.
 func peopleBucketJS(t *testing.T, url string) jetstream.JetStream {
 	t.Helper()
-	nc, err := nats.Connect(url)
+	nc, err := connectTest(url)
 	if err != nil {
 		t.Fatalf("connect: %v", err)
 	}

@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -20,7 +19,7 @@ import (
 // before the gateway runs, with maxAge as its retention (zero: none).
 func withFeedbackBucket(t *testing.T, maxAge time.Duration) func(*Config) {
 	return func(cfg *Config) {
-		nc, err := nats.Connect(cfg.NATSURL)
+		nc, err := connectTest(cfg.NATSURL)
 		if err != nil {
 			t.Fatalf("connect: %v", err)
 		}
