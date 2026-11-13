@@ -4376,7 +4376,8 @@ class Principal:
     handler, or the operator's rendering has to change again.
     ``caller`` stays None until then for every role but one: a profile
     caller's verified task credential (#3889) fills it with the task and the
-    credential's jti, and ``task`` and ``task_target`` with its claims. That
+    credential's jti, and ``task`` and ``task_target`` with its claims
+    (``task_target`` is None for a report credential, #5619). That
     credential arrives in a request header (TASK_CREDENTIAL_HEADER), never the
     body, and is bound to the pod the TokenReview attested before anything
     reads it (ProfileTaskGate). What must hold is that none of these fields is
@@ -13210,7 +13211,8 @@ def mcp_relay_decision(
 
     A profile worker (#3658) reaches the relay only inside a task: a warm pod
     between tasks holds no task credential, so it gets no reads. With one, it
-    is held to mcp_policy.PROFILE_SERVER_TOOLS. Everyone else gets the table.
+    is held to mcp_policy.PROFILE_SERVER_TOOLS; a report credential counts as
+    none. Everyone else gets the table.
     """
     if principal is None or principal.role != CALLER_ROLE_PROFILE:
         return mcp_policy.evaluate(server_name, message), None
@@ -13421,7 +13423,9 @@ class CredentialProxyHandler(_RequestReadDeadline, BaseHTTPRequestHandler):
         is admitted with no task, and task_confinement gives it local-only
         commands; one with a credential that fails is refused whole, so a
         stale or foreign credential is loud rather than quietly downgraded.
-        The token is never logged; a bound one is, by jti, in ``caller``.
+        The token is never logged; a bound one is, by jti, in ``caller``. A
+        report credential is admitted and then held to REPORT_CREDENTIAL_ROUTES:
+        anything else is answered 403 with ``caller.report-credential-route``.
         """
         values = self.headers.get_all(TASK_CREDENTIAL_HEADER) or []
         try:

@@ -391,6 +391,8 @@ What the operator renders per profile, as built (amended 10/6):
     without a credential, so `get-credentials <cluster> --help` is a help read.
     `gcloud config` and `gcloud auth` are refused whole, since even their reads print the
     broker's own account and default project.
+  - A report credential (no target, the `unattended` tier and a trigger; #5619) is refused on
+    `/v1/exec` and the MCP relay before any of this runs.
   - With a credential, every call is held to its target (`task_confinement.py`). Every
     `kubectl --context`, `--kubeconfig` and `kubeconfigContext` must name the target, and a
     call naming none gets the target, not the host cluster; `--cluster`, `--server`, `--user`
