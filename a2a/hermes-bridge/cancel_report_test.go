@@ -218,6 +218,32 @@ func TestAPI_AShutdownDuringTheCancelsHoldEndsItAtOnce(t *testing.T) {
 	}
 }
 
+// shutdownTasks leaves a cancel that is holding its terminal for the card
+// stop to its worker: the in-turn card wait runs after the turn's answer is
+// held (answerHeld), which shutdownTasks already leaves alone, so a user's
+// cancel never reads as a shutdown failure. Called here without ending the
+// stop's request, so the worker is still holding when shutdownTasks runs.
+func TestShutdownTasksLeavesACancelsHoldToItsWorker(t *testing.T) {
+	store := newStopStore(t, http.StatusOK, stopAnswer)
+	release := store.holdAnswers(t)
+	w := startCardWaitTurn(t, "shutdown-race", "console:tab-shutdown-race", store, nil)
+	w.cancel(t)
+	w.awaitCardStop(t)
+	w.b.closing.Store(true)
+	w.b.shutdownTasks()
+	time.Sleep(300 * time.Millisecond)
+	if held, err := w.c.TasksGet(testCtx(t), "platform", w.taskID); err != nil {
+		t.Fatalf("read the held task: %v", err)
+	} else if held.Final {
+		t.Fatalf("shutdownTasks ended the held cancel: %s", held.State)
+	}
+	release()
+	task := waitTerminalFor(t, w.c, w.taskID, 10*time.Second)
+	if task.State != lib.StateCanceled {
+		t.Fatalf("state = %s, want canceled", task.State)
+	}
+}
+
 // The cancel's card stop is deduped per run, not per session: a second run on
 // the same session, canceled later, posts its own stop, so cards a later turn
 // filed before reaching its wait are stopped too. One run posts once however

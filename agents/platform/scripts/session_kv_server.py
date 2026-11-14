@@ -10071,6 +10071,18 @@ CARD_STOP_BUSY_TIMEOUT_S = 3.0
 # The bound on the answer: see the section comment. The bridge's request
 # timeout and the gateway's wait for the control task sit above it.
 CARD_STOP_WORST_CASE_S = CARD_STOP_DEADLINE_S + CARD_STOP_BUSY_TIMEOUT_S + 1.0
+# The bound on a call that joins a running stop (_card_stop_single_flight):
+# the call's one deadline covers both its wait and, when the joined answer
+# can't be reused, its own stop, which then runs on what is left of it; each
+# can overrun the deadline by a board busy timeout and a second. Under the
+# bridge's 35 s request timeout (DefaultCardStopTimeout in
+# a2a/hermes-bridge/cardstop.go), so a joined stop still answers the cancel.
+CARD_STOP_JOIN_WORST_CASE_S = CARD_STOP_WORST_CASE_S + CARD_STOP_BUSY_TIMEOUT_S + 1.0
+# How far behind session-kv's clock the board's created_at may run and a card
+# filed after a stop's scan began still count as new (_card_stop_tree_has_card_since).
+# Hermes writes the board on this pod, so the clocks agree; the slack only
+# makes a reuse rarer, never a stale one more likely.
+CARD_STOP_REUSE_CLOCK_SLACK_S = 2.0
 # Between SIGTERM and SIGKILL for what is left of a stopped card's worker group.
 CARD_STOP_KILL_GRACE_SECONDS = 3.0
 CARD_STOP_KILL_POLL_SECONDS = 0.1
@@ -10119,8 +10131,8 @@ def _card_stop_clock() -> float:
 class _Budget:
     """The call's deadline. `hit` records that something was not started for it."""
 
-    def __init__(self) -> None:
-        self.deadline = _card_stop_clock() + CARD_STOP_DEADLINE_S
+    def __init__(self, deadline: Optional[float] = None) -> None:
+        self.deadline = _card_stop_clock() + CARD_STOP_DEADLINE_S if deadline is None else deadline
         self.hit = False
 
     def left(self) -> float:
@@ -10643,7 +10655,8 @@ def stop_session_cards(session_id: str, request_data: Dict[str, Any]) -> Dict[st
     pid never appeared (a worker may still spawn for it), `errors` for a board
     error after the first pass, how many re-scans ran, `truncated` when the set
     was larger than one pass, and `deadline` when the budget ran out. Answers
-    within CARD_STOP_WORST_CASE_S. A call while another for the same session
+    within CARD_STOP_WORST_CASE_S, or CARD_STOP_JOIN_WORST_CASE_S for a call that
+    joins a running stop. A call while another for the same session
     and conversation runs, or within CARD_STOP_JOIN_WINDOW_S of one with no
     card filed since its first scan, answers with that stop's result marked
     `joined` (_card_stop_single_flight). Past that, calling it again stops
@@ -10659,7 +10672,9 @@ def stop_session_cards(session_id: str, request_data: Dict[str, Any]) -> Dict[st
         raise HTTPException(status_code=400, detail="conversation or context_id is too long")
     if session_id != _conversation_session_id(context_id):
         raise HTTPException(status_code=400, detail="context_id is not this session's")
-    return _card_stop_single_flight(session_id, conversation, lambda: _stop_session_cards_now(session_id, conversation))
+    return _card_stop_single_flight(
+        session_id, conversation, lambda deadline: _stop_session_cards_now(session_id, conversation, deadline)
+    )
 
 
 # A conversation's card stop is single-flight (#5528). With the gateway's
@@ -10730,6 +10745,10 @@ def _card_stop_reusable(flight: _CardStopFlight, session_id: str, conversation: 
 
 
 def _card_stop_single_flight(session_id: str, conversation: str, run) -> Dict[str, Any]:
+    # One deadline for the whole call, so a call that joins a running stop
+    # and then has to stop for itself still answers within
+    # CARD_STOP_JOIN_WORST_CASE_S: run(deadline) gets what is left of it.
+    deadline = _card_stop_clock() + CARD_STOP_DEADLINE_S
     key = (session_id, conversation)
     with _card_stop_flights_lock:
         flight = _card_stop_flights.get(key)
@@ -10766,15 +10785,17 @@ def _card_stop_single_flight(session_id: str, conversation: str, run) -> Dict[st
                     del _card_stop_flights[k]
         if own is not None:
             break
-        # The running stop answers within CARD_STOP_WORST_CASE_S; past that
-        # (it can't, but a wedged board connection is not ours to trust) this
-        # call answers 503 rather than waiting on.
-        if not racing.done.wait(CARD_STOP_WORST_CASE_S + 2.0):
+        # Waited on until this call's own deadline, plus the slack a busy
+        # board connection adds; a stop still running past that (it can't
+        # be, but a wedged board connection is not ours to trust) gets this
+        # call a 503 rather than a longer wait.
+        wait = max(0.0, deadline - _card_stop_clock()) + CARD_STOP_BUSY_TIMEOUT_S + 1.0
+        if not racing.done.wait(wait):
             raise HTTPException(status_code=503, detail="a card stop for this conversation is still running")
         if _card_stop_reusable(racing, session_id, conversation):
             return _joined(racing)
     try:
-        own.result = run()
+        own.result = run(deadline)
         return own.result
     except HTTPException as exc:
         own.error = exc
@@ -10805,15 +10826,17 @@ def _card_stop_tree_has_card_since(session_id: str, conversation: str, since: fl
         return True  # a tree too large to read whole may hold a new card
     # Hermes stamps created_at in whole seconds, so a card filed after the
     # scan began in the same second carries a stamp below `since`: compare
-    # against that second, which errs toward a fresh stop, never a stale one.
-    floor = math.floor(since)
+    # against that second, less CARD_STOP_REUSE_CLOCK_SLACK_S for a writer's
+    # clock a little behind this one, which errs toward a fresh stop, never
+    # a stale one.
+    floor = math.floor(since) - CARD_STOP_REUSE_CLOCK_SLACK_S
     return any(float(card.get("created_at") or 0) >= floor for card in tree.cards.values())
 
 
-def _stop_session_cards_now(session_id: str, conversation: str) -> Dict[str, Any]:
+def _stop_session_cards_now(session_id: str, conversation: str, deadline: Optional[float] = None) -> Dict[str, Any]:
     """One stop of the conversation's cards: the route's body, run through
-    _card_stop_single_flight."""
-    budget = _Budget()
+    _card_stop_single_flight, on the call's deadline (_Budget)."""
+    budget = _Budget(deadline)
     result: Dict[str, Any] = {
         "session_id": session_id,
         "board": False,

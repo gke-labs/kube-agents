@@ -11399,7 +11399,7 @@ class TestCardStop(unittest.TestCase):
         release, entered = _threading.Event(), _threading.Event()
         calls = []
 
-        def run():
+        def run(deadline=None):
             calls.append(1)
             entered.set()
             release.wait(5)
@@ -11439,7 +11439,7 @@ class TestCardStop(unittest.TestCase):
         release, entered = _threading.Event(), _threading.Event()
         calls = []
 
-        def run():
+        def run(deadline=None):
             calls.append(1)
             if len(calls) == 1:
                 entered.set()
@@ -11464,6 +11464,50 @@ class TestCardStop(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertNotIn("joined", out["b"])
 
+    def test_a_join_and_its_own_stop_share_one_deadline(self):
+        # A call that joins a running stop whose answer can't be reused stops
+        # for itself on what is left of its own deadline, not a fresh one, so
+        # the whole call stays inside CARD_STOP_JOIN_WORST_CASE_S.
+        import threading as _threading
+
+        clock = [1000.0]
+        release, entered = _threading.Event(), _threading.Event()
+        deadlines = []
+
+        def run(deadline=None):
+            deadlines.append(deadline)
+            if len(deadlines) == 1:
+                entered.set()
+                release.wait(5)
+                return {"session_id": self.SESSION, "stopped": [], "unresolved": [{"id": "t_1"}]}
+            return {"session_id": self.SESSION, "stopped": [{"id": "t_1"}]}
+
+        out = {}
+
+        def caller(name):
+            out[name] = session_kv_server._card_stop_single_flight(self.SESSION, self.CONVERSATION, run)
+
+        with patch.object(session_kv_server, "_card_stop_clock", lambda: clock[0]):
+            a = _threading.Thread(target=caller, args=("a",))
+            a.start()
+            self.assertTrue(entered.wait(5))
+            clock[0] = 1005.0
+            b = _threading.Thread(target=caller, args=("b",))
+            b.start()
+            time.sleep(0.2)
+            clock[0] = 1015.0
+            release.set()
+            a.join(5)
+            b.join(5)
+        deadline = session_kv_server.CARD_STOP_DEADLINE_S
+        self.assertEqual(deadlines, [1000.0 + deadline, 1005.0 + deadline])
+        self.assertNotIn("joined", out["b"])
+
+    def test_a_joined_stop_answers_inside_the_bridges_timeout(self):
+        # The bridge's POST bound, DefaultCardStopTimeout in
+        # a2a/hermes-bridge/cardstop.go (35 s), must cover a joined stop.
+        self.assertLess(session_kv_server.CARD_STOP_JOIN_WORST_CASE_S, 35.0)
+
     def test_a_truncated_tree_read_counts_as_a_new_card(self):
         self.card("t_a", "ready", session=self.SESSION, created=time.time() - 10)
         truncated = session_kv_server._CardTree({}, [], True)
@@ -11473,7 +11517,7 @@ class TestCardStop(unittest.TestCase):
     def test_another_conversation_never_joins(self):
         calls = []
 
-        def run():
+        def run(deadline=None):
             calls.append(1)
             return {"stopped": []}
 
