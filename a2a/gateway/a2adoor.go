@@ -1409,8 +1409,8 @@ func (d *A2ADoor) TaskTerminal(conversation, taskID string, state lib.TaskState,
 }
 
 // TaskCardStop records a canceled task's card-stop result (CardStopObserver):
-// its text and the cardStop part, the caller's own session's card IDs and
-// titles as the executor wrote them. Bounded like a deliverable.
+// the gateway's text for it and the cardStop part, the caller's own
+// session's card IDs and titles. Bounded like a deliverable.
 func (d *A2ADoor) TaskCardStop(conversation, taskID, text string, cardStop lib.Part) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -1421,8 +1421,11 @@ func (d *A2ADoor) TaskCardStop(conversation, taskID, text string, cardStop lib.P
 		d.tasks[taskID] = task
 		d.taskOrder = append(d.taskOrder, taskID)
 	}
-	if len(text)+len(cardStop.Data) > a2aMaxResultBytes {
-		// A part cut mid-JSON reads as nothing; the text alone says it.
+	task.resultCutFrom = 0
+	if whole := len(text) + len(cardStop.Data); whole > a2aMaxResultBytes {
+		// A part cut mid-JSON reads as nothing; the text alone says it, cut
+		// and marked as a cut deliverable is (metadata.resultTruncatedFrom).
+		task.resultCutFrom = whole
 		text, cardStop = truncateRunes(text, a2aMaxResultBytes), lib.Part{}
 	}
 	before := len(task.cardStopText)

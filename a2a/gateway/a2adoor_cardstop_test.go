@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
@@ -66,8 +67,8 @@ func TestA2ACanceledTaskShowsItsCardStopResult(t *testing.T) {
 		t.Fatalf("the canceled task has %d artifacts, want its card-stop result", len(got.Artifacts))
 	}
 	art := got.Artifacts[0]
-	if text := joinTextParts(art.Parts); text != "canceled; stopped 1 card" {
-		t.Errorf("the artifact's text = %q, want the card-stop text", text)
+	if text := joinTextParts(art.Parts); !strings.HasPrefix(text, "canceled; ") || !strings.Contains(text, "stopped 1 card") {
+		t.Errorf("the artifact's text = %q, want the gateway's card-stop text", text)
 	}
 	res, ok := cardStopResultOf(art.Parts)
 	if !ok {
@@ -75,6 +76,27 @@ func TestA2ACanceledTaskShowsItsCardStopResult(t *testing.T) {
 	}
 	if len(res.Stopped) != 1 || res.Stopped[0].ID != "t_1" {
 		t.Errorf("the cardStop part's stopped cards = %+v, want t_1", res.Stopped)
+	}
+}
+
+// TestA2ACanceledCardStopCarriesNoPartialAnswer: a canceled turn that had
+// published part of its answer into the result before the card-stop chunk
+// shows only the card-stop result. The gateway writes the text itself, so
+// the partial answer chunked into the same artifact never reaches the door.
+func TestA2ACanceledCardStopCarriesNoPartialAnswer(t *testing.T) {
+	got := cancelDoorTaskWith(t, []lib.Part{
+		{Kind: "text", Text: "Scaling checkout-gateway now; the first replica"},
+		{Kind: "text", Text: "canceled; stopped 1 card"},
+		cardStopResultPartFor(t, "t_1"),
+	})
+	if len(got.Artifacts) != 1 {
+		t.Fatalf("the canceled task has %d artifacts, want its card-stop result", len(got.Artifacts))
+	}
+	if text := joinTextParts(got.Artifacts[0].Parts); strings.Contains(text, "first replica") || strings.Contains(text, "Scaling") {
+		t.Errorf("the partial answer reached the door: %q", text)
+	}
+	if n := len(got.Artifacts[0].Parts); n != 2 {
+		t.Errorf("%d parts, want the text and the cardStop part", n)
 	}
 }
 
@@ -126,6 +148,9 @@ func TestA2ACardStopResultIsBounded(t *testing.T) {
 	}
 	if n := len(joinTextParts(obj.Artifacts[0].Parts)); n > a2aMaxResultBytes+len("…") {
 		t.Errorf("the card-stop text is %d bytes, past the bound", n)
+	}
+	if _, cut := obj.Metadata["resultTruncatedFrom"]; !cut {
+		t.Error("a cut card-stop result is not marked resultTruncatedFrom")
 	}
 }
 

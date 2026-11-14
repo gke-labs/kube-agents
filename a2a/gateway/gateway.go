@@ -2893,12 +2893,16 @@ func (g *Gateway) observeTaskDelivered(rec *SessionRecord, taskID, result string
 }
 
 // observeCardStop hands a CardStopObserver a canceled task's card-stop
-// result: the result artifact's text and its cardStop part, the result form
-// only. A result with no such part hands over nothing, so a canceled turn's
-// other output never reaches a door's caller. Announced under the chain's
-// root, and only for the task whose end is the chain's, as observeDelivered.
+// result, read from the result's cardStop part (the result form only). The
+// gateway writes both halves itself: the text in its own wording
+// (canceledCardStopText) and the part re-encoded from the parsed result
+// (lib.CardStopPart), so none of the executor's text and no field the
+// schema doesn't name reaches a door's caller: a canceled turn's partial
+// answer, chunked into the same artifact, stays unrendered. A result with
+// no such part hands over nothing. Announced under the chain's root, and
+// only for the task whose end is the chain's, as observeDelivered.
 func (g *Gateway) observeCardStop(rec *SessionRecord, taskID string, parts []lib.Part) {
-	part, ok := cardStopResultPart(parts)
+	res, ok := cardStopResultOf(parts)
 	if !ok {
 		return
 	}
@@ -2906,20 +2910,20 @@ func (g *Gateway) observeCardStop(rec *SessionRecord, taskID string, parts []lib
 	if !ends {
 		return
 	}
+	part, err := lib.CardStopPart(lib.CardStop{CardStopResult: res})
+	if err != nil {
+		return
+	}
 	if observer, ok := g.adapter.(CardStopObserver); ok {
-		observer.TaskCardStop(rec.Key, id, joinTextParts(parts), part)
+		observer.TaskCardStop(rec.Key, id, canceledCardStopText(res), part)
 	}
 }
 
-// cardStopResultPart is the data part among parts that holds the result
-// form of the cardStop part (cardStopResultOf), alone.
-func cardStopResultPart(parts []lib.Part) (lib.Part, bool) {
-	for _, p := range parts {
-		if _, ok := cardStopResultOf([]lib.Part{p}); ok {
-			return p, true
-		}
-	}
-	return lib.Part{}, false
+// canceledCardStopText is a canceled task's card-stop result as a door's
+// caller reads it: "canceled; " and the gateway's own reply for the result
+// (cardStopReply, titles cleaned as there).
+func canceledCardStopText(r *lib.CardStopResult) string {
+	return "canceled; " + cardStopReply(r, false)
 }
 
 // finalMessageText is the text of a folded task's terminal status message,
