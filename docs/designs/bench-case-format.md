@@ -81,7 +81,9 @@ It cancels the door task (`tasks/cancel`) once a card filed since the send is on
 task still works. No card within `deadline`, or a task that ends before any card, is
 infrastructure, not a pass. The next lane turns the door on for it, so an eval install runs with a
 door a default install doesn't have. The harness writes two entries for any of these cases, `harness_stop_sent` and `harness_cards_stopped`, and the case's
-`tool_called` objectives name them.
+`tool_called` objectives name them. When the door task ends canceled it writes a third,
+`harness_cancel_reported`: completed only when the canceled task carries a `cardStop` result whose
+stopped cards are exactly the cards the board shows archived (#5528).
 A first line of `[bench:reply-under-pushed-report]`, with `opening:`, `report:` and `reply:`
 lines under it, sends the opening as turn one, stores the report for the conversation in the
 agent pod with the row the kanban notifier writes for a card's report inviting a reply that it posted

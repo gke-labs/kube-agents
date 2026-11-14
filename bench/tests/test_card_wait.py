@@ -186,8 +186,9 @@ def test_a_jsonrpc_error_is_a_door_error(door_server):
 class _FakeDoor:
     """A door whose task reads ``states`` in order (the last repeats)."""
 
-    def __init__(self, states, cancel_error=None, after_cancel="canceled", send_errors=()):
+    def __init__(self, states, cancel_error=None, after_cancel="canceled", send_errors=(), canceled_artifacts=None):
         self.states = list(states)
+        self.canceled_artifacts = canceled_artifacts
         self.cancels = 0
         self.gets = 0
         self.sends = []
@@ -204,7 +205,10 @@ class _FakeDoor:
     def get(self, task_id):
         self.gets += 1
         state = self.states.pop(0) if len(self.states) > 1 else self.states[0]
-        return {"id": task_id, "status": {"state": state, "message": {"parts": [{"kind": "text", "text": "on it"}]}}}
+        task = {"id": task_id, "status": {"state": state, "message": {"parts": [{"kind": "text", "text": "on it"}]}}}
+        if state == "canceled" and self.canceled_artifacts is not None:
+            task["artifacts"] = self.canceled_artifacts
+        return task
 
     def cancel(self, task_id):
         self.cancels += 1
@@ -232,8 +236,9 @@ def card_wait(monkeypatch):
         lambda shell, sid, timeout, **kw: board.SessionCards(session_found=True, card_ids=["c-1"], cards={"c-1": {"status": "running"}}, source="state.db"),
     )
 
-    def run(states, sessions, *, prompt=None, cancel_error=None, after_cancel="canceled", send_errors=()):
-        door = _FakeDoor(states, cancel_error, after_cancel, send_errors)
+    def run(states, sessions, *, prompt=None, cancel_error=None, after_cancel="canceled", send_errors=(),
+            canceled_artifacts=None, statuses=None):
+        door = _FakeDoor(states, cancel_error, after_cancel, send_errors, canceled_artifacts)
         reads = list(sessions)
         monkeypatch.setattr(harness.a2a_door, "Door", lambda *a, **k: door)
         monkeypatch.setattr(
@@ -244,6 +249,7 @@ def card_wait(monkeypatch):
         def fake_stop(self, result, session_id, stop, *, send_stop, poll_interval):
             seen.update(session=session_id, sent=send_stop(), stop=stop)
             result.trajectory.append({"name": stop_hook.STOP_ENTRY, "status": "completed"})
+            result.metadata["stop_card_statuses"] = dict(statuses or {})
 
         monkeypatch.setattr(harness.KubeAgentsHarness, "_stop_after_first_card", fake_stop)
         got = harness.KubeAgentsHarness()._execute(prompt or f"{CW} deadline=60 observe=5\nscale it")
@@ -414,3 +420,57 @@ def test_the_scorers_door_entry_name_agrees_with_the_harness():
     assert scoring.A2A_DOOR_SEND_EVENT == harness._A2A_DOOR_SEND_ENTRY
     assert scoring.is_next_lane_record([{"name": harness._A2A_DOOR_SEND_ENTRY}])
     assert not scoring.is_inject_record([{"name": harness._A2A_DOOR_SEND_ENTRY}])
+
+
+def _card_stop_artifact(text, stopped_ids):
+    data = {"cardStop": {"v": 1, "stopped": [{"id": i, "title": "scale it"} for i in stopped_ids], "settled": []}}
+    return [{"artifactId": "t-1-result", "name": "result", "parts": [{"kind": "text", "text": text}, {"kind": "data", "data": data}]}]
+
+
+def _cancel_report(result):
+    return [e for e in result.trajectory if e["name"] == stop_hook.CANCEL_REPORTED_ENTRY]
+
+
+def test_a_canceled_task_that_reports_its_stopped_cards_passes(card_wait):
+    result, _, _ = card_wait(
+        ["working", "working"], [["a2a-ctx-bus"]],
+        canceled_artifacts=_card_stop_artifact("canceled; 🛑 stopped 1 card: scale it", ["c-1"]),
+        statuses={"c-1": "archived"},
+    )
+    (entry,) = _cancel_report(result)
+    assert entry["status"] == "completed", entry
+    assert entry["args"] == {"archived": ["c-1"], "stopped": ["c-1"]}
+
+
+def test_a_canceled_task_with_no_card_stop_result_fails(card_wait):
+    result, _, _ = card_wait(["working", "working"], [["a2a-ctx-bus"]], statuses={"c-1": "archived"})
+    (entry,) = _cancel_report(result)
+    assert entry["status"] == "error" and "no card-stop result" in entry["result"]
+
+
+@pytest.mark.parametrize("text,stopped,why", [
+    ("canceled; 🛑 stopped 1 card: scale it", ["c-2"], "the board shows archived"),
+    ("canceled; nothing is running", [], "the board shows archived"),
+    ("canceled", ["c-1"], "does not open"),
+])
+def test_a_card_stop_result_that_disagrees_with_the_board_fails(card_wait, text, stopped, why):
+    result, _, _ = card_wait(
+        ["working", "working"], [["a2a-ctx-bus"]],
+        canceled_artifacts=_card_stop_artifact(text, stopped),
+        statuses={"c-1": "archived"},
+    )
+    (entry,) = _cancel_report(result)
+    assert entry["status"] == "error" and why in entry["result"], entry
+
+
+def test_a_task_that_did_not_end_canceled_gets_no_cancel_report(card_wait):
+    result, _, _ = card_wait(["working", "working"], [["a2a-ctx-bus"]], after_cancel="completed")
+    assert not _cancel_report(result)
+
+
+def test_a_card_stop_request_is_not_a_result():
+    request = {"artifacts": [{"parts": [{"kind": "text", "text": "stop"}, {"kind": "data", "data": {"cardStop": {"v": 1}}}]}]}
+    assert a2a_door.card_stop_result(request) is None
+    other_version = {"artifacts": [{"parts": [{"kind": "data", "data": {"cardStop": {"v": 2, "stopped": []}}}]}]}
+    assert a2a_door.card_stop_result(other_version) is None
+

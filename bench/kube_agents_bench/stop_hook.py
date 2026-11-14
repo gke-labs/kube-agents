@@ -106,6 +106,14 @@ STOP_ENTRY = "harness_stop_sent"
 #: The trajectory entry for what the stop did: ``completed`` only when every
 #: card the session filed ended ``archived`` inside the window.
 CARDS_STOPPED_ENTRY = "harness_cards_stopped"
+#: For a card-wait stop through the A2A door, the trajectory entry for what
+#: the canceled task told its caller (#5528): ``completed`` only when the task
+#: ended canceled with a card-stop result whose stopped cards are exactly the
+#: cards the board shows archived, and its text says so.
+CANCEL_REPORTED_ENTRY = "harness_cancel_reported"
+#: How a canceled task's card-stop text opens on the A2A door, which writes
+#: it from the result (canceledCardStopText in a2a/gateway).
+CANCEL_REPORT_PREFIX = "canceled; "
 #: The board status a stopped card ends in.
 STOPPED_STATUS = "archived"
 

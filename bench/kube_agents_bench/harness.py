@@ -3063,6 +3063,33 @@ def _skip_report_only_judges() -> None:
     )
 
 
+def _cancel_report_entry(task: dict[str, Any], statuses: dict[str, str]) -> dict[str, Any]:
+    """:data:`stop_hook.CANCEL_REPORTED_ENTRY` for a canceled A2A door task
+    (#5528): ``completed`` when the task carries a card-stop result whose
+    stopped cards are exactly the cards the board showed archived after the
+    stop (``statuses``, as :meth:`KubeAgentsHarness._stop_after_first_card`
+    read them, before the harness archived any leftover) and whose text says
+    so; ``error`` with the reason otherwise, a terminal with no result first."""
+    archived = sorted(t for t, s in statuses.items() if s == stop_hook.STOPPED_STATUS)
+    found = a2a_door.card_stop_result(task)
+    if found is None:
+        why = "the canceled task carries no card-stop result"
+        return {"name": stop_hook.CANCEL_REPORTED_ENTRY, "args": {"archived": archived}, "status": "error", "result": why}
+    text, card_stop = found
+    stopped = sorted(str(c.get("id") or "") for c in card_stop.get("stopped") or [] if isinstance(c, dict))
+    problems = []
+    if not text.startswith(stop_hook.CANCEL_REPORT_PREFIX):
+        problems.append(f"its text does not open {stop_hook.CANCEL_REPORT_PREFIX.strip()!r}")
+    if stopped != archived:
+        problems.append(f"it names stopped card(s) {stopped}, the board shows archived {archived}")
+    return {
+        "name": stop_hook.CANCEL_REPORTED_ENTRY,
+        "args": {"archived": archived, "stopped": stopped},
+        "status": "error" if problems else "completed",
+        "result": "; ".join(problems) if problems else text,
+    }
+
+
 class KubeAgentsHarness(AgentHarness):
     """Drives the in-cluster platform agent over its HTTP endpoint.
 
@@ -3406,6 +3433,8 @@ class KubeAgentsHarness(AgentHarness):
 
             card_wait = stop_hook.Stop(prompt=stop.prompt, observe_seconds=stop.observe_seconds)
             self._stop_after_first_card(result, session, card_wait, send_stop=_send_stop, poll_interval=poll_interval)
+            if cancel[0] and final_state == a2a_door.STATE_CANCELED:
+                result.trajectory.append(_cancel_report_entry(final, result.metadata.get("stop_card_statuses") or {}))
         except _TransportError as exc:
             return _abandon(str(exc))
         return result

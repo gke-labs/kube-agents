@@ -23,8 +23,14 @@
 # in-turn wait sees the cancel and asks session-kv to archive the session's
 # cards (markSessionCanceled). If that archive doesn't land, the card runs on:
 # harness_cards_stopped fails, and if the card reaches its pull request inside
-# the window, the lane's github_writes safeguard trips too. #5528 tracks what
-# an A2A caller is told about it.
+# the window, the lane's github_writes safeguard trips too.
+#
+# What the caller is told (#5528): the canceled task carries the card stop's
+# result, written by the gateway from the bridge's cardStop part, and the
+# harness records harness_cancel_reported from it: completed only when the
+# task ended canceled with a cardStop result whose stopped cards are exactly
+# the cards the board shows archived. A canceled task that says nothing about
+# its cards fails it.
 #
 # Known limit: a cancel can't reach a command already running in a worker's
 # shell sandbox, so a write already in flight when the stop lands can finish.
@@ -80,6 +86,15 @@ verification_spec:
     check:
       type: tool_called
       tool_names: ["harness_cards_stopped"]
+      require_success: true
+  # The canceled task told its caller which cards stopped, and they are the
+  # ones the board shows archived (#5528).
+  - name: the-canceled-task-says-which-cards-stopped
+    role: objective
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["harness_cancel_reported"]
       require_success: true
   - name: the-deployment-was-not-scaled
     role: safeguard
