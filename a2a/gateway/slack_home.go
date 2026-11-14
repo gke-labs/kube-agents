@@ -98,6 +98,11 @@ const (
 	// slackHomePRLink is a pull request as mrkdwn: its URL, number and title.
 	slackHomePRLink = "<%s|#%d %s>"
 
+	// slackHomeUnlisted follows an unlisted row's name, which already says
+	// whether its clusters were not listed here or unread; what both kinds
+	// share is that nothing vouches for their health.
+	slackHomeUnlisted = "health unknown"
+
 	// slackHomeFeedbackWeek is the answer ratings line, over the last
 	// slackHomeFeedbackWindow, drawn when answer feedback is on.
 	slackHomeFeedbackWeek   = "This week: %d 👍, %d 👎"
@@ -492,20 +497,33 @@ func (s *SlackAdapter) homeBlocks(b *lib.Board, waiting []homeQuestion, now time
 	if b.Error != "" {
 		note(fmt.Sprintf(slackHomeBoardUnread, slackDate(now, slackDateTime)))
 	} else {
-		total := max(b.ClusterCount, len(b.Clusters))
+		// An unlisted row (lib.BoardCluster.Unlisted) stands for projects, not
+		// a cluster: the cap and both counts are clusters, and an unlisted row
+		// is drawn wherever it sits, so the cap never hides it.
+		real := 0
+		for _, c := range b.Clusters {
+			if !c.Unlisted {
+				real++
+			}
+		}
+		total := max(b.ClusterCount, real)
 		note(fmt.Sprintf(slackHomeClusterCount, total, plural(total)),
 			slackHomeUpdated+slackDate(b.GeneratedAt, slackDateTime))
 		if b.FirstReportPending && b.FirstMessagePending {
 			note(slackHomeFirstReport)
 		}
-		for i, c := range b.Clusters {
-			if i == slackHomeClustersMax {
-				break
+		drawn := 0
+		for _, c := range b.Clusters {
+			if !c.Unlisted {
+				if drawn == slackHomeClustersMax {
+					continue
+				}
+				drawn++
 			}
 			section(clusterLine(c, b.FirstReportPending), nil)
 		}
-		if shown := min(len(b.Clusters), slackHomeClustersMax); total > shown {
-			note(fmt.Sprintf(slackHomeMoreClusters, total-shown, plural(total-shown)))
+		if total > drawn {
+			note(fmt.Sprintf(slackHomeMoreClusters, total-drawn, plural(total-drawn)))
 		}
 	}
 
@@ -565,9 +583,13 @@ func (s *SlackAdapter) homeBlocks(b *lib.Board, waiting []homeQuestion, now time
 
 // clusterLine is one cluster: a dot for its worst open finding, its name,
 // that finding's title and how many more there are. Before the first report,
-// no finding means not checked yet, so it is not drawn green.
+// no finding means not checked yet, so it is not drawn green; nor is a row
+// for projects whose clusters the board holds no list for (Unlisted).
 func clusterLine(c lib.BoardCluster, firstReportPending bool) string {
 	name := "*" + slackEscaper.Replace(c.Name) + "*"
+	if c.Unlisted {
+		return slackHomeNeutral + " " + name + "  " + slackHomeUnlisted
+	}
 	if c.Findings == 0 && firstReportPending {
 		return slackHomeNeutral + " " + name + "  " + slackHomeNotYet
 	}

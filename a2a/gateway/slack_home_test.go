@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -262,6 +263,28 @@ func TestSlackHomeCountsTheWholeFleetPastTheCap(t *testing.T) {
 	}
 }
 
+// Unlisted rows (#3658) are not clusters: the cap counts real rows only, so
+// an unlisted row is drawn whatever the findings rows ahead of it, and the
+// count and "N more" are clusters, never placeholders.
+func TestSlackHomeTheCapNeverHidesAnUnlistedRow(t *testing.T) {
+	b := &lib.Board{GeneratedAt: homeNow, ClusterCount: 16}
+	for i := 0; i < slackHomeClustersMax; i++ {
+		b.Clusters = append(b.Clusters, lib.BoardCluster{Name: fmt.Sprintf("hot-%02d", i), Findings: 1, Severity: "major", Top: "t"})
+	}
+	b.Clusters = append(b.Clusters, lib.BoardCluster{Name: "member-b (clusters unread)", Unlisted: true})
+	a, api, _ := homeAdapter(t, b, nil)
+	a.homeOpened(&slackevents.AppHomeOpenedEvent{User: "U1", Tab: "home"})
+	got := viewText(t, api.views[0].view)
+	for _, want := range []string{"context: 16 clusters ·", "*member-b (clusters unread)*  " + slackHomeUnlisted, "context: 1 more cluster\n"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("view lacks %q; got:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "17 clusters") {
+		t.Errorf("a placeholder was counted as a cluster; got:\n%s", got)
+	}
+}
+
 // Under allow-all, a users.info failure decides nothing: the tab is left as
 // it was, never told it is not allowed; and a republish to a member who was
 // admitted when they opened it asks users.info nothing again.
@@ -346,6 +369,27 @@ func TestSlackHomeBeforeTheFirstReportIsNotAHealthyFleet(t *testing.T) {
 				t.Errorf("a cluster with findings lost its dot; got:\n%s", got)
 			}
 		})
+	}
+}
+
+func TestSlackHomeAnUnlistedRowIsNeverDrawnHealthy(t *testing.T) {
+	// A row for projects whose clusters the board holds no list for (#3658,
+	// spec.mode: next) has no findings because nobody read it: never green,
+	// before or after the first report. A real clean cluster stays green.
+	for _, pending := range []bool{false, true} {
+		for _, name := range []string{"mgmt (clusters not listed here)", "member-b (clusters unread)"} {
+			line := clusterLine(lib.BoardCluster{Name: name, Unlisted: true}, pending)
+			if strings.Contains(line, slackHomeHealthy) || strings.Contains(line, slackHomeNoFindings) {
+				t.Errorf("unlisted row drawn healthy (pending=%v): %q", pending, line)
+			}
+			want := slackHomeNeutral + " *" + slackEscaper.Replace(name) + "*  " + slackHomeUnlisted
+			if line != want {
+				t.Errorf("clusterLine = %q, want %q", line, want)
+			}
+		}
+	}
+	if got, want := clusterLine(lib.BoardCluster{Name: "web"}, false), slackHomeHealthy+" *web*  "+slackHomeNoFindings; got != want {
+		t.Errorf("a clean cluster = %q, want %q", got, want)
 	}
 }
 

@@ -2547,7 +2547,10 @@ with `views.publish`: a dashboard of five panels, with no model in the loop (`sl
 Running, Recent pull requests and Last audit are one board snapshot, read over the board route: the
 gateway publishes an empty request on `chat.board` with its reply under `chat.board.reply.gateway.`,
 and the Hermes bridge answers with session-kv's `GET /v1/board` (`agents/platform/scripts/board_snapshot.py`):
-every Cluster Agent profile's cluster and any cluster a finding names, with the findings queue's open findings for each, the worst 15 listed beside the total, the running
+every Cluster Agent profile's cluster and any cluster a finding names (under `spec.mode: next`, the resolved scope's clusters instead, read through
+`fleet_scope_targets.list_scope_clusters` with no profile read, #3658), with the findings queue's open findings for each, the worst 15 listed beside the total; under `next`,
+one `unlisted` row per kind for the projects the scope holds no cluster list for (`(clusters not listed here)` for the projects listed live,
+`(clusters unread)` for the unread ones), which the cap and the total leave out and the tab draws as `⚪ health unknown`, never green; the running
 kanban cards, the newest `pr_opened` events, and the newest finished fleet-audit run from the report
 store; and `first_report_pending` while onboarding has filed its sweep, its first report is not out
 (the findings nudge's own marker pair, `findings_nudge.first_report_markers`: the delivery claim, or

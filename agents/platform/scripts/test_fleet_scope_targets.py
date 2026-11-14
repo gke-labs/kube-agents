@@ -705,5 +705,51 @@ class NoCallerWalksProfilesTest(unittest.TestCase):
         reader = (pathlib.Path(__file__).resolve().parent / "fleet_scope_targets.py").read_text(encoding="utf-8")
         self.assertEqual([f.split(":")[0] for f in self.walking_functions(reader)], ["profile_identities"])
 
+    def test_the_board_reads_no_cluster_profile_under_next(self):
+        # #3658: the Home tab's board still reads the profiles outside next (its
+        # today path is unchanged, so the static check above does not hold it);
+        # under next it neither lists the profiles directory nor reads a
+        # Cluster Agent profile.
+        import sqlite3
+        from datetime import datetime, timezone
+
+        import board_snapshot
+        import findings_queue
+        import scope_publisher
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        home = pathlib.Path(tmp.name)
+        profiles = home / "profiles"
+        ghost = profiles / "cluster-ghost-proj-ghost-us-east1"
+        ghost.mkdir(parents=True)
+        (ghost / "config.yaml").write_text(_identity_config("ghost-proj", "ghost", "us-east1"), encoding="utf-8")
+        render = {"present": True, "projects": [], "folders": ["1"]}
+        (home / "scope.json").write_text(json.dumps(render), encoding="utf-8")
+        document = _resolved([("member-a", "ok")], clusters={"member-a": {"at": "2026-11-10T12:00:00Z", "clusters": [["us-central1", "web"]]}})
+        document["memberHash"] = scope_publisher.member_hash(render)
+        (home / "resolved-scope.json").write_text(json.dumps(document), encoding="utf-8")
+        env = mock.patch.dict(os.environ, {fst.SCOPE_FILE_ENV: str(home / "scope.json"),
+                                           fst.RESOLVED_SCOPE_FILE_ENV: str(home / "resolved-scope.json"),
+                                           "GCP_PROJECT_ID": "mgmt"})
+        env.start()
+        self.addCleanup(env.stop)
+
+        real_iterdir = pathlib.Path.iterdir
+
+        def no_profiles_walk(path):
+            if path.name == "profiles":
+                raise AssertionError(f"listed {path}")
+            return real_iterdir(path)
+
+        session = sqlite3.connect(":memory:")
+        findings_queue.init_findings_schema(session)
+        with mock.patch.object(pathlib.Path, "iterdir", autospec=True, side_effect=no_profiles_walk), \
+                mock.patch.object(fst, "profile_identities", side_effect=AssertionError("read a Cluster Agent profile")):
+            board = board_snapshot.snapshot(session, None, datetime.now(timezone.utc), profiles, lambda: None)
+        self.assertIn("web", [row["name"] for row in board["clusters"]])
+        self.assertNotIn("ghost", json.dumps(board))
+
+
 if __name__ == "__main__":
     unittest.main()
