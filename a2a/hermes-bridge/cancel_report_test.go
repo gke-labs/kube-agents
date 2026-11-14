@@ -79,8 +79,11 @@ c.commit()
 	c := gatewayClient(t, url)
 	taskID := "task-report-" + name
 	origin := submitFromEnv(t, c, taskID, contextID, conversation, "scale checkout-gateway to 4")
+	// runTaskAPI counts a wait for the whole turn before the turn runs; the
+	// in-turn card wait (waitForKanbanCards) is the second. A cancel sent at
+	// the first lands mid-turn, before the card wait this tests.
 	waitFor(t, 10*time.Second, "the turn to hold for its card", func() bool {
-		return b.hasActiveKanbanWait(sessionID)
+		return inCardWait(b, sessionID)
 	})
 	return &cardWaitTurn{c: c, b: b, stop: stop, store: store, taskID: taskID, sessionID: sessionID, origin: origin}
 }
@@ -240,4 +243,12 @@ func TestMarkRunCanceled_PostsOncePerRunNotOncePerSession(t *testing.T) {
 	if n := len(store.seen()); n != 2 {
 		t.Errorf("card stop POSTs = %d, want one per run (2)", n)
 	}
+}
+
+// inCardWait reports whether the session's turn has reached its in-turn card
+// wait: both runTaskAPI's wait and waitForKanbanCards' are counted.
+func inCardWait(b *Bridge, sessionID string) bool {
+	b.kanban.mu.Lock()
+	defer b.kanban.mu.Unlock()
+	return b.kanban.activeWaits[sessionID] >= 2
 }

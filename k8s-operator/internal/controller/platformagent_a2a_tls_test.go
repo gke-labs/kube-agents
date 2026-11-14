@@ -300,8 +300,11 @@ func TestTheBusServesTLSFromTheMountedPair(t *testing.T) {
 			t.Errorf("nats.conf lacks %q", want)
 		}
 	}
-	if strings.Contains(conf, "verify: true") {
-		t.Error("nats.conf requires client certificates; mTLS is not part of this render")
+	// The client listener does not ask clients for a certificate. The one
+	// verify: true in the render is the cluster block's, between the bus's
+	// own servers (TestTheRenderedClusterFormsOverVerifiedRoutes).
+	if strings.Contains(a2aClusterBlockRe.ReplaceAllString(conf, ""), "verify: true") {
+		t.Error("nats.conf requires client certificates of clients; mTLS is not part of the client listener")
 	}
 
 	sts := buildA2ANATSStatefulSet(agent, "hash")

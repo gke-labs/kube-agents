@@ -1,0 +1,28 @@
+# The Slack lane's canaries (hack/slack-lane/run.sh): three cases, one for each
+# thing only real Slack shows. Each runs once through Slack (AGENT_TRANSPORT=slack);
+# the case grades the first turn as it does on inject, where it keeps its own
+# nightly record, and the lane adds Slack's own timings. Advisory: the lane gates
+# nothing.
+#
+# "<case id>" runs one turn. "<case id> then: <reply>" sends <reply> in the
+# thread once the first turn settles and records how that second turn went
+# (slack_then_* in the case's slack-timing.json). The case grades the first
+# turn's reply, but its checks run after the second turn, so a safeguard sees
+# anything the second turn changed. A question is answered by typing: Slack's
+# Web API cannot press a button. One case per line; blank lines and # comments
+# are ignored, and a reply may hold a "#".
+#
+# A case that checks a worker's tool calls cannot pass here (the transport
+# records no trajectory).
+
+# An ask gets the arrival reaction, and the answer opens on the answer.
+chat-voice-answer-first
+
+# A question with choice buttons pauses the work, and a typed answer continues
+# it. The answer declines every fix, so the continued card has nothing to change;
+# a card that changed the planted workload anyway would fail the case's
+# catastrophic safeguard, which is how the lane would show it.
+chat-question-asked-to-choose-pauses then: none of those for now, leave it as it is
+
+# A follow-up in the same thread is answered in that thread.
+chat-voice-capabilities-names-cluster-agents then: which of those can change a deployment?

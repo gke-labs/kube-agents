@@ -86,6 +86,7 @@ func publishTerminal(t *testing.T, r *rig, origin *lib.Envelope, party lib.Party
 // line the gateway logged a task going out and nothing about how it ended
 // (#2406).
 func TestTaskTerminalLogsOneLinePerTerminal(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name       string
 		state      lib.TaskState
@@ -162,6 +163,7 @@ func TestTaskTerminalLogsOneLinePerTerminal(t *testing.T) {
 // and the detail (the bridge puts subprocess output there) must not reach
 // the log at all.
 func TestTaskTerminalLogKeepsOnlyASafeReasonToken(t *testing.T) {
+	t.Parallel()
 	logs := &syncBuffer{}
 	r := startRigWithLogger(t, nil, slog.New(slog.NewJSONHandler(logs, nil)))
 	conv := "discord:g1/thread-terminal-log-forged"
@@ -174,14 +176,22 @@ func TestTaskTerminalLogKeepsOnlyASafeReasonToken(t *testing.T) {
 	const forged = "reason: spawn-failed\n{\"level\":\"INFO\",\"msg\":\"task terminal\",\"state\":\"completed\"} - stderr tail: API_TOKEN=sk-live-0123456789"
 	publishTerminal(t, r, origin, lib.Party{Session: "platform"}, lib.TaskEventsSubject("platform", origin.TaskID), lib.StateFailed, forged)
 
+	// The chat reads the token's plain sentence, and the detail, with the
+	// credential the bridge put in a stderr tail, never reaches the room
+	// (reasonInPlainWords).
 	waitFor(t, "the forged failure posts to chat", func() bool {
 		for _, p := range r.adapter.postTexts() {
-			if strings.Contains(p, "sk-live") {
+			if p == noticeFailed+noticeDetailSeparator+reasonSentences["spawn-failed"] {
 				return true
 			}
 		}
 		return false
 	})
+	for _, p := range r.adapter.postTexts() {
+		if strings.Contains(p, "sk-live") {
+			t.Fatalf("the forged detail reached chat: %q", p)
+		}
+	}
 	waitFor(t, "the terminal log line", func() bool { return len(logRecords(t, logs, "task terminal")) > 0 })
 	holdsAt(t, "task terminal lines", 1, func() int { return len(logRecords(t, logs, "task terminal")) })
 
@@ -226,6 +236,7 @@ func TestReasonToken(t *testing.T) {
 // record points somewhere else while the delegated task is still running, and
 // its terminal must still join its ingress line.
 func TestTaskTerminalLogNamesTheTasksOwnAddressee(t *testing.T) {
+	t.Parallel()
 	logs := &syncBuffer{}
 	r := startRigWithLogger(t, nil, slog.New(slog.NewJSONHandler(logs, nil)))
 	conv := "discord:g1/thread-terminal-log-rehomed"
@@ -330,6 +341,7 @@ func assertTerminalLine(t *testing.T, line map[string]any, want map[string]any) 
 // next turn finds it and delivers it. One line, with the fold's state,
 // whose word it was, and the reason token from the final message.
 func TestTaskTerminalLogCoversTheStaleTaskHeal(t *testing.T) {
+	t.Parallel()
 	logs := &syncBuffer{}
 	r := startRigWithLogger(t, nil, slog.New(slog.NewJSONHandler(logs, nil)))
 	conv := "discord:g1/thread-terminal-log-stale-heal"
@@ -406,6 +418,7 @@ func TestTaskTerminalLogCoversTheNeverStartedHeal(t *testing.T) {
 // The publish failure: the task was announced and never reached the bus.
 // Its ingress line is already written, so the line is its only outcome.
 func TestTaskTerminalLogCoversThePublishFailure(t *testing.T) {
+	t.Parallel()
 	logs := &syncBuffer{}
 	r := startRigWithLogger(t, nil, slog.New(slog.NewJSONHandler(logs, nil)))
 	deleteTasksStream(t, r.url)
@@ -469,6 +482,7 @@ func textLogLines(logs *lockedBuffer, msg string, kv ...string) []string {
 // hear of the chain only by its root (observedAs), so a join of "ingress"
 // to "task terminal" on taskId finds an outcome for every one.
 func TestTaskTerminalLogCoversEachTaskOfADelegationChain(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	conv := "discord:g1/t-terminal-log-chain"
 	origin, session, child := delegated(t, r, spawn, conv, "")
@@ -515,6 +529,7 @@ func TestTaskTerminalLogCoversEachTaskOfADelegationChain(t *testing.T) {
 // and on the stale heal's, or a count of terminals by state calls every
 // refused turn a success (#2410 review).
 func TestTaskTerminalLogReportsAHandOffsEnd(t *testing.T) {
+	t.Parallel()
 	refuse := func(t *testing.T) func(*Config) {
 		return func(c *Config) {
 			armInjectMap(t, c)

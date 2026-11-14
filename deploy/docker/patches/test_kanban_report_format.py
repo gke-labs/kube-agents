@@ -231,6 +231,40 @@ class StanzaTest(unittest.TestCase):
         self.assertIn("=== Title ===", REPORT_FORMAT_STANZA)
         self.assertIn("pipe table", REPORT_FORMAT_STANZA)
 
+    def test_a_yes_or_no_answer_carries_no_claims_unless_the_card_asks(self):
+        # The same condition as verified_claims' tool description; a why-question keeps its claims.
+        flat = " ".join(REPORT_FORMAT_STANZA.split())
+        self.assertIn("On a yes-or-no question or a status check, leave `verified_claims` empty", flat)
+        self.assertIn("unless the card asks for verified claims", flat)
+
+    def test_whether_or_why_decides_not_how_the_card_ends(self):
+        # A status card ending "Report the findings." drew claims and a Sources list; no closing earns them.
+        flat = " ".join(REPORT_FORMAT_STANZA.split())
+        self.assertIn(
+            "Decide by what the card asks: whether something is true (a yes-or-no or status question) gets the "
+            "answer, with no claims, sections or Sources list unless the card asks for them; why something broke "
+            "gets the report. A closing "
+            "request to report or summarize never turns a question into a report.",
+            flat,
+        )
+        self.assertNotIn("even when it ends", flat)
+        # A root-cause card ending "Report the findings." keeps its sections.
+        self.assertIn("on a yes-or-no or status card, a closing request to report or summarize is not that ask", flat)
+
+    def test_a_propose_only_line_does_not_turn_a_question_into_a_report(self):
+        # The Platform ends every no-change card with this line; on a status card it drew a Sources list.
+        flat = " ".join(REPORT_FORMAT_STANZA.split())
+        self.assertIn(
+            'Neither does a closing line that starts "Propose only", however it is worded: it '
+            "only rules out opening a pull request or making the change, and never turns a question into a "
+            "request for a fix, a report, "
+            "claims or a Sources list, so a yes-or-no or status card that carries it still gets the short answer.",
+            flat,
+        )
+        self.assertIn('summarize is not that ask, and neither is a line that starts "Propose only".', flat)
+        # The Platform rewords the line ("put the findings in the result"); quoting one wording would miss it.
+        self.assertNotIn("put the fix in result", flat)
+
     def test_the_question_budget_is_the_cases(self):
         """The stanza's question rule and ``chat-voice-answer-first`` name one budget.
 
@@ -254,7 +288,7 @@ class StanzaTest(unittest.TestCase):
             f"{max_chars} characters in all",
             bullet,
         )
-        self.assertIn("A report stays under 2,000 characters", REPORT_FORMAT_STANZA)
+        self.assertIn("Keep a report under 2,000 characters where the findings allow", " ".join(REPORT_FORMAT_STANZA.split()))
 
     def test_the_stanza_itself_is_clean(self):
         """Self-consistency: the instructions must not violate their own rules."""

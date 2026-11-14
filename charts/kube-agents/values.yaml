@@ -170,6 +170,29 @@ operator:
   # "MCP server" reference page.
   mcpServer:
     enabled: false
+  # The AgentProfile dispatcher (<agent>-a2a-dispatcher), which offers each
+  # profile task to a worker in the profile's warm pool, or runs an unattended
+  # one as a Job. Rendered beside every platformAgent.mode: next PlatformAgent
+  # the operator manages; under "today" the operator renders nothing for it.
+  # false sets A2A_PROFILE_DISPATCHER=false on the controller manager, which
+  # removes the dispatcher's Deployment and its bus principal, so AgentProfiles
+  # then publish cards that nothing dispatches. An A2A_PROFILE_DISPATCHER entry
+  # in extraEnv wins. Its image is the release set's a2a-dispatcher, with
+  # A2A_DISPATCHER_IMAGE (in extraEnv) the override. It has a ceiling of about
+  # 200 AgentProfiles that allow unattended under Job mode, about 650 at two
+  # tiers otherwise: the operator binds them oldest first while the
+  # dispatcher's identity and config fit, leaves newer ones unbound, and says
+  # so in the PlatformAgent's DispatcherCeiling condition.
+  profileDispatcher:
+    enabled: true
+  # Slack member ids of end-to-end test users, meant for CI and eval installs;
+  # integration.slack.allowedUsers is still the gate on who is served.
+  # A post such a user makes with a user token through an app carries the
+  # app's bot_id, which the A2A gateway otherwise drops as bot traffic; from a
+  # listed member it is read as theirs. The allowlist still has to admit them.
+  # Rendered as the operator's A2A_SLACK_TEST_USERS, which it hands the
+  # gateway; an A2A_SLACK_TEST_USERS entry in extraEnv wins.
+  slackTestUsers: []
   # The manager's own metrics listener, port 8080, plain HTTP on the pod
   # network: controller-runtime's series plus the operator's view of every
   # PlatformAgent, status.usage and status.phase as three gauge families
@@ -239,8 +262,8 @@ operator:
   # were. What stays: Deployments, StatefulSets,
   # Services, ServiceAccounts, ConfigMaps, PersistentVolumeClaims,
   # NetworkPolicies and PodDisruptionBudgets; ClusterRoles,
-  # ClusterRoleBindings, Roles and RoleBindings; and the three custom
-  # resources themselves (PlatformAgent always, AgentPlugin and AgentProfile
+  # ClusterRoleBindings, Roles and RoleBindings; and the custom resources
+  # themselves (PlatformAgent always, AgentPlugin, AgentProfile and Tier
   # where their CRDs are installed). Deployments, StatefulSets, Services and
   # PersistentVolumeClaims grow with the cluster's workloads, a Deployment
   # carrying a whole pod template, so a cluster with thousands of them is the
@@ -376,6 +399,8 @@ litellm:
   # 3.x model a value also replaces the thinking key the chart renders there
   # to get Gemini's thoughts back ("Gemini's thoughts" on the same page); both
   # ask for them. Chart-only; the kustomize dev base carries no such key.
+  # A vLLM server passes it to the model's chat template as written;
+  # the template decides what each level means (site: inference-gateway page).
   reasoningEffort: ""
   # Renders litellm_settings.drop_params: true (also enabled automatically when
   # fallback.reasoningEffort is set), so a parameter the
@@ -536,7 +561,7 @@ litellm:
     # copies: a chart pinned to a version the mirror was never populated with
     # is an ImagePullBackOff. This pin sat a release behind the kustomize base
     # for exactly that reason.
-    tag: v1.106.0
+    tag: v1.108.6
     pullPolicy: IfNotPresent
   replicaCount: 2
   # Rollout strategy — the canonical home for this argument. The chart template
@@ -779,7 +804,7 @@ hindsight:
     # tag, because that is what mirror-images pushes.
     image:
       repository: ghcr.io/vectorize-io/hindsight-api
-      tag: "0.10.2@sha256:1ba631f950a04460feff6b1e212bad3cdf127b0cfb3d765bdcba12f512481d7b"
+      tag: "0.10.3@sha256:f80f304db313cbc8775acd601fda7d094f5854ebf9bc252d8134eb9276d56b40"
       pullPolicy: IfNotPresent
     # Rollout strategy for the hindsight-api Deployment.
     #
@@ -849,7 +874,7 @@ hindsight:
     # this tag — the pg15 line among them. Read them there before changing it.
     image:
       repository: docker.io/pgvector/pgvector
-      tag: "0.8.6-pg15@sha256:a947c45cdc5906a1bc951f20a8709e321256343ee0f251e4ae00b5e7def4e6da"
+      tag: "0.8.7-pg15@sha256:88164492558c9773a1e17a8305abaca7863e05b3d8bbcdb792774890a2047e06"
       pullPolicy: IfNotPresent
     # Ephemeral storage is the run and tmp emptyDirs' sizeLimits (64Mi and 1Gi,
     # templates/hindsight.yaml) plus 64Mi for the container's logs; the limit
@@ -902,8 +927,10 @@ githubMinter:
   # empty, that Secret must already exist in the release namespace.
   appId: ""
   # KSA/GSA pair for Workload Identity; defaults mirror
-  # terraform/modules/kube-agents-iam, so the binding it creates targets the
-  # KSA the chart renders.
+  # terraform/modules/github-minter, so the binding it creates targets the KSA
+  # the chart renders. The full-install composition sets both from the same
+  # inputs as that module (ksaName from github_minter_ksa_name, which install.sh
+  # makes <cluster>-github-minter on a new install).
   ksaName: kubeagents-github-minter
   gsaName: kubeagents-github-minter-gsa
   # The GSA email allowed to request tokens from any of the three scopes in
@@ -963,15 +990,16 @@ githubMinter:
 fluentBit:
   image:
     repository: docker.io/fluent/fluent-bit
-    tag: "5.1.2"
+    tag: "5.1.5"
 
 # The shell sandbox StatefulSet the operator renders beside every agent pod.
 # Same shape as fluentBit above and for the same reason: the chart never renders
 # the workload itself, it passes the reference to the operator as
 # AGENT_SANDBOX_IMAGE, but the pin has to live somewhere the mirror can be
 # pointed at. Unlike the credential broker — which the operator derives from the
-# agent image by swapping the trailing name — the sandbox is a separate
-# repository built from deploy/sandbox, so it has to be named.
+# agent image by swapping the trailing name — the sandbox is not derived from the
+# agent image, so it is named here, and this value wins over the operator's own
+# derivation from OPERATOR_IMAGE.
 agentSandbox:
   image:
     repository: ghcr.io/gke-labs/kube-agents/agent-sandbox
@@ -1002,7 +1030,8 @@ platformAgent:
   storage:
     # The PlatformAgent's spec.storage.size: the request of the agent's
     # <name>-data claim and of the shell sandbox's data claim. The operator
-    # requests the same size for both. null, the default, leaves the field out
+    # requests the same size for both, and raises the agent's alone for
+    # expectedClusterProfiles below. null, the default, leaves the field out
     # of the CR, and the operator default applies (50Gi). Raising it expands both
     # existing claims online where their StorageClass sets allowVolumeExpansion.
     # Where it does not, the claims keep their size and the CR's
@@ -1015,6 +1044,16 @@ platformAgent:
     # counts it so. A Kubernetes quantity above zero and at most 64Ti, the
     # largest persistent disk, for example 80Gi.
     size: null
+    # The PlatformAgent's spec.storage.expectedClusterProfiles: how many Cluster
+    # Agent profiles the install is expected to hold, one per cluster in scope.
+    # It raises the agent's own data claim (not the sandbox's) to at least
+    # 8Gi + 400Mi per profile, rounded up to whole GiB, the size Hermes' session
+    # stores settle at under the default 90-day retention. The claim
+    # takes the larger of that and size (or the 50Gi default), so this only
+    # raises it, and the formula passes 50Gi above 107 profiles. Raising it
+    # expands the existing claim online where its StorageClass allows. null, the
+    # default, renders no field. An integer from 1 to 20000.
+    expectedClusterProfiles: null
   # Annotations to add to the PlatformAgent custom resource metadata. The
   # operator reads its kubeagents.x-k8s.io/* keys from here (chart README,
   # "PlatformAgent annotations"). Four of them the chart also derives from
@@ -1091,6 +1130,9 @@ platformAgent:
       brokerFailureRatio: 0.15
       brokerFailureMinCalls: 10
       backgroundTasksGaveUp7d: 3
+      # How long the A2A gateway's Slack connection reads down before the
+      # alert fires; spec.mode next with Slack only.
+      slackDisconnectedFor: 5m
       # Friction
       stalledOnboardingDays: 5
       stalledOnboardingSilentDays: 30
@@ -1281,6 +1323,13 @@ platformAgent:
       # maxSessions caps the A2A session pods a "next" install runs at once;
       # the operator's default applies when it is unset, and "today" ignores it.
       # maxSessions: 10
+      # busReplicas is how many NATS servers run a "next" install's bus: 3 runs a
+      # cluster with R3 streams that rides out a node drain, 1 a single server
+      # that is down for each pod restart. A cluster needs three nodes; set 1 on a
+      # cluster that cannot have them (kind, a one-node Standard pool), before the
+      # first install: an existing bus keeps its count, and a different value is
+      # refused rather than converting it.
+      # busReplicas: 3
       # admission is the memory admission the kanban dispatcher applies to its
       # own workers, board-wide: past the budget it refuses a card rather than
       # spawn a worker, blocking the card with kind "capacity" and telling its
@@ -1570,7 +1619,7 @@ platformAgent:
     # images.json like every other third-party image.
     image:
       repository: docker.io/alpine/k8s
-      tag: "1.36.5"
+      tag: "1.36.6"
     # How long to wait for AgentProfile finalizers to clear before deleting
     # the PlatformAgent CR.
     agentProfileTimeout: 30s
@@ -1801,10 +1850,8 @@ platformAgent:
     #
     # forges:
     #   - name: github            # what repositories[].forge refers to
-    #     provider: github        # github (default), gitlab, or gitea; required when host is not github.com
-    #                             # (bitbucket and bitbucket-datacenter forges are declared on the
-    #                             # PlatformAgent resource's spec.integration.forges; the chart does
-    #                             # not render them yet)
+    #     provider: github        # github (default), gitlab, gitea, bitbucket (Cloud) or
+    #                             # bitbucket-datacenter; required when host is not github.com
     #     host: ""                # empty is the provider's default (github.com), or a GitHub Enterprise
     #                             # Server hostname; required for gitea, which has none
     #     scheme: https           # https (default); http only for gitea on an
@@ -1824,6 +1871,22 @@ platformAgent:
     #       key: ca.crt           # created out of band; the broker trusts it for this host only. On a
     #                             # GitHub Enterprise Server forge, the token minter also gets it and trusts
     #                             # it for all of its calls
+    #   - name: bitbucket
+    #     provider: bitbucket     # Bitbucket Cloud, at bitbucket.org only: no host, port or caBundleRef
+    #     namespace: my-workspace # the workspace ID
+    #     credentialsRef:         # required: a Secret with the token under `token`, and an optional
+    #       name: bitbucket-forge-token # read-only token for context repositories under `read-token`
+    #     identity: ""            # only for a workspace, project or repository access token: the
+    #                             # account UUID that token acts as, from the author of a pull
+    #                             # request it opened. An API token names its own account
+    #   - name: bitbucket-dc
+    #     provider: bitbucket-datacenter
+    #     host: bitbucket.example.com # required; served at the root path on port 443
+    #     namespace: INFRA        # the project key
+    #     credentialsRef:         # required: a Secret with a project HTTP access token under `token`
+    #       name: bitbucket-dc-token
+    #     caBundleRef:            # optional: the private CA that signed the instance's certificate
+    #       name: bitbucket-dc-ca
     forges: []
     # repositories:
     #   - forge: github
@@ -1975,12 +2038,15 @@ webConsole:
   enabled: false
   # GET /api/environment and PlatformAgent state: versions, install and
   # last-rollout dates, and counts of nodes, namespaces, pods and controllers
-  # for feedback reports, plus reading and patching the PlatformAgent resource
-  # for repository topology, preferred model annotations, and applied PR
-  # annotations. Needs a service account with list on those kinds and get/patch
-  # on the PlatformAgent, which the chart creates. The console discards the
-  # listed items; the only names GET /api/environment returns are the
-  # kube-agents Helm release, its namespace and the owning Argo CD Application.
+  # for feedback reports, the PlatformAgent's status.usage block (counters,
+  # top tools and token totals, for the feedback attachment and the banner's
+  # since-install figures), plus reading and patching the PlatformAgent
+  # resource for repository topology, preferred model annotations, and applied
+  # PR annotations. Needs a service account with list on those kinds and
+  # get/patch on the PlatformAgent, which the chart creates. The console
+  # discards the listed items; the only names GET /api/environment returns are
+  # the kube-agents Helm release, its namespace and the owning Argo CD
+  # Application.
   environment:
     enabled: true
   # "Polish with Gemini" in the feedback form: POST /api/assist sends the
@@ -2062,9 +2128,12 @@ profiles:
       skills, returning either a grounded Root Cause Analysis with a proposed
       GitOps fix or a redacted Google Cloud Support Escalation Bundle.
     persona:
-      # Placeholder image reference required by the AgentProfile CRD schema;
-      # today the gateway scaffolds `tse` from `/opt/tse-template` in the
-      # platform-agent image until the per-profile Job dispatcher lands.
+      # Placeholder image reference required by the AgentProfile CRD schema:
+      # tse has no persona image of its own yet (#3842). On a next install the
+      # profile dispatcher (on by default) gives every bound profile a warm
+      # worker, and tse's crash-loops at its persona step until #3842 ships
+      # one; Kanban to tse still works. Leave tse off there, or switch the
+      # dispatcher off (operator.profileDispatcher.enabled: false).
       image:
         repository: ghcr.io/gke-labs/kube-agents/platform-agent
         tag: "" # defaults to platformAgent.deployment.image.tag or Chart.appVersion
@@ -2092,8 +2161,8 @@ profiles:
         memory: 2Gi
   # The generic cluster agent (#3658): a read-only SRE for one GKE cluster,
   # which each task names by its project, location and cluster parameters
-  # (`agents/cluster/persona`). Its workers come from the profile dispatcher, so
-  # no pod runs it until the operator runs one. The credential broker holds each
+  # (`agents/cluster/persona`). Its workers come from the profile dispatcher,
+  # which runs by default. The credential broker holds each
   # task's kubectl and gcloud calls to the task's target.
   cluster:
     enabled: false

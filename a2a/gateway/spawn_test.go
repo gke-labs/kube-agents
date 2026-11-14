@@ -2,8 +2,13 @@ package gateway
 
 import (
 	"context"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"log/slog"
 	"path"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -52,6 +57,86 @@ func TestSpawnSetsPodDeadlineMirroringTheAdapters(t *testing.T) {
 	if found != "900" {
 		t.Fatalf("worker env A2A_TASK_DEADLINE_SECONDS = %q, want 900 (the same number the pod deadline is sized from)", found)
 	}
+}
+
+// TestSpawnedSessionPodsSetNdots3: a session pod dials the broker and the
+// kube-api proxy by their 4-dot service names, so it lowers ndots to 3 and
+// the names are asked as written first (#5590). Only ndots changes: the DNS
+// policy stays ClusterFirst, with the cluster's nameservers and search list.
+func TestSpawnedSessionPodsSetNdots3(t *testing.T) {
+	cs := k8sfake.NewSimpleClientset()
+	cfg := &Config{Namespace: "test-ns", WorkerImage: "img", SessionServiceAccount: "agent-a2a-session",
+		TaskDeadline: 15 * time.Minute}
+	s := &podSpawner{cfg: cfg, client: cs, log: slog.Default()}
+	rec := &SessionRecord{Key: "discord:g1/t", ContextID: "ctx-1", BusSession: "chat-otter-abcd", Addressee: "chat-otter-abcd"}
+	if _, err := s.Spawn(context.Background(), rec, "task-1", "", 1); err != nil {
+		t.Fatal(err)
+	}
+	pod, err := cs.CoreV1().Pods("test-ns").Get(context.Background(), "chat-otter-abcd", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pod.Spec.DNSPolicy != "" && pod.Spec.DNSPolicy != corev1.DNSClusterFirst {
+		t.Errorf("dnsPolicy %q, want the default ClusterFirst", pod.Spec.DNSPolicy)
+	}
+	dns := pod.Spec.DNSConfig
+	if dns == nil {
+		t.Fatal("session pod has no dnsConfig, so the resolver keeps ndots:5")
+	}
+	if len(dns.Nameservers) != 0 || len(dns.Searches) != 0 {
+		t.Errorf("dnsConfig adds nameservers %v or searches %v; it should change only ndots", dns.Nameservers, dns.Searches)
+	}
+	var ndots []string
+	for _, o := range dns.Options {
+		if o.Name == "ndots" && o.Value != nil {
+			ndots = append(ndots, *o.Value)
+		}
+	}
+	if len(ndots) != 1 || ndots[0] != "3" {
+		t.Errorf("ndots options %v, want exactly one, 3", ndots)
+	}
+}
+
+// TestSessionPodNdotsIsTheOperators: the operator is a separate Go module,
+// so sessionPodNdots is a copy of its brokerCallerPodNdots
+// (k8s-operator/internal/controller/pod_dns.go). This reads that file, so a
+// change here that leaves the operator behind fails; the operator's
+// TestBrokerCallerPodNdotsIsTheGateways is the same check from the other
+// side, because each module's tests run only when that module changes.
+func TestSessionPodNdotsIsTheOperators(t *testing.T) {
+	const name = "brokerCallerPodNdots"
+	file := filepath.Join("..", "..", "k8s-operator", "internal", "controller", "pod_dns.go")
+	parsed, err := parser.ParseFile(token.NewFileSet(), file, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, decl := range parsed.Decls {
+		gen, ok := decl.(*ast.GenDecl)
+		if !ok || gen.Tok != token.CONST {
+			continue
+		}
+		for _, spec := range gen.Specs {
+			values := spec.(*ast.ValueSpec)
+			for i, ident := range values.Names {
+				if ident.Name != name || i >= len(values.Values) {
+					continue
+				}
+				lit, ok := values.Values[i].(*ast.BasicLit)
+				if !ok || lit.Kind != token.STRING {
+					t.Fatalf("%s: %s is not a string literal", file, name)
+				}
+				got, err := strconv.Unquote(lit.Value)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got != sessionPodNdots {
+					t.Errorf("the operator's %s is %q and sessionPodNdots is %q; change both together", name, got, sessionPodNdots)
+				}
+				return
+			}
+		}
+	}
+	t.Fatalf("%s declares no constant %s", file, name)
 }
 
 // TestSpawnCarriesTheOriginSequence: the pod is told which message on its

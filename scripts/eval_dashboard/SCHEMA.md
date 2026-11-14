@@ -189,6 +189,13 @@ layout and are collected from the moment they start running.
       The same readers count it apart from the storm and the ceiling, and
       `classify.py` classes a case whose ungraded reps are all of this kind
       `fixture-drift`.
+      An `infra` rep whose `reason` leads with `KUBE_AGENTS_FORGE_UNAVAILABLE`
+      is a **forge** rep: every check that errored did so because a forge read
+      failed for a while during grading (a 5xx, a dropped connection, a GitHub
+      rate limit on grading's own token). The same readers count it apart
+      from the storm and outside every pass-rate denominator, and
+      `classify.py` classes a case whose ungraded reps are forge reps, with no
+      storm rep beside them, `forge-unavailable`.
       Similarly, a harness-declared card-wake replay error (`ReplayMismatch`
       or `ReplayBroken`, e.g. `failure wake:`, `question wake:`, `block wake:`, `thread context:`
       in the reason) is recognized by `classify.py` and `health.py` as `fail`,
@@ -585,7 +592,8 @@ what the renderer does with them.
   task results; an `infra` rep whose `reason` leads with
   `KUBE_AGENTS_DELEGATION_CEILING` is also excluded from the storm counts
   (`storm_reps`, `health.json`'s `infra_reps`) and reported under
-  `metrics.ceiling_reps` instead. When `reps` is absent the task's single
+  `metrics.ceiling_reps` instead; one whose `reason` leads with
+  `KUBE_AGENTS_FORGE_UNAVAILABLE` is excluded from the storm counts too. When `reps` is absent the task's single
   `result` stands in for one rep.
 - `runs[].lane_excluded` — the case ids `hack/ci-eval-pr.sh` dropped from
   the matrix before the fan-out on the inject lane
@@ -960,7 +968,7 @@ recorded `null` from a pre-field record), `not_evaluated[]` (the case ids
 the suite could not evaluate; empty on every other verdict), `cases[]`
 (`{case, outcome, cls, also_failing_prs, pass_rate_30d, reason, excerpt, rep_n,
 do, admitted, reps, nightly_failed_recent}`, `reps` being `{pass, fail, infra,
-ceiling, fixture}`) and `health_at` (the verdict in force when it finished, from
+ceiling, fixture, forge}`) and `health_at` (the verdict in force when it finished, from
 history; `null` without history). `rep_n` is the 1-based
 repetition the row is about — the one whose `reason` is shown, else the
 one whose `excerpt` is (`null` when there is neither); the pages link that
@@ -1330,7 +1338,13 @@ read is final.
 `state` (`GREEN|DEGRADED|OUTAGE`), `condition`
 (`shared_break|storm|setup_deaths|lost_pods|fixture_drift|pool_drift|delegation_ceiling|deadline_kill`), `since`, `cause`, `advice`,
 `failing_cases`, `tracking_issues`, `incident`, `recovering`, `stale`,
-`slow`, `near_deadline`, `pool`, `generated_at`, `tick`. Any other state, or an unreadable file, means no
+`slow`, `near_deadline`, `pool`, `generated_at`, `tick`. A `tracking_issues`
+entry is `#N` for an issue of this repository (one `case-notes.yaml` names,
+or one the bot filed here) and the full URL of one the bot filed or adopted
+in the issues repository; `issues_repo` names that repository
+(`ghcli.DEFAULT_REPO`, `KUBE_AGENTS_ISSUES_REPO` when set) and is
+informational: the pages read nothing from it, a reference carries its own
+repository. Any other state, or an unreadable file, means no
 verdict: the Brief says no verdict is published and shows the last 24
 hours in numbers and the runs, the PR view classifies from the runs alone
 and shows no gate banner. Only a `GREEN` verdict reads as healthy. For
@@ -1465,10 +1479,14 @@ the link the message is built from, from `WATCHED`. The reconcile's report,
 `{schema_version, mode, dry_run, commit, fleet_tree, build, job, workers,
 budget_seconds, ceiling_seconds, main_ref, main_check_error, started_at,
 finished_at, exit, exit_code, error, mapped, visited, outcomes{project:
-{outcome, detail, started_at?, finished_at?, allowlist_unused[]?}}, summary}`
+{outcome, detail, started_at?, finished_at?, allowlist_unused[]?,
+startup_fail_reset?}}, summary}`
 (`mapped` is how many projects the run set out to visit and `visited` how
 many it held; a held project carries its times, and `allowlist_unused` only
-when its plan was read; `fleet_tree` is the hash `hack/fleet_reconcile.py` computes
+when its plan was read; `startup_fail_reset` is `{result: reset|failed|skipped,
+instance?, zone?, detail?}`, with the fixture refresh on and not on a dry run: the run resets
+the VM after each project whose state it read, whatever the plan outcome; after a failed
+state read it records `failed` and tries no reset; an interrupted project is not reset; `fleet_tree` is the hash `hack/fleet_reconcile.py` computes
 over the stack's inputs (`docs/ci-pool-projects.md` §6.2 names them; reports
 from before #2645 carry the git tree id of `bench/tf/fleet` instead);
 `main_check_error` is set when the moved-check could
@@ -1492,14 +1510,18 @@ daily passed having reached every project the failed build named, at the same
 `fleet_tree` (a failed build's pre-input-hash git id against the daily's hash
 is not compared; a project a whole pass no longer lists has left the pool and
 counts; a failed build naming no project needs a whole pass), false when it
-failed itself, so its own note is the current story and nothing clears; `by`
+failed itself on a build that owes a hand step, so its own note is the current
+story and nothing clears (a later failure the next run retries writes none of
+its own unless a project persists, and silences nothing); `by`
 is the daily run a recovery was decided on (`build`, `finished_at`,
-`summary`), what the clear cites. A failed build whose report is absent or
-cut short is never recovered by a pass, and a silence ends when a later daily
-passes without reaching the projects. The
+`summary`, `passed`), what the clear cites; a later daily that failed
+elsewhere but applied the projects at the same tree is a recovery too, cited
+with `passed` false. A failed build whose report is absent or cut short is
+never recovered, and a silence ends when a later daily passes without reaching
+the projects, or fails without reaching them on a build that owes no hand step. The
 entry is carried from the previous tick while `build` is still the job's
 latest, unchanged on a tick blind to either job, so neither re-opens the
-failure, and a silence becomes a recovery once a later pass reaches the
+failure, and a silence becomes a recovery once a later run reaches the
 projects.
 `periodics` notes every watched job whose latest build failed or is stale,
 less those superseded. `periodics_runs` is, per read
@@ -1512,8 +1534,12 @@ projects{project: n}, runs}`: the last build counted, each project's
 consecutive failed checks (dropped at zero; every count cleared by a clean
 build) and the run's; a failed build is a note only once the run's count
 reaches the job's threshold (two consecutive checks for the sweep, the first
-failure for the reconciles and for the certification slice), and the poster treats a told job as recovered only
-on a build that passed (`periodics_runs`), not on a sub-threshold failure, and
+failure for the certification slice and the replay lane, and for the reconciles
+the first failure that owes a hand step, otherwise a project at `PERSISTENT_AFTER`
+consecutive runs: [`ci-health.md`](../../docs/ci-health.md), "The watched
+periodics"), and the poster treats a told job as recovered only
+on a build that passed (`periodics_runs`) or, for the postsubmit reconcile, a
+`periodics_superseded` recovery, not on a sub-threshold failure, and
 a told `TOKEN` note only on a passed build whose `tokens_current` is true. `periodics_since` is each open note's start, kept
 for a job across the ticks with no reading for it (which write no note for it)
 and dropped once a tick with a reading for it writes no note

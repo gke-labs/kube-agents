@@ -36,7 +36,9 @@ import credential_proxy
 import credential_proxy_client
 import feedback_broker
 import gke_endpoint
+import no_live_kubectl
 import providers
+import scope_exclude
 import vcs_broker
 from credential_proxy import (
     MAX_REPOSITORY_LENGTH,
@@ -132,6 +134,23 @@ _ENVOY_CONFIG = Path(__file__).resolve().parents[3] / "deploy" / "shared" / "env
 # class left with serve's bounded shares (session 2, scope 1 by default) gets
 # 503 busy when its next request beats the previous release.
 _SERVE_SHARES = ("session_slots", "profile_slots", "scope_slots")
+
+
+def setUpModule():
+    # No test here reaches a cluster: a read of the state ConfigMap that a test
+    # leaves unstubbed is unreadable, and any other kubectl found on PATH fails
+    # the module.
+    global _NO_KUBECTL
+    _NO_KUBECTL = no_live_kubectl.install()
+
+
+def tearDownModule():
+    _NO_KUBECTL.uninstall()
+
+
+class TestNoLiveKubectl(unittest.TestCase):
+    def test_no_test_in_this_module_can_reach_a_cluster(self):
+        no_live_kubectl.assert_in_force(self, _NO_KUBECTL)
 
 
 class _FakeClock:
@@ -4975,28 +4994,32 @@ class CommandExecutorTest(unittest.TestCase):
         # shared kubeconfig for that cluster. A by-hand or skill-driven fetch
         # that names no endpoint would otherwise move an internal-ip cluster
         # back to its public IP for every brokered kubectl after it.
-        executor = self.fake_gcloud(self.executor())
-        seen = []
-        original = executor._execute
+        # Both endpoint flags: a caller under the kube-api proxy sends no flag
+        # (gke_endpoint.KUBE_PROXY_ENVS), so a DNS-only cluster relies on this too.
+        for flag in ("--internal-ip", "--dns-endpoint"):
+            with self.subTest(flag):
+                executor = self.fake_gcloud(self.executor())
+                seen = []
+                original = executor._execute
 
-        def record(argv, **kwargs):
-            seen.append(argv)
-            return original(argv, **kwargs)
+                def record(argv, _seen=seen, _original=original, **kwargs):
+                    _seen.append(argv)
+                    return _original(argv, **kwargs)
 
-        with (
-            mock.patch("gke_endpoint.endpoint_decision", return_value=self.a_decision(["--internal-ip"])) as decide,
-            mock.patch.object(executor, "_execute", record),
-        ):
-            executor.execute(
-                ["gcloud", "container", "clusters", "get-credentials", "cluster-b",
-                 "--location=us-central1", "--project=demo-project"],
-            )
+                with (
+                    mock.patch("gke_endpoint.endpoint_decision", return_value=self.a_decision([flag])) as decide,
+                    mock.patch.object(executor, "_execute", record),
+                ):
+                    executor.execute(
+                        ["gcloud", "container", "clusters", "get-credentials", "cluster-b",
+                         "--location=us-central1", "--project=demo-project"],
+                    )
 
-        fetches = [argv for argv in seen if "get-credentials" in argv]
-        self.assertEqual(1, len(fetches))
-        self.assertEqual("--internal-ip", fetches[0][-1])
-        decide.assert_called_once()
-        self.assertEqual(("demo-project", "cluster-b", "us-central1"), decide.call_args.args)
+                fetches = [argv for argv in seen if "get-credentials" in argv]
+                self.assertEqual(1, len(fetches))
+                self.assertEqual(flag, fetches[0][-1])
+                decide.assert_called_once()
+                self.assertEqual(("demo-project", "cluster-b", "us-central1"), decide.call_args.args)
 
     def test_a_callers_fetch_target_is_read_through_gclouds_flag_shapes(self):
         # Every spelling a hand-typed command might carry: a global flag with a
@@ -5804,6 +5827,22 @@ class CommandExecutorTest(unittest.TestCase):
                 self.assertIsNotNone(process.returncode)
                 self.assertLess(time.monotonic() - started, 10)
                 self.assertGreaterEqual(len(asked), 2)
+
+    def test_a_child_that_exits_just_after_closing_its_pipes_is_reaped_at_once(self):
+        # #5540: a child closes its pipes a moment before it can be reaped.
+        # This one closes both, then exits 50 ms later, so the first look
+        # always misses; one look then a PIPES_CLOSED_POLL_SECONDS sleep cost
+        # half a second here, the short reap poll costs about the 50 ms.
+        process = subprocess.Popen(
+            ["sh", "-c", "exec >&- 2>&-; sleep 0.05"], stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+        )
+        started = time.monotonic()
+        captured = credential_proxy._capture_output(process, None, 1 << 16, 30)
+        elapsed = time.monotonic() - started
+        self.assertEqual(0, process.returncode)
+        self.assertFalse(captured.timed_out)
+        self.assertLess(elapsed, credential_proxy.PIPES_CLOSED_POLL_SECONDS / 2)
 
     def test_a_hang_up_after_the_pipes_close_still_ends_the_command(self):
         # With both pipes closed the read loop has nothing to watch, so the
@@ -8688,12 +8727,9 @@ class ForgeRefreshExecutorTest(unittest.TestCase):
                 executor.refresh_forge_credential("github", "gke-agentic/infra")
         self.assertFalse(executor._refresh_lock.locked())
 
-    def _wait_until(self, condition, deadline_seconds=5):
-        deadline = time.monotonic() + deadline_seconds
-        while not condition():
-            if time.monotonic() > deadline:
-                self.fail("condition not reached before the deadline")
-            time.sleep(0.01)
+    def _wait_until(self, condition):
+        """The module's _wait_until at the close wait, for this class's callers."""
+        _wait_until(self, condition, lambda: "condition not reached before the deadline")
 
     def test_the_lock_is_held_while_its_holder_waits_for_the_budget_and_a_second_refresher_waits_on_it_unreserved(self):
         executor = self._budgeted_executor(admits=1)
@@ -11099,6 +11135,29 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
         CredentialProxyHandler.enforce_read_only = False
         self.assertTrue(self._serve_with(None))
 
+    def test_serve_turns_gcloud_file_logging_off_in_the_exec_role_only(self):
+        # An exec pod's state volume is sized for no gcloud log files; the
+        # broker and the sidecar roles keep gcloud's default.
+        for role, off in (
+            (credential_proxy_client.EXEC_ROLE, True),
+            ("broker", False),
+            ("combined", False),
+        ):
+            with self.subTest(role=role):
+                self._serve_with(None, extra_env={"CREDENTIAL_PROXY_ROLE": role})
+                env = CredentialProxyHandler.executor.environment
+                self.assertEqual(
+                    "1" if off else None, env.get(credential_proxy.GCLOUD_FILE_LOGGING_OFF_ENV)
+                )
+
+    def test_serve_gives_only_the_exec_role_the_kubectl_cache_reclaimer(self):
+        for role, wired in ((credential_proxy_client.EXEC_ROLE, True), ("broker", False)):
+            with self.subTest(role=role):
+                self._serve_with(None, extra_env={"CREDENTIAL_PROXY_ROLE": role})
+                executor = CredentialProxyHandler.executor
+                reclaimers = CredentialProxyHandler.watermark_gate._reclaimers
+                self.assertEqual(wired, executor.reclaim_kubectl_cache in reclaimers)
+
     def test_serve_hands_the_executor_the_container_limit(self):
         # The derivation runs in `serve`, not in the executor, so a test that
         # builds an executor directly gets no budget whatever the runner's
@@ -12220,6 +12279,75 @@ class VcsRouteTest(unittest.TestCase):
             unclassified,
             "a new verb must be classified as a read or a write",
         )
+
+    def test_write_mode_none_refuses_every_branch_and_proposal_write_before_it_spends(self):
+        refreshed = []
+        broker = self.broker(refresh=lambda provider, repository: refreshed.append(repository))
+        with mock.patch.dict(os.environ, {vcs_broker.WRITE_MODE_ENV: "none"}), mock.patch.object(
+            credential_proxy, "managed_repositories", side_effect=AssertionError("the managed list was read")
+        ):
+            for verb in sorted(vcs_broker.PROPOSE_VERBS):
+                with self.subTest(verb=verb), self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                    status, payload = self._handler(
+                        f"/v1/vcs/{verb}", {"repository": "https://github.com/acme/infra"}, broker
+                    )
+                    self.assertEqual(HTTPStatus.FORBIDDEN, status)
+                    self.assertEqual("WRITE_MODE_NONE", payload["code"])
+                    self.assertEqual(credential_proxy.RULE_VCS_WRITE_MODE, payload["rule"])
+                    self.assertIn("explain-only (writeMode: none)", payload["error"])
+                    self.assertNotIn("detail", payload)
+                    self.assertTrue(any(credential_proxy.RULE_VCS_WRITE_MODE in line for line in logs.output))
+        self.assertEqual([], refreshed)
+
+    def test_write_mode_none_keeps_reads_and_issues(self):
+        # Past the write-mode check, these reach the managed-list gate, which
+        # refuses an unregistered repository with its own code.
+        with mock.patch.dict(os.environ, {vcs_broker.WRITE_MODE_ENV: "none"}), mock.patch.object(
+            credential_proxy, "managed_repositories", return_value=frozenset()
+        ):
+            for verb in ("clone", "proposal-view", "issue-create", "issue-comment", "label-ensure"):
+                with self.subTest(verb=verb):
+                    status, payload = self._handler(
+                        f"/v1/vcs/{verb}", {"repository": "https://github.com/acme/infra"}, self.broker()
+                    )
+                    self.assertEqual(HTTPStatus.FORBIDDEN, status)
+                    self.assertEqual("REPOSITORY_NOT_MANAGED", payload.get("code"))
+
+    def test_write_mode_propose_or_unset_lets_a_write_through_to_the_next_gate(self):
+        for value in ("propose", " Propose ", ""):
+            with self.subTest(value=value), mock.patch.dict(
+                os.environ, {vcs_broker.WRITE_MODE_ENV: value}
+            ), mock.patch.object(credential_proxy, "managed_repositories", return_value=frozenset()):
+                status, payload = self._handler(
+                    "/v1/vcs/proposal-create", {"repository": "https://github.com/acme/infra"}, self.broker()
+                )
+                self.assertEqual(HTTPStatus.FORBIDDEN, status)
+                self.assertEqual("REPOSITORY_NOT_MANAGED", payload.get("code"))
+
+    def test_write_mode_is_read_on_every_request(self):
+        # Proves the broker holds no cached copy. On a pod the env changes only
+        # when the operator rolls the broker, so this is not "at once" there.
+        broker = self.broker()
+        body = {"repository": "https://github.com/acme/infra"}
+        with mock.patch.object(credential_proxy, "managed_repositories", return_value=frozenset()):
+            with mock.patch.dict(os.environ, {vcs_broker.WRITE_MODE_ENV: "none"}):
+                _, payload = self._handler("/v1/vcs/publish", body, broker)
+                self.assertEqual("WRITE_MODE_NONE", payload["code"])
+            with mock.patch.dict(os.environ, {vcs_broker.WRITE_MODE_ENV: "propose"}):
+                _, payload = self._handler("/v1/vcs/publish", body, broker)
+                self.assertEqual("REPOSITORY_NOT_MANAGED", payload.get("code"))
+
+    def test_a_misspelt_write_mode_refuses_and_says_why(self):
+        with mock.patch.dict(os.environ, {vcs_broker.WRITE_MODE_ENV: "nope"}), self.assertLogs(
+            credential_proxy.LOGGER, level="WARNING"
+        ):
+            status, payload = self._handler(
+                "/v1/vcs/publish", {"repository": "https://github.com/acme/infra"}, self.broker()
+            )
+        self.assertEqual(HTTPStatus.FORBIDDEN, status)
+        self.assertEqual("WRITE_MODE_NONE", payload["code"])
+        self.assertIn("neither none nor propose", payload["detail"])
+        self.assertNotIn("nope", json.dumps(payload))
 
     def test_a_forge_refusal_is_redacted_before_it_crosses_back(self):
         # The forge's own words are what the caller needs, and they are also a
@@ -15372,6 +15500,19 @@ _DOOR_IDLE_SECONDS = 4 * _RESET_SETTLE_SECONDS
 _HEALTH_ANSWER_SECONDS = 1
 # Refusals made in quick succession, to show the cap writes one line for them.
 _REFUSAL_BURST = 3
+# The lag the stamped-late test puts between a refusal's 503, written on its
+# refusal thread, and the accept loop counting it, which is the stamp the
+# quiet interval is measured from. A refusal helper that returned on the 503
+# alone starts the quiet-interval sleep before the stamp, and the closed
+# holder's handler then finds the interval unexpired and says nothing, which
+# is the shape a loaded runner produced with no lag added. The lag has to
+# outlast the work between the last refusal and that sleep (a health request
+# and a few assertions, milliseconds idle) on any runner for the red to hold,
+# so it is half the loaded-runner settle rather than a margin over the idle
+# figure; and it stays inside the shortened interval, so that a red is the
+# issue's shape (the handler finds the interval unexpired and says nothing)
+# and not a stamp landing after the sleep and a line with the wrong count.
+_REFUSAL_STAMP_LAG_SECONDS = _RESET_SETTLE_SECONDS / 2
 # The small cap the saturation test builds its server with.
 _SMALL_THREAD_CAP = 4
 _KEEPALIVE_REQUESTS = 5
@@ -15399,6 +15540,22 @@ _PARTIAL_REQUEST_LINE = b"GET /"
 # the wait counted from admission and the window from the request's first
 # byte): a queue refusal always lands after the request's read deadline.
 _SLOT_WAIT_PAST_THE_WINDOW_SECONDS = 2 * _SHORT_IDLE_SECONDS
+
+
+def _wait_until(case, condition, failure, deadline_seconds=_CLOSE_WAIT_SECONDS):
+    """Poll ``condition`` every _POLL_SECONDS until it holds; past ``deadline_seconds``, fail ``case`` with ``failure()``.
+
+    The one loop for a test waiting on a server thread's work (a line a
+    handler writes as it returns, a stamp the accept loop sets, a request
+    queued behind a budget), so the deadline arithmetic and the poll interval
+    are not kept in step by hand at each site. ``failure`` is called only on
+    the way out, so a message can carry what the wait saw.
+    """
+    deadline = time.monotonic() + deadline_seconds
+    while not condition():
+        if time.monotonic() > deadline:
+            case.fail(failure())
+        time.sleep(_POLL_SECONDS)
 
 
 def _drip(sock, data, stop):
@@ -15930,14 +16087,35 @@ class ThreadCapTest(_CredentialedUnixServer):
         return _SMALL_THREAD_CAP
 
     def _refused(self):
-        """Connect past the cap and return what the connection read."""
+        """Connect past the cap and return what the connection read.
+
+        Returns once the connection has read the 503 and the close behind it,
+        both written on the refusal thread, and the accept loop has counted
+        the refusal. The count stamps the server's last refusal, which
+        connection_released measures the quiet interval from; a test that
+        timed that interval from the 503 alone would, when the accept loop
+        stamps late, close a holder whose handler finds the interval
+        unexpired and says nothing. Nothing here waits for the refusal
+        thread's drain to return or its slot to come back; a test that needs
+        the slot waits on _refusal_slots with _wait_for_a_free_slot.
+        """
+        before = self._last_refusal_stamp()
         extra = self.connect()
         with contextlib.suppress(BrokenPipeError, ConnectionResetError):
             self.send(extra, "GET", "/healthz")
         status, headers, body = self.response(extra)
         self.assertTrue(self.closed_by_server(extra), "the refused connection stayed open")
         extra.close()  # as Envoy does on reading the answer; the drain returns at once
+        _wait_until(
+            self, lambda: self._last_refusal_stamp() > before,
+            lambda: f"the accept loop did not count the refusal within {_CLOSE_WAIT_SECONDS}s",
+        )
         return status, headers, body
+
+    def _last_refusal_stamp(self):
+        """When the server last counted a refusal, read under the lock the count writes it under."""
+        with self.server._refused_lock:
+            return self.server._last_refusal_at
 
     def _wait_for_a_free_slot(self, slots):
         """Block until a closed connection's thread has given one of ``slots`` back; fail at _CLOSE_WAIT_SECONDS."""
@@ -15945,6 +16123,34 @@ class ThreadCapTest(_CredentialedUnixServer):
         slots.release()
 
     def test_the_connection_past_the_cap_reads_503_and_eof_while_health_answers(self):
+        self._burst_is_one_line_and_a_quiet_interval_ends_the_episode()
+
+    def test_the_release_line_is_written_when_the_accept_loop_counts_the_refusal_late(self):
+        # The refusal thread writes the 503 before the accept loop counts the
+        # refusal, and the count is the stamp the quiet interval is measured
+        # from. Here every count lands _REFUSAL_STAMP_LAG_SECONDS after its
+        # answer, as a loaded runner once arranged on its own: a refusal
+        # helper that returned on the 503 alone would start the quiet-interval
+        # sleep ahead of the last stamp, and the closed holder's handler would
+        # find the interval unexpired, say nothing, and leave no later handler
+        # to say it. The helper waits for the stamp, so the scenario holds.
+        count = self.server._count_refusal
+
+        def lagged_count(answered):
+            time.sleep(_REFUSAL_STAMP_LAG_SECONDS)
+            count(answered)
+
+        with mock.patch.object(self.server, "_count_refusal", lagged_count):
+            self._burst_is_one_line_and_a_quiet_interval_ends_the_episode()
+
+    def _burst_is_one_line_and_a_quiet_interval_ends_the_episode(self):
+        """Saturate the cap, refuse a burst, free one holder after a quiet interval.
+
+        The body of two tests: the burst is one ALERT line and the health
+        listener answers meanwhile; the first holder closed after an interval
+        with no refusal has its handler write the release line; the freed
+        slot serves the next connection.
+        """
         health = credential_proxy.start_health_listener("127.0.0.1", 0)
         self.addCleanup(health.server_close)
         self.addCleanup(health.shutdown)
@@ -15975,15 +16181,18 @@ class ThreadCapTest(_CredentialedUnixServer):
         # over only once an interval has passed with no refusal. The closed
         # holder's handler writes that line as it returns, so the test waits
         # for the line, inside the shortened interval, rather than sleeping.
+        # The sleep is one interval measured from after the last refusal's
+        # stamp (_refused returns only once the accept loop has written it),
+        # and the handler measures the interval after the sleep ends, so the
+        # handler always finds it elapsed.
         with mock.patch.object(credential_proxy, "THREAD_CAP_LOG_INTERVAL_SECONDS", _RESET_SETTLE_SECONDS):
             time.sleep(_RESET_SETTLE_SECONDS)
             with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
                 holders[0].close()
-                deadline = time.monotonic() + _CLOSE_WAIT_SECONDS
-                while not any("thread cap released" in line for line in logs.output):
-                    if time.monotonic() > deadline:
-                        self.fail(f"the closed holder's handler did not report the release: {logs.output}")
-                    time.sleep(_POLL_SECONDS)
+                _wait_until(
+                    self, lambda: any("thread cap released" in line for line in logs.output),
+                    lambda: f"the closed holder's handler did not report the release: {logs.output}",
+                )
             released = [line for line in logs.output if "thread cap released" in line]
             self.assertEqual(1, len(released), logs.output)
             self.assertIn(f"{_REFUSAL_BURST - 1} refused since the last line", released[0])
@@ -16238,7 +16447,7 @@ def yaml_value(text):
 # outside the enum fails Envoy's validation, and any other shape fails the
 # load. A UInt32Value takes a JSON number with no fraction or a string
 # spelling one, from 0 to 2**32 - 1; anything else fails the load (Envoy
-# 1.39.1, --mode validate, on each shape the tests below name). pyyaml's
+# 1.39.1 and re-checked on 1.39.6, --mode validate, on each shape the tests below name). pyyaml's
 # integers are Envoy's: yaml-cpp converts a scalar with the base left to its
 # prefix, so both read 010 as 8 and 0x10 as 16, which Envoy's /clusters page
 # shows.
@@ -16611,7 +16820,7 @@ class ThreadCapDefaultTest(unittest.TestCase):
     def test_a_quoted_digit_priority_is_the_number_envoy_reads(self):
         # pyyaml keeps a quoted scalar a string, and so does Envoy's YAML
         # loader; proto-JSON, given a string that is not an enum value's
-        # name, reads the number it spells. Envoy 1.39.1 loads
+        # name, reads the number it spells. Envoy 1.39.1 and 1.39.6 load
         # `priority: "0"` and its /clusters page shows the DEFAULT breaker at
         # that threshold's count, so the cap has to read it the same way
         # rather than fall to 1024 under a breaker of 4096; `"2"` fails
@@ -16633,7 +16842,7 @@ class ThreadCapDefaultTest(unittest.TestCase):
             self.assertIsNone(credential_proxy._routing_priority(value), value)
 
     def test_a_count_is_bounded_by_uint32_and_an_integer_is_read_as_envoy_reads_it(self):
-        # max_connections is a UInt32Value: Envoy 1.39.1 refuses to load
+        # max_connections is a UInt32Value: Envoy 1.39.1 and 1.39.6 refuse to load
         # 4294967296 (`integer out of range`) and loads 4294967295, so the
         # first is not a count and the second is. An integer pyyaml read
         # from the file needs no re-reading: yaml-cpp converts a scalar with
@@ -18594,6 +18803,56 @@ class ApiRelayOverTheSocketTest(unittest.TestCase):
         status, headers, body = self._request(*args, **kwargs)
         return status, headers, json.loads(body)
 
+    def _exclude(self, project, location, cluster):
+        """Point the handler's exclusions at a scope file that excludes one cluster."""
+        directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, directory, True)
+        scope = directory / "scope.json"
+        scope.write_text(json.dumps({"exclude": {"clusters": [
+            {"projectId": project, "location": location, "clusterName": cluster}]}}), encoding="utf-8")
+        self.addCleanup(
+            self._restore, "exclusions", "exclusions" in CredentialProxyHandler.__dict__,
+            CredentialProxyHandler.__dict__.get("exclusions"),
+        )
+        CredentialProxyHandler.exclusions = scope_exclude.Exclusions(path=lambda: str(scope))
+
+    EXCLUDABLE_GET = "/v1/gcp/container.googleapis.com/v1/projects/acme-prod/locations/us-central1/clusters/{name}"
+    CHECK_HEADERS = {credential_proxy.GET_CREDENTIALS_CHECK_HEADER: "1"}
+
+    def test_the_get_credentials_check_is_refused_for_an_excluded_cluster(self):
+        # The shim then sends get-credentials to /v1/exec, whose own
+        # excluded-cluster refusal answers (#5305); nothing reaches GKE here.
+        self._exclude("acme-prod", "us-central1", "secret-cluster")
+        self.reply["body"] = b'{"name":"secret-cluster","location":"us-central1","status":"RUNNING"}'
+        status, _, body = self._json_request(self.EXCLUDABLE_GET.format(name="secret-cluster"), headers=self.CHECK_HEADERS)
+        self.assertEqual(403, status)
+        self.assertEqual(scope_exclude.RULE_EXCLUDED_CLUSTER, body["rule"])
+        self.assertEqual([], self.upstream_requests)
+
+    def test_without_the_check_header_an_excluded_clusters_read_is_unchanged(self):
+        # #5305 keeps control-plane reads allowed: the reconcile's existence
+        # check sends no header and is answered as before.
+        self._exclude("acme-prod", "us-central1", "secret-cluster")
+        self.reply["body"] = b'{"name":"secret-cluster","location":"us-central1","status":"RUNNING"}'
+        status, _, _ = self._request(self.EXCLUDABLE_GET.format(name="secret-cluster"))
+        self.assertEqual(200, status)
+        self.assertEqual(1, len(self.upstream_requests))
+
+    def test_the_check_header_leaves_a_cluster_that_is_not_excluded_alone(self):
+        self._exclude("acme-prod", "us-central1", "secret-cluster")
+        self.reply["body"] = b'{"name":"ka-a","location":"us-central1","status":"RUNNING"}'
+        status, _, _ = self._request(self.EXCLUDABLE_GET.format(name="ka-a"), headers=self.CHECK_HEADERS)
+        self.assertEqual(200, status)
+        self.assertEqual(1, len(self.upstream_requests))
+        # The header is the broker's to read, not the upstream's: the relay
+        # sends exactly its own two headers.
+        self.assertNotIn(credential_proxy.GET_CREDENTIALS_CHECK_HEADER, self.upstream_requests[0][1])
+
+    def test_the_shim_and_the_broker_name_the_check_header_alike(self):
+        self.assertEqual(
+            credential_proxy_client.GET_CREDENTIALS_CHECK_HEADER, credential_proxy.GET_CREDENTIALS_CHECK_HEADER
+        )
+
     def test_a_get_carrying_a_body_on_a_direct_write_route_announces_its_close(self):
         # The passthrough and the MCP 405 write their response without _json.
         # A GET drains nothing, so a body on it is unread when the response is
@@ -19468,6 +19727,14 @@ class KubeProxyClientTest(unittest.TestCase):
                     credential_proxy_client,
                     "open_broker_request",
                     return_value=contextlib.nullcontext(fake_resp),
+                ),
+                # This argv names its cluster in full, which the shim answers
+                # itself with the kube-api proxy in use (#5447); this test is
+                # the broker answer's path.
+                mock.patch.object(
+                    credential_proxy_client,
+                    "answer_get_credentials_locally",
+                    return_value=None,
                 ),
             ):
                 rc = credential_proxy_client.execute(

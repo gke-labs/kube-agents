@@ -25,6 +25,62 @@ Production guidance is a 3-node cluster with stream replicas R3. Dev and CI run 
 node with R1 under the same config surface - the conformance suite runs against `kind`, so
 nothing here may depend on a managed control plane.
 
+**Amended 10/29 (#3274):** the production posture is the default for a new bus. The
+operator renders `spec.harness.tuning.busReplicas` servers. When the field is unset, an
+install keeps the server count its bus already runs (an install from before this change
+stays on one server), and a new bus gets three. Every stream and bucket the provision Job
+creates takes `min(3, servers)` replicas. The servers find each other through a headless
+routes Service on 6222, authenticated to each other by mutual TLS under the bus CA (the callout does not govern routes, and no route password is rendered). A `maxUnavailable: 1` budget and
+a hostname topology spread keep one drain to one server, and a lame-duck `preStop` moves
+clients off a stopping server rather than dropping them.
+
+**Changing the server count empties the bus.** A server that restarts in cluster mode
+finds its standalone streams unassigned in the new metadata layer and deletes them as
+orphans; going back, a standalone server refuses to load an R3 stream. Either way the
+provision Job then recreates every stream and bucket empty. So setting `busReplicas` on
+an install whose bus already runs another count is a conversion, and its cost is the
+bus's contents: task history, the topics journal, and the KV buckets. Converting without
+that loss is #4225 (a copy into a new cluster before the switch).
+
+**Amended 10/30 (#3274):** so the operator does not convert. An existing bus keeps the
+count it runs: a `busReplicas` that asks for another count is held to the running one,
+with an `A2ABusConversionRefused` condition and Warning, and the admission webhook
+refuses the edit with the same message. #4225 lifts that refusal in the same change that
+adds the migration, so no release can convert without it.
+
+**Amended 11/12 (#5708): a multi-server bus provisions only once its meta group is formed.**
+The servers start in turn (`OrderedReady`), and a member reports ready before a JetStream meta
+leader exists, so the first two elect a leader and the third joins later. Twice in CI, on GKE
+Standard, the third never joined although every server held its routes. The leader then refused
+every R3 stream with a bare "no suitable peers for placement", and the provision Job retried until
+the run timed out. So before the provision Job is created, the operator reads each server's `/jsz`
+at its pod IP: the bus pods have no per-pod DNS names, and the client Service would answer from one
+server at random. The group counts as formed when a quorum of servers report one leader and that
+leader lists every other server as a current peer. Until then the Job waits, and the
+`A2ABusMetaGroup` condition names the server outside.
+
+A server still outside after 3 minutes is restarted once, under every one of these guards:
+
+- it is the only server outside;
+- the rest are a quorum without it;
+- the bus hasn't been provisioned yet, and no server holds a stream or consumer, so no only copy of
+  anything can be on the stray;
+- the stray's own meta node has started (it reports the group's size), which nats-server does only
+  after recovering its store from disk;
+- the bus StatefulSet doesn't already record it as restarted.
+
+The record is an annotation the operator writes before the delete, with its own patch, so the
+StatefulSet's server-side apply leaves it. A new bus starts without one. A server still outside after
+its one restart stays named in the condition, for a person.
+
+If a server isn't running while the others are (its pod absent, being deleted, or not Running,
+as the restarted one is for a while), the Job waits for it under `ServerNotRunning`, and nothing
+is restarted on that account. If a running server's view can't be read, or no server is
+running at all, the verdict is unknown: nothing is held or restarted, and the condition names
+the unreadable server. The check also runs when the provision Job is re-created on a running bus (its 24 h TTL, or a
+digest change). There it can hold that re-run and set the condition, but it never restarts anything on a bus that
+has been provisioned. It doesn't repair a server that drops out of a running bus.
+
 **The customer operates this.** Server restarts - rollouts, node drains, PV failover - are
 routine operations, not incidents. That fact drives the resilience contract below more than
 any other input.
@@ -66,8 +122,9 @@ the tempting place for a cheaper R1 class, but they are also the replay and audi
 and R1 loses them to a single node failure. Audit wins. The cost knob is W, not replicas.
 
 Every stream also carries a hard `max_bytes` cap with `discard: old` alongside its age
-limit (dev defaults: 20GiB `TASKS`, 5GiB `TOPICS-JOURNAL`, 1GiB each for `TOPICS-STATE`
-and `DIRECTORY`). A runaway telemetry flood drops oldest chunks early; it never fills
+limit (dev defaults: 8GiB `TASKS`, 1GiB each for `TOPICS-JOURNAL`, `TOPICS-STATE`
+and `DIRECTORY`; an existing stream keeps its cap, and the provision Job reports the edit that lowers
+it and whether that is safe yet). A runaway telemetry flood drops oldest chunks early; it never fills
 the PV and stalls the whole JetStream deployment, which would take `runtime-state`,
 `session-state`, and discovery down with it. The honest cost: under byte pressure,
 replay completeness degrades oldest-first - a running task's early events can age out of
@@ -76,7 +133,7 @@ before it is reached.
 
 `TASKS` carries one further limit, `max_msgs_per_subject` (4096; amended 9/16). The cap
 above is stream-wide, so one runaway task - a looping harness, a gigabyte of streamed
-artifact text - could consume the whole 20GiB budget and, under `discard: old`, evict
+artifact text - could consume the whole 8GiB budget and, under `discard: old`, evict
 every other session's history on the way out. The per-subject cap makes a runaway pay
 for its own runaway and nobody else's. Be precise about what it is not: a session's
 publish grant is `a2a.tasks.<pod>.*.events` - the task id is not part of the attested
@@ -95,8 +152,9 @@ the sibling of `PostFinalDropped` for assertion 10, so a truncated replay is a
 degradation a reader can see rather than a short history it cannot distinguish from a
 real one. On the number, sized against the publisher that means it rather than the
 well-behaved one: the render sets no `max_payload`, so NATS' 1MiB default is the
-per-message ceiling and 4096 messages is a ~4GiB worst case on one subject - a fifth of
-the stream. The worker adapter's own result chunks are 256KiB, so a task built out of
+per-message ceiling and 4096 messages is a ~4GiB worst case on one subject - half of
+the 8GiB stream since #4476, so a subject that means it can still evict half the other
+sessions' history; the per-subject cap bounds a runaway, not a determined publisher. The worker adapter's own result chunks are 256KiB, so a task built out of
 those reaches nearer 1GiB at the same count, but that is a property of one publisher and
 not a bound the bus enforces. A chat-driven task emits single digits to low hundreds of
 events; reaching 4096 is already a loop or a gigabyte of streamed artifact text. The
@@ -297,10 +355,24 @@ Status (amended 9/4, the callout armed; amended 9/8, sessions moved; amended 9/1
 callout**, by presenting a projected ServiceAccount token: the bus provisioning Job,
 every spawned session pod, the platform agent container, the capability verifier, and
 (amended 10/28, #3655) the AgentProfile dispatcher, when the operator has its image
-(`A2A_DISPATCHER_IMAGE`; off by default until profiles dispatch end to end).
+(`A2A_DISPATCHER_IMAGE`; off by default until profiles dispatch end to end). Amended
+11/10: on by default, at the release set's image, and off at `A2A_PROFILE_DISPATCHER=false`
+(the chart's `operator.profileDispatcher.enabled`).
 The dispatcher's grants name each profile durable it reads on `PROFILE_SUBMITS` and each
 profile it dispatches for; it reconnects when its config adds one, and tasks it holds keep
-running across the reconnect. With a dispatcher the
+running across the reconnect. Listing them all in its map entry grows the entry about
+1.1 KB per profile tier, and past about 1,000 profiles no single user JWT can carry them (#5381).
+With `A2A_DISPATCHER_BUCKETED_GRANTS=true` on the operator, the entry narrows on
+`dispatcher` instead. It carries only the fixed grants, which are its control connection's,
+and the draining profiles' names. A connection that sends the bucket `<b>/32` as its
+CONNECT password beside the token gets the per-profile grants, draining profiles' included,
+of the profiles that hash to bucket b (fnv32a of the name, mod 32): the callout derives them
+from the map's profile entries with `lib.DispatcherGrants`, plus the bucket's own inbox. The
+password picks a slice of what the token already allows; it is not a credential. A bucket the
+callout doesn't accept is refused, never served the control grants. The hash is unkeyed, so
+names chosen to collide fill one bucket, whose mint fails closed at roughly 450 two-tier
+profiles. The switch is off by default, and stays off until the dispatcher opens its bucket
+connections. With a dispatcher the
 operator principal also creates and deletes those durables, and it is the only principal
 with a consumer verb on that stream. **Statically**, from `nats.conf` and listed in `auth_users`:
 the callout itself, which cannot authenticate through the thing it is; the chatops
@@ -615,10 +687,16 @@ Layout:
   one peer every new connection depends on - and nothing looks broken when that
   happens, because established connections are already authorized and keep working
   while the fabric silently accepts no new client. Still owed as they arm: the audit
-  exporter, the janitor, and the metrics scrape (the alert set above is scraped
-  series), and the NATS pods themselves on their route port the moment the deployment
-  leaves the single-node dev shape - a 3-node cluster's servers dial each other, and a
-  fence without the route peer prevents the cluster from ever forming. The topic-grant corollary that two edits
+  exporter and the janitor. The metrics scrape landed (amended 11/9, #4477) without a
+  new peer on 8222, whose one peer stays the operator's pod (for reload
+  confirmation): a `prometheus-nats-exporter` sidecar in each NATS pod reads 8222 over
+  loopback and serves on 7777, and a separate rule admits the managed collector's
+  namespace (`gke-gmp-system`) and the operator's own pod to 7777 and nothing else; the
+  operator reads the stream list there to notice a provisioned stream gone missing
+  (amended 11/10, #4290). The NATS pods' own route peer, which this list used to carry as owed, landed
+  with the three-server default (amended 10/29, #3274): a separate rule admits 6222 from
+  the bus's servers and nothing else, since a fence without it keeps the cluster from
+  ever forming. The topic-grant corollary that two edits
   travel together, applied to the fence. A second policy in the same amendment
   fences the session pods' egress (DNS, 4222 by label, LiteLLM - a spawned worker has no
   other legitimate destination, save the credential broker on its one port when the
@@ -781,7 +859,8 @@ changed value changes the pod template, which rolls the callout. The same check 
 refuses a narrowed pod named after a user in the callout's own identity map (`provision`,
 `agent`, `verifier`, `session`, and any user the map gains), because the callout mints
 each entry that is not narrowed under its `user` and that entry's grants carry
-`_INBOX.<user>.>`; the narrowed entry's own user, `session`, is never minted and is
+`_INBOX.<user>.>` (the dispatcher's entry, though narrowed, is minted under its `user` too,
+and its bucket users `<user>-b0` to `<user>-b31` are reserved with the rest); the narrowed entry's own user, `session`, is never minted and is
 reserved with the rest because one check covers every map user. Those names
 come from the map being served, not from the variable: they are built when the map is
 parsed and installed with it, so a reload that adds or removes a user moves the reserved

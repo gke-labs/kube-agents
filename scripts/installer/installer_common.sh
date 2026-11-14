@@ -2017,7 +2017,8 @@ load_install_env() {
   # install the file records as GitHub, and an inherited GITOPS_HOST would
   # move a GitHub install to a GitHub Enterprise Server. --gitops-forge and
   # --gitops-host are the per-run way in.
-  unset GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_CA_SECRET
+  unset GITOPS_FORGE GITOPS_HOST GITLAB_TOKEN_SECRET GITOPS_CA_SECRET GITOPS_IDENTITY \
+    GITOPS_SWITCH_FROM_FORGE GITOPS_SWITCH_FROM_SECRET
   [ -n "$file" ] && [ -f "$file" ] || return 1
   # Checked before sourcing: a stray quote would otherwise abort the caller
   # through its ERR trap with a bash parse error naming no file.
@@ -2320,8 +2321,8 @@ check_github_org_is_organization() {
   local where="GitHub"
   [ -n "$host" ] && where="$host"
   [ -z "$org" ] && return 0
-  # A GitLab install has no token minter, so no GitHub account to check.
-  [ "${GITOPS_FORGE:-${DEFAULT_GITOPS_FORGE:-github}}" = "gitlab" ] && return 0
+  # A GitLab or Bitbucket install has no token minter, so no GitHub account to check.
+  [ "${GITOPS_FORGE:-${DEFAULT_GITOPS_FORGE:-github}}" = "github" ] || return 0
 
   if is_truthy "${SKIP_GITHUB_ORG_CHECK:-false}"; then
     print_warning "SKIP_GITHUB_ORG_CHECK=true is set; not verifying that '${org}' is an organization."
@@ -2506,6 +2507,12 @@ print_minter_restore_advice() {
 hcl_str() {
   local s="${1//\\/\\\\}"
   s="${s//\"/\\\"}"
+  # HCL reads ${ and %{ in a quoted string as a template sequence; doubling
+  # the first character writes them literally. Through variables, because
+  # bash 3.2 and bash 5 read escapes in a replacement string differently.
+  local tpl='${' tpl_lit='$${' dir='%{' dir_lit='%%{'
+  s="${s//"$tpl"/$tpl_lit}"
+  s="${s//"$dir"/$dir_lit}"
   printf '"%s"' "$s"
 }
 
@@ -4152,15 +4159,20 @@ sys.exit(0)
 # ─── The minter's per-install names (#3504) ──────────────────────────────────
 # The token minter's key ring, key and GSA used to default to one fixed name
 # per project, so a second install that took the defaults adopted the first
-# install's App key. A new install now derives them from its cluster. An
-# install whose state already holds a minter keeps the names in its state: a
-# KMS key ring or key cannot be deleted, and renaming one plans a replacement
-# that would leave the old key and its versions behind.
+# install's App key. A new install now derives them from its cluster, and its
+# KSA too (#5282): Workload Identity's member names the project, namespace and
+# KSA but no cluster, so with one KSA name every install in a project could act
+# as every install's minter GSA. An install whose state already holds a
+# minter keeps the names in its state: a KMS key ring or key cannot be deleted,
+# and renaming one plans a replacement that would leave the old key and its
+# versions behind.
 
 # The names a new install derives from its cluster, separated by |: key ring,
-# key, GSA. A GSA id is 6-30 characters, so a cluster name too long for
+# key, GSA, KSA. A GSA id is 6-30 characters, so a cluster name too long for
 # "<cluster>-minter" keeps its first 18 characters and gains four hex
 # characters of its hash, which keeps two long names that share a prefix apart.
+# The KSA needs no such cut: a GKE cluster name is at most 40 characters, so
+# "<cluster>-github-minter" fits a 63-character DNS label.
 minter_derived_names() {
   local cluster=$1 gsa prefix hash
   gsa="${cluster}-minter"
@@ -4172,28 +4184,37 @@ minter_derived_names() {
     prefix="${prefix%-}"
     gsa="${prefix}-${hash}-minter"
   fi
-  printf '%s|%s|%s\n' "${cluster}-minter-keyring" "${cluster}-minter-key" "$gsa"
+  printf '%s|%s|%s|%s\n' "${cluster}-minter-keyring" "${cluster}-minter-key" "$gsa" "${cluster}-github-minter"
 }
 
-# The minter's key ring, key and GSA names as this install's state records
-# them (module.github_minter[0]), separated by |; a field the state doesn't
-# hold is empty, and all three are when there is no minter in state or no
-# state. tf_state_read's return code when the state could not be read.
+# The minter's key ring, key, GSA and KSA names as this install's state
+# records them (module.github_minter[0]; the KSA is the one its Workload
+# Identity member names), separated by |; a field the state doesn't hold is
+# empty, and all four are when there is no minter in state or no state.
+# tf_state_read's return code when the state could not be read.
 # shellcheck disable=SC2120
 tf_state_minter_names() {
   trap - ERR
   local state
   state=$(tf_state_read "$@") || return $?
   printf '%s' "$state" | python3 -c '
-import json, sys
+import json, re, sys
 try:
     doc = json.load(sys.stdin)
 except Exception:
     sys.exit(int(sys.argv[1]))
 want = {"google_kms_key_ring": "name", "google_kms_crypto_key": "name", "google_service_account": "account_id"}
 found = {}
+ksa = ""
 for r in doc.get("resources", []):
     if r.get("module") != "module.github_minter[0]" or r.get("mode") != "managed":
+        continue
+    if r.get("type") == "google_service_account_iam_member" and r.get("name") == "workload_identity":
+        for i in r.get("instances", []):
+            # serviceAccount:<project>.svc.id.goog[<namespace>/<ksa>]
+            m = re.search(r"\[[^/\]]+/([^\]]+)\]$", (i.get("attributes") or {}).get("member") or "")
+            if m:
+                ksa = m.group(1)
         continue
     attr = want.get(r.get("type"))
     if not attr or r.get("name") != "minter":
@@ -4202,7 +4223,7 @@ for r in doc.get("resources", []):
         value = (i.get("attributes") or {}).get(attr)
         if value:
             found[r["type"]] = value
-print("|".join(found.get(t, "") for t in want))
+print("|".join([found.get(t, "") for t in want] + [ksa]))
 ' "$TF_STATE_RC_UNREADABLE"
 }
 
@@ -4230,24 +4251,36 @@ minter_key_owner() {
   fi
 }
 
-# This install's default minter names, separated by |: key ring, key, GSA. An
-# install with a minter in its state gets the names it holds (a field the
-# state lacks falls back to the project-wide default it was created under). An
+# This install's default minter names, separated by |: key ring, key, GSA,
+# KSA. An install with a minter in its state gets the names it holds (a field
+# the state lacks falls back to the project-wide default it was created under). An
 # install with none gets the names derived from its cluster. When the state
 # can't be read, nothing can be said about which install this is, so it gets
 # the project-wide defaults an existing install was created with, and says so:
 # a new install there should set its names.
 minter_name_defaults() {
-  local project=$1 cluster=$2 names rc=0 ring="" key="" gsa=""
+  local project=$1 cluster=$2 names rc=0 ring="" key="" gsa="" ksa=""
   names="$(tf_state_minter_names "$project" "$cluster")" || rc=$?
   if [ "$rc" -eq "$TF_STATE_RC_UNREADABLE" ]; then
-    print_warning "Could not read this install's Terraform state, so the token minter keeps the project-wide default names (${DEFAULT_KMS_KEYRING}/${DEFAULT_KMS_KEY}, ${DEFAULT_GITHUB_MINTER_GSA_NAME}). On a new install, set KMS_KEYRING, KMS_KEY and GITHUB_MINTER_GSA_NAME to names of its own." >&2
-    printf '%s|%s|%s\n' "$DEFAULT_KMS_KEYRING" "$DEFAULT_KMS_KEY" "$DEFAULT_GITHUB_MINTER_GSA_NAME"
+    print_warning "Could not read this install's Terraform state, so the token minter keeps the project-wide default names (${DEFAULT_KMS_KEYRING}/${DEFAULT_KMS_KEY}, ${DEFAULT_GITHUB_MINTER_GSA_NAME}, KSA ${DEFAULT_GITHUB_MINTER_KSA_NAME}). On a new install, set KMS_KEYRING, KMS_KEY, GITHUB_MINTER_GSA_NAME and GITHUB_MINTER_KSA_NAME to names of its own." >&2
+    printf '%s|%s|%s|%s\n' "$DEFAULT_KMS_KEYRING" "$DEFAULT_KMS_KEY" "$DEFAULT_GITHUB_MINTER_GSA_NAME" "$DEFAULT_GITHUB_MINTER_KSA_NAME"
     return 0
   fi
-  IFS='|' read -r ring key gsa <<<"$names"
-  if [ -n "${ring}${key}${gsa}" ]; then
-    printf '%s|%s|%s\n' "${ring:-$DEFAULT_KMS_KEYRING}" "${key:-$DEFAULT_KMS_KEY}" "${gsa:-$DEFAULT_GITHUB_MINTER_GSA_NAME}"
+  IFS='|' read -r ring key gsa ksa <<<"$names"
+  if [ -n "${ring}${key}${gsa}${ksa}" ]; then
+    # A state with no binding yet is an apply that stopped partway. Its KSA is
+    # the derived one when its GSA is, since both came from one run's names:
+    # the shared default here would hand a new install the name #5282 exists
+    # to retire.
+    if [ -z "$ksa" ]; then
+      local derived_gsa derived_ksa
+      IFS='|' read -r _ _ derived_gsa derived_ksa <<<"$(minter_derived_names "$cluster")"
+      if [ -n "$gsa" ] && [ "$gsa" = "$derived_gsa" ]; then
+        ksa="$derived_ksa"
+      fi
+    fi
+    printf '%s|%s|%s|%s\n' "${ring:-$DEFAULT_KMS_KEYRING}" "${key:-$DEFAULT_KMS_KEY}" \
+      "${gsa:-$DEFAULT_GITHUB_MINTER_GSA_NAME}" "${ksa:-$DEFAULT_GITHUB_MINTER_KSA_NAME}"
     return 0
   fi
   minter_derived_names "$cluster"
@@ -5203,9 +5236,9 @@ write_tfvars_from_state() {
   # import mutating anything before the confirmation (or on a dry run).
   # With no key and no PEM, defer the minter loudly rather than wedge.
   local enable_github_minter="false"
-  # A GitLab install has no GitHub App: the GitOps repository is on GitLab and
-  # the composition refuses the minter beside it.
-  if [ "${GITOPS_FORGE:-${DEFAULT_GITOPS_FORGE:-github}}" = "gitlab" ]; then
+  # A GitLab or Bitbucket install has no GitHub App: the GitOps repository is
+  # on that forge and the composition refuses the minter beside it.
+  if [ "${GITOPS_FORGE:-${DEFAULT_GITOPS_FORGE:-github}}" != "github" ]; then
     :
   elif [ -n "${GITOPS_ORG:-}" ] && [ -n "${GITOPS_REPO:-}" ] && [ -n "${GITHUB_APP_ID:-}" ]; then
     local minter_key_version=""
@@ -5481,6 +5514,8 @@ write_tfvars_from_state() {
     echo "agent_service_account_id         = $(hcl_str "${PLATFORM_AGENT_GSA_NAME:-$DEFAULT_PLATFORM_AGENT_GSA_NAME}")"
     echo "github_minter_service_account_id = $(hcl_str "${GITHUB_MINTER_GSA_NAME:-$DEFAULT_GITHUB_MINTER_GSA_NAME}")"
     echo "litellm_service_account_id       = $(hcl_str "${LITELLM_GSA_NAME:-$DEFAULT_LITELLM_GSA_NAME}")"
+    echo "# The minter's KSA, the other half of its Workload Identity binding."
+    echo "github_minter_ksa_name           = $(hcl_str "${GITHUB_MINTER_KSA_NAME:-$DEFAULT_GITHUB_MINTER_KSA_NAME}")"
     echo ""
     echo "# GKE database encryption. install.sh's existing-cluster step reads the"
     echo "# same two keys, so a create and an adoption encrypt with one key."
@@ -5653,6 +5688,19 @@ write_tfvars_from_state() {
       # it always has.
       if [ -n "${GITOPS_CA_SECRET:-}" ]; then
         echo "gitlab_ca_secret_name     = $(hcl_str "${GITOPS_CA_SECRET}")"
+      fi
+    elif [ "${GITOPS_FORGE:-}" = "bitbucket" ] || [ "${GITOPS_FORGE:-}" = "bitbucket-datacenter" ]; then
+      # A Bitbucket install, Cloud or Data Center: the neutral variables.
+      # GITOPS_REPO is workspace/slug on Cloud and KEY/slug on Data Center.
+      echo "gitops_forge              = $(hcl_str "${GITOPS_FORGE}")"
+      echo "gitops_host               = $(hcl_str "${GITOPS_HOST:-}")"
+      echo "gitops_repo_path          = $(hcl_str "${GITOPS_REPO:-}")"
+      echo "gitops_token_secret_name  = $(hcl_str "${GITLAB_TOKEN_SECRET:-${DEFAULT_BITBUCKET_TOKEN_SECRET:-bitbucket-forge-token}}")"
+      if [ -n "${GITOPS_CA_SECRET:-}" ]; then
+        echo "gitops_ca_secret_name     = $(hcl_str "${GITOPS_CA_SECRET}")"
+      fi
+      if [ -n "${GITOPS_IDENTITY:-}" ]; then
+        echo "gitops_identity           = $(hcl_str "${GITOPS_IDENTITY}")"
       fi
     elif [ -n "${GITOPS_ORG:-}" ] && [ -n "${GITOPS_REPO:-}" ]; then
       echo "github_repo = $(hcl_str "${GITOPS_ORG}/${GITOPS_REPO}")"

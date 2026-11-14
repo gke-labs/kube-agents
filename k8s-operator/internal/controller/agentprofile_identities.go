@@ -21,6 +21,7 @@ import (
 	"os"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/util/validation"
@@ -150,7 +151,8 @@ type agentProfileTierIdentity struct {
 //
 // Each is reserved whether or not this agent renders it now (the session
 // account only on next, the MCP account only under A2A_MCP_DOOR, the scope
-// publisher's only while a publisher may run): a flip or a flag turned on
+// publisher's only while a publisher may run, the dispatcher's only while it
+// is switched on): a flip or a flag turned on
 // later must not find a profile or an override already holding the name.
 //
 // `default` is reserved because every pod in the namespace that names no
@@ -169,6 +171,7 @@ func reservedProfileServiceAccounts(agent *agentv1alpha1.PlatformAgent) map[stri
 		shellSandboxServiceAccountName(agent): "the shell sandbox's ServiceAccount",
 		a2aMCPServiceAccountName(agent):       "the A2A MCP server's ServiceAccount, the broker's mcp caller",
 		scopePublisherName(agent):             "the scope publisher's ServiceAccount, the broker's scope caller",
+		a2aDispatcherName(agent):              "the profile dispatcher's ServiceAccount, which carries its bus principal and Jobs RBAC",
 	}
 }
 
@@ -206,14 +209,7 @@ func resolveAgentProfileIdentities(agent *agentv1alpha1.PlatformAgent, profiles 
 	// Oldest first, so an incumbent keeps a contested ServiceAccount and a
 	// newcomer naming it is the one refused; name breaks ties, so the answer
 	// never depends on list order.
-	sorted := append([]agentv1alpha1.AgentProfile(nil), profiles...)
-	sort.Slice(sorted, func(i, j int) bool {
-		ti, tj := sorted[i].CreationTimestamp, sorted[j].CreationTimestamp
-		if !ti.Equal(&tj) {
-			return ti.Before(&tj)
-		}
-		return sorted[i].Name < sorted[j].Name
-	})
+	sorted := sortedOldestFirst(profiles)
 
 	out := make(map[string]agentProfileResolution, len(sorted))
 	claimedBy := map[string]string{}
@@ -222,7 +218,26 @@ func resolveAgentProfileIdentities(agent *agentv1alpha1.PlatformAgent, profiles 
 		p := &sorted[i]
 		out[p.Name] = resolveOneAgentProfile(p, agent, reserved, mapKeys, claimedBy, profilesNS)
 	}
+	// While the dispatcher runs, only as many profiles as its identity can
+	// carry are bound, oldest first (gke-labs/kube-agents#5381).
+	if a2aDispatcherEnabled() {
+		refuseOverDispatcherCeiling(agent, sorted, out)
+	}
 	return out
+}
+
+// sortedOldestFirst is profiles by creation time, name breaking ties, so an
+// answer that depends on order never depends on list order.
+func sortedOldestFirst(profiles []agentv1alpha1.AgentProfile) []agentv1alpha1.AgentProfile {
+	sorted := append([]agentv1alpha1.AgentProfile(nil), profiles...)
+	sort.Slice(sorted, func(i, j int) bool {
+		ti, tj := sorted[i].CreationTimestamp, sorted[j].CreationTimestamp
+		if !ti.Equal(&tj) {
+			return ti.Before(&tj)
+		}
+		return sorted[i].Name < sorted[j].Name
+	})
+	return sorted
 }
 
 // resolveOneAgentProfile decides one profile's identities, recording each
@@ -242,6 +257,12 @@ func resolveOneAgentProfile(p *agentv1alpha1.AgentProfile, agent *agentv1alpha1.
 		return agentProfileResolution{refused: fmt.Errorf("topic grant %q is not shared.{topic} or agent.{agent}.{topic}", malformedTopicGrant(p)), reason: reasonAgentProfileInvalid}
 	case foreignPublishTopic(p) != "":
 		return agentProfileResolution{refused: fmt.Errorf("publish topic %q is another agent's: an agent-scoped topic has one writer, the agent it names, so a profile publishes only agent.%s.<topic>", foreignPublishTopic(p), p.Name), reason: reasonAgentProfileInvalid}
+	case a2aDispatcherEnabled() && a2aDispatcherBucketedGrants() && isDispatcherBucketUser(p.Name):
+		// With bucketed grants, the dispatcher's bucket users are names no
+		// profile may hold (validateA2AAuthMapIdentities' set rule): one
+		// profile named for one would fail the whole map. Refused here so
+		// it is isolated with a condition instead (#5553, round 1).
+		return agentProfileResolution{refused: fmt.Errorf("profile name %q is one of the dispatcher's bucket users (%s-b0 to %s-b%d)", p.Name, a2aDispatcherUser, a2aDispatcherUser, a2aDispatcherBuckets-1), reason: reasonAgentProfileInvalid}
 	case p.Name == a2aBridgeAddressee:
 		// The CRD refuses this name too; the operator does not rely on
 		// admission alone, because CRD validation can be bypassed by an
@@ -442,4 +463,15 @@ func operatorServiceAccountNames(agent *agentv1alpha1.PlatformAgent) []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+// isDispatcherBucketUser reports whether name is one of the dispatcher's
+// bucket users, <a2aDispatcherUser>-b<n> for n below a2aDispatcherBuckets.
+func isDispatcherBucketUser(name string) bool {
+	rest, ok := strings.CutPrefix(name, a2aDispatcherUser+"-b")
+	if !ok || rest == "" || (len(rest) > 1 && rest[0] == '0') {
+		return false
+	}
+	n, err := strconv.Atoi(rest)
+	return err == nil && n >= 0 && n < a2aDispatcherBuckets
 }
