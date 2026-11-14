@@ -102,7 +102,24 @@ from kube_agents_bench import (
     worker_trajectory,
 )
 from kube_agents_bench.parsing import DELEGATION_TOOL
-from kube_agents_bench.shell_words import _INTERPRETER_RE, _command_word_index, _shell_argvs, _typed_call_may_join, _without_grep_patterns
+from kube_agents_bench.shell_words import (
+    _INTERPRETER_RE,
+    _SHELL_ARITHMETIC_OPENER,
+    _SHELL_ASSIGNMENT_RE,
+    _SHELL_EVAL,
+    _SHELL_LINE_END,
+    _SHELL_PROGRAMS_WITH_COMMAND_STRING,
+    _command_word_index,
+    _extract_shell_command_string,
+    _is_control_operator,
+    _is_redirect,
+    _scan_command_prefix,
+    _shell_argvs,
+    _shell_words_and_spans,
+    _substitution_commands,
+    _typed_call_may_join,
+    _without_grep_patterns,
+)
 from kube_agents_bench.fleet import (
     ROLE_PATTERN,
     FleetRoleUnresolved,
@@ -1830,6 +1847,87 @@ def _read_clipped_args(text: str) -> dict[str, Any]:
     return values
 
 
+def _read_clipped_arg_head(text: str, target: str) -> str | None:
+    """The head of a top-level string argument whose value was cut before closing."""
+    depth = 0
+    key: str | None = None
+    i = 0
+    while i < len(text):
+        char = text[i]
+        if char == '"':
+            literal = _JSON_STRING.match(text, i)
+            if literal is None:
+                if key == target and depth == 1:
+                    return _json_string_body(text[i + 1:])
+                return None
+            string = _json_string_body(literal.group(1))
+            colon = _JSON_KEY_COLON.match(text, literal.end())
+            if colon is not None:
+                key = string if depth == 1 else None
+                i = colon.end()
+                continue
+            key = None
+            i = literal.end()
+            continue
+        if char in "{[":
+            depth += 1
+            key = None
+        elif char in "}]":
+            depth -= 1
+            key = None
+        elif char == ",":
+            key = None
+        elif key is not None and not char.isspace():
+            scalar = _JSON_SCALAR.match(text, i)
+            if scalar is not None:
+                key = None
+                i = scalar.end()
+                continue
+        i += 1
+    return None
+
+
+def _read_clipped_closed_top_level(text: str, target: str) -> str | None:
+    """The last closed top-level string value for target, even if a later cut key dropped it from parsed args."""
+    depth = 0
+    key: str | None = None
+    last_val: str | None = None
+    i = 0
+    while i < len(text):
+        char = text[i]
+        if char == '"':
+            literal = _JSON_STRING.match(text, i)
+            if literal is None:
+                return last_val
+            string = _json_string_body(literal.group(1))
+            colon = _JSON_KEY_COLON.match(text, literal.end())
+            if colon is not None:
+                key = string if depth == 1 else None
+                i = colon.end()
+                continue
+            if key == target and depth == 1:
+                last_val = string
+            key = None
+            i = literal.end()
+            continue
+        if char in "{[":
+            depth += 1
+            key = None
+        elif char in "}]":
+            depth -= 1
+            key = None
+        elif char == ",":
+            key = None
+        elif key is not None and not char.isspace():
+            scalar = _JSON_SCALAR.match(text, i)
+            if scalar is not None:
+                key = None
+                i = scalar.end()
+                continue
+        i += 1
+    return last_val
+
+
 def _args_withheld(entry: dict[str, Any]) -> bool:
     """Whether the pod withheld this call's arguments, so a filter on them cannot decide it."""
     args = entry.get("args")
@@ -2561,6 +2659,26 @@ _NO_WORKER_TERMINAL_CALLS_REASON = (
     "observe its subject (a worker whose tagged calls are all MCP or board calls, with an empty "
     "card log, grades as zero commands)"
 )
+_NO_WORKER_TERMINAL_CALLS_SUCCEEDED_REASON = (
+    "no delegated worker's terminal or execute_code calls are readable in the trajectory: no "
+    "card was delegated or the worker-trajectory capture did not run, so required run(s) requiring "
+    "success could not be verified (a worker whose tagged calls are all MCP or board calls, with an "
+    "empty card log, grades as zero commands)"
+)
+_TRAJ_MISSING_CARD_LOG_REASON = (
+    "the worker card log shows {named} ran, but the worker trajectory did not capture the call"
+)
+_TRAJ_MISSING_NO_TRAJ_REASON = (
+    "no card was delegated or the worker-trajectory capture did not run, so {named} could not be verified"
+)
+_UNRUN_MASKED_REASON = (
+    "{named} ran, but the dictated form is the command alone on its line; "
+    "an operator, connective, or wrapper on the line means its exit is not credited "
+    "(see WorkerRun.succeeded)"
+)
+_UNRUN_CLIPPED_REASON = (
+    "the call's command was clipped in the pod, so what followed the run on the line is unknown ({named})"
+)
 _UNTIMED_WORKER_CALLS_REASON = (
     "{count} worker terminal call(s) carry no numeric time ({shown}), so the ordered read "
     "cannot say what came after the refusal"
@@ -2601,13 +2719,23 @@ class WorkerRun(BaseModel):
     words, and ``word_patterns``, regular expressions each of which some later word of the segment
     must match on its own (``^(?:get|describe)$`` for a verb; a resource list such as
     ``pdb,validatingwebhookconfigurations`` is one word, so a pattern over the word reads it
-    whole, and a quoted mention of the whole command is one word that is no command)."""
+    whole, and a quoted mention of the whole command is one word that is no command), and
+    ``succeeded`` (for ``required_runs`` only), whether the command must have exited 0 (graded from
+    the worker trajectory's terminal call exit status; a non-zero or unrecorded exit does not count;
+    to ensure the call's exit status faithfully reflects the command, the command segment must run
+    alone on its line; connectives at depth 0 such as preceding or following ``&&``, ``||``, ``|``,
+    ``;``, ``&``, or newlines, leading negation (``!``), or detaching, loop, or non-propagating
+    wrappers such as ``setsid`` without ``-w``, ``sudo -b``, ``watch``, ``xargs``, ``flock``, or ``time``,
+    do not credit exit; lone assignment command substitutions propagate exit status when the inner
+    command runs alone; a required run with ``succeeded: true`` and no worker trajectory to read is
+    not credited)."""
 
     model_config = ConfigDict(extra="forbid")
 
     script: str
     flags: list[str] = Field(default_factory=list)
     word_patterns: list[str] = Field(default_factory=list)
+    succeeded: bool = False
 
     @field_validator("word_patterns")
     @classmethod
@@ -2636,6 +2764,145 @@ class WorkerRun(BaseModel):
             if not flag or any(char.isspace() for char in flag):
                 raise ValueError(f"each flag must be one word, not {flag!r}")
         return flags
+
+
+def _has_leading_negation(seg: list[str]) -> bool:
+    """True if seg starts with pipeline negation ! (possibly after time, -p, or NAME=val assignments)."""
+    i = 0
+    while i < len(seg):
+        w = seg[i]
+        if _SHELL_ASSIGNMENT_RE.match(w):
+            i += 1
+            continue
+        if w == "time" or os.path.basename(w) == "time":
+            i += 1
+            while i < len(seg) and seg[i] in ("-p", "--portability"):
+                i += 1
+            continue
+        return w == "!"
+    return False
+
+
+def _has_detaching_wrapper(seg: list[str]) -> bool:
+    """True if seg invokes an exec wrapper with options that detach the process
+    or do not guarantee exit propagation (see :class:`WorkerRun` for wrapper and operator rules)."""
+    wrappers, _ = _scan_command_prefix(seg)
+    return any(detaches for _, _, detaches in wrappers)
+
+
+def _shell_argvs_with_exit_propagation(
+    command: str, outer_spans: tuple[str, ...] | list[str] = ()
+) -> list[tuple[list[str], bool]]:
+    """Like :func:`_shell_argvs`, but pairs each argv with a boolean indicating whether the
+    shell line's final exit code faithfully reflects this segment's success or failure.
+    See :class:`WorkerRun` (``succeeded``) for the exit propagation and operator rules.
+    Redirects (``>``, ``2>&1``), environment assignments (``NAME=val``), non-detaching wrappers,
+    transparent subshell parens ``(cmd)``, and lone command substitutions ``VAR=$(cmd)`` where the
+    inner command runs alone propagate exit status."""
+    words, spans = _shell_words_and_spans(command)
+    segments: list[list[str]] = []
+    leading_ops: list[str] = []
+    argv: list[str] = []
+    current_ops: list[str] = []
+    post_paren_redirect_target = False
+
+    for i, word in enumerate(words):
+        if post_paren_redirect_target:
+            post_paren_redirect_target = False
+            continue
+        if current_ops and current_ops[-1] == ")":
+            if _is_redirect(word) or (word.isdigit() and i + 1 < len(words) and _is_redirect(words[i + 1])):
+                post_paren_redirect_target = not word.isdigit()
+                continue
+        if _is_control_operator(word):
+            op_str = str(word)
+            if argv:
+                if op_str == "(" and (argv == ["!"] or _has_leading_negation(argv)):
+                    leading_ops.extend(["!", "("])
+                    argv = []
+                else:
+                    segments.append(argv)
+                    argv = []
+                    current_ops = [op_str]
+            else:
+                if op_str == _SHELL_LINE_END and current_ops and current_ops[-1] in ("&&", "||", "|", "|&"):
+                    continue
+                current_ops.append(op_str)
+            continue
+        if current_ops:
+            if not segments:
+                leading_ops.extend(op for op in current_ops if op != _SHELL_LINE_END)
+            current_ops = []
+        argv.append(word)
+
+    if argv:
+        segments.append(argv)
+
+    results: list[tuple[list[str], bool]] = []
+    leading_ops = [op for op in leading_ops if op != _SHELL_LINE_END]
+    current_ops = [op for op in current_ops if op not in (_SHELL_LINE_END, ";")]
+    trailing_bg = any(op == "&" for op in current_ops)
+    handled_spans: list[str] = []
+
+    for seg in segments:
+        carries_exit = len(segments) == 1 and not trailing_bg
+        if carries_exit and _has_detaching_wrapper(seg):
+            carries_exit = False
+        if carries_exit and _has_leading_negation(seg):
+            carries_exit = False
+        if carries_exit and (any(op != "(" for op in leading_ops) or any(op != ")" for op in current_ops)):
+            carries_exit = False
+
+        results.append((seg, carries_exit))
+
+        if len(seg) == 1 and _SHELL_ASSIGNMENT_RE.match(seg[0]):
+            _, _, val = seg[0].partition("=")
+            inner = (
+                _substitution_commands(val)
+                if val in spans
+                and val.startswith(("$", "`"))
+                and not val.startswith(_SHELL_ARITHMETIC_OPENER)
+                else None
+            )
+            if inner is not None:
+                handled_spans.append(val)
+                is_outer = val in outer_spans
+                for inner_argv, inner_carries in _shell_argvs_with_exit_propagation(
+                    inner, outer_spans=outer_spans
+                ):
+                    results.append(
+                        (inner_argv, False if is_outer else (carries_exit and inner_carries))
+                    )
+
+        index = _command_word_index(seg)
+        if index is not None and seg[index] == _SHELL_EVAL:
+            for inner_argv, _ in _shell_argvs_with_exit_propagation(
+                " ".join(seg[index + 1:]), outer_spans=outer_spans
+            ):
+                results.append((inner_argv, False))
+            continue
+        if index is not None and os.path.basename(seg[index]) in _SHELL_PROGRAMS_WITH_COMMAND_STRING:
+            cmd_string, has_noexec, has_help_or_version = _extract_shell_command_string(seg, index + 1)
+            if cmd_string is not None:
+                shell_carries = carries_exit and not has_noexec and not has_help_or_version
+                for inner_argv, inner_carries in _shell_argvs_with_exit_propagation(
+                    cmd_string, outer_spans=(*outer_spans, *spans)
+                ):
+                    results.append((inner_argv, shell_carries and inner_carries))
+
+    remaining_spans = list(spans)
+    for val in handled_spans:
+        if val in remaining_spans:
+            remaining_spans.remove(val)
+    for span in remaining_spans:
+        inner = _substitution_commands(span)
+        if inner is not None:
+            for inner_argv, _ in _shell_argvs_with_exit_propagation(
+                inner, outer_spans=outer_spans
+            ):
+                results.append((inner_argv, False))
+
+    return results
 
 
 def _argv_runs(argv: list[str], run: WorkerRun) -> bool:
@@ -2672,6 +2939,57 @@ def _words_after_carry(words: list[str], run: WorkerRun) -> bool:
     return all(flag in words for flag in run.flags) and all(any(re.search(pattern, word) for word in words) for pattern in run.word_patterns)
 
 
+def _code_call_text_and_clip(entry: dict[str, Any]) -> tuple[str | None, bool]:
+    """The command a ``terminal`` call ran, or the program an ``execute_code``
+    call ran, and whether the command came from a clipped head regex; (None, False)
+    for any other tool or a call that carries neither."""
+    if entry.get("name") not in _CODE_TOOLS:
+        return None, False
+    if _args_withheld(entry):
+        return None, False
+    args = entry.get("args")
+    if not isinstance(args, dict):
+        return None, False
+    target = _COMMAND_ARG if entry.get("name") == _TERMINAL_TOOL else _CODE_ARG
+    is_clipped = False
+    command: str | None = None
+    if set(args) == {"raw"} and isinstance(args["raw"], str):
+        raw = args["raw"]
+        clip = _CLIPPED_ARGS.search(raw)
+        if clip is not None:
+            text = raw[: clip.start()]
+            parsed = _read_clipped_args(text)
+            if target in parsed and isinstance(parsed[target], str):
+                command = parsed[target]
+            else:
+                is_clipped = True
+                head = _read_clipped_arg_head(text, target)
+                if head is not None:
+                    command = head
+                else:
+                    closed = _read_clipped_closed_top_level(text, target)
+                    if closed is not None:
+                        command = closed
+        else:
+            args_parsed = _clipped_string_args(raw, {_COMMAND_ARG: "", _CODE_ARG: ""})
+            if target in args_parsed and isinstance(args_parsed[target], str):
+                command = args_parsed[target]
+            else:
+                is_clipped = True
+                head_re = _CLIPPED_COMMAND_HEAD_RE if target == _COMMAND_ARG else _CLIPPED_CODE_HEAD_RE
+                head = head_re.search(raw)
+                if head is not None:
+                    try:
+                        command = json.loads('"' + head.group(1) + '"')
+                    except ValueError:
+                        command = head.group(1)
+    else:
+        val = args.get(target)
+        if isinstance(val, str):
+            command = val
+    return command, is_clipped
+
+
 def _code_call_text(entry: dict[str, Any]) -> str | None:
     """The command a ``terminal`` call ran, or the program an ``execute_code``
     call ran; None for any other tool or a call that carries neither. An
@@ -2679,32 +2997,12 @@ def _code_call_text(entry: dict[str, Any]) -> str | None:
     command is read out of the text, as ``tool_called`` reads its arguments,
     and one clipped inside the command itself keeps the head that survived,
     which carries the verb."""
-    if entry.get("name") not in _CODE_TOOLS:
-        return None
-    args = entry.get("args")
-    if not isinstance(args, dict):
-        return None
-    if set(args) == {"raw"} and isinstance(args["raw"], str):
-        raw = args["raw"]
-        args = _clipped_string_args(raw, {_COMMAND_ARG: "", _CODE_ARG: ""})
-        if _COMMAND_ARG not in args and _CODE_ARG not in args:
-            # The value itself was cut: read its head, as far as the clip kept it.
-            for name, head_re in ((_COMMAND_ARG, _CLIPPED_COMMAND_HEAD_RE), (_CODE_ARG, _CLIPPED_CODE_HEAD_RE)):
-                head = head_re.search(raw)
-                if head is not None:
-                    try:
-                        args = {name: json.loads('"' + head.group(1) + '"')}
-                    except ValueError:
-                        args = {name: head.group(1)}
-                    break
-    command = args.get(_COMMAND_ARG)
-    if entry.get("name") != _TERMINAL_TOOL:
-        command = args.get(_CODE_ARG)  # ``execute_code``: the program text is the command
-    return command if isinstance(command, str) else None
+    command, _ = _code_call_text_and_clip(entry)
+    return command
 
 
-def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[str, float | None, str, str, bool]]:
-    """``(card, at, command, result, failed)`` per tagged ``terminal`` or ``execute_code`` call, in call-time order.
+def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[str, float | None, str | None, str, bool, bool]]:
+    """``(card, at, command, result, succeeded, is_clipped)`` per tagged ``terminal`` or ``execute_code`` call, in call-time order.
 
     ``card`` is the entry's ``task`` tag (its ``session`` when a card is not
     recorded): the worker the call belongs to. The workers' entries reach
@@ -2713,27 +3011,38 @@ def _worker_terminal_calls(trajectory: list[Any]) -> list[tuple[str, float | Non
     sort is stable, and an entry whose ``at`` is not a number keeps its place
     at the front with ``at`` of ``None``, which the caller treats as a read
     it cannot order. ``at`` is the assistant turn's time, so tool calls one
-    turn issued together share it. The command is read as
-    :func:`_code_call_text` reads it, clipped arguments included. A result
-    that is not text reads as empty; ``failed`` is the pod's verdict on the
-    unclipped result (``status == "error"``), so it survives the clip.
+    turn issued together share it. An argument object clipped in the pod
+    arrives as ``{"raw": text}`` and the command is read out of the text, as
+    ``tool_called`` reads its arguments, and one clipped inside the command
+    itself keeps the head that survived, which carries the verb (or ``None``
+    if clipped before the command value opened). A result that is not text
+    reads as empty; ``succeeded`` is whether the pod recorded a completed
+    result with an exit code of 0 (``status == "completed"`` and an integer
+    exit code of 0, from ``exit_code`` or parsed from JSON ``result``; a
+    non-zero or unrecorded exit is ``False``; ``is_clipped`` is whether the
+    arguments were clipped by the pod).
     """
-    calls: list[tuple[str, float | None, str, str, bool]] = []
+    calls: list[tuple[str, float | None, str | None, str, bool, bool]] = []
     for entry in trajectory:
         if not isinstance(entry, dict) or not entry.get("agent"):
             continue
-        command = _code_call_text(entry)
-        if command is None:
+        command, is_clipped = _code_call_text_and_clip(entry)
+        if command is None and not is_clipped:
             continue
         at = entry.get("at")
         result = entry.get("result")
+        call_exit = entry.get("exit_code")
+        if call_exit is None and isinstance(result, str):
+            call_exit = worker_trajectory.extract_exit_code(result)
+        call_succeeded = entry.get("status") == "completed" and call_exit == 0
         calls.append(
             (
                 str(entry.get("task") or entry.get("session") or ""),
                 float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else None,
                 command,
                 result if isinstance(result, str) else "",
-                entry.get("status") == "error",
+                call_succeeded,
+                is_clipped,
             )
         )
     calls.sort(key=lambda call: float("-inf") if call[1] is None else call[1])
@@ -2794,6 +3103,21 @@ def _card_lineages(parents: dict[str, str], cards: list[str]) -> dict[str, str]:
         for member in component:
             lineage[member] = name
     return lineage
+
+
+def _format_traj_missing_reason(
+    runs: list[WorkerRun], argvs: list[list[str]]
+) -> str:
+    in_log = [r for r in runs if any(_argv_runs(argv, r) for argv in argvs)]
+    not_in_log = [r for r in runs if not any(_argv_runs(argv, r) for argv in argvs)]
+    parts = []
+    if in_log:
+        named = ", ".join(" ".join([run.script, *run.flags]) for run in in_log)
+        parts.append(_TRAJ_MISSING_CARD_LOG_REASON.format(named=named))
+    if not_in_log:
+        named = ", ".join(" ".join([run.script, *run.flags]) for run in not_in_log)
+        parts.append(_TRAJ_MISSING_NO_TRAJ_REASON.format(named=named))
+    return "; ".join(parts)
 
 
 @VERIFIERS.register("worker_commands")
@@ -2899,8 +3223,12 @@ class WorkerCommandsVerifier(BaseVerifier):
     ``required_runs``: each names a script (by basename, or module stem under
     ``-m``), flags and word patterns; some command's shell segment, read as an
     argv, must run it with those flags after it, a word matching each pattern,
-    and no ``-h``/``--help`` (:func:`_argv_runs`). ``forbidden_runs``: the same
-    shape, and no segment may run it. An argv tells a quoted mention of the
+    and no ``-h``/``--help`` (:func:`_argv_runs`). When ``succeeded: true``,
+    the terminal call running the command must have exited 0 (see :class:`WorkerRun`;
+    a non-zero or unrecorded exit does not count; graded from the worker
+    trajectory only, and a required run with ``succeeded: true`` and no worker
+    trajectory to read is not credited).
+    ``forbidden_runs``: the same shape without ``succeeded`` (which it rejects), and no segment may run it. An argv tells a quoted mention of the
     invocation from a run, where a pattern over the text cannot: a forbidden
     ``kubectl get`` of budgets is not met by ``grep "kubectl get pdb" SKILL.md``
     or an echoed sentence, where ``forbidden_patterns`` over the text would be.
@@ -2934,8 +3262,8 @@ class WorkerCommandsVerifier(BaseVerifier):
     log shows no program text); only
     delegated workers' logs or calls are read, never the router's, and a
     worker-filed card is read only as far as the trajectory capture reached
-    it (``worker_capture_gaps`` makes a clean read an error only under
-    ``after_result_pattern``); and a
+    it (``worker_capture_gaps`` makes a clean read an error under
+    ``after_result_pattern`` or when an uncredited ``succeeded: true`` run cannot be verified); and a
     command the shell resolved through an alias appears as typed; and a
     pattern reads the characters on the line, so a word the command splits
     with an empty quote or a backslash inside it (``compute''Metadata``) is
@@ -2959,8 +3287,8 @@ class WorkerCommandsVerifier(BaseVerifier):
     ``--``, the one positional ``flock`` and ``chroot`` take, and a redirect with
     its target -- and a program behind one that is not the script, a shell or an
     interpreter (``sudo ls``, ``nohup echo``) is a command of its own, not a run;
-    which flags take a value is not tabled, so the word after a bare flag is
-    read as its value (``sudo -n ls <script> --readiness`` is still credited);
+    which wrapper flags take a value is tabled, so a valueless flag like
+    ``sudo -n`` does not consume the command;
     and a run made through a script file or a shell's standard input
     (``bash run.sh``, ``nohup bash /tmp/run.sh &``, ``echo "<command>" | bash``,
     ``bash -s < run.sh``) is not read as one, since the argv names the file or
@@ -2973,7 +3301,11 @@ class WorkerCommandsVerifier(BaseVerifier):
     every card's under ``after_result_pattern``), so it credits that line; a
     forbidden run reads a logged card's row, where the heredoc is one line
     behind ``cat``, and does not. A card with no log line is read from its
-    typed calls by both. Under
+    typed calls by both; and ``succeeded: true`` on a required run checks the terminal call's
+    overall exit status from the worker trajectory (see ``WorkerRun.succeeded``
+    for the exit propagation and operator rules), while the dictated form is a bare
+    command or redirection.
+    Under
     ``after_result_pattern``: a refused command whose output the call discarded
     prints nothing into its result; a result is clipped in the pod at
     ``worker_trajectory.MAX_RESULT_CHARS``; a read whose output quotes the
@@ -2981,7 +3313,7 @@ class WorkerCommandsVerifier(BaseVerifier):
     typed, so a route behind a shell variable or an alias is not read; no tagged
     worker call at all, or no readable one (every code-tool call's argument
     withheld), is ``status="error"``, a withheld argument beside a readable call
-    is skipped, a worker whose tagged calls are all MCP calls grades as zero
+    is skipped (unless an uncredited ``succeeded: true`` run cannot be verified, which is ``status="error"``), a worker whose tagged calls are all MCP calls grades as zero
     commands, and a capture with gaps that found no forbidden command is
     ``status="error"``; a check with no forbidden set is not ordered, so an
     untimed call and a gap beside a satisfied required set do not error it,
@@ -3021,6 +3353,13 @@ class WorkerCommandsVerifier(BaseVerifier):
             raise ValueError("forbidden_result_patterns read results inside the window after_result_pattern opens; set both")
         return self
 
+    @model_validator(mode="after")
+    def _forbidden_runs_cannot_require_success(self) -> WorkerCommandsVerifier:
+        for run in self.forbidden_runs:
+            if run.succeeded:
+                raise ValueError("forbidden_runs cannot set succeeded: true; an attempted forbidden command trips the check regardless of exit status")
+        return self
+
     def _without_exempt_text(self, command: str, joined: bool = False) -> str:
         # ``joined``: the row's card typed a call the row may have joined lines of
         # (see the grep cut), so no exemption reads it and it is graded whole
@@ -3052,6 +3391,13 @@ class WorkerCommandsVerifier(BaseVerifier):
         # The log rows of a card that typed a call the row may have joined lines of.
         joined_rows: set[str] = set()
         forbidding = bool(self.forbidden_patterns or self.forbidden_runs or self.forbidden_result_patterns)
+        has_succeeded_runs = any(run.succeeded for run in self.required_runs)
+        withheld_calls = sum(
+            1
+            for e in (snap.trajectory or ())
+            if isinstance(e, dict) and e.get("agent") and e.get("name") in _CODE_TOOLS and _args_withheld(e)
+        )
+        withheld = withheld_calls > 0
         if self.after_result_pattern is None:
             # ``None`` stays an error even when the trajectory carries tagged calls: it
             # means a filed card's log could not be read (or nothing was filed), and
@@ -3087,14 +3433,14 @@ class WorkerCommandsVerifier(BaseVerifier):
             logged = {str(row.get("task") or "") for row in snap.worker_commands}
             calls = _worker_terminal_calls(snap.trajectory)
             if "" in logged:
-                children = [command for _, _, command, _, _ in calls]
+                children = [command for _, _, command, _, _, _ in calls if command is not None]
                 if children:
                     sources = (
                         f" ({len(logged_commands)} from the filed cards' logs and {len(children)} tagged calls,"
                         " unjoined because a log row names no card, so a command may be counted twice)"
                     )
             else:
-                children = [command for card, _, command, _, _ in calls if card not in logged]
+                children = [command for card, _, command, _, _, _ in calls if card not in logged and command is not None]
                 # A log row shows a chain as its first command only (``printenv X + 1
                 # command``), so a run chained behind it is on no row (#4620). The
                 # required patterns and runs also read the logged cards' calls as
@@ -3105,7 +3451,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                 # still takes an exempt call out of the required read, as it does a row.
                 if self.required_patterns or self.required_runs:
                     rows = set(logged_commands)
-                    beside_rows = [command for card, _, command, _, _ in calls if card in logged and command not in rows]
+                    beside_rows = [command for card, _, command, _, _, _ in calls if card in logged and command is not None and command not in rows]
                 joined = []
                 if children:
                     joined.append(f"{len(children)} from the tagged calls of cards with no log line")
@@ -3129,9 +3475,18 @@ class WorkerCommandsVerifier(BaseVerifier):
                     joined_rows = {str(row.get("command", "")) for row in snap.worker_commands if str(row.get("task") or "") in joined}
             typed = logged_commands + children
             windowed = typed
+            traj_calls = calls
+            no_traj_for_succeeded = False
+            if has_succeeded_runs and not traj_calls:
+                tagged = any(
+                    isinstance(e, dict) and e.get("agent") for e in (snap.trajectory or ())
+                )
+                if not tagged:
+                    no_traj_for_succeeded = True
         else:
+            no_traj_for_succeeded = False
             calls = _worker_terminal_calls(snap.trajectory)
-            if not calls:
+            if not calls or not any(call[2] is not None for call in calls):
                 # Tagged MCP calls beside an empty card log mean the worker typed nothing.
                 # No tagged entry at all, a card log that was not read or that shows commands
                 # the capture did not carry, or a withheld code-tool argument, is an error.
@@ -3144,7 +3499,8 @@ class WorkerCommandsVerifier(BaseVerifier):
                         elapsed_time=time.monotonic() - start,
                         reason=_NO_WORKER_TERMINAL_CALLS_REASON,
                     )
-            typed = [command for _, _, command, _, _ in calls]
+            typed = [command for _, _, command, _, _, _ in calls if command is not None]
+            calls_typed_count = len(typed)
             # The ordered check reads the calls alone: a log row has no time.
             # A check with no forbidden set keeps the card log as a source for
             # its required checks: the trajectory can be the narrower read (two
@@ -3155,8 +3511,8 @@ class WorkerCommandsVerifier(BaseVerifier):
                 joined = [row for row in (str(r.get("command") or "") for r in snap.worker_commands or []) if row and row not in seen]
                 typed += joined
                 if joined:
-                    sources = f" ({len(calls)} tagged calls as typed and {len(joined)} from the card log)"
-            untimed = [command for _, at, command, _, _ in calls if at is None]
+                    sources = f" ({calls_typed_count} tagged calls as typed and {len(joined)} from the card log)"
+            untimed = [command or "<clipped>" for _, at, command, _, _, _ in calls if at is None]
             # Only the window orders calls; a check with no forbidden set
             # grades nothing by time, so an untimed call cannot mislead it.
             if untimed and forbidding:
@@ -3167,22 +3523,24 @@ class WorkerCommandsVerifier(BaseVerifier):
                     elapsed_time=time.monotonic() - start,
                     reason=_UNTIMED_WORKER_CALLS_REASON.format(count=len(untimed), shown=shown),
                 )
-            lineage = _card_lineages(snap.worker_card_parents or {}, [c for c, _, _, _, _ in calls])
+            lineage = _card_lineages(snap.worker_card_parents or {}, [c for c, _, _, _, _, _ in calls])
             windowed = []
             opened: list[str] = []
             # A check with no forbidden set has nothing to grade after the
             # opener; its reasons say nothing about a window it never used.
-            for root in dict.fromkeys(lineage[c] for c, _, _, _, _ in calls) if forbidding else ():
+            for root in dict.fromkeys(lineage[c] for c, _, _, _, _, _ in calls) if forbidding else ():
                 mine = [call for call in calls if lineage[call[0]] == root]
-                opener = next((i for i, (_, _, _, result, _) in enumerate(mine) if re.search(self.after_result_pattern, result)), None)
+                opener = next((i for i, (_, _, _, result, _, _) in enumerate(mine) if re.search(self.after_result_pattern, result)), None)
                 if opener is None:
                     continue
                 opened_at = mine[opener][1]
-                later = [call for call in mine[opener + 1 :] if call[1] > opened_at]
-                windowed.extend(command for _, _, command, _, _ in later)
-                for _, _, command, result, _ in later:
-                    result_hits.extend((p, command) for p in self.forbidden_result_patterns if re.search(p, result))
-                opened.append(f"{len(later)} in the lineage of card {root} after {mine[opener][2][:_SHOWN_COMMAND_CHARS]!r}")
+                later = [call for call in mine[opener + 1 :] if opened_at is not None and call[1] is not None and call[1] > opened_at]
+                windowed.extend(command for _, _, command, _, _, _ in later if command is not None)
+                for _, _, command, result, _, _ in later:
+                    if command is not None:
+                        result_hits.extend((p, command) for p in self.forbidden_result_patterns if re.search(p, result))
+                opener_cmd = mine[opener][2] or ""
+                opened.append(f"{len(later)} in the lineage of card {root} after {opener_cmd[:_SHOWN_COMMAND_CHARS]!r}")
             if not forbidding:
                 window = ""
             elif not opened:
@@ -3195,6 +3553,7 @@ class WorkerCommandsVerifier(BaseVerifier):
                     f"; {len(windowed)} issued after the first result matching "
                     f"{self.after_result_pattern!r}: " + "; ".join(opened)
                 )
+            traj_calls = calls
         # An exemption removes the text it matched and nothing else: the rest
         # of the line is what the forbidden list reads, and a command an
         # exemption touched is out of the required list. The forbidden list
@@ -3208,22 +3567,156 @@ class WorkerCommandsVerifier(BaseVerifier):
         hits += [(p, f"the result of {c[:_SHOWN_COMMAND_CHARS]}", f"the result of {c[:_SHOWN_COMMAND_CHARS]}") for p, c in result_hits]
         argvs = [argv for c in commands for argv in _shell_argvs(c)]
         typed_argvs = [argv for c in typed for argv in _shell_argvs(c)]
-        unrun = [run for run in self.required_runs if not any(_argv_runs(argv, run) for argv in argvs)]
+
+        traj_eligible = [(cmd, succ, is_clipped) for _, _, cmd, _, succ, is_clipped in traj_calls if cmd is not None and self._without_exempt_text(cmd) == cmd]
+        traj_argv_entries = [
+            (argv, call_succeeded, carries_exit, is_clipped)
+            for cmd_text, call_succeeded, is_clipped in traj_eligible
+            for argv, carries_exit in _shell_argvs_with_exit_propagation(cmd_text)
+        ]
+
+        unrun_missing: list[WorkerRun] = []
+        unrun_failed: list[WorkerRun] = []
+        unrun_masked: list[WorkerRun] = []
+        unrun_clipped: list[WorkerRun] = []
+        traj_missing: list[WorkerRun] = []
+        for run in self.required_runs:
+            if not run.succeeded:
+                if not any(_argv_runs(argv, run) for argv in argvs):
+                    unrun_missing.append(run)
+            else:
+                # Grade succeeded: true from worker trajectory only.
+                # A required run with succeeded: true and no trajectory to read is not credited.
+                if no_traj_for_succeeded:
+                    traj_missing.append(run)
+                    continue
+                matched_any = False
+                matched_masked = False
+                matched_clipped = False
+                matched_clipped_ok = False
+                succeeded = False
+                for argv, call_succeeded, carries_exit, is_clipped in traj_argv_entries:
+                    if _argv_runs(argv, run):
+                        if is_clipped:
+                            matched_clipped = True
+                            if call_succeeded:
+                                matched_clipped_ok = True
+                            continue
+                        matched_any = True
+                        if call_succeeded and carries_exit:
+                            succeeded = True
+                            break
+                        elif call_succeeded and not carries_exit:
+                            matched_masked = True
+                if not succeeded:
+                    if matched_clipped_ok:
+                        unrun_clipped.append(run)
+                    elif matched_any:
+                        if matched_masked:
+                            unrun_masked.append(run)
+                        else:
+                            unrun_failed.append(run)
+                    elif matched_clipped:
+                        unrun_failed.append(run)
+                    elif any(_argv_runs(argv, run) for argv in argvs):
+                        # The card log carries the command, but the trajectory capture missed it.
+                        # Discrepancy between capture sources: cannot verify exit code.
+                        traj_missing.append(run)
+                    else:
+                        unrun_missing.append(run)
+
         ran = [(run, argv) for run in self.forbidden_runs for argv in typed_argvs if _argv_runs(argv, run)]
         # A forbidden command that was read is conclusive whatever else was
-        # not; a missing required command, or a clean read, is not when the
-        # capture has gaps (the siblings' rule, ``worker_agents`` first).
-        partial = self.after_result_pattern is not None and snap.worker_capture_gaps
-        if hits or ran or ((missing or unrun) and not partial):
+        # not; under after_result_pattern, capture gaps make clearing forbidden
+        # patterns or missing required items inconclusive; on the standard path,
+        # card-log misses are conclusive (fail), credited runs pass, and capture
+        # gaps make only an uncredited succeeded: true run inconclusive (error).
+        uncredited_succeeded = [run for run in [*unrun_missing, *unrun_failed, *unrun_masked, *traj_missing, *unrun_clipped] if run.succeeded]
+        gaps = list(snap.worker_capture_gaps or ())
+        if withheld and uncredited_succeeded:
+            gaps.append("the pod withheld a worker terminal call's arguments")
+        has_window_forbidding = bool(self.after_result_pattern is not None and forbidding)
+        clipped_gap = False
+        for _, _, cmd, _, call_succeeded, is_clipped in traj_calls:
+            if not is_clipped:
+                continue
+            if has_window_forbidding and cmd is None:
+                clipped_gap = True
+                break
+            if uncredited_succeeded and call_succeeded:
+                if cmd is None:
+                    clipped_gap = True
+                    break
+                argv_entries = _shell_argvs_with_exit_propagation(cmd)
+                if any(
+                    not any(_argv_runs(argv, run) for argv, _ in argv_entries)
+                    for run in uncredited_succeeded
+                ):
+                    clipped_gap = True
+                    break
+        if clipped_gap:
+            gaps.append("the pod clipped a worker terminal call's arguments")
+        gaps_str = "; ".join(gaps)
+
+        if self.after_result_pattern is not None:
+            partial = bool(gaps)
+            conclusive = bool(hits or ran)
+            failed = conclusive or bool((missing or unrun_missing or unrun_failed or unrun_masked) and not partial)
+        else:
+            partial = bool(gaps) and bool(uncredited_succeeded)
+            conclusive = bool(hits or ran or missing or any(not r.succeeded for r in unrun_missing))
+            failed = conclusive or bool((unrun_missing or unrun_failed or unrun_masked) and not partial)
+
+        if failed:
             parts = []
             if missing:
                 parts.append(
                     f"no worker command matched required pattern(s) {missing} "
                     f"across {len(commands)} command(s){exempted}{sources}"
                 )
-            if unrun:
-                named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun)
-                parts.append(f"no worker command ran {named} across {len(commands)} command(s){sources}")
+            if partial:
+                unrun_missing_reported = [r for r in unrun_missing if not r.succeeded]
+                if unrun_missing_reported:
+                    named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_missing_reported)
+                    parts.append(f"no worker command ran {named} across {len(commands)} command(s){sources}")
+                if unrun_failed:
+                    named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_failed)
+                    parts.append(
+                        f"{named} ran but exited non-zero (or its exit was not recorded); "
+                        f"a retry may sit in the unread part ({gaps_str})"
+                    )
+                if unrun_masked:
+                    named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_masked)
+                    parts.append(
+                        _UNRUN_MASKED_REASON.format(named=named)
+                        + f"; a clean run may sit in the unread part ({gaps_str})"
+                    )
+                if unrun_clipped:
+                    named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_clipped)
+                    parts.append(_UNRUN_CLIPPED_REASON.format(named=named))
+                if traj_missing:
+                    parts.append(_format_traj_missing_reason(traj_missing, argvs))
+                filtered_unseen = [r for r in unrun_missing if r.succeeded]
+                if filtered_unseen:
+                    named = ", ".join(" ".join([run.script, *run.flags]) for run in filtered_unseen)
+                    parts.append(f"{named} not seen in what was read")
+            else:
+                unrun_missing_reported = unrun_missing
+                unrun_failed_reported = unrun_failed
+                if unrun_missing_reported:
+                    named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_missing_reported)
+                    parts.append(f"no worker command ran {named} across {len(commands)} command(s){sources}")
+                if unrun_failed_reported:
+                    named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_failed_reported)
+                    parts.append(f"{named} ran but exited non-zero (or its exit was not recorded)")
+                if unrun_masked:
+                    named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_masked)
+                    parts.append(_UNRUN_MASKED_REASON.format(named=named))
+                if unrun_clipped:
+                    named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_clipped)
+                    parts.append(_UNRUN_CLIPPED_REASON.format(named=named))
+                if traj_missing:
+                    parts.append(_format_traj_missing_reason(traj_missing, argvs))
             if hits:
                 shown = "; ".join(
                     f"{p!r} matched {c[:_SHOWN_COMMAND_CHARS]!r}"
@@ -3244,20 +3737,124 @@ class WorkerCommandsVerifier(BaseVerifier):
                 elapsed_time=time.monotonic() - start,
                 reason="; ".join(parts) + window,
             )
-        # A required command that was read is conclusive the same way: a gap
-        # beside a satisfied required set errors only a check that also has a
-        # forbidden set to clear.
-        if partial and (forbidding or missing or unrun):
-            unseen = f"; required pattern(s) {missing} not seen in what was read" if missing else ""
-            reason = _PARTIAL_WORKER_CAPTURE_REASON.format(gaps="; ".join(snap.worker_capture_gaps)) + unseen + window
-            if not forbidding:
-                not_seen = [f"pattern {p!r}" for p in missing] + [" ".join(["run", run.script, *run.flags]) for run in unrun]
-                reason = _PARTIAL_REQUIRED_CAPTURE_REASON.format(gaps="; ".join(snap.worker_capture_gaps), unseen=", ".join(not_seen))
+        if partial:
+            if self.after_result_pattern is not None:
+                # A required command that was read is conclusive the same way: a gap
+                # beside a satisfied required set errors only a check that also has a
+                # forbidden set to clear.
+                if not forbidding and not (missing or unrun_missing or unrun_failed or unrun_masked or unrun_clipped or traj_missing):
+                    pass
+                else:
+                    unseen = f"; required pattern(s) {missing} not seen in what was read" if missing else ""
+                    if not forbidding:
+                        not_seen = [f"pattern {p!r}" for p in missing] + [
+                            " ".join(["run", run.script, *run.flags])
+                            for run in unrun_missing
+                        ]
+                        details = []
+                        if unrun_failed:
+                            named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_failed)
+                            details.append(
+                                f"{named} ran but exited non-zero (or its exit was not recorded); "
+                                f"a retry may sit in the unread part ({gaps_str})"
+                            )
+                        if unrun_masked:
+                            named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_masked)
+                            details.append(
+                                _UNRUN_MASKED_REASON.format(named=named)
+                                + f"; a clean run may sit in the unread part ({gaps_str})"
+                            )
+                        if unrun_clipped:
+                            named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_clipped)
+                            details.append(_UNRUN_CLIPPED_REASON.format(named=named))
+                        if traj_missing:
+                            details.append(_format_traj_missing_reason(traj_missing, argvs))
+                        if not_seen:
+                            reason = _PARTIAL_REQUIRED_CAPTURE_REASON.format(
+                                gaps=gaps_str,
+                                unseen=", ".join(not_seen),
+                            )
+                            if details:
+                                reason += "; " + "; ".join(details)
+                        else:
+                            reason = (
+                                f"the worker-trajectory capture was partial ({gaps_str}), "
+                                f"so required run(s) requiring success could not be verified: "
+                                + "; ".join(details)
+                            )
+                    else:
+                        unrun_parts = []
+                        if unrun_failed:
+                            named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_failed)
+                            unrun_parts.append(f"{named} ran but exited non-zero (or its exit was not recorded)")
+                        if unrun_masked:
+                            named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_masked)
+                            unrun_parts.append(_UNRUN_MASKED_REASON.format(named=named))
+                        if unrun_clipped:
+                            named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_clipped)
+                            unrun_parts.append(_UNRUN_CLIPPED_REASON.format(named=named))
+                        if unrun_missing:
+                            named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_missing)
+                            unrun_parts.append(f"required run(s) {named} not seen in what was read")
+                        if traj_missing:
+                            unrun_parts.append(_format_traj_missing_reason(traj_missing, argvs))
+                        unrun_extra = ("; " + "; ".join(unrun_parts)) if unrun_parts else ""
+                        reason = _PARTIAL_WORKER_CAPTURE_REASON.format(gaps=gaps_str) + unseen + unrun_extra + window
+                    return VerificationResult(
+                        success=False,
+                        status="error",
+                        elapsed_time=time.monotonic() - start,
+                        reason=reason,
+                    )
+            else:
+                details = []
+                if unrun_failed:
+                    named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_failed)
+                    details.append(
+                        f"{named} ran but exited non-zero (or its exit was not recorded); "
+                        f"a retry may sit in the unread part ({gaps_str})"
+                    )
+                if unrun_masked:
+                    named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_masked)
+                    details.append(
+                        _UNRUN_MASKED_REASON.format(named=named)
+                        + f"; a clean run may sit in the unread part ({gaps_str})"
+                    )
+                if unrun_clipped:
+                    named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_clipped)
+                    details.append(_UNRUN_CLIPPED_REASON.format(named=named))
+                if traj_missing:
+                    details.append(_format_traj_missing_reason(traj_missing, argvs))
+                unseen_succeeded = [r for r in unrun_missing if r.succeeded]
+                if unseen_succeeded:
+                    named = ", ".join(" ".join([run.script, *run.flags]) for run in unseen_succeeded)
+                    details.append(f"{named} not seen in what was read")
+                reason = (
+                    f"the worker-trajectory capture was partial ({gaps_str}), "
+                    f"so required run(s) requiring success could not be verified: "
+                    + "; ".join(details)
+                )
+                return VerificationResult(
+                    success=False,
+                    status="error",
+                    elapsed_time=time.monotonic() - start,
+                    reason=reason,
+                )
+        if traj_missing or unrun_clipped:
+            reasons = []
+            if traj_missing:
+                if no_traj_for_succeeded:
+                    reasons.append(_NO_WORKER_TERMINAL_CALLS_SUCCEEDED_REASON)
+                else:
+                    reasons.append(_format_traj_missing_reason(traj_missing, argvs))
+            if unrun_clipped:
+                named = ", ".join(" ".join([run.script, *run.flags]) for run in unrun_clipped)
+                reasons.append(_UNRUN_CLIPPED_REASON.format(named=named))
             return VerificationResult(
                 success=False,
                 status="error",
                 elapsed_time=time.monotonic() - start,
-                reason=reason,
+                reason="; ".join(reasons),
             )
         return VerificationResult(
             success=True,
@@ -3958,7 +4555,7 @@ class VerifiedClaimsBackedVerifier(BaseVerifier):
             what = "calls claims verified with" if labelled else "has"
             return done("fail", f"the reply {what} {len(blocks)} evidence block(s) (a $ command fence, then an "
                         f"output fence); at least {self.min_blocks} required")
-        calls = [(command, result) for _, _, command, result, _ in _worker_terminal_calls(snap.trajectory)]
+        calls = [(command, result) for _, _, command, result, *_ in _worker_terminal_calls(snap.trajectory) if command is not None]
         withheld = any(
             entry.get("agent") and entry.get("name") in _CODE_TOOLS and _args_withheld(entry)
             for entry in snap.trajectory if isinstance(entry, dict)
