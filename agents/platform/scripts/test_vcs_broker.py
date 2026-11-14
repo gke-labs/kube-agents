@@ -1946,7 +1946,7 @@ class BranchVerbTest(unittest.TestCase):
         self.assertTrue(self.contains(later[:12], later)["contains"])
         self.assertFalse(self.contains(later[:12], merge)["contains"])
 
-    def test_contains_stops_the_fetch_at_the_ceiling(self):
+    def test_contains_refuses_a_history_over_the_ceiling(self):
         merge = self.push_branch("main", "first\n")
         later = self.push_branch("main", "second\n")
         self.broker.max_clone_bytes = 1

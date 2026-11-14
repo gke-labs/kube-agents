@@ -206,8 +206,8 @@ SNAPSHOT_HISTORY = "none"
 MAX_SNAPSHOT_PATHS = 256
 # How often the snapshot clone's size is measured while it runs.
 CLONE_WATCH_SECONDS = 0.5
-#: `revision-contains`'s ancestor: a full or abbreviated commit id, SHA-1 or SHA-256.
-ANCESTOR_RE = re.compile(r"^[0-9a-f]{7,64}$")
+#: `revision-contains`'s ancestor: a full or abbreviated SHA-1 commit id (the scratch repository is SHA-1).
+ANCESTOR_RE = re.compile(r"^[0-9a-f]{7,40}$")
 #: git's words, across server versions, for a fetch of a revision the remote does not have.
 MISSING_REVISION_MARKERS = ("not our ref", "couldn't find remote ref", "unadvertised object", "no such remote ref",
                             "did not send all necessary objects")
@@ -1807,7 +1807,7 @@ class VcsBroker:
         ancestor = payload.get("ancestor")
         ancestor = ancestor.strip().lower() if isinstance(ancestor, str) else ""
         if not ANCESTOR_RE.match(ancestor):
-            raise WorkspaceError("ancestor must be a hex revision id of 7 to 64 characters")
+            raise WorkspaceError("ancestor must be a hex revision id of 7 to 40 characters")
         revision = validate_revision(payload.get("revision"), "revision")
         if revision.lower().startswith(ancestor):
             return bound.stamp({"contains": True})
