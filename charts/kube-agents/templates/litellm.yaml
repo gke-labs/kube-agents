@@ -236,6 +236,21 @@
 {{- end }}
 {{- $callbackList = append $callbackList "llm_trace_logger.proxy_handler_instance" }}
 {{- end }}
+{{- /*
+  The cache probe: one log line per model call holding hashes and counts of
+  the request's tools and system prompt beside the cache usage the provider
+  returned. A diagnostic the eval installs turn on; its header says what the
+  line holds and when to delete it.
+*/}}
+{{- $cacheProbeEnabled := default false .Values.litellm.cacheProbeEnabled }}
+{{- $cacheProbeSource := "" }}
+{{- if $cacheProbeEnabled }}
+{{- $cacheProbeSource = .Files.Get "files/litellm_cache_probe_callback.py" }}
+{{- if empty $cacheProbeSource }}
+{{- fail "the chart's files/litellm_cache_probe_callback.py is missing" }}
+{{- end }}
+{{- $callbackList = append $callbackList "litellm_cache_probe_callback.proxy_handler_instance" }}
+{{- end }}
 {{- $quotedCallbacks := list }}
 {{- range $callbackList }}
 {{- $quotedCallbacks = append $quotedCallbacks (quote .) }}
@@ -255,14 +270,15 @@
 {{- /*
   Every key the ConfigMap carries feeds the checksum: the thinking-replay
   and cache-marker hooks, the rule file, the two redaction modules, the OAuth2
-  hook, the session-affinity hook and the optional trace logger are subPath
+  hook, the session-affinity hook, the optional trace logger and the cache
+  probe are subPath
   mounts too, so an edit to any of them has to roll the pods the same way an
-  edit to config.yaml does. With redaction or trace logging off their extras
+  edit to config.yaml does. With redaction, trace logging or the probe off their extras
   are empty strings, as are the OAuth2 and session-affinity hooks' sources
   while those hooks are not shipped. The slot count reaches the pod as an env
   var, which rolls it by itself.
 */}}
-{{- $checksumInput := printf "%s%s%s%s%s%s%s%s%s" $config $thinkingReplaySource $cacheControlStripSource $redactionConfig $redactorSource $redactionCallbackSource $oauthHookSource $traceLogSource $sessionAffinitySource }}
+{{- $checksumInput := printf "%s%s%s%s%s%s%s%s%s%s" $config $thinkingReplaySource $cacheControlStripSource $redactionConfig $redactorSource $redactionCallbackSource $oauthHookSource $traceLogSource $sessionAffinitySource $cacheProbeSource }}
 {{- /*
   The shadow-mode replay proxy (litellm.replayShadow; values.yaml says what it
   is). On, it and the LiteLLM pods are told apart by one label key with two
@@ -302,6 +318,10 @@ data:
   {{- if $traceLogEnabled }}
   llm_trace_logger.py: |
     {{- $traceLogSource | nindent 4 }}
+  {{- end }}
+  {{- if $cacheProbeEnabled }}
+  litellm_cache_probe_callback.py: |
+    {{- $cacheProbeSource | nindent 4 }}
   {{- end }}
   {{- if $oauthHookEnabled }}
   litellm_oauth2_callback.py: |
@@ -609,6 +629,11 @@ spec:
             - name: config-volume
               mountPath: /app/llm_trace_logger.py
               subPath: llm_trace_logger.py
+            {{- end }}
+            {{- if $cacheProbeEnabled }}
+            - name: config-volume
+              mountPath: /app/litellm_cache_probe_callback.py
+              subPath: litellm_cache_probe_callback.py
             {{- end }}
             {{- if and (eq $provider "openai_compatible") $openaiCompatibleCA.name }}
             # The openai_compatible server's CA bundle, read by ssl_verify on its

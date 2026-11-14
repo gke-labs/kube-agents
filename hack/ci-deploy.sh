@@ -2323,6 +2323,11 @@ delete_orphaned_nats_claims
 # the cap it was given without opening the rendered CR.
 echo "Kanban board cap for this install: max_in_progress=${EVAL_KANBAN_MAX_IN_PROGRESS} (spec.harness.tuning.maxInProgress)"
 echo "Credential-proxy memory limit for this install: ${EVAL_CREDENTIAL_PROXY_MEMORY_LIMIT} (spec.deployment.credentialProxy.resources.limits.memory)"
+# litellm.cacheProbeEnabled: the gateway logs one "cache probe:" line per model
+# call (hashes of the tool list and system prompt, and the cache usage), which
+# collect_litellm_log keeps in the run's litellm.log on green runs too. It is
+# how an eval says why a session writes its prompt cache more than once; the
+# chart's files/litellm_cache_probe_callback.py says how to read the line.
 
 HELM_INSTALL_OUT="$(mktemp)"
 HELM_EXIT=0
@@ -2368,6 +2373,7 @@ for ((attempt=1; attempt<=HELM_DEPLOY_ATTEMPTS; attempt++)); do
     --set "plugins.pubsubPlatform.enabled=true" \
     --set "plugins.stockoutInvestigator.enabled=true" \
     --set "plugins.stockoutInvestigator.applyTuning=false" \
+    --set "litellm.cacheProbeEnabled=true" \
     --set "webConsole.enabled=true" \
     ${A2A_OPERATOR_ENV_ARGS[@]+"${A2A_OPERATOR_ENV_ARGS[@]}"} \
     ${MODE_NEXT_ENV_ARGS[@]+"${MODE_NEXT_ENV_ARGS[@]}"} \

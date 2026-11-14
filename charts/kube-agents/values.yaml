@@ -719,6 +719,12 @@ litellm:
   # . or .. component, no doubled or trailing slash (the gateway container runs
   # with readOnlyRootFilesystem: true and only /tmp is writable).
   traceLogPath: "/tmp/litellm_traces.jsonl"
+  # Logs one "cache probe:" line per successful model call to the gateway's
+  # pod log: short hashes of the tool list and the system prompt (whole, and
+  # per 16 KiB slice), the message and tool counts, and the cache usage the
+  # provider returned. Hashes and counts only, never prompt text. A diagnostic
+  # for prompt-cache re-writes; the eval installs turn it on.
+  cacheProbeEnabled: false
   # The shadow-mode inference replay proxy, an eval fixture
   # (hack/replay-proxy/README.md): it takes the inference-gateway Service, logs
   # what a replay cache would have keyed on for every request, and forwards

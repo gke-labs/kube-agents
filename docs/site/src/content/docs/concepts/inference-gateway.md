@@ -328,6 +328,10 @@ To bound disk consumption on the gateway pod's `/tmp` `emptyDir`, the logger rot
 
 `litellm.traceLogPath` must be a normalised path under `/tmp/`: a `.` or `..` component, or a doubled or trailing slash, is refused at render time. The logger is strictly pass-through: it never mutates live request or response payloads in place. Write exceptions emit a once-per-path `WARNING` to stderr (`kube_agents.llm_trace_logger`) so logging I/O issues are observable in pod logs without failing model calls. When `litellm.traceLogEnabled` is `false` (default), the callback is omitted and the default ConfigMap checksum remains byte-identical.
 
+### Prompt-cache probe
+
+`litellm.cacheProbeEnabled=true` logs one `cache probe:` JSON line per successful model call to the gateway pod's log. Use it to find out why sessions write their prompt to the cache more often than expected. Each line holds short hashes of the tool list and the system prompt (whole, and per 16 KiB slice), the message and tool counts, and the token and cache usage the provider returned. It holds no prompt text. Two calls in one session whose tool hash or system hash differ explain a fresh cache write. Off by default.
+
 ### Vertex AI and Model Garden
 
 `MODEL_PROVIDER=vertex_ai` routes `model-default` to Vertex AI in your own GCP project — the same first-party Gemini models, plus every Model Garden publisher model your project has access to (Anthropic Claude, Llama, Mistral, and the rest). Requests stay inside your project's billing and data boundary, and by default (when using Workload Identity rather than `litellm.vertex.credentialsSecretRef`) no model API key or static GCP key exists in the cluster. That boundary is the project, which governs billing, credentials and data, and it says nothing about geography. The default location is the global endpoint, which makes no promise about the region a request is processed in; see the location bullet below.
