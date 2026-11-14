@@ -170,7 +170,7 @@ user" clauses here. Agents with a user in the loop follow this file.
   `type(optional-scope): description` (`feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`,
   `build`, `ci`, `chore`, `revert`; breaking changes marked with `!` before `:` or a
   `BREAKING CHANGE:` footer). Confirm the title prefix with the author before opening a PR.
-- Push PR branches to a fork, not to the upstream repository.
+- Push PR branches to a fork, not upstream.
 - **Pin every third-party GitHub Action to a full commit SHA with a version comment**
   (`uses: actions/checkout@3d3c42e… # v7.0.1`), and **guard automatically-triggered credentialed
   workflows against forks** with `if: github.repository == 'gke-labs/kube-agents'` on every job.
@@ -179,9 +179,9 @@ user" clauses here. Agents with a user in the loop follow this file.
   A bug fix fills in **Bug Fix: Preventing Recurrence**: why it shipped, what catches it now, where
   else it lives ([`pre_pr_review.md`](.agents/rules/pre_pr_review.md)).
 - **AI Agent Attribution:** No AI co-author trailers (`Co-Authored-By:`) on commits; note AI
-  assistance in the PR description instead.
+  assistance in the PR description.
 - **Write PR titles, bodies, commits, and review replies straight:** plain declaratives leading with
-  the outcome, without self-grading (`comprehensive`, `production-ready`).
+  the outcome, without self-grading (`comprehensive`).
 - **Self-review before opening a PR:** run `review-adversarial`, `review-docs-drift` and, when chat
   output changes, `review-chat-ux` on your diff **in a clean context that did not write it**
   (`/pr-preflight` spawns them). Fix confirmed findings; under **Self-Review** list every
@@ -215,9 +215,9 @@ user" clauses here. Agents with a user in the loop follow this file.
   asked. Mechanics: [`docs/pull-request-workflow.md`](docs/pull-request-workflow.md#how-a-change-merges).
 - **Local Validation Checks:** Before committing, run the checks for what you touched:
   `prettier --write` on changed Markdown/YAML, `make shellcheck` on shell scripts, a
-  `--platform linux/amd64` Docker build (plus `scripts/check_image_layers.py` for a new `RUN`/`COPY`
-  in `deploy/docker/Dockerfile`), `go build` in `k8s-operator/` or `a2a/`, `make terraform-test` on
-  Terraform modules. Commands:
+  `--platform linux/amd64` Docker build (and `scripts/check_image_layers.py` for a new `RUN`/`COPY` in
+  `deploy/docker/Dockerfile`), `go build` in `k8s-operator/` or `a2a/`, `make terraform-test` on Terraform
+  modules, `scripts/dev/repeat_under_load.sh` on a new or changed test. Commands:
   [`docs/pull-request-workflow.md`](docs/pull-request-workflow.md#local-validation-before-committing).
 
 ### The behavioural presubmit gate

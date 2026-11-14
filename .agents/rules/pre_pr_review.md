@@ -4,25 +4,25 @@ paths:
   - ".github/PULL_REQUEST_TEMPLATE.md"
   - "docs/pull-request-workflow.md"
 trigger: model_decision
-description: "Pre-PR review and validation mechanics: running adversarial, docs-drift and chat UX reviews in a clean context, live validation, UX-change screenshots, bug-fix recurrence, and keeping PR sections current."
+description: "Pre-PR review and validation mechanics: running adversarial, docs-drift and chat UX reviews in a clean context, live validation, repeating a new or changed test under load, UX-change screenshots, bug-fix recurrence, and keeping PR sections current."
 ---
 
 # Pre-PR review mechanics
 
 [`AGENTS.md`](../../AGENTS.md) owns the rules below — that adversarial self-review, docs-drift
 review, live validation, the chat UX pass when chat output changes, and a screenshot of a changed
-user-facing surface are required before opening a pull request, that each is recorded in the
-pull request body and kept current across rounds, and that a bug fix must name what stops it
-recurring. This file holds the mechanics of carrying them out, and what the automated review shares
-with the self-review. The comments in
+user-facing surface are required before opening a pull request, that each is recorded in the pull
+request body and kept current across rounds, that a new or changed test is run several times under
+load, and that a bug fix must name what stops it recurring. This file holds the mechanics of
+carrying them out, and what the automated review shares with the self-review. The comments in
 [`.github/PULL_REQUEST_TEMPLATE.md`](../../.github/PULL_REQUEST_TEMPLATE.md) summarise the pair —
 change `AGENTS.md` or this file, whichever owns what you are changing, then reconcile the template
-summary to it. A template section stays in every pull request: the review bot holds a description
-to every heading and has no optional section, and the contributor robot's one exception is the
-"delete this section" phrase. So a section that applies to some pull requests only opens its
-comment with the condition and names the one-line answer the rest write (`Required when ...
-Otherwise write "Not a bug fix."`), never "delete this section"; `make docs-check-pr-template`
-is the tripwire for the shapes seen so far, and a reviewer reads the rest.
+summary to it. A template section stays in every pull request: the review bot holds a description to
+every heading and has no optional section, and the contributor robot's one exception is the "delete
+this section" phrase. So a section that applies to some pull requests only opens its comment with
+the condition and names the one-line answer the rest write (`Required when ... Otherwise write "Not
+a bug fix."`), never "delete this section"; `make docs-check-pr-template` is the tripwire for the
+shapes seen so far, and a reviewer reads the rest.
 
 ## Adversarial self-review
 
@@ -126,6 +126,25 @@ in `AGENTS.md` under Pull Request Hygiene.
   section is not an answer.
 - **The section names the outcome and where the record is**, nothing from inside it:
   [`public_surfaces.md`](public_surfaces.md).
+
+## Repeat a new or changed test
+
+A test that fails at random turns other people's pull requests red, and in the merge queue it
+ejects them. Before committing a new or changed test, and in any case before the first push, run
+it through `scripts/dev/repeat_under_load.sh`. It runs the test command several times while busy
+loops load the same cores, and prints one line:
+
+```bash
+scripts/dev/repeat_under_load.sh -- go test -C a2a ./mcp/ -run TestAFollowedTaskTooLargeToReadIsReadOnce -race
+scripts/dev/repeat_under_load.sh -- python3 -m pytest agents/platform/scripts/test_scope_publisher.py -q
+```
+
+- **Every test runs under load.** A timing, thread, subprocess or shared-file test gets no special
+  case: the load is what makes it fail on a busy CI runner, so every test gets the load.
+- **A failure in any run blocks the push** until its cause is fixed. A rerun that passes is not a
+  fix; the test fails at the same rate for whoever runs it next.
+- **The template's Testing section carries the line the script prints**, one per test command.
+  Reviewers and the review bot read it there; no check enforces it.
 
 ## UX change
 

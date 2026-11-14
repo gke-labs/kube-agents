@@ -52,7 +52,8 @@ for the mechanics.
 
 ## Testing
 
-<!-- Automated checks: unit tests, builds, `make docs-check`, `prettier --check`. -->
+<!-- Automated checks: unit tests, builds, `make docs-check`, `prettier --check`.
+A new or changed test: the line `scripts/dev/repeat_under_load.sh` printed, one per test command. -->
 
 -
 
