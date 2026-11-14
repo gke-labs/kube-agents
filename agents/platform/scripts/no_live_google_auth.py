@@ -128,15 +128,17 @@ class Guard:
         # `import google.auth` asks for `google` first. Where that already fails (no
         # Google package is installed, or a test blocked the name with a `None`
         # entry), the finder below would never be asked; an empty stand-in package
-        # lets the import reach it. With another Google package installed, which is
-        # what the test requirements give through protobuf, `google` is a real
-        # namespace package and stays as it is.
+        # lets the import reach it. A blocked name gets the stand-in also where a
+        # Google package is installed: the real package would lift the block for
+        # every other module under `google`. With another Google package installed
+        # and no block, which is what the test requirements give through protobuf,
+        # `google` is a real namespace package and stays as it is.
         self._saved_package_entry = sys.modules.get(GOOGLE, _NO_ENTRY)
         self._stand_in_package = None
         package = sys.modules.get(GOOGLE)
         if package is None:
             sys.modules.pop(GOOGLE, None)
-            if importlib.util.find_spec(GOOGLE) is None:
+            if self._saved_package_entry is None or importlib.util.find_spec(GOOGLE) is None:
                 package = importlib.util.module_from_spec(importlib.machinery.ModuleSpec(GOOGLE, None, is_package=True))
                 sys.modules[GOOGLE] = package
                 self._stand_in_package = package

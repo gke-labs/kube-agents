@@ -73,6 +73,23 @@ class GuardTestCase(unittest.TestCase):
         importlib.invalidate_caches()
         self.assertIsNone(importlib.util.find_spec("google"), "a Google package is still importable here")
 
+    def a_blocked_name_is_blocked_again_afterwards(self):
+        """Another test blocked `google` with a `None` entry. Under the guard the import of
+        `google.auth` still reaches the guard, the block holds for other Google packages, and
+        the entry is `None` again afterwards."""
+        with patch.dict(sys.modules, {"google": None}):
+            guard = no_live_google_auth.install()
+            self.addCleanup(self.take_down)
+            with self.assertRaises(ModuleNotFoundError):
+                importlib.import_module("google.auth")
+            self.assertEqual(1, len(guard.imports()), "the stand-in let the import reach the guard")
+            with self.assertRaises(ModuleNotFoundError):
+                importlib.import_module("google.protobuf")
+            guard._imports.clear()
+            guard.uninstall()
+            self.assertIn("google", sys.modules)
+            self.assertIsNone(sys.modules["google"])
+
     def with_on_the_path(self, make_package):
         root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, root, True)
@@ -104,16 +121,7 @@ class TestWithNoGooglePackage(GuardTestCase):
         self.assertIsNotNone(importlib.util.find_spec("google"), "a module with no spec would raise here")
 
     def test_a_name_that_another_test_blocked_is_blocked_again_afterwards(self):
-        with patch.dict(sys.modules, {"google": None}):
-            guard = no_live_google_auth.install()
-            self.addCleanup(self.take_down)
-            with self.assertRaises(ModuleNotFoundError):
-                importlib.import_module("google.auth")
-            self.assertEqual(1, len(guard.imports()), "the stand-in let the import reach the guard")
-            guard._imports.clear()
-            guard.uninstall()
-            self.assertIn("google", sys.modules)
-            self.assertIsNone(sys.modules["google"])
+        self.a_blocked_name_is_blocked_again_afterwards()
 
     def test_another_google_package_is_still_reported_missing(self):
         self.install()
@@ -159,6 +167,9 @@ class TestWithAnotherGooglePackage(GuardTestCase):
         guard.uninstall()
         self.assertEqual("protobuf", sys.modules["google.protobuf"].NAME)
 
+    def test_a_name_that_another_test_blocked_is_blocked_again_afterwards(self):
+        self.a_blocked_name_is_blocked_again_afterwards()
+
 
 class TestWithTheLibraryInstalled(GuardTestCase):
     """What a developer who installed google-auth has."""
@@ -169,6 +180,9 @@ class TestWithTheLibraryInstalled(GuardTestCase):
 
     def test_without_the_guard_the_library_loads(self):
         self.assertEqual("the real library", importlib.import_module("google.auth").default()[0])
+
+    def test_a_name_that_another_test_blocked_is_blocked_again_afterwards(self):
+        self.a_blocked_name_is_blocked_again_afterwards()
 
     def test_the_import_fails_and_is_recorded(self):
         guard = self.install()
