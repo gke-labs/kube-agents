@@ -176,13 +176,15 @@ var SensitiveEnvVars = map[string]struct{}{
 	"A2A_BUS_TOKEN_FILE": {},
 	"A2A_BUS_USER":       {},
 	// A2A_NOTIFY_PLATFORM turns the agent's proactive posts from Hermes to
-	// the gateway's chat.notify route. The operator renders it exactly when
-	// the next stack holds the chat backend; an override either way leaves
-	// posts going to a platform that is not there.
+	// the gateway's chat.notify route. It holds the routed platforms,
+	// comma-separated; the operator renders one name, exactly when the next
+	// stack holds the chat backend. An override either way leaves posts going
+	// to a platform that is not there.
 	"A2A_NOTIFY_PLATFORM": {},
 	// A2A_NOTIFY_CONVERSATIONS arms the kanban notifier's report back to the
-	// gateway conversation a card was filed in, on the same route, and names
-	// the platform in the cron relay's refusal when no home channel is set.
+	// gateway conversation a card was filed in, on the same route. It holds
+	// the gateway's platforms, comma-separated; the cron relay names each in
+	// its refusal when no home channel is set.
 	// The operator renders it exactly when the gateway arms the route.
 	"A2A_NOTIFY_CONVERSATIONS":     {},
 	"KUBE_AGENTS_ENABLED_PROFILES": {},
@@ -977,7 +979,7 @@ type TuningSpec struct {
 	// cannot hold the configured concurrency refuses a legitimate session's
 	// consumer create at load. That one is capacity, not a control - it is
 	// sized to fit this cap rather than to enforce it - and because
-	// provisioning never edits an existing stream, an install whose TASKS
+	// provisioning never changes an existing stream's max_consumers, an install whose TASKS
 	// stream is too small for the configured cap makes the provision Job
 	// fail rather than letting the shortfall surface later as a legitimate
 	// session's consumer create being refused and reported as a task
@@ -2845,7 +2847,7 @@ type AgentStatus struct {
 	// in seconds, when the A2A provision Job last found it longer than this
 	// operator creates the stream with (0 when the stream has no age limit).
 	// It is absent when the stream is no longer than that, or before a report.
-	// Provisioning never edits an existing stream, so one an older operator
+	// Provisioning never changes an existing stream's max age, so one an older operator
 	// created longer, or one edited by hand, can keep submissions longer than
 	// this operator would, and the dispatcher is told the longer of the two
 	// (up to a year): a finished task's tombstone has to outlive its

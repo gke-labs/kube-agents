@@ -27,6 +27,32 @@ const attributionSaltInfo = "a2a-attribution-salt"
 // keying in principal.go sees the same shape it always did.
 const attributionSaltLen = 32
 
+// The mux keys and conversation prefixes, exported for cmd/gateway, which
+// builds one adapter per backend: Backends returns the first three, and the
+// console is the essential backend beside them.
+const (
+	BackendGchat   = gchatBackend
+	BackendSlack   = slackBackend
+	BackendDiscord = discordBackend
+	BackendConsole = consoleBackend
+)
+
+// backendArm is one REAL chat backend and the config field that arms it.
+type backendArm struct {
+	name  string
+	armed func(*Config) bool
+}
+
+// backendArms lists the real chat backends in Backends' order. Backends and
+// the mux's direct-message refusal (knownBackendName) both read it; the
+// adapter switch in cmd/gateway, the metrics platform labels and the people
+// reading each name their backends on their own.
+var backendArms = []backendArm{
+	{name: gchatBackend, armed: func(c *Config) bool { return c.GchatRelayURL != "" }},
+	{name: slackBackend, armed: func(c *Config) bool { return c.SlackBotToken != "" }},
+	{name: discordBackend, armed: func(c *Config) bool { return c.DiscordToken != "" }},
+}
+
 // defaultMaxSessions is what MaxSessions means when unset; the field's
 // comment carries the sizing rationale.
 const defaultMaxSessions = 10
@@ -34,6 +60,15 @@ const defaultMaxSessions = 10
 // defaultDelegationDepthMax is what DelegationDepthMax means when unset; the
 // field's comment carries the rationale.
 const defaultDelegationDepthMax = 3
+
+// defaultDelegationWidthMax is what DelegationWidthMax means when unset; the
+// field's comment carries the rationale.
+const defaultDelegationWidthMax = 1
+
+// delegationWidthBuiltMax is the widest A2A_DELEGATION_WIDTH_MAX FromEnv
+// accepts: one, until a batch's aggregated wake and its stop are built
+// (#5682). Raising it is what turns fan-out on.
+const delegationWidthBuiltMax = 1
 
 // defaultScopeFile is where the operator projects the install's rendered
 // spec.scope into the gateway pod: the same scope.json, at the same path, the
@@ -189,11 +224,13 @@ type Config struct {
 
 	// SlackBotToken and SlackAppToken arm the Slack backend: Socket Mode
 	// needs both (xoxb- drives the Web API, xapp- the outbound websocket —
-	// no inbound endpoint, nothing to expose). Exactly one backend may be
-	// configured per gateway process: two gateways bound to one relay
-	// durable split event deliveries (Options.RelayDurable), so a second
-	// backend is a second Deployment with its own durable, not a second
-	// adapter here.
+	// no inbound endpoint, nothing to expose). Slack may run beside the
+	// other backends in one gateway process. Each backend is its own
+	// transport (Chat a Pub/Sub pull through the broker, Slack a Socket
+	// Mode connection, Discord its gateway websocket) and none shares a
+	// durable with another. The task-event relay durable
+	// (Options.RelayDurable) is the process's own, bound once per process,
+	// and the election keeps one leader per Deployment.
 	SlackBotToken string
 	SlackAppToken string
 
@@ -281,11 +318,10 @@ type Config struct {
 	TargetAllowedUsers map[string]map[string][]string
 
 	// InjectListen is the inject side door's HTTP listen address, and setting
-	// it arms the door. DEV AND EVAL ONLY. The door is not a backend in the
-	// one-backend guard's sense (see FromEnv): it may sit beside exactly one
-	// real backend, because a local HTTP door has no silent-stop failure mode
-	// of the kind that guard exists for. The operator renders it only under
-	// its eval flag.
+	// it arms the door. DEV AND EVAL ONLY. The door is not a backend (see
+	// FromEnv): it may sit beside any real backends, because a local HTTP
+	// door consumes nothing and competes for nothing. The operator renders it
+	// only under its eval flag.
 	InjectListen string
 
 	// InjectToken is the bearer token the door requires on every request
@@ -640,6 +676,22 @@ type Config struct {
 	// (A2A_DELEGATE_TOOL on the worker side), not a typo to paper over.
 	DelegationDepthMax int
 
+	// DelegationWidthMax bounds how many children one delegation may ask
+	// for (A2A_DELEGATION_WIDTH_MAX): a session's batch of more is refused
+	// whole, with a notice naming the bound. Each turn's delegateTargets
+	// part advertises it when over one, and the session's tool offers a
+	// batch only then. Width bounds what one conversation asks for, not
+	// what runs at once: the dispatcher queues children to each profile's
+	// concurrency.
+	//
+	// Zero means 1, a single child. FromEnv accepts only 1 for now: a batch's
+	// children can't yet be stopped together, and each would wake the
+	// session on its own, so an operator can't turn fan-out on until its
+	// results and stop are built (delegationWidthBuiltMax). Tests and
+	// embedders that build Config directly may set more, to exercise the
+	// mint. FromEnv also refuses a value under 1, as it does the depth bound.
+	DelegationWidthMax int
+
 	// ScopeFile is the rendered spec.scope a profile task's target is
 	// checked against (A2A_SCOPE_FILE; checkTargetScope). It is read per
 	// routed task, so an edit reaches the gateway without a restart. A
@@ -676,47 +728,54 @@ type Config struct {
 	BusyNoticeAt int
 }
 
-// Backend names the REAL chat backend this config arms: "gchat", "slack",
+// Backends lists every REAL chat backend this config arms, in backendArms'
+// order (gchat, slack, discord: BackendGchat, BackendSlack, BackendDiscord),
+// or nil when none is armed. The doors are not among the answers, for the
+// reason Backend gives.
+func (c *Config) Backends() []string {
+	var backends []string
+	for _, arm := range backendArms {
+		if arm.armed(c) {
+			backends = append(backends, arm.name)
+		}
+	}
+	return backends
+}
+
+// Backend names the first REAL chat backend of Backends: "gchat", "slack",
 // "discord", or "" when a side door (inject, A2A, or both) or the console
-// door alone is the only way in. FromEnv
-// refuses more than one real backend, so the order here only decides what a
-// hand-built Config means.
+// door alone is the only way in. It is the authority default; the door
+// default (inject, a2a or console) is chosen in New, not here.
 //
 // The doors are deliberately not among the answers. Either can be armed
-// beside any one backend, so "which backend is this gateway" and "is a door
+// beside any backend, so "which backend is this gateway" and "is a door
 // open" are two questions, and collapsing them is what would make a door
 // exclusive again.
 func (c *Config) Backend() string {
-	switch {
-	case c.GchatRelayURL != "":
-		return gchatBackend
-	case c.SlackBotToken != "":
-		return slackBackend
-	case c.DiscordToken != "":
-		return discordBackend
-	case c.InjectListen != "" || c.A2ADoorListen != "" || c.ConsoleDoor:
+	if backends := c.Backends(); len(backends) > 0 {
+		return backends[0]
+	}
+	if c.InjectListen != "" || c.A2ADoorListen != "" || c.ConsoleDoor {
 		// No real backend: a door is the whole of the ingress, and the
 		// attribution on a message that comes through it is the door's own.
 		return ""
-	default:
-		// A hand-built Config with nothing armed at all. FromEnv refuses
-		// this; a test that builds a Config directly gets the historical
-		// default rather than an empty backend string in its authority
-		// blocks.
-		return discordBackend
 	}
+	// A hand-built Config with nothing armed at all. FromEnv refuses this;
+	// a test that builds a Config directly gets the historical default
+	// rather than an empty backend string in its authority blocks.
+	return discordBackend
 }
 
 // InjectArmed reports whether the side door is open.
 func (c *Config) InjectArmed() bool { return c.InjectListen != "" }
 
 // HomeLearnArmed reports whether the gateway may learn the Slack home channel
-// from the first admitted channel mention and record it: the backend is
-// Slack, the CR names no home channel (a set one is the CR's, malformed or
-// not), the policy is auto, a record is named, and the operator has armed the
-// learn. Every gate holds, or nothing is read, written or posted.
+// from the first admitted channel mention and record it: the Slack backend
+// is armed (beside any other), the CR names no home channel (a set one is
+// the CR's, malformed or not), the policy is auto, a record is named, and the
+// operator has armed the learn. Every gate holds, or nothing is read, written or posted.
 func (c *Config) HomeLearnArmed() bool {
-	return c.Backend() == slackBackend && c.SlackHomeChannel == "" &&
+	return c.SlackBotToken != "" && c.SlackHomeChannel == "" &&
 		c.SlackHomePolicy != slackHomePolicyManual && c.HomeChannelRecord != "" && c.HomeChannelLearn
 }
 
@@ -841,36 +900,20 @@ func FromEnv() (*Config, error) {
 	if (cfg.SlackBotToken != "") != (cfg.SlackAppToken != "") {
 		return nil, fmt.Errorf("SLACK_BOT_TOKEN and SLACK_APP_TOKEN arm Slack together; only one is set")
 	}
-	// One REAL backend per gateway process, chosen by which credential is
-	// set. A silent default here would make a two-backend misconfiguration a
-	// working Discord gateway that quietly never consumes Chat — refuse both
-	// directions instead. Counted rather than enumerated pairwise: with three
-	// backends the pairs are the easy thing to leave a hole in, and a fourth
-	// must not be addable with a combination nobody checked. Adding a backend
-	// is one entry in this list.
-	var armed []string
-	if cfg.GchatRelayURL != "" {
-		armed = append(armed, "A2A_GCHAT_RELAY_URL")
-	}
-	if cfg.SlackBotToken != "" {
-		armed = append(armed, "the SLACK_BOT_TOKEN+SLACK_APP_TOKEN pair")
-	}
-	if cfg.DiscordToken != "" {
-		armed = append(armed, "DISCORD_TOKEN")
-	}
-	// The doors (inject, A2A) are NOT in that list, decided 2026-09-17 on
+	// The gateway runs every REAL backend whose credential is set. Several
+	// in one process split nothing: each backend is its own transport (Chat
+	// a Pub/Sub pull through the broker, Slack a Socket Mode connection,
+	// Discord its gateway websocket) and none shares a durable with another.
+	// The task-event relay durable is the gateway process's own, bound once
+	// per process, and the election keeps one leader per Deployment. What
+	// the guard still refuses is half a Slack pair (above) and no ingress at
+	// all (below).
+	//
+	// The doors (inject, A2A) are NOT among Backends, decided 2026-09-17 on
 	// the design doc's review for the inject door and holding for its
-	// sibling. The guard exists so that arming two backends cannot leave
-	// one of them silently unconsumed: two processes on one Chat relay
-	// durable split its event deliveries, and the symptom is a gateway that
-	// looks healthy and answers half the messages. A local HTTP door has no
-	// such failure mode — it consumes nothing and competes for nothing — so
-	// counting it would buy no safety and would cost the thing stage 2 needs,
-	// which is the eval door and the Chat relay on one install so the two
-	// transports can be compared against it.
-	switch len(armed) {
-	case 1:
-	case 0:
+	// sibling. A local HTTP door consumes nothing and competes for nothing,
+	// so it is a way in beside the backends rather than one of them.
+	if len(cfg.Backends()) == 0 {
 		// The door alone is enough to start. Decided, not assumed: the A2A
 		// owner's decision of 2026-09-17 on the eval transport's design doc
 		// (eval-next-transport.md) is that an eval install with neither a
@@ -886,8 +929,6 @@ func FromEnv() (*Config, error) {
 		if cfg.InjectListen == "" && cfg.A2ADoorListen == "" && !cfg.ConsoleDoor {
 			return nil, fmt.Errorf("no chat backend: set DISCORD_TOKEN (W0's discord-bot Secret), A2A_GCHAT_RELAY_URL (the credential proxy's chat relay), the SLACK_BOT_TOKEN+SLACK_APP_TOKEN pair (Socket Mode), A2A_INJECT_LISTEN (the dev-only inject side door), A2A_DOOR_LISTEN (the A2A door for agent callers), or A2A_CONSOLE_DOOR=true (the console door alone)")
 		}
-	default:
-		return nil, fmt.Errorf("more than one chat backend is configured (%s): one backend per gateway process — two gateways on one relay durable split event deliveries; run a second Deployment for a second backend. The side doors (A2A_INJECT_LISTEN, A2A_DOOR_LISTEN, A2A_CONSOLE_DOOR) are not backends in this sense and may sit beside any one of them", strings.Join(armed, ", "))
 	}
 	// Fail closed: a door with no token would be reachable by anything that
 	// reaches the listener, and the port-forward path the runner uses is
@@ -939,6 +980,15 @@ func FromEnv() (*Config, error) {
 		return nil, fmt.Errorf("A2A_DELEGATION_DEPTH_MAX %q: need an integer >= 1", depthMax)
 	}
 	cfg.DelegationDepthMax = dm
+	widthMax := envOr("A2A_DELEGATION_WIDTH_MAX", strconv.Itoa(defaultDelegationWidthMax))
+	wm, err := strconv.Atoi(widthMax)
+	if err != nil || wm < 1 || wm > lib.DelegateBatchMax {
+		return nil, fmt.Errorf("A2A_DELEGATION_WIDTH_MAX %q: need an integer from 1 to %d", widthMax, lib.DelegateBatchMax)
+	}
+	if wm > delegationWidthBuiltMax {
+		return nil, fmt.Errorf("A2A_DELEGATION_WIDTH_MAX %q: at most %d for now; fan-out's results and stop are not built yet (#5682)", widthMax, delegationWidthBuiltMax)
+	}
+	cfg.DelegationWidthMax = wm
 	busyAt := envOr(busyNoticeAtEnv, strconv.Itoa(defaultBusyNoticeAt))
 	ba, err := strconv.Atoi(busyAt)
 	if err != nil || ba < 1 {

@@ -456,7 +456,7 @@ artifact, and nine names are reserved so renderers and audit tooling can rely on
 | `thinking` | Reasoning deltas. Debug views only                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `activity` | Tool-call trace, one entry per invocation. Always in the audit replay                                                                                                                                                                                                                                                                                                                                                                                             |
 | `progress` | Agent-authored milestones, renderable to chat at zero model cost. Stage 1 derives these from model narration; the subagent framework spec records the deviation. May carry a chat message (Chat messages, below), the live message's whole state, so `progress` is text plus at most one chat message DataPart per chunk; assertion 18's validator takes a data part there only when it is a chat message                                                         |
-| `delegate` | The session's request to the gateway to mint a child task: one `data` part `{"addressee", "text", "parameters"?}` on the session's own task events (`parameters`: the child's task parameters, below). Consumed by the gateway's relay, never rendered to chat; reserved 10/5, used from the delegation primitive onward                                                                                                                                          |
+| `delegate` | The session's request to the gateway to mint a child task: one `data` part `{"addressee", "text", "parameters"?}`, or a batch `{"tasks": [{"addressee", "text", "parameters"?}, …]}` (never both), on the session's own task events (`parameters`: the child's task parameters, below; the batch: "Delegate targets", below). Consumed by the gateway's relay, never rendered to chat; reserved 10/5, used from the delegation primitive onward                   |
 | `turn`     | One finished turn's answer on a task with more turns queued (an executor that queues follow-ups). Chunked like `result`, posted by renderers as it completes, never the deliverable; the last turn's answer is the `result`.                                                                                                                                                                                                                                      |
 | `notice`   | A message the task posts on its own, beside its live message and its answer (a PR it opened, say): a TextPart, optionally with a chat message. Each `notice` artifact posts once and is never edited. Not the gateway's own notices. A gateway older than 10/8 drops it, so a fact that matters is in the result too; reserved 10/8                                                                                                                               |
 | `handoff`  | The task handed work to kanban cards, which report into its conversation themselves: one TextPart, `cards`. The Hermes bridge's API executor publishes it ahead of the terminal of such a task whenever the conversation route was recorded (Slack or Google Chat). Never rendered; a delegated child's wake reads it as the cards-pending signal beside the terminal's mark, which the bridge sets only on Slack with `KAGE_SLACK_UX` on (#3258). Reserved 10/16 |
@@ -782,10 +782,12 @@ profile parent that has already ended gets no child result; the gateway drops it
 chat session's turn ends when it delegates, so a session parent keeps the chatops wake instead
 (`spec-chatops-gateway.md`, the delegation primitive). On its child's end the gateway starts a new
 turn on the session that carries the child's result, and it doesn't deliver a `childResult` to the
-finished turn's `…in`.
+finished turn's `…in`. A session's request may mint a batch of children (`tasks`), which run side by
+side and queue at the dispatcher like any child. Gathering a batch's results into one wake is the
+next step of fan-out and isn't built yet, which is why the gateway accepts no width but one for now.
 
 **Delegate targets.** A turn the gateway submits to a conversation's own session pod carries
-`{"delegateTargets": {"targets": [{"name", "description"?, "parameters"?}, …], "truncated"?}}`: the
+`{"delegateTargets": {"targets": [{"name", "description"?, "parameters"?}, …], "truncated"?, "widthMax"?}}`: the
 agents that turn's requester may delegate to, `platform` first and then each AgentProfile whose card
 admits them, by the same checks a delegation meets (the target's list and the A2A door's own-list
 rule, for the requester and everyone else whose text reached the session, and the card's tiers). A
@@ -801,6 +803,12 @@ listed, and a turn with none reads as `platform` only.
 - A list has at most 32 targets, and its object encodes to at most 16 KiB, so the session pod can hand it to its
   tool server in one environment variable. The gateway stops before either bound and sets
   `truncated`; a card whose parameters break the rules is left out.
+- `widthMax` is how many children one `delegate` request from the turn may ask for, the gateway's
+  `A2A_DELEGATION_WIDTH_MAX`. The gateway sets it only when it is over one; absent means one, the
+  single shape, so the tool offers `tasks` only when it is present. The gateway accepts no width but
+  one until fan-out's results and stop are built, so no part carries it yet. It is at most 16
+  (`lib.DelegateBatchMax`), the ceiling every reader holds a batch to; each entry's text has the
+  single shape's 16 KiB cap.
 - A reader that finds a part breaking these bounds ignores it (`lib.DelegateTargetsOf`), as though
   the turn carried none.
 
@@ -853,8 +861,8 @@ that would turn every follow-up into a steer queued behind hours of idle.
 
 **The emitter.** Two halves, each a port of the `today` presenter run on the shared
 cases. The hermes-bridge emits what its own turn owns: the answer on the `result` (the
-first sentence as `headline`, cut at a clause when it runs past the headline's cap, the rest
-as `detail`, or under `fold` past `detail`'s cap; an answer that ends by asking which of two
+first sentence as `headline`, cut at a clause when it runs past the headline's cap, or at a
+word with an ellipsis when no clause fits, the rest as `detail`, or under `fold` past `detail`'s cap; an answer that ends by asking which of two
 to five listed options to take carries them as `choices`, its opening paragraph, each
 option's label and first sentence (when every option has one) and the question as `detail`, and the rest under `fold`,
 by the rule `slack_moments.answer_choices` applies under `today`; an answer that instead

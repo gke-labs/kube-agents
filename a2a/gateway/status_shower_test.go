@@ -20,6 +20,7 @@ func (statusShowingAdapter) ShowsTaskStatus(string) bool { return true }
 // "⏳ submitted…" placeholder, no progress edit and no "✅ completed" edit,
 // and the answer is the task's one post.
 func TestAStatusShowingBackendGetsNoRollingLine(t *testing.T) {
+	t.Parallel()
 	r, _ := startRigWithSpawnerAdapter(t, "platform", 0, nil, func(a *fakeAdapter) Adapter {
 		return statusShowingAdapter{a}
 	})
@@ -57,6 +58,7 @@ func TestAStatusShowingBackendGetsNoRollingLine(t *testing.T) {
 // With no line to put it on, a submission that never reached the bus is
 // posted, so the ask does not go unanswered.
 func TestAStatusShowingBackendGetsTheBusFailurePosted(t *testing.T) {
+	t.Parallel()
 	r, _ := startRigWithSpawnerAdapter(t, "platform", 0, nil, func(a *fakeAdapter) Adapter {
 		return statusShowingAdapter{a}
 	})

@@ -43,9 +43,10 @@ const (
 // verb set follows from its mode, so a tier can't name a verb of its own and
 // the vocabulary stays closed.
 //
-// This is the first of the tier work (#3659): no component reads a Tier yet,
-// and the capability verifier and the gateway still use the read and
-// unattended tiers built into them.
+// The operator renders the Tiers in the install's namespace into a file the
+// capability verifier, the gateway and the auth callout load into their tier
+// table (#3659); the read and unattended tiers stay built in and can't be
+// redefined.
 type TierSpec struct {
 	// Mode is whether people or triggers run at this tier. Once tiers are
 	// enforced, interactive will run interactive profile tasks and unattended

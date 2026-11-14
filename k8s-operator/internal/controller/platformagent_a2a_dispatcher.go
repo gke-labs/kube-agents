@@ -65,6 +65,22 @@ const (
 	// prefix and its verifier caller name. The binary spells the same string.
 	a2aDispatcherUser = "dispatcher"
 
+	// a2aDispatcherBucketedGrantsEnvVar turns on the dispatcher's bucketed
+	// grants (#5381). With it on, the dispatcher's map entry carries only its
+	// control connection's fixed grants and the draining profiles' names, and
+	// the callout derives each bucket connection's per-profile grants from
+	// the profile entries. Off by default. Turning it on needs a dispatcher
+	// that opens its bucket connections (#5381's second PR): an older one
+	// loses every profile grant.
+	a2aDispatcherBucketedGrantsEnvVar = "A2A_DISPATCHER_BUCKETED_GRANTS"
+
+	// a2aNarrowingDispatcher is the callout's NarrowingDispatcher, and
+	// a2aDispatcherBuckets is lib.DispatcherBuckets. This module can't import
+	// either; the callout suite parses the rendered map, and the bucket count
+	// is spelled again only to reserve the bucket users here.
+	a2aNarrowingDispatcher = "dispatcher"
+	a2aDispatcherBuckets   = 32
+
 	a2aDispatcherContainerName = "dispatcher"
 	a2aDispatcherStatusPort    = 8080
 
@@ -104,6 +120,42 @@ func a2aDispatcherReleaseImage() string {
 // a2aDispatcherEnabled reports whether this operator renders the dispatcher:
 // unless A2A_PROFILE_DISPATCHER is "false".
 func a2aDispatcherEnabled() bool { return a2aDispatcherImage() != "" }
+
+// a2aDispatcherBucketedGrants reports whether the dispatcher's entry narrows
+// on "dispatcher" (A2A_DISPATCHER_BUCKETED_GRANTS=true). Only the exact
+// string turns it on.
+func a2aDispatcherBucketedGrants() bool {
+	return strings.TrimSpace(os.Getenv(a2aDispatcherBucketedGrantsEnvVar)) == "true"
+}
+
+// dispatcherMapEntry is the dispatcher's identity-map entry. With bucketed
+// grants off, it lists every grant: the fixed set, plus every admitted and
+// draining profile's subjects (dispatcherIdentity). With them on (#5381), it
+// narrows on "dispatcher". Its grants are then the fixed set alone, for the
+// control connection, plus the draining profiles' names. The callout derives
+// every per-profile subject from the profile entries (lib.DispatcherGrants),
+// so the entry's size no longer grows with the profile count.
+func dispatcherMapEntry(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, draining []a2aDispatchProfile) a2aAuthMapIdentity {
+	if !a2aDispatcherBucketedGrants() {
+		entry, _ := a2aDispatcherMapEntry(agent, profiles, draining)
+		return entry
+	}
+	id := dispatcherIdentity(agent, agent.Namespace, nil, nil)
+	var drainingNames []string
+	for _, d := range draining {
+		if !slices.Contains(drainingNames, d.Name) {
+			drainingNames = append(drainingNames, d.Name)
+		}
+	}
+	return a2aAuthMapIdentity{
+		ServiceAccount: id.serviceAccount,
+		User:           id.user,
+		Account:        id.account,
+		Grants:         a2aAuthMapGrants{Publish: id.publish, Subscribe: id.subscribe},
+		Narrowing:      a2aNarrowingDispatcher,
+		Draining:       drainingNames,
+	}
+}
 
 func a2aDispatcherName(agent *agentv1alpha1.PlatformAgent) string {
 	return agent.Name + "-a2a-dispatcher"
@@ -723,14 +775,22 @@ const a2aDrainingWindow = time.Duration(agentv1alpha1.DefaultProfileMaxTaskDeadl
 // deadline under its 6h ceiling), and a time no later than the window from
 // now; nothing else of the entry. An entry that isn't is
 // dropped, and grants nothing.
-func drainingDispatchProfiles(applied *a2aDispatchConfig, live map[string]bool, now time.Time) []a2aDispatchProfile {
+func drainingDispatchProfiles(applied *a2aDispatchConfig, live map[string]bool, now time.Time, reserved ...string) []a2aDispatchProfile {
 	if applied == nil {
 		return nil
 	}
 	var out []a2aDispatchProfile
 	seen := map[string]bool{}
 	for _, a := range applied.Profiles {
+		// A reserved addressee is no profile's name (the operator refuses a
+		// live profile named for one), so an applied entry naming one is
+		// not one this operator wrote, and would grant the dispatcher that
+		// addressee's .supervisor subject. Nor is any other name a2aCanDrainAs
+		// refuses (a principal's, a map user's, a bucket user's): a live
+		// profile may hold one, but the map's mirror refuses it as a draining
+		// name, so carrying it would fail the whole map (#5553, rounds 1-2).
 		if live[a.Name] || seen[a.Name] || !isDNS1123LabelToken(a.Name) || len(a.Tiers) == 0 ||
+			!a2aCanDrainAs(a.Name, reserved) ||
 			slices.ContainsFunc(a.Tiers, func(t string) bool { return !isDNS1123LabelToken(t) }) {
 			continue
 		}
@@ -788,7 +848,7 @@ func (r *PlatformAgentReconciler) dispatchDraining(ctx context.Context, agent *a
 	for _, p := range cfg.Profiles {
 		live[p.Name] = true
 	}
-	return drainingDispatchProfiles(&applied, live, time.Now()), nil
+	return drainingDispatchProfiles(&applied, live, time.Now(), a2aDrainingNameExclusions(agent)...), nil
 }
 
 // reasonDispatchConfigUnreadable is the Warning when the applied dispatch
@@ -1173,4 +1233,28 @@ func agentLabelsMarkComponent(obj client.Object, agent *agentv1alpha1.PlatformAg
 		}
 	}
 	return true
+}
+
+// a2aDrainingNameExclusions are the names, beyond the bucket users, that
+// can't be a draining profile's: the static principals, every user the map
+// renders (the callout-authenticated principals included), and the callout's
+// own user. One list, read by drainingDispatchProfiles and by the map's
+// mirror alike (a2aCanDrainAs), so nothing carried into draining is refused
+// later (#5553, round 2).
+func a2aDrainingNameExclusions(agent *agentv1alpha1.PlatformAgent) []string {
+	// The dispatcher's and the operator's users are rendered by their own
+	// paths, not a2aIdentities, so they are named here.
+	names := append([]string{a2aCalloutConfUser, a2aDispatcherUser, a2aOperatorBusUser}, a2aStaticPrincipalNames(agent)...)
+	for _, id := range a2aIdentities(agent) {
+		names = append(names, id.user)
+	}
+	return names
+}
+
+// a2aCanDrainAs reports whether name can be a draining profile's: not a
+// reserved addressee, not one of excluded (a2aDrainingNameExclusions, plus a
+// map's own entry users where the caller has them), and not a dispatcher
+// bucket user, whatever the switch says.
+func a2aCanDrainAs(name string, excluded []string) bool {
+	return !slices.Contains(a2aReservedAddressees(), name) && !slices.Contains(excluded, name) && !isDispatcherBucketUser(name)
 }

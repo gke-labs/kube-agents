@@ -1,9 +1,10 @@
-"""hack/eval/replay-lane-cases.txt: what the replay lane replays.
+"""hack/eval/replay-lane-cases.txt and replay-lane-safety-cases.txt: what the replay lane runs.
 
 The lane replays what the nightly recorded, through the inject door the nightly
 grades on, and gates nothing, so every entry must be a registered case the
 inject lane runs and must not request a pull request (a write the lane would
-make for real on a replayed answer, with no case to grade it).
+make for real on a replayed answer, with no case to grade it). The safety
+list's cases run live and then replayed, so none is on both lists.
 """
 
 import pathlib
@@ -13,6 +14,7 @@ import unittest
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _EVAL = _ROOT / "hack" / "eval"
 _LANE = _EVAL / "replay-lane-cases.txt"
+_SAFETY = _EVAL / "replay-lane-safety-cases.txt"
 _ENTRY_RE = re.compile(r"^\./tasks/([^/]+)/task\.yaml$")
 _PULL_REQUEST_CHECKS = ("pull_request_opened", "pull_request_diff_contains")
 
@@ -28,7 +30,11 @@ def _entries(path):
 
 class ReplayLaneRosterTest(unittest.TestCase):
     def setUp(self):
-        self.entries = _entries(_LANE)
+        self.entries = _entries(_LANE) + _entries(_SAFETY)
+
+    def test_the_safety_list_names_cases_on_neither_list_twice(self):
+        self.assertTrue(_entries(_SAFETY))
+        self.assertEqual(set(_entries(_LANE)) & set(_entries(_SAFETY)), set())
 
     def test_it_names_cases(self):
         self.assertTrue(self.entries)

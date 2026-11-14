@@ -65,6 +65,9 @@ _OPERATOR_ONLY_ENV_KEYS = ("INCIDENT_TRIAGE_OPEN_PULL_REQUEST", "INCIDENT_TRIAGE
 # projection mounted, the projected file is the channel the gateway posts
 # into, so the mirror must not fill the key the container env lacks.
 _PROJECTED_HOME_ENV_KEYS = ("SLACK_HOME_CHANNEL",)
+# Joins the per-platform no-route refusals when the gateway holds more than one
+# backend with no home channel; chat_delivery_watch reads refusals joined by it.
+NO_CHAT_ROUTE_JOIN = "; "
 
 # The origin of a unit of work (docs/designs/proposal-origin.md §2.1): one value
 # per session, written once under ORIGIN_KEY in its metadata, with the chat
@@ -84,6 +87,15 @@ ORIGIN_PLATFORM_MAX_CHARS = 64
 ORIGIN_JOB_ID_MAX_CHARS = 256
 PROPOSAL_URL_MAX_CHARS = 2048
 PROPOSAL_OPENED_AT_MAX_CHARS = 64
+# The post-merge check's records (design gke-labs/kube-agents#5054, step 1,
+# "Record it"): one row per fix pull request, written when its proposal is
+# claimed and the install's POST_MERGE_CHECK switch is not off. The kinds of
+# fix the check knows, by the fleet audit's check id, which is the first segment
+# of its finding id (`<check>.<cluster>.<namespace>.<object>`); the kind is
+# derived from that id here, never taken from the caller. The pr_opened plugin
+# holds a copy (POST_MERGE_KINDS), which a test pins to this one.
+POST_MERGE_KINDS = ("no-pdb",)
+POST_MERGE_FIELD_MAX_CHARS = 256
 # The upward compression walk `_session_origin` takes, as
 # deploy/docker/patches/kanban_event_routing.py `_compression_ancestors` takes it.
 ORIGIN_COMPRESSION_END_REASON = "compression"
@@ -1054,6 +1066,40 @@ WORKLOAD_INCIDENT_INDEX_TERM = (
 PR_OPENED_EVENT_KIND = "pr_opened"
 PROPOSAL_URL_RE = re.compile(r"^(https?://[^/\s]+/\S+)(?:/pull/|/-/merge_requests/|/pulls/|/pull-requests/)(\d+)(?:[/?#](?:(?!/-/|/issues/|/pull/|/pulls/|/pull-requests/|/merge_requests/)\S)*)?$")
 PROPOSAL_OPEN_STATE = "open"
+_PROPOSAL_URL_PREFIX_RE = re.compile(r"https?://[^/\s]+/")
+_PROPOSAL_URL_MARKERS = ("/pull/", "/-/merge_requests/", "/pulls/", "/pull-requests/")
+_PROPOSAL_URL_TAIL_REFUSED = ("/-/", "/issues/", "/pull/", "/pulls/", "/pull-requests/", "/merge_requests/")
+
+
+def proposal_url_parts(url: str) -> tuple[str, int] | None:
+    """``(repository url, number)``, PROPOSAL_URL_RE's two groups, when it matches ``url``; else None.
+
+    The same answer as that pattern, found by string search rather than a
+    backtracking match, for text a caller sends: its ``\\S+`` before the
+    marker alternation is polynomial on a crafted url.
+    """
+    prefix = _PROPOSAL_URL_PREFIX_RE.match(url)
+    if prefix is None or any(c.isspace() for c in url):
+        return None
+    rest = url[prefix.end():]
+    found = []
+    for marker in _PROPOSAL_URL_MARKERS:
+        at = rest.find(marker, 1)
+        while at != -1:
+            found.append((at, marker))
+            at = rest.find(marker, at + 1)
+    # The pattern's greedy group takes the last marker that leaves a valid tail.
+    for at, marker in sorted(found, reverse=True):
+        start = end = at + len(marker)
+        while end < len(rest) and rest[end].isdecimal():
+            end += 1
+        tail = rest[end:]
+        if end == start or (tail and tail[0] not in "/?#"):
+            continue
+        if any(refused in tail[1:] for refused in _PROPOSAL_URL_TAIL_REFUSED):
+            continue
+        return url[: prefix.end() + at], int(rest[start:end])
+    return None
 # How many of the workload's most recent incidents are searched for a fix.
 FIX_PR_INCIDENTS_SCANNED = 5
 # The forge lookup's budget for the whole search; past it the event is
@@ -1233,6 +1279,11 @@ DRIFT_ALERT_EMOJI = "🔀"
 # shape rather than leaving the column blank and the recap with nothing to
 # group on.
 DRIFT_LEDGER_REASON = "OutOfBandChange"
+
+# The titles a drift triage gives its two usual options. A title is the button
+# slack_ux_incident draws for the option, so these are what a person presses.
+DRIFT_REVERT_TITLE = "Put Git's version back"
+DRIFT_KEEP_TITLE = "Keep it · update Git"
 
 # What a drift card says when the install has no usable GitOps repository
 # registered (gitops_preflight's NO_REGISTERED_REPO, which also covers entries
@@ -1858,6 +1909,54 @@ def init_db() -> None:
                 )
                 """
             )
+            # The post-merge check's records, one per fix pull request: what it
+            # fixes, where it came from and which thread asked, written at open
+            # (POST /v1/post-merge/records). The environment, merge, edit,
+            # revert and outcome columns are filled later by the check itself.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS post_merge_records (
+                    url             TEXT PRIMARY KEY,
+                    repo            TEXT,
+                    number          INTEGER,
+                    kind            TEXT,
+                    finding_id      TEXT,
+                    project         TEXT,
+                    location        TEXT,
+                    cluster         TEXT,
+                    namespace       TEXT,
+                    object          TEXT,
+                    environment     TEXT,
+                    origin          TEXT,
+                    origin_platform TEXT,
+                    opened_at       TEXT,
+                    task_id         TEXT,
+                    thread_platform TEXT,
+                    thread_chat_id  TEXT,
+                    thread_id       TEXT,
+                    merged_at       TEXT,
+                    merge_commit    TEXT,
+                    closed_at       TEXT,
+                    merge_checked_at TEXT,
+                    applied_at      TEXT,
+                    sync_state      TEXT,
+                    health_baseline TEXT,
+                    health_result   TEXT,
+                    health_detail   TEXT,
+                    health_at       TEXT,
+                    health_checked_at TEXT,
+                    human_edited    INTEGER,
+                    reverted_at     TEXT,
+                    outcome         TEXT,
+                    outcome_at      TEXT,
+                    outcome_detail  TEXT,
+                    reported_at     TEXT,
+                    followup_state  TEXT,
+                    followup_attempts INTEGER,
+                    followup_detail TEXT
+                )
+                """
+            )
             # One-time stamp tickets for a card's board origin; spent or
             # expired rows are removed by `cleanup_old_records`.
             conn.execute(
@@ -1897,6 +1996,7 @@ def cleanup_old_records(conn: sqlite3.Connection) -> None:
     # the next sweep re-offers. Their lifecycle is `state`, not age.
     # `cron_job_origins` and `proposals_opened` are absent too: a job's origin
     # holds for as long as the job exists, and the ledger is a durable count.
+    # So is `post_merge_records`: each row is a durable record of a fix pull request.
     try:
         # Delete incident reports and session metadata older than CLEANUP_TTL_DAYS
         param = f"-{CLEANUP_TTL_DAYS} days"
@@ -2872,12 +2972,12 @@ def enabled_chat_platforms() -> list[str]:
        than dropped because it is the truth on the installs that do write it.
     3. The environment signals above, for an install neither file describes.
 
-    One thing outranks all three: the platform ``chat_notify.routed_platform()``
+    One thing outranks all three: the platforms ``chat_notify.routed_platforms()``
     names, from ``A2A_NOTIFY_PLATFORM`` or the projected home-channel file. Under
     ``spec.mode: next`` the
-    managed scope says that platform's Hermes consumer is off because the A2A
-    gateway holds the backend, and posts to it go through the gateway instead,
-    so it is still a platform this install posts to, with a home channel or
+    managed scope says each such platform's Hermes consumer is off because the
+    A2A gateway holds its backend, and posts to it go through the gateway
+    instead, so each is still a platform this install posts to, with a home channel or
     (when it is the only chat platform) without one, the gateway keeping the
     refused posts for a digest. The operator renders the variable only then,
     and it is reserved against every other source.
@@ -2980,17 +3080,18 @@ def _no_chat_route_error() -> str:
     It reaches `last_delivery_error` through the relay adapter and the 502, and
     from there the dashboard, `hermes cron list`, the cronjob tool's reply in
     chat and the `chat_delivery_watch` ledger issue. The gateway names its
-    backend whether or not a home channel is set, so with one named the cause is
-    the missing home channel; without one this cannot tell no chat from a
-    misconfigured one, so it guesses at neither. A pod the operator has routed
-    never reaches this: its send goes to the gateway, whose refusal says the
-    post is kept.
+    backends whether or not a home channel is set, so with any named the cause
+    is the missing home channel, one sentence per platform; without one this
+    cannot tell no chat from a misconfigured one, so it guesses at neither. A
+    pod the operator has routed never reaches this: its send goes to the
+    gateway, whose refusal says the post is kept.
     """
-    platform = chat_notify.gateway_platform()
-    setting = HOME_CHANNEL_SETTINGS.get(platform)
-    if setting:
-        return f"composed but not delivered to {platform} (no home channel: set {setting})"
-    return NO_CHAT_ROUTE_ERROR
+    refusals = [
+        f"composed but not delivered to {platform} (no home channel: set {HOME_CHANNEL_SETTINGS[platform]})"
+        for platform in chat_notify.gateway_platforms()
+        if platform in HOME_CHANNEL_SETTINGS
+    ]
+    return NO_CHAT_ROUTE_JOIN.join(refusals) or NO_CHAT_ROUTE_ERROR
 
 
 def get_active_platform(platforms: Optional[list[str]] = None) -> str:
@@ -4502,6 +4603,10 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
         f"declares, or change git to declare what is now live — and both are worth stating even when one is "
         f"obviously right, because the reader is deciding which state wins. For an object git does not declare "
         f"they are the ones above.\n\n"
+        f"**Title those two with these exact words,** because each title becomes the button a person presses in "
+        f"chat: the revert is `{DRIFT_REVERT_TITLE}`, and changing git to declare what is now live is "
+        f"`{DRIFT_KEEP_TITLE}`. The same words title a lone **Proposed fix** that does one of them. Any other "
+        f"option gets a short title of its own.\n\n"
         f"**With two or more options:** label them 'Option A', 'Option B', ... in order, name those same letters "
         f"in the call to action, and mark exactly one of them '✅ **Recommended: Option <letter>**'. "
         f"The template below shows that shape; repeat its Option line once for each further option.\n\n"
@@ -4520,8 +4625,14 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
         f"Format the report you pass to `kanban_complete`'s `result` exactly like this — "
         f"these three `##` sections are the only ones, and there is no fourth:\n\n"
         f"## What's wrong\n\n"
-        f"<1 sentence: who changed what, and whether it is still live>\n\n"
+        f"<object> on <cluster> was changed outside Git.\n\n"
+        f"<1-2 sentences: which field went from what to what, at what time and by whom, then whether the change "
+        f"still stands and what it means now>\n\n"
         f"## Why\n\n"
+        f"```diff\n"
+        f"- <field>: <its value before the change, or 'not shown by the cluster'>\n"
+        f"+ <field>: <its value now>\n"
+        f"```\n\n"
         f"- <What the live object shows now, and how it differs from what git declares (or that git declares "
         f"nothing for it), with the evidence>\n"
         f"- <What the change affects — availability, cost, security posture — in 1-2 sentences>\n\n"
@@ -6373,7 +6484,7 @@ def relay_cron_report(
     with neither platform, or a pod rendered before the operator routed its only
     platform without a home channel (a routed pod sends, and the gateway refuses
     and keeps the post). The error
-    names the platform and the setting that arms it, in the wording
+    names each platform without a home channel and the setting that arms it, in the wording
     `chat_delivery_watch` reads the platform from; see
     :func:`_no_chat_route_error`.
 
@@ -8347,6 +8458,115 @@ def post_proposal_opened(request_data: Dict[str, Any]) -> Dict[str, bool]:
             cursor = conn.execute(
                 "INSERT OR IGNORE INTO proposals_opened (url, origin, origin_platform, opened_at) VALUES (?, ?, ?, ?)",
                 (url.strip(), origin, platform, opened_at),
+            )
+    return {"recorded": cursor.rowcount > 0}
+
+
+def _bounded_text(request_data: Dict[str, Any], field: str) -> str:
+    """``field`` as a string of at most POST_MERGE_FIELD_MAX_CHARS, empty when absent, else a 400."""
+    value = request_data.get(field) or ""
+    if not isinstance(value, str) or len(value) > POST_MERGE_FIELD_MAX_CHARS:
+        raise HTTPException(
+            status_code=400, detail=f"{field} must be a string of at most {POST_MERGE_FIELD_MAX_CHARS} characters"
+        )
+    return value.strip()
+
+
+def _cluster_coordinates(cluster: str) -> tuple[str, str]:
+    """``(project, location)`` of the managed cluster named ``cluster``; empty when no profile names it or they disagree.
+
+    ``cluster`` is the bare GKE name or the fleet audit's qualified
+    ``<project>/<location>/<name>``; a qualified name matches only the profile
+    whose identity has all three. Read from the Cluster Agent profiles'
+    ``cluster_identity`` stamp, the fleet's own record of each cluster, rather
+    than from the caller.
+    """
+    import cluster_agent_profile
+
+    found = set()
+    profiles = board_snapshot.PROFILES_DIR
+    if not cluster or not profiles.is_dir():
+        return "", ""
+    parts = cluster.split("/")
+    if len(parts) == 3 and all(parts):
+        want = {"project": parts[0], "location": parts[1], "cluster": parts[2]}
+    elif len(parts) == 1:
+        want = {"cluster": cluster}
+    else:
+        return "", ""
+    for home in sorted(profiles.iterdir()):
+        try:
+            identity = cluster_agent_profile.read_cluster_identity(home)
+        except Exception:  # noqa: BLE001 — an unreadable profile names no cluster
+            continue
+        if identity and all(identity[key] == value for key, value in want.items()):
+            found.add((identity["project"], identity["location"]))
+    return found.pop() if len(found) == 1 else ("", "")
+
+
+@app.post("/v1/post-merge/records", dependencies=[Depends(verify_api_key)])
+def post_post_merge_record(request_data: Dict[str, Any]) -> Dict[str, bool]:
+    """Record one fix pull request for the post-merge check; the first record of a url stands.
+
+    The url must be a pull request url (PROPOSAL_URL_RE). The finding it fixes
+    (``finding_id``, ``cluster``, ``namespace``, ``object``) must be of a kind
+    the check knows: the kind is the finding id's first segment (POST_MERGE_KINDS),
+    and a ``kind`` the caller sends is ignored. The cluster's project and location
+    come from the Cluster Agent profiles (:func:`_cluster_coordinates`). 200 either
+    way, so a retry after a lost answer is not told it failed.
+    """
+    url = request_data.get("url")
+    parts = proposal_url_parts(url.strip()) if isinstance(url, str) and len(url) <= PROPOSAL_URL_MAX_CHARS else None
+    if parts is None:
+        raise HTTPException(status_code=400, detail="url must be a pull request url")
+    repository, number = parts
+    sent_number = request_data.get("number")
+    if sent_number is not None and sent_number != number:
+        raise HTTPException(status_code=400, detail="number must match the pull request url")
+    finding_id = _bounded_text(request_data, "finding_id")
+    kind = finding_id.split(".", 1)[0]
+    if kind not in POST_MERGE_KINDS:
+        raise HTTPException(
+            status_code=400, detail=f"finding_id must name a finding of one of {list(POST_MERGE_KINDS)}"
+        )
+    cluster = _bounded_text(request_data, "cluster")
+    workload = _bounded_text(request_data, "object")
+    if not cluster or not workload:
+        raise HTTPException(status_code=400, detail="cluster and object must name the workload the fix is for")
+    origin, platform = _origin_fields(request_data)
+    opened_at = request_data.get("opened_at") or datetime.now(timezone.utc).isoformat()
+    if not isinstance(opened_at, str) or len(opened_at) > PROPOSAL_OPENED_AT_MAX_CHARS:
+        raise HTTPException(
+            status_code=400, detail=f"opened_at must be a string of at most {PROPOSAL_OPENED_AT_MAX_CHARS} characters"
+        )
+    project, location = _cluster_coordinates(cluster)
+    row = (
+        url.strip(),
+        repository,
+        number,
+        kind,
+        finding_id,
+        project,
+        location,
+        cluster,
+        _bounded_text(request_data, "namespace"),
+        workload,
+        _bounded_text(request_data, "environment"),
+        origin,
+        platform,
+        opened_at,
+        _bounded_text(request_data, "task_id"),
+        _bounded_text(request_data, "thread_platform"),
+        _bounded_text(request_data, "thread_chat_id"),
+        _bounded_text(request_data, "thread_id"),
+    )
+    with closing(sqlite3.connect(SESSION_KV_DB_PATH, timeout=ORIGIN_DB_TIMEOUT_SECONDS)) as conn:
+        with conn:
+            cursor = conn.execute(
+                "INSERT OR IGNORE INTO post_merge_records (url, repo, number, kind, finding_id, project, location, "
+                "cluster, namespace, object, environment, origin, origin_platform, opened_at, task_id, "
+                "thread_platform, thread_chat_id, thread_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                row,
             )
     return {"recorded": cursor.rowcount > 0}
 
