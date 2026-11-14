@@ -298,8 +298,8 @@ func TestATransientPolicyReadLeavesDispatcherJobModeAlone(t *testing.T) {
 	}
 }
 
-// Absent while the chart's signal is off, as BusCredentialsReady is on a
-// today install, and removed when the signal goes or the dispatcher does.
+// Absent while the chart's signal is off, and removed when the signal goes
+// or the dispatcher does.
 func TestDispatcherJobModeIsAbsentWithoutTheSignal(t *testing.T) {
 	t.Run("never on", func(t *testing.T) {
 		f := newJobModeFixture(t, sandboxKeysSecret(a2aTestAgent()))
@@ -313,13 +313,6 @@ func TestDispatcherJobModeIsAbsentWithoutTheSignal(t *testing.T) {
 	for name, turnOff := range map[string]func(t *testing.T, f *jobModeFixture){
 		"the signal off":     func(t *testing.T, _ *jobModeFixture) { t.Setenv(a2aDispatcherJobPolicyEnvVar, "") },
 		"the dispatcher off": func(t *testing.T, _ *jobModeFixture) { t.Setenv(a2aProfileDispatcherEnvVar, "false") },
-		"the mode back to today": func(t *testing.T, f *jobModeFixture) {
-			agent := f.agent(t)
-			agent.Spec.Mode = nil
-			if err := f.c.Update(context.Background(), agent); err != nil {
-				t.Fatal(err)
-			}
-		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			f := newJobModeFixture(t, sandboxKeysSecret(a2aTestAgent()))
@@ -453,20 +446,13 @@ func TestDispatcherJobModeWritesStatusOnlyOnAChange(t *testing.T) {
 
 // A pass that returns before the dispatcher step tears nothing down, so it
 // leaves the condition as it was, even with the signal or the dispatcher
-// gone or the mode flipped to today: the Jobs Role and the templates are
+// gone: the Jobs Role and the templates are
 // still live, and an absent condition would say Job mode is off. The first
 // pass that does tear it down removes it.
 func TestARefusedPassLeavesDispatcherJobModeStanding(t *testing.T) {
 	for name, turnOff := range map[string]func(t *testing.T, f *jobModeFixture){
 		"the signal off":     func(t *testing.T, _ *jobModeFixture) { t.Setenv(a2aDispatcherJobPolicyEnvVar, "") },
 		"the dispatcher off": func(t *testing.T, _ *jobModeFixture) { t.Setenv(a2aProfileDispatcherEnvVar, "false") },
-		"the mode back to today": func(t *testing.T, f *jobModeFixture) {
-			agent := f.agent(t)
-			agent.Spec.Mode = nil
-			if err := f.c.Update(context.Background(), agent); err != nil {
-				t.Fatal(err)
-			}
-		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			agent := a2aTestAgent()
@@ -506,45 +492,6 @@ func TestARefusedPassLeavesDispatcherJobModeStanding(t *testing.T) {
 				t.Errorf("%s survived the teardown after %s: %+v", dispatcherJobModeCondition, name, got)
 			}
 		})
-	}
-}
-
-// A flip to today whose profile-namespace teardown fails to delete Job
-// mode's resources leaves the condition standing: the Jobs Role is still
-// live, and an absent condition would say Job mode is off. The fence stays
-// as the sentinel, so the next pass retries, and the one that succeeds
-// removes the condition.
-func TestAFailedJobModeTeardownOnTheFlipToTodayLeavesDispatcherJobModeStanding(t *testing.T) {
-	agent := a2aTestAgent()
-	f := newJobModeFixture(t, sandboxKeysSecret(agent))
-	f.mustReconcile(t)
-	f.mustReconcile(t)
-	wantJobMode(t, f.condition(t), metav1.ConditionTrue, jobModeReasonInPlace)
-	jobsRole := types.NamespacedName{Namespace: profileNamespaceName(agent), Name: a2aDispatcherJobsRoleName(agent)}
-	f.deleteErr = func(obj client.Object) error {
-		if _, isRole := obj.(*rbacv1.Role); isRole && client.ObjectKeyFromObject(obj) == jobsRole {
-			return apierrors.NewForbidden(rbacv1.Resource("roles"), obj.GetName(), errors.New("refused"))
-		}
-		return nil
-	}
-	a := f.agent(t)
-	a.Spec.Mode = nil
-	if err := f.c.Update(context.Background(), a); err != nil {
-		t.Fatal(err)
-	}
-	f.mustReconcile(t)
-	if err := f.c.Get(context.Background(), jobsRole, &rbacv1.Role{}); err != nil {
-		t.Fatalf("precondition: the failed teardown removed the Jobs Role: %v", err)
-	}
-	wantJobMode(t, f.condition(t), metav1.ConditionTrue, jobModeReasonInPlace)
-	// The delete goes through on the next pass and the condition goes.
-	f.deleteErr = nil
-	f.mustReconcile(t)
-	if err := f.c.Get(context.Background(), jobsRole, &rbacv1.Role{}); !apierrors.IsNotFound(err) {
-		t.Fatalf("precondition: the retried teardown left the Jobs Role: %v", err)
-	}
-	if got := f.condition(t); got != nil {
-		t.Errorf("%s survived the teardown on the flip to today: %+v", dispatcherJobModeCondition, got)
 	}
 }
 

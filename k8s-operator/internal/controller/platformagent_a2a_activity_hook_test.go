@@ -29,11 +29,11 @@ import (
 )
 
 // The pod-wide activity hook and its signing key render together, and only
-// on a next install whose bridge (declared, or rendered when none is) has a
-// door the hook can reach: a today install, a next install with no bridge to post to, or a
-// bridge on the cli executor or with its door off or elsewhere, renders
-// exactly what it did before.
-func TestActivityHookRendersOnlyWithABridgeOnNext(t *testing.T) {
+// when the bridge (declared, or rendered when none is) has a door the hook
+// can reach: an install with no bridge to post to, or a bridge on the cli
+// executor or with its door off or elsewhere, renders exactly what it did
+// before.
+func TestActivityHookRendersOnlyWithABridge(t *testing.T) {
 	key := corev1.EnvVar{Name: "API_SERVER_KEY", Value: "k"}
 	keyRef := corev1.EnvVar{Name: "API_SERVER_KEY", ValueFrom: &corev1.EnvVarSource{
 		SecretKeyRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "s"}, Key: "API_SERVER_KEY"}}}
@@ -53,40 +53,37 @@ func TestActivityHookRendersOnlyWithABridgeOnNext(t *testing.T) {
 	bridge := bridgeWith()
 	cases := []struct {
 		name     string
-		mode     *string
 		sidecars []corev1.Container
 		want     bool
 	}{
-		{"today with a bridge", nil, bridge, false},
 		// No declared bridge and no bus yet: the rendered bridge is not
 		// in the pod, so there is no door to post to.
 		// TestARenderedBridgeGetsTheHookOnceInThePod covers the rest.
-		{"next without sidecars", ptr.To("next"), nil, false},
-		{"next with another sidecar", ptr.To("next"), other, false},
-		{"next with a bridge", ptr.To("next"), bridge, true},
-		{"next with an api bridge", ptr.To("next"), bridgeWith(corev1.EnvVar{Name: "BRIDGE_EXECUTOR", Value: "api"}), true},
-		{"next with the door at its default", ptr.To("next"), bridgeWith(corev1.EnvVar{Name: "BRIDGE_ACTIVITY_LISTEN", Value: "127.0.0.1:8651"}), true},
-		{"next with a cli bridge", ptr.To("next"), bridgeWith(corev1.EnvVar{Name: "BRIDGE_EXECUTOR", Value: "cli"}), false},
-		{"next with a cli bridge by reference", ptr.To("next"), bridgeWith(
+		{"without sidecars", nil, false},
+		{"with another sidecar", other, false},
+		{"with a bridge", bridge, true},
+		{"with an api bridge", bridgeWith(corev1.EnvVar{Name: "BRIDGE_EXECUTOR", Value: "api"}), true},
+		{"with the door at its default", bridgeWith(corev1.EnvVar{Name: "BRIDGE_ACTIVITY_LISTEN", Value: "127.0.0.1:8651"}), true},
+		{"with a cli bridge", bridgeWith(corev1.EnvVar{Name: "BRIDGE_EXECUTOR", Value: "cli"}), false},
+		{"with a cli bridge by reference", bridgeWith(
 			corev1.EnvVar{Name: "EXEC", Value: "cli"}, corev1.EnvVar{Name: "BRIDGE_EXECUTOR", Value: "$(EXEC)"}), false},
-		{"next with the door off", ptr.To("next"), bridgeWith(corev1.EnvVar{Name: "BRIDGE_ACTIVITY_LISTEN", Value: "off"}), false},
-		{"next with the door elsewhere", ptr.To("next"), bridgeWith(corev1.EnvVar{Name: "BRIDGE_ACTIVITY_LISTEN", Value: "127.0.0.1:9999"}), false},
-		{"next with the door on every interface", ptr.To("next"), bridgeWith(corev1.EnvVar{Name: "BRIDGE_ACTIVITY_LISTEN", Value: "0.0.0.0:8651"}), true},
-		{"next with the door on the empty host", ptr.To("next"), bridgeWith(corev1.EnvVar{Name: "BRIDGE_ACTIVITY_LISTEN", Value: ":8651"}), true},
-		{"next with the door on the IPv6 wildcard", ptr.To("next"), bridgeWith(corev1.EnvVar{Name: "BRIDGE_ACTIVITY_LISTEN", Value: "[::]:8651"}), true},
-		{"next with the door on another host", ptr.To("next"), bridgeWith(corev1.EnvVar{Name: "BRIDGE_ACTIVITY_LISTEN", Value: "10.0.0.1:8651"}), false},
-		{"next with the door from valueFrom", ptr.To("next"), bridgeWith(fromField("BRIDGE_ACTIVITY_LISTEN")), false},
-		{"next with a keyless bridge", ptr.To("next"), keyless, false},
-		{"next with a blank key", ptr.To("next"), keylessWith(corev1.EnvVar{Name: "API_SERVER_KEY", Value: " "}), false},
-		{"next with the key from a Secret", ptr.To("next"), keylessWith(keyRef), true},
-		{"next with a keyless api bridge", ptr.To("next"), keylessWith(corev1.EnvVar{Name: "BRIDGE_EXECUTOR", Value: "api"}), true},
-		{"next with an empty executor and a key", ptr.To("next"), bridgeWith(corev1.EnvVar{Name: "BRIDGE_EXECUTOR", Value: ""}), true},
-		{"next with the executor from valueFrom", ptr.To("next"), bridgeWith(fromField("BRIDGE_EXECUTOR")), false},
+		{"with the door off", bridgeWith(corev1.EnvVar{Name: "BRIDGE_ACTIVITY_LISTEN", Value: "off"}), false},
+		{"with the door elsewhere", bridgeWith(corev1.EnvVar{Name: "BRIDGE_ACTIVITY_LISTEN", Value: "127.0.0.1:9999"}), false},
+		{"with the door on every interface", bridgeWith(corev1.EnvVar{Name: "BRIDGE_ACTIVITY_LISTEN", Value: "0.0.0.0:8651"}), true},
+		{"with the door on the empty host", bridgeWith(corev1.EnvVar{Name: "BRIDGE_ACTIVITY_LISTEN", Value: ":8651"}), true},
+		{"with the door on the IPv6 wildcard", bridgeWith(corev1.EnvVar{Name: "BRIDGE_ACTIVITY_LISTEN", Value: "[::]:8651"}), true},
+		{"with the door on another host", bridgeWith(corev1.EnvVar{Name: "BRIDGE_ACTIVITY_LISTEN", Value: "10.0.0.1:8651"}), false},
+		{"with the door from valueFrom", bridgeWith(fromField("BRIDGE_ACTIVITY_LISTEN")), false},
+		{"with a keyless bridge", keyless, false},
+		{"with a blank key", keylessWith(corev1.EnvVar{Name: "API_SERVER_KEY", Value: " "}), false},
+		{"with the key from a Secret", keylessWith(keyRef), true},
+		{"with a keyless api bridge", keylessWith(corev1.EnvVar{Name: "BRIDGE_EXECUTOR", Value: "api"}), true},
+		{"with an empty executor and a key", bridgeWith(corev1.EnvVar{Name: "BRIDGE_EXECUTOR", Value: ""}), true},
+		{"with the executor from valueFrom", bridgeWith(fromField("BRIDGE_EXECUTOR")), false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			agent := a2aTestAgent()
-			agent.Spec.Mode = tc.mode
 			if tc.sidecars != nil {
 				agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Sidecars: tc.sidecars}
 			}

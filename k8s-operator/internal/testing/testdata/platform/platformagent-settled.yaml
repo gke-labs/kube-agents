@@ -1,14 +1,13 @@
-# The default example CR with spec.mode: next, so the golden carries the A2A stack
-# (NATS, the A2A gateway, the auth callout, the verifier, the console, the hermes
-# bridge and the provisioning Job) that charts/kube-agents/files/footprint.yaml counts
-# for a next-mode install.
+# The default example CR, reconciled until settled: the golden carries the A2A
+# stack (NATS, the A2A gateway, the auth callout, the verifier, the console, the
+# hermes bridge and the provisioning Job) plus what later passes add, and
+# charts/kube-agents/files/footprint.yaml sums the stack from it.
 apiVersion: kubeagents.x-k8s.io/v1alpha1
 kind: PlatformAgent
 metadata:
   name: platformagent
   namespace: kubeagents-system
 spec:
-  mode: next
   # Harness configures the core execution environment and framework-level settings.
   # +optional
   harness:

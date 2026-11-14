@@ -7,7 +7,7 @@ by agent_namespace and agent; the ratios are recorded once and the alerts read
 the recorded series, so a dashboard and an alert see one number. Two alerts
 are the exceptions: the scrape alert reads `up`, and the Slack alert reads the
 A2A gateway's own connection gauge, by its scrape job, which only the replica
-holding a next-mode Slack install's socket serves (a gateway on another
+holding a Slack install's socket serves (a gateway on another
 backend, or a standby replica, serves no sample, so the alert never fires
 there). Neither carries the agent labels; the four rules below bind the
 alerts over the operator's gauges.
