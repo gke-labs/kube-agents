@@ -415,3 +415,4 @@ plugins:
     - tool_call_audit
     - incident_context
     - pr_opened
+    - model_identity

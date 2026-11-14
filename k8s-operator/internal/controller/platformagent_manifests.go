@@ -1019,6 +1019,7 @@ var DefaultBuiltInPlugins = []string{
 	"bootstrap_onboarding",
 	"pr_opened",
 	"chat_metrics",
+	"model_identity",
 }
 
 // pluginNamePattern mirrors the CEL rule on AgentPlugin.metadata.name. The name becomes
