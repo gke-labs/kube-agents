@@ -23,11 +23,19 @@ import yaml
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _CHART = _REPO_ROOT / "charts" / "kube-agents"
 _LITELLM = _REPO_ROOT / "k8s-operator" / "config" / "integrations" / "litellm"
-_BREAKPOINTS = [
-    {"location": "message", "role": "system", "control": {"type": "ephemeral", "ttl": "1h"}},
-    {"location": "message", "index": -3},
-    {"location": "message", "index": -1},
-]
+_DEFAULT_SYSTEM_TTL = "1h"
+_OVERLAY_TTL_VARIABLE = "LITELLM_SYSTEM_CACHE_TTL"
+
+
+def _breakpoints(system_ttl: str) -> list[dict]:
+    return [
+        {"location": "message", "role": "system", "control": {"type": "ephemeral", "ttl": system_ttl}},
+        {"location": "message", "index": -3},
+        {"location": "message", "index": -1},
+    ]
+
+
+_BREAKPOINTS = _breakpoints(_DEFAULT_SYSTEM_TTL)
 _HELM_BASE_ARGS = [
     "helm",
     "template",
@@ -66,6 +74,19 @@ class TestChartRender(unittest.TestCase):
                 points = self._config(args)["router_settings"]["default_litellm_params"]["cache_control_injection_points"]
                 self.assertEqual(points, _BREAKPOINTS)
 
+    def test_the_system_ttl_is_a_value(self) -> None:
+        for ttl in ("5m", "1h"):
+            with self.subTest(ttl=ttl):
+                args = _model_args("anthropic") + ["--set-string", f"litellm.promptCache.systemTTL={ttl}"]
+                points = self._config(args)["router_settings"]["default_litellm_params"]["cache_control_injection_points"]
+                self.assertEqual(points, _breakpoints(ttl))
+
+    def test_the_schema_refuses_another_ttl(self) -> None:
+        args = _model_args("anthropic") + ["--set-string", "litellm.promptCache.systemTTL=24h"]
+        proc = subprocess.run(_HELM_BASE_ARGS + args, capture_output=True, text=True, check=False)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("systemTTL", proc.stderr)
+
     def test_gemini_and_the_rest_get_none(self) -> None:
         for args in (
             [],
@@ -89,8 +110,17 @@ class TestKustomize(unittest.TestCase):
         base = self._config(_LITELLM / "base" / "config.yaml")
         overlay = self._config(_LITELLM / "overlays" / "anthropic" / "config.yaml")
         points = overlay.pop("router_settings")["default_litellm_params"]["cache_control_injection_points"]
-        self.assertEqual(points, _BREAKPOINTS)
+        self.assertEqual(points, _breakpoints(f"${{{_OVERLAY_TTL_VARIABLE}}}"))
         self.assertEqual(overlay, base)
+
+    def test_the_overlay_ttl_defaults_to_the_chart_default_and_is_substituted(self) -> None:
+        makefile = (_REPO_ROOT / "k8s-operator" / "Makefile").read_text()
+        self.assertIn(f"{_OVERLAY_TTL_VARIABLE} ?= {_DEFAULT_SYSTEM_TTL}", makefile)
+        self.assertIn(f"export {_OVERLAY_TTL_VARIABLE}", makefile)
+        litellm_vars = next(line for line in makefile.splitlines() if line.startswith("LITELLM_VARS ="))
+        self.assertIn(f"$${_OVERLAY_TTL_VARIABLE}", litellm_vars)
+        values = yaml.safe_load((_CHART / "values.yaml").read_text())
+        self.assertEqual(values["litellm"]["promptCache"]["systemTTL"], _DEFAULT_SYSTEM_TTL)
 
     def test_the_anthropic_overlay_merges_its_config_over_the_base(self) -> None:
         kustomization = self._config(_LITELLM / "overlays" / "anthropic" / "kustomization.yaml")
