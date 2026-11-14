@@ -11380,18 +11380,28 @@ class TestCardStop(unittest.TestCase):
         self.assertNotIn("t_new", self.stopped_ids(first))
 
     def test_a_card_filed_in_the_same_second_the_first_stop_began_gets_a_fresh_stop(self):
-        # Hermes stamps created_at in whole seconds: a card filed just after
-        # the first scan began, in that second, carries a stamp below the
-        # scan's start, and must still count as new.
+        # Hermes stamps created_at in whole seconds, so a card filed just
+        # after the first scan began can carry a stamp below it. It is open,
+        # and an open card after a complete stop is new: a fresh stop.
         import math
 
         self.the_tree()
+        first_stamp = math.floor(time.time())
         self.stop()
-        (flight,) = session_kv_server._card_stop_flights.values()
-        self.card("t_same_second", "running", session=self.SESSION, created=math.floor(flight.started_at))
+        self.card("t_same_second", "running", session=self.SESSION, created=first_stamp)
         second = self.stop().json()
         self.assertNotIn("joined", second)
         self.assertEqual(self.stopped_ids(second), ["t_same_second"])
+
+    def test_a_done_card_filed_just_before_the_first_stop_still_joins(self):
+        # As verify_card_stop.py runs it against real Hermes: an earlier
+        # answer's card, done, filed in the first stop's own second. It is
+        # not open, so a second stop at once joins the first.
+        self.card("t_earlier", "done", session=self.SESSION, created=time.time())
+        first = self.stop().json()
+        second = self.stop().json()
+        self.assertTrue(second.get("joined"), second)
+        self.assertEqual(second["settled"], first["settled"])
 
     def test_concurrent_stops_for_one_conversation_scan_once_and_answer_alike(self):
         import threading as _threading
@@ -11451,7 +11461,7 @@ class TestCardStop(unittest.TestCase):
         def caller(name):
             out[name] = session_kv_server._card_stop_single_flight(self.SESSION, self.CONVERSATION, run)
 
-        with patch.object(session_kv_server, "_card_stop_tree_has_card_since", lambda *a: True):
+        with patch.object(session_kv_server, "_card_stop_tree_has_open_card", lambda *a: True):
             a = _threading.Thread(target=caller, args=("a",))
             a.start()
             self.assertTrue(entered.wait(5))
@@ -11512,7 +11522,7 @@ class TestCardStop(unittest.TestCase):
         self.card("t_a", "ready", session=self.SESSION, created=time.time() - 10)
         truncated = session_kv_server._CardTree({}, [], True)
         with patch.object(session_kv_server, "_collect_card_tree", lambda *a, **k: truncated):
-            self.assertTrue(session_kv_server._card_stop_tree_has_card_since(self.SESSION, self.CONVERSATION, time.time()))
+            self.assertTrue(session_kv_server._card_stop_tree_has_open_card(self.SESSION, self.CONVERSATION))
 
     def test_another_conversation_never_joins(self):
         calls = []

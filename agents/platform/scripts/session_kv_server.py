@@ -10652,8 +10652,8 @@ def stop_session_cards(session_id: str, request_data: Dict[str, Any]) -> Dict[st
     was larger than one pass, and `deadline` when the budget ran out. Answers
     within CARD_STOP_WORST_CASE_S, or CARD_STOP_JOIN_WORST_CASE_S for a call that
     joins a running stop. A call while another for the same session
-    and conversation runs, or within CARD_STOP_JOIN_WINDOW_S of one with no
-    card filed since its first scan, answers with that stop's result marked
+    and conversation runs, or within CARD_STOP_JOIN_WINDOW_S of one, with no
+    card open in the conversation's tree now, answers with that stop's result marked
     `joined` (_card_stop_single_flight). Past that, calling it again stops
     nothing new, since an archived card is not open.
     """
@@ -10682,19 +10682,20 @@ def stop_session_cards(session_id: str, request_data: Dict[str, Any]) -> Dict[st
 # finished stop looks at it; either answers with that stop's result, marked
 # `joined`, only when the result is complete (nothing failed, pending,
 # unresolved, past the deadline or truncated) and no card in the
-# conversation's tree was created after that stop's first scan began. A card
-# filed since is real new work, and a partial stop may have left one running:
-# both get a fresh stop. Anything uncertain scans afresh.
+# conversation's tree is open now. A complete stop left nothing open, so an
+# open card is one filed since: real new work, which gets a fresh stop, as
+# does anything a partial stop may have left running. Read by status, not by
+# created_at, whose whole-second stamps can't tell a card filed just before
+# the stop from one filed just after. Anything uncertain scans afresh.
 CARD_STOP_JOIN_WINDOW_S = 60.0
 
 
 class _CardStopFlight:
-    """One stop for a (session, conversation): its result or error, when its
-    first scan began (wall clock, as kanban's created_at), and when it ended."""
+    """One stop for a (session, conversation): its result or error, and when
+    it ended."""
 
     def __init__(self) -> None:
         self.done = threading.Event()
-        self.started_at = time.time()
         self.finished_at: Optional[float] = None  # monotonic
         self.result: Optional[Dict[str, Any]] = None
         self.error: Optional[HTTPException] = None
@@ -10730,12 +10731,12 @@ def _card_stop_result_complete(result: Optional[Dict[str, Any]]) -> bool:
 
 def _card_stop_reusable(flight: _CardStopFlight, session_id: str, conversation: str) -> bool:
     """A finished flight's result answers this call only when it is complete
-    and no card in the conversation's tree was created since its first scan
-    began; anything else needs a fresh stop (fail closed)."""
+    and no card in the conversation's tree is open now (CARD_STOP_JOIN_WINDOW_S's
+    comment); anything else needs a fresh stop (fail closed)."""
     return (
         flight.error is None
         and _card_stop_result_complete(flight.result)
-        and not _card_stop_tree_has_card_since(session_id, conversation, flight.started_at)
+        and not _card_stop_tree_has_open_card(session_id, conversation)
     )
 
 
@@ -10803,9 +10804,10 @@ def _card_stop_single_flight(session_id: str, conversation: str, run) -> Dict[st
         own.done.set()
 
 
-def _card_stop_tree_has_card_since(session_id: str, conversation: str, since: float) -> bool:
-    """Whether the conversation's card tree holds a card created at or after
-    `since`. Any failure to read it answers True, so the caller scans afresh."""
+def _card_stop_tree_has_open_card(session_id: str, conversation: str) -> bool:
+    """Whether the conversation's card tree holds a card that is not done or
+    archived (CARD_STOP_SETTLED_STATUSES). Any failure to read it, or a tree
+    too large to read whole, answers True, so the caller scans afresh."""
     board = _kanban_db_path()
     if not os.path.isfile(board):
         return False
@@ -10818,16 +10820,8 @@ def _card_stop_tree_has_card_since(session_id: str, conversation: str, since: fl
     except Exception:
         return True
     if tree.truncated:
-        return True  # a tree too large to read whole may hold a new card
-    # Hermes stamps created_at in whole seconds, so a card filed after the
-    # scan began in the same second carries a stamp below `since`: compare
-    # against that second, which errs toward a fresh stop, never a stale one.
-    # Hermes writes the board on this pod, so its clock is this one; a wider
-    # margin would count a card filed just before the first stop as new and
-    # never join (verify_card_stop.py's second call).
-    floor = math.floor(since)
-    return any(float(card.get("created_at") or 0) >= floor for card in tree.cards.values())
-
+        return True  # a tree too large to read whole may hold an open card
+    return any(card.get("status") not in CARD_STOP_SETTLED_STATUSES for card in tree.cards.values())
 
 def _stop_session_cards_now(session_id: str, conversation: str, deadline: Optional[float] = None) -> Dict[str, Any]:
     """One stop of the conversation's cards: the route's body, run through
