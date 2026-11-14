@@ -768,12 +768,26 @@ type PlatformAgentReconciler struct {
 // resources. tests/test_operator_secrets_grant.py and the C5 conformance test pin that shape;
 // docs/designs/operator-namespaced-write-verbs.md is the inventory and the reasoning.
 //
-// CR.
-// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents,verbs=get;list;watch;create;update;patch;delete
+// CR. Every write verb here has a caller, and tests/test_operator_secrets_grant.py names it
+// per verb: `update` on platformagents is the finalizer (Add/RemoveFinalizer with r.Update)
+// and `patch` the bus-stream annotation merge patch; the status writes are Status().Update
+// and Status().Patch; `update` on platformagents/finalizers is what the API server's
+// owner-references admission requires of an owner whose rendered objects carry
+// blockOwnerDeletion (SetControllerReference). The reads are the informers (list, watch),
+// the Lists outside them (the webhook's, the usage poller's, the bus-stream check's) and the
+// uncached Gets of a PlatformAgent (r.APIReader, podReader, a2aReader). The reads on
+// platformagents/status are escalation prevention: buildPlatformLocalRole grants the agent's
+// local Role get;list;watch on platformagents and platformagents/status, and the API server
+// refuses a Role whose grantor does not hold every verb in it (a grant on the resource does
+// not cover the subresource), so without them reconcileRBAC fails on every new agent. `get`
+// on the other status subresources and on agentplugins has no sender and stays as the read
+// half of a kind the controller writes or watches. The operator never creates or deletes a
+// PlatformAgent, and never updates an AgentPlugin's status whole, so those verbs are not here.
+// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents/status,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents/finalizers,verbs=update
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentplugins,verbs=get;list;watch
-// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentplugins/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentplugins/status,verbs=get;patch
 // Render: the agent, broker, gateway and bus workloads, and the profile pools. Reads cluster-wide
 // (the informers; escalation prevention); writes namespaced.
 // +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets,verbs=get;list;watch

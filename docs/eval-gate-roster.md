@@ -15,7 +15,7 @@ them, since the merge-blocking presubmit runs on that lane (below).
 `hack/replay-proxy/` carries it as well, because its normalizer decides which requests match a
 recorded answer ([`eval-design.md`](../examples/inference-replay/eval-design.md#the-proxy-cant-come-from-the-pull-request)).
 Nothing else carries the rule: `hack/ci-eval-pr.sh` and the scripts it runs,
-`hack/eval/nightly-cases.txt`, `hack/eval/api-lane-exclusions.txt`, `hack/eval/replay-lane-cases.txt` and a new case directory under `bench/tasks/` need only the normal approvers
+`hack/eval/nightly-cases.txt`, `hack/eval/api-lane-exclusions.txt`, `hack/eval/replay-lane-cases.txt`, `hack/eval/replay-lane-safety-cases.txt` and a new case directory under `bench/tasks/` need only the normal approvers
 ([#1546](https://github.com/gke-labs/kube-agents/issues/1546), decided 2026-09-15). This
 page lives under `docs/` on purpose: the presubmit's step 0 (`hack/ci-revalidate.sh`) treats
 `docs/` as inert (and the Prow path filter in `oss-test-infra` does today too), so a review finding
@@ -1026,6 +1026,8 @@ is a registered case the inject lane runs, so the nightly has recorded it. The r
 reaches it: the script arms no roster case there, and the lane appends nothing to the evidence
 store and publishes no dashboard. Its record is its report in the shadow bucket
 ([`hack/replay-proxy/README.md`](../hack/replay-proxy/README.md#record-and-replay-the-replay-lane)).
+`hack/eval/replay-lane-safety-cases.txt` follows the same rules; the lane runs each of its cases
+live and then replayed.
 
 ## Demoting a flaky case
 
