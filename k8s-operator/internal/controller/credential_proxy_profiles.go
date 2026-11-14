@@ -196,10 +196,10 @@ func withCredentialProxyProfilePeer(np *networkingv1.NetworkPolicy, agent *agent
 // The broker renders before reconcileA2A, so this ensures the signing key
 // itself; ensureA2ATaskSigningKeySecret creates it once and is a read after.
 func (r *PlatformAgentReconciler) credentialProxyProfileConfigFor(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (credentialProxyProfileConfig, error) {
-	if !a2aStackRendering(agent) || r.agentProfilesUnreadable {
+	if r.agentProfilesUnreadable {
 		return credentialProxyProfileConfig{}, nil
 	}
-	profiles, err := boundAgentProfiles(ctx, r.Client, agent)
+	profiles, err := boundAgentProfiles(ctx, r.Client, agent, r.tiersUnreadable)
 	if err != nil {
 		return credentialProxyProfileConfig{}, fmt.Errorf("failed to list AgentProfiles for the credential proxy: %w", err)
 	}

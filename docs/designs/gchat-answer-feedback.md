@@ -52,7 +52,7 @@ false`, with the same effect as the Slack field. The chart carries the value.
   them. Unchanged.
 - The Slack follow-ups #3374 (file a 👎 as an issue), #3447 and #3481. They stay Slack issues and
   would reach Google Chat through the shared recorder when they land.
-- A per-platform off switch. Slack and Google Chat run in one gateway under `next`, and the off
+- A per-platform off switch. Slack and Google Chat run in one gateway, and the off
   switch stays one global flag with two names: either turns feedback off on both.
 - Ratings on home-channel posts (alerts, scheduled reports). The notifier marks only the card
   report that answers an ask in its conversation; home posts are not marked on Slack either.
@@ -180,7 +180,7 @@ button").
 
 **Call 6: the switch.** `spec.integration.googleChat.answerFeedback *bool`, default `true`, the
 Slack field's twin. The operator renders `A2A_GOOGLE_CHAT_ANSWER_FEEDBACK=false` on the gateway
-only when Google Chat is among the platforms the gateway serves under `next` and the field is `false`, as it
+only when Google Chat is among the platforms the gateway serves and the field is `false`, as it
 renders the Slack variable only when Slack is armed. The gateway sets `AnswerFeedbackOff` when
 either variable is `false`; the desk then never starts, no backend draws, and a tap on an older
 message is logged and dropped. Chart: `platformAgent.integration.googleChat.answerFeedback`,

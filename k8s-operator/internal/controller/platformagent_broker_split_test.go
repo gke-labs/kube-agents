@@ -60,10 +60,11 @@ func brokerPodAgent() *agentv1alpha1.PlatformAgent {
 				Location:    "us-central1",
 				ClusterName: "cluster",
 			},
-			// Both chat relays are enabled because they are hosted in the
-			// broker's process, so their URLs have to address its Service. With
-			// them off, an assertion about those two variables would be an
-			// assertion about nothing.
+			// Both chat platforms are enabled: the A2A gateway consumes them,
+			// so the agent container must carry neither relay URL; the Teams
+			// relay, which Hermes still polls, is added by
+			// brokerPodAgentWithTeams where a test needs a relay that does
+			// address the broker Service.
 			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
 				GoogleChat: &agentv1alpha1.GoogleChatSpec{
 					Enabled:          ptr.To(true),
@@ -75,6 +76,18 @@ func brokerPodAgent() *agentv1alpha1.PlatformAgent {
 			},
 		},
 	}
+}
+
+// brokerPodAgentWithTeams is brokerPodAgent with Teams enabled too: the one
+// chat platform Hermes still serves, whose relay URL addresses the broker.
+func brokerPodAgentWithTeams() *agentv1alpha1.PlatformAgent {
+	agent := brokerPodAgent()
+	agent.Spec.Integration.Teams = &agentv1alpha1.TeamsSpec{
+		Enabled:              ptr.To(true),
+		AppIdSecretRef:       &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "teams"}, Key: "id"},
+		AppPasswordSecretRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "teams"}, Key: "password"},
+	}
+	return agent
 }
 
 func brokerContainerNamed(containers []corev1.Container, name string) *corev1.Container {
@@ -136,16 +149,20 @@ func TestTheBrokerIsNotInTheAgentPod(t *testing.T) {
 	if value, found := brokerEnvValue(agentContainer.Env, "CREDENTIAL_PROXY_URL"); !found || value != "" {
 		t.Errorf("the agent container must not be told where the broker is, got %q (present=%v)", value, found)
 	}
+	// With Chat and Slack both on, the A2A gateway consumes both, so neither
+	// relay URL is rendered on the agent container; Teams, which only Hermes
+	// serves, is the relay that still addresses the broker Service.
+	for _, name := range []string{"SLACK_RELAY_URL", "GOOGLE_CHAT_RELAY_URL"} {
+		if value, found := brokerEnvValue(agentContainer.Env, name); found {
+			t.Errorf("%s = %q on the agent container; the gateway consumes Chat and Slack", name, value)
+		}
+	}
 	wantURL := "http://test-agent-credential-proxy.test-ns.svc.cluster.local:8765"
-	for _, name := range []string{"GOOGLE_CHAT_RELAY_URL", "SLACK_RELAY_URL"} {
-		value, found := brokerEnvValue(agentContainer.Env, name)
-		if !found {
-			t.Errorf("expected %s to be set so the assertion below means something", name)
-			continue
-		}
-		if value != wantURL {
-			t.Errorf("expected %s to address the broker Service, got %q", name, value)
-		}
+	teamsPod := buildPodTemplateSpec(brokerPodAgentWithTeams(), "c", "f", "s", "p", nil, renderOptions{})
+	if value, found := brokerEnvValue(brokerContainerNamed(teamsPod.Spec.Containers, "platform-agent").Env, "TEAMS_RELAY_URL"); !found {
+		t.Error("expected TEAMS_RELAY_URL to be set so the assertion below means something")
+	} else if value != wantURL {
+		t.Errorf("expected TEAMS_RELAY_URL to address the broker Service, got %q", value)
 	}
 	if value, _ := brokerEnvValue(agentContainer.Env, "CREDENTIAL_PROXY_TOKEN_FILE"); value != credentialProxyTokenMountPath+"/token" {
 		t.Errorf("expected the agent to present a projected token, got %q", value)
@@ -244,14 +261,15 @@ func TestTheBrokerPodAuthenticatesItsCallers(t *testing.T) {
 	}
 	broker := deployment.Spec.Template.Spec.Containers[0]
 
-	// Both callers are named: the gateway's chat clients present the agent's
-	// ServiceAccount token, the sandbox's wrapped CLIs present the sandbox's.
+	// Every caller is named: the gateway's chat clients present the agent's
+	// ServiceAccount token, the sandbox's wrapped CLIs present the sandbox's,
+	// and the A2A gateway, which consumes Chat, presents its own.
 	want := map[string]string{
 		"CREDENTIAL_PROXY_ROLE":            "broker",
 		"CREDENTIAL_PROXY_AUTH_MODE":       "serviceaccount",
 		"CREDENTIAL_PROXY_AUDIENCE":        credentialProxyAudience,
 		"CREDENTIAL_PROXY_CHAT_AUDIENCE":   credentialProxyChatAudience,
-		"CREDENTIAL_PROXY_ALLOWED_CALLERS": "system:serviceaccount:test-ns:test-agent-gateway-agent,system:serviceaccount:test-ns:test-agent-shell",
+		"CREDENTIAL_PROXY_ALLOWED_CALLERS": "system:serviceaccount:test-ns:test-agent-gateway-agent,system:serviceaccount:test-ns:test-agent-shell,system:serviceaccount:test-ns:test-agent-a2a-gateway",
 		"CREDENTIAL_PROXY_ENVOY_ADDRESS":   "0.0.0.0",
 	}
 	for name, expected := range want {
@@ -365,17 +383,19 @@ func TestTheBrokerServiceAddressesTheBrokerPod(t *testing.T) {
 // time, which is why this checks the URL the agent is actually given rather
 // than a port somebody remembered to write down.
 func TestTheGatewayMayReachTheRelayItIsPointedAt(t *testing.T) {
-	agent := brokerPodAgent()
+	// Teams is the one chat relay Hermes still polls: the A2A gateway holds
+	// Chat and Slack, so their relay URLs are not rendered.
+	agent := brokerPodAgentWithTeams()
 	pod := buildPodTemplateSpec(agent, "c", "f", "s", "p", nil, renderOptions{})
 	agentContainer := brokerContainerNamed(pod.Spec.Containers, "platform-agent")
 
-	relay, found := brokerEnvValue(agentContainer.Env, "SLACK_RELAY_URL")
+	relay, found := brokerEnvValue(agentContainer.Env, "TEAMS_RELAY_URL")
 	if !found || relay == "" {
-		t.Fatal("SLACK_RELAY_URL is unset, so this test asserts nothing")
+		t.Fatal("TEAMS_RELAY_URL is unset, so this test asserts nothing")
 	}
 	target, err := url.Parse(relay)
 	if err != nil {
-		t.Fatalf("SLACK_RELAY_URL is not a URL: %v", err)
+		t.Fatalf("TEAMS_RELAY_URL is not a URL: %v", err)
 	}
 	if target.Hostname() == "127.0.0.1" || target.Hostname() == "localhost" {
 		t.Fatalf("the relay is back on loopback (%q); this test and the rule it "+
@@ -383,7 +403,7 @@ func TestTheGatewayMayReachTheRelayItIsPointedAt(t *testing.T) {
 	}
 	port, err := strconv.ParseInt(target.Port(), 10, 32)
 	if err != nil {
-		t.Fatalf("SLACK_RELAY_URL names no port: %v", err)
+		t.Fatalf("TEAMS_RELAY_URL names no port: %v", err)
 	}
 
 	gateway := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", false)
@@ -1135,14 +1155,12 @@ func TestTheEnvoyConfigKeepsTheProbeOffTheWatchBreaker(t *testing.T) {
 }
 
 // TestTheSessionCallerIsNamedOnlyUnderTheFlag: the session pod becomes a
-// broker caller when the operator carries A2A_SESSION_CLUSTER_VIEW=true on a
-// mode-next install, and never otherwise.
+// broker caller when the operator carries A2A_SESSION_CLUSTER_VIEW=true, and
+// never otherwise.
 func TestTheSessionCallerIsNamedOnlyUnderTheFlag(t *testing.T) {
 	agent := brokerPodAgent()
-	agent.Spec.Mode = ptr.To("next")
-	// Chat off: under next with Google Chat enabled the A2A gateway is a
-	// caller too (a2aChatArmed), and this test is about the session flag
-	// alone.
+	// Chat off: with Google Chat enabled the A2A gateway is a caller too
+	// (a2aChatArmed), and this test is about the session flag alone.
 	if agent.Spec.Integration != nil {
 		agent.Spec.Integration.GoogleChat = nil
 	}
@@ -1179,22 +1197,12 @@ func TestTheSessionCallerIsNamedOnlyUnderTheFlag(t *testing.T) {
 	}
 }
 
-// TestSessionClusterViewIsInertOutsideModeNext: the flag means nothing on a
-// today install, where no session pod exists to be a caller.
-func TestSessionClusterViewIsInertOutsideModeNext(t *testing.T) {
-	t.Setenv(a2aSessionClusterViewEnvVar, "true")
-	agent := brokerPodAgent() // mode unset: today
-	if a2aSessionClusterViewEnabled(agent) {
-		t.Fatal("enabled outside mode next")
-	}
-	if strings.Contains(allowedBrokerCallers(agent, allBrokerCallersOwned), "a2a-session") {
-		t.Fatal("session caller named on a today install")
-	}
+// TestSessionClusterViewArmsOnlyOnTheLiteralTrue: no other spelling of the
+// flag enables the view.
+func TestSessionClusterViewArmsOnlyOnTheLiteralTrue(t *testing.T) {
 	for _, v := range []string{"", "false", "TRUE", "1"} {
 		t.Setenv(a2aSessionClusterViewEnvVar, v)
-		next := brokerPodAgent()
-		next.Spec.Mode = ptr.To("next")
-		if a2aSessionClusterViewEnabled(next) {
+		if a2aSessionClusterViewEnabled(brokerPodAgent()) {
 			t.Errorf("value %q enabled the view; only the literal true may", v)
 		}
 	}

@@ -248,7 +248,7 @@ def preflight_ask(client, channel: str, ask_ts: str) -> None:
             f"the ask carries bot_id={ask['bot_id']} (a user-token post through an app), and the gateway's "
             f"{TEST_USERS_ENV_ON_GATEWAY} does not list its author {ask.get('user')}, so the gateway drops it as "
             "bot traffic. Either the install does not list the test user in operator.slackTestUsers, or the "
-            "install is not on spec.mode next or its operator does not yet run Slack on the gateway, so Slack "
+            "install's operator does not yet run Slack on the gateway, so Slack "
             "is on the Hermes path, which has no such list"
         )
 

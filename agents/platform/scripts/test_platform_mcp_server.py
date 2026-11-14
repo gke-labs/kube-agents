@@ -1866,6 +1866,8 @@ class FleetScopeToolTest(unittest.TestCase):
         # pod and a fresh install's first audits list every visible project.
         config = (Path(__file__).resolve().parent.parent / "config.yaml").read_text(encoding="utf-8")
         self.assertRegex(config, r'(?m)^\s+KUBEAGENTS_SCOPE_FILE: "\$\{KUBEAGENTS_SCOPE_FILE\}"\s*$', "platform_control's env block must forward KUBEAGENTS_SCOPE_FILE for fleet_scope's render fallback")
+        self.assertRegex(config, r'(?m)^\s+KUBEAGENTS_RESOLVED_SCOPE_FILE: "\$\{KUBEAGENTS_RESOLVED_SCOPE_FILE\}"\s*$', "platform_control's env block must forward the resolved scope's path, or the tool reads today's cluster lists under spec.mode: next")
+        self.assertEqual(platform_mcp_server.fleet_scope_targets.RESOLVED_SCOPE_FILE_ENV, "KUBEAGENTS_RESOLVED_SCOPE_FILE")
         for name in platform_mcp_server.fleet_scope_targets.MANAGEMENT_PROJECT_ENVS[:1]:
             self.assertRegex(config, rf'(?m)^\s+{name}: "\$\{{{name}\}}"\s*$')
 

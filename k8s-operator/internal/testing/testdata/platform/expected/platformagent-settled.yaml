@@ -818,6 +818,8 @@ spec:
               value: kubeagents-credential-proxy
             - name: CREDENTIAL_PROXY_ALLOWED_CALLERS
               value: system:serviceaccount:kubeagents-system:platformagent-shell
+            - name: CREDENTIAL_PROXY_KUBE_API_SERVER
+              value: https://kubernetes.default.svc.cluster.local
             - name: CREDENTIAL_PROXY_KUBE_CA_FILE
               value: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
             - name: CREDENTIAL_PROXY_KUBE_TOKEN_FILE
@@ -878,6 +880,10 @@ spec:
             - mountPath: /etc/kube-agents/scope
               name: platform-agent-scope-vol
               readOnly: true
+      dnsConfig:
+        options:
+          - name: ndots
+            value: "2"
       securityContext:
         fsGroup: 10000
         runAsNonRoot: true
@@ -1574,7 +1580,7 @@ spec:
       dnsConfig:
         options:
           - name: ndots
-            value: "3"
+            value: "2"
       securityContext:
         fsGroup: 10000
         runAsNonRoot: true
@@ -2931,6 +2937,30 @@ metadata:
 ---
 apiVersion: v1
 data:
+  tiers.json: |
+    {
+      "tiers": []
+    }
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: a2a-next
+    kubeagents.x-k8s.io/a2a-component: tiers
+  name: platformagent-a2a-tiers
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
+apiVersion: v1
+data:
   identities.json: |
     {
       "version": "1c982ea518e10246",
@@ -3436,6 +3466,8 @@ subjects:
 apiVersion: v1
 kind: Secret
 metadata:
+  annotations:
+    kubeagents.x-k8s.io/a2a-config-profiles: ""
   labels:
     app.kubernetes.io/instance: kubeagents-system-platformagent
     app.kubernetes.io/managed-by: platformagent-controller
@@ -4218,6 +4250,7 @@ spec:
     metadata:
       annotations:
         kubeagents.x-k8s.io/a2a-config-hash: <SHA256_FOR_TESTS>
+        kubeagents.x-k8s.io/a2a-config-profiles: ""
       labels:
         app: platformagent-a2a-nats
         app.kubernetes.io/instance: kubeagents-system-platformagent
@@ -5524,30 +5557,6 @@ metadata:
       name: platformagent
       uid: ""
 spec: {}
----
-apiVersion: v1
-data:
-  tiers.json: |
-    {
-      "tiers": []
-    }
-kind: ConfigMap
-metadata:
-  labels:
-    app.kubernetes.io/instance: kubeagents-system-platformagent
-    app.kubernetes.io/managed-by: platformagent-controller
-    app.kubernetes.io/name: platform-agent
-    app.kubernetes.io/part-of: a2a-next
-    kubeagents.x-k8s.io/a2a-component: tiers
-  name: platformagent-a2a-tiers
-  namespace: kubeagents-system
-  ownerReferences:
-    - apiVersion: kubeagents.x-k8s.io/v1alpha1
-      blockOwnerDeletion: true
-      controller: true
-      kind: PlatformAgent
-      name: platformagent
-      uid: ""
 ---
 apiVersion: batch/v1
 kind: Job

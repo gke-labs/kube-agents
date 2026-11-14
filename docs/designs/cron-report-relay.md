@@ -654,7 +654,7 @@ exists. The operator names every armed platform in `A2A_NOTIFY_CONVERSATIONS` an
 armed platform with a home channel set on the CR in `A2A_NOTIFY_PLATFORM` (each a
 comma-separated list of platform names). The agent adds Slack when the gateway learned a
 channel, and sends home posts to every armed platform when no platform has a home
-(`chat_notify.routed_platforms()`). So a `next` install whose gateway holds no platform
+(`chat_notify.routed_platforms()`). So an install whose gateway holds no platform
 with a home channel is routed anyway: the relay sends to every armed platform, and the
 gateway refuses the post and keeps it for the digest it posts once a home channel is set
 (the gateway design, "Proactive posts"). With a home channel on one platform, the agent

@@ -48,10 +48,14 @@ const (
 // table (#3659); the read and unattended tiers stay built in and can't be
 // redefined.
 type TierSpec struct {
-	// Mode is whether people or triggers run at this tier. Once tiers are
-	// enforced, interactive will run interactive profile tasks and unattended
-	// will only start profile tasks.
+	// Mode is whether people or triggers run at this tier: interactive
+	// gives the read tier's verbs and unattended the unattended tier's. It
+	// can't change once set: a grant already minted at the tier would gain or
+	// lose verbs with it. A tier that needs another mode is a new tier.
+	// (Deleting a tier and recreating it under the same name with another
+	// mode still re-scopes live grants, until GrantTTL ends them.)
 	// +kubebuilder:validation:Enum=interactive;unattended
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="mode can't change: grants already minted at this tier would gain or lose verbs; create a new tier instead"
 	// +required
 	Mode string `json:"mode"`
 

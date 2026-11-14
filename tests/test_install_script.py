@@ -7979,7 +7979,7 @@ class PlatformAgentModeTest(unittest.TestCase):
     def test_the_switch_notice_says_whether_it_named_a_switch(self):
         cases = (
             ("$PLATFORM_AGENT_MODE_UNSET", "$PLATFORM_AGENT_MODE_UNSET", "next", "true"),
-            ("$PLATFORM_AGENT_MODE_UNSET", "$PLATFORM_AGENT_MODE_UNSET", "today", "false"),
+            ("$PLATFORM_AGENT_MODE_UNSET", "$PLATFORM_AGENT_MODE_UNSET", "today", "true"),
             ("", "", "next", "false"),
         )
         for record, live, key, expected in cases:
@@ -8367,7 +8367,7 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
         out = proc.stdout + proc.stderr
         self.assertIn("went on ASKED=8", proc.stdout, out)
         self.assertIn("USERS=[U0123ABCD] HOME=[C0123ABCD] TOKENS=", proc.stdout)
-        self.assertIn("PROMPT: Slack Bot Token (xoxb-..., one workspace: spec.mode next takes a single token)", out)
+        self.assertIn("PROMPT: Slack Bot Token (xoxb-..., one workspace: the A2A gateway takes a single token)", out)
         self.assertIn("PROMPT: Allowed Slack member IDs (comma-separated, such as U0123ABCD; not emails)", out)
         self.assertIn("PROMPT: Slack Home Channel ID (a channel ID such as C0123456789; alerts and reports post there)", out)
         self.assertNotIn("User IDs / Emails", out)
@@ -8472,7 +8472,7 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
         proc = self._interview("--mode=next", "", chat + answers, choice="3")
         out = proc.stdout + proc.stderr
         self.assertIn("went on ASKED=9", proc.stdout, out)
-        self.assertIn("PROMPT: Slack Bot Token (xoxb-..., one workspace: spec.mode next takes a single token)", out)
+        self.assertIn("PROMPT: Slack Bot Token (xoxb-..., one workspace: the A2A gateway takes a single token)", out)
         self.assertNotIn("comma-separated for several workspaces", out)
 
     # ── after the generator's Secret recovery ──
@@ -8517,13 +8517,6 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
         # left for a --generate-only handoff or a manual lifecycle.sh apply.
         self.assertFalse(exists)
         self.assertIn("which carried the refused settings", out)
-
-    def test_a_recovered_token_list_under_today_goes_on(self):
-        proc, exists = self._after_generator({"PLATFORM_AGENT_MODE": "today", "SLACK_ENABLED": "true",
-                                              "SLACK_APP_TOKEN": "xapp-1", "SLACK_BOT_TOKEN": ""})
-        out = proc.stdout + proc.stderr
-        self.assertIn("APPLIED", proc.stdout, out)
-        self.assertTrue(exists)
 
     def test_a_recovered_token_list_is_refused_with_google_chat_beside_slack(self):
         # The gateway takes Slack beside Google Chat, so Chat lifts nothing.

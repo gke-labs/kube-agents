@@ -41,13 +41,12 @@ import (
 )
 
 // TestHomeChannelUnsetMessageFollowsTheGatewaysBackend: the advisory exists
-// exactly when the next stack's gateway holds a chat backend whose home
-// channel is empty (#3320). Today's mode posts through the agent, so it never
-// applies there; with both chats enabled the gateway holds both, and each
-// empty home is reported, Chat first. A platform without a home has its
-// posts sent to the other's home channel when that one has a home, and kept
-// for the digest when neither has. With no record, Slack's message says a
-// mention sets the channel.
+// exactly when the gateway holds a chat backend whose home channel is empty
+// (#3320), whatever spec.mode says; with both chats enabled the gateway
+// holds both, and each empty home is reported, Chat first. A platform
+// without a home has its posts sent to the other's home channel when that
+// one has a home, and kept for the digest when neither has. With no record,
+// Slack's message says a mention sets the channel.
 func TestHomeChannelUnsetMessageFollowsTheGatewaysBackend(t *testing.T) {
 	slackHome := func(mode, home string) func() string {
 		return func() string {
@@ -77,7 +76,8 @@ func TestHomeChannelUnsetMessageFollowsTheGatewaysBackend(t *testing.T) {
 		{"next slack, no home", slackHome("next", ""), []string{"Slack", "spec.integration.slack.homeChannel", "SLACK_HOME_CHANNEL", "mention the agent"}, nil},
 		{"next slack, blank home", slackHome("next", "  "), []string{"spec.integration.slack.homeChannel"}, nil},
 		{"next slack, home set", slackHome("next", "C0123ABCD"), nil, nil},
-		{"today slack, no home", slackHome("today", ""), nil, nil},
+		{"no mode slack, no home", slackHome("", ""), []string{"Slack", "spec.integration.slack.homeChannel"}, nil},
+		{"a stored today slack, no home", slackHome("today", ""), []string{"Slack", "spec.integration.slack.homeChannel"}, nil},
 		{"next chat, no home", chatHome("next", ""), []string{"Google Chat", "spec.integration.googleChat.homeChannel", "GOOGLE_CHAT_HOME_CHANNEL", "keeps them"}, nil},
 		{"next chat and slack, no chat home", func() string {
 			a := chatAndSlackTestAgent("next")
@@ -85,7 +85,7 @@ func TestHomeChannelUnsetMessageFollowsTheGatewaysBackend(t *testing.T) {
 			return homeChannelUnsetMessage(a, homeChannelRecord{})
 		}, []string{"holds Google Chat", "holds Slack", "keeps them", "mention the agent"}, []string{"Slack Hermes platform", "home channel meanwhile"}},
 		{"next chat, home set", chatHome("next", "spaces/AAA"), nil, nil},
-		{"today chat, no home", chatHome("", ""), nil, nil},
+		{"no mode chat, no home", chatHome("", ""), []string{"Google Chat", "spec.integration.googleChat.homeChannel"}, nil},
 		// Slack shares the gateway, so its empty home is reported.
 		{"next chat and slack, chat home set", bothChatHomeOnly, []string{"holds Slack", "spec.integration.slack.homeChannel", "mention the agent", "go to Google Chat's home channel meanwhile"}, []string{"holds Google Chat", "keeps them"}},
 		// Slack's home, from the CR or an admitted record, takes Chat's posts.
@@ -410,8 +410,7 @@ func TestHomeChannelRecordLeavesTheNotifyListsAlone(t *testing.T) {
 // Role rule that reaches it; the projection with its one key always present;
 // the projection mounted read-only, Optional and without subPath in the agent
 // container and the gateway container, on a Slack gateway only, and not in
-// the dashboard container; both ConfigMaps in the next stack's teardown list;
-// the gateway env that arms the learn.
+// the dashboard container; the gateway env that arms the learn.
 func TestHomeChannelRecordObjectsRoleAndMounts(t *testing.T) {
 	a := slackTestAgent("next", true)
 	cm := buildHomeChannelRecord(a)
@@ -425,24 +424,13 @@ func TestHomeChannelRecordObjectsRoleAndMounts(t *testing.T) {
 	if v, ok := proj.Data[homeChannelProjectionKey]; !ok || v != "" {
 		t.Errorf("an empty projection must still carry the key: %v", proj.Data)
 	}
-	// The fourth rule; the resolved scope's read follows it under next.
+	// The fourth rule; the resolved scope's read follows it.
 	rule := buildA2AGatewayRole(a).Rules[3]
 	if len(rule.Resources) != 1 || rule.Resources[0] != "configmaps" ||
 		len(rule.ResourceNames) != 1 || rule.ResourceNames[0] != cm.Name ||
 		strings.Join(rule.Verbs, ",") != "get,patch" {
 		t.Errorf("record rule = %+v (the projection needs no rule: the pods read it as a file)", rule)
 	}
-	torn := map[string]bool{}
-	r := &PlatformAgentReconciler{}
-	for _, e := range r.a2aNamespacedTeardown(a) {
-		if c, ok := e.obj.(*corev1.ConfigMap); ok {
-			torn[c.Name] = true
-		}
-	}
-	if !torn[cm.Name] || !torn[proj.Name] {
-		t.Errorf("teardown list covers record=%v projection=%v, want both", torn[cm.Name], torn[proj.Name])
-	}
-
 	mountOf := func(c *corev1.Container) *corev1.VolumeMount {
 		if c == nil {
 			return nil
@@ -505,20 +493,18 @@ func TestHomeChannelRecordObjectsRoleAndMounts(t *testing.T) {
 
 	// No Slack on the gateway: no projection mount anywhere, so those
 	// templates stay as they were.
-	for name, other := range map[string]*agentv1alpha1.PlatformAgent{"today slack": slackTestAgent("today", true), "next chat": gchatTestAgent("next", true), "next, no chat": a2aTestAgent()} {
+	for name, other := range map[string]*agentv1alpha1.PlatformAgent{"chat": gchatTestAgent("next", true), "no chat": a2aTestAgent()} {
 		pod := buildPodTemplateSpec(other, "h", "h", "h", "h", nil, renderOptions{})
 		if volumeOf(pod.Spec.Volumes) != nil || mountOf(brokerContainerNamed(pod.Spec.Containers, "platform-agent")) != nil {
 			t.Errorf("%s: the agent pod carries the projection mount", name)
 		}
-		if other.Spec.Mode != nil && *other.Spec.Mode == "next" {
-			gw := buildA2AGatewayDeployment(other)
-			if volumeOf(gw.Spec.Template.Spec.Volumes) != nil || mountOf(&gw.Spec.Template.Spec.Containers[0]) != nil {
-				t.Errorf("%s: the gateway pod carries the projection mount", name)
-			}
+		gw := buildA2AGatewayDeployment(other)
+		if volumeOf(gw.Spec.Template.Spec.Volumes) != nil || mountOf(&gw.Spec.Template.Spec.Containers[0]) != nil {
+			t.Errorf("%s: the gateway pod carries the projection mount", name)
 		}
 	}
 
-	// Chat beside Slack under next: Slack is still on the gateway, so both
+	// Chat beside Slack: Slack is still on the gateway, so both
 	// pods carry the projection.
 	both := chatAndSlackTestAgent("next")
 	bothPod := buildPodTemplateSpec(both, "h", "h", "h", "h", nil, renderOptions{})

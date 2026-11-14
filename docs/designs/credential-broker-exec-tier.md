@@ -195,9 +195,9 @@ stay on it as a first step, not because they keep state:
   subscription goes to the broker's A2A relay instance, and the legacy instance is not built
   (`platformagent_manifests.go:4587-4597`). The consumer moved to the A2A gateway; the Pub/Sub pull
   and its receipt map did not. So the stateful pod stays in both modes.
-- **Slack leaves the broker in `next` mode whenever Slack is on** (`a2aSlackArmed`,
-  `platformagent_a2a_manifests.go`), Chat on or off. Only `today` keeps Slack on the broker's
-  relay.
+- **Slack leaves the broker whenever Slack is on** (`a2aSlackArmed`,
+  `platformagent_a2a_manifests.go`), Chat on or off: the A2A gateway holds it, and the broker's
+  relay is not rendered.
 - **The watchers keep no broker state.** The event watcher and the drift detector run in the
   gateway pod's `agent-api-auth` sidecar (`platformagent_manifests.go:4154-4161`), and the gateway
   is capped at 1 replica (`supportedGatewayReplicas`, `manifest_helpers.go:84`). The broker only

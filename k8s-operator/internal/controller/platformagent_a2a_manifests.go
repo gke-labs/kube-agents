@@ -16,10 +16,8 @@ limitations under the License.
 
 package controller
 
-// The A2A stack the operator renders under `mode: next` and nothing else:
-// the NATS/JetStream component, its stream/KV/topic provisioning, and the A2A
-// gateway Deployment. Dark by construction — no call site outside the
-// renderMode gate in Reconcile reaches this file.
+// The A2A stack the operator renders on every install: the NATS/JetStream
+// component, its stream/KV/topic provisioning, and the A2A gateway Deployment.
 //
 // The deployment spec (docs/designs/spec-nats-deployment.md) is the law for
 // streams, retention, and the account layout; subjects come from the payload
@@ -56,7 +54,6 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
-	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
@@ -316,9 +313,9 @@ const (
 	//
 	// Nothing sets it by default. A developer sets it by hand on the operator
 	// Deployment; hack/ci-deploy.sh sets it through the chart's
-	// operator.extraEnv, where the A2A image overrides already go, under
-	// EVAL_MODE_NEXT=1 and only then -- so `AGENT_TRANSPORT=inject` on an
-	// install deployed without the flag finds no Service to reach.
+	// operator.extraEnv, where the A2A image overrides already go -- so
+	// `AGENT_TRANSPORT=inject` on an install deployed another way finds no
+	// Service to reach.
 	//
 	// It is read the same way a2aStrictEventsWriter is: anything but an
 	// explicit "true" is off, so a typo leaves the door shut.
@@ -743,8 +740,7 @@ const (
 	// the first pass that sees the provisioning Job complete, whichever phase
 	// that pass ends on, kept through the Job's later lives (the 24h TTL
 	// removes a finished Job and create-if-absent runs it again; a digest
-	// change runs a new one), removed with the rest of the stack when the mode
-	// flips to today. It is what lets Ready stop counting the Job after the
+	// change runs a new one). It is what lets Ready stop counting the Job after the
 	// first completion. Only this code writes it, so a Ready inherited from an
 	// operator that never counted the Job cannot seed it: that operator is the
 	// one #1701 describes, and its Ready is exactly the claim not to trust.
@@ -1175,8 +1171,8 @@ const (
 	// a2aBridgeDefaultConcurrency mirrors defaultConcurrency in
 	// a2a/cmd/hermes-bridge/main.go, the number of hermes subprocesses -- and
 	// so of running conversations -- one bridge has when BRIDGE_CONCURRENCY
-	// is unset or unreadable, and what a2aBridgeConcurrency answers for a CR
-	// that declares no bridge sidecar.
+	// is unset or unreadable, and what a2aBridgeConcurrency answers for a
+	// declared bridge sidecar that sets no BRIDGE_CONCURRENCY.
 	// The two modules cannot import each other;
 	// TestBridgeConcurrencyMatchesTheA2AModule reads that constant and fails
 	// if this one stops matching it.
@@ -1243,8 +1239,8 @@ const (
 
 	a2aTasksReservedConsumers = 32
 
-	// a2aTasksMaxConsumersFloor is what TASKS shipped with, and what a
-	// default install still gets. Never render below it.
+	// a2aTasksMaxConsumersFloor is what TASKS shipped with. Never render
+	// below it.
 	a2aTasksMaxConsumersFloor = 64
 
 	// a2aTasksMaxMsgsPerSubject bounds one task's own history so a runaway
@@ -1340,9 +1336,10 @@ func a2aNATSExporterImage() string {
 
 // a2aNATSExporterOmitted reports whether the NATS pod renders without the
 // metrics sidecar: when A2A_NATS_IMAGE is overridden and
-// A2A_NATS_EXPORTER_IMAGE is not. An install that mirrors the bus's images
-// set the first before the sidecar existed, and the default exporter
-// reference would not pull there. The sidecar is a plain container, so a pod
+// A2A_NATS_EXPORTER_IMAGE is not. The chart sets both from its a2aBus.images
+// values; a kustomize install that mirrors the bus's images may have set the
+// first before the sidecar existed, and the default exporter reference would
+// not pull there. The sidecar is a plain container, so a pod
 // whose sidecar cannot start never goes Ready and its server leaves the bus;
 // metrics never cost a bus server. The reconcile says so in a Warning event
 // (a2aNATSExporterOmittedReason).
@@ -1614,66 +1611,35 @@ func slackChannelID(s string) string {
 }
 
 // a2aChatArmed reports whether this install's Google Chat is consumed by the
-// next stack: spec.mode is next and spec.integration.googleChat is enabled.
-// That pair is the whole of the arming condition, on purpose. The design
-// decision (spec-chatops-gateway.md, "Coexistence is by mode") is that a
-// next install's Chat goes to the A2A gateway and the legacy Hermes consumer
-// is not rendered, on the one subscription the install already has; a topic
-// fans out to every subscription, and two consumers on one subscription
-// split its deliveries, so exactly one consumer must hold it and the mode is
-// what chooses. The per-component override the mode-switch spec sketches
-// (modeOverrides) is where a next install that wanted legacy Chat would say
-// so; it does not exist, and this predicate is the one place it would be
-// consulted.
-//
-// renderMode is fail-closed, so an unrecognized mode (version skew) reads as
-// today here: the legacy consumer renders and the A2A side is unarmed, which
-// leaves a frozen next-stack gateway without a relay rather than beside a
-// second consumer.
+// A2A stack: spec.integration.googleChat is enabled. That is the whole of
+// the arming condition, on purpose (spec-chatops-gateway.md): Chat goes to
+// the A2A gateway and the legacy Hermes consumer is not rendered, on the one
+// subscription the install already has; a topic fans out to every
+// subscription, and two consumers on one subscription split its deliveries,
+// so exactly one consumer holds it, and this predicate is the one place that
+// would be decided.
 func a2aChatArmed(agent *agentv1alpha1.PlatformAgent) bool {
-	return renderMode(agent, "gateway") == ModeNext && googleChatEnabled(agent)
+	return googleChatEnabled(agent)
 }
 
-// legacyChatConsumer is the complement: the Hermes google_chat platform and
-// its relay env render exactly when Chat is enabled and the next stack is
-// not taking it. Every legacy Chat render site asks this rather than the
-// enabled flag, so the two consumers cannot both render.
-func legacyChatConsumer(agent *agentv1alpha1.PlatformAgent) bool {
-	return googleChatEnabled(agent) && !a2aChatArmed(agent)
-}
-
-// a2aSlackArmed reports whether this install's Slack is consumed by the next
+// a2aSlackArmed reports whether this install's Slack is consumed by the A2A
 // stack: the gateway's Slack backend, on the token pair the CR's
 // spec.integration.slack refs name. It is a2aChatArmed's rule for the same
 // reason: a Slack app's events are spread across every Socket Mode
-// connection it has open, so two consumers on one app split its messages,
-// and the legacy path already opens one (the credential broker's SlackRelay,
-// armed by the same refs). Exactly one consumer holds the app and the mode
-// chooses.
-//
-// Chat does not change this: the gateway runs every armed chat backend in
-// one process (a2a/gateway/config.go, FromEnv), so with both enabled under
-// next the one gateway pod carries Slack beside Chat and the legacy Slack
-// consumer is off. renderMode fails closed, so skew reads as today here too.
-// Unlike Chat, that double-consumes: the frozen gateway holds the pair itself
-// and stays connected beside the re-rendered legacy relay. Accepted and
-// documented in the spec (2026-10-06).
+// connection it has open, so two consumers on one app split its messages.
+// The gateway is the one consumer: it runs every armed chat backend in one
+// process (a2a/gateway/config.go, FromEnv), so with both enabled the one
+// gateway pod carries Slack beside Chat, and nothing renders the Hermes
+// slack platform or a broker Slack relay (the Hermes Slack path went with
+// spec.mode today).
 //
 // The CR alone decides, by decision (2026-10-06): the token Secret is not
 // read, so a multi-workspace bot token (the broker's comma-separated list,
-// which the gateway cannot use) is armed anyway. Such installs must stay on
-// today; the spec's Slack section and the CRD page say so.
+// which the gateway cannot use) is armed anyway. The gateway serves one
+// Slack workspace; the installer refuses the apply when it can see such a
+// token, and the spec's Slack section and the Slack app page say so.
 func a2aSlackArmed(agent *agentv1alpha1.PlatformAgent) bool {
-	return renderMode(agent, "gateway") == ModeNext && slackEnabled(agent)
-}
-
-// legacySlackConsumer is the complement: the broker's Slack relay pair, the
-// Hermes slack platform and its relay env render exactly when Slack is
-// enabled and the next stack is not taking it. Every legacy Slack render
-// site asks this rather than the enabled flag, so the two Socket Mode
-// consumers cannot both render.
-func legacySlackConsumer(agent *agentv1alpha1.PlatformAgent) bool {
-	return slackEnabled(agent) && !a2aSlackArmed(agent)
+	return slackEnabled(agent)
 }
 
 // teamsEnabled is the enabled test for Teams, which only Hermes serves: the
@@ -1687,17 +1653,13 @@ func teamsEnabled(agent *agentv1alpha1.PlatformAgent) bool {
 }
 
 // peopleReadingEnabled reports whether the usage poller reads the A2A
-// gateway's people reading for the install: only while the install renders
-// the A2A stack (a2aStackRendering, the gate the gateway Deployment renders
-// under), since an install with no gateway has nothing to read, and only
-// while no chat platform it enables is served through Hermes, since the
-// gateway counts only the people who write through it, and a count beside a
-// Hermes-served platform would say nobody wrote while that platform's users
-// were writing. The legacy Chat term is already implied by the render gate
-// today (a next install arms Chat on the A2A door, never on its legacy
-// consumer); it stays so the function states the design's rule in full.
+// gateway's people reading for the install: only while no chat platform it
+// enables is served through Hermes, since the gateway counts only the
+// people who write through it, and a count beside a Hermes-served platform
+// would say nobody wrote while that platform's users were writing. Google
+// Chat and Slack are always on the A2A gateway, so only Teams counts.
 func peopleReadingEnabled(agent *agentv1alpha1.PlatformAgent) bool {
-	return a2aStackRendering(agent) && !legacyChatConsumer(agent) && !legacySlackConsumer(agent) && !teamsEnabled(agent)
+	return !teamsEnabled(agent)
 }
 
 // slackEnabled is the enabled test the Slack render sites make, in one place.
@@ -1755,7 +1717,7 @@ func a2aChatDisplayMode(mode string) string {
 // mode-next CR (nothing else spawns a session pod). Anything but "true" is
 // off, so a typo leaves the fence as it is.
 func a2aSessionClusterViewEnabled(agent *agentv1alpha1.PlatformAgent) bool {
-	return renderMode(agent, "a2a-session") == ModeNext && os.Getenv(a2aSessionClusterViewEnvVar) == "true"
+	return os.Getenv(a2aSessionClusterViewEnvVar) == "true"
 }
 
 // a2aCapabilityRequired renders "false" only for an explicit "false", so a
@@ -1929,9 +1891,8 @@ var a2aProvisionedStreams = []string{
 // hand-applied seed tooling connects with — the rendered Job has moved to the
 // callout-authenticated `provision` principal — so this is defence in depth
 // rather than a boundary. It is worth having anyway, because the seed password
-// lives in the creds Secret for the life of the CR and deliberately survives a
-// flip back to today, so the blast radius of a leak is not bounded by anything
-// else.
+// lives in the creds Secret for the life of the CR, so the blast radius of a
+// leak is not bounded by anything else.
 //
 // What the wildcard granted that provisioning never uses, and this list now
 // refuses: STREAM.RESTORE (arbitrary messages with arbitrary stored subjects),
@@ -2320,8 +2281,7 @@ var a2aCredsValueRe = regexp.MustCompile(`^[0-9a-f]{32}$`)
 // a2aReader returns the reader for A2A bookkeeping objects. Straight from the
 // API server on purpose: the cached client's first Get against a kind starts
 // a cluster-wide informer for it, and this path runs on every reconcile of
-// every agent — including today-mode installs that will never render the A2A
-// stack. Caching every Secret and Job in the cluster to serve that is the
+// every agent. Caching every Secret and Job in the cluster to serve that is the
 // same trade APIReader already refuses for collector discovery.
 func (r *PlatformAgentReconciler) a2aReader() client.Reader {
 	if r.APIReader != nil {
@@ -2332,9 +2292,7 @@ func (r *PlatformAgentReconciler) a2aReader() client.Reader {
 
 // ensureA2ACredsSecret creates the per-user credential Secret once and then
 // leaves it alone: regenerating on reconcile would invalidate every connected
-// client every few seconds. It survives a flip back to `today` on purpose —
-// it is inert data, and re-enabling `next` must not re-roll credentials the
-// gateway image may have cached in a still-running pod. The one thing it
+// client every few seconds. The one thing it
 // changes on an existing Secret is a missing or empty key, which it fills.
 // An existing Secret at the name that this PlatformAgent doesn't control is
 // refused rather than adopted or repaired.
@@ -2839,7 +2797,7 @@ func a2aNATSRoutesName(agent *agentv1alpha1.PlatformAgent) string {
 func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret, keys *a2aCalloutKeys, profiles []string) *corev1.Secret {
 	conf := renderA2ANATSConf(agent, func(key string) string { return string(creds.Data[key]) }, keys, profiles)
 
-	return &corev1.Secret{
+	secret := &corev1.Secret{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      a2aNATSConfigSecretName(agent),
@@ -2848,6 +2806,10 @@ func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.
 		},
 		Data: map[string][]byte{a2aNATSConfKey: []byte(conf)},
 	}
+	// The profiles this config carries, for the single server's loaded set
+	// (a2aServerLoadedProfiles).
+	secret.Annotations = map[string]string{a2aConfigProfilesAnnotation: encodeA2AConfigProfiles(profiles)}
+	return secret
 }
 
 // a2aConfigRolloutHash is the digest that rides the StatefulSet pod template
@@ -3039,7 +3001,7 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 			MinReadySeconds: a2aNATSMinReadySeconds(replicas),
 			Selector:        &metav1.LabelSelector{MatchLabels: selector},
 			// Claims are kept on a scale-down and on StatefulSet deletion: a
-			// maintenance scale to 0 and back, or a flip to today and back,
+			// maintenance scale to 0 and back
 			// finds the bus where it left it, and handleDeletion reaps them
 			// with the CR. Only a conversion, which the gate keeps closed in
 			// this release, would want a scale-down to delete them (a later
@@ -4220,7 +4182,7 @@ fi
 // pod ran and failed runs out its backoffLimit and then leaves by TTL; one
 // whose pod never ran — an unpullable image, an unschedulable pod, an
 // admission refusal — has no terminal condition for the TTL to start from
-// and would sit in Pending until the mode flips or the agent is deleted,
+// and would sit in Pending until the agent is deleted,
 // holding one slot in the namespace pod quota the whole time. That last case
 // is the image override scenario this digest exists for, and it is why
 // reconcileA2A sweeps superseded generations by label, keeping only the
@@ -4228,9 +4190,7 @@ fi
 // function builds rather than before it — so a reconcile leaves N+1 of them
 // for a moment, never zero. Two things hold alongside that sweep: the status
 // scan in reconcileA2A reads the current name only, so a Failed condition on
-// a generation the sweep is about to remove never reaches the phase, and
-// cleanupA2A calls the same function keeping nothing, so a mode flip removes
-// every generation at once.
+// a generation the sweep is about to remove never reaches the phase.
 //
 // What the digest does not cover is what is on the bus. Creation is
 // create-only convergence: the script's `info || add` lines make re-runs
@@ -5109,9 +5069,7 @@ func (r *PlatformAgentReconciler) resolveA2ABusReplicas(ctx context.Context, age
 		case running == 2:
 			// No record: claims for ordinals 0 and 1 and not 2 are a
 			// three-server bus that lost one, not a two-server bus, which
-			// never existed. A flip to today keeps the record (#5451), so a
-			// bus back from today resolves through the case above; this one
-			// is for a record lost another way (a served CRD that prunes it).
+			// never existed. A bus with no record reads its claims.
 			running = 3
 		}
 	default:
@@ -5180,7 +5138,7 @@ func BusConversionRefusedMessage(asked, running int32) string {
 func a2aBusConversionRefusedMessage(agent *agentv1alpha1.PlatformAgent) string {
 	running := agent.Status.BusReplicas
 	limits := agentTuning(agent)
-	if !a2aStackRendering(agent) || limits == nil || limits.BusReplicas == nil || (running != 1 && running != 3) {
+	if limits == nil || limits.BusReplicas == nil || (running != 1 && running != 3) {
 		return ""
 	}
 	asked := *limits.BusReplicas
@@ -5543,7 +5501,7 @@ func a2aActivityListenReachesHook(listen string) bool {
 // a2aActivityHookWanted is the gate for both halves of the pod-wide activity
 // hook: the managed config's entry and the agent container's signing key.
 func a2aActivityHookWanted(agent *agentv1alpha1.PlatformAgent) bool {
-	return a2aAgentSurface(agent) && a2aBridgeDoorDeclared(agent)
+	return a2aBridgeDoorDeclared(agent)
 }
 
 // managedHookOutbound is one hooks.outbound entry in hermes's config.
@@ -6454,7 +6412,7 @@ func a2aRequiredSecretRef(ref *corev1.SecretKeySelector, defaultKey string) *cor
 // both are armed, the optional discord-bot Secret reference when neither is,
 // and the inject door under its own flag beside any of them. The console door
 // is always armed (a2aConsoleDoorEnvVar), so a gateway with none of those
-// configured starts on the console door alone: every next install renders it
+// configured starts on the console door alone: every install renders it
 // at one replica.
 func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deployment {
 	name := a2aGatewayName(agent)
@@ -6577,8 +6535,7 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 			// allow-all flag the legacy rule on the RAW list. This is the
 			// gateway's only Slack admission gate (beside refusing another
 			// workspace's member): the principal map overrides attribution,
-			// so a mapped member the CR does not allow is refused under next
-			// as under today.
+			// so a mapped member the CR does not allow is refused.
 			{Name: a2aSlackAllowedUsersEnvVar, Value: strings.Join(a2aAllowlist(slack.AllowedUsers), ",")},
 			{Name: a2aSlackAllowAllUsersEnvVar, Value: strconv.FormatBool(allowAllUsers(slack.AllowedUsers))},
 		}
@@ -6641,10 +6598,9 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 			// is the legacy consumer's rule on the RAW list (allowAllUsers:
 			// absent, or a single empty string), so one CR means one thing
 			// in both modes. A degenerate list - whitespace or commas only -
-			// is therefore a restriction to nobody here as it is under
-			// today, and the gateway says so at boot (an empty allowlist
-			// with allow-all off is the one shape it warns about), rather
-			// than becoming allow-all on the flip to next.
+			// is therefore a restriction to nobody here, and the gateway
+			// says so at boot (an empty allowlist with allow-all off is the
+			// one shape it warns about), rather than becoming allow-all.
 			{Name: a2aGchatAllowedUsersEnvVar, Value: strings.Join(allowed, ",")},
 			{Name: a2aGchatAllowAllUsersEnvVar, Value: strconv.FormatBool(allowAllUsers(gchat.AllowedUsers))},
 			{Name: a2aChatDisplayModeEnvVar, Value: a2aChatDisplayMode(gchat.Mode)},
@@ -6779,8 +6735,8 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		{Name: "SESSION_KV_SALT", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: sessionKVSaltSecretRef(agent)}},
 		// The gateway's own Deployment: spawned session
 		// pods carry an ownerReference to it, so
-		// Kubernetes GC reaps sessions when cleanupA2A —
-		// or anything else — deletes the gateway. The
+		// Kubernetes GC reaps sessions when anything
+		// deletes the gateway. The
 		// Role above grants the one get this needs.
 		{Name: "A2A_OWNER_DEPLOYMENT", Value: name},
 		// The identity spawned sessions run as. Rendered
@@ -7001,6 +6957,10 @@ type a2aProvisionState struct {
 	// busReloadRequeue is when to check again on a bus config reload still
 	// pending (planA2ABusReload). Zero when none is.
 	busReloadRequeue time.Duration
+	// profileHoldRequeue is when to check again on a newly bound profile
+	// held until every bus server has loaded its config
+	// (a2aDispatchableProfiles). Zero when none is held.
+	profileHoldRequeue time.Duration
 	// gatewayElected is the image the pod holding the gateway's Lease runs,
 	// as this pass read it, or nil when it couldn't tell
 	// (observeA2AGatewayElection). The status writers carry it as the
@@ -7126,8 +7086,7 @@ func (r *PlatformAgentReconciler) reconcileA2ANetworkFences(ctx context.Context,
 	return gatewayFenced, profileFenced, nil
 }
 
-// reconcileA2A renders the next stack. Callers gate on renderMode; this
-// function assumes the answer was ModeNext.
+// reconcileA2A renders the A2A stack.
 //
 // A failure confined to the profile namespace (its fence or its quota
 // refused, say by an admission policy scoped there) is logged and doesn't
@@ -7201,7 +7160,7 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	var profiles []agentv1alpha1.AgentProfile
 	if !r.agentProfilesUnreadable {
 		var err error
-		if profiles, err = boundAgentProfiles(ctx, r.Client, agent); err != nil {
+		if profiles, err = boundAgentProfiles(ctx, r.Client, agent, r.tiersUnreadable); err != nil {
 			return state, fmt.Errorf("failed to list AgentProfiles: %w", err)
 		}
 	}
@@ -7222,14 +7181,44 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 			profiles = nil
 		}
 	}
-	// The profiles still draining (#5074), read once from the applied
-	// dispatch config for both renders: the identity map keeps their
-	// .supervisor grant exactly as long as the dispatch config lists them.
-	draining, err := r.dispatchDraining(ctx, agent, profiles)
+	// The profiles the dispatcher may take: a newly bound one waits until
+	// every bus server has loaded its config entry, the gateway's deny on its
+	// supervisor subjects (platformagent_a2a_profile_hold.go). The bus config
+	// below carries every bound profile; the dispatcher's grant here and its
+	// dispatch config carry only these. While any waits, the pass looks again
+	// at the reload's recheck.
+	dispatchable, held, err := r.a2aDispatchableProfiles(ctx, agent, profiles)
 	if err != nil {
 		return state, err
 	}
-	authMaps, authMapVersion, err := buildA2AAuthMapConfigMaps(agent, profiles, draining)
+	// The profiles still draining (#5074), read once from the applied
+	// dispatch config for both renders: the identity map keeps their
+	// .supervisor grant exactly as long as the dispatch config lists them.
+	// Against the dispatchable set, not every bound profile: a draining
+	// profile bound again before the bus has loaded it is held, so it keeps
+	// draining until it is dispatchable.
+	draining, err := r.dispatchDraining(ctx, agent, dispatchable)
+	if err != nil {
+		return state, err
+	}
+	if len(held) > 0 {
+		state.profileHoldRequeue = a2aBusReloadRecheck
+		// With the dispatcher off, only the card waits.
+		what := "holding newly bound AgentProfiles out of the dispatcher until every A2A bus server has loaded their config"
+		if !a2aDispatcherEnabled() {
+			what = "holding newly bound AgentProfiles' cards until every A2A bus server has loaded their config"
+		}
+		logf.FromContext(ctx).Info(what, "profiles", held)
+	}
+	// The install's tiers, which the verifier, the gateway and the callout
+	// mount (optional, so ordering against their Deployments doesn't
+	// matter), before the identity map that may name one of them: an early
+	// return between the two then never leaves a map naming a tier whose
+	// file was not written.
+	if err := r.applyA2ATiers(ctx, agent, profiles); err != nil {
+		return state, err
+	}
+	authMaps, authMapVersion, err := buildA2AAuthMapConfigMapsHeld(agent, profiles, dispatchable, draining)
 	if err != nil {
 		return state, fmt.Errorf("failed to render the A2A identity map: %w", err)
 	}
@@ -7293,6 +7282,7 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// onto it (a2aConfigRolloutHash).
 	profileNames, _ := dispatcherGrantNames(agent, profiles, draining)
 	sts := buildA2ANATSStatefulSet(agent, a2aConfigRolloutHash(agent, creds, calloutKeys, natsTLS.ServingFingerprint, profileNames))
+	annotateA2ABusProfiles(agent, sts, profileNames)
 	busHeld, err := r.a2aBusWaitsForCallout(ctx, agent, sts, calloutGeneration)
 	if err != nil {
 		return state, err
@@ -7308,6 +7298,9 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 			return state, err
 		}
 		if err := r.actOnA2ABusReload(ctx, agent, sts.Name, reload); err != nil {
+			return state, err
+		}
+		if err := r.stampA2ABusPreviousProfiles(ctx, agent, config, sts); err != nil {
 			return state, err
 		}
 		if err := ctrl.SetControllerReference(agent, config, r.Scheme); err != nil {
@@ -7460,16 +7453,18 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// Past the size one identity-map shard can carry, the dispatcher's entry
 	// is left out of the map, so it is torn down as though switched off, and
 	// the condition says why (a2aDispatcherCeiling, gke-labs/kube-agents#5381).
-	// The step itself tears the dispatcher down past the ceiling.
+	// The step itself tears the dispatcher down past the ceiling. Both take
+	// the profiles every bus server has loaded (dispatchable, above), as the
+	// identity map's entry does, so the three agree on the ceiling.
 	state.dispatcherCeiling = dispatcherCeilingRemoved
 	if a2aDispatcherEnabled() {
-		ceiling, _, cerr := a2aDispatcherCeiling(agent, profiles, draining)
+		ceiling, _, cerr := a2aDispatcherCeiling(agent, dispatchable, draining)
 		if cerr != nil {
 			return state, cerr
 		}
 		state.dispatcherCeiling = &ceiling
 	}
-	jobMode, dispatcherProfileErr, err := r.reconcileA2ADispatcherWithJobMode(ctx, agent, profiles, profileFenced, draining)
+	jobMode, dispatcherProfileErr, err := r.reconcileA2ADispatcherWithJobMode(ctx, agent, dispatchable, profileFenced, draining)
 	state.dispatcherJobMode = jobMode
 	if err != nil {
 		return state, err
@@ -7663,8 +7658,8 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// condition: a completed one by TTL, one whose pod ran and failed by
 	// backoffLimit and then TTL. One whose pod never ran — an unpullable
 	// image, an unschedulable pod, an admission refusal — has no condition
-	// for the TTL to start from and would sit in Pending until a mode flip
-	// or agent deletion, holding one slot of the namespace pod quota the
+	// for the TTL to start from and would sit in Pending until agent
+	// deletion, holding one slot of the namespace pod quota the
 	// whole time (#1389). An unpullable image is the likely way to get there
 	// once the name tracks the pod spec (#1347), and a bad script is the way
 	// today. The sweep runs after the current Job is ensured above, or held
@@ -7723,11 +7718,6 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		return state, err
 	}
 	if err := r.applyA2AAgentDoor(ctx, agent); err != nil {
-		return state, err
-	}
-	// The install's tiers, which the verifier, the gateway and the callout
-	// mount (optional, so ordering against their Deployments doesn't matter).
-	if err := r.applyA2ATiers(ctx, agent); err != nil {
 		return state, err
 	}
 
@@ -7998,10 +7988,7 @@ func (r *PlatformAgentReconciler) applyA2AInjectBackend(ctx context.Context, age
 // entry list carries the reader beside each object so the choice is made
 // once, next to the object it is made for.
 //
-// A teardown entry exists for all four as well, for the flip to `today`
-// where neither this function nor the render runs at all.
-//
-// This runs on every next reconcile while the flag is off, so an object
+// This runs on every reconcile while the flag is off, so an object
 // under the door's name, in any of its four kinds, that this PlatformAgent
 // does not own (a copy made by hand, or the previous CR's while the garbage
 // collector runs after a delete and re-create) is skipped and logged, not
@@ -8623,132 +8610,13 @@ func (r *PlatformAgentReconciler) applyA2AGatewayDeployment(ctx context.Context,
 	return r.applyManaged(ctx, agent, dep)
 }
 
-// a2aTeardownEntry is one namespaced object cleanupA2A removes, with the reader
-// that can see it: the Owns() kinds come from the cache, the rest go through
-// a2aReader so no cluster-wide informer starts for a kind nothing watches.
+// a2aTeardownEntry is one namespaced object a door's flag-off path removes,
+// with the reader that can see it: the Owns() kinds come from the cache, the
+// rest go through a2aReader so no cluster-wide informer starts for a kind
+// nothing watches.
 type a2aTeardownEntry struct {
 	obj    client.Object
 	reader client.Reader
-}
-
-// a2aNamespacedTeardown is the ordered list of namespaced objects cleanupA2A
-// deletes by name. The order is load-bearing: see the sentinel argument in
-// cleanupA2A below.
-//
-// A function rather than a literal inside cleanupA2A so its length is readable
-// from a test. That is what lets the cost test assert the early exit is cheaper
-// than the walk it skips, instead of restating how long the walk is and going
-// stale the next time the render grows a step.
-func (r *PlatformAgentReconciler) a2aPreBusTeardown(agent *agentv1alpha1.PlatformAgent) []a2aTeardownEntry {
-	injectMeta := metav1.ObjectMeta{Name: a2aInjectName(agent), Namespace: agent.Namespace}
-	doorMeta := metav1.ObjectMeta{Name: a2aDoorName(agent), Namespace: agent.Namespace}
-	return []a2aTeardownEntry{
-		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.Client},
-		// Its budget, after the Deployment, as the callout's is.
-		{&policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.Client},
-		// The election's Lease, after the gateway that held it.
-		{&coordinationv1.Lease{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayLeaseName(agent), Namespace: agent.Namespace}}, r.Client},
-		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aHomeChannelRecordName(agent), Namespace: agent.Namespace}}, r.Client},
-		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aHomeChannelProjectionName(agent), Namespace: agent.Namespace}}, r.Client},
-		// The tiers file the gateway, the verifier and the callout mount
-		// (platformagent_a2a_tiers.go); its volume is optional.
-		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aTiersName(agent), Namespace: agent.Namespace}}, r.Client},
-		// The inject door's four, listed whatever the flag says: a flip to
-		// today has to clean up after an operator that WAS deployed with the
-		// flag, and the reads are cheap (three are Owns() kinds) and find
-		// nothing on an install that never had it. They go early, beside the
-		// gateway Deployment they belong to. The Secret is a live credential
-		// rather than residue, which is why it goes here and does not
-		// survive the flip the way the bus creds deliberately do.
-		{&corev1.Service{ObjectMeta: injectMeta}, r.Client},
-		{&corev1.ConfigMap{ObjectMeta: injectMeta}, r.Client},
-		{&networkingv1.NetworkPolicy{ObjectMeta: injectMeta}, r.Client},
-		{&corev1.Secret{ObjectMeta: injectMeta}, r.a2aReader()},
-		// The A2A door's four, likewise.
-		{&corev1.Service{ObjectMeta: doorMeta}, r.Client},
-		{&corev1.ConfigMap{ObjectMeta: doorMeta}, r.Client},
-		{&networkingv1.NetworkPolicy{ObjectMeta: doorMeta}, r.Client},
-		{&corev1.Secret{ObjectMeta: doorMeta}, r.a2aReader()},
-		// The console server, with the gateway: both are front doors onto
-		// the bus, and both go before the bus they front. Its fence goes
-		// later, beside the session fence, for the same reason that one is
-		// late: the Delete above returns before the pod is gone.
-		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aConsoleName(agent), Namespace: agent.Namespace}}, r.Client},
-		{&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: a2aConsoleName(agent), Namespace: agent.Namespace}}, r.Client},
-		// The MCP server, the other console client, beside it, and its token
-		// with it. Its fence goes later, beside the console's.
-		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPName(agent), Namespace: agent.Namespace}}, r.Client},
-		{&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPName(agent), Namespace: agent.Namespace}}, r.Client},
-		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPAccessName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
-		// Its broker identity (reconcileA2AMCPBrokerIdentity), after the
-		// Deployment that names it.
-		{&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPServiceAccountName(agent), Namespace: agent.Namespace}}, r.Client},
-		// The auth callout, before the bus it authorizes for. Its Deployment
-		// goes first so its deletion is initiated while there is still a server to
-		// answer for; the keys Secret goes with it rather than surviving like
-		// the per-user creds, because a flip back to today and forward again
-		// re-renders nats.conf anyway, and a stale issuer is the one thing
-		// that would make every callout answer be refused.
-		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutName(agent), Namespace: agent.Namespace}}, r.Client},
-		{&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutName(agent), Namespace: agent.Namespace}}, r.Client},
-		// The callout's budget, after its Deployment for the reason the
-		// verifier's budget below gives: a pass that dies between the two
-		// leaves a budget over terminating pods rather than two running
-		// callouts with none.
-		{&policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutName(agent), Namespace: agent.Namespace}}, r.Client},
-		// The capability verifier, after the gateway that submits work and
-		// before the bus it reads through. Its ServiceAccount goes with it:
-		// left behind, it is a mintable bus identity whose grants include the
-		// read on every capability in the store — the single most valuable
-		// residue this stack could leave in a namespace that is supposed to
-		// look like it has never heard of A2A.
-		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aVerifierName(agent), Namespace: agent.Namespace}}, r.Client},
-		// Its budget, beside the Deployment it selects for. Deleted after
-		// the Deployment rather than before it so a pass that dies between
-		// the two leaves a budget over terminating pods, which is harmless,
-		// rather than two running verifiers with no budget for the moment a
-		// drain arrives. PodDisruptionBudget is an Owns() kind (the platform
-		// budget), so the read is cached.
-		{&policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: a2aVerifierName(agent), Namespace: agent.Namespace}}, r.Client},
-		{&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: a2aVerifierName(agent), Namespace: agent.Namespace}}, r.Client},
-		// The dispatcher (platformagent_a2a_dispatcher.go), Deployment first so
-		// nothing is running when its identity goes, as with the verifier: a
-		// ServiceAccount left behind is a mintable bus identity that writes
-		// leases and fails tasks. Its pod-read Role in the profile namespace
-		// goes with the profile quota, below.
-		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aDispatcherName(agent), Namespace: agent.Namespace}}, r.Client},
-		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aDispatchConfigName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
-		{&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: a2aDispatcherName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
-		{&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: a2aDispatcherName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
-		{&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: a2aDispatcherName(agent), Namespace: agent.Namespace}}, r.Client},
-		{&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
-		{&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
-		{&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutName(agent), Namespace: agent.Namespace}}, r.Client},
-		{&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: a2aProvisionServiceAccountName(agent), Namespace: agent.Namespace}}, r.Client},
-		// The session identity. Removed on a flip to today alongside the
-		// session fence below: with the gateway gone nothing spawns pods that
-		// would mount a token for it, and leaving it behind would leave a
-		// mintable bus identity in a namespace that no longer runs a bus.
-		{&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: a2aSessionServiceAccountName(agent), Namespace: agent.Namespace}}, r.Client},
-		// The identity map is deleted BEFORE the callout keys Secret.
-		// In reconcileA2A the keys Secret is created first and acts as the
-		// sentinel covering the map; deleting the map first ensures that if a
-		// cleanup pass dies on the map delete, the keys Secret is still standing
-		// to prevent the next pass from early-exiting. This entry is shard 0,
-		// which every render has; the shards above it, whose count this list
-		// cannot know, and the unsharded object releases before sharding
-		// rendered go in deleteA2AAuthMapShards, which cleanupA2A runs before
-		// this walk for the same sentinel reason.
-		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aAuthMapShardName(agent, 0), Namespace: agent.Namespace}}, r.a2aReader()},
-		// The task-signing key, before the keys Secret for the same reason
-		// as the map: the keys Secret is the sentinel.
-		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aTaskSigningKeyName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
-		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutKeysName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
-		{&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
-		{&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
-		// ServiceAccount is an Owns() kind, so this read is cached and free.
-		{&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.Client},
-	}
 }
 
 // pruneA2AAuthMapShards deletes what the identity map's render no longer
@@ -8759,8 +8627,8 @@ func (r *PlatformAgentReconciler) pruneA2AAuthMapShards(ctx context.Context, age
 }
 
 // deleteA2AAuthMapShards removes every identity-map object, the unsharded
-// legacy one and every shard, for the flip to today and the CR's deletion.
-// Shard 0 is also a walk entry (a2aPreBusTeardown), which finds it gone.
+// legacy one and every shard. Only tests call it since the flip-to-today
+// teardown went; CR deletion leaves the objects to their owner reference.
 func (r *PlatformAgentReconciler) deleteA2AAuthMapShards(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	return r.deleteA2AAuthMapObjects(ctx, agent, nil)
 }
@@ -8795,388 +8663,23 @@ func (r *PlatformAgentReconciler) deleteA2AAuthMapObjects(ctx context.Context, a
 	return nil
 }
 
-// a2aBusTeardown returns the namespaced NATS bus objects (Service, NetworkPolicy fences,
-// config Secret, ResourceQuota). They are deleted strictly after the callout ClusterRoleBinding
-// and provision Jobs, and immediately before the NATS StatefulSet sentinel.
-func (r *PlatformAgentReconciler) a2aBusTeardown(agent *agentv1alpha1.PlatformAgent) []a2aTeardownEntry {
-	return []a2aTeardownEntry{
-		{&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace}}, r.Client},
-		// A multi-server bus's routes Service and budget. Absent on a single
-		// server, which the teardown reads as already gone.
-		{&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSRoutesName(agent), Namespace: agent.Namespace}}, r.Client},
-		{&policyv1.PodDisruptionBudget{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace}}, r.Client},
-		// NetworkPolicy is an Owns() kind (the agent's own policy), so the
-		// cached reads are free.
-		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
-		// The gateway's own fence. Its Deployment is deleted far above, so
-		// what it fences by now is a terminating pod; it goes here rather
-		// than beside the door fences so it outlives that pod for as long as
-		// the teardown's order allows, and above the verifier fence for the
-		// reason that entry gives.
-		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
-		// The verifier fence goes before the session fence, not after it, even
-		// though the verifier is rendered after the session one. Two reasons,
-		// and the second is the load-bearing one.
-		//
-		// The verifier Deployment is deleted far above, so by the time this
-		// runs the only thing this fence confines is a pod already terminating
-		// — and it is first-party code, not the model-steered worker the
-		// session fence holds. Of the two, the session fence is the one worth
-		// keeping longest.
-		//
-		// And the session fence has to be LAST of the fences, because it is
-		// the only one standing at the end of a teardown that dies partway.
-		// An install refused on its first reconcile under mode next has the
-		// fences and nothing else — reconcileAgentNetworkGuardrails applies
-		// them on every refusal path, before reconcileA2A is reached — so on
-		// the flip to today the fences are the only objects a resumed pass can
-		// recognise. A fence deleted after the session fence would, on exactly
-		// that install, be left behind by a pass that died in between, with
-		// nothing remaining to say the teardown was unfinished. Append a new
-		// fence ABOVE this entry, not below it.
-		// TestTheSessionFenceIsTheLastFenceTheTeardownDeletes pins that.
-		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aVerifierNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
-		// The MCP fence, late for the console fence's reason below, and just
-		// above it: the console fence stays directly above the session
-		// fence, which stays last.
-		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
-		// The console fence, as late as it can go for the session fence's
-		// reason: directly above the session fence, which has to stay last.
-		// The window matters more here: until the console pod exits, anything
-		// in the cluster that reaches it can read the console password off
-		// /config.json, and the creds Secret that password lives in survives
-		// the flip. The order shortens that window to the pod's exit; it does
-		// not remove it.
-		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aConsoleNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
-		// The session fence goes after the gateway Deployment above, which is
-		// what stops new pods being spawned. It does not close the window:
-		// Delete returns as soon as the API server accepts it, and the pods
-		// already running are reaped asynchronously by GC through their
-		// ownerReference, then by their termination grace. So a flip to today
-		// with sessions in flight leaves those workers unfenced for seconds,
-		// not for their lifetimes — ordering shortens that window rather than
-		// removing it, and removing it would take a foreground delete and a
-		// wait this reconcile has no reason to block on.
-		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aSessionNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
-		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSConfigSecretName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
-		// The TLS material goes with the bus, unlike the creds Secret: a CA
-		// reissued on the next flip to next costs nothing, since every client
-		// is re-rendered with the new bundle in the same pass, while a CA key
-		// left behind is a signing key for a bus that no longer exists.
-		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: agentv1alpha1.A2ANATSTLSSecretName(agent.Name), Namespace: agent.Namespace}}, r.a2aReader()},
-		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: agentv1alpha1.A2ANATSCASecretName(agent.Name), Namespace: agent.Namespace}}, r.a2aReader()},
-		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSCABundleName(agent), Namespace: agent.Namespace}}, r.Client},
-		// ResourceQuota is not a watched kind, so the read goes through
-		// a2aReader like the Secrets. Deleting it here is safe even with
-		// session pods still draining (see the function comment): a quota
-		// only gates admission, never running pods.
-		{&corev1.ResourceQuota{ObjectMeta: metav1.ObjectMeta{Name: a2aSessionQuotaName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
-	}
-}
-
-func (r *PlatformAgentReconciler) a2aNamespacedTeardown(agent *agentv1alpha1.PlatformAgent) []a2aTeardownEntry {
-	pre := r.a2aPreBusTeardown(agent)
-	bus := r.a2aBusTeardown(agent)
-	out := make([]a2aTeardownEntry, 0, len(pre)+len(bus))
-	out = append(out, pre...)
-	return append(out, bus...)
-}
-
-// cleanupA2A returns the dark stack to dark when the mode is not next. The
-// creds Secret stays (inert data; re-enabling must not re-roll credentials)
-// and so does the StatefulSet's PVC (JetStream's file store is the audit
-// substrate — flipping a mode is not license to destroy evidence).
-//
-// Session pods — spawned by the gateway once the worker PR arms spawning —
-// are the gateway's, not the operator's: every spawned pod carries an
-// ownerReference to the gateway Deployment (A2A_OWNER_DEPLOYMENT above), so
-// deleting the gateway here hands any stragglers to Kubernetes GC, with no
-// operator exception to the ownership rule below: the walk deletes only
-// what this CR controls and leaves the rest alone.
-func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
-	_, err := r.cleanupA2AWithJobMode(ctx, agent)
-	return err
-}
-
-// cleanupA2AWithJobMode is cleanupA2A, also reporting whether the pass tore
-// the dispatcher's Job mode down: true when nothing of the stack was present,
-// or when deleteDispatcherPodsRBAC (the Jobs Role, the Jobs and the
-// DispatchJobTemplates among what it deletes) succeeded. A failure there
-// leaves Job mode's resources live, so the DispatcherJobMode condition stays.
-func (r *PlatformAgentReconciler) cleanupA2AWithJobMode(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (tornDown bool, err error) {
-	// The Lease goes below with the stack; a flip back to next is a first
-	// install for it, not a deletion to hold back.
-	r.forgetA2AGatewayLease(agent)
-	// The early exit. This path runs on every reconcile of every install that
-	// is not `next` — forever, on installs that have never rendered an A2A
-	// object — so proving "nothing to do" one object at a time is a standing
-	// cost for a no-op. Thirteen reads answer it instead of walking every object
-	// in the teardown sequence (the twelve below, and the profile namespace's
-	// fence, which is tested by this agent's labels):
-	//
-	//   - the StatefulSet, which is deleted LAST below, so its absence means an
-	//     earlier pass ran to completion rather than dying partway,
-	//   - the gateway Deployment, which the render creates last and this
-	//     function deletes first, so it catches a pass that failed immediately,
-	//   - the NATS fence and the session fence, for the render that never
-	//     reaches reconcileA2A. reconcileAgentNetworkGuardrails applies the
-	//     fences on every refusal under mode next, so a CR refused on its
-	//     first reconcile has the fences and none of the other objects here;
-	//     without these two the exit stepped over them on the flip to today
-	//     (#2197). The NATS fence is the first object that path writes, so a
-	//     guardrail render that died anywhere leaves it; the session fence is
-	//     the last fence the teardown deletes, so a cleanup pass that died
-	//     between the two leaves it,
-	//   - the inject door's fence, for the shape neither of those two covers.
-	//     It is written after both and deleted before both, so a render or a
-	//     cleanup that dies partway always leaves one of the two standing
-	//     beside it. The hand does not die partway: an operator triaging an
-	//     EgressAllowlistRefused who deletes the NATS and session fences and
-	//     flips the CR to today before the reconcile that delete enqueued has
-	//     re-applied them hands the first today reconcile a tree holding the
-	//     inject fence alone. Nothing on the today path but this walk removes
-	//     it -- removeA2AInjectBackend runs from the next render only -- so
-	//     without this entry the exit returned, and did so again on every
-	//     reconcile after, over an owned A2A NetworkPolicy. Listed whatever
-	//     the flag says, like its teardown entry: the install that has it is
-	//     the one whose operator was deployed with the flag, and the read
-	//     finds nothing on one that never was,
-	//   - the A2A door's fence, the same shape under the other flag: written
-	//     after the pair and deleted before it, left alone only by the hand,
-	//     removed on the today path by nothing but this walk,
-	//   - the gateway's own fence, the same shape again, under no flag. Since
-	//     #2473 every next gateway has it. It is written after the pair and
-	//     deleted between them (after the NATS fence, before the session
-	//     one), so a render or cleanup that dies partway leaves one of the
-	//     pair beside it; the hand that deletes the pair and flips to today
-	//     leaves it alone, and then nothing on the today path but this walk
-	//     removes it,
-	//   - the console fence, for the same hand on an install without the
-	//     inject flag. It is the third fence reconcileA2ANetworkFences writes,
-	//     so the same two deletes leave it standing alone there, and nothing
-	//     on the today path but this walk removes it either,
-	//   - the MCP server's fence, the same shape under A2A_MCP_DOOR: written
-	//     after the pair, so the same hand leaves it alone, and nothing on the
-	//     today path but this walk removes it,
-	//   - the callout keys Secret, which is the FIRST deletable object
-	//     reconcileA2A creates — the per-user creds Secret is created before it
-	//     and deliberately survives — so a render that died anywhere leaves this
-	//     one behind. It covers the identity-map ConfigMap created right after
-	//     it for the same reason,
-	//   - the config Secret, which held that role before the callout existed.
-	//     Kept for the install whose partial render predates the keys Secret:
-	//     an operator upgraded across this change and then flipped to `today`
-	//     would otherwise step over a config Secret no later object accompanies,
-	//   - the task-signing key Secret, which reconcileCredentialProxy ensures
-	//     (credentialProxyProfileConfigFor) in step 11, ahead of every write
-	//     of reconcileA2A and of the fence pass, whenever a profile is bound.
-	//     A next render that dies between the broker and reconcileA2A leaves
-	//     it alone, and nothing on the today path but this walk removes it.
-	//
-	// Without the Secrets and the fences the exit would step over those objects
-	// and leave an A2A object on a `today` install, which is the darkness
-	// property. The first nine are Owns kinds and free; the three Secret reads
-	// are uncached and happen only when the free nine all miss.
-	//
-	// A sentinel counts only when this CR owns it: a squatted or stale-UID
-	// object under a reserved name is not residue of this CR and is left to
-	// its owner or to the garbage collector. The walk below leaves anything
-	// this CR does not own alone (deleteA2AObjectIfOwned), so a flip with an
-	// unowned object under a reserved name completes around it (#3871); a
-	// present-but-unowned sentinel that counted would only send every
-	// reconcile of a today install through the walk for nothing -- the shape
-	// a next CR deleted and re-created under the same name in today mode
-	// takes, while its old fences still carry the old UID.
-	// Ownership is read off the fetched object, so the exit stays at twelve
-	// Gets, plus one for the profile namespace's fence below, which carries
-	// no owner reference and is tested by this agent's labels instead.
-	//
-	// Adding an object to reconcileA2A ahead of the keys Secret, or to
-	// reconcileA2ANetworkFences ahead of its first write (the profile fence,
-	// then the NATS fence), or an A2A object written by an earlier step
-	// (the broker's task-signing key), means adding it here.
-	// TestTheFlipToTodayRemovesALoneTaskSigningKey reds without the last.
-	// TestTheEarlyExitSeesTheResidueOfARenderThatDiedAnywhere walks every
-	// prefix of both renders and is what makes forgetting it red rather than
-	// silent: without the keys Secret below, its writes 3 and 4 fail, and
-	// without the fences every guardrail prefix does. The inject, door,
-	// console, gateway and MCP fences are the ones no prefix leaves alone;
-	// TestAHandDeletedPairLeavesTheInjectFenceToDriveTheFlip, its A2A door
-	// twin, TestAHandDeletedPairLeavesTheConsoleFenceToDriveTheFlip and
-	// TestTheA2AGatewayFenceComesAndGoesWithTheGateway are what red without
-	// them.
-	sentinels := []a2aTeardownEntry{
-		{&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace}}, r.Client},
-		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.Client},
-		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
-		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aSessionNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
-		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aInjectName(agent), Namespace: agent.Namespace}}, r.Client},
-		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aDoorName(agent), Namespace: agent.Namespace}}, r.Client},
-		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
-		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aConsoleNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
-		{&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: a2aMCPNetpolName(agent), Namespace: agent.Namespace}}, r.Client},
-		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutKeysName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
-		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSConfigSecretName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
-		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aTaskSigningKeyName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
-	}
-	anyPresent := false
-	for _, s := range sentinels {
-		err := s.reader.Get(ctx, client.ObjectKeyFromObject(s.obj), s.obj)
-		if err == nil {
-			if metav1.IsControlledBy(s.obj, agent) {
-				anyPresent = true
-				break
-			}
-			continue
-		}
-		if client.IgnoreNotFound(err) != nil {
-			return false, err
-		}
-	}
-	// The profile fence is the first write of reconcileA2ANetworkFences and
-	// carries no owner reference, so it is tested by this agent's labels.
-	if !anyPresent {
-		fence, err := r.profileFenceRendered(ctx, agent)
-		if err != nil {
-			return false, err
-		}
-		anyPresent = fence
-	}
-	if !anyPresent {
-		return true, nil
-	}
-
-	// Deployment/StatefulSet/Service/ServiceAccount reads come from the cache —
-	// those kinds are already watched (Owns, see SetupWithManager) so the reads
-	// are free. Secret, Role/RoleBinding, ResourceQuota and Job reads go through
-	// a2aReader: a cached read would start a cluster-wide informer for a kind
-	// this controller otherwise never watches, on every install.
-	//
-	// Those uncached reads are the standing cost of this path, which runs on
-	// every reconcile of every today install — see the note on the sweep below.
-
-	// 0. The scope publisher, ahead of everything the early exit reads, so a
-	// pass that dies here leaves every sentinel standing to bring it back.
-	// Its objects are written after the keys Secret, so a render that dies
-	// partway leaves a sentinel too.
-	if err := r.removeScopePublisher(ctx, agent); err != nil {
-		return false, err
-	}
-
-	// Then the identity map's shards, before the walk that deletes the
-	// callout keys Secret covering them (the sentinel argument on the walk's
-	// authmap entry). A callout still running keeps serving its last map when
-	// the objects go, so deleting them ahead of its Deployment costs nothing.
-	if err := r.deleteA2AAuthMapShards(ctx, agent); err != nil {
-		return false, err
-	}
-
-	// 1. Namespaced objects before the bus (gateway, inject, callout, session identities).
-	// Deleted first so the services built on top of the bus are initiated and stopped
-	// before the bus itself.
-	for _, entry := range r.a2aPreBusTeardown(agent) {
-		if err := r.deleteA2AObjectIfOwned(ctx, agent, entry.obj, entry.reader, nil); err != nil {
-			return false, err
-		}
-	}
-
-	// The profile namespace's quota, which carries no owner reference
-	// (agentprofile_namespace.go). Its fence goes after the bus below.
-	profileQuotaErr := r.deleteProfileQuota(ctx, agent)
-	if profileQuotaErr != nil {
-		r.profileNamespaceFailure(ctx, agent, "delete the quota on the flip to today", profileQuotaErr)
-	}
-	// And the dispatcher's warm pools, their CA bundle copy and its pod-read
-	// Role and binding there, likewise unowned, likewise not worth stopping
-	// the flip for, and likewise kept in sight: a failure leaves the fence
-	// below as the sentinel.
-	dispatcherRBACErr := r.deleteDispatcherPodsRBAC(ctx, agent)
-	if dispatcherRBACErr != nil {
-		r.profileNamespaceFailure(ctx, agent, "delete the dispatcher's warm pools, bundle copy or pod-read Role on the flip to today", dispatcherRBACErr)
-	}
-
-	// 2. The callout's ClusterRoleBinding. Cluster-scoped, so it carries no
-	// owner reference — the garbage collector treats a cluster-scoped object
-	// owned by a namespaced one as an orphan and deletes it at once — which
-	// means nothing reclaims it but this. Left behind, it is an A2A-named
-	// ClusterRoleBinding on an install that is supposed to look like it has
-	// never heard of A2A, and it is the darkness property's most visible
-	// residue: cluster-scoped objects are exactly what a security reviewer
-	// lists first.
-	//
-	// Ordered after the callout Deployment in the teardown walk so its
-	// deletion has been initiated before its authorization is reaped, and
-	// before the NATS bus resources and StatefulSet sentinel below so that
-	// a pass dying on this delete leaves the bus whole and the sentinel
-	// standing to resume cleanup (#2216).
-	//
-	// An unowned or squatted binding is skipped (leaving it to its owner) rather
-	// than returning a fatal error that would wedge teardown forever.
-	// However, any error deleting an owned binding (e.g. admission webhook
-	// refusal or RBAC restriction) remains fatal: teardown halts here with the
-	// entire NATS bus (Service, NetworkPolicy fences, config Secret, StatefulSet)
-	// still standing and protected, preserving the sentinel to retry next pass.
-	if err := r.deleteA2ACalloutClusterRoleBinding(ctx, agent); err != nil {
-		return false, err
-	}
-
-	// 3. Provision Jobs carry a content hash in the name, one per generation
-	// that has been rendered here; a mode flip removes every generation.
-	// Ordered before the NATS bus resources and StatefulSet sentinel below so
-	// that a pass dying during Job cleanup leaves the bus intact and the
-	// sentinel standing (#2216).
-	if err := r.deleteA2AProvisionJobs(ctx, agent, ""); err != nil {
-		return false, err
-	}
-
-	// 4. The NATS bus namespaced objects (Service, NetworkPolicy fences,
-	// config Secret, ResourceQuota).
-	for _, entry := range r.a2aBusTeardown(agent) {
-		if err := r.deleteA2AObjectIfOwned(ctx, agent, entry.obj, entry.reader, nil); err != nil {
-			return false, err
-		}
-	}
-
-	// The profile namespace's fence, now that the bus fence admitting that
-	// namespace is gone (LiteLLM's policy dropped it earlier in the pass,
-	// when it re-rendered for today). Before the sentinel, so a failed delete
-	// leaves cleanup to resume.
-	// Skipped on a pass whose quota delete, or the dispatcher's pod-read
-	// RBAC delete, failed: the fence then stays as the sentinel that brings
-	// the teardown back for them, transient failure or not. A pod-read
-	// binding left behind would grant a later ServiceAccount of the
-	// dispatcher's name pod read in the profile namespace. A fence left
-	// behind only restricts, so a failed fence delete is logged and retried
-	// the same way, without holding the bus.
-	if profileQuotaErr == nil && dispatcherRBACErr == nil {
-		if err := r.deleteProfileFence(ctx, agent); err != nil {
-			r.profileNamespaceFailure(ctx, agent, "delete the fence on the flip to today", err)
-		}
-	}
-
-	// 5. LAST, deliberately: the StatefulSet is this function's sentinel. The
-	// early exit above treats its absence as "an earlier pass reached the
-	// end", which is only true while nothing is deleted after it.
-	return dispatcherRBACErr == nil, r.deleteA2ANATSStatefulSet(ctx, agent)
-}
-
 // deleteA2ANATSStatefulSet reaps the NATS StatefulSet.
 //
-// LAST, deliberately: the StatefulSet is cleanupA2A's sentinel. The early exit
-// treats its absence as "an earlier pass reached the end", which is only true
-// while nothing is deleted after it. It is placed after the callout
-// ClusterRoleBinding, provision Jobs, and NATS bus resources so that a pass
-// dying anywhere earlier leaves the StatefulSet standing to resume cleanup (#2216).
+// LAST, deliberately: its absence reads as "an earlier pass reached the end",
+// which is only true while nothing is deleted after it. It is placed after
+// the callout ClusterRoleBinding, provision Jobs, and NATS bus resources so
+// that a pass dying anywhere earlier leaves the StatefulSet standing to resume
+// the deletion (#2216).
 func (r *PlatformAgentReconciler) deleteA2ANATSStatefulSet(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	sts := &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace}}
 	return r.deleteA2AObjectIfOwned(ctx, agent, sts, r.Client, nil)
 }
 
 // deleteA2AProvisionJobs deletes this agent's provision Jobs, found by label
-// because their names carry a content hash, except the one named keep. Two
-// callers: reconcileA2A passes the current render's name so superseded
-// generations go, and cleanupA2A passes "" so a mode flip clears them all.
-// One function so the two sweeps cannot drift apart in what they select.
+// because their names carry a content hash, except the one named keep:
+// reconcileA2A passes the current render's name so superseded generations go
+// (an empty keep would delete every generation; CR deletion leaves them to
+// the owner reference).
 //
 // The List is uncached (a2aReader) for the reason that function gives, and
 // on the reconcile path it is a standing cost paid once per reconcile of a
@@ -9186,14 +8689,14 @@ func (r *PlatformAgentReconciler) deleteA2ANATSStatefulSet(ctx context.Context, 
 // never sees a create again under the current name, and a pass whose create
 // succeeded and whose sweep then failed.
 //
-// Background propagation, for the same reason cleanupA2A always used it: the
+// Background propagation: the
 // pod is what holds the quota slot, and Background hands it to the garbage
 // collector the moment the Job is gone rather than pinning the Job under a
 // foregroundDeletion finalizer until the pod has left — which would put the
 // same Job back in this List on the next pass. A Job already carrying a
-// deletionTimestamp is skipped for that reason too. The IsControlledBy guard
-// is cleanupA2A's: a Job somebody labelled to look like ours, but which this
-// agent does not own, is not ours to delete.
+// deletionTimestamp is skipped for that reason too. The IsControlledBy guard:
+// a Job somebody labelled to look like ours, but which this agent does not
+// own, is not ours to delete.
 func (r *PlatformAgentReconciler) deleteA2AProvisionJobs(ctx context.Context, agent *agentv1alpha1.PlatformAgent, keep string) error {
 	var jobs batchv1.JobList
 	if err := r.a2aReader().List(ctx, &jobs, client.InNamespace(agent.Namespace), client.MatchingLabels{
@@ -9216,11 +8719,9 @@ func (r *PlatformAgentReconciler) deleteA2AProvisionJobs(ctx context.Context, ag
 
 // deleteA2ACalloutClusterRoleBinding reaps the callout's cluster-scoped grant.
 //
-// Called from two places, because there are two ways the next stack goes away:
-// a flip to today (cleanupA2A) and deletion of the CR itself (handleDeletion).
-// Nothing else reclaims it — a cluster-scoped object cannot carry an owner
-// reference to a namespaced CR — so missing either path leaves a standing
-// TokenReview grant behind forever.
+// Called from deletion of the CR (handleDeletion). Nothing else reclaims it —
+// a cluster-scoped object cannot carry an owner reference to a namespaced CR
+// — so missing it leaves a standing TokenReview grant behind forever.
 func (r *PlatformAgentReconciler) deleteA2ACalloutClusterRoleBinding(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	crb := &rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutClusterRoleBindingName(agent)}}
 	if err := r.a2aReader().Get(ctx, client.ObjectKeyFromObject(crb), crb); err != nil {

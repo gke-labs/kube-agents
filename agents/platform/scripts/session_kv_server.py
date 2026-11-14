@@ -2974,15 +2974,15 @@ def enabled_chat_platforms() -> list[str]:
 
     One thing outranks all three: the platforms ``chat_notify.routed_platforms()``
     names, from ``A2A_NOTIFY_PLATFORM``, ``A2A_NOTIFY_CONVERSATIONS`` and the
-    projected home-channel file. Under ``spec.mode: next`` the
-    managed scope says each such platform's Hermes consumer is off because the
+    projected home-channel file. The managed scope says each such
+    platform's Hermes consumer is off because the
     A2A gateway holds its backend, and posts to it go through the gateway
     instead, so each is still a platform this install posts to. The operator
     lists the armed routes with a CR home channel; ``routed_platforms()`` adds
     Slack when the file names a channel, and takes every armed route when no
     platform has a home, the gateway keeping the refused posts for a digest.
-    The alert takes the first of them. The operator renders the variables only
-    under next, and they are reserved against every other source.
+    The alert takes the first of them. The variables are the operator's, and
+    they are reserved against every other source.
 
     Never returns an empty list — an install that resolves to nothing gets
     DEFAULT_CHAT_PLATFORM.

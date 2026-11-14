@@ -569,8 +569,8 @@ type Config struct {
 	// OwnerDeployment names the gateway's own Deployment
 	// (A2A_OWNER_DEPLOYMENT; the operator renders its own render's name).
 	// When set, every spawned session pod carries an ownerReference to it,
-	// so Kubernetes GC reaps sessions when the Deployment goes — cleanupA2A
-	// deleting the gateway, or any other deletion — with no operator
+	// so Kubernetes GC reaps sessions when the Deployment goes — the CR's
+	// deletion, or any other — with no operator
 	// exception to its IsControlledBy refusal. Empty (playground) spawns
 	// unowned pods, the pre-S9 posture.
 	OwnerDeployment string

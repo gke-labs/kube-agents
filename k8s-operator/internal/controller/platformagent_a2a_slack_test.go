@@ -79,40 +79,35 @@ func chatAndSlackTestAgent(mode string) *agentv1alpha1.PlatformAgent {
 	return agent
 }
 
-// TestSlackConsumerIsChosenByMode: one Slack app, one Socket Mode consumer.
-// The two predicates are exact complements whenever Slack is enabled and
-// both false when it is not. Chat beside Slack under next changes nothing:
-// the one gateway process runs both backends, so Slack is armed there too.
-func TestSlackConsumerIsChosenByMode(t *testing.T) {
+// TestSlackArmsWheneverEnabled: one Slack app, one Socket Mode consumer, the
+// gateway's. Slack arms exactly when it is enabled, whatever spec.mode says
+// (absent, a stored "today", "next"). Chat beside Slack changes nothing: the
+// one gateway process runs both backends, so Slack is armed there too.
+func TestSlackArmsWheneverEnabled(t *testing.T) {
 	for _, tc := range []struct {
-		name          string
-		agent         *agentv1alpha1.PlatformAgent
-		armed, legacy bool
+		name  string
+		agent *agentv1alpha1.PlatformAgent
+		armed bool
 	}{
-		{"today with slack", slackTestAgent("", true), false, true},
-		{"today explicit with slack", slackTestAgent("today", true), false, true},
-		{"next with slack", slackTestAgent("next", true), true, false},
-		{"next with slack disabled", slackTestAgent("next", false), false, false},
-		{"today with slack disabled", slackTestAgent("", false), false, false},
-		{"next with no integration", a2aTestAgent(), false, false},
-		{"next with chat only", gchatTestAgent("next", true), false, false},
-		{"next with chat and slack", chatAndSlackTestAgent("next"), true, false},
-		{"today with chat and slack", chatAndSlackTestAgent(""), false, true},
-		// Version skew fails closed to today, as a2aChatArmed does.
-		{"skew with slack", slackTestAgent("later", true), false, true},
+		{"no mode with slack", slackTestAgent("", true), true},
+		{"a stored today with slack", slackTestAgent("today", true), true},
+		{"next with slack", slackTestAgent("next", true), true},
+		{"next with slack disabled", slackTestAgent("next", false), false},
+		{"no mode with slack disabled", slackTestAgent("", false), false},
+		{"no integration", a2aTestAgent(), false},
+		{"chat only", gchatTestAgent("next", true), false},
+		{"next with chat and slack", chatAndSlackTestAgent("next"), true},
+		{"no mode with chat and slack", chatAndSlackTestAgent(""), true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := a2aSlackArmed(tc.agent); got != tc.armed {
 				t.Errorf("a2aSlackArmed = %v, want %v", got, tc.armed)
 			}
-			if got := legacySlackConsumer(tc.agent); got != tc.legacy {
-				t.Errorf("legacySlackConsumer = %v, want %v", got, tc.legacy)
-			}
 		})
 	}
 }
 
-// TestAnArmedGatewayCarriesTheSlackBackend: under next with Slack enabled,
+// TestAnArmedGatewayCarriesTheSlackBackend: with Slack enabled,
 // the gateway's pair is read through the CR's own refs, required whatever
 // the ref says, and the Discord reference is not rendered beside it.
 func TestAnArmedGatewayCarriesTheSlackBackend(t *testing.T) {
@@ -161,7 +156,7 @@ func TestAnUnarmedGatewayCarriesNoSlackPair(t *testing.T) {
 	}
 }
 
-// TestTheSlackIntegrationRendersTheGateway: Slack enabled under next renders
+// TestTheSlackIntegrationRendersTheGateway: Slack enabled renders
 // the gateway with the Slack pair and no other Secret in the namespace. A
 // missing token Secret is the kubelet's to report on the pod (the refs are
 // required).
@@ -191,19 +186,19 @@ var (
 	slackLegacyAgentNames  = []string{"SLACK_RELAY_URL", "SLACK_ALLOWED_USERS", "SLACK_ALLOW_ALL_USERS"}
 )
 
-// TestTheLegacySlackConsumerIsNotRenderedUnderNext: the broker's Slack relay
+// TestTheLegacySlackConsumerRendersOnlyBesideChat: the broker's Slack relay
 // pair, the Hermes slack platform, its relay env on the agent container and
-// its pins in the managed .env all go with the mode, as Chat's do. Under
-// today and skew they are what main renders; with Chat beside Slack under
-// next they go too, because the one gateway runs both backends.
-func TestTheLegacySlackConsumerIsNotRenderedUnderNext(t *testing.T) {
+// its pins in the managed .env never render: the gateway holds Slack
+// whenever it is enabled, whatever spec.mode says, Chat beside it or not,
+// because the one gateway runs both backends.
+func TestTheLegacySlackConsumerIsNeverRendered(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		agent  *agentv1alpha1.PlatformAgent
 		legacy bool
 	}{
-		{"today with slack", slackTestAgent("", true), true},
-		{"skew with slack", slackTestAgent("later", true), true},
+		{"no mode with slack", slackTestAgent("", true), false},
+		{"a stored today with slack", slackTestAgent("today", true), false},
 		{"next with slack", slackTestAgent("next", true), false},
 		{"next with chat and slack", chatAndSlackTestAgent("next"), false},
 	} {
@@ -238,18 +233,15 @@ func TestTheLegacySlackConsumerIsNotRenderedUnderNext(t *testing.T) {
 // which is what opens a Socket Mode connection (the broker's SlackRelay, the
 // gateway's Slack adapter). Slack spreads one app's events across every open
 // connection, so two would split the workspace's messages; none would drop
-// them. Exactly one in every mode rendered by a single operator, and beside
-// Chat, where the gateway holds the pair and the broker does not. (Under
-// version skew across operator versions, a frozen gateway and the
-// re-rendered legacy relay both consume; see spec-chatops-gateway.md).
+// them. Exactly one whatever spec.mode says, and beside Chat, where the
+// gateway holds the pair and the broker does not.
 func TestNoRenderCarriesTwoSlackSocketModeConsumers(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "")
 	for name, agent := range map[string]*agentv1alpha1.PlatformAgent{
-		"today":             slackTestAgent("", true),
+		"no mode":           slackTestAgent("", true),
 		"next":              slackTestAgent("next", true),
-		"skew":              slackTestAgent("later", true),
 		"next with chat":    chatAndSlackTestAgent("next"),
-		"today with chat":   chatAndSlackTestAgent(""),
+		"no mode with chat": chatAndSlackTestAgent(""),
 		"next, inject door": slackTestAgent("next", true),
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -326,7 +318,7 @@ func TestTheGatewayMapIsTheArmedBackendsTable(t *testing.T) {
 	}{
 		{name: "discord", agent: a2aTestAgent()},
 		{name: "door", agent: a2aTestAgent(), door: true},
-		{name: "slack on the legacy path", agent: slackTestAgent("", true)},
+		{name: "slack armed with no mode", agent: slackTestAgent("", true), secret: true},
 		{name: "chat and slack share the gateway", agent: chatAndSlackTestAgent("next"), secret: true},
 		{name: "slack armed", agent: slackTestAgent("next", true), secret: true},
 		{name: "slack armed beside the door", agent: slackTestAgent("next", true), door: true, secret: true},
@@ -419,7 +411,7 @@ func TestChatArmedKeepsSlackAndDropsDiscord(t *testing.T) {
 	}
 }
 
-// TestAGatewayWithChatAndSlackCarriesBothBackends: under next with both
+// TestAGatewayWithChatAndSlackCarriesBothBackends: with both
 // enabled, the one gateway pod carries each backend's whole render (the
 // Slack pair, allowlist, principal-map Secret and home projection; Chat's
 // relay and allowlist), the gateway is the one Socket Mode consumer, and the
@@ -599,7 +591,7 @@ func TestNoEgressPolicySelectsTheGatewayPod(t *testing.T) {
 	}
 }
 
-// TestAnArmedGatewayCarriesTheSlackAllowlist: under next the gateway gates a
+// TestAnArmedGatewayCarriesTheSlackAllowlist: the gateway gates a
 // Slack sender on spec.integration.slack.allowedUsers as well as the
 // principal map, the way Chat's gateway gates on its own list. The list is
 // normalized with the gateway's grammar and the allow-all flag is the legacy
@@ -736,26 +728,8 @@ func TestPeopleSeenOffIsTheOnlyRenderedState(t *testing.T) {
 	})
 }
 
-// TestTheSlackAllowAllDecisionMatchesTheLegacyConsumer: one CR, one answer
-// to "is every Slack member allowed", whichever consumer the mode renders.
-func TestTheSlackAllowAllDecisionMatchesTheLegacyConsumer(t *testing.T) {
-	t.Setenv(a2aInjectBackendEnvVar, "")
-	for _, users := range [][]string{nil, {}, {""}, {" "}, {","}, {" , ", ",,"}, {"", "  "}, {"U1"}, {" U1 ", ""}} {
-		next := slackTestAgent("next", true)
-		next.Spec.Integration.Slack.AllowedUsers = users
-		today := slackTestAgent("", true)
-		today.Spec.Integration.Slack.AllowedUsers = users
-		a2a := envMapOf(buildA2AGatewayDeployment(next).Spec.Template.Spec.Containers[0].Env)[a2aSlackAllowAllUsersEnvVar].Value
-		legacy := envMapOf(brokerContainerNamed(buildPodTemplateSpec(today, "h", "h", "h", "h", nil, renderOptions{}).Spec.Containers, "platform-agent").Env)["SLACK_ALLOW_ALL_USERS"].Value
-		if a2a == "" || a2a != legacy {
-			t.Errorf("allowedUsers=%q: next renders allow-all %q where today renders %q", users, a2a, legacy)
-		}
-	}
-}
-
 // TestAnUnarmedGatewayCarriesNoSlackAllowlist: the pair rides with the
-// backend, so a gateway Slack does not arm (off next, or Slack disabled)
-// carries neither.
+// backend, so a gateway Slack does not arm (Slack disabled) carries neither.
 func TestAnUnarmedGatewayCarriesNoSlackAllowlist(t *testing.T) {
 	t.Setenv(a2aInjectBackendEnvVar, "")
 	for _, agent := range []*agentv1alpha1.PlatformAgent{a2aTestAgent(), slackTestAgent("next", false)} {
@@ -906,8 +880,7 @@ func TestTheAgentRoutesSlackProactivePostsExactlyWhenArmed(t *testing.T) {
 		agent              *agentv1alpha1.PlatformAgent
 		home, conversation bool
 	}{
-		{"today with slack and home", withSlackHome(slackTestAgent("", true), "C0HOME"), false, false},
-		{"skew with slack and home", withSlackHome(slackTestAgent("later", true), "C0HOME"), false, false},
+		{"no mode with slack and home", withSlackHome(slackTestAgent("", true), "C0HOME"), true, true},
 		{"next with slack, public channel", withSlackHome(slackTestAgent("next", true), "C0HOME"), true, true},
 		{"next with slack, private channel", withSlackHome(slackTestAgent("next", true), "G0PRIV"), true, true},
 		{"next with slack, no home channel", slackTestAgent("next", true), false, true},
@@ -927,12 +900,12 @@ func TestTheAgentRoutesSlackProactivePostsExactlyWhenArmed(t *testing.T) {
 					t.Errorf("%s = %q, want %q", name, got.Value, a2aNotifyPlatformSlack)
 				}
 			}
-			if (tc.home || tc.conversation) && legacySlackConsumer(tc.agent) {
+			if _, ok := env["SLACK_RELAY_URL"]; ok && (tc.home || tc.conversation) {
 				t.Error("the notify route and the legacy Hermes slack platform both render")
 			}
-			// The audit relay reads the home channel from the agent's env; under
-			// next it rides with the home route, trimmed and validated, and is
-			// absent rather than empty when the CR names none.
+			// The audit relay reads the home channel from the agent's env; it
+			// rides with the home route, trimmed and validated, and is absent
+			// rather than empty when the CR names none.
 			crHome := strings.TrimSpace(tc.agent.Spec.Integration.Slack.HomeChannel)
 			if home, ok := env["SLACK_HOME_CHANNEL"]; tc.home && crHome != "" && (!ok || strings.TrimSpace(home.Value) != home.Value || home.Value == "") {
 				t.Errorf("SLACK_HOME_CHANNEL = %q (present=%v), want the home channel id beside %s", home.Value, ok, a2aNotifyPlatformEnvVar)

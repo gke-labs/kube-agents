@@ -398,10 +398,11 @@ func TestAnEarlyParkAddsNoConditionWhenTheFieldGoesAboveZero(t *testing.T) {
 	}
 }
 
-// On a today install nothing else asks for a sooner pass, so the short tier's
-// requeue is the one that brings the next read: 30s while short, and the
-// steady-state interval again once every replica is Ready.
-func TestAShortTierRequeuesSoonerOnATodayInstall(t *testing.T) {
+// The short tier asks for a sooner pass than the steady-state interval: 30s
+// while short. (Once every replica is Ready the A2A stack's own requeues,
+// the pending gateway among them, decide the interval, so that half is not
+// pinned here.)
+func TestAShortTierRequeuesSooner(t *testing.T) {
 	scheme := setupScheme()
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
@@ -427,22 +428,10 @@ func TestAShortTierRequeuesSoonerOnATodayInstall(t *testing.T) {
 	if res := pass(t); res.RequeueAfter != credentialProxyExecShortRequeue {
 		t.Fatalf("short tier: RequeueAfter = %v, want %v", res.RequeueAfter, credentialProxyExecShortRequeue)
 	}
-	d := &appsv1.Deployment{}
-	if err := cl.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: credentialProxyExecTierName(agent)}, d); err != nil {
-		t.Fatal(err)
-	}
-	d.Status.ReadyReplicas = 2
-	if err := cl.Status().Update(ctx, d); err != nil {
-		t.Fatal(err)
-	}
-	if res := pass(t); res.RequeueAfter != secretEnvReprobeInterval {
-		t.Fatalf("ready tier: RequeueAfter = %v, want the steady-state %v", res.RequeueAfter, secretEnvReprobeInterval)
-	}
 }
 
 // The out-of-date ClusterRole path returns before the steady-state requeue,
-// so it has to ask for the short tier's sooner pass on its own. A today
-// install, because a next install's pending gateway returns sooner still.
+// so it has to ask for the short tier's sooner pass on its own.
 func TestAShortTierRequeuesSoonerWhileTheClusterRoleIsOutOfDate(t *testing.T) {
 	scheme := setupScheme()
 	agent := &agentv1alpha1.PlatformAgent{

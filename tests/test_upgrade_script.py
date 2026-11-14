@@ -598,79 +598,6 @@ class UpgradeRunContractTest(unittest.TestCase):
             block.index(f"announce_platform_agent_mode_for_apply \"$target_namespace\" {key}\n"),
         )
 
-    def test_a_full_upgrade_refuses_a_switch_out_of_a_file_with_no_mode(self):
-        """A copied install.env.example names no mode and reads as today, so a
-        full upgrade over a next install would switch it back with nothing
-        asked. The full arm's notice block, lifted as written over the real
-        installer_common.sh with the notice stubbed to leave its reads, refuses
-        that and removes the tfvars whenever the reads leave next possible: a
-        switch the notice named, a hand-deleted CR whose release records next,
-        a release history that did not answer. A key that names the mode (empty
-        is a chosen today), reads that show no install on next, and an older
-        target that defines neither check go on."""
-        source = _UPGRADE_SH.read_text()
-        common = _REPO_ROOT / "scripts" / "installer" / "installer_common.sh"
-        start = source.index(
-            '      if declare -F announce_platform_agent_mode_for_apply >/dev/null; then\n'
-            '        announce_platform_agent_mode_for_apply "$target_namespace" '
-            '"${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}" "$PLATFORM_AGENT_MODE_NOTICE_UNGATED"\n'
-        )
-        end = source.index("      # And the container preflight:", start)
-        block = source[start:end]
-        self.assertIn('[ "${PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED:-false}" = "true" ]', block)
-        cr_next = 'PLATFORM_AGENT_CR_READ=ok PLATFORM_AGENT_CR_JSON=\'{"items":[{"spec":{"mode":"next"}}]}\''
-        cr_today = 'PLATFORM_AGENT_CR_READ=ok PLATFORM_AGENT_CR_JSON=\'{"items":[{"spec":{}}]}\''
-        cr_gone = 'PLATFORM_AGENT_CR_READ=ok PLATFORM_AGENT_CR_JSON=\'{"items":[]}\''
-        for mode, announced, reads, define, refused in (
-            (None, "true", cr_next, True, True),
-            ("next", "true", cr_next, True, False),
-            ("", "true", cr_next, True, False),
-            (None, "false", cr_today, True, False),
-            (None, "false", "TFVARS_CLUSTER_EXISTS=false", True, False),
-            (None, "false", "PLATFORM_AGENT_CR_READ=none", True, False),
-            (None, "false", f"{cr_gone} PLATFORM_AGENT_RECORD_READ=none", True, False),
-            (None, "false", f"{cr_gone} PLATFORM_AGENT_RECORD_READ=ok PLATFORM_AGENT_RECORD_JSON='{{}}'", True, False),
-            (None, "false",
-             f"{cr_gone} PLATFORM_AGENT_RECORD_READ=ok PLATFORM_AGENT_RECORD_JSON='{{\"platformAgent\":{{\"mode\":\"next\"}}}}'",
-             True, True),
-            (None, "false", f"{cr_gone} PLATFORM_AGENT_RECORD_READ=ok PLATFORM_AGENT_SERVED_READ=failed", True, True),
-            (None, "false", "PLATFORM_AGENT_CR_READ=failed", True, True),
-            (None, "true", cr_next, False, False),
-        ):
-            with self.subTest(mode=mode, announced=announced, reads=reads, define=define):
-                with tempfile.TemporaryDirectory() as tmp:
-                    tfvars = pathlib.Path(tmp) / "terraform.tfvars"
-                    tfvars.write_text("x = 1\n")
-                    stub = (
-                        f'source "{common}"\n'
-                        f'announce_platform_agent_mode_for_apply() {{ PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED={announced}; {reads}; }}\n'
-                        if define else ""
-                    )
-                    script = f"""
-KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
-{stub}
-print_error() {{ echo "ERROR: $*"; }}
-print_info() {{ echo "INFO: $*"; }}
-set -Eeuo pipefail
-unset PLATFORM_AGENT_MODE PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED TFVARS_CLUSTER_EXISTS
-: "${{DEFAULT_PLATFORM_AGENT_MODE:=today}}" "${{PLATFORM_AGENT_MODE_NOTICE_UNGATED:=ungated}}"
-{":" if mode is None else "PLATFORM_AGENT_MODE=" + mode}
-target_namespace=kubeagents-system tfvars_file={shlex.quote(str(tfvars))}
-{block}
-echo "went on"
-"""
-                    proc = subprocess.run(
-                        ["bash", "-c", script], capture_output=True, text=True, env=get_isolated_test_env(), check=False
-                    )
-                    out = proc.stdout + proc.stderr
-                    if refused:
-                        self.assertNotEqual(proc.returncode, 0, out)
-                        self.assertIn("install.env names no PLATFORM_AGENT_MODE and the install may run next", out)
-                        self.assertFalse(tfvars.exists())
-                    else:
-                        self.assertIn("went on", proc.stdout, out)
-                        self.assertTrue(tfvars.exists())
-
     def test_the_mode_calls_skip_an_older_installer_common(self):
         """installer_common.sh is the target tree's: piped, or with --image-tag
         onto a release before spec.mode support, it defines neither notice nor
@@ -3722,7 +3649,7 @@ class ScopeCheckWiringTest(unittest.TestCase):
 
 class FullArmRefusesNextSlackGatewaySettingsTest(unittest.TestCase):
     """#2812 on upgrade.sh. The full arm applies PLATFORM_AGENT_MODE from
-    install.env. With next and Slack on, Chat on or off, Slack moves to the A2A
+    install.env. With Slack on, Chat on or off, Slack moves to the A2A
     gateway, so the arm refuses an email in SLACK_ALLOWED_USERS, a
     SLACK_HOME_CHANNEL that is not a channel id, or a list of bot tokens.
     The refusal sits beside refuse_full_apply_dropping_next and before the
@@ -3801,8 +3728,6 @@ class FullArmRefusesNextSlackGatewaySettingsTest(unittest.TestCase):
     def test_the_cases_the_refusal_leaves_alone_apply(self):
         for keys in (
             {"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "true", "SLACK_ALLOWED_USERS": "U0123ABCD,W0456EFGH"},
-            {"PLATFORM_AGENT_MODE": "today", "SLACK_ENABLED": "true", "SLACK_ALLOWED_USERS": "alice@example.com"},
-            {"SLACK_ENABLED": "true", "SLACK_ALLOWED_USERS": "alice@example.com"},
             {"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "false", "SLACK_ALLOWED_USERS": "alice@example.com"},
             {"PLATFORM_AGENT_MODE": "next", "SLACK_ALLOWED_USERS": "alice@example.com"},
             {"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "true", "SLACK_ALLOWED_USERS": "U0123ABCD",
@@ -3859,11 +3784,15 @@ class FullArmRefusesNextSlackGatewaySettingsTest(unittest.TestCase):
         self.assertNotIn("secretpart", out)
         self.assertLess(out.index("An applying run would be refused"), out.index("PLANNED"))
 
-    def test_a_plan_is_quiet_where_slack_stays_on_the_today_path(self):
+    def test_a_plan_warns_when_the_key_still_says_today(self):
+        # The apply leaves spec.mode next whatever the key says
+        # (platform_agent_mode_after_apply), so Slack moves to the gateway
+        # and the plan says what an applying run would refuse.
         proc = self._plan({"PLATFORM_AGENT_MODE": "today", "SLACK_ENABLED": "true",
                            "SLACK_ALLOWED_USERS": "alice@example.com"})
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertNotIn("would be refused", proc.stdout + proc.stderr)
+        self.assertIn("An applying run would be refused: SLACK_ALLOWED_USERS holds entries that look like emails",
+                      proc.stdout + proc.stderr)
 
     def test_a_plan_warns_with_google_chat_beside_slack(self):
         # The gateway takes Slack beside Google Chat, so the plan still warns.

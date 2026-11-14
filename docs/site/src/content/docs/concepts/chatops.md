@@ -49,7 +49,7 @@ Unlike Slack's, this one is not covered by `/sethome`. That command writes the *
 
 When no home channel is set and the install's first chat message, on either platform, comes from Google Chat, it makes its space the Planning Agent's home channel, the same write `/sethome` makes. Scheduled `deliver: chat` reports reach that space from then on. That is often a one-person DM: send the first message from the space the team watches, or run `/sethome` there later. The specialists above still read only the pod environment. Like `/sethome`, the write also goes to the profile's `.env`, which outranks a `homeChannel` set on the CR afterwards. After the first message, a CR value still reaches the specialists, but the Planning Agent's home channel moves only with `/sethome`.
 
-Under `spec.mode: next` only the resource field counts. The operator hands it to the A2A gateway, which posts the agent's proactive messages to that space and nowhere else, and `/sethome` does not reach it. The field must name a space (`spaces/<id>`); with it unset or malformed the agent posts nothing to Google Chat unprompted. Unset, the PlatformAgent carries the [`HomeChannelUnset`](/kube-agents/operator/platformagent-crd/#status) condition and the installer warns before it applies.
+Only the resource field counts. The operator hands it to the A2A gateway, which posts the agent's proactive messages to that space and nowhere else, and `/sethome` does not reach it. The field must name a space (`spaces/<id>`); with it unset or malformed the agent posts nothing to Google Chat unprompted. Unset, the PlatformAgent carries the [`HomeChannelUnset`](/kube-agents/operator/platformagent-crd/#status) condition and the installer warns before it applies.
 
 The agent sends home posts to each platform on the gateway that has a home channel. A Slack channel the gateway learned counts. When no platform has one, the gateway refuses them and keeps each platform's posts apart, up to fifty for thirty days. It posts one digest once that platform's home channel is set.
 
@@ -81,7 +81,7 @@ Slack is opt-in. Enable it in the installer's chat menu, where the installer pro
 - The Slack listener itself lives inside the Hermes runtime; it uses Socket Mode (no public webhook required) driven by the app token.
 - [Slack app setup](/kube-agents/install/slack-app/) covers creating the app, its tokens, the allowlist and how to verify, for both modes.
 
-Under `spec.mode: next`, Slack terminates at the A2A gateway instead, on the same app and tokens, with or without Google Chat. The Hermes Slack listener and the credential broker's Socket Mode relay are off on such an install, so one app has one Socket Mode consumer. The exception is version skew (a `spec.mode` the operator does not recognise): the legacy consumer renders again beside the frozen gateway's connection. Each message is then answered by whichever consumer receives it, both admitting by the same list (only the gateway refuses another workspace's member). The `slack` field of [`spec.integration`](/kube-agents/operator/platformagent-crd/#specintegration) has the detail.
+Slack terminates at the A2A gateway instead, on the same app and tokens, with or without Google Chat. The Hermes Slack listener and the credential broker's Socket Mode relay are not rendered, so one app has one Socket Mode consumer. The `slack` field of [`spec.integration`](/kube-agents/operator/platformagent-crd/#specintegration) has the detail.
 
 Who is answered is decided by the same `allowedUsers` list, as on Google Chat: a sender must be on the list (or the list must be empty, which allows all), and one who is not is dropped with a notice. A member of another workspace, posting in a channel shared with yours through Slack Connect, is served only when the list names them as `T…:U…` (their workspace ID, a colon, their member ID); an empty list serves no such member. The gateway's `user_id` principal map (the `a2a-slack-principal-map` Secret) is optional: a sender it names is attributed by the identity it maps them to, and any other admitted sender by their Slack member id.
 
@@ -297,7 +297,7 @@ A message sent while the Planning Agent is still answering an earlier one in the
 
 ## Conversations under `spec.mode: next`
 
-Under `spec.mode: next`, the A2A gateway takes chat in place of the Planning Agent's chat platforms. It holds Google Chat and Slack, either or both, in one process. On a backend the gateway holds, nothing above about the Planning Agent's Slack or Google Chat platform applies. The gateway holds no model. It decides which messages are turns, keeps one status line per task, and answers a few fixed commands itself.
+The A2A gateway takes chat in place of the Planning Agent's chat platforms. It holds Google Chat and Slack, either or both, in one process. On a backend the gateway holds, nothing above about the Planning Agent's Slack or Google Chat platform applies. The gateway holds no model. It decides which messages are turns, keeps one status line per task, and answers a few fixed commands itself.
 
 Every other message goes as a task, by default to the `platform` route. The Hermes bridge in the agent's pod runs it as a Planning Agent turn in that conversation's own Hermes session, and the Planning Agent answers it or files board cards as it does under `today`. How the agent then answers the question is in [How a chat question is answered under `next`](#how-a-chat-question-is-answered-under-next); this section covers what you see in the conversation.
 
@@ -525,7 +525,7 @@ Only a member on the [allowed users](#allowed-users-1) list sees the dashboard; 
 
 Under `next`, the gateway keeps a record of the people who write to it, so an install can count them. Each person who writes on Google Chat, Slack or Discord, once the gateway has verified them, has one hashed key and the time of their last turn, within an hour. A person is the identity the gateway attributes the turn to, so a principal map that folds two member IDs into one identity makes them one person. The key is derived for this record alone and matches no other pseudonym the install keeps.
 
-The doors and the A2A console are not people and get no key. A platform the install still serves through Hermes, such as Microsoft Teams, is outside the record, and a `today` install keeps none.
+The doors and the A2A console are not people and get no key. A platform the install still serves through Hermes, such as Microsoft Teams, is outside the record.
 
 The record is the `people` bucket of the install's NATS server, and only the gateway can read or write its records. The setup job can list the bucket's keys, which are the hashes alone. Whoever holds the gateway's attribution salt and a directory of addresses can re-identify a Google Chat sender's key by hashing the directory, as they can the other pseudonyms the gateway stamps on each turn today. The bucket drops each key 30 days after the person's last turn. Nothing is sent anywhere else.
 
@@ -537,7 +537,7 @@ To turn the record off, set `spec.telemetry.peopleSeen: false` in the `PlatformA
 
 ## How a chat question is answered under `next`
 
-Under `spec.mode: next`, a message from Google Chat or Slack reaches the A2A gateway rather than a listener in the agent pod. The Planning Agent still answers it, and still hands cluster work to a specialist as a kanban card. What differs from `today` is how the message reaches the Planning Agent, over the message bus, and how the card's answer gets back to the thread, through the gateway. Setting up the Slack app for the gateway is covered in [Slack app setup](/kube-agents/install/slack-app/).
+A message from Google Chat or Slack reaches the A2A gateway rather than a listener in the agent pod. The Planning Agent still answers it, and still hands cluster work to a specialist as a kanban card. What differs from `today` is how the message reaches the Planning Agent, over the message bus, and how the card's answer gets back to the thread, through the gateway. Setting up the Slack app for the gateway is covered in [Slack app setup](/kube-agents/install/slack-app/).
 
 The commands below assume the default resource names (`platform-agent`) and the `kubeagents-system` namespace. The gateway logs one JSON object per line.
 
@@ -601,7 +601,7 @@ When no card can be built, the report is posted as text, reshaped with a headlin
 - **Google Chat**: to the space that owns the interaction, or the space set via `GOOGLE_CHAT_HOME_CHANNEL`.
 - **Slack**: to `SLACK_HOME_CHANNEL`.
 
-An alert goes to **one** of them, not both: it opens a thread that the triage turn then replies into, and a thread belongs to a single platform. With both integrations enabled the alert goes to Google Chat, falling through to Slack if that send is not accepted. Under `spec.mode: next` the agent picks one platform for the alert, Chat first, among the platforms that have a home channel. With none, the gateway keeps it for the digest on the first platform. A scheduled report has no such constraint and is posted to every enabled interactive platform (Google Chat and Slack; Microsoft Teams is not enumerated by the delivery resolver) — [the relay design](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/cron-report-relay.md) is canonical for both rules.
+An alert goes to **one** of them, not both: it opens a thread that the triage turn then replies into, and a thread belongs to a single platform. The agent picks one platform for the alert, Chat first, among the platforms that have a home channel. With none, the gateway keeps it for the digest on the first platform. A scheduled report has no such constraint and is posted to every enabled interactive platform (Google Chat and Slack; Microsoft Teams is not enumerated by the delivery resolver) — [the relay design](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/cron-report-relay.md) is canonical for both rules.
 
 A governance watchdog's findings live on its ledger issue and the remediation pull requests that link back to it. Its scheduled report on this path is usually one line of counts ending with the ledger link, so the report to read is the issue — see [Proactive autonomy](/kube-agents/overview/proactive-autonomy/) and [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/) for the schedules.
 

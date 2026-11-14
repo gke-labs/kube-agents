@@ -1,6 +1,6 @@
 """Seam: cron relay adapter → session KV relay → chat_delivery_watch, with no home channel.
 
-A `next` install whose gateway holds one platform with no home channel set
+An install whose gateway holds one platform with no home channel set
 anywhere: `A2A_NOTIFY_PLATFORM` empty (no CR home), `A2A_NOTIFY_CONVERSATIONS`
 naming the platform, no projected Slack channel, both Hermes platforms off.
 Every armed route then takes the home posts, so the relay sends the report to

@@ -627,9 +627,9 @@ render `today` with a warning and an applying run is refused until `--mode` name
 `install.env` that assigns none, unless it was that unread guess. The Day-2 menu's Save & Apply
 settles and saves a missing key the same way. `upgrade.sh` and the generator read a file with no
 key, or an empty one, as `today` (`DEFAULT_PLATFORM_AGENT_MODE`, the name released scripts read as
-an existing install's mode), and a full `upgrade.sh` over a file with no key is refused unless
-its reads show no install on `next` (a read that failed shows nothing), rather than apply a
-switch nobody chose. The generator writes `platform_agent_mode` on every run, and the
+an existing install's mode); a full `upgrade.sh` over a file with no key applies, because
+the CRD defaults `spec.mode` to `next` and the webhook rewrites `today`, so the file cannot
+move the install back. The generator writes `platform_agent_mode` on every run, and the
 composition passes the chart nothing for `today`, so the CR carries no mode field. `install.sh`
 takes `--mode` and records it, or the settled mode, on a first install. Over an existing
 `install.env` it is held to the file by the chat flags' rule above: a `--mode` that disagrees
@@ -673,8 +673,8 @@ leaving the claims larger than the CR says. A value that is not a whole number o
 `Ti` above zero and at most `64Ti` stops every front door but `uninstall.sh`, which exports it empty before it
 regenerates.
 
-When `next` hands Slack to the A2A gateway (Slack on, with Google Chat on or off: the operator's
-`a2aSlackArmed`), `install.sh`, the menu's apply and a full upgrade refuse, before their apply,
+When Slack is on, the A2A gateway holds it, with Google Chat on or off (the operator's
+`a2aSlackArmed`), and `install.sh`, the menu's apply and a full upgrade refuse, before their apply,
 three settings the gateway cannot use (`refuse_next_slack_gateway_settings`):
 
 - a `SLACK_ALLOWED_USERS` entry with an `@`, split as the tfvars render the list. The gateway

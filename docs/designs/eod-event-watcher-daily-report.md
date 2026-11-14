@@ -56,15 +56,15 @@ chat relay partial: the report did not reach slack. Delivered — do not re-run 
 
 The home channel is set either by the
 CR — `spec.integration.googleChat.homeChannel`, which the operator renders into the pod as
-`GOOGLE_CHAT_HOME_CHANNEL` — or by running `/sethome` in the channel you want it in. Under
-`spec.mode: next` `/sethome` does not reach the gateway, so for the platforms the gateway serves the CR
-field is the only way. The operator renders the Google Chat field into the gateway as
+`GOOGLE_CHAT_HOME_CHANNEL` — or by running `/sethome` in the channel you want it in. `/sethome`
+does not reach the gateway, so for the platforms the gateway serves the CR field is the only
+way. The operator renders the Google Chat field into the gateway as
 `A2A_GCHAT_HOME_CHANNEL` rather than into the agent, so there the check below reads `<unset>`; read
 `spec.integration.googleChat.homeChannel` on the `PlatformAgent` instead. The operator names every armed platform in
 `A2A_NOTIFY_CONVERSATIONS` and every armed platform with a home channel set on the CR in
 `A2A_NOTIFY_PLATFORM`; the agent adds Slack when the gateway learned a channel, and with no
-home anywhere, every armed platform keeps the posts for its digest. So a
-`next` install whose gateway holds no platform with a home channel sends anyway: the gateway refuses the
+home anywhere, every armed platform keeps the posts for its digest. So an
+install whose gateway holds no platform with a home channel sends anyway: the gateway refuses the
 recap, keeps it, and names it in the digest it posts once a home channel is set; the recorded error
 is the relay's `composed but not delivered to <platform>`, as above. Alerts on such an install are
 sent too, refused and kept, and the recap lists each as not delivered with the keep as the reason

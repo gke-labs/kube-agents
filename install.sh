@@ -7361,8 +7361,9 @@ run_menu_system() {
         PROJECT_NUMBER="$project_number" print_chat_setup_checklists "$menu_mode"
         if [ "$CHAT_SETUP_CHECKLIST_PRINTED" = "true" ]; then
           # Unlike main(), this apply does not wait for a rollout, and the menu
-          # redrawn below would push the checklist off screen. Under next the
-          # A2A gateway answers every enabled platform; under today, the agent.
+          # redrawn below would push the checklist off screen. The A2A gateway
+          # answers every enabled platform (the mode the helpers read is next
+          # after every apply).
           local menu_listeners="" menu_deployment
           if google_chat_moves_to_a2a_gateway "$menu_mode" "$google_chat_enabled" ||
             slack_moves_to_a2a_gateway "$menu_mode" "$slack_enabled"; then
@@ -7918,8 +7919,8 @@ main() {
     # Same shape as allowed_users_hint above: an empty list has to read as a
     # deliberate choice rather than as a missing default.
     [ -z "$slack_allowed_users" ] && slack_allowed_hint="empty list"
-    # Under next the A2A gateway takes Slack, with Google Chat on or off (the
-    # mode was settled at step 2), and it takes one bot token, member IDs and
+    # The A2A gateway takes Slack, with Google Chat on or off, and it takes
+    # one bot token, member IDs and
     # a channel id. Those prompts say so and ask again on an answer the
     # gateway cannot use, rather than let the refusal after this step throw
     # the interview away. A run with nobody
@@ -7947,7 +7948,7 @@ main() {
       can_ask=false
     fi
     while :; do
-      prompt_read "Slack Bot Token (xoxb-..., one workspace: spec.mode next takes a single token)" \
+      prompt_read "Slack Bot Token (xoxb-..., one workspace: the A2A gateway takes a single token)" \
         slack_bot_token "$slack_bot_token" true "$bot_hint"
       bad="$(slack_bot_token_list_count "$slack_bot_token")"
       if [ -z "$bad" ] && slack_bot_token_has_separator "$slack_bot_token"; then bad=stray; fi
