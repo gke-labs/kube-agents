@@ -110,6 +110,15 @@
             }
           }
         },
+        "profileDispatcher": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          }
+        },
         "slackTestUsers": {
           "type": "array",
           "items": { "type": "string", "pattern": "^[A-Z0-9]+$" }

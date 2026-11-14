@@ -26,13 +26,18 @@ type conditionDoc struct {
 }
 
 // degradedConditionReasons are the reasons the Degraded condition carries,
-// for its row. Listed by constant, so a renamed reason fails to compile; a
+// for its row, in the order updateStatusReady ranks them. A parked pass reads
+// the ones ahead of A2ABusStreamsMissing as ranked above it
+// (degradedRanksAboveBusStreams), so a new reason goes where the chain puts
+// it. Listed by constant, so a renamed reason fails to compile; a
 // new reason has to be added here by hand (the writer passes it as a value,
 // which the completeness test cannot follow).
 var degradedConditionReasons = []string{
 	conditionReasonInvalidGitRepoURL,
 	conditionReasonCorruptManagedRepos,
 	conditionReasonMinterPruningHeld,
+	conditionReasonA2ABusStreamsMissing,
+	conditionReasonA2AGatewayWaitingForTasks,
 	conditionReasonInvalidCredentialProxyResources,
 	conditionReasonInvalidAgentAPIAuthResources,
 	conditionReasonInvalidShellSandboxResources,
@@ -45,7 +50,7 @@ var platformAgentConditionDocs = []conditionDoc{
 	{
 		Type:    readyConditionType,
 		Written: "Always",
-		Meaning: "Tracks `phase`; its `reason` and `message` carry whatever the reconcile is waiting on, including the reasons that park `phase: Degraded` (`RuntimeClassNotFound`, `ShellSandboxCannotBeDisabled`, `ForbiddenVolumeMount`, `EgressAllowlistRefused`, `ModeNotRecognized`, `ShellSandboxKeysMissing`, and under `mode: next` `A2AProvisionFailed`). [What `Ready` reports](#what-ready-reports) says what the last three mean and how a failed provisioning Job is cleared. Under `spec.deployment.scaleToZero: true` it reads `False` with reason `ScaledToZero` beside `phase: Paused` once the gateway has no ready replica; the same section says when.",
+		Meaning: "Tracks `phase`; its `reason` and `message` carry whatever the reconcile is waiting on, including the reasons that park `phase: Degraded` (`RuntimeClassNotFound`, `ShellSandboxCannotBeDisabled`, `ForbiddenVolumeMount`, `EgressAllowlistRefused`, `ModeNotRecognized`, `ShellSandboxKeysMissing`, and under `mode: next` `A2AProvisionFailed`). [What `Ready` reports](#what-ready-reports) says what the last three mean and how a failed provisioning Job is cleared. Under `spec.deployment.scaleToZero: true` it reads `False` with reason `ScaledToZero` beside `phase: Paused` once the gateway has no ready replica; the same section says when. Under `mode: next` with the A2A gateway's election on, the gateway counts as ready only while its elected leader is, after a 30-second grace from the leader's election; with no current leader (no holder, its pod gone, or a holder that stopped renewing) it counts its ready replicas.",
 	},
 	{
 		Type:    degradedConditionType,
@@ -60,8 +65,13 @@ var platformAgentConditionDocs = []conditionDoc{
 	},
 	{
 		Type:    dispatcherJobModeCondition,
-		Written: "Under `mode: next`, while the operator runs the profile dispatcher (`A2A_DISPATCHER_IMAGE`) with the chart's `A2A_DISPATCHER_JOB_POLICY` signal set, from the first pass that reaches the dispatcher",
+		Written: "Under `mode: next`, while the operator runs the profile dispatcher (on by default; `operator.profileDispatcher.enabled`) with the chart's `A2A_DISPATCHER_JOB_POLICY` signal set, from the first pass that reaches the dispatcher",
 		Meaning: "Whether the dispatcher runs unattended profile tasks as Jobs. `Reason: InPlace` (`True`), `PolicyMissing`, `NamespaceNotSelected`, `NamespaceNotReady`, `ForeignJobTemplate`, or `GrantFailed`; [What `DispatcherJobMode` reports](#what-dispatcherjobmode-reports) has each.",
+	},
+	{
+		Type:    dispatcherCeilingCondition,
+		Written: "Under `mode: next`, while the profile dispatcher is switched on",
+		Meaning: "How the dispatcher's identity-map entry and its config compare with what one shard and one ConfigMap can hold. `WithinBudget` (`True`); `NearBudget` (`True`), past four fifths of either, with a Warning event; `ProfilesRefused` (`False`), with a Warning event: the newest profiles aren't bound and the dispatcher serves the rest; `OverBudget` (`False`), with a Warning event, only from draining profiles: no dispatcher until their drains run out. About 200 profiles that allow `unattended` under Job mode, about 650 at two tiers otherwise.",
 	},
 	{
 		Type:    a2aIdentityMapAppliedConditionType,
@@ -84,9 +94,19 @@ var platformAgentConditionDocs = []conditionDoc{
 		Meaning: "`status: True`, `Reason: ProvisionJobComplete`. The record that lets `Ready` stop counting the Job: the finished Job is removed by its 24 h TTL and rendered again, and a spec edit renders a new one under a new digest, and neither re-run should flip a Ready install to `Provisioning` for the minute it takes. Until this condition exists the Job counts, so an install upgraded from an operator that never counted the Job (one that could read `Ready` over an unprovisioned bus) does not inherit a completion nobody saw. The message names the Job that first provisioned the bus. A re-run that fails is still reported as `A2AProvisionFailed`.",
 	},
 	{
+		Type:    busStreamsPresentConditionType,
+		Written: "Under `mode: next`, once `BusProvisioned` is True",
+		Meaning: "Whether the streams and KV buckets the provisioning Job creates are still on the bus, read every five minutes from the bus's metrics exporter on port 7777. `True`, `AllPresent`: every one was seen. `False`, `StreamsMissing`: three polls in a row found the ones the message names missing, and the operator deletes the completed provisioning Job so it runs again and recreates them (`Reprovisioning` while it runs); when the re-run recreated `TASKS`, an `A2ABusTasksRecreated` Warning and a note on this condition say to restart the A2A gateway and the agent pod, whose `TASKS` consumers don't come back on their own; the operator doesn't restart them. Re-runs are at most one per 15 minutes and three per 6 hours, recorded in the `kubeagents.x-k8s.io/a2a-bus-reprovision` annotation. A re-run that completed without bringing them back stops the re-runs for those names (`ReprovisionDidNotRestore`) until they are back or the annotation is removed; a later loss after a restore is re-run as usual. A failed Job is not re-run. While `False`, `Degraded` reads `A2ABusStreamsMissing`. `Unknown`, `DetectionUnavailable`: the bus runs without its exporter ([`A2A_NATS_EXPORTER_IMAGE`](/kube-agents/deploy/docker-images/)). `Unknown`, `ExporterUnreachable`: three polls in a row had no usable answer. No verdict is taken while the bus rolls, converts or provisions, and the condition keeps its last one meanwhile, however long that lasts; the bus's own conditions report the rollout.",
+	},
+	{
 		Type:    a2aVerifierConditionType,
 		Written: "Under `mode: next`, while the capability verifier's Deployment exists and has no ready replica. A pass that cannot read the Deployment leaves it as it stands",
 		Meaning: "`status: False`, `Reason: VerifierNotReady`. A capability check that gets no answer is refused, so every submission is refused terminally while this holds. The CR stays `Ready`: the verifier is on the request path, not the readiness path. Check the `<agent>-a2a-verifier` Deployment's pods and their logs, including the previous container's: a verifier that cannot bind its capability bucket exits, and its log says why. Removed once a replica is ready.",
+	},
+	{
+		Type:    a2aBusMetaConditionType,
+		Written: "Under `mode: next` on a multi-server bus, on a pass that checks the JetStream meta group before creating the provision Job: present while the group isn't formed, a server isn't running, or a server's view can't be read, and removed on the pass that sees it formed. Also removed on any pass where the provision Job already exists, on a one-server bus, on a pass where another hold (the callout, or the bus rolling out) keeps the check from running, and when the mode flips to `today`",
+		Meaning: "`status: False`. `Reason: ServerOutsideMetaGroup` names the server or servers that don't report the meta leader a quorum agrees on, or that the leader doesn't list as current. The provision Job waits, so no stream is created, and the CR isn't `Ready`. A server still outside 3 minutes later is restarted once, with an `A2ABusServerRestarted` Warning, when it is the only one outside, the rest are a quorum, the bus hasn't been provisioned yet with no server holding a stream or consumer, and its own meta node has started. A server already restarted once and still outside is named as left for a person: delete its pod, or wipe the bus. `Reason: ServerNotRunning` names a server whose pod is absent, being deleted, or not Running while the others run, such as the one just restarted: the Job waits for it, and nothing is restarted on that account. `Reason: MetaGroupUnknown` names a running server whose view couldn't be read, or says no server is running; nothing is held or restarted on its account. The check also runs when the Job is re-created on a running bus, where it can hold the re-run and set this condition; it never restarts anything on a bus that has been provisioned, so it doesn't repair a server that drops out of a running bus.",
 	},
 	{
 		Type:    gatewayElectedConditionType,
@@ -105,8 +125,8 @@ var platformAgentConditionDocs = []conditionDoc{
 	},
 	{
 		Type:    kanbanDispatcherFailingCondition,
-		Written: "From the first time the task-board dispatcher fails for a whole poll",
-		Meaning: "`True` (`TicksFailing`) once a board's dispatcher fails 60 ticks in a row (about one five-minute poll), or 3 in a streak at least a poll old, as on a locked board. A fully locked board fails only every 20 to 36 minutes, so there it turns `True` after about an hour. The message names the board, the streak and the last error class. Cards on that board are not dispatched; a full data volume is a common cause. `False` (`Ticking`) at the first poll where no board meets either rule. A good tick resets a streak; a board the dispatcher stops trying drops out after ten minutes. It does not change `phase` or `Ready`. A poll that cannot read the gateway's chat metrics listener leaves it as it is. A board quarantined as corrupt is not counted.",
+		Written: "From the first time the task-board dispatcher fails for a whole poll, or a tick on a board runs past 300 s or fails on a database lock after a busy timeout",
+		Meaning: "`True` (`TicksFailing`) once a board's dispatcher fails 60 ticks in a row (about one five-minute poll), or 3 in a streak at least a poll old, or once a board's tick runs past 300 s or fails on a database lock after waiting a 120 s busy timeout, as on a locked board; a good tick that runs past 300 s can set it for one poll. The message names the board and either the streak with the last error class, or the stuck tick. Cards on that board are not dispatched; a full data volume is a common cause. `False` (`Ticking`) at the first poll where no board meets any rule. A good tick resets a streak and a stuck board; a board the dispatcher stops trying drops out after ten minutes. It does not change `phase` or `Ready`. A poll that cannot read the gateway's chat metrics listener leaves it as it is. A board quarantined as corrupt is not counted.",
 	},
 	{
 		Type:    scopeUndeclaredCondition,

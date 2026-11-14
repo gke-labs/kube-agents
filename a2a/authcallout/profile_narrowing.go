@@ -2,6 +2,7 @@ package authcallout
 
 import (
 	"fmt"
+	"github.com/gke-labs/kube-agents/a2a/capability"
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 	"github.com/gke-labs/kube-agents/a2a/taskcred"
@@ -76,11 +77,9 @@ type TopicGrants struct {
 // to the one subject.
 var topicStreams = []string{lib.StreamTopicsState, lib.StreamTopicsJournal}
 
-// profileTiers are the tiers a profile entry may name, the AgentProfile
-// CRD's allowedTiers values. Duplicated here because the modules cannot
-// import each other, and kept equal by hand: the rendered fixture the
-// contract test reads carries only read.
-var profileTiers = map[string]bool{"read": true, "unattended": true}
+// A profile entry may name any profile tier in capability's table: the
+// built-in read and unattended, and any the install defines with a Tier
+// resource, loaded from the tiers file (capability.LoadTierFile, #3659).
 
 // topicPrefix is how a profile's topic grant becomes a subject.
 const topicPrefix = "a2a.topics."
@@ -211,7 +210,7 @@ func validateProfileEntry(id Identity) error {
 	if !lib.ValidSubjectToken(id.Profile) {
 		return fmt.Errorf("user %q narrows on %q but names profile %q, which is not a dot-free DNS-1123 label", id.User, id.Narrowing, id.Profile)
 	}
-	if id.Tier != "" && !profileTiers[id.Tier] {
+	if id.Tier != "" && !capability.IsProfileTier(capability.Tier(id.Tier)) {
 		return fmt.Errorf("user %q narrows on %q but names tier %q, which is not one of the profile tiers", id.User, id.Narrowing, id.Tier)
 	}
 	if id.Topics == nil {

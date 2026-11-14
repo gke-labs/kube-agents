@@ -18,6 +18,7 @@ import (
 // in the thread it was typed in, before the text becomes a turn: no task
 // starts, a running task is neither steered nor stopped.
 func TestSetHomeNoticeAnswersATypedSethomeOnSlack(t *testing.T) {
+	t.Parallel()
 	d := startSlackDMRig(t)
 	// Not armed: the field decides.
 	d.adapter.events <- slackMsg("im", "D1", "U1", "/sethome", "100.1", "")
@@ -48,6 +49,7 @@ func TestSetHomeNoticeAnswersATypedSethomeOnSlack(t *testing.T) {
 // nothing and gets the notice; a member the list does not admit gets no
 // notice and starts no task.
 func TestSetHomeNoticeLearnsNoHomeAndAdmitsByTheList(t *testing.T) {
+	t.Parallel()
 	d := startSlackDMRig(t)
 	dir := t.TempDir()
 	cm := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: homeTestRecord, Namespace: homeTestNamespace}}
@@ -108,6 +110,7 @@ func TestSetHomeNoticeLeavesAnOpenQuestionOpen(t *testing.T) {
 // default, a users.info that fails changes nothing: admission is the
 // gateway's own rule on the author, so the notice posts and no task starts.
 func TestSetHomeNoticeNeedsNoUserLookup(t *testing.T) {
+	t.Parallel()
 	d := startSlackDMRigWith(t, nil, func(c *Config) {
 		c.SlackAllowedUsers = nil
 		c.SlackAllowAllUsers = true

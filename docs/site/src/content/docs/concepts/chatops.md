@@ -263,7 +263,7 @@ In a thread, the Planning Agent posts nothing after carrying your answer to the 
 
 With `KAGE_SLACK_UX` on, the alert for a crash-looping workload reads as one line on Slack, such as "🚨 **payments-api in prod-east keeps crashing.** Looking now."; alerts for other reasons, and alerts on other platforms, read as before. An incident's triage edits its alert in place instead of replying under it. The alert becomes a one-line headline, then a button per proposed option showing its title, with the recommended one highlighted and marked "(recommended)", and a button for each console link on the report's 🔗 line. The report, up to its first horizontal rule, is folded underneath.
 
-A drift alert's triage adds a line under the headline saying what changed, who changed it and when, and marks the recommended button by its highlight alone.
+A drift alert's triage adds a line under the headline saying what changed, who changed it and when, and marks the recommended button by its highlight alone. Its usual buttons are **Put Git's version back** and **Keep it · update Git**, each of which opens a pull request, and its fold is titled **diff**, since the report opens on the changed field's value before and after.
 
 Clicking an option answers as if you had replied in the thread yourself with `apply Option B: <its title>`, or `apply: <its title>` when there is a single fix. The agent replaces the option buttons with a line such as "✓ <your name>: <its title>", your Slack name in plain text (or, if Slack refuses that edit, posts that line in the thread). Your reply passes the same user and channel checks a typed reply does. A click never needs an @-mention.
 
@@ -360,6 +360,8 @@ A task that fails posts `❌ failed — <why>`, in plain words, or `❌ failed: 
 On Google Chat, the agent's answer is one formatted text message. Its first sentence is bold, the rest is detail or an open "why" section with any table as a monospace block, and a next step or its options are buttons under it. The final answer to each ask, and each alert or report the agent posts on its own, ends with 👍 and 👎 buttons after any others ([Answer feedback](#answer-feedback)).
 
 A card's progress draws one plan message edited in place. A card's report, the needs-you question, the pull-request message, the fleet-audit card, the first-run report and the stuck-task report lay out the same way as on Slack. The stuck-task report's [Retry and Drop](#stuck-task-report-buttons) are numbered. Google Chat draws no reactions on your message, since the app's credential cannot add one.
+
+A first sentence longer than 150 characters is cut at a clause, as on Slack, or at a word when no clause fits. The bold line then ends in "…" and the detail opens on one, so no word of it is lost. The same cut holds on Slack under `next`.
 
 A link button opens its link. A choice button is your reply: clicking it sends the button's answer as your message in the conversation, checked against the allowed-users list like a typed one. A click from someone the gateway would not answer changes nothing. The question then loses its choice buttons and shows `✓ <your name>: <the button>`, by your Chat display name (or "Someone" when Chat gives none), never an @-mention.
 

@@ -79,11 +79,12 @@ images and downloading dependencies.
 The two scripts handle the unset case differently. `dev_rebuild_agent.sh` takes the default pool's
 default machine (2 vCPUs), while `hack/ci-deploy.sh` requests `e2-highcpu-8` because it compiles the
 first-party images (platform, credential-proxy, sandbox, operator, on a pull request's path the
-two AgentPlugin images, and under `EVAL_MODE_NEXT=1` the A2A images and the Hermes bridge) in a
-single Cloud Build
+two AgentPlugin images and the web console, and under `EVAL_MODE_NEXT=1` the A2A images and the
+Hermes bridge) in a single Cloud Build
 submission ([`deploy/docker/cloudbuild-ci.yaml`](../deploy/docker/cloudbuild-ci.yaml)), with the
-sandbox, operator and AgentPlugin builds running in parallel alongside the platform-agent and
-credential-proxy builds. Because private worker pools define their own fixed machine types and
+sandbox, operator, AgentPlugin and web console builds running in parallel alongside the
+platform-agent and credential-proxy builds (the web console waits for the A2A step, which exits at
+once on a today lane). Because private worker pools define their own fixed machine types and
 reject
 `--machine-type`, `hack/ci-deploy.sh` only passes `--machine-type` when `CLOUD_BUILD_WORKER_POOL`
 is unset.
@@ -232,9 +233,11 @@ Deploy the operator deployment, RBAC permissions, and CRDs into the cluster:
 make deploy IMG=$IMG
 ```
 
-The refused tags and the `ALLOW_MUTABLE_IMG=1` override are on the
+`make deploy` applies `config/default` and then `config/profiles`: the profile namespace
+(`kubeagents-system-profiles`) with the operator's namespaced Role and its RoleBinding in it. The
+refused tags and the `ALLOW_MUTABLE_IMG=1` override are on the
 [operator page](../docs/site/src/content/docs/operator/index.md#an-image-ahead-of-its-clusterrole).
-`make undeploy` removes the deployment.
+`make undeploy` removes the deployment and the profile namespace.
 
 ### Step 3: Verify the Deployment
 
@@ -267,7 +270,7 @@ Run the `make deploy-litellm` target, passing the required environment variables
 ```bash
 # 1. Define model provider and default model name:
 export MODEL_PROVIDER=gemini
-export MODEL_DEFAULT_NAME=gemini-3.5-flash
+export MODEL_DEFAULT_NAME=gemini-3.8-flash
 
 # 2. Deploy LiteLLM:
 make deploy-litellm
@@ -355,13 +358,15 @@ When modifying or deprecating RBAC roles or rolebindings in the operator:
 3. **Sync controller RBAC annotations:** make sure the `// +kubebuilder:rbac` markers on the
    reconciler include every permission the operator itself needs to grant or clean up, then run
    `make manifests` to regenerate `config/rbac/role.yaml`. A marker that carries `namespace=`
-   renders as the Role document in that file (bound by `namespaced_role_binding.yaml`) rather
-   than into the ClusterRole; the Secret write verbs are the one such marker, and
-   `tests/test_operator_secrets_grant.py` refuses them anywhere else. Add the verbs to
-   `requiredPermissions` in `rbac_selfcheck.go` too, with `Namespaced: true` for a namespaced
-   marker, then `make chart-sync` to copy both documents into the chart. Which other write verbs
-   can leave the ClusterRole for a namespaced grant, and in what object, is
-   [`docs/designs/operator-namespaced-write-verbs.md`](../docs/designs/operator-namespaced-write-verbs.md).
+   renders as the Role document in that file (bound by `namespaced_role_binding.yaml` in the
+   install namespace and by `config/profiles` in the profile namespace) rather than into the
+   ClusterRole. Every write verb on a namespaced kind the operator renders is such a marker; the
+   reads stay cluster-scoped for the informers and for escalation prevention, and
+   `tests/test_operator_secrets_grant.py` refuses a write verb on those kinds anywhere else
+   ([`docs/designs/operator-namespaced-write-verbs.md`](../docs/designs/operator-namespaced-write-verbs.md)
+   is the inventory). Add the verbs to `requiredPermissions` in `rbac_selfcheck.go` too, with
+   `Namespaced: true` for a namespaced marker, then `make chart-sync` to copy both documents
+   into the chart and the Role document into `config/profiles/role.yaml`.
 
 ---
 

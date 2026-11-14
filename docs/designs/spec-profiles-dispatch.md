@@ -361,7 +361,9 @@ leave open:
   mints for the pod that accepted, before the lease record is written (contract addendum 8, #3889).
   `taskCredential` (audience `nats`) is the password of the worker's task connection.
   `proxyToken` (audience `credential-proxy`) carries the cluster the verifier checked at
-  admission, and a task that names no cluster gets none. Both name the task, its profile and
+  admission, and a task that names no cluster gets none. When an unattended trigger submitted the
+  task, `proxyToken` also carries that `trigger` (`{name, origin, stream}`), which the verifier
+  found equal to the grant's at admission (added 11/11, #4685). Both name the task, its profile and
   tier, the pod, and the pod's UID as the pool saw it at the offer. Both expire at the
   offer's deadline plus the callout's 30s clock skew, and never later than
   `A2A_TASK_CREDENTIAL_MAX_LIFETIME` (6h by default) from the mint. An offer or an abandon
@@ -406,7 +408,8 @@ leave open:
   fails it, which covers the gap `Recreate` leaves. The record carries the deadline and
   intervals its offer did, so a re-adopted task keeps them whatever the config says now.
 - **Grants.** The callout fixes a connection's grants when it connects, and the dispatcher's
-  name each durable and each profile's `.supervisor`. When the config adds a durable or a profile
+  name each durable and each profile's `.supervisor` (with bucketed grants, on its bucket
+  connections). When the config adds a durable or a profile
   the dispatcher reconnects, retrying with backoff while the callout's map catches up. Tasks
   it holds keep running across the reconnect, which drains the old connection so answers it
   had already received still arrive. The NATS spec's `PROFILE_SUBMITS` and callout
@@ -427,7 +430,26 @@ leave open:
   stream when the dispatcher restarts mid-drain has no durable to come back on.
 - **Off by default.** The operator renders the dispatcher only when its `A2A_DISPATCHER_IMAGE`
   is set, until profiles dispatch end to end; with it unset there is no dispatcher and no
-  identity for one.
+  identity for one. Amended 11/10: on by default, at the release set's image (with
+  `A2A_DISPATCHER_IMAGE` the override), and off only at `A2A_PROFILE_DISPATCHER=false`, which
+  the chart sets from `operator.profileDispatcher.enabled`. Its identity-map entry grows with
+  the profile count, and one entry can't be split across shards, so it fills one shard near 650
+  profiles at two tiers. The dispatch config, one ConfigMap, has its own limit: under Job mode
+  each profile that allows `unattended` carries its Job template there, which fills the
+  ConfigMap near 200 such profiles (#5479). The operator binds profiles oldest first (creation
+  time, then name) while both fit, less a reserve for draining profiles, and refuses newer ones with
+  `IdentityReady` reason `DispatcherCeiling`; the dispatcher serves the rest. The PlatformAgent's
+  `DispatcherCeiling` condition warns at four fifths of either budget and reads
+  `ProfilesRefused` while any profile is left out. Past either budget anyway, which only draining
+  profiles can cause, the operator runs no dispatcher rather than write a map or a ConfigMap the
+  API server refuses. It rewrites the dispatch config with the draining profiles alone and each
+  drain's deadline, so the dispatcher comes back once those drains run out. Adding a tier to an older profile can leave the newest one out. #5381 lifts the
+  ceiling, by deriving the grants per connection as sessions are, and blocks the 2,500-profile
+  target.
+  `A2A_DISPATCHER_BUCKETED_GRANTS` (off by default) moves the dispatcher's per-profile grants
+  out of the identity map and onto per-bucket connections the callout derives
+  (spec-nats-deployment.md); a dispatcher that doesn't open them loses every profile grant, so
+  it stays off until the dispatcher opens its bucket connections (#5381). With it on, the dispatcher's entry is a fixed size whatever the profile count, so the ceiling above measures that entry and cuts on the dispatch config's budget alone.
 - **Terminal notice.** A task the dispatcher ends gets a final status on its `.supervisor`
   subject (`lib.TaskSupervisorSubject`, contract addendum 6), never its `.events`, which stays
   the executor's alone: `rejected` when it is refused at admission (nothing ran), `failed`
@@ -556,7 +578,8 @@ The build PRs amend these; this list is what they must cover.
   by the install-wide profile ceiling: while both exist, the ceiling defaults to
   `maxInProgress`'s value so an install's footprint doesn't jump, and `maxInProgress` is
   deprecated once `platform` is off kanban.
-- **Callout narrowing** (`profile_narrowing.go`) and the CRD's identity rendering: one
+- **Callout narrowing** (`profile_narrowing.go`; the dispatcher's bucket connections in
+  `dispatcher_narrowing.go` and `a2a/lib/dispatchgrants.go`) and the CRD's identity rendering: one
   ServiceAccount and identity-map entry per (profile, tier); workers get no fetch grant on the
   shared durables and no verifier grant; the dispatcher gets both.
 

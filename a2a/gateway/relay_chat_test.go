@@ -105,6 +105,7 @@ const testReportText = "3 of 12 clusters are behind\n- prod-eu is on 1.30"
 // lays chat messages out as one message value, its text beside it, and is
 // counted rendered; the text is not posted again in chunks.
 func TestChatResultIsLaidOutByABackendThatRendersIt(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	origin := startChatTask(t, r, "discord:g1/chat-result", true)
 	publishArtifactUpdate(t, r, origin, lib.ArtifactResult, []lib.Part{{Kind: "text", Text: testReportText}, chatPart(t, testReport)}, false, true)
@@ -131,6 +132,7 @@ func TestChatResultIsLaidOutByABackendThatRendersIt(t *testing.T) {
 // Every backend but Slack answers ErrTextOnly, and the relay posts the text:
 // the same post a result with no chat message makes.
 func TestChatResultOnATextOnlyBackendPostsItsText(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	origin := startChatTask(t, r, "discord:g1/chat-text", false)
 	publishArtifactUpdate(t, r, origin, lib.ArtifactResult, []lib.Part{{Kind: "text", Text: testReportText}, chatPart(t, testReport)}, false, true)
@@ -147,6 +149,7 @@ func TestChatResultOnATextOnlyBackendPostsItsText(t *testing.T) {
 // A chat message that breaks a rule is dropped whole, counted invalid, and
 // its text posted; the backend is never handed it.
 func TestInvalidChatMessagePostsItsFallback(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	origin := startChatTask(t, r, "discord:g1/chat-invalid", true)
 	bad := testReport
@@ -165,6 +168,7 @@ func TestInvalidChatMessagePostsItsFallback(t *testing.T) {
 // A chat message the backend refuses (Slack's invalid_blocks, a message too
 // large for it) is retried once as its text.
 func TestRefusedChatMessageIsRetriedAsText(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	r.adapter.mu.Lock()
 	r.adapter.refuseChat = true
@@ -181,6 +185,7 @@ func TestRefusedChatMessageIsRetriedAsText(t *testing.T) {
 // A chat message on a result chunk that is not the last breaks assertion 27
 // and drops; the folded text posts.
 func TestChatMessageOnAnEarlierResultChunkDrops(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	origin := startChatTask(t, r, "discord:g1/chat-chunk", true)
 	publishArtifactUpdate(t, r, origin, lib.ArtifactResult, []lib.Part{{Kind: "text", Text: "3 of 12 "}, chatPart(t, testReport)}, false, false)
@@ -194,6 +199,7 @@ func TestChatMessageOnAnEarlierResultChunkDrops(t *testing.T) {
 
 // A finished turn's answer carries its chat message like a result does.
 func TestChatTurnAnswerIsLaidOut(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	origin := startChatTask(t, r, "discord:g1/chat-turn", true)
 	publishArtifactUpdate(t, r, origin, lib.ArtifactTurn, []lib.Part{{Kind: "text", Text: testReportText}, chatPart(t, testReport)}, false, true)
@@ -202,6 +208,7 @@ func TestChatTurnAnswerIsLaidOut(t *testing.T) {
 
 // A notice posts once, laid out, beside the live message.
 func TestChatNoticePostsOnce(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	origin := startChatTask(t, r, "discord:g1/chat-notice", true)
 	pr := chatmsg.Message{Schema: chatmsg.Schema, Headline: "I opened PR #12 in o/r", Tone: chatmsg.ToneSuccess,
@@ -216,6 +223,7 @@ func TestChatNoticePostsOnce(t *testing.T) {
 // A notice on a text-only backend posts its text, where a gateway before
 // chat messages dropped the artifact.
 func TestTextNoticePostsOnATextOnlyBackend(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	origin := startChatTask(t, r, "discord:g1/text-notice", false)
 	publishArtifactUpdate(t, r, origin, lib.ArtifactNotice, []lib.Part{{Kind: "text", Text: "I opened PR #12 in o/r"}}, false, true)
@@ -225,6 +233,7 @@ func TestTextNoticePostsOnATextOnlyBackend(t *testing.T) {
 // An input-required question carries its choices to the backend, with the
 // question line the relay always posted as its text.
 func TestChatQuestionCarriesItsChoices(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	origin := startChatTask(t, r, "discord:g1/chat-question", true)
 	q := chatmsg.Message{Schema: chatmsg.Schema, Headline: "Which cluster first?",
@@ -246,6 +255,7 @@ var testPlan = chatmsg.Message{Schema: chatmsg.Schema, Plan: &chatmsg.Plan{Title
 // line, and the terminal edit keeps the layout with the terminal line as its
 // text. A progress artifact without one returns the line to text.
 func TestChatProgressLaysOutTheLiveMessage(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	origin := startChatTask(t, r, "discord:g1/chat-progress", true)
 	publishArtifactUpdate(t, r, origin, lib.ArtifactProgress, []lib.Part{{Kind: "text", Text: "reading versions"}, chatPart(t, testPlan)}, false, false)
@@ -274,6 +284,7 @@ func TestChatProgressLaysOutTheLiveMessage(t *testing.T) {
 // On a text-only backend a progress chat message changes nothing: the line
 // is the text edit it always was.
 func TestChatProgressOnATextOnlyBackendEditsText(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	origin := startChatTask(t, r, "discord:g1/text-progress", false)
 	publishArtifactUpdate(t, r, origin, lib.ArtifactProgress, []lib.Part{{Kind: "text", Text: "reading versions"}, chatPart(t, testPlan)}, false, false)
@@ -290,6 +301,7 @@ func TestChatProgressOnATextOnlyBackendEditsText(t *testing.T) {
 // On a text-only backend a progress chat message that changes while the
 // line's text does not costs no edit: the backend shows the text alone.
 func TestChatProgressChangeAloneEditsNothingOnATextOnlyBackend(t *testing.T) {
+	t.Parallel()
 	r := startRigWith(t, func(c *Config) { c.DisplayMode = displayModeDefault })
 	origin := startChatTask(t, r, "discord:g1/text-plan-change", false)
 	waitFor(t, "the working line", func() bool {
@@ -313,6 +325,7 @@ func TestChatProgressChangeAloneEditsNothingOnATextOnlyBackend(t *testing.T) {
 // A chat message that carries only a mark lays nothing out: the line stays
 // the text edit, and nothing is counted rendered.
 func TestMarkOnlyProgressLaysNothingOut(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	origin := startChatTask(t, r, "discord:g1/mark-only-progress", true)
 	markOnly := chatmsg.Message{Schema: chatmsg.Schema, Mark: &chatmsg.Mark{Ask: "investigate"}}
@@ -329,6 +342,7 @@ func TestMarkOnlyProgressLaysNothingOut(t *testing.T) {
 // A laid-out line whose next chat message the backend refuses is replaced by
 // its text, the layout cleared (EditMessage with no chat message).
 func TestChatProgressRefusedAfterLayoutClearsIt(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	origin := startChatTask(t, r, "discord:g1/chat-progress-refused", true)
 	publishArtifactUpdate(t, r, origin, lib.ArtifactProgress, []lib.Part{{Kind: "text", Text: "a"}, chatPart(t, testPlan)}, false, false)
@@ -350,6 +364,7 @@ func TestChatProgressRefusedAfterLayoutClearsIt(t *testing.T) {
 // posts nothing of its own, and is kept on the chain's root entry, so the
 // ask stays marked past the turn's end (card work still open).
 func TestTerminalMarkIsDrawnOnTheAsk(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	conv := "discord:g1/chat-mark"
 	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "d-1", Text: "upgrade prod"}
@@ -380,10 +395,12 @@ func TestTerminalMarkIsDrawnOnTheAsk(t *testing.T) {
 // the wake, so a failed child leaves no ❌ over a wake that then answers, and
 // the ask's reaction stays on until the wake's answer.
 func TestAChildsEndLeavesTheMarkToTheWake(t *testing.T) {
+	t.Parallel()
 	r, spawn := startRigWithSpawner(t)
 	ctx := context.Background()
 	conv := "discord:g1/t-wake-mark"
-	exec, origin, _ := sessionTurnVia(t, r, spawn, conv, "", "how is the fleet?")
+	// Worded as a fleet ask, so the arrival draw and the executor's mark agree.
+	exec, origin, _ := sessionTurnVia(t, r, spawn, conv, "", "how are all my clusters?")
 	ask := conv + "-0"
 	mark := chatPart(t, chatmsg.Message{Schema: chatmsg.Schema, Headline: "looking", Mark: &chatmsg.Mark{Ask: "fleet"}})
 	if err := exec.PublishArtifact(ctx, lib.Artifact{ArtifactID: "artifact-p", Name: lib.ArtifactProgress,
@@ -421,6 +438,7 @@ func TestAChildsEndLeavesTheMarkToTheWake(t *testing.T) {
 // the ask whose question it answered: a click is no message, and an answer
 // continues that ask's work, so the card's settle must land on the ask.
 func TestAClickChainMarksThePreviousAsk(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		msg  InboundMessage
@@ -435,7 +453,7 @@ func TestAClickChainMarksThePreviousAsk(t *testing.T) {
 func testAnswerChainMarksThePreviousAsk(t *testing.T, answer InboundMessage) {
 	r := startRig(t)
 	conv := "discord:g1/click-chain"
-	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "d-5", Text: "which cluster first?"}
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "d-5", Text: "where do I start?"}
 	origin := r.awaitTask(t, "platform")
 	question, err := chatmsg.MarkPart(chatmsg.Mark{Ask: "question", Settle: "blocked"})
 	if err != nil {
@@ -463,14 +481,15 @@ func testAnswerChainMarksThePreviousAsk(t *testing.T, answer InboundMessage) {
 // task has ended, and is written to the record; while the chain runs it is
 // dropped.
 func TestConversationNotifyMarkWaitsForTheChainToEnd(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	conv := "discord:g1/notify-mark"
-	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "d-3", Text: "restart the fleet"}
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "d-3", Text: "how are all my clusters doing?"}
 	origin := r.awaitTask(t, "platform")
 	marker := r.g.Conversations(r.adapter).(notifyMarker)
 	marker.MarkConversation(conv, "plan-1", MarkState{Ask: "fleet", Settle: "blocked"})
-	if got := r.adapter.reactionCalls(); len(got) != 0 {
-		t.Fatalf("a notify mark drew while the chain ran: %v", got)
+	if got := r.adapter.reactionCalls(); fmt.Sprint(got) != fmt.Sprint([]string{conv + " +fleet@d-3"}) {
+		t.Fatalf("reactions while the chain ran = %v, want the arrival's alone: a notify mark must not draw", got)
 	}
 	mark, err := chatmsg.MarkPart(chatmsg.Mark{Ask: "fleet"})
 	if err != nil {
@@ -504,21 +523,25 @@ func TestConversationNotifyMarkWaitsForTheChainToEnd(t *testing.T) {
 // with none takes the ask off once the answer is posted, and a failed one
 // leaves ❌ and lifts ⏸️.
 func TestTerminalWithoutAMarkSettlesTheAsk(t *testing.T) {
+	t.Parallel()
+	// Each ask is worded to the kind its progress marks, so the arrival draw
+	// (askkind.Kind) is the mark's first token and the progress adds the rest.
 	cases := []struct {
 		name  string
+		ask   string
 		mark  chatmsg.Mark
 		state lib.TaskState
 		want  []string
 	}{
-		{"answered", chatmsg.Mark{Ask: "question"}, lib.StateCompleted, []string{"+question", "-question"}},
-		{"failed while blocked", chatmsg.Mark{Ask: "fleet", Settle: "blocked"}, lib.StateFailed,
+		{"answered", "how is checkout?", chatmsg.Mark{Ask: "question"}, lib.StateCompleted, []string{"+question", "-question"}},
+		{"failed while blocked", "how are all my clusters?", chatmsg.Mark{Ask: "fleet", Settle: "blocked"}, lib.StateFailed,
 			[]string{"+fleet", "+blocked", "-fleet", "-blocked", "+failed"}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			r := startRig(t)
 			conv := "discord:g1/settle-" + strings.ReplaceAll(c.name, " ", "-")
-			r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "d-2", Text: "how is the fleet?"}
+			r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "1001", MessageID: "d-2", Text: c.ask}
 			origin := r.awaitTask(t, "platform")
 			mark := c.mark
 			progress := chatPart(t, chatmsg.Message{Schema: chatmsg.Schema, Headline: "looking", Mark: &mark})
@@ -544,6 +567,7 @@ func TestTerminalWithoutAMarkSettlesTheAsk(t *testing.T) {
 
 // A message whose only layout field is its tone lays nothing out.
 func TestToneOnlyProgressLaysNothingOut(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	origin := startChatTask(t, r, "discord:g1/tone-only-progress", true)
 	toneOnly := chatmsg.Message{Schema: chatmsg.Schema, Tone: chatmsg.ToneSuccess}
@@ -560,6 +584,7 @@ func TestToneOnlyProgressLaysNothingOut(t *testing.T) {
 // A layout the backend refused is not offered again while the progress
 // chat message stays the same; the line carries on as text.
 func TestRefusedProgressLayoutIsNotResent(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	r.adapter.mu.Lock()
 	r.adapter.refuseChat = true
@@ -581,6 +606,7 @@ func TestRefusedProgressLayoutIsNotResent(t *testing.T) {
 // limit, an outage) is no refusal: nothing is counted or remembered, and the
 // next artifact lays the same plan out.
 func TestTransientProgressFailureRetriesTheLayout(t *testing.T) {
+	t.Parallel()
 	r := startRig(t)
 	r.adapter.mu.Lock()
 	r.adapter.failChatEdits = 1

@@ -75,7 +75,7 @@ A new status block beside `status.usage`, not inside it:
 | Field                       | Type   | Value                                                                                                                                                                                   |
 | --------------------------- | ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `status.inference.provider` | string | the provider slug, the part before the first `/` (`gemini`, `vertex_ai`, `anthropic`, `openai`, `hosted_vllm`, `sap`; the chart writes its `openai_compatible` choice as `hosted_vllm`) |
-| `status.inference.model`    | string | the model name as typed after the provider (`gemini-3.5-flash`, `claude-opus-5`, `meta-llama/Llama-3.1-8B-Instruct`), or the resource id alone for a resource reference                 |
+| `status.inference.model`    | string | the model name as typed after the provider (`gemini-3.8-flash`, `claude-opus-5`, `meta-llama/Llama-3.1-8B-Instruct`), or the resource id alone for a resource reference                 |
 
 Both absent on a definite negative: no candidate ConfigMap in the namespace, a `model-default`
 entry whose model has an empty provider or an empty name after the split, or no `model-default`

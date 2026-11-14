@@ -350,6 +350,10 @@ class TwoPhaseFanOutTest(unittest.TestCase):
                 f'INJECT_LANE_REQUESTING="{requesting}"',
                 f'STOPPED_ASK_CASES="{stopped}"',
                 f'WRITES_ALONE_CASES="{alone}"',
+                'REPLAY_LANE_SAFETY_NAMES=""',
+                lifted_block(r"^case_repetitions\(\) \{.*?^\}$"),
+                lifted_block(r"^first_queued_rep\(\) \{.*?^\}$"),
+                lifted_block(r"^run_replay_lane_live_arm\(\) \{.*?^\}$"),
                 lifted_block(r"^# Two phases on both lanes.*?^fi$"),
                 'echo "TOTAL=$((UNIT_TOTAL + WRITER_TOTAL))"',
             ]

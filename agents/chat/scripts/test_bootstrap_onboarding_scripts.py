@@ -331,8 +331,8 @@ class DeliveryMainTest(unittest.TestCase):
         """
         (self.d / INVENTORY).write_text("report", encoding="utf-8")
         (self.d / ALIGNED).touch()
-        self.assertTrue(bootstrap_delivery._claim_delivery(self.d))  # winner
-        self.assertFalse(bootstrap_delivery._claim_delivery(self.d))  # loser
+        self.assertTrue(bootstrap_delivery._claim_delivery(self.d, bootstrap_delivery.CLAIM_PATH_ORIGIN))  # winner
+        self.assertFalse(bootstrap_delivery._claim_delivery(self.d, bootstrap_delivery.CLAIM_PATH_ORIGIN))  # loser
 
         rc, out = self._run()
         self.assertEqual(rc, 0)
@@ -815,6 +815,11 @@ class DeliveryToConversationTest(unittest.TestCase):
                 self.assertEqual(self._attempts()["attempts"], 0)
                 self.assertIn("the report waits", self._attempts()["last_reason"])
 
+    def test_an_empty_served_list_reads_as_unset_in_the_reason(self):
+        with mock.patch.dict(os.environ, {"A2A_NOTIFY_CONVERSATIONS": ""}):
+            self._run()
+        self.assertIn("(A2A_NOTIFY_CONVERSATIONS=<unset>)", self._attempts()["last_reason"])
+
     def test_a_block_does_not_restart_the_wait_after_an_attempt(self):
         record = {"attempts": 1, "last_reason": "refused", "last_at": 1000.0}
         (self.d / bootstrap_delivery.CONVERSATION_ATTEMPTS_FILE).write_text(json.dumps(record), encoding="utf-8")
@@ -981,7 +986,7 @@ class DeliveryMarksShownTest(unittest.TestCase):
 
     def test_a_racing_run_marks_nothing(self):
         self._shown()
-        self.assertTrue(bootstrap_delivery._claim_delivery(self.d))
+        self.assertTrue(bootstrap_delivery._claim_delivery(self.d, bootstrap_delivery.CLAIM_PATH_ORIGIN))
         rc, out, _ = self._run()
         self.assertEqual((rc, out), (0, ""))
         self.assertEqual(self.posts, [])
@@ -1199,7 +1204,7 @@ class DeliveryRegistersFindingsTest(unittest.TestCase):
 
     def test_a_racing_run_that_loses_the_claim_only_registers_again(self):
         self._write()
-        self.assertTrue(bootstrap_delivery._claim_delivery(self.d))
+        self.assertTrue(bootstrap_delivery._claim_delivery(self.d, bootstrap_delivery.CLAIM_PATH_ORIGIN))
         rc, out, _ = self._run()
         self.assertEqual((rc, out), (0, ""))
 
@@ -1558,7 +1563,7 @@ class DeliveryFromSandboxTest(unittest.TestCase):
                 self.assertIn("could not archive INVENTORY.md in the sandbox", err)
 
     def test_a_racing_run_does_not_touch_the_sandbox_report(self):
-        self.assertTrue(bootstrap_delivery._claim_delivery(self.d))
+        self.assertTrue(bootstrap_delivery._claim_delivery(self.d, bootstrap_delivery.CLAIM_PATH_ORIGIN))
         rc, out, _ = self._run()
         self.assertEqual((rc, out), (0, ""))
         self.run_.assert_not_called()
@@ -1913,6 +1918,12 @@ class DeliveryWithoutThreadTest(unittest.TestCase):
     def _note_texts(self):
         return [call.args[1] for call in self.notes.call_args_list]
 
+    def _no_human_claim(self, at=None):
+        """A claim the no-human path took, aged to ``at`` when given."""
+        (self.d / COMPLETED).write_text(bootstrap_delivery.CLAIM_PATH_NO_HUMAN + "\n", encoding="utf-8")
+        if at is not None:
+            os.utime(self.d / COMPLETED, (at, at))
+
     def test_silent_before_the_scan_is_filed(self):
         self.assertEqual(self._main(), 0)
         self.assertEqual(self.forge_calls, [])
@@ -1994,6 +2005,33 @@ class DeliveryWithoutThreadTest(unittest.TestCase):
         self.assertTrue((self.d / COMPLETED).exists(), "the issue is the record; the line is best effort")
         self.assertTrue(any("exited 4" in n for n in self._note_texts()))
 
+    def test_the_home_line_lands_on_every_routed_platform(self):
+        self._filed(self.DAY + self.HOUR)
+        def run(argv, **_kwargs):
+            self.runs.append(argv)
+            if argv[3] == "google_chat":
+                raise OSError("no a2a binary")
+            return subprocess.CompletedProcess(argv, 0, "{}\n", "")
+        with (
+            mock.patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "google_chat,slack"}),
+            mock.patch.object(bootstrap_delivery.subprocess, "run", side_effect=run),
+        ):
+            self.assertEqual(self._main(), 0)
+        self.assertEqual([argv[:4] for argv in self.runs], [
+            [chat_notify.A2A_CLI, "notify", "--platform", "google_chat"],
+            [chat_notify.A2A_CLI, "notify", "--platform", "slack"],
+        ], "a failure on google_chat does not skip slack")
+        line_notes = [n for n in self._note_texts() if "the home line" in n]
+        self.assertEqual(line_notes, [
+            bootstrap_delivery.HOME_LINE_PLATFORM_PREFIX.format(platform="google_chat")
+            + bootstrap_delivery.REPORT_HOME_LINE_NOTE.format(
+                outcome=bootstrap_delivery.HOME_LINE_FAILED.format(
+                    code=bootstrap_delivery.HOME_LINE_NO_EXIT, detail=OSError("no a2a binary"))),
+            bootstrap_delivery.HOME_LINE_PLATFORM_PREFIX.format(platform="slack")
+            + bootstrap_delivery.REPORT_HOME_LINE_NOTE.format(outcome=bootstrap_delivery.HOME_LINE_POSTED),
+        ])
+        self.assertTrue((self.d / COMPLETED).exists())
+
     def test_no_routed_platform_posts_no_home_line(self):
         self._filed(self.DAY + self.HOUR)
         with mock.patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "", "A2A_NOTIFY_CONVERSATIONS": ""}):
@@ -2073,10 +2111,7 @@ class DeliveryWithoutThreadTest(unittest.TestCase):
     def test_a_claim_the_run_died_holding_is_released_as_stale(self):
         """No record beside the claim on the no-human path: the stale-claim rule applies, as on the conversation path."""
         self._filed(self.DAY + self.HOUR)
-        (self.d / bootstrap_delivery.REPORT_CLAIMING_FILE).touch()
-        (self.d / COMPLETED).touch()
-        old = time.time() - bootstrap_delivery.STALE_CLAIM_SECONDS - 5
-        os.utime(self.d / COMPLETED, (old, old))
+        self._no_human_claim(time.time() - bootstrap_delivery.STALE_CLAIM_SECONDS - 5)
         self.assertFalse(bootstrap_delivery.delivery_settled(self.d))
         self.assertEqual(self._main(), 0)
         self.assertFalse((self.d / COMPLETED).exists(), "released")
@@ -2182,60 +2217,66 @@ class DeliveryWithoutThreadTest(unittest.TestCase):
         self.assertIn("longer than an issue body", record.get(bootstrap_delivery.ATTEMPTS_REASON, ""))
         self.assertEqual(bootstrap_delivery._attempt_count(record), 1, "counted, so it stops after the waits")
 
-    def test_a_lost_claim_leaves_no_marker_behind(self):
-        """An origin run claimed first during this path's reads: its claim must not read as a dead one of ours."""
+    def test_a_claim_lost_to_an_origin_run_is_left_as_theirs(self):
+        """An origin run claimed first during this path's reads: its claim keeps its own tag and settles."""
         self._filed(self.DAY + self.HOUR)
         real = bootstrap_delivery._register_findings
         def origin_claims(*a, **k):
-            (self.d / COMPLETED).touch()
+            bootstrap_delivery._claim_delivery(self.d, bootstrap_delivery.CLAIM_PATH_ORIGIN)
             return real(*a, **k)
         with mock.patch.object(bootstrap_delivery, "_register_findings", side_effect=origin_claims):
             self.assertEqual(self._main(), 0)
         self.assertEqual(self.forge_calls, [])
-        self.assertFalse((self.d / bootstrap_delivery.REPORT_CLAIMING_FILE).exists())
+        self.assertEqual(bootstrap_delivery._claim_path(self.d), bootstrap_delivery.CLAIM_PATH_ORIGIN)
         self.assertTrue(bootstrap_delivery.delivery_settled(self.d))
 
-    def test_a_claim_lost_to_another_no_human_run_leaves_its_marker_in_place(self):
-        """A manual run beside the tick claimed first, marker and all: the loser must not take the
-        winner's marker with it, or the winner's claim would read as an origin one and settle unfiled."""
+    def test_two_no_human_runs_overlap_and_the_second_yields(self):
+        """A manual run beside the tick claimed first: the second run's create fails, it files nothing,
+        sends nothing, and leaves the winner's claim (and its tag) as it found it."""
         self._filed(self.DAY + self.HOUR)
         real = bootstrap_delivery._register_findings
         def other_claims(*a, **k):
-            (self.d / bootstrap_delivery.REPORT_CLAIMING_FILE).touch()
-            (self.d / COMPLETED).touch()
+            self.assertTrue(bootstrap_delivery._claim_delivery(self.d, bootstrap_delivery.CLAIM_PATH_NO_HUMAN))
             return real(*a, **k)
         with mock.patch.object(bootstrap_delivery, "_register_findings", side_effect=other_claims):
             self.assertEqual(self._main(), 0)
-        self.assertEqual(self.forge_calls, [])
-        self.assertTrue((self.d / bootstrap_delivery.REPORT_CLAIMING_FILE).exists(), "the winner's marker stays")
+        self.assertEqual(self.forge_calls, [], "nothing filed twice")
+        self.assertEqual(self.runs, [], "no second home line")
+        self.assertEqual(bootstrap_delivery._claim_path(self.d), bootstrap_delivery.CLAIM_PATH_NO_HUMAN)
         self.assertFalse(bootstrap_delivery.delivery_settled(self.d), "the winner's filing is still owed")
 
-    def test_a_fresh_marker_with_no_claim_yet_is_another_run_mid_claim(self):
+    def test_a_claim_that_cannot_be_written_is_not_taken(self):
+        """A tag that cannot be written is no claim at all: nothing is left behind, and the run files
+        nothing and records nothing."""
         self._filed(self.DAY + self.HOUR)
-        (self.d / bootstrap_delivery.REPORT_CLAIMING_FILE).write_text("other\n", encoding="utf-8")
-        self.assertEqual(self._main(), 0)
-        self.assertEqual(self.forge_calls, [])
+        with mock.patch.object(bootstrap_delivery.os, "link", side_effect=OSError(28, "no space")):
+            self.assertFalse(bootstrap_delivery._claim_delivery(self.d, bootstrap_delivery.CLAIM_PATH_NO_HUMAN))
+            self.assertFalse((self.d / COMPLETED).exists())
+            self.assertEqual(self._main(), 0)
         self.assertFalse((self.d / COMPLETED).exists())
-        self.assertEqual((self.d / bootstrap_delivery.REPORT_CLAIMING_FILE).read_text(encoding="utf-8"), "other\n")
+        self.assertEqual([p.name for p in self.d.glob(COMPLETED + "*")], [], "no staged file left")
+        self.assertEqual(self.forge_calls, [], "no issue without the claim")
+        self.assertFalse((self.d / bootstrap_delivery.REPORT_FILED_FILE).exists())
+        self.assertEqual(bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE), {})
+        self.assertTrue((self.d / INVENTORY).exists(), "the next tick retries")
 
-    def test_a_marker_a_dead_run_left_before_its_claim_is_taken_over_once_stale(self):
-        self._filed(self.DAY + self.HOUR)
-        marker = self.d / bootstrap_delivery.REPORT_CLAIMING_FILE
-        marker.write_text("dead\n", encoding="utf-8")
-        old = time.time() - bootstrap_delivery.STALE_CLAIM_SECONDS - 5
-        os.utime(marker, (old, old))
-        self.assertEqual(self._main(), 0)
-        self.assertTrue((self.d / bootstrap_delivery.REPORT_FILED_FILE).exists(), "filed")
-        self.assertNotEqual(marker.read_text(encoding="utf-8"), "dead\n", "the marker is this run's")
+    def test_the_claim_never_exists_without_its_tag(self):
+        """A run killed between the create and the write must not leave an empty claim (it would read
+        as an older build's and settle unfiled): the tag is on disk before the claim's name is."""
+        real_link = os.link
+        seen = []
 
-    def test_a_marker_whose_write_fails_is_taken_back(self):
-        """A marker created but never written would hold every later run for STALE_CLAIM_SECONDS and make a
-        human's claim in that window read as a stale one of this path's."""
-        broken = mock.MagicMock()
-        broken.__enter__.return_value.write.side_effect = OSError("no space")
-        with mock.patch.object(bootstrap_delivery.os, "fdopen", return_value=broken):
-            self.assertFalse(bootstrap_delivery._mark_claiming(self.d))
-        self.assertFalse((self.d / bootstrap_delivery.REPORT_CLAIMING_FILE).exists())
+        def linking(src, dst, *a, **k):
+            seen.append((Path(src).read_text(encoding="utf-8"), Path(dst).exists()))
+            return real_link(src, dst, *a, **k)
+
+        with mock.patch.object(bootstrap_delivery.os, "link", linking):
+            self.assertTrue(bootstrap_delivery._claim_delivery(self.d, bootstrap_delivery.CLAIM_PATH_NO_HUMAN))
+        self.assertEqual(seen, [(bootstrap_delivery.CLAIM_PATH_NO_HUMAN + "\n", False)])
+        self.assertEqual(bootstrap_delivery._claim_path(self.d), bootstrap_delivery.CLAIM_PATH_NO_HUMAN)
+        self.assertEqual([p.name for p in self.d.glob(COMPLETED + "*")], [COMPLETED], "no staged file left")
+        self.assertFalse(bootstrap_delivery._claim_delivery(self.d, bootstrap_delivery.CLAIM_PATH_ORIGIN), "exclusive")
+        self.assertEqual(bootstrap_delivery._claim_path(self.d), bootstrap_delivery.CLAIM_PATH_NO_HUMAN, "the loser changes nothing")
 
     def test_a_filed_record_that_does_not_land_keeps_the_report_and_the_claim(self):
         """The issue is open but nothing on disk says so: archiving the report would leave the next run
@@ -2247,9 +2288,17 @@ class DeliveryWithoutThreadTest(unittest.TestCase):
         self.assertTrue((self.d / INVENTORY).exists(), "the report stays for the next run")
         self.assertFalse((self.d / bootstrap_delivery.REPORT_FILED_FILE).exists())
         self.assertTrue((self.d / COMPLETED).exists(), "the claim stays until the stale rule releases it")
-        self.assertTrue((self.d / bootstrap_delivery.REPORT_CLAIMING_FILE).exists())
+        self.assertEqual(bootstrap_delivery._claim_path(self.d), bootstrap_delivery.CLAIM_PATH_NO_HUMAN)
         self.assertFalse(bootstrap_delivery.delivery_settled(self.d))
         self.assertEqual(self.runs, [], "no home line until the filing is on record")
+        old = time.time() - bootstrap_delivery.STALE_CLAIM_SECONDS - 5
+        os.utime(self.d / COMPLETED, (old, old))
+        self.assertEqual(self._main(), 0)
+        self.assertFalse((self.d / COMPLETED).exists(), "the stale rule releases it")
+        record = bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE)
+        self.assertIn("recorded no outcome", record.get(bootstrap_delivery.ATTEMPTS_REASON, ""), "read as this path's")
+        self.assertEqual(bootstrap_delivery._attempt_count(record), 0)
+        self.assertEqual(bootstrap_delivery._read_attempts(self.d), {}, "not the conversation path's")
 
     def test_a_retire_record_that_does_not_land_keeps_the_report_and_the_claim(self):
         self._filed(8 * self.DAY)
@@ -2257,7 +2306,7 @@ class DeliveryWithoutThreadTest(unittest.TestCase):
             self.assertEqual(self._main(), 0)
         self.assertTrue((self.d / INVENTORY).exists())
         self.assertFalse((self.d / bootstrap_delivery.REPORT_RETIRED_FILE).exists())
-        self.assertTrue((self.d / COMPLETED).exists())
+        self.assertEqual(bootstrap_delivery._claim_path(self.d), bootstrap_delivery.CLAIM_PATH_NO_HUMAN)
         self.assertFalse(bootstrap_delivery.delivery_settled(self.d))
 
     def test_a_stale_no_human_release_does_not_count_toward_the_cap(self):
@@ -2269,9 +2318,7 @@ class DeliveryWithoutThreadTest(unittest.TestCase):
             bootstrap_delivery.ATTEMPTS_COUNT: bootstrap_delivery.CONVERSATION_MAX_ATTEMPTS - 1,
             bootstrap_delivery.ATTEMPTS_REASON: "refused", bootstrap_delivery.ATTEMPTS_AT: old - self.DAY,
         }), encoding="utf-8")
-        (self.d / bootstrap_delivery.REPORT_CLAIMING_FILE).touch()
-        (self.d / COMPLETED).touch()
-        os.utime(self.d / COMPLETED, (old, old))
+        self._no_human_claim(old)
         self.assertEqual(self._main(), 0)
         self.assertFalse((self.d / COMPLETED).exists(), "released")
         record = bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE)
@@ -2280,25 +2327,121 @@ class DeliveryWithoutThreadTest(unittest.TestCase):
         self.assertIn("issue-create", [c[0] for c in self.forge_calls], "the next run reaches the ledger again")
         self.assertTrue((self.d / bootstrap_delivery.REPORT_FILED_FILE).exists())
 
-    def test_an_orphan_marker_does_not_hold_a_humans_claim_open(self):
-        """A no-human run killed between its marker and its claim: the human's origin claim must settle,
-        or the jobs never retire and every nudge is held for good."""
+    def test_a_stale_no_human_claim_is_released_once_and_reclaimed_by_the_next_run(self):
         self._filed(self.DAY + self.HOUR)
-        (self.d / bootstrap_delivery.REPORT_CLAIMING_FILE).touch()
+        self._no_human_claim(time.time() - bootstrap_delivery.STALE_CLAIM_SECONDS - 5)
+        self.assertEqual(self._main(), 0)
+        self.assertFalse((self.d / COMPLETED).exists(), "released, nothing else this tick")
+        self.assertEqual(self.forge_calls, [])
+        self.assertEqual(self._main(), 0)
+        self.assertEqual(bootstrap_delivery._claim_path(self.d), bootstrap_delivery.CLAIM_PATH_NO_HUMAN, "re-claimed")
+        self.assertEqual([c[0] for c in self.forge_calls].count("issue-create"), 1)
+        self.assertTrue(bootstrap_delivery.delivery_settled(self.d))
+        self.assertEqual(self._main(), 0)
+        self.assertEqual([c[0] for c in self.forge_calls].count("issue-create"), 1, "no second takeover")
+        self.assertTrue((self.d / COMPLETED).exists())
+        record = bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE)
+        self.assertEqual(record.get(bootstrap_delivery.ATTEMPTS_REASON, "").count("recorded no outcome"), 1)
+
+    def test_a_stale_release_is_recorded_by_the_claims_tag(self):
+        """A dead conversation-path claim counts an attempt in its record; a dead no-human one is recorded
+        in its own record, uncounted."""
+        self._filed(self.DAY + self.HOUR)
+        (self.d / bootstrap_delivery.CONVERSATION_FILE).write_text(json.dumps(CONVERSATION), encoding="utf-8")
+        (self.d / bootstrap_delivery.CONVERSATION_ALIGNED_MARKER).touch()
+        old = time.time() - bootstrap_delivery.STALE_CLAIM_SECONDS - 5
+        (self.d / COMPLETED).write_text(bootstrap_delivery.CLAIM_PATH_CONVERSATION + "\n", encoding="utf-8")
+        os.utime(self.d / COMPLETED, (old, old))
+        self.assertEqual(self._main(), 0)
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertEqual(bootstrap_delivery._attempt_count(bootstrap_delivery._read_attempts(self.d)), 1, "counted")
+        self.assertEqual(bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE), {})
+        self._no_human_claim(old)
+        self.assertEqual(self._main(), 0)
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertEqual(bootstrap_delivery._attempt_count(bootstrap_delivery._read_attempts(self.d)), 1, "not charged again")
+        record = bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE)
+        self.assertIn("recorded no outcome", record.get(bootstrap_delivery.ATTEMPTS_REASON, ""))
+        self.assertEqual(bootstrap_delivery._attempt_count(record), 0, "uncounted")
+
+    def test_an_empty_claim_file_is_not_a_no_human_claim(self):
+        """A claim an older build wrote before the tag existed: it settles and is released as an
+        unmarked claim was, never as this path's."""
+        self._filed(self.DAY + self.HOUR)
+        (self.d / COMPLETED).touch()
+        self.assertEqual(bootstrap_delivery._claim_path(self.d), "")
+        self.assertTrue(bootstrap_delivery.delivery_settled(self.d), "an origin claim, settled at once")
+        (self.d / bootstrap_delivery.CONVERSATION_FILE).write_text(json.dumps(CONVERSATION), encoding="utf-8")
+        self.assertFalse(bootstrap_delivery.delivery_settled(self.d), "a conversation claim waits for its outcome")
+        old = time.time() - bootstrap_delivery.STALE_CLAIM_SECONDS - 5
+        os.utime(self.d / COMPLETED, (old, old))
+        self.assertEqual(self._main(), 0)
+        self.assertFalse((self.d / COMPLETED).exists(), "released as a stale conversation claim")
+        self.assertEqual(bootstrap_delivery._attempt_count(bootstrap_delivery._read_attempts(self.d)), 1)
+        self.assertEqual(bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE), {})
+
+    def test_an_older_builds_no_human_claim_is_read_by_its_marker_and_released_with_it(self):
+        """An upgrade mid-claim: the old build's empty claim with its marker beside it is this path's,
+        not a settled origin claim; the stale rule releases both files."""
+        self._filed(self.DAY + self.HOUR)
+        (self.d / COMPLETED).touch()
+        (self.d / bootstrap_delivery.LEGACY_REPORT_CLAIMING_FILE).touch()
+        self.assertEqual(bootstrap_delivery._claim_path(self.d), bootstrap_delivery.CLAIM_PATH_NO_HUMAN)
+        self.assertFalse(bootstrap_delivery.delivery_settled(self.d))
+        old = time.time() - bootstrap_delivery.STALE_CLAIM_SECONDS - 5
+        os.utime(self.d / COMPLETED, (old, old))
+        self.assertEqual(self._main(), 0)
+        self.assertFalse((self.d / COMPLETED).exists())
+        self.assertFalse((self.d / bootstrap_delivery.LEGACY_REPORT_CLAIMING_FILE).exists())
+        record = bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE)
+        self.assertIn("recorded no outcome", record.get(bootstrap_delivery.ATTEMPTS_REASON, ""))
+        self.assertEqual(bootstrap_delivery._read_attempts(self.d), {}, "the conversation record is not charged")
+
+    def test_a_tagged_claim_settles_by_its_tag_not_by_what_binds_after(self):
+        """An origin claim delivered in its run stays settled when the plugin binds a conversation a
+        moment later; a conversation claim waits for its outcome whether or not the binding is still there."""
+        self._filed(self.DAY + self.HOUR)
+        (self.d / COMPLETED).write_text(bootstrap_delivery.CLAIM_PATH_ORIGIN + "\n", encoding="utf-8")
+        (self.d / bootstrap_delivery.CONVERSATION_FILE).write_text(json.dumps(CONVERSATION), encoding="utf-8")
+        self.assertTrue(bootstrap_delivery.delivery_settled(self.d))
+        (self.d / bootstrap_delivery.CONVERSATION_FILE).unlink()
+        (self.d / COMPLETED).write_text(bootstrap_delivery.CLAIM_PATH_CONVERSATION + "\n", encoding="utf-8")
+        self.assertFalse(bootstrap_delivery.delivery_settled(self.d))
+        (self.d / bootstrap_delivery.CONVERSATION_DONE_FILE).touch()
+        self.assertTrue(bootstrap_delivery.delivery_settled(self.d))
+
+    def test_an_unreadable_claim_decides_nothing_this_tick(self):
+        """A read error on the claim file is not an empty claim: no retire, no release, no record."""
+        self._filed(self.DAY + self.HOUR)
+        self._no_human_claim(time.time() - bootstrap_delivery.STALE_CLAIM_SECONDS - 5)
+        real = Path.read_text
+
+        def failing(self_, *a, **k):
+            if self_.name == COMPLETED:
+                raise OSError(5, "input/output error")
+            return real(self_, *a, **k)
+
+        with mock.patch.object(Path, "read_text", failing):
+            self.assertEqual(bootstrap_delivery._claim_path(self.d), bootstrap_delivery.CLAIM_PATH_UNREADABLE)
+            self.assertFalse(bootstrap_delivery.delivery_settled(self.d))
+            self.assertEqual(self._main(), 0)
+        self.assertTrue((self.d / COMPLETED).exists(), "not released")
+        self.assertEqual(bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE), {})
+        self.assertEqual(bootstrap_delivery._read_attempts(self.d), {})
+
+    def test_a_humans_origin_claim_after_a_released_no_human_claim_settles_at_once(self):
+        """Nothing of the released claim is left to read: the origin claim carries its own tag and
+        settles, or the jobs never retire and every nudge is held for good."""
+        self._filed(self.DAY + self.HOUR)
+        self.forge_refusals["issue-create"] = "FORGE_FORBIDDEN"
+        self.assertEqual(self._main(), 0)  # released
+        self.assertIsNone(bootstrap_delivery._claim_path(self.d))
         (self.d / ALIGNED).touch()
         with contextlib.redirect_stdout(io.StringIO()) as out:  # the origin path prints the report
             self.assertEqual(bootstrap_delivery.main(self.d), 0)
         self.assertIn("Discovery Report", out.getvalue())
-        self.assertTrue((self.d / COMPLETED).exists(), "the human's claim")
-        self.assertFalse((self.d / bootstrap_delivery.REPORT_CLAIMING_FILE).exists(), "the orphan is gone")
+        self.assertEqual(bootstrap_delivery._claim_path(self.d), bootstrap_delivery.CLAIM_PATH_ORIGIN)
         self.assertTrue(bootstrap_delivery.delivery_settled(self.d))
-
-    def test_a_marker_beside_a_live_claim_is_left_to_the_human_check(self):
-        self._filed(self.DAY + self.HOUR)
-        (self.d / bootstrap_delivery.REPORT_CLAIMING_FILE).touch()
-        (self.d / COMPLETED).touch()
-        bootstrap_delivery._drop_orphan_claiming_marker(self.d)
-        self.assertTrue((self.d / bootstrap_delivery.REPORT_CLAIMING_FILE).exists(), "a marker with a claim behind it is a live no-human run")
 
     def _at_the_cap(self, age_seconds):
         self._filed(self.DAY + self.HOUR)
@@ -2309,7 +2452,7 @@ class DeliveryWithoutThreadTest(unittest.TestCase):
 
     def test_at_the_cap_an_issue_a_failed_create_opened_is_found_and_recorded(self):
         """The fifth create opened the issue and then failed: no record, no home line, and day seven
-        would retire a filed report. The cap still gets one lookup per retry wait."""
+        would retire a filed report. The cap still gets one lookup, after the last retry wait."""
         self._at_the_cap(bootstrap_delivery.CONVERSATION_RETRY_WAITS_SECONDS[-1] + 5)
         sweep = bootstrap_delivery.oobe.scan_filed(self.d)[0]
         mine = {"number": 11, "body": bootstrap_delivery.REPORT_ISSUE_SWEEP_MARKER.format(sweep=sweep),
@@ -2331,6 +2474,48 @@ class DeliveryWithoutThreadTest(unittest.TestCase):
         record = bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE)
         self.assertEqual(bootstrap_delivery._attempt_count(record), bootstrap_delivery.CONVERSATION_MAX_ATTEMPTS)
         self.assertIn("no more tries", record.get(bootstrap_delivery.ATTEMPTS_REASON, ""))
+
+    def test_at_the_cap_a_missed_lookup_is_not_repeated_each_tick(self):
+        """A miss records nothing counted, so nothing moved the wait: the listing ran every tick."""
+        self._at_the_cap(bootstrap_delivery.CONVERSATION_RETRY_WAITS_SECONDS[-1] + 5)
+        self.assertEqual(self._main(), 0)
+        self.assertEqual(self._main(), 0)
+        self.assertEqual([c[0] for c in self.forge_calls], ["issue-list", "issue-list"], "one lookup, two ticks")
+        record = bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE)
+        self.assertTrue(record.get(bootstrap_delivery.REPORT_CAP_LOOKUP_DONE))
+        self.assertEqual(record.get(bootstrap_delivery.ATTEMPTS_REASON), bootstrap_delivery.REPORT_NO_ISSUE_AT_CAP_REASON.format(repo="example-org/gitops"))
+        self.assertEqual(bootstrap_delivery._attempt_count(record), bootstrap_delivery.CONVERSATION_MAX_ATTEMPTS)
+
+    def test_the_retire_drops_the_lookup_flag(self):
+        self._at_the_cap(8 * self.DAY)
+        self._filed(8 * self.DAY)
+        path = self.d / bootstrap_delivery.REPORT_ATTEMPTS_FILE
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record[bootstrap_delivery.REPORT_CAP_LOOKUP_DONE] = True
+        path.write_text(json.dumps(record), encoding="utf-8")
+        self.assertEqual(self._main(), 0)
+        self.assertTrue((self.d / bootstrap_delivery.REPORT_RETIRED_FILE).exists())
+        record = bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE)
+        self.assertNotIn(bootstrap_delivery.REPORT_CAP_LOOKUP_DONE, record)
+        self.assertEqual(bootstrap_delivery._attempt_count(record), bootstrap_delivery.CONVERSATION_MAX_ATTEMPTS)
+
+    def test_at_the_cap_a_refused_lookup_waits_out_the_last_retry_wait_again(self):
+        """A listing the repository refuses (a lost token scope, a server error) is not a miss: no
+        done flag, but the refusal moves the wait, so the next lookup is six hours on, not next tick."""
+        self._at_the_cap(bootstrap_delivery.CONVERSATION_RETRY_WAITS_SECONDS[-1] + 5)
+        self.forge_refusals["issue-list"] = "FORGE_FORBIDDEN"
+        self.assertEqual(self._main(), 0)
+        self.assertEqual(self._main(), 0)
+        self.assertEqual([c[0] for c in self.forge_calls], ["issue-list"], "one refused lookup, two ticks")
+        record = bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE)
+        self.assertNotIn(bootstrap_delivery.REPORT_CAP_LOOKUP_DONE, record, "a refusal does not end the lookups")
+        self.assertIn("issue-list on", record.get(bootstrap_delivery.ATTEMPTS_REASON, ""))
+        self.assertAlmostEqual(record[bootstrap_delivery.ATTEMPTS_AT], time.time(), delta=30)
+        self.assertEqual(bootstrap_delivery._attempt_count(record), bootstrap_delivery.CONVERSATION_MAX_ATTEMPTS, "not counted")
+        record[bootstrap_delivery.ATTEMPTS_AT] = time.time() - bootstrap_delivery.CONVERSATION_RETRY_WAITS_SECONDS[-1] - 5
+        (self.d / bootstrap_delivery.REPORT_ATTEMPTS_FILE).write_text(json.dumps(record), encoding="utf-8")
+        self.assertEqual(self._main(), 0)
+        self.assertEqual([c[0] for c in self.forge_calls], ["issue-list", "issue-list"], "asked again after the wait")
 
     def test_at_the_cap_the_lookup_waits_out_the_last_retry_wait(self):
         self._at_the_cap(60)
@@ -2355,10 +2540,7 @@ class DeliveryWithoutThreadTest(unittest.TestCase):
 
     def test_a_stale_no_human_claim_is_recorded_in_its_own_record_uncounted(self):
         self._filed(self.DAY + self.HOUR)
-        (self.d / bootstrap_delivery.REPORT_CLAIMING_FILE).touch()
-        (self.d / COMPLETED).touch()
-        old = time.time() - bootstrap_delivery.STALE_CLAIM_SECONDS - 5
-        os.utime(self.d / COMPLETED, (old, old))
+        self._no_human_claim(time.time() - bootstrap_delivery.STALE_CLAIM_SECONDS - 5)
         self.assertEqual(self._main(), 0)
         record = bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE)
         self.assertIn("recorded no outcome", record.get(bootstrap_delivery.ATTEMPTS_REASON, ""))
@@ -2370,13 +2552,6 @@ class DeliveryWithoutThreadTest(unittest.TestCase):
         self.assertEqual(self._main(), 0)
         (self.d / bootstrap_delivery.CONVERSATION_FILE).write_text(json.dumps(CONVERSATION), encoding="utf-8")
         self.assertTrue(bootstrap_delivery.delivery_settled(self.d), "the filed record settles our claim, not the late binding")
-
-    def test_no_claim_without_its_marker(self):
-        self._filed(self.DAY + self.HOUR)
-        with mock.patch.object(bootstrap_delivery, "_mark_claiming", return_value=False):
-            self.assertEqual(self._main(), 0)
-        self.assertFalse((self.d / COMPLETED).exists())
-        self.assertEqual([v for v, _, _ in self.forge_calls], [])
 
     def test_a_sweep_marker_that_does_not_decode_holds_this_path_not_the_tick(self):
         (self.d / SCAN_FILED).write_bytes(b"\xff\xfe not utf-8")
@@ -2453,7 +2628,7 @@ class DeliveryWithoutThreadTest(unittest.TestCase):
         record = bootstrap_delivery._read_attempts(self.d, bootstrap_delivery.REPORT_ATTEMPTS_FILE)
         self.assertEqual(bootstrap_delivery._attempt_count(record), 1)
         self.assertIn("FORGE_FORBIDDEN", record[bootstrap_delivery.ATTEMPTS_REASON])
-        self.assertFalse((self.d / bootstrap_delivery.REPORT_CLAIMING_FILE).exists(), "the release takes the marker with it")
+        self.assertIsNone(bootstrap_delivery._claim_path(self.d), "nothing of the claim is left")
         self.assertTrue(bootstrap_delivery.delivery_settled(self.d), "a later origin claim would settle at once")
         calls = len(self.forge_calls)
         self.assertEqual(self._main(), 0, "inside the wait after a refused create")
@@ -4254,7 +4429,7 @@ class FirstRunAuditsTest(unittest.TestCase):
         claimed = []
         real = bootstrap_delivery._claim_delivery
         with mock.patch.object(bootstrap_delivery, "_claim_delivery",
-                               side_effect=lambda d: claimed.append(True) or real(d)), \
+                               side_effect=lambda d, tag: claimed.append(True) or real(d, tag)), \
                 mock.patch.object(bootstrap_delivery, "_safe_audits_note",
                                   side_effect=lambda *a, **k: self.assertEqual(claimed, []) or "NOTE-BUILT-FIRST"):
             self.assertIn("NOTE-BUILT-FIRST", self._deliver())

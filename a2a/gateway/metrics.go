@@ -108,6 +108,11 @@ const (
 	slackIngressLagName  = "slack_ingress_lag_seconds"
 	slackAPIDurationName = "slack_api_request_duration_seconds"
 	slackRateLimitedName = "slack_api_rate_limited_total"
+	// slackFirstAckName is how long a Slack ask waited for its first receipt:
+	// from the adapter receiving the message to its arrival reaction landing
+	// (the reactions call succeeded). Ingress lag before it
+	// and the agent's own time after it are measured apart.
+	slackFirstAckName = "slack_first_ack_seconds"
 
 	// The label names. Every value under them comes from a closed list
 	// below, never from a task, a conversation or an executor's text, so
@@ -269,6 +274,7 @@ type Metrics struct {
 	sessions            *prometheus.CounterVec
 	slackIngressLag     *prometheus.HistogramVec
 	slackAPIDuration    *prometheus.HistogramVec
+	slackFirstAckSecs   *prometheus.HistogramVec
 	slackRateLimited    *prometheus.CounterVec
 	// processStart is processStartTimeName, set once in NewMetrics and constant
 	// for the life of the process by construction.
@@ -429,6 +435,13 @@ func NewMetrics() *Metrics {
 			Help:      "Seconds each Slack Web API call the Slack adapter made took, by method (chat.postMessage, chat.update, reactions.add, ..., other) and outcome (ok, a 2xx including Slack's ok:false answers; rate_limited, a 429; error, any other status or no response).",
 			Buckets:   metricsSlackAPIBuckets,
 		}, []string{labelMethod, labelOutcome}),
+		slackFirstAckSecs: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: metricsNamespace,
+			Subsystem: metricsSubsystem,
+			Name:      slackFirstAckName,
+			Help:      "Seconds from the Slack adapter receiving an ask to its arrival reaction landing (the reactions call succeeded); a click, an answer or a steer draws none, and a refused reaction is not counted. No sample until the first.",
+			Buckets:   metricsSlackIngressBuckets,
+		}, nil),
 		slackRateLimited: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: metricsNamespace,
 			Subsystem: metricsSubsystem,
@@ -450,7 +463,7 @@ func NewMetrics() *Metrics {
 		connected: prometheus.NewDesc(prometheus.BuildFQName(metricsNamespace, metricsSubsystem, slackConnectedName), slackConnectedHelp, nil, nil),
 		lastEvent: prometheus.NewDesc(prometheus.BuildFQName(metricsNamespace, metricsSubsystem, slackLastEventName), slackLastEventHelp, nil, nil),
 	}
-	m.registry.MustRegister(m.taskTerminals, m.gchatEventsReceived, m.gchatPulls, m.chatMessages, m.notifyMarksDropped, m.messagesInbound, m.answerFeedback, m.postFeedback, m.sessions, m.slackIngressLag, m.slackAPIDuration, m.slackRateLimited, m.processStart, people, slackGauges)
+	m.registry.MustRegister(m.taskTerminals, m.gchatEventsReceived, m.gchatPulls, m.chatMessages, m.notifyMarksDropped, m.messagesInbound, m.answerFeedback, m.postFeedback, m.sessions, m.slackIngressLag, m.slackAPIDuration, m.slackFirstAckSecs, m.slackRateLimited, m.processStart, people, slackGauges)
 	for _, outcome := range metricsChatOutcomes {
 		m.chatMessages.WithLabelValues(outcome)
 	}

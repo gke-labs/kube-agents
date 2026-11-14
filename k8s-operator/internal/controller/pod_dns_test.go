@@ -18,28 +18,42 @@ package controller
 
 import (
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/utils/ptr"
 )
 
 // Every pod that dials the broker or the kube-api proxy by its 4-dot service
-// name sets ndots:3, so the name is asked as written first (#5590): the shell
-// sandbox, the broker and its exec tier, and the profile workers, both the
-// Job template and the warm pool. The DNS policy stays the default
-// (ClusterFirst), so the cluster's nameservers and search list still apply.
-func TestBrokerCallerPodsSetNdots3(t *testing.T) {
+// name sets ndots:3, so the name is asked as written first (#5590, #5609): the
+// shell sandbox, the profile workers (the Job template and the warm pool), the
+// gateway, the A2A gateway, the A2A MCP server and the scope publisher. The
+// broker, its exec tier and the kube-api proxy resolve 2-dot public API hosts
+// on every call and run only this repository's images, so they set ndots:2
+// (publicAPICallerPodNdots). The DNS policy stays the default (ClusterFirst),
+// so the cluster's nameservers and search list still apply.
+func TestPodsSetTheirNdots(t *testing.T) {
 	a2a := a2aTestAgent()
 	profile := unattendedProfile(a2a, "tse")
 	execAgent := execTierTestAgent(ptr.To(int32(2)))
-	pods := map[string]corev1.PodSpec{
-		"shell sandbox": buildShellSandboxStatefulSet(shellSandboxTestAgent(), "sandbox-ssh", "http://broker:8080", "settings-hash").Spec.Template.Spec,
-		"broker":        buildCredentialProxyDeployment(execAgent, "hash").Spec.Template.Spec,
-		"exec tier":     buildCredentialProxyExecTierDeployment(execAgent, buildCredentialProxyDeployment(execAgent, "hash")).Spec.Template.Spec,
-		"worker Job":    buildProfileJobTemplate(a2a, &profile, false).Spec,
-		"warm pool":     buildProfilePool(a2a, &profile, "read", "agentprofile-tse-read", false).Spec.Template.Spec,
+	type pod struct {
+		spec  corev1.PodSpec
+		ndots string
 	}
-	for name, spec := range pods {
+	pods := map[string]pod{
+		"shell sandbox":   {buildShellSandboxStatefulSet(shellSandboxTestAgent(), "sandbox-ssh", "http://broker:8080", "settings-hash").Spec.Template.Spec, "3"},
+		"worker Job":      {buildProfileJobTemplate(a2a, &profile, false).Spec, "3"},
+		"warm pool":       {buildProfilePool(a2a, &profile, "read", "agentprofile-tse-read", false).Spec.Template.Spec, "3"},
+		"gateway":         {buildPodTemplateSpec(a2a, "h", "h", "h", "h", nil, renderOptions{}).Spec, "3"},
+		"A2A gateway":     {buildA2AGatewayDeployment(a2a).Spec.Template.Spec, "3"},
+		"A2A MCP server":  {buildA2AMCPDeployment(a2a).Spec.Template.Spec, "3"},
+		"scope publisher": {buildScopePublisherJob(a2a, time.Unix(0, 0), "hash").Spec.Template.Spec, "3"},
+		"broker":          {buildCredentialProxyDeployment(execAgent, "hash").Spec.Template.Spec, "2"},
+		"exec tier":       {buildCredentialProxyExecTierDeployment(execAgent, buildCredentialProxyDeployment(execAgent, "hash")).Spec.Template.Spec, "2"},
+		"kube-api proxy":  {buildKubeProxyDeployment(shellSandboxTestAgent(), "", true, "tls-hash").Spec.Template.Spec, "2"},
+	}
+	for name, p := range pods {
+		spec := p.spec
 		if spec.DNSPolicy != "" && spec.DNSPolicy != corev1.DNSClusterFirst {
 			t.Errorf("%s: dnsPolicy %q, want the default ClusterFirst", name, spec.DNSPolicy)
 		}
@@ -57,8 +71,46 @@ func TestBrokerCallerPodsSetNdots3(t *testing.T) {
 				ndots = append(ndots, ptr.Deref(o.Value, ""))
 			}
 		}
-		if len(ndots) != 1 || ndots[0] != "3" {
-			t.Errorf("%s: ndots options %v, want exactly one, 3", name, ndots)
+		if len(ndots) != 1 || ndots[0] != p.ndots {
+			t.Errorf("%s: ndots options %v, want exactly one, %s", name, ndots, p.ndots)
 		}
+		// A pod at ndots:2 runs only this repository's images, whose
+		// resolvers fall back to the search list. A second container would
+		// be someone else's image.
+		if p.ndots == "2" && len(spec.Containers)+len(spec.InitContainers) != 1 {
+			t.Errorf("%s: %d containers and %d init containers at ndots:2, want the one container this repository builds",
+				name, len(spec.Containers), len(spec.InitContainers))
+		}
+	}
+}
+
+// At ndots:2 a 2-dot name is asked of the upstream resolver before the search
+// list resolves it. The kube-api proxy's own default for the host API server
+// is such a name (kubernetes.default.svc), so the operator hands it the full
+// one, which the API server's certificate also carries.
+func TestTheKubeAPIProxyDialsTheAPIServerByItsFullName(t *testing.T) {
+	const want = "https://kubernetes.default.svc.cluster.local"
+	if inClusterAPIServer != want {
+		t.Errorf("inClusterAPIServer = %q, want %q", inClusterAPIServer, want)
+	}
+	var got []string
+	for _, e := range buildKubeProxyDeployment(shellSandboxTestAgent(), "", true, "tls-hash").Spec.Template.Spec.Containers[0].Env {
+		if e.Name == "CREDENTIAL_PROXY_KUBE_API_SERVER" {
+			got = append(got, e.Value)
+		}
+	}
+	if len(got) != 1 || got[0] != want {
+		t.Errorf("CREDENTIAL_PROXY_KUBE_API_SERVER = %v, want exactly one, %q", got, want)
+	}
+}
+
+// The gateway is a separate Go module, so its session pods carry a copy of
+// the value (sessionPodNdots in a2a/gateway/spawn.go). This reads that file,
+// so a change here that leaves the gateway behind fails; the gateway's
+// TestSessionPodNdotsIsTheOperators is the same check from the other side,
+// because each module's tests run only when that module changes.
+func TestBrokerCallerPodNdotsIsTheGateways(t *testing.T) {
+	if got := stringConstInSource(t, a2aGatewaySpawnSource, "sessionPodNdots"); got != brokerCallerPodNdots {
+		t.Errorf("the gateway's sessionPodNdots is %q and brokerCallerPodNdots is %q; change both together", got, brokerCallerPodNdots)
 	}
 }

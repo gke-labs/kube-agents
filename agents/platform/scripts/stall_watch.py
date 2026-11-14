@@ -112,8 +112,11 @@ for good; the ledger's ``unreadable`` entry for the namespace says so while
 it lasts. The discovery lists every namespace in one request (metadata
 only), but only the namespaces the watch reads reach its record: the system
 namespaces, ``STALL_WATCH_EXCLUDE_NAMESPACES`` and the exempt annotation
-keep theirs out of it. An explicit ``STALL_WATCH_KINDS`` replaces the
-wildcard with the rest of the default list, and may name it.
+keep theirs out of it. A cluster with no namespace to watch asks for no
+kind, so it gets no discovery: its record stays as it was, and is redone
+when the cluster has a namespace to watch again and the refresh is due. An
+explicit ``STALL_WATCH_KINDS`` replaces the wildcard with the rest of the
+default list, and may name it.
 
 What an install can tune. The CR's ``spec.harness.stallWatch`` reaches this
 script as three variables the operator pins in the managed .env on every
@@ -337,7 +340,8 @@ NAMESPACES_ARGV = (
 #: kubectl did), so the listing reads the marker before the exit code.
 PROXY_TRUNCATED_TEXT = "credential proxy output truncated"
 #: The kind list is filtered to what a cluster serves, from one
-#: `kubectl api-resources` per cluster, so a warning from the report script
+#: `kubectl api-resources` per cluster that has a namespace to watch, so a
+#: warning from the report script
 #: about a kind it could not scan is always a failure and never "this cluster
 #: has no cert-manager".
 API_RESOURCES_ARGV = ("kubectl", "api-resources", "--namespaced=true", "--verbs=list", "-o", "name")
@@ -530,6 +534,33 @@ SYSTEM_NAMESPACE_PREFIXES = ("gke-", "gke-managed-", "config-management-")
 #: goes dark mid-sweep costs one scan timeout rather than one per namespace.
 PROJECT_LOOKUP_TIMEOUT_SECONDS = 30
 CLUSTER_LIST_TIMEOUT_SECONDS = 120
+# A project's cluster list is read first through the broker's read-only Cloud API
+# relay, from one sandbox process (`gke_cluster_reads.py`, the reader
+# cluster_agent_reconcile uses), which starts no `gcloud` in the broker. The relay
+# answers name, location and status, which is all this listing keeps, and its
+# `missingZones` says when a list is partial. Any other answer, a helper that is
+# missing (a sandbox image older than this script) or cannot run, or a relay this
+# caller may not use, falls back to `gcloud container clusters list` as before; a
+# helper that could not run at all turns the relay off for the rest of the process.
+# The root-owned copy the shell may run (gke_cluster_reads.SANDBOX_GKE_READS;
+# test_stall_watch holds the two equal).
+GKE_READS_HELPER = "/opt/vcs/libexec/platform/gke_cluster_reads.py"
+# The relay read gets at most this, and at most half of the listing's budget, so a
+# helper that stalls leaves gcloud the rest.
+RELAY_LIST_TIMEOUT_SECONDS = 30
+RELAY_LIST_BUDGET_SHARE = 0.5
+# What the helper's own deadline leaves for the sandbox login and the interpreter.
+RELAY_STARTUP_SECONDS = 3.0
+RELAY_INCOMPLETE_LISTING = "the cluster list did not answer for {zones}"
+# The broker's refusals that are about the relay, not one project: a caller role it
+# does not serve, a handler with no relay, a host it does not take (a broker older
+# than the routes). The relay is off for the rest of the process. The same sets as
+# cluster_agent_reconcile's (test_stall_watch holds them equal).
+RELAY_OFF_CODES = frozenset({"CALLER_ROLE_FORBIDDEN", "API_RELAY_DISABLED"})
+RELAY_OFF_RULES = frozenset({"gcp.api.host", "gcp.api.host-refused"})
+# A project the helper may put in a URL path; anything else is listed with gcloud,
+# so a malformed name can never be read as some other path (the reconcile's rule).
+RELAY_SEGMENT = re.compile(r"[a-z0-9][a-z0-9.:-]*")
 #: The broker bounds one gcloud it runs at 300 s (its ``--timeout-seconds``
 #: default) and a one-shot kubectl at 60 s. No cap in this file holds more than
 #: one broker admission wait and one such run. The shim retries a refusal on
@@ -548,7 +579,8 @@ SHIM_RETRY_DEADLINE_SECONDS = max(0, CLUSTER_LIST_TIMEOUT_SECONDS - BROKER_GCLOU
 #: listing still running at the deadline is unlisted this tick. One at a time,
 #: a hundred projects (the scope's cap) each hanging to the gcloud timeout would
 #: outlast the whole tick.
-#: Every listing is a gcloud process the credential proxy runs. The pool was
+#: A listing the relay cannot answer (GKE_READS_HELPER) is a gcloud process the
+#: credential proxy runs; the relay's is one sandbox process and no gcloud. The pool was
 #: sized to the four requests the proxy admitted at its old 1Gi default
 #: (docs/designs/credential-proxy-child-memory-budget.md §2.2), past which a
 #: listing queues at the proxy and one still waiting at its 60 s admission
@@ -583,7 +615,9 @@ NAMESPACE_SCAN_TIMEOUT_SECONDS = 300
 #: One cluster's read in stall_report.py's cluster mode: one kubectl per
 #: kind across every namespace (pages, for the kinds the broker pages), one
 #: for the Warning events, and one per referent kind the dangling-reference
-#: heuristic resolves, at most five. The broker ends a one-shot kubectl at
+#: heuristic resolves, at most five (a referent kind whose cluster-wide
+#: listing failed adds one listing per namespace with a reference, until
+#: one is refused too). The broker ends a one-shot kubectl at
 #: 60 s, so ten minutes holds ten such calls at the bound, past the default
 #: list's eight kinds plus events; a cluster that outruns it is read per
 #: namespace under the cursor instead, so a slow cluster is still read, a
@@ -594,6 +628,18 @@ NAMESPACE_SCAN_TIMEOUT_SECONDS = 300
 #: budget.
 CLUSTER_SCAN_TIMEOUT_SECONDS = 600
 SCAN_TIMEOUT_FLOOR_SECONDS = 1
+#: Every hop through `run_sandbox` runs its remote command under coreutils
+#: `timeout` (in the sandbox image's base; the endpoint helper's own hop in
+#: `gke_endpoint` is not wrapped) at the hop's own bound plus this grace, TERM then KILL after
+#: REMOTE_TIMEOUT_KILL_AFTER_SECONDS. A local timeout ends the ssh and frees
+#: the broker slot, but not the `stall_report.py` or `kubectl` it started on
+#: the other side; without the wrapper a few timeouts leave more readers in
+#: the sandbox than SCAN_WORKERS admits. The grace keeps the local timeout
+#: first, so a timed-out hop still reads as one here.
+REMOTE_TIMEOUT_COMMAND = "timeout"
+REMOTE_TIMEOUT_KILL_FLAG = "-k"
+REMOTE_TIMEOUT_KILL_AFTER_SECONDS = 5
+REMOTE_TIMEOUT_GRACE_SECONDS = 2
 #: stall_report.py exits 2 when it could read no kind at all; anything else
 #: non-zero is a crash, and both leave the namespace unread this tick.
 REPORT_UNREADABLE_EXIT = 2
@@ -793,7 +839,13 @@ def run_sandbox(
     with BROKER_SLOTS:
         if deadline is not None:
             timeout = min(timeout, max(SCAN_TIMEOUT_FLOOR_SECONDS, deadline - time.monotonic()))
-        return sandbox_exec.run(argv, remote_env=remote_env, timeout=timeout, check=False, stdin=stdin)
+        # The remote command runs under `timeout` for the same bound plus a
+        # grace: the local side gives up first, so a timeout here still
+        # reads as one (the budget cut, the cluster's slice skipped), and
+        # the reader in the sandbox ends within the grace rather than
+        # running on past the slot it was counted against.
+        remote = [REMOTE_TIMEOUT_COMMAND, REMOTE_TIMEOUT_KILL_FLAG, str(REMOTE_TIMEOUT_KILL_AFTER_SECONDS), f"{timeout + REMOTE_TIMEOUT_GRACE_SECONDS:g}", *argv]
+        return sandbox_exec.run(remote, remote_env=remote_env, timeout=timeout, check=False, stdin=stdin)
 
 
 def stderr_excerpt(text: str | None) -> str:
@@ -948,10 +1000,75 @@ def project_id() -> str | None:
     return r.stdout.strip() or None
 
 
+_relay_off = False
+
+
+def list_clusters_by_relay(project: str, timeout: float) -> tuple[list[dict], str | None] | None:
+    """`list_clusters`'s answer read through the relay, or None for gcloud to read it."""
+    global _relay_off
+    if _relay_off or timeout < RELAY_STARTUP_SECONDS + 1:
+        return None
+    if not RELAY_SEGMENT.fullmatch(project) or ".." in project:
+        return None
+    request = {"projects": [project], "workers": 1, "budget_seconds": timeout - RELAY_STARTUP_SECONDS}
+    try:
+        result = run_sandbox(["python3", GKE_READS_HELPER], timeout=timeout, stdin=json.dumps(request))
+    except sandbox_exec.SandboxUnavailable:
+        raise
+    except subprocess.TimeoutExpired:
+        return None
+    try:
+        if result.returncode != 0:
+            raise ValueError(f"exit {result.returncode}")
+        row = json.loads(result.stdout or "")["lists"][project]
+    except (ValueError, KeyError, TypeError):
+        _relay_off = True
+        return None
+    if not isinstance(row, dict):
+        _relay_off = True
+        return None
+    error = row.get("error") if isinstance(row.get("error"), dict) else {}
+    if error.get("code") in RELAY_OFF_CODES or (
+        error.get("code") == "SECURITY_POLICY_BLOCKED" and error.get("rule") in RELAY_OFF_RULES
+    ):
+        _relay_off = True
+        return None
+    names, statuses = row.get("clusters"), row.get("statuses")
+    if row.get("status") == http.client.OK and isinstance(names, list) and statuses is None:
+        # A sandbox image whose helper predates the statuses: it will not change
+        # within this process.
+        _relay_off = True
+        return None
+    if (
+        row.get("status") != http.client.OK
+        or not isinstance(names, list)
+        or not isinstance(statuses, list)
+        or len(names) != len(statuses)
+    ):
+        return None
+    clusters = [
+        {"name": pair[0], "location": pair[1], "status": status}
+        for pair, status in zip(names, statuses)
+        if isinstance(pair, list) and len(pair) == 2 and all(isinstance(x, str) and x for x in pair)
+        and isinstance(status, str)
+    ]
+    if len(clusters) != len(names):
+        return None
+    missing = [z for z in row.get("missingZones") or [] if isinstance(z, str)]
+    return clusters, (RELAY_INCOMPLETE_LISTING.format(zones=", ".join(missing)) if missing else None)
+
+
 def list_clusters(project: str, timeout: float = CLUSTER_LIST_TIMEOUT_SECONDS) -> tuple[list[dict], str | None]:
     """Every cluster as {name, location, status}, and why the listing is
-    incomplete when gcloud said so. Raises on a list that could not be read,
-    so the caller can tell an empty project from a failed call."""
+    incomplete when gcloud (or the relay's missingZones) said so. Raises on a
+    list that could not be read, so the caller can tell an empty project from a
+    failed call. The relay is tried first (`list_clusters_by_relay`)."""
+    if not _relay_off:
+        started = time.monotonic()
+        relayed = list_clusters_by_relay(project, min(RELAY_LIST_TIMEOUT_SECONDS, timeout * RELAY_LIST_BUDGET_SHARE))
+        if relayed is not None:
+            return relayed
+        timeout = max(1.0, timeout - (time.monotonic() - started))
     r = run_sandbox(
         ["gcloud", "container", "clusters", "list", f"--project={project}", "--format=json"],
         timeout=timeout,
@@ -1810,9 +1927,10 @@ class SweepContext:
 
 
 def read_cluster(ctx: SweepContext, cid: str) -> ClusterPart:
-    """One cluster's sweep, on a worker: its credentials, its namespaces and
-    served kinds, its wildcard discovery when due, then the cluster-wide
-    read, and the per-namespace read for whatever that could not read whole.
+    """One cluster's sweep, on a worker: its credentials and its namespaces,
+    then, when it has a namespace to watch, its served kinds, its wildcard
+    discovery when due, the cluster-wide read, and the per-namespace read for
+    whatever that could not read whole.
     Returns the part; raises only for a lost sandbox, which ends the tick: the
     raising worker lowers the budget flag itself, so every other worker stops
     at its next check rather than when the main thread sees the exception."""
@@ -1871,19 +1989,25 @@ def read_cluster_part(ctx: SweepContext, cid: str) -> ClusterPart:
         readable = True
         if fetched:
             part.credential = CREDENTIAL_SET
-        served = served_kinds(kubeconfig)
-        kinds, dropped = kinds_for(served)
+        kinds, dropped = None, set()
         # The wildcard's kinds, per namespace, from this cluster's
         # discovery record, redone when due. A discovery that fails holds
         # the kinds it could not read; it never makes the cluster unreadable.
         extra_kinds, held, cut, next_turns = {}, set(), {}, {}
-        candidates = wildcard_candidates(served, ctx.wildcards)
         record = ctx.discoveries.get(cid)
-        if candidates and not sweep.out_of_budget(ctx.started) and ctx.claim_refresh(record, candidates):
-            record = discover_kinds(kubeconfig, candidates, now, record, set(namespaces))
-            part.discovery = record
-        if ctx.wildcards and (candidates or record is not None):
-            extra_kinds, held, cut, next_turns = wildcard_kinds_for(record, candidates, ctx.wildcards, cluster_label(cid))
+        # A cluster with no namespace to watch asks for no kind, so the
+        # served-kinds call and the wildcard discovery are skipped. It is
+        # still read: its listing stands, with 0 namespaces. Its discovery
+        # record stays as it was until it has a namespace to watch again.
+        if namespaces:
+            served = served_kinds(kubeconfig)
+            kinds, dropped = kinds_for(served)
+            candidates = wildcard_candidates(served, ctx.wildcards)
+            if candidates and not sweep.out_of_budget(ctx.started) and ctx.claim_refresh(record, candidates):
+                record = discover_kinds(kubeconfig, candidates, now, record, set(namespaces))
+                part.discovery = record
+            if ctx.wildcards and (candidates or record is not None):
+                extra_kinds, held, cut, next_turns = wildcard_kinds_for(record, candidates, ctx.wildcards, cluster_label(cid))
     except sandbox_exec.SandboxUnavailable:
         raise
     except READ_FAILURES as exc:
