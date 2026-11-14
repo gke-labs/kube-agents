@@ -1,10 +1,10 @@
-"""The chart creates the AgentProfile namespace on a "next" install (#3655).
+"""The chart creates the AgentProfile namespace on every install (#3655).
 
 Profile workers run in `<release namespace>-profiles`. The chart creates it, not the
 operator: the operator renders only its quota and network policy, inside it, with the
-namespaced rights it already holds. A "today" install, the default, gets no such
-namespace. `platformAgent.harness.tuning.profiles` reaches the CR, and the values
-schema holds it to the CRD's bounds.
+namespaced rights it already holds. A release without a PlatformAgent
+(`platformAgent.enabled=false`) gets no such namespace. `platformAgent.harness.tuning.profiles`
+reaches the CR, and the values schema holds it to the CRD's bounds.
 
 Run: python3 -m unittest discover -s tests -p 'test_chart_profiles_namespace.py' -v
 """
@@ -46,12 +46,11 @@ def _docs(template: str, *overrides: str) -> list:
 
 @unittest.skipUnless(_HELM, "helm not on PATH")
 class ProfilesNamespaceRenderTest(unittest.TestCase):
-    def test_a_today_install_gets_no_profile_namespace(self):
-        self.assertEqual(_docs(_NS_TEMPLATE), [])
-        self.assertEqual(_docs(_NS_TEMPLATE, "platformAgent.mode=today"), [])
+    def test_a_release_without_a_platform_agent_gets_no_profile_namespace(self):
+        self.assertEqual(_docs(_NS_TEMPLATE, "platformAgent.enabled=false"), [])
 
-    def test_a_next_install_gets_the_release_namespace_with_profiles_appended(self):
-        docs = _docs(_NS_TEMPLATE, "platformAgent.mode=next")
+    def test_the_default_install_gets_the_release_namespace_with_profiles_appended(self):
+        docs = _docs(_NS_TEMPLATE)
         self.assertEqual(len(docs), 1, docs)
         self.assertEqual(docs[0]["kind"], "Namespace")
         self.assertEqual(docs[0]["metadata"]["name"], f"{_RELEASE_NS}-profiles")
@@ -61,13 +60,13 @@ class ProfilesNamespaceRenderTest(unittest.TestCase):
         self.assertEqual(docs[0]["metadata"]["annotations"]["meta.helm.sh/release-namespace"], _RELEASE_NS)
 
     def test_a_release_namespace_too_long_for_the_suffix_fails_at_render(self):
-        args = [_HELM, "template", "ka", str(_CHART), "-n", "a" * 55, "--set", "platformAgent.mode=next", *_REQUIRED]
+        args = [_HELM, "template", "ka", str(_CHART), "-n", "a" * 55, *_REQUIRED]
         result = subprocess.run(args, capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("longer than 63 characters", result.stderr)
 
     def test_profile_tuning_reaches_the_cr(self):
-        cr = _docs(_CR_TEMPLATE, "platformAgent.mode=next",
+        cr = _docs(_CR_TEMPLATE,
                    "platformAgent.harness.tuning.profiles.ceiling=5",
                    "platformAgent.harness.tuning.profiles.warmReplicas=0")[0]
         self.assertEqual(cr["spec"]["harness"]["tuning"]["profiles"], {"ceiling": 5, "warmReplicas": 0})
