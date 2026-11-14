@@ -403,13 +403,22 @@ func TestBridgeJetStreamGrantOnARealServer(t *testing.T) {
 	}
 	allowed("$JS.ACK TASKS (msg.Ack)", delivered.Ack())
 	// The ack landed, read from web's side, the observer for every consumer
-	// in this test.
+	// in this test. Ack is fire-and-forget, as it is in the bridge, so the
+	// server may not have processed it yet: wait for the floor to move rather
+	// than read it once (#5860).
 	relayView, err := webJS.Consumer(ctx, "TASKS", "bridge-platform")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info, err := relayView.Info(ctx); err != nil || info.AckFloor.Consumer != 1 {
-		t.Fatalf("ack floor after the bridge's ack: %+v (%v)", info, err)
+	var info *jetstream.ConsumerInfo
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		info, err = relayView.Info(ctx)
+		if err == nil && info.AckFloor.Consumer == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("ack floor after the bridge's ack: %+v (%v)", info, err)
+		}
 	}
 
 	_, err = js.Publish(ctx, eventsSubject, []byte(`{"kind":"status-update"}`), jetstream.WithMsgID("e1"))
