@@ -219,6 +219,9 @@ func TestChatChunksContinuationAfterFencedBlock(t *testing.T) {
 	if len(chunks) < 3 {
 		t.Fatalf("got %d chunks, want >= 3", len(chunks))
 	}
+	if !strings.Contains(chunks[1], "prose line") {
+		t.Errorf("chunk 2 cut was dragged back before prose: len=%d suffix=%q", len(chunks[1]), chunks[1][max(0, len(chunks[1])-30):])
+	}
 	for i, c := range chunks {
 		if len(c) > discordChunk {
 			t.Errorf("chunk %d exceeds %d bytes: %d", i, discordChunk, len(c))
