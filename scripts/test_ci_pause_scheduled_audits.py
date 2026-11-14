@@ -25,6 +25,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import sqlite3
 import stat
 import subprocess
@@ -753,15 +754,24 @@ class ChainWatchTest(unittest.TestCase):
             return log.read_text().splitlines() if log.exists() else []
 
     def test_the_watch_runs_passes_and_a_stop_ends_its_nap_at_once(self):
-        calls = self.run_watch(2, 'echo "$1 $2" >> "$LOG"', [
-            "sleep 5",
-            'start=$SECONDS',
+        # A 4s nap against a 2.5s bound: a stop that lands mid-pass legitimately
+        # waits one of the stop's own 1s polls, so the bound has to clear that,
+        # and the nap has to be longer than the bound for "waited out the nap"
+        # to be told apart. Timed in Python, not with bash's whole-second
+        # SECONDS, which rounds a 1.1s stop up to 2 (#5910).
+        py = shlex.quote(sys.executable)
+        now = f"{py} -c 'import time; print(time.time())'"
+        calls = self.run_watch(4, 'echo "$1 $2" >> "$LOG"', [
+            "sleep 9",
+            f"start=$({now})",
             "stop_chain_audits_watch",
             # The nap ended at once, not at its next wake-up.
-            '[ $((SECONDS - start)) -le 1 ] || { echo "stop waited out the nap" >&2; exit 9; }',
+            f"{py} -c 'import sys; sys.exit(float(sys.argv[2]) - float(sys.argv[1]) > 2.5)' \"$start\" \"$({now})\""
+            ' || { echo "stop waited out the nap" >&2; exit 9; }',
             '[ ! -e "{tmp}/watch.running" ] && [ ! -e "{tmp}/watch.pid" ]',
             'n=$(wc -l < "$LOG")',
-            "sleep 3",
+            # Longer than the interval: a watch that survived the stop would pass again.
+            "sleep 5",
             '[ "$(wc -l < "$LOG")" -eq "$n" ]',
         ])
         self.assertGreaterEqual(len(calls), 2)
