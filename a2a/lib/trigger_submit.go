@@ -193,8 +193,13 @@ func validateIdempotencyKey(key string, sched ScheduleRef) error {
 	if parts[1] != sched.Namespace || parts[2] != sched.Name {
 		return fmt.Errorf("idempotency key %q is not for schedule %s/%s", key, sched.Namespace, sched.Name)
 	}
-	if parts[3] == "" || strings.ContainsAny(parts[3], " \t\r\n") {
+	if parts[3] == "" {
 		return fmt.Errorf("idempotency key %q has no run token", key)
+	}
+	for i := 0; i < len(key); i++ {
+		if c := key[i]; c <= ' ' || c == 0x7f {
+			return fmt.Errorf("idempotency key %q holds a space or control character", key)
+		}
 	}
 	return nil
 }

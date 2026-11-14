@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"strings"
 	"sync"
 	"time"
@@ -109,6 +110,9 @@ func (g *Gateway) handleTriggerSubmit(ctx context.Context, subject string, data 
 	if err := dec.Decode(&s); err != nil {
 		return g.triggerRefused("", lib.TriggerRefusedInvalid, "the submission is not well-formed")
 	}
+	if _, err := dec.Token(); err != io.EOF {
+		return g.triggerRefused("", lib.TriggerRefusedInvalid, "the submission has data after its object")
+	}
 	if err := lib.ValidateTriggerSubmit(source, s); err != nil {
 		return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedInvalid, err.Error())
 	}
@@ -121,15 +125,21 @@ func (g *Gateway) handleTriggerSubmit(ctx context.Context, subject string, data 
 		return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedInvalid, "schedule "+s.Schedule.Namespace+"/"+s.Schedule.Name+" is not in the install's namespace")
 	}
 	key := triggerConversationKey(source, s.Schedule)
+	// One submission at a time per trigger, and the relay's batches for its
+	// tasks wait on the same lock (relayBatch): the record read here is the
+	// one written back, and a fast executor's terminal finds its TaskRef.
+	lock := g.lockSession(key)
+	lock.Lock()
+	defer lock.Unlock()
 
-	// A repeat of the last submission is the same run: answered with its
-	// task, ahead of the rate cap, so a retry never spends the budget.
+	// A repeat of a recent run is that run: answered with its task, ahead
+	// of every other check, so a retry never spends the budget or mints.
 	rec, err := g.reg.Get(ctx, key)
 	if err != nil {
 		return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedUnavailable, "the trigger's record could not be read")
 	}
-	if rec != nil && rec.TriggerKey == s.IdempotencyKey && rec.TriggerTask != "" {
-		return lib.TriggerSubmitReply{TaskID: rec.TriggerTask}
+	if task := rec.triggerRunTask(s.IdempotencyKey); task != "" {
+		return lib.TriggerSubmitReply{TaskID: task}
 	}
 
 	card, ok := g.profiles.lookup(s.Profile)
@@ -139,6 +149,17 @@ func (g *Gateway) handleTriggerSubmit(ctx context.Context, subject string, data 
 	if !cardAllowsTier(card, capability.TierUnattended) {
 		return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedTierNotAllowed, "profile "+s.Profile+" does not allow the unattended tier")
 	}
+	// The same route every profile task takes (profileRouteFor): the
+	// install's namespace scope, or a target the scope file admits; the
+	// parameters the persona declares; a pin's tiers on its cluster. A
+	// target that routes the task to another profile isn't this schedule's.
+	route, err := g.profileRouteFor(s.Profile, s.Parameters, capability.TierUnattended, lib.SubmitKindTop)
+	if err != nil {
+		return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedInvalid, err.Error())
+	}
+	if route.Profile != s.Profile {
+		return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedInvalid, "the schedule's target routes to profile "+route.Profile+", not "+s.Profile)
+	}
 	if !g.triggerLimiter().allow(key, time.Now()) {
 		return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedRateLimited, "the trigger is over its rate cap")
 	}
@@ -147,8 +168,8 @@ func (g *Gateway) handleTriggerSubmit(ctx context.Context, subject string, data 
 	trigger := &capability.Trigger{Name: s.Trigger.Name, Origin: s.Trigger.Origin, Stream: s.Trigger.Stream}
 	minted, err := capability.NewMinter(g.client.JetStream()).Mint(ctx, taskID, capability.Entry{
 		Tier:     capability.TierUnattended,
-		Scope:    g.cfg.AuthorityScope,
-		Profile:  s.Profile,
+		Scope:    route.Scope,
+		Profile:  route.Profile,
 		Delegate: profileGrantDelegate,
 		Trigger:  trigger,
 	})
@@ -160,8 +181,13 @@ func (g *Gateway) handleTriggerSubmit(ctx context.Context, subject string, data 
 
 	if rec == nil {
 		rec = &SessionRecord{Key: key, ContextID: "ctx-" + randHex(contextIDHexWidth), Kind: triggerAudienceKind}
-		if err := g.reg.Create(ctx, rec); err != nil && !errors.Is(err, ErrSessionExists) {
-			return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedUnavailable, "the trigger's record could not be written")
+		if err := g.reg.Create(ctx, rec); err != nil {
+			if !errors.Is(err, ErrSessionExists) {
+				return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedUnavailable, "the trigger's record could not be written")
+			}
+			if rec, err = g.reg.Get(ctx, key); err != nil || rec == nil {
+				return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedUnavailable, "the trigger's record could not be read")
+			}
 		}
 	}
 	authority := Authority{
@@ -174,31 +200,31 @@ func (g *Gateway) handleTriggerSubmit(ctx context.Context, subject string, data 
 		Audience: AuthorityAudience{Conversation: key, Kind: triggerAudienceKind},
 		Trigger:  trigger,
 	}
-	route := &profileRoute{Profile: s.Profile, Tier: capability.TierUnattended, Kind: lib.SubmitKindTop, Params: s.Parameters}
 	payload, err := submissionPayload(triggerTaskText(s), taskID, rec.ContextID, route)
 	if err != nil {
 		return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedInvalid, "the task's message could not be built")
 	}
 	correlationID := "corr-" + randHex(contextIDHexWidth)
 	env, err := lib.NewMessageEnvelope(gatewayParty, taskID, rec.ContextID, correlationID, payload,
-		lib.WithTo(lib.Party{Session: s.Profile}),
+		lib.WithTo(lib.Party{Session: route.Profile}),
 		lib.WithAuthority(authority.Render(capRef)),
-		// The idempotency key's envelope id: a publish repeated after a
-		// crash between the publish and the record's write is the stream's
-		// duplicate, not a second task.
+		// The idempotency key's envelope id: a publish repeated inside the
+		// stream's duplicate window is the stream's duplicate, not a
+		// second task.
 		lib.WithEnvelopeID("env-"+taskID))
 	if err != nil {
 		return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedInvalid, "the task's envelope could not be built")
 	}
 
-	// Registered where the relay looks before the publish, as startTask
-	// does, so the executor's first event finds its conversation.
+	// Recorded and registered where the relay looks before the publish, as
+	// startTask does, so the executor's first event finds its conversation.
 	requester := TaskRequester{Backend: triggerRequesterBackend, Subject: s.Trigger.Name}
+	prevActive, prevTasks := rec.ActiveTask, rec.Tasks
 	rec.Delivery = &s.Delivery
 	rec.ActiveTask = &ActiveTask{TaskID: taskID, CorrelationID: correlationID, Ask: truncateRunes(s.Prompt, askCap),
 		SubmittedAt: time.Now(), Capability: capRef}
-	rec.Tasks = append(rec.Tasks, TaskRef{
-		ID: taskID, Addressee: s.Profile, CorrelationID: correlationID, Capability: capRef,
+	rec.Tasks = append(append([]TaskRef(nil), rec.Tasks...), TaskRef{
+		ID: taskID, Addressee: route.Profile, CorrelationID: correlationID, Capability: capRef,
 		Requester: &requester, Attribution: authority.Attribution(), StartedAt: time.Now().UTC(),
 		RootTaskID: taskID, Tier: string(capability.TierUnattended), Request: capAsk(s.Prompt),
 	})
@@ -206,6 +232,10 @@ func (g *Gateway) handleTriggerSubmit(ctx context.Context, subject string, data 
 		rec.Tasks = rec.Tasks[len(rec.Tasks)-taskHistoryCap:]
 	}
 	rec.LastTaskActivity = time.Now().UTC()
+	if err := g.reg.Put(ctx, rec); err != nil {
+		g.log.Error("trigger record write failed", "conversation", rec.Key, "taskId", taskID, "err", err)
+		return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedUnavailable, "the trigger's record could not be written")
+	}
 	g.mu.Lock()
 	g.taskSessions[taskID] = rec.Key
 	g.relays[taskID] = &relayState{local: true}
@@ -213,20 +243,26 @@ func (g *Gateway) handleTriggerSubmit(ctx context.Context, subject string, data 
 	if err := g.reg.IndexTask(ctx, taskID, rec.Key); err != nil {
 		g.log.Error("trigger task index write failed", "taskId", taskID, "err", err)
 	}
-	if _, err := g.client.PublishSeq(ctx, lib.TaskSubmitSubject(s.Profile, string(capability.TierUnattended), lib.SubmitKindTop, taskID), env); err != nil {
+	if _, err := g.client.PublishSeq(ctx, lib.TaskSubmitSubject(route.Profile, string(capability.TierUnattended), lib.SubmitKindTop, taskID), env); err != nil {
 		g.log.Error("trigger task publish failed", "trigger", s.Trigger.Name, "taskId", taskID, "err", err)
 		g.mu.Lock()
 		delete(g.taskSessions, taskID)
 		delete(g.relays, taskID)
 		g.mu.Unlock()
+		rec.ActiveTask, rec.Tasks = prevActive, prevTasks
+		if err := g.reg.Put(ctx, rec); err != nil {
+			g.log.Error("trigger record restore failed", "conversation", rec.Key, "taskId", taskID, "err", err)
+		}
 		return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedUnavailable, "the task could not be published")
 	}
 	// The run is on the bus: only now does the record name it, so a repeat
 	// after a failed publish starts the run rather than answering with a
-	// task that never went out.
-	rec.TriggerKey, rec.TriggerTask = s.IdempotencyKey, taskID
+	// task that never went out. A write that fails here is logged, and the
+	// task id still goes back, so the reconciler holds it and doesn't ask
+	// again under this key.
+	rec.addTriggerRun(TriggerRun{Key: s.IdempotencyKey, Task: taskID})
 	if err := g.reg.Put(ctx, rec); err != nil {
-		g.log.Error("trigger record write failed", "conversation", rec.Key, "taskId", taskID, "err", err)
+		g.log.Error("trigger run write failed", "conversation", rec.Key, "taskId", taskID, "err", err)
 	}
 	g.log.Info("trigger task started", "trigger", s.Trigger.Name, "taskId", taskID, "profile", s.Profile,
 		"idempotencyKey", s.IdempotencyKey)
@@ -249,6 +285,31 @@ func (g *Gateway) unpostableTrigger(conversation string) bool {
 	}
 	g.log.Debug("nothing posted to a trigger's conversation", "conversation", conversation)
 	return true
+}
+
+// triggerRunsKept bounds SessionRecord.TriggerRuns: a reconciler retries a
+// slot only inside its starting deadline, so the recent runs are enough.
+const triggerRunsKept = 64
+
+// triggerRunTask is the task a recent run under key started, or "".
+func (rec *SessionRecord) triggerRunTask(key string) string {
+	if rec == nil {
+		return ""
+	}
+	for _, r := range rec.TriggerRuns {
+		if r.Key == key {
+			return r.Task
+		}
+	}
+	return ""
+}
+
+// addTriggerRun records a run, keeping the newest triggerRunsKept.
+func (rec *SessionRecord) addTriggerRun(r TriggerRun) {
+	rec.TriggerRuns = append(rec.TriggerRuns, r)
+	if n := len(rec.TriggerRuns) - triggerRunsKept; n > 0 {
+		rec.TriggerRuns = append([]TriggerRun(nil), rec.TriggerRuns[n:]...)
+	}
 }
 
 // triggerTaskID derives the run's task id from its idempotency key, so the

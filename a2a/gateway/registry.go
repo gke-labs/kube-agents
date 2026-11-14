@@ -96,6 +96,13 @@ type ActiveTask struct {
 // SessionRecord is one conversation's durable state in the session-state KV
 // bucket: contextId, current pod, bus session name, last activity, roster.
 // Runtime state is not git and not pod annotations; KV is the house answer.
+// TriggerRun is one run the trigger ingress started: its idempotency key and
+// its task (SessionRecord.TriggerRuns).
+type TriggerRun struct {
+	Key  string `json:"key"`
+	Task string `json:"task"`
+}
+
 type SessionRecord struct {
 	Key string `json:"key"`
 	// Epoch is the gateway term that last wrote the record
@@ -176,13 +183,12 @@ type SessionRecord struct {
 	// (trigger:<source>/<ns>/<name>) for the relay to route (#4685 Track 3).
 	// nil everywhere else.
 	Delivery *lib.ScheduleDelivery `json:"delivery,omitempty"`
-	// TriggerKey and TriggerTask are the last submission the trigger
-	// ingress started on this conversation: its idempotency key and the
-	// task. A repeat of the key is answered with the task and starts
-	// nothing, since a second mint would overwrite the grant revision the
-	// first task's envelope pins.
-	TriggerKey  string `json:"triggerKey,omitempty"`
-	TriggerTask string `json:"triggerTask,omitempty"`
+	// TriggerRuns are the recent runs the trigger ingress started on this
+	// conversation, oldest first, at most triggerRunsKept: each run's
+	// idempotency key and task. A repeat of any of them is answered with its
+	// task and starts nothing, since a second mint would overwrite the grant
+	// revision the first task's envelope pins.
+	TriggerRuns []TriggerRun `json:"triggerRuns,omitempty"`
 }
 
 // idleSince is when the conversation went quiet: its last user message, or,

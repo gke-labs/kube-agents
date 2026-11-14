@@ -3,6 +3,8 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -40,14 +42,20 @@ type triggerRig struct {
 
 func startTriggerRig(t *testing.T, tweak func(*Config)) *triggerRig {
 	t.Helper()
+	scope := filepath.Join(t.TempDir(), "scope.json")
+	if err := os.WriteFile(scope, []byte(`{"present":true,"projects":["p1"]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	r := startRigWith(t, func(c *Config) {
 		c.Namespace = "kubeagents-system"
+		c.ScopeFile = scope
 		if tweak != nil {
 			tweak(c)
 		}
 	})
 	r.g.profiles.put("fleet-audit", &lib.AgentCard{Name: "fleet-audit", Tiers: []string{"read", "unattended"}})
 	r.g.profiles.put("readonly", &lib.AgentCard{Name: "readonly", Tiers: []string{"read"}})
+	r.g.profiles.put("cluster", &lib.AgentCard{Name: "cluster", Tiers: []string{"read", "unattended"}, Parameters: clusterParams})
 	nc, err := connectTest(r.url)
 	if err != nil {
 		t.Fatal(err)
@@ -152,8 +160,11 @@ func TestATriggerSubmissionStartsATaskWithTheTriggerBound(t *testing.T) {
 	if rec.Delivery == nil || *rec.Delivery != s.Delivery {
 		t.Errorf("recorded delivery = %+v", rec.Delivery)
 	}
-	if rec.TriggerKey != s.IdempotencyKey || rec.TriggerTask != reply.TaskID {
-		t.Errorf("recorded run = %q %q", rec.TriggerKey, rec.TriggerTask)
+	if len(rec.TriggerRuns) != 1 || rec.TriggerRuns[0] != (TriggerRun{Key: s.IdempotencyKey, Task: reply.TaskID}) {
+		t.Errorf("recorded runs = %+v", rec.TriggerRuns)
+	}
+	if entry.Scope != capability.NamespaceScope("kubeagents-system") {
+		t.Errorf("grant scope = %q, want the install namespace's", entry.Scope)
 	}
 }
 
@@ -180,6 +191,14 @@ func TestARepeatedTriggerSubmissionIsTheSameRun(t *testing.T) {
 	second := tr.submit(t, "schedule", next)
 	if second.Refused != nil || second.TaskID == first.TaskID {
 		t.Fatalf("a new slot = %+v", second)
+	}
+	// The first key, retried after the second, is still the first run.
+	if again := tr.submit(t, "schedule", s); again.TaskID != first.TaskID || again.Refused != nil {
+		t.Fatalf("the first key after the second = %+v, want task %s", again, first.TaskID)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if n := len(tr.submissions()); n != 2 {
+		t.Fatalf("%d submissions published, want 2", n)
 	}
 }
 
@@ -215,6 +234,21 @@ func TestATriggerSubmissionIsRefusedWithAReason(t *testing.T) {
 		{"an unknown field", "schedule", []byte(`{"trigger":{"name":"schedule/x","origin":"builtin","stream":"x"},"extra":1}`), lib.TriggerRefusedInvalid},
 		{"a user origin", "schedule", func() lib.TriggerSubmit { s := goodScheduleSubmit(); s.Trigger.Origin = "user"; return s }(), lib.TriggerRefusedInvalid},
 		{"a bad delivery", "schedule", func() lib.TriggerSubmit { s := goodScheduleSubmit(); s.Delivery.JobKey = "has.dot"; return s }(), lib.TriggerRefusedInvalid},
+		{"a target the scope refuses", "schedule", func() lib.TriggerSubmit {
+			s := goodScheduleSubmit()
+			s.Profile = "cluster"
+			s.Parameters = map[string]string{"project": "p-refused", "location": "us-central1", "cluster": "c1"}
+			return s
+		}(), lib.TriggerRefusedInvalid},
+		{"data after the object", "schedule", func() []byte {
+			b, _ := json.Marshal(goodScheduleSubmit())
+			return append(b, []byte(` {"x":1}`)...)
+		}(), lib.TriggerRefusedInvalid},
+		{"a control character in the run token", "schedule", func() lib.TriggerSubmit {
+			s := goodScheduleSubmit()
+			s.IdempotencyKey = "schedule/kubeagents-system/compliance-audit/17\x01"
+			return s
+		}(), lib.TriggerRefusedInvalid},
 		{"another namespace's schedule", "schedule", func() lib.TriggerSubmit {
 			s := goodScheduleSubmit()
 			s.Schedule.Namespace = "team-a"
