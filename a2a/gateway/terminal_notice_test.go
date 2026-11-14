@@ -25,6 +25,8 @@ func TestReasonInPlainWords(t *testing.T) {
 			reasonSentences["hermes-unstructured-reasoning"], true},
 		{"known token with an operator's detail reads as its sentence", "reason: hermes-api-failed - HTTP 500; session: s-1; error: upstream - timed out",
 			reasonSentences["hermes-api-failed"], true},
+		{"a draining tier's refusal reads as its sentence, not the profile-naming detail", "reason: tier-withdrawn - profile tse no longer runs tier oncall; it is draining, so tasks already running at it finish and nothing new starts",
+			reasonSentences["tier-withdrawn"], true},
 		{"detail-shown token reads as its detail", "reason: verifier-refused - the verifier does not allow this agent to run on prod-east",
 			"the verifier does not allow this agent to run on prod-east", true},
 		{"detail-shown token's detail keeps its own dashes and stops before a session id", "reason: capability-refused - the chain does not terminate at a root - the gateway minted none; session: s-1; turn 2",

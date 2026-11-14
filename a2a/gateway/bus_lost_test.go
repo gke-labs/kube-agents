@@ -192,36 +192,38 @@ func TestARunOffTheBusForTheLimitGivesUp(t *testing.T) {
 	}
 }
 
-// A blip shorter than the limit moves nothing: the count starts again on a
-// reconnect, so two blips that add up past it don't either.
-func TestABusBlipDoesNotEndTheRun(t *testing.T) {
-	shortBusWatch(t, 3*time.Second)
-	r := newBusLostRig(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- r.g.RunWith(ctx, RunOptions{BusDownLimit: termWaitBusMax}) }()
-	waitFor(t, "the relay to bind", func() bool { ready, _ := r.g.Readiness(); return ready })
-	var down time.Duration
-	// Blips of about a second each, until together they pass twice the
-	// limit: the reset on each reconnect is the only thing holding the run.
-	for i := 0; i < 12 && down < 2*termWaitBusMax; i++ {
-		start := time.Now()
-		r.stop(t)
-		time.Sleep(500 * time.Millisecond)
-		r.restart(t)
-		down += time.Since(start)
+// A blip shorter than the limit moves nothing, and the count starts again on
+// a reconnect, so blips that add up past the limit don't either; down for
+// the limit without a break does. On a stepped clock: what the count does
+// is the question, not how fast a runner reconnects (#5904).
+func TestTheBusDownCountStartsAgainOnAReconnect(t *testing.T) {
+	const limit = 60 * time.Second
+	var b busDownTracker
+	at := time.Unix(0, 0)
+	look := func(connected bool, step time.Duration) (time.Duration, bool) {
+		at = at.Add(step)
+		return b.observe(connected, at, limit)
 	}
-	if down < 2*termWaitBusMax {
-		t.Fatalf("the blips added up to %s, under twice the %s limit", down, termWaitBusMax)
+	// Ten blips of 50 s each, 500 s down in all, each followed by one
+	// connected look: none reaches the limit.
+	for i := 0; i < 10; i++ {
+		if _, giveUp := look(false, time.Second); giveUp {
+			t.Fatalf("blip %d: gave up on its first disconnected look", i)
+		}
+		if down, giveUp := look(false, 50*time.Second); giveUp {
+			t.Fatalf("blip %d: gave up after %s down, under the %s limit", i, down, limit)
+		}
+		if down, giveUp := look(true, time.Second); giveUp || down != 0 {
+			t.Fatalf("blip %d: a connected look = %s, %v, want the count reset", i, down, giveUp)
+		}
 	}
-	select {
-	case err := <-done:
-		t.Fatalf("the run ended after blips shorter than the limit: %v", err)
-	case <-time.After(1500 * time.Millisecond):
+	// Down without a break: the look at 59 s holds, the look at 60 s gives up.
+	look(false, time.Second)
+	if down, giveUp := look(false, 59*time.Second); giveUp {
+		t.Fatalf("gave up at %s, under the limit", down)
 	}
-	cancel()
-	if err := receive(t, done, 10*time.Second, "the run to stop"); err != nil {
-		t.Fatalf("run after cancel = %v, want nil", err)
+	if down, giveUp := look(false, time.Second); !giveUp || down != limit {
+		t.Fatalf("down %s without a break = %v, want a give-up at the limit", down, giveUp)
 	}
 }
 
@@ -241,10 +243,11 @@ func TestARunWithoutALimitWaitsOutTheBus(t *testing.T) {
 
 // A full outage under the election. The leader gives its term up, releases
 // the lease and Run returns a lost leadership, so the process exits as on a
-// lost lease. The restarted container (a fresh gateway here) campaigns, and
-// the lease cycles (retaken, the term start waits out the bus, released)
-// without a term number being written; the first term once the bus is back
-// is the next number, not one per cycle.
+// lost lease. The restarted container (a fresh gateway here) campaigns: it
+// takes the lease, its term start waits out the bus and releases it, and it
+// stands back and campaigns again rather than exiting, all without a term
+// number being written; the first term once the bus is back is the next
+// number, not one per cycle.
 func TestAFullOutageCyclesTheLeaseAndWritesNoTerm(t *testing.T) {
 	shortBusWatch(t, time.Second)
 	r := newBusLostRig(t)
@@ -279,25 +282,26 @@ func TestAFullOutageCyclesTheLeaseAndWritesNoTerm(t *testing.T) {
 
 	second := make(chan error, 1)
 	go func() { second <- elect("pod-a").Run(ctx, g2, g2.RunWith) }()
-	released := 0
-	deadline := time.Now().Add(20 * time.Second)
-	for released < 2 && time.Now().Before(deadline) {
-		for leaseHolder(t, cs) != "" && time.Now().Before(deadline) {
-			time.Sleep(testRetryPeriod / 4)
+	// A real release: a holder seen, then none. g2 takes the empty lease
+	// first, waits out the bus at its term start, and releases it; it then
+	// stands back and campaigns again, so its Run keeps going. A term
+	// start's bus wait retries every termWaitRetry, and each try waits out
+	// the client's request timeout, so one cycle takes several seconds.
+	released, prev := 0, leaseHolder(t, cs)
+	deadline := time.Now().Add(45 * time.Second)
+	for released < 1 && time.Now().Before(deadline) {
+		time.Sleep(testRetryPeriod / 4)
+		cur := leaseHolder(t, cs)
+		if prev != "" && cur == "" {
+			released++
 		}
-		for leaseHolder(t, cs) == "" && time.Now().Before(deadline) {
-			time.Sleep(testRetryPeriod / 4)
-		}
-		released++
+		prev = cur
 	}
-	if released < 2 {
-		t.Fatalf("lease released %d times during the outage, want at least 2", released)
+	if released < 1 {
+		t.Fatalf("the restarted gateway never released the lease during the outage")
 	}
-	select {
-	case err := <-second:
-		t.Fatalf("the restarted gateway's Run returned during the outage: %v", err)
-	default:
-	}
+	// Past a stand-back it is still campaigning, not exited.
+	never(t, second, testLeaseDuration+3*testRetryPeriod, "the restarted gateway's Run returned during the outage")
 
 	r.restart(t)
 	waitFor(t, "a term once the bus is back", func() bool { ready, _ := g2.Readiness(); return ready })

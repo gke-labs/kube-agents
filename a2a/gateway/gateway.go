@@ -802,23 +802,14 @@ type RunOptions struct {
 func (g *Gateway) watchBus(ctx context.Context, limit time.Duration, cancel context.CancelCauseFunc) error {
 	t := time.NewTicker(busWatchEvery)
 	defer t.Stop()
-	var downSince time.Time
+	var tracker busDownTracker
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-t.C:
 		}
-		if g.client.Connected() {
-			downSince = time.Time{}
-			continue
-		}
-		now := time.Now()
-		if downSince.IsZero() {
-			downSince = now
-			continue
-		}
-		if down := now.Sub(downSince); down >= limit {
+		if down, giveUp := tracker.observe(g.client.Connected(), time.Now(), limit); giveUp {
 			// Once per give-up, at Info: during a full outage the lease
 			// cycles between replicas, and each cycle logs this once.
 			g.log.Info("gateway term: the bus has been down mid-term; giving the lease up so a replica whose bus answers can lead", "down", down.Round(time.Second).String(), "giveUpAfter", limit.String())
@@ -827,6 +818,29 @@ func (g *Gateway) watchBus(ctx context.Context, limit time.Duration, cancel cont
 			return err
 		}
 	}
+}
+
+// busDownTracker is watchBus's count of how long the connection has been
+// down without a break, separate from the ticker and the client so the
+// count itself can be tested on a clock the test steps.
+type busDownTracker struct {
+	downSince time.Time
+}
+
+// observe takes one look at the connection at now. A connected look starts
+// the count again; the first disconnected look starts it. It reports how
+// long the connection has been down and whether that reaches limit.
+func (b *busDownTracker) observe(connected bool, now time.Time, limit time.Duration) (time.Duration, bool) {
+	if connected {
+		b.downSince = time.Time{}
+		return 0, false
+	}
+	if b.downSince.IsZero() {
+		b.downSince = now
+		return 0, false
+	}
+	down := now.Sub(b.downSince)
+	return down, down >= limit
 }
 
 // RunWith is Run with the elected gateway's options.
@@ -3035,6 +3049,9 @@ type taskStart struct {
 	// names no message of its own; an answer with no earlier chain marks
 	// itself.
 	Click, Answer bool
+	// ArrivedAt is InboundMessage's: when the adapter received the turn, the
+	// start of the first-ack time; zero where the adapter does not set it.
+	ArrivedAt time.Time
 	// Requester is stored on the history entry as given — backend and the
 	// already-pseudonymized subject. startTask hashes a human's author id;
 	// a child copies its parent turn's entry.
@@ -3100,6 +3117,7 @@ func (g *Gateway) startTask(ctx context.Context, rec *SessionRecord, msg Inbound
 		MessageID: msg.MessageID,
 		Click:     msg.Click,
 		Answer:    msg.Answer,
+		ArrivedAt: msg.ArrivedAt,
 		Principal: principal,
 		Requester: TaskRequester{Backend: backend, Subject: requesterSubject(g.ps, backend, msg.AuthorID)},
 		Authority: authority,
@@ -3377,7 +3395,15 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	// heartbeat (mark.go, drawArrivalMark), after the pod is asked for so a
 	// slow reactions call never delays it. A click or an answer continues an
 	// earlier ask, whose mark is the executor's to redraw.
-	if ts.Role == "" && !ts.Click && !ts.Answer && g.drawArrivalMark(rec, taskID, ts.Text) {
+	if ts.Role == "" && !ts.Click && !ts.Answer {
+		drawn, landed := g.drawArrivalMark(rec, taskID, ts.Text)
+		if drawn && landed {
+			// The ask's first receipt is on Slack: the reactions call succeeded.
+			g.metrics.slackFirstAck(ts.ArrivedAt, time.Now())
+		}
+		if !drawn {
+			return taskID, true
+		}
 		if err := g.reg.Put(ctx, rec); err != nil {
 			g.log.Error("session record write failed", "conversation", rec.Key, "err", err)
 		}

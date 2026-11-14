@@ -595,9 +595,9 @@ func buildCredentialProxyDeploymentForPlugins(agent *agentv1alpha1.PlatformAgent
 				Spec: corev1.PodSpec{
 					ServiceAccountName:           saName,
 					AutomountServiceAccountToken: ptr.To(false),
-					// ndots:3, see brokerCallerPodDNSConfig. The exec tier
+					// ndots:2, see publicAPICallerPodNdots. The exec tier
 					// copies this pod spec.
-					DNSConfig: brokerCallerPodDNSConfig(),
+					DNSConfig: publicAPICallerPodDNSConfig(),
 					// See credentialProxyTerminationGraceSeconds: covers the
 					// broker's drain on SIGTERM.
 					TerminationGracePeriodSeconds: ptr.To(credentialProxyTerminationGraceSeconds),

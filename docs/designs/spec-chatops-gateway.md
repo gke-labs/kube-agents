@@ -1706,15 +1706,17 @@ with `kept` beside the error, and `a2a notify` exits with a fourth status for it
 senders that re-send on failure (the drift-backlog digest, the data-volume warning) take
 it as handled, so the keep holds one copy, and the alert path records the alert as kept
 rather than lost. The agent-side callers
-(`agents/platform/scripts/chat_notify.py`) switch on `routed_platform()`, `A2A_NOTIFY_PLATFORM` when set, else the projected file; the env is what the operator
-renders exactly when `a2aChatArmed` holds and `homeChannel` is a space name, or is unset with
-Slack not enabled (`a2aGchatHomeRouted`), and send to every
+(`agents/platform/scripts/chat_notify.py`) switch on `routed_platforms()` (`A2A_NOTIFY_PLATFORM` when set, else the projected file) and send to every
 other platform through `hermes send` as before (a day on with no conversation to take onboarding's
-first report, that report is a ledger issue on GitHub and one home line linking it goes the same way). The kanban notifier's report back to a gateway
+first report, that report is a ledger issue on GitHub, and a home line on each routed platform links it the same way).
+`A2A_NOTIFY_PLATFORM` holds a comma-separated list of platform names, and a single name is a list of one;
+on Chat, the operator renders one name today, exactly when `a2aChatArmed` holds and `homeChannel` is a space
+name, or is unset with Slack not enabled (`a2aGchatHomeRouted`); the Slack render is below. The kanban notifier's report back to a gateway
 conversation (below), and onboarding's first report into the conversation the user first wrote in,
-are armed by their own variable, `A2A_NOTIFY_CONVERSATIONS`, which the
-operator renders whenever the gateway arms the route: `homeChannel` unset (the route then
-serves conversation requests only) or a space name. The Hermes kanban notifier, which posts a card's events into the thread the card
+are armed by their own variable, `A2A_NOTIFY_CONVERSATIONS`, a comma-separated list of the
+platforms the gateway serves (read by `chat_notify.gateway_platforms()` on the agent side and by the kanban patches' own copies), which the operator renders, one name
+today, on Chat, whenever the gateway arms the route: `homeChannel` unset (the route then
+serves conversation requests only) or a space name; the Slack render is below. The Hermes kanban notifier, which posts a card's events into the thread the card
 subscribes to and wakes its creator when a card blocks or fails, reaches the same route
 through a send-only stand-in adapter that exists only inside the notifier
 (`deploy/docker/patches/kanban_chat_notify.py`); nothing else in the Hermes gateway treats
@@ -1770,8 +1772,8 @@ unset (`a2aSlackHomeRouted`: Slack is then the only chat platform, and the gatew
 refuses until a channel is set or learned). Conversation posts are armed whenever the gateway holds
 Slack, `homeChannel` set or not, and `A2A_NOTIFY_CONVERSATIONS` is then `slack`
 (`a2aSlackNotifyArmed`); a `homeChannel` that is set but is not a channel id turns the whole
-route off, as on Chat. Chat holds the single-backend gateway when both are enabled, so at most
-one platform is ever routed.
+route off, as on Chat. Chat holds the single-backend gateway when both are enabled, so the
+operator renders one platform today; the agent reads a comma-separated list in both variables.
 
 **The home-channel record.** Under `next`, Slack on the gateway or not, the operator owns a ConfigMap
 `<agent>-home-channel` with no data, applied beside the gateway Role and torn down with the stack.
@@ -3125,7 +3127,7 @@ feed `/readyz`: a Slack outage would otherwise take the pod, which also serves t
 Ready, the `PlatformAgent` with it, and the gateway's PodDisruptionBudget away, for no failover,
 since the lease rather than readiness picks the leader.
 
-Three more Slack series time the legs the agent's own latency leaves out, each appearing with its
+Four more Slack series time the legs the agent's own latency leaves out, each appearing with its
 first observation. `kubeagents_a2a_gateway_slack_ingress_lag_seconds`, unlabelled, is the arrival
 time less the event's own Slack timestamp, for a message that becomes a turn (the pump reads its
 `event_ts`, or its `ts` when absent) and for every block action (`interactive` reads its
@@ -3138,7 +3140,12 @@ are all timed without a call site changing; the websocket dial and a shortcut's 
 are not. `method` is the URL's last segment when `metricsSlackAPIMethods` names it and `other`
 otherwise; `outcome` is `ok` for a 2xx, which includes Slack's `ok: false` answers, `rate_limited`
 for a 429, and `error` for any other status or no response. The duration ends at the response
-headers.
+headers. `kubeagents_a2a_gateway_slack_first_ack_seconds`, unlabelled, is an ask's wait for its first
+receipt: from the adapter receiving the message (`InboundMessage.ArrivedAt`) to the arrival
+reaction landing (`drawArrivalMark`'s reactions call succeeded), so it includes the gateway's own
+work before the draw (the queue, the capability mint, the publish, a session pod's request). A
+reaction whose call failed, a click or an answer (which draw none), a steer, and an ask refused
+before its task starts are not observed.
 
 The terminal counter counts every terminal the gateway hands its adapter, not only the relay's.
 It counts in `observeTaskTerminal`, the funnel each route ends in once: the relay; the stale-task

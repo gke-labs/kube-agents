@@ -14,7 +14,11 @@ import (
 // addendum 1 adds the required-parameter check under parameters-invalid).
 // PROVISIONAL until the contract settles them.
 const (
-	ReasonTierNotAllowed    = "tier-not-allowed"
+	ReasonTierNotAllowed = "tier-not-allowed"
+	// ReasonTierWithdrawn refuses a submission queued at a tier its profile
+	// drains (lib.DispatchProfile.DrainingTiers, #3659): the tier left the
+	// profile after the submission was queued.
+	ReasonTierWithdrawn     = "tier-withdrawn"
 	ReasonVerifierRefused   = "verifier-refused"
 	ReasonParametersInvalid = "parameters-invalid"
 	ReasonQueueTimeout      = "queue-timeout"

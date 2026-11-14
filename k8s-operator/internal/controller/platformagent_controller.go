@@ -80,10 +80,12 @@ const (
 	// prunedUsageStatus). The RBAC self-check's cadence, for the same reason:
 	// the condition changes when someone applies something, not on a schedule,
 	// and one status write per interval is a cost nobody notices.
-	usageStatusReprobeInterval = 5 * time.Minute
-	minIPv4CIDRPrefix          = 12
-	minIPv6CIDRPrefix          = 48
-	maxCIDRsPerAnnotation      = 50
+	usageStatusReprobeInterval  = 5 * time.Minute
+	observedVersionPrunedLogMsg = "API server pruned status.observedVersion from PlatformAgent status update; CRD may be older than the operator, pausing writes for this field"
+	reprobeInLogKey             = "reprobeIn"
+	minIPv4CIDRPrefix           = 12
+	minIPv6CIDRPrefix           = 48
+	maxCIDRsPerAnnotation       = 50
 
 	// The two keys of the <agent>-gitops-state ConfigMap the minter policy is
 	// synced from: managed_repos renders write policies, context_repos read-only
@@ -530,6 +532,12 @@ type PlatformAgentReconciler struct {
 	// writers leave the field out of their unchanged checks, so the write the
 	// API server prunes does not repeat on every pass (busReplicasStatusCurrent).
 	prunedBusReplicasStatus sync.Map
+	// prunedObservedVersion records, per CR, when a status write was last
+	// seen to come back without status.observedVersion: an operator rolled
+	// ahead of the CRD that adds the field. While fresh, updateStatusReady
+	// leaves ObservedVersion out of its unchanged check so the write the API
+	// server prunes does not repeat on every pass.
+	prunedObservedVersion sync.Map
 
 	// busConversionAllowed lets resolveA2ABusReplicas convert an existing bus
 	// between one server and three. Off in every operator: a conversion
@@ -652,6 +660,12 @@ type PlatformAgentReconciler struct {
 	// informer would never sync.
 	agentProfilesUnreadable bool
 
+	// tiersUnreadable is the same for Tiers (TierAccessDenied): the Tier
+	// watch is skipped and the tiers file renders an empty list, which serves
+	// the compiled-in tiers, rather than listing a kind whose informer would
+	// never sync and stall every next-mode reconcile.
+	tiersUnreadable bool
+
 	// Recorder writes Events on the PlatformAgent. Nil records nothing, which
 	// is what tests and the golden harness supply (recordEvent).
 	//
@@ -762,12 +776,26 @@ type PlatformAgentReconciler struct {
 // resources. tests/test_operator_secrets_grant.py and the C5 conformance test pin that shape;
 // docs/designs/operator-namespaced-write-verbs.md is the inventory and the reasoning.
 //
-// CR.
-// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents,verbs=get;list;watch;create;update;patch;delete
+// CR. Every write verb here has a caller, and tests/test_operator_secrets_grant.py names it
+// per verb: `update` on platformagents is the finalizer (Add/RemoveFinalizer with r.Update)
+// and `patch` the bus-stream annotation merge patch; the status writes are Status().Update
+// and Status().Patch; `update` on platformagents/finalizers is what the API server's
+// owner-references admission requires of an owner whose rendered objects carry
+// blockOwnerDeletion (SetControllerReference). The reads are the informers (list, watch),
+// the Lists outside them (the webhook's, the usage poller's, the bus-stream check's) and the
+// uncached Gets of a PlatformAgent (r.APIReader, podReader, a2aReader). The reads on
+// platformagents/status are escalation prevention: buildPlatformLocalRole grants the agent's
+// local Role get;list;watch on platformagents and platformagents/status, and the API server
+// refuses a Role whose grantor does not hold every verb in it (a grant on the resource does
+// not cover the subresource), so without them reconcileRBAC fails on every new agent. `get`
+// on the other status subresources and on agentplugins has no sender and stays as the read
+// half of a kind the controller writes or watches. The operator never creates or deletes a
+// PlatformAgent, and never updates an AgentPlugin's status whole, so those verbs are not here.
+// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents/status,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=platformagents/finalizers,verbs=update
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentplugins,verbs=get;list;watch
-// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentplugins/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentplugins/status,verbs=get;patch
 // Render: the agent, broker, gateway and bus workloads, and the profile pools. Reads cluster-wide
 // (the informers; escalation prevention); writes namespaced.
 // +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets,verbs=get;list;watch
@@ -1543,6 +1571,10 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if a2aState.busReloadRequeue > 0 {
 			requeue = min(requeue, a2aState.busReloadRequeue)
 		}
+		// And a profile held for the bus's config (a2aDispatchableProfiles).
+		if a2aState.profileHoldRequeue > 0 {
+			requeue = min(requeue, a2aState.profileHoldRequeue)
+		}
 		// So can the TASKS wait's threshold pass (a2aGatewayTasksWaitMessage).
 		return ctrl.Result{RequeueAfter: minPositive(tasksWaitRequeue, requeue)}, nil
 	}
@@ -1563,6 +1595,10 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// And a bus config reload still pending (planA2ABusReload).
 		if a2aState.busReloadRequeue > 0 {
 			requeue = min(requeue, a2aState.busReloadRequeue)
+		}
+		// And a profile held for the bus's config (a2aDispatchableProfiles).
+		if a2aState.profileHoldRequeue > 0 {
+			requeue = min(requeue, a2aState.profileHoldRequeue)
 		}
 		if credentialProxyExecShort(instance) {
 			requeue = min(requeue, credentialProxyExecShortRequeue)
@@ -1630,6 +1666,11 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	if a2aNext && a2aState.busReloadRequeue > 0 {
 		requeueAfter = min(requeueAfter, a2aState.busReloadRequeue)
 	}
+	// A newly bound profile held until every bus server has loaded its
+	// config: a single server's reload landing moves nothing watched.
+	if a2aNext && a2aState.profileHoldRequeue > 0 {
+		requeueAfter = min(requeueAfter, a2aState.profileHoldRequeue)
+	}
 	// An exec tier short of its count: the scheduler's verdict lands on a pod,
 	// which is not watched, so the pass that reads it has to be asked for.
 	if credentialProxyExecShort(instance) {
@@ -1640,11 +1681,12 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 // usageStatusRequeue is how soon the steady-state requeue has to fire for the
 // pruned-status probe: the interval while a record is held for this CR, the
-// whole usage block's or status.inference's. With no
-// record it returns the secret re-read's interval, the ceiling the caller
-// already applies, so the min it feeds leaves the caller's value alone.
+// whole usage block's, status.busReplicas', status.inference's, or
+// status.observedVersion's. With no record it returns the secret re-read's
+// interval, the ceiling the caller already applies, so the min it feeds leaves
+// the caller's value alone.
 func (r *PlatformAgentReconciler) usageStatusRequeue(agent *agentv1alpha1.PlatformAgent) time.Duration {
-	if r.usageStatusPruned(agent) || r.busReplicasStatusPruned(agent) || r.inferencePruned(agent) {
+	if r.usageStatusPruned(agent) || r.busReplicasStatusPruned(agent) || r.inferencePruned(agent) || r.observedVersionPruned(agent) {
 		return usageStatusReprobeInterval
 	}
 	return secretEnvReprobeInterval
@@ -2900,7 +2942,7 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 	}
 	opts.heldGitHubOrg = held
 	if a2aStackRendering(agent) && !r.agentProfilesUnreadable {
-		profiles, err := boundAgentProfiles(ctx, r.Client, agent)
+		profiles, err := boundAgentProfiles(ctx, r.Client, agent, r.tiersUnreadable)
 		if err != nil {
 			return err
 		}
@@ -4888,6 +4930,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	ctx = withA2AGatewayLeaderMemo(ctx)
 	newDeploymentStatusName := ""
 	newDeploymentStatusReadyReplicas := int32(0)
+	newObservedVersion := ""
 	var errWorkload error
 
 	// Whether the gateway workload may still be running Pods from a revision
@@ -4919,6 +4962,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		if errWorkload == nil {
 			newDeploymentStatusName = sts.Name
 			newDeploymentStatusReadyReplicas = sts.Status.ReadyReplicas
+			newObservedVersion = workloadObservedVersion(sts.Spec.Template.Spec.Containers)
 			// The ordered roll has the same window: replicas > 1 over RWO
 			// storage takes this path, and the StatefulSet controller replaces
 			// Pods one at a time.
@@ -4933,6 +4977,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		if errWorkload == nil {
 			newDeploymentStatusName = dep.Name
 			newDeploymentStatusReadyReplicas = dep.Status.ReadyReplicas
+			newObservedVersion = workloadObservedVersion(dep.Spec.Template.Spec.Containers)
 			workloadRollIncomplete = deploymentRollIncomplete(dep)
 		}
 	}
@@ -5074,10 +5119,6 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		}
 	}
 
-	proxyResourcesRefusal, _ := credentialProxyResourcesRefusal(agent)
-	agentAPIAuthRefusal, _ := agentAPIAuthResourcesRefusal(agent)
-	sandboxResourcesRefusal, _ := shellSandboxResourcesRefusal(agent)
-	execRefusal := ValidateCredentialProxyExec(agent, nil)
 	// The A2A gateway still waiting for TASKS on a provisioned bus
 	// (a2aGatewayTasksWaitMessage): read once per pass, only while that
 	// Deployment is short of ready replicas and the bus is up. The requeue
@@ -5153,40 +5194,13 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		degradedStatus = metav1.ConditionTrue
 		degradedReason = conditionReasonA2AGatewayWaitingForTasks
 		degradedMsg = a2aTasksWaitMsg
-	} else if proxyResourcesRefusal != "" {
-		// Same shape as the git refusal above: the spec is read here, on
-		// every pass, rather than carried from reconcileCredentialProxy, so
-		// the condition clears on the pass the override is corrected.
-		// Degraded only, as the held minter entry above: the proxy runs at
-		// the operator's defaults, so Ready and the phase keep what the
-		// workload says. Last, because the reasons above report lost
-		// function and must not be masked by it.
+	} else if reason, msg := specResourceDegraded(agent); reason != "" {
+		// The spec's resource and exec-tier refusals, last: each leaves its
+		// workload at the operator's defaults, and the reasons above report
+		// lost function and must not be masked by them (specResourceDegraded).
 		degradedStatus = metav1.ConditionTrue
-		degradedReason = conditionReasonInvalidCredentialProxyResources
-		degradedMsg = fmt.Sprintf(invalidCredentialProxyResourcesMsgFmt, proxyResourcesRefusal)
-	} else if agentAPIAuthRefusal != "" {
-		// Same shape as the credential-proxy refusal above and last for the same
-		// reason: the sidecar runs at the operator's defaults, so Ready and the
-		// phase keep what the workload says, and a reason reporting lost function
-		// must not be masked by it.
-		degradedStatus = metav1.ConditionTrue
-		degradedReason = conditionReasonInvalidAgentAPIAuthResources
-		degradedMsg = fmt.Sprintf(invalidAgentAPIAuthResourcesMsgFmt, agentAPIAuthRefusal)
-	} else if sandboxResourcesRefusal != "" {
-		// The third resource refusal, ranked after the two above for the same
-		// reason: the shell runs at the operator's defaults, so Ready and the
-		// phase keep what the workload says, and a reason reporting lost
-		// function must not be masked by it.
-		degradedStatus = metav1.ConditionTrue
-		degradedReason = conditionReasonInvalidShellSandboxResources
-		degradedMsg = fmt.Sprintf(invalidShellSandboxResourcesMsgFmt, sandboxResourcesRefusal)
-	} else if len(execRefusal) > 0 {
-		// The exec tier's refusal, after the three above for the same reason:
-		// the tier is not rendered and every command goes to the stateful
-		// broker, so Ready and the phase keep what the workload says.
-		degradedStatus = metav1.ConditionTrue
-		degradedReason = conditionReasonInvalidCredentialProxyExec
-		degradedMsg = fmt.Sprintf(invalidExecTierReplicasMsgFmt, execRefusal[0].Detail)
+		degradedReason = reason
+		degradedMsg = msg
 	}
 	if degradedMsg == "" {
 		degradedMsg = condMsg
@@ -5320,6 +5334,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	// on the pruned copy, an operator rolled ahead of its CRD would write on
 	// every pass, and each write wakes the next through the unfiltered watch.
 	if agent.Status.Phase == newPhase &&
+		(r.observedVersionPruned(agent) || agent.Status.ObservedVersion == newObservedVersion) &&
 		agent.Status.DeploymentStatus.Name == newDeploymentStatusName &&
 		agent.Status.DeploymentStatus.ReadyReplicas == newDeploymentStatusReadyReplicas &&
 		agent.Status.StorageStatus.Bound == newStorageStatusBound &&
@@ -5353,6 +5368,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	// Apply updates
 	agent.Status.Phase = newPhase
 	agent.Status.ObservedGeneration = agent.Generation
+	agent.Status.ObservedVersion = newObservedVersion
 	agent.Status.DeploymentStatus.Name = newDeploymentStatusName
 	agent.Status.DeploymentStatus.ReadyReplicas = newDeploymentStatusReadyReplicas
 	agent.Status.StorageStatus.Bound = newStorageStatusBound
@@ -5446,6 +5462,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	r.noteUsageStatusEcho(ctx, agent, newActiveInterfaces)
 	r.noteBusReplicasEcho(agent, writtenBusReplicas)
 	r.noteInferenceEcho(ctx, agent, wroteInference)
+	r.noteObservedVersionEcho(ctx, agent, newObservedVersion)
 	return newPhase, a2aTasksWaitRequeue, nil
 }
 
@@ -5525,11 +5542,55 @@ func (r *PlatformAgentReconciler) noteUsageEcho(ctx context.Context, agent *agen
 	}
 }
 
+// observedVersionPruned reports whether this CR was recently seen to drop
+// status.observedVersion on write (an operator rolled ahead of the CRD).
+// Returning true pauses repeat writes for usageStatusReprobeInterval so the
+// unchanged check skips status updates until the CRD is updated.
+func (r *PlatformAgentReconciler) observedVersionPruned(agent *agentv1alpha1.PlatformAgent) bool {
+	if r == nil || agent == nil {
+		return false
+	}
+	v, ok := r.prunedObservedVersion.Load(client.ObjectKeyFromObject(agent))
+	if !ok {
+		return false
+	}
+	at, ok := v.(time.Time)
+	if !ok {
+		return false
+	}
+	if time.Since(at) < usageStatusReprobeInterval {
+		return true
+	}
+	r.prunedObservedVersion.Delete(client.ObjectKeyFromObject(agent))
+	return false
+}
+
+// noteObservedVersionEcho compares the non-empty ObservedVersion we wrote
+// against what the API server returned. An older CRD that omits
+// status.observedVersion strips it on write; recording that suppresses repeat
+// status updates for usageStatusReprobeInterval.
+func (r *PlatformAgentReconciler) noteObservedVersionEcho(ctx context.Context, agent *agentv1alpha1.PlatformAgent, written string) {
+	if r == nil || agent == nil || written == "" {
+		return
+	}
+	key := client.ObjectKeyFromObject(agent)
+	if agent.Status.ObservedVersion == written {
+		r.prunedObservedVersion.Delete(key)
+		return
+	}
+	alreadyNoted := r.observedVersionPruned(agent)
+	r.prunedObservedVersion.Store(key, time.Now())
+	if !alreadyNoted {
+		logf.FromContext(ctx).Info(observedVersionPrunedLogMsg, reprobeInLogKey, usageStatusReprobeInterval.String())
+	}
+}
+
 // forgetUsageStatus drops the CR's pruning records when the CR goes away, so the
 // maps do not keep an entry per deleted name for the life of the process.
 func (r *PlatformAgentReconciler) forgetUsageStatus(agent *agentv1alpha1.PlatformAgent) {
 	r.prunedUsageStatus.Delete(client.ObjectKeyFromObject(agent))
 	r.prunedBusReplicasStatus.Delete(client.ObjectKeyFromObject(agent))
+	r.prunedObservedVersion.Delete(client.ObjectKeyFromObject(agent))
 	r.prunedSizingTier.Delete(client.ObjectKeyFromObject(agent))
 	r.steppedBackAt.Delete(client.ObjectKeyFromObject(agent))
 	r.prunedNewerFieldsMu.Lock()
@@ -6393,6 +6454,11 @@ func degradedStatusCurrent(agent *agentv1alpha1.PlatformAgent, reason, message s
 		!credentialProxyExecReadyCurrent(agent, execReady) {
 		return false
 	}
+	// Degraded following BusStreamsPresent on a park (#5707): read from the
+	// agent itself, so the live re-check below judges the live object.
+	if edit, _ := parkBusStreamsDegraded(agent); edit != busStreamsDegradedKeep {
+		return false
+	}
 	if rendered != workloadRendered {
 		return true
 	}
@@ -6522,6 +6588,11 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 	}
 	setCredentialProxyExecReadyCondition(agent, execReady, now)
 	setDataVolumeExpansionCondition(agent, dataVolumeMsg, dataVolumeKnown, now)
+	// Degraded is updateStatusReady's to rank, and a park returns before it
+	// runs; the bus streams' reason alone follows the poller here, which keeps
+	// writing BusStreamsPresent through a park (parkBusStreamsDegraded).
+	edit, busStreams := parkBusStreamsDegraded(agent)
+	applyParkBusStreamsDegraded(agent, edit, busStreams, now)
 	return r.Status().Update(ctx, agent)
 }
 
@@ -6641,6 +6712,29 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		}
 	}
 
+	// Tiers feed the tiers ConfigMap (platformagent_a2a_tiers.go), so a Tier
+	// created, edited or deleted re-renders it. Registered only when the CRD
+	// is installed.
+	tierGVK := agentv1alpha1.GroupVersion.WithKind("Tier")
+	if denied := TierAccessDenied(r.RBAC); len(denied) > 0 {
+		r.tiersUnreadable = true
+		logf.Log.WithName("platformagent-controller").Info(
+			"The operator's role cannot read Tiers; skipping the Tier watch and rendering no install-defined tiers. Restart the operator after applying the current ClusterRole.",
+			"denied", denied)
+	} else if mgr != nil && mgr.GetRESTMapper() != nil {
+		if _, err := mgr.GetRESTMapper().RESTMapping(tierGVK.GroupKind(), tierGVK.Version); err == nil {
+			bld = bld.Watches(
+				&agentv1alpha1.Tier{},
+				handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+					return enqueueAgentsInNamespace(ctx, obj.GetNamespace())
+				}),
+				// The Tier reconciler writes status; only spec changes,
+				// creates and deletes change the file.
+				builder.WithPredicates(predicate.GenerationChangedPredicate{}),
+			)
+		}
+	}
+
 	// AgentProfiles feed the identity map, so a profile created, edited or
 	// deleted re-renders it. Registered only when the CRD is installed, like
 	// AgentPlugin's watch above.
@@ -6661,8 +6755,11 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
 					return enqueueAgentsInNamespace(ctx, obj.GetNamespace())
 				}),
-				// The AgentProfile reconciler writes status; only spec
-				// changes, creates and deletes change the map.
+				// The AgentProfile reconciler writes status. Spec changes,
+				// creates and deletes change the map; status.renderedTiers
+				// also picks the incumbent unattended tier, but it changes
+				// only on a pass that a spec or Tier change started, which
+				// enqueues this controller too.
 				builder.WithPredicates(predicate.GenerationChangedPredicate{}),
 			).Watches(
 				// Whether a profile gets a map entry also depends on its
