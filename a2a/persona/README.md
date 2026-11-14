@@ -27,10 +27,14 @@ The binary has a second caller: the agent-side notification callers
 (`agents/platform/scripts/chat_notify.py`) run `a2a notify` to post proactive messages
 through the gateway, and so does the Hermes kanban notifier for card events
 (`deploy/docker/patches/kanban_chat_notify.py`). Both run it only under `next`: proactive posts
-when the operator renders `A2A_NOTIFY_PLATFORM`, and the report of a card filed in a gateway
-conversation, back to that conversation, when it renders `A2A_NOTIFY_CONVERSATIONS`. Each variable
-holds a comma-separated list of platform names; a single name is a list of one, and the operator
-renders one name today. Onboarding's
+when `routed_platforms()` names a platform (either variable rendered; a learned Slack channel adds Slack),
+and the report of a card filed in a gateway conversation, back to that conversation, when the
+operator renders `A2A_NOTIFY_CONVERSATIONS`. Each variable
+holds a comma-separated list of platform names; a single name is a list of one. The operator
+names every armed route in `A2A_NOTIFY_CONVERSATIONS`, and every armed route with a home channel
+set on the CR in `A2A_NOTIFY_PLATFORM`, Chat first. The agent adds Slack when the gateway learned
+a channel (the projected file), and sends home posts to every armed route when no platform has a
+home; an alert goes to one of those, Chat first. Onboarding's
 first report goes the same way, into the conversation the user first wrote in
 (`agents/chat/scripts/bootstrap_delivery.py`).
 

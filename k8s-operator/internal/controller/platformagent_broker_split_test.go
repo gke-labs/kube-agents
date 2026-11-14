@@ -60,10 +60,11 @@ func brokerPodAgent() *agentv1alpha1.PlatformAgent {
 				Location:    "us-central1",
 				ClusterName: "cluster",
 			},
-			// Both chat relays are enabled because they are hosted in the
-			// broker's process, so their URLs have to address its Service. With
-			// them off, an assertion about those two variables would be an
-			// assertion about nothing.
+			// Both chat platforms are enabled: the A2A gateway consumes them,
+			// so the agent container must carry neither relay URL; the Teams
+			// relay, which Hermes still polls, is added by
+			// brokerPodAgentWithTeams where a test needs a relay that does
+			// address the broker Service.
 			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
 				GoogleChat: &agentv1alpha1.GoogleChatSpec{
 					Enabled:          ptr.To(true),
@@ -75,6 +76,18 @@ func brokerPodAgent() *agentv1alpha1.PlatformAgent {
 			},
 		},
 	}
+}
+
+// brokerPodAgentWithTeams is brokerPodAgent with Teams enabled too: the one
+// chat platform Hermes still serves, whose relay URL addresses the broker.
+func brokerPodAgentWithTeams() *agentv1alpha1.PlatformAgent {
+	agent := brokerPodAgent()
+	agent.Spec.Integration.Teams = &agentv1alpha1.TeamsSpec{
+		Enabled:              ptr.To(true),
+		AppIdSecretRef:       &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "teams"}, Key: "id"},
+		AppPasswordSecretRef: &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: "teams"}, Key: "password"},
+	}
+	return agent
 }
 
 func brokerContainerNamed(containers []corev1.Container, name string) *corev1.Container {
@@ -136,17 +149,20 @@ func TestTheBrokerIsNotInTheAgentPod(t *testing.T) {
 	if value, found := brokerEnvValue(agentContainer.Env, "CREDENTIAL_PROXY_URL"); !found || value != "" {
 		t.Errorf("the agent container must not be told where the broker is, got %q (present=%v)", value, found)
 	}
-	// With Chat and Slack both on, the A2A gateway consumes Chat and Slack
-	// stays on its legacy consumer (legacySlackConsumer), so only the Slack
-	// relay URL is rendered on the agent container.
-	wantURL := "http://test-agent-credential-proxy.test-ns.svc.cluster.local:8765"
-	if value, found := brokerEnvValue(agentContainer.Env, "SLACK_RELAY_URL"); !found {
-		t.Error("expected SLACK_RELAY_URL to be set so the assertion below means something")
-	} else if value != wantURL {
-		t.Errorf("expected SLACK_RELAY_URL to address the broker Service, got %q", value)
+	// With Chat and Slack both on, the A2A gateway consumes both, so neither
+	// relay URL is rendered on the agent container; Teams, which only Hermes
+	// serves, is the relay that still addresses the broker Service.
+	for _, name := range []string{"SLACK_RELAY_URL", "GOOGLE_CHAT_RELAY_URL"} {
+		if value, found := brokerEnvValue(agentContainer.Env, name); found {
+			t.Errorf("%s = %q on the agent container; the gateway consumes Chat and Slack", name, value)
+		}
 	}
-	if value, found := brokerEnvValue(agentContainer.Env, "GOOGLE_CHAT_RELAY_URL"); found {
-		t.Errorf("GOOGLE_CHAT_RELAY_URL = %q on the agent container; the gateway consumes Chat", value)
+	wantURL := "http://test-agent-credential-proxy.test-ns.svc.cluster.local:8765"
+	teamsPod := buildPodTemplateSpec(brokerPodAgentWithTeams(), "c", "f", "s", "p", nil, renderOptions{})
+	if value, found := brokerEnvValue(brokerContainerNamed(teamsPod.Spec.Containers, "platform-agent").Env, "TEAMS_RELAY_URL"); !found {
+		t.Error("expected TEAMS_RELAY_URL to be set so the assertion below means something")
+	} else if value != wantURL {
+		t.Errorf("expected TEAMS_RELAY_URL to address the broker Service, got %q", value)
 	}
 	if value, _ := brokerEnvValue(agentContainer.Env, "CREDENTIAL_PROXY_TOKEN_FILE"); value != credentialProxyTokenMountPath+"/token" {
 		t.Errorf("expected the agent to present a projected token, got %q", value)
@@ -367,17 +383,19 @@ func TestTheBrokerServiceAddressesTheBrokerPod(t *testing.T) {
 // time, which is why this checks the URL the agent is actually given rather
 // than a port somebody remembered to write down.
 func TestTheGatewayMayReachTheRelayItIsPointedAt(t *testing.T) {
-	agent := brokerPodAgent()
+	// Teams is the one chat relay Hermes still polls: the A2A gateway holds
+	// Chat and Slack, so their relay URLs are not rendered.
+	agent := brokerPodAgentWithTeams()
 	pod := buildPodTemplateSpec(agent, "c", "f", "s", "p", nil, renderOptions{})
 	agentContainer := brokerContainerNamed(pod.Spec.Containers, "platform-agent")
 
-	relay, found := brokerEnvValue(agentContainer.Env, "SLACK_RELAY_URL")
+	relay, found := brokerEnvValue(agentContainer.Env, "TEAMS_RELAY_URL")
 	if !found || relay == "" {
-		t.Fatal("SLACK_RELAY_URL is unset, so this test asserts nothing")
+		t.Fatal("TEAMS_RELAY_URL is unset, so this test asserts nothing")
 	}
 	target, err := url.Parse(relay)
 	if err != nil {
-		t.Fatalf("SLACK_RELAY_URL is not a URL: %v", err)
+		t.Fatalf("TEAMS_RELAY_URL is not a URL: %v", err)
 	}
 	if target.Hostname() == "127.0.0.1" || target.Hostname() == "localhost" {
 		t.Fatalf("the relay is back on loopback (%q); this test and the rule it "+
@@ -385,7 +403,7 @@ func TestTheGatewayMayReachTheRelayItIsPointedAt(t *testing.T) {
 	}
 	port, err := strconv.ParseInt(target.Port(), 10, 32)
 	if err != nil {
-		t.Fatalf("SLACK_RELAY_URL names no port: %v", err)
+		t.Fatalf("TEAMS_RELAY_URL names no port: %v", err)
 	}
 
 	gateway := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", false)

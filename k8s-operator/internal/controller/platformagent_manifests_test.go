@@ -2323,9 +2323,10 @@ func TestBuildDeploymentGoogleChatAllowedUsersEmpty(t *testing.T) {
 	}
 }
 
-// With Google Chat on as well, the A2A gateway takes Chat and Slack stays on
-// its legacy consumer (legacySlackConsumer): the broker's relay and the
-// Hermes slack platform, which is what this test renders.
+// With Google Chat on as well, the A2A gateway takes both: the agent
+// container carries no Slack token and no legacy relay env, the broker is
+// not handed the pair, and the CR's home channel reaches the agent beside
+// the notify lists (agentSlackHomeChannelEnvVar).
 func TestBuildDeploymentSlackIntegration(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{
@@ -2366,76 +2367,41 @@ func TestBuildDeploymentSlackIntegration(t *testing.T) {
 	if _, ok := envMap["SLACK_APP_TOKEN"]; ok {
 		t.Error("expected SLACK_APP_TOKEN to be absent from sandbox")
 	}
-	// The relay is hosted in the broker's process, which is a Pod of its own, so
-	// the URL names its Service. What makes it credential-free is unchanged: the
-	// tokens above stay on the far side of it.
-	wantRelay := credentialProxyBaseURL(agent)
-	if envMap["SLACK_RELAY_URL"].Value != wantRelay {
-		t.Errorf("expected Slack relay URL %q, got %v", wantRelay, envMap["SLACK_RELAY_URL"])
-	}
-	if envMap["SLACK_ALLOWED_USERS"].Value != "U123,U456" {
-		t.Errorf("expected SLACK_ALLOWED_USERS U123,U456, got %s", envMap["SLACK_ALLOWED_USERS"].Value)
+	// The legacy relay env pointed the Hermes slack platform at the broker;
+	// the gateway holds Slack, so none of it renders. The home channel still
+	// reaches the agent's readers (the audit relay's report card).
+	for _, name := range []string{"SLACK_RELAY_URL", "SLACK_ALLOWED_USERS", "SLACK_ALLOW_ALL_USERS", "SLACK_HOME_CHANNEL_NAME"} {
+		if got, ok := envMap[name]; ok {
+			t.Errorf("expected no %s on the agent container (the gateway consumes Slack), got %#v", name, got)
+		}
 	}
 	if envMap["SLACK_HOME_CHANNEL"].Value != "C999" {
 		t.Errorf("expected SLACK_HOME_CHANNEL C999, got %s", envMap["SLACK_HOME_CHANNEL"].Value)
-	}
-	if envMap["SLACK_HOME_CHANNEL_NAME"].Value != "general" {
-		t.Errorf("expected SLACK_HOME_CHANNEL_NAME general, got %s", envMap["SLACK_HOME_CHANNEL_NAME"].Value)
 	}
 
 	proxyEnv := make(map[string]corev1.EnvVar)
 	for _, env := range buildCredentialProxyContainer(agent).Env {
 		proxyEnv[env.Name] = env
 	}
-	if proxyEnv["SLACK_BOT_TOKEN"].ValueFrom.SecretKeyRef.Name != "custom-slack-secret" || proxyEnv["SLACK_BOT_TOKEN"].ValueFrom.SecretKeyRef.Key != "bot-token-key" {
-		t.Errorf("expected proxy SLACK_BOT_TOKEN custom-slack-secret/bot-token-key, got %v", proxyEnv["SLACK_BOT_TOKEN"].ValueFrom)
+	for _, name := range []string{"SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"} {
+		if got, ok := proxyEnv[name]; ok {
+			t.Errorf("expected no %s on the broker (the gateway opens the app's one Socket Mode connection), got %#v", name, got)
+		}
 	}
-	if proxyEnv["SLACK_APP_TOKEN"].ValueFrom.SecretKeyRef.Name != "custom-slack-secret" || proxyEnv["SLACK_APP_TOKEN"].ValueFrom.SecretKeyRef.Key != "app-token-key" {
-		t.Errorf("expected proxy SLACK_APP_TOKEN custom-slack-secret/app-token-key, got %v", proxyEnv["SLACK_APP_TOKEN"].ValueFrom)
+	gatewayEnv := make(map[string]corev1.EnvVar)
+	for _, env := range buildA2AGatewayDeployment(agent).Spec.Template.Spec.Containers[0].Env {
+		gatewayEnv[env.Name] = env
 	}
-}
-
-// With Google Chat on as well, Slack stays on its legacy consumer
-// (legacySlackConsumer), which is the render this test is about.
-func TestBuildDeploymentSlackAllowAllUsers(t *testing.T) {
-	agent := &agentv1alpha1.PlatformAgent{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "my-agent",
-			Namespace: "my-ns",
-		},
-		Spec: agentv1alpha1.PlatformAgentSpec{
-			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
-				GoogleChat: &agentv1alpha1.GoogleChatSpec{Enabled: ptr.To(true)},
-				Slack: &agentv1alpha1.SlackSpec{
-					Enabled:      ptr.To(true),
-					AllowedUsers: []string{""},
-				},
-			},
-		},
+	if gatewayEnv[a2aSlackBotTokenEnvVar].ValueFrom.SecretKeyRef.Name != "custom-slack-secret" || gatewayEnv[a2aSlackBotTokenEnvVar].ValueFrom.SecretKeyRef.Key != "bot-token-key" {
+		t.Errorf("expected gateway SLACK_BOT_TOKEN custom-slack-secret/bot-token-key, got %v", gatewayEnv[a2aSlackBotTokenEnvVar].ValueFrom)
 	}
-
-	dep := buildDeployment(agent, "abcd1234", "efgh5678", "ijkl9012", "policy3456", nil, renderOptions{imageVolumeSupported: true})
-	container := dep.Spec.Template.Spec.Containers[0]
-	envMap := make(map[string]corev1.EnvVar)
-	for _, env := range container.Env {
-		envMap[env.Name] = env
-	}
-
-	// Emitted, and empty. The managed .env pins SLACK_ALLOWED_USERS on every reconcile so
-	// the agent cannot write its own; a container env that omits the key when the CR sets
-	// no allowlist would leave the two renders disagreeing about a key that decides who
-	// may talk to the agent.
-	v, ok := envMap["SLACK_ALLOWED_USERS"]
-	if !ok || v.Value != "" {
-		t.Errorf("expected SLACK_ALLOWED_USERS present and empty, got %q (present=%v)", v.Value, ok)
-	}
-	if envMap["SLACK_ALLOW_ALL_USERS"].Value != "true" {
-		t.Errorf("expected SLACK_ALLOW_ALL_USERS true, got %s", envMap["SLACK_ALLOW_ALL_USERS"].Value)
+	if gatewayEnv[a2aSlackAppTokenEnvVar].ValueFrom.SecretKeyRef.Name != "custom-slack-secret" || gatewayEnv[a2aSlackAppTokenEnvVar].ValueFrom.SecretKeyRef.Key != "app-token-key" {
+		t.Errorf("expected gateway SLACK_APP_TOKEN custom-slack-secret/app-token-key, got %v", gatewayEnv[a2aSlackAppTokenEnvVar].ValueFrom)
 	}
 }
 
-// With Google Chat on as well, Slack stays on its legacy consumer: the
-// Hermes slack platform is enabled in the rendered config.
+// With Google Chat on as well, the Hermes slack platform stays off in the
+// rendered config: the A2A gateway is the one Slack consumer.
 func TestBuildConfigMapSlackEnabled(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{
@@ -2454,8 +2420,8 @@ func TestBuildConfigMapSlackEnabled(t *testing.T) {
 
 	cm := buildConfigMap(agent, nil)
 	yamlContent := defaultProfileYAML(t, cm)
-	if !strings.Contains(yamlContent, "slack:") || !strings.Contains(yamlContent, "enabled: true") {
-		t.Errorf("expected config.yaml to enable slack platform, got:\n%s", yamlContent)
+	if !strings.Contains(yamlContent, "slack:") || strings.Contains(yamlContent, "slack:\n    enabled: true") {
+		t.Errorf("expected config.yaml to render the slack platform off, got:\n%s", yamlContent)
 	}
 }
 
@@ -4035,15 +4001,26 @@ func TestManagedConfigPinsModelAndPlatformsButNotHomeChannel(t *testing.T) {
 // the PVC .env (also override=True) beats, so the CR value seeds the home channel and
 // `/sethome` wins from then on.
 //
-// The Chat keys are not among the pins: the A2A gateway consumes Chat and
-// the Hermes google_chat platform renders nothing for it
-// (TestTheLegacyChatConsumerIsNotRendered). With Chat on, Slack stays on its
-// legacy consumer, so its keys are pinned.
+// The Chat and Slack keys are not among the pins: the A2A gateway consumes
+// both and the Hermes google_chat and slack platforms render nothing for
+// them (TestTheLegacyChatConsumerIsNotRendered,
+// TestTheLegacySlackConsumerIsNeverRendered). Teams is the one platform
+// Hermes still serves, so its keys and the gateway-wide pair are pinned.
 func TestManagedEnvPinsPlatformKeysButNotHome(t *testing.T) {
 	env := renderManagedEnv(chatAgent())
-
 	for _, key := range []string{
 		"SLACK_RELAY_URL", "SLACK_ALLOWED_USERS", "SLACK_ALLOW_ALL_USERS",
+		"GATEWAY_ALLOWED_USERS", "GATEWAY_ALLOW_ALL_USERS",
+	} {
+		if strings.Contains(env, key+"=") {
+			t.Errorf("%s is pinned for a platform Hermes does not run:\n%s", key, env)
+		}
+	}
+	teams := chatAgent()
+	teams.Spec.Integration.Teams = &agentv1alpha1.TeamsSpec{Enabled: ptr.To(true), AllowedUsers: []string{"alice@example.com"}}
+	env = renderManagedEnv(teams)
+	for _, key := range []string{
+		"TEAMS_RELAY_URL", "TEAMS_ALLOWED_USERS", "TEAMS_ALLOW_ALL_USERS",
 		"GATEWAY_ALLOWED_USERS", "GATEWAY_ALLOW_ALL_USERS",
 	} {
 		if !strings.Contains(env, key+"=") {
@@ -4120,17 +4097,25 @@ func TestManagedEnvPinsTheLoopbackKeyUnconditionally(t *testing.T) {
 // but by different code, and the managed one is applied LAST with override=True — so a
 // disagreement is not a warning, it is the container env silently losing.
 func TestManagedEnvAgreesWithContainerEnv(t *testing.T) {
-	// Both answers to the access question. With an allowlist the allow-all keys render
-	// `false`, without one they render `true` and the allowlists render empty — and it is
-	// the second shape that never appears in the goldens, so nothing else compares its two
-	// renders to each other.
-	t.Run("allowlisted", func(t *testing.T) { assertManagedEnvAgrees(t, chatAgent()) })
-	t.Run("allow all", func(t *testing.T) {
+	// Both answers to the access question, on Teams, the one platform Hermes still
+	// serves (the gateway holds Chat and Slack, so their keys are not pinned). With an
+	// allowlist the allow-all key renders `false`, with allowAllUsers it renders `true`
+	// and the allowlist renders empty — and it is the second shape that never appears in
+	// the goldens, so nothing else compares its two renders to each other.
+	teamsAgent := func(allowAll bool) *agentv1alpha1.PlatformAgent {
 		agent := chatAgent()
-		agent.Spec.Integration.GoogleChat.AllowedUsers = nil
-		agent.Spec.Integration.Slack.AllowedUsers = nil
-		if !strings.Contains(renderManagedEnv(agent), "SLACK_ALLOW_ALL_USERS=true") {
-			t.Fatalf("an empty allowlist must pin allow-all as true, got:\n%s", renderManagedEnv(agent))
+		agent.Spec.Integration.Teams = &agentv1alpha1.TeamsSpec{Enabled: ptr.To(true), AllowedUsers: []string{"alice@example.com"}}
+		if allowAll {
+			agent.Spec.Integration.Teams.AllowedUsers = nil
+			agent.Spec.Integration.Teams.AllowAllUsers = ptr.To(true)
+		}
+		return agent
+	}
+	t.Run("allowlisted", func(t *testing.T) { assertManagedEnvAgrees(t, teamsAgent(false)) })
+	t.Run("allow all", func(t *testing.T) {
+		agent := teamsAgent(true)
+		if !strings.Contains(renderManagedEnv(agent), "TEAMS_ALLOW_ALL_USERS=true") {
+			t.Fatalf("allowAllUsers must pin allow-all as true, got:\n%s", renderManagedEnv(agent))
 		}
 		assertManagedEnvAgrees(t, agent)
 	})
@@ -7777,14 +7762,13 @@ func TestManagedEnvPinsTheMode(t *testing.T) {
 }
 
 func TestManagedEnvValuesCannotSmuggleALine(t *testing.T) {
-	// Chat on the gateway and Slack beside it on its legacy consumer: the
-	// Slack allowlist is a CR value the managed .env pins.
+	// The Teams allowlist is a CR value the managed .env pins; Google Chat and
+	// Slack pin nothing, so they cannot reach the strip.
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
 		Spec: agentv1alpha1.PlatformAgentSpec{
 			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
-				GoogleChat: &agentv1alpha1.GoogleChatSpec{Enabled: ptr.To(true)},
-				Slack: &agentv1alpha1.SlackSpec{
+				Teams: &agentv1alpha1.TeamsSpec{
 					Enabled:      ptr.To(true),
 					AllowedUsers: []string{"someone\nKUBEAGENTS_MODE=today"},
 				},
@@ -7792,6 +7776,9 @@ func TestManagedEnvValuesCannotSmuggleALine(t *testing.T) {
 		},
 	}
 	rendered := renderManagedEnv(agent)
+	if !strings.Contains(rendered, "TEAMS_ALLOWED_USERS=someoneKUBEAGENTS_MODE=today\n") {
+		t.Fatalf("the Teams allowlist must render with its newline stripped:\n%s", rendered)
+	}
 	// The property is about LINES, which is how every reader of this file
 	// parses it: the smuggled text surviving inside another key's value is
 	// harmless (the parser splits on the first `=`, so it stays that key's

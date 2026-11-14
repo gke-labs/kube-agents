@@ -6682,7 +6682,7 @@ func TestPeopleReadingEnabled_TruthTable(t *testing.T) {
 	}{
 		{"Chat only", agent(true, false, false), true},
 		{"Slack only", agent(false, true, false), true},
-		{"Chat and Slack: Slack on Hermes", agent(true, true, false), false},
+		{"Chat and Slack: both on the gateway", agent(true, true, false), true},
 		{"Teams", agent(false, false, true), false},
 		{"no platform", agent(false, false, false), true},
 	} {

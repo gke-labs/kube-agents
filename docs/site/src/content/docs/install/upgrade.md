@@ -261,9 +261,10 @@ A row labelled `pending` is for a change that had not shipped in a release when 
 | Release | Change                                                                     | What an existing install meets                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | ------- | -------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | pending | a newly bound AgentProfile waits until the bus has loaded it               | On a three-server bus the upgrade rolls the servers once, one at a time, as the profile list joins their pod template; R3 streams keep serving through it. After that, a newly bound profile's card and dispatch wait until every bus server has loaded its config: about a minute on one server, one roll on three. On one server, two profile changes inside one kubelet sync end in a restart of the bus pod about four minutes later (a Normal `BusConfigReloadFolded` Event), which drops bus connections as any bus restart does. `CardPublished` reports the wait as `False` with reason `BusConfigPending`. Rolling back the operator rolls a three-server bus once more.                                                                                                                                                                                                                                                |
-| pending | every install runs the A2A stack                                           | `spec.mode` is deprecated and ignored. An install that ran `today`, or no mode, gets the A2A stack: the NATS bus, the A2A gateway, callout, verifier, console, `hermes-bridge` container and the `<release namespace>-profiles` Namespace. Three NATS servers need three nodes: a Standard cluster that cannot reach three sets `platformAgent.harness.tuning.busReplicas: 1` before this upgrade, since an existing bus keeps its count. Google Chat moves to the gateway, and Slack unless Google Chat is on beside it. Before upgrading, check that `SLACK_ALLOWED_USERS` holds member IDs, not emails, that `SLACK_BOT_TOKEN` is one workspace's, and that a `/sethome` home channel is in `GOOGLE_CHAT_HOME_CHANNEL`. The footprint grows ([Footprint](/kube-agents/install/prerequisites/#footprint)); an existing bus restarts once. No switch back exists.                                                               |
+| pending | every install runs the A2A stack                                           | `spec.mode` is deprecated and ignored. An install that ran `today`, or no mode, gets the A2A stack: the NATS bus, the A2A gateway, callout, verifier, console, `hermes-bridge` container and the `<release namespace>-profiles` Namespace. Three NATS servers need three nodes: a Standard cluster that cannot reach three sets `platformAgent.harness.tuning.busReplicas: 1` before this upgrade, since an existing bus keeps its count. Google Chat moves to the gateway; for Slack, see the row "Slack joins Google Chat on the A2A gateway". Before upgrading, check that `SLACK_ALLOWED_USERS` holds member IDs, not emails, that `SLACK_BOT_TOKEN` is one workspace's, and that a `/sethome` home channel is in `GOOGLE_CHAT_HOME_CHANNEL`. The footprint grows ([Footprint](/kube-agents/install/prerequisites/#footprint)); an existing bus restarts once. No switch back exists.                                        |
 | pending | the A2A bus caps `TASKS` and `TOPICS-JOURNAL` lower                        | `spec.mode: next` only. A new bus creates `TASKS` at 8 GiB and `TOPICS-JOURNAL` at 1 GiB. An existing bus keeps 20 and 5 GiB, since provisioning does not edit a stream: the operator records a `Warning` Event, reason `A2ABusStreamCapAboveRender`, with the `nats stream edit` that lowers each and whether applying it now is safe. Run it with your own NATS credentials.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | pending | the `gemini` and `vertex_ai` default model is `gemini-3.8-flash`           | An install that names no model (`MODEL_DEFAULT_NAME` unset, Terraform `model_default_name` or Helm `litellm.modelDefaultName` empty) moves from `gemini-3.5-flash` to `gemini-3.8-flash` at its next upgrade; its key or Vertex project must serve that model. An `install.sh` install keeps the name it recorded in `install.env`. Set the name to keep the old model.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| pending | Slack joins Google Chat on the A2A gateway                                 | Google Chat and Slack both enabled. An operator upgrade alone moves Slack to the gateway: the broker drops the Slack tokens and the Hermes Slack platform turns off. Slash commands return Slack's timeout error. A `/sethome` home channel does not carry over. See [After the switch: the Slack app](#after-the-switch-the-slack-app). A full upgrade refuses an email in the Slack allowlist, a home channel that is no channel id, and several bot tokens, and warns on an empty home channel; `operator` and `harness` runs do neither. The gateway serves one Slack workspace: install one bot token from one workspace, or turn Slack off. An alert goes to one platform with a home channel, Chat first; with none, Google Chat's digest keeps it.                                                                                                                                                                       |
 | pending | the auth callout rolls once for a new identity-map shape                   | `spec.mode: next` only. The identity map gains a field for the dispatcher's bucketed grants (`A2A_DISPATCHER_BUCKETED_GRANTS`, off by default), so the upgrade restarts the callout pods once, with the switch on or off. New bus connections retry for those seconds; established ones are not touched.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | 0.29.0  | a refused Stop press on Google Chat tells the presser, privately           | `spec.mode: next` only. In a space or a group chat, a press of the Stop button by someone who did not ask for the work now posts one line that the presser alone sees: `Only the person who asked can press Stop here. If it must stop, type stop.` Nobody else in the thread is notified. Nothing changes in a direct message, or on Slack. There is no switch; the way back is the previous release's gateway image. See [Follow-ups while a task runs](/kube-agents/concepts/chatops/#follow-ups-while-a-task-runs).                                                                                                                                                                                                                                                                                                                                                                                                          |
 | 0.29.0  | Google Chat's status line no longer reads `completed`                      | `spec.mode: next` only. When a task completes, the status line each ask posts on Google Chat ends as a bare ✅ after the answer posts. When the work goes to a card, the line becomes the one-line acknowledgement instead, and the card's plan and report follow. Nothing reads `✅ completed`. A task that fails, is cancelled or is rejected keeps its line and its notice as before. The change has no switch; the way back is the previous release's gateway image. See [What a task looks like](/kube-agents/concepts/chatops/#on-google-chat-and-the-a2a-console).                                                                                                                                                                                                                                                                                                                                                        |
@@ -441,7 +442,7 @@ The run also writes a machine-readable report to `/tmp/kube-agents-upgrade-repor
 On an install with Slack enabled, check that Slack still answers. Which process holds the Slack
 connection depends on `spec.mode` (the third command under [Before you start](#before-you-start)):
 
-- **Empty or `today`**, or `next` with Google Chat also enabled: the credential broker.
+- **Empty or `today`**: the credential broker.
 
   ```bash
   kubectl logs deploy/platform-agent-credential-proxy -n kubeagents-system \
@@ -508,7 +509,7 @@ after "Upgrade Complete!", so the app steps that mode needs are on the screen af
 
 ### Google Chat
 
-With Google Chat enabled, Google Chat takes the A2A gateway under `next`. Each top-level
+With Google Chat enabled, the A2A gateway takes Google Chat. Each top-level
 message you send the app in a DM is then its own conversation, answered in its own thread, as on
 Slack ([ChatOps → Google Chat](/kube-agents/concepts/chatops/#google-chat)). The thing to set for
 it is the home channel, where alerts and scheduled reports land. Under `next` the gateway posts them
@@ -523,10 +524,8 @@ Before switching to `next`, set `GOOGLE_CHAT_HOME_CHANNEL` in the same `install.
 ([ChatOps → Home channel](/kube-agents/concepts/chatops/#home-channel)). After the switch, check
 that a scheduled report or an alert reaches that space.
 
-With Slack enabled too, Slack stays on the credential broker under `next`, as under `today`. Then
-none of the Slack steps below apply: switch, check Slack as in [Checking the result](#slack), and
-leave the Slack app as it is. The rest of this section is for an install whose Slack takes the
-gateway.
+With Slack enabled too, the same gateway takes Slack. The Slack steps below apply as they do
+with Google Chat off.
 
 ### Before the switch
 
@@ -553,16 +552,18 @@ gateway.
    - `SLACK_HOME_CHANNEL` in `install.env` is the ID of the channel for alerts and scheduled
      reports: `C…`, or `G…` for some private channels. Under `next` the gateway posts the agent's
      proactive messages to this channel, or, with it empty and `homeChannelPolicy` auto (the
-     default), to the channel of the first top-level mention of the agent. A home channel set with
-     `/sethome` lives in the Planning Agent's
-     profile and does not carry over. A DM ID (`D…`) or a channel name turns off the gateway's
+     default), to the channel of the first top-level mention of the agent. A `/sethome` home
+     channel does not carry over. A DM ID (`D…`) or a channel name turns off the gateway's
      notify route, and with it the reports of board cards
      ([Slack app setup → Home channel](/kube-agents/install/slack-app/#home-channel)). With no home
-     channel those posts are refused while conversations keep working: the run warns, and the
-     `PlatformAgent` carries the `HomeChannelUnset` condition.
+     channel those posts go to Google Chat's home channel, or are refused when Chat has none either,
+     while conversations keep working. The run warns, and the `PlatformAgent` carries
+     `HomeChannelUnset`.
    - Keep the agent image at the operator's release. A learned home channel reaches the agent through
      a file the operator mounts; an older agent image reads env only and never sees it, while the CR
      shows no condition.
+     An older agent image on an install with no home channel on the CR also sends no proactive
+     posts.
    - An allowed member moves the home channel later from the app's Home tab (the Home channel panel);
      the record keeps who moved it and when. On a rollback to a gateway without the panel, a published
      Home view keeps the picker until the member reopens the tab; the old gateway drops a pick and
@@ -810,7 +811,7 @@ change of the new release.
   release that predates the value, re-run with `--drop-undeclared-values`. A full upgrade refuses
   that flag, since it has no recorded values to drop.
 - **A Slack setting the A2A gateway cannot use.** A full upgrade applies `PLATFORM_AGENT_MODE` from
-  `install.env`. With `next`, Slack on and Google Chat off, the A2A gateway takes Slack, and the run
+  `install.env`. With Slack on, the A2A gateway takes Slack, with or without Google Chat. The run
   refuses three settings it cannot use, naming each one:
   - a `SLACK_ALLOWED_USERS` entry with an `@`: the list matches Slack member IDs exactly, so an
     email matches nobody. Replace it with the person's member ID (in Slack, their profile, then
@@ -819,8 +820,8 @@ change of the new release.
     does not arm, so proactive posts and board-card reports stop. The ID is at the bottom of the
     channel details' About tab.
   - a `SLACK_BOT_TOKEN` that holds several tokens, or one with a comma or space left in it: the
-    gateway takes one workspace's token, whole. The run gives the count, never the token. Keep a
-    multi-workspace install on `today`.
+    gateway takes one workspace's token, whole. The run gives the count, never the token. Install
+    one bot token from one workspace, or turn Slack off (`SLACK_ENABLED=false`).
 
   `--plan` warns of the same three without refusing.
 

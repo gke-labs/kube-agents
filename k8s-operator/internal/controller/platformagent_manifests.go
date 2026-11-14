@@ -913,18 +913,10 @@ func renderManagedEnvForPlugins(agent *agentv1alpha1.PlatformAgent, agentPlugins
 	// records where it started rather than testing `lines` for emptiness.
 	platformStart := len(lines)
 
-	// Google Chat has no pins: the A2A gateway is its one consumer, so the
-	// Hermes google_chat platform never runs (a2aChatArmed).
-	//
-	// legacySlackConsumer rather than the enabled flag: when the A2A gateway
-	// takes Slack the Hermes platform is off, so its pins would pin a
-	// platform that does not run; see a2aSlackArmed.
-	if slack := integration.Slack; legacySlackConsumer(agent) {
-		add("SLACK_RELAY_URL", credentialProxyBaseURL(agent))
-		add("SLACK_ALLOWED_USERS", strings.Join(slack.AllowedUsers, ","))
-		add("SLACK_ALLOW_ALL_USERS", strconv.FormatBool(allowAllUsers(slack.AllowedUsers)))
-	}
-
+	// Google Chat and Slack have no pins: the A2A gateway is their one
+	// consumer, so the Hermes google_chat and slack platforms never run
+	// (a2aChatArmed, a2aSlackArmed), and a pin would pin a platform that
+	// does not run.
 	if teams := integration.Teams; teams != nil && teams.Enabled != nil && *teams.Enabled {
 		add("TEAMS_RELAY_URL", credentialProxyBaseURL(agent))
 		add("TEAMS_ALLOWED_USERS", strings.Join(teams.AllowedUsers, ","))
@@ -2414,9 +2406,10 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 			cfg.Display.Platforms["google_chat"] = resolveGoogleChatDisplayConfig(gchat.Mode)
 		}
 		if slack := agent.Spec.Integration.Slack; slack != nil && slack.Enabled != nil {
-			// On only while Hermes is the Slack consumer; under next the A2A
-			// gateway is, see a2aSlackArmed.
-			cfg.Platforms.Slack.Enabled = legacySlackConsumer(agent)
+			// The Hermes slack platform stays off too: the A2A gateway is the
+			// one Slack consumer, and this platform would open a second Socket
+			// Mode connection on the same app beside it (a2aSlackArmed).
+			cfg.Platforms.Slack.Enabled = false
 		}
 		if teams := agent.Spec.Integration.Teams; teams != nil && teams.Enabled != nil {
 			cfg.Platforms.Teams.Enabled = *teams.Enabled
@@ -3241,37 +3234,9 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	}
 
 	if integration := agent.Spec.Integration; integration != nil {
-		// No Google Chat relay env: the A2A gateway carries Chat (a2aChatArmed).
-		// The legacy Slack relay env renders only while Hermes holds Slack,
-		// see a2aSlackArmed.
-		if slack := integration.Slack; legacySlackConsumer(agent) {
-			envVars = append(envVars, []corev1.EnvVar{
-				{
-					Name:  "SLACK_RELAY_URL",
-					Value: credentialProxyBaseURL(agent),
-				},
-				{
-					Name:  "SLACK_ALLOWED_USERS",
-					Value: strings.Join(slack.AllowedUsers, ","),
-				},
-				{
-					Name:  "SLACK_ALLOW_ALL_USERS",
-					Value: strconv.FormatBool(allowAllUsers(slack.AllowedUsers)),
-				},
-			}...)
-			if slack.HomeChannel != "" {
-				envVars = append(envVars, corev1.EnvVar{
-					Name:  "SLACK_HOME_CHANNEL",
-					Value: slack.HomeChannel,
-				})
-			}
-			if slack.HomeChannelName != "" {
-				envVars = append(envVars, corev1.EnvVar{
-					Name:  "SLACK_HOME_CHANNEL_NAME",
-					Value: slack.HomeChannelName,
-				})
-			}
-		}
+		// No Google Chat or Slack relay env: the A2A gateway carries both
+		// (a2aChatArmed, a2aSlackArmed). The Slack home channel the agent's
+		// readers want renders with the notify lists (agentSlackHomeChannelEnvVar).
 		// GITHUB_ORG still names GitHub because that is what the agent reads it
 		// as; docs/designs/version-control-support.md §2 renames the vocabulary,
 		// and doing it here would rename a variable the pod's scripts still spell
@@ -3520,9 +3485,9 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// plugin able to supply the URL is that wiring, arriving from a field further
 	// down the same CR.
 	//
-	// This is tidiness, not containment. GOOGLE_CHAT_RELAY_URL and SLACK_RELAY_URL
-	// above still name the broker, so anything in this container that can form an
-	// HTTP request can still reach it — what stops that being free is the token
+	// This is tidiness, not containment. TEAMS_RELAY_URL above names the broker
+	// when Teams is on, and anything in this container that can form an HTTP
+	// request can reach it anyway — what stops that being free is the token
 	// below, which the broker now checks on every call.
 	envVars = append(envVars, corev1.EnvVar{
 		Name:  "CREDENTIAL_PROXY_URL",
@@ -3628,43 +3593,40 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			Value: strings.Join(opts.enabledProfiles, ","),
 		})
 	}
-	// The Hermes Google Chat platform is off (a2aChatArmed),
-	// so the agent-side callers that used to `hermes send` a proactive post
-	// route it to the gateway's chat.notify home channel instead. This names
-	// the platform they reroute; the bus identity above is what sends it.
-	// With a home channel the route posts; without one it refuses and keeps
-	// the post for the digest, so the route is named whenever the backend
-	// is the only platform the posts could reach (a2aGchatHomeRouted). On a
-	// Chat-and-Slack install with no Chat home the agent is not routed, so
-	// it does not count Chat as a platform to post to ahead of Slack.
-	if a2aGchatHomeRouted(agent) {
-		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyPlatformEnvVar, Value: a2aNotifyPlatformGchat})
-	} else if a2aSlackHomeRouted(agent) {
-		// Slack's half of the same rule: the Hermes slack platform is off
-		// when the gateway holds Slack (legacySlackConsumer), and Chat wins
-		// the single-backend gateway, so at most one platform is routed. Only
-		// the CR's channel travels as env; a channel the gateway learned
-		// reaches the agent through the projection file mounted below
-		// (platformagent_home_channel_record.go), which the agent's readers
-		// take after a non-empty env, so a learn replaces no pod.
-		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyPlatformEnvVar, Value: a2aNotifyPlatformSlack})
-		// The agent's own idea of the Slack home channel: the
-		// audit relay gates its report card on knowing a channel and records
-		// it on the incident's routing row. The Hermes slack platform is off
-		// here, so this arms nothing on the agent but those readers.
+	// The Hermes Google Chat and Slack platforms are off: the gateway holds
+	// them (a2aChatArmed, a2aSlackArmed), so the agent-side callers that
+	// used to `hermes send` a proactive post route it to the gateway's
+	// chat.notify instead; the bus identity above is what sends it.
+	// A2A_NOTIFY_CONVERSATIONS names every armed route, Chat first: a kanban
+	// card's report back to the conversation it was filed in, and
+	// onboarding's first report, need no home. A2A_NOTIFY_PLATFORM names the
+	// armed routes whose home channel the CR sets, and is absent when none
+	// is. The agent adds Slack when the projected file below names a channel
+	// the gateway learned, and sends home posts to every armed route when no
+	// platform has a home; the gateway keeps a home-less platform's posts for
+	// the digest it posts once a channel is set (a2a/gateway/notify_refused.go).
+	// The alert picks one of those on its own, Chat first. Both lists read CR
+	// fields only, so a learn rolls no pod.
+	notify := strings.Join(a2aNotifyHomePlatforms(agent), a2aNotifyPlatformSeparator)
+	conversations := strings.Join(a2aNotifyPlatforms(agent), a2aNotifyPlatformSeparator)
+	if notify != "" {
+		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyPlatformEnvVar, Value: notify})
+	}
+	// The agent's own idea of the Slack home channel: the audit relay gates
+	// its report card on knowing a channel and records it on the incident's
+	// routing row. Only the CR's channel travels as env; a channel the
+	// gateway learned reaches the agent through the projection file mounted
+	// below (platformagent_home_channel_record.go), which the agent's readers
+	// take after a non-empty env, so a learn replaces no pod. It renders
+	// between the two lists, where it always has, so an upgrade that leaves
+	// the values alone rolls no pod.
+	if a2aSlackNotifyArmed(agent) {
 		if home := a2aSlackHomeChannel(agent); home != "" {
 			envVars = append(envVars, corev1.EnvVar{Name: agentSlackHomeChannelEnvVar, Value: home})
 		}
 	}
-	// A kanban card's report back to the gateway conversation it was filed
-	// in, and onboarding's first report into the conversation the user first
-	// wrote in, ride the same route whenever the gateway arms it, home channel
-	// or not. The kanban notifier and onboarding route by this; the cron relay
-	// only names it when it refuses a report for want of a home channel.
-	if a2aGchatNotifyArmed(agent) {
-		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyConversationsEnvVar, Value: a2aNotifyPlatformGchat})
-	} else if a2aSlackNotifyArmed(agent) {
-		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyConversationsEnvVar, Value: a2aNotifyPlatformSlack})
+	if conversations != "" {
+		envVars = append(envVars, corev1.EnvVar{Name: a2aNotifyConversationsEnvVar, Value: conversations})
 	}
 	if a2aActivityHookWanted(agent) {
 		envVars = append(envVars, a2aActivitySecretEnv(agent))
@@ -4483,8 +4445,8 @@ func resolveAgentAPIAuthResources(deployment *agentv1alpha1.DeploymentSpec, tier
 // the same image, with CREDENTIAL_PROXY_ROLE=api-proxy telling
 // deploy/shared/start-services.sh to start neither Envoy nor the executor, and
 // its environment is built here rather than by buildCredentialProxyEnv so that
-// the Slack and Google Chat tokens, the token-broker URL and the gcloud
-// bootstrap stay out of the gateway pod entirely. The agent container cannot
+// the token-broker URL and the gcloud bootstrap stay out of the gateway pod
+// entirely. The agent container cannot
 // reach a credentialed endpoint on this pod's loopback because there is no
 // longer one to reach — which is the property the sandbox split is for.
 //
@@ -4989,17 +4951,11 @@ kubectl config set-context "$KUBE_CONTEXT_NAME" --namespace="$KUBE_DEFAULT_NAMES
 				envVars = append(envVars, corev1.EnvVar{Name: legacyGoogleChatSubscriptionEnvVar, Value: subscription})
 			}
 		}
-		// The pair arms the broker's own Socket Mode connection
-		// (credential_proxy.py, serve: SlackRelay), the legacy consumer.
-		// Under next the A2A gateway opens the app's connection on the same
-		// refs, and Slack spreads an app's events across every connection it
-		// has open, so the broker is not handed the pair; see a2aSlackArmed.
-		if slack := integration.Slack; legacySlackConsumer(agent) {
-			envVars = append(envVars,
-				corev1.EnvVar{Name: "SLACK_BOT_TOKEN", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: defaultSecretRef(slack.BotTokenSecretRef, defaultPlatformAgentSecrets, "SLACK_BOT_TOKEN")}},
-				corev1.EnvVar{Name: "SLACK_APP_TOKEN", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: defaultSecretRef(slack.AppTokenSecretRef, defaultPlatformAgentSecrets, "SLACK_APP_TOKEN")}},
-			)
-		}
+		// No Slack token pair: the A2A gateway opens the app's one Socket
+		// Mode connection on the CR's refs, and Slack spreads an app's events
+		// across every connection it has open, so the broker's own relay
+		// (credential_proxy.py, serve: SlackRelay) is never armed; see
+		// a2aSlackArmed.
 		if teams := integration.Teams; teams != nil && teams.Enabled != nil && *teams.Enabled {
 			envVars = append(envVars,
 				corev1.EnvVar{Name: "TEAMS_APP_ID", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: defaultSecretRef(teams.AppIdSecretRef, defaultPlatformAgentSecrets, "TEAMS_APP_ID")}},
@@ -5347,8 +5303,8 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 	//   - Reports: a fleet-audit cron report and the first inventory report
 	//     post as Block Kit, laid out again as a headline and the top findings
 	//     (the audit's rest counted and left to its ledger, the inventory's
-	//     behind a "See all" button), through the credential
-	//     proxy's Slack relay to the channel or thread the report was already
+	//     behind a "See all" button), through the A2A gateway's
+	//     notify route to the channel or thread the report was already
 	//     bound for; the audit's counts come from its ledger issue, read
 	//     through the forge broker.
 	//   - Thread status: less of a delegated card's delivery posts in the
@@ -7371,8 +7327,8 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 
 	// 12. The credential broker. The gateway holds no credential and calls nothing
 	//     on the broker's credential surface, but the chat relay moved into that
-	//     pod with it, so GOOGLE_CHAT_RELAY_URL and SLACK_RELAY_URL both address
-	//     this Service now — see credentialProxyBaseURL. Without the rule the
+	//     pod with it, so TEAMS_RELAY_URL addresses this Service — see
+	//     credentialProxyBaseURL. Without the rule the
 	//     gateway's pull against /v1/chat/events is dropped and the agent stops
 	//     receiving chat, while every pod stays Running and the CR reads Ready.
 	//     buildCredentialProxyNetworkPolicy already admits the gateway on this

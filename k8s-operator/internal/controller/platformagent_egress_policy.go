@@ -305,8 +305,8 @@ func buildAgentEgressNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluste
 
 	// The credential broker. This is the agent's route to every credentialed
 	// command it is allowed to run, so denying it denies the product:
-	// CREDENTIAL_PROXY_URL, GOOGLE_CHAT_RELAY_URL and SLACK_RELAY_URL all
-	// address it (credentialProxyBaseURL). The Service publishes
+	// CREDENTIAL_PROXY_URL and, with Teams on, TEAMS_RELAY_URL address it
+	// (credentialProxyBaseURL). The Service publishes
 	// credentialProxyPort onto a target port of the same number, and the
 	// selector here is the broker Deployment's own "app" label — Pod selectors,
 	// not the Service, because that is what NetworkPolicy matches after the

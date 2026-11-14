@@ -7361,15 +7361,16 @@ run_menu_system() {
         PROJECT_NUMBER="$project_number" print_chat_setup_checklists "$menu_mode"
         if [ "$CHAT_SETUP_CHECKLIST_PRINTED" = "true" ]; then
           # Unlike main(), this apply does not wait for a rollout, and the menu
-          # redrawn below would push the checklist off screen. Under next the
-          # A2A gateway answers the platform it holds; the agent, the rest.
+          # redrawn below would push the checklist off screen. The A2A gateway
+          # answers every enabled platform (the mode the helpers read is next
+          # after every apply).
           local menu_listeners="" menu_deployment
           if google_chat_moves_to_a2a_gateway "$menu_mode" "$google_chat_enabled" ||
-            slack_moves_to_a2a_gateway "$menu_mode" "$slack_enabled" "$google_chat_enabled"; then
+            slack_moves_to_a2a_gateway "$menu_mode" "$slack_enabled"; then
             menu_listeners="$PLATFORM_AGENT_A2A_GATEWAY_DEPLOYMENT"
           fi
           if { is_truthy "$google_chat_enabled" && ! google_chat_moves_to_a2a_gateway "$menu_mode" "$google_chat_enabled"; } ||
-            { is_truthy "$slack_enabled" && ! slack_moves_to_a2a_gateway "$menu_mode" "$slack_enabled" "$google_chat_enabled"; }; then
+            { is_truthy "$slack_enabled" && ! slack_moves_to_a2a_gateway "$menu_mode" "$slack_enabled"; }; then
             menu_listeners="${menu_listeners} ${PLATFORM_AGENT_DEPLOYMENT}"
           fi
           echo ""
@@ -7918,13 +7919,13 @@ main() {
     # Same shape as allowed_users_hint above: an empty list has to read as a
     # deliberate choice rather than as a missing default.
     [ -z "$slack_allowed_users" ] && slack_allowed_hint="empty list"
-    # Under next with Chat off the A2A gateway takes Slack (the mode was
-    # settled at step 2; arm 3 set google_chat_enabled before this runs), and
-    # it takes one bot token, member IDs and a channel id. Those prompts say
-    # so and ask again on an answer the gateway cannot use, rather than let
-    # the refusal after this step throw the interview away. A run with nobody
+    # The A2A gateway takes Slack, with Google Chat on or off, and it takes
+    # one bot token, member IDs and
+    # a channel id. Those prompts say so and ask again on an answer the
+    # gateway cannot use, rather than let the refusal after this step throw
+    # the interview away. A run with nobody
     # to ask keeps its values, and that refusal is its check.
-    if slack_moves_to_a2a_gateway "${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}" true "$google_chat_enabled"; then
+    if slack_moves_to_a2a_gateway "${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}" true; then
       _prompt_slack_settings_for_gateway
       return 0
     fi
@@ -7947,7 +7948,7 @@ main() {
       can_ask=false
     fi
     while :; do
-      prompt_read "Slack Bot Token (xoxb-..., one workspace: spec.mode next takes a single token)" \
+      prompt_read "Slack Bot Token (xoxb-..., one workspace: the A2A gateway takes a single token)" \
         slack_bot_token "$slack_bot_token" true "$bot_hint"
       bad="$(slack_bot_token_list_count "$slack_bot_token")"
       if [ -z "$bad" ] && slack_bot_token_has_separator "$slack_bot_token"; then bad=stray; fi
@@ -8032,12 +8033,16 @@ main() {
   # channel (#3320). An empty answer is allowed, after a warning and a yes:
   # true to keep the answer, false to ask again. $1 the key, $2 the answer,
   # $3 whether anyone can be asked. With nobody to ask it keeps the answer;
-  # the warning before the apply and the closing summary say it then.
+  # the warning before the apply and the closing summary say it then. The
+  # warning names the other platform's home channel when it holds a value
+  # already: an answer (Google Chat is asked first), a flag or install.env.
   _confirm_no_home_channel() {
-    local home keep=""
+    local home keep="" set_platform
     home="$(trim_go_space "${2:-}")"
     [ -z "$home" ] && [ "${3:-}" = "true" ] || return 0
-    print_warning "$(next_home_channel_unset_message "$1")"
+    set_platform="$(next_home_channel_set_platform "${PARAM_PLATFORM_AGENT_MODE:-$PLATFORM_AGENT_MODE_FALLBACK}" \
+      "$slack_enabled" "$google_chat_enabled" "$slack_home_channel" "$google_chat_home_channel")"
+    print_warning "$(next_home_channel_unset_message "$1" "$set_platform")"
     prompt_read "Continue without a home channel for now? (y/N)" keep "n"
     case "$keep" in [yY] | [yY][eE][sS]) return 0 ;; esac
     return 1
@@ -8135,7 +8140,6 @@ main() {
     3)
       google_chat_enabled="true"
       slack_enabled="true"
-      print_info "Under spec.mode next, Google Chat holds the A2A gateway when both are enabled, and Slack stays on the Hermes Slack platform; choose Slack alone to run Slack on the A2A gateway."
       _prompt_google_chat_settings
       _prompt_slack_settings
       ;;

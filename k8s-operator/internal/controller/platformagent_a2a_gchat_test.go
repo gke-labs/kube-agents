@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -128,12 +129,12 @@ func TestAnArmedGatewayCarriesTheChatBackend(t *testing.T) {
 			t.Errorf("%s = %q (present=%v), want %q", name, got.Value, ok, value)
 		}
 	}
-	// One backend per gateway process: the gateway's guard refuses two, so
-	// the render hands it one. The explicit CR field beats a hand-made
-	// Secret, and the Discord reference is omitted rather than left
-	// optional, because the Secret being present would otherwise arm both.
+	// The Discord reference is the default for a gateway no chat backend
+	// arms. The explicit CR field beats a hand-made Secret: the reference is
+	// omitted rather than left optional, because the Secret being present
+	// would otherwise start a Discord bot the CR never asked for.
 	if _, ok := env["DISCORD_TOKEN"]; ok {
-		t.Error("DISCORD_TOKEN is rendered beside the Chat backend; with the discord-bot Secret present the gateway would refuse to start on two backends")
+		t.Error("DISCORD_TOKEN is rendered beside the Chat backend; a discord-bot Secret left in the namespace would start a backend the CR does not name")
 	}
 
 	var mount *corev1.VolumeMount
@@ -466,42 +467,132 @@ func TestTheHomeChannelReachesTheArmedGateway(t *testing.T) {
 }
 
 // TestTheAgentRoutesProactivePostsToTheGatewayExactlyWhenArmed: the agent
-// container is told to send proactive posts through chat.notify exactly when
-// the gateway holds Google Chat and the home channel is a space name, or
-// is unset with no Slack to fall back to (the gateway then keeps the refused
-// posts for the digest); and the kanban notifier to send a card's report
-// back to its conversation whenever the gateway arms the route (home channel
-// unset or a space name). Telling either with no route behind it sends posts
-// to a subject nobody answers.
+// container is told, in A2A_NOTIFY_CONVERSATIONS, every platform whose route
+// the gateway arms, home channel or not, Chat first, and in
+// A2A_NOTIFY_PLATFORM the armed platforms whose home channel the CR sets.
+// The second may be absent; the agent then sends home posts to Slack's
+// projected channel or to every armed route. Both read CR fields only, so a
+// learned channel rolls no pod. Telling either with no route behind it sends
+// posts to a subject nobody answers.
 func TestTheAgentRoutesProactivePostsToTheGatewayExactlyWhenArmed(t *testing.T) {
 	for _, tc := range []struct {
-		name               string
-		agent              *agentv1alpha1.PlatformAgent
-		home, conversation bool
+		name                            string
+		agent                           *agentv1alpha1.PlatformAgent
+		wantPlatform, wantConversations string // "" for absent
 	}{
-		{"no mode with chat", gchatTestAgent("", true), true, true},
-		{"next with chat", withHome(gchatTestAgent("next", true), "spaces/AAAA"), true, true},
-		{"next with chat, no home channel", gchatTestAgent("next", true), true, true},
-		{"next with chat and slack, no chat home", chatAndSlackTestAgent("next"), false, true},
-		{"next with chat, not a space", withHome(gchatTestAgent("next", true), "spaces/AAAA/threads/B"), false, false},
-		{"next with chat, bare id", withHome(gchatTestAgent("next", true), "AAAA"), false, false},
-		{"next without chat", withHome(gchatTestAgent("next", false), "spaces/AAAA"), false, false},
-		{"no mode with chat and home", withHome(gchatTestAgent("", true), "spaces/AAAA"), true, true},
+		{"no mode with chat", gchatTestAgent("", true), "", "google_chat"},
+		{"a stored today with chat", gchatTestAgent("today", true), "", "google_chat"},
+		{"next with chat", withHome(gchatTestAgent("next", true), "spaces/AAAA"), "google_chat", "google_chat"},
+		{"next with chat, no home channel", gchatTestAgent("next", true), "", "google_chat"},
+		{"next with slack, no home channel", slackTestAgent("next", true), "", "slack"},
+		// Both backends share the gateway, so both carry conversation
+		// reports; the platform list names the ones with a CR home.
+		{"next with chat and slack, no homes", chatAndSlackTestAgent("next"), "", "google_chat,slack"},
+		{"next with chat and slack, slack home only", withSlackHomeChannel(chatAndSlackTestAgent("next"), "C0HOME"), "slack", "google_chat,slack"},
+		{"next with chat and slack, chat home only", withHome(chatAndSlackTestAgent("next"), "spaces/AAAA"), "google_chat", "google_chat,slack"},
+		{"next with chat and slack, both homes", withSlackHomeChannel(withHome(chatAndSlackTestAgent("next"), "spaces/AAAA"), "C0HOME"), "google_chat,slack", "google_chat,slack"},
+		// A malformed home drops only that platform's route; the other stays.
+		{"next with chat and slack, slack home a name", withSlackHomeChannel(withHome(chatAndSlackTestAgent("next"), "spaces/AAAA"), "#ops"), "google_chat", "google_chat"},
+		{"next with chat and slack, chat home not a space", withSlackHomeChannel(withHome(chatAndSlackTestAgent("next"), "AAAA"), "C0HOME"), "slack", "slack"},
+		{"next with chat and slack, both homes malformed", withSlackHomeChannel(withHome(chatAndSlackTestAgent("next"), "AAAA"), "#ops"), "", ""},
+		{"next with chat, not a space", withHome(gchatTestAgent("next", true), "spaces/AAAA/threads/B"), "", ""},
+		{"next with chat, bare id", withHome(gchatTestAgent("next", true), "AAAA"), "", ""},
+		{"next without chat", withHome(gchatTestAgent("next", false), "spaces/AAAA"), "", ""},
+		{"no mode with chat and home", withHome(gchatTestAgent("", true), "spaces/AAAA"), "google_chat", "google_chat"},
+		{"no mode with chat and slack", chatAndSlackTestAgent(""), "", "google_chat,slack"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			pod := buildPodTemplateSpec(tc.agent, "h", "h", "h", "h", nil, renderOptions{})
 			env := envMapOf(brokerContainerNamed(pod.Spec.Containers, "platform-agent").Env)
-			for name, want := range map[string]bool{a2aNotifyPlatformEnvVar: tc.home, a2aNotifyConversationsEnvVar: tc.conversation} {
+			for name, want := range map[string]string{a2aNotifyPlatformEnvVar: tc.wantPlatform, a2aNotifyConversationsEnvVar: tc.wantConversations} {
 				got, ok := env[name]
-				if ok != want {
-					t.Fatalf("%s present = %v, want %v", name, ok, want)
+				if ok != (want != "") {
+					t.Fatalf("%s present = %v, want %v", name, ok, want != "")
 				}
-				if ok && got.Value != "google_chat" {
-					t.Errorf("%s = %q, want google_chat (the platform name the agent-side callers use)", name, got.Value)
+				if ok && got.Value != want {
+					t.Errorf("%s = %q, want %q (the platform names the agent-side callers use)", name, got.Value, want)
 				}
 			}
-			if (tc.home || tc.conversation) && envMapOf(brokerContainerNamed(pod.Spec.Containers, "platform-agent").Env)["GOOGLE_CHAT_RELAY_URL"].Name != "" {
-				t.Error("the notify route and the legacy Hermes platform both render")
+			if tc.wantConversations != "" {
+				for _, name := range []string{"GOOGLE_CHAT_RELAY_URL", "SLACK_RELAY_URL"} {
+					if _, ok := env[name]; ok {
+						t.Errorf("the notify route and the legacy Hermes relay env %s both render", name)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestNotifyPlatformsOrderIsChatThenSlack: the conversations list names every
+// armed route, Chat before Slack, whatever home channels are set, and Slack
+// alone on a Slack-only install.
+func TestNotifyPlatformsOrderIsChatThenSlack(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		agent *agentv1alpha1.PlatformAgent
+		want  []string
+	}{
+		{"chat and slack, no homes", chatAndSlackTestAgent("next"), []string{"google_chat", "slack"}},
+		{"chat and slack, slack home", withSlackHomeChannel(chatAndSlackTestAgent("next"), "C0HOME"), []string{"google_chat", "slack"}},
+		{"chat and slack, chat home", withHome(chatAndSlackTestAgent("next"), "spaces/AAAA"), []string{"google_chat", "slack"}},
+		{"chat only, no home", gchatTestAgent("next", true), []string{"google_chat"}},
+		{"slack only", slackTestAgent("next", true), []string{"slack"}},
+		{"no mode", chatAndSlackTestAgent(""), []string{"google_chat", "slack"}},
+	} {
+		if got := a2aNotifyPlatforms(tc.agent); !slices.Equal(got, tc.want) {
+			t.Errorf("%s: a2aNotifyPlatforms = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestNotifyHomePlatformsAreTheArmedRoutesWithACRHome: the platform list
+// names the armed routes whose CR home channel is set and well-formed, Chat
+// before Slack, and is empty when none is: no fallback to every armed route,
+// and no admitted record, which only the projected file carries.
+func TestNotifyHomePlatformsAreTheArmedRoutesWithACRHome(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		agent *agentv1alpha1.PlatformAgent
+		want  []string
+	}{
+		{"chat and slack, no homes", chatAndSlackTestAgent("next"), nil},
+		{"chat and slack, slack home", withSlackHomeChannel(chatAndSlackTestAgent("next"), "C0HOME"), []string{"slack"}},
+		{"chat and slack, chat home", withHome(chatAndSlackTestAgent("next"), "spaces/AAAA"), []string{"google_chat"}},
+		{"chat and slack, both homes", withSlackHomeChannel(withHome(chatAndSlackTestAgent("next"), "spaces/AAAA"), "C0HOME"), []string{"google_chat", "slack"}},
+		{"chat and slack, chat home not a space", withSlackHomeChannel(withHome(chatAndSlackTestAgent("next"), "AAAA"), "C0HOME"), []string{"slack"}},
+		{"chat only, no home", gchatTestAgent("next", true), nil},
+		{"chat only, home", withHome(gchatTestAgent("next", true), "spaces/AAAA"), []string{"google_chat"}},
+		{"slack only, no home", slackTestAgent("next", true), nil},
+		{"slack only, home", withSlackHomeChannel(slackTestAgent("next", true), "C0HOME"), []string{"slack"}},
+		{"no mode, both homes", withSlackHomeChannel(withHome(chatAndSlackTestAgent(""), "spaces/AAAA"), "C0HOME"), []string{"google_chat", "slack"}},
+	} {
+		if got := a2aNotifyHomePlatforms(tc.agent); !slices.Equal(got, tc.want) {
+			t.Errorf("%s: a2aNotifyHomePlatforms = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestTheAgentCarriesNoChatHomeChannel: the agent container carries no
+// GOOGLE_CHAT_HOME_CHANNEL, whatever the CR sets and whatever spec.mode
+// says: the platform list carries Chat's home, and an added variable would
+// roll the pod on upgrade.
+func TestTheAgentCarriesNoChatHomeChannel(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		agent *agentv1alpha1.PlatformAgent
+	}{
+		{"next with chat and slack, chat home set", withHome(chatAndSlackTestAgent("next"), "spaces/AAAA")},
+		{"next with chat, home set", withHome(gchatTestAgent("next", true), "spaces/AAAA")},
+		{"next slack only", withSlackHomeChannel(slackTestAgent("next", true), "C0HOME")},
+		{"no mode with chat and home", withHome(gchatTestAgent("", true), "spaces/AAAA")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pod := buildPodTemplateSpec(tc.agent, "h", "h", "h", "h", nil, renderOptions{})
+			for _, e := range brokerContainerNamed(pod.Spec.Containers, "platform-agent").Env {
+				if e.Name == "GOOGLE_CHAT_HOME_CHANNEL" {
+					t.Errorf("GOOGLE_CHAT_HOME_CHANNEL = %q, want absent", e.Value)
+				}
 			}
 		})
 	}
@@ -509,6 +600,11 @@ func TestTheAgentRoutesProactivePostsToTheGatewayExactlyWhenArmed(t *testing.T) 
 
 func withHome(agent *agentv1alpha1.PlatformAgent, home string) *agentv1alpha1.PlatformAgent {
 	agent.Spec.Integration.GoogleChat.HomeChannel = home
+	return agent
+}
+
+func withSlackHomeChannel(agent *agentv1alpha1.PlatformAgent, home string) *agentv1alpha1.PlatformAgent {
+	agent.Spec.Integration.Slack.HomeChannel = home
 	return agent
 }
 

@@ -82,7 +82,7 @@ The NATS JetStream server (`<name>-a2a-nats`) the `next` stack is built on. Chat
 
 ### A2A gateway
 
-The `<name>-a2a-gateway` Deployment. It holds the chat backend under `next` (Google Chat when enabled, Slack otherwise), publishes each message as a task, posts the answer and the progress of any card back into the thread, and answers a few commands itself. It holds no model. [Conversations under `spec.mode: next`](/kube-agents/concepts/chatops/#conversations-under-specmode-next) describes what it does in a thread.
+The `<name>-a2a-gateway` Deployment. It holds the chat backends (Google Chat and Slack, either or both), publishes each message as a task, posts the answer and the progress of any card back into the thread, and answers a few commands itself. It holds no model. [Conversations under `spec.mode: next`](/kube-agents/concepts/chatops/#conversations-under-specmode-next) describes what it does in a thread.
 
 ### Hermes bridge
 

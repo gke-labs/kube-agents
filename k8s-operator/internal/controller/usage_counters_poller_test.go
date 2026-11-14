@@ -4246,15 +4246,15 @@ func TestUsagePoller_EachTargetAsksForItsListenersReadings(t *testing.T) {
 	}
 }
 
-// usagePeopleTestAgent is a CR with Chat on and, when slack is set, Slack
-// too; Slack then stays on its legacy consumer, served through Hermes.
-func usagePeopleTestAgent(created time.Time, slack bool) *agentv1alpha1.PlatformAgent {
+// usagePeopleTestAgent is a CR with Chat on and, when teams is set, Teams
+// too; Teams has no gateway backend and is served through Hermes.
+func usagePeopleTestAgent(created time.Time, teams bool) *agentv1alpha1.PlatformAgent {
 	agent := usageTestAgent(created)
 	agent.Spec.Integration = &agentv1alpha1.PlatformAgentIntegrationSpec{
 		GoogleChat: &agentv1alpha1.GoogleChatSpec{Enabled: ptr.To(true)},
 	}
-	if slack {
-		agent.Spec.Integration.Slack = &agentv1alpha1.SlackSpec{Enabled: ptr.To(true)}
+	if teams {
+		agent.Spec.Integration.Teams = &agentv1alpha1.TeamsSpec{Enabled: ptr.To(true)}
 	}
 	return agent
 }
@@ -4301,7 +4301,7 @@ func TestUsagePoller_ThePeopleReadingsLandAsPointerFieldsAndNeverMoveLastActiveT
 	}
 }
 
-func TestUsagePoller_ThePeopleReadingStaysAbsentWhileSlackIsOnHermes(t *testing.T) {
+func TestUsagePoller_ThePeopleReadingStaysAbsentWhileTeamsIsOnHermes(t *testing.T) {
 	created := usageClock(0).Add(-time.Hour)
 	agent := usagePeopleTestAgent(created, true)
 	h := newUsageHarness(t, agent, usagePeopleObjects(created)...)
@@ -4312,7 +4312,7 @@ func TestUsagePoller_ThePeopleReadingStaysAbsentWhileSlackIsOnHermes(t *testing.
 	h.poll(10)
 	status := h.status()
 	if status.PeopleSeen7d != nil || status.PeopleSeen30d != nil {
-		t.Fatalf("people = %d/%d with Slack on Hermes, want absent", gaugeValue(status.PeopleSeen7d), gaugeValue(status.PeopleSeen30d))
+		t.Fatalf("people = %d/%d with Teams on Hermes, want absent", gaugeValue(status.PeopleSeen7d), gaugeValue(status.PeopleSeen30d))
 	}
 	if misses, _ := h.peopleMisses(agent); misses != 0 {
 		t.Fatalf("a closed gate recorded %d people misses, want 0", misses)
@@ -4321,14 +4321,14 @@ func TestUsagePoller_ThePeopleReadingStaysAbsentWhileSlackIsOnHermes(t *testing.
 	if err := h.cl.Get(context.Background(), client.ObjectKeyFromObject(agent), stored); err != nil {
 		t.Fatalf("reading the agent: %v", err)
 	}
-	stored.Spec.Integration.Slack.Enabled = ptr.To(false)
+	stored.Spec.Integration.Teams.Enabled = ptr.To(false)
 	if err := h.cl.Update(context.Background(), stored); err != nil {
-		t.Fatalf("disabling Slack: %v", err)
+		t.Fatalf("disabling Teams: %v", err)
 	}
 	h.poll(15)
 	status = h.status()
 	if gaugeValue(status.PeopleSeen7d) != 3 || gaugeValue(status.PeopleSeen30d) != 11 {
-		t.Fatalf("people = %d/%d after Slack left Hermes, want 3/11", gaugeValue(status.PeopleSeen7d), gaugeValue(status.PeopleSeen30d))
+		t.Fatalf("people = %d/%d after Teams left Hermes, want 3/11", gaugeValue(status.PeopleSeen7d), gaugeValue(status.PeopleSeen30d))
 	}
 }
 

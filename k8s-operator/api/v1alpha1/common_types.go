@@ -176,10 +176,11 @@ var SensitiveEnvVars = map[string]struct{}{
 	"A2A_BUS_TOKEN_FILE": {},
 	"A2A_BUS_USER":       {},
 	// A2A_NOTIFY_PLATFORM turns the agent's proactive posts from Hermes to
-	// the gateway's chat.notify route. It holds the routed platforms,
-	// comma-separated; the operator renders one name, exactly when the next
-	// stack holds the chat backend. An override either way leaves posts going
-	// to a platform that is not there.
+	// the gateway's chat.notify route. It holds every platform whose route is
+	// armed under the next stack with a home channel set on the CR,
+	// comma-separated, Chat first; the agent adds a learned Slack channel and
+	// sends home posts to every armed route when no platform has a home. An
+	// override either way leaves posts going to a platform that is not there.
 	"A2A_NOTIFY_PLATFORM": {},
 	// A2A_NOTIFY_CONVERSATIONS arms the kanban notifier's report back to the
 	// gateway conversation a card was filed in, on the same route. It holds
@@ -3160,13 +3161,13 @@ type AgentUsageStatus struct {
 	ProposalsMergedUntouched *int64 `json:"proposalsMergedUntouched,omitempty"`
 
 	// PeopleSeen7d is the A2A gateway's count now of the distinct people who
-	// wrote on the chat platform it serves within the last 7 days:
+	// wrote on the chat platforms it serves within the last 7 days:
 	// kubeagents_a2a_gateway_people_seen under window 7d, the largest reading
 	// across gateway pods. A reading, not an accumulation: it falls as a
 	// person's last message ages out of the window. A 0 is a reading. Absent
 	// until the first reading, after two polls in a row without one, while a
-	// chat platform the install enables is served through Hermes (Google Chat
-	// or Slack on their legacy consumers, or Teams), and while the served CRD
+	// chat platform the install enables is served through Hermes (Microsoft
+	// Teams), and while the served CRD
 	// predates the field. Moves neither LastActiveTime nor
 	// LastHumanActiveTime.
 	// +optional

@@ -719,7 +719,7 @@ before the restart. Two rules keep a person's edit in that window carded: the ku
 and the daemon's, which cards every late row of a principal with fewer than three late rows in the
 digest. What is left without a card of its own is three or more late non-kubectl changes by one
 principal, which the digest names under that principal. On an install with no chat platform enabled
-(a `next` install whose only chat platform has no home channel counts) the digest is one card on the
+the digest is one card on the
 task board, unassigned and blocked, so no agent acts on it and it stays in view. The daily board
 health report names it while it stays blocked; that report reaches a person once the install
 has chat. One card per burst: the digest closes 60 seconds after its newest row or 10

@@ -381,10 +381,9 @@ type SlackSpec struct {
 	AnswerFeedback *bool `json:"answerFeedback,omitempty"`
 
 	// HomeChannelPolicy ("auto", also absent, or "manual") says whether the
-	// A2A gateway may learn the Slack home channel with
-	// Slack on the gateway (Google Chat not enabled) when HomeChannel is
-	// empty. Under "auto" the channel of the first top-level
-	// mention of the agent in a channel becomes the home channel: the gateway
+	// A2A gateway may learn the Slack home channel when HomeChannel is
+	// empty. Under "auto" the channel of the first top-level mention of the
+	// agent in a channel becomes the home channel: the gateway
 	// records it in the <agent>-home-channel ConfigMap, the operator projects
 	// it into the <agent>-chat-home ConfigMap it mounts as a directory in the
 	// agent pod and the gateway pod, both read the file within about a minute

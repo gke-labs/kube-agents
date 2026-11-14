@@ -17,9 +17,11 @@ card's report never reaches the thread.
 
 The fix
 -------
-The operator names the platforms the gateway holds in ``A2A_NOTIFY_PLATFORM``,
-a comma-separated list (the same switch ``agents/platform/scripts/chat_notify.py``
-reads). For each of those platforms, and only inside the notifier:
+The operator names the platforms the gateway holds in ``A2A_NOTIFY_PLATFORM``
+and ``A2A_NOTIFY_CONVERSATIONS``, comma-separated lists (the same switches
+``agents/platform/scripts/chat_notify.py`` reads); :func:`routed_platforms`
+picks the ones that get home posts. For each of those platforms, and only
+inside the notifier:
 
 1. :func:`active_platforms` counts it as served, so its subscriptions are
    collected.
@@ -112,14 +114,15 @@ from gateway.platforms.base import BasePlatformAdapter, SendResult
 logger = logging.getLogger(__name__)
 
 # The operator's switch (written by platformagent_manifests.go, defined as
-# a2aNotifyPlatformEnvVar in platformagent_a2a_manifests.go): the platforms
-# whose home posts go through the gateway, separated by PLATFORM_LIST_SEPARATOR.
+# a2aNotifyPlatformEnvVar in platformagent_a2a_manifests.go): every armed
+# platform whose home channel the CR sets, separated by
+# PLATFORM_LIST_SEPARATOR, and absent when none is. routed_platforms() adds a
+# learned Slack channel, and falls back to every armed route (the gateway then
+# keeps a refused post for its digest).
 NOTIFY_PLATFORM_ENV = "A2A_NOTIFY_PLATFORM"
 # The platforms whose gateway conversations a card can report back to
-# (a2aNotifyConversationsEnvVar), in the same list form. Rendered whenever the
-# gateway arms the route, home channel or not; A2A_NOTIFY_PLATFORM above is home
-# posts, rendered with a home channel or when the backend is the install's only
-# chat platform (the gateway then keeps a refused post for its digest).
+# (a2aNotifyConversationsEnvVar), in the same list form: every armed route,
+# home channel or not.
 NOTIFY_CONVERSATIONS_ENV = "A2A_NOTIFY_CONVERSATIONS"
 # What separates the platform names in either variable
 # (chat_notify.PLATFORM_LIST_SEPARATOR).
@@ -276,24 +279,36 @@ def platform_list(raw: str) -> list:
     return names
 
 
+def _home_file_value() -> str:
+    """The projected Slack home channel, trimmed, or "" when there is none."""
+    try:
+        with open(os.path.join(HOME_FILE_DIR, HOME_FILE_KEY), encoding="utf-8") as handle:
+            return handle.read().strip()
+    except (OSError, ValueError):
+        return ""
+
+
 def routed_platforms() -> list:
     """The platforms whose home posts the gateway holds, or [] when none.
 
-    The rendered env names them when the CR sets the home channel; a channel the
-    gateway learned is projected into a file instead (the operator's
-    ``slack_home`` mount), so with the env empty the answer is derived from the
-    platforms the gateway holds and a non-empty file. A non-empty env wins.
+    The operator lists every armed route whose home channel the CR sets, Chat
+    first, and this adds Slack when the gateway holds it and the projected file
+    names a channel, the CR's or one it learned. With no such list, home posts
+    go to Slack alone when the file names a channel, and otherwise to every
+    armed route, whose posts the gateway keeps for its digest. The rule reads
+    only the two variables and the file, so it gives the same list as
+    chat_notify.routed_platforms, which this patch cannot import.
     """
-    routed = platform_list(os.environ.get(NOTIFY_PLATFORM_ENV, ""))
-    if routed:
-        return routed
-    if HOME_FILE_PLATFORM not in conversation_platforms():
-        return []
-    try:
-        with open(os.path.join(HOME_FILE_DIR, HOME_FILE_KEY), encoding="utf-8") as handle:
-            return [HOME_FILE_PLATFORM] if handle.read().strip() else []
-    except (OSError, ValueError):
-        return []
+    listed = platform_list(os.environ.get(NOTIFY_PLATFORM_ENV, ""))
+    armed = conversation_platforms()
+    slack_home = HOME_FILE_PLATFORM in armed and bool(_home_file_value())
+    if listed:
+        if slack_home and HOME_FILE_PLATFORM not in listed:
+            return [*listed, HOME_FILE_PLATFORM]
+        return listed
+    if slack_home:
+        return [HOME_FILE_PLATFORM]
+    return armed
 
 
 def routes(platform: Any) -> bool:
@@ -355,7 +370,8 @@ def resolve(runner: Any, platform: Any, adapter: Any, sub: Optional[dict] = None
 
     A subscription addressed to a gateway conversation gets the conversation
     stand-in, armed by A2A_NOTIFY_CONVERSATIONS; any other gets the home stand-in,
-    armed by A2A_NOTIFY_PLATFORM.
+    armed when :func:`routed_platforms` names the platform, which it can do with
+    A2A_NOTIFY_PLATFORM absent.
     """
     if adapter is not None:
         return adapter

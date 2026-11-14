@@ -2291,10 +2291,10 @@ main() {
       # refused, not dropped, as retag_values does on the other two arms. Ahead
       # of the notice below, which an older target's helpers cannot print.
       refuse_full_apply_dropping_next "${repo_dir}/${KUBE_AGENTS_VALUES_SCHEMA}" || exit 1
-      # If this apply moves Slack to the A2A gateway (next, Slack on, Chat
-      # off), the Slack settings the gateway cannot use are refused: an email
-      # in the allowlist, a home channel that is not a channel id, a list of
-      # bot tokens. The generator above has already recovered a token the
+      # If this apply moves Slack to the A2A gateway (next, Slack on), the
+      # Slack settings the gateway cannot use are refused: an email in the
+      # allowlist, a home channel that is not a channel id, a list of bot
+      # tokens. The generator above has already recovered a token the
       # live Secret holds. Guarded: a target tree whose installer_common.sh
       # predates the check does not define it.
       # A refusal removes the tfvars the generator just wrote, which render

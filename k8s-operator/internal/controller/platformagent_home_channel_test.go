@@ -43,8 +43,10 @@ import (
 // TestHomeChannelUnsetMessageFollowsTheGatewaysBackend: the advisory exists
 // exactly when the gateway holds a chat backend whose home channel is empty
 // (#3320), whatever spec.mode says; with both chats enabled the gateway
-// holds Chat, so only Chat's home channel counts. With no record, Slack's message says a mention
-// sets the channel.
+// holds both, and each empty home is reported, Chat first. A platform
+// without a home has its posts sent to the other's home channel when that
+// one has a home, and kept for the digest when neither has. With no record,
+// Slack's message says a mention sets the channel.
 func TestHomeChannelUnsetMessageFollowsTheGatewaysBackend(t *testing.T) {
 	slackHome := func(mode, home string) func() string {
 		return func() string {
@@ -66,24 +68,43 @@ func TestHomeChannelUnsetMessageFollowsTheGatewaysBackend(t *testing.T) {
 		return homeChannelUnsetMessage(a, homeChannelRecord{})
 	}
 	for _, tc := range []struct {
-		name  string
-		msg   func() string
-		names []string // empty: no condition
+		name   string
+		msg    func() string
+		names  []string // empty: no condition
+		absent []string
 	}{
-		{"next slack, no home", slackHome("next", ""), []string{"Slack", "spec.integration.slack.homeChannel", "SLACK_HOME_CHANNEL", "mention the agent"}},
-		{"next slack, blank home", slackHome("next", "  "), []string{"spec.integration.slack.homeChannel"}},
-		{"next slack, home set", slackHome("next", "C0123ABCD"), nil},
-		{"no mode slack, no home", slackHome("", ""), []string{"Slack", "spec.integration.slack.homeChannel"}},
-		{"next chat, no home", chatHome("next", ""), []string{"Google Chat", "spec.integration.googleChat.homeChannel", "GOOGLE_CHAT_HOME_CHANNEL", "keeps them"}},
+		{"next slack, no home", slackHome("next", ""), []string{"Slack", "spec.integration.slack.homeChannel", "SLACK_HOME_CHANNEL", "mention the agent"}, nil},
+		{"next slack, blank home", slackHome("next", "  "), []string{"spec.integration.slack.homeChannel"}, nil},
+		{"next slack, home set", slackHome("next", "C0123ABCD"), nil, nil},
+		{"no mode slack, no home", slackHome("", ""), []string{"Slack", "spec.integration.slack.homeChannel"}, nil},
+		{"a stored today slack, no home", slackHome("today", ""), []string{"Slack", "spec.integration.slack.homeChannel"}, nil},
+		{"next chat, no home", chatHome("next", ""), []string{"Google Chat", "spec.integration.googleChat.homeChannel", "GOOGLE_CHAT_HOME_CHANNEL", "keeps them"}, nil},
 		{"next chat and slack, no chat home", func() string {
 			a := chatAndSlackTestAgent("next")
 			a.Spec.Integration.GoogleChat.HomeChannel = ""
 			return homeChannelUnsetMessage(a, homeChannelRecord{})
-		}, []string{"Google Chat", "Slack Hermes platform meanwhile"}},
-		{"next chat, home set", chatHome("next", "spaces/AAA"), nil},
-		{"no mode chat, no home", chatHome("", ""), []string{"Google Chat", "spec.integration.googleChat.homeChannel"}},
-		{"next chat and slack, chat home set", bothChatHomeOnly, nil},
-		{"next, no chat", func() string { return homeChannelUnsetMessage(a2aTestAgent(), homeChannelRecord{}) }, nil},
+		}, []string{"holds Google Chat", "holds Slack", "keeps them", "mention the agent"}, []string{"Slack Hermes platform", "home channel meanwhile"}},
+		{"next chat, home set", chatHome("next", "spaces/AAA"), nil, nil},
+		{"no mode chat, no home", chatHome("", ""), []string{"Google Chat", "spec.integration.googleChat.homeChannel"}, nil},
+		// Slack shares the gateway, so its empty home is reported.
+		{"next chat and slack, chat home set", bothChatHomeOnly, []string{"holds Slack", "spec.integration.slack.homeChannel", "mention the agent", "go to Google Chat's home channel meanwhile"}, []string{"holds Google Chat", "keeps them"}},
+		// Slack's home, from the CR or an admitted record, takes Chat's posts.
+		{"next chat and slack, slack home set", func() string {
+			a := chatAndSlackTestAgent("next")
+			a.Spec.Integration.Slack.HomeChannel = "C0123ABCD"
+			return homeChannelUnsetMessage(a, homeChannelRecord{})
+		}, []string{"holds Google Chat", "go to Slack's home channel meanwhile"}, []string{"holds Slack", "keeps them"}},
+		{"next chat and slack, slack record admitted", func() string {
+			a := chatAndSlackTestAgent("next")
+			return homeChannelUnsetMessage(a, homeChannelRecord{channel: "C0123ABCD", recorded: "C0123ABCD"})
+		}, []string{"holds Google Chat", "go to Slack's home channel meanwhile"}, []string{"holds Slack", "keeps them"}},
+		// An admitted learned Slack channel is Slack's home: no condition.
+		{"next chat and slack, chat home set, slack record admitted", func() string {
+			a := chatAndSlackTestAgent("next")
+			a.Spec.Integration.GoogleChat.HomeChannel = "spaces/AAA"
+			return homeChannelUnsetMessage(a, homeChannelRecord{channel: "C0123ABCD", recorded: "C0123ABCD"})
+		}, nil, nil},
+		{"next, no chat", func() string { return homeChannelUnsetMessage(a2aTestAgent(), homeChannelRecord{}) }, nil, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := tc.msg()
@@ -98,7 +119,15 @@ func TestHomeChannelUnsetMessageFollowsTheGatewaysBackend(t *testing.T) {
 					t.Errorf("message does not name %q: %q", want, got)
 				}
 			}
-			if !strings.Contains(got, "keeps them") && !strings.Contains(got, "Slack Hermes platform") {
+			for _, unwanted := range tc.absent {
+				if strings.Contains(got, unwanted) {
+					t.Errorf("message names %q: %q", unwanted, got)
+				}
+			}
+			if c, sl := strings.Index(got, "holds Google Chat"), strings.Index(got, "holds Slack"); c >= 0 && sl >= 0 && c > sl {
+				t.Errorf("Chat's sentence must come first: %q", got)
+			}
+			if !strings.Contains(got, "keeps them") && !strings.Contains(got, "home channel meanwhile") {
 				t.Errorf("message must say where the posts go meanwhile, not just that a field is empty: %q", got)
 			}
 		})
@@ -325,12 +354,11 @@ func TestHomeChannelRecordDrivesTheProjection(t *testing.T) {
 			if got := env[agentSlackHomeChannelEnvVar].Value; got != tc.wantEnv {
 				t.Errorf("%s = %q, want %q (the learned channel travels as a file, not env)", agentSlackHomeChannelEnvVar, got, tc.wantEnv)
 			}
-			// Routed with the CR's channel, and with the field empty (Slack is
-			// the only chat platform here, so the gateway keeps what it
-			// refuses); a malformed CR value routes nothing.
-			wantRouted := tc.wantEnv != "" || strings.TrimSpace(tc.crHome) == ""
-			if _, routed := env[a2aNotifyPlatformEnvVar]; routed != wantRouted {
-				t.Errorf("%s present = %v, want %v", a2aNotifyPlatformEnvVar, routed, wantRouted)
+			// Listed only with the CR's channel: a learned one reaches the
+			// agent through the file, and a malformed CR value arms no route.
+			wantListed := tc.wantEnv != ""
+			if _, listed := env[a2aNotifyPlatformEnvVar]; listed != wantListed {
+				t.Errorf("%s present = %v, want %v", a2aNotifyPlatformEnvVar, listed, wantListed)
 			}
 			msg := homeChannelUnsetMessage(a, rec)
 			if (msg != "") != tc.wantCond {
@@ -350,6 +378,31 @@ func TestHomeChannelRecordDrivesTheProjection(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestHomeChannelRecordLeavesTheNotifyListsAlone: with Chat and Slack on
+// the gateway, Chat without a home and Slack's home only in the admitted
+// record, the platform list stays absent (no CR home), the conversations
+// list names every armed route, and the learned channel is not env: the pod
+// template reads CR fields only, so a learn rolls no pod. The agent finds
+// the learned channel in the projected file and sends home posts to Slack.
+func TestHomeChannelRecordLeavesTheNotifyListsAlone(t *testing.T) {
+	a := chatAndSlackTestAgent("next")
+	rec := readHomeChannelRecord(a, &corev1.ConfigMap{Data: map[string]string{homeChannelRecordSlackKey: "C0LEARNED"}})
+	if rec.channel == "" {
+		t.Fatal("the record was not admitted; the case tests nothing")
+	}
+	pod := buildPodTemplateSpec(a, "h", "h", "h", "h", nil, renderOptions{})
+	env := envMapOf(brokerContainerNamed(pod.Spec.Containers, "platform-agent").Env)
+	if got, ok := env[a2aNotifyPlatformEnvVar]; ok {
+		t.Errorf("%s = %q, want absent: no home channel is set on the CR", a2aNotifyPlatformEnvVar, got.Value)
+	}
+	if got := env[a2aNotifyConversationsEnvVar].Value; got != "google_chat,slack" {
+		t.Errorf("%s = %q, want %q", a2aNotifyConversationsEnvVar, got, "google_chat,slack")
+	}
+	if got, ok := env[agentSlackHomeChannelEnvVar]; ok {
+		t.Errorf("%s = %q; the learned channel travels as a file, not env", agentSlackHomeChannelEnvVar, got.Value)
 	}
 }
 
@@ -450,6 +503,16 @@ func TestHomeChannelRecordObjectsRoleAndMounts(t *testing.T) {
 			t.Errorf("%s: the gateway pod carries the projection mount", name)
 		}
 	}
+
+	// Chat beside Slack: Slack is still on the gateway, so both
+	// pods carry the projection.
+	both := chatAndSlackTestAgent("next")
+	bothPod := buildPodTemplateSpec(both, "h", "h", "h", "h", nil, renderOptions{})
+	checkVolume("chat and slack agent pod", volumeOf(bothPod.Spec.Volumes))
+	checkMount("chat and slack agent container", mountOf(brokerContainerNamed(bothPod.Spec.Containers, "platform-agent")), agentChatHomeDir)
+	bothGw := buildA2AGatewayDeployment(both)
+	checkVolume("chat and slack gateway pod", volumeOf(bothGw.Spec.Template.Spec.Volumes))
+	checkMount("chat and slack gateway container", mountOf(&bothGw.Spec.Template.Spec.Containers[0]), a2aGatewayChatHomeDir)
 }
 
 // TestPlatformAgentReconciler_Reconcile_HomeChannelRecordDrivesTheProjection
