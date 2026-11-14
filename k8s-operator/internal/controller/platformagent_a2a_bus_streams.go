@@ -513,7 +513,7 @@ func (p *BusStreamPoller) streak(agent *agentv1alpha1.PlatformAgent) *busStreamS
 // the status, re-runs the provision Job when a loss is confirmed, and says
 // when a re-run has recreated TASKS (tasksRecreatedNote).
 func (p *BusStreamPoller) pollAgent(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
-	if agent.DeletionTimestamp != nil || !a2aStackRendering(agent) || !busProvisioned(agent) {
+	if agent.DeletionTimestamp != nil || !busProvisioned(agent) {
 		delete(p.streaks, agent.UID)
 		return p.removeCondition(ctx, agent)
 	}
@@ -941,12 +941,9 @@ func (p *BusStreamPoller) removeCondition(ctx context.Context, agent *agentv1alp
 	return p.r.Status().Patch(ctx, agent, client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{}))
 }
 
-// busStreamsMissingCondition returns BusStreamsPresent while it is False on a
-// CR whose stack still renders, for Degraded; nil otherwise.
+// busStreamsMissingCondition returns BusStreamsPresent while it is False, for
+// Degraded; nil otherwise.
 func busStreamsMissingCondition(agent *agentv1alpha1.PlatformAgent) *metav1.Condition {
-	if !a2aStackRendering(agent) {
-		return nil
-	}
 	cond := meta.FindStatusCondition(agent.Status.Conditions, busStreamsPresentConditionType)
 	if cond == nil || cond.Status != metav1.ConditionFalse {
 		return nil

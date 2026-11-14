@@ -1633,7 +1633,6 @@ func TestCredentialProxyNetworkPolicyAdmitsOnlyTheSandboxTheGatewayAndTheScrape(
 // caller peer on the credentialed port, present exactly when the view is on.
 func TestCredentialProxyNetworkPolicyAdmitsSessionPodsOnlyUnderTheFlag(t *testing.T) {
 	agent := shellSandboxTestAgent()
-	agent.Spec.Mode = ptr.To("next")
 	t.Setenv(a2aSessionClusterViewEnvVar, "")
 	if got := len(buildCredentialProxyNetworkPolicy(agent).Spec.Ingress[0].From); got != 2 {
 		t.Fatalf("flag off: %d caller peers, want 2", got)
@@ -2236,10 +2235,8 @@ func TestKubeProxyObservabilityManifests(t *testing.T) {
 		t.Errorf("expected kube-proxy NetworkPolicy port 8443 ingress only from %q, got %#v", shellSandboxName(agent), np.Spec.Ingress[0].From)
 	}
 
-	nextAgent := agent.DeepCopy()
-	nextAgent.Spec.Mode = ptr.To("next")
 	t.Setenv(a2aSessionClusterViewEnvVar, "true")
-	sessDep := buildKubeProxyDeployment(nextAgent, "", true, "tls-hash")
+	sessDep := buildKubeProxyDeployment(agent, "", true, "tls-hash")
 	sessEnvs := make(map[string]string)
 	for _, e := range sessDep.Spec.Template.Spec.Containers[0].Env {
 		sessEnvs[e.Name] = e.Value
@@ -2253,7 +2250,7 @@ func TestKubeProxyObservabilityManifests(t *testing.T) {
 	if got := sessEnvs["CREDENTIAL_PROXY_ALLOWED_CALLERS"]; got != "system:serviceaccount:test-ns:test-agent-shell" {
 		t.Errorf("CREDENTIAL_PROXY_ALLOWED_CALLERS = %q, want only shell SA", got)
 	}
-	sessNP := buildKubeProxyNetworkPolicy(nextAgent)
+	sessNP := buildKubeProxyNetworkPolicy(agent)
 	if len(sessNP.Spec.Ingress[0].From) != 2 {
 		t.Fatalf("expected 2 peers (shell, a2a-session) on kube-proxy NetworkPolicy, got %#v", sessNP.Spec.Ingress[0].From)
 	}

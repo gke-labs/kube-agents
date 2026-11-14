@@ -1,6 +1,6 @@
-# Pods the operator starts in the release namespace on a schedule, under
-# platformAgent.mode: next, that no golden renders, so footprint.yaml has no
-# entry for them. The quota preflight adds each one here when the chart can
+# Pods the operator starts in the release namespace on a schedule, that no
+# golden renders, so footprint.yaml has no entry for them. The quota preflight
+# adds each one here when the chart can
 # tell it will run.
 #
 # Hand-kept, and held to the operator by
