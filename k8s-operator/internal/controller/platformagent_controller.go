@@ -1592,7 +1592,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 	// A newly bound profile held until every bus server has loaded its
 	// config: a single server's reload landing moves nothing watched.
-	if a2aNext && a2aState.profileHoldRequeue > 0 {
+	if a2aState.profileHoldRequeue > 0 {
 		requeueAfter = min(requeueAfter, a2aState.profileHoldRequeue)
 	}
 	// An exec tier short of its count: the scheduler's verdict lands on a pod,
