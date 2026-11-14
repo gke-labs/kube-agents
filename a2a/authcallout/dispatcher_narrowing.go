@@ -59,13 +59,24 @@ func validateDispatcherEntry(id Identity) error {
 		}
 		seen[p] = true
 	}
+	held := make(map[string]bool, len(id.Held))
+	for _, p := range id.Held {
+		if !lib.ValidSubjectToken(p) {
+			return fmt.Errorf("user %q lists held profile %q, which is not a single subject token", id.User, p)
+		}
+		if held[p] {
+			return fmt.Errorf("user %q lists held profile %q twice", id.User, p)
+		}
+		held[p] = true
+	}
 	return nil
 }
 
 // dispatcherBucketGrants derives one bucket connection's grants from m: the
 // profile entries whose profile hashes to bucket, with every tier the map
 // gives that profile, then the bucket's draining profiles that have no entry
-// left. A profile entry with no tier (an operator before per-tier identities)
+// left. A held profile (Identity.Held) contributes nothing from its entries.
+// A profile entry with no tier (an operator before per-tier identities)
 // has no durable name, so it contributes the profile's stop and supervisor
 // grants but no durable. Refused profiles have no entry, so they get nothing,
 // as the operator's render did.
@@ -74,6 +85,12 @@ func dispatcherBucketGrants(m *IdentityMap, id Identity, bucket int) Grants {
 	index := map[string]int{}
 	for _, e := range m.Identities {
 		if e.Narrowing != NarrowingProfile || lib.DispatcherBucket(e.Profile) != bucket {
+			continue
+		}
+		// A held profile has entries but no grant yet (Identity.Held). Held
+		// and draining at once, it falls through to the draining list below
+		// and keeps a draining profile's grants.
+		if slices.Contains(id.Held, e.Profile) {
 			continue
 		}
 		i, ok := index[e.Profile]

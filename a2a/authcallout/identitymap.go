@@ -125,6 +125,14 @@ type Identity struct {
 	// profile has no durables left, so a tier would select nothing. Set only
 	// with that narrowing.
 	Draining []string `json:"draining,omitempty"`
+
+	// Held names the profiles a NarrowingDispatcher entry must not be
+	// granted yet: bound, with their own entries in the map, but held until
+	// every bus server has loaded their config (the operator's profile hold,
+	// #5580). A bucket's grants are derived from the profile entries, so
+	// without this a held profile's bucket would be granted its subjects
+	// before the hold lifts (#5935). Set only with that narrowing.
+	Held []string `json:"held,omitempty"`
 }
 
 // IdentityMap is what the operator renders and the callout serves. Version is
@@ -299,6 +307,9 @@ func (id Identity) validate() error {
 	}
 	if id.Narrowing != NarrowingDispatcher && len(id.Draining) > 0 {
 		return fmt.Errorf("user %q lists draining profiles but narrows on %q; only %q reads them", id.User, id.Narrowing, NarrowingDispatcher)
+	}
+	if id.Narrowing != NarrowingDispatcher && len(id.Held) > 0 {
+		return fmt.Errorf("user %q lists held profiles but narrows on %q; only %q reads them", id.User, id.Narrowing, NarrowingDispatcher)
 	}
 	hasGrants := len(id.Grants.Publish) > 0 || len(id.Grants.Subscribe) > 0
 	// The profile fields mean something only under NarrowingProfile. On any

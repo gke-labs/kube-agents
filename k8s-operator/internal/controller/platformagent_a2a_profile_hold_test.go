@@ -588,6 +588,51 @@ func TestAHeldProfileIsOutOfTheDispatchersGrantOnly(t *testing.T) {
 	}
 }
 
+// With bucketed grants the callout derives a bucket's grants from the
+// profile entries, which a held profile keeps, so the dispatcher's entry lists
+// it as held for the callout to skip (#5935): listed while held, gone once it
+// is dispatchable, and never on an unbucketed entry, which leaves it out by
+// construction.
+func TestABucketedDispatcherEntryListsTheHeldProfiles(t *testing.T) {
+	withDispatcher(t)
+	withBucketedGrants(t)
+	agent := a2aTestAgent()
+	x, y := testAgentProfile(agent.Namespace, "x"), testAgentProfile(agent.Namespace, "y")
+	dispatcherOf := func(doc a2aAuthMapDocument) a2aAuthMapIdentity {
+		t.Helper()
+		for _, id := range doc.Identities {
+			if id.User == a2aDispatcherUser {
+				return id
+			}
+		}
+		t.Fatal("no dispatcher in the map")
+		return a2aAuthMapIdentity{}
+	}
+	doc, err := renderA2AAuthMapHeld(agent, []agentv1alpha1.AgentProfile{x, y}, []agentv1alpha1.AgentProfile{x}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := dispatcherOf(doc).Held; !slices.Equal(got, []string{"y"}) {
+		t.Errorf("held = %v, want [y] while y is held", got)
+	}
+	doc, err = renderA2AAuthMapHeld(agent, []agentv1alpha1.AgentProfile{x, y}, []agentv1alpha1.AgentProfile{x, y}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := dispatcherOf(doc).Held; len(got) != 0 {
+		t.Errorf("held = %v once y is dispatchable, want none", got)
+	}
+
+	t.Setenv(a2aDispatcherBucketedGrantsEnvVar, "false")
+	doc, err = renderA2AAuthMapHeld(agent, []agentv1alpha1.AgentProfile{x, y}, []agentv1alpha1.AgentProfile{x}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := dispatcherOf(doc).Held; len(got) != 0 {
+		t.Errorf("held = %v on an unbucketed entry, want none", got)
+	}
+}
+
 // The card waits with the dispatcher: a newly bound profile's card is not
 // published, and the profile says why, until every bus server has loaded its
 // config. A card already on the directory stays.

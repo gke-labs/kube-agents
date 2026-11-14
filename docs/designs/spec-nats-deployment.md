@@ -368,6 +368,9 @@ and the draining profiles' names. A connection that sends the bucket `<b>/32` as
 CONNECT password beside the token gets the per-profile grants, draining profiles' included,
 of the profiles that hash to bucket b (fnv32a of the name, mod 32): the callout derives them
 from the map's profile entries with `lib.DispatcherGrants`, plus the bucket's own inbox. The
+entry also lists, as `held`, the bound profiles the profile hold keeps out of the dispatcher
+until every bus server has loaded their config; their entries stay in the map, and a bucket's
+grants skip them until the hold lifts (#5935). The
 password picks a slice of what the token already allows; it is not a credential. A bucket the
 callout doesn't accept is refused, never served the control grants. The hash is unkeyed, so
 names chosen to collide fill one bucket, whose mint fails closed at roughly 450 two-tier

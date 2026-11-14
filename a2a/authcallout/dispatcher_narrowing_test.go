@@ -44,6 +44,12 @@ func dispatcherEntry(draining ...string) Identity {
 		Narrowing: NarrowingDispatcher, Grants: dispatcherFixed, Draining: draining}
 }
 
+func heldEntry(held ...string) Identity {
+	id := dispatcherEntry()
+	id.Held = held
+	return id
+}
+
 func profileEntry(profile, tier string) Identity {
 	sa := "system:serviceaccount:kubeagents-system:agentprofile-" + profile
 	user := "profile-" + profile
@@ -178,6 +184,52 @@ func TestABucketConnectionGetsItsProfilesGrantsAndNothingElse(t *testing.T) {
 	}
 }
 
+// A held profile's bucket mints none of the held profile's subjects, though
+// its entries stay in the map, until the hold lifts (#5935): with it listed
+// held the bucket holds only the other profile's grants; unlisted, the next
+// map grants it. Held and draining at once, it keeps a draining profile's
+// grants and none of its durables.
+func TestAHeldProfilesBucketMintsNoneOfItsSubjects(t *testing.T) {
+	const b = 3
+	live, held := profileHashingTo(b), ""
+	held = profileHashingTo(b, live)
+	bucketGrants := func(disp Identity) Grants {
+		t.Helper()
+		svc := newDispatcherTestService(t, renderMap(t, disp, profileEntry(live, "read"), profileEntry(held, "read")), dispatcherTokens())
+		d, err := connect(svc, dispatcherToken, lib.DispatcherBucketCredential(b))
+		if err != nil {
+			t.Fatalf("refused: %v", err)
+		}
+		return allowed(d)
+	}
+	inbox := fmt.Sprintf("_INBOX.dispatcher-b%d.>", b)
+	expect := func(profiles ...lib.DispatcherGrantProfile) Grants {
+		g := lib.DispatcherGrants(profiles)
+		return Grants{Publish: append(g.Publish, inbox), Subscribe: append(g.Subscribe, inbox)}
+	}
+
+	if got, want := bucketGrants(heldEntry(held)), expect(lib.DispatcherGrantProfile{Name: live, Tiers: []string{"read"}}); !reflect.DeepEqual(got, want) {
+		t.Errorf("while held: bucket grants =\n%v\nwant\n%v", got, want)
+	}
+	if got := bucketGrants(heldEntry(held)); slices.ContainsFunc(append(got.Publish, got.Subscribe...), func(s string) bool { return strings.Contains(s, held) }) {
+		t.Errorf("while held: the bucket holds a subject of %s: %v", held, got)
+	}
+	if got, want := bucketGrants(dispatcherEntry()), expect(
+		lib.DispatcherGrantProfile{Name: live, Tiers: []string{"read"}},
+		lib.DispatcherGrantProfile{Name: held, Tiers: []string{"read"}},
+	); !reflect.DeepEqual(got, want) {
+		t.Errorf("after the hold: bucket grants =\n%v\nwant\n%v", got, want)
+	}
+	heldDraining := heldEntry(held)
+	heldDraining.Draining = []string{held}
+	if got, want := bucketGrants(heldDraining), expect(
+		lib.DispatcherGrantProfile{Name: live, Tiers: []string{"read"}},
+		lib.DispatcherGrantProfile{Name: held, Draining: true},
+	); !reflect.DeepEqual(got, want) {
+		t.Errorf("held and draining: bucket grants =\n%v\nwant\n%v", got, want)
+	}
+}
+
 // An empty bucket is still a valid connection: its inbox on both sides, so
 // neither side is empty (which the server would read as unrestricted).
 func TestAnEmptyBucketHoldsOnlyItsInbox(t *testing.T) {
@@ -272,6 +324,8 @@ func TestTheMapRefusesAnUnsoundDispatcherEntry(t *testing.T) {
 	profileInTrusted.Account = AccountControl
 	drainingOnGateway := Identity{ServiceAccount: "system:serviceaccount:x:z", User: "z", Account: AccountControl,
 		Grants: Grants{Publish: []string{"a"}, Subscribe: []string{"b"}}, Draining: []string{"p"}}
+	heldOnGateway := Identity{ServiceAccount: "system:serviceaccount:x:h", User: "h", Account: AccountControl,
+		Grants: Grants{Publish: []string{"a"}, Subscribe: []string{"b"}}, Held: []string{"p"}}
 	second := dispatcherEntry()
 	second.ServiceAccount, second.User = "system:serviceaccount:x:d2", "dispatcher2"
 	squatUser := Identity{ServiceAccount: "system:serviceaccount:x:sq", User: "dispatcher-b3", Account: AccountControl,
@@ -287,6 +341,9 @@ func TestTheMapRefusesAnUnsoundDispatcherEntry(t *testing.T) {
 		"a profile named for a bucket user":   {dispatcherEntry(), profileEntry("dispatcher-b3", "read")},
 		"a draining name that is not a token": {dispatcherEntry("a.b")},
 		"a draining name twice":               {dispatcherEntry("a", "a")},
+		"held on a non-dispatcher entry":      {heldOnGateway},
+		"a held name that is not a token":     {heldEntry("a.b")},
+		"a held name twice":                   {heldEntry("a", "a")},
 	} {
 		if _, err := ParseIdentityMap(renderMap(t, ids...)); err == nil {
 			t.Errorf("%s: the map was accepted", name)

@@ -139,7 +139,11 @@ func a2aDispatcherBucketedGrants() bool {
 // control connection, plus the draining profiles' names. The callout derives
 // every per-profile subject from the profile entries (lib.DispatcherGrants),
 // so the entry's size no longer grows with the profile count.
-func dispatcherMapEntry(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, draining []a2aDispatchProfile) a2aAuthMapIdentity {
+// held names the bound profiles kept out of the dispatcher
+// (a2aHeldProfileNames). Unbucketed, the entry is built from the dispatchable
+// profiles alone and leaves them out already; bucketed, the callout derives
+// grants from every profile entry, so the entry lists them for it to skip.
+func dispatcherMapEntry(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, draining []a2aDispatchProfile, held []string) a2aAuthMapIdentity {
 	if !a2aDispatcherBucketedGrants() {
 		entry, _ := a2aDispatcherMapEntry(agent, profiles, draining)
 		return entry
@@ -158,7 +162,21 @@ func dispatcherMapEntry(agent *agentv1alpha1.PlatformAgent, profiles []agentv1al
 		Grants:         a2aAuthMapGrants{Publish: id.publish, Subscribe: id.subscribe},
 		Narrowing:      a2aNarrowingDispatcher,
 		Draining:       drainingNames,
+		Held:           held,
 	}
+}
+
+// a2aHeldProfileNames is the bound profiles not in dispatchable, by name and
+// in the order bound: the ones the profile hold keeps out of the dispatcher.
+func a2aHeldProfileNames(bound, dispatchable []agentv1alpha1.AgentProfile) []string {
+	var held []string
+	for _, p := range bound {
+		if slices.ContainsFunc(dispatchable, func(d agentv1alpha1.AgentProfile) bool { return d.Name == p.Name }) || slices.Contains(held, p.Name) {
+			continue
+		}
+		held = append(held, p.Name)
+	}
+	return held
 }
 
 func a2aDispatcherName(agent *agentv1alpha1.PlatformAgent) string {
