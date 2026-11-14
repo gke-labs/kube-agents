@@ -230,15 +230,15 @@ validator check lands with the first stack that needs it:
    (an appended gentler entry fails it), taken from the dry run of rule 5; never a replica count
    on an autoscaled Deployment.
 8. Every object a fixture plants carries `managed-by=kube-agents-bench` where the kind takes
-   labels: every Kubernetes object, a node pool's GCE resource labels (`--labels` at create, not
-   only `--node-labels`), a GCE address or forwarding rule, an alert policy. A GCP kind without
+   labels: every Kubernetes object, a GKE cluster's or node pool's GCE resource labels (`--labels`
+   at create, not only `--node-labels`), a GCE address or forwarding rule, an alert policy. A GCP kind without
    labels (a network, a subnetwork, a backend service, a health check, a service attachment)
    carries the description prefix `kube-agents-bench plant`. The sweeps key on these marks and
    on nothing else: `hack/ci-teardown.sh` runs `hack/ci_sweep_bench_plants.sh` at every lease
    start and end against the host cluster's webhook configurations, node readiness rules,
-   compute classes and node pools, and `hack/ci_sweep_compute_plants.py` takes addresses, subnets,
-   networks and alert policies today; forwarding rules, service attachments, backend services,
-   health checks and clusters wait on a sibling change to that script and its sweeper role.
+   compute classes and node pools, and `hack/ci_sweep_compute_plants.py` takes clusters, forwarding
+   rules, service attachments, backend services, health checks, addresses, subnets, networks and
+   alert policies every hour.
    `created-by-stack=<stack>` stays the stack's own key for adopting its leftover by name;
    the sweeps never read it. A plant without its mark survives a killed run until someone
    deletes it by hand.
