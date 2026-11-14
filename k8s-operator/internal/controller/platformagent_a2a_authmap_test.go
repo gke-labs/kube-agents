@@ -411,6 +411,12 @@ func TestTheRenderTimeMapCheckRefusesWhatTheCalloutWouldRefuse(t *testing.T) {
 			ids[0].Held = []string{"newcomer"}
 			return ids
 		},
+		"a held name that is not a subject token": func(ids []a2aAuthMapIdentity) []a2aAuthMapIdentity {
+			return append(ids, a2aTestBucketedDispatcherEntry("a.b"))
+		},
+		"a held name twice": func(ids []a2aAuthMapIdentity) []a2aAuthMapIdentity {
+			return append(ids, a2aTestBucketedDispatcherEntry("a", "a"))
+		},
 	}
 
 	for name, mutate := range cases {
@@ -532,4 +538,12 @@ func TestTheSchemaAnnotationIsOnThePodTemplateNotTheDeployment(t *testing.T) {
 	if len(dep.Spec.Template.ObjectMeta.Annotations) == 0 {
 		t.Fatal("the callout pod template carries no annotations at all, so no schema change can roll it")
 	}
+}
+
+// a2aTestBucketedDispatcherEntry is a sound bucketed dispatcher entry listing
+// held, for the render-time check's cases.
+func a2aTestBucketedDispatcherEntry(held ...string) a2aAuthMapIdentity {
+	id := dispatcherIdentity(a2aTestAgent(), "kubeagents-system", nil, nil)
+	return a2aAuthMapIdentity{ServiceAccount: id.serviceAccount, User: id.user, Account: id.account,
+		Grants: a2aAuthMapGrants{Publish: id.publish, Subscribe: id.subscribe}, Narrowing: a2aNarrowingDispatcher, Held: held}
 }

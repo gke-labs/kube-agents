@@ -166,16 +166,25 @@ func dispatcherMapEntry(agent *agentv1alpha1.PlatformAgent, profiles []agentv1al
 	}
 }
 
-// a2aHeldProfileNames is the bound profiles not in dispatchable, by name and
-// in the order bound: the ones the profile hold keeps out of the dispatcher.
-func a2aHeldProfileNames(bound, dispatchable []agentv1alpha1.AgentProfile) []string {
+// a2aHeldProfileNames is the profiles the map renders entries for that are
+// not dispatchable, sorted: the ones the profile hold keeps out of the
+// dispatcher. Read off the rendered profile entries rather than the bound
+// list, so a refused profile (no entry, and out of dispatchable too) is never
+// listed, every name listed has passed its entry's checks, and the list lasts
+// only as long as a hold does. Sorted, so the map's version doesn't move with
+// the order the cache lists profiles in.
+func a2aHeldProfileNames(entries []a2aAuthMapIdentity, dispatchable []agentv1alpha1.AgentProfile) []string {
 	var held []string
-	for _, p := range bound {
-		if slices.ContainsFunc(dispatchable, func(d agentv1alpha1.AgentProfile) bool { return d.Name == p.Name }) || slices.Contains(held, p.Name) {
+	for _, e := range entries {
+		if e.Narrowing != a2aNarrowingProfile || e.Profile == "" || slices.Contains(held, e.Profile) {
 			continue
 		}
-		held = append(held, p.Name)
+		if slices.ContainsFunc(dispatchable, func(d agentv1alpha1.AgentProfile) bool { return d.Name == e.Profile }) {
+			continue
+		}
+		held = append(held, e.Profile)
 	}
+	slices.Sort(held)
 	return held
 }
 

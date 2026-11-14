@@ -281,7 +281,7 @@ func renderA2AAuthMapHeld(agent *agentv1alpha1.PlatformAgent, profiles, dispatch
 		if !over {
 			// Bucketed or not (dispatcherMapEntry); unbucketed, it is
 			// a2aDispatcherMapEntry's entry, which the ceiling measured.
-			identities = append(identities, dispatcherMapEntry(agent, dispatchable, draining, a2aHeldProfileNames(profiles, dispatchable)))
+			identities = append(identities, dispatcherMapEntry(agent, dispatchable, draining, a2aHeldProfileNames(identities, dispatchable)))
 		}
 	}
 
@@ -598,6 +598,15 @@ func validateA2AAuthMapIdentities(identities []a2aAuthMapIdentity, principals ..
 					return fmt.Errorf("identity %d: user %q lists draining profile %q, which is not a dot-free DNS-1123 label, is listed twice, or is a reserved addressee, a principal's or map user's name, or a dispatcher bucket user", i, id.User, p)
 				}
 				seenDraining[p] = true
+			}
+			// The callout's checks on held names (validateDispatcherEntry):
+			// one subject token each, none twice.
+			seenHeld := map[string]bool{}
+			for _, p := range id.Held {
+				if !isDNS1123LabelToken(p) || seenHeld[p] {
+					return fmt.Errorf("identity %d: user %q lists held profile %q, which is not a dot-free DNS-1123 label, or is listed twice", i, id.User, p)
+				}
+				seenHeld[p] = true
 			}
 		default:
 			return fmt.Errorf("identity %d: user %q names narrowing %q, which the callout does not implement", i, id.User, id.Narrowing)

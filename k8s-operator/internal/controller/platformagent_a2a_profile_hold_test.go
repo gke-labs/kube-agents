@@ -623,6 +623,19 @@ func TestABucketedDispatcherEntryListsTheHeldProfiles(t *testing.T) {
 		t.Errorf("held = %v once y is dispatchable, want none", got)
 	}
 
+	// Sorted, whatever order the profiles were bound in; and a refused
+	// profile (no entry, and so never dispatchable) is not held: it would
+	// stay listed for good, and a name the operator refuses is one the
+	// callout refuses too (#5935 review).
+	z, dotted := testAgentProfile(agent.Namespace, "z"), testAgentProfile(agent.Namespace, "dotted.name")
+	doc, err = renderA2AAuthMapHeld(agent, []agentv1alpha1.AgentProfile{z, x, y, dotted}, []agentv1alpha1.AgentProfile{x}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := dispatcherOf(doc).Held; !slices.Equal(got, []string{"y", "z"}) {
+		t.Errorf("held = %v, want [y z]: sorted, and without the refused profile", got)
+	}
+
 	t.Setenv(a2aDispatcherBucketedGrantsEnvVar, "false")
 	doc, err = renderA2AAuthMapHeld(agent, []agentv1alpha1.AgentProfile{x, y}, []agentv1alpha1.AgentProfile{x}, nil)
 	if err != nil {
