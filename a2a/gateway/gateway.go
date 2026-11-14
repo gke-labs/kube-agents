@@ -230,6 +230,10 @@ type Gateway struct {
 	// profiles is the AgentProfiles this gateway can address, kept from
 	// their cards on DIRECTORY (startProfileDirectory).
 	profiles *profileDirectory
+	// triggerLimits is the trigger ingress's per-trigger rate cap, made on
+	// first use (triggerLimiter).
+	triggerLimiterOnce sync.Once
+	triggerLimits      *triggerRateLimiter
 	// resolvedScope reads the scope publisher's ConfigMap (SetResolvedScope);
 	// nil when none is configured.
 	resolvedScope resolvedScopeSource
@@ -926,6 +930,7 @@ func (g *Gateway) RunWith(ctx context.Context, o RunOptions) error {
 	}()
 
 	g.startProfileDirectory(ctx)
+	g.startTriggerIngress(ctx)
 	go g.reapLoop(ctx)
 	if g.spawner != nil {
 		go g.sweepLoop(ctx)

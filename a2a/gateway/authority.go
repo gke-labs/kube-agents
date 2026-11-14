@@ -77,7 +77,13 @@ type Authority struct {
 	Requester AuthorityRequester `json:"requester"`
 	Audience  AuthorityAudience  `json:"audience"`
 	Via       *AuthorityVia      `json:"via,omitempty"`
-	Grants    json.RawMessage    `json:"grants"`
+	// Trigger is the unattended trigger a trigger's submission claims
+	// (trigger_ingress.go): the one the task's grant binds, which the
+	// dispatcher reads back (capability.TriggerFromAuthority) and the
+	// verifier holds equal to the grant's. Only the trigger ingress sets it,
+	// and Attribution leaves it out, so no later task inherits it.
+	Trigger *capability.Trigger `json:"trigger,omitempty"`
+	Grants  json.RawMessage     `json:"grants"`
 }
 
 // Render marshals the block for one envelope. A nil ref renders `grants: null`,
