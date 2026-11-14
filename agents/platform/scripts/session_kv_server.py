@@ -10078,11 +10078,6 @@ CARD_STOP_WORST_CASE_S = CARD_STOP_DEADLINE_S + CARD_STOP_BUSY_TIMEOUT_S + 1.0
 # bridge's 35 s request timeout (DefaultCardStopTimeout in
 # a2a/hermes-bridge/cardstop.go), so a joined stop still answers the cancel.
 CARD_STOP_JOIN_WORST_CASE_S = CARD_STOP_WORST_CASE_S + CARD_STOP_BUSY_TIMEOUT_S + 1.0
-# How far behind session-kv's clock the board's created_at may run and a card
-# filed after a stop's scan began still count as new (_card_stop_tree_has_card_since).
-# Hermes writes the board on this pod, so the clocks agree; the slack only
-# makes a reuse rarer, never a stale one more likely.
-CARD_STOP_REUSE_CLOCK_SLACK_S = 2.0
 # Between SIGTERM and SIGKILL for what is left of a stopped card's worker group.
 CARD_STOP_KILL_GRACE_SECONDS = 3.0
 CARD_STOP_KILL_POLL_SECONDS = 0.1
@@ -10826,10 +10821,11 @@ def _card_stop_tree_has_card_since(session_id: str, conversation: str, since: fl
         return True  # a tree too large to read whole may hold a new card
     # Hermes stamps created_at in whole seconds, so a card filed after the
     # scan began in the same second carries a stamp below `since`: compare
-    # against that second, less CARD_STOP_REUSE_CLOCK_SLACK_S for a writer's
-    # clock a little behind this one, which errs toward a fresh stop, never
-    # a stale one.
-    floor = math.floor(since) - CARD_STOP_REUSE_CLOCK_SLACK_S
+    # against that second, which errs toward a fresh stop, never a stale one.
+    # Hermes writes the board on this pod, so its clock is this one; a wider
+    # margin would count a card filed just before the first stop as new and
+    # never join (verify_card_stop.py's second call).
+    floor = math.floor(since)
     return any(float(card.get("created_at") or 0) >= floor for card in tree.cards.values())
 
 
