@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import sqlite3
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
@@ -208,15 +207,6 @@ def forge_contains(repo: str, ancestor: str, revision: str) -> bool | None:
     return contains if isinstance(contains, bool) else None
 
 
-def _repo_key(url: object) -> str:
-    """A git url as one comparable key: host and path, lower-case, no scheme, user, ``.git`` or trailing slash."""
-    text = str(url or "").strip().lower()
-    text = re.sub(r"^[a-z+]+://", "", text)
-    if "@" in text.split("/", 1)[0]:
-        text = text.split("@", 1)[1].replace(":", "/", 1)
-    return re.sub(r"(\.git)?/*$", "", text)
-
-
 def reconcilers_for(repo: str, namespace: str, lists: dict[str, dict]) -> list[dict]:
     """The reconciler objects on this cluster that deliver ``repo`` into ``namespace``.
 
@@ -228,7 +218,12 @@ def reconcilers_for(repo: str, namespace: str, lists: dict[str, dict]) -> list[d
     counts: with nothing targeting the namespace, the fix is observed directly.
     ``lists`` maps the resource names above to their ``kubectl get -A -o json`` answers.
     """
-    key = _repo_key(repo)
+    import clean_merges
+
+    repo_key = clean_merges.repo_key
+    key = repo_key(repo)
+    if not key:
+        return []
     found = []
     for app in lists.get(ARGO_APPLICATIONS, {}).get("items", []):
         spec = app.get("spec") or {}
@@ -237,7 +232,7 @@ def reconcilers_for(repo: str, namespace: str, lists: dict[str, dict]) -> list[d
             continue
         sources = ([spec["source"]] if isinstance(spec.get("source"), dict) else []) + list(spec.get("sources") or [])
         if destination.get("namespace") == namespace and any(
-            _repo_key(source.get("repoURL")) == key for source in sources if isinstance(source, dict)
+            repo_key(source.get("repoURL")) == key for source in sources if isinstance(source, dict)
         ):
             found.append(app)
     repositories = {
@@ -249,11 +244,11 @@ def reconcilers_for(repo: str, namespace: str, lists: dict[str, dict]) -> list[d
         ref = spec.get("sourceRef") or {}
         source = repositories.get((ref.get("namespace") or meta.get("namespace"), ref.get("name")))
         if (ref.get("kind") == "GitRepository" and source and spec.get("targetNamespace") == namespace
-                and _repo_key((source.get("spec") or {}).get("url")) == key):
+                and repo_key((source.get("spec") or {}).get("url")) == key):
             found.append(kustomization)
     for sync in lists.get(CONFIGSYNC_REPOSYNCS, {}).get("items", []):
         git = (sync.get("spec") or {}).get("git") or {}
-        if (sync.get("metadata") or {}).get("namespace") == namespace and _repo_key(git.get("repo")) == key:
+        if (sync.get("metadata") or {}).get("namespace") == namespace and repo_key(git.get("repo")) == key:
             found.append(sync)
     return found
 
