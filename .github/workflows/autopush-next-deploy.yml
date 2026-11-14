@@ -6,10 +6,9 @@ name: "Autopush-Next: Deploy"
 # deploy as a unit: a run for an older publish can never deploy after a newer
 # one, and a slow or leased autopush-next never holds up autopush.
 #
-# autopush-next has its own GitHub environment and GCP project, whose
-# PLATFORM_AGENT_MODE is next; the reconcile renders that into the chart, so
-# the environment runs next. Until the environment is provisioned its deploy
-# reports `skipped` with a notice (skip_unconfigured).
+# autopush-next has its own GitHub environment and GCP project. Until the
+# environment is provisioned its deploy reports `skipped` with a notice
+# (skip_unconfigured).
 
 on:
   # zizmor: ignore[dangerous-triggers]

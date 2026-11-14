@@ -15,10 +15,10 @@ export CLOUDSDK_CORE_DISABLE_PROMPTS="${CLOUDSDK_CORE_DISABLE_PROMPTS:-1}"
 # once a run has passed. Both read the same three outcomes out of uninstall.sh.
 # shellcheck source=scripts/release/teardown_common.sh
 . "$(dirname "${BASH_SOURCE[0]}")/teardown_common.sh"
-# platform_agent_mode_resolve and the `next` patch and gate. Defines and runs
-# nothing; see the mode check below the install refusals.
-# shellcheck source=scripts/release/platform_agent_mode.sh
-. "$(dirname "${BASH_SOURCE[0]}")/platform_agent_mode.sh"
+# The A2A readiness gate run after the install, at the bottom. Defines and
+# runs nothing.
+# shellcheck source=scripts/release/a2a_readiness.sh
+. "$(dirname "${BASH_SOURCE[0]}")/a2a_readiness.sh"
 
 # A GCE stockout during the install, retried. The nightly environment is
 # created from nothing, and GKE answers a regional capacity shortage with the
@@ -215,19 +215,6 @@ fi
 
 [ "$INSTALL_REFUSAL_STATUS" -eq 0 ] || exit 1
 
-# The PlatformAgent's spec.mode, also above the teardown: a mode that is
-# neither `today` nor `next` is refused here rather than after the environment
-# is gone. Unset and `today` change nothing, down to the environment
-# uninstall.sh and install.sh inherit, which platform_agent_mode_resolve
-# clears of the variable. `next` is applied after the install, at the bottom.
-platform_agent_mode_resolve || exit 1
-# And `next` only on the ephemeral environments; the helper says why.
-# LONG_LIVED_ENVIRONMENT is the workflow's flag for autopush, autopush-next and
-# staging, read with the same truthiness as the allowlist guard above.
-if provision_is_truthy "${LONG_LIVED_ENVIRONMENT:-}"; then
-  platform_agent_mode_refuse_long_lived true "${GKE_CLUSTER_NAME:-}" || exit 1
-fi
-
 # The teardown half of a provision: uninstall.sh, its three outcomes read out
 # of the exit code, and TEARDOWN_STRICT deciding whether a failed one stops
 # the run. A function because the stockout retry at the bottom runs it again
@@ -292,14 +279,6 @@ INSTALL_ARGS=(
   --gcp-region="${GCP_REGION}"
   --gke-cluster-name="${GKE_CLUSTER_NAME}"
   --image-tag="${IMAGE_TAG}"
-  # Named, not left to install.sh's default: a first install with no
-  # install.env now defaults to next, and a today run must install today (the
-  # E2E readiness check compares the installed mode with this one). A next
-  # run installs next, as the exported PLATFORM_AGENT_MODE already made it,
-  # and the patch and gate at the bottom still run. On a long-lived
-  # environment, where next is refused above, the rendered install.env sets no
-  # mode, which resolves to today, so the flag agrees and is recorded there.
-  --mode="${RELEASE_PLATFORM_AGENT_MODE}"
 )
 
 # Everything below reaches install.sh as a flag rather than as an inherited
@@ -495,21 +474,12 @@ done
 rm -f "${INSTALL_LOG}"
 trap - EXIT
 
-# spec.mode: next, then the gate that waits for what the operator renders for
-# it. install.sh reads PLATFORM_AGENT_MODE from the environment this script
-# leaves it exported in under `next` (only rc and nightly get here with it;
-# the long-lived environments are refused above), so the install already
-# renders spec.mode: next and the merge patch below applies a value the CR
-# already holds. The patch is redundant and stays only because removing it
-# moves the tests that pin it; that removal is its own change. The wait
-# stays either way.
+# The gate that waits for the A2A stack the operator renders, so the step
+# ends on an install that is up rather than one still coming up.
 #
 # install.sh has already pointed kubectl at the cluster and checked the
 # context; the context is still named on each call, so nothing here can reach
 # a different cluster.
-if [ "${RELEASE_PLATFORM_AGENT_MODE}" = "${PLATFORM_AGENT_MODE_NEXT}" ]; then
-  MODE_CONTEXT="gke_${GCP_PROJECT_ID}_${GCP_REGION}_${GKE_CLUSTER_NAME}"
-  MODE_NAMESPACE="${NAMESPACE:-$(. "$(dirname "${BASH_SOURCE[0]}")/../../install.defaults.env" && echo "${DEFAULT_NAMESPACE}")}"
-  platform_agent_mode_patch_next "${MODE_NAMESPACE}" "${MODE_CONTEXT}"
-  platform_agent_mode_wait_next "${MODE_NAMESPACE}" "${MODE_CONTEXT}"
-fi
+A2A_CONTEXT="gke_${GCP_PROJECT_ID}_${GCP_REGION}_${GKE_CLUSTER_NAME}"
+A2A_NAMESPACE="${NAMESPACE:-$(. "$(dirname "${BASH_SOURCE[0]}")/../../install.defaults.env" && echo "${DEFAULT_NAMESPACE}")}"
+a2a_readiness_wait "${A2A_NAMESPACE}" "${A2A_CONTEXT}"
