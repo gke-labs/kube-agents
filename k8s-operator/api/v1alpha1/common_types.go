@@ -1033,12 +1033,13 @@ type TuningSpec struct {
 	// server, and a new bus gets three, including the one a today install's
 	// first switch to next creates (status.busReplicas shows which applies).
 	//
-	// Set, it decides the count of a bus that does not exist yet. An existing
-	// bus keeps the count it runs: NATS cannot carry a single server's streams
-	// into a cluster or a cluster's into a single server, and the migration
-	// that would keep them is not here yet, so a count that differs is refused
-	// (the A2ABusConversionRefused condition; the admission webhook refuses the
-	// edit) rather than emptying the bus (docs/designs/spec-nats-deployment.md).
+	// Set, it decides the count of a bus that does not exist yet. On an
+	// existing bus, a change between 1 and 3 starts a migration that keeps
+	// the bus's data (status.busMigration, the A2ABusMigrating condition):
+	// the bus keeps the count it runs until the migration converts it, and
+	// the admission webhook refuses another change while one runs. One server
+	// to three freezes writes for the window, since it copies the streams
+	// (docs/designs/spec-nats-deployment.md).
 	// +kubebuilder:validation:Enum=1;3
 	// +optional
 	BusReplicas *int `json:"busReplicas,omitempty"`
@@ -2799,15 +2800,24 @@ type AgentStatus struct {
 	StorageStatus StorageStatus `json:"storageStatus,omitempty"`
 
 	// BusReplicas is the A2A bus's NATS server count under spec.mode: next:
-	// the count the bus already runs, which spec.harness.tuning.busReplicas
-	// does not change; for a new bus, that field, or 3. Re-derived on every
-	// reconcile under next, so it is a reading of the bus rather than a
-	// setting. Under spec.mode: today it is left at the count the bus last
-	// ran, so that a flip back returns the bus at that count rather than the
-	// count its kept data claims imply; it is not a claim that a bus is
-	// running, and with the claims deleted it no longer decides anything.
+	// the count the bus runs, which only a migration changes (BusMigration);
+	// for a new bus, spec.harness.tuning.busReplicas, or 3. Re-derived from
+	// the cluster on every reconcile under next, so it is a reading of the
+	// bus rather than a setting. Under spec.mode: today it is left at the
+	// count the bus last ran, so that a flip back returns the bus at that
+	// count rather than the count its kept data claims imply; it is not a
+	// claim that a bus is running, and with the claims deleted it no longer
+	// decides anything.
 	// +optional
 	BusReplicas int32 `json:"busReplicas,omitempty"`
+
+	// BusMigration is the A2A bus's server-count migration under spec.mode:
+	// next, while one runs or since the last one ended: setting
+	// spec.harness.tuning.busReplicas to another count on an existing bus
+	// starts one, and it converts the bus without emptying it. Unset when no
+	// migration has run.
+	// +optional
+	BusMigration *BusMigrationStatus `json:"busMigration,omitempty"`
 
 	// Note, deliberately not a doc comment — the blank line below keeps it out of the
 	// CRD description that `kubectl explain` prints. As on the three status structs
@@ -2861,6 +2871,121 @@ type AgentStatus struct {
 	// picked up within a day.
 	// +optional
 	ProfileSubmitMaxAgeSeconds *int64 `json:"profileSubmitMaxAgeSeconds,omitempty"`
+}
+
+// BusMigrationRetry is one retry of a Failed bus migration run: when it was
+// asked for, and the failure it retried.
+type BusMigrationRetry struct {
+	// At is when the retry was asked for.
+	At metav1.Time `json:"at"`
+	// FailedIn is the phase the retried attempt failed in.
+	FailedIn string `json:"failedIn"`
+	// Cause is why the retried attempt failed.
+	// +optional
+	Cause string `json:"cause,omitempty"`
+}
+
+// BusMigrationStatus is one migration of the A2A bus between one NATS server
+// and three.
+type BusMigrationStatus struct {
+	// Leg is the direction: OneToThree (snapshot and restore, behind a write
+	// freeze) or ThreeToOne (in place).
+	// +kubebuilder:validation:Enum=OneToThree;ThreeToOne
+	Leg string `json:"leg"`
+
+	// RunID names this migration's own Jobs, pods, ServiceAccounts and bus
+	// principals.
+	RunID string `json:"runID"`
+
+	// Phase is where the migration is. Done converted the bus with its data;
+	// Abandoned left it at its old count with its data; Failed stopped where
+	// a person has to act, and Message says what.
+	Phase string `json:"phase"`
+
+	// Abandoning is set once the migration is on its way back to the old
+	// count.
+	// +optional
+	Abandoning bool `json:"abandoning,omitempty"`
+
+	// StartedAt is when the migration began.
+	StartedAt metav1.Time `json:"startedAt"`
+
+	// Deadline is the deadline of the stretch the run is on: when an
+	// unfinished phase counts as failed, and when the migration's bus
+	// credentials stop working. Its Jobs stop a few minutes before it. A
+	// run that turns back gets one fresh deadline for its way back
+	// (ForwardDeadline keeps the first), and a retry another.
+	Deadline metav1.Time `json:"deadline"`
+
+	// Message is the manual step a Failed migration names.
+	// +optional
+	Message string `json:"message,omitempty"`
+
+	// Cause is why the run turned back: the phase that failed, and whether
+	// it was still running at Deadline. Set at the first failure and kept
+	// until a retry, which moves it into Retries.
+	// +optional
+	Cause string `json:"cause,omitempty"`
+
+	// ForwardDeadline is the deadline the run went forward under, kept once
+	// it turned back and Deadline became its way back's.
+	// +optional
+	ForwardDeadline *metav1.Time `json:"forwardDeadline,omitempty"`
+
+	// PhaseDeadline is a deadline the current phase has of its own, shorter
+	// than Deadline, which applies as well: the one to three leg's
+	// Converting phase has 15 minutes to get three servers Ready, since the
+	// bus is write-frozen and its only copy is on the staging claim while it
+	// waits. Unset in every other phase.
+	// +optional
+	PhaseDeadline *metav1.Time `json:"phaseDeadline,omitempty"`
+
+	// FailedIn is the phase a Failed run failed in. A run that failed inside
+	// the one to three leg's write freeze keeps the freeze, with its
+	// snapshot, until a person retries it or gives it up, each with an
+	// annotation on the PlatformAgent naming this run (the A2ABusMigrating
+	// condition says which). A Failed run blocks any new migration until
+	// then.
+	// +optional
+	FailedIn string `json:"failedIn,omitempty"`
+
+	// Retries records each retry of a Failed run, oldest first, at most
+	// three.
+	// +optional
+	// +kubebuilder:validation:MaxItems=3
+	Retries []BusMigrationRetry `json:"retries,omitempty"`
+
+	// GivenUp is set when a person gave a Failed run up: its freeze is
+	// lifted, and streams it did not put back are recreated empty.
+	// +optional
+	GivenUp bool `json:"givenUp,omitempty"`
+
+	// Cleared lists the provisioned streams the latest Clearing phase has
+	// deleted, ahead of the conversion or of the rollback after a failed
+	// restore (a failed conversion rolls back on the forward clear's
+	// record). A restore starts only once it names every one.
+	// +optional
+	Cleared []string `json:"cleared,omitempty"`
+
+	// FreezeConfirmed is set once every callout replica serves the write
+	// freeze's identity map, and only then does the bus render without its
+	// static application users and restart into the freeze.
+	// +optional
+	FreezeConfirmed bool `json:"freezeConfirmed,omitempty"`
+
+	// Warnings are what the restore found and restored anyway: a stream
+	// lacking a subject a fresh install has, or a field outside the
+	// restore's policy that differs from a fresh install. Together they are
+	// reported once, in one Warning Event. At most 4 KiB of them; the last says
+	// how many more there were.
+	// +optional
+	Warnings []string `json:"warnings,omitempty"`
+
+	// ObservedGeneration is the PlatformAgent generation that started this
+	// migration. A migration that ended without converting is not started
+	// again until busReplicas asks for another count, or the
+	// bus-migration-start annotation names the run.
+	ObservedGeneration int64 `json:"observedGeneration"`
 }
 
 // AgentUsageStatus is the non-sensitive activity summary of an agent. Static

@@ -8,10 +8,6 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"fmt"
-	"go/ast"
-	"go/parser"
-	"go/token"
-	"k8s.io/apimachinery/pkg/api/meta"
 	"net"
 	"os"
 	"path/filepath"
@@ -31,6 +27,7 @@ import (
 	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -781,11 +778,14 @@ func a2aRoutePeers(t *testing.T, s *natsserver.Server) []string {
 	return peers
 }
 
-// The server count is sticky: a set field wins, an existing bus keeps what it
-// runs (from its StatefulSet, or from the claims a deleted StatefulSet left),
-// and only a bus that does not exist yet gets three. Converting a running bus
-// says so once, because conversion empties it.
-func TestTheBusServerCountIsStickyAndConversionIsAnnounced(t *testing.T) {
+// The server count is sticky: an existing bus keeps what it runs (from its
+// StatefulSet, or from the claims a deleted StatefulSet left), a set field
+// decides only for a bus that does not exist yet, and three when it is
+// unset. A field asking a running bus for the other count starts a
+// migration, once, in the direction it asks, and the bus keeps its count
+// until the migration's phases convert it.
+func TestTheBusServerCountIsStickyAndAChangeStartsAMigration(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
 	ctx := context.Background()
 	claim := func(agent *agentv1alpha1.PlatformAgent, ordinal int, labelled bool) *corev1.PersistentVolumeClaim {
 		c := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSDataClaimName(agent, ordinal), Namespace: agent.Namespace}}
@@ -804,37 +804,37 @@ func TestTheBusServerCountIsStickyAndConversionIsAnnounced(t *testing.T) {
 		return s
 	}
 	for _, tc := range []struct {
-		name      string
-		spec      *int
-		recorded  int32
-		objects   func(*agentv1alpha1.PlatformAgent) []client.Object
-		want      int32
-		wantEvent bool
+		name     string
+		spec     *int
+		recorded int32
+		objects  func(*agentv1alpha1.PlatformAgent) []client.Object
+		want     int32
+		wantLeg  busMigrationLeg // "" for no migration
 	}{
-		{"a new bus", nil, 0, func(*agentv1alpha1.PlatformAgent) []client.Object { return nil }, 3, false},
-		{"an existing single-server bus", nil, 0, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 1, 1)} }, 1, false},
-		{"an existing cluster", nil, 0, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 3, 3)} }, 3, false},
-		{"a deleted single-server bus's claim", nil, 0, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{claim(a, 0, true)} }, 1, false},
+		{"a new bus", nil, 0, func(*agentv1alpha1.PlatformAgent) []client.Object { return nil }, 3, ""},
+		{"an existing single-server bus", nil, 0, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 1, 1)} }, 1, ""},
+		{"an existing cluster", nil, 0, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 3, 3)} }, 3, ""},
+		{"a deleted single-server bus's claim", nil, 0, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{claim(a, 0, true)} }, 1, ""},
 		{"a deleted cluster's claims, one missing", nil, 0, func(a *agentv1alpha1.PlatformAgent) []client.Object {
 			return []client.Object{claim(a, 0, true), claim(a, 1, true)}
-		}, 3, false},
-		{"an unlabelled squatter claim", nil, 0, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{claim(a, 0, false)} }, 3, false},
-		{"set to 3 on a single-server bus converts it", ptr.To(3), 0, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 1, 1)} }, 3, true},
-		{"set to 1 on a cluster converts it", ptr.To(1), 0, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 3, 3)} }, 1, true},
-		{"set to what runs is no conversion", ptr.To(1), 0, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 1, 1)} }, 1, false},
+		}, 3, ""},
+		{"an unlabelled squatter claim", nil, 0, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{claim(a, 0, false)} }, 3, ""},
+		{"set to 3 on a single-server bus migrates it", ptr.To(3), 0, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 1, 1)} }, 1, busMigrationGrow},
+		{"set to 1 on a cluster migrates it", ptr.To(1), 0, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 3, 3)} }, 3, busMigrationShrink},
+		{"set to what runs is no migration", ptr.To(1), 0, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 1, 1)} }, 1, ""},
 		// Claims 0 and 1 without 2 read as a cluster, so setting 1 over
-		// them is a conversion and says so.
-		{"set to 1 over a deleted cluster's two claims converts it", ptr.To(1), 0, func(a *agentv1alpha1.PlatformAgent) []client.Object {
+		// them migrates three servers to one.
+		{"set to 1 over a deleted cluster's two claims migrates it", ptr.To(1), 0, func(a *agentv1alpha1.PlatformAgent) []client.Object {
 			return []client.Object{claim(a, 0, true), claim(a, 1, true)}
-		}, 1, true},
+		}, 3, busMigrationShrink},
 		// A hand scale between 1 and 3 is not the bus's shape: the record
-		// holds, with or without the field, and nothing converts or warns.
-		{"a single-server bus scaled by hand to 3", nil, 1, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 1, 3)} }, 1, false},
-		{"a cluster scaled by hand to 1", nil, 3, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 3, 1)} }, 3, false},
-		{"a hand scale to 3 with the field at the old count", ptr.To(1), 1, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 1, 3)} }, 1, false},
+		// holds, with or without the field, and nothing migrates.
+		{"a single-server bus scaled by hand to 3", nil, 1, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 1, 3)} }, 1, ""},
+		{"a cluster scaled by hand to 1", nil, 3, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 3, 1)} }, 3, ""},
+		{"a hand scale to 3 with the field at the old count", ptr.To(1), 1, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 1, 3)} }, 1, ""},
 		// With no record (an operator from before the field), the template
 		// decides, not the live count.
-		{"an unrecorded single-server bus scaled by hand to 3", nil, 0, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 1, 3)} }, 1, false},
+		{"an unrecorded single-server bus scaled by hand to 3", nil, 0, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 1, 3)} }, 1, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			agent := a2aTestAgent()
@@ -843,14 +843,11 @@ func TestTheBusServerCountIsStickyAndConversionIsAnnounced(t *testing.T) {
 			}
 			objs := append([]client.Object{agent}, tc.objects(agent)...)
 			agent.Status.BusReplicas = tc.recorded
-			rec := record.NewFakeRecorder(8)
-			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).Build(), Scheme: setupScheme(), Recorder: rec, busConversionAllowed: true}
-			converting, err := r.resolveA2ABusReplicas(ctx, agent)
-			if err != nil {
+			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).Build(), Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8),
+				busStreamState: emptyBusStreams}
+			setBusProvisionedCondition(agent, true, "provision-job", metav1.Now()) // an existing, provisioned bus
+			if err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
 				t.Fatal(err)
-			}
-			if converting != tc.wantEvent {
-				t.Errorf("converting = %v, want %v", converting, tc.wantEvent)
 			}
 			if agent.Status.BusReplicas != tc.want {
 				t.Errorf("status.busReplicas = %d, want %d", agent.Status.BusReplicas, tc.want)
@@ -858,19 +855,24 @@ func TestTheBusServerCountIsStickyAndConversionIsAnnounced(t *testing.T) {
 			if got := a2aNATSReplicas(agent); got != int(tc.want) {
 				t.Errorf("a2aNATSReplicas = %d, want %d", got, tc.want)
 			}
-			if got := len(rec.Events) > 0; got != tc.wantEvent {
-				t.Errorf("conversion Event recorded = %v, want %v", got, tc.wantEvent)
+			run := agent.Status.BusMigration
+			switch {
+			case tc.wantLeg == "" && run != nil:
+				t.Errorf("a migration started: %+v", run)
+			case tc.wantLeg != "" && (run == nil || busMigrationLeg(run.Leg) != tc.wantLeg):
+				t.Errorf("migration %+v, want leg %s", run, tc.wantLeg)
 			}
-			// The Event is once per conversion: a second pass that already
-			// reads the new count says nothing more.
-			for len(rec.Events) > 0 {
-				<-rec.Events
+			if run == nil {
+				return
 			}
-			if _, err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
+			// Once: a second pass carries the same run on.
+			id := run.RunID
+			setBusProvisionedCondition(agent, true, "provision-job", metav1.Now()) // an existing, provisioned bus
+			if err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
 				t.Fatal(err)
 			}
-			if len(rec.Events) != 0 {
-				t.Error("the conversion Event repeated on the next pass")
+			if agent.Status.BusMigration.RunID != id {
+				t.Errorf("the next pass started run %s over %s", agent.Status.BusMigration.RunID, id)
 			}
 		})
 	}
@@ -958,20 +960,21 @@ func TestABusReadErrorIsNotReadAsNoBus(t *testing.T) {
 			return c.Get(ctx, key, obj, opts...)
 		}}).Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: setupScheme(), Recorder: record.NewFakeRecorder(4)}
-	if _, err := r.resolveA2ABusReplicas(context.Background(), agent); err == nil {
+	if err := r.resolveA2ABusReplicas(context.Background(), agent); err == nil {
 		t.Fatalf("a failed StatefulSet read resolved to %d servers instead of failing the pass", agent.Status.BusReplicas)
 	}
 }
 
-// Lowering a cluster to one server takes the routes Service and the budget away
-// rather than leaving them: a budget over one server would block its drains.
+// Lowering a cluster to one server (the three to one migration's Shrinking
+// phase) takes the routes Service and the budget away rather than leaving
+// them: a budget over one server would block its drains.
 func TestASingleServerBusHasNoRoutesServiceOrBudget(t *testing.T) {
 	agent := a2aTestAgent()
 	scheme := setupScheme()
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
-	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(16), busConversionAllowed: true}
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(16)}
 	ctx := context.Background()
 	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatal(err)
@@ -985,8 +988,13 @@ func TestASingleServerBusHasNoRoutesServiceOrBudget(t *testing.T) {
 		t.Fatalf("a new bus rendered no budget: %v", err)
 	}
 	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(1)}}
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationShrink), RunID: "1-1", Phase: string(busMigrationShrinking),
+		Deadline: metav1.NewTime(time.Now().Add(time.Hour)), ObservedGeneration: agent.Generation}
 	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatal(err)
+	}
+	if a2aNATSReplicas(agent) != 1 {
+		t.Fatalf("Shrinking rendered %d servers", a2aNATSReplicas(agent))
 	}
 	if err := cl.Get(ctx, routes, &corev1.Service{}); !apierrors.IsNotFound(err) {
 		t.Errorf("the routes Service survived lowering the bus to one server (err=%v)", err)
@@ -1030,65 +1038,83 @@ func TestTheResolvedBusCountIsWrittenToStatus(t *testing.T) {
 	}
 }
 
-// A conversion provisions the bus again, after it rolls out, in both
-// directions and back: the conversion changes STREAM_REPLICAS and so the Job's
-// digested name, the superseded-Job sweep removes the old shape's Job, and the
-// bus gate holds the new one until the roll is done. A conversion back to an
-// earlier shape gets a fresh Job, not that shape's old completed one.
-func TestAConversionProvisionsTheBusAgain(t *testing.T) {
+// A migration provisions the bus again once it ends, in both directions and
+// back: the new count changes STREAM_REPLICAS and so the Job's digested name,
+// the migration holds the Job while it runs, and the superseded-Job sweep
+// removes the old shape's Job. A migration back to an earlier shape gets a
+// fresh Job, not that shape's old completed one.
+func TestAMigrationProvisionsTheBusAgain(t *testing.T) {
 	agent := a2aTestAgent()
 	scheme := setupScheme()
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, discordBotSecret(agent)).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}, &appsv1.StatefulSet{}, &appsv1.Deployment{}).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
-	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(32), busConversionAllowed: true}
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(32)}
 	ctx := context.Background()
 	theCalloutIsServing(t, ctx, cl, r, agent)
+	// The callout's current ReplicaSet, which the fake's absent Deployment
+	// controller would have made: without one the bus holds each config
+	// change of the migration until it can tell the callout has rolled
+	// (a2aBusWaitsForCallout).
+	callout := &appsv1.Deployment{}
+	if err := cl.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aCalloutName(agent)}, callout); err != nil {
+		t.Fatal(err)
+	}
+	calloutReplicaSet(t, ctx, cl, callout, "current", "1")
 	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatal(err)
 	}
 	completeTheProvisionJob(t, ctx, cl, agent)
 	threeServerJob := buildA2AProvisionJob(agent).Name
 	if err := cl.Get(ctx, client.ObjectKey{Name: threeServerJob, Namespace: agent.Namespace}, &batchv1.Job{}); err != nil {
-		t.Fatalf("no provision Job before the conversion: %v", err)
+		t.Fatalf("no provision Job before the migration: %v", err)
+	}
+	// migrate puts the run in phase, as its passes would, then ends it once
+	// the bus has rolled out at the phase's count.
+	migrate := func(leg busMigrationLeg, phase busMigrationPhase, servers int) {
+		t.Helper()
+		agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(servers)}}
+		agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(leg), RunID: "1-1", Phase: string(phase),
+			Deadline: metav1.NewTime(time.Now().Add(time.Hour)), ObservedGeneration: agent.Generation}
+		state, err := r.reconcileA2A(ctx, agent, homeChannelRecord{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !state.jobHeld {
+			t.Errorf("the provision Job was not held during the %s phase", phase)
+		}
+		reportBusRolledOut(t, ctx, cl, agent)
+		agent.Status.BusMigration.Phase = string(busMigrationDone)
+		if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+			t.Fatal(err)
+		}
 	}
 
-	// Convert to one server: the three-server Job is swept as superseded,
-	// and the one-server Job waits for the roll.
-	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(1)}}
-	state, err := r.reconcileA2A(ctx, agent, homeChannelRecord{})
-	if err != nil {
-		t.Fatal(err)
-	}
+	// To one server: the three-server Job is swept as superseded, and the
+	// one-server Job runs once the run is done.
+	migrate(busMigrationShrink, busMigrationShrinking, 1)
 	if err := cl.Get(ctx, client.ObjectKey{Name: threeServerJob, Namespace: agent.Namespace}, &batchv1.Job{}); !apierrors.IsNotFound(err) {
-		t.Errorf("the completed provision Job survived the conversion pass (err=%v)", err)
+		t.Errorf("the completed three-server provision Job survived the migration (err=%v)", err)
 	}
-	if !state.jobHeld {
-		t.Error("the provision Job was not held on the conversion pass, before the bus rolled out")
+	oneServerJob := buildA2AProvisionJob(agent).Name
+	if oneServerJob == threeServerJob {
+		t.Fatal("the one-server Job has the three-server Job's name")
 	}
-
-	// And back to three, on a bus rolled out at one: the three-server Job's
-	// name again, created fresh rather than found complete.
-	reportBusRolledOut(t, ctx, cl, agent)
-	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
-		t.Fatal(err)
+	if err := cl.Get(ctx, client.ObjectKey{Name: oneServerJob, Namespace: agent.Namespace}, &batchv1.Job{}); err != nil {
+		t.Fatalf("no one-server provision Job after the migration: %v", err)
 	}
 	completeTheProvisionJob(t, ctx, cl, agent)
-	agent.Spec.Harness.Tuning.BusReplicas = ptr.To(3)
-	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
-		t.Fatal(err)
-	}
-	reportBusRolledOut(t, ctx, cl, agent)
-	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
-		t.Fatal(err)
-	}
+
+	// And back to three: the three-server Job's name again, created fresh
+	// rather than found complete.
+	migrate(busMigrationGrow, busMigrationConverting, 3)
 	job := &batchv1.Job{}
 	if err := cl.Get(ctx, client.ObjectKey{Name: threeServerJob, Namespace: agent.Namespace}, job); err != nil {
-		t.Fatalf("no provision Job after converting back to three: %v", err)
+		t.Fatalf("no provision Job after migrating back to three: %v", err)
 	}
 	for _, c := range job.Status.Conditions {
 		if c.Type == batchv1.JobComplete {
-			t.Error("the provision Job after converting back is the old completed one, not a fresh run")
+			t.Error("the provision Job after migrating back is the old completed one, not a fresh run")
 		}
 	}
 }
@@ -1148,15 +1174,17 @@ func TestAPrunedBusReplicasStatusDoesNotLoopTheWriters(t *testing.T) {
 	}
 }
 
-// A conversion drops the provisioned-once record, so the CR reads Provisioning
-// until the new shape's provision Job completes, not Ready over an empty bus.
-func TestAConversionDropsBusProvisioned(t *testing.T) {
+// A migration's count change drops the provisioned-once record, so the CR
+// reads Provisioning until the new shape's provision Job completes, not
+// Ready over a bus whose streams are not all back. A phase that keeps the
+// count (the pin) keeps the record.
+func TestAMigrationsCountChangeDropsBusProvisioned(t *testing.T) {
 	agent := a2aTestAgent()
 	scheme := setupScheme()
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, discordBotSecret(agent)).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}, &appsv1.StatefulSet{}, &appsv1.Deployment{}).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
-	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(32), busConversionAllowed: true}
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(32)}
 	ctx := context.Background()
 	theCalloutIsServing(t, ctx, cl, r, agent)
 	setBusProvisionedCondition(agent, true, "provision-job", metav1.Now())
@@ -1171,11 +1199,20 @@ func TestAConversionDropsBusProvisioned(t *testing.T) {
 		t.Fatal("BusProvisioned dropped on a pass with no conversion")
 	}
 	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(1)}}
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationShrink), RunID: "1-1", Phase: string(busMigrationPinning),
+		Deadline: metav1.NewTime(time.Now().Add(time.Hour)), ObservedGeneration: agent.Generation}
+	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
+		t.Fatal(err)
+	}
+	if !busProvisioned(agent) {
+		t.Fatal("BusProvisioned dropped while the pin ran at three servers")
+	}
+	agent.Status.BusMigration.Phase = string(busMigrationShrinking)
 	if _, err := r.reconcileA2A(ctx, agent, homeChannelRecord{}); err != nil {
 		t.Fatal(err)
 	}
 	if busProvisioned(agent) {
-		t.Error("BusProvisioned survived converting the bus, which empties it")
+		t.Error("BusProvisioned survived the bus going to one server")
 	}
 }
 
@@ -1430,12 +1467,11 @@ func TestALoneClaimKeepsTheRecordedServerCount(t *testing.T) {
 			Labels: buildA2ANATSStatefulSet(agent, "h").Spec.VolumeClaimTemplates[0].Labels,
 		}}
 		r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent, claim).Build(), Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8)}
-		converting, err := r.resolveA2ABusReplicas(context.Background(), agent)
-		if err != nil {
+		if err := r.resolveA2ABusReplicas(context.Background(), agent); err != nil {
 			t.Fatal(err)
 		}
-		if agent.Status.BusReplicas != tc.want || converting {
-			t.Errorf("recorded %d, lone claim 0: status.busReplicas = %d converting = %v, want %d and no conversion", tc.recorded, agent.Status.BusReplicas, converting, tc.want)
+		if agent.Status.BusReplicas != tc.want || agent.Status.BusMigration != nil {
+			t.Errorf("recorded %d, lone claim 0: status.busReplicas = %d migration %+v, want %d and no migration", tc.recorded, agent.Status.BusReplicas, agent.Status.BusMigration, tc.want)
 		}
 	}
 }
@@ -1446,6 +1482,7 @@ func TestALoneClaimKeepsTheRecordedServerCount(t *testing.T) {
 // back as a cluster on server 0's standalone store, past the conversion gate.
 // With no claims left there is no bus, and the field (or the default) decides.
 func TestStrayClaimsDoNotOutvoteTheRecordedServerCount(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
 	for _, tc := range []struct {
 		name     string
 		recorded int32
@@ -1476,24 +1513,31 @@ func TestStrayClaimsDoNotOutvoteTheRecordedServerCount(t *testing.T) {
 				}})
 			}
 			rec := record.NewFakeRecorder(8)
-			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).Build(), Scheme: setupScheme(), Recorder: rec}
-			converting, err := r.resolveA2ABusReplicas(context.Background(), agent)
-			if err != nil {
+			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).Build(), Scheme: setupScheme(), Recorder: rec,
+				busStreamState: emptyBusStreams}
+			setBusProvisionedCondition(agent, true, "provision-job", metav1.Now()) // an existing, provisioned bus
+			if err := r.resolveA2ABusReplicas(context.Background(), agent); err != nil {
 				t.Fatal(err)
 			}
-			if agent.Status.BusReplicas != tc.want || converting {
-				t.Errorf("status.busReplicas = %d converting = %v, want %d and no conversion", agent.Status.BusReplicas, converting, tc.want)
+			if agent.Status.BusReplicas != tc.want {
+				t.Errorf("status.busReplicas = %d, want %d", agent.Status.BusReplicas, tc.want)
 			}
-			if tc.spec != nil && *tc.spec != int(tc.want) {
-				select {
-				case ev := <-rec.Events:
-					if !strings.Contains(ev, a2aBusConversionRefusedReason) {
-						t.Errorf("event %q, want the refusal", ev)
-					}
-				default:
-					t.Errorf("a field asking %d of a %d-server bus was not refused", *tc.spec, tc.want)
+			// The recorded count is what a field asking another count
+			// migrates from; the stray claims never decide it.
+			run := agent.Status.BusMigration
+			switch {
+			case tc.spec != nil && *tc.spec != int(tc.want):
+				wantLeg := busMigrationGrow
+				if *tc.spec < int(tc.want) {
+					wantLeg = busMigrationShrink
 				}
+				if run == nil || busMigrationLeg(run.Leg) != wantLeg {
+					t.Errorf("a field asking %d of a %d-server bus: migration %+v, want leg %s", *tc.spec, tc.want, run, wantLeg)
+				}
+			case run != nil:
+				t.Errorf("a migration started: %+v", run)
 			}
+			_ = rec
 		})
 	}
 }
@@ -1528,11 +1572,12 @@ func TestAShortBusRequeuesAndItsNoteSkipsATerminatingPod(t *testing.T) {
 	}
 }
 
-// A converting pass that fails after the StatefulSet apply writes no status,
-// so the CR keeps BusProvisioned and the old count. The retry finds the
-// StatefulSet already at the new count, no conversion by the StatefulSet's
-// account; the persisted count still differs, and the record is dropped.
-func TestAFailedConvertingPassStillDropsBusProvisionedOnTheRetry(t *testing.T) {
+// A pass that moves the count (the migration's Shrinking phase) and fails
+// after the StatefulSet apply writes no status, so the CR keeps
+// BusProvisioned and the old count. The retry finds the StatefulSet already
+// at the new count; the persisted count still differs, and the record is
+// dropped.
+func TestAFailedCountChangingPassStillDropsBusProvisionedOnTheRetry(t *testing.T) {
 	agent := a2aTestAgent()
 	scheme := setupScheme()
 	failCallout := false
@@ -1549,7 +1594,7 @@ func TestAFailedConvertingPassStillDropsBusProvisionedOnTheRetry(t *testing.T) {
 				return base.Patch(ctx, c, obj, patch, opts...)
 			},
 		}).Build()
-	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(32), busConversionAllowed: true}
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(32)}
 	ctx := context.Background()
 	theCalloutIsServing(t, ctx, cl, r, agent)
 	// The callout's current ReplicaSet, which the fake's absent Deployment
@@ -1568,12 +1613,14 @@ func TestAFailedConvertingPassStillDropsBusProvisionedOnTheRetry(t *testing.T) {
 		t.Fatalf("precondition: status.busReplicas = %d, BusProvisioned = %v; want 3 and set", agent.Status.BusReplicas, busProvisioned(agent))
 	}
 	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(1)}}
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationShrink), RunID: "1-1", Phase: string(busMigrationShrinking),
+		Deadline: metav1.NewTime(time.Now().Add(time.Hour)), ObservedGeneration: agent.Generation}
 
-	// The converting pass, on a copy: it fails, so none of its in-memory
-	// status reaches the CR the retry reads.
+	// The count-changing pass, on a copy: it fails, so none of its
+	// in-memory status reaches the CR the retry reads.
 	failCallout = true
 	if _, err := r.reconcileA2A(ctx, agent.DeepCopy(), homeChannelRecord{}); err == nil {
-		t.Fatal("precondition: the injected failure did not fail the converting pass")
+		t.Fatal("precondition: the injected failure did not fail the count-changing pass")
 	}
 	failCallout = false
 	sts := &appsv1.StatefulSet{}
@@ -1585,17 +1632,17 @@ func TestAFailedConvertingPassStillDropsBusProvisionedOnTheRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	if busProvisioned(agent) {
-		t.Error("BusProvisioned survived the retry of a converting pass that failed after the StatefulSet apply; the CR reads Ready over an emptied bus")
+		t.Error("BusProvisioned survived the retry of a count-changing pass that failed after the StatefulSet apply")
 	}
 }
 
-// Converting an existing bus empties it, and the migration that keeps the
-// data is #4225, which lifts the gate in the same change. Until then a set
-// busReplicas that disagrees with the bus is refused in both directions,
-// whether the bus is read from its StatefulSet or from the claims a deleted
-// one left: the count stays, a Warning says so once, and the field still
-// decides for a bus that does not exist yet.
-func TestAnExistingBusRefusesAConversion(t *testing.T) {
+// Setting busReplicas to the other count on an existing bus starts a
+// migration in that direction, read from the StatefulSet or from the claims
+// a deleted one left; the bus keeps the count it runs until the migration's
+// phases convert it, and the field still decides for a bus that does not
+// exist yet.
+func TestAFieldChangeStartsAMigration(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
 	ctx := context.Background()
 	claim := func(agent *agentv1alpha1.PlatformAgent, ordinal int) *corev1.PersistentVolumeClaim {
 		return &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{
@@ -1617,64 +1664,94 @@ func TestAnExistingBusRefusesAConversion(t *testing.T) {
 		spec    int
 		objects func(*agentv1alpha1.PlatformAgent) []client.Object
 		want    int32
-		refused bool
+		leg     busMigrationLeg
 	}{
-		{"one to three", 3, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 1)} }, 1, true},
-		{"three to one", 1, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 3)} }, 3, true},
+		{"one to three", 3, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 1)} }, 1, busMigrationGrow},
+		{"three to one", 1, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 3)} }, 3, busMigrationShrink},
 		{"three to one over a deleted cluster's claims", 1, func(a *agentv1alpha1.PlatformAgent) []client.Object {
 			return []client.Object{claim(a, 0), claim(a, 1)}
-		}, 3, true},
-		{"one to three over a deleted single server's claim", 3, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{claim(a, 0)} }, 1, true},
-		{"the count it runs", 3, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 3)} }, 3, false},
-		{"a new bus takes the field", 1, func(*agentv1alpha1.PlatformAgent) []client.Object { return nil }, 1, false},
+		}, 3, busMigrationShrink},
+		{"one to three over a deleted single server's claim", 3, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{claim(a, 0)} }, 1, busMigrationGrow},
+		{"the count it runs", 3, func(a *agentv1alpha1.PlatformAgent) []client.Object { return []client.Object{sts(a, 3)} }, 3, ""},
+		{"a new bus takes the field", 1, func(*agentv1alpha1.PlatformAgent) []client.Object { return nil }, 1, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			agent := a2aTestAgent()
+			agent.Generation = 4
 			agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(tc.spec)}}
-			rec := record.NewFakeRecorder(8)
-			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(append([]client.Object{agent}, tc.objects(agent)...)...).Build(), Scheme: setupScheme(), Recorder: rec}
-			converting, err := r.resolveA2ABusReplicas(ctx, agent)
-			if err != nil {
+			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(append([]client.Object{agent}, tc.objects(agent)...)...).Build(), Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8), busStreamState: emptyBusStreams}
+			setBusProvisionedCondition(agent, true, "provision-job", metav1.Now()) // an existing, provisioned bus
+			if err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
 				t.Fatal(err)
 			}
-			if converting {
-				t.Error("resolveA2ABusReplicas reports a conversion with the gate shut")
+			if agent.Status.BusReplicas != tc.want || int(*buildA2ANATSStatefulSet(agent, "h").Spec.Replicas) != int(tc.want) {
+				t.Errorf("status %d, rendered %d; want %d until the migration converts it", agent.Status.BusReplicas, *buildA2ANATSStatefulSet(agent, "h").Spec.Replicas, tc.want)
 			}
-			if agent.Status.BusReplicas != tc.want || a2aNATSReplicas(agent) != int(tc.want) || int(*buildA2ANATSStatefulSet(agent, "h").Spec.Replicas) != int(tc.want) {
-				t.Errorf("status %d, a2aNATSReplicas %d, rendered %d; want %d throughout", agent.Status.BusReplicas, a2aNATSReplicas(agent), *buildA2ANATSStatefulSet(agent, "h").Spec.Replicas, tc.want)
-			}
-			msg := a2aBusConversionRefusedMessage(agent)
-			if tc.refused != (msg != "") {
-				t.Errorf("condition message %q, want present = %v", msg, tc.refused)
-			}
-			var events []string
-			for len(rec.Events) > 0 {
-				events = append(events, <-rec.Events)
-			}
-			if tc.refused != (len(events) == 1 && strings.Contains(events[0], a2aBusConversionRefusedReason)) {
-				t.Errorf("events %q, want one %s = %v", events, a2aBusConversionRefusedReason, tc.refused)
-			}
-			if tc.refused && !strings.Contains(msg, "#4225") {
-				t.Errorf("the refusal does not name the migration it waits for: %q", msg)
-			}
-			// Said once: with the condition standing, the next pass is quiet.
-			if tc.refused {
-				setA2ABusConversionRefusedCondition(agent, msg, metav1.Now())
-				if _, err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
-					t.Fatal(err)
-				}
-				if len(rec.Events) != 0 {
-					t.Errorf("a standing refusal is re-announced on every pass: %q", <-rec.Events)
-				}
+			run := agent.Status.BusMigration
+			switch {
+			case tc.leg == "" && run != nil:
+				t.Errorf("no migration wanted, started %+v", run)
+			case tc.leg != "" && (run == nil || run.Leg != string(tc.leg) || run.ObservedGeneration != 4 || run.Deadline.Sub(run.StartedAt.Time) != busMigrationRunDeadline):
+				t.Errorf("migration %+v, want leg %s at generation 4 with the run deadline", run, tc.leg)
 			}
 		})
 	}
 }
 
-// The whole pass, both directions: the StatefulSet stays at the count the
-// bus runs, including on the retry of a pass that failed after its
-// StatefulSet apply, and BusProvisioned stands, because nothing converted.
-func TestARefusedConversionRendersNothingTowardTheNewCount(t *testing.T) {
+// A migration under way is not restarted. One that ended without converting
+// is not started again by an unrelated spec change or a GitOps sync (a new
+// generation asking the same count): only by a different count, or a
+// person naming the last run in the start annotation.
+func TestAMigrationStartsOnlyOnANewTargetOrWhenAsked(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	agent := a2aTestAgent()
+	agent.Generation = 7
+	now := metav1.Now()
+	startBusMigration(agent, 1, 3, now)
+	first := agent.Status.BusMigration.RunID
+	startBusMigration(agent, 1, 3, metav1.NewTime(now.Add(time.Minute)))
+	if agent.Status.BusMigration.RunID != first {
+		t.Error("a migration under way was restarted")
+	}
+	agent.Status.BusMigration.Phase = string(busMigrationAbandoned)
+	for gen := int64(7); gen <= 9; gen++ { // the same generation, then unrelated edits
+		agent.Generation = gen
+		startBusMigration(agent, 1, 3, metav1.NewTime(now.Add(time.Duration(gen)*time.Minute)))
+		if agent.Status.BusMigration.RunID != first {
+			t.Fatalf("generation %d asking the same count started run %s", gen, agent.Status.BusMigration.RunID)
+		}
+	}
+	agent.Annotations = map[string]string{a2aBusMigrationStartAnnotation: "9-999"}
+	startBusMigration(agent, 1, 3, metav1.NewTime(now.Add(10*time.Minute)))
+	if agent.Status.BusMigration.RunID != first {
+		t.Fatal("a start annotation naming another run started one")
+	}
+	agent.Annotations = map[string]string{a2aBusMigrationStartAnnotation: first}
+	startBusMigration(agent, 1, 3, metav1.NewTime(now.Add(11*time.Minute)))
+	second := agent.Status.BusMigration
+	if second.RunID == first || busMigrationPhase(second.Phase) != busMigrationFreezing {
+		t.Fatalf("the start annotation naming the last run: %+v, want a new run from Freezing", second)
+	}
+	// The annotation, left in place, names the old run now: once only.
+	second.Phase = string(busMigrationAbandoned)
+	startBusMigration(agent, 1, 3, metav1.NewTime(now.Add(12*time.Minute)))
+	if agent.Status.BusMigration.RunID != second.RunID {
+		t.Error("a start annotation left in place started a third run")
+	}
+	// A different count starts one with no annotation.
+	agent.Annotations = nil
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationShrink), RunID: "x", Phase: string(busMigrationAbandoned)}
+	startBusMigration(agent, 1, 3, metav1.NewTime(now.Add(13*time.Minute)))
+	if agent.Status.BusMigration.RunID == "x" {
+		t.Error("a new count after a three to one run did not start a migration")
+	}
+}
+
+// The whole pass, both directions: a field change starts a migration whose
+// first phase (the pin, or the freeze) keeps the bus at the count it runs,
+// so the StatefulSet stays there, including on the retry of a pass that
+// failed after its StatefulSet apply, and BusProvisioned stands.
+func TestAFieldChangeRendersNothingTowardTheNewCountBeforeTheMigrationDoes(t *testing.T) {
 	for _, from := range []int32{1, 3} {
 		to := 4 - int(from)
 		agent := a2aTestAgent()
@@ -1726,108 +1803,8 @@ func TestARefusedConversionRendersNothingTowardTheNewCount(t *testing.T) {
 			t.Errorf("%d to %d, retry: StatefulSet %d, status.busReplicas %d; want %d", from, to, got, agent.Status.BusReplicas, from)
 		}
 		if !busProvisioned(agent) {
-			t.Errorf("%d to %d: BusProvisioned dropped although nothing converted", from, to)
+			t.Errorf("%d to %d: BusProvisioned dropped although the count did not change", from, to)
 		}
-	}
-}
-
-// The refusal is a condition the status write carries and clears, beside a
-// Ready that stays on the bus that runs.
-func TestARefusedConversionIsAConditionThatClears(t *testing.T) {
-	ctx := context.Background()
-	agent := a2aTestAgent()
-	// A running cluster: rendered for three servers before the field asks
-	// for one (the count is read from the template, not the live replicas).
-	running := buildA2ANATSStatefulSet(agent, "h")
-	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(1)}}
-	cl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent, running).WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).Build()
-	r := &PlatformAgentReconciler{Client: cl, Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8)}
-	read := func() *metav1.Condition {
-		t.Helper()
-		live := &agentv1alpha1.PlatformAgent{}
-		if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), live); err != nil {
-			t.Fatal(err)
-		}
-		return meta.FindStatusCondition(live.Status.Conditions, a2aBusConversionRefusedConditionType)
-	}
-	if _, err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
-		t.Fatal(err)
-	}
-	if err := r.syncA2AConditions(ctx, agent, a2aProvisionState{done: true}); err != nil {
-		t.Fatal(err)
-	}
-	if c := read(); c == nil || c.Status != metav1.ConditionTrue || c.Message != BusConversionRefusedMessage(1, 3) {
-		t.Fatalf("condition after a refused 3 to 1 = %+v, want True with the shared message", c)
-	}
-	agent.Spec.Harness.Tuning.BusReplicas = nil
-	if _, err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
-		t.Fatal(err)
-	}
-	if err := r.syncA2AConditions(ctx, agent, a2aProvisionState{done: true}); err != nil {
-		t.Fatal(err)
-	}
-	if c := read(); c != nil {
-		t.Errorf("condition after removing the field = %+v, want it gone", c)
-	}
-}
-
-// The gate has one way in, and it is not a production one: in non-test files
-// of this package busConversionAllowed appears only where the reconciler
-// declares it and where resolveA2ABusReplicas reads it, so no flag, env var or
-// constructor can turn a conversion on before #4225 brings the migration with
-// it. A set, a composite-literal key, an address taken (a flag binding) and
-// any further name all fail.
-func TestNothingButTestsAllowsABusConversion(t *testing.T) {
-	files, err := filepath.Glob("*.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	declared, total := 0, 0
-	for _, f := range files {
-		if strings.HasSuffix(f, "_test.go") {
-			continue
-		}
-		parsed, err := parser.ParseFile(token.NewFileSet(), f, nil, 0)
-		if err != nil {
-			t.Fatal(err)
-		}
-		ast.Inspect(parsed, func(n ast.Node) bool {
-			switch n := n.(type) {
-			case *ast.Field:
-				for _, name := range n.Names {
-					if name.Name == "busConversionAllowed" {
-						declared++
-					}
-				}
-			case *ast.KeyValueExpr:
-				if id, ok := n.Key.(*ast.Ident); ok && id.Name == "busConversionAllowed" {
-					t.Errorf("%s sets busConversionAllowed in a composite literal", f)
-				}
-			case *ast.AssignStmt:
-				for _, lhs := range n.Lhs {
-					ast.Inspect(lhs, func(ln ast.Node) bool {
-						if sel, ok := ln.(*ast.SelectorExpr); ok && sel.Sel.Name == "busConversionAllowed" {
-							t.Errorf("%s assigns busConversionAllowed", f)
-						}
-						return true
-					})
-				}
-			case *ast.UnaryExpr:
-				if n.Op == token.AND {
-					if sel, ok := ast.Unparen(n.X).(*ast.SelectorExpr); ok && sel.Sel.Name == "busConversionAllowed" {
-						t.Errorf("%s takes the address of busConversionAllowed", f)
-					}
-				}
-			case *ast.Ident:
-				if n.Name == "busConversionAllowed" {
-					total++
-				}
-			}
-			return true
-		})
-	}
-	if declared != 1 || total != 2 {
-		t.Fatalf("busConversionAllowed is declared %d times and named %d times in non-test files, want 1 declaration and 1 read (2 names); this check would be vacuous or the gate has a new way in", declared, total)
 	}
 }
 
@@ -1879,13 +1856,70 @@ func TestABusScaledByHandKeepsItsRecordedCount(t *testing.T) {
 				}})
 			}
 			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(objs...).Build(), Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8)}
-			if _, err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
+			setBusProvisionedCondition(agent, true, "provision-job", metav1.Now()) // an existing, provisioned bus
+			if err := r.resolveA2ABusReplicas(ctx, agent); err != nil {
 				t.Fatal(err)
 			}
 			if agent.Status.BusReplicas != want || a2aNATSReplicas(agent) != int(want) {
 				t.Errorf("status.busReplicas %d, rendered %d; want %d", agent.Status.BusReplicas, a2aNATSReplicas(agent), want)
 			}
 		})
+	}
+}
+
+// An install upgraded from the operator that refused bus conversions may
+// carry its A2ABusConversionRefused condition; this operator, which
+// migrates instead, removes it on its first status write and never writes
+// it.
+func TestTheRetiredConversionRefusalIsCleared(t *testing.T) {
+	agent := a2aTestAgent()
+	meta.SetStatusCondition(&agent.Status.Conditions, metav1.Condition{Type: a2aBusConversionRefusedConditionType, Status: metav1.ConditionTrue,
+		Reason: "ConversionNotSupported", Message: "left by an earlier operator", LastTransitionTime: metav1.Now()})
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).Build()
+	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(16)}
+	ctx := context.Background()
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), agent); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.syncA2AConditions(ctx, agent, a2aProvisionState{}); err != nil {
+		t.Fatal(err)
+	}
+	stored := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), stored); err != nil {
+		t.Fatal(err)
+	}
+	if c := meta.FindStatusCondition(stored.Status.Conditions, a2aBusConversionRefusedConditionType); c != nil {
+		t.Errorf("the retired condition is still on the CR: %+v", c)
+	}
+}
+
+// Without the operator's own image nothing could run the migration's work,
+// so a busReplicas change starts none: the bus keeps its count and a
+// Warning says why, rather than a run that freezes writes until its
+// deadline.
+func TestNoOperatorImageStartsNoMigration(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "")
+	agent := a2aTestAgent()
+	// A bus rendered for one server, so the field below asks it to grow.
+	sts := buildA2ANATSStatefulSet(a2aSingleServerTestAgent(), "h")
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(3)}}
+	rec := record.NewFakeRecorder(8)
+	r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent, sts).Build(), Scheme: setupScheme(), Recorder: rec}
+	setBusProvisionedCondition(agent, true, "provision-job", metav1.Now()) // an existing, provisioned bus
+	if err := r.resolveA2ABusReplicas(context.Background(), agent); err != nil {
+		t.Fatal(err)
+	}
+	if agent.Status.BusMigration != nil || agent.Status.BusReplicas != 1 {
+		t.Errorf("migration %+v, busReplicas %d; want none and 1", agent.Status.BusMigration, agent.Status.BusReplicas)
+	}
+	select {
+	case e := <-rec.Events:
+		if !strings.Contains(e, reasonA2ABusMigrationUnavailable) || !strings.Contains(e, "OPERATOR_IMAGE") {
+			t.Errorf("event %q", e)
+		}
+	default:
+		t.Error("no Warning saying why the migration did not start")
 	}
 }
 
@@ -1935,5 +1969,152 @@ func TestAClusterRollsOntoAProfileChangeInsteadOfReloading(t *testing.T) {
 	}
 	if plan != (a2aBusReload{}) || desired.Annotations[a2aBusReloadRequestedAnnotation] != "" {
 		t.Errorf("a cluster's reload plan = %+v, annotations %v; want nothing tracked", plan, desired.Annotations)
+	}
+}
+
+// emptyBusStreams is a bus whose provisioned streams hold nothing: none is
+// over a limit, so a one to three migration may start.
+func emptyBusStreams(context.Context, *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error) {
+	streams := map[string]a2aBusStream{}
+	for _, p := range a2aStreamPolicies(1) {
+		streams[p.Name] = a2aBusStream{}
+	}
+	return streams, nil
+}
+
+// One server to three restores every stream under the cap this operator
+// renders, behind a write freeze. A stream already over its cap, or a bus
+// whose stream sizes can't be read, refuses the run before anything freezes:
+// no migration starts, the bus keeps its one server, and a Warning says why.
+// A stream at its cap exactly, and a shrink, start as before.
+func TestAStreamOverItsCapRefusesAGrowBeforeTheFreeze(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	var tasks busmigratePolicy
+	for _, p := range a2aStreamPolicies(1) {
+		if p.Name == "TASKS" {
+			tasks = busmigratePolicy{p.MaxBytes, p.MaxAge}
+		}
+	}
+	with := func(name string, st a2aBusStream) map[string]a2aBusStream {
+		m, _ := emptyBusStreams(context.Background(), nil)
+		m[name] = st
+		return m
+	}
+	now := time.Now()
+	for _, tc := range []struct {
+		name      string
+		single    bool
+		ask       int
+		streams   map[string]a2aBusStream
+		readErr   error
+		wantStart bool
+		wantWarn  string
+	}{
+		{"TASKS over its cap", true, 3, with("TASKS", a2aBusStream{Bytes: tasks.maxBytes + 1}), nil, false, "TASKS holds"},
+		{"TASKS keeps a message past its max age", true, 3, with("TASKS", a2aBusStream{Bytes: 1, Msgs: 1, FirstTime: now.Add(-tasks.maxAge - time.Hour)}), nil, false, "older than its"},
+		{"the sizes can't be read", true, 3, nil, errors.NewServiceUnavailable("no monitor"), false, "could not be read"},
+		{"a report listing none of the streams", true, 3, map[string]a2aBusStream{}, nil, false, "lists none"},
+		{"TASKS at its cap, inside its age", true, 3, with("TASKS", a2aBusStream{Bytes: tasks.maxBytes, Msgs: 1, FirstTime: now.Add(-time.Hour)}), nil, true, ""},
+		{"a stream the policies don't name", true, 3, with("SOMETHING_ELSE", a2aBusStream{Bytes: 1 << 40}), nil, true, ""},
+		{"a shrink isn't checked", false, 1, with("TASKS", a2aBusStream{Bytes: tasks.maxBytes + 1}), nil, true, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := a2aTestAgent()
+			render := agent
+			if tc.single {
+				render = a2aSingleServerTestAgent()
+			}
+			sts := buildA2ANATSStatefulSet(render, "h")
+			agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(tc.ask)}}
+			rec := record.NewFakeRecorder(8)
+			r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent, sts).Build(), Scheme: setupScheme(), Recorder: rec,
+				busStreamState: func(context.Context, *agentv1alpha1.PlatformAgent) (map[string]a2aBusStream, error) {
+					return tc.streams, tc.readErr
+				}}
+			setBusProvisionedCondition(agent, true, "provision-job", metav1.Now()) // an existing, provisioned bus
+			if err := r.resolveA2ABusReplicas(context.Background(), agent); err != nil {
+				t.Fatal(err)
+			}
+			if started := agent.Status.BusMigration != nil; started != tc.wantStart {
+				t.Fatalf("migration %+v, want started=%v", agent.Status.BusMigration, tc.wantStart)
+			}
+			if tc.wantWarn == "" {
+				return
+			}
+			select {
+			case ev := <-rec.Events:
+				if !strings.Contains(ev, reasonA2ABusMigrationStreamsOverCap) || !strings.Contains(ev, tc.wantWarn) {
+					t.Errorf("event %q, want %s naming %q", ev, reasonA2ABusMigrationStreamsOverCap, tc.wantWarn)
+				}
+			default:
+				t.Error("no Warning saying why the migration did not start")
+			}
+		})
+	}
+}
+
+// busmigratePolicy is the two limits the pre-check reads off a policy.
+type busmigratePolicy struct {
+	maxBytes int64
+	maxAge   time.Duration
+}
+
+// The decoder reads the fields nats-server's /jsz?streams=true reports, in
+// a body captured from nats-server v2.14.5 (account and stream trimmed to
+// one each): bytes, messages and the oldest message's time per stream.
+func TestTheJszReportDecodesEachStreamsState(t *testing.T) {
+	body := `{"server_id":"x","now":"2026-11-12T00:20:12Z","config":{},"memory":0,"storage":55,"streams":1,
+		"account_details":[{"name":"TRUSTED","id":"TRUSTED","stream_detail":[{"name":"TASKS","created":"2026-11-12T00:20:12Z",
+		"state":{"messages":1,"bytes":55,"first_seq":1,"first_ts":"2026-11-12T00:20:12.227001Z","last_seq":1,
+		"last_ts":"2026-11-12T00:20:12.227001Z","num_subjects":1,"consumer_count":0}}]}]}`
+	got, err := decodeA2AJsz("jsz", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := a2aBusStream{Bytes: 55, Msgs: 1, FirstTime: time.Date(2026, 11, 12, 0, 20, 12, 227001000, time.UTC)}
+	if got["TASKS"] != want {
+		t.Errorf("TASKS = %+v, want %+v", got["TASKS"], want)
+	}
+}
+
+// A bus never provisioned, with no migration behind it, takes a changed
+// count as asked: no run starts against a bus with no streams, and on a
+// cluster that can't schedule three servers this is how the count comes
+// down. A bus whose last migration changed the count waits for the
+// provisioning after it before the next run starts.
+func TestNoMigrationStartsBeforeTheBusIsProvisioned(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	threeServers := func() (*agentv1alpha1.PlatformAgent, *PlatformAgentReconciler) {
+		agent := a2aTestAgent()
+		agent.Status.BusReplicas = 3
+		sts := buildA2ANATSStatefulSet(agent, "h")
+		agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(1)}}
+		r := &PlatformAgentReconciler{Client: fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent, sts).Build(),
+			Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8), busStreamState: emptyBusStreams}
+		return agent, r
+	}
+
+	agent, r := threeServers()
+	if err := r.resolveA2ABusReplicas(context.Background(), agent); err != nil {
+		t.Fatal(err)
+	}
+	if agent.Status.BusMigration != nil || agent.Status.BusReplicas != 1 {
+		t.Errorf("never provisioned: migration %+v, busReplicas %d; want none and the asked 1", agent.Status.BusMigration, agent.Status.BusReplicas)
+	}
+
+	agent, r = threeServers()
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), RunID: "2-1", Phase: string(busMigrationDone)}
+	if err := r.resolveA2ABusReplicas(context.Background(), agent); err != nil {
+		t.Fatal(err)
+	}
+	if agent.Status.BusMigration.RunID != "2-1" || agent.Status.BusReplicas != 3 {
+		t.Errorf("not yet provisioned after a run: run %s, busReplicas %d; want the old run and 3", agent.Status.BusMigration.RunID, agent.Status.BusReplicas)
+	}
+	setBusProvisionedCondition(agent, true, "provision-job", metav1.Now())
+	if err := r.resolveA2ABusReplicas(context.Background(), agent); err != nil {
+		t.Fatal(err)
+	}
+	if agent.Status.BusMigration.RunID == "2-1" || busMigrationLeg(agent.Status.BusMigration.Leg) != busMigrationShrink {
+		t.Errorf("once provisioned: run %+v, want a new three-to-one run", agent.Status.BusMigration)
 	}
 }

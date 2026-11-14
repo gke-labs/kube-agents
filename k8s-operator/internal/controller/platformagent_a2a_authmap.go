@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -194,6 +195,10 @@ type a2aAuthMapIdentity struct {
 	// no profile entry for the callout to derive their grants from. Omitted
 	// elsewhere.
 	Draining []string `json:"draining,omitempty"`
+	// NotAfter is set only on the bus migration's per-run principals, at
+	// the run's deadline: the callout refuses the entry from then on and
+	// caps every JWT it mints for it there. Omitted elsewhere.
+	NotAfter *time.Time `json:"notAfter,omitempty"`
 }
 
 // a2aAuthMapTopics mirrors the callout's TopicGrants.
@@ -242,7 +247,14 @@ func renderA2AAuthMap(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alph
 // their .supervisor and stop-record grants, and none of their durables.
 func renderA2AAuthMapDraining(agent *agentv1alpha1.PlatformAgent, profiles []agentv1alpha1.AgentProfile, draining []a2aDispatchProfile) (a2aAuthMapDocument, error) {
 	identities := make([]a2aAuthMapIdentity, 0)
-	for _, id := range calloutIdentities(agent) {
+	ids := calloutIdentities(agent)
+	if busMigrationFreezeActive(agent) {
+		// The write freeze: the migration's principals and the run's
+		// sentinel, and nothing else, so no other workload authenticates
+		// (busMigrationFrozenIdentities). No profiles, no dispatcher.
+		ids, profiles = busMigrationFrozenIdentities(agent), nil
+	}
+	for _, id := range ids {
 		identities = append(identities, a2aAuthMapIdentity{
 			ServiceAccount: id.serviceAccount,
 			User:           id.user,
@@ -252,6 +264,7 @@ func renderA2AAuthMapDraining(agent *agentv1alpha1.PlatformAgent, profiles []age
 				Subscribe: id.subscribe,
 			},
 			Narrowing: id.narrowing,
+			NotAfter:  id.notAfter,
 		})
 	}
 	identities = append(identities, agentProfileMapEntries(agent, profiles)...)
@@ -259,8 +272,9 @@ func renderA2AAuthMapDraining(agent *agentv1alpha1.PlatformAgent, profiles []age
 	// durable the operator creates, so it is built here, from the same
 	// profiles (platformagent_a2a_dispatcher.go). Past the ceiling one shard
 	// can carry it is left out, and the operator runs no dispatcher
-	// (a2aDispatcherCeiling, gke-labs/kube-agents#5381).
-	if a2aDispatcherEnabled() {
+	// (a2aDispatcherCeiling, gke-labs/kube-agents#5381). A bus migration's
+	// freeze admits only its own principals, so it is left out then too.
+	if a2aDispatcherEnabled() && !busMigrationFreezeActive(agent) {
 		_, over, err := a2aDispatcherCeiling(agent, profiles, draining)
 		if err != nil {
 			return a2aAuthMapDocument{}, err
@@ -512,6 +526,9 @@ func validateA2AAuthMapIdentities(identities []a2aAuthMapIdentity, principals ..
 			return fmt.Errorf("identity %d: user %q lists draining profiles but narrows on %q; only %q reads them", i, id.User, id.Narrowing, a2aNarrowingDispatcher)
 		}
 		hasGrants := len(id.Grants.Publish) > 0 || len(id.Grants.Subscribe) > 0
+		if id.NotAfter != nil && id.Narrowing != "" {
+			return fmt.Errorf("identity %d: user %q carries notAfter but narrows on %q; only an entry that names its grants expires that way", i, id.User, id.Narrowing)
+		}
 		if id.Narrowing != a2aNarrowingProfile && (id.Profile != "" || id.Topics != nil) {
 			return fmt.Errorf("identity %d: user %q carries profile or topics but narrows on %q; only %q reads them", i, id.User, id.Narrowing, a2aNarrowingProfile)
 		}

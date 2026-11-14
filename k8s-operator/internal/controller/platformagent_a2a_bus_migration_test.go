@@ -1,0 +1,2946 @@
+package controller
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"reflect"
+	"slices"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/nats-io/nats.go"
+	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8slabels "k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/client-go/tools/record"
+	"k8s.io/utils/ptr"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+
+	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
+	"github.com/gke-labs/kube-agents/k8s-operator/internal/busmigrate"
+)
+
+// walkBusMigration runs a migration from its first phase, failing the phase
+// named failAt (and, when failAgain is set, the first phase of the way back
+// too), and returns every phase it passed through and the last step.
+func walkBusMigration(leg busMigrationLeg, failAt busMigrationPhase, failAgain bool) ([]busMigrationPhase, busMigrationStep) {
+	phase := busMigrationPinning
+	if leg == busMigrationGrow {
+		phase = busMigrationFreezing
+	}
+	step := busMigrationStep{next: phase}
+	seen := []busMigrationPhase{phase}
+	failedOnce := false
+	for i := 0; i < 20 && !busMigrationTerminal(step.next); i++ {
+		outcome := busMigrationSucceeded
+		if step.next == failAt && !failedOnce {
+			outcome, failedOnce = busMigrationErred, true
+		} else if failedOnce && failAgain && step.abandoning {
+			outcome, failAgain = busMigrationErred, false
+		}
+		step = nextBusMigrationPhase(leg, step.next, step.abandoning, outcome)
+		seen = append(seen, step.next)
+	}
+	return seen, step
+}
+
+// Every failure point ends bounded: back where it started with the data
+// (Abandoned, not frozen), or, only when the way back itself fails, at Failed
+// with the manual step named; frozen then only for one to three, whose
+// rollback is what failed.
+func TestEveryBusMigrationFailureIsBounded(t *testing.T) {
+	for _, tc := range []struct {
+		leg        busMigrationLeg
+		failAt     busMigrationPhase
+		failAgain  bool
+		want       busMigrationPhase
+		wantFrozen bool
+	}{
+		{busMigrationShrink, "", false, busMigrationDone, false},
+		{busMigrationShrink, busMigrationPinning, false, busMigrationAbandoned, false},
+		{busMigrationShrink, busMigrationPinning, true, busMigrationFailed, false},
+		{busMigrationShrink, busMigrationShrinking, false, busMigrationFailed, false},
+		{busMigrationGrow, "", false, busMigrationDone, false},
+		{busMigrationGrow, busMigrationFreezing, false, busMigrationAbandoned, false},
+		{busMigrationGrow, busMigrationSnapshot, false, busMigrationAbandoned, false},
+		{busMigrationGrow, busMigrationHashing, false, busMigrationAbandoned, false},
+		{busMigrationGrow, busMigrationConverting, false, busMigrationAbandoned, false},
+		{busMigrationGrow, busMigrationRestoring, false, busMigrationAbandoned, false},
+		{busMigrationGrow, busMigrationRestoring, true, busMigrationFailed, true},
+		{busMigrationGrow, busMigrationConverting, true, busMigrationFailed, true},
+	} {
+		seen, last := walkBusMigration(tc.leg, tc.failAt, tc.failAgain)
+		if last.next != tc.want {
+			t.Errorf("%s failing at %q (again: %v): ended %s via %v, want %s", tc.leg, tc.failAt, tc.failAgain, last.next, seen, tc.want)
+			continue
+		}
+		if got := busMigrationFrozen(tc.leg, last.next); got != tc.wantFrozen {
+			t.Errorf("%s failing at %q (again: %v): left frozen = %v, want %v", tc.leg, tc.failAt, tc.failAgain, got, tc.wantFrozen)
+		}
+		if (last.next == busMigrationFailed) != (last.manual != "") {
+			t.Errorf("%s failing at %q: Failed must name a manual step and nothing else may (manual %q)", tc.leg, tc.failAt, last.manual)
+		}
+	}
+}
+
+// One to three clears the single server before the conversion, and failing
+// after the conversion clears the cluster's partial copies, rolls back
+// through one server and the same snapshot, and only then lifts the freeze.
+func TestAOneToThreeFailureAfterTheConversionRollsBack(t *testing.T) {
+	seen, last := walkBusMigration(busMigrationGrow, busMigrationRestoring, false)
+	want := []busMigrationPhase{busMigrationFreezing, busMigrationSnapshot, busMigrationHashing, busMigrationClearing, busMigrationConverting,
+		busMigrationRestoring, busMigrationClearing, busMigrationRollingBack, busMigrationRollbackRestoring, busMigrationReleasing, busMigrationAbandoned}
+	if len(seen) != len(want) {
+		t.Fatalf("phases %v, want %v", seen, want)
+	}
+	for i := range want {
+		if seen[i] != want[i] {
+			t.Fatalf("phases %v, want %v", seen, want)
+		}
+	}
+	if !last.abandoning {
+		t.Error("a rolled-back run does not read as abandoned")
+	}
+}
+
+// A failed conversion rolls straight back: no restore has run, so the
+// three servers hold no copy to clear, and a clear on servers that never all
+// came up would need a quorum they may not have. Through the pass, the
+// rollback's restore starts on the forward clear's record, with nothing
+// cleared again.
+func TestAFailedConversionRollsBackWithoutAClear(t *testing.T) {
+	seen, last := walkBusMigration(busMigrationGrow, busMigrationConverting, false)
+	want := []busMigrationPhase{busMigrationFreezing, busMigrationSnapshot, busMigrationHashing, busMigrationClearing, busMigrationConverting,
+		busMigrationRollingBack, busMigrationRollbackRestoring, busMigrationReleasing, busMigrationAbandoned}
+	if !slices.Equal(seen, want) {
+		t.Fatalf("phases %v, want %v", seen, want)
+	}
+	if !last.abandoning {
+		t.Error("a rolled-back conversion does not read as abandoned")
+	}
+
+	t.Setenv(operatorImageEnvVar, "operator:test")
+	m := newMigrationRig(t, busMigrationGrow, busMigrationClearing, 1, time.Now().Add(time.Hour))
+	m.snapshotKept()
+	m.clearedAll()
+	m.pass(busMigrationConverting, 3)
+	m.agent.Status.BusMigration.PhaseDeadline = ptr.To(metav1.NewTime(time.Now().Add(-time.Second)))
+	m.pass(busMigrationRollingBack, 1)
+	if _, _, ok := m.workload(busMigrationClearBackWork); ok {
+		t.Error("a failed conversion started a clear on the cluster")
+	}
+	m.rollOut(1)
+	m.pass(busMigrationRollbackRestoring, 1)
+	if _, _, ok := m.workload("rollback"); !ok {
+		t.Error("the rollback's restore did not start after a failed conversion")
+	}
+}
+
+// A pending pass changes nothing, and three to one never freezes.
+func TestABusMigrationWaitsAndThreeToOneNeverFreezes(t *testing.T) {
+	for _, phase := range []busMigrationPhase{busMigrationPinning, busMigrationShrinking, busMigrationUnpinning} {
+		if busMigrationFrozen(busMigrationShrink, phase) {
+			t.Errorf("three to one frozen in %s", phase)
+		}
+	}
+	got := nextBusMigrationPhase(busMigrationGrow, busMigrationHashing, false, busMigrationPending)
+	if got.next != busMigrationHashing || got.abandoning {
+		t.Errorf("a pending Hashing pass moved to %+v", got)
+	}
+	for _, phase := range []busMigrationPhase{busMigrationSnapshot, busMigrationHashing, busMigrationConverting, busMigrationRestoring, busMigrationRollingBack, busMigrationReleasing} {
+		if !busMigrationFrozen(busMigrationGrow, phase) {
+			t.Errorf("one to three not frozen in %s", phase)
+		}
+	}
+}
+
+// The bus renders the old count until the phase that converts it, the new
+// one from there, and the old one again on a rollback.
+func TestTheBusRendersTheCountItsPhaseCalls(t *testing.T) {
+	for _, tc := range []struct {
+		leg        busMigrationLeg
+		phase      busMigrationPhase
+		abandoning bool
+		want       int
+	}{
+		{busMigrationShrink, busMigrationPinning, false, 3},
+		{busMigrationShrink, busMigrationUnpinning, true, 3},
+		{busMigrationShrink, busMigrationShrinking, false, 1},
+		{busMigrationShrink, busMigrationDone, false, 1},
+		{busMigrationShrink, busMigrationAbandoned, true, 3},
+		{busMigrationShrink, busMigrationFailed, false, 1},
+		{busMigrationShrink, busMigrationFailed, true, 3},
+		{busMigrationGrow, busMigrationFreezing, false, 1},
+		{busMigrationGrow, busMigrationSnapshot, false, 1},
+		{busMigrationGrow, busMigrationHashing, false, 1},
+		{busMigrationGrow, busMigrationConverting, false, 3},
+		{busMigrationGrow, busMigrationRestoring, false, 3},
+		{busMigrationGrow, busMigrationRollingBack, true, 1},
+		{busMigrationGrow, busMigrationRollbackRestoring, true, 1},
+		{busMigrationGrow, busMigrationReleasing, false, 3},
+		{busMigrationGrow, busMigrationReleasing, true, 1},
+		{busMigrationGrow, busMigrationDone, false, 3},
+		{busMigrationGrow, busMigrationAbandoned, true, 1},
+		{busMigrationGrow, busMigrationFailed, true, 1},
+		{busMigrationGrow, busMigrationFailed, false, 3},
+	} {
+		if got := busMigrationReplicas(tc.leg, tc.phase, tc.abandoning); got != tc.want {
+			t.Errorf("%s %s (abandoning %v) renders %d, want %d", tc.leg, tc.phase, tc.abandoning, got, tc.want)
+		}
+	}
+}
+
+// A Job's outcome is its Complete or Failed condition; still pending past
+// the run's deadline counts as failed.
+func TestAMigrationJobsOutcomeAndTheDeadline(t *testing.T) {
+	job := func(cond batchv1.JobConditionType, status corev1.ConditionStatus) *batchv1.Job {
+		j := &batchv1.Job{}
+		if cond != "" {
+			j.Status.Conditions = []batchv1.JobCondition{{Type: cond, Status: status}}
+		}
+		return j
+	}
+	for _, tc := range []struct {
+		job  *batchv1.Job
+		want busMigrationOutcome
+	}{
+		{job("", ""), busMigrationPending},
+		{job(batchv1.JobComplete, corev1.ConditionTrue), busMigrationSucceeded},
+		{job(batchv1.JobFailed, corev1.ConditionTrue), busMigrationErred},
+		{job(batchv1.JobComplete, corev1.ConditionFalse), busMigrationPending},
+	} {
+		if got := jobOutcome(tc.job); got != tc.want {
+			t.Errorf("jobOutcome(%+v) = %v, want %v", tc.job.Status.Conditions, got, tc.want)
+		}
+	}
+	now := time.Now()
+	if withDeadline(busMigrationPending, now.Add(-time.Second), now) != busMigrationErred {
+		t.Error("a pending phase past the deadline is not failed")
+	}
+	if withDeadline(busMigrationPending, now.Add(time.Hour), now) != busMigrationPending {
+		t.Error("a pending phase before the deadline was failed")
+	}
+	if withDeadline(busMigrationSucceeded, now.Add(-time.Second), now) != busMigrationSucceeded {
+		t.Error("a finished phase was failed by the deadline")
+	}
+}
+
+// migrationRig is a CR mid-migration on a fake cluster, with helpers to make
+// the phase's work finish the way the cluster would report it.
+type migrationRig struct {
+	t     *testing.T
+	agent *agentv1alpha1.PlatformAgent
+	cl    client.Client
+	r     *PlatformAgentReconciler
+	sts   *appsv1.StatefulSet
+}
+
+func newMigrationRig(t *testing.T, leg busMigrationLeg, phase busMigrationPhase, running int32, deadline time.Time) *migrationRig {
+	t.Helper()
+	agent := a2aTestAgent()
+	agent.Generation = 3
+	asked := 1
+	if leg == busMigrationGrow {
+		asked = 3
+	}
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(asked)}}
+	agent.Status.BusReplicas = running
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(leg), RunID: "3-1", Phase: string(phase),
+		StartedAt: metav1.Now(), Deadline: metav1.NewTime(deadline), ObservedGeneration: 3}
+	// A run past Freezing confirmed its freeze on the way.
+	agent.Status.BusMigration.FreezeConfirmed = busMigrationFreezeActive(agent) && phase != busMigrationFreezing
+	sts := buildA2ANATSStatefulSet(agent, "h")
+	sts.Spec.Replicas = ptr.To(running)
+	cl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent, sts).WithStatusSubresource(&appsv1.StatefulSet{}, &batchv1.Job{}, &corev1.Pod{}).Build()
+	return &migrationRig{t: t, agent: agent, cl: cl, r: &PlatformAgentReconciler{Client: cl, Scheme: setupScheme(), Recorder: record.NewFakeRecorder(16), busStreamState: emptyBusStreams}, sts: sts}
+}
+
+// pass runs the resolver and checks the phase and the count it renders.
+func (m *migrationRig) pass(wantPhase busMigrationPhase, wantReplicas int32) {
+	m.t.Helper()
+	if err := m.r.resolveA2ABusReplicas(context.Background(), m.agent); err != nil {
+		m.t.Fatal(err)
+	}
+	if got := busMigrationPhase(m.agent.Status.BusMigration.Phase); got != wantPhase {
+		m.t.Fatalf("phase %s, want %s", got, wantPhase)
+	}
+	if m.agent.Status.BusReplicas != wantReplicas || int32(a2aNATSReplicas(m.agent)) != wantReplicas {
+		m.t.Fatalf("in %s: status.busReplicas %d, rendered %d; want %d", wantPhase, m.agent.Status.BusReplicas, a2aNATSReplicas(m.agent), wantReplicas)
+	}
+}
+
+func (m *migrationRig) finishJob(step string, cond batchv1.JobConditionType) {
+	m.t.Helper()
+	j := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkloadName(m.agent, step, "3-1"), Namespace: m.agent.Namespace}}
+	if err := m.cl.Get(context.Background(), client.ObjectKeyFromObject(j), j); err != nil {
+		m.own(j)
+		if err := m.cl.Create(context.Background(), j); err != nil {
+			m.t.Fatal(err)
+		}
+	}
+	j.Status.Conditions = []batchv1.JobCondition{{Type: cond, Status: corev1.ConditionTrue}}
+	if err := m.cl.Status().Update(context.Background(), j); err != nil {
+		m.t.Fatal(err)
+	}
+}
+
+// own sets the controller reference the operator gives the run's objects.
+func (m *migrationRig) own(obj client.Object) {
+	m.t.Helper()
+	if err := ctrl.SetControllerReference(m.agent, obj, m.r.Scheme); err != nil {
+		m.t.Fatal(err)
+	}
+}
+
+// finishPod ends one of the run's pods as the kubelet would report it, with
+// its termination message, and reason (DeadlineExceeded for a pod stopped at
+// activeDeadlineSeconds).
+func (m *migrationRig) finishPod(name string, phase corev1.PodPhase, message, reason string) {
+	m.t.Helper()
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkloadName(m.agent, name, "3-1"), Namespace: m.agent.Namespace}}
+	if err := m.cl.Get(context.Background(), client.ObjectKeyFromObject(pod), pod); err != nil {
+		m.own(pod)
+		if err := m.cl.Create(context.Background(), pod); err != nil {
+			m.t.Fatal(err)
+		}
+	}
+	pod.Status.Phase, pod.Status.Reason = phase, reason
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: "bus-" + name, State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{Message: message}}}}
+	if err := m.cl.Status().Update(context.Background(), pod); err != nil {
+		m.t.Fatal(err)
+	}
+}
+
+// calloutPods puts the callout's Deployment (two replicas) and its pods on
+// the rig: n pods, each annotated for the freeze when frozen is set, ready
+// when ready is.
+func (m *migrationRig) calloutPods(n int, frozen, ready bool) {
+	m.t.Helper()
+	ctx := context.Background()
+	dep := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutName(m.agent), Namespace: m.agent.Namespace}, Spec: appsv1.DeploymentSpec{Replicas: ptr.To(int32(2))}}
+	if err := m.cl.Create(ctx, dep); err != nil && !apierrors.IsAlreadyExists(err) {
+		m.t.Fatal(err)
+	}
+	old := &corev1.PodList{}
+	_ = m.cl.List(ctx, old, client.InNamespace(m.agent.Namespace), client.MatchingLabels(a2aCalloutPodSelector(m.agent)))
+	for i := range old.Items {
+		_ = m.cl.Delete(ctx, &old.Items[i])
+	}
+	for i := 0; i < n; i++ {
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: fmt.Sprintf("callout-%d", i), Namespace: m.agent.Namespace, Labels: a2aCalloutPodSelector(m.agent)}}
+		if frozen {
+			pod.Annotations = map[string]string{a2aBusFreezeAnnotation: m.agent.Status.BusMigration.RunID}
+		}
+		if err := m.cl.Create(ctx, pod); err != nil {
+			m.t.Fatal(err)
+		}
+		status := corev1.ConditionFalse
+		if ready {
+			status = corev1.ConditionTrue
+		}
+		pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: status}}
+		if err := m.cl.Status().Update(ctx, pod); err != nil {
+			m.t.Fatal(err)
+		}
+	}
+}
+
+// snapshotKept puts the run's stage claim (bound) and run Secret on the rig,
+// both the PlatformAgent's, as the snapshot and hashing phases leave them.
+func (m *migrationRig) snapshotKept() {
+	m.t.Helper()
+	ctx := context.Background()
+	pvc := buildBusStagePVC(m.agent, m.agent.Status.BusMigration)
+	m.own(pvc)
+	if err := m.cl.Create(ctx, pvc); err != nil && !apierrors.IsAlreadyExists(err) {
+		m.t.Fatal(err)
+	}
+	pvc.Status.Phase = corev1.ClaimBound
+	if err := m.cl.Status().Update(ctx, pvc); err != nil {
+		m.t.Fatal(err)
+	}
+	digests, _ := parseBusDigests(validDigests())
+	body, _ := json.Marshal(busmigrate.RunFile{Digests: digests, Policies: a2aStreamPolicies(1)})
+	sec := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: busMigrationRunSecret(m.agent, "3-1"), Namespace: m.agent.Namespace}, Data: map[string][]byte{busMigrationRunKey: body}}
+	m.own(sec)
+	if err := m.cl.Create(ctx, sec); err != nil && !apierrors.IsAlreadyExists(err) {
+		m.t.Fatal(err)
+	}
+}
+
+// clearedAll ends the clear pod having deleted every provisioned stream.
+func (m *migrationRig) clearedAll() {
+	m.t.Helper()
+	b, _ := json.Marshal(busmigrate.Report{Cleared: a2aProvisionedStreams})
+	m.finishPod(busMigrationRunWork(m.agent.Status.BusMigration).name, corev1.PodSucceeded, string(b), "")
+}
+
+// validDigests is a hashing pod's report for every provisioned stream.
+func validDigests() string {
+	d := map[string]busmigrate.StagedDigest{}
+	for i, n := range a2aProvisionedStreams {
+		d[n] = busmigrate.StagedDigest{Data: fmt.Sprintf("%064x", i+1), Meta: fmt.Sprintf("%064x", i+100)}
+	}
+	b, _ := json.Marshal(d)
+	return string(b)
+}
+
+func (m *migrationRig) rollOut(replicas int32) {
+	m.t.Helper()
+	sts := &appsv1.StatefulSet{}
+	if err := m.cl.Get(context.Background(), client.ObjectKeyFromObject(m.sts), sts); err != nil {
+		m.t.Fatal(err)
+	}
+	sts.Spec.Replicas = ptr.To(replicas)
+	// The template the operator renders now: stamped for the run's freeze
+	// once the bus is rendered for it, and not otherwise.
+	if sts.Spec.Template.Annotations == nil {
+		sts.Spec.Template.Annotations = map[string]string{}
+	}
+	delete(sts.Spec.Template.Annotations, a2aBusFreezeAnnotation)
+	if busMigrationFreezeConfigured(m.agent) {
+		sts.Spec.Template.Annotations[a2aBusFreezeAnnotation] = m.agent.Status.BusMigration.RunID
+	}
+	if err := m.cl.Update(context.Background(), sts); err != nil {
+		m.t.Fatal(err)
+	}
+	sts.Status = appsv1.StatefulSetStatus{ObservedGeneration: sts.Generation, Replicas: replicas, ReadyReplicas: replicas, UpdatedReplicas: replicas}
+	if err := m.cl.Status().Update(context.Background(), sts); err != nil {
+		m.t.Fatal(err)
+	}
+}
+
+// Three to one through the pass: the pin Job's completion moves it to
+// Shrinking, which renders one server, and that server rolled out is Done.
+func TestAThreeToOneMigrationRunsThroughThePass(t *testing.T) {
+	m := newMigrationRig(t, busMigrationShrink, busMigrationPinning, 3, time.Now().Add(time.Hour))
+	m.pass(busMigrationPinning, 3)
+	m.finishJob("pin", batchv1.JobComplete)
+	m.pass(busMigrationShrinking, 1)
+	m.pass(busMigrationShrinking, 1)
+	m.rollOut(1)
+	m.pass(busMigrationDone, 1)
+}
+
+// A failed pin Job, or a pin still running at the deadline, unpins and keeps
+// three servers.
+func TestAFailedOrLatePinUnpins(t *testing.T) {
+	m := newMigrationRig(t, busMigrationShrink, busMigrationPinning, 3, time.Now().Add(time.Hour))
+	m.finishJob("pin", batchv1.JobFailed)
+	m.pass(busMigrationUnpinning, 3)
+	late := newMigrationRig(t, busMigrationShrink, busMigrationPinning, 3, time.Now().Add(-time.Minute))
+	late.pass(busMigrationUnpinning, 3)
+}
+
+// One to three through the pass up to the restore: the freeze rolled out,
+// the snapshot Job, the hashing pod, then three servers rendered and rolled
+// out. A conversion still unfinished at the deadline rolls back to one.
+func TestAOneToThreeMigrationRunsThroughThePass(t *testing.T) {
+	m := newMigrationRig(t, busMigrationGrow, busMigrationFreezing, 1, time.Now().Add(time.Hour))
+	recorder := record.NewFakeRecorder(16)
+	m.r.Recorder = recorder
+	m.calloutPods(2, true, true)
+	m.pass(busMigrationFreezing, 1) // the callout confirms; the bus renders for the freeze
+	m.rollOut(1)                    // and restarts into it
+	m.pass(busMigrationSnapshot, 1)
+	m.finishPod("snapshot", corev1.PodSucceeded, "", "")
+	m.pass(busMigrationHashing, 1)
+	m.finishPod("hash", corev1.PodSucceeded, validDigests(), "")
+	m.pass(busMigrationClearing, 1)
+	m.snapshotKept() // the stage claim, bound (the run Secret is the operator's, written above)
+	m.clearedAll()
+	m.pass(busMigrationConverting, 3)
+
+	// The run Secret holds the hashing pod's digests and the operator's
+	// policies, at one replica, owned by the CR.
+	secret := &corev1.Secret{}
+	if err := m.cl.Get(context.Background(), client.ObjectKey{Namespace: m.agent.Namespace, Name: busMigrationRunSecret(m.agent, "3-1")}, secret); err != nil {
+		t.Fatalf("no run Secret after hashing: %v", err)
+	}
+	var run busmigrate.RunFile
+	if err := json.Unmarshal(secret.Data[busMigrationRunKey], &run); err != nil {
+		t.Fatal(err)
+	}
+	wantDigests, _ := parseBusDigests(validDigests())
+	if !reflect.DeepEqual(run.Digests, wantDigests) || !reflect.DeepEqual(run.Policies, a2aStreamPolicies(1)) || !ownedByAgent(secret.ObjectMeta, m.agent) {
+		t.Errorf("run Secret %+v, owners %v", run, secret.OwnerReferences)
+	}
+
+	m.rollOut(3)
+	m.pass(busMigrationRestoring, 3)
+	m.finishPod("restore", corev1.PodSucceeded, `{"warnings":["stream TOPICS-STATE: subject x is missing; a fresh install has it"]}`, "")
+	m.pass(busMigrationReleasing, 3)
+	m.pass(busMigrationReleasing, 3) // still on the frozen template
+	m.rollOut(3)                     // the restart out of the freeze
+	if w := m.agent.Status.BusMigration.Warnings; len(w) != 1 || !strings.Contains(w[0], "subject x is missing") {
+		t.Errorf("status warnings %v", w)
+	}
+	select {
+	case e := <-recorder.Events:
+		if !strings.Contains(e, "Warning BusMigrationDrift") || !strings.Contains(e, "subject x is missing") {
+			t.Errorf("event %q", e)
+		}
+	default:
+		t.Error("no Warning Event for the restore's warnings")
+	}
+	m.pass(busMigrationDone, 3)
+	select {
+	case e := <-recorder.Events:
+		t.Errorf("a second event for the same warnings: %q", e)
+	default:
+	}
+
+	late := newMigrationRig(t, busMigrationGrow, busMigrationConverting, 3, time.Now().Add(-time.Minute))
+	late.pass(busMigrationRollingBack, 1) // no restore ran: nothing on the cluster to clear
+}
+
+// Converting has fifteen minutes of its own to get three servers Ready, on
+// top of the run's deadline: a cluster that cannot schedule servers 1 and 2
+// turns the run back in that time, not at the run's two-hour deadline with
+// the bus frozen all along. A run already in Converting under an operator
+// without the phase's deadline gets one on its first pass.
+func TestAConversionThatCannotFinishTurnsBackAtItsOwnDeadline(t *testing.T) {
+	m := newMigrationRig(t, busMigrationGrow, busMigrationClearing, 1, time.Now().Add(time.Hour))
+	m.snapshotKept()
+	m.clearedAll()
+	m.pass(busMigrationConverting, 3)
+	pd := m.agent.Status.BusMigration.PhaseDeadline
+	if pd == nil {
+		t.Fatal("entering Converting set no phase deadline")
+	}
+	if left := time.Until(pd.Time); left > busMigrationConvertDeadline || left < busMigrationConvertDeadline-time.Minute {
+		t.Fatalf("the conversion's deadline is %s away, want %s", left, busMigrationConvertDeadline)
+	}
+	m.pass(busMigrationConverting, 3) // servers 1 and 2 Pending, within the phase's time
+	m.agent.Status.BusMigration.PhaseDeadline = ptr.To(metav1.NewTime(time.Now().Add(-time.Second)))
+	m.pass(busMigrationRollingBack, 1)
+	run := m.agent.Status.BusMigration
+	if !run.Abandoning || !strings.Contains(run.Cause, "the Converting phase was still running at its own deadline") {
+		t.Errorf("abandoning %v, cause %q", run.Abandoning, run.Cause)
+	}
+	if run.PhaseDeadline != nil {
+		t.Errorf("the conversion's deadline outlived the phase: %v", run.PhaseDeadline)
+	}
+
+	upgraded := newMigrationRig(t, busMigrationGrow, busMigrationConverting, 3, time.Now().Add(time.Hour))
+	upgraded.pass(busMigrationConverting, 3)
+	if upgraded.agent.Status.BusMigration.PhaseDeadline == nil {
+		t.Error("a run found in Converting without a phase deadline got none")
+	}
+}
+
+// A status write whose echo comes back without status.busMigration (the
+// served CRD predates it) stops runs from starting, with a Warning Event:
+// the dropped run would otherwise be started again on every pass, rolling
+// the callout each time. An echo that carries the field clears the record.
+func TestAPrunedBusMigrationStatusStartsNoRun(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	m := newMigrationRig(t, busMigrationShrink, busMigrationPinning, 3, time.Now().Add(time.Hour))
+	setBusProvisionedCondition(m.agent, true, "provision-job", metav1.Now())
+	recorder := record.NewFakeRecorder(16)
+	m.r.Recorder = recorder
+	m.agent.Status.BusMigration = nil // the echo of a write that carried the run
+	m.r.noteBusMigrationEcho(m.agent, true)
+	if err := m.r.resolveA2ABusReplicas(context.Background(), m.agent); err != nil {
+		t.Fatal(err)
+	}
+	if run := m.agent.Status.BusMigration; run != nil {
+		t.Fatalf("a run started while the served CRD drops status.busMigration: %+v", run)
+	}
+	if m.agent.Status.BusReplicas != 3 {
+		t.Errorf("status.busReplicas %d, want the 3 the bus runs", m.agent.Status.BusReplicas)
+	}
+	select {
+	case e := <-recorder.Events:
+		if !strings.Contains(e, "Warning "+reasonA2ABusMigrationUnavailable) || !strings.Contains(e, "drops status.busMigration") {
+			t.Errorf("event %q", e)
+		}
+	default:
+		t.Error("no Warning Event for the pruned field")
+	}
+
+	m.agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{RunID: "9-9"} // an echo that carries the field
+	m.r.noteBusMigrationEcho(m.agent, true)
+	m.agent.Status.BusMigration = nil
+	if err := m.r.resolveA2ABusReplicas(context.Background(), m.agent); err != nil {
+		t.Fatal(err)
+	}
+	if m.agent.Status.BusMigration == nil {
+		t.Error("no run started after an echo carried status.busMigration")
+	}
+}
+
+// A hashing pod whose report is not exactly the provisioned streams' digest
+// pairs writes no run Secret, and the run turns back naming why.
+func TestARefusedDigestReportTurnsTheRunBack(t *testing.T) {
+	m := newMigrationRig(t, busMigrationGrow, busMigrationHashing, 1, time.Now().Add(time.Hour))
+	m.finishPod("hash", corev1.PodSucceeded, `{"TASKS":{"data":"x","meta":"y"}}`, "")
+	if err := m.r.resolveA2ABusReplicas(context.Background(), m.agent); err != nil {
+		t.Fatal(err)
+	}
+	run := m.agent.Status.BusMigration
+	if !run.Abandoning || !strings.Contains(run.Cause, "the hashing pod's report was refused") {
+		t.Errorf("phase %s abandoning %v cause %q", run.Phase, run.Abandoning, run.Cause)
+	}
+	if err := m.cl.Get(context.Background(), client.ObjectKey{Namespace: m.agent.Namespace, Name: busMigrationRunSecret(m.agent, "3-1")}, &corev1.Secret{}); err == nil {
+		t.Error("a run Secret from a refused report")
+	}
+}
+
+// A restore pod that fails rolls back, and the cause carries its report's
+// error; a pod stopped at its deadline names the deadline; warnings the
+// rollback repeats are recorded once.
+func TestAFailedRestoreRollsBackNamingItsError(t *testing.T) {
+	m := newMigrationRig(t, busMigrationGrow, busMigrationRestoring, 3, time.Now().Add(time.Hour))
+	m.finishPod("restore", corev1.PodFailed, `{"error":"stream TASKS: config is outside the operator's policy: subjects: \"a2a.>\" is not one of [a2a.tasks.>]"}`, "")
+	m.pass(busMigrationClearing, 3) // the cluster's partial copies go first, on three servers
+	if c := m.agent.Status.BusMigration.Cause; !strings.Contains(c, "the Restoring phase failed: stream TASKS: config is outside the operator's policy") {
+		t.Errorf("cause %q", c)
+	}
+
+	// Killed with no report and no deadline (evicted): the phase failed,
+	// with no word about a report it never wrote.
+	evicted := newMigrationRig(t, busMigrationGrow, busMigrationRestoring, 3, time.Now().Add(time.Hour))
+	evicted.finishPod("restore", corev1.PodFailed, "", "Evicted")
+	evicted.pass(busMigrationClearing, 3)
+	if c := evicted.agent.Status.BusMigration.Cause; c != "the Restoring phase failed" {
+		t.Errorf("evicted restore cause %q", c)
+	}
+
+	// Killed at its deadline: whatever it reported, or nothing, the cause
+	// is the deadline.
+	for _, msg := range []string{"", `{"error":"context canceled"}`} {
+		late := newMigrationRig(t, busMigrationGrow, busMigrationRollbackRestoring, 1, time.Now().Add(time.Hour))
+		late.agent.Status.BusMigration.Abandoning = true
+		late.finishPod("rollback", corev1.PodFailed, msg, "DeadlineExceeded")
+		if err := late.r.resolveA2ABusReplicas(context.Background(), late.agent); err != nil {
+			t.Fatal(err)
+		}
+		if c := late.agent.Status.BusMigration.Cause; !strings.Contains(c, "the RollbackRestoring phase was still running at the run's deadline") {
+			t.Errorf("rollback stopped at its deadline (report %q): cause %q", msg, c)
+		}
+	}
+
+	// The rollback restores the same snapshot, so it reports the same
+	// warnings: they are recorded once, with one Event.
+	twice := newMigrationRig(t, busMigrationGrow, busMigrationRestoring, 3, time.Now().Add(time.Hour))
+	recorder := record.NewFakeRecorder(16)
+	twice.r.Recorder = recorder
+	const warned = `{"warnings":["stream TASKS: max_consumers is -1; a fresh install has 110"],"error":"stream KV_cap: finishing: boom"}`
+	twice.finishPod("restore", corev1.PodFailed, warned, "")
+	twice.pass(busMigrationClearing, 3)
+	twice.snapshotKept()
+	twice.clearedAll()
+	twice.pass(busMigrationRollingBack, 1)
+	twice.rollOut(1)
+	twice.pass(busMigrationRollbackRestoring, 1)
+	twice.finishPod("rollback", corev1.PodSucceeded, `{"warnings":["stream TASKS: max_consumers is -1; a fresh install has 110"]}`, "")
+	twice.pass(busMigrationReleasing, 1)
+	if n := len(recorder.Events); n != 1 {
+		t.Errorf("%d Events for one set of warnings, want 1", n)
+	}
+	if w := twice.agent.Status.BusMigration.Warnings; len(w) != 1 {
+		t.Errorf("warnings %v", w)
+	}
+}
+
+func TestTheHashingReportIsReadStrictly(t *testing.T) {
+	good, refused := parseBusDigests(validDigests())
+	if refused != "" || len(good) != len(a2aProvisionedStreams) {
+		t.Fatalf("a valid report refused: %s", refused)
+	}
+	var pairs map[string]busmigrate.StagedDigest
+	_ = json.Unmarshal([]byte(validDigests()), &pairs)
+	edit := func(f func(map[string]busmigrate.StagedDigest)) string {
+		c := map[string]busmigrate.StagedDigest{}
+		for k, v := range pairs {
+			c[k] = v
+		}
+		f(c)
+		b, _ := json.Marshal(c)
+		return string(b)
+	}
+	for name, msg := range map[string]string{
+		"not JSON":       "TASKS deadbeef",
+		"a stream short": edit(func(c map[string]busmigrate.StagedDigest) { delete(c, "TASKS") }),
+		"an extra":       edit(func(c map[string]busmigrate.StagedDigest) { c["OTHER"] = c["TASKS"] }),
+		"a renamed":      edit(func(c map[string]busmigrate.StagedDigest) { c["OTHER"] = c["TASKS"]; delete(c, "TASKS") }),
+		"short hex": edit(func(c map[string]busmigrate.StagedDigest) {
+			c["TASKS"] = busmigrate.StagedDigest{Data: "abc", Meta: c["TASKS"].Meta}
+		}),
+		"uppercase hex": edit(func(c map[string]busmigrate.StagedDigest) {
+			d := c["KV_cap"]
+			d.Meta = strings.ToUpper(d.Meta)
+			c["KV_cap"] = d
+		}),
+		"no meta": edit(func(c map[string]busmigrate.StagedDigest) {
+			c["TASKS"] = busmigrate.StagedDigest{Data: c["TASKS"].Data}
+		}),
+	} {
+		if _, refused := parseBusDigests(msg); refused == "" {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
+// No provision Job is created while a migration runs: on one to three it
+// would create the streams empty ahead of the restore. After the run ends
+// the Job runs as usual.
+func TestAMigrationHoldsTheProvisionJob(t *testing.T) {
+	agent := a2aTestAgent()
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, discordBotSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}, &appsv1.StatefulSet{}, &appsv1.Deployment{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(32)}
+	ctx := context.Background()
+	theCalloutIsServing(t, ctx, cl, r, agent)
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), RunID: "1-1", Phase: string(busMigrationRestoring),
+		StartedAt: metav1.Now(), Deadline: metav1.NewTime(time.Now().Add(time.Hour))}
+	agent.Status.BusReplicas = 3
+	// The bus has rolled out, the callout serves: only the migration holds.
+	sts := &appsv1.StatefulSet{}
+	if err := cl.Get(ctx, client.ObjectKey{Namespace: agent.Namespace, Name: a2aNATSName(agent)}, sts); err != nil {
+		t.Fatal(err)
+	}
+	sts.Spec.Replicas = ptr.To(int32(3))
+	if err := cl.Update(ctx, sts); err != nil {
+		t.Fatal(err)
+	}
+	sts.Status = appsv1.StatefulSetStatus{ObservedGeneration: sts.Generation + 1, Replicas: 3, ReadyReplicas: 3, UpdatedReplicas: 3, CurrentReplicas: 3}
+	if err := cl.Status().Update(ctx, sts); err != nil {
+		t.Fatal(err)
+	}
+	state, err := r.reconcileA2A(ctx, agent, homeChannelRecord{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobs := &batchv1.JobList{}
+	if err := cl.List(ctx, jobs, client.InNamespace(agent.Namespace)); err != nil {
+		t.Fatal(err)
+	}
+	for _, j := range jobs.Items {
+		if j.Name == buildA2AProvisionJob(agent).Name {
+			t.Fatalf("the provision Job %s was created while a migration is restoring", j.Name)
+		}
+	}
+	if !state.jobHeld {
+		t.Error("the pass does not report the Job held")
+	}
+	done := a2aTestAgent()
+	done.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Phase: string(busMigrationDone)}
+	if busMigrationHoldsProvision(done) {
+		t.Error("a finished migration still holds the provision Job")
+	}
+}
+
+// The condition says what the run is doing: True while it runs (with the
+// freeze named when writes are frozen), False when it ended without
+// converting or stopped for a person (with the step), absent once Done.
+func TestTheBusMigratingConditionFollowsTheRun(t *testing.T) {
+	for _, tc := range []struct {
+		leg        busMigrationLeg
+		phase      busMigrationPhase
+		abandoning bool
+		message    string
+		present    bool
+		status     metav1.ConditionStatus
+		reason     string
+		contains   []string
+	}{
+		{busMigrationGrow, busMigrationSnapshot, false, "", true, metav1.ConditionTrue, "InProgress", []string{"from 1 NATS servers to 3", "Snapshotting", "writes are frozen"}},
+		{busMigrationShrink, busMigrationPinning, false, "", true, metav1.ConditionTrue, "InProgress", []string{"from 3 NATS servers to 1", "Pinning"}},
+		{busMigrationGrow, busMigrationRollingBack, true, "", true, metav1.ConditionTrue, "InProgress", []string{"undoing", "writes are frozen"}},
+		{busMigrationGrow, busMigrationAbandoned, true, "", true, metav1.ConditionFalse, "Abandoned", []string{"runs 1 servers with its data"}},
+		{busMigrationGrow, busMigrationFailed, true, "restore it by hand", true, metav1.ConditionFalse, "Failed", []string{"restore it by hand"}},
+		{busMigrationGrow, busMigrationDone, false, "", false, "", "", nil},
+	} {
+		agent := a2aTestAgent()
+		agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(tc.leg), Phase: string(tc.phase), Abandoning: tc.abandoning, Message: tc.message}
+		cond, ok := busMigratingCondition(agent)
+		if ok != tc.present {
+			t.Errorf("%s %s: present %v, want %v", tc.leg, tc.phase, ok, tc.present)
+			continue
+		}
+		if !ok {
+			continue
+		}
+		if cond.Status != tc.status || cond.Reason != tc.reason {
+			t.Errorf("%s %s: %s/%s, want %s/%s", tc.leg, tc.phase, cond.Status, cond.Reason, tc.status, tc.reason)
+		}
+		for _, s := range tc.contains {
+			if !strings.Contains(cond.Message, s) {
+				t.Errorf("%s %s: message %q lacks %q", tc.leg, tc.phase, cond.Message, s)
+			}
+		}
+		if tc.leg == busMigrationShrink && strings.Contains(cond.Message, "frozen") {
+			t.Errorf("three to one reports a freeze: %q", cond.Message)
+		}
+	}
+}
+
+// The status write carries the run and its condition, and drops the
+// condition once the run converted the bus.
+func TestTheStatusWriteCarriesTheMigration(t *testing.T) {
+	ctx := context.Background()
+	agent := a2aTestAgent()
+	cl := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent).WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8)}
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), RunID: "1-1", Phase: string(busMigrationHashing), ObservedGeneration: 1}
+	if err := r.syncA2AConditions(ctx, agent, a2aProvisionState{done: true}); err != nil {
+		t.Fatal(err)
+	}
+	live := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), live); err != nil {
+		t.Fatal(err)
+	}
+	if live.Status.BusMigration == nil || live.Status.BusMigration.Phase != string(busMigrationHashing) {
+		t.Fatalf("status.busMigration after the write: %+v", live.Status.BusMigration)
+	}
+	if c := meta.FindStatusCondition(live.Status.Conditions, a2aBusMigratingConditionType); c == nil || c.Status != metav1.ConditionTrue {
+		t.Fatalf("condition after the write: %+v", c)
+	}
+	agent = live
+	agent.Status.BusMigration.Phase = string(busMigrationDone)
+	if err := r.syncA2AConditions(ctx, agent, a2aProvisionState{done: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), live); err != nil {
+		t.Fatal(err)
+	}
+	if c := meta.FindStatusCondition(live.Status.Conditions, a2aBusMigratingConditionType); c != nil {
+		t.Errorf("condition after a Done run: %+v, want it gone", c)
+	}
+	if live.Status.BusMigration == nil || live.Status.BusMigration.Phase != string(busMigrationDone) {
+		t.Errorf("the Done run was not written: %+v", live.Status.BusMigration)
+	}
+}
+
+// The status writer reads its echo for status.busMigration: a write the
+// served CRD prunes it from is recorded, so the next pass starts no run.
+func TestTheStatusWriteNotesAPrunedMigration(t *testing.T) {
+	ctx := context.Background()
+	agent := a2aTestAgent()
+	base := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(agent).WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).Build()
+	cl := interceptor.NewClient(base, interceptor.Funcs{
+		SubResourceUpdate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			// What an older CRD's structural schema does: the unknown field
+			// is dropped on the way in, so the echo has none.
+			if pa, ok := obj.(*agentv1alpha1.PlatformAgent); ok {
+				pa.Status.BusMigration = nil
+			}
+			return c.SubResource(subResourceName).Update(ctx, obj, opts...)
+		},
+	})
+	r := &PlatformAgentReconciler{Client: cl, Scheme: setupScheme(), Recorder: record.NewFakeRecorder(8)}
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationShrink), RunID: "1-1", Phase: string(busMigrationPinning), ObservedGeneration: 1}
+	if err := r.syncA2AConditions(ctx, agent, a2aProvisionState{done: true}); err != nil {
+		t.Fatal(err)
+	}
+	if !r.busMigrationStatusPruned(agent) {
+		t.Error("a write whose echo dropped status.busMigration was not recorded")
+	}
+	r.forgetUsageStatus(agent)
+	if r.busMigrationStatusPruned(agent) {
+		t.Error("the pruned busMigration record outlived forgetUsageStatus")
+	}
+}
+
+// A migration step's bus principal has exactly the JetStream API verbs its
+// leg sends, on the provisioned streams by name, subscribes to its own inbox
+// only, and is in the identity map only while its step runs.
+func TestAMigrationPrincipalHasExactlyItsStepsGrants(t *testing.T) {
+	type grant struct {
+		leg    busMigrationLeg
+		verbs  []string
+		extra  []string // per stream, after the verbs; %s is the stream
+		banned []string
+	}
+	shrinkBanned := []string{"SNAPSHOT", "RESTORE", "DELETE", "PURGE", "CREATE", "CONSUMER", "MSG.DELETE"}
+	snapshot := grant{busMigrationGrow, []string{"INFO", "SNAPSHOT"}, []string{"$JS.SNAPSHOT.ACK.%s.>"},
+		[]string{"RESTORE", "RESTORE-CHUNK", "UPDATE", "DELETE", "PURGE", "CREATE", "CONSUMER", "MSG.DELETE", "LEADER.STEPDOWN"}}
+	restore := grant{busMigrationGrow, []string{"INFO", "RESTORE", "UPDATE", "DELETE"}, []string{"$JS.SNAPSHOT.RESTORE.%s.>"},
+		[]string{"SNAPSHOT", "ACK", "PURGE", "CREATE", "CONSUMER", "MSG.DELETE", "LEADER.STEPDOWN"}}
+	want := map[busMigrationPhase]grant{
+		busMigrationPinning:           {busMigrationShrink, []string{"INFO", "LEADER.STEPDOWN", "UPDATE"}, nil, shrinkBanned},
+		busMigrationUnpinning:         {busMigrationShrink, []string{"INFO", "UPDATE"}, nil, shrinkBanned},
+		busMigrationSnapshot:          snapshot,
+		busMigrationClearing:          {busMigrationGrow, []string{"INFO", "DELETE"}, nil, []string{"SNAPSHOT", "ACK", "RESTORE", "RESTORE-CHUNK", "UPDATE", "PURGE", "CREATE", "CONSUMER", "MSG.DELETE", "LEADER.STEPDOWN"}},
+		busMigrationRestoring:         restore,
+		busMigrationRollbackRestoring: restore,
+	}
+	streamUsers := map[string]bool{}
+	for phase, g := range want {
+		agent := a2aTestAgent()
+		agent.Spec.Mode = ptr.To("next")
+		agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(g.leg), RunID: "5-9", Phase: string(phase)}
+		ids := busMigrationIdentities(agent)
+		if len(ids) != 1 {
+			t.Fatalf("%s: %d principals, want 1", phase, len(ids))
+		}
+		id := ids[0]
+		var expected []string
+		for _, s := range a2aProvisionedStreams {
+			for _, v := range g.verbs {
+				expected = append(expected, "$JS.API.STREAM."+v+"."+s)
+			}
+			for _, e := range g.extra {
+				expected = append(expected, fmt.Sprintf(e, s))
+			}
+		}
+		if !slices.Equal(id.publish, expected) {
+			t.Errorf("%s publish:\n got %v\nwant %v", phase, id.publish, expected)
+		}
+		for _, p := range id.publish {
+			if strings.HasSuffix(p, ".*") || strings.Contains(p, "STREAM.>") || p == "$JS.API.>" || strings.HasPrefix(p, "$JS.API.STREAM.*") ||
+				p == "$JS.SNAPSHOT.RESTORE.>" || p == "$JS.SNAPSHOT.ACK.>" || p == "$JS.SNAPSHOT.>" {
+				t.Errorf("%s: wildcard over stream names: %s", phase, p)
+			}
+			for _, banned := range g.banned {
+				pattern := map[string]string{
+					"SNAPSHOT": "$JS.API.STREAM.SNAPSHOT.", "RESTORE": "$JS.API.STREAM.RESTORE.",
+					"ACK": "$JS.SNAPSHOT.ACK.", "RESTORE-CHUNK": "$JS.SNAPSHOT.RESTORE.",
+				}[banned]
+				if pattern == "" {
+					pattern = "." + banned + "."
+				}
+				if strings.Contains(p, pattern) {
+					t.Errorf("%s grants %s: %s", phase, banned, p)
+				}
+			}
+		}
+		if !slices.Equal(id.subscribe, []string{"_INBOX." + id.user + ".>"}) {
+			t.Errorf("%s subscribe %v, want its own inbox only", phase, id.subscribe)
+		}
+		if g.leg == busMigrationGrow {
+			streamUsers[id.user+" "+id.serviceAccount] = true
+		}
+		// The callout refuses a whole map whose user is not one lowercase
+		// DNS-1123 label (it becomes the inbox prefix), so a long run ID
+		// must still fit; the ServiceAccount and pod names must be one too.
+		long := "9999999-1999999999"
+		for _, name := range []string{id.user, busMigrationPrincipal(busMigrationStreamIdentity, long), busMigrationWorkloadName(agent, "rollback", long), busMigrationRunSecret(agent, long)} {
+			if errs := validation.IsDNS1123Label(name); len(errs) != 0 {
+				t.Errorf("%q is not a DNS-1123 label: %v", name, errs)
+			}
+		}
+		if id.auth != a2aAuthCallout || !strings.Contains(id.serviceAccount, "5-9") {
+			t.Errorf("%s: auth %v by %q, want the callout and a ServiceAccount named for the run", phase, id.auth, id.serviceAccount)
+		}
+		found := false
+		for _, all := range a2aIdentities(agent) {
+			found = found || all.user == id.user
+		}
+		if !found {
+			t.Errorf("%s: the principal is not in the identity map", phase)
+		}
+	}
+	// The snapshot, restore and rollback pods hold one identity.
+	if len(streamUsers) != 1 {
+		t.Errorf("the one to three leg's phases hold %d identities, want one: %v", len(streamUsers), streamUsers)
+	}
+	// Outside those phases, the hashing pod's included, and after the run,
+	// no migration principal.
+	for _, phase := range []busMigrationPhase{busMigrationShrinking, busMigrationFreezing, busMigrationHashing, busMigrationConverting,
+		busMigrationRollingBack, busMigrationReleasing, busMigrationDone, busMigrationAbandoned, busMigrationFailed} {
+		agent := a2aTestAgent()
+		agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), RunID: "5-9", Phase: string(phase)}
+		if ids := busMigrationIdentities(agent); len(ids) != 0 {
+			t.Errorf("%s: %d migration principals, want none", phase, len(ids))
+		}
+	}
+}
+
+// workload reads back the pod spec of a phase's Job or pod.
+func (m *migrationRig) workload(step string) (corev1.PodSpec, metav1.ObjectMeta, bool) {
+	m.t.Helper()
+	key := client.ObjectKey{Namespace: m.agent.Namespace, Name: busMigrationWorkName(m.agent, m.agent.Status.BusMigration, step)}
+	if step != "pin" && step != "unpin" {
+		pod := &corev1.Pod{}
+		if err := m.cl.Get(context.Background(), key, pod); err != nil {
+			return corev1.PodSpec{}, metav1.ObjectMeta{}, false
+		}
+		return pod.Spec, pod.ObjectMeta, true
+	}
+	j := &batchv1.Job{}
+	if err := m.cl.Get(context.Background(), key, j); err != nil {
+		return corev1.PodSpec{}, metav1.ObjectMeta{}, false
+	}
+	return j.Spec.Template.Spec, j.ObjectMeta, true
+}
+
+func ownedByAgent(meta metav1.ObjectMeta, agent *agentv1alpha1.PlatformAgent) bool {
+	for _, o := range meta.OwnerReferences {
+		if o.Kind == "PlatformAgent" && o.Name == agent.Name && o.Controller != nil && *o.Controller {
+			return true
+		}
+	}
+	return false
+}
+
+// The pin Job is created when its phase runs: its own ServiceAccount (owned
+// by the CR, bound to no Role), no API token, the bus token projected for the
+// bus audience, connecting as the step's principal over TLS, bounded by the
+// run's deadline, on the operator's image.
+func TestAPhaseCreatesItsJobAndIdentity(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	m := newMigrationRig(t, busMigrationShrink, busMigrationPinning, 3, time.Now().Add(time.Hour))
+	m.pass(busMigrationPinning, 3)
+	spec, meta, ok := m.workload("pin")
+	if !ok {
+		t.Fatal("no pin Job after a pass in Pinning")
+	}
+	name := busMigrationWorkloadName(m.agent, "pin", "3-1")
+	if !ownedByAgent(meta, m.agent) {
+		t.Errorf("pin Job owners %v", meta.OwnerReferences)
+	}
+	sa := &corev1.ServiceAccount{}
+	if err := m.cl.Get(context.Background(), client.ObjectKey{Namespace: m.agent.Namespace, Name: name}, sa); err != nil {
+		t.Fatalf("no ServiceAccount %s: %v", name, err)
+	}
+	if !ownedByAgent(sa.ObjectMeta, m.agent) {
+		t.Errorf("ServiceAccount owners %v", sa.OwnerReferences)
+	}
+	rbs := &rbacv1.RoleBindingList{}
+	if err := m.cl.List(context.Background(), rbs); err != nil {
+		t.Fatal(err)
+	}
+	for _, rb := range rbs.Items {
+		for _, s := range rb.Subjects {
+			if s.Name == name {
+				t.Errorf("RoleBinding %s binds the migration identity", rb.Name)
+			}
+		}
+	}
+	if spec.ServiceAccountName != name || spec.AutomountServiceAccountToken == nil || *spec.AutomountServiceAccountToken {
+		t.Errorf("serviceAccount %q automount %v", spec.ServiceAccountName, spec.AutomountServiceAccountToken)
+	}
+	if spec.RestartPolicy != corev1.RestartPolicyNever {
+		t.Errorf("restartPolicy %s", spec.RestartPolicy)
+	}
+	c := spec.Containers[0]
+	if c.Image != "registry.example/operator:v1" {
+		t.Errorf("image %q", c.Image)
+	}
+	if c.SecurityContext == nil || c.SecurityContext.ReadOnlyRootFilesystem == nil || !*c.SecurityContext.ReadOnlyRootFilesystem ||
+		c.SecurityContext.AllowPrivilegeEscalation == nil || *c.SecurityContext.AllowPrivilegeEscalation {
+		t.Errorf("container security %+v", c.SecurityContext)
+	}
+	args := strings.Join(c.Command, " ")
+	for _, want := range []string{
+		"/manager bus-migrate pin ",
+		"--server " + a2aNATSTLSScheme + a2aNATSAddress(m.agent),
+		"--ca-file " + a2aNATSCAFile(),
+		"--user " + busMigrationPrincipal("pin", "3-1"),
+		"--token-file " + a2aBusTokenPath + "/" + a2aBusTokenFile,
+		"--streams " + strings.Join(a2aProvisionedStreams, ","),
+		"--target " + a2aNATSName(m.agent) + "-0",
+	} {
+		if !strings.Contains(args, want) {
+			t.Errorf("command %q lacks %q", args, want)
+		}
+	}
+	var token bool
+	for _, v := range spec.Volumes {
+		if v.Projected == nil {
+			continue
+		}
+		for _, src := range v.Projected.Sources {
+			if src.ServiceAccountToken != nil {
+				token = src.ServiceAccountToken.Audience == a2aBusTokenAudience
+			}
+		}
+	}
+	if !token {
+		t.Error("no bus-audience token projected")
+	}
+	j := &batchv1.Job{}
+	if err := m.cl.Get(context.Background(), client.ObjectKey{Namespace: m.agent.Namespace, Name: name}, j); err != nil {
+		t.Fatal(err)
+	}
+	if d := j.Spec.ActiveDeadlineSeconds; d == nil || *d > 3300 || *d < 3200 {
+		t.Errorf("activeDeadlineSeconds %v, want the hour left less the margin", d)
+	}
+}
+
+// A transition creates the next phase's workload in the same pass: a failed
+// pin starts the unpin Job, which raises the streams back to three.
+func TestATransitionCreatesTheNextPhasesJob(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	m := newMigrationRig(t, busMigrationShrink, busMigrationPinning, 3, time.Now().Add(time.Hour))
+	m.finishJob("pin", batchv1.JobFailed)
+	m.pass(busMigrationUnpinning, 3)
+	spec, _, ok := m.workload("unpin")
+	if !ok {
+		t.Fatal("no unpin Job after the pin failed")
+	}
+	if args := strings.Join(spec.Containers[0].Command, " "); !strings.Contains(args, "bus-migrate unpin ") || !strings.Contains(args, "--replicas 3") ||
+		!strings.Contains(args, "--user "+busMigrationPrincipal("unpin", "3-1")) {
+		t.Errorf("unpin command %q", args)
+	}
+}
+
+// Without OPERATOR_IMAGE nothing runs, and the phase waits out the deadline.
+func TestNoOperatorImageRunsNothing(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "")
+	m := newMigrationRig(t, busMigrationShrink, busMigrationPinning, 3, time.Now().Add(time.Hour))
+	m.pass(busMigrationPinning, 3)
+	if _, _, ok := m.workload("pin"); ok {
+		t.Error("a pin Job with no image")
+	}
+}
+
+const (
+	busMigrationMapFixturePath        = "../../../a2a/authcallout/testdata/rendered-identity-map-migration.json"
+	busMigrationRestoreMapFixturePath = "../../../a2a/authcallout/testdata/rendered-identity-map-migration-restore.json"
+	busMigrationClearMapFixturePath   = "../../../a2a/authcallout/testdata/rendered-identity-map-migration-clear.json"
+)
+
+// The map mid-snapshot, as the callout reads it (a2a/authcallout:
+// migration_contract_test.go). The snapshot runs inside the write freeze, so
+// the map is exactly the stream identity, with its exact grants, and the
+// run's sentinel, both expiring at the run's deadline, and no other
+// principal: no gateway, agent, verifier, provisioner, profile or
+// dispatcher. The deadline is far off so the callout's real-server test can
+// still connect.
+func TestRenderedBusMigrationFixture(t *testing.T) {
+	withDispatcher(t)
+	agent := authMapTestAgent()
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), RunID: "3-1", Phase: string(busMigrationSnapshot),
+		Deadline: metav1.NewTime(time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC))}
+	cm, _ := singleA2AAuthMapShard(t, agent, nil)
+	rendered := cm.Data[a2aAuthMapKey]
+	var doc a2aAuthMapDocument
+	if err := json.Unmarshal([]byte(rendered), &doc); err != nil {
+		t.Fatal(err)
+	}
+	var users []string
+	for _, id := range doc.Identities {
+		users = append(users, id.User)
+		if id.NotAfter == nil || !id.NotAfter.Equal(agent.Status.BusMigration.Deadline.Time) {
+			t.Errorf("%s notAfter %v, want the run's deadline", id.User, id.NotAfter)
+		}
+	}
+	if want := []string{busMigrationPrincipal(busMigrationStreamIdentity, "3-1"), busMigrationPrincipal(busMigrationSentinelIdentity, "3-1")}; !slices.Equal(users, want) {
+		t.Errorf("the frozen map holds %v, want exactly %v", users, want)
+	}
+	checkFixture(t, busMigrationMapFixturePath, rendered)
+
+	// The same run in Restoring: the same identity, with the restore's
+	// grants instead of the snapshot's.
+	agent.Status.BusMigration.Phase = string(busMigrationRestoring)
+	cm, _ = singleA2AAuthMapShard(t, agent, nil)
+	checkFixture(t, busMigrationRestoreMapFixturePath, cm.Data[a2aAuthMapKey])
+
+	// And in Clearing: INFO and DELETE only.
+	agent.Status.BusMigration.Phase = string(busMigrationClearing)
+	cm, _ = singleA2AAuthMapShard(t, agent, nil)
+	checkFixture(t, busMigrationClearMapFixturePath, cm.Data[a2aAuthMapKey])
+}
+
+// The freeze holds from Freezing until Releasing begins: in every phase in
+// between the map is the phase's migration principal, if any, and the
+// sentinel; outside it (the three to one leg, Releasing, a finished run) the
+// map is the install's own.
+func TestTheFreezeMapsOnlyTheMigration(t *testing.T) {
+	frozen := []busMigrationPhase{busMigrationFreezing, busMigrationSnapshot, busMigrationHashing, busMigrationConverting,
+		busMigrationRestoring, busMigrationRollingBack, busMigrationRollbackRestoring, busMigrationFailed}
+	for _, phase := range frozen {
+		agent := authMapTestAgent()
+		agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), RunID: "3-1", Phase: string(phase), Deadline: metav1.NewTime(time.Now().Add(time.Hour))}
+		if phase == busMigrationFailed {
+			// Failed in the rollback: the freeze holds.
+			agent.Status.BusMigration.FailedIn = string(busMigrationRollbackRestoring)
+		}
+		doc, err := renderA2AAuthMap(agent, nil)
+		if err != nil {
+			t.Fatalf("%s: %v", phase, err)
+		}
+		want := map[string]bool{busMigrationPrincipal(busMigrationSentinelIdentity, "3-1"): true}
+		for _, id := range busMigrationIdentities(agent) {
+			want[id.user] = true
+		}
+		if len(doc.Identities) != len(want) {
+			t.Errorf("%s: %d entries, want %d", phase, len(doc.Identities), len(want))
+		}
+		for _, id := range doc.Identities {
+			if !want[id.User] {
+				t.Errorf("%s: %s is in the frozen map", phase, id.User)
+			}
+			if strings.HasPrefix(id.User, "migrate-frozen-") {
+				inbox := []string{"_INBOX." + id.User + ".>"}
+				if !slices.Equal(id.Grants.Publish, inbox) || !slices.Equal(id.Grants.Subscribe, inbox) || id.Narrowing != "" {
+					t.Errorf("%s: the sentinel grants %+v, want its own inbox only", phase, id.Grants)
+				}
+				if id.ServiceAccount != a2aServiceAccountName(agent.Namespace, busMigrationWorkloadName(agent, busMigrationSentinelIdentity, "3-1")) {
+					t.Errorf("%s: the sentinel is bound to %s", phase, id.ServiceAccount)
+				}
+			}
+		}
+	}
+	thawed := []struct {
+		leg      busMigrationLeg
+		phase    busMigrationPhase
+		failedIn busMigrationPhase
+		givenUp  bool
+	}{{busMigrationGrow, busMigrationReleasing, "", false}, {busMigrationGrow, busMigrationDone, "", false}, {busMigrationGrow, busMigrationAbandoned, "", false},
+		{busMigrationGrow, busMigrationFailed, busMigrationReleasing, false}, {busMigrationGrow, busMigrationFailed, busMigrationRollbackRestoring, true},
+		{busMigrationGrow, busMigrationFailed, "", false},
+		{busMigrationShrink, busMigrationPinning, "", false}, {busMigrationShrink, busMigrationShrinking, "", false}, {busMigrationShrink, busMigrationFailed, busMigrationUnpinning, false}}
+	for _, tc := range thawed {
+		agent := authMapTestAgent()
+		agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(tc.leg), RunID: "3-1", Phase: string(tc.phase), Deadline: metav1.NewTime(time.Now().Add(time.Hour)),
+			FailedIn: string(tc.failedIn), GivenUp: tc.givenUp}
+		doc, err := renderA2AAuthMap(agent, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var gateway, sentinel bool
+		for _, id := range doc.Identities {
+			gateway = gateway || id.User == "gateway" || id.User == a2aAgentBusUser
+			sentinel = sentinel || strings.HasPrefix(id.User, "migrate-frozen-")
+		}
+		if !gateway || sentinel {
+			t.Errorf("%s %s: install principals %v, sentinel %v; want the install's map", tc.leg, tc.phase, gateway, sentinel)
+		}
+	}
+}
+
+// The sentinel's ServiceAccount is never made: the operator refuses to
+// create it, and a sentinel ServiceAccount someone else made is left as it
+// is, never adopted (no owner reference, no label, no change).
+func TestTheSentinelsServiceAccountIsNeverMadeOrAdopted(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	m := newMigrationRig(t, busMigrationGrow, busMigrationFreezing, 1, time.Now().Add(time.Hour))
+	name := busMigrationWorkloadName(m.agent, busMigrationSentinelIdentity, "3-1")
+	planted := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: m.agent.Namespace}}
+	if err := m.cl.Create(context.Background(), planted); err != nil {
+		t.Fatal(err)
+	}
+	before := planted.ResourceVersion
+	// Walk every phase of the leg, creating each phase's work.
+	for _, phase := range []busMigrationPhase{busMigrationFreezing, busMigrationSnapshot, busMigrationHashing, busMigrationConverting,
+		busMigrationRestoring, busMigrationRollingBack, busMigrationRollbackRestoring, busMigrationReleasing} {
+		m.agent.Status.BusMigration.Phase = string(phase)
+		if err := m.r.ensureBusMigrationWorkload(context.Background(), m.agent, m.agent.Status.BusMigration, time.Now()); err != nil {
+			t.Fatalf("%s: %v", phase, err)
+		}
+	}
+	got := &corev1.ServiceAccount{}
+	if err := m.cl.Get(context.Background(), client.ObjectKeyFromObject(planted), got); err != nil {
+		t.Fatal(err)
+	}
+	if got.ResourceVersion != before || len(got.OwnerReferences) != 0 {
+		t.Errorf("the planted sentinel ServiceAccount was touched: rv %s->%s owners %v", before, got.ResourceVersion, got.OwnerReferences)
+	}
+	// And asked to make it, the operator refuses.
+	run := m.agent.Status.BusMigration
+	err := m.r.ensureBusMigrationWorkloadFor(context.Background(), m.agent, run, busMigrationWork{name: "x", identity: busMigrationSentinelIdentity, pod: true}, time.Now())
+	if err == nil || !strings.Contains(err.Error(), "sentinel") {
+		t.Errorf("creating the sentinel's ServiceAccount: %v, want a refusal", err)
+	}
+}
+
+// notAfter is refused on a narrowed entry here as the callout refuses it
+// there, so a render that put one there fails the reconcile rather than
+// the callout's parse.
+func TestNotAfterOnANarrowedEntryFailsTheRender(t *testing.T) {
+	deadline := time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC)
+	ids := []a2aAuthMapIdentity{{ServiceAccount: "system:serviceaccount:ns:s", User: "session", Account: a2aAccountApp, Narrowing: a2aNarrowingPod, NotAfter: &deadline}}
+	if err := validateA2AAuthMapIdentities(ids); err == nil || !strings.Contains(err.Error(), "notAfter") {
+		t.Errorf("validate error %v, want a refusal naming notAfter", err)
+	}
+}
+
+// Why a run turned back is kept in Cause and named in the condition: a phase
+// still running at the deadline, or a Job the API server stopped at its
+// activeDeadlineSeconds, says the deadline; any other failure says the phase
+// failed. The first cause is kept through the way back.
+func TestATurnedBackRunNamesItsCause(t *testing.T) {
+	late := newMigrationRig(t, busMigrationShrink, busMigrationPinning, 3, time.Now().Add(-time.Minute))
+	late.pass(busMigrationUnpinning, 3)
+	run := late.agent.Status.BusMigration
+	if run.ForwardDeadline == nil {
+		t.Fatal("turning back kept no forward deadline")
+	}
+	if want := "the Pinning phase was still running at the run's deadline, " + run.ForwardDeadline.UTC().Format(time.RFC3339); run.Cause != want {
+		t.Errorf("late pin cause %q, want %q", run.Cause, want)
+	}
+
+	stopped := newMigrationRig(t, busMigrationShrink, busMigrationPinning, 3, time.Now().Add(time.Hour))
+	j := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkloadName(stopped.agent, "pin", "3-1"), Namespace: stopped.agent.Namespace}}
+	stopped.own(j)
+	if err := stopped.cl.Create(context.Background(), j); err != nil {
+		t.Fatal(err)
+	}
+	j.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobFailed, Status: corev1.ConditionTrue, Reason: batchv1.JobReasonDeadlineExceeded}}
+	if err := stopped.cl.Status().Update(context.Background(), j); err != nil {
+		t.Fatal(err)
+	}
+	stopped.pass(busMigrationUnpinning, 3)
+	if c := stopped.agent.Status.BusMigration.Cause; !strings.Contains(c, "still running at the run's deadline") {
+		t.Errorf("a Job stopped at its deadline gives cause %q", c)
+	}
+
+	failed := newMigrationRig(t, busMigrationShrink, busMigrationPinning, 3, time.Now().Add(time.Hour))
+	failed.finishJob("pin", batchv1.JobFailed)
+	failed.pass(busMigrationUnpinning, 3)
+	if c := failed.agent.Status.BusMigration.Cause; c != "the Pinning phase failed" {
+		t.Errorf("failed pin cause %q", c)
+	}
+	// The unpin fails too: the run is Failed, and the cause stays the pin's.
+	failed.finishJob("unpin", batchv1.JobFailed)
+	failed.pass(busMigrationFailed, 3)
+	if c := failed.agent.Status.BusMigration.Cause; c != "the Pinning phase failed" {
+		t.Errorf("after the unpin failed, cause %q; want the first failure kept", c)
+	}
+	if cond, ok := busMigratingCondition(failed.agent); !ok || !strings.Contains(cond.Message, "(the Pinning phase failed)") {
+		t.Errorf("Failed condition %q does not name the cause", cond.Message)
+	}
+
+	done := newMigrationRig(t, busMigrationShrink, busMigrationAbandoned, 3, time.Now().Add(time.Hour))
+	done.agent.Status.BusMigration.Cause = "the Pinning phase failed"
+	if cond, ok := busMigratingCondition(done.agent); !ok || !strings.Contains(cond.Message, "(the Pinning phase failed)") {
+		t.Errorf("Abandoned condition %q does not name the cause", cond.Message)
+	}
+}
+
+// Nothing valid outlives the run's deadline, and the work stops first: a
+// step's principal expires at the deadline, and its Job is stopped minutes
+// before it, so a slow step fails on its own time limit, not on an
+// authorization error halfway through a stream.
+func TestAStepsJobStopsBeforeItsCredentialExpires(t *testing.T) {
+	now := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
+	agent := a2aTestAgent()
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationShrink), RunID: "3-1", Phase: string(busMigrationPinning),
+		Deadline: metav1.NewTime(now.Add(time.Hour))}
+	job := buildBusMigrationJob(agent, agent.Status.BusMigration, "pin", now)
+	jobEnd := now.Add(time.Duration(*job.Spec.ActiveDeadlineSeconds) * time.Second)
+	ids := busMigrationIdentities(agent)
+	if len(ids) != 1 || ids[0].notAfter == nil {
+		t.Fatalf("identities %+v", ids)
+	}
+	if !ids[0].notAfter.Equal(agent.Status.BusMigration.Deadline.Time) {
+		t.Errorf("the principal expires at %v; want the run's deadline %v", ids[0].notAfter, agent.Status.BusMigration.Deadline.Time)
+	}
+	if gap := ids[0].notAfter.Sub(jobEnd); gap < 5*time.Minute {
+		t.Errorf("the Job stops %v before its principal expires; want a margin of minutes", gap)
+	}
+}
+
+// provisionCreateLines is every `stream add` / `kv add` in the rendered
+// provision script, continuations joined, keyed by stream name, as flag maps.
+func provisionCreateLines(t *testing.T) map[string]map[string]string {
+	t.Helper()
+	script := buildA2AProvisionJob(a2aTestAgent()).Spec.Template.Spec.Containers[0].Command[2]
+	script = strings.ReplaceAll(script, "\\\n", " ")
+	lines := map[string]map[string]string{}
+	for _, line := range strings.Split(script, "\n") {
+		_, add, ok := strings.Cut(line, "|| $NATS ")
+		if !ok {
+			continue
+		}
+		f := strings.Fields(add)
+		if len(f) < 3 || f[1] != "add" || (f[0] != "stream" && f[0] != "kv") {
+			continue
+		}
+		name := f[2]
+		if f[0] == "kv" {
+			name = "KV_" + name
+		}
+		flags := map[string]string{"kind": f[0]}
+		for _, tok := range f[3:] {
+			k, v, _ := strings.Cut(strings.TrimPrefix(tok, "--"), "=")
+			flags[k] = strings.Trim(v, `'"`)
+		}
+		lines[name] = flags
+	}
+	if len(lines) == 0 {
+		t.Fatal("no create lines found in the provision script; this test would pass vacuously")
+	}
+	return lines
+}
+
+// The table the restore checks is the provision script, flag for flag: the
+// same streams, and every value the script passes on a policy field.
+func TestTheStreamPoliciesAreTheProvisionScripts(t *testing.T) {
+	lines := provisionCreateLines(t)
+	policies := a2aStreamPolicies(1)
+	var names []string
+	for _, p := range policies {
+		names = append(names, p.Name)
+	}
+	if !slices.Equal(names, a2aProvisionedStreams) {
+		t.Errorf("policy streams %v, provisioned %v", names, a2aProvisionedStreams)
+	}
+	dur := func(s string) time.Duration {
+		if s == "" {
+			return 0
+		}
+		d, err := time.ParseDuration(s)
+		if err != nil {
+			t.Fatalf("duration %q: %v", s, err)
+		}
+		return d
+	}
+	num := func(s string, absent int64) int64 {
+		if s == "" {
+			return absent
+		}
+		n, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			t.Fatalf("number %q: %v", s, err)
+		}
+		return n
+	}
+	for _, p := range policies {
+		f, ok := lines[p.Name]
+		if !ok {
+			t.Errorf("%s: no create line in the provision script", p.Name)
+			continue
+		}
+		if f["replicas"] != "${STREAM_REPLICAS}" {
+			t.Errorf("%s: replicas %q, want the run's STREAM_REPLICAS", p.Name, f["replicas"])
+		}
+		if !strings.EqualFold(f["storage"], p.Storage.String()) {
+			t.Errorf("%s: storage %q, policy %s", p.Name, f["storage"], p.Storage)
+		}
+		var want busmigrate.StreamPolicy
+		switch f["kind"] {
+		case "stream":
+			if f["retention"] != "limits" || f["discard"] != "old" {
+				t.Errorf("%s: retention %q discard %q", p.Name, f["retention"], f["discard"])
+			}
+			_, direct := f["allow-direct"]
+			want = busmigrate.StreamPolicy{Name: p.Name, Subjects: strings.Split(f["subjects"], ","), Retention: nats.LimitsPolicy, Storage: nats.FileStorage,
+				MaxBytes: num(f["max-bytes"], -1), MaxAge: dur(f["max-age"]), Discard: nats.DiscardOld, MaxMsgsPerSubject: num(f["max-msgs-per-subject"], -1),
+				AllowDirect: direct, Replicas: 1}
+		case "kv":
+			bucket := strings.TrimPrefix(p.Name, "KV_")
+			want = busmigrate.StreamPolicy{Name: p.Name, Subjects: []string{"$KV." + bucket + ".>"}, Retention: nats.LimitsPolicy, Storage: nats.FileStorage,
+				MaxBytes: num(f["max-bucket-size"], -1), MaxAge: dur(f["ttl"]), Discard: nats.DiscardNew, MaxMsgsPerSubject: num(f["history"], 1),
+				AllowRollup: true, DenyDelete: true, AllowDirect: true, Replicas: 1}
+		}
+		if !reflect.DeepEqual(p, want) {
+			t.Errorf("%s: policy\n %+v\nscript\n %+v", p.Name, p, want)
+		}
+	}
+}
+
+// The table's KV implications, and every value the script leaves to the
+// CLI's defaults, are what a fresh install creates (busmigrate's
+// fresh_streams.json, captured with the provision image's CLI against the
+// bus image's server): each reference stream passes its policy's Check.
+func TestTheStreamPoliciesMatchAFreshInstall(t *testing.T) {
+	fresh, err := busmigrate.LoadFreshStreams()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range a2aStreamPolicies(1) {
+		ref, ok := fresh.Streams[p.Name]
+		if !ok {
+			t.Errorf("%s: not in the fresh-install reference; regenerate it", p.Name)
+			continue
+		}
+		if d := p.Check(ref); len(d) != 0 {
+			t.Errorf("%s: a fresh install differs from the policy: %v", p.Name, d)
+		}
+	}
+}
+
+// The snapshot pod writes the staging claim as the stream identity; the
+// hashing pod reads it read-only and holds no bus credential, no token and
+// no API access; the restore and rollback pods read it read-only as the
+// stream identity, with the run Secret, ending at three and one replicas.
+func TestTheSnapshotWritesTheStageAndTheOthersReadIt(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	stage := func(spec corev1.PodSpec) (claim *corev1.PersistentVolumeClaimVolumeSource, mount *corev1.VolumeMount) {
+		for i := range spec.Volumes {
+			if spec.Volumes[i].PersistentVolumeClaim != nil {
+				claim = spec.Volumes[i].PersistentVolumeClaim
+				for j := range spec.Containers[0].VolumeMounts {
+					if spec.Containers[0].VolumeMounts[j].Name == spec.Volumes[i].Name {
+						mount = &spec.Containers[0].VolumeMounts[j]
+					}
+				}
+			}
+		}
+		return claim, mount
+	}
+	streamSA := busMigrationWorkloadName(a2aTestAgent(), busMigrationStreamIdentity, "3-1")
+	m := newMigrationRig(t, busMigrationGrow, busMigrationSnapshot, 1, time.Now().Add(time.Hour))
+	m.pass(busMigrationSnapshot, 1)
+	snap, meta, ok := m.workload("snapshot")
+	if !ok {
+		t.Fatal("no snapshot pod")
+	}
+	claim, mount := stage(snap)
+	if claim == nil || claim.ClaimName != busMigrationStageClaim(m.agent, "3-1") || claim.ReadOnly || mount == nil || mount.ReadOnly {
+		t.Errorf("snapshot stage claim %+v mount %+v, want %s read-write", claim, mount, busMigrationStageClaim(m.agent, "3-1"))
+	}
+	if args := strings.Join(snap.Containers[0].Command, " "); !strings.Contains(args, "bus-migrate snapshot ") || !strings.Contains(args, "--dir "+busMigrationStageMount) ||
+		!strings.Contains(args, "--user "+busMigrationPrincipal(busMigrationStreamIdentity, "3-1")) {
+		t.Errorf("snapshot command %q", args)
+	}
+	if snap.ServiceAccountName != streamSA || !ownedByAgent(meta, m.agent) || snap.ActiveDeadlineSeconds == nil || *snap.ActiveDeadlineSeconds > 3300 {
+		t.Errorf("snapshot pod SA %q owners %v deadline %v", snap.ServiceAccountName, meta.OwnerReferences, snap.ActiveDeadlineSeconds)
+	}
+
+	m.finishPod("snapshot", corev1.PodSucceeded, "", "")
+	m.pass(busMigrationHashing, 1)
+	hash, meta, ok := m.workload("hash")
+	if !ok {
+		t.Fatal("no hashing pod")
+	}
+	if !ownedByAgent(meta, m.agent) {
+		t.Errorf("hashing pod owners %v", meta.OwnerReferences)
+	}
+	claim, mount = stage(hash)
+	if claim == nil || !claim.ReadOnly || mount == nil || !mount.ReadOnly {
+		t.Errorf("hashing stage claim %+v mount %+v, want read-only", claim, mount)
+	}
+	if len(hash.Volumes) != 1 || len(hash.Containers[0].Env) != 0 || *hash.AutomountServiceAccountToken || hash.ServiceAccountName == streamSA {
+		t.Errorf("hashing pod carries more than the stage: SA %q volumes %v env %v", hash.ServiceAccountName, hash.Volumes, hash.Containers[0].Env)
+	}
+	if args := strings.Join(hash.Containers[0].Command, " "); !strings.HasPrefix(args, "/manager bus-hash --dir "+busMigrationStageMount) || strings.Contains(args, "--token-file") {
+		t.Errorf("hash command %q", args)
+	}
+
+	for kind, replicas := range map[string]string{"restore": "3", "rollback": "1"} {
+		phase, running := busMigrationRestoring, int32(3)
+		if kind == "rollback" {
+			phase, running = busMigrationRollbackRestoring, 1
+		}
+		r := newMigrationRig(t, busMigrationGrow, phase, running, time.Now().Add(time.Hour))
+		r.agent.Status.BusMigration.Abandoning = kind == "rollback"
+		r.agent.Status.BusMigration.Cleared = a2aProvisionedStreams
+		r.pass(phase, running)
+		spec, _, ok := r.workload(kind)
+		if !ok {
+			t.Fatalf("no %s pod", kind)
+		}
+		claim, mount := stage(spec)
+		if claim == nil || !claim.ReadOnly || mount == nil || !mount.ReadOnly {
+			t.Errorf("%s stage claim %+v mount %+v, want read-only", kind, claim, mount)
+		}
+		var secret *corev1.SecretVolumeSource
+		for _, v := range spec.Volumes {
+			if v.Secret != nil {
+				secret = v.Secret
+			}
+		}
+		if secret == nil || secret.SecretName != busMigrationRunSecret(r.agent, "3-1") || secret.DefaultMode == nil || *secret.DefaultMode != 0o440 {
+			t.Errorf("%s run Secret volume %+v", kind, secret)
+		}
+		args := strings.Join(spec.Containers[0].Command, " ")
+		if !strings.Contains(args, "bus-migrate restore ") || !strings.Contains(args, "--run-file "+busMigrationRunMount+"/"+busMigrationRunKey) ||
+			!strings.Contains(args, "--replicas "+replicas) || spec.ServiceAccountName != streamSA {
+			t.Errorf("%s command %q SA %q", kind, args, spec.ServiceAccountName)
+		}
+	}
+}
+
+// The staging claim is created with the snapshot pod: ReadWriteOncePod,
+// owned by the CR, on the default StorageClass, and big enough for every
+// provisioned stream full to its cap.
+func TestTheSnapshotPhaseCreatesAOnePodStage(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	m := newMigrationRig(t, busMigrationGrow, busMigrationSnapshot, 1, time.Now().Add(time.Hour))
+	m.pass(busMigrationSnapshot, 1)
+	pvc := &corev1.PersistentVolumeClaim{}
+	if err := m.cl.Get(context.Background(), client.ObjectKey{Namespace: m.agent.Namespace, Name: busMigrationStageClaim(m.agent, "3-1")}, pvc); err != nil {
+		t.Fatalf("no staging claim: %v", err)
+	}
+	if !slices.Equal(pvc.Spec.AccessModes, []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOncePod}) {
+		t.Errorf("access modes %v, want ReadWriteOncePod alone", pvc.Spec.AccessModes)
+	}
+	if pvc.Spec.StorageClassName != nil || !ownedByAgent(pvc.ObjectMeta, m.agent) {
+		t.Errorf("storage class %v owners %v", pvc.Spec.StorageClassName, pvc.OwnerReferences)
+	}
+	var caps int64
+	for _, p := range a2aStreamPolicies(1) {
+		caps += p.MaxBytes
+	}
+	got := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
+	if got.Value() < caps || got.Value() > caps*12/10 || got.Value()%(1<<30) != 0 {
+		t.Errorf("stage request %s for %d bytes of caps; want at least the caps, within 20%%, in whole GiB", got.String(), caps)
+	}
+	if got.String() != "15Gi" {
+		t.Errorf("stage request %s, want 15Gi for today's caps (13.0 GiB, 14.3 GiB with 10%% headroom)", got.String())
+	}
+}
+
+// When a run ends its ServiceAccounts go; the stage and run Secret go too,
+// unless it Failed, when they stay for the manual step.
+func TestARunsEndCleansUpWhatItMade(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		from      busMigrationPhase
+		running   int32
+		abandon   bool
+		finish    func(m *migrationRig)
+		end       busMigrationPhase
+		keepStage bool
+	}{
+		{"done", busMigrationReleasing, 3, false, func(m *migrationRig) { m.rollOut(3) }, busMigrationDone, false},
+		{"abandoned", busMigrationReleasing, 1, true, func(m *migrationRig) { m.rollOut(1) }, busMigrationAbandoned, false},
+		{"failed", busMigrationRollbackRestoring, 1, true, func(m *migrationRig) { m.finishPod("rollback", corev1.PodFailed, `{"error":"boom"}`, "") }, busMigrationFailed, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newMigrationRig(t, busMigrationGrow, tc.from, tc.running, time.Now().Add(time.Hour))
+			m.agent.Status.BusMigration.Abandoning = tc.abandon
+			ns := m.agent.Namespace
+			made := []client.Object{
+				&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkloadName(m.agent, busMigrationStreamIdentity, "3-1"), Namespace: ns}},
+				&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkloadName(m.agent, "hash", "3-1"), Namespace: ns}},
+				&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: busMigrationRunSecret(m.agent, "3-1"), Namespace: ns}},
+				&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: busMigrationStageClaim(m.agent, "3-1"), Namespace: ns}},
+			}
+			for _, o := range made {
+				m.own(o)
+				if err := m.cl.Create(context.Background(), o); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// One under a run identity's name that someone else made: never
+			// the run's, so never its to delete.
+			planted := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkloadName(m.agent, "pin", "3-1"), Namespace: ns}}
+			if err := m.cl.Create(context.Background(), planted); err != nil {
+				t.Fatal(err)
+			}
+			tc.finish(m)
+			if err := m.r.resolveA2ABusReplicas(context.Background(), m.agent); err != nil {
+				t.Fatal(err)
+			}
+			if got := busMigrationPhase(m.agent.Status.BusMigration.Phase); got != tc.end {
+				t.Fatalf("phase %s, want %s", got, tc.end)
+			}
+			if tc.end == busMigrationFailed && (m.agent.Status.BusMigration.FailedIn != string(tc.from) || !busMigrationFreezeActive(m.agent)) {
+				t.Errorf("failed in %q, frozen %v; want %s and the freeze held", m.agent.Status.BusMigration.FailedIn, busMigrationFreezeActive(m.agent), tc.from)
+			}
+			for _, o := range made {
+				err := m.cl.Get(context.Background(), client.ObjectKeyFromObject(o), o)
+				_, isSA := o.(*corev1.ServiceAccount)
+				keep := !isSA && tc.keepStage
+				if keep && err != nil {
+					t.Errorf("%T %s was removed from a Failed run", o, o.GetName())
+				}
+				if !keep && err == nil {
+					t.Errorf("%T %s is still there after the run ended %s", o, o.GetName(), tc.end)
+				}
+			}
+			if err := m.cl.Get(context.Background(), client.ObjectKeyFromObject(planted), planted); err != nil {
+				t.Errorf("a ServiceAccount the PlatformAgent doesn't control was deleted by the cleanup: %v", err)
+			}
+		})
+	}
+}
+
+// The operator may not list or watch Secrets, so the run Secret is read
+// uncached (a2aReader): here the cached client refuses any Secret read, and
+// the hashing phase still writes the Secret and moves on.
+func TestTheRunSecretIsReadUncached(t *testing.T) {
+	m := newMigrationRig(t, busMigrationGrow, busMigrationHashing, 1, time.Now().Add(time.Hour))
+	m.finishPod("hash", corev1.PodSucceeded, validDigests(), "")
+	m.r.APIReader = m.cl
+	m.r.Client = interceptor.NewClient(m.cl.(client.WithWatch), interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*corev1.Secret); ok {
+				return fmt.Errorf("secrets is forbidden: cannot list or watch")
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
+	m.pass(busMigrationClearing, 1)
+}
+
+// The pin Job is read uncached: a cached read would start a cluster-wide
+// Job informer the operator otherwise never runs.
+func TestTheMigrationJobsAreReadUncached(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	m := newMigrationRig(t, busMigrationShrink, busMigrationPinning, 3, time.Now().Add(time.Hour))
+	m.r.APIReader = m.cl
+	m.r.Client = interceptor.NewClient(m.cl.(client.WithWatch), interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*batchv1.Job); ok {
+				return fmt.Errorf("a cached Job read")
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	})
+	if err := m.r.resolveA2ABusReplicas(context.Background(), m.agent); err != nil {
+		t.Fatalf("a Pinning pass: %v", err)
+	}
+}
+
+// Nothing the operator renders for the namespace can make the freeze
+// sentinel's ServiceAccount, mint a token for any ServiceAccount, or run a
+// pod as a migration identity: no rule grants serviceaccounts create,
+// serviceaccounts/token create, or a wildcard; pods create is the gateway's
+// alone, and the chart's admission policy pins every pod the gateway makes
+// to the session ServiceAccount. So the sentinel stays an identity nothing
+// holds, and the migration identities stay the operator's pods'. Every
+// pod-bearing and RBAC builder of this package is listed here (the walk's
+// own guard covers the pod builders).
+func TestNoRenderedPrincipalCanMakeOrBorrowAMigrationIdentity(t *testing.T) {
+	agent := a2aTestAgent()
+	roles := map[string][]rbacv1.PolicyRule{
+		"buildA2ACalloutRole":                  buildA2ACalloutRole(agent, 1).Rules,
+		"buildA2ADispatcherConfigRole":         buildA2ADispatcherConfigRole(agent).Rules,
+		"buildA2ADispatcherPodsRole":           buildA2ADispatcherPodsRole(agent).Rules,
+		"buildA2AGatewayRole":                  buildA2AGatewayRole(agent).Rules,
+		"buildCredentialBrokerTokenReviewRole": buildCredentialBrokerTokenReviewRole(agent).Rules,
+		"buildMinimalPlatformRole":             buildMinimalPlatformRole(agent).Rules,
+		"buildPlatformLocalRole":               buildPlatformLocalRole(agent).Rules,
+		"buildPlatformLeaderRole":              buildPlatformLeaderRole(agent).Rules,
+		"buildScopePublisherRole":              buildScopePublisherRole(agent).Rules,
+		"buildA2ADispatcherJobsRole":           buildA2ADispatcherJobsRole(agent).Rules,
+		"buildMinimalPlatformRoleWithSecrets":  buildMinimalPlatformRoleWithSecrets(agent, true).Rules,
+	}
+	if got := buildersReturning(t, map[string]bool{"Role": true, "ClusterRole": true}); len(got) != len(roles) {
+		var names []string
+		for n := range got {
+			names = append(names, n)
+		}
+		t.Fatalf("RBAC builders in the package %v, checked here %d; list the new one", names, len(roles))
+	}
+	grants := func(r rbacv1.PolicyRule, resource, verb string) bool {
+		return (slices.Contains(r.Resources, resource) || slices.Contains(r.Resources, "*")) && (slices.Contains(r.Verbs, verb) || slices.Contains(r.Verbs, "*"))
+	}
+	for name, rules := range roles {
+		for _, r := range rules {
+			if slices.Contains(r.APIGroups, "*") || slices.Contains(r.Resources, "*") || slices.Contains(r.Verbs, "*") {
+				t.Errorf("%s has a wildcard rule: %+v", name, r)
+			}
+			if grants(r, "serviceaccounts", "create") || grants(r, "serviceaccounts/token", "create") {
+				t.Errorf("%s may create ServiceAccounts or their tokens: %+v", name, r)
+			}
+			if grants(r, "pods", "create") && name != "buildA2AGatewayRole" {
+				t.Errorf("%s may create pods, and so run one as any ServiceAccount: %+v", name, r)
+			}
+		}
+	}
+	policy, err := os.ReadFile("../../../charts/kube-agents/templates/a2a-gateway-pod-admission-policy.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(policy), `object.spec.serviceAccountName == variables.sessionAccount`) {
+		t.Error("the gateway pod admission policy no longer pins the gateway's pods to the session ServiceAccount")
+	}
+}
+
+// The bad ordering: a bus that restarts before the callout confirmed the
+// freeze (a drain, say) is not the restart into it. Freezing waits, the bus
+// is not rendered for the freeze, and no snapshot starts, however long the
+// rolled-out bus sits there.
+func TestARestartBeforeTheCalloutConfirmsIsNotTheFreeze(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	m := newMigrationRig(t, busMigrationGrow, busMigrationFreezing, 1, time.Now().Add(time.Hour))
+	m.calloutPods(2, false, true) // the old template: not yet serving the frozen map
+	m.rollOut(1)                  // an early restart
+	for i := 0; i < 3; i++ {
+		m.pass(busMigrationFreezing, 1)
+	}
+	if m.agent.Status.BusMigration.FreezeConfirmed || busMigrationFreezeConfigured(m.agent) {
+		t.Fatal("the freeze was confirmed with no callout replica serving its map")
+	}
+	if _, _, ok := m.workload("snapshot"); ok {
+		t.Fatal("a snapshot started before the freeze was confirmed")
+	}
+	// Once confirmed, the same early restart still does not count: only a
+	// restart onto the frozen template does.
+	m.calloutPods(2, true, true)
+	m.pass(busMigrationFreezing, 1)
+	if !m.agent.Status.BusMigration.FreezeConfirmed {
+		t.Fatal("the freeze was not confirmed with every callout replica serving it")
+	}
+	m.pass(busMigrationFreezing, 1)
+	m.rollOut(1)
+	m.pass(busMigrationSnapshot, 1)
+}
+
+// The confirmation wants every callout replica on the frozen map: too few
+// annotated, one not ready, or any pod left from the old template
+// (terminating included) is not enough.
+func TestTheFreezeNeedsEveryCalloutReplica(t *testing.T) {
+	ctx := context.Background()
+	for name, setup := range map[string]func(m *migrationRig){
+		"one of two": func(m *migrationRig) { m.calloutPods(1, true, true) },
+		"not ready":  func(m *migrationRig) { m.calloutPods(2, true, false) },
+		"no callout": func(m *migrationRig) {},
+		"an old pod left": func(m *migrationRig) {
+			m.calloutPods(2, true, true)
+			old := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "callout-old", Namespace: m.agent.Namespace, Labels: a2aCalloutPodSelector(m.agent),
+				Finalizers: []string{"test/keep"}}}
+			if err := m.cl.Create(ctx, old); err != nil {
+				t.Fatal(err)
+			}
+			if err := m.cl.Delete(ctx, old); err != nil { // terminating, held by the finalizer
+				t.Fatal(err)
+			}
+		},
+	} {
+		m := newMigrationRig(t, busMigrationGrow, busMigrationFreezing, 1, time.Now().Add(time.Hour))
+		setup(m)
+		m.pass(busMigrationFreezing, 1)
+		if m.agent.Status.BusMigration.FreezeConfirmed {
+			t.Errorf("%s: the freeze was confirmed", name)
+		}
+	}
+}
+
+// A callout that never serves the frozen map (refused at start, with no
+// earlier map in a fresh pod, so never ready) does not hang the run: at the
+// deadline Freezing fails into the way back, which releases the freeze with
+// nothing changed, and the cause names the deadline.
+func TestAFreezeTheCalloutNeverServesEndsAtTheDeadline(t *testing.T) {
+	m := newMigrationRig(t, busMigrationGrow, busMigrationFreezing, 1, time.Now().Add(-time.Minute))
+	m.calloutPods(2, true, false)
+	m.pass(busMigrationReleasing, 1)
+	run := m.agent.Status.BusMigration
+	if !run.Abandoning || !strings.Contains(run.Cause, "the Freezing phase was still running at the run's deadline") {
+		t.Errorf("abandoning %v cause %q", run.Abandoning, run.Cause)
+	}
+	m.rollOut(1)
+	m.pass(busMigrationAbandoned, 1)
+}
+
+// The renders on each side of the confirmation. In the freeze, the callout's
+// template carries the run and requires the frozen map's exact version to
+// be ready. Confirmed, nats.conf drops every APP static user, auth_users
+// lists only the callout's user and SYS's, the callout's reserved names do
+// not change, and the bus's template carries the run. Before the
+// confirmation, and in Releasing, none of it.
+func TestTheFreezeRenders(t *testing.T) {
+	keys := a2aTestCalloutKeys(t)
+	agent := a2aTestAgent()
+	normalConf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), keys, nil).Data["nats.conf"])
+	normalReserved := renderA2AReservedPrincipals(agent)
+	// The callout carries the run's annotation through the freeze, and the
+	// frozen map's version for its readiness only until the freeze is
+	// confirmed: after that the version moves with each phase's identities.
+	for _, tc := range []struct {
+		phase                                   busMigrationPhase
+		confirmed                               bool
+		calloutAnnotated, expectEnv, confFrozen bool
+	}{
+		{busMigrationFreezing, false, true, true, false},
+		{busMigrationFreezing, true, true, false, true},
+		{busMigrationRestoring, true, true, false, true},
+		{busMigrationReleasing, true, false, false, false},
+	} {
+		a := a2aTestAgent()
+		a.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), RunID: "3-1", Phase: string(tc.phase),
+			Deadline: metav1.NewTime(time.Now().Add(time.Hour)), FreezeConfirmed: tc.confirmed}
+		name := fmt.Sprintf("%s confirmed=%v", tc.phase, tc.confirmed)
+
+		dep := buildA2ACalloutDeployment(a, "pub", 1)
+		var env string
+		for _, e := range dep.Spec.Template.Spec.Containers[0].Env {
+			if e.Name == a2aCalloutExpectMapVersionEnv {
+				env = e.Value
+			}
+		}
+		frozenVersion, _ := renderA2AAuthMap(a, nil)
+		if got := dep.Spec.Template.Annotations[a2aBusFreezeAnnotation] == "3-1"; got != tc.calloutAnnotated {
+			t.Errorf("%s: callout annotated %v (%q)", name, got, dep.Spec.Template.Annotations[a2aBusFreezeAnnotation])
+		}
+		if got := env != "" && env == frozenVersion.Version; got != tc.expectEnv || (!tc.expectEnv && env != "") {
+			t.Errorf("%s: expected-version env %q (frozen map %q), want set=%v", name, env, frozenVersion.Version, tc.expectEnv)
+		}
+
+		conf := string(buildA2ANATSConfigSecret(a, a2aTestCreds(), keys, nil).Data["nats.conf"])
+		sts := buildA2ANATSStatefulSet(a, "h")
+		if !tc.confFrozen {
+			if conf != normalConf || busNATSFrozenFor(sts) != "" {
+				t.Errorf("%s: the bus is rendered for the freeze", name)
+			}
+			continue
+		}
+		for _, id := range staticIdentities(a) {
+			present := strings.Contains(conf, "user: "+id.user+"\n")
+			if id.account != a2aAccountSys && present {
+				t.Errorf("%s: %s user %s is still in nats.conf", name, id.account, id.user)
+			}
+			if id.account == a2aAccountSys && !present {
+				t.Errorf("%s: %s user %s is gone from nats.conf", name, id.account, id.user)
+			}
+		}
+		if !strings.Contains(conf, "user: "+a2aCalloutConfUser+"\n") {
+			t.Errorf("%s: the callout's own user is gone", name)
+		}
+		// By name, whichever account each is in after the split: the
+		// callout's own user (its AUTH account, outside the static list)
+		// and SYS's stay; every application user goes.
+		for _, user := range []string{a2aCalloutConfUser, "sys"} {
+			if !strings.Contains(conf, "user: "+user+"\n") {
+				t.Errorf("%s: %s is gone from the frozen nats.conf", name, user)
+			}
+		}
+		for _, user := range []string{"gateway", "seed", "web", "bridge", "console", "console-mcp"} {
+			if strings.Contains(conf, "user: "+user+"\n") {
+				t.Errorf("%s: %s is still in the frozen nats.conf", name, user)
+			}
+		}
+		if !strings.Contains(conf, "auth_users: [ "+a2aCalloutConfUser+a2aAuthUsersSeparator+"sys ]") {
+			t.Errorf("%s: auth_users is not the callout's and SYS's:\n%s", name, conf)
+		}
+		if renderA2AReservedPrincipals(a) != normalReserved {
+			t.Errorf("%s: the callout's reserved names changed", name)
+		}
+		if busNATSFrozenFor(sts) != "3-1" {
+			t.Errorf("%s: the bus template is not stamped for the run", name)
+		}
+	}
+}
+
+// Past the confirmation the callout's pod template is the same in every
+// phase of the freeze, so the callout is not rolled at each phase while its
+// pods connect.
+func TestTheConfirmedFreezeDoesNotRollTheCalloutPerPhase(t *testing.T) {
+	var first string
+	for _, phase := range []busMigrationPhase{busMigrationSnapshot, busMigrationHashing, busMigrationClearing, busMigrationConverting, busMigrationRestoring, busMigrationRollingBack, busMigrationRollbackRestoring} {
+		a := a2aTestAgent()
+		a.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), RunID: "3-1", Phase: string(phase),
+			Deadline: metav1.NewTime(time.Now().Add(time.Hour)), FreezeConfirmed: true}
+		b, err := json.Marshal(buildA2ACalloutDeployment(a, "pub", 1).Spec.Template)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if first == "" {
+			first = string(b)
+		} else if string(b) != first {
+			t.Errorf("%s: the callout's pod template differs from the freeze's first confirmed phase, so it rolls", phase)
+		}
+	}
+}
+
+// A pass that rendered the frozen bus and then failed before its status
+// write leaves a bus restarted into the freeze with no confirmation on
+// record. If the callout no longer serves the freeze by then, Freezing does
+// not complete on that restart.
+func TestAFrozenRestartWithoutAConfirmationOnRecordWaits(t *testing.T) {
+	m := newMigrationRig(t, busMigrationGrow, busMigrationFreezing, 1, time.Now().Add(time.Hour))
+	m.agent.Status.BusMigration.FreezeConfirmed = true
+	m.rollOut(1) // rendered and restarted into the freeze
+	m.agent.Status.BusMigration.FreezeConfirmed = false
+	m.calloutPods(2, false, true)
+	m.pass(busMigrationFreezing, 1)
+}
+
+// failedRig is a run Failed in failedIn, a while ago (its deadline passed).
+func failedRig(t *testing.T, leg busMigrationLeg, failedIn busMigrationPhase, running int32) *migrationRig {
+	t.Helper()
+	m := newMigrationRig(t, leg, busMigrationFailed, running, time.Now().Add(-time.Hour))
+	run := m.agent.Status.BusMigration
+	run.FailedIn, run.Abandoning, run.Cause = string(failedIn), true, "the "+string(failedIn)+" phase failed"
+	run.Cleared = a2aProvisionedStreams // the way back cleared the cluster first
+	run.FreezeConfirmed = leg == busMigrationGrow
+	return m
+}
+
+// A one to three run given up at or after its forward clear keeps the staging
+// claim and the run Secret: the clear emptied the single server, and whatever
+// a restore put back may be partial, so the claim may hold the only full copy.
+// Its pods go, so a person can mount the claim, and the condition names it.
+// Before the forward clear the single server still has every stream, and the
+// give-up deletes them as before.
+func TestAGiveUpAfterTheForwardClearKeepsTheStage(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	for _, tc := range []struct {
+		failedIn   busMigrationPhase
+		abandoning bool
+		keep       bool
+	}{
+		{busMigrationClearing, false, true},
+		{busMigrationClearing, true, true},
+		{busMigrationRollingBack, true, true},
+		{busMigrationRollbackRestoring, true, true},
+		{busMigrationRestoring, false, true},
+		{busMigrationReleasing, true, true},
+		{busMigrationFreezing, false, false},
+		{busMigrationSnapshot, false, false},
+		{busMigrationHashing, false, false},
+	} {
+		m := failedRig(t, busMigrationGrow, tc.failedIn, 1)
+		m.agent.Spec.Harness.Tuning.BusReplicas = ptr.To(1)
+		run := m.agent.Status.BusMigration
+		run.Abandoning = tc.abandoning
+		stage := []client.Object{
+			&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: busMigrationRunSecret(m.agent, "3-1"), Namespace: m.agent.Namespace}},
+			&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: busMigrationStageClaim(m.agent, "3-1"), Namespace: m.agent.Namespace}},
+		}
+		for _, o := range stage {
+			m.own(o)
+			if err := m.cl.Create(context.Background(), o); err != nil {
+				t.Fatal(err)
+			}
+		}
+		pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkloadName(m.agent, "snapshot", "3-1"), Namespace: m.agent.Namespace, Labels: a2aLabels(m.agent, busMigrationComponent)}}
+		m.own(pod)
+		if err := m.cl.Create(context.Background(), pod); err != nil {
+			t.Fatal(err)
+		}
+		m.agent.Annotations = map[string]string{a2aBusMigrationAbandonAnnotation: "3-1"}
+		if err := m.r.resolveA2ABusReplicas(context.Background(), m.agent); err != nil {
+			t.Fatal(err)
+		}
+		for _, o := range stage {
+			err := m.cl.Get(context.Background(), client.ObjectKeyFromObject(o), o)
+			if kept := err == nil; kept != tc.keep {
+				t.Errorf("given up in %s (abandoning %v): %T %s kept %v, want %v", tc.failedIn, tc.abandoning, o, o.GetName(), kept, tc.keep)
+			}
+		}
+		if err := m.cl.Get(context.Background(), client.ObjectKey{Namespace: m.agent.Namespace, Name: busMigrationWorkloadName(m.agent, "snapshot", "3-1")}, &corev1.Pod{}); err == nil {
+			t.Errorf("given up in %s: the snapshot pod is left holding the stage", tc.failedIn)
+		}
+		cond, _ := busMigratingCondition(m.agent)
+		if names := strings.Contains(cond.Message, busMigrationStageClaim(m.agent, "3-1")); names != tc.keep {
+			t.Errorf("given up in %s: the condition names the kept claim %v, want %v: %q", tc.failedIn, names, tc.keep, cond.Message)
+		}
+	}
+}
+
+// A retry annotation naming the run's next attempt puts the run back on the
+// way it failed on, from its start, with a fresh deadline its identity
+// expires at, and records the attempt; the same value never retries twice;
+// at most three attempts; a value naming another run or attempt is ignored.
+func TestARetryRerunsTheWayBack(t *testing.T) {
+	for _, tc := range []struct {
+		leg      busMigrationLeg
+		failedIn busMigrationPhase
+		running  int32
+		back     busMigrationPhase
+	}{
+		{busMigrationGrow, busMigrationRollbackRestoring, 1, busMigrationRollingBack},
+		{busMigrationGrow, busMigrationRollingBack, 1, busMigrationRollingBack},
+		{busMigrationShrink, busMigrationUnpinning, 3, busMigrationUnpinning},
+	} {
+		name := fmt.Sprintf("%s from %s", tc.leg, tc.failedIn)
+		m := failedRig(t, tc.leg, tc.failedIn, tc.running)
+		for _, wrong := range []string{"9-9-1", "3-1-2", "3-1", ""} {
+			m.agent.Annotations = map[string]string{a2aBusMigrationRetryAnnotation: wrong}
+			m.pass(busMigrationFailed, tc.running)
+		}
+		before := time.Now()
+		m.agent.Annotations = map[string]string{a2aBusMigrationRetryAnnotation: "3-1-1"}
+		m.pass(tc.back, tc.running)
+		run := m.agent.Status.BusMigration
+		if len(run.Retries) != 1 || run.Retries[0].FailedIn != string(tc.failedIn) || run.Retries[0].Cause == "" || run.FailedIn != "" || run.Cause != "" {
+			t.Errorf("%s: after the retry: %+v", name, run)
+		}
+		if run.Deadline.Time.Before(before.Add(busMigrationRunDeadline - time.Minute)) {
+			t.Errorf("%s: deadline %v, want a fresh one", name, run.Deadline)
+		}
+		if ids := busMigrationIdentities(m.agent); tc.back == busMigrationUnpinning && (len(ids) != 1 || !ids[0].notAfter.Equal(run.Deadline.Time)) {
+			t.Errorf("%s: the identity's notAfter does not follow the new deadline: %+v", name, ids)
+		}
+		// It fails again: the same annotation, still set, does not retry.
+		run.Phase, run.FailedIn, run.Cause = string(busMigrationFailed), string(tc.failedIn), "again"
+		m.pass(busMigrationFailed, tc.running)
+		// Up to three attempts, each its own value; then none.
+		for attempt := 2; attempt <= 4; attempt++ {
+			m.agent.Annotations = map[string]string{a2aBusMigrationRetryAnnotation: fmt.Sprintf("3-1-%d", attempt)}
+			if attempt == 4 {
+				m.pass(busMigrationFailed, tc.running)
+				break
+			}
+			m.pass(tc.back, tc.running)
+			m.agent.Status.BusMigration.Phase, m.agent.Status.BusMigration.FailedIn = string(busMigrationFailed), string(tc.failedIn)
+		}
+		if n := len(m.agent.Status.BusMigration.Retries); n != busMigrationMaxRetries {
+			t.Errorf("%s: %d retries recorded, want the cap of %d", name, n, busMigrationMaxRetries)
+		}
+	}
+	// A failure with no way back to retry is not retried.
+	m := failedRig(t, busMigrationGrow, busMigrationReleasing, 3)
+	m.agent.Annotations = map[string]string{a2aBusMigrationRetryAnnotation: "3-1-1"}
+	m.pass(busMigrationFailed, 3)
+}
+
+// A failed rollback keeps the freeze, holds the provision Job and blocks any
+// new migration through unrelated spec changes; only the abandon annotation
+// naming the run gives it up, lifting the freeze and the hold.
+func TestOnlyAnAbandonNamingTheRunLiftsAFailedFreeze(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	m := failedRig(t, busMigrationGrow, busMigrationRollbackRestoring, 1)
+	frozen := func() bool { return busMigrationFreezeActive(m.agent) && busMigrationHoldsProvision(m.agent) }
+	m.pass(busMigrationFailed, 1)
+	if !frozen() {
+		t.Fatal("a failed rollback lifted the freeze")
+	}
+	// An unrelated spec change, and one asking for a count: nothing lifts,
+	// nothing starts.
+	m.agent.Generation++
+	m.agent.Spec.Harness.Tuning.BusReplicas = ptr.To(3)
+	m.pass(busMigrationFailed, 1)
+	if !frozen() || m.agent.Status.BusMigration.RunID != "3-1" {
+		t.Fatalf("a spec change lifted the freeze or started run %s", m.agent.Status.BusMigration.RunID)
+	}
+	m.agent.Annotations = map[string]string{a2aBusMigrationAbandonAnnotation: "9-9"}
+	m.pass(busMigrationFailed, 1)
+	if !frozen() {
+		t.Fatal("an abandon naming another run lifted the freeze")
+	}
+	// Given up while the spec asks for three, the run's own target: nothing
+	// new starts until a person asks, naming the run.
+	m.agent.Annotations = map[string]string{a2aBusMigrationAbandonAnnotation: "3-1"}
+	m.pass(busMigrationFailed, 1)
+	// Asked to start again, it waits for the bus's provisioning after the
+	// give-up, then starts.
+	m.agent.Annotations[a2aBusMigrationStartAnnotation] = "3-1"
+	meta.RemoveStatusCondition(&m.agent.Status.Conditions, busProvisionedConditionType)
+	m.pass(busMigrationFailed, 1)
+	setBusProvisionedCondition(m.agent, true, "provision-job", metav1.Now())
+	m.pass(busMigrationFreezing, 1)
+	if m.agent.Status.BusMigration.RunID == "3-1" {
+		t.Error("no new run after giving the failed one up")
+	}
+
+	// Given up with nothing more asked: the freeze and the hold lift, and
+	// the map is the install's again. The staging claim and run Secret stay:
+	// a give-up after the forward clear keeps them
+	// (TestAGiveUpAfterTheForwardClearKeepsTheStage).
+	g := failedRig(t, busMigrationGrow, busMigrationRollbackRestoring, 1)
+	g.agent.Spec.Harness.Tuning.BusReplicas = ptr.To(1)
+	kept := []client.Object{
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: busMigrationRunSecret(g.agent, "3-1"), Namespace: g.agent.Namespace}},
+		&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: busMigrationStageClaim(g.agent, "3-1"), Namespace: g.agent.Namespace}},
+	}
+	for _, o := range kept {
+		g.own(o)
+		if err := g.cl.Create(context.Background(), o); err != nil {
+			t.Fatal(err)
+		}
+	}
+	g.agent.Annotations = map[string]string{a2aBusMigrationAbandonAnnotation: "3-1"}
+	g.pass(busMigrationFailed, 1)
+	for _, o := range kept {
+		if err := g.cl.Get(context.Background(), client.ObjectKeyFromObject(o), o); err != nil {
+			t.Errorf("%T %s deleted by a give-up after the forward clear: %v", o, o.GetName(), err)
+		}
+	}
+	if !g.agent.Status.BusMigration.GivenUp || busMigrationFreezeActive(g.agent) || busMigrationHoldsProvision(g.agent) {
+		t.Errorf("after the abandon: %+v", g.agent.Status.BusMigration)
+	}
+	doc, err := renderA2AAuthMap(g.agent, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gateway bool
+	for _, id := range doc.Identities {
+		gateway = gateway || id.User == "gateway" || id.User == a2aAgentBusUser
+	}
+	if !gateway {
+		t.Error("the map after giving up is not the install's")
+	}
+}
+
+// The Failed condition names both annotations with their exact values, what
+// giving up loses, and the retries left.
+func TestTheFailedConditionNamesTheWayOut(t *testing.T) {
+	m := failedRig(t, busMigrationGrow, busMigrationRollbackRestoring, 1)
+	cond, _ := busMigratingCondition(m.agent)
+	for _, want := range []string{
+		a2aBusMigrationRetryAnnotation + "=3-1-1", "3 of 3 left",
+		a2aBusMigrationAbandonAnnotation + "=3-1", "lifts the write freeze and recreates every stream the run did not put back, empty",
+		"no other migration starts",
+	} {
+		if !strings.Contains(cond.Message, want) {
+			t.Errorf("Failed condition %q lacks %q", cond.Message, want)
+		}
+	}
+	m.agent.Status.BusMigration.Retries = make([]agentv1alpha1.BusMigrationRetry, busMigrationMaxRetries)
+	if cond, _ := busMigratingCondition(m.agent); !strings.Contains(cond.Message, "No retries are left") || strings.Contains(cond.Message, a2aBusMigrationRetryAnnotation) {
+		t.Errorf("retries exhausted: %q", cond.Message)
+	}
+	m.agent.Status.BusMigration.GivenUp = true
+	if cond, _ := busMigratingCondition(m.agent); !strings.Contains(cond.Message, "given up") {
+		t.Errorf("given up: %q", cond.Message)
+	}
+}
+
+// A one to three run that fails going forward, in Releasing (the restart out
+// of the freeze never completed), stopped on a converted cluster holding R3
+// streams: it stays at three servers, never rendered back to one over them.
+func TestAOneToThreeRunFailedInReleasingStaysAtThree(t *testing.T) {
+	m := newMigrationRig(t, busMigrationGrow, busMigrationReleasing, 3, time.Now().Add(-time.Minute))
+	m.pass(busMigrationFailed, 3)
+	if m.agent.Status.BusMigration.FailedIn != string(busMigrationReleasing) {
+		t.Errorf("failed in %q", m.agent.Status.BusMigration.FailedIn)
+	}
+	m.pass(busMigrationFailed, 3)
+}
+
+// A retry runs fresh work: the failed attempt's rollback pod (or unpin Job)
+// is still on the cluster, owned by the CR for its logs, and the retry
+// neither reads it as its own outcome nor collides with its name.
+func TestARetryRunsFreshWorkNotTheFailedAttempts(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	m := failedRig(t, busMigrationGrow, busMigrationRollbackRestoring, 1)
+	m.finishPod("rollback", corev1.PodFailed, `{"error":"boom"}`, "") // the failed attempt's pod
+	m.agent.Annotations = map[string]string{a2aBusMigrationRetryAnnotation: "3-1-1"}
+	m.pass(busMigrationRollingBack, 1)
+	m.rollOut(1)
+	m.pass(busMigrationRollbackRestoring, 1)
+	m.pass(busMigrationRollbackRestoring, 1) // the old Failed pod is not this attempt's outcome
+	retried := busMigrationWorkName(m.agent, m.agent.Status.BusMigration, "rollback")
+	if retried == busMigrationWorkloadName(m.agent, "rollback", "3-1") {
+		t.Fatalf("the retry's pod has the failed attempt's name %s", retried)
+	}
+	if err := m.cl.Get(context.Background(), client.ObjectKey{Namespace: m.agent.Namespace, Name: retried}, &corev1.Pod{}); err != nil {
+		t.Errorf("no fresh rollback pod %s for the retry: %v", retried, err)
+	}
+
+	u := failedRig(t, busMigrationShrink, busMigrationUnpinning, 3)
+	u.finishJob("unpin", batchv1.JobFailed) // the failed attempt's Job, still there
+	u.agent.Annotations = map[string]string{a2aBusMigrationRetryAnnotation: "3-1-1"}
+	u.pass(busMigrationUnpinning, 3)
+	u.pass(busMigrationUnpinning, 3)
+	if _, _, ok := u.workload("unpin"); !ok {
+		t.Error("the failed unpin Job was removed")
+	}
+	if err := u.cl.Get(context.Background(), client.ObjectKey{Namespace: u.agent.Namespace, Name: busMigrationWorkName(u.agent, u.agent.Status.BusMigration, "unpin")}, &batchv1.Job{}); err != nil {
+		t.Errorf("no fresh unpin Job for the retry: %v", err)
+	}
+}
+
+// A run's status change that moves neither the A2ABusMigrating condition nor
+// the count (the freeze confirmed, here) is still written: the next pass
+// reads the stored status, and an unwritten confirmation would leave
+// Freezing waiting until its deadline.
+func TestARunStatusChangeAloneIsWritten(t *testing.T) {
+	agent := a2aTestAgent()
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), RunID: "3-1", Phase: string(busMigrationFreezing),
+		Deadline: metav1.NewTime(time.Now().Add(time.Hour)), ObservedGeneration: agent.Generation}
+	scheme := setupScheme()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent).WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).Build()
+	r := &PlatformAgentReconciler{Client: cl, APIReader: cl, Scheme: scheme, Recorder: record.NewFakeRecorder(16)}
+	ctx := context.Background()
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), agent); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.syncA2AConditions(ctx, agent, a2aProvisionState{}); err != nil { // bring the conditions current
+		t.Fatal(err)
+	}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), agent); err != nil {
+		t.Fatal(err)
+	}
+	state := a2aProvisionState{busReplicasPersisted: agent.Status.BusReplicas, busMigrationPersisted: agent.Status.BusMigration.DeepCopy(), busMigrationCaptured: true}
+	agent.Status.BusMigration.FreezeConfirmed = true // what this pass's advance did
+	if err := r.syncA2AConditions(ctx, agent, state); err != nil {
+		t.Fatal(err)
+	}
+	stored := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), stored); err != nil {
+		t.Fatal(err)
+	}
+	if !stored.Status.BusMigration.FreezeConfirmed {
+		t.Error("the freeze's confirmation was not written")
+	}
+}
+
+// A run that hits its deadline after the conversion turns back with time to
+// roll back: the way back gets one fresh deadline (the forward one kept),
+// the rollback pod's deadline is from it, and so is its identity's expiry.
+// A failure on the way back does not renew it again.
+func TestTheWayBackGetsItsOwnDeadline(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	m := newMigrationRig(t, busMigrationGrow, busMigrationRestoring, 3, time.Now().Add(-time.Minute))
+	forward := m.agent.Status.BusMigration.Deadline
+	m.pass(busMigrationClearing, 3)
+	m.snapshotKept()
+	m.clearedAll()
+	m.pass(busMigrationRollingBack, 1)
+	run := m.agent.Status.BusMigration
+	if run.ForwardDeadline == nil || !run.ForwardDeadline.Equal(&forward) {
+		t.Fatalf("forward deadline %v, want %v kept", run.ForwardDeadline, forward)
+	}
+	if time.Until(run.Deadline.Time) < busMigrationRunDeadline-time.Minute {
+		t.Fatalf("the way back's deadline %v is not fresh", run.Deadline)
+	}
+	m.rollOut(1)
+	m.pass(busMigrationRollbackRestoring, 1)
+	spec, _, ok := m.workload("rollback")
+	if !ok || spec.ActiveDeadlineSeconds == nil || *spec.ActiveDeadlineSeconds < 3600 {
+		t.Fatalf("rollback pod deadline %v, want the way back's", spec.ActiveDeadlineSeconds)
+	}
+	if ids := busMigrationIdentities(m.agent); len(ids) != 1 || !ids[0].notAfter.Equal(run.Deadline.Time) {
+		t.Errorf("the rollback identity's expiry %v, want the way back's deadline", ids)
+	}
+	undo := run.Deadline
+	run.Deadline = metav1.NewTime(time.Now().Add(-time.Minute)) // the way back runs out too
+	m.pass(busMigrationFailed, 1)
+	if !m.agent.Status.BusMigration.ForwardDeadline.Equal(&forward) || m.agent.Status.BusMigration.Deadline.After(undo.Time) {
+		t.Error("a failure on the way back renewed its deadline")
+	}
+}
+
+// Objects under a run's names that this PlatformAgent does not control are
+// never trusted or adopted: a planted hashing pod's digests are not read, a
+// planted run Secret is not used, a planted ServiceAccount is not taken
+// over; each fails its phase, naming the object.
+func TestARunTrustsOnlyItsOwnObjects(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	ctx := context.Background()
+
+	hash := newMigrationRig(t, busMigrationGrow, busMigrationHashing, 1, time.Now().Add(time.Hour))
+	planted := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkloadName(hash.agent, "hash", "3-1"), Namespace: hash.agent.Namespace}}
+	if err := hash.cl.Create(ctx, planted); err != nil {
+		t.Fatal(err)
+	}
+	planted.Status.Phase = corev1.PodSucceeded
+	planted.Status.ContainerStatuses = []corev1.ContainerStatus{{State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{Message: validDigests()}}}}
+	if err := hash.cl.Status().Update(ctx, planted); err != nil {
+		t.Fatal(err)
+	}
+	if err := hash.r.resolveA2ABusReplicas(ctx, hash.agent); err != nil {
+		t.Fatal(err)
+	}
+	if run := hash.agent.Status.BusMigration; !run.Abandoning || !strings.Contains(run.Cause, "is not this PlatformAgent's") {
+		t.Errorf("a planted hashing pod: phase %s cause %q", run.Phase, run.Cause)
+	}
+	if err := hash.cl.Get(ctx, client.ObjectKey{Namespace: hash.agent.Namespace, Name: busMigrationRunSecret(hash.agent, "3-1")}, &corev1.Secret{}); err == nil {
+		t.Error("a run Secret was written from a planted hashing pod")
+	}
+
+	sec := newMigrationRig(t, busMigrationGrow, busMigrationHashing, 1, time.Now().Add(time.Hour))
+	if err := sec.cl.Create(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: busMigrationRunSecret(sec.agent, "3-1"), Namespace: sec.agent.Namespace}}); err != nil {
+		t.Fatal(err)
+	}
+	sec.finishPod("hash", corev1.PodSucceeded, validDigests(), "")
+	if err := sec.r.resolveA2ABusReplicas(ctx, sec.agent); err != nil {
+		t.Fatal(err)
+	}
+	if run := sec.agent.Status.BusMigration; !strings.Contains(run.Cause, "the run Secret exists and is not this PlatformAgent's") {
+		t.Errorf("a planted run Secret: phase %s cause %q", run.Phase, run.Cause)
+	}
+
+	sa := newMigrationRig(t, busMigrationGrow, busMigrationSnapshot, 1, time.Now().Add(time.Hour))
+	theirs := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkloadName(sa.agent, busMigrationStreamIdentity, "3-1"), Namespace: sa.agent.Namespace,
+		Annotations: map[string]string{"iam.gke.io/gcp-service-account": "someone@example.iam.gserviceaccount.com"}}}
+	if err := sa.cl.Create(ctx, theirs); err != nil {
+		t.Fatal(err)
+	}
+	before := theirs.ResourceVersion
+	if err := sa.r.resolveA2ABusReplicas(ctx, sa.agent); err != nil {
+		t.Fatal(err)
+	}
+	got := &corev1.ServiceAccount{}
+	if err := sa.cl.Get(ctx, client.ObjectKeyFromObject(theirs), got); err != nil {
+		t.Fatal(err)
+	}
+	if got.ResourceVersion != before || len(got.OwnerReferences) != 0 {
+		t.Error("a planted ServiceAccount was adopted")
+	}
+	if run := sa.agent.Status.BusMigration; !strings.Contains(run.Cause, "ServiceAccount") {
+		t.Errorf("a planted ServiceAccount: phase %s cause %q", run.Phase, run.Cause)
+	}
+	if _, _, ok := sa.workload("snapshot"); ok {
+		t.Error("the snapshot pod ran under a planted ServiceAccount")
+	}
+
+	// A planted staging claim is never handed the snapshot: the pass that
+	// creates the work makes no ServiceAccount or pod against it, and the
+	// phase fails on it, naming it.
+	c := newMigrationRig(t, busMigrationGrow, busMigrationSnapshot, 1, time.Now().Add(time.Hour))
+	claim := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: busMigrationStageClaim(c.agent, "3-1"), Namespace: c.agent.Namespace}}
+	if err := c.cl.Create(ctx, claim); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.r.ensureBusMigrationWorkload(ctx, c.agent, c.agent.Status.BusMigration, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := c.workload("snapshot"); ok {
+		t.Error("the snapshot pod was created against a planted staging claim")
+	}
+	if err := c.cl.Get(ctx, client.ObjectKey{Namespace: c.agent.Namespace, Name: busMigrationWorkloadName(c.agent, busMigrationStreamIdentity, "3-1")}, &corev1.ServiceAccount{}); err == nil {
+		t.Error("the snapshot's ServiceAccount was created against a planted staging claim")
+	}
+	if err := c.r.resolveA2ABusReplicas(ctx, c.agent); err != nil {
+		t.Fatal(err)
+	}
+	if run := c.agent.Status.BusMigration; !strings.Contains(run.Cause, "PersistentVolumeClaim") {
+		t.Errorf("a planted staging claim: phase %s cause %q", run.Phase, run.Cause)
+	}
+	if _, _, ok := c.workload("snapshot"); ok {
+		t.Error("the snapshot pod ran against a planted staging claim")
+	}
+}
+
+// The pass that enters a phase creates its work in the same pass; a
+// ServiceAccount planted under the phase identity's name before then is not
+// adopted there either.
+func TestEnteringAPhaseDoesNotAdoptAPlantedServiceAccount(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	ctx := context.Background()
+	m := newMigrationRig(t, busMigrationGrow, busMigrationFreezing, 1, time.Now().Add(time.Hour))
+	theirs := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkloadName(m.agent, busMigrationStreamIdentity, "3-1"), Namespace: m.agent.Namespace}}
+	if err := m.cl.Create(ctx, theirs); err != nil {
+		t.Fatal(err)
+	}
+	before := theirs.ResourceVersion
+	m.calloutPods(2, true, true)
+	m.pass(busMigrationFreezing, 1)
+	m.rollOut(1)
+	m.pass(busMigrationSnapshot, 1) // enters Snapshotting and would create its work
+	got := &corev1.ServiceAccount{}
+	if err := m.cl.Get(ctx, client.ObjectKeyFromObject(theirs), got); err != nil {
+		t.Fatal(err)
+	}
+	if got.ResourceVersion != before || len(got.OwnerReferences) != 0 {
+		t.Error("entering Snapshotting adopted a planted ServiceAccount")
+	}
+	if _, _, ok := m.workload("snapshot"); ok {
+		t.Error("the snapshot pod was created under a planted ServiceAccount")
+	}
+}
+
+// A callout pod that has exited (evicted and left for collection) answers
+// nothing, so it does not hold the freeze's confirmation back.
+func TestAnExitedCalloutPodDoesNotBlockTheFreeze(t *testing.T) {
+	ctx := context.Background()
+	m := newMigrationRig(t, busMigrationGrow, busMigrationFreezing, 1, time.Now().Add(time.Hour))
+	m.calloutPods(2, true, true)
+	evicted := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "callout-evicted", Namespace: m.agent.Namespace, Labels: a2aCalloutPodSelector(m.agent)}}
+	if err := m.cl.Create(ctx, evicted); err != nil {
+		t.Fatal(err)
+	}
+	evicted.Status.Phase, evicted.Status.Reason = corev1.PodFailed, "Evicted"
+	if err := m.cl.Status().Update(ctx, evicted); err != nil {
+		t.Fatal(err)
+	}
+	m.pass(busMigrationFreezing, 1)
+	if !m.agent.Status.BusMigration.FreezeConfirmed {
+		t.Error("an exited callout pod held the freeze's confirmation back")
+	}
+}
+
+// The migration's pods can reach the bus: every Job and pod it creates
+// carries the component label the bus's NetworkPolicy admits. (Found live:
+// without it the snapshot pod's dial timed out at the fence.)
+func TestTheMigrationsPodsAreAdmittedToTheBus(t *testing.T) {
+	agent := a2aTestAgent()
+	run := &agentv1alpha1.BusMigrationStatus{RunID: "1-1", Deadline: metav1.NewTime(time.Now().Add(time.Hour))}
+	admitted := func(labels map[string]string) bool {
+		np := buildA2ANATSNetworkPolicy(agent)
+		for _, peer := range np.Spec.Ingress[0].From {
+			if peer.PodSelector == nil || peer.NamespaceSelector != nil {
+				continue
+			}
+			sel, err := metav1.LabelSelectorAsSelector(peer.PodSelector)
+			if err == nil && sel.Matches(k8slabels.Set(labels)) {
+				return true
+			}
+		}
+		return false
+	}
+	for name, labels := range map[string]map[string]string{
+		"pin Job":      buildBusMigrationJob(agent, run, "pin", time.Now()).Spec.Template.Labels,
+		"snapshot pod": buildBusStreamPod(agent, run, "snapshot", time.Now()).Labels,
+		"restore pod":  buildBusStreamPod(agent, run, "restore", time.Now()).Labels,
+		"rollback pod": buildBusStreamPod(agent, run, "rollback", time.Now()).Labels,
+	} {
+		if !admitted(labels) {
+			t.Errorf("the %s (labels %v) is not admitted to the bus port", name, labels)
+		}
+	}
+}
+
+// A migration's Jobs and pods are not watched, so the pass that reads their
+// outcome is scheduled while a run is under way, or a Failed run holds its
+// freeze; never otherwise. (Found live: a finished hashing pod sat unread.)
+func TestAMigrationUnderWayIsRequeued(t *testing.T) {
+	agent := a2aTestAgent()
+	if d := busMigrationRequeue(agent); d != 0 {
+		t.Errorf("no run: requeue %v", d)
+	}
+	for phase, want := range map[busMigrationPhase]bool{
+		busMigrationHashing: true, busMigrationSnapshot: true, busMigrationPinning: true,
+		busMigrationDone: false, busMigrationAbandoned: false,
+	} {
+		agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), RunID: "1-1", Phase: string(phase)}
+		if got := busMigrationRequeue(agent) > 0; got != want {
+			t.Errorf("%s: requeued %v, want %v", phase, got, want)
+		}
+	}
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), RunID: "1-1", Phase: string(busMigrationFailed), FailedIn: string(busMigrationRollbackRestoring)}
+	if busMigrationRequeue(agent) == 0 {
+		t.Error("a Failed run holding its freeze is not requeued")
+	}
+}
+
+// A run's end deletes the pods that mount its stage, every attempt's, along
+// with the claim: a claim stays bound while a finished pod names it, so
+// leaving them would pin 32Gi per run. (Found live.) Another run's pods are
+// left alone; a Failed run that keeps its stage keeps them.
+func TestARunsEndDeletesThePodsHoldingItsStage(t *testing.T) {
+	ctx := context.Background()
+	for _, failed := range []bool{false, true} {
+		m := newMigrationRig(t, busMigrationGrow, busMigrationReleasing, 1, time.Now().Add(time.Hour))
+		m.agent.Status.BusMigration.Abandoning = true
+		mk := func(name string) *corev1.Pod {
+			p := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: m.agent.Namespace, Labels: map[string]string{a2aComponentLabel: busMigrationComponent}}}
+			m.own(p)
+			if err := m.cl.Create(ctx, p); err != nil {
+				t.Fatal(err)
+			}
+			return p
+		}
+		ours := []*corev1.Pod{mk(busMigrationWorkloadName(m.agent, "snapshot", "3-1")), mk(busMigrationWorkloadName(m.agent, "hash", "3-1")),
+			mk(busMigrationWorkloadName(m.agent, "rollback", "3-1")), mk(busMigrationWorkloadName(m.agent, "rollback", "3-1") + "-r2")}
+		other := mk(busMigrationWorkloadName(m.agent, "snapshot", "9-9"))
+		if failed {
+			m.agent.Status.BusMigration.Phase, m.agent.Status.BusMigration.FailedIn = string(busMigrationFailed), string(busMigrationRollbackRestoring)
+		}
+		if err := m.r.cleanupBusMigration(ctx, m.agent, m.agent.Status.BusMigration); err != nil {
+			t.Fatal(err)
+		}
+		for _, p := range ours {
+			err := m.cl.Get(ctx, client.ObjectKeyFromObject(p), &corev1.Pod{})
+			if failed && err != nil {
+				t.Errorf("a Failed run's stage pod %s was deleted", p.Name)
+			}
+			if !failed && err == nil {
+				t.Errorf("%s still holds the stage after the run ended", p.Name)
+			}
+		}
+		if err := m.cl.Get(ctx, client.ObjectKeyFromObject(other), &corev1.Pod{}); err != nil {
+			t.Error("another run's pod was deleted")
+		}
+	}
+}
+
+// Clearing deletes nothing unless what replaces it is there: with the run
+// Secret or the stage missing, no clear pod is created and the phase fails,
+// naming why, at the count it was at.
+func TestClearingRefusesWithoutTheSnapshot(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name    string
+		back    bool
+		running int32
+		missing string
+	}{{"forward, no Secret", false, 1, "secret"}, {"back, no stage", true, 3, "pvc"}} {
+		m := newMigrationRig(t, busMigrationGrow, busMigrationClearing, tc.running, time.Now().Add(time.Hour))
+		m.agent.Status.BusMigration.Abandoning = tc.back
+		m.snapshotKept()
+		switch tc.missing {
+		case "secret":
+			if err := m.cl.Delete(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: busMigrationRunSecret(m.agent, "3-1"), Namespace: m.agent.Namespace}}); err != nil {
+				t.Fatal(err)
+			}
+		case "pvc":
+			if err := m.cl.Delete(ctx, &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: busMigrationStageClaim(m.agent, "3-1"), Namespace: m.agent.Namespace}}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		m.pass(busMigrationFailed, tc.running)
+		run := m.agent.Status.BusMigration
+		if !strings.Contains(run.Cause, "the snapshot is not intact, so nothing was cleared") || run.FailedIn != string(busMigrationClearing) {
+			t.Errorf("%s: cause %q failedIn %q", tc.name, run.Cause, run.FailedIn)
+		}
+		if _, _, ok := m.workload(busMigrationRunWork(m.agent.Status.BusMigration).name); ok {
+			t.Errorf("%s: a clear pod was created without the snapshot", tc.name)
+		}
+	}
+}
+
+// No restore starts until the current Clearing has deleted every
+// provisioned stream: a converted cluster still holding the old server's
+// streams reserves its store twice over.
+func TestNoRestoreBeforeTheClearIsDone(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	m := newMigrationRig(t, busMigrationGrow, busMigrationRestoring, 3, time.Now().Add(time.Hour))
+	m.agent.Status.BusMigration.Cleared = a2aProvisionedStreams[:len(a2aProvisionedStreams)-1]
+	m.pass(busMigrationRestoring, 3)
+	m.pass(busMigrationRestoring, 3)
+	if _, _, ok := m.workload("restore"); ok {
+		t.Fatal("a restore pod started with a stream not yet cleared")
+	}
+	m.agent.Status.BusMigration.Cleared = a2aProvisionedStreams
+	m.pass(busMigrationRestoring, 3)
+	if _, _, ok := m.workload("restore"); !ok {
+		t.Fatal("no restore pod once every stream was cleared")
+	}
+}
+
+// A clear that fails partway records what it deleted, stops at the count it
+// was at (three servers on the way back, never shrunk onto their copies),
+// and a retry clears the rest, keeping what was recorded, then goes on.
+func TestAClearFailingPartwayIsRetriedToTheEnd(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	m := newMigrationRig(t, busMigrationGrow, busMigrationClearing, 3, time.Now().Add(time.Hour))
+	m.agent.Status.BusMigration.Abandoning = true
+	m.snapshotKept()
+	m.finishPod(busMigrationClearBackWork, corev1.PodFailed, `{"cleared":["TASKS","DIRECTORY"],"error":"stream TOPICS-STATE: timeout"}`, "")
+	m.pass(busMigrationFailed, 3)
+	run := m.agent.Status.BusMigration
+	if !slices.Equal(run.Cleared, []string{"TASKS", "DIRECTORY"}) || !strings.Contains(run.Cause, "the Clearing phase failed: stream TOPICS-STATE: timeout") {
+		t.Fatalf("cleared %v cause %q", run.Cleared, run.Cause)
+	}
+	if busMigrationRunReplicas(run) != 3 || !busMigrationFreezeActive(m.agent) {
+		t.Fatalf("a failed clear on the way back renders %d servers, frozen %v", busMigrationRunReplicas(run), busMigrationFreezeActive(m.agent))
+	}
+	m.agent.Annotations = map[string]string{a2aBusMigrationRetryAnnotation: "3-1-1"}
+	m.pass(busMigrationClearing, 3)
+	if !slices.Equal(m.agent.Status.BusMigration.Cleared, []string{"TASKS", "DIRECTORY"}) {
+		t.Errorf("the retry forgot what was cleared: %v", m.agent.Status.BusMigration.Cleared)
+	}
+	if _, _, ok := m.workload(busMigrationRunWork(m.agent.Status.BusMigration).name); !ok {
+		t.Fatal("no fresh clear pod for the retry")
+	}
+	b, _ := json.Marshal(busmigrate.Report{Cleared: a2aProvisionedStreams})
+	pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkName(m.agent, m.agent.Status.BusMigration, busMigrationClearBackWork), Namespace: m.agent.Namespace}}
+	if err := m.cl.Get(context.Background(), client.ObjectKeyFromObject(pod), pod); err != nil {
+		t.Fatal(err)
+	}
+	pod.Status.Phase = corev1.PodSucceeded
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{{State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{Message: string(b)}}}}
+	if err := m.cl.Status().Update(context.Background(), pod); err != nil {
+		t.Fatal(err)
+	}
+	m.pass(busMigrationRollingBack, 1)
+	if !busMigrationClearedAll(m.agent.Status.BusMigration) {
+		t.Error("the retried clear did not record every stream")
+	}
+}
+
+// The clear pod deletes by name: the stream identity, no stage, no run Secret.
+func TestTheClearPodDeletesByNameOnly(t *testing.T) {
+	agent := a2aTestAgent()
+	run := &agentv1alpha1.BusMigrationStatus{RunID: "1-1", Deadline: metav1.NewTime(time.Now().Add(time.Hour))}
+	pod := buildBusStreamPod(agent, run, "clear", time.Now())
+	args := strings.Join(pod.Spec.Containers[0].Command, " ")
+	if !strings.Contains(args, "bus-migrate clear ") || strings.Contains(args, "--dir") || strings.Contains(args, "--run-file") {
+		t.Errorf("clear command %q", args)
+	}
+	for _, v := range pod.Spec.Volumes {
+		if v.PersistentVolumeClaim != nil || v.Secret != nil {
+			t.Errorf("the clear pod mounts %s", v.Name)
+		}
+	}
+	if pod.Spec.ServiceAccountName != busMigrationWorkloadName(agent, busMigrationStreamIdentity, "1-1") {
+		t.Errorf("clear pod SA %q", pod.Spec.ServiceAccountName)
+	}
+}
+
+// The pass that enters Clearing creates its pod only with the snapshot
+// intact: a stage gone between the hash and the clear stops it there.
+func TestEnteringClearingChecksTheSnapshotFirst(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	m := newMigrationRig(t, busMigrationGrow, busMigrationHashing, 1, time.Now().Add(time.Hour))
+	m.finishPod("hash", corev1.PodSucceeded, validDigests(), "") // the run Secret is written; no stage claim
+	m.pass(busMigrationClearing, 1)
+	if _, _, ok := m.workload(busMigrationRunWork(m.agent.Status.BusMigration).name); ok {
+		t.Fatal("entering Clearing created a clear pod with no staging claim")
+	}
+}
+
+// Each Clearing starts its record afresh: the way back's clear is not taken
+// as done on the forward clear's list.
+func TestEachClearingStartsItsOwnRecord(t *testing.T) {
+	m := newMigrationRig(t, busMigrationGrow, busMigrationRestoring, 3, time.Now().Add(time.Hour))
+	m.agent.Status.BusMigration.Cleared = a2aProvisionedStreams // the forward clear's
+	m.finishPod("restore", corev1.PodFailed, `{"error":"boom"}`, "")
+	m.pass(busMigrationClearing, 3)
+	if len(m.agent.Status.BusMigration.Cleared) != 0 || busMigrationClearedAll(m.agent.Status.BusMigration) {
+		t.Errorf("the way back's Clearing starts with %v cleared", m.agent.Status.BusMigration.Cleared)
+	}
+}
+
+// Every Job or pod a run creates has a name no other work of the run uses:
+// per phase, per direction (the clear before the conversion and the one on
+// the way back) and per attempt (each retry), so no work is ever read off
+// another's finished object. (Found live twice: a retry reading the failed
+// attempt's pod, and the way back's clear reading the forward one's.)
+// A long agent name still yields Job and pod names within the 63
+// characters their job-name label takes: unique per step and attempt, the
+// same on every call, and recognised as the run's pods by the cleanup. A
+// name that fits is unchanged, so a run under way across an upgrade keeps
+// its objects.
+func TestALongAgentNameKeepsRunNamesWithinALabel(t *testing.T) {
+	agent := a2aTestAgent()
+	agent.Name = "platform-agent-for-the-payments-team"
+	run := &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), RunID: "12-1767225600"}
+	steps := []string{"pin", "unpin", "snapshot", "hash", "restore", "rollback", busMigrationClearWork, busMigrationClearBackWork, busMigrationStreamIdentity, "stage", "run"}
+	seen := map[string]string{}
+	for _, step := range steps {
+		for attempt := 0; attempt <= busMigrationMaxRetries; attempt++ {
+			id := busMigrationAttemptID(run.RunID, attempt)
+			name := busMigrationWorkloadName(agent, step, id)
+			if len(name) > maxLabelValueLength {
+				t.Errorf("%s attempt %d: %q is %d characters, over %d", step, attempt, name, len(name), maxLabelValueLength)
+			}
+			if errs := validation.IsDNS1123Label(name); len(errs) > 0 {
+				t.Errorf("%q is not a DNS label: %v", name, errs)
+			}
+			if name != busMigrationWorkloadName(agent, step, id) {
+				t.Errorf("%s attempt %d: the name differs between calls", step, attempt)
+			}
+			key := fmt.Sprintf("%s/%d", step, attempt)
+			if other, ok := seen[name]; ok {
+				t.Errorf("%q names both %s and %s", name, other, key)
+			}
+			seen[name] = key
+			if slices.Contains([]string{"snapshot", "hash", "restore", "rollback", busMigrationClearWork, busMigrationClearBackWork}, step) && !busMigrationPodOfRun(agent, run, name) {
+				t.Errorf("the cleanup does not recognise %q as the run's pod", name)
+			}
+		}
+	}
+	retried := run.DeepCopy()
+	retried.Retries = make([]agentv1alpha1.BusMigrationRetry, 2)
+	if job := buildBusMigrationJob(agent, retried, "unpin", time.Now()); len(job.Name) > maxLabelValueLength {
+		t.Errorf("the unpin Job's name %q is over %d characters", job.Name, maxLabelValueLength)
+	}
+	other := run.DeepCopy()
+	other.RunID = "12-1767225601"
+	if busMigrationPodOfRun(agent, other, busMigrationWorkloadName(agent, "snapshot", run.RunID)) {
+		t.Error("another run's pod is recognised as this run's")
+	}
+
+	short := a2aTestAgent()
+	if got, want := busMigrationWorkloadName(short, "pin", "3-1"), short.Name+"-bus-pin-3-1"; got != want {
+		t.Errorf("a name that fits changed: %q, want %q", got, want)
+	}
+}
+
+func TestEveryRunWorkNameIsUnique(t *testing.T) {
+	agent := a2aTestAgent()
+	seen := map[string]string{}
+	for _, leg := range []busMigrationLeg{busMigrationShrink, busMigrationGrow} {
+		for _, phase := range []busMigrationPhase{busMigrationPinning, busMigrationUnpinning, busMigrationFreezing, busMigrationSnapshot, busMigrationHashing,
+			busMigrationClearing, busMigrationConverting, busMigrationRestoring, busMigrationRollingBack, busMigrationRollbackRestoring, busMigrationReleasing} {
+			for _, abandoning := range []bool{false, true} {
+				for attempt := 0; attempt <= busMigrationMaxRetries; attempt++ {
+					run := &agentv1alpha1.BusMigrationStatus{Leg: string(leg), RunID: "7-1", Phase: string(phase), Abandoning: abandoning,
+						Retries: make([]agentv1alpha1.BusMigrationRetry, attempt)}
+					work := busMigrationRunWork(run)
+					if work.name == "" {
+						continue
+					}
+					// The same work in the same direction and attempt is the
+					// same object; anything else must differ.
+					key := fmt.Sprintf("%s/dir=%v/attempt=%d", work.name, work.name == busMigrationClearBackWork, attempt)
+					name := busMigrationWorkName(agent, run, work.name)
+					if other, ok := seen[name]; ok && other != key {
+						t.Errorf("%s is the name of both %s and %s", name, other, key)
+					}
+					seen[name] = key
+				}
+			}
+		}
+	}
+	if len(seen) < 8*(busMigrationMaxRetries+1) {
+		t.Errorf("only %d distinct work names; want every work, direction and attempt", len(seen))
+	}
+}
+
+// The live case: the forward clear's pod finished, all cleared, and is still
+// there when the way back's Clearing starts. The way back waits for its own
+// clear; it does not take the forward one's as done.
+func TestTheWayBacksClearIsNotTheForwardOnes(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	m := newMigrationRig(t, busMigrationGrow, busMigrationRestoring, 3, time.Now().Add(time.Hour))
+	m.snapshotKept()
+	b, _ := json.Marshal(busmigrate.Report{Cleared: a2aProvisionedStreams})
+	m.finishPod(busMigrationClearWork, corev1.PodSucceeded, string(b), "") // the forward clear's pod
+	m.finishPod("restore", corev1.PodFailed, `{"error":"boom"}`, "")
+	m.pass(busMigrationClearing, 3)
+	m.pass(busMigrationClearing, 3)
+	m.pass(busMigrationClearing, 3)
+	if _, _, ok := m.workload(busMigrationClearBackWork); !ok {
+		t.Fatal("no clear pod of the way back's own")
+	}
+	m.clearedAll()
+	m.pass(busMigrationRollingBack, 1)
+}
+
+// A run under way is polled at the migration's interval whichever return
+// the pass takes: a pass that holds the provision Job for the run, or sees
+// the callout map unsettled, returns early, and the run's Jobs and pods wake
+// nothing.
+func TestEveryReconcileReturnPollsAMigrationUnderWay(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	agent := a2aTestAgent()
+	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: ptr.To(1)}}
+	agent.Status.BusReplicas = 3
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationShrink), RunID: "3-1", Phase: string(busMigrationPinning),
+		StartedAt: metav1.Now(), Deadline: metav1.NewTime(time.Now().Add(time.Hour))}
+	// With a plugin, so a not-yet-Ready pass takes the plugin recheck's
+	// early return too.
+	plugin := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: agent.Namespace},
+		Spec:       agentv1alpha1.AgentPluginSpec{AgentRef: agent.Name, Image: "gcr.io/p:v1"},
+	}
+	r, _, req := a2aGateTestReconciler(t, agent, plugin)
+	r.busStreamState = emptyBusStreams
+	ctx := context.Background()
+	for i := range 3 {
+		res, err := r.Reconcile(ctx, req)
+		if err != nil {
+			t.Fatalf("Reconcile %d: %v", i+1, err)
+		}
+		if i == 0 {
+			continue // the finalizer pass
+		}
+		if res.RequeueAfter <= 0 || res.RequeueAfter > busMigrationRequeueInterval {
+			t.Fatalf("Reconcile %d: RequeueAfter %v, want at most %v with a run under way", i+1, res.RequeueAfter, busMigrationRequeueInterval)
+		}
+	}
+}
+
+// A switch to today removes a run that ended, or was given up, with what it
+// left: its record, its Jobs, ServiceAccounts, run Secret and staging claim.
+// A run under way, or Failed and not given up, is kept whole, record and
+// claim, since the claim can hold the bus's only copy.
+func TestASwitchToTodayRemovesOnlyAnEndedRun(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name    string
+		phase   busMigrationPhase
+		givenUp bool
+		removed bool
+	}{
+		{"done", busMigrationDone, false, true},
+		{"abandoned", busMigrationAbandoned, false, true},
+		{"failed, given up", busMigrationFailed, true, true},
+		{"failed", busMigrationFailed, false, false},
+		{"under way", busMigrationRestoring, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newMigrationRig(t, busMigrationGrow, tc.phase, 1, time.Now().Add(time.Hour))
+			run := m.agent.Status.BusMigration
+			run.GivenUp = tc.givenUp
+			owned := func(o client.Object) client.Object {
+				o.SetOwnerReferences([]metav1.OwnerReference{*metav1.NewControllerRef(m.agent, agentv1alpha1.GroupVersion.WithKind("PlatformAgent"))})
+				return o
+			}
+			left := []client.Object{
+				owned(&batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkName(m.agent, run, "pin"), Namespace: m.agent.Namespace,
+					Labels: map[string]string{a2aComponentLabel: busMigrationComponent}}}),
+				// An earlier attempt's unpin, which the current name misses.
+				owned(&batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkloadName(m.agent, "unpin", run.RunID+"-r1"), Namespace: m.agent.Namespace,
+					Labels: map[string]string{a2aComponentLabel: busMigrationComponent}}}),
+				owned(&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: busMigrationWorkloadName(m.agent, busMigrationStreamIdentity, run.RunID), Namespace: m.agent.Namespace}}),
+				owned(&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: busMigrationRunSecret(m.agent, run.RunID), Namespace: m.agent.Namespace}}),
+				owned(&corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: busMigrationStageClaim(m.agent, run.RunID), Namespace: m.agent.Namespace}}),
+			}
+			for _, o := range left {
+				if err := m.cl.Create(ctx, o); err != nil {
+					t.Fatal(err)
+				}
+			}
+			foreign := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "someone-elses", Namespace: m.agent.Namespace,
+				Labels: map[string]string{a2aComponentLabel: busMigrationComponent}}}
+			if err := m.cl.Create(ctx, foreign); err != nil {
+				t.Fatal(err)
+			}
+			if err := m.r.busMigrationTornDown(ctx, m.agent); err != nil {
+				t.Fatal(err)
+			}
+			if err := m.cl.Get(ctx, client.ObjectKeyFromObject(foreign), foreign); err != nil {
+				t.Errorf("a migration-labelled Job the PlatformAgent doesn't control was deleted: %v", err)
+			}
+			if got := m.agent.Status.BusMigration == nil; got != tc.removed {
+				t.Errorf("record removed %v, want %v", got, tc.removed)
+			}
+			claim := &corev1.PersistentVolumeClaim{}
+			kept := m.cl.Get(ctx, client.ObjectKey{Namespace: m.agent.Namespace, Name: busMigrationStageClaim(m.agent, run.RunID)}, claim) == nil
+			if kept == tc.removed {
+				t.Errorf("staging claim kept %v, want %v", kept, !tc.removed)
+			}
+			if tc.removed {
+				for _, o := range left {
+					if err := m.cl.Get(ctx, client.ObjectKeyFromObject(o), o); err == nil {
+						t.Errorf("%T %s survived the switch", o, o.GetName())
+					}
+				}
+			}
+		})
+	}
+}
+
+// The pass that tears the A2A stack down on a switch to today writes the
+// removed record, so a switch back to next starts with none.
+func TestTheTodayPassWritesTheRemovedRecord(t *testing.T) {
+	agent := a2aTestAgent()
+	agent.Spec.Mode = ptr.To("today")
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationGrow), RunID: "124-1", Phase: string(busMigrationDone)}
+	r, cl, req := a2aGateTestReconciler(t, agent)
+	ctx := context.Background()
+	for i := range 2 {
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("Reconcile %d: %v", i+1, err)
+		}
+	}
+	got := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Status.BusMigration != nil {
+		t.Errorf("status.busMigration after the switch to today: %+v, want none", got.Status.BusMigration)
+	}
+}
+
+// A one-to-three run that failed partway through its forward clear, and is
+// given up, leaves streams it deleted and never put back, on a count that
+// never changed. Giving it up drops BusProvisioned and deletes the provision
+// Job that earned it, so the Job runs again and recreates them, and Ready and
+// the bridge wait for it; a Job still being deleted counts as nothing done.
+func TestGivingUpAClearThatFailedReprovisionsTheBus(t *testing.T) {
+	t.Setenv(operatorImageEnvVar, "registry.example/operator:v1")
+	ctx := context.Background()
+	m := failedRig(t, busMigrationGrow, busMigrationClearing, 1)
+	m.agent.Spec.Harness.Tuning.BusReplicas = ptr.To(1)
+	setBusProvisionedCondition(m.agent, true, "provision-job", metav1.Now())
+	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "platform-agent-a2a-provision-abc", Namespace: m.agent.Namespace,
+		Labels: map[string]string{a2aComponentLabel: a2aProvisionComponent, labelInstance: instanceLabel(m.agent.Namespace, m.agent.Name)}}}
+	job.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(m.agent, agentv1alpha1.GroupVersion.WithKind("PlatformAgent"))}
+	job.Status.Conditions = []batchv1.JobCondition{{Type: batchv1.JobComplete, Status: corev1.ConditionTrue}}
+	if err := m.cl.Create(ctx, job); err != nil {
+		t.Fatal(err)
+	}
+	m.agent.Annotations = map[string]string{a2aBusMigrationAbandonAnnotation: "3-1"}
+	m.pass(busMigrationFailed, 1)
+	if !m.agent.Status.BusMigration.GivenUp {
+		t.Fatal("the run was not given up")
+	}
+	if busProvisioned(m.agent) {
+		t.Error("BusProvisioned stands after giving up a run that cleared streams")
+	}
+	if err := m.cl.Get(ctx, client.ObjectKeyFromObject(job), &batchv1.Job{}); err == nil {
+		t.Error("the completed provision Job survived; it would count as done and nothing would recreate the streams")
+	}
+	if a2aBridgeInPod(m.agent) {
+		t.Error("the bridge is in the pod before the bus is provisioned again")
+	}
+}
+
+// A given-up three-to-one run is never told that a freeze lifted or that
+// streams were recreated empty: it had no freeze and deleted nothing.
+func TestAGivenUpShrinkClaimsNoFreezeOrRecreatedStreams(t *testing.T) {
+	agent := a2aTestAgent()
+	agent.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: string(busMigrationShrink), RunID: "3-1", Phase: string(busMigrationFailed), FailedIn: string(busMigrationShrinking), GivenUp: true}
+	if got := busMigrationFailedActions(agent); strings.Contains(got, "freeze") || strings.Contains(got, "recreated") {
+		t.Errorf("given-up shrink says %q", got)
+	}
+	agent.Status.BusMigration.Leg = string(busMigrationGrow)
+	if got := busMigrationFailedActions(agent); !strings.Contains(got, "recreated empty") {
+		t.Errorf("given-up grow says %q, want the recreated streams named", got)
+	}
+}

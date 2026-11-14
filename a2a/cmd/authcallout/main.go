@@ -267,7 +267,7 @@ func run(log *slog.Logger) error {
 	}
 	statusSrv := &http.Server{
 		Addr:              statusAddr,
-		Handler:           authcallout.StatusHandler(store, busAttached),
+		Handler:           authcallout.StatusHandlerExpecting(store, busAttached, os.Getenv(authcallout.EnvExpectMapVersion)),
 		ReadHeaderTimeout: statusReadTimeout,
 		WriteTimeout:      statusWriteTimeout,
 	}

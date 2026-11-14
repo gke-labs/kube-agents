@@ -353,9 +353,12 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 	allErrs = append(allErrs, storageErrs...)
 	warnings = append(warnings, storageWarnings...)
 
-	// 6. The bus's server count, on an update: an edit asking an existing bus
-	// for another count is refused here as the operator refuses it.
+	// 6. The bus's server count, on an update: a change while a migration
+	// runs is refused; otherwise a change is how a migration starts.
 	allErrs = append(allErrs, validateBusReplicas(oldObj, platformAgent)...)
+	// 7. Leaving next while a bus migration holds the bus: the run's
+	// staging claim can hold the only copy of the bus's data.
+	allErrs = append(allErrs, validateModeDuringBusMigration(oldObj, platformAgent)...)
 
 	if len(allErrs) > 0 {
 		return warnings, apierrors.NewInvalid(
@@ -368,40 +371,58 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 	return warnings, nil
 }
 
-// validateBusReplicas refuses an update that sets
-// spec.harness.tuning.busReplicas to a count other than the one the existing
-// bus runs, with the operator's own message (controller.BusConversionRefusedMessage):
-// converting a bus empties it until #4225 brings the migration. Best effort:
-// the running count is the stored object's status.busReplicas, which an older
-// CRD prunes, so the operator's refusal on every pass is the enforcement and
-// this only refuses the edit early. An update that leaves the field as it was
-// is let through, so a CR the operator already holds to its count can still
-// be edited otherwise.
+// validateBusReplicas refuses an update that changes
+// spec.harness.tuning.busReplicas while the bus's migration is under way:
+// a run converts to the count it started for, and turning it around mid-way
+// is not a migration it knows how to make. Setting the field to the other
+// count on an existing bus is otherwise how a migration starts (#4225).
+// Best effort: the run is read from the stored object's status.
 func validateBusReplicas(oldObj, platformAgent *agentv1alpha1.PlatformAgent) field.ErrorList {
-	// Under today the field is inert and the bus is torn down, so an edit
-	// that flips to today, or edits a today CR, converts nothing. An edit
-	// from today to next is left to the operator too: a flip to today keeps
-	// status.busReplicas (#5451), but whether a bus is still there to keep
-	// is a question of its data claims, which can be deleted while the CR
-	// is under today and which only the operator reads. Refusing here on the
-	// record alone would refuse a new bus the operator would create.
+	// Under today, or coming from it, there is no bus migration to turn
+	// around: the switch to today tears a run down with the bus, and the
+	// webhook refuses that switch while one is under way.
 	if oldObj == nil || platformAgent.Spec.Mode == nil || *platformAgent.Spec.Mode != "next" {
 		return nil
 	}
 	if oldObj.Spec.Mode == nil || *oldObj.Spec.Mode != "next" {
 		return nil
 	}
-	running := oldObj.Status.BusReplicas
-	asked := busReplicasField(platformAgent)
-	if (running != 1 && running != 3) || asked == nil || int32(*asked) == running { // #nosec G115 -- the CRD admits 1 or 3
+	run := oldObj.Status.BusMigration
+	if run == nil || run.Phase == "Done" || run.Phase == "Abandoned" || run.Phase == "Failed" {
 		return nil
 	}
-	if previous := busReplicasField(oldObj); previous != nil && *previous == *asked {
+	previous, asked := busReplicasField(oldObj), busReplicasField(platformAgent)
+	if (previous == nil) == (asked == nil) && (previous == nil || *previous == *asked) {
 		return nil
 	}
 	return field.ErrorList{field.Forbidden(field.NewPath("spec", "harness", "tuning", "busReplicas"),
-		controller.BusConversionRefusedMessage(int32(*asked), running)+ // #nosec G115 -- the CRD admits 1 or 3
-			" (The operator holds the bus to its count on every pass; this admission check only refuses the edit early.)")}
+		fmt.Sprintf("the A2A bus's %s migration is under way (phase %s); busReplicas can change again once it has ended (status.busMigration)", run.Leg, run.Phase))}
+}
+
+// validateModeDuringBusMigration refuses an update that takes spec.mode off
+// next while the bus's migration is under way, or Failed and not given up:
+// the switch tears the bus down around the run, and a run past its Clearing
+// phase holds the bus's data only in its staging claim. A run that ended, or
+// one given up, is no reason to refuse; the operator removes its record and
+// what it left on the switch. Best effort: the run is read from the stored
+// object's status.
+func validateModeDuringBusMigration(oldObj, platformAgent *agentv1alpha1.PlatformAgent) field.ErrorList {
+	if oldObj == nil || oldObj.Spec.Mode == nil || *oldObj.Spec.Mode != "next" {
+		return nil
+	}
+	if platformAgent.Spec.Mode != nil && *platformAgent.Spec.Mode == "next" {
+		return nil
+	}
+	run := oldObj.Status.BusMigration
+	if run == nil || run.Phase == "Done" || run.Phase == "Abandoned" || (run.Phase == "Failed" && run.GivenUp) {
+		return nil
+	}
+	if run.Phase == "Failed" {
+		return field.ErrorList{field.Forbidden(field.NewPath("spec", "mode"),
+			fmt.Sprintf("the A2A bus's %s migration %s is Failed and holds the bus's snapshot; retry it, or give it up with the annotation kubeagents.x-k8s.io/bus-migration-abandon=%s, before leaving next (status.busMigration)", run.Leg, run.RunID, run.RunID))}
+	}
+	return field.ErrorList{field.Forbidden(field.NewPath("spec", "mode"),
+		fmt.Sprintf("the A2A bus's %s migration %s is under way (phase %s); spec.mode can leave next once it has ended (status.busMigration)", run.Leg, run.RunID, run.Phase))}
 }
 
 func busReplicasField(pa *agentv1alpha1.PlatformAgent) *int {

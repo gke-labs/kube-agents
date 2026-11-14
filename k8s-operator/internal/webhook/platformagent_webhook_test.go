@@ -18,7 +18,6 @@ package webhook
 
 import (
 	"context"
-	"github.com/gke-labs/kube-agents/k8s-operator/internal/controller"
 	"reflect"
 	"slices"
 	"strings"
@@ -1288,18 +1287,60 @@ func TestWebhookRejectsForgeCredentialVolumeAndEnvOverrides(t *testing.T) {
 	}
 }
 
-// An edit asking an existing bus for another server count is refused at
-// apply time with the operator's message, in both directions; an edit that
-// leaves the field as it was, a bus with no recorded count, and a create
-// pass, because the operator is the enforcement and this only refuses early.
-func TestAnEditCannotConvertAnExistingBus(t *testing.T) {
-	agent := func(spec *int, running int32) *agentv1alpha1.PlatformAgent {
+// busReplicas cannot change while the bus's migration is under way; before
+// and after one, changing it is how a migration starts, so it passes.
+// spec.mode cannot leave next while a bus migration is under way, or Failed
+// and not given up: the switch tears the bus down around a run whose staging
+// claim can hold the bus's only copy. A run that ended, or was given up, is
+// no reason to refuse.
+func TestTheModeCannotLeaveNextMidMigration(t *testing.T) {
+	agent := func(mode *string, phase string, givenUp bool) *agentv1alpha1.PlatformAgent {
 		pa := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "pa", Namespace: "kubeagents-system"}}
+		pa.Spec.Mode = mode
+		if phase != "" {
+			pa.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: "OneToThree", RunID: "124-9", Phase: phase, GivenUp: givenUp}
+		}
+		return pa
+	}
+	next, today := ptr.To("next"), ptr.To("today")
+	for _, tc := range []struct {
+		name     string
+		old, new *agentv1alpha1.PlatformAgent
+		refused  string
+	}{
+		{"no run", agent(next, "", false), agent(today, "", false), ""},
+		{"a run under way", agent(next, "Restoring", false), agent(today, "Restoring", false), "is under way"},
+		{"a run under way, mode removed", agent(next, "Pinning", false), agent(nil, "Pinning", false), "is under way"},
+		{"a Failed run", agent(next, "Failed", false), agent(today, "Failed", false), "bus-migration-abandon=124-9"},
+		{"a Failed run given up", agent(next, "Failed", true), agent(today, "Failed", true), ""},
+		{"a run that ended", agent(next, "Done", false), agent(today, "Done", false), ""},
+		{"an abandoned run", agent(next, "Abandoned", false), agent(today, "Abandoned", false), ""},
+		{"staying on next", agent(next, "Restoring", false), agent(next, "Restoring", false), ""},
+		{"a create", nil, agent(today, "", false), ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			errs := validateModeDuringBusMigration(tc.old, tc.new)
+			if (tc.refused != "") != (len(errs) == 1) || (tc.refused != "" && !strings.Contains(errs[0].Error(), tc.refused)) {
+				t.Fatalf("errors %v, want refused naming %q", errs, tc.refused)
+			}
+		})
+	}
+	if _, err := (&PlatformAgentCustomValidator{}).ValidateUpdate(context.Background(), agent(next, "Hashing", false), agent(today, "Hashing", false)); err == nil || !strings.Contains(err.Error(), "spec.mode can leave next") {
+		t.Errorf("ValidateUpdate leaving next mid-run: %v, want the refusal", err)
+	}
+}
+
+func TestBusReplicasCannotChangeMidMigration(t *testing.T) {
+	agent := func(spec *int, phase string) *agentv1alpha1.PlatformAgent {
+		pa := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "pa", Namespace: "kubeagents-system"}}
+		pa.Spec.Mode = ptr.To("next")
 		if spec != nil {
 			pa.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{BusReplicas: spec}}
 		}
-		pa.Status.BusReplicas = running
-		pa.Spec.Mode = ptr.To("next")
+		if phase != "" {
+			pa.Status.BusMigration = &agentv1alpha1.BusMigrationStatus{Leg: "OneToThree", Phase: phase}
+		}
+		pa.Status.BusReplicas = 1
 		return pa
 	}
 	today := func(pa *agentv1alpha1.PlatformAgent) *agentv1alpha1.PlatformAgent {
@@ -1311,34 +1352,23 @@ func TestAnEditCannotConvertAnExistingBus(t *testing.T) {
 		old, new *agentv1alpha1.PlatformAgent
 		refused  bool
 	}{
-		{"one to three", agent(nil, 1), agent(ptr.To(3), 1), true},
-		{"three to one", agent(nil, 3), agent(ptr.To(1), 3), true},
-		{"three to one, changing a set field", agent(ptr.To(3), 3), agent(ptr.To(1), 3), true},
-		{"the count it runs", agent(nil, 3), agent(ptr.To(3), 3), false},
-		{"removing the field", agent(ptr.To(3), 1), agent(nil, 1), false},
-		{"a field the operator already holds, left as it was", agent(ptr.To(3), 1), agent(ptr.To(3), 1), false},
-		{"no recorded count (pruned by an older CRD)", agent(nil, 0), agent(ptr.To(1), 0), false},
-		{"a create", nil, agent(ptr.To(1), 0), false},
-		{"a flip to today with the field set to the other count", agent(nil, 3), today(agent(ptr.To(1), 3)), false},
-		{"a today CR, which keeps its count", today(agent(nil, 1)), today(agent(ptr.To(3), 1)), false},
-		{"from today to next with the other count: the operator decides from the claims", today(agent(nil, 1)), agent(ptr.To(3), 1), false},
+		{"starting a migration", agent(nil, ""), agent(ptr.To(3), ""), false},
+		{"turning a running migration around", agent(ptr.To(3), "Restoring"), agent(ptr.To(1), "Restoring"), true},
+		{"removing the field mid-migration", agent(ptr.To(3), "Hashing"), agent(nil, "Hashing"), true},
+		{"other edits mid-migration", agent(ptr.To(3), "Hashing"), agent(ptr.To(3), "Hashing"), false},
+		{"after a migration ended", agent(ptr.To(3), "Abandoned"), agent(ptr.To(1), "Abandoned"), false},
+		{"a create", nil, agent(ptr.To(3), ""), false},
+		{"from today to next with the other count", today(agent(ptr.To(3), "")), agent(ptr.To(1), ""), false},
+		{"a today CR's edit", today(agent(nil, "")), today(agent(ptr.To(3), "")), false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			errs := validateBusReplicas(tc.old, tc.new)
 			if tc.refused != (len(errs) == 1) {
 				t.Fatalf("errors %v, want refused = %v", errs, tc.refused)
 			}
-			if tc.refused {
-				want := controller.BusConversionRefusedMessage(int32(*tc.new.Spec.Harness.Tuning.BusReplicas), tc.old.Status.BusReplicas)
-				if !strings.Contains(errs[0].Detail, want) || errs[0].Field != "spec.harness.tuning.busReplicas" {
-					t.Errorf("refusal %s: %q, want the operator's message %q", errs[0].Field, errs[0].Detail, want)
-				}
-			}
 		})
 	}
-	// Wired into the update path.
-	_, err := (&PlatformAgentCustomValidator{}).ValidateUpdate(context.Background(), agent(nil, 3), agent(ptr.To(1), 3))
-	if err == nil || !strings.Contains(err.Error(), "#4225") {
-		t.Errorf("ValidateUpdate of a 3 to 1 edit: %v, want the refusal", err)
+	if _, err := (&PlatformAgentCustomValidator{}).ValidateUpdate(context.Background(), agent(ptr.To(3), "Restoring"), agent(ptr.To(1), "Restoring")); err == nil || !strings.Contains(err.Error(), "migration is under way") {
+		t.Errorf("ValidateUpdate turning a migration around: %v, want the refusal", err)
 	}
 }

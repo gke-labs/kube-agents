@@ -3269,7 +3269,7 @@ spec:
   template:
     metadata:
       annotations:
-        a2a.kubeagents.x-k8s.io/identity-map-schema: "6"
+        a2a.kubeagents.x-k8s.io/identity-map-schema: "7"
       labels:
         app: platformagent-a2a-callout
         app.kubernetes.io/instance: kubeagents-system-platformagent
@@ -4777,6 +4777,10 @@ spec:
             matchLabels:
               app.kubernetes.io/part-of: a2a-next
               kubeagents.x-k8s.io/a2a-component: provision
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/part-of: a2a-next
+              kubeagents.x-k8s.io/a2a-component: bus-migration
         - podSelector:
             matchLabels:
               app.kubernetes.io/part-of: a2a-next

@@ -59,6 +59,101 @@ The bus runs [`harness.tuning.busReplicas`](/kube-agents/operator/platformagent-
 
 The verifier's and the callout's topology spreads are `ScheduleAnyway`, so a single-node install still comes up. There the bus needs `busReplicas: 1`. On a cluster with no other schedulable node, such as a single-node install, a drain that evicts a callout waits until the node is uncordoned or the drain overrides the budget.
 
+### Changing the bus's server count
+
+On a bus that already runs, changing `busReplicas` between 1 and 3 starts a migration that keeps the bus's data. The operator runs it in phases, shown in `status.busMigration` and reported by the `A2ABusMigrating` condition. The admission webhook refuses another change to `busReplicas` while one runs. A run has two hours going forward; a phase still running then counts as failed, and the way back gets two hours of its own. Objects under a run's names that the PlatformAgent does not own are never used: a phase that finds one fails and names it.
+
+A migration starts only on a bus whose provisioning has completed (`BusProvisioned`). A bus never provisioned, with no migration behind it, takes a changed count as asked, since it holds no data yet. That is how the count comes down on a cluster that can't schedule three servers. After a migration, the next one waits for the provisioning that follows it.
+
+The webhook also refuses a switch of `spec.mode` off `next` while a migration runs, or while a `Failed` run waits to be retried or given up, since the run's staging claim can hold the bus's only copy. A switch after a run ended removes `status.busMigration` and what the run left.
+
+The operator runs the migration's work in pods of its own image, so it needs `OPERATOR_IMAGE` set, as the chart does. Without it a `busReplicas` change starts no migration: the bus keeps its count, and an `A2ABusMigrationUnavailable` Warning Event says why. The same holds, with the same Event, when the installed CRD is older than the operator and drops `status.busMigration`. The operator sees its first run's record dropped, and starts no other until the CRD is applied and the operator restarted.
+
+**Three servers to one** happens in place. A Job of the operator's moves each stream's leader to server 0 and scales the stream to one replica while the bus is still a cluster; then the bus renders one server. Writes keep flowing, with brief stalls as leaders move and while server 0 restarts on its own.
+
+A one-server bus starts its server with a `stale-cluster-meta` init step. A server that ran in a cluster keeps the cluster's metadata (`/data/jetstream/SYS/_js_`) while it runs alone, and a later move back to three servers would bring back, from it, streams that no longer exist. The step removes exactly that directory, and only on `<agent>-a2a-nats-0`, logging the path and size. It refuses a symbolic link on that path, failing the pod rather than following it: `kubectl logs <agent>-a2a-nats-0 -c stale-cluster-meta` says what it did.
+
+**One server to three** copies the streams, behind a write freeze:
+
+1. **The freeze.** The callout is rolled so that every replica authenticates only the migration. Then the bus restarts without its static application users. From then on, until the freeze lifts, connections drop and are refused: the console and web logins fail, the gateway and the bridge cannot publish, and tasks wait.
+2. **The copy.** The operator's pod snapshots every stream to a staging claim. A pod with no bus access digests the snapshots, and the operator keeps the digests.
+3. **The clear.** With the snapshot pinned, the operator's pod deletes the streams from the single server, so it joins the cluster with nothing on disk; the conversion would have dropped them anyway.
+4. **The conversion.** The bus renders three servers. On a cluster that provisions nodes on demand, such as Autopilot, that includes the nodes for servers 1 and 2. The conversion has 15 minutes of its own (`status.busMigration.phaseDeadline`) to get all three Ready, so a cluster that cannot schedule servers 1 and 2 turns the run back then, not at the run's two-hour deadline.
+5. **The restore.** The operator's restore pod restores each stream, with its consumers, and raises it to three replicas. Before it restores a stream, it checks the snapshot against the operator's digests and against the operator's policy for that stream: its subjects, limits and retention. The stream comes back with the limits the install renders now. A snapshot that does not fit them is refused, which turns the run back: more bytes than the rendered `max_bytes`, or an oldest message older than the rendered `max_age`. After, it checks the restored stream against the same policy and deletes one that fails.
+6. **The release.** The bus restarts with its static users and the callout serves the install's identities again.
+
+The freeze lasts as long as the copy, the conversion and the restore together, which is expected to be minutes. The staging claim is `ReadWriteOncePod`, on the default StorageClass, sized for every stream full to its cap plus 10% (15Gi today), so the default StorageClass must support that access mode.
+
+Before a one to three run starts, the operator reads each stream's size from the bus's monitoring endpoint. If a stream holds more than the cap the restore puts on it, keeps a message older than its max age (a stream an earlier install kept longer), or the sizes can't be read, no run starts and nothing freezes. The bus keeps its one server, and an `A2ABusMigrationStreamsOverCap` Warning Event names each stream and the limit it is over. The operator checks again on later passes and starts the run once every stream is under its cap.
+
+A stream the restore put back that differs from a fresh install of it, on a field outside its policy, is listed in `status.busMigration.warnings` and reported once as a `BusMigrationDrift` Warning Event.
+
+#### When a migration fails
+
+Most failures turn the run back on its own. Three to one, before the bus has gone to one server, raises the streams back to three replicas. One to three, from the conversion on, renders one server again and restores the same snapshot into it, each stream as it was, its own limits included. A failed restore first deletes the cluster's partial copies; a failed conversion has none, since nothing was restored, and goes straight back to one server, whose `stale-cluster-meta` step removes the cluster's metadata.
+
+In both directions the run then ends `Abandoned`: the bus runs as before, with its data, and the condition says why. To try the same count again, annotate the PlatformAgent `kubeagents.x-k8s.io/bus-migration-start=<run>`, naming the abandoned run. Spec changes to other fields, and syncs that change nothing, do not start a new run.
+
+A failed way back stops for a person, and so does a failure with no way back (below). The run is then `Failed`, `status.busMigration.failedIn` names where, and the condition names the step to take. A `Failed` run blocks any other migration, and spec changes leave the bus as it is, until a person acts with an annotation on the PlatformAgent that names the run:
+
+- **Retry:** `kubectl annotate platformagent <name> -n <namespace> kubeagents.x-k8s.io/bus-migration-retry=<run>-<attempt>`, with the value the condition gives. It runs the failed step again with a fresh deadline: the clear (from `Clearing`, keeping what it already deleted), the rollback (from `RollingBack` or `RollbackRestoring`) or the unpin (from `Unpinning`). A run may be retried three times; each attempt is recorded in `status.busMigration.retries`.
+- **Give up:** `kubectl annotate platformagent <name> -n <namespace> kubeagents.x-k8s.io/bus-migration-abandon=<run>`. For a run that failed during the freeze, this lifts the freeze and runs the provision Job again at once, which recreates, empty, every stream the run did not put back. Ready waits for it. It deletes the staging claim and its snapshot, unless the claim holds the streams' only copy ([below](#recovering-a-given-up-runs-staging-claim)).
+
+A rollback that failed keeps the write freeze, the staging claim and the operator's digests until then, so a retry restores the same snapshot. Before retrying, check the `<agent>-a2a-nats-0` pod, and the restore pod's termination message (`kubectl get pod <agent>-bus-rollback-<run> -o jsonpath='{.status.containerStatuses[0].state.terminated.message}'`), which names the stream and the check that failed.
+
+A run that failed in `Shrinking` (server 0 did not come up on its own) or in `Releasing` (the servers did not come back with their static users) has no way back to retry. The bus stays at the count it reached. Fix the `<agent>-a2a-nats` pods, then give the run up to allow the next migration.
+
+#### Recovering a given-up run's staging claim
+
+A one to three run that failed at or after its clear, which emptied the single server, may have the streams' only full copy on its staging claim. Its `failedIn` is then any phase from `Clearing` on: `Clearing`, `Converting`, `Restoring`, `RollingBack`, `RollbackRestoring` or `Releasing`. Retry such a run rather than give it up while retries are left: a retry restores the snapshot into one server on its own.
+
+If it is given up anyway, the operator lifts the freeze, the bus runs one server, and the provision Job recreates every stream empty. It keeps the staging claim `<agent>-bus-stage-<run>` and the run Secret `<agent>-bus-run-<run>`, which holds each snapshot file's SHA-256, and the `A2ABusMigrating` condition names both. It does not restore the snapshot, and it does not delete either object; both are owned by the PlatformAgent, so deleting the PlatformAgent deletes them. A run's object name that would pass 63 characters ends in a hash in place of the run. Find them by their labels (the instance label is `<namespace>-<name>`, cut to 63 characters):
+
+```bash
+kubectl get platformagent <name> -n <namespace> \
+  -o jsonpath='{.status.busMigration.runID} {.status.busMigration.failedIn} givenUp={.status.busMigration.givenUp}{"\n"}'
+kubectl get pvc,secret -n <namespace> \
+  -l kubeagents.x-k8s.io/a2a-component=bus-migration,app.kubernetes.io/instance=<namespace>-<name>
+```
+
+To keep the data past the PlatformAgent, keep the volume when its claim is deleted, and take the claim out of the PlatformAgent's ownership:
+
+```bash
+PV=$(kubectl get pvc <claim> -n <namespace> -o jsonpath='{.spec.volumeName}')
+kubectl patch pv "$PV" -p '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}'
+kubectl patch pvc <claim> -n <namespace> --type=json -p '[{"op":"remove","path":"/metadata/ownerReferences"}]'
+kubectl get secret <agent>-bus-run-<run> -n <namespace> -o jsonpath='{.data.run\.json}' | base64 -d > run.json
+```
+
+The claim holds one directory per stream, each with `stream.tar.s2` (the server's snapshot of the stream) and `meta.json` (its config and state when snapshotted). To copy it out, mount it read-only in a pod of your own (the claim is `ReadWriteOncePod`, so nothing else may hold it):
+
+```bash
+kubectl apply -n <namespace> -f - <<'YAML'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bus-stage-reader
+spec:
+  securityContext: { runAsNonRoot: true, runAsUser: 65532, fsGroup: 65532, seccompProfile: { type: RuntimeDefault } }
+  containers:
+    - name: reader
+      image: busybox:1.37
+      command: ["sleep", "3600"]
+      securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: ["ALL"] } }
+      volumeMounts: [{ name: stage, mountPath: /stage, readOnly: true }]
+  volumes:
+    - name: stage
+      persistentVolumeClaim: { claimName: <claim>, readOnly: true }
+YAML
+kubectl exec -n <namespace> bus-stage-reader -- sh -c 'cd /stage && sha256sum */stream.tar.s2 */meta.json'
+kubectl cp <namespace>/bus-stage-reader:/stage ./bus-stage-<run>
+kubectl delete pod bus-stage-reader -n <namespace>
+```
+
+The checksums should match the `data` and `meta` digests in `run.json`. The bus already runs one server, so set `busReplicas: 1` to match it. While the field asks for three, no new run starts unless the `bus-migration-start` annotation names the given-up run. A new run would snapshot the empty streams onto a claim of its own. Putting the old data back is manual: the operator has no command for it, and restoring a stream takes a bus client allowed `$JS.API.STREAM.RESTORE` on it, which only a migration's own identity holds, and only during its restore. Delete the claim once the data is safe or not needed.
+
+The operator keeps the claim on every such give-up, including one where a restore or a rollback restore had already put every stream back. A claim left over then is the accepted cost of never deleting a copy that might be the only one. To tell whether it's safe to delete, compare each stream's `state.messages` and `state.last_seq` in its `meta.json` on the claim with the same stream on the bus. If every stream on the bus has at least as many messages, and the same last sequence or a later one, the bus holds everything the claim does.
+
 Disabling Google Chat afterwards, with no other backend configured, leaves the gateway running on the console door alone. Flipping back to `today` tears that stack down, keeping the generated credentials Secret and the JetStream PVCs. The callout's keys Secret is **not** kept: a stale issuer key would make every answer the callout gives be refused, so it is deleted with the rest. The task-signing key Secret is deleted with it.
 
 Under `next` the A2A gateway serves Prometheus counters on a metrics-only port, 9096 (container port `a2a-metrics`, set by `A2A_METRICS_PORT`), which the chart's `<name>-a2a-gateway-monitoring` `PodMonitoring` scrapes behind `platformAgent.podMonitoring`; the metrics are listed on [Observability](/kube-agents/concepts/observability/). The gateway's NetworkPolicy, `<name>-a2a-gateway-netpol`, renders wherever the gateway does, eval door or no door. It admits the `gke-gmp-system` namespace and the operator's own pods to that port and nothing else, the operator because its usage poller reads the gateway's inbound-message counter into `status.usage.chatMessagesInboundTotal`.
@@ -1718,7 +1813,7 @@ fail when it writes a condition type that has no row there:
 | `KanbanDispatcherFailing` | From the first time the task-board dispatcher fails for a whole poll, or a tick on a board runs past 300 s or fails on a database lock after a busy timeout | `True` (`TicksFailing`) once a board's dispatcher fails 60 ticks in a row (about one five-minute poll), or 3 in a streak at least a poll old, or once a board's tick runs past 300 s or fails on a database lock after waiting a 120 s busy timeout, as on a locked board; a good tick that runs past 300 s can set it for one poll. The message names the board and either the streak with the last error class, or the stuck tick. Cards on that board are not dispatched; a full data volume is a common cause. `False` (`Ticking`) at the first poll where no board meets any rule. A good tick resets a streak and a stuck board; a board the dispatcher stops trying drops out after ten minutes. It does not change `phase` or `Ready`. A poll that cannot read the gateway's chat metrics listener leaves it as it is. A board quarantined as corrupt is not counted. |
 | `ScopeUndeclared` | While `spec.scope` names no project, folder, organization, Shared VPC host or Metrics Scope, `spec.harness` names the host cluster, and the event watcher registers a cluster in the management project other than the host | `status: True`, `Reason: ClustersAdoptedFromProject`. Without a membership list the reconcile adopts every GKE cluster in the management project. The message counts them, names the first eight as `name (project/location)`, and points at the remedy: name the management project in `spec.scope.projects` to keep them, or list each under `spec.scope.exclude.clusters` ([`spec.scope`](#specscope)); on an installer-made install, set `SCOPE_PROJECTS` or `SCOPE_EXCLUDE_CLUSTERS` in `install.env`. The management project stays in scope under any declaration, so a scope that names other projects silences the condition without retiring the neighbours. Written by the usage poll from the watcher's `k8s_event_watcher_cluster_up` series; absent with the watcher disabled or unreachable, removed once that project registers no cluster beyond the host or a scope is declared. Not `Degraded`; `Ready` is unaffected. |
 | `HomeChannelUnset` | Under `mode: next`, while the A2A gateway holds a chat backend (Google Chat, or Slack with Google Chat off) whose `homeChannel` is empty (on Slack: and no learned channel is admitted) | `status: True`, `Reason: NoHomeChannel`. Proactive posts are refused while conversation replies still arrive. The gateway keeps them for one digest once a channel is set; with Slack on too they go to the Slack Hermes platform, which delivers them only if Slack has a home channel. The message says which. Not `Degraded`; `Ready` is unaffected. Written and cleared on a pass that ends `Ready` or `Provisioning`, and on one that renders the `next` stack and then parks `Degraded` (`ShellSandboxKeysMissing`, `A2AProvisionFailed`); a refusal that returns before the render leaves it as it stands. Set `homeChannel`, or on Slack under `homeChannelPolicy` `auto` mention the agent in a channel or pick one on the Home tab ([`spec.integration`](#specintegration) has the admission rule). |
-| `A2ABusConversionRefused` | Under `mode: next`, while `spec.harness.tuning.busReplicas` asks the existing A2A bus for a server count other than the one it runs | `status: True`, `Reason: ConversionNotSupported`. The bus keeps its count, since changing an existing bus's count is not supported yet. Setting the field to the running count, or removing it, clears the condition. Advisory: Ready stays on the bus that runs. |
+| `A2ABusMigrating` | Under `mode: next`, while a bus migration runs (True), and after one ended without converting the bus (False, `Abandoned`) or stopped for a person (False, `Failed`); absent once one converted the bus, or when none has run | `status: True`, `Reason: InProgress` while a run is under way; the message names its phase, which `status.busMigration` also carries. `False`, `Abandoned`: the run ended and the bus runs on as before, data kept. `False`, `Failed`: the run stopped where a person has to act, and the message names the step. An install upgraded from an operator that refused bus conversions loses that operator's `A2ABusConversionRefused` condition on its first status write. [Changing the bus's server count](#changing-the-buss-server-count) has the phases. |
 | `NoChatPlatform` | Under `mode: next`, while neither Google Chat nor Slack is enabled | `status: True`, `Reason: NoChatPlatform`. Nothing the agent raises unprompted reaches chat. Its audit findings stay in the report store on the data volume and reach the GitOps repository (ledger issues, fix pull requests) when one is registered; alerts are still triaged on the board; other scheduled reports are not delivered. Ask the agent for the audits in the console's chat pane, or read the volume with `kubectl exec`. Not `Degraded`; `Ready` is unaffected. A Discord-backed gateway carries it too, since no notifier posts to Discord. Written and cleared on the same passes as `HomeChannelUnset`. Enable one platform (`spec.integration.slack` or `spec.integration.googleChat` with `enabled: true`) to clear it. |
 | `ShellSandboxPinned` | While `spec.harness.experimental.shellSandbox.image` names an image other than the one the operator would run without it | `status: True`, `Reason: ImageDiffersFromOperator`. The message names both images. A pin survives operator and agent upgrades, and a sandbox older than the agent fails every `kubectl` call at the credential proxy with a policy refusal. Not `Degraded`; `Ready` is unaffected, since a pin to a mirror or a test build can be deliberate. Written and cleared on a pass that ends `Ready` or `Provisioning`, and on one that parks `Degraded` on `ShellSandboxKeysMissing` or `A2AProvisionFailed`, in either mode. Clear the field, or set it to the operator's image, to clear it. |
 | `A2AMCPServer` | Under `mode: next` with the operator's `A2A_MCP_DOOR` flag on, while a ServiceAccount named `<agent>-a2a-mcp` or a Secret named `<agent>-a2a-mcp-token` exists that this PlatformAgent does not control | `status: True`, `Reason: UnownedServiceAccount` or `UnownedTokenSecret`. Both names are reserved: an account somebody else created would run the MCP server as whatever Workload Identity it carries, and a foreign Secret would arm it with their credential. So the server is not rendered; a server and Service rendered earlier are removed, while the fence and the operator's own token stay. For an unowned account the broker's caller list and `CREDENTIAL_PROXY_MCP_CALLERS` do not name it. `Ready` is unaffected. The message names the object. Delete it; the condition clears on the next periodic pass, within 15 minutes. A controller reference is not a remedy: the operator would adopt the object as it is, annotations and contents included. |

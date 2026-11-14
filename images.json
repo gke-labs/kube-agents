@@ -173,7 +173,7 @@
       "repository": "docker.io/library/nats",
       "tag": "2.10-alpine",
       "override": "A2A_NATS_IMAGE",
-      "pulledBy": "The NATS StatefulSet the operator renders under spec.mode: next, and nothing under spec.mode: today.",
+      "pulledBy": "The NATS StatefulSet the operator renders under spec.mode: next, and nothing under spec.mode: today. A one-server bus also runs its `stale-cluster-meta` init step on this image, which needs a shell with `du` and `cut`: mirror an `-alpine` tag, not the scratch-based `nats` tags.",
       "description": "The JetStream bus behind the A2A next stack. The pin is the operator's compiled default; the env var is the only override, since the chart does not set it."
     },
     {
