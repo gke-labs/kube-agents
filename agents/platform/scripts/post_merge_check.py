@@ -361,6 +361,16 @@ def observed_directly(kubectl_json: KubectlJson, record: dict, workload: dict) -
         if selects((budget.get("spec") or {}).get("selector") or {}, labels):
             return True, f"no reconciler targets {namespace}; budget {budget['metadata']['name']} selects the workload"
     return False, f"no reconciler targets {namespace}; no budget selects the workload yet"
+def cluster_coordinates(record: dict) -> tuple[str, str, str]:
+    """``(project, name, location)`` for ``gcloud``: the fleet audit names a cluster
+    ``<project>/<location>/<name>``, so a qualified ``cluster`` gives the bare name, and its parts
+    fill a ``project`` or ``location`` the record left empty."""
+    cluster = str(record.get("cluster") or "")
+    project, location = record.get("project") or "", record.get("location") or ""
+    parts = cluster.split("/")
+    if len(parts) == 3 and all(parts):
+        project, location, cluster = project or parts[0], location or parts[1], parts[2]
+    return project, cluster, location
 
 
 class SandboxKubectl:
@@ -377,7 +387,7 @@ class SandboxKubectl:
     def __call__(self, record: dict, argv: list) -> dict:
         import stall_watch
 
-        key = (record["project"], record["cluster"], record["location"])
+        key = cluster_coordinates(record)
         if key not in self.kubeconfigs:
             self.kubeconfigs[key] = stall_watch.fetch_credentials(*key)
         done = stall_watch.run_sandbox(
@@ -432,9 +442,9 @@ def watch_health(
         url = record["url"]
         updates: dict[str, object] = {"health_checked_at": stamp}
         try:
-            if not (record["project"] and record["location"] and record["cluster"] and record["object"]):
+            cluster = cluster_coordinates(record)
+            if not (all(cluster) and record["object"]):
                 raise ClusterReadError("the record names no cluster or workload to read")
-            cluster = (record["project"], record["location"], record["cluster"])
             if cluster not in lists_by_cluster:
                 lists_by_cluster[cluster] = {
                     resource: kubectl_json(record, ["get", resource, "-A", "-o", "json", "--chunk-size=500"])

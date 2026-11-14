@@ -290,6 +290,11 @@ class WatchHealthTest(unittest.TestCase):
         self.cluster.apps = [argo_app()]
         self.assertEqual(self.tick(2)["applied"], [f"{REPO}/pull/1"])
 
+    def test_a_qualified_cluster_fills_the_coordinates_the_record_left_empty(self):
+        self.conn.execute("UPDATE post_merge_records SET project = '', location = '', cluster = 'p/l/prod'")
+        self.cluster.apps = [argo_app()]
+        self.assertEqual(self.tick(1)["applied"], [f"{REPO}/pull/1"])
+
     def test_a_record_with_no_cluster_coordinates_is_not_read(self):
         self.conn.execute("UPDATE post_merge_records SET project = ''")
         with self.assertLogs("post_merge_check", level="WARNING"):
@@ -386,6 +391,26 @@ class SandboxKubectlTest(unittest.TestCase):
             self.run_with(1, stderr='Error from server (NotFound): deployments.apps "x" not found')
         with self.assertRaises(post_merge_check.ClusterReadError):
             self.run_with(1, stderr="dial tcp: i/o timeout")
+
+    def test_a_qualified_cluster_name_reaches_gcloud_as_its_parts(self):
+        import subprocess
+        import types
+        from unittest import mock
+
+        asked = []
+        fake = types.ModuleType("stall_watch")
+        fake.fetch_credentials = lambda *key: asked.append(key) or "/home/hermes/.kubeconfigs/x.yaml"
+        fake.run_sandbox = lambda argv, timeout, kubeconfig: subprocess.CompletedProcess(argv, 0, '{"items": []}', "")
+        fake.stderr_excerpt = lambda text: text
+        with mock.patch.dict(sys.modules, {"stall_watch": fake}):
+            post_merge_check.SandboxKubectl()({"project": "acme-prod", "cluster": "acme-prod/us-east1/shared",
+                                               "location": "us-east1"}, ["get", "x", "-o", "json"])
+            post_merge_check.SandboxKubectl()({"project": "", "cluster": "acme-dev/europe-west1/web",
+                                               "location": ""}, ["get", "x", "-o", "json"])
+            post_merge_check.SandboxKubectl()({"project": "p", "cluster": "bare", "location": "l"},
+                                              ["get", "x", "-o", "json"])
+        self.assertEqual(asked, [("acme-prod", "shared", "us-east1"), ("acme-dev", "web", "europe-west1"),
+                                 ("p", "bare", "l")])
 
     def test_a_list_that_is_not_found_is_empty_not_a_gone_workload(self):
         import subprocess
