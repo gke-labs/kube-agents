@@ -303,6 +303,18 @@ def selects(selector: dict, labels: dict) -> bool:
     return bool(selector.get("matchLabels") or selector.get("matchExpressions"))
 
 
+def cluster_coordinates(record: dict) -> tuple[str, str, str]:
+    """``(project, name, location)`` for ``gcloud``: the fleet audit names a cluster
+    ``<project>/<location>/<name>``, so a qualified ``cluster`` gives the bare name, and its parts
+    fill a ``project`` or ``location`` the record left empty."""
+    cluster = str(record.get("cluster") or "")
+    project, location = record.get("project") or "", record.get("location") or ""
+    parts = cluster.split("/")
+    if len(parts) == 3 and all(parts):
+        project, location, cluster = project or parts[0], location or parts[1], parts[2]
+    return project, cluster, location
+
+
 class SandboxKubectl:
     """``kubectl ... -o json`` in the shell sandbox, against the record's cluster.
 
@@ -317,7 +329,7 @@ class SandboxKubectl:
     def __call__(self, record: dict, argv: list) -> dict:
         import stall_watch
 
-        key = (record["project"], record["cluster"], record["location"])
+        key = cluster_coordinates(record)
         if key not in self.kubeconfigs:
             self.kubeconfigs[key] = stall_watch.fetch_credentials(*key)
         done = stall_watch.run_sandbox(
