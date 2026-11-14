@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -259,6 +260,28 @@ func TestSlackHomeCountsTheWholeFleetPastTheCap(t *testing.T) {
 	got := viewText(t, api.views[0].view)
 	if !strings.Contains(got, "context: 40 clusters ·") || !strings.Contains(got, "context: 25 more clusters") {
 		t.Errorf("view:\n%s", got)
+	}
+}
+
+// Unlisted rows (#3658) are not clusters: the cap counts real rows only, so
+// an unlisted row is drawn whatever the findings rows ahead of it, and the
+// count and "N more" are clusters, never placeholders.
+func TestSlackHomeTheCapNeverHidesAnUnlistedRow(t *testing.T) {
+	b := &lib.Board{GeneratedAt: homeNow, ClusterCount: 16}
+	for i := 0; i < slackHomeClustersMax; i++ {
+		b.Clusters = append(b.Clusters, lib.BoardCluster{Name: fmt.Sprintf("hot-%02d", i), Findings: 1, Severity: "major", Top: "t"})
+	}
+	b.Clusters = append(b.Clusters, lib.BoardCluster{Name: "member-b (clusters unread)", Unlisted: true})
+	a, api, _ := homeAdapter(t, b, nil)
+	a.homeOpened(&slackevents.AppHomeOpenedEvent{User: "U1", Tab: "home"})
+	got := viewText(t, api.views[0].view)
+	for _, want := range []string{"context: 16 clusters ·", "*member-b (clusters unread)*  " + slackHomeUnlisted, "context: 1 more cluster\n"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("view lacks %q; got:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "17 clusters") {
+		t.Errorf("a placeholder was counted as a cluster; got:\n%s", got)
 	}
 }
 

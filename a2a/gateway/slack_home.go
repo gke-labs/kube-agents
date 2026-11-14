@@ -497,20 +497,33 @@ func (s *SlackAdapter) homeBlocks(b *lib.Board, waiting []homeQuestion, now time
 	if b.Error != "" {
 		note(fmt.Sprintf(slackHomeBoardUnread, slackDate(now, slackDateTime)))
 	} else {
-		total := max(b.ClusterCount, len(b.Clusters))
+		// An unlisted row (lib.BoardCluster.Unlisted) stands for projects, not
+		// a cluster: the cap and both counts are clusters, and an unlisted row
+		// is drawn wherever it sits, so the cap never hides it.
+		real := 0
+		for _, c := range b.Clusters {
+			if !c.Unlisted {
+				real++
+			}
+		}
+		total := max(b.ClusterCount, real)
 		note(fmt.Sprintf(slackHomeClusterCount, total, plural(total)),
 			slackHomeUpdated+slackDate(b.GeneratedAt, slackDateTime))
 		if b.FirstReportPending && b.FirstMessagePending {
 			note(slackHomeFirstReport)
 		}
-		for i, c := range b.Clusters {
-			if i == slackHomeClustersMax {
-				break
+		drawn := 0
+		for _, c := range b.Clusters {
+			if !c.Unlisted {
+				if drawn == slackHomeClustersMax {
+					continue
+				}
+				drawn++
 			}
 			section(clusterLine(c, b.FirstReportPending), nil)
 		}
-		if shown := min(len(b.Clusters), slackHomeClustersMax); total > shown {
-			note(fmt.Sprintf(slackHomeMoreClusters, total-shown, plural(total-shown)))
+		if total > drawn {
+			note(fmt.Sprintf(slackHomeMoreClusters, total-drawn, plural(total-drawn)))
 		}
 	}
 

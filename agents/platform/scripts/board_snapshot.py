@@ -15,7 +15,8 @@ holds the field names this module writes). No model is in the loop:
   and the unread ones, so neither draws as a project with no clusters;
 - running: the kanban cards whose status is ``running``, the cluster their
   assignee profile is scoped to beside each (under next, the profile name
-  derived from each listed cluster, for a card still filed to one);
+  derived from each cluster the resolved scope lists, for a card still filed
+  to one; a card in a project listed live has no label);
 - prs: the newest ``pr_opened`` events (``agents/platform/plugins/pr_opened``);
 - audit: the most recent fleet-audit run to finish, from the report store
   (``skills/fleet-audit/scripts/report_status.py``);
@@ -172,7 +173,10 @@ def scope_identities(scope: fleet_scope_targets.ScopeClusters) -> dict[str, tupl
 
     A card may still be filed to a cluster's per-cluster profile until routing
     moves to the `cluster` profile; its name is derived from the triple, so its
-    card keeps its cluster without a profile being read.
+    card keeps its cluster without a profile being read. Only LISTED projects
+    have triples: a card on a cluster in a project listed live (the management
+    and explicit projects) gets no cluster label under next, since labelling
+    it would mean reading the profiles this mode no longer reads.
     """
     from cluster_agent_profile import profile_name  # lazy: next mode only
 
@@ -221,13 +225,16 @@ def clusters(
     roster: set[tuple[str, str]],
     labels: dict[tuple[str, str], str],
     unlisted: list[dict] | None = None,
-) -> list[dict]:
-    """One row per cluster, worst first: the managed fleet plus any cluster a finding names.
+) -> tuple[list[dict], int]:
+    """The rows the board shows, worst first, and how many clusters there are in all.
 
+    The clusters are the managed fleet plus any cluster a finding names.
     ``findings`` is the open queue in rank order, so the first finding seen for
     a cluster is its top one. Clusters with findings sort by their top
-    finding's rank; ``unlisted`` (the projects with no cluster list, under
-    next) follows them, ahead of the clean ones by name, so the cap never
+    finding's rank; clean ones follow by name; CLUSTERS_MAX of them are shown.
+    ``unlisted`` (the rows for projects with no cluster list, under next) is
+    no cluster: it rides past the cap, after the shown clusters with findings
+    and ahead of the clean ones, and the count leaves it out, so the cap never
     hides it. A cluster is its (project, cluster) pair, the findings queue's
     own key, so two projects' ``prod`` are two rows.
     """
@@ -244,9 +251,9 @@ def clusters(
     for key in sorted(roster - set(rows), key=lambda k: labels[k]):
         rows[key] = {"name": labels[key], "findings": 0}
         order.append(key)
-    found = sum(1 for key in order if rows[key]["findings"])
-    out = [rows[key] for key in order]
-    return [*out[:found], *(unlisted or []), *out[found:]]
+    shown = [rows[key] for key in order[:CLUSTERS_MAX]]
+    found = sum(1 for row in shown if row["findings"])
+    return [*shown[:found], *(unlisted or []), *shown[found:]], len(order)
 
 
 def running(kanban: sqlite3.Connection, identities: dict[str, tuple[str, str]], labels: dict[tuple[str, str], str]) -> list[dict]:
@@ -363,11 +370,11 @@ def snapshot(
     identities = cluster_identities(profiles_dir) if scope is None else scope_identities(scope)
     roster = set(identities.values())
     labels = cluster_labels(roster | {(str(f.get("project") or ""), str(f.get("cluster") or "")) for f in findings})
-    fleet = clusters(findings, roster, labels, unlisted_rows(scope) if scope is not None else None)
+    fleet, count = clusters(findings, roster, labels, unlisted_rows(scope) if scope is not None else None)
     board: dict[str, Any] = {
         "generated_at": now.astimezone(timezone.utc).isoformat(),
-        "clusters": fleet[:CLUSTERS_MAX],
-        "cluster_count": len(fleet),
+        "clusters": fleet,
+        "cluster_count": count,
         "running": [],
         "prs": [],
     }

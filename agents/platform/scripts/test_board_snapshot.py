@@ -423,6 +423,42 @@ class BoardSnapshotNextModeTest(unittest.TestCase):
         self.assertIs(rows["member-b (clusters unread)"]["unlisted"], True)
         self.assertEqual(rows["web"], {"name": "web", "findings": 0})
 
+    def test_the_cap_never_hides_a_placeholder_row(self):
+        # More clusters with findings than the cap, and a project nothing read:
+        # the placeholders ride past the cap, which counts real clusters only,
+        # and cluster_count is clusters, not placeholders.
+        self.next_mode([("member-a", "ok"), ("member-b", "denied")], {"member-a": {"at": "2026-10-16T12:00:00Z", "clusters": []}})
+        hot = board_snapshot.CLUSTERS_MAX + 1
+        findings_queue.register_findings(self.session, [dict(finding(f"hot-{i:02d}", f"hot{i} broken", "major"), project="member-a")
+                                                        for i in range(hot)])
+        board = self.snap()
+        rows = board["clusters"]
+        self.assertEqual([r["name"] for r in rows if r.get("unlisted")],
+                         ["mgmt (clusters not listed here)", "member-b (clusters unread)"])
+        self.assertEqual(len([r for r in rows if not r.get("unlisted")]), board_snapshot.CLUSTERS_MAX)
+        self.assertEqual(board["cluster_count"], hot)
+
+    def test_a_card_in_a_project_listed_live_has_no_cluster_label(self):
+        # Under next the label is derived from the clusters the resolved scope
+        # lists; the management and explicit projects are listed live, so no
+        # name is derived for their clusters and no profile is read for one.
+        from cluster_agent_profile import profile_name
+
+        self.next_mode([], {})
+        kanban = kanban_db()
+        kanban.execute("INSERT INTO tasks VALUES ('t1', 'host work', ?, 'running', ?, ?)",
+                       (profile_name("mgmt", "host", "us-central1"), STARTED, STARTED))
+        (card,) = self.snap(kanban)["running"]
+        self.assertEqual(card["title"], "host work")
+        self.assertNotIn("cluster", card)
+
+    def test_a_blank_resolved_scope_path_is_today_mode(self):
+        # Whitespace is unset, as fleet_scope_targets.resolved_scope_file reads it (#5660).
+        before = self.snap()
+        self.next_mode([("member-a", "ok")], {"member-a": {"at": "2026-10-16T12:00:00Z", "clusters": [["us-central1", "web"]]}})
+        os.environ["KUBEAGENTS_RESOLVED_SCOPE_FILE"] = "  \t "
+        self.assertEqual(self.snap(), before)
+
     def test_a_running_card_on_a_clusters_profile_still_names_its_cluster(self):
         # Until routing moves to the cluster profile, a card may still be
         # assigned to the per-cluster profile name, derived from the scope's

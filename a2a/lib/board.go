@@ -25,9 +25,11 @@ type Board struct {
 	// GeneratedAt is when the sender read it.
 	GeneratedAt time.Time `json:"generated_at"`
 	// Clusters is the clusters the agent manages (a Cluster Agent profile
-	// each) and any other cluster an open finding names, with their open
-	// findings, worst first and capped by the sender; ClusterCount is how many
-	// there are in all. A name repeated across projects is "project/cluster".
+	// each; under spec.mode: next, the resolved scope's) and any other cluster
+	// an open finding names, with their open findings, worst first and capped
+	// by the sender, plus any Unlisted rows, which the cap and ClusterCount
+	// leave out; ClusterCount is how many clusters there are in all. A name
+	// repeated across projects is "project/cluster".
 	Clusters     []BoardCluster `json:"clusters"`
 	ClusterCount int            `json:"cluster_count"`
 	// Running is the kanban cards in flight.
@@ -60,8 +62,12 @@ type BoardCluster struct {
 	// Unlisted marks a row that stands for projects whose clusters the sender
 	// holds no list for (under spec.mode: next, the projects listed live and
 	// the unread ones; the Name says which). It has no findings because
-	// nothing read it, so it is never drawn as a healthy cluster. Absent from
-	// an older sender and from every real cluster row.
+	// nothing read it, so it is never drawn as a healthy cluster, is not
+	// counted in ClusterCount, and is not cut by the cap. Absent from an older
+	// sender and from every real cluster row. A gateway older than the field
+	// drops it and draws the row green with its name ("... (clusters
+	// unread)") still saying what it is; the chart ships the gateway and the
+	// agent image together, so that is a skew while a roll is in progress only.
 	Unlisted bool `json:"unlisted,omitempty"`
 }
 
