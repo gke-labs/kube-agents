@@ -951,6 +951,13 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 		}
 		g.markFrom(rec, taskID, answerChat)
 	case lib.StateFailed, lib.StateCanceled:
+		if s.Status.State == lib.StateCanceled {
+			// The card-stop result of a cancel that stopped the turn's
+			// cards, to the adapter whose caller is a program, before the
+			// terminal (CardStopObserver); nothing else of a canceled
+			// result is handed over.
+			g.observeCardStop(rec, taskID, rs.result)
+		}
 		reason := ""
 		if s.Status.Message != nil {
 			reason = joinTextParts(s.Status.Message.Parts)

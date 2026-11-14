@@ -393,6 +393,17 @@ func (s *sideDoorAdapter) TaskDelivered(conversation, taskID, result string) {
 	}
 }
 
+// TaskCardStop reaches the owning door, as TaskDelivered does.
+func (s *sideDoorAdapter) TaskCardStop(conversation, taskID, text string, cardStop lib.Part) {
+	if door := s.doorFor(conversation); door != nil {
+		if observer, ok := door.(CardStopObserver); ok {
+			observer.TaskCardStop(conversation, taskID, text, cardStop)
+		}
+	} else if observer, ok := s.primary.(CardStopObserver); ok {
+		observer.TaskCardStop(conversation, taskID, text, cardStop)
+	}
+}
+
 // MessageDropped and TurnFinished reach the owning door alone, for the same
 // reason: a chat user reads their own conversation, and a door's caller is
 // the one that would otherwise have to guess what became of its message.

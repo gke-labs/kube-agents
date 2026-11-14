@@ -1846,6 +1846,13 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 				}
 			}
 		}
+		// A canceled task's card-stop result, the one part of a canceled
+		// result a program's caller is handed (CardStopObserver).
+		if task.State == lib.StateCanceled {
+			if art := task.Artifact(lib.ArtifactResult); art != nil {
+				g.observeCardStop(rec, active.TaskID, art.Parts)
+			}
+		}
 		g.logTaskTerminal(rec, addressee, active.TaskID, task.State, source, finalMessageText(task))
 		// A console client is told the task handed work to cards, as the
 		// relay tells it (relayTerminal): the fold read here carries the
@@ -2883,6 +2890,36 @@ func (g *Gateway) observeTaskDelivered(rec *SessionRecord, taskID, result string
 	if stash && isConsoleConversation(rec.Key) {
 		g.consoleResults.put(taskID, result)
 	}
+}
+
+// observeCardStop hands a CardStopObserver a canceled task's card-stop
+// result: the result artifact's text and its cardStop part, the result form
+// only. A result with no such part hands over nothing, so a canceled turn's
+// other output never reaches a door's caller. Announced under the chain's
+// root, and only for the task whose end is the chain's, as observeDelivered.
+func (g *Gateway) observeCardStop(rec *SessionRecord, taskID string, parts []lib.Part) {
+	part, ok := cardStopResultPart(parts)
+	if !ok {
+		return
+	}
+	id, ends := rec.observedAs(taskID)
+	if !ends {
+		return
+	}
+	if observer, ok := g.adapter.(CardStopObserver); ok {
+		observer.TaskCardStop(rec.Key, id, joinTextParts(parts), part)
+	}
+}
+
+// cardStopResultPart is the data part among parts that holds the result
+// form of the cardStop part (cardStopResultOf), alone.
+func cardStopResultPart(parts []lib.Part) (lib.Part, bool) {
+	for _, p := range parts {
+		if _, ok := cardStopResultOf([]lib.Part{p}); ok {
+			return p, true
+		}
+	}
+	return lib.Part{}, false
 }
 
 // finalMessageText is the text of a folded task's terminal status message,
