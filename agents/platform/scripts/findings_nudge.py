@@ -35,7 +35,7 @@ formatting and bookkeeping. Each run:
    the state file alone while its marks have not landed.
 
 Nothing is added before the first inventory report is out (its delivery
-claimed, or under ``spec.mode: next`` its post's outcome recorded), so that
+claimed, or on the conversation path its post's outcome recorded), so that
 report is the first thing onboarding says about the fleet. The hold ends
 ``FIRST_REPORT_HOLD_HOURS`` (24) after onboarding filed its sweep, delivered or
 not: an undelivered report by then means onboarding stalled, and holding on
@@ -115,7 +115,7 @@ RUN_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 # Filed and not yet delivered means a first report is on its way.
 SCAN_FILED_MARKER = ".bootstrap_scan_filed"
 DELIVERED_MARKER = ".bootstrap_completed"
-# Under spec.mode next a claim on the conversation path is one attempt and can
+# A claim on the conversation path is one attempt and can
 # be released; the report is out only once this outcome marker exists
 # (bootstrap_delivery.py, CONVERSATION_FILE, CONVERSATION_ALIGNED_MARKER and
 # CONVERSATION_DONE_FILE).
@@ -177,7 +177,7 @@ def _filed_at(marker: Path) -> tuple[datetime, str] | None:
 def first_report_markers(gateway_home: Path) -> tuple[Path, Path]:
     """The sweep marker, and the marker that says the first report is out.
 
-    Out is the delivery claim, or on the conversation path (``spec.mode: next``)
+    Out is the delivery claim, or on the conversation path
     the recorded outcome, because a claim there can be released and taken
     again. The board snapshot reads the same pair for the Home tab, and ends
     its state early once delivery has registered the sweep's findings.

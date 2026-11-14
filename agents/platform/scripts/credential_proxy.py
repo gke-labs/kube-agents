@@ -2169,7 +2169,7 @@ DEFAULT_CREDENTIAL_PROXY_CHAT_AUDIENCE = "kubeagents-credential-proxy-chat"
 # not known", rather than with some other role's reach.
 DEFAULT_CREDENTIAL_PROXY_MCP_AUDIENCE = "kubeagents-credential-proxy-mcp"
 
-# The scope publisher's audience (#4119). A next-mode Job with no gcloud of its
+# The scope publisher's audience (#4119). A Job with no gcloud of its
 # own: it runs five read-only lookups through /v1/exec, and scope_policy holds
 # it to them. Bound to its callers both ways, and conferred to nobody when no
 # callers are named, as the mcp audience is.
@@ -16521,7 +16521,7 @@ def install_shutdown_handler(
     message pulled but not yet acked sits in Pub/Sub until its ack deadline
     (SHUTDOWN_SETTLE_SECONDS has the argument). The Slack relay's queue is not
     handed back: its envelopes were acknowledged to Slack on arrival, and the
-    gateway on a next install reads Slack itself. A second SIGTERM changes
+    gateway reads Slack itself where it holds Slack. A second SIGTERM changes
     nothing; the stop already under way finishes.
 
     With drain_seconds (the broker role's SHUTDOWN_DRAIN_SECONDS, the exec role's
