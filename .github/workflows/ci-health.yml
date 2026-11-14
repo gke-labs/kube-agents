@@ -458,7 +458,10 @@ jobs:
           # with no release candidate would otherwise stop every publish. Both
           # RC warning shapes (the ls failure and the timeout) name the glob,
           # so dropping lines that mention the job name drops exactly those.
-          if grep -v "post-kube-agents-eval-rc" work/collect.log \
+          # The Slack lane is excluded for the same reason: a failed read
+          # carries slack_overhead forward, and an optional lane must not stall
+          # the publish.
+          if grep -Ev "post-kube-agents-eval-rc|ci-kube-agents-eval-nightly-slack" work/collect.log \
             | grep -Eq "warning: gcloud storage (ls|cat) .*(failed|timed out)"; then
             echo "::error::collect.py could not list or read the Prow archive; not publishing"
             exit 1
