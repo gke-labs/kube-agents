@@ -7,7 +7,7 @@ reports the fix as broken: on 2026-11-05 a dev install said Argo CD had
 deleted a PodDisruptionBudget because it looked before Argo synced the merge.
 This module answers the question that comes first: given the reconciler
 object that delivers the fix and the proposal's ``mergeCommit``, has that
-commit been applied? Nothing calls it yet; the post-merge check will.
+commit been applied? ``post_merge_check.py health`` calls it.
 
 It reads one object, as ``kubectl get -o json`` returns it, and decides
 nothing about the workload; health is the next check's job.
