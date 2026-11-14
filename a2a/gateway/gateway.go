@@ -766,6 +766,10 @@ func (g *Gateway) relaySubscribeConfig() lib.SubscribeConfig {
 		MaxAckPending: relayMaxAckPending,
 		WaitForStream: true,
 		Precreated:    g.relayPrecreated,
+		// The operator moves the relay durable to read the profile
+		// supervisor form too (#5301); either set binds meanwhile.
+		AcceptFilterSets: [][]string{{"a2a.tasks.*.*." + lib.TaskClassEvents, "a2a.tasks.*.*." + lib.TaskClassSupervisor,
+			"a2a.tasks." + lib.TaskProfileSupervisorToken + ".*.*." + lib.TaskClassSupervisor}},
 	}
 }
 
@@ -1832,7 +1836,7 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 		// caller classifying a bridge's own failure by its reason token
 		// would grade it as the persona's for the one that came this way.
 		source := TerminalFromExecutor
-		if terminalSubject == lib.TaskSupervisorSubject(addressee, active.TaskID) {
+		if lib.IsTaskSupervisorSubject(terminalSubject, addressee, active.TaskID) {
 			source = TerminalFromSupervisor
 		}
 		// The deliverable too, from the stream, for the same program: the
@@ -2045,7 +2049,7 @@ func (g *Gateway) relayLagStart(taskID string, storedAt, now time.Time) time.Tim
 // acts twice.
 func (g *Gateway) relayUnrelayedDelegation(ctx context.Context, rec *SessionRecord, taskID, addressee string, task *lib.Task, terminalSubject string) {
 	source := TerminalFromExecutor
-	if terminalSubject == lib.TaskSupervisorSubject(addressee, taskID) {
+	if lib.IsTaskSupervisorSubject(terminalSubject, addressee, taskID) {
 		source = TerminalFromSupervisor
 	}
 	g.mu.Lock()
@@ -2272,7 +2276,7 @@ func (g *Gateway) probeConversation(ctx context.Context, key, taskID string) (Co
 			// only the executor's; a supervisor terminal says an executor
 			// died or never ran, which is the install's.
 			state.TerminalSource = TerminalFromExecutor
-			if terminalSubject == lib.TaskSupervisorSubject(addressee, read) {
+			if lib.IsTaskSupervisorSubject(terminalSubject, addressee, read) {
 				state.TerminalSource = TerminalFromSupervisor
 			}
 			if art := task.Artifact(lib.ArtifactResult); art != nil {
