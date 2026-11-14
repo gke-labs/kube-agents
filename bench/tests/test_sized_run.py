@@ -112,10 +112,6 @@ class RunTest(unittest.TestCase):
         self.assertTrue(result["green"], result)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class RemarkTest(unittest.TestCase):
     def test_an_unclaimed_mark_is_made_again_after_ten_minutes(self):
         marks = {"a": (0.0, 1), "b": (0.0, 1)}
@@ -161,3 +157,7 @@ class VerdictTimingTest(unittest.TestCase):
         self.assertTrue(result["green"])
         self.assertEqual(result["errors"], record.errors)
         self.assertIsNot(result["errors"], record.errors)
+
+
+if __name__ == "__main__":
+    unittest.main()

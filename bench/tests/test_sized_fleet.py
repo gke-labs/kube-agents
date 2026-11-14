@@ -149,10 +149,6 @@ class CheckTest(unittest.TestCase):
         self.assertTrue(sf.check(self.fleet, observed, None)["sound"])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class EpochTest(unittest.TestCase):
     def test_a_kubernetes_timestamp_is_utc_in_any_local_zone(self):
         import os
@@ -181,3 +177,7 @@ class TransientTest(unittest.TestCase):
         message = "The connection to the server 136.119.233.207 was refused - did you specify the right host or port?"
         self.assertTrue(kube.TRANSIENT_RE.search(message))
         self.assertFalse(kube.TRANSIENT_RE.search('Error from server (NotFound): pods "x" not found'))
+
+
+if __name__ == "__main__":
+    unittest.main()

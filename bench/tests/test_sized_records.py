@@ -63,10 +63,6 @@ class CostTest(unittest.TestCase):
             sr.fleet_cost([sr.Instance("e2-medium", 30, 1.0)], [], {"prices": sr.pick_prices(CATALOG)})
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class RegionTest(unittest.TestCase):
     def test_skus_follow_the_region(self):
         europe = {key: (description, region) for key, _s, description, region in sr.skus("europe-west1")}
@@ -124,3 +120,7 @@ class SafeTest(unittest.TestCase):
 
         self.assertEqual(sr.safe(broken, errors, "cost record"), {})
         self.assertEqual(errors, ["cost record: NameError: a defect"])
+
+
+if __name__ == "__main__":
+    unittest.main()
