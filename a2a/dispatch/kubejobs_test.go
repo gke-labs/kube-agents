@@ -421,7 +421,7 @@ func TestTheJobTemplateIsReadOnlyWhenItIsTheConfigsRendering(t *testing.T) {
 				}
 				return
 			}
-			if err == nil || (c.name != "no containers" && c.name != "another profile's" && !errors.Is(err, ErrJobTemplateNotCurrent)) {
+			if err == nil || (c.name != "another profile's" && !errors.Is(err, ErrJobTemplateNotCurrent)) {
 				t.Fatalf("err %v, want the launch held", err)
 			}
 		})
