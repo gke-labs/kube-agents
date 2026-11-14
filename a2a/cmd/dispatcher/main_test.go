@@ -465,3 +465,33 @@ func TestAStopBeforeDispatchingIsACleanStop(t *testing.T) {
 		t.Errorf("a moved namespace during the connect: %v, want errProfileNamespaceMoved", err)
 	}
 }
+
+// With A2A_DISPATCHER_BUCKETED_GRANTS exactly "true" the process prepares one
+// bucket connection per lib.DispatcherBucket, on the projected token; any
+// other value keeps the one connection. A static NATS_USER has no callout to
+// split its grants, so the switch refuses it.
+func TestReadSettingsPreparesTheBucketConnectionsOnlyWhenBucketed(t *testing.T) {
+	tok := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tok, []byte("t"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	base := map[string]string{"NATS_URL": "nats://x", envNamespace: "ka", envConfigMap: "m", lib.EnvBusTokenFile: tok}
+	for v, want := range map[string]int{"true": lib.DispatcherBuckets, " true ": lib.DispatcherBuckets, "": 0, "false": 0, "TRUE": 0, "1": 0} {
+		m := map[string]string{envBucketedGrants: v}
+		for k, val := range base {
+			m[k] = val
+		}
+		s, err := readSettings(env(m))
+		if err != nil {
+			t.Fatalf("%s=%q: %v", envBucketedGrants, v, err)
+		}
+		if len(s.bucketAuth) != want {
+			t.Errorf("%s=%q: %d bucket connections, want %d", envBucketedGrants, v, len(s.bucketAuth), want)
+		}
+	}
+	static := map[string]string{"NATS_URL": "nats://x", envNamespace: "ka", envConfigMap: "m",
+		"NATS_USER": "dispatcher", "NATS_PASSWORD": "pw", envBucketedGrants: "true"}
+	if _, err := readSettings(env(static)); err == nil {
+		t.Error("bucketed grants were accepted on a static NATS_USER")
+	}
+}

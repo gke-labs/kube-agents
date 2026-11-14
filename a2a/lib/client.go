@@ -234,10 +234,13 @@ func (c *Client) ProtocolViolations() int64 {
 type ClientOption func(*clientOptions)
 
 type clientOptions struct {
-	name      string
-	logger    *slog.Logger
-	natsOpts  []nats.Option
-	agreement AgreementPolicy
+	name     string
+	logger   *slog.Logger
+	natsOpts []nats.Option
+	// firstDialOpts apply to Connect's dial alone, never to a rebuild
+	// (WithFirstDialNATSOptions).
+	firstDialOpts []nats.Option
+	agreement     AgreementPolicy
 	// err is set by an option that was handed something it cannot use, and
 	// surfaced by Connect before any dial. Options have no return value, and
 	// a misconfigured credential that fell through to the server would come
@@ -270,6 +273,16 @@ func WithNATSOptions(opts ...nats.Option) ClientOption {
 	return func(o *clientOptions) { o.natsOpts = append(o.natsOpts, opts...) }
 }
 
+// WithFirstDialNATSOptions adds nats.go options to Connect's first dial
+// only. A rebuild (the ClosedHandler recovery, Reconnect) dials without
+// them. For nats.RetryOnFailedConnect above all: on the first dial it lets
+// Connect return a connection that keeps trying in the background, but on a
+// rebuild it would make a failed dial look like success and skip the
+// rebuild's own backoff.
+func WithFirstDialNATSOptions(opts ...nats.Option) ClientOption {
+	return func(o *clientOptions) { o.firstDialOpts = append(o.firstDialOpts, opts...) }
+}
+
 // Connect dials NATS and establishes JetStream. All four connection callbacks
 // — disconnected, reconnected, closed, error — are registered here and logged
 // with the server error that triggered them (NR-3).
@@ -285,7 +298,7 @@ func Connect(ctx context.Context, url string, opts ...ClientOption) (*Client, er
 	if c.log == nil {
 		c.log = slog.Default()
 	}
-	nc, js, err := c.dial()
+	nc, js, err := c.dial(c.opts.firstDialOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -296,7 +309,7 @@ func Connect(ctx context.Context, url string, opts ...ClientOption) (*Client, er
 // dial builds a fresh connection with the callback set. It never touches
 // existing connection objects, so the rebuild path (NR-2) can call it against
 // a dead predecessor.
-func (c *Client) dial() (*nats.Conn, jetstream.JetStream, error) {
+func (c *Client) dial(extra ...nats.Option) (*nats.Conn, jetstream.JetStream, error) {
 	// Order matters: overridable defaults, then the caller's options, then the
 	// four connection callbacks — last, so nothing can displace them (NR-3).
 	opts := []nats.Option{
@@ -306,6 +319,7 @@ func (c *Client) dial() (*nats.Conn, jetstream.JetStream, error) {
 	}
 	opts = append(opts, TLSOptions()...)
 	opts = append(opts, c.opts.natsOpts...)
+	opts = append(opts, extra...)
 	opts = append(opts,
 		// NR-6: jittered backoff on every reconnection attempt, library-owned
 		// like the callbacks below.

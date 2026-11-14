@@ -552,8 +552,13 @@ func TestADrainingProfileBoundAgainKeepsDrainingWhileHeld(t *testing.T) {
 
 // A held profile keeps its own identities in the map, but the dispatcher's
 // grant leaves out its supervisor subjects until it is dispatchable.
+// The unbucketed shape, where the dispatcher entry carries every profile's
+// subjects. With bucketed grants the callout derives each bucket's grants
+// from the profile entries, and a held profile's are not yet left out
+// (gke-labs/kube-agents#5935); the dispatch config leaves it out either way.
 func TestAHeldProfileIsOutOfTheDispatchersGrantOnly(t *testing.T) {
 	withDispatcher(t)
+	t.Setenv(a2aDispatcherBucketedGrantsEnvVar, "false") // on unless "false" since #5577
 	agent := a2aTestAgent()
 	x, y := testAgentProfile(agent.Namespace, "x"), testAgentProfile(agent.Namespace, "y")
 	doc, err := renderA2AAuthMapHeld(agent, []agentv1alpha1.AgentProfile{x, y}, []agentv1alpha1.AgentProfile{x}, nil)

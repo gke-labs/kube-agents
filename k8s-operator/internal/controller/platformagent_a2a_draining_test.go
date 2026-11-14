@@ -113,6 +113,7 @@ func TestADroppedProfileDrainsForItsDeadlineAndThenGoes(t *testing.T) {
 // fixture, which lib validates strictly.
 func TestADrainingProfileKeepsItsTerminalGrantAndNoDurable(t *testing.T) {
 	withDispatcher(t)
+	t.Setenv(a2aDispatcherBucketedGrantsEnvVar, "false") // the flag-off render's fixture
 	withOperatorBusPrincipal(t)
 	agent := authMapTestAgent()
 	tse := testAgentProfile(agent.Namespace, "tse")
@@ -236,6 +237,7 @@ func TestTheReconcileDrainsWhatTheAppliedConfigListed(t *testing.T) {
 // from the one set read for the pass.
 func TestTheReconcileRendersADroppedProfileDrainingInBothPlaces(t *testing.T) {
 	withDispatcher(t)
+	t.Setenv(a2aDispatcherBucketedGrantsEnvVar, "false") // reads the draining grants off the flag-off entry
 	withOperatorBusPrincipal(t)
 	agent := a2aTestAgent()
 	r, cl, req := a2aGateTestReconciler(t, agent)
