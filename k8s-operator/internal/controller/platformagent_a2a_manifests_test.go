@@ -333,16 +333,16 @@ func TestBuildA2AProvisionJob(t *testing.T) {
 	}
 
 	for _, want := range []string{
-		// TASKS: a2a.tasks.>, 72h, 20GiB
-		"TASKS", "a2a.tasks.>", "--max-age=72h", "21474836480",
+		// TASKS: a2a.tasks.>, 72h, 8GiB
+		"TASKS", "a2a.tasks.>", "--max-age=72h", "--max-bytes=8589934592 ",
 		// DIRECTORY: last-value, 1GiB
 		"DIRECTORY", "a2a.agents.>", "--max-msgs-per-subject=1",
 		// TOPICS-STATE: 8-deep, no age, the state topics
 		"TOPICS-STATE", "--max-msgs-per-subject=8",
 		"a2a.topics.agent.platform.upgrade-readiness", "a2a.topics.agent.platform.topology-skew", "a2a.topics.shared.blueprint",
 		"nats stream edit TOPICS-STATE --subjects=",
-		// TOPICS-JOURNAL: 30d, 5GiB, the journal topic
-		"TOPICS-JOURNAL", "--max-age=720h", "5368709120", "a2a.topics.shared.annotations",
+		// TOPICS-JOURNAL: 30d, 1GiB, the journal topic
+		"TOPICS-JOURNAL", "--max-age=720h", "--max-bytes=1073741824 ", "a2a.topics.shared.annotations",
 		// max_bytes discipline
 		"1073741824", "--discard=old",
 		// KV buckets, capped like the streams
@@ -2625,7 +2625,9 @@ func TestCleanupA2AResumesAfterAMidPassErrorOnPartialRender(t *testing.T) {
 	today.Spec.Mode = nil
 
 	writes := 0
-	stopAt := 8
+	// The tiers file is written before the identity map, so the first
+	// authmap shard is the ninth write.
+	stopAt := 9
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(next.DeepCopy()).

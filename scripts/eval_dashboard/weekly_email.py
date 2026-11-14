@@ -232,13 +232,16 @@ TILE_TIME_VALUE = "{minutes} min"
 TILE_TIME_SUB = "middle of {count} timed runs; " + SLOWEST_SHARE + " over {p90} min"
 TILE_TIME_NONE = "n/a"
 TILE_TIME_NONE_SUB = "no timing on record"
-TILE_TOKENS_LABEL = "typical tokens per run"
-TILE_TOKENS_SUB = "middle of {count} counted runs"
+TILE_TOKENS_LABEL = "typical tokens per scenario run"
+TILE_TOKENS_SUB = "one repetition of one scenario, all agents; middle of {count} counted runs"
 TILE_TOKENS_UP = "; &#9650; {pct}% vs last week on the same scenarios"
 TILE_TOKENS_DOWN = "; &#9660; {pct}% vs last week on the same scenarios"
 TILE_TOKENS_SAME = "; flat vs last week on the same scenarios"
 TILE_TOKENS_PARTIAL = "; {count} partial left out"
 TILE_TOKENS_CACHE = "; {pct}% of prompt tokens read from cache ({count} runs)"
+# Fewer runs than this with a prompt split say little about caching, so the
+# cache share is left off the tile and the Chat line below it.
+TOKENS_CACHE_MIN_RUNS = 30
 TILE_TOKENS_NONE = "n/a"
 TILE_TOKENS_NONE_SUB = "no full count; {count} partial left out"
 # Three tiles share the row, or four with the tokens tile.
@@ -356,7 +359,7 @@ CHAT_TIME_SLOWEST = " · slowest area: {name} ({minutes} min)"
 CHAT_TIME_NONE = "⏱ Task time: no timing on record"
 # The tokens line, the same on the card and in its text fallback; left out
 # of both when no repetition the week compared carries a count.
-CHAT_TOKENS = "🔢 Tokens: typical {typical} per run{change}{partial}"
+CHAT_TOKENS = "🔢 Tokens: typical {typical} per scenario run{change}{partial}"
 CHAT_TOKENS_NONE = "🔢 Tokens: no full count{partial}"
 CHAT_TOKENS_UP = " (▲ {pct}% vs last week on the same scenarios)"
 CHAT_TOKENS_DOWN = " (▼ {pct}% vs last week on the same scenarios)"
@@ -1287,7 +1290,7 @@ def tokens_tile_text(figures: dict | None) -> tuple[str, str] | None:
     if figures["typical"] is None:
         return TILE_TOKENS_NONE, TILE_TOKENS_NONE_SUB.format(count=partial)
     change = "" if pct is None else TILE_TOKENS_UP.format(pct=pct) if pct > 0 else TILE_TOKENS_DOWN.format(pct=-pct) if pct < 0 else TILE_TOKENS_SAME
-    cache = "" if figures["cache_pct"] is None else TILE_TOKENS_CACHE.format(pct=figures["cache_pct"], count=figures["cache_runs"])
+    cache = "" if figures["cache_pct"] is None or figures["cache_runs"] < TOKENS_CACHE_MIN_RUNS else TILE_TOKENS_CACHE.format(pct=figures["cache_pct"], count=figures["cache_runs"])
     sub = TILE_TOKENS_SUB.format(count=figures["counted"]) + change + cache + (TILE_TOKENS_PARTIAL.format(count=partial) if partial else "")
     return figures["typical"], sub
 
@@ -1346,7 +1349,7 @@ def chat_tokens(week: dict) -> str | None:
     if figures["typical"] is None:
         return CHAT_TOKENS_NONE.format(partial=partial_text)
     change = "" if pct is None else CHAT_TOKENS_UP.format(pct=pct) if pct > 0 else CHAT_TOKENS_DOWN.format(pct=-pct) if pct < 0 else CHAT_TOKENS_SAME
-    cache = "" if figures["cache_pct"] is None else CHAT_TOKENS_CACHE.format(pct=figures["cache_pct"])
+    cache = "" if figures["cache_pct"] is None or figures["cache_runs"] < TOKENS_CACHE_MIN_RUNS else CHAT_TOKENS_CACHE.format(pct=figures["cache_pct"])
     return CHAT_TOKENS.format(typical=figures["typical"], change=change + cache, partial=partial_text)
 
 

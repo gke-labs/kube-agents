@@ -54,12 +54,13 @@ type InboundMessage struct {
 	// bare quote that could not be read is no turn (gchat.go, quotedAsk).
 	QuotedUnread bool
 
-	// Backend names the ingress this message arrived through, and empty
-	// means the gateway's own configured backend. It exists because one
-	// gateway can now have two ingresses: the inject side door may be armed
-	// beside a real backend, and attribution is a property of the message
-	// rather than of the process. A message that says nothing is attributed
-	// to the configured backend, which is every chat backend's case.
+	// Backend names the ingress this message arrived through. It exists
+	// because one gateway has several ingresses: every armed chat backend
+	// runs behind the mux, and the side doors sit beside them, so
+	// attribution is a property of the message rather than of the process.
+	// Behind the mux every chat message carries its adapter's key (mux.go,
+	// Run). Empty means the gateway's own configured backend, which is only
+	// the case for a hand-built single-adapter gateway with no mux.
 	Backend string
 
 	// Profile, when set, addresses this turn to an AgentProfile, with
@@ -104,6 +105,10 @@ type InboundMessage struct {
 	// settles on the answer, and the ask keeps ⏸️. False on every backend
 	// but Slack.
 	Answer bool
+	// ArrivedAt is when the adapter received the message, set by the Slack
+	// adapter only: the start of slack_first_ack_seconds, which ends when the
+	// gateway has drawn the ask's arrival reaction (drawArrivalMark).
+	ArrivedAt time.Time
 	// Unaddressed marks a message the sender did not address to the bot,
 	// delivered only because of where it was typed: today an unmentioned
 	// Slack reply under one of the bot's own posts (an alert, or another

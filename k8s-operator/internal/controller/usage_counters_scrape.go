@@ -238,8 +238,13 @@ const (
 	// board's streak, in seconds, beside the ticks; matched to them by board.
 	// A plugin from before it serves only the ticks.
 	kanbanDispatcherFailingSecondsSeries = "kubeagents_kanban_dispatcher_failing_seconds"
-	kanbanDispatcherBoardLabel           = "board"
-	kanbanDispatcherErrorLabel           = "error"
+	// kanbanDispatcherStuckSecondsSeries is the plugin's gauge of a board whose
+	// tick ran past its limit or failed on a database lock after a busy timeout
+	// (a locked board), in seconds since that tick began; a board can be stuck
+	// before a streak rule holds. A plugin from before it serves none.
+	kanbanDispatcherStuckSecondsSeries = "kubeagents_kanban_dispatcher_stuck_seconds"
+	kanbanDispatcherBoardLabel         = "board"
+	kanbanDispatcherErrorLabel         = "error"
 	// usageDispatcherBoardCeiling bounds the failing boards one body may list,
 	// refused rather than clamped as usageClusterGaugeCeiling is. Hermes keeps
 	// a handful of boards; a body past this is a broken one.
@@ -312,6 +317,15 @@ const (
 	// usageScrapeKindOther is the kind for an error that is not a
 	// usageScrapeError, which the pod source never returns and a stub might.
 	usageScrapeKindOther = "error"
+
+	// usageClosedIdleErrorText is the text of net/http's unexported
+	// errServerClosedIdle: the transport's read loop starts as soon as the
+	// connection is dialled, and when the peer's close reaches it before the
+	// request is registered there, that plain sentinel -- neither a
+	// net.OpError nor io.EOF, and wrapping neither -- is what client.Do
+	// returns. usageConnectKind compares the innermost cause against it by
+	// equality, so no byte a peer sent can steer the match.
+	usageClosedIdleErrorText = "http: server closed idle connection"
 )
 
 var (
@@ -642,6 +656,15 @@ type usageReading struct {
 // failure.
 type usageDispatcherReading struct {
 	Failing []usageDispatcherFailure
+	// Stuck is the boards whose tick ran past the plugin's limit or failed on a
+	// lock after a busy timeout, with the seconds since that tick began.
+	Stuck []usageDispatcherStuck
+}
+
+// usageDispatcherStuck is one board the plugin reports stuck.
+type usageDispatcherStuck struct {
+	Board   string
+	Seconds int64
 }
 
 // usageDispatcherFailure is one board's failed-tick streak, and its age when
@@ -701,10 +724,11 @@ func (e *usageScrapeError) Error() string {
 
 // usageConnectKind classifies a client.Do error by what happened rather than
 // where it surfaced: a timeout, a dial that was refused, unreachable, a
-// connection the peer accepted but never answered on, or -- only when the peer
-// did send a status line the client could not parse -- a malformed response, so
-// the event points the reader at the layer that failed rather than at a policy.
-// Never the text net/http builds from the bytes it read.
+// connection the peer accepted but never answered on (however the transport
+// reports the close), or -- only when the peer did send a status line the
+// client could not parse -- a malformed response, so the event points the
+// reader at the layer that failed rather than at a policy. Never the text
+// net/http builds from the bytes it read.
 func usageConnectKind(err error) string {
 	if usageTimedOut(err) {
 		return usageScrapeKindTimeout
@@ -728,7 +752,26 @@ func usageConnectKind(err error) string {
 		errors.Is(err, io.EOF) {
 		return usageScrapeKindConnect
 	}
+	// The same close, seen by the transport's read loop before the request
+	// was registered with it, surfaces as the closed-idle sentinel instead of
+	// the EOF underneath: still nothing answered, still connect.
+	if usageRootCause(err).Error() == usageClosedIdleErrorText {
+		return usageScrapeKindConnect
+	}
 	return usageScrapeKindMalformed
+}
+
+// usageRootCause is the innermost error of err's Unwrap chain, the one whose
+// text is its own rather than a wrapper's, so a wrapper that quotes the peer's
+// bytes around a cause is never what a sentinel is compared against.
+func usageRootCause(err error) error {
+	for {
+		inner := errors.Unwrap(err)
+		if inner == nil {
+			return err
+		}
+		err = inner
+	}
 }
 
 // usageTimedOut reports whether err is a deadline or a network timeout, which
@@ -853,7 +896,7 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 		if family == kanbanGaveUpSeries {
 			dispatcher = &usageDispatcherReading{}
 			dispatcherAges = map[string]int64{}
-			wanted = append(wanted, kanbanDispatcherFailedTicksSeries, kanbanDispatcherFailingSecondsSeries)
+			wanted = append(wanted, kanbanDispatcherFailedTicksSeries, kanbanDispatcherFailingSecondsSeries, kanbanDispatcherStuckSecondsSeries)
 		}
 	}
 	// The reading slot, for a body asked for readings: a running sum per spec
@@ -957,6 +1000,17 @@ func foldUsageBody(body io.Reader, counters []string, kinds []usageReadingKind) 
 							return usageReading{}, &usageScrapeError{Kind: usageScrapeKindSample}
 						}
 						dispatcherAges[usageLabelValue(metric, kanbanDispatcherBoardLabel)] = int64(value)
+						continue
+					}
+					if name == kanbanDispatcherStuckSecondsSeries {
+						// Bounded as the age is, for the condition's message.
+						if len(dispatcher.Stuck) >= usageDispatcherBoardCeiling || value >= float64(math.MaxInt64/int64(time.Second)) {
+							return usageReading{}, &usageScrapeError{Kind: usageScrapeKindSample}
+						}
+						dispatcher.Stuck = append(dispatcher.Stuck, usageDispatcherStuck{
+							Board:   usageLabelValue(metric, kanbanDispatcherBoardLabel),
+							Seconds: int64(value),
+						})
 						continue
 					}
 					if name == clusterUpSeries {

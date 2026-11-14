@@ -65,6 +65,9 @@ _OPERATOR_ONLY_ENV_KEYS = ("INCIDENT_TRIAGE_OPEN_PULL_REQUEST", "INCIDENT_TRIAGE
 # projection mounted, the projected file is the channel the gateway posts
 # into, so the mirror must not fill the key the container env lacks.
 _PROJECTED_HOME_ENV_KEYS = ("SLACK_HOME_CHANNEL",)
+# Joins the per-platform no-route refusals when the gateway holds more than one
+# backend with no home channel; chat_delivery_watch reads refusals joined by it.
+NO_CHAT_ROUTE_JOIN = "; "
 
 # The origin of a unit of work (docs/designs/proposal-origin.md §2.1): one value
 # per session, written once under ORIGIN_KEY in its metadata, with the chat
@@ -1276,6 +1279,11 @@ DRIFT_ALERT_EMOJI = "🔀"
 # shape rather than leaving the column blank and the recap with nothing to
 # group on.
 DRIFT_LEDGER_REASON = "OutOfBandChange"
+
+# The titles a drift triage gives its two usual options. A title is the button
+# slack_ux_incident draws for the option, so these are what a person presses.
+DRIFT_REVERT_TITLE = "Put Git's version back"
+DRIFT_KEEP_TITLE = "Keep it · update Git"
 
 # What a drift card says when the install has no usable GitOps repository
 # registered (gitops_preflight's NO_REGISTERED_REPO, which also covers entries
@@ -2964,12 +2972,12 @@ def enabled_chat_platforms() -> list[str]:
        than dropped because it is the truth on the installs that do write it.
     3. The environment signals above, for an install neither file describes.
 
-    One thing outranks all three: the platform ``chat_notify.routed_platform()``
+    One thing outranks all three: the platforms ``chat_notify.routed_platforms()``
     names, from ``A2A_NOTIFY_PLATFORM`` or the projected home-channel file. Under
     ``spec.mode: next`` the
-    managed scope says that platform's Hermes consumer is off because the A2A
-    gateway holds the backend, and posts to it go through the gateway instead,
-    so it is still a platform this install posts to, with a home channel or
+    managed scope says each such platform's Hermes consumer is off because the
+    A2A gateway holds its backend, and posts to it go through the gateway
+    instead, so each is still a platform this install posts to, with a home channel or
     (when it is the only chat platform) without one, the gateway keeping the
     refused posts for a digest. The operator renders the variable only then,
     and it is reserved against every other source.
@@ -3072,17 +3080,18 @@ def _no_chat_route_error() -> str:
     It reaches `last_delivery_error` through the relay adapter and the 502, and
     from there the dashboard, `hermes cron list`, the cronjob tool's reply in
     chat and the `chat_delivery_watch` ledger issue. The gateway names its
-    backend whether or not a home channel is set, so with one named the cause is
-    the missing home channel; without one this cannot tell no chat from a
-    misconfigured one, so it guesses at neither. A pod the operator has routed
-    never reaches this: its send goes to the gateway, whose refusal says the
-    post is kept.
+    backends whether or not a home channel is set, so with any named the cause
+    is the missing home channel, one sentence per platform; without one this
+    cannot tell no chat from a misconfigured one, so it guesses at neither. A
+    pod the operator has routed never reaches this: its send goes to the
+    gateway, whose refusal says the post is kept.
     """
-    platform = chat_notify.gateway_platform()
-    setting = HOME_CHANNEL_SETTINGS.get(platform)
-    if setting:
-        return f"composed but not delivered to {platform} (no home channel: set {setting})"
-    return NO_CHAT_ROUTE_ERROR
+    refusals = [
+        f"composed but not delivered to {platform} (no home channel: set {HOME_CHANNEL_SETTINGS[platform]})"
+        for platform in chat_notify.gateway_platforms()
+        if platform in HOME_CHANNEL_SETTINGS
+    ]
+    return NO_CHAT_ROUTE_JOIN.join(refusals) or NO_CHAT_ROUTE_ERROR
 
 
 def get_active_platform(platforms: Optional[list[str]] = None) -> str:
@@ -4594,6 +4603,10 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
         f"declares, or change git to declare what is now live — and both are worth stating even when one is "
         f"obviously right, because the reader is deciding which state wins. For an object git does not declare "
         f"they are the ones above.\n\n"
+        f"**Title those two with these exact words,** because each title becomes the button a person presses in "
+        f"chat: the revert is `{DRIFT_REVERT_TITLE}`, and changing git to declare what is now live is "
+        f"`{DRIFT_KEEP_TITLE}`. The same words title a lone **Proposed fix** that does one of them. Any other "
+        f"option gets a short title of its own.\n\n"
         f"**With two or more options:** label them 'Option A', 'Option B', ... in order, name those same letters "
         f"in the call to action, and mark exactly one of them '✅ **Recommended: Option <letter>**'. "
         f"The template below shows that shape; repeat its Option line once for each further option.\n\n"
@@ -4612,8 +4625,14 @@ def _drift_task_body(payload: Dict[str, Any]) -> str:
         f"Format the report you pass to `kanban_complete`'s `result` exactly like this — "
         f"these three `##` sections are the only ones, and there is no fourth:\n\n"
         f"## What's wrong\n\n"
-        f"<1 sentence: who changed what, and whether it is still live>\n\n"
+        f"<object> on <cluster> was changed outside Git.\n\n"
+        f"<1-2 sentences: which field went from what to what, at what time and by whom, then whether the change "
+        f"still stands and what it means now>\n\n"
         f"## Why\n\n"
+        f"```diff\n"
+        f"- <field>: <its value before the change, or 'not shown by the cluster'>\n"
+        f"+ <field>: <its value now>\n"
+        f"```\n\n"
         f"- <What the live object shows now, and how it differs from what git declares (or that git declares "
         f"nothing for it), with the evidence>\n"
         f"- <What the change affects — availability, cost, security posture — in 1-2 sentences>\n\n"
@@ -6465,7 +6484,7 @@ def relay_cron_report(
     with neither platform, or a pod rendered before the operator routed its only
     platform without a home channel (a routed pod sends, and the gateway refuses
     and keeps the post). The error
-    names the platform and the setting that arms it, in the wording
+    names each platform without a home channel and the setting that arms it, in the wording
     `chat_delivery_watch` reads the platform from; see
     :func:`_no_chat_route_error`.
 

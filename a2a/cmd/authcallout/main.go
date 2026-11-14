@@ -28,6 +28,7 @@ import (
 	"k8s.io/client-go/rest"
 
 	"github.com/gke-labs/kube-agents/a2a/authcallout"
+	"github.com/gke-labs/kube-agents/a2a/capability"
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
 
@@ -117,6 +118,9 @@ func main() {
 func run(log *slog.Logger) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	// The install's Tier resources, rendered by the operator (#3659): a
+	// profile entry may name any tier the table holds.
+	capability.StartTierFile(ctx, os.Getenv, log)
 
 	namespace := os.Getenv(envNamespace)
 	if namespace == "" {
@@ -214,6 +218,9 @@ func run(log *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("%s: %w", envAuthMapShards, err)
 	}
+	// A map refused because a profile entry names a tier this process hadn't
+	// loaded yet is re-judged when the tier table changes (#3659).
+	capability.OnTiersChanged(store.Revalidate)
 	validator, err := authcallout.NewTokenValidator(clientset, audience)
 	if err != nil {
 		return err

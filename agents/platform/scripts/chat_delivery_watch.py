@@ -307,9 +307,13 @@ def grade_error(error: str) -> str:
 
 
 def platforms_from(error: str) -> list[str]:
-    match = PARTIAL_RE.search(error) or HARD_UNDELIVERED_RE.search(error)
-    if match:
-        return [p.strip() for p in match.group(1).split(",") if p.strip()]
+    partial = PARTIAL_RE.search(error)
+    # A refusal for several platforms repeats the hard phrase once per platform,
+    # so every match counts, in order, each platform once.
+    groups = [partial.group(1)] if partial else HARD_UNDELIVERED_RE.findall(error)
+    if groups:
+        names = [p.strip() for group in groups for p in group.split(",") if p.strip()]
+        return list(dict.fromkeys(names))
     return sorted(set(NOT_CONFIGURED_RE.findall(error)))
 
 

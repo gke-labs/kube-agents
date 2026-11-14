@@ -1,0 +1,13 @@
+# The profile namespace. The operator treats a namespace of this name as the
+# profile namespace only when it carries the component label and the
+# release-namespace annotation below (agentprofile_namespace.go), the markers
+# the chart's profiles-namespace.yaml sets. The annotation names the install
+# namespace the profiles belong to. The name takes the kustomization's prefix.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: system-profiles
+  labels:
+    app.kubernetes.io/component: profiles
+  annotations:
+    meta.helm.sh/release-namespace: kubeagents-system

@@ -199,7 +199,7 @@ func (r *PlatformAgentReconciler) credentialProxyProfileConfigFor(ctx context.Co
 	if !a2aStackRendering(agent) || r.agentProfilesUnreadable {
 		return credentialProxyProfileConfig{}, nil
 	}
-	profiles, err := boundAgentProfiles(ctx, r.Client, agent)
+	profiles, err := boundAgentProfiles(ctx, r.Client, agent, r.tiersUnreadable)
 	if err != nil {
 		return credentialProxyProfileConfig{}, fmt.Errorf("failed to list AgentProfiles for the credential proxy: %w", err)
 	}
