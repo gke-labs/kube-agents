@@ -49,8 +49,6 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "bench"))
 
-import yaml  # noqa: E402
-
 from kube_agents_bench.scale import collect, kube  # noqa: E402
 from kube_agents_bench.scale import sized_fleet as sf  # noqa: E402
 from kube_agents_bench.scale import operations, runner, sized_records, sized_run  # noqa: E402
@@ -70,9 +68,9 @@ RELEASE = "kube-agents"
 CHART_DIR = REPO / "charts" / "kube-agents"
 CRD_DIR = CHART_DIR / "crds"
 REGISTRY = "ghcr.io"
-CHART_VALUES = CHART_DIR / "values.yaml"
-TAG_SUFFIX = ".tag"
-REPOSITORY_FIELD = "repository"
+IMAGES_FILE = REPO / "images.json"
+FIRST_PARTY = "first-party"
+RELEASE_TAG_POLICY = "release"
 MANIFEST_ACCEPT = ("application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, "
                    "application/vnd.docker.distribution.manifest.list.v2+json, "
                    "application/vnd.docker.distribution.manifest.v2+json")
@@ -577,15 +575,15 @@ def summary(name: str, body: dict) -> str:
 
 
 def image_repositories() -> list[str]:
-    """The registry path of each image the release sets a tag on, read from the chart's values."""
-    values = yaml.safe_load(CHART_VALUES.read_text())
-    repos = []
-    for key in IMAGE_TAG_KEYS:
-        node = values
-        for part in key.removesuffix(TAG_SUFFIX).split("."):
-            node = node[part]
-        repos.append(node[REPOSITORY_FIELD].removeprefix(f"{REGISTRY}/"))
-    return repos
+    """The registry path of every first-party image an install pulls at the release's tag.
+
+    images.json is the inventory of what an install pulls. The chart's tag keys name only
+    five; the operator renders the agent bus's images (a2a-*, hermes-bridge, web-console)
+    at its own tag, and the release pushes them last.
+    """
+    images = json.loads(IMAGES_FILE.read_text())["images"]
+    return sorted(i["repository"].removeprefix(f"{REGISTRY}/") for i in images
+                  if i.get("origin") == FIRST_PARTY and i.get("tagPolicy") == RELEASE_TAG_POLICY)
 
 
 def image_published(sha: str) -> bool:
@@ -681,11 +679,21 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         created = datetime.fromisoformat(cluster["createTime"].replace("Z", "+00:00")).timestamp()
         if now - created > args.max_age_hours * SECONDS_PER_HOUR:
             stale.add(cluster["resourceLabels"].get(SIZE_LABEL, "").upper())
-    for size in sorted(s for s in stale if s in TIERS):
+    unknown = sorted(stale - set(TIERS))
+    if unknown:
+        LOG.warning("sized-fleet clusters with no known size label, left alone: %s", ", ".join(unknown) or "(empty)")
+    swept, failed = [], []
+    # Every stale size is tried: one size whose destroy fails must not keep the others standing.
+    for size in sorted(stale & set(TIERS)):
         LOG.warning("deleting the %s fleet an earlier run left", size)
-        cmd_down(argparse.Namespace(**{**vars(args), "size": size}))
-    LOG.info("sweep: %s", ", ".join(sorted(stale)) or "nothing to delete")
-    return 0
+        try:
+            cmd_down(argparse.Namespace(**{**vars(args), "size": size}))
+            swept.append(size)
+        except (TofuFailed, subprocess.SubprocessError, kube.CommandError) as exc:
+            LOG.error("the %s fleet could not be deleted: %s", size, exc)
+            failed.append(size)
+    LOG.info("sweep: deleted %s; failed %s", ", ".join(swept) or "nothing", ", ".join(failed) or "nothing")
+    return EXIT_UNSOUND if failed else 0
 
 
 def cmd_down(args: argparse.Namespace) -> int:

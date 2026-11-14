@@ -110,6 +110,24 @@ class SweepTest(unittest.TestCase):
             cli.cmd_sweep(args())
         self.assertEqual(deleted, ["M"])
 
+    def test_a_failed_size_does_not_stop_the_others_and_the_sweep_says_so(self):
+        old = "2026-11-10T00:00:00Z"
+        clusters = [{"createTime": old, "resourceLabels": {cli.SIZE_LABEL: size}} for size in ("l", "m", "x")]
+        tried = []
+
+        def down(a):
+            tried.append(a.size)
+            if a.size == "L":
+                raise cli.TofuFailed("destroy", 1, "state lock")
+
+        now = cli.datetime.fromisoformat("2026-11-11T10:00:00+00:00").timestamp()
+        with mock.patch.object(cli.kube, "gcloud", return_value=json.dumps(clusters)), \
+                mock.patch.object(cli.time, "time", return_value=now), \
+                mock.patch.object(cli, "cmd_down", side_effect=down):
+            rc = cli.cmd_sweep(args())
+        self.assertEqual(tried, ["L", "M"])
+        self.assertEqual(rc, cli.EXIT_UNSOUND)
+
 
 class EvalTest(unittest.TestCase):
     def test_the_cases_file_lists_paths_and_skips_comments(self):
@@ -134,10 +152,12 @@ class EvalTest(unittest.TestCase):
 
 
 class ImagesTest(unittest.TestCase):
-    def test_every_tagged_image_is_checked_from_the_chart_values(self):
+    def test_every_first_party_image_an_install_pulls_is_checked(self):
         repos = cli.image_repositories()
-        self.assertEqual(len(repos), len(cli.IMAGE_TAG_KEYS))
-        self.assertIn("gke-labs/kube-agents/platform-agent", repos)
+        # The chart's five tags, and the bus images the operator renders at its own tag.
+        for name in ("platform-agent", "k8s-operator", "a2a-gateway", "a2a-worker", "hermes-bridge", "web-console"):
+            self.assertIn(f"gke-labs/kube-agents/{name}", repos)
+        self.assertFalse(any("litellm" in r for r in repos))
 
     def test_a_commit_counts_as_published_only_when_every_image_is(self):
         with mock.patch.object(cli, "manifest_exists", side_effect=lambda repo, sha: "operator" in repo):
