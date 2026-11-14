@@ -356,6 +356,25 @@ class SessionShippedWorkloadSkillsTest(unittest.TestCase):
         self.assertIn('"check if there are any failing workloads"', section)
         self.assertNotIn("workload_triage.py", section)
 
+    def test_cluster_soul_status_answer_names_what_it_found_not_the_command(self):
+        soul = (REPO_ROOT / "agents/cluster/SOUL.md").read_text(encoding="utf-8")
+        section = soul[soul.index("## 4.") : soul.index("## 5.")]
+        self.assertIn(
+            'the evidence sentence states what you found ("no node has `MemoryPressure`"), naming no command, '
+            "script, kube context or the time you ran it",
+            section,
+        )
+        self.assertNotIn("the command named inside an evidence sentence", section)
+
+    def test_triage_scan_status_answer_keeps_run_details_out(self):
+        skills = REPO_ROOT / "agents/cluster"
+        for path in ("skills/workload-triage-scan/SKILL.md", "persona/skills/workload-triage-scan/SKILL.md"):
+            text = (skills / path).read_text(encoding="utf-8")
+            self.assertIn("The command, the kubeconfig context and the UTC time on the scan's first line stay out of the answer.", text, path)
+            self.assertNotIn("(kubeconfig context and UTC time), its summary line and the command", text, path)
+        reporting = (skills / "skills/workload-triage-scan/references/reporting.md").read_text(encoding="utf-8")
+        self.assertNotIn("Scanned <UTC time> on <context>", reporting)
+
 
 class RoutedSkillsExistTest(unittest.TestCase):
     def test_config_connector_skill_exists(self):
