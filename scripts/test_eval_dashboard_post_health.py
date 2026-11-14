@@ -2616,6 +2616,11 @@ class WatchedPeriodics(RunHarness):
         text = post_health.render_periodic_clear(doc, prev)
         self.assertIn("(build 9): 35 visited: 35 converged.", text)
         self.assertNotIn("3 refused", text)
+        # A recovery decided on a daily that failed elsewhere says so beside
+        # its summary, so the ✅ does not read as carrying a failure of its own.
+        doc["periodics_superseded"] = {"post-kube-agents-fleet-reconcile": {"build": "7", "recovery": True, "by": {"build": "11", "finished_at": "2026-09-16T08:40:00+00:00", "summary": "35 visited: 1 failed, 34 applied", "passed": False}}}
+        self.assertEqual(post_health.periodic_clears(doc, prev), ["post-kube-agents-fleet-reconcile"])
+        self.assertIn(f"(build 11): 35 visited: 1 failed, 34 applied{post_health.CLEARED_BY_FAILED_RUN}.", post_health.render_periodic_clear(doc, prev))
 
     def test_the_digest_line_for_an_unreadable_finish_time_says_so(self):
         doc = health("GREEN")

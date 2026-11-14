@@ -1475,7 +1475,10 @@ def review(dry_run: bool = False) -> tuple[list[str], int]:
     now = now_utc()
     stamp = now.strftime(STAMP_FORMAT)
     scope = watch.declared_scope()
-    names = watch.projects()
+    # One read of the cluster lists for the roster and its gap check, as the
+    # daily watch's tick makes (#5621).
+    cluster_lists = watch.cluster_scope()
+    names = watch.projects(cluster_lists)
     if not names:
         raise RuntimeError(NO_PROJECTS_DETAIL)
     home = weekly_home()
@@ -1499,6 +1502,12 @@ def review(dry_run: bool = False) -> tuple[list[str], int]:
         claimed.update(done)
 
     members, errors, tables, failures, read_ids = run_projects(ordered_names(names, previous), scope, on_project=registered)
+    gap = watch.resolved_scope_gap(cluster_lists)
+    if gap is not None:
+        # Under spec.mode: next a resolved scope that names no member left the
+        # member projects out of the roster: the week is partial, said as such,
+        # not a complete review of the live projects alone.
+        failures[str(gap[watch.MEMBER_ID_KEYS[0]])] = str(gap[watch.MESSAGE_KEY])
     if failures and not read_ids:
         raise ProjectsFailed(shown([f"{p}: {d}" for p, d in failures.items()], MAX_NAMES_IN_LINE, OVERFLOW_NOTE_PLAIN), failures)
     report_path = home / stamp / REPORT_MD_NAME

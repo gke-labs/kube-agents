@@ -75,8 +75,9 @@ __all__ = [
 #   ``tool_calls_optional``, ``audit_streams``, ``scope_exclude`` (read by
 #   ``scope_exclude.py``), ``writes_alone`` and ``requested_pull_requests``
 #   (read by ``lane.py`` and by ``load_case``), ``suite``
-#   (``certification``: the case runs on the certification lane only, read by
-#   scripts/validate_bench_cases.py against hack/eval/certification-cases.txt)
+#   (``certification``: the case runs on the certification lane only; the
+#   lane and scripts/validate_bench_cases.py read the bare line from the task
+#   file), ``certification_part`` (which section of that lane, default 1)
 #   -- and ``task_version``, a
 #   case's own revision note that nothing reads. A new one is added here, in a
 #   pull request before any case a pull-request job grades uses it (the
@@ -90,6 +91,7 @@ REPOSITORY_CASE_KEYS = frozenset(
     {
         "domain", "fixtures", "owner", "expected_fail", "tool_calls_optional",
         "audit_streams", scope_exclude.KEY, "task_version", "writes_alone", "suite",
+        "certification_part",
         _REQUESTED_KEY,
     }
 )

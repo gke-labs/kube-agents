@@ -56,6 +56,7 @@ _NAMESPACE = "kubeagents-system"
 _CONSOLE_NAME = "kube-agents-web-console"
 _CR_READY = "Ready\tReconciled: all workloads ready"
 _CR_DEGRADED = "Degraded\tPodUnschedulable: Pod platform-agent-gateway-x cannot be scheduled"
+_CR_BUS_DEGRADED = "Degraded\tPodUnschedulable: Pod platform-agent-a2a-nats-2 cannot be scheduled onto any available node: 0/5 nodes are available"
 
 _IMAGE_SOURCE_SECTION = (r"^# ─── 2a\. Image Source.*?", r"^# --- agent model required in a Prow job: begin")
 _BUILD_SECTION = (r"^# ─── 4\. Build Container Images.*?", r"^# ─── 5\. Chart Deployment")
@@ -622,6 +623,23 @@ class GateTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("ERROR: platform-agent is Degraded with the web console on under today; Ready condition: PodUnschedulable: Pod platform-agent-gateway-x cannot be scheduled", result.stdout)
         self.assertEqual(len(self.kubectl_calls("get platformagent platform-agent")), 12 + 2)
+
+    def test_a_bus_server_waiting_for_a_node_is_waited_for_then_judged(self) -> None:
+        # The operator renders the NATS bus from its first pass; on an
+        # Autopilot pool a server can wait for a node past the minute the
+        # gate reads. Degraded for that reason alone earns the bus window,
+        # and the CR is judged on what it says once the server schedules.
+        result = self.run_gate(cr_first=_CR_BUS_DEGRADED, cr_first_reads=14)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("is Degraded while a NATS server waits for a node", result.stdout)
+        self.assertIn("platform-agent is Ready: Reconciled: all workloads ready)", result.stdout)
+        self.assertEqual(len(self.kubectl_calls("get platformagent platform-agent")), 15)
+
+    def test_a_bus_server_still_unscheduled_after_the_window_fails_as_degraded(self) -> None:
+        result = self.run_gate(cr=_CR_BUS_DEGRADED)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("ERROR: platform-agent is Degraded with the web console on under today; Ready condition: PodUnschedulable: Pod platform-agent-a2a-nats-2", result.stdout)
+        self.assertEqual(len(self.kubectl_calls("get platformagent platform-agent")), 12 + 120 + 2, "the reads, the bus window, then report_cr_status's two")
 
     def test_a_rollout_that_fails_stops_before_any_request(self) -> None:
         result = self.run_gate(rollout_rc=1)

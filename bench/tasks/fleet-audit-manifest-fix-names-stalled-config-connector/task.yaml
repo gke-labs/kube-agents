@@ -1,8 +1,11 @@
-# FIXTURE_NOT_READY — scripts/validate_bench_cases.py. No pool project runs
-# Config Connector (provisioning-kcc-cluster-without-crds-stops relies on
-# that), so the stack below has no cluster to plant on. The entry moves to
-# hack/eval/nightly-cases.txt when a pool project carries a Config Connector
-# cluster in the audited fleet.
+# Registered in hack/eval/nightly-cases.txt. Seeded-a runs Config Connector
+# in namespaced mode in every pool project (the config-connector-namespaced
+# role, bench/tf/fleet/config-connector.tf), and the stack below plants on
+# that cluster. The fixture-state scan of 2026-11-10 read the role healthy on
+# all 40 pool projects. provisioning-kcc-cluster-without-crds-stops keeps
+# slot a out of its scope, so it still sees no Config Connector. A tofu case
+# that declares writes_alone (below), so it runs in the nightly's writers
+# part (writers-c, listed in hack/eval/nightly-writers-c.txt).
 #
 # WHAT THIS GRADES. That a fix of a pool whose declaration Config Connector
 # does not apply says so in the ledger. The stockout collector reads Config
@@ -29,7 +32,13 @@
 # with Ready=False and makes no GCP call. When Config Connector runs in
 # namespaced mode, the plant first creates a ConfigConnectorContext in that
 # namespace with the service account in kcc_google_service_account (it needs
-# no IAM role), because no controller watches a namespace without one. The same declaration, committed to
+# no IAM role), because no controller watches a namespace without one. The
+# namespace carries kubeagents.x-k8s.io/stall-watch: exempt, so the install's
+# stall watch raises no alert on the object; the audits do not read that
+# annotation. The eval install excludes the namespace from the k8s event
+# watcher (EVAL_EVENT_WATCHER_EXCLUDED_NAMESPACE in hack/ci-deploy.sh), so a
+# DependencyNotFound event on the object opens no incident. A dev install
+# without that rule can open one. The same declaration, committed to
 # the GitOps repository at clusters/<seeded-a>/provisioning/pinned-inference-pool.yaml,
 # is the file the SOP's fix for the capped, single-zone pool edits. The
 # teardown closes the pull request the run opened on that file (only from the
@@ -41,6 +50,16 @@
 # Isolation class: one namespace on the Config Connector cluster, one file on
 # the GitOps repository's default branch, read-only fleet sweep, GitOps-repo
 # write (the ledger).
+#
+# writes_alone. The stack writes the declaration to the GitOps repository's
+# default branch for the run. The lane runs this case alone in its second
+# phase, so no other unit's collector reads the planted file while it is
+# live, and the repository reset runs before each repetition and deletes a
+# declaration that a failed or killed teardown left
+# (hack/ci_reset_agent_pulls.py, planted_stack_files). A pull request that
+# the reply does not name is still charged to the case by the write
+# safeguard.
+writes_alone: true
 id: fleet-audit-manifest-fix-names-stalled-config-connector
 name: A stockout fix of a pool whose declaration Config Connector is not applying says so in the ledger
 prompt: >-
@@ -64,9 +83,11 @@ infrastructure:
   # Only what this case sets. The harness gives project_id. The harness gives
   # the narrowed GitOps write token file, gitops_repo (owner/name),
   # kcc_cluster_name, kcc_cluster_location and kcc_google_service_account to
-  # a stack that declares bench_gitops_write_token_file (#4742), once a pool
-  # carries a Config Connector cluster. Each value below is repeated in the stack's
-  # variables.tf and in the checks below; change one and change all.
+  # a stack that declares bench_gitops_write_token_file (#4742); the pool's
+  # Config Connector cluster is seeded-a. Each value below is repeated in the stack's
+  # variables.tf and in the checks below, and kcc_namespace also in
+  # hack/ci-deploy.sh (EVAL_EVENT_WATCHER_EXCLUDED_NAMESPACE); change one and
+  # change all.
   variables:
     kcc_namespace: "eval-kcc-stalled"
     seeded_slot: "a"
@@ -79,9 +100,14 @@ domain: fleet-audits
 # Who answers when this case flakes -- see bench/CONTRIBUTING.md.
 owner: dshnayder
 
-# The pool the declaration names is the hpa-saturated role's.
+# The pool the declaration names is the hpa-saturated role's. The stack plants
+# on the cluster of the config-connector-namespaced role. The drift gate
+# (bench/kube_agents_bench/fixture_drift.py) reads the singular fixture_role,
+# hpa-saturated; when Config Connector is not on seeded-a,
+# the plant stops at apply.
 fixtures:
   - hpa-saturated
+  - config-connector-namespaced
 
 verification_spec:
   # The deciding check: the object as the note names it, the planted

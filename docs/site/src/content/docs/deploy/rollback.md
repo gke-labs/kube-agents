@@ -68,7 +68,10 @@ export KUBE_AGENTS_INSTALL_ENV=/path/to/your/install/install.env
 Read `N`'s release notes before you go. Everything they list is something `N-1` does not know
 about, and the next two sections say what happens to each kind of thing.
 
-On an install running `spec.mode: next`, switch it to `today` first ([Upgrade → Switching back to
+On a release that retires `spec.mode`, the webhook rewrites `today` to `next` and the switch below
+does nothing.
+
+On an earlier release, on an install running `spec.mode: next`, switch it to `today` first ([Upgrade → Switching back to
 `today`](/kube-agents/install/upgrade/#switching-back-to-today)) and check that Slack answers. No
 chart up to 0.9.0 declares `platformAgent.mode`, so a rollback to one cannot keep the mode. The
 recorded key is a value `N-1` does not declare, refused, dropped or ignored as [The

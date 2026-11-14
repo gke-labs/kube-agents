@@ -187,51 +187,6 @@ func TestForgettingAnAgentForgetsItsLease(t *testing.T) {
 	}
 }
 
-// TestTheGatewayLeaseFollowsTheMode: a reconcile under mode next creates the
-// Lease, and the flip to today removes it with the rest of the stack.
-func TestTheGatewayLeaseFollowsTheMode(t *testing.T) {
-	t.Setenv(a2aGatewayElectionEnvVar, "true")
-	scheme := setupScheme()
-	agent := a2aTestAgent()
-	cl := fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithObjects(agent).
-		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
-		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
-		Build()
-	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
-	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
-	ctx := context.Background()
-	for i := 0; i < 2; i++ {
-		if _, err := r.Reconcile(ctx, req); err != nil {
-			t.Fatalf("Reconcile %d: %v", i+1, err)
-		}
-	}
-	if err := cl.Get(ctx, gatewayLeaseKey(agent), &coordinationv1.Lease{}); err != nil {
-		t.Fatalf("no gateway Lease under mode next: %v", err)
-	}
-
-	live := &agentv1alpha1.PlatformAgent{}
-	if err := cl.Get(ctx, req.NamespacedName, live); err != nil {
-		t.Fatal(err)
-	}
-	live.Spec.Mode = ptr.To("today")
-	if err := cl.Update(ctx, live); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := r.Reconcile(ctx, req); err != nil {
-		t.Fatalf("Reconcile under today: %v", err)
-	}
-	if err := cl.Get(ctx, gatewayLeaseKey(agent), &coordinationv1.Lease{}); !errors.IsNotFound(err) {
-		t.Fatalf("the gateway Lease outlived the flip to today: %v", err)
-	}
-	// The teardown's deletion isn't one to hold back: flipping back to
-	// next is a first install for the Lease.
-	if _, seen := r.gatewayLeaseSeen.Load(gatewayLeaseKey(agent)); seen {
-		t.Error("the flip to today left the Lease remembered, so a flip back would hold its recreate")
-	}
-}
-
 // TestTheElectionIsOnByDefault: with A2A_GATEWAY_ELECTION unset, the
 // gateway gets its Lease grant and its election env.
 func TestTheElectionIsOnByDefault(t *testing.T) {

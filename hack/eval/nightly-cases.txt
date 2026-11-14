@@ -564,12 +564,12 @@
 ./tasks/upgrades-zonal-control-plane-outage-warned/task.yaml
 
 # The oobe job's first-run audits stage (docs/designs/oobe.md): once the
-# onboarding scan settles, four fleet audits start instead of waiting for their
-# schedules, one after another. The stack arms the stage with two archived
-# stand-in cards, the scan marker and the hand-off's record, and puts back the
-# oobe job the image ships;
-# the verifier reads the Platform Agent's cron runs. Nightly rather than presubmit
-# because each repetition runs four real audits back to back. Off the infra
+# onboarding scan settles, four fleet audits and the upgrade retrospective start
+# instead of waiting for their schedules, one after another. On the lease's fresh
+# install the case grades the install's own chain and arms nothing (on a long-lived
+# install the stack arms a stand-in); the verifier reads the Platform Agent's cron
+# runs. Nightly from its registration; its first repetition waits out the
+# install's own chain, up to about two hours after the fan-out. Off the infra
 # lock (the 2026-10-15 paragraph of nightly-budget-history.txt).
 ./tasks/oobe-first-run-audits/task.yaml
 
@@ -1068,9 +1068,9 @@
 ./tasks/cluster-agent-autopilot-headroom-invariant/task.yaml
 
 # A cluster-wide "what is failing?" question across the seeded fleet: at least
-# one worker runs workload_triage.py, the healthy-cluster worker (seeded-c;
-# seeded-b's kube-system has Unschedulable pods, #5377) finishes without
-# polling, exploring system namespaces, or re-scanning,
+# one worker runs workload_triage.py, the healthy-cluster worker (seeded-b;
+# seeded-c's ComputeClass workloads sit Unschedulable on some pool projects,
+# #5684) finishes without polling, exploring system namespaces, or re-scanning,
 # and the crashloop-workload role's payments-api is still named OOMKilled
 # (#3181). deployer: noop, one fan-out round trip; reads the seeded fleet's
 # crashloop-workload role. `validated: false` until its first observed nightly
@@ -1155,6 +1155,21 @@
 # only when its answer reads the managed clusters as excluded (the case header
 # says how to read one). deployer: noop; an audit, so 3000 s of delegation wait.
 ./tasks/fleet-audit-as-many-excluded-as-managed/task.yaml
+
+# A stockout fix of a pool whose declaration Config Connector does not apply
+# says so in the ledger (#4594). prebuilt/kcc-stalled-declaration plants one
+# stalled ContainerNodePool on seeded-a, which runs Config Connector in
+# namespaced mode (the config-connector-namespaced role), and commits its
+# declaration to the GitOps repository with the stack write token; it removes
+# both at destroy. Fixture: hpa-saturated. The fixture-state scan of
+# 2026-11-10 reads config-connector-namespaced healthy on all 40 pool
+# projects. writes_alone, because the stack writes to the GitOps repository's
+# default branch: it runs alone in the writers part (writers-c), after a
+# repository reset that deletes a declaration a failed teardown left. It has
+# a stack and is not in infra_lock_exempt, so it also holds the infra lock.
+# Priced at the stockout audit's band plus the stack's waits. It has no
+# FIXTURE_NOT_READY entry.
+./tasks/fleet-audit-manifest-fix-names-stalled-config-connector/task.yaml
 
 # An on-demand audit that moved nothing still reports its ledger URL (#1929).
 # prebuilt/stale-audit-ledger with ledger_kind "gap" opens an ai-security-audit

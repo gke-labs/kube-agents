@@ -35,9 +35,10 @@ const RouteSession = "session"
 // first: up to 14 A/AAAA queries per lookup (#5590). With 3 they are asked
 // as written first, and the 2-dot NATS_URL host keeps the search list order
 // (musl libc does not fall back to it for a name with ndots or more dots).
-// The operator sets the same value on the sandbox, worker and broker pods
-// (brokerCallerPodNdots in k8s-operator/internal/controller/pod_dns.go);
-// keep the two in step.
+// The operator sets the same value on the pods it renders that dial the
+// broker (brokerCallerPodNdots in k8s-operator/internal/controller/pod_dns.go
+// lists them), and a test in each module reads the other's constant, so the
+// two cannot drift apart.
 const sessionPodNdots = "3"
 
 // resolverNdotsOption is the resolv.conf option sessionPodNdots sets.
@@ -369,8 +370,8 @@ func (s *podSpawner) resolveOwner(ctx context.Context) error {
 // from a session pod.
 func (s *podSpawner) Spawn(ctx context.Context, rec *SessionRecord, taskID, primer string, originSeq uint64) (string, error) {
 	name := rec.BusSession
-	// The gateway Deployment owns its sessions: when it goes — cleanupA2A on
-	// a mode flip, or any other deletion — Kubernetes GC reaps the pods it
+	// The gateway Deployment owns its sessions: when it goes — the CR's
+	// deletion, or any other — Kubernetes GC reaps the pods it
 	// spawned, closing the orphaned-session window without an operator
 	// exception to the IsControlledBy refusal. Empty on playground installs
 	// that never configured an owner.

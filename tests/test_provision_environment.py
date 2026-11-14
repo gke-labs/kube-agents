@@ -797,11 +797,13 @@ class BooleanVariablesSurviveTheFlagRouteTest(GithubMinterInputsTest):
 
     def test_a_rebuild_with_the_minter_names_the_project_wide_key(self):
         """After the teardown the state holds no minter, so unnamed the install would derive names with no key (#3504)."""
-        body = f'echo "minter: $KMS_KEYRING|$KMS_KEY|${{GITHUB_MINTER_GSA_NAME:-}}" >> "{MOCK_CALLS_LOG}"\n'
+        body = (f'echo "minter: $KMS_KEYRING|$KMS_KEY|${{GITHUB_MINTER_GSA_NAME:-}}|${{GITHUB_MINTER_KSA_NAME:-}}"'
+                f' >> "{MOCK_CALLS_LOG}"\n')
         proc, tmp_dir = self._run(
             {"GITOPS_ORG": "o", "GITOPS_REPO": "r", "GITHUB_APP_ID": "12345"}, install_body=body)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertIn("minter: github-token-minter-keyring|github-token-minter-key|kubeagents-github-minter-gsa",
+        self.assertIn("minter: github-token-minter-keyring|github-token-minter-key|kubeagents-github-minter-gsa"
+                      "|kubeagents-github-minter",
                       self._install_call(tmp_dir))
         # An environment's own names win, and one without the minter gets none.
         proc, tmp_dir = self._run(
@@ -809,7 +811,7 @@ class BooleanVariablesSurviveTheFlagRouteTest(GithubMinterInputsTest):
              "KMS_KEY": "env-key"}, install_body=body)
         self.assertIn("minter: env-ring|env-key|", self._install_call(tmp_dir))
         proc, tmp_dir = self._run({}, install_body=body)
-        self.assertIn("minter: ||", self._install_call(tmp_dir))
+        self.assertIn("minter: |||", self._install_call(tmp_dir))
 
     def test_a_truthy_spelling_reaches_the_flag_as_true(self):
         for name, flag in self._TOGGLES.items():

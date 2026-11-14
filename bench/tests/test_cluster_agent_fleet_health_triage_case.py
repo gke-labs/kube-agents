@@ -169,23 +169,24 @@ def test_coordinator_sweep_with_single_flagged_cluster_card_passes():
         assert _status(check, calls) == "pass", check
 
 
-def test_a_seeded_b_kube_system_follow_up_card_is_not_graded():
-    # The 2026-11-07 and 11-08 nightlies: seeded-b's scan ends with system pods
-    # unhealthy, the coordinator cards seeded-b again for kube-system details,
-    # and its worker reads them. seeded-b is out of the fast-exit checks; a
-    # --include-system scan or a kube-system read on seeded-c is graded red by
-    # the parametrized tests below.
+def test_a_seeded_c_unschedulable_pod_follow_up_is_not_graded():
+    # The 2026-11-12 and 11-13 nightlies: on a pool project where seeded-c's
+    # ComputeClass workloads sit Unschedulable, its scan ends `unhealthy: 5`.
+    # A worker that looks into them (a second scan, an all-namespaces read,
+    # more than six calls) is right to, and seeded-c is out of the fast-exit
+    # checks; the same shapes on seeded-b are graded red by the parametrized
+    # tests below.
     calls = [
         _worker_call("card-b", 10.0, PREFLIGHT_CMD, "{}", agent=SEEDED_B),
-        _worker_call("card-b", 11.0, SCAN_CMD, "unhealthy: 0\nsystem unhealthy: 3", agent=SEEDED_B),
-        _worker_call("card-b-2", 30.0, PREFLIGHT_CMD, "{}", agent=SEEDED_B),
-        _worker_call("card-b-2", 31.0, SCAN_CMD + " --include-system", "kube-system: 3/25", agent=SEEDED_B),
-        _worker_call(
-            "card-b-2", 32.0, "kubectl get pods -n kube-system --field-selector=status.phase=Pending -o wide", "", agent=SEEDED_B
-        ),
-        _worker_call("card-b-2", 33.0, "kubectl describe nodes", "", agent=SEEDED_B),
+        _worker_call("card-b", 11.0, SCAN_CMD, "unhealthy: 0\nsystem unhealthy: 0", agent=SEEDED_B),
         _worker_call("card-c", 10.5, PREFLIGHT_CMD, "{}", agent=SEEDED_C),
-        _worker_call("card-c", 11.5, SCAN_CMD, "unhealthy: 0\nsystem unhealthy: 0", agent=SEEDED_C),
+        _worker_call("card-c", 11.5, SCAN_CMD, "unhealthy: 5\nsystem unhealthy: 0", agent=SEEDED_C),
+        _worker_call("card-c", 12.5, "kubectl get pods -A --field-selector=status.phase=Pending -o wide", "", agent=SEEDED_C),
+        _worker_call("card-c", 13.5, "kubectl describe pod app-worker-a-5dc5455d9-6mnqv -n seeded-compute-class", "", agent=SEEDED_C),
+        _worker_call("card-c", 14.5, "kubectl get events -n seeded-compute-class", "", agent=SEEDED_C),
+        _worker_call("card-c", 15.5, "kubectl describe nodes", "", agent=SEEDED_C),
+        _worker_call("card-c", 16.5, "kubectl get pods -n kube-system -o wide", "", agent=SEEDED_C),
+        _worker_call("card-c-2", 30.0, SCAN_CMD + " --include-system", "kube-system: 0/25", agent=SEEDED_C),
         _worker_call("card-oom", 12.0, SCAN_CMD, "unhealthy: 1\nsystem unhealthy: 0", agent=SEEDED_A),
     ]
     for check in (SCAN_RAN, NO_POLL_OR_EXPLORE, NO_RECHECK):
@@ -199,13 +200,13 @@ def test_missing_workload_triage_fails_scan_ran_check():
         _worker_call("card-c", 10.5, "kubectl get events -n kube-system", "LAST SEEN", agent=SEEDED_C),
     ]
     assert _status(SCAN_RAN, calls) == "fail"
-    assert _status(NO_POLL_OR_EXPLORE, calls) == "fail"
-    # The -A read was seeded-b's, which the fast-exit checks no longer grade;
-    # the same read on seeded-c fails in the parametrized re-check test.
-    assert _status(NO_RECHECK, calls) == "pass"
+    # The kube-system read was seeded-c's, which the fast-exit checks do not
+    # grade; the same read on seeded-b fails in the parametrized test below.
+    assert _status(NO_POLL_OR_EXPLORE, calls) == "pass"
+    assert _status(NO_RECHECK, calls) == "fail"
 
 
-@pytest.mark.parametrize("healthy_agent", [SEEDED_C])
+@pytest.mark.parametrize("healthy_agent", [SEEDED_B])
 @pytest.mark.parametrize(
     "bad_command",
     [
@@ -254,7 +255,7 @@ def test_poll_or_system_exploration_on_healthy_cluster_fails(
     assert _status(NO_POLL_OR_EXPLORE, calls) == "fail", (healthy_agent, bad_command)
 
 
-@pytest.mark.parametrize("healthy_agent", [SEEDED_C])
+@pytest.mark.parametrize("healthy_agent", [SEEDED_B])
 def test_execute_code_mcp_or_command_budget_exceeded_on_healthy_cluster_fails(healthy_agent: str):
     for code_body in (
         "import time\ntime.sleep(15)\n",
@@ -318,7 +319,7 @@ def test_execute_code_mcp_or_command_budget_exceeded_on_healthy_cluster_fails(he
     assert _status(NO_POLL_OR_EXPLORE, seven_calls) == "fail"
 
 
-@pytest.mark.parametrize("healthy_agent", [SEEDED_C])
+@pytest.mark.parametrize("healthy_agent", [SEEDED_B])
 @pytest.mark.parametrize(
     "recheck_command",
     [
@@ -384,7 +385,7 @@ def test_rechecking_or_all_namespaces_on_healthy_cluster_fails(
     assert _status(NO_RECHECK, calls) == "fail", (healthy_agent, recheck_command)
 
 
-@pytest.mark.parametrize("healthy_agent", [SEEDED_C])
+@pytest.mark.parametrize("healthy_agent", [SEEDED_B])
 def test_single_call_for_loop_or_subshell_rescan_on_healthy_cluster_fails(healthy_agent: str):
     single_loop = [
         _worker_call(
@@ -413,53 +414,53 @@ def test_single_call_for_loop_or_subshell_rescan_on_healthy_cluster_fails(health
 def test_two_scans_in_one_call_or_across_retried_cards_on_healthy_cluster_fails(sep: str):
     chained = [
         _worker_call(
-            "card-c",
+            "card-b",
             10.0,
             f"{SCAN_CMD}{sep}{SCAN_JSON_CMD}",
             "unhealthy: 0\nsystem unhealthy: 0",
-            agent=SEEDED_C,
+            agent=SEEDED_B,
         ),
     ]
     assert _status(NO_RECHECK, chained) == "fail", sep
 
     retried = [
-        _worker_call("card-c-1", 10.0, SCAN_CMD, "unhealthy: 0\nsystem unhealthy: 0", agent=SEEDED_C),
-        _worker_call("card-c-2", 20.0, SCAN_CMD, "unhealthy: 0\nsystem unhealthy: 0", agent=SEEDED_C),
+        _worker_call("card-b-1", 10.0, SCAN_CMD, "unhealthy: 0\nsystem unhealthy: 0", agent=SEEDED_B),
+        _worker_call("card-b-2", 20.0, SCAN_CMD, "unhealthy: 0\nsystem unhealthy: 0", agent=SEEDED_B),
     ]
     assert _status(NO_RECHECK, retried) == "fail"
 
 
 def test_help_flag_and_non_watch_or_single_namespace_flags_do_not_false_red():
     calls = [
-        _worker_call("card-c", 10.2, "command -v /opt/data/scripts/workload_triage.py", "/opt/data/scripts/workload_triage.py", agent=SEEDED_C),
-        _worker_call("card-c", 11.2, f"command -V /opt/data/scripts/workload_triage.py && {SCAN_CMD}", "unhealthy: 0\nsystem unhealthy: 0", agent=SEEDED_C),
+        _worker_call("card-b", 10.2, "command -v /opt/data/scripts/workload_triage.py", "/opt/data/scripts/workload_triage.py", agent=SEEDED_B),
+        _worker_call("card-b", 11.2, f"command -V /opt/data/scripts/workload_triage.py && {SCAN_CMD}", "unhealthy: 0\nsystem unhealthy: 0", agent=SEEDED_B),
         _worker_call(
-            "card-c",
+            "card-b",
             12.5,
             "kubectl exec payments-api-7f8 -n seeded-debug -- ls -Al /data",
             "total 0",
-            agent=SEEDED_C,
+            agent=SEEDED_B,
         ),
         _worker_call(
-            "card-c",
+            "card-b",
             12.8,
             "kubectl exec payments-api-7f8 -n seeded-debug -- grep -A 3 Error /var/log/app.log",
             "",
-            agent=SEEDED_C,
+            agent=SEEDED_B,
         ),
         _worker_call(
-            "card-c",
+            "card-b",
             14.0,
             "kubectl get --raw /api/v1/namespaces/seeded-debug/pods",
             "{}",
-            agent=SEEDED_C,
+            agent=SEEDED_B,
         ),
         _worker_call(
-            "card-c",
+            "card-b",
             14.5,
             "kubectl get pods -n billing-system",
             "NAME READY",
-            agent=SEEDED_C,
+            agent=SEEDED_B,
         ),
         _worker_call(
             "card-d-check",
@@ -471,43 +472,43 @@ def test_help_flag_and_non_watch_or_single_namespace_flags_do_not_false_red():
     ]
     assert _status(NO_POLL_OR_EXPLORE, calls) == "pass"
     assert _status(NO_RECHECK, calls) == "pass"
-    # A separate list, so these stay under seeded-c's call budget and its two-scan count.
+    # A separate list, so these stay under seeded-b's call budget and its two-scan count.
     moved = [
-        _worker_call("card-c2", 10.0, "python3 /opt/data/scripts/workload_triage.py --help", "usage:", agent=SEEDED_C),
-        _worker_call("card-c2", 10.5, "cat /opt/data/scripts/workload_triage.py", "#!/usr/bin/env python3", agent=SEEDED_C),
+        _worker_call("card-b2", 10.0, "python3 /opt/data/scripts/workload_triage.py --help", "usage:", agent=SEEDED_B),
+        _worker_call("card-b2", 10.5, "cat /opt/data/scripts/workload_triage.py", "#!/usr/bin/env python3", agent=SEEDED_B),
         _worker_call(
-            "card-c2",
+            "card-b2",
             11.0,
             'OUT=/tmp/workload_triage.txt; python3 /opt/data/scripts/workload_triage.py > "$OUT"',
             "unhealthy: 0\nsystem unhealthy: 0",
-            agent=SEEDED_C,
+            agent=SEEDED_B,
         ),
         _worker_call(
-            "card-c2",
+            "card-b2",
             11.5,
             "python3 -c \"print(open('/tmp/workload_triage.txt').read())\"",
             "unhealthy: 0\nsystem unhealthy: 0",
-            agent=SEEDED_C,
+            agent=SEEDED_B,
         ),
         _worker_call(
-            "card-c2",
+            "card-b2",
             12.0,
             "kubectl exec payments-api-7f8 -n seeded-debug -- curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/healthz",
             "200",
-            agent=SEEDED_C,
+            agent=SEEDED_B,
         ),
         _worker_call(
-            "card-c2",
+            "card-b2",
             13.0,
             "kubectl get pods -n seeded-debug -o wide --field-selector spec.nodeName=gke-seeded-b-default-pool-1234",
             "NAME READY",
-            agent=SEEDED_C,
+            agent=SEEDED_B,
         ),
     ]
     assert _status(NO_POLL_OR_EXPLORE, moved) == "pass"
     assert _status(NO_RECHECK, moved) == "pass"
 
-@pytest.mark.parametrize("healthy_agent", [SEEDED_B, SEEDED_C])
+@pytest.mark.parametrize("healthy_agent", [SEEDED_B])
 @pytest.mark.parametrize(
     "benign_command",
     [
