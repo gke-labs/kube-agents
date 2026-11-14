@@ -426,6 +426,390 @@ class TestScrubStepText(unittest.TestCase):
                 if "S3cretValue9" not in old_out:
                     self.assertNotIn("S3cretValue9", new_out)
 
+    def test_a_flag_after_a_masked_key_value_keeps_its_value_masked(self):
+        # #5535: the redactor runs first, and its key-value rule reads a bare
+        # value up to whitespace, which the escaped-space mark is not, so it
+        # took the flag word into the value it masked and served the flag's
+        # value. The flag rules now read those values before the redactor.
+        for run in (1, 2, 4):
+            plain_cmds = (
+                "DB_PASSWORD=x" + "\\\\" * run + " --password S3cretValue9",
+                "mysql DB_PASSWORD=x" + "\\\\" * run + " -p S3cretValue9",
+                "curl TOKEN=x" + "\\\\" * run + " -u admin:S3cretValue9 https://x",
+            )
+            for plain in plain_cmds:
+                for wrapper, cmd in (("", plain), ("eval", "eval " + plain), ("bash -c", f'bash -c "{plain}"')):
+                    for text in (json.dumps({"command": cmd}), cmd):
+                        with self.subTest(cmd=cmd, form=text[:1]):
+                            out = _scrub("tool_call", text)
+                            # Known limit, the same before: inside a quoted
+                            # `bash -c "…"` script the short and user:pass
+                            # flag rules do not run (`sub_shell_segments`).
+                            if wrapper == "bash -c" and not plain.startswith("DB_PASSWORD"):
+                                self.assertIn("S3cretValue9", out)
+                            else:
+                                self.assertNotIn("S3cretValue9", out)
+
+    def test_a_quoted_or_equals_flag_value_after_a_masked_key_value_is_masked(self):
+        # The redactor's bare value runs on through `=` and an unquoted
+        # `user:` and ends at the first whitespace, quote, `,{}]` or
+        # backslash escape, so how much of the flag its marker took depends
+        # on the spelling. A quoted value ends at its closing quote, whatever
+        # follows it.
+        shapes = (
+            'DB_PASSWORD=x%s --password="S3cretValue9"',
+            "DB_PASSWORD=x%s --password='S3cretValue9'",
+            'DB_PASSWORD=x%s --password "S3cretValue9"',
+            'DB_PASSWORD=x%s --password= "S3cretValue9"',
+            'mysql DB_PASSWORD=x%s -p="S3cretValue9"',
+            'mysql DB_PASSWORD=x%s -p"S3cretValue9"',
+            'curl TOKEN=x%s -u admin:"S3cretValue9" https://x',
+            "curl TOKEN=x%s -u admin:'S3cretValue9' https://x",
+            'curl TOKEN=x%s --user=admin:"S3cretValue9" https://x',
+            'curl TOKEN=x%s --user="admin:S3cretValue9" https://x',
+            'curl TOKEN=x%s -uadmin:"S3cretValue9" https://x',
+            'curl TOKEN=x%s --user=ad,min:"S3cretValue9" https://x',
+            'curl TOKEN=x%s --user=ad}min:"S3cretValue9" https://x',
+            'curl TOKEN=x%s -uad]min:"S3cretValue9" https://x',
+            'curl TOKEN=x%s -uad{min:"S3cretValue9" https://x',
+            'curl TOKEN=x%s -uad[min:"S3cretValue9" https://x',
+            'curl TOKEN=x%s -uad\\nmin:"S3cretValue9" https://x',
+            "DB_PASSWORD=x%s --password=,S3cretValue9",
+            "DB_PASSWORD=x%s --password=\\nS3cretValue9",
+            'DB_PASSWORD=x%s --password="S3cretValue9"\\ --host=db',
+            'mysql DB_PASSWORD=x%s -p"S3cretValue9"\\ -h\\ db',
+            'curl TOKEN=x%s -u admin:"S3cretValue9"\\ https://x',
+        )
+        for run in (1, 2, 4):
+            for shape in shapes:
+                plain = shape % ("\\" * run)
+                for cmd in (plain, "eval " + plain):
+                    for text in (json.dumps({"command": cmd}), cmd):
+                        with self.subTest(cmd=cmd, form=text[:1]):
+                            self.assertNotIn("S3cretValue9", _scrub("tool_call", text))
+        # A value made of symbols alone is a value too, quoted or after `=`.
+        for shape in (
+            'curl TOKEN=x\\ -u admin:"%s" https://x',
+            "curl TOKEN=x\\ -u admin:'%s' https://x",
+            'DB_PASSWORD=x\\ --password="%s"',
+            'mysql DB_PASSWORD=x\\ -p="%s"',
+            'mysql DB_PASSWORD=x\\ -p"%s"',
+            'curl TOKEN=x\\ --user=admin:"%s" https://x',
+            'curl TOKEN=x\\ -uadmin:"%s" https://x',
+            "DB_PASSWORD=x\\ --password=,%s",
+        ):
+            cmd = shape % "#%!!+~"
+            for text in (json.dumps({"command": cmd}), cmd):
+                with self.subTest(cmd=cmd, form=text[:1]):
+                    self.assertNotIn("#%!!+~", _scrub("tool_call", text))
+
+    def test_a_bare_user_pass_value_before_a_shell_operator_stays_masked(self):
+        # The `user:pass` rule ends its segment at `;`, `|` or `&`, so the
+        # value read stops there, and the served value ends a word there too.
+        for tail in (";echo done", "|cat", "&&ls", " ; ls", ""):
+            cmd = "curl https://x TOKEN=x\\\\ -u admin:S3cretValue9" + tail
+            for text in (json.dumps({"command": cmd}), cmd):
+                with self.subTest(cmd=cmd, form=text[:1]):
+                    out = _scrub("tool_call", text)
+                    self.assertNotIn("S3cretValue9", out)
+                    self.assertIn(tail, out)
+        # A quote and a closing parenthesis end the word too.
+        for cmd in (
+            "curl TOKEN=x\\ -u admin:S3cretValue9' https://x",
+            'bash -c "(curl TOKEN=x\\ -u admin:S3cretValue9)" ; curl TOKEN=x\\ -u admin:S3cretValue9',
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertNotIn("S3cretValue9", _scrub("tool_call", cmd))
+
+    def test_a_value_read_before_the_redactor_keeps_its_flag_and_marker_spellings(self):
+        # Each value keeps the spelling after its own flag and the one after
+        # the marker that took the flag word; the quoted spelling and the one
+        # after the marker that ran on to the first end of the redactor's
+        # value are added to them, not put in their place (after a space
+        # separator it is the marker spelling again). Each spelling carries
+        # the offset where its value starts.
+        marker = worker_transcript.REDACTED_SECRET_MARKER
+        secret, quoted = "S3cretValue9", '"S3cretValue9"'
+        cases = (
+            ("DB_PASSWORD=x\\\\ --password S3cretValue9", [("--password ", secret), (marker + " ", secret)] + [(marker + " ", secret)]),
+            ("mysql DB_PASSWORD=x\\\\ -p S3cretValue9", [("-p ", secret), (marker + " ", secret)] + [(marker + " ", secret)]),
+            (
+                "curl TOKEN=x\\\\ -u admin:S3cretValue9;echo",
+                [("-u admin:", secret), (marker + " admin:", secret)] + [(marker + " admin:", secret)],
+            ),
+            (
+                'curl TOKEN=x\\\\ -u admin:"S3cretValue9"',
+                [
+                    ("-u admin:", secret),
+                    (marker + " admin:", secret),
+                    ("-u admin:", quoted),
+                    (marker + " admin:", quoted),
+                    (marker + " admin:", quoted),
+                ],
+            ),
+            (
+                'curl TOKEN=x\\\\ --user=admin:"S3cretValue9"',
+                [
+                    ("--user=admin:", secret),
+                    (marker + "=admin:", secret),
+                    ("--user=admin:", quoted),
+                    (marker + "=admin:", quoted),
+                    (marker, quoted),
+                ],
+            ),
+            (
+                'DB_PASSWORD=x\\\\ --password="S3cretValue9"',
+                [("--password=", quoted), (marker + "=", quoted), (marker, quoted)],
+            ),
+            # The redactor's value ends inside the value, not at its start:
+            # no spelling after the marker.
+            (
+                "mysql DB_PASSWORD=x\\\\ --password=S,3cretValue9",
+                [("--password=", "S,3cretValue9"), (marker + "=", "S,3cretValue9")],
+            ),
+        )
+        for cmd, want in cases:
+            with self.subTest(cmd=cmd):
+                read = worker_transcript.at_fold_flag_secrets(REDACTOR, worker_transcript.fold_shell_command(cmd))
+                self.assertEqual(read, [tuple((lead + value, len(lead)) for lead, value in want)])
+
+    def test_a_spelling_is_masked_at_each_place_it_ends_a_word(self):
+        # The second place of `-pa-pa` starts inside the first, which does
+        # not end a word.
+        marker = worker_transcript.REDACTED_SECRET_MARKER
+        mask = worker_transcript.mask_served_values
+        self.assertEqual(mask("mysql x-pa-pa-pa", [(("-pa-pa", 2),)]), "mysql x-pa-p" + marker)
+        self.assertEqual(mask("mysql -pa-pa x-pa-pa", [(("-pa-pa", 2),)]), "mysql -p" + marker + " x-p" + marker)
+        # Places that overlap get one marker, from the first value's start.
+        self.assertEqual(mask("-u a:b -p c", [(("-u a:b -p", 5), ("-p c", 3))]), "-u a:" + marker)
+        self.assertEqual(mask("no flag here", [(("-p c", 3),)]), "no flag here")
+        # In a run of its own flag word the value's last place ends a word.
+        run = "mysql\\ -p" + "S-p" * 8 + "S " + "S-p" * 24 + "S"
+        self.assertEqual(_scrub("tool_call", run), "mysql\\ -p" + marker + " " + "S-p" * 16 + marker)
+        # A command without an escaped space has no value to read.
+        self.assertEqual(worker_transcript.at_fold_flag_secrets(REDACTOR, "mysql DB_PASSWORD=x -p S3cretValue9"), [])
+
+    def test_a_long_lead_or_a_run_of_markers_scrubs_in_linear_time(self):
+        # A value has at most three leads, whatever the lead's length, and
+        # each spelling is searched for as plain text: a lead that repeats
+        # itself or the marker, and a spelling found again inside its own
+        # last place, do not cost quadratic time.
+        import time
+
+        marker = worker_transcript.REDACTED_SECRET_MARKER
+        for cmd in (
+            "curl TOKEN=x\\\\ -u " + "a" * 8000 + ':"S3cretValue9" https://x',
+            "curl TOKEN=x\\\\ -u " + "," * 8000 + ':"S3cretValue9" https://x',
+            "DB_PASSWORD=x\\\\ --password" + "=" * 8000 + '"S3cretValue9"',
+            'mysql DB_PASSWORD=x\\\\ -p="S3cretValue9" ' + marker * 16000,
+            "curl h\\ -u=a" + ("," + marker) * 8000 + ':"S3cretValue9"',
+            "curl h\\ " + "-u," * 50000 + 'a:"S3cretValue9"',
+            "curl h\\ -u" + marker * 8000 + ":S3cretValue9",
+            "curl TOKEN=x\\\\ -u" + marker * 8000 + ':"S3cretValue9" ; echo ' + marker * 8002,
+            "curl TOKEN=x\\ -ua:" + "S-ua:" * 40000 + "S ; echo " + "-ua:S" * 60000 + "-",
+            "curl TOKEN=x\\ -ua:" + "S)-ua:" * 32000 + "S ; echo " + "-ua:S)" * 64000,
+            "TOKEN=x\\ mysql\\ --password= abc\\ -p S3cretValue9 ; mysql\\ -p"
+            + ":-p" * 24600
+            + ": ; echo -p"
+            + ":-p" * 75300
+            + ": y",
+        ):
+            with self.subTest(cmd=cmd[:40]):
+                start = time.monotonic()
+                out = _scrub("tool_call", cmd)
+                self.assertLess(time.monotonic() - start, 1.0)
+                self.assertNotIn("S3cretValue9", out)
+
+    def test_a_value_that_holds_the_next_flag_word_does_not_hide_the_next_value(self):
+        # The first value is `abc\ -p` (or `abc\ -u`): its place overlaps
+        # the place of the second value, and one marker stands for both. The
+        # same for three values in a row, for a value with an escaped shell
+        # operator, and for a quoted value that ends at the next value's
+        # opening quote.
+        for cmd in (
+            "TOKEN=x\\ mysql\\ --password= abc\\ -p S3cretValue9",
+            "TOKEN=x\\ mysql\\ --password abc\\ -p S3cretValue9",
+            "TOKEN=x\\ curl\\ --secret= abc\\ -u admin:S3cretValue9 https://x",
+            "TOKEN=x\\ curl\\ --secret=,abc\\ -u admin:S3cretValue9 https://x",
+            "PASSWORD=x\\ mysql\\ -ua,b:abc\\ -p S3cretValue9",
+            "eval TOKEN=x\\\\ mysql\\\\ --password= abc\\\\ -p S3cretValue9",
+            "TOKEN=x\\ mysql\\ --password= A1secret\\ -p S3cretValue9\\ --user=root:C3secret",
+            "DB_PASSWORD=x\\ mariadb\\ --passphrase= A1secret\\ -u admin:S3cretValue9\\ -p=C3secret",
+            "TOKEN=x\\ mysql\\ -u= admin:U1secret\\ -pS1part\\&S3cretValue9",
+            'PASSWORD=x\\ curl\\ --password="S2secret\\ -u "admin:S3cretValue9""',
+        ):
+            for text in (json.dumps({"command": cmd}), cmd):
+                with self.subTest(cmd=cmd, form=text[:1]):
+                    out = _scrub("tool_call", text)
+                    for secret in ("S3cretValue9", "A1secret", "C3secret", "U1secret", "S1part", "S2secret"):
+                        self.assertNotIn(secret, out)
+        # A quoted spelling found again inside its own place: one marker.
+        marker = worker_transcript.REDACTED_SECRET_MARKER
+        self.assertEqual(_scrub("tool_call", 'mysql TOKEN=x\\ -p"S1-p"S1-p"'), "mysql TOKEN=" + marker + marker)
+
+    def test_a_spelling_that_does_not_end_a_word_many_times_still_masks_its_value(self):
+        # `--token ab` is found 1100 times in front of other letters; the
+        # search goes on to the place that ends a word.
+        cmd = "PASSWORD=x\\ --token ab TOKEN=y\\ curl\\ -u root:S3cretValue9 " + "x--token abc " * 1100 + "--token ab"
+        out = _scrub("tool_call", cmd)
+        self.assertNotIn("S3cretValue9", out)
+        self.assertEqual(out.count("x--token abc "), 1100)
+        self.assertTrue(out.endswith("--token " + worker_transcript.REDACTED_SECRET_MARKER))
+
+    def test_a_value_the_mask_leaves_alone_takes_no_place_from_a_later_value(self):
+        # At most 32 values are kept. A quoted shell operator is not kept, so
+        # 32 of them do not push out the value after them; a 33rd real value
+        # is past the limit and is served, as before.
+        many = "curl https://x" + '\\ -u a:"&"' * 32 + " TOKEN=x\\\\ -u admin:S3cretValue9 https://y"
+        for text in (json.dumps({"command": many}), many):
+            with self.subTest(form=text[:1]):
+                self.assertNotIn("S3cretValue9", _scrub("tool_call", text))
+        past = "curl " + " ".join("TOKEN=x\\ -u u:Secret%02dValue" % n for n in range(33))
+        out = _scrub("tool_call", past)
+        for n in range(32):
+            self.assertNotIn("Secret%02dValue" % n, out)
+        self.assertIn("Secret32Value", out)
+
+    def test_two_values_with_one_served_spelling_take_the_form_that_masks_more(self):
+        # `-ua,x:S` and `-p,x:S` are both served as the marker and `,x:S`;
+        # the short-flag value is all of it, and no part of it is served.
+        cmd = "curl TOKEN=t\\ -ua,hunter2Pw:S3cretValue9 https://x ; mysql PASSWORD=t\\ -p,hunter2Pw:S3cretValue9"
+        for text in (json.dumps({"command": cmd}), cmd):
+            with self.subTest(form=text[:1]):
+                out = _scrub("tool_call", text)
+                self.assertNotIn("hunter2Pw", out)
+                self.assertNotIn("S3cretValue9", out)
+        # The value that masks more is read first here.
+        cmd = "TOKEN=t\\ --password=,hunter2Pw:S3cretValue9 ; curl TOKEN=t\\ -ua,hunter2Pw:S3cretValue9 https://x"
+        out = _scrub("tool_call", cmd)
+        self.assertNotIn("hunter2Pw", out)
+        self.assertNotIn("S3cretValue9", out)
+        # `-a ad[,c:'S'` and `-u= ad[,c:'S'`: the short flag's value is the
+        # `user:` of the other. The two places overlap, and one marker
+        # stands for both from the first value's start.
+        cmd = "mysql PASSWORD=t\\\\ -a ad[,c:'S3cretValue9' ; docker login passwd:t\\ -u= ad[,c:'S3cretValue9';"
+        out = _scrub("tool_call", cmd)
+        self.assertNotIn("S3cretValue9", out)
+        self.assertNotIn("ad[,c:", out)
+
+    def test_the_spelling_after_the_marker_leaves_other_markers_text_alone(self):
+        # A value made of closing punctuation alone gets no spelling after
+        # the marker, so the text after other markers in the command stays.
+        marker = worker_transcript.REDACTED_SECRET_MARKER
+        cases = (
+            (
+                "curl -d '{\"password\": \"hunter2\", \"user\": \"bob\"}' https://x ; "
+                "python3 -c 'run([\"DB_PASSWORD=x\\ --password=\", pw])'",
+                "curl -d '{\"password\": \"" + marker + "\", \"user\": \"bob\"}' https://x ; "
+                "python3 -c 'run([\"DB_PASSWORD=" + marker + "\", pw])'",
+            ),
+            (
+                "printf 'DB_PASSWORD=abc\\n' > .env && printf 'TOKEN=x\\ --token=\\n'",
+                "printf 'DB_PASSWORD=" + marker + "\\n' > .env && printf 'TOKEN=" + marker + "\\n'",
+            ),
+            (
+                "curl -d {API_KEY=abc} https://x TOKEN=x\\ --password=}",
+                "curl -d {API_KEY=" + marker + "} https://x TOKEN=" + marker + "}",
+            ),
+            (
+                "curl -d '{\"password\": \"hunter2\", \"user\": \"bob\"}' TOKEN=x\\ -ua:'\",' https://x",
+                "curl -d '{\"password\": \"" + marker + "\", \"user\": \"bob\"}' TOKEN=" + marker + "'\",' https://x",
+            ),
+            (
+                "python3 -c 'run(\"DB_PASSWORD=abc\") ; run(\"TOKEN=x\\ --password=\")'",
+                "python3 -c 'run(\"DB_PASSWORD=" + marker + "\") ; run(\"TOKEN=" + marker + "\")'",
+            ),
+            # A shell operator is not a value, and a value ends a word.
+            ("TOKEN=x\\ --password && ls", "TOKEN=" + marker + " && ls"),
+            ("mysql -u r\\ -p1 -h 10.0.0.1 && grep -p12 f", "mysql -u r\\ -p" + marker + " -h 10.0.0.1 && grep -p12 f"),
+        )
+        for cmd, want in cases:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(_scrub("tool_call", cmd), want)
+                self.assertEqual(json.loads(_scrub("tool_call", json.dumps({"command": cmd})))["command"], want)
+
+    def test_the_longest_spelling_at_a_place_is_masked_whole(self):
+        # `ab` is a value of its own and the start of another: the longer
+        # value is not cut after `ab`.
+        out = _scrub("tool_call", "TOKEN=x\\ --password ab;cdSecret9 TOKEN=y\\ --password ab")
+        self.assertNotIn("cdSecret9", out)
+
+    def test_the_redactor_value_end_rule_is_the_redactors(self):
+        # `REDACTOR_BARE_VALUE_END_RE` restates where the bare branch of the
+        # redactor's key-value rule ends; a change there must change it too.
+        tails = [chr(code) for code in range(32, 127)] + ["\t", "\n", "\r", ""]
+        tails += ["\\" + char for char in 'nrt"/x \\']
+        for tail in tails:
+            with self.subTest(tail=tail):
+                value = "ab" + tail + "cd"
+                found = REDACTOR.SECRET_KV_PATTERN.match("password=" + value)
+                ours = worker_transcript.REDACTOR_BARE_VALUE_END_RE.search(value)
+                self.assertEqual(found.group("bare"), value[: ours.start()] if ours else value)
+                if ours:
+                    self.assertLessEqual(len(ours.group(0)), worker_transcript.REDACTOR_BARE_VALUE_END_MAX_LEN)
+
+    def test_a_flag_value_another_rule_rewrote_in_part_is_a_known_limit(self):
+        # Known limit, the same before: when another rule rewrites part of
+        # the value (an e-mail address in it, or as the `user:`), or the
+        # redactor's value ends inside a value joined to its flag, the served
+        # text no longer spells the value read, and the rest is served.
+        for cmd, served in (
+            ('DB_PASSWORD=x\\\\ --password "S3cretValue9:admin@example.com"', "S3cretValue9"),
+            ("curl TOKEN=x\\\\ -u admin@example.com:S3cretValue9 https://x", "S3cretValue9"),
+            ("mysql DB_PASSWORD=x\\\\ -pS3,cretValue9", ",cretValue9"),
+            ("DB_PASSWORD=x\\\\ --password=S3}cretValue9", "}cretValue9"),
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertIn(served, _scrub("tool_call", cmd))
+
+    def test_a_value_read_before_the_redactor_is_masked_only_after_its_flag(self):
+        # The same string elsewhere in the command is not the flag's value:
+        # a short value must not mask letters in other words, spaces or the
+        # markers already there.
+        cases = (
+            ("cd mysql && TOKEN=x\\\\ --password mysql ls mysql", ("cd mysql &&", "ls mysql")),
+            ("mysql -h db.example.com -u root\\ -pe -e 'select 1'", ("db.example.com", "'select 1'")),
+            ("mysql -u r\\ -p1 -h 10.0.0.1", ("10.0.0.1",)),
+        )
+        for cmd, kept in cases:
+            for text in (json.dumps({"command": cmd}), cmd):
+                with self.subTest(cmd=cmd, form=text[:1]):
+                    out = _scrub("tool_call", text)
+                    for word in kept:
+                        self.assertIn(word, out)
+                    self.assertNotIn("[R[", out)
+
+    def test_reading_flag_values_first_never_masks_less(self):
+        # A property check with redactor-only secrets in the mix: the
+        # redactor and every rule read the same text as before, so with the
+        # early read off (the rules as before #5535) no command masks a
+        # secret the early read does not.
+        import random
+
+        secrets = (
+            "S3cretValue9",
+            "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8",
+            "AKIA" + "IOSFODNN7EXAMPLE",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.c2lnbmF0dXJlc2lnbmF0dXJl",
+            "-----BEGIN RSA PRIVATE KEY-----",
+            "https://admin:Pa55wordQ9@host",
+        )
+        rng = random.Random(5535)
+        words = ["mysql ", "curl ", "redis-cli ", "ls ", "--password ", "--token=", "-p", "-u ", "-a ", "admin:", "x",
+                 "DB_PASSWORD=", "TOKEN=", "password: ", "\\", "\\\\", "\\ ", "\\\\ ", " ", "=", '"', "'",
+                 "eval ", "-n prod", "-prod.cnf ", "--draft ", "my\\ ", "; ", "| ", "--password=", "-p=", "--user=",
+                 '"S3cretValue9"', "'S3cretValue9'", *secrets]
+        commands = ["".join(rng.choice(words) for _ in range(rng.randint(2, 12))) for _ in range(3000)]
+        for cmd in commands:
+            for text in (json.dumps({"command": cmd}), cmd):
+                new_out = _scrub("tool_call", text)
+                with mock.patch.object(worker_transcript, "at_fold_flag_secrets", return_value=[]):
+                    old_out = _scrub("tool_call", text)
+                with self.subTest(cmd=cmd, form=text[:1]):
+                    for secret in secrets:
+                        if secret not in old_out:
+                            self.assertNotIn(secret, new_out)
+
     def test_a_tool_calls_prose_argument_keeps_its_diagnosis(self):
         # A worker reports through `kanban_complete(result=...)`: prose, as a reply is.
         report = "## Why\n- Secret: db-credentials is missing the key 'password'\n- Token: expired at 10:00\n"
