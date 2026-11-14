@@ -2421,6 +2421,16 @@ Mutation(
         "is gone (#5682 moved the cap check into the shared validator)",
     ),
     Mutation(
+        "C1-delegate-gateway-validates-only-some-requests",
+        "a2a/gateway/delegation.go",
+        ("if !parsed || lib.ValidateDelegateRequest(req) != nil {",
+         "if !parsed || lib.ValidateDelegateRequest(req) != nil && len(req.Tasks) > 0 {"),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "condition the gateway's validator call so it guards only batches: "
+        "the call still appears, but a single over-length task that reached "
+        "the bus without the adapter is minted",
+    ),
+    Mutation(
         "C1-delegate-validator-cap-hand-spelled",
         "a2a/lib/payload.go",
         ("case len(text) > DelegateTextCap:", "case len(text) > 16*1024:"),
@@ -2441,11 +2451,63 @@ Mutation(
     Mutation(
         "C1-delegate-validator-skips-batch-entries",
         "a2a/lib/payload.go",
-        ("validateDelegateText(e.Text)", "validateDelegateText(r.Text)"),
+        ("validateDelegateText(e.Text)", "error(nil)"),
         "test_C1_the_delegate_text_cap_is_spelled_once",
-        "cap the request's top-level text inside the batch loop instead of "
-        "each entry's: every batch entry then goes uncapped, through the "
-        "adapter and the gateway alike",
+        "stop checking each batch entry's text in lib's shared validator: the "
+        "gateway then mints a batch entry of any length that reached the bus "
+        "without the adapter",
+    ),
+    Mutation(
+        "C1-delegate-adapter-skips-batch-entries",
+        "a2a/worker-adapter/delegate.go",
+        ('if why := validateDelegate(lib.DelegateRequest{Addressee: e.Addressee, Text: e.Text, Parameters: e.Parameters}); why != "" {',
+         'if why := ""; why != "" {'),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "stop validating each batch entry in the worker-adapter's "
+        "validateDelegateFor: the adapter then publishes a batch whose "
+        "entries it never capped",
+    ),
+    Mutation(
+        "C1-delegate-adapter-checks-the-wrong-batch-text",
+        "a2a/worker-adapter/delegate.go",
+        ("Text: e.Text, Parameters: e.Parameters}); why", 'Text: "ok", Parameters: e.Parameters}); why'),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "validate each batch entry with a fixed text instead of its own: the "
+        "per-entry call still runs, but no entry's real text is capped",
+    ),
+    Mutation(
+        "C1-delegate-adapter-batch-refusal-neutered",
+        "a2a/worker-adapter/delegate.go",
+        ('Parameters: e.Parameters}); why != "" {', 'Parameters: e.Parameters}); false {'),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "keep the per-entry validateDelegate call but never act on its answer: "
+        "the call is still there, and every batch entry is published unchecked",
+    ),
+    Mutation(
+        "C1-delegate-adapter-publish-refusal-neutered",
+        "a2a/worker-adapter/adapter.go",
+        ('validateDelegateFor(ask.req, a.delegateWidth); why != "" {',
+         'validateDelegateFor(ask.req, a.delegateWidth); false && why != "" {'),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "keep the adapter's validateDelegateFor call but never refuse on it: "
+        "an over-length request is published to the bus",
+    ),
+    Mutation(
+        "C1-delegate-adapter-publish-check-commented-out",
+        "a2a/worker-adapter/adapter.go",
+        ('if why := validateDelegateFor(ask.req, a.delegateWidth); why != "" {',
+         'if why := ""; why != "" { // validateDelegateFor(ask.req, a.delegateWidth)'),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "drop the adapter's check and leave its call in a comment on the same "
+        "line: only a pin that reads code without comments sees it gone",
+    ),
+    Mutation(
+        "C1-delegate-adapter-skips-the-single-request",
+        "a2a/worker-adapter/delegate.go",
+        ("\t\treturn validateDelegate(req)\n", "\t\treturn \"\"\n"),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "stop validating a single (non-batch) request in the worker-adapter's "
+        "entry point: validateDelegate then guards nothing the adapter publishes",
     ),
     Mutation(
         "C1-delegate-validator-skips-the-single-text",
