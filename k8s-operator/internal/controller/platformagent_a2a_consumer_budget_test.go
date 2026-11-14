@@ -85,10 +85,15 @@ func TestSessionConsumerCountMatchesTheA2AModule(t *testing.T) {
 //
 // The floor matters as much as the arithmetic: 64 is what TASKS shipped with,
 // so rendering below it on a small install would TIGHTEN a live stream's cap
-// relative to today. Deriving downward is a silent capacity regression on
-// somebody's working install; deriving upward is the thing being fixed. Hence
-// max(64, budget), and hence the first row.
+// relative to what it had. Deriving downward is a silent capacity regression
+// on somebody's working install; deriving upward is the thing being fixed.
+// Hence max(64, budget), and hence the first row. The table is at the
+// bridge's own default of 2 workers, the reserve table's row (32), pinned
+// through the operator's setting for the rendered bridge; unpinned, the
+// rendered bridge runs 10 and even the default install derives above the
+// floor, which the last block holds.
 func TestTasksMaxConsumersDerivation(t *testing.T) {
+	t.Setenv(a2aBridgeConcurrencyOperatorEnvVar, strconv.Itoa(a2aBridgeDefaultConcurrency))
 	for _, tc := range []struct {
 		name        string
 		maxSessions *int
@@ -118,6 +123,16 @@ func TestTasksMaxConsumersDerivation(t *testing.T) {
 			}
 		})
 	}
+	t.Run("the rendered bridge's default is above the floor", func(t *testing.T) {
+		t.Setenv(a2aBridgeConcurrencyOperatorEnvVar, "")
+		agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
+		if got := a2aTasksConsumerBudget(agent); got != 110 {
+			t.Errorf("budget = %d, want 110: 10 sessions at 3, plus 20 and 6 a worker for the rendered bridge's 10", got)
+		}
+		if got := a2aTasksMaxConsumers(agent); got != 110 {
+			t.Errorf("rendered max_consumers = %d, want 110: a default install derives above the floor", got)
+		}
+	})
 }
 
 // The budget reads the bridge sidecar's BRIDGE_CONCURRENCY. Before it did,
@@ -125,10 +140,11 @@ func TestTasksMaxConsumersDerivation(t *testing.T) {
 // one at 2 and was told the same 32-consumer reserve, while its bridge ran
 // three times the conversations the asks row was sized for (gke-labs#2043).
 // This asserts only through the budget, the render and the script -- the
-// three things an install sees. A tree without the resolver produces 62, 64
-// and a 32-consumer reserve on every shape below; the rows that declare a
-// count expect other numbers, which is what pins that the resolver reads
-// it, and the rows that do not pin that it reads nothing else.
+// three things an install sees. The rows that declare a count expect
+// numbers a tree without the resolver cannot produce, which is what pins
+// that the resolver reads it; the rows that declare none count the bridge
+// the operator renders in the sidecar's place (10 workers, an 80-consumer
+// reserve), and pin that it reads nothing else.
 func TestTasksBudgetReadsTheBridgeSidecarConcurrency(t *testing.T) {
 	bridge := func(env ...corev1.EnvVar) *agentv1alpha1.DeploymentSpec {
 		return &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{{Name: "hermes-bridge", Image: "bridge:dev", Env: env}}}
@@ -141,10 +157,10 @@ func TestTasksBudgetReadsTheBridgeSidecarConcurrency(t *testing.T) {
 		wantRender int
 		wantScript []string
 	}{
-		{"no sidecar is the default install", nil, 62, 64,
-			[]string{"required_consumers=62", "--max-consumers=64", "plus 32 reserved", "sized for 2 bridge workers"}},
-		{"a sidecar that is not a bridge changes nothing", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{{Name: "fluent-bit", Image: "fb:dev"}}}, 62, 64,
-			[]string{"required_consumers=62", "--max-consumers=64", "plus 32 reserved", "sized for 2 bridge workers"}},
+		{"no sidecar is the default install, with the rendered bridge", nil, 110, 110,
+			[]string{"required_consumers=110", "--max-consumers=110", "plus 80 reserved", "sized for 10 bridge workers: the operator renders the bridge"}},
+		{"a sidecar that is not a bridge changes nothing", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{{Name: "fluent-bit", Image: "fb:dev"}}}, 110, 110,
+			[]string{"required_consumers=110", "--max-consumers=110", "plus 80 reserved", "sized for 10 bridge workers: the operator renders the bridge"}},
 		{"the bridge's own default written on the CR changes nothing", bridge(lit("2")), 62, 64,
 			[]string{"required_consumers=62", "--max-consumers=64", "plus 32 reserved", "sized for 2 bridge workers"}},
 		{"the presubmit's four clears the floor", bridge(lit("4")), 74, 74,
@@ -386,6 +402,8 @@ func TestProvisionSaysWhenABridgeCountWasNotRead(t *testing.T) {
 			nil, []string{"NOTE: a spec.deployment.sidecars"}},
 		{"a literal alone says nothing", sidecar([]corev1.EnvVar{{Name: "BRIDGE_CONCURRENCY", Value: "2"}}, nil), false,
 			nil, []string{"NOTE: a spec.deployment.sidecars"}},
+		// No sidecar: the operator renders the bridge, whose literal the
+		// render wrote itself, so there is nothing unread to note.
 		{"no sidecar says nothing", nil, false,
 			nil, []string{"NOTE: a spec.deployment.sidecars"}},
 	} {
@@ -395,17 +413,23 @@ func TestProvisionSaysWhenABridgeCountWasNotRead(t *testing.T) {
 			if got := a2aBridgeEnvFromUnread(agent); got != tc.wantEnvFromUnread {
 				t.Errorf("a2aBridgeEnvFromUnread = %v, want %v", got, tc.wantEnvFromUnread)
 			}
-			// The numbers do not move: the default install's budget, which
-			// a 64-wide stream holds, so the run below exits 0.
-			if got := a2aTasksConsumerBudget(agent); got != 62 {
-				t.Fatalf("budget = %d, want 62", got)
+			// The numbers do not move on a declared bridge: the bridge's
+			// default budgets 62, which a 64-wide stream holds. With no
+			// sidecar the rendered bridge's 10 workers budget 110, so the
+			// stream is sized to hold that; either way the run exits 0.
+			wantBudget, width := 62, 64
+			if tc.deployment == nil {
+				wantBudget, width = 110, 110
 			}
-			code, stderr := runProvision(t, agent, 64)
+			if got := a2aTasksConsumerBudget(agent); got != wantBudget {
+				t.Fatalf("budget = %d, want %d", got, wantBudget)
+			}
+			code, stderr := runProvision(t, agent, width)
 			if code != 0 {
 				t.Fatalf("exit %d, want 0\nstderr:\n%s", code, stderr)
 			}
 			if strings.Contains(stderr, "TASKS holds max_consumers") {
-				t.Errorf("a 64-wide stream refused a budget of 62:\n%s", stderr)
+				t.Errorf("a %d-wide stream refused a budget of %d:\n%s", width, wantBudget, stderr)
 			}
 			for _, want := range tc.want {
 				if !strings.Contains(stderr, want) {
@@ -459,11 +483,15 @@ func TestProvisionRefusalOffersFewerBridgeWorkers(t *testing.T) {
 		t.Errorf("stderr counts two ways out on a CR with three:\n%s", stderr)
 	}
 
-	// At the default there is no worker count to lower, and the refusal reads
-	// as it did: two ways out, no third lever, no worker arithmetic.
+	// At the bridge's default, declared on the CR, there is no worker count
+	// to lower, and the refusal reads as it did: two ways out, no third
+	// lever, no worker arithmetic.
 	agent = &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
 	sessions := 100
 	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{MaxSessions: &sessions}}
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{{
+		Name: "hermes-bridge", Image: "bridge:dev", Env: []corev1.EnvVar{{Name: "BRIDGE_CONCURRENCY", Value: "2"}},
+	}}}
 	stderr = runProvisionRefusal(t, agent, 64)
 	for _, want := range []string{
 		"sized for 2 bridge workers: each spec.deployment.sidecars entry",
@@ -477,6 +505,32 @@ func TestProvisionRefusalOffersFewerBridgeWorkers(t *testing.T) {
 	for _, unwanted := range []string{"Or keep spec.harness.tuning.maxSessions", "Fewer bridge workers", "workers_fit", "the most this render sizes for"} {
 		if strings.Contains(stderr, unwanted) {
 			t.Errorf("stderr names %q on a CR at the bridge's default, which has no worker count to lower:\n%s", unwanted, stderr)
+		}
+	}
+
+	// With no sidecar the operator renders the bridge at its own default of
+	// 10 workers, so a default CR (maxSessions=10, budget 110) is refused by
+	// a 64-wide stream, and the third lever is the operator's setting, not
+	// a sidecar entry: beside maxSessions=10 the stream has room for
+	// (64 - 30 - 20) / 6 = 2 workers.
+	agent = &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
+	stderr = runProvisionRefusal(t, agent, 64)
+	for _, want := range []string{
+		"TASKS holds max_consumers=64 but this PlatformAgent needs 110:",
+		"plus 80 reserved for the standing durables, the web rail and tasks/get replays.",
+		"sized for 10 bridge workers: the operator renders the bridge, at the",
+		"A2A_BRIDGE_CONCURRENCY in its own environment, or 10 when that is unset, 2 when it is not a count).",
+		"Or keep spec.harness.tuning.maxSessions at 10 and set the operator's A2A_BRIDGE_CONCURRENCY to at most 2",
+		"- the operator renders the bridge; unset, it runs 10 - which is",
+		"the reserve is 20 plus 6 a worker.",
+	} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("stderr does not name %q\ngot:\n%s", want, stderr)
+		}
+	}
+	for _, unwanted := range []string{"each spec.deployment.sidecars entry", "declare the bridge sidecar"} {
+		if strings.Contains(stderr, unwanted) {
+			t.Errorf("stderr names %q on a CR whose bridge the operator renders:\n%s", unwanted, stderr)
 		}
 	}
 
@@ -595,8 +649,10 @@ func refusalLines(script string) string {
 // failed is the other surface that named maxSessions alone. On the install
 // gke-labs#2043 describes it read "maxSessions=10 needs (74)" though
 // maxSessions=10 fit before the sidecar was declared. It now attributes the
-// need to both inputs and offers the third lever when the CR declares more
-// workers than the bridge's default, and reads as it did when it does not.
+// need to both inputs and offers the third lever when the count is above the
+// bridge's default -- a sidecar the CR declares, or the bridge the operator
+// renders in its place, whose lever is the operator's setting -- and reads
+// as it did when it is not.
 // Both through the helper, which is the format string, and once through the
 // reconcile, which is what calls it.
 func TestProvisionFailureStatusNamesBothInputs(t *testing.T) {
@@ -618,21 +674,39 @@ func TestProvisionFailureStatusNamesBothInputs(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		deployment *agentv1alpha1.DeploymentSpec
-		sessions   int // 0 is the default maxSessions
+		operator   string // the operator's A2A_BRIDGE_CONCURRENCY for the rendered bridge; "" is unset
+		sessions   int    // 0 is the default maxSessions
 		want       []string
 		unwanted   []string
 	}{
-		{"the default install names maxSessions and two ways out", nil, 0,
+		// No sidecar: the operator renders the bridge at its default of 10,
+		// so the count is an input, attributed to the operator's setting,
+		// and the third lever is that setting.
+		{"the default install names maxSessions and the rendered bridge, and three ways out", nil, "", 0,
+			[]string{
+				"spec.harness.tuning.maxSessions=10 and the 10 bridge workers the operator's rendered bridge runs (its default of 10, with no A2A_BRIDGE_CONCURRENCY in the operator's environment) need together (110; the reserve is 80 at 10 workers and 32 at 2).",
+				"so the ways out are to lower maxSessions until the budget fits the stream, to set the operator's A2A_BRIDGE_CONCURRENCY to fewer workers (unset, the rendered bridge runs 10) until it does, or to delete the TASKS stream and let provisioning recreate it at 110,",
+				"and therefore the maxSessions, or the worker count, that fits. The three do not finish the same way. Lowering maxSessions, or the operator's bridge setting, finishes by itself: either re-renders this Job,",
+			},
+			[]string{"needs (110)", "the CR declares", "spec.deployment.sidecars", "the two ways out", "declare the bridge sidecar"}},
+		{"the operator's setting at the bridge's default reads as maxSessions alone", nil, "2", 0,
 			[]string{
 				"spec.harness.tuning.maxSessions=10 needs (62).",
 				"so the two ways out are to lower maxSessions until the budget fits the stream, or to delete the TASKS stream and let provisioning recreate it at 64,",
 				"and therefore the maxSessions that fits. The two do not finish the same way. Lowering maxSessions finishes by itself:",
 			},
 			[]string{"bridge workers", "fewer workers", "BRIDGE_CONCURRENCY", "The three"}},
-		{"the bridge's own default written on the CR reads the same", bridge("2"), 0,
+		{"the operator's setting above the default is named as the operator's", nil, "4", 0,
+			[]string{
+				"spec.harness.tuning.maxSessions=10 and the 4 bridge workers the operator's rendered bridge runs (A2A_BRIDGE_CONCURRENCY in the operator's environment) need together (74; the reserve is 44 at 4 workers and 32 at 2).",
+				"to set the operator's A2A_BRIDGE_CONCURRENCY to fewer workers (unset, the rendered bridge runs 10) until it does,",
+				"recreate it at 74,",
+			},
+			[]string{"the CR declares", "spec.deployment.sidecars", "its default of 10"}},
+		{"the bridge's own default written on the CR reads as maxSessions alone", bridge("2"), "", 0,
 			[]string{"spec.harness.tuning.maxSessions=10 needs (62).", "so the two ways out are"},
 			[]string{"bridge workers", "fewer workers", "BRIDGE_CONCURRENCY"}},
-		{"the presubmit's four names both inputs and three ways out", bridge("4"), 0,
+		{"the presubmit's four names both inputs and three ways out", bridge("4"), "", 0,
 			[]string{
 				"spec.harness.tuning.maxSessions=10 and the 4 bridge workers the CR declares (BRIDGE_CONCURRENCY on spec.deployment.sidecars) need together (74; the reserve is 44 at 4 workers and 32 at the bridge's default of 2).",
 				"so the ways out are to lower maxSessions until the budget fits the stream, to declare the bridge sidecar with fewer workers (a lower BRIDGE_CONCURRENCY, or none for the bridge's default of 2) until it does, or to delete the TASKS stream and let provisioning recreate it at 74,",
@@ -642,7 +716,7 @@ func TestProvisionFailureStatusNamesBothInputs(t *testing.T) {
 				"kubectl rollout restart deployment/test-agent-a2a-gateway -n test-ns, and the agent workload test-agent-gateway with it",
 			},
 			[]string{"the two ways out", "The two do not finish", "needs (74)", "more than 1024"}},
-		{"a capped count says so", bridge("9223372036854775807"), 0,
+		{"a capped count says so", bridge("9223372036854775807"), "", 0,
 			[]string{
 				"the 1024 bridge workers the CR declares",
 				"need together (6194;",
@@ -655,7 +729,7 @@ func TestProvisionFailureStatusNamesBothInputs(t *testing.T) {
 		// and a reference, so the message says what the render read and
 		// states the per-entry rule.
 		{"a literal beside a valueFrom is a read, not a declaration, and says the rule", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
-			sidecar("bridge-a", lit("6")), sidecar("bridge-b", fromRef)}}, 0,
+			sidecar("bridge-a", lit("6")), sidecar("bridge-b", fromRef)}}, "", 0,
 			[]string{
 				"spec.harness.tuning.maxSessions=10 and the 8 bridge workers " + readClause + " need together (98; the reserve is 68 at 8 workers and 32 at the bridge's default of 2).",
 				"so the ways out are to lower maxSessions until the budget fits the stream, to declare the bridge sidecar with fewer workers",
@@ -663,7 +737,7 @@ func TestProvisionFailureStatusNamesBothInputs(t *testing.T) {
 			},
 			[]string{"the CR declares", "the two ways out", "more than 1024"}},
 		{"two literals are what the CR declares, with no rule to state", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
-			sidecar("bridge-a", lit("4")), sidecar("bridge-b", lit("6"))}}, 0,
+			sidecar("bridge-a", lit("4")), sidecar("bridge-b", lit("6"))}}, "", 0,
 			[]string{
 				"spec.harness.tuning.maxSessions=10 and the 10 bridge workers the CR declares (BRIDGE_CONCURRENCY on spec.deployment.sidecars) need together (110; the reserve is 80 at 10 workers and 32 at the bridge's default of 2).",
 				"recreate it at 110,",
@@ -676,7 +750,7 @@ func TestProvisionFailureStatusNamesBothInputs(t *testing.T) {
 		// the default's, and the ways out stay two, there being no lower
 		// count to offer at the default.
 		{"a lone reference to a valueFrom is the default, and the message still states the read rule", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
-			sidecar("hermes-bridge", corev1.EnvVar{Name: "EVAL_PARALLELISM", ValueFrom: fromRef.ValueFrom}, lit("$(EVAL_PARALLELISM)"))}}, 0,
+			sidecar("hermes-bridge", corev1.EnvVar{Name: "EVAL_PARALLELISM", ValueFrom: fromRef.ValueFrom}, lit("$(EVAL_PARALLELISM)"))}}, "", 0,
 			[]string{
 				"spec.harness.tuning.maxSessions=10 and the 2 bridge workers " + readClause + " need together (62; the reserve is 32 at 2 workers, the bridge's default).",
 				"so the two ways out are to lower maxSessions until the budget fits the stream, or to delete the TASKS stream and let provisioning recreate it at 64,",
@@ -687,7 +761,7 @@ func TestProvisionFailureStatusNamesBothInputs(t *testing.T) {
 		// attribution, since 1023 and a reference is not a CR declaring
 		// more than 1024.
 		{"a capped count over a read says the count, not the CR, is past the cap", &agentv1alpha1.DeploymentSpec{Sidecars: []corev1.Container{
-			sidecar("bridge-a", lit("1023")), sidecar("bridge-b", fromRef)}}, 0,
+			sidecar("bridge-a", lit("1023")), sidecar("bridge-b", fromRef)}}, "", 0,
 			[]string{
 				"the 1024 bridge workers " + readClause + " need together (6194;",
 				"That count is more than 1024; the budget sizes for at most that many, the queue behind the bridge's workers, and a count past it is a typo to correct.",
@@ -699,7 +773,7 @@ func TestProvisionFailureStatusNamesBothInputs(t *testing.T) {
 		// number maxSessions alone does not produce -- but there is no
 		// lower count to declare, so the lever is not offered and the
 		// ways out stay two.
-		{"one worker is named as an input, with no lower count to offer", bridge("1"), 20,
+		{"one worker is named as an input, with no lower count to offer", bridge("1"), "", 20,
 			[]string{
 				"spec.harness.tuning.maxSessions=20 and the 1 bridge worker the CR declares (BRIDGE_CONCURRENCY on spec.deployment.sidecars) need together (86; the reserve is 26 at 1 worker and 32 at the bridge's default of 2, with no lower count left to declare).",
 				"so the two ways out are to lower maxSessions until the budget fits the stream, or to delete the TASKS stream and let provisioning recreate it at 86,",
@@ -708,6 +782,7 @@ func TestProvisionFailureStatusNamesBothInputs(t *testing.T) {
 			[]string{"needs (86)", "fewer workers", "The three", "the worker count, that fits", "1 bridge workers", "at 1 workers"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(a2aBridgeConcurrencyOperatorEnvVar, tc.operator)
 			agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
 			agent.Spec.Deployment = tc.deployment
 			if tc.sessions != 0 {
@@ -767,7 +842,8 @@ func TestProvisionFailureStatusNamesBothInputs(t *testing.T) {
 }
 
 // The rendered flags, so a refactor that drops one is caught without running
-// anything.
+// anything. 40 sessions at 3, plus the 80 the rendered bridge's 10 workers
+// reserve, is 200.
 func TestTasksStreamCarriesItsLimits(t *testing.T) {
 	agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
 	sessions := 40
@@ -780,7 +856,7 @@ func TestTasksStreamCarriesItsLimits(t *testing.T) {
 	}
 	for _, want := range []string{
 		"--max-msgs-per-subject=4096",
-		"--max-consumers=152",
+		"--max-consumers=200",
 		"--discard=old",
 	} {
 		if !strings.Contains(add, want) {
@@ -842,6 +918,11 @@ func TestProvisionReportsATasksStreamOlderThanItsRender(t *testing.T) {
 		t.Fatalf("bash is required to execute the provision script (it uses `set -o pipefail`): %v", err)
 	}
 
+	// The worker count is incidental here, so the rendered bridge is pinned
+	// at the bridge's own default through the operator's setting: the
+	// literals below are the reserve table's row at 2 (32), and the third
+	// lever stays out of the way of the two branches under test.
+	t.Setenv(a2aBridgeConcurrencyOperatorEnvVar, strconv.Itoa(a2aBridgeDefaultConcurrency))
 	agent := &agentv1alpha1.PlatformAgent{ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"}}
 	sessions := 100
 	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{Tuning: &agentv1alpha1.TuningSpec{MaxSessions: &sessions}}

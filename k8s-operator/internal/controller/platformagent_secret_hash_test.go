@@ -650,9 +650,15 @@ func TestAHealthyPassAsksToBeWokenForTheSecretReRead(t *testing.T) {
 	if _, err := r.Reconcile(ctx, req); err != nil {
 		t.Fatalf("Reconcile 1: %v", err)
 	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile 2: %v", err)
+	}
+	// The A2A stack's own pending requeue would mask the interval under test
+	// until the stack has settled.
+	settleA2AStack(t, ctx, cl, r, req, agent)
 	result, err := r.Reconcile(ctx, req)
 	if err != nil {
-		t.Fatalf("Reconcile 2: %v", err)
+		t.Fatalf("settled Reconcile: %v", err)
 	}
 	if result.RequeueAfter != secretEnvReprobeInterval {
 		t.Errorf("RequeueAfter = %v, want %v", result.RequeueAfter, secretEnvReprobeInterval)
@@ -667,14 +673,16 @@ func TestAHealthyPassAsksToBeWokenForTheSecretReRead(t *testing.T) {
 // only when an integration is configured (buildCredentialProxyEnv), so on a
 // default fixture it is stamped with nothing and reverting the call in
 // reconcileCredentialProxy leaves the suite green — which is exactly what
-// review found.
+// review found. Google Chat is on as well, so Slack stays on the broker's
+// legacy relay rather than the A2A gateway (legacySlackConsumer).
 func TestRotatingASlackTokenChangesTheRenderedCredentialProxy(t *testing.T) {
 	scheme := setupScheme()
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
 		Spec: agentv1alpha1.PlatformAgentSpec{
 			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
-				Slack: &agentv1alpha1.SlackSpec{Enabled: ptr.To(true)},
+				GoogleChat: &agentv1alpha1.GoogleChatSpec{Enabled: ptr.To(true)},
+				Slack:      &agentv1alpha1.SlackSpec{Enabled: ptr.To(true)},
 			},
 		},
 	}

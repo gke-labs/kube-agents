@@ -731,9 +731,11 @@ func TestAFalseConditionMakesTheCRDegraded(t *testing.T) {
 	if c := busStreamsMissingCondition(agent); c == nil || c.Message != "Missing: TASKS" {
 		t.Errorf("busStreamsMissingCondition = %+v, want the False condition", c)
 	}
+	// A stored "today" renders the stack like any other value, so the condition
+	// still counts for Degraded.
 	agent.Spec.Mode = ptr.To("today")
-	if c := busStreamsMissingCondition(agent); c != nil {
-		t.Errorf("busStreamsMissingCondition = %+v under today, want nil", c)
+	if c := busStreamsMissingCondition(agent); c == nil {
+		t.Error("busStreamsMissingCondition = nil for a stored today, want the False condition")
 	}
 }
 
