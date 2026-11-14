@@ -39,7 +39,8 @@ INCIDENT_TRIAGE = "incident-triage"
 CHAT = "chat"
 MEMORY_SERVICE = "memory-service"
 SESSION_PODS = "session-pods"
-EXTRA_ROWS = (FIRST_RUN, INCIDENT_TRIAGE, CHAT, MEMORY_SERVICE, SESSION_PODS)
+GITOPS_DRIFT = "gitops-drift"
+EXTRA_ROWS = (FIRST_RUN, INCIDENT_TRIAGE, CHAT, MEMORY_SERVICE, SESSION_PODS, GITOPS_DRIFT)
 UNATTRIBUTED = "unattributed"
 OTHER = "other"
 OOBE_JOB = "oobe"
@@ -55,6 +56,12 @@ ORIGINS = {"event": INCIDENT_TRIAGE, "chat": CHAT}
 # Chat sessions: the agent API and the chat gateways.
 CHAT_SOURCES = {"api_server", "cli", "telegram", "slack", "discord", "google_chat", "webhook"}
 TOKEN_FIELDS = ("input", "cached", "output", "reasoning")
+# An inject's session, by the reason the Session KV server records on its intercepted_events
+# row (agents/platform/scripts/session_kv_server.py, STALL_LEDGER_REASON and
+# DRIFT_LEDGER_REASON), counts under the capability that raised it: the design's "An inject
+# counts under the capability that raised it". An event's own reasons stay incident triage.
+INJECT_REASONS = {"ControllerStall": "stall-watch", "OutOfBandChange": GITOPS_DRIFT}
+SESSION_KV_DB = "/var/lib/kube-agents/session/session_kv.db"
 KANBAN_SOURCE = "kanban"
 # Profile kinds for each row's split: the front door, the Platform Agent, the Cluster Agents.
 FRONT_DOOR_PROFILE = "default"
@@ -93,6 +100,17 @@ for profile, path in stores:
             out["sessions"].append(dict(r, profile=profile))
     except sqlite3.Error as exc:
         out["errors"].append("%s: %s" % (path, exc))
+out["injects"] = []
+kv = os.environ.get("SESSION_KV_DB_PATH") or (sys.argv[3] if len(sys.argv) > 3 else "")
+if kv and sys.argv[4:] and os.path.exists(kv):
+    try:
+        conn = ro(kv)
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='intercepted_events'").fetchone():
+            for r in conn.execute("SELECT session_id, object_uid, reason FROM intercepted_events WHERE reason IN (%s)"
+                                  % ",".join("?" for _ in sys.argv[4:]), sys.argv[4:]):
+                out["injects"].append(dict(r))
+    except sqlite3.Error as exc:
+        out["errors"].append("%s: %s" % (kv, exc))
 board = os.path.join(root, "kanban.db")
 if os.path.exists(board):
     try:
@@ -128,7 +146,7 @@ def read_stores(context: str, namespace: str, since: float = 0.0) -> dict[str, A
         raise kube.CommandError("no gateway pod to read the session records in")
     out = kube.kubectl(context, "exec", "-n", namespace, pod, "-c", operations.AGENT_CONTAINER, "--",
                        operations.JOB_PYTHON, "-c", READ_SCRIPT, DATA_ROOT, str(max(0.0, since - READ_SLACK_SECONDS)),
-                       timeout=READ_TIMEOUT_SECONDS)
+                       SESSION_KV_DB, *INJECT_REASONS, timeout=READ_TIMEOUT_SECONDS)
     return decode(out)
 
 
@@ -191,6 +209,13 @@ def join(stores: dict[str, Any], caps: tuple[str, ...]) -> Join:
                 and 0 <= started - float(r.get("started_at") or 0) <= RUN_START_SLACK_SECONDS]
         if near:
             worker_card[sid] = max(near, key=lambda r: float(r.get("started_at") or 0))["task_id"]
+    # The stall watch keys its row by the session it opens (object_uid); the drift path and the
+    # event path by session_id. Either names the inject's session.
+    injected: dict[str, str] = {}
+    for row in stores.get("injects", []):
+        for key in (row.get("session_id"), row.get("object_uid")):
+            if key and row.get("reason") in INJECT_REASONS:
+                injected[key] = INJECT_REASONS[row["reason"]]
     result = Join({}, {})
     # Under spec.mode next a delegation travels the agent bus, not the board: its worker's kanban
     # session has no card. It joins to the chat turn open when it started, when exactly one was.
@@ -221,15 +246,23 @@ def join(stores: dict[str, Any], caps: tuple[str, ...]) -> Join:
                 return job, "card names the job"
             creator = card.get("session_id")
             if creator and creator not in seen and creator != sid:
-                return decide(creator, seen | {sid})[0], "card creator"
+                cap = decide(creator, seen | {sid})[0]
+                if cap != UNATTRIBUTED:
+                    return cap, "card creator"
+            # A creator with no row (pruned) or one no rule reaches: the card's own origin decides.
             if card.get("origin") in ORIGINS:
                 return ORIGINS[card["origin"]], "card origin"
             return UNATTRIBUTED, "card with no creator or origin"
+        if sid in injected:
+            cap = injected[sid]
+            return (cap, "inject") if cap in caps else (UNATTRIBUTED, f"inject from {cap}, not in the list")
         if EVENT_ID.match(sid):
             return INCIDENT_TRIAGE, "event session"
         parent = session.get("parent_session_id")
         if parent and parent not in seen and parent != sid:
-            return decide(parent, seen | {sid})[0], "parent session"
+            cap = decide(parent, seen | {sid})[0]
+            if cap != UNATTRIBUTED:
+                return cap, "parent session"
         if session.get("source") in CHAT_SOURCES:
             return CHAT, f"source {session.get('source')}"
         if session.get("source") == KANBAN_SOURCE:
