@@ -27,10 +27,11 @@
 #
 # What the caller is told (#5528): the canceled task carries the card stop's
 # result, written by the gateway from the bridge's cardStop part, and the
-# harness records harness_cancel_reported from it: completed only when the
-# task ended canceled with a cardStop result whose stopped cards are exactly
-# the cards the board shows archived. A canceled task that says nothing about
-# its cards fails it.
+# harness records harness_cancel_reported from it once the door accepted the
+# cancel and the task ended canceled: completed only when the cardStop
+# result's stopped cards are exactly the cards the board shows archived
+# (less any it calls settled) and its text opens "canceled; ". A canceled
+# task that says nothing about its cards fails it.
 #
 # Known limit: a cancel can't reach a command already running in a worker's
 # shell sandbox, so a write already in flight when the stop lands can finish.

@@ -422,8 +422,9 @@ def test_the_scorers_door_entry_name_agrees_with_the_harness():
     assert not scoring.is_inject_record([{"name": harness._A2A_DOOR_SEND_ENTRY}])
 
 
-def _card_stop_artifact(text, stopped_ids):
-    data = {"cardStop": {"v": 1, "stopped": [{"id": i, "title": "scale it"} for i in stopped_ids], "settled": []}}
+def _card_stop_artifact(text, stopped_ids, settled_ids=(), stopped=None):
+    data = {"cardStop": {"v": 1, "stopped": stopped if stopped is not None else [{"id": i, "title": "scale it"} for i in stopped_ids],
+                         "settled": [{"id": i, "title": "earlier", "status": "done"} for i in settled_ids]}}
     return [{"artifactId": "t-1-result", "name": "result", "parts": [{"kind": "text", "text": text}, {"kind": "data", "data": data}]}]
 
 
@@ -476,4 +477,52 @@ def test_a_card_stop_request_is_not_a_result():
     assert a2a_door.card_stop_result(request) is None
     other_version = {"artifacts": [{"parts": [{"kind": "data", "data": {"cardStop": {"v": 2, "stopped": []}}}]}]}
     assert a2a_door.card_stop_result(other_version) is None
+
+
+def test_a_card_the_board_shows_done_is_not_counted_as_stopped(card_wait):
+    result, _, _ = card_wait(
+        ["working", "working"], [["a2a-ctx-bus"]],
+        canceled_artifacts=_card_stop_artifact("canceled; 🛑 stopped 1 card: scale it", ["c-1"]),
+        statuses={"c-1": "archived", "c-0": "done"},
+    )
+    (entry,) = _cancel_report(result)
+    assert entry["status"] == "completed", entry
+
+
+def test_a_card_the_result_calls_settled_is_not_counted_as_stopped(card_wait):
+    # An agent that archived a card of its own before the cancel: the stop
+    # reports it settled, and the board shows it archived.
+    result, _, _ = card_wait(
+        ["working", "working"], [["a2a-ctx-bus"]],
+        canceled_artifacts=_card_stop_artifact("canceled; 🛑 stopped 1 card: scale it", ["c-1"], settled_ids=["c-0"]),
+        statuses={"c-1": "archived", "c-0": "archived"},
+    )
+    (entry,) = _cancel_report(result)
+    assert entry["status"] == "completed", entry
+
+
+def test_a_malformed_stopped_list_fails(card_wait):
+    result, _, _ = card_wait(
+        ["working", "working"], [["a2a-ctx-bus"]],
+        canceled_artifacts=_card_stop_artifact("canceled; 🛑 stopped 1 card", [], stopped=[{"id": "c-1"}, "c-9"]),
+        statuses={"c-1": "archived"},
+    )
+    (entry,) = _cancel_report(result)
+    assert entry["status"] == "error" and "string id" in entry["result"], entry
+
+
+def test_a_refused_cancel_gets_no_cancel_report_even_if_the_task_ends_canceled(card_wait):
+    # The door refuses the cancel, yet the task reads canceled after it (a
+    # cancel from elsewhere): the stop window runs, and only the guard's
+    # cancel-accepted half keeps the entry off.
+    result, _, _ = card_wait(
+        ["working", "working", "canceled"], [["a2a-ctx-bus"]],
+        cancel_error=harness.a2a_door.DoorError(-32000, "refused"),
+        canceled_artifacts=_card_stop_artifact("canceled; 🛑 stopped 1 card", ["c-1"]),
+        statuses={"c-1": "archived"},
+    )
+    status = [e for e in result.trajectory if e["name"] == harness._A2A_DOOR_STATUS_ENTRY]
+    assert status and status[0]["args"]["state"] == "canceled", result.trajectory
+    assert any(e["name"] == stop_hook.STOP_ENTRY for e in result.trajectory)
+    assert not _cancel_report(result)
 

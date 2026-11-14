@@ -3068,16 +3068,28 @@ def _cancel_report_entry(task: dict[str, Any], statuses: dict[str, str]) -> dict
     (#5528): ``completed`` when the task carries a card-stop result whose
     stopped cards are exactly the cards the board showed archived after the
     stop (``statuses``, as :meth:`KubeAgentsHarness._stop_after_first_card`
-    read them, before the harness archived any leftover) and whose text says
-    so; ``error`` with the reason otherwise, a terminal with no result first."""
-    archived = sorted(t for t, s in statuses.items() if s == stop_hook.STOPPED_STATUS)
+    read them, before the harness archived any leftover), less any the
+    result calls already settled, and whose text opens
+    :data:`stop_hook.CANCEL_REPORT_PREFIX`. ``error`` with the reason
+    otherwise; a canceled task with no card-stop result at all is the first.
+
+    Strict on purpose: a card the stop reported still pending whose archive
+    lands inside the window fails it, since the caller was told the card may
+    run on. A card the result calls failed and that never archived is
+    ``harness_cards_stopped``'s miss as well."""
+    archived = {t for t, s in statuses.items() if s == stop_hook.STOPPED_STATUS}
     found = a2a_door.card_stop_result(task)
     if found is None:
         why = "the canceled task carries no card-stop result"
-        return {"name": stop_hook.CANCEL_REPORTED_ENTRY, "args": {"archived": archived}, "status": "error", "result": why}
+        return {"name": stop_hook.CANCEL_REPORTED_ENTRY, "args": {"archived": sorted(archived)}, "status": "error", "result": why}
     text, card_stop = found
-    stopped = sorted(str(c.get("id") or "") for c in card_stop.get("stopped") or [] if isinstance(c, dict))
     problems = []
+    listed = card_stop.get("stopped") or []
+    if not all(isinstance(c, dict) and isinstance(c.get("id"), str) for c in listed):
+        problems.append("its stopped list holds an entry that is not a card with a string id")
+    stopped = sorted(c["id"] for c in listed if isinstance(c, dict) and isinstance(c.get("id"), str))
+    settled = {c["id"] for c in card_stop.get("settled") or [] if isinstance(c, dict) and isinstance(c.get("id"), str)}
+    archived = sorted(archived - settled)
     if not text.startswith(stop_hook.CANCEL_REPORT_PREFIX):
         problems.append(f"its text does not open {stop_hook.CANCEL_REPORT_PREFIX.strip()!r}")
     if stopped != archived:
