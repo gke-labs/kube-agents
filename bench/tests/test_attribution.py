@@ -170,3 +170,34 @@ class ReadScriptTest(unittest.TestCase):
     def test_a_cut_off_read_is_an_error_that_says_so(self):
         with self.assertRaises(at.kube.CommandError):
             at.decode("eJzLSM3JyQcABiwCFQ"[:10])
+
+
+class BusDelegationTest(unittest.TestCase):
+    def stores(self, chats):
+        sessions = [session("w", source="kanban", started=150.0)]
+        for i, (start, end) in enumerate(chats):
+            s = session(f"chat{i}", source="api_server", started=start)
+            s["ended_at"] = end
+            sessions.append(s)
+        return {"sessions": sessions, "cards": [], "runs": []}
+
+    def test_a_cardless_worker_joins_the_one_chat_turn_open_when_it_started(self):
+        joined = at.join(self.stores([(100.0, 300.0)]), CAPS)
+        self.assertEqual(joined.capability["w"], at.CHAT)
+        self.assertEqual(joined.rules["w"], "bus delegation from the one open chat turn")
+
+    def test_two_open_chat_turns_or_none_leave_it_unattributed(self):
+        self.assertEqual(at.join(self.stores([(100.0, 300.0), (120.0, 400.0)]), CAPS).capability["w"],
+                         at.UNATTRIBUTED)
+        self.assertEqual(at.join(self.stores([(10.0, 20.0)]), CAPS).capability["w"], at.UNATTRIBUTED)
+
+
+class ProfileSplitTest(unittest.TestCase):
+    def test_each_row_splits_its_tokens_by_front_door_platform_and_cluster_agents(self):
+        data = {"sessions": [session("cron_compliance-audit_20261111_200909", profile="platform"),
+                             session("child", source="subagent", parent="cron_compliance-audit_20261111_200909",
+                                     profile="cluster-p-c1-us-central1-f")],
+                "cards": [], "runs": []}
+        row = at.attribute(data, 0, 500, caps=CAPS)["capabilities"]["compliance-audit"]
+        self.assertEqual(row["by_profile"], {"platform": 100, at.CLUSTER_AGENTS: 100})
+        self.assertEqual(at.profile_kind("default"), "default")

@@ -55,6 +55,12 @@ ORIGINS = {"event": INCIDENT_TRIAGE, "chat": CHAT}
 # Chat sessions: the agent API and the chat gateways.
 CHAT_SOURCES = {"api_server", "cli", "telegram", "slack", "discord", "google_chat", "webhook"}
 TOKEN_FIELDS = ("input", "cached", "output", "reasoning")
+KANBAN_SOURCE = "kanban"
+# Profile kinds for each row's split: the front door, the Platform Agent, the Cluster Agents.
+FRONT_DOOR_PROFILE = "default"
+PLATFORM_PROFILE = "platform"
+CLUSTER_PROFILE_PREFIX = "cluster-"
+CLUSTER_AGENTS = "cluster-agents"
 # The first-run flow's cards carry these idempotency keys (agents/chat/scripts/oobe.py's scan).
 FIRST_RUN_KEY_PREFIX = "bootstrap-"
 # A run that ended blocked or failed keeps no worker session id; its worker session starts
@@ -77,9 +83,13 @@ stores = [("default", os.path.join(root, "state.db"))]
 stores += [(p.split("/")[-2], p) for p in sorted(glob.glob(os.path.join(root, "profiles", "*", "state.db")))]
 for profile, path in stores:
     try:
-        for r in ro(path).execute(
-                "SELECT id, source, started_at, parent_session_id, input_tokens, output_tokens, "
-                "cache_read_tokens, reasoning_tokens FROM sessions WHERE started_at >= ?", (since,)):
+        conn = ro(path)
+        cols = {c[1] for c in conn.execute("PRAGMA table_info(sessions)")}
+        ends = [c for c in ("ended_at", "last_activity_at") if c in cols]
+        end = "COALESCE(%s) AS ended_at" % ", ".join(ends) if ends else "NULL AS ended_at"
+        for r in conn.execute(
+                "SELECT id, source, started_at, %s, parent_session_id, input_tokens, output_tokens, "
+                "cache_read_tokens, reasoning_tokens FROM sessions WHERE started_at >= ?" % end, (since,)):
             out["sessions"].append(dict(r, profile=profile))
     except sqlite3.Error as exc:
         out["errors"].append("%s: %s" % (path, exc))
@@ -138,6 +148,13 @@ def tokens(session: dict[str, Any]) -> dict[str, int]:
             "reasoning": int(session.get("reasoning_tokens") or 0)}
 
 
+def profile_kind(profile: str | None) -> str:
+    """The row split's kind: the front door, the Platform Agent, the Cluster Agents, or the profile itself."""
+    if profile and profile.startswith(CLUSTER_PROFILE_PREFIX):
+        return CLUSTER_AGENTS
+    return profile or FRONT_DOOR_PROFILE
+
+
 def mentioned_job(text: str, jobs: tuple[str, ...]) -> str | None:
     """The longest job id a card's text names, so an audit run from a card counts under the audit."""
     named = [job for job in jobs if re.search(rf"(?<![\w-]){re.escape(job)}(?![\w-])", text)]
@@ -175,6 +192,15 @@ def join(stores: dict[str, Any], caps: tuple[str, ...]) -> Join:
         if near:
             worker_card[sid] = max(near, key=lambda r: float(r.get("started_at") or 0))["task_id"]
     result = Join({}, {})
+    # Under spec.mode next a delegation travels the agent bus, not the board: its worker's kanban
+    # session has no card. It joins to the chat turn open when it started, when exactly one was.
+    chats = [s for s in sessions.values() if s.get("source") in CHAT_SOURCES and not EVENT_ID.match(s["id"])]
+
+    def open_chat(session: dict[str, Any]) -> str | None:
+        started = float(session.get("started_at") or 0)
+        live = [c["id"] for c in chats if float(c.get("started_at") or 0) <= started
+                <= float(c.get("ended_at") or c.get("started_at") or 0)]
+        return live[0] if len(live) == 1 else None
 
     def decide(sid: str, seen: frozenset = frozenset()) -> tuple[str, str]:
         if sid in result.capability:
@@ -206,6 +232,11 @@ def join(stores: dict[str, Any], caps: tuple[str, ...]) -> Join:
             return decide(parent, seen | {sid})[0], "parent session"
         if session.get("source") in CHAT_SOURCES:
             return CHAT, f"source {session.get('source')}"
+        if session.get("source") == KANBAN_SOURCE:
+            chat = open_chat(session)
+            if chat and chat not in seen:
+                return decide(chat, seen | {sid})[0], "bus delegation from the one open chat turn"
+            return UNATTRIBUTED, "kanban session with no card and not one open chat turn"
         return UNATTRIBUTED, f"source {session.get('source')}"
 
     for sid in sessions:
@@ -231,9 +262,12 @@ def attribute(stores: dict[str, Any], start: float, end: float, litellm: dict[st
         if not start <= started < end:
             continue
         cap = joined.capability[session["id"]]
-        row = rows.setdefault(cap, {**dict.fromkeys(TOKEN_FIELDS, 0), "sessions": 0})
+        row = rows.setdefault(cap, {**dict.fromkeys(TOKEN_FIELDS, 0), "sessions": 0, "by_profile": {}})
+        kind = profile_kind(session.get("profile"))
+        split = row["by_profile"].setdefault(kind, 0)
         for name, value in tokens(session).items():
             row[name] += value
+        row["by_profile"][kind] = split + sum(v for k, v in tokens(session).items() if k != "reasoning")
         row["sessions"] += 1
         if cap == UNATTRIBUTED:
             rule = joined.rules[session["id"]]
@@ -244,7 +278,7 @@ def attribute(stores: dict[str, Any], start: float, end: float, litellm: dict[st
     # LiteLLM's counters only; the design counts them in Unattributed.
     outside = outside_sessions(rows, litellm)
     if any(outside.values()):
-        row = rows.setdefault(UNATTRIBUTED, {**dict.fromkeys(TOKEN_FIELDS, 0), "sessions": 0})
+        row = rows.setdefault(UNATTRIBUTED, {**dict.fromkeys(TOKEN_FIELDS, 0), "sessions": 0, "by_profile": {}})
         for name, value in outside.items():
             row[name] += value
         unattributed_rules["outside any session"] = 0
@@ -311,8 +345,11 @@ def markdown(record: dict[str, dict[str, Any]]) -> str:
         lines += [f"## {window} window ({'sound' if sound else 'unsound'})", "",
                   "| Capability | Tokens | Share |", "| --- | ---: | ---: |"]
         lines += [f"| {r['capability']} | {r['tokens']:,} | {r['share']:.1%} |" for r in body["overview"]]
-        lines += ["", "| Capability | Sessions | Input | Cached input | Output |", "| --- | ---: | ---: | ---: | ---: |"]
+        lines += ["", "| Capability | Sessions | Input | Cached input | Output | By profile |",
+                  "| --- | ---: | ---: | ---: | ---: | --- |"]
         for cap, row in sorted(body["capabilities"].items()):
-            lines.append(f"| {cap} | {row['sessions']} | {row['input']:,} | {row['cached']:,} | {row['output']:,} |")
+            split = ", ".join(f"{k} {v:,}" for k, v in sorted(row.get("by_profile", {}).items(), key=lambda kv: -kv[1]))
+            lines.append(f"| {cap} | {row['sessions']} | {row['input']:,} | {row['cached']:,} | {row['output']:,} "
+                         f"| {split} |")
         lines += ["", f"Checks: `{json.dumps(body['checks'])}`", ""]
     return "\n".join(lines)
