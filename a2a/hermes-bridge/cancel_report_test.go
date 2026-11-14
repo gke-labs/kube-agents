@@ -278,3 +278,34 @@ func inCardWait(b *Bridge, sessionID string) bool {
 	defer b.kanban.mu.Unlock()
 	return b.kanban.activeWaits[sessionID] >= 2
 }
+
+// A Google-token A2A door session records an identity-only route (no
+// platform) with an a2a: conversation. The cancel's stop must send the key
+// the gateway's card-stop control sends for it, not that one, or the two
+// never share session-kv's single flight.
+func TestACancelsStopSendsTheControlsKeyForAnIdentityOnlyRoute(t *testing.T) {
+	store := newStopStore(t, http.StatusOK, stopAnswer)
+	b := &Bridge{
+		cfg: Config{
+			RouteURL:        store.srv.URL,
+			RouteKey:        "kv-key",
+			CardStopTimeout: 5 * time.Second,
+			Logger:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+		},
+		routeClient: store.srv.Client(),
+	}
+	b.rememberRoute("a2a-ctx-google", conversationRoute{ContextID: "ctx-google", Conversation: "a2a:ctx-google"})
+	if _, why := b.stopSessionCards("a2a-ctx-google"); why != "" {
+		t.Fatalf("no answer: %s", why)
+	}
+	posts := store.seen()
+	if len(posts) != 1 {
+		t.Fatalf("%d card-stop POSTs, want 1", len(posts))
+	}
+	if got := posts[0].body.Conversation; got != "" {
+		t.Errorf("conversation = %q, want the control's empty key", got)
+	}
+	if got := posts[0].body.ContextID; got != "ctx-google" {
+		t.Errorf("context = %q, want the route's", got)
+	}
+}

@@ -363,7 +363,16 @@ func (b *Bridge) stopSessionCards(sessionID string) (*cardStopResponse, string) 
 	}
 	route := b.recordedRoute(sessionID)
 	contextID := strings.TrimSpace(route.ContextID)
-	conversation := strings.TrimSpace(route.Conversation)
+	// Only a chat route's conversation is the key the gateway's card-stop
+	// control sends (postCardStop, through routeFor). An identity-only route
+	// (Platform empty: a Google-token A2A door's, kept for memory isolation)
+	// carries an a2a: key the control never sends, so it falls back to
+	// routeFor below, as the control does, and the two stops share
+	// session-kv's single flight.
+	var conversation string
+	if route.Platform != "" {
+		conversation = strings.TrimSpace(route.Conversation)
+	}
 
 	b.kanban.mu.Lock()
 	meta := b.kanban.consoleSessions[sessionID]
