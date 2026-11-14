@@ -192,7 +192,8 @@ through the chart value, so the merge-blocking presubmit exercises that route.
 ## Switches inside `next`
 
 The A2A gateway's inject door (`spec-chatops-gateway.md`, "The test backend") renders only
-when the OPERATOR carries `A2A_INJECT_BACKEND=true`, on top of `spec.mode: next`, and its A2A
+when the OPERATOR carries `A2A_INJECT_BACKEND=true`, on top of `spec.mode: next` (the same flag
+renders the gateway's `A2A_INJECT_CONFIRM=true`, which lets the door take a confirm), and its A2A
 door for agent callers (`spec-chatops-gateway.md`, "The A2A door") only under
 `A2A_AGENT_DOOR=true`, the same way. That is not a
 second mode mechanism and does not belong in the field this document defines. The door takes the

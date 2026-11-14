@@ -224,9 +224,12 @@ func TestStaticAndCalloutPrincipalsPartitionTheSet(t *testing.T) {
 // connect on every install; seed is applied rather than rendered, so
 // dropping its user would break an object already running on installs today;
 // and console is web's reason again -- a browser holds no ServiceAccount
-// token -- with its one write narrowed to a single subject rather than
-// widened into a second read credential. A seventh name here means someone
-// added a principal without asking whether it could have an identity.
+// token -- with its writes narrowed to two subjects rather than widened
+// into a second read credential; console-mcp is console's reason in a
+// different shape: the MCP pod holds no ServiceAccount token (it never talks
+// to the API server), and it is console less the confirm door. An eighth
+// name here means someone added a principal without asking whether it could
+// have an identity.
 func TestTheStaticResidueIsExactlyTheOnesWithReasons(t *testing.T) {
 	var got []string
 	for _, id := range staticIdentities(identityTestAgent()) {

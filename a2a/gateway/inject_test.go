@@ -134,6 +134,9 @@ func startInjectRigWith(t *testing.T, tweak func(*Config)) *injectRig {
 	if tweak != nil {
 		tweak(cfg)
 	}
+	if cfg.InjectConfirm {
+		adapter.AllowConfirm()
+	}
 	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: injectBackend})
 	if err != nil {
 		t.Fatalf("New: %v", err)
