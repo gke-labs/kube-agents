@@ -2446,6 +2446,89 @@ class CollaborationTest(unittest.TestCase):
                     with mock.patch.dict(os.environ, {vcs_broker.WRITE_MODE_ENV: value}):
                         self.assertNotIn("writeModeDetail", broker.capabilities({"repository": repository}))
 
+    def _dial(self, **extra):
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        self.addCleanup(setattr, vcs_broker, "_dial_level", None)
+        self.addCleanup(setattr, vcs_broker, "_dial_reported", False)
+        vcs_broker._dial_level = None
+        vcs_broker._dial_reported = False
+        patcher = mock.patch.object(vcs_broker, "DIAL_STATE_FILE", str(Path(scratch.name) / "dial"))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return {vcs_broker.DIAL_ENV: "on", **extra}
+
+    def test_the_dial_is_no_source_while_its_switch_is_off(self):
+        environ = self._dial()
+        vcs_broker.set_dial_level("explain")
+        for value in ("off", "", "true"):
+            with self.subTest(value=value):
+                off = {**environ, vcs_broker.DIAL_ENV: value}
+                self.assertIsNone(vcs_broker.dial_level(off))
+                self.assertEqual("propose", vcs_broker.write_mode(off)[0])
+
+    def test_the_dial_fails_closed_until_a_level_is_set(self):
+        environ = self._dial()
+        self.assertEqual("explain", vcs_broker.dial_level(environ))
+        self.assertEqual(("none", vcs_broker.WRITE_MODE_DIAL_RAW), vcs_broker.write_mode(environ))
+        detail = vcs_broker.write_mode_detail(vcs_broker.write_mode(environ)[1])
+        self.assertIn("autonomy dial is at Explain", detail, "the refusal names the dial, not the env")
+        self.assertNotIn("neither", detail)
+
+    def test_an_env_spelt_like_the_dial_marker_is_still_a_misspelt_env(self):
+        environ = {vcs_broker.WRITE_MODE_ENV: "dial:explain", vcs_broker.DIAL_ENV: "off"}
+        mode, raw = vcs_broker.write_mode(environ)
+        self.assertEqual("none", mode)
+        self.assertNotEqual(vcs_broker.WRITE_MODE_DIAL_RAW, raw)
+        detail = vcs_broker.write_mode_detail(raw)
+        self.assertIn("neither none nor propose", detail)
+        self.assertNotIn("autonomy dial", detail)
+
+    def test_each_dial_level_applies_at_once_and_only_restricts(self):
+        environ = self._dial()
+        for level, mode in (("explain", "none"), ("propose", "propose"), ("automerge", "propose")):
+            with self.subTest(level=level):
+                vcs_broker.set_dial_level(level)
+                self.assertEqual(mode, vcs_broker.write_mode(environ)[0])
+                # The env's none wins over any level.
+                self.assertEqual("none", vcs_broker.write_mode({**environ, vcs_broker.WRITE_MODE_ENV: "none"})[0])
+
+    def test_capabilities_reports_the_dial_restriction(self):
+        environ = self._dial()
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        broker = vcs_broker.VcsBroker(
+            Path(scratch.name), git_runner=lambda *a, **k: None, refresh=lambda provider, repo: None
+        )
+        with mock.patch.dict(os.environ, environ):
+            vcs_broker.set_dial_level("explain")
+            self.assertEqual("none", broker.capabilities({"repository": "acme/infra"})["writeMode"])
+            vcs_broker.set_dial_level("propose")
+            self.assertEqual("propose", broker.capabilities({"repository": "acme/infra"})["writeMode"])
+
+    def test_a_restarted_broker_reads_the_stored_level(self):
+        environ = self._dial()
+        vcs_broker.set_dial_level("automerge")
+        vcs_broker._dial_level = None
+        self.assertEqual("automerge", vcs_broker.dial_level(environ))
+        Path(vcs_broker.DIAL_STATE_FILE).write_text("yolo\n")
+        self.assertEqual("explain", vcs_broker.dial_level(environ))
+        Path(vcs_broker.DIAL_STATE_FILE).write_bytes(b"\xff\xfeautomerge")
+        self.assertEqual("explain", vcs_broker.dial_level(environ), "undecodable bytes fail closed")
+        self.assertEqual("none", vcs_broker.write_mode(environ)[0])
+
+    def test_a_set_level_is_told_apart_from_none_set(self):
+        environ = self._dial()
+        self.assertFalse(vcs_broker.dial_reported())
+        vcs_broker.set_dial_level("explain")
+        self.assertTrue(vcs_broker.dial_reported())
+
+    def test_set_dial_level_refuses_anything_but_a_level(self):
+        self._dial()
+        for level in ("", "EXPLAIN", "on", "none"):
+            with self.subTest(level=level), self.assertRaises(ValueError):
+                vcs_broker.set_dial_level(level)
+
     def test_propose_verbs_are_writes_that_move_a_branch_or_touch_a_proposal(self):
         self.assertLess(vcs_broker.PROPOSE_VERBS, vcs_broker.WRITE_VERBS)
         self.assertEqual(
