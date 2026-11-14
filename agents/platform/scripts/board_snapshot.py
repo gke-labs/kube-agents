@@ -6,9 +6,16 @@ holds the field names this module writes). No model is in the loop:
 
 - clusters: every Cluster Agent profile's ``cluster_identity`` (the managed
   fleet), each with the open findings the findings queue holds for it, ranked
-  by the queue's own order (``findings_queue.ranked_findings``);
+  by the queue's own order (``findings_queue.ranked_findings``). Under
+  ``spec.mode: next`` the fleet is the resolved scope's instead
+  (``fleet_scope_targets.list_scope_clusters``, #3658) and no profile is read:
+  a member project's clusters as the scope publisher listed them, and one row
+  each for the projects it holds no list for, the ones the watch scripts list
+  live (the management and explicit projects; the board runs no ``gcloud``)
+  and the unread ones, so neither draws as a project with no clusters;
 - running: the kanban cards whose status is ``running``, the cluster their
-  assignee profile is scoped to beside each;
+  assignee profile is scoped to beside each (under next, the profile name
+  derived from each listed cluster, for a card still filed to one);
 - prs: the newest ``pr_opened`` events (``agents/platform/plugins/pr_opened``);
 - audit: the most recent fleet-audit run to finish, from the report store
   (``skills/fleet-audit/scripts/report_status.py``);
@@ -38,6 +45,7 @@ from typing import Any
 
 import findings_nudge
 import findings_queue
+import fleet_scope_targets
 
 HERMES_HOME = os.environ.get("HERMES_HOME") or "/opt/data"
 PROFILES_DIR = Path(HERMES_HOME) / "profiles"
@@ -74,6 +82,15 @@ WIRE_INT_MAX = (1 << 63) - 1
 PROJECT_CLUSTER_SEP = "/"
 CONFIG_NAME = "config.yaml"
 IDENTITY_KEY = "cluster_identity"
+# Under spec.mode: next, the rows for the projects the resolved scope holds no
+# cluster list for. The wire shape has no field for "not listed" (a2a/lib/board.go),
+# so the row's name says it; each kind is one row, naming the first few projects.
+LIVE_ROW = "{projects} (clusters not listed here)"
+UNREAD_ROW = "{projects} (clusters unread)"
+UNLISTED_NAMED_MAX = 3
+UNLISTED_MORE = "{named} and {more} more projects"
+# The placeholder fleet_scope_targets names the members of an unusable resolved scope by.
+SCOPE_MEMBERS = "scope members"
 
 
 class BoardError(Exception):
@@ -135,6 +152,58 @@ def cluster_identities(profiles_dir: Path | None = None) -> dict[str, tuple[str,
     return out
 
 
+def scope_clusters(profiles_dir: Path | None = None) -> fleet_scope_targets.ScopeClusters | None:
+    """The resolved scope's clusters under spec.mode: next; None outside it, where the profiles answer.
+
+    The scope render is the operator's, always written, so one that cannot be
+    read is an error on the board, not a fleet of none.
+    """
+    if fleet_scope_targets.resolved_scope_file() is None:
+        return None
+    try:
+        return fleet_scope_targets.list_scope_clusters((profiles_dir or PROFILES_DIR).parent)
+    except fleet_scope_targets.ScopeRenderUnreadable as exc:
+        raise BoardError(f"the scope render could not be read: {exc}") from None
+
+
+def scope_identities(scope: fleet_scope_targets.ScopeClusters) -> dict[str, tuple[str, str]]:
+    """Profile name -> (project, cluster) for each listed cluster, derived rather than read.
+
+    A card may still be filed to a cluster's per-cluster profile until routing
+    moves to the `cluster` profile; its name is derived from the triple, so its
+    card keeps its cluster without a profile being read.
+    """
+    from cluster_agent_profile import profile_name  # lazy: next mode only
+
+    return {
+        profile_name(project, cluster, location): (project, cluster)
+        for entry in scope.projects
+        if entry.status == fleet_scope_targets.STATUS_LISTED
+        for project, location, cluster in entry.clusters or ()
+    }
+
+
+def _named(projects: list[str]) -> str:
+    named = ", ".join(projects[:UNLISTED_NAMED_MAX])
+    more = len(projects) - UNLISTED_NAMED_MAX
+    return UNLISTED_MORE.format(named=named, more=more) if more > 0 else named
+
+
+def unlisted_rows(scope: fleet_scope_targets.ScopeClusters) -> list[dict]:
+    """A row for the projects listed live and one for the unread ones, each only when there are some."""
+    live = [e.project for e in scope.projects if e.status == fleet_scope_targets.STATUS_LIST_LIVE]
+    unread = [
+        SCOPE_MEMBERS if e.project == fleet_scope_targets.UNRESOLVED_SCOPE_ROW else e.project
+        for e in scope.projects
+        if e.status == fleet_scope_targets.STATUS_UNREAD
+    ]
+    return [
+        {"name": template.format(projects=_named(projects)), "findings": 0}
+        for projects, template in ((live, LIVE_ROW), (unread, UNREAD_ROW))
+        if projects
+    ]
+
+
 def cluster_labels(keys: set[tuple[str, str]]) -> dict[tuple[str, str], str]:
     """Each (project, cluster) as the board names it: the cluster, or project/cluster where the name repeats."""
     projects: dict[str, set[str]] = {}
@@ -146,14 +215,20 @@ def cluster_labels(keys: set[tuple[str, str]]) -> dict[tuple[str, str], str]:
     }
 
 
-def clusters(findings: list[dict], roster: set[tuple[str, str]], labels: dict[tuple[str, str], str]) -> list[dict]:
+def clusters(
+    findings: list[dict],
+    roster: set[tuple[str, str]],
+    labels: dict[tuple[str, str], str],
+    unlisted: list[dict] | None = None,
+) -> list[dict]:
     """One row per cluster, worst first: the managed fleet plus any cluster a finding names.
 
     ``findings`` is the open queue in rank order, so the first finding seen for
     a cluster is its top one. Clusters with findings sort by their top
-    finding's rank; clean ones follow by name. A cluster is its (project,
-    cluster) pair, the findings queue's own key, so two projects' ``prod`` are
-    two rows.
+    finding's rank; ``unlisted`` (the projects with no cluster list, under
+    next) follows them, ahead of the clean ones by name, so the cap never
+    hides it. A cluster is its (project, cluster) pair, the findings queue's
+    own key, so two projects' ``prod`` are two rows.
     """
     rows: dict[tuple[str, str], dict] = {}
     order: list[tuple[str, str]] = []
@@ -168,7 +243,9 @@ def clusters(findings: list[dict], roster: set[tuple[str, str]], labels: dict[tu
     for key in sorted(roster - set(rows), key=lambda k: labels[k]):
         rows[key] = {"name": labels[key], "findings": 0}
         order.append(key)
-    return [rows[key] for key in order]
+    found = sum(1 for key in order if rows[key]["findings"])
+    out = [rows[key] for key in order]
+    return [*out[:found], *(unlisted or []), *out[found:]]
 
 
 def running(kanban: sqlite3.Connection, identities: dict[str, tuple[str, str]], labels: dict[tuple[str, str], str]) -> list[dict]:
@@ -281,10 +358,11 @@ def snapshot(
         findings = findings_queue.ranked_findings(session_db)
     except sqlite3.Error as exc:
         raise BoardError(f"the findings queue could not be read: {exc}") from None
-    identities = cluster_identities(profiles_dir)
+    scope = scope_clusters(profiles_dir)
+    identities = cluster_identities(profiles_dir) if scope is None else scope_identities(scope)
     roster = set(identities.values())
     labels = cluster_labels(roster | {(str(f.get("project") or ""), str(f.get("cluster") or "")) for f in findings})
-    fleet = clusters(findings, roster, labels)
+    fleet = clusters(findings, roster, labels, unlisted_rows(scope) if scope is not None else None)
     board: dict[str, Any] = {
         "generated_at": now.astimezone(timezone.utc).isoformat(),
         "clusters": fleet[:CLUSTERS_MAX],
