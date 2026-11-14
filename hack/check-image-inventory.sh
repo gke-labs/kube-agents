@@ -43,11 +43,30 @@ readonly LABEL_MIRRORED="a mirrored install"
 # slash and a colon in it — cannot tell an image from any other reference-like
 # value: githubMinter's ISSUER_ALLOWLIST is two https:// URLs joined by a comma
 # and matches that shape exactly, so it was reported as an image rendered
-# outside the mirror (#1139). The chart emits four names the pattern below
-# catches: OPERATOR_IMAGE, PLATFORM_AGENT_IMAGE, AGENT_SANDBOX_IMAGE and
-# FLUENT_BIT_IMAGE.
+# outside the mirror (#1139). The chart emits the names in
+# CHART_IMAGE_ENV_NAMES, every one of which the pattern below catches.
 readonly IMAGE_ENV_NAME_RE='^[[:space:]]*-[[:space:]]+name:[[:space:]]*[A-Z0-9_]*_IMAGE[[:space:]]*$'
 readonly VALUE_FIELD_RE='^[[:space:]]*value:[[:space:]]*'
+
+# The *_IMAGE env vars the chart's default render must carry on the operator,
+# one per image the operator renders at reconcile time that appears in no
+# chart template. Check 3 reads whatever the render emits, so an env var the
+# chart stopped emitting -- a values key renamed, a `with` guard around it that
+# no longer matches -- would drop out of checks 3a-3c with everything green
+# and the operator back on its compiled default, which on a mirrored install
+# is a public registry; check_chart_image_env_rendered holds the list to the
+# render. The four A2A_NATS_* names are the bus's third-party images, which the
+# chart sets from a2aBus.images (#1557 found them unmirrored).
+readonly CHART_IMAGE_ENV_NAMES=(
+  OPERATOR_IMAGE
+  PLATFORM_AGENT_IMAGE
+  AGENT_SANDBOX_IMAGE
+  FLUENT_BIT_IMAGE
+  A2A_NATS_IMAGE
+  A2A_PROVISION_IMAGE
+  A2A_NATS_RELOADER_IMAGE
+  A2A_NATS_EXPORTER_IMAGE
+)
 
 # The `image:` field of a rendered manifest, quoted or bare, reference in group
 # 1; a reference has no whitespace, so the class stops there and trailing
@@ -338,9 +357,12 @@ jq -r '.images[] | select(.tagFrom) | "\(.name)\t\(.tagFrom.file)\t\(.tagFrom.ke
 # 2. The pins compiled into the operator. Each is an image the operator falls
 #    back to when its env var is unset, so a drift here mirrors the wrong tag
 #    with nothing to catch it at render time. fluent-bit reaches every agent
-#    pod. nats, nats-box, the config reloader and prometheus-nats-exporter reach
-#    only a `spec.mode: next` install, which no chart render in check 3 turns on,
-#    so this is the only check that sees them (#1557). The constants keep Docker Hub's short spelling because that
+#    pod; nats, nats-box, the config reloader and prometheus-nats-exporter reach
+#    every install's bus. The chart sets all five env vars from its values, so
+#    check 3 holds the chart's pins to the inventory through the render; this
+#    check holds the operator's fallbacks, which an operator rendered outside
+#    the chart (the kustomize base) still runs on (#1557).
+#    The constants keep Docker Hub's short spelling because that
 #    is the string the operator renders into the pod template; the comparison
 #    is on the normalised form, the same way check 1 reads a Dockerfile ARG.
 #    The first-party next defaults (gateway, worker, callout, capability
@@ -482,15 +504,13 @@ image_refs() {
 # registry port (host:5000/name) is not mistaken for one. ref_pin keeps the
 # digest (tag@sha256:...), because that is the form images.json pins a tag and
 # a digest together with and what the chart's default render must match byte for
-# byte. No render reaches that branch today: seven entries pin as tag@digest —
-# hindsight-api, hindsight-postgresql, busybox, the A2A bus's nats server,
-# nats-server-config-reloader, prometheus-nats-exporter and, through tags.env,
-# the Hermes base. busybox and the Hermes base are build-time, the Hindsight
-# pair sits behind hindsight.enabled, which no render below turns on, and the
-# nats server, the reloader and the exporter are the operator's to render, not
-# the chart's.
-# The branch is what keeps the comparison right when one of them does reach a
-# render.
+# byte. Three env vars reach that branch: A2A_NATS_IMAGE, A2A_NATS_RELOADER_IMAGE
+# and A2A_NATS_EXPORTER_IMAGE, which the default render carries with their
+# digests (the mirrored render drops them, since `make mirror-images` pushes by
+# tag). images.json pins four more entries as tag@digest — hindsight-api,
+# hindsight-postgresql, busybox and, through tags.env, the Hermes base. busybox
+# and the Hermes base are build-time, and the Hindsight pair sits behind
+# hindsight.enabled, which no render below turns on.
 split_ref() {
   local ref=${1%%@*} digest=""
   case "$1" in
@@ -636,6 +656,19 @@ mirrored_images="$(image_refs <<<"$mirrored_render")"
   exit 1
 }
 
+# Every env var in CHART_IMAGE_ENV_NAMES is on the operator in the default
+# render. Checks 3a-3c read the references the render emits, so one the chart
+# has stopped emitting is not a wrong reference they can report, it is a
+# missing one they never see; this is the check that notices.
+check_chart_image_env_rendered() {
+  local label=$1 rendered=$2 name
+  for name in "${CHART_IMAGE_ENV_NAMES[@]}"; do
+    grep -qE "^[[:space:]]*-[[:space:]]+name:[[:space:]]*${name}[[:space:]]*$" <<<"$rendered" ||
+      fail "$label: the chart renders no $name env var on the operator, so the operator falls back to its compiled default for that image and the mirror is never pointed at it. Check the value it is rendered from in charts/kube-agents/values.yaml and the guard around it in templates/operator-deployment.yaml."
+  done
+}
+
+check_chart_image_env_rendered "$LABEL_DEFAULT" "$default_render"
 check_inventory_pins "$LABEL_DEFAULT" "$default_images"
 check_mirror_prefix "$LABEL_MIRRORED" "$mirrored_images"
 check_mirror_names "$LABEL_MIRRORED" "$mirrored_images"

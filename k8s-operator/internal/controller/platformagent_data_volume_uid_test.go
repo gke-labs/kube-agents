@@ -78,7 +78,7 @@ type renderedPodTemplate struct {
 //
 // The builders are called directly rather than through the reconciler's gates,
 // so a workload an install would not create today — the shell sandbox is
-// experimental, the A2A pods are dark outside mode next — is still walked. What
+// experimental — is still walked. What
 // is being asserted is what the builder would render if the gate opened. Both
 // gateway shapes are rendered for the same reason: useStatefulSet picks one of
 // them per CR, and the one it did not pick is still a pod this operator build
@@ -185,7 +185,6 @@ func dataVolumeTestAgent() *agentv1alpha1.PlatformAgent {
 // is what actually puts a second claim name in front of the filter.
 func dataVolumeEveryComponentAgent() *agentv1alpha1.PlatformAgent {
 	agent := dataVolumeTestAgent()
-	agent.Spec.Mode = ptr.To(string(ModeNext))
 	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{
 		Experimental: &agentv1alpha1.ExperimentalSpec{
 			ShellSandbox: &agentv1alpha1.ShellSandboxSpec{Enabled: ptr.To(true)},

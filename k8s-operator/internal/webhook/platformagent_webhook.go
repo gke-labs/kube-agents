@@ -129,6 +129,15 @@ func (d *PlatformAgentCustomDefaulter) Default(ctx context.Context, platformAgen
 			platformAgent.Spec.Harness.Memory.UserProfileEnabled = ptr.To(false)
 		}
 	}
+	// The retired mode. An apply that still says "today" (an install.env or a
+	// manifest from before the removal) is moved, not refused: the object it
+	// writes is the one the operator runs anyway.
+	if platformAgent.Spec.Mode == nil || *platformAgent.Spec.Mode != agentv1alpha1.PlatformAgentModeNext {
+		if platformAgent.Spec.Mode != nil {
+			platformagentlog.Info("rewriting the retired spec.mode", "name", platformAgent.Name, "from", *platformAgent.Spec.Mode, "to", agentv1alpha1.PlatformAgentModeNext)
+		}
+		platformAgent.Spec.Mode = ptr.To(agentv1alpha1.PlatformAgentModeNext)
+	}
 
 	return nil
 }
@@ -378,17 +387,7 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 // is let through, so a CR the operator already holds to its count can still
 // be edited otherwise.
 func validateBusReplicas(oldObj, platformAgent *agentv1alpha1.PlatformAgent) field.ErrorList {
-	// Under today the field is inert and the bus is torn down, so an edit
-	// that flips to today, or edits a today CR, converts nothing. An edit
-	// from today to next is left to the operator too: a flip to today keeps
-	// status.busReplicas (#5451), but whether a bus is still there to keep
-	// is a question of its data claims, which can be deleted while the CR
-	// is under today and which only the operator reads. Refusing here on the
-	// record alone would refuse a new bus the operator would create.
-	if oldObj == nil || platformAgent.Spec.Mode == nil || *platformAgent.Spec.Mode != "next" {
-		return nil
-	}
-	if oldObj.Spec.Mode == nil || *oldObj.Spec.Mode != "next" {
+	if oldObj == nil {
 		return nil
 	}
 	running := oldObj.Status.BusReplicas

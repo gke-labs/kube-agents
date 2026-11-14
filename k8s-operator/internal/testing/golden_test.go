@@ -62,10 +62,9 @@ func newTestScheme() *runtime.Scheme {
 	_ = agentv1alpha1.AddToScheme(s)
 	_ = corev1.AddToScheme(s)
 	_ = appsv1.AddToScheme(s)
-	// batchv1: the mode gate's cleanup path lists Jobs on every today-mode
-	// reconcile, which is every golden case.
+	// batchv1: the A2A render lists its provision Jobs on every reconcile.
 	_ = batchv1.AddToScheme(s)
-	// The gateway's election Lease, on by default under next.
+	// The gateway's election Lease, on by default.
 	_ = coordinationv1.AddToScheme(s)
 	_ = networkingv1.AddToScheme(s)
 	_ = policyv1.AddToScheme(s)
@@ -210,11 +209,12 @@ func TestAgentsGolden(t *testing.T) {
 			},
 		},
 		{
-			// spec.mode: next renders the A2A stack beside the agent; the chart's
-			// footprint.yaml sums it from this golden for a next-mode install.
-			name:         "PlatformAgentNextMode",
-			inputPath:    filepath.Join("testdata", "platform", "platformagent-next.yaml"),
-			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-next.yaml"),
+			// The default example CR reconciled until settled, so the golden
+			// carries what later passes add (the bridge's activity hook); the
+			// chart's footprint.yaml sums the A2A stack from this golden.
+			name:         "PlatformAgentSettled",
+			inputPath:    filepath.Join("testdata", "platform", "platformagent-settled.yaml"),
+			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-settled.yaml"),
 			settled:      true,
 			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
 			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
