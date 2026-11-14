@@ -170,13 +170,20 @@ SUPPLEMENT_PATH = "/opt/defaults/scripts/worker_transcript.py"
 # Bounds applied inside the pod, so the exec output stays bounded however much
 # a worker talked. A run's workers make tens to a few hundred calls; the call
 # cap is a runaway guard, and the per-field caps keep a ``kubectl logs`` dump or
-# a manifest read from carrying the whole record with it. A clipped field ends
-# in a marker naming how much was dropped. Clipping follows scrubbing, so a cut
-# never lands inside a Secret block the scrubber then cannot see.
+# a manifest read from carrying the whole record with it. A clipped field
+# carries a marker naming how much was dropped. A clipped result keeps its
+# whole head and its last RESULT_TAIL_CHARS after the marker, and a result
+# no longer than the two together is kept whole: a script's verdict and its warnings
+# come last (a fleet-audit ``finish`` prints its store-write warning at the
+# end of a 10 KB output), so a head-only cut hid the one line a red needed.
+# Arguments stay head-only; their readers close a cut value at the marker.
+# Clipping follows scrubbing, so a cut never lands inside a Secret block the
+# scrubber then cannot see.
 MAX_CARDS = 32
 MAX_CALLS = 2000
 MAX_RESULT_CHARS = 2000
 MAX_ARGS_CHARS = 2000
+RESULT_TAIL_CHARS = 1000
 # What ``gaps`` reports for a read the pod clipped, by the cap that fired: past
 # ``MAX_CARDS`` later cards were never read, and past ``MAX_CALLS`` the walk
 # goes on but later workers' calls are dropped. Either way a profile that
@@ -233,8 +240,8 @@ _IN_POD_SCRIPT = r"""
 import importlib.util, json, os, sqlite3, sys
 
 ROOT, SENTINEL, REDACTOR, SUPPLEMENT = sys.argv[1:5]
-MAX_CARDS, MAX_CALLS, MAX_RESULT, MAX_ARGS = [int(a) for a in sys.argv[5:9]]
-roots = [a for a in sys.argv[9:] if a]
+MAX_CARDS, MAX_CALLS, MAX_RESULT, MAX_ARGS, RESULT_TAIL = [int(a) for a in sys.argv[5:10]]
+roots = [a for a in sys.argv[10:] if a]
 # Seconds a read waits on a locked store before reporting the card unread. A
 # hermes writer holds a WAL lock for milliseconds; anything longer is stuck.
 SQLITE_BUSY_TIMEOUT = 10
@@ -350,13 +357,16 @@ def failed(result):
     )
 
 
-def clip(text, limit):
+def clip(text, limit, tail=0):
     if text is None:
         return None
     text = text if isinstance(text, str) else json.dumps(text, default=str)
-    if len(text) <= limit:
+    if len(text) <= limit + max(tail, 0):
         return text
-    return text[:limit] + " ...[clipped %d chars]" % (len(text) - limit)
+    marker = " ...[clipped %d chars]" % (len(text) - limit - max(tail, 0))
+    if tail <= 0:
+        return text[:limit] + marker
+    return text[:limit] + marker + "... " + text[-tail:]
 
 
 # A worker call's arguments, clipped. Arguments too long to fit that are a
@@ -530,7 +540,7 @@ def read_session(conn, card, profile, sid):
             if target["_withhold"] and result is not None and redactor is not None:
                 target["result"] = WITHHELD_READ_RESULT
             else:
-                target["result"] = clip(scrub(result, RESULT_KIND), MAX_RESULT)
+                target["result"] = clip(scrub(result, RESULT_KIND), MAX_RESULT, RESULT_TAIL)
     if orphans:
         out["errors"].append(
             "session %s of %s: %d tool result(s) matched no call" % (sid, profile, orphans)
@@ -835,6 +845,7 @@ def command(task_ids: list[str]) -> str:
             str(MAX_CALLS),
             str(MAX_RESULT_CHARS),
             str(MAX_ARGS_CHARS),
+            str(RESULT_TAIL_CHARS),
             *task_ids,
         ]
     )

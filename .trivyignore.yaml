@@ -53,10 +53,14 @@ misconfigurations:
     paths:
       - "deploy/sandbox/**"
 
-  # Ignore KSV-0056: manager-role requires networkpolicies access to manage agent sandboxes
+  # Ignore KSV-0056: manager-role requires networkpolicies access to manage agent sandboxes.
+  # config/profiles/role.yaml is the same Role document, copied there by `make chart-sync`
+  # for the profile namespace's kustomization (kustomize refuses a resource above its own
+  # directory), so the exemption covers the copy for the same reason.
   - id: KSV-0056
     paths:
       - "k8s-operator/config/rbac/**"
+      - "k8s-operator/config/profiles/role.yaml"
 
   # Ignore KSV-0041: callers need Secret verbs on the manager role, and trivy
   # cannot scope an exemption to one rule -- `paths` globs are its whole
@@ -64,7 +68,8 @@ misconfigurations:
   # read verbs stay on the ClusterRole, and KSV-0041 flags a ClusterRole that
   # names secrets with any of them. The write verbs are the namespaced Role
   # document in role.yaml (the marker carries `namespace=`), bound in the
-  # install namespace; a Role is KSV-0113 (MEDIUM), under the scan's threshold.
+  # install namespace and the profile namespace (config/profiles/role.yaml is
+  # its copy); a Role is KSV-0113 (MEDIUM), under the scan's threshold.
   #
   #   - `get`: checkShellSandboxKeys asks whether the sandbox's authorized-keys
   #     Secret exists, so the CR can report a missing one instead of leaving the
@@ -76,7 +81,7 @@ misconfigurations:
   #     read values; only their HMAC-SHA256 digest, keyed by the UIDs of the
   #     Secrets read, leaves the controller, and the digest goes on an object
   #     the operator already writes.
-  #   - create/update/patch/delete, in the install namespace only: under
+  #   - create/update/patch/delete, in the install namespace and the profile namespace only: under
   #     `mode: next` the operator generates and repairs the A2A NATS credential
   #     and config Secrets, and ensureKubeProxyTLSSecret manages the
   #     `<agent>-kube-proxy-tls` Secret, owner-referenced to the PlatformAgent.
@@ -95,6 +100,7 @@ misconfigurations:
   - id: KSV-0041
     paths:
       - "k8s-operator/config/rbac/**"
+      - "k8s-operator/config/profiles/role.yaml"
       - "k8s-operator/internal/testing/testdata/platform/expected/**"
 
   # Ignore KSV-0118: sample manifests, testdata, and kustomize overlays do not define full security contexts

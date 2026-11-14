@@ -2,8 +2,13 @@ package gateway
 
 import (
 	"context"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"log/slog"
 	"path"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -90,6 +95,48 @@ func TestSpawnedSessionPodsSetNdots3(t *testing.T) {
 	if len(ndots) != 1 || ndots[0] != "3" {
 		t.Errorf("ndots options %v, want exactly one, 3", ndots)
 	}
+}
+
+// TestSessionPodNdotsIsTheOperators: the operator is a separate Go module,
+// so sessionPodNdots is a copy of its brokerCallerPodNdots
+// (k8s-operator/internal/controller/pod_dns.go). This reads that file, so a
+// change here that leaves the operator behind fails; the operator's
+// TestBrokerCallerPodNdotsIsTheGateways is the same check from the other
+// side, because each module's tests run only when that module changes.
+func TestSessionPodNdotsIsTheOperators(t *testing.T) {
+	const name = "brokerCallerPodNdots"
+	file := filepath.Join("..", "..", "k8s-operator", "internal", "controller", "pod_dns.go")
+	parsed, err := parser.ParseFile(token.NewFileSet(), file, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, decl := range parsed.Decls {
+		gen, ok := decl.(*ast.GenDecl)
+		if !ok || gen.Tok != token.CONST {
+			continue
+		}
+		for _, spec := range gen.Specs {
+			values := spec.(*ast.ValueSpec)
+			for i, ident := range values.Names {
+				if ident.Name != name || i >= len(values.Values) {
+					continue
+				}
+				lit, ok := values.Values[i].(*ast.BasicLit)
+				if !ok || lit.Kind != token.STRING {
+					t.Fatalf("%s: %s is not a string literal", file, name)
+				}
+				got, err := strconv.Unquote(lit.Value)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got != sessionPodNdots {
+					t.Errorf("the operator's %s is %q and sessionPodNdots is %q; change both together", name, got, sessionPodNdots)
+				}
+				return
+			}
+		}
+	}
+	t.Fatalf("%s declares no constant %s", file, name)
 }
 
 // TestSpawnCarriesTheOriginSequence: the pod is told which message on its

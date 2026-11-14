@@ -307,7 +307,7 @@ To change the provider on an existing installation, set `MEMORY=hindsight|file|o
 When `--memory=hindsight` is enabled, the Helm chart and operator deploy two workloads in the agent namespace ([`k8s-operator/config/integrations/hindsight/`](../../k8s-operator/config/integrations/hindsight/README.md)):
 
 1. **`hindsight-api` (`Deployment`, port `8888`) — the `hindsight-api` component entry**:
-   - Runs `ghcr.io/vectorize-io/hindsight-api:0.10.2` (pinned by digest in `images.json`) as a non-root container (`RuntimeDefault` seccomp profile, all Linux capabilities dropped).
+   - Runs `ghcr.io/vectorize-io/hindsight-api` at the tag and digest pinned in `images.json` as a non-root container (`RuntimeDefault` seccomp profile, all Linux capabilities dropped).
    - Requests `500m` CPU / `2Gi` memory with limits `4` CPU / `4Gi` memory (`k8s-operator/config/integrations/hindsight/api.yaml` and `charts/kube-agents/values.yaml`): steady-state idle CPU is $\approx 9\text{m}$, the `4`-core CPU limit absorbs burst cross-encoder reranking (`~7 s`, and raising CPU limits above `4` on `e2-standard-4` nodes yields no single-pod speedup), and `2Gi`–`4Gi` memory holds the `1.4 GB` baked-in model weights without OOM under GKE Autopilot's non-bursting request/limit clamp.
    - Exposes Prometheus metrics (`/metrics`, including `hindsight_operation_duration_seconds`) on port `8888`, scraped by GKE Managed Prometheus via [`podmonitoring.yaml`](../../k8s-operator/config/integrations/hindsight/podmonitoring.yaml).
    - Sets `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1` so the baked-in embedding model (`BAAI/bge-small-en-v1.5`) and cross-encoder reranker (`cross-encoder/ms-marco-MiniLM-L-6-v2`) run completely offline without internet egress.

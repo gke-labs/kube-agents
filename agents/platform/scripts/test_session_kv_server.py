@@ -63,8 +63,26 @@ except Exception:  # pragma: no cover
     sys.modules["mcp.server"] = _stub
 
 import chat_notify
+import no_live_kubectl
 import session_kv_server
 from session_kv_server import clean_workload_name, clean_reason_label, clean_event_message, get_severity_details
+
+
+def setUpModule():
+    # No test here reaches a cluster: a read of the state ConfigMap that a test
+    # leaves unstubbed is unreadable, and any other kubectl found on PATH fails
+    # the module.
+    global _NO_KUBECTL
+    _NO_KUBECTL = no_live_kubectl.install()
+
+
+def tearDownModule():
+    _NO_KUBECTL.uninstall()
+
+
+class TestNoLiveKubectl(unittest.TestCase):
+    def test_no_test_in_this_module_can_reach_a_cluster(self):
+        no_live_kubectl.assert_in_force(self, _NO_KUBECTL)
 
 
 class ParkedTriagePool:
@@ -1229,6 +1247,26 @@ class TestSlackIncidentAlertDelivery(unittest.TestCase):
         with patch.dict(os.environ, {"A2A_NOTIFY_PLATFORM": "google_chat"}):
             self._run(lambda _platform, _msg, _session: "spaces/AAA/threads/T1")
         session_kv_server._record_alert_title.assert_called_once()
+
+    def test_the_alert_goes_to_one_platform_when_both_are_routed(self):
+        # both routed: _trigger_agent_troubleshooter posts the initial alert to google_chat only (CHAT_PLATFORMS order),
+        # registers one session route, and logs the "will not receive it" warning naming slack.
+        argvs = []
+
+        def notify(argv, **_kwargs):
+            argvs.append(argv)
+            return session_kv_server.subprocess.CompletedProcess(
+                argv, 0, stdout=json.dumps({"message_id": "m1", "thread_id": "spaces/AAA/threads/T1"}), stderr="")
+
+        pool = park_triage_starts()
+        with patch.dict(os.environ, {chat_notify.NOTIFY_PLATFORM_ENV: "google_chat,slack"}), \
+             patch.object(session_kv_server.subprocess, "run", side_effect=notify), \
+             self.assertLogs("session_kv_server", level="WARNING") as logs:
+            session_kv_server.trigger_agent_troubleshooter("s1", "alert", {}, 7, slack_alert_msg="slack alert")
+            pool.run()
+        self.assertEqual([argv[:4] for argv in argvs], [[chat_notify.A2A_CLI, "notify", "--platform", "google_chat"]])
+        session_kv_server._register_session_routing.assert_called_once_with("s1", "google_chat", "spaces/AAA/threads/T1")
+        self.assertTrue(any("slack will not receive it" in line for line in logs.output), logs.output)
 
 
 class TestAlertTitleRecord(unittest.TestCase):
@@ -5311,6 +5349,9 @@ class TestRelayWithNoChatRoute(unittest.TestCase):
 
         self.assertEqual(chat_delivery_watch.platforms_from(self.SLACK_REFUSAL), ["slack"])
         self.assertEqual(chat_delivery_watch.platforms_from(session_kv_server.NO_CHAT_ROUTE_ERROR), [])
+        os.environ[chat_notify.NOTIFY_CONVERSATIONS_ENV] = "google_chat,slack"
+        self.assertEqual(
+            chat_delivery_watch.platforms_from(session_kv_server._no_chat_route_error()), ["google_chat", "slack"])
 
     def test_a_routed_platform_is_not_refused(self):
         """The control: with a home channel the operator renders
@@ -5320,6 +5361,43 @@ class TestRelayWithNoChatRoute(unittest.TestCase):
         _, mocks = self._post()
         self.assertEqual(
             [call.args[0] for call in mocks["_send_to_chat"].call_args_list], ["slack"])
+
+    def test_the_no_route_error_names_every_gateway_platform_without_a_home(self):
+        with patch.dict(os.environ, {chat_notify.NOTIFY_CONVERSATIONS_ENV: "google_chat,slack",
+                                     chat_notify.NOTIFY_PLATFORM_ENV: ""}, clear=False):
+            msg = session_kv_server._no_chat_route_error()
+        self.assertIn("not delivered to google_chat (no home channel: set", msg)
+        self.assertIn("not delivered to slack (no home channel: set", msg)
+        self.assertIn("; ", msg)
+
+    def test_the_relay_posts_one_leg_per_routed_platform(self):
+        # both platforms routed, no earlier delivery: relay_cron_report sends one leg to google_chat and one to slack,
+        # each through the gateway (`a2a notify --platform <p>`), and never two legs to one platform.
+        os.environ[chat_notify.NOTIFY_CONVERSATIONS_ENV] = "google_chat,slack"
+        os.environ[chat_notify.NOTIFY_PLATFORM_ENV] = "google_chat,slack"
+        argvs = []
+
+        def notify(argv, **_kwargs):
+            argvs.append(argv)
+            return session_kv_server.subprocess.CompletedProcess(
+                argv, 0, stdout=json.dumps({"message_id": "m1", "thread_id": "t1"}), stderr="")
+
+        outbound = [
+            patch.object(session_kv_server, name, return_value=None)
+            for name in ("_post_audit_blocks", "_post_failed_audit_via_gateway", "_slack_audit_headline",
+                         "_failed_audit_line")
+        ]
+        for patcher in outbound:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        with patch.object(session_kv_server.subprocess, "run", side_effect=notify):
+            response = self.client.post(
+                "/v1/cron-reports",
+                json={"job_id": "fleet-wide-cost-analysis", "profile": "platform", "report": "finding"},
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(all(argv[:3] == [chat_notify.A2A_CLI, "notify", "--platform"] for argv in argvs), argvs)
+        self.assertEqual(sorted(argv[3] for argv in argvs), ["google_chat", "slack"])
 
     def test_an_install_no_source_describes_keeps_the_fallback(self):
         """No file says anything, so nothing is explicitly off: the relay still
@@ -7943,6 +8021,21 @@ class TestDriftInject(unittest.TestCase):
             / "SKILL.md"
         )
         self.assertTrue(bundle.is_file(), f"{bundle} is named by the drift card and does not exist")
+
+    def test_the_card_titles_the_two_ways_out_as_the_buttons_read(self):
+        """slack_ux_incident turns each option's title into its button, so the card fixes the two usual ones.
+
+        The "What's wrong" section is a headline paragraph and a what-who-when
+        paragraph, which the drift layout shows under the headline, and "Why"
+        opens on the diff the layout's "diff" fold is named for.
+        """
+        card = session_kv_server._drift_task_body(self._payload())
+        self.assertIn("the revert is `Put Git's version back`", card)
+        self.assertIn("is `Keep it · update Git`", card)
+        self.assertIn("## What's wrong\n\n<object> on <cluster> was changed outside Git.\n\n<1-2 sentences:", card)
+        self.assertIn("## Why\n\n```diff\n- <field>:", card)
+        without = session_kv_server._drift_task_body_without_gitops(self._payload())
+        self.assertNotIn(session_kv_server.DRIFT_REVERT_TITLE, without)
 
     def test_the_card_handles_an_object_git_does_not_declare(self):
         """No declared state means no revert, and the card has to say so twice.

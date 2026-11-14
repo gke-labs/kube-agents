@@ -837,6 +837,8 @@ spec:
               value: kubeagents-credential-proxy
             - name: CREDENTIAL_PROXY_ALLOWED_CALLERS
               value: system:serviceaccount:kubeagents-system:platformagent-shell
+            - name: CREDENTIAL_PROXY_KUBE_API_SERVER
+              value: https://kubernetes.default.svc.cluster.local
             - name: CREDENTIAL_PROXY_KUBE_CA_FILE
               value: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
             - name: CREDENTIAL_PROXY_KUBE_TOKEN_FILE
@@ -897,6 +899,10 @@ spec:
             - mountPath: /etc/kube-agents/scope
               name: platform-agent-scope-vol
               readOnly: true
+      dnsConfig:
+        options:
+          - name: ndots
+            value: "2"
       securityContext:
         fsGroup: 10000
         runAsNonRoot: true
@@ -1591,7 +1597,7 @@ spec:
       dnsConfig:
         options:
           - name: ndots
-            value: "3"
+            value: "2"
       securityContext:
         fsGroup: 10000
         runAsNonRoot: true
@@ -1861,6 +1867,8 @@ spec:
             - name: CREDENTIAL_PROXY_URL
             - name: CREDENTIAL_PROXY_TOKEN_FILE
               value: /var/run/secrets/kubeagents/credential-proxy/token
+            - name: KUBE_PROXY_IN_USE_URL
+              value: https://platformagent-kube-proxy.kubeagents-system.svc.cluster.local:8443
             - name: KUBE_AGENTS_MCP_RELAY_URL
               value: http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765/v1/mcp
             - name: PUBSUB_RELAY_URL
@@ -2054,6 +2062,10 @@ spec:
             - mountPath: /var/lib/fluent-bit
               name: system-metadata
               subPath: fluent-bit-state/platformagent
+      dnsConfig:
+        options:
+          - name: ndots
+            value: "3"
       initContainers:
         - args:
             - |-
