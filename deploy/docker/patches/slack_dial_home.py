@@ -1,0 +1,525 @@
+"""The autonomy dial on the Slack app's Home tab, when ``KUBEAGENTS_DIAL`` is on.
+
+Installed into the image at ``/opt/hermes/gateway/slack_dial_home.py``.
+``apply_slack_dial_home.py`` makes the Slack adapter hand every
+``app_home_opened`` on the Home tab to :func:`opened`, and always wire
+:func:`register`'s one listener, for this module's own action id. With the
+switch off (the default, and any value but ``on``) opening the tab publishes the
+one line :data:`OFF`, so a dial drawn before the switch went off does not
+linger, and a click on a dial Slack still shows is acknowledged and answered
+with the same line, so it never errors. Nothing is read or recorded while the
+switch is off. An app without the Home tab turned on never sends the event, so
+nothing changes for it.
+
+What the tab shows
+------------------
+"What it may change": the three levels (Explain, Propose fixes, Auto-merge
+proven fixes), the one recorded marked, and the kinds of fix under them with
+whether each auto-merges. A kind auto-merges only at the Auto-merge level and
+only when the record's ``kinds`` turns it on; this page never sets ``kinds``, so
+the list here is read-only. Nothing reads the level yet, so the tab says it is
+recorded only.
+
+Each kind also shows its progress toward the auto-merge offer in each
+repository that has fixes of it in that kind's environment, since the offer is earned per repository:
+"org/infra: 3 of 5 clean merges · org/apps: 1 of 5 clean merges", read from
+Session KV's ``GET`` :data:`CLEAN_MERGES_PATH` (the counter in
+``agents/platform/scripts/clean_merges.py``, keyed by repository, kind and
+environment) each time the tab is drawn. A kind with no records anywhere is
+"0 of 5"; at most :data:`PROGRESS_REPOS_MAX` repositories are named, the rest
+counted. Enough merges that the counter does not yet call ``ready`` (too few
+days) says how many days; a read that fails says the count is unavailable
+rather than showing 0. :func:`progress_for` answers one repository's line, for
+a row that shows a single chosen repository.
+
+Who sees it and who may change it
+---------------------------------
+Only a member the adapter would answer (``_is_interactive_user_authorized``,
+the check a button click gets) sees the dial; anyone else gets one line. Of
+those, only an install admin gets the radio buttons: a member listed in
+``KUBEAGENTS_DIAL_ADMINS`` (comma-separated Slack member ids) or, when that is
+unset or empty, an admin or owner of the install's own workspace (the one its
+first bot token authenticated in) by ``users.info``. Everyone else sees
+the same page read-only. A lookup that fails shows the page read-only with a
+line saying the account could not be checked. A pick is checked again when it
+arrives, so a stale tab or a forged payload changes nothing for a non-admin.
+
+The record
+----------
+One JSON file, :data:`STATE_NAME` under ``$HERMES_HOME`` (the agent's volume),
+holding the level, who set it and when, and the per-kind switches. A missing or
+unreadable file is :data:`DEFAULT_LEVEL`, which is what the agent does today:
+it proposes fixes as pull requests and merges nothing. A pick rewrites only the
+level, setter and time, keeping every other key; a file that exists but cannot
+be read is never overwritten. Writes are atomic.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import re
+import tempfile
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+FLAG_ENV = "KUBEAGENTS_DIAL"
+ADMINS_ENV = "KUBEAGENTS_DIAL_ADMINS"
+STATE_NAME = "kube-agents/dial.json"
+
+LEVEL_ACTION_ID = "kage_dial.level"
+
+#: ``(value, title, description)``, in the order the tab lists them.
+LEVELS = (
+    ("explain", "Explain", "Finds and explains; changes nothing"),
+    ("propose", "Propose fixes", "Opens a PR; your team merges"),
+    ("automerge", "Auto-merge proven fixes", "Your pipeline merges proven fixes"),
+)
+LEVEL_VALUES = tuple(value for value, _title, _description in LEVELS)
+LEVEL_TITLES = {value: title for value, title, _description in LEVELS}
+DEFAULT_LEVEL = "propose"
+AUTOMERGE_LEVEL = "automerge"
+
+#: ``(kind, title, environment)`` for each kind of fix the dial lists. The kind
+#: is the audit's check id, the key the clean-merge counter uses.
+FIX_KINDS = (("no-pdb", "Disruption budgets", "dev"),)
+
+#: The Session KV server's loopback address and key, as ``kanban_origin``
+#: spells them, and the clean-merge counter's route.
+SESSION_KV_URL = "http://127.0.0.1:8699"
+SESSION_KV_KEY_ENV = "SESSION_KV_API_KEY"
+CLEAN_MERGES_PATH = "/v1/post-merge/clean-merges"
+#: Drawing the tab waits at most this long for the count.
+CLEAN_MERGES_TIMEOUT_SECONDS = 2.0
+
+TITLE = "What it may change"
+OFF = "The autonomy dial is off on this install."
+DENIED = "Kage only shows its settings to the people this install lets ask it."
+READ_ONLY = "Only an install admin can change this."
+NOT_CHECKED = "Could not check your Slack account, so this is read-only. Open the tab again to retry."
+NOT_SAVED = "Not saved: the stored setting could not be read or written. Check the agent's logs."
+NOT_ENFORCED = "Recorded only: the agent does not act on this setting yet."
+SET_BY = "Set to *{title}* by <@{user}>"
+KIND_ON = "auto-merges"
+KIND_OFF = "off"
+PROGRESS = "{clean} of {needed} clean merges"
+PROGRESS_DAYS = "{clean} of {needed} clean merges, on {days} of {days_needed} separate days"
+PROGRESS_UNKNOWN = "clean merges could not be read; open the tab again to retry"
+PROGRESS_IN = "{repo}: {progress}"
+PROGRESS_MORE = "+{count} more"
+#: The most repositories one kind's row names before it counts the rest.
+PROGRESS_REPOS_MAX = 4
+MARK_ON = "●"
+MARK_OFF = "○"
+SLACK_TIME = "<!date^{epoch}^{{date_short_pretty}} {{time}}|{fallback}>"
+SLACK_TIME_FALLBACK = "%Y-%m-%d %H:%M UTC"
+
+#: Each member's last DM channel from ``app_home_opened``, so a pick is
+#: authorized as the open was (a 1:1 DM) rather than as a group chat.
+_dm_channels: dict[tuple[str, str], str] = {}
+_DM_CHANNELS_MAX = 500
+
+
+#: A Slack member id, the only setter the adapter records.
+_MEMBER_ID_RE = re.compile(r"[UW][A-Z0-9]{2,20}")
+#: Year 9999, inside every platform's time.gmtime range.
+_SET_AT_MAX = 253402300799
+
+
+def enabled() -> bool:
+    """Whether ``KUBEAGENTS_DIAL`` is ``on``; unset or anything else is off."""
+    return os.environ.get(FLAG_ENV, "").strip().lower() == "on"
+
+
+def state_path() -> Path:
+    home = os.environ.get("HERMES_HOME") or os.path.expanduser("~")
+    return Path(home) / STATE_NAME
+
+
+class UnreadableRecord(Exception):
+    """The record exists but is not a JSON object."""
+
+
+def _read_raw() -> dict:
+    """The record as stored; empty when there is none, UnreadableRecord when it is not an object."""
+    try:
+        raw = json.loads(state_path().read_text())
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        raise UnreadableRecord(str(exc)) from exc
+    if not isinstance(raw, dict):
+        raise UnreadableRecord(f"a {type(raw).__name__}, not an object")
+    return raw
+
+
+def read_state() -> dict:
+    """The record, or the default level with no setter when there is none or it is unreadable."""
+    state: dict = {"level": DEFAULT_LEVEL, "set_by": "", "set_at": 0, "kinds": {}}
+    try:
+        raw = _read_raw()
+    except UnreadableRecord as exc:
+        logger.warning("slack_dial_home: could not read %s; showing %s: %s", state_path(), DEFAULT_LEVEL, exc)
+        return state
+    if raw.get("level") in LEVEL_VALUES:
+        state["level"] = raw["level"]
+        # Both reach the tab: set_by inside Slack mrkdwn, set_at through
+        # time.gmtime. A hand-edited or damaged record must not inject markup
+        # or stop the tab drawing, so anything out of shape is dropped.
+        set_by = str(raw.get("set_by") or "")
+        state["set_by"] = set_by if _MEMBER_ID_RE.fullmatch(set_by) else ""
+        set_at = raw.get("set_at")
+        state["set_at"] = set_at if type(set_at) is int and 0 < set_at <= _SET_AT_MAX else 0
+    if isinstance(raw.get("kinds"), dict):
+        state["kinds"] = {str(k): v is True for k, v in raw["kinds"].items()}
+    return state
+
+
+def write_level(level: str, user_id: str) -> dict:
+    """Record ``level`` as set by ``user_id`` now, keeping every other key; UnreadableRecord writes nothing."""
+    state = _read_raw()
+    state.update(level=level, set_by=user_id, set_at=int(time.time()))
+    path = state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".dial-")
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump(state, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+    return state
+
+
+def configured_admins() -> set[str]:
+    return {part.strip() for part in os.environ.get(ADMINS_ENV, "").split(",") if part.strip()}
+
+
+def home_team(adapter: Any) -> str:
+    """The install's own workspace: the one its first bot token authenticated in."""
+    bot = getattr(adapter, "_bot_user_id", None)
+    teams = getattr(adapter, "_team_bot_user_ids", None) or {}
+    return next((team for team, user in teams.items() if bot and user == bot), "")
+
+
+async def is_admin(adapter: Any, user_id: str) -> bool | None:
+    """Whether ``user_id`` may change the dial; None when it could not be checked.
+
+    The list in ``KUBEAGENTS_DIAL_ADMINS`` when set; otherwise an admin or owner
+    of the install's own workspace, so an admin of another workspace the app is
+    in, or of a Slack Connect guest's organisation, is not one here.
+    """
+    admins = configured_admins()
+    if admins:
+        return user_id in admins
+    team = home_team(adapter)
+    if not team:
+        logger.warning("slack_dial_home: the install's workspace is not known yet; showing the dial read-only")
+        return None
+    try:
+        response = await adapter._get_client("", team_id=team).users_info(user=user_id)
+        user = (response.get("user") if hasattr(response, "get") else None) or {}
+    except Exception as exc:  # noqa: BLE001 — undecided is read-only, never admin
+        logger.warning("slack_dial_home: users.info failed for %s; showing the dial read-only: %s", user_id, exc)
+        return None
+    if user.get("team_id") != team:
+        return False
+    return bool(user.get("is_admin") or user.get("is_owner") or user.get("is_primary_owner"))
+
+
+def read_track_record() -> dict | None:
+    """The counter's answer from Session KV; None when it cannot be read."""
+    token = (os.environ.get(SESSION_KV_KEY_ENV) or "").strip()
+    if not token:
+        logger.warning("slack_dial_home: no %s; not showing clean merges", SESSION_KV_KEY_ENV)
+        return None
+    request = urllib.request.Request(SESSION_KV_URL + CLEAN_MERGES_PATH, headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(request, timeout=CLEAN_MERGES_TIMEOUT_SECONDS) as response:
+            record = json.loads(response.read() or b"{}")
+    except Exception as exc:  # noqa: BLE001 — the tab says the count is unavailable
+        logger.warning("slack_dial_home: could not read the clean merges: %r", exc)
+        return None
+    if not (isinstance(record, dict) and isinstance(record.get("counts"), list)
+            and isinstance(record.get("clean_merges_needed"), int)
+            and isinstance(record.get("days_needed"), int)):
+        logger.warning("slack_dial_home: the clean merges answer has an unexpected shape")
+        return None
+    return record
+
+
+_REPO_SEGMENT = re.compile(r"[A-Za-z0-9_.-]+")
+_SCP_REMOTE = re.compile(r"^(?:[^/@]+@)?(?P<host>[^/:]+):(?P<path>.+)$")
+_GITHUB_HOSTS = frozenset({"github.com", "www.github.com", "ssh.github.com"})
+_KNOWN_HOSTS = frozenset({"github.com", "gitlab.com", "bitbucket.org"})
+_GITHUB_HOSTS_CANONICAL = "github.com"
+
+
+def repo_key(url: Any) -> str:
+    """``clean_merges.repo_key``: ``host/path`` lower-case, parsed as ``repo_ref.parse`` does.
+
+    Copied rather than imported, since the gateway does not carry the agent's
+    scripts; a test pins the two together. ``""`` for anything with no host,
+    fewer than two path segments, or an unsafe segment.
+    """
+    if not isinstance(url, str):
+        return ""
+    text = url.strip()
+    if not text or len(text) > 256:
+        return ""
+    if "://" in text:
+        try:
+            split = urllib.parse.urlsplit(text)
+            host, path = (split.hostname or ""), split.path
+        except ValueError:
+            return ""
+        if not host:
+            return ""
+    else:
+        scp = _SCP_REMOTE.match(text)
+        host, path = (scp.group("host"), scp.group("path")) if scp else ("", text)
+    path = path.strip("/")
+    name = path[:-4] if path.endswith(".git") else path
+    if name != path and name and not name.endswith("/"):
+        path = name
+    path = path.strip("/")
+    if not host and "/" in path:
+        first, _, rest = path.partition("/")
+        rest = rest.strip("/")
+        if first.lower() in _KNOWN_HOSTS and rest:
+            host, path = first, rest
+    segments = path.split("/")
+    if not host or len(segments) < 2 or not all(
+        _REPO_SEGMENT.fullmatch(s) and s not in (".", "..", ".git") and not s.startswith("-")
+        for s in segments
+    ):
+        return ""
+    host = host.lower()
+    return f"{'github.com' if host in _GITHUB_HOSTS else host}/{path}".lower()
+
+
+def short_repo(key: str) -> str:
+    """``org/infra`` for the key ``github.com/org/infra``; any other host stays, so two hosts never share a name.
+
+    Built from the counter's ``repo_key`` rather than the recorded url, which can carry a query or
+    fragment the key ignores, and escaped for Slack mrkdwn.
+    """
+    text = str(key).removeprefix(_GITHUB_HOSTS_CANONICAL + "/")
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _entries(record: dict, kind: str, environment: str) -> list[dict]:
+    """The counter's entries for ``kind`` in ``environment``, one per repository, most clean merges first."""
+    found = [
+        entry for entry in record["counts"]
+        if isinstance(entry, dict) and entry.get("kind") == kind and entry.get("environment") == environment
+        and isinstance(entry.get("repo_key"), str) and entry["repo_key"]
+    ]
+    return sorted(found, key=lambda e: (-(e.get("clean") if isinstance(e.get("clean"), int) else 0), e["repo_key"]))
+
+
+def _words(record: dict, entry: dict | None) -> str:
+    entry = entry if isinstance(entry, dict) else {}
+    needed, days_needed = record["clean_merges_needed"], record["days_needed"]
+    clean = entry.get("clean") if isinstance(entry.get("clean"), int) else 0
+    days = entry.get("days") if isinstance(entry.get("days"), int) else 0
+    if clean >= needed and entry.get("ready") is not True:
+        return PROGRESS_DAYS.format(clean=needed, needed=needed, days=days, days_needed=days_needed)
+    return PROGRESS.format(clean=min(clean, needed), needed=needed)
+
+
+def progress_for(record: dict | None, kind: str, environment: str, repo: str) -> str:
+    """``kind``'s progress in ``environment`` in one repository, e.g. "3 of 5 clean merges"; 0 with no records there."""
+    if record is None:
+        return PROGRESS_UNKNOWN
+    key = repo_key(repo)
+    return _words(record, next((e for e in _entries(record, kind, environment) if e["repo_key"] == key), None))
+
+
+def progress(record: dict | None, kind: str, environment: str) -> str:
+    """``kind``'s progress in ``environment`` in every repository with records of it, each named."""
+    if record is None:
+        return PROGRESS_UNKNOWN
+    entries = _entries(record, kind, environment)
+    if not entries:
+        return _words(record, None)
+    shown = [
+        PROGRESS_IN.format(repo=short_repo(entry["repo_key"]), progress=_words(record, entry))
+        for entry in entries[:PROGRESS_REPOS_MAX]
+    ]
+    if len(entries) > PROGRESS_REPOS_MAX:
+        shown.append(PROGRESS_MORE.format(count=len(entries) - PROGRESS_REPOS_MAX))
+    return " · ".join(shown)
+
+
+def _section(text: str) -> dict:
+    return {"type": "section", "text": {"type": "mrkdwn", "text": text}}
+
+
+def _context(text: str) -> dict:
+    return {"type": "context", "elements": [{"type": "mrkdwn", "text": text}]}
+
+
+def _option(value: str, title: str, description: str) -> dict:
+    return {
+        "text": {"type": "mrkdwn", "text": f"*{title}*"},
+        "description": {"type": "plain_text", "text": description},
+        "value": value,
+    }
+
+
+def blocks(state: dict, can_change: bool, note: str = "", record: dict | None = None) -> list[dict]:
+    """The dial: the levels (a radio for an admin, marks otherwise), the kinds and their clean merges, who set it."""
+    level = state["level"]
+    out = [_section(f"*{TITLE}*")]
+    if can_change:
+        options = [_option(*entry) for entry in LEVELS]
+        out.append({
+            "type": "actions",
+            "elements": [{
+                "type": "radio_buttons",
+                "action_id": LEVEL_ACTION_ID,
+                "options": options,
+                "initial_option": options[LEVEL_VALUES.index(level)],
+            }],
+        })
+    else:
+        for value, title, description in LEVELS:
+            mark = MARK_ON if value == level else MARK_OFF
+            out.append(_section(f"{mark}  *{title}*\n{description}"))
+    for kind, title, environment in FIX_KINDS:
+        on = level == AUTOMERGE_LEVEL and state["kinds"].get(kind, False)
+        out.append(_context(f"{title} ({environment}) · {KIND_ON if on else KIND_OFF} · {progress(record, kind, environment)}"))
+    footer = [NOT_ENFORCED]
+    if state["set_by"]:
+        line = SET_BY.format(title=LEVEL_TITLES[level], user=state["set_by"])
+        if state["set_at"]:
+            fallback = time.strftime(SLACK_TIME_FALLBACK, time.gmtime(state["set_at"]))
+            line += " · " + SLACK_TIME.format(epoch=state["set_at"], fallback=fallback)
+        footer.append(line)
+    if note:
+        footer.append(note)
+    elif not can_change:
+        footer.append(READ_ONLY)
+    for line in footer:
+        out.append(_context(line))
+    return out
+
+
+def _remember_dm(team_id: str, user_id: str, channel_id: str) -> None:
+    if not (user_id and channel_id.startswith("D")):
+        return
+    _dm_channels.pop((team_id, user_id), None)
+    _dm_channels[(team_id, user_id)] = channel_id
+    while len(_dm_channels) > _DM_CHANNELS_MAX:
+        _dm_channels.pop(next(iter(_dm_channels)))
+
+
+async def _dm_channel(adapter: Any, user_id: str, team_id: str) -> str:
+    """The member's DM with the app: remembered from the open, else opened (after a restart)."""
+    channel = _dm_channels.get((team_id, user_id), "")
+    if not channel:
+        try:
+            channel = str(await adapter._ensure_dm_conversation(user_id, team_id=team_id) or "")
+        except Exception as exc:  # noqa: BLE001 — checked as a group chat, which fails closed
+            logger.warning("slack_dial_home: could not open a DM with %s: %s", user_id, exc)
+            channel = ""
+        _remember_dm(team_id, user_id, channel)
+    return channel if channel.startswith("D") else ""
+
+
+async def _authorized(adapter: Any, user_id: str, team_id: str) -> bool:
+    return adapter._is_interactive_user_authorized(
+        user_id, channel_id=await _dm_channel(adapter, user_id, team_id), team_id=team_id,
+    )
+
+
+async def publish(adapter: Any, team_id: str, user_id: str, note: str = "") -> None:
+    """Draw ``user_id``'s Home tab and publish it."""
+    client = adapter._get_client("", team_id=team_id)
+    if not await _authorized(adapter, user_id, team_id):
+        view_blocks = [_section(DENIED)]
+    else:
+        admin = await is_admin(adapter, user_id)
+        record = await asyncio.to_thread(read_track_record)
+        view_blocks = blocks(read_state(), admin is True, note or (NOT_CHECKED if admin is None else ""), record)
+    try:
+        await client.views_publish(user_id=user_id, view={"type": "home", "blocks": view_blocks})
+    except Exception as exc:  # noqa: BLE001 — the tab stays as it was
+        logger.warning("slack_dial_home: views.publish failed for %s: %s", user_id, exc)
+
+
+async def publish_off(adapter: Any, team_id: str, user_id: str) -> None:
+    """Replace ``user_id``'s Home tab with the one line :data:`OFF`."""
+    view = {"type": "home", "blocks": [_section(OFF)]}
+    try:
+        await adapter._get_client("", team_id=team_id).views_publish(user_id=user_id, view=view)
+    except Exception as exc:  # noqa: BLE001 — the tab stays as it was
+        logger.warning("slack_dial_home: views.publish failed for %s: %s", user_id, exc)
+
+
+async def opened(adapter: Any, event: dict, body: dict | None = None) -> None:
+    """Answer the Home tab opening with the dial, or with :data:`OFF` when the switch is off."""
+    user_id = str(event.get("user") or "")
+    if not user_id:
+        return
+    team_id = adapter._event_team_id(event, body)
+    if not enabled():
+        await publish_off(adapter, team_id, user_id)
+        return
+    _remember_dm(team_id, user_id, str(event.get("channel") or ""))
+    await publish(adapter, team_id, user_id)
+
+
+async def on_level(adapter: Any, ack: Any, body: dict, action: dict) -> None:
+    """Record a pick from an admin; anyone else's pick changes nothing and redraws the tab."""
+    await ack()
+    user_id = str((body.get("user") or {}).get("id") or "")
+    if not user_id:
+        return
+    team_id = adapter._event_team_id({}, body)
+    if not enabled():
+        await publish_off(adapter, team_id, user_id)
+        return
+    level = str((action.get("selected_option") or {}).get("value") or "")
+    note = ""
+    if not await _authorized(adapter, user_id, team_id):
+        logger.warning("slack_dial_home: ignoring a dial pick by %s, who is not allowed", user_id)
+    elif level not in LEVEL_VALUES:
+        logger.warning("slack_dial_home: ignoring a dial pick of unknown level %r by %s", level, user_id)
+    else:
+        admin = await is_admin(adapter, user_id)
+        if admin is True:
+            # Compared with the stored record, not read_state(): that reads a
+            # missing or unreadable file as Propose, which would skip the write.
+            try:
+                if _read_raw().get("level") != level:
+                    write_level(level, user_id)
+                    logger.info("slack_dial_home: dial set to %s by %s", level, user_id)
+            except (UnreadableRecord, OSError) as exc:
+                logger.warning("slack_dial_home: not recording %s by %s: %s", level, user_id, exc)
+                note = NOT_SAVED
+        else:
+            logger.warning("slack_dial_home: ignoring a dial pick of %s by %s, who is not an install admin", level, user_id)
+            note = READ_ONLY if admin is False else NOT_CHECKED
+    await publish(adapter, team_id, user_id, note)
+
+
+def register(adapter: Any) -> None:
+    """Add the level listener to ``adapter._app``."""
+
+    async def _on_level(ack, body, action):
+        await on_level(adapter, ack, body, action)
+
+    adapter._app.action(LEVEL_ACTION_ID)(_on_level)
+    logger.info("slack_dial_home: dial level handler registered")
