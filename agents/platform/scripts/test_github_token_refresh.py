@@ -42,6 +42,13 @@ class GitHubTokenRefreshTest(unittest.TestCase):
         no_metadata = patch("github_token_refresh.metadata_identity_token", return_value=None)
         no_metadata.start()
         self.addCleanup(no_metadata.stop)
+        # A credentials file is asked before gcloud too: `wif_credentials.load_document` opens
+        # the file that any of these names. A developer's shell may carry one.
+        environment = patch.dict(os.environ)
+        environment.start()
+        self.addCleanup(environment.stop)
+        for name in ("CREDENTIAL_PROXY_WIF_CREDENTIAL_FILE", "GOOGLE_APPLICATION_CREDENTIALS", "CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE"):
+            os.environ.pop(name, None)
 
     @patch("github_token_refresh.subprocess.run")
     def test_get_current_git_repo_https(self, run):
