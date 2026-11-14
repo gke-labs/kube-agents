@@ -60,7 +60,7 @@ Long-lived environments are reconciled and deployed atomically using `./upgrade.
 
 - **staging** is deployed by `Staging: Deploy` (`staging-deploy.yml`), which triggers when the staging promotion pipeline pushes a `staging_*` tag. It pushes that tag only after two gates: its full E2E test matrix passes on a fresh nightly cluster, and the release-candidate eval returns GREEN on the `evalcand_*` tag it pushes first. The workflow reconciles the Terraform composition, Helm release, and container images together atomically from that validated candidate commit.
 - **autopush** is deployed by `Autopush: Deploy` (`autopush-deploy.yml`), which triggers whenever candidate container images are successfully published to GHCR from `main`.
-- **autopush-next** is deployed by `Autopush-Next: Deploy` (`autopush-next-deploy.yml`), on the same trigger and resolving the same commit, from its own GitHub environment and GCP project, which set `PLATFORM_AGENT_MODE=next`. It is a separate workflow so that each lane holds its own workflow-level concurrency group: a run holds the group from creation, so resolve and deploy are serialized together and an older publish never lands after a newer one, and a failure or a held lease on one environment does not hold up the other. Its `REGISTRY_PREFIX` has to match `autopush`'s, because its resolve job checks the candidate images bound to `autopush`, so that it never binds, and so creates, an unprovisioned `autopush-next`. Until its GitHub environment exists with a `GCP_PROJECT_ID`, its deploy posts a notice and reports `skipped`. The installer reads that variable, so the reconcile renders `spec.mode: next` and the environment runs `next`; what a rebuild does with it is under [`PLATFORM_AGENT_MODE`](#what-each-environment-has-to-be-configured-with) below. `Autopush-Next: Google Chat E2E` (`autopush-next-e2e-gchat.yml`) reads `E2E_GCP_SERVICE_ACCOUNT`, `E2E_GCP_WORKLOAD_IDENTITY_PROVIDER` and `E2E_CHAT_SPACE_ID` from the same environment and skips until all three are set ([`tests/e2e/README.md`](../tests/e2e/README.md#against-autopush-next)).
+- **autopush-next** is deployed by `Autopush-Next: Deploy` (`autopush-next-deploy.yml`), on the same trigger and resolving the same commit, from its own GitHub environment and GCP project. It is a separate workflow so that each lane holds its own workflow-level concurrency group: a run holds the group from creation, so resolve and deploy are serialized together and an older publish never lands after a newer one, and a failure or a held lease on one environment does not hold up the other. Its `REGISTRY_PREFIX` has to match `autopush`'s, because its resolve job checks the candidate images bound to `autopush`, so that it never binds, and so creates, an unprovisioned `autopush-next`. Until its GitHub environment exists with a `GCP_PROJECT_ID`, its deploy posts a notice and reports `skipped`. `Autopush-Next: Google Chat E2E` (`autopush-next-e2e-gchat.yml`) reads `E2E_GCP_SERVICE_ACCOUNT`, `E2E_GCP_WORKLOAD_IDENTITY_PROVIDER` and `E2E_CHAT_SPACE_ID` from the same environment and skips until all three are set ([`tests/e2e/README.md`](../tests/e2e/README.md#against-autopush-next)).
 
 A deploy takes the live-test lease before it applies anything (see
 [`designs/live-test-lease.md`](designs/live-test-lease.md)).
@@ -227,7 +227,7 @@ Optional, and copied through when set: `CLUSTER_MODE`, `MODEL_DEFAULT_NAME`,
 `CHAT_TOPIC_NAME`, `CHAT_SUB_NAME`, `SLACK_ENABLED`, `SLACK_HOME_CHANNEL`,
 `SLACK_HOME_CHANNEL_NAME`, `SLACK_HOME_CHANNEL_POLICY`, `PLATFORM_AGENT_CUSTOM_ROLES`,
 `REGISTRY_PREFIX`, `THIRD_PARTY_REGISTRY_PREFIX`,
-`KMS_KEYRING`, `KMS_KEY`, `GITOPS_ORG`, `GITOPS_REPO`, `PLATFORM_AGENT_MODE`,
+`KMS_KEYRING`, `KMS_KEY`, `GITOPS_ORG`, `GITOPS_REPO`,
 `HELM_UPGRADE_INSTALL`. Secrets: `GH_APP_ID`,
 `GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `SLACK_BOT_TOKEN`,
 `SLACK_APP_TOKEN`.
@@ -254,17 +254,9 @@ in-place change that runs one `helm upgrade` (a new release revision). It does n
 recover a release left in a `pending-install` or `pending-upgrade` state; Helm still
 refuses those with "another operation is in progress".
 
-`PLATFORM_AGENT_MODE` is the `PlatformAgent`'s `spec.mode`, `today` or `next`; the
-renderer refuses anything else and writes `today` as no key, because an absent
-`spec.mode` is `today` to the CRD. The installer reads the key (`install.sh --mode`
-records it in `install.env`), so on this path a full upgrade renders the mode into the
-chart, and a key edited since the last apply switches the install. A rebuild through
-`deploy-environment.yml` takes the mode as its `mode` input instead; on `rc` and
-`nightly` it hands that to `install.sh` and gates on what the operator renders for it.
-Both that workflow and `provision_environment.sh` refuse `next` on `autopush`,
-`autopush-next` and `staging` and pass no mode for them, so a rebuild of a long-lived
-environment installs `today`. One whose variable says `next` moves back to `next` on
-its next reconcile, and the drift plan shows the difference in between.
+`PLATFORM_AGENT_MODE` is no longer read: every install runs the A2A stack, the renderer
+writes no key for it, and `deploy-environment.yml` has no `mode` input. A variable of that
+name left on an environment is ignored; remove it.
 
 Two naming details that are easy to trip over:
 

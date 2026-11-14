@@ -907,10 +907,10 @@ canonical walkthroughs.
 
 Every install runs the A2A stack: the operator puts the NATS bus and the A2A
 gateway in front of the agent, and the chart renders the profile namespace and
-counts the stack in its quota preflight on every render. The chart renders
-`spec.mode` only when `platformAgent.mode` is set, and the operator ignores the
-value. The key, which once chose between this stack and the previous one, is
-deprecated; the schema still accepts it so an older values file renders.
+counts the stack in its quota preflight on every render. The chart writes no
+`spec.mode` on the `PlatformAgent`. `platformAgent.mode`, which once chose
+between this stack and the previous one, is deprecated: the schema still
+accepts it so an older values file renders, and the chart ignores it.
 `platformAgent.harness.tuning.maxSessions` caps the A2A session pods the
 install runs at once and renders only when set.
 

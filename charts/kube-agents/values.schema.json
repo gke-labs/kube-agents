@@ -994,7 +994,7 @@
           "type": "string"
         },
         "mode": {
-          "description": "Deprecated and ignored: every install runs the A2A stack, and the operator ignores a value set here (the chart still renders it; the webhook rewrites today to next). Accepted so a values file that still sets it renders.",
+          "description": "Deprecated and ignored: every install runs the A2A stack, and the chart renders no spec.mode on the PlatformAgent. Accepted so a values file that still sets it renders.",
           "enum": [null, "", "today", "next"]
         },
         "telemetry": {

@@ -1,6 +1,6 @@
 ---
 title: Using kube-agents from Antigravity
-description: Connect Google Antigravity to a spec.mode next install through the MCP server and the kube-agents-mcp bridge, send a first message, and fix the common connection errors.
+description: Connect Google Antigravity to an install through the MCP server and the kube-agents-mcp bridge, send a first message, and fix the common connection errors.
 ---
 
 This guide connects [Google Antigravity](https://antigravity.google) to a kube-agents install, so the agent in your editor can ask the install questions, hand it work and read the answers. The path has two pieces. The [MCP server](/kube-agents/reference/a2a-mcp/) runs in the cluster beside the A2A console. The `kube-agents-mcp` bridge runs on your workstation as a local MCP server that Antigravity starts. The bridge finds the install through your kubeconfig, reads the server's token and reaches it over a port-forward of its own, so the only Antigravity setting it needs is the path to the binary.
@@ -11,14 +11,14 @@ The steps work the same from any MCP host that starts local servers over standar
 
 You need four things:
 
-- **An install in `spec.mode: next`.** The MCP server is a client of the `next` message bus and renders nothing under `today`. Check with `kubectl get platformagent -A -o custom-columns=NAME:.metadata.name,NAMESPACE:.metadata.namespace,MODE:.spec.mode`.
+- **An installed `PlatformAgent`.** The MCP server is a client of the install's message bus. Check with `kubectl get platformagent -A`.
 - **The MCP server turned on.** It is off by default; the next section turns it on.
 - **A kubeconfig context for the cluster** the install runs on, which works from a terminal on the same machine (`kubectl --context <context> get pods -n kubeagents-system`).
 - **Go 1.27 or later**, to build the bridge.
 
 ## Turn on the MCP server
 
-The server has no `PlatformAgent` field. It is rendered while the operator's controller manager runs with the environment variable `A2A_MCP_DOOR=true`, on top of `spec.mode: next`, and the chart value `operator.mcpServer.enabled: true` sets that variable. On an install made with `install.sh`, that is one `TF_VAR_extra_helm_values` line in `install.env`, followed by an `install.sh` or `upgrade.sh` run:
+The server has no `PlatformAgent` field. It is rendered while the operator's controller manager runs with the environment variable `A2A_MCP_DOOR=true`, and the chart value `operator.mcpServer.enabled: true` sets that variable. On an install made with `install.sh`, that is one `TF_VAR_extra_helm_values` line in `install.env`, followed by an `install.sh` or `upgrade.sh` run:
 
 ```bash
 TF_VAR_extra_helm_values='{operator={mcpServer={enabled=true}}}'
@@ -184,7 +184,7 @@ printf '%s\n' \
 
 ### Connected to the install, but the server is missing
 
-`fetching MCP token Secret <namespace>/<name>-a2a-mcp-token: ... not found` means the MCP server is not turned on for that install, or the operator has not rendered it yet. `... forbidden` means your account lacks `get` on the Secret. The bridge connects to any install it finds, including `today` installs and ones without the server, so with several installs make sure the one it picked is the one you turned on.
+`fetching MCP token Secret <namespace>/<name>-a2a-mcp-token: ... not found` means the MCP server is not turned on for that install, or the operator has not rendered it yet. `... forbidden` means your account lacks `get` on the Secret. The bridge connects to any install it finds, including ones without the server, so with several installs make sure the one it picked is the one you turned on.
 
 ### Port-forward errors
 
