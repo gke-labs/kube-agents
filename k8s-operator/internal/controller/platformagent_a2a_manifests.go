@@ -324,6 +324,18 @@ const (
 	// explicit "true" is off, so a typo leaves the door shut.
 	a2aInjectBackendEnvVar = "A2A_INJECT_BACKEND"
 
+	// a2aNATSDebugEnvVar turns on nats-server's debug logging on the bus, for
+	// CI only (#5708): hack/ci-deploy.sh sets it through operator.extraEnv, so
+	// a failing run's server logs carry the meta group's raft votes, terms and
+	// peer updates. It is never a CR field or a chart value, so an install
+	// can't turn it on by accident (only operator.extraEnv reaches it). Debug, never trace: trace logs protocol
+	// frames, payloads and CONNECT included, and CI logs are public. Debug
+	// names connections and the public keys they authenticated with, nothing
+	// secret. Anything but an explicit "true" is off. It reaches the operator
+	// only through the chart's operator.extraEnv, which takes any variable, so
+	// turning it on is a deliberate act.
+	a2aNATSDebugEnvVar = "A2A_NATS_DEBUG"
+
 	// a2aSessionClusterViewEnvVar arms the session pods' temporary read-only
 	// cluster view: session pods route kubectl through <agent>-kube-proxy
 	// (read-only-dry-run with Secret redaction) and reach the credential
@@ -1448,6 +1460,18 @@ func a2aCardStop() string {
 	return "false"
 }
 
+// renderA2ANATSDebug is the bus's debug line, present only while the
+// operator's environment asks for it (a2aNATSDebugEnvVar).
+func renderA2ANATSDebug() string {
+	if os.Getenv(a2aNATSDebugEnvVar) != "true" {
+		return ""
+	}
+	return `# CI only (A2A_NATS_DEBUG on the operator): raft votes, terms and peer
+# updates in the log, for #5708. Debug, never trace.
+debug: true
+`
+}
+
 // a2aInjectBackendEnabled reports whether the operator was deployed with the
 // eval flag. Anything but an explicit "true" is off, for the reason
 // a2aStrictEventsWriter gives: a typo must relax rather than tighten, and
@@ -2476,7 +2500,7 @@ http: ` + strconv.Itoa(a2aNATSMonitorPort) + `
 # For the reloader in the same pod, which signals this PID when the mounted
 # config changes.
 pid_file: "` + a2aNATSPIDFile + `"
-` + renderA2ANATSLameDuck(agent) + renderA2ANATSCluster(agent) + `
+` + renderA2ANATSDebug() + renderA2ANATSLameDuck(agent) + renderA2ANATSCluster(agent) + `
 
 # TLS on the client listener, required of every connection: the server
 # advertises tls_required, so a client that dials nats:// is told to upgrade

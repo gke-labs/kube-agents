@@ -557,6 +557,11 @@ readonly A2A_INJECT_BACKEND_ON="true"
 # don't depend on that default.
 readonly A2A_GATEWAY_ELECTION_ENV_VAR="A2A_GATEWAY_ELECTION"
 readonly A2A_GATEWAY_ELECTION_ON="true"
+# nats-server debug logging on the bus (k8s-operator a2aNATSDebugEnvVar): on for
+# the lane only, so a failing run's bus logs carry the meta group's raft votes,
+# terms and peer updates (#5708). Debug, never trace: trace logs payloads.
+readonly A2A_NATS_DEBUG_ENV_VAR="A2A_NATS_DEBUG"
+readonly A2A_NATS_DEBUG_ON="true"
 # The card stop (a2a/gateway/cardstop.go): armed on the next lane, so a
 # `stop` sent through the inject door stops the conversation's kanban cards,
 # which chat-stop-halts-delegated-remediation grades. The operator renders
@@ -1988,6 +1993,9 @@ if [ "${EVAL_MODE_NEXT:-}" = "1" ]; then
     # The A2A door, for the card-wait stopped ask (above).
     --set-string "operator.extraEnv[11].name=${A2A_AGENT_DOOR_ENV_VAR}"
     --set-string "operator.extraEnv[11].value=${A2A_AGENT_DOOR_ON}"
+    # The bus's debug logging, for #5708 (above).
+    --set-string "operator.extraEnv[12].name=${A2A_NATS_DEBUG_ENV_VAR}"
+    --set-string "operator.extraEnv[12].value=${A2A_NATS_DEBUG_ON}"
   )
 fi
 
