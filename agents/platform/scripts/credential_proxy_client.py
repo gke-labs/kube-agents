@@ -270,11 +270,16 @@ GET_CREDENTIALS_GENERATED_LINE = "kubeconfig entry generated for {cluster}."
 DEFAULT_KUBE_PROXY_TOKEN_FILE = "/var/run/secrets/kubeagents/credential-proxy/token"
 KUBE_PROXY_USER_NAME = "kube-proxy-caller"
 # Beside each kubeconfig the merge below checks, one line per context it found current or wrote:
-# `<context> <sha256 of the file> <sha256 of proxy URL, CA file and token file>`. The sandbox's
-# kubectl wrapper (deploy/sandbox/kubectl_context_registered.sh) skips Python only on an exact line,
-# so any later edit to the file, or a new proxy URL, CA file or token file, runs the merge once more.
+# `<context> <sha256 of the file> <sha256 of record version, proxy URL, CA file and token file>`. The
+# sandbox's kubectl wrapper (deploy/sandbox/kubectl_context_registered.sh) skips Python only on an
+# exact line, so any later edit to the file, or a new proxy URL, CA file or token file, runs the
+# merge once more.
 REGISTERED_MARKER_NAME = ".{name}.contexts-registered"
 REGISTERED_MARKER_ENV_SEPARATOR = "\n"
+# The record sits on a volume that outlives the image. Increase this, here and as RECORD_VERSION in
+# the wrapper's helper, when the merge changes what it accepts as a context's current entries: a
+# record from an older client then matches nothing, and the merge runs once more for that context.
+REGISTERED_MARKER_VERSION = "1"
 SANDBOX_HERMES_UID = 1001
 SANDBOX_HERMES_KUBECONFIG_PATH = Path("/home/hermes/.kube/config")
 SANDBOX_WORKER_UID = 1000
@@ -1172,7 +1177,9 @@ def _record_registered_context(
     marker = path.with_name(REGISTERED_MARKER_NAME.format(name=path.name))
     file_digest = hashlib.sha256(content).hexdigest()
     env_digest = hashlib.sha256(
-        REGISTERED_MARKER_ENV_SEPARATOR.join((proxy_url, ca_file, token_file)).encode("utf-8")
+        REGISTERED_MARKER_ENV_SEPARATOR.join(
+            (REGISTERED_MARKER_VERSION, proxy_url, ca_file, token_file)
+        ).encode("utf-8")
     ).hexdigest()
     kept = []
     if marker.is_file() and not marker.is_symlink():
