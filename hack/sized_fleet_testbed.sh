@@ -25,7 +25,9 @@
 #
 # The kube-agents install on the host cluster is the installer's
 # (scripts/installer/, INSTALL.md), run before or after this script; step 5 then
-# marks that cluster as one a run may reset. The project and its billing link are
+# marks that cluster as one a run may reset. Install it as the design's install
+# under test: no chat channel, no GitOps repository. `hack/sized_fleet.py install`
+# refuses a release with either, and turns the audits' auto-promote off. The project and its billing link are
 # preconditions, as for the eval pool's projects.
 #
 #   hack/sized_fleet_testbed.sh --project-id=<project> [--host-cluster=scale-host] [--host-location=us-central1-c]

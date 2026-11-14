@@ -29,6 +29,7 @@ A run by hand goes through this script, from a `main` checkout, never through
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import os
@@ -81,6 +82,12 @@ HTTP_NOT_FOUND = 404
 IMAGE_TAG_KEYS = ("agentSandbox.image.tag", "operator.image.tag", "platformAgent.deployment.image.tag",
                   "plugins.pubsubPlatform.image.tag", "plugins.stockoutInvestigator.image.tag")
 SIZING_KEY = "platformAgent.deployment.sizingProfile"
+# The design's install under test ("The install under test"): no chat channel, no GitOps
+# repository, and the audits' auto-promote off, so a nightly's reports reach no person.
+AUTO_PROMOTE_ENV = "KUBEAGENTS_AUDIT_AUTO_PROMOTE"
+AUTO_PROMOTE_OFF = "false"
+CHAT_INTEGRATIONS = ("googleChat", "slack")
+GITOPS_LISTS = ("forges", "repositories")
 # The fleet-sizing page's tier for each size, by its fleet-controllers row.
 TIERS = {"S": "medium", "M": "medium", "L": "fleet"}
 # How far back in `main` to look for a commit whose images are published.
@@ -461,8 +468,11 @@ def run_case(case: str, name: str, env: dict[str, str], evals: Path) -> dict:
                             start_new_session=True)
     try:
         output, _ = proc.communicate(timeout=EVAL_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired:
-        os.killpg(proc.pid, signal.SIGTERM)
+    except BaseException:
+        # A timeout, or the run's own end (a signal, a lost lease): devops-bench is in its own
+        # session, so nothing else stops it.
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGTERM)
         output, _ = proc.communicate()
         (evals / f"{name}.log").write_text(output or "")
         raise
@@ -613,6 +623,19 @@ def newest_published(ref: str = "HEAD") -> str:
     raise SystemExit(f"no commit in the last {IMAGE_LOOKBACK} of {ref} has published images")
 
 
+def test_bed_values(values: dict) -> tuple[list[str], list[dict]]:
+    """What in a release's values the design's install under test forbids, and its env with auto-promote off."""
+    integration = (values.get("platformAgent") or {}).get("integration") or {}
+    problems = [f"platformAgent.integration.{name}.enabled is true" for name in CHAT_INTEGRATIONS
+                if (integration.get(name) or {}).get("enabled")]
+    if (integration.get("github") or {}).get("gitRepo"):
+        problems.append("platformAgent.integration.github.gitRepo is set")
+    problems += [f"platformAgent.integration.{name} is not empty" for name in GITOPS_LISTS if integration.get(name)]
+    env = [e for e in ((values.get("platformAgent") or {}).get("deployment") or {}).get("env") or []
+           if e.get("name") != AUTO_PROMOTE_ENV]
+    return problems, env + [{"name": AUTO_PROMOTE_ENV, "value": AUTO_PROMOTE_OFF}]
+
+
 def cmd_install(args: argparse.Namespace) -> int:
     """Upgrade the host install to the commit under test, at the size's tier, under its lease."""
     sha = args.sha or newest_published()
@@ -621,6 +644,11 @@ def cmd_install(args: argparse.Namespace) -> int:
     kube.gcloud("container", "clusters", "get-credentials", args.host_cluster, f"--location={args.host_location}",
                 project=args.project)
     check_host(args)
+    values = json.loads(kube.run(["helm", "--kube-context", host_context, "-n", args.namespace, "get", "values",
+                                  RELEASE, "-o", "json"]) or "{}")
+    problems, env = test_bed_values(values)
+    if problems:
+        raise SystemExit("the host install is not the design's install under test: " + "; ".join(problems))
     with host_lease(args), tempfile.TemporaryDirectory(prefix="sized-chart-") as tree:
         # The chart and CRDs of the commit whose images run, not of this checkout: HEAD's images
         # may not be published yet, and a newer chart may read values older images lack.
@@ -632,6 +660,9 @@ def cmd_install(args: argparse.Namespace) -> int:
         kube.run(["kubectl", "--context", host_context, "apply", "--server-side", "--force-conflicts", "-f",
                   str(chart / CRD_DIR.name)], timeout=HELM_TIMEOUT_SECONDS)
         sets = [f"--set={key}={sha}" for key in IMAGE_TAG_KEYS] + [f"--set={SIZING_KEY}={tier}"]
+        overrides = Path(tree) / "test-bed-values.json"
+        overrides.write_text(json.dumps({"platformAgent": {"deployment": {"env": env}}}))
+        sets += ["-f", str(overrides)]
         # --reset-then-reuse-values: the chart's own defaults, then the release's values on top,
         # so a key the newer chart adds gets its default rather than nothing.
         kube.run(["helm", "--kube-context", host_context, "-n", args.namespace, "upgrade", RELEASE, str(chart),

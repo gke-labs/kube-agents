@@ -170,3 +170,31 @@ class EvalCaseIsolationTest(unittest.TestCase):
         self.assertFalse(summary["a"]["passed"])
         self.assertTrue(summary["b"]["passed"])
         relay.stop.assert_called_once()
+
+
+class TestBedValuesTest(unittest.TestCase):
+    def test_a_release_with_chat_or_gitops_is_refused(self):
+        values = {"platformAgent": {"integration": {"slack": {"enabled": True}, "github": {"gitRepo": "o/r"},
+                                                    "repositories": [{"url": "x"}]}}}
+        problems, _ = cli.test_bed_values(values)
+        self.assertEqual(len(problems), 3)
+
+    def test_auto_promote_is_turned_off_and_other_env_kept(self):
+        values = {"platformAgent": {"deployment": {"env": [{"name": "A", "value": "1"},
+                                                          {"name": cli.AUTO_PROMOTE_ENV, "value": "true"}]}}}
+        problems, env = cli.test_bed_values(values)
+        self.assertEqual(problems, [])
+        self.assertEqual(env, [{"name": "A", "value": "1"}, {"name": cli.AUTO_PROMOTE_ENV, "value": "false"}])
+
+
+class RunCaseInterruptTest(unittest.TestCase):
+    def test_an_interrupt_stops_the_case_process_group_and_is_raised(self):
+        proc = mock.Mock(pid=4242)
+        proc.communicate.side_effect = [SystemExit(143), ("partial", None)]
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(cli.subprocess, "Popen", return_value=proc), \
+                mock.patch.object(cli.os, "killpg") as killpg:
+            with self.assertRaises(SystemExit):
+                cli.run_case("./tasks/a/task.yaml", "a", {}, Path(tmp))
+            self.assertEqual((Path(tmp) / "a.log").read_text(), "partial")
+        killpg.assert_called_once_with(4242, cli.signal.SIGTERM)
