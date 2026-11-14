@@ -151,7 +151,8 @@ UPSTREAM_SIGNATURES = {
     # google_chat_relay_patch's relay_standalone_send stands in for this one
     # and declares the same parameters: send_message_tool calls it with
     # upstream's keywords, so one it does not declare is a TypeError on every
-    # `hermes send` and every alert on a today-mode install.
+    # `hermes send` and every alert posted through Hermes's own Google Chat
+    # platform.
     "google_chat._standalone_send": (
         "pconfig, chat_id, message, *, thread_id=..., media_files=..., "
         "force_document=..."

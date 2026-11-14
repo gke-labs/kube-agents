@@ -88,14 +88,14 @@ a separate component rather than being folded into ``setupId``. A drifting
 judge moves every baseline at once, and a judge that tracks whatever the agent
 is running cannot be told apart from an agent that got better.
 
-THE MODE IS THE SIXTH COMPONENT: the ``spec.mode`` of the install the matrix
-graded, ``today`` or ``next``. ``setupId`` names the same agent model and
-harness under either, so without it a next-mode run and a today-mode run file
-under one key, and rung 6 compared a next run's judged mean with today's
-history. The gate reads it off the run's transport (``gate.graded_mode``).
-``today`` is the default and is never written: a record with no ``mode`` reads
-as today, so every line recorded before the field existed keeps matching
-today's key, and a today key serialises byte-for-byte as it did.
+THE MODE IS THE SIXTH COMPONENT: the stack the install the matrix graded ran,
+``next`` for every run now that every install runs the A2A stack, ``today``
+for the lines recorded when the Planning Agent ran its own chat platforms.
+``setupId`` names the same agent model and harness under either, so without
+it the two stacks' runs filed under one key, and rung 6 compared a next run's
+judged mean with today's history. ``today`` is the legacy reading and is never
+written: a record with no ``mode`` reads as today, so every line recorded
+before the field existed keeps matching today's key, never next's.
 """
 
 from __future__ import annotations
@@ -185,9 +185,10 @@ RECORD_COLLECTING = "collecting"
 RECORD_STALE = "stale"
 RECORD_NONE = "none"
 
-#: The ``spec.mode`` a run graded, the version key's sixth component.
-#: ``today`` is the default and is left out of the serialised key, so the
-#: records written before the component existed read as today.
+#: The stack a run graded, the version key's sixth component. Every run
+#: grades ``next`` now; ``today`` is the legacy reading of a serialised key
+#: with no ``mode``, so the records written before the component existed,
+#: and those of the retired today-mode nightly, stay readable and apart.
 MODE_TODAY = "today"
 MODE_NEXT = "next"
 MODES = (MODE_TODAY, MODE_NEXT)
@@ -339,7 +340,8 @@ class VersionKey:
 
     Equality is exact on all six. There is no notion of a compatible-enough
     key: the point of the key is that a baseline measured on other software is
-    not evidence about this one, and a next-mode install is other software.
+    not evidence about this one, and the stack before the A2A one was other
+    software.
     """
 
     setup_id: str
@@ -347,11 +349,11 @@ class VersionKey:
     judge_model: str
     fleet: int
     verifiers: int
-    mode: str = MODE_TODAY
+    mode: str = MODE_NEXT
 
     def to_dict(self) -> dict[str, Any]:
-        """The key as written. ``mode`` only when it is not today, so a today
-        key is the same five-field object every existing line carries."""
+        """The key as written. ``mode`` only when it is not today, so a legacy
+        today key is the same five-field object its lines carry."""
         doc: dict[str, Any] = {
             "setup_id": self.setup_id,
             "scoring_version": self.scoring_version,
@@ -365,9 +367,9 @@ class VersionKey:
 
     @classmethod
     def from_dict(cls, doc: dict[str, Any]) -> VersionKey:
-        """An absent or empty ``mode`` is today. Any other value is kept as
-        written, so a mode this reader does not know matches neither today's
-        key nor next's rather than being pooled into one of them."""
+        """An absent or empty ``mode`` is today, the legacy reading. Any other
+        value is kept as written, so a mode this reader does not know matches
+        neither today's key nor next's rather than being pooled into one of them."""
         return cls(
             setup_id=str(doc.get("setup_id") or ""),
             scoring_version=str(doc.get("scoring_version") or ""),
@@ -385,7 +387,7 @@ class VersionKey:
         scoring_version: str | None,
         judge_model: str | None,
         versions: Versions,
-        mode: str = MODE_TODAY,
+        mode: str = MODE_NEXT,
     ) -> VersionKey | None:
         """Build the key for a run, or None when the run does not carry one.
 

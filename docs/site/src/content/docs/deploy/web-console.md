@@ -10,7 +10,7 @@ The web console is a browser workspace for reviewing incident triage and talking
 <video controls loop muted playsinline preload="metadata" style="width: 100%; border-radius: 8px; border: 1px solid var(--sl-color-hairline);" src="/kube-agents/web-console-demo.mp4"></video>
 
 :::note
-The web console is distinct from the A2A console, which a `spec.mode: next` install serves without a flag. See [User interfaces](/kube-agents/reference/user-interfaces/) for a comparison of the browser pages.
+The web console is distinct from the A2A console, which every install serves without a flag. See [User interfaces](/kube-agents/reference/user-interfaces/) for a comparison of the browser pages.
 :::
 
 ## Turn it on and open it

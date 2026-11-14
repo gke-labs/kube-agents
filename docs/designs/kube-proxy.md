@@ -271,7 +271,7 @@ contexts:
       user: kube-proxy-caller
 ```
 
-(`client-go` sends `tokenFile` bearer tokens only over `https://` connections. The operator generates an ECDSA CA and server certificate in the `<agent>-kube-proxy-tls` Secret, mounts `tls.crt` and `tls.key` into `<agent>-kube-proxy`, mounts `ca.crt` read-only into `<agent>-shell`, and publishes `ca.crt` in the `<agent>-kube-proxy-ca-bundle` ConfigMap, which session pods mount under `mode: next` when `A2A_SESSION_CLUSTER_VIEW=true`.)
+(`client-go` sends `tokenFile` bearer tokens only over `https://` connections. The operator generates an ECDSA CA and server certificate in the `<agent>-kube-proxy-tls` Secret, mounts `tls.crt` and `tls.key` into `<agent>-kube-proxy`, mounts `ca.crt` read-only into `<agent>-shell`, and publishes `ca.crt` in the `<agent>-kube-proxy-ca-bundle` ConfigMap, which session pods mount when `A2A_SESSION_CLUSTER_VIEW=true`.)
 
 How multi-cluster context switching works:
 

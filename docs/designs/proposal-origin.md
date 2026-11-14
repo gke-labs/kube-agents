@@ -45,7 +45,7 @@ starts it. The values, as many as the runtime can tell apart:
 
 | Origin      | The work                                                                                                                                                                                                                                                                                                   |
 | ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `chat`      | a person's message on a chat platform: the A2A bridge's sessions for Google Chat, Slack and Discord, and the Hermes gateway's platform sessions under `today` (Google Chat, Slack, Teams)                                                                                                                  |
+| `chat`      | a person's message on a chat platform: the A2A bridge's sessions for Google Chat, Slack and Discord, and the Hermes gateway's platform sessions (Slack beside Google Chat, Teams)                                                                                                                          |
 | `console`   | the operator-facing consoles: sessions whose id the web console minted (`web-console-*`) or the admin console's chat page minted (`portal_*`), both read as a convention by the in-pod reader until the agent-API door writes a record, the A2A gateway's `console` backend, and cards the dashboard files |
 | `api`       | a caller on the agent API or an A2A door (`a2a`, `a2a-google`, `inject`): another agent or a script, not a person on a chat platform                                                                                                                                                                       |
 | `event`     | the event watcher's triage: a `k8s-evt-*` session the Session KV server opens for a cluster event, decided by the first injected payload (`k8s-event`, `k8s-event-followup` and `controller-stall` are all `event`)                                                                                        |
@@ -62,7 +62,7 @@ Three kinds of unit carry the record, each written by in-pod code inside one tru
   `platform: k8s-watcher` today), at the first inject since the create call carries no body,
   `event` or `drift` from the payload's kind; a watcher in shared mode injects into a session the operator named and the server never created, so that session has no record and its work resolves as `other`, which is accepted since nothing in the repository sets that mode; by the hermes-bridge for every `a2a-*` session, before its first turn (the bridge opens a
   session through the first turn's header), from the backend (`chat` for `gchat`, `slack` and
-  `discord`, `console` for `console`, `api` for the doors), a write beside the route record; by the `session_store` plugin for the `today`
+  `discord`, `console` for `console`, `api` for the doors), a write beside the route record; by the `session_store` plugin for the Hermes
   platform sessions it already records (`chat`). The record carries the chat platform beside the origin under its own key,
   `origin_platform`, since `platform` is already a `session_store` key that the Session KV server
   overwrites on an alert's session with the chat platform the alert was posted to. A continuation
@@ -268,7 +268,7 @@ holds as it stands.
 - **hermes-bridge** (`a2a/hermes-bridge/api.go`): the origin write before the first turn, from
   the backend.
 - **`session_store` plugin** (`agents/chat/defaults/plugins/session_store/`): `origin` and
-  `origin_platform` in its key list; `chat` with the platform for `today` platform sessions.
+  `origin_platform` in its key list; `chat` with the platform for Hermes platform sessions.
 - **Chat bootstrap** (`agents/chat/scripts/bootstrap_handoff.py`): `chat` on its onboarding
   cards.
 - **The in-pod reader** (the hook's resolution and the board patch): `console` from the `web-console-` and `portal_` id prefixes.

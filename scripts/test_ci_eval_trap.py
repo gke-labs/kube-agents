@@ -435,9 +435,9 @@ class CancelStopsModelCallsTest(unittest.TestCase):
             self.assertNotIn("called kubectl", out, f"context={context!r}")
 
     def test_every_term_trap_calls_it(self):
-        """The rollback round trips' own traps too, and the plain one they put back."""
+        """The one TERM trap the script installs."""
         traps = re.findall(r"^\s*trap '([^\n]*)' TERM INT$", self.src, re.M)
-        self.assertGreaterEqual(len(traps), 5)
+        self.assertEqual(len(traps), 1)
         for t in traps:
             self.assertTrue(t.endswith("stop_model_calls_on_cancel || true; exit 143"), t)
 

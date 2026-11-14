@@ -528,9 +528,9 @@ class UpgradeRefusalRemovesTheTfvarsTest(unittest.TestCase):
         arm = source[body_start:source.index("\n      ;;\n", body_start)]
         stubs = (
             "print_step() { :; }\nrefuse_apply_over_undeclared_scope() { :; }\n"
-            "announce_platform_agent_mode_for_apply() { :; }\ncheck_scope_container_access() { :; }\n"
-            "check_service_account_ownership() { :; }\nrefuse_full_apply_dropping_next() { :; }\n"
-            "refuse_next_slack_gateway_settings_from_env() { :; }\n"
+            "check_scope_container_access() { :; }\n"
+            "check_service_account_ownership() { :; }\n"
+            "refuse_slack_gateway_settings_from_env() { :; }\n"
             'refuse_apply_dropping_live_gitops() { echo "REFUSED gitops"; return 1; }\n'
             'apply_crd_upgrades() { echo "APPLIED crds"; }\nrun_lifecycle() { echo "APPLIED terraform"; }\n'
         )

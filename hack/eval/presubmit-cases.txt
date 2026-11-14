@@ -216,9 +216,8 @@
 # 2026-10-26 (api transport) was a collapse on the route objective alone,
 # the two report
 # objectives passing, when the worker_commands read saw one command and no
-# gcloud. The inject lane sets that objective aside; the today lane, which
-# runs this file over the api transport, grades it, so a red there on that
-# objective alone is the api transport's read of a platform card.
+# gcloud. The inject lane, which every CI lane is now, sets that objective
+# aside.
 # An alert-policy question is answered from Cloud Monitoring through the
 # broker: the planted policy is named and reported disabled, two
 # report_contains objectives graded on every lane; the route objective and

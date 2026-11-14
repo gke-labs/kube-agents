@@ -68,24 +68,21 @@ export KUBE_AGENTS_INSTALL_ENV=/path/to/your/install/install.env
 Read `N`'s release notes before you go. Everything they list is something `N-1` does not know
 about, and the next two sections say what happens to each kind of thing.
 
-On a release that retires `spec.mode`, the webhook rewrites `today` to `next` and the switch below
-does nothing.
+Every release from the one that retired `spec.mode: today` runs the A2A stack, and the
+`PlatformAgent` reads `spec.mode: next` whatever it carried before. A rollback to an earlier
+release keeps the stack, since that release's operator reads the same field. To return to the
+earlier stack there, follow that release's own "Switching back to `today`" section after the
+rollback. A full run with `PLATFORM_AGENT_MODE=today` alone changes nothing there, because that
+release's record already renders no mode and Helm sends no patch. Patch the field first
+(`kubectl patch platformagent <name> -n <namespace> --type=merge -p '{"spec":{"mode":"today"}}'`),
+or run that release's `upgrade.sh` once with `PLATFORM_AGENT_MODE=next` and then with `today`. That
+release refuses a full run over a file with no key while the install runs `next`.
 
-On an earlier release, on an install running `spec.mode: next`, switch it to `today` first ([Upgrade → Switching back to
-`today`](/kube-agents/install/upgrade/#switching-back-to-today)) and check that Slack answers. No
-chart up to 0.9.0 declares `platformAgent.mode`, so a rollback to one cannot keep the mode. The
-recorded key is a value `N-1` does not declare, refused, dropped or ignored as [The
-rollback](#the-rollback) and [When a rollback is refused](#when-a-rollback-is-refused) say. Without
-it the install is back on `today` with nothing in the run to say so. Switching first moves
-Slack back to the credential broker, and the Slack app back to its `today` settings, with the checks
-that section gives, instead of leaving you to find the app without its slash commands after the
-rollback.
-
-### A bus left down by a rollback under `next`
+### A bus left down by a rollback
 
 Since the release that separates the bus's accounts, the bus keeps its stored streams under a
 `TRUSTED` account that earlier releases do not configure, and `upgrade.sh` refuses a direct rollback
-past that change unless it is given `--allow-breaking-downgrade`. If one ran under `next` anyway, the bus pod `<name>-a2a-nats-0` stays
+past that change unless it is given `--allow-breaking-downgrade`. If one ran anyway, the bus pod `<name>-a2a-nats-0` stays
 not Ready with `JetStream account 'TRUSTED' could not be resolved` in its log, and the auth callouts,
 the A2A gateway and the agent's bridge fail behind it.
 
@@ -119,9 +116,10 @@ kubectl get pod platform-agent-a2a-nats-0 -n kubeagents-system \
 kubectl delete pod platform-agent-a2a-nats-0 -n kubeagents-system
 ```
 
-Then roll back as this page says: switch to `today` first, and move the bus's store back as the
-bus-accounts entry under [Upgrade → Breaking changes](/kube-agents/install/upgrade/#breaking-changes-in-recent-releases)
-says before you return to `next`.
+Then roll back as this page says, and move the bus's store back as the bus-accounts entry under
+[Upgrade → Breaking changes](/kube-agents/install/upgrade/#breaking-changes-in-recent-releases)
+says. The flip through `today` that entry names exists only on a release before the one that
+retired it: roll back to such a release first, and make the flip and the move there.
 
 ## The rollback
 

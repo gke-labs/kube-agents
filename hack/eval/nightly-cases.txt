@@ -11,8 +11,8 @@
 # night). The registration lint (scripts/validate_bench_cases.py) reads this
 # file as well as the presubmit one; the domain-coverage lint reads only
 # blocking-roster.txt, so neither an entry here nor a held-out presubmit
-# seat counts as coverage. The main nightly grades spec.mode next
-# (EVAL_MODE_NEXT=1) as eight periodics on eight projects: the main part in
+# seat counts as coverage. The main nightly grades through the inject door
+# as eight periodics on eight projects: the main part in
 # five shards (#3384, #4238) across ci-kube-agents-eval-nightly with
 # EVAL_NIGHTLY_PART=main-a and ci-kube-agents-eval-nightly-main-b to -main-e
 # with main-b to main-e, the stack-bearing cases placed by nightly-main-b.txt
@@ -631,10 +631,10 @@
 ./tasks/fleet-audit-clean-close-reads-clean/task.yaml
 # A /session crashloop question is answered under the persona's rule for its
 # access (#2858): with the session cluster view on, a GKE skill, kubectl and
-# the session's own answer; with it off, as on the next lane today, the
+# the session's own answer; with it off, as on the eval install today, the
 # skill check skips and the pod-search safeguard and the relayed answer are
-# graded (the task's VIEW ON OR OFF note says how it tells). Real only on
-# the next lane's inject transport; on the api lane every check passes
+# graded (the task's VIEW ON OR OFF note says how it tells). Real on the
+# inject transport; over the agent API every check passes
 # without testing anything (its TRANSPORT note). deployer: noop; reads the
 # seeded fleet's crashloop-workload role.
 ./tasks/session-crashloop-question-loads-a-skill/task.yaml
@@ -665,9 +665,9 @@
 ./tasks/scale-request-proposes-pr/task.yaml
 
 # A /session turn that delegates a cluster question ends in one wake's answer,
-# not in the delegation depth bound (#2819). Real only on the next lane's
-# inject transport, where the gateway routes /session to a session pod; on
-# the api lane it reaches the platform agent as a plain prompt and its
+# not in the delegation depth bound (#2819). Real only on the inject
+# transport, where the gateway routes /session to a session pod; over
+# the agent API it reaches the platform agent as a plain prompt and its
 # forbidden-phrase check passes without testing anything. deployer: noop.
 ./tasks/session-cluster-question-wake-answers-once/task.yaml
 # gitops-drift-noise-filtered-triage: the drift detector's principal
@@ -848,7 +848,8 @@
 
 # A fleet search's per-cluster cards complete on the clusters that don't have
 # the workload, rather than waiting for it (#2978). Worker-scope checks, so it
-# grades on the api lanes; fixture no-pdb-workload on seeded-a.
+# grades on an inject record that carries the workers' calls; fixture
+# no-pdb-workload on seeded-a.
 ./tasks/fanout-absent-cluster-cards-complete/task.yaml
 
 # A card's answer with one obvious next step declares it on a last line of
@@ -977,7 +978,7 @@
 # the harness stores the report for the conversation as the kanban notifier
 # would, then sends the reply on it; the hermes-bridge attaches the stored
 # report to the turn. deployer: noop, two front-door turns, reads no cluster;
-# inject lane only (api-lane-exclusions.txt).
+# needs the inject door.
 ./tasks/chat-reply-under-pushed-report/task.yaml
 
 # A question naming one seeded cluster reaches that cluster's Cluster Agent
@@ -1020,16 +1021,15 @@
 ./tasks/chat-stop-during-card-wait-a2a-door/task.yaml
 
 # gke-labs#3263, Slack Stop step 1: a `stop` typed after the Planning Agent
-# filed a card stops the card before it opens its pull request. Next lane
-# only (api-lane-exclusions.txt): the harness sends the stop through the
-# inject door, and hack/ci-deploy.sh arms the card stop there. deployer: noop,
-# the no-pdb-workload fixture, one card, a 900s observation window. Its
-# record files under the version key's `next` mode, the inject lane's.
+# filed a card stops the card before it opens its pull request. Needs the
+# inject door: the harness sends the stop through it, and hack/ci-deploy.sh
+# arms the card stop on the install. deployer: noop,
+# the no-pdb-workload fixture, one card, a 900s observation window.
 ./tasks/chat-stop-halts-delegated-remediation/task.yaml
 
 # gke-labs#3263, Slack Stop step 3: a `stop` sent while the opening turn still
 # runs leaves no card running, though the turn had not filed one yet when the
-# stop went. Next lane only (api-lane-exclusions.txt), as above. deployer:
+# stop went. Needs the inject door, as above. deployer:
 # noop, the no-pdb-workload fixture, one front-door turn and at most one card,
 # a 600s observation window.
 ./tasks/chat-stop-mid-turn-files-no-card/task.yaml
@@ -1110,8 +1110,8 @@
 # #3975's two lanes, then green on the inject lane with the route reverted
 # (#4116), so a presubmit seat could not fail when the fix is undone:
 # the case stays nightly by the decision on #3975's review thread. No CI lane
-# grades its route check today (the nightly's main shards run through the inject
-# door; since #3969 the api-lane jobs carry the presubmit list, not this file).
+# grades its route check (every lane runs through the inject door, which
+# sets a worker_commands check aside).
 # Enters again once a lane grades that route and the record holds (#3598).
 # The domain's roster seat is consistency-drift-outlier since 2026-10-26.
 ./tasks/consistency-authorized-networks-probe/task.yaml
@@ -1128,7 +1128,7 @@
 
 # A fan-out's polling sleep and every worker command finish inside the terminal
 # limit rather than being cut at the 60 s Hermes' seeded .env set (#5423).
-# Worker-scope check, so it grades on the api lanes and on an inject record
+# Worker-scope check, so it grades on an inject record
 # that carries the workers' calls; no fixture.
 ./tasks/fanout-commands-outlast-terminal-limit/task.yaml
 
@@ -1403,9 +1403,9 @@
 # (#4705), is a public tree over the ceiling with one manifest on a removed
 # apiVersion; the scan reads it with no credential, so it needs no pool change.
 # Red on main 5a4cdc5e and three greens on #4776's build, on the
-# devops-bench-complex-evals dev install (today mode, agent API). On this
-# file's inject lane only the report checks grade (the task header says
-# which), so the api lane is the red's home.
+# devops-bench-complex-evals dev install (agent API). Through the inject
+# door only the report checks grade (the task header says which), so the
+# agent API, which no CI lane uses now, is the red's home.
 ./tasks/upgrades-api-deprecation-large-repo/task.yaml
 
 # Catalogue entry 23 through the readiness report's control-plane-upgrade-history

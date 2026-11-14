@@ -31,8 +31,8 @@
 # guesses from the fleet, or says it has no such report: the objective fails.
 #
 # `fixtures: []`: the case stores and reads its own row and reads no cluster.
-# Inject lane only (hack/eval/api-lane-exclusions.txt): the API server has
-# no conversation the bridge keys the row to.
+# Needs the inject door, which every CI lane grades through: the API server
+# has no conversation the bridge keys the row to.
 id: chat-reply-under-pushed-report
 name: A reply under a pushed report is answered with the report
 prompt: |-

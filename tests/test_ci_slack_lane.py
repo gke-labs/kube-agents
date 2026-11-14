@@ -1,6 +1,6 @@
 """The Slack lane's nightly wiring: hack/ci-deploy.sh's 2a block and hack/ci-eval-pr.sh's lane step.
 
-ci-kube-agents-eval-nightly-slack sets EVAL_SLACK_LANE=1 beside EVAL_MODE_NEXT=1. The deploy
+ci-kube-agents-eval-nightly-slack sets EVAL_SLACK_LANE=1. The deploy
 arms Slack through the eval app when its secrets read, and the eval runs hack/slack-lane/run.sh
 in place of the matrix. The 2a block is run here against a fake gcloud, so the secrets it reads
 and the Helm values it hands the install are pinned without a cluster.
@@ -20,7 +20,6 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _DEPLOY = _REPO_ROOT / "hack" / "ci-deploy.sh"
 _EVAL = _REPO_ROOT / "hack" / "ci-eval-pr.sh"
 _LANE = _REPO_ROOT / "hack" / "slack-lane" / "run.sh"
-_JOB = "ci-kube-agents-eval-nightly-slack"
 
 
 def _deploy_constants() -> str:
@@ -67,12 +66,8 @@ _ALL = {
 
 
 class DeployTest(unittest.TestCase):
-    def test_the_job_may_deploy_next(self):
-        names = re.search(r'^readonly EVAL_MODE_NEXT_JOB_NAMES="([^"]*)"', _DEPLOY.read_text(), re.MULTILINE).group(1).split()
-        self.assertIn(_JOB, names)
-
     def test_with_every_secret_slack_is_armed_for_the_test_user(self):
-        proc = _run_2a({"EVAL_SLACK_LANE": "1", "EVAL_MODE_NEXT": "1"}, _ALL)
+        proc = _run_2a({"EVAL_SLACK_LANE": "1"}, _ALL)
         self.assertEqual(0, proc.returncode, proc.stderr)
         args = [line[len("ARG "):] for line in proc.stdout.splitlines() if line.startswith("ARG ")]
         self.assertIn("platformAgent.integration.slack.enabled=true", args)
@@ -86,18 +81,13 @@ class DeployTest(unittest.TestCase):
 
     def test_a_missing_secret_leaves_slack_off(self):
         partial = {k: v for k, v in _ALL.items() if k != "slack-eval-app-token"}
-        proc = _run_2a({"EVAL_SLACK_LANE": "1", "EVAL_MODE_NEXT": "1"}, partial)
+        proc = _run_2a({"EVAL_SLACK_LANE": "1"}, partial)
         self.assertEqual(0, proc.returncode, proc.stderr)
         self.assertNotIn("ARG platformAgent", proc.stdout)
         self.assertIn("slack-eval-app-token", proc.stdout)
 
-    def test_the_lane_needs_next(self):
-        proc = _run_2a({"EVAL_SLACK_LANE": "1"}, _ALL)
-        self.assertNotEqual(0, proc.returncode)
-        self.assertIn("EVAL_MODE_NEXT=1", proc.stderr)
-
     def test_other_runs_are_untouched(self):
-        proc = _run_2a({"EVAL_MODE_NEXT": "1"}, _ALL)
+        proc = _run_2a({}, _ALL)
         self.assertEqual(0, proc.returncode, proc.stderr)
         self.assertEqual([], [line for line in proc.stdout.splitlines() if line.strip() not in ("", "ARG")])
 

@@ -177,8 +177,8 @@ spec:
 | `parameters`                            | Optional. The task parameters the persona declares, `[{name, required}]`, at most 16 (amended 10/28, #3655). The gateway routes cluster work by them and the dispatcher refuses a submission missing a required one, since neither can read the persona image; the worker refuses to run when this list and the persona's differ.                                                                                                                                                                                                                                                                    |
 | `resources`                             | Pod resources. Default is the demo-proven class: 250m/512Mi requests, 1 CPU/2Gi limits.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 
-Everything here is dark content: the dispatcher and the profile CRD render nothing unless
-the mode switch says `next`.
+Everything here renders on every install; the `spec.mode` switch that once held it dark
+is gone.
 
 As built, the CRD reserves the name `platform`, because the Hermes bridge is that addressee's
 executor, and `resources` and `concurrency` are required rather than defaulted. The example
@@ -199,7 +199,7 @@ carried a Role with pod create/delete/watch; that goes away.)
 **The dispatcher turns messages into Jobs.** A dispatcher controller in the operator
 binary holds one durable consumer per profile on `a2a.tasks.{profile}.*.in`. The
 dispatcher and the janitor run under the operator manager's leader election - the
-`--leader-elect` machinery the operator already ships, required on under `mode: next` -
+`--leader-elect` machinery the operator already ships, required on -
 so "one dispatcher" and "exactly one final event" are elected properties, not deployment
 accidents. Scaling the operator for HA changes nothing here: followers hold no
 consumers. Only a
@@ -436,11 +436,10 @@ What the operator renders per profile, as built (amended 10/6):
 
 Two limits of what is built. Until #3889's later PRs (the dispatcher's mint and the worker's
 task connection) land, a worker's pod connection still reaches every task of its profile, so
-two pods of one profile can reach each other's task subjects. And a profile deleted while its agent is on `today` releases its finalizer with no
-tombstone, because there is no bus to publish one on. The directory survives a flip to
-`today` on the bus's PVC, so that card is still there when the agent goes back to `next`.
-Nothing sweeps directory entries that have no profile. Fixing that means either holding
-deletion on a `today` install or giving the operator a read of the whole directory.
+two pods of one profile can reach each other's task subjects. And nothing sweeps directory entries
+that have no profile: a profile deleted while its agent was still on `spec.mode: today`, before
+that mode went, released its finalizer with no tombstone, because there was no bus to publish one
+on, and its entry stays on the bus's PVC until the operator gains a read of the whole directory.
 
 Profile names and session names share the addressee space on `a2a.tasks.>`. A profile named
 exactly like a live session pod (`<profile>-<animal>-<hex>`) would get that session's events

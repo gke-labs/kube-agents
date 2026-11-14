@@ -1,15 +1,15 @@
-"""Today's Slack presentation as ``kube-agents.chat/v1`` messages, for ``spec.mode: next``.
+"""The Slack presentation as ``kube-agents.chat/v1`` messages, for the A2A gateway.
 
 Pure functions only, like the presenters they port: nothing here imports the
-Hermes gateway, the Slack SDK or the network. Under ``next`` the chat gateway
+Hermes gateway, the Slack SDK or the network. The chat gateway
 renders a chat message and composes nothing (``docs/designs/spec-a2a-payloads.md``,
 "Chat messages"), so the composing that ``slack_status``, ``slack_presenter`` and
 ``slack_moments`` do for Block Kit happens here instead, with the same rules and
 caps, and the result is a dict the notify route carries beside its text
-fallback. The Block Kit functions are untouched: ``today`` keeps them, byte for
-byte, and every function here is new.
+fallback. The Block Kit functions are untouched: the Hermes Slack adapter keeps
+them, byte for byte, and every function here is new.
 
-Each builder returns the chat message, or None when today posts the plain text
+Each builder returns the chat message, or None where Block Kit posts the plain text
 (an answer that opens on a code fence, a rest past the fold's cap). ``*_text``
 builds the fallback where the caller has no text of its own; it is plain, since
 the gateway escapes the fallback itself. Every field carries the raw text: the

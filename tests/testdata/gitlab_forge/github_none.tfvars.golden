@@ -48,10 +48,6 @@ vertex_manage_serving_project = true
 # keys that are set. A bucket that is not here keeps the image default.
 alert_daily_limits = {}
 
-# The PlatformAgent's spec.mode (PLATFORM_AGENT_MODE in install.env). The
-# composition passes the chart nothing for "today", so its CR carries no mode.
-platform_agent_mode = "today"
-
 # The PlatformAgent's spec.storage.size (PLATFORM_AGENT_STORAGE_SIZE in
 # install.env). The composition passes the chart nothing for the default.
 platform_agent_storage_size = "50Gi"

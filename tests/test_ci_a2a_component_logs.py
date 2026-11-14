@@ -191,14 +191,14 @@ class A2AComponentLogsTest(unittest.TestCase):
         self.assertTrue(any(f"-l {_COMPONENT_SELECTOR} " in f"{c} " for c in selectors), selectors)
         self.assertTrue(any(f"-l {_SESSION_SELECTOR} " in f"{c} " for c in selectors), selectors)
 
-    def test_the_rollback_prefix_reaches_the_file_names(self) -> None:
-        result, artifacts, _ = self.collect(prefix="rollback-")
+    def test_a_prefix_reaches_the_file_names(self) -> None:
+        result, artifacts, _ = self.collect(prefix="rearmed-")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue((artifacts / f"rollback-a2a-callout-{_CRASHING}-previous.log").exists())
-        self.assertTrue((artifacts / "rollback-a2a-component-pods.txt").exists())
+        self.assertTrue((artifacts / f"rearmed-a2a-callout-{_CRASHING}-previous.log").exists())
+        self.assertTrue((artifacts / "rearmed-a2a-component-pods.txt").exists())
         self.assertFalse((artifacts / f"a2a-callout-{_CRASHING}.log").exists())
 
-    def test_a_today_mode_install_gains_no_log_files(self) -> None:
+    def test_an_install_with_no_a2a_pods_gains_no_log_files(self) -> None:
         result, artifacts, calls = self.collect(component_listing="", session_listing="")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(sorted(p.name for p in artifacts.glob("a2a-*.log")), [])

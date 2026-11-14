@@ -4,12 +4,11 @@
 # ==============================================================================
 set -e
 
-# An install.env that records no PLATFORM_AGENT_MODE predates the key, so it
-# is a today install whatever DEFAULT_PLATFORM_AGENT_MODE now says.
-readonly SLACK_UNRECORDED_PLATFORM_AGENT_MODE="today"
-readonly SLACK_NEXT_APP_DOC="https://gke-labs.github.io/kube-agents/install/slack-app/#for-specmode-next-the-a2a-gateway"
-readonly SLACK_NEXT_MOVE_APP_DOC="https://gke-labs.github.io/kube-agents/install/slack-app/#moving-an-existing-app-to-next"
-readonly SLACK_NEXT_HOME_CHANNEL_DOC="https://gke-labs.github.io/kube-agents/install/slack-app/#home-channel"
+# The Slack app setup page: the manifest the A2A gateway takes, how to move an
+# app made for the Hermes Slack platform onto it, and the home channel.
+readonly SLACK_GATEWAY_APP_DOC="https://gke-labs.github.io/kube-agents/install/slack-app/#for-the-a2a-gateway-slack-the-only-chat-platform"
+readonly SLACK_GATEWAY_MOVE_APP_DOC="https://gke-labs.github.io/kube-agents/install/slack-app/#moving-an-app-made-for-the-hermes-listener"
+readonly SLACK_GATEWAY_HOME_CHANNEL_DOC="https://gke-labs.github.io/kube-agents/install/slack-app/#home-channel"
 
 # Any position, as common.sh reads its own flags: `-y --help` is still a
 # request for this text, not a run.
@@ -21,8 +20,8 @@ Usage: print_instructions_slack.sh [--dry-run] [-y|--no-confirm]
 
 Prints the Slack setup checklist for this install: the app settings to
 verify, the first message to send, and the steps after it. The steps follow
-the Slack path the install uses: the A2A gateway under PLATFORM_AGENT_MODE=next
-without Google Chat, the Hermes listener otherwise. It reads
+the Slack path the install uses: the A2A gateway when Google Chat is off, the
+Hermes Slack platform beside Google Chat. It reads
 the install.env at the root of the checkout it sits in ($KUBE_AGENTS_INSTALL_ENV
 instead, when set) and scripts/installer/vars.sh, and prints the checklist
 only when SLACK_ENABLED is on there (true, yes, 1 or on). install.sh runs it
@@ -40,18 +39,14 @@ done
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/common.sh" "$@"
 
-# A standalone run takes the mode from install.env alone, as install.sh's own
-# bootstrap does. An exported GOOGLE_CHAT_ENABLED or SLACK_HOME_CHANNEL the
-# file does not assign is kept: install.sh applies those too.
-if [ -z "${SLACK_STEPS_PLATFORM_AGENT_MODE+set}" ] && [ -f "$(install_env_file_for_state)" ]; then
-  unset PLATFORM_AGENT_MODE
-fi
+# A standalone run reads install.env; an exported GOOGLE_CHAT_ENABLED or
+# SLACK_HOME_CHANNEL the file does not assign is kept: install.sh applies
+# those too.
 load_state
 
 # install.sh passes what its run applied, which load_state's install.env would
 # otherwise override. A standalone run passes none and reads the file.
-if [ -n "${SLACK_STEPS_PLATFORM_AGENT_MODE+set}" ]; then
-  PLATFORM_AGENT_MODE="$SLACK_STEPS_PLATFORM_AGENT_MODE"
+if [ -n "${SLACK_STEPS_SLACK_ENABLED+set}" ]; then
   SLACK_ENABLED="${SLACK_STEPS_SLACK_ENABLED:-}"
   GOOGLE_CHAT_ENABLED="${SLACK_STEPS_GOOGLE_CHAT_ENABLED:-}"
   SLACK_HOME_CHANNEL="${SLACK_STEPS_HOME_CHANNEL:-}"
@@ -67,12 +62,12 @@ print_a2a_gateway_steps() {
   local home not_an_id
   home="$(trim_go_space "${SLACK_HOME_CHANNEL:-}")"
   not_an_id="$(slack_home_channel_not_an_id "$home")"
-  echo -e "[ ] 1. Check the Slack app against the spec.mode next manifest:"
-  echo -e "       ${SLACK_NEXT_APP_DOC}"
+  echo -e "[ ] 1. Check the Slack app against the A2A gateway's manifest:"
+  echo -e "       ${SLACK_GATEWAY_APP_DOC}"
   echo -e "       Socket Mode on, the scopes and message events it lists, and ${C_YELLOW}no slash commands${C_RESET}:"
   echo -e "       the A2A gateway does not acknowledge them, so Slack shows the member a timeout error."
-  echo -e "       An app made for today: delete its ${C_WHITE}features.slash_commands${C_RESET} block instead of pasting the new manifest over it:"
-  echo -e "       ${SLACK_NEXT_MOVE_APP_DOC}"
+  echo -e "       An app made for the Hermes Slack platform: delete its ${C_WHITE}features.slash_commands${C_RESET} block instead of pasting the new manifest over it:"
+  echo -e "       ${SLACK_GATEWAY_MOVE_APP_DOC}"
   echo -e ""
   echo -e "[ ] 2. Check that the gateway connected to Slack (it can take a minute after the install):"
   echo -e "       ${C_WHITE}kubectl logs deploy/${PLATFORM_AGENT_A2A_GATEWAY_DEPLOYMENT} -c ${PLATFORM_AGENT_A2A_GATEWAY_CONTAINER} -n ${ns} | grep 'slack connected'${C_RESET}"
@@ -85,10 +80,10 @@ print_a2a_gateway_steps() {
     echo -e "       Set ${C_WHITE}SLACK_HOME_CHANNEL${C_RESET} in install.env to a channel ID (C... or G...) and re-run the installer."
     echo -e "       Or mention the agent once, top-level, in the channel you want: under homeChannelPolicy auto (the default) that channel becomes the home channel."
     echo -e "       Or pick the channel on the app's Home tab (Home channel panel)."
-    echo -e "       ${C_WHITE}/sethome${C_RESET} does not set it under next: ${SLACK_NEXT_HOME_CHANNEL_DOC}"
+    echo -e "       ${C_WHITE}/sethome${C_RESET} does not set it on the A2A gateway: ${SLACK_GATEWAY_HOME_CHANNEL_DOC}"
   elif [ -n "$not_an_id" ]; then
     echo -e "[ ] 4. SLACK_HOME_CHANNEL is '${not_an_id}', which is not a channel ID, so the gateway posts no alerts or scheduled reports to Slack."
-    echo -e "       Set ${C_WHITE}SLACK_HOME_CHANNEL${C_RESET} in install.env to a channel ID (C... or G...) and re-run the installer: ${SLACK_NEXT_HOME_CHANNEL_DOC}"
+    echo -e "       Set ${C_WHITE}SLACK_HOME_CHANNEL${C_RESET} in install.env to a channel ID (C... or G...) and re-run the installer: ${SLACK_GATEWAY_HOME_CHANNEL_DOC}"
   else
     echo -e "[ ] 4. Invite the app to the home channel ${C_WHITE}${home}${C_RESET}, or Slack refuses its alerts and scheduled reports there:"
     echo -e "       ${C_WHITE}/invite @<app display name>${C_RESET} in that channel."
@@ -105,8 +100,7 @@ if is_truthy "${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}"; then
   fi
 
   echo -e "${C_CYAN}${C_BOLD}--- [Slack Integration Instructions] ---${C_RESET}"
-  if slack_moves_to_a2a_gateway "${PLATFORM_AGENT_MODE:-$SLACK_UNRECORDED_PLATFORM_AGENT_MODE}" \
-    "${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}" "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}"; then
+  if slack_moves_to_a2a_gateway "${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}" "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}"; then
     print_a2a_gateway_steps
     exit 0
   fi

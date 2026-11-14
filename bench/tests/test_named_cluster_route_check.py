@@ -73,7 +73,7 @@ NO_CARD = [
     }
 ]
 # The inject transport's own entries, which mark a record as the inject lane's
-# (scoring.is_inject_record) and as one whose door showed the trace.
+# (scoring._inject_record) and as one whose door showed the trace.
 INJECT_MARKERS = [
     {
         "name": "inject.task",

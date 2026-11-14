@@ -198,11 +198,10 @@ Rules:
 
 Resolution turns the declared scope into a set of `(project, cluster, location)` tuples, plus a
 per-project outcome. It runs inside the existing reconcile job under the agent's identity, through
-the credential broker, because the operator deliberately holds no GCP credential. Outside
-`spec.mode: next`, the reconcile is the only process in the install that talks to GCP on a
-schedule.
+the credential broker, because the operator deliberately holds no GCP credential. The reconcile and the scope
+publisher are the two processes in the install that talk to GCP on a schedule.
 
-Under `spec.mode: next` there is a second scheduled caller, the scope publisher. The operator
+The scope publisher is the second scheduled caller. The operator
 starts it as a Job every 15 minutes, and soon after the membership fields of `spec.scope` change,
 while the scope declares a folder, organisation, Shared VPC host or Metrics Scope. It resolves the
 same members through the broker's `scope` role, under a ServiceAccount of its own, and writes them
@@ -378,7 +377,7 @@ carries `spec.deployment.env` (`common_types.go:368-372`) only as a generic pass
 rendered file's hash joins the ConfigMap hash that rolls the agent workload, so editing the scope
 takes effect at the next pod start and the next reconcile tick, whichever is later.
 
-Under `spec.mode: next` the A2A gateway also needs the membership, to check a delegated task's
+The A2A gateway also needs the membership, to check a delegated task's
 target cluster before it mints a grant, and it cannot read this volume. The design adds a
 separate publisher for it. `scope_publisher.py` ships in the agent image: it runs the reconcile's
 own lookups, exclusion rules and cap with a runner that sends each gcloud command to the
@@ -404,8 +403,7 @@ dropped first: a document whose rows fit is published without it rather than as 
 it as a Job every 15 minutes, when the membership fields change, and at creation. The broker's
 `scope` caller role admits only the lookups' five argv shapes, each on an argument the broker's
 own copy of `scope.json` declares or an earlier lookup returned. The gateway checks a profile
-task's target against the document, as described below. The reconcile, its snapshot and today-mode
-installs do not change.
+task's target against the document, as described below. The reconcile and its snapshot do not change.
 
 Whether the snapshot should also be lifted into `.status` is open (§11). It would make `kubectl get
 platformagent -o yaml` answer "which projects does this install manage" without a pod exec, but the

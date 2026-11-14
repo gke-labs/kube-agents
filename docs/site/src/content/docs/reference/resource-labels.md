@@ -14,11 +14,11 @@ kubectl get all,configmap,pvc,serviceaccount,secret -A \
   -l 'app.kubernetes.io/part-of in (kube-agents,a2a-next)'
 ```
 
-The set has two values by design. Controller output rendered under `mode: next`, a first
-install's default, carries `part-of: a2a-next` instead of `kube-agents`, plus a
+The set has two values by design. The A2A stack's controller output carries
+`part-of: a2a-next` instead of `kube-agents`, plus a
 `kubeagents.x-k8s.io/a2a-component` label. So the A2A stack is one query of its own
 (`-l app.kubernetes.io/part-of=a2a-next`), and `-l app.kubernetes.io/part-of=kube-agents` keeps
-meaning the components every mode shares. On a `next` install, the second selector alone misses
+meaning the rest of the install. The second selector alone misses
 the bus, the callout, the verifier, the console and the gateway.
 
 ## The label contract
@@ -46,8 +46,7 @@ database are all built from them. Do not add `component` anywhere else on the st
 
 One more source stamps labels at runtime rather than at install: the a2a chatops gateway
 (`a2a/gateway/spawn.go`) stamps `app.kubernetes.io/component: a2a-session` and
-`app.kubernetes.io/part-of: a2a-next` on the session pods it spawns. It spawns them only
-under `spec.mode: next`, a first install's default, where the operator renders
+`app.kubernetes.io/part-of: a2a-next` on the session pods it spawns. It spawns them because the operator renders
 `A2A_SPAWN_SESSIONS`. The values are
 load-bearing the same way Hindsight's are, and for more consumers: the gateway's
 session cap counts pods and its sweeper lists them by exactly this pair, the operator's bus fence
@@ -152,7 +151,7 @@ kubectl get all -A \
 
 Cluster-scoped RBAC the project owns — the objects most easily orphaned, since a namespaced
 PlatformAgent cannot own a cluster-scoped resource through an owner reference. Both `part-of`
-values again: under `mode: next` the auth callout's ClusterRoleBinding to `system:auth-delegator`
+values again: the auth callout's ClusterRoleBinding to `system:auth-delegator`
 carries `a2a-next`.
 
 ```bash

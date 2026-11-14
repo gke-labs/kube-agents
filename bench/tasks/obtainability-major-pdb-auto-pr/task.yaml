@@ -9,8 +9,8 @@
 # declaration. obtainability-planted-pdb grades only the ledger finding;
 # pdb-remediation-pr grades a budget the model writes.
 #
-# WHY THE PROMPT ASKS FOR THE FIX. A `mode: next` lane (EVAL_MODE_NEXT=1,
-# which the writers nightlies that run this case set) installs the agent with
+# WHY THE PROMPT ASKS FOR THE FIX. The eval install (the writers nightlies
+# that run this case included) installs the agent with
 # KUBEAGENTS_AUDIT_AUTO_PROMOTE=false (hack/ci-deploy.sh, #3439), so the
 # automatic sweep opens nothing there: `finish` writes the budget and lists
 # it as awaiting `/remediate`. The case first asked only for the audit and

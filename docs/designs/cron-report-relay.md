@@ -53,7 +53,7 @@ chat roster: profile-cron-tick  (no_agent, * * * * *)
                           ├── hermes send                     → the report, as written
                           │   or slack_blocks_post            → a fleet-audit headline as Block Kit
                           │                                     (Slack, KAGE_SLACK_UX on; below)
-                          │   or a2a notify --chat-file       → the same card under spec.mode: next
+                          │   or a2a notify --chat-file       → the same card, for the platform the gateway holds
                           │
                           └── INSERT INTO incidents (chat_id, thread_id, report)
                                        │
@@ -69,8 +69,8 @@ the investigation already happened, and no agent turn runs at all (see
 The pieces that make an alert answerable — a thread, a routing row bound to it,
 and the report stored against that thread — are reused unchanged.
 
-Under `spec.mode: next` the post leg is `a2a notify` through the A2A gateway rather
-than `hermes send`, for the platform the gateway holds (spec-chatops-gateway.md,
+For the platform the A2A gateway holds, the post leg is `a2a notify` through the gateway rather
+than `hermes send` (spec-chatops-gateway.md,
 "Proactive posts: the chat.notify route"). The report still lands in a thread and the
 same `incidents` row is stored against it, but a reply typed into it reaches the A2A
 gateway and runs through the hermes-bridge's `api` executor, never through the Hermes
@@ -84,8 +84,8 @@ session and the conversation key; a key naming a whole DM or space rather than a
 up), and frames the report ahead of the user's words with the hook's
 notice and token list.
 
-With `KAGE_SLACK_UX` on, the Slack leg of a fleet-audit job's report, and under
-`spec.mode: next` the Google Chat leg too, sends a
+With `KAGE_SLACK_UX` on, the Slack leg of a fleet-audit job's report, and the Google Chat
+leg, sends a
 headline in place of the report (`slack_audit_report.py`, called from
 `relay_cron_report`), provided a chat id or a Slack
 home channel is known (or the leg is one the gateway routes, which holds its home channel), the job's `skills` (a list or one string, or the legacy `skill`) include
@@ -135,7 +135,7 @@ way to what the report said beyond its line, such as lines above it or the link
 targets the bold line drops.
 
 `_failed_audit_line` posts the first sentence of a report's "What's wrong" section
-(`slack_audit_report.failed_line`, or `failed_chat` under `spec.mode: next`) for a report
+(`slack_audit_report.failed_line` through the relay, or `failed_chat` through the gateway) for a report
 that ends with no ledger link, and only for a job that runs the fleet-audit skill. The
 scheduled delivery of a job the image ships posts what its `finish` rendered or a notice
 that it did not finish
@@ -144,7 +144,7 @@ and neither has that section, so the line is not posted for it. A fleet-audit jo
 at runtime, and a mid-run `report_to_chat`, still post the model's text, and the line
 still applies to them.
 
-Every other report (Google Chat under `today`, one that does not end with
+Every other report (one that does not end with
 a managed-repository issue link and is not such a failed run, a job the scheduler already delivered to Slack
 itself when it also left another platform to the relay, or any report with the
 flag off) is posted unchanged. A job whose `deliver` value claims
@@ -176,7 +176,7 @@ which leaves the other half for the sends to every platform: the Block Kit post
 stops short of it with room left for the text send, and when too little is left to
 read the ledger the report goes out as text in one send.
 
-Under `spec.mode: next` the gateway holds the chat platform, Slack or Google Chat, and the
+Where the gateway holds the chat platform (Google Chat, or Slack with Chat off) the
 broker's relay is gone, so the same card goes to the gateway, for whichever leg it routes,
 as a `kube-agents.chat/v1` message instead
 (`slack_audit_report.chat_from_issue`, posted with `a2a notify --chat-file`), and the
@@ -187,7 +187,7 @@ breaks a rule or the platform refuses it; the leg's own fallbacks above are unch
 A fleet-audit report with no ledger link that is fleet-audit's own summary of a run with
 no GitOps repository (`slack_audit_report.summary_card`) gets the same card, built from
 the summary instead of an issue. `_post_summary_card` posts `blocks_from_summary` through
-the relay, or `chat_from_summary` through the gateway under `spec.mode: next`: the
+the relay, or `chat_from_summary` through the gateway: the
 summary's headline, its finding rows, its other lines under them, and "Look at the first
 one" with no link button. The label fleet-audit stores above a re-run's summary, when an
 earlier finish published and stopped, is dropped, as the ledger card drops it. Where the
@@ -198,9 +198,9 @@ of the ledger card.
 says: the script leaves its rows, each with the ids of the cards it stands for, in a file
 beside its record, and `_board_health_card` reads that file (`board_health_card.load`)
 only when its text is the report being relayed, with the flag on and a channel known (or the
-leg routed through the gateway), on Slack and, under `spec.mode: next`, on Google Chat.
+leg routed through the gateway), on Slack and on Google Chat.
 `_post_board_health_card` posts it as Block Kit through the relay (`blocks_from_card`), or
-under `spec.mode: next` as a chat message whose rows carry `tasks` and `actions`
+through the gateway as a chat message whose rows carry `tasks` and `actions`
 (`chat_from_card`), with Retry and Drop under each row on Slack and, on Google Chat, under
 the message and labelled by the row's number (`a2a/gateway/slack_board.go`,
 `a2a/gateway/gchat_board.go`). Its outcomes, and the report going out as text where the card does not post, are the audit
@@ -331,8 +331,7 @@ and the image's roster still has a job that reads as daily. A failure no
 retry clears says so instead of promising one: rejected credentials, and the
 scheduler's blocked-configuration line (which it sends once, running the job no
 more until the configuration is fixed), end with "An admin needs to fix this
-before it can run; the details are in the agent's log." There is no clock time: under `spec.mode: next`, the default
-for a first install, the gateway escapes Slack's `<!date^…>` token, and a time
+before it can run; the details are in the agent's log." There is no clock time: the A2A gateway escapes Slack's `<!date^…>` token, and a time
 in one zone is wrong for most readers. A failure posts once: `scheduler_failure_posts` keeps the reason each
 job last posted, and the same reason is withheld until the job's `completed` row
 in the run ledger starts after that post, or until any delivery from the job
@@ -542,7 +541,7 @@ exactly as before, and the index only runs where the hook previously did nothing
 Google Chat opens a thread around every top-level message, so the thread name on
 an inbound payload cannot say whether the user posted at top level or replied
 inside a real thread. Chat's `message.threadReply` flag does say (it is true only
-for a reply in a thread; the `mode: next` gateway reads it to mark a top-level ask and keys every DM
+for a reply in a thread; the A2A gateway reads it to mark a top-level ask and keys every DM
 message by its thread, per `spec-chatops-gateway.md`), but the Hermes adapter does not read it. It settles
 the question by counting inbound messages per thread: a thread it has
 never seen one in is read as main flow, and the bot answers in the space rather
@@ -650,7 +649,7 @@ An install with no chat route gets no send at all: when the managed scope turns
 every platform off and nothing routes one through the gateway — an install with
 neither Google Chat nor Slack, or one whose home channel is malformed, which routes
 nothing — the relay answers 502 without posting, and the detail says that no route
-exists. A `next` install whose only chat platform is held by the gateway with no home
+exists. An install whose only chat platform is held by the gateway with no home
 channel is routed anyway: the operator renders `A2A_NOTIFY_PLATFORM` for it (a
 comma-separated list of platform names, one today), the relay
 sends, and the gateway refuses the post and keeps it for the digest it posts once a

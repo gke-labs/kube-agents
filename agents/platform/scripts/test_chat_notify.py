@@ -423,7 +423,7 @@ class SlackRouteTest(unittest.TestCase):
         self.assertEqual(argv, ["a2a", "notify", "--platform", "slack", "--thread", "C0HOME/1700000000.000100", "--", "drift on prod"])
 
     def test_a_slack_thread_carries_its_own_channel(self):
-        # A today-era DM thread: the gateway refuses a non-home channel, so the
+        # A DM thread the Hermes Slack adapter opened: the gateway refuses a non-home channel, so the
         # follow-up is not posted into home.
         with mock.patch.dict(os.environ, SLACK_ROUTED):
             argv = chat_notify.command("slack:D0DM:1700000000.000200", "follow-up")

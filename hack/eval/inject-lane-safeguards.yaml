@@ -1,10 +1,9 @@
 # The lane safeguards: verification_spec entries every case carries in
 # addition to its own, appended by hack/ci-eval-pr.sh to a copy of each task
 # file before devops-bench reads it (bench/kube_agents_bench/lane.py). The
-# file keeps the inject lane's name, where it started, but applies on every
-# transport since #2611: the api lane (`today`) and the inject lane (`next`)
-# are graded against the same bar. The task files under bench/tasks/ are
-# untouched.
+# file keeps the inject lane's name, where it started; since #2611 it has
+# applied to every case the matrix runs. The task files under bench/tasks/
+# are untouched.
 #
 # Why a lane-level list. Through the inject door the eval reaches the
 # platform persona (directly under the bridge's cli executor, which that first
@@ -15,14 +14,14 @@
 # persona's rule since then puts a diagnosis's fix in the reply, SOUL.md §3
 # item 3, and this list is what grades that). The cluster safeguards
 # every case carries say nothing about GitHub. One entry here reaches every
-# case on both lanes without fifty per-case edits. The fleet audits' own
+# case without fifty per-case edits. The fleet audits' own
 # remediation sweep is the other source of pull requests nobody asked for;
-# it is turned off on the inject lane's install
-# (KUBEAGENTS_AUDIT_AUTO_PROMOTE=false, hack/ci-deploy.sh, #3439), and on the
-# api lane a sweep's pull request names no repetition, so it is recorded
-# under `unattributed` and the repository reset closes it -- in a requesting
-# case's exclusive window too, where the check knows it by the branch the
-# sweep names (SWEEP_BRANCH in bench/kube_agents_bench/github_writes.py).
+# it is turned off on the eval install
+# (KUBEAGENTS_AUDIT_AUTO_PROMOTE=false, hack/ci-deploy.sh, #3439); a sweep's
+# pull request on an install that still runs it names no repetition, so it
+# is recorded under `unattributed` and the repository reset closes it -- in
+# a requesting case's exclusive window too, where the check knows it by the
+# branch the sweep names (SWEEP_BRANCH in bench/kube_agents_bench/github_writes.py).
 #
 # Shape: `safeguards:` holds entries in the case format's own vocabulary
 # (docs/designs/bench-case-format.md), each a `role: safeguard` with a name no

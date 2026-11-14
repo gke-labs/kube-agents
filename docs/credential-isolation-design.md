@@ -249,7 +249,7 @@ audience-bound projected ServiceAccount token (one hour; the audience is per
 caller, `kubeagents-credential-proxy` for the sandbox, `kubeagents-credential-proxy-chat` for
 the gateway, `kubeagents-credential-proxy-watcher` for the gateway's `agent-api-auth` container
 alone (the event watcher and drift detector, whose fleet and Pub/Sub calls go through the
-broker's watcher routes) and, when the next stack takes Google Chat, `kubeagents-credential-proxy-a2a-chat`
+broker's watcher routes) and, when Google Chat is enabled, `kubeagents-credential-proxy-a2a-chat`
 for the A2A gateway) as a bearer header, and the
 runtime verifies it with a `TokenReview` against `CREDENTIAL_PROXY_ALLOWED_CALLERS`.
 That list names the gateway's ServiceAccount and the sandbox's, the A2A gateway's when it
@@ -1126,7 +1126,7 @@ file and never a `.git` it can write into.
   `spec.deployment.sidecars`/`initContainers` are appended to the Pod
   substantially as written; the webhook does not require a read-only root of
   them, so a CR can still add a writable container to this Pod. "As written"
-  is not literal under `spec.mode: next`: the A2A render strips reserved-name
+  is not literal: the A2A render strips reserved-name
   volume mounts and bus-credential mounts from a sidecar, and writes two env
   names onto it because both feed the capability check rather than the
   container's own configuration - `A2A_CAPABILITY_REQUIRED` as an override
