@@ -1,7 +1,6 @@
 # The GHES lane's matrix: what pull-kube-agents-smoke-test-ghes runs on a
 # pull request and ci-kube-agents-eval-weekly-ghes-next runs once a week
-# (kube-agents#3684), both under spec.mode next (EVAL_MODE_NEXT=1, through
-# the inject door).
+# (kube-agents#3684), both through the inject door.
 # hack/ci-eval-pr.sh reads this file in place of the catalogue whenever
 # EVAL_FORGE is ghes, on either tier. The forge is the forwarding proxy in
 # hack/ghes-proxy at a private host with a private CA, stood up per run by

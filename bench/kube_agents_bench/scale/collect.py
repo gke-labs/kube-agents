@@ -52,8 +52,9 @@ RUNNING_PHASE = "Running"
 # A2A chat gateway (platform-agent-a2a-gateway-*) on installs that run one.
 GATEWAY_SELECTOR = "app=platform-agent-gateway"
 PLATFORM_AGENT_RESOURCE = "platformagents"
-# The CRD's default for spec.mode.
-DEFAULT_MODE = "today"
+# What an absent spec.mode reads as: the CRD now defaults it to next, the one
+# stack every install runs.
+DEFAULT_MODE = "next"
 # The agent's data volume: profiles, sessions, the kanban board. The other claims (bus, shell) are not it.
 AGENT_DATA_CLAIM = "platform-agent-data"
 AGENT_CONTAINER = "platform-agent"

@@ -3548,7 +3548,7 @@ def test_an_expected_fail_case_passing_only_on_the_visible_checks_keeps_its_mark
 
 
 def test_an_expected_fail_case_passing_whole_still_demands_the_flip(expected_fail_spec, make_run):
-    """The api-lane behaviour rung 5 exists for is untouched: a pass with
+    """The behaviour rung 5 exists for is untouched: a pass with
     nothing set aside is a pass, and three of them are the flip demand."""
     verdict = grade_case(expected_fail_spec, [make_run() for _ in range(3)], admitted=True)
     assert verdict.rung is Rung.EXPECTED_FAIL_PASSED and verdict.blocking

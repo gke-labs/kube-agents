@@ -998,7 +998,6 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--publish-bucket", default="", help="record: the shared replay cache bucket")
     parser.add_argument("--publish-interval", type=float, default=DEFAULT_PUBLISH_INTERVAL_SECONDS)
     parser.add_argument("--job-name", default="", help="record: the Prow job name, written into each record")
-    parser.add_argument("--eval-mode-next", default="", help="record and replay: EVAL_MODE_NEXT (1 is next mode)")
     parser.add_argument("--forge", default="", help="record and replay: EVAL_FORGE (empty is github)")
     parser.add_argument("--commit", default="", type=_shaped(COMMIT_SHAPE, "commit id"),
                         help="record: the checkout's commit, written into each record")
@@ -1035,8 +1034,7 @@ def make_publisher(args: argparse.Namespace, collector: "Collector"):
     return publish_cache.Publisher(keep_dir=args.keep_dir, verdicts_dir=args.verdicts_dir,
                                    bucket=args.publish_bucket, build=args.build, run=collector.run,
                                    env=GCLOUD_ENV, emit=collector.emit,
-                                   job=publish_cache.job_identity(args.job_name, args.eval_mode_next, args.forge,
-                                                                     args.commit))
+                                   job=publish_cache.job_identity(args.job_name, args.forge, args.commit))
 
 
 def make_lane_report(args: argparse.Namespace) -> Optional[Callable[[str], Optional[str]]]:

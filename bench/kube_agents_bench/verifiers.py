@@ -3378,10 +3378,9 @@ class DelegatedToVerifier(BaseVerifier):
     ``forbidden_addressees``: Python regular expressions, none of which may
     ``re.fullmatch`` any addressee. At least one of the two lists is set.
 
-    Fails closed: a run that could not say (the api transport, or a door
-    older than the field) is ``status="error"``, never a pass or a fail. A
-    case that relies on this check belongs in
-    ``hack/eval/api-lane-exclusions.txt``, so the api lane never runs it.
+    Fails closed: a run that could not say (the api transport, which no CI
+    lane uses, or a door older than the field) is ``status="error"``, never
+    a pass or a fail.
     """
 
     type: Literal["delegated_to"]
@@ -7380,8 +7379,8 @@ class GitHubWritesVerifier(BaseVerifier):
     names is charged all the same, since no other repetition was writing --
     except one on a branch the fleet audits' remediation sweep names
     (``platform-agent/fix-<audit-id>-...-<digest>``,
-    :data:`kube_agents_bench.github_writes.SWEEP_BRANCH`): the api lane
-    keeps the sweep on and the five first-run audits keep their clock until
+    :data:`kube_agents_bench.github_writes.SWEEP_BRANCH`): an install that
+    keeps the sweep on has the five first-run audits keep their clock until
     the install's own chain has run them, so
     such a pull request is unattributed there as in a shared window.
     Otherwise a write no repetition names is graded by none (a reply that

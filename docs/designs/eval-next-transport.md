@@ -1,11 +1,10 @@
 # The eval transport under `spec.mode: next`
 
-> **STATUS — design of record; stage 1 built, off by default.** The gateway has the inject adapter
-> and the bench harness selects it with `AGENT_TRANSPORT=inject`; the operator renders the door
-> only under its eval flag; `EVAL_MODE_NEXT=1` on the presubmit scripts builds the bridge image,
-> flips the install, hands the operator the bridge's settings and runs the matrix through the door (The CI flag). The
-> merge-blocking presubmit sets the flag, so every pull request is graded through the door; the
-> today lane grades `today` after a scripted rollback. Stage 2's operator wiring is rendered and
+> **STATUS — design of record; built, the one transport CI grades over.** The gateway has the
+> inject adapter and the bench harness selects it with `AGENT_TRANSPORT=inject`; the operator
+> renders the door only under its eval flag; every install runs the A2A stack, so the presubmit
+> scripts build the bridge image, hand the operator the bridge's settings and run every matrix
+> through the door (The CI flag). Stage 2's operator wiring is rendered and
 > its eval-install half is not started.
 > The measurement that motivates the document is on
 > gke-labs/kube-agents#1661; the presubmit run it cites is build `2100310325382352896`. The A2A
@@ -96,8 +95,7 @@ Service, off by default, rendered by the operator only under the eval flag. Its 
 the gateway spec's "The inject backend" section; this document records what the harness does
 with it. The direct-bus transport survives as a diagnostic, below.
 
-Selected by `AGENT_TRANSPORT=inject`; unset, or `api`, is today's transport byte for byte, and
-the presubmit exports nothing new until it chooses to. The exchange:
+Selected by `AGENT_TRANSPORT=inject`; unset, or `api`, is the agent API transport byte for byte (a developer's door; no CI lane uses it). The exchange:
 
 1. Port-forward the adapter's Service on `AGENT_CLUSTER_CONTEXT`, through the harness's existing
    forward machinery and its retry classes.
@@ -661,112 +659,69 @@ it, and the wait goes.
 
 ## The CI flag
 
-`EVAL_MODE_NEXT=1` in `hack/ci-deploy.sh` flips the presubmit's eval install to `next` after the
-today-mode install has passed its own readiness and connectivity checks. It records the agent
-Deployment's generation, sets the mode through the chart's `platformAgent.mode` in a `helm
-upgrade --reuse-values` of its own release (with the `maxSessions` sized for the bridge's
-workers, so the first render sees both), and waits for the generation to move before
-asking any workload for status, because the flip is a rollout and a status read before it lands
-describes the old pods. It then gates, in order, on the NATS StatefulSet, the callout Deployment,
+There is no flag now: every install runs the A2A stack, and `hack/ci-deploy.sh` has one path.
+Step 5's install hands the operator the A2A image references through the chart's
+`operator.extraEnv`, arms the gateway's inject door on the operator the same way
+(`A2A_INJECT_BACKEND=true`), sets the bridge's image and `BRIDGE_CONCURRENCY` on it
+(`A2A_BRIDGE_IMAGE`, `A2A_BRIDGE_CONCURRENCY`; the bridge's default `api` executor), and sets the
+CR's `maxSessions` sized for the bridge's workers so the first provisioning Job's TASKS budget
+fits the floor. Step 6b then gates, in order, on the NATS StatefulSet, the callout Deployment,
 the provisioning Job reaching `complete` (the Job depends on the callout; before the operator
 ordered its creation after a serving callout replica it was measured at 19.5 minutes under adverse
-conditions, so its bound is generous), and the agent Deployment. Then
-the door and the executor. The deploy arms the gateway's inject door on the operator under the
-same flag (`A2A_INJECT_BACKEND=true` through the chart's `operator.extraEnv`, beside the A2A
-image overrides) and waits for the door's Service and token Secret. The bridge is the
-operator's: it renders it with the image and `BRIDGE_CONCURRENCY` the deploy sets on it the same
-way (`A2A_BRIDGE_IMAGE`, `A2A_BRIDGE_CONCURRENCY`) and the bridge's default `api` executor, and
-the TASKS budget counts its workers from the first `next` render, so the mode change is the only
-change and the one provisioning Job is already sized for the bridge. The bridge enters the agent
-pod only once the bus is provisioned (the CR's `BusProvisioned` condition), so the agent
-Deployment rolls twice, once for the mode change and once after the Job for the bridge, and the
-step gates both rolls. The step waits for the
-bridge's own log line that it is consuming `platform` tasks, because a flip without a consuming
-bridge leaves a bus on which nobody answers, then gates the verifier's rollout and the web
-console under `next` (the same read routes and chat turn the deploy gated under `today`, through
-the console's port-forward). It reports the A2A gateway's state and last log
-lines and does not gate on it: the door gives the gateway the backend it lacked, so it now
-starts, but a gateway that is down is what the harness classifies as infrastructure on every
-case, and gating it is the change that follows the first measured run through the door. The
-flag reaches the operator as an operator environment variable, the pattern the A2A image
-overrides use, and not as a CRD field (decided 2026-09-17 by the A2A owner on the adapter's
-issue): the door maps a body-supplied principal, and nothing a customer can set on a
-`PlatformAgent` may render it. The rendered object set with the flag unset carries no inject
-Service, env or NetworkPolicy, and that is a property for the conformance suite to check rather
-than a comment to trust. The A2A images the flip needs, and the bridge image, are built in the
-same Cloud Build as the other images (two steps of their own, no-ops with the flag unset) and the
-three are set on the operator, because its defaults point at a registry the pool projects cannot
-pull from. Under the same flag
-`hack/ci-eval-pr.sh` runs the matrix through the door: it exports `AGENT_TRANSPORT=inject` and
-`AGENT_INJECT_TOKEN`, read from the token Secret the operator renders beside the door, and
-changes nothing else about the run except what hangs off that transport switch: the inject
-lane's exclusion list (`hack/eval/inject-lane-exclusions.txt`, keyed on `AGENT_TRANSPORT` rather
-than on this flag) leaves out the cases whose premise needs the chat front door, and its mirror
-(`hack/eval/api-lane-exclusions.txt`) keeps the cases only the door can carry off every other
-lane; the deploy also arms the card stop (`A2A_CARD_STOP`) on the install, which those cases
-grade, and turns on the gateway's A2A door (`A2A_AGENT_DOOR`) for the card-wait stopped ask, which
-cancels a door task while its turn holds for its cards. The script exports that door's own token
-(`AGENT_A2A_DOOR_TOKEN`) beside the inject one. An eval install therefore runs with a door a
-default install doesn't have. The lane safeguards (`hack/eval/inject-lane-safeguards.yaml`) hang off neither the flag
-nor the transport: on both lanes they are appended to a scratch copy of every remaining task
-file, which the unit hands devops-bench, over the leased project's GitOps repository exported as
-`BENCH_GITOPS_REPO` (the run refuses to start without one), with the cases that request a pull
-request, the stopped asks and the cases that declare `writes_alone: true`, run in a second phase after every first-phase unit (a case that
-declares `scope_exclude:` runs after them, in a phase of its own), one at a time and each after a settle, so no repetition that requests nothing shares the repository with one that
-writes by design and no window reaches back into the unit before; and after the fan-out the
-script lists in the job log what the run left on that repository, closing nothing. With the flag
-unset, the transport, the inject lane's exclusion list, the card stop and the rollback check
-below are off; the api lane's exclusion list and the lane safeguards still apply.
+conditions, so its bound is generous), and the agent Deployment. Then the door and the executor:
+the deploy waits for the door's Service and token Secret, and for the second roll of the agent
+Deployment, since the bridge enters the agent pod only once the bus is provisioned (the CR's
+`BusProvisioned` condition). The step ends on the bridge's own log line that it is consuming
+`platform` tasks, because an install without a consuming bridge leaves a bus on which nobody
+answers, then gates the verifier's rollout and the web console (its read routes and a chat
+turn, through the console's port-forward). It reports the A2A gateway's state and last log lines and does not gate on it: a gateway
+that is down is what the harness classifies as infrastructure on every case, and gating it is
+the change that follows the first measured run through the door. The door is armed through an
+operator environment variable, the pattern the A2A image overrides use, and not through a CRD
+field (decided 2026-09-17 by the A2A owner on the adapter's issue): the door maps a body-supplied
+principal, and nothing a customer can set on a `PlatformAgent` may render it. The rendered object
+set with the operator variable unset carries no inject Service, env or NetworkPolicy, and that is a
+property for the conformance suite to check rather than a comment to trust. The A2A images and the
+bridge image are built in the same Cloud Build as the other images (two steps of their own) and
+set on the operator, because its defaults point at a registry the pool projects cannot pull from.
 
-Under the flag a run on `main` also checks the rollback path once the suite verdict is computed and
-before the final line announces it (a pull request's run, `JOB_TYPE` presubmit or batch, skips it,
-since nobody reads the report there and the today lane below proves the same path):
-`hack/rollback-roundtrip.sh` flips the install to `today`
-and back to `next`, with any CR-declared `spec.deployment.sidecars` unset before the first flip
-and declared again after the second (the lane declares none: the bridge the operator renders
-leaves and returns with the mode), and asserts that the JetStream PVC and the bus creds Secret keep their
-UIDs, that the agent answers a turn under `today`, that a task completes over the bus
-afterwards, and, before the first flip and after each leg, that the web console's read routes
-answer and a chat turn through it gets a reply (a `SKIP` on an install with no console, which the
-lane always has). It is reported, not gated: its own section of the log and two artifacts
-(`rollback-roundtrip.log`, `rollback-roundtrip.txt`), no case in the matrix, and no effect
-on the job's exit status. It is skipped when the job is too old for its one-hour bound to end
-inside the job's deadline, counted from its Prow `BUILD_ID` or, when that gives no start, from
-the eval script's own start plus an allowance for the deploy in front of it. It is also skipped
-on a release-candidate run (`RC_COMMIT_SHA` set): the promotion waits on that job finishing, so
-an hour of report-only round trip would come out of the verdict poller's 330 minutes. The eval's gateway
-log and pod diagnostics are collected before it starts, because the flip replaces the pods
-they come from.
+`hack/ci-eval-pr.sh` runs every matrix through the door: it exports `AGENT_TRANSPORT=inject` and
+`AGENT_INJECT_TOKEN`, read from the token Secret the operator renders beside the door. The inject
+lane's exclusion list (`hack/eval/inject-lane-exclusions.txt`) leaves out the cases whose premise
+needs the chat front door; a listed case therefore runs on no CI lane until its entry goes. The
+deploy arms the card stop (`A2A_CARD_STOP`) on the install, which the stopped-ask cases grade, and
+turns on the gateway's A2A door (`A2A_AGENT_DOOR`) for the card-wait stopped ask, which cancels a
+door task while its turn holds for its cards; the script exports that door's own token
+(`AGENT_A2A_DOOR_TOKEN`) beside the inject one, so an eval install runs with a door a default
+install does not have. The
+lane safeguards (`hack/eval/inject-lane-safeguards.yaml`) are appended to a scratch copy of every
+task file, which the unit hands devops-bench, over the leased project's GitOps repository exported
+as `BENCH_GITOPS_REPO` (the run refuses to start without one), with the cases that request a pull
+request, the stopped asks and the cases that declare `writes_alone: true` run in a second phase
+after every first-phase unit (a case that declares `scope_exclude:` runs after them, in a phase
+of its own), one at a time and each after a settle, so no repetition that requests nothing shares
+the repository with one that writes by design and no window reaches back into the unit before;
+and after the fan-out the script lists in the job log what the run left on that repository,
+closing nothing.
 
-Where the flag is set is the Prow job's choice, not a script default, and since `next` became the
-mode a new install gets, the merge-blocking presubmit sets it: every pull request is graded on
-`next` through the door. `today` stays supported as the rollback, so a second lane proves that
-path. The today lane (`pull-kube-agents-smoke-test-today`, on pull requests that touch the round trip, or on demand) sets the flag together with
-`EVAL_ROLLBACK_LANE=1`: the deploy is the flagged one, and `hack/ci-eval-pr.sh` then runs
-`hack/rollback-roundtrip.sh` with `ROLLBACK_END_MODE=today` before the matrix, which adds a third
-leg (`next` to `today` again, with the first leg's checks) and leaves the install rolled back. The
-matrix runs over the agent API on that install, with no exclusion list and no lane safeguards,
-and a rollback that fails stops the run red rather than being reported beside it. The deploy
-refuses `EVAL_ROLLBACK_LANE=1` without the flag, before anything is built.
+A run on `main` records under the version key's `next` mode
+([`bench/baselines/README.md`](../../bench/baselines/README.md)), and rung 6 compares only with
+history at that key (agent model included; the main nightly and the presubmit run the same one).
+The dashboard's Trend page keeps a series per mode: it draws `next` by default, and the legacy
+`today` series stays selectable from the lines the store already holds until they age out of
+its window; its Nightly page reads the main nightly's runs, so it shows `next`.
 
-The flag admits those jobs by name and nothing else without a pull request: section 2b of the
-deploy accepts `EVAL_MODE_NEXT=1` on a run that carries a `PULL_NUMBER` or whose `JOB_NAME` is
-listed in `EVAL_MODE_NEXT_JOB_NAMES` in `hack/ci-deploy.sh` (the merge-blocking presubmit, for
-the batch runs Tide started, the main nightly's eight parts
-`ci-kube-agents-eval-nightly`, `ci-kube-agents-eval-nightly-main-b` to `-main-e`,
-`ci-kube-agents-eval-nightly-writers`, `-writers-b` and `-writers-c`, the GitLab lane's nightly
-under next, the GHES and GitLab CE lanes' weekly jobs under next (`ci-kube-agents-eval-weekly-ghes-next`, `ci-kube-agents-eval-weekly-gitlab-ce-next`), the certification lane's first slice (`ci-kube-agents-certification-1`), the release-candidate eval's postsubmit, which grades a candidate in the mode a new
-install gets, the replay lane (`ci-kube-agents-eval-replay-lane`) and the Slack lane's nightly (`ci-kube-agents-eval-nightly-slack`)), and refuses it on any other Prow run, so the flag mis-set on another periodic or
-postsubmit still stops the deploy before anything is built. A next-mode run has a record of its own: the baseline version key carries the mode, which
-`bench-gate` reads off the inject transport ([`bench/baselines/README.md`](../../bench/baselines/README.md)),
-so the main nightly appends under a `next` key that today's window never reads, and rung 6 on the
-inject lane compares only with next-mode history at its own key (agent model included; the main
-nightly and the presubmit run the same one). The today lane is the rollback check, and it stays
-out of the recorder and the dashboard publisher (`EVAL_ROLLBACK_LANE=1`): its key reads `today`,
-but it grades a rolled-back install. No job appends today's window now. The dashboard's Trend page
-keeps a series per mode: it draws `next` by default, and today's stays selectable from the lines
-the store already holds until they age out of its window; its Nightly page
-reads the main nightly's runs, so it shows `next`.
+**History.** While `spec.mode: today` existed, `EVAL_MODE_NEXT=1` on a Prow job chose this path:
+the deploy installed `today`, proved it, then flipped the install to `next` through the chart's
+`platformAgent.mode` and gated the stack; the eval script exported the inject transport under the
+same flag, and an api-lane exclusion list (`hack/eval/api-lane-exclusions.txt`) kept the cases only
+the door can carry off the lanes that graded over the agent API. A second lane,
+`pull-kube-agents-smoke-test-today` (`EVAL_ROLLBACK_LANE=1`), proved the rollback path with
+`hack/rollback-roundtrip.sh` (`next` to `today` and back, the JetStream PVC and the bus creds
+Secret keeping their UIDs) and graded the rolled-back install over the agent API, gating nothing;
+a report-only round trip after the verdict ran the same script on `main`. The mode, the flag,
+the lane, the round trip and the api-lane list retired together; a Prow job that still exports
+`EVAL_MODE_NEXT=1` is ignored.
 
 ## Open questions
 

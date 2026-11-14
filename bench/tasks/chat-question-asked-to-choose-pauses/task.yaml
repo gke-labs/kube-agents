@@ -23,8 +23,8 @@
 # shape reaches: it reads the report's normalized text (lowercased, `*`, `_`
 # and backticks dropped), so it refuses a `*` bullet list, and it accepts a
 # list after a "Shall I proceed?" that the parser leaves as text. Only the
-# inject lane's board read produces the question section, so the case is on
-# hack/eval/api-lane-exclusions.txt.
+# inject lane's board read produces the question section, so the case needs
+# the inject door, which every CI lane grades through.
 #
 # What it does not grade: the click, or the work after the answer. The block
 # ends the run (blocked is terminal to the harness's wait), so the case grades

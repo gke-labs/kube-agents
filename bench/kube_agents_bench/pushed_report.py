@@ -30,13 +30,12 @@ What it grades is the hermes-bridge's read of that row before the turn
 (``a2a/hermes-bridge/incident.go``): under ``spec.mode: next`` a reply under
 a report the relay or the notifier pushed reaches the bridge with no link to
 the report, and the bridge attaches the stored report ahead of the user's
-words, as the Hermes gateway's ``incident_context`` hook does under today.
+words, as the Hermes gateway's ``incident_context`` hook did before the bus.
 A case asks about a detail only the report carries; an agent that has the
 report answers it, and one that does not cannot.
 
-It runs on the inject transport only: the API server has no conversation
-the bridge keys the row to. A case that uses it lists itself in
-``hack/eval/api-lane-exclusions.txt``.
+It runs on the inject transport only, which every CI lane uses: the API
+server has no conversation the bridge keys the row to.
 
 The plant records :data:`PLANT_ENTRY` on the run's trajectory with status
 ``completed``, so a case's ``tool_called`` objective with
