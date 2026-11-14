@@ -1796,8 +1796,8 @@ class VcsBroker:
         `revision`'s commits are fetched into a scratch repository, never
         checked out, and the fetch is stopped at the clone's size ceiling
         (`CLONE_TOO_LARGE`). `revision` is a full id, since it is what is
-        fetched; `ancestor` may be abbreviated (Bitbucket Cloud's
-        `mergeCommit` is 12 characters) and is resolved after the fetch. A
+        fetched; `ancestor` may be abbreviated (a forge can report a
+        merge commit by a short id) and is resolved after the fetch. A
         revision the remote does not have is `REVISION_NOT_FOUND`; an
         untrusted certificate or a refused credential is answered by its
         cause, and any other failed fetch is the retryable `FORGE_CALL_FAILED`.
