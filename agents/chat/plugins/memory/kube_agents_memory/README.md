@@ -1,10 +1,11 @@
 # `kube_agents_memory` — the Hindsight-backed memory provider
 
 A thin wrapper around the memory provider Hermes already ships (`plugins/memory/hindsight`).
-Everyone's memory lives in one bank, `kube-agents-memory`, and a **scope tag** on every fact is
-what separates one person's from another's: `user:<id>` for a private memory, `scope:shared` for
-one the whole organisation can read. Recall asks for the current user's tag plus the shared tag,
-and nothing else can come back.
+Everyone's conversational memory lives in one bank, `kube-agents-memory`, and a **scope tag** on
+every fact is what separates one person's from another's: `user:<id>` for a private memory,
+`scope:shared` for one the whole organisation can read (with `kind:handoff` marking ephemeral
+iteration-budget checkpoints). Recall asks for the current user's tag plus the shared tag, and on
+shared reads also merges structured `DEC-*`/`LES-*` records over NATS when `curator` is configured.
 
 Nearly all of the code is there because Hindsight has no way to learn the _current user's id_ —
 its `{user}` substitution is wired to `bank_id` alone, so `retain_tags: "user:{user_id}"` tags
@@ -23,9 +24,9 @@ Hermes base-image bump brings its fixes along with no merge to redo.
 
 | Module                                 | Holds                                                                                   | A change here is                     |
 | -------------------------------------- | --------------------------------------------------------------------------------------- | ------------------------------------ |
-| [`config_schema.py`](config_schema.py) | Bank name, the two scope tags, retain strategies and missions, the profile-config reads | a data-migration question            |
+| [`config_schema.py`](config_schema.py) | Bank name, scope and handoff tags, retain strategies and missions, profile-config reads | a data-migration question            |
 | [`prompts.py`](prompts.py)             | System prompt variants, tool schemas, the guidance strings a result carries             | an agent-behaviour question          |
-| [`client.py`](client.py)               | The only code that touches the stock provider or its generated client                   | where a Hermes base-image bump lands |
+| [`client.py`](client.py)               | Stock provider and generated-client calls plus NATS `curator recall` integration        | where a Hermes base-image bump lands |
 | [`session.py`](session.py)             | The provider class: identity, session states, tool dispatch                             | the wrapper's own logic              |
 
 Three things outside this package restate the constants in `config_schema.py` and must be kept in

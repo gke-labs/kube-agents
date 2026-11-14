@@ -41,7 +41,8 @@ try:
 except (ImportError, ValueError):
     import _stubs  # type: ignore # noqa: F401
 
-from kube_agents_memory import SHARED_TAG, KubeAgentsMemoryProvider  # noqa: E402
+from unittest.mock import patch  # noqa: E402
+from kube_agents_memory import SHARED_TAG, KubeAgentsMemoryProvider, client as memory_client  # noqa: E402
 
 PLUGIN_DIR = os.path.join(
     _REPO, "agents", "chat", "plugins", "memory", "kube_agents_memory"
@@ -150,6 +151,78 @@ class TestRecallReporting(unittest.TestCase):
         self.assertIn("Memory is a search, not an index", p.system_prompt_block())
         p._user_tag = ""  # shared-only variant
         self.assertIn("Memory is a search, not an index", p.system_prompt_block())
+
+    def test_prefetch_and_recall_merge_nats_decisions(self):
+        """Prefetch and shared recall include structured DEC-*/LES-* records from NATS."""
+        p, _ = provider(results=[])
+        p._hindsight.prefetch = lambda query, session_id="": ""
+        dec_text = "[DEC-2026-004] [STATUS: REJECTED — do not enforce as active policy]\nNo infrastructure PR merges on Fridays"
+        with patch.object(memory_client, "recall_decisions", return_value=[dec_text]):
+            prefetched = p.prefetch("Can we merge on Friday?", session_id="s1")
+            self.assertIn("# Memory", prefetched)
+            self.assertIn("DEC-2026-004", prefetched)
+            self.assertIn("STATUS: REJECTED", prefetched)
+
+            shared_res = json.loads(
+                p.handle_tool_call("memory_recall", {"query": "Friday", "scope": "shared"})
+            )
+            self.assertEqual(shared_res["status"], "found")
+            self.assertEqual(shared_res["matches"], 1)
+            self.assertIn("DEC-2026-004", shared_res["result"])
+
+            personal_res = json.loads(
+                p.handle_tool_call("memory_recall", {"query": "Friday", "scope": "personal"})
+            )
+            self.assertEqual(personal_res["status"], "no_match")
+
+            reflect_res = json.loads(
+                p.handle_tool_call("memory_reflect", {"query": "Friday", "scope": "shared"})
+            )
+            self.assertEqual(reflect_res["status"], "found")
+            self.assertIn("DEC-2026-004", reflect_res["result"])
+            self.assertIn("STATUS: REJECTED", reflect_res["result"])
+
+    def test_recall_decisions_extracts_okf_id_and_status_from_document_id_and_tags(self):
+        """Hindsight recall results with UUID ids preserve OKF record IDs and status headers,
+        and leading-dash queries travel safely via --query.
+        """
+        fake_stdout = json.dumps(
+            {
+                "results": [
+                    {
+                        "id": "b1925c0e-1111-2222-3333-444455556666",
+                        "document_id": "okf:acme/infra:DEC-2026-004",
+                        "text": "No infrastructure PR merges on Fridays",
+                        "tags": ["scope:shared", "kind:decision", "status:rejected"],
+                    },
+                    {
+                        "id": "c2925c0e-1111-2222-3333-444455556666",
+                        "document_id": "okf:acme/infra:LES-2026-011",
+                        "text": "Keep checkout memory >= 256Mi",
+                        "tags": ["scope:shared", "kind:lesson", "status:proposed"],
+                    },
+                ],
+                "records": [],
+            }
+        )
+        seen_cmds = []
+
+        def fake_run(cmd, **kwargs):
+            seen_cmds.append(cmd)
+            return SimpleNamespace(returncode=0, stdout=fake_stdout, stderr="")
+
+        with patch.dict(os.environ, {"NATS_URL": "nats://localhost:4222"}), \
+             patch.object(memory_client, "_resolve_curator_bin", return_value="/usr/local/bin/curator"), \
+             patch("subprocess.run", side_effect=fake_run):
+            hits = memory_client.recall_decisions("-n kubeagents-system pod crash")
+
+        self.assertEqual(
+            seen_cmds,
+            [["/usr/local/bin/curator", "recall", "--query", "-n kubeagents-system pod crash"]],
+        )
+        self.assertEqual(len(hits), 2)
+        self.assertIn("[DEC-2026-004] [STATUS: REJECTED — do not enforce as active policy]", hits[0])
+        self.assertIn("[LES-2026-011] [STATUS: PROPOSED — awaiting pull request review; not yet active policy]", hits[1])
 
 
 if __name__ == "__main__":

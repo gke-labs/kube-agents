@@ -63,11 +63,11 @@ RECALL_PREAMBLE = (
 NO_MATCH_GUIDANCE = (
     "The store was reachable and answered: this query matched nothing. That is "
     "not the same as the record not existing. Recall is a semantic search that "
-    "returns top matches over the consolidated layer, so a record phrased "
-    "differently, held under a scope not searched here, or retained but not yet "
-    "consolidated will not surface. Do not report that something does not exist "
-    "on the strength of this result — report that the search did not surface it, "
-    "and try an exact identifier, different wording, or a wider scope."
+    "returns top matches within the queried scope and lookback window, so a "
+    "record phrased differently, held under a scope not searched here, or "
+    "outside `since_hours` will not surface. Do not report that something does "
+    "not exist on the strength of this result — report that the search did not "
+    "surface it, and try an exact identifier, different wording, or a wider scope."
 )
 UNREACHABLE_GUIDANCE = (
     "Memory could not be reached, so nothing was searched. This is a failure of "
@@ -263,6 +263,15 @@ def tool_schemas(
                     "content": {"type": "string", "description": "The fact to store, phrased to stand on its own."},
                     "scope": scope_write,
                     "context": {"type": "string", "description": "Short label (e.g. 'user preference', 'team standard')."},
+                    "kind": {
+                        "type": "string",
+                        "enum": ["fact", "handoff"],
+                        "description": (
+                            "Kind of entry to store: 'fact' (default durable fact or decision) or "
+                            "'handoff' (iteration-budget investigation checkpoint with verified findings, "
+                            "ruled-out hypotheses, and remaining next steps so a follow-up session can resume)."
+                        ),
+                    },
                 },
                 "required": ["content"],
             },
@@ -284,6 +293,13 @@ def tool_schemas(
                 "properties": {
                     "query": {"type": "string", "description": "What to search for."},
                     "scope": scope_read,
+                    "since_hours": {
+                        "type": "integer",
+                        "description": (
+                            "Optional lookback window in hours (e.g. 8, 12, or 24 for shift handover) "
+                            "to filter recalled memories to recent operational events and handoffs."
+                        ),
+                    },
                 },
                 "required": ["query"],
             },

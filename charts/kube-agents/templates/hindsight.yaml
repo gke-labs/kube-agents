@@ -370,9 +370,11 @@ rendered manifest; keep it true of every shape the values can render.
 {{- $apiEgress := or .Values.litellm.enabled (gt (len $apiAdditionalEgress) 0) }}
 {{- if $apiNetworkPolicy }}
 ---
-# Confines hindsight-api's ingress to pods in the release namespace (the agent
-# gateway and its workers) and the GKE Managed Prometheus collector namespace
-# on TCP 8888, and its egress to cluster DNS, hindsight-postgresql on TCP 5432,
+# Confines hindsight-api's ingress on TCP 8888 to trusted gateway and
+# credential-proxy pods in the release namespace (explicitly excluding
+# shell-sandbox StatefulSet pods, kube-proxy, and session/worker pods) and the
+# GKE Managed Prometheus collector namespace, and its egress to cluster DNS,
+# hindsight-postgresql on TCP 5432,
 # and the in-cluster inference gateway (LiteLLM or standalone-replay) on TCP
 # 80, 4000, and 8080. Models are baked into the image (HF_HUB_OFFLINE=1,
 # TRANSFORMERS_OFFLINE=1) and the pod holds no cloud identity, so neither
@@ -405,7 +407,20 @@ spec:
     {{- end }}
   ingress:
     - from:
-        - podSelector: {}
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: platform-agent
+              app.kubernetes.io/part-of: kube-agents
+            matchExpressions:
+              - key: statefulset.kubernetes.io/pod-name
+                operator: DoesNotExist
+              - key: kubeagents.x-k8s.io/component
+                operator: NotIn
+                values:
+                  - kube-proxy
+        - podSelector:
+            matchLabels:
+              kubeagents.x-k8s.io/a2a-component: gateway
       ports:
         - port: 8888
           protocol: TCP

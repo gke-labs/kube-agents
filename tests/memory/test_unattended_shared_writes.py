@@ -108,7 +108,7 @@ class TestUnattendedSharedWrites(unittest.TestCase):
         """
         p, retained = provider()
         r = json.loads(p.handle_tool_call("memory_retain", {
-            "content": "Dataplane V2 is off on kage-management, so NetworkPolicies are inert."
+            "content": "Dataplane V2 is off on staging-cluster-1, so NetworkPolicies are inert."
         }))
         self.assertEqual(r.get("result"), "Stored in shared memory.", r)
         self.assertEqual(retained["items"][0]["tags"], [SHARED_TAG], retained)
@@ -131,7 +131,7 @@ class TestUnattendedSharedWrites(unittest.TestCase):
         """
         p, retained = provider(unattended=False)
         r = json.loads(p.handle_tool_call("memory_retain", {
-            "content": "Dmitry is on call for networking next week.",
+            "content": "Alice is on call for networking next week.",
         }))
         self.assertIn("error", r, r)
         self.assertEqual(r["error"], SHARED_SESSION_NOTICE, r)
@@ -254,6 +254,112 @@ class TestUnattendedSharedWrites(unittest.TestCase):
                 )
             ]
             self.assertNotIn("memory_retain", names, names)
+
+    def test_shared_write_stores_only_in_conversational_hindsight_bank(self):
+        """Chat shared writes remain in Layer 1 (`kube-agents-memory`) without
+        shelling out to Curator or opening GitOps pull requests.
+        """
+        from unittest.mock import patch
+
+        p, retained = provider(unattended=False)
+        with patch.dict(
+            os.environ,
+            {"NATS_URL": "nats://localhost:4222"},
+        ), patch("subprocess.run") as run_mock:
+            r = json.loads(
+                p.handle_tool_call(
+                    "memory_retain",
+                    {"content": "Keep shared rules in Hindsight without opening GitHub PRs.", "scope": "shared"},
+                )
+            )
+            run_mock.assert_not_called()
+            self.assertEqual(r.get("result"), "Stored in shared memory.", r)
+            self.assertEqual(retained["items"][0]["tags"], [SHARED_TAG], retained)
+
+    def test_handoff_checkpoint_stores_under_checkpoint_strategy_with_isolated_observation_scope(self):
+        """Iteration-budget handoff checkpoints work in unattended and group sessions,
+        refuse implicit DM disclosure, and isolate observation_scopes from scope:shared.
+        """
+        from kube_agents_memory.config_schema import CHECKPOINT_STRATEGY, HANDOFF_TAG
+
+        # 1. Unattended session: kind='handoff' defaults to shared with isolated observation_scopes.
+        p, retained = provider(unattended=True)
+        p._session_id = "sess-42"
+        r = json.loads(
+            p.handle_tool_call(
+                "memory_retain",
+                {
+                    "content": "Verified: checkout OOM is not caused by HPA. Remaining: inspect Redis pool.",
+                    "kind": "handoff",
+                },
+            )
+        )
+        self.assertEqual(r.get("kind"), "handoff", r)
+        self.assertEqual(retained["items"][0]["strategy"], CHECKPOINT_STRATEGY, retained)
+        self.assertIn(HANDOFF_TAG, retained["items"][0]["tags"], retained)
+        self.assertIn("session:sess-42", retained["items"][0]["tags"], retained)
+        self.assertEqual(retained["items"][0]["observation_scopes"], [[HANDOFF_TAG, "session:sess-42"]])
+
+        # 2. Unattributed group thread (unattended=False, _user_tag=''): kind='handoff' also works without scope='shared'.
+        p_group, retained_group = provider(unattended=False)
+        p_group._session_id = "thread-9"
+        r_group = json.loads(
+            p_group.handle_tool_call(
+                "memory_retain",
+                {"content": "Group incident handoff note.", "kind": "handoff"},
+            )
+        )
+        self.assertEqual(r_group.get("kind"), "handoff", r_group)
+        self.assertEqual(retained_group["items"][0]["observation_scopes"], [[HANDOFF_TAG, "session:thread-9"]])
+
+        # 3. Attributed DM (_user_tag='user:alice'): implicit kind='handoff' is refused so private DM content never leaks to shared.
+        p_dm, retained_dm = provider(unattended=False)
+        p_dm._user_tag = "user:alice"
+        r_dm = json.loads(
+            p_dm.handle_tool_call(
+                "memory_retain",
+                {"content": "Private DM investigation note.", "kind": "handoff"},
+            )
+        )
+        self.assertIn("error", r_dm, r_dm)
+        self.assertFalse(retained_dm, retained_dm)
+
+    def test_recall_since_hours_filters_older_and_undated_items_and_prefers_ingestion_time(self):
+        """Shift-handover recall with `since_hours` keeps recent items (even if text cites
+        an old date) and drops stale or undated items.
+        """
+        from datetime import datetime, timedelta, timezone
+        from unittest.mock import patch
+        from kube_agents_memory import client as kam_client
+
+        p, _ = provider(unattended=True)
+        now = datetime.now(timezone.utc)
+        recent_ts = (now - timedelta(hours=2)).isoformat()
+        stale_ts = (now - timedelta(hours=36)).isoformat()
+        fake_results = [
+            SimpleNamespace(
+                text="Since the 2026-10-01 upgrade, checkout handoff note",
+                mentioned_at=recent_ts,
+                occurred_start="2026-10-01T00:00:00+00:00",
+            ),
+            SimpleNamespace(text="Old staging alert from two days ago", mentioned_at=stale_ts),
+            SimpleNamespace(text="Timeless undated consolidated observation"),
+        ]
+        with patch.object(kam_client, "recall", return_value=fake_results), \
+             patch.object(kam_client, "recall_decisions", return_value=["[DEC-2026-001]\nOld rule"]):
+            r = json.loads(
+                p.handle_tool_call(
+                    "memory_recall",
+                    {"query": "shift handover", "scope": "shared", "since_hours": 12},
+                )
+            )
+            self.assertEqual(r["status"], "found", r)
+            self.assertEqual(r["matches"], 1, r)
+            self.assertEqual(r["searched"].get("since_hours"), 12, r)
+            self.assertIn("checkout handoff note", r["result"], r)
+            self.assertNotIn("Old staging alert", r["result"], r)
+            self.assertNotIn("Timeless undated", r["result"], r)
+            self.assertNotIn("DEC-2026-001", r["result"], r)
 
 
 if __name__ == "__main__":
