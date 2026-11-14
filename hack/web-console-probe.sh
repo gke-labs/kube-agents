@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# The web console probe, shared by hack/ci-deploy.sh and hack/rollback-roundtrip.sh
+# The web console probe hack/ci-deploy.sh sources
 # ==============================================================================
 # Sourced, not run. One pass over the web console (a2a/cmd/web-console) at a
 # base URL, the way a browser behind `kubectl port-forward` reaches it: the
 # health route, the page, the read routes (200 and a JSON object, the two
 # metadata routes with the keys the page reads), one chat turn into a fresh
 # console session, and the session's messages, which must show the user's row
-# and the assistant's. The deploy's gate runs it under today and under next;
-# the round trip runs it after pre and after every flip. One copy, so what
-# counts as a pass, and what is worth another tunnel, cannot drift between
-# the two (#2462).
+# and the assistant's. The deploy's gate runs it once, at the end of its A2A
+# gates. One file of its own, so what counts as a pass, and what is worth
+# another tunnel, cannot drift when a second caller sources it (#2462).
 #
 # The caller owns the tunnel and the retry loop. web_console_probe returns 0
 # on a pass, WEB_CONSOLE_PROBE_RETRY for an answer a fresh tunnel or another

@@ -2104,7 +2104,7 @@ class SyncProfileSkillsTest(unittest.TestCase):
             self.assertFalse((tmp / "profile" / self.OLD).exists())
 
     def test_no_overlay_leaves_the_template_alone(self):
-        """A today install passes an empty $3 — the flip-back self-clean. The
+        """An image without /opt/a2a-template/skills passes an empty $3. The
         skill is gone because the swap rebuilt skills/ from the template only."""
         with tempfile.TemporaryDirectory() as tmp:
             tmp = pathlib.Path(tmp)
@@ -3258,132 +3258,91 @@ class NpmCacheShareTest(unittest.TestCase):
         self.assertFalse((target / ".cache").exists())
 
 
-class A2AModeProbeTest(unittest.TestCase):
-    """Step 2.6a-bis gates the A2A skill overlay on runtime_mode.is_next().
+class A2ASkillOverlayStepTest(unittest.TestCase):
+    """Step 2.6a-bis overlays the A2A topics skill into the platform profile on every boot.
 
-    The probe hands the operator's managed .env to Python and lets runtime_mode —
-    the one agent-side reader the mode spec allows — answer. Exit meanings:
-    0 next (overlay), 1 today or no managed scope (skip silently), 2 no readable
-    managed env (skip with a warning; on an operator-managed install that is a
-    fault the skill's silent absence would otherwise hide).
+    Every install runs the A2A stack, so nothing gates the overlay: no managed
+    .env key, no container environment. The step passes the image's skill tree
+    to sync_profile_skills as $3 whenever the image ships it, and the template
+    alone when it does not.
 
-    The parse is the strict KEY=value renderManagedEnv writes, never `.`-sourced:
-    the entrypoint is pid 1, and sourcing would execute whatever a value that
-    grew a space turned into. That property is asserted here, not just claimed.
+    The shipped block is run as written, with one substitution: the image path
+    of the skill tree (`/opt/a2a-template/skills`) is pointed at a directory
+    under the test's temp root, since the host has no such tree.
     """
 
-    def _probe(self, managed_env, pwned_marker=None, extra_env=None, reader=True):
-        """Run the real probe. `managed_env` is the .env body, or None for no file,
-        or ... (Ellipsis) for HERMES_MANAGED_DIR unset entirely.
+    OPENER = 'if [ -d "$TARGET_DIR/profiles/platform" ] && [ -d "$PLATFORM_TEMPLATE" ]; then'
+    IMAGE_SKILLS = "/opt/a2a-template/skills"
+    OVERLAY_LINE = "Overlaying the A2A topics skill into the platform profile"
 
-        `extra_env` adds process environment the container would have inherited.
-        `reader=False` drops runtime_mode off the path, standing in for a broken
-        image.
+    def _tree(self, root, **files):
+        root = pathlib.Path(root)
+        root.mkdir(parents=True, exist_ok=True)
+        for name, body in files.items():
+            (root / name).write_text(body, encoding="utf-8")
+        return root
+
+    def _run(self, tmp, ship_skill=True, managed_env=None, extra_env=None):
+        """Run the shipped step against a template and a profile under `tmp`.
+
+        `ship_skill` plants the image's skill tree; `managed_env` writes an
+        operator-managed .env the old gate used to read; `extra_env` adds
+        container environment. Neither of the last two may change the answer.
         """
-        script = f"{_extract_shell_function('a2a_mode_probe')}\na2a_mode_probe\n"
+        tmp = pathlib.Path(tmp)
+        self._tree(tmp / "template" / "skills", **{"platform.md": "shipped"})
+        self._tree(tmp / "data" / "profiles" / "platform" / "skills", **{"stale.md": "x"})
+        a2a_skills = tmp / "a2a" / "skills"
+        if ship_skill:
+            self._tree(a2a_skills, **{"a2a-topics.md": "bus"})
+        block = _extract_shell_block(self.OPENER).replace(self.IMAGE_SKILLS, str(a2a_skills))
+        script = f"set -e\n{_extract_shell_function('sync_profile_skills')}\n{block}echo DONE\n"
+        env = {
+            "PATH": "/usr/bin:/bin",
+            "HOSTNAME": "test-pod-0",
+            "TARGET_DIR": str(tmp / "data"),
+            "PLATFORM_TEMPLATE": str(tmp / "template"),
+        }
+        if managed_env is not None:
+            managed = tmp / "managed"
+            managed.mkdir()
+            (managed / ".env").write_text(managed_env, encoding="utf-8")
+            env["HERMES_MANAGED_DIR"] = str(managed)
+        if extra_env:
+            env.update(extra_env)
+        proc = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=60, env=env)
+        installed = sorted(p.name for p in (tmp / "data" / "profiles" / "platform" / "skills").iterdir())
+        return proc, installed
+
+    def test_the_skill_is_overlaid_with_no_mode_anywhere(self):
         with tempfile.TemporaryDirectory() as tmp:
-            tmp = pathlib.Path(tmp)
-            # The image runs the probe on $INSTALL_DIR's venv Python and imports
-            # runtime_mode from /opt/defaults/scripts; neither exists on a host.
-            # The venv is faked with a symlink and the module comes in through
-            # PYTHONPATH — sys.path.insert of an absent directory is harmless, so
-            # the probe under test is byte-identical to the one the image runs.
-            (tmp / ".venv" / "bin").mkdir(parents=True)
-            (tmp / ".venv" / "bin" / "python3").symlink_to(sys.executable)
-            env = {
-                "PATH": "/usr/bin:/bin",
-                "INSTALL_DIR": str(tmp),
-            }
-            if reader:
-                env["PYTHONPATH"] = str(_REPO / "agents" / "platform" / "scripts")
-            if extra_env:
-                env.update(extra_env)
-            if managed_env is not Ellipsis:
-                managed = tmp / "managed"
-                managed.mkdir()
-                env["HERMES_MANAGED_DIR"] = str(managed)
-                if managed_env is not None:
-                    body = managed_env
-                    if pwned_marker:
-                        body = body.replace("{MARKER}", str(pwned_marker))
-                    (managed / ".env").write_text(body, encoding="utf-8")
-            return subprocess.run(
-                ["sh", "-c", script], capture_output=True, text=True, timeout=60, env=env
-            )
+            proc, installed = self._run(tmp)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("DONE", proc.stdout)
+            self.assertIn(self.OVERLAY_LINE, proc.stdout)
+            self.assertEqual(installed, ["a2a-topics.md", "platform.md"])
 
-    def test_next_answers_overlay(self):
-        proc = self._probe("API_SERVER_KEY=x\nKUBEAGENTS_MODE=next\n")
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-
-    def test_today_answers_skip(self):
-        proc = self._probe("API_SERVER_KEY=x\nKUBEAGENTS_MODE=today\n")
-        self.assertEqual(proc.returncode, 1, proc.stderr)
-
-    def test_an_unrecognized_mode_fails_closed(self):
-        """runtime_mode's own rule, exercised through the probe: the dark stack
-        stays dark from both sides of the boundary."""
-        proc = self._probe("KUBEAGENTS_MODE=quantum\n")
-        self.assertEqual(proc.returncode, 1, proc.stderr)
-
-    def test_a_pin_free_env_reads_as_today(self):
-        proc = self._probe("API_SERVER_KEY=x\n")
-        self.assertEqual(proc.returncode, 1, proc.stderr)
-
-    def test_a_missing_managed_env_is_reported_not_conflated(self):
-        proc = self._probe(None)
-        self.assertEqual(proc.returncode, 2, proc.stderr)
-
-    def test_no_managed_scope_at_all_skips_silently(self):
-        """Unset HERMES_MANAGED_DIR is a non-operator start (compose, docker run),
-        not a fault — the same marker every other managed-scope step gates on."""
-        proc = self._probe(Ellipsis)
-        self.assertEqual(proc.returncode, 1, proc.stderr)
-
-    def test_the_inherited_container_env_cannot_decide_the_mode(self):
-        """The managed file is the ONLY delivery path, which is the spec's whole
-        point — one answer per agent, computed in one place.
-
-        This is not hypothetical: an AgentPlugin's spec.env is copied into the
-        agent container verbatim with no allowlist, so a plugin can put this key
-        in the process environment. Before os.environ.clear() the probe read it
-        whenever the file was silent, which made the plugin a second writer of a
-        decision the operator owns. Found by adversarial review before this
-        shipped.
-        """
-        # Key absent from the file entirely: the inherited value must not fill in.
-        proc = self._probe("API_SERVER_KEY=x\n", extra_env={"KUBEAGENTS_MODE": "next"})
-        self.assertEqual(proc.returncode, 1, proc.stderr)
-        # And the file still wins when the two disagree.
-        proc = self._probe(
-            "KUBEAGENTS_MODE=today\n", extra_env={"KUBEAGENTS_MODE": "next"}
-        )
-        self.assertEqual(proc.returncode, 1, proc.stderr)
-
-    def test_a_malformed_line_is_skipped_not_called_unreadable(self):
-        """An empty key is not a pin. os.environ refuses one, and letting that
-        raise reported a perfectly readable file as missing."""
-        proc = self._probe("=x\nKUBEAGENTS_MODE=next\n")
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-
-    def test_a_missing_reader_is_a_fault_not_a_decision(self):
-        """A broken image must not read as 'today' behind a bare traceback: the
-        skill would be silently absent with nothing saying why."""
-        proc = self._probe("KUBEAGENTS_MODE=next\n", reader=False)
-        self.assertEqual(proc.returncode, 2, proc.stderr)
-
-    def test_a_hostile_value_is_data_not_shell(self):
-        """The reason this is a parse and not a `.`: a value carrying a space and
-        a command must neither break the gate nor run."""
-        with tempfile.TemporaryDirectory() as outside:
-            marker = pathlib.Path(outside) / "pwned"
-            proc = self._probe(
-                "SLACK_HOME_CHANNEL_NAME=general chat; touch {MARKER}\n"
-                "KUBEAGENTS_MODE=next\n",
-                pwned_marker=marker,
+    def test_a_stored_today_pin_no_longer_holds_the_skill_back(self):
+        """An operator from before the switch was removed still pins the mode
+        into the managed .env for one release; the agent image no longer reads
+        it, so a `today` pin, in the file or in the environment, overlays too."""
+        with tempfile.TemporaryDirectory() as tmp:
+            proc, installed = self._run(
+                tmp,
+                managed_env="API_SERVER_KEY=x\nKUBEAGENTS_MODE=today\n",
+                extra_env={"KUBEAGENTS_MODE": "today"},
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
-            self.assertFalse(marker.exists(), "a managed .env value was executed")
+            self.assertIn(self.OVERLAY_LINE, proc.stdout)
+            self.assertEqual(installed, ["a2a-topics.md", "platform.md"])
 
+    def test_an_image_without_the_skill_tree_syncs_the_template_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc, installed = self._run(tmp, ship_skill=False)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("DONE", proc.stdout)
+            self.assertNotIn(self.OVERLAY_LINE, proc.stdout)
+            self.assertEqual(installed, ["platform.md"])
 
 
 def _extract_nested_block(opener, indent, closer="fi"):

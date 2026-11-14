@@ -87,11 +87,12 @@ RECORD_RUNS = "runs"
 RECORD_DECISIONS = "decisions"
 RECORD_LOST_LINES = "lost_lines"
 RECORD_OBJECTS = "objects"
-# The recording job: its Prow job name, the install mode it graded (next or
-# today), its forge (github when EVAL_FORGE is unset) and the commit its
-# checkout was at (empty when git could not say; records written before it
-# have none). The lane fetches objects only from records whose mode and forge
-# match its own run's, so a GitLab or today-mode night's answers, which it
+# The recording job: its Prow job name, the install mode it graded (next; a
+# record written before every install ran the A2A stack may read today), its
+# forge (github when EVAL_FORGE is unset) and the commit its checkout was at
+# (empty when git could not say; records written before it have none). The
+# lane fetches objects only from records whose mode and forge match its own
+# run's, so a GitLab night's answers, or an old today-mode night's, which it
 # can't hit, never take its room, and replays on the newest night's commit
 # (fetch_cache.py --print-commit).
 RECORD_JOB = "job"
@@ -408,10 +409,11 @@ class Publisher:
         return report
 
 
-def job_identity(name: str, mode_next: str, forge: str, commit: str = "") -> Dict[str, str]:
-    """The record's job block from the eval's own settings (EVAL_MODE_NEXT, EVAL_FORGE) and its checkout's commit."""
-    return {JOB_NAME: name, JOB_MODE: MODE_NEXT if mode_next == "1" else MODE_TODAY,
-            JOB_FORGE: forge or DEFAULT_FORGE, JOB_COMMIT: commit}
+def job_identity(name: str, forge: str, commit: str = "") -> Dict[str, str]:
+    """The record's job block from the eval's own settings (EVAL_FORGE) and its
+    checkout's commit; every install grades the A2A stack, so the mode is
+    always next."""
+    return {JOB_NAME: name, JOB_MODE: MODE_NEXT, JOB_FORGE: forge or DEFAULT_FORGE, JOB_COMMIT: commit}
 
 
 def _size(path: str) -> int:

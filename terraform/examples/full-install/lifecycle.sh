@@ -1686,8 +1686,8 @@ delete_agent_cr() {
       -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
     # The operator's naming from k8s-operator/internal/controller
     # (platformagent_manifests.go, platformagent_controller.go, and
-    # platformagent_a2a_callout.go): cluster-scoped RBAC and the next-mode
-    # JetStream PVC that no owner reference reaps when the finalizer is stripped.
+    # platformagent_a2a_callout.go): cluster-scoped RBAC and the JetStream
+    # PVC that no owner reference reaps when the finalizer is stripped.
     agent_name="${ref##*/}"
     inst_label="${namespace}-${agent_name}"
     if [ "${#inst_label}" -gt "$K8S_LABEL_VALUE_MAX_LENGTH" ]; then

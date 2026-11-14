@@ -43,8 +43,8 @@ longer wakes the agent if Slack sends that change without a new ``edited``.
 Nothing in this repository sets ``allow_bots``, and its default drops bot posts
 anyway.
 
-The Go gateway (next mode) admits no ``message_changed`` at all
-(``slackTurnSubtypes`` in ``a2a/gateway/slack.go``), so this is today mode's half.
+The Go gateway admits no ``message_changed`` at all (``slackTurnSubtypes`` in
+``a2a/gateway/slack.go``), so this is the Hermes Slack adapter's half.
 Unconditional: the replay needs only a restart and an edit in a thread, flag or
 not.
 

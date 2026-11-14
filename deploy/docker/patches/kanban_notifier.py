@@ -220,8 +220,8 @@ CLIPPED_TAIL = (
 
 
 # The platform names as a subscription and the gateway's env carry them. The platforms whose cards get laid-out chat
-# messages (chat_ux_on) are Slack under either mode and Google Chat under
-# ``spec.mode: next``, where the A2A gateway lays a ``kube-agents.chat/v1``
+# messages (chat_ux_on) are Slack, and Google Chat where the gateway serves
+# it, which lays a ``kube-agents.chat/v1``
 # message out as text with buttons; the other patch modules read this tuple
 # rather than keep their own. The gateway's served platform is read from the
 # operator's env (kanban_chat_notify.NOTIFY_PLATFORM_ENV and
@@ -1535,8 +1535,8 @@ def store_incident_report(
 # then the wake has the creator explain the same failure in its own words.
 #
 # Both are presentation and both are gated on the flag *and* on a platform
-# the cards are drawn for (Slack, and Google Chat where the gateway serves it
-# under ``spec.mode: next``), so every other platform, and a flag-off one, gets
+# the cards are drawn for (Slack, and Google Chat where the gateway serves
+# it), so every other platform, and a flag-off one, gets
 # exactly upstream's text.
 #
 # The failure line is held, not dropped. The ping is sent before the wake is
@@ -1609,15 +1609,15 @@ def slack_ux_on(platform: object) -> bool:
 
 def chat_ux_on(platform: object) -> bool:
     """Whether ``platform``'s cards get laid-out chat messages: :func:`slack_ux_on`, or
-    Google Chat with the flag on when the gateway serves it (``spec.mode: next``).
+    Google Chat with the flag on when the gateway serves it.
 
-    Under ``next`` the A2A gateway lays a ``kube-agents.chat/v1`` message out on
+    The A2A gateway lays a ``kube-agents.chat/v1`` message out on
     Google Chat as text with buttons, so the plan, the moments, the answer and
-    the failure reply go to it as they go to Slack. Under ``today`` Google
-    Chat is Hermes's own adapter, which takes text, and nothing is served, so
+    the failure reply go to it as they go to Slack. Where Hermes's own Google
+    Chat adapter is the consumer it takes text, and nothing is served, so
     this reads False there as before. The Slack-API paths (reactions, Agent
     Sessions, ``chat.update``) keep their own Slack gates; a Google Chat card
-    under ``next`` is delivered by the chat.notify stand-in, which has none.
+    is delivered by the chat.notify stand-in, which has none.
     """
     name = str(platform or "").strip().lower()
     if name == SLACK_PLATFORM:
@@ -1628,7 +1628,7 @@ def chat_ux_on(platform: object) -> bool:
 
 
 def gateway_serves(platform: object) -> bool:
-    """Whether the A2A gateway serves ``platform``'s posts (``spec.mode: next``): a
+    """Whether the A2A gateway serves ``platform``'s posts: a
     platform the operator names in the ``A2A_NOTIFY_PLATFORM`` (home posts) or
     ``A2A_NOTIFY_CONVERSATIONS`` (conversations) list, as kanban_chat_notify reads them."""
     name = str(platform or "").strip().lower()
@@ -1658,7 +1658,7 @@ def completion_text(head: str, title: str, handoff: str, platform: object = None
 
     Flag off, or a platform the cards are not drawn for (:func:`chat_ux_on`), this
     is upstream's f-string exactly. On a card platform (Slack, or Google Chat where
-    the gateway serves it under ``spec.mode: next``) it drops the head line and
+    the gateway serves it) it drops the head line and
     leads with the worker's report, or
     its summary when there is no report (:func:`handoff_with_result`); a card
     that completed with neither keeps the head line, since an empty message
@@ -1687,7 +1687,7 @@ def explained_by_wake(
     """Whether the creator's wake will narrate this failure, so the ping can go.
 
     True only on a card platform (Slack, or Google Chat where the gateway serves
-    it under ``spec.mode: next``) with the flag on, for a failure kind, on a subscription
+    it) with the flag on, for a failure kind, on a subscription
     that asked to be woken, when ``kanban.wake_on_events`` wakes for the kind.
     Those are the conditions under which ``wake_kinds_for`` on a push adapter
     puts the kind in the wake set, so the one message the thread gets is the

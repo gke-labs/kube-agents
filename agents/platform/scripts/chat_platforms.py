@@ -76,8 +76,8 @@ CONFIG_PATH = os.environ.get("PLATFORM_AGENT_CONFIG_PATH", "/opt/data/config.yam
 # matching `spec.integration.<platform>.enabled` is true and this pod is the platform's
 # consumer, so it answers the question being asked rather than approximating it
 # (platformagent_manifests.go, the `integration.GoogleChat` / `integration.Slack` blocks
-# in buildPodTemplateSpec). Under `mode: next` Google Chat moves to the A2A gateway and
-# the variable is not set here, so this list does not count it; the platforms
+# in buildPodTemplateSpec). Google Chat is the A2A gateway's, so the variable is not
+# set here, so this list does not count it; the platforms
 # `chat_notify.routed_platforms()` names, from `A2A_NOTIFY_PLATFORM` or the projected
 # home-channel file, are counted through the gateway's notify route.
 #
@@ -198,8 +198,8 @@ def enabled_chat_platforms() -> list[str]:
     file: that combination is an operator or an admin turning a platform off on a pod
     that still has the variables rendered on it, and the file is the more specific
     statement. The one exception is each platform `chat_notify.routed_platforms()`
-    names, from `A2A_NOTIFY_PLATFORM` or the projected home-channel file: under
-    `next` the managed scope turns that platform's Hermes consumer off because the
+    names, from `A2A_NOTIFY_PLATFORM` or the projected home-channel file: the
+    managed scope turns that platform's Hermes consumer off because the
     A2A gateway holds the backend, and posts reach it through the gateway, so it
     counts as enabled whatever the files say. The operator renders the variable
     and the file only then, and reserves the variable.
@@ -212,7 +212,7 @@ def enabled_chat_platforms() -> list[str]:
 
     resolved = []
     for name in CHAT_PLATFORMS:
-        # Under next the managed scope says the Hermes platform is off, because
+        # The managed scope says the Hermes platform is off where
         # the A2A gateway holds the backend; posts to it go through the
         # gateway's chat.notify route instead (chat_notify.py), so it is
         # still a platform this install posts to.

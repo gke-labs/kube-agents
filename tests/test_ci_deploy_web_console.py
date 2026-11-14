@@ -5,7 +5,7 @@
 console's, so the console was never run on a CI install (gke-labs/kube-agents#2462).
 Now the build has a `web-console` step, section 2a hands the chart the
 console's image on both image-source paths, step 5 turns it on, and
-`gate_web_console` (section 6a under today; the end of 6b under next) rolls
+`gate_web_console` (defined in section 6a, run at the end of 6b) rolls
 the console out, reads its routes through a port-forward, sends one chat
 turn through it, reads the session back and checks the CR is not Degraded.
 
@@ -19,8 +19,8 @@ or is not JSON, fails naming the route; a Degraded CR after the turn fails, and
 so does a CR read that returns nothing for the whole window, while one that
 answers after empty reads is judged on the answer;
 a rollout that never finishes fails before any request. The requests
-themselves are hack/web-console-probe.sh's, which hack/rollback-roundtrip.sh
-sources too; its routes, keys, header and session shape are pinned against
+themselves are hack/web-console-probe.sh's; its routes, keys, header and
+session shape are pinned against
 the console's Go source.
 """
 
@@ -40,7 +40,6 @@ from tests.test_ci_deploy_rc_images import fake_candidate_tree
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _CI_DEPLOY = _REPO_ROOT / "hack" / "ci-deploy.sh"
-_ROLLBACK = _REPO_ROOT / "hack" / "rollback-roundtrip.sh"
 _PROBE = _REPO_ROOT / "hack" / "web-console-probe.sh"
 _CLOUDBUILD = _REPO_ROOT / "deploy" / "docker" / "cloudbuild-ci.yaml"
 _CONSOLE_DIR = _REPO_ROOT / "a2a" / "cmd" / "web-console"
@@ -60,8 +59,8 @@ _CR_BUS_DEGRADED = "Degraded\tPodUnschedulable: Pod platform-agent-a2a-nats-2 ca
 
 _IMAGE_SOURCE_SECTION = (r"^# ─── 2a\. Image Source.*?", r"^# --- agent model required in a Prow job: begin")
 _BUILD_SECTION = (r"^# ─── 4\. Build Container Images.*?", r"^# ─── 5\. Chart Deployment")
-_GATE_SECTION = (r"^# ─── 6a\. The web console.*?", r"^# ─── 6b\. EVAL_MODE_NEXT")
-_MODE_SECTION = (r"^# ─── 6b\. EVAL_MODE_NEXT.*?", r"^# ─── 7\. Agent API Connectivity")
+_GATE_SECTION = (r"^# ─── 6a\. The web console.*?", r"^# ─── 6b\. Gate the A2A stack")
+_MODE_SECTION = (r"^# ─── 6b\. Gate the A2A stack.*?", r"^# ─── 7\. Agent API Connectivity")
 
 _READ_ROUTES = (
     "/api/insights",
@@ -132,7 +131,7 @@ def go_constant(path: pathlib.Path, name: str) -> str:
 
 def run_bash(script: str, env: dict | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
-        ["bash", "-c", f"set -euo pipefail\nunset RC_COMMIT_SHA EVAL_MODE_NEXT PULL_NUMBER JOB_NAME\n{script}"],
+        ["bash", "-c", f"set -euo pipefail\nunset RC_COMMIT_SHA PULL_NUMBER JOB_NAME\n{script}"],
         capture_output=True,
         text=True,
         check=False,
@@ -238,6 +237,8 @@ class BuildSectionTest(unittest.TestCase):
                     'export PROJECT_ID="kube-agents-evals"',
                     'export HERMES_AGENT_TAG="v0"',
                     'MODE_NEXT_BRIDGE_CONCURRENCY="4"',
+                    # Section 2a sets it; the candidate path names the A2A images under it.
+                    'RC_REGISTRY_PREFIX="ghcr.io/gke-labs/kube-agents"',
                     "BUILD_WORKER_ARGS=(--machine-type=e2-highcpu-8)",
                     "A2A_OPERATOR_ENV_ARGS=()",
                     'gcloud() { printf "%s\\n" "$@" >&2; case "$1 $2" in "builds submit") printf "b-1\\tu\\n" ;; "builds describe") echo SUCCESS ;; esac; }',
@@ -256,12 +257,10 @@ class BuildSectionTest(unittest.TestCase):
                 return line.partition("=")[2]
         raise AssertionError(f"no --substitutions in:\n{result.stdout}\n{result.stderr}")
 
-    def test_the_build_names_the_console_image_on_every_lane(self) -> None:
-        for flag in ("", 'export EVAL_MODE_NEXT="1"'):
-            with self.subTest(flag=flag or "unset"):
-                result = self.run_build_section(flag)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn(f"_WEB_CONSOLE_URI={_AR_REPO}/web-console:{_TAG}", self.substitutions(result))
+    def test_the_build_names_the_console_image(self) -> None:
+        result = self.run_build_section("")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"_WEB_CONSOLE_URI={_AR_REPO}/web-console:{_TAG}", self.substitutions(result))
 
     def test_the_release_candidate_path_builds_nothing(self) -> None:
         result = self.run_build_section('export RC_COMMIT_SHA="b4ee5f3eb9c2aceb7f03460d2e573278ab9483fe"')
@@ -279,18 +278,19 @@ class HelmInvocationTest(unittest.TestCase):
 
 
 class CallSitesTest(unittest.TestCase):
-    def test_the_gate_runs_under_today_after_step_6_and_under_next_at_the_end_of_6b(self) -> None:
+    def test_the_gate_is_defined_in_6a_and_runs_once_at_the_end_of_6b(self) -> None:
         script = text(_CI_DEPLOY)
         gate_section = lifted(*_GATE_SECTION)
-        self.assertTrue(gate_section.rstrip().endswith("gate_web_console today"), gate_section[-200:])
+        self.assertNotRegex(gate_section, r"^gate_web_console\b", "6a defines the gate; 6b runs it")
         self.assertLess(script.index('echo "✓ Rollout verification finished'), script.index("# ─── 6a. The web console"))
         mode_section = lifted(*_MODE_SECTION)
-        self.assertEqual(mode_section.count("gate_web_console next"), 1)
+        calls = re.findall(r"^gate_web_console.*$", mode_section, re.MULTILINE)
+        self.assertEqual(calls, ["gate_web_console"])
         self.assertLess(
             mode_section.index('gate_mode_next_rollout "deployment/${PLATFORM_AGENT_CR_NAME}-a2a-verifier"'),
-            mode_section.index("gate_web_console next"),
+            mode_section.index("\ngate_web_console\n"),
         )
-        self.assertLess(mode_section.index("gate_web_console next"), mode_section.index('report_cr_status "mode-next-ready"'))
+        self.assertLess(mode_section.index("\ngate_web_console\n"), mode_section.index('report_cr_status "a2a-gates-ready"'))
 
     def test_the_exit_trap_closes_the_gates_tunnel(self) -> None:
         self.assertIn('kill "${WEB_CONSOLE_PF_PID:-}" 2>/dev/null || true', shell_function(_CI_DEPLOY, "deploy_exit"))
@@ -355,19 +355,15 @@ class SourcePinsTest(unittest.TestCase):
         self.assertIsNotNone(turn_timeout)
         self.assertGreater(int(consts["WEB_CONSOLE_CHAT_MAX_TIME_SECONDS"]), int(turn_timeout.group(1)))
 
-    def test_the_round_trip_runs_the_same_probe_as_the_deploy(self) -> None:
-        """One copy of the requests and the judgement, sourced by both; a
-        second copy in either script would be the drift this test exists for."""
-        deploy, rollback, probe = text(_CI_DEPLOY), text(_ROLLBACK), text(_PROBE)
-        for script in (deploy, rollback):
-            self.assertIn('source "${SCRIPT_DIR}/web-console-probe.sh"', script)
-            for function in ("web_console_request", "web_console_expect_json", "web_console_expect_roles", "web_console_probe"):
-                self.assertNotIn(f"{function}() {{", script)
-                self.assertIn(f"{function}() {{", probe)
-            self.assertIn("web_console_probe ", script)
-        self.assertEqual(constants(_ROLLBACK)["WEB_CONSOLE_PORT"], constants(_CI_DEPLOY)["WEB_CONSOLE_PORT"])
-        self.assertEqual(constants(_ROLLBACK)["WEB_CONSOLE_NAME_DEFAULT"], f"{constants(_CI_DEPLOY)['HELM_RELEASE_NAME']}-web-console")
-        self.assertGreater(int(constants(_ROLLBACK)["DEFAULT_CONSOLE_TURN_TIMEOUT"]), 300)
+    def test_the_deploy_sources_the_probe_rather_than_copying_it(self) -> None:
+        """One copy of the requests and the judgement, in the probe file; a
+        second copy in the deploy would be the drift this test exists for."""
+        deploy, probe = text(_CI_DEPLOY), text(_PROBE)
+        self.assertIn('source "${SCRIPT_DIR}/web-console-probe.sh"', deploy)
+        for function in ("web_console_request", "web_console_expect_json", "web_console_expect_roles", "web_console_probe"):
+            self.assertNotIn(f"{function}() {{", deploy)
+            self.assertIn(f"{function}() {{", probe)
+        self.assertIn("web_console_probe ", deploy)
 
 
 class _Console(http.server.BaseHTTPRequestHandler):
@@ -498,6 +494,7 @@ class GateTest(unittest.TestCase):
                 ),
                 shell_function(_CI_DEPLOY, "report_cr_status"),
                 lifted(*_GATE_SECTION),
+                'gate_web_console',
                 'echo "REACHED 6b"',
             ]
         )
@@ -511,11 +508,11 @@ class GateTest(unittest.TestCase):
         result = self.run_gate()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("REACHED 6b", result.stdout)
-        self.assertIn(f"✓ deployment/{_CONSOLE_NAME} rolled out under today", result.stdout)
+        self.assertIn(f"✓ deployment/{_CONSOLE_NAME} rolled out", result.stdout)
         self.assertIn("every read route answered 200 with a JSON object", result.stdout)
         self.assertIn("/api/chat answered the turn on session web-console-", result.stdout)
         self.assertIn("shows the user and assistant rows", result.stdout)
-        self.assertRegex(result.stdout, r"✓ web console verified under today in \d+s \(attempt 1/5; platform-agent is Ready: Reconciled: all workloads ready\)")
+        self.assertRegex(result.stdout, r"✓ web console verified in \d+s \(attempt 1/5; platform-agent is Ready: Reconciled: all workloads ready\)")
         # The rollout gate, then one tunnel to the console's Service.
         self.assertEqual(self.kubectl_calls("rollout"), [f"kubectl rollout status deployment/{_CONSOLE_NAME} -n {_NAMESPACE} --timeout=600s"])
         self.assertEqual(len(self.kubectl_calls("port-forward")), 1)
@@ -545,21 +542,21 @@ class GateTest(unittest.TestCase):
         result = self.run_gate(chat_statuses=[403])
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertNotIn("REACHED 6b", result.stdout)
-        self.assertIn("web console attempt 1/5 (today) failed: /api/chat: HTTP 403: ", result.stdout)
+        self.assertIn("web console attempt 1/5 failed: /api/chat: HTTP 403: ", result.stdout)
         self.assertIn("a fresh tunnel would not change that", result.stdout)
-        self.assertIn("ERROR: the web console failed under today: /api/chat: HTTP 403: ", result.stdout)
+        self.assertIn("ERROR: the web console failed: /api/chat: HTTP 403: ", result.stdout)
         self.assertEqual(len(self.kubectl_calls("port-forward")), 1)
         self.assertEqual(len(self.chat_calls), 1)
         # The failure dump: the console's log and the CR's status.
         self.assertTrue(self.kubectl_calls(f"logs -n {_NAMESPACE} deployment/{_CONSOLE_NAME}"))
-        self.assertTrue((pathlib.Path(self.tmp.name) / "platformagent-status-web-console-today.yaml").exists())
+        self.assertTrue((pathlib.Path(self.tmp.name) / "platformagent-status-web-console.yaml").exists())
 
     def test_a_504_then_a_200_is_retried_through_a_fresh_tunnel(self) -> None:
         result = self.run_gate(chat_statuses=[504, 200])
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("web console attempt 1/5 (today) failed: /api/chat: HTTP 504: ", result.stdout)
+        self.assertIn("web console attempt 1/5 failed: /api/chat: HTTP 504: ", result.stdout)
         self.assertIn("respawning the tunnel", result.stdout)
-        self.assertIn("✓ web console verified under today", result.stdout)
+        self.assertIn("✓ web console verified", result.stdout)
         self.assertIn("(attempt 2/5;", result.stdout)
         self.assertEqual(len(self.kubectl_calls("port-forward")), 2)
         self.assertEqual(len(self.chat_calls), 2)
@@ -568,27 +565,27 @@ class GateTest(unittest.TestCase):
     def test_a_metadata_route_missing_a_key_the_page_reads_fails_naming_the_route(self) -> None:
         result = self.run_gate(environment_missing_counts=True)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn("ERROR: the web console failed under today: /api/environment: HTTP 200 but the object lacks counts: ", result.stdout)
+        self.assertIn("ERROR: the web console failed: /api/environment: HTTP 200 but the object lacks counts: ", result.stdout)
         self.assertEqual(self.chat_calls, [], "nothing is sent to the agent once a read route has failed")
         self.assertEqual(len(self.kubectl_calls("port-forward")), 1)
 
     def test_a_route_that_is_not_json_fails_naming_the_route(self) -> None:
         result = self.run_gate(insights_not_json=True)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn("ERROR: the web console failed under today: /api/insights: HTTP 200 but the body is not JSON (", result.stdout)
+        self.assertIn("ERROR: the web console failed: /api/insights: HTTP 200 but the body is not JSON (", result.stdout)
 
     def test_a_page_that_is_not_the_console_fails(self) -> None:
         result = self.run_gate(page_plain=True)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn("ERROR: the web console failed under today: /: HTTP 200 but the body is not the console page (no <html): service unavailable", result.stdout)
+        self.assertIn("ERROR: the web console failed: /: HTTP 200 but the body is not the console page (no <html): service unavailable", result.stdout)
 
     def test_a_session_without_the_assistants_row_gets_another_turn_then_fails(self) -> None:
         """A turn that ended with no text is the model's doing, not the
         tunnel's, so it gets the attempts a 504 gets before the gate fails."""
         result = self.run_gate(messages_no_assistant=True)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertRegex(result.stdout, r"web console attempt 1/5 \(today\) failed: /api/sessions/web-console-[0-9a-f]{32}/messages: HTTP 200 but no assistant row among 1 message\(s\) \(roles: user\); respawning the tunnel")
-        self.assertRegex(result.stdout, r"ERROR: the web console failed under today: /api/sessions/web-console-[0-9a-f]{32}/messages: HTTP 200 but no assistant row among 1 message\(s\) \(roles: user\)")
+        self.assertRegex(result.stdout, r"web console attempt 1/5 failed: /api/sessions/web-console-[0-9a-f]{32}/messages: HTTP 200 but no assistant row among 1 message\(s\) \(roles: user\); respawning the tunnel")
+        self.assertRegex(result.stdout, r"ERROR: the web console failed: /api/sessions/web-console-[0-9a-f]{32}/messages: HTTP 200 but no assistant row among 1 message\(s\) \(roles: user\)")
         self.assertEqual(len(self.kubectl_calls("port-forward")), 5)
         self.assertEqual(len(self.chat_calls), 5)
 
@@ -596,7 +593,7 @@ class GateTest(unittest.TestCase):
         result = self.run_gate(cr=_CR_DEGRADED)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("shows the user and assistant rows", result.stdout, "the CR is read after the turn, not instead of it")
-        self.assertIn("ERROR: platform-agent is Degraded with the web console on under today; Ready condition: PodUnschedulable: Pod platform-agent-gateway-x cannot be scheduled", result.stdout)
+        self.assertIn("ERROR: platform-agent is Degraded with the web console on; Ready condition: PodUnschedulable: Pod platform-agent-gateway-x cannot be scheduled", result.stdout)
         # Re-read the bounded number of times before failing.
         self.assertEqual(len(self.kubectl_calls("get platformagent platform-agent")), 12 + 2, "12 reads, then report_cr_status's two")
 
@@ -606,7 +603,7 @@ class GateTest(unittest.TestCase):
         result = self.run_gate(cr="")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("shows the user and assistant rows", result.stdout, "the CR is read after the turn, not instead of it")
-        self.assertIn("ERROR: platform-agent is unread with the web console on under today: all 12 reads after the turn returned no phase", result.stdout)
+        self.assertIn("ERROR: platform-agent is unread with the web console on: all 12 reads after the turn returned no phase", result.stdout)
         self.assertNotIn("✓ web console verified", result.stdout)
         self.assertEqual(len(self.kubectl_calls("get platformagent platform-agent")), 12 + 2, "12 reads, then report_cr_status's two")
 
@@ -621,7 +618,7 @@ class GateTest(unittest.TestCase):
         self.calls.write_text("")
         result = self.run_gate(cr=_CR_DEGRADED, cr_first="", cr_first_reads=2)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn("ERROR: platform-agent is Degraded with the web console on under today; Ready condition: PodUnschedulable: Pod platform-agent-gateway-x cannot be scheduled", result.stdout)
+        self.assertIn("ERROR: platform-agent is Degraded with the web console on; Ready condition: PodUnschedulable: Pod platform-agent-gateway-x cannot be scheduled", result.stdout)
         self.assertEqual(len(self.kubectl_calls("get platformagent platform-agent")), 12 + 2)
 
     def test_a_bus_server_waiting_for_a_node_is_waited_for_then_judged(self) -> None:
@@ -644,7 +641,7 @@ class GateTest(unittest.TestCase):
     def test_a_rollout_that_fails_stops_before_any_request(self) -> None:
         result = self.run_gate(rollout_rc=1)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-        self.assertIn(f"ERROR: deployment/{_CONSOLE_NAME} rollout failed under today", result.stdout)
+        self.assertIn(f"ERROR: deployment/{_CONSOLE_NAME} rollout failed", result.stdout)
         self.assertEqual(self.requests, [])
         self.assertEqual(self.kubectl_calls("port-forward"), [])
 

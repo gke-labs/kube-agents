@@ -1035,12 +1035,6 @@ agentSandbox:
 platformAgent:
   enabled: true
   name: platform-agent
-  # Deprecated and ignored. platformAgent.mode once chose between the A2A
-  # stack and the previous one; the operator now runs every install on the
-  # A2A stack and the CRD defaults spec.mode to next. A value set here still
-  # renders spec.mode on the CR, which the webhook rewrites to next. The key
-  # goes in a later release.
-  mode: null
   telemetry:
     # The A2A gateway keeps one hashed key and a last-active time per chat
     # person for 30 days, and serves the people seen in the last 7 and 30 days

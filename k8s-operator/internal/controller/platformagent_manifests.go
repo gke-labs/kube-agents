@@ -1190,9 +1190,8 @@ const (
 
 	// kubeagentsModeEnvKey is the managed .env key an agent image from before
 	// the removal of spec.mode today reads to learn which stack it runs, and
-	// kubeagentsModeValue the one answer. The agent image's runtime_mode.py
-	// still reads it; the pin goes once no supported agent image predates the
-	// removal.
+	// kubeagentsModeValue the one answer. Nothing in the current image reads
+	// it; the pin goes once no supported agent image predates the removal.
 	kubeagentsModeEnvKey = "KUBEAGENTS_MODE"
 	kubeagentsModeValue  = agentv1alpha1.PlatformAgentModeNext
 )

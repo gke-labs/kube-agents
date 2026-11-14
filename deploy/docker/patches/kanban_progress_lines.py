@@ -316,7 +316,7 @@ STARTED_KIND = "heartbeat"
 #: ``KAGE_SLACK_UX`` on, :func:`silent_event` posts the PR from it.
 PR_OPENED_KIND = "pr_opened"
 
-#: Under ``spec.mode: next``, the terminal kind whose report is laid out as an
+#: Through the gateway, the terminal kind whose report is laid out as an
 #: answer (its first sentence the headline, the rest the detail) when it goes
 #: out through the chat.notify stand-in (:func:`_with_answer`).
 ANSWER_KIND = "completed"
@@ -566,7 +566,7 @@ async def _settle_reaction(adapter: Any, sub: dict, kind: str, board: Optional[s
 
 def _slack_quiet(sub: dict) -> Any:
     """``kanban_notifier`` when ``KAGE_SLACK_UX`` is on for this card's platform, else None:
-    a Slack card, or a Google Chat card under ``spec.mode: next``, where the gateway
+    a Slack card, or a Google Chat card, where the gateway
     lays the chat messages out (``kanban_notifier.chat_ux_on``).
 
     Imported when a delivery runs: ``gateway/kanban_notifier.py`` is copied into
@@ -902,7 +902,7 @@ def _with_answer(
 ) -> Optional[dict]:
     """``metadata`` with a completed card's report, or a hard-wall block's reason, laid out as an answer, for the chat.notify stand-in.
 
-    Under ``spec.mode: next`` the gateway lays the report out from a
+    The gateway lays the report out from a
     ``kube-agents.chat/v1`` answer (``chat_message.answer_message``). Only with
     ``KAGE_SLACK_UX`` on for a Slack card, never for an actionable report,
     whose call to action stays in view as today, and never raises: anything
@@ -954,7 +954,7 @@ def hard_wall_line(payload: object, message: str) -> str:
 def _wake_reply_lost(adapter: Any) -> bool:
     """Whether a wake for this card is answered where no one sees it.
 
-    Under ``spec.mode: next`` a conversation card's wake is self-posted into
+    A conversation card's wake is self-posted into
     the bridge's session and its reply goes nowhere
     (``kanban_chat_notify.ConversationNotifyAdapter``), so a line held for it
     would never be told: :func:`deliver` holds nothing for such a card and
@@ -1076,8 +1076,8 @@ async def deliver(
     ``gateway/slack_ux_moments.py``. A card blocked on Hermes's hard-wall kind
     (:data:`HARD_WALL_BLOCK_KIND`) asks nothing: its row and its ask settle as
     a give-up's, red and ❌ (:func:`settles_as`), and the line it holds or posts
-    is the worker's reason (:func:`hard_wall_line`). Under ``spec.mode: next``
-    a conversation card's wake reply is never posted, so that line posts
+    is the worker's reason (:func:`hard_wall_line`). A conversation card's
+    wake reply is never posted, so that line posts
     rather than waiting on the wake (:func:`_wake_reply_lost`).
     """
     chat_id = sub["chat_id"]

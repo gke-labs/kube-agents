@@ -68,19 +68,14 @@ run "the_default_written_out_passes_no_storage" {
   }
 }
 
-run "a_raised_size_is_passed_beside_the_mode" {
+run "a_raised_size_is_passed" {
   command = apply
   variables {
     platform_agent_storage_size = "80Gi"
-    platform_agent_mode         = "next"
   }
   assert {
     condition     = jsonencode(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).platformAgent.storage) == jsonencode({ size = "80Gi" })
     error_message = "storage: ${jsonencode(yamldecode(nonsensitive(helm_release.kube_agents.values[0])).platformAgent.storage)}"
-  }
-  assert {
-    condition     = yamldecode(nonsensitive(helm_release.kube_agents.values[0])).platformAgent.mode == "next"
-    error_message = "the storage operand replaced the mode"
   }
 }
 

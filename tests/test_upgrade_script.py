@@ -564,83 +564,6 @@ class UpgradeRunContractTest(unittest.TestCase):
                 self.assertNotIn("ENABLE_DRIFT_DETECTOR", line)
                 self.assertNotIn("TF_VAR_enable_drift", line)
 
-    def test_the_mode_is_announced_on_a_full_upgrade_and_noted_on_a_retag(self):
-        """A full apply carries PLATFORM_AGENT_MODE from install.env and says when
-        that switches the install, right after the scope check whose reads it
-        takes; a retag reuses the release record and says, from the values
-        retag_values just read, when a full upgrade would move the mode. Both
-        before their arm raises the apply gate."""
-        source = _UPGRADE_SH.read_text()
-        key = '"${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}"'
-        dispatch = source.index('  case "$PARAM_UPGRADE_MODE" in\n    operator)')
-        self.assertNotIn("platform_agent_mode_for", source[source.index('exit "$plan_status"'):dispatch])
-        for mode, after, call in (
-            # Nothing asks between the notice and the apply, so it is the ungated one.
-            ("full", 'refuse_apply_over_undeclared_scope "$target_namespace" || exit 1\n',
-             f'announce_platform_agent_mode_for_apply "$target_namespace" {key} "$PLATFORM_AGENT_MODE_NOTICE_UNGATED"\n'),
-            ("operator", 'retag_values "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace" "${repo_dir}/${KUBE_AGENTS_VALUES_SCHEMA}"\n',
-             f'note_platform_agent_mode_for_retag "$target_namespace" {key} "$PARAM_UPGRADE_MODE" "$RETAG_VALUES_JSON"\n'),
-            ("harness", 'retag_values "$KUBE_AGENTS_HELM_RELEASE" "$target_namespace" "${repo_dir}/${KUBE_AGENTS_VALUES_SCHEMA}"\n',
-             f'note_platform_agent_mode_for_retag "$target_namespace" {key} "$PARAM_UPGRADE_MODE" "$RETAG_VALUES_JSON"\n'),
-        ):
-            with self.subTest(mode=mode):
-                arm_at = source.index(f"\n    {mode})\n", dispatch)
-                arm = source[arm_at : source.index("\n      ;;\n", arm_at)]
-                self.assertIn(call, arm)
-                self.assertLess(arm.index(after), arm.index(call))
-                self.assertLess(arm.index(call), arm.index('UPGRADE_APPLY_STARTED="true"'))
-        # The plan says it too, after the scope check whose reads it takes: it
-        # is the preview of the same full apply.
-        plan = source.index('print_step "4. Planning (read-only)"')
-        block = source[plan : plan + 2000]
-        self.assertLess(
-            block.index('refuse_apply_over_undeclared_scope "$target_namespace" "$SCOPE_CHECK_MODE_WARN"'),
-            block.index(f"announce_platform_agent_mode_for_apply \"$target_namespace\" {key}\n"),
-        )
-
-    def test_the_mode_calls_skip_an_older_installer_common(self):
-        """installer_common.sh is the target tree's: piped, or with --image-tag
-        onto a release before spec.mode support, it defines neither notice nor
-        DEFAULT_PLATFORM_AGENT_MODE. Each mode call site in the plan, the full
-        arm and both retag arms, lifted as written (with its guard when it has
-        one), runs under the script's strict shell against a stub
-        installer_common.sh lacking them, and must neither abort nor print
-        "command not found"."""
-        lines = _UPGRADE_SH.read_text().splitlines()
-        blocks = []
-        for index, line in enumerate(lines):
-            for fn in ("announce_platform_agent_mode_for_apply", "note_platform_agent_mode_for_retag"):
-                if line.strip().startswith(f'{fn} "$target_namespace"'):
-                    block = [line]
-                    if lines[index - 1].strip() == f"if declare -F {fn} >/dev/null; then":
-                        block = [lines[index - 1], line, lines[index + 1]]
-                    blocks.append("\n".join(b.strip() for b in block))
-        self.assertEqual(len(blocks), 4, blocks)
-        with tempfile.TemporaryDirectory() as tmp:
-            stub = pathlib.Path(tmp) / "installer_common.sh"
-            stub.write_text("# An installer_common.sh from before spec.mode support.\nload_install_env() { :; }\n")
-            for block in blocks:
-                with self.subTest(block=block.splitlines()[0]):
-                    script = f"""
-KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
-source {shlex.quote(str(stub))}
-set -Eeuo pipefail
-trap 'echo "ABORT BANNER" >&2' ERR
-unset PLATFORM_AGENT_MODE DEFAULT_PLATFORM_AGENT_MODE PLATFORM_AGENT_MODE_NOTICE_UNGATED
-target_namespace=kubeagents-system PARAM_UPGRADE_MODE=harness RETAG_VALUES_JSON='{{}}'
-{block}
-echo "reached the end"
-"""
-                    proc = subprocess.run(
-                        ["bash", "-c", script], capture_output=True, text=True, env=get_isolated_test_env()
-                    )
-                    out = proc.stdout + proc.stderr
-                    self.assertEqual(proc.returncode, 0, out)
-                    self.assertIn("reached the end", proc.stdout, out)
-                    self.assertNotIn("command not found", out)
-                    self.assertNotIn("unbound variable", out)
-                    self.assertNotIn("ABORT BANNER", out)
-
     def test_the_generator_call_asks_for_a_memory_answer(self):
         """upgrade.sh's half of the Hindsight guard.
 
@@ -704,17 +627,6 @@ echo "reached the end"
             "applies, and --plan renders the same tfvars, so none of them may fall "
             "through to multiuser_memory when the cluster could not be asked",
         )
-
-    def test_the_full_arm_refuses_a_dropped_next_before_its_notice(self):
-        """The refusal runs whatever the target's helpers are: after the scope
-        check, ahead of the guarded notice an older target cannot print."""
-        source = _UPGRADE_SH.read_text()
-        arm_at = source.index("\n    full)\n", source.index('case "$PARAM_UPGRADE_MODE" in\n    operator)'))
-        arm = source[arm_at : source.index("\n      ;;\n", arm_at)]
-        refusal = '\n      refuse_full_apply_dropping_next "${repo_dir}/${KUBE_AGENTS_VALUES_SCHEMA}" || exit 1\n'
-        self.assertEqual(arm.count(refusal), 1)
-        self.assertLess(arm.index('refuse_apply_over_undeclared_scope "$target_namespace" || exit 1'), arm.index(refusal))
-        self.assertLess(arm.index(refusal), arm.index("declare -F announce_platform_agent_mode_for_apply"))
 
     def test_the_apply_gate_sits_after_every_refusal_in_its_arm(self):
         """UPGRADE_APPLY_STARTED is what keeps cleanup() from putting an adopted
@@ -1675,89 +1587,15 @@ helm_retag operator.image.tag
         self.assertEqual(json.loads(self._rendered(proc, "notes")), notes)
         self.assertEqual(json.loads(self._rendered(proc, "keys")), keys)
 
-    def test_a_harness_retag_keeps_the_recorded_mode(self):
-        """The retag modes carry platformAgent.mode on the release's own record:
-        the schema declares the key, so the filter keeps it, and the chart
-        renders it back onto the CR."""
+    def test_a_harness_retag_carries_a_recorded_mode_the_chart_ignores(self):
+        """Every install's release once recorded platformAgent.mode. The chart
+        keeps the key declared and ignored, so a retag re-applies the record
+        without dropping it, and the CR carries no spec.mode from the chart."""
         recorded = json.loads(json.dumps(self._RECORDED))
         recorded["platformAgent"]["mode"] = "next"
         proc = self._retag(recorded, _REPO_ROOT)
         self.assertEqual(proc.returncode, 0, proc.stdout[-2000:] + proc.stderr)
         self.assertNotIn("Dropping 'platformAgent.mode'", proc.stdout)
-        crs = [d for d in yaml.safe_load_all(proc.stdout[proc.stdout.index("---"):]) if d and d.get("kind") == "PlatformAgent"]
-        self.assertEqual([cr["spec"].get("mode") for cr in crs], ["next"])
-
-    def _modeless_chart(self):
-        """This repository's chart less `platformAgent.mode`: a rollback to a release that predates #2524."""
-        repo = self.base / "modeless-repo"
-        chart = repo / "charts" / "kube-agents"
-        shutil.copytree(_REPO_ROOT / "charts" / "kube-agents", chart)
-        schema_path = chart / "values.schema.json"
-        schema = json.loads(schema_path.read_text())
-        del schema["properties"]["platformAgent"]["properties"]["mode"]
-        schema_path.write_text(json.dumps(schema))
-        return repo
-
-    def _recorded_with_mode(self, mode):
-        recorded = json.loads(json.dumps(self._RECORDED))
-        recorded["platformAgent"]["mode"] = mode
-        return recorded
-
-    def test_a_retag_onto_a_chart_without_mode_refuses_to_drop_next(self):
-        """Dropping a recorded `next` would render no mode, and Helm would take
-        spec.mode off the CR: a switch to today on a retag. Refused, with or
-        without --drop-undeclared-values, before helm upgrade runs."""
-        repo = self._modeless_chart()
-        for drop in (True, False):
-            with self.subTest(drop=drop):
-                proc = self._retag(self._recorded_with_mode("next"), repo, drop=drop)
-                self.assertNotEqual(proc.returncode, 0, proc.stdout[-2000:])
-                self.assertIn("records platformAgent.mode: next", proc.stdout)
-                self.assertIn("predates spec.mode support", proc.stdout)
-                self.assertIn("--upgrade-mode=full", proc.stdout)
-                self.assertNotIn("Dropping 'platformAgent.mode'", proc.stdout)
-                self.assertNotIn("ci-cluster", proc.stdout)
-
-    def _full_refusal(self, repo, mode):
-        schema = repo / "charts" / "kube-agents" / "values.schema.json"
-        assignment = "" if mode is None else f"PLATFORM_AGENT_MODE={shlex.quote(mode)}\n"
-        script = f"""
-KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
-{assignment}refuse_full_apply_dropping_next {shlex.quote(str(schema))}
-"""
-        return subprocess.run(
-            ["bash", "-c", script],
-            capture_output=True,
-            text=True,
-            timeout=self._HELM_TIMEOUT_SECONDS,
-            env=get_isolated_test_env(),
-        )
-
-    def test_a_full_apply_onto_a_chart_without_mode_refuses_next(self):
-        """The full arm's half of the retag refusal: a chart that predates
-        platformAgent.mode renders no mode, so install.env's next would come
-        off the CR. Refused, naming both ways out."""
-        proc = self._full_refusal(self._modeless_chart(), "next")
-        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
-        self.assertIn("sets PLATFORM_AGENT_MODE=next", proc.stdout)
-        self.assertIn("predates spec.mode support", proc.stdout)
-        self.assertIn("PLATFORM_AGENT_MODE=today", proc.stdout)
-
-    def test_a_full_apply_refuses_only_next_onto_a_chart_without_mode(self):
-        """today or no key renders what an absent mode means, and a chart that
-        declares the key keeps next, so none of these refuse."""
-        modeless = self._modeless_chart()
-        for repo, mode in ((modeless, "today"), (modeless, None), (_REPO_ROOT, "next"), (_REPO_ROOT, "today")):
-            with self.subTest(repo=repo.name, mode=mode):
-                proc = self._full_refusal(repo, mode)
-                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-                self.assertNotIn("predates spec.mode support", proc.stdout)
-
-    def test_a_retag_onto_a_chart_without_mode_drops_a_recorded_today(self):
-        """`today` is what an absent mode means, so dropping it switches nothing."""
-        proc = self._retag(self._recorded_with_mode("today"), self._modeless_chart())
-        self.assertEqual(proc.returncode, 0, proc.stdout[-2000:] + proc.stderr)
-        self.assertIn("Dropping 'platformAgent.mode'", proc.stdout)
         crs = [d for d in yaml.safe_load_all(proc.stdout[proc.stdout.index("---"):]) if d and d.get("kind") == "PlatformAgent"]
         self.assertEqual([cr["spec"].get("mode") for cr in crs], [None])
 
@@ -3647,17 +3485,15 @@ class ScopeCheckWiringTest(unittest.TestCase):
         self.assertIn('kubectl --context "$(gke_context_name)" apply --server-side --force-conflicts', common)
 
 
-class FullArmRefusesNextSlackGatewaySettingsTest(unittest.TestCase):
-    """#2812 on upgrade.sh. The full arm applies PLATFORM_AGENT_MODE from
-    install.env. With next, Slack on and Chat off, Slack moves to the A2A
-    gateway, so the arm refuses an email in SLACK_ALLOWED_USERS, a
+class FullArmRefusesSlackGatewaySettingsTest(unittest.TestCase):
+    """#2812 on upgrade.sh. With Slack on and Chat off, the A2A gateway holds
+    Slack, so the full arm refuses an email in SLACK_ALLOWED_USERS, a
     SLACK_HOME_CHANNEL that is not a channel id, or a list of bot tokens.
-    The refusal sits beside refuse_full_apply_dropping_next and before the
-    arm's first write. The test runs the arm from the source with every
+    The refusal sits after the scope check and before the arm's first write. The test runs the arm from the source with every
     other guard and both writes stubbed, so it can observe that nothing was
     applied."""
 
-    _CALL = "if ! refuse_next_slack_gateway_settings_from_env; then"
+    _CALL = "if ! refuse_slack_gateway_settings_from_env; then"
 
     def _arm(self):
         source = _UPGRADE_SH.read_text()
@@ -3670,8 +3506,6 @@ class FullArmRefusesNextSlackGatewaySettingsTest(unittest.TestCase):
         stubs = (
             "print_step() { :; }\n"
             "refuse_apply_over_undeclared_scope() { :; }\n"
-            # The notice, leaving the reads of a cluster with no PlatformAgent type.
-            "announce_platform_agent_mode_for_apply() { PLATFORM_AGENT_CR_READ=none; }\n"
             "check_scope_container_access() { :; }\n"
             "check_service_account_ownership() { :; }\n"
             'apply_crd_upgrades() { echo "APPLIED crds"; }\n'
@@ -3691,8 +3525,8 @@ class FullArmRefusesNextSlackGatewaySettingsTest(unittest.TestCase):
             env=get_isolated_test_env(), cwd=str(_REPO_ROOT),
         )
 
-    def test_next_with_slack_on_the_gateway_refuses_each_setting_and_applies_nothing(self):
-        base = {"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "true"}
+    def test_slack_on_the_gateway_refuses_each_setting_and_applies_nothing(self):
+        base = {"SLACK_ENABLED": "true"}
         for extra, says in (
             ({"SLACK_ALLOWED_USERS": "U0123ABCD, alice@example.com"},
              "SLACK_ALLOWED_USERS holds entries that look like emails: alice@example.com."),
@@ -3714,7 +3548,7 @@ class FullArmRefusesNextSlackGatewaySettingsTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             tfvars = pathlib.Path(tmp) / "terraform.tfvars"
             tfvars.write_text('slack_bot_token = "xoxb-1-secretpart,xoxb-2-secretpart"\n')
-            proc = self._run({"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "true",
+            proc = self._run({"SLACK_ENABLED": "true",
                               "SLACK_BOT_TOKEN": "xoxb-1-secretpart,xoxb-2-secretpart"}, str(tfvars))
             left = tfvars.exists()
         out = proc.stdout + proc.stderr
@@ -3724,13 +3558,15 @@ class FullArmRefusesNextSlackGatewaySettingsTest(unittest.TestCase):
 
     def test_the_cases_the_refusal_leaves_alone_apply(self):
         for keys in (
-            {"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "true", "SLACK_ALLOWED_USERS": "U0123ABCD,W0456EFGH"},
-            {"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "false", "SLACK_ALLOWED_USERS": "alice@example.com"},
-            {"PLATFORM_AGENT_MODE": "next", "SLACK_ALLOWED_USERS": "alice@example.com"},
-            {"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "true", "SLACK_ALLOWED_USERS": "U0123ABCD",
+            {"SLACK_ENABLED": "true", "SLACK_ALLOWED_USERS": "U0123ABCD,W0456EFGH"},
+            {"SLACK_ENABLED": "false", "SLACK_ALLOWED_USERS": "alice@example.com"},
+            {"SLACK_ALLOWED_USERS": "alice@example.com"},
+            {"SLACK_ENABLED": "true", "SLACK_ALLOWED_USERS": "U0123ABCD",
              "SLACK_HOME_CHANNEL": "C0123ABCD", "SLACK_BOT_TOKEN": "xoxb-1-secretpart"},
-            # Chat holds the gateway; Slack stays on the today path.
-            {"PLATFORM_AGENT_MODE": "next", "GOOGLE_CHAT_ENABLED": "true", "SLACK_ENABLED": "true",
+            # A leftover PLATFORM_AGENT_MODE is not read.
+            {"PLATFORM_AGENT_MODE": "today", "SLACK_ENABLED": "true", "SLACK_ALLOWED_USERS": "U0123ABCD"},
+            # Chat holds the gateway; Slack stays on the Hermes Slack platform.
+            {"GOOGLE_CHAT_ENABLED": "true", "SLACK_ENABLED": "true",
              "SLACK_ALLOWED_USERS": "alice@example.com", "SLACK_HOME_CHANNEL": "D0DM",
              "SLACK_BOT_TOKEN": "xoxb-a,xoxb-b"},
         ):
@@ -3753,7 +3589,7 @@ class FullArmRefusesNextSlackGatewaySettingsTest(unittest.TestCase):
         end = source.index('    exit "$plan_status"\n  fi\n', start) + len('    exit "$plan_status"\n  fi\n')
         stubs = (
             "print_step() { :; }\nrefuse_apply_over_undeclared_scope() { :; }\n"
-            "check_scope_container_access() { :; }\nannounce_platform_agent_mode_for_apply() { :; }\n"
+            "check_scope_container_access() { :; }\n"
             'write_report() { echo "REPORT $1"; }\nrun_lifecycle() { echo "PLANNED"; return 0; }\n'
         )
         exports = "".join(f"export {k}={shlex.quote(v)}\n" for k, v in keys.items())
@@ -3769,7 +3605,7 @@ class FullArmRefusesNextSlackGatewaySettingsTest(unittest.TestCase):
                               env=get_isolated_test_env(), cwd=str(_REPO_ROOT))
 
     def test_a_plan_warns_of_each_setting_the_full_run_would_refuse(self):
-        proc = self._plan({"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "true",
+        proc = self._plan({"SLACK_ENABLED": "true",
                            "SLACK_ALLOWED_USERS": "alice@example.com", "SLACK_HOME_CHANNEL": "D0DM",
                            "SLACK_BOT_TOKEN": "xoxb-1-secretpart,xoxb-2-secretpart"})
         out = proc.stdout + proc.stderr
@@ -3785,15 +3621,15 @@ class FullArmRefusesNextSlackGatewaySettingsTest(unittest.TestCase):
         self.assertNotIn("secretpart", out)
         self.assertLess(out.index("An applying run would be refused"), out.index("PLANNED"))
 
-    def test_a_plan_is_quiet_where_slack_stays_on_the_today_path(self):
-        proc = self._plan({"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "true", "GOOGLE_CHAT_ENABLED": "true",
+    def test_a_plan_is_quiet_where_slack_stays_beside_google_chat(self):
+        proc = self._plan({"SLACK_ENABLED": "true", "GOOGLE_CHAT_ENABLED": "true",
                            "SLACK_ALLOWED_USERS": "alice@example.com"})
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertNotIn("would be refused", proc.stdout + proc.stderr)
 
     # ── #3320: no home channel for the gateway's chat backend ──
 
-    _NO_HOME = {"PLATFORM_AGENT_MODE": "next", "SLACK_ENABLED": "true", "SLACK_ALLOWED_USERS": "U0123ABCD"}
+    _NO_HOME = {"SLACK_ENABLED": "true", "SLACK_ALLOWED_USERS": "U0123ABCD"}
 
     def test_a_plan_warns_of_no_home_channel_and_ends_on_it(self):
         proc = self._plan(self._NO_HOME)
@@ -3822,24 +3658,23 @@ class FullArmRefusesNextSlackGatewaySettingsTest(unittest.TestCase):
         # non-interactive log ends.
         source = _UPGRADE_SH.read_text()
         done = source.index('  print_step "🎉 Upgrade Complete!"\n')
-        self.assertIn("    print_next_home_channel_unset_summary\n", source[done:source.index("\n}\n", done)])
+        self.assertIn("    print_gateway_home_channel_unset_summary\n", source[done:source.index("\n}\n", done)])
 
-    def test_the_refusal_sits_beside_the_dropped_next_refusal_before_the_gate(self):
+    def test_the_refusal_sits_after_the_scope_check_before_the_gate(self):
         arm = self._arm()
         self.assertEqual(arm.count(self._CALL), 1)
         call = arm.index(self._CALL)
-        self.assertLess(arm.index('refuse_full_apply_dropping_next "${repo_dir}/${KUBE_AGENTS_VALUES_SCHEMA}" || exit 1'), call)
-        self.assertLess(call, arm.index("declare -F announce_platform_agent_mode_for_apply"))
+        self.assertLess(arm.index('refuse_apply_over_undeclared_scope "$target_namespace" || exit 1'), call)
         # Guarded: an older target's installer_common.sh lacks it.
-        self.assertIn("if declare -F refuse_next_slack_gateway_settings_from_env >/dev/null; then\n        " + self._CALL, arm)
+        self.assertIn("if declare -F refuse_slack_gateway_settings_from_env >/dev/null; then\n        " + self._CALL, arm)
         self.assertLess(call, arm.index('UPGRADE_APPLY_STARTED="true"'))
 
 
 
 class FullUpgradeEndsOnTheChatChecklistTest(unittest.TestCase):
     """#3615. A full upgrade applies the chat keys from install.env, so its
-    end prints the chat setup checklist for the mode the CR is left on, as
-    install.sh does after each of its applies. The tail of main(), lifted as
+    end prints the chat setup checklist, as install.sh does after each of
+    its applies. The tail of main(), lifted as
     written over the real installer_common.sh with gcloud stubbed, calls the
     helper on the full arm only, under a declare -F guard an older target's
     installer_common.sh fails, with the project number read only when Google
@@ -3847,7 +3682,7 @@ class FullUpgradeEndsOnTheChatChecklistTest(unittest.TestCase):
     run uses the real helper and printers, so the checklist is on record."""
 
     _STUB_HELPER = (
-        'print_chat_setup_checklists() { echo "CHECKLIST mode=$1 number=${PROJECT_NUMBER:-} '
+        'print_chat_setup_checklists() { echo "CHECKLIST args=[$*] number=${PROJECT_NUMBER:-} '
         'env=${INSTALL_ENV_FILE:-} topic=${CHAT_TOPIC_NAME:-}"; }\n'
     )
 
@@ -3867,35 +3702,34 @@ class FullUpgradeEndsOnTheChatChecklistTest(unittest.TestCase):
                 f"{helper}"
                 f'gcloud() {{ echo "$*" >>{shlex.quote(str(gcloud_log))}; echo 123456; }}\n'
                 "print_step() { :; }\n"
-                'print_next_home_channel_unset_summary() { echo "SUMMARY"; }\n'
+                'print_gateway_home_channel_unset_summary() { echo "SUMMARY"; }\n'
                 "set -Eeuo pipefail\n"
                 f"{exports}"
-                f"PARAM_UPGRADE_MODE={mode}; PROJECT_ID=proj; DEFAULT_PLATFORM_AGENT_MODE=today\n"
+                f"PARAM_UPGRADE_MODE={mode}; PROJECT_ID=proj\n"
                 f"_tail() {{\nlocal install_env_file={shlex.quote(install_env_file)}\n{self._tail()}\n}}\n"
                 "_tail\n"
             )
             proc = subprocess.run(
                 ["bash", "-c", script], capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=60,
-                env=get_isolated_test_env(env, absent=("PLATFORM_AGENT_MODE", "CHAT_TOPIC_NAME")),
+                env=get_isolated_test_env(env, absent=("CHAT_TOPIC_NAME",)),
             )
             calls = gcloud_log.read_text() if gcloud_log.exists() else ""
         return proc, calls
 
-    def test_a_full_upgrade_prints_the_checklist_for_the_mode_after_the_apply(self):
-        proc, calls = self._run("full", {"GOOGLE_CHAT_ENABLED": "true", "PLATFORM_AGENT_MODE": "today",
-                                         "PLATFORM_AGENT_MODE_AFTER_APPLY": "next", "CHAT_TOPIC_NAME": "t"})
+    def test_a_full_upgrade_prints_the_checklist_after_the_apply(self):
+        proc, calls = self._run("full", {"GOOGLE_CHAT_ENABLED": "true", "CHAT_TOPIC_NAME": "t"})
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(proc.stdout.splitlines(),
-                         ["CHECKLIST mode=next number=123456 env=/x/install.env topic=t", "SUMMARY"])
+                         ["CHECKLIST args=[] number=123456 env=/x/install.env topic=t", "SUMMARY"])
         self.assertEqual(calls, "projects describe proj --format=value(projectNumber)\n")
 
-    def test_the_mode_falls_back_to_the_key_and_the_number_is_read_for_google_chat_only(self):
+    def test_the_number_is_read_for_google_chat_only(self):
         # A file that names no topic rendered the default, which the helper is
         # handed, since the generator keeps its default local.
         proc, calls = self._run("full", {"SLACK_ENABLED": "true"})
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(proc.stdout.splitlines(),
-                         ["CHECKLIST mode=today number= env=/x/install.env topic=platform-agent-chat-events", "SUMMARY"])
+                         ["CHECKLIST args=[] number= env=/x/install.env topic=platform-agent-chat-events", "SUMMARY"])
         self.assertEqual(calls, "")
 
     def test_the_retag_arms_and_an_older_target_print_no_checklist(self):

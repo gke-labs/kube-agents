@@ -39,14 +39,29 @@ from tests.testing.release import (
     MOCK_CR_NOT_READY,
     MOCK_CR_READY_AT_GENERATION_2,
     MOCK_CR_STALE_READY,
-    MOCK_MODE_CONTEXT,
-    write_mode_kubectl_stub,
+    MOCK_GKE_CONTEXT,
+    write_a2a_readiness_kubectl_stub,
 )
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _PROVISION_SCRIPT = _REPO_ROOT / "scripts" / "release" / "provision_environment.sh"
-# PLATFORM_AGENT_MODE_GATE_TIMEOUT_SECONDS's default in platform_agent_mode.sh.
+# A2A_READINESS_GATE_TIMEOUT_SECONDS's default in a2a_readiness.sh.
 _GATE_BUDGET_SECONDS = 1800
+# The A2A readiness gate the script runs after the install needs a kubectl on
+# PATH. Its calls go to a log of their own, so the install and uninstall
+# mocks' log reads as it did before the gate existed.
+_GATE_KUBECTL_LOG = "kubectl-calls"
+
+
+def _env_with_gate_stub(tmp_dir, overrides, absent=()):
+    """get_isolated_test_env, plus a kubectl that answers the gate at once."""
+    bin_dir = tmp_dir / "bin"
+    write_a2a_readiness_kubectl_stub(bin_dir, tmp_dir / _GATE_KUBECTL_LOG)
+    return get_isolated_test_env(
+        overrides={"A2A_READINESS_POLL_SECONDS": "0", **overrides},
+        bin_dir=str(bin_dir),
+        absent=absent,
+    )
 
 
 class ProvisionEnvironmentTest(unittest.TestCase):
@@ -82,8 +97,7 @@ exit 0
 """)
             mock_install.chmod(0o755)
 
-            env = get_isolated_test_env(
-                overrides={
+            env = _env_with_gate_stub(tmp_dir, overrides={
                     "GCP_PROJECT_ID": MOCK_GCP_PROJECT_ID,
                     "GCP_REGION": MOCK_GCP_REGION,
                     "GKE_CLUSTER_NAME": MOCK_GKE_CLUSTER_NAME,
@@ -128,7 +142,6 @@ exit 0
                 f"--gcp-region={MOCK_GCP_REGION} "
                 f"--gke-cluster-name={MOCK_GKE_CLUSTER_NAME} "
                 f"--image-tag={MOCK_IMAGE_TAG_SHA} "
-                f"--mode=today "
                 f"--enable-google-chat "
                 f"--google-chat-mode={MOCK_GOOGLE_CHAT_MODE} "
                 f"--google-chat-home-channel=spaces/TEST12345 "
@@ -159,8 +172,7 @@ exit 0
             mock_install.write_text(f'#!/usr/bin/env bash\necho "install: $*" >> "{recorded_calls}"\nexit 0\n')
             mock_install.chmod(0o755)
 
-            env = get_isolated_test_env(
-                overrides={
+            env = _env_with_gate_stub(tmp_dir, overrides={
                     "GCP_PROJECT_ID": MOCK_GCP_PROJECT_ID,
                     "GCP_REGION": MOCK_GCP_REGION,
                     "GKE_CLUSTER_NAME": MOCK_GKE_CLUSTER_NAME,
@@ -195,8 +207,7 @@ exit 0
             mock_install.write_text(f'#!/usr/bin/env bash\necho "install: $*" >> "{recorded_calls}"\nexit 0\n')
             mock_install.chmod(0o755)
 
-            env = get_isolated_test_env(
-                overrides={
+            env = _env_with_gate_stub(tmp_dir, overrides={
                     "GCP_PROJECT_ID": MOCK_GCP_PROJECT_ID,
                     "GCP_REGION": MOCK_GCP_REGION,
                     "GKE_CLUSTER_NAME": MOCK_GKE_CLUSTER_NAME,
@@ -245,8 +256,7 @@ exit 0
 """)
                     mock_install.chmod(0o755)
 
-                    env = get_isolated_test_env(
-                        overrides={
+                    env = _env_with_gate_stub(tmp_dir, overrides={
                             "GCP_PROJECT_ID": MOCK_GCP_PROJECT_ID,
                             "GCP_REGION": MOCK_GCP_REGION,
                             "GKE_CLUSTER_NAME": MOCK_GKE_CLUSTER_NAME,
@@ -287,8 +297,7 @@ exit 0
 """)
             mock_install.chmod(0o755)
 
-            env = get_isolated_test_env(
-                overrides={
+            env = _env_with_gate_stub(tmp_dir, overrides={
                     "GCP_PROJECT_ID": MOCK_GCP_PROJECT_ID,
                     "GCP_REGION": MOCK_GCP_REGION,
                     "GKE_CLUSTER_NAME": MOCK_GKE_CLUSTER_NAME,
@@ -357,8 +366,7 @@ exit 0
 """)
         mock_install.chmod(0o755)
 
-        env = get_isolated_test_env(
-            overrides={
+        env = _env_with_gate_stub(tmp_dir, overrides={
                 "GCP_PROJECT_ID": MOCK_GCP_PROJECT_ID,
                 "GCP_REGION": MOCK_GCP_REGION,
                 "GKE_CLUSTER_NAME": MOCK_GKE_CLUSTER_NAME,
@@ -532,7 +540,7 @@ exit {install_exit}
             ["bash", str(_PROVISION_SCRIPT)],
             capture_output=True,
             text=True,
-            env=get_isolated_test_env(overrides=base),
+            env=_env_with_gate_stub(tmp_dir, overrides=base),
             cwd=str(tmp_dir),
         )
         return proc, tmp_dir
@@ -1028,18 +1036,16 @@ class SlackTokensAreRequiredBeforeTheTeardownTest(GithubMinterInputsTest):
                 )
 
 
-class PlatformAgentModeTest(unittest.TestCase):
-    """spec.mode on the rebuild path: `today` is the script as it was, `next` adds a patch and a gate.
+class A2AReadinessGateTest(unittest.TestCase):
+    """The rebuild path ends on the A2A readiness gate, after the install.
 
-    The workflow passes its `mode` input as PLATFORM_AGENT_MODE. Unset and
-    `today` must leave every command and every environment the script hands on
-    exactly as they were before the input existed; `next` must add the CR patch
-    and the readiness gate after the install and nothing else; and anything
-    else must stop the run before the teardown destroys the environment.
+    Every install runs the A2A stack, so the script hands install.sh no
+    stack to pick and then waits for what the operator renders: the CR's
+    Ready for its generation, the two bus conditions and each rollout, in
+    the namespace the install was given.
     """
 
-    _NEXT_GATE = [
-        "kubectl --context {ctx} patch platformagent platform-agent -n {ns} --type merge -p {{\"spec\":{{\"mode\":\"next\"}}}}",
+    _GATE = [
         "kubectl --context {ctx} get platformagent platform-agent -n {ns} -o jsonpath=READ",
         "kubectl --context {ctx} get platformagent platform-agent -n {ns} -o jsonpath=BusProvisioned",
         "kubectl --context {ctx} get platformagent platform-agent -n {ns} -o jsonpath=BusCredentialsReady",
@@ -1050,7 +1056,7 @@ class PlatformAgentModeTest(unittest.TestCase):
         "kubectl --context {ctx} rollout status deployment/platform-agent-a2a-gateway -n {ns} --timeout=GATE",
     ]
 
-    def _run(self, overrides, absent=(), **stub):
+    def _run(self, overrides=None, absent=(), **stub):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         tmp_dir = pathlib.Path(tmp.name)
@@ -1060,31 +1066,30 @@ class PlatformAgentModeTest(unittest.TestCase):
             (MOCK_INSTALL_SCRIPT, "install", 0),
         ):
             script = tmp_dir / name
-            # The mode variable as each child sees it: set, empty, or absent.
             script.write_text(
                 "#!/usr/bin/env bash\n"
-                f'echo "{verb}: $* [PLATFORM_AGENT_MODE=${{PLATFORM_AGENT_MODE-<absent>}}]" >> "{calls}"\n'
+                f'echo "{verb}: $*" >> "{calls}"\n'
                 f"exit {code}\n"
             )
             script.chmod(0o755)
         bin_dir = tmp_dir / "bin"
-        write_mode_kubectl_stub(bin_dir, calls, **stub)
+        write_a2a_readiness_kubectl_stub(bin_dir, calls, **stub)
         base = {
             "GCP_PROJECT_ID": MOCK_GCP_PROJECT_ID,
             "GCP_REGION": MOCK_GCP_REGION,
             "GKE_CLUSTER_NAME": MOCK_GKE_CLUSTER_NAME,
             "IMAGE_TAG": MOCK_IMAGE_TAG_SHA,
             "GOOGLE_CHAT_ENABLED": "true",
-            "PLATFORM_AGENT_MODE_POLL_SECONDS": "0",
+            "A2A_READINESS_POLL_SECONDS": "0",
         }
-        base.update(overrides)
+        base.update(overrides or {})
         proc = subprocess.run(
             ["bash", str(_PROVISION_SCRIPT)],
             capture_output=True,
             text=True,
             env=get_isolated_test_env(
                 overrides=base, bin_dir=str(bin_dir),
-                absent=("PLATFORM_AGENT_MODE", "NAMESPACE") + tuple(absent),
+                absent=("NAMESPACE",) + tuple(absent),
             ),
             cwd=str(tmp_dir),
         )
@@ -1114,54 +1119,36 @@ class PlatformAgentModeTest(unittest.TestCase):
         return out
 
     def _expected_gate(self, namespace="kubeagents-system"):
-        return [g.format(ctx=MOCK_MODE_CONTEXT, ns=namespace) for g in self._NEXT_GATE]
+        return [g.format(ctx=MOCK_GKE_CONTEXT, ns=namespace) for g in self._GATE]
 
-    def test_today_is_byte_identical_to_no_mode_at_all(self):
-        unset_proc, unset_calls = self._run({})
-        today_proc, today_calls = self._run({"PLATFORM_AGENT_MODE": "today"})
-        self.assertEqual(unset_proc.returncode, 0, unset_proc.stderr)
-        self.assertEqual(today_proc.returncode, 0, today_proc.stderr)
-        self.assertEqual(today_calls, unset_calls)
-        self.assertEqual(today_proc.stdout, unset_proc.stdout)
-        self.assertEqual(today_proc.stderr, unset_proc.stderr)
-
-    def test_today_runs_no_kubectl_and_hands_on_no_mode_variable(self):
-        for value in ("today", ""):
-            with self.subTest(value=value):
-                proc, calls = self._run({"PLATFORM_AGENT_MODE": value})
-                self.assertEqual(proc.returncode, 0, proc.stderr)
-                self.assertEqual(len(calls), 2, calls)
-                self.assertTrue(calls[0].startswith("uninstall: "), calls)
-                self.assertTrue(calls[1].startswith("install: "), calls)
-                for call in calls:
-                    self.assertIn("[PLATFORM_AGENT_MODE=<absent>]", call)
-                # Named: install.sh's own first-install default is next.
-                self.assertIn(" --mode=today ", calls[1])
-
-    def test_next_installs_with_todays_arguments_then_patches_and_gates(self):
-        _, today_calls = self._run({})
-        proc, calls = self._run({"PLATFORM_AGENT_MODE": "next"})
-        self.assertEqual(proc.returncode, 0, proc.stderr)
+    def test_the_gate_follows_the_teardown_and_the_install(self):
+        proc, calls = self._run()
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         calls = self._normalise(calls)
-        # The same teardown and the same install arguments; the install sees
-        # the mode it will read once it takes one, and nothing else changes.
-        self.assertEqual(
-            calls[0], today_calls[0].replace("<absent>", "next")
-        )
-        self.assertEqual(
-            calls[1], today_calls[1].replace("<absent>", "next").replace(" --mode=today ", " --mode=next ")
-        )
+        self.assertTrue(calls[0].startswith("uninstall: "), calls)
+        self.assertTrue(calls[1].startswith("install: "), calls)
         self.assertEqual(calls[2:], self._expected_gate())
 
-    def test_next_patches_the_namespace_the_install_was_given(self):
-        proc, calls = self._run({"PLATFORM_AGENT_MODE": "next", "NAMESPACE": "agents-elsewhere"})
+    def test_the_install_is_handed_no_stack_to_pick(self):
+        """Every install runs the A2A stack: no flag names one, and no variable is read for one."""
+        proc, calls = self._run()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("--mode", calls[1])
+        self.assertNotIn("PLATFORM_AGENT_MODE", _PROVISION_SCRIPT.read_text())
+
+    def test_the_gate_reads_the_namespace_the_install_was_given(self):
+        proc, calls = self._run({"NAMESPACE": "agents-elsewhere"})
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self._normalise(calls)[2:], self._expected_gate("agents-elsewhere"))
 
+    def test_the_gate_runs_on_a_long_lived_environment_too(self):
+        proc, calls = self._run({"LONG_LIVED_ENVIRONMENT": "true", "GOOGLE_CHAT_ALLOW_ALL_USERS": "true"})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self._normalise(calls)[2:], self._expected_gate())
+
     def test_a_stale_ready_is_not_taken_for_the_new_generation(self):
-        """Right after the patch the CR still carries today's Ready."""
+        """Right after an edit the CR still carries the previous generation's Ready."""
         proc, calls = self._run(
-            {"PLATFORM_AGENT_MODE": "next"},
             ready_reads=(MOCK_CR_STALE_READY, MOCK_CR_STALE_READY, MOCK_CR_READY_AT_GENERATION_2),
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -1170,63 +1157,36 @@ class PlatformAgentModeTest(unittest.TestCase):
 
     def test_an_install_that_never_goes_ready_fails_the_step(self):
         proc, calls = self._run(
-            {"PLATFORM_AGENT_MODE": "next", "PLATFORM_AGENT_MODE_GATE_TIMEOUT_SECONDS": "0"},
+            {"A2A_READINESS_GATE_TIMEOUT_SECONDS": "0"},
             ready_reads=(MOCK_CR_NOT_READY,),
         )
         self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("::error title=mode next: PlatformAgent not Ready::", proc.stdout)
+        self.assertIn("::error title=A2A stack: PlatformAgent not Ready::", proc.stdout)
         self.assertFalse(any("rollout status" in c for c in calls), calls)
 
     def test_a_bus_condition_that_never_reads_true_fails_the_step(self):
         proc, calls = self._run(
-            {"PLATFORM_AGENT_MODE": "next", "PLATFORM_AGENT_MODE_GATE_TIMEOUT_SECONDS": "0"},
+            {"A2A_READINESS_GATE_TIMEOUT_SECONDS": "0"},
             condition_status="False",
         )
         self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("::error title=mode next: BusProvisioned not True::", proc.stdout)
+        self.assertIn("::error title=A2A stack: BusProvisioned not True::", proc.stdout)
         self.assertFalse(any("rollout status" in c for c in calls), calls)
 
-    def test_next_is_refused_on_a_long_lived_environment_before_the_teardown(self):
-        for spelling in ("true", "1", "yes"):
-            with self.subTest(spelling=spelling):
-                proc, calls = self._run(
-                    {"PLATFORM_AGENT_MODE": "next", "LONG_LIVED_ENVIRONMENT": spelling,
-                     "GOOGLE_CHAT_ALLOW_ALL_USERS": "true"}
-                )
-                self.assertEqual(proc.returncode, 1)
-                self.assertEqual(calls, [], "nothing may run, the teardown least of all")
-                self.assertIn("::error title=spec.mode next is for the ephemeral environments::", proc.stdout)
-
-    def test_today_on_a_long_lived_environment_is_untouched(self):
-        proc, calls = self._run(
-            {"PLATFORM_AGENT_MODE": "today", "LONG_LIVED_ENVIRONMENT": "true",
-             "GOOGLE_CHAT_ALLOW_ALL_USERS": "true"}
-        )
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(len(calls), 2, calls)
-
     def test_a_failed_rollout_fails_the_step(self):
-        proc, _ = self._run({"PLATFORM_AGENT_MODE": "next"}, rollout_exit=1)
+        proc, _ = self._run(rollout_exit=1)
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("did not roll out", proc.stdout)
 
     def test_the_gate_always_waits_on_the_a2a_gateway(self):
-        # Every next install runs the gateway (on the console door alone with
-        # no chat backend), so the gate reads no condition that could make it
+        # Every install runs the gateway (on the console door alone with no
+        # chat backend), so the gate reads no condition that could make it
         # skip the rollout, and the last thing it waits on is that rollout.
-        proc, calls = self._run({"PLATFORM_AGENT_MODE": "next"})
+        proc, calls = self._run()
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self._normalise(calls)[-1], self._expected_gate()[-1])
         self.assertFalse(any("A2AGateway" in c for c in calls), calls)
         self.assertNotIn("no chat backend", proc.stdout)
-
-    def test_a_mode_that_is_not_a_mode_is_refused_before_the_teardown(self):
-        for value in ("Next", "nxt", "today ", "TODAY"):
-            with self.subTest(value=value):
-                proc, calls = self._run({"PLATFORM_AGENT_MODE": value})
-                self.assertEqual(proc.returncode, 1)
-                self.assertEqual(calls, [], "nothing may run, the teardown least of all")
-                self.assertIn("::error title=PLATFORM_AGENT_MODE is not a mode::", proc.stdout)
 
 
 class DeployEnvironmentCarriesTheInstallSettingsTest(unittest.TestCase):
@@ -1403,7 +1363,7 @@ exit 0
         proc = subprocess.run(
             ["bash", str(_PROVISION_SCRIPT)],
             capture_output=True, text=True,
-            env=get_isolated_test_env(overrides=base), cwd=str(tmp_dir),
+            env=_env_with_gate_stub(tmp_dir, overrides=base), cwd=str(tmp_dir),
         )
         lines = recorded_calls.read_text().splitlines() if recorded_calls.exists() else []
         calls = lines.count(MOCK_INSTALL_SUCCESS_SIGNAL)

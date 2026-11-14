@@ -22,11 +22,6 @@
 
 set -euo pipefail
 
-# Wall clock at this script's entry, before the lease heartbeat, the cluster
-# auth and section 1: the fallback job start for the rollback round trip's
-# start-by bound when BUILD_ID does not give one (job_started_epoch).
-EVAL_SCRIPT_STARTED_EPOCH="$(date +%s)"
-
 # The eval rosters, four files beside this script under hack/eval/ (#1546):
 # what every pull request runs, what can red one on a graded failure, what
 # the nightly adds, and what the GitLab lane runs on a pull request (#2394).
@@ -86,14 +81,12 @@ readonly EVAL_NIGHTLY_WRITERS_C_FILE="eval/nightly-writers-c.txt"
 # drifts past that, change it.
 readonly NIGHTLY_MAIN_SHARDS=5
 readonly NIGHTLY_MAIN_CKSUM_SHIFT=4
-# A fifth file, read beside them and applied on one lane only (#2039): the
-# cases the inject lane does not run, because their premise needs the chat
-# front door. The lane is the one EVAL_INJECT_TRANSPORT below names.
+# A fifth file, read beside them (#2039): the cases the matrix does not run,
+# because their premise needs the chat front door, which the inject door
+# every matrix goes through (EVAL_INJECT_TRANSPORT below) does not carry. A
+# listed case therefore runs on no CI lane; the file's header says so.
 readonly EVAL_INJECT_LANE_EXCLUSIONS_FILE="eval/inject-lane-exclusions.txt"
-# Its mirror (#3263): the cases every other lane does not run, because their
-# premise needs the inject door (a second message on the same conversation).
-readonly EVAL_API_LANE_EXCLUSIONS_FILE="eval/api-lane-exclusions.txt"
-# A sixth, applied on every lane despite its name (#2079, #2611): the
+# A sixth (#2079, #2611): the
 # safeguards every case carries beside its own -- today the one that fails a
 # repetition on a GitHub write it made that the case did not request.
 # Appended to a copy of each task file before devops-bench reads it
@@ -223,24 +216,16 @@ readonly EVAL_GRADING_LOG
 # The suite's markdown verdict table, written beside the grading log.
 readonly EVAL_VERDICT_MARKDOWN_FILE="eval-verdict.md"
 
-# EVAL_MODE_NEXT=1 is the flag hack/ci-deploy.sh flipped the install to
-# `spec.mode: next` under, in the same job environment. Under it the matrix
-# runs through the gateway's inject door (docs/designs/eval-next-transport.md,
-# stage 1): the harness's transport switch, and the door's bearer token read
-# from the Secret the operator renders beside the door -- <agent>-a2a-inject,
-# key `token` (a2aInjectName and a2aInjectTokenKey in the operator; the deploy
-# already waited for it). Unset, the matrix runs over the agent API exactly
-# as before. The merge-blocking presubmit runs under it: next is the mode a
-# new install gets. Three places read the flag: the today lane's step in
-# section 3 (run_rollback_lane, which refuses EVAL_ROLLBACK_LANE=1 without
-# it); section 4 below, whose door it skips on that lane; and the rollback
-# round trip after the suite verdict (run_rollback_roundtrip, below). The
-# baseline recorder and the dashboard publisher read EVAL_ROLLBACK_LANE
-# instead: a next-mode run on main records under the version key's `next`
-# mode (VersionKey.mode in bench/kube_agents_bench/baselines.py, which
-# `bench-gate` reads off AGENT_TRANSPORT), so it no longer lands in today's
-# window, and only the today lane, which grades a rolled-back install, stays
-# out of both.
+# Every matrix runs through the gateway's inject door
+# (docs/designs/eval-next-transport.md): the harness's transport switch, and
+# the door's bearer token read from the Secret the operator renders beside
+# the door -- <agent>-a2a-inject, key `token` (a2aInjectName and
+# a2aInjectTokenKey in the operator; the deploy already waited for it).
+# Section 4 below exports both. A run on main records under the version
+# key's `next` mode (VersionKey.mode in bench/kube_agents_bench/baselines.py),
+# the one mode a run grades now. EVAL_MODE_NEXT, the flag that once chose
+# this path over the agent API, is no longer read anywhere in this script: a
+# Prow job that still exports it is ignored.
 readonly EVAL_INJECT_TRANSPORT="inject"
 readonly EVAL_INJECT_TOKEN_SECRET_SUFFIX="-a2a-inject"
 readonly EVAL_INJECT_TOKEN_SECRET_KEY="token"
@@ -255,42 +240,6 @@ readonly EVAL_A2A_DOOR_TOKEN_SECRET_KEY="token"
 # fan-out on one listener that the first unit to finish tears down. The base
 # sits clear of the API range (28642 + seq) for any matrix this job runs.
 readonly EVAL_INJECT_LOCAL_PORT_BASE=29099
-
-# The rollback round trip under EVAL_MODE_NEXT=1 on main (run_rollback_roundtrip,
-# after the suite verdict is computed; a pull request's run and a
-# release-candidate run skip it, for the reasons the function gives, and the
-# today lane runs it before its matrix instead, run_rollback_lane):
-# hack/rollback-roundtrip.sh flips the install
-# next -> today -> next and checks the JetStream PVC and the bus creds Secret
-# come through it (cutover condition 6, #2461). Reported beside the verdict,
-# never in it: its own log section and artifacts, no case, no effect on the
-# exit status. It starts only while the JOB is young enough that its own
-# bound still ends inside the presubmit's 360m deadline, measured from the
-# job's start (job_started_epoch), not from the eval's, so a slow deploy in
-# front counts against it too. The arithmetic: start by 15600s (260m), plus
-# the 3600s bound, plus the 60s kill grace, ends by 19260s; the 360m deadline
-# is 21600s, which leaves 2340s (39m) for the verdict line, the EXIT trap's
-# artifact collection and the teardown's 10m uninstall bound
-# (hack/ci-teardown.sh, RELEASE_UNINSTALL_TIMEOUT). The bound kills a run that
-# outlives it, after a grace for its port-forwards to close.
-readonly EVAL_ROLLBACK_SCRIPT="rollback-roundtrip.sh"
-readonly EVAL_ROLLBACK_JOB_DEADLINE_SECONDS=21600
-readonly EVAL_ROLLBACK_START_BY_SECONDS=15600
-readonly EVAL_ROLLBACK_TIMEOUT_SECONDS=3600
-readonly EVAL_ROLLBACK_KILL_AFTER_SECONDS=60
-readonly EVAL_ROLLBACK_LOG="rollback-roundtrip.log"
-readonly EVAL_ROLLBACK_RESULTS="rollback-roundtrip.txt"
-# The round trip after the suite verdict is for a next-mode run on main: a
-# pull request's next-mode run (the merge-blocking presubmit's, or a batch's
-# that Tide ran) skips it, since nobody reads a report-only result there and the
-# today lane below proves the same path on pull requests that touch the round
-# trip, or on demand.
-readonly EVAL_ROLLBACK_SKIP_JOB_TYPES="presubmit batch"
-# The today lane, EVAL_ROLLBACK_LANE=1 beside EVAL_MODE_NEXT=1
-# (run_rollback_lane, in section 3): the deploy brings the install up under
-# next, the round trip runs before the matrix and ends with the install at
-# this mode, and the matrix then grades today over the agent API.
-readonly EVAL_ROLLBACK_LANE_END_MODE="today"
 
 # stop_model_calls_on_cancel (beside the TERM trap): the job types whose
 # cancelled run is thrown away, so a SIGTERM may cut model access at once, and
@@ -443,7 +392,7 @@ readonly STATE_LOCK_RETRY_SECONDS=30
 # hack/ci-revalidate.sh, which the Prow job also runs before it leases an
 # evaluation project (kube-agents-presubmits.yaml in oss-test-infra). Run
 # here too, first, so a job definition that has not yet hoisted it still
-# saves the eval matrix, and so the today lane's presubmit that runs this script
+# saves the eval matrix, and so another presubmit that runs this script
 # under its own JOB_NAME is covered the same way. The script's header owns
 # the rules: a green at this head, whatever main has done since (#1202),
 # or at an earlier head when everything since is inert (#1179), is reused;
@@ -725,9 +674,7 @@ fi
 # prerequisite 2 below puts the credential itself out of the presubmit's
 # reach; that split is what makes the boundary structural, exactly as
 # docs/designs/eval-scorer.md#the-two-service-accounts argues for the
-# baseline store. The recorder's fourth condition, EVAL_ROLLBACK_LANE unset,
-# is mirrored too: the today lane grades a rolled-back install and reports
-# nothing as main's history.
+# baseline store.
 #
 # Nothing publishes until BOTH prerequisites exist:
 #   1. the nightly periodic (NEVER the presubmit) exports
@@ -771,10 +718,6 @@ publish_eval_dashboard() {
   fi
   if [ -n "${RC_COMMIT_SHA:-}" ]; then
     echo "eval-dashboard publish skipped: RC_COMMIT_SHA=${RC_COMMIT_SHA} is set: a release-candidate run measures a candidate, it does not report main's history"
-    return 0
-  fi
-  if [ "${EVAL_ROLLBACK_LANE:-}" = "1" ]; then
-    echo "eval-dashboard publish skipped: EVAL_ROLLBACK_LANE=1 is set: the today lane grades a rolled-back install, which is not main's history"
     return 0
   fi
   if [ "${EVAL_SLACK_LANE:-}" = "1" ]; then
@@ -1366,56 +1309,6 @@ prepare_replay_lane_cache || exit 1
 [ "${EVAL_REPLAY_LANE:-}" = "true" ] || start_replay_shadow_collector
 export AGENT_SERVICE_NAME="platform-agent"
 export AGENT_NAMESPACE="${TARGET_NAMESPACE}"
-
-# ─── The today lane: roll the next install back before grading ──────────────
-# EVAL_ROLLBACK_LANE=1, set beside EVAL_MODE_NEXT=1 on the today lane's job
-# (pull-kube-agents-smoke-test-today in oss-test-infra). With next the mode
-# new installs get and the merge-blocking presubmit grading it, today is
-# what a rollback lands on, and this lane proves that path: the deploy brings the install up under next exactly as for the
-# next lane, this step runs hack/rollback-roundtrip.sh with ROLLBACK_END_MODE
-# set to EVAL_ROLLBACK_LANE_END_MODE (next -> today -> next -> today: the
-# rollback, the flip forward on the kept PVC and creds Secret, and the
-# rollback again), and the matrix then runs over the agent API on the
-# rolled-back install (section 4 leaves the transport alone on this lane).
-#
-# Unlike the report-only round trip after a next-mode matrix, a failure here
-# stops the job: a rollback that does not land leaves nothing for today's
-# matrix to grade, and on this lane the failure is the finding. It runs here,
-# before the ledger and repository resets and the audit pause below, so they
-# act on the pod the matrix will talk to; the pod watch above already covers
-# the pods the flips replace. Run in the background and waited on, so the
-# job's deadline TERM reaches the round trip, as in run_rollback_roundtrip.
-run_rollback_lane() {
-  if [ "${EVAL_ROLLBACK_LANE:-}" != "1" ]; then
-    return 0
-  fi
-  if [ "${EVAL_MODE_NEXT:-}" != "1" ]; then
-    echo "ERROR: EVAL_ROLLBACK_LANE=1 needs EVAL_MODE_NEXT=1: the lane rolls a next install back to today, and without the flag the deploy installed today and there is nothing to roll back." >&2
-    exit 1
-  fi
-  local artifacts="${ARTIFACTS:-/tmp/artifacts}" status=0
-  local -a bound=()
-  mkdir -p "${artifacts}"
-  profile_begin "rollback lane: next -> today -> next -> today, before the matrix"
-  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Rollback lane: rolling the next install back to ${EVAL_ROLLBACK_LANE_END_MODE} before grading its matrix (EVAL_ROLLBACK_LANE=1) ==="
-  if command -v timeout >/dev/null 2>&1; then
-    bound=(timeout --kill-after="${EVAL_ROLLBACK_KILL_AFTER_SECONDS}" "${EVAL_ROLLBACK_TIMEOUT_SECONDS}")
-  fi
-  ROLLBACK_END_MODE="${EVAL_ROLLBACK_LANE_END_MODE}" ROLLBACK_KUBE_CONTEXT="${AGENT_CLUSTER_CONTEXT:-}" \
-    ROLLBACK_RESULTS_FILE="${artifacts}/${EVAL_ROLLBACK_RESULTS}" \
-    ${bound[@]+"${bound[@]}"} bash "${SCRIPT_DIR}/${EVAL_ROLLBACK_SCRIPT}" "${TARGET_NAMESPACE}" "${AGENT_SERVICE_NAME}" \
-    > >(tee "${artifacts}/${EVAL_ROLLBACK_LOG}") 2>&1 &
-  EVAL_ROLLBACK_PID=$!
-  trap 'kill -TERM "${EVAL_ROLLBACK_PID}" 2>/dev/null || true; wait "${EVAL_ROLLBACK_PID}" 2>/dev/null || true; stop_model_calls_on_cancel || true; exit 143' TERM INT
-  wait "${EVAL_ROLLBACK_PID}" || status=$?
-  trap 'stop_model_calls_on_cancel || true; exit 143' TERM INT
-  if [ "${status}" -ne 0 ]; then
-    echo "ERROR: the rollback lane's round trip failed (exit ${status}): the next install did not roll back to ${EVAL_ROLLBACK_LANE_END_MODE} cleanly, so its matrix is not run. The last FAIL line above names the check, or says the run was stopped at its ${EVAL_ROLLBACK_TIMEOUT_SECONDS}s bound (transcript: ${artifacts}/${EVAL_ROLLBACK_LOG})." >&2
-    exit 1
-  fi
-  echo "✓ Rolled back to ${EVAL_ROLLBACK_LANE_END_MODE}; the matrix runs over the agent API on this install"
-}
-run_rollback_lane
 
 # The harness's default delegation wait (1800s) sits INSIDE the compliance
 # canary's observed completion spread: on 2026-08-27 (build
@@ -3047,37 +2940,31 @@ export TF_VAR_prow_pull_number="${PULL_NUMBER:-}"
 # Dynamically fetches API_SERVER_KEY from GKE secret and locks down the agent model
 PLATFORM_AGENT_TOKEN="$(kubectl get secret platform-agent-secrets -n "${TARGET_NAMESPACE}" -o jsonpath='{.data.API_SERVER_KEY}' | base64 --decode)"
 export PLATFORM_AGENT_TOKEN
-# Under EVAL_MODE_NEXT=1 the deploy flipped the install to next, armed the
-# inject door and declared the bridge; the matrix goes through the door. The
-# agent token above is still fetched: the transport switch changes how a
-# prompt reaches the agent, not what else the run reads from the install.
-# Everything about the door the harness needs beyond these two it derives
-# from AGENT_SERVICE_NAME and AGENT_NAMESPACE, exported above. The today lane
-# (EVAL_ROLLBACK_LANE=1) carries the flag for its deploy, but run_rollback_lane
-# has rolled the install back by now and the door is gone with the bus, so its
-# matrix stays on the agent API.
-if [ "${EVAL_MODE_NEXT:-}" = "1" ] && [ "${EVAL_ROLLBACK_LANE:-}" != "1" ]; then
-  EVAL_INJECT_TOKEN_SECRET="${AGENT_SERVICE_NAME}${EVAL_INJECT_TOKEN_SECRET_SUFFIX}"
-  if ! AGENT_INJECT_TOKEN="$(kubectl get secret "${EVAL_INJECT_TOKEN_SECRET}" -n "${TARGET_NAMESPACE}" -o jsonpath="{.data.${EVAL_INJECT_TOKEN_SECRET_KEY}}" | base64 --decode)" || [ -z "${AGENT_INJECT_TOKEN}" ]; then
-    echo "ERROR: EVAL_MODE_NEXT=1 but the inject door's token Secret ${EVAL_INJECT_TOKEN_SECRET} (key ${EVAL_INJECT_TOKEN_SECRET_KEY}) is missing or empty in ${TARGET_NAMESPACE}." >&2
-    echo "       The operator renders it only when deployed with the inject door armed, which hack/ci-deploy.sh does under the same flag." >&2
-    exit 1
-  fi
-  export AGENT_INJECT_TOKEN
-  export AGENT_TRANSPORT="${EVAL_INJECT_TRANSPORT}"
-  # The A2A door's token, for the card-wait stopped ask alone. Missing is not
-  # fatal: the matrix goes through the inject door, and the harness records
-  # that one case as infrastructure when it has no token. The value is never
-  # echoed; only the Secret's name is.
-  EVAL_A2A_DOOR_TOKEN_SECRET="${AGENT_SERVICE_NAME}${EVAL_A2A_DOOR_TOKEN_SECRET_SUFFIX}"
-  if AGENT_A2A_DOOR_TOKEN="$(kubectl get secret "${EVAL_A2A_DOOR_TOKEN_SECRET}" -n "${TARGET_NAMESPACE}" -o jsonpath="{.data.${EVAL_A2A_DOOR_TOKEN_SECRET_KEY}}" | base64 --decode)" && [ -n "${AGENT_A2A_DOOR_TOKEN}" ]; then
-    export AGENT_A2A_DOOR_TOKEN
-  else
-    unset AGENT_A2A_DOOR_TOKEN
-    echo "WARNING: the A2A door's token Secret ${EVAL_A2A_DOOR_TOKEN_SECRET} (key ${EVAL_A2A_DOOR_TOKEN_SECRET_KEY}) is missing or empty in ${TARGET_NAMESPACE}; a card-wait stopped ask will be recorded as infrastructure." >&2
-  fi
-  echo "EVAL_MODE_NEXT=1: running the matrix through the inject door (AGENT_TRANSPORT=${AGENT_TRANSPORT}, token from ${EVAL_INJECT_TOKEN_SECRET})"
+# The deploy armed the inject door and declared the bridge; the matrix goes
+# through the door. The agent token above is still fetched: the transport
+# changes how a prompt reaches the agent, not what else the run reads from
+# the install. Everything about the door the harness needs beyond these two
+# it derives from AGENT_SERVICE_NAME and AGENT_NAMESPACE, exported above.
+EVAL_INJECT_TOKEN_SECRET="${AGENT_SERVICE_NAME}${EVAL_INJECT_TOKEN_SECRET_SUFFIX}"
+if ! AGENT_INJECT_TOKEN="$(kubectl get secret "${EVAL_INJECT_TOKEN_SECRET}" -n "${TARGET_NAMESPACE}" -o jsonpath="{.data.${EVAL_INJECT_TOKEN_SECRET_KEY}}" | base64 --decode)" || [ -z "${AGENT_INJECT_TOKEN}" ]; then
+  echo "ERROR: the inject door's token Secret ${EVAL_INJECT_TOKEN_SECRET} (key ${EVAL_INJECT_TOKEN_SECRET_KEY}) is missing or empty in ${TARGET_NAMESPACE}." >&2
+  echo "       The operator renders it only when deployed with the inject door armed, which hack/ci-deploy.sh does on every install." >&2
+  exit 1
 fi
+export AGENT_INJECT_TOKEN
+export AGENT_TRANSPORT="${EVAL_INJECT_TRANSPORT}"
+# The A2A door's token, for the card-wait stopped ask alone. Missing is not
+# fatal: the matrix goes through the inject door, and the harness records
+# that one case as infrastructure when it has no token. The value is never
+# echoed; only the Secret's name is.
+EVAL_A2A_DOOR_TOKEN_SECRET="${AGENT_SERVICE_NAME}${EVAL_A2A_DOOR_TOKEN_SECRET_SUFFIX}"
+if AGENT_A2A_DOOR_TOKEN="$(kubectl get secret "${EVAL_A2A_DOOR_TOKEN_SECRET}" -n "${TARGET_NAMESPACE}" -o jsonpath="{.data.${EVAL_A2A_DOOR_TOKEN_SECRET_KEY}}" | base64 --decode)" && [ -n "${AGENT_A2A_DOOR_TOKEN}" ]; then
+  export AGENT_A2A_DOOR_TOKEN
+else
+  unset AGENT_A2A_DOOR_TOKEN
+  echo "WARNING: the A2A door's token Secret ${EVAL_A2A_DOOR_TOKEN_SECRET} (key ${EVAL_A2A_DOOR_TOKEN_SECRET_KEY}) is missing or empty in ${TARGET_NAMESPACE}; a card-wait stopped ask will be recorded as infrastructure." >&2
+fi
+echo "running the matrix through the inject door (AGENT_TRANSPORT=${AGENT_TRANSPORT}, token from ${EVAL_INJECT_TOKEN_SECRET})"
 export JUDGE_API_KEY="${GEMINI_API_KEY}"
 export JUDGE_PROVIDER="google"
 # The judge is pinned INDEPENDENTLY of the agent, and the invariant is:
@@ -3164,9 +3051,9 @@ fi
 # nightly-cases.txt is what EVAL_TIER=nightly appends
 # (NIGHTLY_TASKS), blocking-roster.txt, read further down, is what can red
 # a pull request on a graded failure (BOOTSTRAP_ADMITTED),
-# inject-lane-exclusions.txt, read after the tier switch, is what the inject
-# lane leaves out of both (#2039), and inject-lane-safeguards.yaml, read
-# after that, is what every case on either lane carries beside its own
+# inject-lane-exclusions.txt, read after the tier switch, is what the matrix
+# leaves out of both (#2039), and inject-lane-safeguards.yaml, read
+# after that, is what every case carries beside its own
 # checks (#2079). The split exists
 # so OWNERS can tell them apart: hack/OWNERS puts the two presubmit files
 # under the eval-crew alias and lets the nightly file fall through to the
@@ -3644,24 +3531,21 @@ case "${EVAL_CERTIFICATION_PART}" in
 esac
 
 # ─── The inject lane's exclusions (#2039) ────────────────────────────────────
-# Under AGENT_TRANSPORT=inject -- the harness's own switch, which the
-# EVAL_MODE_NEXT=1 block above exports before this point -- the matrix goes
-# through the gateway's inject door, which carries neither a specialist's
+# The matrix goes through the gateway's inject door (AGENT_TRANSPORT=inject,
+# exported in section 4 above), which carries neither a specialist's
 # answer folded back into the chat thread nor a card's wake: a case whose
 # premise needs one cannot hold there whatever the agent does.
 # hack/eval/inject-lane-exclusions.txt names those cases,
 # each with its reason as the comment block above it (the file's header and
 # scripts/test_eval_rosters.py hold every entry to one), and this drops them
 # from TASKS before TASK_NAMES and the fan-out are built from it, so the
-# suite grades and reports the cases that ran. Read on every lane, so a
-# missing file or an entry naming no case fails here rather than on the
-# lane that needs it; applied on the inject lane only, so the api lane's
-# matrix stays byte for byte the presubmit file. Not a demotion: the roster
-# files are untouched. The names dropped here are kept in
-# INJECT_LANE_DROPPED (empty on every other lane) so the BOOTSTRAP_ADMITTED
+# suite grades and reports the cases that ran. Every matrix goes through the
+# door, so a listed case runs on no CI lane until its entry goes. Not a
+# demotion: the roster files are untouched. The names dropped here are kept in
+# INJECT_LANE_DROPPED so the BOOTSTRAP_ADMITTED
 # export below leaves them out too -- a roster name the suite never grades
-# would otherwise trip bench-gate's misspelled-roster banner on every run
-# of the lane. A check the transport blinds (tool_called, worker_commands,
+# would otherwise trip bench-gate's misspelled-roster banner on every run.
+# A check the transport blinds (tool_called, worker_commands,
 # worker_agents, worker_budget) is the scorer's to set aside, not this file's:
 # docs/designs/eval-scorer.md, "The inject lane".
 INJECT_LANE_EXCLUSIONS_FILE="${SCRIPT_DIR}/${EVAL_INJECT_LANE_EXCLUSIONS_FILE}"
@@ -3671,8 +3555,7 @@ INJECT_LANE_DROPPED=""
 # spells it: the drop below is an exact match against the matrix's names,
 # so a variant a filesystem test would accept (`agent-kanban-smoke/`) would
 # pass here and match nothing there, leaving the case running on the lane
-# with nothing said. Registered means the presubmit or the nightly file --
-# a nightly-only case may be excluded from an inject nightly.
+# with nothing said. Registered means the presubmit or the nightly file.
 REGISTERED_CASE_NAMES="$(printf '%s\n' "${PRESUBMIT_ENTRIES}" "${NIGHTLY_ENTRIES}" | sed -e 's#^\./tasks/##' -e 's#/task\.yaml$##')"
 while IFS= read -r NAME; do
   if [ -z "${NAME}" ]; then continue; fi
@@ -3681,12 +3564,12 @@ while IFS= read -r NAME; do
     exit 1
   fi
 done <<< "${INJECT_LANE_EXCLUDED}"
-if [ "${AGENT_TRANSPORT:-}" = "${EVAL_INJECT_TRANSPORT}" ] && [ -n "${INJECT_LANE_EXCLUDED}" ]; then
+if [ -n "${INJECT_LANE_EXCLUDED}" ]; then
   INJECT_LANE_KEPT=()
   for ENTRY in "${TASKS[@]}"; do
     NAME="$(basename "$(dirname "${ENTRY}")")"
     if grep -qxF -- "${NAME}" <<< "${INJECT_LANE_EXCLUDED}"; then
-      echo "AGENT_TRANSPORT=${AGENT_TRANSPORT}: ${NAME} leaves the matrix -- excluded on this lane; the reason is in ${EVAL_INJECT_LANE_EXCLUSIONS_FILE}"
+      echo "AGENT_TRANSPORT=${AGENT_TRANSPORT:-inject}: ${NAME} leaves the matrix -- excluded on this lane; the reason is in ${EVAL_INJECT_LANE_EXCLUSIONS_FILE}"
       INJECT_LANE_DROPPED="${INJECT_LANE_DROPPED}${NAME}
 "
     else
@@ -3698,38 +3581,7 @@ if [ "${AGENT_TRANSPORT:-}" = "${EVAL_INJECT_TRANSPORT}" ] && [ -n "${INJECT_LAN
     echo "ERROR: every case in the matrix is excluded on the inject lane (${EVAL_INJECT_LANE_EXCLUSIONS_FILE}); the lane would run nothing and report green." >&2
     exit 1
   fi
-  echo "AGENT_TRANSPORT=${AGENT_TRANSPORT}: ${#TASKS[@]} task(s) remain in the matrix"
-fi
-# The mirror (#3263): hack/eval/api-lane-exclusions.txt names the cases only
-# the inject door can carry (a stop sent as the conversation's next message,
-# bench/kube_agents_bench/stop_hook.py). Read and checked on every lane like
-# the list above; applied on every transport but inject. None of them is on
-# the blocking roster (scripts/test_eval_rosters.py), so BOOTSTRAP_ADMITTED
-# needs no drop list for them.
-API_LANE_EXCLUSIONS_FILE="${SCRIPT_DIR}/${EVAL_API_LANE_EXCLUSIONS_FILE}"
-API_LANE_EXCLUDED="$(roster_entries "${API_LANE_EXCLUSIONS_FILE}")"
-while IFS= read -r NAME; do
-  if [ -z "${NAME}" ]; then continue; fi
-  if ! grep -qxF -- "${NAME}" <<< "${REGISTERED_CASE_NAMES}"; then
-    echo "ERROR: ${API_LANE_EXCLUSIONS_FILE}: '${NAME}' is not a case id in ${PRESUBMIT_CASES_FILE} or ${NIGHTLY_CASES_FILE}; an exclusion that matches nothing would leave the case it meant running on the api lane." >&2
-    exit 1
-  fi
-done <<< "${API_LANE_EXCLUDED}"
-if [ "${AGENT_TRANSPORT:-}" != "${EVAL_INJECT_TRANSPORT}" ] && [ -n "${API_LANE_EXCLUDED}" ]; then
-  API_LANE_KEPT=()
-  for ENTRY in "${TASKS[@]}"; do
-    NAME="$(basename "$(dirname "${ENTRY}")")"
-    if grep -qxF -- "${NAME}" <<< "${API_LANE_EXCLUDED}"; then
-      echo "AGENT_TRANSPORT=${AGENT_TRANSPORT:-api}: ${NAME} leaves the matrix -- it runs on the inject lane only; the reason is in ${EVAL_API_LANE_EXCLUSIONS_FILE}"
-    else
-      API_LANE_KEPT+=("${ENTRY}")
-    fi
-  done
-  TASKS=(${API_LANE_KEPT[@]+"${API_LANE_KEPT[@]}"})
-  if [ "${#TASKS[@]}" -eq 0 ]; then
-    echo "ERROR: every case in the matrix is excluded on the api lane (${EVAL_API_LANE_EXCLUSIONS_FILE}); the lane would run nothing and report green." >&2
-    exit 1
-  fi
+  echo "AGENT_TRANSPORT=${AGENT_TRANSPORT:-inject}: ${#TASKS[@]} task(s) remain in the matrix"
 fi
 
 # ─── Grade with the merge target's grader (#1560, section 6) ─────────────────
@@ -3868,8 +3720,7 @@ export EVAL_GRADER_SHA
 # case id devops-bench records is the directory name, so it is unchanged;
 # `bench-gate case` still reads the file under bench/tasks/, and the appended
 # entry reaches it through the record's report, which is what rung 1 grades.
-# Applied on every transport, the api lane as well as the inject lane
-# (#2611), so `today` and `next` are graded against the same bar. A write
+# Applied to every case in the matrix (#2611). A write
 # the safeguard charges is one the repetition's reply or creating calls name, or
 # any write in the window of a case that runs alone in the second phase
 # (GitHubWritesVerifier in bench/kube_agents_bench/verifiers.py), so a case
@@ -3940,7 +3791,7 @@ INJECT_LANE_REQUESTING="$(printf '%s\n' "${INJECT_LANE_COPIES}" | awk '$1 > 0 { 
 # The settle before each writer unit is the safeguard's window: a write
 # in the last seconds of the unit before must be older than it.
 WRITER_LAUNCH_PAUSE="${EVAL_GITHUB_WRITE_SETTLE_SECONDS}"
-echo "AGENT_TRANSPORT=${AGENT_TRANSPORT:-api}: every task in the matrix carries the lane safeguards (${EVAL_INJECT_LANE_SAFEGUARDS_FILE}) over BENCH_GITOPS_REPO=${BENCH_GITOPS_REPO}; copies under ${INJECT_LANE_TASKS_DIR}; cases that request a pull request, run after every other unit, each after the repository is reset: ${INJECT_LANE_REQUESTING:-none}"
+echo "AGENT_TRANSPORT=${AGENT_TRANSPORT:-inject}: every task in the matrix carries the lane safeguards (${EVAL_INJECT_LANE_SAFEGUARDS_FILE}) over BENCH_GITOPS_REPO=${BENCH_GITOPS_REPO}; copies under ${INJECT_LANE_TASKS_DIR}; cases that request a pull request, run after every other unit, each after the repository is reset: ${INJECT_LANE_REQUESTING:-none}"
 # The stopped asks in the matrix (a prompt opening with the harness's stop
 # directive, bench/kube_agents_bench/stop_hook.py; only the inject lane
 # carries one) run in the same second phase although they request no pull
@@ -3950,16 +3801,12 @@ echo "AGENT_TRANSPORT=${AGENT_TRANSPORT:-api}: every task in the matrix carries 
 # Alone in the second phase, whose window the lane marks exclusive
 # (bench/kube_agents_bench/lane.py), a failed stop reds itself whether or
 # not it names the write, and reds only itself.
-# Read from the prompt, as the harness reads it, not from
-# api-lane-exclusions.txt, which may come to list door-only cases of other
-# kinds.
+# Read from the prompt, as the harness reads it.
 STOPPED_ASK_CASES=""
-if [ "${AGENT_TRANSPORT:-}" = "${EVAL_INJECT_TRANSPORT}" ]; then
-  if ! STOPPED_ASK_CASES="$(cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.stop_hook "${TASKS[@]}" \
-      | awk '{ printf "%s%s", sep, $0; sep = "," }')"; then
-    echo "ERROR: could not read which cases are stopped asks (kube_agents_bench.stop_hook, above); the fan-out cannot run them after every other unit, so the run does not start." >&2
-    exit 1
-  fi
+if ! STOPPED_ASK_CASES="$(cd "${BENCH_DIR}" && uv run python -m kube_agents_bench.stop_hook "${TASKS[@]}" \
+    | awk '{ printf "%s%s", sep, $0; sep = "," }')"; then
+  echo "ERROR: could not read which cases are stopped asks (kube_agents_bench.stop_hook, above); the fan-out cannot run them after every other unit, so the run does not start." >&2
+  exit 1
 fi
 if [ -n "${STOPPED_ASK_CASES}" ]; then
   echo "stopped asks, run after every other unit with the cases that request a pull request: ${STOPPED_ASK_CASES}"
@@ -4520,10 +4367,10 @@ while IFS= read -r NAME; do
   if [ "${EVAL_REPLAY_LANE:-}" = "true" ]; then
     continue
   fi
-  # A roster case the inject lane's exclusion step dropped from the matrix
-  # (INJECT_LANE_DROPPED, empty on every other lane) leaves the export too:
+  # A roster case the exclusion step dropped from the matrix
+  # (INJECT_LANE_DROPPED) leaves the export too:
   # it is still checked against the presubmit above, because the file is
-  # the api lane's roster and stays a subset of it, but a name that arms a
+  # the roster and stays a subset of it, but a name that arms a
   # case the suite never grades would trip bench-gate's "BOOTSTRAP_ADMITTED
   # names no graded case" banner on every run of the lane, and that banner
   # exists to catch a misspelled roster entry.
@@ -4618,9 +4465,9 @@ export EVAL_BASELINE_STORE="${EVAL_BASELINE_STORE:-}"
 CASE_RESULTS=()
 
 # Whether this run appends to the baseline store, decided once here and read
-# by record_case inside the fan-out and by the record step after it. The four
-# conditions -- a main-branch job type, no PULL_NUMBER, no release candidate,
-# not the today lane -- and why each one is there are explained at that step
+# by record_case inside the fan-out and by the record step after it. The
+# conditions -- a main-branch job type, no PULL_NUMBER, no release candidate
+# -- and why each one is there are explained at that step
 # ("Baseline collection", below the fan-out).
 case "${JOB_TYPE:-}" in
   postsubmit | periodic) EVAL_IS_MAIN_RUN="true" ;;
@@ -4634,9 +4481,6 @@ fi
 # with the GitHub nights' under the same key. The lane reads the store like
 # a presubmit; a record of its own is a decision for later (#2832).
 if [ "${EVAL_FORGE:-github}" != "github" ]; then
-  EVAL_IS_MAIN_RUN="false"
-fi
-if [ "${EVAL_ROLLBACK_LANE:-}" = "1" ]; then
   EVAL_IS_MAIN_RUN="false"
 fi
 # The replay lane never appends: a replayed run repeats a recording that
@@ -4962,7 +4806,7 @@ unit_cost_hint() {
     # the worker to its retries after the refusal (#1948); priced at the
     # middle so it is not the last tier a deadline cut truncates.
     stop-on-permission-refusal) echo 1200 ;;
-    # Next-lane nightly only (api-lane-exclusions.txt). The opening turn files
+    # Nightly only. The opening turn files
     # a card, then the harness sends `stop` and waits out the prompt's
     # observe=900 window (stop_hook.py), so a repetition is never under 900s;
     # priced in that band so a deadline cut does not take it first.
@@ -6168,7 +6012,7 @@ fi
 # A scope edit that does not take effect records the case's repetitions as
 # infrastructure rather than grading an install without the exclusion. A case
 # that also writes keeps the writer pause before each repetition. The gateway
-# log is taken first, as the rollback lane takes it: each scope edit replaces
+# log is taken first: each scope edit replaces
 # the pod, and the log of every other case's repetitions lives only in it.
 [ "${#SCOPE_EXCLUDE_LINES[@]}" -eq 0 ] || collect_gateway_log
 for SCOPE_LINE in ${SCOPE_EXCLUDE_LINES[@]+"${SCOPE_EXCLUDE_LINES[@]}"}; do
@@ -6309,19 +6153,12 @@ profile_begin "record + final gate"
 # record once written. The candidate would then be measured for non-inferiority
 # against a window it had just moved.
 #
-# EVAL_ROLLBACK_LANE=1 is the fourth. No today-lane job runs on main now, but
-# one with no PULL_NUMBER would carry EVAL_MODE_NEXT=1 for its deploy and
-# grade the install after rolling it back to today, over the api transport,
-# so its key would read today; but a rolled-back install is not the fresh today
-# install today's window measures. `bench-gate record` refuses it too.
-#
-# A next-mode run on main does record. The main nightly
+# A run on main records under the version key's `next` mode. The main nightly
 # (ci-kube-agents-eval-nightly, its -main-b to -main-e shards and its
-# -writers, -writers-b and -writers-c thirds, EVAL_MODE_NEXT=1) is a periodic with no PULL_NUMBER, and its matrix runs over the inject transport,
-# which `bench-gate` reads as the version key's `next` mode: its lines file
-# under a key of their own, never today's, and are the window an inject-lane
-# run at the same agent model (setupId) is compared with. No job records
-# today's window now: the rollback check is the today lane, refused above.
+# -writers, -writers-b and -writers-c thirds) is a periodic with no
+# PULL_NUMBER, and its matrix runs over the inject transport, which
+# `bench-gate` files under the key's `next` mode: its lines are the window an
+# inject-lane run at the same agent model (setupId) is compared with.
 # (ci-kube-agents-eval-nightly-gitlab-next stays out on the GitLab condition
 # above.) Whether the job's identity may append is a grant in oss-test-infra
 # this script cannot see; without it the append fails, is logged, and the
@@ -6344,8 +6181,6 @@ if [ "${EVAL_IS_MAIN_RUN}" = "true" ] && [ -z "${PULL_NUMBER:-}" ]; then
     echo "WARNING: recording baseline evidence failed; the verdict below is unaffected."
 elif [ -n "${RC_COMMIT_SHA:-}" ]; then
   echo "Release-candidate run (RC_COMMIT_SHA=${RC_COMMIT_SHA}): the baseline store is read, never written — the candidate is judged against main's window, not added to it."
-elif [ "${EVAL_ROLLBACK_LANE:-}" = "1" ] && [ -z "${PULL_NUMBER:-}" ]; then
-  echo "Today-lane run (EVAL_ROLLBACK_LANE=1, JOB_TYPE=${JOB_TYPE:-unset}): the baseline store is read, never written — a rolled-back install is not what today's window measures."
 elif [ -n "${EVAL_REASONING_EFFORT:-}" ] && [ -z "${PULL_NUMBER:-}" ]; then
   echo "Reasoning-effort run (EVAL_REASONING_EFFORT=${EVAL_REASONING_EFFORT}, JOB_TYPE=${JOB_TYPE:-unset}): the baseline store is read, never written; the version key carries no effort, so the lines would pool with the default-effort window."
 else
@@ -6420,136 +6255,6 @@ announce_suite_verdict() {
   return 1
 }
 
-# When the job started, for the rollback round trip's start-by bound: sets
-# EVAL_JOB_STARTED_EPOCH and EVAL_JOB_STARTED_FROM (what it was read from).
-# Prow's BUILD_ID is a Twitter snowflake whose top bits are milliseconds since
-# a fixed epoch, and it decodes to the pod's pendingTime within seconds
-# (scripts/pool_pressure.py, SNOWFLAKE_*, which scripts/test_pool_pressure.py
-# holds to recorded prowjobs): before the clone, the build and the deploy, so
-# an age read from it is never short. Without one that decodes to a time in
-# the last day, the fallback is this script's own entry less an allowance for
-# the deploy that ran before it as a separate script (about 45m on the next
-# lane), so the start-by arithmetic holds on that path too.
-readonly EVAL_SNOWFLAKE_EPOCH_MS=1288834974657
-readonly EVAL_SNOWFLAKE_TIMESTAMP_SHIFT=22
-readonly EVAL_JOB_START_MAX_AGE_SECONDS=86400
-readonly EVAL_JOB_START_DEPLOY_ALLOWANCE_SECONDS=2700
-job_started_epoch() {
-  local now decoded
-  now="$(date +%s)"
-  EVAL_JOB_STARTED_EPOCH=$((EVAL_SCRIPT_STARTED_EPOCH - EVAL_JOB_START_DEPLOY_ALLOWANCE_SECONDS))
-  EVAL_JOB_STARTED_FROM="this script's start less ${EVAL_JOB_START_DEPLOY_ALLOWANCE_SECONDS}s for the deploy; BUILD_ID gave none"
-  if [[ "${BUILD_ID:-}" =~ ^[0-9]{15,19}$ ]]; then
-    decoded=$((((10#${BUILD_ID} >> EVAL_SNOWFLAKE_TIMESTAMP_SHIFT) + EVAL_SNOWFLAKE_EPOCH_MS) / 1000))
-    if [ "${decoded}" -le "${now}" ] && [ $((now - decoded)) -le "${EVAL_JOB_START_MAX_AGE_SECONDS}" ]; then
-      EVAL_JOB_STARTED_EPOCH="${decoded}"
-      EVAL_JOB_STARTED_FROM="BUILD_ID ${BUILD_ID}"
-    fi
-  fi
-}
-
-# The rollback round trip, under EVAL_MODE_NEXT=1 only (the constants at the
-# top say why it runs and how long it may). Called after the suite step has
-# written eval-verdict.json and eval-verdict.md and captured SUITE_STATUS,
-# and before the final line announces them, so it can change neither: it
-# runs in a child process whose status it reports and then drops, and it
-# always returns 0. Its own section of this log, its own artifacts
-# (EVAL_ROLLBACK_LOG, the transcript; EVAL_ROLLBACK_RESULTS, the PASS/FAIL
-# lines and an outcome), and no case in the matrix.
-#
-# The flip replaces the agent pod, whose log and diagnostics the EXIT trap
-# collects, so the eval's are taken first; the gateway log collector keeps
-# the first capture of a process, so the trap does not overwrite it with the
-# replacement pod's. The pod and event watches keep running through the
-# round trip, and the diagnostics collector is re-armed under a prefix
-# before it starts: whatever ends the run after that (a pass, a failure, the
-# deadline's TERM), the EXIT trap stops the watch, whose tails then cover
-# the flip, and writes a rollback-* snapshot beside the eval's. The LiteLLM
-# log is not taken here: the flip patches spec.mode, which leaves
-# deployment/litellm alone (the operator only reads it), so the trap's
-# capture still holds the eval's lines, with the round trip's single-turn
-# requests after them. The broker's evidence is taken here: with Google Chat
-# armed the operator re-renders the proxy Deployment on a mode flip (the
-# broker's chat env follows the mode), and a replaced pod starts its log and
-# its counters from zero, which would leave the eval's queue unrecorded. The
-# presubmit install runs with Chat off, so there the capture is defensive.
-#
-# The round trip runs in the background and is waited on, so a SIGTERM (the
-# job's deadline) reaches this script's trap during the wait rather than
-# after an hour: the handler here passes it on to the round trip, which
-# reports itself interrupted, and then exits 143 as the global trap does, so
-# the EXIT trap's collection still runs inside the grace period. The start-by
-# bound is on the job's age, so that handler is for a deadline that moved,
-# not for a slow deploy.
-run_rollback_roundtrip() {
-  if [ "${EVAL_MODE_NEXT:-}" != "1" ]; then
-    return 0
-  fi
-  # The today lane ran its round trip before the matrix (run_rollback_lane)
-  # and is under today now; there is no next install here to start from.
-  if [ "${EVAL_ROLLBACK_LANE:-}" = "1" ]; then
-    return 0
-  fi
-  local skip_type
-  for skip_type in ${EVAL_ROLLBACK_SKIP_JOB_TYPES}; do
-    if [ "${skip_type}" = "${JOB_TYPE:-}" ]; then
-      echo "Rollback round trip skipped: a pull request's run (JOB_TYPE=${JOB_TYPE}); the today presubmit (pull-kube-agents-smoke-test-today) proves the rollback path on pull requests that touch the round trip, or on demand"
-      return 0
-    fi
-  done
-  # A release-candidate run's verdict is read only once the job has finished
-  # (scripts/release/poll_rc_eval_verdict.py waits for finished.json, and
-  # gives up at 330 minutes), so an hour of report-only round trip here would
-  # be an hour off the promotion's budget for a check that cannot change it.
-  if [ -n "${RC_COMMIT_SHA:-}" ]; then
-    echo "Rollback round trip skipped: a release-candidate run (RC_COMMIT_SHA=${RC_COMMIT_SHA}); its verdict waits on this job finishing, and the round trip is reported, never gated"
-    return 0
-  fi
-  local log="${ARTIFACT_DIR}/${EVAL_ROLLBACK_LOG}" results="${ARTIFACT_DIR}/${EVAL_ROLLBACK_RESULTS}"
-  local now job_age status=0 outcome
-  local -a bound=()
-  profile_begin "rollback round trip (report-only)"
-  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Rollback round trip (next -> today -> next), reported beside the eval verdict and not part of it ==="
-  : >"${results}" || true
-  job_started_epoch
-  now="$(date +%s)"
-  job_age=$((now - EVAL_JOB_STARTED_EPOCH))
-  if [ "${job_age}" -gt "${EVAL_ROLLBACK_START_BY_SECONDS}" ]; then
-    echo "SKIPPED: not enough time left in the job: it started ${job_age}s ago (${EVAL_JOB_STARTED_FROM}), past the ${EVAL_ROLLBACK_START_BY_SECONDS}s start-by bound, so the round trip's ${EVAL_ROLLBACK_TIMEOUT_SECONDS}s bound would not end inside the job's ${EVAL_ROLLBACK_JOB_DEADLINE_SECONDS}s deadline with room for the verdict and the teardown" | tee -a "${results}"
-    echo "OUTCOME: skipped" >>"${results}" || true
-    return 0
-  fi
-  echo "the job started ${job_age}s ago (${EVAL_JOB_STARTED_FROM}); inside the ${EVAL_ROLLBACK_START_BY_SECONDS}s start-by bound" | tee -a "${results}"
-  collect_gateway_log
-  collect_agent_pod_diagnostics --keep-watch
-  collect_credential_proxy_evidence
-  # Both read by collect_agent_pod_diagnostics (hack/ci-env.sh).
-  # shellcheck disable=SC2034
-  AGENT_DIAG_COLLECTED=""
-  # shellcheck disable=SC2034
-  AGENT_DIAG_PREFIX="rollback-"
-  if command -v timeout >/dev/null 2>&1; then
-    bound=(timeout --kill-after="${EVAL_ROLLBACK_KILL_AFTER_SECONDS}" "${EVAL_ROLLBACK_TIMEOUT_SECONDS}")
-  fi
-  # Streamed as it runs, and kept whole in its own file. timeout passes a
-  # TERM it receives on to the script.
-  ROLLBACK_KUBE_CONTEXT="${AGENT_CLUSTER_CONTEXT:-}" ROLLBACK_RESULTS_FILE="${results}" \
-    ${bound[@]+"${bound[@]}"} bash "${SCRIPT_DIR}/${EVAL_ROLLBACK_SCRIPT}" "${TARGET_NAMESPACE}" "${AGENT_SERVICE_NAME}" \
-    > >(tee "${log}") 2>&1 &
-  EVAL_ROLLBACK_PID=$!
-  trap 'kill -TERM "${EVAL_ROLLBACK_PID}" 2>/dev/null || true; wait "${EVAL_ROLLBACK_PID}" 2>/dev/null || true; stop_model_calls_on_cancel || true; exit 143' TERM INT
-  wait "${EVAL_ROLLBACK_PID}" || status=$?
-  trap 'stop_model_calls_on_cancel || true; exit 143' TERM INT
-  if [ "${status}" -eq 0 ]; then
-    outcome="passed"
-  else
-    outcome="failed (exit ${status})"
-  fi
-  echo "OUTCOME: ${outcome}" >>"${results}" || true
-  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Rollback round trip ${outcome}; report-only, so the eval verdict below is unchanged by it (transcript: ${log}) ==="
-  return 0
-}
-
 TOTAL_DURATION=$((SECONDS - START_TIME))
 SUITE_STATUS=0
 # From here the run writes its own verdict; the EXIT trap's cut-off report
@@ -6564,6 +6269,5 @@ if [ -f "${ARTIFACT_DIR}/${EVAL_VERDICT_MARKDOWN_FILE}" ]; then
 else
   echo "WARNING: bench-gate suite exited ${SUITE_STATUS} without writing ${ARTIFACT_DIR}/${EVAL_VERDICT_MARKDOWN_FILE}; its output is in ${EVAL_GRADING_LOG_FILE}"
 fi
-run_rollback_roundtrip || true
 announce_suite_verdict "${SUITE_STATUS}" "${ARTIFACT_DIR}/eval-verdict.json" \
   "${ARTIFACT_DIR}/eval-verdict.md" "${TOTAL_DURATION}" || exit $?

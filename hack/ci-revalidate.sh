@@ -189,7 +189,7 @@ readonly REVALIDATION_HISTORY_PREFIX="gs://kube-agents-evals-presubmit-logs/pr-l
 # The job whose history and status context step 0 reads: the running job's
 # own name, which Prow exports as JOB_NAME. Every presubmit that runs this
 # script has its own history path and its own status context, so keying the
-# reuse on a fixed name would let a second job (the today lane's presubmit, which
+# reuse on a fixed name would let a second job (another presubmit that
 # runs step 0 too) find the blocking job's green build
 # at the same head and run nothing. Outside Prow the default keeps the log
 # lines and the tests naming the job that exists.
@@ -237,8 +237,8 @@ readonly REVALIDATION_PULL_URL_PREFIX="https://github.com/gke-labs/kube-agents/p
 readonly REVALIDATION_HISTORY_LIMIT=20
 # A green from before the job changed what it grades is not a verdict this
 # run could only repeat. EVAL_REVALIDATION_NOT_BEFORE, a UTC time set in the
-# job's env in oss-test-infra (the swap to spec.mode next, or a rollback to
-# today), refuses a green build whose EARLIEST matching success status on
+# job's env in oss-test-infra (a change to the stack the job grades),
+# refuses a green build whose EARLIEST matching success status on
 # GitHub was created before it: the original crier event, which the retired
 # sticky re-pin's later copies (same build URL) cannot stand in for. GitHub's
 # time, not the GCS record's, for the trust-surface reason above. Unset or

@@ -6,9 +6,9 @@ as said with the card ids it stands for, and the text it was said with. The
 relay (``session_kv_server.relay_cron_report``) reads it here for the job's
 Slack leg and posts it in place of the text, so each row gets two buttons:
 
-* under today, as Block Kit (:func:`blocks_from_card`) through the credential
-  proxy's Slack relay; a tap reaches ``slack_ux_clicks.py``;
-* under ``spec.mode: next``, as a ``kube-agents.chat/v1`` message
+* on the Hermes Slack adapter, as Block Kit (:func:`blocks_from_card`) through
+  the credential proxy's Slack relay; a tap reaches ``slack_ux_clicks.py``;
+* through the gateway, as a ``kube-agents.chat/v1`` message
   (:func:`chat_from_card`) through the gateway, whose rows carry ``tasks`` and
   ``actions``; the gateway draws the buttons and takes the tap.
 
@@ -27,8 +27,8 @@ from pathlib import Path
 import chat_message as _chat
 import kanban_board_health as _health
 
-#: The two buttons, the same ids under both modes: ``slack_ux_clicks.py``
-#: (today) and ``a2a/gateway/slack_board.go`` (next) match them.
+#: The two buttons, the same ids on both Slack paths: ``slack_ux_clicks.py``
+#: (the Hermes Slack adapter) and ``a2a/gateway/slack_board.go`` (the gateway) match them.
 ACTION_PREFIX = "kage_board"
 ACTION_RETRY = "retry"
 ACTION_DROP = "drop"
@@ -149,7 +149,7 @@ def blocks_from_card(card: dict) -> tuple[list[dict], str]:
 
 
 def chat_from_card(card: dict) -> tuple[dict, str]:
-    """The card as a ``kube-agents.chat/v1`` message for ``spec.mode: next``: ``(chat, text)``.
+    """The card as a ``kube-agents.chat/v1`` message for the gateway: ``(chat, text)``.
 
     Each row's text is its title in bold, its detail the status and holding-back
     lines, and a row with buttons carries its ids as ``tasks`` and both

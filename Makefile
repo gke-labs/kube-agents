@@ -255,7 +255,7 @@ PYTHON_TEST_PATH := $(CURDIR):$(CURDIR)/agentplugins/lib:$(CURDIR)/agentplugins/
 # The files the sweep hands out first. xargs feeds the workers in list order,
 # and the globs above sort by path, so a long file that sorts late started
 # late: on 2026-10-14 (run 38592675526) every other file had finished at
-# 16:01:24 and tests/test_rollback_roundtrip.py, 182 s on its own and sorted
+# 16:01:24 and one 182 s file (since deleted), sorted
 # into the last tenth of the list, ran alone until 16:03:32 with three of four
 # workers idle.
 # Longest-first is the schedule that closes that gap, and the simulation over
@@ -269,7 +269,6 @@ PYTHON_TEST_PATH := $(CURDIR):$(CURDIR)/agentplugins/lib:$(CURDIR)/agentplugins/
 # tail again until someone adds it; the per-file blocks the sweep prints carry
 # the `Ran N tests in S s` line to find it by.
 PYTHON_TEST_HEAVY_FILES := \
-	tests/test_rollback_roundtrip.py \
 	agents/platform/scripts/test_credential_proxy.py \
 	tests/test_fleet_fixture_state.py \
 	scripts/test_eval_dashboard_pages.py \

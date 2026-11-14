@@ -171,8 +171,7 @@ readonly FOOTPRINT_TFVARS_VALUE_MAP="platform_agent_storage_size=platformAgent.s
 memory_provider=platformAgent.harness.memory.provider
 hermes_dashboard_enabled=platformAgent.harness.hermes.dashboardEnabled
 web_console_enabled=webConsole.enabled
-enable_github_minter=githubMinter.enabled
-platform_agent_mode=platformAgent.mode"
+enable_github_minter=githubMinter.enabled"
 
 # ─── OpenAI-compatible model server ───────────────────────────────────────────
 # The ports a base URL without one is dialled on, and the TCP port range.
@@ -299,19 +298,22 @@ readonly LITELLM_DEPLOYMENT="litellm"
 readonly PLATFORM_AGENT_SHELL_STATEFULSET="platform-agent-shell"
 # shellcheck disable=SC2034
 readonly PLATFORM_AGENT_CREDENTIAL_PROXY_DEPLOYMENT="platform-agent-credential-proxy"
-# The A2A gateway Deployment that holds Slack under spec.mode next, and its
-# container.
+# The A2A gateway Deployment that holds Google Chat, and Slack when Google
+# Chat is off, and its container.
 # shellcheck disable=SC2034  # read by print_instructions_slack.sh
 readonly PLATFORM_AGENT_A2A_GATEWAY_DEPLOYMENT="platform-agent-a2a-gateway"
 # shellcheck disable=SC2034  # read by print_instructions_slack.sh
 readonly PLATFORM_AGENT_A2A_GATEWAY_CONTAINER="gateway"
-# The operator's page for a spec.mode switch, which links the design document
-# (docs/designs/spec-mode-switch.md) for what the switch changes inside.
-readonly PLATFORM_AGENT_MODE_SWITCH_DOC="https://gke-labs.github.io/kube-agents/install/upgrade/#switching-specmode"
+# PLATFORM_AGENT_MODE in install.env once chose the PlatformAgent's spec.mode,
+# which picked between two component stacks. Every install runs the A2A stack
+# now, so the loaders read the key, say so once, and ignore it. The notice.
+readonly PLATFORM_AGENT_MODE_IGNORED_NOTICE="still sets PLATFORM_AGENT_MODE, which is no longer read: every install runs the A2A stack (the NATS bus and the A2A gateway in front of the agent). You may remove the key."
+# Whether note_ignored_platform_agent_mode_key has spoken this run.
+PLATFORM_AGENT_MODE_IGNORED_NOTED="false"
 # The Slack app setup page's allowlist section, which says how to find a
-# member ID; refuse_next_slack_gateway_settings points at it.
+# member ID; refuse_slack_gateway_settings points at it.
 readonly SLACK_ALLOWLIST_DOC="https://gke-labs.github.io/kube-agents/install/slack-app/#allowed-users"
-# The same page's home channel section, which next_home_channel_unset_remedy
+# The same page's home channel section, which gateway_home_channel_unset_remedy
 # points at.
 readonly SLACK_HOME_CHANNEL_DOC="https://gke-labs.github.io/kube-agents/install/slack-app/#home-channel"
 # A Slack home channel the A2A gateway arms its notify route on: a public
@@ -348,21 +350,11 @@ GO_TRIMSPACE_CHARS=(
   $'\xe2\x80\xa8' $'\xe2\x80\xa9' $'\xe2\x80\xaf' $'\xe2\x81\x9f' $'\xe3\x80\x80'
 )
 readonly GO_TRIMSPACE_CHARS
-# What platform_agent_mode_in_values and platform_agent_mode_on_cr print for
-# a field that is not there: a record that carries no platformAgent.mode, or a
-# CR with no spec.mode. Told apart from printing nothing, which means there is
-# no CR.
-readonly PLATFORM_AGENT_MODE_UNSET="unset"
 # How each of read_platform_agent_install_state's reads came out.
 readonly PLATFORM_AGENT_READ_OK="ok"
 readonly PLATFORM_AGENT_READ_NONE="none"
 readonly PLATFORM_AGENT_READ_FAILED="failed"
 readonly PLATFORM_AGENT_READ_NO_CONTEXT="no-context"
-# The front doors pass this to announce_platform_agent_mode_for_apply when
-# no confirmation stands between the notice and the apply (upgrade.sh's full
-# arm, the Day-2 menu's apply, install.sh -y), so the notice does not offer
-# "run again" as a way out of a run that will not wait for one.
-readonly PLATFORM_AGENT_MODE_NOTICE_UNGATED="ungated"
 # The composition's two Helm releases, by their Terraform type and name: the
 # front doors ask the state whether it manages one before deciding what a
 # cert-manager or kube-agents release already on the cluster means.
@@ -944,12 +936,6 @@ is_valid_redaction_ip_action() {
   [[ "${1:-}" =~ ^(mask|pseudonym|off)$ ]]
 }
 
-# PLATFORM_AGENT_MODE: the PlatformAgent CRD's spec.mode enum, which the
-# chart's platformAgent.mode and the composition's platform_agent_mode take too.
-is_valid_platform_agent_mode() {
-  [[ "${1:-}" =~ ^(today|next)$ ]]
-}
-
 # PLATFORM_AGENT_STORAGE_SIZE: a whole number of Mi, Gi or Ti above zero and at
 # most 64Ti, what the composition's platform_agent_storage_size validation
 # takes. The CRD's spec.storage.size takes any quantity; this is the narrower
@@ -1086,13 +1072,7 @@ print_footprint_summary() {
   rm -f "$err_file"
 }
 
-# The PlatformAgent and its release, read once for the scope check and the
-# mode notice beside it. Each front door calls refuse_apply_over_undeclared_scope
-# and then announce_platform_agent_mode_for_apply against the same namespace,
-# with nothing applied in between, so the reads this fills are held for the
-# notice (PLATFORM_AGENT_READS_HELD_FOR) and the notice takes and clears them
-# instead of asking the cluster again. A run whose scope check did not run
-# (an install.sh --dry-run, a first install) has the notice read for itself.
+# The PlatformAgent and its release, read for the scope check.
 #
 # Fills, for $1 namespace:
 #   PLATFORM_AGENT_CR_READ      PLATFORM_AGENT_READ_OK, _NONE (no PlatformAgent
@@ -1102,26 +1082,20 @@ print_footprint_summary() {
 #                               nothing was asked)
 #   PLATFORM_AGENT_CR_JSON      the `kubectl get platformagents -o json` list
 #   PLATFORM_AGENT_RECORD_READ  _OK, _NONE (no release) or _FAILED; empty when
-#                               the CR read did not answer, or $2 is "cr-only"
+#                               the CR read did not answer
 #   PLATFORM_AGENT_RECORD_JSON  the latest revision's values ({} with no release)
 #   PLATFORM_AGENT_SERVED_JSON  the last served revision's values, only when
 #                               the latest did not serve (a failed or pending
 #                               upgrade); {} otherwise
-#   PLATFORM_AGENT_SERVED_REVISION  that revision's number, else empty
-#   PLATFORM_AGENT_SERVED_READ  _FAILED when the release history, or that
-#                               revision's values, could not be read, else
-#                               empty
 #   PLATFORM_AGENT_READ_ERROR   the failed read's stderr, on one line
 # A missing type and a missing release are answers, told apart from a read
 # that failed by kubectl's and helm's exit status and their own error text,
 # never by empty output. Caller has PROJECT_ID, REGION and CLUSTER_NAME set
 # (gke_context_name).
 read_platform_agent_install_state() {
-  local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" scope="${2:-}" expected_ctx err_file served_rev history_json
-  PLATFORM_AGENT_READS_HELD_FOR="$namespace"
+  local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" expected_ctx err_file served_rev history_json
   PLATFORM_AGENT_CR_READ="" PLATFORM_AGENT_CR_JSON="" PLATFORM_AGENT_RECORD_READ=""
-  PLATFORM_AGENT_RECORD_JSON="{}" PLATFORM_AGENT_SERVED_JSON="{}" PLATFORM_AGENT_SERVED_READ=""
-  PLATFORM_AGENT_SERVED_REVISION=""
+  PLATFORM_AGENT_RECORD_JSON="{}" PLATFORM_AGENT_SERVED_JSON="{}"
   PLATFORM_AGENT_READ_ERROR=""
   expected_ctx="$(gke_context_name)"
   if ! kubectl config get-contexts "$expected_ctx" >/dev/null 2>&1; then
@@ -1143,10 +1117,6 @@ read_platform_agent_install_state() {
     return 0
   fi
   PLATFORM_AGENT_CR_READ="$PLATFORM_AGENT_READ_OK"
-  if [ "$scope" = "cr-only" ]; then
-    rm -f "$err_file"
-    return 0
-  fi
   if ! PLATFORM_AGENT_RECORD_JSON="$(trap - ERR; helm get values "$KUBE_AGENTS_HELM_RELEASE" -n "$namespace" --kube-context "$expected_ctx" -o json 2>"$err_file")"; then
     if grep -qiE "$HELM_RELEASE_NOT_FOUND_PATTERN" "$err_file"; then
       PLATFORM_AGENT_RECORD_READ="$PLATFORM_AGENT_READ_NONE"
@@ -1164,9 +1134,8 @@ read_platform_agent_install_state() {
   # what Helm diffs the next render against. On a healthy release the latest
   # revision is the one record, so a hand edit that happens to restore an
   # earlier scope is still a hand edit. A history that cannot be read, or
-  # parsed, is PLATFORM_AGENT_SERVED_READ failed: the scope check compares
-  # against the latest revision alone, but the mode notice, which picks one
-  # record, says it did not run rather than guess the latest served.
+  # parsed, names the failure in PLATFORM_AGENT_READ_ERROR: the scope check
+  # compares against the latest revision alone.
   if ! history_json="$(trap - ERR; helm history "$KUBE_AGENTS_HELM_RELEASE" -n "$namespace" --kube-context "$expected_ctx" -o json 2>"$err_file")" \
     || ! served_rev="$(trap - ERR; printf '%s' "$history_json" | python3 -c '
 import json, sys
@@ -1178,171 +1147,36 @@ served = [] if latest is None or latest.get("status") in statuses else [
 ]
 print(max(served) if served else "")
 ' "$HELM_SERVED_REVISION_STATUSES" 2>>"$err_file")"; then
-    PLATFORM_AGENT_SERVED_READ="$PLATFORM_AGENT_READ_FAILED"
     PLATFORM_AGENT_READ_ERROR="the release history did not answer: $(tr '\n' ' ' <"$err_file" | sed 's/[[:space:]]*$//')"
     rm -f "$err_file"
     return 0
   fi
   rm -f "$err_file"
-  PLATFORM_AGENT_SERVED_REVISION="$served_rev"
   if [ -n "$served_rev" ]; then
     if ! PLATFORM_AGENT_SERVED_JSON="$(trap - ERR; helm get values "$KUBE_AGENTS_HELM_RELEASE" -n "$namespace" --kube-context "$expected_ctx" --revision "$served_rev" -o json 2>/dev/null)"; then
       PLATFORM_AGENT_SERVED_JSON="{}"
-      PLATFORM_AGENT_SERVED_READ="$PLATFORM_AGENT_READ_FAILED"
       PLATFORM_AGENT_READ_ERROR="revision ${served_rev}, the last one that served, did not answer"
     fi
   fi
 }
 
-# The held reads for $1 namespace when the scope check just made them, or
-# fresh ones; either way none are held afterwards, so a later call (the
-# menu's next apply) reads again.
-take_platform_agent_install_state() {
-  local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}"
-  if [ -z "${PLATFORM_AGENT_READS_HELD_FOR:-}" ] || [ "$PLATFORM_AGENT_READS_HELD_FOR" != "$namespace" ]; then
-    read_platform_agent_install_state "$namespace" "${2:-}"
-  fi
-  PLATFORM_AGENT_READS_HELD_FOR=""
-}
-
-# The spec.mode of the one PlatformAgent in $1 (a `kubectl get -o json`
-# list), PLATFORM_AGENT_MODE_UNSET when it carries none, nothing when the
-# list is empty. The CR, not the record, is the mode the install runs: a mode
-# set by hand with kubectl is on the CR and in no record.
-platform_agent_mode_on_cr() {
-  printf '%s' "${1:-}" | (trap - ERR; python3 -c '
-import json, sys
-items = (json.load(sys.stdin) or {}).get("items") or []
-if items:
-    sys.stdout.write((items[0].get("spec") or {}).get("mode") or sys.argv[1])
-' "$PLATFORM_AGENT_MODE_UNSET" 2>/dev/null) || true
-}
-
-# The platformAgent.mode of $1 (a release's values as JSON),
-# PLATFORM_AGENT_MODE_UNSET when it records none.
-platform_agent_mode_in_values() {
-  printf '%s' "${1:-}" | (trap - ERR; python3 -c '
-import json, sys
-values = json.load(sys.stdin) or {}
-sys.stdout.write((values.get("platformAgent") or {}).get("mode") or sys.argv[1])
-' "$PLATFORM_AGENT_MODE_UNSET" 2>/dev/null) || true
-}
-
-# A mode as the operator reads it: an absent one is today.
-effective_platform_agent_mode() {
-  if [ "${1:-}" = "$PLATFORM_AGENT_MODE_UNSET" ]; then
-    printf '%s' "$DEFAULT_PLATFORM_AGENT_MODE"
-  else
-    printf '%s' "${1:-}"
-  fi
-}
-
-# The spec.mode the CR carries after a full apply of PLATFORM_AGENT_MODE: $1
-# the record's (the served revision's platformAgent.mode), $2 the live CR's,
-# $3 the key.
-# The composition renders "next" as mode: next and "today" as no field, and
-# Helm patches a custom resource from the difference between the served
-# render and the new one. So a render that changes the mode sets it, one
-# that drops a recorded mode removes it, and one the record already matches
-# changes nothing, leaving whatever the CR carries, a mode set by hand
-# included. The render is modelled from the key alone: a platformAgent.mode
-# in the composition's extra_helm_values is merged over it and wins, and is
-# not seen here (platform_agent_mode_extra_values_caveat says so).
-platform_agent_mode_after_apply() {
-  # Compatibility shim, removed with the mode switch: the CRD defaults
-  # spec.mode to next and the webhook rewrites today, so every apply leaves
-  # next whatever the record, the CR or the key says. The switch notice, the
-  # retag note and the chat checklists read the mode from here.
-  printf '%s' next
-}
-
-# Said under every mode notice that names what an apply does: the
-# composition merges extra_helm_values over the document it computes from
-# PLATFORM_AGENT_MODE, so a platformAgent.mode set there decides, and the
-# installer cannot read it (it lives in a *.auto.tfvars or
-# TF_VAR_extra_helm_values, beside the tfvars the generator writes).
-platform_agent_mode_extra_values_caveat() {
-  print_info "This compares PLATFORM_AGENT_MODE in install.env with the cluster. A platformAgent.mode set through the composition's extra_helm_values wins over the key, and this check does not see it."
-}
-
-# Says what a full apply does to the install's spec.mode: $1 the record's
-# mode, $2 the live CR's, $3 what PLATFORM_AGENT_MODE resolves to now, $4
-# PLATFORM_AGENT_MODE_NOTICE_UNGATED when no confirmation follows. A
-# switch is a rollout of a different component stack, not a setting, and the
-# only trace of it in install.env is the one key someone edited, so the run
-# that applies it names it first. A key the apply cannot bring the CR to,
-# because the CR carries a mode set outside this installer, is named too.
-# Silent when either value is empty (no CR, no release: a first install),
-# and on a re-apply of the same mode. Sets PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED
-# to true when it names a switch, so install.sh -y can refuse one nobody chose. A read that failed is not empty: the
-# front-door call says so itself (announce_platform_agent_mode_for_apply).
-# Caller defines print_warning / print_info.
-announce_platform_agent_mode_switch() {
-  local record="${1:-}" live="${2:-}" key="${3:-}" route="${4:-}" from to
-  # Read by install.sh's -y refusal.
-  # shellcheck disable=SC2034
-  PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED="false"
-  [ -n "$record" ] && [ -n "$live" ] || return 0
-  from="$(effective_platform_agent_mode "$live")"
-  to="$(effective_platform_agent_mode "$(platform_agent_mode_after_apply "$record" "$live" "$key")")"
-  if [ "$from" = "$to" ]; then
-    if [ "$to" != "$key" ]; then
-      print_info "install.env resolves PLATFORM_AGENT_MODE to ${key}, but spec.mode stays next: the CRD defaults it and the webhook rewrites today (${PLATFORM_AGENT_MODE_SWITCH_DOC}). Set PLATFORM_AGENT_MODE=next in install.env, or remove the key, to end this note."
-      platform_agent_mode_extra_values_caveat
-    fi
-    return 0
-  fi
-  # shellcheck disable=SC2034
-  PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED="true"
-  print_warning "This apply switches the install from spec.mode ${from} to ${to} (PLATFORM_AGENT_MODE in install.env): a mode switch, not a settings change."
-  if [ "$to" = "next" ]; then
-    print_info "The operator renders the NATS bus and the A2A gateway beside today's stack and rolls the agent onto them. Under next, chat moves from the agent to the A2A gateway: Google Chat, or Slack when it is the only chat platform enabled."
-  else
-    print_info "The operator retires the A2A stack and rolls the agent back onto today's path."
-  fi
-  if [ "$route" = "$PLATFORM_AGENT_MODE_NOTICE_UNGATED" ]; then
-    print_info "What a switch does, either way: ${PLATFORM_AGENT_MODE_SWITCH_DOC}. This run applies it without asking first: to keep spec.mode ${from}, stop it now (Ctrl-C) and set PLATFORM_AGENT_MODE=${from} in install.env. ./upgrade.sh --plan previews an apply without making it."
-  else
-    print_info "What a switch does, either way: ${PLATFORM_AGENT_MODE_SWITCH_DOC}. To keep spec.mode ${from}, set PLATFORM_AGENT_MODE=${from} in install.env and run again."
-  fi
-  platform_agent_mode_extra_values_caveat
-}
-
-# The retag modes' half: upgrade.sh --upgrade-mode=harness or operator moves
-# image tags on the release's recorded values and applies no tfvars, so the
-# CR keeps the mode it has whatever PLATFORM_AGENT_MODE says. Said when a full
-# upgrade would move it, rather than left for that upgrade to switch the
-# install without a word from this run. $1 the record's mode, $2 the live
-# CR's, $3 the key, $4 the upgrade mode. Silent when either is empty.
-note_platform_agent_mode_not_applied() {
-  local record="${1:-}" live="${2:-}" key="${3:-}" upgrade_mode="${4:-}" running full
-  [ -n "$record" ] && [ -n "$live" ] || return 0
-  running="$(effective_platform_agent_mode "$live")"
-  full="$(effective_platform_agent_mode "$(platform_agent_mode_after_apply "$record" "$live" "$key")")"
-  [ "$running" != "$full" ] || return 0
-  print_warning "install.env sets PLATFORM_AGENT_MODE=${key}, but this --upgrade-mode=${upgrade_mode} run installs an operator whose CRD defaults spec.mode to ${full}: the install runs the A2A stack after it whatever the key says."
-  print_info "Set PLATFORM_AGENT_MODE=next in install.env, or remove the key (${PLATFORM_AGENT_MODE_SWITCH_DOC})."
-  platform_agent_mode_extra_values_caveat
-}
-
 # Whether Slack is consumed by the A2A gateway after this apply: the
 # operator's a2aSlackArmed (k8s-operator platformagent_a2a_manifests.go),
-# which is spec.mode next, Slack enabled and Google Chat not armed. Chat holds
-# the gateway when both are on, and Slack stays on the today path. $1 the
-# mode the apply renders, $2 SLACK_ENABLED, $3 GOOGLE_CHAT_ENABLED.
+# which is Slack enabled and Google Chat not armed. Chat holds the gateway
+# when both are on, and Slack stays on the Hermes Slack platform. $1
+# SLACK_ENABLED, $2 GOOGLE_CHAT_ENABLED.
 slack_moves_to_a2a_gateway() {
-  [ "${1:-}" = "next" ] && is_truthy "${2:-}" && ! is_truthy "${3:-}"
+  is_truthy "${1:-}" && ! is_truthy "${2:-}"
 }
 
 # Whether Google Chat is consumed by the A2A gateway after this apply: the
 # operator's a2aChatArmed (k8s-operator platformagent_a2a_manifests.go),
-# spec.mode next with Google Chat enabled. $1 the mode the apply renders, $2
-# GOOGLE_CHAT_ENABLED.
+# Google Chat enabled. $1 GOOGLE_CHAT_ENABLED.
 google_chat_moves_to_a2a_gateway() {
-  [ "${1:-}" = "next" ] && is_truthy "${2:-}"
+  is_truthy "${1:-}"
 }
 
-# The three checks behind refuse_next_slack_gateway_settings, one per
+# The three checks behind refuse_slack_gateway_settings, one per
 # setting, which the install.sh interview also uses to re-ask. Each prints
 # nothing for a setting that passes.
 #
@@ -1426,8 +1260,8 @@ slack_bot_token_has_separator() {
   return 1
 }
 
-# Three Slack settings that the today path accepts and the A2A gateway does
-# not. They are refused before the front door applies anything (#2812), and
+# Three Slack settings that the Hermes Slack platform accepts and the A2A
+# gateway does not. They are refused before the front door applies anything (#2812), and
 # only when Slack moves to the gateway (slack_moves_to_a2a_gateway). Every
 # failing setting is reported in one run. There is no email-to-ID lookup.
 #
@@ -1435,7 +1269,7 @@ slack_bot_token_has_separator() {
 #   The installer's prompt in 0.7 and 0.8 asked for "User IDs / Emails", and
 #   an email matches nobody, so that person is refused after the switch. A
 #   list of only emails is non-empty, so it does not fall back to allow-all.
-#   The today path (Hermes) never matched an email either.
+#   The Hermes Slack platform never matched an email either.
 # - SLACK_HOME_CHANNEL, when set, must be a channel id
 #   (SLACK_HOME_CHANNEL_ID_RE). With anything else, a DM (D...) or a user
 #   (U...), the gateway leaves its notify route unarmed, so proactive posts
@@ -1449,16 +1283,15 @@ slack_bot_token_has_separator() {
 #   recovered from the live Secret later, so the front doors call again
 #   after recovery.
 #
-# $1 the mode the apply renders, $2 SLACK_ENABLED, $3 GOOGLE_CHAT_ENABLED,
-# $4 the allowlist, $5 the home channel, $6 the bot token. $7 is "flags"
-# when install.sh's flags can set them too, so the remedy names each flag.
-# $8 is SCOPE_CHECK_MODE_WARN for a run that applies nothing (upgrade.sh
-# --plan, install.sh --dry-run): it warns, as the scope check does, and
-# returns 0.
-refuse_next_slack_gateway_settings() {
-  local allowlist="${4:-}" home="${5:-}" token="${6:-}" flags="${7:-}" mode="${8:-}"
-  local emails bad_home count refused=false via keep_today say=print_error lead=""
-  slack_moves_to_a2a_gateway "${1:-}" "${2:-}" "${3:-}" || return 0
+# $1 SLACK_ENABLED, $2 GOOGLE_CHAT_ENABLED, $3 the allowlist, $4 the home
+# channel, $5 the bot token. $6 is "flags" when install.sh's flags can set
+# them too, so the remedy names each flag. $7 is SCOPE_CHECK_MODE_WARN for a
+# run that applies nothing (upgrade.sh --plan, install.sh --dry-run): it
+# warns, as the scope check does, and returns 0.
+refuse_slack_gateway_settings() {
+  local allowlist="${3:-}" home="${4:-}" token="${5:-}" flags="${6:-}" mode="${7:-}"
+  local emails bad_home count refused=false via say=print_error lead=""
+  slack_moves_to_a2a_gateway "${1:-}" "${2:-}" || return 0
   if [ "$mode" = "$SCOPE_CHECK_MODE_WARN" ]; then
     say=print_warning
     lead="An applying run would be refused: "
@@ -1466,31 +1299,26 @@ refuse_next_slack_gateway_settings() {
   emails="$(slack_allowlist_emails "$allowlist")"
   if [ -n "$emails" ]; then
     via="install.env"; [ "$flags" = "flags" ] && via="install.env or --slack-allowed-users"
-    "$say" "${lead}SLACK_ALLOWED_USERS holds entries that look like emails: ${emails}. Under spec.mode next the A2A gateway matches this allowlist against Slack member IDs exactly (such as U0123ABCD), so an email matches nobody and the person it names would be locked out after this apply."
-    print_info "Find each person's member ID in Slack: open their profile, choose ⋮ (More), then Copy member ID. Replace the emails with those IDs in ${via} and run again. Slack app setup for next: ${SLACK_ALLOWLIST_DOC}"
+    "$say" "${lead}SLACK_ALLOWED_USERS holds entries that look like emails: ${emails}. The A2A gateway matches this allowlist against Slack member IDs exactly (such as U0123ABCD), so an email matches nobody and the person it names would be locked out after this apply."
+    print_info "Find each person's member ID in Slack: open their profile, choose ⋮ (More), then Copy member ID. Replace the emails with those IDs in ${via} and run again. Slack app setup for the A2A gateway: ${SLACK_ALLOWLIST_DOC}"
     refused=true
   fi
   bad_home="$(slack_home_channel_not_an_id "$home")"
   if [ -n "$bad_home" ]; then
     via="install.env"; [ "$flags" = "flags" ] && via="install.env or --slack-home-channel"
-    "$say" "${lead}SLACK_HOME_CHANNEL is '${bad_home}', which is not a Slack channel id (C... or G...). Under spec.mode next the A2A gateway does not arm its notify route with it, so the agent's proactive posts and every board card's report back stop."
+    "$say" "${lead}SLACK_HOME_CHANNEL is '${bad_home}', which is not a Slack channel id (C... or G...). The A2A gateway does not arm its notify route with it, so the agent's proactive posts and every board card's report back stop."
     print_info "Use the channel's id: in Slack, open the channel's details; the id is at the bottom of the About tab. Set it in ${via} and run again."
     refused=true
   fi
   count="$(slack_bot_token_list_count "$token")"
   if [ -n "$count" ]; then
-    via="install.env"; keep_today="PLATFORM_AGENT_MODE=today"
-    if [ "$flags" = "flags" ]; then
-      via="install.env or --slack-bot-token"
-      # A first install is next by default, so the flag is the way to stay on today.
-      keep_today="PLATFORM_AGENT_MODE=today (--mode=today on a first install with no install.env)"
-    fi
-    "$say" "${lead}SLACK_BOT_TOKEN holds ${count} tokens, a list for several workspaces. Under spec.mode next the A2A gateway's Slack backend takes one workspace's bot token, and Slack refuses a list, so that backend retries without end and nothing answers on Slack."
-    print_info "Set SLACK_BOT_TOKEN to one workspace's bot token (xoxb-...) in ${via} and run again, or keep this install on ${keep_today}."
+    via="install.env"; [ "$flags" = "flags" ] && via="install.env or --slack-bot-token"
+    "$say" "${lead}SLACK_BOT_TOKEN holds ${count} tokens, a list for several workspaces. The A2A gateway's Slack backend takes one workspace's bot token, and Slack refuses a list, so that backend retries without end and nothing answers on Slack."
+    print_info "Set SLACK_BOT_TOKEN to one workspace's bot token (xoxb-...) in ${via} and run again."
     refused=true
   elif slack_bot_token_has_separator "$token"; then
     via="install.env"; [ "$flags" = "flags" ] && via="install.env or --slack-bot-token"
-    "$say" "${lead}SLACK_BOT_TOKEN holds one token with a comma or space left in it. Under spec.mode next the A2A gateway's Slack backend takes the value whole, and Slack refuses it, so that backend retries without end and nothing answers on Slack."
+    "$say" "${lead}SLACK_BOT_TOKEN holds one token with a comma or space left in it. The A2A gateway's Slack backend takes the value whole, and Slack refuses it, so that backend retries without end and nothing answers on Slack."
     print_info "Remove the comma or space from SLACK_BOT_TOKEN in ${via} and run again."
     refused=true
   fi
@@ -1498,16 +1326,16 @@ refuse_next_slack_gateway_settings() {
   return 0
 }
 
-# refuse_next_slack_gateway_settings on the exported keys: what install.env
+# refuse_slack_gateway_settings on the exported keys: what install.env
 # loaded, or what install.sh exported, plus a token the tfvars generator
-# recovered from the live Secret. $1 and $2 are the other's $7 and $8.
-refuse_next_slack_gateway_settings_from_env() {
-  refuse_next_slack_gateway_settings "$(platform_agent_mode_after_apply "" "" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}")" \
+# recovered from the live Secret. $1 and $2 are the other's $6 and $7.
+refuse_slack_gateway_settings_from_env() {
+  refuse_slack_gateway_settings \
     "${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}" "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}" \
     "${SLACK_ALLOWED_USERS:-}" "${SLACK_HOME_CHANNEL:-}" "${SLACK_BOT_TOKEN:-}" "${1:-}" "${2:-}"
 }
 
-# Under spec.mode next the A2A gateway, not the agent, makes the agent's
+# The A2A gateway, not the agent, makes the agent's
 # proactive posts (alerts, drift reports, scheduled reports), and it arms them
 # only on a home channel. A reply in a conversation still arrives without one,
 # so an install with none looks healthy while every unprompted post is refused
@@ -1516,21 +1344,20 @@ refuse_next_slack_gateway_settings_from_env() {
 # state as the HomeChannelUnset condition.
 #
 # The install.env key of the home channel the gateway's chat backend lacks,
-# or nothing: $1 the mode the apply renders, $2 SLACK_ENABLED, $3
-# GOOGLE_CHAT_ENABLED, $4 SLACK_HOME_CHANNEL, $5 GOOGLE_CHAT_HOME_CHANNEL.
+# or nothing: $1 SLACK_ENABLED, $2 GOOGLE_CHAT_ENABLED, $3 SLACK_HOME_CHANNEL,
+# $4 GOOGLE_CHAT_HOME_CHANNEL.
 # The backend follows the operator: Chat holds the gateway when enabled, and
 # Slack only when Chat is not (slack_moves_to_a2a_gateway).
-next_home_channel_unset_key() {
+gateway_home_channel_unset_key() {
   local home
-  [ "${1:-}" = "next" ] || return 0
-  if is_truthy "${3:-}"; then
-    home="${5:-}"
+  if is_truthy "${2:-}"; then
+    home="${4:-}"
     home="$(trim_go_space "$home")"
     [ -n "$home" ] || printf '%s' GOOGLE_CHAT_HOME_CHANNEL
     return 0
   fi
-  if is_truthy "${2:-}"; then
-    home="${4:-}"
+  if is_truthy "${1:-}"; then
+    home="${3:-}"
     home="$(trim_go_space "$home")"
     [ -n "$home" ] || printf '%s' SLACK_HOME_CHANNEL
   fi
@@ -1538,19 +1365,19 @@ next_home_channel_unset_key() {
 }
 
 # The warning for that key ($1), one line.
-next_home_channel_unset_message() {
+gateway_home_channel_unset_message() {
   local meanwhile="it refuses them and keeps them for one digest"
   # Only the Chat key can have Slack beside it: Slack holds the gateway only
   # with Chat off, so with the Slack key the posts are kept, never sent on.
   if [ "${1:-}" = GOOGLE_CHAT_HOME_CHANNEL ]; then
     meanwhile="${meanwhile} (or, with Slack enabled too, they go to the Slack Hermes platform, which delivers them only if Slack has a home channel)"
   fi
-  printf '%s' "${1} is empty, and under spec.mode next the A2A gateway posts the agent's alerts, drift reports and scheduled reports only to a home channel, so until one is set ${meanwhile}; replies in a conversation still arrive. The PlatformAgent carries the HomeChannelUnset condition until it is set."
+  printf '%s' "${1} is empty, and the A2A gateway posts the agent's alerts, drift reports and scheduled reports only to a home channel, so until one is set ${meanwhile}; replies in a conversation still arrive. The PlatformAgent carries the HomeChannelUnset condition until it is set."
 }
 
 # What to set for that key ($1); $2 is "flags" when install.sh's flags can
 # set it too.
-next_home_channel_unset_remedy() {
+gateway_home_channel_unset_remedy() {
   local via="install.env"
   case "${1:-}" in
     SLACK_HOME_CHANNEL)
@@ -1564,37 +1391,37 @@ next_home_channel_unset_remedy() {
   esac
 }
 
-# Set by warn_next_home_channel_unset, and again by install.sh from the mode
-# after the apply, so the front door's closing summary can say it again where
-# the reader of a non-interactive run's log will see it.
-NEXT_HOME_CHANNEL_UNSET_KEY=""
+# Set by warn_gateway_home_channel_unset, and again by install.sh after the
+# apply, so the front door's closing summary can say it again where the
+# reader of a non-interactive run's log will see it.
+GATEWAY_HOME_CHANNEL_UNSET_KEY=""
 
 # Warns when the apply leaves the gateway's chat backend without a home
 # channel, and records the key for the closing summary. Takes
-# next_home_channel_unset_key's five arguments, then "flags" as $6. Never
+# gateway_home_channel_unset_key's four arguments, then "flags" as $5. Never
 # refuses.
-warn_next_home_channel_unset() {
-  NEXT_HOME_CHANNEL_UNSET_KEY="$(next_home_channel_unset_key "${1:-}" "${2:-}" "${3:-}" "${4:-}" "${5:-}")"
-  [ -n "$NEXT_HOME_CHANNEL_UNSET_KEY" ] || return 0
-  print_warning "$(next_home_channel_unset_message "$NEXT_HOME_CHANNEL_UNSET_KEY")"
-  print_info "$(next_home_channel_unset_remedy "$NEXT_HOME_CHANNEL_UNSET_KEY" "${6:-}")"
+warn_gateway_home_channel_unset() {
+  GATEWAY_HOME_CHANNEL_UNSET_KEY="$(gateway_home_channel_unset_key "${1:-}" "${2:-}" "${3:-}" "${4:-}")"
+  [ -n "$GATEWAY_HOME_CHANNEL_UNSET_KEY" ] || return 0
+  print_warning "$(gateway_home_channel_unset_message "$GATEWAY_HOME_CHANNEL_UNSET_KEY")"
+  print_info "$(gateway_home_channel_unset_remedy "$GATEWAY_HOME_CHANNEL_UNSET_KEY" "${5:-}")"
   return 0
 }
 
-# warn_next_home_channel_unset on the exported keys; $1 is its $6.
-warn_next_home_channel_unset_from_env() {
-  warn_next_home_channel_unset "$(platform_agent_mode_after_apply "" "" "${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}")" \
+# warn_gateway_home_channel_unset on the exported keys; $1 is its $5.
+warn_gateway_home_channel_unset_from_env() {
+  warn_gateway_home_channel_unset \
     "${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}" "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}" \
     "${SLACK_HOME_CHANNEL:-}" "${GOOGLE_CHAT_HOME_CHANNEL:-}" "${1:-}"
 }
 
-# The closing summary's block, when warn_next_home_channel_unset found the
+# The closing summary's block, when warn_gateway_home_channel_unset found the
 # key empty: printed last, so a non-interactive log ends on it. $1 "flags".
-print_next_home_channel_unset_summary() {
-  [ -n "$NEXT_HOME_CHANNEL_UNSET_KEY" ] || return 0
+print_gateway_home_channel_unset_summary() {
+  [ -n "$GATEWAY_HOME_CHANNEL_UNSET_KEY" ] || return 0
   echo ""
-  print_warning "No home channel: proactive posts are not delivered there yet. $(next_home_channel_unset_message "$NEXT_HOME_CHANNEL_UNSET_KEY")"
-  print_info "$(next_home_channel_unset_remedy "$NEXT_HOME_CHANNEL_UNSET_KEY" "${1:-}")"
+  print_warning "No home channel: proactive posts are not delivered there yet. $(gateway_home_channel_unset_message "$GATEWAY_HOME_CHANNEL_UNSET_KEY")"
+  print_info "$(gateway_home_channel_unset_remedy "$GATEWAY_HOME_CHANNEL_UNSET_KEY" "${1:-}")"
 }
 
 # Set by print_chat_setup_checklists: "true" when it printed a checklist.
@@ -1616,18 +1443,17 @@ print_chat_checklist_commands() {
   return 0
 }
 
-# The chat setup checklists after an apply, and the closing summary's key: $1
-# the spec.mode the CR is on after it. The chat keys, NAMESPACE, PROJECT_NUMBER
-# and INSTALL_ENV_FILE are read from the environment the apply rendered from,
-# which every caller has exported by then; what the apply used wins over
-# install.env in the printers. Returns 0 whatever it printed, because the
-# front doors call it bare under set -e.
+# The chat setup checklists after an apply, and the closing summary's key.
+# The chat keys, NAMESPACE, PROJECT_NUMBER and INSTALL_ENV_FILE are read from
+# the environment the apply rendered from, which every caller has exported by
+# then; what the apply used wins over install.env in the printers. Returns 0
+# whatever it printed, because the front doors call it bare under set -e.
 # shellcheck disable=SC2034  # both globals are read by install.sh
 print_chat_setup_checklists() {
-  local mode="${1:-}" printers failed="false"
+  local printers failed="false"
   printers="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   CHAT_SETUP_CHECKLIST_PRINTED="false"
-  NEXT_HOME_CHANNEL_UNSET_KEY="$(next_home_channel_unset_key "$mode" "${SLACK_ENABLED:-}" \
+  GATEWAY_HOME_CHANNEL_UNSET_KEY="$(gateway_home_channel_unset_key "${SLACK_ENABLED:-}" \
     "${GOOGLE_CHAT_ENABLED:-}" "${SLACK_HOME_CHANNEL:-}" "${GOOGLE_CHAT_HOME_CHANNEL:-}")"
   # --dry-run: a printer changes nothing, yet load_state would otherwise ask
   # for REGISTRY_PREFIX on a terminal when no file records it, and write it to
@@ -1635,7 +1461,6 @@ print_chat_setup_checklists() {
   if is_truthy "${GOOGLE_CHAT_ENABLED:-}"; then
     echo ""
     KUBE_AGENTS_INSTALL_ENV="${INSTALL_ENV_FILE:-}" \
-      GCHAT_STEPS_PLATFORM_AGENT_MODE="$mode" \
       GCHAT_STEPS_GOOGLE_CHAT_ENABLED="${GOOGLE_CHAT_ENABLED:-}" \
       GCHAT_STEPS_HOME_CHANNEL="${GOOGLE_CHAT_HOME_CHANNEL:-}" \
       GCHAT_STEPS_ALLOWED_USERS="${ALLOWED_USERS:-}" \
@@ -1648,7 +1473,6 @@ print_chat_setup_checklists() {
   if is_truthy "${SLACK_ENABLED:-}"; then
     echo ""
     KUBE_AGENTS_INSTALL_ENV="${INSTALL_ENV_FILE:-}" \
-      SLACK_STEPS_PLATFORM_AGENT_MODE="$mode" \
       SLACK_STEPS_SLACK_ENABLED="${SLACK_ENABLED:-}" \
       SLACK_STEPS_GOOGLE_CHAT_ENABLED="${GOOGLE_CHAT_ENABLED:-false}" \
       SLACK_STEPS_HOME_CHANNEL="${SLACK_HOME_CHANNEL:-}" \
@@ -1661,121 +1485,6 @@ print_chat_setup_checklists() {
     print_chat_checklist_commands
   fi
   return 0
-}
-
-# Said when a read the notice needs failed, so the run does not go on as if
-# the notice had been weighed and found nothing to say. $1 what could not be
-# read, $2 the key, $3 namespace.
-_platform_agent_mode_unread() {
-  print_warning "The mode-switch check did not run: ${1}. This apply renders spec.mode from PLATFORM_AGENT_MODE=${2} in install.env whatever the PlatformAgent carries now, so if that differs it is a mode switch (${PLATFORM_AGENT_MODE_SWITCH_DOC})."
-  print_info "Check before confirming: kubectl get platformagents -n ${3} --context $(gke_context_name) -o jsonpath='{.items[*].spec.mode}' (empty is today)."
-}
-
-# The spec.mode the CR carries after this apply, for the chat checklists that
-# follow it: the key, unless the reads below show a CR the apply leaves on
-# another mode (platform_agent_mode_after_apply). A platformAgent.mode in the
-# composition's extra_helm_values is not followed: the installer cannot read
-# it (platform_agent_mode_extra_values_caveat).
-PLATFORM_AGENT_MODE_AFTER_APPLY=""
-
-# The front door's call, after the scope check beside it: $1 namespace, $2
-# the key, $3 PLATFORM_AGENT_MODE_NOTICE_UNGATED on a route with no
-# confirmation after the notice. Quiet where there is nothing to switch (a cluster the tfvars
-# generator found NOT_FOUND, so TFVARS_CLUSTER_EXISTS=false, which is every
-# first install: nothing is read, since a kubeconfig context left by an
-# earlier install of the same name points at an endpoint that is gone; no
-# PlatformAgent type, no CR, no release), loud where a read failed. Past that
-# guard the cluster exists, so a kubeconfig with no context for it (kubectl
-# absent, or a get-credentials that did not land on the --dry-run and
-# --generate-only routes the scope check skips) is a read that did not
-# happen, and is said with the scope check's remedy.
-# shellcheck disable=SC2034  # PLATFORM_AGENT_MODE_AFTER_APPLY is read by install.sh and upgrade.sh
-announce_platform_agent_mode_for_apply() {
-  local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" key="${2:-}" live record
-  # Read by install.sh's -y refusal.
-  # shellcheck disable=SC2034
-  PLATFORM_AGENT_MODE_SWITCH_ANNOUNCED="false"
-  PLATFORM_AGENT_MODE_AFTER_APPLY="$(platform_agent_mode_after_apply "" "" "$key")"
-  if [ "${TFVARS_CLUSTER_EXISTS:-}" = "false" ]; then
-    PLATFORM_AGENT_READS_HELD_FOR=""
-    return 0
-  fi
-  take_platform_agent_install_state "$namespace"
-  case "$PLATFORM_AGENT_CR_READ" in
-    "$PLATFORM_AGENT_READ_FAILED")
-      _platform_agent_mode_unread "the PlatformAgent in namespace '${namespace}' could not be read (${PLATFORM_AGENT_READ_ERROR})" "$key" "$namespace"
-      return 0
-      ;;
-    "$PLATFORM_AGENT_READ_NO_CONTEXT")
-      _platform_agent_mode_unread "the kubeconfig has no context '$(gke_context_name)' to read the PlatformAgent through (run: gcloud container clusters get-credentials ${CLUSTER_NAME} --location ${REGION} --project ${PROJECT_ID})" "$key" "$namespace"
-      return 0
-      ;;
-    "$PLATFORM_AGENT_READ_OK") ;;
-    *) return 0 ;;
-  esac
-  live="$(platform_agent_mode_on_cr "$PLATFORM_AGENT_CR_JSON")"
-  [ -n "$live" ] || return 0
-  if [ "$PLATFORM_AGENT_RECORD_READ" = "$PLATFORM_AGENT_READ_FAILED" ] || [ "$PLATFORM_AGENT_SERVED_READ" = "$PLATFORM_AGENT_READ_FAILED" ]; then
-    _platform_agent_mode_unread "the values of release '${KUBE_AGENTS_HELM_RELEASE}' in namespace '${namespace}' could not be read (${PLATFORM_AGENT_READ_ERROR})" "$key" "$namespace"
-    return 0
-  fi
-  [ "$PLATFORM_AGENT_RECORD_READ" = "$PLATFORM_AGENT_READ_OK" ] || return 0
-  if [ -n "$PLATFORM_AGENT_SERVED_REVISION" ]; then
-    record="$(platform_agent_mode_in_values "$PLATFORM_AGENT_SERVED_JSON")"
-  else
-    record="$(platform_agent_mode_in_values "$PLATFORM_AGENT_RECORD_JSON")"
-  fi
-  PLATFORM_AGENT_MODE_AFTER_APPLY="$(effective_platform_agent_mode "$(platform_agent_mode_after_apply "$record" "$live" "$key")")"
-  announce_platform_agent_mode_switch "$record" "$live" "$key" "${3:-}"
-}
-
-# After announce_platform_agent_mode_for_apply, from the reads it left:
-# succeeds unless they show that no install runs next, that is no cluster, no
-# PlatformAgent type, a CR on today, or, with the CR gone, no release or one
-# that records today (the next apply recreates the CR from it). A read that
-# failed or did not happen is not today. upgrade.sh refuses a keyless
-# install.env on this, since such a file renders today.
-platform_agent_install_may_run_next() {
-  local live record
-  [ "${TFVARS_CLUSTER_EXISTS:-}" = "false" ] && return 1
-  case "${PLATFORM_AGENT_CR_READ:-}" in
-    "$PLATFORM_AGENT_READ_NONE") return 1 ;;
-    "$PLATFORM_AGENT_READ_OK") ;;
-    *) return 0 ;;
-  esac
-  live="$(platform_agent_mode_on_cr "$PLATFORM_AGENT_CR_JSON")"
-  if [ -n "$live" ]; then
-    [ "$(effective_platform_agent_mode "$live")" = "next" ]
-    return
-  fi
-  case "${PLATFORM_AGENT_RECORD_READ:-}" in
-    "$PLATFORM_AGENT_READ_NONE") return 1 ;;
-    "$PLATFORM_AGENT_READ_OK") ;;
-    *) return 0 ;;
-  esac
-  [ "${PLATFORM_AGENT_SERVED_READ:-}" = "$PLATFORM_AGENT_READ_FAILED" ] && return 0
-  if [ -n "${PLATFORM_AGENT_SERVED_REVISION:-}" ]; then
-    record="$(platform_agent_mode_in_values "$PLATFORM_AGENT_SERVED_JSON")"
-  else
-    record="$(platform_agent_mode_in_values "$PLATFORM_AGENT_RECORD_JSON")"
-  fi
-  [ "$(effective_platform_agent_mode "$record")" = "next" ]
-}
-
-# upgrade.sh's retag arms, after retag_values: $1 namespace, $2 the key, $3
-# the upgrade mode, $4 RETAG_VALUES_JSON, the values the retag re-applies and
-# so the record a later full upgrade diffs against. Only the CR is read here.
-note_platform_agent_mode_for_retag() {
-  local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" live
-  read_platform_agent_install_state "$namespace" cr-only
-  PLATFORM_AGENT_READS_HELD_FOR=""
-  if [ "$PLATFORM_AGENT_CR_READ" = "$PLATFORM_AGENT_READ_FAILED" ]; then
-    print_info "Whether a full upgrade would switch spec.mode was not checked: the PlatformAgent in namespace '${namespace}' could not be read (${PLATFORM_AGENT_READ_ERROR}). This run leaves the mode where it is either way."
-    return 0
-  fi
-  [ "$PLATFORM_AGENT_CR_READ" = "$PLATFORM_AGENT_READ_OK" ] || return 0
-  live="$(platform_agent_mode_on_cr "$PLATFORM_AGENT_CR_JSON")"
-  note_platform_agent_mode_not_applied "$(platform_agent_mode_in_values "${4:-}")" "$live" "${2:-}" "${3:-}"
 }
 
 # The GCP IAM role bundles the install knows how to grant. Kubernetes RBAC is
@@ -2001,10 +1710,6 @@ load_install_env() {
   # inherited SCOPED_SA_POOL_ENABLED=true would arm the pool for one run, on
   # accounts the next run from a clean shell deletes again.
   unset SCOPED_SA_POOL_ENABLED SCOPED_SA_POOL_MAX_ACCOUNTS
-  # The PlatformAgent's mode too: an inherited PLATFORM_AGENT_MODE=next would
-  # switch the install's component stack for one run, and the next run from a
-  # clean shell would switch it back and retire the A2A stack.
-  unset PLATFORM_AGENT_MODE
   # The data volume size too: an inherited PLATFORM_AGENT_STORAGE_SIZE would
   # grow both data claims for one run, and the next run from a clean shell
   # would drop the field again, leaving claims larger than the CR says.
@@ -2028,7 +1733,25 @@ load_install_env() {
   # shellcheck disable=SC1090
   . "$file"
   set +a
+  note_ignored_platform_agent_mode_key "$file"
   return 0
+}
+
+# PLATFORM_AGENT_MODE is read and ignored: a file from before every install
+# ran the A2A stack still assigns it, and a loader says so once rather than
+# refuse the file or apply anything from the key. Detected from the file, not
+# the variable, so a shell export says nothing; the variable is unset either
+# way, as the loaders do for every key only the file may set, so nothing
+# downstream can read it. $1 the install.env just loaded. Caller defines
+# print_info.
+note_ignored_platform_agent_mode_key() {
+  local file="${1:-}"
+  unset PLATFORM_AGENT_MODE
+  [ "$PLATFORM_AGENT_MODE_IGNORED_NOTED" != "true" ] || return 0
+  [ -n "$file" ] && [ -f "$file" ] || return 0
+  grep -Eq "^[[:space:]]*(export[[:space:]]+)?PLATFORM_AGENT_MODE=" "$file" 2>/dev/null || return 0
+  PLATFORM_AGENT_MODE_IGNORED_NOTED="true"
+  print_info "${file} ${PLATFORM_AGENT_MODE_IGNORED_NOTICE}"
 }
 
 # ─── install.env Persistence ──────────────────────────────────────────────────
@@ -2040,8 +1763,8 @@ load_install_env() {
 # any key here: "Save & Apply Configuration Changes" is an explicit instruction
 # to record a change, not the installer quietly overwriting an input. install.sh
 # itself writes only as scripts/installer/README.md ("install.env") lists: the
-# file on a first install, a chat key or PLATFORM_AGENT_MODE it lacks, and the
-# GitOps keys a run applies differently.
+# file on a first install, a chat key it lacks, and the GitOps keys a run
+# applies differently.
 #
 # No `export` keyword in the output: install.env is a dotenv, loaded with
 # `set -a`. The value is still %q-quoted, so spaces and quotes survive.
@@ -3085,9 +2808,6 @@ refuse_apply_over_undeclared_scope() {
   local namespace="${1:-${NAMESPACE:-$DEFAULT_NAMESPACE}}" mode="${2:-$SCOPE_CHECK_MODE_REFUSE}"
   local expected_ctx cr_json record_json served_json err_file verdict first_line
   expected_ctx="$(gke_context_name)"
-  # The reads stay held for the mode notice each front door calls next
-  # (announce_platform_agent_mode_for_apply), which takes them rather than
-  # asking the cluster the same questions again.
   read_platform_agent_install_state "$namespace"
   case "$PLATFORM_AGENT_CR_READ" in
     "$PLATFORM_AGENT_READ_NO_CONTEXT")
@@ -5447,16 +5167,10 @@ write_tfvars_from_state() {
     print_error "HELM_UPGRADE_INSTALL='${helm_upgrade_install}' is neither true nor false. Fix it in install.env."
     return 1
   fi
-  # The mode, for the MODEL_MAX_TOKENS reason: upgrade.sh and the Day-2 menu
-  # regenerate from install.env without install.sh's check, and the variable's
-  # validation would otherwise refuse it at plan, naming neither the key nor
-  # the file.
-  local platform_agent_mode="${PLATFORM_AGENT_MODE:-$DEFAULT_PLATFORM_AGENT_MODE}"
-  if ! is_valid_platform_agent_mode "$platform_agent_mode"; then
-    print_error "PLATFORM_AGENT_MODE='${platform_agent_mode}' is not one of today, next. Fix it in install.env."
-    return 1
-  fi
-  # The data volume size, for the same reason.
+  # The data volume size, for the MODEL_MAX_TOKENS reason: upgrade.sh and the
+  # Day-2 menu regenerate from install.env without install.sh's check, and
+  # the variable's validation would otherwise refuse it at plan, naming
+  # neither the key nor the file.
   local platform_agent_storage_size="${PLATFORM_AGENT_STORAGE_SIZE:-$DEFAULT_PLATFORM_AGENT_STORAGE_SIZE}"
   if ! is_valid_platform_agent_storage_size "$platform_agent_storage_size"; then
     print_error "PLATFORM_AGENT_STORAGE_SIZE='${platform_agent_storage_size}' is not a whole number of Mi, Gi or Ti above zero and at most 64Ti, for example 80Gi. Fix it in install.env, or on a first install, in the value this shell exports."
@@ -5566,10 +5280,6 @@ write_tfvars_from_state() {
     else
       echo "alert_daily_limits = {}"
     fi
-    echo ""
-    echo "# The PlatformAgent's spec.mode (PLATFORM_AGENT_MODE in install.env). The"
-    echo "# composition passes the chart nothing for \"today\", so its CR carries no mode."
-    echo "platform_agent_mode = $(hcl_str "$platform_agent_mode")"
     echo ""
     echo "# The PlatformAgent's spec.storage.size (PLATFORM_AGENT_STORAGE_SIZE in"
     echo "# install.env). The composition passes the chart nothing for the default."

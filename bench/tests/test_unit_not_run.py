@@ -42,7 +42,7 @@ from kube_agents_bench.gate import main
 from kube_agents_bench.scoring import INFRA_FAILURE_MARKER, MISSING
 
 from conftest import FIXTURE_RUNS, GREEN_RUNS, TASKS
-from test_gate import BASELINES, JUDGE, KEY, baseline_line, graded_case, run_record, store_with
+from test_gate import BASELINES, JUDGE, NEXT_KEY, baseline_line, graded_case, run_record, store_with
 
 CI_EVAL_PR = Path(__file__).resolve().parents[2] / "hack" / "ci-eval-pr.sh"
 
@@ -166,7 +166,7 @@ def test_a_lead_off_unminted_repetition_keeps_the_version_key(kanban_task, tmp_p
     out = tmp_path / "case.json"
     doc = graded_case(kanban_task, [lost, FIXTURE_RUNS / GREEN_RUNS[0], FIXTURE_RUNS / GREEN_RUNS[1]], out, store)
     assert [r["outcome"] for r in doc["reps"]] == ["infra", "pass", "pass"]
-    assert doc["version_key"] == KEY
+    assert doc["version_key"] == NEXT_KEY
     # Rung 6 has main's judged mean to compare against.
     assert doc["baseline_judged"] == {"OutcomeValidity": 1.0}
     assert doc["baseline_runs"] == 21
@@ -176,7 +176,7 @@ def test_a_lead_off_unminted_repetition_keeps_the_version_key(kanban_task, tmp_p
     after = (store / "agent-kanban-smoke.jsonl").read_text(encoding="utf-8").splitlines()
     assert len(after) == len(before) + 1
     line = json.loads(after[-1])
-    assert line["key"] == KEY and (line["runs"], line["passes"]) == (2, 2)
+    assert line["key"] == NEXT_KEY and (line["runs"], line["passes"]) == (2, 2)
 
 
 def test_every_repetition_unminted_excludes_the_case(pdb_task, tmp_path):

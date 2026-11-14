@@ -187,7 +187,7 @@ init_var_registry_prefix() {
 
 # ─── Third-party images ───────────────────────────────────────────────────────
 # Images an install pulls that this project does not build: the LiteLLM
-# gateway, the fluent-bit logging sidecar, the GitHub token minter, and
+# gateway, the fluent-bit logging sidecar, the NATS bus, the GitHub token minter, and
 # cert-manager. A mirror commonly keeps those under a different path from the
 # kube-agents images, and an install may mirror one set without the other, so
 # they get their own prefix rather than sharing REGISTRY_PREFIX.

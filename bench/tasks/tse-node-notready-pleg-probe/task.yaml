@@ -2,7 +2,7 @@
 # healthy) escalation request to the optional GKE Support Agent (tse) specialist
 # and verify it produces the 5-section Google Cloud Support Escalation Bundle.
 #
-# Precondition: a spec.mode: next install with the optional AgentProfile/tse
+# Precondition: an install with the optional AgentProfile/tse
 # bound (profiles.tse.enabled=true, so the operator projects
 # KUBE_AGENTS_ENABLED_PROFILES=tse and the entrypoint scaffolds
 # /opt/data/profiles/tse). Parked: the CI lane doesn't enable tse and the case
@@ -56,18 +56,18 @@ verification_spec:
   # The specialist's side: a card completed by the tse profile, read from
   # the worker's calls, which the harness reads back from the pod tagged with
   # the profile (worker_trajectory). A leaf in the workers scope is
-  # worker-blind (cases.py `worker_blind_checks`): graded on the api lane,
-  # set aside as not applicable on every inject record until the scorer
-  # grades worker entries there (#2619). Its own entry, not a leaf beside the
+  # worker-blind (cases.py `worker_blind_checks`): graded only on a
+  # developer's run over the agent API, set aside as not applicable on every
+  # inject record until the scorer grades worker entries there (#2619). Its own entry, not a leaf beside the
   # router's in the entry above: a compound with a workers-scope leaf is
   # worker-blind as a whole, which would take the delegation out of the
   # inject lane's grading. Inside this entry the router leaf comes first, in a
   # fail-fast `sequence`: with no card at all the workers scope has nothing
   # to read and answers `error`, which blocks the repetition at the coverage
   # rung before any fail is tallied; the router leaf turns that run into a
-  # definite fail on the api lane too. That leaf keeps the `assignee` read:
-  # the api lane, the one lane that grades this entry, records the argument
-  # readable, and a card the Planning Agent filed to another profile, whose
+  # definite fail over the agent API too. That leaf keeps the `assignee` read:
+  # a run over the agent API, the one run that grades this entry, records the
+  # argument readable, and a card the Planning Agent filed to another profile, whose
   # worker fanned a child out to tse, is not the delegation the case asks
   # for. A card filed and never worked still has no tagged entry and reads
   # as `error`: the run is unobserved, and coverage blocks it.

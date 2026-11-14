@@ -503,12 +503,11 @@ class RevalidationTest(unittest.TestCase):
         self.assertIn(f"cat {prefix}/200/started.json", calls)
 
     def test_the_history_read_is_keyed_on_the_running_jobs_name(self):
-        """A second presubmit running this script (the next-mode lane, under
-        EVAL_MODE_NEXT=1) has its own history path and its own status
-        context. Keyed on a fixed name it would find the today job's green
-        build at the same head and skip its own matrix; keyed on JOB_NAME it
-        reads only its own history, and the today job's status attests
-        nothing for it."""
+        """A second presubmit running this script has its own history path and
+        its own status context. Keyed on a fixed name it would find the
+        blocking job's green build at the same head and skip its own matrix;
+        keyed on JOB_NAME it reads only its own history, and the blocking
+        job's status attests nothing for it."""
         other_job = f"{_JOB}-next"
         self._plant_history([("200", True, self.c1, self.c3)])
         proc = self._run(
@@ -519,14 +518,14 @@ class RevalidationTest(unittest.TestCase):
         self.assertIn(f"ls {own}/*/finished.json", calls)
         self.assertFalse(
             [c for c in calls if f"/{_PR}/{_JOB}/" in c],
-            f"the today job's history was read under JOB_NAME={other_job}: {calls}",
+            f"the blocking job's history was read under JOB_NAME={other_job}: {calls}",
         )
-        # The stub listing is the today job's; its status event names the
-        # today context, so the other job's attestation must fail closed.
+        # The stub listing is the blocking job's; its status event names the
+        # blocking context, so the other job's attestation must fail closed.
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
         self.assertIn(f"GitHub holds no {other_job} success status", proc.stdout)
 
-    def test_job_name_unset_or_empty_reads_the_today_jobs_history(self):
+    def test_job_name_unset_or_empty_reads_the_blocking_jobs_history(self):
         """The script reads `${JOB_NAME:-default}`, which treats an absent
         variable and an empty one alike -- so both states have to reach it.
         The probe line pins which one each subtest handed the script; without
@@ -814,9 +813,9 @@ class RevalidationTest(unittest.TestCase):
         self.assertIn("VERDICT: REVALIDATED-EXIT", proc.stdout)
         self.assertRegex(proc.stdout, r"REVALIDATED against green build 200\b")
 
-    def test_an_override_of_the_today_job_does_not_green_the_next_lane(self):
-        """The next-mode lane runs step 0 under its own JOB_NAME; an admin's
-        override of the today job's context is not its verdict."""
+    def test_an_override_of_the_blocking_job_does_not_green_another_lane(self):
+        """Another lane runs step 0 under its own JOB_NAME; an admin's
+        override of the blocking job's context is not its verdict."""
         self._plant_statuses(self.c3, [self._override_event()])
         proc = self._run(cur_head=self.c3, cur_base=self.c5, env_overrides={"JOB_NAME": f"{_JOB}-next"})
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)

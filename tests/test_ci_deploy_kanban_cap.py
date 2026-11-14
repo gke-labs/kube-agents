@@ -40,7 +40,7 @@ _CAP_FLAG = '--set "platformAgent.harness.tuning.maxInProgress=${EVAL_KANBAN_MAX
 _CAP_AS_STRING = '--set-string "platformAgent.harness.tuning.maxInProgress'
 _CAP_CONSTANT_RE = re.compile(r'^readonly EVAL_KANBAN_MAX_IN_PROGRESS="(\d+)"$', re.MULTILINE)
 # The presubmit's lane count is the eval script's own default, and ci-deploy.sh
-# carries the same default for the bridge (tests/test_ci_deploy_mode_next.py
+# carries the same default for the bridge (tests/test_ci_deploy_a2a_stack.py
 # pins the two equal). The eval's lane cards come in through the inject and
 # A2A doors, so they are user cards, and at a cap of 2 or more user cards may
 # hold every slot but the one guaranteed to background triage

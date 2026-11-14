@@ -299,7 +299,7 @@ class TestCaseDerivation(unittest.TestCase):
 class TestLaneExcluded(unittest.TestCase):
     def test_the_inject_lanes_dropped_cases_are_named_once_each(self):
         log = (
-            "EVAL_MODE_NEXT=1: running the matrix through the inject door (AGENT_TRANSPORT=inject, token from x)\n"
+            "running the matrix through the inject door (AGENT_TRANSPORT=inject, token from x)\n"
             "AGENT_TRANSPORT=inject: case-c leaves the matrix -- excluded on this lane; the reason is in inject-lane-exclusions.txt\n"
             "AGENT_TRANSPORT=inject: case-d leaves the matrix -- excluded on this lane; the reason is in inject-lane-exclusions.txt\n"
             "AGENT_TRANSPORT=inject: case-c leaves the matrix -- excluded on this lane; the reason is in inject-lane-exclusions.txt\n"

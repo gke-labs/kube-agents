@@ -47,7 +47,7 @@ The GitOps PR path all infrastructure changes take. Enforced by `SOUL.md` and im
 
 ### `kubeagents-system`
 
-The Kubernetes namespace that hosts the kube-agents control plane: the operator, the Platform Agent gateway Deployment, the LiteLLM gateway, Minty, related integration workloads, and under `spec.mode: next` the [A2A stack](#specmode).
+The Kubernetes namespace that hosts the kube-agents control plane: the operator, the Platform Agent gateway Deployment, the LiteLLM gateway, Minty, related integration workloads, and the [A2A stack](#the-a2a-stack).
 
 ### Toolset
 
@@ -70,23 +70,23 @@ This table gives the common outcomes that a card can show. For each outcome, it 
 
 If a card blocks again for the same type of reason (a second question, or a second [rate limit](/kube-agents/operator/platformagent-crd/#specharnesstuning)), Hermes moves it to triage.
 
-## The `next` stack
+## The A2A stack
 
 ### `spec.mode`
 
-The `PlatformAgent` field that selects the component stack. `next`, which a first `install.sh` run records unless it mirrors its third-party images or is passed `--mode=today`, puts the [message bus](#message-bus) and the [A2A gateway](#a2a-gateway) in front of the agent. `today` is the previous layout, where the Planning Agent's own chat adapters listen; it is what a chart or Terraform install with no mode runs, and the rollback ([Switching back to `today`](/kube-agents/install/upgrade/#switching-back-to-today)).
+A deprecated `PlatformAgent` field that the operator ignores: every install runs the A2A stack, which puts the [message bus](#message-bus) and the [A2A gateway](#a2a-gateway) in front of the agent. The webhook rewrites `today` to `next`, and a later release removes the field.
 
 ### Message bus
 
-The NATS JetStream server (`<name>-a2a-nats`) the `next` stack is built on. Chat messages travel over it as tasks, agents publish their progress and results to it, and the [A2A console](#a2a-console) reads it. An auth callout authenticates every client and a verifier checks every submitted task.
+The NATS JetStream server (`<name>-a2a-nats`) the A2A stack is built on. Chat messages travel over it as tasks, agents publish their progress and results to it, and the [A2A console](#a2a-console) reads it. An auth callout authenticates every client and a verifier checks every submitted task.
 
 ### A2A gateway
 
-The `<name>-a2a-gateway` Deployment. It holds the chat backend under `next` (Google Chat when enabled, Slack otherwise), publishes each message as a task, posts the answer and the progress of any card back into the thread, and answers a few commands itself. It holds no model. [Conversations under `spec.mode: next`](/kube-agents/concepts/chatops/#conversations-under-specmode-next) describes what it does in a thread.
+The `<name>-a2a-gateway` Deployment. It holds the chat backend (Google Chat when enabled, Slack otherwise), publishes each message as a task, posts the answer and the progress of any card back into the thread, and answers a few commands itself. It holds no model. [Conversations through the A2A gateway](/kube-agents/concepts/chatops/#conversations-through-the-a2a-gateway) describes what it does in a thread.
 
 ### Hermes bridge
 
-The `hermes-bridge` container the operator adds to the `<name>-gateway` pod under `next`. It takes tasks off the bus and runs each as a Planning Agent turn on the agent's API server, in a Hermes session per conversation.
+The `hermes-bridge` container the operator adds to the `<name>-gateway` pod. It takes tasks off the bus and runs each as a Planning Agent turn on the agent's API server, in a Hermes session per conversation.
 
 ### Session pod
 
@@ -94,7 +94,7 @@ A pod the A2A gateway starts for one conversation moved onto the `/session` rout
 
 ### A2A console
 
-The browser page the `<name>-a2a-console` pod serves on every `next` install: a status view of the bus and a chat pane that reaches the Planning Agent through the gateway's console door. Reached through `kubectl port-forward` ([User interfaces](/kube-agents/reference/user-interfaces/#a2a-console)).
+The browser page the `<name>-a2a-console` pod serves on every install: a status view of the bus and a chat pane that reaches the Planning Agent through the gateway's console door. Reached through `kubectl port-forward` ([User interfaces](/kube-agents/reference/user-interfaces/#a2a-console)).
 
 ## Runtime and framework
 
@@ -106,7 +106,7 @@ The agent runtime all the agents run on ([nousresearch/hermes-agent](https://git
 
 A native Hermes feature (`hermes -p <name>`) giving multiple isolated Hermes instances — each with its own config, sessions, skills, and home directory — inside a single gateway process. In `kube-agents`, the `default` profile is the [Planning Agent](#planning-agent), the `platform` profile is the [Platform Agent](#platform-agent), and each `cluster-*` profile is a [Cluster Agent](#cluster-agent). Executable scripts are shared across profiles; persona, config, and skills are per-profile.
 
-A Hermes profile is a directory inside the `<name>-gateway` pod, `$HERMES_HOME/profiles/<name>` for every profile but `default`, whose home is `$HERMES_HOME` itself, and no Kubernetes object. It is distinct from the [`AgentProfile`](/kube-agents/operator/agentprofile-crd/) custom resource (`kubectl get apr`), which describes one kind of agent pod on the message bus under `spec.mode: next` and renders nothing under `today`.
+A Hermes profile is a directory inside the `<name>-gateway` pod, `$HERMES_HOME/profiles/<name>` for every profile but `default`, whose home is `$HERMES_HOME` itself, and no Kubernetes object. It is distinct from the [`AgentProfile`](/kube-agents/operator/agentprofile-crd/) custom resource (`kubectl get apr`), which describes one kind of agent pod on the message bus.
 
 ### MCP (Model Context Protocol)
 

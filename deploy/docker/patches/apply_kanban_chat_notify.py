@@ -4,7 +4,7 @@
 Run by ``deploy/docker/Dockerfile`` against ``/opt/hermes``. One anchored edit
 and one trailer in ``gateway/kanban_watchers_notifier.py``. Why the change is
 needed (a card subscribed to a chat platform the A2A gateway holds is skipped
-forever under ``spec.mode: next``) is in the module docstring of
+forever) is in the module docstring of
 ``deploy/docker/patches/kanban_chat_notify.py``; this file documents where the
 edits land.
 

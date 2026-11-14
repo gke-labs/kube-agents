@@ -13,8 +13,8 @@ the queue line, the scan's checks folded, and the buttons. Nothing here reads
 with its reason, and the caller posts the text instead.
 
 :func:`chat` is the card as a ``kube-agents.chat/v1`` message for
-``spec.mode: next``, :func:`blocks` the same card as Block Kit for the
-today door, each with the fallback text the door posts when it cannot lay the
+the gateway, :func:`blocks` the same card as Block Kit for the
+Slack relay door, each with the fallback text the door posts when it cannot lay the
 card out.
 
 ``FIX_FIRST``, ``FIX_ONLY`` and ``COUNT_WORDS`` are ``inventory_presenter``'s
@@ -304,7 +304,7 @@ def chat(card: Card) -> tuple[dict, str]:
 
 
 def blocks(card: Card) -> tuple[list[dict], str]:
-    """``(blocks, text)``: the card as Block Kit for the today door and the message's mrkdwn text."""
+    """``(blocks, text)``: the card as Block Kit for the Hermes Slack door and the message's mrkdwn text."""
     built = slack_presenter.blocks_report(
         card.headline,
         detail=card.detail,

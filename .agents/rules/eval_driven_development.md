@@ -86,18 +86,16 @@ PLATFORM_AGENT_TOKEN=$(kubectl --context "$AGENT_CLUSTER_CONTEXT" get secret pla
 Without `GCP_PROJECT_ID` the judge fails to construct (`No API key was provided`); the eval
 still needs the judge even though only the deterministic checks decide.
 
-The blocking presubmit grades a `spec.mode: next` install through the A2A gateway's inject door,
-so that is the lane a case on its matrix goes red or green on. Against a next install, add the
-two exports `hack/ci-eval-pr.sh` makes there: `AGENT_TRANSPORT=inject`, and `AGENT_INJECT_TOKEN`
-from the `token` key of the `platform-agent-a2a-inject` Secret in the same namespace. A case on
-`hack/eval/inject-lane-exclusions.txt` is graded over the agent API instead (the today lane and
-the nightlies); run it without them. A case on `hack/eval/api-lane-exclusions.txt` is the
-reverse: it runs only with them, and without them its run errors rather than going red. The
-card-wait stopped ask (`[bench:stop-in-card-wait]`) also needs `AGENT_A2A_DOOR_TOKEN`, from the
-`token` key of the `platform-agent-a2a-door` Secret, on an install with the A2A door on; without
-it the run is infrastructure. The lane also appends the GitHub-write safeguard in
-`hack/eval/inject-lane-safeguards.yaml` to every task, so a case that passes here can still trip
-it in CI.
+Every CI lane, the blocking presubmit and the nightlies, grades the install through the A2A
+gateway's inject door, so that is the lane a case goes red or green on. Add the two exports
+`hack/ci-eval-pr.sh` makes there: `AGENT_TRANSPORT=inject`, and `AGENT_INJECT_TOKEN` from the
+`token` key of the `platform-agent-a2a-inject` Secret in the same namespace. A case on
+`hack/eval/inject-lane-exclusions.txt` runs on no CI lane until it is moved off that list; run it
+over the agent API, without the two exports, and say so in the pull request. The card-wait stopped ask (`[bench:stop-in-card-wait]`) also needs `AGENT_A2A_DOOR_TOKEN`, from the
+`token` key of the `platform-agent-a2a-door` Secret, which the lane turns on; without it the run is
+infrastructure. The lane also appends
+the GitHub-write safeguard in `hack/eval/inject-lane-safeguards.yaml` to every task, so a case that
+passes here can still trip it in CI.
 
 A case that reads the seeded fleet needs it in your dev project: run
 [`hack/fleet-kubeconfigs.sh`](../../hack/fleet-kubeconfigs.sh) and export
