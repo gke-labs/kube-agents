@@ -90,6 +90,19 @@ class GuardTestCase(unittest.TestCase):
             self.assertIn("google", sys.modules)
             self.assertIsNone(sys.modules["google"])
 
+    def the_probe_counts_only_the_guards_own_refusal(self):
+        """`assert_in_force` fails when the guard's finder is gone, and the probe says no after
+        `uninstall()`, also where the import fails anyway because the library is missing."""
+        guard = self.install()
+        no_live_google_auth.assert_in_force(self, guard)
+        sys.meta_path.remove(guard._refuser)
+        self.assertFalse(guard.refuses_the_import())
+        with self.assertRaises(AssertionError):
+            no_live_google_auth.assert_in_force(unittest.TestCase(), guard)
+        sys.meta_path.insert(0, guard._refuser)
+        guard.uninstall()
+        self.assertFalse(guard.refuses_the_import())
+
     def with_on_the_path(self, make_package):
         root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, root, True)
@@ -122,6 +135,9 @@ class TestWithNoGooglePackage(GuardTestCase):
 
     def test_a_name_that_another_test_blocked_is_blocked_again_afterwards(self):
         self.a_blocked_name_is_blocked_again_afterwards()
+
+    def test_the_probe_counts_only_the_guards_own_refusal(self):
+        self.the_probe_counts_only_the_guards_own_refusal()
 
     def test_another_google_package_is_still_reported_missing(self):
         self.install()
@@ -170,6 +186,9 @@ class TestWithAnotherGooglePackage(GuardTestCase):
     def test_a_name_that_another_test_blocked_is_blocked_again_afterwards(self):
         self.a_blocked_name_is_blocked_again_afterwards()
 
+    def test_the_probe_counts_only_the_guards_own_refusal(self):
+        self.the_probe_counts_only_the_guards_own_refusal()
+
 
 class TestWithTheLibraryInstalled(GuardTestCase):
     """What a developer who installed google-auth has."""
@@ -183,6 +202,9 @@ class TestWithTheLibraryInstalled(GuardTestCase):
 
     def test_a_name_that_another_test_blocked_is_blocked_again_afterwards(self):
         self.a_blocked_name_is_blocked_again_afterwards()
+
+    def test_the_probe_counts_only_the_guards_own_refusal(self):
+        self.the_probe_counts_only_the_guards_own_refusal()
 
     def test_the_import_fails_and_is_recorded(self):
         guard = self.install()

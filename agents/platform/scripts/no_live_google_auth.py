@@ -101,6 +101,10 @@ def _caller() -> str:
     return _UNKNOWN_CALLER
 
 
+class _Refused(ModuleNotFoundError):
+    """The guard's own refusal. The type tells it from a library that is only missing."""
+
+
 class _Refuser(importlib.abc.MetaPathFinder):
     """First on `sys.meta_path`: refuses `google.auth` and everything under it."""
 
@@ -111,7 +115,7 @@ class _Refuser(importlib.abc.MetaPathFinder):
         if not _is_google_auth(fullname):
             return None
         self._guard._record(fullname)
-        raise ModuleNotFoundError(REFUSAL_MESSAGE, name=fullname)
+        raise _Refused(REFUSAL_MESSAGE, name=fullname)
 
 
 class Guard:
@@ -160,12 +164,13 @@ class Guard:
         return list(self._imports)
 
     def refuses_the_import(self) -> bool:
-        """Whether `import google.auth` fails now. This probe is not recorded."""
+        """Whether the guard refuses `import google.auth` now. An import that fails only
+        because the library is missing, as in CI, does not count. This probe is not recorded."""
         self._probing = True
         try:
             importlib.import_module(GOOGLE_AUTH)
-        except ModuleNotFoundError:
-            return True
+        except ModuleNotFoundError as error:
+            return isinstance(error, _Refused)
         finally:
             self._probing = False
         return False
