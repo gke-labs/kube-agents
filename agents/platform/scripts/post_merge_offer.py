@@ -138,6 +138,10 @@ def offer(
         return {"action": "none", "reason": "already offered"}
     if fix.get("state") != "merged":
         return {"action": "none", "reason": f"#{number} is {fix.get('state') or 'unknown'}, not merged"}
+    if (forge("branch-view", {"branch": branch}).get("branch") or {}).get("exists"):
+        # `_open` would open a published branch as it stands, unchecked by the
+        # writer, under a body that promises one allow rule; never for an offer.
+        return {"action": "none", "reason": f"{branch} is published without a pull request; not offering from it"}
     try:
         url = open_proposal(
             forge, repo, branch, str(fix.get("target") or ""),

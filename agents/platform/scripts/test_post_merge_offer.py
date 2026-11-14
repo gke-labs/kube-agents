@@ -13,11 +13,13 @@ BRANCH = "platform-agent/automerge-offer-no-pdb-dev"
 
 
 class FakeForge:
-    def __init__(self, *, state="merged", existing=None):
-        self.calls, self.state, self.existing = [], state, existing
+    def __init__(self, *, state="merged", existing=None, held=False):
+        self.calls, self.state, self.existing, self.held = [], state, existing, held
 
     def __call__(self, verb, payload):
         self.calls.append((verb, payload))
+        if verb == "branch-view":
+            return {"branch": {"exists": self.held}}
         if verb == "proposal-list":
             return {"proposals": [self.existing] if self.existing else []}
         if verb == "proposal-view":
@@ -129,6 +131,14 @@ class TestOffer(unittest.TestCase):
     def test_other_errors_propagate(self):
         with self.assertRaises(RuntimeError):
             run(FakeForge(), FakeOpen(raises=RuntimeError("broker down")))
+
+    def test_a_published_branch_without_a_pull_request_is_not_offered_from(self):
+        forge, opener = FakeForge(held=True), FakeOpen()
+        result = run(forge, opener)
+        self.assertEqual(result["action"], "none")
+        self.assertIn("published without a pull request", result["reason"])
+        self.assertEqual(opener.opened, [])
+        self.assertNotIn("proposal-comment", forge.verbs())
 
     def test_unmerged_fix(self):
         forge = FakeForge(state="open")
