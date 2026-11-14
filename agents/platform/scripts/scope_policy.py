@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """What the credential proxy runs for the scope publisher.
 
-The scope publisher is a next-mode Job that resolves which projects sit in an
+The scope publisher is a Job that resolves which projects sit in an
 install's folders, organizations, Shared VPC hosts and Metrics Scopes, and
 writes them to a ConfigMap the A2A gateway reads. It reaches GCP through the
 broker's `/v1/exec` under the `scope` role, and this module is the whole of

@@ -1,8 +1,8 @@
 """Reader for the shared kube-agents.chat/v1 cases in ``tests/conformance/chat/``.
 
 Each case is one JSON file: an ``input`` and the ``expected`` chat messages the
-next-mode emitter owes for it, one per output in order. ``source`` names the
-today test the case comes from: the test its input was lifted from, or, where
+chat-message emitter owes for it, one per output in order. ``source`` names the
+Block Kit test the case comes from: the test its input was lifted from, or, where
 the input was built to show a rule (a window past its cap, say), the test that
 pins that rule; ``notes`` says where the two differ. ``a2a/lib/chatmsg`` checks every expected
 message against the full validator; this reader checks the files' shape so the
@@ -10,8 +10,8 @@ Python presenters can be run against them (``spec-a2a-payloads.md``, "Chat
 messages"). A case with ``input.events`` has one ``expected`` entry per event,
 ``null`` where the event emits no chat message.
 
-The text fallback is not pinned: today's is Slack mrkdwn, escaped for Slack, and
-under next the gateway escapes it, so the emitter decides it.
+The text fallback is not pinned: Block Kit's is Slack mrkdwn, escaped for Slack, and
+the gateway escapes its own, so the emitter decides it.
 """
 
 from __future__ import annotations

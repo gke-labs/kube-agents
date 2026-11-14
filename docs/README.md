@@ -295,7 +295,7 @@ identifier appears, add its source here.
 | Persona rules and `§N` section numbering | the profile's `SOUL.md` |
 | RBAC bindings and KSA defaults laid down per agent | `k8s-operator/internal/controller/platformagent_manifests.go` |
 | `app.kubernetes.io/*` label values on installed objects | `k8s-operator/internal/controller/manifest_helpers.go`, each `kustomization.yaml`, and `a2a/gateway/spawn.go` (gateway-spawned session pods) |
-| The retired mode switch's managed key (`KUBEAGENTS_MODE`, pinned to `next` until no supported agent image predates the removal, so an older image reads the right value) | `k8s-operator/internal/controller/platformagent_manifests.go` (writer); `agents/platform/scripts/runtime_mode.py` (reader, which gates the entrypoint's A2A overlay) |
+| The retired mode switch's managed key (`KUBEAGENTS_MODE`, pinned to `next` until no supported agent image predates the removal, so an older image reads the right value) | `k8s-operator/internal/controller/platformagent_manifests.go` (writer); the agent image has no reader left |
 | Controller permissions | `k8s-operator/config/rbac/` |
 | The operator RBAC self-check: the `RBACIncomplete` reason, its re-check interval and condition message; the floating tags `make deploy` refuses and `ALLOW_MUTABLE_IMG` | `k8s-operator/internal/controller/rbac_selfcheck.go`; `k8s-operator/Makefile` |
 | `make` targets | the root `Makefile` and `k8s-operator/Makefile` |
