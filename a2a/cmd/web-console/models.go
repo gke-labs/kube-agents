@@ -15,6 +15,11 @@ import (
 )
 
 const (
+	// defaultGeminiModel is the chart's default for the gemini and vertex_ai
+	// providers (DEFAULT_MODEL_GEMINI in install.defaults.env), the model the
+	// console names when the install names none.
+	defaultGeminiModel = "gemini-3.8-flash"
+
 	activeModelAnnotation    = "kubeagents.x-k8s.io/active-model"
 	activeTargetAnnotation   = "kubeagents.x-k8s.io/active-model-target"
 	reasoningLevelAnnotation = "kubeagents.x-k8s.io/reasoning-level"
@@ -66,7 +71,7 @@ var candidateModelCatalog = []ModelOption{
 		ModelTarget:       "vertex_ai/gemini-3.5-flash",
 		SupportsReasoning: true,
 		ReasoningLevel:    "dynamic",
-		Description:       "Frontier multimodal model with adaptive thinking (Recommended)",
+		Description:       "Frontier multimodal model with adaptive thinking",
 	},
 	{
 		ID:                "gemini-3.5-pro",
@@ -93,7 +98,7 @@ var candidateModelCatalog = []ModelOption{
 		ModelTarget:       "vertex_ai/gemini-3.8-flash",
 		SupportsReasoning: true,
 		ReasoningLevel:    "dynamic",
-		Description:       "Next-generation high-speed multimodal reasoning model",
+		Description:       "Next-generation high-speed multimodal reasoning model (Recommended)",
 	},
 	{
 		ID:                "gemini-3.8-pro",
@@ -401,7 +406,7 @@ func (s *server) getModelsResponse(ctx context.Context, probeAll ...bool) Models
 		} else if s.cfg.ModelName != "" {
 			activeModel = s.cfg.ModelName
 		} else {
-			activeModel = "gemini-3.5-flash"
+			activeModel = defaultGeminiModel
 		}
 	}
 	if activeProvider == "" {
@@ -589,7 +594,7 @@ func (s *server) handleModelsPost(w http.ResponseWriter, r *http.Request) {
 			activeModel = s.cfg.ModelName
 		}
 		if activeModel == "" {
-			activeModel = "gemini-3.5-flash"
+			activeModel = defaultGeminiModel
 		}
 	}
 

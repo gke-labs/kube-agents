@@ -22,7 +22,7 @@ ROUTED = {chat_notify.NOTIFY_PLATFORM_ENV: "google_chat"}
 class HomeFileTest(unittest.TestCase):
     """The home channel the operator projects into the pod as a file.
 
-    A learned channel is never rendered into the pod env; ``routed_platform``
+    A learned channel is never rendered into the pod env; ``routed_platforms``
     and ``home_file_value`` take it from the file after a non-empty env, and
     read it on every call because the kubelet refreshes it in place.
     """
@@ -47,13 +47,13 @@ class HomeFileTest(unittest.TestCase):
     def test_a_projected_channel_routes_slack_and_names_the_home(self):
         self._write("C0FILE\n")
         self.assertEqual(chat_notify.home_file_value(), "C0FILE")
-        self.assertEqual(chat_notify.routed_platform(), "slack")
+        self.assertEqual(chat_notify.routed_platforms(), ["slack"])
         self.assertTrue(chat_notify.routes("slack"))
 
     def test_a_non_empty_env_wins_over_the_file(self):
         self._write("C0FILE\n")
         with mock.patch.dict(os.environ, {chat_notify.NOTIFY_PLATFORM_ENV: "google_chat"}):
-            self.assertEqual(chat_notify.routed_platform(), "google_chat")
+            self.assertEqual(chat_notify.routed_platforms(), ["google_chat"])
 
     def test_an_empty_or_absent_file_routes_nothing(self):
         # The directory is mounted and empty: the Optional volume before the
@@ -62,18 +62,18 @@ class HomeFileTest(unittest.TestCase):
         self.assertEqual(chat_notify.home_file_value(), "")
         self._write("")
         self.assertEqual(chat_notify.home_file(), ("", True))
-        self.assertEqual(chat_notify.routed_platform(), "")
+        self.assertEqual(chat_notify.routed_platforms(), [])
         self._write("")
-        self.assertEqual(chat_notify.routed_platform(), "")
+        self.assertEqual(chat_notify.routed_platforms(), [])
         self._write("   \n")
         self.assertEqual(chat_notify.home_file_value(), "")
 
     def test_the_file_routes_only_the_platform_the_gateway_holds(self):
         self._write("C0FILE\n")
         with mock.patch.dict(os.environ, {chat_notify.NOTIFY_CONVERSATIONS_ENV: "google_chat"}):
-            self.assertEqual(chat_notify.routed_platform(), "")
+            self.assertEqual(chat_notify.routed_platforms(), [])
         with mock.patch.dict(os.environ, {chat_notify.NOTIFY_CONVERSATIONS_ENV: ""}):
-            self.assertEqual(chat_notify.routed_platform(), "")
+            self.assertEqual(chat_notify.routed_platforms(), [])
 
     def test_the_file_is_read_on_every_call(self):
         self._write("C0ONE\n")
@@ -87,13 +87,35 @@ class HomeFileTest(unittest.TestCase):
         with open(os.path.join(self.dir, chat_notify.HOME_FILE_KEY), "wb") as handle:
             handle.write(b"\xff\xfe\x00C0")
         self.assertEqual(chat_notify.home_file(), ("", True))
-        self.assertEqual(chat_notify.routed_platform(), "")
+        self.assertEqual(chat_notify.routed_platforms(), [])
 
     def test_a_missing_directory_reads_as_nothing(self):
         with mock.patch.object(chat_notify, "HOME_FILE_DIR", os.path.join(self.dir, "absent")):
             self.assertEqual(chat_notify.home_file(), ("", False))
             self.assertEqual(chat_notify.home_file_value(), "")
-            self.assertEqual(chat_notify.routed_platform(), "")
+            self.assertEqual(chat_notify.routed_platforms(), [])
+
+
+class PlatformListTest(unittest.TestCase):
+    """Both env vars carry a comma-separated list of platforms; one value is a list of one."""
+
+    def test_a_list_parses_stripped_deduped_in_order(self):
+        self.assertEqual(chat_notify.platform_list("google_chat, slack,,slack"), ["google_chat", "slack"])
+        self.assertEqual(chat_notify.platform_list("  "), [])
+        self.assertEqual(chat_notify.platform_list(" slack "), ["slack"])
+
+    def test_both_env_vars_read_as_lists(self):
+        with mock.patch.dict(os.environ, {chat_notify.NOTIFY_PLATFORM_ENV: "google_chat,slack",
+                                          chat_notify.NOTIFY_CONVERSATIONS_ENV: "slack, google_chat"}, clear=False):
+            self.assertEqual(chat_notify.routed_platforms(), ["google_chat", "slack"])
+            self.assertEqual(chat_notify.gateway_platforms(), ["slack", "google_chat"])
+            self.assertTrue(chat_notify.routes("slack"))
+            self.assertTrue(chat_notify.routes("google_chat"))
+            self.assertFalse(chat_notify.routes("discord"))
+
+    def test_a_single_value_is_a_list_of_one(self):
+        with mock.patch.dict(os.environ, {chat_notify.NOTIFY_PLATFORM_ENV: "google_chat"}, clear=False):
+            self.assertEqual(chat_notify.routed_platforms(), ["google_chat"])
 
 
 class CommandTest(unittest.TestCase):
@@ -549,7 +571,7 @@ class ConversationRouteTest(unittest.TestCase):
     def test_the_bus_and_the_served_platform_come_from_the_env(self):
         with mock.patch.dict(os.environ, {chat_notify.NOTIFY_CONVERSATIONS_ENV: " slack ", "NATS_URL": "nats://n:4222",
                                           "A2A_BUS_USER": "agent", "NATS_USER": ""}):
-            self.assertEqual(chat_notify.gateway_platform(), "slack")
+            self.assertEqual(chat_notify.gateway_platforms(), ["slack"])
             self.assertEqual(chat_notify.bus_unreachable_reason(), "")
             with mock.patch.dict(os.environ, {"A2A_BUS_USER": "", "NATS_USER": "legacy"}):
                 self.assertEqual(chat_notify.bus_unreachable_reason(), "")

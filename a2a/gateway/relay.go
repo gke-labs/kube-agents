@@ -99,6 +99,7 @@ var reasonSentences = map[string]string{
 	"delegate-socket-failed":             "the agent's worker could not open its delegation channel",
 	"no-worker":                          "no worker on this install can run this request",
 	"tier-not-allowed":                   "this agent is not allowed to run requests of this kind",
+	"tier-withdrawn":                     "this kind of request is being withdrawn from this agent; requests already running finish, but no new ones start",
 	"lease-expired":                      "the worker that took this request stopped responding; ask again",
 	// The agent ran and produced no answer.
 	"hermes-exited-nonzero":         "the agent stopped with an error before it answered",

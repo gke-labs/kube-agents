@@ -200,3 +200,45 @@ func TestKanbanDispatcher_WithoutTheAgeTheTickRuleStands(t *testing.T) {
 		t.Fatalf("at 60 ticks with no age: condition %+v, want True with no age in the message", cond)
 	}
 }
+
+// A fully locked board: its first tick runs past the limit before any
+// failure. The plugin reports it stuck, and the condition turns True at that
+// poll, with no failed tick; it holds while the board stays stuck and clears
+// after a good tick.
+func TestKanbanDispatcher_AStuckTickSetsItBeforeAnyFailure(t *testing.T) {
+	h := dispatcherHarness(t)
+	h.stub.setDispatcherStuck(chatAddr(), []usageDispatcherStuck{{Board: "default", Seconds: 400}})
+	h.poll(5)
+	cond := dispatcherCondition(h)
+	if cond == nil || cond.Status != metav1.ConditionTrue || cond.Reason != kanbanDispatcherReasonTicksFailing {
+		t.Fatalf("stuck at 400 s: condition %+v, want True", cond)
+	}
+	if !strings.Contains(cond.Message, `tick on board "default" waited on its database (it ran past 5m0s, or failed on a lock after a busy timeout)`) || !strings.Contains(cond.Message, "6m40s since it began") {
+		t.Fatalf("message = %q", cond.Message)
+	}
+	// Still stuck, now with one failure below the streak rules.
+	h.stub.setDispatcherStuck(chatAddr(), []usageDispatcherStuck{{Board: "default", Seconds: 2160}},
+		usageDispatcherFailure{Board: "default", Error: "OperationalError", Ticks: 1, Seconds: 1440, HasAge: true})
+	h.poll(10)
+	if cond := dispatcherCondition(h); cond == nil || cond.Status != metav1.ConditionTrue {
+		t.Fatalf("stuck with one failure: condition %+v, want True held", cond)
+	}
+	h.stub.setDispatcher(chatAddr())
+	h.poll(15)
+	if cond := dispatcherCondition(h); cond == nil || cond.Status != metav1.ConditionFalse || !strings.Contains(cond.Message, "no board is stuck on its database") {
+		t.Fatalf("after a good tick: condition %+v, want False", cond)
+	}
+}
+
+// A board failing by the streak rules names its streak, also when another
+// board is stuck, and both count.
+func TestKanbanDispatcher_AStreakIsNamedBeforeAStuckBoard(t *testing.T) {
+	h := dispatcherHarness(t)
+	h.stub.setDispatcherStuck(chatAddr(), []usageDispatcherStuck{{Board: "locked", Seconds: 600}},
+		usageDispatcherFailure{Board: "default", Error: "OSError", Ticks: kanbanDispatcherFailingTicks})
+	h.poll(5)
+	cond := dispatcherCondition(h)
+	if cond == nil || !strings.Contains(cond.Message, `failed 60 ticks in a row on board "default"`) || !strings.Contains(cond.Message, "2 boards are failing") {
+		t.Fatalf("condition %+v, want the streak named and two boards counted", cond)
+	}
+}

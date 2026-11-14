@@ -36,6 +36,10 @@ MAX_FILE_BYTES = 64 * 1024
 # A rule naming anything else is kept but can never match, and says so.
 KNOWN_FIX_TYPES = frozenset({"no-pdb"})
 WILDCARD = "*"
+# The label on a fix pull request the customer's pipeline may merge on its own
+# (`KUBEAGENTS_AUTOMERGE=on`). A merged pull request carrying it is one that
+# merged without a human review, which is what the step-down acts on.
+AUTOMERGE_LABEL = "kube-agents:auto-merge"
 # The cluster resource labels that carry the environment, in the order the
 # fleet-drift SOP resolves them (`fleet_drift.ENV_LABEL_KEYS`). Only a label
 # counts here: fleet drift also guesses from cluster names, which is fine for
@@ -295,6 +299,93 @@ def decide(rules: Rules, fix_type: str, environment: str) -> Decision:
         if rule.fix in KNOWN_FIX_TYPES and rule.matches(fix_type, environment):
             return Decision(True, f"allowed by automerge.allow[{index}]")
     return Decision(False, f"no allow rule names {fix_type} in {environment}")
+
+
+def with_deny(text: str, fix_type: str, environment: str, note: str = "") -> str:
+    """The file's text with one more deny rule, for `fix_type` in `environment`.
+
+    An edit of the text, never a re-render: the file is the customer's, and a
+    pull request that rewrote every comment and quote in it to add one rule
+    would hide the rule. The rule goes at the end of `automerge.deny`, which is
+    created when absent. `note` becomes a comment above it in a block-style
+    file. Raises `RulesError` for a file this cannot read or a layout it cannot
+    add to, and checks its own output: the result must parse and must deny.
+    """
+    import yaml
+
+    before = parse(text)
+    if before.status != LOADED:
+        raise RulesError(f"{RULES_FILE} does not parse; not edited")
+    fix_q, env_q = json.dumps(fix_type), json.dumps(environment)
+    root = yaml.compose(text, Loader=yaml.SafeLoader)
+    automerge = next((v for k, v in root.value if k.value == "automerge"), None)
+    if not isinstance(automerge, yaml.MappingNode):
+        raise RulesError("no `automerge` mapping to add a deny rule to")
+    deny = next((v for k, v in automerge.value if k.value == "deny"), None)
+    deny_key = next((k for k, v in automerge.value if k.value == "deny"), None)
+    flow_item = f"{{fix: {fix_q}, environments: [{env_q}]}}"
+    nl = "\r\n" if "\r\n" in text else "\n"
+    comment = f"# {' '.join(note.split())}" if note else ""
+
+    def block_item(pad: str) -> str:
+        head = f"{pad}{comment}{nl}" if comment else ""
+        return f"{head}{pad}- fix: {fix_q}{nl}{pad}  environments: [{env_q}]{nl}"
+
+    if isinstance(deny, yaml.SequenceNode) and deny.flow_style:
+        close = deny.end_mark.index - 1
+        insert = flow_item if not deny.value or _ends_in_comma(text, close) else f", {flow_item}"
+        out = text[:close] + insert + text[close:]
+    elif isinstance(deny, yaml.SequenceNode) and deny.value:
+        # The sequence's own mark is its first `-`; the first rule's mark is its
+        # first key, which may sit on the next line after a bare `-`.
+        out = _insert_after_line(text, _exact_end(deny), block_item(" " * deny.start_mark.column))
+    elif automerge.flow_style:
+        if deny is not None:
+            raise RulesError("`automerge.deny` is not a list")
+        close = automerge.end_mark.index - 1
+        sep = ", " if automerge.value and not _ends_in_comma(text, close) else ""
+        out = text[:close] + f"{sep}deny: [{flow_item}]" + text[close:]
+    elif deny_key is not None:
+        # `deny:` with nothing after it. `deny: ~` or `deny: null` fall to the
+        # final check: the items below them would not parse.
+        pad = " " * (deny_key.start_mark.column + 2)
+        out = _insert_after_line(text, deny_key.end_mark.index, block_item(pad))
+    else:
+        pad = " " * automerge.value[0][0].start_mark.column
+        out = _insert_after_line(text, _exact_end(automerge), f"{pad}deny:{nl}" + block_item(pad + "  "))
+    edited = parse(out)
+    # Exactly one rule more, nothing moved: an alias's node carries its anchor's
+    # marks, so a position found from it can land inside another list.
+    if (
+        edited.status != LOADED
+        or decide(edited, fix_type, environment).allowed
+        or edited.allow != before.allow
+        or edited.deny != before.deny + (Rule(fix_type, (environment,)),)
+    ):
+        raise RulesError(f"could not add a deny rule to this layout of {RULES_FILE}")
+    return out
+
+
+def _ends_in_comma(text: str, close: int) -> bool:
+    """Whether a flow collection closing at `close` already ends in `,` (YAML allows it)."""
+    return text[:close].rstrip().endswith(",")
+
+
+def _exact_end(node: Any) -> int:
+    """Where `node`'s last character is: a block collection's own end mark runs on past comments."""
+    import yaml
+
+    while isinstance(node, yaml.CollectionNode) and not node.flow_style and node.value:
+        last = node.value[-1]
+        node = last[1] if isinstance(last, tuple) else last
+    return node.end_mark.index
+
+
+def _insert_after_line(text: str, index: int, lines: str) -> str:
+    end = text.find("\n", index)
+    if end < 0:
+        return text + ("\r\n" if lines.endswith("\r\n") else "\n") + lines
+    return text[: end + 1] + lines + text[end + 1 :]
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -2,7 +2,7 @@
 
 > **STATUS: design of record, lane in review, page not checked in.** The suite's tier, roster
 > and first cases are on `main` (`EVAL_TIER=certification` in `hack/ci-eval-pr.sh`,
-> `hack/eval/certification-cases.txt`, the "Certification suite" section of
+> the `suite: certification` line in each case's task file, the "Certification suite" section of
 > [`bench/README.md`](../../bench/README.md#certification-suite)). The lane is the Prow periodic
 > `ci-kube-agents-certification-1` proposed in GoogleCloudPlatform/oss-test-infra#2768. The page
 > and its rating reader exist as a local prototype only; the constants this document cites from
@@ -30,8 +30,9 @@ commits no customer installs. This document separates the two.
 - **Scenario.** One bench case under `bench/tasks/<id>/` with `suite: certification` in its
   `task.yaml`, graded by deterministic checks on the product's own artifacts (the audit ledger,
   the pull request, the chat answer). A row has one or more scenarios as its tests.
-- **Roster.** `hack/eval/certification-cases.txt`: the scenarios the lane runs, in `# part N`
-  sections, each line under a reason block that names the row it grades.
+- **Roster.** The task files: a scenario is on the lane when its task file carries the bare line
+  `suite: certification`, in the section its `certification_part: N` line names (none is part 1),
+  with the row it grades in the task file's header comment.
 - **Release window.** All scored repetitions of one scenario on one GA release, across every
   build of the lane that graded that release. One release, one window; a Rerun on the same
   release pools into it, never into a neighbouring release's window. A model change mid-release
@@ -58,7 +59,7 @@ commits no customer installs. This document separates the two.
   a repetition whose checks do not apply on the transport it ran on. It is listed and never
   votes.
 - **Declared gap.** A scenario marked `expected_fail: true` in its `task.yaml`
-  ([`bench-case-format.md`](bench-case-format.md), "The fields"). Its roster reason block names
+  ([`bench-case-format.md`](bench-case-format.md), "The fields"). Its task file's header names
   the issue that owns the gap. It is shown as a gap, never as a pass.
 
 ## The rating rule
@@ -144,10 +145,11 @@ item with its cost.
   `hack/ci-deploy.sh` as `RC_COMMIT_SHA`, which installs the published images and builds nothing.
 - **One tree.** The release's commit (the GA tag's parent: the candidate commit whose images the
   release promoted) supplies everything: the published images, the chart, the CRDs, the harness
-  (`bench/`, `hack/ci-eval-pr.sh`), the roster and the cases. The job checks
-  the tree out at that commit, and the RC path in `hack/ci-deploy.sh` requires it. A release
-  whose tree has no roster entry is skipped before any lease and reads "No run"; the record
-  names one commit. A release's cases grade the skills that release ships, so a certificate
+  (`bench/`, `hack/ci-eval-pr.sh`) and the suite's cases. The job checks
+  the tree out at that commit, and the RC path in `hack/ci-deploy.sh` requires it. The job's
+  pre-lease guard reads the suite line (`suite: certification` in a task file at the release
+  commit; the retired roster file is its second test, for releases older than that line) and
+  skips a release that has neither, which reads "No run"; the record names one commit. A release's cases grade the skills that release ships, so a certificate
   never mixes `main`'s cases with an older release's skills.
 - **Repetitions.** 3 per build while the suite is built out (`EVAL_REPETITIONS=3`,
   `EVAL_TASK_PARALLELISM=1`: every scenario plants a stack, and the harness runs stack-bearing
@@ -174,7 +176,7 @@ item with its cost.
 ## The roster and case rules
 
 The entry rules are the "Certification suite" section of
-[`bench/README.md`](../../bench/README.md#certification-suite) and the roster's header; this
+[`bench/README.md`](../../bench/README.md#certification-suite) and each case's task file header; this
 document restates none of them. Two rules decided on 2026-11-05 are not in that list yet and
 land with the first case pull requests: a check binds to the planted object, so a ledger check
 names the finding and the object in one finding block (`scope: finding` on

@@ -526,6 +526,8 @@ func buildScopePublisherJob(agent *agentv1alpha1.PlatformAgent, start time.Time,
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: labels},
 				Spec: corev1.PodSpec{
+					// ndots:3, see brokerCallerPodDNSConfig.
+					DNSConfig:                    brokerCallerPodDNSConfig(),
 					RestartPolicy:                corev1.RestartPolicyNever,
 					ServiceAccountName:           scopePublisherName(agent),
 					AutomountServiceAccountToken: ptr.To(false),

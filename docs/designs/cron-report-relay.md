@@ -651,14 +651,16 @@ every platform off and nothing routes one through the gateway — an install wit
 neither Google Chat nor Slack, or one whose home channel is malformed, which routes
 nothing — the relay answers 502 without posting, and the detail says that no route
 exists. A `next` install whose only chat platform is held by the gateway with no home
-channel is routed anyway: the operator renders `A2A_NOTIFY_PLATFORM` for it, the relay
+channel is routed anyway: the operator renders `A2A_NOTIFY_PLATFORM` for it (a
+comma-separated list of platform names, one today), the relay
 sends, and the gateway refuses the post and keeps it for the digest it posts once a
 home channel is set (the gateway design, "Proactive posts"). The 502's detail is then
-the relay's `composed but not delivered to <platform>`; the gateway's refusal, which
+the relay's `composed but not delivered to <platform>`. The gateway's refusal, which
 says the post is kept, is in the gateway's and the session server's logs. A pod
 rendered before the operator routed it still answers the platform-naming detail
 (`composed but not delivered to slack (no home channel: set
-spec.integration.slack.homeChannel / SLACK_HOME_CHANNEL)`).
+spec.integration.slack.homeChannel / SLACK_HOME_CHANNEL)`), one such sentence per
+gateway platform without a home channel, joined by `; `.
 
 The one narrowing is `also_delivered_to`: a platform the cron child already
 posted the raw report to is skipped, and where that would empty the set the

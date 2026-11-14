@@ -5,7 +5,7 @@ sidebar:
   order: 4
 ---
 
-`kube-agents` follows [Semantic Versioning 2.0.0](https://semver.org/) (`MAJOR.MINOR.PATCH`) without a `v` prefix across container images, OCI Helm charts, and Terraform modules.
+`kube-agents` follows [Semantic Versioning 2.0.0](https://semver.org/) (`MAJOR.MINOR.PATCH`) without a `v` prefix across container images, OCI Helm charts, and Terraform modules. The one exception is the Go module tag below, which Go requires to carry a `v`.
 
 Every release is cut from one commit: the installer scripts (`install.sh`, `uninstall.sh`, `upgrade.sh`), the Helm chart and the container images of a release all come from it, and the release has passed an install and end-to-end run on a live GKE cluster before its tag is published. An emergency release can skip that live run, never the build checks: its images must already exist for the commit, and a version tag that already points elsewhere aborts it. The maintainers' procedure is [`scripts/release/README.md`](https://github.com/gke-labs/kube-agents/tree/main/scripts/release).
 
@@ -55,6 +55,7 @@ cut from `main`, lists every pull request it will contain if it is cut from the 
 3. The tag sits on a stamped release commit: `BAKED_RELEASE_VERSION="X.Y.Z"` is written into the root scripts (`install.sh`, `uninstall.sh`, `upgrade.sh`), the chart version (`charts/kube-agents/Chart.yaml`) and the Terraform default image tags (`terraform/examples/full-install/variables.tf`, `terraform.tfvars.example`). Both `install.sh` and `upgrade.sh` check that a Git checkout matches the tag's commit and that a tree outside Git carries a matching stamp or bundle marker; `upgrade.sh` also refuses a tree whose stamp names another release. [Provenance attribution](#provenance-attribution-and-release-bundle-marker) has the steps.
 4. The offline bundle is staged from the tagged commit with `git archive`, carries the `.release-bundle` provenance marker, and is packaged as `.tar.gz` and `.zip`.
 5. Software Bills of Materials are generated with Syft, SPDX 2.3 JSON and CycloneDX 1.5 JSON for the bundle and SPDX 2.3 JSON for each container image, and published with `checksums.txt`, which carries SHA256 checksums for every release asset.
+6. The `k8s-api-proxy` Go module is tagged `k8s-api-proxy/vX.Y.Z` at the release commit, so `go get github.com/gke-labs/kube-agents/k8s-api-proxy@vX.Y.Z` builds the proxy library that release ships. The module is v0 and its API may change in any release; a release at `1.0.0` or later tags no module until its own versioning is decided. See the [module README](https://github.com/gke-labs/kube-agents/tree/main/k8s-api-proxy).
 
 ## Offline distribution bundles and SBOMs
 
