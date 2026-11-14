@@ -66,3 +66,25 @@ func TestATierIsReportedAccepted(t *testing.T) {
 		t.Fatalf("a missing tier: %v", err)
 	}
 }
+
+// A tier the components would skip (a legacy name, a built-in under another
+// mode) is not Accepted, and says why: status tells what the components do.
+func TestATierTheComponentsSkipIsNotAccepted(t *testing.T) {
+	for name, mode := range map[string]string{"platform": agentv1alpha1.TierModeInteractive, "read": agentv1alpha1.TierModeUnattended} {
+		tier := &agentv1alpha1.Tier{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "ns", Generation: 1}, Spec: agentv1alpha1.TierSpec{Mode: mode}}
+		c := fake.NewClientBuilder().WithScheme(setupScheme()).WithObjects(tier).WithStatusSubresource(&agentv1alpha1.Tier{}).Build()
+		r := &TierReconciler{Client: c, Scheme: setupScheme()}
+		req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "ns", Name: name}}
+		if _, err := r.Reconcile(context.Background(), req); err != nil {
+			t.Fatal(err)
+		}
+		var got agentv1alpha1.Tier
+		if err := c.Get(context.Background(), req.NamespacedName, &got); err != nil {
+			t.Fatal(err)
+		}
+		cond := meta.FindStatusCondition(got.Status.Conditions, agentv1alpha1.TierConditionAccepted)
+		if cond == nil || cond.Status != metav1.ConditionFalse || cond.Reason != tierReasonSkipped {
+			t.Errorf("%s/%s: Accepted = %+v, want False/%s", name, mode, cond, tierReasonSkipped)
+		}
+	}
+}

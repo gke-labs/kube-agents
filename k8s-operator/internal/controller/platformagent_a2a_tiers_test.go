@@ -144,7 +144,7 @@ func TestAnUnreadableTierRoleRendersAnEmptyTiersFileWithoutListing(t *testing.T)
 	failing := &listFailsOnTiers{Client: cl}
 	r.Client = failing
 	r.tiersUnreadable = true
-	if err := r.applyA2ATiers(context.Background(), agent); err != nil {
+	if err := r.applyA2ATiers(context.Background(), agent, nil); err != nil {
 		t.Fatalf("applyA2ATiers with tiersUnreadable: %v", err)
 	}
 	if failing.lists != 0 {
@@ -158,7 +158,7 @@ func TestAnUnreadableTierRoleRendersAnEmptyTiersFileWithoutListing(t *testing.T)
 		t.Errorf("tiers file %q, want an empty list", cm.Data[a2aTiersKey])
 	}
 	r.tiersUnreadable = false
-	if err := r.applyA2ATiers(context.Background(), agent); err == nil {
+	if err := r.applyA2ATiers(context.Background(), agent, nil); err == nil {
 		t.Error("a Forbidden Tier list without the flag rendered a file; it should fail the reconcile")
 	}
 }

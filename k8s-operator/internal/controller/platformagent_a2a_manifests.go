@@ -7176,7 +7176,7 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	var profiles []agentv1alpha1.AgentProfile
 	if !r.agentProfilesUnreadable {
 		var err error
-		if profiles, err = boundAgentProfiles(ctx, r.Client, agent); err != nil {
+		if profiles, err = boundAgentProfiles(ctx, r.Client, agent, r.tiersUnreadable); err != nil {
 			return state, fmt.Errorf("failed to list AgentProfiles: %w", err)
 		}
 	}
@@ -7202,6 +7202,14 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// .supervisor grant exactly as long as the dispatch config lists them.
 	draining, err := r.dispatchDraining(ctx, agent, profiles)
 	if err != nil {
+		return state, err
+	}
+	// The install's tiers, which the verifier, the gateway and the callout
+	// mount (optional, so ordering against their Deployments doesn't
+	// matter), before the identity map that may name one of them: an early
+	// return between the two then never leaves a map naming a tier whose
+	// file was not written.
+	if err := r.applyA2ATiers(ctx, agent, profiles); err != nil {
 		return state, err
 	}
 	authMaps, authMapVersion, err := buildA2AAuthMapConfigMaps(agent, profiles, draining)
@@ -7698,11 +7706,6 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 		return state, err
 	}
 	if err := r.applyA2AAgentDoor(ctx, agent); err != nil {
-		return state, err
-	}
-	// The install's tiers, which the verifier, the gateway and the callout
-	// mount (optional, so ordering against their Deployments doesn't matter).
-	if err := r.applyA2ATiers(ctx, agent); err != nil {
 		return state, err
 	}
 
