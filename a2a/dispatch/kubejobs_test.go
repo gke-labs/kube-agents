@@ -5,8 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,6 +21,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/utils/ptr"
@@ -225,7 +231,7 @@ func TestTheRenderedJobConfigBuildsAJob(t *testing.T) {
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("the rendered config doesn't validate: %v", err)
 	}
-	job, err := buildJob(cfg, "tse", "unattended", "task-1")
+	job, err := renderedFixtureJob(t, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -261,7 +267,7 @@ func TestTheBuiltJobMatchesTheAdmissionFixture(t *testing.T) {
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		t.Fatal(err)
 	}
-	job, err := buildJob(cfg, "tse", "unattended", "task-1")
+	job, err := renderedFixtureJob(t, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -348,5 +354,116 @@ func TestAPolicyRefusalIsTold(t *testing.T) {
 				t.Errorf("err %v: refused-by-policy %v, want %v", err, errors.Is(err, ErrJobRefusedByPolicy), c.want)
 			}
 		})
+	}
+}
+
+// renderedFixtureJob launches tse's Job from cfg through Launch, on a fake
+// clientset, reading the template from the operator's rendered
+// DispatchJobTemplate fixture, and returns the Job it created.
+func renderedFixtureJob(t *testing.T, cfg lib.DispatchConfig) (*batchv1.Job, error) {
+	t.Helper()
+	param, err := os.ReadFile("testdata/rendered-dispatch-job-template.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	kube := fake.NewSimpleClientset()
+	k := NewKubeJobs(kube, func() lib.DispatchConfig { return cfg })
+	k.getTemplate = func(_ context.Context, ns, name string) ([]byte, error) {
+		if ns != cfg.ProfileNamespace || name != "kube-agents-dispatch-job-profile-tse" {
+			t.Fatalf("read %s/%s, want the param the config names", ns, name)
+		}
+		return param, nil
+	}
+	if _, err := k.Launch(context.Background(), "tse", "unattended", "task-1"); err != nil {
+		return nil, err
+	}
+	return kube.BatchV1().Jobs(cfg.ProfileNamespace).Get(context.Background(), JobName("tse", "unattended", "task-1"), metav1.GetOptions{})
+}
+
+// A config that names a template reads it from the param only while the
+// param carries the rendering the config names: a param from another
+// rendering, or none, holds the launch with ErrJobTemplateNotCurrent, and no
+// Job is built. The inline copy an older operator sends is used as it is.
+func TestTheJobTemplateIsReadOnlyWhenItIsTheConfigsRendering(t *testing.T) {
+	ref := &lib.DispatchJobTemplateRef{Name: "kube-agents-dispatch-job-profile-tse", Hash: "aaaa"}
+	param := func(hash string) []byte {
+		return []byte(`{"metadata":{"annotations":{"` + lib.DispatchJobTemplateHashAnnotation + `":"` + hash + `"}},"spec":{"template":{"spec":{"containers":[{"name":"w"}]}}}}`)
+	}
+	cases := []struct {
+		name    string
+		get     func() ([]byte, error)
+		current bool
+	}{
+		{"current", func() ([]byte, error) { return param("aaaa"), nil }, true},
+		{"another rendering", func() ([]byte, error) { return param("bbbb"), nil }, false},
+		{"no hash", func() ([]byte, error) {
+			return []byte(`{"spec":{"template":{"spec":{"containers":[{"name":"w"}]}}}}`), nil
+		}, false},
+		{"no containers", func() ([]byte, error) {
+			return []byte(`{"metadata":{"annotations":{"` + lib.DispatchJobTemplateHashAnnotation + `":"aaaa"}},"spec":{"template":{"spec":{}}}}`), nil
+		}, false},
+		{"another profile's", func() ([]byte, error) { return param("aaaa"), nil }, false},
+		{"missing", func() ([]byte, error) {
+			return nil, apierrors.NewNotFound(schema.GroupResource{Group: "kubeagents.x-k8s.io", Resource: "dispatchjobtemplates"}, ref.Name)
+		}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			k := &KubeJobs{getTemplate: func(context.Context, string, string) ([]byte, error) { return c.get() }}
+			prof := &lib.DispatchProfile{Name: "tse", JobTemplateRef: ref}
+			if c.name == "another profile's" {
+				prof.Name = "other"
+			}
+			tmpl, err := k.jobTemplate(context.Background(), "ns", prof)
+			if c.current {
+				if err != nil || len(tmpl) == 0 {
+					t.Fatalf("template %s, err %v: want the param's", tmpl, err)
+				}
+				return
+			}
+			if err == nil || (c.name != "another profile's" && !errors.Is(err, ErrJobTemplateNotCurrent)) {
+				t.Fatalf("err %v, want the launch held", err)
+			}
+		})
+	}
+	inline := json.RawMessage(`{"spec":{"containers":[{"name":"w"}]}}`)
+	k := &KubeJobs{getTemplate: func(context.Context, string, string) ([]byte, error) {
+		t.Fatal("an inline template was looked up")
+		return nil, nil
+	}}
+	if tmpl, err := k.jobTemplate(context.Background(), "ns", &lib.DispatchProfile{Name: "tse", JobTemplate: inline}); err != nil || string(tmpl) != string(inline) {
+		t.Fatalf("inline template %s, err %v: want it as sent", tmpl, err)
+	}
+}
+
+// getJobTemplate reads the param at its API path, in the profile namespace,
+// and a 404 from the API server reads as NotFound, which jobTemplate turns
+// into a held launch.
+func TestGetJobTemplateReadsTheParamsPath(t *testing.T) {
+	var asked string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		asked = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/gone") {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"kind":"Status","apiVersion":"v1","status":"Failure","reason":"NotFound","code":404}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"metadata":{"name":"x"}}`))
+	}))
+	defer srv.Close()
+	kube, err := kubernetes.NewForConfig(&rest.Config{Host: srv.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	k := NewKubeJobs(kube, nil)
+	if _, err := k.getTemplate(context.Background(), "test-ns-profiles", "kube-agents-dispatch-job-profile-tse"); err != nil {
+		t.Fatal(err)
+	}
+	if want := "/apis/kubeagents.x-k8s.io/v1alpha1/namespaces/test-ns-profiles/dispatchjobtemplates/kube-agents-dispatch-job-profile-tse"; asked != want {
+		t.Errorf("read %s, want %s", asked, want)
+	}
+	if _, err := k.getTemplate(context.Background(), "test-ns-profiles", "gone"); !apierrors.IsNotFound(err) {
+		t.Errorf("a 404 reads as %v, want NotFound", err)
 	}
 }

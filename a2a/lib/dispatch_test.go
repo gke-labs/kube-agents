@@ -515,3 +515,43 @@ func TestTheOperatorsDrainingDispatchConfigDecodesAndValidates(t *testing.T) {
 		t.Errorf("%d draining and %d live profiles, want one each", draining, live)
 	}
 }
+
+// A profile names its Job template by reference or carries it inline, never
+// both, and a reference needs an object name and a hash.
+func TestAJobTemplateRefNeedsANameAndAHashAndNoInlineCopy(t *testing.T) {
+	base := func() DispatchConfig {
+		cfg := validDispatchConfig()
+		return cfg
+	}
+	ref := &DispatchJobTemplateRef{Name: "kube-agents-dispatch-job-profile-tse", Hash: "06ecfba171668118"}
+	ok := base()
+	ok.Profiles[0].JobTemplateRef = ref
+	if err := ok.Validate(); err != nil {
+		t.Fatalf("a well-formed reference was refused: %v", err)
+	}
+	if !ok.Profiles[0].HasJobTemplate() {
+		t.Error("a profile naming a template doesn't run as Jobs")
+	}
+	for name, mutate := range map[string]func(*DispatchProfile){
+		"no hash": func(p *DispatchProfile) { p.JobTemplateRef = &DispatchJobTemplateRef{Name: ref.Name} },
+		"no name": func(p *DispatchProfile) { p.JobTemplateRef = &DispatchJobTemplateRef{Hash: ref.Hash} },
+		"bad name": func(p *DispatchProfile) {
+			p.JobTemplateRef = &DispatchJobTemplateRef{Name: "Not_A_Name", Hash: ref.Hash}
+		},
+		"inline too": func(p *DispatchProfile) {
+			p.JobTemplateRef = ref
+			p.JobTemplate = json.RawMessage(`{"spec":{"containers":[{"name":"w"}]}}`)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := base()
+			mutate(&cfg.Profiles[0])
+			if err := cfg.Validate(); err == nil {
+				t.Error("refused nothing")
+			}
+		})
+	}
+	if (DispatchProfile{}).HasJobTemplate() {
+		t.Error("a profile with no template runs as Jobs")
+	}
+}

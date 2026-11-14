@@ -453,7 +453,7 @@ func a2aDispatcherCeiling(agent *agentv1alpha1.PlatformAgent, profiles []agentv1
 		condition.Status = metav1.ConditionTrue
 		condition.Reason = dispatcherCeilingReasonNear
 		condition.Message = fmt.Sprintf("the profile dispatcher's config for %d profiles is %d bytes, %d%% of the %d bytes one ConfigMap can hold; "+
-			"past it the operator binds no newer profiles (about 200 profiles that allow unattended under Job mode). Lifting the ceiling is %s",
+			"past it the operator binds no newer profiles. Lifting the ceiling is %s",
 			fit, configBytes, configPct, a2aDispatchConfigLimitBytes, dispatchConfigCeilingIssue)
 	case size >= a2aDispatcherWarnBytes:
 		condition.Status = metav1.ConditionTrue
