@@ -23,7 +23,13 @@ no model. Each tick:
    profile, one the reconciler pruned for ``spec.scope.exclude.clusters`` or
    ``RECONCILE_EXCLUDE`` or has not yet scaffolded, is left unread: the
    exclusion is the operator keeping a model turn off that cluster, and this
-   watch follows the same roster;
+   watch follows the same roster. Under ``spec.mode: next`` the scope
+   publisher's resolved scope names the fleet instead
+   (``fleet_scope_targets.list_scope_clusters``, #5621): the management and
+   explicit projects are listed as above, a member project's clusters come
+   from the publisher's list, a member it holds no list for is held as a
+   failed listing is, and a cluster in scope and not excluded is swept
+   whether or not it has a profile;
 2. per cluster, points a per-cluster kubeconfig at the cluster and lists the
    namespaces that are not system namespaces and not excluded (see "What an
    install can tune" below). The credentials behind that
@@ -193,6 +199,7 @@ from pathlib import Path
 # already on `sys.path` when the scheduler runs it as a plain subprocess.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import credential_proxy_client  # noqa: E402
+import fleet_scope_targets  # noqa: E402
 import gitops_workspace  # noqa: E402
 import sandbox_exec  # noqa: E402
 from gke_endpoint import dns_endpoint_args  # noqa: E402
@@ -744,6 +751,12 @@ TERMINAL_CARD_STATUSES = frozenset({"done", "archived", "cancelled", "failed"})
 BOARD_DB_NAME = "kanban.db"
 BOARD_BUSY_TIMEOUT_SECONDS = 10
 NOTICED_PREFIX = "🧭 stall noticed"
+# A stall swept under spec.mode: next on a cluster with no Cluster Agent
+# profile to assign its alert to (#5621): no alert is raised, and each such
+# namespace is said in chat once while its rows stay ledgered (UNROUTED_KEY
+# holds the ones said), until #5622 moves the alert to the cluster profile.
+UNROUTED_MARK = "with no Cluster Agent profile to alert"
+UNROUTED_KEY = "unrouted"
 CLEARED_PREFIX = "✅ stall cleared"
 DRY_RUN_PREFIX = "dry run:"
 #: A card the board no longer has, or cannot describe for this many ticks
@@ -1484,6 +1497,7 @@ def empty_state() -> dict:
         EPISODES_KEY: {},
         "sweep_error": None,
         INJECT_ERROR_KEY: None,
+        UNROUTED_KEY: None,
         "updated_at": None,
         CURSOR_KEY: None,
         CREDENTIALS_KEY: {},
@@ -1675,6 +1689,10 @@ class Sweep:
         project, name, location = split_cluster_id(cid)
         if project in self.unlisted_projects:
             return True
+        if fleet_scope_targets.UNRESOLVED_SCOPE_ROW in self.unlisted_projects and project not in self.projects:
+            # The resolved scope could not be read, so which projects are its
+            # members is unknown this tick: a project it does not name is held.
+            return True
         return project not in self.projects and cluster_agent_for(project, name, location) is not None
 
     def verdict(self, entry: dict) -> str:
@@ -1809,23 +1827,14 @@ def profile_identity(home: Path) -> dict[str, str] | None:
         return None
 
 
-def roster_projects() -> tuple[set[str], dict[str, str]]:
+def roster_projects(scope: fleet_scope_targets.ScopeClusters | None = None) -> tuple[set[str], dict[str, str]]:
     """The projects the Cluster Agent profiles' identities name, and a ledger
-    entry for each profile whose identity names none."""
-    from cluster_agent_profile import RESERVED_PROFILES  # lazy, as in cluster_agent_for
-
-    base = Path(gitops_workspace.agent_home()) / PROFILES_DIR
-    if not base.is_dir():
-        return set(), {}
-    projects, unread = set(), {}
-    for home in base.iterdir():
-        if home.name in RESERVED_PROFILES or home.name.startswith(".") or not home.is_dir():
-            continue
-        identity = profile_identity(home)
-        if identity:
-            projects.add(identity["project"])
-        else:
-            unread[f"{PROFILE_SCOPE} {home.name}"] = NO_IDENTITY_REASON
+    entry for each profile whose identity names none: the profiles walk
+    `fleet_scope_targets.list_scope_clusters` makes outside spec.mode: next."""
+    if scope is None:
+        scope = fleet_scope_targets.list_scope_clusters(gitops_workspace.agent_home())
+    projects = {entry.project for entry in scope.projects}
+    unread = {f"{PROFILE_SCOPE} {name}": NO_IDENTITY_REASON for name in scope.unidentified_profiles}
     return projects, unread
 
 
@@ -2179,10 +2188,21 @@ def sweep_fleet(
     `cluster_timings` its record of what each cluster cost to read
     (CLUSTER_TIMINGS_KEY), and `now` the tick's time, which a fetch, a
     discovery or a read this tick is recorded as."""
-    projects, unread_profiles = roster_projects()
-    sweep = Sweep({management_project} | projects)
-    sweep.unread_profiles = set(unread_profiles)
-    sweep.unreadable.update(unread_profiles)
+    scope = fleet_scope_targets.list_scope_clusters(gitops_workspace.agent_home(), management_project=management_project)
+    # Under spec.mode: next the resolved scope answers (#5621): the management
+    # and explicit projects are listed live, a member project's clusters come
+    # from the scope publisher's list, and a member nothing listed is held as
+    # a failed listing is. Outside it, the profiles' projects are listed live.
+    entries = scope.by_project() if scope.next_mode else {}
+    if scope.next_mode:
+        sweep = Sweep({management_project} | set(entries))
+        live = {management_project} | {p for p, e in entries.items() if e.status == fleet_scope_targets.STATUS_LIST_LIVE}
+    else:
+        projects, unread_profiles = roster_projects(scope)
+        sweep = Sweep({management_project} | projects)
+        sweep.unread_profiles = set(unread_profiles)
+        sweep.unreadable.update(unread_profiles)
+        live = sweep.projects
     records = dict(credentials or {})
     discoveries = dict(discovered or {})
     timings = dict(cluster_timings or {})
@@ -2191,35 +2211,61 @@ def sweep_fleet(
     clock = time.perf_counter()
     source = report_source()
     failures: dict[str, Exception] = {}
-    listings = list_projects(sorted(sweep.projects), management_project, started)
+    listings = list_projects(sorted(live), management_project, started)
     listing_seconds = seconds_since(clock)
     # Every listed cluster is registered before any is read: a cluster the
     # budget never reaches is unread, not gone.
     sweepable = []
+    resolved_listed = False
     for project in sorted(sweep.projects):
-        listing = listings[project]
+        resolved = False
+        if project in listings:
+            listing = listings[project]
+        elif entries[project].status == fleet_scope_targets.STATUS_UNREAD:
+            sweep.unlisted_projects.add(project)
+            sweep.unreadable[f"{LISTING_SCOPE} {project}"] = entries[project].reason or ""
+            continue
+        else:
+            # The publisher's probe listed names and locations, not statuses:
+            # each is swept, and one that is not serving fails its read.
+            listing = ([{"name": name, "location": location, "status": ""} for _, location, name in entries[project].clusters or ()], None)
+            resolved = resolved_listed = True
         if isinstance(listing, Exception):
             failures[project] = listing
             sweep.unlisted_projects.add(project)
             sweep.unreadable[f"{LISTING_SCOPE} {project}"] = failure_text(listing)
             continue
         clusters, incomplete = listing
+        if scope.next_mode:
+            # The reader leaves an excluded cluster out of a member's listing; it
+            # has left the roster all the same, so an alert open on it closes as
+            # the roster's, not as a stall that cleared.
+            for excluded_project, location, name in scope.excluded_clusters:
+                if excluded_project == project:
+                    sweep.unmanaged.add(cluster_id(project, name, location))
         if incomplete:
             sweep.unlisted_projects.add(project)
             sweep.unreadable[f"{LISTING_SCOPE} {project}"] = f"incomplete: {incomplete}"
         for cluster in clusters:
             cid = cluster_id(project, cluster["name"], cluster["location"])
-            if cluster_agent_for(project, cluster["name"], cluster["location"]) is None:
+            if scope.next_mode:
+                # The cluster agent is one `cluster` AgentProfile with a target
+                # now (#3658): a cluster in the resolved scope and not excluded
+                # is swept, profile or none. An excluded one is not a gap.
+                if not scope.admits(project, cluster["location"], cluster["name"]):
+                    sweep.unmanaged.add(cid)
+                    continue
+            elif cluster_agent_for(project, cluster["name"], cluster["location"]) is None:
                 sweep.unmanaged.add(cid)
                 sweep.unreadable[scope_key(cid)] = NO_PROFILE_REASON
                 continue
             sweep.listed_clusters.add(cid)
-            if cluster["status"] in SWEEPABLE_CLUSTER_STATUSES:
+            if resolved or cluster["status"] in SWEEPABLE_CLUSTER_STATUSES:
                 sweepable.append((cid, cluster))
                 sweep.sweepable_clusters.add(cid)
             else:
                 sweep.unreadable[scope_key(cid)] = f"status={cluster['status'] or 'unknown'}"
-    if len(failures) == len(sweep.projects):
+    if len(failures) == len(live) and not resolved_listed:
         raise failures[management_project]
     # Clusters are read SCAN_WORKERS at a time, in cursor order. Each worker
     # fills a ClusterPart and shares nothing but the budget flag; the parts
@@ -2769,6 +2815,8 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
         if not dry_run and episode.get("pending") and scope not in candidates and scope_rows(state, scope):
             candidates[scope] = []
     raised = held = 0
+    unrouted: list[str] = []
+    opened: set[str] = set()
     refusal: str | None = None
     for scope in sorted(candidates, key=lambda sc: (scope_first_seen(state, sc), sc)):
         new_rows = candidates[scope]
@@ -2787,12 +2835,17 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
                 what, shown = f"would comment on card `{episode.get('card') or 'not yet filed'}` for", new_rows
             elif not would_raise(state, sweep, scope, now, min_age):
                 continue
-            elif raised < MAX_ALERTS_PER_TICK:
-                what, shown = "would raise an alert for", rows
-                raised += 1
-            else:
+            elif cluster_agent_for(project, name, location) is None:
+                # The same check a real alert makes, in the same place: no
+                # profile, no alert, and no promise of one at the cap.
+                unrouted.append(scope)
+                continue
+            elif raised >= MAX_ALERTS_PER_TICK:
                 held += 1
                 continue
+            else:
+                what, shown = "would raise an alert for", rows
+                raised += 1
             lines.append(f"{DRY_RUN_PREFIX} {what} {scope_label_text(scope)}: {names_text(object_names(shown))}")
             continue
         if episode:
@@ -2824,18 +2877,23 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
                 previous = episode
         if not would_raise(state, sweep, scope, now, min_age):
             continue
+        # The profile is checked before the cap and a refusal, so a stall no
+        # alert can follow for is never counted among those held for one.
+        assignee = cluster_agent_for(project, name, location)
+        if assignee is None:
+            # Outside next mode the profile went between the sweep and the
+            # alert, and the next sweep leaves the cluster out. Under next mode
+            # the cluster is swept whether or not it has a profile, so the
+            # stall is said in chat rather than lost (below).
+            sys.stderr.write(f"stall_watch: {cid} has no Cluster Agent profile; no alert for {scope}\n")
+            unrouted.append(scope)
+            continue
         if refusal is not None:
             # The server refused this tick's first alert; the rest wait for the
             # next tick rather than each spending a timeout on the same answer.
             continue
         if raised >= MAX_ALERTS_PER_TICK:
             held += 1
-            continue
-        assignee = cluster_agent_for(project, name, location)
-        if assignee is None:
-            # The profile went between the sweep and the alert; the next sweep
-            # leaves the cluster out and its rows clear.
-            sys.stderr.write(f"stall_watch: {cid} has no Cluster Agent profile; no alert for {scope}\n")
             continue
         payload = stall_payload(project, name, location, namespace, assignee, rows, scope_first_seen(state, scope) or now)
         try:
@@ -2860,6 +2918,21 @@ def episode_lines(state: dict, sweep: Sweep, new_by_scope: dict, cleared_by_scop
             sys.stderr.write(f"stall_watch: no alert for {scope}: {refusal}\n")
             continue
         raised += 1
+        opened.add(scope)
+    # A namespace already said stays said while its rows stay ledgered: a tick
+    # that did not read it, held it at the cap, or saw only some of the set
+    # clear is not news. It is forgotten once its rows go or this tick's alert
+    # opens an episode for it, so a stall that comes back is said again; an
+    # older episode it still holds (an expired alert, a finished card) does
+    # not make it news again.
+    ledgered = {scope_key(e["cluster"], e["namespace"]) for e in state["stalls"].values()}
+    said = {scope for scope in state.get(UNROUTED_KEY) or [] if scope in ledgered and scope not in opened}
+    fresh = sorted(set(unrouted) - said)
+    if fresh:
+        shown = names_text([scope_label_text(scope) for scope in fresh])
+        text = f"{NOTICED_PREFIX} in {len(fresh)} namespace{'s' if len(fresh) > 1 else ''} {UNROUTED_MARK} ({shown}); no alert was raised, and each is said once while it stays stalled"
+        lines.append(f"{DRY_RUN_PREFIX} {text}" if dry_run else text)
+    state[UNROUTED_KEY] = sorted(said | set(unrouted)) or None
     if held:
         text = f"{NOTICED_PREFIX} in {held} more namespace{'s' if held > 1 else ''}; alerts follow on later ticks, {MAX_ALERTS_PER_TICK} a tick"
         lines.append(f"{DRY_RUN_PREFIX} {text}" if dry_run else text)

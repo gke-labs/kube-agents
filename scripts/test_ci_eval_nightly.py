@@ -2,8 +2,8 @@
 
 `hack/ci-eval-pr.sh` builds its task matrix from the files under hack/eval/
 (#1546): presubmit-cases.txt into TASKS, nightly-cases.txt into
-NIGHTLY_TASKS, certification-cases.txt into CERTIFICATION_TASKS,
-blocking-roster.txt into BOOTSTRAP_ADMITTED's default. Then
+NIGHTLY_TASKS, the task files carrying the bare line `suite: certification`
+into CERTIFICATION_TASKS, blocking-roster.txt into BOOTSTRAP_ADMITTED's default. Then
 EVAL_TIER selects the matrix: unset or "presubmit" runs exactly TASKS,
 "nightly" appends NIGHTLY_TASKS, "certification" runs CERTIFICATION_TASKS
 alone, and anything else stops the job before it spends a cluster. The properties below are exercised against the REAL text
@@ -85,7 +85,9 @@ def lifted_block(pattern: str) -> str:
 
 
 def roster_constants() -> str:
-    return lifted_block(r"^readonly EVAL_PRESUBMIT_CASES_FILE=[^\n]*\n(?:readonly EVAL_[A-Z_]+_FILE=[^\n]*\n)*")
+    files = lifted_block(r"^readonly EVAL_PRESUBMIT_CASES_FILE=[^\n]*\n(?:readonly EVAL_[A-Z_]+_FILE=[^\n]*\n)*")
+    lines = lifted_block(r"^readonly CERTIFICATION_SUITE_LINE_RE=[^\n]*\n(?:readonly CERTIFICATION_[A-Z_]+=[^\n]*\n)+")
+    return files + lines
 
 
 def matrix_section() -> str:
@@ -124,13 +126,16 @@ PRINT_ARRAYS = (
     'printf "TASK %s\\n" "${TASKS[@]}"\n'
     'printf "NIGHTLY %s\\n" "${NIGHTLY_TASKS[@]}"\n'
     'printf "ROSTER %s\\n" "${BOOTSTRAP_ADMITTED}"\n'
+    # The `+` form: an empty array is unbound under `set -u` on bash 3.2.
+    'for c in ${CERTIFICATION_TASKS[@]+"${CERTIFICATION_TASKS[@]}"}; do printf "CERT %s\\n" "$c"; done\n'
 )
 
 
-def load_matrix(env: dict | None = None, hack_dir: pathlib.Path = HACK_DIR) -> subprocess.CompletedProcess:
-    """The real loading code over the files under `hack_dir`/eval, BENCH_DIR
-    pinned to the real bench/ so entries resolve against real cases."""
-    section = matrix_section().replace('BENCH_DIR="${SCRIPT_DIR}/../bench"', f'BENCH_DIR="{BENCH_DIR}"')
+def load_matrix(env: dict | None = None, hack_dir: pathlib.Path = HACK_DIR, bench_dir: pathlib.Path = BENCH_DIR) -> subprocess.CompletedProcess:
+    """The real loading code over the files under `hack_dir`/eval and the
+    task files under `bench_dir`/tasks; the real bench/ by default, so entries
+    resolve against real cases."""
+    section = matrix_section().replace('BENCH_DIR="${SCRIPT_DIR}/../bench"', f'BENCH_DIR="{bench_dir}"')
     body = "\n".join([f'SCRIPT_DIR="{hack_dir}"', roster_constants(), section, roster_block(), PRINT_ARRAYS])
     return run_bash(body, env)
 
@@ -180,7 +185,6 @@ def run_roster_check_over_an_oversized_corpus(check: str, tasks_array: str) -> s
             'NIGHTLY_ENTRIES=""',
             "PRESUBMIT_CASES_FILE=presubmit-cases.txt",
             "NIGHTLY_CASES_FILE=nightly-cases.txt",
-            "CERTIFICATION_CASES_FILE=certification-cases.txt",
             "LANE_CASES_FILE=gitlab-cases.txt",
             "EVAL_FORGE=gitlab",
             f'{tasks_array}=("{OVERSIZED_ENTRY}")',
@@ -198,6 +202,11 @@ class ShellAndPythonAgreeTest(unittest.TestCase):
         self.assertEqual(lines_tagged(result, "TASK"), presubmit_entries())
         self.assertEqual(lines_tagged(result, "NIGHTLY"), nightly_entries())
         self.assertEqual(lines_tagged(result, "ROSTER"), [",".join(eval_rosters.blocking_roster())])
+        self.assertEqual(
+            lines_tagged(result, "CERT"),
+            [f"./tasks/{name}/task.yaml" for name in eval_rosters.certification_cases()],
+            "the shell's grep over the task files and the Python read list the same suite in the same order",
+        )
 
     def test_the_env_override_of_the_roster_still_wins(self):
         result = load_matrix({"BOOTSTRAP_ADMITTED": "x-probe,y-probe"})
@@ -303,17 +312,37 @@ class RefusalTest(unittest.TestCase):
         self.assertEqual(lines_tagged(result, "NIGHTLY"), nightly_entries())
 
 
-# Three case directories that are in no roster (KNOWN_UNREGISTERED in
-# scripts/validate_bench_cases.py), so a scratch certification file can name
-# them without tripping the one-lane rule.
-CERTIFICATION_SCRATCH_CASES = tuple(sorted(validate_bench_cases.KNOWN_UNREGISTERED))[:3]
-CERTIFICATION_SCRATCH_FILE = (
-    "# header\n"
-    f"./tasks/{CERTIFICATION_SCRATCH_CASES[0]}/task.yaml\n"
-    "# part 2\n"
-    f"./tasks/{CERTIFICATION_SCRATCH_CASES[1]}/task.yaml  # trailing note\n"
-    f"./tasks/{CERTIFICATION_SCRATCH_CASES[2]}/task.yaml\n"
-)
+# Scratch certification cases: task files written into a temporary bench tree
+# beside symlinks to every presubmit and nightly case (check_case_entries
+# resolves those against BENCH_DIR). None of the real suite is linked in, so
+# what the tier enumerates is exactly what a test wrote. The tier reads the
+# bare `suite: certification` line and the bare `certification_part: N` line
+# and nothing else; a quoted value or a trailing comment is invisible to it,
+# which is why the validator refuses those spellings.
+CERTIFICATION_SCRATCH_CASES = ("cert-scratch-a", "cert-scratch-b", "cert-scratch-c")
+CERTIFICATION_SCRATCH_TASKS = {
+    CERTIFICATION_SCRATCH_CASES[0]: "id: cert-scratch-a\nsuite: certification\n",
+    CERTIFICATION_SCRATCH_CASES[1]: "id: cert-scratch-b\nsuite: certification\ncertification_part: 2\n",
+    CERTIFICATION_SCRATCH_CASES[2]: "id: cert-scratch-c\nsuite: certification\ncertification_part: 2\n",
+}
+
+
+def scratch_bench(tasks: dict[str, str], root: pathlib.Path) -> pathlib.Path:
+    """A bench tree under `root`: symlinks to the real presubmit and nightly
+    case directories, plus one directory per scratch task file."""
+    bench = root / "bench"
+    (bench / "tasks").mkdir(parents=True)
+    for name in eval_rosters.presubmit_cases() + eval_rosters.nightly_cases():
+        (bench / "tasks" / name).symlink_to(TASKS_DIR / name, target_is_directory=True)
+    for name, text in tasks.items():
+        case = bench / "tasks" / name
+        if case.is_symlink():
+            case.unlink()
+            shutil.copytree(TASKS_DIR / name, case)
+        else:
+            case.mkdir()
+        (case / "task.yaml").write_text(text)
+    return bench
 
 
 def certification_part_block() -> str:
@@ -322,70 +351,89 @@ def certification_part_block() -> str:
     return lifted_block(r"^# ─── The certification part.*?^esac$")
 
 
-def load_matrix_through_the_certification_part(env: dict | None = None, hack_dir: pathlib.Path = HACK_DIR) -> subprocess.CompletedProcess:
+def load_matrix_through_the_certification_part(env: dict | None = None, hack_dir: pathlib.Path = HACK_DIR, bench_dir: pathlib.Path = BENCH_DIR) -> subprocess.CompletedProcess:
     """The matrix section, the nightly part's check, the certification part
     and the roster export, in the script's order."""
-    section = matrix_section().replace('BENCH_DIR="${SCRIPT_DIR}/../bench"', f'BENCH_DIR="{BENCH_DIR}"')
+    section = matrix_section().replace('BENCH_DIR="${SCRIPT_DIR}/../bench"', f'BENCH_DIR="{bench_dir}"')
     body = "\n".join([f'SCRIPT_DIR="{hack_dir}"', roster_constants(), section, part_check(), certification_part_block(), roster_block(), PRINT_ARRAYS])
     return run_bash(body, env)
 
 
 class CertificationTierTest(unittest.TestCase):
-    """EVAL_TIER=certification: the certification file alone, by part, and
-    never a case the presubmit or the nightly runs."""
+    """EVAL_TIER=certification: the task files carrying the bare suite line,
+    by part, in case-id order, and never a case the presubmit or the nightly
+    runs."""
 
-    def scratch(self, text: str, env: dict | None = None) -> subprocess.CompletedProcess:
+    def scratch(self, tasks: dict[str, str], env: dict | None = None) -> subprocess.CompletedProcess:
         with tempfile.TemporaryDirectory() as tmp:
-            hack = pathlib.Path(tmp) / "hack"
-            shutil.copytree(HACK_DIR / "eval", hack / "eval")
-            (hack / "eval" / "certification-cases.txt").write_text(text)
-            return load_matrix_through_the_certification_part({"EVAL_TIER": "certification", **(env or {})}, hack_dir=hack)
+            bench = scratch_bench(tasks, pathlib.Path(tmp))
+            return load_matrix_through_the_certification_part({"EVAL_TIER": "certification", **(env or {})}, bench_dir=bench)
 
     def entries(self, *names: str) -> list[str]:
         return [f"./tasks/{name}/task.yaml" for name in names]
 
-    def test_the_tier_runs_the_certification_file_and_nothing_else(self):
-        result = self.scratch(CERTIFICATION_SCRATCH_FILE)
+    def test_the_tier_runs_the_suite_cases_in_id_order_and_nothing_else(self):
+        # Written out of order; the matrix is case-id order whatever the tree's.
+        shuffled = {k: CERTIFICATION_SCRATCH_TASKS[k] for k in reversed(CERTIFICATION_SCRATCH_CASES)}
+        result = self.scratch(shuffled)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(lines_tagged(result, "TASK"), self.entries(*CERTIFICATION_SCRATCH_CASES))
         self.assertIn("EVAL_TIER=certification: 3 certification case(s) make the matrix", result.stdout)
-        self.assertEqual(lines_tagged(result, "ROSTER"), [""], "no roster name is in the matrix, so none is exported: the gate's no-graded-case banner must not fire")
+        self.assertEqual(lines_tagged(result, "ROSTER"), [""], "no roster name is in the matrix, so none is exported: the gate's no-graded-case banner")
         self.assertIn("rung 4 is disarmed on this lane", result.stdout)
 
+    def test_the_order_is_by_case_id_not_by_path(self):
+        # `tasks/foo-bar/task.yaml` sorts before `tasks/foo/task.yaml` as a
+        # path (`-` before `/`); the shell sorts the id field, as Python does.
+        tasks = {"foo-bar": "id: foo-bar\nsuite: certification\n", "foo": "id: foo\nsuite: certification\n"}
+        result = self.scratch(tasks)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(lines_tagged(result, "TASK"), self.entries("foo", "foo-bar"))
+
+    def test_a_crlf_task_file_is_off_the_lane(self):
+        tasks = {"cert-scratch-a": "id: cert-scratch-a\r\nsuite: certification\r\n", "cert-scratch-b": "id: cert-scratch-b\nsuite: certification\n"}
+        result = self.scratch(tasks)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(lines_tagged(result, "TASK"), self.entries("cert-scratch-b"))
+
     def test_a_part_keeps_its_section_only(self):
-        result = self.scratch(CERTIFICATION_SCRATCH_FILE, {"EVAL_CERTIFICATION_PART": "2"})
+        result = self.scratch(CERTIFICATION_SCRATCH_TASKS, {"EVAL_CERTIFICATION_PART": "2"})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(lines_tagged(result, "TASK"), self.entries(*CERTIFICATION_SCRATCH_CASES[1:]))
         self.assertIn("Certification part: 2 (2 of 3 cases)", result.stdout)
-        result = self.scratch(CERTIFICATION_SCRATCH_FILE, {"EVAL_CERTIFICATION_PART": "1"})
-        self.assertEqual(lines_tagged(result, "TASK"), self.entries(CERTIFICATION_SCRATCH_CASES[0]), "entries above the first marker are part 1")
+        result = self.scratch(CERTIFICATION_SCRATCH_TASKS, {"EVAL_CERTIFICATION_PART": "1"})
+        self.assertEqual(lines_tagged(result, "TASK"), self.entries(CERTIFICATION_SCRATCH_CASES[0]), "a case with no part line is part 1")
 
-    def test_a_line_that_is_not_a_marker_is_a_comment_to_the_shell_too(self):
-        # The grammar scripts/eval_rosters.py's PART_MARKER_RE shares: `#part 2`,
-        # an indented marker and `# part 0` are comments, so their entries
-        # stay in the section above.
-        for not_a_marker in ("#part 2", "  # part 2", "# part 0"):
-            with self.subTest(line=not_a_marker):
-                text = f"./tasks/{CERTIFICATION_SCRATCH_CASES[0]}/task.yaml\n{not_a_marker}\n./tasks/{CERTIFICATION_SCRATCH_CASES[1]}/task.yaml\n"
-                result = self.scratch(text, {"EVAL_CERTIFICATION_PART": "1"})
-                self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(lines_tagged(result, "TASK"), self.entries(*CERTIFICATION_SCRATCH_CASES[:2]))
+    def test_only_the_bare_lines_are_read(self):
+        # The grammar the validator holds every task file to: anything else
+        # is a comment to the shell, so a quoted suite is off the lane and a
+        # quoted or commented part is part 1.
+        tasks = {
+            "cert-scratch-a": 'id: cert-scratch-a\nsuite: "certification"\n',
+            "cert-scratch-b": "id: cert-scratch-b\nsuite: certification  # the page row\n",
+            "cert-scratch-c": "id: cert-scratch-c\nsuite: certification\ncertification_part: 2  # note\n",
+            "cert-scratch-d": 'id: cert-scratch-d\nsuite: certification\ncertification_part: "2"\n',
+            "cert-scratch-e": "id: cert-scratch-e\nsuite: certification\n  certification_part: 2\n",
+        }
+        result = self.scratch(tasks)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(lines_tagged(result, "TASK"), self.entries("cert-scratch-c", "cert-scratch-d", "cert-scratch-e"))
+        result = self.scratch(tasks, {"EVAL_CERTIFICATION_PART": "2"})
+        self.assertNotEqual(result.returncode, 0, "no bare part line: every case is part 1, so part 2 is empty")
+        self.assertIn("EVAL_CERTIFICATION_PART=2 selects no case", result.stderr)
 
-    def test_the_other_tiers_do_not_read_the_file_into_the_matrix(self):
+    def test_the_other_tiers_do_not_read_the_suite_into_the_matrix(self):
         with tempfile.TemporaryDirectory() as tmp:
-            hack = pathlib.Path(tmp) / "hack"
-            shutil.copytree(HACK_DIR / "eval", hack / "eval")
-            (hack / "eval" / "certification-cases.txt").write_text(CERTIFICATION_SCRATCH_FILE)
+            bench = scratch_bench(CERTIFICATION_SCRATCH_TASKS, pathlib.Path(tmp))
             for tier, expected in (("presubmit", presubmit_entries()), ("nightly", presubmit_entries() + nightly_entries())):
-                result = load_matrix_through_the_certification_part({"EVAL_TIER": tier}, hack_dir=hack)
+                result = load_matrix_through_the_certification_part({"EVAL_TIER": tier}, bench_dir=bench)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(lines_tagged(result, "TASK"), expected, tier)
 
-    def test_the_checked_in_file_is_accepted_empty_by_the_other_tiers(self):
-        # The file lands empty, before its first case; only the certification
-        # tier refuses an empty read.
+    def test_the_real_tree_loads_under_the_other_tiers_with_the_suite_present(self):
         result = load_matrix({"EVAL_TIER": "nightly"})
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(lines_tagged(result, "CERT"), "the real tree carries suite cases; the nightly tier reads past them")
 
     def assert_refused(self, result, *needles):
         self.assertNotEqual(result.returncode, 0, result.stdout)
@@ -393,11 +441,15 @@ class CertificationTierTest(unittest.TestCase):
         for needle in needles:
             self.assertIn(needle, result.stderr)
 
-    def test_an_entry_in_another_roster_stops_the_job(self):
-        result = self.scratch("./tasks/agent-kanban-smoke/task.yaml\n")
-        self.assert_refused(result, "certification-cases.txt", "agent-kanban-smoke", "certification lane only")
-        result = self.scratch(f"./tasks/{eval_rosters.nightly_cases()[0]}/task.yaml\n")
-        self.assert_refused(result, "certification-cases.txt", "certification lane only")
+    def test_a_suite_case_in_another_roster_stops_the_job(self):
+        presubmit = eval_rosters.presubmit_cases()[0]
+        text = (TASKS_DIR / presubmit / "task.yaml").read_text(encoding="utf-8") + "suite: certification\n"
+        result = self.scratch({presubmit: text})
+        self.assert_refused(result, presubmit, "certification lane only")
+        nightly = eval_rosters.nightly_cases()[0]
+        text = (TASKS_DIR / nightly / "task.yaml").read_text(encoding="utf-8") + "suite: certification\n"
+        result = self.scratch({nightly: text})
+        self.assert_refused(result, nightly, "certification lane only")
 
     def test_a_duplicate_on_the_first_line_of_an_oversized_roster_still_stops_the_job(self):
         """The pipe form read a duplicate as absent whenever grep stopped
@@ -408,12 +460,12 @@ class CertificationTierTest(unittest.TestCase):
         self.assertNotIn("CHECK-PASSED", result.stdout, "the duplicate was accepted")
         self.assertIn("certification lane only", result.stderr)
 
-    def test_an_empty_file_stops_the_certification_tier(self):
-        result = self.scratch("# part 1\n")
-        self.assert_refused(result, "certification-cases.txt names no case")
+    def test_an_empty_suite_stops_the_certification_tier(self):
+        result = self.scratch({})
+        self.assert_refused(result, "no task file under bench/tasks/ carries the bare line 'suite: certification'")
 
     def test_a_part_that_selects_nothing_stops_the_job(self):
-        result = self.scratch(CERTIFICATION_SCRATCH_FILE, {"EVAL_CERTIFICATION_PART": "3"})
+        result = self.scratch(CERTIFICATION_SCRATCH_TASKS, {"EVAL_CERTIFICATION_PART": "3"})
         self.assert_refused(result, "EVAL_CERTIFICATION_PART=3 selects no case")
 
     def test_a_part_outside_the_tier_or_a_bad_part_stops_the_job(self):
@@ -421,10 +473,10 @@ class CertificationTierTest(unittest.TestCase):
         self.assert_refused(result, "EVAL_CERTIFICATION_PART=1", "EVAL_TIER=nightly")
         for bad in ("0", "01", "one", "-1"):
             with self.subTest(part=bad):
-                self.assert_refused(self.scratch(CERTIFICATION_SCRATCH_FILE, {"EVAL_CERTIFICATION_PART": bad}), "must be 'all' or a whole number")
+                self.assert_refused(self.scratch(CERTIFICATION_SCRATCH_TASKS, {"EVAL_CERTIFICATION_PART": bad}), "must be 'all' or a whole number")
 
     def test_the_tier_refuses_a_forge_lane(self):
-        result = self.scratch(CERTIFICATION_SCRATCH_FILE, {"EVAL_FORGE": "gitlab"})
+        result = self.scratch(CERTIFICATION_SCRATCH_TASKS, {"EVAL_FORGE": "gitlab"})
         self.assert_refused(result, "grades GitHub only")
 
     def test_the_unknown_tier_message_names_the_tier(self):

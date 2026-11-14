@@ -12488,6 +12488,12 @@ spec:
                     was last computed from.
                   format: int64
                   type: integer
+                observedVersion:
+                  description: |-
+                    ObservedVersion is the image tag or digest from the reconciled gateway
+                    workload's platform-agent container (for example, "v0.12.3", "sha-abc1234",
+                    or "sha256:..."), stripped of any registry host and repository path.
+                  type: string
                 phase:
                   description: |-
                     Phase is the overall state (Pending, Provisioning, Ready, Paused, Degraded, Failed).

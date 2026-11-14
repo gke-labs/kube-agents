@@ -218,6 +218,9 @@ func run(log *slog.Logger) error {
 	if err != nil {
 		return fmt.Errorf("%s: %w", envAuthMapShards, err)
 	}
+	// A map refused because a profile entry names a tier this process hadn't
+	// loaded yet is re-judged when the tier table changes (#3659).
+	capability.OnTiersChanged(store.Revalidate)
 	validator, err := authcallout.NewTokenValidator(clientset, audience)
 	if err != nil {
 		return err

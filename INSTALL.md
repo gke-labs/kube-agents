@@ -1289,7 +1289,7 @@ describes the token. A Bitbucket forge is declared the same way, with `provider:
 ```bash
 # Deploy LiteLLM Gateway
 export MODEL_PROVIDER=gemini
-export MODEL_DEFAULT_NAME=gemini-3.5-flash
+export MODEL_DEFAULT_NAME=gemini-3.8-flash
 # For MODEL_PROVIDER=vertex_ai also export PROJECT_ID, LITELLM_KSA_NAME,
 # LITELLM_GSA_NAME, VERTEX_PROJECT_ID, and VERTEX_LOCATION — the vertex overlay
 # renders the gateway's Workload Identity ServiceAccount from them.

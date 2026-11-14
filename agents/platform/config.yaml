@@ -87,8 +87,13 @@ mcp_servers:
       # the CA it trusts the bus by: the bus requires TLS, and without
       # NATS_CA_FILE the CLI checks the bus against the system roots and every
       # post fails verification. The bus token is a file mount, not
-      # environment, so nothing else is needed.
+      # environment, so nothing else is needed. A2A_NOTIFY_PLATFORM and
+      # A2A_NOTIFY_CONVERSATIONS each hold a comma-separated list of platform
+      # names (the operator renders one name today). With the first empty,
+      # routed_platforms() derives Slack from the conversations list and a
+      # learned home channel, so the child needs both.
       A2A_NOTIFY_PLATFORM: "${A2A_NOTIFY_PLATFORM}"
+      A2A_NOTIFY_CONVERSATIONS: "${A2A_NOTIFY_CONVERSATIONS}"
       NATS_URL: "${NATS_URL}"
       NATS_CA_FILE: "${NATS_CA_FILE}"
       A2A_BUS_USER: "${A2A_BUS_USER}"
@@ -117,6 +122,10 @@ mcp_servers:
       # snapshot answers yet (a fresh install before its first tick, a CR that
       # gained a block since the last one); the operator always sets it.
       KUBEAGENTS_SCOPE_FILE: "${KUBEAGENTS_SCOPE_FILE}"
+      # The scope publisher's resolved scope, mounted read-only under
+      # spec.mode: next and pinned empty outside it (#5621), for the cluster
+      # lists fleet_scope_targets.list_scope_clusters reads.
+      KUBEAGENTS_RESOLVED_SCOPE_FILE: "${KUBEAGENTS_RESOLVED_SCOPE_FILE}"
   # A remote MCP endpoint, proxied over stdio by mcp-remote. The explicit
   # timeout is a backstop: unpatched, mcp-remote drops the request id when the
   # remote answers non-2xx, so the client parks for the whole 300s default.

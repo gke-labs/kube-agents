@@ -60,8 +60,13 @@ const (
 	// agent use on kind.
 	inClusterContextName = "in-cluster"
 	// inClusterAPIServer is the in-cluster API server address; its certificate
-	// carries this name, so no IP has to be read at render time.
-	inClusterAPIServer = "https://kubernetes.default.svc"
+	// carries this name, so no IP has to be read at render time. The full
+	// name, because the pods that dial it run with ndots:2
+	// (publicAPICallerPodNdots), where the 2-dot kubernetes.default.svc would
+	// be asked of the upstream resolver before the search list resolves it.
+	// It needs the cluster.local DNS domain, as the Service URLs the operator
+	// renders already do.
+	inClusterAPIServer = "https://kubernetes.default.svc.cluster.local"
 
 	defaultPlatformAgentSecrets = "platform-agent-secrets"
 	sessionKVDBPath             = "/var/lib/kube-agents/session/session_kv.db"
