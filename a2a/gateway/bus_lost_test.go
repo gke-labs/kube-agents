@@ -192,36 +192,38 @@ func TestARunOffTheBusForTheLimitGivesUp(t *testing.T) {
 	}
 }
 
-// A blip shorter than the limit moves nothing: the count starts again on a
-// reconnect, so two blips that add up past it don't either.
-func TestABusBlipDoesNotEndTheRun(t *testing.T) {
-	shortBusWatch(t, 3*time.Second)
-	r := newBusLostRig(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- r.g.RunWith(ctx, RunOptions{BusDownLimit: termWaitBusMax}) }()
-	waitFor(t, "the relay to bind", func() bool { ready, _ := r.g.Readiness(); return ready })
-	var down time.Duration
-	// Blips of about a second each, until together they pass twice the
-	// limit: the reset on each reconnect is the only thing holding the run.
-	for i := 0; i < 12 && down < 2*termWaitBusMax; i++ {
-		start := time.Now()
-		r.stop(t)
-		time.Sleep(500 * time.Millisecond)
-		r.restart(t)
-		down += time.Since(start)
+// A blip shorter than the limit moves nothing, and the count starts again on
+// a reconnect, so blips that add up past the limit don't either; down for
+// the limit without a break does. On a stepped clock: what the count does
+// is the question, not how fast a runner reconnects (#5904).
+func TestTheBusDownCountStartsAgainOnAReconnect(t *testing.T) {
+	const limit = 60 * time.Second
+	var b busDownTracker
+	at := time.Unix(0, 0)
+	look := func(connected bool, step time.Duration) (time.Duration, bool) {
+		at = at.Add(step)
+		return b.observe(connected, at, limit)
 	}
-	if down < 2*termWaitBusMax {
-		t.Fatalf("the blips added up to %s, under twice the %s limit", down, termWaitBusMax)
+	// Ten blips of 50 s each, 500 s down in all, each followed by one
+	// connected look: none reaches the limit.
+	for i := 0; i < 10; i++ {
+		if _, giveUp := look(false, time.Second); giveUp {
+			t.Fatalf("blip %d: gave up on its first disconnected look", i)
+		}
+		if down, giveUp := look(false, 50*time.Second); giveUp {
+			t.Fatalf("blip %d: gave up after %s down, under the %s limit", i, down, limit)
+		}
+		if down, giveUp := look(true, time.Second); giveUp || down != 0 {
+			t.Fatalf("blip %d: a connected look = %s, %v, want the count reset", i, down, giveUp)
+		}
 	}
-	select {
-	case err := <-done:
-		t.Fatalf("the run ended after blips shorter than the limit: %v", err)
-	case <-time.After(1500 * time.Millisecond):
+	// Down without a break: the look at 59 s holds, the look at 60 s gives up.
+	look(false, time.Second)
+	if down, giveUp := look(false, 59*time.Second); giveUp {
+		t.Fatalf("gave up at %s, under the limit", down)
 	}
-	cancel()
-	if err := receive(t, done, 10*time.Second, "the run to stop"); err != nil {
-		t.Fatalf("run after cancel = %v, want nil", err)
+	if down, giveUp := look(false, time.Second); !giveUp || down != limit {
+		t.Fatalf("down %s without a break = %v, want a give-up at the limit", down, giveUp)
 	}
 }
 
