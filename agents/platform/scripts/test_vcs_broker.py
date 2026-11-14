@@ -1939,6 +1939,43 @@ class BranchVerbTest(unittest.TestCase):
         with self.assertRaises(WorkspaceError):
             self.contains("main", merge)
 
+    def test_contains_takes_an_abbreviated_ancestor(self):
+        merge = self.push_branch("main", "first\n")
+        later = self.push_branch("main", "second\n")
+        self.assertTrue(self.contains(merge[:12], later)["contains"])
+        self.assertTrue(self.contains(later[:12], later)["contains"])
+        self.assertFalse(self.contains(later[:12], merge)["contains"])
+
+    def test_contains_stops_the_fetch_at_the_ceiling(self):
+        merge = self.push_branch("main", "first\n")
+        later = self.push_branch("main", "second\n")
+        self.broker.max_clone_bytes = 1
+        with self.assertRaises(WorkspaceError) as caught:
+            self.contains(merge, later)
+        self.assertEqual(caught.exception.fields.get("code"), "CLONE_TOO_LARGE")
+        self.assertNotIn("`branch`", str(caught.exception))
+
+    def test_contains_answers_a_failed_fetch_by_its_cause(self):
+        from unittest import mock
+
+        merge = self.push_branch("main", "first\n")
+        later = self.push_branch("main", "second\n")
+        failed = subprocess.CompletedProcess([], 128, "", "fatal: unable to access: Could not resolve host")
+        real = self.broker._git_for
+
+        def runner(*args, **kwargs):
+            git = real(*args, **kwargs)
+
+            def wrapped(cwd, *argv, **kw):
+                return failed if argv[:1] == ("fetch",) else git(cwd, *argv, **kw)
+
+            return wrapped
+
+        with mock.patch.object(self.broker, "_git_for", side_effect=runner):
+            with self.assertRaises(WorkspaceError) as caught:
+                self.contains(merge, later)
+        self.assertEqual(caught.exception.fields.get("code"), "FORGE_CALL_FAILED")
+
     # -- branch-view -----------------------------------------------------
 
     def test_view_says_a_branch_the_remote_does_not_hold_is_absent(self):

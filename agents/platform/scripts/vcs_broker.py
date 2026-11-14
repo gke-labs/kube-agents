@@ -206,6 +206,11 @@ SNAPSHOT_HISTORY = "none"
 MAX_SNAPSHOT_PATHS = 256
 # How often the snapshot clone's size is measured while it runs.
 CLONE_WATCH_SECONDS = 0.5
+#: `revision-contains`'s ancestor: a full or abbreviated commit id, SHA-1 or SHA-256.
+ANCESTOR_RE = re.compile(r"^[0-9a-f]{7,64}$")
+#: git's words, across server versions, for a fetch of a revision the remote does not have.
+MISSING_REVISION_MARKERS = ("not our ref", "couldn't find remote ref", "unadvertised object", "no such remote ref",
+                            "did not send all necessary objects")
 # A path entry, and all of them joined: well under the kernel's limits on one
 # argument (128 KiB) and on a command line, so git always starts.
 MAX_SNAPSHOT_PATH_BYTES = 4096
@@ -1788,35 +1793,66 @@ class VcsBroker:
         The post-merge check's question when a GitOps tool applied a commit
         other than the merge commit: reconcilers track a branch, so a later
         merge carries this one. git against the remote, like `branch-view`:
-        `revision`'s history is fetched into a scratch repository, never checked
-        out, under the clone's size ceiling. A fetch that fails, whether the
-        remote lacks the revision or the credential, network or ceiling stopped
-        it, is refused as `REVISION_NOT_FOUND`. A revision equal to `ancestor`
-        contains it without a fetch.
+        `revision`'s commits are fetched into a scratch repository, never
+        checked out, and the fetch is stopped at the clone's size ceiling
+        (`CLONE_TOO_LARGE`). `revision` is a full id, since it is what is
+        fetched; `ancestor` may be abbreviated (Bitbucket Cloud's
+        `mergeCommit` is 12 characters) and is resolved after the fetch. A
+        revision the remote does not have is `REVISION_NOT_FOUND`; an
+        untrusted certificate or a refused credential is answered by its
+        cause, and any other failed fetch is the retryable `FORGE_CALL_FAILED`.
+        A revision that starts with `ancestor` contains it without a fetch.
         """
         bound = self._bind(payload)
-        ancestor = validate_revision(payload.get("ancestor"), "ancestor")
+        ancestor = payload.get("ancestor")
+        ancestor = ancestor.strip().lower() if isinstance(ancestor, str) else ""
+        if not ANCESTOR_RE.match(ancestor):
+            raise WorkspaceError("ancestor must be a hex revision id of 7 to 64 characters")
         revision = validate_revision(payload.get("revision"), "revision")
-        if ancestor == revision:
+        if revision.lower().startswith(ancestor):
             return bound.stamp({"contains": True})
         bound.ensure()
         git = bound.git
         root = self._scratch("contains")
         try:
             git(root, "init", "--quiet", "--bare")
+            last, stopped = [0.0], [False]
+
+            def over_ceiling() -> bool:
+                now = time.monotonic()
+                if now - last[0] < CLONE_WATCH_SECONDS:
+                    return False
+                last[0] = now
+                stopped[0] = _tree_bytes(root, self.max_clone_bytes) > self.max_clone_bytes
+                return stopped[0]
+
             fetched = git(
                 root, "fetch", "--quiet", "--no-tags", "--filter=tree:0", bound.forge.clone_url(bound.repo), revision,
-                check=False,
+                check=False, stop=over_ceiling,
             )
+            remedy = "The history of this one revision is over it; nothing in the request makes the fetch smaller."
+            if stopped[0]:
+                raise self._clone_too_large(bound.repo, remedy)
             if fetched.returncode != 0:
+                stderr = fetched.stderr or ""
+                refusal = self._tls_refusal(stderr) or _git_refusal(bound.forge, bound.repo, stderr, "fetch")
+                if refusal is not None:
+                    raise refusal
+                if any(marker in stderr for marker in MISSING_REVISION_MARKERS):
+                    raise WorkspaceError(
+                        f"{bound.repo} has no revision {revision}",
+                        status=404,
+                        code="REVISION_NOT_FOUND",
+                    )
                 raise WorkspaceError(
-                    f"{bound.repo} has no revision {revision} this credential can fetch",
-                    status=404,
-                    code="REVISION_NOT_FOUND",
+                    f"could not fetch {revision} from {bound.repo}: git exited {fetched.returncode}",
+                    status=502,
+                    code="FORGE_CALL_FAILED",
                 )
-            self._enforce_ceiling(root, bound.repo)
+            self._enforce_ceiling(root, bound.repo, remedy=remedy)
             present = git(root, "rev-parse", "--verify", "--quiet", f"{ancestor}^{{commit}}", check=False)
-            contains = present.returncode == 0 and self._is_ancestor(git, root, ancestor, revision)
+            full = (present.stdout or "").strip()
+            contains = present.returncode == 0 and bool(full) and self._is_ancestor(git, root, full, revision)
         finally:
             self._discard_scratch(root)
         return bound.stamp({"contains": contains})
