@@ -1719,8 +1719,17 @@ def slack_overheads_from_gcs(gcloud: str = DEFAULT_GCLOUD, prefix: str = SLACK_L
         if isinstance(doc, dict) and "error" not in doc:
             # Dated as the nightlies are (nightly.night_day), so it meets its own night.
             day = nightly.night_day(started)
-            out.append({"build_id": build_id, "date": day.isoformat(), **{k: doc.get(k) for k in SLACK_OVERHEAD_KEYS}})
+            out.append(_slack_overhead_entry(build_id, day.isoformat(), doc))
     return out
+
+
+def _slack_overhead_entry(build_id: str, date, doc: dict) -> dict:
+    """One slack_overhead entry, each SLACK_OVERHEAD_KEYS value a finite number or None:
+    json.loads accepts NaN and Infinity, and json.dumps would write them into the inlined
+    page, where JSON.parse refuses them (trend._mean's rule)."""
+    def finite(value):
+        return value if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) else None
+    return {"build_id": build_id, "date": date, **{k: finite(doc.get(k)) for k in SLACK_OVERHEAD_KEYS}}
 
 
 def records_location(base: str) -> bool:
@@ -2908,7 +2917,9 @@ def collect(
         data["releases"] = sorted(by_id.values(), key=_release_sort_key, reverse=True)[:rc_limit]
     # The Slack lane's overhead, newest first: this scan's read merged over the
     # prior file's by build, so a failed read keeps what was there.
-    known = [o for o in (prior_data or {}).get("slack_overhead") or [] if isinstance(o, dict) and isinstance(o.get("build_id"), str) and o["build_id"].isdecimal()]
+    prior_overhead = (prior_data or {}).get("slack_overhead")
+    known = [_slack_overhead_entry(o["build_id"], o.get("date"), o) for o in prior_overhead if isinstance(o, dict)
+             and isinstance(o.get("build_id"), str) and o["build_id"].isdecimal()] if isinstance(prior_overhead, list) else []
     fresh = slack_overheads_from_gcs(gcloud, slack_lane_prefix, known=frozenset(o["build_id"] for o in known)) if slack_lane_prefix else []
     by_build = {o["build_id"]: o for o in known} | {o["build_id"]: o for o in fresh}
     if by_build:

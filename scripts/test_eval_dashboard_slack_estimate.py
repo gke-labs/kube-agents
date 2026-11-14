@@ -132,6 +132,21 @@ class CollectReadsTheLaneTest(unittest.TestCase):
             got = collect.collect(from_dir=runs, merge_with=str(prior_file))
         self.assertEqual(["1"], [o["build_id"] for o in got["slack_overhead"]])
 
+    def test_a_malformed_prior_list_or_a_non_finite_value_is_not_carried(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prior_file = pathlib.Path(tmp) / "data.json"
+            runs = pathlib.Path(tmp) / "runs"
+            runs.mkdir()
+            base = {"schema_version": 1, "generated_at": "2026-09-09T12:00:00+00:00", "cases": [], "runs": []}
+            prior_file.write_text(json.dumps({**base, "slack_overhead": 1}))
+            self.assertNotIn("slack_overhead", collect.collect(from_dir=runs, merge_with=str(prior_file)))
+            prior_file.write_text(json.dumps({**base, "slack_overhead": [
+                {"build_id": "1", "date": "2026-09-07", "delivery_lag_s": float("nan"), "post_s": float("inf"),
+                 "first_ack_p50_s": True, "first_ack_p95_s": 1.2}]}))
+            got = collect.collect(from_dir=runs, merge_with=str(prior_file))["slack_overhead"][0]
+        self.assertEqual({"delivery_lag_s": None, "post_s": None, "first_ack_p50_s": None, "first_ack_p95_s": 1.2},
+                         {k: got[k] for k in collect.SLACK_OVERHEAD_KEYS})
+
     def test_a_known_build_is_not_read_again(self):
         listing = "gs://b/lane/1/\ngs://b/lane/2/\n"
         reads = []
