@@ -191,7 +191,13 @@ evidence says the storm is unconfirmed; the evidence line and the Chat
 sentence also quote the repetitions' own words for how they died, as the
 harness wrote them and after the same scrub as the periodics' quoted log line,
 commonest first, so a batch that said `hermes-rate-limited` reads as that and
-not as the bot's guess), or setup
+not as the bot's guess; a run whose install died mid-run, every pod deleted
+within a minute as the collector read it from the job's pods watch, is set
+aside before the count, since its lost attempts are that install's and not the
+pool's: the evidence records `install died: PR #4158 on kube-agents-evals-18
+at 02:02 UTC, every pod Killing; 8 case attempts not counted as a storm`
+storm or no storm, and a storm that still fires names the run in its line and
+in Chat as not counted), or setup
 deaths (3+ runs that concluded `FAILURE` under 5 minutes with no tasks, on 2+
 pull requests, in 2 hours, #1172; an aborted zero-task run is a superseded
 push), or seeded

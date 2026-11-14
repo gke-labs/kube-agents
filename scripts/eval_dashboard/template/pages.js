@@ -609,7 +609,10 @@ function breakFacts(inc, inWindow) {
   const mergeFact = mergesFact(inc, inWindow);
   if (mergeFact) facts.push(mergeFact);
   let reps = 0, storm = 0;
-  for (const run of hit) for (const c of run.cases || []) { reps += repTotal(c.reps); storm += c.reps.infra; }
+  for (const run of hit) {
+    for (const c of run.cases || []) reps += repTotal(c.reps);
+    storm += runStormReps(run);
+  }
   const quiet = reps > 0 && storm / reps < PAGE.stormNoiseShare;
   facts.push(fact(!quiet, quiet
     ? `Not a quota storm: the agent ran and was graded on ${pct(1 - storm / reps)} of repetitions in these runs.`
@@ -617,13 +620,22 @@ function breakFacts(inc, inWindow) {
   return facts;
 }
 
+// The run's storm losses as classify.py and health.py count them: none from
+// a run whose install died (`storm_reps` is 0 there); the per-case sum is the
+// fallback for a run row written before the field existed.
+function runStormReps(run) {
+  if (typeof run.storm_reps === "number") return run.storm_reps;
+  return (run.cases || []).reduce((n, c) => n + (c.cls === "install-died" ? 0 : (c.reps.infra || 0)), 0);
+}
+
 function stormFacts(inc, inWindow) {
   let reps = 0, storm = 0;
   const prs = new Set();
   const projects = new Set();
   for (const run of inWindow) {
-    let mine = 0;
-    for (const c of run.cases || []) { reps += repTotal(c.reps); storm += c.reps.infra; mine += c.reps.infra; }
+    for (const c of run.cases || []) reps += repTotal(c.reps);
+    const mine = runStormReps(run);
+    storm += mine;
     if (mine) { if (run.pr != null) prs.add(run.pr); if (run.project) projects.add(run.project); }
   }
   const graded = inWindow.flatMap((r) => (r.cases || []).filter((c) => c.admitted && c.outcome !== "infra"));
@@ -1222,6 +1234,7 @@ function tagFor(c) {
   if (c.cls === "delegation-ceiling") return '<span class="tag storm">delegation ceiling</span>';
   if (c.cls === "fixture-drift") return '<span class="tag storm">fixture drifted</span>';
   if (c.cls === "forge-unavailable") return '<span class="tag storm">forge unavailable</span>';
+  if (c.cls === "install-died") return '<span class="tag storm">install died</span>';
   return '<span class="tag unclear">unexplained</span>';
 }
 
@@ -1415,6 +1428,7 @@ function lastFailureHtml(c) {
   else if (f.cls === "storm") head = "a quota storm: repetitions lost before grading";
   else if (f.cls === "delegation-ceiling") head = "the delegation ceiling: the harness stopped waiting with the worker still running";
   else if (f.cls === "fixture-drift") head = "a drifted fixture: the case was not run on that lease";
+  else if (f.cls === "install-died") head = "a dead install: every pod of the run's install was deleted at once";
   else if (f.cls === "only-this-pr") head = "PR-caused: passed on other PRs around it";
   else if (f.event) head = "failed all reps in a run where almost everything failed";
   else head = "failed all reps";

@@ -50,6 +50,11 @@ BUILD_1089_MIXED = "2094714569262895104"  # PR 1089, blocked/infra-heavy reps
 # A real post-kube-agents-eval-rc build -- a postsubmit, so no `pull` key in
 # started.json and no PR number anywhere in the log.
 RC_TESTDATA = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "testdata_rc"
+# The install's pod and event watches: a real green run's pods file (11-09,
+# nothing deleted), and hand-built files in the same columns for the 10-29
+# evals-18 drain shape (every pod deleted within seconds, Killing events)
+# and a rollout (two pods a minute apart).
+INSTALL_DEATH_TESTDATA = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "testdata_install_death"
 BUILD_RC_GREEN = "2097891568546484224"  # staging_2609092307_5b5ad10, GREEN, no baseline
 
 # Two real builds of 2026-09-11 (#1478): a pod whose node went NotReady
@@ -3303,3 +3308,110 @@ class TestGitLabLane(_MergeBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InstallDeathTest(unittest.TestCase):
+    """`runs[].install_deaths`: the moments every pod of the install was
+    deleted at once, from the run's own pods watch, with the events' words."""
+
+    def text(self, name):
+        return (INSTALL_DEATH_TESTDATA / name).read_text(encoding="utf-8")
+
+    def test_every_pod_deleted_within_the_span_is_a_death_with_the_events_words(self):
+        # The drain: the two StatefulSet pods go first and nats-0 is back
+        # under its own name before the last deletion (a new generation, not
+        # the deleted one); the scheduler's Preempted event carries only an
+        # eventTime and a message with two spaces inside.
+        deaths = collect.parse_install_deaths(self.text("drained-pods-watch.txt"), lambda: self.text("drained-events-watch.txt"))
+        self.assertEqual(
+            deaths,
+            [{"at": "2026-10-29T02:02:08Z", "pods": 8, "reasons": {"Killing": 8, "Preempted": 1}, "messages": ["Stopping container platform-agent", "Preempted by kube-system/konnectivity-agent-59d786d895-zgzd5  on node gk3-pool-1"]}],
+        )
+
+    def test_a_rollout_and_a_quiet_run_are_no_death_and_read_no_events(self):
+        def no_events():
+            raise AssertionError("the events watch is read only for a death")
+        self.assertEqual(collect.parse_install_deaths(self.text("rollout-pods-watch.txt"), no_events), [])
+        self.assertEqual(collect.parse_install_deaths(self.text("green-pods-watch.txt"), no_events), [])
+
+    def test_a_reopened_events_watch_counts_each_event_once(self):
+        events = self.text("drained-events-watch.txt")
+        twice = events + events
+        death = collect.parse_install_deaths(self.text("drained-pods-watch.txt"), lambda: twice)[0]
+        self.assertEqual(death["reasons"], {"Killing": 8, "Preempted": 1})
+
+    def test_no_pods_watch_is_unknown_not_no_death(self):
+        self.assertIsNone(collect.parse_install_deaths(None, lambda: ""))
+        self.assertEqual(collect.parse_install_deaths("", lambda: ""), [])
+
+    def test_a_reopened_watch_reprints_and_the_last_line_per_pod_wins(self):
+        # A watch that could not be held lists everything again on reopen:
+        # the header and every pod repeat, and only the last state counts.
+        text = self.text("drained-pods-watch.txt")
+        twice = text + text
+        self.assertEqual(collect.parse_install_deaths(twice, lambda: self.text("drained-events-watch.txt"))[0]["pods"], 8)
+        # The dead pods' own status reason is counted beside the events'.
+        preempted = text.replace("Running     <none>      2026-10-29T01:01:00Z   2026-10-29T02:02:08Z", "Failed      Preempted   2026-10-29T01:01:00Z   2026-10-29T02:02:08Z")
+        self.assertNotEqual(preempted, text)
+        death = collect.parse_install_deaths(preempted, lambda: "")[0]
+        self.assertEqual(death["reasons"], {"Preempted": 1})
+
+    def test_the_watch_columns_are_the_jobs(self):
+        # The parser keys on header names hack/ci-env.sh prints; a renamed
+        # column there would read every build as "no death" and nothing
+        # else would notice.
+        env = (pathlib.Path(__file__).resolve().parent.parent / "hack" / "ci-env.sh").read_text(encoding="utf-8")
+        pods = re.search(r'^readonly AGENT_DIAG_WATCH_POD_COLUMNS="([^"]+)"$', env, re.M).group(1)
+        events = re.search(r'^readonly AGENT_DIAG_WATCH_EVENT_COLUMNS="([^"]+)"$', env, re.M).group(1)
+        pod_names = {part.split(":")[0] for part in pods.split(",")}
+        event_names = {part.split(":")[0] for part in events.split(",")}
+        self.assertTrue({collect.POD_WATCH_NAME, collect.POD_WATCH_PHASE, collect.POD_WATCH_REASON, collect.POD_WATCH_STARTED, collect.POD_WATCH_DELETING} <= pod_names, pod_names)
+        self.assertTrue({collect.EVENT_WATCH_FIRST, collect.EVENT_WATCH_LAST, collect.EVENT_WATCH_REASON, collect.EVENT_WATCH_NAME, collect.EVENT_WATCH_MESSAGE} <= event_names, event_names)
+        self.assertEqual(pods.split(",")[0].split(":")[0], collect.POD_WATCH_NAME)
+        self.assertEqual(events.split(",")[0].split(":")[0], collect.EVENT_WATCH_FIRST)
+
+    def test_a_newer_generation_under_the_same_name_ends_the_older_one(self):
+        # The watch missed shell-0's first deletion (a reopen gap): its first
+        # generation keeps a row with no DELETING, a second generation started
+        # before the drain and died in it. The first is not alive at the
+        # drain, so the death still reads.
+        text = self.text("drained-pods-watch.txt")
+        gap = text.replace(f"{'platform-agent-shell-0':<50} {'Running':<11} {'<none>':<11} {'2026-10-29T01:04:00Z':<22} {'2026-10-29T02:02:08Z':<22}", f"{'platform-agent-shell-0':<50} {'Running':<11} {'<none>':<11} {'2026-10-29T02:01:00Z':<22} {'2026-10-29T02:02:08Z':<22}")
+        self.assertNotEqual(gap, text)
+        deaths = collect.parse_install_deaths(gap, lambda: self.text("drained-events-watch.txt"))
+        self.assertEqual((len(deaths), deaths[0]["pods"]), (1, 8), deaths)
+
+    def test_a_replacement_generations_own_events_are_not_the_dead_pods(self):
+        # The replacement's Scheduled and Pulled come seconds before its
+        # startTime (02:02:30): neither is the dead pod's.
+        rows = [
+            f"{'2026-10-29T02:02:25Z':<22} {'2026-10-29T02:02:25Z':<22} {'<nil>':<22} 1       Normal    Scheduled                        Pod                     {'platform-agent-a2a-nats-0':<50} Successfully assigned kubeagents-system/platform-agent-a2a-nats-0 to gk3-node",
+            f"{'2026-10-29T02:02:27Z':<22} {'2026-10-29T02:02:27Z':<22} {'<nil>':<22} 1       Normal    Pulled                           Pod                     {'platform-agent-a2a-nats-0':<50} Container image already present on machine",
+        ]
+        events = self.text("drained-events-watch.txt") + "\n".join(rows) + "\n"
+        death = collect.parse_install_deaths(self.text("drained-pods-watch.txt"), lambda: events)[0]
+        self.assertEqual(death["reasons"], {"Killing": 8, "Preempted": 1})
+
+    def test_a_pod_born_and_deleted_inside_the_span_is_neither_alive_nor_dead(self):
+        text = self.text("drained-pods-watch.txt")
+        extra = f"{'platform-agent-a2a-gateway-7c95444d84-short':<50} {'Running':<11} {'<none>':<11} {'2026-10-29T02:02:20Z':<22} {'2026-10-29T02:02:50Z':<22} c                            0          <none>   <none>   <none>\n"
+        deaths = collect.parse_install_deaths(text + extra, lambda: self.text("drained-events-watch.txt"))
+        self.assertEqual((len(deaths), deaths[0]["pods"]), (1, 8))
+
+    def test_build_run_reads_the_pods_watch_once_and_the_events_only_on_a_death(self):
+        asked = []
+        inner = collect._dir_reader(TESTDATA / "2092688354838581248")
+
+        def reader(name):
+            asked.append(name)
+            if name == collect.POD_WATCH_FILE:
+                return self.text("green-pods-watch.txt")
+            return inner(name)
+
+        run = collect.build_run("2092688354838581248", reader)
+        self.assertEqual(run["install_deaths"], [])
+        self.assertEqual(asked.count(collect.POD_WATCH_FILE), 1)
+        self.assertEqual(asked.count(collect.EVENT_WATCH_FILE), 0)
+        # A build without the watch records nothing: unknown, not "no death".
+        self.assertNotIn("install_deaths", collect.build_run("2092688354838581248", inner))
+

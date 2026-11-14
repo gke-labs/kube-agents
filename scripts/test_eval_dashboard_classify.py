@@ -206,6 +206,29 @@ class RepAndOutcomeTest(unittest.TestCase):
         cannot drift (the scorer is a package this test does not import)."""
         self.assertEqual(classify.DELEGATION_CEILING_MARKER, SCORER_CEILING_MARKER)
 
+    def test_a_run_whose_install_died_is_not_a_storm_run(self):
+        # Six infra reps from an install killed mid-run: the health rule sets
+        # the run aside, and the per-case advice must not send its owner to
+        # wait for a storm that is not one.
+        tasks = [task(name, "iii") for name in sorted(ADMITTED)[:2]] + [task(name, "ppp") for name in sorted(ADMITTED)[2:]]
+        dead = dict(run(100, 4158, T0 - timedelta(minutes=5), tasks=tasks), install_deaths=[{"at": "2026-10-29T02:02:08Z", "pods": 12, "reasons": {"Killing": 12}, "messages": []}])
+        alive = run(100, 4158, T0 - timedelta(minutes=5), tasks=tasks)
+        self.assertFalse(classify.run_is_storm(dead))
+        self.assertTrue(classify.run_is_storm(alive))
+        # The Brief's storm facts read the same count: none from a dead install.
+        self.assertEqual((classify.storm_reps(dead), classify.storm_reps(alive)), (0, 6))
+        self.assertEqual(classify_run(dead, [dead])["storm_reps"], 0)
+        name = sorted(ADMITTED)[0]
+        row = case(classify_run(dead, [dead]), name)
+        self.assertEqual((row["cls"], row["do"]), (classify.CLS_INSTALL_DIED, classify.DO_INSTALL_DIED))
+        self.assertEqual(case(classify_run(alive, [alive]), name)["cls"], "storm")
+        # Under a declared storm the dead install still names itself.
+        self.assertEqual(case(classify_run(dead, [dead], health_at=STORM), name)["cls"], classify.CLS_INSTALL_DIED)
+        # Every case lost that way: the headline says so, not the storm's shape.
+        every = dict(run(101, 4159, T0 - timedelta(minutes=5), tasks=[task(n, "iii") for n in sorted(ADMITTED)]), install_deaths=dead["install_deaths"])
+        verdict = classify_run(every, [every])
+        self.assertEqual(verdict["headline"], "Nothing was graded: the run's install died, every pod deleted at once.")
+
     def test_a_ceiling_rep_is_its_own_kind_not_a_storm(self):
         self.assertEqual(classify.rep_kind({"result": "infra", "reason": CEILING}), "ceiling")
         self.assertEqual(classify.rep_kind({"result": "fail", "reason": CEILING}), "ceiling", "the marker decides, whatever the verdict token")

@@ -265,7 +265,7 @@ class Shapes(Harness):
         names = sorted(ADMITTED)
         stormy = [task(names[0], "ffe")] + [task(name, "eee") for name in names[1:3]] + [task(name, "ppp") for name in names[3:]]
         mine = run(100, 1300, NOW - timedelta(minutes=5), tasks=stormy, result="FAILURE")
-        storm = {"state": "DEGRADED", "condition": "storm", "since": "2026-09-08T13:00:00+00:00", "failing_cases": [], "tracking_issues": [], "incident": {"prs": [1, 2, 3], "runs": 3, "window_start": "2026-09-08T13:15:00+00:00", "window_end": "2026-09-08T14:25:00+00:00", "causes": [["the executor's own failure (hermes-rate-limited)", 27], ["delegated worker hit infrastructure failure (rate_limit): card on board…", 1]]}}
+        storm = {"state": "DEGRADED", "condition": "storm", "since": "2026-09-08T13:00:00+00:00", "failing_cases": [], "tracking_issues": [], "incident": {"prs": [1, 2, 3], "runs": 3, "window_start": "2026-09-08T13:15:00+00:00", "window_end": "2026-09-08T14:25:00+00:00", "causes": [["the executor's own failure (hermes-rate-limited)", 27], ["delegated worker hit infrastructure failure (rate_limit): card on board…", 1]], "set_aside": [{"pr": 4158, "project": "kube-agents-evals-18", "build_id": "100", "reps": 8, "at": "2026-10-29T02:02:08Z", "words": "every pod Killing"}]}}
         self.tick(data(mine, *green_others()), storm)
         box = self.gh.bodies()[0].split("\n")[3]
         self.assertTrue(box.startswith("> 🟡 **Gate degraded** since Tue 9:00 AM ET. quota storm 9:15 AM–10:25 AM ET hit 3 PRs."), box)
@@ -275,6 +275,8 @@ class Shapes(Harness):
         self.assertNotIn("reps", self.gh.bodies()[0])
         self.assertNotIn("hermes-rate-limited", self.gh.bodies()[0])
         self.assertNotIn("27", box)
+        self.assertNotIn("not counted", box)
+        self.assertNotIn("evals-18", self.gh.bodies()[0])
 
     def test_a_run_that_records_where_it_lives_links_the_console_browser(self):
         """runs[].gcs_base (the smoke lanes' own bucket, which Deck cannot
@@ -694,7 +696,7 @@ def health_doc_for(condition, cause, since, incident):
 
 
 def storm_health():
-    return {"state": "DEGRADED", "condition": "storm", "since": "2026-09-08T13:00:00+00:00", "failing_cases": [], "tracking_issues": [], "incident": {"prs": [1, 2, 3], "runs": 3, "window_start": "2026-09-08T13:15:00+00:00", "window_end": "2026-09-08T14:25:00+00:00", "causes": [["the executor's own failure (hermes-rate-limited)", 27], ["delegated worker hit infrastructure failure (rate_limit): card on board…", 1]]}}
+    return {"state": "DEGRADED", "condition": "storm", "since": "2026-09-08T13:00:00+00:00", "failing_cases": [], "tracking_issues": [], "incident": {"prs": [1, 2, 3], "runs": 3, "window_start": "2026-09-08T13:15:00+00:00", "window_end": "2026-09-08T14:25:00+00:00", "causes": [["the executor's own failure (hermes-rate-limited)", 27], ["delegated worker hit infrastructure failure (rate_limit): card on board…", 1]], "set_aside": [{"pr": 4158, "project": "kube-agents-evals-18", "build_id": "100", "reps": 8, "at": "2026-10-29T02:02:08Z", "words": "every pod Killing"}]}}
 
 
 class NotEvaluatedComment(Harness):
@@ -789,6 +791,20 @@ class NotEvaluatedComment(Harness):
         self.tick(data(mine, *green_others()), green_health())
         box = self.gh.bodies()[0].split("\n")[3]
         self.assertTrue(box.startswith("> Some cases could not be graded: delegated work was still running when the harness stopped waiting."), box)
+
+    def test_cases_lost_to_a_dead_install_name_the_install(self):
+        mine = not_evaluated(100, 1300, NOW - timedelta(minutes=5), install_deaths=[{"at": "2026-10-29T02:02:08Z", "pods": 12, "reasons": {"Killing": 12}, "messages": []}])
+        self.tick(data(mine, *green_others()), green_health())
+        box = self.gh.bodies()[0].split("\n")[3]
+        self.assertTrue(box.startswith("> Some cases could not be graded: the run's install died under them, every pod deleted at once."), box)
+        self.assertNotIn("evals-", self.gh.bodies()[0])
+        # Beside a ceiling case the agent did not run for the dead install's
+        # cases, so the mix keeps the never-ran wording, not "the agent ran".
+        lost = ("agent-kanban-smoke", "security-overgrant-probe")
+        mixed = not_evaluated(101, 1301, NOW - timedelta(minutes=5), lost=lost, letters={lost[0]: "ccc", lost[1]: "iii"}, install_deaths=[{"at": "2026-10-29T02:02:08Z", "pods": 12, "reasons": {"Killing": 12}, "messages": []}])
+        self.tick(data(mixed, *green_others()), green_health())
+        box = self.gh.bodies()[-1].split("\n")[3]
+        self.assertTrue(box.startswith("> Some cases could not be graded: infrastructure failed before the agent ran."), box)
 
     def test_a_mix_of_causes_names_one_stage_only_when_it_is_shared(self):
         """Forge beside the ceiling: the agent ran for both. Forge beside a
@@ -928,7 +944,7 @@ class PublicCommentCarriesNoCaseResultsTest(Harness):
     def test_not_evaluated_names_no_case(self):
         mine = not_evaluated(100, 1300, NOW - timedelta(minutes=5), lost=("agent-kanban-smoke", "security-overgrant-probe"))
         mine["tasks"].append(task("reliability-pdb-probe", "fff"))
-        storm = {"state": "DEGRADED", "condition": "storm", "since": "2026-09-08T13:00:00+00:00", "failing_cases": ["security-overgrant-probe"], "tracking_issues": [], "incident": {"prs": [1, 2, 3], "runs": 3, "window_start": "2026-09-08T13:15:00+00:00", "window_end": "2026-09-08T14:25:00+00:00", "causes": [["the executor's own failure (hermes-rate-limited)", 27], ["delegated worker hit infrastructure failure (rate_limit): card on board…", 1]]}}
+        storm = {"state": "DEGRADED", "condition": "storm", "since": "2026-09-08T13:00:00+00:00", "failing_cases": ["security-overgrant-probe"], "tracking_issues": [], "incident": {"prs": [1, 2, 3], "runs": 3, "window_start": "2026-09-08T13:15:00+00:00", "window_end": "2026-09-08T14:25:00+00:00", "causes": [["the executor's own failure (hermes-rate-limited)", 27], ["delegated worker hit infrastructure failure (rate_limit): card on board…", 1]], "set_aside": [{"pr": 4158, "project": "kube-agents-evals-18", "build_id": "100", "reps": 8, "at": "2026-10-29T02:02:08Z", "words": "every pod Killing"}]}}
         self.tick(data(mine, *green_others()), storm)
         [body] = self.gh.bodies()
         self.assertIn("### ⚪ Smoke gate: run not evaluated", body)

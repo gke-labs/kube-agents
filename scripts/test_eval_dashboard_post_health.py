@@ -372,6 +372,20 @@ class Shapes(RunHarness):
             "🟡 *Smoke gate: flaky* — quota storm 1:15 PM–2:25 PM ET hit 3 PRs; reps: 27 hermes-rate-limited, 1 delegated worker hit infrastructure….  Passing runs still count;"
         ), self.opener.texts[0])
 
+    def test_storm_names_the_runs_set_aside_for_a_dead_install(self):
+        doc = storm()
+        doc["incident"]["causes"] = [["the executor's own failure (hermes-rate-limited)", 18]]
+        doc["incident"]["set_aside"] = [{"pr": 4158, "project": "kube-agents-evals-18", "build_id": "100", "reps": 8, "at": "2026-10-29T02:02:08Z", "words": "every pod Killing"}]
+        self.tick(doc, T0)
+        self.assertIn("hit 3 PRs; reps: 18 hermes-rate-limited; not counted: 8 case attempts on PR #4158 (kube-agents-evals-18), whose install died at 10:02 PM ET.  Passing", self.opener.texts[0])
+        # A record without the project or the time still says the count.
+        doc["incident"]["set_aside"] = [{"pr": 4158, "project": None, "build_id": "100", "reps": 8, "at": None, "words": "every pod deleted"}]
+        self.assertIn("; not counted: 8 case attempts on PR #4158, whose install died.", post_health.cause_sentence(doc))
+        doc["incident"]["set_aside"][0]["pr"] = None
+        self.assertIn("; not counted: 8 case attempts on one run, whose install died.", post_health.cause_sentence(doc))
+        doc["incident"]["set_aside"] = [{"pr": 4158, "project": "kube-agents-evals-18", "build_id": "100", "reps": 8, "at": "2026-10-29T02:02:08Z", "words": "every pod Killing"}, {"pr": 4160, "project": "kube-agents-evals-3", "build_id": "101", "reps": 3, "at": "2026-10-29T02:40:00Z", "words": "every pod Killing"}]
+        self.assertIn("; not counted: 8 case attempts on PR #4158 (kube-agents-evals-18), whose install died at 10:02 PM ET; 3 case attempts on PR #4160 (kube-agents-evals-3), whose install died at 10:40 PM ET.", post_health.cause_sentence(doc))
+
     def test_storm_names_four_phrasings_and_counts_the_rest(self):
         # A short sentence is kept whole; past four phrasings the rest is a count.
         doc = storm()

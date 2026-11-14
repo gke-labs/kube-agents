@@ -1037,6 +1037,35 @@ class BrowserTest(unittest.TestCase):
         self.assertNotIn("all 0 reps", page)
         self.assertNotIn("0 reps lost", page)
 
+    def test_a_dead_installs_attempts_are_not_the_storm_briefs_losses(self):
+        # The Brief's "N of M repetitions came back with no agent run" counts
+        # the storm's losses; a dead install's are its own.
+        data = copy.deepcopy(self.data)
+        run = next(r for r in data["runs"] if r["build_id"] == "2097282860221206528")
+        task = next(t for t in run["tasks"] if t["name"] == CRASHLOOP_TRIO[0])
+        task["result"] = "infra"
+        task["reps"] = [{"n": n, "result": "infra", "reason": "the harness recorded an infrastructure condition or exhausted its retries without reaching the agent (KUBE_AGENTS_INFRA_FAILURE): the record is scored, but there is no answer in it to grade (the inject tunnel failed)"} for n in (1, 2, 3)]
+        since = run["started"]
+        incident = {"prs": [1, 2, 3], "runs": 3, "window_start": run["started"], "window_end": run["finished"]}
+        storm = health_doc("DEGRADED", condition="storm", failing_cases=[], tracking_issues=[], since=since, incident=incident)
+        before = dom_text(render_to(pathlib.Path(self.tmp.name) / "alive", data, health=storm) / "index.html")
+        run["install_deaths"] = [{"at": "2026-10-29T02:02:08Z", "pods": 12, "reasons": {"Killing": 12}, "messages": []}]
+        after = dom_text(render_to(pathlib.Path(self.tmp.name) / "dead", data, health=storm) / "index.html")
+        lost = lambda page: int(re.search(r"(\d+) of \d+ repetitions</b> came back with no agent run", page).group(1))
+        self.assertEqual(lost(before) - lost(after), 3, (lost(before), lost(after)))
+
+    def test_a_case_lost_to_a_dead_install_says_so_on_the_run_page(self):
+        data = copy.deepcopy(self.data)
+        run = next(r for r in data["runs"] if r["build_id"] == "2097282860221206528")
+        run["install_deaths"] = [{"at": "2026-10-29T02:02:08Z", "pods": 12, "reasons": {"Killing": 12}, "messages": []}]
+        task = next(t for t in run["tasks"] if t["name"] == CRASHLOOP_TRIO[0])
+        task["result"] = "infra"
+        task["reps"] = [{"n": n, "result": "infra", "reason": "the harness recorded an infrastructure condition or exhausted its retries without reaching the agent (KUBE_AGENTS_INFRA_FAILURE): the record is scored, but there is no answer in it to grade (the kanban board could not be read 3 times running)"} for n in (1, 2, 3)]
+        out = render_to(pathlib.Path(self.tmp.name) / "died", data, health=health_doc())
+        page = dom_text(out / "run.html", query="build=2097282860221206528")
+        self.assertIn('class="tag storm">install died<', page)
+        self.assertNotIn('class="tag unclear">unexplained<', page)
+
     def test_a_case_lost_to_a_forge_outage_says_so_on_the_run_page(self):
         """Forge reps sit under their own key in `reps` (#5342); the card is
         tagged and worded as a forge outage, not as unexplained or lost."""

@@ -122,6 +122,19 @@ layout and are collected from the moment they start running.
   a document written before the collector recorded it has no key.
 - `project` — from the `Successfully leased project: <name>` log line;
   `null` when the log never got that far.
+- `install_deaths` — **optional, additive**: the moments the run's install
+  died, from the job's watch of the install's pods
+  (`artifacts/agent-pods-watch.txt`): every pod alive at one moment (two or
+  more) deleted within 60 seconds, as a node upgrade or an autoscaler
+  scale-down does to a single-node install; a rollout never empties the set.
+  Each is `{at, pods, reasons, messages}`: when, how many pods, the pods' own
+  status reasons and the namespace events' reasons for them in the minute
+  either side of the first deletion, counted (`{"Killing": 12}`), and up to
+  two of those events' messages, each cut to 160 characters. `[]` when the
+  watch shows none; absent when the build has no watch to read (a record from
+  before the job kept one), which `health.py` counts as no death. The storm
+  rule leaves such a run's attempts out of its count (`docs/ci-health.md`,
+  the storm paragraph).
 - `started` / `finished` — `started.json` / `finished.json` timestamps as
   ISO 8601 UTC; `null` when unparseable.
 - `result` — `finished.json`'s `result` verbatim: `SUCCESS`, `FAILURE` or
@@ -195,7 +208,9 @@ layout and are collected from the moment they start running.
       rate limit on grading's own token). The same readers count it apart
       from the storm and outside every pass-rate denominator, and
       `classify.py` classes a case whose ungraded reps are forge reps, with no
-      storm rep beside them, `forge-unavailable`.
+      storm rep beside them, `forge-unavailable`. A case whose ungraded reps
+      sit in a run with `install_deaths` (below) is `install-died`: the
+      install died under it, and `health.py` keeps the run out of the storm.
       Similarly, a harness-declared card-wake replay error (`ReplayMismatch`
       or `ReplayBroken`, e.g. `failure wake:`, `question wake:`, `block wake:`, `thread context:`
       in the reason) is recognized by `classify.py` and `health.py` as `fail`,
@@ -593,7 +608,9 @@ what the renderer does with them.
   `KUBE_AGENTS_DELEGATION_CEILING` is also excluded from the storm counts
   (`storm_reps`, `health.json`'s `infra_reps`) and reported under
   `metrics.ceiling_reps` instead; one whose `reason` leads with
-  `KUBE_AGENTS_FORGE_UNAVAILABLE` is excluded from the storm counts too. When `reps` is absent the task's single
+  `KUBE_AGENTS_FORGE_UNAVAILABLE` is excluded from the storm counts too; a
+  storm rep in a run whose install died (`install_deaths`) leaves the run's
+  `storm_reps` and the storm rule but stays in `infra_reps`. When `reps` is absent the task's single
   `result` stands in for one rep.
 - `runs[].lane_excluded` — the case ids `hack/ci-eval-pr.sh` dropped from
   the matrix before the fan-out on the inject lane
@@ -1351,7 +1368,11 @@ and shows no gate banner. Only a `GREEN` verdict reads as healthy. For
 `storm` the `incident` also carries `causes`, the repetitions' own words for
 how they died with counts (`[[words, n], …]`, every phrasing, commonest first,
 scrubbed and cut as the periodics' quoted log line is), which the Chat
-sentence names short. For
+sentence names short, and `set_aside`: the runs in the window whose install
+died (`runs[].install_deaths`), kept out of the count, each
+`{pr, project, build_id, reps, at, words}` (`reps` the run's dead attempts,
+`at` the first death's time, `words` its reasons as "every pod Killing";
+`pr`, `project` and `at` `null` as on the record), `[]` when none. For
 `lost_pods` the `incident` also carries `nodes` (`{node name: runs lost on
 it}`) and `event` (`true` when the loss counts as a build-cluster event);
 the pages give it the same 2-hour lead on the Brief's window as a storm and
