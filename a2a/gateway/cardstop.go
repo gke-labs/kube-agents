@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -577,7 +579,10 @@ func (g *Gateway) abandonCardStop(ctx context.Context, rec *SessionRecord, autho
 // anything that could ping or lay out (cardStopTitle), and says plainly what
 // the stop could not promise. A stop that found nothing open says nothing is
 // running, which is now true: the executor looked. It looked at cards only,
-// so with a newer turn running (turnRunning) it says no card was open.
+// so with a newer turn running (turnRunning) it says no card was open. Last
+// come the pull requests the conversation's cards had opened before the
+// stop (cardStopWriteClauses); none named is not a claim that nothing was
+// written.
 func cardStopReply(r *lib.CardStopResult, turnRunning bool) string {
 	var clauses []string
 	if n := r.Unresolved; n > 0 && len(r.Stopped) > 0 {
@@ -623,7 +628,70 @@ func cardStopReply(r *lib.CardStopResult, turnRunning bool) string {
 	default:
 		head = nothingRunningNotice
 	}
+	clauses = append(clauses, cardStopWriteClauses(r)...)
 	return strings.Join(append([]string{head}, clauses...), "; ")
+}
+
+// cardStopWritePRURLRE is a pull request (/pull/<n>) or GitLab merge
+// request (/-/merge_requests/<n>) url with nothing in it a chat surface could
+// read as markup, the form session-kv passes on. Checked again here because
+// the reply links what it names; the second group is the number.
+var cardStopWritePRURLRE = regexp.MustCompile(`\Ahttps://[A-Za-z0-9.-]+(?::[0-9]{1,5})?/[A-Za-z0-9._~/-]{1,300}?/(pull|-/merge_requests)/([0-9]{1,9})\z`)
+
+// cardStopMRPath is the url segment that marks a GitLab merge request, which
+// is labelled !<number> rather than #<number>.
+const cardStopMRPath = "-/merge_requests"
+
+// cardStopWrites is the pull requests a result says the conversation's cards
+// opened, in the executor's order, dropping any entry that is not a
+// well-formed pull request or merge request url whose number matches.
+func cardStopWrites(r *lib.CardStopResult) []lib.CardStopWrite {
+	var opened []lib.CardStopWrite
+	for _, w := range r.Writes[:min(len(r.Writes), lib.CardStopWritesMax)] {
+		m := cardStopWritePRURLRE.FindStringSubmatch(w.URL)
+		if w.Kind != lib.CardStopWritePullRequest || w.Verb != lib.CardStopWriteOpened || m == nil || m[2] != strconv.Itoa(w.Number) {
+			continue
+		}
+		opened = append(opened, w)
+	}
+	return opened
+}
+
+// cardStopPRLinks names pull requests as markdown links labelled #<number>
+// (!<number> for a merge request), which the chat adapters turn into their
+// own link form: "#412", "#412 and #413", "#412, #413 and !7".
+func cardStopPRLinks(ws []lib.CardStopWrite) string {
+	links := make([]string, len(ws))
+	for i, w := range ws {
+		sigil := "#"
+		if cardStopWritePRURLRE.FindStringSubmatch(w.URL)[1] == cardStopMRPath {
+			sigil = "!"
+		}
+		links[i] = fmt.Sprintf("[%s%d](%s)", sigil, w.Number, w.URL)
+	}
+	if len(links) == 1 {
+		return links[0]
+	}
+	return strings.Join(links[:len(links)-1], ", ") + " and " + links[len(links)-1]
+}
+
+// cardStopPRNoun is "a pull request" for one and "pull requests" for more.
+func cardStopPRNoun(ws []lib.CardStopWrite) string {
+	if len(ws) == 1 {
+		return "a pull request"
+	}
+	return "pull requests"
+}
+
+// cardStopWriteClauses is the typed stop's clause for the pull requests the
+// conversation's cards had already opened ("already opened a pull request:
+// #412"), or none.
+func cardStopWriteClauses(r *lib.CardStopResult) []string {
+	opened := cardStopWrites(r)
+	if len(opened) == 0 {
+		return nil
+	}
+	return []string{"already opened " + cardStopPRNoun(opened) + ": " + cardStopPRLinks(opened)}
 }
 
 // cardTitles names the first cardStopNamed cards and counts the rest. cut

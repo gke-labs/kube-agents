@@ -30,6 +30,16 @@ The directive line may carry ``observe=<seconds>`` after it; the default is
 :data:`DEFAULT_OBSERVE_SECONDS`. A case writes its prompt as a YAML literal
 block (``|-``), since a folded one joins the directive to the ask.
 
+``cards=done`` moves the stop later: the harness waits off the board until
+every card the turn filed is terminal, for at most ``wait=<seconds>``
+(:data:`DEFAULT_WAIT_SECONDS`), then until the conversation has gone quiet
+(the harness's `_await_quiet`), and stops then, so a case can grade what a
+stop says about work that already landed. Whichever way the stop goes, the
+harness reads the gateway's answer to it off the conversation and records it
+as :data:`STOP_REPLY_ENTRY`: ``completed`` with the answer as its result, or
+``error`` when no answer came within the harness's bound. A case asserts on
+the answer with ``tool_called`` and ``result``.
+
 :data:`MID_TURN_DIRECTIVE` is the same stop sent while the opening turn is
 still running rather than after it ended: ``after=<seconds>`` (default
 :data:`DEFAULT_AFTER_SECONDS`) after the harness first sees the task
@@ -108,6 +118,16 @@ STOP_ENTRY = "harness_stop_sent"
 CARDS_STOPPED_ENTRY = "harness_cards_stopped"
 #: The board status a stopped card ends in.
 STOPPED_STATUS = "archived"
+#: The trajectory entry for the gateway's answer to the stop.
+STOP_REPLY_ENTRY = "harness_stop_reply"
+#: The optional field that moves the stop to after the filed cards ended, and
+#: its one value.
+CARDS_FIELD = "cards="
+CARDS_DONE = "done"
+#: The optional field bounding that wait, in seconds, and its default and cap.
+WAIT_FIELD = "wait="
+DEFAULT_WAIT_SECONDS = 1800.0
+MAX_WAIT_SECONDS = 3600.0
 
 
 @dataclass(frozen=True)
@@ -118,6 +138,11 @@ class Stop:
 
     prompt: str
     observe_seconds: float
+    #: Stop once every filed card is terminal rather than at once.
+    cards_done: bool = False
+    #: The longest wait for that, in seconds.
+    wait_seconds: float = DEFAULT_WAIT_SECONDS
+    #: For a mid-turn stop, how long after the task is first seen working it goes.
     mid_turn_after: float | None = None
     #: For a card-wait stop, how long to wait for the first card; ``None``
     #: otherwise.
@@ -143,8 +168,11 @@ def parse(prompt: str) -> Stop | None:
     """The stopped ask ``prompt`` holds, or ``None`` for an ordinary ask.
 
     Raises:
-        ValueError: The directive carries something other than one
-            ``observe=<seconds>`` within bounds, or no ask follows it.
+        ValueError: The directive carries a field it does not take (the stop
+            after the turn takes ``observe=<seconds>``, ``cards=done`` and
+            ``wait=<seconds>``; the mid-turn stop ``observe=<seconds>`` and
+            ``after=<seconds>``), one twice or out of bounds, ``wait=`` without
+            ``cards=done``, or no ask follows it.
     """
     if not is_stopped_ask(prompt):
         return None
@@ -156,24 +184,38 @@ def parse(prompt: str) -> Stop | None:
     allowed = {
         MID_TURN_DIRECTIVE: (OBSERVE_FIELD, AFTER_FIELD),
         CARD_WAIT_DIRECTIVE: (OBSERVE_FIELD, DEADLINE_FIELD),
-    }.get(directive, (OBSERVE_FIELD,))
+    }.get(directive, (OBSERVE_FIELD, CARDS_FIELD, WAIT_FIELD))
     fields: dict[str, str] = {}
     for word in words[1:]:
         name = next((f for f in allowed if word.startswith(f)), None)
         if name is None or name in fields:
-            raise ValueError(f"{directive} takes at most one each of {', '.join(f + '<seconds>' for f in allowed)}, got {words[1:]}")
+            shown = ", ".join(f + (CARDS_DONE if f == CARDS_FIELD else "<seconds>") for f in allowed)
+            raise ValueError(f"{directive} takes at most one each of {shown}, got {words[1:]}")
         fields[name] = word[len(name) :]
     observe = _seconds(directive, OBSERVE_FIELD, fields.get(OBSERVE_FIELD), DEFAULT_OBSERVE_SECONDS, MAX_OBSERVE_SECONDS)
     after = None
     if directive == MID_TURN_DIRECTIVE:
         after = _seconds(directive, AFTER_FIELD, fields.get(AFTER_FIELD), DEFAULT_AFTER_SECONDS, MAX_AFTER_SECONDS)
+    cards = fields.get(CARDS_FIELD)
+    if cards is not None and cards != CARDS_DONE:
+        raise ValueError(f"{directive}: {CARDS_FIELD} takes only {CARDS_DONE}, got {cards}")
+    if WAIT_FIELD in fields and cards is None:
+        raise ValueError(f"{directive}: {WAIT_FIELD} bounds {CARDS_FIELD}{CARDS_DONE}, which is missing")
+    wait = _seconds(directive, WAIT_FIELD, fields.get(WAIT_FIELD), DEFAULT_WAIT_SECONDS, MAX_WAIT_SECONDS)
     deadline = None
     if directive == CARD_WAIT_DIRECTIVE:
         deadline = _seconds(directive, DEADLINE_FIELD, fields.get(DEADLINE_FIELD), DEFAULT_DEADLINE_SECONDS, MAX_DEADLINE_SECONDS)
     ask = rest.strip()
     if not ask:
         raise ValueError(f"{directive} needs the ask on the lines after it")
-    return Stop(prompt=ask, observe_seconds=observe, mid_turn_after=after, card_wait_deadline=deadline)
+    return Stop(
+        prompt=ask,
+        observe_seconds=observe,
+        cards_done=cards is not None,
+        wait_seconds=wait,
+        mid_turn_after=after,
+        card_wait_deadline=deadline,
+    )
 
 
 def _seconds(directive: str, field: str, value: str | None, default: float, ceiling: float) -> float:

@@ -389,7 +389,7 @@ Besides [`/session`](#session), a bare [`/feedback`](#feedback) and [`/feedback 
 
   A second `stop` before the task ends gets `🛑 cancel already sent — the task ends when the executor confirms`. With nothing running in the conversation, `stop` gets `🤷 nothing is running`. In a conversation that has run a task, the reply adds that if the agent filed a card for it, that card keeps working until it finishes. A card outlives the turn that filed it, and by default `stop` cannot reach it.
 
-  On an install whose operator sets `A2A_CARD_STOP=true`, `stop` stops the cards instead, except in a conversation whose tasks go to a session worker (the `/session` route below, or after `delegate`), which keeps the card notice. It posts `🛑 stopping this conversation's cards…`, which becomes `🛑 stopped 2 cards: <title>, <title>` naming up to five cards, with a note for anything it could not promise, such as cards that had already finished or a card that may still start.
+  On an install whose operator sets `A2A_CARD_STOP=true`, `stop` stops the cards instead, except in a conversation whose tasks go to a session worker (the `/session` route below, or after `delegate`), which keeps the card notice. It posts `🛑 stopping this conversation's cards…`, which becomes `🛑 stopped 2 cards: <title>, <title>` naming up to five cards, with a note for anything it could not promise, such as cards that had already finished or a card that may still start. Once the stop is confirmed, it then names any pull request your latest request's cards, or a card still running, had already opened: `already opened a pull request: #412`.
 
   With no card open it answers `🤷 nothing is running`, or `🤷 no card was open in this conversation` if you've asked something new in the meantime. Card titles are shown as plain text, so a title can't mention anyone or add a link; dots and colons in a title show as look-alikes, so a URL in it isn't clickable.
 
@@ -411,6 +411,8 @@ Besides [`/session`](#session), a bare [`/feedback`](#feedback) and [`/feedback 
   - `Nothing was running.` when there was nothing to stop;
   - `No tasks were running yet. I'm still answering your latest question.` when there was nothing to stop but a newer question of yours is running;
   - `I couldn't stop the work in this thread. Press Stop again.` when the stop could not be confirmed and another press can help, or `I couldn't stop the work in this thread.` when it can't.
+
+  A line like `I'd already opened a pull request before you stopped me: #412` then names, linked, any pull request your latest request's cards, or a card still running, had already opened. A reply that names none is not a promise that nothing changed: only pull requests and merge requests the agent opened are recorded, not other changes.
 
   Pressing it again while a stop is still running adds nothing, unless you had asked something new since, which it stops too. Without `A2A_CARD_STOP`, and in a conversation whose tasks go to a session worker, the button does exactly what typing `stop` does.
 

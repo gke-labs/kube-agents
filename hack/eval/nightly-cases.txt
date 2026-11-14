@@ -1034,6 +1034,13 @@
 # a 600s observation window.
 ./tasks/chat-stop-mid-turn-files-no-card/task.yaml
 
+# gke-labs#4061, the Stop write record: a `stop` typed after the card opened
+# its pull request names that pull request in the stop's answer. Next lane
+# only (api-lane-exclusions.txt), as above; requests one pull request
+# (pull_request_opened). deployer: noop, the no-pdb-workload fixture, one
+# card, the stop after it ends.
+./tasks/chat-stop-names-pull-request-already-opened/task.yaml
+
 # A per-node listing (five columns) arrives in the chat thread as a pipe
 # table, not as a bullet per node: the A2A gateway renders a table on Google
 # Chat as a monospace block, and the personas and report stanza no longer tell

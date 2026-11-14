@@ -862,6 +862,7 @@ API_LANE_EXCLUDED = [
     "chat-stop-during-card-wait-a2a-door",  # #5407: the harness cancels through the A2A door, which only the next lane turns on
     "chat-question-asked-to-choose-pauses",  # #4004: grades the question only the inject lane's board read folds in
     "chat-reply-under-pushed-report",  # #4059: the harness stores the report and sends the reply through the door
+    "chat-stop-names-pull-request-already-opened",  # #4061: the stop's answer, read off the inject conversation
     "session-delegates-to-the-profile-asked-for",  # #5191: delegated_to reads the inject read route
 ]
 
@@ -962,6 +963,10 @@ INJECT_LANE_SAFEGUARDS = [
 # the fan-out's second phase on both lanes, after every other unit has
 # finished. A new requesting case edits this set in the same pull request.
 INJECT_LANE_REQUESTING = [
+    # chat-stop-names-pull-request-already-opened (#4061): the card opens the
+    # pull request the stop's answer has to name; listed in `requesting:`,
+    # since no check of its reads GitHub.
+    "chat-stop-names-pull-request-already-opened",
     "cluster-agent-crashloop-fix-request",
     # cluster-setting-request-proposes-pr: asked to turn on Binary Authorization, it
     # may propose the change as a pull request; its objective's
