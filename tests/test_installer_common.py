@@ -6190,6 +6190,16 @@ class NextHomeChannelUnsetWarningTest(unittest.TestCase):
                 self.assertIn("keeps them for one digest", out)
                 self.assertNotIn("meanwhile", out)
 
+    def test_a_slack_home_that_is_not_a_channel_id_is_no_home(self):
+        # The operator's slackChannelID arms no Slack route for it, so Google
+        # Chat's posts are kept for the digest, not sent to Slack.
+        for slack_home in ("#general", "D0123ABCD", "c0123abcd"):
+            with self.subTest(slack_home=slack_home):
+                out = self._run(chat="true", slack_home=slack_home, summary=True).stdout
+                self.assertIn("rc=0 key=GOOGLE_CHAT_HOME_CHANNEL\n", out)
+                self.assertEqual(out.count("keeps them for one digest"), 2, out)
+                self.assertNotIn("meanwhile", out)
+
     def test_the_message_names_no_hermes_fallback(self):
         for kw in ({}, {"slack": "false", "chat": "true"}, {"chat": "true"}):
             with self.subTest(**kw):

@@ -1541,8 +1541,9 @@ next_home_channel_unset_key() {
 # The gateway platform that has a home channel, as the operator names it in
 # the HomeChannelUnset condition, or nothing: next_home_channel_unset_key's
 # five arguments. Google Chat first, as the agent picks where home posts go
-# (chat_notify.routed_platforms). A Chat home counts only as a space name: the
-# gateway arms no Chat route for anything else. It cannot see a Slack channel
+# (chat_notify.routed_platforms). A Chat home counts only as a space name, and
+# a Slack home only as a channel id: the gateway arms no route for anything
+# else (the operator's slackChannelID). It cannot see a Slack channel
 # the gateway learned from a mention, which only the cluster records: with
 # that channel learned, the warning for Google Chat still says the gateway
 # keeps its posts, while the agent sends them to Slack. Called when a key is
@@ -1558,7 +1559,9 @@ next_home_channel_set_platform() {
   fi
   if slack_moves_to_a2a_gateway "${1:-}" "${2:-}"; then
     home="$(trim_go_space "${4:-}")"
-    [ -z "$home" ] || printf '%s' "$NEXT_HOME_CHANNEL_SLACK_PLATFORM"
+    if [ -n "$home" ] && [ -z "$(slack_home_channel_not_an_id "$home")" ]; then
+      printf '%s' "$NEXT_HOME_CHANNEL_SLACK_PLATFORM"
+    fi
   fi
   return 0
 }

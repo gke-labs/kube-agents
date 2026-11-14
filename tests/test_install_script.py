@@ -8475,6 +8475,23 @@ class NextSlackGatewaySettingsWiringTest(unittest.TestCase):
         self.assertIn("PROMPT: Slack Bot Token (xoxb-..., one workspace: the A2A gateway takes a single token)", out)
         self.assertNotIn("comma-separated for several workspaces", out)
 
+    def test_a_seeded_slack_home_that_is_not_an_id_names_no_platform(self):
+        # Both on, Chat's home left empty, install.env seeding a Slack home the
+        # gateway cannot arm: the Chat warning says the posts are kept for the
+        # digest, not that they go to Slack's home channel.
+        for seeded, there in (("#general", None), ("C0123ABCD", "Slack's home channel")):
+            with self.subTest(seeded=seeded):
+                chat = ["", "", "", "", "y"]
+                answers = ["xoxb-1-secretpart", "xapp-1", "U0123ABCD", "C0123ABCD", "#ops"]
+                proc = self._interview("--mode=next", f"SLACK_HOME_CHANNEL={seeded}\n", chat + answers, choice="3")
+                out = proc.stdout + proc.stderr
+                warning = out.split("GOOGLE_CHAT_HOME_CHANNEL is empty", 1)[1].split("PROMPT:", 1)[0]
+                if there:
+                    self.assertIn(f"go to {there} meanwhile", warning, out)
+                else:
+                    self.assertIn("keeps them for one digest", warning, out)
+                    self.assertNotIn("meanwhile", warning)
+
     # ── after the generator's Secret recovery ──
 
     def _after_generator(self, keys, dry_run=False):
