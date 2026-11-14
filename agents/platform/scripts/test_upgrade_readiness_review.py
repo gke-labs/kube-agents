@@ -1038,6 +1038,29 @@ class TheTick(unittest.TestCase):
         self.assertEqual(latest["project_failures"], {OTHER_PROJECT: "clusters list: PERMISSION_DENIED"})
         self.assertEqual(len(self.registered), 2)  # the read project's two members, nothing for the unlisted one
 
+    def test_an_unusable_resolved_scope_makes_the_week_partial(self):
+        # Under spec.mode: next a too-large or missing resolved scope names no
+        # member, so the roster is the management project alone. The week's
+        # review must say its member projects were not read, not report itself
+        # complete (#5621), and build the roster and the gap from one read.
+        fst = watch.fleet_scope_targets
+        unusable = fst.ScopeClusters(
+            source=fst.SOURCE_RESOLVED_SCOPE,
+            projects=(fst.ProjectClusters(PROJECT, fst.STATUS_LIST_LIVE),
+                      fst.ProjectClusters(fst.UNRESOLVED_SCOPE_ROW, fst.STATUS_UNREAD, reason="too-large")),
+            note="the resolved scope at /r.json is in state 'too-large', so no member project's clusters are known",
+        )
+        with mock.patch.dict(os.environ, {watch.PROJECTS_ENV: "", watch.MANAGEMENT_PROJECT_ENV: PROJECT}), mock.patch.object(
+            fst, "list_scope_clusters", return_value=unusable
+        ) as read:
+            code, out = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertEqual(read.call_count, 1)
+        self.assertEqual(self.asked[0], [PROJECT])
+        self.assertIn(f"1 project(s) not read this week: {fst.UNRESOLVED_SCOPE_ROW}: the resolved scope at /r.json is in state 'too-large'", out)
+        latest = json.loads((review.weekly_home() / review.LATEST_JSON_NAME).read_text())
+        self.assertIn(fst.UNRESOLVED_SCOPE_ROW, latest["project_failures"])
+
     def test_a_project_spelled_by_number_the_report_could_not_resolve_is_not_read(self):
         # The report records a failed describe as a listing row with no location,
         # whatever else the envelope carries; that row is what makes the project

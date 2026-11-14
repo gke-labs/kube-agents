@@ -1571,6 +1571,10 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if a2aState.busReloadRequeue > 0 {
 			requeue = min(requeue, a2aState.busReloadRequeue)
 		}
+		// And a profile held for the bus's config (a2aDispatchableProfiles).
+		if a2aState.profileHoldRequeue > 0 {
+			requeue = min(requeue, a2aState.profileHoldRequeue)
+		}
 		// So can the TASKS wait's threshold pass (a2aGatewayTasksWaitMessage).
 		return ctrl.Result{RequeueAfter: minPositive(tasksWaitRequeue, requeue)}, nil
 	}
@@ -1591,6 +1595,10 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// And a bus config reload still pending (planA2ABusReload).
 		if a2aState.busReloadRequeue > 0 {
 			requeue = min(requeue, a2aState.busReloadRequeue)
+		}
+		// And a profile held for the bus's config (a2aDispatchableProfiles).
+		if a2aState.profileHoldRequeue > 0 {
+			requeue = min(requeue, a2aState.profileHoldRequeue)
 		}
 		if credentialProxyExecShort(instance) {
 			requeue = min(requeue, credentialProxyExecShortRequeue)
@@ -1657,6 +1665,11 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// bus's config_load_time does.
 	if a2aNext && a2aState.busReloadRequeue > 0 {
 		requeueAfter = min(requeueAfter, a2aState.busReloadRequeue)
+	}
+	// A newly bound profile held until every bus server has loaded its
+	// config: a single server's reload landing moves nothing watched.
+	if a2aNext && a2aState.profileHoldRequeue > 0 {
+		requeueAfter = min(requeueAfter, a2aState.profileHoldRequeue)
 	}
 	// An exec tier short of its count: the scheduler's verdict lands on a pod,
 	// which is not watched, so the pass that reads it has to be asked for.

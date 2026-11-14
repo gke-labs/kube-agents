@@ -136,9 +136,12 @@ type AgentProfileReconciler struct {
 // is no `agentprofiles/finalizers` verb: nothing the operator renders carries an owner
 // reference to a profile (the profile's ServiceAccounts carry labels only and outlive it), so
 // owner-references admission never asks for it, and the finalizer itself is a field of the
-// main resource, written by the merge patch above.
+// main resource, written by the merge patch above. The one `get` on the
+// bus StatefulSet's ControllerRevisions reads which profiles every server has
+// loaded (a2aClusterLoadedProfiles).
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentprofiles,verbs=get;list;watch;patch
 // +kubebuilder:rbac:groups=kubeagents.x-k8s.io,resources=agentprofiles/status,verbs=get;update
+// +kubebuilder:rbac:groups=apps,resources=controllerrevisions,verbs=get
 
 // Reconcile renders one profile.
 func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -297,6 +300,21 @@ func (r *AgentProfileReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		case err != nil:
 			return ctrl.Result{}, err
 		}
+	}
+
+	// A newly bound profile's card waits until every bus server has loaded
+	// its config entry, as the dispatcher's config does
+	// (platformagent_a2a_profile_hold.go): the gateway routes by the card.
+	held, err := r.agentProfileCardHeld(ctx, agent, &profile)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if held {
+		msg := "the A2A bus is loading this profile's config on every server; the card is published once it has"
+		if err := r.writeStatus(ctx, &profile, agent, &verdict, resolution.serviceAccountList(), idReason, idMsg, reasonAgentProfileBusConfigPending, msg, idReason == reasonAgentProfileRendered); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: a2aBusReloadRecheck}, nil
 	}
 
 	// The card and the durables follow the narrowed copy, never the raw

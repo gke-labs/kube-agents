@@ -53,6 +53,21 @@ const (
 	// recorded one is the reload landing.
 	a2aBusReloadRequestedAnnotation = "kubeagents.x-k8s.io/a2a-reload-requested-at"
 	a2aBusReloadBaselineAnnotation  = "kubeagents.x-k8s.io/a2a-reload-baseline"
+	// a2aBusReloadFoldedAnnotation marks a pending reload that a later
+	// config was folded into before it was confirmed. One load-time move
+	// can't say which of the two writes it applied, so the move re-arms the
+	// wait for the newest write rather than confirm it
+	// (platformagent_a2a_profile_hold.go relies on that).
+	a2aBusReloadFoldedAnnotation = "kubeagents.x-k8s.io/a2a-reload-folded"
+	// a2aBusReloadRearmedAnnotation marks a wait re-armed off a folded
+	// reload's move. Writes seconds apart usually reach the pod in one
+	// kubelet write, so a re-armed wait often sees no further move, and
+	// nothing the server reports can say whether the newest write was in the
+	// one it saw. Past a2aBusReloadBound it is restarted onto the newest,
+	// as any unconfirmed reload is: confirming by the move's absence would
+	// admit a profile whose deny the server might not hold. The mark only
+	// makes that restart a Normal Event rather than a failure Warning.
+	a2aBusReloadRearmedAnnotation = "kubeagents.x-k8s.io/a2a-reload-rearmed"
 
 	// How long a reload may take before the operator restarts the bus pod
 	// instead. The kubelet writes an updated Secret into a running pod
@@ -67,7 +82,10 @@ const (
 	a2aBusVarzTimeout = 3 * time.Second
 
 	a2aBusConfigReloadedReason = "BusConfigReloaded"
-	a2aBusReloadFailedReason   = "BusConfigReloadFailed"
+	// a2aBusConfigReloadFoldedReason is the Normal Event for a restart onto
+	// a folded config change (a2aBusReloadRearmedAnnotation).
+	a2aBusConfigReloadFoldedReason = "BusConfigReloadFolded"
+	a2aBusReloadFailedReason       = "BusConfigReloadFailed"
 )
 
 // a2aBusVarzClient reads the bus's monitoring endpoint directly: an
@@ -132,6 +150,10 @@ type a2aBusReload struct {
 	requeue time.Duration
 	// reloaded: the pending reload landed on this pass.
 	reloaded bool
+	// folded: restartPod is for a wait re-armed off a folded reload's move,
+	// whose newest write can't be confirmed in place, not a reload that
+	// failed (a2aBusReloadRearmedAnnotation).
+	folded bool
 	// busUID is the live StatefulSet's, which a restarted pod must belong to.
 	busUID types.UID
 }
@@ -178,6 +200,16 @@ func (r *PlatformAgentReconciler) planA2ABusReload(ctx context.Context, agent *a
 			baseline = ""
 		}
 		stampA2ABusReload(config, now.UTC().Format(time.RFC3339Nano), baseline)
+		// Folded only while the earlier write is still unloaded: a load time
+		// already off the pending record's baseline is that write landing
+		// before the recheck saw it, and the bus then owes one reload, this
+		// one, which its next move confirms. A load time that couldn't be
+		// read, now or then, can't tell, and folds.
+		if _, pending := live.Annotations[a2aBusReloadRequestedAnnotation]; pending {
+			if prior := live.Annotations[a2aBusReloadBaselineAnnotation]; baseline == "" || prior == "" || baseline == prior {
+				config.Annotations[a2aBusReloadFoldedAnnotation] = "true"
+			}
+		}
 		return a2aBusReload{requeue: a2aBusReloadRecheck, busUID: busUID}, nil
 	}
 	requestedAt, pending := live.Annotations[a2aBusReloadRequestedAnnotation]
@@ -187,17 +219,35 @@ func (r *PlatformAgentReconciler) planA2ABusReload(ctx context.Context, agent *a
 	baseline := live.Annotations[a2aBusReloadBaselineAnnotation]
 	loaded, err := r.a2aBusConfigLoadTime(ctx, agent)
 	// A moved load time is taken as this config landing. When a second
-	// change was folded into a pending one before the first reached the
-	// pod, the first reload landing can clear both; the reloader still
-	// applies the second when the kubelet writes it.
+	// change was folded into a pending one before it was confirmed, the
+	// move may be the first write landing, so it re-arms the wait off the
+	// new load time instead; the reloader applies the second write when the
+	// kubelet makes it, and if that write had already been applied, the
+	// bound restarts the pod onto it.
 	if err == nil && baseline != "" && loaded != baseline {
+		if _, folded := live.Annotations[a2aBusReloadFoldedAnnotation]; folded {
+			// The move may be the earlier write landing: wait for one off
+			// this load time, or restart past the bound, for the newest.
+			stampA2ABusReload(config, now.UTC().Format(time.RFC3339Nano), loaded)
+			config.Annotations[a2aBusReloadRearmedAnnotation] = "true"
+			return a2aBusReload{requeue: a2aBusReloadRecheck, busUID: busUID}, nil
+		}
 		return a2aBusReload{reloaded: true, busUID: busUID}, nil
 	}
+	_, rearmed := live.Annotations[a2aBusReloadRearmedAnnotation]
 	since, perr := time.Parse(time.RFC3339Nano, requestedAt)
 	if perr != nil || now.Sub(since) >= a2aBusReloadBound {
-		return a2aBusReload{restartPod: true, busUID: busUID}, nil
+		// A re-armed fold the server still answers for is the expected
+		// shape, not a failed reload; it restarts all the same.
+		return a2aBusReload{restartPod: true, folded: rearmed && perr == nil && err == nil, busUID: busUID}, nil
 	}
 	stampA2ABusReload(config, requestedAt, baseline)
+	if _, folded := live.Annotations[a2aBusReloadFoldedAnnotation]; folded {
+		config.Annotations[a2aBusReloadFoldedAnnotation] = "true"
+	}
+	if rearmed {
+		config.Annotations[a2aBusReloadRearmedAnnotation] = "true"
+	}
 	return a2aBusReload{requeue: min(a2aBusReloadRecheck, a2aBusReloadBound-now.Sub(since)), busUID: busUID}, nil
 }
 
@@ -239,6 +289,13 @@ func (r *PlatformAgentReconciler) actOnA2ABusReload(ctx context.Context, agent *
 			return nil
 		}
 		return fmt.Errorf("failed to restart A2A bus pod %s after a failed reload: %w", pod.Name, err)
+	}
+	if plan.folded {
+		logf.FromContext(ctx).Info("restarted the A2A bus pod onto a folded config change", "pod", pod.Name, "bound", a2aBusReloadBound)
+		r.recordEvent(agent, corev1.EventTypeNormal, a2aBusConfigReloadFoldedReason,
+			fmt.Sprintf("Restarted A2A bus pod %s: two config changes reached it together, and the newer one can't be confirmed in place, so it restarts onto it.",
+				pod.Name))
+		return nil
 	}
 	logf.FromContext(ctx).Info("restarted the A2A bus pod: its config reload wasn't confirmed in time", "pod", pod.Name, "bound", a2aBusReloadBound)
 	r.recordEvent(agent, corev1.EventTypeWarning, a2aBusReloadFailedReason,
