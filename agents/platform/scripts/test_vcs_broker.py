@@ -2475,6 +2475,15 @@ class CollaborationTest(unittest.TestCase):
         self.assertIn("autonomy dial is at Explain", detail, "the refusal names the dial, not the env")
         self.assertNotIn("neither", detail)
 
+    def test_an_env_spelt_like_the_dial_marker_is_still_a_misspelt_env(self):
+        environ = {vcs_broker.WRITE_MODE_ENV: "dial:explain", vcs_broker.DIAL_ENV: "off"}
+        mode, raw = vcs_broker.write_mode(environ)
+        self.assertEqual("none", mode)
+        self.assertNotEqual(vcs_broker.WRITE_MODE_DIAL_RAW, raw)
+        detail = vcs_broker.write_mode_detail(raw)
+        self.assertIn("neither none nor propose", detail)
+        self.assertNotIn("autonomy dial", detail)
+
     def test_each_dial_level_applies_at_once_and_only_restricts(self):
         environ = self._dial()
         for level, mode in (("explain", "none"), ("propose", "propose"), ("automerge", "propose")):

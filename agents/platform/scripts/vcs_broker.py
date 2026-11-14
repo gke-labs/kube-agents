@@ -2532,8 +2532,10 @@ def write_mode(environ: Mapping[str, str] | None = None) -> tuple[str, str]:
 DIAL_ENV = "KUBEAGENTS_DIAL"
 # On the broker's state emptyDir: it outlives a container restart, not the Pod.
 DIAL_STATE_FILE = "/var/lib/credential-proxy/dial-level"
-# write_mode()'s raw value when the dial, not the env, is what restricts.
-WRITE_MODE_DIAL_RAW = "dial:explain"
+# write_mode()'s raw value when the dial, not the env, is what restricts. It
+# starts with a NUL, which no environment value can hold, so an env set to the
+# same visible text is still read (and explained) as a misspelt env.
+WRITE_MODE_DIAL_RAW = "\x00dial:explain"
 DIAL_EXPLAIN = "explain"
 DIAL_PROPOSE = "propose"
 DIAL_AUTOMERGE = "automerge"
