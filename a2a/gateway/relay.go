@@ -1371,7 +1371,7 @@ func terminalLine(state lib.TaskState, progress string) string {
 // rather than failing the relay — chat delivery is best-effort; the stream
 // is the record.
 func (g *Gateway) post(conversation, text string) {
-	if strings.TrimSpace(text) == "" {
+	if strings.TrimSpace(text) == "" || g.unpostableTrigger(conversation) {
 		return
 	}
 	for _, chunk := range chatChunks(text, discordChunk) {

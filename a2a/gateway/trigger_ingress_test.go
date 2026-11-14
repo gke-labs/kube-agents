@@ -40,7 +40,12 @@ type triggerRig struct {
 
 func startTriggerRig(t *testing.T, tweak func(*Config)) *triggerRig {
 	t.Helper()
-	r := startRigWith(t, tweak)
+	r := startRigWith(t, func(c *Config) {
+		c.Namespace = "kubeagents-system"
+		if tweak != nil {
+			tweak(c)
+		}
+	})
 	r.g.profiles.put("fleet-audit", &lib.AgentCard{Name: "fleet-audit", Tiers: []string{"read", "unattended"}})
 	r.g.profiles.put("readonly", &lib.AgentCard{Name: "readonly", Tiers: []string{"read"}})
 	nc, err := connectTest(r.url)
@@ -210,6 +215,12 @@ func TestATriggerSubmissionIsRefusedWithAReason(t *testing.T) {
 		{"an unknown field", "schedule", []byte(`{"trigger":{"name":"schedule/x","origin":"builtin","stream":"x"},"extra":1}`), lib.TriggerRefusedInvalid},
 		{"a user origin", "schedule", func() lib.TriggerSubmit { s := goodScheduleSubmit(); s.Trigger.Origin = "user"; return s }(), lib.TriggerRefusedInvalid},
 		{"a bad delivery", "schedule", func() lib.TriggerSubmit { s := goodScheduleSubmit(); s.Delivery.JobKey = "has.dot"; return s }(), lib.TriggerRefusedInvalid},
+		{"another namespace's schedule", "schedule", func() lib.TriggerSubmit {
+			s := goodScheduleSubmit()
+			s.Schedule.Namespace = "team-a"
+			s.IdempotencyKey = "schedule/team-a/compliance-audit/1763100000"
+			return s
+		}(), lib.TriggerRefusedInvalid},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			reply := tr.submit(t, tc.source, tc.body)
@@ -268,4 +279,49 @@ func readCapEntry(t *testing.T, url string, ref capability.Ref) capability.Entry
 		t.Fatal(err)
 	}
 	return entry
+}
+
+// TestATriggerIngressWithNoNamespaceRefusesEverySubmission: a gateway that
+// doesn't know its own namespace can't tell a built-in schedule from
+// another namespace's, so it starts nothing.
+func TestATriggerIngressWithNoNamespaceRefusesEverySubmission(t *testing.T) {
+	r := startRig(t)
+	r.g.profiles.put("fleet-audit", &lib.AgentCard{Name: "fleet-audit", Tiers: []string{"unattended"}})
+	data, err := json.Marshal(goodScheduleSubmit())
+	if err != nil {
+		t.Fatal(err)
+	}
+	reply := r.g.handleTriggerSubmit(context.Background(), lib.TriggerSubmitSubject("schedule"), data)
+	if reply.Refused == nil || reply.Refused.Reason != lib.TriggerRefusedInvalid {
+		t.Fatalf("reply = %+v, want invalid", reply)
+	}
+}
+
+// TestATriggerTasksEndPostsNothingToChat: a trigger's task that completes
+// is relayed, but nothing is posted to its conversation, which no chat
+// backend owns (the result's delivery is Track 3's).
+func TestATriggerTasksEndPostsNothingToChat(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	reply := tr.submit(t, "schedule", goodScheduleSubmit())
+	if reply.Refused != nil {
+		t.Fatalf("refused: %+v", reply.Refused)
+	}
+	waitFor(t, "the submission", func() bool { return len(tr.submissions()) == 1 })
+	var origin lib.Envelope
+	if err := json.Unmarshal(tr.submissions()[0].Data, &origin); err != nil {
+		t.Fatal(err)
+	}
+	exec := tr.execFor(t, &origin, "fleet-audit")
+	completeTask(t, exec, "No findings.")
+	waitFor(t, "the trigger task's terminal", func() bool {
+		rec, err := tr.g.reg.Get(context.Background(), "trigger:schedule/kubeagents-system/compliance-audit")
+		return err == nil && rec != nil && rec.ActiveTask == nil
+	})
+	tr.adapter.mu.Lock()
+	defer tr.adapter.mu.Unlock()
+	for _, p := range tr.adapter.posts {
+		if strings.HasPrefix(p.Conversation, triggerConversationPrefix) {
+			t.Fatalf("posted to a trigger's conversation: %+v", p)
+		}
+	}
 }

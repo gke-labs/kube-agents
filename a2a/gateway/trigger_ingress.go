@@ -112,6 +112,14 @@ func (g *Gateway) handleTriggerSubmit(ctx context.Context, subject string, data 
 	if err := lib.ValidateTriggerSubmit(source, s); err != nil {
 		return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedInvalid, err.Error())
 	}
+	// A trigger's identity is schedule/<name>, with no namespace in it: the
+	// grant, the report stream it binds and the rate cap all key on it. A
+	// built-in schedule lives in the install's own namespace (one
+	// PlatformAgent per cluster, which owns them), so a schedule anywhere
+	// else is refused, and two namespaces never share a trigger.
+	if g.cfg.Namespace == "" || s.Schedule.Namespace != g.cfg.Namespace {
+		return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedInvalid, "schedule "+s.Schedule.Namespace+"/"+s.Schedule.Name+" is not in the install's namespace")
+	}
 	key := triggerConversationKey(source, s.Schedule)
 
 	// A repeat of the last submission is the same run: answered with its
@@ -131,7 +139,7 @@ func (g *Gateway) handleTriggerSubmit(ctx context.Context, subject string, data 
 	if !cardAllowsTier(card, capability.TierUnattended) {
 		return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedTierNotAllowed, "profile "+s.Profile+" does not allow the unattended tier")
 	}
-	if !g.triggerLimiter().allow(s.Trigger.Name, time.Now()) {
+	if !g.triggerLimiter().allow(key, time.Now()) {
 		return g.triggerRefused(s.Trigger.Name, lib.TriggerRefusedRateLimited, "the trigger is over its rate cap")
 	}
 
@@ -229,6 +237,18 @@ func (g *Gateway) handleTriggerSubmit(ctx context.Context, subject string, data 
 // trigger:<source>/<namespace>/<name>.
 func triggerConversationKey(source string, s lib.ScheduleRef) string {
 	return triggerConversationPrefix + source + "/" + s.Namespace + "/" + s.Name
+}
+
+// unpostableTrigger reports whether conversation is a trigger's own, which
+// no chat backend owns: the relay posts nothing there (a backend handed the
+// key would refuse it, or worse, read it as one of its own). Where an
+// unattended result goes is Track 3's (#5618), from the record's Delivery.
+func (g *Gateway) unpostableTrigger(conversation string) bool {
+	if !strings.HasPrefix(conversation, triggerConversationPrefix) {
+		return false
+	}
+	g.log.Debug("nothing posted to a trigger's conversation", "conversation", conversation)
+	return true
 }
 
 // triggerTaskID derives the run's task id from its idempotency key, so the

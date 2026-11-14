@@ -96,6 +96,9 @@ func chatDroppedWhat(c chatmsg.Carrier, r chatmsg.Reading) string {
 // exactly the post the relay made before chat messages existed. An answer
 // marked for feedback keeps the mark on the text too, on its last chunk.
 func (g *Gateway) postMessage(conversation string, m OutMessage) {
+	if g.unpostableTrigger(conversation) {
+		return
+	}
 	if m.Chat != nil && strings.TrimSpace(m.Text) != "" {
 		_, err := g.adapter.PostMessage(conversation, m)
 		if g.chatOutcome(conversation, err) {
