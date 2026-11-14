@@ -357,7 +357,9 @@ On the A2A console the answer posts as a message of its own, and the status line
 
 A task that fails posts `❌ failed — <why>`, in plain words, or `❌ failed: <text>` when the reason arrived as plain text; one that is cancelled posts `🛑 canceled`; one the executor refuses posts `🚫 the executor rejected the task — <why>`. When the agent needs something from you it posts `❓ <its question>`; your next message in the conversation is the answer. On Google Chat, the gateway rewrites the markdown Chat's text format has no syntax for. A heading becomes a bold line, a rule is dropped, and a bulleted list's marker becomes the one Chat draws a bullet from. A pipe table becomes a monospace block with its columns lined up.
 
-On Google Chat, the agent's answer is one formatted text message. Its first sentence is bold, the rest is detail or an open "why" section with any table as a monospace block, and a next step or its options are buttons under it. The final answer to each ask ends with 👍 and 👎 buttons after any others ([Answer feedback](#answer-feedback)). A card's progress draws one plan message edited in place. A card's report, the needs-you question, the pull-request message, the fleet-audit card, the first-run report and the stuck-task report lay out the same way as on Slack. The stuck-task report's [Retry and Drop](#stuck-task-report-buttons) are numbered. Google Chat draws no reactions on your message, since the app's credential cannot add one.
+On Google Chat, the agent's answer is one formatted text message. Its first sentence is bold, the rest is detail or an open "why" section with any table as a monospace block, and a next step or its options are buttons under it. The final answer to each ask, and each alert or report the agent posts on its own, ends with 👍 and 👎 buttons after any others ([Answer feedback](#answer-feedback)).
+
+A card's progress draws one plan message edited in place. A card's report, the needs-you question, the pull-request message, the fleet-audit card, the first-run report and the stuck-task report lay out the same way as on Slack. The stuck-task report's [Retry and Drop](#stuck-task-report-buttons) are numbered. Google Chat draws no reactions on your message, since the app's credential cannot add one.
 
 A first sentence longer than 150 characters is cut at a clause, as on Slack, or at a word when no clause fits. The bold line then ends in "…" and the detail opens on one, so no word of it is lost. The same cut holds on Slack under `next`.
 
@@ -444,7 +446,9 @@ If a task is already running on the `platform` route when you send `/session`, t
 
 ### Answer feedback
 
-On Slack and Google Chat, the final answer to each ask ends with 👍 and 👎 buttons. That is the agent's own answer or, when it hands the work to a card, the card's report rather than its acknowledgement, once per ask however many cards it fanned out to. An ask whose cards were still running when the agent restarted gets none. The exception is a card that posts progress after the restart while the thread's latest question was also handed to cards: its report is rated under that question. Plan rows, progress, questions waiting on you, notices and home-channel posts have none. A tap from someone the gateway would not answer changes nothing.
+On Slack and Google Chat, the final answer to each ask ends with 👍 and 👎 buttons. That is the agent's own answer or, when it hands the work to a card, the card's report rather than its acknowledgement, once per ask however many cards it fanned out to. An ask whose cards were still running when the agent restarted gets none. The exception is a card that posts progress after the restart while the thread's latest question was also handed to cards: its report is rated under that question. In a conversation, plan rows, progress, questions waiting on you and notices have none. A tap from someone the gateway would not answer changes nothing.
+
+What the agent posts on its own in the home channel carries the same buttons, labelled Useful and Not useful: an alert, kept through the triage that rewrites it, and a scheduled or audit report. They come after the post's own buttons, such as a drift alert's two, which stay first. Replies in an alert's thread, such as the triage card's progress, have none. A rating there counts as a rating of that alert or report, not of an answer, so a 👎 on an alert you found noisy does not read as a wrong answer. Its box says only the post is kept, since nobody asked a question, and its export names the alert's trigger rather than a question.
 
 Each rating is counted, and the button you tapped fills in. The gateway keeps your question and the answer with it, and nothing else from the thread, so an operator can turn the exchange into an evaluation case: a 👎 as a case to fix, a 👍 as a good answer to keep. A 👍 shows nothing more. A 👎 opens a box asking what was wrong (optional, one line), kept with it. The box says how long your question and the answer are kept, or only the answer when the question is no longer on record. Cancel keeps the 👎 without a note.
 
@@ -456,7 +460,7 @@ On Google Chat, Send or Cancel collapses the card to the same thanks line and th
 
 In a Google Chat space, the filled button shows the latest tap by anyone, while each person's rating is kept separately.
 
-You have one rating per answer, so a 👍 on an answer you gave a 👎 replaces it, note and all, and the reverse. The last seven days' count, such as "This week: 4 👍, 1 👎", is on the Slack Home tab only, refreshed every five minutes; Google Chat has no Home tab. On Slack, no scope beyond the ones [Slack](#slack) lists is needed.
+You have one rating per answer, so a 👍 on an answer you gave a 👎 replaces it, note and all, and the reverse. The last seven days' count of answer ratings, such as "This week: 4 👍, 1 👎", is on the Slack Home tab only, refreshed every five minutes; Google Chat has no Home tab. On Slack, no scope beyond the ones [Slack](#slack) lists is needed.
 
 What a rating keeps can include cluster names and whatever else the question and answer held. It is stored in the `feedback` bucket of the install's NATS server, and only the gateway can read or write its records. The setup job can list the bucket's keys, which hold the task and a string derived from the rater's Slack member ID or Google Chat address. The bucket drops each record 30 days after it was given. Nothing is sent anywhere else. An install whose NATS server has no such bucket draws no buttons; the gateway checks for one again every minute for half an hour after it starts.
 
@@ -467,7 +471,9 @@ kubectl exec -n kubeagents-system deploy/<name>-a2a-gateway -- \
     /gateway feedback export --since 7d > feedback.tar
 ```
 
-To turn it off, set `spec.integration.slack.answerFeedback: false` or `spec.integration.googleChat.answerFeedback: false` in the `PlatformAgent` CR, for the platform the install uses, or the chart's `platformAgent.integration.<slack|googleChat>.answerFeedback`. On an install made with `install.sh`, put that value in a `TF_VAR_extra_helm_values` line in `install.env`, for example `TF_VAR_extra_helm_values='{platformAgent={integration={googleChat={answerFeedback=false}}}}'`. Answers then carry no buttons and nothing is kept. Tapping a button already posted counts nothing, keeps nothing and opens no box; Slack still highlights the tapped button. Ratings kept before you turned it off stay until the bucket drops them.
+For an alert or report, `transcript.md` holds the post and says nobody asked, and the draft's prompt names the trigger to plant instead of a question.
+
+To turn it off, set `spec.integration.slack.answerFeedback: false` or `spec.integration.googleChat.answerFeedback: false` in the `PlatformAgent` CR, for the platform the install uses, or the chart's `platformAgent.integration.<slack|googleChat>.answerFeedback`. On an install made with `install.sh`, put that value in a `TF_VAR_extra_helm_values` line in `install.env`, for example `TF_VAR_extra_helm_values='{platformAgent={integration={googleChat={answerFeedback=false}}}}'`. Answers, alerts and reports then carry no buttons and nothing is kept. Tapping a button already posted counts nothing, keeps nothing and opens no box; Slack still highlights the tapped button. Ratings kept before you turned it off stay until the bucket drops them.
 
 ### `/feedback`
 

@@ -56,6 +56,8 @@ false`, with the same effect as the Slack field. The chart carries the value.
   `next`, so the off switch stays one global flag with two names.
 - Ratings on home-channel posts (alerts, scheduled reports). The notifier marks only the card
   report that answers an ask in its conversation; home posts are not marked on Slack either.
+  Since superseded: home posts are rated on both backends, as `spec-chatops-gateway.md`'s
+  "Answer feedback" section describes.
 
 ## Anti-goals
 

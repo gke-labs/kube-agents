@@ -25,8 +25,10 @@ import (
 // run in the gateway's pod, which holds the bucket's only credentials). Each
 // draft is a directory in a tar on the writer: task.yaml, a case skeleton per
 // docs/designs/bench-case-format.md whose prompt is the rater's ask, and
-// transcript.md, the exchange that was rated. A line per draft goes to the
-// log writer.
+// transcript.md, the exchange that was rated. A post the agent made on its
+// own answered no question, so its draft's prompt is a TODO naming the
+// trigger to plant (feedbackPostTrigger) and its transcript holds the post.
+// A line per draft goes to the log writer.
 const (
 	feedbackCaseIDPrefix  = "feedback-"
 	feedbackCaseDateForm  = "20060102"
@@ -48,6 +50,15 @@ const (
 	// feedbackNoAsk stands in for an ask the session record no longer held
 	// when the answer was rated (past AskTTL, or a reaped session).
 	feedbackNoAsk = "TODO: the question was no longer on record when this answer was rated; take it from the conversation"
+	// feedbackPostTrigger stands in for the ask of a post the agent made on
+	// its own (FeedbackRecord.Kind), which answered no question: its trigger
+	// (the event, the drift, the schedule) is what a case plants, and the
+	// prompt is how that trigger reaches the agent. %s is the kind.
+	feedbackPostTrigger = "TODO: nobody asked; this rates %s the agent posted on its own. Plant the trigger the post reports (the event, the drift, the schedule) as the case's fixture, and write the prompt the way that trigger reaches the agent"
+	// feedbackPostNoTrigger is the transcript's trigger section for such a
+	// post. A long report posts in several messages and only the last, which
+	// carries the controls, is kept, so its trigger may be in one before it.
+	feedbackPostNoTrigger = "Nobody asked: the agent posted this %s on its own. The rated message is below. A long report posts in several messages and only the last one, which carries the buttons, is kept, so its trigger may be in an earlier one."
 
 	// The characters JSON writes raw and YAML refuses in a stream, and the
 	// two Unicode separators YAML reads as line breaks.
@@ -129,8 +140,13 @@ func ExportFeedback(ctx context.Context, c *lib.Client, since time.Duration, now
 				return i, err
 			}
 		}
+		// A post the agent made on its own had no ask: its line quotes the post.
+		quoted := k.rec.Ask
+		if k.rec.Kind != "" {
+			quoted = k.rec.Answer
+		}
 		fmt.Fprintf(log, "%d %s · %s · “%s”\n%s\n%s\n", i+1, feedbackMark(k.rec), k.rec.RatedAt.Format(feedbackRatedDateForm),
-			clipWords(k.rec.Ask, feedbackSummaryAskMax), files[0].name, files[1].name)
+			clipWords(quoted, feedbackSummaryAskMax), files[0].name, files[1].name)
 	}
 	return len(recs), tw.Close()
 }
@@ -160,7 +176,7 @@ func feedbackCaseYAML(id string, rec FeedbackRecord) string {
 		note = feedbackNoNote
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "# A candidate eval case from a %s on an answer, exported from an install\n", feedbackMark(rec))
+	fmt.Fprintf(&b, "# A candidate eval case from a %s on %s, exported from an install\n", feedbackMark(rec), feedbackRatedWhat(rec))
 	b.WriteString("# (`/gateway feedback export`). It is a draft: fill in every TODO before\n")
 	b.WriteString("# submitting it, per bench/CONTRIBUTING.md and\n")
 	b.WriteString("# docs/designs/bench-case-format.md. transcript.md beside it is the\n")
@@ -205,7 +221,9 @@ func feedbackTranscriptMD(rec FeedbackRecord) string {
 	}
 	var b strings.Builder
 	b.WriteString("# The rated exchange\n\n")
-	if rec.Rating == FeedbackUp {
+	if rec.Rating == FeedbackUp && rec.Kind != "" {
+		fmt.Fprintf(&b, "Rated 👍 on %s (%s), a useful %s.\n\n", rec.RatedAt.UTC().Format(feedbackRatedDateForm), rec.Platform, rec.Kind)
+	} else if rec.Rating == FeedbackUp {
 		fmt.Fprintf(&b, "Rated 👍 on %s (%s), a good answer.\n\n", rec.RatedAt.UTC().Format(feedbackRatedDateForm), rec.Platform)
 	} else {
 		fmt.Fprintf(&b, "Rated 👎 on %s (%s). What the rater said was wrong: %s\n\n",
@@ -216,6 +234,10 @@ func feedbackTranscriptMD(rec FeedbackRecord) string {
 		fmt.Fprintf(&b, "- Context: `%s`\n", rec.ContextID)
 	}
 	fmt.Fprintf(&b, "- Conversation: `%s`, message `%s`\n\n", rec.Conversation, rec.MessageID)
+	if rec.Kind != "" {
+		b.WriteString("## The trigger\n\n" + fmt.Sprintf(feedbackPostNoTrigger, rec.Kind) + "\n\n## The rated post\n\n" + rec.Answer + "\n")
+		return b.String()
+	}
 	b.WriteString("## The ask\n\n" + feedbackAskOrTODO(rec) + "\n\n## The rated answer\n\n" + rec.Answer + "\n")
 	return b.String()
 }
@@ -249,12 +271,34 @@ func yamlComment(s string) string {
 }
 
 // feedbackAskOrTODO is the record's ask, or a TODO saying it was not on
-// record, so a draft never ships an empty prompt as if it were the ask.
+// record, so a draft never ships an empty prompt as if it were the ask. A
+// post the agent made on its own had no ask: its TODO names the trigger to
+// plant instead.
 func feedbackAskOrTODO(rec FeedbackRecord) string {
+	if rec.Kind != "" {
+		return fmt.Sprintf(feedbackPostTrigger, feedbackKindNoun(rec.Kind))
+	}
 	if strings.TrimSpace(rec.Ask) == "" {
 		return feedbackNoAsk
 	}
 	return rec.Ask
+}
+
+// feedbackKindNoun is a post kind with its article ("an alert", "a report").
+func feedbackKindNoun(kind string) string {
+	if kind == postKindAlert {
+		return "an " + kind
+	}
+	return "a " + kind
+}
+
+// feedbackRatedWhat says what the record rated: an answer, or a post the
+// agent made on its own.
+func feedbackRatedWhat(rec FeedbackRecord) string {
+	if rec.Kind == "" {
+		return "an answer"
+	}
+	return feedbackKindNoun(rec.Kind) + " the agent posted on its own"
 }
 
 // clipWords is s on one line, clipped to n code points with an ellipsis.
