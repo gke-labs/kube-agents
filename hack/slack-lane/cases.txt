@@ -2,7 +2,7 @@
 # thing only real Slack shows. Each runs once through Slack (AGENT_TRANSPORT=slack);
 # the case grades the first turn as it does on inject, where it keeps its own
 # nightly record, and the lane adds Slack's own timings. Advisory: the lane gates
-# nothing.
+# nothing. ci-kube-agents-eval-nightly-slack runs them one at a time.
 #
 # "<case id>" runs one turn. "<case id> then: <reply>" sends <reply> in the
 # thread once the first turn settles and records how that second turn went

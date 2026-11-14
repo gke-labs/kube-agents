@@ -122,6 +122,8 @@ _NEXT_LANE_JOB_NAMES = (
     "post-kube-agents-eval-rc",
     # The replay lane: a periodic replaying the next-mode nightlies' recordings.
     "ci-kube-agents-eval-replay-lane",
+    # The Slack lane's nightly: hack/slack-lane/run.sh in place of the matrix.
+    "ci-kube-agents-eval-nightly-slack",
 )
 _RC_REGISTRY_PREFIX = "ghcr.io/gke-labs/kube-agents"
 _RC_COMMIT_SHA = "b4ee5f3eb9c2aceb7f03460d2e573278ab9483fe"

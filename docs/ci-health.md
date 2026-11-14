@@ -541,7 +541,8 @@ daily pass over every project. A fourth, `ci-kube-agents-certification-1`, is
 not a pool job but the certification lane's weekly slice, watched here because
 its record is its logs bucket and nothing else reads a failed build of it. A fifth,
 `ci-kube-agents-eval-replay-lane`, is the inference-replay lane, watched because it gates nothing
-and publishes no dashboard data, so nothing else reads a failed build of it either. `scripts/eval_dashboard/periodics.py` lists them in `WATCHED`, one entry
+and publishes no dashboard data, so nothing else reads a failed build of it either. The Slack lane's nightly,
+`ci-kube-agents-eval-nightly-slack`, is not watched: it is advisory, and its cases never red it. `scripts/eval_dashboard/periodics.py` lists them in `WATCHED`, one entry
 per job with its label, its stale window, the report it writes, and the words
 its messages are built from, so adding the next periodic is one entry. The 15-minute tick's `Fetch the watched periodics'
 latest builds` step reads each job's `latest-build.txt` from
