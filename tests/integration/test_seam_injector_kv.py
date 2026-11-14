@@ -99,6 +99,20 @@ def _go_cache_dir(fallback_parent):
     return str(Path(fallback_parent) / FALLBACK_GOCACHE_DIRNAME)
 
 
+def _go_test_output(test_filter: str, completed: subprocess.CompletedProcess) -> str:
+    """The assertion message for a `go test` run: exit code, stdout, stderr.
+
+    Both streams, always. A run that never reached the Go test, such as a
+    module download that failed before the package could load, prints only
+    `FAIL ... [setup failed]` on stdout and the cause on stderr; a message
+    without stderr shows the job log the verdict and not the error.
+    """
+    return (
+        f"go test {test_filter} exited {completed.returncode}\n"
+        f"--- stdout ---\n{completed.stdout}\n--- stderr ---\n{completed.stderr}"
+    )
+
+
 @unittest.skipUnless(GO, "no Go toolchain on PATH")
 class InjectorKVSeamTest(unittest.TestCase):
     @classmethod
@@ -135,11 +149,7 @@ class InjectorKVSeamTest(unittest.TestCase):
             text=True,
             timeout=300,
         )
-        self.assertEqual(
-            0,
-            completed.returncode,
-            f"go test {test_filter} failed:\n{completed.stdout}\n{completed.stderr}",
-        )
+        self.assertEqual(0, completed.returncode, _go_test_output(test_filter, completed))
         return completed.stdout
 
     def test_the_real_client_creates_a_session_and_injects_through_the_envelope(self):
@@ -236,8 +246,9 @@ class InjectorKVSeamTest(unittest.TestCase):
                 "GOCACHE": self.gocache,
             }
         )
+        test_filter = "TestLiveKVCreateAndInject"
         completed = subprocess.run(
-            [GO, "test", "-run", "TestLiveKVCreateAndInject", "./cmd/k8s-event-watcher/"],
+            [GO, "test", "-run", test_filter, "./cmd/k8s-event-watcher/"],
             cwd=str(REPO_ROOT / "k8s-operator"),
             env=env,
             capture_output=True,
@@ -245,14 +256,17 @@ class InjectorKVSeamTest(unittest.TestCase):
             timeout=300,
         )
         combined = completed.stdout + completed.stderr
+        # Every assertion message carries both streams: a `[setup failed]`
+        # run fails the last assertion below, and its cause is on stderr.
+        output = _go_test_output(test_filter, completed)
         # No transport/decode error from the client (its error strings all
         # carry the "injector:" prefix)...
-        self.assertNotIn("injector: POST inject", combined)
-        self.assertNotIn("injector: decode", combined)
+        self.assertNotIn("injector: POST inject", combined, output)
+        self.assertNotIn("injector: decode", combined, output)
         # ...and the run failed only on the Go test's own status expectation,
         # which proves the empty body was read as a status, not an error.
-        self.assertNotEqual(0, completed.returncode)
-        self.assertIn("expected status injected", completed.stdout)
+        self.assertNotEqual(0, completed.returncode, output)
+        self.assertIn("expected status injected", completed.stdout, output)
 
 
 if __name__ == "__main__":
