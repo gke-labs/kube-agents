@@ -3269,10 +3269,12 @@ check_scope_container_access() {
   # Every probe below is called in a `||` list: the front doors run under
   # `set -eE` with an ERR trap, and a probe answering "denied" is an answer,
   # not an error, on the bare call upgrade.sh --plan makes as well as on the
-  # `|| exit 1` call the applying modes make.
+  # `|| exit 1` call the applying modes make. Each clears the ERR trap inside
+  # its substitution: bash 3.2 fires an inherited one there on the probe's
+  # non-zero return, before the `||` is consulted.
   if ! _scope_asset_api_enabled "$project"; then
     rc=0
-    constraint="$(_scope_policy_denying_asset_api "$project")" || rc=$?
+    constraint="$(trap - ERR; _scope_policy_denying_asset_api "$project")" || rc=$?
     if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
       failures+=("${SCOPE_ASSET_API} cannot be enabled in project '${project}': the effective organisation policy ${constraint} denies it, and the reconcile resolves a folder or organisation through that API. Ask the organisation's administrator for an exception, or declare explicit SCOPE_PROJECTS instead.")
     elif [ "$rc" -eq "$SCOPE_PROBE_UNDECIDED" ]; then
@@ -3283,7 +3285,7 @@ check_scope_container_access() {
     undecided+=("whether ${identity} can set IAM policy on the declared containers (curl is not installed)")
   elif properties="$(_scope_gcloud_auth_properties_in_the_way)" && [ -n "$properties" ]; then
     undecided+=("whether ${identity} can set IAM policy on the declared containers (gcloud's active configuration sets ${properties}, which its token mint honours and Terraform does not; run: gcloud config unset <property>, or set GOOGLE_IMPERSONATE_SERVICE_ACCOUNT to apply as that account)")
-  elif ! token="$(_scope_terraform_access_token)" || [ -z "$token" ]; then
+  elif ! token="$(trap - ERR; _scope_terraform_access_token)" || [ -z "$token" ]; then
     undecided+=("whether ${identity} can set IAM policy on the declared containers ($(_scope_terraform_token_remedy))")
   else
     local IFS=$', \t\n'
@@ -3292,7 +3294,7 @@ check_scope_container_access() {
     for entry in $folders; do
       [ -n "$entry" ] || continue
       rc=0
-      reason="$(_scope_container_can_set_iam "folders/${entry}" "$SCOPE_FOLDER_SET_IAM_PERMISSION" "$token")" || rc=$?
+      reason="$(trap - ERR; _scope_container_can_set_iam "folders/${entry}" "$SCOPE_FOLDER_SET_IAM_PERMISSION" "$token")" || rc=$?
       if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
         failures+=("${identity} cannot set IAM policy on folders/${entry} (${SCOPE_FOLDER_SET_IAM_PERMISSION}), or the folder does not exist; the apply would fail binding the agent's roles there. Ask for roles/resourcemanager.folderIamAdmin on the folder for that identity, or drop it from SCOPE_FOLDERS.")
       elif [ "$rc" -ne "$SCOPE_PROBE_GRANTED" ]; then
@@ -3302,7 +3304,7 @@ check_scope_container_access() {
       fi
       $pool_lists || continue
       rc=0
-      reason="$(_scope_container_can_set_iam "folders/${entry}" "$SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION" "$token")" || rc=$?
+      reason="$(trap - ERR; _scope_container_can_set_iam "folders/${entry}" "$SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION" "$token")" || rc=$?
       if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
         failures+=("${identity} cannot list the members of folders/${entry} (${SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION}); the plan ${SCOPE_POOL_CONTAINER_READ_REASON} and would refuse. Ask for ${SCOPE_CONTAINER_ASSET_SEARCH_ROLE} on the folder for that identity, set SCOPED_SA_POOL_ENABLED=false, or drop it from SCOPE_FOLDERS.")
       elif [ "$rc" -ne "$SCOPE_PROBE_GRANTED" ]; then
@@ -3312,7 +3314,7 @@ check_scope_container_access() {
     for entry in $organizations; do
       [ -n "$entry" ] || continue
       rc=0
-      reason="$(_scope_container_can_set_iam "organizations/${entry}" "$SCOPE_ORGANIZATION_SET_IAM_PERMISSION" "$token")" || rc=$?
+      reason="$(trap - ERR; _scope_container_can_set_iam "organizations/${entry}" "$SCOPE_ORGANIZATION_SET_IAM_PERMISSION" "$token")" || rc=$?
       if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
         failures+=("${identity} cannot set IAM policy on organizations/${entry} (${SCOPE_ORGANIZATION_SET_IAM_PERMISSION}), or the organisation is not visible to it; the apply would fail binding the agent's roles there. Ask for roles/resourcemanager.organizationAdmin for that identity, or drop it from SCOPE_ORGANIZATIONS.")
       elif [ "$rc" -ne "$SCOPE_PROBE_GRANTED" ]; then
@@ -3322,7 +3324,7 @@ check_scope_container_access() {
       fi
       $pool_lists || continue
       rc=0
-      reason="$(_scope_container_can_set_iam "organizations/${entry}" "$SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION" "$token")" || rc=$?
+      reason="$(trap - ERR; _scope_container_can_set_iam "organizations/${entry}" "$SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION" "$token")" || rc=$?
       if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
         failures+=("${identity} cannot list the members of organizations/${entry} (${SCOPE_CONTAINER_ASSET_SEARCH_PERMISSION}); the plan ${SCOPE_POOL_CONTAINER_READ_REASON} and would refuse. Ask for ${SCOPE_CONTAINER_ASSET_SEARCH_ROLE} on the organisation for that identity, set SCOPED_SA_POOL_ENABLED=false, or drop it from SCOPE_ORGANIZATIONS.")
       elif [ "$rc" -ne "$SCOPE_PROBE_GRANTED" ]; then
@@ -3439,11 +3441,12 @@ check_scope_export_sink_access() {
     undecided+=("whether ${identity} can create a Log Router sink in the scope's projects (curl is not installed)")
   elif properties="$(_scope_gcloud_auth_properties_in_the_way)" && [ -n "$properties" ]; then
     undecided+=("whether ${identity} can create a Log Router sink in the scope's projects (gcloud's active configuration sets ${properties}, which its token mint honours and Terraform does not; run: gcloud config unset <property>, or set GOOGLE_IMPERSONATE_SERVICE_ACCOUNT to apply as that account)")
-  elif ! token="$(_scope_terraform_access_token)" || [ -z "$token" ]; then
+  elif ! token="$(trap - ERR; _scope_terraform_access_token)" || [ -z "$token" ]; then
     undecided+=("whether ${identity} can create a Log Router sink in the scope's projects ($(_scope_terraform_token_remedy))")
   else
     # Each probe is called in a `||` list: a denied answer is an answer, not
-    # an error, under the front doors' ERR trap. Globbing off around the
+    # an error, under the front doors' ERR trap, which each clears inside its
+    # substitution as the container preflight does. Globbing off around the
     # unquoted split, as the container preflight has it: an entry carrying a
     # glob character would otherwise be replaced by the files it matches.
     case "$-" in *f*) had_noglob=true ;; esac
@@ -3454,7 +3457,7 @@ check_scope_export_sink_access() {
         continue
       fi
       rc=0
-      reason="$(_scope_container_can_set_iam "projects/${entry}" "$SCOPE_SINK_CREATE_PERMISSION" "$token")" || rc=$?
+      reason="$(trap - ERR; _scope_container_can_set_iam "projects/${entry}" "$SCOPE_SINK_CREATE_PERMISSION" "$token")" || rc=$?
       if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
         # The state is read on the first denial alone: a run with every
         # project granted never reads it.
@@ -3467,7 +3470,7 @@ check_scope_export_sink_access() {
           # it: the plan refreshes it, and a 403 or 404 above may mean the
           # project itself is not visible.
           rc=0
-          reason="$(_scope_container_can_set_iam "projects/${entry}" "$SCOPE_SINK_GET_PERMISSION" "$token")" || rc=$?
+          reason="$(trap - ERR; _scope_container_can_set_iam "projects/${entry}" "$SCOPE_SINK_GET_PERMISSION" "$token")" || rc=$?
           if [ "$rc" -eq "$SCOPE_PROBE_DENIED" ]; then
             failures+=("${identity} cannot read this install's drift audit-log sink in project '${entry}' (${SCOPE_SINK_GET_PERMISSION}), or the project is not visible to it, and cannot create one (${SCOPE_SINK_CREATE_PERMISSION}); the plan reads the sink and would fail there, or the apply would at that project's read, after the host's resources and the other projects' sinks have changed. Ask for ${SCOPE_SINK_CREATE_ROLE} in project '${entry}' for that identity, or ${SCOPE_SINK_READ_ROLE} there for an apply that leaves the sink as it is.")
           else
