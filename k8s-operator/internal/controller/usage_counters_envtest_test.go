@@ -312,6 +312,11 @@ func TestUsagePollerUnderACRDWithoutUsageEnvtest(t *testing.T) {
 	if !h.r.usageStatusPruned(h.agent) {
 		t.Fatal("the probe's echo under the pruning CRD did not refresh the record")
 	}
+	// Read through the poller's clock, still at this probe's minute: the
+	// record the retries below have to outrun.
+	if !h.p.newerFieldPruned(h.agent, usageNewerFieldInference) {
+		t.Fatal("the probe's echo under the pruning CRD did not re-stamp the inference totals' record")
+	}
 
 	// Apply this release's CRD, expire the record, and the next poll lands
 	// the totals accumulated since the operator was upgraded.
