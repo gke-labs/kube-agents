@@ -1846,6 +1846,13 @@ func (g *Gateway) healActiveTask(ctx context.Context, rec *SessionRecord) {
 				}
 			}
 		}
+		// A canceled task's card-stop result, the one part of a canceled
+		// result a program's caller is handed (CardStopObserver).
+		if task.State == lib.StateCanceled {
+			if art := task.Artifact(lib.ArtifactResult); art != nil {
+				g.observeCardStop(rec, active.TaskID, art.Parts)
+			}
+		}
 		g.logTaskTerminal(rec, addressee, active.TaskID, task.State, source, finalMessageText(task))
 		// A console client is told the task handed work to cards, as the
 		// relay tells it (relayTerminal): the fold read here carries the
@@ -2883,6 +2890,40 @@ func (g *Gateway) observeTaskDelivered(rec *SessionRecord, taskID, result string
 	if stash && isConsoleConversation(rec.Key) {
 		g.consoleResults.put(taskID, result)
 	}
+}
+
+// observeCardStop hands a CardStopObserver a canceled task's card-stop
+// result, read from the result's cardStop part (the result form only). The
+// gateway writes both halves itself: the text in its own wording
+// (canceledCardStopText) and the part re-encoded from the parsed result
+// (lib.CardStopPart), so none of the executor's text and no field the
+// schema doesn't name reaches a door's caller: a canceled turn's partial
+// answer, chunked into the same artifact, stays unrendered. A result with
+// no such part hands over nothing. Announced under the chain's root, and
+// only for the task whose end is the chain's, as observeDelivered.
+func (g *Gateway) observeCardStop(rec *SessionRecord, taskID string, parts []lib.Part) {
+	res, ok := cardStopResultOf(parts)
+	if !ok {
+		return
+	}
+	id, ends := rec.observedAs(taskID)
+	if !ends {
+		return
+	}
+	part, err := lib.CardStopPart(lib.CardStop{CardStopResult: res})
+	if err != nil {
+		return
+	}
+	if observer, ok := g.adapter.(CardStopObserver); ok {
+		observer.TaskCardStop(rec.Key, id, canceledCardStopText(res), part)
+	}
+}
+
+// canceledCardStopText is a canceled task's card-stop result as a door's
+// caller reads it: "canceled; " and the gateway's own reply for the result
+// (cardStopReply, titles cleaned as there).
+func canceledCardStopText(r *lib.CardStopResult) string {
+	return "canceled; " + cardStopReply(r, false)
 }
 
 // finalMessageText is the text of a folded task's terminal status message,

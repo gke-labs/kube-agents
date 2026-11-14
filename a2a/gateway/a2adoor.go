@@ -188,6 +188,11 @@ type a2aTask struct {
 	// it arrived, so an empty result is distinguishable from none.
 	result    string
 	delivered bool
+	// cardStopText and cardStop are a canceled task's card-stop result
+	// (CardStopObserver): rendered as its one artifact when the task ends
+	// canceled, and never otherwise.
+	cardStopText string
+	cardStop     *lib.Part
 	// resultCutFrom is the deliverable's length when it exceeded
 	// a2aMaxResultBytes; zero when it was kept whole.
 	resultCutFrom int
@@ -1403,6 +1408,42 @@ func (d *A2ADoor) TaskTerminal(conversation, taskID string, state lib.TaskState,
 	d.wakeLocked()
 }
 
+// TaskCardStop records a canceled task's card-stop result (CardStopObserver):
+// the gateway's text for it and the cardStop part, the caller's own
+// session's card IDs and titles. Bounded like a deliverable.
+func (d *A2ADoor) TaskCardStop(conversation, taskID, text string, cardStop lib.Part) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	task, ok := d.tasks[taskID]
+	if !ok {
+		conv := d.conversationLocked(conversation)
+		task = &a2aTask{id: taskID, key: conversation, contextID: conv.contextID, caller: conv.caller, created: time.Now()}
+		d.tasks[taskID] = task
+		d.taskOrder = append(d.taskOrder, taskID)
+	}
+	task.resultCutFrom = 0
+	if whole := len(text) + len(cardStop.Data); whole > a2aMaxResultBytes {
+		// A part cut mid-JSON reads as nothing; the text alone says it, cut
+		// and marked as a cut deliverable is (metadata.resultTruncatedFrom).
+		task.resultCutFrom = whole
+		text, cardStop = truncateRunes(text, a2aMaxResultBytes), lib.Part{}
+	}
+	before := len(task.cardStopText)
+	if task.cardStop != nil {
+		before += len(task.cardStop.Data)
+	}
+	d.chargeLocked(task, len(text)+len(cardStop.Data)-before)
+	task.cardStopText = text
+	task.cardStop = nil
+	if cardStop.Kind != "" {
+		part := cardStop
+		task.cardStop = &part
+	}
+	task.updated = time.Now()
+	d.enforceBudgetLocked(task)
+	d.wakeLocked()
+}
+
 // TaskDelivered records the deliverable the relay hands over whole before
 // posting it in chunks (DeliverableObserver). It is the task's one artifact;
 // the posts stay what they are, the task's history.
@@ -1587,6 +1628,17 @@ func (d *A2ADoor) taskObjectLocked(task *a2aTask) a2aTaskObject {
 		// relay handed nothing for (a non-text result, a heal with no
 		// artifact on the stream) renders no artifact rather than a guess.
 		artifacts = []lib.Artifact{{ArtifactID: task.id + "-result", Name: lib.ArtifactResult, Parts: textParts(task.result)}}
+	}
+	if state == lib.StateCanceled && task.cardStopText != "" {
+		// A canceled task shows only its card-stop result (TaskCardStop):
+		// whether the turn's cards stopped, as text and as the cardStop
+		// part the card-stop control returns (#5528). Any other output a
+		// canceled turn produced stays unrendered.
+		parts := textParts(task.cardStopText)
+		if task.cardStop != nil {
+			parts = append(parts, *task.cardStop)
+		}
+		artifacts = []lib.Artifact{{ArtifactID: task.id + "-result", Name: lib.ArtifactResult, Parts: parts}}
 	}
 	metadata := map[string]any{"backend": a2aBackendForCaller(task.caller)}
 	if task.resultCutFrom > 0 {
