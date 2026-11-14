@@ -34,6 +34,9 @@ Model responses vary from run to run, and a provider 429 can look like a harness
 
 ## Metrics
 
+These metrics are per container and per install. [`capability-usage-attribution.md`](capability-usage-attribution.md)
+designs the split of memory and model tokens by capability.
+
 Each metric has a threshold. The breaking point of a metric is the stress level where it reaches its threshold. The last column says whether the Phase 1 runner records the metric. Phases 2 and 3 add each container's requests and the CPU it used over each window (`cpu_seconds`), the commands the credential proxy ran and their run time, and the proxy load's commands per second and their times (`bench/scale/README.md` lists every metric).
 
 | Metric                                                                                                                                                                                                                                                                        | Source                                                                                                                                                                                                                             | Threshold                                                                                     | Phase 1                                                               |
