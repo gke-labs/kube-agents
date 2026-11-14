@@ -96,13 +96,6 @@ type ActiveTask struct {
 // SessionRecord is one conversation's durable state in the session-state KV
 // bucket: contextId, current pod, bus session name, last activity, roster.
 // Runtime state is not git and not pod annotations; KV is the house answer.
-// TriggerRun is one run the trigger ingress started: its idempotency key and
-// its task (SessionRecord.TriggerRuns).
-type TriggerRun struct {
-	Key  string `json:"key"`
-	Task string `json:"task"`
-}
-
 type SessionRecord struct {
 	Key string `json:"key"`
 	// Epoch is the gateway term that last wrote the record
@@ -189,6 +182,13 @@ type SessionRecord struct {
 	// task and starts nothing, since a second mint would overwrite the grant
 	// revision the first task's envelope pins.
 	TriggerRuns []TriggerRun `json:"triggerRuns,omitempty"`
+}
+
+// TriggerRun is one run the trigger ingress started: its idempotency key and
+// its task (SessionRecord.TriggerRuns).
+type TriggerRun struct {
+	Key  string `json:"key"`
+	Task string `json:"task"`
 }
 
 // idleSince is when the conversation went quiet: its last user message, or,
