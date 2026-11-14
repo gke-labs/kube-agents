@@ -37,6 +37,10 @@ SERVICE_SUFFIX = "-a2a-door"
 REMOTE_PORT = 8098
 TOKEN_SECRET_SUFFIX = "-a2a-door"
 TOKEN_SECRET_KEY = "token"  # a Secret key name, not a credential
+#: The card-stop data part's key (lib.CardStopPart in a2a/lib), and the one
+#: version there is.
+CARD_STOP_KEY = "cardStop"
+CARD_STOP_VERSION = 1
 
 #: Task states the door reports that end a task.
 TERMINAL_STATES = frozenset({"completed", "failed", "canceled", "rejected"})
@@ -160,6 +164,22 @@ def task_text(task: dict[str, Any]) -> str:
         if isinstance(artifact, dict):
             texts.append(_parts_text(artifact))
     return next((t for t in texts if t), "")
+
+
+def card_stop_result(task: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+    """A canceled task's card-stop result (#5528): its artifact's text and the
+    ``cardStop`` part's result form, or ``None`` when the task carries none.
+    The request form (no ``stopped`` list) is not a result."""
+    for artifact in task.get("artifacts") or []:
+        if not isinstance(artifact, dict):
+            continue
+        for part in artifact.get("parts") or []:
+            if not isinstance(part, dict) or part.get("kind") != "data" or not isinstance(part.get("data"), dict):
+                continue
+            found = part["data"].get(CARD_STOP_KEY)
+            if isinstance(found, dict) and found.get("v") == CARD_STOP_VERSION and isinstance(found.get("stopped"), list):
+                return _parts_text(artifact), found
+    return None
 
 
 def _parts_text(holder: Any) -> str:
