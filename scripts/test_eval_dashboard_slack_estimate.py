@@ -65,10 +65,18 @@ class SlackEstimateTest(unittest.TestCase):
         nights = [{"started": f"2026-09-{20 - i:02d}T00:00:00+00:00", "slack": {"e2e_p95_s": float(10 - i)}} for i in range(10)] + [{}]
         # A same-date re-run of the newest night counts once.
         nights.insert(1, {"started": "2026-09-20T03:00:00+00:00", "slack": {"e2e_p95_s": 100.0}})
-        slack_estimate.average_p95(nights)
+        slack_estimate.average_p95(nights, nightly.night_date)
         self.assertEqual(7.0, nights[0]["slack"]["e2e_p95_7n_s"], "mean of 10..4, the re-run not counted")
         self.assertEqual(1.5, nights[9]["slack"]["e2e_p95_7n_s"], "fewer dates left: mean of 2 and 1")
         self.assertNotIn("slack", nights[11])
+
+    def test_a_night_started_just_before_midnight_keeps_its_own_date(self):
+        nights = [{"started": "2026-09-19T23:58:00+00:00", "slack": {"e2e_p95_s": 20.0}},
+                  {"started": "2026-09-19T00:01:00+00:00", "slack": {"e2e_p95_s": 10.0}},
+                  {"slack": {"e2e_p95_s": 4.0}}, {"slack": {"e2e_p95_s": 6.0}}]
+        slack_estimate.average_p95(nights, nightly.night_date)
+        self.assertEqual(10.0, nights[0]["slack"]["e2e_p95_7n_s"],
+                         "the 09-20 night and the 09-19 night both count, and each undated night on its own")
 
     def test_a_missing_term_gives_no_estimate(self):
         self.assertIsNone(slack_estimate.estimate(20.0, None, OVERHEAD))
@@ -106,12 +114,37 @@ class CollectReadsTheLaneTest(unittest.TestCase):
             prior_file.write_text(json.dumps({"schema_version": 1, "generated_at": "2026-09-09T12:00:00+00:00", "cases": [], "runs": [], "slack_overhead": prior}))
             runs = pathlib.Path(tmp) / "runs"
             runs.mkdir()
-            with mock.patch.object(collect, "slack_overheads_from_gcs", lambda gcloud, prefix: calls.append(prefix) or fresh):
+            with mock.patch.object(collect, "slack_overheads_from_gcs",
+                                   lambda gcloud, prefix, known: calls.append((prefix, known)) or fresh):
                 merged = collect.collect(from_dir=runs, merge_with=str(prior_file), slack_lane_prefix="gs://lane/")
                 kept = collect.collect(from_dir=runs, merge_with=str(prior_file))
         self.assertEqual(["2", "1"], [o["build_id"] for o in merged["slack_overhead"]], "newest first, the prior kept")
         self.assertEqual(["1"], [o["build_id"] for o in kept["slack_overhead"]], "no prefix: nothing read, the prior carried")
-        self.assertEqual(["gs://lane/"], calls)
+        self.assertEqual([("gs://lane/", frozenset({"1"}))], calls, "the prior's builds are passed as known")
+
+    def test_a_prior_entry_with_a_non_numeric_build_is_dropped(self):
+        prior = [{"build_id": "abc", "date": "2026-09-07"}, {"build_id": "1", "date": "2026-09-07"}]
+        with tempfile.TemporaryDirectory() as tmp:
+            prior_file = pathlib.Path(tmp) / "data.json"
+            prior_file.write_text(json.dumps({"schema_version": 1, "generated_at": "2026-09-09T12:00:00+00:00", "cases": [], "runs": [], "slack_overhead": prior}))
+            runs = pathlib.Path(tmp) / "runs"
+            runs.mkdir()
+            got = collect.collect(from_dir=runs, merge_with=str(prior_file))
+        self.assertEqual(["1"], [o["build_id"] for o in got["slack_overhead"]])
+
+    def test_a_known_build_is_not_read_again(self):
+        listing = "gs://b/lane/1/\ngs://b/lane/2/\n"
+        reads = []
+
+        def storage_call(args, gcloud):
+            reads.append(args[1])
+            return None, "One or more URLs matched no objects"
+
+        with mock.patch.object(collect, "_gcloud_storage", lambda args, gcloud: listing), \
+                mock.patch.object(collect, "_gcloud_storage_call", storage_call):
+            collect.slack_overheads_from_gcs("gcloud", prefix="gs://b/lane/", known=frozenset({"1"}))
+        self.assertTrue(reads)
+        self.assertTrue(all("/2/" in path for path in reads), reads)
 
     def test_no_lane_is_no_overhead(self):
         with mock.patch.object(collect, "_gcloud_storage", lambda args, gcloud: None):

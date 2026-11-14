@@ -1701,13 +1701,15 @@ def _gcs_reader(base: str, gcloud: str):
 
 
 def slack_overheads_from_gcs(gcloud: str = DEFAULT_GCLOUD, prefix: str = SLACK_LANE_PREFIX,
-                             limit: int = SLACK_OVERHEAD_NIGHTS) -> list[dict]:
+                             limit: int = SLACK_OVERHEAD_NIGHTS, known: frozenset = frozenset()) -> list[dict]:
     """The Slack lane's recorded overhead per build, newest first: ``{build_id, date, ...}``
     with SLACK_OVERHEAD_KEYS. A build with no overhead file, one that records an error, or
-    no lane at all yields nothing, so the pages stay quiet until the lane runs."""
+    no lane at all yields nothing, so the pages stay quiet until the lane runs. A build in
+    ``known`` (already in the prior data.json) is not read again."""
     listing = _gcloud_storage(["ls", prefix], gcloud)
     out = []
-    for build_id, base in sorted(_build_dirs(listing or ""), key=lambda b: int(b[0]), reverse=True)[:limit]:
+    newest = sorted(_build_dirs(listing or ""), key=lambda b: int(b[0]), reverse=True)[:limit]
+    for build_id, base in [(b, base) for b, base in newest if b not in known]:
         read = _gcs_reader(base, gcloud)
         started, text = _started_at(read("started.json")), read(SLACK_OVERHEAD_FILE)
         try:
@@ -2906,8 +2908,8 @@ def collect(
         data["releases"] = sorted(by_id.values(), key=_release_sort_key, reverse=True)[:rc_limit]
     # The Slack lane's overhead, newest first: this scan's read merged over the
     # prior file's by build, so a failed read keeps what was there.
-    known = [o for o in (prior_data or {}).get("slack_overhead") or [] if isinstance(o, dict) and isinstance(o.get("build_id"), str)]
-    fresh = slack_overheads_from_gcs(gcloud, slack_lane_prefix) if slack_lane_prefix else []
+    known = [o for o in (prior_data or {}).get("slack_overhead") or [] if isinstance(o, dict) and isinstance(o.get("build_id"), str) and o["build_id"].isdecimal()]
+    fresh = slack_overheads_from_gcs(gcloud, slack_lane_prefix, known=frozenset(o["build_id"] for o in known)) if slack_lane_prefix else []
     by_build = {o["build_id"]: o for o in known} | {o["build_id"]: o for o in fresh}
     if by_build:
         data["slack_overhead"] = sorted(by_build.values(), key=lambda o: int(o["build_id"]), reverse=True)[:SLACK_OVERHEAD_NIGHTS]

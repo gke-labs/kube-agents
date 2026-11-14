@@ -68,10 +68,12 @@ def annotate(doc: dict, day: str | None, overheads) -> None:
     }
 
 
-def average_p95(nights: list[dict]) -> None:
+def average_p95(nights: list[dict], day_of) -> None:
     """Each night's ``slack.e2e_p95_7n_s``: the mean e2e p95 of up to P95_NIGHTS dates that
     carry one, its own and the dates before it (``nights`` newest first; a date's newest night
-    counts once, so a same-date re-run does not count twice)."""
+    counts once, so a same-date re-run does not count twice). ``day_of(night)`` dates a night
+    (nightly.night_date, passed in because nightly imports this module); an undated night
+    counts on its own."""
     for index, night in enumerate(nights):
         slack = night.get("slack")
         if not isinstance(slack, dict):
@@ -79,7 +81,7 @@ def average_p95(nights: list[dict]) -> None:
         by_date: dict = {}
         for n in nights[index:]:
             value = (n.get("slack") or {}).get("e2e_p95_s") if isinstance(n.get("slack"), dict) else None
-            day = (n.get("started") or "")[:10]
+            day = day_of(n) or id(n)
             if isinstance(value, (int, float)) and day not in by_date:
                 by_date[day] = value
             if len(by_date) == P95_NIGHTS:

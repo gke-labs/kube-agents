@@ -877,7 +877,7 @@ def night_reports(data: dict, limit: int = NIGHTS_ON_RECORD, running: list[dict]
         sources.sort(key=lambda source: -source[0])
         previous = {part: nights[at][part] for at, part in sources}
         out.append(joined_night_document(night, data, previous or None, running, borrowed))
-    slack_estimate.average_p95(out)
+    slack_estimate.average_p95(out, night_date)
     return out
 
 
