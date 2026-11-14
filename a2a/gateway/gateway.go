@@ -230,6 +230,10 @@ type Gateway struct {
 	// profiles is the AgentProfiles this gateway can address, kept from
 	// their cards on DIRECTORY (startProfileDirectory).
 	profiles *profileDirectory
+	// triggerLimits is the trigger ingress's per-trigger rate cap, made on
+	// first use (triggerLimiter).
+	triggerLimiterOnce sync.Once
+	triggerLimits      *triggerRateLimiter
 	// resolvedScope reads the scope publisher's ConfigMap (SetResolvedScope);
 	// nil when none is configured.
 	resolvedScope resolvedScopeSource
@@ -926,6 +930,7 @@ func (g *Gateway) RunWith(ctx context.Context, o RunOptions) error {
 	}()
 
 	g.startProfileDirectory(ctx)
+	g.startTriggerIngress(ctx)
 	go g.reapLoop(ctx)
 	if g.spawner != nil {
 		go g.sweepLoop(ctx)
@@ -3223,7 +3228,9 @@ func (g *Gateway) startTaskWith(ctx context.Context, rec *SessionRecord, ts task
 	// can arrive (the demo posts one while the pod cold-starts; same idea).
 	// None on a backend that shows the task's status itself (StatusShower).
 	statusMsgID, lineless := "", g.showsTaskStatus(rec.Key)
-	if !lineless {
+	// A trigger's conversation has no chat backend: no placeholder there
+	// (unpostableTrigger), for a child or a wake started on its record.
+	if !lineless && !g.unpostableTrigger(rec.Key) {
 		var err error
 		statusMsgID, err = g.adapter.PostMessage(rec.Key, OutMessage{Text: withLineNote("⏳ submitted…", ts.LineNote), Stop: taskID})
 		if err != nil {

@@ -628,6 +628,10 @@ type Config struct {
 	// chosen must not be a generous one.
 	AuthorityTier  capability.Tier
 	AuthorityScope capability.Scope
+	// TriggerRatePerHour is the per-trigger cap on submissions the trigger
+	// ingress accepts (trigger_ingress.go): a token bucket that holds this
+	// many and refills at this rate. Zero takes DefaultTriggerRatePerHour.
+	TriggerRatePerHour int
 
 	// CapabilityOptional relaxes exactly one thing: what happens when this
 	// gateway cannot mint. Zero value — the safe one — refuses the turn.
