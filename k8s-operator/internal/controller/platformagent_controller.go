@@ -278,7 +278,7 @@ const (
 	// store; with none, the report store alone. The audits are what the
 	// store holds; an alert's triage still runs on the board, and the other
 	// scheduled reports have no store of their own.
-	noChatPlatformMessageFormat = "Neither Google Chat nor Slack is enabled (spec.mode next), so the agent's proactive posts -- " +
+	noChatPlatformMessageFormat = "Neither Google Chat nor Slack is enabled, so the agent's proactive posts -- " +
 		"alerts, drift reports, scheduled reports -- have no chat to go to. Its audit findings %s; alerts are still triaged " +
 		"on the board, and other scheduled reports are not delivered. Ask the agent for the audits in the console's chat pane, " +
 		"or read the volume with kubectl exec. Enable spec.integration.slack or spec.integration.googleChat " +
@@ -303,7 +303,7 @@ const (
 	// homeChannelUnsetMessageFormat takes the backend, the CR field, the
 	// install.env key, what the field holds, and where the posts go
 	// meanwhile (one of the two sentences below).
-	homeChannelUnsetMessageFormat = "The A2A gateway holds %[1]s (spec.mode next) and %[2]s is empty, so the agent's " +
+	homeChannelUnsetMessageFormat = "The A2A gateway holds %[1]s and %[2]s is empty, so the agent's " +
 		"proactive posts -- alerts, drift reports, scheduled reports -- %[5]s; " +
 		"replies in a conversation still arrive. Set %[2]s (%[3]s in install.env) to %[4]s to deliver them."
 	// homeChannelUnsetKept is the meanwhile when the gateway's backend is the
@@ -325,7 +325,7 @@ const (
 	// Both status writers carry it, updateStatusReady and
 	// updateStatusDegraded, because the strip happens at render and the render
 	// is above both of them: three refusals park the CR on Degraded after the
-	// Pod has already been written (ModeNotRecognized, A2AProvisionFailed,
+	// Pod has already been written (A2AProvisionFailed,
 	// ShellSandboxKeysMissing), and ShellSandboxKeysMissing is where a bare
 	// `helm install` sits indefinitely -- the chart renders the sandbox's
 	// authorized-keys Secret only when a public key is supplied. That is the
@@ -1047,6 +1047,12 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return r.handleDeletion(ctx, instance)
 	}
 
+	// 1b. Move a stored spec.mode "today" to "next" (mode_migration.go). The
+	// render below does not read the field; this keeps the object truthful.
+	if migrated, err := r.migrateRetiredMode(ctx, instance); err != nil || migrated {
+		return ctrl.Result{}, err
+	}
+
 	// 2. Add Finalizer if not present
 	if !controllerutil.ContainsFinalizer(instance, platformAgentFinalizer) {
 		controllerutil.AddFinalizer(instance, platformAgentFinalizer)
@@ -1067,16 +1073,6 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
-	// 2b. Validate the mode gate once at the top; everything downstream asks
-	// renderMode, which fails closed. An error here is version skew — a newer
-	// CRD's mode value this binary does not know (see mode.go). Today's stack
-	// still renders below, so the cluster keeps running what it ran; status
-	// reports Degraded/ModeNotRecognized at the end instead of Ready.
-	_, modeErr := resolveMode(instance)
-	if modeErr != nil {
-		log.Info("Unrecognized spec.mode; rendering today's stack and reporting Degraded", "error", modeErr.Error())
-	}
-
 	// 2d. BusCredentialsReady, written on the way out rather than at a point in
 	// the sequence below.
 	//
@@ -1094,45 +1090,36 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// long as the refusal does. The CR reports a callout serving a named map
 	// version through a Deployment that may since have lost every replica.
 	//
-	// Version skew is the one case with nothing to say. renderMode fails closed
-	// to today while cleanupA2A is deliberately not run (see the mode gate
-	// below), so the bus a newer CRD rendered is still standing; clearing the
-	// condition would report it gone, and rewriting it would claim this binary
-	// knows what it describes. Both are worse than leaving it.
-	//
 	// DispatcherJobMode is written on the way out for the same reasons, from
-	// the dispatcher step's verdict (syncDispatcherJobMode), or cleanupA2A's
-	// below. A pass that reached neither leaves it as it was.
+	// the dispatcher step's verdict (syncDispatcherJobMode). A pass that did
+	// not reach it leaves it as it was.
 	busCredsMapVersion := ""
 	var dispatcherJobMode, dispatcherCeiling *metav1.Condition
-	if modeErr == nil {
-		wantNext := renderMode(instance, "nats") == ModeNext
-		exitWrite := func(condition string, err error) {
-			if err == nil {
-				return
-			}
-			if retErr == nil {
-				retErr = err
-				return
-			}
-			// The reconcile is already failing and will requeue. If the
-			// failure is already a PlatformAgent conflict being requeued cleanly,
-			// a subsequent conflict writing the condition is the same race
-			// and should not log an Error with a stack trace.
-			if isPlatformAgentConflict(retErr) && errors.IsConflict(err) {
-				log.Info("Conflict writing "+condition+"; pass already requeuing on conflict", "error", err)
-			} else {
-				log.Error(err, "could not write "+condition)
-			}
+	exitWrite := func(condition string, err error) {
+		if err == nil {
+			return
 		}
-		defer func() {
-			exitWrite(busCredentialsReadyCondition, r.syncBusCredentialsReady(ctx, instance, wantNext, busCredsMapVersion))
-			exitWrite(dispatcherCeilingCondition, r.syncDispatcherCeiling(ctx, instance, dispatcherCeiling))
-			// Last, so it outlives every status writer of its pass
-			// (TestDispatcherJobModeOutlivesTheStatusWritersOfItsPass).
-			exitWrite(dispatcherJobModeCondition, r.syncDispatcherJobMode(ctx, instance, dispatcherJobMode))
-		}()
+		if retErr == nil {
+			retErr = err
+			return
+		}
+		// The reconcile is already failing and will requeue. If the
+		// failure is already a PlatformAgent conflict being requeued cleanly,
+		// a subsequent conflict writing the condition is the same race
+		// and should not log an Error with a stack trace.
+		if isPlatformAgentConflict(retErr) && errors.IsConflict(err) {
+			log.Info("Conflict writing "+condition+"; pass already requeuing on conflict", "error", err)
+		} else {
+			log.Error(err, "could not write "+condition)
+		}
 	}
+	defer func() {
+		exitWrite(busCredentialsReadyCondition, r.syncBusCredentialsReady(ctx, instance, true, busCredsMapVersion))
+		exitWrite(dispatcherCeilingCondition, r.syncDispatcherCeiling(ctx, instance, dispatcherCeiling))
+		// Last, so it outlives every status writer of its pass
+		// (TestDispatcherJobModeOutlivesTheStatusWritersOfItsPass).
+		exitWrite(dispatcherJobModeCondition, r.syncDispatcherJobMode(ctx, instance, dispatcherJobMode))
+	}()
 
 	// 2z. Refuse an override that names one of the operator's own
 	// ServiceAccounts, before step 3 writes it with the broker's Workload
@@ -1400,62 +1387,15 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
-	// The mode gate: `next` additionally renders the A2A stack -- NATS, the
-	// auth callout, the gateway, the capability verifier, the provisioning
-	// Job; `today` keeps the
-	// dark stack dark — including tearing it
-	// back down after a flip, so `mode` absent renders exactly today's stack
-	// rather than today's stack plus leftovers. Version skew touches NEITHER
-	// branch: renderMode fails closed to today, and letting that reach
-	// cleanupA2A would have a one-version operator rollback tear down a live
-	// bus that a newer CRD's mode legitimately rendered. Skew is a status
-	// problem (below), not a rendering instruction.
-	var a2aState a2aProvisionState
-	a2aNext := a2aStackRendering(instance)
-	if a2aNext {
-		a2aState, err = r.reconcileA2A(ctx, instance, homeRec)
-		// For the deferred write at 2d, failed pass or not: a step after
-		// the dispatcher's failing doesn't undo what it did to Job mode.
-		dispatcherJobMode = a2aState.dispatcherJobMode
-		dispatcherCeiling = a2aState.dispatcherCeiling
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-	} else if modeErr == nil {
-		tornDown, err := r.cleanupA2AWithJobMode(ctx, instance)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		// Under today the operator writes nothing in the profile namespace,
-		// and a chart upgrade after a flip from next removes it with its
-		// RoleBinding. The fence pass that would forget it never runs here,
-		// so forget it on this branch, or the self-check keeps probing a
-		// namespace this agent no longer writes in and reports it denied.
-		r.RBAC.Forget(profileNamespaceName(instance))
-		// The bus is torn down but its data claims are kept, so that a flip
-		// back reuses them, and so is the count it last ran at (#5451): with
-		// no record, the flip back reads the claims, and a single server once
-		// scaled by hand keeps claims -1 and -2 under WhenScaled Retain,
-		// which read as three servers over a one-server store and recreate
-		// every stream empty. resolveA2ABusReplicas reads the record only
-		// while a bus exists to keep (a StatefulSet or labelled claims), so a
-		// record kept here cannot bring back a bus whose claims are gone.
-		// The writers are told the value the CR carries, so the kept field
-		// reads current and no pass writes status on its account.
-		a2aState.busReplicasPersisted = instance.Status.BusReplicas
-		// The dispatcher and its Job mode went with the stack, unless their
-		// profile-namespace teardown failed: then the Jobs Role and templates
-		// are still live and the condition stays as it was.
-		if tornDown {
-			dispatcherJobMode = jobModeTornDown
-		}
-		// No dispatcher without the stack, so no ceiling to report.
-		dispatcherCeiling = dispatcherCeilingRemoved
-		// No callout, so no claim about its map: the condition goes.
-		removed := a2aIdentityMapRemoved
-		a2aState.calloutMap = &removed
-		// No bus, so no meta group: its condition goes too.
-		a2aState.busMeta = a2aBusMetaState{checked: true}
+	// The A2A stack: NATS, the auth callout, the gateway, the capability
+	// verifier, the provisioning Job and the tiers. Every install renders it.
+	a2aState, err := r.reconcileA2A(ctx, instance, homeRec)
+	// For the deferred write at 2d, failed pass or not: a step after
+	// the dispatcher's failing doesn't undo what it did to Job mode.
+	dispatcherJobMode = a2aState.dispatcherJobMode
+	dispatcherCeiling = a2aState.dispatcherCeiling
+	if err != nil {
+		return ctrl.Result{}, err
 	}
 	// The record travelled into the render (the projection) and travels on
 	// the state to every status writer below, the failed and parked paths
@@ -1466,23 +1406,9 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// The version this pass rendered, for the deferred write at 2d. Empty on
 	// every path that did not get here, where the write reads it back off the
 	// ConfigMap the callout watches instead.
-	if a2aNext {
-		busCredsMapVersion = a2aState.AuthMapVersion
-	}
+	busCredsMapVersion = a2aState.AuthMapVersion
 
-	// 9. Update status phase. While the mode is unrecognized the phase is
-	// Degraded with a named reason — silently rendering today at that point
-	// would leave nothing in `kubectl describe` saying the cluster runs
-	// something other than what the spec asks. Requeue: the skew resolves by
-	// an operator upgrade or a spec correction, neither of which is an event
-	// on this object's watches.
-	if modeErr != nil {
-		msg := modeErr.Error() + " (version skew); rendering today's stack until the operator is upgraded or spec.mode is corrected"
-		if statusErr := r.updateStatusDegraded(ctx, instance, "ModeNotRecognized", msg, workloadRendered); statusErr != nil {
-			return ctrl.Result{}, statusErr
-		}
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
-	}
+	// 9. Update status phase.
 	if a2aState.failed {
 		// The render-derived conditions first (syncA2AConditions): this
 		// pass withheld or lit the gateway and may have seen an earlier
@@ -1509,11 +1435,9 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// Secret write in the namespace.
 	if reason, msg := r.checkShellSandboxKeys(ctx, instance); reason != "" {
 		log.Info(msg)
-		// Same as the failed-Job path: a next install can sit here for
-		// days, and its render-derived conditions have to follow the
-		// renders it keeps doing. Under today it is the pass that removes
-		// the next-mode conditions a flip left behind; on a today install
-		// that never had them it writes nothing.
+		// Same as the failed-Job path: an install can sit here for days,
+		// and its render-derived conditions have to follow the renders it
+		// keeps doing.
 		if err := r.syncA2AConditions(ctx, instance, a2aState); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -1562,7 +1486,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// settles, so the pass that sees it settle has to be scheduled.
 	// a2aBusNeedsRecheck adds a bus server short of the count while a
 	// quorum serves, for the same reason.
-	if a2aNext && r.a2aBusNeedsRecheck(ctx, instance, a2aState) {
+	if r.a2aBusNeedsRecheck(ctx, instance, a2aState) {
 		requeue := a2aPendingRequeue
 		// A held-back Lease recreate can be due sooner (ensureA2AGatewayLease).
 		if a2aState.leaseRequeue > 0 {
@@ -1571,6 +1495,10 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// So can a pending bus reload's recheck (planA2ABusReload).
 		if a2aState.busReloadRequeue > 0 {
 			requeue = min(requeue, a2aState.busReloadRequeue)
+		}
+		// And a profile held for the bus's config (a2aDispatchableProfiles).
+		if a2aState.profileHoldRequeue > 0 {
+			requeue = min(requeue, a2aState.profileHoldRequeue)
 		}
 		// So can the TASKS wait's threshold pass (a2aGatewayTasksWaitMessage).
 		return ctrl.Result{RequeueAfter: minPositive(tasksWaitRequeue, requeue)}, nil
@@ -1592,6 +1520,10 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// And a bus config reload still pending (planA2ABusReload).
 		if a2aState.busReloadRequeue > 0 {
 			requeue = min(requeue, a2aState.busReloadRequeue)
+		}
+		// And a profile held for the bus's config (a2aDispatchableProfiles).
+		if a2aState.profileHoldRequeue > 0 {
+			requeue = min(requeue, a2aState.profileHoldRequeue)
 		}
 		if credentialProxyExecShort(instance) {
 			requeue = min(requeue, credentialProxyExecShortRequeue)
@@ -1641,23 +1573,28 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// The scope publisher's next run, or the moment its document goes stale:
 	// Jobs are not watched, so the pass that starts the run and the pass
 	// that turns ScopeResolved False have to be asked for.
-	if a2aNext && a2aState.scopeRequeue > 0 {
+	if a2aState.scopeRequeue > 0 {
 		requeueAfter = min(requeueAfter, a2aState.scopeRequeue)
 	}
 	// A deleted gateway Lease whose recreate is being held back: nothing
 	// else wakes the pass that creates it.
-	if a2aNext && a2aState.leaseRequeue > 0 {
+	if a2aState.leaseRequeue > 0 {
 		requeueAfter = min(requeueAfter, a2aState.leaseRequeue)
 	}
 	// A bus pod stuck on an old revision inside its grace period: the pass
 	// that replaces it has to be asked for, since pods are not watched.
-	if a2aNext && a2aState.busPodRequeue > 0 {
+	if a2aState.busPodRequeue > 0 {
 		requeueAfter = min(requeueAfter, a2aState.busPodRequeue)
 	}
 	// A bus config reload not yet confirmed: nothing watched moves when the
 	// bus's config_load_time does.
-	if a2aNext && a2aState.busReloadRequeue > 0 {
+	if a2aState.busReloadRequeue > 0 {
 		requeueAfter = min(requeueAfter, a2aState.busReloadRequeue)
+	}
+	// A newly bound profile held until every bus server has loaded its
+	// config: a single server's reload landing moves nothing watched.
+	if a2aState.profileHoldRequeue > 0 {
+		requeueAfter = min(requeueAfter, a2aState.profileHoldRequeue)
 	}
 	// An exec tier short of its count: the scheduler's verdict lands on a pod,
 	// which is not watched, so the pass that reads it has to be asked for.
@@ -1740,8 +1677,8 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 		// Left behind, it is a standing grant of tokenreviews/create and
 		// subjectaccessreviews/create to a ServiceAccount name in a namespace,
 		// surviving the workload it was minted for — so anyone who can later
-		// create a ServiceAccount of that name inherits it. cleanupA2A reaps it
-		// on a mode flip; this is the other way the stack can go away.
+		// create a ServiceAccount of that name inherits it. This is the one
+		// way the stack goes away.
 		if err := r.deleteA2ACalloutClusterRoleBinding(ctx, agent); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -2929,13 +2866,13 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 		return err
 	}
 	opts.heldGitHubOrg = held
-	if a2aStackRendering(agent) && !r.agentProfilesUnreadable {
+	if !r.agentProfilesUnreadable {
 		profiles, err := boundAgentProfiles(ctx, r.Client, agent, r.tiersUnreadable)
 		if err != nil {
 			return err
 		}
 		opts.enabledProfiles = enabledAgentProfileNames(agent, profiles)
-	} else if a2aAgentSurface(agent) {
+	} else {
 		heldProfiles, err := r.heldEnabledProfiles(ctx, agent)
 		if err != nil {
 			return err
@@ -3085,10 +3022,9 @@ func (r *PlatformAgentReconciler) heldGitHubOrg(ctx context.Context, agent *agen
 }
 
 // heldEnabledProfiles returns the KUBE_AGENTS_ENABLED_PROFILES value the live
-// gateway carries when the A2A agent surface is kept (`a2aAgentSurface`) but
-// the AgentProfile list cannot be freshly rendered (version skew or
-// `agentProfilesUnreadable`), so the gateway pod is not rolled and an already
-// enabled optional Hermes profile (`tse`) is not archived during skew.
+// gateway carries when the AgentProfile list cannot be freshly rendered
+// (`agentProfilesUnreadable`), so the gateway pod is not rolled and an already
+// enabled optional Hermes profile (`tse`) is not archived meanwhile.
 func (r *PlatformAgentReconciler) heldEnabledProfiles(ctx context.Context, agent *agentv1alpha1.PlatformAgent) ([]string, error) {
 	val, err := r.heldGatewayEnvValue(ctx, agent, enabledProfilesEnvVar, "")
 	if err != nil || val == "" {
@@ -3891,38 +3827,21 @@ func (r *PlatformAgentReconciler) reconcileAgentNetworkGuardrails(ctx context.Co
 	if err := r.reconcileAgentEgressPolicy(ctx, agent, r.agentEgressDNSClusterIPs(ctx, agent, netpolProf), otlpEndpoint); err != nil {
 		errs = append(errs, err)
 	}
-	if a2aStackRendering(agent) {
-		// No server count is resolved here: this path does not reconcile the
-		// bus, so it must not write status.busReplicas or announce a
-		// conversion, and the bus fence does not depend on the count.
-		if _, _, err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
-			var pnErr *profileNamespaceError
-			if goerrors.As(err, &pnErr) {
-				r.profileNamespaceFailure(ctx, agent, "fence", pnErr.err)
-			} else {
-				errs = append(errs, err)
-			}
+	// No server count is resolved here: this path does not reconcile the
+	// bus, so it must not write status.busReplicas or announce a
+	// conversion, and the bus fence does not depend on the count.
+	if _, _, err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
+		var pnErr *profileNamespaceError
+		if goerrors.As(err, &pnErr) {
+			r.profileNamespaceFailure(ctx, agent, "fence", pnErr.err)
+		} else {
+			errs = append(errs, err)
 		}
 	}
 	if err := r.reconcileLiteLLMNetworkPolicy(ctx, agent, netpolProf); err != nil {
 		errs = append(errs, err)
 	}
 	return goerrors.Join(errs...)
-}
-
-// a2aStackRendering is the gate reconcileA2A sits behind, as a predicate rather
-// than an expression at its one call site, because the refusal paths above have
-// to ask the same question and two spellings of it would be two things to keep
-// true. resolveMode and renderMode are both pure functions of the CR, so asking
-// twice in one reconcile costs nothing and cannot disagree.
-//
-// modeErr is part of the gate, not noise beside it: an unrecognised spec.mode is
-// the version skew described at the call site, and skew deliberately renders
-// neither branch. A refusal during a freeze must not start asserting fences the
-// unfrozen path would not have touched.
-func a2aStackRendering(agent *agentv1alpha1.PlatformAgent) bool {
-	_, modeErr := resolveMode(agent)
-	return modeErr == nil && renderMode(agent, "nats") == ModeNext
 }
 
 // agentEgressDNSClusterIPs is the resolved cluster DNS VIP list for the agent
@@ -4473,98 +4392,91 @@ func (r *PlatformAgentReconciler) readSplitWorkloads(ctx context.Context, agent 
 	// the namespace. The hold stays; it stops being silent. BusCredentialsReady is
 	// not the signal for it: that condition asks for every replica, so it reads
 	// False through holds the gate has already released.
-	//
-	// a2aStackRendering, not a2aAgentSurface: this has to be the same predicate as
-	// whatever creates the Deployment. On version skew the A2A objects are frozen
-	// rather than reconciled, and that CR is already Degraded for the skew itself --
-	// a second reason to hold Ready there would report the freeze as a fault.
 	gatewayCond := ""
-	if a2aStackRendering(agent) {
-		// The rest of the stack the mode renders counts too (#1701): a next
-		// install whose NATS is not up, whose callout serves nothing, or
-		// whose bus was never provisioned cannot serve an A2A request either,
-		// and until these were counted the CR read Ready over every one of
-		// those states (quota refusals, image pulls, a Job burning its
-		// backoff). NATS and the callout are read here; the Job's answer
-		// arrives in a2a from the pass's own read of it (below).
-		nats := &appsv1.StatefulSet{}
-		natsName := a2aNATSName(agent)
-		if err := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: natsName}, nats); err != nil {
-			if !errors.IsNotFound(err) {
-				return nil, "", fmt.Errorf("failed to get A2A NATS StatefulSet for status update: %w", err)
-			}
-			nats.Status.ReadyReplicas = 0
+	// The rest of the stack the mode renders counts too (#1701): a next
+	// install whose NATS is not up, whose callout serves nothing, or
+	// whose bus was never provisioned cannot serve an A2A request either,
+	// and until these were counted the CR read Ready over every one of
+	// those states (quota refusals, image pulls, a Job burning its
+	// backoff). NATS and the callout are read here; the Job's answer
+	// arrives in a2a from the pass's own read of it (below).
+	nats := &appsv1.StatefulSet{}
+	natsName := a2aNATSName(agent)
+	if err := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: natsName}, nats); err != nil {
+		if !errors.IsNotFound(err) {
+			return nil, "", fmt.Errorf("failed to get A2A NATS StatefulSet for status update: %w", err)
 		}
-		callout := &appsv1.Deployment{}
-		calloutName := a2aCalloutName(agent)
-		if err := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: calloutName}, callout); err != nil {
-			if !errors.IsNotFound(err) {
-				return nil, "", fmt.Errorf("failed to get A2A auth callout Deployment for status update: %w", err)
-			}
-			callout.Status.ReadyReplicas = 0
+		nats.Status.ReadyReplicas = 0
+	}
+	callout := &appsv1.Deployment{}
+	calloutName := a2aCalloutName(agent)
+	if err := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: calloutName}, callout); err != nil {
+		if !errors.IsNotFound(err) {
+			return nil, "", fmt.Errorf("failed to get A2A auth callout Deployment for status update: %w", err)
 		}
-		// The Job counts until the bus has been provisioned once. After that a
-		// Job that is absent or running again is the TTL re-run (the finished
-		// Job is removed a day after completion and create-if-absent builds
-		// it again; a2aProvisionJobName's comment) or a digest change, both
-		// of which re-run an idempotent script against a bus that is already
-		// there, and neither should flip a Ready install to Provisioning for
-		// the minute it takes. "Provisioned once" is the BusProvisioned
-		// condition, which only a pass that saw the Job complete writes
-		// (updateStatusReady, below); this pass's own sighting counts too, so
-		// the first completion is Ready on the pass that sees it. Not the
-		// Ready condition: an install upgraded from an operator that never
-		// counted the Job carries a Ready=True that says nothing about the
-		// bus, and a latch seeded from it would never count the Job at all.
-		// The Job itself is not read again here; reconcileA2A read it this
-		// pass and a2a carries the answer. A Failed Job is
-		// A2AProvisionFailed's, before this runs.
-		jobName := a2a.jobName
-		if jobName == "" {
-			jobName = strings.TrimSuffix(agent.Name+a2aProvisionJobNameInfix, "-")
-		}
-		var provisioned int32
-		if a2a.done || busProvisioned(agent) {
-			provisioned = 1
-		}
-		workloads = append(workloads,
-			splitWorkloadStatus{name: natsName, kind: "StatefulSet", ready: a2aNATSServingReplicas(nats)},
-			splitWorkloadStatus{name: calloutName, kind: "Deployment", ready: callout.Status.ReadyReplicas},
-			splitWorkloadStatus{name: jobName, kind: "Job", ready: provisioned},
-		)
+		callout.Status.ReadyReplicas = 0
+	}
+	// The Job counts until the bus has been provisioned once. After that a
+	// Job that is absent or running again is the TTL re-run (the finished
+	// Job is removed a day after completion and create-if-absent builds
+	// it again; a2aProvisionJobName's comment) or a digest change, both
+	// of which re-run an idempotent script against a bus that is already
+	// there, and neither should flip a Ready install to Provisioning for
+	// the minute it takes. "Provisioned once" is the BusProvisioned
+	// condition, which only a pass that saw the Job complete writes
+	// (updateStatusReady, below); this pass's own sighting counts too, so
+	// the first completion is Ready on the pass that sees it. Not the
+	// Ready condition: an install upgraded from an operator that never
+	// counted the Job carries a Ready=True that says nothing about the
+	// bus, and a latch seeded from it would never count the Job at all.
+	// The Job itself is not read again here; reconcileA2A read it this
+	// pass and a2a carries the answer. A Failed Job is
+	// A2AProvisionFailed's, before this runs.
+	jobName := a2a.jobName
+	if jobName == "" {
+		jobName = strings.TrimSuffix(agent.Name+a2aProvisionJobNameInfix, "-")
+	}
+	var provisioned int32
+	if a2a.done || busProvisioned(agent) {
+		provisioned = 1
+	}
+	workloads = append(workloads,
+		splitWorkloadStatus{name: natsName, kind: "StatefulSet", ready: a2aNATSServingReplicas(nats)},
+		splitWorkloadStatus{name: calloutName, kind: "Deployment", ready: callout.Status.ReadyReplicas},
+		splitWorkloadStatus{name: jobName, kind: "Job", ready: provisioned},
+	)
 
-		gateway := &appsv1.Deployment{}
-		gatewayName := a2aGatewayName(agent)
-		if err := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: gatewayName}, gateway); err != nil {
-			if !errors.IsNotFound(err) {
-				return nil, "", fmt.Errorf("failed to get A2A gateway Deployment for status update: %w", err)
-			}
-			// Absent: the callout gate is holding it (or the API server has
-			// not served the apply back yet), and it counts as not ready.
-			// The render confirmed a waking gateway live, so a miss here is
-			// this read's lag, and the condition stays.
-			if a2a.gatewayWaking {
-				gatewayCond = a2aGatewayWakingMessage
-			}
-			workloads = append(workloads, splitWorkloadStatus{name: gatewayName, kind: "Deployment", ready: 0})
-		} else {
-			// Coming back from dark (an upgraded install): the condition
-			// stays until a replica is ready, by this read rather than the
-			// render's, so a pod that turned ready since the render clears
-			// it on this pass.
-			if a2a.gatewayWaking && gateway.Status.ReadyReplicas == 0 {
-				gatewayCond = a2aGatewayWakingMessage
-			}
-			// Elected replicas: Ready follows the leader, which alone binds
-			// the relay, rather than a standby that reads Ready
-			// (a2aGatewayReadyByLeader).
-			ready, leader, recheck := r.a2aGatewayReadyByLeader(ctx, agent, gateway, time.Now())
-			w := splitWorkloadStatus{name: gatewayName, kind: "Deployment", ready: ready, recheck: recheck}
-			if leader != "" {
-				w.detail = "(elected leader " + leader + " not ready)"
-			}
-			workloads = append(workloads, w)
+	gateway := &appsv1.Deployment{}
+	gatewayName := a2aGatewayName(agent)
+	if err := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: gatewayName}, gateway); err != nil {
+		if !errors.IsNotFound(err) {
+			return nil, "", fmt.Errorf("failed to get A2A gateway Deployment for status update: %w", err)
 		}
+		// Absent: the callout gate is holding it (or the API server has
+		// not served the apply back yet), and it counts as not ready.
+		// The render confirmed a waking gateway live, so a miss here is
+		// this read's lag, and the condition stays.
+		if a2a.gatewayWaking {
+			gatewayCond = a2aGatewayWakingMessage
+		}
+		workloads = append(workloads, splitWorkloadStatus{name: gatewayName, kind: "Deployment", ready: 0})
+	} else {
+		// Coming back from dark (an upgraded install): the condition
+		// stays until a replica is ready, by this read rather than the
+		// render's, so a pod that turned ready since the render clears
+		// it on this pass.
+		if a2a.gatewayWaking && gateway.Status.ReadyReplicas == 0 {
+			gatewayCond = a2aGatewayWakingMessage
+		}
+		// Elected replicas: Ready follows the leader, which alone binds
+		// the relay, rather than a standby that reads Ready
+		// (a2aGatewayReadyByLeader).
+		ready, leader, recheck := r.a2aGatewayReadyByLeader(ctx, agent, gateway, time.Now())
+		w := splitWorkloadStatus{name: gatewayName, kind: "Deployment", ready: ready, recheck: recheck}
+		if leader != "" {
+			w.detail = "(elected leader " + leader + " not ready)"
+		}
+		workloads = append(workloads, w)
 	}
 
 	return workloads, gatewayCond, nil
@@ -4683,9 +4595,6 @@ func setA2AGatewayCondition(agent *agentv1alpha1.PlatformAgent, msg string, now 
 // An absent Deployment is a real answer (not ready is false; see above) and a
 // read error is not, so NotFound is not folded in with the rest.
 func (r *PlatformAgentReconciler) a2aVerifierNotReady(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (notReady, known bool) {
-	if !a2aStackRendering(agent) {
-		return false, true
-	}
 	verifier := &appsv1.Deployment{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: a2aVerifierName(agent)}, verifier); err != nil {
 		if errors.IsNotFound(err) {
@@ -4735,10 +4644,9 @@ func setA2AVerifierCondition(agent *agentv1alpha1.PlatformAgent, notReady, known
 }
 
 // wantBusProvisioned is the provisioned-once record's desired presence:
-// sticky under next once this pass or an earlier one saw the Job complete,
-// absent under today, where the flip's teardown took the bus with it.
+// sticky once this pass or an earlier one saw the Job complete.
 func wantBusProvisioned(agent *agentv1alpha1.PlatformAgent, a2a a2aProvisionState) bool {
-	return a2aStackRendering(agent) && (a2a.done || busProvisioned(agent))
+	return a2a.done || busProvisioned(agent)
 }
 
 // busProvisionedConditionCurrent reports whether the CR already carries the
@@ -4909,7 +4817,7 @@ func (r *PlatformAgentReconciler) liveAgentSatisfies(ctx context.Context, agent 
 // A2A gateway's TASKS wait needs (0 for none; a2aGatewayTasksWaitMessage). otlpEndpoint, otlpSource,
 // and netpolProfile are the resolved telemetry and network policy wiring; they are reported
 // rather than derived because discovery is otherwise invisible to anyone reading the CR.
-// a2a is what reconcileA2A found this pass (zero on a today install): whether the
+// a2a is what reconcileA2A found this pass: whether the
 // provisioning Job is complete and what it is called, so the status write neither
 // re-reads the Job nor re-renders it to learn its name.
 func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *agentv1alpha1.PlatformAgent, otlpEndpoint, otlpSource string, netpolProfile netpolProfile, a2a a2aProvisionState) (string, time.Duration, error) {
@@ -5031,15 +4939,13 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		condStatus = metav1.ConditionTrue
 		condReason = "Reconciled"
 		condMsg = "Gateway, shell sandbox and credential broker are all ready"
-		if a2aStackRendering(agent) {
-			condMsg = "Gateway, shell sandbox, credential broker, NATS, auth callout, bus provisioning and A2A gateway are all ready"
-			// A quorum serves, so Ready stands, but a server short of
-			// the configured count is a bus one failure from an outage
-			// and is said here: the pod scan below does not run on a
-			// Ready pass.
-			if note := r.a2aNATSShortNote(ctx, agent); note != "" {
-				condMsg += ". " + note
-			}
+		condMsg = "Gateway, shell sandbox, credential broker, NATS, auth callout, bus provisioning and A2A gateway are all ready"
+		// A quorum serves, so Ready stands, but a server short of
+		// the configured count is a bus one failure from an outage
+		// and is said here: the pod scan below does not run on a
+		// Ready pass.
+		if note := r.a2aNATSShortNote(ctx, agent); note != "" {
+			condMsg += ". " + note
 		}
 	case errWorkload == nil:
 		// The bucket question the scan asks is "has this install ever
@@ -5625,11 +5531,10 @@ func homeChannelUnsetMessage(agent *agentv1alpha1.PlatformAgent, rec homeChannel
 }
 
 // noChatPlatformMsg is the NoChatPlatform condition's message for this spec,
-// or "" when the condition is to be absent: the install is not on the next
-// stack, or has a chat platform (HomeChannelUnset then says what a missing
-// home channel costs).
+// or "" when the condition is to be absent: the install has a chat platform
+// (HomeChannelUnset then says what a missing home channel costs).
 func noChatPlatformMsg(agent *agentv1alpha1.PlatformAgent) string {
-	if renderMode(agent, "gateway") != ModeNext || googleChatEnabled(agent) || slackEnabled(agent) {
+	if googleChatEnabled(agent) || slackEnabled(agent) {
 		return ""
 	}
 	where := noChatPlatformNoRepo
@@ -6103,14 +6008,7 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 	// Last rather than first: the ordering above is load-bearing, and an install
 	// faulting in more than one workload has to keep reporting the sentence it
 	// always did.
-	//
-	// a2aStackRendering, the same predicate readSplitWorkloads gates on and the same
-	// one that renders the Deployment: a today install has no such pod, and a skewed
-	// one has its A2A objects frozen and is already Degraded/ModeNotRecognized for
-	// the skew itself -- a second reason there would report the freeze as a fault.
-	if a2aStackRendering(agent) {
-		selectors = append(selectors, map[string]string{"app": a2aGatewayName(agent)})
-	}
+	selectors = append(selectors, map[string]string{"app": a2aGatewayName(agent)})
 
 	// The verifier, for the opposite reason to the gateway's and so worth its own
 	// paragraph: it is scanned precisely because it does NOT gate Ready.
@@ -6137,9 +6035,7 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 	// turns a Provisioning into a Degraded an operator will act on. That is
 	// wanted for an unoverridden image and wrong for the bucket wait, and the
 	// pod loop below draws the line.
-	if a2aStackRendering(agent) {
-		selectors = append(selectors, map[string]string{"app": a2aVerifierName(agent)})
-	}
+	selectors = append(selectors, map[string]string{"app": a2aVerifierName(agent)})
 
 	// The bus's servers. On a multi-server bus the StatefulSet counts toward
 	// Ready once a quorum serves (a2aNATSServingReplicas), so a server stuck
@@ -6147,9 +6043,7 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 	// the CR Ready; updateStatusReady's message names it then
 	// (a2aNATSShortNote). While the CR is not Ready, this scan carries the
 	// pod's reason to the status.
-	if a2aStackRendering(agent) {
-		selectors = append(selectors, map[string]string{"app": a2aNATSName(agent)})
-	}
+	selectors = append(selectors, map[string]string{"app": a2aNATSName(agent)})
 
 	pods := make([]corev1.Pod, 0)
 	// A read that failed is not a selector that matched nothing, and since
@@ -6172,10 +6066,9 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 	//
 	// Only a fault this scan itself wrote, though, which is what the message
 	// prefixes test. Degraded with Ready=False is also what Reconcile's
-	// refusals write (ShellSandboxKeysMissing, ModeNotRecognized,
-	// A2AProvisionFailed) and what this pass's own git checks write, and those
-	// clear on evidence this pass has already gathered -- the Secret now
-	// exists, the mode was corrected. Re-asserting one of those because a Pod
+	// refusals write (ShellSandboxKeysMissing, A2AProvisionFailed) and what
+	// this pass's own git checks write, and those clear on evidence this pass
+	// has already gathered -- the Secret now exists. Re-asserting one of those because a Pod
 	// list got a 429 would contradict a check that ran, and on a spec edit the
 	// generation witness forces the write out, stamping a refusal as current
 	// against the generation that fixed it.
@@ -6419,8 +6312,8 @@ const (
 	// render, which returns with the workload untouched:
 	// EgressAllowlistRefused.
 	workloadNotRendered
-	// workloadRendered is the three refusals below the render:
-	// ModeNotRecognized, A2AProvisionFailed, ShellSandboxKeysMissing.
+	// workloadRendered is the two refusals below the render:
+	// A2AProvisionFailed, ShellSandboxKeysMissing.
 	workloadRendered
 )
 

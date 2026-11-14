@@ -26,10 +26,8 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
@@ -257,7 +255,7 @@ func TestCredentialProxyProfileConfigFor(t *testing.T) {
 	}
 }
 
-// No profile namespace, no profiles, or a today install: nothing to render.
+// No profile namespace, or no profiles: nothing to render.
 func TestCredentialProxyProfileConfigForRendersNothingWithoutProfiles(t *testing.T) {
 	scheme := setupScheme()
 	ctx := context.Background()
@@ -272,41 +270,6 @@ func TestCredentialProxyProfileConfigForRendersNothingWithoutProfiles(t *testing
 	noProfiles := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, profileNamespaceObject(agent)).Build()
 	if cfg, err := (&PlatformAgentReconciler{Client: noProfiles, Scheme: scheme}).credentialProxyProfileConfigFor(ctx, agent); err != nil || cfg.enabled() {
 		t.Errorf("no profiles: %+v, %v", cfg, err)
-	}
-
-	today := a2aTestAgent()
-	today.Spec.Mode = ptr.To("today")
-	todayClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(today, &profile, profileNamespaceObject(today)).Build()
-	if cfg, err := (&PlatformAgentReconciler{Client: todayClient, Scheme: scheme}).credentialProxyProfileConfigFor(ctx, today); err != nil || cfg.enabled() {
-		t.Errorf("a today install: %+v, %v", cfg, err)
-	}
-}
-
-// The broker's reconcile (step 11) ensures the task-signing key ahead of
-// every other A2A write, so a next render that dies between the broker and
-// reconcileA2A leaves that Secret alone. The flip to today must still tear it
-// down: it is one of cleanupA2A's sentinels.
-func TestTheFlipToTodayRemovesALoneTaskSigningKey(t *testing.T) {
-	scheme := setupScheme()
-	agent := a2aTestAgent()
-	agent.UID = "agent-uid"
-	profile := testAgentProfile(agent.Namespace, "auditor")
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, &profile, profileNamespaceObject(agent)).Build()
-	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
-	ctx := context.Background()
-
-	if _, err := r.credentialProxyProfileConfigFor(ctx, agent); err != nil {
-		t.Fatalf("credentialProxyProfileConfigFor: %v", err)
-	}
-	key := types.NamespacedName{Namespace: agent.Namespace, Name: a2aTaskSigningKeyName(agent)}
-	if err := cl.Get(ctx, key, &corev1.Secret{}); err != nil {
-		t.Fatalf("the task-signing key Secret was not ensured: %v", err)
-	}
-	if err := r.cleanupA2A(ctx, agent); err != nil {
-		t.Fatalf("cleanupA2A: %v", err)
-	}
-	if err := cl.Get(ctx, key, &corev1.Secret{}); !apierrors.IsNotFound(err) {
-		t.Errorf("the task-signing key Secret survived the flip to today (err=%v): the early exit stepped over it", err)
 	}
 }
 

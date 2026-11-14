@@ -145,12 +145,13 @@ func TestTheGatewayWaitForTasksIsReadFromItsPods(t *testing.T) {
 		t.Error("a BusProvisioned=False install read as a gateway waiting for TASKS")
 	}
 
-	// A today install renders no A2A gateway, so nothing it lists is one.
-	today := a2aTestAgent()
-	today.Spec.Mode = nil
-	provisionedAt(today, now.Add(-time.Hour))
-	if _, waiting := a2aGatewayTasksWait(today, []corev1.Pod{*a2aGatewayPod(today, "gw-1", ago(time.Hour), false)}); waiting {
-		t.Error("a today install read as a gateway waiting for TASKS")
+	// A CR with no spec.mode renders the stack like any other (the CRD defaults
+	// the field), so its gateway waits like any other.
+	modeless := a2aTestAgent()
+	modeless.Spec.Mode = nil
+	provisionedAt(modeless, now.Add(-time.Hour))
+	if _, waiting := a2aGatewayTasksWait(modeless, []corev1.Pod{*a2aGatewayPod(modeless, "gw-1", ago(time.Hour), false)}); !waiting {
+		t.Error("a mode-less install did not read as a gateway waiting for TASKS")
 	}
 }
 

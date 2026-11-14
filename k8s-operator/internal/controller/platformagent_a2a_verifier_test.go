@@ -26,7 +26,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
@@ -354,9 +353,9 @@ func TestTheVerifierBudgetSelectsTheDeploymentItBudgets(t *testing.T) {
 		t.Errorf("the platform budget selects the verifier pods %v; a drain would charge a verifier eviction to the gateway's allowance", verifierPods)
 	}
 
-	// Labelled as part of the next stack, which is how the residue sweep and
-	// the flip to today find it. A budget stamped only with the default
-	// part-of would be invisible to both and survive the flip.
+	// Labelled as part of the A2A stack, which is how the residue sweep
+	// finds it. A budget stamped only with the default part-of would be
+	// invisible to it.
 	if got := pdb.Labels[labelPartOf]; got != a2aPartOf {
 		t.Errorf("budget part-of label = %q, want %q; the teardown sweep lists by that label", got, a2aPartOf)
 	}
@@ -532,11 +531,9 @@ func TestReconcileA2AVerifierRecoversFromAForeignBudgetField(t *testing.T) {
 }
 
 // The darkness property for the budget by name. The label sweep in
-// TestNothingA2ALabelledSurvivesAFlipToToday lists PodDisruptionBudgets too
-// and is what catches a budget nobody added to the teardown; this is the
-// verifier-specific statement a reader of #2058 looks for — rendered under
-// next, gone under today — through the full Reconcile rather than the step.
-func TestTheVerifierBudgetComesAndGoesWithTheMode(t *testing.T) {
+// The verifier-specific statement a reader of #2058 looks for: the budget is
+// rendered through the full Reconcile rather than the step.
+func TestTheVerifierBudgetIsRenderedThroughReconcile(t *testing.T) {
 	ctx := context.Background()
 	scheme := setupScheme()
 	agent := a2aTestAgent()
@@ -554,27 +551,10 @@ func TestTheVerifierBudgetComesAndGoesWithTheMode(t *testing.T) {
 	// Two passes: the first adds the finalizer, the second renders.
 	for i := 0; i < 2; i++ {
 		if _, err := r.Reconcile(ctx, req); err != nil {
-			t.Fatalf("Reconcile %d under next: %v", i+1, err)
+			t.Fatalf("Reconcile %d: %v", i+1, err)
 		}
 	}
-	pdb := &policyv1.PodDisruptionBudget{}
-	if err := cl.Get(ctx, key, pdb); err != nil {
-		t.Fatalf("no verifier budget under mode next: %v", err)
-	}
-
-	fresh := &agentv1alpha1.PlatformAgent{}
-	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
-		t.Fatalf("get agent: %v", err)
-	}
-	fresh.Spec.Mode = nil
-	if err := cl.Update(ctx, fresh); err != nil {
-		t.Fatalf("flip to today: %v", err)
-	}
-	if _, err := r.Reconcile(ctx, req); err != nil {
-		t.Fatalf("Reconcile after the flip: %v", err)
-	}
-	err := cl.Get(ctx, key, &policyv1.PodDisruptionBudget{})
-	if !errors.IsNotFound(err) {
-		t.Errorf("the verifier budget survives a flip to today (get: %v); a budget over no pods is inert residue until the next verifier is scheduled", err)
+	if err := cl.Get(ctx, key, &policyv1.PodDisruptionBudget{}); err != nil {
+		t.Fatalf("no verifier budget after the render: %v", err)
 	}
 }

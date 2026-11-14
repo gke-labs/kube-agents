@@ -52,7 +52,16 @@ _CHECK_THREE_CONSTANTS = (*_LIFTED_CONSTANTS, "LABEL_DEFAULT", "LABEL_MIRRORED")
 # The env vars the chart renders an image into. The pattern has to match every
 # one of them: a name it misses is an image the operator stamps onto agent pods
 # that no check sees.
-_IMAGE_ENV_NAMES = ("OPERATOR_IMAGE", "PLATFORM_AGENT_IMAGE", "AGENT_SANDBOX_IMAGE", "FLUENT_BIT_IMAGE")
+_IMAGE_ENV_NAMES = (
+    "OPERATOR_IMAGE",
+    "PLATFORM_AGENT_IMAGE",
+    "AGENT_SANDBOX_IMAGE",
+    "FLUENT_BIT_IMAGE",
+    "A2A_NATS_IMAGE",
+    "A2A_PROVISION_IMAGE",
+    "A2A_NATS_RELOADER_IMAGE",
+    "A2A_NATS_EXPORTER_IMAGE",
+)
 
 # What the behavioural tests below cannot reach, because it is top-level script
 # rather than a function: the call that puts the minter through check_toggle,
@@ -65,6 +74,7 @@ _IMAGE_ENV_NAMES = ("OPERATOR_IMAGE", "PLATFORM_AGENT_IMAGE", "AGENT_SANDBOX_IMA
 _CALL_SITES = (
     'check_toggle githubMinter "${MINTER_VALUES[@]}"',
     "--set githubMinter.enabled=true",
+    'check_chart_image_env_rendered "$LABEL_DEFAULT" "$default_render"',
 )
 _GUARDS = (
     '[ -n "$(image_field_refs <<<"$default_render")" ] || {',
@@ -380,6 +390,17 @@ class CheckThreeWiringTest(unittest.TestCase):
         text = _SCRIPT.read_text()
         for call in _CALL_SITES:
             self.assertIn(call, text)
+
+    def test_every_image_env_var_is_required_of_the_default_render(self):
+        """CHART_IMAGE_ENV_NAMES is the list check_chart_image_env_rendered
+        holds the render to; an env var missing from it can drop out of the
+        chart with every check green."""
+        text = _SCRIPT.read_text()
+        start = text.index("readonly CHART_IMAGE_ENV_NAMES=(")
+        block = text[start : text.index(")", start)]
+        for name in _IMAGE_ENV_NAMES:
+            with self.subTest(name=name):
+                self.assertIn(f"\n  {name}\n", block)
 
     def test_script_guards_against_an_extraction_that_matches_nothing(self):
         text = _SCRIPT.read_text()

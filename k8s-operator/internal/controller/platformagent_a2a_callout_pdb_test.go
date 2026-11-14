@@ -24,7 +24,6 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
@@ -233,10 +232,8 @@ func TestReconcileA2ACalloutRecoversFromAForeignBudgetField(t *testing.T) {
 	}
 }
 
-// Rendered under next, gone under today, through the full Reconcile. The
-// label sweep in TestNothingA2ALabelledSurvivesAFlipToToday is what catches a
-// budget nobody added to the teardown; this is the callout-specific statement.
-func TestTheCalloutBudgetComesAndGoesWithTheMode(t *testing.T) {
+// Rendered through the full Reconcile: the callout-specific statement.
+func TestTheCalloutBudgetIsRenderedThroughReconcile(t *testing.T) {
 	ctx := context.Background()
 	scheme := setupScheme()
 	agent := a2aTestAgent()
@@ -253,35 +250,20 @@ func TestTheCalloutBudgetComesAndGoesWithTheMode(t *testing.T) {
 
 	for i := 0; i < 2; i++ {
 		if _, err := r.Reconcile(ctx, req); err != nil {
-			t.Fatalf("Reconcile %d under next: %v", i+1, err)
+			t.Fatalf("Reconcile %d: %v", i+1, err)
 		}
 	}
 	if err := cl.Get(ctx, key, &policyv1.PodDisruptionBudget{}); err != nil {
-		t.Fatalf("no callout budget under mode next: %v", err)
-	}
-
-	fresh := &agentv1alpha1.PlatformAgent{}
-	if err := cl.Get(ctx, req.NamespacedName, fresh); err != nil {
-		t.Fatalf("get agent: %v", err)
-	}
-	fresh.Spec.Mode = nil
-	if err := cl.Update(ctx, fresh); err != nil {
-		t.Fatalf("flip to today: %v", err)
-	}
-	if _, err := r.Reconcile(ctx, req); err != nil {
-		t.Fatalf("Reconcile after the flip: %v", err)
-	}
-	if err := cl.Get(ctx, key, &policyv1.PodDisruptionBudget{}); !errors.IsNotFound(err) {
-		t.Errorf("the callout budget survives a flip to today (get: %v)", err)
+		t.Fatalf("no callout budget after the render: %v", err)
 	}
 }
 
 // The same statements against a real API server: the budget is admitted with
 // both its fields and the owner reference, the spread's matchLabelKeys
 // survives admission (a server with the gate off would drop it silently, and
-// a fake client would never notice), a hand edit to minAvailable made by
-// another field manager is recovered by the next reconcile, and the flip to
-// today deletes the budget. No disruption controller runs under envtest, so
+// a fake client would never notice), and a hand edit to minAvailable made by
+// another field manager is recovered by the next reconcile. No disruption
+// controller runs under envtest, so
 // the budget's status and the eviction API's answers are not exercised here.
 func TestTheCalloutBudgetAndSpreadOnARealAPIServerEnvtest(t *testing.T) {
 	cl, scheme := startEnvtest(t)
@@ -371,15 +353,5 @@ func TestTheCalloutBudgetAndSpreadOnARealAPIServerEnvtest(t *testing.T) {
 	if recovered.Spec.MinAvailable != nil || recovered.Spec.MaxUnavailable == nil || recovered.Spec.MaxUnavailable.IntValue() != 1 {
 		t.Errorf("after the hand edit and a reconcile the budget is maxUnavailable %v / minAvailable %v, want 1 / unset",
 			recovered.Spec.MaxUnavailable, recovered.Spec.MinAvailable)
-	}
-
-	// The flip to today.
-	agent.Spec.Mode = nil
-	if err := cl.Update(ctx, agent); err != nil {
-		t.Fatalf("flip to today: %v", err)
-	}
-	reconcile("today")
-	if err := cl.Get(ctx, key, &policyv1.PodDisruptionBudget{}); !errors.IsNotFound(err) {
-		t.Errorf("the callout budget survives a flip to today on a real API server (get: %v)", err)
 	}
 }

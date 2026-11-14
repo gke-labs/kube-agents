@@ -161,33 +161,6 @@ func TestARenderedBridgeWithNoExecutorSettingRunsTheAPIExecutor(t *testing.T) {
 	}
 }
 
-// Under today nothing is rendered, which is also what ends the rollback
-// crash-loop: there is no bridge left behind to dial a torn-down bus.
-func TestATodayInstallGetsNoBridge(t *testing.T) {
-	// Provisioned first: on the pass that flips to today the CR still carries
-	// BusProvisioned (the end-of-pass status write removes it), so the mode
-	// check is the only thing keeping the bridge out.
-	agent := provisionedAgent()
-	agent.Spec.Mode = ptr.To("today")
-	if got := containersNamed(bridgeTestPod(agent), a2aBridgeContainerName); len(got) != 0 {
-		t.Errorf("a today install renders %d bridge containers", len(got))
-	}
-	agent.Spec.Mode = nil
-	if got := containersNamed(bridgeTestPod(agent), a2aBridgeContainerName); len(got) != 0 {
-		t.Errorf("an install with no mode renders %d bridge containers", len(got))
-	}
-}
-
-// Version skew freezes a running bus rather than tearing it down, so its
-// executor stays, like the agent container's own bus wiring.
-func TestVersionSkewKeepsTheRenderedBridge(t *testing.T) {
-	agent := provisionedAgent()
-	agent.Spec.Mode = ptr.To("later")
-	if got := containersNamed(bridgeTestPod(agent), a2aBridgeContainerName); len(got) != 1 {
-		t.Errorf("version skew renders %d bridge containers, want 1", len(got))
-	}
-}
-
 // A CR that declares its own bridge keeps it, and the operator renders none,
 // so the pod never carries two containers of one name.
 func TestADeclaredBridgeWins(t *testing.T) {
