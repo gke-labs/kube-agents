@@ -46,7 +46,7 @@ func agentProfileCRDBeforeTiers(t *testing.T) (old []byte, full map[string]any) 
 		rules := root["x-kubernetes-validations"].([]any)
 		for i, r := range rules {
 			rule := r.(map[string]any)
-			if strings.Contains(rule["rule"].(string), "? 44 : 50") {
+			if strings.Contains(rule["rule"].(string), "<= 54") {
 				rules[i] = map[string]any{"rule": "self.metadata.name.size() <= 55", "message": "at most 55 characters"}
 				swapped++
 			}

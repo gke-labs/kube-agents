@@ -18410,7 +18410,10 @@ def unwritten_refusal_message(
     notes = notes or {}
     parts = [
         f"{len(unwritten)} finding(s) need their fix written before a `/remediate` "
-        "can open a pull request for them."
+        # The second sentence is #2953: a worker wrote the fixes and then opened them.
+        "can open a pull request for them. Writing a fix opens nothing unless a person's "
+        "`/remediate` already asks for it: it waits in the ledger as awaiting `/remediate`, "
+        "and you run `remediate` only when the request itself asks for fixes to be opened."
         if sweep_off
         else f"{len(unwritten)} finding(s) qualify for an automatic pull request, but "
         "their fix is not written."
@@ -26819,14 +26822,16 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
         log(
             f"{fid}: the collector ran this check on this cluster and emitted no "
             "candidate for this object, so the sweep will not open a pull request "
-            f"on it. Comment `/remediate {fid}` if you have read it and want one."
+            f"on it. A person who has read it and wants one comments `/remediate {fid}`; never you. "
+            "A request that itself asks for fixes to be opened runs `remediate` instead."
         )
     for fid in plan.needs_triage:
         log(
             f"{fid}: the collector flagged this and stands behind it, and marked "
             f"the fix `{triage_reasons.get(fid, '?')}` as needing a judgement it could not make, so the sweep will "
-            f"not open a pull request on it. Comment `/remediate {fid}` once you "
-            "have decided."
+            f"not open a pull request on it. A person comments `/remediate {fid}` once they "
+            "have decided; never you. A request that itself asks for fixes to be opened runs "
+            "`remediate` instead."
         )
     for fid in plan.already_open:
         log(f"{fid} already has an open remediation pull request; not replacing it.")
@@ -26835,8 +26840,8 @@ def _finish(args: argparse.Namespace, audit_id: str) -> dict | None:
         pr = pr_by_finding.get(fid) or {}
         log(
             f"{fid} was requested by a `/remediate` older than the close of "
-            f"#{pr.get('number', '?')}; the close answers the request. Comment "
-            "`/remediate " + fid + "` again to re-open it."
+            f"#{pr.get('number', '?')}; the close answers the request. A person comments "
+            "`/remediate " + fid + "` again to re-open it; never you."
         )
 
     title = issue_title(audit_id, findings)
