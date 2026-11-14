@@ -167,6 +167,26 @@ class ReadScriptTest(unittest.TestCase):
         self.assertNotIn("old", {s["id"] for s in stores["sessions"]})
         self.assertEqual(len(stores["cards"][0]["body"]), 100000)
 
+    def test_the_inject_rows_come_back_by_reason(self):
+        import os
+        import sqlite3
+        import subprocess
+        import sys
+        import tempfile
+        with tempfile.TemporaryDirectory() as root:
+            self.make_stores(root)
+            kv = os.path.join(root, "session_kv.db")
+            conn = sqlite3.connect(kv)
+            conn.execute("CREATE TABLE intercepted_events (session_id TEXT, object_uid TEXT, reason TEXT)")
+            conn.executemany("INSERT INTO intercepted_events VALUES (?, ?, ?)",
+                             [("", "k8s-evt-1", "ControllerStall"), ("k8s-evt-2", "u", "OutOfBandChange"),
+                              ("k8s-evt-3", "u", "BackOff")])
+            conn.commit()
+            out = subprocess.run([sys.executable, "-c", at.READ_SCRIPT, root, "1000", kv, *at.INJECT_REASONS],
+                                 capture_output=True, text=True, check=True, env={}).stdout
+        injects = at.decode(out)["injects"]
+        self.assertEqual(sorted(i["reason"] for i in injects), ["ControllerStall", "OutOfBandChange"])
+
     def test_a_cut_off_read_is_an_error_that_says_so(self):
         with self.assertRaises(at.kube.CommandError):
             at.decode("eJzLSM3JyQcABiwCFQ"[:10])
@@ -201,3 +221,30 @@ class ProfileSplitTest(unittest.TestCase):
         row = at.attribute(data, 0, 500, caps=CAPS)["capabilities"]["compliance-audit"]
         self.assertEqual(row["by_profile"], {"platform": 100, at.CLUSTER_AGENTS: 100})
         self.assertEqual(at.profile_kind("default"), "default")
+
+
+class InjectJoinTest(unittest.TestCase):
+    def test_a_stall_or_drift_inject_counts_under_its_origin_and_an_event_stays_triage(self):
+        data = {"sessions": [session("k8s-evt-1", source="api_server"), session("k8s-evt-2", source="api_server"),
+                             session("k8s-evt-3", source="api_server")],
+                "cards": [], "runs": [],
+                "injects": [{"session_id": "", "object_uid": "k8s-evt-1", "reason": "ControllerStall"},
+                            {"session_id": "k8s-evt-2", "object_uid": "x", "reason": "OutOfBandChange"}]}
+        joined = at.join(data, CAPS + ("stall-watch",)).capability
+        self.assertEqual(joined["k8s-evt-1"], "stall-watch")
+        self.assertEqual(joined["k8s-evt-2"], at.GITOPS_DRIFT)
+        self.assertEqual(joined["k8s-evt-3"], at.INCIDENT_TRIAGE)
+
+
+class FallbackTest(unittest.TestCase):
+    def test_a_card_whose_creator_has_no_row_falls_back_to_its_origin(self):
+        data = {"sessions": [session("w", source="kanban")],
+                "cards": [{"id": "t", "title": "x", "body": "", "session_id": "pruned", "idempotency_key": None,
+                           "origin": "chat"}],
+                "runs": [{"task_id": "t", "profile": "platform", "started_at": 90.0,
+                          "metadata": json.dumps({"worker_session_id": "w"})}]}
+        self.assertEqual(at.join(data, CAPS).capability["w"], at.CHAT)
+
+    def test_a_child_whose_parent_has_no_row_falls_back_to_its_own_source(self):
+        data = {"sessions": [session("c", source="api_server", parent="pruned")], "cards": [], "runs": []}
+        self.assertEqual(at.join(data, CAPS).capability["c"], at.CHAT)
