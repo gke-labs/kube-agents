@@ -2562,7 +2562,7 @@ def dial_level(environ: Mapping[str, str] | None = None) -> str | None:
             return _dial_level
     try:
         stored = _dial_state_path().read_text(encoding="utf-8").strip()
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         stored = ""
     return stored if stored in DIAL_LEVELS else DIAL_EXPLAIN
 

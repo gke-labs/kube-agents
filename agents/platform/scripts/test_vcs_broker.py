@@ -2513,6 +2513,9 @@ class CollaborationTest(unittest.TestCase):
         self.assertEqual("automerge", vcs_broker.dial_level(environ))
         Path(vcs_broker.DIAL_STATE_FILE).write_text("yolo\n")
         self.assertEqual("explain", vcs_broker.dial_level(environ))
+        Path(vcs_broker.DIAL_STATE_FILE).write_bytes(b"\xff\xfeautomerge")
+        self.assertEqual("explain", vcs_broker.dial_level(environ), "undecodable bytes fail closed")
+        self.assertEqual("none", vcs_broker.write_mode(environ)[0])
 
     def test_a_set_level_is_told_apart_from_none_set(self):
         environ = self._dial()
