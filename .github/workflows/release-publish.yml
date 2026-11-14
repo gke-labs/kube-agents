@@ -135,6 +135,10 @@ jobs:
       # Dispatches docs-deploy.yml on main after Publish GitHub Release so
       # GitHub Pages serves the newly published GA installer scripts.
       actions: write
+    # Read by relabel-upgrade-table, which runs once this job has tagged a release.
+    outputs:
+      release_version: ${{ steps.calculate-version.outputs.release_version }}
+      published: ${{ steps.verify-eligibility.outputs.skip_release != 'true' }}
     steps:
       - name: Generate Release Bot Token
         id: release-token
@@ -194,6 +198,16 @@ jobs:
           RC_CANDIDATE_COMMIT: ${{ steps.calculate-version.outputs.rc_candidate_commit }}
           GH_TOKEN: ${{ steps.release-token.outputs.token }}
         run: ./scripts/release/tag_ga_release.sh
+
+      # `k8s-api-proxy/vX.Y.Z` at the GA tag's commit, so `go get` resolves the
+      # library at the version the release ships. A step of its own, after the
+      # GA tag's atomic push: a run that fails here has published no GitHub
+      # Release, so a re-run resumes, skips the GA tag and retries this one.
+      - name: Tag Go Modules
+        if: steps.verify-eligibility.outputs.skip_release != 'true'
+        env:
+          RELEASE_VERSION: ${{ steps.calculate-version.outputs.release_version }}
+        run: ./scripts/release/tag_go_modules.sh
 
       # The builder image and config from mirror.gcr.io, as in docker-build.yml:
       # this step pulls moby/buildkit from Docker Hub on the runner's daemon, which
@@ -280,3 +294,52 @@ jobs:
           if ! gh workflow run docs-deploy.yml --ref main; then
             echo "::warning::Failed to dispatch docs-deploy.yml on main; run Docs Deploy manually to refresh Pages installer scripts."
           fi
+
+  # A new release can contain upgrade-table rows still labelled `pending`, and
+  # `make docs-check-upgrade-releases` then fails every push to main until they
+  # are relabelled (#5673). This job opens the pull request that relabels them,
+  # by the rule that check uses, minutes after the tag. It writes no commit to
+  # main: the pull request goes through review and the merge queue like any
+  # other. Its own job, so the publish job's token keeps its permissions and a
+  # failure here leaves the published release alone.
+  relabel-upgrade-table:
+    name: Open the Upgrade-Table Relabel Pull Request
+    runs-on: ubuntu-latest
+    # The workflow's concurrency group is held until this job ends.
+    timeout-minutes: 10
+    needs: publish-release
+    if: |
+      github.repository == 'gke-labs/kube-agents' &&
+      github.ref == 'refs/heads/main' &&
+      needs.publish-release.outputs.published == 'true'
+    permissions:
+      contents: read
+    steps:
+      # A pull request opened with the workflow's own GITHUB_TOKEN starts no
+      # workflow, so its required checks would never run: the release bot opens it.
+      - name: Generate Release Bot Token
+        id: relabel-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      # The whole history and the tags: the relabel finds the commit that added
+      # each row and the releases that contain it.
+      - name: Checkout main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/heads/main
+          fetch-depth: 0
+          fetch-tags: true
+          # The script hands the token to its push alone, so nothing it runs
+          # before (the relabel, prettier from npm) can read it from .git/config.
+          persist-credentials: false
+
+      - name: Relabel and open the pull request
+        env:
+          RELEASE_VERSION: ${{ needs.publish-release.outputs.release_version }}
+          GH_TOKEN: ${{ steps.relabel-token.outputs.token }}
+        run: ./scripts/release/open_upgrade_relabel_pr.sh

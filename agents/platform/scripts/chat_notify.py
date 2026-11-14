@@ -4,8 +4,8 @@ Under ``spec.mode: next`` the operator stops rendering the Hermes chat platform
 that ``hermes send`` posts through, because the A2A gateway consumes the chat
 backend instead. Every caller that posts unprompted (the alert path, the cron
 relay, the Cluster Agent reconcile notice, ``send_notification``) would then post
-nowhere. The operator names the platform the gateway now holds in
-``A2A_NOTIFY_PLATFORM``, and for that platform these callers run
+nowhere. The operator names the platforms the gateway now holds in
+``A2A_NOTIFY_PLATFORM``, and for those platforms these callers run
 ``a2a notify`` instead, which asks the gateway to post to the home channel over
 its ``chat.notify`` route.
 
@@ -37,12 +37,16 @@ from contextlib import closing
 
 # The variable the operator renders into the agent container exactly when the
 # next stack holds the chat backend (platformagent_manifests.go,
-# a2aNotifyPlatformEnvVar). Its value is a platform name as Hermes spells it.
+# a2aNotifyPlatformEnvVar). Its value is a list of platform names as Hermes
+# spells them, separated by PLATFORM_LIST_SEPARATOR; one name is a list of one.
 NOTIFY_PLATFORM_ENV = "A2A_NOTIFY_PLATFORM"
 # The variable the operator renders whenever the gateway arms its chat.notify
 # route, home channel or not (platformagent_a2a_manifests.go,
-# a2aNotifyConversationsEnvVar): the platform whose backend the gateway holds.
+# a2aNotifyConversationsEnvVar): the platforms whose backends the gateway holds,
+# in the same list form.
 NOTIFY_CONVERSATIONS_ENV = "A2A_NOTIFY_CONVERSATIONS"
+# What separates the platform names in either variable.
+PLATFORM_LIST_SEPARATOR = ","
 # The operator projects the home channel it admitted (the CR field, else the
 # channel the gateway learned) into a ConfigMap mounted as a directory in the
 # agent pod, so a learned channel reaches the pod without a restart. One file,
@@ -144,38 +148,48 @@ def home_file_value() -> str:
     return home_file()[0]
 
 
-def routed_platform() -> str:
-    """The platform whose posts go through the gateway, or "" when none does.
+def platform_list(raw: str) -> list[str]:
+    """The platform names in a comma-separated env value: stripped, empties dropped, first of a duplicate kept, in order."""
+    names: list[str] = []
+    for part in raw.split(PLATFORM_LIST_SEPARATOR):
+        name = part.strip()
+        if name and name not in names:
+            names.append(name)
+    return names
 
-    The rendered env names it when the CR sets the home channel, and when the
+
+def routed_platforms() -> list[str]:
+    """The platforms whose posts go through the gateway, or [] when none does.
+
+    The rendered env names them when the CR sets the home channel, and when the
     gateway's backend is the install's only chat platform with no home channel
     set: the gateway then refuses each post and keeps it for the digest it
     posts once one is. A learned channel is never rendered into the pod, so
     with the env empty the answer is derived: the gateway holds Slack
     (``A2A_NOTIFY_CONVERSATIONS``) and the projected file names a home channel.
+    A non-empty env wins over the file.
     """
-    routed = os.environ.get(NOTIFY_PLATFORM_ENV, "").strip()
+    routed = platform_list(os.environ.get(NOTIFY_PLATFORM_ENV, ""))
     if routed:
         return routed
-    if gateway_platform() == SLACK_PLATFORM and home_file_value():
-        return SLACK_PLATFORM
-    return ""
+    if SLACK_PLATFORM in gateway_platforms() and home_file_value():
+        return [SLACK_PLATFORM]
+    return []
 
 
-def gateway_platform() -> str:
-    """The platform whose backend the gateway holds, or "" when it holds none.
+def gateway_platforms() -> list[str]:
+    """The platforms whose backends the gateway holds, or [] when it holds none.
 
-    Unlike :func:`routed_platform` this is set with no home channel, so it names
-    the platform an install has when nothing routes a proactive post there, and
+    Unlike :func:`routed_platforms` this is set with no home channel, so it names
+    the platforms an install has when nothing routes a proactive post there, and
     whose conversations :func:`conversation_command` can post into.
     """
-    return os.environ.get(NOTIFY_CONVERSATIONS_ENV, "").strip()
+    return platform_list(os.environ.get(NOTIFY_CONVERSATIONS_ENV, ""))
 
 
 def routes(platform: str) -> bool:
     """Whether a post to ``platform`` goes through the gateway's chat.notify route."""
-    routed = routed_platform()
-    return bool(routed) and platform == routed
+    return platform in routed_platforms()
 
 
 def bus_unreachable_reason() -> str:

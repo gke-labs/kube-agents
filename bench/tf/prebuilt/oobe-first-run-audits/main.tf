@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# The scenario driver for bench/tasks/oobe-first-run-audits: put a long-lived
-# install where a fresh one is when its onboarding inventory scan settles, so the
-# `oobe` job's first-run audits stage fires, and let the verifier read whether the
-# five audits were started.
+# The scenario driver for bench/tasks/oobe-first-run-audits. On a fresh install (an
+# eval lease), it waits for the install's own first-run stage to finish and arms
+# nothing: the verifier grades that chain, the one the install ran. On a long-lived
+# install whose first run was long ago (own_stage.py `fresh`: the stage's record last
+# written more than a day ago), it puts the install where a fresh one is when its
+# onboarding inventory scan settles, so the `oobe` job's first-run audits stage fires,
+# and lets the verifier read whether the five audits were started.
 #
 # arm.py (beside this file) files two archived stand-in cards, a sweep and a
 # ranking card after it, points `.bootstrap_scan_filed` at the sweep and the
@@ -25,19 +28,21 @@
 # one: an install that finished onboarding before the job existed never got it.
 # An image without the job gets nothing put back, so nothing starts the audits.
 #
-# Before it arms, the apply waits for the install's own first-run stage to finish
-# (its audits stage done, and, if the report was claimed, the job removed by the
-# tick that follows; own_stage.py says why), failing after `own_wait`. An earlier run's arm left behind is disarmed first. After the arm it
-# waits, up to `chain_wait`, for the stage to finish: it marks the audits one after
-# another, which outlasts the verifier's two-minute window. On an image without the
-# job there is nothing to wait for.
+# First the apply waits for the install's own first-run stage to finish (its audits
+# stage done, and, if the report was claimed, the job removed by the tick that
+# follows; own_stage.py says why), failing after `own_wait`. An earlier run's arm left
+# behind is disarmed first. A fresh first run ends the apply there. Otherwise it arms,
+# then waits, up to `chain_wait`, for the stage to finish: it marks the audits one
+# after another, which outlasts the verifier's two-minute window. On an image without
+# the job there is nothing to wait for. The two waits never both run long: a stage
+# that was still pending is fresh once it finishes.
 #
-# Waiting on running audits is the runner's job, not this stack's: it holds the
-# five streams' locks for the unit (the case's `audit_streams`), and every unit on
-# one of them, the next repetition of this case included, first waits, up to its
-# bound, for a run the install started there or a pending stage has still to start
-# (hack/ci-eval-pr.sh: wait_platform_runs). Run by hand, without the runner, the
-# stage itself holds its first mark until an earlier repetition's audit has ended.
+# The case declares no audit streams: on an eval lease it starts no audit, and the
+# runner's wait for runs the install started (hack/ci-eval-pr.sh: wait_platform_runs)
+# keeps an audit case off a stream while the install's chain is on it. An armed
+# stand-in on a long-lived install starts five real runs with no stream lock held,
+# so run it there alone. Run by hand, the stage itself holds its first mark until an
+# earlier repetition's audit has ended.
 #
 # The teardown, and the exit trap on a failed apply, run disarm.py: the markers
 # go back as they were and the `oobe` job comes out if this stack put it there.
@@ -62,11 +67,13 @@ locals {
   arm_b64    = base64encode(file("${path.module}/arm.py"))
   disarm_b64 = base64encode(file("${path.module}/disarm.py"))
   own_b64    = base64encode(file("${path.module}/own_stage.py"))
-  # A fresh CI install's scan settles about 17 minutes after boot, then its chain runs four
-  # audits and claims the fifth (one to 45 minutes each). The runner holds the onboarding
-  # state lock while this waits, and hack/ci-eval-pr.sh sizes that lock's deadline from
-  # own_wait plus chain_wait (STATE_LOCK_HOLD_SECONDS), so a change here changes that too.
-  own_wait = 3600
+  # How long the apply waits for the install's own first-run stage. On the 2026-11-10
+  # presubmits a fresh install's chain ended 52-115 minutes after the fan-out (median 69,
+  # 105 of 138 builds past an hour), and this case launches first. The runner holds the
+  # onboarding state lock while this waits, and hack/ci-eval-pr.sh sizes that lock's
+  # deadline from own_wait plus chain_wait (STATE_LOCK_HOLD_SECONDS), so a change here
+  # changes that too.
+  own_wait = 7800
   # arm.py prints this when the image ships no oobe job.
   no_job = "ships no oobe job"
   # The chain runs the four fleet audits and then the upgrade retrospective one after
@@ -160,12 +167,20 @@ resource "null_resource" "oobe" {
         elapsed=$((elapsed + ${local.poll}))
       done
 
-      # ---- 3. Arm ---------------------------------------------------------
+      # ---- 3. Grade the install's own first run, if it is this install's -
+      # Every repetition reads the same chain: the install runs it once.
+      first_run="$(printf '%s' '${local.own_b64}' | base64 -d | agent_py "${local.home}" fresh)"
+      if [ "$first_run" = fresh ]; then
+        echo "The install's own first run is recent: grading it, nothing armed."
+        exit 0
+      fi
+
+      # ---- 4. Arm a stand-in on an install whose first run was long ago ---
       arming=1
       armed="$(printf '%s' '${local.arm_b64}' | base64 -d | agent_py "${local.home}" "${local.hermes}" "$(date -u +%Y%m%d%H%M%S)")"
       printf '%s\n' "$armed"
 
-      # ---- 4. Wait for the chain --------------------------------------------
+      # ---- 5. Wait for the chain --------------------------------------------
       # The stage marks the five audits one after another and is done once the last,
       # the retrospective, has started. Whether or not it gets there in time, the verifier decides; this
       # only keeps its two-minute window from opening before the chain has run.

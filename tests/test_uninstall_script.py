@@ -1148,6 +1148,10 @@ class GvisorFloorCannotBlockTheTeardownTest(unittest.TestCase):
         minter_at = text.find('export MINTER_SHARED_KEY="" MINTER_ADOPT_KEY=""')
         self.assertNotEqual(minter_at, -1, "uninstall.sh must blank MINTER_SHARED_KEY and MINTER_ADOPT_KEY")
         self.assertLess(minter_at, call_at)
+        # The minter's KSA name: terraform validates it as a DNS-1123 label.
+        minter_ksa_at = text.find('export GITHUB_MINTER_KSA_NAME=""')
+        self.assertNotEqual(minter_ksa_at, -1, "uninstall.sh must blank GITHUB_MINTER_KSA_NAME")
+        self.assertLess(minter_ksa_at, call_at)
         provider_at = text.find('export MODEL_PROVIDER="$DEFAULT_MODEL_PROVIDER" MODEL_DEFAULT_NAME=""')
         self.assertNotEqual(provider_at, -1, "uninstall.sh must reset an openai_compatible provider")
         self.assertLess(provider_at, call_at)

@@ -128,8 +128,8 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
 
     # apply_minter_name_defaults (#3504): a name the operator gave wins; the
     # rest come from minter_name_defaults, stubbed here to known values.
-    _MINTER_STUB = "minter_name_defaults() { printf 'derived-ring|derived-key|derived-gsa\\n'; }"
-    _MINTER_SHOW = 'echo "ring=$PARAM_KMS_KEYRING key=$PARAM_KMS_KEY gsa=$GITHUB_MINTER_GSA_NAME"'
+    _MINTER_STUB = "minter_name_defaults() { printf 'derived-ring|derived-key|derived-gsa|derived-ksa\\n'; }"
+    _MINTER_SHOW = 'echo "ring=$PARAM_KMS_KEYRING key=$PARAM_KMS_KEY gsa=$GITHUB_MINTER_GSA_NAME ksa=$GITHUB_MINTER_KSA_NAME"'
 
     def _apply_minter_names(self, env=None):
         return self._run_install_func(
@@ -137,7 +137,7 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
 
     def test_a_new_install_naming_nothing_gets_the_per_install_names(self):
         proc = self._apply_minter_names()
-        self.assertIn("ring=derived-ring key=derived-key gsa=derived-gsa", proc.stdout, proc.stderr)
+        self.assertIn("ring=derived-ring key=derived-key gsa=derived-gsa ksa=derived-ksa", proc.stdout, proc.stderr)
 
     def test_minter_names_the_operator_gave_are_kept(self):
         """install.env or the environment naming them: never replaced, so an
@@ -146,13 +146,14 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
             "KMS_KEYRING": "github-token-minter-keyring",
             "KMS_KEY": "github-token-minter-key",
             "GITHUB_MINTER_GSA_NAME": "kubeagents-github-minter-gsa",
+            "GITHUB_MINTER_KSA_NAME": "kubeagents-github-minter",
         })
-        self.assertIn("ring=github-token-minter-keyring key=github-token-minter-key gsa=kubeagents-github-minter-gsa",
-                      proc.stdout, proc.stderr)
+        self.assertIn("ring=github-token-minter-keyring key=github-token-minter-key gsa=kubeagents-github-minter-gsa"
+                      " ksa=kubeagents-github-minter", proc.stdout, proc.stderr)
 
     def test_a_partly_named_minter_keeps_what_was_named(self):
         proc = self._apply_minter_names(env={"KMS_KEYRING": "my-ring"})
-        self.assertIn("ring=my-ring key=derived-key gsa=derived-gsa", proc.stdout, proc.stderr)
+        self.assertIn("ring=my-ring key=derived-key gsa=derived-gsa ksa=derived-ksa", proc.stdout, proc.stderr)
 
     # confirm_minter_key_owner (#3504), with the state read and the owner read stubbed.
     def _confirm_owner(self, owner, owner_rc=0, state_names="", env=None, answer=None):

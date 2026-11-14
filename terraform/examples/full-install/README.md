@@ -242,7 +242,10 @@ installer front doors that means `PLATFORM_AGENT_GSA_NAME`,
 `GITHUB_MINTER_GSA_NAME` and `LITELLM_GSA_NAME` in `install.env`, which every
 front door regenerates `terraform.tfvars` from; every front door that applies
 (`install.sh`, its Day-2 menu, `upgrade.sh`) checks for the collision first and
-names the key to set. Do not rely on a shell
+names the key to set. The minter's KSA (`github_minter_ksa_name`,
+`GITHUB_MINTER_KSA_NAME`) is the other half of its Workload Identity binding:
+`install.sh` names a new install's after its cluster and records it, so two
+installs sharing the namespace don't bind one member. Do not rely on a shell
 `export` or a hand-edited `terraform.tfvars` instead: the export dies with the
 shell and the file is regenerated on every run, and either way the next run
 resolves the name back to the default and plans the GSA's destroy-and-recreate

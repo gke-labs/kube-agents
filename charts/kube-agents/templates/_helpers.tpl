@@ -888,7 +888,7 @@ Takes the root context.
 {{- $provider := .Values.litellm.modelProvider }}
 {{- /* Per-provider default model names mirror install.defaults.env (DEFAULT_MODEL_*);
        a chart cannot source that file, and tests/test_installer_common.py pins the two equal. */}}
-{{- $defaultModels := dict "gemini" "gemini-3.5-flash" "anthropic" "claude-opus-5" "openai" "gpt-5.4" "vertex_ai" "gemini-3.5-flash" "sap" "anthropic--claude-4.5-sonnet" }}
+{{- $defaultModels := dict "gemini" "gemini-3.8-flash" "anthropic" "claude-opus-5" "openai" "gpt-5.4" "vertex_ai" "gemini-3.8-flash" "sap" "anthropic--claude-4.5-sonnet" }}
 {{- /*
   openai_compatible has no default model, so it is allowed beside the table
   rather than in it. Any other value is taken as a LiteLLM provider slug

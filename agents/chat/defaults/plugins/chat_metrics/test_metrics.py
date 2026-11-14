@@ -124,6 +124,7 @@ _DISPATCH_LINE = re.compile(r'^kubeagents_kanban_dispatcher_failed_ticks\{board=
 
 
 _AGE_LINE = re.compile(r'^kubeagents_kanban_dispatcher_failing_seconds\{board="((?:[^"\\]|\\.)*)",error="([^"]*)"\} (\d+)$', re.M)
+_STUCK_LINE = re.compile(r'^kubeagents_kanban_dispatcher_stuck_seconds\{board="((?:[^"\\]|\\.)*)"\} (\d+)$', re.M)
 
 
 class DispatcherFailedTicksTest(unittest.TestCase):
@@ -312,10 +313,123 @@ class DispatcherFailedTicksTest(unittest.TestCase):
         self.assertEqual([("default", "OperationalError", "0")], _AGE_LINE.findall(registry.render()))
         self.assertEqual([("default", "OperationalError", "1")], _DISPATCH_LINE.findall(registry.render()))
 
+    def test_a_tick_running_past_the_limit_makes_the_board_stuck(self):
+        # A locked board: its first tick waits the busy timeout per statement.
+        now = [100.0]
+        registry = metrics.ChatMetrics(clock=lambda: now[0])
+        registry.record_dispatch_tick_start("default", tick=True)
+        now[0] += 300
+        self.assertEqual([], _STUCK_LINE.findall(registry.render()))
+        now[0] += 100
+        self.assertEqual([("default", "400")], _STUCK_LINE.findall(registry.render()))
+        # No failure yet: the streak families stay empty.
+        self.assertEqual([], _DISPATCH_LINE.findall(registry.render()))
+
+    def test_only_a_tick_counts_not_the_other_tries(self):
+        # Auto-decompose can run a model call, so a long one is healthy.
+        now = [100.0]
+        registry = metrics.ChatMetrics(clock=lambda: now[0])
+        registry.record_dispatch_tick_start("default")
+        now[0] += 900
+        self.assertEqual([], _STUCK_LINE.findall(registry.render()))
+
+    def test_a_stuck_board_stays_stuck_until_a_good_tick(self):
+        # The whole locked loop: a 12-minute tick that fails, then the ready
+        # probe and auto-decompose. Never a render between.
+        now = [100.0]
+        registry = metrics.ChatMetrics(clock=lambda: now[0])
+
+        def attempt(tick, fail=False):
+            registry.record_dispatch_tick_start("default", tick=tick)
+            now[0] += 720
+            if fail:
+                registry.record_dispatch_tick("default", "OperationalError")
+            registry.record_dispatch_tick_end("default")
+
+        attempt(True, fail=True)
+        attempt(False)
+        attempt(False)
+        self.assertEqual([("default", str(3 * 720))], _STUCK_LINE.findall(registry.render()))
+        registry.record_dispatch_tick_start("default", tick=True)
+        now[0] += 10
+        registry.record_dispatch_tick("default", "")
+        registry.record_dispatch_tick_end("default")
+        self.assertEqual([], _STUCK_LINE.findall(registry.render()))
+
+    def test_a_tick_that_fails_on_a_lock_after_a_busy_timeout_is_stuck(self):
+        # A rollback-journal board: each locked tick waits two busy timeouts
+        # (about 250 s), under the in-flight limit, then fails on the lock.
+        now = [100.0]
+        registry = metrics.ChatMetrics(clock=lambda: now[0])
+        registry.record_dispatch_tick_start("default", tick=True)
+        now[0] += 250
+        self.assertEqual([], _STUCK_LINE.findall(registry.render()))
+        registry.record_dispatch_tick("default", "OperationalError", locked=True)
+        registry.record_dispatch_tick_end("default")
+        self.assertEqual([("default", "250")], _STUCK_LINE.findall(registry.render()))
+
+    def test_the_lock_rule_starts_at_one_busy_timeout(self):
+        now = [100.0]
+        registry = metrics.ChatMetrics(clock=lambda: now[0])
+        for board, ran in (("under", metrics.STUCK_LOCK_WAIT_SECONDS - 1), ("at", metrics.STUCK_LOCK_WAIT_SECONDS + 1)):
+            registry.record_dispatch_tick_start(board, tick=True)
+            now[0] += ran
+            registry.record_dispatch_tick(board, "OperationalError", locked=True)
+            registry.record_dispatch_tick_end(board)
+        self.assertEqual(["at"], [b for b, _ in _STUCK_LINE.findall(registry.render())])
+        self.assertEqual(120.0, metrics.STUCK_LOCK_WAIT_SECONDS)
+
+    def test_a_slow_failure_of_another_kind_or_a_quick_lock_failure_is_not_stuck(self):
+        now = [100.0]
+        registry = metrics.ChatMetrics(clock=lambda: now[0])
+        registry.record_dispatch_tick_start("disk", tick=True)
+        now[0] += 250
+        registry.record_dispatch_tick("disk", "OSError")
+        registry.record_dispatch_tick_end("disk")
+        registry.record_dispatch_tick_start("brief", tick=True)
+        now[0] += 60
+        registry.record_dispatch_tick("brief", "OperationalError", locked=True)
+        registry.record_dispatch_tick_end("brief")
+        self.assertEqual([], _STUCK_LINE.findall(registry.render()))
+
+    def test_a_slow_good_tick_does_not_leave_the_board_stuck(self):
+        now = [100.0]
+        registry = metrics.ChatMetrics(clock=lambda: now[0])
+        registry.record_dispatch_tick_start("default", tick=True)
+        now[0] += 400
+        registry.record_dispatch_tick("default", "")
+        registry.record_dispatch_tick_end("default")
+        self.assertEqual([], _STUCK_LINE.findall(registry.render()))
+
+    def test_a_tick_that_ends_with_no_result_leaves_no_stuck_state(self):
+        # The corrupt-board branch: the board is quarantined, not counted, also
+        # when a scrape saw its tick past the limit.
+        now = [100.0]
+        registry = metrics.ChatMetrics(clock=lambda: now[0])
+        registry.record_dispatch_tick_start("corrupt", tick=True)
+        now[0] += 400
+        self.assertEqual(1, len(_STUCK_LINE.findall(registry.render())))
+        registry.record_dispatch_tick_end("corrupt")
+        self.assertEqual([], _STUCK_LINE.findall(registry.render()))
+
+    def test_a_stuck_board_the_dispatcher_stops_trying_drops_out(self):
+        now = [100.0]
+        registry = metrics.ChatMetrics(clock=lambda: now[0])
+        registry.record_dispatch_tick_start("archived", tick=True)
+        now[0] += 400
+        registry.record_dispatch_tick("archived", "OperationalError")
+        registry.record_dispatch_tick_end("archived")
+        now[0] += metrics.DISPATCH_FAILURE_STALE_SECONDS
+        self.assertEqual(1, len(_STUCK_LINE.findall(registry.render())))
+        now[0] += 1
+        self.assertEqual([], _STUCK_LINE.findall(registry.render()))
+
     def test_an_idle_registry_renders_the_family_with_no_series(self):
         exposition = metrics.ChatMetrics().render()
         self.assertIn("# TYPE kubeagents_kanban_dispatcher_failing_seconds gauge", exposition)
         self.assertEqual([], _AGE_LINE.findall(exposition))
+        self.assertIn("# TYPE kubeagents_kanban_dispatcher_stuck_seconds gauge", exposition)
+        self.assertEqual([], _STUCK_LINE.findall(exposition))
         self.assertIn("# TYPE kubeagents_kanban_dispatcher_failed_ticks gauge", exposition)
         self.assertEqual([], _DISPATCH_LINE.findall(exposition))
 

@@ -79,6 +79,16 @@ evictions, byte size, and entry count are exported on the metrics listener as
 `kubeagents_kube_proxy_cache_requests_total`, `kubeagents_kube_proxy_cache_evictions_total`,
 `kubeagents_kube_proxy_cache_bytes`, and `kubeagents_kube_proxy_cache_entries`.
 
+Cached responses and coalesced fetches are shared across callers, which is safe while the
+`UpstreamTransport` uses one credential for everyone, as `pkg/upstream` does. An embedder whose
+transport picks a credential per caller or tenant sets `Config.CallerPartition`: its value for the
+authenticated caller is part of the cache and coalescing keys, so requests share a response or a
+fetch only within a partition, and the transport reads it with `PartitionFromContext` to choose
+the credential. Coalescing runs even with a `0s` resource TTL, so a per-tenant transport without a
+partition needs the cache off (`Config.Cache` nil). Invalidation is not partitioned: a `401` or
+`403` in one partition evicts that resource's entries in every partition, which costs the others
+refetches but never serves one partition another's response.
+
 It is a self-contained Go module. Run its checks from this directory:
 
 ```bash
@@ -89,3 +99,15 @@ go test -race ./...
 
 `k8sapiproxy-test.yml` runs those and gosec, built from `k8s-operator/go.mod`'s pin (this module
 declares none); `make gosec` at the repository root runs the same scan over this module.
+
+Every kube-agents release `X.Y.Z` tags this module `k8s-api-proxy/vX.Y.Z` at the release commit,
+so a program can embed the handler with its own authenticator, upstream transport and audit sink:
+
+```bash
+go get github.com/gke-labs/kube-agents/k8s-api-proxy@latest  # or @vX.Y.Z
+```
+
+The module is v0: `Config`, `Policy` and its modes, `CallerAuthenticator`, `UpstreamTransport`,
+`AuditSink`, `CacheStore` and `AuditEvent` may change in any release. The version moves with every
+kube-agents release, whether or not this module changed; a release at `1.0.0` or later tags no
+module until the module's own versioning is decided.

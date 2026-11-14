@@ -2625,7 +2625,9 @@ func TestCleanupA2AResumesAfterAMidPassErrorOnPartialRender(t *testing.T) {
 	today.Spec.Mode = nil
 
 	writes := 0
-	stopAt := 8
+	// The tiers file is written before the identity map, so the first
+	// authmap shard is the ninth write.
+	stopAt := 9
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithObjects(next.DeepCopy()).
