@@ -50,10 +50,10 @@ _IMAGE_ENV_NAMES = (
 
 # The NATS bus's four images, pulled by the operator-rendered bus of every
 # install: the trailing name `make mirror-images` writes each copy under, and
-# the upstream repository. Two are pinned by digest as well as tag upstream;
+# the upstream repository. Three are pinned by digest as well as tag upstream;
 # the mirror holds them by tag alone, so under a prefix the digest has to go.
 _BUS_IMAGES = {
-    "nats": "docker.io/library/nats:2.10-alpine",
+    "nats": "docker.io/library/nats:2.10.29-alpine@sha256:",
     "nats-box": "docker.io/natsio/nats-box:0.14.5",
     "nats-server-config-reloader": "docker.io/natsio/nats-server-config-reloader:0.25.0@sha256:",
     "prometheus-nats-exporter": "docker.io/natsio/prometheus-nats-exporter:0.20.3@sha256:",
@@ -234,7 +234,7 @@ class ChartThirdPartyImageRegistryTest(unittest.TestCase):
         # The bus's four: <prefix>/<name>:<tag>, the digest dropped, which is
         # the copy `make mirror-images` pushes.
         env = self._operator_env(docs)
-        self.assertEqual(env["A2A_NATS_IMAGE"], f"{third_mirror}/nats:2.10-alpine")
+        self.assertEqual(env["A2A_NATS_IMAGE"], f"{third_mirror}/nats:2.10.29-alpine")
         self.assertEqual(env["A2A_PROVISION_IMAGE"], f"{third_mirror}/nats-box:0.14.5")
         self.assertEqual(env["A2A_NATS_RELOADER_IMAGE"], f"{third_mirror}/nats-server-config-reloader:0.25.0")
         self.assertEqual(env["A2A_NATS_EXPORTER_IMAGE"], f"{third_mirror}/prometheus-nats-exporter:0.20.3")

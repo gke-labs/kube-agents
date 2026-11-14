@@ -1008,7 +1008,7 @@ a2aBus:
   images:
     nats:
       repository: docker.io/library/nats
-      tag: "2.10-alpine"
+      tag: "2.10.29-alpine@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927"
     natsBox:
       repository: docker.io/natsio/nats-box
       tag: "0.14.5"
