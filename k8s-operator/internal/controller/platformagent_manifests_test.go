@@ -7762,14 +7762,13 @@ func TestManagedEnvPinsTheMode(t *testing.T) {
 }
 
 func TestManagedEnvValuesCannotSmuggleALine(t *testing.T) {
-	// Chat on the gateway and Slack beside it on its legacy consumer: the
-	// Slack allowlist is a CR value the managed .env pins.
+	// The Teams allowlist is a CR value the managed .env pins; Google Chat and
+	// Slack pin nothing, so they cannot reach the strip.
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
 		Spec: agentv1alpha1.PlatformAgentSpec{
 			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
-				GoogleChat: &agentv1alpha1.GoogleChatSpec{Enabled: ptr.To(true)},
-				Slack: &agentv1alpha1.SlackSpec{
+				Teams: &agentv1alpha1.TeamsSpec{
 					Enabled:      ptr.To(true),
 					AllowedUsers: []string{"someone\nKUBEAGENTS_MODE=today"},
 				},
@@ -7777,6 +7776,9 @@ func TestManagedEnvValuesCannotSmuggleALine(t *testing.T) {
 		},
 	}
 	rendered := renderManagedEnv(agent)
+	if !strings.Contains(rendered, "TEAMS_ALLOWED_USERS=someoneKUBEAGENTS_MODE=today\n") {
+		t.Fatalf("the Teams allowlist must render with its newline stripped:\n%s", rendered)
+	}
 	// The property is about LINES, which is how every reader of this file
 	// parses it: the smuggled text surviving inside another key's value is
 	// harmless (the parser splits on the first `=`, so it stays that key's
