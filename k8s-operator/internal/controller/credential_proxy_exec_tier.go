@@ -165,6 +165,10 @@ var credentialProxyExecTierEnvDropped = map[string]bool{
 	execTierDroppedMinterEnv:        true,
 	"GOOGLE_CHAT_PROJECT_ID":        true,
 	"GOOGLE_CHAT_SUBSCRIPTION_NAME": true,
+	// The A2A gateway's Chat relay settings: the exec tier runs no relay, and
+	// a subscription change must not roll every exec replica.
+	a2aGoogleChatSubscriptionEnvVar:      true,
+	credentialProxyA2AChatAudienceEnvVar: true,
 }
 
 func credentialProxyExecTierName(agent *agentv1alpha1.PlatformAgent) string {

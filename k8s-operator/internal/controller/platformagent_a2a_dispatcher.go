@@ -591,8 +591,11 @@ type a2aDispatchConfig struct {
 }
 
 type a2aDispatchProfile struct {
-	Name                  string               `json:"name"`
-	Tiers                 []string             `json:"tiers"`
+	Name  string   `json:"name"`
+	Tiers []string `json:"tiers"`
+	// UnattendedTier is lib.DispatchProfile's: the profile's unattended-mode
+	// tier when it is a Tier resource, not the built-in (#3659).
+	UnattendedTier        string               `json:"unattendedTier,omitempty"`
 	Concurrency           int                  `json:"concurrency"`
 	QueueTimeoutSeconds   int                  `json:"queueTimeoutSeconds"`
 	ActiveDeadlineSeconds int                  `json:"activeDeadlineSeconds"`
@@ -605,6 +608,16 @@ type a2aDispatchProfile struct {
 	// DrainingUntil is lib.DispatchProfile's (#5074): set on a profile that
 	// has left the install, which is listed with no durables until then.
 	DrainingUntil time.Time `json:"drainingUntil,omitzero"`
+	// DrainingTiers is lib.DispatchProfile's (#3659, 2b-ii): tiers that left
+	// a live profile and still drain (agentprofile_tier_drain.go).
+	DrainingTiers []a2aDrainingTier `json:"drainingTiers,omitempty"`
+}
+
+// a2aDrainingTier is lib.DrainingTier.
+type a2aDrainingTier struct {
+	Tier  string    `json:"tier"`
+	Mode  string    `json:"mode"`
+	Until time.Time `json:"until"`
 }
 
 type a2aDispatchDurable struct {
@@ -723,9 +736,14 @@ func dispatchConfigHeader(agent *agentv1alpha1.PlatformAgent) a2aDispatchConfig 
 // dispatchProfileEntry is one live profile's entry in the dispatch config,
 // with its Job template when it has one.
 func dispatchProfileEntry(agent *agentv1alpha1.PlatformAgent, p *agentv1alpha1.AgentProfile, jobTemplate *corev1.PodTemplateSpec) a2aDispatchProfile {
+	unattendedTier := unattendedTierOf(p)
+	if unattendedTier == agentv1alpha1.AgentProfileTierUnattended {
+		unattendedTier = "" // the built-in, which the dispatcher knows
+	}
 	dp := a2aDispatchProfile{
 		Name:                  p.Name,
-		Tiers:                 p.AllowedTierList(),
+		Tiers:                 liveTiersOf(p),
+		UnattendedTier:        unattendedTier,
 		Concurrency:           int(p.Spec.Concurrency),
 		QueueTimeoutSeconds:   int(p.QueueTimeout()),
 		ActiveDeadlineSeconds: func() int { d, _ := cappedTaskDeadline(agent, p); return d }(),
@@ -735,7 +753,15 @@ func dispatchProfileEntry(agent *agentv1alpha1.PlatformAgent, p *agentv1alpha1.A
 	for _, param := range p.Spec.Parameters {
 		dp.Parameters = append(dp.Parameters, a2aCardParameter{Name: param.Name, Required: param.Required})
 	}
-	for _, tier := range dp.Tiers {
+	drains := drainingTiersOf(p)
+	for _, tier := range p.AllowedTierList() {
+		if until, ok := drains[tier]; ok {
+			dp.DrainingTiers = append(dp.DrainingTiers, a2aDrainingTier{Tier: tier, Mode: tierModeOf(p, tier), Until: until})
+		}
+	}
+	// The draining tiers' durables too, so what is queued at them is read
+	// and refused tier-withdrawn rather than left with no terminal.
+	for _, tier := range p.AllowedTierList() {
 		for _, kind := range a2aSubmitKinds {
 			dp.Durables = append(dp.Durables, a2aDispatchDurable{Tier: tier, Kind: kind, Name: profileDurableName(p.Name, tier, kind)})
 		}
@@ -803,10 +829,19 @@ func drainingDispatchProfiles(applied *a2aDispatchConfig, live map[string]bool, 
 		} else if !now.Before(until) {
 			continue
 		}
+		// The profile's own unattended-mode tier, while it drains too: the
+		// dispatcher reads it to clean up that tier's Jobs and to count its
+		// adopted tasks on the unattended side (unattendedFor). Carried only
+		// when it is one of the entry's tiers.
+		unattendedTier := ""
+		if slices.Contains(a.Tiers, a.UnattendedTier) {
+			unattendedTier = a.UnattendedTier
+		}
 		out = append(out, a2aDispatchProfile{
-			Name:        a.Name,
-			Tiers:       slices.Clone(a.Tiers),
-			Concurrency: max(a.Concurrency, 1),
+			Name:           a.Name,
+			Tiers:          slices.Clone(a.Tiers),
+			UnattendedTier: unattendedTier,
+			Concurrency:    max(a.Concurrency, 1),
 			// The limits within the render's own range, so the dispatcher's
 			// Validate takes the entry whatever was written into it.
 			QueueTimeoutSeconds:   min(max(a.QueueTimeoutSeconds, 0), math.MaxInt32),

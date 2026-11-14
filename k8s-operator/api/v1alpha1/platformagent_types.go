@@ -22,6 +22,13 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// PlatformAgentModeNext is the one value spec.mode takes. The field is
+// deprecated: "today" named a stack no release renders any more, so the
+// admission webhook rewrites it, and an absent field, to this value, and the
+// operator patches a stored "today" to it. The CRD markers on Mode below
+// spell the same value by hand, since a marker cannot name a constant.
+const PlatformAgentModeNext = "next"
+
 // PlatformAgentSpec defines the desired state of PlatformAgent
 type PlatformAgentSpec struct {
 	AgentSpec `json:",inline"`
@@ -34,10 +41,14 @@ type PlatformAgentSpec struct {
 	// +optional
 	Integration *PlatformAgentIntegrationSpec `json:"integration,omitempty"`
 
-	// Mode selects which component stack the operator renders.  "today" is the
-	// current architecture.  "next" additionally renders the NATS and A2A
-	// gateway components, which are otherwise dark.  Absent means "today".
+	// Mode is deprecated and ignored: every install runs the A2A stack (the
+	// NATS bus and the A2A gateway), which "next" once selected.
+	// The field stays so a stored object that still carries "today" remains
+	// valid; the admission webhook rewrites "today" to "next", the schema
+	// defaults an absent field to "next", and the operator patches a stored
+	// "today" to "next" on its first pass. A later release removes the field.
 	// +kubebuilder:validation:Enum=today;next
+	// +kubebuilder:default=next
 	// +optional
 	Mode *string `json:"mode,omitempty"`
 
@@ -317,7 +328,7 @@ type GoogleChatSpec struct {
 	Mode string `json:"mode,omitempty"`
 
 	// AnswerFeedback draws thumbs-up and thumbs-down buttons under each
-	// final answer on Google Chat under spec.mode next, and keeps each rating
+	// final answer on Google Chat, and keeps each rating
 	// with its question and answer (a thumbs-down with its note) on the install for the feedback bucket's max age (30 days as provisioned).
 	// False hides the buttons and keeps nothing.
 	// +kubebuilder:default=true
@@ -362,7 +373,7 @@ type SlackSpec struct {
 	HomeChannelName string `json:"homeChannelName,omitempty"`
 
 	// AnswerFeedback draws Slack's thumbs-up and thumbs-down buttons under
-	// each final answer under spec.mode next, and keeps each rating with
+	// each final answer, and keeps each rating with
 	// its question and answer (a thumbs-down with its note) on the install for the feedback bucket's max age (30 days as provisioned).
 	// False hides the buttons and keeps nothing.
 	// +kubebuilder:default=true
@@ -370,7 +381,7 @@ type SlackSpec struct {
 	AnswerFeedback *bool `json:"answerFeedback,omitempty"`
 
 	// HomeChannelPolicy ("auto", also absent, or "manual") says whether the
-	// A2A gateway may learn the Slack home channel under spec.mode next with
+	// A2A gateway may learn the Slack home channel with
 	// Slack on the gateway (Google Chat not enabled) when HomeChannel is
 	// empty. Under "auto" the channel of the first top-level
 	// mention of the agent in a channel becomes the home channel: the gateway

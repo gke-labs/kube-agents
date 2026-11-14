@@ -94,7 +94,8 @@ const (
 	// a Role and RoleBinding nobody installs by default. A RoleBinding can name
 	// a Role in its own namespace only, so the Role is copied, not referenced.
 	rbacAgentNamespaceCause = "a denial marked (in namespace ...) means that namespace has no copy of the " +
-		"operator's namespaced Role and no RoleBinding to it; create both there"
+		"operator's namespaced Role and no RoleBinding to it; create both there (the chart and make deploy " +
+		"render them in the install namespace and in its profile namespace)"
 	// rbacAgentNamespaceLabelMark is the substring of a denied label that names
 	// an agent namespace (rbacAgentNamespaceLabelFormat's opening), which
 	// rbacIncompleteMessage looks for to add rbacAgentNamespaceCause.
@@ -112,10 +113,13 @@ const (
 	// and nobody goes looking for a missing ClusterRole rule.
 	rbacNamespacedLabelSuffix = " (in the operator's namespace)"
 	// rbacAgentNamespaceLabelFormat is the same mark for a PlatformAgent's own
-	// namespace, when that is not the operator's: "create secrets (in namespace
-	// team-a)". The namespaced Role is bound in the install namespace by both
-	// install paths and nowhere else, so an agent elsewhere is the one install
-	// shape the operator-namespace probe cannot see.
+	// namespace, when that is not the operator's, and for its profile namespace:
+	// "create secrets (in namespace team-a)", "create deployments.apps (in
+	// namespace kubeagents-system-profiles)". The namespaced Role is bound in
+	// the install namespace and the profile namespace by both install paths
+	// (the chart under mode next, make deploy in every mode); those two
+	// namespaces, and an agent elsewhere, are what the operator-namespace
+	// probe cannot see.
 	rbacAgentNamespaceLabelFormat = " (in namespace %s)"
 )
 
@@ -147,9 +151,10 @@ type requiredPermission struct {
 var (
 	rbacReadVerbs  = []string{"get", "list", "watch"}
 	rbacWriteVerbs = []string{"get", "list", "watch", "create", "update", "patch", "delete"}
-	// rbacSecretWriteVerbs is the namespaced half of the Secret grant: the
-	// verbs that change a Secret, without the reads the ClusterRole holds.
-	rbacSecretWriteVerbs = []string{"create", "update", "patch", "delete"}
+	// rbacNamespacedWriteVerbs is the namespaced half of every rendered kind's
+	// grant: the verbs that change an object, without the reads the
+	// ClusterRole holds for the informers and for escalation prevention.
+	rbacNamespacedWriteVerbs = []string{"create", "update", "patch", "delete"}
 	// rbacSecretsListLabel and rbacSecretsWatchLabel are the denied labels of
 	// the cluster-wide Secret enumeration tuples. resolveMinimalRoleSecretsRead
 	// looks for them in Denied() to tell an operator whose ClusterRole predates
@@ -167,33 +172,53 @@ var (
 // fails on any difference in either direction, so a marker change that forgets
 // this list does not build green.
 var requiredPermissions = []requiredPermission{
-	{Group: "kubeagents.x-k8s.io", Resources: []string{"platformagents"}, Verbs: rbacWriteVerbs},
+	// The custom resources, each verb with a caller (the markers above
+	// Reconcile and tests/test_operator_secrets_grant.py name them): no
+	// create or delete on platformagents, no whole-status update on
+	// agentplugins. list and watch on platformagents/status are escalation
+	// prevention for the agent's local Role, which grants them.
+	{Group: "kubeagents.x-k8s.io", Resources: []string{"platformagents"}, Verbs: []string{"get", "list", "watch", "update", "patch"}},
 	{Group: "kubeagents.x-k8s.io", Resources: []string{"platformagents/status"}, Verbs: []string{"get", "list", "watch", "update", "patch"}},
 	{Group: "kubeagents.x-k8s.io", Resources: []string{"platformagents/finalizers"}, Verbs: []string{"update"}},
 	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentplugins"}, Verbs: rbacReadVerbs},
-	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentplugins/status"}, Verbs: []string{"get", "update", "patch"}},
+	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentplugins/status"}, Verbs: []string{"get", "patch"}},
 	// agentprofiles: the AgentProfile reconciler adds and removes its
-	// finalizer (update, patch) and writes status; the PlatformAgent
-	// reconciler lists them into the identity map.
-	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentprofiles"}, Verbs: []string{"get", "list", "watch", "update", "patch"}},
-	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentprofiles/status"}, Verbs: []string{"get", "update", "patch"}},
-	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentprofiles/finalizers"}, Verbs: []string{"update"}},
+	// finalizer with a merge patch (patchFinalizers; no update, which would
+	// drop spec fields a newer CRD added) and writes status with
+	// Status().Update; the PlatformAgent reconciler lists them into the
+	// identity map.
+	// No agentprofiles/finalizers: nothing carries an owner reference to a
+	// profile, so owner-references admission never asks for it.
+	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentprofiles"}, Verbs: []string{"get", "list", "watch", "patch"}},
+	{Group: "kubeagents.x-k8s.io", Resources: []string{"agentprofiles/status"}, Verbs: []string{"get", "update"}},
 	// tiers: the Tier reconciler reads each tier and writes its Accepted
 	// condition (#3659). Nothing else: tiers are cluster administrators' to
 	// write.
 	{Group: "kubeagents.x-k8s.io", Resources: []string{"tiers"}, Verbs: rbacReadVerbs},
 	{Group: "kubeagents.x-k8s.io", Resources: []string{"tiers/status"}, Verbs: []string{"get", "update", "patch"}},
-	{Group: "apps", Resources: []string{"deployments", "statefulsets"}, Verbs: rbacWriteVerbs},
+	// Every rendered kind is two tuples: the reads cluster-wide, for the
+	// informers and for escalation prevention, and the writes namespaced, in
+	// the Role document (the markers carry `namespace=`), which both install
+	// paths bind in the install namespace and the chart binds in the profile
+	// namespace as well. docs/designs/operator-namespaced-write-verbs.md.
+	{Group: "apps", Resources: []string{"deployments", "statefulsets"}, Verbs: rbacReadVerbs},
+	{Group: "apps", Resources: []string{"deployments", "statefulsets"}, Verbs: rbacNamespacedWriteVerbs, Namespaced: true},
 	{Group: "apps", Resources: []string{"daemonsets", "replicasets"}, Verbs: rbacReadVerbs},
-	{Group: "", Resources: []string{"serviceaccounts", "persistentvolumeclaims", "configmaps", "services", "pods"}, Verbs: rbacWriteVerbs},
+	// The bus StatefulSet's revisions: which profiles every server has
+	// loaded (a2aClusterLoadedProfiles).
+	{Group: "apps", Resources: []string{"controllerrevisions"}, Verbs: []string{"get"}},
+	{Group: "", Resources: []string{"serviceaccounts", "persistentvolumeclaims", "configmaps", "services", "pods"}, Verbs: rbacReadVerbs},
+	{Group: "", Resources: []string{"serviceaccounts", "persistentvolumeclaims", "configmaps", "services", "pods"}, Verbs: rbacNamespacedWriteVerbs, Namespaced: true},
 	{Group: "", Resources: []string{"namespaces", "nodes", "persistentvolumes", "limitranges", "endpoints", "pods/log"}, Verbs: rbacReadVerbs},
 	// events: read with the rest, plus create and patch for the Recorder's
-	// Events on the PlatformAgent. On an install whose ClusterRole predates
-	// the recorder this is the shortfall the self-check names.
-	{Group: "", Resources: []string{"events"}, Verbs: []string{"get", "list", "watch", "create", "patch"}},
-	// resourcequotas: the mode-next session-pod bound is rendered and removed
-	// by the operator, so this one is write rather than read.
-	{Group: "", Resources: []string{"resourcequotas"}, Verbs: rbacWriteVerbs},
+	// Events on the PlatformAgent, in its namespace. On an install whose
+	// RBAC predates the recorder this is the shortfall the self-check names.
+	{Group: "", Resources: []string{"events"}, Verbs: rbacReadVerbs},
+	{Group: "", Resources: []string{"events"}, Verbs: []string{"create", "patch"}, Namespaced: true},
+	// resourcequotas: the mode-next session-pod bound and the profile quota
+	// are rendered and removed by the operator, so this one has writes.
+	{Group: "", Resources: []string{"resourcequotas"}, Verbs: rbacReadVerbs},
+	{Group: "", Resources: []string{"resourcequotas"}, Verbs: rbacNamespacedWriteVerbs, Namespaced: true},
 	// secrets, read, cluster-wide: `get` for checkShellSandboxKeys and
 	// stampSecretEnvHash, by name; `list` and `watch` held only so
 	// buildMinimalPlatformRole, which grants them to the agent's audit
@@ -208,30 +233,45 @@ var requiredPermissions = []requiredPermission{
 	// carries `namespace=`, so the grant is a Role in the install namespace and
 	// the ClusterRole carries no Secret write verb. See
 	// tests/test_operator_secrets_grant.py.
-	{Group: "", Resources: []string{"secrets"}, Verbs: rbacSecretWriteVerbs, Namespaced: true},
+	{Group: "", Resources: []string{"secrets"}, Verbs: rbacNamespacedWriteVerbs, Namespaced: true},
 	{Group: "metrics.k8s.io", Resources: []string{"nodes", "pods"}, Verbs: rbacReadVerbs},
 	{Group: "autoscaling", Resources: []string{"horizontalpodautoscalers"}, Verbs: rbacReadVerbs},
 	{Group: "batch", Resources: []string{"cronjobs"}, Verbs: rbacReadVerbs},
 	// jobs: the mode-next provisioning run is created and swept by the operator.
-	{Group: "batch", Resources: []string{"jobs"}, Verbs: rbacWriteVerbs},
+	{Group: "batch", Resources: []string{"jobs"}, Verbs: rbacReadVerbs},
+	{Group: "batch", Resources: []string{"jobs"}, Verbs: rbacNamespacedWriteVerbs, Namespaced: true},
 	// dispatchjobtemplates: the dispatcher Job admission policy's params in
-	// the profile namespace, which the operator alone writes. No watch: read
-	// uncached. podtemplates: create only, the dry run that defaults them.
-	{Group: "kubeagents.x-k8s.io", Resources: []string{"dispatchjobtemplates"}, Verbs: []string{"get", "list", "create", "update", "patch", "delete"}},
-	{Group: "", Resources: []string{"podtemplates"}, Verbs: []string{"create"}},
+	// the profile namespace, which the operator alone writes. The reads stay
+	// cluster-wide (no watch; the teardown lists the kind in a profile
+	// namespace that a mode-today install never binds the Role in), the
+	// writes are namespaced. podtemplates: create only, the dry run that
+	// defaults them.
+	{Group: "kubeagents.x-k8s.io", Resources: []string{"dispatchjobtemplates"}, Verbs: []string{"get", "list"}},
+	{Group: "kubeagents.x-k8s.io", Resources: []string{"dispatchjobtemplates"}, Verbs: rbacNamespacedWriteVerbs, Namespaced: true},
+	{Group: "", Resources: []string{"podtemplates"}, Verbs: []string{"create"}, Namespaced: true},
 	// The dispatcher Job admission policy and its binding, read by name
 	// before the dispatcher gets its Jobs Role (dispatcherJobPolicyInPlace).
 	{Group: "admissionregistration.k8s.io", Resources: []string{"validatingadmissionpolicies"}, Verbs: []string{"get"}, Name: dispatcherJobPolicyName},
 	{Group: "admissionregistration.k8s.io", Resources: []string{"validatingadmissionpolicybindings"}, Verbs: []string{"get"}, Name: dispatcherJobPolicyName},
-	{Group: "coordination.k8s.io", Resources: []string{"leases"}, Verbs: rbacWriteVerbs},
+	{Group: "coordination.k8s.io", Resources: []string{"leases"}, Verbs: rbacReadVerbs},
+	{Group: "coordination.k8s.io", Resources: []string{"leases"}, Verbs: rbacNamespacedWriteVerbs, Namespaced: true},
 	{Group: "node.k8s.io", Resources: []string{"runtimeclasses"}, Verbs: rbacReadVerbs},
 	// storageclasses: growDataClaim reads a data claim's class by name.
 	{Group: "storage.k8s.io", Resources: []string{"storageclasses"}, Verbs: []string{"get"}},
-	{Group: "networking.k8s.io", Resources: []string{"networkpolicies"}, Verbs: rbacWriteVerbs},
+	{Group: "networking.k8s.io", Resources: []string{"networkpolicies"}, Verbs: rbacReadVerbs},
+	{Group: "networking.k8s.io", Resources: []string{"networkpolicies"}, Verbs: rbacNamespacedWriteVerbs, Namespaced: true},
 	{Group: "networking.k8s.io", Resources: []string{"ingresses"}, Verbs: rbacReadVerbs},
-	{Group: "networking.gke.io", Resources: []string{"fqdnnetworkpolicies"}, Verbs: rbacWriteVerbs},
-	{Group: "policy", Resources: []string{"poddisruptionbudgets"}, Verbs: rbacWriteVerbs},
-	{Group: "rbac.authorization.k8s.io", Resources: []string{"clusterroles", "clusterrolebindings", "roles", "rolebindings"}, Verbs: rbacWriteVerbs},
+	{Group: "networking.gke.io", Resources: []string{"fqdnnetworkpolicies"}, Verbs: rbacReadVerbs},
+	{Group: "networking.gke.io", Resources: []string{"fqdnnetworkpolicies"}, Verbs: rbacNamespacedWriteVerbs, Namespaced: true},
+	{Group: "policy", Resources: []string{"poddisruptionbudgets"}, Verbs: rbacReadVerbs},
+	{Group: "policy", Resources: []string{"poddisruptionbudgets"}, Verbs: rbacNamespacedWriteVerbs, Namespaced: true},
+	// The cluster-scoped RBAC kinds keep every verb: the per-agent ClusterRoles
+	// and bindings have computed names. Roles and RoleBindings are rendered in
+	// the agent's namespace and the profile namespace only, so their writes
+	// are namespaced; the informers keep the reads cluster-wide.
+	{Group: "rbac.authorization.k8s.io", Resources: []string{"clusterroles", "clusterrolebindings"}, Verbs: rbacWriteVerbs},
+	{Group: "rbac.authorization.k8s.io", Resources: []string{"roles", "rolebindings"}, Verbs: rbacReadVerbs},
+	{Group: "rbac.authorization.k8s.io", Resources: []string{"roles", "rolebindings"}, Verbs: rbacNamespacedWriteVerbs, Namespaced: true},
 	// `bind` on system:auth-delegator, which the operator uses under mode:
 	// next to grant the auth callout TokenReview. Probed WITH the name,
 	// because the grant is scoped by resourceNames and a scoped grant does
@@ -316,10 +356,12 @@ func flattenRequiredPermissions() []permissionTuple {
 // grant being checked. A namespaced tuple is reviewed in namespace, the
 // operator's own, where both paths bind the Role, and once more in each of
 // agentNamespaces: the namespaces of the PlatformAgents the controller has
-// reconciled that are not the operator's own. An agent there reads its
-// Secrets under a RoleBinding nobody installs by default, so without this
-// second review the probe passes while every reconcile of that agent fails
-// forbidden. An empty namespace (under `make run`, off the cluster) reviews
+// reconciled that are not the operator's own, and the profile namespaces it
+// has seen exist. An agent outside the install namespace writes under a
+// RoleBinding nobody installs by default, and the profile namespace under the
+// one the chart renders there, so without this second review the probe passes
+// while every write in those namespaces fails forbidden. An empty namespace
+// (under `make run`, off the cluster) reviews
 // the operator-namespace tuple cluster-wide, which the developer's own
 // credential answers.
 func probeRBAC(ctx context.Context, reviews authorizationv1client.SelfSubjectAccessReviewInterface, namespace string, agentNamespaces []string) ([]deniedPermission, error) {
@@ -566,11 +608,12 @@ func (c *RBACChecker) Denied() []string {
 	return labelsOf(c.denied)
 }
 
-// DeniedFor returns the last probe's denials that concern an agent in
-// namespace: every cluster-wide and operator-namespace denial, plus the ones
-// probed in that namespace. A denial in some other agent's namespace is that
-// agent's condition, not this one's.
-func (c *RBACChecker) DeniedFor(namespace string) []string {
+// DeniedFor returns the last probe's denials that concern an agent whose
+// namespaces are the ones given (its own and its profile namespace): every
+// cluster-wide and operator-namespace denial, plus the ones probed in those
+// namespaces. A denial in some other agent's namespace is that agent's
+// condition, not this one's.
+func (c *RBACChecker) DeniedFor(namespaces ...string) []string {
 	if c == nil {
 		return nil
 	}
@@ -578,7 +621,7 @@ func (c *RBACChecker) DeniedFor(namespace string) []string {
 	defer c.mu.Unlock()
 	var out []string
 	for _, d := range c.denied {
-		if d.namespace == "" || d.namespace == namespace {
+		if d.namespace == "" || slices.Contains(namespaces, d.namespace) {
 			out = append(out, d.label)
 		}
 	}
@@ -680,7 +723,9 @@ func rbacIncompleteMessage(denied []string) string {
 // still names the denied permissions in that case.
 func (r *PlatformAgentReconciler) reportRBACSkew(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (bool, error) {
 	r.RBAC.Observe(agent.Namespace)
-	denied := r.RBAC.DeniedFor(agent.Namespace)
+	// The profile namespace is observed where the reconcile first sees it
+	// exist (reconcileProfileFence); its denials are this agent's too.
+	denied := r.RBAC.DeniedFor(agent.Namespace, profileNamespaceName(agent))
 	degraded := len(denied) > 0
 	existing := meta.FindStatusCondition(agent.Status.Conditions, degradedConditionType)
 	ownsCondition := existing == nil || existing.Reason == reasonRBACIncomplete

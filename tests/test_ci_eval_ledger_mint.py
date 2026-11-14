@@ -590,6 +590,7 @@ class UnitNotRunTest(unittest.TestCase):
                         "reset_agent_pulls",
                         "record_unit_not_run",
                         "finished_rep_count",
+                        "case_repetitions",
                         "release_streams",
                         "skip_unit",
                         "run_one_unit",

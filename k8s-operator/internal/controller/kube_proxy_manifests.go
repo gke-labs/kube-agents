@@ -253,6 +253,10 @@ func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent, otlpEndpoint s
 		{Name: memlimit.GoMemLimitEnv, Value: kubeProxyGoMemLimit()},
 		{Name: "CREDENTIAL_PROXY_AUDIENCE", Value: credentialProxyAudience},
 		{Name: "CREDENTIAL_PROXY_ALLOWED_CALLERS", Value: allowedCallers},
+		// The host API server by its full name. The proxy's own default is
+		// kubernetes.default.svc, a 2-dot name that this pod's ndots:2 would
+		// ask the upstream resolver for first (publicAPICallerPodNdots).
+		{Name: "CREDENTIAL_PROXY_KUBE_API_SERVER", Value: inClusterAPIServer},
 		{Name: "CREDENTIAL_PROXY_KUBE_CA_FILE", Value: kubeAPIAccessMountPath + "/ca.crt"},
 		{Name: "CREDENTIAL_PROXY_KUBE_TOKEN_FILE", Value: kubeAPIAccessMountPath + "/token"},
 	}
@@ -415,6 +419,8 @@ func buildKubeProxyDeployment(agent *agentv1alpha1.PlatformAgent, otlpEndpoint s
 					Annotations: podAnnotations,
 				},
 				Spec: corev1.PodSpec{
+					// ndots:2, see publicAPICallerPodNdots.
+					DNSConfig:                    publicAPICallerPodDNSConfig(),
 					ServiceAccountName:           saName,
 					AutomountServiceAccountToken: ptr.To(false),
 					SecurityContext: &corev1.PodSecurityContext{

@@ -117,10 +117,10 @@ spec:
             # The three images the operator resolves for pods the chart never
             # renders: an agent Deployment whose PlatformAgent omits
             # spec.deployment.image, the shell sandbox StatefulSet it renders
-            # beside every agent pod, and the logging sidecar it injects into
-            # that pod. Without these a mirrored install still reaches ghcr.io
-            # and Docker Hub at reconcile time, long after `helm install`
-            # reported success. CREDENTIAL_PROXY_IMAGE is absent by design —
+            # beside every agent pod, the logging sidecar it injects into
+            # that pod, and the NATS bus's four images. Without these a
+            # mirrored install still reaches ghcr.io and Docker Hub at
+            # reconcile time, long after `helm install` reported success. CREDENTIAL_PROXY_IMAGE is absent by design —
             # the operator derives the broker image from the agent image by
             # swapping the trailing name, so it follows the value below. The
             # sandbox is not derived from the agent image, so it is named.
@@ -151,6 +151,49 @@ spec:
               value: "{{ include "kube-agents.imageRepository" (dict "repository" ($sandboxImage.repository | default "ghcr.io/gke-labs/kube-agents/agent-sandbox") "registry" (include "kube-agents.imageRegistry" .)) }}:{{ $sandboxImage.tag | default .Chart.AppVersion }}"
             - name: FLUENT_BIT_IMAGE
               value: "{{ include "kube-agents.imageRepository" (dict "repository" .Values.fluentBit.image.repository "registry" (include "kube-agents.thirdPartyImageRegistry" .)) }}:{{ .Values.fluentBit.image.tag }}"
+            {{- /* The A2A NATS bus's four third-party images, which the
+                   operator renders for every install and which, like
+                   FLUENT_BIT_IMAGE, follow global.thirdPartyImageRegistry.
+                   Rendered through kube-agents.thirdPartyImage rather than
+                   imageRepository because two of the four are pinned by digest
+                   as well as tag: unmirrored, the operator pulls the full pin;
+                   mirrored, it pulls <prefix>/<name>:<tag>, the copy `make
+                   mirror-images` writes. Always set, so the operator never falls
+                   back to its compiled Docker Hub defaults on a mirrored
+                   install, and so A2A_NATS_IMAGE and A2A_NATS_EXPORTER_IMAGE are
+                   set together (the operator omits the exporter sidecar when
+                   only the first is: a2aNATSExporterOmitted, mirrored by
+                   kube-agents.a2aNATSExporterRendered). The one exception is
+                   operator.extraEnv that sets A2A_NATS_IMAGE alone, the mirrored
+                   install from before the exporter existed: the chart's exporter
+                   pin stays out (kube-agents.a2aBusExporterFromChart), so that
+                   install keeps running without the sidecar.
+
+                   `| default dict` because a2aBus is a key this chart gained,
+                   the same guard agentSandbox carries above: a render against an
+                   older release's values (`helm upgrade --reuse-values`) has no
+                   a2aBus, and skipping the four there leaves the operator on its
+                   compiled defaults, the same pins, as that release already
+                   ran. */}}
+            {{- $bus := (.Values.a2aBus | default dict).images | default dict }}
+            {{- with $bus.nats }}
+            - name: A2A_NATS_IMAGE
+              value: {{ include "kube-agents.thirdPartyImage" (dict "repository" .repository "tag" .tag "root" $) | quote }}
+            {{- end }}
+            {{- with $bus.natsBox }}
+            - name: A2A_PROVISION_IMAGE
+              value: {{ include "kube-agents.thirdPartyImage" (dict "repository" .repository "tag" .tag "root" $) | quote }}
+            {{- end }}
+            {{- with $bus.configReloader }}
+            - name: A2A_NATS_RELOADER_IMAGE
+              value: {{ include "kube-agents.thirdPartyImage" (dict "repository" .repository "tag" .tag "root" $) | quote }}
+            {{- end }}
+            {{- if include "kube-agents.a2aBusExporterFromChart" $ }}
+            {{- with $bus.prometheusExporter }}
+            - name: A2A_NATS_EXPORTER_IMAGE
+              value: {{ include "kube-agents.thirdPartyImage" (dict "repository" .repository "tag" .tag "root" $) | quote }}
+            {{- end }}
+            {{- end }}
             {{- /* The pull identity for those same pods. Redundant for the CR
                    this release renders, which carries the secrets itself, and
                    load-bearing for any OTHER PlatformAgent written against this
