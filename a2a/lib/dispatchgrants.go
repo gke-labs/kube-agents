@@ -52,17 +52,22 @@ func DispatcherBucketCredential(bucket int) string {
 // accepts only the canonical spelling DispatcherBucketCredential writes, with
 // this build's K and a bucket in [0, K). Anything else is an error, so a
 // stray password is refused rather than read as some bucket.
+//
+// The error names the part that was wrong and never the password: a refused
+// one is whatever the client put in CONNECT's password field, a credential
+// sent on the wrong entry included, and the callout logs this error as the
+// refusal's reason (CodeQL go/clear-text-logging, alert #134).
 func ParseDispatcherBucketCredential(s string) (int, error) {
 	b, k, ok := strings.Cut(s, "/")
 	if !ok {
 		return 0, fmt.Errorf("a dispatcher bucket is <bucket>/<buckets>")
 	}
 	if k != strconv.Itoa(DispatcherBuckets) {
-		return 0, fmt.Errorf("the dispatcher asks for %q buckets; this callout splits its grants into %d", k, DispatcherBuckets)
+		return 0, fmt.Errorf("the dispatcher asks for a bucket count other than %d, which this callout splits its grants into", DispatcherBuckets)
 	}
 	n, err := strconv.Atoi(b)
 	if err != nil || n < 0 || n >= DispatcherBuckets || strconv.Itoa(n) != b {
-		return 0, fmt.Errorf("dispatcher bucket %q is not one of 0..%d", b, DispatcherBuckets-1)
+		return 0, fmt.Errorf("the dispatcher bucket is not a plain integer in 0..%d", DispatcherBuckets-1)
 	}
 	return n, nil
 }

@@ -1,6 +1,7 @@
 package authcallout
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/nats-io/jwt/v2"
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nkeys"
 
 	lib "github.com/gke-labs/kube-agents/a2a/lib"
@@ -227,6 +229,45 @@ func TestABadBucketIsRefusedNotServedTheControlGrants(t *testing.T) {
 			t.Errorf("password %q: accepted as user %q", bad, d.user)
 		} else if !strings.Contains(err.Error(), "dispatcher bucket") {
 			t.Errorf("password %q: %v", bad, err)
+		}
+	}
+}
+
+// The refusal's reason is the one place a refused connection's cause exists,
+// and the callout logs it; the password is whatever the client sent, a task
+// credential presented on the dispatcher's entry included. So the log line
+// says a dispatcher bucket was refused and carries no part of the password,
+// through the same decide the server's request reaches.
+func TestARefusedBucketPasswordIsNotLogged(t *testing.T) {
+	const marker = "s3cr3t-credential"
+	svc := newDispatcherTestService(t, renderMap(t, dispatcherEntry(), profileEntry("a", "read")), dispatcherTokens())
+	var logged bytes.Buffer
+	svc.log = slog.New(slog.NewTextHandler(&logged, nil))
+	serverKP, err := nkeys.CreateServer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverID, _ := serverKP.PublicKey()
+	for _, bad := range []string{marker + "/32", "7/" + marker, marker + "/" + marker} {
+		logged.Reset()
+		userKP, _ := nkeys.CreateUser()
+		userPub, _ := userKP.PublicKey()
+		rc := jwt.NewAuthorizationRequestClaims(userPub)
+		rc.Server.ID = serverID
+		rc.UserNkey = userPub
+		rc.ConnectOptions.Token = dispatcherToken
+		rc.ConnectOptions.Password = bad
+		encoded, err := rc.Encode(serverKP)
+		if err != nil {
+			t.Fatal(err)
+		}
+		svc.decide(context.Background(), &nats.Msg{Subject: AuthRequestSubject, Data: []byte(encoded)})
+		got := logged.String()
+		if !strings.Contains(got, "refusing a connection") || !strings.Contains(got, "dispatcher bucket") {
+			t.Fatalf("password %q: no refusal for a dispatcher bucket was logged:\n%s", bad, got)
+		}
+		if strings.Contains(got, marker) {
+			t.Errorf("password %q: the log carries the password:\n%s", bad, got)
 		}
 	}
 }
