@@ -133,7 +133,7 @@ func TestA2ACardStopResultIsBounded(t *testing.T) {
 	d := bareDoor(t)
 	key := a2aConversationKey(a2aTestCaller, "big-stop")
 	d.TaskStarted(key, "task-stop")
-	big := make([]byte, a2aMaxResultBytes)
+	big := make([]byte, a2aMaxResultBytes+64)
 	for i := range big {
 		big[i] = 'x'
 	}
@@ -146,8 +146,8 @@ func TestA2ACardStopResultIsBounded(t *testing.T) {
 	if _, ok := cardStopResultOf(obj.Artifacts[0].Parts); ok {
 		t.Error("an over-bound card-stop result kept its part")
 	}
-	if n := len(joinTextParts(obj.Artifacts[0].Parts)); n > a2aMaxResultBytes+len("…") {
-		t.Errorf("the card-stop text is %d bytes, past the bound", n)
+	if n := len(joinTextParts(obj.Artifacts[0].Parts)); n > a2aMaxResultBytes+len("…") || n >= len(big) {
+		t.Errorf("the card-stop text is %d bytes, not cut to the bound", n)
 	}
 	if _, cut := obj.Metadata["resultTruncatedFrom"]; !cut {
 		t.Error("a cut card-stop result is not marked resultTruncatedFrom")
