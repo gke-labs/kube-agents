@@ -4,10 +4,6 @@
 # ==============================================================================
 set -e
 
-# An install.env that records no PLATFORM_AGENT_MODE predates the key, so it
-# is a today install whatever DEFAULT_PLATFORM_AGENT_MODE now says.
-readonly GCHAT_UNRECORDED_PLATFORM_AGENT_MODE="today"
-
 # Any position, as common.sh reads its own flags: `-y --help` is still a
 # request for this text, not a run.
 for arg in "$@"; do
@@ -17,9 +13,8 @@ for arg in "$@"; do
 Usage: print_instructions_gchat.sh [--dry-run] [-y|--no-confirm]
 
 Prints the Google Chat setup checklist for this install: the app settings to
-verify, the first message to send, and the steps after it. The steps follow
-the Google Chat path the install uses: the A2A gateway under
-PLATFORM_AGENT_MODE=next, the Hermes listener otherwise. It reads
+verify, the first message to send, and the steps after it (the A2A gateway
+holds Google Chat). It reads
 the install.env at the root of the checkout it sits in ($KUBE_AGENTS_INSTALL_ENV
 instead, when set) and scripts/installer/vars.sh, and prints the checklist
 only when GOOGLE_CHAT_ENABLED is on there (true, yes, 1 or on). install.sh runs it
@@ -42,17 +37,11 @@ source "${SCRIPT_DIR}/common.sh" "$@"
 # which terraform/modules/chat-pubsub/main.tf grants publisher on the events topic.
 readonly WORKSPACE_ADDONS_SA_DOMAIN="gcp-sa-gsuiteaddons.iam.gserviceaccount.com"
 
-# A standalone run takes the mode from install.env alone, as install.sh's own
-# bootstrap does.
-if [ -z "${GCHAT_STEPS_PLATFORM_AGENT_MODE+set}" ] && [ -f "$(install_env_file_for_state)" ]; then
-  unset PLATFORM_AGENT_MODE
-fi
 load_state
 
 # install.sh passes what its run applied, which load_state's install.env would
 # otherwise override. A standalone run passes none and reads the file.
-if [ -n "${GCHAT_STEPS_PLATFORM_AGENT_MODE+set}" ]; then
-  PLATFORM_AGENT_MODE="$GCHAT_STEPS_PLATFORM_AGENT_MODE"
+if [ -n "${GCHAT_STEPS_GOOGLE_CHAT_ENABLED+set}" ]; then
   GOOGLE_CHAT_ENABLED="${GCHAT_STEPS_GOOGLE_CHAT_ENABLED:-}"
   GOOGLE_CHAT_HOME_CHANNEL="${GCHAT_STEPS_HOME_CHANNEL:-}"
   ALLOWED_USERS="${GCHAT_STEPS_ALLOWED_USERS:-}"
@@ -77,7 +66,7 @@ print_a2a_gateway_steps() {
   if [ -z "$home" ]; then
     echo -e "[ ] ${step}. No home channel is configured, so the agent posts no alerts or scheduled reports to Google Chat."
     echo -e "       Set ${C_WHITE}GOOGLE_CHAT_HOME_CHANNEL${C_RESET} in install.env to a space name (${C_WHITE}spaces/<id>${C_RESET}) and re-run the installer."
-    echo -e "       A chat message or ${C_WHITE}/sethome${C_RESET} does not set it under next."
+    echo -e "       A chat message or ${C_WHITE}/sethome${C_RESET} does not set it."
   elif [ -n "$not_a_space" ]; then
     echo -e "[ ] ${step}. GOOGLE_CHAT_HOME_CHANNEL is '${not_a_space}', which is not a space name, so the A2A gateway turns off its notify route:"
     echo -e "       no alerts or scheduled reports, and no card reports back to the conversation that asked for them."
@@ -120,32 +109,16 @@ if is_truthy "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}"; then
   echo -e "         ${C_YELLOW}If it stays blank, Chat will silently deliver NO events — re-run install.sh (it re-applies the Chat Pub/Sub resources) and re-save this config.${C_RESET}"
   echo -e ""
   next_step=2
-  on_gateway=false
-  if google_chat_moves_to_a2a_gateway "${PLATFORM_AGENT_MODE:-$GCHAT_UNRECORDED_PLATFORM_AGENT_MODE}" \
-    "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}"; then
-    on_gateway=true
-  fi
   if [ -n "${PROJECT_NUMBER:-}" ]; then
     next_step=3
     echo -e "[ ] 2. Direct DM Link to Bot on Google Chat:"
     echo -e "       ${C_WHITE}https://chat.google.com/dm/${PROJECT_NUMBER}${C_RESET}"
     echo -e "       Type: ${C_WHITE}\"Hi Platform Agent\"${C_RESET}"
-    if ! $on_gateway && [ -z "${GOOGLE_CHAT_HOME_CHANNEL:-}" ]; then
-      echo -e "       With no home channel configured, the install's first chat message makes its space the home channel for scheduled reports."
-      echo -e "       To use a team space instead, send the first message there, or run ${C_WHITE}/sethome${C_RESET} there afterwards."
-    fi
     echo -e ""
   else
     print_warning "PROJECT_NUMBER is unavailable; open the configured app from Google Chat instead of using a generated DM link."
   fi
-  if $on_gateway; then
-    print_a2a_gateway_steps "$next_step"
-    exit 0
-  fi
-  echo -e "[ ] ${next_step}. ${C_YELLOW}[Optional]${C_RESET} Approve pairing code in GKE container:"
-  echo -e "       ${C_CYAN}(Only required for first-time bot deployments. If the bot responds instantly, skip this!)${C_RESET}"
-  echo -e "       ${C_WHITE}kubectl exec -it deploy/${PLATFORM_AGENT_DEPLOYMENT} -n ${NAMESPACE:-$DEFAULT_NAMESPACE} -- hermes pairing approve google_chat <PAIRING_CODE>${C_RESET}"
-  echo -e ""
+  print_a2a_gateway_steps "$next_step"
 else
   # On stderr: a pipe still gets nothing, but a reader who expected the
   # checklist learns which file and key decided there is none.

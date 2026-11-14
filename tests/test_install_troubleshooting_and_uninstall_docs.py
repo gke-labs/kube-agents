@@ -57,10 +57,10 @@ class UninstallDocsTest(unittest.TestCase):
         self.assertNotIn("recurring 1-minute cron in your agent harness", content)
         self.assertNotIn("delete the `agents/platform` directory from your harness workspace", content)
 
-    def test_uninstall_page_documents_mode_next_residue_and_commands(self):
+    def test_uninstall_page_documents_a2a_stack_residue_and_commands(self):
         content = UNINSTALL_MD.read_text(encoding="utf-8")
-        # Check that spec.mode: next section exists
-        self.assertIn("What `spec.mode: next` leaves behind", content)
+        # Check that the A2A stack residue section exists
+        self.assertIn("What the A2A stack leaves behind", content)
         self.assertIn("platform-agent-a2a-nats-creds", content)
         self.assertIn("data-platform-agent-a2a-nats-0", content)
         self.assertIn("a2a-slack-principal-map", content)
