@@ -2819,7 +2819,7 @@ func a2aNATSRoutesName(agent *agentv1alpha1.PlatformAgent) string {
 func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret, keys *a2aCalloutKeys, profiles []string) *corev1.Secret {
 	conf := renderA2ANATSConf(agent, func(key string) string { return string(creds.Data[key]) }, keys, profiles)
 
-	return &corev1.Secret{
+	secret := &corev1.Secret{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      a2aNATSConfigSecretName(agent),
@@ -2828,6 +2828,10 @@ func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.
 		},
 		Data: map[string][]byte{a2aNATSConfKey: []byte(conf)},
 	}
+	// The profiles this config carries, for the single server's loaded set
+	// (a2aServerLoadedProfiles).
+	secret.Annotations = map[string]string{a2aConfigProfilesAnnotation: encodeA2AConfigProfiles(profiles)}
+	return secret
 }
 
 // a2aConfigRolloutHash is the digest that rides the StatefulSet pod template
@@ -6976,6 +6980,10 @@ type a2aProvisionState struct {
 	// busReloadRequeue is when to check again on a bus config reload still
 	// pending (planA2ABusReload). Zero when none is.
 	busReloadRequeue time.Duration
+	// profileHoldRequeue is when to check again on a newly bound profile
+	// held until every bus server has loaded its config
+	// (a2aDispatchableProfiles). Zero when none is held.
+	profileHoldRequeue time.Duration
 	// gatewayElected is the image the pod holding the gateway's Lease runs,
 	// as this pass read it, or nil when it couldn't tell
 	// (observeA2AGatewayElection). The status writers carry it as the
@@ -7197,12 +7205,34 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 			profiles = nil
 		}
 	}
+	// The profiles the dispatcher may take: a newly bound one waits until
+	// every bus server has loaded its config entry, the gateway's deny on its
+	// supervisor subjects (platformagent_a2a_profile_hold.go). The bus config
+	// below carries every bound profile; the dispatcher's grant here and its
+	// dispatch config carry only these. While any waits, the pass looks again
+	// at the reload's recheck.
+	dispatchable, held, err := r.a2aDispatchableProfiles(ctx, agent, profiles)
+	if err != nil {
+		return state, err
+	}
 	// The profiles still draining (#5074), read once from the applied
 	// dispatch config for both renders: the identity map keeps their
 	// .supervisor grant exactly as long as the dispatch config lists them.
-	draining, err := r.dispatchDraining(ctx, agent, profiles)
+	// Against the dispatchable set, not every bound profile: a draining
+	// profile bound again before the bus has loaded it is held, so it keeps
+	// draining until it is dispatchable.
+	draining, err := r.dispatchDraining(ctx, agent, dispatchable)
 	if err != nil {
 		return state, err
+	}
+	if len(held) > 0 {
+		state.profileHoldRequeue = a2aBusReloadRecheck
+		// With the dispatcher off, only the card waits.
+		what := "holding newly bound AgentProfiles out of the dispatcher until every A2A bus server has loaded their config"
+		if !a2aDispatcherEnabled() {
+			what = "holding newly bound AgentProfiles' cards until every A2A bus server has loaded their config"
+		}
+		logf.FromContext(ctx).Info(what, "profiles", held)
 	}
 	// The install's tiers, which the verifier, the gateway and the callout
 	// mount (optional, so ordering against their Deployments doesn't
@@ -7212,7 +7242,7 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	if err := r.applyA2ATiers(ctx, agent, profiles); err != nil {
 		return state, err
 	}
-	authMaps, authMapVersion, err := buildA2AAuthMapConfigMaps(agent, profiles, draining)
+	authMaps, authMapVersion, err := buildA2AAuthMapConfigMapsHeld(agent, profiles, dispatchable, draining)
 	if err != nil {
 		return state, fmt.Errorf("failed to render the A2A identity map: %w", err)
 	}
@@ -7276,6 +7306,7 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// onto it (a2aConfigRolloutHash).
 	profileNames, _ := dispatcherGrantNames(agent, profiles, draining)
 	sts := buildA2ANATSStatefulSet(agent, a2aConfigRolloutHash(agent, creds, calloutKeys, natsTLS.ServingFingerprint, profileNames))
+	annotateA2ABusProfiles(agent, sts, profileNames)
 	busHeld, err := r.a2aBusWaitsForCallout(ctx, agent, sts, calloutGeneration)
 	if err != nil {
 		return state, err
@@ -7291,6 +7322,9 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 			return state, err
 		}
 		if err := r.actOnA2ABusReload(ctx, agent, sts.Name, reload); err != nil {
+			return state, err
+		}
+		if err := r.stampA2ABusPreviousProfiles(ctx, agent, config, sts); err != nil {
 			return state, err
 		}
 		if err := ctrl.SetControllerReference(agent, config, r.Scheme); err != nil {
@@ -7443,16 +7477,18 @@ func (r *PlatformAgentReconciler) reconcileA2AStack(ctx context.Context, agent *
 	// Past the size one identity-map shard can carry, the dispatcher's entry
 	// is left out of the map, so it is torn down as though switched off, and
 	// the condition says why (a2aDispatcherCeiling, gke-labs/kube-agents#5381).
-	// The step itself tears the dispatcher down past the ceiling.
+	// The step itself tears the dispatcher down past the ceiling. Both take
+	// the profiles every bus server has loaded (dispatchable, above), as the
+	// identity map's entry does, so the three agree on the ceiling.
 	state.dispatcherCeiling = dispatcherCeilingRemoved
 	if a2aDispatcherEnabled() {
-		ceiling, _, cerr := a2aDispatcherCeiling(agent, profiles, draining)
+		ceiling, _, cerr := a2aDispatcherCeiling(agent, dispatchable, draining)
 		if cerr != nil {
 			return state, cerr
 		}
 		state.dispatcherCeiling = &ceiling
 	}
-	jobMode, dispatcherProfileErr, err := r.reconcileA2ADispatcherWithJobMode(ctx, agent, profiles, profileFenced, draining)
+	jobMode, dispatcherProfileErr, err := r.reconcileA2ADispatcherWithJobMode(ctx, agent, dispatchable, profileFenced, draining)
 	state.dispatcherJobMode = jobMode
 	if err != nil {
 		return state, err
