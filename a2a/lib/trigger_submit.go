@@ -21,6 +21,25 @@ const (
 	TriggerSubmitSubjectSuffix = ".submit"
 )
 
+// TriggerReplySubjectPrefix opens the subjects the gateway answers a
+// submission on: a2a.trigger.reply.<source>.<id>. A namespace of its own,
+// not the caller's _INBOX, for the reason the verifier answers on
+// a2a.cap.reply.>: a grant to publish into callers' inboxes would reach
+// where they read their JetStream replies.
+const TriggerReplySubjectPrefix = "a2a.trigger.reply."
+
+// TriggerReplySubject is where source's submission id is answered.
+func TriggerReplySubject(source, id string) string {
+	return TriggerReplySubjectPrefix + source + "." + id
+}
+
+// ValidTriggerReplySubject reports whether reply is
+// a2a.trigger.reply.<source>.<id>, with id one subject token.
+func ValidTriggerReplySubject(source, reply string) bool {
+	id, ok := strings.CutPrefix(reply, TriggerReplySubjectPrefix+source+".")
+	return ok && id != "" && !strings.ContainsAny(id, ".*> \t\r\n")
+}
+
 // TriggerSourceSchedule is the source whose triggers are AgentSchedules,
 // published by the operator's reconciler.
 const TriggerSourceSchedule = triggerScheduleSource

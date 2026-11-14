@@ -71,7 +71,7 @@ func startTriggerRig(t *testing.T, tweak func(*Config)) *triggerRig {
 	}
 	// The ingress subscribes as Run starts; wait until it answers.
 	waitFor(t, "the trigger ingress", func() bool {
-		_, err := nc.Request(lib.TriggerSubmitSubject("schedule"), []byte("{"), time.Second)
+		_, err := tr.request("schedule", []byte("{"), time.Second)
 		return err == nil
 	})
 	return tr
@@ -86,7 +86,7 @@ func (tr *triggerRig) submit(t *testing.T, source string, body any) lib.TriggerS
 			t.Fatal(err)
 		}
 	}
-	msg, err := tr.nc.Request(lib.TriggerSubmitSubject(source), data, 5*time.Second)
+	msg, err := tr.request(source, data, 5*time.Second)
 	if err != nil {
 		t.Fatalf("request: %v", err)
 	}
@@ -95,6 +95,21 @@ func (tr *triggerRig) submit(t *testing.T, source string, body any) lib.TriggerS
 		t.Fatalf("reply %q: %v", msg.Data, err)
 	}
 	return reply
+}
+
+// request submits data for source with the reply on the source's own reply
+// namespace, as the operator will, and waits for the answer.
+func (tr *triggerRig) request(source string, data []byte, wait time.Duration) (*nats.Msg, error) {
+	reply := lib.TriggerReplySubject(source, nats.NewInbox()[len("_INBOX."):])
+	sub, err := tr.nc.SubscribeSync(reply)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = sub.Unsubscribe() }()
+	if err := tr.nc.PublishRequest(lib.TriggerSubmitSubject(source), reply, data); err != nil {
+		return nil, err
+	}
+	return sub.NextMsg(wait)
 }
 
 func (tr *triggerRig) submissions() []*nats.Msg {
@@ -357,5 +372,23 @@ func TestATriggerTasksEndPostsNothingToChat(t *testing.T) {
 		if strings.HasPrefix(p.Conversation, triggerConversationPrefix) {
 			t.Fatalf("posted to a trigger's conversation: %+v", p)
 		}
+	}
+}
+
+// TestATriggerSubmissionWithAReplyOutsideItsNamespaceStartsNothing: a
+// submission whose reply subject isn't a2a.trigger.reply.<source>.<id>
+// (here, a plain inbox) is dropped unanswered, and no task starts.
+func TestATriggerSubmissionWithAReplyOutsideItsNamespaceStartsNothing(t *testing.T) {
+	tr := startTriggerRig(t, nil)
+	data, err := json.Marshal(goodScheduleSubmit())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tr.nc.Request(lib.TriggerSubmitSubject("schedule"), data, 500*time.Millisecond); err == nil {
+		t.Fatal("a submission with an inbox reply was answered")
+	}
+	time.Sleep(200 * time.Millisecond)
+	if n := len(tr.submissions()); n != 0 {
+		t.Fatalf("%d submissions published", n)
 	}
 }

@@ -99,3 +99,18 @@ func TestScheduleDeliveryIsChatOrLocalWithALabelKey(t *testing.T) {
 		}
 	}
 }
+
+func TestATriggerReplyIsOnlyInItsSourcesNamespace(t *testing.T) {
+	good := TriggerReplySubject("schedule", "abc123")
+	if good != "a2a.trigger.reply.schedule.abc123" || !ValidTriggerReplySubject("schedule", good) {
+		t.Fatalf("%q is not valid", good)
+	}
+	for _, bad := range []string{
+		"", "_INBOX.operator.abc", "a2a.trigger.reply.schedule.", "a2a.trigger.reply.schedule.a.b",
+		"a2a.trigger.reply.schedule.*", "a2a.trigger.reply.schedule.>", "a2a.trigger.reply.event-watcher.abc",
+	} {
+		if ValidTriggerReplySubject("schedule", bad) {
+			t.Errorf("%q accepted", bad)
+		}
+	}
+}

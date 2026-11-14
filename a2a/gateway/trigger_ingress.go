@@ -67,10 +67,16 @@ func (g *Gateway) startTriggerIngress(ctx context.Context) {
 	go func() {
 		for {
 			sub, err := g.client.SubscribeCore(triggerSubmitWildcard, func(m *nats.Msg) {
-				reply := g.handleTriggerSubmit(ctx, m.Subject, m.Data)
-				if m.Reply == "" {
+				// Answered only on the source's own reply namespace
+				// (lib.TriggerReplySubject): a submission naming any other
+				// reply subject is dropped before anything is started, so
+				// no answer, and no task, goes where the source can't read.
+				source, err := lib.ParseTriggerSubmitSubject(m.Subject)
+				if err != nil || !lib.ValidTriggerReplySubject(source, m.Reply) {
+					g.log.Info("trigger submission dropped: no reply subject in the source's namespace", "subject", m.Subject)
 					return
 				}
+				reply := g.handleTriggerSubmit(ctx, m.Subject, m.Data)
 				if data, err := json.Marshal(reply); err == nil {
 					if err := m.Respond(data); err != nil {
 						g.log.Warn("trigger submission reply failed", "subject", m.Subject, "err", err)
