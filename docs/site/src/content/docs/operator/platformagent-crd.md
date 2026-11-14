@@ -1544,7 +1544,7 @@ So each base has one spelling, the one the broker targets and protects. Changing
 The operator writes observed state to the `status` subresource; [PlatformAgent fields → Status](/kube-agents/operator/platformagent-fields/#status) lists every field with its type. How the `usage` counters are produced, where `inference` comes from, and what each condition reports, follows.
 
 `usage.toolExecutionsTotal`, `usage.toolExecutionsBlockedTotal`, `usage.eventsIngestedTotal`, `usage.sessionsTotal`, `usage.chatSessionsTotal`, `usage.remediationsProposedTotal`,
-`usage.chatMessagesInboundTotal`, `usage.brokerFailuresTotal`, `usage.chatTurnsErroredTotal`, `usage.backgroundTasksGaveUpTotal`, `usage.negativeFeedbackTotal`, `usage.positiveFeedbackTotal`,
+`usage.chatMessagesInboundTotal`, `usage.brokerFailuresTotal`, `usage.chatTurnsErroredTotal`, `usage.backgroundTasksGaveUpTotal`, `usage.negativeFeedbackTotal`, `usage.positiveFeedbackTotal`, `usage.autonomousNegativeFeedbackTotal`, `usage.autonomousPositiveFeedbackTotal`,
 `usage.lastActiveTime`, `usage.lastHumanActiveTime`, the two cluster gauges and the proposal, people and origin readings are produced by the operator, on the leader and off the reconcile path. So are the three inference totals, `usage.inputTokensTotal`, `usage.outputTokensTotal` and `usage.spendMicrosUSDTotal`. Every five
 minutes it reads the credential broker's, the event watcher's, the chat plugin's, LiteLLM's and the A2A gateway's metrics listeners over the pod network, folds the counter series into totals it keeps with their per-pod baseline in the
 `<name>-usage-counters` ConfigMap, so the counters stay monotonic across pod, process and operator
@@ -1662,10 +1662,12 @@ and the retention stays this release's own until the CRD is applied.
 The counters and the two times land through the poller above, which consults the same five-minute
 record. Under a served CRD that predates `status.usage` they accumulate in the
 `<name>-usage-counters` ConfigMap and land with the first patch after this release's CRD is
-applied. Under a served CRD at a previous schema, which has `status.usage` without the fields added
+applied.
+
+Under a served CRD at a previous schema, which has `status.usage` without the fields added
 later (the two cluster gauges, the proposal readings, the people readings, the origin readings, `chatMessagesInboundTotal`,
 `toolExecutionsBlockedTotal`, `brokerFailuresTotal`, `chatTurnsErroredTotal`,
-`backgroundTasksGaveUpTotal`, `negativeFeedbackTotal`, `positiveFeedbackTotal`, `chatSessionsTotal`, the three inference totals and `lastHumanActiveTime`), the first-schema
+`backgroundTasksGaveUpTotal`, `negativeFeedbackTotal`, `positiveFeedbackTotal`, the two autonomous feedback totals, `chatSessionsTotal`, the three inference totals and `lastHumanActiveTime`), the first-schema
 counters keep landing and the newer fields are probed again every five minutes until this
 release's CRD is applied. `storageStatus.capacityBytes` and `freeBytes` follow the same rule under
 a served CRD that predates them.
