@@ -2452,6 +2452,32 @@ Mutation(
         "per-entry call still runs, but no entry's real text is capped",
     ),
     Mutation(
+        "C1-delegate-adapter-batch-refusal-neutered",
+        "a2a/worker-adapter/delegate.go",
+        ('Parameters: e.Parameters}); why != "" {', 'Parameters: e.Parameters}); false {'),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "keep the per-entry validateDelegate call but never act on its answer: "
+        "the call is still there, and every batch entry is published unchecked",
+    ),
+    Mutation(
+        "C1-delegate-adapter-publish-refusal-neutered",
+        "a2a/worker-adapter/adapter.go",
+        ('validateDelegateFor(ask.req, a.delegateWidth); why != "" {',
+         'validateDelegateFor(ask.req, a.delegateWidth); false && why != "" {'),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "keep the adapter's validateDelegateFor call but never refuse on it: "
+        "an over-length request is published to the bus",
+    ),
+    Mutation(
+        "C1-delegate-adapter-publish-check-commented-out",
+        "a2a/worker-adapter/adapter.go",
+        ('if why := validateDelegateFor(ask.req, a.delegateWidth); why != "" {',
+         'if why := ""; why != "" { // validateDelegateFor(ask.req, a.delegateWidth)'),
+        "test_C1_the_delegate_text_cap_is_spelled_once",
+        "drop the adapter's check and leave its call in a comment on the same "
+        "line: only a pin that reads code without comments sees it gone",
+    ),
+    Mutation(
         "C1-delegate-adapter-skips-the-single-request",
         "a2a/worker-adapter/delegate.go",
         ("\t\treturn validateDelegate(req)\n", "\t\treturn \"\"\n"),
