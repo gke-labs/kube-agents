@@ -387,15 +387,23 @@ def _with_rule(text: str, section: str, fix_type: str, environment: str, note: s
     edited = parse(out)
     # Exactly one rule more, nothing moved: an alias's node carries its anchor's
     # marks, so a position found from it can land inside another list.
-    added = Rule(fix_type, (environment,))
+    what = "an allow" if section == "allow" else "a deny"
+    try:
+        # The rule on its own: a bad fix type or environment says so, while a
+        # splice that does not re-parse is a layout this cannot add to.
+        added = _parse_rule(
+            {"fix": fix_type, "environments": [environment]},
+            f"automerge.{section}",
+            wildcard_ok=section == "deny",
+            warnings=[],
+        )
+    except RulesError as exc:
+        raise RulesError(f"could not add {what} rule to {RULES_FILE}: {exc}") from exc
     if section == "allow":
         expected = (before.allow + (added,), before.deny)
     else:
         expected = (before.allow, before.deny + (added,))
-    what = "an allow" if section == "allow" else "a deny"
-    if edited.status != LOADED:
-        raise RulesError(f"could not add {what} rule to {RULES_FILE}: {edited.error}")
-    if (edited.allow, edited.deny) != expected:
+    if edited.status != LOADED or (edited.allow, edited.deny) != expected:
         raise RulesError(f"could not add {what} rule to this layout of {RULES_FILE}")
     if section == "allow" and not decide(edited, fix_type, environment).allowed:
         # A deny already covers it, so the edit would allow nothing.

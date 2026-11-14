@@ -389,6 +389,18 @@ class TestWithAllow(unittest.TestCase):
         with self.assertRaisesRegex(ar.RulesError, "bogus"):
             ar.with_allow("version: 1\n", "bogus", "dev")
 
+    def test_a_layout_that_cannot_take_the_rule_is_one_line(self):
+        for section, text in (
+            ("allow", "version: 1\nautomerge: ~\n"),
+            ("deny", "version: 1\nautomerge:\n  allow: [{fix: no-pdb, environments: [dev]}]\n  deny: ~\n"),
+        ):
+            with self.subTest(section):
+                edit = ar.with_allow if section == "allow" else ar.with_deny
+                with self.assertRaises(ar.RulesError) as caught:
+                    edit(text, "no-pdb", "qa")
+                self.assertIn("this layout", str(caught.exception))
+                self.assertNotIn("\n", str(caught.exception))
+
     def test_every_known_fix_type_has_a_name(self):
         self.assertEqual(set(ar.FIX_TYPE_NAMES), set(ar.KNOWN_FIX_TYPES))
 
