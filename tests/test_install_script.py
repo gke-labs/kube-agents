@@ -10562,6 +10562,37 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         self.assertNotIn('tee "$log_file"', proc.stderr)
         self.assertNotIn("tee ", proc.stderr)
 
+    def test_only_an_explicit_gvisor_off_confirms_the_pool_destroy(self):
+        # guard_gvisor_pool_teardown reads KUBEAGENTS_ALLOW_NODE_POOL_DESTROY.
+        # An explicit --enable-gvisor=false or "No" at the interview's prompt
+        # (both set PARAM_ENABLE_GVISOR_EXPLICIT) confirms it; ENABLE_GVISOR=false
+        # from install.env alone does not (#5824).
+        repo_dir = self._tmp_path / "mock-repo"
+        compose_dir = repo_dir / "terraform" / "examples" / "full-install"
+        compose_dir.mkdir(parents=True)
+        lifecycle_sh = compose_dir / "lifecycle.sh"
+        lifecycle_sh.write_text('#!/bin/bash\necho "ALLOW=${KUBEAGENTS_ALLOW_NODE_POOL_DESTROY:-unset}"\n')
+        lifecycle_sh.chmod(0o755)
+        log_file = self._tmp_path / "provision.log"
+        cases = (
+            ("export ENABLE_GVISOR=false; PARAM_ENABLE_GVISOR_EXPLICIT=true", "ALLOW=true"),
+            ("export ENABLE_GVISOR=false", "ALLOW=unset"),
+            ("export ENABLE_GVISOR=true; PARAM_ENABLE_GVISOR_EXPLICIT=true", "ALLOW=unset"),
+        )
+        for setup, want in cases:
+            with self.subTest(setup=setup):
+                proc = self._run_func(
+                    f'unset KUBEAGENTS_ALLOW_NODE_POOL_DESTROY; {setup}; run_lifecycle_apply "{repo_dir}" "{log_file}"')
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn(want, log_file.read_text())
+
+    def test_the_interviews_no_marks_gvisor_explicit(self):
+        text = _INSTALL_SH.read_text()
+        branch = text[text.index('prompt_menu "$gvisor_prompt" "${gvisor_yes} (Default)"'):]
+        branch = branch[: branch.index("    else\n")]
+        self.assertIn('enable_gvisor="false"', branch)
+        self.assertIn('PARAM_ENABLE_GVISOR_EXPLICIT="true"', branch)
+
     def test_successful_apply_writes_log_file_and_succeeds(self):
         repo_dir = self._tmp_path / "mock-repo"
         compose_dir = repo_dir / "terraform" / "examples" / "full-install"

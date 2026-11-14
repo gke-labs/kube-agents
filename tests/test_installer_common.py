@@ -2224,12 +2224,129 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn("rc=0", proc.stdout, proc.stderr)
             self.assertIn("enable_gvisor_node_pool    = true", dest.read_text())
 
+    def _tfvars_unset_gvisor(self, pools_behaviour, autopilot=False, env_extra=None, state=None):
+        # An existing cluster (the describe answers), with `node-pools list`
+        # answering pools_behaviour, and no ENABLE_GVISOR unless env_extra
+        # sets one.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                # The harness stubs the printers silent; these two say what
+                # the resolver tells the operator.
+                'print_info() { echo "INFO: $*" >&2; }; print_warning() { echo "WARN: $*" >&2; }; '
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", **(env_extra or {})},
+                describe_stub=_autopilot_describe_stub() if autopilot else "printf '\\n'; exit 0",
+                gcloud_extra_cases=f'  *"node-pools list"*) {pools_behaviour} ;;\n',
+                **({"gcloud_stdout": state} if state is not None else {}),
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            return proc, dest.read_text()
+
+    def test_tfvars_unset_gvisor_keeps_a_live_standard_gvisor_pool(self):
+        # #5824: a supplied install.env with no ENABLE_GVISOR, on a Standard
+        # install that install.sh had built with the pool (the fresh-install
+        # default), planned the pool's destruction on the next upgrade.
+        proc, content = self._tfvars_unset_gvisor("printf 'default-pool\\ngvisor-pool\\n'")
+        self.assertIn("enable_gvisor_node_pool    = true", content)
+        self.assertIn('agent_runtime_class        = "gvisor"', content)
+        self.assertIn("runs the gVisor pool 'gvisor-pool', so this run keeps it", proc.stderr)
+
+    def test_tfvars_unset_gvisor_reads_a_standard_cluster_without_the_pool_as_off(self):
+        proc, content = self._tfvars_unset_gvisor("printf 'default-pool\\n'")
+        self.assertIn("enable_gvisor_node_pool    = false", content)
+        self.assertIn('agent_runtime_class        = ""', content)
+
+    def test_tfvars_unset_gvisor_warns_when_the_pools_cannot_be_listed(self):
+        proc, content = self._tfvars_unset_gvisor("echo 'ERROR: permission denied' >&2; exit 1")
+        self.assertIn("enable_gvisor_node_pool    = false", content)
+        self.assertIn("could not be listed", proc.stderr)
+        self.assertIn("refuses to destroy a gVisor pool it finds in state", proc.stderr)
+
+    def test_tfvars_unset_gvisor_on_autopilot_without_state_keeps_the_sandbox(self):
+        # No state to read: Autopilot has no pool to list, so the sandbox a
+        # fresh install defaults on stays on; only an explicit false turns it off.
+        proc, content = self._tfvars_unset_gvisor("printf 'should-not-be-asked\\n'", autopilot=True)
+        self.assertIn('agent_runtime_class        = "gvisor"', content)
+        self.assertIn("enable_gvisor_node_pool    = false", content)
+        self.assertIn("keeps the agent sandboxed on Autopilot", proc.stderr)
+
+    @staticmethod
+    def _release_state(runtime_class, extra_values=None, quote='"', cluster="autopilot"):
+        q = quote
+        values = (f'{q}platformAgent{q}:\n  {q}deployment{q}:\n    {q}availability{q}:\n'
+                  f'      {q}runtimeClassName{q}: {q}{runtime_class}{q}\n'
+                  f'{q}harness{q}:\n  {q}enabled{q}: true\n')
+        return _state_doc([
+            {"mode": "managed", "type": "google_container_cluster", "name": cluster,
+             "instances": [_cluster_instance()]},
+            {"mode": "managed", "type": "helm_release", "name": "kube_agents",
+             "instances": [{"attributes": {"values": [values] + (extra_values or [])}}]},
+        ])
+
+    def test_tfvars_unset_gvisor_reads_only_the_agents_own_runtime_class(self):
+        # extra_helm_values is the second document; a runtimeClassName there
+        # belongs to something else (the shell sandbox), not the agent.
+        extra = '"harness":\n  "experimental":\n    "shellSandbox":\n      "runtimeClassName": "gvisor"\n'
+        proc, content = self._tfvars_unset_gvisor("exit 1", autopilot=True,
+                                                  state=self._release_state("", extra_values=[extra]))
+        self.assertIn('agent_runtime_class        = ""', content)
+
+    def test_tfvars_unset_gvisor_reads_a_single_quoted_release(self):
+        proc, content = self._tfvars_unset_gvisor("exit 1", autopilot=True,
+                                                  state=self._release_state("gvisor", quote="\x27"))
+        self.assertIn('agent_runtime_class        = "gvisor"', content)
+
+    def test_tfvars_unset_gvisor_trusts_a_standard_state_without_the_pool(self):
+        # The state holds the release and no pool: a live pool it does not
+        # record is not this install's, and planning it would 409.
+        proc, content = self._tfvars_unset_gvisor("printf 'default-pool\\ngvisor-pool\\n'",
+                                                  state=self._release_state("", cluster="standard"))
+        self.assertIn("enable_gvisor_node_pool    = false", content)
+        self.assertNotIn("so this run keeps it", proc.stderr)
+
+    def test_tfvars_unset_gvisor_on_autopilot_keeps_a_sandbox_the_state_records(self):
+        # A fresh Autopilot install defaults the sandbox on too
+        # (install.defaults.env DEFAULT_ENABLE_GVISOR); its release renders
+        # runtimeClassName gvisor, and reading a missing key as off would turn
+        # the sandbox off on upgrade.
+        proc, content = self._tfvars_unset_gvisor("exit 1", autopilot=True,
+                                                  state=self._release_state("gvisor"))
+        self.assertIn('agent_runtime_class        = "gvisor"', content)
+        self.assertIn("enable_gvisor_node_pool    = false", content)
+        self.assertIn("Terraform state runs the agent sandboxed", proc.stderr)
+
+    def test_tfvars_unset_gvisor_on_autopilot_reads_an_unsandboxed_release_as_off(self):
+        proc, content = self._tfvars_unset_gvisor("exit 1", autopilot=True,
+                                                  state=self._release_state(""))
+        self.assertIn('agent_runtime_class        = ""', content)
+
+    def test_tfvars_unset_gvisor_reads_a_pool_in_state_without_listing(self):
+        state = _state_doc([
+            {"mode": "managed", "type": "google_container_cluster", "name": "standard",
+             "instances": [_cluster_instance()]},
+            {"module": "module.gke_cluster", "mode": "managed", "type": "google_container_node_pool",
+             "name": "gvisor", "instances": [{"attributes": {"name": "gvisor-pool"}}]},
+        ])
+        proc, content = self._tfvars_unset_gvisor("echo 'should not be asked' >&2; exit 1", state=state)
+        self.assertIn("enable_gvisor_node_pool    = true", content)
+        self.assertNotIn("could not be listed", proc.stderr)
+
+    def test_tfvars_explicit_gvisor_false_is_not_overruled_by_a_live_pool(self):
+        # An explicit value wins: uninstall.sh exports false on purpose, and
+        # an operator's ENABLE_GVISOR="false" is theirs to make (the apply's
+        # pool guard asks them to confirm the destroy).
+        proc, content = self._tfvars_unset_gvisor("printf 'default-pool\\ngvisor-pool\\n'",
+                                                  env_extra={"ENABLE_GVISOR": "false"})
+        self.assertIn("enable_gvisor_node_pool    = false", content)
+        self.assertNotIn("so this run keeps it", proc.stderr)
+
     def test_tfvars_leaves_the_agent_unsandboxed_when_gvisor_is_unset(self):
         # install.sh owns the default-on policy and always exports the result
-        # before calling this, so an unset ENABLE_GVISOR here is not a
-        # fresh install -- it is a caller reading an install that already
-        # exists, and such an install is not sandboxed. Deciding otherwise
-        # would make the generator disagree with the running cluster.
+        # before calling this, so an unset ENABLE_GVISOR here is a caller
+        # reading an install that already exists. With no gVisor pool in the
+        # cluster's listing (this stub lists none), that install is not
+        # sandboxed, and the generator must agree with the running cluster.
         with tempfile.TemporaryDirectory() as out_dir:
             dest = pathlib.Path(out_dir) / "terraform.tfvars"
             proc = self._run(
@@ -2242,20 +2359,28 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn("enable_gvisor_node_pool    = false", content)
             self.assertIn('agent_runtime_class        = ""', content)
 
-    def test_tfvars_unset_gvisor_skips_the_autopilot_floor(self):
-        # uninstall.sh treats install.env as optional -- the documented
-        # `curl ... | bash` teardown runs from a fresh clone that has none --
-        # and calls this bare under `set -e` before lifecycle.sh destroy. If an
-        # unset ENABLE_GVISOR defaulted on, the floor check would abort the
-        # teardown of an old Autopilot cluster and leave the install with no
-        # working way to remove itself.
+    def test_tfvars_unset_gvisor_on_a_sub_floor_autopilot_keeps_the_sandbox_and_its_floor(self):
+        # With no ENABLE_GVISOR and no state to read, an existing Autopilot
+        # install keeps the sandbox (#5824: only an explicit false turns it
+        # off), so the version floor applies. uninstall.sh is not exposed: it
+        # exports ENABLE_GVISOR=false itself before calling this (uninstall.sh,
+        # "export ENABLE_GVISOR=\"false\""), which
+        # test_tfvars_gvisor_off_clears_the_floor_on_a_sub_floor_autopilot covers.
         proc = self._run(
             'rc=0; write_tfvars_from_state /dev/null || rc=$?; echo "rc=$rc"',
             env={"API_SERVER_KEY": "k"},
             describe_stub=_autopilot_describe_stub("1.26.9-gke.9999"),
         )
-        self.assertIn("rc=0", proc.stdout, proc.stderr)
-        self.assertNotIn("1.27.4-gke.800", proc.stderr)
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+        self.assertIn("1.27.4-gke.800", proc.stderr)
+
+    def test_uninstall_exports_gvisor_false_before_rendering(self):
+        text = (_REPO_ROOT / "uninstall.sh").read_text()
+        export = text.index('export ENABLE_GVISOR="false"')
+        calls = [i for i in range(len(text)) if text.startswith("write_tfvars_from_state", i)
+                 and not text[text.rfind("\n", 0, i) + 1:i].lstrip().startswith("#")]
+        self.assertTrue(calls, "uninstall.sh renders no tfvars")
+        self.assertLess(export, min(calls), "the export must come before every render")
 
     def _tfvars(self, env, **run_kwargs):
         """Generate a terraform.tfvars and return its text.

@@ -77,8 +77,9 @@ Change a default there and every front door follows. Do **not** restate one in
 this table instead. A second copy of a default is how the installer's permission-set
 default once disagreed with the provisioner's. One case is not a copy and stays: a
 fallback that deliberately differs from the fresh-install default because it reads an
-install that already exists, as `${ENABLE_GVISOR:-false}` does in the control panel and
-in `write_tfvars_from_state`. Those carry the argument beside them.
+install that already exists: `ENABLE_GVISOR`, which `resolve_existing_install_gvisor` reads
+from the live install for both the control panel and `write_tfvars_from_state`. The argument
+is beside it.
 
 It is sourced **without** `set -a`, unlike `install.env`: these are the project's
 defaults, not the install's configuration, so they stay shell variables rather than
@@ -244,9 +245,11 @@ install.defaults.env  →  an exported environment variable  →  install.env  �
 That precedence has a sharp edge on an install that already exists. A key missing from
 `install.env` is not "leave it as it is": it resolves to the default, the default is written
 into `terraform.tfvars`, and `upgrade.sh --upgrade-mode=full` then plans the destruction of
-whatever the default does not mention. `ENABLE_GVISOR` absent destroys the gVisor node pool
-on a Standard cluster (`write_tfvars_from_state` falls back to `false` for that key, not to
-`install.defaults.env`'s `true`); `MEMORY` absent falls back to `file` unless
+whatever the default does not mention. `ENABLE_GVISOR` is the exception: absent, it is read
+from the live install (the Terraform state's gVisor pool or the release's runtimeClassName,
+then the cluster's node pools; Autopilot with no state keeps the sandbox), and `lifecycle.sh`
+refuses an apply that would destroy a gVisor pool unless `KUBEAGENTS_ALLOW_NODE_POOL_DESTROY=true`
+(`upgrade.sh --allow-node-pool-destroy`) confirms it; `MEMORY` absent falls back to `file` unless
 `write_tfvars_from_state` finds a live Hindsight deployment (`hindsight-postgresql` or
 `hindsight-api`) on the target cluster, in which case `kube_agents_memory` is preserved
 (`--memory=file` or `MEMORY=file` is required to tear it down);
@@ -273,9 +276,8 @@ configuration first and real drift second.
 `ENABLE_DRIFT_DETECTOR` has the same sharp edge pointing the other way, because its absence
 provisions rather than destroys. Two things have to hold for that, and most keys fail one of
 them: `write_tfvars_from_state` has to resolve the key against `install.defaults.env` rather
-than against a literal `false`, and the default there has to be `true`. `ENABLE_GVISOR`, in
-the paragraph above, clears the second and fails the first — it defaults to `true` and still
-destroys, because the generator hardcodes `${ENABLE_GVISOR:-false}`. `ENABLE_GKE_BACKUP_PLAN`,
+than against a literal `false`, and the default there has to be `true`. `ENABLE_GVISOR` is
+outside the rule: it reads the live install instead of any default (above). `ENABLE_GKE_BACKUP_PLAN`,
 `ENABLE_PUBSUB_PLATFORM` and `ENABLE_STOCKOUT_INVESTIGATOR` clear the first and fail the
 second. `VERTEX_MANAGE_SERVING_PROJECT` is the only other key where both hold: absent, it
 re-enables `aiplatform.googleapis.com` and re-grants `roles/aiplatform.user` in the serving

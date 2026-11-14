@@ -1339,7 +1339,7 @@ parse_args() {
         SCOPE_FLAG_PASSED="true"
         PARAM_SCOPED_SA_POOL_MAX_ACCOUNTS="${1#*=}"
         require_scope_flag_value "${1%%=*}" "$PARAM_SCOPED_SA_POOL_MAX_ACCOUNTS"; shift ;;
-      --enable-gvisor|--enable-gvisor=*) PARAM_ENABLE_GVISOR="$(flag_bool_value "$1")"; shift ;;
+      --enable-gvisor|--enable-gvisor=*) PARAM_ENABLE_GVISOR="$(flag_bool_value "$1")"; PARAM_ENABLE_GVISOR_EXPLICIT="true"; shift ;;
       # Validated here and again in main(). The second check is not redundant:
       # PARAM_ENABLE_WEBUI is seeded from the recorded value and resolved with
       # ${VAR:-...}, which reads an empty assignment as "unset" and hands back
@@ -4295,6 +4295,15 @@ run_lifecycle_apply() {
     export KUBE_AGENTS_STATE_BUCKET="${KUBE_AGENTS_STATE_BUCKET:-$DEFAULT_KUBE_AGENTS_STATE_BUCKET}"
     export KUBE_AGENTS_STATE_PREFIX
     KUBE_AGENTS_STATE_PREFIX="$(tf_state_prefix)"
+    # An explicit --enable-gvisor=false, or "No" picked at the interview's
+    # gVisor prompt, is the confirmation lifecycle.sh's guard_gvisor_pool_teardown
+    # asks for before it destroys a live gVisor pool. A value that only came from
+    # install.env is not: that is the line a lost or wrong file gets wrong.
+    # ENABLE_GVISOR, not PARAM_ENABLE_GVISOR: the interview's answer reaches
+    # only the former (exported with the rest of the run's configuration).
+    if [ "${PARAM_ENABLE_GVISOR_EXPLICIT:-}" = "true" ] && [ "${ENABLE_GVISOR:-}" = "false" ]; then
+      export KUBEAGENTS_ALLOW_NODE_POOL_DESTROY=true
+    fi
     ./lifecycle.sh apply -auto-approve -input=false
   ) 2>&1 | tee "$log_file" || ps=("${PIPESTATUS[@]}")
 
@@ -7006,11 +7015,14 @@ run_menu_system() {
   local custom_roles="${PLATFORM_AGENT_CUSTOM_ROLES:-}"
   # Not the fresh-install default. The control panel describes an install that
   # already exists and its Save & Apply re-applies what it displays, so an
-  # install.env with no ENABLE_GVISOR has to read as the standard runtime —
-  # that is what such a cluster is actually running. Defaulting on here would
-  # show "gVisor Sandbox" for an unsandboxed install and then provision a node
-  # pool nobody asked for on the next apply.
-  local enable_gvisor="${ENABLE_GVISOR:-false}"
+  # install.env with no ENABLE_GVISOR has to read as what the cluster runs:
+  # resolve_existing_install_gvisor asks it, the same reader the Terraform
+  # variables use, so the panel and the apply cannot disagree. A default of
+  # true would show "gVisor Sandbox" for an unsandboxed install and provision a
+  # pool nobody asked for; a default of false showed a Standard install's pool
+  # as off and destroyed it on the next apply.
+  local enable_gvisor
+  enable_gvisor="$(resolve_existing_install_gvisor "$project_id" "$cluster_name" "$region")"
   # DEFAULT_ENABLE_WEBUI is "false" and the paragraph above applies to it too:
   # the panel has to read as what an unconfigured install is running. Flipping
   # that default on would make this show a dashboard nobody deployed, so the
@@ -8727,6 +8739,9 @@ main() {
       prompt_menu "$gvisor_prompt" "${gvisor_yes} (Default)" "$gvisor_no" gvisor_choice
       if [ "$gvisor_choice" = "2" ]; then
         enable_gvisor="false"
+        # The operator's own choice, as --enable-gvisor=false is: it confirms
+        # the destroy of a live gVisor pool (run_lifecycle_apply).
+        PARAM_ENABLE_GVISOR_EXPLICIT="true"
       fi
     else
       prompt_menu "$gvisor_prompt" "${gvisor_no} (Default)" "$gvisor_yes" gvisor_choice

@@ -106,6 +106,7 @@ PARAM_DROP_UNDECLARED_VALUES="false"
 # the older release cannot read, so a rollback across one is refused unless
 # the operator has read the commits the refusal names and asks for it.
 PARAM_ALLOW_BREAKING_DOWNGRADE="false"
+PARAM_ALLOW_NODE_POOL_DESTROY="false"
 PARAM_PROJECT_ID=""
 PARAM_CLUSTER_NAME=""
 PARAM_REGION=""
@@ -367,6 +368,11 @@ Options:
                            as a breaking change: a rollback to an older release,
                            or a commit build moved to a release that lacks it.
                            Without it the move is refused and each commit named.
+  --allow-node-pool-destroy
+                           Let a full upgrade destroy the gVisor node pool
+                           (ENABLE_GVISOR="false" on a Standard install that runs
+                           one). Without it the apply refuses, so a lost or
+                           wrong install.env line cannot take the pool away.
   --help, -h               Show this help message
 
 Examples:
@@ -1534,6 +1540,7 @@ parse_args() {
       --keep-image-tag) PARAM_KEEP_IMAGE_TAG="true"; shift ;;
       --drop-undeclared-values) PARAM_DROP_UNDECLARED_VALUES="true"; shift ;;
       --allow-breaking-downgrade) PARAM_ALLOW_BREAKING_DOWNGRADE="true"; shift ;;
+      --allow-node-pool-destroy) PARAM_ALLOW_NODE_POOL_DESTROY="true"; shift ;;
       --dry-run) PARAM_DRY_RUN="true"; shift ;;
       --gcp-project-id=*) PARAM_PROJECT_ID="${1#*=}"; shift ;;
       --gcp-project-id) PARAM_PROJECT_ID="$2"; shift 2 ;;
@@ -1583,6 +1590,10 @@ run_lifecycle() {
     KUBE_AGENTS_STATE_BUCKET="${KUBE_AGENTS_STATE_BUCKET:-$DEFAULT_KUBE_AGENTS_STATE_BUCKET}"
     KUBE_AGENTS_STATE_PREFIX="$(tf_state_prefix)"
     export KUBE_AGENTS_STATE_BUCKET KUBE_AGENTS_STATE_PREFIX
+    # lifecycle.sh's guard_gvisor_pool_teardown reads this; only the flag sets it.
+    if [ "$PARAM_ALLOW_NODE_POOL_DESTROY" = "true" ]; then
+      export KUBEAGENTS_ALLOW_NODE_POOL_DESTROY=true
+    fi
     ./lifecycle.sh "$@"
   )
 }
@@ -1795,6 +1806,10 @@ main() {
     full|harness|operator) ;;
     *) print_error "Unsupported upgrade mode '$PARAM_UPGRADE_MODE'. Use full, harness, or operator."; exit 1 ;;
   esac
+  if [ "$PARAM_ALLOW_NODE_POOL_DESTROY" = "true" ] && [ "$PARAM_UPGRADE_MODE" != "full" ]; then
+    print_error "--allow-node-pool-destroy applies to --upgrade-mode=full, the only mode that runs Terraform. Harness and operator upgrades touch no node pool."
+    exit 1
+  fi
   if [ "$PARAM_DROP_UNDECLARED_VALUES" = "true" ] && [ "$PARAM_UPGRADE_MODE" = "full" ]; then
     print_error "--drop-undeclared-values applies to --upgrade-mode=operator and harness, which reuse the release's recorded values. A full upgrade renders them from install.env."
     exit 1

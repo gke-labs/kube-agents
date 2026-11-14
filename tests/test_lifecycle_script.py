@@ -152,7 +152,8 @@ class LifecycleScriptGuardTest(unittest.TestCase):
                    untaint_stub="exit 0",
                    stdout_path=None,
                    sigint_after=None,
-                   tee_fails=False):
+                   tee_fails=False,
+                   extra_env=None):
         """Run a lifecycle.sh function against stubbed terraform and gcloud commands."""
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"
@@ -413,8 +414,10 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_LIFECYCLE_SH}"
             # has been trying them out by hand.
             env = get_isolated_test_env(
                 bin_dir=str(bin_dir),
-                absent=["STATE_BACKEND_ATTEMPTS", "STATE_BACKEND_WAIT_SECONDS"],
+                absent=["STATE_BACKEND_ATTEMPTS", "STATE_BACKEND_WAIT_SECONDS",
+                        "KUBEAGENTS_ALLOW_NODE_POOL_DESTROY"],
             )
+            env.update(extra_env or {})
             cwd = str(_REPO_ROOT / "terraform" / "examples" / "full-install")
             if stdout_path is not None:
                 # stdout a regular file, as `./lifecycle.sh apply > apply.log`
@@ -1119,6 +1122,40 @@ resource "google_service_account" "agent" {
         )
         self.assertEqual(proc.returncode, 1)
         self.assertIn("sizing_profile is 'fleet', the profile the last apply recorded", proc.stderr)
+
+    def test_guard_gvisor_pool_teardown_no_op_without_a_pool_in_state(self):
+        proc = self._run_guard("guard_gvisor_pool_teardown", state_list="", tfvar_enable_gvisor="false")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+
+    def test_guard_gvisor_pool_teardown_passes_a_kept_pool(self):
+        proc = self._run_guard("guard_gvisor_pool_teardown", state_list=self._GVISOR_ADDRESS,
+                               tfvar_enable_gvisor="true")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+
+    def test_guard_gvisor_pool_teardown_refuses_a_pool_the_flag_drops(self):
+        """The upgrade that read a missing ENABLE_GVISOR as false planned the pool's destroy."""
+        proc = self._run_guard("guard_gvisor_pool_teardown", state_list=self._GVISOR_ADDRESS,
+                               tfvar_enable_gvisor="false")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("this state's cluster runs the gVisor pool", proc.stderr)
+        self.assertIn("would DESTROY that pool", proc.stderr)
+        self.assertIn('set ENABLE_GVISOR="true" in install.env', proc.stderr)
+        self.assertIn("--allow-node-pool-destroy", proc.stderr)
+
+    def test_guard_gvisor_pool_teardown_lets_a_confirmed_destroy_go(self):
+        proc = self._run_guard("guard_gvisor_pool_teardown", state_list=self._GVISOR_ADDRESS,
+                               tfvar_enable_gvisor="false",
+                               extra_env={"KUBEAGENTS_ALLOW_NODE_POOL_DESTROY": "true"})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("as KUBEAGENTS_ALLOW_NODE_POOL_DESTROY=true confirms", proc.stderr)
+
+    def test_guard_gvisor_pool_teardown_runs_on_apply(self):
+        text = (_REPO_ROOT / "terraform/examples/full-install/lifecycle.sh").read_text()
+        apply = text[text.index("  apply)\n"):]
+        apply = apply[: apply.index("log \"terraform apply\"")]
+        self.assertIn("guard_gvisor_pool_teardown", apply)
 
     def test_guard_node_pool_shape_lets_a_gvisor_pool_being_removed_go(self):
         """enable_gvisor_node_pool off with the pool still in state is the apply that destroys
