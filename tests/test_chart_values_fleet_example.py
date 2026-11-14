@@ -63,12 +63,16 @@ _ALLOWLIST_RE = re.compile(
 )
 _ALLOWLIST_ENTRY_RE = re.compile(r'^\s*"(?P<name>[A-Z0-9_]+)":\s*\{\}', re.MULTILINE)
 _SANDBOX_FORWARD_RE = re.compile(r'envAuditAutoPromote\s*=\s*"(?P<name>[A-Z0-9_]+)"')
-# The two process tunables the page and the example say are left out. The agent
-# container's allowlist above drops them; the credential-proxy and agent-api-auth
+# The process tunable the page and the example say is left out. The agent
+# container's allowlist above drops it; the credential-proxy and agent-api-auth
 # containers take spec.deployment.env through mergeCredentialProxyEnv, a denylist
 # of the names the operator itself sets or lists as sensitive, so a name the
 # operator source never spells as a string reaches those two containers.
-_LEFT_OUT_ENV_NAMES = ("CLOUDSDK_CORE_DISABLE_FILE_LOGGING", "MALLOC_ARENA_MAX")
+_LEFT_OUT_ENV_NAMES = ("MALLOC_ARENA_MAX",)
+# The name the page and the example say has no effect on gcloud when a values
+# file sets it: the credential proxy does not pass the pod's value to the
+# commands it runs (GCLOUD_FILE_LOGGING_OFF_ENV in credential_proxy.py).
+_NO_EFFECT_ENV_NAME = "CLOUDSDK_CORE_DISABLE_FILE_LOGGING"
 # The env names the CR template renders from a chart key (incidentWorkloadDedupSeconds,
 # alertDailyLimits.<bucket>). The template skips the key whenever env carries the name,
 # so an example entry for one would win over the key, its 0 included.
@@ -256,7 +260,7 @@ class ExampleShapeTest(unittest.TestCase):
                 self.assertFalse(entry["name"].startswith(tuple(prefixes)), "alertDailyLimits is the route")
 
     def test_the_names_the_maintainers_left_out_stay_out(self):
-        """The page says the two names reach the proxy pod and not the agent container."""
+        """The page says the name reaches the proxy pod and not the agent container."""
         names = {entry["name"] for entry in self.values["platformAgent"]["deployment"]["env"]}
         forwarded = _forwarded_env_names()
         source = _operator_source()
@@ -265,6 +269,11 @@ class ExampleShapeTest(unittest.TestCase):
                 self.assertNotIn(name, names)
                 self.assertNotIn(name, forwarded, f"{name} reaches the agent container now; re-read the page's sentence on it")
                 self.assertNotIn(f'"{name}"', source, f"the operator names {name} now; re-read which container it reaches")
+
+    def test_the_name_with_no_effect_stays_out(self):
+        """The page says the example leaves the name out."""
+        names = {entry["name"] for entry in self.values["platformAgent"]["deployment"]["env"]}
+        self.assertNotIn(_NO_EFFECT_ENV_NAME, names)
 
     def test_the_operator_memory_request_matches_its_limit(self):
         # Autopilot without bursting sets limits equal to requests; the file
