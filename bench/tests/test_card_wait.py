@@ -464,7 +464,10 @@ def test_a_card_stop_result_that_disagrees_with_the_board_fails(card_wait, text,
 
 
 def test_a_task_that_did_not_end_canceled_gets_no_cancel_report(card_wait):
-    result, _, _ = card_wait(["working", "working"], [["a2a-ctx-bus"]], after_cancel="completed")
+    # Still working when the cancel's settle ran out: the stop window runs,
+    # and the one guard left decides (a task that ended any other terminal
+    # state is abandoned before the window, as a setup error).
+    result, _, _ = card_wait(["working", "working"], [["a2a-ctx-bus"]], after_cancel="working")
     assert not _cancel_report(result)
 
 

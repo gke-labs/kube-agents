@@ -37,6 +37,10 @@ SERVICE_SUFFIX = "-a2a-door"
 REMOTE_PORT = 8098
 TOKEN_SECRET_SUFFIX = "-a2a-door"
 TOKEN_SECRET_KEY = "token"  # a Secret key name, not a credential
+#: The card-stop data part's key (lib.CardStopPart in a2a/lib), and the one
+#: version there is.
+CARD_STOP_KEY = "cardStop"
+CARD_STOP_VERSION = 1
 
 #: Task states the door reports that end a task.
 TERMINAL_STATES = frozenset({"completed", "failed", "canceled", "rejected"})
@@ -160,12 +164,6 @@ def task_text(task: dict[str, Any]) -> str:
         if isinstance(artifact, dict):
             texts.append(_parts_text(artifact))
     return next((t for t in texts if t), "")
-
-
-#: The card-stop data part's key (lib.CardStopPart in a2a/lib), and the one
-#: version there is.
-CARD_STOP_KEY = "cardStop"
-CARD_STOP_VERSION = 1
 
 
 def card_stop_result(task: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:

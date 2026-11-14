@@ -147,6 +147,7 @@ HARNESS_WRITTEN_ENTRIES = frozenset(
     {
         stop_hook.STOP_ENTRY,
         stop_hook.CARDS_STOPPED_ENTRY,
+        stop_hook.CANCEL_REPORTED_ENTRY,
         pushed_report.PLANT_ENTRY,
         worker_trajectory.GAP_ENTRY,
         worker_trajectory.NO_WORKER_CALLS_ENTRY,
